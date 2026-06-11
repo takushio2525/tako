@@ -134,6 +134,10 @@ fn rgba_alpha(c: tako_core::Rgb, a: f32) -> Rgba {
     Rgba { a, ..rgba(c) }
 }
 
+fn hsla_alpha(c: tako_core::Rgb, a: f32) -> Hsla {
+    rgba_alpha(c, a).into()
+}
+
 /// IME 変換中（未確定文字列 = marked text）の状態（FR-1.9）。
 /// 変換開始時のフォーカスペインを保持し、変換途中でフォーカスが移っても確定先がぶれないようにする
 struct ImeComposition {
@@ -415,6 +419,23 @@ impl TakoApp {
     /// フォーカス中ペインを閉じる。タブ最後の 1 ペインならタブを閉じ、最後のタブならアプリ終了
     fn close_focused_pane(&mut self, cx: &mut Context<Self>) {
         self.remove_pane(self.focused_pane(), cx);
+    }
+
+    /// ペインの × ボタン（FR-1.3 の補助 UI）。CLI / MCP と同じコマンド層（dispatch）を
+    /// 通す（開発不変条件の UI 側の一貫性）。「最後のタブの最後の 1 ペイン」は dispatch が
+    /// 拒否するため、誤クリックでアプリが終了することはない（終了は cmd+W / cmd+Q のみ）
+    fn close_pane_button(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::Close {
+                pane: Some(pane_id.as_u64()),
+            },
+            PaneOrigin::User,
+        );
+        if let Err(e) = result {
+            eprintln!("warning: ペインを閉じられない: {e}");
+        }
+        cx.notify();
     }
 
     fn remove_pane(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
@@ -1064,6 +1085,40 @@ impl TakoApp {
                 this.on_pane_scroll(pane_id, event, window, cx);
             }))
             .children(lines)
+            .children(Some(
+                // 閉じるボタン（iTerm2 風。左上に控えめなオーバーレイ）
+                div()
+                    .id(("pane-close", pane_id.as_u64()))
+                    .absolute()
+                    .top(px(2.0))
+                    .left(px(4.0))
+                    .w(px(14.0))
+                    .h(px(14.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .occlude()
+                    .text_size(px(11.0))
+                    .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.5))
+                    .hover(|d| {
+                        d.bg(rgba_alpha(theme.tab_bar_background, 0.9))
+                            .text_color(hsla(theme.foreground))
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                            // ペインの選択開始・フォーカス処理に流さない
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.close_pane_button(pane_id, cx);
+                    }))
+                    .child("×"),
+            ))
             .children(scrollbar.map(|(top, thumb_h, track_h, dragging)| {
                 div()
                     .id(("scrollbar", pane_id.as_u64()))
@@ -3069,6 +3124,24 @@ mod self_test {
                 .flatten()
                 .unwrap_or(false);
             check(wide_hit, "全角行のクリックが正しいセルに解決");
+
+            // 47. ペインの × ボタン（dispatch 共有経路）。split で増やして × 相当の操作で
+            //     片付き、フォーカスが残存ペインへ戻ること
+            type_text(any, cx, &format!("{cli} split --right >/dev/null"), true);
+            wait(cx, 1500).await;
+            let close_button_ok = window
+                .update(cx, |app, _, cx| {
+                    let before = app.workspace.active_tab().tree().len();
+                    let target = app.focused_pane();
+                    app.close_pane_button(target, cx);
+                    let tree = app.workspace.active_tab().tree();
+                    before == 2
+                        && tree.len() == 1
+                        && !tree.contains(target)
+                        && !app.terminals.contains_key(&target)
+                })
+                .unwrap_or(false);
+            check(close_button_ok, "ペインの × ボタンで閉じる（dispatch 経由）");
 
             println!("TAKO_APP_SELF_TEST_OK");
             std::process::exit(0);
