@@ -31,6 +31,23 @@ pub use alacritty_terminal::event::Event as TermEvent;
 /// スクロールバックの保持行数
 const SCROLLBACK_LINES: usize = 10_000;
 
+/// シェルの既定 cwd（ホームディレクトリ）。macOS / Linux は `$HOME`、Windows は `%USERPROFILE%`。
+/// 取得できなければ None（その場合は親プロセスの cwd を継承する alacritty の既定挙動になる）
+fn default_home_dir() -> Option<PathBuf> {
+    home_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+}
+
+/// `default_home_dir` の純粋ロジック（テスト用に env 参照と分離）。
+/// `$HOME` を優先し、無ければ `%USERPROFILE%`。どちらも空なら None
+fn home_from(
+    home: Option<std::ffi::OsString>,
+    userprofile: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    home.or(userprofile)
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error("PTY の生成に失敗した")]
@@ -132,10 +149,23 @@ impl TerminalSession {
             cell_width: 8,
             cell_height: 16,
         };
+        // TERM / COLORTERM はまずデフォルトを敷き、呼び出し側の env で上書きできるようにする。
+        // alacritty_terminal の `setup_env` はホストプロセスの env を書き換える方式で tako は
+        // 呼んでおらず、未設定だと親（.app は Finder 由来で TERM 不定）を継承して tmux 等が
+        // 「missing or unsuitable terminal」で落ちる。alacritty terminfo は未導入環境が多いので
+        // 安全側の xterm-256color を既定にし、24bit カラーは COLORTERM=truecolor で広告する。
+        let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::from([
+            ("TERM".to_string(), "xterm-256color".to_string()),
+            ("COLORTERM".to_string(), "truecolor".to_string()),
+        ]);
+        env.extend(options.env);
+
         let tty_options = tty::Options {
             shell: options.command.map(|c| tty::Shell::new(c.program, c.args)),
-            working_directory: options.cwd,
-            env: options.env.into_iter().collect(),
+            // cwd 未指定なら親プロセスの cwd（.app 起動時は `/`）ではなくホームを既定にする。
+            // 元ペインの cwd 継承は OSC 7 シェル統合（Phase 4）で対応する。
+            working_directory: options.cwd.or_else(default_home_dir),
+            env,
             ..tty::Options::default()
         };
         let pty = tty::new(&tty_options, window_size, 0).map_err(SessionError::Pty)?;
@@ -330,5 +360,27 @@ mod tests {
         assert_eq!(paste_payload("a\nb", false), b"a\rb".to_vec());
         assert_eq!(paste_payload("a\r\nb", false), b"a\rb".to_vec());
         assert_eq!(paste_payload("x", true), b"\x1b[200~x\x1b[201~".to_vec());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn ホームディレクトリは_HOME_を優先し_空は無視する() {
+        use std::ffi::OsString;
+        // HOME があればそれを使う
+        assert_eq!(
+            home_from(
+                Some(OsString::from("/Users/foo")),
+                Some(OsString::from("C:\\u"))
+            ),
+            Some(PathBuf::from("/Users/foo"))
+        );
+        // HOME 無し → USERPROFILE（Windows）
+        assert_eq!(
+            home_from(None, Some(OsString::from("C:\\Users\\foo"))),
+            Some(PathBuf::from("C:\\Users\\foo"))
+        );
+        // 空文字は無視（親 cwd 継承へフォールバック）
+        assert_eq!(home_from(Some(OsString::new()), None), None);
+        assert_eq!(home_from(None, None), None);
     }
 }
