@@ -682,8 +682,13 @@ impl TakoApp {
             ScrollDelta::Pixels(p) => (f32::from(p.y) / f32::from(cell.height)) as i32,
         };
         if lines != 0 {
+            // mouse reporting / alternate scroll / 自前スクロールの出し分けはセッション側
+            let (col, row) = self
+                .cell_at(pane_id, event.position)
+                .map(|(c, r, _)| (c, r))
+                .unwrap_or((0, 0));
             if let Some(session) = self.terminals.get(&pane_id) {
-                session.scroll_display(lines);
+                session.scroll_wheel(lines, col, row);
                 cx.notify();
             }
         }
@@ -2654,6 +2659,59 @@ mod self_test {
                 focused_contains(window, cx, "TAKO-STALE-42"),
                 "古い環境変数からフォールバック",
             );
+
+            // 43. ホイールの出し分け: 通常画面 = 自前スクロールバック表示、
+            //     alternate screen = PTY 転送（TUI が自前処理。回帰: Claude Code TUI で
+            //     チャットを遡れない）。転送バイト列の網羅はユニットテスト側
+            let wheel_up = |app: &mut TakoApp, cx: &mut Context<TakoApp>| {
+                let pane = app.focused_pane();
+                let center = app
+                    .pane_text_areas
+                    .iter()
+                    .find(|(id, _)| *id == pane)
+                    .map(|(_, b)| b.center())
+                    .unwrap_or_default();
+                app.on_pane_scroll(
+                    pane,
+                    &ScrollWheelEvent {
+                        position: center,
+                        delta: ScrollDelta::Lines(point(0.0, 2.0)),
+                        ..ScrollWheelEvent::default()
+                    },
+                    cx,
+                );
+            };
+            type_text(any, cx, "seq 200", true);
+            wait(cx, 1000).await;
+            let scrolled_normal = window
+                .update(cx, |app, _, cx| {
+                    wheel_up(app, cx);
+                    let offset = app
+                        .terminals
+                        .get(&app.focused_pane())
+                        .map(|s| s.display_offset())
+                        .unwrap_or(0);
+                    if let Some(s) = app.terminals.get(&app.focused_pane()) {
+                        s.scroll_to_bottom();
+                    }
+                    offset > 0
+                })
+                .unwrap_or(false);
+            check(scrolled_normal, "通常画面のホイールでスクロールバック");
+            // alternate screen 中は自前スクロールせず PTY へ転送される
+            type_text(any, cx, r"printf '\e[?1049h'; sleep 2; printf '\e[?1049l'", true);
+            wait(cx, 800).await;
+            let forwarded_in_alt = window
+                .update(cx, |app, _, cx| {
+                    wheel_up(app, cx);
+                    app.terminals
+                        .get(&app.focused_pane())
+                        .map(|s| s.display_offset())
+                        == Some(0)
+                })
+                .unwrap_or(false);
+            check(forwarded_in_alt, "alt screen のホイールは PTY 転送");
+            wait(cx, 2000).await; // alt screen 解除を待つ
 
             println!("TAKO_APP_SELF_TEST_OK");
             std::process::exit(0);

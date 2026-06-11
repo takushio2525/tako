@@ -304,6 +304,29 @@ impl TerminalSession {
         self.term.lock().scroll_display(Scroll::Delta(delta_lines));
     }
 
+    /// マウスホイール入力。端末モードに応じて PTY 転送（mouse reporting /
+    /// alternate scroll）と自前スクロールバック表示を出し分ける（`wheel_action`）。
+    /// `col` / `row` は表示セル座標（mouse reporting の座標に使う）
+    pub fn scroll_wheel(&self, delta_lines: i32, col: usize, row: usize) {
+        let mode = *self.term.lock().mode();
+        match wheel_action(mode, delta_lines, col, row) {
+            // 転送はスクロールバック表示を動かさない（write() の bottom 戻しも不要）
+            WheelAction::Write(bytes) => self.notifier.notify(bytes),
+            WheelAction::ScrollDisplay(lines) => self.scroll_display(lines),
+            WheelAction::None => {}
+        }
+    }
+
+    /// スクロールバック表示のオフセット（行。0 = 最下部）
+    pub fn display_offset(&self) -> usize {
+        self.term.lock().grid().display_offset()
+    }
+
+    /// スクロールバックに保持している行数
+    pub fn history_size(&self) -> usize {
+        self.term.lock().grid().history_size()
+    }
+
     pub fn scroll_to_bottom(&self) {
         let mut term = self.term.lock();
         if term.grid().display_offset() != 0 {
@@ -437,6 +460,61 @@ impl CommandState {
     }
 }
 
+/// ホイール入力の出し分け先
+#[derive(Debug, PartialEq, Eq)]
+enum WheelAction {
+    /// PTY へ書く（mouse reporting / alternate scroll）
+    Write(Vec<u8>),
+    /// 自前スクロールバック表示を動かす
+    ScrollDisplay(i32),
+    /// 何もしない
+    None,
+}
+
+/// ホイールの定石出し分け（alacritty / iTerm2 と同様）。`delta_lines` 正 = 上（過去）方向:
+/// ① mouse reporting 中 → SGR / X10 のホイールボタンイベントを送る（TUI が自前処理）
+/// ② alternate screen + alternate scroll（ESC[?1007、既定 ON）→ 上下矢印キーに変換
+/// ③ それ以外の alternate screen → 何もしない（スクロールバックが無い）
+/// ④ 通常画面 → 自前スクロールバック表示
+fn wheel_action(mode: TermMode, delta_lines: i32, col: usize, row: usize) -> WheelAction {
+    if delta_lines == 0 {
+        return WheelAction::None;
+    }
+    let count = delta_lines.unsigned_abs() as usize;
+    if mode.intersects(TermMode::MOUSE_MODE) {
+        // ホイールボタン: 64 = 上、65 = 下
+        let button: u8 = if delta_lines > 0 { 64 } else { 65 };
+        let event: Vec<u8> = if mode.contains(TermMode::SGR_MOUSE) {
+            format!("\x1b[<{button};{};{}M", col + 1, row + 1).into_bytes()
+        } else {
+            // X10 形式（各値 +32 の 1 バイト。座標は 223 が上限）
+            vec![
+                0x1b,
+                b'[',
+                b'M',
+                32 + button,
+                32 + (col + 1).min(223) as u8,
+                32 + (row + 1).min(223) as u8,
+            ]
+        };
+        WheelAction::Write(event.repeat(count))
+    } else if mode.contains(TermMode::ALT_SCREEN) {
+        if mode.contains(TermMode::ALTERNATE_SCROLL) {
+            let key: &[u8] = match (mode.contains(TermMode::APP_CURSOR), delta_lines > 0) {
+                (true, true) => b"\x1bOA",
+                (true, false) => b"\x1bOB",
+                (false, true) => b"\x1b[A",
+                (false, false) => b"\x1b[B",
+            };
+            WheelAction::Write(key.repeat(count))
+        } else {
+            WheelAction::None
+        }
+    } else {
+        WheelAction::ScrollDisplay(delta_lines)
+    }
+}
+
 /// コマンド実行状態の遷移。エラー（Failed）はひと目で気づけるよう、
 /// 次のコマンドが実行開始されるまでプロンプトに戻っても保持する（FR-2.1.4）
 fn next_command_state(current: CommandState, mark: PromptMark) -> CommandState {
@@ -511,6 +589,51 @@ mod tests {
         assert_eq!(next_command_state(Failed(1), PromptStart), Failed(1));
         assert_eq!(next_command_state(Failed(1), CommandStart), Failed(1));
         assert_eq!(next_command_state(Failed(1), CommandExecuted), Running);
+    }
+
+    #[test]
+    fn ホイールは端末モードで出し分ける() {
+        let base = TermMode::default(); // ALTERNATE_SCROLL を含む
+        // 通常画面 → 自前スクロールバック
+        assert_eq!(wheel_action(base, 3, 0, 0), WheelAction::ScrollDisplay(3));
+        // alternate screen + alternate scroll → 矢印キー × 行数
+        let alt = base | TermMode::ALT_SCREEN;
+        assert_eq!(
+            wheel_action(alt, 2, 0, 0),
+            WheelAction::Write(b"\x1b[A\x1b[A".to_vec())
+        );
+        assert_eq!(
+            wheel_action(alt, -1, 0, 0),
+            WheelAction::Write(b"\x1b[B".to_vec())
+        );
+        // app cursor モードでは SS3 形式
+        assert_eq!(
+            wheel_action(alt | TermMode::APP_CURSOR, 1, 0, 0),
+            WheelAction::Write(b"\x1bOA".to_vec())
+        );
+        // alternate scroll が明示 OFF なら何もしない
+        assert_eq!(
+            wheel_action(alt - TermMode::ALTERNATE_SCROLL, 1, 0, 0),
+            WheelAction::None
+        );
+        // mouse reporting（SGR）→ ホイールボタンイベント（座標は 1-based）
+        let mouse = alt | TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        assert_eq!(
+            wheel_action(mouse, 1, 4, 2), // col=4, row=2 → 5;3
+            WheelAction::Write(b"\x1b[<64;5;3M".to_vec())
+        );
+        assert_eq!(
+            wheel_action(mouse, -1, 0, 0),
+            WheelAction::Write(b"\x1b[<65;1;1M".to_vec())
+        );
+        // mouse reporting（X10 レガシー）→ +32 バイト形式
+        let x10 = base | TermMode::MOUSE_REPORT_CLICK;
+        assert_eq!(
+            wheel_action(x10, 1, 0, 0),
+            WheelAction::Write(vec![0x1b, b'[', b'M', 96, 33, 33])
+        );
+        // 0 行は無視
+        assert_eq!(wheel_action(base, 0, 0, 0), WheelAction::None);
     }
 
     #[test]
