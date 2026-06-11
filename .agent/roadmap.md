@@ -18,7 +18,9 @@
 - [x] Windows は**調査ベースで成立見込み高と判断**（Zed Windows 正式リリース済み・単体利用実績あり。
       実機が無いため実ビルドは未実施 → 残タスクとして下記に移管）
 - [x] alacritty_terminal + PTY でシェルを起動し、グリッドを GPUI で描画する最小 PoC（macOS、`poc/03-term-poc`）
-- [ ] **（残タスク → Phase 1 へ）** Windows で PoC をビルド・スモーク（GitHub Actions windows ランナーで代替検証）
+- [x] **（残タスク → Phase 1 で完了、2026-06-11）** Windows でのビルド・スモーク:
+      GitHub Actions windows ランナーで本実装ワークスペース（gpui git 版 + alacritty_terminal 含む）の
+      build + test が成功（PoC 相当を上回る検証。Spectre-mitigated libs は CI で追加インストール）
 - [ ] **（残タスク → Phase 6 へ）** Windows 実機での動作検証（ConPTY・IME・フォント描画）
 - [x] PTY クレート確定: **alacritty_terminal::tty**（portable-pty 不要）。非同期: **GPUI executor + futures channel**（tokio 不要）
 - [x] GPUI の Windows 未成熟箇所をリスト化（`architecture.md` の「Phase 0 検証結果」節）
@@ -27,15 +29,17 @@
 調査ベースの判断だが、Zed 本体の正式リリース実績から**スタック採用を確定**。
 GPUI バージョン戦略は **zed リポ git rev 固定**（`architecture.md` 参照）。
 
-## Phase 1: macOS MVP（素のターミナル）
+## Phase 1: macOS MVP（素のターミナル）→ 前半完了（2026-06-11）
 
-- [ ] Cargo ワークスペース構成（tako-core / tako-control / tako-app / tako-cli）確定
-- [ ] タブの作成・切替・クローズ（FR-1.2）
-- [ ] ペイン分割・リサイズ・フォーカス移動（FR-1.3）
-- [ ] PaneTree ドメインモデルと UI の分離（GPUI 非依存の core/）
-- [ ] スクロールバック・コピペ・基本的な使い心地
-- [ ] Windows ビルドを CI（GitHub Actions）に組み込む
-      （**Phase 0 残タスク**: windows ランナーで PoC 相当のビルド・スモークをまず通す。実機が無いため CI が唯一の Windows 検証手段）
+- [x] Cargo ワークスペース構成（tako-core / tako-control / tako-app / tako-cli）確定
+- [x] PaneTree ドメインモデルと UI の分離（GPUI 非依存の core/。分割・削除・フォーカス・リサイズ・
+      均等化・layout 取得、テスト 24 本。操作 API は FR-2.5 と 1:1 対応前提）
+- [x] tako-app がワークスペース構成上で最小ターミナル（1 ペイン）を起動
+      （`TAKO_SELF_TEST=1` で入力 → PTY → グリッド反映を機械検証可能）
+- [x] Windows ビルドを CI（GitHub Actions）に組み込む（macOS / Windows 両ランナーで build + test 緑）
+- [ ] タブの作成・切替・クローズ UI（FR-1.2。ドメインモデルは実装済み、描画と操作が未）
+- [ ] ペイン分割・リサイズ・フォーカス移動 UI（FR-1.3。同上）
+- [ ] スクロールバック・コピペ・基本的な使い心地（色・カーソル描画・PTY リサイズ含む）
 
 **Exit Criteria**: 日常のターミナルとして自分が常用できる（macOS）。
 

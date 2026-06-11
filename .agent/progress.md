@@ -28,3 +28,10 @@
 - Windows は Web 調査で成立見込み高と判断（Zed 正式リリース済み）。実ビルドは Phase 1 CI / Phase 6 実機へ残タスク化。検証結果・ハマりどころは architecture.md / poc/README.md に反映
 - 関連コミット: `c1427b4` `f0e68ff` + ドキュメント反映コミット
 - 次: Phase 1 — Cargo ワークスペース構成と CI（windows スモーク含む）から着手
+
+## 2026-06-11（Phase 1 前半完了 + 仕様拡充）
+
+- 仕様: FR-2.5 AI レイアウト操作セット / 設計原則 5 AI フルコントロール / FR-2.6 注釈レイヤ / FR-3.8 Web ビューペイン（方式候補は architecture.md）を要件化
+- 実装: 4 クレートワークスペース + PaneTree ドメインモデル（GPUI 非依存・テスト 24 本）+ tako-app 最小ターミナル（セルフテスト緑）+ CI が macOS / Windows 両緑（Phase 0 残タスクの Windows スモーク完了）
+- 関連コミット: `c1ae3e0` `bd69d91` `5f26d45` `559bbc5` `d9c5f8b` `fc3dad2`
+- 次: Phase 1 後半 — 複数ペイン描画・タブ UI・スクロールバック
