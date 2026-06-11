@@ -127,3 +127,13 @@
 - CI の fmt 検査落ち（clippy のみ確認していた）を修正し緑復帰。教訓: コミット前は
   `cargo fmt --all --check` も回す
 - 次: FR-2.12（実行体の設計分岐の回答待ち）→ Phase 4 後半
+
+## 2026-06-12（AI 自動リネーム FR-2.12 完成）
+
+- 方式 1 = tako 常駐（ユーザー承認済み）で実装: TitleSource（手動優先）+ タブ rename API
+  （`tako tab rename` / MCP `tako_rename_tab`）+ 検知ループ（autorename.rs、指紋 +
+  デバウンス 4 秒 + クールダウン 30 秒）+ `claude -p --model claude-haiku-4-5-20251001`
+  子プロセス（プロンプト 1 本・タイムアウト 30 秒）+ ヒューリスティックフォールバック +
+  OFF 設定（settings.json + `tako autorename` / MCP。計 17 ツール）。セルフテスト 77 項目緑
+- 次: Phase 4 後半（listen ポート検知 → 提案チップ → 集約センター）。
+  claude 実呼び出しの見た目は常用確認（manual-checks.md）

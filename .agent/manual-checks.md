@@ -95,3 +95,15 @@ role / title の設定・取得自体はセルフテスト（`tako title / role 
 - [ ] Dock から起動した tako 内で Claude Code が MCP 接続できる
       （初回登録済みなら設定ゼロ。`claude mcp list` で tako が ✓）
 - [ ] /Applications へコピーして同上が通る
+
+## AI 自動リネーム（FR-2.12）
+
+トグル・rename API・手動優先・ヒューリスティック適用はセルフテスト（項目 50〜52）で
+機械検証済み。claude CLI を実際に呼ぶ経路と見た目は常用で確認:
+
+- [ ] コマンド実行が一段落して数秒後（静穏 4 秒 + クールダウン 30 秒）、タブ名・ペイン名が
+      作業内容に沿った短い日本語名へ変わる
+- [ ] `tako title` / `tako tab rename` で手動命名したタブ・ペインは自動で上書きされない
+- [ ] `tako tab rename --tab N ''`（空文字）で手動指定が解除され、自動リネームが再開する
+- [ ] `tako autorename off` で止まり、再起動後も OFF が維持される（settings.json）
+- [ ] claude CLI の無い環境（PATH から外す）で OSC タイトル / cwd 由来の名前に劣化する

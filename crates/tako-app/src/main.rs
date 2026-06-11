@@ -13,6 +13,8 @@
 //! IPC・`tako` CLI の e2e）と Phase 3 の内蔵 MCP サーバー（Streamable HTTP +
 //! stdio ブリッジ）、Phase 3.5 の IME 変換状態（marked text）を機械検証して終了する。
 
+mod autorename;
+
 use std::collections::HashMap;
 use std::ops::Range;
 use std::time::Duration;
@@ -31,7 +33,7 @@ use gpui_platform::application;
 use tako_control::{ControlHost, IncomingRequest, IpcServer, McpServer};
 use tako_core::{
     ratio_for_position, CommandState, Pane, PaneId, PaneOrigin, Rect, SelectionKind, SessionNotice,
-    SpawnOptions, SplitAxis, SplitDirection, TabId, TerminalSession, Theme, Workspace,
+    SpawnOptions, SplitAxis, SplitDirection, TabId, TerminalSession, Theme, TitleSource, Workspace,
 };
 
 /// 新規セッションの初期グリッド。最初の render で実寸へリサイズされる
@@ -148,6 +150,32 @@ fn hsla_alpha(c: tako_core::Rgb, a: f32) -> Hsla {
     rgba_alpha(c, a).into()
 }
 
+/// コマンド実行状態のラベル（自動リネームの素材・指紋用。list の表現と揃える）
+fn command_state_label(state: CommandState) -> &'static str {
+    match state {
+        CommandState::Unknown => "unknown",
+        CommandState::Idle => "idle",
+        CommandState::Running => "running",
+        CommandState::Failed(_) => "failed",
+    }
+}
+
+/// 自動リネーム（FR-2.12.4）の起動時の有効判定。
+/// セルフテストでは検知ループを止める（トグル・適用経路だけを機械検証する）。
+/// `TAKO_AUTO_RENAME=0|false|off` は設定ファイルより優先して無効化する
+fn initial_auto_rename() -> bool {
+    if std::env::var_os("TAKO_SELF_TEST").is_some() {
+        return false;
+    }
+    if matches!(
+        std::env::var("TAKO_AUTO_RENAME").ok().as_deref(),
+        Some("0" | "false" | "off")
+    ) {
+        return false;
+    }
+    tako_control::settings::load().auto_rename
+}
+
 /// IME 変換中（未確定文字列 = marked text）の状態（FR-1.9）。
 /// 変換開始時のフォーカスペインを保持し、変換途中でフォーカスが移っても確定先がぶれないようにする
 struct ImeComposition {
@@ -207,6 +235,8 @@ struct TakoApp {
     tmux_sessions: Vec<serde_json::Value>,
     /// kill の確認待ち（セッション名, window index）。誤爆防止（FR-2.13.3）
     tmux_pending_kill: Option<(String, Option<u32>)>,
+    /// タブ・ペイン名の AI 自動リネームの検知状態（FR-2.12。ループは new で張る）
+    autorename: autorename::AutoRenamer,
 }
 
 /// ドラッグ中の境界の情報。座標→比率換算に必要な分割領域と軸を握っておく
@@ -289,6 +319,7 @@ impl TakoApp {
             tmuxview_active: false,
             tmux_sessions: Vec::new(),
             tmux_pending_kill: None,
+            autorename: autorename::AutoRenamer::new(initial_auto_rename()),
         };
         let root_id = app.workspace.active_tab().tree().focused();
         if let Err(e) = app.spawn_session(root_id, SpawnOptions::default(), cx) {
@@ -341,7 +372,158 @@ impl TakoApp {
         })
         .detach();
 
+        // タブ・ペイン名の AI 自動リネーム（FR-2.12）。素材指紋の静穏（デバウンス）を
+        // 検知したタブだけ、バックグラウンドで名前生成（claude / ヒューリスティック）を
+        // 走らせて反映する。判断はプロンプト 1 本（autorename モジュール）に閉じる
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(autorename::POLL_INTERVAL)
+                .await;
+            let Ok(jobs) = this.update(cx, |app: &mut TakoApp, _| app.autorename_jobs()) else {
+                break; // View が破棄された
+            };
+            for materials in jobs {
+                let tab = materials.tab;
+                let plan = cx
+                    .background_executor()
+                    .spawn(async move { autorename::generate(&materials) })
+                    .await;
+                if this
+                    .update(cx, |app: &mut TakoApp, cx| {
+                        app.apply_rename_plan(tab, &plan, cx)
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .detach();
+
         app
+    }
+
+    /// 自動リネームの検知 tick（FR-2.12.2）。タブごとの素材指紋を更新し、
+    /// 静穏（デバウンス済み）で未処理のタブの素材一式を返す
+    fn autorename_jobs(&mut self) -> Vec<autorename::TabMaterials> {
+        let snapshot: Vec<(u64, u64)> = self
+            .workspace
+            .tabs()
+            .iter()
+            .map(|tab| {
+                // 指紋は「節目」だけで取る（cwd / OSC タイトル / 実行状態 / 手動フラグ）。
+                // 画面末尾は実行中に毎 tick 変わり静穏にならないため含めない
+                let parts: Vec<_> = tab
+                    .tree()
+                    .panes()
+                    .iter()
+                    .map(|p| {
+                        let session = self.terminals.get(&p.id());
+                        (
+                            p.id().as_u64(),
+                            p.title_source() == TitleSource::Manual,
+                            p.role().map(str::to_string),
+                            session.and_then(|s| s.title()).map(str::to_string),
+                            session
+                                .and_then(|s| s.cwd())
+                                .map(|c| c.display().to_string()),
+                            session
+                                .map(|s| command_state_label(s.command_state()))
+                                .unwrap_or("none"),
+                        )
+                    })
+                    .collect();
+                let manual_tab = tab.title_source() == TitleSource::Manual;
+                (
+                    tab.id().as_u64(),
+                    autorename::fingerprint(&(manual_tab, parts)),
+                )
+            })
+            .collect();
+        self.autorename
+            .tick(&snapshot, std::time::Instant::now())
+            .into_iter()
+            .filter_map(|tab| self.collect_rename_materials(tab))
+            .collect()
+    }
+
+    /// 命名素材の収集（FR-2.12.1 で list に公開している情報 + 画面末尾）。
+    /// 手動リネーム済みのペインは除外する（FR-2.12.3）。素材が無いタブは None
+    fn collect_rename_materials(&self, tab_id: u64) -> Option<autorename::TabMaterials> {
+        let tab = self
+            .workspace
+            .tabs()
+            .iter()
+            .find(|t| t.id().as_u64() == tab_id)?;
+        let panes: Vec<autorename::PaneMaterials> = tab
+            .tree()
+            .panes()
+            .iter()
+            .filter(|p| p.title_source() != TitleSource::Manual)
+            .map(|p| {
+                let session = self.terminals.get(&p.id());
+                autorename::PaneMaterials {
+                    pane: p.id().as_u64(),
+                    role: p.role().map(str::to_string),
+                    osc_title: session.and_then(|s| s.title()).map(str::to_string),
+                    cwd: session
+                        .and_then(|s| s.cwd())
+                        .map(|c| c.display().to_string()),
+                    state: session
+                        .map(|s| command_state_label(s.command_state()))
+                        .unwrap_or("none"),
+                    tail: autorename::trim_tail(
+                        session.map(|s| s.visible_lines()).unwrap_or_default(),
+                    ),
+                }
+            })
+            .collect();
+        // 命名の手がかりが何も無い（シェル統合なし + 出力なし）タブは呼び出しを浪費しない
+        let has_signal = panes.iter().any(|p| {
+            p.osc_title.is_some() || p.cwd.is_some() || p.state != "unknown" || !p.tail.is_empty()
+        });
+        if panes.is_empty() || !has_signal {
+            return None;
+        }
+        Some(autorename::TabMaterials {
+            tab: tab_id,
+            rename_tab: tab.title_source() != TitleSource::Manual,
+            panes,
+        })
+    }
+
+    /// 生成された名前の反映。手動リネーム済みは set_title_auto 側が拒否する（FR-2.12.3）
+    fn apply_rename_plan(
+        &mut self,
+        tab_id: u64,
+        plan: &autorename::RenamePlan,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab_id) = self
+            .workspace
+            .tabs()
+            .iter()
+            .map(|t| t.id())
+            .find(|t| t.as_u64() == tab_id)
+        else {
+            return; // 生成中に閉じられたタブ
+        };
+        let tab = self
+            .workspace
+            .get_tab_mut(tab_id)
+            .expect("直前に存在確認済み");
+        if let Some(title) = &plan.tab {
+            let _ = tab.set_title_auto(title.clone());
+        }
+        let pane_ids: Vec<PaneId> = tab.tree().panes().iter().map(|p| p.id()).collect();
+        for (id, title) in &plan.panes {
+            if let Some(pane_id) = pane_ids.iter().find(|p| p.as_u64() == *id) {
+                if let Some(pane) = tab.tree_mut().get_mut(*pane_id) {
+                    let _ = pane.set_title_auto(title.clone());
+                }
+            }
+        }
+        cx.notify();
     }
 
     /// tmux 一覧を更新する。UI も CLI / MCP と同じコマンド層（dispatch）を通す
@@ -1138,16 +1320,20 @@ impl TakoApp {
             .iter()
             .map(|tab| {
                 let id = tab.id();
-                // タブ表示名: フォーカス中ペインの OSC タイトルがあれば優先
-                let label = tab
-                    .tree()
-                    .panes()
-                    .iter()
-                    .find(|p| p.id() == tab.tree().focused())
-                    .and_then(|p| self.terminals.get(&p.id()))
-                    .and_then(|s| s.title())
-                    .unwrap_or(tab.title())
-                    .to_string();
+                // タブ表示名: リネーム済み（自動 FR-2.12 / 手動）はタブ名を、
+                // 未設定（連番のまま）はフォーカス中ペインの OSC タイトルを優先する
+                let label = if tab.title_source() == TitleSource::Default {
+                    tab.tree()
+                        .panes()
+                        .iter()
+                        .find(|p| p.id() == tab.tree().focused())
+                        .and_then(|p| self.terminals.get(&p.id()))
+                        .and_then(|s| s.title())
+                        .unwrap_or(tab.title())
+                        .to_string()
+                } else {
+                    tab.title().to_string()
+                };
                 // タブ内ペイン状態の集約ドット（FR-2.1.4）: エラー > 実行中のみ表示
                 let dot = match CommandState::aggregate(
                     tab.tree()
@@ -1502,6 +1688,22 @@ impl ControlHost for TakoApp {
 
     fn detach_session(&mut self, pane: PaneId) {
         self.terminals.remove(&pane);
+    }
+
+    fn auto_rename_enabled(&self) -> bool {
+        self.autorename.enabled
+    }
+
+    fn set_auto_rename(&mut self, enabled: bool) {
+        self.autorename.enabled = enabled;
+        // 永続化（FR-2.12.4）。セルフテスト中はユーザー設定を汚さない
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.auto_rename = enabled;
+            if let Err(e) = tako_control::settings::save(&settings) {
+                eprintln!("warning: 設定を保存できない: {e}");
+            }
+        }
     }
 }
 
@@ -2896,7 +3098,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 15, "MCP tools/list は 15 ツール");
+            check(status == 200 && tool_count == 17, "MCP tools/list は 17 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -3522,6 +3724,82 @@ mod self_test {
                 })
                 .unwrap_or(false);
             check(view_ok, "tmuxview の表示・確認フロー・復帰");
+
+            // 50. tako tab rename（FR-2.12.1）: 呼び出し元ペインからタブを解決し、
+            //     明示リネームは手動扱い（title_source = manual）でタブ表示名になる
+            let (active_tab, active_pane) = window
+                .update(cx, |app, _, _| {
+                    (app.workspace.active_tab_id(), app.focused_pane())
+                })
+                .unwrap_or_else(|_| fail("FR-2.12 開始時の状態取得"));
+            press(any, cx, "ctrl-u");
+            type_text(any, cx, &format!("{cli} tab rename 実験タブ"), true);
+            wait(cx, 1000).await;
+            let renamed = window
+                .update(cx, |app, _, _| {
+                    app.workspace
+                        .get_tab(active_tab)
+                        .map(|t| {
+                            t.title() == "実験タブ" && t.title_source() == TitleSource::Manual
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            check(renamed, "tako tab rename（手動扱い）");
+
+            // 51. 自動リネームの適用と手動優先（FR-2.12.3）: 手動のタブ・ペインは
+            //     上書きされず、手動指定の解除後は同じ plan が反映される
+            let apply_ok = window
+                .update(cx, |app, _, cx| {
+                    let tab_u = active_tab.as_u64();
+                    let tab = app.workspace.get_tab_mut(active_tab).expect("タブはある");
+                    if let Some(pane) = tab.tree_mut().get_mut(active_pane) {
+                        pane.set_title(Some("手動名".into()));
+                    }
+                    let plan = autorename::RenamePlan {
+                        tab: Some("自動タブ".into()),
+                        panes: vec![(active_pane.as_u64(), "自動ペイン".into())],
+                    };
+                    app.apply_rename_plan(tab_u, &plan, cx);
+                    let tab = app.workspace.get_tab(active_tab).expect("タブはある");
+                    let kept = tab.title() == "実験タブ"
+                        && tab.tree().get(active_pane).and_then(|p| p.title()) == Some("手動名");
+                    // 手動指定を解除すると自動が効くようになる
+                    let tab = app.workspace.get_tab_mut(active_tab).expect("タブはある");
+                    tab.clear_manual_title();
+                    if let Some(pane) = tab.tree_mut().get_mut(active_pane) {
+                        pane.set_title(None);
+                    }
+                    app.apply_rename_plan(tab_u, &plan, cx);
+                    let tab = app.workspace.get_tab(active_tab).expect("タブはある");
+                    kept && tab.title() == "自動タブ"
+                        && tab.title_source() == TitleSource::Auto
+                        && tab.tree().get(active_pane).and_then(|p| p.title())
+                            == Some("自動ペイン")
+                })
+                .unwrap_or(false);
+            check(apply_ok, "自動リネームの適用と手動優先");
+
+            // 52. tako autorename の ON/OFF と状態取得（FR-2.12.4。CLI / MCP と同じ
+            //     dispatch 経路。セルフテスト中は設定ファイルへ永続化しない）
+            type_text(
+                any,
+                cx,
+                &format!(
+                    "{cli} autorename off >/dev/null && {cli} autorename \
+                     | grep -q '\"enabled\":false' && echo TAKO-AR-$((50+2))"
+                ),
+                true,
+            );
+            wait(cx, 1200).await;
+            check(
+                focused_contains(window, cx, "TAKO-AR-52"),
+                "tako autorename off / 状態取得",
+            );
+            let toggled = window
+                .update(cx, |app, _, _| !app.autorename.enabled)
+                .unwrap_or(false);
+            check(toggled, "自動リネームの無効化が検知ループへ反映");
 
             println!("TAKO_APP_SELF_TEST_OK");
             std::process::exit(0);

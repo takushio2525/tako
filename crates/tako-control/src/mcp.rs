@@ -335,6 +335,21 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_rename_tab",
+            "description": "タブの表示タイトルを変更する（FR-2.12.1）。明示リネームとして\
+                自動リネームより優先される。空文字を渡すと手動指定を解除し、\
+                自動リネーム（有効時）が再びタブ名を更新するようになる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tab": { "type": "integer", "minimum": 0, "description": "対象タブ ID（省略時は呼び出し元ペインのタブ）" },
+                    "title": { "type": "string", "description": "新しいタブタイトル（空文字で手動指定を解除）" },
+                },
+                "required": ["title"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_create_tab",
             "description": "新しいタブ（= エージェントグループ）を作り、タブ ID と初期ペイン ID を返す。\
                 いまのタブと無関係な作業系列を始めるときに使う（1 グループ = 1 タブ）。",
@@ -368,6 +383,19 @@ pub fn tools() -> Vec<Value> {
                     "pane": pane_schema("対象ペイン ID（省略時は呼び出し元）"),
                 },
                 "required": ["tab"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_auto_rename",
+            "description": "タブ・ペイン名の AI 自動リネーム（FR-2.12）の ON/OFF を切り替える\
+                （enabled 省略時は現在状態の取得のみ）。設定は永続化される。\
+                手動で付けた名前（tako_set_title / tako_rename_tab）は自動より常に優先される。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "enabled": { "type": "boolean", "description": "true = 有効化、false = 無効化（省略時は状態取得）" },
+                },
                 "additionalProperties": false,
             },
         }),
@@ -468,6 +496,19 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             title: str_arg(args, "title")?,
             role: str_arg(args, "role")?,
         },
+        "tako_rename_tab" => {
+            let tab = u64_arg(args, "tab")?;
+            Request::TabRename {
+                // tab 省略時は呼び出し元ペインからタブを解決する（Equalize と同パターン）
+                pane: if tab.is_none() {
+                    Some(target_pane(args, caller)?)
+                } else {
+                    None
+                },
+                tab,
+                title: str_arg(args, "title")?.ok_or("title を指定する")?,
+            }
+        }
         "tako_create_tab" => Request::TabNew {
             title: str_arg(args, "title")?,
         },
@@ -477,6 +518,9 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
         "tako_move_pane_to_tab" => Request::MovePane {
             pane: Some(target_pane(args, caller)?),
             tab: required_u64(args, "tab")?,
+        },
+        "tako_auto_rename" => Request::AutoRename {
+            enabled: bool_arg(args, "enabled")?,
         },
         _ => return Err(format!("不明なツール: {name}")),
     })
@@ -793,7 +837,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 15);
+        assert_eq!(tools.len(), 17);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

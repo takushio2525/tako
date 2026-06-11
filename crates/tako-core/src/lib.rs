@@ -16,7 +16,7 @@ pub mod tmux;
 pub mod workspace;
 
 pub use osc_tap::{OscEvent, PromptMark};
-pub use pane::{Pane, PaneId, PaneOrigin};
+pub use pane::{Pane, PaneId, PaneOrigin, TitleSource};
 pub use pane_tree::{
     ratio_for_position, PaneBorder, PaneNode, PaneTree, PaneTreeError, Rect, SplitAxis,
     SplitDirection,

@@ -26,6 +26,12 @@ pub trait ControlHost {
     fn attach_session(&mut self, pane: PaneId, options: SpawnOptions);
     /// 閉じられたペインのセッションを破棄する
     fn detach_session(&mut self, pane: PaneId);
+    /// AI 自動リネーム（FR-2.12.4）の現在状態。UI 層が検知ループの状態を返す
+    fn auto_rename_enabled(&self) -> bool {
+        true
+    }
+    /// AI 自動リネームの ON/OFF 切替（永続化は実装側の責務）
+    fn set_auto_rename(&mut self, _enabled: bool) {}
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -302,11 +308,37 @@ pub fn dispatch(
             Ok(json!({ "killed": session, "window": window }))
         }
 
+        Request::TabRename { pane, tab, title } => {
+            let tab_id = match tab {
+                Some(raw) => find_tab(host.workspace(), raw)?,
+                None => resolve_pane(host.workspace(), pane)?.0,
+            };
+            let tab = host
+                .workspace_mut()
+                .get_tab_mut(tab_id)
+                .expect("find_tab / resolve_pane で存在確認済み");
+            if title.is_empty() {
+                // 空文字 = 手動指定の解除（タイトルは保持し、自動リネームを再開させる）
+                tab.clear_manual_title();
+            } else {
+                tab.set_title_manual(title);
+            }
+            Ok(json!({ "tab": tab_id.as_u64(), "title": tab.title() }))
+        }
+
         Request::TabNew { title } => {
             let pane = Pane::new(origin);
             let pane_id = pane.id();
+            let explicit = title.is_some();
             let title = title.unwrap_or_else(|| format!("{}", host.workspace().tabs().len() + 1));
             let tab_id = host.workspace_mut().create_tab(title, pane);
+            if explicit {
+                // 明示タイトル付きの作成は手動リネーム扱い（自動リネームに上書きさせない）
+                if let Some(tab) = host.workspace_mut().get_tab_mut(tab_id) {
+                    let title = tab.title().to_string();
+                    tab.set_title_manual(title);
+                }
+            }
             host.attach_session(pane_id, SpawnOptions::default());
             Ok(json!({ "tab": tab_id.as_u64(), "pane": pane_id.as_u64() }))
         }
@@ -324,6 +356,13 @@ pub fn dispatch(
                 .move_pane(target, dest)
                 .map_err(op_err)?;
             Ok(Value::Null)
+        }
+
+        Request::AutoRename { enabled } => {
+            if let Some(enabled) = enabled {
+                host.set_auto_rename(enabled);
+            }
+            Ok(json!({ "enabled": host.auto_rename_enabled() }))
         }
     }
 }
@@ -380,6 +419,8 @@ fn list_json(host: &dyn ControlHost) -> Value {
                     json!({
                         "id": p.id().as_u64(),
                         "title": p.title(),
+                        // title の出どころ（FR-2.12.3。manual は自動リネームに上書きされない）
+                        "title_source": title_source_str(p.title_source()),
                         "osc_title": session.and_then(|s| s.title()),
                         "role": p.role(),
                         "origin": origin_str(p.origin()),
@@ -411,6 +452,7 @@ fn list_json(host: &dyn ControlHost) -> Value {
             json!({
                 "id": tab.id().as_u64(),
                 "title": tab.title(),
+                "title_source": title_source_str(tab.title_source()),
                 "active": tab.id() == ws.active_tab_id(),
                 "focused_pane": tree.focused().as_u64(),
                 "panes": panes,
@@ -419,6 +461,15 @@ fn list_json(host: &dyn ControlHost) -> Value {
         })
         .collect();
     json!({ "active_tab": ws.active_tab_id().as_u64(), "tabs": tabs })
+}
+
+/// タイトルの出どころの文字列表現（list / MCP 公開用。FR-2.12.1）
+fn title_source_str(source: tako_core::TitleSource) -> &'static str {
+    match source {
+        tako_core::TitleSource::Default => "default",
+        tako_core::TitleSource::Auto => "auto",
+        tako_core::TitleSource::Manual => "manual",
+    }
 }
 
 /// コマンド実行状態の文字列表現（list / MCP 公開用）
@@ -825,6 +876,72 @@ mod tests {
         let tab1 = host.ws.tabs()[0].id().as_u64();
         dispatch(&mut host, Request::TabSelect { tab: tab1 }, PaneOrigin::Cli).unwrap();
         assert_eq!(host.ws.active_tab_id().as_u64(), tab1);
+    }
+
+    #[test]
+    fn タブのリネームと手動優先() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        // pane からタブを解決してリネーム（FR-2.12.1）
+        let result = dispatch(
+            &mut host,
+            Request::TabRename {
+                pane: Some(root),
+                tab: None,
+                title: "実験".into(),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["title"].as_str(), Some("実験"));
+        let tab = &host.ws.tabs()[0];
+        assert_eq!(tab.title(), "実験");
+        assert_eq!(tab.title_source(), tako_core::TitleSource::Manual);
+        // list に title_source が公開される
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        assert_eq!(list["tabs"][0]["title_source"].as_str(), Some("manual"));
+        assert_eq!(
+            list["tabs"][0]["panes"][0]["title_source"].as_str(),
+            Some("default")
+        );
+        // 空文字で手動指定を解除（タイトルは保持）
+        let tab_id = host.ws.tabs()[0].id().as_u64();
+        dispatch(
+            &mut host,
+            Request::TabRename {
+                pane: None,
+                tab: Some(tab_id),
+                title: String::new(),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let tab = &host.ws.tabs()[0];
+        assert_eq!(tab.title(), "実験");
+        assert_eq!(tab.title_source(), tako_core::TitleSource::Default);
+    }
+
+    #[test]
+    fn 明示タイトル付きのタブ作成は手動扱い() {
+        let mut host = MockHost::new();
+        dispatch(
+            &mut host,
+            Request::TabNew {
+                title: Some("agents".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            host.ws.active_tab().title_source(),
+            tako_core::TitleSource::Manual
+        );
+        // 連番の既定タイトルは Default のまま（自動リネーム対象）
+        dispatch(&mut host, Request::TabNew { title: None }, PaneOrigin::Cli).unwrap();
+        assert_eq!(
+            host.ws.active_tab().title_source(),
+            tako_core::TitleSource::Default
+        );
     }
 
     #[test]

@@ -139,12 +139,22 @@ pub enum Request {
         session: String,
         window: Option<u32>,
     },
+    /// タブのリネーム（FR-2.12.1）。`tab` 省略時は `pane`（呼び出し元）の属するタブ。
+    /// 明示リネームとして自動リネーム（FR-2.12）より優先され、空文字で手動指定を解除する
+    TabRename {
+        pane: Option<u64>,
+        tab: Option<u64>,
+        title: String,
+    },
     /// タブ作成（FR-2.5.10）
     TabNew { title: Option<String> },
     /// タブ切替（FR-2.5.10）
     TabSelect { tab: u64 },
     /// ペインの別タブへの移送（FR-2.5.10）
     MovePane { pane: Option<u64>, tab: u64 },
+    /// タブ・ペイン名の AI 自動リネーム（FR-2.12.4）の ON/OFF。
+    /// `enabled` 省略時は現在状態の取得のみ。設定は永続化される
+    AutoRename { enabled: Option<bool> },
 }
 
 /// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。

@@ -59,9 +59,11 @@ enum Command {
     Resize(ResizeArgs),
     /// タブ内の全ペインのサイズを均等化する
     Equalize(EqualizeArgs),
-    /// タブ操作（new / select / move-pane）
+    /// タブ操作（new / rename / select / move-pane）
     #[command(subcommand)]
     Tab(TabCommand),
+    /// タブ・ペイン名の AI 自動リネーム（FR-2.12）の ON/OFF・状態確認
+    Autorename(AutorenameArgs),
     /// tmux セッションの一覧・kill（FR-2.13。消し忘れ tmux の発見と片付け）
     #[command(subcommand)]
     Tmux(TmuxCommand),
@@ -224,6 +226,13 @@ struct ResizeArgs {
 }
 
 #[derive(Args)]
+struct AutorenameArgs {
+    /// on = 有効化、off = 無効化（省略時は現在状態を表示）
+    #[arg(value_parser = ["on", "off"])]
+    state: Option<String>,
+}
+
+#[derive(Args)]
 struct EqualizeArgs {
     /// 対象タブ ID（省略時は呼び出し元ペインの属するタブ）
     #[arg(long)]
@@ -237,6 +246,14 @@ enum TabCommand {
         /// タブのタイトル（省略時は連番）
         #[arg(long)]
         title: Option<String>,
+    },
+    /// タブの表示タイトルを変える（明示リネーム = 自動リネームより優先。空文字で解除）
+    Rename {
+        /// 対象タブ ID（省略時は呼び出し元ペインの属するタブ）
+        #[arg(long)]
+        tab: Option<u64>,
+        /// 新しいタイトル（複数引数はスペース連結。空文字で手動指定を解除）
+        title: Vec<String>,
     },
     /// タブを切り替える
     Select { tab: u64 },
@@ -434,10 +451,23 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Tab(TabCommand::New { title }) => Request::TabNew {
             title: title.clone(),
         },
+        Command::Tab(TabCommand::Rename { tab, title }) => Request::TabRename {
+            // --tab 指定があればそれを、無ければ呼び出し元ペインからタブを解決する
+            pane: if tab.is_none() {
+                target_pane(None)?
+            } else {
+                None
+            },
+            tab: *tab,
+            title: title.join(" "),
+        },
         Command::Tab(TabCommand::Select { tab }) => Request::TabSelect { tab: *tab },
         Command::Tab(TabCommand::MovePane { tab, pane }) => Request::MovePane {
             pane: target_pane(*pane)?,
             tab: *tab,
+        },
+        Command::Autorename(args) => Request::AutoRename {
+            enabled: args.state.as_deref().map(|s| s == "on"),
         },
         Command::Tmux(TmuxCommand::List { socket }) => Request::TmuxList {
             socket: socket.clone(),
@@ -517,6 +547,7 @@ fn print_result(command: &Command, result: &Value) {
             );
         }
         Command::Tab(TabCommand::New { .. }) => println!("{result}"),
+        Command::Autorename(_) => println!("{result}"),
         Command::Tmux(TmuxCommand::List { .. }) => {
             println!(
                 "{}",
@@ -723,6 +754,19 @@ mod tests {
         assert_eq!(
             build_request(&command).unwrap(),
             Request::TabSelect { tab: 2 }
+        );
+    }
+
+    #[test]
+    fn tab_renameはタイトルを連結しタブ指定を解釈する() {
+        let command = parse(&["tako", "tab", "rename", "--tab", "3", "実験", "用"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::TabRename {
+                pane: None,
+                tab: Some(3),
+                title: "実験 用".into(),
+            }
         );
     }
 }

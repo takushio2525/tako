@@ -3,7 +3,7 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::pane::Pane;
+use crate::pane::{Pane, TitleSource};
 use crate::pane_tree::PaneTree;
 
 /// プロセス生存期間中ユニークなタブ ID（`TAKO_TAB_ID` として外部公開される）
@@ -32,6 +32,8 @@ impl fmt::Display for TabId {
 pub struct Tab {
     id: TabId,
     title: String,
+    /// `title` の出どころ（FR-2.12.3。Default = 初期連番のまま）
+    title_source: TitleSource,
     tree: PaneTree,
 }
 
@@ -40,6 +42,7 @@ impl Tab {
         Self {
             id: TabId::next(),
             title: title.into(),
+            title_source: TitleSource::Default,
             tree: PaneTree::new(root_pane),
         }
     }
@@ -52,8 +55,34 @@ impl Tab {
         &self.title
     }
 
+    pub fn title_source(&self) -> TitleSource {
+        self.title_source
+    }
+
+    /// 初期タイトルの差し替え（出どころは変えない。UI の連番付け直し等）
     pub fn set_title(&mut self, title: impl Into<String>) {
         self.title = title.into();
+    }
+
+    /// 明示リネーム（`tako tab rename` / MCP / UI。FR-2.12.3 で自動より優先される）
+    pub fn set_title_manual(&mut self, title: impl Into<String>) {
+        self.title = title.into();
+        self.title_source = TitleSource::Manual;
+    }
+
+    /// 手動リネームの解除。タイトルは保持しつつ Default に戻し、自動リネームを再開させる
+    pub fn clear_manual_title(&mut self) {
+        self.title_source = TitleSource::Default;
+    }
+
+    /// 自動リネーム（FR-2.12）。Manual 設定済みなら上書きせず false を返す
+    pub fn set_title_auto(&mut self, title: impl Into<String>) -> bool {
+        if self.title_source == TitleSource::Manual {
+            return false;
+        }
+        self.title = title.into();
+        self.title_source = TitleSource::Auto;
+        true
     }
 
     pub fn tree(&self) -> &PaneTree {
@@ -67,5 +96,26 @@ impl Tab {
     /// タブを消費してペインツリーを取り出す（ペインの別タブ移送で使う）
     pub fn into_tree(self) -> PaneTree {
         self.tree
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pane::PaneOrigin;
+
+    #[test]
+    fn 手動タイトルは自動に上書きされずクリアで再開する() {
+        let mut tab = Tab::new("1", Pane::new(PaneOrigin::User));
+        assert_eq!(tab.title_source(), TitleSource::Default);
+        assert!(tab.set_title_auto("ビルド"));
+        assert_eq!(tab.title(), "ビルド");
+        assert_eq!(tab.title_source(), TitleSource::Auto);
+        tab.set_title_manual("agents");
+        assert!(!tab.set_title_auto("別名"));
+        assert_eq!(tab.title(), "agents");
+        tab.clear_manual_title();
+        assert!(tab.set_title_auto("再開"));
+        assert_eq!(tab.title(), "再開");
     }
 }
