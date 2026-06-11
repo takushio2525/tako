@@ -5449,6 +5449,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui_platform",
+ "tako-control",
  "tako-core",
 ]
 

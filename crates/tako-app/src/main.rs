@@ -9,11 +9,13 @@
 //! 同じ API を将来 MCP / CLI からも呼ぶため、UI に閉じたロジックを作らない）。
 //!
 //! `TAKO_SELF_TEST=1` で起動すると、キーディスパッチ経由で入力・分割・タブ・色・
-//! スクロールバック・コピペの経路を機械検証して終了する。
+//! スクロールバック・コピペの経路に加え、Phase 2 の制御プレーン（環境変数注入・
+//! IPC・`tako` CLI の e2e）を機械検証して終了する。
 
 use std::collections::HashMap;
 use std::time::Duration;
 
+use futures::channel::mpsc::unbounded;
 use futures::StreamExt;
 use gpui::{
     actions, div, point, prelude::*, px, relative, size, App, Bounds, ClipboardItem, Context,
@@ -23,6 +25,7 @@ use gpui::{
     UnderlineStyle, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
+use tako_control::{ControlHost, IncomingRequest, IpcServer};
 use tako_core::{
     Pane, PaneId, PaneOrigin, Rect, SelectionKind, SessionNotice, SpawnOptions, SplitAxis,
     SplitDirection, TabId, TerminalSession, Theme, Workspace,
@@ -129,12 +132,27 @@ struct TakoApp {
     selecting: Option<PaneId>,
     /// 直近 render でのアクティブタブ各ペインのテキスト領域（マウス座標→セル変換用）
     pane_text_areas: Vec<(PaneId, Bounds<Pixels>)>,
+    /// Layer 1 IPC サーバー（FR-2.2 の受け口。起動失敗時は None で IPC なし動作）
+    ipc: Option<IpcServer>,
+    /// dispatch 中に依頼されたセッション起動（GPUI の Context が要るため遅延実行する）
+    pending_attach: Vec<(PaneId, SpawnOptions)>,
 }
 
 impl TakoApp {
     fn new(cx: &mut Context<Self>) -> Self {
+        // IPC サーバー（Layer 1 の受け口）。最初のセッション起動より前に立てて
+        // ルートペインのシェルにも TAKO_SOCKET / TAKO_TOKEN を注入できるようにする
+        let (control_tx, mut control_rx) = unbounded::<IncomingRequest>();
+        let ipc = match IpcServer::start(control_tx) {
+            Ok(server) => Some(server),
+            Err(e) => {
+                eprintln!("warning: IPC サーバーを起動できない（tako CLI は使えない）: {e}");
+                None
+            }
+        };
+
         let mut app = Self {
-            // ルートペインは下の spawn_pane で差し替える（Workspace::new がペインを要求するため仮を渡す）
+            // ルートペインは下の spawn_session でセッションを張る
             workspace: Workspace::new("1", Pane::new(PaneOrigin::User)),
             terminals: HashMap::new(),
             theme: Theme::default(),
@@ -142,18 +160,63 @@ impl TakoApp {
             cell_size: None,
             selecting: None,
             pane_text_areas: Vec::new(),
+            ipc,
+            pending_attach: Vec::new(),
         };
-        // 仮ルートペインにセッションを張る
         let root_id = app.workspace.active_tab().tree().focused();
-        app.attach_session(root_id, cx);
+        app.spawn_session(root_id, SpawnOptions::default(), cx);
+
+        // IPC リクエストを UI スレッドで dispatch するループ。
+        // 操作セマンティクスは tako-control::dispatch に一元化されている（設計原則 5）
+        cx.spawn(async move |this, cx| {
+            while let Some(incoming) = control_rx.next().await {
+                let result = this.update(cx, |app: &mut TakoApp, cx| {
+                    let result = tako_control::dispatch(app, incoming.request, PaneOrigin::Cli);
+                    // dispatch が依頼したセッション起動をここで実行（Context が要るため）
+                    for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                        app.spawn_session(pane, options, cx);
+                    }
+                    cx.notify();
+                    result
+                });
+                match result {
+                    // 接続が先に切れていても無視してよい
+                    Ok(result) => {
+                        let _ = incoming.reply.send(result);
+                    }
+                    Err(_) => break, // View が破棄された
+                }
+            }
+        })
+        .detach();
+
         app
     }
 
-    /// ペイン ID に対する新しい TerminalSession を起動し、イベント中継タスクを張る
-    fn attach_session(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
-        let (session, mut rx) =
-            TerminalSession::spawn(INITIAL_COLS, INITIAL_ROWS, SpawnOptions::default())
-                .expect("PTY 付きシェルを起動できなかった");
+    /// ペイン ID に対する新しい TerminalSession を起動し、イベント中継タスクを張る。
+    /// 制御プレーンの接続情報を環境変数で注入する（FR-2.1.1）
+    fn spawn_session(
+        &mut self,
+        pane_id: PaneId,
+        mut options: SpawnOptions,
+        cx: &mut Context<Self>,
+    ) {
+        options
+            .env
+            .push(("TAKO_PANE_ID".into(), pane_id.to_string()));
+        if let Some(tab_id) = self.workspace.find_tab_of_pane(pane_id) {
+            options.env.push(("TAKO_TAB_ID".into(), tab_id.to_string()));
+        }
+        if let Some(ipc) = &self.ipc {
+            options
+                .env
+                .push(("TAKO_SOCKET".into(), ipc.endpoint().to_string()));
+            options
+                .env
+                .push(("TAKO_TOKEN".into(), ipc.token().to_string()));
+        }
+        let (session, mut rx) = TerminalSession::spawn(INITIAL_COLS, INITIAL_ROWS, options)
+            .expect("PTY 付きシェルを起動できなかった");
         self.terminals.insert(pane_id, session);
         cx.spawn(async move |this, cx| {
             while let Some(event) = rx.next().await {
@@ -208,7 +271,7 @@ impl TakoApp {
             .split(target, direction, pane)
             .is_ok()
         {
-            self.attach_session(pane_id, cx);
+            self.spawn_session(pane_id, SpawnOptions::default(), cx);
         }
         cx.notify();
     }
@@ -287,7 +350,7 @@ impl TakoApp {
         let pane = Pane::new(PaneOrigin::User);
         let pane_id = pane.id();
         self.workspace.create_tab(title, pane);
-        self.attach_session(pane_id, cx);
+        self.spawn_session(pane_id, SpawnOptions::default(), cx);
         cx.notify();
     }
 
@@ -628,6 +691,31 @@ impl TakoApp {
     }
 }
 
+/// tako-control の dispatch がドメイン状態へ触るためのホスト実装。
+/// セッション起動だけは GPUI の Context が要るため `pending_attach` へ積み、
+/// dispatch 直後（IPC リクエストループ内）で実行する
+impl ControlHost for TakoApp {
+    fn workspace(&self) -> &Workspace {
+        &self.workspace
+    }
+
+    fn workspace_mut(&mut self) -> &mut Workspace {
+        &mut self.workspace
+    }
+
+    fn session(&self, pane: PaneId) -> Option<&TerminalSession> {
+        self.terminals.get(&pane)
+    }
+
+    fn attach_session(&mut self, pane: PaneId, options: SpawnOptions) {
+        self.pending_attach.push((pane, options));
+    }
+
+    fn detach_session(&mut self, pane: PaneId) {
+        self.terminals.remove(&pane);
+    }
+}
+
 /// 文字数ベースの単純な切り詰め（タブ表示名用）
 fn truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
@@ -823,7 +911,8 @@ fn main() {
 }
 
 /// セルフテスト: キーディスパッチ経由で入力・分割・フォーカス・リサイズ・タブ・色・
-/// スクロールバック・コピペの経路を機械検証して終了する。
+/// スクロールバック・コピペの経路（1〜13）と、制御プレーンの環境変数注入 +
+/// ペイン内シェルから実 `tako` CLI を叩く e2e（14〜29）を機械検証して終了する。
 /// `WindowHandle<V>::update` 内の dispatch_keystroke はルートビューの二重借用で
 /// パニックするため AnyWindowHandle::update を使う（poc/README.md）
 mod self_test {
@@ -1092,6 +1181,254 @@ mod self_test {
                 })
                 .unwrap_or(false);
             check(resized, "PTY リサイズ追従");
+
+            // --- Phase 2: 制御プレーン（環境変数注入 + IPC + tako CLI の e2e）---
+            // ここからはペイン内のシェルから実際に `tako` CLI を叩いて検証する。
+            // 出力マーカーは `$((40+2))` で組み立て、入力エコー行との誤一致を防ぐ
+
+            // 14. CLI バイナリの準備（target/debug/tako。常にビルドして鮮度を保証）
+            let cli = {
+                let built = std::process::Command::new("cargo")
+                    .args(["build", "-p", "tako-cli", "--quiet"])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                let path = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.join("tako")))
+                    .filter(|p| p.exists());
+                let Some(path) = path else {
+                    fail("tako CLI のビルド / パス特定");
+                };
+                check(built, "tako CLI のビルド");
+                format!("\"{}\"", path.display())
+            };
+
+            // 現状: タブ 1 = {ペイン 2}（アクティブ・フォーカス中）、タブ 2 = {ペイン 3}
+            let (pane2, tab1) = window
+                .update(cx, |app, _, _| {
+                    (app.focused_pane(), app.workspace.active_tab_id())
+                })
+                .unwrap_or_else(|_| fail("Phase 2 開始時の状態取得"));
+
+            // 15. TAKO_PANE_ID / TAKO_TAB_ID の注入（FR-2.1.1）
+            type_text(any, cx, "echo P=$TAKO_PANE_ID,T=$TAKO_TAB_ID", true);
+            wait(cx, 800).await;
+            check(
+                focused_contains(window, cx, &format!("P={pane2},T={tab1}")),
+                "TAKO_PANE_ID / TAKO_TAB_ID 注入",
+            );
+
+            // 16. TAKO_SOCKET（ソケットファイル実在）と TAKO_TOKEN の注入
+            type_text(
+                any,
+                cx,
+                "test -S \"$TAKO_SOCKET\" && [ -n \"$TAKO_TOKEN\" ] && echo TAKO-SOCK-$((40+2))",
+                true,
+            );
+            wait(cx, 800).await;
+            check(
+                focused_contains(window, cx, "TAKO-SOCK-42"),
+                "TAKO_SOCKET / TAKO_TOKEN 注入",
+            );
+
+            // 17. tako list がペイン内シェルから成功する（FR-2.2.4 / FR-2.2.7）
+            type_text(
+                any,
+                cx,
+                &format!("{cli} list >/dev/null && echo TAKO-LIST-$((40+2))"),
+                true,
+            );
+            wait(cx, 1000).await;
+            check(focused_contains(window, cx, "TAKO-LIST-42"), "tako list");
+
+            // 18. tako split --down（呼び出し元の自動特定 + origin=cli + フォーカス移動）
+            type_text(any, cx, &format!("{cli} split --down"), true);
+            wait(cx, 1500).await;
+            let (pane_count, pane4, origin_cli) = window
+                .update(cx, |app, _, _| {
+                    let tree = app.workspace.active_tab().tree();
+                    let focused = tree.focused();
+                    (
+                        tree.len(),
+                        focused,
+                        tree.get(focused).map(|p| p.origin()) == Some(PaneOrigin::Cli),
+                    )
+                })
+                .unwrap_or_else(|_| fail("tako split 後の状態取得"));
+            check(pane_count == 2, "tako split で 2 ペイン");
+            check(pane4 != pane2, "split 後フォーカスは新ペイン");
+            check(origin_cli, "新ペインの origin は cli");
+
+            // 19. tako send で別ペインへコマンドを流し込む（FR-2.2.2。pane4 から pane2 へ）
+            type_text(
+                any,
+                cx,
+                &format!("{cli} send --pane {pane2} 'echo TAKO-SEND-$((40+2))'"),
+                true,
+            );
+            wait(cx, 1200).await;
+            let sent = window
+                .update(cx, |app, _, _| {
+                    app.terminals
+                        .get(&pane2)
+                        .map(|s| s.visible_lines().iter().any(|l| l.contains("TAKO-SEND-42")))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            check(sent, "tako send で別ペインへ送信");
+
+            // 20. tako read で別ペインの画面内容を取得する（FR-2.2.5）
+            type_text(
+                any,
+                cx,
+                &format!(
+                    "{cli} read --pane {pane2} | grep -q TAKO-SEND-42 && echo TAKO-READ-$((40+2))"
+                ),
+                true,
+            );
+            wait(cx, 1000).await;
+            check(focused_contains(window, cx, "TAKO-READ-42"), "tako read");
+
+            // 21. tako title --role（FR-2.2.6 / FR-2.1.3）
+            type_text(
+                any,
+                cx,
+                &format!("{cli} title --pane {pane2} --role worker-1 REVIEWER"),
+                true,
+            );
+            wait(cx, 800).await;
+            let titled = window
+                .update(cx, |app, _, _| {
+                    app.workspace
+                        .get_tab(tab1)
+                        .and_then(|t| t.tree().get(pane2))
+                        .map(|p| p.title() == Some("REVIEWER") && p.role() == Some("worker-1"))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            check(titled, "tako title / role 設定");
+
+            // 22. tako resize --share-y（FR-2.5.6。pane2 の縦取り分を 0.7 へ）
+            type_text(
+                any,
+                cx,
+                &format!("{cli} resize --pane {pane2} --share-y 0.7"),
+                true,
+            );
+            wait(cx, 800).await;
+            let share = window
+                .update(cx, |app, _, _| {
+                    app.workspace
+                        .active_tab()
+                        .tree()
+                        .layout(Rect::UNIT)
+                        .into_iter()
+                        .find(|(id, _)| *id == pane2)
+                        .map(|(_, r)| r.height)
+                        .unwrap_or(0.0)
+                })
+                .unwrap_or(0.0);
+            check((share - 0.7).abs() < 0.01, "tako resize");
+
+            // 23. tako equalize（FR-2.5.7。呼び出し元ペインのタブを均等化）
+            type_text(any, cx, &format!("{cli} equalize"), true);
+            wait(cx, 800).await;
+            let share = window
+                .update(cx, |app, _, _| {
+                    app.workspace
+                        .active_tab()
+                        .tree()
+                        .layout(Rect::UNIT)
+                        .into_iter()
+                        .find(|(id, _)| *id == pane2)
+                        .map(|(_, r)| r.height)
+                        .unwrap_or(0.0)
+                })
+                .unwrap_or(0.0);
+            check((share - 0.5).abs() < 0.01, "tako equalize");
+
+            // 24. tako focus <id>（FR-2.2.3）
+            type_text(any, cx, &format!("{cli} focus {pane2}"), true);
+            wait(cx, 800).await;
+            let refocused = window
+                .update(cx, |app, _, _| app.focused_pane())
+                .unwrap_or_else(|_| fail("tako focus 後の状態取得"));
+            check(refocused == pane2, "tako focus");
+
+            // 25. tako tab new（FR-2.5.10。pane2 から実行 → 新タブがアクティブに）
+            type_text(any, cx, &format!("{cli} tab new --title agents"), true);
+            wait(cx, 1500).await;
+            let (tab_count, pane5, on_new_tab) = window
+                .update(cx, |app, _, _| {
+                    let active = app.workspace.active_tab();
+                    (
+                        app.workspace.tabs().len(),
+                        active.tree().focused(),
+                        active.title() == "agents",
+                    )
+                })
+                .unwrap_or_else(|_| fail("tako tab new 後の状態取得"));
+            check(tab_count == 3 && on_new_tab, "tako tab new");
+
+            // 26. tako tab move-pane（呼び出し元 pane5 をタブ 1 へ移送。元タブは消える）
+            type_text(any, cx, &format!("{cli} tab move-pane {tab1}"), true);
+            wait(cx, 1000).await;
+            let moved = window
+                .update(cx, |app, _, _| {
+                    app.workspace.tabs().len() == 2
+                        && app.workspace.find_tab_of_pane(pane5) == Some(tab1)
+                })
+                .unwrap_or(false);
+            check(moved, "tako tab move-pane");
+
+            // 27. tako tab select（アクティブタブを 1 へ戻す）。
+            // 入力先のペイン 3 にはステップ 10 のペースト残留があるため ctrl-u で行を消す
+            press(any, cx, "ctrl-u");
+            type_text(any, cx, &format!("{cli} tab select {tab1}"), true);
+            wait(cx, 800).await;
+            let selected = window
+                .update(cx, |app, _, _| app.workspace.active_tab_id() == tab1)
+                .unwrap_or(false);
+            check(selected, "tako tab select");
+
+            // 28. tako close --pane（FR-2.5.4。pane4 を片付ける）
+            type_text(any, cx, &format!("{cli} close --pane {pane4}"), true);
+            wait(cx, 1000).await;
+            let closed = window
+                .update(cx, |app, _, _| {
+                    !app.workspace
+                        .get_tab(tab1)
+                        .map(|t| t.tree().contains(pane4))
+                        .unwrap_or(true)
+                        && !app.terminals.contains_key(&pane4)
+                })
+                .unwrap_or(false);
+            check(closed, "tako close");
+
+            // 29. 不正トークンの接続拒否（FR-2.3.4。直接ソケットへ書き込んで確認）
+            let endpoint = window
+                .update(cx, |app, _, _| {
+                    app.ipc.as_ref().map(|ipc| ipc.endpoint().to_string())
+                })
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| fail("IPC エンドポイント取得"));
+            let auth_rejected = (|| -> Option<bool> {
+                use std::io::{BufRead, BufReader, Write};
+                let stream = std::os::unix::net::UnixStream::connect(&endpoint).ok()?;
+                let mut writer = stream.try_clone().ok()?;
+                writeln!(
+                    writer,
+                    r#"{{"jsonrpc":"2.0","id":1,"token":"bogus","method":"list"}}"#
+                )
+                .ok()?;
+                let mut line = String::new();
+                BufReader::new(stream).read_line(&mut line).ok()?;
+                Some(line.contains("-32001"))
+            })()
+            .unwrap_or(false);
+            check(auth_rejected, "不正トークンの拒否");
 
             println!("TAKO_APP_SELF_TEST_OK");
             std::process::exit(0);

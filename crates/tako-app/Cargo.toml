@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 tako-core.workspace = true
+tako-control.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 futures.workspace = true
