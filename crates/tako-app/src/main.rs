@@ -588,27 +588,79 @@ impl TakoApp {
     // --- マウス ---
 
     /// ウィンドウ座標をペイン内のセル座標へ変換する（col, row, セル右半分か）
-    fn cell_at(&self, pane_id: PaneId, position: Point<Pixels>) -> Option<(usize, usize, bool)> {
+    /// マウス座標 → グリッドセル（col, row, セル内右半分か）。
+    /// 行の描画はプロポーショナルな実フォント幅で行われ、全角文字の advance は
+    /// セル幅 × 2 と一致しない（描画とグリッドがずれる）。そのため x は描画と同じ
+    /// shaping で文字位置へ直し、`ScreenLine::cell_cols` でグリッド col に写像する
+    fn cell_at(
+        &self,
+        pane_id: PaneId,
+        position: Point<Pixels>,
+        window: &mut Window,
+    ) -> Option<(usize, usize, bool)> {
         let (_, area) = self.pane_text_areas.iter().find(|(id, _)| *id == pane_id)?;
         let cell = self.cell_size?;
         let session = self.terminals.get(&pane_id)?;
         let (cols, rows) = session.size();
         let local = position - area.origin;
-        let x = (f32::from(local.x) / f32::from(cell.width)).max(0.0);
         let y = (f32::from(local.y) / f32::from(cell.height)).max(0.0);
-        let col = (x as usize).min(cols.saturating_sub(1));
         let row = (y as usize).min(rows.saturating_sub(1));
-        Some((col, row, x.fract() > 0.5))
+        let local_x = f32::from(local.x).max(0.0);
+
+        let screen = session.screen(&self.theme);
+        let Some(line) = screen.lines.get(row) else {
+            // スナップショット外（起動直後等）は等幅前提の線形換算へフォールバック
+            let col = ((local_x / f32::from(cell.width)) as usize).min(cols.saturating_sub(1));
+            return Some((col, row, false));
+        };
+        let shaped = window.text_system().shape_line(
+            SharedString::from(line.text.clone()),
+            px(self.theme.font_size),
+            &[self.mono_text_run(line.text.len())],
+            None,
+        );
+        let byte_ix = shaped.closest_index_for_x(px(local_x));
+        let char_ix = line.text[..byte_ix].chars().count();
+        let col = line
+            .cell_cols
+            .get(char_ix)
+            .copied()
+            // 行テキスト末尾より右は線形換算（テキストは全列を埋めるため通常は来ない）
+            .unwrap_or((local_x / f32::from(cell.width)) as usize)
+            .min(cols.saturating_sub(1));
+        // セル内の左右判定も描画上の文字幅で行う
+        let char_start = f32::from(shaped.x_for_index(byte_ix));
+        let next_ix = line.text[byte_ix..]
+            .chars()
+            .next()
+            .map(|c| byte_ix + c.len_utf8())
+            .unwrap_or(byte_ix);
+        let char_end = f32::from(shaped.x_for_index(next_ix));
+        let side_right = char_end > char_start && (local_x - char_start) / (char_end - char_start) > 0.5;
+        Some((col, row, side_right))
+    }
+
+    /// 行テキスト全体を 1 ランで shape するための TextRun（幅計算用。色は使われない）
+    fn mono_text_run(&self, len: usize) -> TextRun {
+        TextRun {
+            len,
+            font: gpui::font(self.theme.font_family.clone()),
+            color: hsla(self.theme.foreground),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }
     }
 
     fn on_pane_mouse_down(
         &mut self,
         pane_id: PaneId,
         event: &MouseDownEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let _ = self.workspace.active_tab_mut().tree_mut().focus(pane_id);
-        if let Some((col, row, right)) = self.cell_at(pane_id, event.position) {
+        if let Some((col, row, right)) = self.cell_at(pane_id, event.position, window) {
             if let Some(session) = self.terminals.get(&pane_id) {
                 let kind = match event.click_count {
                     1 => SelectionKind::Simple,
@@ -654,7 +706,12 @@ impl TakoApp {
         cx.notify();
     }
 
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if event.pressed_button != Some(MouseButton::Left) {
             // ウィンドウ外でボタンが離されると MouseUp が届かないことがある。
             // 取り残したドラッグ・選択状態はここで畳む（残留すると以後どこを
@@ -690,7 +747,7 @@ impl TakoApp {
         let Some(pane_id) = self.selecting else {
             return;
         };
-        if let Some((col, row, right)) = self.cell_at(pane_id, event.position) {
+        if let Some((col, row, right)) = self.cell_at(pane_id, event.position, window) {
             if let Some(session) = self.terminals.get(&pane_id) {
                 session.extend_selection(col, row, right);
                 cx.notify();
@@ -720,6 +777,7 @@ impl TakoApp {
         &mut self,
         pane_id: PaneId,
         event: &ScrollWheelEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(cell) = self.cell_size else {
@@ -732,7 +790,7 @@ impl TakoApp {
         if lines != 0 {
             // mouse reporting / alternate scroll / 自前スクロールの出し分けはセッション側
             let (col, row) = self
-                .cell_at(pane_id, event.position)
+                .cell_at(pane_id, event.position, window)
                 .map(|(c, r, _)| (c, r))
                 .unwrap_or((0, 0));
             if let Some(session) = self.terminals.get(&pane_id) {
@@ -998,12 +1056,12 @@ impl TakoApp {
             .overflow_hidden()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.on_pane_mouse_down(pane_id, event, cx);
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.on_pane_mouse_down(pane_id, event, window, cx);
                 }),
             )
-            .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
-                this.on_pane_scroll(pane_id, event, cx);
+            .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, window, cx| {
+                this.on_pane_scroll(pane_id, event, window, cx);
             }))
             .children(lines)
             .children(scrollbar.map(|(top, thumb_h, track_h, dragging)| {
@@ -1577,8 +1635,8 @@ impl Render for TakoApp {
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 this.handle_key(&event.keystroke, cx);
             }))
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                this.on_mouse_move(event, cx);
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                this.on_mouse_move(event, window, cx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
@@ -1957,6 +2015,7 @@ mod self_test {
                             pressed_button: Some(MouseButton::Left),
                             modifiers: Modifiers::default(),
                         },
+                        win,
                         cx,
                     );
                     app.on_mouse_up(
@@ -2013,6 +2072,7 @@ mod self_test {
                             pressed_button: None,
                             modifiers: Modifiers::default(),
                         },
+                        win,
                         cx,
                     );
                     app.dragging_border.is_none()
@@ -2837,7 +2897,7 @@ mod self_test {
             // 43. ホイールの出し分け: 通常画面 = 自前スクロールバック表示、
             //     alternate screen = PTY 転送（TUI が自前処理。回帰: Claude Code TUI で
             //     チャットを遡れない）。転送バイト列の網羅はユニットテスト側
-            let wheel_up = |app: &mut TakoApp, cx: &mut Context<TakoApp>| {
+            let wheel_up = |app: &mut TakoApp, win: &mut Window, cx: &mut Context<TakoApp>| {
                 let pane = app.focused_pane();
                 let center = app
                     .pane_text_areas
@@ -2852,14 +2912,15 @@ mod self_test {
                         delta: ScrollDelta::Lines(point(0.0, 2.0)),
                         ..ScrollWheelEvent::default()
                     },
+                    win,
                     cx,
                 );
             };
             type_text(any, cx, "seq 200", true);
             wait(cx, 1000).await;
             let scrolled_normal = window
-                .update(cx, |app, _, cx| {
-                    wheel_up(app, cx);
+                .update(cx, |app, win, cx| {
+                    wheel_up(app, win, cx);
                     let offset = app
                         .terminals
                         .get(&app.focused_pane())
@@ -2876,8 +2937,8 @@ mod self_test {
             type_text(any, cx, r"printf '\e[?1049h'; sleep 2; printf '\e[?1049l'", true);
             wait(cx, 800).await;
             let forwarded_in_alt = window
-                .update(cx, |app, _, cx| {
-                    wheel_up(app, cx);
+                .update(cx, |app, win, cx| {
+                    wheel_up(app, win, cx);
                     app.terminals
                         .get(&app.focused_pane())
                         .map(|s| s.display_offset())
@@ -2967,6 +3028,47 @@ mod self_test {
                 })
                 .unwrap_or(false);
             check(disambiguate_off, "kitty protocol pop で解除");
+
+            // 46. 全角行のマウス座標→セル変換（回帰: 範囲選択が見た目よりだいぶ左から始まる）。
+            //     全角の描画幅はセル幅 × 2 と一致しないため、描画上の「う」の位置をクリック
+            //     したとき、グリッド col = 4（全角 2 セル × 2 文字ぶん）に解決されること
+            press(any, cx, "ctrl-u");
+            type_text(any, cx, "echo あいうえおかきくけこ", true);
+            wait(cx, 1000).await;
+            let wide_hit = window
+                .update(cx, |app, win, _| {
+                    let pane = app.focused_pane();
+                    let (_, area) = app
+                        .pane_text_areas
+                        .iter()
+                        .find(|(id, _)| *id == pane)
+                        .copied()?;
+                    let cell = app.cell_size?;
+                    let screen = app.terminals.get(&pane)?.screen(&app.theme);
+                    let row = screen
+                        .lines
+                        .iter()
+                        .position(|l| l.text.starts_with("あいうえおかきくけこ"))?;
+                    let line = &screen.lines[row];
+                    // 描画と同じ shaping で「う」の先頭 x を求め、少し右をクリックする
+                    let shaped = win.text_system().shape_line(
+                        SharedString::from(line.text.clone()),
+                        px(app.theme.font_size),
+                        &[app.mono_text_run(line.text.len())],
+                        None,
+                    );
+                    let x = f32::from(shaped.x_for_index("あい".len())) + 2.0;
+                    let pos = point(
+                        area.origin.x + px(x),
+                        area.origin.y + cell.height * row as f32 + px(2.0),
+                    );
+                    let (col, hit_row, _) = app.cell_at(pane, pos, win)?;
+                    Some(col == 4 && hit_row == row)
+                })
+                .ok()
+                .flatten()
+                .unwrap_or(false);
+            check(wide_hit, "全角行のクリックが正しいセルに解決");
 
             println!("TAKO_APP_SELF_TEST_OK");
             std::process::exit(0);

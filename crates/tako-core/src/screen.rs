@@ -38,6 +38,10 @@ pub struct StyleRun {
 pub struct ScreenLine {
     pub text: String,
     pub runs: Vec<StyleRun>,
+    /// `text` の各文字（char 順）が占めるグリッド列。全角文字はスペーサーを
+    /// テキストから除いているため、次の文字との col 差が 2 になる。
+    /// 描画（プロポーショナルな実フォント幅）とグリッド座標の写像に使う
+    pub cell_cols: Vec<usize>,
 }
 
 /// 表示中グリッドのスナップショット
@@ -148,10 +152,12 @@ pub fn snapshot<T: EventListener>(term: &Term<T>, theme: &Theme) -> Screen {
         .map(|cells| {
             let mut text = String::with_capacity(cols);
             let mut runs: Vec<StyleRun> = Vec::new();
-            for (c, style) in cells {
+            let mut cell_cols = Vec::with_capacity(cols);
+            for (col, (c, style)) in cells.into_iter().enumerate() {
                 if c == '\0' {
                     continue; // 太幅文字のスペーサー: 直前の文字が 2 セル分を占める
                 }
+                cell_cols.push(col);
                 let start = text.len();
                 text.push(c);
                 let end = text.len();
@@ -177,7 +183,11 @@ pub fn snapshot<T: EventListener>(term: &Term<T>, theme: &Theme) -> Screen {
                     }),
                 }
             }
-            ScreenLine { text, runs }
+            ScreenLine {
+                text,
+                runs,
+                cell_cols,
+            }
         })
         .collect();
 
