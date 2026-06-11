@@ -11,18 +11,20 @@
 //! `TAKO_SELF_TEST=1` で起動すると、キーディスパッチ経由で入力・分割・タブ・色・
 //! スクロールバック・コピペの経路に加え、Phase 2 の制御プレーン（環境変数注入・
 //! IPC・`tako` CLI の e2e）と Phase 3 の内蔵 MCP サーバー（Streamable HTTP +
-//! stdio ブリッジ）を機械検証して終了する。
+//! stdio ブリッジ）、Phase 3.5 の IME 変換状態（marked text）を機械検証して終了する。
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::time::Duration;
 
 use futures::channel::mpsc::unbounded;
 use futures::StreamExt;
 use gpui::{
-    actions, div, point, prelude::*, px, relative, size, App, Bounds, ClipboardItem, Context,
-    FocusHandle, Font, FontStyle, FontWeight, HighlightStyle, Hsla, KeyBinding, Keystroke,
-    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba,
-    ScrollDelta, ScrollWheelEvent, SharedString, Size, StrikethroughStyle, StyledText, TextStyle,
+    actions, canvas, div, point, prelude::*, px, relative, size, App, Bounds, ClipboardItem,
+    Context, ElementInputHandler, EntityInputHandler, FocusHandle, Font, FontStyle, FontWeight,
+    HighlightStyle, Hsla, KeyBinding, Keystroke, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollDelta, ScrollWheelEvent,
+    SharedString, Size, StrikethroughStyle, StyledText, TextRun, TextStyle, UTF16Selection,
     UnderlineStyle, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
@@ -122,6 +124,34 @@ fn hsla(c: tako_core::Rgb) -> Hsla {
     rgba(c).into()
 }
 
+/// IME 変換中（未確定文字列 = marked text）の状態（FR-1.9）。
+/// 変換開始時のフォーカスペインを保持し、変換途中でフォーカスが移っても確定先がぶれないようにする
+struct ImeComposition {
+    /// 変換対象のペイン（確定文字列の書き込み先）
+    pane: PaneId,
+    /// 未確定文字列
+    text: String,
+    /// IME が注目している文節（`text` 内の UTF-16 コード単位の範囲）。太い下線で強調する
+    selected_utf16: Option<Range<usize>>,
+}
+
+/// UTF-16 コード単位のオフセットを UTF-8 バイトオフセットへ変換する（範囲外は末尾へ丸める）。
+/// NSTextInputClient（macOS の IME プロトコル）は範囲をすべて UTF-16 で渡してくる
+fn utf16_to_byte_offset(text: &str, utf16_offset: usize) -> usize {
+    let mut utf16 = 0;
+    for (byte, c) in text.char_indices() {
+        if utf16 >= utf16_offset {
+            return byte;
+        }
+        utf16 += c.len_utf16();
+    }
+    text.len()
+}
+
+fn utf16_len(text: &str) -> usize {
+    text.chars().map(char::len_utf16).sum()
+}
+
 struct TakoApp {
     workspace: Workspace,
     terminals: HashMap<PaneId, TerminalSession>,
@@ -141,6 +171,8 @@ struct TakoApp {
     token: Option<String>,
     /// dispatch 中に依頼されたセッション起動（GPUI の Context が要るため遅延実行する）
     pending_attach: Vec<(PaneId, SpawnOptions)>,
+    /// IME 変換中の未確定文字列（FR-1.9。None = 変換中でない）
+    ime: Option<ImeComposition>,
 }
 
 impl TakoApp {
@@ -191,6 +223,7 @@ impl TakoApp {
             mcp,
             token,
             pending_attach: Vec::new(),
+            ime: None,
         };
         let root_id = app.workspace.active_tab().tree().focused();
         app.spawn_session(root_id, SpawnOptions::default(), cx);
@@ -424,9 +457,58 @@ impl TakoApp {
             if let Some(session) = self.focused_session() {
                 session.clear_selection();
                 session.write(bytes);
+                // ここで処理済みを宣言しないと、macOS が未処理キーを IME（input handler）へ
+                // 回送し insertText → replace_text_in_range で二重入力になる（FR-1.9）
+                cx.stop_propagation();
                 cx.notify();
             }
         }
+    }
+
+    // --- IME（FR-1.9） ---
+
+    /// IME 操作の対象ペイン。変換中はその開始ペイン、それ以外はフォーカスペイン
+    fn ime_target(&self) -> PaneId {
+        self.ime
+            .as_ref()
+            .map(|ime| ime.pane)
+            .unwrap_or_else(|| self.focused_pane())
+    }
+
+    /// 指定ペインのカーソルセル左上（ウィンドウ座標）。
+    /// スクロールバック表示中などカーソル非表示のときは None
+    fn pane_cursor_origin(&self, pane: PaneId) -> Option<Point<Pixels>> {
+        let (_, area) = self.pane_text_areas.iter().find(|(id, _)| *id == pane)?;
+        let cell = self.cell_size?;
+        let (col, row) = self.terminals.get(&pane)?.screen(&self.theme).cursor?;
+        Some(point(
+            area.origin.x + cell.width * col as f32,
+            area.origin.y + cell.height * row as f32,
+        ))
+    }
+
+    /// 未確定文字列の先頭から指定プレフィックスまでの描画幅（候補ウィンドウの位置出し用）
+    fn ime_prefix_width(&self, prefix: &str, window: &mut Window) -> Pixels {
+        if prefix.is_empty() {
+            return px(0.0);
+        }
+        let run = TextRun {
+            len: prefix.len(),
+            font: gpui::font(self.theme.font_family.clone()),
+            color: hsla(self.theme.foreground),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        window
+            .text_system()
+            .shape_line(
+                SharedString::from(prefix.to_string()),
+                px(self.theme.font_size),
+                &[run],
+                None,
+            )
+            .width
     }
 
     // --- マウス ---
