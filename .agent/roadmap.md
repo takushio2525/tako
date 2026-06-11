@@ -29,7 +29,7 @@
 調査ベースの判断だが、Zed 本体の正式リリース実績から**スタック採用を確定**。
 GPUI バージョン戦略は **zed リポ git rev 固定**（`architecture.md` 参照）。
 
-## Phase 1: macOS MVP（素のターミナル）→ 前半完了（2026-06-11）
+## Phase 1: macOS MVP（素のターミナル）→ ✅ 実装完了（2026-06-11。常用判断はユーザー確認待ち）
 
 - [x] Cargo ワークスペース構成（tako-core / tako-control / tako-app / tako-cli）確定
 - [x] PaneTree ドメインモデルと UI の分離（GPUI 非依存の core/。分割・削除・フォーカス・リサイズ・
@@ -37,11 +37,15 @@ GPUI バージョン戦略は **zed リポ git rev 固定**（`architecture.md` 
 - [x] tako-app がワークスペース構成上で最小ターミナル（1 ペイン）を起動
       （`TAKO_SELF_TEST=1` で入力 → PTY → グリッド反映を機械検証可能）
 - [x] Windows ビルドを CI（GitHub Actions）に組み込む（macOS / Windows 両ランナーで build + test 緑）
-- [ ] タブの作成・切替・クローズ UI（FR-1.2。ドメインモデルは実装済み、描画と操作が未）
-- [ ] ペイン分割・リサイズ・フォーカス移動 UI（FR-1.3。同上）
-- [ ] スクロールバック・コピペ・基本的な使い心地（色・カーソル描画・PTY リサイズ含む）
+- [x] タブの作成・切替・クローズ UI（FR-1.2。タブバー + cmd+T / cmd+W / cmd+数字 / cmd+shift+[]）
+- [x] ペイン分割・リサイズ・フォーカス移動 UI（FR-1.3。cmd+D / cmd+shift+D / cmd+alt+矢印 /
+      ctrl+cmd+矢印。iTerm2 踏襲）
+- [x] スクロールバック・コピペ・基本的な使い心地（256 色 / truecolor・カーソル・選択コピー
+      （copy-on-select）・ブラケットペースト・PTY リサイズ追従・exit でペイン自動クローズ。
+      描画色はすべて tako-core の Theme 経由（FR-4 の実装指針））
 
 **Exit Criteria**: 日常のターミナルとして自分が常用できる（macOS）。
+→ 実装・機械検証（セルフテスト 13 項目）は完了。常用フィードバックは使いながら Phase 2 以降で拾う。
 
 ## Phase 2: Layer 1 — CLI と環境変数注入
 
