@@ -118,3 +118,12 @@
 - 関連コミット: `2e1f718` `6c7ef60` `0693120` `fa18c47` `44f4699` `8fed3ca` 他
 - 残課題: 描画のグリッド不一致（全角 advance ≠ 2 セル）は座標変換のみ吸収、描画は未対応
 - 次: FR-2.12 実装 → Phase 4 後半
+
+## 2026-06-12（tmuxview FR-2.13 完成）
+
+- tmux 見える化: tako-core::tmux（取得層・パースはユニットテスト）+ dispatch
+  TmuxList/TmuxKill（tty 突き合わせで tako タブ・ペイン対応付け）+ `tako tmux list/kill` +
+  MCP 2 ツール（15 個）+ 右端固定タブ UI（確認つき kill、2 秒更新）。セルフテスト 73 項目緑
+- CI の fmt 検査落ち（clippy のみ確認していた）を修正し緑復帰。教訓: コミット前は
+  `cargo fmt --all --check` も回す
+- 次: FR-2.12（実行体の設計分岐の回答待ち）→ Phase 4 後半

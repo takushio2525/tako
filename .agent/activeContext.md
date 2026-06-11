@@ -6,11 +6,11 @@
 
 ## 現在の対象
 
-- 何を / どこを: **常用フィードバック一括対応完了**（2026-06-12 深夜）。スクロールバック
-  出し分け・スクロールバー・Shift+Enter（kitty protocol）・IME 候補位置・全角行の
-  選択座標・ペイン × ボタン・接続情報の永続化（FR-2.2.9）。
-  次は FR-2.12（AI 自動リネーム）実装 → Phase 4 後半（listen ポート検知・提案チップ・
-  集約センター）
+- 何を / どこを: **常用フィードバック一括対応 + tmuxview（FR-2.13）完成**（2026-06-12）。
+  tmuxview = 右端固定タブ + tmux 一覧（tty 突き合わせで tako タブ・ペイン対応付け）+
+  確認つき kill + `tako tmux list/kill` + MCP 2 ツール（計 15 ツール）。
+  次は FR-2.12（AI 自動リネーム。**実行体の設計分岐をユーザーへ報告済み・回答待ち**）→
+  Phase 4 後半（listen ポート検知・提案チップ・集約センター）
 - ステータス: push 済み・CI 緑確認待ち。**/Applications の .app は最新化済み**。
   ユーザーの実行中 tako は要再起動（修正反映 + control.json の自インスタンス復帰）
 - 最終更新: 2026-06-12
@@ -37,7 +37,10 @@
 - **× ボタン / スクロールバー**: UI からも dispatch（CLI/MCP と同じコマンド層）を通す。
   scroll は `tako scroll --to/--delta` + `tako_scroll_pane`（MCP 13 ツール）+ list の
   scroll フィールド
-- セルフテストは **69 項目**。IME 項目 38 はタイミングで稀にフレーク（再実行で緑）
+- **tmux 対応付けの仕組み**: TerminalSession が spawn 時に TIOCPTYGNAME（macOS）で
+  PTY スレーブ tty 名を保持 → dispatch TmuxList が tmux の client_tty と突き合わせ。
+  Linux/Windows は未対応（None = 対応付けなしで劣化）
+- セルフテストは **73 項目**。IME 項目 38 はタイミングで稀にフレーク（再実行で緑）
 - gpui ソース参照は `~/.cargo/git/checkouts/zed-*/cafbf4b/crates/gpui*` のみ（Apache-2.0）
 
 ## 現フェーズで Read すべき設計書
