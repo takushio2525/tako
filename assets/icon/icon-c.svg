@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- 案C: 触手 1 本で描くプロンプト「>」+ カーソル + AI エージェント網（ノード結線） -->
+  <defs>
+    <radialGradient id="c-bg" cx="0.35" cy="0.3" r="1.1">
+      <stop offset="0" stop-color="#4d44d4"/>
+      <stop offset="1" stop-color="#1d1a4b"/>
+    </radialGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="234" fill="url(#c-bg)"/>
+  <!-- AI ノード網（右上） -->
+  <g stroke="#a5b4fc" stroke-width="9" opacity="0.9">
+    <line x1="668" y1="300" x2="788" y2="222"/>
+    <line x1="788" y1="222" x2="852" y2="350"/>
+    <line x1="668" y1="300" x2="852" y2="350"/>
+  </g>
+  <g fill="#c7d2fe">
+    <circle cx="668" cy="300" r="26"/>
+    <circle cx="788" cy="222" r="19"/>
+    <circle cx="852" cy="350" r="19"/>
+  </g>
+  <!-- プロンプト「>」を触手 1 本で（下腕の先端はカール） -->
+  <path d="M312,322 L614,512 L388,656 C322,698 264,668 272,612"
+        fill="none" stroke="#fb7185" stroke-width="102"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- 吸盤 -->
+  <g fill="#ffffff" opacity="0.55">
+    <circle cx="408" cy="403" r="14"/>
+    <circle cx="492" cy="456" r="14"/>
+    <circle cx="528" cy="540" r="14"/>
+    <circle cx="448" cy="591" r="14"/>
+  </g>
+  <!-- ブロックカーソル -->
+  <rect x="652" y="618" width="172" height="86" rx="16" fill="#34d399"/>
+</svg>

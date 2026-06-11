@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- 案B: タコの頭そのものがターミナルウィンドウ（信号ドット + カーソルの目 + 触手） -->
+  <defs>
+    <linearGradient id="b-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5eead4"/>
+      <stop offset="1" stop-color="#0e7490"/>
+    </linearGradient>
+    <clipPath id="b-win">
+      <rect x="242" y="240" width="540" height="410" rx="92"/>
+    </clipPath>
+  </defs>
+  <rect width="1024" height="1024" rx="234" fill="url(#b-bg)"/>
+  <!-- 触手（ウィンドウの下から生える） -->
+  <g fill="none" stroke="#16202e" stroke-width="58" stroke-linecap="round">
+    <path d="M330,610 C320,740 276,795 232,818"/>
+    <path d="M420,620 C420,750 398,808 366,852"/>
+    <path d="M512,624 C512,756 512,816 512,862"/>
+    <path d="M604,620 C604,750 626,808 658,852"/>
+    <path d="M694,610 C704,740 748,795 792,818"/>
+  </g>
+  <!-- ウィンドウ = 頭 -->
+  <rect x="242" y="240" width="540" height="410" rx="92" fill="#16202e"/>
+  <g clip-path="url(#b-win)">
+    <rect x="242" y="240" width="540" height="100" fill="#27364d"/>
+  </g>
+  <!-- タイトルバーの信号ドット -->
+  <circle cx="312" cy="290" r="16" fill="#ff5f57"/>
+  <circle cx="362" cy="290" r="16" fill="#febc2e"/>
+  <circle cx="412" cy="290" r="16" fill="#28c840"/>
+  <!-- 目 = ブロックカーソル 2 個 -->
+  <rect x="398" y="408" width="60" height="96" rx="12" fill="#4ade80"/>
+  <rect x="566" y="408" width="60" height="96" rx="12" fill="#4ade80"/>
+  <!-- 口（微笑） -->
+  <path d="M470,562 q42,30 84,0" fill="none" stroke="#4ade80"
+        stroke-width="14" stroke-linecap="round"/>
+</svg>
