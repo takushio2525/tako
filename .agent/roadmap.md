@@ -86,6 +86,8 @@ tmux 系オーケストレーター（spawn-worker.sh 等）が CLI 差し替え
       候補とリスクは `architecture.md`「Web ビューペイン」節。暫定は外部ブラウザ起動でも可）
 - [ ] AI 誘導・注釈オーバーレイ（FR-2.6）と `tako_open_file` / `tako_open_url` / `tako_annotate`
       （FR-2.5.11〜12。設計原則 5「AI フルコントロール」）
+- [ ] diff ビューアペイン（FR-3.9）と AI 成果物プレゼンテーション `show_file` / `show_diff` /
+      `show_url`（FR-2.7。ツール説明文への「タスク完了時は成果物を提示せよ」規範埋め込み含む）
 
 **Exit Criteria**: エージェントの成果物（コード・README）を tako から出ずに確認・微修正できる。
 「あのファイル開いて見せて」「ここを見て」が AI 経由で通る。

@@ -152,7 +152,10 @@ TerminalSession がシェルを spawn する際に注入する:
   同じ API を呼ぶ（コマンドディスパッチの一元化）。
   後段フェーズの追加ツール（案）: `tako_create_tab` / `tako_move_pane`（タブ振り分け、FR-2.5.10）/
   `tako_open_file`（プレビュー表示、FR-2.5.11）/ `tako_open_url`（Web ビュー、FR-2.5.12）/
-  `tako_annotate`（注釈オーバーレイ、FR-2.6）
+  `tako_annotate`（注釈オーバーレイ、FR-2.6）/ `tako_show_file` / `tako_show_diff` /
+  `tako_show_url`（AI 成果物プレゼンテーション、FR-2.7）
+- ツール説明文には「タスク完了時は成果物を提示せよ」の規範を埋め込む（FR-2.7.5。
+  エージェントの振る舞いをプロンプト工学で誘導するのもプロダクトの一部）
 - 接続トークンから呼び出し元ペインを特定し、**操作スコープのデフォルトを同タブ内に制限**（FR-2.3.3）
 - エージェント側の自動発見方式（mcp.json の自動生成 or 各エージェント CLI の規約への追従）は
   Phase 3 で詰める。Claude Code を最初のリファレンス対象とする
