@@ -1,0 +1,14 @@
+[package]
+name = "tako-app"
+description = "GPUI バイナリ（UI 層）。GPUI 依存はこのクレートだけに閉じ込める"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "tako-app"
+path = "src/main.rs"
+
+[dependencies]
+tako-core.workspace = true

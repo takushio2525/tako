@@ -1,0 +1,25 @@
+# tako ワークスペース。レイヤ構成は .agent/architecture.md を参照。
+# 依存方向: tako-app(ui) → tako-control → tako-core → (platform は Phase 2 以降に分離検討)
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+# poc/ は Phase 0 の使い捨て検証コード。各自が独立ワークスペースを持つ
+exclude = ["poc"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/takushio2525/tako"
+
+[workspace.dependencies]
+tako-core = { path = "crates/tako-core" }
+tako-control = { path = "crates/tako-control" }
+alacritty_terminal = "0.26"
+futures = "0.3"
+thiserror = "2"
+tracing = "0.1"
+# GPUI は zed リポの git rev 固定（自動更新しない。追従は意識的なタスク。.agent/architecture.md）
+gpui = { git = "https://github.com/zed-industries/zed", rev = "cafbf4b5df7fedb67fc0f248850a5654efcec5d9" }
+# font-kit feature 必須: 無いとテキストシステムがスタブ化し文字が一切描画されない（poc/README.md）
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cafbf4b5df7fedb67fc0f248850a5654efcec5d9", features = ["font-kit"] }

@@ -1,0 +1,11 @@
+[package]
+name = "tako-cli"
+description = "Layer 1 CLI（`tako` コマンド）。Phase 2 で実装"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "tako"
+path = "src/main.rs"

@@ -1,0 +1,10 @@
+[package]
+name = "tako-control"
+description = "制御プレーン（IPC / MCP / パッシブ検知）。GPUI 非依存。Phase 2 で実装"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tako-core.workspace = true

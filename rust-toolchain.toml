@@ -1,0 +1,4 @@
+# git 版 gpui（zed main）が新しめの stable を要求するためピン留め（1.89 不可、1.95.0 で確認済み）
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,13 @@
+[package]
+name = "tako-core"
+description = "ドメインモデル（Workspace / Tab / PaneTree / TerminalSession）。GPUI 非依存"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+alacritty_terminal.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
