@@ -132,7 +132,9 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_list_panes",
             "description": "タブとペインのツリー構造・ジオメトリ（位置・サイズ・分割比率）・\
-                状態（タイトル・role・origin・フォーカス）を JSON で返す。\
+                状態（タイトル・role・origin・フォーカス・cwd・state）を JSON で返す。\
+                state はシェル統合（OSC 133）由来で idle / running / failed（exit_code 付き）\
+                / unknown（統合なし）。エージェントや dev サーバーの実行状況の把握に使える。\
                 ペインを操作する前にまずこれを呼び、現状のレイアウトとペイン ID を把握すること。",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
         }),

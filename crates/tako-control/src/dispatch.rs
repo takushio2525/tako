@@ -86,7 +86,14 @@ pub fn dispatch(
                     program: c.remove(0),
                     args: c,
                 }),
-                cwd: cwd.map(Into::into),
+                // cwd 未指定なら分割元ペインの cwd（OSC 7 通知）を継承する。
+                // ssh 先などローカルに存在しないパスは無視しホーム既定に任せる
+                cwd: cwd.map(Into::into).or_else(|| {
+                    host.session(target)
+                        .and_then(|s| s.cwd())
+                        .filter(|p| p.is_dir())
+                        .map(|p| p.to_path_buf())
+                }),
                 env: Vec::new(),
             };
             host.attach_session(new_id, options);
@@ -294,6 +301,13 @@ fn list_json(host: &dyn ControlHost) -> Value {
                         "role": p.role(),
                         "origin": origin_str(p.origin()),
                         "focused": p.id() == tree.focused(),
+                        // OSC 7 / 133 シェル統合由来（未検知なら null / "unknown"。FR-2.1.4）
+                        "cwd": session.and_then(|s| s.cwd()).map(|p| p.display().to_string()),
+                        "state": session.map(|s| command_state_str(s.command_state())),
+                        "exit_code": session.and_then(|s| match s.command_state() {
+                            tako_core::CommandState::Failed(code) => Some(code),
+                            _ => None,
+                        }),
                         "rect": {
                             "x": rect.x,
                             "y": rect.y,
@@ -316,6 +330,16 @@ fn list_json(host: &dyn ControlHost) -> Value {
         })
         .collect();
     json!({ "active_tab": ws.active_tab_id().as_u64(), "tabs": tabs })
+}
+
+/// コマンド実行状態の文字列表現（list / MCP 公開用）
+fn command_state_str(state: tako_core::CommandState) -> &'static str {
+    match state {
+        tako_core::CommandState::Unknown => "unknown",
+        tako_core::CommandState::Idle => "idle",
+        tako_core::CommandState::Running => "running",
+        tako_core::CommandState::Failed(_) => "failed",
+    }
 }
 
 fn tree_json(node: &PaneNode) -> Value {

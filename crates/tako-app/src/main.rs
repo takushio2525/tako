@@ -30,8 +30,8 @@ use gpui::{
 use gpui_platform::application;
 use tako_control::{ControlHost, IncomingRequest, IpcServer, McpServer};
 use tako_core::{
-    ratio_for_position, Pane, PaneId, PaneOrigin, Rect, SelectionKind, SessionNotice, SpawnOptions,
-    SplitAxis, SplitDirection, TabId, TerminalSession, Theme, Workspace,
+    ratio_for_position, CommandState, Pane, PaneId, PaneOrigin, Rect, SelectionKind, SessionNotice,
+    SpawnOptions, SplitAxis, SplitDirection, TabId, TerminalSession, Theme, Workspace,
 };
 
 /// 新規セッションの初期グリッド。最初の render で実寸へリサイズされる
@@ -359,6 +359,16 @@ impl TakoApp {
 
     fn split(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
         let target = self.focused_pane();
+        // 分割元ペインの cwd（OSC 7 通知）を継承する（ローカルに無いパスは無視）
+        let options = SpawnOptions {
+            cwd: self
+                .terminals
+                .get(&target)
+                .and_then(|s| s.cwd())
+                .filter(|p| p.is_dir())
+                .map(|p| p.to_path_buf()),
+            ..SpawnOptions::default()
+        };
         let pane = Pane::new(PaneOrigin::User);
         let pane_id = pane.id();
         if self
@@ -368,7 +378,7 @@ impl TakoApp {
             .split(target, direction, pane)
             .is_ok()
         {
-            if let Err(e) = self.spawn_session(pane_id, SpawnOptions::default(), cx) {
+            if let Err(e) = self.spawn_session(pane_id, options, cx) {
                 eprintln!("warning: ペインを開けない: {e}");
                 self.remove_pane(pane_id, cx);
             }
@@ -2479,6 +2489,70 @@ mod self_test {
             // 片付け（最後の 1 ペイン close = タブごと閉じる経路も通す）
             type_text(any, cx, &format!("{cli} close"), true);
             wait(cx, 1000).await;
+
+            // 41. OSC 7 / 133 タップ → cwd / state が反映され list で公開される
+            //     （FR-2.4.1 の検知経路 + FR-2.1.4 の公開の e2e。
+            //     シェル統合スクリプト導入前なので printf で手動発行する）
+            press(any, cx, "ctrl-u");
+            type_text(
+                any,
+                cx,
+                r"printf '\e]7;file:///private/tmp\a\e]133;C\a'",
+                true,
+            );
+            wait(cx, 1000).await;
+            let (osc_cwd_ok, osc_running) = window
+                .update(cx, |app, _, _| {
+                    let session = app.terminals.get(&app.focused_pane());
+                    (
+                        session
+                            .and_then(|s| s.cwd())
+                            .map(|p| p == std::path::Path::new("/private/tmp"))
+                            .unwrap_or(false),
+                        session.map(|s| s.command_state() == CommandState::Running) == Some(true),
+                    )
+                })
+                .unwrap_or((false, false));
+            check(osc_cwd_ok, "OSC 7 で cwd 検知");
+            check(osc_running, "OSC 133 C で running");
+            type_text(any, cx, r"printf '\e]133;D;1\a\e]133;A\a'", true);
+            wait(cx, 1000).await;
+            let osc_failed = window
+                .update(cx, |app, _, _| {
+                    app.terminals
+                        .get(&app.focused_pane())
+                        .map(|s| s.command_state() == CommandState::Failed(1))
+                        == Some(true)
+                })
+                .unwrap_or(false);
+            check(osc_failed, "OSC 133 D;1 で failed（プロンプト後も保持）");
+            // 開発不変条件: 検知した状態は list（CLI / MCP 共有の dispatch）からも見える
+            let list_exposes = window
+                .update(cx, |app, _, _| {
+                    let focused = app.focused_pane().as_u64();
+                    let value = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::List,
+                        PaneOrigin::Cli,
+                    )
+                    .expect("list は常に成功する");
+                    value["tabs"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|t| t["panes"].as_array().into_iter().flatten())
+                        .any(|p| {
+                            p["id"].as_u64() == Some(focused)
+                                && p["state"].as_str() == Some("failed")
+                                && p["exit_code"].as_i64() == Some(1)
+                                && p["cwd"].as_str() == Some("/private/tmp")
+                        })
+                })
+                .unwrap_or(false);
+            check(list_exposes, "list が state / exit_code / cwd を公開");
+            // 片付け: 状態を idle へ戻す
+            type_text(any, cx, r"printf '\e]133;D;0\a'", true);
+            wait(cx, 500).await;
 
             println!("TAKO_APP_SELF_TEST_OK");
             std::process::exit(0);
