@@ -10,7 +10,7 @@ iTerm2 + Zed の思想で Zed 級に高速・軽量。macOS 先行、Windows 対
 
 - 目的: AI エージェント（Claude Code 等）+ 子エージェント + dev サーバーを「1 グループ = 1 タブ」で集約監視する
 - 対象: AI エージェントで開発する開発者。**ただしゼロコンフィグで一般ユーザーが使えることが最優先の設計原則**
-- 状況: **仕様策定フェーズ完了 → Phase 0（技術検証スパイク）待ち。コードは未着手**
+- 状況: **Phase 0 完了 → Phase 1（macOS MVP）実装中。ワークスペース・PaneTree・最小ターミナル・CI まで完了**
 
 ## 技術スタック
 
@@ -28,7 +28,13 @@ tako/
 ├── AGENTS.md / CLAUDE.md   ← AI 向け規約（このファイル）
 ├── .agent/                 ← AI 向け詳細仕様（下記参照）
 ├── README.md / LICENSE     ← 人間向け・Apache-2.0
-└── (crates/ 等)            ← Phase 1 で tako-core / tako-control / tako-app / tako-cli を切る
+├── crates/
+│   ├── tako-core/          ← ドメインモデル（PaneTree / Workspace / TerminalSession、GPUI 非依存）
+│   ├── tako-control/       ← 制御プレーン（IPC / MCP / 検知。Phase 2 までスタブ）
+│   ├── tako-app/           ← GPUI バイナリ（GPUI 依存はここだけ）
+│   └── tako-cli/           ← Layer 1 CLI（Phase 2 までスタブ）
+├── poc/                    ← Phase 0 の使い捨て検証コード（品質基準の対象外）
+└── .github/workflows/      ← CI（macOS / Windows ビルド + テスト）
 ```
 
 - `.agent/` に置くもの: AI 向け仕様・作業文脈。置かないもの: 人間向け紹介文（README へ）
@@ -41,7 +47,15 @@ tako/
 
 ## コマンド
 
-コード未着手のため未定。Phase 1 で `dev` / `build` / `lint` / `test` をここに表で書く。
+| 操作 | コマンド |
+|---|---|
+| dev（最小ターミナル起動） | `cargo run -p tako-app` |
+| セルフテスト起動（入力経路の機械検証） | `TAKO_SELF_TEST=1 cargo run -p tako-app` |
+| build | `cargo build --workspace` |
+| lint | `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` |
+| test | `cargo test --workspace` |
+
+CI（`.github/workflows/ci.yml`）は macOS / Windows の両ランナーで build + test を回す。
 
 ## AI 向け詳細仕様（必要なときだけ Read する）
 

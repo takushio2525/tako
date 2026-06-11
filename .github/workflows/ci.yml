@@ -1,0 +1,70 @@
+# CI — macOS / Windows でビルド + lint + テスト
+#
+# Windows ジョブは Phase 0 残タスク「windows ランナーでの PoC 相当ビルド・スモーク」を兼ねる
+# （実機が無いため CI が唯一の Windows 検証手段。.agent/roadmap.md Phase 1）。
+# gpui の Windows ビルド前提（Spectre-mitigated libs 等）は .agent/architecture.md を参照。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI ではインクリメンタルビルド不要（キャッシュ効率優先）
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  macos:
+    name: macOS（build + lint + test）
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml と同じバージョンをピン（git 版 gpui が新しめの stable を要求）
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: フォーマット検査
+        run: cargo fmt --all --check
+      - name: Clippy（warning をエラー扱い）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: ビルド
+        run: cargo build --workspace
+      - name: テスト
+        run: cargo test --workspace
+
+  windows:
+    name: Windows（build + test スモーク）
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      # gpui の Windows ビルドは Spectre-mitigated libs が前提（無いとリンクエラー）。
+      # ランナーの VS には既定で入っていないため VS インストーラーで追加する
+      - name: Spectre-mitigated libs をインストール
+        shell: pwsh
+        run: |
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          Write-Host "VS installation: $vsPath"
+          $process = Start-Process -FilePath "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe" `
+            -ArgumentList "modify", "--installPath", "`"$vsPath`"", `
+              "--add", "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre", `
+              "--quiet", "--norestart", "--nocache" `
+            -Wait -PassThru
+          # 3010 = 成功（要再起動）。ランナーでは再起動不要
+          if (($process.ExitCode -ne 0) -and ($process.ExitCode -ne 3010)) {
+            Write-Error "VS インストーラーが終了コード $($process.ExitCode) で失敗"
+            exit 1
+          }
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: ビルド
+        run: cargo build --workspace
+      - name: テスト
+        run: cargo test --workspace
