@@ -14,6 +14,9 @@ pub struct Settings {
     /// タブ・ペイン名の AI 自動リネーム（FR-2.12.4。既定 ON）
     #[serde(default = "default_true")]
     pub auto_rename: bool,
+    /// listen ポート検知 + 提案チップ（FR-2.4.4。既定 ON）
+    #[serde(default = "default_true")]
+    pub port_detect: bool,
 }
 
 fn default_true() -> bool {
@@ -22,7 +25,10 @@ fn default_true() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { auto_rename: true }
+        Self {
+            auto_rename: true,
+            port_detect: true,
+        }
     }
 }
 
@@ -82,7 +88,10 @@ mod tests {
     fn 書き出しと読み戻しが往復する() {
         let path = temp_path("roundtrip");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
-        let settings = Settings { auto_rename: false };
+        let settings = Settings {
+            auto_rename: false,
+            port_detect: false,
+        };
         save_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), Some(settings));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -95,5 +104,6 @@ mod tests {
         // 空オブジェクトでも既定が立つ（後方互換）
         let parsed: Settings = serde_json::from_str("{}").unwrap();
         assert!(parsed.auto_rename);
+        assert!(parsed.port_detect);
     }
 }

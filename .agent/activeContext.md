@@ -6,15 +6,13 @@
 
 ## 現在の対象
 
-- 何を / どこを: **FR-2.12（AI 自動リネーム）と FR-2.4.2（listen ポート検知）完成**
-  （2026-06-12）。自動リネーム = tako 常駐検知ループ → `claude -p`（haiku）→
-  `set_title_auto`（手動優先 TitleSource、OFF は settings.json + `tako autorename` / MCP
-  計 17 ツール）。listen 検知 = `tako-core::ports`（libproc + tty 突き合わせ、3 秒
-  ポーリング）→ list / MCP の `listen_ports`。
-  次は**提案チップ（FR-2.4.3〜4）だが表示位置・承諾アクションの設計分岐をユーザーへ
-  確認してから着手** → 集約センター（FR-2.10）
-- ステータス: セルフテスト 79 項目緑・push 済み・CI 緑（FR-2.12 分）。
-  /Applications の .app は FR-2.12 時点まで反映済み（listen 検知分は要再ビルド）
+- 何を / どこを: **Phase 4 後半を前進**（2026-06-12）: FR-2.12（AI 自動リネーム）+
+  FR-2.4.2（listen ポート検知）+ FR-2.4.3〜4（提案チップ + OFF 設定）完成。
+  チップ = 検知ペイン下端インライン、承諾 = `open_preview`（当面は外部ブラウザ、
+  Phase 5 で Web ビューペインへ差し替える抽象点。設計はユーザー承認済み）。
+  MCP は計 18 ツール。FR-2.14（MCP ゼロコンフィグオンボーディング）を要件登録済み
+  （実装は Phase 7 前）。次は**集約センター（FR-2.10）**で Phase 4 完了
+- ステータス: セルフテスト 83 項目緑。チップ分のコミット・push と .app 更新は進行中
 - 最終更新: 2026-06-12
 
 ## 直近の観点・指摘
@@ -47,17 +45,17 @@
 
 ## 現フェーズで Read すべき設計書
 
-- 提案チップ（FR-2.4.3〜4）着手時: `architecture.md`「Layer 3」節 + `requirements.md`
-  FR-2.4.3〜2.4.4（**着手前に表示位置・承諾アクションをユーザーへ確認**）
-- 集約センター（FR-2.10）着手時: `requirements.md` FR-2.10
+- 集約センター（FR-2.10）着手時: `requirements.md` FR-2.10 + `architecture.md`「Layer 3」節
+  （状態素材は CommandState::aggregate / list の state が既にある）
 
 ## 未解決・次の一手
 
-- [ ] **ユーザー確認待ち**: 提案チップの設計分岐（表示位置 / 承諾アクション =
-      Web ビュー未実装のため暫定は外部ブラウザ `open` か）
-- [ ] 提案チップ（FR-2.4.3〜4。パッシブ検知の OFF 設定含む）→ 集約センター（FR-2.10）
-- [ ] /Applications の .app 更新（`scripts/build-app.sh --install`）+ ユーザー再起動
-- [ ] 常用確認: 自動リネームの claude 実呼び出し経路（manual-checks.md「AI 自動リネーム」）
+- [ ] 集約センター（FR-2.10。全タブの入力待ち / 完了 / 質問ありを集約しクリックでジャンプ）
+      で Phase 4 完了
+- [ ] FR-2.14（MCP ゼロコンフィグオンボーディング）は現タスク群の後（Phase 7 前必須）
+- [ ] /Applications の .app 更新 + ユーザー再起動
+- [ ] 常用確認: 自動リネーム（claude 実呼び出し）+ 提案チップ（実 dev サーバー）
+      → manual-checks.md
 - [ ] 描画のグリッド不一致（全角 advance ≠ 2 セル）の根本対応の要否を常用で判断
 
 ## 関連ファイル / リンク

@@ -389,6 +389,19 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_port_detect",
+            "description": "listen ポート検知 + 提案チップ（FR-2.4.2〜2.4.4）の ON/OFF を\
+                切り替える（enabled 省略時は現在状態の取得のみ）。設定は永続化される。\
+                有効時、各ペインの listen 中 TCP ポートは tako_list_panes の listen_ports で読める。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "enabled": { "type": "boolean", "description": "true = 有効化、false = 無効化（省略時は状態取得）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_auto_rename",
             "description": "タブ・ペイン名の AI 自動リネーム（FR-2.12）の ON/OFF を切り替える\
                 （enabled 省略時は現在状態の取得のみ）。設定は永続化される。\
@@ -522,6 +535,9 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             tab: required_u64(args, "tab")?,
         },
         "tako_auto_rename" => Request::AutoRename {
+            enabled: bool_arg(args, "enabled")?,
+        },
+        "tako_port_detect" => Request::PortDetect {
             enabled: bool_arg(args, "enabled")?,
         },
         _ => return Err(format!("不明なツール: {name}")),
@@ -839,7 +855,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

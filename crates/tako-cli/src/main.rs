@@ -63,7 +63,9 @@ enum Command {
     #[command(subcommand)]
     Tab(TabCommand),
     /// タブ・ペイン名の AI 自動リネーム（FR-2.12）の ON/OFF・状態確認
-    Autorename(AutorenameArgs),
+    Autorename(ToggleArgs),
+    /// listen ポート検知 + 提案チップ（FR-2.4.2〜2.4.4）の ON/OFF・状態確認
+    Portdetect(ToggleArgs),
     /// tmux セッションの一覧・kill（FR-2.13。消し忘れ tmux の発見と片付け）
     #[command(subcommand)]
     Tmux(TmuxCommand),
@@ -225,8 +227,9 @@ struct ResizeArgs {
     share_y: Option<f32>,
 }
 
+/// ON/OFF トグル系コマンド共通の引数（autorename / portdetect）
 #[derive(Args)]
-struct AutorenameArgs {
+struct ToggleArgs {
     /// on = 有効化、off = 無効化（省略時は現在状態を表示）
     #[arg(value_parser = ["on", "off"])]
     state: Option<String>,
@@ -469,6 +472,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Autorename(args) => Request::AutoRename {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
+        Command::Portdetect(args) => Request::PortDetect {
+            enabled: args.state.as_deref().map(|s| s == "on"),
+        },
         Command::Tmux(TmuxCommand::List { socket }) => Request::TmuxList {
             socket: socket.clone(),
         },
@@ -547,7 +553,7 @@ fn print_result(command: &Command, result: &Value) {
             );
         }
         Command::Tab(TabCommand::New { .. }) => println!("{result}"),
-        Command::Autorename(_) => println!("{result}"),
+        Command::Autorename(_) | Command::Portdetect(_) => println!("{result}"),
         Command::Tmux(TmuxCommand::List { .. }) => {
             println!(
                 "{}",

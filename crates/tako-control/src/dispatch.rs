@@ -32,6 +32,12 @@ pub trait ControlHost {
     }
     /// AI 自動リネームの ON/OFF 切替（永続化は実装側の責務）
     fn set_auto_rename(&mut self, _enabled: bool) {}
+    /// listen ポート検知 + 提案チップ（FR-2.4.4）の現在状態
+    fn port_detect_enabled(&self) -> bool {
+        true
+    }
+    /// listen ポート検知の ON/OFF 切替（永続化・検知済み情報の掃除は実装側の責務）
+    fn set_port_detect(&mut self, _enabled: bool) {}
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -363,6 +369,13 @@ pub fn dispatch(
                 host.set_auto_rename(enabled);
             }
             Ok(json!({ "enabled": host.auto_rename_enabled() }))
+        }
+
+        Request::PortDetect { enabled } => {
+            if let Some(enabled) = enabled {
+                host.set_port_detect(enabled);
+            }
+            Ok(json!({ "enabled": host.port_detect_enabled() }))
         }
     }
 }

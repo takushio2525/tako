@@ -155,6 +155,9 @@ pub enum Request {
     /// タブ・ペイン名の AI 自動リネーム（FR-2.12.4）の ON/OFF。
     /// `enabled` 省略時は現在状態の取得のみ。設定は永続化される
     AutoRename { enabled: Option<bool> },
+    /// listen ポート検知 + 提案チップ（FR-2.4.4）の ON/OFF。
+    /// `enabled` 省略時は現在状態の取得のみ。設定は永続化される
+    PortDetect { enabled: Option<bool> },
 }
 
 /// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。

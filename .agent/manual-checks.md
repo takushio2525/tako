@@ -107,3 +107,14 @@ role / title の設定・取得自体はセルフテスト（`tako title / role 
 - [ ] `tako tab rename --tab N ''`（空文字）で手動指定が解除され、自動リネームが再開する
 - [ ] `tako autorename off` で止まり、再起動後も OFF が維持される（settings.json）
 - [ ] claude CLI の無い環境（PATH から外す）で OSC タイトル / cwd 由来の名前に劣化する
+
+## listen ポート検知と提案チップ（FR-2.4.2〜2.4.4）
+
+検知・チップの状態遷移・OFF トグルはセルフテスト（項目 53〜55）で機械検証済み。
+見た目と実サーバーでの体験は常用で確認:
+
+- [ ] `npm run dev` 等で dev サーバーを起動すると数秒以内にペイン下端へ
+      「localhost:PORT（プロセス名）が listen 中」チップが出る
+- [ ] 「ブラウザで開く」で既定ブラウザに該当 URL が開き、チップが消える
+- [ ] 「×」で消え、同じサーバーが動いている間は再提案されない（再起動で再提案）
+- [ ] `tako portdetect off` でチップ・list の listen_ports が消え、再起動後も OFF が維持される

@@ -176,6 +176,42 @@ fn initial_auto_rename() -> bool {
     tako_control::settings::load().auto_rename
 }
 
+/// listen ポート検知（FR-2.4.4）の起動時の有効判定。
+/// セルフテストでは検知経路そのものを機械検証するため常に有効で始める
+fn initial_port_detect() -> bool {
+    if std::env::var_os("TAKO_SELF_TEST").is_some() {
+        return true;
+    }
+    if matches!(
+        std::env::var("TAKO_PORT_DETECT").ok().as_deref(),
+        Some("0" | "false" | "off")
+    ) {
+        return false;
+    }
+    tako_control::settings::load().port_detect
+}
+
+/// プレビューを開く（提案チップ承諾アクションの**差し替え点**）。
+/// 当面は外部ブラウザで開き、Phase 5 で Web ビューペイン（FR-3.8）が入ったら
+/// ここをペイン生成（`tako_open_url` 相当）へ差し替える
+fn open_preview(url: &str) {
+    // セルフテスト中に実ブラウザを開かない（チップの状態遷移だけ検証する）
+    if std::env::var_os("TAKO_SELF_TEST").is_some() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open").arg(url).spawn();
+    if let Err(e) = result {
+        eprintln!("warning: ブラウザを開けない: {e}");
+    }
+}
+
 /// IME 変換中（未確定文字列 = marked text）の状態（FR-1.9）。
 /// 変換開始時のフォーカスペインを保持し、変換途中でフォーカスが移っても確定先がぶれないようにする
 struct ImeComposition {
@@ -237,6 +273,20 @@ struct TakoApp {
     tmux_pending_kill: Option<(String, Option<u32>)>,
     /// タブ・ペイン名の AI 自動リネームの検知状態（FR-2.12。ループは new で張る）
     autorename: autorename::AutoRenamer,
+    /// listen ポート検知 + 提案チップの有効状態（FR-2.4.4。dispatch から切替）
+    port_detect: bool,
+    /// 表示中の提案チップ（FR-2.4.3。新規 listen ポートごとに 1 件）
+    port_suggestions: Vec<PortSuggestion>,
+    /// 却下済みの (ペイン, ポート)。ポートが消えるまで再提案しない
+    dismissed_ports: std::collections::HashSet<(PaneId, u16)>,
+}
+
+/// 提案チップ 1 件分（FR-2.4.3。「localhost:PORT をブラウザで開く？」）
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PortSuggestion {
+    pane: PaneId,
+    port: u16,
+    process: String,
 }
 
 /// ドラッグ中の境界の情報。座標→比率換算に必要な分割領域と軸を握っておく
@@ -320,6 +370,9 @@ impl TakoApp {
             tmux_sessions: Vec::new(),
             tmux_pending_kill: None,
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
+            port_detect: initial_port_detect(),
+            port_suggestions: Vec::new(),
+            dismissed_ports: std::collections::HashSet::new(),
         };
         let root_id = app.workspace.active_tab().tree().focused();
         if let Err(e) = app.spawn_session(root_id, SpawnOptions::default(), cx) {
@@ -401,11 +454,14 @@ impl TakoApp {
         .detach();
 
         // listen ポート検知（FR-2.4.2）。ペインの tty とプロセスの制御端末を突き合わせ、
-        // 配下の LISTEN 中 TCP ポートを 3 秒毎に拾って list / MCP へ公開する
-        // （提案チップ FR-2.4.3 はこの素材を使う）。スキャンはバックグラウンドで行う
+        // 配下の LISTEN 中 TCP ポートを 3 秒毎に拾って list / MCP へ公開し、
+        // 新規ポートには提案チップを立てる（FR-2.4.3）。スキャンはバックグラウンドで行う
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(3)).await;
             let Ok(ttys) = this.update(cx, |app: &mut TakoApp, _| {
+                if !app.port_detect {
+                    return Vec::new(); // 無効中（FR-2.4.4）は何もしない
+                }
                 app.terminals
                     .iter()
                     .filter_map(|(pane, session)| {
@@ -427,11 +483,46 @@ impl TakoApp {
             let result = this.update(cx, |app: &mut TakoApp, cx| {
                 let mut changed = false;
                 for (pane, rdev) in &ttys {
-                    if let Some(session) = app.terminals.get_mut(pane) {
-                        let ports = scanned.remove(rdev).unwrap_or_default();
-                        changed |= session.set_listen_ports(ports);
+                    let Some(session) = app.terminals.get_mut(pane) else {
+                        continue;
+                    };
+                    let ports = scanned.remove(rdev).unwrap_or_default();
+                    let old: std::collections::HashSet<u16> =
+                        session.listen_ports().iter().map(|p| p.port).collect();
+                    if !session.set_listen_ports(ports) {
+                        continue;
+                    }
+                    changed = true;
+                    let now: Vec<(u16, String)> = session
+                        .listen_ports()
+                        .iter()
+                        .map(|p| (p.port, p.process.clone()))
+                        .collect();
+                    // 消えたポートのチップ・却下記録は掃除（再 listen で再提案される）
+                    app.port_suggestions
+                        .retain(|s| s.pane != *pane || now.iter().any(|(port, _)| *port == s.port));
+                    app.dismissed_ports
+                        .retain(|(p, port)| p != pane || now.iter().any(|(q, _)| q == port));
+                    // 新規ポート → 提案チップ（FR-2.4.3。表示だけで強制分割はしない）
+                    for (port, process) in &now {
+                        let fresh = !old.contains(port)
+                            && !app.dismissed_ports.contains(&(*pane, *port))
+                            && !app
+                                .port_suggestions
+                                .iter()
+                                .any(|s| s.pane == *pane && s.port == *port);
+                        if fresh {
+                            app.port_suggestions.push(PortSuggestion {
+                                pane: *pane,
+                                port: *port,
+                                process: process.clone(),
+                            });
+                        }
                     }
                 }
+                // 閉じられたペインのチップを掃除
+                app.port_suggestions
+                    .retain(|s| app.terminals.contains_key(&s.pane));
                 if changed {
                     cx.notify();
                 }
@@ -565,6 +656,22 @@ impl TakoApp {
                 }
             }
         }
+        cx.notify();
+    }
+
+    /// 提案チップの承諾（FR-2.4.3）。プレビューを開いてチップを畳む
+    fn accept_port_suggestion(&mut self, pane: PaneId, port: u16, cx: &mut Context<Self>) {
+        self.port_suggestions
+            .retain(|s| !(s.pane == pane && s.port == port));
+        open_preview(&format!("http://localhost:{port}"));
+        cx.notify();
+    }
+
+    /// 提案チップの却下。同じポートが listen し続ける間は再提案しない
+    fn dismiss_port_suggestion(&mut self, pane: PaneId, port: u16, cx: &mut Context<Self>) {
+        self.port_suggestions
+            .retain(|s| !(s.pane == pane && s.port == port));
+        self.dismissed_ports.insert((pane, port));
         cx.notify();
     }
 
@@ -1548,6 +1655,13 @@ impl TakoApp {
             Some((top, thumb_h, track_h, dragging))
         });
 
+        // 提案チップ（FR-2.4.3）。このペインの先頭 1 件だけ下端に出す（残りは閉じたら順に）
+        let suggestion = self
+            .port_suggestions
+            .iter()
+            .find(|s| s.pane == pane_id)
+            .map(|s| (s.port, s.process.clone()));
+
         let screen = self.terminals.get(&pane_id).map(|s| s.screen(&theme));
 
         let lines: Vec<_> = screen
@@ -1705,6 +1819,60 @@ impl TakoApp {
                     )
                     .children(badge_label.map(|label| SharedString::from(truncate(&label, 32))))
             }))
+            .children(suggestion.map(|(port, process)| {
+                // 提案チップ（FR-2.4.3）: 検知ペイン下端のインライン表示。
+                // 承諾アクションは open_preview（当面は外部ブラウザ。差し替え点）
+                let label = if process.is_empty() {
+                    format!("localhost:{port} が listen 中")
+                } else {
+                    format!("localhost:{port}（{process}）が listen 中")
+                };
+                div()
+                    .id(("port-chip", pane_id.as_u64()))
+                    .absolute()
+                    .bottom(px(4.0))
+                    .left(px(8.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .occlude() // 下のペインへの選択開始を防ぐ
+                    .bg(rgba(theme.tab_bar_background))
+                    .border_1()
+                    .border_color(hsla(theme.accent))
+                    .text_size(px(11.0))
+                    .text_color(hsla(theme.foreground))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                    )
+                    .child(SharedString::from(label))
+                    .child(
+                        div()
+                            .id(("port-chip-open", pane_id.as_u64()))
+                            .cursor_pointer()
+                            .text_color(hsla(theme.accent))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.accept_port_suggestion(pane_id, port, cx);
+                            }))
+                            .child("ブラウザで開く"),
+                    )
+                    .child(
+                        div()
+                            .id(("port-chip-dismiss", pane_id.as_u64()))
+                            .cursor_pointer()
+                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.7))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.dismiss_port_suggestion(pane_id, port, cx);
+                            }))
+                            .child("×"),
+                    )
+            }))
     }
 }
 
@@ -1742,6 +1910,30 @@ impl ControlHost for TakoApp {
         if std::env::var_os("TAKO_SELF_TEST").is_none() {
             let mut settings = tako_control::settings::load();
             settings.auto_rename = enabled;
+            if let Err(e) = tako_control::settings::save(&settings) {
+                eprintln!("warning: 設定を保存できない: {e}");
+            }
+        }
+    }
+
+    fn port_detect_enabled(&self) -> bool {
+        self.port_detect
+    }
+
+    fn set_port_detect(&mut self, enabled: bool) {
+        self.port_detect = enabled;
+        if !enabled {
+            // 検知済み情報も掃除する（list の listen_ports / 表示中チップ / 却下記録）
+            for session in self.terminals.values_mut() {
+                session.set_listen_ports(Vec::new());
+            }
+            self.port_suggestions.clear();
+            self.dismissed_ports.clear();
+        }
+        // 永続化（FR-2.4.4）。セルフテスト中はユーザー設定を汚さない
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.port_detect = enabled;
             if let Err(e) = tako_control::settings::save(&settings) {
                 eprintln!("warning: 設定を保存できない: {e}");
             }
@@ -3140,7 +3332,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 17, "MCP tools/list は 17 ツール");
+            check(status == 200 && tool_count == 18, "MCP tools/list は 18 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -3895,6 +4087,59 @@ mod self_test {
                 })
                 .unwrap_or(false);
             check(listed, "list に listen_ports が公開される");
+
+            // 54. 提案チップ（FR-2.4.3）: 新規 listen ポートでチップが立ち、却下で消え、
+            //     却下中は同じポートを再提案しない
+            let chip_up = window
+                .update(cx, |app, _, _| {
+                    let pane = app.focused_pane();
+                    app.port_suggestions
+                        .iter()
+                        .any(|s| s.pane == pane && s.port == free_port)
+                })
+                .unwrap_or(false);
+            check(chip_up, "listen 検知で提案チップが立つ");
+            let chip_dismissed = window
+                .update(cx, |app, _, cx| {
+                    let pane = app.focused_pane();
+                    app.dismiss_port_suggestion(pane, free_port, cx);
+                    !app.port_suggestions
+                        .iter()
+                        .any(|s| s.pane == pane && s.port == free_port)
+                        && app.dismissed_ports.contains(&(pane, free_port))
+                })
+                .unwrap_or(false);
+            check(chip_dismissed, "チップの却下と再提案抑止");
+
+            // 55. tako portdetect の ON/OFF（FR-2.4.4。CLI / MCP と同じ dispatch 経路）。
+            //     無効化で listen_ports・チップが掃除される
+            type_text(
+                any,
+                cx,
+                &format!(
+                    "{cli} portdetect off >/dev/null && {cli} portdetect \
+                     | grep -q '\"enabled\":false' && echo TAKO-PD-$((50+5))"
+                ),
+                true,
+            );
+            wait(cx, 1200).await;
+            check(
+                focused_contains(window, cx, "TAKO-PD-55"),
+                "tako portdetect off / 状態取得",
+            );
+            let detect_cleared = window
+                .update(cx, |app, _, _| {
+                    !app.port_detect
+                        && app.port_suggestions.is_empty()
+                        && app
+                            .terminals
+                            .values()
+                            .all(|s| s.listen_ports().is_empty())
+                })
+                .unwrap_or(false);
+            check(detect_cleared, "ポート検知の無効化で検知済み情報がクリアされる");
+            type_text(any, cx, &format!("{cli} portdetect on >/dev/null"), true);
+            wait(cx, 800).await;
             type_text(any, cx, "kill %1 2>/dev/null", true);
             wait(cx, 500).await;
 

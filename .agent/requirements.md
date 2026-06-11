@@ -121,6 +121,19 @@ MCP stdio ブリッジ（`tako mcp serve`）のフォールバックは「環境
 | FR-2.4.3 | 検知時に「プレビューを開く？」等の**提案チップ**を表示。承諾時のみペイン生成（強制分割はしない） | S |
 | FR-2.4.4 | パッシブ検知全体を設定で無効化できる | M |
 
+実装メモ（FR-2.4.2〜2.4.4 は 2026-06-12 完成）:
+
+- 検知は `tako-core::ports`（libproc + tty 突き合わせ、3 秒ポーリング）→ list / MCP の
+  `listen_ports`。詳細は `architecture.md`「Layer 3」節
+- チップは検知ペイン下端のインライン表示（新規ポートごとに 1 件、却下でそのポートが
+  消えるまで再提案しない）。承諾アクションは `open_preview`（**差し替え点**。当面は
+  外部ブラウザ `open`、Phase 5 の Web ビューペイン FR-3.8 実装後にペイン生成へ差し替え。
+  2026-06-12 ユーザー承認の設計）
+- OFF は `settings.json` の `port_detect` + dispatch `PortDetect`
+  （`tako portdetect on|off` / MCP `tako_port_detect`、計 18 ツール）+
+  env `TAKO_PORT_DETECT=0|false|off`。無効化時は検知済み情報（listen_ports・チップ・
+  却下記録）も掃除する
+
 ### FR-2.5 AI レイアウト操作セット（Layer 1 / Layer 2 共通）
 
 > 方針: **AI での開発がやりやすく、かつ AI が開発をアシストできる**こと（設計原則 5「AI フルコントロール」の具体化）。
