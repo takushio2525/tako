@@ -130,12 +130,17 @@ pub enum Request {
     MovePane { pane: Option<u64>, tab: u64 },
 }
 
-/// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）
+/// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。
+/// `origin` は生成主体の自己申告（`"mcp"` = MCP 経由。省略時は CLI）。
+/// トークンを持つプロセスは信頼済みのため、これは UI 表示・ポリシー用のラベルであって
+/// セキュリティ境界ではない
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RequestEnvelope {
     pub jsonrpc: String,
     pub id: u64,
     pub token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     #[serde(flatten)]
     pub request: Request,
 }
@@ -146,6 +151,7 @@ impl RequestEnvelope {
             jsonrpc: JSONRPC_VERSION.into(),
             id,
             token: token.into(),
+            origin: None,
             request,
         }
     }

@@ -10,7 +10,8 @@ iTerm2 + Zed の思想で Zed 級に高速・軽量。macOS 先行、Windows 対
 
 - 目的: AI エージェント（Claude Code 等）+ 子エージェント + dev サーバーを「1 グループ = 1 タブ」で集約監視する
 - 対象: AI エージェントで開発する開発者。**ただしゼロコンフィグで一般ユーザーが使えることが最優先の設計原則**
-- 状況: **Phase 1（macOS MVP）/ Phase 2（Layer 1 CLI + 環境変数注入）完了。次は Phase 3（内蔵 MCP サーバー）**
+- 状況: **Phase 1〜3 コア完了（macOS MVP / Layer 1 CLI / Layer 2 内蔵 MCP サーバー）。
+  次は Phase 3 残（role/状態表示 UI）→ Phase 4（パッシブ検知）**
 
 ## 技術スタック
 
@@ -30,9 +31,9 @@ tako/
 ├── README.md / LICENSE     ← 人間向け・Apache-2.0
 ├── crates/
 │   ├── tako-core/          ← ドメインモデル（PaneTree / Workspace / TerminalSession、GPUI 非依存）
-│   ├── tako-control/       ← 制御プレーン（IPC + dispatch 実装済み。MCP / 検知は Phase 3/4）
-│   ├── tako-app/           ← GPUI バイナリ（GPUI 依存はここだけ）
-│   └── tako-cli/           ← Layer 1 CLI（`tako` コマンド。IPC 経由でペイン / タブを操作）
+│   ├── tako-control/       ← 制御プレーン（IPC + dispatch + MCP 実装済み。検知は Phase 4）
+│   ├── tako-app/           ← GPUI バイナリ（GPUI 依存はここだけ。IPC / MCP サーバー内蔵）
+│   └── tako-cli/           ← Layer 1 CLI（`tako` コマンド）+ MCP stdio ブリッジ（`tako mcp serve`）
 ├── poc/                    ← Phase 0 の使い捨て検証コード（品質基準の対象外）
 └── .github/workflows/      ← CI（macOS / Windows ビルド + テスト）
 ```
@@ -59,7 +60,8 @@ tako/
 | 操作 | コマンド |
 |---|---|
 | dev（最小ターミナル起動） | `cargo run -p tako-app` |
-| セルフテスト起動（入力経路 + CLI e2e の機械検証） | `TAKO_SELF_TEST=1 cargo run -p tako-app` |
+| セルフテスト起動（入力経路 + CLI / MCP e2e の機械検証） | `TAKO_SELF_TEST=1 cargo run -p tako-app` |
+| Claude Code 実機検証（MCP 設定ゼロ接続） | `scripts/verify-claude-mcp.sh`（要 claude CLI + 認証） |
 | `tako` CLI ビルド | `cargo build -p tako-cli`（バイナリは `target/debug/tako`） |
 | build | `cargo build --workspace` |
 | lint | `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` |

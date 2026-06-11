@@ -63,19 +63,26 @@ GPUI バージョン戦略は **zed リポ git rev 固定**（`architecture.md` 
 → セルフテスト 29 項目（ペイン内シェルから実 `tako` CLI を叩く e2e 含む）で機械検証済み。
 tmux 系オーケストレーターの実地差し替えは Phase 3 以降の常用で確認する。
 
-## Phase 3: Layer 2 — 内蔵 MCP サーバー（最大の差別化点）
+## Phase 3: Layer 2 — 内蔵 MCP サーバー（最大の差別化点）→ ✅ コア完了（2026-06-11。残: role/状態表示 UI）
 
-- [ ] MCP サーバー内蔵（IPC と操作セットを共有、FR-2.3.1）
-- [ ] `TAKO_MCP_URL` による自動発見 + トークン認証（FR-2.3.2 / 2.3.4）
-- [ ] 呼び出し元ペイン特定と同タブスコープ制限（FR-2.3.3）
-- [ ] Claude Code をリファレンスとした設定ゼロ接続の実証
-- [ ] ペインの role ラベルと状態表示 UI（FR-2.1.3〜2.1.4）
-- [ ] FR-2.5 レイアウト操作セットの MCP 公開（リサイズ・均等化・タブ操作 FR-2.5.10 は
-      Phase 2 で CLI / dispatch 実装済み → MCP ツールとして公開するだけ。
+- [x] MCP サーバー内蔵（IPC と操作セットを共有、FR-2.3.1。エンジン + Streamable HTTP +
+      stdio ブリッジ `tako mcp serve` の構成は `architecture.md`「Layer 2」節）
+- [x] `TAKO_MCP_URL` による自動発見 + トークン認証（FR-2.3.2 / 2.3.4。Bearer + Origin 検証。
+      Claude Code は環境変数からの自動発見機構を持たないため、現実解は
+      user スコープへの stdio ブリッジ登録 1 回 → 以後ゼロ設定）
+- [x] 呼び出し元ペイン特定と同タブスコープ制限（FR-2.3.3。特定 = TAKO_PANE_ID /
+      X-Tako-Pane、省略時デフォルトが同タブに解決。ハード強制は FR-2.3.5 と併せて後段）
+- [x] Claude Code をリファレンスとした設定ゼロ接続の実証
+      （`scripts/verify-claude-mcp.sh`。stdio / HTTP 両経路で実 `claude -p` が通る）
+- [ ] ペインの role ラベルと状態表示 UI（FR-2.1.3〜2.1.4。role の設定・取得自体は
+      CLI / MCP で可能。**UI 表示が未実装** → Phase 4 の集約センターと併せて実装）
+- [x] FR-2.5 レイアウト操作セットの MCP 公開（12 ツール。
       ファイル/URL 系 FR-2.5.11〜12 は Phase 5 のペイン種別実装後）
 
 **Exit Criteria**: tako 内で Claude Code を起動し、**何も設定せずに**
 「dev サーバーを隣のペインで起動して」が通る。
+→ 機械検証（セルフテスト 36 項目 + verify-claude-mcp.sh）で経路は実証済み。
+GUI 内での常用体験は初回登録（`claude mcp add --scope user`）後に日常使いで確認する。
 
 ## Phase 4: Layer 3 — パッシブ検知
 

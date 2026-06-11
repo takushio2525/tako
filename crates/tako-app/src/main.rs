@@ -10,7 +10,8 @@
 //!
 //! `TAKO_SELF_TEST=1` で起動すると、キーディスパッチ経由で入力・分割・タブ・色・
 //! スクロールバック・コピペの経路に加え、Phase 2 の制御プレーン（環境変数注入・
-//! IPC・`tako` CLI の e2e）を機械検証して終了する。
+//! IPC・`tako` CLI の e2e）と Phase 3 の内蔵 MCP サーバー（Streamable HTTP +
+//! stdio ブリッジ）を機械検証して終了する。
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -25,7 +26,7 @@ use gpui::{
     UnderlineStyle, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
-use tako_control::{ControlHost, IncomingRequest, IpcServer};
+use tako_control::{ControlHost, IncomingRequest, IpcServer, McpServer};
 use tako_core::{
     Pane, PaneId, PaneOrigin, Rect, SelectionKind, SessionNotice, SpawnOptions, SplitAxis,
     SplitDirection, TabId, TerminalSession, Theme, Workspace,
@@ -134,22 +135,48 @@ struct TakoApp {
     pane_text_areas: Vec<(PaneId, Bounds<Pixels>)>,
     /// Layer 1 IPC サーバー（FR-2.2 の受け口。起動失敗時は None で IPC なし動作）
     ipc: Option<IpcServer>,
+    /// Layer 2 内蔵 MCP サーバー（FR-2.3 の受け口。起動失敗時は None で MCP なし動作）
+    mcp: Option<McpServer>,
+    /// IPC / MCP 共有のセッション認証トークン（FR-2.3.4。ログに出さない）
+    token: Option<String>,
     /// dispatch 中に依頼されたセッション起動（GPUI の Context が要るため遅延実行する）
     pending_attach: Vec<(PaneId, SpawnOptions)>,
 }
 
 impl TakoApp {
     fn new(cx: &mut Context<Self>) -> Self {
-        // IPC サーバー（Layer 1 の受け口）。最初のセッション起動より前に立てて
-        // ルートペインのシェルにも TAKO_SOCKET / TAKO_TOKEN を注入できるようにする
+        // IPC（Layer 1）と MCP（Layer 2）の受け口。最初のセッション起動より前に立てて
+        // ルートペインのシェルにも TAKO_SOCKET / TAKO_MCP_URL / TAKO_TOKEN を注入できるようにする。
+        // 認証トークンは両者で共有する（FR-2.3.4）
         let (control_tx, mut control_rx) = unbounded::<IncomingRequest>();
-        let ipc = match IpcServer::start(control_tx) {
-            Ok(server) => Some(server),
+        let token = match tako_control::generate_token() {
+            Ok(token) => Some(token),
             Err(e) => {
-                eprintln!("warning: IPC サーバーを起動できない（tako CLI は使えない）: {e}");
+                eprintln!("warning: 認証トークンを生成できない（IPC / MCP は使えない）: {e}");
                 None
             }
         };
+        let ipc = token.as_ref().and_then(|token| {
+            match IpcServer::start(control_tx.clone(), token.clone()) {
+                Ok(server) => Some(server),
+                Err(e) => {
+                    eprintln!("warning: IPC サーバーを起動できない（tako CLI は使えない）: {e}");
+                    None
+                }
+            }
+        });
+        let mcp =
+            token
+                .as_ref()
+                .and_then(|token| match McpServer::start(control_tx, token.clone()) {
+                    Ok(server) => Some(server),
+                    Err(e) => {
+                        eprintln!(
+                        "warning: MCP サーバーを起動できない（エージェント連携は使えない）: {e}"
+                    );
+                        None
+                    }
+                });
 
         let mut app = Self {
             // ルートペインは下の spawn_session でセッションを張る
@@ -161,6 +188,8 @@ impl TakoApp {
             selecting: None,
             pane_text_areas: Vec::new(),
             ipc,
+            mcp,
+            token,
             pending_attach: Vec::new(),
         };
         let root_id = app.workspace.active_tab().tree().focused();
@@ -171,7 +200,7 @@ impl TakoApp {
         cx.spawn(async move |this, cx| {
             while let Some(incoming) = control_rx.next().await {
                 let result = this.update(cx, |app: &mut TakoApp, cx| {
-                    let result = tako_control::dispatch(app, incoming.request, PaneOrigin::Cli);
+                    let result = tako_control::dispatch(app, incoming.request, incoming.origin);
                     // dispatch が依頼したセッション起動をここで実行（Context が要るため）
                     for (pane, options) in std::mem::take(&mut app.pending_attach) {
                         app.spawn_session(pane, options, cx);
@@ -211,9 +240,16 @@ impl TakoApp {
             options
                 .env
                 .push(("TAKO_SOCKET".into(), ipc.endpoint().to_string()));
+        }
+        if let Some(mcp) = &self.mcp {
             options
                 .env
-                .push(("TAKO_TOKEN".into(), ipc.token().to_string()));
+                .push(("TAKO_MCP_URL".into(), mcp.url().to_string()));
+        }
+        if self.ipc.is_some() || self.mcp.is_some() {
+            if let Some(token) = &self.token {
+                options.env.push(("TAKO_TOKEN".into(), token.clone()));
+            }
         }
         let (session, mut rx) = TerminalSession::spawn(INITIAL_COLS, INITIAL_ROWS, options)
             .expect("PTY 付きシェルを起動できなかった");
@@ -912,7 +948,8 @@ fn main() {
 
 /// セルフテスト: キーディスパッチ経由で入力・分割・フォーカス・リサイズ・タブ・色・
 /// スクロールバック・コピペの経路（1〜13）と、制御プレーンの環境変数注入 +
-/// ペイン内シェルから実 `tako` CLI を叩く e2e（14〜29）を機械検証して終了する。
+/// ペイン内シェルから実 `tako` CLI を叩く e2e（14〜29）、内蔵 MCP サーバー
+/// （Streamable HTTP + stdio ブリッジ、30〜36）を機械検証して終了する。
 /// `WindowHandle<V>::update` 内の dispatch_keystroke はルートビューの二重借用で
 /// パニックするため AnyWindowHandle::update を使う（poc/README.md）
 mod self_test {
@@ -957,6 +994,132 @@ mod self_test {
                 cx,
             );
         });
+    }
+
+    /// 最小 HTTP クライアント（MCP Streamable HTTP の機械検証用）。(status, body) を返す
+    fn mcp_post(
+        url: &str,
+        token: Option<&str>,
+        extra_headers: &[(&str, &str)],
+        body: &str,
+    ) -> Option<(u16, String)> {
+        use std::io::{Read, Write};
+        let rest = url.strip_prefix("http://")?;
+        let (hostport, path) = rest.split_once('/')?;
+        let mut stream = std::net::TcpStream::connect(hostport).ok()?;
+        let mut request = format!(
+            "POST /{path} HTTP/1.1\r\nHost: {hostport}\r\nContent-Type: application/json\r\n\
+             Accept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        if let Some(token) = token {
+            request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        }
+        for (name, value) in extra_headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        request.push_str(body);
+        stream.write_all(request.as_bytes()).ok()?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response).ok()?;
+        let status = response.split_whitespace().nth(1)?.parse().ok()?;
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
+        Some((status, body))
+    }
+
+    /// [`mcp_post`] をバックグラウンドスレッドで実行する。このセルフテスト future は
+    /// メインスレッド（foreground executor）で動いており、ここで同期ブロックすると
+    /// 同じスレッドの dispatch ループが止まり tools/call の応答待ちとデッドロックする
+    async fn mcp_post_bg(
+        cx: &AsyncApp,
+        url: &str,
+        token: Option<&str>,
+        extra_headers: &[(&str, &str)],
+        body: &str,
+    ) -> Option<(u16, String)> {
+        let url = url.to_string();
+        let token = token.map(str::to_string);
+        let headers: Vec<(String, String)> = extra_headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let body = body.to_string();
+        cx.background_executor()
+            .spawn(async move {
+                let headers: Vec<(&str, &str)> = headers
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+                mcp_post(&url, token.as_deref(), &headers, &body)
+            })
+            .await
+    }
+
+    /// [`bridge_roundtrip`] のバックグラウンド版（デッドロック回避は mcp_post_bg と同じ理由。
+    /// ブリッジの tools/call は IPC 経由で UI スレッドの dispatch を待つ）
+    async fn bridge_roundtrip_bg(
+        cx: &AsyncApp,
+        cli: std::path::PathBuf,
+        envs: Vec<(String, String)>,
+        inputs: &[&'static str],
+    ) -> Vec<String> {
+        let inputs = inputs.to_vec();
+        cx.background_executor()
+            .spawn(async move {
+                let envs: Vec<(&str, &str)> =
+                    envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                bridge_roundtrip(&cli, &envs, &inputs)
+            })
+            .await
+    }
+
+    /// stdio ブリッジ（`tako mcp serve`）へ MCP メッセージ列を流し、応答行を回収する。
+    /// 指定した TAKO_* 以外は環境から除去し、tako 内 / 外の両状態を再現できるようにする
+    fn bridge_roundtrip(
+        cli: &std::path::Path,
+        envs: &[(&str, &str)],
+        inputs: &[&str],
+    ) -> Vec<String> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut command = Command::new(cli);
+        command
+            .args(["mcp", "serve"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        for key in [
+            "TAKO_SOCKET",
+            "TAKO_TOKEN",
+            "TAKO_PANE_ID",
+            "TAKO_TAB_ID",
+            "TAKO_MCP_URL",
+        ] {
+            command.env_remove(key);
+        }
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let Ok(mut child) = command.spawn() else {
+            return Vec::new();
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            for line in inputs {
+                let _ = writeln!(stdin, "{line}");
+            }
+            // drop で stdin が閉じ、ブリッジは EOF で終了する
+        }
+        let Ok(output) = child.wait_with_output() else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(String::from)
+            .collect()
     }
 
     /// フォーカス中ペインの表示行に needle が含まれるか
@@ -1187,7 +1350,7 @@ mod self_test {
             // 出力マーカーは `$((40+2))` で組み立て、入力エコー行との誤一致を防ぐ
 
             // 14. CLI バイナリの準備（target/debug/tako。常にビルドして鮮度を保証）
-            let cli = {
+            let (cli_path, cli) = {
                 let built = std::process::Command::new("cargo")
                     .args(["build", "-p", "tako-cli", "--quiet"])
                     .status()
@@ -1201,7 +1364,8 @@ mod self_test {
                     fail("tako CLI のビルド / パス特定");
                 };
                 check(built, "tako CLI のビルド");
-                format!("\"{}\"", path.display())
+                let quoted = format!("\"{}\"", path.display());
+                (path, quoted)
             };
 
             // 現状: タブ 1 = {ペイン 2}（アクティブ・フォーカス中）、タブ 2 = {ペイン 3}
@@ -1433,6 +1597,184 @@ mod self_test {
                 .unwrap_or(false);
                 check(auth_rejected, "不正トークンの拒否");
             }
+
+            // --- Phase 3: 内蔵 MCP サーバー（Streamable HTTP + stdio ブリッジ）---
+
+            // 30. TAKO_MCP_URL の注入（FR-2.3.2）
+            press(any, cx, "ctrl-u");
+            type_text(
+                any,
+                cx,
+                "[ -n \"$TAKO_MCP_URL\" ] && echo TAKO-MCPENV-$((40+2))",
+                true,
+            );
+            wait(cx, 800).await;
+            check(
+                focused_contains(window, cx, "TAKO-MCPENV-42"),
+                "TAKO_MCP_URL 注入",
+            );
+
+            // MCP / IPC の接続情報と呼び出し元ペインを取得
+            let (mcp_url, token, ipc_endpoint, caller) = window
+                .update(cx, |app, _, _| {
+                    (
+                        app.mcp.as_ref().map(|m| m.url().to_string()),
+                        app.token.clone(),
+                        app.ipc.as_ref().map(|i| i.endpoint().to_string()),
+                        app.focused_pane(),
+                    )
+                })
+                .unwrap_or_else(|_| fail("MCP 接続情報の取得"));
+            let Some(mcp_url) = mcp_url else {
+                fail("MCP サーバーの起動");
+            };
+            let Some(token) = token else {
+                fail("セッショントークンの生成");
+            };
+            let Some(ipc_endpoint) = ipc_endpoint else {
+                fail("IPC エンドポイントの取得");
+            };
+            let caller_str = caller.to_string();
+            const INIT_MSG: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"self-test","version":"0"}}}"#;
+            const INITIALIZED_MSG: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+            const TOOLS_LIST_MSG: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+            const LIST_CALL_MSG: &str = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"tako_list_panes","arguments":{}}}"#;
+
+            // 31. MCP initialize ハンドシェイク + initialized 通知（FR-2.3.1）
+            let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], INIT_MSG)
+                .await
+                .unwrap_or_else(|| fail("MCP initialize 接続"));
+            check(
+                status == 200
+                    && response.contains(r#""serverInfo""#)
+                    && response.contains("tako"),
+                "MCP initialize",
+            );
+            let (status, _) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], INITIALIZED_MSG)
+                .await
+                .unwrap_or_else(|| fail("MCP initialized 通知"));
+            check(status == 202, "MCP 通知は 202");
+
+            // 32. tools/list が FR-2.5 の操作セットを公開している
+            let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], TOOLS_LIST_MSG)
+                .await
+                .unwrap_or_else(|| fail("MCP tools/list 接続"));
+            let tool_count = serde_json::from_str::<serde_json::Value>(&response)
+                .ok()
+                .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
+                .unwrap_or(0);
+            check(status == 200 && tool_count == 12, "MCP tools/list は 12 ツール");
+
+            // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
+            let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
+                .await
+                .unwrap_or_else(|| fail("MCP list_panes 接続"));
+            check(
+                status == 200
+                    && response.contains("tabs")
+                    && response.contains(r#""isError":false"#),
+                "MCP list_panes",
+            );
+
+            // 34. tools/call tako_split_pane（X-Tako-Pane で呼び出し元特定 + origin=mcp）と
+            //     tako_close_pane での片付け（FR-2.3.3 / FR-2.5.3〜4）
+            let (status, response) = mcp_post_bg(
+                cx,
+                &mcp_url,
+                Some(&token),
+                &[("X-Tako-Pane", &caller_str)],
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tako_split_pane","arguments":{"direction":"down"}}}"#,
+            )
+            .await
+            .unwrap_or_else(|| fail("MCP split 接続"));
+            check(status == 200, "MCP split 応答");
+            let new_pane = serde_json::from_str::<serde_json::Value>(&response)
+                .ok()
+                .and_then(|v| {
+                    v["result"]["content"][0]["text"]
+                        .as_str()
+                        .map(str::to_string)
+                })
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .and_then(|v| v["pane"].as_u64())
+                .unwrap_or_else(|| fail("MCP split の応答解釈"));
+            wait(cx, 1200).await;
+            let origin_mcp = window
+                .update(cx, |app, _, _| {
+                    app.workspace
+                        .active_tab()
+                        .tree()
+                        .panes()
+                        .iter()
+                        .find(|p| p.id().as_u64() == new_pane)
+                        .map(|p| p.origin())
+                        == Some(PaneOrigin::Mcp)
+                })
+                .unwrap_or(false);
+            check(origin_mcp, "MCP split（origin=mcp）");
+            let close_msg = format!(
+                r#"{{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{{"name":"tako_close_pane","arguments":{{"pane":{new_pane}}}}}}}"#
+            );
+            let (status, _) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], &close_msg)
+                .await
+                .unwrap_or_else(|| fail("MCP close 接続"));
+            wait(cx, 500).await;
+            let closed = window
+                .update(cx, |app, _, _| {
+                    !app.workspace
+                        .active_tab()
+                        .tree()
+                        .panes()
+                        .iter()
+                        .any(|p| p.id().as_u64() == new_pane)
+                })
+                .unwrap_or(false);
+            check(status == 200 && closed, "MCP close_pane で片付け");
+
+            // 35. 不正トークン / 不正 Origin の拒否（FR-2.3.4）
+            let (status, _) = mcp_post_bg(cx, &mcp_url, Some("bogus"), &[], LIST_CALL_MSG)
+                .await
+                .unwrap_or_else(|| fail("MCP 不正トークン接続"));
+            check(status == 401, "MCP 不正トークンは 401");
+            let (status, _) = mcp_post_bg(
+                cx,
+                &mcp_url,
+                Some(&token),
+                &[("Origin", "http://evil.example")],
+                LIST_CALL_MSG,
+            )
+            .await
+            .unwrap_or_else(|| fail("MCP 不正 Origin 接続"));
+            check(status == 403, "MCP 不正 Origin は 403");
+
+            // 36. stdio ブリッジ（`tako mcp serve`）e2e: 環境変数から接続情報を読み、
+            //     IPC へ中継して list が通る（Claude Code 連携と同じ経路）
+            let lines = bridge_roundtrip_bg(
+                cx,
+                cli_path.clone(),
+                vec![
+                    ("TAKO_SOCKET".into(), ipc_endpoint.clone()),
+                    ("TAKO_TOKEN".into(), token.clone()),
+                    ("TAKO_PANE_ID".into(), caller_str.clone()),
+                ],
+                &[INIT_MSG, INITIALIZED_MSG, LIST_CALL_MSG],
+            )
+            .await;
+            check(
+                lines.len() == 2
+                    && lines[0].contains(r#""serverInfo""#)
+                    && lines[1].contains("tabs")
+                    && lines[1].contains(r#""isError":false"#),
+                "stdio ブリッジ e2e",
+            );
+            // tako の外では 0 ツール（user スコープ登録済みでも他セッションを邪魔しない）
+            let lines =
+                bridge_roundtrip_bg(cx, cli_path.clone(), Vec::new(), &[INIT_MSG, TOOLS_LIST_MSG])
+                    .await;
+            check(
+                lines.len() == 2 && lines[1].contains(r#""tools":[]"#),
+                "ブリッジは tako 外で 0 ツール",
+            );
 
             println!("TAKO_APP_SELF_TEST_OK");
             std::process::exit(0);

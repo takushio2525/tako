@@ -13,33 +13,37 @@
 use std::io;
 
 use futures::channel::mpsc::UnboundedSender;
+use tako_core::PaneOrigin;
 
 use crate::dispatch::DispatchError;
 use crate::protocol::Request;
 
-/// UI 側へ渡す 1 リクエスト。`reply` へ dispatch の結果を返すと接続スレッドが応答を書く
+/// UI 側へ渡す 1 リクエスト。`reply` へ dispatch の結果を返すと接続スレッドが応答を書く。
+/// `origin` は新規生成ペインの生成主体（IPC 直 = Cli、MCP 経由 = Mcp）
 pub struct IncomingRequest {
     pub request: Request,
+    pub origin: PaneOrigin,
     pub reply: std::sync::mpsc::SyncSender<Result<serde_json::Value, DispatchError>>,
 }
 
 /// IPC サーバーのハンドル。drop でソケットファイルを片付ける。
-/// `endpoint` / `token` はペインのシェルへ `TAKO_SOCKET` / `TAKO_TOKEN` として注入する
+/// `endpoint` はペインのシェルへ `TAKO_SOCKET` として注入する
 pub struct IpcServer {
     endpoint: String,
-    token: String,
 }
 
 impl IpcServer {
-    /// サーバーを起動する。受け取った各リクエストは `tx` 経由で UI スレッドへ届く
-    pub fn start(tx: UnboundedSender<IncomingRequest>) -> io::Result<Self> {
+    /// サーバーを起動する。受け取った各リクエストは `tx` 経由で UI スレッドへ届く。
+    /// `token` はセッション共有の認証トークン（[`crate::generate_token`] で生成し、
+    /// MCP サーバーとも共有する。FR-2.3.4）
+    pub fn start(tx: UnboundedSender<IncomingRequest>, token: String) -> io::Result<Self> {
         #[cfg(unix)]
         {
-            unix_imp::start(tx)
+            unix_imp::start(tx, token)
         }
         #[cfg(windows)]
         {
-            let _ = tx;
+            let _ = (tx, token);
             // TODO(Phase 6): named pipe（`\\.\pipe\tako-<pid>` 等）での実装
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -52,11 +56,6 @@ impl IpcServer {
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
-
-    /// セッション毎のランダム認証トークン（FR-2.3.4。ログに出さない）
-    pub fn token(&self) -> &str {
-        &self.token
-    }
 }
 
 impl Drop for IpcServer {
@@ -66,13 +65,6 @@ impl Drop for IpcServer {
     }
 }
 
-/// 接続認証トークンを OS の CSPRNG から生成する（hex 64 文字）
-fn generate_token() -> io::Result<String> {
-    let mut buf = [0u8; 32];
-    getrandom::fill(&mut buf).map_err(|e| io::Error::other(format!("CSPRNG が使えない: {e}")))?;
-    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
-}
-
 #[cfg(unix)]
 mod unix_imp {
     use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -80,11 +72,15 @@ mod unix_imp {
     use std::os::unix::net::{UnixListener, UnixStream};
 
     use futures::channel::mpsc::UnboundedSender;
+    use tako_core::PaneOrigin;
 
-    use super::{generate_token, IncomingRequest, IpcServer};
+    use super::{IncomingRequest, IpcServer};
     use crate::protocol::{error_code, RequestEnvelope, ResponseEnvelope};
 
-    pub(super) fn start(tx: UnboundedSender<IncomingRequest>) -> std::io::Result<IpcServer> {
+    pub(super) fn start(
+        tx: UnboundedSender<IncomingRequest>,
+        token: String,
+    ) -> std::io::Result<IpcServer> {
         // pid + プロセス内連番でユニーク化（テスト等で複数サーバーを立てても衝突しない）
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -94,9 +90,8 @@ mod unix_imp {
         let listener = UnixListener::bind(&path)?;
         // 自ユーザーのプロセスのみ接続可能にする（トークンと二段の防御線）
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        let token = generate_token()?;
 
-        let accept_token = token.clone();
+        let accept_token = token;
         std::thread::Builder::new()
             .name("tako-ipc-accept".into())
             .spawn(move || {
@@ -119,7 +114,6 @@ mod unix_imp {
 
         Ok(IpcServer {
             endpoint: path.display().to_string(),
-            token,
         })
     }
 
@@ -174,8 +168,14 @@ mod unix_imp {
             );
         }
         let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        // MCP stdio ブリッジ（`tako mcp serve`）経由のリクエストは origin = Mcp として扱う
+        let origin = match envelope.origin.as_deref() {
+            Some("mcp") => PaneOrigin::Mcp,
+            _ => PaneOrigin::Cli,
+        };
         let incoming = IncomingRequest {
             request: envelope.request,
+            origin,
             reply: reply_tx,
         };
         if tx.unbounded_send(incoming).is_err() {
@@ -209,10 +209,12 @@ mod tests {
     use super::*;
     use crate::protocol::{error_code, RequestEnvelope, ResponseEnvelope};
 
+    const TEST_TOKEN: &str = "test-token";
+
     /// サーバー + ダミーディスパッチャ（list に固定値を返す）を立てて 1 往復する
     fn roundtrip(token_for_client: Option<String>) -> ResponseEnvelope {
         let (tx, mut rx) = unbounded::<IncomingRequest>();
-        let server = IpcServer::start(tx).expect("IPC サーバーを起動できる");
+        let server = IpcServer::start(tx, TEST_TOKEN.into()).expect("IPC サーバーを起動できる");
 
         // UI イベントループの代わりに同期実行のディスパッチャを立てる
         std::thread::spawn(move || {
@@ -221,7 +223,7 @@ mod tests {
             }
         });
 
-        let token = token_for_client.unwrap_or_else(|| server.token().to_string());
+        let token = token_for_client.unwrap_or_else(|| TEST_TOKEN.to_string());
         let stream = UnixStream::connect(server.endpoint()).expect("ソケットへ接続できる");
         let mut writer = stream.try_clone().unwrap();
         let envelope = RequestEnvelope::new(1, token, Request::List);
@@ -250,7 +252,7 @@ mod tests {
     #[test]
     fn dropでソケットファイルが消える() {
         let (tx, _rx) = unbounded::<IncomingRequest>();
-        let server = IpcServer::start(tx).unwrap();
+        let server = IpcServer::start(tx, TEST_TOKEN.into()).unwrap();
         let path = server.endpoint().to_string();
         assert!(std::fs::metadata(&path).is_ok());
         drop(server);

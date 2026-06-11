@@ -1,0 +1,958 @@
+//! mcp — Layer 2 内蔵 MCP サーバー（FR-2.3 / FR-2.5。最大の差別化点）
+//!
+//! Model Context Protocol の JSON-RPC 処理（initialize / tools/list / tools/call）と
+//! ツールカタログをトランスポート非依存のエンジン（[`handle_message`]）として実装する。
+//! 操作の実行は [`crate::dispatch`] へ委ねるため、ツールのセマンティクスは
+//! CLI（Layer 1）と完全に一致する（設計原則 5「AI フルコントロール」）。
+//!
+//! トランスポートは 2 系統（採用理由と検証結果は `.agent/architecture.md`「Layer 2」節）:
+//!
+//! - **Streamable HTTP**（[`McpServer`]）: localhost バインド + Bearer トークン認証。
+//!   接続先 URL を `TAKO_MCP_URL` として各ペインへ注入する。呼び出し元ペインは
+//!   `X-Tako-Pane` ヘッダで申告する（FR-2.3.3）
+//! - **stdio ブリッジ**（`tako mcp serve`、tako-cli 側）: Claude Code 等の stdio
+//!   クライアント向け。このエンジンを共有し、実行だけ IPC へ中継する
+//!
+//! ツール説明文と initialize の `instructions` には FR-2.7.5 の行動規範
+//! （レビューを求めるときは見せろ / 読んでほしければ開け / 方針相談は例を作って並べろ /
+//! 終わったら片付けろ）を埋め込む。エージェントの振る舞いをプロンプトで誘導するのも
+//! プロダクトの一部である。
+
+use std::io;
+
+use futures::channel::mpsc::UnboundedSender;
+use serde_json::{json, Value};
+use tako_core::PaneOrigin;
+
+use crate::ipc::IncomingRequest;
+use crate::protocol::{Axis, Direction, Request};
+
+/// サーバーが既定で名乗る MCP プロトコルバージョン
+pub const PROTOCOL_VERSION: &str = "2025-06-18";
+/// 応答できるバージョン（クライアント申告がここにあればそのまま受ける）
+const KNOWN_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// 1 接続分の文脈。トランスポート層（HTTP / stdio ブリッジ）が組み立てる
+pub struct McpSession<'a> {
+    /// 呼び出し元ペイン（stdio: `TAKO_PANE_ID`、HTTP: `X-Tako-Pane` ヘッダ。FR-2.3.3）。
+    /// pane 引数が省略されたツール呼び出しのデフォルト対象になる
+    pub caller_pane: Option<u64>,
+    /// false のとき tools/list は空を返す（tako の外で起動された stdio ブリッジ用。
+    /// 登録済みでも tako 外の Claude Code セッションを邪魔しない）
+    pub connected: bool,
+    /// 操作の実行係（HTTP: dispatch チャネル往復、stdio: IPC 往復）。
+    /// Err は「ツール実行エラー」として isError 付き結果になる
+    pub exec: &'a mut dyn FnMut(Request) -> Result<Value, String>,
+}
+
+/// MCP メッセージを 1 件処理する。応答すべき JSON-RPC レスポンスを返す
+/// （notification と response メッセージには `None`）
+pub fn handle_message(message: &Value, session: &mut McpSession) -> Option<Value> {
+    // method が無いものはクライアントからの response（ping への返事等）→ 無視
+    let method = message.get("method")?.as_str()?.to_string();
+    let id = match message.get("id") {
+        // id 無し = notification（notifications/initialized 等）。応答しない
+        None | Some(Value::Null) => return None,
+        Some(id) => id.clone(),
+    };
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+    let result = match method.as_str() {
+        "initialize" => Ok(initialize_result(&params, session.connected)),
+        "ping" => Ok(json!({})),
+        "tools/list" => {
+            let tools = if session.connected {
+                tools()
+            } else {
+                Vec::new()
+            };
+            Ok(json!({ "tools": tools }))
+        }
+        "tools/call" => call_tool(&params, session),
+        _ => Err((-32601, format!("メソッド {method} は未対応"))),
+    };
+    Some(match result {
+        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+        Err((code, message)) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": code, "message": message },
+        }),
+    })
+}
+
+fn initialize_result(params: &Value, connected: bool) -> Value {
+    // バージョン交渉: クライアント申告が既知ならそれを受け、未知なら最新を名乗る
+    let requested = params.get("protocolVersion").and_then(Value::as_str);
+    let version = match requested {
+        Some(v) if KNOWN_VERSIONS.contains(&v) => v,
+        _ => PROTOCOL_VERSION,
+    };
+    let instructions = if connected {
+        INSTRUCTIONS
+    } else {
+        "tako アプリの外で起動されたため、ペイン操作ツールは提供されない。\
+         tako 内のターミナルからエージェントを起動すると使えるようになる。"
+    };
+    json!({
+        "protocolVersion": version,
+        "capabilities": { "tools": { "listChanged": false } },
+        "serverInfo": {
+            "name": "tako",
+            "title": "tako terminal",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "instructions": instructions,
+    })
+}
+
+/// initialize で配るサーバー指示。FR-2.7.5 の行動規範（ユースケース (a)〜(c) + 片付け）
+const INSTRUCTIONS: &str = "\
+tako は AI エージェントが画面（タブ / ペイン）を直接操作できる GUI ターミナル。\
+このツール群で、人間と同じようにペインの分割・コマンド実行・画面の読み取り・片付けができる。\n\
+\n\
+行動規範（ユーザー体験の一部。意識的に従うこと）:\n\
+- レビューを求めるときは見せろ: 作業を終えてユーザーに確認を求めるときは、口頭説明だけでなく\
+成果物（diff・ファイル・実行結果）を tako_split_pane で新しいペインに開いて提示する\
+（例: command=[\"git\",\"diff\",\"HEAD\"] や [\"less\",\"README.md\"]）\n\
+- 読んでほしければ開け: ユーザーに読んでほしいドキュメントは、実際にペインで開いて見せる\n\
+- 方針相談は例を作って並べろ: 複数案があるときは案ごとにペインを並べて同時に見せ、\
+ユーザーが見比べて選べるようにする（tako_equalize_layout で整える）\n\
+- 終わったら片付けろ: 役目を終えた作業ペインは tako_close_pane で閉じ、\
+レイアウトが乱れたら tako_equalize_layout で整える\n\
+- 操作の前に tako_list_panes で現状のレイアウトとペイン ID を把握する";
+
+/// ペイン ID 引数のスキーマ（省略時は呼び出し元）
+fn pane_schema(description: &str) -> Value {
+    json!({ "type": "integer", "minimum": 0, "description": description })
+}
+
+/// 公開ツールカタログ（FR-2.5 と 1:1。CLI のサブコマンドと同じ操作セット）
+pub fn tools() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "tako_list_panes",
+            "description": "タブとペインのツリー構造・ジオメトリ（位置・サイズ・分割比率）・\
+                状態（タイトル・role・origin・フォーカス）を JSON で返す。\
+                ペインを操作する前にまずこれを呼び、現状のレイアウトとペイン ID を把握すること。",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+        }),
+        json!({
+            "name": "tako_split_pane",
+            "description": "ペインを分割して新しいターミナルペインを作り、新ペイン ID を返す。\
+                command を指定するとシェルの代わりにそのコマンドを実行する\
+                （dev サーバーの起動、`git diff` やファイルビューアの表示に使う）。\
+                ユーザーに成果物を見せるとき・レビューを求めるときは、このツールで結果を\
+                開いて提示すること（見せたいものは口頭で説明せず実際に開く）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("分割の基準ペイン ID（省略時は呼び出し元ペインの隣に生える）"),
+                    "direction": {
+                        "type": "string",
+                        "enum": ["right", "down", "left", "up"],
+                        "description": "新ペインが生える方向（省略時は right）",
+                    },
+                    "ratio": {
+                        "type": "number",
+                        "exclusiveMinimum": 0.0,
+                        "exclusiveMaximum": 1.0,
+                        "description": "新ペイン側の取り分（省略時は等分）",
+                    },
+                    "command": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "シェルの代わりに実行するコマンドと引数（例: [\"npm\",\"run\",\"dev\"]）。\
+                            終了するとペインも閉じる。省略時は対話シェルが起動する",
+                    },
+                    "cwd": { "type": "string", "description": "新ペインの作業ディレクトリ" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_send_input",
+            "description": "指定ペインの端末へテキストを書き込む（既定で末尾に改行を付けて実行する）。\
+                対象の誤指定はそのまま誤実行になるため、必ず tako_list_panes で確認した\
+                ペイン ID を渡すこと。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": { "type": "integer", "minimum": 0, "description": "送信先ペイン ID（必須）" },
+                    "text": { "type": "string", "description": "送信するテキスト" },
+                    "newline": {
+                        "type": "boolean",
+                        "description": "末尾に改行を付けるか（省略時 true。プロンプトへの部分入力は false）",
+                    },
+                },
+                "required": ["pane", "text"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_read_pane",
+            "description": "指定ペインの画面内容（表示中のテキスト）を返す。\
+                別ペインで実行したコマンドの結果確認や、エージェント・dev サーバーの出力監視に使う。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": { "type": "integer", "minimum": 0, "description": "対象ペイン ID（必須）" },
+                    "lines": { "type": "integer", "minimum": 1, "description": "末尾からの行数制限" },
+                },
+                "required": ["pane"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_focus_pane",
+            "description": "ペインへフォーカスを移す。pane（ID 指定。別タブならタブも切り替わる）か\
+                direction（アクティブタブ内の隣接移動）のどちらか一方を指定する。\
+                ユーザーに見てほしいペインへ注意を向ける用途にも使う。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": { "type": "integer", "minimum": 0, "description": "フォーカス先ペイン ID" },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["right", "down", "left", "up"],
+                        "description": "隣接ペインへの方向移動",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_close_pane",
+            "description": "ペインを閉じる。pane 省略時は呼び出し元自身（自分のペイン）を閉じる。\
+                役目を終えた作業ペインはこのツールで片付けること。\
+                タブ最後の 1 ペインならタブごと閉じる（最後のタブの最後のペインは閉じられない）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン ID（省略時は呼び出し元 = 自己片付け）"),
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_resize_pane",
+            "description": "ペインの取り分（サイズ比率）を変える。delta は相対変更（正で拡大）、\
+                share は 0–1 の絶対指定で、どちらか一方だけを渡す。\
+                ユーザーに見せたいペインを広げる用途にも使う。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン ID（省略時は呼び出し元）"),
+                    "axis": {
+                        "type": "string",
+                        "enum": ["x", "y"],
+                        "description": "x = 横幅、y = 縦幅",
+                    },
+                    "delta": { "type": "number", "description": "取り分の相対変更量（例: 0.1 / -0.1）" },
+                    "share": {
+                        "type": "number",
+                        "exclusiveMinimum": 0.0,
+                        "exclusiveMaximum": 1.0,
+                        "description": "取り分の絶対指定",
+                    },
+                },
+                "required": ["axis"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_equalize_layout",
+            "description": "タブ内の全ペインのサイズを均等化する。作業後にレイアウトが乱れたら\
+                これで整えること。複数案をペインで並べて見せるときの仕上げにも使う。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tab": { "type": "integer", "minimum": 0, "description": "対象タブ ID（省略時は呼び出し元ペインのタブ）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_set_title",
+            "description": "ペインの表示タイトルと役割ラベル（role。例: worker-1, dev-server）を設定する。\
+                ペインを作ったら役割が分かる名前を付け、ユーザーが監視しやすくすること。\
+                空文字を渡すとクリアする。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン ID（省略時は呼び出し元）"),
+                    "title": { "type": "string", "description": "表示タイトル" },
+                    "role": { "type": "string", "description": "役割ラベル" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_create_tab",
+            "description": "新しいタブ（= エージェントグループ）を作り、タブ ID と初期ペイン ID を返す。\
+                いまのタブと無関係な作業系列を始めるときに使う（1 グループ = 1 タブ）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "タブのタイトル（省略時は連番）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_select_tab",
+            "description": "表示するタブを切り替える。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tab": { "type": "integer", "minimum": 0, "description": "アクティブにするタブ ID" },
+                },
+                "required": ["tab"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_move_pane_to_tab",
+            "description": "ペインを別のタブへ移送する。タブをまたぐ整理（グループ分け）に使う。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tab": { "type": "integer", "minimum": 0, "description": "移送先タブ ID" },
+                    "pane": pane_schema("対象ペイン ID（省略時は呼び出し元）"),
+                },
+                "required": ["tab"],
+                "additionalProperties": false,
+            },
+        }),
+    ]
+}
+
+fn call_tool(params: &Value, session: &mut McpSession) -> Result<Value, (i64, String)> {
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or((-32602, "ツール名（name）が無い".to_string()))?;
+    let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    let request = build_request(name, &args, session.caller_pane).map_err(|e| (-32602, e))?;
+    // 実行失敗は「ツール実行エラー」としてエージェントへ返す（MCP の isError。
+    // エージェントが読んで自己修正できるよう、JSON-RPC エラーにはしない）
+    Ok(match (session.exec)(request) {
+        Ok(value) => {
+            let text = match value {
+                Value::Null => "ok".to_string(),
+                value => value.to_string(),
+            };
+            json!({ "content": [{ "type": "text", "text": text }], "isError": false })
+        }
+        Err(message) => {
+            json!({ "content": [{ "type": "text", "text": message }], "isError": true })
+        }
+    })
+}
+
+/// ツール呼び出しを操作プロトコル（[`Request`]）へ写す。エラーは引数バリデーション失敗
+fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Request, String> {
+    Ok(match name {
+        "tako_list_panes" => Request::List,
+        "tako_split_pane" => Request::Split {
+            pane: Some(target_pane(args, caller)?),
+            direction: direction_arg(args)?,
+            ratio: f32_arg(args, "ratio")?,
+            command: str_vec_arg(args, "command")?.filter(|c| !c.is_empty()),
+            cwd: str_arg(args, "cwd")?,
+        },
+        "tako_send_input" => Request::Send {
+            pane: Some(required_u64(args, "pane")?),
+            text: str_arg(args, "text")?.ok_or("text を指定する")?,
+            newline: bool_arg(args, "newline")?.unwrap_or(true),
+        },
+        "tako_read_pane" => Request::Read {
+            pane: Some(required_u64(args, "pane")?),
+            lines: u64_arg(args, "lines")?.map(|n| n as usize),
+        },
+        "tako_focus_pane" => {
+            let pane = u64_arg(args, "pane")?;
+            let direction = direction_arg(args)?;
+            if pane.is_none() && direction.is_none() {
+                return Err("pane か direction のどちらか一方を指定する".into());
+            }
+            Request::Focus { pane, direction }
+        }
+        "tako_close_pane" => Request::Close {
+            pane: Some(target_pane(args, caller)?),
+        },
+        "tako_resize_pane" => Request::Resize {
+            pane: Some(target_pane(args, caller)?),
+            axis: match str_arg(args, "axis")?.as_deref() {
+                Some("x") => Axis::X,
+                Some("y") => Axis::Y,
+                _ => return Err("axis は \"x\" か \"y\" を指定する".into()),
+            },
+            delta: f32_arg(args, "delta")?,
+            share: f32_arg(args, "share")?,
+        },
+        "tako_equalize_layout" => {
+            let tab = u64_arg(args, "tab")?;
+            Request::Equalize {
+                // tab 省略時は呼び出し元ペインからタブを解決する
+                pane: if tab.is_none() {
+                    Some(target_pane(args, caller)?)
+                } else {
+                    None
+                },
+                tab,
+            }
+        }
+        "tako_set_title" => Request::Title {
+            pane: Some(target_pane(args, caller)?),
+            title: str_arg(args, "title")?,
+            role: str_arg(args, "role")?,
+        },
+        "tako_create_tab" => Request::TabNew {
+            title: str_arg(args, "title")?,
+        },
+        "tako_select_tab" => Request::TabSelect {
+            tab: required_u64(args, "tab")?,
+        },
+        "tako_move_pane_to_tab" => Request::MovePane {
+            pane: Some(target_pane(args, caller)?),
+            tab: required_u64(args, "tab")?,
+        },
+        _ => return Err(format!("不明なツール: {name}")),
+    })
+}
+
+/// `pane` 引数（省略時は呼び出し元へフォールバック。FR-2.3.3 のデフォルトスコープ）
+fn target_pane(args: &Value, caller: Option<u64>) -> Result<u64, String> {
+    u64_arg(args, "pane")?.or(caller).ok_or_else(|| {
+        "対象ペインを特定できない（pane を指定する。\
+         呼び出し元ペインの自動特定には TAKO_PANE_ID / X-Tako-Pane が必要）"
+            .into()
+    })
+}
+
+fn required_u64(args: &Value, key: &str) -> Result<u64, String> {
+    u64_arg(args, key)?.ok_or_else(|| format!("{key} を指定する"))
+}
+
+fn u64_arg(args: &Value, key: &str) -> Result<Option<u64>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("{key} は非負整数で指定する")),
+    }
+}
+
+fn f32_arg(args: &Value, key: &str) -> Result<Option<f32>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_f64()
+            .map(|f| Some(f as f32))
+            .ok_or_else(|| format!("{key} は数値で指定する")),
+    }
+}
+
+fn str_arg(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(|s| Some(s.to_string()))
+            .ok_or_else(|| format!("{key} は文字列で指定する")),
+    }
+}
+
+fn bool_arg(args: &Value, key: &str) -> Result<Option<bool>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| format!("{key} は真偽値で指定する")),
+    }
+}
+
+fn direction_arg(args: &Value) -> Result<Option<Direction>, String> {
+    match str_arg(args, "direction")?.as_deref() {
+        None => Ok(None),
+        Some("right") => Ok(Some(Direction::Right)),
+        Some("down") => Ok(Some(Direction::Down)),
+        Some("left") => Ok(Some(Direction::Left)),
+        Some("up") => Ok(Some(Direction::Up)),
+        Some(other) => Err(format!(
+            "direction が不正: {other}（right / down / left / up のいずれか）"
+        )),
+    }
+}
+
+fn str_vec_arg(args: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(String::from)
+                    .ok_or_else(|| format!("{key} は文字列の配列で指定する"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Some(_) => Err(format!("{key} は文字列の配列で指定する")),
+    }
+}
+
+// --- Streamable HTTP トランスポート ---
+
+/// リクエストボディの上限（暴走・誤接続対策）
+const MAX_BODY_BYTES: u64 = 1 << 20;
+
+/// 内蔵 MCP サーバーのハンドル。`url` をペインのシェルへ `TAKO_MCP_URL` として注入する。
+/// ポートはプロセス終了時に OS が解放するため明示シャットダウンは持たない
+pub struct McpServer {
+    url: String,
+}
+
+impl McpServer {
+    /// 127.0.0.1 の空きポートで Streamable HTTP サーバーを起動する。
+    /// 受け取った各操作は IPC と同じ `tx` 経由で UI スレッドへ届く（dispatch 共有）
+    pub fn start(tx: UnboundedSender<IncomingRequest>, token: String) -> io::Result<Self> {
+        let server = tiny_http::Server::http("127.0.0.1:0")
+            .map_err(|e| io::Error::other(format!("MCP HTTP サーバーを起動できない: {e}")))?;
+        let port = server
+            .server_addr()
+            .to_ip()
+            .ok_or_else(|| io::Error::other("MCP サーバーのポートを特定できない"))?
+            .port();
+        let url = format!("http://127.0.0.1:{port}/mcp");
+        std::thread::Builder::new()
+            .name("tako-mcp-http".into())
+            .spawn(move || {
+                for request in server.incoming_requests() {
+                    handle_http(request, &token, &tx);
+                }
+            })?;
+        Ok(Self { url })
+    }
+
+    /// 接続先 URL（`TAKO_MCP_URL` として注入する）
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+fn header_value(request: &tiny_http::Request, name: &'static str) -> Option<String> {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv(name))
+        .map(|h| h.value.as_str().to_string())
+}
+
+fn respond(request: tiny_http::Request, status: u16, body: Option<String>) {
+    let result = match body {
+        Some(body) => {
+            let header =
+                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                    .expect("固定値のヘッダ構築は失敗しない");
+            request.respond(
+                tiny_http::Response::from_string(body)
+                    .with_header(header)
+                    .with_status_code(status),
+            )
+        }
+        None => request.respond(tiny_http::Response::empty(status)),
+    };
+    if let Err(e) = result {
+        tracing::debug!("MCP 応答の送信に失敗: {e}");
+    }
+}
+
+fn handle_http(
+    mut request: tiny_http::Request,
+    token: &str,
+    tx: &UnboundedSender<IncomingRequest>,
+) {
+    // Origin 検証: ブラウザからの DNS リバインディング対策（MCP 仕様の要請）。
+    // 非ブラウザクライアントは通常 Origin を送らない
+    if let Some(origin) = header_value(&request, "origin") {
+        let local = [
+            "http://127.0.0.1",
+            "http://localhost",
+            "https://127.0.0.1",
+            "https://localhost",
+        ]
+        .iter()
+        .any(|prefix| origin.starts_with(prefix));
+        if !local {
+            return respond(request, 403, None);
+        }
+    }
+    // Bearer トークン認証（FR-2.3.4。アプリ外プロセスの拒否）
+    let authorized =
+        header_value(&request, "authorization").is_some_and(|v| v == format!("Bearer {token}"));
+    if !authorized {
+        return respond(request, 401, None);
+    }
+    // Streamable HTTP の必須経路は POST のみ実装（GET の SSE ストリームは任意機能のため
+    // 405 を返す。サーバー発のリクエスト・通知を持たないため不要）
+    if *request.method() != tiny_http::Method::Post {
+        return respond(request, 405, None);
+    }
+    let caller_pane = header_value(&request, "x-tako-pane").and_then(|v| v.parse().ok());
+    let mut body = String::new();
+    {
+        use std::io::Read as _;
+        if request
+            .as_reader()
+            .take(MAX_BODY_BYTES)
+            .read_to_string(&mut body)
+            .is_err()
+        {
+            return respond(request, 400, None);
+        }
+    }
+    let Ok(message) = serde_json::from_str::<Value>(&body) else {
+        let error = json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": { "code": -32700, "message": "リクエストを JSON として解釈できない" },
+        });
+        return respond(request, 400, Some(error.to_string()));
+    };
+    let mut exec = |req: Request| -> Result<Value, String> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        tx.unbounded_send(IncomingRequest {
+            request: req,
+            origin: PaneOrigin::Mcp,
+            reply: reply_tx,
+        })
+        .map_err(|_| "アプリ側の受け口が閉じている".to_string())?;
+        match reply_rx.recv() {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("アプリ側から応答が返らなかった".into()),
+        }
+    };
+    let mut session = McpSession {
+        caller_pane,
+        connected: true,
+        exec: &mut exec,
+    };
+    match handle_message(&message, &mut session) {
+        Some(response) => respond(request, 200, Some(response.to_string())),
+        // notification（initialized 等）には 202 Accepted を返す（Streamable HTTP 仕様）
+        None => respond(request, 202, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 受けた Request を記録して固定値を返す exec
+    fn run(message: Value, caller: Option<u64>, connected: bool) -> (Option<Value>, Vec<Request>) {
+        let mut seen = Vec::new();
+        let mut exec = |request: Request| -> Result<Value, String> {
+            seen.push(request);
+            Ok(json!({ "pane": 7 }))
+        };
+        let mut session = McpSession {
+            caller_pane: caller,
+            connected,
+            exec: &mut exec,
+        };
+        let response = handle_message(&message, &mut session);
+        (response, seen)
+    }
+
+    fn call(name: &str, args: Value) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": args },
+        })
+    }
+
+    #[test]
+    fn initializeはバージョン交渉とinstructionsを返す() {
+        let message = json!({
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": { "protocolVersion": "2025-03-26" },
+        });
+        let (response, _) = run(message, None, true);
+        let result = &response.unwrap()["result"];
+        assert_eq!(result["protocolVersion"], "2025-03-26");
+        assert_eq!(result["serverInfo"]["name"], "tako");
+        // 行動規範（FR-2.7.5）が埋め込まれている
+        let instructions = result["instructions"].as_str().unwrap();
+        assert!(instructions.contains("レビューを求めるときは見せろ"));
+        assert!(instructions.contains("片付け"));
+
+        // 未知バージョンは最新を名乗る
+        let message = json!({
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": { "protocolVersion": "9999-01-01" },
+        });
+        let (response, _) = run(message, None, true);
+        assert_eq!(
+            response.unwrap()["result"]["protocolVersion"],
+            PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn notificationとresponseには応答しない() {
+        let (response, _) = run(
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+            None,
+            true,
+        );
+        assert!(response.is_none());
+        let (response, _) = run(
+            json!({ "jsonrpc": "2.0", "id": 5, "result": {} }),
+            None,
+            true,
+        );
+        assert!(response.is_none());
+    }
+
+    #[test]
+    fn ツールカタログは操作セットを網羅する() {
+        let tools = tools();
+        assert_eq!(tools.len(), 12);
+        for tool in &tools {
+            let name = tool["name"].as_str().unwrap();
+            assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
+            assert!(!tool["description"].as_str().unwrap().is_empty());
+            assert_eq!(tool["inputSchema"]["type"], "object");
+        }
+        // 行動規範が説明文側にも埋め込まれている（FR-2.7.5）
+        let split = tools
+            .iter()
+            .find(|t| t["name"] == "tako_split_pane")
+            .unwrap();
+        assert!(split["description"].as_str().unwrap().contains("レビュー"));
+    }
+
+    #[test]
+    fn 未接続ではツールを公開しない() {
+        let (response, _) = run(
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+            None,
+            false,
+        );
+        assert_eq!(response.unwrap()["result"]["tools"], json!([]));
+    }
+
+    #[test]
+    fn splitは呼び出し元ペインへフォールバックする() {
+        let (response, seen) = run(
+            call("tako_split_pane", json!({ "direction": "down" })),
+            Some(3),
+            true,
+        );
+        assert_eq!(
+            seen,
+            vec![Request::Split {
+                pane: Some(3),
+                direction: Some(Direction::Down),
+                ratio: None,
+                command: None,
+                cwd: None,
+            }]
+        );
+        let result = &response.unwrap()["result"];
+        assert_eq!(result["isError"], false);
+        assert!(result["content"][0]["text"].as_str().unwrap().contains("7"));
+    }
+
+    #[test]
+    fn 呼び出し元不明でpane省略はエラー() {
+        let (response, seen) = run(call("tako_close_pane", json!({})), None, true);
+        assert!(seen.is_empty());
+        let error = &response.unwrap()["error"];
+        assert_eq!(error["code"], -32602);
+        assert!(error["message"].as_str().unwrap().contains("pane"));
+    }
+
+    #[test]
+    fn sendとreadはpane必須() {
+        let (response, seen) = run(
+            call("tako_send_input", json!({ "text": "ls" })),
+            Some(3), // 呼び出し元があってもフォールバックしない（誤送信防止）
+            true,
+        );
+        assert!(seen.is_empty());
+        assert_eq!(response.unwrap()["error"]["code"], -32602);
+
+        let (_, seen) = run(
+            call("tako_read_pane", json!({ "pane": 4, "lines": 10 })),
+            None,
+            true,
+        );
+        assert_eq!(
+            seen,
+            vec![Request::Read {
+                pane: Some(4),
+                lines: Some(10),
+            }]
+        );
+    }
+
+    #[test]
+    fn 実行エラーはエラーフラグ付き結果になる() {
+        let mut exec = |_: Request| -> Result<Value, String> {
+            Err("ペイン 9 が見つからない".into())
+        };
+        let mut session = McpSession {
+            caller_pane: None,
+            connected: true,
+            exec: &mut exec,
+        };
+        let response = handle_message(&call("tako_list_panes", json!({})), &mut session).unwrap();
+        let result = &response["result"];
+        assert_eq!(result["isError"], true);
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("見つからない"));
+    }
+
+    #[test]
+    fn 不明なツールと未対応メソッドはエラー() {
+        let (response, _) = run(call("tako_explode", json!({})), None, true);
+        assert_eq!(response.unwrap()["error"]["code"], -32602);
+        let (response, _) = run(
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "resources/list" }),
+            None,
+            true,
+        );
+        assert_eq!(response.unwrap()["error"]["code"], -32601);
+    }
+
+    // --- HTTP トランスポート（実ポートで往復） ---
+
+    mod http {
+        use super::*;
+        use futures::channel::mpsc::unbounded;
+        use futures::StreamExt;
+        use std::io::{Read, Write};
+
+        const TOKEN: &str = "http-test-token";
+
+        /// サーバー + ダミーディスパッチャ（list に固定値を返す）を立てる
+        fn start_server() -> McpServer {
+            let (tx, mut rx) = unbounded::<IncomingRequest>();
+            let server = McpServer::start(tx, TOKEN.into()).expect("MCP サーバーを起動できる");
+            std::thread::spawn(move || {
+                while let Some(incoming) = futures::executor::block_on(rx.next()) {
+                    assert_eq!(incoming.origin, PaneOrigin::Mcp);
+                    let _ = incoming.reply.send(Ok(json!({ "tabs": [] })));
+                }
+            });
+            server
+        }
+
+        fn post(
+            url: &str,
+            auth: Option<&str>,
+            extra_headers: &[(&str, &str)],
+            body: &str,
+        ) -> (u16, String) {
+            let rest = url.strip_prefix("http://").expect("テスト URL は http");
+            let (hostport, path) = rest.split_once('/').expect("URL にパスがある");
+            let mut stream = std::net::TcpStream::connect(hostport).expect("接続できる");
+            let mut request = format!(
+                "POST /{path} HTTP/1.1\r\nHost: {hostport}\r\nContent-Type: application/json\r\n\
+                 Accept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n",
+                body.len()
+            );
+            if let Some(token) = auth {
+                request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+            }
+            for (name, value) in extra_headers {
+                request.push_str(&format!("{name}: {value}\r\n"));
+            }
+            request.push_str("\r\n");
+            request.push_str(body);
+            stream.write_all(request.as_bytes()).expect("送信できる");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("受信できる");
+            let status = response
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .expect("ステータス行がある");
+            let body = response
+                .split_once("\r\n\r\n")
+                .map(|(_, b)| b.to_string())
+                .unwrap_or_default();
+            (status, body)
+        }
+
+        #[test]
+        fn 認証付きでツール呼び出しが往復する() {
+            let server = start_server();
+            let body = call("tako_list_panes", json!({})).to_string();
+            let (status, response) = post(server.url(), Some(TOKEN), &[], &body);
+            assert_eq!(status, 200);
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["result"]["isError"], false);
+            assert!(response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("tabs"));
+        }
+
+        #[test]
+        fn 不正トークンと不正オリジンは拒否される() {
+            let server = start_server();
+            let body = call("tako_list_panes", json!({})).to_string();
+            let (status, _) = post(server.url(), Some("bogus"), &[], &body);
+            assert_eq!(status, 401);
+            let (status, _) = post(server.url(), None, &[], &body);
+            assert_eq!(status, 401);
+            let (status, _) = post(
+                server.url(),
+                Some(TOKEN),
+                &[("Origin", "http://evil.example")],
+                &body,
+            );
+            assert_eq!(status, 403);
+        }
+
+        #[test]
+        fn notificationは202になる() {
+            let server = start_server();
+            let body = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+            let (status, _) = post(server.url(), Some(TOKEN), &[], &body.to_string());
+            assert_eq!(status, 202);
+        }
+
+        #[test]
+        fn 呼び出し元ペインはヘッダで申告できる() {
+            let (tx, mut rx) = unbounded::<IncomingRequest>();
+            let server = McpServer::start(tx, TOKEN.into()).unwrap();
+            std::thread::spawn(move || {
+                while let Some(incoming) = futures::executor::block_on(rx.next()) {
+                    // X-Tako-Pane がデフォルト対象として解決されている（FR-2.3.3）
+                    assert_eq!(
+                        incoming.request,
+                        Request::Close { pane: Some(42) },
+                        "X-Tako-Pane が呼び出し元として使われる"
+                    );
+                    let _ = incoming.reply.send(Ok(json!({ "closed": 42 })));
+                }
+            });
+            let body = call("tako_close_pane", json!({})).to_string();
+            let (status, response) =
+                post(server.url(), Some(TOKEN), &[("X-Tako-Pane", "42")], &body);
+            assert_eq!(status, 200);
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["result"]["isError"], false);
+        }
+    }
+}

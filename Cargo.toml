@@ -26,6 +26,10 @@ serde_json = "1"
 getrandom = "0.3"
 # `tako` CLI の引数パーサ（デファクト標準）
 clap = { version = "4", features = ["derive"] }
+# 内蔵 MCP サーバーの Streamable HTTP トランスポート（FR-2.3）。
+# 同期・スレッドベースの最小 HTTP サーバーで「tokio を持ち込まない」方針を維持する
+# （公式 Rust SDK の rmcp は tokio 必須のため不採用。.agent/architecture.md「Layer 2」節）
+tiny_http = "0.12"
 # GPUI は zed リポの git rev 固定（自動更新しない。追従は意識的なタスク。.agent/architecture.md）
 gpui = { git = "https://github.com/zed-industries/zed", rev = "cafbf4b5df7fedb67fc0f248850a5654efcec5d9" }
 # font-kit feature 必須: 無いとテキストシステムがスタブ化し文字が一切描画されない（poc/README.md）

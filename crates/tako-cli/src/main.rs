@@ -5,6 +5,8 @@
 //! tako の外で実行された場合は明確なエラーを返す（FR-2.2.8）。
 //!
 //! 操作セットは `tako_control::protocol::Request`（FR-2.5）と 1:1。
+//! `tako mcp serve` は Layer 2 の MCP stdio ブリッジ（FR-2.3）として動き、
+//! エージェントの MCP クライアントから起動される（mcp_serve のコメント参照）。
 //! シェルスクリプトから使う例:
 //!
 //! ```sh
@@ -57,6 +59,19 @@ enum Command {
     /// タブ操作（new / select / move-pane）
     #[command(subcommand)]
     Tab(TabCommand),
+    /// MCP 連携（serve = stdio ブリッジ。エージェントの MCP クライアントが起動する）
+    #[command(subcommand)]
+    Mcp(McpCommand),
+}
+
+#[derive(Subcommand)]
+enum McpCommand {
+    /// stdio で MCP サーバーとして動き、操作を tako アプリへ中継する。
+    /// Claude Code には 1 回だけ `claude mcp add --scope user tako -- tako mcp serve` で登録すると、
+    /// 以後 tako 内のどのペインからでも設定なしでペイン操作ツールが使える
+    /// （接続情報は起動毎に TAKO_SOCKET / TAKO_TOKEN / TAKO_PANE_ID から読む）。
+    /// tako の外ではツールを公開しない（無害に 0 ツールで応答する）
+    Serve,
 }
 
 #[derive(Args)]
@@ -195,13 +210,70 @@ enum TabCommand {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match run(cli.command) {
+    let result = match cli.command {
+        Command::Mcp(McpCommand::Serve) => mcp_serve(),
+        command => run(command),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("error: {message}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// MCP stdio ブリッジ（FR-2.3.2 のゼロコンフィグ接続を成立させる実体）。
+/// 1 行 1 JSON の MCP メッセージを stdin から読み、プロトコル処理は
+/// `tako_control::mcp`（HTTP トランスポートと共有）に任せ、操作の実行だけ
+/// IPC へ origin="mcp" で中継する。呼び出し元ペインは環境変数から特定する
+fn mcp_serve() -> Result<(), String> {
+    use std::io::{BufRead, Write};
+
+    let socket = std::env::var("TAKO_SOCKET").ok();
+    let token = std::env::var("TAKO_TOKEN").ok();
+    let connected = socket.is_some() && token.is_some();
+    let caller = caller_pane();
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout().lock();
+    for line in stdin.lock().lines() {
+        let line = line.map_err(|e| format!("stdin の読み取りに失敗: {e}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let response = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(message) => {
+                let mut exec = |request: Request| -> Result<Value, String> {
+                    match (socket.as_deref(), token.as_deref()) {
+                        (Some(socket), Some(token)) => {
+                            transport::roundtrip(socket, token, request, Some("mcp"))
+                        }
+                        _ => Err(OUTSIDE_TAKO.into()),
+                    }
+                };
+                let mut session = tako_control::mcp::McpSession {
+                    caller_pane: caller,
+                    connected,
+                    exec: &mut exec,
+                };
+                tako_control::mcp::handle_message(&message, &mut session)
+            }
+            Err(e) => Some(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": { "code": -32700, "message": format!("JSON として解釈できない: {e}") },
+            })),
+        };
+        if let Some(response) = response {
+            writeln!(stdout, "{response}")
+                .map_err(|e| format!("stdout への書き込みに失敗: {e}"))?;
+            stdout
+                .flush()
+                .map_err(|e| format!("stdout の flush に失敗: {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 fn run(command: Command) -> Result<(), String> {
@@ -311,6 +383,8 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane: target_pane(*pane)?,
             tab: *tab,
         },
+        // main() で mcp_serve() へ分岐済みのため論理的に到達不能
+        Command::Mcp(_) => unreachable!("mcp serve は run() を通らない"),
     })
 }
 
@@ -318,7 +392,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
 fn send_request(request: Request) -> Result<Value, String> {
     let socket = std::env::var("TAKO_SOCKET").map_err(|_| OUTSIDE_TAKO.to_string())?;
     let token = std::env::var("TAKO_TOKEN").map_err(|_| OUTSIDE_TAKO.to_string())?;
-    transport::roundtrip(&socket, &token, request)
+    transport::roundtrip(&socket, &token, request, None)
 }
 
 fn print_result(command: &Command, result: &Value) {
@@ -353,13 +427,20 @@ mod transport {
     use serde_json::Value;
     use tako_control::protocol::{Request, RequestEnvelope, ResponseEnvelope};
 
-    pub fn roundtrip(socket: &str, token: &str, request: Request) -> Result<Value, String> {
+    /// `origin` は生成主体の自己申告（MCP ブリッジは `Some("mcp")`、CLI 直は `None`）
+    pub fn roundtrip(
+        socket: &str,
+        token: &str,
+        request: Request,
+        origin: Option<&str>,
+    ) -> Result<Value, String> {
         let stream = UnixStream::connect(socket)
             .map_err(|e| format!("tako アプリへ接続できない（{socket}: {e}）"))?;
         let mut writer = stream
             .try_clone()
             .map_err(|e| format!("接続の複製に失敗: {e}"))?;
-        let envelope = RequestEnvelope::new(1, token, request);
+        let mut envelope = RequestEnvelope::new(1, token, request);
+        envelope.origin = origin.map(Into::into);
         let json =
             serde_json::to_string(&envelope).map_err(|e| format!("送信の構築に失敗: {e}"))?;
         writeln!(writer, "{json}").map_err(|e| format!("送信に失敗: {e}"))?;
@@ -387,7 +468,12 @@ mod transport {
     use serde_json::Value;
     use tako_control::protocol::Request;
 
-    pub fn roundtrip(_socket: &str, _token: &str, _request: Request) -> Result<Value, String> {
+    pub fn roundtrip(
+        _socket: &str,
+        _token: &str,
+        _request: Request,
+        _origin: Option<&str>,
+    ) -> Result<Value, String> {
         Err("Windows の IPC（named pipe）は未実装（Phase 6 で対応予定）".into())
     }
 }
