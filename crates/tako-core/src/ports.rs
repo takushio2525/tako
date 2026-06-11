@@ -22,9 +22,16 @@ pub struct ListenPort {
 }
 
 /// tty デバイス名（`/dev/ttysNNN`）→ rdev。tty とプロセスの突き合わせキーに使う
+#[cfg(unix)]
 pub fn tty_rdev(tty_name: &str) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(tty_name).ok().map(|m| m.rdev())
+}
+
+/// Windows に tty の概念は無い（ConPTY の対応付けは Phase 6 で別途設計する）
+#[cfg(not(unix))]
+pub fn tty_rdev(_tty_name: &str) -> Option<u64> {
+    None
 }
 
 /// 指定した tty（rdev）群に属するプロセスの listen ポートを一括スキャンする。
