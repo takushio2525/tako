@@ -215,6 +215,8 @@ impl TerminalSession {
             ("TERM".to_string(), "xterm-256color".to_string()),
             ("COLORTERM".to_string(), "truecolor".to_string()),
         ]);
+        // シェル統合（OSC 7/133 発行）の自動注入。options.env が常に優先
+        env.extend(crate::shell_integration::env().iter().cloned());
         env.extend(options.env);
 
         let tty_options = tty::Options {

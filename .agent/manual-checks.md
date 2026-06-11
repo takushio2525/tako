@@ -44,6 +44,17 @@
       リサイズが誤発火しない（カーソル形状が変わる領域とドラッグ開始領域が常に一致する。
       機械検証はセルフテスト 5c）
 
+## シェル統合（FR-2.4.1、Phase 4）
+
+zsh の自動注入（ZDOTDIR 方式）はセルフテスト 41/41b で機械検証済み。
+bash / fish は注入経路（PROMPT_COMMAND / XDG_DATA_DIRS）が異なるため手動確認する:
+
+- [ ] ペイン内で `bash` を起動 → `cd /tmp` → `tako list` の該当ペインに cwd が出る
+- [ ] 同 bash で `false` → `tako list` の state が failed / exit_code 1
+- [ ] ペイン内で `fish` を起動（インストール済みなら）→ 同上
+- [ ] p10k / starship 等のプロンプトカスタマイズと共存できる（プロンプト崩れなし）
+- [ ] `TAKO_NO_SHELL_INTEGRATION=1 tako-app` で統合が無効化される（cwd / state が unknown のまま）
+
 ## role / title バッジ表示（FR-2.1.3、Phase 3 残）
 
 role / title の設定・取得自体はセルフテスト（`tako title / role 設定`）で機械検証済み。

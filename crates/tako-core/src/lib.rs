@@ -7,6 +7,7 @@ pub mod osc_tap;
 pub mod pane;
 pub mod pane_tree;
 pub mod screen;
+pub mod shell_integration;
 pub mod tab;
 pub mod terminal;
 pub mod theme;
