@@ -181,6 +181,8 @@ pub struct TerminalSession {
     command_state: CommandState,
     /// PTY スレーブの tty 名（tmux クライアントとの対応付け。FR-2.13.2）
     tty_name: Option<String>,
+    /// 検知された listen ポート（FR-2.4.2。UI 層のポーリングが更新する）
+    listen_ports: Vec<crate::ports::ListenPort>,
 }
 
 impl TerminalSession {
@@ -262,6 +264,7 @@ impl TerminalSession {
                 cwd: None,
                 command_state: CommandState::default(),
                 tty_name,
+                listen_ports: Vec::new(),
             },
             rx,
         ))
@@ -450,6 +453,20 @@ impl TerminalSession {
     /// OSC 133 から導出したコマンド実行状態
     pub fn command_state(&self) -> CommandState {
         self.command_state
+    }
+
+    /// 検知された listen ポート（FR-2.4.2。list / MCP に公開される）
+    pub fn listen_ports(&self) -> &[crate::ports::ListenPort] {
+        &self.listen_ports
+    }
+
+    /// listen ポート検知結果の反映。変化があれば true（再描画・通知の判断用）
+    pub fn set_listen_ports(&mut self, ports: Vec<crate::ports::ListenPort>) -> bool {
+        if self.listen_ports == ports {
+            return false;
+        }
+        self.listen_ports = ports;
+        true
     }
 
     /// 表示中グリッドの色解決済みスナップショット（描画・読み取りの基盤）

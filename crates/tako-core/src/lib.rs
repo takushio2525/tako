@@ -7,6 +7,7 @@ pub mod osc_tap;
 pub mod pane;
 pub mod pane_tree;
 pub mod paths;
+pub mod ports;
 pub mod screen;
 pub mod shell_integration;
 pub mod tab;
@@ -21,6 +22,7 @@ pub use pane_tree::{
     ratio_for_position, PaneBorder, PaneNode, PaneTree, PaneTreeError, Rect, SplitAxis,
     SplitDirection,
 };
+pub use ports::ListenPort;
 pub use screen::{Screen, ScreenLine, StyleRun};
 pub use tab::{Tab, TabId};
 pub use terminal::{

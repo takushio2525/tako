@@ -137,3 +137,12 @@
   OFF 設定（settings.json + `tako autorename` / MCP。計 17 ツール）。セルフテスト 77 項目緑
 - 次: Phase 4 後半（listen ポート検知 → 提案チップ → 集約センター）。
   claude 実呼び出しの見た目は常用確認（manual-checks.md）
+
+## 2026-06-12（listen ポート検知 FR-2.4.2 完成）
+
+- tako-core::ports 新設: libproc（proc_listpids / PROC_PIDFDSOCKETINFO）+ tty 突き合わせで
+  ペイン配下の LISTEN 中 TCP を 3 秒ポーリング検知し、list / MCP の listen_ports へ公開。
+  socket_fdinfo は SDK 転記 + 自プロセス listen のユニットテストで ABI 検証。
+  セルフテスト 79 項目緑（nc -l の e2e 含む）
+- 次: 提案チップ（FR-2.4.3〜4）は表示位置・承諾アクションの設計分岐を**ユーザーへ確認
+  してから**着手 → 集約センター（FR-2.10）

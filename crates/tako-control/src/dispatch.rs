@@ -432,6 +432,13 @@ fn list_json(host: &dyn ControlHost) -> Value {
                             tako_core::CommandState::Failed(code) => Some(code),
                             _ => None,
                         }),
+                        // ペイン配下プロセスの listen 中 TCP ポート（FR-2.4.2。
+                        // tty 突き合わせのポーリング検知。未対応環境では空配列）
+                        "listen_ports": session.map(|s| s.listen_ports().iter().map(|p| json!({
+                            "port": p.port,
+                            "pid": p.pid,
+                            "process": p.process,
+                        })).collect::<Vec<_>>()),
                         "rect": {
                             "x": rect.x,
                             "y": rect.y,

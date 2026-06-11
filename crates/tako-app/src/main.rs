@@ -400,6 +400,48 @@ impl TakoApp {
         })
         .detach();
 
+        // listen ポート検知（FR-2.4.2）。ペインの tty とプロセスの制御端末を突き合わせ、
+        // 配下の LISTEN 中 TCP ポートを 3 秒毎に拾って list / MCP へ公開する
+        // （提案チップ FR-2.4.3 はこの素材を使う）。スキャンはバックグラウンドで行う
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(3)).await;
+            let Ok(ttys) = this.update(cx, |app: &mut TakoApp, _| {
+                app.terminals
+                    .iter()
+                    .filter_map(|(pane, session)| {
+                        let rdev = tako_core::ports::tty_rdev(session.tty_name()?)?;
+                        Some((*pane, rdev))
+                    })
+                    .collect::<Vec<_>>()
+            }) else {
+                break; // View が破棄された
+            };
+            if ttys.is_empty() {
+                continue;
+            }
+            let rdevs: Vec<u64> = ttys.iter().map(|(_, rdev)| *rdev).collect();
+            let mut scanned = cx
+                .background_executor()
+                .spawn(async move { tako_core::ports::scan(&rdevs) })
+                .await;
+            let result = this.update(cx, |app: &mut TakoApp, cx| {
+                let mut changed = false;
+                for (pane, rdev) in &ttys {
+                    if let Some(session) = app.terminals.get_mut(pane) {
+                        let ports = scanned.remove(rdev).unwrap_or_default();
+                        changed |= session.set_listen_ports(ports);
+                    }
+                }
+                if changed {
+                    cx.notify();
+                }
+            });
+            if result.is_err() {
+                break;
+            }
+        })
+        .detach();
+
         app
     }
 
@@ -3800,6 +3842,61 @@ mod self_test {
                 .update(cx, |app, _, _| !app.autorename.enabled)
                 .unwrap_or(false);
             check(toggled, "自動リネームの無効化が検知ループへ反映");
+
+            // 53. listen ポート検知（FR-2.4.2）。ペイン内で nc を listen させ、
+            //     tty 突き合わせのポーリング（3 秒毎）が拾うまで待つ。
+            //     ポートは bind(0) で空きを取ってから渡す（既知ポートとの衝突回避）
+            let free_port = std::net::TcpListener::bind("127.0.0.1:0")
+                .ok()
+                .and_then(|l| l.local_addr().ok())
+                .map(|a| a.port())
+                .unwrap_or(12947);
+            press(any, cx, "ctrl-u");
+            type_text(any, cx, &format!("nc -l {free_port} &"), true);
+            let mut detected = false;
+            for _ in 0..8 {
+                wait(cx, 1500).await;
+                detected = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&app.focused_pane())
+                            .map(|s| s.listen_ports().iter().any(|p| p.port == free_port))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if detected {
+                    break;
+                }
+            }
+            check(detected, "listen ポート検知（nc -l）");
+            // list（CLI / MCP と同じ dispatch）にも listen_ports として公開される
+            let listed = window
+                .update(cx, |app, _, _| {
+                    let pane = app.focused_pane().as_u64();
+                    let value = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::List,
+                        PaneOrigin::Cli,
+                    )
+                    .expect("list は常に成功する");
+                    value["tabs"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|t| t["panes"].as_array().cloned().unwrap_or_default())
+                        .filter(|p| p["id"].as_u64() == Some(pane))
+                        .any(|p| {
+                            p["listen_ports"]
+                                .as_array()
+                                .is_some_and(|ports| ports.iter().any(|e| {
+                                    e["port"].as_u64() == Some(free_port as u64)
+                                }))
+                        })
+                })
+                .unwrap_or(false);
+            check(listed, "list に listen_ports が公開される");
+            type_text(any, cx, "kill %1 2>/dev/null", true);
+            wait(cx, 500).await;
 
             println!("TAKO_APP_SELF_TEST_OK");
             std::process::exit(0);

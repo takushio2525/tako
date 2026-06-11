@@ -6,14 +6,15 @@
 
 ## 現在の対象
 
-- 何を / どこを: **FR-2.12（タブ・ペイン名の AI 自動リネーム）完成**（2026-06-12、
-  方式 1 = tako 常駐をユーザー承認済み）。検知ループ（2 秒ポーリング + 静穏 4 秒 +
-  クールダウン 30 秒）→ `claude -p`（haiku 固定）→ `set_title_auto` 反映。手動優先は
-  `TitleSource`、OFF は settings.json + `tako autorename` / MCP（計 17 ツール）。
-  次は **Phase 4 後半**（listen ポート検知 FR-2.4.2 → 提案チップ → 集約センター FR-2.10）
-- ステータス: セルフテスト 77 項目緑・push 済み。**/Applications の .app は要更新**
-  （`scripts/build-app.sh --install`）。claude 実呼び出し経路は常用で確認
-  （manual-checks.md「AI 自動リネーム」）
+- 何を / どこを: **FR-2.12（AI 自動リネーム）と FR-2.4.2（listen ポート検知）完成**
+  （2026-06-12）。自動リネーム = tako 常駐検知ループ → `claude -p`（haiku）→
+  `set_title_auto`（手動優先 TitleSource、OFF は settings.json + `tako autorename` / MCP
+  計 17 ツール）。listen 検知 = `tako-core::ports`（libproc + tty 突き合わせ、3 秒
+  ポーリング）→ list / MCP の `listen_ports`。
+  次は**提案チップ（FR-2.4.3〜4）だが表示位置・承諾アクションの設計分岐をユーザーへ
+  確認してから着手** → 集約センター（FR-2.10）
+- ステータス: セルフテスト 79 項目緑・push 済み・CI 緑（FR-2.12 分）。
+  /Applications の .app は FR-2.12 時点まで反映済み（listen 検知分は要再ビルド）
 - 最終更新: 2026-06-12
 
 ## 直近の観点・指摘
@@ -23,6 +24,10 @@
   claude 解決はログインシェル経由 `command -v claude`（GUI の PATH 最小問題対策、
   `TAKO_CLAUDE_BIN` で差し替え可）。`TAKO_SELF_TEST` 中はループ無効 + claude 不使用 +
   設定を永続化しない
+- **listen ポート検知**（`tako-core::ports`）: libc に無い `socket_fdinfo` は SDK ヘッダ
+  転記 + **自プロセス listen のユニットテストで ABI 検証**。バッファは align 1 のため
+  `read_unaligned` 必須。「ペイン配下」= 制御端末（`proc_bsdinfo.e_tdev`）と PTY スレーブ
+  rdev の一致（プロセスツリー走査より単純でジョブ全体を拾う）。Linux / Windows は空で劣化
 - **タブ表示名の優先順位**: title_source = default のタブのみ「フォーカスペインの OSC
   タイトル」フォールバック。auto / manual はタブ名を表示（OSC に上書きされない）
 - **ホイールの出し分け**（`wheel_action`）: mouse reporting → SGR/X10 転送、
@@ -42,13 +47,15 @@
 
 ## 現フェーズで Read すべき設計書
 
-- Phase 4 後半着手時: `architecture.md`「Layer 3」節 + `requirements.md` FR-2.4.2〜2.4.4 /
-  FR-2.10（listen ポート検知は macOS: libproc）
+- 提案チップ（FR-2.4.3〜4）着手時: `architecture.md`「Layer 3」節 + `requirements.md`
+  FR-2.4.3〜2.4.4（**着手前に表示位置・承諾アクションをユーザーへ確認**）
+- 集約センター（FR-2.10）着手時: `requirements.md` FR-2.10
 
 ## 未解決・次の一手
 
-- [ ] Phase 4 後半: listen ポート検知（FR-2.4.2）→ 提案チップ（FR-2.4.3〜4）→
-      集約センター（FR-2.10）
+- [ ] **ユーザー確認待ち**: 提案チップの設計分岐（表示位置 / 承諾アクション =
+      Web ビュー未実装のため暫定は外部ブラウザ `open` か）
+- [ ] 提案チップ（FR-2.4.3〜4。パッシブ検知の OFF 設定含む）→ 集約センター（FR-2.10）
 - [ ] /Applications の .app 更新（`scripts/build-app.sh --install`）+ ユーザー再起動
 - [ ] 常用確認: 自動リネームの claude 実呼び出し経路（manual-checks.md「AI 自動リネーム」）
 - [ ] 描画のグリッド不一致（全角 advance ≠ 2 セル）の根本対応の要否を常用で判断
