@@ -195,6 +195,9 @@ impl TerminalSession {
 
         let config = Config {
             scrolling_history: SCROLLBACK_LINES,
+            // kitty keyboard protocol（CSI > u の push/pop）を受理する。
+            // 既定 false だと TUI の有効化要求が無視され Shift+Enter 等を区別できない
+            kitty_keyboard: true,
             ..Config::default()
         };
         let term_size = TermSize::new(cols, rows);
@@ -340,6 +343,15 @@ impl TerminalSession {
     /// alternate screen（全画面 TUI）中か。スクロールバーの表示判定等に使う
     pub fn is_alt_screen(&self) -> bool {
         self.term.lock().mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// kitty keyboard protocol の disambiguate フラグ（TUI が `CSI > 1 u` で有効化）。
+    /// 有効時、UI 層は Esc / 修飾付き Enter 等を CSI u 形式で送る（Shift+Enter の区別）
+    pub fn disambiguate_keys(&self) -> bool {
+        self.term
+            .lock()
+            .mode()
+            .contains(TermMode::DISAMBIGUATE_ESC_CODES)
     }
 
     pub fn scroll_to_bottom(&self) {
