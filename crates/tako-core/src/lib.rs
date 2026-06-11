@@ -3,6 +3,7 @@
 //! Workspace / Tab / PaneTree / Pane / TerminalSession / Theme / Screen を提供する。
 //! GPUI への依存はここに置かない（GPUI 破壊的変更リスクの防波堤。`.agent/architecture.md`）。
 
+pub mod osc_tap;
 pub mod pane;
 pub mod pane_tree;
 pub mod screen;
@@ -11,6 +12,7 @@ pub mod terminal;
 pub mod theme;
 pub mod workspace;
 
+pub use osc_tap::{OscEvent, PromptMark};
 pub use pane::{Pane, PaneId, PaneOrigin};
 pub use pane_tree::{
     ratio_for_position, PaneBorder, PaneNode, PaneTree, PaneTreeError, Rect, SplitAxis,
@@ -19,8 +21,8 @@ pub use pane_tree::{
 pub use screen::{Screen, ScreenLine, StyleRun};
 pub use tab::{Tab, TabId};
 pub use terminal::{
-    SelectionKind, SessionError, SessionNotice, SpawnCommand, SpawnOptions, TermEvent,
-    TerminalSession,
+    CommandState, SelectionKind, SessionError, SessionEvent, SessionNotice, SpawnCommand,
+    SpawnOptions, TermEvent, TerminalSession,
 };
 pub use theme::{Rgb, Theme};
 pub use workspace::{Workspace, WorkspaceError};

@@ -5501,6 +5501,7 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "futures",
+ "polling",
  "thiserror 2.0.18",
  "tracing",
 ]

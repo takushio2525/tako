@@ -23,6 +23,8 @@ strip = "symbols"
 tako-core = { path = "crates/tako-core" }
 tako-control = { path = "crates/tako-control" }
 alacritty_terminal = "0.26"
+# PTY タップ（EventedReadWrite 委譲ラッパ）のトレイトシグネチャに必要。alacritty 経由で既にツリー内
+polling = "3"
 futures = "0.3"
 thiserror = "2"
 tracing = "0.1"

@@ -22,11 +22,36 @@ use alacritty_terminal::term::{test::TermSize, viewport_to_point, Config, Term, 
 use alacritty_terminal::tty;
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 
+use crate::osc_tap::{OscEvent, PromptMark, TapPty};
 use crate::screen::{self, Screen};
 use crate::theme::Theme;
 
 /// PTY / IO スレッドからのイベント。UI 層はこれを `process_event` へ渡す
 pub use alacritty_terminal::event::Event as TermEvent;
+
+/// セッションが UI 層へ流すイベント（alacritty のイベント + OSC タップの検知）
+#[derive(Debug)]
+pub enum SessionEvent {
+    /// alacritty_terminal の IO スレッドからのイベント
+    Term(TermEvent),
+    /// OSC 7 / 133 タップの検知（`osc_tap`。FR-2.4.1）
+    Osc(OscEvent),
+}
+
+/// OSC 133 マークから導出するコマンド実行状態（FR-2.1.4 の表示・list の公開元）。
+/// シェル統合が無いペインは Unknown のまま
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommandState {
+    /// シェル統合未検知（OSC 133 が一度も届いていない）
+    #[default]
+    Unknown,
+    /// プロンプト表示中（入力待ち）
+    Idle,
+    /// コマンド実行中
+    Running,
+    /// 直近コマンドが非ゼロ exit で終了。次のコマンド実行開始まで保持する
+    Failed(i32),
+}
 
 /// スクロールバックの保持行数
 const SCROLLBACK_LINES: usize = 10_000;
@@ -106,12 +131,12 @@ impl SelectionKind {
 
 /// alacritty の IO スレッドから UI 層へイベントを中継するプロキシ
 #[derive(Clone)]
-pub struct EventProxy(UnboundedSender<TermEvent>);
+pub struct EventProxy(UnboundedSender<SessionEvent>);
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TermEvent) {
         // 受信側（UI）が先に破棄されていても IO スレッドは落とさない
-        let _ = self.0.unbounded_send(event);
+        let _ = self.0.unbounded_send(SessionEvent::Term(event));
     }
 }
 
@@ -122,6 +147,10 @@ pub struct TerminalSession {
     cols: usize,
     rows: usize,
     title: Option<String>,
+    /// OSC 7 で通知された cwd（シェル統合が無ければ None のまま）
+    cwd: Option<PathBuf>,
+    /// OSC 133 から導出したコマンド実行状態
+    command_state: CommandState,
 }
 
 impl TerminalSession {
@@ -132,9 +161,9 @@ impl TerminalSession {
         cols: usize,
         rows: usize,
         options: SpawnOptions,
-    ) -> Result<(Self, UnboundedReceiver<TermEvent>), SessionError> {
-        let (tx, rx) = unbounded::<TermEvent>();
-        let proxy = EventProxy(tx);
+    ) -> Result<(Self, UnboundedReceiver<SessionEvent>), SessionError> {
+        let (tx, rx) = unbounded::<SessionEvent>();
+        let proxy = EventProxy(tx.clone());
 
         let config = Config {
             scrolling_history: SCROLLBACK_LINES,
@@ -169,6 +198,13 @@ impl TerminalSession {
             ..tty::Options::default()
         };
         let pty = tty::new(&tty_options, window_size, 0).map_err(SessionError::Pty)?;
+        // PTY 読み取りを OSC 7 / 133 タップで観測する（バイト列は変更しない。`osc_tap`）
+        let pty = TapPty::new(
+            pty,
+            Box::new(move |event| {
+                let _ = tx.unbounded_send(SessionEvent::Osc(event));
+            }),
+        );
 
         let event_loop = EventLoop::new(term.clone(), proxy, pty, false, false)
             .map_err(SessionError::EventLoop)?;
@@ -182,6 +218,8 @@ impl TerminalSession {
                 cols,
                 rows,
                 title: None,
+                cwd: None,
+                command_state: CommandState::default(),
             },
             rx,
         ))
@@ -270,7 +308,17 @@ impl TerminalSession {
     /// IO スレッドから中継されたイベントを処理する。
     /// PtyWrite（端末からの応答要求）は PTY へ書き戻す。UI 層は処理後に再描画し、
     /// 戻り値の通知（終了・タイトル変更・クリップボード要求）に対応する
-    pub fn process_event(&mut self, event: TermEvent) -> Option<SessionNotice> {
+    pub fn process_event(&mut self, event: SessionEvent) -> Option<SessionNotice> {
+        match event {
+            SessionEvent::Term(event) => self.process_term_event(event),
+            SessionEvent::Osc(event) => {
+                self.process_osc_event(event);
+                None
+            }
+        }
+    }
+
+    fn process_term_event(&mut self, event: TermEvent) -> Option<SessionNotice> {
         match event {
             TermEvent::PtyWrite(text) => {
                 self.notifier.notify(text.into_bytes());
@@ -288,6 +336,26 @@ impl TerminalSession {
             TermEvent::Exit | TermEvent::ChildExit(_) => Some(SessionNotice::Exited),
             _ => None,
         }
+    }
+
+    /// OSC 7 / 133 タップの検知を cwd・コマンド実行状態へ反映する（FR-2.4.1）
+    fn process_osc_event(&mut self, event: OscEvent) {
+        match event {
+            OscEvent::CwdChanged(path) => self.cwd = Some(path),
+            OscEvent::Mark(mark) => {
+                self.command_state = next_command_state(self.command_state, mark);
+            }
+        }
+    }
+
+    /// OSC 7 で通知された cwd（シェル統合が無ければ None）
+    pub fn cwd(&self) -> Option<&std::path::Path> {
+        self.cwd.as_deref()
+    }
+
+    /// OSC 133 から導出したコマンド実行状態
+    pub fn command_state(&self) -> CommandState {
+        self.command_state
     }
 
     /// 表示中グリッドの色解決済みスナップショット（描画・読み取りの基盤）
@@ -309,6 +377,20 @@ impl Drop for TerminalSession {
     fn drop(&mut self) {
         // IO スレッドへ終了を通知する（PTY が drop されシェルにも HUP が届く）
         let _ = self.notifier.0.send(Msg::Shutdown);
+    }
+}
+
+/// コマンド実行状態の遷移。エラー（Failed）はひと目で気づけるよう、
+/// 次のコマンドが実行開始されるまでプロンプトに戻っても保持する（FR-2.1.4）
+fn next_command_state(current: CommandState, mark: PromptMark) -> CommandState {
+    match mark {
+        PromptMark::PromptStart | PromptMark::CommandStart => match current {
+            CommandState::Failed(code) => CommandState::Failed(code),
+            _ => CommandState::Idle,
+        },
+        PromptMark::CommandExecuted => CommandState::Running,
+        PromptMark::CommandFinished(Some(code)) if code != 0 => CommandState::Failed(code),
+        PromptMark::CommandFinished(_) => CommandState::Idle,
     }
 }
 
@@ -354,6 +436,25 @@ fn paste_payload(text: &str, bracketed: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn コマンド実行状態の遷移とエラー保持() {
+        use CommandState::*;
+        use PromptMark::*;
+        // 通常サイクル: prompt → 実行 → 正常終了 → prompt
+        assert_eq!(next_command_state(Unknown, PromptStart), Idle);
+        assert_eq!(next_command_state(Idle, CommandExecuted), Running);
+        assert_eq!(next_command_state(Running, CommandFinished(Some(0))), Idle);
+        assert_eq!(next_command_state(Running, CommandFinished(None)), Idle);
+        // 非ゼロ exit → Failed はプロンプトに戻っても保持し、次の実行開始で解除
+        assert_eq!(
+            next_command_state(Running, CommandFinished(Some(1))),
+            Failed(1)
+        );
+        assert_eq!(next_command_state(Failed(1), PromptStart), Failed(1));
+        assert_eq!(next_command_state(Failed(1), CommandStart), Failed(1));
+        assert_eq!(next_command_state(Failed(1), CommandExecuted), Running);
+    }
 
     #[test]
     fn ペースト改行は正規化されブラケットモードで包まれる() {

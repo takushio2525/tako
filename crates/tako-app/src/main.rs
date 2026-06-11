@@ -319,7 +319,7 @@ impl TakoApp {
     fn on_term_event(
         &mut self,
         pane_id: PaneId,
-        event: tako_core::TermEvent,
+        event: tako_core::SessionEvent,
         cx: &mut Context<Self>,
     ) {
         let Some(session) = self.terminals.get_mut(&pane_id) else {
