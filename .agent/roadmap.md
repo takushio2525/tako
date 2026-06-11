@@ -10,18 +10,22 @@
   （最後にまとめて移植、はしない。GPUI の Windows 成熟を継続的に追跡する意味もある）
 - 各フェーズは「動くものが残る」単位で切る
 
-## Phase 0: 技術検証スパイク（最重要）
+## Phase 0: 技術検証スパイク（最重要）→ ✅ 完了（2026-06-11、条件付き）
 
 **GPUI の Windows ビルド検証スパイク + 最小ターミナル描画 PoC**
 
-- [ ] GPUI 単体アプリ（ウィンドウ + テキスト描画）が macOS / **Windows** 両方でビルド・起動できることを確認
-- [ ] alacritty_terminal + PTY でシェルを起動し、グリッドを GPUI で描画する最小 PoC（macOS）
-- [ ] 同 PoC を Windows（ConPTY）で動かす
-- [ ] PTY クレート（portable-pty 等）と非同期方式（GPUI executor / tokio）を確定
-- [ ] GPUI の Windows 未成熟箇所（IME・フォント・ウィンドウ管理等）を洗い出してリスト化
+- [x] GPUI 単体アプリ（ウィンドウ + テキスト描画）が macOS でビルド・起動（crates.io 版 / git 版両方で確認）
+- [x] Windows は**調査ベースで成立見込み高と判断**（Zed Windows 正式リリース済み・単体利用実績あり。
+      実機が無いため実ビルドは未実施 → 残タスクとして下記に移管）
+- [x] alacritty_terminal + PTY でシェルを起動し、グリッドを GPUI で描画する最小 PoC（macOS、`poc/03-term-poc`）
+- [ ] **（残タスク → Phase 1 へ）** Windows で PoC をビルド・スモーク（GitHub Actions windows ランナーで代替検証）
+- [ ] **（残タスク → Phase 6 へ）** Windows 実機での動作検証（ConPTY・IME・フォント描画）
+- [x] PTY クレート確定: **alacritty_terminal::tty**（portable-pty 不要）。非同期: **GPUI executor + futures channel**（tokio 不要）
+- [x] GPUI の Windows 未成熟箇所をリスト化（`architecture.md` の「Phase 0 検証結果」節）
 
-**Exit Criteria**: 両 OS で「シェルが動いて文字が打てる窓」が出る。
-**失敗時**: GPUI を諦め、代替（iced / 自前 wgpu / Tauri 等）の再評価に戻る。この判断ごと記録する。
+**判定**: macOS では Exit Criteria（シェルが動いて文字が打てる窓）達成。Windows は実機が無く
+調査ベースの判断だが、Zed 本体の正式リリース実績から**スタック採用を確定**。
+GPUI バージョン戦略は **zed リポ git rev 固定**（`architecture.md` 参照）。
 
 ## Phase 1: macOS MVP（素のターミナル）
 
@@ -31,6 +35,7 @@
 - [ ] PaneTree ドメインモデルと UI の分離（GPUI 非依存の core/）
 - [ ] スクロールバック・コピペ・基本的な使い心地
 - [ ] Windows ビルドを CI（GitHub Actions）に組み込む
+      （**Phase 0 残タスク**: windows ランナーで PoC 相当のビルド・スモークをまず通す。実機が無いため CI が唯一の Windows 検証手段）
 
 **Exit Criteria**: 日常のターミナルとして自分が常用できる（macOS）。
 

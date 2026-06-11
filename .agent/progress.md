@@ -21,3 +21,10 @@
 - 仕様書一式作成: concept / requirements / architecture / roadmap + README（日英）+ LICENSE（Apache-2.0）
 - 未決事項: MCP トランスポート（Phase 3）、ハイライタ選定（Phase 5）、`tako` コマンド名衝突調査、Linux 対応の扱い
 - 次: Phase 0 — GPUI Windows ビルド検証スパイク + 最小ターミナル描画 PoC
+
+## 2026-06-11（Phase 0 完了）
+
+- Phase 0 実施: GPUI 最小ウィンドウ（crates.io 0.2.2 / git rev 固定の両方）+ alacritty_terminal 最小ターミナル PoC が macOS で成功。スタック採用確定、GPUI は git rev 固定戦略
+- Windows は Web 調査で成立見込み高と判断（Zed 正式リリース済み）。実ビルドは Phase 1 CI / Phase 6 実機へ残タスク化。検証結果・ハマりどころは architecture.md / poc/README.md に反映
+- 関連コミット: `c1427b4` `f0e68ff` + ドキュメント反映コミット
+- 次: Phase 1 — Cargo ワークスペース構成と CI（windows スモーク含む）から着手

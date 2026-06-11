@@ -7,23 +7,62 @@
 | 領域 | 採用 | 根拠 |
 |---|---|---|
 | 言語 | Rust | ネイティブ性能、メモリ安全、Warp / Zed / Alacritty の実績 |
-| UI フレームワーク | **GPUI**（Zed 製） | GPU 描画で Zed 級の速度を出せる唯一級の Rust UI。Zed 本体が実証 |
-| ターミナルエミュレーション | **alacritty_terminal** | 枯れた VT 実装。Zed のターミナルも同クレートを採用しており GPUI との組み合わせ実績がある |
-| PTY | portable-pty 等（Phase 0 で選定） | macOS / Windows（ConPTY）の差を吸収 |
-| 非同期 | GPUI の executor を基本、必要なら tokio（Phase 0 で判断） | |
+| UI フレームワーク | **GPUI**（Zed 製、**zed リポ git rev 固定**） | GPU 描画で Zed 級の速度を出せる唯一級の Rust UI。Zed 本体が実証。バージョン戦略は下記 |
+| ターミナルエミュレーション | **alacritty_terminal 0.26+**（crates.io） | 枯れた VT 実装（Apache-2.0、2026-04 更新で活発）。Zed のターミナルも同クレート採用 |
+| PTY | **alacritty_terminal::tty**（Phase 0 で確定） | 同クレートが macOS openpty / Windows ConPTY を吸収済み。portable-pty は不要と判断 |
+| 非同期 | **GPUI executor + futures channel**（Phase 0 で確定） | PTY IO は alacritty の EventLoop スレッド、UI への通知は channel + `cx.spawn` で足りる。tokio 不要 |
 
 ### ⚠️ 採用リスク（明記事項）
 
 1. **GPUI は pre-1.0 であり、破壊的変更が頻発する。**
    Zed 本体の都合で API が変わる前提で付き合う。対策:
    - GPUI への依存を `ui/` レイヤに閉じ込め、コアロジック（ペインツリー・制御プレーン）は GPUI 非依存に保つ
-   - バージョンを Cargo.lock で固定し、追従は意識的なタスクとして行う（自動更新しない）
-2. **GPUI の Windows 対応は進行中（未完成）。**
-   Windows 対応は tako の必須要件なので、これが最大の技術リスク。
-   → **Phase 0 を「GPUI の Windows ビルド検証スパイク + 最小ターミナル描画 PoC」とし、
-   ここで成立しなければスタック再検討に戻る**（`roadmap.md` 参照）。
-3. **ライセンス互換性**: GPUI は Apache-2.0、alacritty_terminal は Apache-2.0 / MIT で、
+   - **git rev 固定**（`rev = "..."`）で依存し、追従は意識的なタスクとして行う（自動更新しない）
+2. **GPUI の Windows 対応**: Phase 0 の調査で「ビルド・起動の成立」リスクはほぼ解消と判断
+   （下記「Phase 0 検証結果」参照）。残るのは品質面（スクリーンリーダー欠落等）と実機未検証であること。
+3. **GPUI の汎用フレームワークとしての開発減速（2025 年末に Zed が表明）**。
+   crates.io リリースは停滞しており、安定供給は期待できない。コミュニティフォーク
+   gpui-ce（crates.io に 0.3.x あり、元 Zed 社員主導）が乗り換え先の保険。
+   「ui/ に閉じ込める」方針がこのリスクの防波堤を兼ねる。
+4. **ライセンス互換性**: GPUI は Apache-2.0、alacritty_terminal は Apache-2.0 で、
    tako の Apache-2.0 と互換。cmux（GPL-3.0）のコードは絶対に読まない（`concept.md` 参照）。
+   **zed リポ内の gpui 以外のクレート（terminal 等）は GPL 系のため同様にコードを読まない**
+   （gpui / gpui_platform 等 Apache-2.0 のものだけ参照可）。
+
+### Phase 0 検証結果（2026-06-11、詳細は `poc/README.md`）
+
+**結論: Rust + GPUI + alacritty_terminal スタックは成立。** macOS で最小ターミナル
+（シェル起動・出力描画・キー入力）が動作した。PoC は `poc/` 配下（本実装とは分離）。
+
+#### GPUI バージョン戦略: zed リポ git rev 固定を採用
+
+- **crates.io 版（0.2.2）は 2025-10-22 以降更新停止**。開発減速宣言もあり再開は期待薄
+- Windows まわりの修正・改善が入るのは git 版のみ → **git + `rev` 固定 + 意識的な追従**が唯一の現実解
+  （gpui-component / Longbridge Pro など単体利用の先行事例も同方式）
+- 検証時 rev: `cafbf4b5df7fedb67fc0f248850a5654efcec5d9`（2026-06-10 の main）
+
+#### git 版 gpui のハマりどころ（実装時に必ず踏む）
+
+- **`gpui_platform` の `font-kit` feature を有効にしないと文字が一切描画されない**（無警告でスタブ化）
+- `Application::new()` 廃止 → `gpui_platform::application()`（プラットフォーム実装が別クレートに分離）
+- 最新 stable Rust が必要（1.89 不可、1.95.0 で確認）。`rust-toolchain.toml` でピン留めする
+- ウィンドウがオクルージョン状態だと display link が止まり再描画されない（仕様）
+- `WindowHandle<V>::update` 内での `dispatch_keystroke` はビュー二重借用でパニック → `AnyWindowHandle::update` を使う
+
+#### GPUI の Windows 対応の現状（2026-06 時点、Web 調査ベース・実機未検証）
+
+- **Zed 本体の Windows 版は 2025-10-15 に正式リリース済み**（DirectX 11 + DirectWrite のネイティブ実装、
+  毎週リリースに組込み）。「Windows 対応は実験的」という認識はもう古い
+- gpui 単体も Windows は feature flag 不要の公式サポート。gpui-component（★11k、Windows 対応明記）と
+  その商用利用（Longbridge Pro）という git 依存単体利用の実績あり
+- ビルド前提: MSVC C++ build tools + **Spectre-mitigated libs** + Windows 10 SDK 10.0.20348.0+ + CMake
+- 既知の未成熟箇所（zed リポ issue、`platform:windows` 約 120 件）:
+  - **スクリーンリーダー（UIA)対応が完全欠落**（#41138、未解決）— アクセシビリティ要件には致命的
+  - フォント描画: Mica 有効時のぼやけ（#56382）、**ターミナル TUI のフォント描画崩れ（#58830）**、リガチャ（#51754）
+  - テキスト入力時の GPU 負荷が高い（#37727）、画像アトラス解放漏れ（#56667）
+  - IME（日本語含む CJK）は 2025 年末に集中修正されおおむね機能する模様
+- **未検証**: この PC は macOS のため Windows 実ビルドは未実施。Phase 1 の CI 整備時に
+  GitHub Actions の windows ランナーで PoC をビルド・スモークし、実機級の検証は Phase 6 で行う（`roadmap.md`）
 
 ## 全体レイヤ構成
 
