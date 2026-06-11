@@ -1,14 +1,19 @@
 //! Workspace — タブ一覧とアクティブタブの管理（FR-1.2）
 
-use crate::pane::Pane;
+use crate::pane::{Pane, PaneId};
+use crate::pane_tree::{PaneTreeError, SplitDirection};
 use crate::tab::{Tab, TabId};
 
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum WorkspaceError {
     #[error("タブ {0} が見つからない")]
     TabNotFound(TabId),
+    #[error("ペイン {0} が見つからない")]
+    PaneNotFound(PaneId),
     #[error("最後の 1 タブは閉じられない（アプリ終了は UI 層の責務）")]
     LastTab,
+    #[error("ペイン {0} は既にタブ {1} にある")]
+    AlreadyInTab(PaneId, TabId),
 }
 
 /// アプリ全体の状態のルート。常に 1 つ以上のタブを持つ
@@ -105,6 +110,51 @@ impl Workspace {
         self.activate_by_offset(self.tabs.len() - 1)
     }
 
+    /// ペインが属するタブを探す（FR-2.2.7 の呼び出し元特定や IPC のペイン解決に使う）
+    pub fn find_tab_of_pane(&self, pane: PaneId) -> Option<TabId> {
+        self.tabs
+            .iter()
+            .find(|t| t.tree().contains(pane))
+            .map(|t| t.id())
+    }
+
+    /// ペインを別タブへ移送する（FR-2.5.10）。移動先ではフォーカス中ペインの右に生える。
+    /// 移動元タブが空になる場合はタブごと閉じる
+    pub fn move_pane(&mut self, pane: PaneId, dest: TabId) -> Result<(), WorkspaceError> {
+        let src = self
+            .find_tab_of_pane(pane)
+            .ok_or(WorkspaceError::PaneNotFound(pane))?;
+        if self.get_tab(dest).is_none() {
+            return Err(WorkspaceError::TabNotFound(dest));
+        }
+        if src == dest {
+            return Err(WorkspaceError::AlreadyInTab(pane, dest));
+        }
+        let src_tree = self
+            .get_tab_mut(src)
+            .expect("find_tab_of_pane で存在確認済み")
+            .tree_mut();
+        let moved = match src_tree.close(pane) {
+            Ok(pane) => pane,
+            Err(PaneTreeError::LastPane) => {
+                // 1 ペインだけのタブ → タブごと閉じてペインを取り出す
+                // （dest が別タブとして存在するので LastTab にはならない）
+                let tab = self.close_tab(src).expect("dest タブが他に存在する");
+                let mut panes = tab.into_tree().into_panes();
+                panes.pop().expect("タブは常に 1 ペイン以上を持つ")
+            }
+            // contains 確認済みのため PaneNotFound は論理的に到達不能
+            Err(e) => unreachable!("move_pane の close で想定外のエラー: {e}"),
+        };
+        let dest_tab = self.get_tab_mut(dest).expect("存在確認済み");
+        let focused = dest_tab.tree().focused();
+        dest_tab
+            .tree_mut()
+            .split(focused, SplitDirection::Right, moved)
+            .expect("focused ペインは常に存在する");
+        Ok(())
+    }
+
     fn activate_by_offset(&mut self, offset: usize) -> TabId {
         let index = self
             .tabs
@@ -167,6 +217,63 @@ mod tests {
         let mut ws = Workspace::new("t1", pane());
         let t1 = ws.active_tab_id();
         assert_eq!(ws.close_tab(t1).unwrap_err(), WorkspaceError::LastTab);
+    }
+
+    #[test]
+    fn ペインからタブを逆引きできる() {
+        let mut ws = Workspace::new("t1", pane());
+        let t1 = ws.active_tab_id();
+        let p1 = ws.active_tab().tree().focused();
+        let p2 = pane();
+        let p2_id = p2.id();
+        let t2 = ws.create_tab("t2", p2);
+        assert_eq!(ws.find_tab_of_pane(p1), Some(t1));
+        assert_eq!(ws.find_tab_of_pane(p2_id), Some(t2));
+        let ghost = pane().id();
+        assert_eq!(ws.find_tab_of_pane(ghost), None);
+    }
+
+    #[test]
+    fn ペインを別タブへ移送できる() {
+        let mut ws = Workspace::new("t1", pane());
+        let t1 = ws.active_tab_id();
+        let p1 = ws.active_tab().tree().focused();
+        // t1 に 2 ペイン目を生やしてから t2 へ移送する
+        let extra = pane();
+        let extra_id = extra.id();
+        ws.active_tab_mut()
+            .tree_mut()
+            .split(p1, SplitDirection::Right, extra)
+            .unwrap();
+        let t2 = ws.create_tab("t2", pane());
+        ws.move_pane(extra_id, t2).unwrap();
+        assert_eq!(ws.find_tab_of_pane(extra_id), Some(t2));
+        assert_eq!(ws.get_tab(t1).unwrap().tree().len(), 1);
+        assert_eq!(ws.get_tab(t2).unwrap().tree().len(), 2);
+    }
+
+    #[test]
+    fn 最後のペインの移送はタブごと閉じる() {
+        let mut ws = Workspace::new("t1", pane());
+        let t1 = ws.active_tab_id();
+        let p1 = ws.active_tab().tree().focused();
+        let t2 = ws.create_tab("t2", pane());
+        ws.move_pane(p1, t2).unwrap();
+        assert_eq!(ws.tabs().len(), 1);
+        assert!(ws.get_tab(t1).is_none());
+        assert_eq!(ws.get_tab(t2).unwrap().tree().len(), 2);
+        assert_eq!(ws.find_tab_of_pane(p1), Some(t2));
+    }
+
+    #[test]
+    fn 同じタブへの移送はエラー() {
+        let mut ws = Workspace::new("t1", pane());
+        let t1 = ws.active_tab_id();
+        let p1 = ws.active_tab().tree().focused();
+        assert_eq!(
+            ws.move_pane(p1, t1).unwrap_err(),
+            WorkspaceError::AlreadyInTab(p1, t1)
+        );
     }
 
     #[test]

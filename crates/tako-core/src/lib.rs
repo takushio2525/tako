@@ -15,6 +15,9 @@ pub use pane::{Pane, PaneId, PaneOrigin};
 pub use pane_tree::{PaneNode, PaneTree, PaneTreeError, Rect, SplitAxis, SplitDirection};
 pub use screen::{Screen, ScreenLine, StyleRun};
 pub use tab::{Tab, TabId};
-pub use terminal::{SelectionKind, SessionError, SessionNotice, TermEvent, TerminalSession};
+pub use terminal::{
+    SelectionKind, SessionError, SessionNotice, SpawnCommand, SpawnOptions, TermEvent,
+    TerminalSession,
+};
 pub use theme::{Rgb, Theme};
 pub use workspace::{Workspace, WorkspaceError};

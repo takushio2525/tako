@@ -24,8 +24,8 @@ use gpui::{
 };
 use gpui_platform::application;
 use tako_core::{
-    Pane, PaneId, PaneOrigin, Rect, SelectionKind, SessionNotice, SplitAxis, SplitDirection, TabId,
-    TerminalSession, Theme, Workspace,
+    Pane, PaneId, PaneOrigin, Rect, SelectionKind, SessionNotice, SpawnOptions, SplitAxis,
+    SplitDirection, TabId, TerminalSession, Theme, Workspace,
 };
 
 /// 新規セッションの初期グリッド。最初の render で実寸へリサイズされる
@@ -151,8 +151,9 @@ impl TakoApp {
 
     /// ペイン ID に対する新しい TerminalSession を起動し、イベント中継タスクを張る
     fn attach_session(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
-        let (session, mut rx) = TerminalSession::spawn(INITIAL_COLS, INITIAL_ROWS)
-            .expect("PTY 付きシェルを起動できなかった");
+        let (session, mut rx) =
+            TerminalSession::spawn(INITIAL_COLS, INITIAL_ROWS, SpawnOptions::default())
+                .expect("PTY 付きシェルを起動できなかった");
         self.terminals.insert(pane_id, session);
         cx.spawn(async move |this, cx| {
             while let Some(event) = rx.next().await {

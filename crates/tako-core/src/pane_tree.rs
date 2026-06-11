@@ -447,6 +447,25 @@ impl PaneTree {
         Ok(new_share)
     }
 
+    /// ツリーを消費して全ペインを取り出す（タブを閉じてペインを移送する操作で使う）
+    pub fn into_panes(mut self) -> Vec<Pane> {
+        fn rec(node: PaneNode, out: &mut Vec<Pane>) {
+            match node {
+                PaneNode::Leaf(pane) => out.push(pane),
+                PaneNode::Split { first, second, .. } => {
+                    rec(*first, out);
+                    rec(*second, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        rec(
+            self.root.take().expect("PaneTree.root は常に Some"),
+            &mut out,
+        );
+        out
+    }
+
     /// 全分割の比率をリーフ数に応じて均等化する（FR-2.5.7 のプリセット相当）
     pub fn equalize(&mut self) {
         fn rec(node: &mut PaneNode) -> usize {

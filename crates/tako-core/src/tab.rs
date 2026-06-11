@@ -63,4 +63,9 @@ impl Tab {
     pub fn tree_mut(&mut self) -> &mut PaneTree {
         &mut self.tree
     }
+
+    /// タブを消費してペインツリーを取り出す（ペインの別タブ移送で使う）
+    pub fn into_tree(self) -> PaneTree {
+        self.tree
+    }
 }

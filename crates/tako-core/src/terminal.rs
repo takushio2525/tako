@@ -9,6 +9,7 @@
 //!
 //! 表示内容の読み取りは色解決済みスナップショット（`screen::snapshot`）で行う。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use alacritty_terminal::event::{EventListener, Notify, OnResize, WindowSize};
@@ -47,6 +48,25 @@ pub enum SessionNotice {
     TitleChanged,
     /// OSC 52 によるクリップボード書き込み要求
     ClipboardStore(String),
+}
+
+/// シェルの代わりに起動するコマンド（`tako split -- <command>` 等で使う）
+#[derive(Debug, Clone)]
+pub struct SpawnCommand {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+/// セッション起動オプション（FR-2.1.1 / FR-2.2.1）。
+/// `env` には UI 層が `TAKO_PANE_ID` 等を詰める。値はログに出さない（`conventions.md`）
+#[derive(Debug, Clone, Default)]
+pub struct SpawnOptions {
+    /// None ならデフォルトシェルを起動する
+    pub command: Option<SpawnCommand>,
+    /// 起動時の作業ディレクトリ。None なら継承
+    pub cwd: Option<PathBuf>,
+    /// 追加で注入する環境変数
+    pub env: Vec<(String, String)>,
 }
 
 /// マウス選択の種類（クリック回数に対応: 1=文字、2=単語、3=行）
@@ -88,12 +108,13 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
-    /// デフォルトシェルを PTY 上で起動する。
+    /// シェル（または `options.command`）を PTY 上で起動する。
     /// 戻り値のレシーバが流すイベントは UI 層で `process_event` に渡すこと。
     /// セル寸法（px）は PTY の TIOCSWINSZ 用。UI 層が実測値で `resize` し直す前提の初期値
     pub fn spawn(
         cols: usize,
         rows: usize,
+        options: SpawnOptions,
     ) -> Result<(Self, UnboundedReceiver<TermEvent>), SessionError> {
         let (tx, rx) = unbounded::<TermEvent>();
         let proxy = EventProxy(tx);
@@ -111,7 +132,13 @@ impl TerminalSession {
             cell_width: 8,
             cell_height: 16,
         };
-        let pty = tty::new(&tty::Options::default(), window_size, 0).map_err(SessionError::Pty)?;
+        let tty_options = tty::Options {
+            shell: options.command.map(|c| tty::Shell::new(c.program, c.args)),
+            working_directory: options.cwd,
+            env: options.env.into_iter().collect(),
+            ..tty::Options::default()
+        };
+        let pty = tty::new(&tty_options, window_size, 0).map_err(SessionError::Pty)?;
 
         let event_loop = EventLoop::new(term.clone(), proxy, pty, false, false)
             .map_err(SessionError::EventLoop)?;
