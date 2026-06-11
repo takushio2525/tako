@@ -23,9 +23,9 @@ use gpui::{
     actions, canvas, div, point, prelude::*, px, relative, size, App, Bounds, ClipboardItem,
     Context, ElementInputHandler, EntityInputHandler, FocusHandle, Font, FontStyle, FontWeight,
     HighlightStyle, Hsla, KeyBinding, Keystroke, Modifiers, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollDelta, ScrollWheelEvent,
-    SharedString, Size, StrikethroughStyle, StyledText, TextRun, TextStyle, UTF16Selection,
-    UnderlineStyle, Window, WindowBounds, WindowOptions,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollDelta, ScrollWheelEvent, SharedString,
+    Size, StrikethroughStyle, StyledText, TextRun, TextStyle, UTF16Selection, UnderlineStyle,
+    Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use tako_control::{ControlHost, IncomingRequest, IpcServer, McpServer};
@@ -834,6 +834,142 @@ impl ControlHost for TakoApp {
     }
 }
 
+/// IME（macOS では NSTextInputClient 相当）との接点（FR-1.9）。
+/// ターミナルには編集対象の「文書」が無いため、**未確定文字列そのものを擬似ドキュメント**
+/// として公開する（範囲はすべてその文字列内の UTF-16 オフセット）。
+/// 確定文字列は PTY へ書き、未確定文字列は render のオーバーレイでカーソル位置に表示する
+impl EntityInputHandler for TakoApp {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let ime = self.ime.as_ref()?;
+        let start = utf16_to_byte_offset(&ime.text, range_utf16.start);
+        let end = utf16_to_byte_offset(&ime.text, range_utf16.end);
+        Some(ime.text.get(start..end)?.to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        // 変換中は IME の注目文節（無ければ末尾キャレット）、非変換中は空ドキュメントの先頭
+        let range = match self.ime.as_ref() {
+            Some(ime) => ime.selected_utf16.clone().unwrap_or_else(|| {
+                let end = utf16_len(&ime.text);
+                end..end
+            }),
+            None => 0..0,
+        };
+        Some(UTF16Selection {
+            range,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.ime.as_ref().map(|ime| 0..utf16_len(&ime.text))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        // NSTextInputClient の規約: unmark は「未確定文字列をそのまま挿入扱いにする」
+        if let Some(ime) = self.ime.take() {
+            if let Some(session) = self.terminals.get(&ime.pane) {
+                session.write(ime.text.into_bytes());
+            }
+        }
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range_utf16: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 確定（insertText 相当）。変換を開始したペインへ書き、変換状態を畳む
+        let pane = self
+            .ime
+            .take()
+            .map(|ime| ime.pane)
+            .unwrap_or_else(|| self.focused_pane());
+        if let Some(session) = self.terminals.get(&pane) {
+            session.clear_selection();
+            session.write(text.as_bytes().to_vec());
+        }
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // IME は毎回未確定文字列の全文を渡してくるので丸ごと差し替える。
+        // 空文字は変換キャンセル（esc）を意味する
+        if new_text.is_empty() {
+            self.ime = None;
+        } else {
+            let pane = self
+                .ime
+                .take()
+                .map(|ime| ime.pane)
+                .unwrap_or_else(|| self.focused_pane());
+            self.ime = Some(ImeComposition {
+                pane,
+                text: new_text.to_string(),
+                selected_utf16: new_selected_range,
+            });
+        }
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _element_bounds: Bounds<Pixels>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        // 変換候補ウィンドウの位置出し。カーソルセル + 範囲先頭までの描画幅
+        let origin = self.pane_cursor_origin(self.ime_target())?;
+        let cell = self.cell_size?;
+        let x_offset = match self.ime.as_ref() {
+            Some(ime) => {
+                let end = utf16_to_byte_offset(&ime.text, range_utf16.start);
+                self.ime_prefix_width(&ime.text[..end], window)
+            }
+            None => px(0.0),
+        };
+        Some(Bounds::new(
+            point(origin.x + x_offset, origin.y),
+            size(cell.width, cell.height),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
 /// 文字数ベースの単純な切り詰め（タブ表示名用）
 fn truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
@@ -923,6 +1059,88 @@ impl Render for TakoApp {
             .collect();
         let _ = cell;
 
+        // IME 変換中テキストのインライン表示（FR-1.9）。変換対象ペインのカーソル位置に
+        // 未確定文字列を重ね、全体に細下線・IME の注目文節に太下線 + 選択色を付ける
+        let ime_overlay = self.ime.as_ref().and_then(|ime| {
+            let anchor = self.pane_cursor_origin(ime.pane)?;
+            let text = ime.text.clone();
+            // ハイライト範囲は重複禁止（StyledText の要求）のため、注目文節の前・文節・後の
+            // 3 区間に分割して組む。文節範囲（UTF-16）はバイト範囲へ変換する
+            let thin = HighlightStyle {
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.0),
+                    color: None,
+                    wavy: false,
+                }),
+                ..HighlightStyle::default()
+            };
+            let thick = HighlightStyle {
+                background_color: Some(hsla(theme.selection_background)),
+                underline: Some(UnderlineStyle {
+                    thickness: px(2.0),
+                    color: Some(hsla(theme.accent)),
+                    wavy: false,
+                }),
+                ..HighlightStyle::default()
+            };
+            let clause = ime
+                .selected_utf16
+                .as_ref()
+                .map(|sel| {
+                    utf16_to_byte_offset(&text, sel.start)..utf16_to_byte_offset(&text, sel.end)
+                })
+                .filter(|r| !r.is_empty())
+                .unwrap_or(0..0);
+            let mut highlights = Vec::new();
+            if clause.start > 0 {
+                highlights.push((0..clause.start, thin));
+            }
+            if !clause.is_empty() {
+                highlights.push((clause.clone(), thick));
+            }
+            if clause.end < text.len() {
+                highlights.push((clause.end..text.len(), thin));
+            }
+            Some(
+                div()
+                    .absolute()
+                    .left(anchor.x - content_origin.x)
+                    .top(anchor.y - content_origin.y)
+                    .h(px(theme.line_height))
+                    .bg(rgba(theme.background))
+                    .child(
+                        StyledText::new(text)
+                            .with_default_highlights(&self.text_style(), highlights),
+                    ),
+            )
+        });
+
+        // IME（確定・未確定入力）の受け口を OS へ登録する。`Window::handle_input` は
+        // paint フェーズ限定 API のため、何も描かない canvas の paint フックから呼ぶ
+        let ime_registration = {
+            let entity = cx.entity();
+            let focus = self.focus_handle.clone();
+            let target = self.ime_target();
+            let target_bounds = self
+                .pane_text_areas
+                .iter()
+                .find(|(id, _)| *id == target)
+                .map(|(_, b)| *b)
+                .unwrap_or_else(|| Bounds::new(content_origin, content_size));
+            canvas(
+                |_, _, _| (),
+                move |_, _, window, cx| {
+                    window.handle_input(
+                        &focus,
+                        ElementInputHandler::new(target_bounds, entity),
+                        cx,
+                    );
+                },
+            )
+            .absolute()
+            .size_full()
+        };
+
         div()
             .flex()
             .flex_col()
@@ -999,7 +1217,14 @@ impl Render for TakoApp {
                 }),
             )
             .child(self.render_tab_bar(cx))
-            .child(div().flex_1().relative().children(panes))
+            .child(
+                div()
+                    .flex_1()
+                    .relative()
+                    .children(panes)
+                    .children(ime_overlay),
+            )
+            .child(ime_registration)
     }
 }
 
@@ -1031,7 +1256,7 @@ fn main() {
 /// セルフテスト: キーディスパッチ経由で入力・分割・フォーカス・リサイズ・タブ・色・
 /// スクロールバック・コピペの経路（1〜13）と、制御プレーンの環境変数注入 +
 /// ペイン内シェルから実 `tako` CLI を叩く e2e（14〜29）、内蔵 MCP サーバー
-/// （Streamable HTTP + stdio ブリッジ、30〜36）を機械検証して終了する。
+/// （Streamable HTTP + stdio ブリッジ、30〜36）、IME 変換状態（37〜39）を機械検証して終了する。
 /// `WindowHandle<V>::update` 内の dispatch_keystroke はルートビューの二重借用で
 /// パニックするため AnyWindowHandle::update を使う（poc/README.md）
 mod self_test {
@@ -1856,6 +2081,66 @@ mod self_test {
             check(
                 lines.len() == 2 && lines[1].contains(r#""tools":[]"#),
                 "ブリッジは tako 外で 0 ツール",
+            );
+
+            // --- Phase 3.5: IME 変換状態（FR-1.9）---
+            // NSTextInputClient 経由の実イベントは合成できないため、EntityInputHandler の
+            // 実装メソッドを直接呼んで状態遷移と PTY への流れを機械検証する。
+            // 変換中テキストの見た目は手動チェック（.agent/manual-checks.md）
+
+            // 37. 未確定文字列（marked text）は状態として保持され、PTY へは流れない
+            press(any, cx, "ctrl-u");
+            let marked_ok = window
+                .update(cx, |app, window, cx| {
+                    app.replace_and_mark_text_in_range(None, "にほんご", Some(0..4), window, cx);
+                    let bounds = app.bounds_for_range(
+                        0..4,
+                        Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))),
+                        window,
+                        cx,
+                    );
+                    // "にほんご" は UTF-16 で 4 コード単位
+                    app.marked_text_range(window, cx) == Some(0..4)
+                        && app.ime.as_ref().map(|i| i.text.as_str()) == Some("にほんご")
+                        && bounds.is_some()
+                })
+                .unwrap_or(false);
+            check(marked_ok, "IME marked text の保持と位置出し");
+            wait(cx, 600).await;
+            check(
+                !focused_contains(window, cx, "にほんご"),
+                "IME 変換中は PTY へ流れない",
+            );
+
+            // 38. 確定（insertText 相当）で PTY へ書かれ、変換状態が畳まれる
+            let committed = window
+                .update(cx, |app, window, cx| {
+                    app.replace_text_in_range(None, "echo IME-$((40+2))-にほんご", window, cx);
+                    app.ime.is_none()
+                })
+                .unwrap_or(false);
+            check(committed, "IME 確定で変換状態クリア");
+            press(any, cx, "enter");
+            wait(cx, 1000).await;
+            check(
+                focused_contains(window, cx, "IME-42-にほんご"),
+                "IME 確定文字列が PTY へ",
+            );
+
+            // 39. unmarkText は「未確定文字列をそのまま挿入」（NSTextInputClient の規約）
+            press(any, cx, "ctrl-u");
+            let unmarked = window
+                .update(cx, |app, window, cx| {
+                    app.replace_and_mark_text_in_range(None, "かくてい", None, window, cx);
+                    app.unmark_text(window, cx);
+                    app.ime.is_none()
+                })
+                .unwrap_or(false);
+            check(unmarked, "unmark で変換状態クリア");
+            wait(cx, 800).await;
+            check(
+                focused_contains(window, cx, "かくてい"),
+                "unmark はそのまま挿入",
             );
 
             println!("TAKO_APP_SELF_TEST_OK");
