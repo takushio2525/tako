@@ -9,7 +9,8 @@ publish = false
 [dependencies]
 # 破壊的変更が頻発するため rev 固定（2026-06-10 時点の main）。追従は意識的タスクとして行う
 gpui = { git = "https://github.com/zed-industries/zed", rev = "cafbf4b5df7fedb67fc0f248850a5654efcec5d9" }
-# zed main では Application 生成がプラットフォーム実装ごと gpui_platform に分離された
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cafbf4b5df7fedb67fc0f248850a5654efcec5d9" }
+# zed main では Application 生成がプラットフォーム実装ごと gpui_platform に分離された。
+# font-kit feature を有効にしないとテキストシステムがスタブになり文字が一切描画されない（ハマりどころ）
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cafbf4b5df7fedb67fc0f248850a5654efcec5d9", features = ["font-kit"] }
 
 [workspace]

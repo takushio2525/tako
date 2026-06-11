@@ -1,0 +1,16 @@
+[package]
+name = "term-poc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Phase 0 検証スパイク (b): alacritty_terminal + PTY + GPUI の最小ターミナル
+# gpui は本実装で採用予定の「zed git rev 固定」版を使う（poc/02 と同 rev）
+[dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "cafbf4b5df7fedb67fc0f248850a5654efcec5d9" }
+# font-kit feature 必須: 無いと macOS のテキストシステムがスタブになり文字が描画されない
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cafbf4b5df7fedb67fc0f248850a5654efcec5d9", features = ["font-kit"] }
+alacritty_terminal = "0.26.0"
+futures = "0.3"
+
+[workspace]
