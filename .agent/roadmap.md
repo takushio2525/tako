@@ -84,6 +84,18 @@ tmux 系オーケストレーターの実地差し替えは Phase 3 以降の常
 → 機械検証（セルフテスト 36 項目 + verify-claude-mcp.sh）で経路は実証済み。
 GUI 内での常用体験は初回登録（`claude mcp add --scope user`）後に日常使いで確認する。
 
+## Phase 3.5: 日常使い品質（Phase 4 と並行可能な独立タスク）
+
+> Phase 3 完了を機にユーザーが tako を日常ターミナルとして使い始める。
+> そのためのブロッカー除去タスク群で、Phase 4 の機能開発と並行して進めてよい。
+
+- [ ] IME 変換中表示（FR-1.9 = Must。未確定文字列・変換候補のインライン表示。
+      日本語ユーザーの日常使いブロッカー）
+- [ ] .app バンドル化: icns 生成（アイコンは `assets/icon/icon-a.svg` に決定済み）・
+      Info.plist・/Applications へ配置可能なビルド手順
+
+**Exit Criteria**: Dock から起動した tako で、日本語入力を含む日常作業を常用できる。
+
 ## Phase 4: Layer 3 — パッシブ検知
 
 - [ ] OSC 7 / 133 シェル統合（zsh / bash / fish 同梱、FR-2.4.1）
