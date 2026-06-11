@@ -62,9 +62,35 @@ enum Command {
     /// タブ操作（new / select / move-pane）
     #[command(subcommand)]
     Tab(TabCommand),
+    /// tmux セッションの一覧・kill（FR-2.13。消し忘れ tmux の発見と片付け）
+    #[command(subcommand)]
+    Tmux(TmuxCommand),
     /// MCP 連携（serve = stdio ブリッジ。エージェントの MCP クライアントが起動する）
     #[command(subcommand)]
     Mcp(McpCommand),
+}
+
+#[derive(Subcommand)]
+enum TmuxCommand {
+    /// 全 tmux セッションを JSON で一覧する（tako ペインとの対応付け込み）
+    List {
+        /// tmux サーバー名（`tmux -L` 相当。省略時は既定サーバー）
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// セッション（--window 指定時はその window）を kill する。確認なしで即実行されるため
+    /// 対象は `tako tmux list` で確認してから指定すること
+    Kill {
+        /// 対象セッション名
+        #[arg(long)]
+        session: String,
+        /// window index（指定時は kill-window、省略時は kill-session）
+        #[arg(long)]
+        window: Option<u32>,
+        /// tmux サーバー名（`tmux -L` 相当）
+        #[arg(long)]
+        socket: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -413,6 +439,18 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane: target_pane(*pane)?,
             tab: *tab,
         },
+        Command::Tmux(TmuxCommand::List { socket }) => Request::TmuxList {
+            socket: socket.clone(),
+        },
+        Command::Tmux(TmuxCommand::Kill {
+            session,
+            window,
+            socket,
+        }) => Request::TmuxKill {
+            socket: socket.clone(),
+            session: session.clone(),
+            window: *window,
+        },
         // main() で mcp_serve() へ分岐済みのため論理的に到達不能
         Command::Mcp(_) => unreachable!("mcp serve は run() を通らない"),
     })
@@ -479,6 +517,13 @@ fn print_result(command: &Command, result: &Value) {
             );
         }
         Command::Tab(TabCommand::New { .. }) => println!("{result}"),
+        Command::Tmux(TmuxCommand::List { .. }) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(result).unwrap_or_default()
+            );
+        }
+        Command::Tmux(TmuxCommand::Kill { .. }) => println!("{result}"),
         _ => {}
     }
 }

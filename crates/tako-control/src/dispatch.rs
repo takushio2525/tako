@@ -241,6 +241,67 @@ pub fn dispatch(
             Ok(Value::Null)
         }
 
+        Request::TmuxList { socket } => {
+            let sessions = tako_core::tmux::list_sessions(socket.as_deref());
+            // tako ペインとの対応付け: attach クライアントの tty とペインの PTY スレーブ名を
+            // 突き合わせる（FR-2.13.2。一致しないクライアントは tako 外 = 外部ターミナル由来）
+            let ws = host.workspace();
+            let pane_of_tty: Vec<(String, u64, u64)> = ws
+                .tabs()
+                .iter()
+                .flat_map(|tab| {
+                    tab.tree().panes().into_iter().filter_map(|p| {
+                        let tty = host.session(p.id())?.tty_name()?;
+                        Some((tty.to_string(), p.id().as_u64(), tab.id().as_u64()))
+                    })
+                })
+                .collect();
+            let sessions: Vec<Value> = sessions
+                .iter()
+                .map(|s| {
+                    let clients: Vec<Value> = s
+                        .client_ttys
+                        .iter()
+                        .map(|tty| {
+                            let hit = pane_of_tty.iter().find(|(t, _, _)| t == tty);
+                            json!({
+                                "tty": tty,
+                                // tako のどのペインで表示中か（null = tako 外のターミナル）
+                                "pane": hit.map(|(_, pane, _)| *pane),
+                                "tab": hit.map(|(_, _, tab)| *tab),
+                            })
+                        })
+                        .collect();
+                    json!({
+                        "name": s.name,
+                        "created": s.created,
+                        "attached": s.attached,
+                        "windows": s.windows.iter().map(|w| json!({
+                            "index": w.index,
+                            "name": w.name,
+                            "active": w.active,
+                            "panes": w.panes,
+                        })).collect::<Vec<_>>(),
+                        "clients": clients,
+                    })
+                })
+                .collect();
+            Ok(json!({ "sessions": sessions }))
+        }
+
+        Request::TmuxKill {
+            socket,
+            session,
+            window,
+        } => {
+            match window {
+                Some(index) => tako_core::tmux::kill_window(socket.as_deref(), &session, index),
+                None => tako_core::tmux::kill_session(socket.as_deref(), &session),
+            }
+            .map_err(DispatchError::Operation)?;
+            Ok(json!({ "killed": session, "window": window }))
+        }
+
         Request::TabNew { title } => {
             let pane = Pane::new(origin);
             let pane_id = pane.id();

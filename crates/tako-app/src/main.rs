@@ -2590,7 +2590,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 13, "MCP tools/list は 13 ツール");
+            check(status == 200 && tool_count == 15, "MCP tools/list は 15 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -3143,6 +3143,62 @@ mod self_test {
                 })
                 .unwrap_or(false);
             check(close_button_ok, "ペインの × ボタンで閉じる（dispatch 経由）");
+
+            // 48. tmux 一覧と kill（FR-2.13）。専用 -L ソケットで隔離し、ユーザーの
+            //     実 tmux サーバーには一切触れない。tmux 不在環境ではスキップする
+            let has_tmux = std::process::Command::new("tmux")
+                .arg("-V")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if has_tmux {
+                let sock = format!("tako-selftest-{}", std::process::id());
+                let created = std::process::Command::new("tmux")
+                    .args(["-L", &sock, "new-session", "-d", "-s", "tako-test"])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                check(created, "テスト用 tmux セッション作成");
+                wait(cx, 500).await;
+                press(any, cx, "ctrl-u");
+                type_text(
+                    any,
+                    cx,
+                    &format!(
+                        "{cli} tmux list --socket {sock} | grep -q tako-test \
+                         && echo TAKO-TMUX-$((40+8))"
+                    ),
+                    true,
+                );
+                wait(cx, 1500).await;
+                check(focused_contains(window, cx, "TAKO-TMUX-48"), "tako tmux list");
+                type_text(
+                    any,
+                    cx,
+                    &format!("{cli} tmux kill --session tako-test --socket {sock}"),
+                    true,
+                );
+                wait(cx, 1200).await;
+                let gone = window
+                    .update(cx, |app, _, _| {
+                        let value = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TmuxList {
+                                socket: Some(sock.clone()),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .expect("tmux list は常に成功する");
+                        value["sessions"].as_array().map(Vec::is_empty) == Some(true)
+                    })
+                    .unwrap_or(false);
+                check(gone, "tako tmux kill でセッションが消える");
+                let _ = std::process::Command::new("tmux")
+                    .args(["-L", &sock, "kill-server"])
+                    .status();
+            } else {
+                eprintln!("（tmux 不在のため項目 48 をスキップ）");
+            }
 
             println!("TAKO_APP_SELF_TEST_OK");
             std::process::exit(0);

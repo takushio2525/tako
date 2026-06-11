@@ -221,6 +221,36 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_tmux_list",
+            "description": "実行中の全 tmux セッションを一覧する（FR-2.13）。各セッションの\
+                window 一覧・作成日時・attach 状態に加え、attach クライアントが tako の\
+                どのタブ・ペインに表示されているか（pane / tab が null なら tako 外の\
+                ターミナル由来）を返す。消し忘れて裏で動き続ける tmux の発見に使う。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "socket": { "type": "string", "description": "tmux サーバー名（tmux -L 相当。省略時は既定サーバー）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_tmux_kill",
+            "description": "tmux セッション（window 指定時はその window）を kill する。\
+                **破壊的操作**: 中で動いているプロセスごと終了する。必ず tako_tmux_list で\
+                対象を確認し、ユーザーの同意を得てから実行すること（誤爆防止。FR-2.13.3）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": { "type": "string", "description": "対象セッション名（必須）" },
+                    "window": { "type": "integer", "minimum": 0, "description": "window index（指定時は kill-window、省略時は kill-session）" },
+                    "socket": { "type": "string", "description": "tmux サーバー名（tmux -L 相当）" },
+                },
+                "required": ["session"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_focus_pane",
             "description": "ペインへフォーカスを移す。pane（ID 指定。別タブならタブも切り替わる）か\
                 direction（アクティブタブ内の隣接移動）のどちらか一方を指定する。\
@@ -386,6 +416,14 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
         "tako_read_pane" => Request::Read {
             pane: Some(required_u64(args, "pane")?),
             lines: u64_arg(args, "lines")?.map(|n| n as usize),
+        },
+        "tako_tmux_list" => Request::TmuxList {
+            socket: str_arg(args, "socket")?,
+        },
+        "tako_tmux_kill" => Request::TmuxKill {
+            socket: str_arg(args, "socket")?,
+            session: str_arg(args, "session")?.ok_or("session を指定する")?,
+            window: u64_arg(args, "window")?.map(|n| n as u32),
         },
         "tako_scroll_pane" => Request::Scroll {
             pane: Some(target_pane(args, caller)?),
@@ -755,7 +793,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 15);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

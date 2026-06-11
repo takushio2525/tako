@@ -12,6 +12,7 @@ pub mod shell_integration;
 pub mod tab;
 pub mod terminal;
 pub mod theme;
+pub mod tmux;
 pub mod workspace;
 
 pub use osc_tap::{OscEvent, PromptMark};
@@ -27,4 +28,5 @@ pub use terminal::{
     SpawnOptions, TermEvent, TerminalSession,
 };
 pub use theme::{Rgb, Theme};
+pub use tmux::{TmuxSession, TmuxWindow};
 pub use workspace::{Workspace, WorkspaceError};

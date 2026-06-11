@@ -129,6 +129,16 @@ pub enum Request {
         title: Option<String>,
         role: Option<String>,
     },
+    /// tmux セッション一覧 + tako ペインとの対応付け（FR-2.13）。
+    /// `socket` は `tmux -L` のサーバー名（通常は None = 既定サーバー）
+    TmuxList { socket: Option<String> },
+    /// tmux の kill（FR-2.13.3）。`window` 指定で kill-window、なければ kill-session。
+    /// 誤爆防止の確認は呼び出し側（UI / AI）の責務
+    TmuxKill {
+        socket: Option<String>,
+        session: String,
+        window: Option<u32>,
+    },
     /// タブ作成（FR-2.5.10）
     TabNew { title: Option<String> },
     /// タブ切替（FR-2.5.10）

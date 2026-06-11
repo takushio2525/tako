@@ -179,6 +179,8 @@ pub struct TerminalSession {
     cwd: Option<PathBuf>,
     /// OSC 133 から導出したコマンド実行状態
     command_state: CommandState,
+    /// PTY スレーブの tty 名（tmux クライアントとの対応付け。FR-2.13.2）
+    tty_name: Option<String>,
 }
 
 impl TerminalSession {
@@ -234,7 +236,9 @@ impl TerminalSession {
             env,
             ..tty::Options::default()
         };
-        let pty = tty::new(&tty_options, window_size, 0).map_err(SessionError::Pty)?;
+        let mut pty = tty::new(&tty_options, window_size, 0).map_err(SessionError::Pty)?;
+        // PTY スレーブの tty 名（/dev/ttysNNN）。tmux クライアントとの対応付けに使う（FR-2.13.2）
+        let tty_name = slave_tty_name(&mut pty);
         // PTY 読み取りを OSC 7 / 133 タップで観測する（バイト列は変更しない。`osc_tap`）
         let pty = TapPty::new(
             pty,
@@ -257,9 +261,15 @@ impl TerminalSession {
                 title: None,
                 cwd: None,
                 command_state: CommandState::default(),
+                tty_name,
             },
             rx,
         ))
+    }
+
+    /// PTY スレーブの tty 名（取得できない環境では None）
+    pub fn tty_name(&self) -> Option<&str> {
+        self.tty_name.as_deref()
     }
 
     /// 現在のグリッドサイズ（cols, rows）
@@ -554,6 +564,31 @@ fn next_command_state(current: CommandState, mark: PromptMark) -> CommandState {
         PromptMark::CommandFinished(Some(code)) if code != 0 => CommandState::Failed(code),
         PromptMark::CommandFinished(_) => CommandState::Idle,
     }
+}
+
+/// PTY master fd からスレーブの tty 名を得る（macOS: TIOCPTYGNAME）。
+/// 失敗・未対応プラットフォームでは None（対応付け機能が劣化するだけで害は無い）
+#[cfg(target_os = "macos")]
+fn slave_tty_name(pty: &mut tty::Pty) -> Option<String> {
+    use std::os::fd::AsRawFd;
+
+    use alacritty_terminal::tty::EventedReadWrite;
+
+    let fd = pty.reader().as_raw_fd();
+    // TIOCPTYGNAME は 128 バイトのバッファを要求する
+    let mut buf = [0u8; 128];
+    let result = unsafe { libc::ioctl(fd, libc::TIOCPTYGNAME as _, buf.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    let len = buf.iter().position(|&b| b == 0)?;
+    std::str::from_utf8(&buf[..len]).ok().map(str::to_string)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn slave_tty_name(_pty: &mut tty::Pty) -> Option<String> {
+    // Linux は ptsname_r、Windows は ConPTY で別概念。必要になったフェーズで対応する
+    None
 }
 
 fn side(right: bool) -> Side {

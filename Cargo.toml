@@ -25,6 +25,8 @@ tako-control = { path = "crates/tako-control" }
 alacritty_terminal = "0.26"
 # PTY タップ（EventedReadWrite 委譲ラッパ）のトレイトシグネチャに必要。alacritty 経由で既にツリー内
 polling = "3"
+# PTY スレーブ名の取得（TIOCPTYGNAME。tmux 対応付け FR-2.13）。alacritty 経由で既にツリー内
+libc = "0.2"
 futures = "0.3"
 thiserror = "2"
 tracing = "0.1"
