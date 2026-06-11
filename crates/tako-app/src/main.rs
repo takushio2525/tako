@@ -1406,29 +1406,33 @@ mod self_test {
                 .unwrap_or(false);
             check(closed, "tako close");
 
-            // 29. 不正トークンの接続拒否（FR-2.3.4。直接ソケットへ書き込んで確認）
-            let endpoint = window
-                .update(cx, |app, _, _| {
-                    app.ipc.as_ref().map(|ipc| ipc.endpoint().to_string())
-                })
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| fail("IPC エンドポイント取得"));
-            let auth_rejected = (|| -> Option<bool> {
-                use std::io::{BufRead, BufReader, Write};
-                let stream = std::os::unix::net::UnixStream::connect(&endpoint).ok()?;
-                let mut writer = stream.try_clone().ok()?;
-                writeln!(
-                    writer,
-                    r#"{{"jsonrpc":"2.0","id":1,"token":"bogus","method":"list"}}"#
-                )
-                .ok()?;
-                let mut line = String::new();
-                BufReader::new(stream).read_line(&mut line).ok()?;
-                Some(line.contains("-32001"))
-            })()
-            .unwrap_or(false);
-            check(auth_rejected, "不正トークンの拒否");
+            // 29. 不正トークンの接続拒否（FR-2.3.4。直接ソケットへ書き込んで確認）。
+            // UnixStream を使うため unix 限定（Windows の IPC は Phase 6 で実装）
+            #[cfg(unix)]
+            {
+                let endpoint = window
+                    .update(cx, |app, _, _| {
+                        app.ipc.as_ref().map(|ipc| ipc.endpoint().to_string())
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| fail("IPC エンドポイント取得"));
+                let auth_rejected = (|| -> Option<bool> {
+                    use std::io::{BufRead, BufReader, Write};
+                    let stream = std::os::unix::net::UnixStream::connect(&endpoint).ok()?;
+                    let mut writer = stream.try_clone().ok()?;
+                    writeln!(
+                        writer,
+                        r#"{{"jsonrpc":"2.0","id":1,"token":"bogus","method":"list"}}"#
+                    )
+                    .ok()?;
+                    let mut line = String::new();
+                    BufReader::new(stream).read_line(&mut line).ok()?;
+                    Some(line.contains("-32001"))
+                })()
+                .unwrap_or(false);
+                check(auth_rejected, "不正トークンの拒否");
+            }
 
             println!("TAKO_APP_SELF_TEST_OK");
             std::process::exit(0);
