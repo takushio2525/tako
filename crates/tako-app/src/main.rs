@@ -1453,6 +1453,45 @@ mod self_test {
             wait(cx, 1000).await;
             check(focused_contains(window, cx, "TAKO-INPUT-OK"), "入力エコー");
 
+            // 1b. TERM / COLORTERM 注入（tmux 等の「missing or unsuitable terminal」回避）
+            type_text(any, cx, "echo TERMCHK=$TERM,$COLORTERM", true);
+            wait(cx, 800).await;
+            check(
+                focused_contains(window, cx, "TERMCHK=xterm-256color,truecolor"),
+                "TERM / COLORTERM 注入",
+            );
+
+            // 1c. 初期 cwd はホーム（.app 起動時に `/` へ落ちない）
+            type_text(any, cx, "[ \"$PWD\" = \"$HOME\" ] && echo CWDCHK-$((40+2))", true);
+            wait(cx, 800).await;
+            check(focused_contains(window, cx, "CWDCHK-42"), "初期 cwd はホーム");
+
+            // 1d. tako 内で tmux がエラーなく起動できる（TERM 修正の実地確認。
+            //     専用ソケット -L で実環境の tmux サーバーに触れない。未インストール時は素通し）
+            type_text(
+                any,
+                cx,
+                "if command -v tmux >/dev/null; then tmux -L takoST kill-server 2>/dev/null; \
+                 tmux -L takoST new-session -d 'sleep 5' && tmux -L takoST kill-server 2>/dev/null \
+                 && echo TMUX-OK-42; else echo TMUX-OK-42; fi",
+                true,
+            );
+            wait(cx, 1500).await;
+            check(
+                focused_contains(window, cx, "TMUX-OK-42"),
+                "tako 内で tmux がエラーなく起動",
+            );
+
+            // 1e. Backspace が \x7f を送り行編集で文字が消える（特殊キー→PTY バイト変換の往復確認）。
+            //     "echo BSPxx" から 2 文字消して "OK" を足し "echo BSPOK" になる。
+            //     もし空白等が送られると行が一致せず出力が変わる
+            type_text(any, cx, "echo BSPxx", false);
+            press(any, cx, "backspace");
+            press(any, cx, "backspace");
+            type_text(any, cx, "OK", true);
+            wait(cx, 900).await;
+            check(focused_contains(window, cx, "BSPOK"), "Backspace で行編集できる");
+
             let pane1 = window
                 .update(cx, |app, _, _| app.focused_pane())
                 .unwrap_or_else(|_| fail("初期ペイン取得"));
@@ -2147,5 +2186,81 @@ mod self_test {
             std::process::exit(0);
         })
         .detach();
+    }
+}
+
+/// 特殊キー → PTY 送出バイト列の総点検（バイトレベル検証）。
+/// 実 IME / GUI を起動できない CI でもキーエンコードの退行を捕まえる
+#[cfg(test)]
+mod keystroke_tests {
+    use super::*;
+
+    fn ks(key: &str) -> Keystroke {
+        Keystroke {
+            modifiers: Modifiers::default(),
+            key: key.into(),
+            key_char: None,
+        }
+    }
+    fn ks_char(key: &str, ch: &str) -> Keystroke {
+        Keystroke {
+            modifiers: Modifiers::default(),
+            key: key.into(),
+            key_char: Some(ch.into()),
+        }
+    }
+    fn ks_ctrl(key: &str) -> Keystroke {
+        Keystroke {
+            modifiers: Modifiers {
+                control: true,
+                ..Modifiers::default()
+            },
+            key: key.into(),
+            key_char: None,
+        }
+    }
+
+    #[test]
+    fn 特殊キーは正しいバイト列を送る() {
+        // Backspace は DEL(0x7f)。BS(0x08) ではない（macOS の stty erase 既定が ^?）
+        assert_eq!(keystroke_to_bytes(&ks("backspace")), Some(b"\x7f".to_vec()));
+        assert_eq!(keystroke_to_bytes(&ks("enter")), Some(b"\r".to_vec()));
+        assert_eq!(keystroke_to_bytes(&ks("tab")), Some(b"\t".to_vec()));
+        assert_eq!(keystroke_to_bytes(&ks("escape")), Some(b"\x1b".to_vec()));
+        assert_eq!(keystroke_to_bytes(&ks("up")), Some(b"\x1b[A".to_vec()));
+        assert_eq!(keystroke_to_bytes(&ks("down")), Some(b"\x1b[B".to_vec()));
+        assert_eq!(keystroke_to_bytes(&ks("right")), Some(b"\x1b[C".to_vec()));
+        assert_eq!(keystroke_to_bytes(&ks("left")), Some(b"\x1b[D".to_vec()));
+        assert_eq!(keystroke_to_bytes(&ks("home")), Some(b"\x1b[H".to_vec()));
+        assert_eq!(keystroke_to_bytes(&ks("end")), Some(b"\x1b[F".to_vec()));
+        assert_eq!(keystroke_to_bytes(&ks("pageup")), Some(b"\x1b[5~".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("pagedown")),
+            Some(b"\x1b[6~".to_vec())
+        );
+        assert_eq!(keystroke_to_bytes(&ks("delete")), Some(b"\x1b[3~".to_vec()));
+    }
+
+    #[test]
+    fn ctrl英字はc0制御コードを送る() {
+        assert_eq!(keystroke_to_bytes(&ks_ctrl("a")), Some(vec![0x01]));
+        assert_eq!(keystroke_to_bytes(&ks_ctrl("c")), Some(vec![0x03]));
+        assert_eq!(keystroke_to_bytes(&ks_ctrl("u")), Some(vec![0x15]));
+        assert_eq!(keystroke_to_bytes(&ks_ctrl("z")), Some(vec![0x1a]));
+    }
+
+    #[test]
+    fn 印字可能文字はkey_charをそのまま送る() {
+        assert_eq!(keystroke_to_bytes(&ks_char("a", "a")), Some(b"a".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks_char("space", " ")),
+            Some(b" ".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks_char("a", "あ")),
+            Some("あ".as_bytes().to_vec())
+        );
+        // key_char の無い未知キーは送出しない
+        assert_eq!(keystroke_to_bytes(&ks("f5")), None);
     }
 }
