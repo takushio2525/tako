@@ -1,0 +1,737 @@
+//! dispatch — プロトコルリクエストを tako-core ドメイン API へ写す一元ディスパッチャ
+//!
+//! 設計原則 5「AI フルコントロール」の実装基盤: UI（tako-app）の IPC 受け口と
+//! 将来の MCP サーバー（Phase 3）が**同じ dispatch** を呼ぶことで、操作セマンティクスを
+//! 一箇所に保つ。各操作は `PaneTree` / `Workspace` の API と 1:1 対応（FR-2.5）。
+//!
+//! GPUI に依存する処理（セッション起動時のイベント中継、再描画通知）は
+//! [`ControlHost`] trait の向こう側（UI 層）に置く。
+
+use serde_json::{json, Value};
+use tako_core::{
+    Pane, PaneId, PaneNode, PaneOrigin, PaneTreeError, Rect, SpawnCommand, SpawnOptions, SplitAxis,
+    TabId, TerminalSession, Workspace,
+};
+
+use crate::protocol::{error_code, Direction, Request};
+
+/// dispatch がドメイン状態へ触るためのホスト。UI 層（tako-app）とテストが実装する
+pub trait ControlHost {
+    fn workspace(&self) -> &Workspace;
+    fn workspace_mut(&mut self) -> &mut Workspace;
+    /// ペインのターミナルセッション（send / read / list の画面情報に使う）
+    fn session(&self, pane: PaneId) -> Option<&TerminalSession>;
+    /// ツリーへ挿入済みの新ペインに対しセッションを起動しイベント中継を張る。
+    /// `TAKO_PANE_ID` 等の環境変数合成は実装側の責務（FR-2.1.1）
+    fn attach_session(&mut self, pane: PaneId, options: SpawnOptions);
+    /// 閉じられたペインのセッションを破棄する
+    fn detach_session(&mut self, pane: PaneId);
+}
+
+#[derive(Debug, PartialEq, thiserror::Error)]
+pub enum DispatchError {
+    #[error("ペイン {0} が見つからない")]
+    PaneNotFound(u64),
+    #[error("タブ {0} が見つからない")]
+    TabNotFound(u64),
+    #[error("対象ペインが未指定（--pane 指定か TAKO_PANE_ID が必要）")]
+    NoTargetPane,
+    #[error("ペイン {0} にはターミナルセッションがない")]
+    NoSession(u64),
+    #[error("無効なパラメータ: {0}")]
+    InvalidParams(String),
+    #[error("{0}")]
+    Operation(String),
+}
+
+impl DispatchError {
+    /// JSON-RPC エラーコードへの対応付け
+    pub fn code(&self) -> i64 {
+        match self {
+            DispatchError::InvalidParams(_) => error_code::INVALID_PARAMS,
+            _ => error_code::OPERATION,
+        }
+    }
+}
+
+/// リクエストを実行し、成功時の `result` 値を返す。
+/// `origin` は新規生成ペインの生成主体（Layer 1 CLI なら `Cli`、Phase 3 の MCP なら `Mcp`）
+pub fn dispatch(
+    host: &mut dyn ControlHost,
+    request: Request,
+    origin: PaneOrigin,
+) -> Result<Value, DispatchError> {
+    match request {
+        Request::Split {
+            pane,
+            direction,
+            ratio,
+            command,
+            cwd,
+        } => {
+            let (tab, target) = resolve_pane(host.workspace(), pane)?;
+            let new_pane = Pane::new(origin);
+            let new_id = new_pane.id();
+            // 呼び出し元（target）と同じタブに生える（FR-2.1.2）
+            tree_mut(host.workspace_mut(), tab)
+                .split_with_ratio(
+                    target,
+                    direction.unwrap_or(Direction::Right).to_core(),
+                    ratio.unwrap_or(0.5),
+                    new_pane,
+                )
+                .map_err(op_err)?;
+            let options = SpawnOptions {
+                command: command.filter(|c| !c.is_empty()).map(|mut c| SpawnCommand {
+                    program: c.remove(0),
+                    args: c,
+                }),
+                cwd: cwd.map(Into::into),
+                env: Vec::new(),
+            };
+            host.attach_session(new_id, options);
+            Ok(json!({ "pane": new_id.as_u64() }))
+        }
+
+        Request::Close { pane } => {
+            let (tab, target) = resolve_pane(host.workspace(), pane)?;
+            let closed = tree_mut(host.workspace_mut(), tab).close(target);
+            match closed {
+                Ok(_) => {}
+                Err(PaneTreeError::LastPane) => {
+                    // タブ最後の 1 ペイン → タブごと閉じる。最後のタブなら拒否する
+                    // （アプリ終了に等しい操作は AI / CLI からは行わせない。UI の cmd+W のみ）
+                    host.workspace_mut().close_tab(tab).map_err(op_err)?;
+                }
+                Err(e) => return Err(op_err(e)),
+            }
+            host.detach_session(target);
+            Ok(json!({ "closed": target.as_u64() }))
+        }
+
+        Request::Focus { pane, direction } => {
+            if let Some(direction) = direction {
+                // 方向指定はアクティブタブ内の隣接移動（FR-2.5.5）
+                let moved = host
+                    .workspace_mut()
+                    .active_tab_mut()
+                    .tree_mut()
+                    .focus_direction(direction.to_core());
+                Ok(json!({ "focused": moved.map(|id| id.as_u64()) }))
+            } else {
+                let (tab, target) = resolve_pane(host.workspace(), pane)?;
+                let ws = host.workspace_mut();
+                tree_mut(ws, tab).focus(target).map_err(op_err)?;
+                // 別タブのペインへのフォーカスはタブ切替も伴う
+                ws.activate_tab(tab).map_err(op_err)?;
+                Ok(json!({ "focused": target.as_u64() }))
+            }
+        }
+
+        Request::Resize {
+            pane,
+            axis,
+            delta,
+            share,
+        } => {
+            let (tab, target) = resolve_pane(host.workspace(), pane)?;
+            let tree = tree_mut(host.workspace_mut(), tab);
+            let new_share = match (delta, share) {
+                (Some(d), None) => tree.resize_by(target, axis.to_core(), d).map_err(op_err)?,
+                (None, Some(s)) => tree.set_share(target, axis.to_core(), s).map_err(op_err)?,
+                _ => {
+                    return Err(DispatchError::InvalidParams(
+                        "delta か share のどちらか一方を指定する".into(),
+                    ))
+                }
+            };
+            Ok(json!({ "share": new_share }))
+        }
+
+        Request::Equalize { pane, tab } => {
+            let tab_id = match tab {
+                Some(raw) => find_tab(host.workspace(), raw)?,
+                None => resolve_pane(host.workspace(), pane)?.0,
+            };
+            tree_mut(host.workspace_mut(), tab_id).equalize();
+            Ok(Value::Null)
+        }
+
+        Request::List => Ok(list_json(host)),
+
+        Request::Send {
+            pane,
+            text,
+            newline,
+        } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let session = host
+                .session(target)
+                .ok_or(DispatchError::NoSession(target.as_u64()))?;
+            let mut bytes = text.into_bytes();
+            if newline {
+                bytes.push(b'\r');
+            }
+            session.write(bytes);
+            Ok(Value::Null)
+        }
+
+        Request::Read { pane, lines } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let session = host
+                .session(target)
+                .ok_or(DispatchError::NoSession(target.as_u64()))?;
+            let mut all = session.visible_lines();
+            while all.last().is_some_and(|l| l.is_empty()) {
+                all.pop();
+            }
+            if let Some(n) = lines {
+                if all.len() > n {
+                    all.drain(..all.len() - n);
+                }
+            }
+            Ok(json!({ "pane": target.as_u64(), "text": all.join("\n") }))
+        }
+
+        Request::Title { pane, title, role } => {
+            if title.is_none() && role.is_none() {
+                return Err(DispatchError::InvalidParams(
+                    "title か role の少なくとも一方を指定する".into(),
+                ));
+            }
+            let (tab, target) = resolve_pane(host.workspace(), pane)?;
+            let pane = tree_mut(host.workspace_mut(), tab)
+                .get_mut(target)
+                .expect("resolve_pane で存在確認済み");
+            if let Some(t) = title {
+                pane.set_title((!t.is_empty()).then_some(t));
+            }
+            if let Some(r) = role {
+                pane.set_role((!r.is_empty()).then_some(r));
+            }
+            Ok(Value::Null)
+        }
+
+        Request::TabNew { title } => {
+            let pane = Pane::new(origin);
+            let pane_id = pane.id();
+            let title = title.unwrap_or_else(|| format!("{}", host.workspace().tabs().len() + 1));
+            let tab_id = host.workspace_mut().create_tab(title, pane);
+            host.attach_session(pane_id, SpawnOptions::default());
+            Ok(json!({ "tab": tab_id.as_u64(), "pane": pane_id.as_u64() }))
+        }
+
+        Request::TabSelect { tab } => {
+            let tab_id = find_tab(host.workspace(), tab)?;
+            host.workspace_mut().activate_tab(tab_id).map_err(op_err)?;
+            Ok(Value::Null)
+        }
+
+        Request::MovePane { pane, tab } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let dest = find_tab(host.workspace(), tab)?;
+            host.workspace_mut()
+                .move_pane(target, dest)
+                .map_err(op_err)?;
+            Ok(Value::Null)
+        }
+    }
+}
+
+/// `pane` 省略はエラー（呼び出し元解決はクライアント側の責務。FR-2.2.7）
+fn resolve_pane(ws: &Workspace, pane: Option<u64>) -> Result<(TabId, PaneId), DispatchError> {
+    let raw = pane.ok_or(DispatchError::NoTargetPane)?;
+    for tab in ws.tabs() {
+        if let Some(p) = tab.tree().panes().iter().find(|p| p.id().as_u64() == raw) {
+            return Ok((tab.id(), p.id()));
+        }
+    }
+    Err(DispatchError::PaneNotFound(raw))
+}
+
+fn find_tab(ws: &Workspace, raw: u64) -> Result<TabId, DispatchError> {
+    ws.tabs()
+        .iter()
+        .map(|t| t.id())
+        .find(|t| t.as_u64() == raw)
+        .ok_or(DispatchError::TabNotFound(raw))
+}
+
+fn tree_mut(ws: &mut Workspace, tab: TabId) -> &mut tako_core::PaneTree {
+    ws.get_tab_mut(tab)
+        .expect("呼び出し前に存在確認済みのタブ")
+        .tree_mut()
+}
+
+fn op_err(e: impl std::fmt::Display) -> DispatchError {
+    DispatchError::Operation(e.to_string())
+}
+
+/// ワークスペース全体の構造化スナップショット（FR-2.5.1〜2）。
+/// ツリー構造 + 単位矩形ジオメトリ + 各ペインの状態を返す
+fn list_json(host: &dyn ControlHost) -> Value {
+    let ws = host.workspace();
+    let tabs: Vec<Value> = ws
+        .tabs()
+        .iter()
+        .map(|tab| {
+            let tree = tab.tree();
+            let rects = tree.layout(Rect::UNIT);
+            let panes: Vec<Value> = tree
+                .panes()
+                .iter()
+                .map(|p| {
+                    let rect = rects
+                        .iter()
+                        .find(|(id, _)| *id == p.id())
+                        .map(|(_, r)| *r)
+                        .expect("panes と layout は同じツリー由来");
+                    let session = host.session(p.id());
+                    json!({
+                        "id": p.id().as_u64(),
+                        "title": p.title(),
+                        "osc_title": session.and_then(|s| s.title()),
+                        "role": p.role(),
+                        "origin": origin_str(p.origin()),
+                        "focused": p.id() == tree.focused(),
+                        "rect": {
+                            "x": rect.x,
+                            "y": rect.y,
+                            "width": rect.width,
+                            "height": rect.height,
+                        },
+                        "cols": session.map(|s| s.size().0),
+                        "rows": session.map(|s| s.size().1),
+                    })
+                })
+                .collect();
+            json!({
+                "id": tab.id().as_u64(),
+                "title": tab.title(),
+                "active": tab.id() == ws.active_tab_id(),
+                "focused_pane": tree.focused().as_u64(),
+                "panes": panes,
+                "tree": tree_json(tree.root()),
+            })
+        })
+        .collect();
+    json!({ "active_tab": ws.active_tab_id().as_u64(), "tabs": tabs })
+}
+
+fn tree_json(node: &PaneNode) -> Value {
+    match node {
+        PaneNode::Leaf(p) => json!({ "type": "pane", "id": p.id().as_u64() }),
+        PaneNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => json!({
+            "type": "split",
+            "axis": match axis {
+                SplitAxis::Horizontal => "x",
+                SplitAxis::Vertical => "y",
+            },
+            "ratio": ratio,
+            "first": tree_json(first),
+            "second": tree_json(second),
+        }),
+    }
+}
+
+fn origin_str(origin: PaneOrigin) -> &'static str {
+    match origin {
+        PaneOrigin::User => "user",
+        PaneOrigin::Cli => "cli",
+        PaneOrigin::Mcp => "mcp",
+        PaneOrigin::Suggestion => "suggestion",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::Axis;
+
+    /// セッションを起動しないテスト用ホスト（レイアウト操作の検証に使う）
+    struct MockHost {
+        ws: Workspace,
+        attached: Vec<u64>,
+        detached: Vec<u64>,
+    }
+
+    impl MockHost {
+        fn new() -> Self {
+            Self {
+                ws: Workspace::new("t1", Pane::new(PaneOrigin::User)),
+                attached: Vec::new(),
+                detached: Vec::new(),
+            }
+        }
+
+        fn root_pane(&self) -> u64 {
+            self.ws.active_tab().tree().focused().as_u64()
+        }
+    }
+
+    impl ControlHost for MockHost {
+        fn workspace(&self) -> &Workspace {
+            &self.ws
+        }
+        fn workspace_mut(&mut self) -> &mut Workspace {
+            &mut self.ws
+        }
+        fn session(&self, _pane: PaneId) -> Option<&TerminalSession> {
+            None
+        }
+        fn attach_session(&mut self, pane: PaneId, _options: SpawnOptions) {
+            self.attached.push(pane.as_u64());
+        }
+        fn detach_session(&mut self, pane: PaneId) {
+            self.detached.push(pane.as_u64());
+        }
+    }
+
+    fn split(host: &mut MockHost, pane: u64) -> u64 {
+        dispatch(
+            host,
+            Request::Split {
+                pane: Some(pane),
+                direction: None,
+                ratio: None,
+                command: None,
+                cwd: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap()["pane"]
+            .as_u64()
+            .unwrap()
+    }
+
+    #[test]
+    fn splitで同じタブに新ペインが生えattachされる() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let new_id = split(&mut host, root);
+        assert_eq!(host.attached, vec![new_id]);
+        assert_eq!(host.ws.active_tab().tree().len(), 2);
+        // 生成主体は Cli（FR-2.3.5 のポリシー制御に使う）
+        let tree = host.ws.active_tab().tree();
+        let origin = tree
+            .panes()
+            .iter()
+            .find(|p| p.id().as_u64() == new_id)
+            .unwrap()
+            .origin();
+        assert_eq!(origin, PaneOrigin::Cli);
+    }
+
+    #[test]
+    fn closeでペインが消えdetachされる() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let new_id = split(&mut host, root);
+        let result = dispatch(
+            &mut host,
+            Request::Close { pane: Some(new_id) },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["closed"].as_u64(), Some(new_id));
+        assert_eq!(host.detached, vec![new_id]);
+        assert_eq!(host.ws.active_tab().tree().len(), 1);
+    }
+
+    #[test]
+    fn タブ最後のペインのcloseはタブごと閉じる() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        dispatch(&mut host, Request::TabNew { title: None }, PaneOrigin::Cli).unwrap();
+        assert_eq!(host.ws.tabs().len(), 2);
+        dispatch(
+            &mut host,
+            Request::Close { pane: Some(root) },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(host.ws.tabs().len(), 1);
+        assert_eq!(host.detached, vec![root]);
+    }
+
+    #[test]
+    fn 最後のタブの最後のペインは閉じられない() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let err = dispatch(
+            &mut host,
+            Request::Close { pane: Some(root) },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DispatchError::Operation(_)));
+        assert_eq!(host.ws.tabs().len(), 1);
+        assert!(host.detached.is_empty());
+    }
+
+    #[test]
+    fn focusはタブ切替も伴う() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let result = dispatch(&mut host, Request::TabNew { title: None }, PaneOrigin::Cli).unwrap();
+        let tab2 = result["tab"].as_u64().unwrap();
+        assert_eq!(host.ws.active_tab_id().as_u64(), tab2);
+        // タブ 1 のペインへフォーカス → アクティブタブも戻る
+        dispatch(
+            &mut host,
+            Request::Focus {
+                pane: Some(root),
+                direction: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_ne!(host.ws.active_tab_id().as_u64(), tab2);
+        assert_eq!(host.ws.active_tab().tree().focused().as_u64(), root);
+    }
+
+    #[test]
+    fn 方向フォーカスはアクティブタブ内で動く() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let new_id = split(&mut host, root);
+        // split 後のフォーカスは新ペイン（右側）。左へ戻る
+        let result = dispatch(
+            &mut host,
+            Request::Focus {
+                pane: None,
+                direction: Some(Direction::Left),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["focused"].as_u64(), Some(root));
+        // さらに左には何もない → null
+        let result = dispatch(
+            &mut host,
+            Request::Focus {
+                pane: None,
+                direction: Some(Direction::Left),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!(result["focused"].is_null());
+        let _ = new_id;
+    }
+
+    #[test]
+    fn resizeはdeltaとshareの排他指定() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let new_id = split(&mut host, root);
+        let result = dispatch(
+            &mut host,
+            Request::Resize {
+                pane: Some(new_id),
+                axis: Axis::X,
+                delta: Some(0.2),
+                share: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!((result["share"].as_f64().unwrap() - 0.7).abs() < 1e-5);
+        let result = dispatch(
+            &mut host,
+            Request::Resize {
+                pane: Some(new_id),
+                axis: Axis::X,
+                delta: None,
+                share: Some(0.4),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!((result["share"].as_f64().unwrap() - 0.4).abs() < 1e-5);
+        let err = dispatch(
+            &mut host,
+            Request::Resize {
+                pane: Some(new_id),
+                axis: Axis::X,
+                delta: Some(0.1),
+                share: Some(0.5),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DispatchError::InvalidParams(_)));
+    }
+
+    #[test]
+    fn equalizeはpaneからタブを解決する() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let new_id = split(&mut host, root);
+        dispatch(
+            &mut host,
+            Request::Resize {
+                pane: Some(new_id),
+                axis: Axis::X,
+                delta: Some(0.3),
+                share: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        dispatch(
+            &mut host,
+            Request::Equalize {
+                pane: Some(root),
+                tab: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let rects = host.ws.active_tab().tree().layout(Rect::UNIT);
+        for (_, r) in rects {
+            assert!((r.width - 0.5).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn listはツリーとジオメトリと状態を返す() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let new_id = split(&mut host, root);
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(new_id),
+                title: Some("worker".into()),
+                role: Some("dev-server".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let result = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        let tabs = result["tabs"].as_array().unwrap();
+        assert_eq!(tabs.len(), 1);
+        let panes = tabs[0]["panes"].as_array().unwrap();
+        assert_eq!(panes.len(), 2);
+        let new_pane = panes
+            .iter()
+            .find(|p| p["id"].as_u64() == Some(new_id))
+            .unwrap();
+        assert_eq!(new_pane["title"].as_str(), Some("worker"));
+        assert_eq!(new_pane["role"].as_str(), Some("dev-server"));
+        assert_eq!(new_pane["origin"].as_str(), Some("cli"));
+        assert_eq!(new_pane["focused"].as_bool(), Some(true));
+        assert!((new_pane["rect"]["x"].as_f64().unwrap() - 0.5).abs() < 1e-5);
+        // ツリー構造（ルートが split で leaf を 2 つ持つ）
+        assert_eq!(tabs[0]["tree"]["type"].as_str(), Some("split"));
+        assert_eq!(tabs[0]["tree"]["second"]["id"].as_u64(), Some(new_id));
+    }
+
+    #[test]
+    fn sendとreadはセッションが無ければエラー() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let err = dispatch(
+            &mut host,
+            Request::Send {
+                pane: Some(root),
+                text: "ls".into(),
+                newline: true,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert_eq!(err, DispatchError::NoSession(root));
+        let err = dispatch(
+            &mut host,
+            Request::Read {
+                pane: Some(root),
+                lines: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert_eq!(err, DispatchError::NoSession(root));
+    }
+
+    #[test]
+    fn タブ操作とペイン移送() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let new_id = split(&mut host, root);
+        let result = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: Some("agents".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let tab2 = result["tab"].as_u64().unwrap();
+        // TabNew のペインも attach される
+        assert_eq!(host.attached.len(), 2);
+
+        dispatch(
+            &mut host,
+            Request::MovePane {
+                pane: Some(new_id),
+                tab: tab2,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            host.ws
+                .find_tab_of_pane(
+                    host.ws
+                        .get_tab(find_tab(&host.ws, tab2).unwrap())
+                        .unwrap()
+                        .tree()
+                        .focused()
+                )
+                .unwrap()
+                .as_u64(),
+            tab2
+        );
+        assert_eq!(
+            host.ws
+                .get_tab(find_tab(&host.ws, tab2).unwrap())
+                .unwrap()
+                .tree()
+                .len(),
+            2
+        );
+
+        // タブ切替
+        let tab1 = host.ws.tabs()[0].id().as_u64();
+        dispatch(&mut host, Request::TabSelect { tab: tab1 }, PaneOrigin::Cli).unwrap();
+        assert_eq!(host.ws.active_tab_id().as_u64(), tab1);
+    }
+
+    #[test]
+    fn 不正な対象はエラー() {
+        let mut host = MockHost::new();
+        let err = dispatch(&mut host, Request::Close { pane: None }, PaneOrigin::Cli).unwrap_err();
+        assert_eq!(err, DispatchError::NoTargetPane);
+        let err = dispatch(
+            &mut host,
+            Request::Close { pane: Some(99999) },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert_eq!(err, DispatchError::PaneNotFound(99999));
+        let err = dispatch(
+            &mut host,
+            Request::TabSelect { tab: 99999 },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert_eq!(err, DispatchError::TabNotFound(99999));
+    }
+}

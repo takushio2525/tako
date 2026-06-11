@@ -1,6 +1,6 @@
 [package]
 name = "tako-control"
-description = "制御プレーン（IPC / MCP / パッシブ検知）。GPUI 非依存。Phase 2 で実装"
+description = "制御プレーン（IPC / MCP / パッシブ検知）。GPUI 非依存"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,3 +8,9 @@ repository.workspace = true
 
 [dependencies]
 tako-core.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+getrandom.workspace = true

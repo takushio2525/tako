@@ -19,6 +19,13 @@ alacritty_terminal = "0.26"
 futures = "0.3"
 thiserror = "2"
 tracing = "0.1"
+# IPC / CLI のプロトコル定義（JSON-RPC 風）に使う
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# TAKO_TOKEN 生成用の OS CSPRNG（FR-2.3.4。std に相当機能が無いため採用）
+getrandom = "0.3"
+# `tako` CLI の引数パーサ（デファクト標準）
+clap = { version = "4", features = ["derive"] }
 # GPUI は zed リポの git rev 固定（自動更新しない。追従は意識的なタスク。.agent/architecture.md）
 gpui = { git = "https://github.com/zed-industries/zed", rev = "cafbf4b5df7fedb67fc0f248850a5654efcec5d9" }
 # font-kit feature 必須: 無いとテキストシステムがスタブ化し文字が一切描画されない（poc/README.md）

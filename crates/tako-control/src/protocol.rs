@@ -1,0 +1,250 @@
+//! protocol — Layer 1 IPC / Layer 2 MCP 共通の操作プロトコル定義（FR-2.2 / FR-2.5）
+//!
+//! ワイヤ形式は 1 行 1 JSON の JSON-RPC 2.0 サブセット + `token` フィールド拡張:
+//!
+//! ```json
+//! {"jsonrpc":"2.0","id":1,"token":"...","method":"split","params":{"pane":3,"direction":"down"}}
+//! {"jsonrpc":"2.0","id":1,"result":{"pane":7}}
+//! {"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"..."}}
+//! ```
+//!
+//! 操作セットは FR-2.5（AI レイアウト操作セット）と 1:1。Phase 3 の MCP ツールも
+//! この [`Request`] を共有し、`dispatch` 経由で同じセマンティクスを呼ぶ。
+
+use serde::{Deserialize, Serialize};
+use tako_core::{SplitAxis, SplitDirection};
+
+pub const JSONRPC_VERSION: &str = "2.0";
+
+/// JSON-RPC エラーコード
+pub mod error_code {
+    /// JSON として解釈できない
+    pub const PARSE: i64 = -32700;
+    /// パラメータ不正
+    pub const INVALID_PARAMS: i64 = -32602;
+    /// サーバー内部エラー（受け口の消失等）
+    pub const INTERNAL: i64 = -32603;
+    /// ドメイン操作の失敗（ペインが無い等）
+    pub const OPERATION: i64 = -32000;
+    /// トークン認証失敗（FR-2.3.4）
+    pub const AUTH: i64 = -32001;
+}
+
+/// 分割・フォーカス移動の方向（`tako_core::SplitDirection` のワイヤ表現）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    Right,
+    Down,
+    Left,
+    Up,
+}
+
+impl Direction {
+    pub fn to_core(self) -> SplitDirection {
+        match self {
+            Direction::Right => SplitDirection::Right,
+            Direction::Down => SplitDirection::Down,
+            Direction::Left => SplitDirection::Left,
+            Direction::Up => SplitDirection::Up,
+        }
+    }
+}
+
+/// リサイズの軸（`tako_core::SplitAxis` のワイヤ表現）。x = 横幅、y = 縦幅
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Axis {
+    X,
+    Y,
+}
+
+impl Axis {
+    pub fn to_core(self) -> SplitAxis {
+        match self {
+            Axis::X => SplitAxis::Horizontal,
+            Axis::Y => SplitAxis::Vertical,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 操作リクエスト。`pane` 省略時は呼び出し元ペイン（クライアント側で `TAKO_PANE_ID` から
+/// 解決して詰める。FR-2.2.7）。各操作のセマンティクスは tako-core の API と 1:1
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "method", content = "params", rename_all = "snake_case")]
+pub enum Request {
+    /// ペイン分割（FR-2.2.1 / FR-2.5.3）。`command` 指定時はシェルの代わりに実行する
+    Split {
+        pane: Option<u64>,
+        direction: Option<Direction>,
+        /// 新ペイン側の取り分（0.0–1.0、省略時は等分）
+        ratio: Option<f32>,
+        command: Option<Vec<String>>,
+        cwd: Option<String>,
+    },
+    /// ペイン削除（FR-2.5.4。呼び出し元自身の削除 = 自己片付けを含む）
+    Close { pane: Option<u64> },
+    /// フォーカス移動（FR-2.5.5）。`direction` 指定時はアクティブタブ内の方向移動
+    Focus {
+        pane: Option<u64>,
+        direction: Option<Direction>,
+    },
+    /// サイズ調整（FR-2.5.6）。`delta` は相対増減、`share` は取り分の絶対指定
+    Resize {
+        pane: Option<u64>,
+        axis: Axis,
+        delta: Option<f32>,
+        share: Option<f32>,
+    },
+    /// レイアウト均等化（FR-2.5.7）。`tab` 省略時は `pane` の属するタブ
+    Equalize { pane: Option<u64>, tab: Option<u64> },
+    /// タブ / ペインのツリー構造・ジオメトリ・状態の取得（FR-2.2.4 / FR-2.5.1〜2）
+    List,
+    /// ペインへのテキスト送信（FR-2.2.2）。`newline` で末尾に改行（CR）を付与
+    Send {
+        pane: Option<u64>,
+        text: String,
+        #[serde(default = "default_true")]
+        newline: bool,
+    },
+    /// ペインの画面内容取得（FR-2.2.5）。`lines` は末尾からの行数制限
+    Read {
+        pane: Option<u64>,
+        lines: Option<usize>,
+    },
+    /// タイトル・役割ラベルの設定（FR-2.2.6 / FR-2.1.3）。空文字でクリア
+    Title {
+        pane: Option<u64>,
+        title: Option<String>,
+        role: Option<String>,
+    },
+    /// タブ作成（FR-2.5.10）
+    TabNew { title: Option<String> },
+    /// タブ切替（FR-2.5.10）
+    TabSelect { tab: u64 },
+    /// ペインの別タブへの移送（FR-2.5.10）
+    MovePane { pane: Option<u64>, tab: u64 },
+}
+
+/// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RequestEnvelope {
+    pub jsonrpc: String,
+    pub id: u64,
+    pub token: String,
+    #[serde(flatten)]
+    pub request: Request,
+}
+
+impl RequestEnvelope {
+    pub fn new(id: u64, token: impl Into<String>, request: Request) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id,
+            token: token.into(),
+            request,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RpcError {
+    pub code: i64,
+    pub message: String,
+}
+
+/// レスポンスエンベロープ。`result` / `error` のどちらか一方を持つ
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResponseEnvelope {
+    pub jsonrpc: String,
+    pub id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<RpcError>,
+}
+
+impl ResponseEnvelope {
+    pub fn ok(id: u64, result: serde_json::Value) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    pub fn err(id: u64, code: i64, message: impl Into<String>) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id,
+            result: None,
+            error: Some(RpcError {
+                code,
+                message: message.into(),
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn リクエストエンベロープが往復できる() {
+        let envelope = RequestEnvelope::new(
+            7,
+            "secret",
+            Request::Split {
+                pane: Some(3),
+                direction: Some(Direction::Down),
+                ratio: None,
+                command: Some(vec!["npm".into(), "run".into(), "dev".into()]),
+                cwd: None,
+            },
+        );
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(json.contains(r#""method":"split""#));
+        assert!(json.contains(r#""token":"secret""#));
+        let back: RequestEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, 7);
+        assert_eq!(back.request, envelope.request);
+    }
+
+    #[test]
+    fn paramsなしのlistとデフォルト値が解釈できる() {
+        let back: RequestEnvelope =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"token":"t","method":"list"}"#)
+                .unwrap();
+        assert_eq!(back.request, Request::List);
+
+        // newline はデフォルト true、pane は省略可
+        let back: RequestEnvelope = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":2,"token":"t","method":"send","params":{"text":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            back.request,
+            Request::Send {
+                pane: None,
+                text: "ls".into(),
+                newline: true
+            }
+        );
+    }
+
+    #[test]
+    fn レスポンスはresultとerrorを排他で持つ() {
+        let ok = serde_json::to_string(&ResponseEnvelope::ok(1, serde_json::json!({"pane": 5})))
+            .unwrap();
+        assert!(ok.contains(r#""result""#) && !ok.contains(r#""error""#));
+        let err =
+            serde_json::to_string(&ResponseEnvelope::err(1, error_code::AUTH, "認証失敗")).unwrap();
+        assert!(err.contains(r#""error""#) && !err.contains(r#""result""#));
+    }
+}
