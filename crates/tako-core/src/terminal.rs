@@ -62,6 +62,34 @@ fn default_home_dir() -> Option<PathBuf> {
     home_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
 }
 
+/// 既定シェル。unix では alacritty に `None` を渡さず**ここで明示解決する**。
+///
+/// alacritty の既定（None）は macOS で setuid root の `login` ラッパ経由になり、
+/// ペイン close 時の `Pty::drop` が `kill(login, SIGHUP)` を権限エラーで失敗（返り値無視）
+/// → `child.wait()` が永久ブロック → master fd・signal fd・IO スレッド・login プロセスが
+/// **close のたびにリーク**する。fd 枯渇で PTY 生成が失敗し日常使用でアプリが死ぬ
+/// （2026-06-11 常用報告の根本原因）。本家 alacritty はウィンドウ close = プロセス終了の
+/// ため顕在化しないが、tako はペイン単位でセッションを破棄するので直撃する。
+/// ユーザー権限のシェルを直接 spawn すれば SIGHUP が届き wait も即返る。
+/// `-l` でログインシェル動作（profile 読み込み）は維持する
+#[cfg(unix)]
+fn default_shell() -> Option<SpawnCommand> {
+    let program = std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/bin/sh".into());
+    Some(SpawnCommand {
+        program,
+        args: vec!["-l".into()],
+    })
+}
+
+/// Windows は alacritty の既定（PowerShell / cmd）に任せる（Phase 6 で精査）
+#[cfg(windows)]
+fn default_shell() -> Option<SpawnCommand> {
+    None
+}
+
 /// `default_home_dir` の純粋ロジック（テスト用に env 参照と分離）。
 /// `$HOME` を優先し、無ければ `%USERPROFILE%`。どちらも空なら None
 fn home_from(
@@ -190,7 +218,11 @@ impl TerminalSession {
         env.extend(options.env);
 
         let tty_options = tty::Options {
-            shell: options.command.map(|c| tty::Shell::new(c.program, c.args)),
+            // command 未指定なら既定シェルを明示解決する（login ラッパ回避。`default_shell`）
+            shell: options
+                .command
+                .or_else(default_shell)
+                .map(|c| tty::Shell::new(c.program, c.args)),
             // cwd 未指定なら親プロセスの cwd（.app 起動時は `/`）ではなくホームを既定にする。
             // 元ペインの cwd 継承は OSC 7 シェル統合（Phase 4）で対応する。
             working_directory: options.cwd.or_else(default_home_dir),

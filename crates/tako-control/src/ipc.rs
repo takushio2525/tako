@@ -242,6 +242,45 @@ mod tests {
     }
 
     #[test]
+    fn 連続接続でfdが漏れない() {
+        fn fd_count() -> usize {
+            std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0)
+        }
+        fn one_roundtrip(endpoint: &str) {
+            let stream = UnixStream::connect(endpoint).unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let envelope = RequestEnvelope::new(1, TEST_TOKEN.to_string(), Request::List);
+            writeln!(writer, "{}", serde_json::to_string(&envelope).unwrap()).unwrap();
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).unwrap();
+        }
+
+        let (tx, mut rx) = unbounded::<IncomingRequest>();
+        let server = IpcServer::start(tx, TEST_TOKEN.into()).unwrap();
+        std::thread::spawn(move || {
+            while let Some(incoming) = futures::executor::block_on(rx.next()) {
+                let _ = incoming.reply.send(Ok(json!({})));
+            }
+        });
+        // ウォームアップ（スレッドスタック等の初期確保を測定から外す）
+        for _ in 0..3 {
+            one_roundtrip(server.endpoint());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let before = fd_count();
+        for _ in 0..10 {
+            one_roundtrip(server.endpoint());
+        }
+        // 接続スレッドの終了（fd クローズ）を待つ
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let after = fd_count();
+        assert!(
+            after <= before + 2,
+            "IPC 接続 10 回で fd が {before} → {after} に増えた（リーク）"
+        );
+    }
+
+    #[test]
     fn 不正なトークンは認証エラーで拒否される() {
         let response = roundtrip(Some("bogus-token".into()));
         let error = response.error.expect("エラーになる");

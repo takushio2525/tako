@@ -116,6 +116,20 @@ Workspace
 - Pane は `role`（任意ラベル）と `origin`（user / cli / mcp / suggestion）を持ち、
   UI 表示とポリシー制御（FR-2.3.5）に使う
 
+### ⚠️ PTY セッション破棄のハマりどころ（2026-06-11 常用クラッシュの教訓）
+
+- **alacritty に既定シェル解決を任せない**（`tty::Options.shell = None` 禁止）。macOS では
+  setuid root の `login` ラッパ経由になり、ペイン close 時の `Pty::drop` が
+  `kill(login, SIGHUP)` を権限エラーで失敗（返り値無視）→ `child.wait()` 永久ブロック →
+  **close のたびに master fd・signal fd・IO スレッド・login プロセスがリーク**する。
+  本家 alacritty はウィンドウ close = プロセス終了のため顕在化しないが、tako はペイン単位で
+  セッションを破棄するので直撃する（fd 枯渇 → PTY 生成失敗）。
+  tako は `$SHELL` をユーザー権限で直接 spawn する（`TerminalSession::default_shell`、`-l` 付き）
+- **PTY 生成失敗で panic しない**。GPUI のイベント処理は FFI コールバック内のため、
+  panic は unwind できず SIGABRT でアプリごと落ちる。`spawn_session` は Result を返し、
+  失敗時はペインを巻き戻して CLI / MCP へエラー応答する。
+  回帰はセルフテスト 40 / 40b（split→close ストレス + fd リーク検査）で機械検証する
+
 ## 制御プレーン（コンセプト①の 3 層）
 
 ### 環境変数注入（共通基盤）

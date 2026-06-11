@@ -242,17 +242,27 @@ impl TakoApp {
             dragging_border: None,
         };
         let root_id = app.workspace.active_tab().tree().focused();
-        app.spawn_session(root_id, SpawnOptions::default(), cx);
+        if let Err(e) = app.spawn_session(root_id, SpawnOptions::default(), cx) {
+            // 最初のペインすら開けない環境では使いようがない。SIGABRT ではなく明示終了する
+            eprintln!("fatal: 最初のシェルを起動できない: {e}");
+            std::process::exit(1);
+        }
 
         // IPC リクエストを UI スレッドで dispatch するループ。
         // 操作セマンティクスは tako-control::dispatch に一元化されている（設計原則 5）
         cx.spawn(async move |this, cx| {
             while let Some(incoming) = control_rx.next().await {
                 let result = this.update(cx, |app: &mut TakoApp, cx| {
-                    let result = tako_control::dispatch(app, incoming.request, incoming.origin);
-                    // dispatch が依頼したセッション起動をここで実行（Context が要るため）
+                    let mut result = tako_control::dispatch(app, incoming.request, incoming.origin);
+                    // dispatch が依頼したセッション起動をここで実行（Context が要るため）。
+                    // PTY 起動失敗は生成済みペインを巻き戻してエラー応答にする（落とさない）
                     for (pane, options) in std::mem::take(&mut app.pending_attach) {
-                        app.spawn_session(pane, options, cx);
+                        if let Err(e) = app.spawn_session(pane, options, cx) {
+                            app.remove_pane(pane, cx);
+                            result = Err(tako_control::DispatchError::Operation(format!(
+                                "PTY を起動できなかった: {e}"
+                            )));
+                        }
                     }
                     cx.notify();
                     result
@@ -272,13 +282,15 @@ impl TakoApp {
     }
 
     /// ペイン ID に対する新しい TerminalSession を起動し、イベント中継タスクを張る。
-    /// 制御プレーンの接続情報を環境変数で注入する（FR-2.1.1）
+    /// 制御プレーンの接続情報を環境変数で注入する（FR-2.1.1）。
+    /// 失敗（fd 枯渇等での PTY 生成エラー）は Err で返す。ここで panic すると GPUI の
+    /// FFI コールバック境界を越えられず SIGABRT でアプリごと落ちる（2026-06-11 常用報告）
     fn spawn_session(
         &mut self,
         pane_id: PaneId,
         mut options: SpawnOptions,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), tako_core::SessionError> {
         options
             .env
             .push(("TAKO_PANE_ID".into(), pane_id.to_string()));
@@ -300,8 +312,7 @@ impl TakoApp {
                 options.env.push(("TAKO_TOKEN".into(), token.clone()));
             }
         }
-        let (session, mut rx) = TerminalSession::spawn(INITIAL_COLS, INITIAL_ROWS, options)
-            .expect("PTY 付きシェルを起動できなかった");
+        let (session, mut rx) = TerminalSession::spawn(INITIAL_COLS, INITIAL_ROWS, options)?;
         self.terminals.insert(pane_id, session);
         cx.spawn(async move |this, cx| {
             while let Some(event) = rx.next().await {
@@ -314,6 +325,7 @@ impl TakoApp {
             }
         })
         .detach();
+        Ok(())
     }
 
     fn on_term_event(
@@ -356,7 +368,10 @@ impl TakoApp {
             .split(target, direction, pane)
             .is_ok()
         {
-            self.spawn_session(pane_id, SpawnOptions::default(), cx);
+            if let Err(e) = self.spawn_session(pane_id, SpawnOptions::default(), cx) {
+                eprintln!("warning: ペインを開けない: {e}");
+                self.remove_pane(pane_id, cx);
+            }
         }
         cx.notify();
     }
@@ -435,7 +450,10 @@ impl TakoApp {
         let pane = Pane::new(PaneOrigin::User);
         let pane_id = pane.id();
         self.workspace.create_tab(title, pane);
-        self.spawn_session(pane_id, SpawnOptions::default(), cx);
+        if let Err(e) = self.spawn_session(pane_id, SpawnOptions::default(), cx) {
+            eprintln!("warning: タブを開けない: {e}");
+            self.remove_pane(pane_id, cx); // 最後の 1 ペイン → タブごと畳まれる
+        }
         cx.notify();
     }
 
@@ -2357,6 +2375,69 @@ mod self_test {
                 focused_contains(window, cx, "かくてい"),
                 "unmark はそのまま挿入",
             );
+
+            // 40. 【回帰】2 ペイン構成（左右分割）で非フォーカス側を CLI close しても落ちない
+            //     （2026-06-11 常用報告: 根分割の崩しで panic→SIGABRT）。
+            //     直前の IME テストが入力行に残した「かくてい」を ctrl-u で消してから打つ
+            press(any, cx, "ctrl-u");
+            type_text(any, cx, &format!("{cli} tab new --title close-reg"), true);
+            wait(cx, 1200).await;
+            let reg_pane_a = window
+                .update(cx, |app, _, _| app.workspace.active_tab().tree().focused())
+                .unwrap_or_else(|_| fail("回帰 40: タブ作成後の状態取得"));
+            type_text(any, cx, &format!("{cli} split --right"), true);
+            wait(cx, 1500).await;
+            let reg_pane_b = window
+                .update(cx, |app, _, _| app.workspace.active_tab().tree().focused())
+                .unwrap_or_else(|_| fail("回帰 40: split 後の状態取得"));
+            check(reg_pane_b != reg_pane_a, "回帰 40: split で新ペイン");
+            // 旧ペインへフォーカスを戻し、新ペイン（非フォーカス側）を外から閉じる
+            type_text(any, cx, &format!("{cli} focus {reg_pane_a}"), true);
+            wait(cx, 800).await;
+            type_text(any, cx, &format!("{cli} close --pane {reg_pane_b}"), true);
+            wait(cx, 1500).await;
+            let collapsed = window
+                .update(cx, |app, _, _| {
+                    let tree = app.workspace.active_tab().tree();
+                    tree.len() == 1
+                        && tree.focused() == reg_pane_a
+                        && !app.terminals.contains_key(&reg_pane_b)
+                })
+                .unwrap_or(false);
+            check(collapsed, "CLI close 非フォーカスペインで根分割が崩れる");
+
+            // 40b. split→close を 10 周しても落ちず fd が漏れない（PTY 起動は fd を食うため、
+            //      リークすると日常使用で fd 枯渇 → spawn 失敗に至る）
+            let fd_before = std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0);
+            type_text(
+                any,
+                cx,
+                &format!(
+                    "for i in $(seq 1 10); do p=$({cli} split --right) && {cli} close --pane $p; done; echo TAKO-STRESS-$((40+2))"
+                ),
+                true,
+            );
+            wait(cx, 10000).await;
+            check(
+                focused_contains(window, cx, "TAKO-STRESS-42"),
+                "split/close ストレス 10 周",
+            );
+            let stress_stable = window
+                .update(cx, |app, _, _| {
+                    app.workspace.active_tab().tree().len() == 1
+                        && app.workspace.active_tab().tree().focused() == reg_pane_a
+                })
+                .unwrap_or(false);
+            check(stress_stable, "ストレス後もツリーが安定");
+            let fd_after = std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0);
+            check(
+                fd_after <= fd_before + 8,
+                "split/close で fd が漏れない",
+            );
+
+            // 片付け（最後の 1 ペイン close = タブごと閉じる経路も通す）
+            type_text(any, cx, &format!("{cli} close"), true);
+            wait(cx, 1000).await;
 
             println!("TAKO_APP_SELF_TEST_OK");
             std::process::exit(0);
