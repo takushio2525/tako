@@ -414,6 +414,29 @@ impl Drop for TerminalSession {
     }
 }
 
+impl CommandState {
+    /// 複数ペインの状態を「注目度」で集約する（タブの状態ドット・FR-2.10 集約センター用）。
+    /// Failed > Running > Idle > Unknown
+    pub fn aggregate<I: IntoIterator<Item = CommandState>>(states: I) -> CommandState {
+        states.into_iter().fold(CommandState::Unknown, |acc, s| {
+            if s.priority() > acc.priority() {
+                s
+            } else {
+                acc
+            }
+        })
+    }
+
+    fn priority(self) -> u8 {
+        match self {
+            CommandState::Failed(_) => 3,
+            CommandState::Running => 2,
+            CommandState::Idle => 1,
+            CommandState::Unknown => 0,
+        }
+    }
+}
+
 /// コマンド実行状態の遷移。エラー（Failed）はひと目で気づけるよう、
 /// 次のコマンドが実行開始されるまでプロンプトに戻っても保持する（FR-2.1.4）
 fn next_command_state(current: CommandState, mark: PromptMark) -> CommandState {
@@ -488,6 +511,15 @@ mod tests {
         assert_eq!(next_command_state(Failed(1), PromptStart), Failed(1));
         assert_eq!(next_command_state(Failed(1), CommandStart), Failed(1));
         assert_eq!(next_command_state(Failed(1), CommandExecuted), Running);
+    }
+
+    #[test]
+    fn 状態の集約はfailedを最優先する() {
+        use CommandState::*;
+        assert_eq!(CommandState::aggregate([Idle, Running, Failed(2)]), Failed(2));
+        assert_eq!(CommandState::aggregate([Unknown, Idle, Running]), Running);
+        assert_eq!(CommandState::aggregate([Unknown, Idle]), Idle);
+        assert_eq!(CommandState::aggregate([]), Unknown);
     }
 
     #[test]

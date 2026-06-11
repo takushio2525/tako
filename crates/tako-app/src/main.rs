@@ -726,7 +726,19 @@ impl TakoApp {
                     .and_then(|s| s.title())
                     .unwrap_or(tab.title())
                     .to_string();
-                (id, label)
+                // タブ内ペイン状態の集約ドット（FR-2.1.4）: エラー > 実行中のみ表示
+                let dot = match CommandState::aggregate(
+                    tab.tree()
+                        .panes()
+                        .iter()
+                        .filter_map(|p| self.terminals.get(&p.id()))
+                        .map(|s| s.command_state()),
+                ) {
+                    CommandState::Failed(_) => Some(theme.ansi[1]), // 赤
+                    CommandState::Running => Some(theme.accent),
+                    _ => None,
+                };
+                (id, label, dot)
             })
             .collect();
 
@@ -737,7 +749,7 @@ impl TakoApp {
             .h(px(TAB_BAR_HEIGHT))
             .w_full()
             .bg(rgba(theme.tab_bar_background))
-            .children(tabs.into_iter().map(|(id, label)| {
+            .children(tabs.into_iter().map(|(id, label, dot)| {
                 let is_active = id == active;
                 div()
                     .id(("tab", id.as_u64()))
@@ -762,6 +774,9 @@ impl TakoApp {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let _ = this.workspace.activate_tab(id);
                         cx.notify();
+                    }))
+                    .children(dot.map(|color| {
+                        div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color))
                     }))
                     .child(SharedString::from(truncate(&label, 24)))
                     .child(
@@ -811,7 +826,8 @@ impl TakoApp {
             );
         }
 
-        // role / title バッジ（FR-2.1.3）。`tako title` / MCP で設定されたときだけ右上に重ねる
+        // role / title バッジ（FR-2.1.3）。`tako title` / MCP で設定されたときだけ右上に重ねる。
+        // コマンド実行状態（FR-2.1.4）はドット色で添える: 赤 = エラー、アクセント = 実行中
         let badge_label = self
             .workspace
             .active_tab()
@@ -822,6 +838,14 @@ impl TakoApp {
                 (Some(t), None) => Some(t.to_string()),
                 (None, Some(r)) => Some(r.to_string()),
                 (None, None) => None,
+            });
+        let state_dot = self
+            .terminals
+            .get(&pane_id)
+            .and_then(|s| match s.command_state() {
+                tako_core::CommandState::Failed(_) => Some(theme.ansi[1]),
+                tako_core::CommandState::Running => Some(theme.accent),
+                _ => None,
             });
 
         let screen = self.terminals.get(&pane_id).map(|s| s.screen(&theme));
@@ -894,18 +918,29 @@ impl TakoApp {
                 this.on_pane_scroll(pane_id, event, cx);
             }))
             .children(lines)
-            .children(badge_label.map(|label| {
-                div()
-                    .absolute()
-                    .top(px(2.0))
-                    .right(px(6.0))
-                    .px_1()
-                    .rounded_sm()
-                    .bg(rgba(theme.tab_bar_background))
-                    .text_size(px(10.0))
-                    .text_color(hsla(theme.accent))
-                    .child(SharedString::from(truncate(&label, 32)))
-            }))
+            .children(
+                (badge_label.is_some() || state_dot.is_some()).then(|| {
+                    div()
+                        .absolute()
+                        .top(px(2.0))
+                        .right(px(6.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .px_1()
+                        .rounded_sm()
+                        .bg(rgba(theme.tab_bar_background))
+                        .text_size(px(10.0))
+                        .text_color(hsla(theme.accent))
+                        .children(state_dot.map(|color| {
+                            div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color))
+                        }))
+                        .children(
+                            badge_label.map(|label| SharedString::from(truncate(&label, 32))),
+                        )
+                }),
+            )
     }
 }
 
