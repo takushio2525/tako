@@ -657,7 +657,8 @@ impl TakoApp {
             .map(|c| byte_ix + c.len_utf8())
             .unwrap_or(byte_ix);
         let char_end = f32::from(shaped.x_for_index(next_ix));
-        let side_right = char_end > char_start && (local_x - char_start) / (char_end - char_start) > 0.5;
+        let side_right =
+            char_end > char_start && (local_x - char_start) / (char_end - char_start) > 0.5;
         Some((col, row, side_right))
     }
 
@@ -922,9 +923,9 @@ impl TakoApp {
                         let _ = this.workspace.activate_tab(id);
                         cx.notify();
                     }))
-                    .children(dot.map(|color| {
-                        div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color))
-                    }))
+                    .children(
+                        dot.map(|color| div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color))),
+                    )
                     .child(SharedString::from(truncate(&label, 24)))
                     .child(
                         div()
@@ -1009,8 +1010,8 @@ impl TakoApp {
             let total = (history + rows) as f32;
             let track_h = f32::from(area.size.height);
             let thumb_h = (rows as f32 / total * track_h).clamp(20.0, track_h);
-            let top = ((history - s.display_offset()) as f32 / total * track_h)
-                .min(track_h - thumb_h);
+            let top =
+                ((history - s.display_offset()) as f32 / total * track_h).min(track_h - thumb_h);
             let dragging = self.dragging_scrollbar == Some(pane_id);
             Some((top, thumb_h, track_h, dragging))
         });
@@ -1081,9 +1082,11 @@ impl TakoApp {
                     this.on_pane_mouse_down(pane_id, event, window, cx);
                 }),
             )
-            .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, window, cx| {
-                this.on_pane_scroll(pane_id, event, window, cx);
-            }))
+            .on_scroll_wheel(
+                cx.listener(move |this, event: &ScrollWheelEvent, window, cx| {
+                    this.on_pane_scroll(pane_id, event, window, cx);
+                }),
+            )
             .children(lines)
             .children(Some(
                 // 閉じるボタン（iTerm2 風。左上に控えめなオーバーレイ）
@@ -1149,29 +1152,27 @@ impl TakoApp {
                             )),
                     )
             }))
-            .children(
-                (badge_label.is_some() || state_dot.is_some()).then(|| {
-                    div()
-                        .absolute()
-                        .top(px(2.0))
-                        .right(px(6.0))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .px_1()
-                        .rounded_sm()
-                        .bg(rgba(theme.tab_bar_background))
-                        .text_size(px(10.0))
-                        .text_color(hsla(theme.accent))
-                        .children(state_dot.map(|color| {
+            .children((badge_label.is_some() || state_dot.is_some()).then(|| {
+                div()
+                    .absolute()
+                    .top(px(2.0))
+                    .right(px(6.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px_1()
+                    .rounded_sm()
+                    .bg(rgba(theme.tab_bar_background))
+                    .text_size(px(10.0))
+                    .text_color(hsla(theme.accent))
+                    .children(
+                        state_dot.map(|color| {
                             div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color))
-                        }))
-                        .children(
-                            badge_label.map(|label| SharedString::from(truncate(&label, 32))),
-                        )
-                }),
-            )
+                        }),
+                    )
+                    .children(badge_label.map(|label| SharedString::from(truncate(&label, 32))))
+            }))
     }
 }
 
@@ -3184,22 +3185,55 @@ mod keystroke_tests {
     #[test]
     fn 特殊キーは正しいバイト列を送る() {
         // Backspace は DEL(0x7f)。BS(0x08) ではない（macOS の stty erase 既定が ^?）
-        assert_eq!(keystroke_to_bytes_legacy(&ks("backspace")), Some(b"\x7f".to_vec()));
-        assert_eq!(keystroke_to_bytes_legacy(&ks("enter")), Some(b"\r".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes_legacy(&ks("backspace")),
+            Some(b"\x7f".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes_legacy(&ks("enter")),
+            Some(b"\r".to_vec())
+        );
         assert_eq!(keystroke_to_bytes_legacy(&ks("tab")), Some(b"\t".to_vec()));
-        assert_eq!(keystroke_to_bytes_legacy(&ks("escape")), Some(b"\x1b".to_vec()));
-        assert_eq!(keystroke_to_bytes_legacy(&ks("up")), Some(b"\x1b[A".to_vec()));
-        assert_eq!(keystroke_to_bytes_legacy(&ks("down")), Some(b"\x1b[B".to_vec()));
-        assert_eq!(keystroke_to_bytes_legacy(&ks("right")), Some(b"\x1b[C".to_vec()));
-        assert_eq!(keystroke_to_bytes_legacy(&ks("left")), Some(b"\x1b[D".to_vec()));
-        assert_eq!(keystroke_to_bytes_legacy(&ks("home")), Some(b"\x1b[H".to_vec()));
-        assert_eq!(keystroke_to_bytes_legacy(&ks("end")), Some(b"\x1b[F".to_vec()));
-        assert_eq!(keystroke_to_bytes_legacy(&ks("pageup")), Some(b"\x1b[5~".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes_legacy(&ks("escape")),
+            Some(b"\x1b".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes_legacy(&ks("up")),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes_legacy(&ks("down")),
+            Some(b"\x1b[B".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes_legacy(&ks("right")),
+            Some(b"\x1b[C".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes_legacy(&ks("left")),
+            Some(b"\x1b[D".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes_legacy(&ks("home")),
+            Some(b"\x1b[H".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes_legacy(&ks("end")),
+            Some(b"\x1b[F".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes_legacy(&ks("pageup")),
+            Some(b"\x1b[5~".to_vec())
+        );
         assert_eq!(
             keystroke_to_bytes_legacy(&ks("pagedown")),
             Some(b"\x1b[6~".to_vec())
         );
-        assert_eq!(keystroke_to_bytes_legacy(&ks("delete")), Some(b"\x1b[3~".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes_legacy(&ks("delete")),
+            Some(b"\x1b[3~".to_vec())
+        );
     }
 
     #[test]
@@ -3290,7 +3324,10 @@ mod keystroke_tests {
 
     #[test]
     fn 印字可能文字はkey_charをそのまま送る() {
-        assert_eq!(keystroke_to_bytes_legacy(&ks_char("a", "a")), Some(b"a".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes_legacy(&ks_char("a", "a")),
+            Some(b"a".to_vec())
+        );
         assert_eq!(
             keystroke_to_bytes_legacy(&ks_char("space", " ")),
             Some(b" ".to_vec())

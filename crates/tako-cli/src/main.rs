@@ -429,9 +429,7 @@ fn send_request(request: Request) -> Result<Value, String> {
 /// 操作エラーはフォールバックせずそのまま返す。どちらの情報源も無ければ「tako の外」
 fn send_request_via(request: Request, origin: Option<&str>) -> Result<Value, String> {
     let env_pair = match (std::env::var("TAKO_SOCKET"), std::env::var("TAKO_TOKEN")) {
-        (Ok(socket), Ok(token)) if !socket.is_empty() && !token.is_empty() => {
-            Some((socket, token))
-        }
+        (Ok(socket), Ok(token)) if !socket.is_empty() && !token.is_empty() => Some((socket, token)),
         _ => None,
     };
     let env_failure = match &env_pair {

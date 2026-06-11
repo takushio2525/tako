@@ -348,7 +348,12 @@ mod tests {
         let mut s = OscScanner::new();
         let events = scan_all(
             &mut s,
-            &[b"ls\r\n\x1b]13", b"3;C", b"\x07echo\x1b]7;file:", b"///tmp\x07"],
+            &[
+                b"ls\r\n\x1b]13",
+                b"3;C",
+                b"\x07echo\x1b]7;file:",
+                b"///tmp\x07",
+            ],
         );
         assert_eq!(
             events,

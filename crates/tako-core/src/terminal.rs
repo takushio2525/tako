@@ -621,7 +621,7 @@ mod tests {
     #[test]
     fn ホイールは端末モードで出し分ける() {
         let base = TermMode::default(); // ALTERNATE_SCROLL を含む
-        // 通常画面 → 自前スクロールバック
+                                        // 通常画面 → 自前スクロールバック
         assert_eq!(wheel_action(base, 3, 0, 0), WheelAction::ScrollDisplay(3));
         // alternate screen + alternate scroll → 矢印キー × 行数
         let alt = base | TermMode::ALT_SCREEN;
@@ -666,7 +666,10 @@ mod tests {
     #[test]
     fn 状態の集約はfailedを最優先する() {
         use CommandState::*;
-        assert_eq!(CommandState::aggregate([Idle, Running, Failed(2)]), Failed(2));
+        assert_eq!(
+            CommandState::aggregate([Idle, Running, Failed(2)]),
+            Failed(2)
+        );
         assert_eq!(CommandState::aggregate([Unknown, Idle, Running]), Running);
         assert_eq!(CommandState::aggregate([Unknown, Idle]), Idle);
         assert_eq!(CommandState::aggregate([]), Unknown);

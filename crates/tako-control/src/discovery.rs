@@ -43,7 +43,10 @@ pub fn info_path() -> Option<PathBuf> {
 /// 接続情報を書き出す（アプリ起動時に呼ぶ）。tmp へ書いて rename する（読み手と競合しない）
 pub fn write(info: &ControlInfo) -> io::Result<PathBuf> {
     let path = info_path().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::Unsupported, "データディレクトリを解決できない")
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "データディレクトリを解決できない",
+        )
     })?;
     write_to(&path, info)?;
     Ok(path)
