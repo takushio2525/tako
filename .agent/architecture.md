@@ -128,7 +128,8 @@ TerminalSession がシェルを spawn する際に注入する:
 - 単一バイナリ `tako`。`TAKO_SOCKET` + `TAKO_TOKEN` を読んで IPC サーバーに JSON-RPC で接続
 - pane 指定省略時は `TAKO_PANE_ID` を呼び出し元として使う（FR-2.2.7）
 - `TAKO_SOCKET` が無ければ「tako の外で実行されている」エラー（FR-2.2.8）
-- サブコマンド: `split` / `send` / `focus` / `list` / `read` / `close` / `title`
+- サブコマンド: `split` / `send` / `focus` / `list` / `read` / `close` / `title` /
+  `resize` / `layout`（レイアウト操作の要件カタログは FR-2.5）
 - IPC プロトコルは MCP ツールと同じ操作セットに 1:1 対応させ、実装を共有する
 
 ### Layer 2: 内蔵 MCP サーバー
@@ -136,7 +137,14 @@ TerminalSession がシェルを spawn する際に注入する:
 - control/ 内で起動し、`TAKO_MCP_URL`（+ `TAKO_TOKEN`）で公開
 - トランスポートは Streamable HTTP（localhost バインド）を第一候補（Phase 3 で確定）
 - 公開ツール（案）: `tako_split_pane` / `tako_send_input` / `tako_read_pane` /
-  `tako_focus_pane` / `tako_list_panes` / `tako_set_title`
+  `tako_focus_pane` / `tako_list_panes` / `tako_set_title` /
+  `tako_close_pane` / `tako_resize_pane` / `tako_apply_layout`（均等化・最大化等のプリセット）/
+  `tako_get_pane`（個別ペインの状態取得）
+- ツールセットは **FR-2.5（AI レイアウト操作セット）**を網羅する。
+  《AI での開発がやりやすく、かつ AI が開発をアシストできる》が設計方針:
+  エージェントが自分の作業ペインを片付けたり、成果物提示のためにレイアウトを
+  整えたりできるよう、読み取り（ツリー構造 + ジオメトリ）と操作を対で公開する。
+  各操作のセマンティクスは tako-core の PaneTree API と 1:1 対応させる
 - 接続トークンから呼び出し元ペインを特定し、**操作スコープのデフォルトを同タブ内に制限**（FR-2.3.3）
 - エージェント側の自動発見方式（mcp.json の自動生成 or 各エージェント CLI の規約への追従）は
   Phase 3 で詰める。Claude Code を最初のリファレンス対象とする
