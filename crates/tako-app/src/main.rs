@@ -591,6 +591,12 @@ impl TakoApp {
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         if event.pressed_button != Some(MouseButton::Left) {
+            // ウィンドウ外でボタンが離されると MouseUp が届かないことがある。
+            // 取り残したドラッグ・選択状態はここで畳む（残留すると以後どこを
+            // 左ドラッグしてもリサイズが発火し「当たり判定が広がった」ように見える）
+            if self.dragging_border.take().is_some() | self.selecting.take().is_some() {
+                cx.notify();
+            }
             return;
         }
         // 境界ドラッグ中は分割比率を更新（PTY リサイズは次の render の追従に任せる）
@@ -1748,6 +1754,41 @@ mod self_test {
                 (drag_width - 0.3).abs() < 0.02 && drag_cleared,
                 "境界ドラッグでリサイズ",
             );
+
+            // 5c. 【回帰】ウィンドウ外リリース等で MouseUp を取りこぼしても、ボタン非押下の
+            //     移動でドラッグ状態が畳まれる（残留すると当たり判定が広がったように見える）
+            let stale_cleared = window
+                .update(cx, |app, win, cx| {
+                    let vp = win.viewport_size();
+                    let area_w = f32::from(vp.width);
+                    let area_h = f32::from(vp.height) - TAB_BAR_HEIGHT;
+                    let border_rect = Rect::new(0.0, TAB_BAR_HEIGHT, area_w, area_h);
+                    let border = app
+                        .workspace
+                        .active_tab()
+                        .tree()
+                        .borders(border_rect)
+                        .into_iter()
+                        .find(|b| b.axis == SplitAxis::Horizontal)
+                        .expect("縦境界が 1 本あるはず");
+                    // MouseUp を挟まずドラッグ状態だけ残す（ウィンドウ外リリースの再現）
+                    app.dragging_border = Some(DragBorder {
+                        index: border.index,
+                        axis: border.axis,
+                        area: border.area,
+                    });
+                    app.on_mouse_move(
+                        &MouseMoveEvent {
+                            position: point(px(10.0), px(TAB_BAR_HEIGHT + 10.0)),
+                            pressed_button: None,
+                            modifiers: Modifiers::default(),
+                        },
+                        cx,
+                    );
+                    app.dragging_border.is_none()
+                })
+                .unwrap_or(false);
+            check(stale_cleared, "取り残しドラッグ状態は非押下移動で畳まれる");
 
             // 6. cmd-w でフォーカスペインを閉じる
             press(any, cx, "cmd-w");
