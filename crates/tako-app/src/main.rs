@@ -777,6 +777,19 @@ impl TakoApp {
             );
         }
 
+        // role / title バッジ（FR-2.1.3）。`tako title` / MCP で設定されたときだけ右上に重ねる
+        let badge_label = self
+            .workspace
+            .active_tab()
+            .tree()
+            .get(pane_id)
+            .and_then(|p| match (p.title(), p.role()) {
+                (Some(t), Some(r)) => Some(format!("{t} · {r}")),
+                (Some(t), None) => Some(t.to_string()),
+                (None, Some(r)) => Some(r.to_string()),
+                (None, None) => None,
+            });
+
         let screen = self.terminals.get(&pane_id).map(|s| s.screen(&theme));
 
         let lines: Vec<_> = screen
@@ -847,6 +860,18 @@ impl TakoApp {
                 this.on_pane_scroll(pane_id, event, cx);
             }))
             .children(lines)
+            .children(badge_label.map(|label| {
+                div()
+                    .absolute()
+                    .top(px(2.0))
+                    .right(px(6.0))
+                    .px_1()
+                    .rounded_sm()
+                    .bg(rgba(theme.tab_bar_background))
+                    .text_size(px(10.0))
+                    .text_color(hsla(theme.accent))
+                    .child(SharedString::from(truncate(&label, 32)))
+            }))
     }
 }
 

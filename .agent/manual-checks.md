@@ -41,6 +41,16 @@
 - [ ] 端まで引いても潰れない（MIN_SHARE/MAX_SHARE=0.1/0.9 でクランプ）
 - [ ] 境界ハンドル上でのドラッグは選択（copy-on-select）を誤発火しない
 
+## role / title バッジ表示（FR-2.1.3、Phase 3 残）
+
+role / title の設定・取得自体はセルフテスト（`tako title / role 設定`）で機械検証済み。
+バッジの見た目は目視で確認:
+
+- [ ] `tako title --role worker-1 REVIEWER` → ペイン右上に「REVIEWER · worker-1」バッジが出る
+- [ ] role のみ / title のみ設定でもバッジが出る（両方未設定なら出ない）
+- [ ] バッジがターミナル 1 行目の文字と重なっても読める（タブバー背景色の下地）
+- [ ] バッジ上のクリックでもペインフォーカス・選択が通常どおり動く
+
 ## .app バンドル（Phase 3.5）
 
 `scripts/build-app.sh --verify` の機械検証（バンドル版バイナリでのセルフテスト 39 項目）に
