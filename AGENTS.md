@@ -10,7 +10,7 @@ iTerm2 + Zed の思想で Zed 級に高速・軽量。macOS 先行、Windows 対
 
 - 目的: AI エージェント（Claude Code 等）+ 子エージェント + dev サーバーを「1 グループ = 1 タブ」で集約監視する
 - 対象: AI エージェントで開発する開発者。**ただしゼロコンフィグで一般ユーザーが使えることが最優先の設計原則**
-- 状況: **Phase 0 完了 → Phase 1（macOS MVP）実装中。ワークスペース・PaneTree・最小ターミナル・CI まで完了**
+- 状況: **Phase 1（macOS MVP）/ Phase 2（Layer 1 CLI + 環境変数注入）完了。次は Phase 3（内蔵 MCP サーバー）**
 
 ## 技術スタック
 
@@ -30,9 +30,9 @@ tako/
 ├── README.md / LICENSE     ← 人間向け・Apache-2.0
 ├── crates/
 │   ├── tako-core/          ← ドメインモデル（PaneTree / Workspace / TerminalSession、GPUI 非依存）
-│   ├── tako-control/       ← 制御プレーン（IPC / MCP / 検知。Phase 2 までスタブ）
+│   ├── tako-control/       ← 制御プレーン（IPC + dispatch 実装済み。MCP / 検知は Phase 3/4）
 │   ├── tako-app/           ← GPUI バイナリ（GPUI 依存はここだけ）
-│   └── tako-cli/           ← Layer 1 CLI（Phase 2 までスタブ）
+│   └── tako-cli/           ← Layer 1 CLI（`tako` コマンド。IPC 経由でペイン / タブを操作）
 ├── poc/                    ← Phase 0 の使い捨て検証コード（品質基準の対象外）
 └── .github/workflows/      ← CI（macOS / Windows ビルド + テスト）
 ```
@@ -50,15 +50,17 @@ tako/
 - **設計原則 5「AI フルコントロール」は不変条件**: すべての機能は追加した時点で MCP / CLI から
   操作可能でなければならない（UI でできることはすべて AI からもできる）。新機能の Definition of
   Done に「対応する MCP / CLI 操作の提供」を含め、例外は理由を `.agent/requirements.md` に明記する
-- 制御プレーン実装前（Phase 2 まで）も、新機能の操作ロジックは tako-core の操作 API として実装し、
-  将来の MCP / CLI 公開を前提とした構造にする（UI 層に閉じたロジックを作らない）
+- 新機能の操作ロジックは tako-core の操作 API として実装し、`tako-control::dispatch`
+  （protocol + ControlHost）へ 1:1 で載せる（UI 層に閉じたロジックを作らない）。
+  Phase 2 以降、CLI はこの経路で操作できる。MCP 公開（Phase 3）も同じ dispatch を呼ぶ
 
 ## コマンド
 
 | 操作 | コマンド |
 |---|---|
 | dev（最小ターミナル起動） | `cargo run -p tako-app` |
-| セルフテスト起動（入力経路の機械検証） | `TAKO_SELF_TEST=1 cargo run -p tako-app` |
+| セルフテスト起動（入力経路 + CLI e2e の機械検証） | `TAKO_SELF_TEST=1 cargo run -p tako-app` |
+| `tako` CLI ビルド | `cargo build -p tako-cli`（バイナリは `target/debug/tako`） |
 | build | `cargo build --workspace` |
 | lint | `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` |
 | test | `cargo test --workspace` |

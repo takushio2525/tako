@@ -6,30 +6,36 @@
 
 ## 現在の対象
 
-- 何を / どこを: Phase 1（macOS MVP）実装完了。次は Phase 2（Layer 1 — CLI と環境変数注入）
-- ステータス: Phase 2 未着手。Phase 1 の常用フィードバック収集中
+- 何を / どこを: Phase 2（Layer 1 — CLI と環境変数注入）実装完了。次は Phase 3（内蔵 MCP サーバー）
+- ステータス: Phase 3 未着手。CI（macOS / Windows）緑確認待ちは push 直後のみ
 - 最終更新: 2026-06-11
 
 ## 直近の観点・指摘
 
-- **設計原則 5「AI フルコントロール」は開発不変条件に昇格**（AGENTS.md 必須ルール参照）。
-  新機能 = tako-core の操作 API + 将来の MCP/CLI 公開前提の構造、を徹底する
-- **描画色・フォントは tako-core の Theme を一枚通す**（FR-4）。UI への直書き禁止
-- tako-app のキーバインドは iTerm2 踏襲（cmd+D 分割 / cmd+W close / cmd+alt+矢印フォーカス /
-  ctrl+cmd+矢印リサイズ / cmd+T・cmd+数字タブ / cmd+C/V）。cmd+W は「ペイン → タブ → アプリ」の順
-- `TAKO_SELF_TEST=1 cargo run -p tako-app` で 13 項目を機械検証できる（入力 / 分割 / フォーカス /
-  リサイズ / クローズ / タブ / ANSI 色 / スクロールバック / ペースト / 選択コピー / PTY リサイズ）
-- スクリーン抽出は `tako-core::screen::snapshot`（Term 直接受けの純関数、PTY なしでテスト可能）
-- gpui ハマりどころ（font-kit feature 必須等）は `poc/README.md` / `architecture.md` 参照（変わらず必読）
+- **操作ディスパッチは `tako-control::dispatch`（ControlHost trait）に一元化済み**。
+  Phase 3 の MCP サーバーは新しい操作実装を書かず、この dispatch を呼ぶだけにする（設計原則 5）
+- IPC ワイヤ形式: 1 行 1 JSON の JSON-RPC 2.0 サブセット + `token` フィールド
+  （`crates/tako-control/src/protocol.rs` が正）。UDS は `$TMPDIR/tako-<pid>-<seq>.sock`（0600）
+- `tako` CLI: split / send / focus / list / read / close / title / resize / equalize /
+  tab new・select・move-pane。`--pane` 省略時は `TAKO_PANE_ID` で呼び出し元を自動特定
+- 環境変数注入は tako-app の `spawn_session` で実施（PANE/TAB/SOCKET/TOKEN。MCP_URL は Phase 3）
+- 安全制約: CLI からの close は「最後のタブの最後のペイン」を拒否（アプリ終了は UI のみ）
+- セルフテストは 29 項目（1〜13: ターミナル基盤、14〜29: 制御プレーン e2e。
+  ペイン内シェルから実 `tako` バイナリを叩いて検証する）
+- Windows named pipe は Phase 6 の TODO（`architecture.md`「IPC トランスポート」節に検討事項）
+- gpui ハマりどころ（font-kit feature 必須等）は `poc/README.md` / `architecture.md` 参照（必読）
 
 ## 現フェーズで Read すべき設計書
 
-- Phase 2 着手時: `.agent/architecture.md`「制御プレーン」節と `requirements.md` FR-2.1〜2.2 を
-  Read してから実装。IPC の操作セマンティクスは `crates/tako-core/src/pane_tree.rs` の API と 1:1
+- Phase 3 着手時: `.agent/architecture.md`「Layer 2」「IPC トランスポート（Phase 2 実装メモ）」節と
+  `requirements.md` FR-2.3 / FR-2.5 を Read してから実装。
+  MCP は `tako-control` の protocol / dispatch を共有し、トランスポート（Streamable HTTP
+  localhost が第一候補）と `TAKO_MCP_URL` 注入・Claude Code 設定ゼロ接続だけを足す
 
 ## 未解決・次の一手
 
-- [ ] Phase 2: `TAKO_PANE_ID` 等の環境変数注入（TerminalSession::spawn 拡張）→ IPC サーバー → `tako` CLI
+- [ ] Phase 3: MCP サーバー内蔵（dispatch 共有）→ `TAKO_MCP_URL` 注入 → Claude Code 設定ゼロ
+      接続の実証 → role / 状態表示 UI（FR-2.1.3〜2.1.4）
 - [ ] Phase 1 残骨格: ドラッグでのペイン境界リサイズ・IME 変換中表示は未実装（常用しながら判断）
 - [ ] Phase 5 送り: Web ビューペイン（FR-3.8）・注釈レイヤ（FR-2.6）・diff ビューア（FR-3.9）・
       提示系（FR-2.7）・フィードバック（FR-2.8）・cmd+K（FR-2.9）

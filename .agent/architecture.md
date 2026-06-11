@@ -121,17 +121,39 @@ TerminalSession がシェルを spawn する際に注入する:
 | `TAKO_PANE_ID` | 呼び出し元ペインの ID |
 | `TAKO_TAB_ID` | 所属タブの ID |
 | `TAKO_SOCKET` | IPC エンドポイント（macOS: Unix domain socket パス、Windows: named pipe 名） |
-| `TAKO_MCP_URL` | 内蔵 MCP サーバーの接続先（Layer2 自動発見用） |
+| `TAKO_MCP_URL` | 内蔵 MCP サーバーの接続先（Layer2 自動発見用。**Phase 3 で注入開始**） |
 | `TAKO_TOKEN` | 接続認証トークン（セッション毎に生成。外部プロセスの接続拒否に使う） |
 
-### Layer 1: CLI（`tako-cli`）
+Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`（`SpawnOptions.env`）
+経由で注入済み（tako-app の `spawn_session`）。
+
+### Layer 1: CLI（`tako-cli`）→ ✅ 実装済み（Phase 2、2026-06-11）
 
 - 単一バイナリ `tako`。`TAKO_SOCKET` + `TAKO_TOKEN` を読んで IPC サーバーに JSON-RPC で接続
 - pane 指定省略時は `TAKO_PANE_ID` を呼び出し元として使う（FR-2.2.7）
 - `TAKO_SOCKET` が無ければ「tako の外で実行されている」エラー（FR-2.2.8）
 - サブコマンド: `split` / `send` / `focus` / `list` / `read` / `close` / `title` /
-  `resize` / `layout`（レイアウト操作の要件カタログは FR-2.5）
+  `resize` / `equalize` / `tab new` / `tab select` / `tab move-pane`（カタログは FR-2.5）
 - IPC プロトコルは MCP ツールと同じ操作セットに 1:1 対応させ、実装を共有する
+
+### IPC トランスポート（Phase 2 実装メモ）
+
+- ワイヤ形式: **1 行 1 JSON の JSON-RPC 2.0 サブセット + `token` フィールド拡張**
+  （`crates/tako-control/src/protocol.rs` が正）。操作セットは FR-2.5 と 1:1
+- **操作のディスパッチは `tako-control::dispatch`（`ControlHost` trait）に一元化**。
+  tako-app の IPC 受信ループと Phase 3 の MCP サーバーが**同じ dispatch を呼ぶ**ことで、
+  設計原則 5（UI でできることはすべて AI からもできる）のセマンティクスを一箇所に保つ
+- unix: `$TMPDIR/tako-<pid>-<seq>.sock`（パーミッション 0600）+ 32 バイト CSPRNG トークン
+  （getrandom）。accept スレッド + 接続毎スレッドのブロッキング IO で受け、リクエストは
+  futures channel で UI スレッドへ渡して dispatch する（tokio を持ち込まない方針を維持）
+- CLI / MCP からの `close` は「最後のタブの最後のペイン」を拒否する
+  （アプリ終了に等しい操作は UI の cmd+W のみ。FR-2.5.9 の安全性方針）
+- **TODO(Phase 6): Windows named pipe**。`IpcServer::start` と CLI の transport は
+  `#[cfg(windows)]` でスタブ化済み（サーバー起動失敗でもアプリは IPC なしで継続する）。
+  実装時の検討事項:
+  - パイプ名規約（`\\.\pipe\tako-<pid>` 想定）を `TAKO_SOCKET` に入れる
+  - アクセス制御: UDS の 0600 に相当する DACL（同一ユーザー限定）+ トークン認証の二段
+  - ConPTY 環境での env 注入は alacritty_terminal の `tty::Options::env` 依存のため実機確認
 
 ### Layer 2: 内蔵 MCP サーバー
 

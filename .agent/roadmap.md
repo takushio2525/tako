@@ -47,16 +47,21 @@ GPUI バージョン戦略は **zed リポ git rev 固定**（`architecture.md` 
 **Exit Criteria**: 日常のターミナルとして自分が常用できる（macOS）。
 → 実装・機械検証（セルフテスト 13 項目）は完了。常用フィードバックは使いながら Phase 2 以降で拾う。
 
-## Phase 2: Layer 1 — CLI と環境変数注入
+## Phase 2: Layer 1 — CLI と環境変数注入 → ✅ 完了（2026-06-11）
 
-- [ ] `TAKO_PANE_ID` / `TAKO_TAB_ID` / `TAKO_SOCKET` / `TAKO_TOKEN` 注入（FR-2.1.1）
-- [ ] IPC サーバー（Unix domain socket + JSON-RPC）
-- [ ] `tako split` / `send` / `focus` / `list`（FR-2.2.1〜2.2.4）
-- [ ] `tako read` / `close` / `title`（FR-2.2.5〜2.2.6）
-- [ ] 呼び出し元ペイン自動特定とアプリ外実行時のエラー（FR-2.2.7〜2.2.8）
+- [x] `TAKO_PANE_ID` / `TAKO_TAB_ID` / `TAKO_SOCKET` / `TAKO_TOKEN` 注入（FR-2.1.1。
+      `TAKO_MCP_URL` は Phase 3 の MCP 実装時に注入開始）
+- [x] IPC サーバー（Unix domain socket + JSON-RPC + トークン認証。操作ディスパッチは
+      `tako-control::dispatch` に一元化し Phase 3 の MCP と共有する。
+      Windows named pipe は Phase 6 の TODO → `architecture.md`「IPC トランスポート」節）
+- [x] `tako split` / `send` / `focus` / `list`（FR-2.2.1〜2.2.4）
+- [x] `tako read` / `close` / `title`（FR-2.2.5〜2.2.6）。加えて FR-2.5 から
+      `resize` / `equalize` / `tab new・select・move-pane`（FR-2.5.6〜7 / 2.5.10）を前倒し実装
+- [x] 呼び出し元ペイン自動特定とアプリ外実行時のエラー（FR-2.2.7〜2.2.8）
 
 **Exit Criteria**: シェルスクリプトから同タブ内にペインを生やしてコマンドを流し込める。
-tmux 系オーケストレーター（spawn-worker.sh 等）が CLI 差し替えだけで動く。
+→ セルフテスト 29 項目（ペイン内シェルから実 `tako` CLI を叩く e2e 含む）で機械検証済み。
+tmux 系オーケストレーターの実地差し替えは Phase 3 以降の常用で確認する。
 
 ## Phase 3: Layer 2 — 内蔵 MCP サーバー（最大の差別化点）
 
@@ -65,7 +70,8 @@ tmux 系オーケストレーター（spawn-worker.sh 等）が CLI 差し替え
 - [ ] 呼び出し元ペイン特定と同タブスコープ制限（FR-2.3.3）
 - [ ] Claude Code をリファレンスとした設定ゼロ接続の実証
 - [ ] ペインの role ラベルと状態表示 UI（FR-2.1.3〜2.1.4）
-- [ ] FR-2.5 レイアウト操作セットの拡充（リサイズ・レイアウトプリセット・タブ操作 FR-2.5.10。
+- [ ] FR-2.5 レイアウト操作セットの MCP 公開（リサイズ・均等化・タブ操作 FR-2.5.10 は
+      Phase 2 で CLI / dispatch 実装済み → MCP ツールとして公開するだけ。
       ファイル/URL 系 FR-2.5.11〜12 は Phase 5 のペイン種別実装後）
 
 **Exit Criteria**: tako 内で Claude Code を起動し、**何も設定せずに**

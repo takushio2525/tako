@@ -46,3 +46,12 @@
   色・カーソル・選択コピペ・PTY 追従。セルフテスト 13 項目緑
 - 関連コミット: `10ddd3d` `7d1bda3` `9f433e8` `0037034` `092e0a6` `e346cfe` `b84ae6b`
 - 次: Phase 2 — 環境変数注入 + IPC + `tako` CLI
+
+## 2026-06-11（Phase 2 完了）
+
+- Layer 1 実装: TAKO_* 環境変数注入 + IPC サーバー（UDS 0600 + CSPRNG トークン認証）+
+  `tako` CLI（split/send/focus/list/read/close/title/resize/equalize/tab 系）。
+  操作ディスパッチは tako-control::dispatch に一元化（Phase 3 の MCP も同じ層を呼ぶ）。
+  セルフテスト 29 項目緑（ペイン内シェルから実 CLI を叩く e2e 含む）
+- 関連コミット: `3bfdedc` `14e16b2` `0b5858f` `83d17ad` + ドキュメント反映
+- 次: Phase 3 — 内蔵 MCP サーバー（dispatch 共有、TAKO_MCP_URL、Claude Code 設定ゼロ接続）
