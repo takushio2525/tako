@@ -1202,7 +1202,12 @@ impl EntityInputHandler for TakoApp {
         let cell = self.cell_size?;
         let x_offset = match self.ime.as_ref() {
             Some(ime) => {
-                let end = utf16_to_byte_offset(&ime.text, range_utf16.start);
+                let start = clamp_ime_range_start(
+                    range_utf16.start,
+                    ime.text.encode_utf16().count(),
+                    ime.selected_utf16.as_ref(),
+                );
+                let end = utf16_to_byte_offset(&ime.text, start);
                 self.ime_prefix_width(&ime.text[..end], window)
             }
             None => px(0.0),
@@ -1234,6 +1239,23 @@ fn truncate(s: &str, max_chars: usize) -> String {
 }
 
 /// GPUI の Keystroke を端末入力バイト列へ変換する
+/// `firstRectForCharacterRange` の range 先頭を擬似ドキュメント（marked text のみ・
+/// 0 起点）内へ解釈する。macOS のライブ変換は確定済みテキストを含む**文書全体基準**の
+/// オフセットを渡してくることがあり、そのまま使うと候補ウィンドウが確定分の幅だけ
+/// 右へずれ続ける（打ち進めるほど離れる）。範囲外のオフセットは注目文節の先頭
+/// （無ければ末尾 = 挿入点）として扱う
+fn clamp_ime_range_start(
+    start_utf16: usize,
+    marked_utf16_len: usize,
+    selected: Option<&Range<usize>>,
+) -> usize {
+    if start_utf16 <= marked_utf16_len {
+        start_utf16
+    } else {
+        selected.map(|r| r.start).unwrap_or(marked_utf16_len)
+    }
+}
+
 /// 修飾キーのエンコード（xterm / kitty 共通: 1 + shift | alt<<1 | ctrl<<2 | super<<3）
 fn encode_modifiers(m: &Modifiers) -> u8 {
     1 + (m.shift as u8)
@@ -2581,10 +2603,19 @@ mod self_test {
                         window,
                         cx,
                     );
+                    // 文書全体基準のオフセット（ライブ変換）は文節先頭と同じ位置に出る
+                    // （回帰: 打ち進めるほど候補ウィンドウが右へ離れる）
+                    let bounds_oob = app.bounds_for_range(
+                        1000..1004,
+                        Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))),
+                        window,
+                        cx,
+                    );
                     // "にほんご" は UTF-16 で 4 コード単位
                     app.marked_text_range(window, cx) == Some(0..4)
                         && app.ime.as_ref().map(|i| i.text.as_str()) == Some("にほんご")
                         && bounds.is_some()
+                        && bounds_oob.map(|b| b.origin) == bounds.map(|b| b.origin)
                 })
                 .unwrap_or(false);
             check(marked_ok, "IME marked text の保持と位置出し");
@@ -2994,6 +3025,17 @@ mod keystroke_tests {
             Some(b"\x1b[6~".to_vec())
         );
         assert_eq!(keystroke_to_bytes_legacy(&ks("delete")), Some(b"\x1b[3~".to_vec()));
+    }
+
+    #[test]
+    fn imeのrange先頭は擬似ドキュメント内へ解釈する() {
+        // 正常系（marked text 内のオフセット）はそのまま
+        assert_eq!(clamp_ime_range_start(0, 4, None), 0);
+        assert_eq!(clamp_ime_range_start(4, 4, Some(&(2..4))), 4);
+        // 文書全体基準のオフセット（ライブ変換）は注目文節の先頭へ
+        assert_eq!(clamp_ime_range_start(100, 4, Some(&(2..4))), 2);
+        // 注目文節が無ければ末尾（挿入点）へ
+        assert_eq!(clamp_ime_range_start(100, 4, None), 4);
     }
 
     #[test]
