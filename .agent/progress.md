@@ -106,3 +106,15 @@
   外部長寿命プロセスから手作業ゼロ接続を実機検証。MCP ブリッジは env あり時のみ
   フォールバック（tako 外 0 ツール維持）。セルフテスト 59 項目緑
 - 次: Phase 4 後半（listen ポート検知・提案チップ・集約センター FR-2.10）
+
+## 2026-06-12（常用フィードバック一括対応）
+
+- スクロールバック出し分け（wheel_action: mouse reporting 転送 / alt screen 矢印変換 /
+  通常画面自前）+ スクロールバー（FR-2.5.13。tako scroll / tako_scroll_pane / list 公開）
+- Shift+Enter（Config.kitty_keyboard 有効化 + CSI u 送出 + 修飾付き機能キーの xterm 形式）、
+  IME 候補位置（ライブ変換の文書全体オフセットを marked 内へ解釈）、全角行の選択座標
+  （shaping ベース cell_at + ScreenLine::cell_cols）、ペイン × ボタン（dispatch 経由）
+- FR-2.12（AI 自動リネーム）を要件登録（実装は次ターン以降）。セルフテスト 69 項目緑
+- 関連コミット: `2e1f718` `6c7ef60` `0693120` `fa18c47` `44f4699` `8fed3ca` 他
+- 残課題: 描画のグリッド不一致（全角 advance ≠ 2 セル）は座標変換のみ吸収、描画は未対応
+- 次: FR-2.12 実装 → Phase 4 後半
