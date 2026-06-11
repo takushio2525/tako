@@ -225,6 +225,21 @@ impl TakoApp {
                     }
                 });
 
+        // 接続情報をファイルへ永続化（FR-2.2.9）。アプリ再起動後も外部の長寿命プロセス
+        // から `tako` CLI が繋ぎ直せるようにする（CLI 側のフォールバック先）
+        if let (Some(ipc), Some(token)) = (&ipc, &token) {
+            let info = tako_control::discovery::ControlInfo {
+                version: 1,
+                pid: std::process::id(),
+                socket: ipc.endpoint().to_string(),
+                token: token.clone(),
+                mcp_url: mcp.as_ref().map(|m| m.url().to_string()),
+            };
+            if let Err(e) = tako_control::discovery::write(&info) {
+                eprintln!("warning: 接続情報ファイルを書き出せない（再起動後の外部接続は環境変数頼みになる）: {e}");
+            }
+        }
+
         let mut app = Self {
             // ルートペインは下の spawn_session でセッションを張る
             workspace: Workspace::new("1", Pane::new(PaneOrigin::User)),
@@ -2606,6 +2621,39 @@ mod self_test {
             wait(cx, 800).await;
             type_text(any, cx, "true", true);
             wait(cx, 500).await;
+
+            // 42. 接続情報の永続化と発見（FR-2.2.9）: 環境変数なしでもファイル発見で
+            //     CLI が繋がる（アプリ再起動後に外部の長寿命プロセスが繋ぎ直す経路と同じ）
+            type_text(
+                any,
+                cx,
+                &format!(
+                    "env -u TAKO_SOCKET -u TAKO_TOKEN -u TAKO_PANE_ID {cli} list >/dev/null \
+                     && echo TAKO-DISC-$((40+2))"
+                ),
+                true,
+            );
+            wait(cx, 1200).await;
+            check(
+                focused_contains(window, cx, "TAKO-DISC-42"),
+                "環境変数なしでファイル発見接続",
+            );
+            // 42b. 古い環境変数からのフォールバック（接続不可 → ファイル、認証失敗 → ファイル）
+            type_text(
+                any,
+                cx,
+                &format!(
+                    "TAKO_SOCKET=/nonexistent.sock {cli} list >/dev/null \
+                     && TAKO_TOKEN=bogus-stale-token {cli} list >/dev/null \
+                     && echo TAKO-STALE-$((40+2))"
+                ),
+                true,
+            );
+            wait(cx, 1200).await;
+            check(
+                focused_contains(window, cx, "TAKO-STALE-42"),
+                "古い環境変数からフォールバック",
+            );
 
             println!("TAKO_APP_SELF_TEST_OK");
             std::process::exit(0);

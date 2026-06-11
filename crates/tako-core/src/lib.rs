@@ -6,6 +6,7 @@
 pub mod osc_tap;
 pub mod pane;
 pub mod pane_tree;
+pub mod paths;
 pub mod screen;
 pub mod shell_integration;
 pub mod tab;

@@ -4,8 +4,10 @@
 //! - dispatch: リクエスト → tako-core ドメイン API の一元ディスパッチャ（設計原則 5）
 //! - ipc: Layer 1 IPC サーバー（Unix domain socket + トークン認証）
 //! - mcp: Layer 2 内蔵 MCP サーバー（エンジン + Streamable HTTP。ipc と dispatch を共有）
-//! - detect: パッシブ検知（Layer 3。OSC 7/133・listen ポート検知。Phase 4 で実装）
+//! - discovery: 接続情報（ソケット・トークン）の永続化と発見（FR-2.2.9）
+//! - detect: パッシブ検知（Layer 3。listen ポート検知は Phase 4 後半で実装）
 
+pub mod discovery;
 pub mod dispatch;
 pub mod ipc;
 pub mod mcp;

@@ -7,8 +7,9 @@
 //! 無効化は `TAKO_NO_SHELL_INTEGRATION=1`（FR-2.4.4 の設定 UI までの暫定）。
 //! Windows（PowerShell）は Phase 6 で対応する。
 
-use std::path::PathBuf;
 use std::sync::OnceLock;
+
+use crate::paths::data_dir;
 
 const ZSH_ZSHENV: &str = include_str!("../shell-integration/zshenv.zsh");
 const BASH_SCRIPT: &str = include_str!("../shell-integration/tako.bash");
@@ -74,35 +75,10 @@ fn write_scripts() -> std::io::Result<Vec<(String, String)>> {
     Ok(env)
 }
 
-/// tako のデータディレクトリ（スクリプト書き出し先）
-fn data_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        std::env::var_os("HOME")
-            .filter(|h| !h.is_empty())
-            .map(|h| PathBuf::from(h).join("Library/Application Support/tako"))
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        std::env::var_os("XDG_DATA_HOME")
-            .filter(|d| !d.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .filter(|h| !h.is_empty())
-                    .map(|h| PathBuf::from(h).join(".local/share"))
-            })
-            .map(|d| d.join("tako"))
-    }
-    #[cfg(windows)]
-    {
-        // Phase 6（PowerShell 統合）で対応
-        None
-    }
-}
-
 #[cfg(all(test, unix))]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]

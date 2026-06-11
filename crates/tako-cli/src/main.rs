@@ -21,9 +21,10 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
 use tako_control::protocol::{Axis, Direction, Request};
 
-/// tako の外で実行されたときのエラー（FR-2.2.8）
-const OUTSIDE_TAKO: &str =
-    "tako アプリ内のターミナルで実行してください（TAKO_SOCKET / TAKO_TOKEN が未設定）";
+/// tako の外で実行されたときのエラー（FR-2.2.8）。
+/// 接続情報は環境変数 → 発見ファイル（FR-2.2.9）の順で解決した上での不在を意味する
+const OUTSIDE_TAKO: &str = "tako アプリへの接続情報が無い（TAKO_SOCKET / TAKO_TOKEN 未設定・\
+    接続情報ファイルも無し）。tako アプリを起動するか、tako 内のターミナルで実行してください";
 
 #[derive(Parser)]
 #[command(
@@ -230,9 +231,14 @@ fn main() -> ExitCode {
 fn mcp_serve() -> Result<(), String> {
     use std::io::{BufRead, Write};
 
-    let socket = std::env::var("TAKO_SOCKET").ok();
-    let token = std::env::var("TAKO_TOKEN").ok();
-    let connected = socket.is_some() && token.is_some();
+    // ツール公開の判定は**環境変数のみ**で行う（発見ファイルは見ない）。
+    // tako の外で起動された Claude セッションへツールを公開しない方針（FR-2.3.2 の
+    // 「tako 外で 0 ツール」）を保つため。tako 内で起動された長寿命ブリッジが
+    // アプリ再起動で stale になった場合のみ、exec 時にファイルへフォールバックする
+    let connected = matches!(
+        (std::env::var("TAKO_SOCKET"), std::env::var("TAKO_TOKEN")),
+        (Ok(s), Ok(t)) if !s.is_empty() && !t.is_empty()
+    );
     let caller = caller_pane();
 
     let stdin = std::io::stdin();
@@ -245,11 +251,10 @@ fn mcp_serve() -> Result<(), String> {
         let response = match serde_json::from_str::<serde_json::Value>(&line) {
             Ok(message) => {
                 let mut exec = |request: Request| -> Result<Value, String> {
-                    match (socket.as_deref(), token.as_deref()) {
-                        (Some(socket), Some(token)) => {
-                            transport::roundtrip(socket, token, request, Some("mcp"))
-                        }
-                        _ => Err(OUTSIDE_TAKO.into()),
+                    if connected {
+                        send_request_via(request, Some("mcp"))
+                    } else {
+                        Err(OUTSIDE_TAKO.into())
                     }
                 };
                 let mut session = tako_control::mcp::McpSession {
@@ -390,9 +395,44 @@ fn build_request(command: &Command) -> Result<Request, String> {
 
 /// 環境変数から接続情報を読み、1 リクエストを往復させる
 fn send_request(request: Request) -> Result<Value, String> {
-    let socket = std::env::var("TAKO_SOCKET").map_err(|_| OUTSIDE_TAKO.to_string())?;
-    let token = std::env::var("TAKO_TOKEN").map_err(|_| OUTSIDE_TAKO.to_string())?;
-    transport::roundtrip(&socket, &token, request, None)
+    send_request_via(request, None)
+}
+
+/// 接続情報の解決とフォールバック（FR-2.2.9）。
+/// ①環境変数（`TAKO_SOCKET` / `TAKO_TOKEN`）で試行し、接続不可・認証失敗
+/// （= アプリ再起動で env が古い）なら ②発見ファイル（`discovery`）で再試行する。
+/// 操作エラーはフォールバックせずそのまま返す。どちらの情報源も無ければ「tako の外」
+fn send_request_via(request: Request, origin: Option<&str>) -> Result<Value, String> {
+    let env_pair = match (std::env::var("TAKO_SOCKET"), std::env::var("TAKO_TOKEN")) {
+        (Ok(socket), Ok(token)) if !socket.is_empty() && !token.is_empty() => {
+            Some((socket, token))
+        }
+        _ => None,
+    };
+    let env_failure = match &env_pair {
+        Some((socket, token)) => {
+            match transport::roundtrip(socket, token, request.clone(), origin) {
+                Ok(value) => return Ok(value),
+                Err(TransportError::Other(message)) => return Err(message),
+                Err(stale) => Some(stale),
+            }
+        }
+        None => None,
+    };
+    // 環境変数と同じ内容のファイルへ再試行しても無意味なので除外する
+    let file_info = tako_control::discovery::read().filter(|info| {
+        env_pair
+            .as_ref()
+            .is_none_or(|(s, t)| (s, t) != (&info.socket, &info.token))
+    });
+    if let Some(info) = file_info {
+        return transport::roundtrip(&info.socket, &info.token, request, origin)
+            .map_err(TransportError::message);
+    }
+    Err(match env_failure {
+        Some(stale) => stale.message(),
+        None => OUTSIDE_TAKO.to_string(),
+    })
 }
 
 fn print_result(command: &Command, result: &Value) {
@@ -419,13 +459,34 @@ fn print_result(command: &Command, result: &Value) {
     }
 }
 
+/// 接続試行の失敗種別。Connect / Auth は「環境変数が古い」可能性があり、
+/// 発見ファイルへのフォールバック対象になる（FR-2.2.9）
+enum TransportError {
+    /// 接続できない（ソケット不在・アプリ停止）
+    Connect(String),
+    /// 認証失敗（トークンが古い = 別インスタンスのもの）
+    Auth(String),
+    /// その他（操作エラー・プロトコルエラー。フォールバックしない）
+    Other(String),
+}
+
+impl TransportError {
+    fn message(self) -> String {
+        match self {
+            TransportError::Connect(m) | TransportError::Auth(m) | TransportError::Other(m) => m,
+        }
+    }
+}
+
 #[cfg(unix)]
 mod transport {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
     use serde_json::Value;
-    use tako_control::protocol::{Request, RequestEnvelope, ResponseEnvelope};
+    use tako_control::protocol::{error_code, Request, RequestEnvelope, ResponseEnvelope};
+
+    use super::TransportError;
 
     /// `origin` は生成主体の自己申告（MCP ブリッジは `Some("mcp")`、CLI 直は `None`）
     pub fn roundtrip(
@@ -433,29 +494,37 @@ mod transport {
         token: &str,
         request: Request,
         origin: Option<&str>,
-    ) -> Result<Value, String> {
-        let stream = UnixStream::connect(socket)
-            .map_err(|e| format!("tako アプリへ接続できない（{socket}: {e}）"))?;
+    ) -> Result<Value, TransportError> {
+        let stream = UnixStream::connect(socket).map_err(|e| {
+            TransportError::Connect(format!("tako アプリへ接続できない（{socket}: {e}）"))
+        })?;
         let mut writer = stream
             .try_clone()
-            .map_err(|e| format!("接続の複製に失敗: {e}"))?;
+            .map_err(|e| TransportError::Other(format!("接続の複製に失敗: {e}")))?;
         let mut envelope = RequestEnvelope::new(1, token, request);
         envelope.origin = origin.map(Into::into);
-        let json =
-            serde_json::to_string(&envelope).map_err(|e| format!("送信の構築に失敗: {e}"))?;
-        writeln!(writer, "{json}").map_err(|e| format!("送信に失敗: {e}"))?;
+        let json = serde_json::to_string(&envelope)
+            .map_err(|e| TransportError::Other(format!("送信の構築に失敗: {e}")))?;
+        writeln!(writer, "{json}")
+            .map_err(|e| TransportError::Other(format!("送信に失敗: {e}")))?;
 
         let mut line = String::new();
         BufReader::new(stream)
             .read_line(&mut line)
-            .map_err(|e| format!("応答の受信に失敗: {e}"))?;
+            .map_err(|e| TransportError::Other(format!("応答の受信に失敗: {e}")))?;
         if line.is_empty() {
-            return Err("tako アプリから応答が返らなかった".into());
+            return Err(TransportError::Other(
+                "tako アプリから応答が返らなかった".into(),
+            ));
         }
-        let response: ResponseEnvelope =
-            serde_json::from_str(&line).map_err(|e| format!("応答を解釈できない: {e}"))?;
+        let response: ResponseEnvelope = serde_json::from_str(&line)
+            .map_err(|e| TransportError::Other(format!("応答を解釈できない: {e}")))?;
         if let Some(error) = response.error {
-            return Err(error.message);
+            return Err(if error.code == error_code::AUTH {
+                TransportError::Auth(error.message)
+            } else {
+                TransportError::Other(error.message)
+            });
         }
         Ok(response.result.unwrap_or(Value::Null))
     }
@@ -468,13 +537,17 @@ mod transport {
     use serde_json::Value;
     use tako_control::protocol::Request;
 
+    use super::TransportError;
+
     pub fn roundtrip(
         _socket: &str,
         _token: &str,
         _request: Request,
         _origin: Option<&str>,
-    ) -> Result<Value, String> {
-        Err("Windows の IPC（named pipe）は未実装（Phase 6 で対応予定）".into())
+    ) -> Result<Value, TransportError> {
+        Err(TransportError::Other(
+            "Windows の IPC（named pipe）は未実装（Phase 6 で対応予定）".into(),
+        ))
     }
 }
 

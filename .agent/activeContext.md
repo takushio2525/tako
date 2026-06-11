@@ -6,14 +6,15 @@
 
 ## 現在の対象
 
-- 何を / どこを: **Phase 3 完全完了 + Phase 4 前半完了**（role/状態表示 UI、OSC 7/133
-  シェル統合、state/cwd の list・MCP 公開、split cwd 継承）。
-  常用クラッシュ 2 件（fd リーク→SIGABRT、境界ドラッグ判定残留）も根治済み。
+- 何を / どこを: **接続情報の永続化（FR-2.2.9）完了**。`control.json`（0600）へ
+  socket/token/mcp_url を書き出し、CLI は env → ファイルの順で解決（接続不可・認証失敗
+  のみフォールバック）。アプリ再起動後も外部長寿命プロセスから手作業ゼロで接続できる
+  ことを実機検証済み。Phase 3 完全完了 + Phase 4 前半（OSC 統合・状態 UI）も完了済み。
   次は Phase 4 後半（listen ポート検知・提案チップ・集約センター）
 - ステータス: push 済み。CI（macOS / Windows）緑確認待ち。
-  /Applications の .app は**状態 UI・シェル統合より前の版** → 次回作業時か常用前に
-  `scripts/build-app.sh --verify --install` で更新すること
-- 最終更新: 2026-06-11（深夜セッション）
+  **ユーザーの常用 tako は要再起動**（検証で control.json が一時上書きされたため、
+  再起動で自インスタンスの情報に復帰 + 全修正入りの新 .app になる）
+- 最終更新: 2026-06-12（深夜セッション）
 
 ## 直近の観点・指摘
 
@@ -35,9 +36,12 @@
 - **UI**: ペイン右上バッジ（title · role + 状態ドット）、タブバーに集約状態ドット
   （`CommandState::aggregate`、Failed=赤 > Running=アクセント）。見た目の手触りは
   manual-checks.md の項目で常用時に確認
-- セルフテストは **55 項目**（40/40b: close 回帰 + fd リーク検査、41/41b: シェル統合
-  e2e + split cwd 継承、5c: ドラッグ状態残留）。IME「確定文字列が PTY へ」は
-  タイミング起因で稀にフレーク（再実行で緑。要観察）
+- **接続情報の発見**: `tako-control::discovery`（`<data_dir>/control.json`、最新起動が
+  上書き = 最新優先、終了時削除なし）。CLI の解決順は env → ファイル。MCP ブリッジの
+  フォールバックは「env あり = tako 内起動」に限定（tako 外 0 ツールの方針維持）
+- セルフテストは **59 項目**（40/40b: close 回帰 + fd リーク検査、41/41b: シェル統合
+  e2e + split cwd 継承、42/42b: ファイル発見 + stale env フォールバック、5c: ドラッグ
+  状態残留）。IME「確定文字列が PTY へ」はタイミング起因で稀にフレーク（再実行で緑）
 - gpui ソース参照は `~/.cargo/git/checkouts/zed-*/cafbf4b/crates/gpui*` のみ（Apache-2.0）
 
 ## 現フェーズで Read すべき設計書
