@@ -6,9 +6,11 @@
 pub mod pane;
 pub mod pane_tree;
 pub mod tab;
+pub mod terminal;
 pub mod workspace;
 
 pub use pane::{Pane, PaneId, PaneOrigin};
 pub use pane_tree::{PaneNode, PaneTree, PaneTreeError, Rect, SplitAxis, SplitDirection};
 pub use tab::{Tab, TabId};
+pub use terminal::{SessionError, TermEvent, TerminalSession};
 pub use workspace::{Workspace, WorkspaceError};
