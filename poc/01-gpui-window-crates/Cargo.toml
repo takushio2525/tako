@@ -1,0 +1,11 @@
+[package]
+name = "gpui-window-crates"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Phase 0 検証スパイク: crates.io 版 gpui で最小ウィンドウが出るか
+[dependencies]
+gpui = "0.2.2"
+
+[workspace]

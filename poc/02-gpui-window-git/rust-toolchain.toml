@@ -1,0 +1,4 @@
+# git 版 gpui（zed main）は rustc 1.89 では未安定 API を要求してビルド不可。
+# 新しめの stable を要求する（検証時点では 1.95.0 で成功）。
+[toolchain]
+channel = "1.95.0"
