@@ -57,6 +57,8 @@ tmux 系オーケストレーター（spawn-worker.sh 等）が CLI 差し替え
 - [ ] 呼び出し元ペイン特定と同タブスコープ制限（FR-2.3.3）
 - [ ] Claude Code をリファレンスとした設定ゼロ接続の実証
 - [ ] ペインの role ラベルと状態表示 UI（FR-2.1.3〜2.1.4）
+- [ ] FR-2.5 レイアウト操作セットの拡充（リサイズ・レイアウトプリセット・タブ操作 FR-2.5.10。
+      ファイル/URL 系 FR-2.5.11〜12 は Phase 5 のペイン種別実装後）
 
 **Exit Criteria**: tako 内で Claude Code を起動し、**何も設定せずに**
 「dev サーバーを隣のペインで起動して」が通る。
@@ -76,8 +78,13 @@ tmux 系オーケストレーター（spawn-worker.sh 等）が CLI 差し替え
 - [ ] Markdown プレビュー（FR-3.3）・軽い編集（FR-3.5）
 - [ ] 右サイドバー: git graph（FR-3.6）
 - [ ] PDF プレビューの要否再判断（FR-3.4）
+- [ ] Web ビューペイン実現方式の検証スパイク（FR-3.8。WKWebView / WebView2 重ね合わせ。
+      候補とリスクは `architecture.md`「Web ビューペイン」節。暫定は外部ブラウザ起動でも可）
+- [ ] AI 誘導・注釈オーバーレイ（FR-2.6）と `tako_open_file` / `tako_open_url` / `tako_annotate`
+      （FR-2.5.11〜12。設計原則 5「AI フルコントロール」）
 
 **Exit Criteria**: エージェントの成果物（コード・README）を tako から出ずに確認・微修正できる。
+「あのファイル開いて見せて」「ここを見て」が AI 経由で通る。
 
 ## Phase 6: Windows 本格対応
 

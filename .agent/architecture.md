@@ -101,7 +101,8 @@ Workspace
     └── PaneTree (二分木: Split { axis, ratio, children } | Leaf(Pane))
         └── Pane
             ├── TerminalPane (TerminalSession を保持)
-            └── PreviewPane (Code | Markdown | Pdf | Editor)
+            ├── PreviewPane (Code | Markdown | Pdf | Editor)
+            └── WebViewPane (URL を表示。実現方式・リスクは「Web ビューペイン」節、後段フェーズ)
 ```
 
 - `PaneId` / `TabId` はプロセス生存期間中ユニークな整数 ID（環境変数・CLI で使う）
@@ -145,6 +146,10 @@ TerminalSession がシェルを spawn する際に注入する:
   エージェントが自分の作業ペインを片付けたり、成果物提示のためにレイアウトを
   整えたりできるよう、読み取り（ツリー構造 + ジオメトリ）と操作を対で公開する。
   各操作のセマンティクスは tako-core の PaneTree API と 1:1 対応させる
+- 長期的には設計原則 5「AI フルコントロール」に従い **UI でできる操作をすべてツール化**する。
+  後段フェーズの追加ツール（案）: `tako_create_tab` / `tako_move_pane`（タブ振り分け、FR-2.5.10）/
+  `tako_open_file`（プレビュー表示、FR-2.5.11）/ `tako_open_url`（Web ビュー、FR-2.5.12）/
+  `tako_annotate`（注釈オーバーレイ、FR-2.6）
 - 接続トークンから呼び出し元ペインを特定し、**操作スコープのデフォルトを同タブ内に制限**（FR-2.3.3）
 - エージェント側の自動発見方式（mcp.json の自動生成 or 各エージェント CLI の規約への追従）は
   Phase 3 で詰める。Claude Code を最初のリファレンス対象とする
@@ -168,6 +173,32 @@ TerminalSession がシェルを spawn する際に注入する:
 - **PDF**: 優先度 C。pdfium バインディング等、Phase 5 で要否ごと再判断
 - **軽い編集**: ロープ構造（ropey）+ 最小限の編集操作。LSP はやらない（Non-goal）
 - **git graph**: gitoxide または git2-rs でコミットグラフを取得し GPUI で描画
+
+## Web ビューペイン（FR-3.8、後段フェーズ）
+
+**GPUI には webview 要素が無い**ため、実現には GPUI の外の仕組みが要る。
+候補と技術リスク（採否は後段フェーズの検証スパイクで判断、`roadmap.md`）:
+
+1. **ネイティブ webview の重ね合わせ（第一候補）**:
+   macOS は WKWebView を NSView として GPUI ウィンドウへ addSubview、
+   Windows は WebView2 を子 HWND として配置し、ペイン矩形に位置・サイズを追従させる。
+   ランタイム同梱不要で軽い（NFR-3/7 と整合）。
+   リスク: GPUI の GPU 合成レイヤとネイティブビューの z オーダー協調
+   （GPUI 描画はネイティブビューの**下**にしか出せない＝注釈オーバーレイ FR-2.6 と干渉）、
+   タブ切替・分割変更時の表示/非表示とクリッピング、フォーカス・IME・キーボードショートカットの
+   ルーティング分断、スクリーンショット系機能に映らない
+2. **オフスクリーンレンダリング**: CEF / Servo 系でテクスチャ化して GPUI 内で描画。
+   z オーダー問題は消えるが、依存が巨大でメモリ・配布サイズが NFR-3/7 に反する。保留
+3. **外部ブラウザ起動（フォールバック）**: ペイン統合を諦め `open <url>` する。
+   Phase 5 以前でも `tako_open_url` の暫定実装として先行提供できる
+
+## AI 誘導・注釈レイヤ（FR-2.6、後段フェーズ）
+
+ペイン上のハイライト・指し示しは **GPUI の描画だけで完結する見込み**（deferred / overlay 描画、
+ネイティブビュー不要）。対象指定は「ペイン ID + グリッド座標（行・列範囲）or 相対矩形」を
+MCP / CLI から受け、UI 層がレイアウト矩形に変換して描画する。
+入力はオーバーレイを素通しし、ユーザー操作・明示消去・タイムアウトで消す（FR-2.6.3）。
+注意: Web ビューペイン上だけはネイティブビューが最前面になるため別方式が要る（上記リスク参照）。
 
 ## プラットフォーム抽象（platform/）
 
