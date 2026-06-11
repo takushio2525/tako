@@ -84,17 +84,22 @@ tmux 系オーケストレーターの実地差し替えは Phase 3 以降の常
 → 機械検証（セルフテスト 36 項目 + verify-claude-mcp.sh）で経路は実証済み。
 GUI 内での常用体験は初回登録（`claude mcp add --scope user`）後に日常使いで確認する。
 
-## Phase 3.5: 日常使い品質（Phase 4 と並行可能な独立タスク）
+## Phase 3.5: 日常使い品質 → ✅ 実装完了（2026-06-11。常用での手動確認はユーザー）
 
 > Phase 3 完了を機にユーザーが tako を日常ターミナルとして使い始める。
-> そのためのブロッカー除去タスク群で、Phase 4 の機能開発と並行して進めてよい。
+> そのためのブロッカー除去タスク群。
 
-- [ ] IME 変換中表示（FR-1.9 = Must。未確定文字列・変換候補のインライン表示。
-      日本語ユーザーの日常使いブロッカー）
-- [ ] .app バンドル化: icns 生成（アイコンは `assets/icon/icon-a.svg` に決定済み）・
-      Info.plist・/Applications へ配置可能なビルド手順
+- [x] IME 変換中表示（FR-1.9 = Must）: GPUI `EntityInputHandler` で未確定文字列の
+      インライン表示（細下線）+ 注目文節の強調（太下線 + 選択色）+ 候補ウィンドウの
+      位置出し（`bounds_for_range`）。機械検証はセルフテスト 37〜39、
+      見た目・実 IME の確認は `.agent/manual-checks.md` の手動チェックリスト
+- [x] .app バンドル化: `scripts/build-app.sh`（icns 生成・Info.plist・ad-hoc 署名・
+      tako CLI 同梱・`--verify` でバンドル版セルフテスト・`--install` で /Applications 配置）。
+      release profile（thin LTO + strip）新設。アイコンは A 案採用（`assets/icon/README.md`）
 
 **Exit Criteria**: Dock から起動した tako で、日本語入力を含む日常作業を常用できる。
+→ 機械検証は完了。実 IME の見た目（manual-checks.md）と常用フィードバックはユーザーが
+日常使いで確認する。配布署名 / notarization は Phase 7。
 
 ## Phase 4: Layer 3 — パッシブ検知
 

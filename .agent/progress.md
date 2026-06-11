@@ -66,3 +66,12 @@
   FR-5 セッション永続性
 - 関連コミット: `a63f50e` `[機能追加] Layer 2 内蔵 MCP サーバー` + 仕様 3 コミット
 - 次: Phase 3.5（IME + .app バンドル）/ Phase 4（パッシブ検知 + role/状態表示 UI）
+
+## 2026-06-11（Phase 3.5 完了）
+
+- 日常使い品質: IME 変換中表示（FR-1.9。EntityInputHandler + オーバーレイ + 候補位置出し、
+  セルフテスト 39 項目 + manual-checks.md 新設）と .app バンドル化
+  （scripts/build-app.sh: icns / Info.plist / CLI 同梱 / --verify / --install、release profile）。
+  アイコンは A 案採用を assets/icon/README.md に記録
+- 関連コミット: `1a8e698` `[機能追加] IME 変換中表示` / `0d0c0da` `[機能追加] .app バンドル化`
+- 次: ユーザーの日常常用開始（manual-checks.md）/ Phase 4（パッシブ検知 + role/状態表示 UI）
