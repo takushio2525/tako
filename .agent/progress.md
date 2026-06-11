@@ -86,3 +86,15 @@
   グローバル on_mouse_move。セルフテスト 44 項目（1b〜1e/5b 追加）緑
 - 関連コミット: `d8f3752` `[修正] TERM/cwd` / `52294ab` `[修正] 特殊キー総点検`
 - 次: 日常常用継続 / Phase 4（パッシブ検知 + role/状態表示 UI）
+
+## 2026-06-11（常用クラッシュ根治 + Phase 3 完了 + Phase 4 前半）
+
+- 常用クラッシュ根治: login ラッパ起因の close ごとの fd/スレッド/プロセスリーク →
+  $SHELL 直接 spawn で解消、PTY 生成失敗の expect panic → Result 化でエラー応答に。
+  境界ドラッグ状態の残留（MouseUp 取りこぼし）も修正。教訓は architecture.md へ
+- Phase 3 完了 + Phase 4 前半: role/title バッジ + 状態ドット UI（FR-2.1.3〜2.1.4）、
+  TapPty による OSC 7/133 検知（osc_tap.rs）、zsh/bash/fish シェル統合自動注入
+  （FR-2.4.1）、list・MCP への cwd/state/exit_code 公開、split の cwd 継承。
+  セルフテスト 55 項目緑
+- 関連コミット: `44c794e`（クラッシュ根治）`30827b6`（シェル統合）`1f6ff12`（状態 UI）他
+- 次: Phase 4 後半（listen ポート検知・提案チップ・集約センター FR-2.10）

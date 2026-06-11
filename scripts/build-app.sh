@@ -4,7 +4,7 @@
 # 使い方:
 #   scripts/build-app.sh            # dist/tako.app を生成
 #   scripts/build-app.sh --verify   # 生成後、バンドル版バイナリでセルフテスト
-#                                   # （TAKO_* 注入 / IPC / MCP の 39 項目）を実行
+#                                   # （TAKO_* 注入 / IPC / MCP を含む全項目）を実行
 #   scripts/build-app.sh --install  # 生成後、/Applications へコピー
 #
 # 方式メモ: cargo-bundle は不採用（メンテ停滞・icns 生成は結局別途必要・
@@ -119,7 +119,7 @@ codesign --force -s - "$APP"
 echo "==> 生成完了: ${APP}（バージョン ${VERSION}）"
 
 if [[ $VERIFY -eq 1 ]]; then
-  echo "==> バンドル版セルフテスト（TAKO_* 注入 / IPC / MCP を含む 39 項目）"
+  echo "==> バンドル版セルフテスト（TAKO_* 注入 / IPC / MCP を含む全項目）"
   # セルフテストはペイン内から実 tako CLI（同梱版が exe 隣に居る）を叩く e2e を含む。
   # cargo build を内部で呼ぶためリポジトリ内から実行すること
   if TAKO_SELF_TEST=1 "$APP/Contents/MacOS/tako-app" | grep -q "TAKO_APP_SELF_TEST_OK"; then
