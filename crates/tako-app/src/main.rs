@@ -134,6 +134,16 @@ fn rgba_alpha(c: tako_core::Rgb, a: f32) -> Rgba {
     Rgba { a, ..rgba(c) }
 }
 
+/// 経過秒の相対表記（tmuxview の作成日時表示用）
+fn format_age(seconds: i64) -> String {
+    match seconds.max(0) {
+        s if s < 60 => format!("{s} 秒前"),
+        s if s < 3600 => format!("{} 分前", s / 60),
+        s if s < 86400 => format!("{} 時間前", s / 3600),
+        s => format!("{} 日前", s / 86400),
+    }
+}
+
 fn hsla_alpha(c: tako_core::Rgb, a: f32) -> Hsla {
     rgba_alpha(c, a).into()
 }
@@ -191,6 +201,12 @@ struct TakoApp {
     dragging_border: Option<DragBorder>,
     /// スクロールバーをドラッグ中のペイン
     dragging_scrollbar: Option<PaneId>,
+    /// tmuxview タブ（FR-2.13）を表示中か。タブモデルには入れない固定 UI 状態
+    tmuxview_active: bool,
+    /// tmux 一覧の最新スナップショット（dispatch の TmuxList 結果。表示は描画側の責務）
+    tmux_sessions: Vec<serde_json::Value>,
+    /// kill の確認待ち（セッション名, window index）。誤爆防止（FR-2.13.3）
+    tmux_pending_kill: Option<(String, Option<u32>)>,
 }
 
 /// ドラッグ中の境界の情報。座標→比率換算に必要な分割領域と軸を握っておく
@@ -270,6 +286,9 @@ impl TakoApp {
             ime: None,
             dragging_border: None,
             dragging_scrollbar: None,
+            tmuxview_active: false,
+            tmux_sessions: Vec::new(),
+            tmux_pending_kill: None,
         };
         let root_id = app.workspace.active_tab().tree().focused();
         if let Err(e) = app.spawn_session(root_id, SpawnOptions::default(), cx) {
@@ -308,7 +327,53 @@ impl TakoApp {
         })
         .detach();
 
+        // tmuxview 表示中は 2 秒毎に一覧を更新する（FR-2.13。表示していない間は何もしない）
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            let result = this.update(cx, |app: &mut TakoApp, cx| {
+                if app.tmuxview_active {
+                    app.refresh_tmux(cx);
+                }
+            });
+            if result.is_err() {
+                break; // View が破棄された
+            }
+        })
+        .detach();
+
         app
+    }
+
+    /// tmux 一覧を更新する。UI も CLI / MCP と同じコマンド層（dispatch）を通す
+    fn refresh_tmux(&mut self, cx: &mut Context<Self>) {
+        let value = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::TmuxList { socket: None },
+            PaneOrigin::User,
+        )
+        .unwrap_or_else(|_| serde_json::json!({ "sessions": [] }));
+        self.tmux_sessions = value["sessions"].as_array().cloned().unwrap_or_default();
+        cx.notify();
+    }
+
+    /// 確認済みの kill を実行する（kill ボタン → 確認 → ここ）
+    fn tmux_kill_confirmed(&mut self, cx: &mut Context<Self>) {
+        let Some((session, window)) = self.tmux_pending_kill.take() else {
+            return;
+        };
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::TmuxKill {
+                socket: None,
+                session,
+                window,
+            },
+            PaneOrigin::User,
+        );
+        if let Err(e) = result {
+            eprintln!("warning: tmux を kill できない: {e}");
+        }
+        self.refresh_tmux(cx);
     }
 
     /// ペイン ID に対する新しい TerminalSession を起動し、イベント中継タスクを張る。
@@ -503,6 +568,7 @@ impl TakoApp {
     }
 
     fn new_tab(&mut self, cx: &mut Context<Self>) {
+        self.tmuxview_active = false;
         let title = format!("{}", self.workspace.tabs().len() + 1);
         let pane = Pane::new(PaneOrigin::User);
         let pane_id = pane.id();
@@ -515,6 +581,7 @@ impl TakoApp {
     }
 
     fn activate_tab_index(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.tmuxview_active = false;
         if let Some(id) = self.workspace.tabs().get(index).map(|t| t.id()) {
             let _ = self.workspace.activate_tab(id);
         }
@@ -660,6 +727,213 @@ impl TakoApp {
         let side_right =
             char_end > char_start && (local_x - char_start) / (char_end - char_start) > 0.5;
         Some((col, row, side_right))
+    }
+
+    /// tmuxview タブの中身（FR-2.13。データは `tmux_sessions` = dispatch の TmuxList 結果）。
+    /// 表示方法は変わる前提（FR-2.13.5）なので、ここは JSON を読んで並べるだけに留める
+    fn render_tmuxview(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = self.theme.clone();
+        let sessions = self.tmux_sessions.clone();
+        let pending = self.tmux_pending_kill.clone();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let mut root = div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .bg(rgba(theme.background))
+            .text_color(hsla(theme.foreground))
+            .text_size(px(13.0))
+            .overflow_hidden()
+            .child(
+                div()
+                    .text_color(hsla(theme.tab_inactive_foreground))
+                    .text_size(px(11.0))
+                    .child("実行中の tmux セッション（2 秒毎に更新。kill は確認つき）"),
+            );
+        if sessions.is_empty() {
+            return root.child(
+                div()
+                    .text_color(hsla(theme.tab_inactive_foreground))
+                    .child("実行中の tmux セッションはない"),
+            );
+        }
+        for (index, session) in sessions.iter().enumerate() {
+            let name = session["name"].as_str().unwrap_or("?").to_string();
+            let attached = session["attached"].as_bool().unwrap_or(false);
+            let created = session["created"].as_i64().unwrap_or(0);
+            // tako との対応付け: クライアントごとに tako のタブ・ペイン / tako 外を表示する
+            let clients: Vec<String> = session["clients"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|c| match (c["tab"].as_u64(), c["pane"].as_u64()) {
+                    (Some(tab), Some(pane)) => format!("tako タブ {tab} / ペイン {pane}"),
+                    _ => format!("tako 外（{}）", c["tty"].as_str().unwrap_or("?")),
+                })
+                .collect();
+            let location = if clients.is_empty() {
+                "detached（どこにも表示されていない）".to_string()
+            } else {
+                clients.join("、")
+            };
+            let windows: Vec<(u32, String)> = session["windows"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|w| {
+                    let w_index = w["index"].as_u64().unwrap_or(0) as u32;
+                    (
+                        w_index,
+                        format!(
+                            "{}:{}（{} ペイン）",
+                            w_index,
+                            w["name"].as_str().unwrap_or("?"),
+                            w["panes"].as_u64().unwrap_or(0),
+                        ),
+                    )
+                })
+                .collect();
+
+            let kill_name = name.clone();
+            let mut card = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .bg(rgba_alpha(theme.tab_bar_background, 0.6))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .font_weight(FontWeight::BOLD)
+                                .child(SharedString::from(name.clone())),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(if attached {
+                                    hsla(theme.accent)
+                                } else {
+                                    hsla(theme.ansi[3]) // 黄: 消し忘れ候補
+                                })
+                                .child(if attached { "attached" } else { "detached" }),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(hsla(theme.tab_inactive_foreground))
+                                .child(SharedString::from(format!(
+                                    "作成 {} ・ {}",
+                                    format_age(now - created),
+                                    location,
+                                ))),
+                        )
+                        .child(div().flex_grow(1.0))
+                        .child(
+                            div()
+                                .id(("tmux-kill", index as u64))
+                                .px_2()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_size(px(11.0))
+                                .text_color(hsla(theme.ansi[1]))
+                                .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.tmux_pending_kill = Some((kill_name.clone(), None));
+                                    cx.notify();
+                                }))
+                                .child("kill"),
+                        ),
+                )
+                .children(windows.into_iter().map(|(w_index, label)| {
+                    let kill_name = name.clone();
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .pl_4()
+                        .text_size(px(12.0))
+                        .child(SharedString::from(label))
+                        .child(
+                            div()
+                                .id(("tmux-kill-window", ((index as u64) << 16) | w_index as u64))
+                                .px_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_size(px(10.0))
+                                .text_color(hsla_alpha(theme.ansi[1], 0.8))
+                                .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.tmux_pending_kill =
+                                        Some((kill_name.clone(), Some(w_index)));
+                                    cx.notify();
+                                }))
+                                .child("kill"),
+                        )
+                }));
+            // 誤爆防止のインライン確認（FR-2.13.3）
+            if let Some((pending_session, pending_window)) = &pending {
+                if *pending_session == name {
+                    let label = match pending_window {
+                        Some(w) => format!("window {w} を kill する？（中のプロセスごと終了）"),
+                        None => {
+                            format!("セッション {name} を kill する？（中のプロセスごと終了）")
+                        }
+                    };
+                    card = card.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .pl_4()
+                            .text_size(px(12.0))
+                            .text_color(hsla(theme.ansi[1]))
+                            .child(SharedString::from(label))
+                            .child(
+                                div()
+                                    .id(("tmux-kill-yes", index as u64))
+                                    .px_2()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .bg(rgba_alpha(theme.ansi[1], 0.25))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.tmux_kill_confirmed(cx);
+                                    }))
+                                    .child("kill する"),
+                            )
+                            .child(
+                                div()
+                                    .id(("tmux-kill-no", index as u64))
+                                    .px_2()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .bg(rgba_alpha(theme.tab_bar_background, 0.9))
+                                    .text_color(hsla(theme.foreground))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.tmux_pending_kill = None;
+                                        cx.notify();
+                                    }))
+                                    .child("やめる"),
+                            ),
+                    );
+                }
+            }
+            root = root.child(card);
+        }
+        root
     }
 
     /// 行テキスト全体を 1 ランで shape するための TextRun（幅計算用。色は使われない）
@@ -920,6 +1194,7 @@ impl TakoApp {
                     })
                     .text_size(px(12.0))
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tmuxview_active = false;
                         let _ = this.workspace.activate_tab(id);
                         cx.notify();
                     }))
@@ -947,6 +1222,35 @@ impl TakoApp {
                     .text_color(hsla(theme.tab_inactive_foreground))
                     .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
                     .child("+"),
+            )
+            .child(div().flex_grow(1.0))
+            .child(
+                // 右端固定の tmuxview タブ（FR-2.13.1。閉じる × は持たない）
+                div()
+                    .id("tab-tmuxview")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .h_full()
+                    .px_3()
+                    .cursor_pointer()
+                    .when(self.tmuxview_active, |d| {
+                        d.bg(rgba(theme.tab_active_background))
+                            .border_b_2()
+                            .border_color(hsla(theme.accent))
+                    })
+                    .text_color(if self.tmuxview_active {
+                        hsla(theme.tab_active_foreground)
+                    } else {
+                        hsla(theme.tab_inactive_foreground)
+                    })
+                    .text_size(px(12.0))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.tmuxview_active = true;
+                        this.refresh_tmux(cx);
+                    }))
+                    .child("tmux"),
             )
     }
 
@@ -1701,14 +2005,16 @@ impl Render for TakoApp {
                 }),
             )
             .child(self.render_tab_bar(cx))
-            .child(
+            .child(if self.tmuxview_active {
+                self.render_tmuxview(cx)
+            } else {
                 div()
                     .flex_1()
                     .relative()
                     .children(panes)
                     .children(border_handles)
-                    .children(ime_overlay),
-            )
+                    .children(ime_overlay)
+            })
             .child(ime_registration)
     }
 }
@@ -3199,6 +3505,23 @@ mod self_test {
             } else {
                 eprintln!("（tmux 不在のため項目 48 をスキップ）");
             }
+
+            // 49. tmuxview タブの状態遷移（FR-2.13.1。表示 → 一覧更新 → タブ操作で復帰。
+            //     一覧は既定サーバーの読み取りのみで無害。kill の確認フローも畳めること）
+            let view_ok = window
+                .update(cx, |app, _, cx| {
+                    app.tmuxview_active = true;
+                    app.refresh_tmux(cx);
+                    let shown = app.tmuxview_active;
+                    // 確認フロー: 存在しないセッションの kill は無害に失敗し pending が畳まれる
+                    app.tmux_pending_kill = Some(("tako-no-such-session".into(), None));
+                    app.tmux_kill_confirmed(cx);
+                    let pending_cleared = app.tmux_pending_kill.is_none();
+                    app.activate_tab_index(0, cx);
+                    shown && pending_cleared && !app.tmuxview_active
+                })
+                .unwrap_or(false);
+            check(view_ok, "tmuxview の表示・確認フロー・復帰");
 
             println!("TAKO_APP_SELF_TEST_OK");
             std::process::exit(0);
