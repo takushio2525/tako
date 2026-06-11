@@ -327,6 +327,21 @@ impl TerminalSession {
         self.term.lock().grid().history_size()
     }
 
+    /// スクロールバック表示を絶対位置へ動かす（0 = 最下部。history を超えると先頭へクランプ）
+    pub fn scroll_to(&self, offset: usize) {
+        let mut term = self.term.lock();
+        let current = term.grid().display_offset() as i32;
+        let target = offset.min(term.grid().history_size()) as i32;
+        if target != current {
+            term.scroll_display(Scroll::Delta(target - current));
+        }
+    }
+
+    /// alternate screen（全画面 TUI）中か。スクロールバーの表示判定等に使う
+    pub fn is_alt_screen(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::ALT_SCREEN)
+    }
+
     pub fn scroll_to_bottom(&self) {
         let mut term = self.term.lock();
         if term.grid().display_offset() != 0 {

@@ -200,6 +200,28 @@ pub fn dispatch(
             Ok(json!({ "pane": target.as_u64(), "text": all.join("\n") }))
         }
 
+        Request::Scroll { pane, to, delta } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let session = host
+                .session(target)
+                .ok_or(DispatchError::NoSession(target.as_u64()))?;
+            match (to, delta) {
+                (Some(offset), None) => session.scroll_to(offset as usize),
+                (None, Some(lines)) => session.scroll_display(lines),
+                _ => {
+                    return Err(DispatchError::InvalidParams(
+                        "to（絶対位置。0 = 最下部）か delta（相対行数）のどちらか一方を指定する"
+                            .into(),
+                    ))
+                }
+            }
+            Ok(json!({
+                "pane": target.as_u64(),
+                "offset": session.display_offset(),
+                "history": session.history_size(),
+            }))
+        }
+
         Request::Title { pane, title, role } => {
             if title.is_none() && role.is_none() {
                 return Err(DispatchError::InvalidParams(
@@ -316,6 +338,12 @@ fn list_json(host: &dyn ControlHost) -> Value {
                         },
                         "cols": session.map(|s| s.size().0),
                         "rows": session.map(|s| s.size().1),
+                        // スクロールバック表示の状態（FR-2.5.13。alt_screen 中は無効）
+                        "scroll": session.map(|s| json!({
+                            "offset": s.display_offset(),
+                            "history": s.history_size(),
+                            "alt_screen": s.is_alt_screen(),
+                        })),
                     })
                 })
                 .collect();

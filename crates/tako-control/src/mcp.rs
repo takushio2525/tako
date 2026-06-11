@@ -205,6 +205,22 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_scroll_pane",
+            "description": "ペインのスクロールバック表示を動かす（FR-2.5.13）。\
+                to は絶対位置（0 = 最下部、大きいほど過去）、delta は相対行数（正 = 過去方向）。\
+                どちらか一方を指定する。応答に現在の offset と history（保持行数）を返す。\
+                過去の出力を確認するときは tako_read_pane と組み合わせる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": { "type": "integer", "minimum": 0, "description": "対象ペイン ID（省略時は呼び出し元）" },
+                    "to": { "type": "integer", "minimum": 0, "description": "絶対位置（0 = 最下部）" },
+                    "delta": { "type": "integer", "description": "相対行数（正 = 過去方向）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_focus_pane",
             "description": "ペインへフォーカスを移す。pane（ID 指定。別タブならタブも切り替わる）か\
                 direction（アクティブタブ内の隣接移動）のどちらか一方を指定する。\
@@ -371,6 +387,11 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             pane: Some(required_u64(args, "pane")?),
             lines: u64_arg(args, "lines")?.map(|n| n as usize),
         },
+        "tako_scroll_pane" => Request::Scroll {
+            pane: Some(target_pane(args, caller)?),
+            to: u64_arg(args, "to")?,
+            delta: i64_arg(args, "delta")?.map(|n| n as i32),
+        },
         "tako_focus_pane" => {
             let pane = u64_arg(args, "pane")?;
             let direction = direction_arg(args)?;
@@ -443,6 +464,16 @@ fn u64_arg(args: &Value, key: &str) -> Result<Option<u64>, String> {
             .as_u64()
             .map(Some)
             .ok_or_else(|| format!("{key} は非負整数で指定する")),
+    }
+}
+
+fn i64_arg(args: &Value, key: &str) -> Result<Option<i64>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| format!("{key} は整数で指定する")),
     }
 }
 
@@ -724,7 +755,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 13);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

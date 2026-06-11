@@ -49,6 +49,9 @@ const RESIZE_STEP: f32 = 0.05;
 /// ペイン境界のドラッグ判定/カーソル変更の当たり幅（px。仕切り線を中心に左右各 BORDER_HANDLE/2）
 const BORDER_HANDLE: f32 = 8.0;
 
+/// スクロールバーの当たり領域の幅（px。サムはこの内側に描く）
+const SCROLLBAR_WIDTH: f32 = 10.0;
+
 actions!(
     tako,
     [
@@ -126,6 +129,11 @@ fn hsla(c: tako_core::Rgb) -> Hsla {
     rgba(c).into()
 }
 
+/// 半透明色（スクロールバー等のオーバーレイ用）
+fn rgba_alpha(c: tako_core::Rgb, a: f32) -> Rgba {
+    Rgba { a, ..rgba(c) }
+}
+
 /// IME 変換中（未確定文字列 = marked text）の状態（FR-1.9）。
 /// 変換開始時のフォーカスペインを保持し、変換途中でフォーカスが移っても確定先がぶれないようにする
 struct ImeComposition {
@@ -177,6 +185,8 @@ struct TakoApp {
     ime: Option<ImeComposition>,
     /// ドラッグ中のペイン境界（None = ドラッグしていない）
     dragging_border: Option<DragBorder>,
+    /// スクロールバーをドラッグ中のペイン
+    dragging_scrollbar: Option<PaneId>,
 }
 
 /// ドラッグ中の境界の情報。座標→比率換算に必要な分割領域と軸を握っておく
@@ -255,6 +265,7 @@ impl TakoApp {
             pending_attach: Vec::new(),
             ime: None,
             dragging_border: None,
+            dragging_scrollbar: None,
         };
         let root_id = app.workspace.active_tab().tree().focused();
         if let Err(e) = app.spawn_session(root_id, SpawnOptions::default(), cx) {
@@ -614,14 +625,47 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// スクロールバーの押下: その位置へジャンプし、ドラッグ追従を開始する
+    fn start_scrollbar_drag(&mut self, pane_id: PaneId, y: Pixels, cx: &mut Context<Self>) {
+        self.dragging_scrollbar = Some(pane_id);
+        self.scrollbar_drag_to(pane_id, y, cx);
+    }
+
+    /// マウス y 座標をスクロールバック位置へ換算する（サム中心 = マウス位置）
+    fn scrollbar_drag_to(&mut self, pane_id: PaneId, y: Pixels, cx: &mut Context<Self>) {
+        let Some((_, area)) = self.pane_text_areas.iter().find(|(id, _)| *id == pane_id) else {
+            return;
+        };
+        let Some(session) = self.terminals.get(&pane_id) else {
+            return;
+        };
+        let history = session.history_size();
+        let (_, rows) = session.size();
+        let total = (history + rows) as f32;
+        let ratio = ((f32::from(y) - f32::from(area.origin.y)) / f32::from(area.size.height))
+            .clamp(0.0, 1.0);
+        // 表示窓（rows 行）の中心をマウス位置の行へ合わせ、上端行 → offset に直す
+        let top_row = (ratio * total - rows as f32 / 2.0).clamp(0.0, history as f32);
+        session.scroll_to(history - top_row.round() as usize);
+        cx.notify();
+    }
+
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         if event.pressed_button != Some(MouseButton::Left) {
             // ウィンドウ外でボタンが離されると MouseUp が届かないことがある。
             // 取り残したドラッグ・選択状態はここで畳む（残留すると以後どこを
             // 左ドラッグしてもリサイズが発火し「当たり判定が広がった」ように見える）
-            if self.dragging_border.take().is_some() | self.selecting.take().is_some() {
+            if self.dragging_border.take().is_some()
+                | self.dragging_scrollbar.take().is_some()
+                | self.selecting.take().is_some()
+            {
                 cx.notify();
             }
+            return;
+        }
+        // スクロールバードラッグ中はスクロール位置を追従させる
+        if let Some(pane_id) = self.dragging_scrollbar {
+            self.scrollbar_drag_to(pane_id, event.position.y, cx);
             return;
         }
         // 境界ドラッグ中は分割比率を更新（PTY リサイズは次の render の追従に任せる）
@@ -651,7 +695,7 @@ impl TakoApp {
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, cx: &mut Context<Self>) {
-        if self.dragging_border.take().is_some() {
+        if self.dragging_border.take().is_some() | self.dragging_scrollbar.take().is_some() {
             cx.notify();
             return;
         }
@@ -868,6 +912,26 @@ impl TakoApp {
                 _ => None,
             });
 
+        // スクロールバー（FR-2.5.13 の UI）。通常画面で履歴があるときだけ控えめに重ねる。
+        // alternate screen（TUI）はスクロールバックが無いので出さない
+        let scrollbar = self.terminals.get(&pane_id).and_then(|s| {
+            if s.is_alt_screen() {
+                return None;
+            }
+            let history = s.history_size();
+            if history == 0 {
+                return None;
+            }
+            let (_, rows) = s.size();
+            let total = (history + rows) as f32;
+            let track_h = f32::from(area.size.height);
+            let thumb_h = (rows as f32 / total * track_h).clamp(20.0, track_h);
+            let top = ((history - s.display_offset()) as f32 / total * track_h)
+                .min(track_h - thumb_h);
+            let dragging = self.dragging_scrollbar == Some(pane_id);
+            Some((top, thumb_h, track_h, dragging))
+        });
+
         let screen = self.terminals.get(&pane_id).map(|s| s.screen(&theme));
 
         let lines: Vec<_> = screen
@@ -938,6 +1002,36 @@ impl TakoApp {
                 this.on_pane_scroll(pane_id, event, cx);
             }))
             .children(lines)
+            .children(scrollbar.map(|(top, thumb_h, track_h, dragging)| {
+                div()
+                    .id(("scrollbar", pane_id.as_u64()))
+                    .absolute()
+                    .top(px(0.0))
+                    .right(px(0.0))
+                    .w(px(SCROLLBAR_WIDTH))
+                    .h(px(track_h))
+                    .occlude() // 下のペインへの選択開始を防ぐ
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.start_scrollbar_drag(pane_id, event.position.y, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(top))
+                            .right(px(2.0))
+                            .w(px(SCROLLBAR_WIDTH - 4.0))
+                            .h(px(thumb_h))
+                            .rounded_sm()
+                            .bg(rgba_alpha(
+                                theme.tab_inactive_foreground,
+                                if dragging { 0.7 } else { 0.35 },
+                            )),
+                    )
+            }))
             .children(
                 (badge_label.is_some() || state_dot.is_some()).then(|| {
                     div()
@@ -2309,7 +2403,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 12, "MCP tools/list は 12 ツール");
+            check(status == 200 && tool_count == 13, "MCP tools/list は 13 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -2712,6 +2806,62 @@ mod self_test {
                 .unwrap_or(false);
             check(forwarded_in_alt, "alt screen のホイールは PTY 転送");
             wait(cx, 2000).await; // alt screen 解除を待つ
+
+            // 44. スクロール操作の CLI 公開（FR-2.5.13）とスクロールバードラッグ換算。
+            //     43 で alt screen へ転送した矢印キーが復帰後の zle に届き履歴を遡っているため、
+            //     ctrl-u で行をクリアしてから打つ。タイプ（write）は最下部へ戻し、スクロール中は
+            //     新しい出力が画面外になるため、成否は echo ではなく offset で検証する
+            press(any, cx, "ctrl-u");
+            type_text(any, cx, &format!("{cli} scroll --to 5 >/dev/null"), true);
+            wait(cx, 1000).await;
+            let cli_scrolled = window
+                .update(cx, |app, _, _| {
+                    app.terminals
+                        .get(&app.focused_pane())
+                        .map(|s| s.display_offset() >= 5)
+                        == Some(true)
+                })
+                .unwrap_or(false);
+            check(cli_scrolled, "tako scroll --to が表示位置に反映");
+            let (drag_top_ok, drag_bottom_ok, drag_cleared) = window
+                .update(cx, |app, _, cx| {
+                    let pane = app.focused_pane();
+                    let area = app
+                        .pane_text_areas
+                        .iter()
+                        .find(|(id, _)| *id == pane)
+                        .map(|(_, b)| *b)
+                        .expect("フォーカスペインのレイアウトはある");
+                    // トラック上端へドラッグ = 最古、下端 = 最下部（サム中心合わせ + クランプ）
+                    app.start_scrollbar_drag(pane, area.origin.y, cx);
+                    let top_ok = app
+                        .terminals
+                        .get(&pane)
+                        .map(|s| s.display_offset() == s.history_size())
+                        == Some(true);
+                    app.scrollbar_drag_to(pane, area.origin.y + area.size.height, cx);
+                    let bottom_ok = app
+                        .terminals
+                        .get(&pane)
+                        .map(|s| s.display_offset() == 0)
+                        == Some(true);
+                    app.on_mouse_up(
+                        &MouseUpEvent {
+                            button: MouseButton::Left,
+                            position: point(px(0.0), px(0.0)),
+                            modifiers: Modifiers::default(),
+                            click_count: 1,
+                        },
+                        cx,
+                    );
+                    (top_ok, bottom_ok, app.dragging_scrollbar.is_none())
+                })
+                .unwrap_or((false, false, false));
+            check(drag_top_ok, "スクロールバードラッグで最上部へ");
+            check(
+                drag_bottom_ok && drag_cleared,
+                "スクロールバードラッグで最下部へ（解放でクリア）",
+            );
 
             println!("TAKO_APP_SELF_TEST_OK");
             std::process::exit(0);

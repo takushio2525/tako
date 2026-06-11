@@ -116,6 +116,13 @@ pub enum Request {
         pane: Option<u64>,
         lines: Option<usize>,
     },
+    /// スクロールバック表示の操作（FR-2.5.13）。`to` は絶対位置（0 = 最下部）、
+    /// `delta` は相対行数（正 = 過去方向）。両方省略はエラー
+    Scroll {
+        pane: Option<u64>,
+        to: Option<u64>,
+        delta: Option<i32>,
+    },
     /// タイトル・役割ラベルの設定（FR-2.2.6 / FR-2.1.3）。空文字でクリア
     Title {
         pane: Option<u64>,

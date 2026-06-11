@@ -49,6 +49,8 @@ enum Command {
     List,
     /// ペインの画面内容をテキストで出力する
     Read(ReadArgs),
+    /// スクロールバック表示を動かす（--to 0 で最下部へ）
+    Scroll(ScrollArgs),
     /// ペインを閉じる（タブ最後の 1 ペインならタブごと閉じる）
     Close(CloseArgs),
     /// ペインのタイトル・役割ラベルを設定する（空文字でクリア）
@@ -142,6 +144,19 @@ struct ReadArgs {
     /// 末尾からの行数制限
     #[arg(long)]
     lines: Option<usize>,
+}
+
+#[derive(Args)]
+struct ScrollArgs {
+    /// 対象ペイン ID（省略時は呼び出し元）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// 絶対位置（0 = 最下部、大きいほど過去）
+    #[arg(long, conflicts_with = "delta")]
+    to: Option<u64>,
+    /// 相対行数（正 = 過去方向）
+    #[arg(long, allow_hyphen_values = true)]
+    delta: Option<i32>,
 }
 
 #[derive(Args)]
@@ -344,6 +359,16 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane: target_pane(args.pane)?,
             lines: args.lines,
         },
+        Command::Scroll(args) => {
+            if args.to.is_none() && args.delta.is_none() {
+                return Err("--to（絶対位置。0 = 最下部）か --delta（相対行数）を指定する".into());
+            }
+            Request::Scroll {
+                pane: target_pane(args.pane)?,
+                to: args.to,
+                delta: args.delta,
+            }
+        }
         Command::Close(args) => Request::Close {
             pane: target_pane(args.pane)?,
         },
@@ -448,6 +473,7 @@ fn print_result(command: &Command, result: &Value) {
                 println!("{text}");
             }
         }
+        Command::Scroll(_) => println!("{result}"),
         Command::List => {
             println!(
                 "{}",
