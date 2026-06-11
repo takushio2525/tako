@@ -6,42 +6,48 @@
 
 ## 現在の対象
 
-- 何を / どこを: Phase 2（Layer 1 — CLI と環境変数注入）実装完了。次は Phase 3（内蔵 MCP サーバー）
-- ステータス: Phase 3 未着手。CI（macOS / Windows）緑確認待ちは push 直後のみ
+- 何を / どこを: Phase 3（Layer 2 — 内蔵 MCP サーバー）コア完了。
+  次は Phase 3.5（日常使い品質: IME 変換中表示 + .app バンドル）と
+  Phase 3 残（role/状態表示 UI → Phase 4 の集約センターと併せて）
+- ステータス: push 直後の CI（macOS / Windows）緑確認待ちのみ
 - 最終更新: 2026-06-11
 
 ## 直近の観点・指摘
 
-- **操作ディスパッチは `tako-control::dispatch`（ControlHost trait）に一元化済み**。
-  Phase 3 の MCP サーバーは新しい操作実装を書かず、この dispatch を呼ぶだけにする（設計原則 5）
-- IPC ワイヤ形式: 1 行 1 JSON の JSON-RPC 2.0 サブセット + `token` フィールド
-  （`crates/tako-control/src/protocol.rs` が正）。UDS は `$TMPDIR/tako-<pid>-<seq>.sock`（0600）
-- `tako` CLI: split / send / focus / list / read / close / title / resize / equalize /
-  tab new・select・move-pane。`--pane` 省略時は `TAKO_PANE_ID` で呼び出し元を自動特定
-- 環境変数注入は tako-app の `spawn_session` で実施（PANE/TAB/SOCKET/TOKEN。MCP_URL は Phase 3）
-- 安全制約: CLI からの close は「最後のタブの最後のペイン」を拒否（アプリ終了は UI のみ）
-- セルフテストは 29 項目（1〜13: ターミナル基盤、14〜29: 制御プレーン e2e。
-  ペイン内シェルから実 `tako` バイナリを叩いて検証する）
-- Windows named pipe は Phase 6 の TODO（`architecture.md`「IPC トランスポート」節に検討事項）
+- **MCP は 2 トランスポート**: Streamable HTTP（tako-app 内蔵、`TAKO_MCP_URL` 注入、
+  Bearer + Origin 検証、tiny_http）と stdio ブリッジ（`tako mcp serve`。実行を IPC へ
+  origin="mcp" で中継）。エンジン `tako-control::mcp` は共有で、実行は dispatch を呼ぶだけ
+- **Claude Code 設定ゼロの現実解**: 環境変数からの MCP 自動発見機構は無い（2.1.x で検証）。
+  初回 1 回 `claude mcp add --scope user tako -- <repo>/target/debug/tako mcp serve` を登録
+  → 以後どのペインでもゼロ設定。tako 外では 0 ツールで無害。
+  実機検証は `scripts/verify-claude-mcp.sh`（実 claude で stdio / HTTP 両経路 OK、2026-06-11）
+- ツールは 12 個（FR-2.5 と 1:1）。send / read は pane 必須（誤送信防止）、close は
+  pane 省略 = 自己片付け。行動規範（FR-2.7.5）は initialize の instructions + 説明文に埋め込み
+- セルフテストは 36 項目（30〜36 が MCP）。**セルフテスト future はメインスレッドで動くため、
+  dispatch 往復を伴うブロッキング呼び出しは background executor へ逃がす**（デッドロックの教訓）
+- ユーザーが tako の日常常用を開始予定 → Phase 3.5（FR-1.9 IME = Must、.app バンドル。
+  アイコンは `assets/icon/icon-a.svg` 決定済み）。新規仕様: 画像プレビュー FR-3.10（Phase 5）、
+  セッション永続性 FR-5（v0.2 以降）
 - gpui ハマりどころ（font-kit feature 必須等）は `poc/README.md` / `architecture.md` 参照（必読）
 
 ## 現フェーズで Read すべき設計書
 
-- Phase 3 着手時: `.agent/architecture.md`「Layer 2」「IPC トランスポート（Phase 2 実装メモ）」節と
-  `requirements.md` FR-2.3 / FR-2.5 を Read してから実装。
-  MCP は `tako-control` の protocol / dispatch を共有し、トランスポート（Streamable HTTP
-  localhost が第一候補）と `TAKO_MCP_URL` 注入・Claude Code 設定ゼロ接続だけを足す
+- Phase 3.5 着手時: `requirements.md` FR-1.9 と `architecture.md`「Phase 0 検証結果」
+  （IME は GPUI の input handler まわり。gpui の ime 対応状況は要調査）
+- Phase 4 着手時: `.agent/architecture.md`「Layer 3」節 + `requirements.md` FR-2.4 / FR-2.10 /
+  FR-2.1.3〜2.1.4（role/状態表示 UI は Phase 3 残をここで回収）
 
 ## 未解決・次の一手
 
-- [ ] Phase 3: MCP サーバー内蔵（dispatch 共有）→ `TAKO_MCP_URL` 注入 → Claude Code 設定ゼロ
-      接続の実証 → role / 状態表示 UI（FR-2.1.3〜2.1.4）
-- [ ] Phase 1 残骨格: ドラッグでのペイン境界リサイズ・IME 変換中表示は未実装（常用しながら判断）
-- [ ] Phase 5 送り: Web ビューペイン（FR-3.8）・注釈レイヤ（FR-2.6）・diff ビューア（FR-3.9）・
-      提示系（FR-2.7）・フィードバック（FR-2.8）・cmd+K（FR-2.9）
+- [ ] Phase 3.5: IME 変換中表示（FR-1.9 = M）+ .app バンドル化（icns / Info.plist）
+- [ ] Phase 3 残: role ラベル / 状態表示 UI（FR-2.1.3〜2.1.4。Phase 4 集約センターと併せて）
+- [ ] Phase 4: パッシブ検知（OSC 7/133・listen ポート・提案チップ・集約センター）
+- [ ] Phase 1 残骨格: ドラッグでのペイン境界リサイズ（常用しながら判断）
+- [ ] Phase 5 送り: 画像プレビュー（FR-3.10）・Web ビュー（FR-3.8）・注釈（FR-2.6）・
+      diff（FR-3.9）・提示系（FR-2.7）・フィードバック（FR-2.8）・cmd+K（FR-2.9）
 
 ## 関連ファイル / リンク
 
 - リポジトリ: https://github.com/takushio2525/tako（private）
 - 仕様一式: `.agent/concept.md` / `requirements.md` / `architecture.md` / `roadmap.md`
-- PoC: `poc/`（Phase 0 検証コード。01: crates.io 版、02: git 版、03: 最小ターミナル）
+- MCP 実機検証: `scripts/verify-claude-mcp.sh` / `crates/tako-control/examples/mcp_host.rs`

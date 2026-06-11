@@ -55,3 +55,14 @@
   セルフテスト 29 項目緑（ペイン内シェルから実 CLI を叩く e2e 含む）
 - 関連コミット: `3bfdedc` `14e16b2` `0b5858f` `83d17ad` + ドキュメント反映
 - 次: Phase 3 — 内蔵 MCP サーバー（dispatch 共有、TAKO_MCP_URL、Claude Code 設定ゼロ接続）
+
+## 2026-06-11（Phase 3 コア完了）
+
+- Layer 2 実装: MCP エンジン（dispatch 共有・12 ツール・行動規範埋め込み）+ Streamable HTTP
+  （TAKO_MCP_URL 注入、Bearer + Origin 検証）+ stdio ブリッジ `tako mcp serve`。
+  Claude Code は env 自動発見機構なし → user スコープ登録 1 回で以後ゼロ設定が現実解。
+  実 claude で stdio / HTTP 両経路の実機検証 OK、セルフテスト 36 項目緑
+- 仕様追加: FR-3.10 画像プレビュー / Phase 3.5 日常使い品質（IME = M 格上げ + .app 化）/
+  FR-5 セッション永続性
+- 関連コミット: `a63f50e` `[機能追加] Layer 2 内蔵 MCP サーバー` + 仕様 3 コミット
+- 次: Phase 3.5（IME + .app バンドル）/ Phase 4（パッシブ検知 + role/状態表示 UI）
