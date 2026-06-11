@@ -12,6 +12,13 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/takushio2525/tako"
 
+# 配布バンドル（scripts/build-app.sh）用のリリース最適化。
+# thin LTO + 単一 codegen unit でサイズと速度を取り、シンボルは落とす（NFR-1〜3 / NFR-7）
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
 [workspace.dependencies]
 tako-core = { path = "crates/tako-core" }
 tako-control = { path = "crates/tako-control" }

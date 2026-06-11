@@ -3,7 +3,7 @@
 **AI エージェント時代の、集約監視に特化した高速 GUI ターミナル**
 **A fast GUI terminal built for the AI-agent era — monitor your whole agent fleet in one tab.**
 
-> 🚧 仕様策定フェーズ。コードはまだありません。 / Spec phase — no code yet.
+> 🚧 開発中（macOS で動作、Windows はビルドのみ CI 検証）。 / In development — runs on macOS; Windows is build-verified in CI.
 
 ## なぜ tako？ / Why tako?
 
@@ -21,10 +21,43 @@ Working with AI agents like Claude Code, a single task naturally splits into the
 ## ステータス / Status
 
 仕様は [`.agent/`](.agent/) にあります（concept / requirements / architecture / roadmap）。
-Phase 0（GPUI の Windows ビルド検証 + 最小ターミナル PoC）から開始します。
+ターミナル基盤（タブ・分割・IME）、`tako` CLI、内蔵 MCP サーバー（Claude Code 連携）まで動作します。
 
 Specs live in [`.agent/`](.agent/) (concept / requirements / architecture / roadmap).
-Development starts with Phase 0: a GPUI Windows build spike + minimal terminal rendering PoC.
+The terminal core (tabs, splits, IME), the `tako` CLI, and the built-in MCP server (Claude Code integration) are working.
+
+## ビルドとインストール / Build & Install
+
+macOS で `tako.app` を生成して `/Applications` へ配置するには:
+
+```sh
+# dist/tako.app を生成（--verify でバンドル版のセルフテストも実行）
+scripts/build-app.sh --verify
+
+# /Applications へ配置（手動なら dist/tako.app をコピーでも同じ）
+scripts/build-app.sh --install
+```
+
+アイコンの再描画には `rsvg-convert`（`brew install librsvg`）を使います。
+無い場合は同梱の PNG から自動でフォールバックします。
+
+開発時はバンドル不要で `cargo run -p tako-app` がそのまま使えます。
+
+To build `tako.app` on macOS, run `scripts/build-app.sh --verify` (creates `dist/tako.app` and
+runs the bundled self-test), then `scripts/build-app.sh --install` to copy it into `/Applications`.
+Icon rendering uses `rsvg-convert` (`brew install librsvg`) with a PNG fallback.
+For development, plain `cargo run -p tako-app` works without bundling.
+
+### Claude Code 連携 / Claude Code integration
+
+tako 内で Claude Code からペイン操作（分割・送信・読み取り等）を使うには、初回 1 回だけ
+MCP の stdio ブリッジを登録します（以後はどのプロジェクトでも設定ゼロ）:
+
+```sh
+claude mcp add --scope user tako -- /Applications/tako.app/Contents/MacOS/tako mcp serve
+```
+
+Register the bundled stdio bridge once (`claude mcp add --scope user tako -- /Applications/tako.app/Contents/MacOS/tako mcp serve`); after that, pane-control tools are available with zero per-project setup. Outside tako the bridge exposes 0 tools and stays out of the way.
 
 ## ライセンス / License
 
