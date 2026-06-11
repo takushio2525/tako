@@ -21,17 +21,17 @@ use futures::channel::mpsc::unbounded;
 use futures::StreamExt;
 use gpui::{
     actions, canvas, div, point, prelude::*, px, relative, size, App, Bounds, ClipboardItem,
-    Context, ElementInputHandler, EntityInputHandler, FocusHandle, Font, FontStyle, FontWeight,
-    HighlightStyle, Hsla, KeyBinding, Keystroke, Modifiers, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollDelta, ScrollWheelEvent, SharedString,
-    Size, StrikethroughStyle, StyledText, TextRun, TextStyle, UTF16Selection, UnderlineStyle,
-    Window, WindowBounds, WindowOptions,
+    Context, CursorStyle, ElementInputHandler, EntityInputHandler, FocusHandle, Font, FontStyle,
+    FontWeight, HighlightStyle, Hsla, KeyBinding, Keystroke, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollDelta,
+    ScrollWheelEvent, SharedString, Size, StrikethroughStyle, StyledText, TextRun, TextStyle,
+    UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use tako_control::{ControlHost, IncomingRequest, IpcServer, McpServer};
 use tako_core::{
-    Pane, PaneId, PaneOrigin, Rect, SelectionKind, SessionNotice, SpawnOptions, SplitAxis,
-    SplitDirection, TabId, TerminalSession, Theme, Workspace,
+    ratio_for_position, Pane, PaneId, PaneOrigin, Rect, SelectionKind, SessionNotice, SpawnOptions,
+    SplitAxis, SplitDirection, TabId, TerminalSession, Theme, Workspace,
 };
 
 /// 新規セッションの初期グリッド。最初の render で実寸へリサイズされる
@@ -46,6 +46,8 @@ const PANE_BORDER: f32 = 1.0;
 const PANE_PADDING: f32 = 4.0;
 /// キーボードリサイズ 1 回あたりの比率変化
 const RESIZE_STEP: f32 = 0.05;
+/// ペイン境界のドラッグ判定/カーソル変更の当たり幅（px。仕切り線を中心に左右各 BORDER_HANDLE/2）
+const BORDER_HANDLE: f32 = 8.0;
 
 actions!(
     tako,
@@ -173,6 +175,19 @@ struct TakoApp {
     pending_attach: Vec<(PaneId, SpawnOptions)>,
     /// IME 変換中の未確定文字列（FR-1.9。None = 変換中でない）
     ime: Option<ImeComposition>,
+    /// ドラッグ中のペイン境界（None = ドラッグしていない）
+    dragging_border: Option<DragBorder>,
+}
+
+/// ドラッグ中の境界の情報。座標→比率換算に必要な分割領域と軸を握っておく
+#[derive(Debug, Clone, Copy)]
+struct DragBorder {
+    /// `PaneTree::set_split_ratio` に渡す分割インデックス
+    index: usize,
+    /// 分割の軸（Horizontal = 縦線を左右に、Vertical = 横線を上下に動かす）
+    axis: SplitAxis,
+    /// 分割領域（ウィンドウ座標 px）。`ratio_for_position` でマウス座標を比率へ換算する
+    area: Rect,
 }
 
 impl TakoApp {
@@ -224,6 +239,7 @@ impl TakoApp {
             token,
             pending_attach: Vec::new(),
             ime: None,
+            dragging_border: None,
         };
         let root_id = app.workspace.active_tab().tree().focused();
         app.spawn_session(root_id, SpawnOptions::default(), cx);
@@ -549,8 +565,29 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// 境界ハンドルの押下でドラッグ開始（リサイズ）。選択は始めない
+    fn start_border_drag(&mut self, border: DragBorder, cx: &mut Context<Self>) {
+        self.dragging_border = Some(border);
+        cx.notify();
+    }
+
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         if event.pressed_button != Some(MouseButton::Left) {
+            return;
+        }
+        // 境界ドラッグ中は分割比率を更新（PTY リサイズは次の render の追従に任せる）
+        if let Some(drag) = self.dragging_border {
+            let ratio = ratio_for_position(
+                drag.area,
+                drag.axis,
+                f32::from(event.position.x),
+                f32::from(event.position.y),
+            );
+            self.workspace
+                .active_tab_mut()
+                .tree_mut()
+                .set_split_ratio(drag.index, ratio);
+            cx.notify();
             return;
         }
         let Some(pane_id) = self.selecting else {
@@ -565,6 +602,10 @@ impl TakoApp {
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.dragging_border.take().is_some() {
+            cx.notify();
+            return;
+        }
         if let Some(pane_id) = self.selecting.take() {
             // iTerm2 流の copy-on-select
             if let Some(text) = self
@@ -1059,6 +1100,56 @@ impl Render for TakoApp {
             .collect();
         let _ = cell;
 
+        // ペイン境界のドラッグハンドル（仕切り線の上に数 px 幅の透明な当たり領域を重ねる）。
+        // ヒットテストとカーソル形状は gpui に任せ、押下で start_border_drag を呼ぶ。
+        // 境界座標はウィンドウ空間で算出し、配置はコンテナ（y=TAB_BAR_HEIGHT 起点）ローカルへ直す
+        let border_rect = Rect::new(
+            f32::from(content_origin.x),
+            f32::from(content_origin.y),
+            f32::from(content_size.width),
+            f32::from(content_size.height),
+        );
+        let origin_x = f32::from(content_origin.x);
+        let origin_y = f32::from(content_origin.y);
+        let border_handles: Vec<_> = self
+            .workspace
+            .active_tab()
+            .tree()
+            .borders(border_rect)
+            .into_iter()
+            .map(|b| {
+                let drag = DragBorder {
+                    index: b.index,
+                    axis: b.axis,
+                    area: b.area,
+                };
+                let len = b.span_end - b.span_start;
+                let base = div().absolute().occlude().on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                        this.start_border_drag(drag, cx);
+                        cx.stop_propagation();
+                    }),
+                );
+                match b.axis {
+                    // 縦線（左右ドラッグ）
+                    SplitAxis::Horizontal => base
+                        .left(px(b.position - origin_x - BORDER_HANDLE / 2.0))
+                        .top(px(b.span_start - origin_y))
+                        .w(px(BORDER_HANDLE))
+                        .h(px(len))
+                        .cursor(CursorStyle::ResizeLeftRight),
+                    // 横線（上下ドラッグ）
+                    SplitAxis::Vertical => base
+                        .left(px(b.span_start - origin_x))
+                        .top(px(b.position - origin_y - BORDER_HANDLE / 2.0))
+                        .w(px(len))
+                        .h(px(BORDER_HANDLE))
+                        .cursor(CursorStyle::ResizeUpDown),
+                }
+            })
+            .collect();
+
         // IME 変換中テキストのインライン表示（FR-1.9）。変換対象ペインのカーソル位置に
         // 未確定文字列を重ね、全体に細下線・IME の注目文節に太下線 + 選択色を付ける
         let ime_overlay = self.ime.as_ref().and_then(|ime| {
@@ -1222,6 +1313,7 @@ impl Render for TakoApp {
                     .flex_1()
                     .relative()
                     .children(panes)
+                    .children(border_handles)
                     .children(ime_overlay),
             )
             .child(ime_registration)
@@ -1554,6 +1646,65 @@ mod self_test {
                 })
                 .unwrap_or(0.0);
             check(width > 0.52, "ctrl-cmd-right でリサイズ");
+
+            // 5b. 境界ドラッグでリサイズ（border ヒットテスト→座標を比率へ換算→set_split_ratio）。
+            //     pane1|pane2 の縦境界を領域の左から 30% へドラッグし、pane1 幅が約 0.3 になる。
+            //     ドラッグ終了でドラッグ状態がクリアされることも確認する
+            let (drag_width, drag_cleared) = window
+                .update(cx, |app, win, cx| {
+                    let vp = win.viewport_size();
+                    let area_w = f32::from(vp.width);
+                    let area_h = f32::from(vp.height) - TAB_BAR_HEIGHT;
+                    let border_rect = Rect::new(0.0, TAB_BAR_HEIGHT, area_w, area_h);
+                    let border = app
+                        .workspace
+                        .active_tab()
+                        .tree()
+                        .borders(border_rect)
+                        .into_iter()
+                        .find(|b| b.axis == SplitAxis::Horizontal)
+                        .expect("縦境界が 1 本あるはず");
+                    app.dragging_border = Some(DragBorder {
+                        index: border.index,
+                        axis: border.axis,
+                        area: border.area,
+                    });
+                    let drag_x = border.area.x + border.area.width * 0.3;
+                    let drag_y = border.area.y + border.area.height * 0.5;
+                    let pos = point(px(drag_x), px(drag_y));
+                    app.on_mouse_move(
+                        &MouseMoveEvent {
+                            position: pos,
+                            pressed_button: Some(MouseButton::Left),
+                            modifiers: Modifiers::default(),
+                        },
+                        cx,
+                    );
+                    app.on_mouse_up(
+                        &MouseUpEvent {
+                            button: MouseButton::Left,
+                            position: pos,
+                            modifiers: Modifiers::default(),
+                            click_count: 1,
+                        },
+                        cx,
+                    );
+                    let w = app
+                        .workspace
+                        .active_tab()
+                        .tree()
+                        .layout(Rect::UNIT)
+                        .into_iter()
+                        .find(|(id, _)| *id == pane1)
+                        .map(|(_, r)| r.width)
+                        .unwrap_or(0.0);
+                    (w, app.dragging_border.is_none())
+                })
+                .unwrap_or((0.0, false));
+            check(
+                (drag_width - 0.3).abs() < 0.02 && drag_cleared,
+                "境界ドラッグでリサイズ",
+            );
 
             // 6. cmd-w でフォーカスペインを閉じる
             press(any, cx, "cmd-w");

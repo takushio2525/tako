@@ -498,22 +498,7 @@ impl PaneTree {
                     first,
                     second,
                 } => {
-                    let (r1, r2) = match axis {
-                        SplitAxis::Horizontal => {
-                            let w = r.width * ratio;
-                            (
-                                Rect::new(r.x, r.y, w, r.height),
-                                Rect::new(r.x + w, r.y, r.width - w, r.height),
-                            )
-                        }
-                        SplitAxis::Vertical => {
-                            let h = r.height * ratio;
-                            (
-                                Rect::new(r.x, r.y, r.width, h),
-                                Rect::new(r.x, r.y + h, r.width, r.height - h),
-                            )
-                        }
-                    };
+                    let (r1, r2) = split_rects(r, *axis, *ratio);
                     rec(first, r1, out);
                     rec(second, r2, out);
                 }
@@ -523,6 +508,130 @@ impl PaneTree {
         rec(self.root_ref(), bounds, &mut out);
         out
     }
+
+    /// 全分割の仕切り線を pre-order（`set_split_ratio` の index と同順）で列挙する。
+    /// UI 層の境界ヒットテスト・カーソル変更・ドラッグリサイズに使う。
+    /// 座標は `layout` に渡した bounds と同じ空間で返す
+    pub fn borders(&self, bounds: Rect) -> Vec<PaneBorder> {
+        fn rec(node: &PaneNode, r: Rect, idx: &mut usize, out: &mut Vec<PaneBorder>) {
+            let PaneNode::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } = node
+            else {
+                return;
+            };
+            let my_index = *idx;
+            *idx += 1;
+            let (r1, r2) = split_rects(r, *axis, *ratio);
+            // 仕切り線は first と second の境目。線が走る範囲は分割領域の長辺
+            let border = match axis {
+                SplitAxis::Horizontal => PaneBorder {
+                    axis: *axis,
+                    area: r,
+                    index: my_index,
+                    ratio: *ratio,
+                    position: r1.right(),
+                    span_start: r.y,
+                    span_end: r.bottom(),
+                },
+                SplitAxis::Vertical => PaneBorder {
+                    axis: *axis,
+                    area: r,
+                    index: my_index,
+                    ratio: *ratio,
+                    position: r1.bottom(),
+                    span_start: r.x,
+                    span_end: r.right(),
+                },
+            };
+            out.push(border);
+            rec(first, r1, idx, out);
+            rec(second, r2, idx, out);
+        }
+        let mut out = Vec::new();
+        let mut idx = 0;
+        rec(self.root_ref(), bounds, &mut idx, &mut out);
+        out
+    }
+
+    /// `borders` の `index` が指す分割の first 側取り分を絶対設定する（ドラッグ反映用）。
+    /// `MIN_SHARE..=MAX_SHARE` にクランプし、設定後の ratio を返す。index が無効なら None
+    pub fn set_split_ratio(&mut self, index: usize, ratio: f32) -> Option<f32> {
+        fn rec(node: &mut PaneNode, target: usize, idx: &mut usize, ratio: f32) -> Option<f32> {
+            let PaneNode::Split {
+                ratio: r,
+                first,
+                second,
+                ..
+            } = node
+            else {
+                return None;
+            };
+            let my_index = *idx;
+            *idx += 1;
+            if my_index == target {
+                let new = ratio.clamp(MIN_SHARE, MAX_SHARE);
+                *r = new;
+                return Some(new);
+            }
+            rec(first, target, idx, ratio).or_else(|| rec(second, target, idx, ratio))
+        }
+        let mut idx = 0;
+        rec(self.root_mut(), index, &mut idx, ratio)
+    }
+}
+
+/// 矩形 `r` を `axis` 軸・`ratio`（first 側取り分）で 2 分割する
+fn split_rects(r: Rect, axis: SplitAxis, ratio: f32) -> (Rect, Rect) {
+    match axis {
+        SplitAxis::Horizontal => {
+            let w = r.width * ratio;
+            (
+                Rect::new(r.x, r.y, w, r.height),
+                Rect::new(r.x + w, r.y, r.width - w, r.height),
+            )
+        }
+        SplitAxis::Vertical => {
+            let h = r.height * ratio;
+            (
+                Rect::new(r.x, r.y, r.width, h),
+                Rect::new(r.x, r.y + h, r.width, r.height - h),
+            )
+        }
+    }
+}
+
+/// 仕切り領域 `area` 内のポインタ座標 `(x, y)` を first 側取り分比率へ換算する（純粋関数）。
+/// Horizontal は x、Vertical は y を使う。`MIN_SHARE..=MAX_SHARE` にクランプする
+pub fn ratio_for_position(area: Rect, axis: SplitAxis, x: f32, y: f32) -> f32 {
+    let raw = match axis {
+        SplitAxis::Horizontal if area.width > 0.0 => (x - area.x) / area.width,
+        SplitAxis::Vertical if area.height > 0.0 => (y - area.y) / area.height,
+        _ => 0.5,
+    };
+    raw.clamp(MIN_SHARE, MAX_SHARE)
+}
+
+/// ドラッグ可能なペイン境界線（分割の仕切り）。座標は `borders` に渡した bounds と同じ空間
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PaneBorder {
+    /// この境界を生む分割の軸。Horizontal = 左右分割の縦線、Vertical = 上下分割の横線
+    pub axis: SplitAxis,
+    /// 分割対象の領域全体（`ratio_for_position` での座標→比率換算に使う）
+    pub area: Rect,
+    /// `set_split_ratio` に渡す分割インデックス（pre-order の Split 順）
+    pub index: usize,
+    /// 現在の first 側取り分
+    pub ratio: f32,
+    /// 仕切り線の位置。Horizontal なら x 座標、Vertical なら y 座標
+    pub position: f32,
+    /// 仕切り線が走る範囲の始点（Horizontal なら y、Vertical なら x）
+    pub span_start: f32,
+    /// 仕切り線が走る範囲の終点
+    pub span_end: f32,
 }
 
 /// 区間 [a1, a2) と [b1, b2) の重なり長
@@ -791,6 +900,83 @@ mod tests {
         for id in [a, b, c] {
             assert_close_to(rect_of(&t, id).width, 1.0 / 3.0);
         }
+    }
+
+    #[test]
+    fn 境界列挙は分割ごとに仕切り線を返す() {
+        // [root | new]（Horizontal, ratio 0.5）を縦線 1 本で返す
+        let (mut t, root) = tree();
+        let _ = t
+            .split(root, SplitDirection::Right, Pane::new(PaneOrigin::User))
+            .unwrap();
+        let borders = t.borders(Rect::UNIT);
+        assert_eq!(borders.len(), 1);
+        let b = borders[0];
+        assert_eq!(b.axis, SplitAxis::Horizontal);
+        assert_eq!(b.index, 0);
+        assert_close_to(b.position, 0.5); // 縦線の x 位置
+        assert_close_to(b.span_start, 0.0);
+        assert_close_to(b.span_end, 1.0);
+    }
+
+    #[test]
+    fn ネスト分割は境界をpre_orderで列挙しindexで個別にリサイズできる() {
+        // [root | (new1 / new2)]: 外側 Horizontal(index 0) + 内側 Vertical(index 1)
+        let (mut t, root) = tree();
+        let new1 = t
+            .split(root, SplitDirection::Right, Pane::new(PaneOrigin::User))
+            .unwrap();
+        let new2 = t
+            .split(new1, SplitDirection::Down, Pane::new(PaneOrigin::User))
+            .unwrap();
+        let borders = t.borders(Rect::UNIT);
+        assert_eq!(borders.len(), 2);
+        assert_eq!(borders[0].axis, SplitAxis::Horizontal);
+        assert_eq!(borders[1].axis, SplitAxis::Vertical);
+        // 内側の横線は右半分（x: 0.5..1.0）に走る
+        assert_close_to(borders[1].span_start, 0.5);
+        assert_close_to(borders[1].span_end, 1.0);
+
+        // index 0（外側）を 0.7 へ → root が広がり、内側分割は無傷
+        let set = t.set_split_ratio(0, 0.7).unwrap();
+        assert_close_to(set, 0.7);
+        assert_close_to(rect_of(&t, root).width, 0.7);
+        assert_close_to(rect_of(&t, new2).height, 0.5);
+
+        // index 1（内側）を 0.25 へ → new1 が縮み new2 が広がる
+        t.set_split_ratio(1, 0.25).unwrap();
+        assert_close_to(rect_of(&t, new1).height, 0.25);
+        assert_close_to(rect_of(&t, new2).height, 0.75);
+
+        // 無効 index は None
+        assert_eq!(t.set_split_ratio(9, 0.5), None);
+    }
+
+    #[test]
+    fn 座標から比率への換算はクランプされる() {
+        let area = Rect::new(0.0, 0.0, 1.0, 1.0);
+        // Horizontal は x を使う
+        assert_close_to(
+            ratio_for_position(area, SplitAxis::Horizontal, 0.3, 0.9),
+            0.3,
+        );
+        // Vertical は y を使う
+        assert_close_to(ratio_for_position(area, SplitAxis::Vertical, 0.9, 0.6), 0.6);
+        // 範囲外はクランプ（MIN_SHARE..=MAX_SHARE）
+        assert_close_to(
+            ratio_for_position(area, SplitAxis::Horizontal, -1.0, 0.5),
+            MIN_SHARE,
+        );
+        assert_close_to(
+            ratio_for_position(area, SplitAxis::Horizontal, 2.0, 0.5),
+            MAX_SHARE,
+        );
+        // オフセットのある領域でも相対換算
+        let area2 = Rect::new(0.5, 0.0, 0.5, 1.0);
+        assert_close_to(
+            ratio_for_position(area2, SplitAxis::Horizontal, 0.75, 0.0),
+            0.5,
+        );
     }
 
     #[test]

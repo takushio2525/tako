@@ -12,7 +12,10 @@ pub mod theme;
 pub mod workspace;
 
 pub use pane::{Pane, PaneId, PaneOrigin};
-pub use pane_tree::{PaneNode, PaneTree, PaneTreeError, Rect, SplitAxis, SplitDirection};
+pub use pane_tree::{
+    ratio_for_position, PaneBorder, PaneNode, PaneTree, PaneTreeError, Rect, SplitAxis,
+    SplitDirection,
+};
 pub use screen::{Screen, ScreenLine, StyleRun};
 pub use tab::{Tab, TabId};
 pub use terminal::{

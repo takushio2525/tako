@@ -39,7 +39,8 @@ GPUI バージョン戦略は **zed リポ git rev 固定**（`architecture.md` 
 - [x] Windows ビルドを CI（GitHub Actions）に組み込む（macOS / Windows 両ランナーで build + test 緑）
 - [x] タブの作成・切替・クローズ UI（FR-1.2。タブバー + cmd+T / cmd+W / cmd+数字 / cmd+shift+[]）
 - [x] ペイン分割・リサイズ・フォーカス移動 UI（FR-1.3。cmd+D / cmd+shift+D / cmd+alt+矢印 /
-      ctrl+cmd+矢印。iTerm2 踏襲）
+      ctrl+cmd+矢印。iTerm2 踏襲）。境界線のマウスドラッグリサイズも実装済み
+      （tako-core `borders`/`set_split_ratio`/`ratio_for_position`、UI は透明ハンドル + cursor）
 - [x] スクロールバック・コピペ・基本的な使い心地（256 色 / truecolor・カーソル・選択コピー
       （copy-on-select）・ブラケットペースト・PTY リサイズ追従・exit でペイン自動クローズ。
       描画色はすべて tako-core の Theme 経由（FR-4 の実装指針））

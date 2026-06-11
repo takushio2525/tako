@@ -75,3 +75,14 @@
   アイコンは A 案採用を assets/icon/README.md に記録
 - 関連コミット: `1a8e698` `[機能追加] IME 変換中表示` / `0d0c0da` `[機能追加] .app バンドル化`
 - 次: ユーザーの日常常用開始（manual-checks.md）/ Phase 4（パッシブ検知 + role/状態表示 UI）
+
+## 2026-06-11（常用初日バグ修正 + 境界ドラッグリサイズ）
+
+- バグ修正 3 件: ①TERM 未設定で tmux が落ちる→spawn で TERM=xterm-256color/COLORTERM=truecolor
+  既定注入（options.env 優先）②初期 cwd が `/`→$HOME 既定（継承は OSC 7 で Phase 4）
+  ③Backspace は \x7f で正しく症状は①の二次効果と判明、特殊キーの byte unit test 追加
+- 機能: ペイン境界ドラッグリサイズ。tako-core に borders/set_split_ratio/ratio_for_position
+  追加（pre-order index で分割特定、ユニットテスト 3 本）。UI は透明ハンドル div + cursor +
+  グローバル on_mouse_move。セルフテスト 44 項目（1b〜1e/5b 追加）緑
+- 関連コミット: `d8f3752` `[修正] TERM/cwd` / `52294ab` `[修正] 特殊キー総点検`
+- 次: 日常常用継続 / Phase 4（パッシブ検知 + role/状態表示 UI）

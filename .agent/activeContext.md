@@ -6,10 +6,10 @@
 
 ## 現在の対象
 
-- 何を / どこを: **Phase 3.5（日常使い品質）実装完了**。IME 変換中表示（FR-1.9）+
-  .app バンドル化（`scripts/build-app.sh`）+ アイコン A 案確定。
-  次はユーザーの日常常用開始（手動チェック）と Phase 4（パッシブ検知 + role/状態表示 UI）
-- ステータス: push 後の CI（macOS / Windows）緑確認待ちのみ
+- 何を / どこを: **常用初日バグ 3 件修正 + ペイン境界ドラッグリサイズ実装完了**。
+  Phase 3.5（IME・.app）は既に完了済み。次はユーザーの日常常用継続と
+  Phase 4（パッシブ検知 + role/状態表示 UI）
+- ステータス: push 後の CI（macOS / Windows）緑確認待ち
 - 最終更新: 2026-06-11
 
 ## 直近の観点・指摘
@@ -25,7 +25,18 @@
   （`claude mcp add --scope user tako -- /Applications/tako.app/Contents/MacOS/tako mcp serve`
   の登録パスを安定させるため）。ad-hoc 署名のみ（配布署名 / notarization は Phase 7）。
   bash は `$VAR（` の全角文字を変数名に含めて解釈するので `${VAR}` で括ること
-- セルフテストは **39 項目**（37〜39 が IME）。セルフテスト future はメインスレッドで動くため
+- **常用初日バグの要点**: ①シェルの `TERM` を未設定で親（.app は Finder 由来で不定）から
+  継承していた → tmux が「missing or unsuitable terminal」で落ちる。`TerminalSession::spawn`
+  で `TERM=xterm-256color`/`COLORTERM=truecolor` を既定注入（`options.env` 優先）。
+  ②初期 cwd が `/`（.app の親 cwd）→ `$HOME` 既定に（元ペイン継承は OSC 7 で Phase 4）。
+  ③Backspace のバイト変換（`keystroke_to_bytes`）は `\x7f` で正しく、症状は①の二次効果
+  （不正 TERM で zle が terminfo を読めず DEL が空白描画）。総点検の unit test を追加
+- **境界ドラッグリサイズ**: 換算ロジックは tako-core（`PaneTree::borders`/`set_split_ratio`/
+  `ratio_for_position`、pre-order index で分割を一意特定）。UI は薄く、各境界に数 px の
+  透明ハンドル div を重ね `cursor` と `on_mouse_down`→`start_border_drag`、移動は
+  グローバル `on_mouse_move` で `set_split_ratio`、PTY は次 render の `render_pane` で追従
+- セルフテストは **44 項目**（1b〜1e: TERM/cwd/tmux/Backspace、5b: 境界ドラッグ、
+  37〜39: IME）。セルフテスト future はメインスレッドで動くため
   dispatch 往復を伴うブロッキングは background executor へ（デッドロックの教訓）
 - gpui ハマりどころ（font-kit feature 必須等）は `poc/README.md` / `architecture.md` 参照。
   gpui ソース参照は `~/.cargo/git/checkouts/zed-*/cafbf4b/crates/gpui*` のみ（Apache-2.0。
@@ -43,7 +54,7 @@
       フィードバックは FR へ反映）
 - [ ] Phase 3 残: role ラベル / 状態表示 UI（FR-2.1.3〜2.1.4。Phase 4 集約センターと併せて）
 - [ ] Phase 4: パッシブ検知（OSC 7/133・listen ポート・提案チップ・集約センター）
-- [ ] Phase 1 残骨格: ドラッグでのペイン境界リサイズ（常用しながら判断）
+- [x] Phase 1 残骨格: ドラッグでのペイン境界リサイズ（実装済み。見た目の手触りは常用で確認）
 - [ ] Phase 5 送り: 画像プレビュー（FR-3.10）・Web ビュー（FR-3.8）・注釈（FR-2.6）・
       diff（FR-3.9）・提示系（FR-2.7）・フィードバック（FR-2.8）・cmd+K（FR-2.9）
 
