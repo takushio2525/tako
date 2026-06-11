@@ -48,6 +48,12 @@
 - 最新 stable Rust が必要（1.89 不可、1.95.0 で確認）。`rust-toolchain.toml` でピン留めする
 - ウィンドウがオクルージョン状態だと display link が止まり再描画されない（仕様）
 - `WindowHandle<V>::update` 内での `dispatch_keystroke` はビュー二重借用でパニック → `AnyWindowHandle::update` を使う
+- IME（Phase 3.5 で実装。FR-1.9）: `Window::handle_input` は **paint フェーズ限定 API**
+  → 何も描かない `canvas` の paint フックから `ElementInputHandler` を登録する。
+  `on_key_down` で PTY へ書いたら **`cx.stop_propagation()` 必須**（未処理扱いだと macOS が
+  キーを inputContext へ回送し insertText → `replace_text_in_range` で二重入力になる）。
+  `StyledText::with_default_highlights` のハイライト範囲は**非重複・昇順**必須
+  （重ねると `invalid text run` でパニック）。NSTextInputClient の範囲はすべて UTF-16 オフセット
 
 #### GPUI の Windows 対応の現状（2026-06 時点、Web 調査ベース・実機未検証）
 
