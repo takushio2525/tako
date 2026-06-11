@@ -21,7 +21,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # rust-toolchain.toml と同じバージョンをピン（git 版 gpui が新しめの stable を要求）
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -42,7 +42,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # gpui の Windows ビルドは Spectre-mitigated libs が前提（無いとリンクエラー）。
       # ランナーの VS には既定で入っていないため VS インストーラーで追加する
       - name: Spectre-mitigated libs をインストール
