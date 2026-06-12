@@ -313,6 +313,8 @@ struct TakoApp {
     dragging_border: Option<DragBorder>,
     /// スクロールバーをドラッグ中のペイン
     dragging_scrollbar: Option<PaneId>,
+    /// ホイール行換算の端数持ち越し（accumulate_scroll）。ペイン close で破棄
+    scroll_accum: HashMap<PaneId, f32>,
     /// 右サイドバー情報パネル（tmux 一覧 FR-2.13 / 集約センター FR-2.10）の表示状態。
     /// 表示・幅・ビューは dispatch（CLI / MCP の `tako panel`）からも操作できる
     panel_visible: bool,
@@ -476,6 +478,7 @@ impl TakoApp {
             ime: None,
             dragging_border: None,
             dragging_scrollbar: None,
+            scroll_accum: HashMap::new(),
             panel_visible: false,
             panel_view: PanelView::default(),
             panel_width: PANEL_DEFAULT_WIDTH,
@@ -1145,6 +1148,7 @@ impl TakoApp {
         match tab.tree_mut().close(pane_id) {
             Ok(_) => {
                 self.terminals.remove(&pane_id);
+                self.scroll_accum.remove(&pane_id);
                 self.drop_backend_session(pane_id);
             }
             Err(_) => {
@@ -1164,6 +1168,7 @@ impl TakoApp {
             Ok(_) => {
                 for id in pane_ids {
                     self.terminals.remove(&id);
+                    self.scroll_accum.remove(&id);
                     self.drop_backend_session(id);
                 }
             }
@@ -2007,10 +2012,16 @@ impl TakoApp {
         let Some(cell) = self.cell_size else {
             return;
         };
-        let lines = match event.delta {
-            ScrollDelta::Lines(l) => (l.y * 3.0) as i32,
-            ScrollDelta::Pixels(p) => (f32::from(p.y) / f32::from(cell.height)) as i32,
+        let delta_lines = match event.delta {
+            ScrollDelta::Lines(l) => l.y * 3.0,
+            ScrollDelta::Pixels(p) => f32::from(p.y) / f32::from(cell.height),
         };
+        // トラックパッドはイベント単位のピクセルデルタが 1 セル未満になりがちで、
+        // 都度切り捨てるとゆっくりスクロールが完全に無反応になる（2026-06-12
+        // 実機バグ (1) の app 側要因）。端数をペインごとに持ち越して積分する
+        let carry = self.scroll_accum.entry(pane_id).or_insert(0.0);
+        let (lines, rest) = accumulate_scroll(*carry, delta_lines);
+        *carry = rest;
         if lines != 0 {
             // mouse reporting / alternate scroll / 自前スクロールの出し分けはセッション側
             let (col, row) = self
@@ -2646,6 +2657,7 @@ impl ControlHost for TakoApp {
 
     fn detach_session(&mut self, pane: PaneId) {
         self.terminals.remove(&pane);
+        self.scroll_accum.remove(&pane);
         // CLI / MCP からの明示 close（FR-2.5.4）。バックエンドセッションも片付ける
         self.drop_backend_session(pane);
     }
@@ -5389,6 +5401,54 @@ mod self_test {
 
 /// 特殊キー → PTY 送出バイト列の総点検（バイトレベル検証）。
 /// 実 IME / GUI を起動できない CI でもキーエンコードの退行を捕まえる
+/// ホイールデルタの行換算。整数化できた行数と持ち越す端数を返す。
+/// 方向が反転したら端数を捨てる（逆向きの貯金で初動が重くなるのを防ぐ）
+fn accumulate_scroll(carry: f32, delta_lines: f32) -> (i32, f32) {
+    let carry = if carry * delta_lines < 0.0 {
+        0.0
+    } else {
+        carry
+    };
+    let total = carry + delta_lines;
+    let lines = total.trunc() as i32;
+    (lines, total - lines as f32)
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::accumulate_scroll;
+
+    #[test]
+    fn 微小デルタは蓄積されて行になる() {
+        // 0.4 行ずつのゆっくりトラックパッド: 3 イベント目で 1 行出る
+        let (l1, c1) = accumulate_scroll(0.0, 0.4);
+        assert_eq!(l1, 0);
+        let (l2, c2) = accumulate_scroll(c1, 0.4);
+        assert_eq!(l2, 0);
+        let (l3, c3) = accumulate_scroll(c2, 0.4);
+        assert_eq!(l3, 1);
+        assert!((c3 - 0.2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn 大きなデルタは即時に複数行になる() {
+        let (lines, carry) = accumulate_scroll(0.0, 2.7);
+        assert_eq!(lines, 2);
+        assert!((carry - 0.7).abs() < 1e-5);
+        let (lines, carry) = accumulate_scroll(0.0, -3.2);
+        assert_eq!(lines, -3);
+        assert!((carry + 0.2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn 方向反転で端数は捨てる() {
+        // 上方向の貯金 0.9 があっても、下へ動かした瞬間はゼロから数え直す
+        let (lines, carry) = accumulate_scroll(0.9, -0.4);
+        assert_eq!(lines, 0);
+        assert!((carry + 0.4).abs() < 1e-5);
+    }
+}
+
 #[cfg(test)]
 mod keystroke_tests {
     use super::*;
