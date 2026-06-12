@@ -418,16 +418,18 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_panel",
-            "description": "右サイドバー情報パネル（tmux セッション一覧 / エージェント集約センター）\
-                の表示・非表示・幅・ビューを切り替える（全省略で現在状態の取得）。\
-                ユーザーに tmux の状況やエージェントの状態を見せたいとき view を選んで表示し、\
-                邪魔なら隠す。",
+            "description": "右サイドバー情報パネルの表示・非表示・幅・ビュー切替と、\
+                左サイドバーのファイルツリーの表示・非表示を操作する（全省略で現在状態の取得）。\
+                view=tmux はタブごとの全ペイン一覧 + 管理外 / kill 漏れ tmux セッションの統合ビュー、\
+                view=git は git graph（実装まではプレースホルダ）。ユーザーに tmux や\
+                エージェントの状況を見せたいとき表示し、邪魔なら隠す。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "visible": { "type": "boolean", "description": "true = 表示、false = 非表示" },
                     "width": { "type": "number", "exclusiveMinimum": 0, "description": "パネル幅（px）" },
-                    "view": { "type": "string", "enum": ["tmux", "agents"], "description": "表示するビュー" },
+                    "view": { "type": "string", "enum": ["tmux", "git"], "description": "表示するビュー" },
+                    "filetree": { "type": "boolean", "description": "左サイドバーのファイルツリーの表示・非表示" },
                 },
                 "additionalProperties": false,
             },
@@ -582,9 +584,10 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             view: match str_arg(args, "view")?.as_deref() {
                 None => None,
                 Some("tmux") => Some(crate::protocol::PanelViewWire::Tmux),
-                Some("agents") => Some(crate::protocol::PanelViewWire::Agents),
-                Some(other) => return Err(format!("view が不正: {other}（tmux | agents）")),
+                Some("git") => Some(crate::protocol::PanelViewWire::Git),
+                Some(other) => return Err(format!("view が不正: {other}（tmux | git）")),
             },
+            filetree: bool_arg(args, "filetree")?,
         },
         _ => return Err(format!("不明なツール: {name}")),
     })

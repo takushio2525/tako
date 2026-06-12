@@ -116,13 +116,17 @@ const PANEL_MIN_WIDTH: f32 = 220.0;
 /// ペイン上部タイトルバーの高さ（px。iTerm2 風: × ボタン + ペイン名）
 const PANE_TITLE_BAR: f32 = 22.0;
 
+/// 下部ステータスバーの高さ（px。FR-2.16.4。Zed / VSCode 風）
+const STATUS_BAR_HEIGHT: f32 = 24.0;
+
 /// 右サイドバー情報パネルの内部タブ（固定タブ 0 個方針。2026-06-12）。
-/// 将来 git graph（FR-3.6）もここに足す（パネルは切り替え式コンテナとして設計）
+/// FR-2.16.6 で agents は tmux ビューへ統合済み。Git は git graph（FR-3.6）の
+/// 実装までプレースホルダ（パネルは切り替え式コンテナとして設計）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum PanelView {
     #[default]
     Tmux,
-    Agents,
+    Git,
 }
 
 actions!(
@@ -384,6 +388,8 @@ struct TakoApp {
     /// kill の確認待ち（セッション名, window index, tmux サーバー名）。誤爆防止（FR-2.13.3）。
     /// サーバー名は tako バックエンド（Phase 5.5）のセッションを kill するときに使う
     tmux_pending_kill: Option<(String, Option<u32>, Option<String>)>,
+    /// 統合 tmux ビューのペイン行ゴミ箱 → kill 確認待ちのペイン（FR-2.16.7。誤爆防止）
+    pending_pane_kill: Option<PaneId>,
     /// 左サイドバーのファイルツリー（FR-3.1 / FR-3.7。cmd+B でトグル）
     filetree: filetree::FileTree,
     /// タブ・ペイン名の AI 自動リネームの検知状態（FR-2.12。ループは new で張る）
@@ -412,18 +418,42 @@ struct PortSuggestion {
     process: String,
 }
 
-/// 集約センターの 1 行分（FR-2.10。全タブのペイン状態の写し）
+/// 統合 tmux ビューのペイン 1 行分（FR-2.16.6。旧集約センター FR-2.10 の写し）
 #[derive(Debug, Clone)]
 struct AgentEntry {
     pane: PaneId,
     /// 表示名（ペイン title / role > OSC タイトル > 既定）
     label: String,
-    tab_title: String,
     state: CommandState,
     cwd: Option<String>,
+    /// ペインを保持する tmux バックエンドセッション名（Phase 5.5。非永続化ペインは None）
+    backend: Option<String>,
 }
 
-/// 集約センターの並び順（注目度。エラー > 入力待ち > 実行中 > 不明）
+/// 統合 tmux ビューのタブ 1 枠分（FR-2.16.6。タブ名ラベル付き四角枠 + 全ペイン入れ子）
+#[derive(Debug, Clone)]
+struct TmuxViewTabGroup {
+    tab: TabId,
+    title: String,
+    rows: Vec<AgentEntry>,
+}
+
+/// どのタブにも表示されていない tmux セッション 1 件分（FR-2.16.8）。
+/// `orphan_backend` = tako から起動されたが対応ペインを失った残骸（kill 漏れ?）、
+/// false = tako 管理外（ユーザーが直接立てた等）
+#[derive(Debug, Clone)]
+struct UnlistedTmuxSession {
+    name: String,
+    socket: Option<String>,
+    orphan_backend: bool,
+    attached: bool,
+    created: i64,
+    location: String,
+    /// (window index, 表示ラベル)
+    windows: Vec<(u32, String)>,
+}
+
+/// ペイン行の並び順（注目度。エラー > 入力待ち > 実行中 > 不明）
 fn state_rank(state: CommandState) -> u8 {
     match state {
         CommandState::Failed(_) => 0,
@@ -542,6 +572,7 @@ impl TakoApp {
             dragging_panel: false,
             tmux_sessions: Vec::new(),
             tmux_pending_kill: None,
+            pending_pane_kill: None,
             filetree: filetree::FileTree::default(),
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
             port_detect: initial_port_detect(),
@@ -912,15 +943,16 @@ impl TakoApp {
         cx.notify();
     }
 
-    /// 集約センターの一覧（FR-2.10.1）。全タブ・全ペインの状態を注目度順
-    /// （エラー > 入力待ち > 実行中 > 不明）に並べる。素材は list（CLI / MCP）と同じ
-    fn agent_entries(&self) -> Vec<AgentEntry> {
-        let mut entries: Vec<AgentEntry> = self
-            .workspace
+    /// 統合 tmux ビューのタブ枠一覧（FR-2.16.6。データと表示の分離 = FR-2.13.5）。
+    /// 各枠内のペイン行は注目度順（エラー > 入力待ち > 実行中 > 不明）。
+    /// 素材は list（CLI / MCP）と同じ
+    fn tmux_view_groups(&self) -> Vec<TmuxViewTabGroup> {
+        self.workspace
             .tabs()
             .iter()
-            .flat_map(|tab| {
-                tab.tree()
+            .map(|tab| {
+                let mut rows: Vec<AgentEntry> = tab
+                    .tree()
                     .panes()
                     .iter()
                     .map(|p| {
@@ -937,20 +969,79 @@ impl TakoApp {
                         AgentEntry {
                             pane: p.id(),
                             label,
-                            tab_title: tab.title().to_string(),
                             state: session
                                 .map(|s| s.command_state())
                                 .unwrap_or(CommandState::Unknown),
                             cwd: session
                                 .and_then(|s| s.cwd())
                                 .map(|c| c.display().to_string()),
+                            backend: self.backend_sessions.get(&p.id()).cloned(),
                         }
                     })
-                    .collect::<Vec<_>>()
+                    .collect();
+                rows.sort_by_key(|e| state_rank(e.state));
+                TmuxViewTabGroup {
+                    tab: tab.id(),
+                    title: tab.title().to_string(),
+                    rows,
+                }
             })
-            .collect();
-        entries.sort_by_key(|e| state_rank(e.state));
-        entries
+            .collect()
+    }
+
+    /// どのタブにも表示されていない tmux セッションの抽出（FR-2.16.8）。
+    /// 対応ペインを持つバックエンドセッションはタブ枠内のペイン行が代表するため除外し、
+    /// 残りを「kill 漏れ?（orphan バックエンド）」と「管理外（ユーザー直起動等）」に分類する
+    fn tmux_unlisted_sessions(&self) -> Vec<UnlistedTmuxSession> {
+        self.tmux_sessions
+            .iter()
+            .filter_map(|session| {
+                let backend = session["backend"].as_bool().unwrap_or(false);
+                if backend && session["backend_pane"].as_u64().is_some() {
+                    return None; // タブ枠内のペイン行で表示済み
+                }
+                let clients: Vec<String> = session["clients"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|c| match (c["tab"].as_u64(), c["pane"].as_u64()) {
+                        (Some(tab), Some(pane)) => format!("tako タブ {tab} / ペイン {pane}"),
+                        _ => format!("tako 外（{}）", c["tty"].as_str().unwrap_or("?")),
+                    })
+                    .collect();
+                let location = if backend {
+                    "orphan（対応ペインなし）".to_string()
+                } else if clients.is_empty() {
+                    "detached（どこにも表示されていない）".to_string()
+                } else {
+                    clients.join("、")
+                };
+                let windows = session["windows"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|w| {
+                        let index = w["index"].as_u64().unwrap_or(0) as u32;
+                        let label = format!(
+                            "{}:{}（{} ペイン）",
+                            index,
+                            w["name"].as_str().unwrap_or("?"),
+                            w["panes"].as_u64().unwrap_or(0),
+                        );
+                        (index, label)
+                    })
+                    .collect();
+                Some(UnlistedTmuxSession {
+                    name: session["name"].as_str().unwrap_or("?").to_string(),
+                    socket: session["socket"].as_str().map(str::to_string),
+                    orphan_backend: backend,
+                    attached: session["attached"].as_bool().unwrap_or(false),
+                    created: session["created"].as_i64().unwrap_or(0),
+                    location,
+                    windows,
+                })
+            })
+            .collect()
     }
 
     /// 集約センターからのジャンプ（FR-2.10.2）。CLI / MCP と同じコマンド層
@@ -985,6 +1076,25 @@ impl TakoApp {
         )
         .unwrap_or_else(|_| serde_json::json!({ "sessions": [] }));
         self.tmux_sessions = value["sessions"].as_array().cloned().unwrap_or_default();
+    }
+
+    /// 統合 tmux ビューのペイン行ゴミ箱の確認済み kill（FR-2.16.7）。
+    /// CLI / MCP と同じコマンド層（dispatch の Close）を通す
+    fn pane_kill_confirmed(&mut self, cx: &mut Context<Self>) {
+        let Some(pane) = self.pending_pane_kill.take() else {
+            return;
+        };
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::Close {
+                pane: Some(pane.as_u64()),
+            },
+            PaneOrigin::User,
+        );
+        if let Err(e) = result {
+            eprintln!("warning: ペインを kill できない: {e}");
+        }
+        cx.notify();
     }
 
     /// 確認済みの kill を実行する（kill ボタン → 確認 → ここ）
@@ -1512,91 +1622,215 @@ impl TakoApp {
         Some((col, row, side_right))
     }
 
-    /// tmuxview タブの中身（FR-2.13。データは `tmux_sessions` = dispatch の TmuxList 結果）。
-    /// 表示方法は変わる前提（FR-2.13.5）なので、ここは JSON を読んで並べるだけに留める
-    fn render_tmuxview(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+    /// 統合 tmux ビュー（FR-2.16.6〜2.16.8。旧 tmuxview FR-2.13 + 集約センター FR-2.10 の
+    /// 1 本化）。タブごとの「タブ名ラベル付き四角枠」に全ペインを入れ子表示し、行クリックで
+    /// ジャンプ、ゴミ箱 → 確認 → kill（dispatch の Close）。続けて、どのタブにも表示されて
+    /// いない tmux セッションを「管理外 / kill 漏れ?」に区別して列挙する（確認つき TmuxKill）
+    fn render_tmux_view(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme.clone();
-        let sessions = self.tmux_sessions.clone();
-        let pending = self.tmux_pending_kill.clone();
+        let groups = self.tmux_view_groups();
+        let unlisted = self.tmux_unlisted_sessions();
+        let pending_pane = self.pending_pane_kill;
+        let pending_tmux = self.tmux_pending_kill.clone();
+        let active_tab = self.workspace.active_tab_id();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
         let mut root = div()
+            .id("tmux-view")
             .flex_1()
             .flex()
             .flex_col()
             .gap_2()
-            .p_4()
+            .p_3()
             .bg(rgba(theme.background))
             .text_color(hsla(theme.foreground))
-            .text_size(px(13.0))
-            .overflow_hidden()
+            .text_size(px(12.0))
+            .overflow_y_scroll()
             .child(
                 div()
                     .text_color(hsla(theme.tab_inactive_foreground))
                     .text_size(px(11.0))
-                    .child("実行中の tmux セッション（2 秒毎に更新。kill は確認つき）"),
+                    .child("タブごとの全ペイン（クリックでジャンプ。kill は確認つき）"),
             );
-        if sessions.is_empty() {
-            return root.child(
+
+        // タブ枠: タブ名ラベル付き四角枠 + 枠内に全ペインの入れ子表示（FR-2.16.6）
+        for group in groups {
+            let is_active = group.tab == active_tab;
+            let mut card = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(if is_active {
+                    hsla_alpha(theme.accent, 0.6)
+                } else {
+                    hsla(theme.pane_border)
+                })
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(if is_active {
+                            hsla(theme.tab_active_foreground)
+                        } else {
+                            hsla(theme.tab_inactive_foreground)
+                        })
+                        .overflow_hidden()
+                        .child(SharedString::from(format!(
+                            "タブ {}",
+                            truncate(&group.title, 30)
+                        ))),
+                );
+            for row in group.rows {
+                let pane = row.pane;
+                let (color, state_label) = match row.state {
+                    CommandState::Failed(code) => (theme.ansi[1], format!("エラー ({code})")),
+                    CommandState::Idle => (theme.ansi[2], "入力待ち".to_string()),
+                    CommandState::Running => (theme.accent, "実行中".to_string()),
+                    CommandState::Unknown => {
+                        (theme.tab_inactive_foreground, "状態不明".to_string())
+                    }
+                };
+                // 補足（cwd / 保持セッション）は詰めすぎず省略（…）で見切れを防ぐ
+                let detail = match (&row.cwd, &row.backend) {
+                    (Some(cwd), Some(b)) => {
+                        format!("{} ・ tmux: {}", truncate(cwd, 24), truncate(b, 16))
+                    }
+                    (Some(cwd), None) => truncate(cwd, 36),
+                    (None, Some(b)) => format!("tmux: {}", truncate(b, 24)),
+                    (None, None) => String::new(),
+                };
+                card = card.child(
+                    div()
+                        .id(("tmux-pane-row", pane.as_u64()))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .overflow_hidden()
+                        .hover(|d| d.bg(rgba_alpha(theme.tab_bar_background, 0.8)))
+                        .on_click(cx.listener(move |this, _, _, cx| this.jump_to_pane(pane, cx)))
+                        .child(
+                            div()
+                                .w(px(8.0))
+                                .h(px(8.0))
+                                .flex_none()
+                                .rounded_full()
+                                .bg(hsla(color)),
+                        )
+                        .child(
+                            div()
+                                .w(px(64.0))
+                                .flex_none()
+                                .text_size(px(11.0))
+                                .text_color(hsla(color))
+                                .child(SharedString::from(state_label)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .font_weight(FontWeight::BOLD)
+                                .child(SharedString::from(truncate(&row.label, 28))),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(hsla(theme.tab_inactive_foreground))
+                                .overflow_hidden()
+                                .child(SharedString::from(detail)),
+                        )
+                        .child(
+                            // ゴミ箱 → 確認 → kill（FR-2.16.7）
+                            div()
+                                .id(("pane-kill", pane.as_u64()))
+                                .px_1()
+                                .flex_none()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_size(px(11.0))
+                                .text_color(hsla_alpha(theme.ansi[1], 0.8))
+                                .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.pending_pane_kill = Some(pane);
+                                    cx.notify();
+                                }))
+                                .child("🗑"),
+                        ),
+                );
+                if pending_pane == Some(pane) {
+                    card = card.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .pl_4()
+                            .text_size(px(11.0))
+                            .text_color(hsla(theme.ansi[1]))
+                            .child(SharedString::from(format!(
+                                "ペイン {pane} を kill していいですか?（中のプロセスごと終了）"
+                            )))
+                            .child(
+                                div()
+                                    .id(("pane-kill-yes", pane.as_u64()))
+                                    .px_2()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .bg(rgba_alpha(theme.ansi[1], 0.25))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.pane_kill_confirmed(cx);
+                                    }))
+                                    .child("kill する"),
+                            )
+                            .child(
+                                div()
+                                    .id(("pane-kill-no", pane.as_u64()))
+                                    .px_2()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .bg(rgba_alpha(theme.tab_bar_background, 0.9))
+                                    .text_color(hsla(theme.foreground))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.pending_pane_kill = None;
+                                        cx.notify();
+                                    }))
+                                    .child("やめる"),
+                            ),
+                    );
+                }
+            }
+            root = root.child(card);
+        }
+
+        // どのタブにも表示されていない tmux セッション（FR-2.16.8。
+        // 管理外 = ユーザー直起動等 / kill 漏れ? = orphan バックエンドの残骸）
+        if !unlisted.is_empty() {
+            root = root.child(
                 div()
+                    .mt_2()
                     .text_color(hsla(theme.tab_inactive_foreground))
-                    .child("実行中の tmux セッションはない"),
+                    .text_size(px(11.0))
+                    .child("どのタブにも表示されていない tmux セッション（2 秒毎に更新）"),
             );
         }
-        for (index, session) in sessions.iter().enumerate() {
-            let name = session["name"].as_str().unwrap_or("?").to_string();
-            let attached = session["attached"].as_bool().unwrap_or(false);
-            let created = session["created"].as_i64().unwrap_or(0);
-            // tako 自身のバックエンド永続化セッション（Phase 5.5 / FR-5）は区別表示する。
-            // kill すると対応ペインの中身が消えるため、対応ペイン / orphan を明示する
-            let backend = session["backend"].as_bool().unwrap_or(false);
-            let socket = session["socket"].as_str().map(str::to_string);
-            // tako との対応付け: クライアントごとに tako のタブ・ペイン / tako 外を表示する
-            let clients: Vec<String> = session["clients"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|c| match (c["tab"].as_u64(), c["pane"].as_u64()) {
-                    (Some(tab), Some(pane)) => format!("tako タブ {tab} / ペイン {pane}"),
-                    _ => format!("tako 外（{}）", c["tty"].as_str().unwrap_or("?")),
-                })
-                .collect();
-            let location = if backend {
-                match (
-                    session["backend_tab"].as_u64(),
-                    session["backend_pane"].as_u64(),
-                ) {
-                    (Some(tab), Some(pane)) => format!("タブ {tab} / ペイン {pane} の中身を保持"),
-                    _ => "orphan（対応ペインなし。kill してよい候補）".to_string(),
-                }
-            } else if clients.is_empty() {
-                "detached（どこにも表示されていない）".to_string()
+        for (index, session) in unlisted.iter().enumerate() {
+            let (badge_label, badge_color) = if session.orphan_backend {
+                ("kill漏れ?", theme.ansi[1]) // 赤: tako が起動して kill し損ねた残骸
             } else {
-                clients.join("、")
+                ("管理外", theme.ansi[3]) // 黄: tako の外で立てられたセッション
             };
-            let windows: Vec<(u32, String)> = session["windows"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|w| {
-                    let w_index = w["index"].as_u64().unwrap_or(0) as u32;
-                    (
-                        w_index,
-                        format!(
-                            "{}:{}（{} ペイン）",
-                            w_index,
-                            w["name"].as_str().unwrap_or("?"),
-                            w["panes"].as_u64().unwrap_or(0),
-                        ),
-                    )
-                })
-                .collect();
-
-            let kill_name = name.clone();
-            let kill_socket = socket.clone();
+            let kill_name = session.name.clone();
+            let kill_socket = session.socket.clone();
             let mut card = div()
                 .flex()
                 .flex_col()
@@ -1610,73 +1844,86 @@ impl TakoApp {
                         .flex_row()
                         .items_center()
                         .gap_2()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .px_1()
+                                .flex_none()
+                                .rounded_sm()
+                                .text_size(px(10.0))
+                                .text_color(hsla(badge_color))
+                                .bg(rgba_alpha(badge_color, 0.15))
+                                .child(badge_label),
+                        )
                         .child(
                             div()
                                 .font_weight(FontWeight::BOLD)
-                                .child(SharedString::from(name.clone())),
+                                .overflow_hidden()
+                                .child(SharedString::from(truncate(&session.name, 24))),
                         )
-                        .children(backend.then(|| {
-                            div()
-                                .px_1()
-                                .rounded_sm()
-                                .text_size(px(10.0))
-                                .text_color(hsla(theme.accent))
-                                .bg(rgba_alpha(theme.accent, 0.15))
-                                .child("tako 永続化")
-                        }))
                         .child(
                             div()
                                 .text_size(px(11.0))
-                                .text_color(if attached {
+                                .flex_none()
+                                .text_color(if session.attached {
                                     hsla(theme.accent)
                                 } else {
-                                    hsla(theme.ansi[3]) // 黄: 消し忘れ候補
+                                    hsla(theme.ansi[3])
                                 })
-                                .child(if attached { "attached" } else { "detached" }),
+                                .child(if session.attached {
+                                    "attached"
+                                } else {
+                                    "detached"
+                                }),
                         )
                         .child(
                             div()
                                 .text_size(px(11.0))
                                 .text_color(hsla(theme.tab_inactive_foreground))
+                                .overflow_hidden()
                                 .child(SharedString::from(format!(
                                     "作成 {} ・ {}",
-                                    format_age(now - created),
-                                    location,
+                                    format_age(now - session.created),
+                                    session.location,
                                 ))),
                         )
                         .child(div().flex_grow(1.0))
                         .child(
                             div()
                                 .id(("tmux-kill", index as u64))
-                                .px_2()
+                                .px_1()
+                                .flex_none()
                                 .rounded_sm()
                                 .cursor_pointer()
                                 .text_size(px(11.0))
-                                .text_color(hsla(theme.ansi[1]))
+                                .text_color(hsla_alpha(theme.ansi[1], 0.8))
                                 .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.tmux_pending_kill =
                                         Some((kill_name.clone(), None, kill_socket.clone()));
                                     cx.notify();
                                 }))
-                                .child("kill"),
+                                .child("🗑"),
                         ),
                 )
-                .children(windows.into_iter().map(|(w_index, label)| {
-                    let kill_name = name.clone();
-                    let kill_socket = socket.clone();
+                .children(session.windows.iter().map(|(w_index, label)| {
+                    let w_index = *w_index;
+                    let kill_name = session.name.clone();
+                    let kill_socket = session.socket.clone();
                     div()
                         .flex()
                         .flex_row()
                         .items_center()
                         .gap_2()
                         .pl_4()
-                        .text_size(px(12.0))
-                        .child(SharedString::from(label))
+                        .text_size(px(11.0))
+                        .overflow_hidden()
+                        .child(SharedString::from(truncate(label, 40)))
                         .child(
                             div()
                                 .id(("tmux-kill-window", ((index as u64) << 16) | w_index as u64))
                                 .px_1()
+                                .flex_none()
                                 .rounded_sm()
                                 .cursor_pointer()
                                 .text_size(px(10.0))
@@ -1690,22 +1937,23 @@ impl TakoApp {
                                     ));
                                     cx.notify();
                                 }))
-                                .child("kill"),
+                                .child("🗑"),
                         )
                 }));
-            // 誤爆防止のインライン確認（FR-2.13.3）
-            if let Some((pending_session, pending_window, _)) = &pending {
-                if *pending_session == name {
-                    let label = match (pending_window, backend) {
+            // 誤爆防止のインライン確認（FR-2.13.3 / FR-2.16.8）
+            if let Some((pending_session, pending_window, _)) = &pending_tmux {
+                if *pending_session == session.name {
+                    let name = &session.name;
+                    let label = match (pending_window, session.orphan_backend) {
                         (Some(w), _) => {
-                            format!("window {w} を kill する？（中のプロセスごと終了）")
+                            format!("window {w} を kill していいですか?（中のプロセスごと終了）")
                         }
                         (None, true) => format!(
-                            "{name} は tako の永続化セッション。kill すると対応ペインの中身が消える。kill する？"
+                            "{name} は tako の kill 漏れ残骸の可能性。kill していいですか?（中のプロセスごと終了）"
                         ),
-                        (None, false) => {
-                            format!("セッション {name} を kill する？（中のプロセスごと終了）")
-                        }
+                        (None, false) => format!(
+                            "管理外セッション {name} を kill していいですか?（中のプロセスごと終了）"
+                        ),
                     };
                     card = card.child(
                         div()
@@ -1714,7 +1962,7 @@ impl TakoApp {
                             .items_center()
                             .gap_2()
                             .pl_4()
-                            .text_size(px(12.0))
+                            .text_size(px(11.0))
                             .text_color(hsla(theme.ansi[1]))
                             .child(SharedString::from(label))
                             .child(
@@ -1749,6 +1997,23 @@ impl TakoApp {
             root = root.child(card);
         }
         root
+    }
+
+    /// git ビュー（FR-2.16.4 の git トグルの表示先）。git graph（FR-3.6）の実装までの
+    /// プレースホルダ
+    fn render_git_view(&mut self) -> gpui::Div {
+        let theme = self.theme.clone();
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_4()
+            .bg(rgba(theme.background))
+            .text_color(hsla(theme.tab_inactive_foreground))
+            .text_size(px(12.0))
+            .child("git graph は未実装（FR-3.6）")
+            .child("ブランチ・コミットのグラフ表示をここに追加予定")
     }
 
     /// ファイルツリーの root をフォーカスペインの cwd（無ければ $HOME）に追従させる
@@ -1852,83 +2117,6 @@ impl TakoApp {
     /// ファイルツリーのファイル行クリック。プレビューペイン（FR-3.2）は次の区切りで
     /// 実装するため、当面はフォーカスペインの cwd 基準で何もしない（プレースホルダ）
     fn open_file_row(&mut self, _path: &std::path::Path, _cx: &mut Context<Self>) {}
-
-    /// 集約センター（FR-2.10）。全タブのペイン状態を 1 か所で見てクリックでジャンプする
-    fn render_agents_view(&mut self, cx: &mut Context<Self>) -> gpui::Div {
-        let theme = self.theme.clone();
-        let entries = self.agent_entries();
-        let mut root = div()
-            .flex_1()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .p_4()
-            .bg(rgba(theme.background))
-            .text_color(hsla(theme.foreground))
-            .text_size(px(13.0))
-            .overflow_hidden()
-            .child(
-                div()
-                    .text_color(hsla(theme.tab_inactive_foreground))
-                    .text_size(px(11.0))
-                    .child(
-                        "全タブのペイン状態（クリックでジャンプ。エラー > 入力待ち > 実行中の順）",
-                    ),
-            );
-        for entry in entries {
-            let (color, state_label) = match entry.state {
-                CommandState::Failed(code) => (theme.ansi[1], format!("エラー ({code})")),
-                CommandState::Idle => (theme.ansi[2], "入力待ち".to_string()),
-                CommandState::Running => (theme.accent, "実行中".to_string()),
-                CommandState::Unknown => (theme.tab_inactive_foreground, "状態不明".to_string()),
-            };
-            let pane = entry.pane;
-            root = root.child(
-                div()
-                    .id(("agent-entry", pane.as_u64()))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .p_2()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .bg(rgba_alpha(theme.tab_bar_background, 0.6))
-                    .hover(|d| d.bg(rgba(theme.tab_bar_background)))
-                    .on_click(cx.listener(move |this, _, _, cx| this.jump_to_pane(pane, cx)))
-                    .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(hsla(color)))
-                    .child(
-                        div()
-                            .w(px(72.0))
-                            .text_size(px(11.0))
-                            .text_color(hsla(color))
-                            .child(SharedString::from(state_label)),
-                    )
-                    .child(
-                        div()
-                            .font_weight(FontWeight::BOLD)
-                            .child(SharedString::from(truncate(&entry.label, 32))),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(hsla(theme.tab_inactive_foreground))
-                            .child(SharedString::from(format!(
-                                "タブ {} ・ ペイン {}",
-                                truncate(&entry.tab_title, 16),
-                                pane
-                            ))),
-                    )
-                    .children(entry.cwd.map(|cwd| {
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(hsla(theme.tab_inactive_foreground))
-                            .child(SharedString::from(truncate(&cwd, 48)))
-                    })),
-            );
-        }
-        root
-    }
 
     /// 行テキスト全体を 1 ランで shape するための TextRun（幅計算用。色は使われない）
     fn mono_text_run(&self, len: usize) -> TextRun {
@@ -2456,14 +2644,6 @@ impl TakoApp {
             })
             .collect();
 
-        // agents 固定タブのドット: 全ペイン集約（タブ単位ドットのアプリ全体版。FR-2.10）
-        let agents_dot =
-            match CommandState::aggregate(self.terminals.values().map(|s| s.command_state())) {
-                CommandState::Failed(_) => Some(theme.ansi[1]),
-                CommandState::Running => Some(theme.accent),
-                _ => None,
-            };
-
         div()
             .flex()
             .flex_row()
@@ -2523,47 +2703,109 @@ impl TakoApp {
                     .child("+"),
             )
             .child(div().flex_grow(1.0))
+        // 旧「◧ panel」トグルは下部ステータスバーへ集約済み（FR-2.16.4）
+    }
+
+    /// 下部ステータスバー（FR-2.16.4。Zed / VSCode 風）。
+    /// 左 = ファイルツリートグル、右 = tmux 管理・git 管理トグル。
+    /// トグル状態は dispatch（`tako panel` / MCP `tako_panel`）からも取得・操作できる
+    fn render_status_bar(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = self.theme.clone();
+        // 全ペイン集約の状態ドット（旧 agents 固定タブ → ◧ panel から引き継ぎ。FR-2.10）
+        let agents_dot =
+            match CommandState::aggregate(self.terminals.values().map(|s| s.command_state())) {
+                CommandState::Failed(_) => Some(theme.ansi[1]),
+                CommandState::Running => Some(theme.accent),
+                _ => None,
+            };
+        let toggle = |id: &'static str, active: bool| {
+            div()
+                .id(id)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .h_full()
+                .px_2()
+                .cursor_pointer()
+                .text_size(px(11.0))
+                .when(active, |d| d.bg(rgba(theme.tab_active_background)))
+                .text_color(if active {
+                    hsla(theme.tab_active_foreground)
+                } else {
+                    hsla(theme.tab_inactive_foreground)
+                })
+                .hover(|d| d.bg(rgba_alpha(theme.tab_active_background, 0.7)))
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .h(px(STATUS_BAR_HEIGHT))
+            .w_full()
+            .bg(rgba(theme.tab_bar_background))
+            .border_t_1()
+            .border_color(hsla(theme.pane_border))
             .child(
-                // 右端の情報パネルトグル（固定タブ 0 個方針。FR-2.10 / FR-2.13 は
-                // 右サイドバーの内部タブへ統合）。全ペイン集約の状態ドットを添える
-                div()
-                    .id("panel-toggle")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .h_full()
-                    .px_3()
-                    .cursor_pointer()
-                    .when(self.panel_visible, |d| {
-                        d.bg(rgba(theme.tab_active_background))
-                            .border_b_2()
-                            .border_color(hsla(theme.accent))
-                    })
-                    .text_color(if self.panel_visible {
-                        hsla(theme.tab_active_foreground)
-                    } else {
-                        hsla(theme.tab_inactive_foreground)
-                    })
-                    .text_size(px(12.0))
+                toggle("statusbar-filetree", self.filetree.visible)
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.panel_visible = !this.panel_visible;
-                        if this.panel_visible && this.panel_view == PanelView::Tmux {
-                            this.refresh_tmux(cx);
-                        }
+                        this.toggle_filetree();
                         cx.notify();
                     }))
-                    .children(
-                        agents_dot.map(|color| {
-                            div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color))
-                        }),
-                    )
-                    .child("◧ panel"),
+                    .child("◫ ファイル"),
+            )
+            .child(div().flex_grow(1.0))
+            .child(
+                toggle(
+                    "statusbar-tmux",
+                    self.panel_visible && self.panel_view == PanelView::Tmux,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.toggle_panel_view(PanelView::Tmux, cx);
+                }))
+                .children(
+                    agents_dot
+                        .map(|color| div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color))),
+                )
+                .child("⌗ tmux"),
+            )
+            .child(
+                toggle(
+                    "statusbar-git",
+                    self.panel_visible && self.panel_view == PanelView::Git,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.toggle_panel_view(PanelView::Git, cx);
+                }))
+                .child("⎇ git"),
             )
     }
 
-    /// 右サイドバー情報パネル（非表示なら None）。内部タブで tmux 一覧（FR-2.13）と
-    /// 集約センター（FR-2.10）を切り替える。将来 git graph（FR-3.6）もここに足す
+    /// ファイルツリーの表示トグル（cmd+B / ステータスバー / dispatch 共通の入口）
+    fn toggle_filetree(&mut self) {
+        self.filetree.visible = !self.filetree.visible;
+        // render を待たず即座に root を同期する（オクルージョン中は GPUI が
+        // 再描画しないため、render 内の追従だけだと開いた直後に空になる）
+        self.sync_filetree_root();
+    }
+
+    /// ステータスバーの tmux / git トグル: 同じビューが開いていれば閉じ、
+    /// 違うビューならそのビューへ切り替えて開く（FR-2.16.4）
+    fn toggle_panel_view(&mut self, view: PanelView, cx: &mut Context<Self>) {
+        if self.panel_visible && self.panel_view == view {
+            self.panel_visible = false;
+        } else {
+            self.panel_visible = true;
+            self.panel_view = view;
+            if view == PanelView::Tmux {
+                self.refresh_tmux(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 右サイドバー情報パネル（非表示なら None）。内部タブは統合 tmux ビュー
+    /// （FR-2.16.6）と git（git graph FR-3.6 実装まではプレースホルダ）の 2 本
     fn render_panel(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
         if !self.panel_visible {
             return None;
@@ -2619,11 +2861,12 @@ impl TakoApp {
                             ),
                         )
                         .child(
-                            tab_button("agents", PanelView::Agents, view == PanelView::Agents)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.panel_view = PanelView::Agents;
+                            tab_button("git", PanelView::Git, view == PanelView::Git).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.panel_view = PanelView::Git;
                                     cx.notify();
-                                })),
+                                }),
+                            ),
                         )
                         .child(div().flex_grow(1.0))
                         .child(
@@ -2640,8 +2883,8 @@ impl TakoApp {
                         ),
                 )
                 .child(match view {
-                    PanelView::Tmux => self.render_tmuxview(cx),
-                    PanelView::Agents => self.render_agents_view(cx),
+                    PanelView::Tmux => self.render_tmux_view(cx).into_any_element(),
+                    PanelView::Git => self.render_git_view().into_any_element(),
                 })
                 .child(
                     // 左端のリサイズハンドル（ドラッグで幅調整）
@@ -3079,7 +3322,7 @@ impl ControlHost for TakoApp {
     fn panel_state(&self) -> (bool, f32, tako_control::protocol::PanelViewWire) {
         let view = match self.panel_view {
             PanelView::Tmux => tako_control::protocol::PanelViewWire::Tmux,
-            PanelView::Agents => tako_control::protocol::PanelViewWire::Agents,
+            PanelView::Git => tako_control::protocol::PanelViewWire::Git,
         };
         (self.panel_visible, self.panel_width, view)
     }
@@ -3099,12 +3342,22 @@ impl ControlHost for TakoApp {
         if let Some(view) = view {
             self.panel_view = match view {
                 tako_control::protocol::PanelViewWire::Tmux => PanelView::Tmux,
-                tako_control::protocol::PanelViewWire::Agents => PanelView::Agents,
+                tako_control::protocol::PanelViewWire::Git => PanelView::Git,
             };
         }
         // tmux ビューを開いたら一覧を即時更新する（描画通知は dispatch ループが行う）
         if self.panel_visible && self.panel_view == PanelView::Tmux {
             self.refresh_tmux_data();
+        }
+    }
+
+    fn filetree_visible(&self) -> bool {
+        self.filetree.visible
+    }
+
+    fn set_filetree(&mut self, visible: bool) {
+        if self.filetree.visible != visible {
+            self.toggle_filetree();
         }
     }
 }
@@ -3401,9 +3654,10 @@ impl Render for TakoApp {
             px(0.0)
         };
         let content_origin = point(sidebar_width, px(TAB_BAR_HEIGHT));
+        // 下部ステータスバー（FR-2.16.4）の分も差し引く
         let content_size = size(
             viewport.width - sidebar_width - panel_width,
-            viewport.height - px(TAB_BAR_HEIGHT),
+            viewport.height - px(TAB_BAR_HEIGHT) - px(STATUS_BAR_HEIGHT),
         );
         let tree = self.workspace.active_tab().tree();
         let focused = tree.focused();
@@ -3625,10 +3879,7 @@ impl Render for TakoApp {
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.copy_selection(cx)))
             .on_action(cx.listener(|this, _: &PasteClipboard, _, cx| this.paste(cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
-                this.filetree.visible = !this.filetree.visible;
-                // render を待たず即座に root を同期する（オクルージョン中は GPUI が
-                // 再描画しないため、render 内の追従だけだと開いた直後に空になる）
-                this.sync_filetree_root();
+                this.toggle_filetree();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &Quit, _, cx| {
@@ -3676,6 +3927,7 @@ impl Render for TakoApp {
                     )
                     .children(self.render_panel(cx)),
             )
+            .child(self.render_status_bar(cx))
             .child(ime_registration)
     }
 }
@@ -5206,8 +5458,8 @@ mod self_test {
                 eprintln!("（tmux 不在のため項目 48 をスキップ）");
             }
 
-            // 49. 情報パネルの tmux ビュー（FR-2.13。dispatch の Panel 操作で表示 →
-            //     一覧更新 → kill の確認フローが畳めること → 非表示）。固定タブ 0 個方針
+            // 49. 情報パネルの統合 tmux ビュー（FR-2.13 / FR-2.16.6。dispatch の Panel 操作で
+            //     表示 → 一覧更新 → kill の確認フローが畳めること → 非表示）。固定タブ 0 個方針
             let view_ok = window
                 .update(cx, |app, _, cx| {
                     let opened = tako_control::dispatch(
@@ -5216,6 +5468,7 @@ mod self_test {
                             visible: Some(true),
                             width: Some(320.0),
                             view: Some(tako_control::protocol::PanelViewWire::Tmux),
+                            filetree: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -5232,6 +5485,7 @@ mod self_test {
                             visible: Some(false),
                             width: None,
                             view: None,
+                            filetree: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -5239,7 +5493,7 @@ mod self_test {
                     opened_ok && shown && pending_cleared && closed_ok && !app.panel_visible
                 })
                 .unwrap_or(false);
-            check(view_ok, "情報パネル（tmux ビュー）の表示・確認フロー・非表示");
+            check(view_ok, "情報パネル（統合 tmux ビュー）の表示・確認フロー・非表示");
 
             // 50. tako tab rename（FR-2.12.1）: 呼び出し元ペインからタブを解決し、
             //     明示リネームは手動扱い（title_source = manual）でタブ表示名になる
@@ -5425,51 +5679,95 @@ mod self_test {
             type_text(any, cx, "kill %1 2>/dev/null", true);
             wait(cx, 500).await;
 
-            // 56. 集約センター（FR-2.10。情報パネルの agents ビュー）。全タブのペインが
-            //     注目度順に並び、ジャンプで該当ペインへフォーカス（パネルは開いたまま）
-            let agents_ok = window
+            // 56. 統合 tmux ビューのタブ枠データ（FR-2.16.6〜2.16.7。旧集約センター FR-2.10 を
+            //     統合）。全タブの全ペインがタブ枠に載り、枠内は注目度順。ジャンプで該当ペインへ
+            //     フォーカス（パネルは開いたまま）。ペイン kill の確認フローも畳める
+            let groups_ok = window
                 .update(cx, |app, _, cx| {
                     let opened = tako_control::dispatch(
                         app,
                         tako_control::protocol::Request::Panel {
                             visible: Some(true),
                             width: None,
-                            view: Some(tako_control::protocol::PanelViewWire::Agents),
+                            view: Some(tako_control::protocol::PanelViewWire::Tmux),
+                            filetree: None,
                         },
                         PaneOrigin::Cli,
                     );
-                    let opened_ok =
-                        matches!(&opened, Ok(v) if v["view"].as_str() == Some("agents"));
-                    let entries = app.agent_entries();
-                    // 全ペインが載っている + 注目度順（rank が単調非減少）
+                    let opened_ok = matches!(&opened, Ok(v) if v["view"].as_str() == Some("tmux"));
+                    let groups = app.tmux_view_groups();
+                    // タブ枠がタブと 1:1 + 全ペインが載っている + 枠内は注目度順（単調非減少）
+                    let tabs_match = groups.len() == app.workspace.tabs().len();
                     let total: usize = app
                         .workspace
                         .tabs()
                         .iter()
                         .map(|t| t.tree().panes().len())
                         .sum();
-                    let all_listed = entries.len() == total && total > 0;
-                    let sorted = entries
-                        .windows(2)
-                        .all(|w| state_rank(w[0].state) <= state_rank(w[1].state));
+                    let listed: usize = groups.iter().map(|g| g.rows.len()).sum();
+                    let all_listed = listed == total && total > 0;
+                    let sorted = groups.iter().all(|g| {
+                        g.rows
+                            .windows(2)
+                            .all(|w| state_rank(w[0].state) <= state_rank(w[1].state))
+                    });
                     // 非アクティブタブのペインへジャンプ → タブも切り替わる
-                    let target = entries
+                    let target = groups
                         .iter()
-                        .find(|e| {
-                            app.workspace.find_tab_of_pane(e.pane)
-                                != Some(app.workspace.active_tab_id())
-                        })
-                        .or(entries.first())
+                        .find(|g| g.tab != app.workspace.active_tab_id())
+                        .and_then(|g| g.rows.first())
+                        .or_else(|| groups.first().and_then(|g| g.rows.first()))
                         .map(|e| e.pane)
                         .expect("エントリは 1 件以上ある");
                     app.jump_to_pane(target, cx);
+                    let jumped = app.focused_pane() == target;
                     // ジャンプしてもパネルは開いたまま（畳むのはユーザー / AI の明示操作）
                     let still_open = app.panel_visible;
+                    // ペイン kill（FR-2.16.7）: 一時ペインを生やし、ゴミ箱 → 確認 → kill の
+                    // 経路（pending → pane_kill_confirmed = dispatch Close）で消えること。
+                    // dispatch を直接呼ぶためセッション起動依頼（pending_attach）はここで
+                    // 処理する（IPC ループ相当。残すと後続 dispatch が死んだペインを起動する）
+                    let split = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Split {
+                            pane: Some(target.as_u64()),
+                            direction: None,
+                            ratio: None,
+                            command: None,
+                            cwd: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    let temp = split
+                        .ok()
+                        .and_then(|v| v["pane"].as_u64())
+                        .expect("split は成功する");
+                    for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                        app.spawn_session(pane, options, cx)
+                            .expect("一時ペインの PTY 起動は成功する");
+                    }
+                    let temp_id = app
+                        .workspace
+                        .tabs()
+                        .iter()
+                        .flat_map(|t| t.tree().panes())
+                        .map(|p| p.id())
+                        .find(|p| p.as_u64() == temp)
+                        .expect("生やしたペインは存在する");
+                    app.pending_pane_kill = Some(temp_id);
+                    app.pane_kill_confirmed(cx);
+                    let killed = app.pending_pane_kill.is_none()
+                        && !app
+                            .workspace
+                            .tabs()
+                            .iter()
+                            .flat_map(|t| t.tree().panes())
+                            .any(|p| p.id() == temp_id);
                     app.panel_visible = false;
-                    opened_ok && all_listed && sorted && app.focused_pane() == target && still_open
+                    opened_ok && tabs_match && all_listed && sorted && jumped && still_open && killed
                 })
                 .unwrap_or(false);
-            check(agents_ok, "集約センター（パネル agents ビュー）の一覧とジャンプ");
+            check(groups_ok, "統合 tmux ビューのタブ枠一覧・ジャンプ・kill 確認フロー");
 
             // 57. ファイルツリー（FR-3.1 / FR-3.7）。cmd+B で開閉し、表示中は
             //     フォーカスペインの cwd（無ければ $HOME）が root に追従して行が出る
@@ -5803,8 +6101,8 @@ mod self_test {
                 any,
                 cx,
                 &format!(
-                    "{cli} panel --show --view agents --width 300 \
-                     | grep -q '\"view\":\"agents\"' && echo TAKO-PN-$((60+4))"
+                    "{cli} panel --show --view git --width 300 \
+                     | grep -q '\"view\":\"git\"' && echo TAKO-PN-$((60+4))"
                 ),
                 true,
             );
@@ -5816,13 +6114,40 @@ mod self_test {
             let panel_synced = window
                 .update(cx, |app, _, _| {
                     let ok = app.panel_visible
-                        && app.panel_view == PanelView::Agents
+                        && app.panel_view == PanelView::Git
                         && (app.panel_width - 300.0).abs() < 1.0;
                     app.panel_visible = false;
                     ok
                 })
                 .unwrap_or(false);
             check(panel_synced, "panel 操作が UI 状態へ反映");
+
+            // 64b. ファイルツリーの CLI / MCP 経路（FR-2.16.5。従来は cmd+B のみだった）:
+            //      `tako panel --filetree on/off` で開閉でき、状態が応答 JSON に載る
+            press(any, cx, "ctrl-u");
+            type_text(
+                any,
+                cx,
+                &format!(
+                    "{cli} panel --filetree on | grep -q '\"filetree\":true' \
+                     && echo TAKO-FT-$((60+4))b"
+                ),
+                true,
+            );
+            wait(cx, 1200).await;
+            check(
+                focused_contains(window, cx, "TAKO-FT-64b"),
+                "tako panel --filetree の roundtrip",
+            );
+            let filetree_synced = window
+                .update(cx, |app, _, _| {
+                    // dispatch 経由でも root の cwd 同期込みで開く（行が出る状態）
+                    let opened = app.filetree.visible && app.filetree.root().is_some();
+                    app.set_filetree(false);
+                    opened && !app.filetree.visible
+                })
+                .unwrap_or(false);
+            check(filetree_synced, "filetree 操作が UI 状態へ反映");
 
             // 65. 接続情報の上書き競合（2026-06-12 バグ (8) の回帰）: 一時インスタンスが
             //     current（control.json）を上書きして exit した状況を再現し、env なしの

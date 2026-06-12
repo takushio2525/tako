@@ -61,6 +61,12 @@ pub trait ControlHost {
         _view: Option<crate::protocol::PanelViewWire>,
     ) {
     }
+    /// 左サイドバーのファイルツリー（FR-3.1）の表示状態（FR-2.16.5）
+    fn filetree_visible(&self) -> bool {
+        false
+    }
+    /// ファイルツリーの表示・非表示（root の cwd 同期は実装側の責務）
+    fn set_filetree(&mut self, _visible: bool) {}
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -476,6 +482,7 @@ pub fn dispatch(
             visible,
             width,
             view,
+            filetree,
         } => {
             if let Some(w) = width {
                 if !w.is_finite() || w <= 0.0 {
@@ -485,11 +492,15 @@ pub fn dispatch(
                 }
             }
             host.set_panel(visible, width, view);
+            if let Some(filetree) = filetree {
+                host.set_filetree(filetree);
+            }
             let (visible, width, view) = host.panel_state();
             Ok(json!({
                 "visible": visible,
                 "width": width,
                 "view": view.as_str(),
+                "filetree": host.filetree_visible(),
             }))
         }
     }

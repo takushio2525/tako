@@ -245,8 +245,11 @@ struct PanelArgs {
     #[arg(long)]
     width: Option<f32>,
     /// 表示するビュー
-    #[arg(long, value_parser = ["tmux", "agents"])]
+    #[arg(long, value_parser = ["tmux", "git"])]
     view: Option<String>,
+    /// 左サイドバーのファイルツリー表示（FR-2.16.5。on = 表示、off = 非表示）
+    #[arg(long, value_parser = ["on", "off"])]
+    filetree: Option<String>,
 }
 
 /// ON/OFF トグル系コマンド共通の引数（autorename / portdetect）
@@ -505,9 +508,10 @@ fn build_request(command: &Command) -> Result<Request, String> {
             },
             width: args.width,
             view: args.view.as_deref().map(|v| match v {
-                "agents" => tako_control::protocol::PanelViewWire::Agents,
+                "git" => tako_control::protocol::PanelViewWire::Git,
                 _ => tako_control::protocol::PanelViewWire::Tmux,
             }),
+            filetree: args.filetree.as_deref().map(|s| s == "on"),
         },
         Command::Portdetect(args) => Request::PortDetect {
             enabled: args.state.as_deref().map(|s| s == "on"),

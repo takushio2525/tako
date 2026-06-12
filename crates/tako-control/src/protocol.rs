@@ -72,19 +72,20 @@ fn default_true() -> bool {
     true
 }
 
-/// 右サイドバー情報パネルの内部ビュー（固定タブ 0 個方針。将来 git graph を追加予定）
+/// 右サイドバー情報パネルの内部ビュー（固定タブ 0 個方針。FR-2.16.6 で agents は
+/// tmux ビューへ統合済み。git は git graph（FR-3.6）実装までプレースホルダ表示）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PanelViewWire {
     Tmux,
-    Agents,
+    Git,
 }
 
 impl PanelViewWire {
     pub fn as_str(self) -> &'static str {
         match self {
             PanelViewWire::Tmux => "tmux",
-            PanelViewWire::Agents => "agents",
+            PanelViewWire::Git => "git",
         }
     }
 }
@@ -179,14 +180,17 @@ pub enum Request {
     /// `enabled` 省略時は現在状態の取得のみ。切替は**以後生成されるペイン**に効く
     /// （既存ペインのバックエンドは変わらない）。設定は永続化される
     Persist { enabled: Option<bool> },
-    /// 右サイドバー情報パネル（tmux 一覧 / 集約センター）の表示・幅・ビュー切替。
-    /// すべて省略 = 現在状態の取得のみ（AI が成果や状況をユーザーへ見せる導線。
-    /// 設計原則 5: UI でできる操作はすべてここから可能）
+    /// 右サイドバー情報パネル（統合 tmux ビュー / git）の表示・幅・ビュー切替と、
+    /// 左サイドバーのファイルツリー表示切替（FR-2.16.5。下部ステータスバーのトグルと
+    /// 同じ経路）。すべて省略 = 現在状態の取得のみ（AI が成果や状況をユーザーへ見せる
+    /// 導線。設計原則 5: UI でできる操作はすべてここから可能）
     Panel {
         visible: Option<bool>,
         /// パネル幅（px）
         width: Option<f32>,
         view: Option<PanelViewWire>,
+        /// 左サイドバーのファイルツリー（FR-3.1）の表示・非表示
+        filetree: Option<bool>,
     },
 }
 
