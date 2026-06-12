@@ -278,3 +278,13 @@
   ③ ステータスバー消失 = taffy flex 子の min-content 最小サイズが根因 → 中段 min_h(0) +
   各バー flex_none（教訓は architecture.md）。セルフテスト 109 項目緑（61f 追加）
 - 次: ユーザー再起動 → manual-checks「実機バグ 3 件一括修正」節の実機確認
+
+## 2026-06-13（Phase 5 再開: コードプレビュー / Markdown / タブ = ワークスペース）
+
+- FR-3.2 コードプレビュー（syntect を `Highlighter` trait で抽象化 + 行番号）/ FR-3.3
+  Markdown（pulldown-cmark。目アイコンで code ⇔ markdown トグル、mode は CLI / MCP 可）/
+  FR-3.1 改（ファイルツリーをタブ内全ペイン cwd のマルチルート = ワークスペース表示へ刷新）。
+  dispatch `OpenFile` + `tako open` + MCP `tako_open_file`（計 21 ツール）+ layout.json 永続化
+- セルフテスト 114 項目緑（66/66b/67 追加）。実装メモは requirements.md FR-3.1〜3.3
+- 次: ユーザー再起動 → manual-checks「ワークスペース機能第 1 弾」節 / 次タスクは相談
+  （FR-3.6 git graph or FR-2.19 ポートパネルが候補）

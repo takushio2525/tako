@@ -10,10 +10,10 @@
 use serde_json::{json, Value};
 use tako_core::{
     Pane, PaneId, PaneNode, PaneOrigin, PaneTreeError, Rect, SpawnCommand, SpawnOptions, SplitAxis,
-    TabId, TerminalSession, Workspace,
+    SplitDirection, TabId, TerminalSession, Workspace,
 };
 
-use crate::protocol::{error_code, Direction, Request};
+use crate::protocol::{error_code, Direction, PreviewModeWire, Request};
 
 /// dispatch がドメイン状態へ触るためのホスト。UI 層（tako-app）とテストが実装する
 pub trait ControlHost {
@@ -67,6 +67,17 @@ pub trait ControlHost {
     }
     /// ファイルツリーの表示・非表示（root の cwd 同期は実装側の責務）
     fn set_filetree(&mut self, _visible: bool) {}
+    /// ペインのプレビュー状態（FR-3.2。`(path, mode)`。プレビューペインでなければ None）
+    fn preview_state(&self, _pane: PaneId) -> Option<(String, crate::protocol::PreviewModeWire)> {
+        None
+    }
+    /// ペインをプレビューペインにする / 表示内容を差し替える（読み込みは実装側の責務）
+    fn set_preview(&mut self, _pane: PaneId, _path: &str, _mode: crate::protocol::PreviewModeWire) {
+    }
+    /// タブ内の既存プレビューペイン（OpenFile の再利用先。VSCode のプレビュータブ相当）
+    fn preview_pane_of_tab(&self, _tab: TabId) -> Option<PaneId> {
+        None
+    }
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -503,6 +514,58 @@ pub fn dispatch(
                 "filetree": host.filetree_visible(),
             }))
         }
+
+        Request::OpenFile { pane, path, mode } => {
+            let (tab, target) = resolve_pane(host.workspace(), pane)?;
+            // 相対パスは対象ペインの cwd（OSC 7。無ければプロセスの cwd）基準で解決する
+            let mut resolved = std::path::PathBuf::from(&path);
+            if resolved.is_relative() {
+                if let Some(cwd) = host.session(target).and_then(|s| s.cwd()) {
+                    resolved = cwd.join(resolved);
+                }
+            }
+            let resolved = resolved.canonicalize().map_err(|e| {
+                DispatchError::Operation(format!("ファイルを開けない（{path}: {e}）"))
+            })?;
+            if !resolved.is_file() {
+                return Err(DispatchError::Operation(format!(
+                    "ファイルではない: {}",
+                    resolved.display()
+                )));
+            }
+            let mode =
+                mode.unwrap_or_else(|| match resolved.extension().and_then(|e| e.to_str()) {
+                    Some(ext) if ext.eq_ignore_ascii_case("md") => PreviewModeWire::Markdown,
+                    Some(ext) if ext.eq_ignore_ascii_case("markdown") => PreviewModeWire::Markdown,
+                    _ => PreviewModeWire::Code,
+                });
+            // 表示先の解決: 対象自身がプレビュー > 同タブの既存プレビュー（再利用）>
+            // 対象を分割して新設（ターミナルセッションは起動しない = attach なし）
+            let (view_pane, created) = if host.preview_state(target).is_some() {
+                (target, false)
+            } else if let Some(existing) = host.preview_pane_of_tab(tab) {
+                (existing, false)
+            } else {
+                let new_pane = Pane::new(origin);
+                let new_id = new_pane.id();
+                tree_mut(host.workspace_mut(), tab)
+                    .split_with_ratio(target, SplitDirection::Right, 0.5, new_pane)
+                    .map_err(op_err)?;
+                (new_id, true)
+            };
+            let path_str = resolved.display().to_string();
+            host.set_preview(view_pane, &path_str, mode);
+            // 開いたものへフォーカスを移す（タブ切替はしない。見せる導線は Focus / FR-2.7）
+            tree_mut(host.workspace_mut(), tab)
+                .focus(view_pane)
+                .map_err(op_err)?;
+            Ok(json!({
+                "pane": view_pane.as_u64(),
+                "path": path_str,
+                "mode": mode.as_str(),
+                "created": created,
+            }))
+        }
     }
 }
 
@@ -592,6 +655,11 @@ fn list_json(host: &dyn ControlHost) -> Value {
                             "history": s.history_size(),
                             "alt_screen": s.is_alt_screen(),
                         })),
+                        // プレビューペイン（FR-3.2 / FR-3.3）。ターミナルペインでは null
+                        "preview": host.preview_state(p.id()).map(|(path, mode)| json!({
+                            "path": path,
+                            "mode": mode.as_str(),
+                        })),
                     })
                 })
                 .collect();
@@ -668,6 +736,7 @@ mod tests {
         ws: Workspace,
         attached: Vec<u64>,
         detached: Vec<u64>,
+        previews: std::collections::HashMap<u64, (String, PreviewModeWire)>,
     }
 
     impl MockHost {
@@ -676,6 +745,7 @@ mod tests {
                 ws: Workspace::new("t1", Pane::new(PaneOrigin::User)),
                 attached: Vec::new(),
                 detached: Vec::new(),
+                previews: std::collections::HashMap::new(),
             }
         }
 
@@ -699,6 +769,22 @@ mod tests {
         }
         fn detach_session(&mut self, pane: PaneId) {
             self.detached.push(pane.as_u64());
+            self.previews.remove(&pane.as_u64());
+        }
+        fn preview_state(&self, pane: PaneId) -> Option<(String, PreviewModeWire)> {
+            self.previews.get(&pane.as_u64()).cloned()
+        }
+        fn set_preview(&mut self, pane: PaneId, path: &str, mode: PreviewModeWire) {
+            self.previews.insert(pane.as_u64(), (path.into(), mode));
+        }
+        fn preview_pane_of_tab(&self, tab: TabId) -> Option<PaneId> {
+            self.ws
+                .get_tab(tab)?
+                .tree()
+                .panes()
+                .into_iter()
+                .map(|p| p.id())
+                .find(|p| self.previews.contains_key(&p.as_u64()))
         }
     }
 
@@ -1088,6 +1174,69 @@ mod tests {
             host.ws.active_tab().title_source(),
             tako_core::TitleSource::Default
         );
+    }
+
+    #[test]
+    fn open_fileはプレビューペインを生やし再利用する() {
+        let dir = std::env::temp_dir().join(format!("tako-dispatch-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.join("b.md"), "# 見出し").unwrap();
+
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let open = |host: &mut MockHost, path: String, mode: Option<PreviewModeWire>| {
+            dispatch(
+                host,
+                Request::OpenFile {
+                    pane: Some(root),
+                    path,
+                    mode,
+                },
+                PaneOrigin::Mcp,
+            )
+        };
+        // 新設: ペインが生え、ターミナルは attach されない。mode は拡張子から code
+        let result = open(&mut host, dir.join("a.rs").display().to_string(), None).unwrap();
+        let preview_pane = result["pane"].as_u64().unwrap();
+        assert_ne!(preview_pane, root);
+        assert_eq!(result["created"].as_bool(), Some(true));
+        assert_eq!(result["mode"].as_str(), Some("code"));
+        assert!(host.attached.is_empty(), "プレビューは PTY を起動しない");
+        assert_eq!(host.ws.active_tab().tree().len(), 2);
+        // フォーカスはプレビューペインへ
+        assert_eq!(host.ws.active_tab().tree().focused().as_u64(), preview_pane);
+        // 再利用: 同タブの 2 ファイル目は同じペインに差し替わる。.md は markdown 既定
+        let result = open(&mut host, dir.join("b.md").display().to_string(), None).unwrap();
+        assert_eq!(result["pane"].as_u64(), Some(preview_pane));
+        assert_eq!(result["created"].as_bool(), Some(false));
+        assert_eq!(result["mode"].as_str(), Some("markdown"));
+        assert_eq!(host.ws.active_tab().tree().len(), 2);
+        // mode の明示指定（トグルの CLI / MCP 経路）: 同じファイルを code 表示へ
+        let result = open(
+            &mut host,
+            dir.join("b.md").display().to_string(),
+            Some(PreviewModeWire::Code),
+        )
+        .unwrap();
+        assert_eq!(result["mode"].as_str(), Some("code"));
+        // list に preview が公開される
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        let panes = list["tabs"][0]["panes"].as_array().unwrap();
+        let preview = panes
+            .iter()
+            .find(|p| p["id"].as_u64() == Some(preview_pane))
+            .unwrap();
+        assert_eq!(preview["preview"]["mode"].as_str(), Some("code"));
+        assert!(preview["preview"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("b.md"));
+        // 存在しないパス・ディレクトリはエラー
+        assert!(open(&mut host, dir.join("no-such").display().to_string(), None).is_err());
+        assert!(open(&mut host, dir.display().to_string(), None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

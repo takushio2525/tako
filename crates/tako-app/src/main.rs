@@ -15,6 +15,7 @@
 
 mod autorename;
 mod filetree;
+mod preview;
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -392,6 +393,9 @@ struct TakoApp {
     pending_pane_kill: Option<PaneId>,
     /// 左サイドバーのファイルツリー（FR-3.1 / FR-3.7。cmd+B でトグル）
     filetree: filetree::FileTree,
+    /// プレビューペイン（FR-3.2 / FR-3.3）。キーに居るペインはターミナルではなく
+    /// ファイル内容（コードハイライト / Markdown レンダリング）を描画する
+    previews: HashMap<PaneId, preview::PreviewState>,
     /// タブ・ペイン名の AI 自動リネームの検知状態（FR-2.12。ループは new で張る）
     autorename: autorename::AutoRenamer,
     /// listen ポート検知 + 提案チップの有効状態（FR-2.4.4。dispatch から切替）
@@ -589,6 +593,7 @@ impl TakoApp {
             tmux_pending_kill: None,
             pending_pane_kill: None,
             filetree: filetree::FileTree::default(),
+            previews: HashMap::new(),
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
             port_detect: initial_port_detect(),
             port_suggestions: Vec::new(),
@@ -618,6 +623,16 @@ impl TakoApp {
                 let Some(&pane) = pane_ids.iter().find(|p| p.as_u64() == r.pane) else {
                     continue;
                 };
+                // プレビューペイン（FR-3.2）はファイルを開き直すだけ（PTY は起動しない）
+                if let Some(p) = &r.preview {
+                    let mode = match p.mode.as_str() {
+                        "markdown" => preview::PreviewMode::Markdown,
+                        _ => preview::PreviewMode::Code,
+                    };
+                    app.previews
+                        .insert(pane, preview::load(std::path::Path::new(&p.path), mode));
+                    continue;
+                }
                 if let Some(name) = &r.session {
                     app.backend_sessions.insert(pane, name.clone());
                 }
@@ -633,7 +648,7 @@ impl TakoApp {
                     eprintln!("warning: ペイン {pane} を復元できない: {e}");
                 }
             }
-            if app.terminals.is_empty() {
+            if app.terminals.is_empty() && app.previews.is_empty() {
                 eprintln!("fatal: 復元したペインを 1 つも起動できない");
                 std::process::exit(1);
             }
@@ -690,7 +705,7 @@ impl TakoApp {
                 if app.panel_visible && app.panel_view == PanelView::Tmux {
                     app.refresh_tmux(cx);
                 }
-                app.sync_filetree_root();
+                app.sync_filetree_roots();
                 if app.filetree.visible && app.filetree.refresh() {
                     cx.notify();
                 }
@@ -976,10 +991,14 @@ impl TakoApp {
                             (Some(t), Some(r)) => format!("{t} · {r}"),
                             (Some(t), None) => t.to_string(),
                             (None, Some(r)) => r.to_string(),
-                            (None, None) => session
-                                .and_then(|s| s.title())
-                                .unwrap_or("シェル")
-                                .to_string(),
+                            // プレビューペイン（FR-3.2）はファイル名で表す
+                            (None, None) => match self.previews.get(&p.id()) {
+                                Some(preview) => format!("📄 {}", preview.file_name()),
+                                None => session
+                                    .and_then(|s| s.title())
+                                    .unwrap_or("シェル")
+                                    .to_string(),
+                            },
                         };
                         AgentEntry {
                             pane: p.id(),
@@ -1386,6 +1405,7 @@ impl TakoApp {
         match tab.tree_mut().close(pane_id) {
             Ok(_) => {
                 self.terminals.remove(&pane_id);
+                self.previews.remove(&pane_id);
                 self.scroll_accum.remove(&pane_id);
                 self.scroll_ctls.remove(&pane_id);
                 self.drop_backend_session(pane_id);
@@ -1407,6 +1427,7 @@ impl TakoApp {
             Ok(_) => {
                 for id in pane_ids {
                     self.terminals.remove(&id);
+                    self.previews.remove(&id);
                     self.scroll_accum.remove(&id);
                     self.scroll_ctls.remove(&id);
                     self.drop_backend_session(id);
@@ -1440,6 +1461,7 @@ impl TakoApp {
         }
         let backend_sessions = &self.backend_sessions;
         let terminals = &self.terminals;
+        let previews = &self.previews;
         let layout = tako_control::layout::capture(
             &self.workspace,
             &|pane| tako_control::layout::PaneMeta {
@@ -1448,6 +1470,12 @@ impl TakoApp {
                     .get(&pane)
                     .and_then(|s| s.cwd())
                     .map(|p| p.display().to_string()),
+                preview: previews
+                    .get(&pane)
+                    .map(|p| tako_control::layout::PreviewLayout {
+                        path: p.path.display().to_string(),
+                        mode: p.mode.to_wire().as_str().to_string(),
+                    }),
             },
             self.window_frame.clone(),
         );
@@ -2215,30 +2243,47 @@ impl TakoApp {
 
     /// ファイルツリーの root をフォーカスペインの cwd（無ければ $HOME）に追従させる
     /// （FR-3.1。render・トグル・定期ループから呼ばれる。非表示中は何もしない）
-    fn sync_filetree_root(&mut self) {
+    /// 「タブ = ワークスペース」の同期(FR-3.1。2026-06-13 変更): アクティブタブ内の
+    /// 全ペインの cwd（OSC 7）をワークスペースフォルダとしてツリーへ並べる。
+    /// cwd が 1 つも取れないときはホームへフォールバック
+    fn sync_filetree_roots(&mut self) {
         if !self.filetree.visible {
             return;
         }
-        let cwd = self
-            .focused_session()
-            .and_then(|s| s.cwd())
-            .map(|p| p.to_path_buf())
-            .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from));
-        self.filetree.set_root(cwd);
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        for pane in self.workspace.active_tab().tree().panes() {
+            let Some(cwd) = self
+                .terminals
+                .get(&pane.id())
+                .and_then(|s| s.cwd())
+                .filter(|p| p.is_dir())
+            else {
+                continue;
+            };
+            let cwd = cwd.to_path_buf();
+            if !roots.contains(&cwd) {
+                roots.push(cwd);
+            }
+        }
+        if roots.is_empty() {
+            if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+                roots.push(home);
+            }
+        }
+        self.filetree.set_roots(roots);
     }
 
-    /// 左サイドバーのファイルツリー（FR-3.1。非表示なら None = 純粋なターミナル FR-3.7）
+    /// 左サイドバーのファイルツリー（FR-3.1。非表示なら None = 純粋なターミナル FR-3.7）。
+    /// 「タブ = ワークスペース」: タブ内全ペインの cwd がワークスペースフォルダとして並ぶ
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
         if !self.filetree.visible {
             return None;
         }
         let theme = self.theme.clone();
-        let root_label = self
-            .filetree
-            .root()
-            .and_then(|r| r.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "—".into());
+        let tab_title = self.workspace.active_tab().title().to_string();
+        // プレビュー表示中のファイル（開いている行を控えめにハイライトする）
+        let open_paths: std::collections::HashSet<std::path::PathBuf> =
+            self.previews.values().map(|p| p.path.clone()).collect();
         let rows = self.filetree.rows();
         Some(
             div()
@@ -2253,14 +2298,16 @@ impl TakoApp {
                 .text_color(hsla(theme.foreground))
                 .overflow_hidden()
                 .child(
+                    // ヘッダ: ワークスペース = アクティブタブ（VSCode のエクスプローラ相当）
                     div()
                         .px_2()
                         .py_1()
-                        .text_size(px(11.0))
-                        .text_color(hsla(theme.tab_inactive_foreground))
+                        .flex_none()
+                        .text_size(px(10.0))
+                        .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.9))
                         .child(SharedString::from(format!(
-                            "📁 {}",
-                            truncate(&root_label, 24)
+                            "ワークスペース — {}",
+                            truncate(&tab_title, 20)
                         ))),
                 )
                 .child(
@@ -2273,7 +2320,8 @@ impl TakoApp {
                         .children(rows.into_iter().enumerate().map(|(index, row)| {
                             let path = row.entry.path.clone();
                             let is_dir = row.entry.is_dir;
-                            let marker = if is_dir {
+                            let is_open = !is_dir && open_paths.contains(&path);
+                            let chevron = if is_dir {
                                 if row.expanded {
                                     "▾ "
                                 } else {
@@ -2282,18 +2330,15 @@ impl TakoApp {
                             } else {
                                 "  "
                             };
-                            div()
+                            let base = div()
                                 .id(("filetree-row", index as u64))
                                 .flex()
                                 .flex_row()
                                 .items_center()
+                                .w_full()
                                 .px_1()
-                                .pl(px(6.0 + 12.0 * row.depth as f32))
                                 .cursor_pointer()
                                 .hover(|d| d.bg(rgba(theme.tab_active_background)))
-                                .when(!is_dir, |d| {
-                                    d.text_color(hsla_alpha(theme.foreground, 0.85))
-                                })
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if is_dir {
                                         this.filetree.toggle_dir(&path);
@@ -2301,19 +2346,74 @@ impl TakoApp {
                                         this.open_file_row(&path, cx);
                                     }
                                     cx.notify();
-                                }))
-                                .child(SharedString::from(format!(
-                                    "{marker}{}",
-                                    truncate(&row.entry.name, 26)
-                                )))
+                                }));
+                            if row.root {
+                                // ワークスペースフォルダの見出し行: 太字 + 上仕切り線（2 つ目以降）
+                                base.when(index > 0, |d| {
+                                    d.border_t_1()
+                                        .border_color(hsla_alpha(theme.pane_border, 0.6))
+                                        .mt_1()
+                                })
+                                .py(px(2.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(hsla(theme.tab_active_foreground))
+                                .child(SharedString::from(
+                                    format!("{chevron}🗂 {}", truncate(&row.entry.name, 22)),
+                                ))
+                            } else {
+                                base.pl(px(8.0 + 12.0 * row.depth as f32))
+                                    .when(!is_dir, |d| {
+                                        d.text_color(hsla_alpha(theme.foreground, 0.85))
+                                    })
+                                    .when(is_open, |d| {
+                                        d.bg(rgba_alpha(theme.tab_active_background, 0.6))
+                                            .text_color(hsla(theme.accent))
+                                    })
+                                    .child(SharedString::from(format!(
+                                        "{chevron}{}",
+                                        truncate(&row.entry.name, 24)
+                                    )))
+                            }
                         })),
                 ),
         )
     }
 
-    /// ファイルツリーのファイル行クリック。プレビューペイン（FR-3.2）は次の区切りで
-    /// 実装するため、当面はフォーカスペインの cwd 基準で何もしない（プレースホルダ）
-    fn open_file_row(&mut self, _path: &std::path::Path, _cx: &mut Context<Self>) {}
+    /// ファイルツリーのファイル行クリック → プレビューペインで開く（FR-3.2）。
+    /// CLI / MCP（`tako open` / `tako_open_file`）と同じ dispatch 経路を通す
+    /// （開発不変条件の UI 側の一貫性。OpenFile はセッション起動を伴わないため
+    /// pending_attach の後処理は不要）
+    fn open_file_row(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        let pane = self.focused_pane().as_u64();
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::OpenFile {
+                pane: Some(pane),
+                path: path.display().to_string(),
+                mode: None,
+            },
+            PaneOrigin::User,
+        );
+        if let Err(e) = result {
+            eprintln!("warning: ファイルを開けない: {e}");
+        }
+        cx.notify();
+    }
+
+    /// プレビューの「コード ⇔ Markdown」トグル（目アイコン。FR-3.3）。
+    /// 同じ状態は dispatch（OpenFile の mode 指定）= CLI / MCP からも切り替えられる
+    fn toggle_preview_mode(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        let Some(state) = self.previews.get(&pane_id) else {
+            return;
+        };
+        let mode = match state.mode {
+            preview::PreviewMode::Code => preview::PreviewMode::Markdown,
+            preview::PreviewMode::Markdown => preview::PreviewMode::Code,
+        };
+        let path = state.path.clone();
+        self.previews.insert(pane_id, preview::load(&path, mode));
+        cx.notify();
+    }
 
     /// 行テキスト全体を 1 ランで shape するための TextRun（幅計算用。色は使われない）
     fn mono_text_run(&self, len: usize) -> TextRun {
@@ -2988,7 +3088,7 @@ impl TakoApp {
         self.filetree.visible = !self.filetree.visible;
         // render を待たず即座に root を同期する（オクルージョン中は GPUI が
         // 再描画しないため、render 内の追従だけだと開いた直後に空になる）
-        self.sync_filetree_root();
+        self.sync_filetree_roots();
     }
 
     /// ステータスバーの tmux / git トグル: 同じビューが開いていれば閉じ、
@@ -3118,7 +3218,13 @@ impl TakoApp {
         area: Bounds<Pixels>,
         focused: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
+        // プレビューペイン（FR-3.2 / FR-3.3）はターミナルではなくファイル内容を描く
+        if self.previews.contains_key(&pane_id) {
+            return self
+                .render_preview_pane(pane_id, rect, focused, cx)
+                .into_any_element();
+        }
         let theme = self.theme.clone();
         let default_style = self.text_style();
         let cell = self.cell_size.expect("render 冒頭で実測済み");
@@ -3420,6 +3526,356 @@ impl TakoApp {
                             .child("×"),
                     )
             }))
+            .into_any_element()
+    }
+
+    /// プレビューペインの描画（FR-3.2 コード / FR-3.3 Markdown）。
+    /// タイトルバーはファイル名 + （.md のみ）目アイコンのモードトグル + × ボタン
+    fn render_preview_pane(
+        &mut self,
+        pane_id: PaneId,
+        rect: Rect,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = self.theme.clone();
+        let state = self.previews.get(&pane_id).expect("呼び出し前に確認済み");
+        let file_name = state.file_name();
+        let path_label = state.path.display().to_string();
+        let md_capable = state.markdown_capable();
+        let mode = state.mode;
+        let truncated = state.truncated;
+
+        // 本文要素を先に組む（state の借用をここで終える）
+        let body: Vec<gpui::AnyElement> = match &state.content {
+            preview::PreviewContent::Code(lines) => {
+                let number_width = lines.len().to_string().len();
+                lines
+                    .iter()
+                    .enumerate()
+                    .map(|(i, line)| {
+                        self.preview_code_line(line, Some((i + 1, number_width)))
+                            .into_any_element()
+                    })
+                    .collect()
+            }
+            preview::PreviewContent::Markdown(blocks) => blocks
+                .iter()
+                .map(|block| self.preview_md_block(block))
+                .collect(),
+            preview::PreviewContent::Error(message) => vec![div()
+                .p_2()
+                .text_color(hsla(theme.ansi[1]))
+                .child(SharedString::from(message.clone()))
+                .into_any_element()],
+        };
+
+        div()
+            .id(("pane", pane_id.as_u64()))
+            .absolute()
+            .left(relative(rect.x))
+            .top(relative(rect.y))
+            .w(relative(rect.width))
+            .h(relative(rect.height))
+            .bg(rgba(theme.background))
+            .border(px(PANE_BORDER))
+            .border_color(if focused {
+                hsla(theme.accent)
+            } else {
+                hsla(theme.pane_border)
+            })
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    let _ = this.workspace.active_tab_mut().tree_mut().focus(pane_id);
+                    cx.notify();
+                }),
+            )
+            .child(
+                // タイトルバー: × / 📄 ファイル名 / （md のみ）モードトグル
+                div()
+                    .id(("preview-titlebar", pane_id.as_u64()))
+                    .h(px(PANE_TITLE_BAR))
+                    .flex_none()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px_1()
+                    .bg(rgba_alpha(
+                        theme.tab_bar_background,
+                        if focused { 1.0 } else { 0.6 },
+                    ))
+                    .text_size(px(11.0))
+                    .text_color(hsla(theme.tab_inactive_foreground))
+                    .child(
+                        div()
+                            .id(("pane-close", pane_id.as_u64()))
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
+                            .hover(|d| {
+                                d.bg(rgba_alpha(theme.ansi[1], 0.25))
+                                    .text_color(hsla(theme.foreground))
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.close_pane_button(pane_id, cx);
+                            }))
+                            .child("×"),
+                    )
+                    .child(
+                        div()
+                            .text_color(if focused {
+                                hsla(theme.foreground)
+                            } else {
+                                hsla(theme.tab_inactive_foreground)
+                            })
+                            .child(SharedString::from(format!(
+                                "📄 {}",
+                                truncate(&file_name, 36)
+                            ))),
+                    )
+                    .child(div().flex_grow(1.0))
+                    .children(md_capable.then(|| {
+                        // 目アイコンのトグル（FR-3.3）: コード表示 ⇔ md レンダリング
+                        let (icon, label) = match mode {
+                            preview::PreviewMode::Markdown => ("</>", "コードとして表示"),
+                            preview::PreviewMode::Code => ("👁", "md レンダリング表示"),
+                        };
+                        div()
+                            .id(("preview-mode-toggle", pane_id.as_u64()))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(hsla(theme.accent))
+                            .hover(|d| d.bg(rgba_alpha(theme.tab_active_background, 0.8)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_preview_mode(pane_id, cx);
+                            }))
+                            .child(SharedString::from(format!("{icon} {label}")))
+                    }))
+                    .child(
+                        div()
+                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.6))
+                            .text_size(px(10.0))
+                            .child(SharedString::from(truncate(&path_label, 40))),
+                    ),
+            )
+            .child(
+                div()
+                    .id(("preview-scroll", pane_id.as_u64()))
+                    .flex_1()
+                    .p(px(PANE_PADDING + 4.0))
+                    .flex()
+                    .flex_col()
+                    .overflow_y_scroll()
+                    .children(body)
+                    .children(truncated.then(|| {
+                        div()
+                            .pt_2()
+                            .text_size(px(11.0))
+                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
+                            .child("…（大きいファイルのため末尾を省略して表示）")
+                    })),
+            )
+    }
+
+    /// ハイライト済みコード 1 行 → StyledText（行番号は控えめな色で前置する）
+    fn preview_code_line(&self, line: &preview::Line, number: Option<(usize, usize)>) -> gpui::Div {
+        let theme = &self.theme;
+        let mut text = String::new();
+        let mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
+        if let Some((n, width)) = number {
+            let prefix = format!("{n:>width$}  ");
+            highlights.push((
+                0..prefix.len(),
+                HighlightStyle {
+                    color: Some(hsla_alpha(theme.tab_inactive_foreground, 0.5)),
+                    ..HighlightStyle::default()
+                },
+            ));
+            text.push_str(&prefix);
+        }
+        for span in line {
+            let start = text.len();
+            text.push_str(&span.text);
+            let style = HighlightStyle {
+                color: span.color.map(hsla),
+                font_weight: span.bold.then_some(FontWeight::BOLD),
+                font_style: span.italic.then_some(FontStyle::Italic),
+                ..HighlightStyle::default()
+            };
+            if span.color.is_some() || span.bold || span.italic {
+                highlights.push((start..text.len(), style));
+            }
+        }
+        if text.is_empty() {
+            // 空行も高さを保つ
+            text.push(' ');
+        }
+        div()
+            .h(px(theme.line_height))
+            .flex_none()
+            .child(StyledText::new(text).with_default_highlights(&self.text_style(), highlights))
+    }
+
+    /// Markdown インラインスパン列 → (テキスト, ハイライト範囲)
+    fn preview_md_text(
+        &self,
+        spans: &[preview::MdSpan],
+    ) -> (String, Vec<(std::ops::Range<usize>, HighlightStyle)>) {
+        let theme = &self.theme;
+        let mut text = String::new();
+        let mut highlights = Vec::new();
+        for span in spans {
+            let start = text.len();
+            text.push_str(&span.text);
+            let styled = span.bold || span.italic || span.code || span.strike || span.link;
+            if !styled {
+                continue;
+            }
+            highlights.push((
+                start..text.len(),
+                HighlightStyle {
+                    color: if span.code {
+                        Some(hsla(theme.ansi[3]))
+                    } else if span.link {
+                        Some(hsla(theme.accent))
+                    } else {
+                        None
+                    },
+                    background_color: span.code.then(|| hsla(theme.tab_bar_background)),
+                    font_weight: span.bold.then_some(FontWeight::BOLD),
+                    font_style: span.italic.then_some(FontStyle::Italic),
+                    underline: span.link.then(|| UnderlineStyle {
+                        thickness: px(1.0),
+                        color: None,
+                        wavy: false,
+                    }),
+                    strikethrough: span.strike.then_some(StrikethroughStyle {
+                        thickness: px(1.0),
+                        color: None,
+                    }),
+                    ..HighlightStyle::default()
+                },
+            ));
+        }
+        (text, highlights)
+    }
+
+    /// Markdown ブロック 1 つの描画（FR-3.3）
+    fn preview_md_block(&self, block: &preview::MdBlock) -> gpui::AnyElement {
+        let theme = self.theme.clone();
+        match block {
+            preview::MdBlock::Heading { level, spans } => {
+                let (text, highlights) = self.preview_md_text(spans);
+                let size = match level {
+                    1 => 19.0,
+                    2 => 16.0,
+                    3 => 14.0,
+                    _ => 13.0,
+                };
+                div()
+                    .pt_2()
+                    .pb_1()
+                    .text_size(px(size))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(hsla(theme.foreground))
+                    .when(*level <= 2, |d| {
+                        d.border_b_1()
+                            .border_color(hsla_alpha(theme.pane_border, 0.8))
+                    })
+                    .child(
+                        StyledText::new(text)
+                            .with_default_highlights(&self.text_style(), highlights),
+                    )
+                    .into_any_element()
+            }
+            preview::MdBlock::Paragraph { spans } => {
+                let (text, highlights) = self.preview_md_text(spans);
+                div()
+                    .py_1()
+                    .child(
+                        StyledText::new(text)
+                            .with_default_highlights(&self.text_style(), highlights),
+                    )
+                    .into_any_element()
+            }
+            preview::MdBlock::ListItem {
+                depth,
+                marker,
+                spans,
+            } => {
+                let (text, highlights) = self.preview_md_text(spans);
+                div()
+                    .flex()
+                    .flex_row()
+                    .pl(px(8.0 + 16.0 * *depth as f32))
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(hsla_alpha(theme.foreground, 0.7))
+                            .child(SharedString::from(marker.clone())),
+                    )
+                    .child(
+                        StyledText::new(text)
+                            .with_default_highlights(&self.text_style(), highlights),
+                    )
+                    .into_any_element()
+            }
+            preview::MdBlock::CodeBlock { lines } => div()
+                .my_1()
+                .p_2()
+                .rounded_md()
+                .bg(rgba_alpha(theme.tab_bar_background, 0.9))
+                .flex()
+                .flex_col()
+                .children(lines.iter().map(|line| self.preview_code_line(line, None)))
+                .into_any_element(),
+            preview::MdBlock::Quote { spans } => {
+                let (text, highlights) = self.preview_md_text(spans);
+                div()
+                    .my_1()
+                    .pl_2()
+                    .border_l_2()
+                    .border_color(hsla_alpha(theme.accent, 0.6))
+                    .text_color(hsla_alpha(theme.foreground, 0.75))
+                    .child(
+                        StyledText::new(text)
+                            .with_default_highlights(&self.text_style(), highlights),
+                    )
+                    .into_any_element()
+            }
+            preview::MdBlock::Rule => div()
+                .my_2()
+                .h(px(1.0))
+                .bg(hsla_alpha(theme.pane_border, 0.9))
+                .into_any_element(),
+        }
     }
 }
 
@@ -3445,6 +3901,7 @@ impl ControlHost for TakoApp {
 
     fn detach_session(&mut self, pane: PaneId) {
         self.terminals.remove(&pane);
+        self.previews.remove(&pane);
         self.scroll_accum.remove(&pane);
         self.scroll_ctls.remove(&pane);
         // CLI / MCP からの明示 close（FR-2.5.4）。バックエンドセッションも片付ける
@@ -3562,6 +4019,40 @@ impl ControlHost for TakoApp {
         if self.filetree.visible != visible {
             self.toggle_filetree();
         }
+    }
+
+    fn preview_state(
+        &self,
+        pane: PaneId,
+    ) -> Option<(String, tako_control::protocol::PreviewModeWire)> {
+        self.previews
+            .get(&pane)
+            .map(|p| (p.path.display().to_string(), p.mode.to_wire()))
+    }
+
+    fn set_preview(
+        &mut self,
+        pane: PaneId,
+        path: &str,
+        mode: tako_control::protocol::PreviewModeWire,
+    ) {
+        self.previews.insert(
+            pane,
+            preview::load(
+                std::path::Path::new(path),
+                preview::PreviewMode::from_wire(mode),
+            ),
+        );
+    }
+
+    fn preview_pane_of_tab(&self, tab: TabId) -> Option<PaneId> {
+        self.workspace
+            .get_tab(tab)?
+            .tree()
+            .panes()
+            .into_iter()
+            .map(|p| p.id())
+            .find(|id| self.previews.contains_key(id))
     }
 }
 
@@ -3836,7 +4327,7 @@ impl Render for TakoApp {
         let theme = self.theme.clone();
 
         // ファイルツリーの root をフォーカスペインの cwd に追従させる（FR-3.1）
-        self.sync_filetree_root();
+        self.sync_filetree_roots();
 
         // OS ウィンドウのフレームを採取する（layout 保存 = 再起動時のウィンドウ復元用。
         // window_bounds() は fullscreen / maximized 中でも復元サイズを返す）
@@ -5071,7 +5562,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 20, "MCP tools/list は 20 ツール");
+            check(status == 200 && tool_count == 21, "MCP tools/list は 21 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -5993,13 +6484,13 @@ mod self_test {
             check(groups_ok, "統合 tmux ビューのタブ枠一覧・ジャンプ・kill 確認フロー");
 
             // 57. ファイルツリー（FR-3.1 / FR-3.7）。cmd+B で開閉し、表示中は
-            //     フォーカスペインの cwd（無ければ $HOME）が root に追従して行が出る
+            //     タブ内ペインの cwd（無ければ $HOME）がワークスペースフォルダとして並ぶ
             press(any, cx, "cmd-b");
             wait(cx, 600).await;
             let sidebar_ok = window
                 .update(cx, |app, _, _| {
                     let visible = app.filetree.visible;
-                    let root_ok = app.filetree.root().is_some();
+                    let root_ok = !app.filetree.roots().is_empty();
                     let has_rows = !app.filetree.rows().is_empty();
                     visible && root_ok && has_rows
                 })
@@ -6430,7 +6921,7 @@ mod self_test {
             let filetree_synced = window
                 .update(cx, |app, _, _| {
                     // dispatch 経由でも root の cwd 同期込みで開く（行が出る状態）
-                    let opened = app.filetree.visible && app.filetree.root().is_some();
+                    let opened = app.filetree.visible && !app.filetree.roots().is_empty();
                     app.set_filetree(false);
                     opened && !app.filetree.visible
                 })
@@ -6465,6 +6956,226 @@ mod self_test {
                 focused_contains(window, cx, "TAKO-DSC-65"),
                 "汚染された current から生存インスタンスへフォールバック",
             );
+
+            // 66. プレビューペイン（FR-3.2 / FR-3.3）: dispatch OpenFile（tako open / MCP
+            //     tako_open_file / ファイルツリークリックと同一経路）でコードと md を開く。
+            //     再利用・モード切替（dispatch + 目アイコントグル）・list 公開・close 片付け。
+            //     OpenFile はセッション起動を伴わないため直接 dispatch でよい（pending_attach
+            //     の後処理は不要 = 項目 56 の罠の対象外）
+            let preview_dir =
+                std::env::temp_dir().join(format!("tako-selftest-preview-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&preview_dir);
+            std::fs::create_dir_all(&preview_dir).expect("一時ディレクトリを作れる");
+            std::fs::write(preview_dir.join("hello.rs"), "fn main() {}\n").unwrap();
+            std::fs::write(preview_dir.join("note.md"), "# Title\n\n- item\n").unwrap();
+            let preview_ok = window
+                .update(cx, |app, _, cx| {
+                    let base = app.focused_pane().as_u64();
+                    let open = |app: &mut TakoApp, path: String, mode| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::OpenFile {
+                                pane: Some(base),
+                                path,
+                                mode,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                    };
+                    // コードを開く: ペインが生え、PTY は起動しない。フォーカスは移る
+                    let opened = open(
+                        app,
+                        preview_dir.join("hello.rs").display().to_string(),
+                        None,
+                    )
+                    .expect("open_file は成功する");
+                    let pane = opened["pane"].as_u64().expect("pane が返る");
+                    let code_ok = opened["mode"].as_str() == Some("code")
+                        && opened["created"].as_bool() == Some(true)
+                        && pane != base
+                        && !app.terminals.keys().any(|p| p.as_u64() == pane)
+                        && app.focused_pane().as_u64() == pane
+                        && matches!(
+                            app.previews.values().next().map(|p| &p.content),
+                            Some(preview::PreviewContent::Code(lines)) if !lines.is_empty()
+                        );
+                    // md を開く: 同じプレビューペインを再利用し、既定で markdown 表示
+                    let opened = open(app, preview_dir.join("note.md").display().to_string(), None)
+                        .expect("md の open_file は成功する");
+                    let md_ok = opened["pane"].as_u64() == Some(pane)
+                        && opened["created"].as_bool() == Some(false)
+                        && opened["mode"].as_str() == Some("markdown")
+                        && matches!(
+                            app.previews.values().next().map(|p| &p.content),
+                            Some(preview::PreviewContent::Markdown(blocks))
+                                if matches!(blocks.first(),
+                                    Some(preview::MdBlock::Heading { level: 1, .. }))
+                        );
+                    // dispatch の mode 指定（CLI --mode / MCP mode と同じ）でコード表示へ
+                    let opened = open(
+                        app,
+                        preview_dir.join("note.md").display().to_string(),
+                        Some(tako_control::protocol::PreviewModeWire::Code),
+                    )
+                    .expect("mode 指定の open_file は成功する");
+                    let mode_ok = opened["mode"].as_str() == Some("code");
+                    // 目アイコンのトグル（UI 経路）で md レンダリングへ戻る
+                    let pane_id = app
+                        .previews
+                        .keys()
+                        .next()
+                        .copied()
+                        .expect("プレビューは 1 枚ある");
+                    app.toggle_preview_mode(pane_id, cx);
+                    let toggle_ok = app
+                        .previews
+                        .get(&pane_id)
+                        .is_some_and(|p| p.mode == preview::PreviewMode::Markdown);
+                    // list へ preview（path / mode）が公開される
+                    let list = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::List,
+                        PaneOrigin::Cli,
+                    )
+                    .expect("list は成功する");
+                    let listed = list["tabs"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|t| t["panes"].as_array().cloned().unwrap_or_default())
+                        .find(|p| p["id"].as_u64() == Some(pane));
+                    let list_ok = listed.as_ref().is_some_and(|p| {
+                        p["preview"]["mode"].as_str() == Some("markdown")
+                            && p["preview"]["path"]
+                                .as_str()
+                                .is_some_and(|s| s.ends_with("note.md"))
+                    });
+                    // close で片付く（previews からも消える）
+                    let closed = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Close { pane: Some(pane) },
+                        PaneOrigin::Cli,
+                    )
+                    .is_ok()
+                        && app.previews.is_empty();
+                    code_ok && md_ok && mode_ok && toggle_ok && list_ok && closed
+                })
+                .unwrap_or(false);
+            check(preview_ok, "プレビューペインの open / 再利用 / モード切替 / close");
+
+            // 66b. `tako open` CLI e2e（開発不変条件）: ペイン内シェルから実 CLI で開く。
+            //      開いた後のフォーカスはプレビューペインに在るため、検証は app 状態で行う
+            press(any, cx, "ctrl-u");
+            type_text(
+                any,
+                cx,
+                &format!(
+                    "{cli} open {} > /dev/null",
+                    preview_dir.join("note.md").display()
+                ),
+                true,
+            );
+            let mut cli_open_ok = false;
+            for _ in 0..10 {
+                wait(cx, 300).await;
+                cli_open_ok = window
+                    .update(cx, |app, _, _| {
+                        app.previews
+                            .values()
+                            .any(|p| p.path.ends_with("note.md") && p.markdown_capable())
+                    })
+                    .unwrap_or(false);
+                if cli_open_ok {
+                    break;
+                }
+            }
+            check(cli_open_ok, "tako open CLI でプレビューが開く");
+            // 後片付け: プレビューを閉じる（フォーカスはターミナルへ戻る）
+            let cleaned = window
+                .update(cx, |app, _, _| {
+                    let pane = app.previews.keys().next().copied();
+                    if let Some(pane) = pane {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Close {
+                                pane: Some(pane.as_u64()),
+                            },
+                            PaneOrigin::Cli,
+                        );
+                    }
+                    app.previews.is_empty()
+                        && app.terminals.contains_key(&app.focused_pane())
+                })
+                .unwrap_or(false);
+            check(cleaned, "プレビュー close 後はターミナルへフォーカスが戻る");
+            let _ = std::fs::remove_dir_all(&preview_dir);
+
+            // 67. ファイルツリーの「タブ = ワークスペース」（FR-3.1。2026-06-13 変更）:
+            //     タブ内全ペインの cwd がワークスペースフォルダとして並ぶ（マルチルート）。
+            //     cwd 違いのペインを生やし、ルート見出しが 2 つ以上になることを確認する
+            let temp_pane = window
+                .update(cx, |app, _, cx| {
+                    let base = app.focused_pane().as_u64();
+                    let split = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Split {
+                            pane: Some(base),
+                            direction: None,
+                            ratio: None,
+                            command: None,
+                            cwd: Some("/private/tmp".into()),
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .expect("split は成功する");
+                    // 直接 dispatch のためセッション起動依頼はここで処理（項目 56 と同じ）
+                    for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                        app.spawn_session(pane, options, cx)
+                            .expect("一時ペインの PTY 起動は成功する");
+                    }
+                    app.set_filetree(true);
+                    split["pane"].as_u64().expect("pane が返る")
+                })
+                .unwrap_or(0);
+            let mut multiroot_ok = false;
+            for _ in 0..20 {
+                wait(cx, 300).await;
+                multiroot_ok = window
+                    .update(cx, |app, _, _| {
+                        app.sync_filetree_roots();
+                        let roots = app.filetree.roots();
+                        let header_rows =
+                            app.filetree.rows().iter().filter(|r| r.root).count();
+                        roots.len() >= 2
+                            && roots.iter().any(|r| r.ends_with("tmp"))
+                            && header_rows == roots.len()
+                    })
+                    .unwrap_or(false);
+                if multiroot_ok {
+                    break;
+                }
+            }
+            check(
+                multiroot_ok,
+                "タブ内全ペインの cwd がワークスペースフォルダとして並ぶ",
+            );
+            // 後片付け: ペインを閉じるとそのフォルダがツリーから消える
+            let workspace_shrinks = window
+                .update(cx, |app, _, _| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Close {
+                            pane: Some(temp_pane),
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    app.sync_filetree_roots();
+                    let shrunk = !app.filetree.roots().iter().any(|r| r.ends_with("tmp"));
+                    app.set_filetree(false);
+                    shrunk && !app.filetree.visible
+                })
+                .unwrap_or(false);
+            check(workspace_shrinks, "ペイン close でワークスペースフォルダが畳まれる");
 
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {

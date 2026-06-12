@@ -90,6 +90,25 @@ impl PanelViewWire {
     }
 }
 
+/// プレビューペインの表示モード（FR-3.2 / FR-3.3）。
+/// Markdown ファイルは目アイコンのトグル（UI）または CLI / MCP の mode 指定で
+/// 「コードとして表示」⇔「md レンダリング表示」を切り替えられる
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewModeWire {
+    Code,
+    Markdown,
+}
+
+impl PreviewModeWire {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PreviewModeWire::Code => "code",
+            PreviewModeWire::Markdown => "markdown",
+        }
+    }
+}
+
 /// 操作リクエスト。`pane` 省略時は呼び出し元ペイン（クライアント側で `TAKO_PANE_ID` から
 /// 解決して詰める。FR-2.2.7）。各操作のセマンティクスは tako-core の API と 1:1
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -191,6 +210,16 @@ pub enum Request {
         view: Option<PanelViewWire>,
         /// 左サイドバーのファイルツリー（FR-3.1）の表示・非表示
         filetree: Option<bool>,
+    },
+    /// ファイルをプレビューペインで開く（FR-3.2 / FR-2.5.11。「探して開いて見せて」のコア操作）。
+    /// `pane` がプレビューペインならそのまま差し替え、ターミナルペインなら同タブの既存
+    /// プレビューペインを再利用し、無ければ `pane` を分割して生やす（ターミナルは起動しない）。
+    /// 相対パスは `pane` の cwd（OSC 7）基準で解決する。
+    /// `mode` 省略時は拡張子から自動判定（.md / .markdown → markdown、それ以外 code）
+    OpenFile {
+        pane: Option<u64>,
+        path: String,
+        mode: Option<PreviewModeWire>,
     },
 }
 

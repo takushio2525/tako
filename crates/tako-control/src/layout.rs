@@ -81,6 +81,18 @@ pub struct PaneLayout {
     pub origin: String,
     /// 保存時点の cwd（OSC 7 由来）。セッションが消えていた場合の開き直しに使う
     pub cwd: Option<String>,
+    /// プレビューペイン（FR-3.2 / FR-3.3）の表示内容。None = ターミナルペイン。
+    /// 旧ファイルには無いので serde default で後方互換
+    #[serde(default)]
+    pub preview: Option<PreviewLayout>,
+}
+
+/// プレビューペインの保存内容（復元時はファイルを開き直す。PTY は起動しない）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreviewLayout {
+    pub path: String,
+    /// "code" | "markdown"
+    pub mode: String,
 }
 
 /// capture 時にアプリ側から渡すペイン付帯情報
@@ -88,6 +100,7 @@ pub struct PaneLayout {
 pub struct PaneMeta {
     pub session: Option<String>,
     pub cwd: Option<String>,
+    pub preview: Option<PreviewLayout>,
 }
 
 /// 復元されたペインの spawn 指示（Workspace へ挿入済み。セッション起動は呼び出し側）
@@ -96,6 +109,8 @@ pub struct RestoredPane {
     pub pane: u64,
     pub session: Option<String>,
     pub cwd: Option<String>,
+    /// Some ならプレビューペインとして復元する（spawn しない）
+    pub preview: Option<PreviewLayout>,
 }
 
 /// 現在の Workspace 構造をレイアウト表現へ写す。`meta` でペインごとの
@@ -136,6 +151,7 @@ fn capture_node(node: &PaneNode, meta: &dyn Fn(PaneId) -> PaneMeta) -> NodeLayou
                 role: pane.role().map(str::to_string),
                 origin: origin_str(pane.origin()).to_string(),
                 cwd: m.cwd,
+                preview: m.preview,
             })
         }
         PaneNode::Split {
@@ -226,6 +242,7 @@ fn restore_node(
                 pane: p.id,
                 session: p.session.clone(),
                 cwd: p.cwd.clone(),
+                preview: p.preview.clone(),
             });
             Some((PaneNode::Leaf(pane), id))
         }
@@ -382,6 +399,10 @@ mod tests {
             &|pane| PaneMeta {
                 session: Some(format!("tako-s{}", pane.as_u64())),
                 cwd: Some("/tmp".into()),
+                preview: Some(PreviewLayout {
+                    path: format!("/tmp/p{}.md", pane.as_u64()),
+                    mode: "markdown".into(),
+                }),
             },
             Some(frame.clone()),
         );
@@ -412,6 +433,11 @@ mod tests {
         assert!(restored
             .iter()
             .all(|r| r.session.as_deref() == Some(format!("tako-s{}", r.pane).as_str())));
+        // プレビュー情報（FR-3.2）も往復する
+        assert!(restored.iter().all(|r| r
+            .preview
+            .as_ref()
+            .is_some_and(|p| p.mode == "markdown" && p.path == format!("/tmp/p{}.md", r.pane))));
         // フォーカスも保たれる（タブ 1 は split 後の新ペイン）
         assert_eq!(
             restored_ws.tabs()[0].tree().focused().as_u64(),

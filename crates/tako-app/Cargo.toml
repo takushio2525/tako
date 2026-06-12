@@ -18,3 +18,6 @@ gpui_platform.workspace = true
 futures.workspace = true
 # セルフテストでの MCP 応答解釈に使う
 serde_json.workspace = true
+# プレビューペイン: コードハイライト（FR-3.2）と Markdown パース（FR-3.3）
+syntect.workspace = true
+pulldown-cmark.workspace = true

@@ -1,6 +1,8 @@
 //! filetree — 左サイドバーのファイルツリー（FR-3.1 / FR-3.7）
 //!
-//! フォーカス中ペインの cwd（OSC 7 検知）をルートに表示する VSCode 風ツリー。
+//! 「タブ = ワークスペース」: アクティブタブ内の**全ペインの cwd**（OSC 7 検知）を
+//! ワークスペースフォルダとして並べるマルチルートツリー（VSCode の
+//! 「フォルダをワークスペースに追加」相当。2026-06-13 にフォーカスペイン連動から変更）。
 //! 状態・読み込み・フラット化は GPUI 非依存（描画は main.rs 側）。
 //! 内容の更新はポーリング（表示中のみ。notify クレートは必要になったら再判断 =
 //! `architecture.md`「コンセプト②の実現」）。
@@ -20,44 +22,64 @@ pub struct Entry {
     pub is_dir: bool,
 }
 
-/// 表示用にフラット化した 1 行
+/// 表示用にフラット化した 1 行。`root` = ワークスペースフォルダの見出し行
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub entry: Entry,
     pub depth: usize,
     pub expanded: bool,
+    pub root: bool,
 }
 
 /// ファイルツリーの状態。`visible` は FR-3.7（折りたたみで純粋なターミナルに戻る）
 #[derive(Default)]
 pub struct FileTree {
     pub visible: bool,
-    root: Option<PathBuf>,
+    roots: Vec<PathBuf>,
+    /// 展開中ディレクトリ（ルート自身も含む。絶対パスがキーなのでルート間で共有できる）
     expanded: HashSet<PathBuf>,
     cache: HashMap<PathBuf, Vec<Entry>>,
 }
 
 impl FileTree {
-    pub fn root(&self) -> Option<&Path> {
-        self.root.as_deref()
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
     }
 
-    /// cwd 連動（FR-3.1）。root が変わったら展開状態とキャッシュを畳んで読み直す。
-    /// 変化があれば true（再描画判断用）
-    pub fn set_root(&mut self, root: Option<PathBuf>) -> bool {
-        if self.root == root {
+    /// ワークスペースフォルダ列の同期（FR-3.1。呼び出し側がタブ内ペインの cwd を集める）。
+    /// 重複は除き、既存ルートの展開状態は維持する。変化があれば true（再描画判断用）
+    pub fn set_roots(&mut self, roots: Vec<PathBuf>) -> bool {
+        let mut deduped: Vec<PathBuf> = Vec::new();
+        for root in roots {
+            if !deduped.contains(&root) {
+                deduped.push(root);
+            }
+        }
+        if self.roots == deduped {
             return false;
         }
-        self.root = root;
-        self.expanded.clear();
-        self.cache.clear();
-        if let Some(root) = self.root.clone() {
-            self.cache.insert(root.clone(), read_dir_sorted(&root));
+        // 消えたルートの状態は畳む（配下の展開・キャッシュは refresh が掃除する）
+        for old in &self.roots {
+            if !deduped.contains(old) {
+                self.expanded.remove(old);
+                self.cache.remove(old);
+            }
         }
+        for root in &deduped {
+            // 新規ルートだけ展開済みで読み込む（VSCode のワークスペースフォルダ同様。
+            // 既存ルートはユーザーが畳んだ状態を尊重する）
+            if !self.roots.contains(root) {
+                self.expanded.insert(root.clone());
+                self.cache
+                    .entry(root.clone())
+                    .or_insert_with(|| read_dir_sorted(root));
+            }
+        }
+        self.roots = deduped;
         true
     }
 
-    /// ディレクトリ行のクリック: 展開 ⇄ 折りたたみ
+    /// ディレクトリ行（ルート見出し行を含む）のクリック: 展開 ⇄ 折りたたみ
     pub fn toggle_dir(&mut self, path: &Path) {
         if self.expanded.contains(path) {
             self.expanded.remove(path);
@@ -69,11 +91,27 @@ impl FileTree {
         }
     }
 
-    /// 表示行（root 直下から展開状態に従った深さ優先）
+    /// 表示行: ルート見出し行 + 展開状態に従った深さ優先の中身
     pub fn rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
-        if let Some(root) = &self.root {
-            self.collect_rows(root, 0, &mut rows);
+        for root in &self.roots {
+            let expanded = self.expanded.contains(root);
+            rows.push(Row {
+                entry: Entry {
+                    path: root.clone(),
+                    name: root
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| root.display().to_string()),
+                    is_dir: true,
+                },
+                depth: 0,
+                expanded,
+                root: true,
+            });
+            if expanded {
+                self.collect_rows(root, 1, &mut rows);
+            }
         }
         rows
     }
@@ -91,6 +129,7 @@ impl FileTree {
                 entry: entry.clone(),
                 depth,
                 expanded,
+                root: false,
             });
             if expanded {
                 self.collect_rows(&entry.path, depth + 1, rows);
@@ -98,11 +137,12 @@ impl FileTree {
         }
     }
 
-    /// root + 展開中ディレクトリの内容を読み直す（ポーリング更新）。
+    /// ルート + 展開中ディレクトリの内容を読み直す（ポーリング更新）。
     /// 変化があれば true。消えたディレクトリはキャッシュ・展開状態から落とす
     pub fn refresh(&mut self) -> bool {
-        let mut targets: Vec<PathBuf> = self.root.iter().cloned().collect();
+        let mut targets: Vec<PathBuf> = self.roots.clone();
         targets.extend(self.expanded.iter().cloned());
+        targets.dedup();
         let mut changed = false;
         for dir in targets {
             if !dir.is_dir() {
@@ -162,38 +202,66 @@ mod tests {
         dir
     }
 
+    /// (name, depth, root) のタプル列に写す（検証用）
+    fn names(tree: &FileTree) -> Vec<(String, usize, bool)> {
+        tree.rows()
+            .iter()
+            .map(|r| (r.entry.name.clone(), r.depth, r.root))
+            .collect()
+    }
+
     #[test]
-    fn ルート直下はディレクトリ先の名前順で並ぶ() {
+    fn ルート見出しの下にディレクトリ先の名前順で並ぶ() {
         let dir = fixture("t1");
         let mut tree = FileTree::default();
-        assert!(tree.set_root(Some(dir.clone())));
-        // 同じ root の再設定は変化なし
-        assert!(!tree.set_root(Some(dir.clone())));
-        let names: Vec<(String, usize)> = tree
-            .rows()
-            .iter()
-            .map(|r| (r.entry.name.clone(), r.depth))
-            .collect();
+        assert!(tree.set_roots(vec![dir.clone()]));
+        // 同じルート列の再設定は変化なし
+        assert!(!tree.set_roots(vec![dir.clone()]));
+        let root_name = dir.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(
-            names,
+            names(&tree),
             vec![
-                ("docs".to_string(), 0),
-                ("src".to_string(), 0),
-                ("README.md".to_string(), 0),
+                (root_name, 0, true),
+                ("docs".to_string(), 1, false),
+                ("src".to_string(), 1, false),
+                ("README.md".to_string(), 1, false),
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn 展開で子が出て折りたたみで消える() {
+    fn 複数ルートが順序と重複除去つきで並ぶ() {
         let dir = fixture("t2");
         let mut tree = FileTree::default();
-        tree.set_root(Some(dir.clone()));
+        assert!(tree.set_roots(vec![
+            dir.join("src"),
+            dir.join("docs"),
+            dir.join("src"), // 重複は除かれる
+        ]));
+        assert_eq!(tree.roots(), &[dir.join("src"), dir.join("docs")]);
+        let rows = names(&tree);
+        let roots: Vec<_> = rows.iter().filter(|(_, _, root)| *root).collect();
+        assert_eq!(roots.len(), 2);
+        assert!(rows.contains(&("main.rs".to_string(), 1, false)));
+        // ルート見出しの折りたたみで中身が消える
+        tree.toggle_dir(&dir.join("src"));
+        assert!(!names(&tree).contains(&("main.rs".to_string(), 1, false)));
+        // ルートが減っても残りの展開状態は維持される
+        assert!(tree.set_roots(vec![dir.join("docs")]));
+        assert_eq!(names(&tree).len(), 1, "docs は空ディレクトリ");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 展開で子が出て折りたたみで消える() {
+        let dir = fixture("t3");
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![dir.clone()]);
         tree.toggle_dir(&dir.join("src"));
         let rows = tree.rows();
         let main_rs = rows.iter().find(|r| r.entry.name == "main.rs").unwrap();
-        assert_eq!(main_rs.depth, 1);
+        assert_eq!(main_rs.depth, 2);
         assert!(rows.iter().any(|r| r.entry.name == "src" && r.expanded));
         tree.toggle_dir(&dir.join("src"));
         assert!(!tree.rows().iter().any(|r| r.entry.name == "main.rs"));
@@ -202,9 +270,9 @@ mod tests {
 
     #[test]
     fn refreshは追加と消滅を拾う() {
-        let dir = fixture("t3");
+        let dir = fixture("t4");
         let mut tree = FileTree::default();
-        tree.set_root(Some(dir.clone()));
+        tree.set_roots(vec![dir.clone()]);
         assert!(!tree.refresh(), "変化が無ければ false");
         std::fs::write(dir.join("new.txt"), "x").unwrap();
         assert!(tree.refresh());
@@ -221,15 +289,11 @@ mod tests {
     }
 
     #[test]
-    fn root変更で展開状態が畳まれ読めないパスは空になる() {
-        let dir = fixture("t4");
+    fn 読めないルートは見出しだけ残り中身は空() {
         let mut tree = FileTree::default();
-        tree.set_root(Some(dir.clone()));
-        tree.toggle_dir(&dir.join("src"));
-        tree.set_root(Some(dir.join("docs")));
-        assert!(tree.rows().is_empty(), "docs は空ディレクトリ");
-        tree.set_root(Some(PathBuf::from("/no/such/dir")));
-        assert!(tree.rows().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+        tree.set_roots(vec![PathBuf::from("/no/such/dir")]);
+        let rows = tree.rows();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].root);
     }
 }

@@ -59,6 +59,9 @@ enum Command {
     Resize(ResizeArgs),
     /// タブ内の全ペインのサイズを均等化する
     Equalize(EqualizeArgs),
+    /// ファイルをプレビューペインで開く（FR-3.2 / FR-3.3。コード = ハイライト表示、
+    /// .md は既定でレンダリング表示。--mode code でソース表示へ切替）
+    Open(OpenArgs),
     /// タブ操作（new / rename / select / move-pane）
     #[command(subcommand)]
     Tab(TabCommand),
@@ -231,6 +234,18 @@ struct ResizeArgs {
     /// 縦の取り分を絶対指定（0.0–1.0）
     #[arg(long)]
     share_y: Option<f32>,
+}
+
+#[derive(Args)]
+struct OpenArgs {
+    /// 開くファイルのパス（相対パスは対象ペインの cwd 基準で解決される）
+    path: String,
+    /// 基準ペイン ID（省略時は呼び出し元。プレビューの表示先解決に使う）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// 表示モード（省略時は拡張子から自動判定。md = markdown の別名）
+    #[arg(long, value_parser = ["code", "markdown", "md"])]
+    mode: Option<String>,
 }
 
 #[derive(Args)]
@@ -476,6 +491,27 @@ fn build_request(command: &Command) -> Result<Request, String> {
             },
             tab: args.tab,
         },
+        Command::Open(args) => {
+            // 相対パスは CLI 実行時の cwd で絶対化する（--pane で別ペインを指定しても
+            // 「いま居る場所」基準のまま意図どおりに解決される）
+            let path = std::path::Path::new(&args.path);
+            let path = if path.is_relative() {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(path).display().to_string())
+                    .unwrap_or_else(|_| args.path.clone())
+            } else {
+                args.path.clone()
+            };
+            Request::OpenFile {
+                pane: target_pane(args.pane)?,
+                path,
+                mode: match args.mode.as_deref() {
+                    None => None,
+                    Some("code") => Some(tako_control::protocol::PreviewModeWire::Code),
+                    Some(_) => Some(tako_control::protocol::PreviewModeWire::Markdown),
+                },
+            }
+        }
         Command::Tab(TabCommand::New { title }) => Request::TabNew {
             title: title.clone(),
         },
@@ -602,6 +638,7 @@ fn print_result(command: &Command, result: &Value) {
             );
         }
         Command::Tab(TabCommand::New { .. }) => println!("{result}"),
+        Command::Open(_) => println!("{result}"),
         Command::Autorename(_)
         | Command::Portdetect(_)
         | Command::Persist(_)
@@ -815,6 +852,27 @@ mod tests {
             build_request(&command).unwrap(),
             Request::TabSelect { tab: 2 }
         );
+    }
+
+    #[test]
+    fn openは絶対パスとモード別名を解釈する() {
+        let command = parse(&["tako", "open", "/tmp/a.md", "--pane", "5", "--mode", "md"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::OpenFile {
+                pane: Some(5),
+                path: "/tmp/a.md".into(),
+                mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
+            }
+        );
+        // 相対パスは CLI の cwd で絶対化される
+        let command = parse(&["tako", "open", "b.rs", "--pane", "5"]);
+        let Request::OpenFile { path, mode, .. } = build_request(&command).unwrap() else {
+            panic!("OpenFile になる");
+        };
+        assert!(std::path::Path::new(&path).is_absolute());
+        assert!(path.ends_with("b.rs"));
+        assert_eq!(mode, None);
     }
 
     #[test]

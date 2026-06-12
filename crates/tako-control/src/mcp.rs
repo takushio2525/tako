@@ -435,6 +435,30 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_open_file",
+            "description": "ファイルをプレビューペインで開いてユーザーに見せる（FR-3.2 / FR-2.5.11）。\
+                コードはシンタックスハイライト付き、Markdown は既定でレンダリング表示\
+                （mode=code でソース表示へ切替可能 = プレビューの目アイコントグルと同じ操作）。\
+                ペインは再利用される: 対象がプレビューペインなら差し替え、同タブに既存の\
+                プレビューペインがあればそこへ、無ければ pane を分割して生やす（ターミナルは\
+                起動しない）。「このファイルを見て」「成果物を確認して」の提示に使うこと。\
+                相対パスは pane の cwd 基準で解決する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("基準ペイン ID（省略時は呼び出し元。プレビューの表示先解決に使う）"),
+                    "path": { "type": "string", "description": "開くファイルのパス（必須。相対パスは pane の cwd 基準）" },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["code", "markdown"],
+                        "description": "表示モード（省略時は拡張子から自動判定。.md / .markdown → markdown）",
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_persist",
             "description": "セッション永続化 = tmux バックエンド（FR-5）の ON/OFF を切り替える\
                 （enabled 省略時は現在状態の取得のみ）。有効時、各ペインは tako 専用 tmux\
@@ -577,6 +601,16 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
         },
         "tako_persist" => Request::Persist {
             enabled: bool_arg(args, "enabled")?,
+        },
+        "tako_open_file" => Request::OpenFile {
+            pane: Some(target_pane(args, caller)?),
+            path: str_arg(args, "path")?.ok_or("path を指定する")?,
+            mode: match str_arg(args, "mode")?.as_deref() {
+                None => None,
+                Some("code") => Some(crate::protocol::PreviewModeWire::Code),
+                Some("markdown") => Some(crate::protocol::PreviewModeWire::Markdown),
+                Some(other) => return Err(format!("mode が不正: {other}（code | markdown）")),
+            },
         },
         "tako_panel" => Request::Panel {
             visible: bool_arg(args, "visible")?,
@@ -902,9 +936,60 @@ mod tests {
     }
 
     #[test]
+    fn open_fileはモードを解釈し呼び出し元へフォールバックする() {
+        let (response, requests) = run(
+            call(
+                "tako_open_file",
+                json!({ "path": "/tmp/x.md", "mode": "code" }),
+            ),
+            Some(7),
+            true,
+        );
+        assert!(response.is_some());
+        assert_eq!(
+            requests,
+            vec![Request::OpenFile {
+                pane: Some(7),
+                path: "/tmp/x.md".into(),
+                mode: Some(crate::protocol::PreviewModeWire::Code),
+            }]
+        );
+        // mode 省略は拡張子の自動判定に委ねる（None で渡る）
+        let (_, requests) = run(
+            call("tako_open_file", json!({ "path": "a.rs" })),
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::OpenFile {
+                pane: Some(7),
+                path: "a.rs".into(),
+                mode: None,
+            }]
+        );
+        // 不正な mode と path 欠落は引数エラー
+        let (response, requests) = run(
+            call("tako_open_file", json!({ "path": "a.rs", "mode": "html" })),
+            Some(7),
+            true,
+        );
+        assert!(requests.is_empty());
+        assert!(response.unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("mode"));
+        let (response, _) = run(call("tako_open_file", json!({})), Some(7), true);
+        assert!(response.unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("path"));
+    }
+
+    #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 20);
+        assert_eq!(tools.len(), 21);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

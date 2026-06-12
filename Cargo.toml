@@ -41,6 +41,16 @@ clap = { version = "4", features = ["derive"] }
 # 同期・スレッドベースの最小 HTTP サーバーで「tokio を持ち込まない」方針を維持する
 # （公式 Rust SDK の rmcp は tokio 必須のため不採用。.agent/architecture.md「Layer 2」節）
 tiny_http = "0.12"
+# コードプレビューのシンタックスハイライト（FR-3.2）。純 Rust 構成（regex-fancy）で
+# oniguruma の C 依存を避ける（Windows CI。.agent/architecture.md「コンセプト②の実現」）
+syntect = { version = "5", default-features = false, features = [
+    "parsing",
+    "regex-fancy",
+    "default-syntaxes",
+    "default-themes",
+] }
+# Markdown プレビューのパーサ（FR-3.3。イベントストリーム型で GPUI 独自描画に写す）
+pulldown-cmark = { version = "0.13", default-features = false }
 # GPUI は zed リポの git rev 固定（自動更新しない。追従は意識的なタスク。.agent/architecture.md）
 gpui = { git = "https://github.com/zed-industries/zed", rev = "cafbf4b5df7fedb67fc0f248850a5654efcec5d9" }
 # font-kit feature 必須: 無いとテキストシステムがスタブ化し文字が一切描画されない（poc/README.md）
