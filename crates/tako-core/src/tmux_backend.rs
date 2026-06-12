@@ -506,13 +506,16 @@ mod tests {
             session.disambiguate_keys()
         );
 
-        // Esc（CSI u 形式 \e[27u）も内側のペインへ届く（kitty 要求済みペインには
-        // kitty 形式のまま）。バックエンドペインでの disambiguate 常時有効化が
-        // vim 等の Esc を壊さないことの確認
-        session.write(b"\x1b[27u".to_vec());
+        // Esc 単押し（素の \e。UI 層 handle_key はバックエンドペインで Esc を
+        // CSI 27u にしない = CsiUMode::ModifiedOnly）も内側ペインへ素のまま届く。
+        // tmux は CSI 27u を内側の kitty 要求に関係なく素通しするため、CSI u に
+        // すると非対応アプリで「27u」が文字化けする（2026-06-12 実機バグ）。
+        // 素の \e は escape-time で正しく解釈され素のまま届く（その固定）
+        session.write(b"\x1b".to_vec());
+        session.write(b"ESC-RAW\r".to_vec());
         let mut esc_delivered = false;
         for _ in 0..50 {
-            if session.visible_lines().join("\n").contains("[27u") {
+            if session.visible_lines().join("\n").contains("^[ESC-RAW") {
                 esc_delivered = true;
                 break;
             }
@@ -520,8 +523,89 @@ mod tests {
         }
         assert!(
             esc_delivered,
-            "Esc（CSI 27u）が tmux 越しに届かない。画面: {:?}",
+            "Esc（素の \\e）が tmux 越しに素のまま届かない。画面: {:?}",
             session.visible_lines().join("\n")
+        );
+        assert!(
+            !session.visible_lines().join("\n").contains("27u"),
+            "Esc が CSI 27u 断片として漏れている（2026-06-12 実機バグの回帰）。画面: {:?}",
+            session.visible_lines().join("\n")
+        );
+    }
+
+    /// Esc 単押しが「kitty を要求していない」内側アプリ（素の zsh 相当）にも
+    /// 素の \e のまま届き、「27u」が文字として漏れない e2e
+    /// （2026-06-12 実機バグの再発防止）。
+    /// 後半は前提のカナリア: tmux が受信 CSI 27u を非要求ペインへ素通しすること
+    /// （= UI 層が Esc を CSI u で送ってはいけない理由）を観測ログに残す。
+    /// tmux 側が将来「非要求ペインへはレガシー再エンコード」に変われば
+    /// CsiUMode::ModifiedOnly の Esc 例外は不要にできる
+    #[test]
+    #[cfg(unix)]
+    fn esc単押しは非kittyアプリにも素のescで届き27uが漏れない() {
+        if !available() {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-esc-{}", std::process::id());
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                kill_server(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(socket.clone());
+        // 内側アプリ: kitty を**要求しない** cat -v（素の zsh で Esc を押した状況の再現）
+        let options = SpawnOptions {
+            command: Some(SpawnCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "echo TAKO-ESC-READY; exec cat -v".into()],
+            }),
+            cwd: Some(std::env::temp_dir()),
+            env: vec![],
+        };
+        let (session, _rx) =
+            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-esc"))
+                .expect("tmux クライアントを spawn できる");
+        let wait_for = |needle: &str| -> bool {
+            for _ in 0..100 {
+                if session
+                    .visible_lines()
+                    .iter()
+                    .any(|line| line.contains(needle))
+                {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            false
+        };
+        assert!(
+            wait_for("TAKO-ESC-READY"),
+            "内側アプリが立ち上がらない。画面: {:?}",
+            session.visible_lines().join("\n")
+        );
+        // UI 層（handle_key の CsiUMode::ModifiedOnly）と同じバイト列: Esc は素の \e
+        session.write(b"\x1b".to_vec());
+        session.write(b"ESC-RAW\r".to_vec());
+        assert!(
+            wait_for("^[ESC-RAW"),
+            "Esc（素の \\e）が内側へ素のまま届かない。画面: {:?}",
+            session.visible_lines().join("\n")
+        );
+        assert!(
+            !session.visible_lines().join("\n").contains("27u"),
+            "Esc 単押しで「27u」が文字として漏れた（2026-06-12 実機バグの回帰）。画面: {:?}",
+            session.visible_lines().join("\n")
+        );
+        // カナリア: CSI 27u は非要求ペインにも素通しされる（tmux 3.6 の実測挙動。
+        // これが変わったら main.rs の Esc 例外を見直せる）
+        session.write(b"\x1b[27u".to_vec());
+        session.write(b"\r".to_vec());
+        let passthrough = wait_for("^[[27u");
+        eprintln!(
+            "CSI 27u の非要求ペインへの素通し = {passthrough}（true 想定。false になったら \
+             tmux が再エンコードするようになった = CsiUMode::ModifiedOnly の Esc 例外を再検討）"
         );
     }
 

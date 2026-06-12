@@ -1464,18 +1464,28 @@ impl TakoApp {
         if keystroke.modifiers.platform {
             return;
         }
-        // tmux バックエンドペインでは disambiguate（CSI u 送出）を常に有効化する。
+        // tmux バックエンドペインでは修飾付きキーの CSI u 送出を常に有効化する。
         // 内側アプリ（claude 等）が kitty protocol を要求しても tmux は外側端末へ
         // 伝えない（core の e2e で確認済み）ため、外側 Term のモードだけでは
-        // Shift+Enter を区別できない。tmux は extended-keys always で CSI u を解釈し、
-        // 内側ペインの要求に応じた形式（kitty / レガシー）へ再エンコードするので
-        // 常時送出で安全（Esc の往復も e2e で検証済み）
-        let disambiguate = self
+        // Shift+Enter を区別できない。tmux は extended-keys always で CSI u を解釈し
+        // 内側ペインへ届けるので、修飾付きキーは常時 CSI u で安全。
+        // ただし **Esc 単押しは CSI 27u にしない**（ModifiedOnly）: tmux 3.6 は受信した
+        // CSI 27u を内側ペインの kitty 要求の有無に関係なく素通しするため、CSI u
+        // 非対応アプリ（素の zsh 等）の入力欄に「27u」が文字として挿入される
+        // （2026-06-12 実機バグ）。素の \e は tmux が escape-time で正しく解釈し
+        // 内側へ素のまま届く（core e2e で固定）
+        let kitty_requested = self
             .focused_session()
             .map(|s| s.disambiguate_keys())
-            .unwrap_or(false)
-            || self.backend_sessions.contains_key(&self.focused_pane());
-        if let Some(bytes) = keystroke_to_bytes(keystroke, disambiguate) {
+            .unwrap_or(false);
+        let csi_u = if kitty_requested {
+            CsiUMode::Full
+        } else if self.backend_sessions.contains_key(&self.focused_pane()) {
+            CsiUMode::ModifiedOnly
+        } else {
+            CsiUMode::Off
+        };
+        if let Some(bytes) = keystroke_to_bytes(keystroke, csi_u) {
             // tmux スクロール中（copy-mode）は iTerm2 流に最下部へ戻してから流す
             // （copy-mode にキーが飲まれて「入力が反映されない」症状の根治）
             self.cancel_scroll_before_input(self.focused_pane());
@@ -3540,16 +3550,30 @@ fn encode_modifiers(m: &Modifiers) -> u8 {
         + ((m.platform as u8) << 3)
 }
 
-/// キー入力 → PTY バイト列。`disambiguate` は kitty keyboard protocol の
-/// disambiguate フラグ（TUI が `CSI > 1 u` で有効化。Claude Code 等が
-/// Shift+Enter を区別するために使う）。有効時は Esc と修飾付き
-/// Enter / Tab / Backspace を CSI u 形式で送る。
+/// CSI u（kitty keyboard protocol）の送出範囲
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CsiUMode {
+    /// レガシー端末モード（CSI u を送らない）
+    Off,
+    /// 修飾付き Enter / Tab / Backspace / Esc のみ CSI u（tmux バックエンドペイン）。
+    /// Esc 単押しは素の \e のまま — tmux 3.6 は受信した CSI 27u を内側ペインの
+    /// kitty 要求の有無に関係なく素通しするため、CSI u 非対応アプリの入力欄に
+    /// 「27u」が文字として挿入される（2026-06-12 実機バグ）。修飾付きキーは
+    /// レガシー形式だと区別不能（Shift+Enter = \r）なので CSI u を維持する
+    ModifiedOnly,
+    /// Esc 単押しも CSI 27u（アプリ自身が kitty disambiguate を要求済み = 確実に解釈できる）
+    Full,
+}
+
+/// キー入力 → PTY バイト列。`csi_u` は kitty keyboard protocol（disambiguate
+/// フラグ。TUI が `CSI > 1 u` で有効化。Claude Code 等が Shift+Enter を
+/// 区別するために使う）の送出範囲。
 /// それ以外のフラグ（REPORT_ALL_KEYS 等）は未対応（必要になったら拡張する）
-fn keystroke_to_bytes(ks: &Keystroke, disambiguate: bool) -> Option<Vec<u8>> {
+fn keystroke_to_bytes(ks: &Keystroke, csi_u: CsiUMode) -> Option<Vec<u8>> {
     let mods = encode_modifiers(&ks.modifiers);
-    if disambiguate {
+    if csi_u != CsiUMode::Off {
         let code: Option<u32> = match ks.key.as_str() {
-            "escape" => Some(27),
+            "escape" if csi_u == CsiUMode::Full || mods > 1 => Some(27),
             "enter" if mods > 1 => Some(13),
             "tab" if mods > 1 => Some(9),
             "backspace" if mods > 1 => Some(127),
@@ -6367,32 +6391,64 @@ mod keystroke_tests {
     fn disambiguate有効時は修飾付きenterをcsi_uで送る() {
         // Claude Code TUI の Shift+Enter 改行（kitty keyboard protocol disambiguate）
         assert_eq!(
-            keystroke_to_bytes(&ks_shift("enter"), true),
+            keystroke_to_bytes(&ks_shift("enter"), CsiUMode::Full),
             Some(b"\x1b[13;2u".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes(&ks_ctrl("enter"), true),
+            keystroke_to_bytes(&ks_ctrl("enter"), CsiUMode::Full),
             Some(b"\x1b[13;5u".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes(&ks_shift("tab"), true),
+            keystroke_to_bytes(&ks_shift("tab"), CsiUMode::Full),
             Some(b"\x1b[9;2u".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes(&ks_shift("backspace"), true),
+            keystroke_to_bytes(&ks_shift("backspace"), CsiUMode::Full),
             Some(b"\x1b[127;2u".to_vec())
         );
-        // Esc は単押しでも CSI u（disambiguate の仕様）
+        // Esc は単押しでも CSI u（アプリが kitty 要求済み = disambiguate の仕様）
         assert_eq!(
-            keystroke_to_bytes(&ks("escape"), true),
+            keystroke_to_bytes(&ks("escape"), CsiUMode::Full),
             Some(b"\x1b[27u".to_vec())
         );
         // 無修飾 Enter / Tab / Backspace はレガシーのまま
-        assert_eq!(keystroke_to_bytes(&ks("enter"), true), Some(b"\r".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("tab"), true), Some(b"\t".to_vec()));
         assert_eq!(
-            keystroke_to_bytes(&ks("backspace"), true),
+            keystroke_to_bytes(&ks("enter"), CsiUMode::Full),
+            Some(b"\r".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("tab"), CsiUMode::Full),
+            Some(b"\t".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("backspace"), CsiUMode::Full),
             Some(b"\x7f".to_vec())
+        );
+    }
+
+    #[test]
+    fn バックエンドペインはesc単押しを素のescで送る() {
+        // tmux バックエンド強制（ModifiedOnly）: 修飾付きキーは CSI u を維持しつつ、
+        // Esc 単押しは素の \e。tmux は CSI 27u を内側ペインの kitty 要求に関係なく
+        // 素通しするため、CSI u 非対応アプリに「27u」が文字として挿入される
+        // （2026-06-12 実機バグの再発防止）
+        assert_eq!(
+            keystroke_to_bytes(&ks("escape"), CsiUMode::ModifiedOnly),
+            Some(b"\x1b".to_vec())
+        );
+        // Shift+Enter（生命線）は CSI u のまま
+        assert_eq!(
+            keystroke_to_bytes(&ks_shift("enter"), CsiUMode::ModifiedOnly),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks_shift("tab"), CsiUMode::ModifiedOnly),
+            Some(b"\x1b[9;2u".to_vec())
+        );
+        // 修飾付き Esc はレガシー形式だと区別不能なので CSI u
+        assert_eq!(
+            keystroke_to_bytes(&ks_shift("escape"), CsiUMode::ModifiedOnly),
+            Some(b"\x1b[27;2u".to_vec())
         );
     }
 
@@ -6417,7 +6473,7 @@ mod keystroke_tests {
 
     /// disambiguate なし（レガシー端末モード）の変換
     fn keystroke_to_bytes_legacy(ks: &Keystroke) -> Option<Vec<u8>> {
-        keystroke_to_bytes(ks, false)
+        keystroke_to_bytes(ks, CsiUMode::Off)
     }
 
     #[test]

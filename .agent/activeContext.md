@@ -4,28 +4,21 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-06-12 夜・パネル UI 刷新 完了直後）
+## 現在の対象（2026-06-12 夜・Esc「27u」バグ根治直後）
 
-- **パネル UI 刷新（FR-2.16.4〜2.16.8）完了**（コミット c91f7b3・CI 確認中に引き継ぎ）:
-  - 下部ステータスバー新設（左 = ◫ ファイル、右 = ⌗ tmux / ⎇ git）。「◧ panel」廃止
-  - パネル内部タブ 1 本化: agents → 統合「tmux」ビュー（タブ名ラベル枠 + 全ペイン入れ子 +
-    ゴミ箱 → 確認 → dispatch Close）。旧 tmuxview 削除。git ビューはプレースホルダ
-  - FR-2.16.8（実装中のユーザー追加要件）: タブ未表示の tmux を「管理外 /
-    kill漏れ?」ラベルで区別表示 + 確認つき TmuxKill
-  - ファイルツリーの CLI / MCP 経路新設: `Request::Panel` に `filetree` 追加
-    （`tako panel --filetree on/off` / MCP `tako_panel`。ツール数は 20 のまま）。
-    パネル view の wire 値は `tmux | git`（**agents は廃止**）
-- セルフテスト **107 項目**緑・workspace テスト緑・clippy / fmt 緑・
-  `.app` を /Applications へ反映済み・**ユーザーの再起動待ち**（前回のスクロール根治 +
-  署名安定化 + 今回の UI 刷新がまとめて次回起動から有効）
+- **既知バグ「Esc で 27u が入力欄に挿入」を根治**: 根因は tmux 3.6 が受信した
+  CSI 27u を内側ペインの kitty 要求の有無に関係なく素通しすること（on / always
+  どちらでも。実測）× tako がバックエンドペインで Esc 単押しを常に CSI 27u で
+  送っていたこと。`CsiUMode`（Off / ModifiedOnly / Full）を導入し、バックエンド
+  強制時は Esc 単押しを素の `\e` に（修飾付きキーの CSI u = Shift+Enter の生命線は
+  維持）。詳細: `architecture.md`「実機リグレッション」節の拡張キー項
+- 別件: ロケールカナリア（tmux.rs）が同一バイナリ・同一マシンで数時間内に挙動反転
+  （C ロケールの TAB サニタイズが再現しなくなった）→ hard assert を観測 eprintln へ降格。
+  修正本体の保証（tmux_command で TAB 保持・パース成功）は引き続き assert
+- セルフテスト緑・workspace テスト緑・clippy / fmt 緑・`.app` を /Applications へ
+  反映済み・**ユーザーの再起動待ち**（スクロール根治 + 署名安定化 + パネル UI 刷新 +
+  今回の Esc 修正がまとめて次回起動から有効）
 - 最終更新: 2026-06-12
-
-## 既知バグ（次の worker が修正）
-
-- [ ] **Escape で「27u」が入力欄に挿入されることがある**（2026-06-12 報告）。
-  extended-keys（CSI u）対応の副作用。tako の kitty / CSI-u 対応（`handle_key`）と
-  ネスト tmux の extended-keys 設定（`NESTED_TMUX_SNIPPET`）の整合を調査して直すこと。
-  関連: `architecture.md`「スクロール制御」節 + FR-2.17 実装メモ、core e2e の CSI u 往復
 
 ## 未着手タスク（優先順はユーザーと相談）
 
@@ -37,7 +30,8 @@
 - [ ] **FR-2.14 MCP ゼロコンフィグオンボーディング**（配布前必須。FR-2.14.6 含む）
 - [ ] **FR-2.17 ネスト tmux の検出・診断・ワンタップ適用**（Phase 7）
 - [ ] **FR-2.15 ターミナルのたまり場**（UI の見せ方をユーザーと相談してから着手）
-- [ ] 常用確認: manual-checks.md「パネル UI 刷新」節 +「スクロール・キー実機バグ一括」節
+- [ ] 常用確認: manual-checks.md「パネル UI 刷新」「スクロール・キー実機バグ一括」
+      「Esc『27u』挿入バグ修正」各節
 - [ ] 描画のグリッド不一致（全角 advance ≠ セル幅 ×2）の要否判断
 
 ## Phase 5 再開手順（FR-3.2 から）
@@ -51,7 +45,11 @@
 
 ## 直近の観点・指摘（実装時に踏みやすい点）
 
-- **セルフテストで dispatch を直接呼ぶときの罠**（今回踏んだ）: `Request::Split` を
+- **CSI u の送出範囲は `CsiUMode`**（main.rs）: Full = アプリが kitty 要求済み
+  （Esc も CSI 27u）/ ModifiedOnly = バックエンドペイン強制（Esc は素の `\e`）/
+  Off = レガシー。tmux は CSI 27u を非要求ペインにも素通しする（e2e のカナリア
+  eprintln が観測。これが変わったら ModifiedOnly の Esc 例外を再検討）
+- **セルフテストで dispatch を直接呼ぶときの罠**: `Request::Split` を
   テストクロージャ内から直接 dispatch すると `pending_attach` が処理されず、後続の
   CLI dispatch が「ツリーに居ないペイン」を起動して以降の項目が壊れる。
   直接 dispatch した後は `std::mem::take(&mut app.pending_attach)` → `spawn_session` を
@@ -61,7 +59,6 @@
 - **スクロール関連の罠**: ペインターゲットは `=セッション名:`（末尾コロン必須）。
   extended-keys は always 必須。conf はサーバー起動時のみ → 稼働サーバーへは `sync_conf`
 - **ネスト tmux の推奨設定の正は `tmux_backend::NESTED_TMUX_SNIPPET`**
-- **バックエンドペインは disambiguate 常時 ON**（handle_key）。core e2e が回帰防止
 - **接続情報**: `instances/control-<pid>.json` + current。CLI は生存候補へ自動フォールバック
 - セルフテストは **107 項目**。IME 項目は稀にフレーク（再実行で緑）
 - gpui ソース参照は `~/.cargo/git/checkouts/zed-*/cafbf4b/crates/gpui*` のみ（Apache-2.0）
@@ -70,8 +67,8 @@
 
 - Phase 5 再開時: 上の「再開手順」+ `architecture.md`「コンセプト②の実現」
 - FR-2.19 ポートパネル着手時: `requirements.md` FR-2.19 + FR-2.16（パネルのビュー追加）
-- スクロール / ネスト tmux に触るとき: `architecture.md`「スクロール制御」+
-  `requirements.md` FR-2.17
+- スクロール / ネスト tmux / 拡張キーに触るとき: `architecture.md`「スクロール制御」+
+  「実機リグレッション」節 + `requirements.md` FR-2.17
 - 配布・オンボーディング着手時: `roadmap.md` Phase 7 + `requirements.md` FR-2.14 +
   `concept.md` ビジョン節
 

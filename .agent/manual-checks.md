@@ -223,3 +223,13 @@ tmux バイナリ解決・マウス / CSI u の生配送・明示コマンド sp
       「kill漏れ?」ラベルで出て、それぞれ確認つきで kill できる
 - [ ] `tako panel --filetree on/off` / `--view git` が UI に反映される
 - [ ] git ビューはプレースホルダ文言が出る（git graph は FR-3.6）
+
+## Esc「27u」挿入バグ修正（2026-06-12）
+
+素の `\e` 往復・「27u」非漏出・CSI u 維持は core e2e + 単体テストで機械検証済み。
+実 .app で確認:
+
+- [ ] 素の zsh ペインで Esc を押しても「27u」が入力欄に**挿入されない**
+- [ ] claude ペインで Esc が効く（入力キャンセル等）+ Shift+Enter 改行が引き続き効く
+- [ ] ネスト tmux（自前サーバー attach）内の claude でも Esc / Shift+Enter が効く
+- [ ] vim ペインで Esc によるモード切替が遅延なく効く（escape-time 10ms の範囲）
