@@ -46,7 +46,10 @@
 ## 現フェーズで Read すべき設計書
 
 - Phase 5 着手時: `roadmap.md`「Phase 5」+ `architecture.md`「コンセプト②の実現」
-  「Web ビューペイン」節（ハイライタ等の技術選定はユーザーへ選択肢提示）
+  「Web ビューペイン」節。**技術選定（ハイライタ等）は候補 2〜4 個 + 推奨 1 つ +
+  各トレードオフ 1 行の形でユーザーへ提示して止まる**（roadmap Phase 5 末尾に明記）
+- Phase 5.5（tmux バックエンド永続化。全 PTY の tmux session 化・完全復元、
+  ユーザー承認済み方式）を Phase 5 の次に登録済み → `roadmap.md`「Phase 5.5」
 - FR-2.14 着手時: `requirements.md` FR-2.14 の実装メモ
 
 ## 未解決・次の一手
