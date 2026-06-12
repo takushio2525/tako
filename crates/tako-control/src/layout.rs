@@ -24,6 +24,27 @@ pub struct LayoutFile {
     pub version: u32,
     pub active_tab: u64,
     pub tabs: Vec<TabLayout>,
+    /// OS ウィンドウのフレーム（サイズ・位置・フルスクリーン等。2026-06-12 追加。
+    /// 旧ファイルには無いので serde default で後方互換）
+    #[serde(default)]
+    pub window: Option<WindowFrame>,
+}
+
+/// OS ウィンドウのジオメトリ（復元時は起動時のウィンドウ生成オプションに使う）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowFrame {
+    /// 復元サイズ（fullscreen / maximized 中はその解除後のサイズ）の左上座標と寸法（px）
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    /// "windowed" | "maximized" | "fullscreen"
+    #[serde(default = "default_window_state")]
+    pub state: String,
+}
+
+fn default_window_state() -> String {
+    "windowed".into()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -78,11 +99,17 @@ pub struct RestoredPane {
 }
 
 /// 現在の Workspace 構造をレイアウト表現へ写す。`meta` でペインごとの
-/// バックエンドセッション名・cwd を引く（UI 層が保持している情報）
-pub fn capture(ws: &Workspace, meta: &dyn Fn(PaneId) -> PaneMeta) -> LayoutFile {
+/// バックエンドセッション名・cwd を、`window` で OS ウィンドウのフレームを受け取る
+/// （いずれも UI 層が保持している情報）
+pub fn capture(
+    ws: &Workspace,
+    meta: &dyn Fn(PaneId) -> PaneMeta,
+    window: Option<WindowFrame>,
+) -> LayoutFile {
     LayoutFile {
         version: LAYOUT_VERSION,
         active_tab: ws.active_tab_id().as_u64(),
+        window,
         tabs: ws
             .tabs()
             .iter()
@@ -343,15 +370,31 @@ mod tests {
             .iter()
             .flat_map(|t| t.tree().panes().into_iter().map(|p| p.id().as_u64()))
             .collect();
-        let layout = capture(&ws, &|pane| PaneMeta {
-            session: Some(format!("tako-s{}", pane.as_u64())),
-            cwd: Some("/tmp".into()),
-        });
+        let frame = WindowFrame {
+            x: 10.0,
+            y: 20.0,
+            width: 1280.0,
+            height: 800.0,
+            state: "fullscreen".into(),
+        };
+        let layout = capture(
+            &ws,
+            &|pane| PaneMeta {
+                session: Some(format!("tako-s{}", pane.as_u64())),
+                cwd: Some("/tmp".into()),
+            },
+            Some(frame.clone()),
+        );
 
-        // serde 往復
+        // serde 往復（ウィンドウフレーム込み）
         let json = serde_json::to_string(&layout).unwrap();
         let back: LayoutFile = serde_json::from_str(&json).unwrap();
         assert_eq!(back, layout);
+        assert_eq!(back.window, Some(frame));
+        // ウィンドウフレームの無い旧ファイルも読める（後方互換）
+        let legacy: LayoutFile =
+            serde_json::from_str(&json.replace(",\"window\":{", ",\"_window\":{")).unwrap();
+        assert_eq!(legacy.window, None);
 
         let (restored_ws, restored) = restore(&back).expect("復元できる");
         assert_eq!(restored_ws.active_tab_id().as_u64(), active);
@@ -386,15 +429,16 @@ mod tests {
             version: LAYOUT_VERSION,
             active_tab: 1,
             tabs: vec![],
+            window: None,
         })
         .is_none());
         // バージョン不一致
         let ws = sample_workspace();
-        let mut layout = capture(&ws, &|_| PaneMeta::default());
+        let mut layout = capture(&ws, &|_| PaneMeta::default(), None);
         layout.version = 99;
         assert!(restore(&layout).is_none());
         // ペイン ID 重複
-        let mut layout = capture(&ws, &|_| PaneMeta::default());
+        let mut layout = capture(&ws, &|_| PaneMeta::default(), None);
         layout.version = LAYOUT_VERSION;
         let dup = layout.tabs[0].clone();
         layout.tabs.push(TabLayout {
@@ -410,7 +454,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("layout.json");
         let ws = sample_workspace();
-        let layout = capture(&ws, &|_| PaneMeta::default());
+        let layout = capture(&ws, &|_| PaneMeta::default(), None);
         save_to(&path, &layout).unwrap();
         assert_eq!(load_from(&path), Some(layout));
         let _ = std::fs::remove_dir_all(&dir);

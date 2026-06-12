@@ -343,6 +343,8 @@ struct TakoApp {
     backend_sessions: HashMap<PaneId, String>,
     /// 直近に保存したレイアウトの JSON（変化したときだけ書き込むための比較用）
     last_saved_layout: Option<String>,
+    /// OS ウィンドウの現フレーム（render で採取し layout 保存に含める。FR-5）
+    window_frame: Option<tako_control::layout::WindowFrame>,
 }
 
 /// 提案チップ 1 件分（FR-2.4.3。「localhost:PORT をブラウザで開く？」）
@@ -482,6 +484,7 @@ impl TakoApp {
             tmux_persist,
             backend_sessions: HashMap::new(),
             last_saved_layout: None,
+            window_frame: None,
         };
         if restored.is_empty() {
             let root_id = app.workspace.active_tab().tree().focused();
@@ -1186,15 +1189,17 @@ impl TakoApp {
         }
         let backend_sessions = &self.backend_sessions;
         let terminals = &self.terminals;
-        let layout = tako_control::layout::capture(&self.workspace, &|pane| {
-            tako_control::layout::PaneMeta {
+        let layout = tako_control::layout::capture(
+            &self.workspace,
+            &|pane| tako_control::layout::PaneMeta {
                 session: backend_sessions.get(&pane).cloned(),
                 cwd: terminals
                     .get(&pane)
                     .and_then(|s| s.cwd())
                     .map(|p| p.display().to_string()),
-            }
-        });
+            },
+            self.window_frame.clone(),
+        );
         let Ok(json) = serde_json::to_string(&layout) else {
             return;
         };
@@ -2997,6 +3002,23 @@ impl Render for TakoApp {
         // ファイルツリーの root をフォーカスペインの cwd に追従させる（FR-3.1）
         self.sync_filetree_root();
 
+        // OS ウィンドウのフレームを採取する（layout 保存 = 再起動時のウィンドウ復元用。
+        // window_bounds() は fullscreen / maximized 中でも復元サイズを返す）
+        self.window_frame = Some({
+            let (state, bounds) = match window.window_bounds() {
+                WindowBounds::Windowed(b) => ("windowed", b),
+                WindowBounds::Maximized(b) => ("maximized", b),
+                WindowBounds::Fullscreen(b) => ("fullscreen", b),
+            };
+            tako_control::layout::WindowFrame {
+                x: f32::from(bounds.origin.x),
+                y: f32::from(bounds.origin.y),
+                width: f32::from(bounds.size.width),
+                height: f32::from(bounds.size.height),
+                state: state.to_string(),
+            }
+        });
+
         // アクティブタブのレイアウト（単位矩形）と、マウス変換用のピクセル矩形を更新する。
         // サイドバー表示中はその幅だけコンテンツ領域を右へずらす（ペイン矩形・境界
         // ハンドル・IME 位置はすべて content_origin / content_size 起点で連動する）
@@ -3316,11 +3338,29 @@ fn main() {
     }
     application().run(|cx: &mut App| {
         cx.bind_keys(key_bindings());
-        let bounds = Bounds::centered(None, size(px(960.), px(600.)), cx);
+        // 保存済みウィンドウフレームの復元（FR-5。終了前にフルスクリーンなら
+        // フルスクリーンで開く）。セルフテストは既定サイズで決定的に動かす
+        let saved_frame = if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            tako_control::layout::load().and_then(|l| l.window)
+        } else {
+            None
+        };
+        let window_bounds = match saved_frame {
+            // 壊れた保存値（極端に小さい等）は既定へフォールバック
+            Some(f) if f.width >= 200.0 && f.height >= 150.0 => {
+                let bounds = Bounds::new(point(px(f.x), px(f.y)), size(px(f.width), px(f.height)));
+                match f.state.as_str() {
+                    "fullscreen" => WindowBounds::Fullscreen(bounds),
+                    "maximized" => WindowBounds::Maximized(bounds),
+                    _ => WindowBounds::Windowed(bounds),
+                }
+            }
+            _ => WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx)),
+        };
         let window = cx
             .open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_bounds: Some(window_bounds),
                     ..Default::default()
                 },
                 |window, cx| {
