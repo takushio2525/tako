@@ -197,6 +197,32 @@ fn initial_port_detect() -> bool {
     tako_control::settings::load().port_detect
 }
 
+/// tmux バックエンド永続化（Phase 5.5 / FR-5）の起動時の有効判定。
+/// セルフテストでは既定 OFF（専用項目が dispatch 経由で ON にして検証する。
+/// 既存項目を tmux 経由にしてスクロールバック等の挙動を変えない）。
+/// `TAKO_PERSIST=0|false|off` は設定ファイルより優先して無効化する
+fn initial_tmux_persist() -> bool {
+    if std::env::var_os("TAKO_SELF_TEST").is_some() {
+        return false;
+    }
+    if matches!(
+        std::env::var("TAKO_PERSIST").ok().as_deref(),
+        Some("0" | "false" | "off")
+    ) {
+        return false;
+    }
+    tako_control::settings::load().tmux_persist
+}
+
+/// バックエンドセッション名の払い出し（`tako-<hex12>`）。
+/// 乱数ベースなので多重起動・PID 再利用でも過去の残骸セッションと衝突しない
+fn new_backend_session_name() -> String {
+    let token =
+        tako_control::generate_token().unwrap_or_else(|_| format!("{:024x}", std::process::id()));
+    let tail = &token[..12.min(token.len())];
+    format!("{}{tail}", tako_core::tmux_backend::SESSION_PREFIX)
+}
+
 /// プレビューを開く（提案チップ承諾アクションの**差し替え点**）。
 /// 当面は外部ブラウザで開き、Phase 5 で Web ビューペイン（FR-3.8）が入ったら
 /// ここをペイン生成（`tako_open_url` 相当）へ差し替える
@@ -275,8 +301,9 @@ struct TakoApp {
     tmuxview_active: bool,
     /// tmux 一覧の最新スナップショット（dispatch の TmuxList 結果。表示は描画側の責務）
     tmux_sessions: Vec<serde_json::Value>,
-    /// kill の確認待ち（セッション名, window index）。誤爆防止（FR-2.13.3）
-    tmux_pending_kill: Option<(String, Option<u32>)>,
+    /// kill の確認待ち（セッション名, window index, tmux サーバー名）。誤爆防止（FR-2.13.3）。
+    /// サーバー名は tako バックエンド（Phase 5.5）のセッションを kill するときに使う
+    tmux_pending_kill: Option<(String, Option<u32>, Option<String>)>,
     /// 集約センター（FR-2.10）を表示中か。tmuxview と同じ固定タブ UI 状態
     agents_view_active: bool,
     /// 左サイドバーのファイルツリー（FR-3.1 / FR-3.7。cmd+B でトグル）
@@ -289,6 +316,12 @@ struct TakoApp {
     port_suggestions: Vec<PortSuggestion>,
     /// 却下済みの (ペイン, ポート)。ポートが消えるまで再提案しない
     dismissed_ports: std::collections::HashSet<(PaneId, u16)>,
+    /// tmux バックエンド永続化（Phase 5.5 / FR-5）の有効状態（dispatch から切替）
+    tmux_persist: bool,
+    /// ペインを保持する tmux バックエンドセッション名（persist 有効時のみ登録される）
+    backend_sessions: HashMap<PaneId, String>,
+    /// 直近に保存したレイアウトの JSON（変化したときだけ書き込むための比較用）
+    last_saved_layout: Option<String>,
 }
 
 /// 提案チップ 1 件分（FR-2.4.3。「localhost:PORT をブラウザで開く？」）
@@ -381,9 +414,26 @@ impl TakoApp {
             }
         }
 
+        // 再起動からの復元（Phase 5.5 / FR-5）。persist 有効 + tmux ありなら
+        // レイアウトファイルから同じ ID・同じ構成でワークスペースを再現し、
+        // 各ペインは下の spawn ループで tmux バックエンドセッションへ再 attach する
+        let tmux_persist = initial_tmux_persist();
+        let mut restored: Vec<tako_control::layout::RestoredPane> = Vec::new();
+        let workspace = if tmux_persist && tako_core::tmux_backend::available() {
+            tako_control::layout::load()
+                .and_then(|file| tako_control::layout::restore(&file))
+                .map(|(ws, panes)| {
+                    restored = panes;
+                    ws
+                })
+                .unwrap_or_else(|| Workspace::new("1", Pane::new(PaneOrigin::User)))
+        } else {
+            Workspace::new("1", Pane::new(PaneOrigin::User))
+        };
+
         let mut app = Self {
-            // ルートペインは下の spawn_session でセッションを張る
-            workspace: Workspace::new("1", Pane::new(PaneOrigin::User)),
+            // ルートペイン（復元時は全ペイン）は下の spawn_session でセッションを張る
+            workspace,
             terminals: HashMap::new(),
             theme: Theme::default(),
             focus_handle: cx.focus_handle(),
@@ -406,12 +456,49 @@ impl TakoApp {
             port_detect: initial_port_detect(),
             port_suggestions: Vec::new(),
             dismissed_ports: std::collections::HashSet::new(),
+            tmux_persist,
+            backend_sessions: HashMap::new(),
+            last_saved_layout: None,
         };
-        let root_id = app.workspace.active_tab().tree().focused();
-        if let Err(e) = app.spawn_session(root_id, SpawnOptions::default(), cx) {
-            // 最初のペインすら開けない環境では使いようがない。SIGABRT ではなく明示終了する
-            eprintln!("fatal: 最初のシェルを起動できない: {e}");
-            std::process::exit(1);
+        if restored.is_empty() {
+            let root_id = app.workspace.active_tab().tree().focused();
+            if let Err(e) = app.spawn_session(root_id, SpawnOptions::default(), cx) {
+                // 最初のペインすら開けない環境では使いようがない。SIGABRT ではなく明示終了する
+                eprintln!("fatal: 最初のシェルを起動できない: {e}");
+                std::process::exit(1);
+            }
+        } else {
+            // 復元 spawn: 保存済みセッション名で attach（消えていれば保存 cwd で開き直し）。
+            // セッション名の無かったペイン（直接 spawn 時代）も以後はバックエンドに乗る
+            let pane_ids: Vec<PaneId> = app
+                .workspace
+                .tabs()
+                .iter()
+                .flat_map(|t| t.tree().panes().into_iter().map(|p| p.id()))
+                .collect();
+            for r in &restored {
+                let Some(&pane) = pane_ids.iter().find(|p| p.as_u64() == r.pane) else {
+                    continue;
+                };
+                if let Some(name) = &r.session {
+                    app.backend_sessions.insert(pane, name.clone());
+                }
+                let options = SpawnOptions {
+                    cwd: r
+                        .cwd
+                        .clone()
+                        .map(std::path::PathBuf::from)
+                        .filter(|p| p.is_dir()),
+                    ..SpawnOptions::default()
+                };
+                if let Err(e) = app.spawn_session(pane, options, cx) {
+                    eprintln!("warning: ペイン {pane} を復元できない: {e}");
+                }
+            }
+            if app.terminals.is_empty() {
+                eprintln!("fatal: 復元したペインを 1 つも起動できない");
+                std::process::exit(1);
+            }
         }
 
         // IPC リクエストを UI スレッドで dispatch するループ。
@@ -430,6 +517,8 @@ impl TakoApp {
                             )));
                         }
                     }
+                    // AI / CLI 操作によるレイアウト変化を即座に永続化する（Phase 5.5）
+                    app.save_layout();
                     cx.notify();
                     result
                 });
@@ -452,9 +541,12 @@ impl TakoApp {
                 if app.tmuxview_active {
                     app.refresh_tmux(cx);
                 }
+                app.sync_filetree_root();
                 if app.filetree.visible && app.filetree.refresh() {
                     cx.notify();
                 }
+                // UI 操作・cwd 変化によるレイアウト変化の定期保存（Phase 5.5。差分時のみ書く）
+                app.save_layout();
             });
             if result.is_err() {
                 break; // View が破棄された
@@ -786,13 +878,13 @@ impl TakoApp {
 
     /// 確認済みの kill を実行する（kill ボタン → 確認 → ここ）
     fn tmux_kill_confirmed(&mut self, cx: &mut Context<Self>) {
-        let Some((session, window)) = self.tmux_pending_kill.take() else {
+        let Some((session, window, socket)) = self.tmux_pending_kill.take() else {
             return;
         };
         let result = tako_control::dispatch(
             self,
             tako_control::protocol::Request::TmuxKill {
-                socket: None,
+                socket,
                 session,
                 window,
             },
@@ -835,6 +927,25 @@ impl TakoApp {
                 options.env.push(("TAKO_TOKEN".into(), token.clone()));
             }
         }
+        // tmux バックエンド（Phase 5.5 / FR-5）: persist 有効 + tmux ありなら、シェルを
+        // 直接ではなく専用サーバーのセッションとして spawn する。`new-session -A` なので
+        // 復元時（既存セッション名）は attach、新規ペインは作成と、同じ経路で済む
+        let mut backend_session = None;
+        if self.tmux_persist && tako_core::tmux_backend::available() {
+            let name = self
+                .backend_sessions
+                .entry(pane_id)
+                .or_insert_with(new_backend_session_name)
+                .clone();
+            options = tako_core::tmux_backend::wrap_options(
+                options,
+                &tako_core::tmux_backend::socket_name(),
+                &name,
+            );
+            backend_session = Some(name);
+        } else {
+            self.backend_sessions.remove(&pane_id);
+        }
         let (session, mut rx) = TerminalSession::spawn(INITIAL_COLS, INITIAL_ROWS, options)?;
         self.terminals.insert(pane_id, session);
         cx.spawn(async move |this, cx| {
@@ -848,6 +959,38 @@ impl TakoApp {
             }
         })
         .detach();
+        // バックエンド構成では配下プロセスの制御端末は tmux サーバー側のペイン tty になる。
+        // ポート検知（FR-2.4.2）と tmuxview（FR-2.13.2）の突き合わせ先をそちらへ差し替える
+        // （セッション起動直後はまだ取れないことがあるためバックグラウンドでリトライ）
+        if let Some(name) = backend_session {
+            let socket = tako_core::tmux_backend::socket_name();
+            cx.spawn(async move |this, cx| {
+                for _ in 0..20 {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(250))
+                        .await;
+                    let (socket, name) = (socket.clone(), name.clone());
+                    let tty = cx
+                        .background_executor()
+                        .spawn(async move { tako_core::tmux_backend::pane_tty(&socket, &name) })
+                        .await;
+                    let alive = this.update(cx, |app: &mut TakoApp, _| {
+                        match (&tty, app.terminals.get_mut(&pane_id)) {
+                            (Some(tty), Some(session)) => {
+                                session.set_tty_name(Some(tty.clone()));
+                                false // 解決済み → ループ終了
+                            }
+                            (None, Some(_)) => true, // 未解決 → リトライ
+                            (_, None) => false,      // ペインが先に閉じた → 打ち切り
+                        }
+                    });
+                    if !matches!(alive, Ok(true)) {
+                        return;
+                    }
+                }
+            })
+            .detach();
+        }
         Ok(())
     }
 
@@ -931,6 +1074,17 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// ペインを閉じたときのバックエンドセッション破棄（Phase 5.5）。
+    /// **明示 close のときだけ**呼ぶ（アプリ終了経路では呼ばない = セッションが残り永続化）。
+    /// シェル exit 由来の close では既にセッションが消えており kill は無害な空振りになる
+    fn drop_backend_session(&mut self, pane_id: PaneId) {
+        if let Some(name) = self.backend_sessions.remove(&pane_id) {
+            let socket = tako_core::tmux_backend::socket_name();
+            // UI スレッドを塞がない（tmux 不調時の output() 待ちを避ける）
+            std::thread::spawn(move || tako_core::tmux_backend::kill_session(&socket, &name));
+        }
+    }
+
     fn remove_pane(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
         let Some(tab_id) = self
             .workspace
@@ -948,6 +1102,7 @@ impl TakoApp {
         match tab.tree_mut().close(pane_id) {
             Ok(_) => {
                 self.terminals.remove(&pane_id);
+                self.drop_backend_session(pane_id);
             }
             Err(_) => {
                 // LastPane: タブごと閉じる
@@ -966,14 +1121,55 @@ impl TakoApp {
             Ok(_) => {
                 for id in pane_ids {
                     self.terminals.remove(&id);
+                    self.drop_backend_session(id);
                 }
             }
             Err(_) => {
-                // LastTab: アプリ終了は UI 層の責務
+                // LastTab: アプリ終了は UI 層の責務。最後のペインの明示 close なので
+                // セッションも破棄し、次回起動で空レイアウトを復元しないようファイルも消す
+                for id in pane_ids {
+                    self.drop_backend_session(id);
+                }
+                if std::env::var_os("TAKO_SELF_TEST").is_none() {
+                    tako_control::layout::remove();
+                }
                 cx.quit();
             }
         }
         cx.notify();
+    }
+
+    /// レイアウトの保存（Phase 5.5 / FR-5）。構造が変わったときだけ書き込む。
+    /// 定期ループ（2 秒）・dispatch 後・終了時に呼ばれる。セルフテスト中は
+    /// ユーザーのレイアウトファイルを汚さない
+    fn save_layout(&mut self) {
+        if !self.tmux_persist
+            || !tako_core::tmux_backend::available()
+            || std::env::var_os("TAKO_SELF_TEST").is_some()
+        {
+            return;
+        }
+        let backend_sessions = &self.backend_sessions;
+        let terminals = &self.terminals;
+        let layout = tako_control::layout::capture(&self.workspace, &|pane| {
+            tako_control::layout::PaneMeta {
+                session: backend_sessions.get(&pane).cloned(),
+                cwd: terminals
+                    .get(&pane)
+                    .and_then(|s| s.cwd())
+                    .map(|p| p.display().to_string()),
+            }
+        });
+        let Ok(json) = serde_json::to_string(&layout) else {
+            return;
+        };
+        if self.last_saved_layout.as_deref() == Some(json.as_str()) {
+            return;
+        }
+        match tako_control::layout::save(&layout) {
+            Ok(_) => self.last_saved_layout = Some(json),
+            Err(e) => eprintln!("warning: レイアウトを保存できない: {e}"),
+        }
     }
 
     fn focus_direction(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
@@ -1197,6 +1393,10 @@ impl TakoApp {
             let name = session["name"].as_str().unwrap_or("?").to_string();
             let attached = session["attached"].as_bool().unwrap_or(false);
             let created = session["created"].as_i64().unwrap_or(0);
+            // tako 自身のバックエンド永続化セッション（Phase 5.5 / FR-5）は区別表示する。
+            // kill すると対応ペインの中身が消えるため、対応ペイン / orphan を明示する
+            let backend = session["backend"].as_bool().unwrap_or(false);
+            let socket = session["socket"].as_str().map(str::to_string);
             // tako との対応付け: クライアントごとに tako のタブ・ペイン / tako 外を表示する
             let clients: Vec<String> = session["clients"]
                 .as_array()
@@ -1207,7 +1407,15 @@ impl TakoApp {
                     _ => format!("tako 外（{}）", c["tty"].as_str().unwrap_or("?")),
                 })
                 .collect();
-            let location = if clients.is_empty() {
+            let location = if backend {
+                match (
+                    session["backend_tab"].as_u64(),
+                    session["backend_pane"].as_u64(),
+                ) {
+                    (Some(tab), Some(pane)) => format!("タブ {tab} / ペイン {pane} の中身を保持"),
+                    _ => "orphan（対応ペインなし。kill してよい候補）".to_string(),
+                }
+            } else if clients.is_empty() {
                 "detached（どこにも表示されていない）".to_string()
             } else {
                 clients.join("、")
@@ -1231,6 +1439,7 @@ impl TakoApp {
                 .collect();
 
             let kill_name = name.clone();
+            let kill_socket = socket.clone();
             let mut card = div()
                 .flex()
                 .flex_col()
@@ -1249,6 +1458,15 @@ impl TakoApp {
                                 .font_weight(FontWeight::BOLD)
                                 .child(SharedString::from(name.clone())),
                         )
+                        .children(backend.then(|| {
+                            div()
+                                .px_1()
+                                .rounded_sm()
+                                .text_size(px(10.0))
+                                .text_color(hsla(theme.accent))
+                                .bg(rgba_alpha(theme.accent, 0.15))
+                                .child("tako 永続化")
+                        }))
                         .child(
                             div()
                                 .text_size(px(11.0))
@@ -1280,7 +1498,8 @@ impl TakoApp {
                                 .text_color(hsla(theme.ansi[1]))
                                 .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.tmux_pending_kill = Some((kill_name.clone(), None));
+                                    this.tmux_pending_kill =
+                                        Some((kill_name.clone(), None, kill_socket.clone()));
                                     cx.notify();
                                 }))
                                 .child("kill"),
@@ -1288,6 +1507,7 @@ impl TakoApp {
                 )
                 .children(windows.into_iter().map(|(w_index, label)| {
                     let kill_name = name.clone();
+                    let kill_socket = socket.clone();
                     div()
                         .flex()
                         .flex_row()
@@ -1306,19 +1526,27 @@ impl TakoApp {
                                 .text_color(hsla_alpha(theme.ansi[1], 0.8))
                                 .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.tmux_pending_kill =
-                                        Some((kill_name.clone(), Some(w_index)));
+                                    this.tmux_pending_kill = Some((
+                                        kill_name.clone(),
+                                        Some(w_index),
+                                        kill_socket.clone(),
+                                    ));
                                     cx.notify();
                                 }))
                                 .child("kill"),
                         )
                 }));
             // 誤爆防止のインライン確認（FR-2.13.3）
-            if let Some((pending_session, pending_window)) = &pending {
+            if let Some((pending_session, pending_window, _)) = &pending {
                 if *pending_session == name {
-                    let label = match pending_window {
-                        Some(w) => format!("window {w} を kill する？（中のプロセスごと終了）"),
-                        None => {
+                    let label = match (pending_window, backend) {
+                        (Some(w), _) => {
+                            format!("window {w} を kill する？（中のプロセスごと終了）")
+                        }
+                        (None, true) => format!(
+                            "{name} は tako の永続化セッション。kill すると対応ペインの中身が消える。kill する？"
+                        ),
+                        (None, false) => {
                             format!("セッション {name} を kill する？（中のプロセスごと終了）")
                         }
                     };
@@ -1364,6 +1592,20 @@ impl TakoApp {
             root = root.child(card);
         }
         root
+    }
+
+    /// ファイルツリーの root をフォーカスペインの cwd（無ければ $HOME）に追従させる
+    /// （FR-3.1。render・トグル・定期ループから呼ばれる。非表示中は何もしない）
+    fn sync_filetree_root(&mut self) {
+        if !self.filetree.visible {
+            return;
+        }
+        let cwd = self
+            .focused_session()
+            .and_then(|s| s.cwd())
+            .map(|p| p.to_path_buf())
+            .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from));
+        self.filetree.set_root(cwd);
     }
 
     /// 左サイドバーのファイルツリー（FR-3.1。非表示なら None = 純粋なターミナル FR-3.7）
@@ -2207,6 +2449,8 @@ impl ControlHost for TakoApp {
 
     fn detach_session(&mut self, pane: PaneId) {
         self.terminals.remove(&pane);
+        // CLI / MCP からの明示 close（FR-2.5.4）。バックエンドセッションも片付ける
+        self.drop_backend_session(pane);
     }
 
     fn auto_rename_enabled(&self) -> bool {
@@ -2247,6 +2491,33 @@ impl ControlHost for TakoApp {
                 eprintln!("warning: 設定を保存できない: {e}");
             }
         }
+    }
+
+    fn tmux_persist_enabled(&self) -> bool {
+        self.tmux_persist
+    }
+
+    fn set_tmux_persist(&mut self, enabled: bool) {
+        self.tmux_persist = enabled;
+        // 切替は以後生成されるペインに効く。既存のバックエンドペインはそのまま
+        // （close 時の kill は backend_sessions に残っているため引き続き行われる）。
+        // 永続化（FR-5）。セルフテスト中はユーザー設定・レイアウトを汚さない
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.tmux_persist = enabled;
+            if let Err(e) = tako_control::settings::save(&settings) {
+                eprintln!("warning: 設定を保存できない: {e}");
+            }
+            if !enabled {
+                // OFF 中は復元しない。次回起動が古いレイアウトを拾わないよう消しておく
+                tako_control::layout::remove();
+                self.last_saved_layout = None;
+            }
+        }
+    }
+
+    fn backend_session(&self, pane: PaneId) -> Option<String> {
+        self.backend_sessions.get(&pane).cloned()
     }
 }
 
@@ -2506,14 +2777,7 @@ impl Render for TakoApp {
         let theme = self.theme.clone();
 
         // ファイルツリーの root をフォーカスペインの cwd に追従させる（FR-3.1）
-        if self.filetree.visible {
-            let cwd = self
-                .focused_session()
-                .and_then(|s| s.cwd())
-                .map(|p| p.to_path_buf())
-                .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from));
-            self.filetree.set_root(cwd);
-        }
+        self.sync_filetree_root();
 
         // アクティブタブのレイアウト（単位矩形）と、マウス変換用のピクセル矩形を更新する。
         // サイドバー表示中はその幅だけコンテンツ領域を右へずらす（ペイン矩形・境界
@@ -2749,9 +3013,16 @@ impl Render for TakoApp {
             .on_action(cx.listener(|this, _: &PasteClipboard, _, cx| this.paste(cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.filetree.visible = !this.filetree.visible;
+                // render を待たず即座に root を同期する（オクルージョン中は GPUI が
+                // 再描画しないため、render 内の追従だけだと開いた直後に空になる）
+                this.sync_filetree_root();
                 cx.notify();
             }))
-            .on_action(cx.listener(|_, _: &Quit, _, cx| cx.quit()))
+            .on_action(cx.listener(|this, _: &Quit, _, cx| {
+                // 終了直前の構成を保存してから抜ける（Phase 5.5。セッションは残る = 永続化）
+                this.save_layout();
+                cx.quit()
+            }))
             .on_action(cx.listener(|this, _: &ActivateTab1, _, cx| this.activate_tab_index(0, cx)))
             .on_action(cx.listener(|this, _: &ActivateTab2, _, cx| this.activate_tab_index(1, cx)))
             .on_action(cx.listener(|this, _: &ActivateTab3, _, cx| this.activate_tab_index(2, cx)))
@@ -2798,6 +3069,16 @@ impl Render for TakoApp {
 }
 
 fn main() {
+    // セルフテストの tmux バックエンド項目は、ユーザーの実バックエンド（tako サーバー）を
+    // 汚さない隔離ソケットで行う（終了時に self_test 側が kill-server で片付ける）
+    if std::env::var_os("TAKO_SELF_TEST").is_some()
+        && std::env::var_os("TAKO_TMUX_SOCKET").is_none()
+    {
+        std::env::set_var(
+            "TAKO_TMUX_SOCKET",
+            format!("tako-st-{}", std::process::id()),
+        );
+    }
     application().run(|cx: &mut App| {
         cx.bind_keys(key_bindings());
         let bounds = Bounds::centered(None, size(px(960.), px(600.)), cx);
@@ -3674,7 +3955,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 18, "MCP tools/list は 18 ツール");
+            check(status == 200 && tool_count == 19, "MCP tools/list は 19 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -4292,7 +4573,7 @@ mod self_test {
                     app.refresh_tmux(cx);
                     let shown = app.tmuxview_active;
                     // 確認フロー: 存在しないセッションの kill は無害に失敗し pending が畳まれる
-                    app.tmux_pending_kill = Some(("tako-no-such-session".into(), None));
+                    app.tmux_pending_kill = Some(("tako-no-such-session".into(), None, None));
                     app.tmux_kill_confirmed(cx);
                     let pending_cleared = app.tmux_pending_kill.is_none();
                     app.activate_tab_index(0, cx);
@@ -4540,6 +4821,168 @@ mod self_test {
                 .update(cx, |app, _, _| !app.filetree.visible)
                 .unwrap_or(false);
             check(sidebar_closed, "ファイルツリーの折りたたみ（cmd+B）");
+
+            // 58. tako persist の ON/OFF と状態取得（Phase 5.5 / FR-5。CLI / MCP と同じ
+            //     dispatch 経路。セルフテスト中は設定・レイアウトを永続化しない）
+            type_text(
+                any,
+                cx,
+                &format!(
+                    "{cli} persist on >/dev/null && {cli} persist \
+                     | grep -q '\"enabled\":true' && echo TAKO-PS-$((50+8))"
+                ),
+                true,
+            );
+            wait(cx, 1200).await;
+            check(
+                focused_contains(window, cx, "TAKO-PS-58"),
+                "tako persist on / 状態取得",
+            );
+            let persist_on = window
+                .update(cx, |app, _, _| app.tmux_persist)
+                .unwrap_or(false);
+            check(persist_on, "persist 有効化が spawn 経路へ反映");
+
+            // 59〜62. tmux バックエンド永続化の実機 e2e（tmux 不在環境ではスキップ）。
+            //     隔離ソケット（main() で TAKO_TMUX_SOCKET=tako-st-<pid> を設定済み）上で
+            //     セッション生成 → シェル動作 → OSC パススルー → tty 差し替え →
+            //     tmuxview 区別 → 明示 close での kill を検証する
+            if tako_core::tmux_backend::available() {
+                let backend_sock = tako_core::tmux_backend::socket_name();
+
+                // 59. persist 有効中の分割はバックエンドセッションとして生え、シェルが動く
+                press(any, cx, "cmd-d");
+                wait(cx, 800).await;
+                let (backend_pane, backend_name) = window
+                    .update(cx, |app, _, _| {
+                        let pane = app.focused_pane();
+                        (pane, app.backend_sessions.get(&pane).cloned())
+                    })
+                    .unwrap_or_else(|_| fail("バックエンドペインの状態取得"));
+                let backend_name = backend_name.unwrap_or_else(|| {
+                    fail("persist 有効中の新ペインにバックエンドセッション名が付く")
+                });
+                let mut session_up = false;
+                for _ in 0..20 {
+                    wait(cx, 500).await;
+                    session_up = tako_core::tmux::list_sessions(Some(&backend_sock))
+                        .iter()
+                        .any(|s| s.name == backend_name);
+                    if session_up {
+                        break;
+                    }
+                }
+                check(session_up, "分割でバックエンドセッションが生える");
+                press(any, cx, "ctrl-u");
+                type_text(any, cx, "echo TAKO-BK-'OK'", true);
+                let mut echoed = false;
+                for _ in 0..20 {
+                    wait(cx, 500).await;
+                    echoed = focused_contains(window, cx, "TAKO-BK-OK");
+                    if echoed {
+                        break;
+                    }
+                }
+                check(echoed, "バックエンドペインでシェルが動く");
+
+                // 60. OSC 7 パススルー（allow-passthrough + シェル統合の包み直し）で
+                //     tmux 越しでも cwd 検知（FR-2.4.1）が生きている
+                press(any, cx, "ctrl-u");
+                type_text(any, cx, "mkdir -p /tmp/tako-osc-e2e && cd /tmp/tako-osc-e2e", true);
+                let mut cwd_ok = false;
+                for _ in 0..20 {
+                    wait(cx, 500).await;
+                    cwd_ok = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&backend_pane)
+                                .and_then(|s| s.cwd())
+                                .map(|p| p.display().to_string().contains("tako-osc-e2e"))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if cwd_ok {
+                        break;
+                    }
+                }
+                check(cwd_ok, "OSC 7 が tmux パススルーで届く（cwd 検知維持）");
+
+                // 61. tty がバックエンド側ペイン tty へ差し替わり（ポート検知・tmuxview の
+                //     突き合わせ先）、tmux list が backend: true + 対応ペインで区別される
+                let mut tty_ok = false;
+                for _ in 0..20 {
+                    wait(cx, 500).await;
+                    let inner = tako_core::tmux_backend::pane_tty(&backend_sock, &backend_name);
+                    tty_ok = inner.is_some()
+                        && window
+                            .update(cx, |app, _, _| {
+                                app.terminals
+                                    .get(&backend_pane)
+                                    .and_then(|s| s.tty_name().map(str::to_string))
+                                    == inner
+                            })
+                            .unwrap_or(false);
+                    if tty_ok {
+                        break;
+                    }
+                }
+                check(tty_ok, "tty がバックエンドペイン tty へ差し替わる");
+                let listed_backend = window
+                    .update(cx, |app, _, _| {
+                        let value = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TmuxList { socket: None },
+                            PaneOrigin::Cli,
+                        )
+                        .expect("tmux list は常に成功する");
+                        value["sessions"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|s| {
+                                s["name"].as_str() == Some(backend_name.as_str())
+                                    && s["backend"].as_bool() == Some(true)
+                                    && s["backend_pane"].as_u64()
+                                        == Some(backend_pane.as_u64())
+                            })
+                    })
+                    .unwrap_or(false);
+                check(listed_backend, "tmux list がバックエンドを区別表示する");
+
+                // 62. ペインの明示 close でバックエンドセッションも破棄される
+                //     （アプリ終了では破棄されない = 永続化、は core の e2e テストで検証済み）
+                press(any, cx, "cmd-w");
+                let mut killed = false;
+                for _ in 0..20 {
+                    wait(cx, 500).await;
+                    killed = !tako_core::tmux::list_sessions(Some(&backend_sock))
+                        .iter()
+                        .any(|s| s.name == backend_name);
+                    if killed {
+                        break;
+                    }
+                }
+                check(killed, "明示 close でバックエンドセッションが消える");
+
+                // 後片付け: 隔離バックエンドサーバーごと落とす
+                tako_core::tmux_backend::kill_server(&backend_sock);
+            } else {
+                eprintln!("（tmux 不在のため項目 59〜62 をスキップ）");
+            }
+            // persist を OFF に戻す（以後の項目・終了処理への影響を断つ）
+            let persist_off = window
+                .update(cx, |app, _, _| {
+                    let result = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Persist {
+                            enabled: Some(false),
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    matches!(result, Ok(v) if v["enabled"].as_bool() == Some(false))
+                })
+                .unwrap_or(false);
+            check(persist_off, "tako persist off（dispatch 経由）");
 
             println!("TAKO_APP_SELF_TEST_OK");
             std::process::exit(0);

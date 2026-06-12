@@ -17,19 +17,38 @@ if [[ -f "${ZDOTDIR:-$HOME}/.zshenv" ]]; then
 fi
 
 if [[ -o interactive && -n ${TAKO_PANE_ID-} ]]; then
+  # tako の tmux バックエンド（Phase 5.5 / FR-5。ソケット名 tako*）配下なら:
+  # 1) OSC をパススルー（DCS tmux; … ST。allow-passthrough）で包み、外の tako へ届かせる
+  # 2) TMUX / TMUX_PANE を unset し、ユーザー自身の tmux 利用（ネスト）を素通しにする
+  #    （バックエンドは見えない裏方。素の `tmux` が今まで通り既定サーバーに繋がる）
+  _tako_tmux=
+  if [[ -n ${TMUX-} && ${${TMUX%%,*}:t} == tako* ]]; then
+    _tako_tmux=1
+    unset TMUX TMUX_PANE
+  fi
+  _tako_emit() {
+    if [[ -n $_tako_tmux ]]; then
+      # パススルー内の ESC は二重化する（tmux の仕様）。
+      # 置換は変数経由（"${...//$'\e'/...}" の置換側 $'…' はリテラル扱いされる）
+      local esc=$'\e'
+      builtin printf '\ePtmux;%s\e\\' "${1//$esc/$esc$esc}"
+    else
+      builtin printf '%s' "$1"
+    fi
+  }
   _tako_report_cwd() {
-    builtin printf '\e]7;file://%s%s\a' "${HOST-}" "$PWD"
+    _tako_emit $'\e]7;file://'"${HOST-}${PWD}"$'\a'
   }
   _tako_preexec() {
-    builtin printf '\e]133;C\a'
+    _tako_emit $'\e]133;C\a'
   }
   _tako_precmd() {
     local ret=$?
     if [[ -n ${_tako_ran_command-} ]]; then
-      builtin printf '\e]133;D;%d\a' "$ret"
+      _tako_emit $'\e]133;D;'"$ret"$'\a'
     fi
     _tako_ran_command=
-    builtin printf '\e]133;A\a'
+    _tako_emit $'\e]133;A\a'
     _tako_report_cwd
   }
   _tako_mark_exec() {

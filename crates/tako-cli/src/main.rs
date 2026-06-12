@@ -66,6 +66,9 @@ enum Command {
     Autorename(ToggleArgs),
     /// listen ポート検知 + 提案チップ（FR-2.4.2〜2.4.4）の ON/OFF・状態確認
     Portdetect(ToggleArgs),
+    /// セッション永続化 = tmux バックエンド（FR-5）の ON/OFF・状態確認。
+    /// 有効時、tako を再起動してもタブ構成と実行中プロセスが復元される
+    Persist(ToggleArgs),
     /// tmux セッションの一覧・kill（FR-2.13。消し忘れ tmux の発見と片付け）
     #[command(subcommand)]
     Tmux(TmuxCommand),
@@ -472,6 +475,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Autorename(args) => Request::AutoRename {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
+        Command::Persist(args) => Request::Persist {
+            enabled: args.state.as_deref().map(|s| s == "on"),
+        },
         Command::Portdetect(args) => Request::PortDetect {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
@@ -553,7 +559,9 @@ fn print_result(command: &Command, result: &Value) {
             );
         }
         Command::Tab(TabCommand::New { .. }) => println!("{result}"),
-        Command::Autorename(_) | Command::Portdetect(_) => println!("{result}"),
+        Command::Autorename(_) | Command::Portdetect(_) | Command::Persist(_) => {
+            println!("{result}")
+        }
         Command::Tmux(TmuxCommand::List { .. }) => {
             println!(
                 "{}",

@@ -17,6 +17,10 @@ pub struct Settings {
     /// listen ポート検知 + 提案チップ（FR-2.4.4。既定 ON）
     #[serde(default = "default_true")]
     pub port_detect: bool,
+    /// tmux バックエンドによるセッション永続化（Phase 5.5 / FR-5。既定 ON。
+    /// tmux 不在環境では設定に関わらず直接 spawn へ無害劣化する）
+    #[serde(default = "default_true")]
+    pub tmux_persist: bool,
 }
 
 fn default_true() -> bool {
@@ -28,6 +32,7 @@ impl Default for Settings {
         Self {
             auto_rename: true,
             port_detect: true,
+            tmux_persist: true,
         }
     }
 }
@@ -91,6 +96,7 @@ mod tests {
         let settings = Settings {
             auto_rename: false,
             port_detect: false,
+            tmux_persist: false,
         };
         save_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), Some(settings));
@@ -105,5 +111,6 @@ mod tests {
         let parsed: Settings = serde_json::from_str("{}").unwrap();
         assert!(parsed.auto_rename);
         assert!(parsed.port_detect);
+        assert!(parsed.tmux_persist);
     }
 }

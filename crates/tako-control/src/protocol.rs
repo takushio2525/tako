@@ -158,6 +158,10 @@ pub enum Request {
     /// listen ポート検知 + 提案チップ（FR-2.4.4）の ON/OFF。
     /// `enabled` 省略時は現在状態の取得のみ。設定は永続化される
     PortDetect { enabled: Option<bool> },
+    /// tmux バックエンドによるセッション永続化（Phase 5.5 / FR-5）の ON/OFF。
+    /// `enabled` 省略時は現在状態の取得のみ。切替は**以後生成されるペイン**に効く
+    /// （既存ペインのバックエンドは変わらない）。設定は永続化される
+    Persist { enabled: Option<bool> },
 }
 
 /// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。

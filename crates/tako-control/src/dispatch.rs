@@ -38,6 +38,17 @@ pub trait ControlHost {
     }
     /// listen ポート検知の ON/OFF 切替（永続化・検知済み情報の掃除は実装側の責務）
     fn set_port_detect(&mut self, _enabled: bool) {}
+    /// tmux バックエンド永続化（Phase 5.5 / FR-5）の現在状態
+    fn tmux_persist_enabled(&self) -> bool {
+        false
+    }
+    /// tmux バックエンド永続化の ON/OFF 切替（永続化は実装側の責務。以後のペインに効く）
+    fn set_tmux_persist(&mut self, _enabled: bool) {}
+    /// ペインを保持している tmux バックエンドセッション名（tmuxview の区別表示用。
+    /// バックエンドでないペイン・非対応実装では None）
+    fn backend_session(&self, _pane: PaneId) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -254,9 +265,10 @@ pub fn dispatch(
         }
 
         Request::TmuxList { socket } => {
-            let sessions = tako_core::tmux::list_sessions(socket.as_deref());
-            // tako ペインとの対応付け: attach クライアントの tty とペインの PTY スレーブ名を
-            // 突き合わせる（FR-2.13.2。一致しないクライアントは tako 外 = 外部ターミナル由来）
+            // tako ペインとの対応付け: attach クライアントの tty とペインの tty を
+            // 突き合わせる（FR-2.13.2。一致しないクライアントは tako 外 = 外部ターミナル由来。
+            // tmux バックエンドのペインは tty がバックエンド側ペイン tty に差し替わっており、
+            // その中でユーザーが開いたネスト tmux のクライアントもこの突き合わせで対応付く）
             let ws = host.workspace();
             let pane_of_tty: Vec<(String, u64, u64)> = ws
                 .tabs()
@@ -268,36 +280,73 @@ pub fn dispatch(
                     })
                 })
                 .collect();
-            let sessions: Vec<Value> = sessions
+            // tako 自身のバックエンドセッション（Phase 5.5）の対応表: セッション名 → ペイン
+            let backend_of: Vec<(String, u64, u64)> = ws
+                .tabs()
                 .iter()
-                .map(|s| {
-                    let clients: Vec<Value> = s
-                        .client_ttys
-                        .iter()
-                        .map(|tty| {
-                            let hit = pane_of_tty.iter().find(|(t, _, _)| t == tty);
-                            json!({
-                                "tty": tty,
-                                // tako のどのペインで表示中か（null = tako 外のターミナル）
-                                "pane": hit.map(|(_, pane, _)| *pane),
-                                "tab": hit.map(|(_, _, tab)| *tab),
-                            })
-                        })
-                        .collect();
-                    json!({
-                        "name": s.name,
-                        "created": s.created,
-                        "attached": s.attached,
-                        "windows": s.windows.iter().map(|w| json!({
-                            "index": w.index,
-                            "name": w.name,
-                            "active": w.active,
-                            "panes": w.panes,
-                        })).collect::<Vec<_>>(),
-                        "clients": clients,
+                .flat_map(|tab| {
+                    tab.tree().panes().into_iter().filter_map(|p| {
+                        let name = host.backend_session(p.id())?;
+                        Some((name, p.id().as_u64(), tab.id().as_u64()))
                     })
                 })
                 .collect();
+            let session_json = |s: &tako_core::TmuxSession, backend: bool, socket: &Value| {
+                let clients: Vec<Value> = s
+                    .client_ttys
+                    .iter()
+                    .map(|tty| {
+                        let hit = pane_of_tty.iter().find(|(t, _, _)| t == tty);
+                        json!({
+                            "tty": tty,
+                            // tako のどのペインで表示中か（null = tako 外のターミナル）
+                            "pane": hit.map(|(_, pane, _)| *pane),
+                            "tab": hit.map(|(_, _, tab)| *tab),
+                        })
+                    })
+                    .collect();
+                let owner = backend_of.iter().find(|(name, _, _)| *name == s.name);
+                json!({
+                    "name": s.name,
+                    "created": s.created,
+                    "attached": s.attached,
+                    // tako のバックエンド永続化セッションか（FR-5。kill すると
+                    // 対応ペインの中身が消えるため、UI / AI は区別して扱うこと）
+                    "backend": backend,
+                    "socket": socket,
+                    // backend セッションを保持している tako ペイン（orphan なら null）
+                    "backend_pane": owner.map(|(_, pane, _)| *pane),
+                    "backend_tab": owner.map(|(_, _, tab)| *tab),
+                    "windows": s.windows.iter().map(|w| json!({
+                        "index": w.index,
+                        "name": w.name,
+                        "active": w.active,
+                        "panes": w.panes,
+                    })).collect::<Vec<_>>(),
+                    "clients": clients,
+                })
+            };
+            let backend_socket = tako_core::tmux_backend::socket_name();
+            let explicit_backend = socket.as_deref() == Some(backend_socket.as_str());
+            let mut sessions: Vec<Value> = tako_core::tmux::list_sessions(socket.as_deref())
+                .iter()
+                .map(|s| {
+                    session_json(
+                        s,
+                        explicit_backend,
+                        &socket.as_deref().map(Into::into).unwrap_or(Value::Null),
+                    )
+                })
+                .collect();
+            // 既定サーバーの一覧には tako バックエンドのセッションも併記する
+            // （消し忘れの発見が FR-2.13 の目的。バックエンドの orphan も見えるべき）
+            if socket.is_none() {
+                sessions.extend(
+                    tako_core::tmux::list_sessions(Some(&backend_socket))
+                        .iter()
+                        .map(|s| session_json(s, true, &backend_socket.clone().into())),
+                );
+            }
             Ok(json!({ "sessions": sessions }))
         }
 
@@ -376,6 +425,17 @@ pub fn dispatch(
                 host.set_port_detect(enabled);
             }
             Ok(json!({ "enabled": host.port_detect_enabled() }))
+        }
+
+        Request::Persist { enabled } => {
+            if let Some(enabled) = enabled {
+                host.set_tmux_persist(enabled);
+            }
+            Ok(json!({
+                "enabled": host.tmux_persist_enabled(),
+                // tmux 不在環境では enabled でも直接 spawn へ劣化していることを示す
+                "available": tako_core::tmux_backend::available(),
+            }))
         }
     }
 }

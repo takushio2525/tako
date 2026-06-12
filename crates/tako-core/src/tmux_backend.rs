@@ -103,14 +103,15 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
         args.push("-c".to_string());
         args.push(cwd.display().to_string());
     }
-    // 内側で動かすコマンド。未指定なら既定シェル（`$SHELL -l`。直接 spawn 時と同じ解決）。
-    // tmux は残余引数を空白連結して sh -c で実行するため、各語をクォートして 1 引数で渡す
-    if let Some(inner) = options
-        .command
-        .clone()
-        .or_else(crate::terminal::default_shell)
-    {
-        args.push(shell_quoted(&inner));
+    // 内側で動かすコマンド。**未指定時はあえて渡さない**: tmux はコマンド指定があると
+    // `default-shell -c <コマンド>` で実行し、この非対話 zsh ラッパーが tako の
+    // シェル統合 .zshenv を読んで ZDOTDIR を消費してしまう（内側の対話シェルに
+    // 統合が届かなくなる。2026-06-12 のスパイクで判明）。未指定なら tmux が
+    // default-shell（$SHELL → passwd の順で解決）をログインシェルとして直接 spawn
+    // するので、直接 spawn 時と同じく統合が効く。
+    // 明示コマンドは残余引数が空白連結 + sh -c されるため、各語をクォートして 1 引数で渡す
+    if let Some(inner) = &options.command {
+        args.push(shell_quoted(inner));
     }
     SpawnOptions {
         command: Some(SpawnCommand {
@@ -124,16 +125,17 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
 /// バックエンドセッション内ペインの tty（`/dev/ttysNNN`）。
 /// ペイン配下のプロセスはこの tty を制御端末に持つため、listen ポート検知（FR-2.4.2）と
 /// tmuxview の tty 突き合わせ（FR-2.13.2）はこの tty に差し替えて維持する。
+/// `list-panes` を使う（`display-message -p` はクライアント無しだと空を返す）。
 /// セッション未作成・tmux 不在では None（呼び出し側がリトライする）
 pub fn pane_tty(socket: &str, session: &str) -> Option<String> {
     let output = Command::new("tmux")
         .args([
             "-L",
             socket,
-            "display-message",
-            "-p",
+            "list-panes",
             "-t",
             &format!("={session}"),
+            "-F",
             "#{pane_tty}",
         ])
         .output()
@@ -141,7 +143,12 @@ pub fn pane_tty(socket: &str, session: &str) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let tty = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let tty = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
     (!tty.is_empty()).then_some(tty)
 }
 
@@ -232,14 +239,12 @@ mod tests {
     }
 
     #[test]
-    fn コマンド未指定は既定シェルで包む() {
-        #[cfg(unix)]
-        {
-            let wrapped = wrap_options(SpawnOptions::default(), "tako-test", "tako-x");
-            let command = wrapped.command.unwrap();
-            // 末尾の 1 引数が既定シェル（$SHELL -l）になっている
-            assert!(command.args.last().unwrap().ends_with(" -l"));
-        }
+    fn コマンド未指定はtmuxの既定シェルに任せる() {
+        let wrapped = wrap_options(SpawnOptions::default(), "tako-test", "tako-x");
+        let command = wrapped.command.unwrap();
+        // コマンドを渡さない（zsh -c ラッパーがシェル統合の ZDOTDIR を消費するのを
+        // 避け、tmux がログインシェルを直接 spawn する経路に乗せる）
+        assert_eq!(command.args.last().unwrap(), "tako-x");
     }
 
     /// 永続化の根幹 e2e: クライアント（tako 側）を破棄してもセッションが生き、
@@ -304,6 +309,58 @@ mod tests {
         assert!(
             wait_for(&second, "TAKO-PERSIST-OK"),
             "再 attach で画面内容が復元される"
+        );
+    }
+
+    /// シェル統合の OSC 7 が tmux パススルー（allow-passthrough + スクリプトの包み直し）で
+    /// tako 側の TapPty まで届くことの e2e（FR-2.4.1 × Phase 5.5 の共存検証）。
+    /// zsh / tmux が無い環境ではスキップ
+    #[test]
+    #[cfg(unix)]
+    fn osc7はtmuxパススルーで外へ届く() {
+        if !available() {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        if !std::path::Path::new("/bin/zsh").exists() {
+            eprintln!("skip: zsh が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-osc-{}", std::process::id());
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                kill_server(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(socket.clone());
+        // シェル統合（ZDOTDIR 等）+ TAKO_PANE_ID（統合スクリプトの発動条件）。
+        // コマンドは指定しない = tmux の default-shell（SHELL 環境変数）経由で
+        // ログインシェルが直接 spawn され、シェル統合が本番と同じ経路で効く
+        let mut env: Vec<(String, String)> = crate::shell_integration::env().to_vec();
+        env.push(("TAKO_PANE_ID".into(), "1".into()));
+        env.push(("SHELL".into(), "/bin/zsh".into()));
+        let options = SpawnOptions {
+            command: None,
+            cwd: Some("/".into()),
+            env,
+        };
+        let (mut session, mut rx) =
+            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-osc"))
+                .expect("tmux クライアントを spawn できる");
+        session.write(b"cd /private/tmp\r".to_vec());
+        for _ in 0..100 {
+            while let Ok(event) = rx.try_recv() {
+                session.process_event(event);
+            }
+            if session.cwd() == Some(std::path::Path::new("/private/tmp")) {
+                return; // OSC 7 がパススルーで届いた
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!(
+            "OSC 7 が届かない。画面: {:?}",
+            session.visible_lines().join("\n")
         );
     }
 }

@@ -6,11 +6,13 @@
 //! - mcp: Layer 2 内蔵 MCP サーバー（エンジン + Streamable HTTP。ipc と dispatch を共有）
 //! - discovery: 接続情報（ソケット・トークン）の永続化と発見（FR-2.2.9）
 //! - settings: ユーザー設定の永続化（自動リネーム ON/OFF 等。FR-2.12.4）
+//! - layout: タブ / ペイン構成の永続化と復元（Phase 5.5 / FR-5）
 //! - detect: パッシブ検知（Layer 3。listen ポート検知は Phase 4 後半で実装）
 
 pub mod discovery;
 pub mod dispatch;
 pub mod ipc;
+pub mod layout;
 pub mod mcp;
 pub mod protocol;
 pub mod settings;

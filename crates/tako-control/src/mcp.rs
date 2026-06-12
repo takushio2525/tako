@@ -227,7 +227,9 @@ pub fn tools() -> Vec<Value> {
             "description": "実行中の全 tmux セッションを一覧する（FR-2.13）。各セッションの\
                 window 一覧・作成日時・attach 状態に加え、attach クライアントが tako の\
                 どのタブ・ペインに表示されているか（pane / tab が null なら tako 外の\
-                ターミナル由来）を返す。消し忘れて裏で動き続ける tmux の発見に使う。",
+                ターミナル由来）を返す。消し忘れて裏で動き続ける tmux の発見に使う。\
+                backend = true のセッションは tako 自身のペイン永続化用（FR-5）: kill すると\
+                対応ペイン（backend_pane）の中身が消えるため、通常は対象にしないこと。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -414,6 +416,21 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "tako_persist",
+            "description": "セッション永続化 = tmux バックエンド（FR-5）の ON/OFF を切り替える\
+                （enabled 省略時は現在状態の取得のみ）。有効時、各ペインは tako 専用 tmux\
+                サーバーのセッションとして保持され、tako を再起動しても実行中プロセスごと\
+                復元される。切替は以後生成されるペインに効く。available = false は tmux\
+                不在環境で直接 spawn へ劣化していることを示す。設定は永続化される。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "enabled": { "type": "boolean", "description": "true = 有効化、false = 無効化（省略時は状態取得）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -538,6 +555,9 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             enabled: bool_arg(args, "enabled")?,
         },
         "tako_port_detect" => Request::PortDetect {
+            enabled: bool_arg(args, "enabled")?,
+        },
+        "tako_persist" => Request::Persist {
             enabled: bool_arg(args, "enabled")?,
         },
         _ => return Err(format!("不明なツール: {name}")),
@@ -855,7 +875,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 19);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
