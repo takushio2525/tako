@@ -271,6 +271,8 @@ struct TakoApp {
     tmux_sessions: Vec<serde_json::Value>,
     /// kill の確認待ち（セッション名, window index）。誤爆防止（FR-2.13.3）
     tmux_pending_kill: Option<(String, Option<u32>)>,
+    /// 集約センター（FR-2.10）を表示中か。tmuxview と同じ固定タブ UI 状態
+    agents_view_active: bool,
     /// タブ・ペイン名の AI 自動リネームの検知状態（FR-2.12。ループは new で張る）
     autorename: autorename::AutoRenamer,
     /// listen ポート検知 + 提案チップの有効状態（FR-2.4.4。dispatch から切替）
@@ -287,6 +289,27 @@ struct PortSuggestion {
     pane: PaneId,
     port: u16,
     process: String,
+}
+
+/// 集約センターの 1 行分（FR-2.10。全タブのペイン状態の写し）
+#[derive(Debug, Clone)]
+struct AgentEntry {
+    pane: PaneId,
+    /// 表示名（ペイン title / role > OSC タイトル > 既定）
+    label: String,
+    tab_title: String,
+    state: CommandState,
+    cwd: Option<String>,
+}
+
+/// 集約センターの並び順（注目度。エラー > 入力待ち > 実行中 > 不明）
+fn state_rank(state: CommandState) -> u8 {
+    match state {
+        CommandState::Failed(_) => 0,
+        CommandState::Idle => 1,
+        CommandState::Running => 2,
+        CommandState::Unknown => 3,
+    }
 }
 
 /// ドラッグ中の境界の情報。座標→比率換算に必要な分割領域と軸を握っておく
@@ -369,6 +392,7 @@ impl TakoApp {
             tmuxview_active: false,
             tmux_sessions: Vec::new(),
             tmux_pending_kill: None,
+            agents_view_active: false,
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
             port_detect: initial_port_detect(),
             port_suggestions: Vec::new(),
@@ -675,6 +699,66 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// 集約センターの一覧（FR-2.10.1）。全タブ・全ペインの状態を注目度順
+    /// （エラー > 入力待ち > 実行中 > 不明）に並べる。素材は list（CLI / MCP）と同じ
+    fn agent_entries(&self) -> Vec<AgentEntry> {
+        let mut entries: Vec<AgentEntry> = self
+            .workspace
+            .tabs()
+            .iter()
+            .flat_map(|tab| {
+                tab.tree()
+                    .panes()
+                    .iter()
+                    .map(|p| {
+                        let session = self.terminals.get(&p.id());
+                        let label = match (p.title(), p.role()) {
+                            (Some(t), Some(r)) => format!("{t} · {r}"),
+                            (Some(t), None) => t.to_string(),
+                            (None, Some(r)) => r.to_string(),
+                            (None, None) => session
+                                .and_then(|s| s.title())
+                                .unwrap_or("シェル")
+                                .to_string(),
+                        };
+                        AgentEntry {
+                            pane: p.id(),
+                            label,
+                            tab_title: tab.title().to_string(),
+                            state: session
+                                .map(|s| s.command_state())
+                                .unwrap_or(CommandState::Unknown),
+                            cwd: session
+                                .and_then(|s| s.cwd())
+                                .map(|c| c.display().to_string()),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        entries.sort_by_key(|e| state_rank(e.state));
+        entries
+    }
+
+    /// 集約センターからのジャンプ（FR-2.10.2）。CLI / MCP と同じコマンド層
+    /// （dispatch の Focus = タブ切替も伴う）を通す
+    fn jump_to_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        self.agents_view_active = false;
+        self.tmuxview_active = false;
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::Focus {
+                pane: Some(pane.as_u64()),
+                direction: None,
+            },
+            PaneOrigin::User,
+        );
+        if let Err(e) = result {
+            eprintln!("warning: ペインへ移動できない: {e}");
+        }
+        cx.notify();
+    }
+
     /// tmux 一覧を更新する。UI も CLI / MCP と同じコマンド層（dispatch）を通す
     fn refresh_tmux(&mut self, cx: &mut Context<Self>) {
         let value = tako_control::dispatch(
@@ -900,6 +984,7 @@ impl TakoApp {
 
     fn new_tab(&mut self, cx: &mut Context<Self>) {
         self.tmuxview_active = false;
+        self.agents_view_active = false;
         let title = format!("{}", self.workspace.tabs().len() + 1);
         let pane = Pane::new(PaneOrigin::User);
         let pane_id = pane.id();
@@ -913,6 +998,7 @@ impl TakoApp {
 
     fn activate_tab_index(&mut self, index: usize, cx: &mut Context<Self>) {
         self.tmuxview_active = false;
+        self.agents_view_active = false;
         if let Some(id) = self.workspace.tabs().get(index).map(|t| t.id()) {
             let _ = self.workspace.activate_tab(id);
         }
@@ -1267,6 +1353,83 @@ impl TakoApp {
         root
     }
 
+    /// 集約センター（FR-2.10）。全タブのペイン状態を 1 か所で見てクリックでジャンプする
+    fn render_agents_view(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = self.theme.clone();
+        let entries = self.agent_entries();
+        let mut root = div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_4()
+            .bg(rgba(theme.background))
+            .text_color(hsla(theme.foreground))
+            .text_size(px(13.0))
+            .overflow_hidden()
+            .child(
+                div()
+                    .text_color(hsla(theme.tab_inactive_foreground))
+                    .text_size(px(11.0))
+                    .child(
+                        "全タブのペイン状態（クリックでジャンプ。エラー > 入力待ち > 実行中の順）",
+                    ),
+            );
+        for entry in entries {
+            let (color, state_label) = match entry.state {
+                CommandState::Failed(code) => (theme.ansi[1], format!("エラー ({code})")),
+                CommandState::Idle => (theme.ansi[2], "入力待ち".to_string()),
+                CommandState::Running => (theme.accent, "実行中".to_string()),
+                CommandState::Unknown => (theme.tab_inactive_foreground, "状態不明".to_string()),
+            };
+            let pane = entry.pane;
+            root = root.child(
+                div()
+                    .id(("agent-entry", pane.as_u64()))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .p_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(rgba_alpha(theme.tab_bar_background, 0.6))
+                    .hover(|d| d.bg(rgba(theme.tab_bar_background)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.jump_to_pane(pane, cx)))
+                    .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(hsla(color)))
+                    .child(
+                        div()
+                            .w(px(72.0))
+                            .text_size(px(11.0))
+                            .text_color(hsla(color))
+                            .child(SharedString::from(state_label)),
+                    )
+                    .child(
+                        div()
+                            .font_weight(FontWeight::BOLD)
+                            .child(SharedString::from(truncate(&entry.label, 32))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(hsla(theme.tab_inactive_foreground))
+                            .child(SharedString::from(format!(
+                                "タブ {} ・ ペイン {}",
+                                truncate(&entry.tab_title, 16),
+                                pane
+                            ))),
+                    )
+                    .children(entry.cwd.map(|cwd| {
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(hsla(theme.tab_inactive_foreground))
+                            .child(SharedString::from(truncate(&cwd, 48)))
+                    })),
+            );
+        }
+        root
+    }
+
     /// 行テキスト全体を 1 ランで shape するための TextRun（幅計算用。色は使われない）
     fn mono_text_run(&self, len: usize) -> TextRun {
         TextRun {
@@ -1499,6 +1662,14 @@ impl TakoApp {
             })
             .collect();
 
+        // agents 固定タブのドット: 全ペイン集約（タブ単位ドットのアプリ全体版。FR-2.10）
+        let agents_dot =
+            match CommandState::aggregate(self.terminals.values().map(|s| s.command_state())) {
+                CommandState::Failed(_) => Some(theme.ansi[1]),
+                CommandState::Running => Some(theme.accent),
+                _ => None,
+            };
+
         div()
             .flex()
             .flex_row()
@@ -1530,6 +1701,7 @@ impl TakoApp {
                     .text_size(px(12.0))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.tmuxview_active = false;
+                        this.agents_view_active = false;
                         let _ = this.workspace.activate_tab(id);
                         cx.notify();
                     }))
@@ -1560,6 +1732,41 @@ impl TakoApp {
             )
             .child(div().flex_grow(1.0))
             .child(
+                // 右端固定の集約センタータブ（FR-2.10。閉じる × は持たない）。
+                // 全ペイン集約の状態ドット（エラー > 実行中）を添える
+                div()
+                    .id("tab-agents")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .h_full()
+                    .px_3()
+                    .cursor_pointer()
+                    .when(self.agents_view_active, |d| {
+                        d.bg(rgba(theme.tab_active_background))
+                            .border_b_2()
+                            .border_color(hsla(theme.accent))
+                    })
+                    .text_color(if self.agents_view_active {
+                        hsla(theme.tab_active_foreground)
+                    } else {
+                        hsla(theme.tab_inactive_foreground)
+                    })
+                    .text_size(px(12.0))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.agents_view_active = true;
+                        this.tmuxview_active = false;
+                        cx.notify();
+                    }))
+                    .children(
+                        agents_dot.map(|color| {
+                            div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color))
+                        }),
+                    )
+                    .child("agents"),
+            )
+            .child(
                 // 右端固定の tmuxview タブ（FR-2.13.1。閉じる × は持たない）
                 div()
                     .id("tab-tmuxview")
@@ -1583,6 +1790,7 @@ impl TakoApp {
                     .text_size(px(12.0))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.tmuxview_active = true;
+                        this.agents_view_active = false;
                         this.refresh_tmux(cx);
                     }))
                     .child("tmux"),
@@ -2443,6 +2651,8 @@ impl Render for TakoApp {
             .child(self.render_tab_bar(cx))
             .child(if self.tmuxview_active {
                 self.render_tmuxview(cx)
+            } else if self.agents_view_active {
+                self.render_agents_view(cx)
             } else {
                 div()
                     .flex_1()
@@ -4142,6 +4352,42 @@ mod self_test {
             wait(cx, 800).await;
             type_text(any, cx, "kill %1 2>/dev/null", true);
             wait(cx, 500).await;
+
+            // 56. 集約センター（FR-2.10）。全タブのペインが注目度順に並び、
+            //     エントリのジャンプで該当ペインへフォーカスしビューが畳まれる
+            let agents_ok = window
+                .update(cx, |app, _, cx| {
+                    app.agents_view_active = true;
+                    let entries = app.agent_entries();
+                    // 全ペインが載っている + 注目度順（rank が単調非減少）
+                    let total: usize = app
+                        .workspace
+                        .tabs()
+                        .iter()
+                        .map(|t| t.tree().panes().len())
+                        .sum();
+                    let all_listed = entries.len() == total && total > 0;
+                    let sorted = entries
+                        .windows(2)
+                        .all(|w| state_rank(w[0].state) <= state_rank(w[1].state));
+                    // 非アクティブタブのペインへジャンプ → タブも切り替わる
+                    let target = entries
+                        .iter()
+                        .find(|e| {
+                            app.workspace.find_tab_of_pane(e.pane)
+                                != Some(app.workspace.active_tab_id())
+                        })
+                        .or(entries.first())
+                        .map(|e| e.pane)
+                        .expect("エントリは 1 件以上ある");
+                    app.jump_to_pane(target, cx);
+                    all_listed
+                        && sorted
+                        && app.focused_pane() == target
+                        && !app.agents_view_active
+                })
+                .unwrap_or(false);
+            check(agents_ok, "集約センターの一覧とジャンプ");
 
             println!("TAKO_APP_SELF_TEST_OK");
             std::process::exit(0);
