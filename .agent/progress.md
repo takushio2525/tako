@@ -163,3 +163,13 @@
   agents タブに全ペイン集約ドット。tmuxview と同型の固定タブパターン。
   セルフテスト 84 項目緑。これで Phase 4（Layer 3 パッシブ検知）完了
 - 次: Phase 5（ワークスペース機能）か FR-2.14 前倒しをユーザーと相談
+
+## 2026-06-12（ファイルツリー FR-3.1/3.7 完成 → Phase 5 一時中断）
+
+- Phase 5 着手: 技術選定確定（syntect + Highlighter trait 抽象 / git CLI 子プロセス /
+  pulldown-cmark。architecture.md に記録）→ ファイルツリー完成（filetree.rs に状態・
+  読み込み・フラット化を分離 + ユニットテスト 4 本、cmd+B トグル、cwd 追従、
+  content_origin シフトでペイン座標系と連動）。セルフテスト 86 項目緑
+- **ユーザー指示で Phase 5 を一時中断、Phase 5.5（tmux バックエンド永続化）を別 worker が
+  先行**。中断点と再開手順は activeContext.md「Phase 5 の中断点」
+- 次: Phase 5.5（別 worker）/ 再開時は FR-3.2 コードプレビュー + tako_open_file

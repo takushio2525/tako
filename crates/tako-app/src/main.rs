@@ -14,6 +14,7 @@
 //! stdio ブリッジ）、Phase 3.5 の IME 変換状態（marked text）を機械検証して終了する。
 
 mod autorename;
+mod filetree;
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -54,6 +55,9 @@ const BORDER_HANDLE: f32 = 8.0;
 /// スクロールバーの当たり領域の幅（px。サムはこの内側に描く）
 const SCROLLBAR_WIDTH: f32 = 10.0;
 
+/// 左サイドバー（ファイルツリー）の幅（px。FR-3.1）
+const SIDEBAR_WIDTH: f32 = 220.0;
+
 actions!(
     tako,
     [
@@ -73,6 +77,7 @@ actions!(
         ShortenPane,
         CopySelection,
         PasteClipboard,
+        ToggleSidebar,
         Quit,
         ActivateTab1,
         ActivateTab2,
@@ -105,6 +110,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-cmd-up", ShortenPane, None),
         KeyBinding::new("cmd-c", CopySelection, None),
         KeyBinding::new("cmd-v", PasteClipboard, None),
+        KeyBinding::new("cmd-b", ToggleSidebar, None),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-1", ActivateTab1, None),
         KeyBinding::new("cmd-2", ActivateTab2, None),
@@ -273,6 +279,8 @@ struct TakoApp {
     tmux_pending_kill: Option<(String, Option<u32>)>,
     /// 集約センター（FR-2.10）を表示中か。tmuxview と同じ固定タブ UI 状態
     agents_view_active: bool,
+    /// 左サイドバーのファイルツリー（FR-3.1 / FR-3.7。cmd+B でトグル）
+    filetree: filetree::FileTree,
     /// タブ・ペイン名の AI 自動リネームの検知状態（FR-2.12。ループは new で張る）
     autorename: autorename::AutoRenamer,
     /// listen ポート検知 + 提案チップの有効状態（FR-2.4.4。dispatch から切替）
@@ -393,6 +401,7 @@ impl TakoApp {
             tmux_sessions: Vec::new(),
             tmux_pending_kill: None,
             agents_view_active: false,
+            filetree: filetree::FileTree::default(),
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
             port_detect: initial_port_detect(),
             port_suggestions: Vec::new(),
@@ -435,12 +444,16 @@ impl TakoApp {
         })
         .detach();
 
-        // tmuxview 表示中は 2 秒毎に一覧を更新する（FR-2.13。表示していない間は何もしない）
+        // tmuxview 表示中は 2 秒毎に一覧を更新する（FR-2.13。表示していない間は何もしない）。
+        // ファイルツリー（FR-3.1）の内容追従も同じ間隔で行う
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(2)).await;
             let result = this.update(cx, |app: &mut TakoApp, cx| {
                 if app.tmuxview_active {
                     app.refresh_tmux(cx);
+                }
+                if app.filetree.visible && app.filetree.refresh() {
+                    cx.notify();
                 }
             });
             if result.is_err() {
@@ -1352,6 +1365,94 @@ impl TakoApp {
         }
         root
     }
+
+    /// 左サイドバーのファイルツリー（FR-3.1。非表示なら None = 純粋なターミナル FR-3.7）
+    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if !self.filetree.visible {
+            return None;
+        }
+        let theme = self.theme.clone();
+        let root_label = self
+            .filetree
+            .root()
+            .and_then(|r| r.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "—".into());
+        let rows = self.filetree.rows();
+        Some(
+            div()
+                .w(px(SIDEBAR_WIDTH))
+                .h_full()
+                .flex()
+                .flex_col()
+                .bg(rgba(theme.tab_bar_background))
+                .border_r_1()
+                .border_color(hsla(theme.pane_border))
+                .text_size(px(12.0))
+                .text_color(hsla(theme.foreground))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_size(px(11.0))
+                        .text_color(hsla(theme.tab_inactive_foreground))
+                        .child(SharedString::from(format!(
+                            "📁 {}",
+                            truncate(&root_label, 24)
+                        ))),
+                )
+                .child(
+                    div()
+                        .id("filetree-list")
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .overflow_y_scroll()
+                        .children(rows.into_iter().enumerate().map(|(index, row)| {
+                            let path = row.entry.path.clone();
+                            let is_dir = row.entry.is_dir;
+                            let marker = if is_dir {
+                                if row.expanded {
+                                    "▾ "
+                                } else {
+                                    "▸ "
+                                }
+                            } else {
+                                "  "
+                            };
+                            div()
+                                .id(("filetree-row", index as u64))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .px_1()
+                                .pl(px(6.0 + 12.0 * row.depth as f32))
+                                .cursor_pointer()
+                                .hover(|d| d.bg(rgba(theme.tab_active_background)))
+                                .when(!is_dir, |d| {
+                                    d.text_color(hsla_alpha(theme.foreground, 0.85))
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if is_dir {
+                                        this.filetree.toggle_dir(&path);
+                                    } else {
+                                        this.open_file_row(&path, cx);
+                                    }
+                                    cx.notify();
+                                }))
+                                .child(SharedString::from(format!(
+                                    "{marker}{}",
+                                    truncate(&row.entry.name, 26)
+                                )))
+                        })),
+                ),
+        )
+    }
+
+    /// ファイルツリーのファイル行クリック。プレビューペイン（FR-3.2）は次の区切りで
+    /// 実装するため、当面はフォーカスペインの cwd 基準で何もしない（プレースホルダ）
+    fn open_file_row(&mut self, _path: &std::path::Path, _cx: &mut Context<Self>) {}
 
     /// 集約センター（FR-2.10）。全タブのペイン状態を 1 か所で見てクリックでジャンプする
     fn render_agents_view(&mut self, cx: &mut Context<Self>) -> gpui::Div {
@@ -2404,10 +2505,30 @@ impl Render for TakoApp {
         let cell = self.measure_cell(window);
         let theme = self.theme.clone();
 
-        // アクティブタブのレイアウト（単位矩形）と、マウス変換用のピクセル矩形を更新する
+        // ファイルツリーの root をフォーカスペインの cwd に追従させる（FR-3.1）
+        if self.filetree.visible {
+            let cwd = self
+                .focused_session()
+                .and_then(|s| s.cwd())
+                .map(|p| p.to_path_buf())
+                .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from));
+            self.filetree.set_root(cwd);
+        }
+
+        // アクティブタブのレイアウト（単位矩形）と、マウス変換用のピクセル矩形を更新する。
+        // サイドバー表示中はその幅だけコンテンツ領域を右へずらす（ペイン矩形・境界
+        // ハンドル・IME 位置はすべて content_origin / content_size 起点で連動する）
         let viewport = window.viewport_size();
-        let content_origin = point(px(0.0), px(TAB_BAR_HEIGHT));
-        let content_size = size(viewport.width, viewport.height - px(TAB_BAR_HEIGHT));
+        let sidebar_width = if self.filetree.visible {
+            px(SIDEBAR_WIDTH)
+        } else {
+            px(0.0)
+        };
+        let content_origin = point(sidebar_width, px(TAB_BAR_HEIGHT));
+        let content_size = size(
+            viewport.width - sidebar_width,
+            viewport.height - px(TAB_BAR_HEIGHT),
+        );
         let tree = self.workspace.active_tab().tree();
         let focused = tree.focused();
         let layout = tree.layout(Rect::UNIT);
@@ -2626,6 +2747,10 @@ impl Render for TakoApp {
             }))
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.copy_selection(cx)))
             .on_action(cx.listener(|this, _: &PasteClipboard, _, cx| this.paste(cx)))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                this.filetree.visible = !this.filetree.visible;
+                cx.notify();
+            }))
             .on_action(cx.listener(|_, _: &Quit, _, cx| cx.quit()))
             .on_action(cx.listener(|this, _: &ActivateTab1, _, cx| this.activate_tab_index(0, cx)))
             .on_action(cx.listener(|this, _: &ActivateTab2, _, cx| this.activate_tab_index(1, cx)))
@@ -2656,10 +2781,17 @@ impl Render for TakoApp {
             } else {
                 div()
                     .flex_1()
-                    .relative()
-                    .children(panes)
-                    .children(border_handles)
-                    .children(ime_overlay)
+                    .flex()
+                    .flex_row()
+                    .children(self.render_sidebar(cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .relative()
+                            .children(panes)
+                            .children(border_handles)
+                            .children(ime_overlay),
+                    )
             })
             .child(ime_registration)
     }
@@ -4388,6 +4520,26 @@ mod self_test {
                 })
                 .unwrap_or(false);
             check(agents_ok, "集約センターの一覧とジャンプ");
+
+            // 57. ファイルツリー（FR-3.1 / FR-3.7）。cmd+B で開閉し、表示中は
+            //     フォーカスペインの cwd（無ければ $HOME）が root に追従して行が出る
+            press(any, cx, "cmd-b");
+            wait(cx, 600).await;
+            let sidebar_ok = window
+                .update(cx, |app, _, _| {
+                    let visible = app.filetree.visible;
+                    let root_ok = app.filetree.root().is_some();
+                    let has_rows = !app.filetree.rows().is_empty();
+                    visible && root_ok && has_rows
+                })
+                .unwrap_or(false);
+            check(sidebar_ok, "ファイルツリーの表示と cwd 追従");
+            press(any, cx, "cmd-b");
+            wait(cx, 300).await;
+            let sidebar_closed = window
+                .update(cx, |app, _, _| !app.filetree.visible)
+                .unwrap_or(false);
+            check(sidebar_closed, "ファイルツリーの折りたたみ（cmd+B）");
 
             println!("TAKO_APP_SELF_TEST_OK");
             std::process::exit(0);
