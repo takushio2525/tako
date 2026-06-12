@@ -45,6 +45,10 @@
 
 ## 直近の観点・指摘（実装時に踏みやすい点）
 
+- **CI（GitHub Actions）はリポ設定で意図的に無効化中**（2026-06-12〜。Actions 無料枠
+  90% 到達のためユーザーが停止。workflow ファイルは有効なまま）。push 後に CI 実行が
+  作成されないのは正常 → CI 待ちポーリングはしない。品質保証はローカルの
+  セルフテスト + `cargo test --workspace` + fmt + clippy 全緑で足りる扱い
 - **CSI u の送出範囲は `CsiUMode`**（main.rs）: Full = アプリが kitty 要求済み
   （Esc も CSI 27u）/ ModifiedOnly = バックエンドペイン強制（Esc は素の `\e`）/
   Off = レガシー。tmux は CSI 27u を非要求ペインにも素通しする（e2e のカナリア
