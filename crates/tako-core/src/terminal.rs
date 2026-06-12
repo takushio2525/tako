@@ -73,7 +73,7 @@ fn default_home_dir() -> Option<PathBuf> {
 /// ユーザー権限のシェルを直接 spawn すれば SIGHUP が届き wait も即返る。
 /// `-l` でログインシェル動作（profile 読み込み）は維持する
 #[cfg(unix)]
-fn default_shell() -> Option<SpawnCommand> {
+pub(crate) fn default_shell() -> Option<SpawnCommand> {
     let program = std::env::var("SHELL")
         .ok()
         .filter(|s| !s.is_empty())
@@ -86,7 +86,7 @@ fn default_shell() -> Option<SpawnCommand> {
 
 /// Windows は alacritty の既定（PowerShell / cmd）に任せる（Phase 6 で精査）
 #[cfg(windows)]
-fn default_shell() -> Option<SpawnCommand> {
+pub(crate) fn default_shell() -> Option<SpawnCommand> {
     None
 }
 
@@ -273,6 +273,13 @@ impl TerminalSession {
     /// PTY スレーブの tty 名（取得できない環境では None）
     pub fn tty_name(&self) -> Option<&str> {
         self.tty_name.as_deref()
+    }
+
+    /// tty 名の差し替え（Phase 5.5 tmux バックエンド用）。
+    /// バックエンド構成ではペイン配下のプロセスは tmux サーバー側のペイン tty を
+    /// 制御端末に持つため、ポート検知・tmuxview の突き合わせ先をそちらへ向ける
+    pub fn set_tty_name(&mut self, tty: Option<String>) {
+        self.tty_name = tty;
     }
 
     /// 現在のグリッドサイズ（cols, rows）

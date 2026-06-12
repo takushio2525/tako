@@ -10,11 +10,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PaneId(u64);
 
+static PANE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 impl PaneId {
     /// 新しいユニーク ID を採番する（プロセス全体で単調増加）
     fn next() -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(1);
-        PaneId(COUNTER.fetch_add(1, Ordering::Relaxed))
+        PaneId(PANE_ID_COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// 復元 ID の予約（Phase 5.5）。採番カウンタを ID の先へ進め、以後の新規採番と
+    /// 衝突させない。再起動をまたいで `TAKO_PANE_ID` を有効に保つための土台
+    fn reserve(id: u64) {
+        PANE_ID_COUNTER.fetch_max(id.saturating_add(1), Ordering::Relaxed);
     }
 
     pub fn as_u64(self) -> u64 {
@@ -75,6 +82,25 @@ impl Pane {
             title: None,
             title_source: TitleSource::Default,
             role: None,
+        }
+    }
+
+    /// レイアウト復元用（Phase 5.5）。保存済み ID をそのまま再現する。
+    /// 環境変数 `TAKO_PANE_ID` を再起動をまたいで有効に保つため、ID は変えない
+    pub fn restore(
+        id: u64,
+        origin: PaneOrigin,
+        title: Option<String>,
+        title_source: TitleSource,
+        role: Option<String>,
+    ) -> Self {
+        PaneId::reserve(id);
+        Self {
+            id: PaneId(id),
+            origin,
+            title,
+            title_source,
+            role,
         }
     }
 

@@ -10,10 +10,16 @@ use crate::pane_tree::PaneTree;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TabId(u64);
 
+static TAB_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 impl TabId {
     fn next() -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(1);
-        TabId(COUNTER.fetch_add(1, Ordering::Relaxed))
+        TabId(TAB_ID_COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// 復元 ID の予約（Phase 5.5）。採番カウンタを ID の先へ進める（`PaneId` と同様）
+    fn reserve(id: u64) {
+        TAB_ID_COUNTER.fetch_max(id.saturating_add(1), Ordering::Relaxed);
     }
 
     pub fn as_u64(self) -> u64 {
@@ -44,6 +50,18 @@ impl Tab {
             title: title.into(),
             title_source: TitleSource::Default,
             tree: PaneTree::new(root_pane),
+        }
+    }
+
+    /// レイアウト復元用（Phase 5.5）。保存済み ID をそのまま再現する
+    /// （`TAKO_TAB_ID` を再起動をまたいで有効に保つ）
+    pub fn restore(id: u64, title: String, title_source: TitleSource, tree: PaneTree) -> Self {
+        TabId::reserve(id);
+        Self {
+            id: TabId(id),
+            title,
+            title_source,
+            tree,
         }
     }
 

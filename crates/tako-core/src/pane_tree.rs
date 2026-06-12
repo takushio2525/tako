@@ -106,6 +106,24 @@ const MAX_SHARE: f32 = 0.9;
 /// 浮動小数の比較誤差吸収（focus_direction の隣接判定に使う）
 const EPS: f32 = 1e-4;
 
+/// 復元ツリーの比率を妥当域へ再帰的にクランプする（`from_root` 用）
+fn clamp_ratios(node: &mut PaneNode) {
+    if let PaneNode::Split {
+        ratio,
+        first,
+        second,
+        ..
+    } = node
+    {
+        if !ratio.is_finite() {
+            *ratio = 0.5;
+        }
+        *ratio = ratio.clamp(MIN_SHARE, MAX_SHARE);
+        clamp_ratios(first);
+        clamp_ratios(second);
+    }
+}
+
 /// タブ内のペイン分割ツリー。常に 1 つ以上のペインを持つ
 #[derive(Debug)]
 pub struct PaneTree {
@@ -121,6 +139,21 @@ impl PaneTree {
             root: Some(PaneNode::Leaf(root_pane)),
             focused,
         }
+    }
+
+    /// レイアウト復元用（Phase 5.5）。保存済みツリーから構築する。
+    /// focused がツリーに無ければ先頭ペインへ、比率は妥当域へクランプする
+    /// （壊れた保存値からの防御）
+    pub fn from_root(root: PaneNode, focused: PaneId) -> Self {
+        let mut tree = Self {
+            root: Some(root),
+            focused,
+        };
+        clamp_ratios(tree.root_mut());
+        if !tree.contains(focused) {
+            tree.focused = tree.panes()[0].id();
+        }
+        tree
     }
 
     fn root_ref(&self) -> &PaneNode {

@@ -34,6 +34,20 @@ impl Workspace {
         }
     }
 
+    /// レイアウト復元用（Phase 5.5）。tabs が空なら None（呼び出し側が新規作成へ
+    /// フォールバックする）。active が見つからなければ先頭タブをアクティブにする
+    pub fn restore(tabs: Vec<Tab>, active: TabId) -> Option<Self> {
+        if tabs.is_empty() {
+            return None;
+        }
+        let active = if tabs.iter().any(|t| t.id() == active) {
+            active
+        } else {
+            tabs[0].id()
+        };
+        Some(Self { tabs, active })
+    }
+
     pub fn tabs(&self) -> &[Tab] {
         &self.tabs
     }

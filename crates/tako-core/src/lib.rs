@@ -14,6 +14,7 @@ pub mod tab;
 pub mod terminal;
 pub mod theme;
 pub mod tmux;
+pub mod tmux_backend;
 pub mod workspace;
 
 pub use osc_tap::{OscEvent, PromptMark};
