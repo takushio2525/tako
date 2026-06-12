@@ -79,6 +79,28 @@ set -g update-environment 'TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL TAKO_TAB_ID'
 set -gq copy-mode-position-format ''
 ";
 
+/// ユーザー自前 tmux サーバー（ネスト tmux）向けの推奨設定スニペット（FR-2.17.5）。
+/// tako ペイン内で `tmux attach` するユーザーサーバーが既定値のままだと、
+/// ホイールのスクロールバック遡り（mouse off で SGR を握り潰す）と
+/// Shift+Enter（extended-keys off で kitty 要求を拒否 → 素の Enter に劣化）が
+/// ネスト境界で死ぬ（2026-06-12 実機バグ (1)(4) の根因）。
+/// FR-2.17 のワンタップ適用・診断はこの定義を正とする。
+/// 品質はネストチェーン e2e（ホイール / CSI u）で保証する
+pub const NESTED_TMUX_SNIPPET: &str = "\
+# tako 連携: tako ペイン内で attach した tmux でもホイール遡りと Shift+Enter を通す
+set -g mouse on
+# always 必須: tmux はペインからの kitty keyboard 要求（\\e[>1u。Claude Code が使う）を
+# 認識しない（modifyOtherKeys 形式のみ）ため、on では S-Enter が素の Enter に劣化する
+set -s extended-keys always
+set -sq extended-keys-format csi-u
+# 外側端末（tako バックエンド = TERM tmux-256color / iTerm2 等 = xterm-256color）が
+# 拡張キー対応であることを明示する。これが無いとネスト側が CSI u 入力を解釈せず捨てる
+set -as terminal-features 'tmux*:extkeys'
+set -as terminal-features 'xterm*:extkeys'
+# copy-mode の右上インジケータ（時刻 + [位置/履歴] 表示）を出さない
+set -gq copy-mode-position-format ''
+";
+
 /// 専用 conf をデータディレクトリへ書き出す（毎起動上書き = バージョン更新追従）。
 /// 書けない環境では `/dev/null` を返し「ユーザー conf を読まない」ことだけは維持する
 fn ensure_conf() -> PathBuf {
@@ -501,6 +523,172 @@ mod tests {
         assert!(
             esc_delivered,
             "Esc（CSI 27u）が tmux 越しに届かない。画面: {:?}",
+            session.visible_lines().join("\n")
+        );
+    }
+
+    /// ネスト tmux（バックエンド → ユーザー自前 tmux → アプリ）のチェーン e2e 用ヘルパ。
+    /// ユーザーサーバー側は NESTED_TMUX_SNIPPET（FR-2.17 の推奨設定）で起動する
+    #[cfg(unix)]
+    fn spawn_nested(
+        backend_socket: &str,
+        nested_socket: &str,
+        inner_cmd: &str,
+    ) -> crate::TerminalSession {
+        let conf_path = std::env::temp_dir().join(format!("tako-nest-conf-{nested_socket}"));
+        std::fs::write(&conf_path, NESTED_TMUX_SNIPPET).expect("ネスト conf を書ける");
+        // バックエンドペインの中でユーザー tmux サーバーへ new-session する
+        // （実機の「自前 tmux セッションを tako 内で attach」構成の再現）
+        let options = SpawnOptions {
+            command: Some(SpawnCommand {
+                program: crate::tmux::tmux_bin().to_string(),
+                args: vec![
+                    "-u".into(),
+                    "-L".into(),
+                    nested_socket.into(),
+                    "-f".into(),
+                    conf_path.display().to_string(),
+                    "new-session".into(),
+                    "-A".into(),
+                    "-s".into(),
+                    "nest".into(),
+                    inner_cmd.into(),
+                ],
+            }),
+            cwd: Some(std::env::temp_dir()),
+            env: vec![],
+        };
+        let (session, _rx) = crate::TerminalSession::spawn(
+            80,
+            24,
+            wrap_options(options, backend_socket, "tako-e2e-nest"),
+        )
+        .expect("ネスト構成を spawn できる");
+        session
+    }
+
+    /// ネスト tmux 越しのホイールがユーザーサーバーの copy-mode スクロールに乗る e2e
+    /// （2026-06-12 実機バグ (1) の再発防止。NESTED_TMUX_SNIPPET の mouse on が前提）。
+    /// 経路: tako の SGR → バックエンド tmux（mouse_any=1 で send -M 生転送）→
+    /// ネスト tmux（mouse on）→ copy-mode でネスト側スクロールバックを遡る
+    #[test]
+    #[cfg(unix)]
+    fn ネストtmux越しのホイールで内側スクロールバックを遡れる() {
+        if !available() {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let backend = format!("tako-coretest-nestw-{}", std::process::id());
+        let nested = format!("tako-coretest-nestw-in-{}", std::process::id());
+        struct Cleanup(String, String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                kill_server(&self.0);
+                kill_server(&self.1);
+            }
+        }
+        let _cleanup = Cleanup(backend.clone(), nested.clone());
+        let session = spawn_nested(
+            &backend,
+            &nested,
+            "i=0; while [ $i -lt 100 ]; do echo LINE-$i; i=$((i+1)); done; exec sleep 60",
+        );
+        // ネスト内の出力完了 + 外側のマウスモード（バックエンド mouse on）を待つ
+        let mut ready = false;
+        for _ in 0..100 {
+            if session.mouse_reporting()
+                && session
+                    .visible_lines()
+                    .iter()
+                    .any(|l| l.trim_end() == "LINE-99")
+            {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            ready,
+            "ネスト構成が立ち上がらない。画面: {:?}",
+            session.visible_lines().join("\n")
+        );
+        // ホイール上 → ネスト tmux の copy-mode で遡る（過去の LINE-n が見える）
+        session.scroll_wheel(3, 10, 10);
+        let mut scrolled = false;
+        for _ in 0..50 {
+            let top_n = session
+                .visible_lines()
+                .first()
+                .map(|l| l.trim_end().to_string())
+                .and_then(|t| {
+                    t.strip_prefix("LINE-")
+                        .and_then(|s| s.parse::<usize>().ok())
+                });
+            if let Some(n) = top_n {
+                if n < 77 {
+                    scrolled = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            scrolled,
+            "ネスト越しのホイールでスクロールバックを遡れない（バグ (1) の回帰）。画面: {:?}",
+            session.visible_lines().join("\n")
+        );
+    }
+
+    /// ネスト tmux 越しの CSI u（Shift+Enter）が最内のアプリへ kitty 形式のまま届く e2e
+    /// （2026-06-12 実機バグ (4) の再発防止。NESTED_TMUX_SNIPPET の extended-keys on +
+    /// バックエンド conf の extended-keys always が両輪）。
+    /// 最内は kitty を要求して受信バイトを可視化する cat -v
+    #[test]
+    #[cfg(unix)]
+    fn ネストtmux越しのcsi_uが最内アプリへ届く() {
+        if !available() {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let backend = format!("tako-coretest-nestk-{}", std::process::id());
+        let nested = format!("tako-coretest-nestk-in-{}", std::process::id());
+        struct Cleanup(String, String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                kill_server(&self.0);
+                kill_server(&self.1);
+            }
+        }
+        let _cleanup = Cleanup(backend.clone(), nested.clone());
+        let session = spawn_nested(
+            &backend,
+            &nested,
+            r"printf '\033[>1u'; echo TAKO-NEST-'READY'; exec cat -v",
+        );
+        let wait_for = |needle: &str| -> bool {
+            for _ in 0..100 {
+                if session
+                    .visible_lines()
+                    .iter()
+                    .any(|line| line.contains(needle))
+                {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            false
+        };
+        assert!(
+            wait_for("TAKO-NEST-READY"),
+            "ネスト構成が立ち上がらない。画面: {:?}",
+            session.visible_lines().join("\n")
+        );
+        // Shift+Enter（CSI u）。バックエンドペインは UI 層が CSI u 送出を常時有効化
+        // するため、ここでも生の CSI u を書く（handle_key と同じバイト列）
+        session.write(b"\x1b[13;2u".to_vec());
+        assert!(
+            wait_for("[13;2u"),
+            "CSI u がネスト tmux 越しに素の Enter へ劣化した（バグ (4) の回帰）。画面: {:?}",
             session.visible_lines().join("\n")
         );
     }
