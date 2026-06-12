@@ -173,3 +173,14 @@
 - **ユーザー指示で Phase 5 を一時中断、Phase 5.5（tmux バックエンド永続化）を別 worker が
   先行**。中断点と再開手順は activeContext.md「Phase 5 の中断点」
 - 次: Phase 5.5（別 worker）/ 再開時は FR-3.2 コードプレビュー + tako_open_file
+
+## 2026-06-12（Phase 5.5 tmux バックエンド永続化 完成）
+
+- FR-5 実装: spawn を `tmux -L tako new-session -A` 経由に差し替え + layout.json で
+  同一 ID 復元（再起動で実行中プロセス・画面内容・AI 操作が継続）。`tako persist` /
+  MCP `tako_persist`（19 ツール）、tmuxview 区別表示、シェル統合は OSC パススルー +
+  TMUX unset。tmux 不在は直接 spawn へ劣化。罠 3 件は architecture.md「Phase 5.5」に記録
+- セルフテスト 95 項目緑（58〜62 追加）+ core e2e 2 本。ファイルツリー root 追従が
+  render 依存でオクルージョン中にフレークする既存問題も修正（sync_filetree_root）
+- FR-2.15「ターミナルのたまり場」を要件登録（実装は UI 相談後）。FR-2.14.5 / コンセプト追記
+- 次: .app 反映（build-app.sh --install）→ ユーザー再起動 OK / Phase 5 再開は FR-3.2 から
