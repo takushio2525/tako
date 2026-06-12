@@ -112,9 +112,34 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-echo "==> ad-hoc 署名（ローカル実行用。配布署名 / notarization は Phase 7）"
-codesign --force -s - "$APP/Contents/MacOS/tako"
-codesign --force -s - "$APP"
+# 署名 identity の解決。ad-hoc（-s -）はビルドごとに CDHash が変わり、macOS の
+# TCC がビルドのたびに別アプリ扱いして権限（フォルダアクセス等）をリセットする
+# （2026-06-12 実機バグ: 何回承認してもダイアログが再出現）。安定 identity =
+# キーチェーンの Apple Development 証明書（Xcode が管理。無ければ TAKO_CODESIGN_IDENTITY
+# で自己署名証明書等を指定）で署名し、権限の承認をビルドをまたいで保持する。
+# 配布署名（Developer ID + notarization）は Phase 7 で別途
+resolve_sign_identity() {
+  if [[ -n "${TAKO_CODESIGN_IDENTITY:-}" ]]; then
+    echo "$TAKO_CODESIGN_IDENTITY"
+    return
+  fi
+  # 最初の有効な Apple Development identity の SHA-1 を使う（名前指定は重複時に
+  # codesign が ambiguous で落ちるため、ハッシュ指定で一意化する）
+  security find-identity -p codesigning -v 2>/dev/null \
+    | sed -n 's/^ *[0-9]*) \([0-9A-F]\{40\}\) "Apple Development:.*/\1/p' | head -1
+}
+IDENTITY=$(resolve_sign_identity)
+if [[ -n "$IDENTITY" ]]; then
+  echo "==> 署名（identity: ${IDENTITY}。TCC 権限がビルドをまたいで保持される）"
+  codesign --force -s "$IDENTITY" "$APP/Contents/MacOS/tako"
+  codesign --force -s "$IDENTITY" "$APP"
+else
+  echo "==> ad-hoc 署名（注意: 安定 identity が無いため、ビルドごとに TCC の"
+  echo "    フォルダアクセス権限がリセットされる。Xcode で Apple Development 証明書を"
+  echo "    作るか TAKO_CODESIGN_IDENTITY を指定すると解消する）"
+  codesign --force -s - "$APP/Contents/MacOS/tako"
+  codesign --force -s - "$APP"
+fi
 
 echo "==> 生成完了: ${APP}（バージョン ${VERSION}）"
 
