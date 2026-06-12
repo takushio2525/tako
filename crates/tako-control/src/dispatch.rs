@@ -240,15 +240,37 @@ pub fn dispatch(
             let session = host
                 .session(target)
                 .ok_or(DispatchError::NoSession(target.as_u64()))?;
+            if matches!((to, delta), (Some(_), Some(_)) | (None, None)) {
+                return Err(DispatchError::InvalidParams(
+                    "to（絶対位置。0 = 最下部）か delta（相対行数）のどちらか一方を指定する".into(),
+                ));
+            }
+            // バックエンドペイン（Phase 5.5）のスクロールバックは tmux 側にある。
+            // ネスト tmux（ペイン内 attach）まで含めて tako-core::scroll が解決・駆動する
+            // （UI のホイール / スクロールバーと同じ層。開発不変条件）
+            if let Some(backend) = host.backend_session(target) {
+                let socket = tako_core::tmux_backend::socket_name();
+                let scroll_target = tako_core::scroll::resolve_target(&socket, &backend, &[None]);
+                let state = match (to, delta) {
+                    (Some(offset), None) => {
+                        tako_core::scroll::scroll_to(&scroll_target, offset as usize)
+                    }
+                    (None, Some(lines)) => tako_core::scroll::scroll_by(&scroll_target, lines),
+                    _ => unreachable!("引数は上で検証済み"),
+                }
+                .ok_or_else(|| {
+                    DispatchError::Operation("バックエンドセッションのスクロールに失敗".into())
+                })?;
+                return Ok(json!({
+                    "pane": target.as_u64(),
+                    "offset": state.position,
+                    "history": state.history,
+                }));
+            }
             match (to, delta) {
                 (Some(offset), None) => session.scroll_to(offset as usize),
                 (None, Some(lines)) => session.scroll_display(lines),
-                _ => {
-                    return Err(DispatchError::InvalidParams(
-                        "to（絶対位置。0 = 最下部）か delta（相対行数）のどちらか一方を指定する"
-                            .into(),
-                    ))
-                }
+                _ => unreachable!("引数は上で検証済み"),
             }
             Ok(json!({
                 "pane": target.as_u64(),

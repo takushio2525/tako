@@ -70,6 +70,14 @@ struct CellStyle {
 
 /// Term の表示内容を色解決済みスナップショットへ変換する
 pub fn snapshot<T: EventListener>(term: &Term<T>, theme: &Theme) -> Screen {
+    snapshot_opts(term, theme, true)
+}
+
+/// `show_cursor = false` でカーソルセルの強調を抑止する版。
+/// tmux copy-mode でスクロール中のバックエンドペインは、tmux が報告する
+/// copy-mode カーソルが画面に固定表示されて不自然なため UI 層が隠す
+/// （2026-06-12 実機フィードバック (b)）
+pub fn snapshot_opts<T: EventListener>(term: &Term<T>, theme: &Theme, show_cursor: bool) -> Screen {
     let cols = term.columns();
     let rows = term.screen_lines();
     let content = term.renderable_content();
@@ -87,7 +95,7 @@ pub fn snapshot<T: EventListener>(term: &Term<T>, theme: &Theme) -> Screen {
     let mut grid: Vec<Vec<(char, CellStyle)>> =
         vec![vec![(' ', default_style.clone()); cols]; rows];
 
-    let cursor = (content.cursor.shape != CursorShape::Hidden)
+    let cursor = (show_cursor && content.cursor.shape != CursorShape::Hidden)
         .then(|| point_to_viewport(display_offset, content.cursor.point))
         .flatten()
         .map(|p| (p.column.0, p.line))
@@ -309,6 +317,17 @@ mod tests {
         let s = snapshot(&term, &theme());
         let run = run_for(&s.lines[0], "X");
         assert!(run.bold && run.italic && run.underline && run.strikeout);
+    }
+
+    #[test]
+    fn show_cursor_falseでカーソル強調が消える() {
+        // tmux copy-mode スクロール中のカーソル居残り対策（2026-06-12 実機 (b)）。
+        // DECTCEM（\e[?25l）による非表示は alacritty 側が処理する
+        let term = term_with(b"ab");
+        let s = snapshot_opts(&term, &theme(), false);
+        assert_eq!(s.cursor, None);
+        let hidden = term_with(b"\x1b[?25lab");
+        assert_eq!(snapshot(&hidden, &theme()).cursor, None);
     }
 
     #[test]

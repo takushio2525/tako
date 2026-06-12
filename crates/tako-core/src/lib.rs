@@ -9,6 +9,7 @@ pub mod pane_tree;
 pub mod paths;
 pub mod ports;
 pub mod screen;
+pub mod scroll;
 pub mod shell_integration;
 pub mod tab;
 pub mod terminal;

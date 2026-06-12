@@ -537,6 +537,11 @@ impl TerminalSession {
         screen::snapshot(&self.term.lock(), theme)
     }
 
+    /// カーソル強調を抑止できる版（tmux copy-mode スクロール中の描画用）
+    pub fn screen_opts(&self, theme: &Theme, show_cursor: bool) -> Screen {
+        screen::snapshot_opts(&self.term.lock(), theme, show_cursor)
+    }
+
     /// 表示行を文字列で返す（装飾なし。セルフテスト・将来の `tako read` 用）
     pub fn visible_lines(&self) -> Vec<String> {
         self.screen(&Theme::default())

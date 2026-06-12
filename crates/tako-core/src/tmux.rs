@@ -139,7 +139,7 @@ pub fn kill_window(socket: Option<&str>, session: &str, window: u32) -> Result<(
 
 /// tmux CLI 実行。サーバー未起動（list 系の "no server running"）はエラー文字列を返す
 /// （list 側で空扱いにする）。tmux バイナリ不在も同様
-fn run_tmux(socket: Option<&str>, args: &[&str]) -> Result<String, String> {
+pub(crate) fn run_tmux(socket: Option<&str>, args: &[&str]) -> Result<String, String> {
     let mut command = Command::new(tmux_bin());
     if let Some(name) = socket {
         command.args(["-L", name]);

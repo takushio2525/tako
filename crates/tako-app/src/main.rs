@@ -54,6 +54,57 @@ const BORDER_HANDLE: f32 = 8.0;
 
 /// スクロールバーの当たり領域の幅（px。サムはこの内側に描く）
 const SCROLLBAR_WIDTH: f32 = 10.0;
+/// スクロールバーの表示維持時間とフェード時間（iTerm2 流の出し方。FR-2.5.13）
+const SCROLLBAR_SHOW_MS: u128 = 1000;
+const SCROLLBAR_FADE_MS: u128 = 400;
+
+/// 最終スクロールからの経過時間 → スクロールバー不透明度（1.0 → 0.0）
+fn scrollbar_alpha(elapsed_ms: u128) -> f32 {
+    if elapsed_ms <= SCROLLBAR_SHOW_MS {
+        1.0
+    } else if elapsed_ms >= SCROLLBAR_SHOW_MS + SCROLLBAR_FADE_MS {
+        0.0
+    } else {
+        1.0 - (elapsed_ms - SCROLLBAR_SHOW_MS) as f32 / SCROLLBAR_FADE_MS as f32
+    }
+}
+
+/// バックエンド / ネスト tmux スクロールの UI 側状態（ペイン単位）。
+/// ホイールは pending に溜めて 1 つの tmux 操作へコアレッシングする
+/// （SGR イベント洪水による「ばっと飛ぶ」スクロールの対策。2026-06-12）
+struct ScrollCtl {
+    /// 解決済みのスクロール実体（None = 未解決。初回ポンプで解決する）
+    target: Option<tako_core::scroll::ScrollTarget>,
+    state: tako_core::scroll::ScrollState,
+    /// 未送信の相対行数（正 = 遡る）
+    pending: i32,
+    /// スクロールバードラッグの絶対位置目標（pending より優先）
+    drag_goal: Option<usize>,
+    /// tmux 操作の実行中（完了時に残りをポンプ）
+    in_flight: bool,
+    /// copy-mode 中の外部変化（ユーザー操作・新規出力）への追従要求
+    want_refresh: bool,
+    last_activity: std::time::Instant,
+    last_refresh: std::time::Instant,
+    /// 直近のホイール座標（マウス要求アプリと判明したとき生 SGR へ流す用）
+    last_cell: (usize, usize),
+}
+
+impl Default for ScrollCtl {
+    fn default() -> Self {
+        Self {
+            target: None,
+            state: tako_core::scroll::ScrollState::default(),
+            pending: 0,
+            drag_goal: None,
+            in_flight: false,
+            want_refresh: false,
+            last_activity: std::time::Instant::now(),
+            last_refresh: std::time::Instant::now(),
+            last_cell: (0, 0),
+        }
+    }
+}
 
 /// 左サイドバー（ファイルツリー）の幅（px。FR-3.1）
 const SIDEBAR_WIDTH: f32 = 220.0;
@@ -315,6 +366,10 @@ struct TakoApp {
     dragging_scrollbar: Option<PaneId>,
     /// ホイール行換算の端数持ち越し（accumulate_scroll）。ペイン close で破棄
     scroll_accum: HashMap<PaneId, f32>,
+    /// バックエンド / ネスト tmux スクロールの UI 状態（コアレッシング + フェード表示）
+    scroll_ctls: HashMap<PaneId, ScrollCtl>,
+    /// フェード再描画・copy-mode 追従ティッカーの稼働中フラグ
+    scroll_ticker: bool,
     /// 右サイドバー情報パネル（tmux 一覧 FR-2.13 / 集約センター FR-2.10）の表示状態。
     /// 表示・幅・ビューは dispatch（CLI / MCP の `tako panel`）からも操作できる
     panel_visible: bool,
@@ -479,6 +534,8 @@ impl TakoApp {
             dragging_border: None,
             dragging_scrollbar: None,
             scroll_accum: HashMap::new(),
+            scroll_ctls: HashMap::new(),
+            scroll_ticker: false,
             panel_visible: false,
             panel_view: PanelView::default(),
             panel_width: PANEL_DEFAULT_WIDTH,
@@ -541,7 +598,18 @@ impl TakoApp {
         cx.spawn(async move |this, cx| {
             while let Some(incoming) = control_rx.next().await {
                 let result = this.update(cx, |app: &mut TakoApp, cx| {
+                    let was_scroll = matches!(
+                        incoming.request,
+                        tako_control::protocol::Request::Scroll { .. }
+                    );
                     let mut result = tako_control::dispatch(app, incoming.request, incoming.origin);
+                    // CLI / MCP のスクロールでも UI のスクロールバー・カーソル抑止が
+                    // 同じ状態を共有する（開発不変条件: UI と AI 操作の等価性）
+                    if was_scroll {
+                        if let Ok(value) = &result {
+                            app.sync_scroll_from_dispatch(value, cx);
+                        }
+                    }
                     // dispatch が依頼したセッション起動をここで実行（Context が要るため）。
                     // PTY 起動失敗は生成済みペインを巻き戻してエラー応答にする（落とさない）
                     for (pane, options) in std::mem::take(&mut app.pending_attach) {
@@ -1149,6 +1217,7 @@ impl TakoApp {
             Ok(_) => {
                 self.terminals.remove(&pane_id);
                 self.scroll_accum.remove(&pane_id);
+                self.scroll_ctls.remove(&pane_id);
                 self.drop_backend_session(pane_id);
             }
             Err(_) => {
@@ -1169,6 +1238,7 @@ impl TakoApp {
                 for id in pane_ids {
                     self.terminals.remove(&id);
                     self.scroll_accum.remove(&id);
+                    self.scroll_ctls.remove(&id);
                     self.drop_backend_session(id);
                 }
             }
@@ -1296,6 +1366,9 @@ impl TakoApp {
             .unwrap_or(false)
             || self.backend_sessions.contains_key(&self.focused_pane());
         if let Some(bytes) = keystroke_to_bytes(keystroke, disambiguate) {
+            // tmux スクロール中（copy-mode）は iTerm2 流に最下部へ戻してから流す
+            // （copy-mode にキーが飲まれて「入力が反映されない」症状の根治）
+            self.cancel_scroll_before_input(self.focused_pane());
             if let Some(session) = self.focused_session() {
                 session.clear_selection();
                 session.write(bytes);
@@ -1909,17 +1982,37 @@ impl TakoApp {
         let Some((_, area)) = self.pane_text_areas.iter().find(|(id, _)| *id == pane_id) else {
             return;
         };
+        let area = *area;
+        let backend = self.backend_sessions.contains_key(&pane_id);
         let Some(session) = self.terminals.get(&pane_id) else {
             return;
         };
-        let history = session.history_size();
         let (_, rows) = session.size();
+        let history = if backend {
+            self.scroll_ctls
+                .get(&pane_id)
+                .map(|c| c.state.history)
+                .unwrap_or(0)
+        } else {
+            session.history_size()
+        };
         let total = (history + rows) as f32;
         let ratio = ((f32::from(y) - f32::from(area.origin.y)) / f32::from(area.size.height))
             .clamp(0.0, 1.0);
         // 表示窓（rows 行）の中心をマウス位置の行へ合わせ、上端行 → offset に直す
         let top_row = (ratio * total - rows as f32 / 2.0).clamp(0.0, history as f32);
-        session.scroll_to(history - top_row.round() as usize);
+        let offset = history - top_row.round() as usize;
+        if backend {
+            let ctl = self.scroll_ctls.entry(pane_id).or_default();
+            ctl.last_activity = std::time::Instant::now();
+            ctl.drag_goal = Some(offset);
+            ctl.pending = 0;
+            self.pump_scroll(pane_id, cx);
+            self.ensure_scroll_ticker(cx);
+        } else {
+            session.scroll_to(offset);
+            self.mark_scroll_activity(pane_id, cx);
+        }
         cx.notify();
     }
 
@@ -2023,16 +2116,272 @@ impl TakoApp {
         let (lines, rest) = accumulate_scroll(*carry, delta_lines);
         *carry = rest;
         if lines != 0 {
-            // mouse reporting / alternate scroll / 自前スクロールの出し分けはセッション側
             let (col, row) = self
                 .cell_at(pane_id, event.position, window)
                 .map(|(c, r, _)| (c, r))
                 .unwrap_or((0, 0));
-            if let Some(session) = self.terminals.get(&pane_id) {
+            if self.backend_sessions.contains_key(&pane_id) {
+                // バックエンドペイン: tako が tmux スクロールを正確な行数で駆動する
+                self.backend_scroll(pane_id, lines, (col, row), cx);
+            } else if let Some(session) = self.terminals.get(&pane_id) {
+                // 直接ペイン: mouse reporting / alternate scroll / 自前スクロールの
+                // 出し分けはセッション側
                 session.scroll_wheel(lines, col, row);
+                self.mark_scroll_activity(pane_id, cx);
                 cx.notify();
             }
         }
+    }
+
+    // --- バックエンド / ネスト tmux スクロール（tako-core::scroll の UI 側） ---
+
+    /// ホイール行数をバックエンドスクロールへ積む。マウス要求アプリ（vim 等）へは
+    /// 従来どおり生 SGR を転送し、それ以外は tako 自身が tmux copy-mode を正確な
+    /// 行数で駆動する。SGR 経由で tmux 既定バインドの copy-mode に入れる方式は
+    /// 「5 行単位でばっと飛ぶ」「キー入力が copy-mode に飲まれる」「copy-mode
+    /// カーソルが画面に居座る」の 3 症状を生むためやめた（2026-06-12 実機）
+    fn backend_scroll(
+        &mut self,
+        pane_id: PaneId,
+        lines: i32,
+        cell: (usize, usize),
+        cx: &mut Context<Self>,
+    ) {
+        let ctl = self.scroll_ctls.entry(pane_id).or_default();
+        ctl.last_activity = std::time::Instant::now();
+        ctl.last_cell = cell;
+        if ctl.target.is_some() && ctl.state.wants_mouse {
+            if let Some(session) = self.terminals.get(&pane_id) {
+                session.scroll_wheel(lines, cell.0, cell.1);
+            }
+        } else {
+            ctl.pending += lines;
+            self.pump_scroll(pane_id, cx);
+        }
+        self.ensure_scroll_ticker(cx);
+        cx.notify();
+    }
+
+    /// 溜まったスクロール要求を 1 つの tmux 操作として実行する（ペイン単位に直列 =
+    /// コアレッシング）。完了時に残りがあれば再帰的にポンプする
+    fn pump_scroll(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend_sessions.get(&pane_id).cloned() else {
+            return;
+        };
+        let Some(ctl) = self.scroll_ctls.get_mut(&pane_id) else {
+            return;
+        };
+        if ctl.in_flight {
+            return;
+        }
+        let need_resolve = ctl.target.is_none();
+        let goal = ctl.drag_goal.take();
+        let delta = std::mem::take(&mut ctl.pending);
+        let refresh = std::mem::take(&mut ctl.want_refresh);
+        if !need_resolve && goal.is_none() && delta == 0 && !refresh {
+            return;
+        }
+        ctl.in_flight = true;
+        ctl.last_refresh = std::time::Instant::now();
+        let target = ctl.target.clone();
+        let socket = tako_core::tmux_backend::socket_name();
+        cx.spawn(async move |this, cx| {
+            let task = cx.background_executor().spawn(async move {
+                use tako_core::scroll;
+                let target =
+                    target.unwrap_or_else(|| scroll::resolve_target(&socket, &backend, &[None]));
+                let state = if let Some(goal) = goal {
+                    scroll::scroll_to(&target, goal)
+                } else if delta != 0 {
+                    scroll::scroll_by(&target, delta)
+                } else {
+                    scroll::scroll_state(&target)
+                };
+                (target, state)
+            });
+            let (target, state) = task.await;
+            this.update(cx, |app, cx| {
+                let mut flush: Option<i32> = None;
+                if let Some(ctl) = app.scroll_ctls.get_mut(&pane_id) {
+                    ctl.in_flight = false;
+                    ctl.target = Some(target);
+                    if let Some(state) = state {
+                        ctl.state = state;
+                        // 解決して初めてマウス要求アプリと判明したら、待つ間に
+                        // 溜まった分を生 SGR へ振り替える
+                        if state.wants_mouse && ctl.pending != 0 {
+                            flush = Some(std::mem::take(&mut ctl.pending));
+                        }
+                    }
+                }
+                if let Some(lines) = flush {
+                    let cell = app
+                        .scroll_ctls
+                        .get(&pane_id)
+                        .map(|c| c.last_cell)
+                        .unwrap_or((0, 0));
+                    if let Some(session) = app.terminals.get(&pane_id) {
+                        session.scroll_wheel(lines, cell.0, cell.1);
+                    }
+                } else {
+                    app.pump_scroll(pane_id, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// dispatch（CLI / MCP）の Scroll 応答を UI のスクロール状態へ反映する
+    fn sync_scroll_from_dispatch(&mut self, value: &serde_json::Value, cx: &mut Context<Self>) {
+        let (Some(pane), Some(offset), Some(history)) = (
+            value["pane"].as_u64(),
+            value["offset"].as_u64(),
+            value["history"].as_u64(),
+        ) else {
+            return;
+        };
+        let Some(pane_id) = self
+            .workspace
+            .tabs()
+            .iter()
+            .flat_map(|t| t.tree().panes())
+            .map(|p| p.id())
+            .find(|id| id.as_u64() == pane)
+        else {
+            return;
+        };
+        if self.backend_sessions.contains_key(&pane_id) {
+            let ctl = self.scroll_ctls.entry(pane_id).or_default();
+            ctl.last_activity = std::time::Instant::now();
+            ctl.state.position = offset as usize;
+            ctl.state.history = history as usize;
+            ctl.state.in_mode = offset > 0;
+            // dispatch 側で解決済みだが UI 側の target は未解決のままにし、
+            // 次のホイール / キー時に必要なら解決する（cancel は target が要るため）
+            if offset > 0 && ctl.target.is_none() {
+                ctl.want_refresh = true;
+                self.pump_scroll(pane_id, cx);
+            }
+            self.ensure_scroll_ticker(cx);
+        } else {
+            self.mark_scroll_activity(pane_id, cx);
+        }
+        cx.notify();
+    }
+
+    /// 直接ペインのスクロール活動を記録する（スクロールバーのフェード表示トリガー）
+    fn mark_scroll_activity(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        self.scroll_ctls.entry(pane_id).or_default().last_activity = std::time::Instant::now();
+        self.ensure_scroll_ticker(cx);
+    }
+
+    /// copy-mode 中のキー入力前に最下部へ戻す（iTerm2 流）。同期実行（~数 ms）なのは
+    /// 非同期にするとキーが先に copy-mode へ届いて飲まれるため
+    fn cancel_scroll_before_input(&mut self, pane_id: PaneId) {
+        if let Some(ctl) = self.scroll_ctls.get_mut(&pane_id) {
+            if ctl.state.in_mode {
+                if let Some(target) = &ctl.target {
+                    tako_core::scroll::cancel(target);
+                }
+                ctl.state.in_mode = false;
+                ctl.state.position = 0;
+                ctl.pending = 0;
+                ctl.drag_goal = None;
+            }
+        }
+    }
+
+    /// スクロールバーのフェード再描画と copy-mode 状態の追従。
+    /// 対象エントリが尽きたら自動停止する
+    fn ensure_scroll_ticker(&mut self, cx: &mut Context<Self>) {
+        if self.scroll_ticker {
+            return;
+        }
+        self.scroll_ticker = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                let live = this
+                    .update(cx, |app, cx| {
+                        let dragging = app.dragging_scrollbar;
+                        app.scroll_ctls.retain(|id, ctl| {
+                            ctl.in_flight
+                                || ctl.pending != 0
+                                || ctl.drag_goal.is_some()
+                                || ctl.state.in_mode
+                                || Some(*id) == dragging
+                                || scrollbar_alpha(ctl.last_activity.elapsed().as_millis()) > 0.0
+                        });
+                        // copy-mode 中は外部変化（ユーザーの q・新規出力での履歴増）に追従
+                        let refresh: Vec<PaneId> = app
+                            .scroll_ctls
+                            .iter_mut()
+                            .filter(|(_, ctl)| {
+                                ctl.state.in_mode
+                                    && !ctl.in_flight
+                                    && ctl.last_refresh.elapsed() >= Duration::from_millis(1000)
+                            })
+                            .map(|(id, ctl)| {
+                                ctl.want_refresh = true;
+                                *id
+                            })
+                            .collect();
+                        for id in refresh {
+                            app.pump_scroll(id, cx);
+                        }
+                        cx.notify();
+                        !app.scroll_ctls.is_empty()
+                    })
+                    .unwrap_or(false);
+                if !live {
+                    break;
+                }
+            }
+            this.update(cx, |app, _| app.scroll_ticker = false).ok();
+        })
+        .detach();
+    }
+
+    /// スクロールバーの描画情報 (top, thumb_h, track_h, alpha, dragging)。
+    /// スクロール活動が無い・フェードアウト済み・履歴ゼロでは None（iTerm2 流）
+    fn scrollbar_overlay(
+        &self,
+        pane_id: PaneId,
+        area: Bounds<Pixels>,
+    ) -> Option<(f32, f32, f32, f32, bool)> {
+        let dragging = self.dragging_scrollbar == Some(pane_id);
+        let ctl = self.scroll_ctls.get(&pane_id)?;
+        let alpha = if dragging {
+            1.0
+        } else {
+            scrollbar_alpha(ctl.last_activity.elapsed().as_millis())
+        };
+        if alpha <= 0.0 {
+            return None;
+        }
+        let session = self.terminals.get(&pane_id)?;
+        let (offset, history) = if self.backend_sessions.contains_key(&pane_id) {
+            // バックエンドのスクロールバックは tmux 側（ネスト先含む）にある
+            (ctl.state.position, ctl.state.history)
+        } else {
+            if session.is_alt_screen() {
+                return None;
+            }
+            (session.display_offset(), session.history_size())
+        };
+        if history == 0 {
+            return None;
+        }
+        let (_, rows) = session.size();
+        let total = (history + rows) as f32;
+        let track_h = f32::from(area.size.height);
+        let thumb_h = (rows as f32 / total * track_h).clamp(20.0, track_h);
+        let top = ((history - offset.min(history)) as f32 / total * track_h).min(track_h - thumb_h);
+        Some((top, thumb_h, track_h, alpha, dragging))
     }
 
     // --- 描画 ---
@@ -2370,25 +2719,9 @@ impl TakoApp {
                 _ => None,
             });
 
-        // スクロールバー（FR-2.5.13 の UI）。通常画面で履歴があるときだけ控えめに重ねる。
-        // alternate screen（TUI）はスクロールバックが無いので出さない
-        let scrollbar = self.terminals.get(&pane_id).and_then(|s| {
-            if s.is_alt_screen() {
-                return None;
-            }
-            let history = s.history_size();
-            if history == 0 {
-                return None;
-            }
-            let (_, rows) = s.size();
-            let total = (history + rows) as f32;
-            let track_h = f32::from(area.size.height);
-            let thumb_h = (rows as f32 / total * track_h).clamp(20.0, track_h);
-            let top =
-                ((history - s.display_offset()) as f32 / total * track_h).min(track_h - thumb_h);
-            let dragging = self.dragging_scrollbar == Some(pane_id);
-            Some((top, thumb_h, track_h, dragging))
-        });
+        // スクロールバー（FR-2.5.13）: iTerm2 流にスクロール中だけ表示 → フェードアウト。
+        // バックエンドペインは tmux 側（ネスト先含む）の位置・履歴を表示する
+        let scrollbar = self.scrollbar_overlay(pane_id, area);
 
         // 提案チップ（FR-2.4.3）。このペインの先頭 1 件だけ下端に出す（残りは閉じたら順に）
         let suggestion = self
@@ -2397,7 +2730,16 @@ impl TakoApp {
             .find(|s| s.pane == pane_id)
             .map(|s| (s.port, s.process.clone()));
 
-        let screen = self.terminals.get(&pane_id).map(|s| s.screen(&theme));
+        // tmux copy-mode でスクロール中は copy-mode カーソルが画面に固定表示されて
+        // 不自然なため隠す（2026-06-12 実機フィードバック (b)）
+        let scrolled_in_tmux = self
+            .scroll_ctls
+            .get(&pane_id)
+            .is_some_and(|c| c.state.in_mode);
+        let screen = self
+            .terminals
+            .get(&pane_id)
+            .map(|s| s.screen_opts(&theme, !scrolled_in_tmux));
 
         let lines: Vec<_> = screen
             .map(|screen| {
@@ -2548,7 +2890,7 @@ impl TakoApp {
                     .overflow_hidden()
                     .children(lines),
             )
-            .children(scrollbar.map(|(top, thumb_h, track_h, dragging)| {
+            .children(scrollbar.map(|(top, thumb_h, track_h, alpha, dragging)| {
                 div()
                     .id(("scrollbar", pane_id.as_u64()))
                     .absolute()
@@ -2574,7 +2916,7 @@ impl TakoApp {
                             .rounded_sm()
                             .bg(rgba_alpha(
                                 theme.tab_inactive_foreground,
-                                if dragging { 0.7 } else { 0.35 },
+                                alpha * if dragging { 0.7 } else { 0.35 },
                             )),
                     )
             }))
@@ -2658,6 +3000,7 @@ impl ControlHost for TakoApp {
     fn detach_session(&mut self, pane: PaneId) {
         self.terminals.remove(&pane);
         self.scroll_accum.remove(&pane);
+        self.scroll_ctls.remove(&pane);
         // CLI / MCP からの明示 close（FR-2.5.4）。バックエンドセッションも片付ける
         self.drop_backend_session(pane);
     }
@@ -2835,6 +3178,7 @@ impl EntityInputHandler for TakoApp {
             .take()
             .map(|ime| ime.pane)
             .unwrap_or_else(|| self.focused_pane());
+        self.cancel_scroll_before_input(pane);
         if let Some(session) = self.terminals.get(&pane) {
             session.clear_selection();
             session.write(text.as_bytes().to_vec());
@@ -5274,6 +5618,128 @@ mod self_test {
                     .unwrap_or(false);
                 check(listed_backend, "tmux list がバックエンドを区別表示する");
 
+                // 61b. バックエンドのホイール = tako 駆動の tmux スクロール
+                //（SGR 任せの copy-mode 突入をやめた方式。コアレッシング + 正確な行数）
+                press(any, cx, "ctrl-u");
+                type_text(any, cx, "seq 200", true);
+                wait(cx, 1000).await;
+                window
+                    .update(cx, |app, win, cx| {
+                        let center = app
+                            .pane_text_areas
+                            .iter()
+                            .find(|(id, _)| *id == backend_pane)
+                            .map(|(_, b)| b.center())
+                            .unwrap_or_default();
+                        app.on_pane_scroll(
+                            backend_pane,
+                            &ScrollWheelEvent {
+                                position: center,
+                                delta: ScrollDelta::Lines(point(0.0, 4.0)),
+                                ..ScrollWheelEvent::default()
+                            },
+                            win,
+                            cx,
+                        );
+                    })
+                    .ok();
+                let mut wheel_scrolled = false;
+                for _ in 0..20 {
+                    wait(cx, 300).await;
+                    wheel_scrolled = window
+                        .update(cx, |app, _, _| {
+                            app.scroll_ctls
+                                .get(&backend_pane)
+                                .map(|c| c.state.in_mode && c.state.position > 0)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if wheel_scrolled {
+                        break;
+                    }
+                }
+                check(wheel_scrolled, "バックエンドのホイールが tmux スクロールに乗る");
+
+                // 61c. スクロールバーはスクロール中だけ表示され、時間経過でフェードする
+                let bar_visible = window
+                    .update(cx, |app, _, _| {
+                        let area = app
+                            .pane_text_areas
+                            .iter()
+                            .find(|(id, _)| *id == backend_pane)
+                            .map(|(_, b)| *b)
+                            .unwrap_or_default();
+                        app.scrollbar_overlay(backend_pane, area).is_some()
+                    })
+                    .unwrap_or(false);
+                let bar_faded = window
+                    .update(cx, |app, _, _| {
+                        if let Some(ctl) = app.scroll_ctls.get_mut(&backend_pane) {
+                            ctl.last_activity =
+                                std::time::Instant::now() - Duration::from_secs(3);
+                        }
+                        let area = app
+                            .pane_text_areas
+                            .iter()
+                            .find(|(id, _)| *id == backend_pane)
+                            .map(|(_, b)| *b)
+                            .unwrap_or_default();
+                        app.scrollbar_overlay(backend_pane, area).is_none()
+                    })
+                    .unwrap_or(false);
+                check(
+                    bar_visible && bar_faded,
+                    "スクロールバーはスクロール中だけ表示（フェード）",
+                );
+
+                // 61d. スクロール中のキー入力は最下部へ戻してから流れる（iTerm2 流。
+                //      copy-mode にキーが飲まれて入力が反映されない症状の回帰検知）
+                press(any, cx, "enter");
+                let mut key_cancelled = false;
+                for _ in 0..20 {
+                    wait(cx, 300).await;
+                    key_cancelled = window
+                        .update(cx, |app, _, _| {
+                            app.scroll_ctls
+                                .get(&backend_pane)
+                                .map(|c| !c.state.in_mode)
+                                .unwrap_or(true)
+                        })
+                        .unwrap_or(false)
+                        && tako_core::scroll::scroll_state(
+                            &tako_core::scroll::ScrollTarget::Backend {
+                                socket: backend_sock.clone(),
+                                session: backend_name.clone(),
+                            },
+                        )
+                        .map(|s| !s.in_mode)
+                        .unwrap_or(false);
+                    if key_cancelled {
+                        break;
+                    }
+                }
+                check(key_cancelled, "スクロール中のキー入力で最下部へ戻る（iTerm2 流）");
+
+                // 61e. CLI（dispatch 共有）でもバックエンドの tmux スクロールに効く
+                press(any, cx, "ctrl-u");
+                type_text(any, cx, &format!("{cli} scroll --to 5 >/dev/null"), true);
+                let mut cli_scrolled = false;
+                for _ in 0..20 {
+                    wait(cx, 300).await;
+                    cli_scrolled = tako_core::scroll::scroll_state(
+                        &tako_core::scroll::ScrollTarget::Backend {
+                            socket: backend_sock.clone(),
+                            session: backend_name.clone(),
+                        },
+                    )
+                    .map(|s| s.position >= 5)
+                    .unwrap_or(false);
+                    if cli_scrolled {
+                        break;
+                    }
+                }
+                check(cli_scrolled, "tako scroll がバックエンドの tmux スクロールに効く");
+
                 // 62. ペインの明示 close でバックエンドセッションも破棄される
                 //     （アプリ終了では破棄されない = 永続化、は core の e2e テストで検証済み）
                 press(any, cx, "cmd-w");
@@ -5438,6 +5904,17 @@ mod scroll_tests {
         let (lines, carry) = accumulate_scroll(0.0, -3.2);
         assert_eq!(lines, -3);
         assert!((carry + 0.2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn スクロールバーは表示維持後にフェードする() {
+        use super::{scrollbar_alpha, SCROLLBAR_FADE_MS, SCROLLBAR_SHOW_MS};
+        assert_eq!(scrollbar_alpha(0), 1.0);
+        assert_eq!(scrollbar_alpha(SCROLLBAR_SHOW_MS), 1.0);
+        let mid = scrollbar_alpha(SCROLLBAR_SHOW_MS + SCROLLBAR_FADE_MS / 2);
+        assert!(mid > 0.0 && mid < 1.0, "フェード中間で半透明: {mid}");
+        assert_eq!(scrollbar_alpha(SCROLLBAR_SHOW_MS + SCROLLBAR_FADE_MS), 0.0);
+        assert_eq!(scrollbar_alpha(u128::MAX), 0.0);
     }
 
     #[test]
