@@ -441,6 +441,12 @@ impl TakoApp {
         // レイアウトファイルから同じ ID・同じ構成でワークスペースを再現し、
         // 各ペインは下の spawn ループで tmux バックエンドセッションへ再 attach する
         let tmux_persist = initial_tmux_persist();
+        if tmux_persist && tako_core::tmux_backend::available() {
+            // 生き残っている既存サーバーへ最新 conf を再適用する（conf は
+            // サーバー起動時にしか読まれないため、バージョン更新の設定変更が
+            // ここで同期されないと永久に届かない）
+            tako_core::tmux_backend::sync_conf(&tako_core::tmux_backend::socket_name());
+        }
         let mut restored: Vec<tako_control::layout::RestoredPane> = Vec::new();
         let workspace = if tmux_persist && tako_core::tmux_backend::available() {
             tako_control::layout::load()
@@ -2690,6 +2696,10 @@ impl ControlHost for TakoApp {
 
     fn set_tmux_persist(&mut self, enabled: bool) {
         self.tmux_persist = enabled;
+        if enabled && tako_core::tmux_backend::available() {
+            // 過去の起動から生き残っているサーバーがあれば最新 conf を再適用する
+            tako_core::tmux_backend::sync_conf(&tako_core::tmux_backend::socket_name());
+        }
         // 切替は以後生成されるペインに効く。既存のバックエンドペインはそのまま
         // （close 時の kill は backend_sessions に残っているため引き続き行われる）。
         // 永続化（FR-5）。セルフテスト中はユーザー設定・レイアウトを汚さない

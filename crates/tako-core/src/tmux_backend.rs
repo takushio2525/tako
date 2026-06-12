@@ -56,6 +56,11 @@ pub fn available() -> bool {
 /// - `update-environment`: 再 attach 時にセッション環境の TAKO_* を新インスタンスの値へ
 ///   更新する（既存プロセスには届かないが、それは CLI の control.json フォールバック
 ///   = FR-2.2.9 が吸収する）
+/// - `copy-mode-position-format ''`: copy-mode（ホイールスクロール）右上の
+///   位置インジケータを消す。tmux 3.6 の既定フォーマットは先頭行タイムスタンプ
+///   （`15:13 [10/77]` のような時刻表示）を含み、通常ペインのスクロール中に
+///   謎の時刻として見えてしまう（2026-06-12 実機バグ (2)）。
+///   スクロール位置は tako 側のスクロールバー（FR-2.5.13）が示す
 const BACKEND_CONF: &str = "\
 # tako tmux バックエンド設定（自動生成。手で編集しない。tako-core::tmux_backend）
 set -g status off
@@ -71,6 +76,7 @@ set -s extended-keys always
 set -sq extended-keys-format csi-u
 set -as terminal-features 'xterm*:extkeys:RGB'
 set -g update-environment 'TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL TAKO_TAB_ID'
+set -gq copy-mode-position-format ''
 ";
 
 /// 専用 conf をデータディレクトリへ書き出す（毎起動上書き = バージョン更新追従）。
@@ -84,6 +90,19 @@ fn ensure_conf() -> PathBuf {
         Some(path)
     }
     write_conf().unwrap_or_else(|| PathBuf::from("/dev/null"))
+}
+
+/// 稼働中のバックエンドサーバーへ最新 conf を再適用する。
+/// conf は `-f` でサーバー**起動時**にしか読まれず、サーバーは tako の再起動を
+/// 生き残る（FR-5 の永続化）ため、tako のバージョン更新で変えた設定が
+/// 既存サーバーへ届かない（2026-06-12 実機バグ (2) の温床）。
+/// アプリ起動時・persist 有効化時に呼ぶ。サーバー不在なら何もしない（起動もしない）
+pub fn sync_conf(socket: &str) {
+    let conf = ensure_conf();
+    let _ = Command::new(crate::tmux::tmux_bin())
+        .args(["-L", socket, "source-file"])
+        .arg(&conf)
+        .output();
 }
 
 /// SpawnOptions を tmux セッション経由に書き換える。
@@ -537,6 +556,192 @@ mod tests {
             "CJK 出力が現れない。画面: {:?}",
             session.visible_lines().join("\n")
         );
+    }
+
+    /// 通常画面・非マウスのペイン（素のシェルや Claude Code）へのホイールは
+    /// バックエンド tmux の copy-mode でスクロールバックを遡り、かつ右上に
+    /// 位置インジケータ（tmux 3.6 既定は先頭行タイムスタンプ = 時刻を含む）を
+    /// **描かない**ことの e2e（2026-06-12 実機バグ (2) の再発防止。
+    /// conf の `copy-mode-position-format ''` が回帰検知の対象）
+    #[test]
+    #[cfg(unix)]
+    fn 通常ペインのホイールはcopy_modeで遡りインジケータを出さない() {
+        if !available() {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-ind-{}", std::process::id());
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                kill_server(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(socket.clone());
+        // 100 行出力して待機する sh（通常画面・非マウス。Claude Code と同型）
+        let options = SpawnOptions {
+            command: Some(SpawnCommand {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "i=0; while [ $i -lt 100 ]; do echo LINE-$i; i=$((i+1)); done; exec sleep 60"
+                        .into(),
+                ],
+            }),
+            cwd: Some(std::env::temp_dir()),
+            env: vec![],
+        };
+        let (session, _rx) =
+            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-ind"))
+                .expect("tmux クライアントを spawn できる");
+        let wait_top = |pred: &dyn Fn(&str) -> bool| -> Option<String> {
+            for _ in 0..100 {
+                let lines = session.visible_lines();
+                if let Some(top) = lines.first() {
+                    if pred(top) {
+                        return Some(top.clone());
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            session.visible_lines().first().cloned()
+        };
+        // 出力完了（最終行が見えている）を待つ
+        for _ in 0..100 {
+            if session
+                .visible_lines()
+                .iter()
+                .any(|l| l.trim_end() == "LINE-99")
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // ホイール上 → copy-mode で遡る（1 イベント目が copy-mode 入り、以後スクロール）
+        session.scroll_wheel(3, 10, 10);
+        let top = wait_top(&|top| {
+            let t = top.trim_end();
+            t.starts_with("LINE-") && t != "LINE-77"
+        })
+        .expect("先頭行が取れる");
+        let t = top.trim_end();
+        let n: usize = t
+            .strip_prefix("LINE-")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                panic!("スクロール後の先頭行が LINE-n でない（インジケータ等の混入）: {top:?}")
+            });
+        assert!(n < 77, "ホイールで遡れていない。先頭行: {top:?}");
+        // 行全体が LINE-n のみ = 右上に時刻 / [位置/履歴] インジケータが無い
+        assert_eq!(
+            t,
+            format!("LINE-{n}"),
+            "右上に位置インジケータが描かれている（バグ (2) の回帰）: {top:?}"
+        );
+        // ホイール下で最下部へ戻ると copy-mode が解けて元の画面（LINE-99）に戻る
+        session.scroll_wheel(-30, 10, 10);
+        let mut back = false;
+        for _ in 0..50 {
+            if session
+                .visible_lines()
+                .iter()
+                .any(|l| l.trim_end() == "LINE-99")
+            {
+                back = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(back, "ホイール下で最下部へ戻らない");
+    }
+
+    /// sync_conf が**稼働中**のサーバーへ最新 conf を再適用することの e2e。
+    /// サーバーは tako 再起動を生き残るため、これが無いと conf 更新が永久に届かない
+    #[test]
+    #[cfg(unix)]
+    fn sync_confは稼働中サーバーへ設定を再適用する() {
+        if !available() {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-sync-{}", std::process::id());
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                kill_server(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(socket.clone());
+        let tmux = crate::tmux::tmux_bin();
+        // 旧バージョン相当: conf 無し（/dev/null）でサーバーを起動しておく
+        let status = Command::new(tmux)
+            .args([
+                "-L",
+                &socket,
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "x",
+            ])
+            .arg("sleep 30")
+            .status()
+            .expect("tmux サーバーを起動できる");
+        assert!(status.success());
+        let show = |opt: &str| -> Option<String> {
+            let out = Command::new(tmux)
+                .args(["-L", &socket, "show-options", "-g", "-v", opt])
+                .output()
+                .ok()?;
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        };
+        // 既定では copy-mode-position-format が空でない（tmux 3.6+。
+        // オプション自体が無い古い tmux では検証をスキップ）
+        let Some(before) = Command::new(tmux)
+            .args([
+                "-L",
+                &socket,
+                "show-options",
+                "-g",
+                "-w",
+                "-v",
+                "copy-mode-position-format",
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        else {
+            eprintln!("skip: copy-mode-position-format 非対応の tmux");
+            return;
+        };
+        assert!(
+            !before.is_empty(),
+            "前提が変わった: 既定でインジケータが空（テストの意味が無い）"
+        );
+        sync_conf(&socket);
+        let after = Command::new(tmux)
+            .args([
+                "-L",
+                &socket,
+                "show-options",
+                "-g",
+                "-w",
+                "-v",
+                "copy-mode-position-format",
+            ])
+            .output()
+            .expect("show-options が動く");
+        assert_eq!(
+            String::from_utf8_lossy(&after.stdout).trim(),
+            "",
+            "sync_conf 後もインジケータ書式が既定のまま（再適用されていない）"
+        );
+        // 他の主要設定も同期されている（mouse on は wheel 配送の前提）
+        assert_eq!(show("mouse").as_deref(), Some("on"));
     }
 
     /// マウス**非要求**の alt-screen アプリ（ペイン内 `tmux attach` のネストや全画面 TUI）への
