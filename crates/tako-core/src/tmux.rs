@@ -137,14 +137,30 @@ pub fn kill_window(socket: Option<&str>, session: &str, window: u32) -> Result<(
     .map(|_| ())
 }
 
-/// tmux CLI 実行。サーバー未起動（list 系の "no server running"）はエラー文字列を返す
-/// （list 側で空扱いにする）。tmux バイナリ不在も同様
-pub(crate) fn run_tmux(socket: Option<&str>, args: &[&str]) -> Result<String, String> {
+/// tmux クライアント子プロセスの雛形。バイナリ解決（`tmux_bin`）と
+/// **UTF-8 ロケールの明示注入**を一手に引き受ける。
+///
+/// tmux 3.6 はクライアントのロケールが C（LC_CTYPE / LANG 未設定）だと、
+/// コマンド出力中の制御文字を `_` に置換する（サニタイズ）。Dock 起動の .app は
+/// ロケール環境変数ゼロのため、`-F "…\t…"` のタブ区切り出力が
+/// `master-2_1781179563_0` になり**全パースが沈黙全滅**していた
+/// （tmuxview 空表示・tako 駆動スクロール無反応の共通根本原因。2026-06-12 実機）。
+/// ペイン側の CJK 対策（LC_CTYPE=UTF-8 既定注入）と同じ Terminal.app 方式で、
+/// クライアント側にも UTF-8 を明示する。LC_ALL は LC_CTYPE より優先されるため、
+/// 親から C が継承されても効くよう除去する
+pub(crate) fn tmux_command(socket: Option<&str>) -> Command {
     let mut command = Command::new(tmux_bin());
+    command.env_remove("LC_ALL").env("LC_CTYPE", "UTF-8");
     if let Some(name) = socket {
         command.args(["-L", name]);
     }
-    let output = command
+    command
+}
+
+/// tmux CLI 実行。サーバー未起動（list 系の "no server running"）はエラー文字列を返す
+/// （list 側で空扱いにする）。tmux バイナリ不在も同様
+pub(crate) fn run_tmux(socket: Option<&str>, args: &[&str]) -> Result<String, String> {
+    let output = tmux_command(socket)
         .args(args)
         .output()
         .map_err(|e| format!("tmux を実行できない: {e}"))?;
@@ -232,5 +248,92 @@ mod tests {
         let parsed = parse_sessions("only-name\nok\t1\t0\n", "broken\n", "broken\n");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].name, "ok");
+    }
+
+    /// tmux クライアント子プロセスに UTF-8 ロケールが必ず注入される
+    /// （Dock 起動の .app はロケール環境変数ゼロ → tmux 3.6 がタブ区切り出力の
+    /// TAB を `_` にサニタイズし全パースが沈黙全滅した 2026-06-12 実機バグの再発防止）
+    #[test]
+    fn tmux_commandはutf8ロケールを注入する() {
+        let command = tmux_command(Some("sock"));
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(
+            envs.contains(&("LC_CTYPE".into(), Some("UTF-8".into()))),
+            "LC_CTYPE=UTF-8 が注入されていない: {envs:?}"
+        );
+        assert!(
+            envs.contains(&("LC_ALL".into(), None)),
+            "LC_ALL が除去されていない（C 継承で LC_CTYPE が無効化される）: {envs:?}"
+        );
+    }
+
+    /// tmux 3.6 の実挙動の検証（カナリア）+ 修正の e2e:
+    /// C ロケールのクライアントはタブ区切り `-F` 出力の TAB を `_` に置換するが、
+    /// ロケール無し環境（Dock 起動の .app 相当）でも `run_tmux` 経由なら TAB が保持される
+    #[test]
+    #[cfg(unix)]
+    fn ロケール無し環境でもタブ区切り出力が壊れない() {
+        if !crate::tmux_backend::available() {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-loc-{}", std::process::id());
+        let _ = run_tmux(Some(&socket), &["new-session", "-d", "-s", "loc-e2e"]);
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::tmux_backend::kill_server(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(socket.clone());
+
+        // カナリア: C ロケールの素のクライアントでは TAB が `_` にサニタイズされる
+        // （この前提が崩れた = tmux 側の挙動変更。修正方針の再確認が要る）
+        let raw = Command::new(tmux_bin())
+            .env_remove("LANG")
+            .env_remove("LC_CTYPE")
+            .env("LC_ALL", "C")
+            .args([
+                "-L",
+                &socket,
+                "list-sessions",
+                "-F",
+                "#{session_name}\t#{session_created}",
+            ])
+            .output()
+            .expect("tmux を実行できる");
+        let raw = String::from_utf8_lossy(&raw.stdout);
+        assert!(
+            raw.contains("loc-e2e_") && !raw.contains('\t'),
+            "カナリア: C ロケールで TAB がサニタイズされる前提が崩れた: {raw:?}"
+        );
+
+        // 修正の本体: ロケール無しの親環境を模しても run_tmux は TAB を保持する
+        // （tmux_command が LC_CTYPE=UTF-8 を明示注入するため、親に依存しない）
+        let fixed = tmux_command(Some(&socket))
+            .env_remove("LANG")
+            .args(["list-sessions", "-F", "#{session_name}\t#{session_created}"])
+            .output()
+            .expect("tmux を実行できる");
+        let fixed = String::from_utf8_lossy(&fixed.stdout);
+        assert!(
+            fixed.contains("loc-e2e\t"),
+            "ロケール注入後も TAB が保持されない: {fixed:?}"
+        );
+
+        // データ取得層まで通しで: list_sessions がセッションをパースできる
+        let sessions = list_sessions(Some(&socket));
+        assert!(
+            sessions.iter().any(|s| s.name == "loc-e2e"),
+            "list_sessions がパースできない: {sessions:?}"
+        );
     }
 }

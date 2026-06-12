@@ -14,7 +14,6 @@
 //!   `~/.tmux.conf` は読まない（status バー・prefix キー等が見えない裏方に徹する）
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::OnceLock;
 
 use crate::paths::data_dir;
@@ -38,7 +37,7 @@ pub fn socket_name() -> String {
 pub fn available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        Command::new(crate::tmux::tmux_bin())
+        crate::tmux::tmux_command(None)
             .arg("-V")
             .output()
             .map(|o| o.status.success())
@@ -121,8 +120,8 @@ fn ensure_conf() -> PathBuf {
 /// アプリ起動時・persist 有効化時に呼ぶ。サーバー不在なら何もしない（起動もしない）
 pub fn sync_conf(socket: &str) {
     let conf = ensure_conf();
-    let _ = Command::new(crate::tmux::tmux_bin())
-        .args(["-L", socket, "source-file"])
+    let _ = crate::tmux::tmux_command(Some(socket))
+        .arg("source-file")
         .arg(&conf)
         .output();
 }
@@ -175,10 +174,8 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
 /// `list-panes` を使う（`display-message -p` はクライアント無しだと空を返す）。
 /// セッション未作成・tmux 不在では None（呼び出し側がリトライする）
 pub fn pane_tty(socket: &str, session: &str) -> Option<String> {
-    let output = Command::new(crate::tmux::tmux_bin())
+    let output = crate::tmux::tmux_command(Some(socket))
         .args([
-            "-L",
-            socket,
             "list-panes",
             "-t",
             &format!("={session}"),
@@ -207,8 +204,8 @@ pub fn kill_session(socket: &str, session: &str) {
 
 /// バックエンドサーバーごと落とす（セルフテストの後片付け用）
 pub fn kill_server(socket: &str) {
-    let _ = Command::new(crate::tmux::tmux_bin())
-        .args(["-L", socket, "kill-server"])
+    let _ = crate::tmux::tmux_command(Some(socket))
+        .arg("kill-server")
         .output();
 }
 
@@ -238,6 +235,7 @@ fn quote_word(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn 単語のクォートはシェル安全() {
