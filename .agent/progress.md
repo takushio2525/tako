@@ -215,3 +215,17 @@
   OS ウィンドウフレーム（サイズ・位置・fullscreen/maximized）を layout.json に追加し、
   起動時の WindowOptions へ適用（壊れた保存値は既定 960×600 へフォールバック）
 - セルフテスト 101 項目緑。この worker はここで引き継ぎ（未着手一覧は activeContext.md）
+
+## 2026-06-12（スクロール・キー実機バグ一括 + スクロール制御の方式転換）
+
+- 実機 4 バグ + 品質 2 点を根治: 時刻表示（tmux 3.6 copy-mode インジケータ → 空書式 +
+  sync_conf で稼働サーバーへ conf 再適用）/ ホイール無反応・Shift+Enter（根因は
+  ネスト tmux の既定値。~/.tmux.conf 整備 = NESTED_TMUX_SNIPPET、extended-keys は
+  always 必須を実測特定、FR-2.17 要件化）/ トラックパッド端数蓄積
+- スクロール制御を方式転換: tako-core::scroll 新設（実体解決 = tty 突き合わせ、
+  copy-mode を正確な行数で駆動、キー入力前 cancel = iTerm2 流、カーソル抑止、
+  iTerm2 流フェードスクロールバー、CLI / MCP 同一経路）。コアレッシングでヌルヌル化
+- 関連コミット: `6b04806` `b0301b0` `4ca3ae3` `de85fb1`。セルフテスト 105 項目緑・
+  .app を /Applications へ反映済み
+- 次: ユーザー実機確認（manual-checks「スクロール・キー実機バグ一括」節）→
+  パネル UI 系タスク（ユーザーから別途）or Phase 5 再開（FR-3.2）
