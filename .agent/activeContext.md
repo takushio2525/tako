@@ -41,6 +41,17 @@
 `panel_state()`・`set_panel()`（3079 行付近）、`tako-control` の `protocol.rs::PanelViewWire` +
 `dispatch.rs::Panel` + `mcp.rs::tako_panel`、ファイルツリーは `filetree.rs` + cmd+B（3628 行付近）。
 
+## 既知バグ（次の worker が修正）
+
+- [ ] **Escape で「27u」が入力欄に挿入されることがある**（2026-06-12 報告）。
+  extended-keys（CSI u）対応の副作用: ESC のキーコード 27 の CSI-u エンコード断片
+  （`CSI 27;1u` 等）がチェーンのどこかで解釈されず、エスケープ部分だけ食われて
+  残りが文字として漏れている。tako の kitty / CSI-u 対応（`handle_key` の CSI u 送出・
+  disambiguate 常時 ON）とネスト tmux の extended-keys 設定
+  （`NESTED_TMUX_SNIPPET` の always / extkeys）の整合を調査して直すこと。
+  関連: `architecture.md`「スクロール制御」節 + FR-2.17 の実装メモ（CSI u の罠）、
+  core e2e の CSI u 往復テスト（tmux_backend / scroll）
+
 ## 未着手タスク（優先順はユーザーと相談）
 
 - [ ] **パネル UI 刷新（FR-2.16.4〜2.16.7）** ← 次の実装タスク（上記）
