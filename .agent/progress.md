@@ -197,3 +197,14 @@
   幅調整・`tako panel` + MCP `tako_panel` = 20 ツール）+ ペインタイトルバー（FR-2.1.3 更新）
 - セルフテスト 98 項目緑（63 明示コマンド split / 64 panel CLI 追加）
 - 次: .app 反映 → ユーザー実機確認（manual-checks「実機リグレッション修正一括」節）
+
+## 2026-06-12（P0: CJK 全滅 + バグ (8) 接続競合 + 復元失敗の解明）
+
+- P0 CJK: ロケール無し環境（Finder 起動）で tmux クライアントが CJK を _ 置換していた。
+  backend tmux に -u + ペイン env に LC_CTYPE=UTF-8 既定注入（Terminal.app 方式）。
+  LC_ALL=C 強制の e2e で回帰防止
+- バグ (8): discovery を instances/ + current 構成に。CLI は生存候補へ自動フォールバック
+  （除外キーは socket+token ペア）。セルフテストは TAKO_DISCOVERY_DIR で完全隔離 + 項目 65
+- 再起動復元失敗の根因 = 旧ビルドの PATH 問題で layout.json が未保存（保存条件不成立）。
+  現ビルドで解消を**実 .app の隔離 HOME e2e**（起動→kill→マーカー→再起動→復元+CLI 到達）で実証
+- 次: ユーザー再起動（今回は復元なし・次回から効く）/ 残: ユーザー実機確認
