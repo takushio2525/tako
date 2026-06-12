@@ -633,6 +633,11 @@ impl TakoApp {
                 .spawn(async move { tako_core::ports::scan(&rdevs) })
                 .await;
             let result = this.update(cx, |app: &mut TakoApp, cx| {
+                // スキャン中に無効化（portdetect off）が割り込んだら結果を破棄する
+                // （クリア済みの listen_ports / チップを古い結果で再汚染しない）
+                if !app.port_detect {
+                    return;
+                }
                 let mut changed = false;
                 for (pane, rdev) in &ttys {
                     let Some(session) = app.terminals.get_mut(pane) else {
@@ -1162,6 +1167,7 @@ impl TakoApp {
                 if std::env::var_os("TAKO_SELF_TEST").is_none() {
                     tako_control::layout::remove();
                 }
+                tako_control::discovery::cleanup(std::process::id());
                 cx.quit();
             }
         }
@@ -3238,8 +3244,10 @@ impl Render for TakoApp {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &Quit, _, cx| {
-                // 終了直前の構成を保存してから抜ける（Phase 5.5。セッションは残る = 永続化）
+                // 終了直前の構成を保存してから抜ける（Phase 5.5。セッションは残る = 永続化）。
+                // 接続情報は片付け、死んだ接続先を CLI の候補に残さない（バグ (8)）
                 this.save_layout();
+                tako_control::discovery::cleanup(std::process::id());
                 cx.quit()
             }))
             .on_action(cx.listener(|this, _: &ActivateTab1, _, cx| this.activate_tab_index(0, cx)))
@@ -3293,6 +3301,17 @@ fn main() {
         std::env::set_var(
             "TAKO_TMUX_SOCKET",
             format!("tako-st-{}", std::process::id()),
+        );
+    }
+    // セルフテストの接続情報はメインの control.json に**触らない**（2026-06-12 バグ (8):
+    // 一時インスタンスの上書き → exit でメインへの CLI / MCP 接続が全断した）。
+    // 専用一時ディレクトリへ隔離し、ペイン内 CLI も env 継承で同じ場所を見る
+    if std::env::var_os("TAKO_SELF_TEST").is_some()
+        && std::env::var_os("TAKO_DISCOVERY_DIR").is_none()
+    {
+        std::env::set_var(
+            "TAKO_DISCOVERY_DIR",
+            std::env::temp_dir().join(format!("tako-st-discovery-{}", std::process::id())),
         );
     }
     application().run(|cx: &mut App| {
@@ -5276,6 +5295,40 @@ mod self_test {
                 })
                 .unwrap_or(false);
             check(panel_synced, "panel 操作が UI 状態へ反映");
+
+            // 65. 接続情報の上書き競合（2026-06-12 バグ (8) の回帰）: 一時インスタンスが
+            //     current（control.json）を上書きして exit した状況を再現し、env なしの
+            //     CLI が候補列経由で**生きているインスタンス**へ自動フォールバックする
+            //     （置き場は TAKO_DISCOVERY_DIR の隔離ディレクトリ。メインには触らない）
+            let poisoned = tako_control::discovery::write(&tako_control::discovery::ControlInfo {
+                version: 1,
+                pid: 999_999,
+                socket: "/tmp/tako-dead-instance.sock".into(),
+                token: "stale-token".into(),
+                mcp_url: None,
+            })
+            .is_ok();
+            check(poisoned, "current の汚染書き込み（バグ (8) 再現準備）");
+            press(any, cx, "ctrl-u");
+            type_text(
+                any,
+                cx,
+                &format!(
+                    "env -u TAKO_SOCKET -u TAKO_TOKEN {cli} list >/dev/null \
+                     && echo TAKO-DSC-$((60+5))"
+                ),
+                true,
+            );
+            wait(cx, 1500).await;
+            check(
+                focused_contains(window, cx, "TAKO-DSC-65"),
+                "汚染された current から生存インスタンスへフォールバック",
+            );
+
+            // 後片付け: 隔離した接続情報ディレクトリを消す
+            if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
+                let _ = std::fs::remove_dir_all(dir);
+            }
 
             println!("TAKO_APP_SELF_TEST_OK");
             std::process::exit(0);

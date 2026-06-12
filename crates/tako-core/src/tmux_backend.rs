@@ -91,6 +91,10 @@ fn ensure_conf() -> PathBuf {
 /// `options.cwd` は `-c` で渡す（既存セッションへの attach では tmux が無視する）
 pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> SpawnOptions {
     let mut args = vec![
+        // UTF-8 を強制する。Finder 起動の .app は LANG / LC_CTYPE が無く、tmux が
+        // 非 UTF-8 クライアント扱いで CJK を `_` に置換してしまう（2026-06-12 P0:
+        // 日本語が全滅した実機リグレッション）。ロケール非依存の -u が確実
+        "-u".to_string(),
         "-L".to_string(),
         socket.to_string(),
         "-f".to_string(),
@@ -478,6 +482,59 @@ mod tests {
         assert!(
             esc_delivered,
             "Esc（CSI 27u）が tmux 越しに届かない。画面: {:?}",
+            session.visible_lines().join("\n")
+        );
+    }
+
+    /// CJK が tmux 越しでも描画される e2e（2026-06-12 P0 リグレッションの再発防止）。
+    /// Finder 起動の .app はロケール環境変数が無い（= POSIX ロケール）。それを LC_ALL=C の
+    /// 強制で再現し、`-u`（UTF-8 強制）が効いて日本語が `_` に置換されないことを検証する
+    #[test]
+    #[cfg(unix)]
+    fn cjkはロケール無し環境でもtmux越しに描画される() {
+        if !available() {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-cjk-{}", std::process::id());
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                kill_server(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(socket.clone());
+        let options = SpawnOptions {
+            // 出力経路を直接検証する（タイプ入力を経由しない）: 日本語を printf して待機
+            command: Some(SpawnCommand {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "printf '日本語テストOK\\n'; exec sleep 30".into(),
+                ],
+            }),
+            cwd: Some(std::env::temp_dir()),
+            // .app（Finder 起動）のロケール無し環境を再現する（テスト実行シェルの
+            // LANG を C で上書き。子プロセスへは合成 env が優先で渡る）
+            env: vec![("LC_ALL".into(), "C".into()), ("LANG".into(), "C".into())],
+        };
+        let (session, _rx) =
+            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-cjk"))
+                .expect("tmux クライアントを spawn できる");
+        for _ in 0..100 {
+            let lines = session.visible_lines().join("\n");
+            if lines.contains("日本語テストOK") {
+                return; // CJK がそのまま描画された
+            }
+            // tmux が非 UTF-8 扱いすると _ に置換される（P0 の症状）
+            assert!(
+                !lines.contains("____"),
+                "CJK が _ に置換されている（tmux のロケール退行）。画面: {lines:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!(
+            "CJK 出力が現れない。画面: {:?}",
             session.visible_lines().join("\n")
         );
     }

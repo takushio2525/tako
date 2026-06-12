@@ -117,6 +117,18 @@ pub fn login_shell_command(command: SpawnCommand) -> SpawnCommand {
     command
 }
 
+/// ロケール既定注入の純粋ロジック（テスト用に env 参照と分離）。
+/// LANG / LC_ALL / LC_CTYPE のどれも継承されないときだけ `LC_CTYPE=UTF-8` を返す
+fn default_locale_env(
+    lang: Option<std::ffi::OsString>,
+    lc_all: Option<std::ffi::OsString>,
+    lc_ctype: Option<std::ffi::OsString>,
+) -> Option<(String, String)> {
+    let unset = |v: &Option<std::ffi::OsString>| v.as_deref().is_none_or(|s| s.is_empty());
+    (unset(&lang) && unset(&lc_all) && unset(&lc_ctype))
+        .then(|| ("LC_CTYPE".to_string(), "UTF-8".to_string()))
+}
+
 /// `default_home_dir` の純粋ロジック（テスト用に env 参照と分離）。
 /// `$HOME` を優先し、無ければ `%USERPROFILE%`。どちらも空なら None
 fn home_from(
@@ -249,6 +261,17 @@ impl TerminalSession {
             ("TERM".to_string(), "xterm-256color".to_string()),
             ("COLORTERM".to_string(), "truecolor".to_string()),
         ]);
+        // ロケール未設定（Finder 起動の .app はプロセス環境に LANG が無い）だと、
+        // ペイン内で起動した tmux クライアントが非 UTF-8 扱いになり CJK を `_` に
+        // 置換する（2026-06-12 P0: 日本語全滅）。Terminal.app と同じく LC_CTYPE だけ
+        // UTF-8 を既定注入する（メッセージ言語は変えない。継承 env / options.env が優先）
+        if let Some((key, value)) = default_locale_env(
+            std::env::var_os("LANG"),
+            std::env::var_os("LC_ALL"),
+            std::env::var_os("LC_CTYPE"),
+        ) {
+            env.insert(key, value);
+        }
         // シェル統合（OSC 7/133 発行）の自動注入。options.env が常に優先
         env.extend(crate::shell_integration::env().iter().cloned());
         env.extend(options.env);
@@ -772,6 +795,31 @@ mod tests {
         assert_eq!(paste_payload("a\nb", false), b"a\rb".to_vec());
         assert_eq!(paste_payload("a\r\nb", false), b"a\rb".to_vec());
         assert_eq!(paste_payload("x", true), b"\x1b[200~x\x1b[201~".to_vec());
+    }
+
+    #[test]
+    fn ロケール既定はどれも未設定のときだけ注入される() {
+        use std::ffi::OsString;
+        let utf8 = Some(("LC_CTYPE".to_string(), "UTF-8".to_string()));
+        // 全部未設定 / 空 → 注入（.app の Finder 環境）
+        assert_eq!(default_locale_env(None, None, None), utf8);
+        assert_eq!(
+            default_locale_env(Some(OsString::new()), None, Some(OsString::new())),
+            utf8
+        );
+        // どれか 1 つでも設定済みなら触らない（ターミナル起動・ユーザー設定を尊重）
+        assert_eq!(
+            default_locale_env(Some(OsString::from("ja_JP.UTF-8")), None, None),
+            None
+        );
+        assert_eq!(
+            default_locale_env(None, Some(OsString::from("C")), None),
+            None
+        );
+        assert_eq!(
+            default_locale_env(None, None, Some(OsString::from("UTF-8"))),
+            None
+        );
     }
 
     #[test]

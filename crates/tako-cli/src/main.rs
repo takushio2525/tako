@@ -536,34 +536,42 @@ fn send_request(request: Request) -> Result<Value, String> {
 
 /// 接続情報の解決とフォールバック（FR-2.2.9）。
 /// ①環境変数（`TAKO_SOCKET` / `TAKO_TOKEN`）で試行し、接続不可・認証失敗
-/// （= アプリ再起動で env が古い）なら ②発見ファイル（`discovery`）で再試行する。
-/// 操作エラーはフォールバックせずそのまま返す。どちらの情報源も無ければ「tako の外」
+/// （= アプリ再起動で env が古い）なら ②発見ファイルの候補列（current →
+/// 生きているインスタンス。`discovery::read_candidates`）を順に再試行する。
+/// 一時インスタンス（セルフテスト・二重起動）が current を上書きして exit しても、
+/// 生きているメインへ自動で届く（2026-06-12 バグ (8) の恒久対策）。
+/// 操作エラーはフォールバックせずそのまま返す。どの情報源も無ければ「tako の外」
 fn send_request_via(request: Request, origin: Option<&str>) -> Result<Value, String> {
     let env_pair = match (std::env::var("TAKO_SOCKET"), std::env::var("TAKO_TOKEN")) {
         (Ok(socket), Ok(token)) if !socket.is_empty() && !token.is_empty() => Some((socket, token)),
         _ => None,
     };
-    let env_failure = match &env_pair {
-        Some((socket, token)) => {
-            match transport::roundtrip(socket, token, request.clone(), origin) {
-                Ok(value) => return Ok(value),
-                Err(TransportError::Other(message)) => return Err(message),
-                Err(stale) => Some(stale),
-            }
+    let mut last_failure = None;
+    if let Some((socket, token)) = &env_pair {
+        match transport::roundtrip(socket, token, request.clone(), origin) {
+            Ok(value) => return Ok(value),
+            Err(TransportError::Other(message)) => return Err(message),
+            Err(stale) => last_failure = Some(stale),
         }
-        None => None,
-    };
-    // 環境変数と同じ内容のファイルへ再試行しても無意味なので除外する
-    let file_info = tako_control::discovery::read().filter(|info| {
-        env_pair
-            .as_ref()
-            .is_none_or(|(s, t)| (s, t) != (&info.socket, &info.token))
-    });
-    if let Some(info) = file_info {
-        return transport::roundtrip(&info.socket, &info.token, request, origin)
-            .map_err(TransportError::message);
     }
-    Err(match env_failure {
+    // 試行済みと同一内容の候補へ再試行しても無意味なので除外する。
+    // 除外キーは (socket, token) ペア（socket だけで除外すると「正しいソケット +
+    // 古いトークン」の認証失敗から正トークンで再試行できなくなる）
+    let mut tried: Vec<(String, String)> = env_pair.iter().cloned().collect();
+    for info in tako_control::discovery::read_candidates() {
+        let key = (info.socket.clone(), info.token.clone());
+        if tried.contains(&key) {
+            continue;
+        }
+        tried.push(key);
+        match transport::roundtrip(&info.socket, &info.token, request.clone(), origin) {
+            Ok(value) => return Ok(value),
+            Err(TransportError::Other(message)) => return Err(message),
+            // 死んだ残骸・別インスタンスのトークン → 次の候補へ
+            Err(stale) => last_failure = Some(stale),
+        }
+    }
+    Err(match last_failure {
         Some(stale) => stale.message(),
         None => OUTSIDE_TAKO.to_string(),
     })
