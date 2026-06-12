@@ -6,12 +6,14 @@
 
 ## 現在の対象
 
-- 何を / どこを: **Phase 5.5（tmux バックエンド永続化）完了（2026-06-12）**。
-  全ペインを `tmux -L tako` のセッションとして保持し、再起動でタブ構成・実行中
-  プロセス・画面内容ごと復元する（FR-5 再設計済み）。`tako persist` / MCP
-  `tako_persist`（計 19 ツール）で OFF 可。tmux 不在では直接 spawn へ無害劣化
-- ステータス: セルフテスト 95 項目緑・core e2e（detach→再 attach / OSC パススルー）緑・
-  コミット / push 済み。**/Applications の .app 更新済み = ユーザーは再起動してよい**
+- 何を / どこを: **Phase 5.5 完了 + 実機リグレッション一括修正（2026-06-12）**。
+  ① tmux_bin のログインシェル解決（.app の最小 PATH で tmuxview 空 / バックエンド沈黙劣化
+  / 明示コマンド split 失敗の根本原因）② マウス / CSI u の tmux 越し生配送保証
+  （バックエンドペインは disambiguate 常時 ON + conf `extended-keys-format csi-u`）
+  ③ IME 候補位置を shaping 化（全角行のずれ根治）④ 固定タブ 0 個化 = 右サイドバー
+  情報パネル（tmux / agents 内部タブ、ドラッグ幅調整、`tako panel` / MCP `tako_panel` =
+  計 20 ツール）⑤ ペインタイトルバー（× + 状態ドット + リネーム名）
+- ステータス: セルフテスト 98 項目緑・core e2e 4 本緑。.app 反映は本ターン末尾参照
 - 最終更新: 2026-06-12
 
 ## 次の一手 = Phase 5 再開（FR-3.2 コードプレビュー + `tako_open_file`）
@@ -22,7 +24,7 @@
    `default-syntaxes` / `default-themes`。oniguruma の C 依存回避 = Windows CI 配慮）。
    **`Highlighter` trait で抽象化**し将来 tree-sitter へ差し替え可能に（ユーザー指示）
 3. dispatch `OpenFile { pane, path }` + CLI `tako open <path>` + MCP `tako_open_file`
-   （開発不変条件。ツール 20 個目）
+   （開発不変条件。ツール 21 個目）
 4. `main.rs` の `open_file_row()` が**プレースホルダで待っている**
    （ファイルツリーのファイル行クリック → ここからプレビューを開く）
 - その後: FR-3.3 Markdown（pulldown-cmark）→ FR-3.6 git graph（git CLI 子プロセス、
@@ -46,8 +48,9 @@
   トグルは dispatch 経由（`tako autorename` / `tako portdetect` / `tako persist` + MCP）
 - **描画とグリッドのずれ（残課題）**: 全角 advance ≠ セル幅 ×2。座標変換は shaping で
   吸収済み、描画自体は未対応
-- セルフテストは **95 項目**。IME 項目はタイミングで稀にフレーク（再実行で緑）。
-  tmux 項目は隔離ソケット（`TAKO_TMUX_SOCKET=tako-st-<pid>`）+ 終了時 kill-server
+- セルフテストは **98 項目**。IME 項目はタイミングで稀にフレーク（再実行で緑）。
+  tmux 項目は隔離ソケット（`TAKO_TMUX_SOCKET=tako-st-<pid>`）+ 終了時 kill-server。
+  ファイルツリー root 追従はオクルージョン対策で render 非依存化済み（sync_filetree_root）
 - gpui ソース参照は `~/.cargo/git/checkouts/zed-*/cafbf4b/crates/gpui*` のみ（Apache-2.0）
 
 ## 現フェーズで Read すべき設計書
@@ -58,8 +61,8 @@
 ## 未解決・次の一手
 
 - [ ] Phase 5 再開: FR-3.2 コードプレビュー + tako_open_file（上記）
-- [ ] 常用確認: manual-checks.md「tmux バックエンド永続化」節（再起動復元 / AI 操作継続 /
-      スクロール体感 / ネスト tmux / persist off）
+- [ ] 常用確認: manual-checks.md「tmux バックエンド永続化」+「実機リグレッション修正一括」節
+      （再起動復元 / claude のホイール・Shift+Enter / IME 位置 / パネル / タイトルバー）
 - [ ] たまり場（FR-2.15）: UI の見せ方をユーザーと相談（実装は当分先で OK）
 - [ ] 描画のグリッド不一致の根本対応の要否を常用で判断
 

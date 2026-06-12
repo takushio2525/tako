@@ -417,6 +417,22 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_panel",
+            "description": "右サイドバー情報パネル（tmux セッション一覧 / エージェント集約センター）\
+                の表示・非表示・幅・ビューを切り替える（全省略で現在状態の取得）。\
+                ユーザーに tmux の状況やエージェントの状態を見せたいとき view を選んで表示し、\
+                邪魔なら隠す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "visible": { "type": "boolean", "description": "true = 表示、false = 非表示" },
+                    "width": { "type": "number", "exclusiveMinimum": 0, "description": "パネル幅（px）" },
+                    "view": { "type": "string", "enum": ["tmux", "agents"], "description": "表示するビュー" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_persist",
             "description": "セッション永続化 = tmux バックエンド（FR-5）の ON/OFF を切り替える\
                 （enabled 省略時は現在状態の取得のみ）。有効時、各ペインは tako 専用 tmux\
@@ -559,6 +575,16 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
         },
         "tako_persist" => Request::Persist {
             enabled: bool_arg(args, "enabled")?,
+        },
+        "tako_panel" => Request::Panel {
+            visible: bool_arg(args, "visible")?,
+            width: f32_arg(args, "width")?,
+            view: match str_arg(args, "view")?.as_deref() {
+                None => None,
+                Some("tmux") => Some(crate::protocol::PanelViewWire::Tmux),
+                Some("agents") => Some(crate::protocol::PanelViewWire::Agents),
+                Some(other) => return Err(format!("view が不正: {other}（tmux | agents）")),
+            },
         },
         _ => return Err(format!("不明なツール: {name}")),
     })
@@ -875,7 +901,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 20);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

@@ -159,3 +159,20 @@ role / title の設定・取得自体はセルフテスト（`tako title / role 
       `on` に戻すと新規ペインが再び永続化される
 - [ ] 異常系: `tmux -L tako kill-server` で全セッションを消してから tako を起動しても、
       レイアウトだけ復元され各ペインは保存 cwd の新しいシェルで開く（落ちない）
+
+## 実機リグレッション修正一括（2026-06-12 夕）
+
+tmux バイナリ解決・マウス / CSI u の生配送・明示コマンド split・IME 位置は機械検証済み
+（core e2e + セルフテスト 63〜64）。実 .app で以下を確認:
+
+- [ ] **Dock 起動の .app で** tmuxview（パネル tmux ビュー）に既定サーバーのセッションが出る
+      + `tako persist` が `"available":true`（tmux_bin のログインシェル解決）
+- [ ] バックエンドペインの claude 内でホイール → チャットが遡れる（copy-mode）。
+      入力履歴が暴発しない（矢印キー化の根絶）
+- [ ] バックエンドペインの claude で Shift+Enter 改行が効く（CSI u 強制 + csi-u 形式）
+- [ ] 日本語の長文入力で IME 候補ウィンドウがカーソル直下に出続ける（全角行の shaping 位置）
+- [ ] `tako split --pane N --down -- tmux attach -t xxx` が通る（ログインシェル経由実行）
+- [ ] 右サイドバーパネル: タブバー右端の「◧ panel」で開閉、左端ドラッグで幅調整、
+      内部タブ tmux ⇔ agents 切替、`tako panel --show --view agents` でも操作できる
+- [ ] ペインタイトルバー: × で閉じる・状態ドット・リネーム名が出る。タイトルバーの
+      クリックでフォーカス移動（選択は始まらない）

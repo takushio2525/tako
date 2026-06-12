@@ -49,6 +49,18 @@ pub trait ControlHost {
     fn backend_session(&self, _pane: PaneId) -> Option<String> {
         None
     }
+    /// 右サイドバー情報パネルの状態 (visible, width, view)
+    fn panel_state(&self) -> (bool, f32, crate::protocol::PanelViewWire) {
+        (false, 0.0, crate::protocol::PanelViewWire::Tmux)
+    }
+    /// 右サイドバー情報パネルの操作（None の項目は変更しない）
+    fn set_panel(
+        &mut self,
+        _visible: Option<bool>,
+        _width: Option<f32>,
+        _view: Option<crate::protocol::PanelViewWire>,
+    ) {
+    }
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -435,6 +447,27 @@ pub fn dispatch(
                 "enabled": host.tmux_persist_enabled(),
                 // tmux 不在環境では enabled でも直接 spawn へ劣化していることを示す
                 "available": tako_core::tmux_backend::available(),
+            }))
+        }
+
+        Request::Panel {
+            visible,
+            width,
+            view,
+        } => {
+            if let Some(w) = width {
+                if !w.is_finite() || w <= 0.0 {
+                    return Err(DispatchError::InvalidParams(
+                        "width は正の数（px）を指定する".into(),
+                    ));
+                }
+            }
+            host.set_panel(visible, width, view);
+            let (visible, width, view) = host.panel_state();
+            Ok(json!({
+                "visible": visible,
+                "width": width,
+                "view": view.as_str(),
             }))
         }
     }

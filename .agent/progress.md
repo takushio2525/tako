@@ -184,3 +184,16 @@
   render 依存でオクルージョン中にフレークする既存問題も修正（sync_filetree_root）
 - FR-2.15「ターミナルのたまり場」を要件登録（実装は UI 相談後）。FR-2.14.5 / コンセプト追記
 - 次: .app 反映（build-app.sh --install）→ ユーザー再起動 OK / Phase 5 再開は FR-3.2 から
+
+## 2026-06-12（実機リグレッション一括修正 + 情報パネル化）
+
+- 根本修正: tmux_bin ログインシェル解決（.app 最小 PATH が tmuxview 空・バックエンド沈黙
+  劣化・明示コマンド split 失敗の共通原因）/ 明示コマンドは `$SHELL -l -c` 経由に
+- マウス・キー保証: 「マウス要求アプリへ生 SGR 配送」「alt-screen 非マウスでホイールが
+  矢印化しない」「CSI u（Shift+Enter / Esc）の tmux 越し往復」を core e2e 化。
+  バックエンドペインは disambiguate 常時 ON + conf に extended-keys-format csi-u
+- IME 候補位置: pane_cursor_origin を shaping 化（全角行で右へずれる根本原因）
+- UI: 固定タブ 0 個 → 右サイドバー情報パネル（FR-2.16。tmux / agents 内部タブ・ドラッグ
+  幅調整・`tako panel` + MCP `tako_panel` = 20 ツール）+ ペインタイトルバー（FR-2.1.3 更新）
+- セルフテスト 98 項目緑（63 明示コマンド split / 64 panel CLI 追加）
+- 次: .app 反映 → ユーザー実機確認（manual-checks「実機リグレッション修正一括」節）

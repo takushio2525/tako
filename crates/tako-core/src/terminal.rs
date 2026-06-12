@@ -90,6 +90,33 @@ pub(crate) fn default_shell() -> Option<SpawnCommand> {
     None
 }
 
+/// 明示コマンド（`tako split -- <command>` 等）をログインシェル経由の実行に包む。
+/// .app（Dock 起動）のプロセス環境は PATH が最小構成（/usr/bin:/bin:…）のため、
+/// コマンドを直接 exec すると Homebrew の `tmux` や `npm` が見つからず PTY 生成に
+/// 失敗する（2026-06-12 実機リグレッション）。`$SHELL -l -c "<コマンド>"` にして
+/// ユーザーの PATH・環境変数で実行する
+#[cfg(unix)]
+pub fn login_shell_command(command: SpawnCommand) -> SpawnCommand {
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/bin/sh".into());
+    SpawnCommand {
+        program: shell,
+        args: vec![
+            "-l".into(),
+            "-c".into(),
+            crate::tmux_backend::shell_quoted(&command),
+        ],
+    }
+}
+
+/// Windows は PATH 探索が CreateProcess 任せのためそのまま（Phase 6 で精査）
+#[cfg(windows)]
+pub fn login_shell_command(command: SpawnCommand) -> SpawnCommand {
+    command
+}
+
 /// `default_home_dir` の純粋ロジック（テスト用に env 参照と分離）。
 /// `$HOME` を優先し、無ければ `%USERPROFILE%`。どちらも空なら None
 fn home_from(
@@ -372,6 +399,12 @@ impl TerminalSession {
             .lock()
             .mode()
             .contains(TermMode::DISAMBIGUATE_ESC_CODES)
+    }
+
+    /// mouse reporting が要求されているか（ホイール転送の出し分けと同じ判定。
+    /// tmux バックエンドの e2e 検証・デバッグ用）
+    pub fn mouse_reporting(&self) -> bool {
+        self.term.lock().mode().intersects(TermMode::MOUSE_MODE)
     }
 
     pub fn scroll_to_bottom(&self) {

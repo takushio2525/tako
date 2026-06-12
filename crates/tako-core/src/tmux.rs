@@ -9,6 +9,67 @@
 //! コマンド実行は薄いラッパに分離してある。tmux 不在・サーバー未起動は空一覧で無害に劣化する。
 
 use std::process::Command;
+use std::sync::OnceLock;
+
+/// tmux バイナリの場所（プロセス内で 1 回だけ解決してキャッシュする）。
+/// Dock 起動の .app は PATH が最小構成（/usr/bin:/bin:…）で Homebrew の tmux が
+/// 見えない（2026-06-12 実機リグレッション: tmuxview が空 + バックエンド永続化が
+/// 沈黙劣化）。解決順: `TAKO_TMUX_BIN` → PATH → 既知の場所 → ログインシェルの
+/// `command -v`（autorename の claude 解決と同じ手口）。不在なら "tmux" を返し、
+/// 呼び出し側は実行失敗として無害に劣化する
+pub fn tmux_bin() -> &'static str {
+    static BIN: OnceLock<String> = OnceLock::new();
+    BIN.get_or_init(resolve_tmux_bin)
+}
+
+fn resolve_tmux_bin() -> String {
+    if let Some(bin) = std::env::var_os("TAKO_TMUX_BIN") {
+        if !bin.is_empty() {
+            return bin.to_string_lossy().into_owned();
+        }
+    }
+    // PATH 直（ターミナルからの起動・開発時はこれで足りる）
+    if Command::new("tmux")
+        .arg("-V")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return "tmux".into();
+    }
+    // 既知の場所（Homebrew arm64 / Intel / MacPorts）
+    for candidate in [
+        "/opt/homebrew/bin/tmux",
+        "/usr/local/bin/tmux",
+        "/opt/local/bin/tmux",
+    ] {
+        if std::path::Path::new(candidate).is_file() {
+            return candidate.into();
+        }
+    }
+    // ログインシェル経由でユーザーの PATH を引く（unix のみ）
+    #[cfg(unix)]
+    {
+        let shell = std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/bin/sh".into());
+        if let Ok(output) = Command::new(shell)
+            .args(["-l", "-c", "command -v tmux"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() && std::path::Path::new(&path).is_file() {
+                    return path;
+                }
+            }
+        }
+    }
+    "tmux".into()
+}
 
 /// tmux の 1 window
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +140,7 @@ pub fn kill_window(socket: Option<&str>, session: &str, window: u32) -> Result<(
 /// tmux CLI 実行。サーバー未起動（list 系の "no server running"）はエラー文字列を返す
 /// （list 側で空扱いにする）。tmux バイナリ不在も同様
 fn run_tmux(socket: Option<&str>, args: &[&str]) -> Result<String, String> {
-    let mut command = Command::new("tmux");
+    let mut command = Command::new(tmux_bin());
     if let Some(name) = socket {
         command.args(["-L", name]);
     }

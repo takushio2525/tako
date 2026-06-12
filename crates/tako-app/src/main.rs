@@ -58,6 +58,22 @@ const SCROLLBAR_WIDTH: f32 = 10.0;
 /// 左サイドバー（ファイルツリー）の幅（px。FR-3.1）
 const SIDEBAR_WIDTH: f32 = 220.0;
 
+/// 右サイドバー（情報パネル）の既定幅・最小幅（px。ドラッグで可変）
+const PANEL_DEFAULT_WIDTH: f32 = 340.0;
+const PANEL_MIN_WIDTH: f32 = 220.0;
+
+/// ペイン上部タイトルバーの高さ（px。iTerm2 風: × ボタン + ペイン名）
+const PANE_TITLE_BAR: f32 = 22.0;
+
+/// 右サイドバー情報パネルの内部タブ（固定タブ 0 個方針。2026-06-12）。
+/// 将来 git graph（FR-3.6）もここに足す（パネルは切り替え式コンテナとして設計）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PanelView {
+    #[default]
+    Tmux,
+    Agents,
+}
+
 actions!(
     tako,
     [
@@ -297,15 +313,20 @@ struct TakoApp {
     dragging_border: Option<DragBorder>,
     /// スクロールバーをドラッグ中のペイン
     dragging_scrollbar: Option<PaneId>,
-    /// tmuxview タブ（FR-2.13）を表示中か。タブモデルには入れない固定 UI 状態
-    tmuxview_active: bool,
+    /// 右サイドバー情報パネル（tmux 一覧 FR-2.13 / 集約センター FR-2.10）の表示状態。
+    /// 表示・幅・ビューは dispatch（CLI / MCP の `tako panel`）からも操作できる
+    panel_visible: bool,
+    /// パネルの表示中ビュー（内部タブ）
+    panel_view: PanelView,
+    /// パネル幅（px。左端ハンドルのドラッグで可変）
+    panel_width: f32,
+    /// パネル左端の境界をドラッグ中か
+    dragging_panel: bool,
     /// tmux 一覧の最新スナップショット（dispatch の TmuxList 結果。表示は描画側の責務）
     tmux_sessions: Vec<serde_json::Value>,
     /// kill の確認待ち（セッション名, window index, tmux サーバー名）。誤爆防止（FR-2.13.3）。
     /// サーバー名は tako バックエンド（Phase 5.5）のセッションを kill するときに使う
     tmux_pending_kill: Option<(String, Option<u32>, Option<String>)>,
-    /// 集約センター（FR-2.10）を表示中か。tmuxview と同じ固定タブ UI 状態
-    agents_view_active: bool,
     /// 左サイドバーのファイルツリー（FR-3.1 / FR-3.7。cmd+B でトグル）
     filetree: filetree::FileTree,
     /// タブ・ペイン名の AI 自動リネームの検知状態（FR-2.12。ループは new で張る）
@@ -447,10 +468,12 @@ impl TakoApp {
             ime: None,
             dragging_border: None,
             dragging_scrollbar: None,
-            tmuxview_active: false,
+            panel_visible: false,
+            panel_view: PanelView::default(),
+            panel_width: PANEL_DEFAULT_WIDTH,
+            dragging_panel: false,
             tmux_sessions: Vec::new(),
             tmux_pending_kill: None,
-            agents_view_active: false,
             filetree: filetree::FileTree::default(),
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
             port_detect: initial_port_detect(),
@@ -533,12 +556,12 @@ impl TakoApp {
         })
         .detach();
 
-        // tmuxview 表示中は 2 秒毎に一覧を更新する（FR-2.13。表示していない間は何もしない）。
+        // パネルの tmux 一覧表示中は 2 秒毎に更新する（FR-2.13。非表示中は何もしない）。
         // ファイルツリー（FR-3.1）の内容追従も同じ間隔で行う
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(2)).await;
             let result = this.update(cx, |app: &mut TakoApp, cx| {
-                if app.tmuxview_active {
+                if app.panel_visible && app.panel_view == PanelView::Tmux {
                     app.refresh_tmux(cx);
                 }
                 app.sync_filetree_root();
@@ -846,10 +869,8 @@ impl TakoApp {
     }
 
     /// 集約センターからのジャンプ（FR-2.10.2）。CLI / MCP と同じコマンド層
-    /// （dispatch の Focus = タブ切替も伴う）を通す
+    /// （dispatch の Focus = タブ切替も伴う）を通す。パネルは開いたまま
     fn jump_to_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
-        self.agents_view_active = false;
-        self.tmuxview_active = false;
         let result = tako_control::dispatch(
             self,
             tako_control::protocol::Request::Focus {
@@ -866,6 +887,12 @@ impl TakoApp {
 
     /// tmux 一覧を更新する。UI も CLI / MCP と同じコマンド層（dispatch）を通す
     fn refresh_tmux(&mut self, cx: &mut Context<Self>) {
+        self.refresh_tmux_data();
+        cx.notify();
+    }
+
+    /// tmux 一覧の取得だけ（再描画通知なし。dispatch 内から呼べる形）
+    fn refresh_tmux_data(&mut self) {
         let value = tako_control::dispatch(
             self,
             tako_control::protocol::Request::TmuxList { socket: None },
@@ -873,7 +900,6 @@ impl TakoApp {
         )
         .unwrap_or_else(|_| serde_json::json!({ "sessions": [] }));
         self.tmux_sessions = value["sessions"].as_array().cloned().unwrap_or_default();
-        cx.notify();
     }
 
     /// 確認済みの kill を実行する（kill ボタン → 確認 → ここ）
@@ -927,6 +953,9 @@ impl TakoApp {
                 options.env.push(("TAKO_TOKEN".into(), token.clone()));
             }
         }
+        // 明示コマンドはログインシェル経由で実行する（.app の最小 PATH では
+        // `tmux attach` や `npm` が直接 exec で見つからない。2026-06-12 リグレッション (7)）
+        options.command = options.command.map(tako_core::login_shell_command);
         // tmux バックエンド（Phase 5.5 / FR-5）: persist 有効 + tmux ありなら、シェルを
         // 直接ではなく専用サーバーのセッションとして spawn する。`new-session -A` なので
         // 復元時（既存セッション名）は attach、新規ペインは作成と、同じ経路で済む
@@ -1192,8 +1221,6 @@ impl TakoApp {
     }
 
     fn new_tab(&mut self, cx: &mut Context<Self>) {
-        self.tmuxview_active = false;
-        self.agents_view_active = false;
         let title = format!("{}", self.workspace.tabs().len() + 1);
         let pane = Pane::new(PaneOrigin::User);
         let pane_id = pane.id();
@@ -1206,8 +1233,6 @@ impl TakoApp {
     }
 
     fn activate_tab_index(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.tmuxview_active = false;
-        self.agents_view_active = false;
         if let Some(id) = self.workspace.tabs().get(index).map(|t| t.id()) {
             let _ = self.workspace.activate_tab(id);
         }
@@ -1237,10 +1262,17 @@ impl TakoApp {
         if keystroke.modifiers.platform {
             return;
         }
+        // tmux バックエンドペインでは disambiguate（CSI u 送出）を常に有効化する。
+        // 内側アプリ（claude 等）が kitty protocol を要求しても tmux は外側端末へ
+        // 伝えない（core の e2e で確認済み）ため、外側 Term のモードだけでは
+        // Shift+Enter を区別できない。tmux は extended-keys always で CSI u を解釈し、
+        // 内側ペインの要求に応じた形式（kitty / レガシー）へ再エンコードするので
+        // 常時送出で安全（Esc の往復も e2e で検証済み）
         let disambiguate = self
             .focused_session()
             .map(|s| s.disambiguate_keys())
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || self.backend_sessions.contains_key(&self.focused_pane());
         if let Some(bytes) = keystroke_to_bytes(keystroke, disambiguate) {
             if let Some(session) = self.focused_session() {
                 session.clear_selection();
@@ -1265,12 +1297,42 @@ impl TakoApp {
 
     /// 指定ペインのカーソルセル左上（ウィンドウ座標）。
     /// スクロールバック表示中などカーソル非表示のときは None
-    fn pane_cursor_origin(&self, pane: PaneId) -> Option<Point<Pixels>> {
+    /// ペインのカーソル左上のウィンドウ座標。x は描画と同じ shaping で求める
+    /// （`cell_at` の逆写像）。全角行は advance ≠ セル幅 × 2 のため、col × セル幅の
+    /// 線形換算だと打ち進めるほど IME 候補ウィンドウ・未確定文字列が右へずれていく
+    /// （2026-06-12 実機リグレッション (5) の根本原因）
+    fn pane_cursor_origin(&self, pane: PaneId, window: &mut Window) -> Option<Point<Pixels>> {
         let (_, area) = self.pane_text_areas.iter().find(|(id, _)| *id == pane)?;
         let cell = self.cell_size?;
-        let (col, row) = self.terminals.get(&pane)?.screen(&self.theme).cursor?;
+        let screen = self.terminals.get(&pane)?.screen(&self.theme);
+        let (col, row) = screen.cursor?;
+        let x = match screen.lines.get(row) {
+            Some(line) => {
+                // カーソル col に対応する文字（cell_cols は単調非減少）の描画位置
+                let char_ix = line
+                    .cell_cols
+                    .iter()
+                    .position(|&c| c >= col)
+                    .unwrap_or(line.cell_cols.len());
+                let byte_ix = line
+                    .text
+                    .char_indices()
+                    .nth(char_ix)
+                    .map(|(i, _)| i)
+                    .unwrap_or(line.text.len());
+                let shaped = window.text_system().shape_line(
+                    SharedString::from(line.text.clone()),
+                    px(self.theme.font_size),
+                    &[self.mono_text_run(line.text.len())],
+                    None,
+                );
+                f32::from(shaped.x_for_index(byte_ix))
+            }
+            // スナップショット外（起動直後等）は等幅前提の線形換算へフォールバック
+            None => f32::from(cell.width) * col as f32,
+        };
         Some(point(
-            area.origin.x + cell.width * col as f32,
+            area.origin.x + px(x),
             area.origin.y + cell.height * row as f32,
         ))
     }
@@ -1852,9 +1914,18 @@ impl TakoApp {
             if self.dragging_border.take().is_some()
                 | self.dragging_scrollbar.take().is_some()
                 | self.selecting.take().is_some()
+                | std::mem::take(&mut self.dragging_panel)
             {
                 cx.notify();
             }
+            return;
+        }
+        // 情報パネルの幅ドラッグ
+        if self.dragging_panel {
+            let total = f32::from(window.viewport_size().width);
+            let max = (total * 0.7).max(PANEL_MIN_WIDTH);
+            self.panel_width = (total - f32::from(event.position.x)).clamp(PANEL_MIN_WIDTH, max);
+            cx.notify();
             return;
         }
         // スクロールバードラッグ中はスクロール位置を追従させる
@@ -1889,7 +1960,10 @@ impl TakoApp {
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, cx: &mut Context<Self>) {
-        if self.dragging_border.take().is_some() | self.dragging_scrollbar.take().is_some() {
+        if self.dragging_border.take().is_some()
+            | self.dragging_scrollbar.take().is_some()
+            | std::mem::take(&mut self.dragging_panel)
+        {
             cx.notify();
             return;
         }
@@ -2043,8 +2117,6 @@ impl TakoApp {
                     })
                     .text_size(px(12.0))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.tmuxview_active = false;
-                        this.agents_view_active = false;
                         let _ = this.workspace.activate_tab(id);
                         cx.notify();
                     }))
@@ -2075,10 +2147,10 @@ impl TakoApp {
             )
             .child(div().flex_grow(1.0))
             .child(
-                // 右端固定の集約センタータブ（FR-2.10。閉じる × は持たない）。
-                // 全ペイン集約の状態ドット（エラー > 実行中）を添える
+                // 右端の情報パネルトグル（固定タブ 0 個方針。FR-2.10 / FR-2.13 は
+                // 右サイドバーの内部タブへ統合）。全ペイン集約の状態ドットを添える
                 div()
-                    .id("tab-agents")
+                    .id("panel-toggle")
                     .flex()
                     .flex_row()
                     .items_center()
@@ -2086,20 +2158,22 @@ impl TakoApp {
                     .h_full()
                     .px_3()
                     .cursor_pointer()
-                    .when(self.agents_view_active, |d| {
+                    .when(self.panel_visible, |d| {
                         d.bg(rgba(theme.tab_active_background))
                             .border_b_2()
                             .border_color(hsla(theme.accent))
                     })
-                    .text_color(if self.agents_view_active {
+                    .text_color(if self.panel_visible {
                         hsla(theme.tab_active_foreground)
                     } else {
                         hsla(theme.tab_inactive_foreground)
                     })
                     .text_size(px(12.0))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.agents_view_active = true;
-                        this.tmuxview_active = false;
+                        this.panel_visible = !this.panel_visible;
+                        if this.panel_visible && this.panel_view == PanelView::Tmux {
+                            this.refresh_tmux(cx);
+                        }
                         cx.notify();
                     }))
                     .children(
@@ -2107,37 +2181,111 @@ impl TakoApp {
                             div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color))
                         }),
                     )
-                    .child("agents"),
+                    .child("◧ panel"),
             )
-            .child(
-                // 右端固定の tmuxview タブ（FR-2.13.1。閉じる × は持たない）
-                div()
-                    .id("tab-tmuxview")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .h_full()
-                    .px_3()
-                    .cursor_pointer()
-                    .when(self.tmuxview_active, |d| {
-                        d.bg(rgba(theme.tab_active_background))
-                            .border_b_2()
-                            .border_color(hsla(theme.accent))
-                    })
-                    .text_color(if self.tmuxview_active {
-                        hsla(theme.tab_active_foreground)
-                    } else {
-                        hsla(theme.tab_inactive_foreground)
-                    })
-                    .text_size(px(12.0))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.tmuxview_active = true;
-                        this.agents_view_active = false;
-                        this.refresh_tmux(cx);
-                    }))
-                    .child("tmux"),
-            )
+    }
+
+    /// 右サイドバー情報パネル（非表示なら None）。内部タブで tmux 一覧（FR-2.13）と
+    /// 集約センター（FR-2.10）を切り替える。将来 git graph（FR-3.6）もここに足す
+    fn render_panel(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if !self.panel_visible {
+            return None;
+        }
+        let theme = self.theme.clone();
+        let view = self.panel_view;
+        let tab_button = |label: &'static str, target: PanelView, active: bool| {
+            div()
+                .id(("panel-tab", target as u64))
+                .px_2()
+                .py_1()
+                .cursor_pointer()
+                .text_size(px(11.0))
+                .when(active, |d| {
+                    d.bg(rgba(theme.tab_active_background))
+                        .border_b_2()
+                        .border_color(hsla(theme.accent))
+                })
+                .text_color(if active {
+                    hsla(theme.tab_active_foreground)
+                } else {
+                    hsla(theme.tab_inactive_foreground)
+                })
+                .child(label)
+        };
+        Some(
+            div()
+                .w(px(self.panel_width))
+                .h_full()
+                .relative()
+                .flex()
+                .flex_col()
+                .bg(rgba(theme.background))
+                .border_l_1()
+                .border_color(hsla(theme.pane_border))
+                .overflow_hidden()
+                .child(
+                    // 内部タブヘッダ（切り替え式コンテナ。右端 × でパネルを閉じる）
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .h(px(26.0))
+                        .bg(rgba(theme.tab_bar_background))
+                        .child(
+                            tab_button("tmux", PanelView::Tmux, view == PanelView::Tmux).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.panel_view = PanelView::Tmux;
+                                    this.refresh_tmux(cx);
+                                }),
+                            ),
+                        )
+                        .child(
+                            tab_button("agents", PanelView::Agents, view == PanelView::Agents)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.panel_view = PanelView::Agents;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(div().flex_grow(1.0))
+                        .child(
+                            div()
+                                .id("panel-close")
+                                .px_1()
+                                .cursor_pointer()
+                                .text_color(hsla(theme.tab_inactive_foreground))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.panel_visible = false;
+                                    cx.notify();
+                                }))
+                                .child("×"),
+                        ),
+                )
+                .child(match view {
+                    PanelView::Tmux => self.render_tmuxview(cx),
+                    PanelView::Agents => self.render_agents_view(cx),
+                })
+                .child(
+                    // 左端のリサイズハンドル（ドラッグで幅調整）
+                    div()
+                        .id("panel-resize")
+                        .absolute()
+                        .left(px(0.0))
+                        .top(px(0.0))
+                        .w(px(BORDER_HANDLE))
+                        .h_full()
+                        .cursor(CursorStyle::ResizeLeftRight)
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                                this.dragging_panel = true;
+                                cx.stop_propagation();
+                            }),
+                        ),
+                ),
+        )
     }
 
     fn render_pane(
@@ -2164,7 +2312,7 @@ impl TakoApp {
             );
         }
 
-        // role / title バッジ（FR-2.1.3）。`tako title` / MCP で設定されたときだけ右上に重ねる。
+        // タイトルバーの表示名（FR-2.1.3。iTerm2 風: 手動 / AI リネーム > role > OSC タイトル）。
         // コマンド実行状態（FR-2.1.4）はドット色で添える: 赤 = エラー、アクセント = 実行中
         let badge_label = self
             .workspace
@@ -2177,6 +2325,14 @@ impl TakoApp {
                 (None, Some(r)) => Some(r.to_string()),
                 (None, None) => None,
             });
+        let title_label = badge_label
+            .or_else(|| {
+                self.terminals
+                    .get(&pane_id)
+                    .and_then(|s| s.title())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "ターミナル".to_string());
         let state_dot = self
             .terminals
             .get(&pane_id)
@@ -2271,7 +2427,8 @@ impl TakoApp {
             } else {
                 hsla(theme.pane_border)
             })
-            .p(px(PANE_PADDING))
+            .flex()
+            .flex_col()
             .overflow_hidden()
             .on_mouse_down(
                 MouseButton::Left,
@@ -2284,46 +2441,90 @@ impl TakoApp {
                     this.on_pane_scroll(pane_id, event, window, cx);
                 }),
             )
-            .children(lines)
-            .children(Some(
-                // 閉じるボタン（iTerm2 風。左上に控えめなオーバーレイ）
+            .child(
+                // ペイン上部のタイトルバー（iTerm2 風。FR-2.1.3 のバッジを置き換える主表示）:
+                // 左に分かりやすい × ボタン、状態ドット、ペイン名（手動 / AI リネーム）
                 div()
-                    .id(("pane-close", pane_id.as_u64()))
-                    .absolute()
-                    .top(px(2.0))
-                    .left(px(4.0))
-                    .w(px(14.0))
-                    .h(px(14.0))
+                    .id(("pane-titlebar", pane_id.as_u64()))
+                    .h(px(PANE_TITLE_BAR))
+                    .flex_none()
+                    .w_full()
                     .flex()
+                    .flex_row()
                     .items_center()
-                    .justify_center()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .occlude()
+                    .gap_1()
+                    .px_1()
+                    .bg(rgba_alpha(
+                        theme.tab_bar_background,
+                        if focused { 1.0 } else { 0.6 },
+                    ))
                     .text_size(px(11.0))
-                    .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.5))
-                    .hover(|d| {
-                        d.bg(rgba_alpha(theme.tab_bar_background, 0.9))
-                            .text_color(hsla(theme.foreground))
-                    })
+                    .text_color(hsla(theme.tab_inactive_foreground))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                            // ペインの選択開始・フォーカス処理に流さない
+                        // タイトルバーからは選択を開始しない（フォーカスだけ移す）
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
+                            this.workspace
+                                .active_tab_mut()
+                                .tree_mut()
+                                .focus(pane_id)
+                                .ok();
+                            cx.notify();
                         }),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.close_pane_button(pane_id, cx);
-                    }))
-                    .child("×"),
-            ))
+                    .child(
+                        div()
+                            .id(("pane-close", pane_id.as_u64()))
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
+                            .hover(|d| {
+                                d.bg(rgba_alpha(theme.ansi[1], 0.25))
+                                    .text_color(hsla(theme.foreground))
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.close_pane_button(pane_id, cx);
+                            }))
+                            .child("×"),
+                    )
+                    .children(
+                        state_dot.map(|color| {
+                            div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color))
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_color(if focused {
+                                hsla(theme.foreground)
+                            } else {
+                                hsla(theme.tab_inactive_foreground)
+                            })
+                            .child(SharedString::from(truncate(&title_label, 48))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .p(px(PANE_PADDING))
+                    .overflow_hidden()
+                    .children(lines),
+            )
             .children(scrollbar.map(|(top, thumb_h, track_h, dragging)| {
                 div()
                     .id(("scrollbar", pane_id.as_u64()))
                     .absolute()
-                    .top(px(0.0))
+                    .top(px(PANE_TITLE_BAR))
                     .right(px(0.0))
                     .w(px(SCROLLBAR_WIDTH))
                     .h(px(track_h))
@@ -2348,27 +2549,6 @@ impl TakoApp {
                                 if dragging { 0.7 } else { 0.35 },
                             )),
                     )
-            }))
-            .children((badge_label.is_some() || state_dot.is_some()).then(|| {
-                div()
-                    .absolute()
-                    .top(px(2.0))
-                    .right(px(6.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .px_1()
-                    .rounded_sm()
-                    .bg(rgba(theme.tab_bar_background))
-                    .text_size(px(10.0))
-                    .text_color(hsla(theme.accent))
-                    .children(
-                        state_dot.map(|color| {
-                            div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color))
-                        }),
-                    )
-                    .children(badge_label.map(|label| SharedString::from(truncate(&label, 32))))
             }))
             .children(suggestion.map(|(port, process)| {
                 // 提案チップ（FR-2.4.3）: 検知ペイン下端のインライン表示。
@@ -2519,6 +2699,38 @@ impl ControlHost for TakoApp {
     fn backend_session(&self, pane: PaneId) -> Option<String> {
         self.backend_sessions.get(&pane).cloned()
     }
+
+    fn panel_state(&self) -> (bool, f32, tako_control::protocol::PanelViewWire) {
+        let view = match self.panel_view {
+            PanelView::Tmux => tako_control::protocol::PanelViewWire::Tmux,
+            PanelView::Agents => tako_control::protocol::PanelViewWire::Agents,
+        };
+        (self.panel_visible, self.panel_width, view)
+    }
+
+    fn set_panel(
+        &mut self,
+        visible: Option<bool>,
+        width: Option<f32>,
+        view: Option<tako_control::protocol::PanelViewWire>,
+    ) {
+        if let Some(visible) = visible {
+            self.panel_visible = visible;
+        }
+        if let Some(width) = width {
+            self.panel_width = width.max(PANEL_MIN_WIDTH);
+        }
+        if let Some(view) = view {
+            self.panel_view = match view {
+                tako_control::protocol::PanelViewWire::Tmux => PanelView::Tmux,
+                tako_control::protocol::PanelViewWire::Agents => PanelView::Agents,
+            };
+        }
+        // tmux ビューを開いたら一覧を即時更新する（描画通知は dispatch ループが行う）
+        if self.panel_visible && self.panel_view == PanelView::Tmux {
+            self.refresh_tmux_data();
+        }
+    }
 }
 
 /// IME（macOS では NSTextInputClient 相当）との接点（FR-1.9）。
@@ -2632,7 +2844,7 @@ impl EntityInputHandler for TakoApp {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         // 変換候補ウィンドウの位置出し。カーソルセル + 範囲先頭までの描画幅
-        let origin = self.pane_cursor_origin(self.ime_target())?;
+        let origin = self.pane_cursor_origin(self.ime_target(), window)?;
         let cell = self.cell_size?;
         let x_offset = match self.ime.as_ref() {
             Some(ime) => {
@@ -2788,9 +3000,15 @@ impl Render for TakoApp {
         } else {
             px(0.0)
         };
+        // 右サイドバー情報パネルの幅もコンテンツ領域から差し引く
+        let panel_width = if self.panel_visible {
+            px(self.panel_width)
+        } else {
+            px(0.0)
+        };
         let content_origin = point(sidebar_width, px(TAB_BAR_HEIGHT));
         let content_size = size(
-            viewport.width - sidebar_width,
+            viewport.width - sidebar_width - panel_width,
             viewport.height - px(TAB_BAR_HEIGHT),
         );
         let tree = self.workspace.active_tab().tree();
@@ -2800,13 +3018,14 @@ impl Render for TakoApp {
             .iter()
             .map(|(id, r)| {
                 let inset = PANE_BORDER + PANE_PADDING;
+                // テキスト領域はタイトルバー（PANE_TITLE_BAR）の下から始まる
                 let origin = point(
                     content_origin.x + content_size.width * r.x + px(inset),
-                    content_origin.y + content_size.height * r.y + px(inset),
+                    content_origin.y + content_size.height * r.y + px(inset + PANE_TITLE_BAR),
                 );
                 let area_size = size(
                     content_size.width * r.width - px(inset * 2.0),
-                    content_size.height * r.height - px(inset * 2.0),
+                    content_size.height * r.height - px(inset * 2.0 + PANE_TITLE_BAR),
                 );
                 (*id, Bounds::new(origin, area_size))
             })
@@ -2879,7 +3098,7 @@ impl Render for TakoApp {
         // IME 変換中テキストのインライン表示（FR-1.9）。変換対象ペインのカーソル位置に
         // 未確定文字列を重ね、全体に細下線・IME の注目文節に太下線 + 選択色を付ける
         let ime_overlay = self.ime.as_ref().and_then(|ime| {
-            let anchor = self.pane_cursor_origin(ime.pane)?;
+            let anchor = self.pane_cursor_origin(ime.pane, window)?;
             let text = ime.text.clone();
             // ハイライト範囲は重複禁止（StyledText の要求）のため、注目文節の前・文節・後の
             // 3 区間に分割して組む。文節範囲（UTF-16）はバイト範囲へ変換する
@@ -3045,11 +3264,7 @@ impl Render for TakoApp {
                 }),
             )
             .child(self.render_tab_bar(cx))
-            .child(if self.tmuxview_active {
-                self.render_tmuxview(cx)
-            } else if self.agents_view_active {
-                self.render_agents_view(cx)
-            } else {
+            .child(
                 div()
                     .flex_1()
                     .flex()
@@ -3063,7 +3278,8 @@ impl Render for TakoApp {
                             .children(border_handles)
                             .children(ime_overlay),
                     )
-            })
+                    .children(self.render_panel(cx)),
+            )
             .child(ime_registration)
     }
 }
@@ -3955,7 +4171,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 19, "MCP tools/list は 19 ツール");
+            check(status == 200 && tool_count == 20, "MCP tools/list は 20 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -4565,22 +4781,40 @@ mod self_test {
                 eprintln!("（tmux 不在のため項目 48 をスキップ）");
             }
 
-            // 49. tmuxview タブの状態遷移（FR-2.13.1。表示 → 一覧更新 → タブ操作で復帰。
-            //     一覧は既定サーバーの読み取りのみで無害。kill の確認フローも畳めること）
+            // 49. 情報パネルの tmux ビュー（FR-2.13。dispatch の Panel 操作で表示 →
+            //     一覧更新 → kill の確認フローが畳めること → 非表示）。固定タブ 0 個方針
             let view_ok = window
                 .update(cx, |app, _, cx| {
-                    app.tmuxview_active = true;
-                    app.refresh_tmux(cx);
-                    let shown = app.tmuxview_active;
+                    let opened = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Panel {
+                            visible: Some(true),
+                            width: Some(320.0),
+                            view: Some(tako_control::protocol::PanelViewWire::Tmux),
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    let opened_ok = matches!(&opened, Ok(v) if v["visible"].as_bool() == Some(true)
+                        && v["view"].as_str() == Some("tmux"));
+                    let shown = app.panel_visible && app.panel_view == PanelView::Tmux;
                     // 確認フロー: 存在しないセッションの kill は無害に失敗し pending が畳まれる
                     app.tmux_pending_kill = Some(("tako-no-such-session".into(), None, None));
                     app.tmux_kill_confirmed(cx);
                     let pending_cleared = app.tmux_pending_kill.is_none();
-                    app.activate_tab_index(0, cx);
-                    shown && pending_cleared && !app.tmuxview_active
+                    let closed = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Panel {
+                            visible: Some(false),
+                            width: None,
+                            view: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    let closed_ok = matches!(&closed, Ok(v) if v["visible"].as_bool() == Some(false));
+                    opened_ok && shown && pending_cleared && closed_ok && !app.panel_visible
                 })
                 .unwrap_or(false);
-            check(view_ok, "tmuxview の表示・確認フロー・復帰");
+            check(view_ok, "情報パネル（tmux ビュー）の表示・確認フロー・非表示");
 
             // 50. tako tab rename（FR-2.12.1）: 呼び出し元ペインからタブを解決し、
             //     明示リネームは手動扱い（title_source = manual）でタブ表示名になる
@@ -4766,11 +5000,21 @@ mod self_test {
             type_text(any, cx, "kill %1 2>/dev/null", true);
             wait(cx, 500).await;
 
-            // 56. 集約センター（FR-2.10）。全タブのペインが注目度順に並び、
-            //     エントリのジャンプで該当ペインへフォーカスしビューが畳まれる
+            // 56. 集約センター（FR-2.10。情報パネルの agents ビュー）。全タブのペインが
+            //     注目度順に並び、ジャンプで該当ペインへフォーカス（パネルは開いたまま）
             let agents_ok = window
                 .update(cx, |app, _, cx| {
-                    app.agents_view_active = true;
+                    let opened = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Panel {
+                            visible: Some(true),
+                            width: None,
+                            view: Some(tako_control::protocol::PanelViewWire::Agents),
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    let opened_ok =
+                        matches!(&opened, Ok(v) if v["view"].as_str() == Some("agents"));
                     let entries = app.agent_entries();
                     // 全ペインが載っている + 注目度順（rank が単調非減少）
                     let total: usize = app
@@ -4794,13 +5038,13 @@ mod self_test {
                         .map(|e| e.pane)
                         .expect("エントリは 1 件以上ある");
                     app.jump_to_pane(target, cx);
-                    all_listed
-                        && sorted
-                        && app.focused_pane() == target
-                        && !app.agents_view_active
+                    // ジャンプしてもパネルは開いたまま（畳むのはユーザー / AI の明示操作）
+                    let still_open = app.panel_visible;
+                    app.panel_visible = false;
+                    opened_ok && all_listed && sorted && app.focused_pane() == target && still_open
                 })
                 .unwrap_or(false);
-            check(agents_ok, "集約センターの一覧とジャンプ");
+            check(agents_ok, "集約センター（パネル agents ビュー）の一覧とジャンプ");
 
             // 57. ファイルツリー（FR-3.1 / FR-3.7）。cmd+B で開閉し、表示中は
             //     フォーカスペインの cwd（無ければ $HOME）が root に追従して行が出る
@@ -4983,6 +5227,55 @@ mod self_test {
                 })
                 .unwrap_or(false);
             check(persist_off, "tako persist off（dispatch 経由）");
+
+            // 63. 明示コマンド付き split の回帰（2026-06-12 リグレッション (7)）。
+            //     コマンドはログインシェル経由で実行される（最小 PATH の .app でも
+            //     `tmux attach` 等が解決できる）。出力マーカーで実行を機械検証する
+            press(any, cx, "ctrl-u");
+            type_text(
+                any,
+                cx,
+                &format!("{cli} split --down -- sh -c 'echo TAKO-CMD-\"OK\"; sleep 15'"),
+                true,
+            );
+            let mut cmd_ok = false;
+            for _ in 0..15 {
+                wait(cx, 600).await;
+                cmd_ok = focused_contains(window, cx, "TAKO-CMD-OK");
+                if cmd_ok {
+                    break;
+                }
+            }
+            check(cmd_ok, "明示コマンド付き split（ログインシェル経由）");
+            press(any, cx, "cmd-w");
+            wait(cx, 500).await;
+
+            // 64. tako panel CLI（開発不変条件）: 表示・ビュー・幅の roundtrip
+            press(any, cx, "ctrl-u");
+            type_text(
+                any,
+                cx,
+                &format!(
+                    "{cli} panel --show --view agents --width 300 \
+                     | grep -q '\"view\":\"agents\"' && echo TAKO-PN-$((60+4))"
+                ),
+                true,
+            );
+            wait(cx, 1200).await;
+            check(
+                focused_contains(window, cx, "TAKO-PN-64"),
+                "tako panel CLI の roundtrip",
+            );
+            let panel_synced = window
+                .update(cx, |app, _, _| {
+                    let ok = app.panel_visible
+                        && app.panel_view == PanelView::Agents
+                        && (app.panel_width - 300.0).abs() < 1.0;
+                    app.panel_visible = false;
+                    ok
+                })
+                .unwrap_or(false);
+            check(panel_synced, "panel 操作が UI 状態へ反映");
 
             println!("TAKO_APP_SELF_TEST_OK");
             std::process::exit(0);

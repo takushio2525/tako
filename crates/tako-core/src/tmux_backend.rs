@@ -33,11 +33,12 @@ pub fn socket_name() -> String {
         .unwrap_or_else(|| "tako".into())
 }
 
-/// tmux が使えるか（`tmux -V` が成功するか）。プロセス内でキャッシュする
+/// tmux が使えるか（`tmux -V` が成功するか）。プロセス内でキャッシュする。
+/// バイナリは `tmux::tmux_bin`（ログインシェル解決込み）で引く（.app の最小 PATH 対策）
 pub fn available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        Command::new("tmux")
+        Command::new(crate::tmux::tmux_bin())
             .arg("-V")
             .output()
             .map(|o| o.status.success())
@@ -67,6 +68,7 @@ set -g set-clipboard on
 set -g default-terminal tmux-256color
 set -s escape-time 10
 set -s extended-keys always
+set -sq extended-keys-format csi-u
 set -as terminal-features 'xterm*:extkeys:RGB'
 set -g update-environment 'TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL TAKO_TAB_ID'
 ";
@@ -115,7 +117,7 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
     }
     SpawnOptions {
         command: Some(SpawnCommand {
-            program: "tmux".into(),
+            program: crate::tmux::tmux_bin().to_string(),
             args,
         }),
         ..options
@@ -128,7 +130,7 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
 /// `list-panes` を使う（`display-message -p` はクライアント無しだと空を返す）。
 /// セッション未作成・tmux 不在では None（呼び出し側がリトライする）
 pub fn pane_tty(socket: &str, session: &str) -> Option<String> {
-    let output = Command::new("tmux")
+    let output = Command::new(crate::tmux::tmux_bin())
         .args([
             "-L",
             socket,
@@ -160,13 +162,14 @@ pub fn kill_session(socket: &str, session: &str) {
 
 /// バックエンドサーバーごと落とす（セルフテストの後片付け用）
 pub fn kill_server(socket: &str) {
-    let _ = Command::new("tmux")
+    let _ = Command::new(crate::tmux::tmux_bin())
         .args(["-L", socket, "kill-server"])
         .output();
 }
 
 /// 語のリストを sh -c 安全な 1 つのコマンド文字列へ組み立てる
-fn shell_quoted(command: &SpawnCommand) -> String {
+/// （terminal::login_shell_command とも共有する）
+pub(crate) fn shell_quoted(command: &SpawnCommand) -> String {
     std::iter::once(&command.program)
         .chain(command.args.iter())
         .map(|w| quote_word(w))
@@ -219,7 +222,8 @@ mod tests {
         };
         let wrapped = wrap_options(options, "tako-test", "tako-abc123");
         let command = wrapped.command.expect("tmux コマンドに置き換わる");
-        assert_eq!(command.program, "tmux");
+        // バイナリはログインシェル解決で絶対パスになることがある（.app の最小 PATH 対策）
+        assert!(command.program.ends_with("tmux"));
         let args = command.args;
         // -L <socket> と new-session -A -D -s <session> を含む
         let l = args.iter().position(|a| a == "-L").unwrap();
@@ -361,6 +365,171 @@ mod tests {
         panic!(
             "OSC 7 が届かない。画面: {:?}",
             session.visible_lines().join("\n")
+        );
+    }
+
+    /// マウスレポートと拡張キー（CSI u）が tmux 越しでも**生のまま**内側アプリへ届く e2e。
+    /// 「アプリがマウスレポートを要求したら必ず生のマウスイベントが届く」は tako の
+    /// 存在意義に関わる保証（2026-06-12 実機リグレッションの再発防止）。
+    /// 内側は受信バイトを可視化する `cat -v`（^[ = ESC）
+    #[test]
+    #[cfg(unix)]
+    fn マウスレポートと拡張キーがtmux越しに生で届く() {
+        if !available() {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-mouse-{}", std::process::id());
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                kill_server(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(socket.clone());
+        // 内側アプリ: SGR マウス + kitty keyboard を要求してから受信バイトを表示
+        let options = SpawnOptions {
+            command: Some(SpawnCommand {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    r"printf '\033[?1000h\033[?1006h\033[>1u'; exec cat -v".into(),
+                ],
+            }),
+            cwd: Some(std::env::temp_dir()),
+            env: vec![],
+        };
+        let (session, _rx) =
+            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-mouse"))
+                .expect("tmux クライアントを spawn できる");
+
+        // 内側のマウス要求が tmux → 外側端末（tako の Term）まで伝わる
+        let mut mouse_on = false;
+        for _ in 0..100 {
+            if session.mouse_reporting() {
+                mouse_on = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            mouse_on,
+            "内側アプリのマウス要求が外側端末モードへ伝わる。画面: {:?}",
+            session.visible_lines().join("\n")
+        );
+
+        // ホイール → 生の SGR マウスイベントが内側アプリへ届く（矢印キー変換は禁止）
+        session.scroll_wheel(1, 5, 5);
+        let mut delivered = false;
+        for _ in 0..50 {
+            let lines = session.visible_lines().join("\n");
+            assert!(
+                !lines.contains("^[[A") && !lines.contains("^[OA"),
+                "ホイールが矢印キーに化けている（リグレッション）。画面: {lines:?}"
+            );
+            if lines.contains("[<64;6;6M") {
+                delivered = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            delivered,
+            "生の SGR ホイールイベントが届かない。画面: {:?}",
+            session.visible_lines().join("\n")
+        );
+
+        // Shift+Enter（CSI u）も tmux 越しで**kitty 形式のまま**内側へ届く
+        // （extended-keys always + extended-keys-format csi-u。FR の常用要件）
+        session.write(b"\x1b[13;2u".to_vec());
+        let mut key_delivered = false;
+        for _ in 0..50 {
+            if session.visible_lines().join("\n").contains("[13;2u") {
+                key_delivered = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            key_delivered,
+            "Shift+Enter（CSI u）が tmux 越しに kitty 形式で届かない。画面: {:?}",
+            session.visible_lines().join("\n")
+        );
+        // 外側（tako の Term）には拡張キーモードが伝わらない（tmux の仕様）。
+        // そのため UI 層はバックエンドペインで disambiguate を強制する（main.rs の
+        // handle_key）。ここでは前提（伝わらない）が変わったら気づけるよう記録する
+        eprintln!(
+            "外側 disambiguate = {}（false 想定。true になったら main.rs の強制は不要）",
+            session.disambiguate_keys()
+        );
+
+        // Esc（CSI u 形式 \e[27u）も内側のペインへ届く（kitty 要求済みペインには
+        // kitty 形式のまま）。バックエンドペインでの disambiguate 常時有効化が
+        // vim 等の Esc を壊さないことの確認
+        session.write(b"\x1b[27u".to_vec());
+        let mut esc_delivered = false;
+        for _ in 0..50 {
+            if session.visible_lines().join("\n").contains("[27u") {
+                esc_delivered = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            esc_delivered,
+            "Esc（CSI 27u）が tmux 越しに届かない。画面: {:?}",
+            session.visible_lines().join("\n")
+        );
+    }
+
+    /// マウス**非要求**の alt-screen アプリ（ペイン内 `tmux attach` のネストや全画面 TUI）への
+    /// ホイールが矢印キーに化けない e2e（2026-06-12 実機リグレッション (1) の再発防止）。
+    /// tmux の既定はこの構成でホイール → ↑↓ 変換（入力履歴が回る事故の元）なので、
+    /// バックエンド conf がこれを抑止していることを検証する
+    #[test]
+    #[cfg(unix)]
+    fn alt_screenの非マウスペインでホイールが矢印に化けない() {
+        if !available() {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-alt-{}", std::process::id());
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                kill_server(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(socket.clone());
+        // 内側: alt screen に入るだけでマウスは要求しない（claude を内包する
+        // ネスト tmux クライアントや less / vim 既定がこの形）
+        let options = SpawnOptions {
+            command: Some(SpawnCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), r"printf '\033[?1049h'; exec cat -v".into()],
+            }),
+            cwd: Some(std::env::temp_dir()),
+            env: vec![],
+        };
+        let (session, _rx) =
+            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-alt"))
+                .expect("tmux クライアントを spawn できる");
+        // 外側のマウスモード（バックエンドの mouse on）を待つ
+        for _ in 0..100 {
+            if session.mouse_reporting() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(session.mouse_reporting(), "バックエンドの mouse on が効く");
+        // 上下ホイール → 矢印キーが内側へ送られないこと
+        session.scroll_wheel(1, 5, 5);
+        session.scroll_wheel(-1, 5, 5);
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let lines = session.visible_lines().join("\n");
+        assert!(
+            !lines.contains("^[[A") && !lines.contains("^[OA") && !lines.contains("^[[B"),
+            "ホイールが矢印キーに化けている（リグレッション (1)）。画面: {lines:?}"
         );
     }
 }

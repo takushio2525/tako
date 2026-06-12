@@ -72,6 +72,23 @@ fn default_true() -> bool {
     true
 }
 
+/// 右サイドバー情報パネルの内部ビュー（固定タブ 0 個方針。将来 git graph を追加予定）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PanelViewWire {
+    Tmux,
+    Agents,
+}
+
+impl PanelViewWire {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PanelViewWire::Tmux => "tmux",
+            PanelViewWire::Agents => "agents",
+        }
+    }
+}
+
 /// 操作リクエスト。`pane` 省略時は呼び出し元ペイン（クライアント側で `TAKO_PANE_ID` から
 /// 解決して詰める。FR-2.2.7）。各操作のセマンティクスは tako-core の API と 1:1
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -162,6 +179,15 @@ pub enum Request {
     /// `enabled` 省略時は現在状態の取得のみ。切替は**以後生成されるペイン**に効く
     /// （既存ペインのバックエンドは変わらない）。設定は永続化される
     Persist { enabled: Option<bool> },
+    /// 右サイドバー情報パネル（tmux 一覧 / 集約センター）の表示・幅・ビュー切替。
+    /// すべて省略 = 現在状態の取得のみ（AI が成果や状況をユーザーへ見せる導線。
+    /// 設計原則 5: UI でできる操作はすべてここから可能）
+    Panel {
+        visible: Option<bool>,
+        /// パネル幅（px）
+        width: Option<f32>,
+        view: Option<PanelViewWire>,
+    },
 }
 
 /// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。

@@ -27,8 +27,8 @@ pub use ports::ListenPort;
 pub use screen::{Screen, ScreenLine, StyleRun};
 pub use tab::{Tab, TabId};
 pub use terminal::{
-    CommandState, SelectionKind, SessionError, SessionEvent, SessionNotice, SpawnCommand,
-    SpawnOptions, TermEvent, TerminalSession,
+    login_shell_command, CommandState, SelectionKind, SessionError, SessionEvent, SessionNotice,
+    SpawnCommand, SpawnOptions, TermEvent, TerminalSession,
 };
 pub use theme::{Rgb, Theme};
 pub use tmux::{TmuxSession, TmuxWindow};

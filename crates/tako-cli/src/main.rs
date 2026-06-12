@@ -69,6 +69,9 @@ enum Command {
     /// セッション永続化 = tmux バックエンド（FR-5）の ON/OFF・状態確認。
     /// 有効時、tako を再起動してもタブ構成と実行中プロセスが復元される
     Persist(ToggleArgs),
+    /// 右サイドバー情報パネル（tmux 一覧 / agents 集約センター）の表示・幅・ビュー切替。
+    /// 引数なしで現在状態を表示する
+    Panel(PanelArgs),
     /// tmux セッションの一覧・kill（FR-2.13。消し忘れ tmux の発見と片付け）
     #[command(subcommand)]
     Tmux(TmuxCommand),
@@ -228,6 +231,22 @@ struct ResizeArgs {
     /// 縦の取り分を絶対指定（0.0–1.0）
     #[arg(long)]
     share_y: Option<f32>,
+}
+
+#[derive(Args)]
+struct PanelArgs {
+    /// パネルを表示する
+    #[arg(long, conflicts_with = "hide")]
+    show: bool,
+    /// パネルを隠す
+    #[arg(long)]
+    hide: bool,
+    /// パネル幅（px）
+    #[arg(long)]
+    width: Option<f32>,
+    /// 表示するビュー
+    #[arg(long, value_parser = ["tmux", "agents"])]
+    view: Option<String>,
 }
 
 /// ON/OFF トグル系コマンド共通の引数（autorename / portdetect）
@@ -478,6 +497,18 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Persist(args) => Request::Persist {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
+        Command::Panel(args) => Request::Panel {
+            visible: match (args.show, args.hide) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            },
+            width: args.width,
+            view: args.view.as_deref().map(|v| match v {
+                "agents" => tako_control::protocol::PanelViewWire::Agents,
+                _ => tako_control::protocol::PanelViewWire::Tmux,
+            }),
+        },
         Command::Portdetect(args) => Request::PortDetect {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
@@ -559,7 +590,10 @@ fn print_result(command: &Command, result: &Value) {
             );
         }
         Command::Tab(TabCommand::New { .. }) => println!("{result}"),
-        Command::Autorename(_) | Command::Portdetect(_) | Command::Persist(_) => {
+        Command::Autorename(_)
+        | Command::Portdetect(_)
+        | Command::Persist(_)
+        | Command::Panel(_) => {
             println!("{result}")
         }
         Command::Tmux(TmuxCommand::List { .. }) => {
