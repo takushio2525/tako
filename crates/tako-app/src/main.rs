@@ -436,6 +436,21 @@ struct TmuxViewTabGroup {
     tab: TabId,
     title: String,
     rows: Vec<AgentEntry>,
+    /// このタブのペイン内で attach 中の外部 tmux セッション（FR-2.16.9）
+    sessions: Vec<AttachedTmuxSession>,
+}
+
+/// タブ内ペインで attach 中の外部 tmux セッション 1 件分（FR-2.16.9）。
+/// 別サーバーのセッション（例: orchestrator の master 用）を tako ペインで
+/// `tmux attach` して見ている場合、「管理外」ではなくそのタブの配下として表示する
+#[derive(Debug, Clone)]
+struct AttachedTmuxSession {
+    name: String,
+    socket: Option<String>,
+    /// attach クライアントを表示している tako ペイン
+    pane: u64,
+    /// (window index, 表示ラベル)
+    windows: Vec<(u32, String)>,
 }
 
 /// どのタブにも表示されていない tmux セッション 1 件分（FR-2.16.8）。
@@ -984,13 +999,69 @@ impl TakoApp {
                     tab: tab.id(),
                     title: tab.title().to_string(),
                     rows,
+                    sessions: self.tmux_sessions_attached_to(tab.id().as_u64()),
                 }
             })
             .collect()
     }
 
+    /// tmux セッションの attach クライアントが tako ペインで表示中なら
+    /// その (tab, pane) を返す（TmuxList が tty 突き合わせ済みの clients を使う）。
+    /// tako 自身のバックエンド保持セッションは対象外（タブ枠のペイン行が代表する）
+    fn tmux_session_attached_at(session: &serde_json::Value) -> Option<(u64, u64)> {
+        if session["backend"].as_bool().unwrap_or(false)
+            && session["backend_pane"].as_u64().is_some()
+        {
+            return None;
+        }
+        session["clients"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find_map(|c| Some((c["tab"].as_u64()?, c["pane"].as_u64()?)))
+    }
+
+    /// TmuxList の 1 セッション分 JSON から window 一覧の表示ラベルを組む
+    fn tmux_session_windows(session: &serde_json::Value) -> Vec<(u32, String)> {
+        session["windows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|w| {
+                let index = w["index"].as_u64().unwrap_or(0) as u32;
+                let label = format!(
+                    "{}:{}（{} ペイン）",
+                    index,
+                    w["name"].as_str().unwrap_or("?"),
+                    w["panes"].as_u64().unwrap_or(0),
+                );
+                (index, label)
+            })
+            .collect()
+    }
+
+    /// 指定タブのペイン内で attach 中の外部 tmux セッション（FR-2.16.9）
+    fn tmux_sessions_attached_to(&self, tab: u64) -> Vec<AttachedTmuxSession> {
+        self.tmux_sessions
+            .iter()
+            .filter_map(|session| {
+                let (at_tab, pane) = Self::tmux_session_attached_at(session)?;
+                if at_tab != tab {
+                    return None;
+                }
+                Some(AttachedTmuxSession {
+                    name: session["name"].as_str().unwrap_or("?").to_string(),
+                    socket: session["socket"].as_str().map(str::to_string),
+                    pane,
+                    windows: Self::tmux_session_windows(session),
+                })
+            })
+            .collect()
+    }
+
     /// どのタブにも表示されていない tmux セッションの抽出（FR-2.16.8）。
-    /// 対応ペインを持つバックエンドセッションはタブ枠内のペイン行が代表するため除外し、
+    /// 対応ペインを持つバックエンドセッションはタブ枠内のペイン行が、tako ペイン内で
+    /// attach 中のセッションはタブ枠内の紐付け表示（FR-2.16.9）が代表するため除外し、
     /// 残りを「kill 漏れ?（orphan バックエンド）」と「管理外（ユーザー直起動等）」に分類する
     fn tmux_unlisted_sessions(&self) -> Vec<UnlistedTmuxSession> {
         self.tmux_sessions
@@ -999,6 +1070,9 @@ impl TakoApp {
                 let backend = session["backend"].as_bool().unwrap_or(false);
                 if backend && session["backend_pane"].as_u64().is_some() {
                     return None; // タブ枠内のペイン行で表示済み
+                }
+                if Self::tmux_session_attached_at(session).is_some() {
+                    return None; // tako ペイン内で attach 中 = タブ枠へ紐付け表示済み
                 }
                 let clients: Vec<String> = session["clients"]
                     .as_array()
@@ -1016,21 +1090,7 @@ impl TakoApp {
                 } else {
                     clients.join("、")
                 };
-                let windows = session["windows"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|w| {
-                        let index = w["index"].as_u64().unwrap_or(0) as u32;
-                        let label = format!(
-                            "{}:{}（{} ペイン）",
-                            index,
-                            w["name"].as_str().unwrap_or("?"),
-                            w["panes"].as_u64().unwrap_or(0),
-                        );
-                        (index, label)
-                    })
-                    .collect();
+                let windows = Self::tmux_session_windows(session);
                 Some(UnlistedTmuxSession {
                     name: session["name"].as_str().unwrap_or("?").to_string(),
                     socket: session["socket"].as_str().map(str::to_string),
@@ -1632,10 +1692,78 @@ impl TakoApp {
         Some((col, row, side_right))
     }
 
-    /// 統合 tmux ビュー（FR-2.16.6〜2.16.8。旧 tmuxview FR-2.13 + 集約センター FR-2.10 の
+    /// kill 確認のインラインブロック（FR-2.16.7）。メッセージ行（折り返し）+ ボタン行の
+    /// 縦積みにし、文言が長くてもボタンがパネル右端へ見切れないようにする
+    /// （flex_row 一列だと長文時にボタンごと overflow_hidden で切られる。2026-06-13 実機）。
+    /// `confirm_pane` = Some ならペイン kill（dispatch Close）、None なら tmux kill
+    fn render_kill_confirm(
+        &self,
+        id_seed: u64,
+        message: String,
+        confirm_pane: Option<PaneId>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let theme = &self.theme;
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .pl_4()
+            .w_full()
+            .text_size(px(11.0))
+            .text_color(hsla(theme.ansi[1]))
+            .child(div().w_full().child(SharedString::from(message)))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id(("kill-yes", id_seed))
+                            .px_2()
+                            .flex_none()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .bg(rgba_alpha(theme.ansi[1], 0.25))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if confirm_pane.is_some() {
+                                    this.pane_kill_confirmed(cx);
+                                } else {
+                                    this.tmux_kill_confirmed(cx);
+                                }
+                            }))
+                            .child("kill する"),
+                    )
+                    .child(
+                        div()
+                            .id(("kill-no", id_seed))
+                            .px_2()
+                            .flex_none()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .bg(rgba_alpha(theme.tab_bar_background, 0.9))
+                            .text_color(hsla(theme.foreground))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if confirm_pane.is_some() {
+                                    this.pending_pane_kill = None;
+                                } else {
+                                    this.tmux_pending_kill = None;
+                                }
+                                cx.notify();
+                            }))
+                            .child("やめる"),
+                    ),
+            )
+    }
+
+    /// 統合 tmux ビュー（FR-2.16.6〜2.16.9。旧 tmuxview FR-2.13 + 集約センター FR-2.10 の
     /// 1 本化）。タブごとの「タブ名ラベル付き四角枠」に全ペインを入れ子表示し、行クリックで
-    /// ジャンプ、ゴミ箱 → 確認 → kill（dispatch の Close）。続けて、どのタブにも表示されて
-    /// いない tmux セッションを「管理外 / kill 漏れ?」に区別して列挙する（確認つき TmuxKill）
+    /// ジャンプ、ゴミ箱 → 確認 → kill（dispatch の Close）。タブ内ペインで attach 中の
+    /// 外部 tmux セッションは window 一覧ごとタブ枠へ紐付け表示する（FR-2.16.9）。続けて、
+    /// どのタブにも表示されていない tmux セッションを「管理外 / kill 漏れ?」に区別して
+    /// 列挙する（確認つき TmuxKill）
     fn render_tmux_view(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme.clone();
         let groups = self.tmux_view_groups();
@@ -1667,7 +1795,7 @@ impl TakoApp {
             );
 
         // タブ枠: タブ名ラベル付き四角枠 + 枠内に全ペインの入れ子表示（FR-2.16.6）
-        for group in groups {
+        for (group_index, group) in groups.into_iter().enumerate() {
             let is_active = group.tab == active_tab;
             let mut card = div()
                 .flex()
@@ -1778,6 +1906,80 @@ impl TakoApp {
                         ),
                 );
                 if pending_pane == Some(pane) {
+                    card = card.child(self.render_kill_confirm(
+                        pane.as_u64(),
+                        format!("ペイン {pane} を kill していいですか?（中のプロセスごと終了）"),
+                        Some(pane),
+                        cx,
+                    ));
+                }
+            }
+            // タブ内ペインで attach 中の外部 tmux セッション（FR-2.16.9）。
+            // 「管理外」へ落とさず、見えているタブの配下として window 一覧ごと表示する
+            for (s_index, session) in group.sessions.iter().enumerate() {
+                // 確認 UI の id 衝突を避ける（ペイン kill は pane id、こちらは上位ビット）
+                let id_seed = (1 << 32) | ((group_index as u64) << 16) | s_index as u64;
+                let kill_name = session.name.clone();
+                let kill_socket = session.socket.clone();
+                card = card.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .px_1()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .px_1()
+                                .flex_none()
+                                .rounded_sm()
+                                .text_size(px(10.0))
+                                .text_color(hsla(theme.accent))
+                                .bg(rgba_alpha(theme.accent, 0.15))
+                                .child("tmux"),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .font_weight(FontWeight::BOLD)
+                                .text_size(px(11.0))
+                                .child(SharedString::from(truncate(&session.name, 24))),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(10.0))
+                                .text_color(hsla(theme.tab_inactive_foreground))
+                                .child(SharedString::from(format!(
+                                    "ペイン {} で attach 中",
+                                    session.pane
+                                ))),
+                        )
+                        .child(
+                            div()
+                                .id(("tmux-att-kill", id_seed))
+                                .px_1()
+                                .flex_none()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_size(px(11.0))
+                                .text_color(hsla_alpha(theme.ansi[1], 0.8))
+                                .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.tmux_pending_kill =
+                                        Some((kill_name.clone(), None, kill_socket.clone()));
+                                    cx.notify();
+                                }))
+                                .child("🗑"),
+                        ),
+                );
+                for (w_index, label) in &session.windows {
+                    let w_index = *w_index;
+                    let kill_name = session.name.clone();
+                    let kill_socket = session.socket.clone();
                     card = card.child(
                         div()
                             .flex()
@@ -1786,37 +1988,50 @@ impl TakoApp {
                             .gap_2()
                             .pl_4()
                             .text_size(px(11.0))
-                            .text_color(hsla(theme.ansi[1]))
-                            .child(SharedString::from(format!(
-                                "ペイン {pane} を kill していいですか?（中のプロセスごと終了）"
-                            )))
+                            .overflow_hidden()
                             .child(
                                 div()
-                                    .id(("pane-kill-yes", pane.as_u64()))
-                                    .px_2()
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .bg(rgba_alpha(theme.ansi[1], 0.25))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.pane_kill_confirmed(cx);
-                                    }))
-                                    .child("kill する"),
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .child(SharedString::from(truncate(label, 40))),
                             )
                             .child(
                                 div()
-                                    .id(("pane-kill-no", pane.as_u64()))
-                                    .px_2()
+                                    .id(("tmux-att-kill-window", (id_seed << 8) | w_index as u64))
+                                    .px_1()
+                                    .flex_none()
                                     .rounded_sm()
                                     .cursor_pointer()
-                                    .bg(rgba_alpha(theme.tab_bar_background, 0.9))
-                                    .text_color(hsla(theme.foreground))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.pending_pane_kill = None;
+                                    .text_size(px(10.0))
+                                    .text_color(hsla_alpha(theme.ansi[1], 0.8))
+                                    .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.tmux_pending_kill = Some((
+                                            kill_name.clone(),
+                                            Some(w_index),
+                                            kill_socket.clone(),
+                                        ));
                                         cx.notify();
                                     }))
-                                    .child("やめる"),
+                                    .child("🗑"),
                             ),
                     );
+                }
+                // attach 済みセッションへの kill 確認（unlisted 側と同じ pending を使う）
+                if let Some((pending_session, pending_window, _)) = &pending_tmux {
+                    if *pending_session == session.name {
+                        let label = match pending_window {
+                            Some(w) => format!(
+                                "window {w} を kill していいですか?（中のプロセスごと終了）"
+                            ),
+                            None => format!(
+                                "セッション {} を kill していいですか?（中のプロセスごと終了。\
+                                 attach 中のペインからも消える）",
+                                session.name
+                            ),
+                        };
+                        card = card.child(self.render_kill_confirm(id_seed, label, None, cx));
+                    }
                 }
             }
             root = root.child(card);
@@ -1928,7 +2143,14 @@ impl TakoApp {
                         .pl_4()
                         .text_size(px(11.0))
                         .overflow_hidden()
-                        .child(SharedString::from(truncate(label, 40)))
+                        .child(
+                            // ラベルは flex_1 で縮められるように包む（裸のテキスト子だと
+                            // 長文時にゴミ箱ごと右へ押し出されて見切れる）
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .child(SharedString::from(truncate(label, 40))),
+                        )
                         .child(
                             div()
                                 .id(("tmux-kill-window", ((index as u64) << 16) | w_index as u64))
@@ -1965,43 +2187,8 @@ impl TakoApp {
                             "管理外セッション {name} を kill していいですか?（中のプロセスごと終了）"
                         ),
                     };
-                    card = card.child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .pl_4()
-                            .text_size(px(11.0))
-                            .text_color(hsla(theme.ansi[1]))
-                            .child(SharedString::from(label))
-                            .child(
-                                div()
-                                    .id(("tmux-kill-yes", index as u64))
-                                    .px_2()
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .bg(rgba_alpha(theme.ansi[1], 0.25))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.tmux_kill_confirmed(cx);
-                                    }))
-                                    .child("kill する"),
-                            )
-                            .child(
-                                div()
-                                    .id(("tmux-kill-no", index as u64))
-                                    .px_2()
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .bg(rgba_alpha(theme.tab_bar_background, 0.9))
-                                    .text_color(hsla(theme.foreground))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.tmux_pending_kill = None;
-                                        cx.notify();
-                                    }))
-                                    .child("やめる"),
-                            ),
-                    );
+                    // 確認 UI の id は attach 済み側（1<<32 系）と衝突しない下位値
+                    card = card.child(self.render_kill_confirm(index as u64, label, None, cx));
                 }
             }
             root = root.child(card);
@@ -2659,6 +2846,8 @@ impl TakoApp {
             .flex_row()
             .items_center()
             .h(px(TAB_BAR_HEIGHT))
+            // ルート flex 列が窮屈になっても高さを譲らない（ステータスバー消失と同根の予防）
+            .flex_none()
             .w_full()
             .bg(rgba(theme.tab_bar_background))
             .children(tabs.into_iter().map(|(id, label, dot)| {
@@ -2752,6 +2941,9 @@ impl TakoApp {
             .flex_row()
             .items_center()
             .h(px(STATUS_BAR_HEIGHT))
+            // ルート flex 列が窮屈になっても高さを譲らない（消失バグの再発防止。
+            // 根本対策は中段の min_h(0) — 下の render 末尾コメント参照）
+            .flex_none()
             .w_full()
             .bg(rgba(theme.tab_bar_background))
             .border_t_1()
@@ -2861,6 +3053,7 @@ impl TakoApp {
                         .gap_1()
                         .px_2()
                         .h(px(26.0))
+                        .flex_none()
                         .bg(rgba(theme.tab_bar_background))
                         .child(
                             tab_button("tmux", PanelView::Tmux, view == PanelView::Tmux).on_click(
@@ -3938,6 +4131,12 @@ impl Render for TakoApp {
             .child(
                 div()
                     .flex_1()
+                    // ステータスバー消失の根本対策（2026-06-13 実機）: flex 子の自動最小
+                    // サイズは overflow: visible だと min-content になるため、サイドバー /
+                    // パネルの内在コンテンツ高（ファイルツリー行数・tmux 一覧）がウィンドウ高を
+                    // 超えるとこの中段が縮めず、下のステータスバーが画面外へ押し出されていた。
+                    // min_h(0) で常にビューポート内へ収める（内側のスクロールが内容を受ける）
+                    .min_h(px(0.0))
                     .flex()
                     .flex_row()
                     .children(self.render_sidebar(cx))
@@ -6061,6 +6260,71 @@ mod self_test {
                     }
                 }
                 check(cli_scrolled, "tako scroll がバックエンドの tmux スクロールに効く");
+
+                // 61f. タブ内ペインで attach 中の外部 tmux セッションはタブ枠へ紐付き、
+                //      「管理外 / kill 漏れ?」に出ない（FR-2.16.9。別サーバーのセッションを
+                //      tako ペインで attach して見ている構成が管理外扱いされた
+                //      2026-06-13 実機バグの回帰検知）
+                let tmux_bin = tako_core::tmux::tmux_bin();
+                press(any, cx, "ctrl-u");
+                type_text(
+                    any,
+                    cx,
+                    &format!(
+                        "{tmux_bin} -L {backend_sock} new-session -d -s att-e2e && \
+                         {tmux_bin} -L {backend_sock} attach -t att-e2e"
+                    ),
+                    true,
+                );
+                let mut attached_ok = false;
+                for _ in 0..20 {
+                    wait(cx, 500).await;
+                    attached_ok = window
+                        .update(cx, |app, _, _| {
+                            app.refresh_tmux_data();
+                            let groups = app.tmux_view_groups();
+                            // attach 先ペイン（backend_pane）が居るタブ枠に紐付く
+                            let in_group = groups.iter().any(|g| {
+                                g.rows.iter().any(|r| r.pane == backend_pane)
+                                    && g.sessions.iter().any(|s| {
+                                        s.name == "att-e2e"
+                                            && s.pane == backend_pane.as_u64()
+                                            && !s.windows.is_empty()
+                                    })
+                            });
+                            let not_unlisted = !app
+                                .tmux_unlisted_sessions()
+                                .iter()
+                                .any(|s| s.name == "att-e2e");
+                            in_group && not_unlisted
+                        })
+                        .unwrap_or(false);
+                    if attached_ok {
+                        break;
+                    }
+                }
+                check(
+                    attached_ok,
+                    "attach 中の外部 tmux セッションがタブ枠へ紐付く（管理外に出ない）",
+                );
+                // 後片付け: セッション kill（dispatch 経由 = UI の確認後と同じ経路）で
+                // 内側の attach クライアントも終了し、ペインはシェルへ戻る
+                let att_killed = window
+                    .update(cx, |app, _, _| {
+                        let result = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TmuxKill {
+                                socket: Some(backend_sock.clone()),
+                                session: "att-e2e".into(),
+                                window: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        result.is_ok()
+                    })
+                    .unwrap_or(false);
+                check(att_killed, "attach 済みセッションの kill（dispatch TmuxKill）");
+                wait(cx, 800).await;
 
                 // 62. ペインの明示 close でバックエンドセッションも破棄される
                 //     （アプリ終了では破棄されない = 永続化、は core の e2e テストで検証済み）

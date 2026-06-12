@@ -269,3 +269,12 @@
   バックエンド強制時の Esc は素の `\e` に（修飾付き CSI u = Shift+Enter は維持）。
   e2e 2 本 + 単体テスト追加。別件: ロケールカナリアの挙動反転を観測 eprintln へ降格
 - 次: ユーザー再起動 → manual-checks「Esc『27u』挿入バグ修正」節の実機確認
+
+## 2026-06-13（実機バグ 3 件一括修正: 管理外誤判定 / kill 確認見切れ / ステータスバー消失）
+
+- ① attach 済み外部 tmux セッション（例: master-tako）の「管理外」誤判定 →
+  clients の tty 突き合わせで該当タブ枠へ window 一覧ごと紐付け表示（FR-2.16.9 要件化）
+  ② kill 確認 UI をメッセージ + ボタンの縦積みへ共通化（render_kill_confirm、見切れ根治）
+  ③ ステータスバー消失 = taffy flex 子の min-content 最小サイズが根因 → 中段 min_h(0) +
+  各バー flex_none（教訓は architecture.md）。セルフテスト 109 項目緑（61f 追加）
+- 次: ユーザー再起動 → manual-checks「実機バグ 3 件一括修正」節の実機確認

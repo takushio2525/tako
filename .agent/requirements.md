@@ -370,6 +370,7 @@ close（= バックエンドセッション kill）のまま。
 | FR-2.16.6 | **パネル内部タブの 1 本化**: 中身が表示される現 agents ビューを「**tmux**」へリネームし、空表示バグのある旧 tmuxview を削除して統合する。統合後の理想表示 = tako の**タブごとに「タブ名ラベル付きの四角枠」で囲い、枠内にそのタブの全ペインを並べる入れ子表示** | M | ✅ 2026-06-12 |
 | FR-2.16.7 | 統合ビューの各ペイン行の右に**ゴミ箱ボタン** →「kill していいですか?」**確認 → kill**（dispatch 経由）。行が横幅を超える場合は**折り返しまたは省略（…）で見切れさせない**。tmux セッション列挙が正しく動くことを保証する（**旧 tmuxview の空表示バグの解消**を含む） | M | ✅ 2026-06-12 |
 | FR-2.16.8 | 統合 tmux ビューに**どのタブにも表示されていないものを検知・表示するセクション**を設ける。対象は (a) **tako 管理外**の tmux セッション（ユーザーが直接立てたもの等）と (b) **kill 漏れ?** = tako から起動されたが対応ペインを失った orphan バックエンドセッション。両者をラベルで見た目区別し、どちらも**確認つき kill** ができる（FR-2.18 の自動サーフェスとは別物 = こちらは可視化と手動 kill） | M | ✅ 2026-06-12 |
+| FR-2.16.9 | **タブ内 attach 済みセッションのタブ紐付け表示**: tako ペイン内で `tmux attach` されている外部 tmux セッション（例: orchestrator の master セッションを別サーバーから attach）は「管理外」へ落とさず、attach クライアントの tty と tako ペインの tty 突き合わせで**該当タブの枠内に紐付けて表示**する（セッション名 + attach 先ペイン + window 一覧。window 単位の確認つき kill も可能）。CLI / MCP は既存 `tako tmux list` / `tako_tmux_list` の `clients[].tab/pane` で同じ対応情報を取得できる（新規操作なし = 開発不変条件充足） | M | ✅ 2026-06-13 |
 
 実装メモ（FR-2.16.4〜2.16.8。2026-06-12 仕様化・同日実装）:
 
@@ -379,9 +380,13 @@ close（= バックエンドセッション kill）のまま。
   `filetree` パラメータ追加（`tako panel --filetree on/off` / MCP `tako_panel` の
   `filetree`。応答 JSON にも `filetree` を含む。新ツールは増やさず計 20 のまま）。
   パネルビューの wire 値は `tmux | git`（`agents` は廃止）
-- 統合 tmux ビューのデータ層は `tmux_view_groups()`（タブ枠）+
-  `tmux_unlisted_sessions()`（FR-2.16.8 の分類）として表示と分離（FR-2.13.5 の継承）。
-  ペイン行の kill は dispatch `Close`、未表示セッションの kill は dispatch `TmuxKill`
+- 統合 tmux ビューのデータ層は `tmux_view_groups()`（タブ枠。FR-2.16.9 の attach 済み
+  セッション紐付け = `tmux_sessions_attached_to()` を含む）+
+  `tmux_unlisted_sessions()`（FR-2.16.8 の分類。attach 済みは除外）として表示と分離
+  （FR-2.13.5 の継承）。ペイン行の kill は dispatch `Close`、attach 済み / 未表示
+  セッションの kill は dispatch `TmuxKill`
+- kill 確認 UI は**メッセージ行（折り返し）+ ボタン行の縦積み**（`render_kill_confirm`）。
+  flex_row 一列だと長い確認文言でボタンごとパネル右端へ見切れる（2026-06-13 実機バグ②）
 - localhost ポートパネル（FR-2.19）もこの情報パネルのビューとして追加予定
 
 ### ペインタイトルバー（FR-2.1.3 の表示更新。2026-06-12 実装）
