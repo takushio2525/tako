@@ -4,23 +4,16 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-06-13・D&D 3 件完了直後）
+## 現在の対象（2026-06-13・パフォーマンスバグ修正完了）
 
-- **ドラッグ&ドロップ 3 件を実装**（FR-2.16.10 / FR-3.11 / FR-1.10）:
-  ① 統合 tmux ビューのセッション（attach 済み・管理外・kill漏れ）を D&D でタブ内へ
-  取り込み = 分割ペインで `TMUX= tmux attach`（dispatch `TmuxOpen` + `tako tmux open` +
-  MCP `tako_tmux_open` = **計 22 ツール**） ② ファイルツリーのファイルを D&D で
-  ドロップ位置にプレビュー（`OpenFile` に `direction` 追加。中央 40% = 従来の再利用）
-  ③ ペインタイトルバーの D&D で同タブ内移動（iTerm2 流。`Workspace::move_pane_to` +
-  `MovePane` の `target`/`direction` 拡張）。3 件共通でドロップ先ハイライト +
-  挿入プレビュー（象限 → 半面強調 + 結果ラベル）。実装メモは `requirements.md`
-  FR-2.16.10 / FR-3.11 実装メモ節
-- 直前の完了: ワークスペース第 1 弾（FR-3.1 改 / 3.2 / 3.3。コードプレビュー /
-  Markdown トグル / マルチルートツリー）
-- セルフテスト **120 項目**緑（68 = tmux open e2e / 68b = OpenFile direction /
-  68c = MovePane target 追加）・cargo test 全緑・clippy / fmt 緑・`.app` 反映済み・
-  **ユーザーの再起動 + manual-checks「ドラッグ&ドロップ 3 件」
-  「ワークスペース機能第 1 弾」両節の実機確認待ち**
+- **パフォーマンスバグ 3 件を修正**:
+  ① preview::load の syntect ハイライトを background executor へ非同期化（UI コスト
+  200ms+ → 0.8ms、248 倍高速化。平文即表示 + 色は後から付く 2 段階 UX）
+  ② sync_filetree_roots の毎フレーム is_dir() stat syscall を除去
+  ③ FileTree::refresh の read_dir を background executor へ移行
+- 直前の完了: D&D 3 件（FR-2.16.10 / FR-3.11 / FR-1.10）
+- セルフテスト **120 項目**緑・cargo test 88 pass・clippy / fmt 緑・`.app` 反映済み
+- **ユーザーの再起動 + 体感確認待ち**
 - 最終更新: 2026-06-13
 
 ## 未着手タスク（優先順はユーザーと相談）
@@ -45,6 +38,9 @@
   90% 到達のためユーザーが停止。workflow ファイルは有効なまま）。push 後に CI 実行が
   作成されないのは正常 → CI 待ちポーリングはしない。品質保証はローカルの
   セルフテスト + `cargo test --workspace` + fmt + clippy 全緑で足りる扱い
+- **UI スレッド同期処理の教訓（2026-06-13）**: syntect ハイライト・read_dir・stat を
+  UI スレッドで同期実行するとフレーム落ちの原因になる。1ms 以上かかる I/O / CPU 計算は
+  background executor へ。詳細は `architecture.md`「UI スレッド同期処理のパフォーマンス教訓」
 - **プレビューペインは terminals に居ない**: `terminals.get(pane)` が None でも正常系。
   ペイン横断の処理（集約・kill・close）は previews も見ること（close 系 3 経路 +
   detach_session で previews を掃除済み）。`render_pane` の返り値は `AnyElement` 化済み
@@ -69,7 +65,7 @@
   extended-keys は always 必須。conf はサーバー起動時のみ → 稼働サーバーへは `sync_conf`
 - **ネスト tmux の推奨設定の正は `tmux_backend::NESTED_TMUX_SNIPPET`**
 - **接続情報**: `instances/control-<pid>.json` + current。CLI は生存候補へ自動フォールバック
-- セルフテストは **114 項目**。IME 項目は稀にフレーク（再実行で緑）
+- セルフテストは **120 項目**。IME 項目は稀にフレーク（再実行で緑）
 - gpui ソース参照は `~/.cargo/git/checkouts/zed-*/cafbf4b/crates/gpui*` のみ（Apache-2.0）
 
 ## 現フェーズで Read すべき設計書

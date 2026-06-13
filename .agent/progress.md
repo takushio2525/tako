@@ -301,3 +301,11 @@
   セルフテスト 120 項目緑（68/68b/68c 追加）・cargo test / fmt / clippy 全緑
 - 関連コミット: `16a01eb` `[機能追加] D&D 3件` / `1daa5b9` `[修正] zsh equals 展開`
 - 次: ユーザー再起動 → manual-checks「ドラッグ&ドロップ 3 件」節の実機確認
+
+## 2026-06-13（パフォーマンスバグ修正: UI スレッド非ブロック化 3 件）
+
+- ① preview::load を 2 段階化（load_fast 平文即表示 0.8ms + background highlight 200ms+。
+  UI ブロック 248 倍高速化）② sync_filetree_roots の毎フレーム is_dir() stat 除去
+  ③ FileTree::refresh の read_dir を background executor へ移行。教訓は architecture.md
+- 関連コミット: `e1ed21e` `[改善] プレビュー/ファイルツリーのパフォーマンスバグ修正`
+- 次: ユーザー再起動 → 体感確認
