@@ -363,6 +363,8 @@ struct TakoApp {
     token: Option<String>,
     /// dispatch 中に依頼されたセッション起動（GPUI の Context が要るため遅延実行する）
     pending_attach: Vec<(PaneId, SpawnOptions)>,
+    /// dispatch 中に依頼されたプレビューの background ハイライト（ペイン, パス, 生テキスト）
+    pending_highlights: Vec<(PaneId, std::path::PathBuf, String)>,
     /// IME 変換中の未確定文字列（FR-1.9。None = 変換中でない）
     ime: Option<ImeComposition>,
     /// ドラッグ中のペイン境界（None = ドラッグしていない）
@@ -673,6 +675,7 @@ impl TakoApp {
             mcp,
             token,
             pending_attach: Vec::new(),
+            pending_highlights: Vec::new(),
             ime: None,
             dragging_border: None,
             dragging_scrollbar: None,
@@ -725,8 +728,13 @@ impl TakoApp {
                         "markdown" => preview::PreviewMode::Markdown,
                         _ => preview::PreviewMode::Code,
                     };
-                    app.previews
-                        .insert(pane, preview::load(std::path::Path::new(&p.path), mode));
+                    let path = std::path::Path::new(&p.path);
+                    let (state, raw) = preview::load_fast(path, mode);
+                    if let Some(text) = raw {
+                        app.pending_highlights
+                            .push((pane, path.to_path_buf(), text));
+                    }
+                    app.previews.insert(pane, state);
                     continue;
                 }
                 if let Some(name) = &r.session {
@@ -747,6 +755,10 @@ impl TakoApp {
             if app.terminals.is_empty() && app.previews.is_empty() {
                 eprintln!("fatal: 復元したペインを 1 つも起動できない");
                 std::process::exit(1);
+            }
+            // 復元時のプレビューも background でハイライトする
+            for (pane, path, text) in std::mem::take(&mut app.pending_highlights) {
+                app.spawn_highlight(pane, path, text, cx);
             }
         }
 
@@ -777,6 +789,10 @@ impl TakoApp {
                             )));
                         }
                     }
+                    // プレビューの syntect ハイライトを background で実行する
+                    for (pane, path, text) in std::mem::take(&mut app.pending_highlights) {
+                        app.spawn_highlight(pane, path, text, cx);
+                    }
                     // AI / CLI 操作によるレイアウト変化を即座に永続化する（Phase 5.5）
                     app.save_layout();
                     cx.notify();
@@ -794,22 +810,38 @@ impl TakoApp {
         .detach();
 
         // パネルの tmux 一覧表示中は 2 秒毎に更新する（FR-2.13。非表示中は何もしない）。
-        // ファイルツリー（FR-3.1）の内容追従も同じ間隔で行う
+        // ファイルツリー（FR-3.1）の内容追従も同じ間隔で行う（I/O は background）
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(2)).await;
-            let result = this.update(cx, |app: &mut TakoApp, cx| {
+            // ① main thread: tmux 更新 + root 同期 + スキャン対象収集
+            let targets = this.update(cx, |app: &mut TakoApp, cx| {
                 if app.panel_visible && app.panel_view == PanelView::Tmux {
                     app.refresh_tmux(cx);
                 }
                 app.sync_filetree_roots();
-                if app.filetree.visible && app.filetree.refresh() {
-                    cx.notify();
-                }
-                // UI 操作・cwd 変化によるレイアウト変化の定期保存（Phase 5.5。差分時のみ書く）
                 app.save_layout();
+                if app.filetree.visible {
+                    Some(app.filetree.refresh_targets())
+                } else {
+                    None
+                }
             });
-            if result.is_err() {
-                break; // View が破棄された
+            let Ok(targets) = targets else { break };
+            // ② background: ディレクトリ読み取り（read_dir + stat）
+            if let Some(targets) = targets {
+                let task = cx
+                    .background_executor()
+                    .spawn(async move { filetree::scan_dirs(&targets) });
+                let results = task.await;
+                // ③ main thread: 結果適用
+                let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                    if app.filetree.apply_refresh(results) {
+                        cx.notify();
+                    }
+                });
+                if ok.is_err() {
+                    break;
+                }
             }
         })
         .detach();
@@ -2365,23 +2397,17 @@ impl TakoApp {
             .child("ブランチ・コミットのグラフ表示をここに追加予定")
     }
 
-    /// ファイルツリーの root をフォーカスペインの cwd（無ければ $HOME）に追従させる
-    /// （FR-3.1。render・トグル・定期ループから呼ばれる。非表示中は何もしない）
-    /// 「タブ = ワークスペース」の同期(FR-3.1。2026-06-13 変更): アクティブタブ内の
-    /// 全ペインの cwd（OSC 7）をワークスペースフォルダとしてツリーへ並べる。
-    /// cwd が 1 つも取れないときはホームへフォールバック
+    /// ファイルツリーの root をアクティブタブ内全ペインの cwd に追従させる（FR-3.1）。
+    /// render・トグル・定期ループから呼ばれる。非表示中は何もしない。
+    /// is_dir() の stat syscall は毎フレーム呼ぶと重いため省略し、
+    /// 2 秒の refresh() で存在しないディレクトリを回収する
     fn sync_filetree_roots(&mut self) {
         if !self.filetree.visible {
             return;
         }
         let mut roots: Vec<std::path::PathBuf> = Vec::new();
         for pane in self.workspace.active_tab().tree().panes() {
-            let Some(cwd) = self
-                .terminals
-                .get(&pane.id())
-                .and_then(|s| s.cwd())
-                .filter(|p| p.is_dir())
-            else {
+            let Some(cwd) = self.terminals.get(&pane.id()).and_then(|s| s.cwd()) else {
                 continue;
             };
             let cwd = cwd.to_path_buf();
@@ -2548,8 +2574,38 @@ impl TakoApp {
             preview::PreviewMode::Markdown => preview::PreviewMode::Code,
         };
         let path = state.path.clone();
-        self.previews.insert(pane_id, preview::load(&path, mode));
+        let (new_state, raw) = preview::load_fast(&path, mode);
+        self.previews.insert(pane_id, new_state);
+        if let Some(text) = raw {
+            self.spawn_highlight(pane_id, path, text, cx);
+        }
         cx.notify();
+    }
+
+    /// syntect ハイライトを background executor で実行し、完了後にプレビューを差し替える
+    fn spawn_highlight(
+        &self,
+        pane: PaneId,
+        path: std::path::PathBuf,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let p = path.clone();
+            let task = cx
+                .background_executor()
+                .spawn(async move { preview::highlight_text(&p, &text) });
+            let lines = task.await;
+            let _ = this.update(cx, |app, cx| {
+                if let Some(state) = app.previews.get_mut(&pane) {
+                    if state.path == path {
+                        state.content = preview::PreviewContent::Code(lines);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     // --- D&D（FR-2.16.10 tmux セッション取り込み / FR-3.11 ファイルプレビュー） ---
@@ -4461,13 +4517,13 @@ impl ControlHost for TakoApp {
         path: &str,
         mode: tako_control::protocol::PreviewModeWire,
     ) {
-        self.previews.insert(
-            pane,
-            preview::load(
-                std::path::Path::new(path),
-                preview::PreviewMode::from_wire(mode),
-            ),
-        );
+        let path = std::path::Path::new(path);
+        let (state, raw) = preview::load_fast(path, preview::PreviewMode::from_wire(mode));
+        if let Some(text) = raw {
+            self.pending_highlights
+                .push((pane, path.to_path_buf(), text));
+        }
+        self.previews.insert(pane, state);
     }
 
     fn preview_pane_of_tab(&self, tab: TabId) -> Option<PaneId> {

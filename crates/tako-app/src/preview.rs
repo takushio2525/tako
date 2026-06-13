@@ -127,8 +127,8 @@ pub fn is_markdown_path(path: &Path) -> bool {
     )
 }
 
-/// ファイルを読み込んでプレビュー状態を作る。読めない場合も Error 内容として返す
-/// （呼び出し側はペインを開いたまま理由を見せる）
+/// ファイルを読み込んでプレビュー状態を作る（テスト用。本番は load_fast + background highlight）
+#[cfg(test)]
 pub fn load(path: &Path, mode: PreviewMode) -> PreviewState {
     let (text, truncated) = match read_text(path) {
         Ok(pair) => pair,
@@ -151,6 +151,48 @@ pub fn load(path: &Path, mode: PreviewMode) -> PreviewState {
         content,
         truncated,
     }
+}
+
+/// 高速ロード（UI スレッド用）: ファイルを読むが syntect ハイライトはスキップする。
+/// Code モードは平文（色なし）を返し、呼び出し側が background で [`highlight_text`] を
+/// 走らせて差し替える。Markdown は pulldown-cmark が十分速いのでそのまま完成版を返す。
+/// 戻り値の `Option<String>` は Code モードの生テキスト（background ハイライト用）
+pub fn load_fast(path: &Path, mode: PreviewMode) -> (PreviewState, Option<String>) {
+    let (text, truncated) = match read_text(path) {
+        Ok(pair) => pair,
+        Err(message) => {
+            return (
+                PreviewState {
+                    path: path.to_path_buf(),
+                    mode,
+                    content: PreviewContent::Error(message),
+                    truncated: false,
+                },
+                None,
+            );
+        }
+    };
+    let (content, raw) = match mode {
+        PreviewMode::Markdown => (PreviewContent::Markdown(markdown_blocks(&text)), None),
+        PreviewMode::Code => {
+            let lines = text.lines().map(|l| vec![plain_span(l)]).collect();
+            (PreviewContent::Code(lines), Some(text))
+        }
+    };
+    (
+        PreviewState {
+            path: path.to_path_buf(),
+            mode,
+            content,
+            truncated,
+        },
+        raw,
+    )
+}
+
+/// background executor 上で呼ぶ: syntect ハイライトだけを実行して行列を返す
+pub fn highlight_text(path: &Path, text: &str) -> Vec<Line> {
+    highlighter().highlight(path, text)
 }
 
 /// テキストとして読む。バイナリ（NUL 含有）は明示エラー、上限超過は切り詰める
@@ -536,6 +578,66 @@ mod tests {
         let state = load(&dir.join("no-such.txt"), PreviewMode::Code);
         assert!(matches!(&state.content, PreviewContent::Error(_)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 性能計測（通常テストでは走らせない）: `cargo test -p tako-app --release -- --ignored --nocapture perf_`
+    #[test]
+    #[ignore]
+    fn perf_ハイライト計測() {
+        use std::time::Instant;
+        let src_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+
+        let t0 = Instant::now();
+        let hl = highlighter();
+        let init = t0.elapsed();
+        eprintln!("[perf] SyntaxSet+Theme ロード: {:?}", init);
+
+        let text = std::fs::read_to_string(&src_path).unwrap();
+        let lines = text.lines().count().min(MAX_LINES);
+        let capped: String = text.lines().take(MAX_LINES).collect::<Vec<_>>().join("\n");
+
+        let t1 = Instant::now();
+        let out = hl.highlight(&src_path, &capped);
+        eprintln!(
+            "[perf] highlight main.rs（{} 行）: {:?}（{} 行出力）",
+            lines,
+            t1.elapsed(),
+            out.len()
+        );
+
+        // 2 回目（SyntaxSet ロード済み）の load() 全体 = 旧同期経路
+        let t2 = Instant::now();
+        let state = load(&src_path, PreviewMode::Code);
+        eprintln!(
+            "[perf] load() 同期全体: {:?} truncated={}",
+            t2.elapsed(),
+            state.truncated
+        );
+
+        // load_fast = UI スレッドが払うコスト（ファイル読み + 平文化のみ）
+        let t2b = Instant::now();
+        let (fast_state, raw) = load_fast(&src_path, PreviewMode::Code);
+        eprintln!(
+            "[perf] load_fast() UI コスト: {:?} truncated={} raw={}bytes",
+            t2b.elapsed(),
+            fast_state.truncated,
+            raw.as_ref().map(|s| s.len()).unwrap_or(0)
+        );
+
+        // Markdown: このリポジトリの requirements.md（大きめの実物）
+        let md_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.agent/requirements.md");
+        if md_path.is_file() {
+            let md = std::fs::read_to_string(&md_path).unwrap();
+            let t3 = Instant::now();
+            let blocks = markdown_blocks(&md);
+            eprintln!(
+                "[perf] markdown_blocks requirements.md（{} bytes）: {:?}（{} ブロック）",
+                md.len(),
+                t3.elapsed(),
+                blocks.len()
+            );
+        }
     }
 
     #[test]

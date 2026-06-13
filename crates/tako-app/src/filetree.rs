@@ -137,27 +137,52 @@ impl FileTree {
         }
     }
 
-    /// ルート + 展開中ディレクトリの内容を読み直す（ポーリング更新）。
-    /// 変化があれば true。消えたディレクトリはキャッシュ・展開状態から落とす
+    /// 同期 refresh（テスト用。本番は refresh_targets → scan_dirs → apply_refresh）
+    #[cfg(test)]
     pub fn refresh(&mut self) -> bool {
+        let results = scan_dirs(&self.refresh_targets());
+        self.apply_refresh(results)
+    }
+
+    /// background executor 向け: スキャン対象のディレクトリ一覧を返す
+    pub fn refresh_targets(&self) -> Vec<PathBuf> {
         let mut targets: Vec<PathBuf> = self.roots.clone();
         targets.extend(self.expanded.iter().cloned());
         targets.dedup();
+        targets
+    }
+
+    /// background executor の結果を適用する。変化があれば true
+    pub fn apply_refresh(&mut self, results: Vec<(PathBuf, Option<Vec<Entry>>)>) -> bool {
         let mut changed = false;
-        for dir in targets {
-            if !dir.is_dir() {
+        for (dir, entries) in results {
+            if let Some(fresh) = entries {
+                if self.cache.get(&dir) != Some(&fresh) {
+                    self.cache.insert(dir, fresh);
+                    changed = true;
+                }
+            } else {
                 changed |= self.cache.remove(&dir).is_some();
                 changed |= self.expanded.remove(&dir);
-                continue;
-            }
-            let fresh = read_dir_sorted(&dir);
-            if self.cache.get(&dir) != Some(&fresh) {
-                self.cache.insert(dir, fresh);
-                changed = true;
             }
         }
         changed
     }
+}
+
+/// ディレクトリ列をスキャンする（background executor で呼べる純粋 I/O）。
+/// 存在しないディレクトリは None を返す
+pub fn scan_dirs(targets: &[PathBuf]) -> Vec<(PathBuf, Option<Vec<Entry>>)> {
+    targets
+        .iter()
+        .map(|dir| {
+            if dir.is_dir() {
+                (dir.clone(), Some(read_dir_sorted(dir)))
+            } else {
+                (dir.clone(), None)
+            }
+        })
+        .collect()
 }
 
 /// ディレクトリを読んで「ディレクトリ先・名前（大文字小文字無視）順」に並べる。
@@ -286,6 +311,50 @@ mod tests {
             .iter()
             .any(|r| r.entry.name == "docs" && r.expanded));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 性能計測（通常テストでは走らせない）: `cargo test -p tako-app --release -- --ignored --nocapture perf_`
+    #[test]
+    #[ignore]
+    fn perf_ツリー計測() {
+        use std::time::Instant;
+        // 合成: 5000 ファイルの大ディレクトリ（node_modules / target 相当）
+        let big = std::env::temp_dir().join(format!("tako-filetree-perf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&big);
+        std::fs::create_dir_all(&big).unwrap();
+        for i in 0..5000 {
+            std::fs::write(big.join(format!("file-{i:05}.txt")), "x").unwrap();
+        }
+
+        let t0 = Instant::now();
+        let entries = read_dir_sorted(&big);
+        eprintln!(
+            "[perf] read_dir_sorted 5000 エントリ: {:?}（{} 行に切り詰め）",
+            t0.elapsed(),
+            entries.len()
+        );
+
+        // 実リポジトリ相当: tako リポジトリルートを root に、複数ディレクトリ展開
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![repo.clone(), big.clone()]);
+        for sub in ["crates", ".agent", "scripts", "poc"] {
+            tree.toggle_dir(&repo.join(sub));
+        }
+        let t1 = Instant::now();
+        let changed = tree.refresh();
+        eprintln!(
+            "[perf] refresh（root 2 + 展開 4）: {:?} changed={}",
+            t1.elapsed(),
+            changed
+        );
+        let t2 = Instant::now();
+        let rows = tree.rows();
+        eprintln!("[perf] rows(): {:?}（{} 行）", t2.elapsed(), rows.len());
+        let _ = std::fs::remove_dir_all(&big);
     }
 
     #[test]
