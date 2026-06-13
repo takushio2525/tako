@@ -726,6 +726,8 @@ impl TakoApp {
                 if let Some(p) = &r.preview {
                     let mode = match p.mode.as_str() {
                         "markdown" => preview::PreviewMode::Markdown,
+                        "image" => preview::PreviewMode::Image,
+                        "pdf" => preview::PreviewMode::Pdf,
                         _ => preview::PreviewMode::Code,
                     };
                     let path = std::path::Path::new(&p.path);
@@ -2523,6 +2525,18 @@ impl TakoApp {
                                     format!("{chevron}🗂 {}", truncate(&row.entry.name, 22)),
                                 ))
                             } else {
+                                let file_icon = if !is_dir {
+                                    let p = std::path::Path::new(&row.entry.name);
+                                    if preview::image_format_from_path(p).is_some() {
+                                        "🖼 "
+                                    } else if preview::is_pdf_path(p) {
+                                        "📕 "
+                                    } else {
+                                        ""
+                                    }
+                                } else {
+                                    ""
+                                };
                                 base.pl(px(8.0 + 12.0 * row.depth as f32))
                                     .when(!is_dir, |d| {
                                         d.text_color(hsla_alpha(theme.foreground, 0.85))
@@ -2532,7 +2546,7 @@ impl TakoApp {
                                             .text_color(hsla(theme.accent))
                                     })
                                     .child(SharedString::from(format!(
-                                        "{chevron}{}",
+                                        "{chevron}{file_icon}{}",
                                         truncate(&row.entry.name, 24)
                                     )))
                             }
@@ -2564,7 +2578,8 @@ impl TakoApp {
     }
 
     /// プレビューの「コード ⇔ Markdown」トグル（目アイコン。FR-3.3）。
-    /// 同じ状態は dispatch（OpenFile の mode 指定）= CLI / MCP からも切り替えられる
+    /// 同じ状態は dispatch（OpenFile の mode 指定）= CLI / MCP からも切り替えられる。
+    /// Image / Pdf モードではトグルしない
     fn toggle_preview_mode(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
         let Some(state) = self.previews.get(&pane_id) else {
             return;
@@ -2572,6 +2587,7 @@ impl TakoApp {
         let mode = match state.mode {
             preview::PreviewMode::Code => preview::PreviewMode::Markdown,
             preview::PreviewMode::Markdown => preview::PreviewMode::Code,
+            preview::PreviewMode::Image | preview::PreviewMode::Pdf => return,
         };
         let path = state.path.clone();
         let (new_state, raw) = preview::load_fast(&path, mode);
@@ -2580,6 +2596,41 @@ impl TakoApp {
             self.spawn_highlight(pane_id, path, text, cx);
         }
         cx.notify();
+    }
+
+    /// PDF のページ送り（FR-3.4）。next=true で次ページ、false で前ページ。
+    /// background executor でレンダリングして差し替える
+    fn pdf_change_page(&mut self, pane_id: PaneId, next: bool, cx: &mut Context<Self>) {
+        let Some(state) = self.previews.get(&pane_id) else {
+            return;
+        };
+        let preview::PreviewContent::Pdf(data) = &state.content else {
+            return;
+        };
+        let new_page = if next {
+            if data.current_page + 1 >= data.total_pages {
+                return;
+            }
+            data.current_page + 1
+        } else {
+            if data.current_page == 0 {
+                return;
+            }
+            data.current_page - 1
+        };
+        let path = state.path.clone();
+        cx.spawn(async move |this, cx| {
+            let p = path.clone();
+            let task = cx
+                .background_executor()
+                .spawn(async move { preview::load_pdf(&p, new_page) });
+            let new_state = task.await;
+            let _ = this.update(cx, |app, cx| {
+                app.previews.insert(pane_id, new_state);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// syntect ハイライトを background executor で実行し、完了後にプレビューを差し替える
@@ -4017,6 +4068,13 @@ impl TakoApp {
         let mode = state.mode;
         let truncated = state.truncated;
 
+        // Image / Pdf ではタイトルバーのトグルボタンを出さず、代わりにページ送りを出す
+        let pdf_info = if let preview::PreviewContent::Pdf(data) = &state.content {
+            Some((data.current_page, data.total_pages))
+        } else {
+            None
+        };
+
         // 本文要素を先に組む（state の借用をここで終える）
         let body: Vec<gpui::AnyElement> = match &state.content {
             preview::PreviewContent::Code(lines) => {
@@ -4034,6 +4092,47 @@ impl TakoApp {
                 .iter()
                 .map(|block| self.preview_md_block(block))
                 .collect(),
+            preview::PreviewContent::Image(data) => {
+                let gpui_format = match data.format {
+                    preview::ImageFileFormat::Png => gpui::ImageFormat::Png,
+                    preview::ImageFileFormat::Jpeg => gpui::ImageFormat::Jpeg,
+                    preview::ImageFileFormat::Gif => gpui::ImageFormat::Gif,
+                    preview::ImageFileFormat::WebP => gpui::ImageFormat::Webp,
+                    preview::ImageFileFormat::Svg => gpui::ImageFormat::Svg,
+                };
+                let image =
+                    std::sync::Arc::new(gpui::Image::from_bytes(gpui_format, data.bytes.clone()));
+                vec![div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        gpui::img(image)
+                            .object_fit(gpui::ObjectFit::Contain)
+                            .max_w_full()
+                            .max_h_full(),
+                    )
+                    .into_any_element()]
+            }
+            preview::PreviewContent::Pdf(data) => {
+                let image = std::sync::Arc::new(gpui::Image::from_bytes(
+                    gpui::ImageFormat::Png,
+                    data.page_png.clone(),
+                ));
+                vec![div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        gpui::img(image)
+                            .object_fit(gpui::ObjectFit::Contain)
+                            .max_w_full()
+                            .max_h_full(),
+                    )
+                    .into_any_element()]
+            }
             preview::PreviewContent::Error(message) => vec![div()
                 .p_2()
                 .text_color(hsla(theme.ansi[1]))
@@ -4125,10 +4224,14 @@ impl TakoApp {
                             } else {
                                 hsla(theme.tab_inactive_foreground)
                             })
-                            .child(SharedString::from(format!(
-                                "📄 {}",
-                                truncate(&file_name, 36)
-                            ))),
+                            .child(SharedString::from({
+                                let icon = match mode {
+                                    preview::PreviewMode::Image => "🖼",
+                                    preview::PreviewMode::Pdf => "📕",
+                                    _ => "📄",
+                                };
+                                format!("{icon} {}", truncate(&file_name, 36))
+                            })),
                     )
                     .child(div().flex_grow(1.0))
                     .children(md_capable.then(|| {
@@ -4136,6 +4239,7 @@ impl TakoApp {
                         let (icon, label) = match mode {
                             preview::PreviewMode::Markdown => ("</>", "コードとして表示"),
                             preview::PreviewMode::Code => ("👁", "md レンダリング表示"),
+                            _ => ("", ""),
                         };
                         div()
                             .id(("preview-mode-toggle", pane_id.as_u64()))
@@ -4157,6 +4261,85 @@ impl TakoApp {
                                 this.toggle_preview_mode(pane_id, cx);
                             }))
                             .child(SharedString::from(format!("{icon} {label}")))
+                    }))
+                    // PDF ページ送りボタン（FR-3.4）
+                    .children(pdf_info.map(|(current, total)| {
+                        let has_prev = current > 0;
+                        let has_next = current + 1 < total;
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id(("pdf-prev", pane_id.as_u64()))
+                                    .px_1()
+                                    .rounded_sm()
+                                    .cursor(if has_prev {
+                                        CursorStyle::PointingHand
+                                    } else {
+                                        CursorStyle::Arrow
+                                    })
+                                    .text_color(if has_prev {
+                                        hsla(theme.accent)
+                                    } else {
+                                        hsla_alpha(theme.tab_inactive_foreground, 0.4)
+                                    })
+                                    .when(has_prev, |d| {
+                                        d.hover(|d| {
+                                            d.bg(rgba_alpha(theme.tab_active_background, 0.8))
+                                        })
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation()
+                                        }),
+                                    )
+                                    .when(has_prev, |d| {
+                                        d.on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.pdf_change_page(pane_id, false, cx);
+                                        }))
+                                    })
+                                    .child("<"),
+                            )
+                            .child(SharedString::from(format!("{}/{}", current + 1, total)))
+                            .child(
+                                div()
+                                    .id(("pdf-next", pane_id.as_u64()))
+                                    .px_1()
+                                    .rounded_sm()
+                                    .cursor(if has_next {
+                                        CursorStyle::PointingHand
+                                    } else {
+                                        CursorStyle::Arrow
+                                    })
+                                    .text_color(if has_next {
+                                        hsla(theme.accent)
+                                    } else {
+                                        hsla_alpha(theme.tab_inactive_foreground, 0.4)
+                                    })
+                                    .when(has_next, |d| {
+                                        d.hover(|d| {
+                                            d.bg(rgba_alpha(theme.tab_active_background, 0.8))
+                                        })
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation()
+                                        }),
+                                    )
+                                    .when(has_next, |d| {
+                                        d.on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.pdf_change_page(pane_id, true, cx);
+                                        }))
+                                    })
+                                    .child(">"),
+                            )
                     }))
                     .child(
                         div()
@@ -7877,6 +8060,134 @@ mod self_test {
                 move_ok,
                 "MovePane target+direction の挿し直し（タイトルバー D&D 同等）",
             );
+
+            // 69. 画像プレビュー（FR-3.10）: dispatch OpenFile で PNG を開き、
+            //     Image モードで表示される。拡張子ベースの自動判定が効く。
+            //     list にも preview.mode="image" として公開される
+            let img_dir =
+                std::env::temp_dir().join(format!("tako-selftest-img-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&img_dir);
+            std::fs::create_dir_all(&img_dir).expect("一時ディレクトリを作れる");
+            // 最小の有効な PNG（1x1 透明ピクセル）
+            let png_bytes: Vec<u8> = vec![
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49,
+                0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06,
+                0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44,
+                0x41, 0x54, 0x78, 0x9C, 0x62, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE5, 0x27,
+                0xDE, 0xFC, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60,
+                0x82,
+            ];
+            std::fs::write(img_dir.join("test.png"), &png_bytes).unwrap();
+            // JPEG のダミー（マジックバイトだけ。デコードは GPUI 側でここでは読み込みのみ）
+            std::fs::write(img_dir.join("photo.jpg"), [0xFF, 0xD8, 0xFF, 0xE0]).unwrap();
+            let img_ok = window
+                .update(cx, |app, _, _cx| {
+                    let base = app.focused_pane().as_u64();
+                    let open = |app: &mut TakoApp, path: String| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::OpenFile {
+                                pane: Some(base),
+                                path,
+                                mode: None,
+                                direction: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                    };
+                    // PNG を開く
+                    let r =
+                        open(app, img_dir.join("test.png").display().to_string()).expect("PNG を開ける");
+                    let pane_id = r["pane"].as_u64().expect("pane が返る");
+                    let png_ok = r["mode"].as_str() == Some("image")
+                        && app
+                            .previews
+                            .iter()
+                            .any(|(pid, p)| {
+                                pid.as_u64() == pane_id
+                                    && matches!(
+                                        &p.content,
+                                        preview::PreviewContent::Image(d)
+                                            if d.format == preview::ImageFileFormat::Png
+                                    )
+                            });
+                    // JPEG を同じプレビューペインで再利用して開く
+                    let r2 =
+                        open(app, img_dir.join("photo.jpg").display().to_string()).expect("JPEG を開ける");
+                    let jpg_ok = r2["mode"].as_str() == Some("image")
+                        && r2["pane"].as_u64() == Some(pane_id); // 再利用
+                    // list に preview.mode="image" が見える
+                    let list =
+                        tako_control::dispatch(app, tako_control::protocol::Request::List, PaneOrigin::Cli)
+                            .expect("list は成功する");
+                    let has_image = list.to_string().contains("\"image\"");
+                    // 後片付け
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Close {
+                            pane: Some(pane_id),
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    png_ok && jpg_ok && has_image
+                })
+                .unwrap_or(false);
+            check(img_ok, "画像プレビュー（FR-3.10。PNG / JPEG の OpenFile と list 公開）");
+            let _ = std::fs::remove_dir_all(&img_dir);
+
+            // 70. PDF プレビュー（FR-3.4 macOS）: dispatch OpenFile で PDF を開き、
+            //     Pdf モードで Core Graphics レンダリングされたページが表示される
+            #[cfg(target_os = "macos")]
+            {
+                let pdf_dir =
+                    std::env::temp_dir().join(format!("tako-selftest-pdf-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&pdf_dir);
+                std::fs::create_dir_all(&pdf_dir).expect("一時ディレクトリを作れる");
+                // 最小の有効な PDF（1 ページ・空白）
+                let pdf_content = b"%PDF-1.0\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj 2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj 3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj\nxref\n0 4\n0000000000 65535 f \n0000000009 00065 n \n0000000058 00000 n \n0000000115 00000 n \ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n190\n%%EOF";
+                std::fs::write(pdf_dir.join("test.pdf"), pdf_content).unwrap();
+                let pdf_ok = window
+                    .update(cx, |app, _, _cx| {
+                        let base = app.focused_pane().as_u64();
+                        let r = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::OpenFile {
+                                pane: Some(base),
+                                path: pdf_dir.join("test.pdf").display().to_string(),
+                                mode: None,
+                                direction: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .expect("PDF を開ける");
+                        let pane_id = r["pane"].as_u64().expect("pane が返る");
+                        let mode_ok = r["mode"].as_str() == Some("pdf");
+                        let content_ok = app
+                            .previews
+                            .iter()
+                            .any(|(pid, p)| {
+                                pid.as_u64() == pane_id
+                                    && matches!(
+                                        &p.content,
+                                        preview::PreviewContent::Pdf(d)
+                                            if d.total_pages == 1
+                                                && d.current_page == 0
+                                                && !d.page_png.is_empty()
+                                    )
+                            });
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Close {
+                                pane: Some(pane_id),
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        mode_ok && content_ok
+                    })
+                    .unwrap_or(false);
+                check(pdf_ok, "PDF プレビュー（FR-3.4。Core Graphics レンダリング）");
+                let _ = std::fs::remove_dir_all(&pdf_dir);
+            }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {

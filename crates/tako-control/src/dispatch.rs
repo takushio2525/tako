@@ -634,6 +634,15 @@ pub fn dispatch(
                 mode.unwrap_or_else(|| match resolved.extension().and_then(|e| e.to_str()) {
                     Some(ext) if ext.eq_ignore_ascii_case("md") => PreviewModeWire::Markdown,
                     Some(ext) if ext.eq_ignore_ascii_case("markdown") => PreviewModeWire::Markdown,
+                    Some(ext)
+                        if matches!(
+                            ext.to_ascii_lowercase().as_str(),
+                            "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg"
+                        ) =>
+                    {
+                        PreviewModeWire::Image
+                    }
+                    Some(ext) if ext.eq_ignore_ascii_case("pdf") => PreviewModeWire::Pdf,
                     _ => PreviewModeWire::Code,
                 });
             // 表示先の解決: direction 指定（FR-3.11 = D&D のドロップ位置）なら再利用せず

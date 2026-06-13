@@ -90,7 +90,7 @@ impl PanelViewWire {
     }
 }
 
-/// プレビューペインの表示モード（FR-3.2 / FR-3.3）。
+/// プレビューペインの表示モード（FR-3.2 / FR-3.3 / FR-3.10 / FR-3.4）。
 /// Markdown ファイルは目アイコンのトグル（UI）または CLI / MCP の mode 指定で
 /// 「コードとして表示」⇔「md レンダリング表示」を切り替えられる
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +98,8 @@ impl PanelViewWire {
 pub enum PreviewModeWire {
     Code,
     Markdown,
+    Image,
+    Pdf,
 }
 
 impl PreviewModeWire {
@@ -105,6 +107,8 @@ impl PreviewModeWire {
         match self {
             PreviewModeWire::Code => "code",
             PreviewModeWire::Markdown => "markdown",
+            PreviewModeWire::Image => "image",
+            PreviewModeWire::Pdf => "pdf",
         }
     }
 }

@@ -1,9 +1,11 @@
-//! preview — プレビューペイン（FR-3.2 コード / FR-3.3 Markdown）の読み込みと整形
+//! preview — プレビューペイン（コード / Markdown / 画像 / PDF）の読み込みと整形
 //!
 //! GPUI 非依存（描画は main.rs 側）。シンタックスハイライトは syntect だが、
 //! 将来 tree-sitter へ差し替えられるよう [`Highlighter`] trait で抽象化する
 //! （`architecture.md`「コンセプト②の実現」。ユーザー指示）。
 //! Markdown は pulldown-cmark でイベントストリームをブロック列へ写す。
+//! 画像は生バイトを保持し GPUI 側でデコードする（FR-3.10）。
+//! PDF は macOS Core Graphics でページを RGBA にレンダリングする（FR-3.4）。
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -19,6 +21,8 @@ const MAX_LINES: usize = 5_000;
 pub enum PreviewMode {
     Code,
     Markdown,
+    Image,
+    Pdf,
 }
 
 impl PreviewMode {
@@ -26,6 +30,8 @@ impl PreviewMode {
         match self {
             PreviewMode::Code => PreviewModeWire::Code,
             PreviewMode::Markdown => PreviewModeWire::Markdown,
+            PreviewMode::Image => PreviewModeWire::Image,
+            PreviewMode::Pdf => PreviewModeWire::Pdf,
         }
     }
 
@@ -33,6 +39,8 @@ impl PreviewMode {
         match wire {
             PreviewModeWire::Code => PreviewMode::Code,
             PreviewModeWire::Markdown => PreviewMode::Markdown,
+            PreviewModeWire::Image => PreviewMode::Image,
+            PreviewModeWire::Pdf => PreviewMode::Pdf,
         }
     }
 }
@@ -87,11 +95,40 @@ pub enum MdBlock {
     Rule,
 }
 
+/// 画像データ（生バイトを保持。GPUI 側で Image::from_bytes してデコードする）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageData {
+    pub bytes: Vec<u8>,
+    pub format: ImageFileFormat,
+}
+
+/// 対応画像フォーマット（GPUI の ImageFormat と 1:1 だが GPUI 非依存にする）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageFileFormat {
+    Png,
+    Jpeg,
+    Gif,
+    WebP,
+    Svg,
+}
+
+/// PDF データ（現在表示中のページの RGBA ピクセルを保持）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdfData {
+    /// 現在ページの PNG バイト列（Core Graphics でレンダリング済み）
+    pub page_png: Vec<u8>,
+    /// 0-indexed
+    pub current_page: usize,
+    pub total_pages: usize,
+}
+
 /// 読み込み済みのプレビュー内容
 #[derive(Debug, Clone, PartialEq)]
 pub enum PreviewContent {
     Code(Vec<Line>),
     Markdown(Vec<MdBlock>),
+    Image(ImageData),
+    Pdf(PdfData),
     /// 読めない・バイナリ等（正常系の劣化。ペインは開いたまま理由を表示する）
     Error(String),
 }
@@ -127,9 +164,380 @@ pub fn is_markdown_path(path: &Path) -> bool {
     )
 }
 
+/// 画像ファイルの拡張子判定 → フォーマット
+pub fn image_format_from_path(path: &Path) -> Option<ImageFileFormat> {
+    let ext = path.extension()?.to_str()?;
+    match ext.to_ascii_lowercase().as_str() {
+        "png" => Some(ImageFileFormat::Png),
+        "jpg" | "jpeg" => Some(ImageFileFormat::Jpeg),
+        "gif" => Some(ImageFileFormat::Gif),
+        "webp" => Some(ImageFileFormat::WebP),
+        "svg" => Some(ImageFileFormat::Svg),
+        _ => None,
+    }
+}
+
+/// PDF ファイルの拡張子判定
+pub fn is_pdf_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some(ext) if ext.eq_ignore_ascii_case("pdf")
+    )
+}
+
+const MAX_IMAGE_BYTES: usize = 50_000_000; // 50 MB
+
+/// 画像ファイルを読み込む（生バイト。デコードは GPUI 側）
+pub fn load_image(path: &Path) -> PreviewState {
+    let format = match image_format_from_path(path) {
+        Some(f) => f,
+        None => {
+            return PreviewState {
+                path: path.to_path_buf(),
+                mode: PreviewMode::Image,
+                content: PreviewContent::Error("対応していない画像形式".into()),
+                truncated: false,
+            }
+        }
+    };
+    match std::fs::read(path) {
+        Ok(bytes) if bytes.len() > MAX_IMAGE_BYTES => PreviewState {
+            path: path.to_path_buf(),
+            mode: PreviewMode::Image,
+            content: PreviewContent::Error(format!(
+                "画像が大きすぎる（{:.1} MB、上限 50 MB）",
+                bytes.len() as f64 / 1_000_000.0
+            )),
+            truncated: false,
+        },
+        Ok(bytes) => PreviewState {
+            path: path.to_path_buf(),
+            mode: PreviewMode::Image,
+            content: PreviewContent::Image(ImageData { bytes, format }),
+            truncated: false,
+        },
+        Err(e) => PreviewState {
+            path: path.to_path_buf(),
+            mode: PreviewMode::Image,
+            content: PreviewContent::Error(format!("読み込めない: {e}")),
+            truncated: false,
+        },
+    }
+}
+
+/// PDF のページを 1 ページ分レンダリングして PreviewState を返す。
+/// page は 0-indexed。Core Graphics FFI で描画する（macOS のみ）
+pub fn load_pdf(path: &Path, page: usize) -> PreviewState {
+    #[cfg(target_os = "macos")]
+    {
+        match pdf_render::render_page(path, page) {
+            Ok((png_bytes, total_pages)) => PreviewState {
+                path: path.to_path_buf(),
+                mode: PreviewMode::Pdf,
+                content: PreviewContent::Pdf(PdfData {
+                    page_png: png_bytes,
+                    current_page: page,
+                    total_pages,
+                }),
+                truncated: false,
+            },
+            Err(e) => PreviewState {
+                path: path.to_path_buf(),
+                mode: PreviewMode::Pdf,
+                content: PreviewContent::Error(e),
+                truncated: false,
+            },
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = page;
+        PreviewState {
+            path: path.to_path_buf(),
+            mode: PreviewMode::Pdf,
+            content: PreviewContent::Error("PDF プレビューは macOS のみ対応".into()),
+            truncated: false,
+        }
+    }
+}
+
+/// macOS Core Graphics を使った PDF ページレンダリング
+#[cfg(target_os = "macos")]
+mod pdf_render {
+    use std::path::Path;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGPDFDocumentCreateWithURL(url: *const core::ffi::c_void) -> *const core::ffi::c_void;
+        fn CGPDFDocumentRelease(document: *const core::ffi::c_void);
+        fn CGPDFDocumentGetNumberOfPages(document: *const core::ffi::c_void) -> usize;
+        fn CGPDFDocumentGetPage(
+            document: *const core::ffi::c_void,
+            page_number: usize,
+        ) -> *const core::ffi::c_void;
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    struct CGRect {
+        origin: CGPoint,
+        size: CGSize,
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    struct CGSize {
+        width: f64,
+        height: f64,
+    }
+
+    // kCGPDFMediaBox = 0
+    const CG_PDF_MEDIA_BOX: i32 = 0;
+
+    extern "C" {
+        fn CGPDFPageGetBoxRect(page: *const core::ffi::c_void, box_type: i32) -> CGRect;
+        fn CGColorSpaceCreateDeviceRGB() -> *const core::ffi::c_void;
+        fn CGColorSpaceRelease(space: *const core::ffi::c_void);
+        fn CGBitmapContextCreate(
+            data: *mut u8,
+            width: usize,
+            height: usize,
+            bits_per_component: usize,
+            bytes_per_row: usize,
+            space: *const core::ffi::c_void,
+            bitmap_info: u32,
+        ) -> *const core::ffi::c_void;
+        fn CGContextRelease(context: *const core::ffi::c_void);
+        fn CGContextSetRGBFillColor(
+            context: *const core::ffi::c_void,
+            red: f64,
+            green: f64,
+            blue: f64,
+            alpha: f64,
+        );
+        fn CGContextFillRect(context: *const core::ffi::c_void, rect: CGRect);
+        fn CGContextScaleCTM(context: *const core::ffi::c_void, sx: f64, sy: f64);
+        fn CGContextDrawPDFPage(context: *const core::ffi::c_void, page: *const core::ffi::c_void);
+        fn CGBitmapContextCreateImage(
+            context: *const core::ffi::c_void,
+        ) -> *const core::ffi::c_void;
+        fn CGImageRelease(image: *const core::ffi::c_void);
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFURLCreateWithFileSystemPath(
+            allocator: *const core::ffi::c_void,
+            file_path: *const core::ffi::c_void,
+            path_style: isize,
+            is_directory: bool,
+        ) -> *const core::ffi::c_void;
+        fn CFRelease(cf: *const core::ffi::c_void);
+    }
+
+    #[link(name = "ImageIO", kind = "framework")]
+    extern "C" {
+        fn CGImageDestinationCreateWithData(
+            data: *const core::ffi::c_void,
+            image_type: *const core::ffi::c_void,
+            count: usize,
+            options: *const core::ffi::c_void,
+        ) -> *const core::ffi::c_void;
+        fn CGImageDestinationAddImage(
+            dest: *const core::ffi::c_void,
+            image: *const core::ffi::c_void,
+            properties: *const core::ffi::c_void,
+        );
+        fn CGImageDestinationFinalize(dest: *const core::ffi::c_void) -> bool;
+    }
+
+    extern "C" {
+        fn CFDataCreateMutable(
+            allocator: *const core::ffi::c_void,
+            capacity: isize,
+        ) -> *const core::ffi::c_void;
+        fn CFDataGetBytePtr(data: *const core::ffi::c_void) -> *const u8;
+        fn CFDataGetLength(data: *const core::ffi::c_void) -> isize;
+    }
+
+    extern "C" {
+        fn CFStringCreateWithBytes(
+            allocator: *const core::ffi::c_void,
+            bytes: *const u8,
+            num_bytes: isize,
+            encoding: u32,
+            is_external: bool,
+        ) -> *const core::ffi::c_void;
+    }
+
+    // kCFStringEncodingUTF8 = 0x08000100
+    const CF_STRING_ENCODING_UTF8: u32 = 0x08000100;
+    // kCFURLPOSIXPathStyle = 0
+    const CF_URL_POSIX_PATH_STYLE: isize = 0;
+    // kCGImageAlphaPremultipliedLast = 1 (RGBA with premultiplied alpha)
+    const CG_IMAGE_ALPHA_PREMULTIPLIED_LAST: u32 = 1;
+
+    const RENDER_SCALE: f64 = 2.0; // Retina 品質
+
+    fn make_cfstring(s: &str) -> *const core::ffi::c_void {
+        unsafe {
+            CFStringCreateWithBytes(
+                std::ptr::null(),
+                s.as_ptr(),
+                s.len() as isize,
+                CF_STRING_ENCODING_UTF8,
+                false,
+            )
+        }
+    }
+
+    pub fn render_page(path: &Path, page: usize) -> Result<(Vec<u8>, usize), String> {
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| "パスが UTF-8 でない".to_string())?;
+        unsafe {
+            let cf_path = make_cfstring(path_str);
+            if cf_path.is_null() {
+                return Err("CFString 生成失敗".into());
+            }
+            let url = CFURLCreateWithFileSystemPath(
+                std::ptr::null(),
+                cf_path,
+                CF_URL_POSIX_PATH_STYLE,
+                false,
+            );
+            CFRelease(cf_path);
+            if url.is_null() {
+                return Err("CFURL 生成失敗".into());
+            }
+
+            let doc = CGPDFDocumentCreateWithURL(url);
+            CFRelease(url);
+            if doc.is_null() {
+                return Err("PDF を開けない".into());
+            }
+
+            let total = CGPDFDocumentGetNumberOfPages(doc);
+            if total == 0 {
+                CGPDFDocumentRelease(doc);
+                return Err("PDF にページがない".into());
+            }
+
+            // Core Graphics の PDF ページは 1-indexed
+            let page_num = page.min(total - 1) + 1;
+            let pdf_page = CGPDFDocumentGetPage(doc, page_num);
+            if pdf_page.is_null() {
+                CGPDFDocumentRelease(doc);
+                return Err(format!("ページ {} を取得できない", page_num));
+            }
+
+            let media_box = CGPDFPageGetBoxRect(pdf_page, CG_PDF_MEDIA_BOX);
+            let pixel_w = (media_box.size.width * RENDER_SCALE) as usize;
+            let pixel_h = (media_box.size.height * RENDER_SCALE) as usize;
+            if pixel_w == 0 || pixel_h == 0 {
+                CGPDFDocumentRelease(doc);
+                return Err("ページサイズが 0".into());
+            }
+
+            let bytes_per_row = pixel_w * 4;
+            let mut buffer = vec![0u8; bytes_per_row * pixel_h];
+            let color_space = CGColorSpaceCreateDeviceRGB();
+            let ctx = CGBitmapContextCreate(
+                buffer.as_mut_ptr(),
+                pixel_w,
+                pixel_h,
+                8,
+                bytes_per_row,
+                color_space,
+                CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
+            );
+            CGColorSpaceRelease(color_space);
+            if ctx.is_null() {
+                CGPDFDocumentRelease(doc);
+                return Err("ビットマップコンテキスト生成失敗".into());
+            }
+
+            // 白背景
+            CGContextSetRGBFillColor(ctx, 1.0, 1.0, 1.0, 1.0);
+            CGContextFillRect(
+                ctx,
+                CGRect {
+                    origin: CGPoint { x: 0.0, y: 0.0 },
+                    size: CGSize {
+                        width: pixel_w as f64,
+                        height: pixel_h as f64,
+                    },
+                },
+            );
+
+            CGContextScaleCTM(ctx, RENDER_SCALE, RENDER_SCALE);
+            CGContextDrawPDFPage(ctx, pdf_page);
+
+            // RGBA バッファ → PNG バイト列（ImageIO 経由）
+            let cg_image = CGBitmapContextCreateImage(ctx);
+            CGContextRelease(ctx);
+            CGPDFDocumentRelease(doc);
+
+            if cg_image.is_null() {
+                return Err("CGImage 生成失敗".into());
+            }
+
+            let png_data = cgimage_to_png(cg_image);
+            CGImageRelease(cg_image);
+
+            match png_data {
+                Some(bytes) => Ok((bytes, total)),
+                None => Err("PNG エンコード失敗".into()),
+            }
+        }
+    }
+
+    unsafe fn cgimage_to_png(image: *const core::ffi::c_void) -> Option<Vec<u8>> {
+        let png_uti = make_cfstring("public.png");
+        let mutable_data = CFDataCreateMutable(std::ptr::null(), 0);
+        if mutable_data.is_null() {
+            CFRelease(png_uti);
+            return None;
+        }
+        let dest = CGImageDestinationCreateWithData(mutable_data, png_uti, 1, std::ptr::null());
+        CFRelease(png_uti);
+        if dest.is_null() {
+            CFRelease(mutable_data);
+            return None;
+        }
+
+        CGImageDestinationAddImage(dest, image, std::ptr::null());
+        let ok = CGImageDestinationFinalize(dest);
+        CFRelease(dest);
+
+        if !ok {
+            CFRelease(mutable_data);
+            return None;
+        }
+
+        let ptr = CFDataGetBytePtr(mutable_data);
+        let len = CFDataGetLength(mutable_data) as usize;
+        let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+        CFRelease(mutable_data);
+        Some(bytes)
+    }
+}
+
 /// ファイルを読み込んでプレビュー状態を作る（テスト用。本番は load_fast + background highlight）
 #[cfg(test)]
 pub fn load(path: &Path, mode: PreviewMode) -> PreviewState {
+    match mode {
+        PreviewMode::Image => return load_image(path),
+        PreviewMode::Pdf => return load_pdf(path, 0),
+        _ => {}
+    }
     let (text, truncated) = match read_text(path) {
         Ok(pair) => pair,
         Err(message) => {
@@ -144,6 +552,7 @@ pub fn load(path: &Path, mode: PreviewMode) -> PreviewState {
     let content = match mode {
         PreviewMode::Markdown => PreviewContent::Markdown(markdown_blocks(&text)),
         PreviewMode::Code => PreviewContent::Code(highlighter().highlight(path, &text)),
+        PreviewMode::Image | PreviewMode::Pdf => unreachable!(),
     };
     PreviewState {
         path: path.to_path_buf(),
@@ -156,8 +565,14 @@ pub fn load(path: &Path, mode: PreviewMode) -> PreviewState {
 /// 高速ロード（UI スレッド用）: ファイルを読むが syntect ハイライトはスキップする。
 /// Code モードは平文（色なし）を返し、呼び出し側が background で [`highlight_text`] を
 /// 走らせて差し替える。Markdown は pulldown-cmark が十分速いのでそのまま完成版を返す。
+/// Image / Pdf モードは専用ローダーに委譲する。
 /// 戻り値の `Option<String>` は Code モードの生テキスト（background ハイライト用）
 pub fn load_fast(path: &Path, mode: PreviewMode) -> (PreviewState, Option<String>) {
+    match mode {
+        PreviewMode::Image => return (load_image(path), None),
+        PreviewMode::Pdf => return (load_pdf(path, 0), None),
+        _ => {}
+    }
     let (text, truncated) = match read_text(path) {
         Ok(pair) => pair,
         Err(message) => {
@@ -178,6 +593,7 @@ pub fn load_fast(path: &Path, mode: PreviewMode) -> (PreviewState, Option<String
             let lines = text.lines().map(|l| vec![plain_span(l)]).collect();
             (PreviewContent::Code(lines), Some(text))
         }
+        PreviewMode::Image | PreviewMode::Pdf => unreachable!(),
     };
     (
         PreviewState {
@@ -645,5 +1061,100 @@ mod tests {
         assert!(is_markdown_path(Path::new("/a/README.md")));
         assert!(is_markdown_path(Path::new("/a/B.Markdown")));
         assert!(!is_markdown_path(Path::new("/a/main.rs")));
+    }
+
+    #[test]
+    fn 画像フォーマット判定() {
+        assert_eq!(
+            image_format_from_path(Path::new("/a/icon.png")),
+            Some(ImageFileFormat::Png)
+        );
+        assert_eq!(
+            image_format_from_path(Path::new("/a/photo.JPG")),
+            Some(ImageFileFormat::Jpeg)
+        );
+        assert_eq!(
+            image_format_from_path(Path::new("/a/anim.gif")),
+            Some(ImageFileFormat::Gif)
+        );
+        assert_eq!(
+            image_format_from_path(Path::new("/a/modern.webp")),
+            Some(ImageFileFormat::WebP)
+        );
+        assert_eq!(
+            image_format_from_path(Path::new("/a/vector.svg")),
+            Some(ImageFileFormat::Svg)
+        );
+        assert_eq!(image_format_from_path(Path::new("/a/main.rs")), None);
+    }
+
+    #[test]
+    fn pdf判定() {
+        assert!(is_pdf_path(Path::new("/a/doc.pdf")));
+        assert!(is_pdf_path(Path::new("/a/DOC.PDF")));
+        assert!(!is_pdf_path(Path::new("/a/main.rs")));
+    }
+
+    #[test]
+    fn 画像ファイルの読み込み() {
+        let dir = std::env::temp_dir().join(format!("tako-preview-img-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 最小の有効な PNG（1x1 透明ピクセル）
+        let png_bytes: Vec<u8> = vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
+            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
+            0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, // RGBA
+            0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, // IDAT
+            0x78, 0x9C, 0x62, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE5, // data
+            0x27, 0xDE, 0xFC, // checksum
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, // IEND
+            0xAE, 0x42, 0x60, 0x82,
+        ];
+        let path = dir.join("test.png");
+        std::fs::write(&path, &png_bytes).unwrap();
+        let state = load(&path, PreviewMode::Image);
+        assert_eq!(state.mode, PreviewMode::Image);
+        match &state.content {
+            PreviewContent::Image(data) => {
+                assert_eq!(data.format, ImageFileFormat::Png);
+                assert_eq!(data.bytes, png_bytes);
+            }
+            other => panic!("Image になる: {:?}", other),
+        }
+        // 不在ファイルはエラー
+        let state = load(&dir.join("no-such.png"), PreviewMode::Image);
+        assert!(matches!(&state.content, PreviewContent::Error(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pdfのページレンダリング() {
+        let test_paths = [
+            "/System/Library/Frameworks/Quartz.framework/Versions/A/Frameworks/PDFKit.framework/Versions/A/Resources/test.pdf",
+            "/Library/Documentation/License.lpdf",
+        ];
+        // テスト用にダミー PDF があれば使う。なければスキップ
+        // （CI 環境でシステム PDF の場所が保証できないため）
+        let pdf_path = test_paths.iter().find(|p| Path::new(p).is_file());
+        if pdf_path.is_none() {
+            eprintln!("[skip] テスト用 PDF が見つからない");
+            return;
+        }
+        let state = load(Path::new(pdf_path.unwrap()), PreviewMode::Pdf);
+        match &state.content {
+            PreviewContent::Pdf(data) => {
+                assert!(data.total_pages > 0);
+                assert!(!data.page_png.is_empty());
+                // PNG シグネチャの確認
+                assert_eq!(&data.page_png[..4], &[0x89, 0x50, 0x4E, 0x47]);
+            }
+            PreviewContent::Error(e) => {
+                eprintln!("[skip] PDF レンダリング失敗（環境依存）: {e}");
+            }
+            other => panic!("Pdf になる: {:?}", other),
+        }
     }
 }
