@@ -112,13 +112,11 @@ pub enum ImageFileFormat {
     Svg,
 }
 
-/// PDF データ（現在表示中のページの RGBA ピクセルを保持）
+/// PDF データ（全ページの PNG を保持し、スクロールで閲覧）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PdfData {
-    /// 現在ページの PNG バイト列（Core Graphics でレンダリング済み）
-    pub page_png: Vec<u8>,
-    /// 0-indexed
-    pub current_page: usize,
+    /// 各ページの PNG バイト列（Core Graphics でレンダリング済み）
+    pub pages: Vec<Vec<u8>>,
     pub total_pages: usize,
 }
 
@@ -225,18 +223,17 @@ pub fn load_image(path: &Path) -> PreviewState {
     }
 }
 
-/// PDF のページを 1 ページ分レンダリングして PreviewState を返す。
-/// page は 0-indexed。Core Graphics FFI で描画する（macOS のみ）
-pub fn load_pdf(path: &Path, page: usize) -> PreviewState {
+/// PDF の全ページをレンダリングして PreviewState を返す。
+/// Core Graphics FFI で描画する（macOS のみ）
+pub fn load_pdf(path: &Path, _page: usize) -> PreviewState {
     #[cfg(target_os = "macos")]
     {
-        match pdf_render::render_page(path, page) {
-            Ok((png_bytes, total_pages)) => PreviewState {
+        match pdf_render::render_all_pages(path) {
+            Ok((all_pages, total_pages)) => PreviewState {
                 path: path.to_path_buf(),
                 mode: PreviewMode::Pdf,
                 content: PreviewContent::Pdf(PdfData {
-                    page_png: png_bytes,
-                    current_page: page,
+                    pages: all_pages,
                     total_pages,
                 }),
                 truncated: false,
@@ -251,7 +248,7 @@ pub fn load_pdf(path: &Path, page: usize) -> PreviewState {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = page;
+        let _ = _page;
         PreviewState {
             path: path.to_path_buf(),
             mode: PreviewMode::Pdf,
@@ -398,7 +395,7 @@ mod pdf_render {
         }
     }
 
-    pub fn render_page(path: &Path, page: usize) -> Result<(Vec<u8>, usize), String> {
+    pub fn render_all_pages(path: &Path) -> Result<(Vec<Vec<u8>>, usize), String> {
         let path_str = path
             .to_str()
             .ok_or_else(|| "パスが UTF-8 でない".to_string())?;
@@ -430,72 +427,72 @@ mod pdf_render {
                 return Err("PDF にページがない".into());
             }
 
-            // Core Graphics の PDF ページは 1-indexed
-            let page_num = page.min(total - 1) + 1;
-            let pdf_page = CGPDFDocumentGetPage(doc, page_num);
-            if pdf_page.is_null() {
-                CGPDFDocumentRelease(doc);
-                return Err(format!("ページ {} を取得できない", page_num));
-            }
+            let mut all_pages = Vec::with_capacity(total);
+            for page_idx in 0..total {
+                let page_num = page_idx + 1;
+                let pdf_page = CGPDFDocumentGetPage(doc, page_num);
+                if pdf_page.is_null() {
+                    all_pages.push(Vec::new());
+                    continue;
+                }
 
-            let media_box = CGPDFPageGetBoxRect(pdf_page, CG_PDF_MEDIA_BOX);
-            let pixel_w = (media_box.size.width * RENDER_SCALE) as usize;
-            let pixel_h = (media_box.size.height * RENDER_SCALE) as usize;
-            if pixel_w == 0 || pixel_h == 0 {
-                CGPDFDocumentRelease(doc);
-                return Err("ページサイズが 0".into());
-            }
+                let media_box = CGPDFPageGetBoxRect(pdf_page, CG_PDF_MEDIA_BOX);
+                let pixel_w = (media_box.size.width * RENDER_SCALE) as usize;
+                let pixel_h = (media_box.size.height * RENDER_SCALE) as usize;
+                if pixel_w == 0 || pixel_h == 0 {
+                    all_pages.push(Vec::new());
+                    continue;
+                }
 
-            let bytes_per_row = pixel_w * 4;
-            let mut buffer = vec![0u8; bytes_per_row * pixel_h];
-            let color_space = CGColorSpaceCreateDeviceRGB();
-            let ctx = CGBitmapContextCreate(
-                buffer.as_mut_ptr(),
-                pixel_w,
-                pixel_h,
-                8,
-                bytes_per_row,
-                color_space,
-                CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
-            );
-            CGColorSpaceRelease(color_space);
-            if ctx.is_null() {
-                CGPDFDocumentRelease(doc);
-                return Err("ビットマップコンテキスト生成失敗".into());
-            }
+                let bytes_per_row = pixel_w * 4;
+                let mut buffer = vec![0u8; bytes_per_row * pixel_h];
+                let color_space = CGColorSpaceCreateDeviceRGB();
+                let ctx = CGBitmapContextCreate(
+                    buffer.as_mut_ptr(),
+                    pixel_w,
+                    pixel_h,
+                    8,
+                    bytes_per_row,
+                    color_space,
+                    CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
+                );
+                CGColorSpaceRelease(color_space);
+                if ctx.is_null() {
+                    all_pages.push(Vec::new());
+                    continue;
+                }
 
-            // 白背景
-            CGContextSetRGBFillColor(ctx, 1.0, 1.0, 1.0, 1.0);
-            CGContextFillRect(
-                ctx,
-                CGRect {
-                    origin: CGPoint { x: 0.0, y: 0.0 },
-                    size: CGSize {
-                        width: pixel_w as f64,
-                        height: pixel_h as f64,
+                CGContextSetRGBFillColor(ctx, 1.0, 1.0, 1.0, 1.0);
+                CGContextFillRect(
+                    ctx,
+                    CGRect {
+                        origin: CGPoint { x: 0.0, y: 0.0 },
+                        size: CGSize {
+                            width: pixel_w as f64,
+                            height: pixel_h as f64,
+                        },
                     },
-                },
-            );
+                );
 
-            CGContextScaleCTM(ctx, RENDER_SCALE, RENDER_SCALE);
-            CGContextDrawPDFPage(ctx, pdf_page);
+                CGContextScaleCTM(ctx, RENDER_SCALE, RENDER_SCALE);
+                CGContextDrawPDFPage(ctx, pdf_page);
 
-            // RGBA バッファ → PNG バイト列（ImageIO 経由）
-            let cg_image = CGBitmapContextCreateImage(ctx);
-            CGContextRelease(ctx);
+                let cg_image = CGBitmapContextCreateImage(ctx);
+                CGContextRelease(ctx);
+
+                if cg_image.is_null() {
+                    all_pages.push(Vec::new());
+                    continue;
+                }
+
+                let png_data = cgimage_to_png(cg_image);
+                CGImageRelease(cg_image);
+
+                all_pages.push(png_data.unwrap_or_default());
+            }
+
             CGPDFDocumentRelease(doc);
-
-            if cg_image.is_null() {
-                return Err("CGImage 生成失敗".into());
-            }
-
-            let png_data = cgimage_to_png(cg_image);
-            CGImageRelease(cg_image);
-
-            match png_data {
-                Some(bytes) => Ok((bytes, total)),
-                None => Err("PNG エンコード失敗".into()),
-            }
+            Ok((all_pages, total))
         }
     }
 
@@ -1147,9 +1144,10 @@ mod tests {
         match &state.content {
             PreviewContent::Pdf(data) => {
                 assert!(data.total_pages > 0);
-                assert!(!data.page_png.is_empty());
+                assert!(!data.pages.is_empty());
+                assert!(!data.pages[0].is_empty());
                 // PNG シグネチャの確認
-                assert_eq!(&data.page_png[..4], &[0x89, 0x50, 0x4E, 0x47]);
+                assert_eq!(&data.pages[0][..4], &[0x89, 0x50, 0x4E, 0x47]);
             }
             PreviewContent::Error(e) => {
                 eprintln!("[skip] PDF レンダリング失敗（環境依存）: {e}");

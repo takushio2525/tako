@@ -2598,41 +2598,6 @@ impl TakoApp {
         cx.notify();
     }
 
-    /// PDF のページ送り（FR-3.4）。next=true で次ページ、false で前ページ。
-    /// background executor でレンダリングして差し替える
-    fn pdf_change_page(&mut self, pane_id: PaneId, next: bool, cx: &mut Context<Self>) {
-        let Some(state) = self.previews.get(&pane_id) else {
-            return;
-        };
-        let preview::PreviewContent::Pdf(data) = &state.content else {
-            return;
-        };
-        let new_page = if next {
-            if data.current_page + 1 >= data.total_pages {
-                return;
-            }
-            data.current_page + 1
-        } else {
-            if data.current_page == 0 {
-                return;
-            }
-            data.current_page - 1
-        };
-        let path = state.path.clone();
-        cx.spawn(async move |this, cx| {
-            let p = path.clone();
-            let task = cx
-                .background_executor()
-                .spawn(async move { preview::load_pdf(&p, new_page) });
-            let new_state = task.await;
-            let _ = this.update(cx, |app, cx| {
-                app.previews.insert(pane_id, new_state);
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
     /// syntect ハイライトを background executor で実行し、完了後にプレビューを差し替える
     fn spawn_highlight(
         &self,
@@ -4068,9 +4033,8 @@ impl TakoApp {
         let mode = state.mode;
         let truncated = state.truncated;
 
-        // Image / Pdf ではタイトルバーのトグルボタンを出さず、代わりにページ送りを出す
-        let pdf_info = if let preview::PreviewContent::Pdf(data) = &state.content {
-            Some((data.current_page, data.total_pages))
+        let pdf_info: Option<usize> = if let preview::PreviewContent::Pdf(data) = &state.content {
+            Some(data.total_pages)
         } else {
             None
         };
@@ -4115,24 +4079,41 @@ impl TakoApp {
                     )
                     .into_any_element()]
             }
-            preview::PreviewContent::Pdf(data) => {
-                let image = std::sync::Arc::new(gpui::Image::from_bytes(
-                    gpui::ImageFormat::Png,
-                    data.page_png.clone(),
-                ));
-                vec![div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        gpui::img(image)
-                            .object_fit(gpui::ObjectFit::Contain)
-                            .max_w_full()
-                            .max_h_full(),
-                    )
-                    .into_any_element()]
-            }
+            preview::PreviewContent::Pdf(data) => data
+                .pages
+                .iter()
+                .enumerate()
+                .filter(|(_, png)| !png.is_empty())
+                .map(|(i, png)| {
+                    let image = std::sync::Arc::new(gpui::Image::from_bytes(
+                        gpui::ImageFormat::Png,
+                        png.clone(),
+                    ));
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .w_full()
+                        .pb_2()
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.6))
+                                .pb_1()
+                                .child(SharedString::from(format!(
+                                    "— {} / {} —",
+                                    i + 1,
+                                    data.total_pages
+                                ))),
+                        )
+                        .child(
+                            gpui::img(image)
+                                .object_fit(gpui::ObjectFit::Contain)
+                                .max_w_full(),
+                        )
+                        .into_any_element()
+                })
+                .collect(),
             preview::PreviewContent::Error(message) => vec![div()
                 .p_2()
                 .text_color(hsla(theme.ansi[1]))
@@ -4262,84 +4243,11 @@ impl TakoApp {
                             }))
                             .child(SharedString::from(format!("{icon} {label}")))
                     }))
-                    // PDF ページ送りボタン（FR-3.4）
-                    .children(pdf_info.map(|(current, total)| {
-                        let has_prev = current > 0;
-                        let has_next = current + 1 < total;
+                    .children(pdf_info.map(|total| {
                         div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .id(("pdf-prev", pane_id.as_u64()))
-                                    .px_1()
-                                    .rounded_sm()
-                                    .cursor(if has_prev {
-                                        CursorStyle::PointingHand
-                                    } else {
-                                        CursorStyle::Arrow
-                                    })
-                                    .text_color(if has_prev {
-                                        hsla(theme.accent)
-                                    } else {
-                                        hsla_alpha(theme.tab_inactive_foreground, 0.4)
-                                    })
-                                    .when(has_prev, |d| {
-                                        d.hover(|d| {
-                                            d.bg(rgba_alpha(theme.tab_active_background, 0.8))
-                                        })
-                                    })
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                                            cx.stop_propagation()
-                                        }),
-                                    )
-                                    .when(has_prev, |d| {
-                                        d.on_click(cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.pdf_change_page(pane_id, false, cx);
-                                        }))
-                                    })
-                                    .child("<"),
-                            )
-                            .child(SharedString::from(format!("{}/{}", current + 1, total)))
-                            .child(
-                                div()
-                                    .id(("pdf-next", pane_id.as_u64()))
-                                    .px_1()
-                                    .rounded_sm()
-                                    .cursor(if has_next {
-                                        CursorStyle::PointingHand
-                                    } else {
-                                        CursorStyle::Arrow
-                                    })
-                                    .text_color(if has_next {
-                                        hsla(theme.accent)
-                                    } else {
-                                        hsla_alpha(theme.tab_inactive_foreground, 0.4)
-                                    })
-                                    .when(has_next, |d| {
-                                        d.hover(|d| {
-                                            d.bg(rgba_alpha(theme.tab_active_background, 0.8))
-                                        })
-                                    })
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                                            cx.stop_propagation()
-                                        }),
-                                    )
-                                    .when(has_next, |d| {
-                                        d.on_click(cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.pdf_change_page(pane_id, true, cx);
-                                        }))
-                                    })
-                                    .child(">"),
-                            )
+                            .text_size(px(11.0))
+                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.6))
+                            .child(SharedString::from(format!("{} ページ", total)))
                     }))
                     .child(
                         div()
@@ -8171,8 +8079,8 @@ mod self_test {
                                         &p.content,
                                         preview::PreviewContent::Pdf(d)
                                             if d.total_pages == 1
-                                                && d.current_page == 0
-                                                && !d.page_png.is_empty()
+                                                && d.pages.len() == 1
+                                                && !d.pages[0].is_empty()
                                     )
                             });
                         let _ = tako_control::dispatch(
