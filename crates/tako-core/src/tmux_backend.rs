@@ -219,9 +219,12 @@ pub(crate) fn shell_quoted(command: &SpawnCommand) -> String {
         .join(" ")
 }
 
-/// 単語のシェルクォート。英数と無害な記号のみならそのまま、他は単引用符で包む
+/// 単語のシェルクォート。英数と無害な記号のみならそのまま、他は単引用符で包む。
+/// 先頭 `=` は zsh の equals 展開（`=cmd` → コマンドのフルパス）に化けるため必ず包む
+/// （例: `tmux attach -t =name` の完全一致指定。2026-06-13 D&D 実装で実測）
 fn quote_word(word: &str) -> String {
     let safe = !word.is_empty()
+        && !word.starts_with('=')
         && word
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_./=:,@%+".contains(c));
@@ -244,6 +247,9 @@ mod tests {
         assert_eq!(quote_word("a b"), "'a b'");
         assert_eq!(quote_word("it's"), r#"'it'\''s'"#);
         assert_eq!(quote_word(""), "''");
+        // 先頭 = は zsh の equals 展開を踏むため必ず包む（途中の = は安全）
+        assert_eq!(quote_word("=dnd-src"), "'=dnd-src'");
+        assert_eq!(quote_word("TMUX="), "TMUX=");
         assert_eq!(
             shell_quoted(&SpawnCommand {
                 program: "npm".into(),
