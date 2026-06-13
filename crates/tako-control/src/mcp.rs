@@ -255,6 +255,29 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_tmux_open",
+            "description": "tmux セッションを現在のタブへ取り込んで表示する（FR-2.16.10）。\
+                pane を direction（省略時は右）へ分割した新ペインで attach クライアントを\
+                起動する。管理外・kill 漏れセッション（tako_tmux_list で発見したもの）の\
+                中身をユーザーに見せる・自分で確認するときに使う。\
+                新ペインを閉じてもセッション側は終了しない（kill ではない）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": { "type": "string", "description": "対象セッション名（必須。tako_tmux_list の name）" },
+                    "socket": { "type": "string", "description": "tmux サーバー名（tmux -L 相当。tako_tmux_list の socket をそのまま渡す）" },
+                    "pane": pane_schema("分割の基準ペイン ID（省略時は呼び出し元の隣に生える）"),
+                    "direction": {
+                        "type": "string",
+                        "enum": ["right", "down", "left", "up"],
+                        "description": "新ペインが生える方向（省略時は right）",
+                    },
+                },
+                "required": ["session"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_focus_pane",
             "description": "ペインへフォーカスを移す。pane（ID 指定。別タブならタブも切り替わる）か\
                 direction（アクティブタブ内の隣接移動）のどちらか一方を指定する。\
@@ -379,14 +402,22 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_move_pane_to_tab",
-            "description": "ペインを別のタブへ移送する。タブをまたぐ整理（グループ分け）に使う。",
+            "description": "ペインを移動する。tab 指定 = 別タブの末尾へ移送（グループ分け）、\
+                target 指定 = そのペインの隣（direction 側）へ挿し直す（同タブ内の並べ替え = \
+                ペインタイトルバーの D&D と同じ操作。タブまたぎも可）。どちらか一方を指定する。\
+                レイアウトを整えてユーザーに見せる導線に使う。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "tab": { "type": "integer", "minimum": 0, "description": "移送先タブ ID" },
+                    "tab": { "type": "integer", "minimum": 0, "description": "移送先タブ ID（target と排他）" },
+                    "target": { "type": "integer", "minimum": 0, "description": "挿入先ペイン ID（このペインの隣に入る）" },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["right", "down", "left", "up"],
+                        "description": "target のどちら側に入るか（省略時は right。target 指定時のみ有効）",
+                    },
                     "pane": pane_schema("対象ペイン ID（省略時は呼び出し元）"),
                 },
-                "required": ["tab"],
                 "additionalProperties": false,
             },
         }),
@@ -441,8 +472,9 @@ pub fn tools() -> Vec<Value> {
                 （mode=code でソース表示へ切替可能 = プレビューの目アイコントグルと同じ操作）。\
                 ペインは再利用される: 対象がプレビューペインなら差し替え、同タブに既存の\
                 プレビューペインがあればそこへ、無ければ pane を分割して生やす（ターミナルは\
-                起動しない）。「このファイルを見て」「成果物を確認して」の提示に使うこと。\
-                相対パスは pane の cwd 基準で解決する。",
+                起動しない）。direction を指定すると再利用せず必ずその方向へ分割して開く\
+                （表示位置を制御したいとき）。「このファイルを見て」「成果物を確認して」の\
+                提示に使うこと。相対パスは pane の cwd 基準で解決する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -452,6 +484,11 @@ pub fn tools() -> Vec<Value> {
                         "type": "string",
                         "enum": ["code", "markdown"],
                         "description": "表示モード（省略時は拡張子から自動判定。.md / .markdown → markdown）",
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["right", "down", "left", "up"],
+                        "description": "指定時は既存プレビューを再利用せず pane をこの方向へ分割して開く（FR-3.11）",
                     },
                 },
                 "required": ["path"],
@@ -527,6 +564,12 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             session: str_arg(args, "session")?.ok_or("session を指定する")?,
             window: u64_arg(args, "window")?.map(|n| n as u32),
         },
+        "tako_tmux_open" => Request::TmuxOpen {
+            socket: str_arg(args, "socket")?,
+            session: str_arg(args, "session")?.ok_or("session を指定する")?,
+            pane: Some(target_pane(args, caller)?),
+            direction: direction_arg(args)?,
+        },
         "tako_scroll_pane" => Request::Scroll {
             pane: Some(target_pane(args, caller)?),
             to: u64_arg(args, "to")?,
@@ -591,7 +634,9 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
         },
         "tako_move_pane_to_tab" => Request::MovePane {
             pane: Some(target_pane(args, caller)?),
-            tab: required_u64(args, "tab")?,
+            tab: u64_arg(args, "tab")?,
+            target: u64_arg(args, "target")?,
+            direction: direction_arg(args)?,
         },
         "tako_auto_rename" => Request::AutoRename {
             enabled: bool_arg(args, "enabled")?,
@@ -611,6 +656,7 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
                 Some("markdown") => Some(crate::protocol::PreviewModeWire::Markdown),
                 Some(other) => return Err(format!("mode が不正: {other}（code | markdown）")),
             },
+            direction: direction_arg(args)?,
         },
         "tako_panel" => Request::Panel {
             visible: bool_arg(args, "visible")?,
@@ -952,9 +998,10 @@ mod tests {
                 pane: Some(7),
                 path: "/tmp/x.md".into(),
                 mode: Some(crate::protocol::PreviewModeWire::Code),
+                direction: None,
             }]
         );
-        // mode 省略は拡張子の自動判定に委ねる（None で渡る）
+        // mode 省略は拡張子の自動判定に委ねる（None で渡る）。direction も省略可
         let (_, requests) = run(
             call("tako_open_file", json!({ "path": "a.rs" })),
             Some(7),
@@ -966,6 +1013,25 @@ mod tests {
                 pane: Some(7),
                 path: "a.rs".into(),
                 mode: None,
+                direction: None,
+            }]
+        );
+        // direction 指定（FR-3.11 = D&D のドロップ位置の同等操作）
+        let (_, requests) = run(
+            call(
+                "tako_open_file",
+                json!({ "path": "a.rs", "direction": "down" }),
+            ),
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::OpenFile {
+                pane: Some(7),
+                path: "a.rs".into(),
+                mode: None,
+                direction: Some(Direction::Down),
             }]
         );
         // 不正な mode と path 欠落は引数エラー
@@ -987,9 +1053,37 @@ mod tests {
     }
 
     #[test]
+    fn tmux_openはセッション必須でドロップ位置相当を写す() {
+        let (_, requests) = run(
+            call(
+                "tako_tmux_open",
+                json!({ "session": "master-tako", "socket": "work", "direction": "down" }),
+            ),
+            Some(3),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::TmuxOpen {
+                socket: Some("work".into()),
+                session: "master-tako".into(),
+                pane: Some(3),
+                direction: Some(Direction::Down),
+            }]
+        );
+        // session 欠落は引数エラー
+        let (response, requests) = run(call("tako_tmux_open", json!({})), Some(3), true);
+        assert!(requests.is_empty());
+        assert!(response.unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("session"));
+    }
+
+    #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 21);
+        assert_eq!(tools.len(), 22);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

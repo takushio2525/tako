@@ -289,3 +289,14 @@
 - セルフテスト 114 項目緑（66/66b/67 追加）。実装メモは requirements.md FR-3.1〜3.3
 - 次: ユーザー再起動 → manual-checks「ワークスペース機能第 1 弾」節 / 次タスクは相談
   （FR-3.6 git graph or FR-2.19 ポートパネルが候補）
+
+## 2026-06-13（D&D 3 件: tmux 取り込み / ファイルプレビュー / ペイン移動）
+
+- FR-2.16.10（tmux セッションを D&D でタブ内へ分割 attach 表示。dispatch `TmuxOpen` +
+  `tako tmux open` + MCP `tako_tmux_open` = 計 22 ツール）/ FR-3.11（ファイルツリー D&D →
+  ドロップ位置にプレビュー。`OpenFile` に `direction`）/ FR-1.10（タイトルバー D&D で
+  ペイン移動。`Workspace::move_pane_to` + `MovePane` の `target`/`direction` 拡張）。
+  3 件共通のドロップ先ハイライト + 挿入プレビュー（象限 → 半面強調 + 結果ラベル）
+- 副産物: zsh equals 展開バグ根治（`quote_word` が先頭 `=` をクォート）。
+  セルフテスト 120 項目緑（68/68b/68c 追加）・cargo test / fmt / clippy 全緑
+- 次: ユーザー再起動 → manual-checks「ドラッグ&ドロップ 3 件」節の実機確認

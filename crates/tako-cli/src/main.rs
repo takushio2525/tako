@@ -104,6 +104,31 @@ enum TmuxCommand {
         #[arg(long)]
         socket: Option<String>,
     },
+    /// セッションを現在のタブへ取り込む（FR-2.16.10。統合 tmux ビューの D&D と同等操作）。
+    /// 対象ペインを分割した新ペインで attach クライアントを起動する。
+    /// 新ペインを閉じてもセッションは残る（kill ではない）
+    Open {
+        /// 対象セッション名
+        session: String,
+        /// tmux サーバー名（`tmux -L` 相当。`tako tmux list` の socket をそのまま渡す）
+        #[arg(long)]
+        socket: Option<String>,
+        /// 分割の基準ペイン ID（省略時は呼び出し元）
+        #[arg(long)]
+        pane: Option<u64>,
+        /// 右に分割（既定）
+        #[arg(long, conflicts_with_all = ["down", "up", "left"])]
+        right: bool,
+        /// 下に分割
+        #[arg(long, conflicts_with_all = ["right", "up", "left"])]
+        down: bool,
+        /// 上に分割
+        #[arg(long, conflicts_with_all = ["right", "down", "left"])]
+        up: bool,
+        /// 左に分割
+        #[arg(long, conflicts_with_all = ["right", "down", "up"])]
+        left: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -246,6 +271,18 @@ struct OpenArgs {
     /// 表示モード（省略時は拡張子から自動判定。md = markdown の別名）
     #[arg(long, value_parser = ["code", "markdown", "md"])]
     mode: Option<String>,
+    /// 既存プレビューを再利用せず右に分割して開く（FR-3.11 = D&D のドロップ位置相当）
+    #[arg(long, conflicts_with_all = ["down", "up", "left"])]
+    right: bool,
+    /// 同・下に分割して開く
+    #[arg(long, conflicts_with_all = ["right", "up", "left"])]
+    down: bool,
+    /// 同・上に分割して開く
+    #[arg(long, conflicts_with_all = ["right", "down", "left"])]
+    up: bool,
+    /// 同・左に分割して開く
+    #[arg(long, conflicts_with_all = ["right", "down", "up"])]
+    left: bool,
 }
 
 #[derive(Args)]
@@ -300,13 +337,29 @@ enum TabCommand {
     },
     /// タブを切り替える
     Select { tab: u64 },
-    /// ペインを別タブへ移送する
+    /// ペインを移動する: タブ ID 指定 = 別タブの末尾へ、--target 指定 = そのペインの
+    /// 隣（--right 等の方向）へ挿し直す（FR-1.10 = タイトルバー D&D の同等操作）
     MovePane {
-        /// 移送先タブ ID
-        tab: u64,
+        /// 移送先タブ ID（--target と排他）
+        tab: Option<u64>,
+        /// 挿入先ペイン ID（このペインの隣に入る。同タブ内の並べ替えに使う）
+        #[arg(long, conflicts_with = "tab")]
+        target: Option<u64>,
         /// 対象ペイン ID（省略時は呼び出し元）
         #[arg(long)]
         pane: Option<u64>,
+        /// --target の右に入る（既定）
+        #[arg(long, conflicts_with_all = ["down", "up", "left"])]
+        right: bool,
+        /// --target の下に入る
+        #[arg(long, conflicts_with_all = ["right", "up", "left"])]
+        down: bool,
+        /// --target の上に入る
+        #[arg(long, conflicts_with_all = ["right", "down", "left"])]
+        up: bool,
+        /// --target の左に入る
+        #[arg(long, conflicts_with_all = ["right", "down", "up"])]
+        left: bool,
     },
 }
 
@@ -510,6 +563,14 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     Some("code") => Some(tako_control::protocol::PreviewModeWire::Code),
                     Some(_) => Some(tako_control::protocol::PreviewModeWire::Markdown),
                 },
+                // 方向指定なし = 既存プレビュー再利用の従来セマンティクス
+                direction: match (args.right, args.down, args.up, args.left) {
+                    (true, _, _, _) => Some(Direction::Right),
+                    (_, true, _, _) => Some(Direction::Down),
+                    (_, _, true, _) => Some(Direction::Up),
+                    (_, _, _, true) => Some(Direction::Left),
+                    _ => None,
+                },
             }
         }
         Command::Tab(TabCommand::New { title }) => Request::TabNew {
@@ -526,10 +587,31 @@ fn build_request(command: &Command) -> Result<Request, String> {
             title: title.join(" "),
         },
         Command::Tab(TabCommand::Select { tab }) => Request::TabSelect { tab: *tab },
-        Command::Tab(TabCommand::MovePane { tab, pane }) => Request::MovePane {
-            pane: target_pane(*pane)?,
-            tab: *tab,
-        },
+        Command::Tab(TabCommand::MovePane {
+            tab,
+            target,
+            pane,
+            right,
+            down,
+            up,
+            left,
+        }) => {
+            // 方向フラグは --target 指定時のみ有効（黙って無視せず明示エラーにする）
+            if (*right || *down || *up || *left) && target.is_none() {
+                return Err("--right/--down/--up/--left は --target と併用する".into());
+            }
+            Request::MovePane {
+                pane: target_pane(*pane)?,
+                tab: *tab,
+                target: *target,
+                direction: target.map(|_| match (down, up, left) {
+                    (true, _, _) => Direction::Down,
+                    (_, true, _) => Direction::Up,
+                    (_, _, true) => Direction::Left,
+                    _ => Direction::Right,
+                }),
+            }
+        }
         Command::Autorename(args) => Request::AutoRename {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
@@ -563,6 +645,25 @@ fn build_request(command: &Command) -> Result<Request, String> {
             socket: socket.clone(),
             session: session.clone(),
             window: *window,
+        },
+        Command::Tmux(TmuxCommand::Open {
+            session,
+            socket,
+            pane,
+            right: _,
+            down,
+            up,
+            left,
+        }) => Request::TmuxOpen {
+            socket: socket.clone(),
+            session: session.clone(),
+            pane: target_pane(*pane)?,
+            direction: match (down, up, left) {
+                (true, _, _) => Some(Direction::Down),
+                (_, true, _) => Some(Direction::Up),
+                (_, _, true) => Some(Direction::Left),
+                _ => Some(Direction::Right),
+            },
         },
         // main() で mcp_serve() へ分岐済みのため論理的に到達不能
         Command::Mcp(_) => unreachable!("mcp serve は run() を通らない"),
@@ -651,7 +752,9 @@ fn print_result(command: &Command, result: &Value) {
                 serde_json::to_string_pretty(result).unwrap_or_default()
             );
         }
-        Command::Tmux(TmuxCommand::Kill { .. }) => println!("{result}"),
+        Command::Tmux(TmuxCommand::Kill { .. }) | Command::Tmux(TmuxCommand::Open { .. }) => {
+            println!("{result}")
+        }
         _ => {}
     }
 }
@@ -844,7 +947,9 @@ mod tests {
             build_request(&command).unwrap(),
             Request::MovePane {
                 pane: Some(9),
-                tab: 4,
+                tab: Some(4),
+                target: None,
+                direction: None,
             }
         );
         let command = parse(&["tako", "tab", "select", "2"]);
@@ -852,6 +957,45 @@ mod tests {
             build_request(&command).unwrap(),
             Request::TabSelect { tab: 2 }
         );
+    }
+
+    #[test]
+    fn move_paneのtarget指定は方向つきで写す() {
+        // FR-1.10: タイトルバー D&D の同等操作（同タブ内の挿し直し）
+        let command = parse(&[
+            "tako",
+            "tab",
+            "move-pane",
+            "--target",
+            "7",
+            "--pane",
+            "9",
+            "--down",
+        ]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::MovePane {
+                pane: Some(9),
+                tab: None,
+                target: Some(7),
+                direction: Some(Direction::Down),
+            }
+        );
+        // 方向省略は右
+        let command = parse(&["tako", "tab", "move-pane", "--target", "7", "--pane", "9"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::MovePane {
+                pane: Some(9),
+                tab: None,
+                target: Some(7),
+                direction: Some(Direction::Right),
+            }
+        );
+        // tab と --target の併用は clap が拒否、--target なしの方向指定は build_request が拒否
+        assert!(Cli::try_parse_from(["tako", "tab", "move-pane", "4", "--target", "7"]).is_err());
+        let command = parse(&["tako", "tab", "move-pane", "4", "--pane", "9", "--down"]);
+        assert!(build_request(&command).is_err());
     }
 
     #[test]
@@ -863,16 +1007,65 @@ mod tests {
                 pane: Some(5),
                 path: "/tmp/a.md".into(),
                 mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
+                direction: None,
             }
         );
         // 相対パスは CLI の cwd で絶対化される
         let command = parse(&["tako", "open", "b.rs", "--pane", "5"]);
-        let Request::OpenFile { path, mode, .. } = build_request(&command).unwrap() else {
+        let Request::OpenFile {
+            path,
+            mode,
+            direction,
+            ..
+        } = build_request(&command).unwrap()
+        else {
             panic!("OpenFile になる");
         };
         assert!(std::path::Path::new(&path).is_absolute());
         assert!(path.ends_with("b.rs"));
         assert_eq!(mode, None);
+        assert_eq!(direction, None);
+        // 方向指定（FR-3.11 = D&D のドロップ位置相当）
+        let command = parse(&["tako", "open", "/tmp/a.md", "--pane", "5", "--down"]);
+        let Request::OpenFile { direction, .. } = build_request(&command).unwrap() else {
+            panic!("OpenFile になる");
+        };
+        assert_eq!(direction, Some(Direction::Down));
+    }
+
+    #[test]
+    fn tmux_openは方向とソケットを解釈する() {
+        let command = parse(&[
+            "tako",
+            "tmux",
+            "open",
+            "master-tako",
+            "--socket",
+            "work",
+            "--pane",
+            "3",
+            "--down",
+        ]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::TmuxOpen {
+                socket: Some("work".into()),
+                session: "master-tako".into(),
+                pane: Some(3),
+                direction: Some(Direction::Down),
+            }
+        );
+        // 方向省略は右
+        let command = parse(&["tako", "tmux", "open", "s1", "--pane", "3"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::TmuxOpen {
+                socket: None,
+                session: "s1".into(),
+                pane: Some(3),
+                direction: Some(Direction::Right),
+            }
+        );
     }
 
     #[test]

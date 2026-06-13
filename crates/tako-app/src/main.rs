@@ -25,9 +25,9 @@ use futures::channel::mpsc::unbounded;
 use futures::StreamExt;
 use gpui::{
     actions, canvas, div, point, prelude::*, px, relative, size, App, Bounds, ClipboardItem,
-    Context, CursorStyle, ElementInputHandler, EntityInputHandler, FocusHandle, Font, FontStyle,
-    FontWeight, HighlightStyle, Hsla, KeyBinding, Keystroke, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollDelta,
+    Context, CursorStyle, DragMoveEvent, ElementInputHandler, EntityInputHandler, FocusHandle,
+    Font, FontStyle, FontWeight, HighlightStyle, Hsla, KeyBinding, Keystroke, Modifiers,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollDelta,
     ScrollWheelEvent, SharedString, Size, StrikethroughStyle, StyledText, TextRun, TextStyle,
     UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions,
 };
@@ -412,6 +412,12 @@ struct TakoApp {
     last_saved_layout: Option<String>,
     /// OS ウィンドウの現フレーム（render で採取し layout 保存に含める。FR-5）
     window_frame: Option<tako_control::layout::WindowFrame>,
+    /// D&D 中のペイロード種別（FR-2.16.10 / FR-3.11）。on_drag 開始でセット、
+    /// drop / mouse-up でクリア。gpui の active_drag は型を公開しないため自前で追跡し、
+    /// ドロップ先オーバーレイの生成判定 + ラベル出し分けに使う
+    drag_kind: Option<DragKind>,
+    /// ドラッグ中のドロップ先（ペイン, 挿入位置）。挿入プレビュー表示の状態
+    drop_target: Option<(PaneId, DropZone)>,
 }
 
 /// 提案チップ 1 件分（FR-2.4.3。「localhost:PORT をブラウザで開く？」）
@@ -491,6 +497,94 @@ struct DragBorder {
     axis: SplitAxis,
     /// 分割領域（ウィンドウ座標 px）。`ratio_for_position` でマウス座標を比率へ換算する
     area: Rect,
+}
+
+/// D&D ペイロード: 統合 tmux ビューのセッション行（FR-2.16.10。`on_drop` の型キー）
+#[derive(Debug, Clone)]
+struct TmuxSessionDrag {
+    name: String,
+    socket: Option<String>,
+}
+
+/// D&D ペイロード: ファイルツリーのファイル行（FR-3.11。`on_drop` の型キー）
+#[derive(Debug, Clone)]
+struct FileDrag {
+    path: std::path::PathBuf,
+}
+
+/// D&D ペイロード: ペインのタイトルバー（FR-1.10。iTerm2 流のペイン移動）
+#[derive(Debug, Clone, Copy)]
+struct PaneDrag {
+    pane: PaneId,
+}
+
+/// ドラッグ中のペイロード種別（`TakoApp::drag_kind`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DragKind {
+    TmuxSession,
+    File,
+    Pane,
+}
+
+/// ドロップ先の挿入位置。上下左右 = その方向へ分割、Center = ファイル D&D のみで
+/// 「direction なし = FR-3.2 の既存プレビュー再利用セマンティクス」
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropZone {
+    Left,
+    Right,
+    Up,
+    Down,
+    Center,
+}
+
+/// カーソル位置 → ドロップゾーンの判定（純関数。fx / fy はペイン矩形内の正規化位置）。
+/// `center_allowed` 時は中央 40% 矩形を Center、外周は最も近い辺の象限にする
+fn drop_zone(fx: f32, fy: f32, center_allowed: bool) -> DropZone {
+    if center_allowed && (0.3..=0.7).contains(&fx) && (0.3..=0.7).contains(&fy) {
+        return DropZone::Center;
+    }
+    [
+        (fx, DropZone::Left),
+        (1.0 - fx, DropZone::Right),
+        (fy, DropZone::Up),
+        (1.0 - fy, DropZone::Down),
+    ]
+    .into_iter()
+    .min_by(|a, b| a.0.total_cmp(&b.0))
+    .map(|(_, zone)| zone)
+    .expect("候補は常に 4 つある")
+}
+
+/// ドロップゾーン → 分割方向（Center は呼び出し側で direction なしに落とすこと）
+fn zone_to_direction(zone: DropZone) -> tako_control::protocol::Direction {
+    use tako_control::protocol::Direction;
+    match zone {
+        DropZone::Left => Direction::Left,
+        DropZone::Right | DropZone::Center => Direction::Right,
+        DropZone::Up => Direction::Up,
+        DropZone::Down => Direction::Down,
+    }
+}
+
+/// ドラッグ中にカーソルへ追従するゴーストチップ（`on_drag` のコンストラクタが返す）
+struct DragGhost {
+    label: String,
+    theme: Theme,
+}
+
+impl Render for DragGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(rgba(self.theme.tab_bar_background))
+            .border_1()
+            .border_color(hsla(self.theme.accent))
+            .text_size(px(11.0))
+            .text_color(hsla(self.theme.foreground))
+            .child(SharedString::from(self.label.clone()))
+    }
 }
 
 impl TakoApp {
@@ -602,6 +696,8 @@ impl TakoApp {
             backend_sessions: HashMap::new(),
             last_saved_layout: None,
             window_frame: None,
+            drag_kind: None,
+            drop_target: None,
         };
         if restored.is_empty() {
             let root_id = app.workspace.active_tab().tree().focused();
@@ -1951,12 +2047,26 @@ impl TakoApp {
                 let kill_socket = session.socket.clone();
                 card = card.child(
                     div()
+                        .id(("tmux-att-row", id_seed))
                         .flex()
                         .flex_row()
                         .items_center()
                         .gap_2()
                         .px_1()
                         .overflow_hidden()
+                        .cursor(CursorStyle::OpenHand)
+                        // D&D でタブ内へ取り込み（FR-2.16.10。attach 済みでも多重 attach 可）
+                        .on_drag(
+                            TmuxSessionDrag {
+                                name: session.name.clone(),
+                                socket: session.socket.clone(),
+                            },
+                            self.drag_ghost_builder(
+                                DragKind::TmuxSession,
+                                format!("tmux: {}", truncate(&session.name, 24)),
+                                cx,
+                            ),
+                        )
                         .child(
                             div()
                                 .px_1()
@@ -2093,11 +2203,25 @@ impl TakoApp {
                 .bg(rgba_alpha(theme.tab_bar_background, 0.6))
                 .child(
                     div()
+                        .id(("tmux-unlisted-row", index as u64))
                         .flex()
                         .flex_row()
                         .items_center()
                         .gap_2()
                         .overflow_hidden()
+                        .cursor(CursorStyle::OpenHand)
+                        // D&D で現在のタブへ取り込んで表示（FR-2.16.10。kill せず中身を確認できる）
+                        .on_drag(
+                            TmuxSessionDrag {
+                                name: session.name.clone(),
+                                socket: session.socket.clone(),
+                            },
+                            self.drag_ghost_builder(
+                                DragKind::TmuxSession,
+                                format!("tmux: {}", truncate(&session.name, 24)),
+                                cx,
+                            ),
+                        )
                         .child(
                             div()
                                 .px_1()
@@ -2330,6 +2454,7 @@ impl TakoApp {
                             } else {
                                 "  "
                             };
+                            let drag_path = path.clone();
                             let base = div()
                                 .id(("filetree-row", index as u64))
                                 .flex()
@@ -2346,7 +2471,18 @@ impl TakoApp {
                                         this.open_file_row(&path, cx);
                                     }
                                     cx.notify();
-                                }));
+                                }))
+                                // ファイルは D&D でドロップ位置にプレビューとして開ける（FR-3.11）
+                                .when(!is_dir, |d| {
+                                    d.on_drag(
+                                        FileDrag { path: drag_path },
+                                        self.drag_ghost_builder(
+                                            DragKind::File,
+                                            format!("📄 {}", truncate(&row.entry.name, 24)),
+                                            cx,
+                                        ),
+                                    )
+                                });
                             if row.root {
                                 // ワークスペースフォルダの見出し行: 太字 + 上仕切り線（2 つ目以降）
                                 base.when(index > 0, |d| {
@@ -2391,6 +2527,7 @@ impl TakoApp {
                 pane: Some(pane),
                 path: path.display().to_string(),
                 mode: None,
+                direction: None,
             },
             PaneOrigin::User,
         );
@@ -2413,6 +2550,272 @@ impl TakoApp {
         let path = state.path.clone();
         self.previews.insert(pane_id, preview::load(&path, mode));
         cx.notify();
+    }
+
+    // --- D&D（FR-2.16.10 tmux セッション取り込み / FR-3.11 ファイルプレビュー） ---
+
+    /// `on_drag` のコンストラクタを作る共通部: drag_kind を記録してゴーストチップを返す。
+    /// gpui はドラッグ開始時にこのコンストラクタを 1 回呼ぶ（= ドラッグ開始フック）
+    fn drag_ghost_builder<T: 'static>(
+        &self,
+        kind: DragKind,
+        label: String,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&T, Point<Pixels>, &mut Window, &mut App) -> gpui::Entity<DragGhost> + 'static
+    {
+        let entity = cx.entity().downgrade();
+        let theme = self.theme.clone();
+        move |_, _, _, cx| {
+            let _ = entity.update(cx, |this, cx| {
+                this.drag_kind = Some(kind);
+                this.drop_target = None;
+                cx.notify();
+            });
+            cx.new(|_| DragGhost {
+                label: label.clone(),
+                theme: theme.clone(),
+            })
+        }
+    }
+
+    /// ドロップ先オーバーレイの on_drag_move: カーソルのペイン内位置から挿入位置を更新する。
+    /// capture phase で全ペインのオーバーレイに届くため、矩形内判定は自前で行う
+    fn update_drop_target(
+        &mut self,
+        pane_id: PaneId,
+        bounds: Bounds<Pixels>,
+        position: Point<Pixels>,
+        kind: DragKind,
+        cx: &mut Context<Self>,
+    ) {
+        let new = bounds.contains(&position).then(|| {
+            let fx =
+                f32::from(position.x - bounds.origin.x) / f32::from(bounds.size.width).max(1.0);
+            let fy =
+                f32::from(position.y - bounds.origin.y) / f32::from(bounds.size.height).max(1.0);
+            (pane_id, drop_zone(fx, fy, kind == DragKind::File))
+        });
+        match new {
+            Some(target) => {
+                if self.drop_target != Some(target) {
+                    self.drop_target = Some(target);
+                    cx.notify();
+                }
+            }
+            // このペインから出た（別ペインのオーバーレイが新しい位置を立てる）
+            None => {
+                if self.drop_target.is_some_and(|(p, _)| p == pane_id) {
+                    self.drop_target = None;
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// ドロップ確定の共通処理: ドラッグ状態を畳み、対象ペインで確定した挿入位置を返す
+    fn take_drop_zone(&mut self, pane_id: PaneId) -> Option<DropZone> {
+        self.drag_kind = None;
+        self.drop_target
+            .take()
+            .filter(|(p, _)| *p == pane_id)
+            .map(|(_, zone)| zone)
+    }
+
+    /// tmux セッション行のドロップ（FR-2.16.10）: CLI / MCP と同じ dispatch `TmuxOpen` で
+    /// ドロップ位置のペインを分割し attach 表示する。セッション起動（pending_attach）の
+    /// 後処理は Split 系と同じ（項目 56 の罠）
+    fn drop_tmux_session(
+        &mut self,
+        pane_id: PaneId,
+        drag: TmuxSessionDrag,
+        cx: &mut Context<Self>,
+    ) {
+        let zone = self.take_drop_zone(pane_id).unwrap_or(DropZone::Right);
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::TmuxOpen {
+                socket: drag.socket,
+                session: drag.name,
+                pane: Some(pane_id.as_u64()),
+                direction: Some(zone_to_direction(zone)),
+            },
+            PaneOrigin::User,
+        );
+        match result {
+            Ok(_) => {
+                for (pane, options) in std::mem::take(&mut self.pending_attach) {
+                    if let Err(e) = self.spawn_session(pane, options, cx) {
+                        eprintln!("warning: 取り込みペインを開けない: {e}");
+                        self.remove_pane(pane, cx);
+                    }
+                }
+            }
+            Err(e) => eprintln!("warning: tmux セッションを取り込めない: {e}"),
+        }
+        cx.notify();
+    }
+
+    /// ペインタイトルバーのドロップ（FR-1.10）: dispatch `MovePane`（target + direction）で
+    /// 同タブ内の挿し直し。自分自身へのドロップは no-op
+    fn drop_pane(&mut self, pane_id: PaneId, drag: PaneDrag, cx: &mut Context<Self>) {
+        let zone = self.take_drop_zone(pane_id).unwrap_or(DropZone::Right);
+        if drag.pane == pane_id {
+            cx.notify();
+            return;
+        }
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::MovePane {
+                pane: Some(drag.pane.as_u64()),
+                tab: None,
+                target: Some(pane_id.as_u64()),
+                direction: Some(zone_to_direction(zone)),
+            },
+            PaneOrigin::User,
+        );
+        if let Err(e) = result {
+            eprintln!("warning: ペインを移動できない: {e}");
+        }
+        cx.notify();
+    }
+
+    /// ファイル行のドロップ（FR-3.11）: 中央ゾーンは direction なし = FR-3.2 の
+    /// 再利用セマンティクス、象限はその方向への分割で開く（dispatch `OpenFile`）
+    fn drop_file(&mut self, pane_id: PaneId, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        let zone = self.take_drop_zone(pane_id).unwrap_or(DropZone::Center);
+        let direction = match zone {
+            DropZone::Center => None,
+            zone => Some(zone_to_direction(zone)),
+        };
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::OpenFile {
+                pane: Some(pane_id.as_u64()),
+                path: path.display().to_string(),
+                mode: None,
+                direction,
+            },
+            PaneOrigin::User,
+        );
+        if let Err(e) = result {
+            eprintln!("warning: ファイルを開けない: {e}");
+        }
+        cx.notify();
+    }
+
+    /// ペイン 1 枚分のドロップ先オーバーレイ（D&D 中のみ生成）。
+    /// ホバー中はドロップ後に新ペインが占める半面をハイライトし、結果ラベルを出す
+    /// （FR-2.16.10 / FR-3.11 の「ドロップしたらこうなる」挿入プレビュー）
+    fn render_drop_target(
+        &self,
+        pane_id: PaneId,
+        rect: Rect,
+        kind: DragKind,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = &self.theme;
+        let zone = self
+            .drop_target
+            .filter(|(p, _)| *p == pane_id)
+            .map(|(_, zone)| zone);
+        let mut overlay = div()
+            .id(("drop-target", pane_id.as_u64()))
+            .absolute()
+            .left(relative(rect.x))
+            .top(relative(rect.y))
+            .w(relative(rect.width))
+            .h(relative(rect.height))
+            .on_drag_move::<TmuxSessionDrag>(cx.listener(
+                move |this, e: &DragMoveEvent<TmuxSessionDrag>, _, cx| {
+                    this.update_drop_target(
+                        pane_id,
+                        e.bounds,
+                        e.event.position,
+                        DragKind::TmuxSession,
+                        cx,
+                    );
+                },
+            ))
+            .on_drag_move::<FileDrag>(cx.listener(
+                move |this, e: &DragMoveEvent<FileDrag>, _, cx| {
+                    this.update_drop_target(
+                        pane_id,
+                        e.bounds,
+                        e.event.position,
+                        DragKind::File,
+                        cx,
+                    );
+                },
+            ))
+            .on_drag_move::<PaneDrag>(cx.listener(
+                move |this, e: &DragMoveEvent<PaneDrag>, _, cx| {
+                    // 自分自身の上では挿入プレビューを出さない（移動にならないため）
+                    if e.drag(cx).pane == pane_id {
+                        if this.drop_target.is_some_and(|(p, _)| p == pane_id) {
+                            this.drop_target = None;
+                            cx.notify();
+                        }
+                        return;
+                    }
+                    this.update_drop_target(
+                        pane_id,
+                        e.bounds,
+                        e.event.position,
+                        DragKind::Pane,
+                        cx,
+                    );
+                },
+            ))
+            .on_drop::<TmuxSessionDrag>(cx.listener(move |this, drag: &TmuxSessionDrag, _, cx| {
+                this.drop_tmux_session(pane_id, drag.clone(), cx);
+            }))
+            .on_drop::<FileDrag>(cx.listener(move |this, drag: &FileDrag, _, cx| {
+                this.drop_file(pane_id, drag.path.clone(), cx);
+            }))
+            .on_drop::<PaneDrag>(cx.listener(move |this, drag: &PaneDrag, _, cx| {
+                this.drop_pane(pane_id, *drag, cx);
+            }));
+        if let Some(zone) = zone {
+            let (left, top, w, h) = match zone {
+                DropZone::Left => (0.0, 0.0, 0.5, 1.0),
+                DropZone::Right => (0.5, 0.0, 0.5, 1.0),
+                DropZone::Up => (0.0, 0.0, 1.0, 0.5),
+                DropZone::Down => (0.0, 0.5, 1.0, 0.5),
+                DropZone::Center => (0.0, 0.0, 1.0, 1.0),
+            };
+            let label = match (kind, zone) {
+                (DragKind::TmuxSession, _) => "ここに分割して表示",
+                (DragKind::File, DropZone::Center) => "ここで開く",
+                (DragKind::File, _) => "ここに分割して開く",
+                (DragKind::Pane, _) => "この位置に移動",
+            };
+            overlay = overlay.child(
+                div()
+                    .absolute()
+                    .left(relative(left))
+                    .top(relative(top))
+                    .w(relative(w))
+                    .h(relative(h))
+                    .rounded_sm()
+                    .bg(rgba_alpha(theme.accent, 0.18))
+                    .border_2()
+                    .border_color(hsla(theme.accent))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgba(theme.tab_bar_background))
+                            .text_size(px(11.0))
+                            .text_color(hsla(theme.foreground))
+                            .child(label),
+                    ),
+            );
+        }
+        overlay
     }
 
     /// 行テキスト全体を 1 ランで shape するための TextRun（幅計算用。色は使われない）
@@ -2560,6 +2963,12 @@ impl TakoApp {
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, cx: &mut Context<Self>) {
+        // D&D の後始末（ドロップ成立時は on_drop が stop_propagation 込みで先に畳む。
+        // ここはドロップ先以外で離した場合のクリア）
+        if self.drag_kind.take().is_some() | self.drop_target.take().is_some() {
+            cx.notify();
+            return;
+        }
         if self.dragging_border.take().is_some()
             | self.dragging_scrollbar.take().is_some()
             | std::mem::take(&mut self.dragging_panel)
@@ -3382,6 +3791,12 @@ impl TakoApp {
                     ))
                     .text_size(px(11.0))
                     .text_color(hsla(theme.tab_inactive_foreground))
+                    .cursor(CursorStyle::OpenHand)
+                    // タイトルバーの D&D でペインを移動できる（FR-1.10。iTerm2 流）
+                    .on_drag(
+                        PaneDrag { pane: pane_id },
+                        self.drag_ghost_builder(DragKind::Pane, truncate(&title_label, 24), cx),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         // タイトルバーからは選択を開始しない（フォーカスだけ移す）
@@ -3612,6 +4027,16 @@ impl TakoApp {
                     ))
                     .text_size(px(11.0))
                     .text_color(hsla(theme.tab_inactive_foreground))
+                    .cursor(CursorStyle::OpenHand)
+                    // プレビューペインもタイトルバー D&D で移動できる（FR-1.10）
+                    .on_drag(
+                        PaneDrag { pane: pane_id },
+                        self.drag_ghost_builder(
+                            DragKind::Pane,
+                            format!("📄 {}", truncate(&file_name, 24)),
+                            cx,
+                        ),
+                    )
                     .child(
                         div()
                             .id(("pane-close", pane_id.as_u64()))
@@ -4387,6 +4812,7 @@ impl Render for TakoApp {
             })
             .collect();
 
+        let drop_layout = layout.clone();
         let panes: Vec<_> = layout
             .into_iter()
             .map(|(id, rect)| {
@@ -4400,6 +4826,19 @@ impl Render for TakoApp {
             })
             .collect();
         let _ = cell;
+
+        // D&D 中のみ、各ペインにドロップ先オーバーレイを重ねる（FR-2.16.10 / FR-3.11）。
+        // gpui 側のドラッグが外部要因（Esc 等）で消えたフレームでは出さない
+        let drop_overlays: Vec<_> = self
+            .drag_kind
+            .filter(|_| cx.has_active_drag())
+            .map(|kind| {
+                drop_layout
+                    .iter()
+                    .map(|(id, rect)| self.render_drop_target(*id, *rect, kind, cx))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // ペイン境界のドラッグハンドル（仕切り線の上に数 px 幅の透明な当たり領域を重ねる）。
         // ヒットテストとカーソル形状は gpui に任せ、押下で start_border_drag を呼ぶ。
@@ -4637,6 +5076,7 @@ impl Render for TakoApp {
                             .relative()
                             .children(panes)
                             .children(border_handles)
+                            .children(drop_overlays)
                             .children(ime_overlay),
                     )
                     .children(self.render_panel(cx)),
@@ -5562,7 +6002,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 21, "MCP tools/list は 21 ツール");
+            check(status == 200 && tool_count == 22, "MCP tools/list は 22 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -6978,6 +7418,7 @@ mod self_test {
                                 pane: Some(base),
                                 path,
                                 mode,
+                                direction: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -7177,6 +7618,210 @@ mod self_test {
                 .unwrap_or(false);
             check(workspace_shrinks, "ペイン close でワークスペースフォルダが畳まれる");
 
+            // 68. D&D の同等操作（開発不変条件。FR-2.16.10 / FR-3.11 / FR-1.10）:
+            //     UI のドロップと同じ dispatch 経路（TmuxOpen / OpenFile direction /
+            //     MovePane target）を機械検証する。tmux 系は専用 -L ソケットで隔離
+            if has_tmux {
+                let dnd_sock = format!("tako-selftest-dnd-{}", std::process::id());
+                let created = std::process::Command::new("tmux")
+                    .args(["-L", &dnd_sock, "new-session", "-d", "-s", "dnd-src"])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                check(created, "D&D 用 tmux セッション作成");
+                wait(cx, 300).await;
+                let opened_pane = window
+                    .update(cx, |app, _, cx| {
+                        let base = app.focused_pane().as_u64();
+                        let opened = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TmuxOpen {
+                                socket: Some(dnd_sock.clone()),
+                                session: "dnd-src".into(),
+                                pane: Some(base),
+                                direction: Some(tako_control::protocol::Direction::Down),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .expect("tmux open は成功する");
+                        // セッション起動を伴う直接 dispatch（項目 56 / 67 と同じ後処理）
+                        for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                            app.spawn_session(pane, options, cx)
+                                .expect("取り込みペインの PTY 起動は成功する");
+                        }
+                        opened["pane"].as_u64().expect("pane が返る")
+                    })
+                    .unwrap_or(0);
+                // attach クライアントが実際にセッションへ繋がる（list-clients が非空になる）
+                let mut attached = false;
+                for _ in 0..25 {
+                    wait(cx, 400).await;
+                    attached = std::process::Command::new("tmux")
+                        .args(["-L", &dnd_sock, "list-clients"])
+                        .output()
+                        .map(|o| o.status.success() && !o.stdout.is_empty())
+                        .unwrap_or(false);
+                    if attached {
+                        break;
+                    }
+                }
+                check(attached, "tmux open: 分割ペインの attach クライアントが繋がる");
+                // 存在しないセッション名は分割前に弾かれる（空ペインが生えない）
+                let rejected = window
+                    .update(cx, |app, _, _| {
+                        let before = app.workspace.active_tab().tree().len();
+                        let base = app.focused_pane().as_u64();
+                        let err = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TmuxOpen {
+                                socket: Some(dnd_sock.clone()),
+                                session: "no-such-session".into(),
+                                pane: Some(base),
+                                direction: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .is_err();
+                        err && app.workspace.active_tab().tree().len() == before
+                    })
+                    .unwrap_or(false);
+                check(rejected, "tmux open: 存在しないセッションは分割前に弾く");
+                // 取り込みペインを閉じてもセッション側は残る（kill ではない）
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Close {
+                            pane: Some(opened_pane),
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                });
+                wait(cx, 800).await;
+                let survives = std::process::Command::new("tmux")
+                    .args(["-L", &dnd_sock, "has-session", "-t", "=dnd-src"])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                check(survives, "tmux open: ペイン close でもセッションは残る");
+                let _ = std::process::Command::new("tmux")
+                    .args(["-L", &dnd_sock, "kill-server"])
+                    .status();
+            } else {
+                eprintln!("（tmux 不在のため項目 68 をスキップ）");
+            }
+
+            // 68b. OpenFile の direction（ファイル D&D のドロップ位置。FR-3.11）:
+            //      既存プレビューがあっても再利用せず指定方向に分割して開く
+            let dnd_dir =
+                std::env::temp_dir().join(format!("tako-selftest-dnd-file-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dnd_dir);
+            std::fs::create_dir_all(&dnd_dir).expect("一時ディレクトリを作れる");
+            std::fs::write(dnd_dir.join("a.rs"), "fn main() {}\n").unwrap();
+            let open_direction_ok = window
+                .update(cx, |app, _, _| {
+                    let base = app.focused_pane().as_u64();
+                    let path = dnd_dir.join("a.rs").display().to_string();
+                    let open = |app: &mut TakoApp, direction| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::OpenFile {
+                                pane: Some(base),
+                                path: path.clone(),
+                                mode: None,
+                                direction,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .expect("open_file は成功する")
+                    };
+                    let first = open(app, None)["pane"].as_u64().expect("pane が返る");
+                    let second =
+                        open(app, Some(tako_control::protocol::Direction::Down));
+                    let split_new = second["pane"].as_u64() != Some(first)
+                        && second["created"].as_bool() == Some(true)
+                        && app.previews.len() == 2;
+                    // 後片付け: プレビュー 2 枚を閉じる
+                    for pane in [first, second["pane"].as_u64().unwrap_or(0)] {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Close { pane: Some(pane) },
+                            PaneOrigin::Cli,
+                        );
+                    }
+                    split_new && app.previews.is_empty()
+                })
+                .unwrap_or(false);
+            check(
+                open_direction_ok,
+                "OpenFile direction は再利用せず指定方向に開く（ファイル D&D 同等）",
+            );
+            let _ = std::fs::remove_dir_all(&dnd_dir);
+
+            // 68c. MovePane の target + direction（タイトルバー D&D のペイン移動。FR-1.10）:
+            //      [base | p2] から base を p2 の下へ → 縦分割（p2 上 / base 下・全幅）
+            let move_ok = window
+                .update(cx, |app, _, cx| {
+                    let base = app.focused_pane().as_u64();
+                    let split = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Split {
+                            pane: Some(base),
+                            direction: None,
+                            ratio: None,
+                            command: None,
+                            cwd: None,
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .expect("split は成功する");
+                    for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                        app.spawn_session(pane, options, cx)
+                            .expect("一時ペインの PTY 起動は成功する");
+                    }
+                    let p2 = split["pane"].as_u64().expect("pane が返る");
+                    tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::MovePane {
+                            pane: Some(base),
+                            tab: None,
+                            target: Some(p2),
+                            direction: Some(tako_control::protocol::Direction::Down),
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .expect("move-pane --target は成功する");
+                    let rects = app.workspace.active_tab().tree().layout(Rect::UNIT);
+                    let rect_of = |raw: u64| {
+                        rects
+                            .iter()
+                            .find(|(p, _)| p.as_u64() == raw)
+                            .map(|(_, r)| *r)
+                    };
+                    // base が p2 の「直下」（同列・同幅の縦分割）に入る。タブに他の
+                    // ペインが残っていても成り立つ相対条件で見る
+                    let moved = match (rect_of(p2), rect_of(base)) {
+                        (Some(top), Some(bottom)) => {
+                            top.y < bottom.y
+                                && (top.x - bottom.x).abs() < 1e-5
+                                && (top.width - bottom.width).abs() < 1e-5
+                        }
+                        _ => false,
+                    };
+                    // 後片付け: 一時ペインを閉じて 1 ペイン構成へ戻す
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Close { pane: Some(p2) },
+                        PaneOrigin::Cli,
+                    );
+                    moved
+                })
+                .unwrap_or(false);
+            check(
+                move_ok,
+                "MovePane target+direction の挿し直し（タイトルバー D&D 同等）",
+            );
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -7206,7 +7851,31 @@ fn accumulate_scroll(carry: f32, delta_lines: f32) -> (i32, f32) {
 
 #[cfg(test)]
 mod scroll_tests {
-    use super::accumulate_scroll;
+    use super::{accumulate_scroll, drop_zone, zone_to_direction, DropZone};
+
+    #[test]
+    fn ドロップゾーンは象限と中央を判定する() {
+        // 4 象限（対角線分割。tmux ドラッグ = center_allowed なし）
+        assert_eq!(drop_zone(0.1, 0.5, false), DropZone::Left);
+        assert_eq!(drop_zone(0.9, 0.5, false), DropZone::Right);
+        assert_eq!(drop_zone(0.5, 0.1, false), DropZone::Up);
+        assert_eq!(drop_zone(0.5, 0.9, false), DropZone::Down);
+        // 中央でも center_allowed なしなら最寄り辺に落ちる
+        assert!(matches!(
+            drop_zone(0.5, 0.45, false),
+            DropZone::Up | DropZone::Left | DropZone::Right | DropZone::Down
+        ));
+        assert_ne!(drop_zone(0.5, 0.45, false), DropZone::Center);
+        // ファイルドラッグは中央 40% が Center（= 再利用セマンティクス）
+        assert_eq!(drop_zone(0.5, 0.5, true), DropZone::Center);
+        assert_eq!(drop_zone(0.31, 0.69, true), DropZone::Center);
+        assert_eq!(drop_zone(0.1, 0.5, true), DropZone::Left);
+        assert_eq!(drop_zone(0.5, 0.75, true), DropZone::Down);
+        // ゾーン → 方向の写し（Center は呼び出し側で direction なしに落とす）
+        use tako_control::protocol::Direction;
+        assert_eq!(zone_to_direction(DropZone::Left), Direction::Left);
+        assert_eq!(zone_to_direction(DropZone::Down), Direction::Down);
+    }
 
     #[test]
     fn 微小デルタは蓄積されて行になる() {

@@ -414,6 +414,67 @@ pub fn dispatch(
             Ok(json!({ "killed": session, "window": window }))
         }
 
+        Request::TmuxOpen {
+            socket,
+            session,
+            pane,
+            direction,
+        } => {
+            // 存在しないセッション名は分割前に弾く（D&D 経路では起こらないが、
+            // CLI / MCP からのタイポで空ペインだけが生えるのを防ぐ）
+            let exists = tako_core::tmux::list_sessions(socket.as_deref())
+                .iter()
+                .any(|s| s.name == session);
+            if !exists {
+                return Err(DispatchError::Operation(format!(
+                    "tmux セッション {session} が見つからない（socket: {}）",
+                    socket.as_deref().unwrap_or("既定")
+                )));
+            }
+            let (tab, target) = resolve_pane(host.workspace(), pane)?;
+            let new_pane = Pane::new(origin);
+            let new_id = new_pane.id();
+            tree_mut(host.workspace_mut(), tab)
+                .split_with_ratio(
+                    target,
+                    direction.unwrap_or(Direction::Right).to_core(),
+                    0.5,
+                    new_pane,
+                )
+                .map_err(op_err)?;
+            // attach クライアントを起動する（FR-2.16.10）。`TMUX=` はネストガードの回避
+            // （tako バックエンドペイン = tmux 内からでも attach できる）、`=` 接頭辞は
+            // セッション名の完全一致指定。ペインを閉じる = クライアント終了で、
+            // セッション側は無傷で残る
+            let mut command = vec!["env".to_string(), "TMUX=".to_string(), "tmux".to_string()];
+            if let Some(socket) = &socket {
+                command.push("-L".into());
+                command.push(socket.clone());
+            }
+            command.extend([
+                "attach-session".to_string(),
+                "-t".to_string(),
+                format!("={session}"),
+            ]);
+            let mut command = command.into_iter();
+            host.attach_session(
+                new_id,
+                SpawnOptions {
+                    command: Some(SpawnCommand {
+                        program: command.next().expect("env が先頭にある"),
+                        args: command.collect(),
+                    }),
+                    cwd: None,
+                    env: Vec::new(),
+                },
+            );
+            Ok(json!({
+                "pane": new_id.as_u64(),
+                "session": session,
+                "socket": socket,
+            }))
+        }
+
         Request::TabRename { pane, tab, title } => {
             let tab_id = match tab {
                 Some(raw) => find_tab(host.workspace(), raw)?,
@@ -455,12 +516,43 @@ pub fn dispatch(
             Ok(Value::Null)
         }
 
-        Request::MovePane { pane, tab } => {
-            let (_, target) = resolve_pane(host.workspace(), pane)?;
-            let dest = find_tab(host.workspace(), tab)?;
-            host.workspace_mut()
-                .move_pane(target, dest)
-                .map_err(op_err)?;
+        Request::MovePane {
+            pane,
+            tab,
+            target,
+            direction,
+        } => {
+            let (_, source) = resolve_pane(host.workspace(), pane)?;
+            match (tab, target) {
+                // 従来動作: 別タブの末尾（フォーカス右）へ移送
+                (Some(tab), None) => {
+                    if direction.is_some() {
+                        return Err(DispatchError::InvalidParams(
+                            "direction は target 指定時のみ使える".into(),
+                        ));
+                    }
+                    let dest = find_tab(host.workspace(), tab)?;
+                    host.workspace_mut()
+                        .move_pane(source, dest)
+                        .map_err(op_err)?;
+                }
+                // FR-1.10: target ペインの隣（direction 側）へ挿し直す
+                (None, Some(raw)) => {
+                    let (_, target) = resolve_pane(host.workspace(), Some(raw))?;
+                    host.workspace_mut()
+                        .move_pane_to(
+                            source,
+                            target,
+                            direction.unwrap_or(Direction::Right).to_core(),
+                        )
+                        .map_err(op_err)?;
+                }
+                _ => {
+                    return Err(DispatchError::InvalidParams(
+                        "tab か target のどちらか一方を指定する".into(),
+                    ))
+                }
+            }
             Ok(Value::Null)
         }
 
@@ -515,7 +607,12 @@ pub fn dispatch(
             }))
         }
 
-        Request::OpenFile { pane, path, mode } => {
+        Request::OpenFile {
+            pane,
+            path,
+            mode,
+            direction,
+        } => {
             let (tab, target) = resolve_pane(host.workspace(), pane)?;
             // 相対パスは対象ペインの cwd（OSC 7。無ければプロセスの cwd）基準で解決する
             let mut resolved = std::path::PathBuf::from(&path);
@@ -539,9 +636,17 @@ pub fn dispatch(
                     Some(ext) if ext.eq_ignore_ascii_case("markdown") => PreviewModeWire::Markdown,
                     _ => PreviewModeWire::Code,
                 });
-            // 表示先の解決: 対象自身がプレビュー > 同タブの既存プレビュー（再利用）>
-            // 対象を分割して新設（ターミナルセッションは起動しない = attach なし）
-            let (view_pane, created) = if host.preview_state(target).is_some() {
+            // 表示先の解決: direction 指定（FR-3.11 = D&D のドロップ位置）なら再利用せず
+            // 必ずその方向へ分割。省略時は 対象自身がプレビュー > 同タブの既存プレビュー
+            // （再利用）> 右分割で新設（ターミナルセッションは起動しない = attach なし）
+            let (view_pane, created) = if let Some(direction) = direction {
+                let new_pane = Pane::new(origin);
+                let new_id = new_pane.id();
+                tree_mut(host.workspace_mut(), tab)
+                    .split_with_ratio(target, direction.to_core(), 0.5, new_pane)
+                    .map_err(op_err)?;
+                (new_id, true)
+            } else if host.preview_state(target).is_some() {
                 (target, false)
             } else if let Some(existing) = host.preview_pane_of_tab(tab) {
                 (existing, false)
@@ -1077,7 +1182,9 @@ mod tests {
             &mut host,
             Request::MovePane {
                 pane: Some(new_id),
-                tab: tab2,
+                tab: Some(tab2),
+                target: None,
+                direction: None,
             },
             PaneOrigin::Cli,
         )
@@ -1108,6 +1215,86 @@ mod tests {
         let tab1 = host.ws.tabs()[0].id().as_u64();
         dispatch(&mut host, Request::TabSelect { tab: tab1 }, PaneOrigin::Cli).unwrap();
         assert_eq!(host.ws.active_tab_id().as_u64(), tab1);
+    }
+
+    #[test]
+    fn move_paneのtarget指定は同タブ内で挿し直す() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let new_id = split(&mut host, root); // [root | new]
+                                             // root を new の下へ（FR-1.10 = タイトルバー D&D の同等操作）
+        dispatch(
+            &mut host,
+            Request::MovePane {
+                pane: Some(root),
+                tab: None,
+                target: Some(new_id),
+                direction: Some(Direction::Down),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let rects = host.ws.active_tab().tree().layout(Rect::UNIT);
+        let rect_of = |raw: u64| {
+            rects
+                .iter()
+                .find(|(p, _)| p.as_u64() == raw)
+                .map(|(_, r)| *r)
+                .unwrap()
+        };
+        assert!(rect_of(new_id).y < rect_of(root).y, "root が下に入る");
+        assert!((rect_of(root).width - 1.0).abs() < 1e-5, "縦分割 = 全幅");
+        // tab と target の同時指定・両方省略・target + tab なし direction はエラー
+        let tab1 = host.ws.tabs()[0].id().as_u64();
+        let err = dispatch(
+            &mut host,
+            Request::MovePane {
+                pane: Some(root),
+                tab: Some(tab1),
+                target: Some(new_id),
+                direction: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DispatchError::InvalidParams(_)));
+        let err = dispatch(
+            &mut host,
+            Request::MovePane {
+                pane: Some(root),
+                tab: None,
+                target: None,
+                direction: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DispatchError::InvalidParams(_)));
+        let err = dispatch(
+            &mut host,
+            Request::MovePane {
+                pane: Some(root),
+                tab: Some(tab1),
+                target: None,
+                direction: Some(Direction::Down),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DispatchError::InvalidParams(_)));
+        // 自分自身へはドメイン層が拒否する
+        let err = dispatch(
+            &mut host,
+            Request::MovePane {
+                pane: Some(root),
+                tab: None,
+                target: Some(root),
+                direction: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DispatchError::Operation(_)));
     }
 
     #[test]
@@ -1193,6 +1380,7 @@ mod tests {
                     pane: Some(root),
                     path,
                     mode,
+                    direction: None,
                 },
                 PaneOrigin::Mcp,
             )
@@ -1237,6 +1425,62 @@ mod tests {
         assert!(open(&mut host, dir.join("no-such").display().to_string(), None).is_err());
         assert!(open(&mut host, dir.display().to_string(), None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_fileのdirection指定は再利用せず分割する() {
+        let dir =
+            std::env::temp_dir().join(format!("tako-dispatch-open-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn main() {}").unwrap();
+
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let open = |host: &mut MockHost, direction: Option<Direction>| {
+            dispatch(
+                host,
+                Request::OpenFile {
+                    pane: Some(root),
+                    path: dir.join("a.rs").display().to_string(),
+                    mode: None,
+                    direction,
+                },
+                PaneOrigin::User,
+            )
+            .unwrap()
+        };
+        // 1 枚目（direction なし）でプレビューが生える
+        let first = open(&mut host, None)["pane"].as_u64().unwrap();
+        // direction 指定（D&D のドロップ位置。FR-3.11）は既存プレビューを再利用しない
+        let result = open(&mut host, Some(Direction::Down));
+        let second = result["pane"].as_u64().unwrap();
+        assert_ne!(second, first, "再利用せず新ペインに開く");
+        assert_eq!(result["created"].as_bool(), Some(true));
+        assert_eq!(host.ws.active_tab().tree().len(), 3);
+        assert!(host.attached.is_empty(), "プレビューは PTY を起動しない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tmux_openは存在しないセッションを分割前に弾く() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let err = dispatch(
+            &mut host,
+            Request::TmuxOpen {
+                socket: Some(format!("tako-test-no-such-server-{}", std::process::id())),
+                session: "no-such-session".into(),
+                pane: Some(root),
+                direction: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DispatchError::Operation(_)));
+        // 分割もセッション起動も起きていない
+        assert_eq!(host.ws.active_tab().tree().len(), 1);
+        assert!(host.attached.is_empty());
     }
 
     #[test]

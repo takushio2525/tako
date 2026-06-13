@@ -176,6 +176,16 @@ pub enum Request {
         session: String,
         window: Option<u32>,
     },
+    /// tmux セッションをタブ内へ取り込む（FR-2.16.10。統合 tmux ビューの D&D と同等操作）。
+    /// `pane` を `direction`（省略時は右）へ分割した新ペインで attach クライアント
+    /// （`TMUX= tmux [-L socket] attach-session -t =session`）を起動する。
+    /// 新ペインを閉じてもセッションは残る（kill しない）
+    TmuxOpen {
+        socket: Option<String>,
+        session: String,
+        pane: Option<u64>,
+        direction: Option<Direction>,
+    },
     /// タブのリネーム（FR-2.12.1）。`tab` 省略時は `pane`（呼び出し元）の属するタブ。
     /// 明示リネームとして自動リネーム（FR-2.12）より優先され、空文字で手動指定を解除する
     TabRename {
@@ -187,8 +197,16 @@ pub enum Request {
     TabNew { title: Option<String> },
     /// タブ切替（FR-2.5.10）
     TabSelect { tab: u64 },
-    /// ペインの別タブへの移送（FR-2.5.10）
-    MovePane { pane: Option<u64>, tab: u64 },
+    /// ペインの移動（FR-2.5.10 / FR-1.10）。`tab` 指定 = 別タブの末尾へ移送（従来動作）、
+    /// `target` 指定 = そのペインを `direction`（省略時は右）へ分割した位置に挿し直す
+    /// （同タブ内の並べ替え = タイトルバー D&D と同等。タブまたぎも可）。
+    /// `tab` と `target` は排他で、どちらか一方が必須
+    MovePane {
+        pane: Option<u64>,
+        tab: Option<u64>,
+        target: Option<u64>,
+        direction: Option<Direction>,
+    },
     /// タブ・ペイン名の AI 自動リネーム（FR-2.12.4）の ON/OFF。
     /// `enabled` 省略時は現在状態の取得のみ。設定は永続化される
     AutoRename { enabled: Option<bool> },
@@ -215,11 +233,14 @@ pub enum Request {
     /// `pane` がプレビューペインならそのまま差し替え、ターミナルペインなら同タブの既存
     /// プレビューペインを再利用し、無ければ `pane` を分割して生やす（ターミナルは起動しない）。
     /// 相対パスは `pane` の cwd（OSC 7）基準で解決する。
-    /// `mode` 省略時は拡張子から自動判定（.md / .markdown → markdown、それ以外 code）
+    /// `mode` 省略時は拡張子から自動判定（.md / .markdown → markdown、それ以外 code）。
+    /// `direction` 指定時（FR-3.11 = ファイル D&D の同等操作）は既存プレビューを
+    /// 再利用せず、必ず `pane` をその方向へ分割して新しいプレビューペインを生やす
     OpenFile {
         pane: Option<u64>,
         path: String,
         mode: Option<PreviewModeWire>,
+        direction: Option<Direction>,
     },
 }
 
