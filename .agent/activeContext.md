@@ -4,17 +4,21 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-06-13・パフォーマンスバグ修正完了）
+## 現在の対象（2026-06-14・tmux パネル UI 刷新完了）
 
-- **パフォーマンスバグ 3 件を修正**:
-  ① preview::load の syntect ハイライトを background executor へ非同期化（UI コスト
-  200ms+ → 0.8ms、248 倍高速化。平文即表示 + 色は後から付く 2 段階 UX）
-  ② sync_filetree_roots の毎フレーム is_dir() stat syscall を除去
-  ③ FileTree::refresh の read_dir を background executor へ移行
-- 直前の完了: D&D 3 件（FR-2.16.10 / FR-3.11 / FR-1.10）
-- セルフテスト **120 項目**緑・cargo test 88 pass・clippy / fmt 緑・`.app` 反映済み
+- **統合 tmux ビュー（render_tmux_view）を全面刷新**:
+  ① アコーディオン折りたたみ式タブグループ（panel_collapsed_tabs で状態管理）
+  ② 状態色統一（緑=実行中 / 黄=入力待ち / 赤=エラー / 灰=不明）
+  ③ × ボタンは hover 時のみ表示（group_hover）、ゴミ箱→× に変更
+  ④ GPUI の whitespace_nowrap + text_ellipsis でレスポンシブ省略（固定 truncate 廃止）
+  ⑤ パディング・行間を大幅削減（VSCode サイドバー水準の情報密度）
+  ⑥ セクション区切り線 + 「未表示セッション」ラベルで管理外/kill漏れ? を明確化
+  ⑦ kill 確認を縦積み→横 1 行インライン化（render_kill_confirm）
+- パネル幅のドラッグリサイズは既存機構で動作確認済み
+- D&D（FR-2.16.10）は既存コードをそのまま維持（on_drag / drag_ghost_builder）
+- cargo test 88 pass・clippy / fmt 緑・`.app` 反映済み
 - **ユーザーの再起動 + 体感確認待ち**
-- 最終更新: 2026-06-13
+- 最終更新: 2026-06-14
 
 ## 未着手タスク（優先順はユーザーと相談）
 

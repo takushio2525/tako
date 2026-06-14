@@ -309,3 +309,19 @@
   ③ FileTree::refresh の read_dir を background executor へ移行。教訓は architecture.md
 - 関連コミット: `e1ed21e` `[改善] プレビュー/ファイルツリーのパフォーマンスバグ修正`
 - 次: ユーザー再起動 → 体感確認
+
+## 2026-06-14（プレビュー書式崩れ 4 件一括修正）
+
+- ① コード行を行番号（固定幅左列）+ 本文（flex_1 折り返し）に分離 → 長行見切れ・MD コード
+  ビュー行重なり解消 ② UI 経路で pending_highlights 未 drain → syntect ハイライト未発火を
+  修正 ③ MD ListItem を flex_1 div で折り返し ④ ①と同根
+- 関連コミット: `83cfe2c` `[修正] プレビュー表示の書式崩れ4件を一括修正`
+- 次: ユーザー再起動 → 実機確認
+
+## 2026-06-14（tmux パネル UI 刷新）
+
+- render_tmux_view / render_kill_confirm を全面書き換え: アコーディオン折りたたみ、
+  状態色統一（緑/黄/赤）、hover 時のみ × 表示、GPUI text_ellipsis、パディング削減、
+  セクション区切り明確化。FileOp dispatch（FR-3.12）も同時追加
+- 関連コミット: `20261e9` `[改善] tmux パネル UI 刷新 + FileOp dispatch`
+- 次: ユーザー再起動 → 実機確認

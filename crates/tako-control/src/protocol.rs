@@ -326,8 +326,14 @@ impl ResponseEnvelope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileOpKind {
-    CopyAbsolutePath, CopyRelativePath, Reveal, OpenTerminal,
-    Rename, CreateFile, CreateDir, Trash,
+    CopyAbsolutePath,
+    CopyRelativePath,
+    Reveal,
+    OpenTerminal,
+    Rename,
+    CreateFile,
+    CreateDir,
+    Trash,
 }
 
 #[cfg(test)]

@@ -687,10 +687,14 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
                 other => return Err(format!("op が不正: {other}")),
             };
             Request::FileOp {
-                op, path: str_arg(args, "path")?.ok_or("path を指定する")?,
+                op,
+                path: str_arg(args, "path")?.ok_or("path を指定する")?,
                 name: str_arg(args, "name")?,
                 pane: match op {
-                    crate::protocol::FileOpKind::OpenTerminal | crate::protocol::FileOpKind::CopyRelativePath => Some(target_pane(args, caller)?),
+                    crate::protocol::FileOpKind::OpenTerminal
+                    | crate::protocol::FileOpKind::CopyRelativePath => {
+                        Some(target_pane(args, caller)?)
+                    }
                     _ => None,
                 },
             }
@@ -1120,7 +1124,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 22);
+        assert_eq!(tools.len(), 23);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
