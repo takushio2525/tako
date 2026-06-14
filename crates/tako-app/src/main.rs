@@ -507,11 +507,13 @@ struct DragBorder {
     area: Rect,
 }
 
-/// D&D ペイロード: 統合 tmux ビューのセッション行（FR-2.16.10。`on_drop` の型キー）
+/// D&D ペイロード: 統合 tmux ビューのセッション/window 行（FR-2.16.10。`on_drop` の型キー）
 #[derive(Debug, Clone)]
 struct TmuxSessionDrag {
     name: String,
     socket: Option<String>,
+    /// Some(index) なら特定 window を attach、None ならセッション全体
+    window: Option<u32>,
 }
 
 /// D&D ペイロード: ファイルツリーのファイル行（FR-3.11。`on_drop` の型キー）
@@ -2157,6 +2159,7 @@ impl TakoApp {
                             TmuxSessionDrag {
                                 name: session.name.clone(),
                                 socket: session.socket.clone(),
+                                window: None,
                             },
                             self.drag_ghost_builder(
                                 DragKind::TmuxSession,
@@ -2220,6 +2223,8 @@ impl TakoApp {
                     let w_index = *w_index;
                     let kill_name = session.name.clone();
                     let kill_socket = session.socket.clone();
+                    let drag_name = session.name.clone();
+                    let drag_socket = session.socket.clone();
                     card = card.child(
                         div()
                             .id((
@@ -2233,6 +2238,19 @@ impl TakoApp {
                             .gap_1()
                             .pl_4()
                             .text_size(px(11.0))
+                            .cursor(CursorStyle::OpenHand)
+                            .on_drag(
+                                TmuxSessionDrag {
+                                    name: drag_name,
+                                    socket: drag_socket,
+                                    window: Some(w_index),
+                                },
+                                self.drag_ghost_builder(
+                                    DragKind::TmuxSession,
+                                    format!("tmux: {}", truncate(label, 24)),
+                                    cx,
+                                ),
+                            )
                             .overflow_hidden()
                             .child(
                                 div()
@@ -2327,6 +2345,7 @@ impl TakoApp {
                             TmuxSessionDrag {
                                 name: session.name.clone(),
                                 socket: session.socket.clone(),
+                                window: None,
                             },
                             self.drag_ghost_builder(
                                 DragKind::TmuxSession,
@@ -2406,6 +2425,8 @@ impl TakoApp {
                     let w_index = *w_index;
                     let kill_name = session.name.clone();
                     let kill_socket = session.socket.clone();
+                    let drag_name = session.name.clone();
+                    let drag_socket = session.socket.clone();
                     div()
                         .id((
                             "tmux-unlisted-wrow",
@@ -2418,6 +2439,19 @@ impl TakoApp {
                         .gap_1()
                         .pl_4()
                         .text_size(px(11.0))
+                        .cursor(CursorStyle::OpenHand)
+                        .on_drag(
+                            TmuxSessionDrag {
+                                name: drag_name,
+                                socket: drag_socket,
+                                window: Some(w_index),
+                            },
+                            self.drag_ghost_builder(
+                                DragKind::TmuxSession,
+                                format!("tmux: {}", truncate(label, 24)),
+                                cx,
+                            ),
+                        )
                         .overflow_hidden()
                         .child(
                             div()
@@ -3251,6 +3285,7 @@ impl TakoApp {
             tako_control::protocol::Request::TmuxOpen {
                 socket: drag.socket,
                 session: drag.name,
+                window: drag.window,
                 pane: Some(pane_id.as_u64()),
                 direction: Some(zone_to_direction(zone)),
             },
@@ -8376,6 +8411,7 @@ mod self_test {
                             tako_control::protocol::Request::TmuxOpen {
                                 socket: Some(dnd_sock.clone()),
                                 session: "dnd-src".into(),
+                                window: None,
                                 pane: Some(base),
                                 direction: Some(tako_control::protocol::Direction::Down),
                             },
@@ -8414,6 +8450,7 @@ mod self_test {
                             tako_control::protocol::Request::TmuxOpen {
                                 socket: Some(dnd_sock.clone()),
                                 session: "no-such-session".into(),
+                                window: None,
                                 pane: Some(base),
                                 direction: None,
                             },

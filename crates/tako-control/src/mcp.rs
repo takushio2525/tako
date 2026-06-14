@@ -582,6 +582,7 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
         "tako_tmux_open" => Request::TmuxOpen {
             socket: str_arg(args, "socket")?,
             session: str_arg(args, "session")?.ok_or("session を指定する")?,
+            window: u64_arg(args, "window")?.map(|n| n as u32),
             pane: Some(target_pane(args, caller)?),
             direction: direction_arg(args)?,
         },
@@ -1108,6 +1109,7 @@ mod tests {
             vec![Request::TmuxOpen {
                 socket: Some("work".into()),
                 session: "master-tako".into(),
+                window: None,
                 pane: Some(3),
                 direction: Some(Direction::Down),
             }]

@@ -417,6 +417,7 @@ pub fn dispatch(
         Request::TmuxOpen {
             socket,
             session,
+            window,
             pane,
             direction,
         } => {
@@ -451,11 +452,11 @@ pub fn dispatch(
                 command.push("-L".into());
                 command.push(socket.clone());
             }
-            command.extend([
-                "attach-session".to_string(),
-                "-t".to_string(),
-                format!("={session}"),
-            ]);
+            let target = match window {
+                Some(w) => format!("={session}:{w}"),
+                None => format!("={session}"),
+            };
+            command.extend(["attach-session".to_string(), "-t".to_string(), target]);
             let mut command = command.into_iter();
             host.attach_session(
                 new_id,
@@ -1675,6 +1676,7 @@ mod tests {
             Request::TmuxOpen {
                 socket: Some(format!("tako-test-no-such-server-{}", std::process::id())),
                 session: "no-such-session".into(),
+                window: None,
                 pane: Some(root),
                 direction: None,
             },

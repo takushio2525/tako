@@ -694,6 +694,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }) => Request::TmuxOpen {
             socket: socket.clone(),
             session: session.clone(),
+            window: None,
             pane: target_pane(*pane)?,
             direction: match (down, up, left) {
                 (true, _, _) => Some(Direction::Down),
@@ -1163,6 +1164,7 @@ mod tests {
             Request::TmuxOpen {
                 socket: Some("work".into()),
                 session: "master-tako".into(),
+                window: None,
                 pane: Some(3),
                 direction: Some(Direction::Down),
             }
@@ -1174,6 +1176,7 @@ mod tests {
             Request::TmuxOpen {
                 socket: None,
                 session: "s1".into(),
+                window: None,
                 pane: Some(3),
                 direction: Some(Direction::Right),
             }

@@ -187,6 +187,8 @@ pub enum Request {
     TmuxOpen {
         socket: Option<String>,
         session: String,
+        /// 特定 window のみ attach（省略時はセッション全体）
+        window: Option<u32>,
         pane: Option<u64>,
         direction: Option<Direction>,
     },
