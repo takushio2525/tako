@@ -533,11 +533,11 @@ struct ContextMenu {
 
 /// ファイルツリーのインライン編集（FR-3.12）
 #[derive(Clone)]
-#[allow(dead_code)]
 struct InlineEdit {
     parent: std::path::PathBuf,
     kind: InlineEditKind,
     text: String,
+    cursor: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1707,6 +1707,11 @@ impl TakoApp {
     // --- キー入力 ---
 
     fn handle_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
+        if self.inline_edit.is_some() {
+            self.handle_inline_edit_key(keystroke, cx);
+            cx.stop_propagation();
+            return;
+        }
         // cmd を含む未バインドのキーはシェルへ流さない
         if keystroke.modifiers.platform {
             return;
@@ -2465,7 +2470,55 @@ impl TakoApp {
         // プレビュー表示中のファイル（開いている行を控えめにハイライトする）
         let open_paths: std::collections::HashSet<std::path::PathBuf> =
             self.previews.values().map(|p| p.path.clone()).collect();
-        let rows = self.filetree.rows();
+        let mut rows = self.filetree.rows();
+        // 新規ファイル/フォルダ用の仮行を親の直後に挿入
+        let inline_new_insert = match &self.inline_edit {
+            Some(edit) if edit.kind != InlineEditKind::Rename => {
+                let parent = &edit.parent;
+                // 親ディレクトリの子の末尾（展開済み子孫をすべて飛ばした直後）に挿入
+                let insert_pos =
+                    rows.iter()
+                        .position(|r| r.entry.path == *parent)
+                        .map(|parent_idx| {
+                            let parent_depth = rows[parent_idx].depth;
+                            let mut end = parent_idx + 1;
+                            while end < rows.len() && rows[end].depth > parent_depth {
+                                end += 1;
+                            }
+                            end
+                        });
+                insert_pos.map(|pos| {
+                    let depth = rows
+                        .get(pos.saturating_sub(1))
+                        .filter(|r| r.entry.path == *parent)
+                        .map(|r| r.depth + 1)
+                        .unwrap_or_else(|| {
+                            rows.get(pos.saturating_sub(1))
+                                .map(|r| r.depth)
+                                .unwrap_or(1)
+                        });
+                    (pos, depth)
+                })
+            }
+            _ => None,
+        };
+        if let Some((pos, depth)) = inline_new_insert {
+            let edit = self.inline_edit.as_ref().unwrap();
+            rows.insert(
+                pos,
+                filetree::Row {
+                    entry: filetree::Entry {
+                        path: edit.parent.join("__inline_new__"),
+                        name: String::new(),
+                        is_dir: edit.kind == InlineEditKind::NewDir,
+                    },
+                    depth,
+                    expanded: false,
+                    root: false,
+                },
+            );
+        }
+        let inline_edit_snapshot = self.inline_edit.clone();
         Some(
             div()
                 .w(px(SIDEBAR_WIDTH))
@@ -2501,6 +2554,62 @@ impl TakoApp {
                         .children(rows.into_iter().enumerate().map(|(index, row)| {
                             let path = row.entry.path.clone();
                             let is_dir = row.entry.is_dir;
+                            // インライン編集中の行を検出
+                            let is_inline = match &inline_edit_snapshot {
+                                Some(edit) if edit.kind == InlineEditKind::Rename => {
+                                    path == edit.parent
+                                }
+                                Some(edit) if path == edit.parent.join("__inline_new__") => true,
+                                _ => false,
+                            };
+                            if is_inline {
+                                let edit = inline_edit_snapshot.as_ref().unwrap();
+                                let depth = row.depth;
+                                let indent = 8.0 + 12.0 * depth as f32;
+                                let icon = match edit.kind {
+                                    InlineEditKind::Rename => {
+                                        if is_dir {
+                                            "🗂 "
+                                        } else {
+                                            ""
+                                        }
+                                    }
+                                    InlineEditKind::NewFile => "📄 ",
+                                    InlineEditKind::NewDir => "🗂 ",
+                                };
+                                let before_cursor = &edit.text[..edit.cursor];
+                                let after_cursor = &edit.text[edit.cursor..];
+                                return div()
+                                    .id(("filetree-row", index as u64))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .w_full()
+                                    .px_1()
+                                    .pl(px(indent))
+                                    .bg(rgba_alpha(theme.tab_active_background, 0.8))
+                                    .child(SharedString::from(icon.to_string()))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .flex()
+                                            .flex_row()
+                                            .border_1()
+                                            .border_color(hsla(theme.accent))
+                                            .rounded_sm()
+                                            .px(px(2.0))
+                                            .bg(rgba(theme.background))
+                                            .child(SharedString::from(before_cursor.to_string()))
+                                            .child(
+                                                div()
+                                                    .w(px(1.0))
+                                                    .h(px(14.0))
+                                                    .bg(hsla(theme.foreground))
+                                                    .flex_none(),
+                                            )
+                                            .child(SharedString::from(after_cursor.to_string())),
+                                    );
+                            }
                             let is_open = !is_dir && open_paths.contains(&path);
                             let chevron = if is_dir {
                                 if row.expanded {
@@ -2675,6 +2784,121 @@ impl TakoApp {
         Some(backdrop.into_any_element())
     }
 
+    fn handle_inline_edit_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) {
+        match ks.key.as_str() {
+            "enter" => {
+                self.commit_inline_edit(cx);
+            }
+            "escape" => {
+                self.inline_edit = None;
+                cx.notify();
+            }
+            "backspace" => {
+                if let Some(ref mut edit) = self.inline_edit {
+                    if edit.cursor > 0 {
+                        let prev = edit.text[..edit.cursor]
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        edit.text.drain(prev..edit.cursor);
+                        edit.cursor = prev;
+                    }
+                }
+                cx.notify();
+            }
+            "delete" => {
+                if let Some(ref mut edit) = self.inline_edit {
+                    if edit.cursor < edit.text.len() {
+                        let next = edit.text[edit.cursor..]
+                            .char_indices()
+                            .nth(1)
+                            .map(|(i, _)| edit.cursor + i)
+                            .unwrap_or(edit.text.len());
+                        edit.text.drain(edit.cursor..next);
+                    }
+                }
+                cx.notify();
+            }
+            "left" => {
+                if let Some(ref mut edit) = self.inline_edit {
+                    if edit.cursor > 0 {
+                        edit.cursor = edit.text[..edit.cursor]
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                    }
+                }
+                cx.notify();
+            }
+            "right" => {
+                if let Some(ref mut edit) = self.inline_edit {
+                    if edit.cursor < edit.text.len() {
+                        edit.cursor = edit.text[edit.cursor..]
+                            .char_indices()
+                            .nth(1)
+                            .map(|(i, _)| edit.cursor + i)
+                            .unwrap_or(edit.text.len());
+                    }
+                }
+                cx.notify();
+            }
+            "home" => {
+                if let Some(ref mut edit) = self.inline_edit {
+                    edit.cursor = 0;
+                }
+                cx.notify();
+            }
+            "end" => {
+                if let Some(ref mut edit) = self.inline_edit {
+                    edit.cursor = edit.text.len();
+                }
+                cx.notify();
+            }
+            _ => {
+                if let Some(ch) = ks.key_char.as_ref() {
+                    if !ch.is_empty() && !ks.modifiers.control && !ks.modifiers.platform {
+                        if let Some(ref mut edit) = self.inline_edit {
+                            edit.text.insert_str(edit.cursor, ch);
+                            edit.cursor += ch.len();
+                        }
+                        cx.notify();
+                    }
+                }
+            }
+        }
+    }
+
+    fn commit_inline_edit(&mut self, cx: &mut Context<Self>) {
+        use tako_control::protocol::{FileOpKind, Request};
+        let Some(edit) = self.inline_edit.take() else {
+            return;
+        };
+        let name = edit.text.trim().to_string();
+        if name.is_empty() {
+            cx.notify();
+            return;
+        }
+        let (op, path_str) = match edit.kind {
+            InlineEditKind::Rename => (FileOpKind::Rename, edit.parent.display().to_string()),
+            InlineEditKind::NewFile => (FileOpKind::CreateFile, edit.parent.display().to_string()),
+            InlineEditKind::NewDir => (FileOpKind::CreateDir, edit.parent.display().to_string()),
+        };
+        let _ = tako_control::dispatch(
+            self,
+            Request::FileOp {
+                op,
+                path: path_str,
+                name: Some(name),
+                pane: None,
+            },
+            PaneOrigin::User,
+        );
+        self.sync_filetree_roots();
+        cx.notify();
+    }
+
     /// コンテキストメニューのアクション実行（FR-3.12）
     fn handle_context_action(
         &mut self,
@@ -2745,6 +2969,15 @@ impl TakoApp {
                 );
             }
             "rename" | "new-file" | "new-dir" => {
+                let init_text = if action == "rename" {
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    String::new()
+                };
+                let cursor = init_text.len();
                 self.inline_edit = Some(InlineEdit {
                     parent: if action == "rename" || path.is_dir() {
                         path.to_path_buf()
@@ -2756,15 +2989,18 @@ impl TakoApp {
                         "new-file" => InlineEditKind::NewFile,
                         _ => InlineEditKind::NewDir,
                     },
-                    text: if action == "rename" {
-                        path.file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned()
-                    } else {
-                        String::new()
-                    },
+                    text: init_text,
+                    cursor,
                 });
+                if action != "rename" {
+                    if let Some(parent_path) = if path.is_dir() {
+                        Some(path.to_path_buf())
+                    } else {
+                        path.parent().map(|p| p.to_path_buf())
+                    } {
+                        self.filetree.expand_dir(&parent_path);
+                    }
+                }
             }
             "trash" => {
                 let _ = tako_control::dispatch(
@@ -4964,6 +5200,16 @@ impl EntityInputHandler for TakoApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // インライン編集中は IME 確定文字列をインライン入力に振り分ける
+        if let Some(ref mut edit) = self.inline_edit {
+            if !text.is_empty() {
+                edit.text.insert_str(edit.cursor, text);
+                edit.cursor += text.len();
+            }
+            self.ime = None;
+            cx.notify();
+            return;
+        }
         // 確定（insertText 相当）。変換を開始したペインへ書き、変換状態を畳む
         let pane = self
             .ime
@@ -6425,7 +6671,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 22, "MCP tools/list は 22 ツール");
+            check(status == 200 && tool_count == 23, "MCP tools/list は 23 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)

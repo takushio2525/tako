@@ -79,6 +79,16 @@ impl FileTree {
         true
     }
 
+    /// ディレクトリを展開する（既に展開中なら何もしない）
+    pub fn expand_dir(&mut self, path: &Path) {
+        if !self.expanded.contains(path) {
+            self.expanded.insert(path.to_path_buf());
+            self.cache
+                .entry(path.to_path_buf())
+                .or_insert_with(|| read_dir_sorted(path));
+        }
+    }
+
     /// ディレクトリ行（ルート見出し行を含む）のクリック: 展開 ⇄ 折りたたみ
     pub fn toggle_dir(&mut self, path: &Path) {
         if self.expanded.contains(path) {
