@@ -414,6 +414,10 @@ struct TakoApp {
     last_saved_layout: Option<String>,
     /// OS ウィンドウの現フレーム（render で採取し layout 保存に含める。FR-5）
     window_frame: Option<tako_control::layout::WindowFrame>,
+    /// ファイルツリーのコンテキストメニュー（FR-3.12）
+    context_menu: Option<ContextMenu>,
+    /// ファイルツリーのインライン編集
+    inline_edit: Option<InlineEdit>,
     /// D&D 中のペイロード種別（FR-2.16.10 / FR-3.11）。on_drag 開始でセット、
     /// drop / mouse-up でクリア。gpui の active_drag は型を公開しないため自前で追跡し、
     /// ドロップ先オーバーレイの生成判定 + ラベル出し分けに使う
@@ -518,6 +522,29 @@ struct FileDrag {
 #[derive(Debug, Clone, Copy)]
 struct PaneDrag {
     pane: PaneId,
+}
+
+/// ファイルツリーの右クリックコンテキストメニュー（FR-3.12）
+struct ContextMenu {
+    path: std::path::PathBuf,
+    is_dir: bool,
+    position: Point<Pixels>,
+}
+
+/// ファイルツリーのインライン編集（FR-3.12）
+#[derive(Clone)]
+#[allow(dead_code)]
+struct InlineEdit {
+    parent: std::path::PathBuf,
+    kind: InlineEditKind,
+    text: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InlineEditKind {
+    Rename,
+    NewFile,
+    NewDir,
 }
 
 /// ドラッグ中のペイロード種別（`TakoApp::drag_kind`）
@@ -689,6 +716,8 @@ impl TakoApp {
             tmux_sessions: Vec::new(),
             tmux_pending_kill: None,
             pending_pane_kill: None,
+            context_menu: None,
+            inline_edit: None,
             filetree: filetree::FileTree::default(),
             previews: HashMap::new(),
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
@@ -2492,25 +2521,36 @@ impl TakoApp {
                                 .px_1()
                                 .cursor_pointer()
                                 .hover(|d| d.bg(rgba(theme.tab_active_background)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if is_dir {
-                                        this.filetree.toggle_dir(&path);
-                                    } else {
-                                        this.open_file_row(&path, cx);
+                                .on_click(cx.listener({
+                                    let ctx_path = path.clone();
+                                    move |this, e: &gpui::ClickEvent, _, cx| {
+                                        if e.is_right_click() {
+                                            this.context_menu = Some(ContextMenu {
+                                                path: ctx_path.clone(),
+                                                is_dir,
+                                                position: e.mouse_position().unwrap_or_default(),
+                                            });
+                                        } else if is_dir {
+                                            this.filetree.toggle_dir(&ctx_path);
+                                        } else {
+                                            this.open_file_row(&ctx_path, cx);
+                                        }
+                                        cx.notify();
                                     }
-                                    cx.notify();
                                 }))
                                 // ファイルは D&D でドロップ位置にプレビューとして開ける（FR-3.11）
-                                .when(!is_dir, |d| {
-                                    d.on_drag(
-                                        FileDrag { path: drag_path },
-                                        self.drag_ghost_builder(
-                                            DragKind::File,
-                                            format!("📄 {}", truncate(&row.entry.name, 24)),
-                                            cx,
+                                .on_drag(
+                                    FileDrag { path: drag_path },
+                                    self.drag_ghost_builder(
+                                        DragKind::File,
+                                        format!(
+                                            "{} {}",
+                                            if is_dir { "🗂" } else { "📄" },
+                                            truncate(&row.entry.name, 24)
                                         ),
-                                    )
-                                });
+                                        cx,
+                                    ),
+                                );
                             if row.root {
                                 // ワークスペースフォルダの見出し行: 太字 + 上仕切り線（2 つ目以降）
                                 base.when(index > 0, |d| {
@@ -2553,6 +2593,195 @@ impl TakoApp {
                         })),
                 ),
         )
+    }
+
+    /// コンテキストメニューの描画（FR-3.12）
+    fn render_context_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let ctx = self.context_menu.as_ref()?;
+        let theme = &self.theme;
+        let path = ctx.path.clone();
+        let is_dir = ctx.is_dir;
+        let pos = ctx.position;
+        let items: Vec<(&str, &str)> = vec![
+            ("copy-rel", "相対パスをコピー"),
+            ("copy-abs", "絶対パスをコピー"),
+            ("reveal", "Finder で表示"),
+            ("open-term", "ターミナルで開く"),
+            ("sep1", ""),
+            ("rename", "名前変更"),
+            ("new-file", "新しいファイル"),
+            ("new-dir", "新しいフォルダ"),
+            ("sep2", ""),
+            ("trash", "削除"),
+        ];
+        let menu = div()
+            .absolute()
+            .left(pos.x)
+            .top(pos.y)
+            .w(px(180.0))
+            .py(px(4.0))
+            .bg(rgba(theme.tab_bar_background))
+            .border_1()
+            .border_color(hsla(theme.pane_border))
+            .rounded_md()
+            .text_size(px(12.0))
+            .text_color(hsla(theme.foreground))
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .children(items.into_iter().enumerate().map(|(i, (id, label))| {
+                if id.starts_with("sep") {
+                    return div()
+                        .h(px(1.0))
+                        .mx_1()
+                        .my(px(2.0))
+                        .bg(hsla_alpha(theme.pane_border, 0.5))
+                        .into_any_element();
+                }
+                let path = path.clone();
+                div()
+                    .id(("ctx-item", i as u64))
+                    .w_full()
+                    .px_2()
+                    .py(px(2.0))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgba(theme.tab_active_background)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.context_menu = None;
+                        this.handle_context_action(id, &path, is_dir, cx);
+                    }))
+                    .when(id == "trash", |d| d.text_color(hsla(theme.ansi[1])))
+                    .child(SharedString::from(label.to_string()))
+                    .into_any_element()
+            }));
+        let backdrop = div()
+            .id("ctx-backdrop")
+            .absolute()
+            .size_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.context_menu = None;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, cx| {
+                    this.context_menu = None;
+                    cx.notify();
+                }),
+            )
+            .child(menu);
+        Some(backdrop.into_any_element())
+    }
+
+    /// コンテキストメニューのアクション実行（FR-3.12）
+    fn handle_context_action(
+        &mut self,
+        action: &str,
+        path: &std::path::Path,
+        _is_dir: bool,
+        cx: &mut Context<Self>,
+    ) {
+        use tako_control::protocol::{FileOpKind, Request};
+        let path_str = path.display().to_string();
+        match action {
+            "copy-abs" => {
+                if let Ok(result) = tako_control::dispatch(
+                    self,
+                    Request::FileOp {
+                        op: FileOpKind::CopyAbsolutePath,
+                        path: path_str,
+                        name: None,
+                        pane: None,
+                    },
+                    PaneOrigin::User,
+                ) {
+                    if let Some(p) = result["path"].as_str() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(p.to_string()));
+                    }
+                }
+            }
+            "copy-rel" => {
+                let pane = self.focused_pane().as_u64();
+                if let Ok(result) = tako_control::dispatch(
+                    self,
+                    Request::FileOp {
+                        op: FileOpKind::CopyRelativePath,
+                        path: path_str,
+                        name: None,
+                        pane: Some(pane),
+                    },
+                    PaneOrigin::User,
+                ) {
+                    if let Some(p) = result["path"].as_str() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(p.to_string()));
+                    }
+                }
+            }
+            "reveal" => {
+                let _ = tako_control::dispatch(
+                    self,
+                    Request::FileOp {
+                        op: FileOpKind::Reveal,
+                        path: path_str,
+                        name: None,
+                        pane: None,
+                    },
+                    PaneOrigin::User,
+                );
+            }
+            "open-term" => {
+                let pane = self.focused_pane().as_u64();
+                let _ = tako_control::dispatch(
+                    self,
+                    Request::FileOp {
+                        op: FileOpKind::OpenTerminal,
+                        path: path_str,
+                        name: None,
+                        pane: Some(pane),
+                    },
+                    PaneOrigin::User,
+                );
+            }
+            "rename" | "new-file" | "new-dir" => {
+                self.inline_edit = Some(InlineEdit {
+                    parent: if action == "rename" || path.is_dir() {
+                        path.to_path_buf()
+                    } else {
+                        path.parent().unwrap_or(path).to_path_buf()
+                    },
+                    kind: match action {
+                        "rename" => InlineEditKind::Rename,
+                        "new-file" => InlineEditKind::NewFile,
+                        _ => InlineEditKind::NewDir,
+                    },
+                    text: if action == "rename" {
+                        path.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
+                    } else {
+                        String::new()
+                    },
+                });
+            }
+            "trash" => {
+                let _ = tako_control::dispatch(
+                    self,
+                    Request::FileOp {
+                        op: FileOpKind::Trash,
+                        path: path_str,
+                        name: None,
+                        pane: None,
+                    },
+                    PaneOrigin::User,
+                );
+                self.sync_filetree_roots();
+            }
+            _ => {}
+        }
+        cx.notify();
     }
 
     /// ファイルツリーのファイル行クリック → プレビューペインで開く（FR-3.2）。
@@ -2759,10 +2988,34 @@ impl TakoApp {
         cx.notify();
     }
 
-    /// ファイル行のドロップ（FR-3.11）: 中央ゾーンは direction なし = FR-3.2 の
-    /// 再利用セマンティクス、象限はその方向への分割で開く（dispatch `OpenFile`）
+    /// ファイル行のドロップ（FR-3.11 / FR-3.13）:
+    /// ターミナルペイン中央 → パス文字列を send、それ以外 → ファイルを開く
     fn drop_file(&mut self, pane_id: PaneId, path: std::path::PathBuf, cx: &mut Context<Self>) {
         let zone = self.take_drop_zone(pane_id).unwrap_or(DropZone::Center);
+        let is_terminal =
+            self.terminals.contains_key(&pane_id) && !self.previews.contains_key(&pane_id);
+        if is_terminal && zone == DropZone::Center {
+            let path_str = path.display().to_string();
+            let escaped = if path_str
+                .chars()
+                .any(|c| c == ' ' || c == '\'' || c == '"' || c == '(' || c == ')')
+            {
+                format!("'{}'", path_str.replace('\'', "'\\\\''"))
+            } else {
+                path_str
+            };
+            let _ = tako_control::dispatch(
+                self,
+                tako_control::protocol::Request::Send {
+                    pane: Some(pane_id.as_u64()),
+                    text: escaped,
+                    newline: false,
+                },
+                PaneOrigin::User,
+            );
+            cx.notify();
+            return;
+        }
         let direction = match zone {
             DropZone::Center => None,
             zone => Some(zone_to_direction(zone)),
@@ -5057,6 +5310,8 @@ impl Render for TakoApp {
             })
             .collect();
 
+        let context_menu_overlay = self.render_context_menu(cx);
+
         // IME 変換中テキストのインライン表示（FR-1.9）。変換対象ペインのカーソル位置に
         // 未確定文字列を重ね、全体に細下線・IME の注目文節に太下線 + 選択色を付ける
         let ime_overlay = self.ime.as_ref().and_then(|ime| {
@@ -5244,6 +5499,7 @@ impl Render for TakoApp {
                             .children(panes)
                             .children(border_handles)
                             .children(drop_overlays)
+                            .children(context_menu_overlay)
                             .children(ime_overlay),
                     )
                     .children(self.render_panel(cx)),
