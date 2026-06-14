@@ -4192,7 +4192,6 @@ impl TakoApp {
                 .bg(rgba(theme.background))
                 .border_l_1()
                 .border_color(hsla(theme.pane_border))
-                .overflow_hidden()
                 .child(
                     // 内部タブヘッダ（切り替え式コンテナ。右端 × でパネルを閉じる）
                     div()
