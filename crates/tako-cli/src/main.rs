@@ -78,12 +78,37 @@ enum Command {
     /// ファイルシステム操作（FR-3.12）
     #[command(subcommand)]
     File(FileCommand),
+    /// git リポジトリ情報の取得（FR-3.6 git graph / FR-3.9 diff ビューア）
+    #[command(subcommand)]
+    Git(GitCommand),
     /// tmux セッションの一覧・kill（FR-2.13。消し忘れ tmux の発見と片付け）
     #[command(subcommand)]
     Tmux(TmuxCommand),
     /// MCP 連携（serve = stdio ブリッジ。エージェントの MCP クライアントが起動する）
     #[command(subcommand)]
     Mcp(McpCommand),
+}
+
+#[derive(Subcommand)]
+enum GitCommand {
+    /// コミット履歴・ブランチ一覧・変更状態を JSON で出力する
+    Log {
+        /// 取得するコミット数上限（省略時 200）
+        #[arg(long, default_value_t = 200)]
+        max_count: usize,
+        /// 対象ペイン ID（省略時は呼び出し元）
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// git diff をファイル・ハンク・行単位の JSON で出力する
+    Diff {
+        /// diff 種別: unstaged（既定）/ staged / コミットハッシュ
+        #[arg(long)]
+        target: Option<String>,
+        /// 対象ペイン ID（省略時は呼び出し元）
+        #[arg(long)]
+        pane: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -671,6 +696,14 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Portdetect(args) => Request::PortDetect {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
+        Command::Git(GitCommand::Log { max_count, pane }) => Request::GitLog {
+            pane: target_pane(*pane)?,
+            max_count: Some(*max_count),
+        },
+        Command::Git(GitCommand::Diff { target, pane }) => Request::GitDiff {
+            pane: target_pane(*pane)?,
+            target: target.clone(),
+        },
         Command::Tmux(TmuxCommand::List { socket }) => Request::TmuxList {
             socket: socket.clone(),
         },
@@ -852,6 +885,12 @@ fn print_result(command: &Command, result: &Value) {
         | Command::Persist(_)
         | Command::Panel(_) => {
             println!("{result}")
+        }
+        Command::Git(GitCommand::Log { .. }) | Command::Git(GitCommand::Diff { .. }) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(result).unwrap_or_default()
+            );
         }
         Command::Tmux(TmuxCommand::List { .. }) => {
             println!(

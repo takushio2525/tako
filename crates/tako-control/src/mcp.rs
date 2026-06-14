@@ -525,6 +525,35 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "tako_git_log",
+            "description": "git リポジトリのコミット履歴・ブランチ一覧・変更状態を取得する\
+                （FR-3.6 git graph）。対象ペインの cwd から git リポジトリを解決する。\
+                コミットグラフ描画・ブランチ操作の判断材料として使う。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン"),
+                    "max_count": { "type": "integer", "description": "取得するコミット数上限（省略時 200）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_git_diff",
+            "description": "git diff を取得する（FR-3.9 diff ビューア）。対象ペインの cwd の\
+                リポジトリの diff をファイル・ハンク・行単位で返す。target で種別を指定: \
+                \"unstaged\"（ワーキングツリー変更。既定）/ \"staged\"（ステージ済み）/ \
+                コミットハッシュ（そのコミットの差分）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン"),
+                    "target": { "type": "string", "description": "diff 種別: unstaged / staged / コミットハッシュ" },
+                },
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -700,6 +729,14 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
                 },
             }
         }
+        "tako_git_log" => Request::GitLog {
+            pane: Some(target_pane(args, caller)?),
+            max_count: u64_arg(args, "max_count")?.map(|n| n as usize),
+        },
+        "tako_git_diff" => Request::GitDiff {
+            pane: Some(target_pane(args, caller)?),
+            target: str_arg(args, "target")?,
+        },
         "tako_panel" => Request::Panel {
             visible: bool_arg(args, "visible")?,
             width: f32_arg(args, "width")?,
@@ -1126,7 +1163,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 23);
+        assert_eq!(tools.len(), 25);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

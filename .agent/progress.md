@@ -351,3 +351,13 @@
   TmuxOpen の存在確認も `has_session`（1 コマンド）に軽量化
 - 関連コミット: `24eecec` `[改善] tmux ポーリングの非同期化で UI スレッドブロック解消`
 - 次: ユーザーが tako 終了 → .app 差し替え → 再起動して実機確認
+
+## 2026-06-14（git タブ実装: FR-3.6 git graph + FR-3.9 diff ビューア）
+
+- `tako-core::git` 新設（git CLI 子プロセス、tmux.rs と同パターン。log/branch/status/diff
+  パーサ + unit test 5 本）。dispatch `GitLog`/`GitDiff` + CLI `tako git log/diff` + MCP
+  `tako_git_log`/`tako_git_diff`（計 25 ツール）。右パネルの git ビューをプレースホルダから
+  4 セクション（ブランチ / 変更ファイル / コミットグラフ / diff）のアコーディオンに置き換え。
+  cwd 連動 2 秒ポーリング + パネル開いた瞬間の即時 fetch。コミットクリックでそのコミットの diff 表示
+- cargo test 93 pass・clippy / fmt 緑。feature/git-tab ブランチ
+- 次: ユーザーが .app 差し替え → 再起動して実機確認

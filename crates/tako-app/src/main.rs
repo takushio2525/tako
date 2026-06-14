@@ -429,6 +429,33 @@ struct TakoApp {
     drag_kind: Option<DragKind>,
     /// ドラッグ中のドロップ先（ペイン, 挿入位置）。挿入プレビュー表示の状態
     drop_target: Option<(PaneId, DropZone)>,
+    /// git パネルのデータ（FR-3.6。cwd 連動で 2 秒ポーリング更新）
+    git_data: Option<GitPanelData>,
+    /// git パネルで選択中のコミット（diff 表示用）
+    git_selected_commit: Option<String>,
+    /// git パネルのアコーディオン折りたたみ
+    git_collapsed: GitCollapsed,
+}
+
+/// git パネルのデータスナップショット（FR-3.6 / FR-3.9）
+#[derive(Debug, Clone)]
+struct GitPanelData {
+    repo_root: String,
+    branch: String,
+    upstream: String,
+    commits: Vec<tako_core::GitCommit>,
+    branches: Vec<tako_core::GitBranch>,
+    status: Vec<tako_core::GitStatusEntry>,
+    diff_files: Vec<tako_core::DiffFile>,
+}
+
+/// git パネルのアコーディオン折りたたみ状態
+#[derive(Debug, Clone, Default)]
+struct GitCollapsed {
+    branches: bool,
+    changes: bool,
+    commits: bool,
+    diff: bool,
 }
 
 /// TmuxOpen でペインに表示している外部 tmux セッションの監視情報
@@ -746,6 +773,9 @@ impl TakoApp {
             window_frame: None,
             drag_kind: None,
             drop_target: None,
+            git_data: None,
+            git_selected_commit: None,
+            git_collapsed: GitCollapsed::default(),
         };
         if restored.is_empty() {
             let root_id = app.workspace.active_tab().tree().focused();
@@ -856,12 +886,11 @@ impl TakoApp {
         })
         .detach();
 
-        // 2 秒毎の定期更新: tmux 一覧（FR-2.13）+ ファイルツリー（FR-3.1）。
-        // tmux コマンド実行（6 サブプロセス、計 25〜50ms）は background で行い、
-        // UI スレッドではコンテキスト収集と結果適用のみ（< 1ms）
+        // 2 秒毎の定期更新: tmux 一覧（FR-2.13）+ ファイルツリー（FR-3.1）+ git（FR-3.6）。
+        // 外部コマンド実行は background で行い、UI スレッドではコンテキスト収集と結果適用のみ
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(2)).await;
-            // ① main thread: tmux コンテキスト + filetree 対象 + view 監視対象を収集（高速）
+            // ① main thread: tmux コンテキスト + filetree 対象 + view 監視対象 + git を収集（高速）
             let prep = this.update(cx, |app: &mut TakoApp, _| {
                 let tmux_ctx = if app.panel_visible && app.panel_view == PanelView::Tmux {
                     Some(app.collect_tmux_context())
@@ -880,9 +909,15 @@ impl TakoApp {
                     .iter()
                     .map(|(id, t)| (*id, t.session.clone(), t.socket.clone()))
                     .collect();
-                (tmux_ctx, filetree_targets, view_targets)
+                let git_cwd = if app.panel_visible && app.panel_view == PanelView::Git {
+                    app.active_tab_cwd()
+                } else {
+                    None
+                };
+                let git_selected = app.git_selected_commit.clone();
+                (tmux_ctx, filetree_targets, view_targets, git_cwd, git_selected)
             });
-            let Ok((tmux_ctx, filetree_targets, view_targets)) = prep else {
+            let Ok((tmux_ctx, filetree_targets, view_targets, git_cwd, git_selected)) = prep else {
                 break;
             };
             // ② background: tmux コマンド実行 + ディレクトリ読み取り
@@ -941,6 +976,21 @@ impl TakoApp {
                     if app.filetree.apply_refresh(results) {
                         cx.notify();
                     }
+                });
+                if ok.is_err() {
+                    break;
+                }
+            }
+            // ③ background: git データ取得
+            if let Some(cwd) = git_cwd {
+                let selected = git_selected;
+                let task = cx
+                    .background_executor()
+                    .spawn(async move { fetch_git_data(&cwd, selected.as_deref()) });
+                let data = task.await;
+                let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                    app.git_data = data;
+                    cx.notify();
                 });
                 if ok.is_err() {
                     break;
@@ -1387,6 +1437,24 @@ impl TakoApp {
         )
         .unwrap_or_else(|_| serde_json::json!({ "sessions": [] }));
         self.tmux_sessions = value["sessions"].as_array().cloned().unwrap_or_default();
+    }
+
+    /// アクティブタブの最初のペインの cwd を返す（git パネルの cwd 連動用）
+    fn active_tab_cwd(&self) -> Option<std::path::PathBuf> {
+        let tab = self.workspace.active_tab();
+        let active_pane = tab.tree().focused();
+        self.terminals
+            .get(&active_pane)
+            .and_then(|s| s.cwd())
+            .map(|p| p.to_path_buf())
+            .or_else(|| {
+                tab.tree().panes().iter().find_map(|p| {
+                    self.terminals
+                        .get(&p.id())
+                        .and_then(|s| s.cwd())
+                        .map(|p| p.to_path_buf())
+                })
+            })
     }
 
     /// background thread で tmux セッション一覧を取得するためのコンテキストを収集する。
@@ -2631,21 +2699,406 @@ impl TakoApp {
         root
     }
 
-    /// git ビュー（FR-2.16.4 の git トグルの表示先）。git graph（FR-3.6）の実装までの
-    /// プレースホルダ
-    fn render_git_view(&mut self) -> gpui::Div {
+    /// git ビュー（FR-3.6 git graph + FR-3.9 diff ビューア）。cwd 連動で 2 秒ポーリング更新。
+    /// セクション: ブランチ → 変更ファイル → コミットグラフ → diff
+    fn render_git_view(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme.clone();
-        div()
+        let data = self.git_data.clone();
+        let collapsed = self.git_collapsed.clone();
+
+        let mut root = div()
+            .id("git-view")
             .flex_1()
             .flex()
             .flex_col()
-            .gap_1()
-            .p_4()
+            .overflow_y_scroll()
             .bg(rgba(theme.background))
             .text_color(hsla(theme.tab_inactive_foreground))
-            .text_size(px(12.0))
-            .child("git graph は未実装（FR-3.6）")
-            .child("ブランチ・コミットのグラフ表示をここに追加予定")
+            .text_size(px(11.0));
+
+        let Some(data) = data else {
+            // git パネルを開いた瞬間のデータ取得（初回は即 fetch）
+            if self.git_data.is_none() {
+                if let Some(cwd) = self.active_tab_cwd() {
+                    cx.spawn(async move |this, cx| {
+                        let data = cx
+                            .background_executor()
+                            .spawn(async move { fetch_git_data(&cwd, None) })
+                            .await;
+                        let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                            app.git_data = data;
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
+            }
+            return root.p_4().child("git リポジトリを検出中…");
+        };
+
+        let accent = theme.accent;
+        let fg = theme.tab_inactive_foreground;
+        let fg_active = theme.tab_active_foreground;
+        let bg_hover = theme.selection_background;
+
+        // ──── リポヘッダ ────
+        let repo_name = std::path::Path::new(&data.repo_root)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| data.repo_root.clone());
+        root = root.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .px_2()
+                .py_1()
+                .bg(rgba(theme.tab_bar_background))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(hsla(fg_active))
+                        .child(format!("⎇ {}", data.branch)),
+                )
+                .child(
+                    div()
+                        .ml_2()
+                        .text_size(px(10.0))
+                        .text_color(hsla(fg))
+                        .child(repo_name),
+                )
+                .when(!data.upstream.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .ml_2()
+                            .text_size(px(10.0))
+                            .text_color(hsla(fg))
+                            .child(format!("↑ {}", data.upstream)),
+                    )
+                }),
+        );
+
+        // ──── ブランチ一覧セクション ────
+        root = root.child(
+            div()
+                .id("git-branches-header")
+                .flex()
+                .flex_row()
+                .items_center()
+                .px_2()
+                .py(px(3.0))
+                .cursor_pointer()
+                .text_size(px(10.0))
+                .text_color(hsla(fg))
+                .hover(|d| d.bg(rgba_alpha(bg_hover, 0.3)))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.git_collapsed.branches = !this.git_collapsed.branches;
+                    cx.notify();
+                }))
+                .child(if collapsed.branches { "▸" } else { "▾" })
+                .child(format!(
+                    " ブランチ ({})",
+                    data.branches.iter().filter(|b| !b.is_remote).count()
+                )),
+        );
+        if !collapsed.branches {
+            for branch in &data.branches {
+                if branch.is_remote {
+                    continue;
+                }
+                let is_current = branch.is_current;
+                root = root.child(
+                    div()
+                        .px_3()
+                        .py(px(1.0))
+                        .text_size(px(11.0))
+                        .when(is_current, |d| d.text_color(hsla(accent)))
+                        .when(!is_current, |d| d.text_color(hsla(fg)))
+                        .child(format!(
+                            "{}{}",
+                            if is_current { "● " } else { "  " },
+                            branch.name
+                        )),
+                );
+            }
+        }
+
+        // ──── 変更ファイルセクション ────
+        if !data.status.is_empty() {
+            root = root.child(
+                div()
+                    .id("git-changes-header")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .px_2()
+                    .py(px(3.0))
+                    .mt_1()
+                    .cursor_pointer()
+                    .text_size(px(10.0))
+                    .text_color(hsla(fg))
+                    .hover(|d| d.bg(rgba_alpha(bg_hover, 0.3)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.git_collapsed.changes = !this.git_collapsed.changes;
+                        cx.notify();
+                    }))
+                    .child(if collapsed.changes { "▸" } else { "▾" })
+                    .child(format!(" 変更 ({})", data.status.len())),
+            );
+            if !collapsed.changes {
+                for entry in &data.status {
+                    let color = match (entry.index, entry.worktree) {
+                        ('?', _) => theme.ansi[2],            // 緑 = untracked
+                        (_, 'M') => theme.ansi[3],            // 黄 = modified
+                        ('D', _) | (_, 'D') => theme.ansi[1], // 赤 = deleted
+                        ('A', _) => theme.ansi[2],            // 緑 = added
+                        _ => fg,
+                    };
+                    let badge = match (entry.index, entry.worktree) {
+                        ('?', _) => "?",
+                        (_, 'M') | ('M', _) => "M",
+                        ('D', _) | (_, 'D') => "D",
+                        ('A', _) => "A",
+                        ('R', _) => "R",
+                        _ => " ",
+                    };
+                    root = root.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .px_3()
+                            .py(px(1.0))
+                            .text_size(px(11.0))
+                            .child(
+                                div()
+                                    .w(px(14.0))
+                                    .text_color(hsla(color))
+                                    .child(badge.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_ellipsis()
+                                    .text_color(hsla(fg))
+                                    .child(entry.path.clone()),
+                            ),
+                    );
+                }
+            }
+        }
+
+        // ──── コミットグラフセクション ────
+        let selected_commit = self.git_selected_commit.clone();
+        root = root.child(
+            div()
+                .id("git-commits-header")
+                .flex()
+                .flex_row()
+                .items_center()
+                .px_2()
+                .py(px(3.0))
+                .mt_1()
+                .cursor_pointer()
+                .text_size(px(10.0))
+                .text_color(hsla(fg))
+                .hover(|d| d.bg(rgba_alpha(bg_hover, 0.3)))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.git_collapsed.commits = !this.git_collapsed.commits;
+                    cx.notify();
+                }))
+                .child(if collapsed.commits { "▸" } else { "▾" })
+                .child(format!(" コミット ({})", data.commits.len())),
+        );
+        if !collapsed.commits {
+            for (i, commit) in data.commits.iter().enumerate() {
+                let hash = commit.short_hash.clone();
+                let full_hash = commit.hash.clone();
+                let is_selected = selected_commit.as_deref() == Some(&commit.hash);
+                let is_merge = commit.parents.len() > 1;
+                let has_refs = !commit.refs.is_empty();
+
+                let mut row = div()
+                    .id(("git-commit", i))
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .px_2()
+                    .py(px(2.0))
+                    .cursor_pointer()
+                    .when(is_selected, |d| d.bg(rgba_alpha(accent, 0.15)))
+                    .hover(|d| d.bg(rgba_alpha(bg_hover, 0.3)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.git_selected_commit.as_deref() == Some(&full_hash) {
+                            this.git_selected_commit = None;
+                        } else {
+                            this.git_selected_commit = Some(full_hash.clone());
+                        }
+                        // 即座に diff を取得する
+                        if let Some(cwd) = this.active_tab_cwd() {
+                            let selected = this.git_selected_commit.clone();
+                            cx.spawn(async move |this, cx| {
+                                let data = cx
+                                    .background_executor()
+                                    .spawn(async move { fetch_git_data(&cwd, selected.as_deref()) })
+                                    .await;
+                                let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                                    app.git_data = data;
+                                    cx.notify();
+                                });
+                            })
+                            .detach();
+                        }
+                        cx.notify();
+                    }));
+
+                // グラフドット列
+                let dot = if is_merge { "●─" } else { "● " };
+                row = row.child(
+                    div()
+                        .w(px(18.0))
+                        .flex_none()
+                        .text_size(px(10.0))
+                        .text_color(hsla(accent))
+                        .child(dot),
+                );
+
+                // コミット情報
+                let mut info = div().flex_1().flex().flex_col();
+                // 1行目: subject + refs
+                let mut first_line = div().flex().flex_row().items_center().gap_1();
+                first_line = first_line.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(hsla(fg_active))
+                        .text_ellipsis()
+                        .child(commit.subject.clone()),
+                );
+                if has_refs {
+                    for r in commit.refs.split(", ") {
+                        let is_head = r.contains("HEAD");
+                        first_line = first_line.child(
+                            div()
+                                .px_1()
+                                .rounded(px(3.0))
+                                .text_size(px(9.0))
+                                .bg(if is_head {
+                                    rgba_alpha(accent, 0.3)
+                                } else {
+                                    rgba_alpha(fg, 0.15)
+                                })
+                                .text_color(if is_head { hsla(accent) } else { hsla(fg) })
+                                .child(r.to_string()),
+                        );
+                    }
+                }
+                info = info.child(first_line);
+                // 2行目: hash + author + date
+                info = info.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .text_size(px(9.0))
+                        .text_color(hsla(fg))
+                        .child(hash)
+                        .child(commit.author.clone())
+                        .child(commit.date_relative.clone()),
+                );
+                row = row.child(info);
+                root = root.child(row);
+            }
+        }
+
+        // ──── diff セクション ────
+        if !data.diff_files.is_empty() {
+            root = root.child(
+                div()
+                    .id("git-diff-header")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .px_2()
+                    .py(px(3.0))
+                    .mt_1()
+                    .cursor_pointer()
+                    .text_size(px(10.0))
+                    .text_color(hsla(fg))
+                    .hover(|d| d.bg(rgba_alpha(bg_hover, 0.3)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.git_collapsed.diff = !this.git_collapsed.diff;
+                        cx.notify();
+                    }))
+                    .child(if collapsed.diff { "▸" } else { "▾" })
+                    .child(format!(
+                        " diff ({}{})",
+                        data.diff_files.len(),
+                        if selected_commit.is_some() {
+                            " コミット"
+                        } else {
+                            " ファイル"
+                        }
+                    )),
+            );
+            if !collapsed.diff {
+                for file in &data.diff_files {
+                    // ファイルヘッダ
+                    root = root.child(
+                        div()
+                            .px_3()
+                            .py(px(2.0))
+                            .text_size(px(10.0))
+                            .text_color(hsla(fg_active))
+                            .bg(rgba_alpha(fg, 0.05))
+                            .child(file.path.clone()),
+                    );
+                    for hunk in &file.hunks {
+                        // ハンクヘッダ
+                        root = root.child(
+                            div()
+                                .px_3()
+                                .py(px(1.0))
+                                .text_size(px(9.0))
+                                .text_color(hsla(theme.ansi[6])) // cyan
+                                .child(hunk.header.clone()),
+                        );
+                        for line in &hunk.lines {
+                            let (prefix, color, bg_color) = match line.kind {
+                                tako_core::DiffLineKind::Add => (
+                                    "+",
+                                    theme.ansi[2], // 緑
+                                    rgba_alpha(theme.ansi[2], 0.1),
+                                ),
+                                tako_core::DiffLineKind::Remove => (
+                                    "-",
+                                    theme.ansi[1], // 赤
+                                    rgba_alpha(theme.ansi[1], 0.1),
+                                ),
+                                tako_core::DiffLineKind::Context => (
+                                    " ",
+                                    fg,
+                                    Rgba {
+                                        r: 0.0,
+                                        g: 0.0,
+                                        b: 0.0,
+                                        a: 0.0,
+                                    },
+                                ),
+                            };
+                            root = root.child(
+                                div()
+                                    .px_3()
+                                    .text_size(px(11.0))
+                                    .text_color(hsla(color))
+                                    .bg(bg_color)
+                                    .child(format!("{prefix}{}", line.content)),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        root
     }
 
     /// ファイルツリーの root をアクティブタブ内全ペインの cwd に追従させる（FR-3.1）。
@@ -4309,8 +4762,29 @@ impl TakoApp {
             if view == PanelView::Tmux {
                 self.refresh_tmux(cx);
             }
+            if view == PanelView::Git {
+                self.refresh_git(cx);
+            }
         }
         cx.notify();
+    }
+
+    /// git パネルのデータを即座に background 取得する
+    fn refresh_git(&mut self, cx: &mut Context<Self>) {
+        if let Some(cwd) = self.active_tab_cwd() {
+            let selected = self.git_selected_commit.clone();
+            cx.spawn(async move |this, cx| {
+                let data = cx
+                    .background_executor()
+                    .spawn(async move { fetch_git_data(&cwd, selected.as_deref()) })
+                    .await;
+                let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                    app.git_data = data;
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
     }
 
     /// 右サイドバー情報パネル（非表示なら None）。内部タブは統合 tmux ビュー
@@ -4393,7 +4867,7 @@ impl TakoApp {
                 )
                 .child(match view {
                     PanelView::Tmux => self.render_tmux_view(cx).into_any_element(),
-                    PanelView::Git => self.render_git_view().into_any_element(),
+                    PanelView::Git => self.render_git_view(cx).into_any_element(),
                 })
                 .child(
                     // 左端のリサイズハンドル（ドラッグで幅調整）
@@ -5988,6 +6462,31 @@ impl Render for TakoApp {
     }
 }
 
+/// background thread で git データを取得する（2 秒ポーリング用）
+fn fetch_git_data(cwd: &std::path::Path, selected_commit: Option<&str>) -> Option<GitPanelData> {
+    let repo = tako_core::git::repo_root(cwd)?;
+    let commits = tako_core::git::log_commits(&repo, 200);
+    let branches = tako_core::git::list_branches(&repo);
+    let status = tako_core::git::status(&repo);
+    let diff_files = if let Some(hash) = selected_commit {
+        tako_core::git::diff(&repo, &tako_core::DiffTarget::Commit(hash.to_string()))
+    } else {
+        let mut files = tako_core::git::diff(&repo, &tako_core::DiffTarget::Unstaged);
+        let staged = tako_core::git::diff(&repo, &tako_core::DiffTarget::Staged);
+        files.extend(staged);
+        files
+    };
+    Some(GitPanelData {
+        repo_root: repo.display().to_string(),
+        branch: status.branch.clone(),
+        upstream: status.upstream.clone(),
+        commits,
+        branches,
+        status: status.entries,
+        diff_files,
+    })
+}
+
 fn main() {
     // セルフテストの tmux バックエンド項目は、ユーザーの実バックエンド（tako サーバー）を
     // 汚さない隔離ソケットで行う（終了時に self_test 側が kill-server で片付ける）
@@ -6904,7 +7403,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 23, "MCP tools/list は 23 ツール");
+            check(status == 200 && tool_count == 25, "MCP tools/list は 25 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)

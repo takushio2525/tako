@@ -255,6 +255,18 @@ pub enum Request {
         name: Option<String>,
         pane: Option<u64>,
     },
+    /// git ログ取得（FR-3.6 git graph）。`pane` の cwd のリポジトリのコミット一覧・
+    /// ブランチ・status を返す。`max_count` は取得上限（省略時 200）
+    GitLog {
+        pane: Option<u64>,
+        max_count: Option<usize>,
+    },
+    /// git diff 取得（FR-3.9 diff ビューア）。`target` で diff の種別を指定:
+    /// `"unstaged"` / `"staged"` / コミットハッシュ（省略時は unstaged）
+    GitDiff {
+        pane: Option<u64>,
+        target: Option<String>,
+    },
 }
 
 /// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。

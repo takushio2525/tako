@@ -890,6 +890,77 @@ pub fn dispatch(
                 }
             }
         }
+        Request::GitLog { pane, max_count } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let cwd = host
+                .session(target)
+                .and_then(|s| s.cwd())
+                .ok_or(DispatchError::Operation("cwd が取得できない".into()))?;
+            let repo = tako_core::git::repo_root(cwd)
+                .ok_or(DispatchError::Operation("git リポジトリではない".into()))?;
+            let max = max_count.unwrap_or(200);
+            let commits = tako_core::git::log_commits(&repo, max);
+            let branches = tako_core::git::list_branches(&repo);
+            let status = tako_core::git::status(&repo);
+            Ok(json!({
+                "repo": repo.display().to_string(),
+                "branch": status.branch,
+                "upstream": status.upstream,
+                "commits": commits.iter().map(|c| json!({
+                    "hash": c.hash,
+                    "short_hash": c.short_hash,
+                    "author": c.author,
+                    "date": c.date_relative,
+                    "subject": c.subject,
+                    "refs": c.refs,
+                    "parents": c.parents,
+                })).collect::<Vec<_>>(),
+                "branches": branches.iter().map(|b| json!({
+                    "name": b.name,
+                    "current": b.is_current,
+                    "remote": b.is_remote,
+                    "hash": b.commit_hash,
+                    "subject": b.subject,
+                })).collect::<Vec<_>>(),
+                "status": status.entries.iter().map(|e| json!({
+                    "path": e.path,
+                    "index": e.index.to_string(),
+                    "worktree": e.worktree.to_string(),
+                })).collect::<Vec<_>>(),
+            }))
+        }
+        Request::GitDiff { pane, target } => {
+            let (_, pane_id) = resolve_pane(host.workspace(), pane)?;
+            let cwd = host
+                .session(pane_id)
+                .and_then(|s| s.cwd())
+                .ok_or(DispatchError::Operation("cwd が取得できない".into()))?;
+            let repo = tako_core::git::repo_root(cwd)
+                .ok_or(DispatchError::Operation("git リポジトリではない".into()))?;
+            let diff_target = match target.as_deref() {
+                None | Some("unstaged") => tako_core::git::DiffTarget::Unstaged,
+                Some("staged") => tako_core::git::DiffTarget::Staged,
+                Some(hash) => tako_core::git::DiffTarget::Commit(hash.to_string()),
+            };
+            let files = tako_core::git::diff(&repo, &diff_target);
+            Ok(json!({
+                "repo": repo.display().to_string(),
+                "files": files.iter().map(|f| json!({
+                    "path": f.path,
+                    "hunks": f.hunks.iter().map(|h| json!({
+                        "header": h.header,
+                        "lines": h.lines.iter().map(|l| json!({
+                            "kind": match l.kind {
+                                tako_core::DiffLineKind::Context => "context",
+                                tako_core::DiffLineKind::Add => "add",
+                                tako_core::DiffLineKind::Remove => "remove",
+                            },
+                            "content": l.content,
+                        })).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+            }))
+        }
     }
 }
 
