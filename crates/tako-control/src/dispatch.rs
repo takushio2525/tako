@@ -443,20 +443,34 @@ pub fn dispatch(
                     new_pane,
                 )
                 .map_err(op_err)?;
-            // attach クライアントを起動する（FR-2.16.10）。`TMUX=` はネストガードの回避
-            // （tako バックエンドペイン = tmux 内からでも attach できる）、`=` 接頭辞は
-            // セッション名の完全一致指定。ペインを閉じる = クライアント終了で、
-            // セッション側は無傷で残る
+            // grouped session で独立表示する（FR-2.16.10）。`new-session -t <session>`
+            // は同じ window 群を共有するが表示 window は独立なセッションを作る。
+            // これにより元のクライアント（親）の表示が巻き込まれない。
+            // grouped session はペインを閉じるとクライアント終了→セッション destroy
+            // だが、元のセッションとその window は無傷で残る。
+            // `TMUX=` はネストガードの回避（tako バックエンドペイン内からでも実行可）
             let mut command = vec!["env".to_string(), "TMUX=".to_string(), "tmux".to_string()];
             if let Some(socket) = &socket {
                 command.push("-L".into());
                 command.push(socket.clone());
             }
-            let target = match window {
-                Some(w) => format!("={session}:{w}"),
-                None => format!("={session}"),
-            };
-            command.extend(["attach-session".to_string(), "-t".to_string(), target]);
+            command.extend([
+                "new-session".to_string(),
+                "-t".to_string(),
+                format!("={session}"),
+            ]);
+            if let Some(w) = window {
+                command.extend(["-s".to_string(), format!("tako-view-{session}-{w}")]);
+                // 初期 window を指定（grouped session 内で表示する window を選ぶ）
+                // new-session -t では直接 window を指定できないので、作成後に
+                // select-window を ; で繋ぐ
+                command.extend([
+                    ";".to_string(),
+                    "select-window".to_string(),
+                    "-t".to_string(),
+                    format!("{w}"),
+                ]);
+            }
             let mut command = command.into_iter();
             host.attach_session(
                 new_id,
