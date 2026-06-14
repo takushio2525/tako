@@ -2690,14 +2690,8 @@ impl TakoApp {
                                 .hover(|d| d.bg(rgba(theme.tab_active_background)))
                                 .on_click(cx.listener({
                                     let ctx_path = path.clone();
-                                    move |this, e: &gpui::ClickEvent, _, cx| {
-                                        if e.is_right_click() {
-                                            this.context_menu = Some(ContextMenu {
-                                                path: ctx_path.clone(),
-                                                is_dir,
-                                                position: e.mouse_position().unwrap_or_default(),
-                                            });
-                                        } else if is_dir {
+                                    move |this, _: &gpui::ClickEvent, _, cx| {
+                                        if is_dir {
                                             this.filetree.toggle_dir(&ctx_path);
                                         } else {
                                             this.open_file_row(&ctx_path, cx);
@@ -2705,6 +2699,21 @@ impl TakoApp {
                                         cx.notify();
                                     }
                                 }))
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener({
+                                        let ctx_path = path.clone();
+                                        move |this, e: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.context_menu = Some(ContextMenu {
+                                                path: ctx_path.clone(),
+                                                is_dir,
+                                                position: e.position,
+                                            });
+                                            cx.notify();
+                                        }
+                                    }),
+                                )
                                 // ファイルは D&D でドロップ位置にプレビューとして開ける（FR-3.11）
                                 .on_drag(
                                     FileDrag { path: drag_path },
