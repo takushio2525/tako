@@ -267,6 +267,20 @@ pub enum Request {
         pane: Option<u64>,
         target: Option<String>,
     },
+    /// ペインをたまり場へ退避する（FR-2.15.1）。プロセスは生きたまま画面から外す
+    Shelve { pane: Option<u64> },
+    /// たまり場からペインを復帰させる（FR-2.15.3 / FR-2.15.4）。`target` を
+    /// `direction`（省略時は右）へ分割した位置に挿し直す。`target` 省略時は
+    /// アクティブタブのフォーカス中ペインの隣
+    Unshelve {
+        pane: u64,
+        target: Option<u64>,
+        direction: Option<Direction>,
+    },
+    /// たまり場の一覧取得。shelved ペインの ID / title / role / 状態を返す
+    ShelvedList,
+    /// たまり場のペインを kill する（FR-2.15.2）。確認は呼び出し側の責務
+    ShelvedKill { pane: u64 },
 }
 
 /// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。

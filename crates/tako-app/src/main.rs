@@ -36,6 +36,7 @@ use tako_control::{ControlHost, IncomingRequest, IpcServer, McpServer};
 use tako_core::{
     ratio_for_position, CommandState, Pane, PaneId, PaneOrigin, Rect, SelectionKind, SessionNotice,
     SpawnOptions, SplitAxis, SplitDirection, TabId, TerminalSession, Theme, TitleSource, Workspace,
+    WorkspaceError,
 };
 
 /// 新規セッションの初期グリッド。最初の render で実寸へリサイズされる
@@ -119,6 +120,9 @@ const PANE_TITLE_BAR: f32 = 22.0;
 
 /// 下部ステータスバーの高さ（px。FR-2.16.4。Zed / VSCode 風）
 const STATUS_BAR_HEIGHT: f32 = 24.0;
+
+/// たまり場ドロワーの既定高さ（px。FR-2.15）
+const DRAWER_DEFAULT_HEIGHT: f32 = 150.0;
 
 /// 右サイドバー情報パネルの内部タブ（固定タブ 0 個方針。2026-06-12）。
 /// FR-2.16.6 で agents は tmux ビューへ統合済み。Git は git graph（FR-3.6）の
@@ -435,6 +439,12 @@ struct TakoApp {
     git_selected_commit: Option<String>,
     /// git パネルのアコーディオン折りたたみ
     git_collapsed: GitCollapsed,
+    /// たまり場ドロワーの表示状態（FR-2.15。下部ステータスバーのボタンでトグル）
+    drawer_visible: bool,
+    /// たまり場ドロワーの高さ（px）
+    drawer_height: f32,
+    /// たまり場内のペインの kill 確認待ち
+    shelved_pending_kill: Option<PaneId>,
 }
 
 /// git パネルのデータスナップショット（FR-3.6 / FR-3.9）
@@ -588,12 +598,19 @@ enum InlineEditKind {
     NewDir,
 }
 
+/// D&D ペイロード: たまり場のペイン（FR-2.15.3。ドロワーからペインエリアへ復帰）
+#[derive(Debug, Clone, Copy)]
+struct ShelvedPaneDrag {
+    pane: PaneId,
+}
+
 /// ドラッグ中のペイロード種別（`TakoApp::drag_kind`）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DragKind {
     TmuxSession,
     File,
     Pane,
+    ShelvedPane,
 }
 
 /// ドロップ先の挿入位置。上下左右 = その方向へ分割、Center = ファイル D&D のみで
@@ -776,6 +793,9 @@ impl TakoApp {
             git_data: None,
             git_selected_commit: None,
             git_collapsed: GitCollapsed::default(),
+            drawer_visible: false,
+            drawer_height: DRAWER_DEFAULT_HEIGHT,
+            shelved_pending_kill: None,
         };
         if restored.is_empty() {
             let root_id = app.workspace.active_tab().tree().focused();
@@ -1716,15 +1736,30 @@ impl TakoApp {
     /// 通す（開発不変条件の UI 側の一貫性）。「最後のタブの最後の 1 ペイン」は dispatch が
     /// 拒否するため、誤クリックでアプリが終了することはない（終了は cmd+W / cmd+Q のみ）
     fn close_pane_button(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
-        let result = tako_control::dispatch(
-            self,
-            tako_control::protocol::Request::Close {
-                pane: Some(pane_id.as_u64()),
-            },
-            PaneOrigin::User,
-        );
-        if let Err(e) = result {
-            eprintln!("warning: ペインを閉じられない: {e}");
+        // FR-2.15.1: × ボタンは kill ではなくたまり場への退避
+        match self.workspace.shelve_pane(pane_id) {
+            Ok(()) => {}
+            Err(WorkspaceError::LastTab) => {
+                // 最後のタブの最後のペイン: 新しいペインを生やしてからリトライ
+                let new_pane = Pane::new(PaneOrigin::User);
+                let new_id = new_pane.id();
+                let focused = self.workspace.active_tab().tree().focused();
+                if self
+                    .workspace
+                    .active_tab_mut()
+                    .tree_mut()
+                    .split(focused, SplitDirection::Right, new_pane)
+                    .is_ok()
+                {
+                    if let Err(e) = self.spawn_session(new_id, SpawnOptions::default(), cx) {
+                        eprintln!("warning: 代替ペインを起動できない: {e}");
+                    }
+                    if let Err(e) = self.workspace.shelve_pane(pane_id) {
+                        eprintln!("warning: たまり場へ退避できない: {e}");
+                    }
+                }
+            }
+            Err(e) => eprintln!("warning: たまり場へ退避できない: {e}"),
         }
         cx.notify();
     }
@@ -4017,6 +4052,17 @@ impl TakoApp {
                     );
                 },
             ))
+            .on_drag_move::<ShelvedPaneDrag>(cx.listener(
+                move |this, e: &DragMoveEvent<ShelvedPaneDrag>, _, cx| {
+                    this.update_drop_target(
+                        pane_id,
+                        e.bounds,
+                        e.event.position,
+                        DragKind::ShelvedPane,
+                        cx,
+                    );
+                },
+            ))
             .on_drop::<TmuxSessionDrag>(cx.listener(move |this, drag: &TmuxSessionDrag, _, cx| {
                 this.drop_tmux_session(pane_id, drag.clone(), cx);
             }))
@@ -4025,6 +4071,9 @@ impl TakoApp {
             }))
             .on_drop::<PaneDrag>(cx.listener(move |this, drag: &PaneDrag, _, cx| {
                 this.drop_pane(pane_id, *drag, cx);
+            }))
+            .on_drop::<ShelvedPaneDrag>(cx.listener(move |this, drag: &ShelvedPaneDrag, _, cx| {
+                this.drop_shelved_pane(pane_id, *drag, cx);
             }));
         if let Some(zone) = zone {
             let (left, top, w, h) = match zone {
@@ -4039,6 +4088,7 @@ impl TakoApp {
                 (DragKind::File, DropZone::Center) => "ここで開く",
                 (DragKind::File, _) => "ここに分割して開く",
                 (DragKind::Pane, _) => "この位置に移動",
+                (DragKind::ShelvedPane, _) => "ここに復帰",
             };
             overlay = overlay.child(
                 div()
@@ -4665,6 +4715,223 @@ impl TakoApp {
         // 旧「◧ panel」トグルは下部ステータスバーへ集約済み（FR-2.16.4）
     }
 
+    /// たまり場からのドロップ（FR-2.15.3）
+    fn drop_shelved_pane(
+        &mut self,
+        target_pane: PaneId,
+        drag: ShelvedPaneDrag,
+        cx: &mut Context<Self>,
+    ) {
+        let zone = self.drop_target.take().map(|(_, z)| z);
+        let direction = match zone {
+            Some(DropZone::Left) => SplitDirection::Left,
+            Some(DropZone::Right) | None => SplitDirection::Right,
+            Some(DropZone::Up) => SplitDirection::Up,
+            Some(DropZone::Down) => SplitDirection::Down,
+            Some(DropZone::Center) => SplitDirection::Right,
+        };
+        if let Err(e) = self
+            .workspace
+            .unshelve_pane(drag.pane, target_pane, direction)
+        {
+            eprintln!("warning: たまり場から復帰できない: {e}");
+        }
+        self.drag_kind = None;
+        if self.workspace.shelved_panes().is_empty() {
+            self.drawer_visible = false;
+        }
+        cx.notify();
+    }
+
+    /// たまり場ドロワーの描画（FR-2.15。下部、ステータスバーの上に展開）
+    fn render_drawer(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if !self.drawer_visible {
+            return None;
+        }
+        let theme = self.theme.clone();
+        let shelved: Vec<(PaneId, String, CommandState)> = self
+            .workspace
+            .shelved_panes()
+            .iter()
+            .map(|p| {
+                let label = p
+                    .title()
+                    .map(|s| s.to_string())
+                    .or_else(|| p.role().map(|s| s.to_string()))
+                    .unwrap_or_else(|| format!("pane {}", p.id()));
+                let state = self
+                    .terminals
+                    .get(&p.id())
+                    .map(|s| s.command_state())
+                    .unwrap_or(CommandState::Unknown);
+                (p.id(), label, state)
+            })
+            .collect();
+
+        let pending_kill = self.shelved_pending_kill;
+
+        let mut content = div()
+            .id("drawer-content")
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .h_full()
+            .px_2()
+            .py_1();
+
+        if shelved.is_empty() {
+            content = content.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(hsla(theme.tab_inactive_foreground))
+                    .py_1()
+                    .child("退避中のターミナルはありません"),
+            );
+        } else {
+            for (pane_id, label, state) in &shelved {
+                let pane_id = *pane_id;
+                let state_color = match state {
+                    CommandState::Failed(_) => Some(theme.ansi[1]),
+                    CommandState::Running => Some(theme.accent),
+                    CommandState::Idle => Some(theme.ansi[3]),
+                    _ => None,
+                };
+                let is_pending_kill = pending_kill == Some(pane_id);
+
+                let mut row = div()
+                    .id(("shelved-row", pane_id.as_u64()))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px_1()
+                    .py(px(2.0))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_size(px(11.0))
+                    .text_color(hsla(theme.foreground))
+                    .hover(|d| d.bg(rgba_alpha(theme.tab_active_background, 0.5)))
+                    .on_drag(
+                        ShelvedPaneDrag { pane: pane_id },
+                        self.drag_ghost_builder(DragKind::ShelvedPane, truncate(label, 24), cx),
+                    );
+
+                if let Some(color) = state_color {
+                    row = row.child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color)));
+                }
+
+                row = row.child(
+                    div()
+                        .flex_1()
+                        .overflow_x_hidden()
+                        .text_ellipsis()
+                        .child(label.clone()),
+                );
+
+                if is_pending_kill {
+                    // kill 確認（FR-2.15.2）
+                    row = row
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(hsla(theme.ansi[1]))
+                                .child("kill?"),
+                        )
+                        .child(
+                            div()
+                                .id(("shelved-kill-yes", pane_id.as_u64()))
+                                .cursor_pointer()
+                                .text_size(px(10.0))
+                                .text_color(hsla(theme.ansi[1]))
+                                .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
+                                .px_1()
+                                .rounded_sm()
+                                .child("はい")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.shelved_pending_kill = None;
+                                    if let Some(_pane) = this.workspace.remove_shelved(pane_id) {
+                                        this.terminals.remove(&pane_id);
+                                        this.previews.remove(&pane_id);
+                                        this.scroll_accum.remove(&pane_id);
+                                        this.scroll_ctls.remove(&pane_id);
+                                        this.drop_backend_session(pane_id);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id(("shelved-kill-no", pane_id.as_u64()))
+                                .cursor_pointer()
+                                .text_size(px(10.0))
+                                .text_color(hsla(theme.tab_inactive_foreground))
+                                .hover(|d| d.bg(rgba_alpha(theme.tab_active_background, 0.5)))
+                                .px_1()
+                                .rounded_sm()
+                                .child("いいえ")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.shelved_pending_kill = None;
+                                    cx.notify();
+                                })),
+                        );
+                } else {
+                    // × ボタン（kill 確認開始）
+                    row = row.child(
+                        div()
+                            .id(("shelved-close", pane_id.as_u64()))
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(hsla(theme.tab_inactive_foreground))
+                            .hover(|d| d.text_color(hsla(theme.ansi[1])))
+                            .child("×")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.shelved_pending_kill = Some(pane_id);
+                                cx.notify();
+                            })),
+                    );
+                }
+
+                content = content.child(row);
+            }
+        }
+
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .flex_none()
+                .h(px(self.drawer_height))
+                .w_full()
+                .bg(rgba(theme.tab_bar_background))
+                .border_t_1()
+                .border_color(hsla(theme.pane_border))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .h(px(20.0))
+                        .px_2()
+                        .text_size(px(10.0))
+                        .text_color(hsla(theme.tab_inactive_foreground))
+                        .child("退避中のターミナル")
+                        .child(div().flex_grow(1.0))
+                        .child(
+                            div()
+                                .id("drawer-close")
+                                .cursor_pointer()
+                                .hover(|d| d.text_color(hsla(theme.foreground)))
+                                .child("×")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.drawer_visible = false;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(content),
+        )
+    }
+
     /// 下部ステータスバー（FR-2.16.4。Zed / VSCode 風）。
     /// 左 = ファイルツリートグル、右 = tmux 管理・git 管理トグル。
     /// トグル状態は dispatch（`tako panel` / MCP `tako_panel`）からも取得・操作できる
@@ -4716,6 +4983,20 @@ impl TakoApp {
                     }))
                     .child("◫ ファイル"),
             )
+            .child({
+                let shelved_count = self.workspace.shelved_panes().len();
+                let drawer_open = self.drawer_visible;
+                toggle("statusbar-shelved", drawer_open)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.drawer_visible = !this.drawer_visible;
+                        cx.notify();
+                    }))
+                    .child(if shelved_count > 0 {
+                        format!("⏏ 退避 ({})", shelved_count)
+                    } else {
+                        "⏏ 退避".into()
+                    })
+            })
             .child(div().flex_grow(1.0))
             .child(
                 toggle(
@@ -5696,6 +5977,10 @@ impl ControlHost for TakoApp {
             .insert(pane, TmuxViewTarget { session, socket });
     }
 
+    fn reattach_shelved(&mut self, _pane: PaneId) {
+        // セッションは terminals HashMap に残っている。再描画のみ必要
+    }
+
     fn auto_rename_enabled(&self) -> bool {
         self.autorename.enabled
     }
@@ -6456,6 +6741,7 @@ impl Render for TakoApp {
                     )
                     .children(self.render_panel(cx)),
             )
+            .children(self.render_drawer(cx))
             .child(self.render_status_bar(cx))
             .child(ime_registration)
             .children(context_menu_overlay)
@@ -7403,7 +7689,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 25, "MCP tools/list は 25 ツール");
+            check(status == 200 && tool_count == 29, "MCP tools/list は 29 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)

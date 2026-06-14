@@ -23,6 +23,8 @@ pub enum WorkspaceError {
 pub struct Workspace {
     tabs: Vec<Tab>,
     active: TabId,
+    /// たまり場（FR-2.15）: タブから外したがプロセスは生きているペイン
+    shelved: Vec<Pane>,
 }
 
 impl Workspace {
@@ -33,6 +35,7 @@ impl Workspace {
         Self {
             tabs: vec![tab],
             active,
+            shelved: Vec::new(),
         }
     }
 
@@ -47,7 +50,11 @@ impl Workspace {
         } else {
             tabs[0].id()
         };
-        Some(Self { tabs, active })
+        Some(Self {
+            tabs,
+            active,
+            shelved: Vec::new(),
+        })
     }
 
     pub fn tabs(&self) -> &[Tab] {
@@ -221,6 +228,92 @@ impl Workspace {
         Ok(())
     }
 
+    /// レイアウト復元用（FR-2.15.5）。shelved ペインも含めて復元する
+    pub fn restore_with_shelved(tabs: Vec<Tab>, active: TabId, shelved: Vec<Pane>) -> Option<Self> {
+        if tabs.is_empty() {
+            return None;
+        }
+        let active = if tabs.iter().any(|t| t.id() == active) {
+            active
+        } else {
+            tabs[0].id()
+        };
+        Some(Self {
+            tabs,
+            active,
+            shelved,
+        })
+    }
+
+    pub fn shelved_panes(&self) -> &[Pane] {
+        &self.shelved
+    }
+
+    /// ペインをたまり場へ退避する（FR-2.15.1）。ペインをツリーから外してたまり場に移す。
+    /// タブが空になる場合はタブを閉じる。最後のタブの最後のペインの場合は LastTab を返す
+    /// （アプリ層で新ペインを生やしてからリトライする判断は呼び出し側の責務）
+    pub fn shelve_pane(&mut self, pane_id: PaneId) -> Result<(), WorkspaceError> {
+        let tab_id = self
+            .find_tab_of_pane(pane_id)
+            .ok_or(WorkspaceError::PaneNotFound(pane_id))?;
+        let tab = self
+            .get_tab_mut(tab_id)
+            .expect("find_tab_of_pane で存在確認済み");
+        match tab.tree_mut().close(pane_id) {
+            Ok(pane) => {
+                self.shelved.push(pane);
+                Ok(())
+            }
+            Err(PaneTreeError::LastPane) => {
+                if self.tabs.len() > 1 {
+                    let tab = self.close_tab(tab_id).expect("複数タブが存在する");
+                    let mut panes = tab.into_tree().into_panes();
+                    self.shelved
+                        .push(panes.pop().expect("タブは常に 1 ペイン以上を持つ"));
+                    Ok(())
+                } else {
+                    Err(WorkspaceError::LastTab)
+                }
+            }
+            Err(e) => unreachable!("shelve_pane の close で想定外のエラー: {e}"),
+        }
+    }
+
+    /// たまり場からペインを復帰させる（FR-2.15.3）。target を direction 側に分割して挿入する
+    pub fn unshelve_pane(
+        &mut self,
+        pane_id: PaneId,
+        target: PaneId,
+        direction: SplitDirection,
+    ) -> Result<(), WorkspaceError> {
+        let idx = self
+            .shelved
+            .iter()
+            .position(|p| p.id() == pane_id)
+            .ok_or(WorkspaceError::PaneNotFound(pane_id))?;
+        let tab_id = self
+            .find_tab_of_pane(target)
+            .ok_or(WorkspaceError::PaneNotFound(target))?;
+        let pane = self.shelved.remove(idx);
+        self.get_tab_mut(tab_id)
+            .expect("find_tab_of_pane で存在確認済み")
+            .tree_mut()
+            .split_with_ratio(target, direction, 0.5, pane)
+            .expect("target は存在するペイン");
+        Ok(())
+    }
+
+    /// たまり場からペインを削除する（FR-2.15.2 の kill 時に使う）
+    pub fn remove_shelved(&mut self, pane_id: PaneId) -> Option<Pane> {
+        let idx = self.shelved.iter().position(|p| p.id() == pane_id)?;
+        Some(self.shelved.remove(idx))
+    }
+
+    /// ペインがたまり場にあるか
+    pub fn is_shelved(&self, pane_id: PaneId) -> bool {
+        self.shelved.iter().any(|p| p.id() == pane_id)
+    }
+
     fn activate_by_offset(&mut self, offset: usize) -> TabId {
         let index = self
             .tabs
@@ -389,6 +482,66 @@ mod tests {
             ws.move_pane(p1, t1).unwrap_err(),
             WorkspaceError::AlreadyInTab(p1, t1)
         );
+    }
+
+    #[test]
+    fn ペインをたまり場に退避して復帰できる() {
+        let mut ws = Workspace::new("t1", pane());
+        let p1 = ws.active_tab().tree().focused();
+        let p2 = pane();
+        let p2_id = p2.id();
+        ws.active_tab_mut()
+            .tree_mut()
+            .split(p1, SplitDirection::Right, p2)
+            .unwrap();
+        // p2 を退避
+        ws.shelve_pane(p2_id).unwrap();
+        assert_eq!(ws.shelved_panes().len(), 1);
+        assert_eq!(ws.shelved_panes()[0].id(), p2_id);
+        assert_eq!(ws.active_tab().tree().len(), 1);
+        assert!(ws.is_shelved(p2_id));
+        // p2 を p1 の右に復帰
+        ws.unshelve_pane(p2_id, p1, SplitDirection::Right).unwrap();
+        assert_eq!(ws.shelved_panes().len(), 0);
+        assert_eq!(ws.active_tab().tree().len(), 2);
+        assert!(!ws.is_shelved(p2_id));
+    }
+
+    #[test]
+    fn たまり場退避でタブが空になるとタブを閉じる() {
+        let mut ws = Workspace::new("t1", pane());
+        let p1 = ws.active_tab().tree().focused();
+        let t2_pane = pane();
+        let t2_pane_id = t2_pane.id();
+        let _t2 = ws.create_tab("t2", t2_pane);
+        // t2 の唯一のペインを退避 → t2 はタブごと閉じる
+        ws.shelve_pane(t2_pane_id).unwrap();
+        assert_eq!(ws.tabs().len(), 1);
+        assert_eq!(ws.shelved_panes().len(), 1);
+        assert_eq!(ws.active_tab().tree().focused(), p1);
+    }
+
+    #[test]
+    fn 最後のタブの最後のペインは退避できない() {
+        let mut ws = Workspace::new("t1", pane());
+        let p1 = ws.active_tab().tree().focused();
+        assert_eq!(ws.shelve_pane(p1).unwrap_err(), WorkspaceError::LastTab);
+    }
+
+    #[test]
+    fn たまり場のペインをkillできる() {
+        let mut ws = Workspace::new("t1", pane());
+        let p1 = ws.active_tab().tree().focused();
+        let p2 = pane();
+        let p2_id = p2.id();
+        ws.active_tab_mut()
+            .tree_mut()
+            .split(p1, SplitDirection::Right, p2)
+            .unwrap();
+        ws.shelve_pane(p2_id).unwrap();
+        let removed = ws.remove_shelved(p2_id);
+        assert!(removed.is_some());
+        assert_eq!(ws.shelved_panes().len(), 0);
     }
 
     #[test]

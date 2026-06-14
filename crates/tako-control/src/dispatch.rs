@@ -9,8 +9,8 @@
 
 use serde_json::{json, Value};
 use tako_core::{
-    Pane, PaneId, PaneNode, PaneOrigin, PaneTreeError, Rect, SpawnCommand, SpawnOptions, SplitAxis,
-    SplitDirection, TabId, TerminalSession, Workspace,
+    CommandState, Pane, PaneId, PaneNode, PaneOrigin, PaneTreeError, Rect, SpawnCommand,
+    SpawnOptions, SplitAxis, SplitDirection, TabId, TerminalSession, Workspace,
 };
 
 use crate::protocol::{error_code, Direction, FileOpKind, PreviewModeWire, Request};
@@ -65,6 +65,9 @@ pub trait ControlHost {
     fn filetree_visible(&self) -> bool {
         false
     }
+    /// たまり場から復帰させたペインのセッションを再接続する（FR-2.15.3）。
+    /// セッション自体は shelve 時に破棄していないため、UI 層で再描画するだけでよい場合が多い
+    fn reattach_shelved(&mut self, _pane: PaneId) {}
     /// ファイルツリーの表示・非表示（root の cwd 同期は実装側の責務）
     fn set_filetree(&mut self, _visible: bool) {}
     /// ペインのプレビュー状態（FR-3.2。`(path, mode)`。プレビューペインでなければ None）
@@ -960,6 +963,72 @@ pub fn dispatch(
                     })).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>(),
             }))
+        }
+
+        Request::Shelve { pane } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            host.workspace_mut().shelve_pane(target).map_err(op_err)?;
+            Ok(json!({ "shelved": target.as_u64() }))
+        }
+
+        Request::Unshelve {
+            pane,
+            target,
+            direction,
+        } => {
+            let pane_id = PaneId::from_raw(pane);
+            if !host.workspace().is_shelved(pane_id) {
+                return Err(DispatchError::PaneNotFound(pane));
+            }
+            let target_id = if let Some(t) = target {
+                let (_, id) = resolve_pane(host.workspace(), Some(t))?;
+                id
+            } else {
+                host.workspace().active_tab().tree().focused()
+            };
+            let dir = direction
+                .map(|d| d.to_core())
+                .unwrap_or(SplitDirection::Right);
+            host.workspace_mut()
+                .unshelve_pane(pane_id, target_id, dir)
+                .map_err(op_err)?;
+            host.reattach_shelved(pane_id);
+            Ok(json!({ "unshelved": pane, "target": target_id.as_u64() }))
+        }
+
+        Request::ShelvedList => {
+            let shelved: Vec<serde_json::Value> = host
+                .workspace()
+                .shelved_panes()
+                .iter()
+                .map(|p| {
+                    let state = host
+                        .session(p.id())
+                        .map(|s| s.command_state())
+                        .unwrap_or(CommandState::Unknown);
+                    let cwd = host
+                        .session(p.id())
+                        .and_then(|s| s.cwd())
+                        .map(|p| p.display().to_string());
+                    json!({
+                        "pane": p.id().as_u64(),
+                        "title": p.title(),
+                        "role": p.role(),
+                        "state": format!("{state:?}").to_lowercase(),
+                        "cwd": cwd,
+                    })
+                })
+                .collect();
+            Ok(json!({ "shelved": shelved }))
+        }
+
+        Request::ShelvedKill { pane } => {
+            let pane_id = PaneId::from_raw(pane);
+            if host.workspace_mut().remove_shelved(pane_id).is_none() {
+                return Err(DispatchError::PaneNotFound(pane));
+            }
+            host.detach_session(pane_id);
+            Ok(json!({ "killed": pane }))
         }
     }
 }

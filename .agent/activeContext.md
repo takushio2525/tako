@@ -4,14 +4,16 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-06-14・git タブ実装完了）
+## 現在の対象（2026-06-14・git タブ + たまり場マージ完了）
 
 - **FR-3.6 git graph + FR-3.9 diff ビューア**: 右サイドバーの git タブにコミットグラフ・
   ブランチ一覧・変更ファイル・diff 表示を実装。`tako-core::git` モジュール新設（git CLI
   子プロセス、tmux.rs と同パターン）。dispatch `GitLog`/`GitDiff` + CLI `tako git log/diff`
-  + MCP `tako_git_log`/`tako_git_diff`（計 25 ツール）
-- cargo test 93 pass・clippy / fmt 緑
-- feature/git-tab ブランチで作業
+  + MCP `tako_git_log`/`tako_git_diff`
+- **たまり場機能（FR-2.15）を完全実装**: × ボタンが kill → 退避に変更、下部ドロワー UI、
+  D&D 復帰、CLI / MCP 4 操作、レイアウト永続化
+- feature/git-tab と feature/tamari-ba を main にマージ統合（計 29 ツール）
+- **tako 終了 → `scripts/build-app.sh --install` → 再起動** をユーザーに依頼して実機確認
 - 最終更新: 2026-06-14
 
 ## 残作業・既知の制約
@@ -29,7 +31,6 @@
 - [ ] **FR-2.18 未表示の子の自動サーフェス**
 - [ ] **FR-2.14 MCP ゼロコンフィグオンボーディング**（配布前必須）
 - [ ] **FR-2.17 ネスト tmux の検出・診断・ワンタップ適用**（Phase 7）
-- [ ] **FR-2.15 ターミナルのたまり場**（UI の見せ方をユーザーと相談してから着手）
 
 ## 直近の観点・指摘（実装時に踏みやすい点）
 
