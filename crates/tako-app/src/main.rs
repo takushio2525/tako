@@ -414,6 +414,8 @@ struct TakoApp {
     last_saved_layout: Option<String>,
     /// OS ウィンドウの現フレーム（render で採取し layout 保存に含める。FR-5）
     window_frame: Option<tako_control::layout::WindowFrame>,
+    /// tmux ビューのアコーディオン折りたたみ状態（タブ group_index → 折りたたみ）
+    collapsed_tmux_tabs: std::collections::HashSet<usize>,
     /// ファイルツリーのコンテキストメニュー（FR-3.12）
     context_menu: Option<ContextMenu>,
     /// ファイルツリーのインライン編集
@@ -716,6 +718,7 @@ impl TakoApp {
             tmux_sessions: Vec::new(),
             tmux_pending_kill: None,
             pending_pane_kill: None,
+            collapsed_tmux_tabs: std::collections::HashSet::new(),
             context_menu: None,
             inline_edit: None,
             filetree: filetree::FileTree::default(),
@@ -1973,8 +1976,8 @@ impl TakoApp {
             .flex_1()
             .flex()
             .flex_col()
-            .gap_2()
-            .p_3()
+            .gap_1()
+            .p_1()
             .bg(rgba(theme.background))
             .text_color(hsla(theme.foreground))
             .text_size(px(12.0))
@@ -1989,11 +1992,12 @@ impl TakoApp {
         // タブ枠: タブ名ラベル付き四角枠 + 枠内に全ペインの入れ子表示（FR-2.16.6）
         for (group_index, group) in groups.into_iter().enumerate() {
             let is_active = group.tab == active_tab;
+            let is_collapsed = self.collapsed_tmux_tabs.contains(&group_index);
             let mut card = div()
                 .flex()
                 .flex_col()
                 .gap_1()
-                .p_2()
+                .p_1()
                 .rounded_md()
                 .border_1()
                 .border_color(if is_active {
@@ -2003,6 +2007,7 @@ impl TakoApp {
                 })
                 .child(
                     div()
+                        .id(("tmux-tab-header", group_index as u64))
                         .text_size(px(11.0))
                         .font_weight(FontWeight::BOLD)
                         .text_color(if is_active {
@@ -2011,11 +2016,27 @@ impl TakoApp {
                             hsla(theme.tab_inactive_foreground)
                         })
                         .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.collapsed_tmux_tabs.contains(&group_index) {
+                                this.collapsed_tmux_tabs.remove(&group_index);
+                            } else {
+                                this.collapsed_tmux_tabs.insert(group_index);
+                            }
+                            cx.notify();
+                        }))
                         .child(SharedString::from(format!(
-                            "タブ {}",
-                            truncate(&group.title, 30)
+                            "{} タブ {}",
+                            if is_collapsed { "▸" } else { "▾" },
+                            truncate(&group.title, 28)
                         ))),
                 );
+            if is_collapsed {
+                root = root.child(card);
+                continue;
+            }
             for row in group.rows {
                 let pane = row.pane;
                 let (color, state_label) = match row.state {
@@ -2038,10 +2059,11 @@ impl TakoApp {
                 card = card.child(
                     div()
                         .id(("tmux-pane-row", pane.as_u64()))
+                        .group("tmux-row")
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap_2()
+                        .gap_1()
                         .px_1()
                         .rounded_sm()
                         .cursor_pointer()
@@ -2058,16 +2080,19 @@ impl TakoApp {
                         )
                         .child(
                             div()
-                                .w(px(64.0))
+                                .w(px(56.0))
                                 .flex_none()
                                 .text_size(px(11.0))
                                 .text_color(hsla(color))
+                                .whitespace_nowrap()
                                 .child(SharedString::from(state_label)),
                         )
                         .child(
                             div()
                                 .flex_1()
                                 .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
                                 .font_weight(FontWeight::BOLD)
                                 .child(SharedString::from(truncate(&row.label, 28))),
                         )
@@ -2076,10 +2101,11 @@ impl TakoApp {
                                 .text_size(px(10.0))
                                 .text_color(hsla(theme.tab_inactive_foreground))
                                 .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
                                 .child(SharedString::from(detail)),
                         )
                         .child(
-                            // ゴミ箱 → 確認 → kill（FR-2.16.7）
                             div()
                                 .id(("pane-kill", pane.as_u64()))
                                 .px_1()
@@ -2088,13 +2114,15 @@ impl TakoApp {
                                 .cursor_pointer()
                                 .text_size(px(11.0))
                                 .text_color(hsla_alpha(theme.ansi[1], 0.8))
+                                .opacity(0.0)
+                                .group_hover("tmux-row", |d| d.opacity(1.0))
                                 .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.pending_pane_kill = Some(pane);
                                     cx.notify();
                                 }))
-                                .child("🗑"),
+                                .child("×"),
                         ),
                 );
                 if pending_pane == Some(pane) {
@@ -2116,10 +2144,11 @@ impl TakoApp {
                 card = card.child(
                     div()
                         .id(("tmux-att-row", id_seed))
+                        .group("tmux-att-row")
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap_2()
+                        .gap_1()
                         .px_1()
                         .overflow_hidden()
                         .cursor(CursorStyle::OpenHand)
@@ -2149,6 +2178,8 @@ impl TakoApp {
                             div()
                                 .flex_1()
                                 .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
                                 .font_weight(FontWeight::BOLD)
                                 .text_size(px(11.0))
                                 .child(SharedString::from(truncate(&session.name, 24))),
@@ -2158,6 +2189,7 @@ impl TakoApp {
                                 .flex_none()
                                 .text_size(px(10.0))
                                 .text_color(hsla(theme.tab_inactive_foreground))
+                                .whitespace_nowrap()
                                 .child(SharedString::from(format!(
                                     "ペイン {} で attach 中",
                                     session.pane
@@ -2172,6 +2204,8 @@ impl TakoApp {
                                 .cursor_pointer()
                                 .text_size(px(11.0))
                                 .text_color(hsla_alpha(theme.ansi[1], 0.8))
+                                .opacity(0.0)
+                                .group_hover("tmux-att-row", |d| d.opacity(1.0))
                                 .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
@@ -2179,7 +2213,7 @@ impl TakoApp {
                                         Some((kill_name.clone(), None, kill_socket.clone()));
                                     cx.notify();
                                 }))
-                                .child("🗑"),
+                                .child("×"),
                         ),
                 );
                 for (w_index, label) in &session.windows {
@@ -2188,10 +2222,15 @@ impl TakoApp {
                     let kill_socket = session.socket.clone();
                     card = card.child(
                         div()
+                            .id((
+                                "tmux-att-window-row",
+                                (id_seed << 8) | w_index as u64 | 0x8000_0000,
+                            ))
+                            .group("tmux-att-wrow")
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap_2()
+                            .gap_1()
                             .pl_4()
                             .text_size(px(11.0))
                             .overflow_hidden()
@@ -2199,6 +2238,8 @@ impl TakoApp {
                                 div()
                                     .flex_1()
                                     .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
                                     .child(SharedString::from(truncate(label, 40))),
                             )
                             .child(
@@ -2210,6 +2251,8 @@ impl TakoApp {
                                     .cursor_pointer()
                                     .text_size(px(10.0))
                                     .text_color(hsla_alpha(theme.ansi[1], 0.8))
+                                    .opacity(0.0)
+                                    .group_hover("tmux-att-wrow", |d| d.opacity(1.0))
                                     .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.tmux_pending_kill = Some((
@@ -2266,16 +2309,17 @@ impl TakoApp {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .p_2()
+                .p_1()
                 .rounded_md()
                 .bg(rgba_alpha(theme.tab_bar_background, 0.6))
                 .child(
                     div()
                         .id(("tmux-unlisted-row", index as u64))
+                        .group("tmux-unlisted")
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap_2()
+                        .gap_1()
                         .overflow_hidden()
                         .cursor(CursorStyle::OpenHand)
                         // D&D で現在のタブへ取り込んで表示（FR-2.16.10。kill せず中身を確認できる）
@@ -2304,12 +2348,15 @@ impl TakoApp {
                             div()
                                 .font_weight(FontWeight::BOLD)
                                 .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
                                 .child(SharedString::from(truncate(&session.name, 24))),
                         )
                         .child(
                             div()
                                 .text_size(px(11.0))
                                 .flex_none()
+                                .whitespace_nowrap()
                                 .text_color(if session.attached {
                                     hsla(theme.accent)
                                 } else {
@@ -2326,6 +2373,8 @@ impl TakoApp {
                                 .text_size(px(11.0))
                                 .text_color(hsla(theme.tab_inactive_foreground))
                                 .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
                                 .child(SharedString::from(format!(
                                     "作成 {} ・ {}",
                                     format_age(now - session.created),
@@ -2342,13 +2391,15 @@ impl TakoApp {
                                 .cursor_pointer()
                                 .text_size(px(11.0))
                                 .text_color(hsla_alpha(theme.ansi[1], 0.8))
+                                .opacity(0.0)
+                                .group_hover("tmux-unlisted", |d| d.opacity(1.0))
                                 .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.tmux_pending_kill =
                                         Some((kill_name.clone(), None, kill_socket.clone()));
                                     cx.notify();
                                 }))
-                                .child("🗑"),
+                                .child("×"),
                         ),
                 )
                 .children(session.windows.iter().map(|(w_index, label)| {
@@ -2356,19 +2407,24 @@ impl TakoApp {
                     let kill_name = session.name.clone();
                     let kill_socket = session.socket.clone();
                     div()
+                        .id((
+                            "tmux-unlisted-wrow",
+                            ((index as u64) << 16) | w_index as u64 | 0x8000_0000,
+                        ))
+                        .group("tmux-unlisted-wrow")
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap_2()
+                        .gap_1()
                         .pl_4()
                         .text_size(px(11.0))
                         .overflow_hidden()
                         .child(
-                            // ラベルは flex_1 で縮められるように包む（裸のテキスト子だと
-                            // 長文時にゴミ箱ごと右へ押し出されて見切れる）
                             div()
                                 .flex_1()
                                 .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
                                 .child(SharedString::from(truncate(label, 40))),
                         )
                         .child(
@@ -2380,6 +2436,8 @@ impl TakoApp {
                                 .cursor_pointer()
                                 .text_size(px(10.0))
                                 .text_color(hsla_alpha(theme.ansi[1], 0.8))
+                                .opacity(0.0)
+                                .group_hover("tmux-unlisted-wrow", |d| d.opacity(1.0))
                                 .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.tmux_pending_kill = Some((
@@ -2389,7 +2447,7 @@ impl TakoApp {
                                     ));
                                     cx.notify();
                                 }))
-                                .child("🗑"),
+                                .child("×"),
                         )
                 }));
             // 誤爆防止のインライン確認（FR-2.13.3 / FR-2.16.8）
@@ -2737,6 +2795,7 @@ impl TakoApp {
             .text_color(hsla(theme.foreground))
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
             .children(items.into_iter().enumerate().map(|(i, (id, label))| {
                 if id.starts_with("sep") {
                     return div()
@@ -2765,6 +2824,8 @@ impl TakoApp {
         let backdrop = div()
             .id("ctx-backdrop")
             .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
             .size_full()
             .on_mouse_down(
                 MouseButton::Left,
@@ -5745,13 +5806,13 @@ impl Render for TakoApp {
                             .children(panes)
                             .children(border_handles)
                             .children(drop_overlays)
-                            .children(context_menu_overlay)
                             .children(ime_overlay),
                     )
                     .children(self.render_panel(cx)),
             )
             .child(self.render_status_bar(cx))
             .child(ime_registration)
+            .children(context_menu_overlay)
     }
 }
 
