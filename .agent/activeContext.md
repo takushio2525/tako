@@ -4,18 +4,14 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-06-14・インラインテキスト入力 UI 完成）
+## 現在の対象（2026-06-14・パフォーマンスバグ修正 2 回目）
 
-- **FR-3.12 インライン編集 UI 完成**: ファイルツリーのコンテキストメニューから「名前変更」
-  「新しいファイル」「新しいフォルダ」を選ぶと、ツリーの該当行にインラインテキスト入力欄が
-  表示される。Enter で確定（dispatch FileOp）、Esc でキャンセル。IME 入力にも対応
-  （EntityInputHandler の replace_text_in_range をインライン編集中に振り分け）
-- 新規ファイル/フォルダは親ディレクトリの子の末尾に仮行を挿入して入力。
-  親が未展開なら自動展開する（`FileTree::expand_dir`）
-- カーソル移動（←→Home/End）、BackSpace/Delete、IME 確定文字列の挿入をサポート
-- MCP ツール数が 23 に更新（前回の FR-3.12 で `tako_file_op` 追加分。セルフテスト期待値修正）
-- cargo test 88 pass・clippy / fmt 緑・`.app` 反映済み
-- **ユーザーの再起動 + 実機確認待ち**
+- **tmux ポーリングの非同期化**: 2 秒ポーリングの `refresh_tmux_data` が 6 回の同期
+  tmux サブプロセス実行（計 25〜50ms）で UI スレッドをブロックしていた問題を修正。
+  コンテキスト収集のみ UI スレッド（< 0.1ms）、tmux コマンドは background executor に移行。
+  `TmuxOpen` の存在確認も `list_sessions`（3 コマンド）→ `has_session`（1 コマンド）に軽量化
+- cargo test 88 pass・clippy / fmt 緑・`.app` 生成済み（`dist/tako.app`）
+- **tako 終了 → `scripts/build-app.sh --install` → 再起動** をユーザーに依頼して実機確認
 - 最終更新: 2026-06-14
 
 ## 残作業・既知の制約
@@ -36,11 +32,11 @@
 ## 直近の観点・指摘（実装時に踏みやすい点）
 
 - **CI（GitHub Actions）はリポ設定で意図的に無効化中**（2026-06-12〜）
-- **Edit ツールのフックが変更を巻き戻す**: Bash + python3 での一括パッチが安全。
-  複数ファイルにまたがる変更は Edit ツールではなく Bash で一括適用する
-- **GPUI の ClickEvent.is_right_click()**: `on_click` のクロージャで右クリック判定可能
-- **インライン編集 UI**: `handle_key` の冒頭で `inline_edit.is_some()` をチェックし、
-  Enter/Esc/文字入力を横取り。IME 確定は `replace_text_in_range` で振り分け
+- **tmux ポーリングの非同期化パターン**: UI スレッドで `collect_tmux_context()` →
+  background で `fetch_tmux_sessions()` → UI スレッドで `self.tmux_sessions` 適用。
+  dispatch 層（CLI/MCP 用）はそのまま同期で残す
+- **Edit ツールのフックが変更を巻き戻す**: Bash + python3 での一括パッチが安全
+- **インライン編集 UI**: `handle_key` の冒頭で `inline_edit.is_some()` をチェック
 
 ## 現フェーズで Read すべき設計書
 
