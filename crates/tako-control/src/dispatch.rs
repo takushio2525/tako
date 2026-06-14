@@ -78,6 +78,9 @@ pub trait ControlHost {
     fn preview_pane_of_tab(&self, _tab: TabId) -> Option<PaneId> {
         None
     }
+    /// TmuxOpen ペインの監視対象を登録する。対象セッションが消滅したらペインを
+    /// 自動クローズする（実装側の責務）
+    fn track_tmux_view(&mut self, _pane: PaneId, _session: String, _socket: Option<String>) {}
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -469,6 +472,15 @@ pub fn dispatch(
                     format!("{w}"),
                 ]);
             }
+            // grouped session のクリーンアップ: ペインクローズ時にクライアントが
+            // 切断されたら自動破棄される（残骸防止）
+            command.extend([
+                ";".to_string(),
+                "set".to_string(),
+                "destroy-unattached".to_string(),
+                "on".to_string(),
+            ]);
+            host.track_tmux_view(new_id, session.clone(), socket.clone());
             let mut command = command.into_iter();
             host.attach_session(
                 new_id,

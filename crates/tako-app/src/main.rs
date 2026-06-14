@@ -416,6 +416,9 @@ struct TakoApp {
     window_frame: Option<tako_control::layout::WindowFrame>,
     /// tmux ビューのアコーディオン折りたたみ状態（タブ group_index → 折りたたみ）
     collapsed_tmux_tabs: std::collections::HashSet<usize>,
+    /// TmuxOpen で作成されたペインの監視対象。対象セッションが消滅したら
+    /// ペインを自動クローズする（ポーリングで検知）
+    tmux_view_panes: HashMap<PaneId, TmuxViewTarget>,
     /// ファイルツリーのコンテキストメニュー（FR-3.12）
     context_menu: Option<ContextMenu>,
     /// ファイルツリーのインライン編集
@@ -426,6 +429,13 @@ struct TakoApp {
     drag_kind: Option<DragKind>,
     /// ドラッグ中のドロップ先（ペイン, 挿入位置）。挿入プレビュー表示の状態
     drop_target: Option<(PaneId, DropZone)>,
+}
+
+/// TmuxOpen でペインに表示している外部 tmux セッションの監視情報
+#[derive(Debug, Clone)]
+struct TmuxViewTarget {
+    session: String,
+    socket: Option<String>,
 }
 
 /// 提案チップ 1 件分（FR-2.4.3。「localhost:PORT をブラウザで開く？」）
@@ -721,6 +731,7 @@ impl TakoApp {
             tmux_pending_kill: None,
             pending_pane_kill: None,
             collapsed_tmux_tabs: std::collections::HashSet::new(),
+            tmux_view_panes: HashMap::new(),
             context_menu: None,
             inline_edit: None,
             filetree: filetree::FileTree::default(),
@@ -850,7 +861,7 @@ impl TakoApp {
         // UI スレッドではコンテキスト収集と結果適用のみ（< 1ms）
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(2)).await;
-            // ① main thread: tmux コンテキスト + filetree 対象を収集（高速）
+            // ① main thread: tmux コンテキスト + filetree 対象 + view 監視対象を収集（高速）
             let prep = this.update(cx, |app: &mut TakoApp, _| {
                 let tmux_ctx = if app.panel_visible && app.panel_view == PanelView::Tmux {
                     Some(app.collect_tmux_context())
@@ -864,9 +875,14 @@ impl TakoApp {
                 } else {
                     None
                 };
-                (tmux_ctx, filetree_targets)
+                let view_targets: Vec<(PaneId, String, Option<String>)> = app
+                    .tmux_view_panes
+                    .iter()
+                    .map(|(id, t)| (*id, t.session.clone(), t.socket.clone()))
+                    .collect();
+                (tmux_ctx, filetree_targets, view_targets)
             });
-            let Ok((tmux_ctx, filetree_targets)) = prep else {
+            let Ok((tmux_ctx, filetree_targets, view_targets)) = prep else {
                 break;
             };
             // ② background: tmux コマンド実行 + ディレクトリ読み取り
@@ -885,6 +901,35 @@ impl TakoApp {
                 });
                 if ok.is_err() {
                     break;
+                }
+            }
+            // TmuxOpen ペインの監視: 対象セッションが消滅したら自動クローズ
+            if !view_targets.is_empty() {
+                let dead_panes: Vec<PaneId> = {
+                    let targets = view_targets;
+                    cx.background_executor()
+                        .spawn(async move {
+                            targets
+                                .into_iter()
+                                .filter(|(_, session, socket)| {
+                                    !tako_core::tmux::has_session(socket.as_deref(), session)
+                                })
+                                .map(|(id, _, _)| id)
+                                .collect()
+                        })
+                        .await
+                };
+                if !dead_panes.is_empty() {
+                    let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                        for pane_id in dead_panes {
+                            if app.tmux_view_panes.contains_key(&pane_id) {
+                                app.remove_pane(pane_id, cx);
+                            }
+                        }
+                    });
+                    if ok.is_err() {
+                        break;
+                    }
                 }
             }
             if let Some(targets) = filetree_targets {
@@ -1401,8 +1446,8 @@ impl TakoApp {
         let result = tako_control::dispatch(
             self,
             tako_control::protocol::Request::TmuxKill {
-                socket,
-                session,
+                socket: socket.clone(),
+                session: session.clone(),
                 window,
             },
             PaneOrigin::User,
@@ -1410,7 +1455,29 @@ impl TakoApp {
         if let Err(e) = result {
             eprintln!("warning: tmux を kill できない: {e}");
         }
+        // セッション kill 時、そのセッションを TmuxOpen で表示していたペインを閉じる
+        if window.is_none() {
+            self.close_tmux_view_panes(&session, socket.as_deref(), cx);
+        }
         self.refresh_tmux(cx);
+    }
+
+    /// 指定セッションを TmuxOpen で表示していたペインをすべて閉じる
+    fn close_tmux_view_panes(
+        &mut self,
+        session: &str,
+        socket: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let panes: Vec<PaneId> = self
+            .tmux_view_panes
+            .iter()
+            .filter(|(_, target)| target.session == session && target.socket.as_deref() == socket)
+            .map(|(id, _)| *id)
+            .collect();
+        for pane_id in panes {
+            self.remove_pane(pane_id, cx);
+        }
     }
 
     /// ペイン ID に対する新しい TerminalSession を起動し、イベント中継タスクを張る。
@@ -1625,6 +1692,7 @@ impl TakoApp {
                 self.previews.remove(&pane_id);
                 self.scroll_accum.remove(&pane_id);
                 self.scroll_ctls.remove(&pane_id);
+                self.tmux_view_panes.remove(&pane_id);
                 self.drop_backend_session(pane_id);
             }
             Err(_) => {
@@ -1647,6 +1715,7 @@ impl TakoApp {
                     self.previews.remove(&id);
                     self.scroll_accum.remove(&id);
                     self.scroll_ctls.remove(&id);
+                    self.tmux_view_panes.remove(&id);
                     self.drop_backend_session(id);
                 }
             }
@@ -1654,6 +1723,7 @@ impl TakoApp {
                 // LastTab: アプリ終了は UI 層の責務。最後のペインの明示 close なので
                 // セッションも破棄し、次回起動で空レイアウトを復元しないようファイルも消す
                 for id in pane_ids {
+                    self.tmux_view_panes.remove(&id);
                     self.drop_backend_session(id);
                 }
                 if std::env::var_os("TAKO_SELF_TEST").is_none() {
@@ -5142,8 +5212,14 @@ impl ControlHost for TakoApp {
         self.previews.remove(&pane);
         self.scroll_accum.remove(&pane);
         self.scroll_ctls.remove(&pane);
+        self.tmux_view_panes.remove(&pane);
         // CLI / MCP からの明示 close（FR-2.5.4）。バックエンドセッションも片付ける
         self.drop_backend_session(pane);
+    }
+
+    fn track_tmux_view(&mut self, pane: PaneId, session: String, socket: Option<String>) {
+        self.tmux_view_panes
+            .insert(pane, TmuxViewTarget { session, socket });
     }
 
     fn auto_rename_enabled(&self) -> bool {
