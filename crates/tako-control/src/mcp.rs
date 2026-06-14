@@ -525,6 +525,57 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "tako_shelve_pane",
+            "description": "ペインをたまり場へ退避する（FR-2.15）。プロセスは生きたまま\
+                画面から外す。邪魔なペインを画面外へ退避させるのに使う。退避中のペインは\
+                tako_shelved_list で確認でき、tako_unshelve_pane で画面に戻せる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": { "type": "integer", "description": "退避するペインの ID（省略時は呼び出し元）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_unshelve_pane",
+            "description": "たまり場のペインを画面に復帰させる（FR-2.15）。target ペインの\
+                direction 側を分割して表示する。退避中に使いたくなったペインを取り出すのに使う。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": { "type": "integer", "description": "復帰させるペインの ID（shelved list から取得）" },
+                    "target": { "type": "integer", "description": "挿入先ペインの ID（省略時はフォーカス中ペイン）" },
+                    "direction": { "type": "string", "enum": ["right","down","left","up"], "description": "分割方向（省略時は right）" },
+                },
+                "required": ["pane"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_shelved_list",
+            "description": "たまり場に退避中のペイン一覧を取得する（FR-2.15）。各ペインの\
+                ID / title / role / state / cwd を返す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_shelved_kill",
+            "description": "たまり場のペインを kill する（FR-2.15.2）。プロセスとバックエンド\
+                セッションも終了する。復帰不要なペインの片付けに使う。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": { "type": "integer", "description": "kill するペインの ID" },
+                },
+                "required": ["pane"],
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -700,6 +751,18 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
                 },
             }
         }
+        "tako_shelve_pane" => Request::Shelve {
+            pane: Some(target_pane(args, caller)?),
+        },
+        "tako_unshelve_pane" => Request::Unshelve {
+            pane: required_u64(args, "pane")?,
+            target: u64_arg(args, "target")?,
+            direction: direction_arg(args)?,
+        },
+        "tako_shelved_list" => Request::ShelvedList,
+        "tako_shelved_kill" => Request::ShelvedKill {
+            pane: required_u64(args, "pane")?,
+        },
         "tako_panel" => Request::Panel {
             visible: bool_arg(args, "visible")?,
             width: f32_arg(args, "width")?,
@@ -1126,7 +1189,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 23);
+        assert_eq!(tools.len(), 27);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

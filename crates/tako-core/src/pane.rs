@@ -27,6 +27,11 @@ impl PaneId {
     pub fn as_u64(self) -> u64 {
         self.0
     }
+
+    /// 既知の ID から PaneId を構築する（dispatch 層でワイヤ値を解決する用途）
+    pub fn from_raw(id: u64) -> Self {
+        PaneId(id)
+    }
 }
 
 impl fmt::Display for PaneId {

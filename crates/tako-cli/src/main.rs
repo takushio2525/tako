@@ -75,6 +75,13 @@ enum Command {
     /// 右サイドバー情報パネル（tmux 一覧 / agents 集約センター）の表示・幅・ビュー切替。
     /// 引数なしで現在状態を表示する
     Panel(PanelArgs),
+    /// ペインをたまり場へ退避する（プロセスは生きたまま画面から外す。FR-2.15）
+    Shelve(ShelveArgs),
+    /// たまり場のペインを画面に復帰させる（FR-2.15）
+    Unshelve(UnshelveArgs),
+    /// たまり場に退避中のペイン一覧を JSON で出力する（FR-2.15）
+    #[command(name = "shelved")]
+    ShelvedList,
     /// ファイルシステム操作（FR-3.12）
     #[command(subcommand)]
     File(FileCommand),
@@ -347,6 +354,25 @@ struct ToggleArgs {
     /// on = 有効化、off = 無効化（省略時は現在状態を表示）
     #[arg(value_parser = ["on", "off"])]
     state: Option<String>,
+}
+
+#[derive(Args)]
+struct ShelveArgs {
+    /// 退避するペイン ID（省略時は呼び出し元。TAKO_PANE_ID から自動解決）
+    #[arg(long)]
+    pane: Option<u64>,
+}
+
+#[derive(Args)]
+struct UnshelveArgs {
+    /// 復帰させるペインの ID（tako shelved で確認）
+    pane: u64,
+    /// 挿入先ペインの ID（省略時はフォーカス中ペイン）
+    #[arg(long)]
+    target: Option<u64>,
+    /// 分割方向（right / down / left / up。省略時は right）
+    #[arg(long)]
+    direction: Option<String>,
 }
 
 #[derive(Args)]
@@ -671,6 +697,15 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Portdetect(args) => Request::PortDetect {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
+        Command::Shelve(args) => Request::Shelve {
+            pane: target_pane(args.pane)?,
+        },
+        Command::Unshelve(args) => Request::Unshelve {
+            pane: args.pane,
+            target: args.target,
+            direction: args.direction.as_deref().map(parse_direction).transpose()?,
+        },
+        Command::ShelvedList => Request::ShelvedList,
         Command::Tmux(TmuxCommand::List { socket }) => Request::TmuxList {
             socket: socket.clone(),
         },
@@ -764,6 +799,16 @@ fn build_request(command: &Command) -> Result<Request, String> {
         // main() で mcp_serve() へ分岐済みのため論理的に到達不能
         Command::Mcp(_) => unreachable!("mcp serve は run() を通らない"),
     })
+}
+
+fn parse_direction(s: &str) -> Result<Direction, String> {
+    match s {
+        "right" | "r" => Ok(Direction::Right),
+        "down" | "d" => Ok(Direction::Down),
+        "left" | "l" => Ok(Direction::Left),
+        "up" | "u" => Ok(Direction::Up),
+        _ => Err(format!("不正な方向: {s}（right / down / left / up）")),
+    }
 }
 
 fn resolve_cli_path(path: &str) -> String {

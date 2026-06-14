@@ -4,13 +4,11 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-06-14・パフォーマンスバグ修正 2 回目）
+## 現在の対象（2026-06-14・たまり場機能 FR-2.15 完成）
 
-- **tmux ポーリングの非同期化**: 2 秒ポーリングの `refresh_tmux_data` が 6 回の同期
-  tmux サブプロセス実行（計 25〜50ms）で UI スレッドをブロックしていた問題を修正。
-  コンテキスト収集のみ UI スレッド（< 0.1ms）、tmux コマンドは background executor に移行。
-  `TmuxOpen` の存在確認も `list_sessions`（3 コマンド）→ `has_session`（1 コマンド）に軽量化
-- cargo test 88 pass・clippy / fmt 緑・`.app` 生成済み（`dist/tako.app`）
+- **たまり場機能（FR-2.15）を完全実装**: × ボタンが kill → 退避に変更、下部ドロワー UI、
+  D&D 復帰、CLI / MCP 4 操作（計 27 ツール）、レイアウト永続化
+- cargo test 92 pass・clippy / fmt 緑
 - **tako 終了 → `scripts/build-app.sh --install` → 再起動** をユーザーに依頼して実機確認
 - 最終更新: 2026-06-14
 
@@ -27,14 +25,10 @@
 - [ ] **FR-2.18 未表示の子の自動サーフェス**
 - [ ] **FR-2.14 MCP ゼロコンフィグオンボーディング**（配布前必須）
 - [ ] **FR-2.17 ネスト tmux の検出・診断・ワンタップ適用**（Phase 7）
-- [ ] **FR-2.15 ターミナルのたまり場**（UI の見せ方をユーザーと相談してから着手）
 
 ## 直近の観点・指摘（実装時に踏みやすい点）
 
 - **CI（GitHub Actions）はリポ設定で意図的に無効化中**（2026-06-12〜）
-- **tmux ポーリングの非同期化パターン**: UI スレッドで `collect_tmux_context()` →
-  background で `fetch_tmux_sessions()` → UI スレッドで `self.tmux_sessions` 適用。
-  dispatch 層（CLI/MCP 用）はそのまま同期で残す
 - **Edit ツールのフックが変更を巻き戻す**: Bash + python3 での一括パッチが安全
 - **インライン編集 UI**: `handle_key` の冒頭で `inline_edit.is_some()` をチェック
 

@@ -28,6 +28,9 @@ pub struct LayoutFile {
     /// 旧ファイルには無いので serde default で後方互換）
     #[serde(default)]
     pub window: Option<WindowFrame>,
+    /// たまり場に退避中のペイン（FR-2.15.5）
+    #[serde(default)]
+    pub shelved: Vec<PaneLayout>,
 }
 
 /// OS ウィンドウのジオメトリ（復元時は起動時のウィンドウ生成オプションに使う）
@@ -136,6 +139,23 @@ pub fn capture(
                 tree: capture_node(tab.tree().root(), meta),
             })
             .collect(),
+        shelved: ws
+            .shelved_panes()
+            .iter()
+            .map(|pane| {
+                let m = meta(pane.id());
+                PaneLayout {
+                    id: pane.id().as_u64(),
+                    session: m.session,
+                    title: pane.title().map(str::to_string),
+                    title_source: title_source_str(pane.title_source()).to_string(),
+                    role: pane.role().map(str::to_string),
+                    origin: origin_str(pane.origin()).to_string(),
+                    cwd: m.cwd,
+                    preview: m.preview,
+                }
+            })
+            .collect(),
     }
 }
 
@@ -217,8 +237,30 @@ pub fn restore(file: &LayoutFile) -> Option<(Workspace, Vec<RestoredPane>)> {
         }
         tabs.push(tab);
     }
+    // たまり場ペインの復元（FR-2.15.5）
+    let mut shelved_panes = Vec::new();
+    for p in &file.shelved {
+        if !pane_ids.insert(p.id) {
+            return None;
+        }
+        let pane = Pane::restore(
+            p.id,
+            parse_origin(&p.origin),
+            p.title.clone(),
+            parse_title_source(&p.title_source),
+            p.role.clone(),
+        );
+        restored.push(RestoredPane {
+            pane: p.id,
+            session: p.session.clone(),
+            cwd: p.cwd.clone(),
+            preview: p.preview.clone(),
+        });
+        shelved_panes.push(pane);
+    }
+
     let active = active.unwrap_or(tabs[0].id());
-    let ws = Workspace::restore(tabs, active)?;
+    let ws = Workspace::restore_with_shelved(tabs, active, shelved_panes)?;
     Some((ws, restored))
 }
 
@@ -456,6 +498,7 @@ mod tests {
             active_tab: 1,
             tabs: vec![],
             window: None,
+            shelved: vec![],
         })
         .is_none());
         // バージョン不一致
