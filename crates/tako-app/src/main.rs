@@ -2574,6 +2574,7 @@ impl TakoApp {
         if let Err(e) = result {
             eprintln!("warning: ファイルを開けない: {e}");
         }
+        self.drain_pending_highlights(cx);
         cx.notify();
     }
 
@@ -2622,6 +2623,13 @@ impl TakoApp {
             });
         })
         .detach();
+    }
+
+    /// UI から直接 dispatch した場合の pending_highlights を処理する
+    fn drain_pending_highlights(&mut self, cx: &mut Context<Self>) {
+        for (pane, path, text) in std::mem::take(&mut self.pending_highlights) {
+            self.spawn_highlight(pane, path, text, cx);
+        }
     }
 
     // --- D&D（FR-2.16.10 tmux セッション取り込み / FR-3.11 ファイルプレビュー） ---
@@ -2772,6 +2780,7 @@ impl TakoApp {
         if let Err(e) = result {
             eprintln!("warning: ファイルを開けない: {e}");
         }
+        self.drain_pending_highlights(cx);
         cx.notify();
     }
 
@@ -4275,22 +4284,11 @@ impl TakoApp {
             )
     }
 
-    /// ハイライト済みコード 1 行 → StyledText（行番号は控えめな色で前置する）
+    /// ハイライト済みコード 1 行（行番号は固定幅左列、本文は残り幅で折り返す）
     fn preview_code_line(&self, line: &preview::Line, number: Option<(usize, usize)>) -> gpui::Div {
         let theme = &self.theme;
         let mut text = String::new();
         let mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
-        if let Some((n, width)) = number {
-            let prefix = format!("{n:>width$}  ");
-            highlights.push((
-                0..prefix.len(),
-                HighlightStyle {
-                    color: Some(hsla_alpha(theme.tab_inactive_foreground, 0.5)),
-                    ..HighlightStyle::default()
-                },
-            ));
-            text.push_str(&prefix);
-        }
         for span in line {
             let start = text.len();
             text.push_str(&span.text);
@@ -4305,13 +4303,33 @@ impl TakoApp {
             }
         }
         if text.is_empty() {
-            // 空行も高さを保つ
             text.push(' ');
         }
-        div()
-            .h(px(theme.line_height))
-            .flex_none()
-            .child(StyledText::new(text).with_default_highlights(&self.text_style(), highlights))
+        let code_el = StyledText::new(text).with_default_highlights(&self.text_style(), highlights);
+        if let Some((n, width)) = number {
+            let num_label = format!("{n:>width$}  ");
+            let num_len = num_label.len();
+            div()
+                .flex()
+                .flex_row()
+                .child(
+                    div()
+                        .flex_none()
+                        .child(StyledText::new(num_label).with_default_highlights(
+                            &self.text_style(),
+                            vec![(
+                                0..num_len,
+                                HighlightStyle {
+                                    color: Some(hsla_alpha(theme.tab_inactive_foreground, 0.5)),
+                                    ..HighlightStyle::default()
+                                },
+                            )],
+                        )),
+                )
+                .child(div().flex_1().min_w(px(0.0)).child(code_el))
+        } else {
+            div().child(code_el)
+        }
     }
 
     /// Markdown インラインスパン列 → (テキスト, ハイライト範囲)
@@ -4414,8 +4432,10 @@ impl TakoApp {
                             .child(SharedString::from(marker.clone())),
                     )
                     .child(
-                        StyledText::new(text)
-                            .with_default_highlights(&self.text_style(), highlights),
+                        div().flex_1().min_w(px(0.0)).child(
+                            StyledText::new(text)
+                                .with_default_highlights(&self.text_style(), highlights),
+                        ),
                     )
                     .into_any_element()
             }
