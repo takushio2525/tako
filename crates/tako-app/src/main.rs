@@ -935,7 +935,13 @@ impl TakoApp {
                     None
                 };
                 let git_selected = app.git_selected_commit.clone();
-                (tmux_ctx, filetree_targets, view_targets, git_cwd, git_selected)
+                (
+                    tmux_ctx,
+                    filetree_targets,
+                    view_targets,
+                    git_cwd,
+                    git_selected,
+                )
             });
             let Ok((tmux_ctx, filetree_targets, view_targets, git_cwd, git_selected)) = prep else {
                 break;
