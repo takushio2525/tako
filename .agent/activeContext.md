@@ -4,89 +4,55 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-06-14・tmux パネル UI 刷新完了）
+## 現在の対象（2026-06-14・コンテキストメニュー + D&D パス挿入完了）
 
-- **統合 tmux ビュー（render_tmux_view）を全面刷新**:
-  ① アコーディオン折りたたみ式タブグループ（panel_collapsed_tabs で状態管理）
-  ② 状態色統一（緑=実行中 / 黄=入力待ち / 赤=エラー / 灰=不明）
-  ③ × ボタンは hover 時のみ表示（group_hover）、ゴミ箱→× に変更
-  ④ GPUI の whitespace_nowrap + text_ellipsis でレスポンシブ省略（固定 truncate 廃止）
-  ⑤ パディング・行間を大幅削減（VSCode サイドバー水準の情報密度）
-  ⑥ セクション区切り線 + 「未表示セッション」ラベルで管理外/kill漏れ? を明確化
-  ⑦ kill 確認を縦積み→横 1 行インライン化（render_kill_confirm）
-- パネル幅のドラッグリサイズは既存機構で動作確認済み
-- D&D（FR-2.16.10）は既存コードをそのまま維持（on_drag / drag_ghost_builder）
+- **FR-3.12 コンテキストメニュー**: ファイルツリーの右クリックで VSCode 風メニュー表示。
+  相対/絶対パスコピー・Finder 表示・ターミナルで cd・名前変更（インラインリネームは
+  InlineEdit 構造体を準備済み、UI の実装は次タスク）・新規ファイル/フォルダ・ゴミ箱送り。
+  全操作は dispatch `FileOp` + CLI `tako file` + MCP `tako_file_op`（計 23 ツール）
+- **FR-3.13 D&D パス挿入**: ファイル・フォルダをターミナルペインへ D&D するとパス文字列を
+  PTY に send（newline: false）。プレビューペインへのドロップは FR-3.11 の既存挙動を維持。
+  ファイルだけでなくフォルダもドラッグ可能に拡張
 - cargo test 88 pass・clippy / fmt 緑・`.app` 反映済み
-- **ユーザーの再起動 + 体感確認待ち**
+- **ユーザーの再起動 + 実機確認待ち**
 - 最終更新: 2026-06-14
+
+## 残作業・既知の制約
+
+- インラインリネーム / 新規ファイル・フォルダの **UI 入力部分は未実装**（`InlineEdit`
+  構造体 + `InlineEditKind` は準備済み。コンテキストメニューから「名前変更」等を選ぶと
+  `self.inline_edit` にセットされるが、テキスト入力 UI の描画は次タスク）
+- コンテキストメニューの位置がサイドバー基準でなくウィンドウ基準になる可能性
+  （GPUI の `position` がウィンドウ座標のため。実機で確認してから調整）
 
 ## 未着手タスク（優先順はユーザーと相談）
 
-- [ ] **Phase 5 続き**: FR-3.6 git graph（git CLI 子プロセス。パネルの git ビュー =
-      プレースホルダを差し替える）→ FR-3.5 軽い編集 / FR-3.10 画像プレビュー /
-      FR-3.9 diff ビューア + FR-2.7 show_file/show_diff
-- [ ] **FR-2.19 localhost ポートパネル**(パネル UI 刷新済みで土台あり。要件登録済み)
-- [ ] **FR-2.18 未表示の子の自動サーフェス**（フェーズ未定。要件登録済み）
-- [ ] **FR-2.14 MCP ゼロコンフィグオンボーディング**（配布前必須。FR-2.14.6 含む）
+- [ ] **インラインリネーム / 新規作成の UI 入力**（InlineEdit の描画。FR-3.12 の残り）
+- [ ] **Phase 5 続き**: FR-3.6 git graph / FR-3.5 軽い編集 / FR-3.9 diff ビューア
+- [ ] **FR-2.19 localhost ポートパネル**
+- [ ] **FR-2.18 未表示の子の自動サーフェス**
+- [ ] **FR-2.14 MCP ゼロコンフィグオンボーディング**（配布前必須）
 - [ ] **FR-2.17 ネスト tmux の検出・診断・ワンタップ適用**（Phase 7）
 - [ ] **FR-2.15 ターミナルのたまり場**（UI の見せ方をユーザーと相談してから着手）
-- [ ] 常用確認: manual-checks.md「ドラッグ&ドロップ 3 件」「ワークスペース機能第 1 弾」
-      「実機バグ 3 件一括修正」各節
-- [ ] 描画のグリッド不一致（全角 advance ≠ セル幅 ×2）の要否判断
-- [ ] プレビューの既知の制約: 長いコード行の横スクロール未対応 / 画像はエラー表示
-      （FR-3.10 で対応）/ ファイル変更の自動リロードなし（開き直しで更新）
 
 ## 直近の観点・指摘（実装時に踏みやすい点）
 
-- **CI（GitHub Actions）はリポ設定で意図的に無効化中**（2026-06-12〜。Actions 無料枠
-  90% 到達のためユーザーが停止。workflow ファイルは有効なまま）。push 後に CI 実行が
-  作成されないのは正常 → CI 待ちポーリングはしない。品質保証はローカルの
-  セルフテスト + `cargo test --workspace` + fmt + clippy 全緑で足りる扱い
-- **UI スレッド同期処理の教訓（2026-06-13）**: syntect ハイライト・read_dir・stat を
-  UI スレッドで同期実行するとフレーム落ちの原因になる。1ms 以上かかる I/O / CPU 計算は
-  background executor へ。詳細は `architecture.md`「UI スレッド同期処理のパフォーマンス教訓」
-- **プレビューペインは terminals に居ない**: `terminals.get(pane)` が None でも正常系。
-  ペイン横断の処理（集約・kill・close）は previews も見ること（close 系 3 経路 +
-  detach_session で previews を掃除済み）。`render_pane` の返り値は `AnyElement` 化済み
-- **dispatch OpenFile はセッション起動を伴わない** → セルフテストで直接 dispatch して
-  よい（Split の pending_attach の罠の対象外。項目 56 コメント参照）。
-  **TmuxOpen はセッション起動を伴う** → 直接 dispatch 後に pending_attach 処理が必要
-- **zsh の equals 展開の罠**: 明示コマンドの引数が `=` で始まると `$SHELL -l -c` 経由で
-  化ける（`tmux attach -t =name` で実測）→ `quote_word` が先頭 `=` を必ずクォートする
-- **GPUI の D&D**: bubble は登録の逆順 → gpui 内部のドラッグ準備リスナー（後登録）は
-  ユーザー listener の stop_propagation より先に走る = タイトルバーの focus 用
-  on_mouse_down と on_drag は共存できる。drop 成立時は on_drop が stop_propagation
-  するためルート on_mouse_up は走らない（非成立時のみそこでドラッグ状態をクリア）
-- **GPUI（taffy）の flex 子は overflow: visible だと自動最小サイズ = min-content**:
-  スクロールしない固定バーを flex 列に置くときは「可変領域に `min_h(0)` +
-  固定バーに `flex_none()`」をセットで付ける（ステータスバー消失バグの教訓）
-- **統合 tmux ビューのデータ層**: `tmux_view_groups()`（タブ枠 + FR-2.16.9 の attach
-  紐付け）+ `tmux_unlisted_sessions()`（管理外 / orphan）。プレビューペインの行ラベルは
-  「📄 ファイル名」
-- **CSI u の送出範囲は `CsiUMode`**（main.rs）: Full = アプリが kitty 要求済み /
-  ModifiedOnly = バックエンドペイン強制（Esc は素の `\e`）/ Off = レガシー
-- **スクロール関連の罠**: ペインターゲットは `=セッション名:`（末尾コロン必須）。
-  extended-keys は always 必須。conf はサーバー起動時のみ → 稼働サーバーへは `sync_conf`
-- **ネスト tmux の推奨設定の正は `tmux_backend::NESTED_TMUX_SNIPPET`**
-- **接続情報**: `instances/control-<pid>.json` + current。CLI は生存候補へ自動フォールバック
-- セルフテストは **120 項目**。IME 項目は稀にフレーク（再実行で緑）
-- gpui ソース参照は `~/.cargo/git/checkouts/zed-*/cafbf4b/crates/gpui*` のみ（Apache-2.0）
+- **CI（GitHub Actions）はリポ設定で意図的に無効化中**（2026-06-12〜）
+- **Edit ツールのフックが変更を巻き戻す**: Bash + python3 での一括パッチが安全。
+  複数ファイルにまたがる変更は Edit ツールではなく Bash で一括適用する
+- **GPUI の ClickEvent.is_right_click()**: `on_click` のクロージャで右クリック判定可能。
+  コンテキストメニューはこれで実装（`on_mouse_down(MouseButton::Right, ...)` ではなく）
+- **D&D パス挿入のエスケープ**: スペース・クォート・括弧を含むパスはシングルクォートで
+  囲む（`shell_escape` パターン）。newline: false で改行なし挿入
+- その他の注意点は前回の activeContext.md を参照
 
 ## 現フェーズで Read すべき設計書
 
-- FR-3.6 git graph 着手時: `architecture.md`「コンセプト②の実現」（git CLI 方式）+
-  `requirements.md` FR-3.6 / FR-2.16（パネルの git ビュー差し替え）
-- FR-3.5 / FR-3.9 / FR-3.10 着手時: `requirements.md` FR-3 実装メモ +
-  `crates/tako-app/src/preview.rs`（プレビュー基盤に乗せる）
-- FR-2.19 ポートパネル着手時: `requirements.md` FR-2.19 + FR-2.16（パネルのビュー追加）
-- スクロール / ネスト tmux / 拡張キーに触るとき: `architecture.md`「スクロール制御」+
-  「実機リグレッション」節 + `requirements.md` FR-2.17
-- 配布・オンボーディング着手時: `roadmap.md` Phase 7 + `requirements.md` FR-2.14 +
-  `concept.md` ビジョン節
+- インラインリネーム着手時: `crates/tako-app/src/main.rs`（`InlineEdit` / `InlineEditKind`）
+- FR-3.6 git graph 着手時: `architecture.md`「コンセプト②の実現」
+- 配布・オンボーディング着手時: `roadmap.md` Phase 7
 
 ## 関連ファイル / リンク
 
 - リポジトリ: https://github.com/takushio2525/tako（private）
 - 仕様一式: `.agent/concept.md` / `requirements.md` / `architecture.md` / `roadmap.md`
-- 手動チェック: `.agent/manual-checks.md` / .app 生成: `scripts/build-app.sh`
-- MCP 実機検証: `scripts/verify-claude-mcp.sh`
