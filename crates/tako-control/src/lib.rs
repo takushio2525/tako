@@ -17,7 +17,7 @@ pub mod mcp;
 pub mod protocol;
 pub mod settings;
 
-pub use dispatch::{dispatch, ControlHost, DispatchError};
+pub use dispatch::{dispatch, fetch_tmux_sessions, ControlHost, DispatchError, TmuxContext};
 pub use ipc::{IncomingRequest, IpcServer};
 pub use mcp::McpServer;
 

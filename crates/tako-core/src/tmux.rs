@@ -123,6 +123,12 @@ pub fn list_sessions(socket: Option<&str>) -> Vec<TmuxSession> {
     parse_sessions(&sessions, &windows, &clients)
 }
 
+/// セッションの存在確認（`has-session`、1 コマンド）。
+/// `list_sessions`（3 コマンド）よりはるかに軽量
+pub fn has_session(socket: Option<&str>, name: &str) -> bool {
+    run_tmux(socket, &["has-session", "-t", &format!("={name}")]).is_ok()
+}
+
 /// セッションを kill する。誤爆防止の確認は呼び出し側（UI / AI）の責務
 pub fn kill_session(socket: Option<&str>, name: &str) -> Result<(), String> {
     run_tmux(socket, &["kill-session", "-t", &format!("={name}")]).map(|_| ())

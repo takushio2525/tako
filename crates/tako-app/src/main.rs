@@ -845,31 +845,53 @@ impl TakoApp {
         })
         .detach();
 
-        // パネルの tmux 一覧表示中は 2 秒毎に更新する（FR-2.13。非表示中は何もしない）。
-        // ファイルツリー（FR-3.1）の内容追従も同じ間隔で行う（I/O は background）
+        // 2 秒毎の定期更新: tmux 一覧（FR-2.13）+ ファイルツリー（FR-3.1）。
+        // tmux コマンド実行（6 サブプロセス、計 25〜50ms）は background で行い、
+        // UI スレッドではコンテキスト収集と結果適用のみ（< 1ms）
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(2)).await;
-            // ① main thread: tmux 更新 + root 同期 + スキャン対象収集
-            let targets = this.update(cx, |app: &mut TakoApp, cx| {
-                if app.panel_visible && app.panel_view == PanelView::Tmux {
-                    app.refresh_tmux(cx);
-                }
+            // ① main thread: tmux コンテキスト + filetree 対象を収集（高速）
+            let prep = this.update(cx, |app: &mut TakoApp, _| {
+                let tmux_ctx = if app.panel_visible && app.panel_view == PanelView::Tmux {
+                    Some(app.collect_tmux_context())
+                } else {
+                    None
+                };
                 app.sync_filetree_roots();
                 app.save_layout();
-                if app.filetree.visible {
+                let filetree_targets = if app.filetree.visible {
                     Some(app.filetree.refresh_targets())
                 } else {
                     None
-                }
+                };
+                (tmux_ctx, filetree_targets)
             });
-            let Ok(targets) = targets else { break };
-            // ② background: ディレクトリ読み取り（read_dir + stat）
-            if let Some(targets) = targets {
+            let Ok((tmux_ctx, filetree_targets)) = prep else {
+                break;
+            };
+            // ② background: tmux コマンド実行 + ディレクトリ読み取り
+            let tmux_result = if let Some(ctx) = tmux_ctx {
+                let task = cx
+                    .background_executor()
+                    .spawn(async move { tako_control::fetch_tmux_sessions(&ctx) });
+                Some(task.await)
+            } else {
+                None
+            };
+            if let Some(sessions) = tmux_result {
+                let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                    app.tmux_sessions = sessions;
+                    cx.notify();
+                });
+                if ok.is_err() {
+                    break;
+                }
+            }
+            if let Some(targets) = filetree_targets {
                 let task = cx
                     .background_executor()
                     .spawn(async move { filetree::scan_dirs(&targets) });
                 let results = task.await;
-                // ③ main thread: 結果適用
                 let ok = this.update(cx, |app: &mut TakoApp, cx| {
                     if app.filetree.apply_refresh(results) {
                         cx.notify();
@@ -1310,7 +1332,8 @@ impl TakoApp {
         cx.notify();
     }
 
-    /// tmux 一覧の取得だけ（再描画通知なし。dispatch 内から呼べる形）
+    /// tmux 一覧の取得だけ（再描画通知なし。dispatch 内から呼べる形。
+    /// CLI / MCP 経由の同期更新と、パネルタブ切替時の即時更新に使う）
     fn refresh_tmux_data(&mut self) {
         let value = tako_control::dispatch(
             self,
@@ -1319,6 +1342,36 @@ impl TakoApp {
         )
         .unwrap_or_else(|_| serde_json::json!({ "sessions": [] }));
         self.tmux_sessions = value["sessions"].as_array().cloned().unwrap_or_default();
+    }
+
+    /// background thread で tmux セッション一覧を取得するためのコンテキストを収集する。
+    /// UI スレッドでの実行コスト: pane/tab の走査のみ（< 0.1ms）
+    fn collect_tmux_context(&self) -> tako_control::TmuxContext {
+        let ws = &self.workspace;
+        let pane_of_tty: Vec<(String, u64, u64)> = ws
+            .tabs()
+            .iter()
+            .flat_map(|tab| {
+                tab.tree().panes().into_iter().filter_map(|p| {
+                    let tty = self.terminals.get(&p.id())?.tty_name()?;
+                    Some((tty.to_string(), p.id().as_u64(), tab.id().as_u64()))
+                })
+            })
+            .collect();
+        let backend_of: Vec<(String, u64, u64)> = ws
+            .tabs()
+            .iter()
+            .flat_map(|tab| {
+                tab.tree().panes().into_iter().filter_map(|p| {
+                    let name = self.backend_sessions.get(&p.id())?.clone();
+                    Some((name, p.id().as_u64(), tab.id().as_u64()))
+                })
+            })
+            .collect();
+        tako_control::TmuxContext {
+            pane_of_tty,
+            backend_of,
+        }
     }
 
     /// 統合 tmux ビューのペイン行ゴミ箱の確認済み kill（FR-2.16.7）。

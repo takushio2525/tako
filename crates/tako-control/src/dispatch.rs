@@ -422,11 +422,9 @@ pub fn dispatch(
             direction,
         } => {
             // 存在しないセッション名は分割前に弾く（D&D 経路では起こらないが、
-            // CLI / MCP からのタイポで空ペインだけが生えるのを防ぐ）
-            let exists = tako_core::tmux::list_sessions(socket.as_deref())
-                .iter()
-                .any(|s| s.name == session);
-            if !exists {
+            // CLI / MCP からのタイポで空ペインだけが生えるのを防ぐ）。
+            // has-session（1 コマンド）で確認（旧 list_sessions は 3 コマンドで重かった）
+            if !tako_core::tmux::has_session(socket.as_deref(), &session) {
                 return Err(DispatchError::Operation(format!(
                     "tmux セッション {session} が見つからない（socket: {}）",
                     socket.as_deref().unwrap_or("既定")
@@ -1048,6 +1046,60 @@ fn origin_str(origin: PaneOrigin) -> &'static str {
         PaneOrigin::Mcp => "mcp",
         PaneOrigin::Suggestion => "suggestion",
     }
+}
+
+/// UI スレッドで収集した pane/backend 対応表。`fetch_tmux_sessions` に渡す
+pub struct TmuxContext {
+    pub pane_of_tty: Vec<(String, u64, u64)>,
+    pub backend_of: Vec<(String, u64, u64)>,
+}
+
+/// tmux セッション一覧を取得して JSON 配列を返す。
+/// tmux コマンド実行（重い）を含むため、**background thread で呼ぶこと**。
+/// dispatch の TmuxList と同じ JSON 構造を返す
+pub fn fetch_tmux_sessions(ctx: &TmuxContext) -> Vec<Value> {
+    let session_json = |s: &tako_core::TmuxSession, backend: bool, socket: &Value| {
+        let clients: Vec<Value> = s
+            .client_ttys
+            .iter()
+            .map(|tty| {
+                let hit = ctx.pane_of_tty.iter().find(|(t, _, _)| t == tty);
+                json!({
+                    "tty": tty,
+                    "pane": hit.map(|(_, pane, _)| *pane),
+                    "tab": hit.map(|(_, _, tab)| *tab),
+                })
+            })
+            .collect();
+        let owner = ctx.backend_of.iter().find(|(name, _, _)| *name == s.name);
+        json!({
+            "name": s.name,
+            "created": s.created,
+            "attached": s.attached,
+            "backend": backend,
+            "socket": socket,
+            "backend_pane": owner.map(|(_, pane, _)| *pane),
+            "backend_tab": owner.map(|(_, _, tab)| *tab),
+            "windows": s.windows.iter().map(|w| json!({
+                "index": w.index,
+                "name": w.name,
+                "active": w.active,
+                "panes": w.panes,
+            })).collect::<Vec<_>>(),
+            "clients": clients,
+        })
+    };
+    let backend_socket = tako_core::tmux_backend::socket_name();
+    let mut sessions: Vec<Value> = tako_core::tmux::list_sessions(None)
+        .iter()
+        .map(|s| session_json(s, false, &Value::Null))
+        .collect();
+    sessions.extend(
+        tako_core::tmux::list_sessions(Some(&backend_socket))
+            .iter()
+            .map(|s| session_json(s, true, &backend_socket.clone().into())),
+    );
+    sessions
 }
 
 #[cfg(test)]
