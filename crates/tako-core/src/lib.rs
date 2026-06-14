@@ -3,6 +3,7 @@
 //! Workspace / Tab / PaneTree / Pane / TerminalSession / Theme / Screen を提供する。
 //! GPUI への依存はここに置かない（GPUI 破壊的変更リスクの防波堤。`.agent/architecture.md`）。
 
+pub mod git;
 pub mod osc_tap;
 pub mod pane;
 pub mod pane_tree;
@@ -18,6 +19,10 @@ pub mod tmux;
 pub mod tmux_backend;
 pub mod workspace;
 
+pub use git::{
+    DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffTarget, GitBranch, GitCommit, GitStatus,
+    GitStatusEntry,
+};
 pub use osc_tap::{OscEvent, PromptMark};
 pub use pane::{Pane, PaneId, PaneOrigin, TitleSource};
 pub use pane_tree::{
