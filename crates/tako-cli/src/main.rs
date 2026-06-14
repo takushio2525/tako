@@ -75,6 +75,9 @@ enum Command {
     /// 右サイドバー情報パネル（tmux 一覧 / agents 集約センター）の表示・幅・ビュー切替。
     /// 引数なしで現在状態を表示する
     Panel(PanelArgs),
+    /// ファイルシステム操作（FR-3.12）
+    #[command(subcommand)]
+    File(FileCommand),
     /// tmux セッションの一覧・kill（FR-2.13。消し忘れ tmux の発見と片付け）
     #[command(subcommand)]
     Tmux(TmuxCommand),
@@ -129,6 +132,17 @@ enum TmuxCommand {
         #[arg(long, conflicts_with_all = ["right", "down", "up"])]
         left: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum FileCommand {
+    CopyPath { path: String, #[arg(long)] relative: bool, #[arg(long)] pane: Option<u64> },
+    Reveal { path: String },
+    OpenTerminal { path: String, #[arg(long)] pane: Option<u64> },
+    Rename { path: String, name: String },
+    Create { path: String, name: String },
+    Mkdir { path: String, name: String },
+    Trash { path: String },
 }
 
 #[derive(Subcommand)]
@@ -665,9 +679,26 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 _ => Some(Direction::Right),
             },
         },
+        Command::File(FileCommand::CopyPath { path, relative, pane }) => {
+            let abs = resolve_cli_path(path);
+            if *relative { Request::FileOp { op: tako_control::protocol::FileOpKind::CopyRelativePath, path: abs, name: None, pane: target_pane(*pane)? } }
+            else { Request::FileOp { op: tako_control::protocol::FileOpKind::CopyAbsolutePath, path: abs, name: None, pane: None } }
+        }
+        Command::File(FileCommand::Reveal { path }) => Request::FileOp { op: tako_control::protocol::FileOpKind::Reveal, path: resolve_cli_path(path), name: None, pane: None },
+        Command::File(FileCommand::OpenTerminal { path, pane }) => Request::FileOp { op: tako_control::protocol::FileOpKind::OpenTerminal, path: resolve_cli_path(path), name: None, pane: target_pane(*pane)? },
+        Command::File(FileCommand::Rename { path, name }) => Request::FileOp { op: tako_control::protocol::FileOpKind::Rename, path: resolve_cli_path(path), name: Some(name.clone()), pane: None },
+        Command::File(FileCommand::Create { path, name }) => Request::FileOp { op: tako_control::protocol::FileOpKind::CreateFile, path: resolve_cli_path(path), name: Some(name.clone()), pane: None },
+        Command::File(FileCommand::Mkdir { path, name }) => Request::FileOp { op: tako_control::protocol::FileOpKind::CreateDir, path: resolve_cli_path(path), name: Some(name.clone()), pane: None },
+        Command::File(FileCommand::Trash { path }) => Request::FileOp { op: tako_control::protocol::FileOpKind::Trash, path: resolve_cli_path(path), name: None, pane: None },
         // main() で mcp_serve() へ分岐済みのため論理的に到達不能
         Command::Mcp(_) => unreachable!("mcp serve は run() を通らない"),
     })
+}
+
+fn resolve_cli_path(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    if p.is_relative() { std::env::current_dir().map(|cwd| cwd.join(p).display().to_string()).unwrap_or_else(|_| path.to_string()) }
+    else { path.to_string() }
 }
 
 /// 環境変数から接続情報を読み、1 リクエストを往復させる
@@ -755,6 +786,8 @@ fn print_result(command: &Command, result: &Value) {
         Command::Tmux(TmuxCommand::Kill { .. }) | Command::Tmux(TmuxCommand::Open { .. }) => {
             println!("{result}")
         }
+        Command::File(FileCommand::CopyPath { .. }) => { if let Some(p) = result["path"].as_str() { println!("{p}"); } }
+        Command::File(_) => println!("{result}"),
         _ => {}
     }
 }

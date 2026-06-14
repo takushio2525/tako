@@ -246,6 +246,13 @@ pub enum Request {
         mode: Option<PreviewModeWire>,
         direction: Option<Direction>,
     },
+    /// ファイルシステム操作（FR-3.12）
+    FileOp {
+        op: FileOpKind,
+        path: String,
+        name: Option<String>,
+        pane: Option<u64>,
+    },
 }
 
 /// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。
@@ -313,6 +320,14 @@ impl ResponseEnvelope {
             }),
         }
     }
+}
+
+/// ファイルシステム操作の種別（FR-3.12）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileOpKind {
+    CopyAbsolutePath, CopyRelativePath, Reveal, OpenTerminal,
+    Rename, CreateFile, CreateDir, Trash,
 }
 
 #[cfg(test)]

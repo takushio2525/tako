@@ -13,7 +13,7 @@ use tako_core::{
     SplitDirection, TabId, TerminalSession, Workspace,
 };
 
-use crate::protocol::{error_code, Direction, PreviewModeWire, Request};
+use crate::protocol::{error_code, Direction, FileOpKind, PreviewModeWire, Request};
 
 /// dispatch がドメイン状態へ触るためのホスト。UI 層（tako-app）とテストが実装する
 pub trait ControlHost {
@@ -680,6 +680,126 @@ pub fn dispatch(
                 "created": created,
             }))
         }
+Request::FileOp { op, path, name, pane } => {
+            let path = std::path::PathBuf::from(&path);
+            match op {
+                FileOpKind::CopyAbsolutePath => {
+                    let abs = if path.is_absolute() { path } else {
+                        std::env::current_dir().unwrap_or_default().join(&path)
+                    };
+                    Ok(json!({ "path": abs.display().to_string() }))
+                }
+                FileOpKind::CopyRelativePath => {
+                    let abs = if path.is_absolute() { path.clone() } else {
+                        std::env::current_dir().unwrap_or_default().join(&path)
+                    };
+                    let rel = if let Some(pane_id) = pane {
+                        let (_, target) = resolve_pane(host.workspace(), Some(pane_id))?;
+                        host.session(target)
+                            .and_then(|s| s.cwd())
+                            .and_then(|cwd| pathdiff::diff_paths(&abs, cwd))
+                            .unwrap_or_else(|| abs.clone())
+                    } else { abs.clone() };
+                    Ok(json!({ "path": rel.display().to_string() }))
+                }
+                FileOpKind::Reveal => {
+                    if !path.exists() {
+                        return Err(DispatchError::Operation(format!("パスが存在しない: {}", path.display())));
+                    }
+                    #[cfg(target_os = "macos")]
+                    { std::process::Command::new("open").arg("-R").arg(&path).spawn()
+                        .map_err(|e| DispatchError::Operation(format!("Finder を開けない: {e}")))?; }
+                    #[cfg(not(target_os = "macos"))]
+                    { return Err(DispatchError::Operation("Finder で表示は macOS のみ対応".into())); }
+                    Ok(json!({ "revealed": path.display().to_string() }))
+                }
+                FileOpKind::OpenTerminal => {
+                    let dir = if path.is_dir() { path.clone() } else {
+                        path.parent().map(|p| p.to_path_buf()).unwrap_or(path.clone())
+                    };
+                    let (_, target) = resolve_pane(host.workspace(), pane)?;
+                    host.session(target).ok_or(DispatchError::NoSession(target.as_u64()))?;
+                    let cd_text = format!("cd {}\r", shell_escape(&dir.display().to_string()));
+                    if let Some(session) = host.session(target) {
+                        session.write(cd_text.as_bytes());
+                    }
+                    Ok(json!({ "pane": target.as_u64(), "cwd": dir.display().to_string() }))
+                }
+                FileOpKind::Rename => {
+                    let new_name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+                    if new_name.is_empty() || new_name.contains('/') || new_name.contains('\\') {
+                        return Err(DispatchError::InvalidParams("無効なファイル名".into()));
+                    }
+                    let parent = path.parent().ok_or(DispatchError::Operation("親ディレクトリが取得できない".into()))?;
+                    let new_path = parent.join(&new_name);
+                    if new_path.exists() {
+                        return Err(DispatchError::Operation(format!("既に存在する: {}", new_path.display())));
+                    }
+                    std::fs::rename(&path, &new_path).map_err(|e| DispatchError::Operation(format!("リネームに失敗: {e}")))?;
+                    Ok(json!({ "old": path.display().to_string(), "new": new_path.display().to_string() }))
+                }
+                FileOpKind::CreateFile => {
+                    let file_name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+                    if file_name.is_empty() || file_name.contains('/') || file_name.contains('\\') {
+                        return Err(DispatchError::InvalidParams("無効なファイル名".into()));
+                    }
+                    let parent = if path.is_dir() { path.clone() } else {
+                        path.parent().map(|p| p.to_path_buf()).unwrap_or(path.clone())
+                    };
+                    let new_path = parent.join(&file_name);
+                    if new_path.exists() {
+                        return Err(DispatchError::Operation(format!("既に存在する: {}", new_path.display())));
+                    }
+                    std::fs::File::create(&new_path).map_err(|e| DispatchError::Operation(format!("ファイル作成に失敗: {e}")))?;
+                    Ok(json!({ "created": new_path.display().to_string() }))
+                }
+                FileOpKind::CreateDir => {
+                    let dir_name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+                    if dir_name.is_empty() || dir_name.contains('/') || dir_name.contains('\\') {
+                        return Err(DispatchError::InvalidParams("無効なフォルダ名".into()));
+                    }
+                    let parent = if path.is_dir() { path.clone() } else {
+                        path.parent().map(|p| p.to_path_buf()).unwrap_or(path.clone())
+                    };
+                    let new_path = parent.join(&dir_name);
+                    if new_path.exists() {
+                        return Err(DispatchError::Operation(format!("既に存在する: {}", new_path.display())));
+                    }
+                    std::fs::create_dir(&new_path).map_err(|e| DispatchError::Operation(format!("フォルダ作成に失敗: {e}")))?;
+                    Ok(json!({ "created": new_path.display().to_string() }))
+                }
+                FileOpKind::Trash => {
+                    if !path.exists() {
+                        return Err(DispatchError::Operation(format!("パスが存在しない: {}", path.display())));
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        let posix = path.display().to_string();
+                        let script = format!("tell application \"Finder\" to delete (POSIX file \"{}\" as alias)", posix.replace('\\', "\\\\").replace('"', "\\\""));
+                        let out = std::process::Command::new("osascript").arg("-e").arg(&script).output()
+                            .map_err(|e| DispatchError::Operation(format!("ゴミ箱への移動に失敗: {e}")))?;
+                        if !out.status.success() {
+                            let msg = String::from_utf8_lossy(&out.stderr);
+                            return Err(DispatchError::Operation(format!("ゴミ箱への移動に失敗: {msg}")));
+                        }
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        std::fs::remove_file(&path).or_else(|_| std::fs::remove_dir_all(&path))
+                            .map_err(|e| DispatchError::Operation(format!("削除に失敗: {e}")))?;
+                    }
+                    Ok(json!({ "trashed": path.display().to_string() }))
+                }
+            }
+        }
+    }
+}
+
+fn shell_escape(s: &str) -> String {
+    if s.chars().all(|c| c.is_alphanumeric() || c == '/' || c == '.' || c == '-' || c == '_') {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
     }
 }
 

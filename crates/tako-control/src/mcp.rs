@@ -496,6 +496,21 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_file_op",
+            "description": "ファイルシステム操作（FR-3.12）。op で操作種別を指定する",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "op": { "type": "string", "enum": ["copy_absolute_path","copy_relative_path","reveal","open_terminal","rename","create_file","create_dir","trash"] },
+                    "path": { "type": "string", "description": "対象パス（必須）" },
+                    "name": { "type": "string" },
+                    "pane": pane_schema("cd 先ペイン"),
+                },
+                "required": ["op", "path"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_persist",
             "description": "セッション永続化 = tmux バックエンド（FR-5）の ON/OFF を切り替える\
                 （enabled 省略時は現在状態の取得のみ）。有効時、各ペインは tako 専用 tmux\
@@ -658,6 +673,28 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             },
             direction: direction_arg(args)?,
         },
+        "tako_file_op" => {
+            let op_str = str_arg(args, "op")?.ok_or("op を指定する")?;
+            let op = match op_str.as_str() {
+                "copy_absolute_path" => crate::protocol::FileOpKind::CopyAbsolutePath,
+                "copy_relative_path" => crate::protocol::FileOpKind::CopyRelativePath,
+                "reveal" => crate::protocol::FileOpKind::Reveal,
+                "open_terminal" => crate::protocol::FileOpKind::OpenTerminal,
+                "rename" => crate::protocol::FileOpKind::Rename,
+                "create_file" => crate::protocol::FileOpKind::CreateFile,
+                "create_dir" => crate::protocol::FileOpKind::CreateDir,
+                "trash" => crate::protocol::FileOpKind::Trash,
+                other => return Err(format!("op が不正: {other}")),
+            };
+            Request::FileOp {
+                op, path: str_arg(args, "path")?.ok_or("path を指定する")?,
+                name: str_arg(args, "name")?,
+                pane: match op {
+                    crate::protocol::FileOpKind::OpenTerminal | crate::protocol::FileOpKind::CopyRelativePath => Some(target_pane(args, caller)?),
+                    _ => None,
+                },
+            }
+        }
         "tako_panel" => Request::Panel {
             visible: bool_arg(args, "visible")?,
             width: f32_arg(args, "width")?,
