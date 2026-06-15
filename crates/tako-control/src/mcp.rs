@@ -140,9 +140,11 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_list_panes",
             "description": "タブとペインのツリー構造・ジオメトリ（位置・サイズ・分割比率）・\
-                状態（タイトル・role・origin・フォーカス・cwd・state・listen_ports）を JSON で返す。\
+                状態（タイトル・role・origin・フォーカス・cwd・state・listen_ports・surface）を JSON で返す。\
                 state はシェル統合（OSC 133）由来で idle / running / failed（exit_code 付き）\
-                / unknown（統合なし）。listen_ports はペイン配下プロセスが listen 中の\
+                / unknown（統合なし）。surface はそのペインが前面表示中か裏で実行中かの分類で\
+                foreground（アクティブタブ所属＝画面に出ている）/ background（非アクティブタブ＝裏で実行中）。\
+                listen_ports はペイン配下プロセスが listen 中の\
                 TCP ポート（dev サーバーの起動検知に使える）。エージェントや dev サーバーの\
                 実行状況の把握に使える。\
                 ペインを操作する前にまずこれを呼び、現状のレイアウトとペイン ID を把握すること。",
@@ -612,7 +614,8 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_unshelve_pane",
             "description": "たまり場のペインを画面に復帰させる。target ペインの\
-                direction 側を分割して表示する。退避中に使いたくなったペインを取り出すのに使う。",
+                direction 側を分割して表示する。target 省略時は退避元（由来）タブへ戻す\
+                （由来タブが閉じていればアクティブタブ）。退避中に使いたくなったペインを取り出すのに使う。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -627,7 +630,9 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_shelved_list",
             "description": "たまり場に退避中のペイン一覧を取得する。各ペインの\
-                ID / title / role / state / cwd を返す。",
+                ID / title / role / state / cwd に加え、由来タブ（origin_tab / origin_tab_title）と\
+                surface（常に background = 裏で実行中）を返す。退避ペインはこの由来タブで\
+                グループ分けして表示され、tako_unshelve_pane で由来タブへ戻せる。",
             "inputSchema": {
                 "type": "object",
                 "properties": {},

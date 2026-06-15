@@ -397,7 +397,7 @@ struct ShelveArgs {
 struct UnshelveArgs {
     /// 復帰させるペインの ID（tako shelved で確認）
     pane: u64,
-    /// 挿入先ペインの ID（省略時はフォーカス中ペイン）
+    /// 挿入先ペインの ID（省略時は退避元の由来タブ。閉じていればアクティブタブ）
     #[arg(long)]
     target: Option<u64>,
     /// 分割方向（right / down / left / up。省略時は right）

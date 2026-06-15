@@ -349,6 +349,7 @@ Phase 3 設計時の指針:
 | FR-2.15.3 | ドラッグ & ドロップでたまり場 → タブ内ペインへ復帰できる | M | ✅ 2026-06-14 |
 | FR-2.15.4 | AI も MCP / CLI から出し入れできる（邪魔なペインを退避させる・成果物をたまり場から取り出してユーザーに見せる、という tako のコンセプト操作。開発不変条件） | M | ✅ 2026-06-14 |
 | FR-2.15.5 | たまり場の中身もレイアウト永続化（FR-5.2）の対象にする（再起動で復元） | S | ✅ 2026-06-14 |
+| FR-2.15.6 | **退避のタブ別分離**: 退避ペインは退避元（由来）タブを記録し、たまり場を**由来タブごとに分離**して見せる。① 統合 tmux ビュー（FR-2.16.6）では各タブ枠内に「そのタブ由来の退避ペイン」を**バックグラウンド行**（親タブはタブ枠が明示）として表示し、由来タブが既に閉じている退避は「タブ \<名前\>（閉じたタブ）」グループにまとめる ② たまり場ドロワーは由来タブごとにグループ見出し付きで横並び表示する ③ 復帰は既定で由来タブへ戻す（閉じていればアクティブタブ）。状態取得・操作は `tako_shelved_list` の `origin_tab` / `origin_tab_title` と `tako_unshelve_pane`（target 省略＝由来タブ）で AI からも可能（開発不変条件） | M | ✅ 2026-06-15 |
 
 実装メモ（2026-06-14）:
 
@@ -361,8 +362,11 @@ Phase 3 設計時の指針:
   kill。タイトルバー D&D / ペインエリアへのドロップで復帰
 - ペイン側の操作分離（2026-06-15）: ペインタイトルバーに ー（退避 = `shelve_pane_button`）と
   ×（kill = `close_pane_button` → `remove_pane`）を併置。タブバーの ー / × と挙動を統一
-- データモデル: `Workspace::shelved: Vec<Pane>`。`shelve_pane()` / `unshelve_pane()` /
-  `remove_shelved()`。ターミナルセッションは `terminals` HashMap に残したまま（kill しない）
+- データモデル: `Workspace::shelved: Vec<ShelvedPane>`（`ShelvedPane` = ペイン + 由来タブ
+  `origin_tab` / `origin_tab_title` のスナップショット。FR-2.15.6 タブ別分離用。由来タブは
+  退避でタブごと閉じることがあるため ID に加えタブ名を保持）。`shelve_pane()` /
+  `unshelve_pane()`（target 省略＝由来タブへ復帰）/ `remove_shelved()` /
+  `shelved_origin_tab()`。ターミナルセッションは `terminals` HashMap に残したまま（kill しない）
 - dispatch: `Shelve` / `Unshelve` / `ShelvedList` / `ShelvedKill` の 4 リクエスト
 - CLI: `tako shelve` / `tako unshelve <pane>` / `tako shelved`（一覧）
 - MCP: `tako_shelve_pane` / `tako_unshelve_pane` / `tako_shelved_list` / `tako_shelved_kill`
@@ -386,9 +390,10 @@ Phase 3 設計時の指針:
 | FR-2.16.6 | **パネル内部タブの 1 本化**: 中身が表示される現 agents ビューを「**tmux**」へリネームし、空表示バグのある旧 tmuxview を削除して統合する。統合後の理想表示 = tako の**タブごとに「タブ名ラベル付きの四角枠」で囲い、枠内にそのタブの全ペインを並べる入れ子表示** | M | ✅ 2026-06-12 |
 | FR-2.16.7 | 統合ビューの各ペイン行の右に**ゴミ箱ボタン** →「kill していいですか?」**確認 → kill**（dispatch 経由）。行が横幅を超える場合は**折り返しまたは省略（…）で見切れさせない**。tmux セッション列挙が正しく動くことを保証する（**旧 tmuxview の空表示バグの解消**を含む） | M | ✅ 2026-06-12 |
 | FR-2.16.8 | 統合 tmux ビューに**どのタブにも表示されていないものを検知・表示するセクション**を設ける。対象は (a) **tako 管理外**の tmux セッション（ユーザーが直接立てたもの等）と (b) **kill 漏れ?** = tako から起動されたが対応ペインを失った orphan バックエンドセッション。両者をラベルで見た目区別し、どちらも**確認つき kill** ができる（FR-2.18 の自動サーフェスとは別物 = こちらは可視化と手動 kill） | M | ✅ 2026-06-12 |
-| FR-2.16.9 | **タブ内 attach 済みセッションのタブ紐付け表示**: tako ペイン内で `tmux attach` されている外部 tmux セッション（例: orchestrator の master セッションを別サーバーから attach）は「管理外」へ落とさず、attach クライアントの tty と tako ペインの tty 突き合わせで**該当タブの枠内に紐付けて表示**する（セッション名 + attach 先ペイン + window 一覧。window 単位の確認つき kill も可能）。CLI / MCP は既存 `tako tmux list` / `tako_tmux_list` の `clients[].tab/pane` で同じ対応情報を取得できる（新規操作なし = 開発不変条件充足） | M | ✅ 2026-06-13 |
+| FR-2.16.9 | **タブ内 attach 済みセッションのタブ紐付け表示**: tako ペイン内で `tmux attach` されている外部 tmux セッション（例: orchestrator の master セッションを別サーバーから attach）は「管理外」へ落とさず、attach クライアントの tty と tako ペインの tty 突き合わせで**該当タブの枠内に紐付けて表示**する（セッション名 + window 一覧。window 単位の確認つき kill も可能）。**2026-06-15 二重化解消**: セッションを独立ブロックで重複表示せず、**ホストペイン行の下にインデントして入れ子表示**し（ホスト行が「どのペインが attach しているか」を示すので「ペイン N で attach 中」は省く）、ホスト行の detail にセッション名を出して **1 セッション = タブツリー上 1 箇所**に統合する。CLI / MCP は既存 `tako tmux list` / `tako_tmux_list` の `clients[].tab/pane` で同じ対応情報を取得できる（新規操作なし = 開発不変条件充足） | M | ✅ 2026-06-13 / 2026-06-15 統合 |
 | FR-2.16.10 | **tmux セッションの D&D 取り込み**: 統合 tmux ビューに並ぶセッション（タブ枠内の attach 済み・管理外・kill 漏れ? のすべて）を**ドラッグ&ドロップで現在のタブ内へ取り込み、ドロップ位置のペインを分割して表示**できる。実体は新ペインで `TMUX= tmux [-L socket] attach-session` クライアントを起動する（= ネスト attach。多重 attach は tmux の通常動作として許容）。**ドラッグ中はドロップ先ペインのハイライト + 挿入プレビュー必須**: カーソル位置の象限（上下左右）から分割方向を判定し、「ドロップしたら新ペインが占める半面」を強調表示してラベルで結果を示す。同等操作は dispatch `TmuxOpen` + CLI `tako tmux open` + MCP `tako_tmux_open`（開発不変条件） | M | ✅ 2026-06-13 |
 | FR-2.16.11 | **orphan tmux セッションの一括クリーンアップ**: 前回クラッシュ等で取り残された tako 由来の裸のバックエンドセッションを掃除する。**起動時に自動実行**するほか、同等操作を dispatch `TmuxCleanup` + CLI `tako tmux cleanup` + MCP `tako_tmux_cleanup`（開発不変条件）で公開する。対象は backend socket 上の **`tako-` プレフィックス・detached・非 grouped・protected 外**のみで、使用中（attached）・表示中ビュー（grouped）・ユーザーの実セッション（既定サーバー・非 `tako-` 名）には構造上一切触れない | M | ✅ 2026-06-15 |
+| FR-2.16.12 | **子の表示分類（表示中 / バックグラウンド）**: 統合 tmux ビューの各ペイン行に、前面表示中か裏で実行中かのバッジを付ける。**foreground（表示中）= アクティブタブ所属（タイル表示で画面に出ている）**、**background（バックグラウンド）= 非アクティブタブ所属または退避中**。バックグラウンドの子は親（タブ枠 / 由来タブ）が表示位置で明示される。状態取得は `tako list` / `tako_list_panes` の各ペイン `surface`（`foreground` / `background`）で AI からも可能（開発不変条件。退避ペインは `tako_shelved_list` の `surface` が常に `background`） | M | ✅ 2026-06-15 |
 
 実装メモ（FR-2.16.4〜2.16.8。2026-06-12 仕様化・同日実装）:
 

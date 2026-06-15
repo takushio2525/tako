@@ -23,8 +23,59 @@ pub enum WorkspaceError {
 pub struct Workspace {
     tabs: Vec<Tab>,
     active: TabId,
-    /// たまり場（FR-2.15）: タブから外したがプロセスは生きているペイン
-    shelved: Vec<Pane>,
+    /// たまり場（FR-2.15）: タブから外したがプロセスは生きているペイン。
+    /// 由来タブごとに分離表示する（FR-2.15.6）ため `ShelvedPane` で由来を保持する
+    shelved: Vec<ShelvedPane>,
+}
+
+/// たまり場へ退避したペイン（FR-2.15）。「タブ別分離」表示（タブツリー・ドロワー）と
+/// 由来タブへの復帰のため由来タブを記録する。退避でタブごと閉じることがあり
+/// 由来タブが実在しないこともあるため、ID に加えてタブ名をスナップショットしておく
+#[derive(Debug)]
+pub struct ShelvedPane {
+    pane: Pane,
+    /// 退避元タブの ID（既に閉じられている場合もある）
+    origin_tab: TabId,
+    /// 退避時点のタブ名（閉じたタブ由来でも親タブを明記できるよう保持する）
+    origin_tab_title: String,
+}
+
+impl ShelvedPane {
+    /// 退避ペインを由来タブ情報とともに包む（退避時・レイアウト復元時の両方で使う）
+    pub fn from_pane(pane: Pane, origin_tab: TabId, origin_tab_title: String) -> Self {
+        Self {
+            pane,
+            origin_tab,
+            origin_tab_title,
+        }
+    }
+
+    /// 退避ペイン本体（タイトル・role・origin・title_source 等の参照に使う）
+    pub fn pane(&self) -> &Pane {
+        &self.pane
+    }
+
+    pub fn id(&self) -> PaneId {
+        self.pane.id()
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.pane.title()
+    }
+
+    pub fn role(&self) -> Option<&str> {
+        self.pane.role()
+    }
+
+    /// 退避元タブの ID（実在を保証しない。表示・復帰先解決に使う）
+    pub fn origin_tab(&self) -> TabId {
+        self.origin_tab
+    }
+
+    /// 退避時点のタブ名（親タブの明記に使う）
+    pub fn origin_tab_title(&self) -> &str {
+        &self.origin_tab_title
+    }
 }
 
 impl Workspace {
@@ -229,7 +280,11 @@ impl Workspace {
     }
 
     /// レイアウト復元用（FR-2.15.5）。shelved ペインも含めて復元する
-    pub fn restore_with_shelved(tabs: Vec<Tab>, active: TabId, shelved: Vec<Pane>) -> Option<Self> {
+    pub fn restore_with_shelved(
+        tabs: Vec<Tab>,
+        active: TabId,
+        shelved: Vec<ShelvedPane>,
+    ) -> Option<Self> {
         if tabs.is_empty() {
             return None;
         }
@@ -245,31 +300,48 @@ impl Workspace {
         })
     }
 
-    pub fn shelved_panes(&self) -> &[Pane] {
+    pub fn shelved_panes(&self) -> &[ShelvedPane] {
         &self.shelved
+    }
+
+    /// 退避ペインを 1 件引く（由来タブの参照・復帰先解決に使う）
+    pub fn shelved(&self, pane_id: PaneId) -> Option<&ShelvedPane> {
+        self.shelved.iter().find(|p| p.id() == pane_id)
+    }
+
+    /// 退避ペインの由来タブ ID（タブ別分離表示・復帰先の解決に使う。FR-2.15.6）
+    pub fn shelved_origin_tab(&self, pane_id: PaneId) -> Option<TabId> {
+        self.shelved(pane_id).map(|p| p.origin_tab())
     }
 
     /// ペインをたまり場へ退避する（FR-2.15.1）。ペインをツリーから外してたまり場に移す。
     /// タブが空になる場合はタブを閉じる。最後のタブの最後のペインの場合は LastTab を返す
-    /// （アプリ層で新ペインを生やしてからリトライする判断は呼び出し側の責務）
+    /// （アプリ層で新ペインを生やしてからリトライする判断は呼び出し側の責務）。
+    /// 由来タブ（FR-2.15.6 のタブ別分離表示用）は退避時点の ID とタブ名を記録する
     pub fn shelve_pane(&mut self, pane_id: PaneId) -> Result<(), WorkspaceError> {
         let tab_id = self
             .find_tab_of_pane(pane_id)
             .ok_or(WorkspaceError::PaneNotFound(pane_id))?;
+        let origin_title = self
+            .get_tab(tab_id)
+            .map(|t| t.title().to_string())
+            .unwrap_or_default();
         let tab = self
             .get_tab_mut(tab_id)
             .expect("find_tab_of_pane で存在確認済み");
         match tab.tree_mut().close(pane_id) {
             Ok(pane) => {
-                self.shelved.push(pane);
+                self.shelved
+                    .push(ShelvedPane::from_pane(pane, tab_id, origin_title));
                 Ok(())
             }
             Err(PaneTreeError::LastPane) => {
                 if self.tabs.len() > 1 {
                     let tab = self.close_tab(tab_id).expect("複数タブが存在する");
                     let mut panes = tab.into_tree().into_panes();
+                    let pane = panes.pop().expect("タブは常に 1 ペイン以上を持つ");
                     self.shelved
-                        .push(panes.pop().expect("タブは常に 1 ペイン以上を持つ"));
+                        .push(ShelvedPane::from_pane(pane, tab_id, origin_title));
                     Ok(())
                 } else {
                     Err(WorkspaceError::LastTab)
@@ -294,7 +366,7 @@ impl Workspace {
         let tab_id = self
             .find_tab_of_pane(target)
             .ok_or(WorkspaceError::PaneNotFound(target))?;
-        let pane = self.shelved.remove(idx);
+        let pane = self.shelved.remove(idx).pane;
         self.get_tab_mut(tab_id)
             .expect("find_tab_of_pane で存在確認済み")
             .tree_mut()
@@ -304,7 +376,7 @@ impl Workspace {
     }
 
     /// たまり場からペインを削除する（FR-2.15.2 の kill 時に使う）
-    pub fn remove_shelved(&mut self, pane_id: PaneId) -> Option<Pane> {
+    pub fn remove_shelved(&mut self, pane_id: PaneId) -> Option<ShelvedPane> {
         let idx = self.shelved.iter().position(|p| p.id() == pane_id)?;
         Some(self.shelved.remove(idx))
     }
@@ -318,16 +390,21 @@ impl Workspace {
     /// タブを閉じて全ペインを shelved に移す。最後の 1 タブの場合は LastTab を返す
     /// （呼び出し側で新ペインを生やしてからリトライする想定）
     pub fn shelve_tab(&mut self, tab_id: TabId) -> Result<Vec<PaneId>, WorkspaceError> {
-        if self.get_tab(tab_id).is_none() {
-            return Err(WorkspaceError::TabNotFound(tab_id));
-        }
+        let origin_title = match self.get_tab(tab_id) {
+            Some(t) => t.title().to_string(),
+            None => return Err(WorkspaceError::TabNotFound(tab_id)),
+        };
         if self.tabs.len() == 1 {
             return Err(WorkspaceError::LastTab);
         }
         let tab = self.close_tab(tab_id).expect("複数タブ確認済み");
         let panes = tab.into_tree().into_panes();
         let ids: Vec<PaneId> = panes.iter().map(|p| p.id()).collect();
-        self.shelved.extend(panes);
+        self.shelved.extend(
+            panes
+                .into_iter()
+                .map(|p| ShelvedPane::from_pane(p, tab_id, origin_title.clone())),
+        );
         Ok(ids)
     }
 
@@ -530,12 +607,18 @@ mod tests {
         let p1 = ws.active_tab().tree().focused();
         let t2_pane = pane();
         let t2_pane_id = t2_pane.id();
-        let _t2 = ws.create_tab("t2", t2_pane);
+        let t2 = ws.create_tab("t2", t2_pane);
         // t2 の唯一のペインを退避 → t2 はタブごと閉じる
         ws.shelve_pane(t2_pane_id).unwrap();
         assert_eq!(ws.tabs().len(), 1);
         assert_eq!(ws.shelved_panes().len(), 1);
         assert_eq!(ws.active_tab().tree().focused(), p1);
+        // 由来タブは閉じても ID とタブ名がスナップショットされる（FR-2.15.6）
+        let shelved = ws.shelved(t2_pane_id).unwrap();
+        assert_eq!(shelved.origin_tab(), t2);
+        assert_eq!(shelved.origin_tab_title(), "t2");
+        assert!(ws.get_tab(t2).is_none(), "由来タブは閉じている");
+        assert_eq!(ws.shelved_origin_tab(t2_pane_id), Some(t2));
     }
 
     #[test]
@@ -581,6 +664,11 @@ mod tests {
         assert_eq!(ws.tabs().len(), 1);
         assert_eq!(ws.active_tab_id(), t2);
         assert_eq!(ws.shelved_panes().len(), 2);
+        // タブ単位退避では全ペインが同じ由来タブ（t1）を共有する（FR-2.15.6）
+        assert!(ws
+            .shelved_panes()
+            .iter()
+            .all(|p| p.origin_tab() == t1 && p.origin_tab_title() == "t1"));
     }
 
     #[test]

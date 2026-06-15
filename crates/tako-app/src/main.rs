@@ -128,6 +128,9 @@ const DRAWER_DEFAULT_HEIGHT: f32 = 240.0;
 /// たまり場ドロワー上端のヘッダ行の高さ（px）
 const DRAWER_HEADER_HEIGHT: f32 = 22.0;
 
+/// たまり場ドロワーのタブ別グループ見出し行の高さ（px。FR-2.15.6）
+const DRAWER_GROUP_HEADER: f32 = 16.0;
+
 /// たまり場の退避プレビューカード 1 枚の幅（px。横並び + 横スクロール）
 const SHELF_CARD_WIDTH: f32 = 300.0;
 
@@ -517,6 +520,24 @@ struct TmuxViewTabGroup {
     rows: Vec<AgentEntry>,
     /// このタブのペイン内で attach 中の外部 tmux セッション（FR-2.16.9）
     sessions: Vec<AttachedTmuxSession>,
+    /// このタブ由来の退避ペイン（FR-2.15.6。タブ別分離してバックグラウンド表示する）
+    shelved: Vec<ShelvedEntry>,
+}
+
+/// タブ別退避表示の 1 ペイン分（FR-2.15.6）。退避ペインは常にバックグラウンド扱い
+#[derive(Debug, Clone)]
+struct ShelvedEntry {
+    pane: PaneId,
+    label: String,
+    state: CommandState,
+}
+
+/// 閉じた由来タブの退避ペイン群（FR-2.15.6）。由来タブが既に存在しない退避ペインを
+/// 「タブ <名前>（閉じたタブ）」としてまとめて表示する
+#[derive(Debug, Clone)]
+struct ClosedOriginShelfGroup {
+    title: String,
+    entries: Vec<ShelvedEntry>,
 }
 
 /// タブ内ペインで attach 中の外部 tmux セッション 1 件分（FR-2.16.9）。
@@ -1353,14 +1374,88 @@ impl TakoApp {
                     })
                     .collect();
                 rows.sort_by_key(|e| state_rank(e.state));
+                let shelved = self.shelved_entries_of_tab(tab.id());
                 TmuxViewTabGroup {
                     tab: tab.id(),
                     title: tab.title().to_string(),
                     rows,
                     sessions: self.tmux_sessions_attached_to(tab.id().as_u64()),
+                    shelved,
                 }
             })
             .collect()
+    }
+
+    /// 退避ペインの表示ラベル（title > role > cwd ベース名 > 既定）。
+    /// タブツリーのバックグラウンド行とドロワーのカードで共用する
+    fn shelved_label(&self, p: &tako_core::ShelvedPane) -> String {
+        p.title()
+            .map(|s| s.to_string())
+            .or_else(|| p.role().map(|s| s.to_string()))
+            .or_else(|| {
+                // cwd のベース名（例: ~/projects/tako → 「tako」）で意味づけする
+                self.terminals
+                    .get(&p.id())
+                    .and_then(|s| s.cwd())
+                    .and_then(|c| c.file_name())
+                    .map(|n| format!("ターミナル: {}", n.to_string_lossy()))
+            })
+            .unwrap_or_else(|| "ターミナル".to_string())
+    }
+
+    /// 退避ペインのコマンド状態（ターミナル不在なら Unknown）
+    fn shelved_state(&self, pane_id: PaneId) -> CommandState {
+        self.terminals
+            .get(&pane_id)
+            .map(|s| s.command_state())
+            .unwrap_or(CommandState::Unknown)
+    }
+
+    /// 指定した由来タブの退避ペインのエントリ列（FR-2.15.6。タブ別分離表示用）
+    fn shelved_entries_of_tab(&self, origin: TabId) -> Vec<ShelvedEntry> {
+        self.workspace
+            .shelved_panes()
+            .iter()
+            .filter(|p| p.origin_tab() == origin)
+            .map(|p| ShelvedEntry {
+                pane: p.id(),
+                label: self.shelved_label(p),
+                state: self.shelved_state(p.id()),
+            })
+            .collect()
+    }
+
+    /// 由来タブが既に閉じている退避ペインを、由来タブごとにまとめて返す（FR-2.15.6）。
+    /// 生存タブの退避は各タブ枠（`tmux_view_groups` の `shelved`）が表示するためここでは除く
+    fn tmux_view_closed_origin_shelved(&self) -> Vec<ClosedOriginShelfGroup> {
+        use std::collections::hash_map::Entry;
+        let mut groups: Vec<ClosedOriginShelfGroup> = Vec::new();
+        // 由来タブ ID → groups 内の位置（初出順を保つ）
+        let mut index: std::collections::HashMap<TabId, usize> = std::collections::HashMap::new();
+        for p in self.workspace.shelved_panes() {
+            let origin = p.origin_tab();
+            // 生存タブ由来は各タブ枠で表示済みなので除外する
+            if self.workspace.get_tab(origin).is_some() {
+                continue;
+            }
+            let entry = ShelvedEntry {
+                pane: p.id(),
+                label: self.shelved_label(p),
+                state: self.shelved_state(p.id()),
+            };
+            let next = groups.len();
+            match index.entry(origin) {
+                Entry::Occupied(e) => groups[*e.get()].entries.push(entry),
+                Entry::Vacant(e) => {
+                    e.insert(next);
+                    groups.push(ClosedOriginShelfGroup {
+                        title: p.origin_tab_title().to_string(),
+                        entries: vec![entry],
+                    });
+                }
+            }
+        }
+        groups
     }
 
     /// tmux セッションの attach クライアントが tako ペインで表示中なら
@@ -2282,6 +2377,272 @@ impl TakoApp {
             )
     }
 
+    /// 表示分類バッジ（FR-2.16.12）。前面表示中 = アクティブタブ所属、それ以外は裏で実行中。
+    /// タブツリーのペイン行・退避行で共用する
+    fn surface_badge(&self, is_foreground: bool) -> gpui::Div {
+        let theme = &self.theme;
+        let (txt, col) = if is_foreground {
+            ("表示中", theme.accent)
+        } else {
+            ("バックグラウンド", theme.tab_inactive_foreground)
+        };
+        div()
+            .px_1()
+            .flex_none()
+            .rounded_sm()
+            .text_size(px(9.0))
+            .whitespace_nowrap()
+            .text_color(hsla(col))
+            .bg(rgba_alpha(col, 0.15))
+            .child(txt)
+    }
+
+    /// attach 中の外部 tmux セッションをホストペイン配下に入れ子表示する（FR-2.16.6 一本化 /
+    /// FR-2.16.9）。ホスト行の下にインデントして「セッション名 + window 一覧 + 確認つき kill」を
+    /// 描く。どのペインが attach しているかはホスト行が示すので「ペイン N で attach 中」は省く
+    fn render_attached_session_rows(
+        &self,
+        group_index: usize,
+        s_index: usize,
+        session: &AttachedTmuxSession,
+        pending_tmux: &Option<(String, Option<u32>, Option<String>)>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let theme = &self.theme;
+        // 確認 UI の id 衝突を避ける（ペイン kill は pane id、こちらは上位ビット）
+        let id_seed = (1 << 32) | ((group_index as u64) << 16) | s_index as u64;
+        let kill_name = session.name.clone();
+        let kill_socket = session.socket.clone();
+        let mut container = div().flex().flex_col().gap_1().pl_4().child(
+            div()
+                .id(("tmux-att-row", id_seed))
+                .group("tmux-att-row")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .px_1()
+                .overflow_hidden()
+                .cursor(CursorStyle::OpenHand)
+                // D&D でタブ内へ取り込み（FR-2.16.10。attach 済みでも多重 attach 可）
+                .on_drag(
+                    TmuxSessionDrag {
+                        name: session.name.clone(),
+                        socket: session.socket.clone(),
+                        window: None,
+                    },
+                    self.drag_ghost_builder(
+                        DragKind::TmuxSession,
+                        format!("tmux: {}", truncate(&session.name, 24)),
+                        cx,
+                    ),
+                )
+                .child(
+                    div()
+                        .px_1()
+                        .flex_none()
+                        .rounded_sm()
+                        .text_size(px(10.0))
+                        .text_color(hsla(theme.accent))
+                        .bg(rgba_alpha(theme.accent, 0.15))
+                        .child("⎇ tmux"),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .font_weight(FontWeight::BOLD)
+                        .text_size(px(11.0))
+                        .child(SharedString::from(truncate(&session.name, 24))),
+                )
+                .child(
+                    div()
+                        .id(("tmux-att-kill", id_seed))
+                        .px_1()
+                        .flex_none()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_size(px(11.0))
+                        .text_color(hsla_alpha(theme.ansi[1], 0.8))
+                        .opacity(0.0)
+                        .group_hover("tmux-att-row", |d| d.opacity(1.0))
+                        .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.tmux_pending_kill =
+                                Some((kill_name.clone(), None, kill_socket.clone()));
+                            cx.notify();
+                        }))
+                        .child("×"),
+                ),
+        );
+        for (w_index, label) in &session.windows {
+            let w_index = *w_index;
+            let kill_name = session.name.clone();
+            let kill_socket = session.socket.clone();
+            let drag_name = session.name.clone();
+            let drag_socket = session.socket.clone();
+            container = container.child(
+                div()
+                    .id((
+                        "tmux-att-window-row",
+                        (id_seed << 8) | w_index as u64 | 0x8000_0000,
+                    ))
+                    .group("tmux-att-wrow")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .pl_4()
+                    .text_size(px(11.0))
+                    .cursor(CursorStyle::OpenHand)
+                    .on_drag(
+                        TmuxSessionDrag {
+                            name: drag_name,
+                            socket: drag_socket,
+                            window: Some(w_index),
+                        },
+                        self.drag_ghost_builder(
+                            DragKind::TmuxSession,
+                            format!("tmux: {}", truncate(label, 24)),
+                            cx,
+                        ),
+                    )
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(SharedString::from(truncate(label, 40))),
+                    )
+                    .child(
+                        div()
+                            .id(("tmux-att-kill-window", (id_seed << 8) | w_index as u64))
+                            .px_1()
+                            .flex_none()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_size(px(10.0))
+                            .text_color(hsla_alpha(theme.ansi[1], 0.8))
+                            .opacity(0.0)
+                            .group_hover("tmux-att-wrow", |d| d.opacity(1.0))
+                            .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.tmux_pending_kill =
+                                    Some((kill_name.clone(), Some(w_index), kill_socket.clone()));
+                                cx.notify();
+                            }))
+                            .child("🗑"),
+                    ),
+            );
+        }
+        // attach 済みセッションへの kill 確認（unlisted 側と同じ pending を使う）
+        if let Some((pending_session, pending_window, _)) = pending_tmux {
+            if *pending_session == session.name {
+                let label = match pending_window {
+                    Some(w) => {
+                        format!("window {w} を kill していいですか?（中のプロセスごと終了）")
+                    }
+                    None => format!(
+                        "セッション {} を kill していいですか?（中のプロセスごと終了。\
+                         attach 中のペインからも消える）",
+                        session.name
+                    ),
+                };
+                container = container.child(self.render_kill_confirm(id_seed, label, None, cx));
+            }
+        }
+        container
+    }
+
+    /// 退避ペインのバックグラウンド行（FR-2.15.6）。タブ枠内（タブ別分離）と
+    /// 「閉じたタブ」グループで共用。バッジ + 状態ドット + ラベル + 復帰（由来タブへ戻す）。
+    /// D&D でもペインエリアへ復帰できる（ドロワーと同じ ShelvedPaneDrag）
+    fn render_shelved_row(
+        &self,
+        entry: &ShelvedEntry,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = &self.theme;
+        let pane_id = entry.pane;
+        let state_color = match entry.state {
+            CommandState::Failed(_) => Some(theme.ansi[1]),
+            CommandState::Running => Some(theme.accent),
+            CommandState::Idle => Some(theme.ansi[3]),
+            _ => None,
+        };
+        let mut row = div()
+            .id(("tmux-shelved-row", pane_id.as_u64()))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .px_1()
+            .rounded_sm()
+            .text_size(px(11.0))
+            .text_color(hsla(theme.tab_inactive_foreground))
+            .cursor(CursorStyle::OpenHand)
+            .on_drag(
+                ShelvedPaneDrag { pane: pane_id },
+                self.drag_ghost_builder(DragKind::ShelvedPane, truncate(&entry.label, 24), cx),
+            )
+            .child(self.surface_badge(false));
+        if let Some(color) = state_color {
+            row = row.child(
+                div()
+                    .w(px(6.0))
+                    .h(px(6.0))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(hsla(color)),
+            );
+        }
+        row.child(
+            div()
+                .flex_1()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(SharedString::from(format!(
+                    "{}（退避）",
+                    truncate(&entry.label, 22)
+                ))),
+        )
+        .child(
+            div()
+                .id(("tmux-shelved-restore", pane_id.as_u64()))
+                .px_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_size(px(10.0))
+                .text_color(hsla(theme.accent))
+                .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
+                .child("復帰")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    // 由来タブが生きていればそこへ、無ければアクティブタブへ戻す
+                    let origin = this.workspace.shelved_origin_tab(pane_id);
+                    let target = origin
+                        .and_then(|t| this.workspace.get_tab(t))
+                        .map(|t| t.tree().focused())
+                        .unwrap_or_else(|| this.workspace.active_tab().tree().focused());
+                    if let Err(e) =
+                        this.workspace
+                            .unshelve_pane(pane_id, target, SplitDirection::Right)
+                    {
+                        eprintln!("warning: たまり場から復帰できない: {e}");
+                    }
+                    if this.workspace.shelved_panes().is_empty() {
+                        this.drawer_visible = false;
+                    }
+                    cx.notify();
+                })),
+        )
+    }
+
     /// 統合 tmux ビュー（FR-2.16.6〜2.16.9。旧 tmuxview FR-2.13 + 集約センター FR-2.10 の
     /// 1 本化）。タブごとの「タブ名ラベル付き四角枠」に全ペインを入れ子表示し、行クリックで
     /// ジャンプ、ゴミ箱 → 確認 → kill（dispatch の Close）。タブ内ペインで attach 中の
@@ -2366,6 +2727,9 @@ impl TakoApp {
                 root = root.child(card);
                 continue;
             }
+            // どの attach セッションをホスト行の下に出したか（取りこぼし防止に使う）
+            let mut rendered_sessions: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
             for row in group.rows {
                 let pane = row.pane;
                 let (color, state_label) = match row.state {
@@ -2376,14 +2740,26 @@ impl TakoApp {
                         (theme.tab_inactive_foreground, "状態不明".to_string())
                     }
                 };
-                // 補足（cwd / 保持セッション）は詰めすぎず省略（…）で見切れを防ぐ
-                let detail = match (&row.cwd, &row.backend) {
-                    (Some(cwd), Some(b)) => {
-                        format!("{} ・ tmux: {}", truncate(cwd, 24), truncate(b, 16))
+                // このペインが attach 表示している外部セッション（あれば detail に名前を出す。
+                // window 一覧はホスト行の下に入れ子表示するので二重化しない。FR-2.16.6）
+                let hosted: Vec<&AttachedTmuxSession> = group
+                    .sessions
+                    .iter()
+                    .filter(|s| s.pane == pane.as_u64())
+                    .collect();
+                // 補足（cwd / 保持セッション / attach 先）は詰めすぎず省略（…）で見切れを防ぐ
+                let detail = if !hosted.is_empty() {
+                    let names: Vec<String> = hosted.iter().map(|s| truncate(&s.name, 18)).collect();
+                    format!("tmux: {}", names.join(" / "))
+                } else {
+                    match (&row.cwd, &row.backend) {
+                        (Some(cwd), Some(b)) => {
+                            format!("{} ・ tmux: {}", truncate(cwd, 24), truncate(b, 16))
+                        }
+                        (Some(cwd), None) => truncate(cwd, 36),
+                        (None, Some(b)) => format!("tmux: {}", truncate(b, 24)),
+                        (None, None) => String::new(),
                     }
-                    (Some(cwd), None) => truncate(cwd, 36),
-                    (None, Some(b)) => format!("tmux: {}", truncate(b, 24)),
-                    (None, None) => String::new(),
                 };
                 card = card.child(
                     div()
@@ -2399,6 +2775,8 @@ impl TakoApp {
                         .overflow_hidden()
                         .hover(|d| d.bg(rgba_alpha(theme.tab_bar_background, 0.8)))
                         .on_click(cx.listener(move |this, _, _, cx| this.jump_to_pane(pane, cx)))
+                        // 表示分類バッジ（FR-2.16.12。表示中 = アクティブタブ所属）
+                        .child(self.surface_badge(is_active))
                         .child(
                             div()
                                 .w(px(8.0))
@@ -2409,7 +2787,7 @@ impl TakoApp {
                         )
                         .child(
                             div()
-                                .w(px(56.0))
+                                .w(px(52.0))
                                 .flex_none()
                                 .text_size(px(11.0))
                                 .text_color(hsla(color))
@@ -2423,7 +2801,7 @@ impl TakoApp {
                                 .whitespace_nowrap()
                                 .text_ellipsis()
                                 .font_weight(FontWeight::BOLD)
-                                .child(SharedString::from(truncate(&row.label, 28))),
+                                .child(SharedString::from(truncate(&row.label, 24))),
                         )
                         .child(
                             div()
@@ -2462,170 +2840,38 @@ impl TakoApp {
                         cx,
                     ));
                 }
-            }
-            // タブ内ペインで attach 中の外部 tmux セッション（FR-2.16.9）。
-            // 「管理外」へ落とさず、見えているタブの配下として window 一覧ごと表示する
-            for (s_index, session) in group.sessions.iter().enumerate() {
-                // 確認 UI の id 衝突を避ける（ペイン kill は pane id、こちらは上位ビット）
-                let id_seed = (1 << 32) | ((group_index as u64) << 16) | s_index as u64;
-                let kill_name = session.name.clone();
-                let kill_socket = session.socket.clone();
-                card = card.child(
-                    div()
-                        .id(("tmux-att-row", id_seed))
-                        .group("tmux-att-row")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .px_1()
-                        .overflow_hidden()
-                        .cursor(CursorStyle::OpenHand)
-                        // D&D でタブ内へ取り込み（FR-2.16.10。attach 済みでも多重 attach 可）
-                        .on_drag(
-                            TmuxSessionDrag {
-                                name: session.name.clone(),
-                                socket: session.socket.clone(),
-                                window: None,
-                            },
-                            self.drag_ghost_builder(
-                                DragKind::TmuxSession,
-                                format!("tmux: {}", truncate(&session.name, 24)),
-                                cx,
-                            ),
-                        )
-                        .child(
-                            div()
-                                .px_1()
-                                .flex_none()
-                                .rounded_sm()
-                                .text_size(px(10.0))
-                                .text_color(hsla(theme.accent))
-                                .bg(rgba_alpha(theme.accent, 0.15))
-                                .child("tmux"),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .font_weight(FontWeight::BOLD)
-                                .text_size(px(11.0))
-                                .child(SharedString::from(truncate(&session.name, 24))),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(px(10.0))
-                                .text_color(hsla(theme.tab_inactive_foreground))
-                                .whitespace_nowrap()
-                                .child(SharedString::from(format!(
-                                    "ペイン {} で attach 中",
-                                    session.pane
-                                ))),
-                        )
-                        .child(
-                            div()
-                                .id(("tmux-att-kill", id_seed))
-                                .px_1()
-                                .flex_none()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .text_size(px(11.0))
-                                .text_color(hsla_alpha(theme.ansi[1], 0.8))
-                                .opacity(0.0)
-                                .group_hover("tmux-att-row", |d| d.opacity(1.0))
-                                .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.tmux_pending_kill =
-                                        Some((kill_name.clone(), None, kill_socket.clone()));
-                                    cx.notify();
-                                }))
-                                .child("×"),
-                        ),
-                );
-                for (w_index, label) in &session.windows {
-                    let w_index = *w_index;
-                    let kill_name = session.name.clone();
-                    let kill_socket = session.socket.clone();
-                    let drag_name = session.name.clone();
-                    let drag_socket = session.socket.clone();
-                    card = card.child(
-                        div()
-                            .id((
-                                "tmux-att-window-row",
-                                (id_seed << 8) | w_index as u64 | 0x8000_0000,
-                            ))
-                            .group("tmux-att-wrow")
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_1()
-                            .pl_4()
-                            .text_size(px(11.0))
-                            .cursor(CursorStyle::OpenHand)
-                            .on_drag(
-                                TmuxSessionDrag {
-                                    name: drag_name,
-                                    socket: drag_socket,
-                                    window: Some(w_index),
-                                },
-                                self.drag_ghost_builder(
-                                    DragKind::TmuxSession,
-                                    format!("tmux: {}", truncate(label, 24)),
-                                    cx,
-                                ),
-                            )
-                            .overflow_hidden()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .child(SharedString::from(truncate(label, 40))),
-                            )
-                            .child(
-                                div()
-                                    .id(("tmux-att-kill-window", (id_seed << 8) | w_index as u64))
-                                    .px_1()
-                                    .flex_none()
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .text_size(px(10.0))
-                                    .text_color(hsla_alpha(theme.ansi[1], 0.8))
-                                    .opacity(0.0)
-                                    .group_hover("tmux-att-wrow", |d| d.opacity(1.0))
-                                    .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.tmux_pending_kill = Some((
-                                            kill_name.clone(),
-                                            Some(w_index),
-                                            kill_socket.clone(),
-                                        ));
-                                        cx.notify();
-                                    }))
-                                    .child("🗑"),
-                            ),
-                    );
-                }
-                // attach 済みセッションへの kill 確認（unlisted 側と同じ pending を使う）
-                if let Some((pending_session, pending_window, _)) = &pending_tmux {
-                    if *pending_session == session.name {
-                        let label = match pending_window {
-                            Some(w) => format!(
-                                "window {w} を kill していいですか?（中のプロセスごと終了）"
-                            ),
-                            None => format!(
-                                "セッション {} を kill していいですか?（中のプロセスごと終了。\
-                                 attach 中のペインからも消える）",
-                                session.name
-                            ),
-                        };
-                        card = card.child(self.render_kill_confirm(id_seed, label, None, cx));
+                // ホストペイン配下に attach 中セッションを入れ子表示（FR-2.16.6 一本化）
+                for (s_index, session) in group.sessions.iter().enumerate() {
+                    if session.pane != pane.as_u64() {
+                        continue;
                     }
+                    rendered_sessions.insert(s_index);
+                    card = card.child(self.render_attached_session_rows(
+                        group_index,
+                        s_index,
+                        session,
+                        &pending_tmux,
+                        cx,
+                    ));
+                }
+            }
+            // ホストペインが行に出ていない attach セッションの取りこぼし防止（防御的に表示）
+            for (s_index, session) in group.sessions.iter().enumerate() {
+                if rendered_sessions.contains(&s_index) {
+                    continue;
+                }
+                card = card.child(self.render_attached_session_rows(
+                    group_index,
+                    s_index,
+                    session,
+                    &pending_tmux,
+                    cx,
+                ));
+            }
+            // このタブ由来の退避ペインをバックグラウンド表示（FR-2.15.6 タブ別分離）
+            if !group.shelved.is_empty() {
+                for entry in &group.shelved {
+                    card = card.child(self.render_shelved_row(entry, cx));
                 }
             }
             root = root.child(card);
@@ -2833,103 +3079,45 @@ impl TakoApp {
             root = root.child(card);
         }
 
-        // 退避中セクション: たまり場にあるペインを表示（tmux ビュー内で視認可能にする）
-        let shelved: Vec<_> = self
-            .workspace
-            .shelved_panes()
-            .iter()
-            .map(|p| {
-                let label = p
-                    .title()
-                    .map(|s| s.to_string())
-                    .or_else(|| p.role().map(|s| s.to_string()))
-                    .or_else(|| {
-                        // cwd のベース名（例: ~/projects/tako → 「tako」）で意味づけする
-                        self.terminals
-                            .get(&p.id())
-                            .and_then(|s| s.cwd())
-                            .and_then(|c| c.file_name())
-                            .map(|n| format!("ターミナル: {}", n.to_string_lossy()))
-                    })
-                    .unwrap_or_else(|| "ターミナル".to_string());
-                let state = self
-                    .terminals
-                    .get(&p.id())
-                    .map(|s| s.command_state())
-                    .unwrap_or(CommandState::Unknown);
-                (p.id(), label, state)
-            })
-            .collect();
-        if !shelved.is_empty() {
-            let mut shelved_card = div()
+        // 由来タブが閉じた退避ペインは「タブ <名前>（閉じたタブ）」にまとめて表示する。
+        // 生存タブ由来の退避は各タブ枠内へバックグラウンド表示済み（FR-2.15.6 タブ別分離）
+        let closed_origin = self.tmux_view_closed_origin_shelved();
+        if !closed_origin.is_empty() {
+            root = root.child(
+                div()
+                    .mt_2()
+                    .text_color(hsla(theme.tab_inactive_foreground))
+                    .text_size(px(11.0))
+                    .child("閉じたタブの退避ターミナル（バックグラウンドで実行中）"),
+            );
+        }
+        for shelf_group in &closed_origin {
+            let mut card = div()
                 .flex()
                 .flex_col()
                 .gap_1()
                 .p_1()
                 .rounded_md()
                 .border_1()
-                .border_color(hsla(theme.pane_border))
+                .border_color(hsla_alpha(theme.pane_border, 0.7))
                 .child(
                     div()
                         .text_size(px(11.0))
+                        .font_weight(FontWeight::BOLD)
                         .text_color(hsla(theme.tab_inactive_foreground))
-                        .child(format!("⏏ 退避中 ({})", shelved.len())),
-                );
-            for (pane_id, label, state) in &shelved {
-                let pane_id = *pane_id;
-                let state_color = match state {
-                    CommandState::Failed(_) => Some(theme.ansi[1]),
-                    CommandState::Running => Some(theme.accent),
-                    CommandState::Idle => Some(theme.ansi[3]),
-                    _ => None,
-                };
-                let mut row = div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .px_1()
-                    .py(px(1.0))
-                    .rounded_sm()
-                    .text_size(px(11.0))
-                    .text_color(hsla(theme.tab_inactive_foreground));
-                if let Some(color) = state_color {
-                    row = row.child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color)));
-                }
-                row = row.child(
-                    div()
-                        .flex_1()
-                        .overflow_x_hidden()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
                         .text_ellipsis()
-                        .child(label.clone()),
+                        .child(SharedString::from(format!(
+                            "タブ {}（閉じたタブ・{} 件）",
+                            truncate(&shelf_group.title, 20),
+                            shelf_group.entries.len()
+                        ))),
                 );
-                row = row.child(
-                    div()
-                        .id(("tmux-unshelve", pane_id.as_u64()))
-                        .cursor_pointer()
-                        .text_size(px(10.0))
-                        .text_color(hsla(theme.accent))
-                        .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
-                        .px_1()
-                        .rounded_sm()
-                        .child("復帰")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let target = this.workspace.active_tab().tree().focused();
-                            if let Err(e) =
-                                this.workspace
-                                    .unshelve_pane(pane_id, target, SplitDirection::Right)
-                            {
-                                eprintln!("warning: たまり場から復帰できない: {e}");
-                            }
-                            if this.workspace.shelved_panes().is_empty() {
-                                this.drawer_visible = false;
-                            }
-                            cx.notify();
-                        })),
-                );
-                shelved_card = shelved_card.child(row);
+            for entry in &shelf_group.entries {
+                card = card.child(self.render_shelved_row(entry, cx));
             }
-            root = root.child(shelved_card);
+            root = root.child(card);
         }
 
         root
@@ -4988,45 +5176,232 @@ impl TakoApp {
         cx.notify();
     }
 
-    /// たまり場ドロワーの描画（FR-2.15。下部、ステータスバーの上に展開）
+    /// 退避ドロワーのカード 1 枚（実画面サムネイル + タイトルバー）。タブ別グループ内で
+    /// 1 ペインずつ描く（FR-2.15.6）。復帰は由来タブへ戻す（無ければアクティブタブ）
+    fn render_shelf_card(
+        &self,
+        entry: &ShelvedEntry,
+        pending_kill: Option<PaneId>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = self.theme.clone();
+        let pane_id = entry.pane;
+        let label = entry.label.clone();
+        let state_color = match entry.state {
+            CommandState::Failed(_) => Some(theme.ansi[1]),
+            CommandState::Running => Some(theme.accent),
+            CommandState::Idle => Some(theme.ansi[3]),
+            _ => None,
+        };
+        let is_pending_kill = pending_kill == Some(pane_id);
+        // 実画面プレビュー（カーソルは出さずサムネイルらしくする）
+        let lines = self.terminal_screen_lines(pane_id, false);
+
+        // カードタイトルバー（通常ペインと同じスタイル。D&D でペインエリアへ復帰可能）
+        let mut titlebar = div()
+            .id(("shelf-titlebar", pane_id.as_u64()))
+            .h(px(PANE_TITLE_BAR))
+            .flex_none()
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .px_1()
+            .bg(rgba(theme.tab_bar_background))
+            .text_size(px(11.0))
+            .text_color(hsla(theme.tab_inactive_foreground))
+            .cursor(CursorStyle::OpenHand)
+            .on_drag(
+                ShelvedPaneDrag { pane: pane_id },
+                self.drag_ghost_builder(DragKind::ShelvedPane, truncate(&label, 24), cx),
+            );
+
+        if is_pending_kill {
+            // kill 確認（FR-2.15.2）。tmux セッションごと完全破棄する
+            titlebar = titlebar
+                .child(
+                    div()
+                        .flex_1()
+                        .overflow_x_hidden()
+                        .text_ellipsis()
+                        .text_color(hsla(theme.ansi[1]))
+                        .child("完全に破棄?"),
+                )
+                .child(
+                    div()
+                        .id(("shelf-kill-yes", pane_id.as_u64()))
+                        .cursor_pointer()
+                        .text_color(hsla(theme.ansi[1]))
+                        .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
+                        .px_1()
+                        .rounded_sm()
+                        .child("はい")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.shelved_pending_kill = None;
+                            if this.workspace.remove_shelved(pane_id).is_some() {
+                                this.terminals.remove(&pane_id);
+                                this.previews.remove(&pane_id);
+                                this.scroll_accum.remove(&pane_id);
+                                this.scroll_ctls.remove(&pane_id);
+                                this.drop_tmux_view_session(pane_id);
+                                this.drop_backend_session(pane_id);
+                            }
+                            if this.workspace.shelved_panes().is_empty() {
+                                this.drawer_visible = false;
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .id(("shelf-kill-no", pane_id.as_u64()))
+                        .cursor_pointer()
+                        .text_color(hsla(theme.tab_inactive_foreground))
+                        .hover(|d| d.bg(rgba_alpha(theme.tab_active_background, 0.5)))
+                        .px_1()
+                        .rounded_sm()
+                        .child("いいえ")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.shelved_pending_kill = None;
+                            cx.notify();
+                        })),
+                );
+        } else {
+            if let Some(color) = state_color {
+                titlebar =
+                    titlebar.child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color)));
+            }
+            titlebar = titlebar
+                .child(
+                    div()
+                        .flex_1()
+                        .overflow_x_hidden()
+                        .text_ellipsis()
+                        .text_color(hsla(theme.foreground))
+                        .child(SharedString::from(truncate(&label, 40))),
+                )
+                // 復帰ボタン（× の隣。FR-2.15.3。由来タブへ戻す）
+                .child(
+                    div()
+                        .id(("shelf-restore", pane_id.as_u64()))
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(hsla(theme.accent))
+                        .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
+                        .child("復帰")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let origin = this.workspace.shelved_origin_tab(pane_id);
+                            let target = origin
+                                .and_then(|t| this.workspace.get_tab(t))
+                                .map(|t| t.tree().focused())
+                                .unwrap_or_else(|| this.workspace.active_tab().tree().focused());
+                            if let Err(e) =
+                                this.workspace
+                                    .unshelve_pane(pane_id, target, SplitDirection::Right)
+                            {
+                                eprintln!("warning: たまり場から復帰できない: {e}");
+                            }
+                            if this.workspace.shelved_panes().is_empty() {
+                                this.drawer_visible = false;
+                            }
+                            cx.notify();
+                        })),
+                )
+                // kill ボタン（右上の ×。完全破棄の確認を開始。FR-2.15.2）
+                .child(
+                    div()
+                        .id(("shelf-kill", pane_id.as_u64()))
+                        .w(px(16.0))
+                        .h(px(16.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
+                        .hover(|d| {
+                            d.bg(rgba_alpha(theme.ansi[1], 0.25))
+                                .text_color(hsla(theme.foreground))
+                        })
+                        .child("×")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.shelved_pending_kill = Some(pane_id);
+                            cx.notify();
+                        })),
+                );
+        }
+
+        // カード本文 = ターミナルの実画面プレビュー（通常ペインと同じ行描画）。
+        // ターミナルを持たない退避（プレビューペイン等）はラベルだけ示す
+        let body = if lines.is_empty() {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(11.0))
+                .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.6))
+                .child(SharedString::from(truncate(&label, 24)))
+        } else {
+            div()
+                .flex_1()
+                .p(px(PANE_PADDING))
+                .overflow_hidden()
+                .bg(rgba(theme.background))
+                .children(lines)
+        };
+
+        div()
+            .id(("shelf-card", pane_id.as_u64()))
+            .flex_none()
+            .w(px(SHELF_CARD_WIDTH))
+            .h_full()
+            .flex()
+            .flex_col()
+            .rounded_md()
+            .overflow_hidden()
+            .border_1()
+            .border_color(if is_pending_kill {
+                hsla(theme.ansi[1])
+            } else {
+                hsla(theme.pane_border)
+            })
+            .bg(rgba(theme.background))
+            .child(titlebar)
+            .child(body)
+    }
+
+    /// たまり場ドロワーの描画（FR-2.15。下部、ステータスバーの上に展開）。
+    /// 退避ターミナルは由来タブごとにグループ分けして横並び表示する（FR-2.15.6）
     fn render_drawer(&mut self, cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
         if !self.drawer_visible {
             return None;
         }
         let theme = self.theme.clone();
-        let shelved: Vec<(PaneId, String, CommandState)> = self
-            .workspace
-            .shelved_panes()
-            .iter()
-            .map(|p| {
-                let label = p
-                    .title()
-                    .map(|s| s.to_string())
-                    .or_else(|| p.role().map(|s| s.to_string()))
-                    .or_else(|| {
-                        // cwd のベース名（例: ~/projects/tako → 「tako」）で意味づけする
-                        self.terminals
-                            .get(&p.id())
-                            .and_then(|s| s.cwd())
-                            .and_then(|c| c.file_name())
-                            .map(|n| format!("ターミナル: {}", n.to_string_lossy()))
-                    })
-                    .unwrap_or_else(|| "ターミナル".to_string());
-                let state = self
-                    .terminals
-                    .get(&p.id())
-                    .map(|s| s.command_state())
-                    .unwrap_or(CommandState::Unknown);
-                (p.id(), label, state)
-            })
-            .collect();
+        // 由来タブごとにグループ化（FR-2.15.6 退避エリアのタブ別分離）。生存タブはタブ順、
+        // 由来タブが閉じたものは「タブ <名前>（閉じたタブ）」として後ろにまとめる
+        let mut shelf_groups: Vec<(String, Vec<ShelvedEntry>)> = Vec::new();
+        for tab in self.workspace.tabs() {
+            let entries = self.shelved_entries_of_tab(tab.id());
+            if !entries.is_empty() {
+                shelf_groups.push((tab.title().to_string(), entries));
+            }
+        }
+        for closed in self.tmux_view_closed_origin_shelved() {
+            shelf_groups.push((format!("{}（閉じたタブ）", closed.title), closed.entries));
+        }
+        let shelved_total: usize = shelf_groups.iter().map(|(_, e)| e.len()).sum();
 
         let pending_kill = self.shelved_pending_kill;
 
         // 退避ターミナルをカード本文の寸法へリサイズし、通常ペインと同じ見え方の
-        // プレビュー（実画面サムネイル）にする。resize は冪等なので毎フレーム呼んでも安全
+        // プレビュー（実画面サムネイル）にする。resize は冪等なので毎フレーム呼んでも安全。
+        // グループ見出しの高さ分も本文から差し引く
         let body_h = (self.drawer_height
             - DRAWER_HEADER_HEIGHT
+            - DRAWER_GROUP_HEADER
             - PANE_TITLE_BAR
             - PANE_PADDING * 2.0
             - PANE_BORDER * 2.0
@@ -5039,14 +5414,18 @@ impl TakoApp {
             let rows = (body_h / f32::from(cell.height)).floor() as usize;
             let cw = f32::from(cell.width).round() as u16;
             let ch = f32::from(cell.height).round() as u16;
-            for (pane_id, _, _) in &shelved {
-                if let Some(session) = self.terminals.get_mut(pane_id) {
+            let ids: Vec<PaneId> = shelf_groups
+                .iter()
+                .flat_map(|(_, e)| e.iter().map(|x| x.pane))
+                .collect();
+            for pane_id in ids {
+                if let Some(session) = self.terminals.get_mut(&pane_id) {
                     session.resize(cols, rows, cw, ch);
                 }
             }
         }
 
-        // カードを横並びに配置し、横スクロールで全件閲覧できるようにする（FR-2.15）
+        // タブ別グループを横並びに配置し、横スクロールで全件閲覧できるようにする（FR-2.15.6）
         let mut cards = div()
             .id("drawer-cards")
             .flex()
@@ -5058,7 +5437,7 @@ impl TakoApp {
             .py_1()
             .overflow_x_scroll();
 
-        if shelved.is_empty() {
+        if shelf_groups.is_empty() {
             cards = cards.child(
                 div()
                     .text_size(px(11.0))
@@ -5067,191 +5446,43 @@ impl TakoApp {
                     .child("退避中のターミナルはありません"),
             );
         } else {
-            for (pane_id, label, state) in &shelved {
-                let pane_id = *pane_id;
-                let state_color = match state {
-                    CommandState::Failed(_) => Some(theme.ansi[1]),
-                    CommandState::Running => Some(theme.accent),
-                    CommandState::Idle => Some(theme.ansi[3]),
-                    _ => None,
-                };
-                let is_pending_kill = pending_kill == Some(pane_id);
-                // 実画面プレビュー（カーソルは出さずサムネイルらしくする）
-                let lines = self.terminal_screen_lines(pane_id, false);
-
-                // カードタイトルバー（通常ペインと同じスタイル。D&D でペインエリアへ復帰可能）
-                let mut titlebar = div()
-                    .id(("shelf-titlebar", pane_id.as_u64()))
-                    .h(px(PANE_TITLE_BAR))
-                    .flex_none()
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .px_1()
-                    .bg(rgba(theme.tab_bar_background))
-                    .text_size(px(11.0))
-                    .text_color(hsla(theme.tab_inactive_foreground))
-                    .cursor(CursorStyle::OpenHand)
-                    .on_drag(
-                        ShelvedPaneDrag { pane: pane_id },
-                        self.drag_ghost_builder(DragKind::ShelvedPane, truncate(label, 24), cx),
-                    );
-
-                if is_pending_kill {
-                    // kill 確認（FR-2.15.2）。tmux セッションごと完全破棄する
-                    titlebar = titlebar
-                        .child(
-                            div()
-                                .flex_1()
-                                .overflow_x_hidden()
-                                .text_ellipsis()
-                                .text_color(hsla(theme.ansi[1]))
-                                .child("完全に破棄?"),
-                        )
-                        .child(
-                            div()
-                                .id(("shelf-kill-yes", pane_id.as_u64()))
-                                .cursor_pointer()
-                                .text_color(hsla(theme.ansi[1]))
-                                .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
-                                .px_1()
-                                .rounded_sm()
-                                .child("はい")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.shelved_pending_kill = None;
-                                    if this.workspace.remove_shelved(pane_id).is_some() {
-                                        this.terminals.remove(&pane_id);
-                                        this.previews.remove(&pane_id);
-                                        this.scroll_accum.remove(&pane_id);
-                                        this.scroll_ctls.remove(&pane_id);
-                                        this.drop_tmux_view_session(pane_id);
-                                        this.drop_backend_session(pane_id);
-                                    }
-                                    if this.workspace.shelved_panes().is_empty() {
-                                        this.drawer_visible = false;
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id(("shelf-kill-no", pane_id.as_u64()))
-                                .cursor_pointer()
-                                .text_color(hsla(theme.tab_inactive_foreground))
-                                .hover(|d| d.bg(rgba_alpha(theme.tab_active_background, 0.5)))
-                                .px_1()
-                                .rounded_sm()
-                                .child("いいえ")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.shelved_pending_kill = None;
-                                    cx.notify();
-                                })),
-                        );
-                } else {
-                    if let Some(color) = state_color {
-                        titlebar = titlebar
-                            .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color)));
-                    }
-                    titlebar = titlebar
-                        .child(
-                            div()
-                                .flex_1()
-                                .overflow_x_hidden()
-                                .text_ellipsis()
-                                .text_color(hsla(theme.foreground))
-                                .child(SharedString::from(truncate(label, 40))),
-                        )
-                        // 復帰ボタン（× の隣。FR-2.15.3。たまり場から現在のタブへ戻す）
-                        .child(
-                            div()
-                                .id(("shelf-restore", pane_id.as_u64()))
-                                .px_1()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .text_color(hsla(theme.accent))
-                                .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
-                                .child("復帰")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let target = this.workspace.active_tab().tree().focused();
-                                    if let Err(e) = this.workspace.unshelve_pane(
-                                        pane_id,
-                                        target,
-                                        SplitDirection::Right,
-                                    ) {
-                                        eprintln!("warning: たまり場から復帰できない: {e}");
-                                    }
-                                    if this.workspace.shelved_panes().is_empty() {
-                                        this.drawer_visible = false;
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                        // kill ボタン（右上の ×。完全破棄の確認を開始。FR-2.15.2）
-                        .child(
-                            div()
-                                .id(("shelf-kill", pane_id.as_u64()))
-                                .w(px(16.0))
-                                .h(px(16.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
-                                .hover(|d| {
-                                    d.bg(rgba_alpha(theme.ansi[1], 0.25))
-                                        .text_color(hsla(theme.foreground))
-                                })
-                                .child("×")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.shelved_pending_kill = Some(pane_id);
-                                    cx.notify();
-                                })),
-                        );
-                }
-
-                // カード本文 = ターミナルの実画面プレビュー（通常ペインと同じ行描画）。
-                // ターミナルを持たない退避（プレビューペイン等）はラベルだけ示す
-                let body = if lines.is_empty() {
-                    div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(11.0))
-                        .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.6))
-                        .child(SharedString::from(truncate(label, 24)))
-                } else {
-                    div()
-                        .flex_1()
-                        .p(px(PANE_PADDING))
-                        .overflow_hidden()
-                        .bg(rgba(theme.background))
-                        .children(lines)
-                };
-
-                let card = div()
-                    .id(("shelf-card", pane_id.as_u64()))
-                    .flex_none()
-                    .w(px(SHELF_CARD_WIDTH))
-                    .h_full()
+            for (gi, (title, entries)) in shelf_groups.iter().enumerate() {
+                let mut group = div()
+                    .id(("drawer-group", gi as u64))
                     .flex()
                     .flex_col()
-                    .rounded_md()
-                    .overflow_hidden()
-                    .border_1()
-                    .border_color(if is_pending_kill {
-                        hsla(theme.ansi[1])
-                    } else {
-                        hsla(theme.pane_border)
+                    .h_full()
+                    .gap_1()
+                    // グループ間の区切り（最初以外の左に縦線）でタブ別の塊を視認させる
+                    .when(gi > 0, |d| {
+                        d.pl_2()
+                            .border_l_1()
+                            .border_color(hsla_alpha(theme.pane_border, 0.6))
                     })
-                    .bg(rgba(theme.background))
-                    .child(titlebar)
-                    .child(body);
-
-                cards = cards.child(card);
+                    .child(
+                        // 親タブ見出し（FR-2.15.6。退避ペインの親タブを明記）
+                        div()
+                            .h(px(DRAWER_GROUP_HEADER))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .text_size(px(10.0))
+                            .text_color(hsla(theme.tab_inactive_foreground))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(SharedString::from(format!(
+                                "タブ {}（{}）",
+                                truncate(title, 18),
+                                entries.len()
+                            ))),
+                    );
+                let mut row = div().flex().flex_row().flex_1().min_h(px(0.0)).gap_2();
+                for entry in entries {
+                    row = row.child(self.render_shelf_card(entry, pending_kill, cx));
+                }
+                group = group.child(row);
+                cards = cards.child(group);
             }
         }
 
@@ -5281,7 +5512,7 @@ impl TakoApp {
                         .text_color(hsla(theme.tab_inactive_foreground))
                         .child(SharedString::from(format!(
                             "退避中のターミナル（{}）",
-                            shelved.len()
+                            shelved_total
                         )))
                         .child(div().flex_grow(1.0))
                         .child(

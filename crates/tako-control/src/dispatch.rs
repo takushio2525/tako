@@ -1047,11 +1047,17 @@ pub fn dispatch(
             if !host.workspace().is_shelved(pane_id) {
                 return Err(DispatchError::PaneNotFound(pane));
             }
+            // target 省略時は由来タブ（FR-2.15.6）のフォーカスペインへ戻す。
+            // 由来タブが既に閉じていればアクティブタブへフォールバックする
             let target_id = if let Some(t) = target {
                 let (_, id) = resolve_pane(host.workspace(), Some(t))?;
                 id
             } else {
-                host.workspace().active_tab().tree().focused()
+                let ws = host.workspace();
+                ws.shelved_origin_tab(pane_id)
+                    .and_then(|tab| ws.get_tab(tab))
+                    .map(|tab| tab.tree().focused())
+                    .unwrap_or_else(|| ws.active_tab().tree().focused())
             };
             let dir = direction
                 .map(|d| d.to_core())
@@ -1083,6 +1089,11 @@ pub fn dispatch(
                         "role": p.role(),
                         "state": format!("{state:?}").to_lowercase(),
                         "cwd": cwd,
+                        // 由来タブ（FR-2.15.6。タブ別分離表示・復帰先の解決に使う）
+                        "origin_tab": p.origin_tab().as_u64(),
+                        "origin_tab_title": p.origin_tab_title(),
+                        // 退避ペインは常に裏で動いている（FR-2.16.12 の表示分類と一致）
+                        "surface": "background",
                     })
                 })
                 .collect();
@@ -1255,6 +1266,9 @@ fn list_json(host: &dyn ControlHost) -> Value {
         .map(|tab| {
             let tree = tab.tree();
             let rects = tree.layout(Rect::UNIT);
+            // 前面表示中（アクティブタブ）か裏で動いているか（FR-2.16.12）。
+            // tako はアクティブタブの全ペインをタイル表示するので、表示中 = アクティブタブ所属
+            let tab_active = tab.id() == ws.active_tab_id();
             let panes: Vec<Value> = tree
                 .panes()
                 .iter()
@@ -1267,6 +1281,8 @@ fn list_json(host: &dyn ControlHost) -> Value {
                     let session = host.session(p.id());
                     json!({
                         "id": p.id().as_u64(),
+                        // 表示分類（FR-2.16.12）。foreground = 前面表示中 / background = 裏で実行中
+                        "surface": if tab_active { "foreground" } else { "background" },
                         "title": p.title(),
                         // title の出どころ（FR-2.12.3。manual は自動リネームに上書きされない）
                         "title_source": title_source_str(p.title_source()),
@@ -1314,7 +1330,7 @@ fn list_json(host: &dyn ControlHost) -> Value {
                 "id": tab.id().as_u64(),
                 "title": tab.title(),
                 "title_source": title_source_str(tab.title_source()),
-                "active": tab.id() == ws.active_tab_id(),
+                "active": tab_active,
                 "focused_pane": tree.focused().as_u64(),
                 "panes": panes,
                 "tree": tree_json(tree.root()),
@@ -1734,6 +1750,86 @@ mod tests {
         for (_, r) in rects {
             assert!((r.width - 0.5).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn listはペインの表示分類surfaceを返す() {
+        // FR-2.16.12: 表示中 = アクティブタブ所属、それ以外は裏で実行中
+        let mut host = MockHost::new();
+        let root = host.root_pane(); // t1 のペイン
+        host.ws.create_tab("t2", Pane::new(PaneOrigin::User)); // t2 がアクティブに
+        let result = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        let tabs = result["tabs"].as_array().unwrap();
+        for tab in tabs {
+            let active = tab["active"].as_bool().unwrap();
+            for p in tab["panes"].as_array().unwrap() {
+                let surface = p["surface"].as_str().unwrap();
+                let want = if active { "foreground" } else { "background" };
+                assert_eq!(surface, want);
+            }
+        }
+        // root（非アクティブな t1）は background
+        let root_surface = tabs
+            .iter()
+            .flat_map(|t| t["panes"].as_array().unwrap())
+            .find(|p| p["id"].as_u64() == Some(root))
+            .unwrap()["surface"]
+            .as_str()
+            .unwrap();
+        assert_eq!(root_surface, "background");
+    }
+
+    #[test]
+    fn shelvedリストは由来タブとbackgroundを返す() {
+        // FR-2.15.6: 退避ペインは由来タブを保持し、常に background 分類で返す
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let t1 = host.ws.active_tab_id();
+        host.ws.create_tab("t2", Pane::new(PaneOrigin::User)); // 退避できるよう 2 タブに
+        dispatch(
+            &mut host,
+            Request::Shelve { pane: Some(root) },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let result = dispatch(&mut host, Request::ShelvedList, PaneOrigin::Cli).unwrap();
+        let shelved = result["shelved"].as_array().unwrap();
+        assert_eq!(shelved.len(), 1);
+        assert_eq!(shelved[0]["pane"].as_u64(), Some(root));
+        assert_eq!(shelved[0]["origin_tab"].as_u64(), Some(t1.as_u64()));
+        assert_eq!(shelved[0]["origin_tab_title"].as_str(), Some("t1"));
+        assert_eq!(shelved[0]["surface"].as_str(), Some("background"));
+    }
+
+    #[test]
+    fn unshelveはtarget省略で由来タブへ戻す() {
+        // FR-2.15.6: 復帰先 target 省略時は由来タブ（生存していれば）へ戻す
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let t1 = host.ws.active_tab_id();
+        let p2 = split(&mut host, root); // t1 に 2 ペイン目
+        host.ws.create_tab("t2", Pane::new(PaneOrigin::User)); // t2 をアクティブに
+        dispatch(
+            &mut host,
+            Request::Shelve { pane: Some(p2) },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!(host.ws.is_shelved(PaneId::from_raw(p2)));
+        // アクティブは t2 だが、由来タブ t1 へ戻ること
+        let result = dispatch(
+            &mut host,
+            Request::Unshelve {
+                pane: p2,
+                target: None,
+                direction: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["unshelved"].as_u64(), Some(p2));
+        assert!(!host.ws.is_shelved(PaneId::from_raw(p2)));
+        assert_eq!(host.ws.find_tab_of_pane(PaneId::from_raw(p2)), Some(t1));
     }
 
     #[test]

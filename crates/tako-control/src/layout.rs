@@ -14,7 +14,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tako_core::{Pane, PaneId, PaneNode, PaneOrigin, PaneTree, Tab, TitleSource, Workspace};
+use tako_core::{
+    Pane, PaneId, PaneNode, PaneOrigin, PaneTree, ShelvedPane, Tab, TabId, TitleSource, Workspace,
+};
 
 /// レイアウトファイルのフォーマットバージョン（互換のない変更で上げる）
 pub const LAYOUT_VERSION: u32 = 1;
@@ -88,6 +90,13 @@ pub struct PaneLayout {
     /// 旧ファイルには無いので serde default で後方互換
     #[serde(default)]
     pub preview: Option<PreviewLayout>,
+    /// 退避ペインの由来タブ ID（FR-2.15.6。タブ別分離表示用）。tree 内のペインでは
+    /// 常に None。旧ファイル後方互換のため default + 出力時は None を省略する
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_tab: Option<u64>,
+    /// 退避ペインの由来タブ名（同上。閉じたタブ由来でも親を明記できるよう保持）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_tab_title: Option<String>,
 }
 
 /// プレビューペインの保存内容（復元時はファイルを開き直す。PTY は起動しない）
@@ -142,7 +151,8 @@ pub fn capture(
         shelved: ws
             .shelved_panes()
             .iter()
-            .map(|pane| {
+            .map(|shelved| {
+                let pane = shelved.pane();
                 let m = meta(pane.id());
                 PaneLayout {
                     id: pane.id().as_u64(),
@@ -153,6 +163,9 @@ pub fn capture(
                     origin: origin_str(pane.origin()).to_string(),
                     cwd: m.cwd,
                     preview: m.preview,
+                    // 由来タブ（FR-2.15.6）。再起動後もタブ別分離表示を保つ
+                    origin_tab: Some(shelved.origin_tab().as_u64()),
+                    origin_tab_title: Some(shelved.origin_tab_title().to_string()),
                 }
             })
             .collect(),
@@ -172,6 +185,9 @@ fn capture_node(node: &PaneNode, meta: &dyn Fn(PaneId) -> PaneMeta) -> NodeLayou
                 origin: origin_str(pane.origin()).to_string(),
                 cwd: m.cwd,
                 preview: m.preview,
+                // tree 内のペインは退避ではないので由来タブを持たない
+                origin_tab: None,
+                origin_tab_title: None,
             })
         }
         PaneNode::Split {
@@ -237,7 +253,14 @@ pub fn restore(file: &LayoutFile) -> Option<(Workspace, Vec<RestoredPane>)> {
         }
         tabs.push(tab);
     }
-    // たまり場ペインの復元（FR-2.15.5）
+    // たまり場ペインの復元（FR-2.15.5 / FR-2.15.6）。由来タブ無しの旧ファイルは
+    // アクティブ（無ければ先頭）タブを由来とみなしてフォールバックする
+    let fallback_tab = active.unwrap_or_else(|| tabs[0].id());
+    let fallback_title = tabs
+        .iter()
+        .find(|t| t.id() == fallback_tab)
+        .map(|t| t.title().to_string())
+        .unwrap_or_default();
     let mut shelved_panes = Vec::new();
     for p in &file.shelved {
         if !pane_ids.insert(p.id) {
@@ -256,7 +279,12 @@ pub fn restore(file: &LayoutFile) -> Option<(Workspace, Vec<RestoredPane>)> {
             cwd: p.cwd.clone(),
             preview: p.preview.clone(),
         });
-        shelved_panes.push(pane);
+        let origin_tab = p.origin_tab.map(TabId::from_raw).unwrap_or(fallback_tab);
+        let origin_title = p
+            .origin_tab_title
+            .clone()
+            .unwrap_or_else(|| fallback_title.clone());
+        shelved_panes.push(ShelvedPane::from_pane(pane, origin_tab, origin_title));
     }
 
     let active = active.unwrap_or(tabs[0].id());
@@ -488,6 +516,53 @@ mod tests {
         // 復元後の新規採番は既存 ID と衝突しない
         let new_pane = Pane::new(PaneOrigin::User);
         assert!(new_pane.id().as_u64() > *pane_ids.iter().max().unwrap());
+    }
+
+    #[test]
+    fn 退避ペインの由来タブが永続化で往復する() {
+        let mut ws = sample_workspace();
+        // tab1（"作業"）の root を退避（2 ペインあるのでタブは残る）
+        let shelve_target = ws.tabs()[0].tree().panes()[0].id();
+        let origin_tab = ws.tabs()[0].id();
+        ws.shelve_pane(shelve_target).unwrap();
+        let layout = capture(&ws, &|_| PaneMeta::default(), None);
+        // serde 往復後も origin_tab フィールドが保たれる
+        let json = serde_json::to_string(&layout).unwrap();
+        let back: LayoutFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, layout);
+        assert_eq!(back.shelved.len(), 1);
+        assert_eq!(back.shelved[0].origin_tab, Some(origin_tab.as_u64()));
+        assert_eq!(back.shelved[0].origin_tab_title.as_deref(), Some("作業"));
+        // 復元後も由来タブが一致する
+        let (restored_ws, _) = restore(&back).unwrap();
+        assert_eq!(restored_ws.shelved_panes().len(), 1);
+        let restored = &restored_ws.shelved_panes()[0];
+        assert_eq!(restored.origin_tab().as_u64(), origin_tab.as_u64());
+        assert_eq!(restored.origin_tab_title(), "作業");
+    }
+
+    #[test]
+    fn 由来タブ無しの旧ファイルはフォールバックする() {
+        // 旧フォーマット（shelved に origin_tab 無し）でも読めて、由来は
+        // アクティブタブへフォールバックする（後方互換）
+        let mut ws = sample_workspace();
+        let shelve_target = ws.tabs()[0].tree().panes()[0].id();
+        ws.shelve_pane(shelve_target).unwrap();
+        let layout = capture(&ws, &|_| PaneMeta::default(), None);
+        // origin_tab 系を取り除いた JSON を作る（skip_serializing_if で None は出ないので
+        // 文字列から該当キーを抜くだけで旧ファイルを再現できる）
+        let json = serde_json::to_string(&layout).unwrap();
+        let legacy_json = json
+            .replace(
+                &format!("\"origin_tab\":{}", layout.shelved[0].origin_tab.unwrap()),
+                "\"_ot\":0",
+            )
+            .replace("\"origin_tab_title\":\"作業\"", "\"_ott\":\"x\"");
+        let legacy: LayoutFile = serde_json::from_str(&legacy_json).unwrap();
+        assert_eq!(legacy.shelved[0].origin_tab, None);
+        let (restored_ws, _) = restore(&legacy).unwrap();
+        let active = restored_ws.active_tab_id();
+        assert_eq!(restored_ws.shelved_panes()[0].origin_tab(), active);
     }
 
     #[test]
