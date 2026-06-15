@@ -369,3 +369,17 @@
   ドロワーからペインエリアへ D&D 復帰 / CLI・MCP 4 操作（計 27 ツール）/
   layout.json 永続化（shelved フィールド追加、serde default で後方互換）
 - 次: ユーザー再起動 → 実機確認
+
+## 2026-06-15（タブ単位退避: 最小化ボタン + D&D 退避）
+
+- タブバーに最小化ボタン（ー）を追加、タブ内全ペインをまとめてたまり場へ退避。
+  タブを退避ボタン/ドロワーへ D&D でも退避可。コアに `shelve_tab()` 新設（テスト 2 本）
+- 関連コミット: `d55be1e` `[機能追加] タブ単位の退避: 最小化ボタン + D&D 退避`
+
+## 2026-06-15（tmux orphan 修正 + tmux ビュー退避セクション）
+
+- TmuxOpen ペインの close 時に tmux セッションが kill されず orphan 化する問題を修正。
+  `drop_tmux_view_session()` 新設で remove_pane/tab/detach_session/shelved kill 全経路を修正。
+  tmux パネルに「⏏ 退避中」セクション追加（状態ドット + 復帰ボタン）
+- 関連コミット: `a37812e` `[修正] tmux D&D タブの orphan 化防止 + tmux ビューに退避中セクション追加`
+- 次: ユーザー再起動 → 実機確認

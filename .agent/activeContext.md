@@ -4,25 +4,19 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-06-14・git タブ + たまり場マージ完了）
+## 現在の対象（2026-06-15・タブ退避 + tmux orphan 修正完了）
 
-- **FR-3.6 git graph + FR-3.9 diff ビューア**: 右サイドバーの git タブにコミットグラフ・
-  ブランチ一覧・変更ファイル・diff 表示を実装。`tako-core::git` モジュール新設（git CLI
-  子プロセス、tmux.rs と同パターン）。dispatch `GitLog`/`GitDiff` + CLI `tako git log/diff`
-  + MCP `tako_git_log`/`tako_git_diff`
-- **たまり場機能（FR-2.15）を完全実装**: × ボタンが kill → 退避に変更、下部ドロワー UI、
-  D&D 復帰、CLI / MCP 4 操作、レイアウト永続化
-- feature/git-tab と feature/tamari-ba を main にマージ統合（計 29 ツール）
+- **FR-2.15 タブ単位退避**: 最小化ボタン（ー）+ D&D 退避を実装
+- **tmux D&D タブの orphan 化防止**: `drop_tmux_view_session()` 新設で全 close 経路を修正
+- **tmux パネルに退避中セクション**: 退避ペインの状態表示 + 復帰ボタン
 - **tako 終了 → `scripts/build-app.sh --install` → 再起動** をユーザーに依頼して実機確認
-- 最終更新: 2026-06-14
+- 最終更新: 2026-06-15
 
 ## 残作業・既知の制約
 
 - コンテキストメニューの位置がサイドバー基準でなくウィンドウ基準になる可能性
-  （GPUI の `position` がウィンドウ座標のため。実機で確認してから調整）
-- PDF プレビューのセルフテストが Core Graphics 環境依存で失敗（既知。今回無関係）
-- git パネルのコミットグラフは現在テキストベース（● / ●─ のドット列）。将来的にグラフ線の
-  描画（lazygit 風のカラムライン）を追加できる構造になっている
+- PDF プレビューのセルフテストが Core Graphics 環境依存で失敗（既知）
+- git パネルのコミットグラフは現在テキストベース
 
 ## 未着手タスク（優先順はユーザーと相談）
 
@@ -35,8 +29,6 @@
 ## 直近の観点・指摘（実装時に踏みやすい点）
 
 - **CI（GitHub Actions）はリポ設定で意図的に無効化中**（2026-06-12〜）
-- **git パネルの非同期パターン**: tmux と同じ 2 秒ポーリングループ内で、パネル表示中のみ
-  `fetch_git_data()` を background executor で実行。パネル開いた瞬間も即 fetch
 - **Edit ツールのフックが変更を巻き戻す**: Bash + python3 での一括パッチが安全
 - **インライン編集 UI**: `handle_key` の冒頭で `inline_edit.is_some()` をチェック
 

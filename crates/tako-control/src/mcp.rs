@@ -632,6 +632,18 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "tako_check_health",
+            "description": "tako 環境の健全性を診断する。接続直後に呼んで環境に問題がないか確認すること。\
+                チェック項目: tako CLI が PATH に通っているか / CLI とアプリのバージョンが一致するか / \
+                外部ツール（tmux 等）の有無 / セッション永続化の状態。\
+                問題がある場合は issue 配列に修正方法の提案を含めて返す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -847,6 +859,7 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             },
             filetree: bool_arg(args, "filetree")?,
         },
+        "tako_check_health" => Request::CheckHealth,
         _ => return Err(format!("不明なツール: {name}")),
     })
 }
@@ -1262,7 +1275,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 29);
+        assert_eq!(tools.len(), 30);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

@@ -1043,6 +1043,8 @@ pub fn dispatch(
             host.detach_session(pane_id);
             Ok(json!({ "killed": pane }))
         }
+
+        Request::CheckHealth => Ok(check_health(host)),
     }
 }
 
@@ -1054,6 +1056,110 @@ fn shell_escape(s: &str) -> String {
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
     }
+}
+
+fn check_health(host: &dyn ControlHost) -> Value {
+    let app_version = env!("CARGO_PKG_VERSION").to_string();
+    let mut issues: Vec<Value> = Vec::new();
+
+    // tako CLI が PATH に通っているか
+    let cli_path = which("tako");
+    let cli_in_path = cli_path.is_some();
+    if !cli_in_path {
+        issues.push(json!({
+            "level": "error",
+            "check": "cli_in_path",
+            "message": "tako CLI が PATH に見つからない。.app バンドル内の CLI を PATH に追加するか、\
+                scripts/build-app.sh --install でインストールすること",
+        }));
+    }
+
+    // CLI バージョンとアプリバージョンの一致
+    let cli_version = cli_path
+        .as_ref()
+        .and_then(|path| {
+            std::process::Command::new(path)
+                .arg("--version")
+                .output()
+                .ok()
+        })
+        .and_then(|out| {
+            String::from_utf8(out.stdout)
+                .ok()
+                .and_then(|s| s.split_whitespace().last().map(|v| v.to_string()))
+        });
+    let version_match = cli_version.as_deref() == Some(&app_version);
+    if cli_in_path && !version_match {
+        issues.push(json!({
+            "level": "warning",
+            "check": "version_match",
+            "message": format!(
+                "CLI バージョン ({}) とアプリバージョン ({}) が不一致。\
+                 build-app.sh --install で最新の CLI をインストールすること",
+                cli_version.as_deref().unwrap_or("不明"),
+                app_version,
+            ),
+        }));
+    }
+
+    // tmux の有無
+    let tmux_available = which("tmux").is_some();
+    if !tmux_available {
+        issues.push(json!({
+            "level": "warning",
+            "check": "tmux",
+            "message": "tmux がインストールされていない。セッション永続化（tako 再起動時の復元）が\
+                使えない。brew install tmux でインストール可能",
+        }));
+    }
+
+    // セッション永続化の状態
+    let persist_enabled = host.tmux_persist_enabled();
+    let persist_available = tako_core::tmux_backend::available();
+    if tmux_available && !persist_enabled {
+        issues.push(json!({
+            "level": "info",
+            "check": "persist",
+            "message": "セッション永続化が無効。tako persist on で有効にすると、\
+                tako 再起動時にプロセスと画面内容が復元される",
+        }));
+    }
+
+    // ワークスペースの状態サマリ
+    let ws = host.workspace();
+    let tab_count = ws.tabs().len();
+    let pane_count: usize = ws.tabs().iter().map(|t| t.tree().len()).sum();
+    let shelved_count = ws.shelved_panes().len();
+
+    let healthy = issues.is_empty();
+
+    json!({
+        "healthy": healthy,
+        "app_version": app_version,
+        "cli_version": cli_version,
+        "cli_in_path": cli_in_path,
+        "version_match": version_match,
+        "tmux_available": tmux_available,
+        "persist_enabled": persist_enabled,
+        "persist_available": persist_available,
+        "workspace": {
+            "tabs": tab_count,
+            "panes": pane_count,
+            "shelved": shelved_count,
+        },
+        "issues": issues,
+    })
+}
+
+fn which(name: &str) -> Option<String> {
+    std::process::Command::new("which")
+        .arg(name)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// `pane` 省略はエラー（呼び出し元解決はクライアント側の責務。FR-2.2.7）
@@ -1368,19 +1474,13 @@ mod tests {
     #[test]
     fn splitのtab指定は別タブ内に分割する() {
         let mut host = MockHost::new();
-        let root = host.root_pane();
+        let _root = host.root_pane();
         // タブ 2 を作り、タブ 1 に戻る
-        let result =
-            dispatch(&mut host, Request::TabNew { title: None }, PaneOrigin::Cli).unwrap();
+        let result = dispatch(&mut host, Request::TabNew { title: None }, PaneOrigin::Cli).unwrap();
         let tab2 = result["tab"].as_u64().unwrap();
         let tab2_pane = result["pane"].as_u64().unwrap();
         let tab1 = host.ws.tabs()[0].id().as_u64();
-        dispatch(
-            &mut host,
-            Request::TabSelect { tab: tab1 },
-            PaneOrigin::Cli,
-        )
-        .unwrap();
+        dispatch(&mut host, Request::TabSelect { tab: tab1 }, PaneOrigin::Cli).unwrap();
         assert_eq!(host.ws.active_tab_id().as_u64(), tab1);
         // tab 指定でタブ 2 内に分割（active tab はタブ 1 のまま）
         let result = dispatch(

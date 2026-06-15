@@ -284,6 +284,8 @@ pub enum Request {
     ShelvedList,
     /// たまり場のペインを kill する（FR-2.15.2）。確認は呼び出し側の責務
     ShelvedKill { pane: u64 },
+    /// 環境の健全性診断。CLI の PATH / バージョン一致 / 外部ツールの有無等をチェックする
+    CheckHealth,
 }
 
 /// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。
