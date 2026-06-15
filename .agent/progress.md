@@ -424,3 +424,17 @@
 - 関連コミット: `f64d2a3` `[改善] サイドバー tmux ビュー一本化…`
 - 検証: build / clippy(-D warnings) / fmt / test 全緑、セルフテストは既知 PDF 以外緑
 - 次: push → `build-app.sh --install` → 再起動で実機確認
+
+## 2026-06-15（タブツリー ホバー/ピン プレビュー 4 機能）
+- F1 ホバープレビュー（FR-2.16.13）: バックグラウンド行を on_hover でマウス位置に実画面
+  サムネイル（terminal_screen_lines・リサイズせず）ポップアップ。ライブ更新は on_term_event 由来
+- F2 折りたたみ改修（FR-2.16.14）: 意味論を「バックグラウンド行+退避だけ隠す」へ（Q2 選択）。
+  TabId キー化 + Request::CollapseTab + tako collapse + MCP + list collapsed + layout 永続化
+- F4 グループプレビュー（FR-2.16.16）: 閉じたタブグループを on_hover で全退避ペイン縦積み。
+  PreviewTarget::ClosedGroup 追加。閉じタブ分割自体は f64d2a3 で実装済み
+- F3 ピン留め（FR-2.16.15）: 📌 でアプリ内フローティング窓化（OS マルチ窓不使用）。D&D 移動 +
+  × 解除 + ライブ。Request::Pin + tako pin + MCP tako_pin_preview + list pinned（計 33 ツール）
+- 関連コミット: `765af0d`(F1) `cf04a31`(F2) `96d01b3`(F4) `c12d4c5`(F3)
+- 検証: build / clippy(-D warnings exit 0) / fmt / test 全緑（app33/cli10/control58/core103）。
+  セルフテストは既知 PDF 以外緑 = ツール数 33 通過
+- 次: push → tako 終了（Cmd-Q）→ `build-app.sh --install` → 再起動で実機確認
