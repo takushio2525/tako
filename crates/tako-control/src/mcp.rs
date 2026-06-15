@@ -294,6 +294,21 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_tmux_cleanup",
+            "description": "取り残された orphan tmux セッションを一括クリーンアップする。\
+                tako バックエンドサーバー上の detached・非 grouped・未使用の tako- セッション\
+                （前回クラッシュ等で残った裸のバックエンドセッション）だけを kill し、kill した\
+                名前を返す。**使用中（attached）・表示中ビュー・ユーザーの実セッションには\
+                一切触れない**ため tako_tmux_kill より安全。消し忘れ掃除の定型操作に使う。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "socket": { "type": "string", "description": "tmux サーバー名（tmux -L 相当。省略時は tako バックエンドサーバー）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_focus_pane",
             "description": "ペインへフォーカスを移す。pane（ID 指定。別タブならタブも切り替わる）か\
                 direction（アクティブタブ内の隣接移動）のどちらか一方を指定する。\
@@ -700,6 +715,9 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             lines: u64_arg(args, "lines")?.map(|n| n as usize),
         },
         "tako_tmux_list" => Request::TmuxList {
+            socket: str_arg(args, "socket")?,
+        },
+        "tako_tmux_cleanup" => Request::TmuxCleanup {
             socket: str_arg(args, "socket")?,
         },
         "tako_tmux_kill" => Request::TmuxKill {
@@ -1275,7 +1293,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 30);
+        assert_eq!(tools.len(), 31);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

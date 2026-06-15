@@ -81,9 +81,24 @@ pub trait ControlHost {
     fn preview_pane_of_tab(&self, _tab: TabId) -> Option<PaneId> {
         None
     }
-    /// TmuxOpen ペインの監視対象を登録する。対象セッションが消滅したらペインを
-    /// 自動クローズする（実装側の責務）
-    fn track_tmux_view(&mut self, _pane: PaneId, _session: String, _socket: Option<String>) {}
+    /// TmuxOpen ペインの監視対象を登録する。`session` は監視・再 attach 対象の
+    /// **元セッション**（ラッパー名は入れない）。`wrapper` は表示用の `tako-view-*`
+    /// grouped session 名で、ペイン close 時に kill する（`None` = 元セッションを直接
+    /// attach したので close 時も kill しない）。元セッション消滅で自動クローズする
+    fn track_tmux_view(
+        &mut self,
+        _pane: PaneId,
+        _session: String,
+        _wrapper: Option<String>,
+        _socket: Option<String>,
+    ) {
+    }
+    /// orphan tmux セッションの一括クリーンアップ（FR-2.16.11）。実装側が現存ペイン・
+    /// 退避ペイン・表示中ビューを protected として除外し、backend socket 上の取り残し
+    /// セッションを kill する。kill した名前を返す
+    fn cleanup_orphan_tmux(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -460,43 +475,72 @@ pub fn dispatch(
                     new_pane,
                 )
                 .map_err(op_err)?;
-            // grouped session で独立表示する（FR-2.16.10）。`new-session -t <session>`
-            // は同じ window 群を共有するが表示 window は独立なセッションを作る。
-            // これにより元のクライアント（親）の表示が巻き込まれない。
-            // grouped session はペインを閉じるとクライアント終了→セッション destroy
-            // だが、元のセッションとその window は無傷で残る。
+            // 元セッションの解決（無限ネスト防止 = 今回の根治）。tmux はグループ名を
+            // 「最初に作られた元セッション名」にするため、`tako-view-*` ラッパーや grouped
+            // session を開こうとしても group を辿れば必ず元へ戻る。
+            // 例: `tako-view-tako-view-master-tako-2-0`（group=master-tako）→ `master-tako`
+            let group = tako_core::tmux::session_group(socket.as_deref(), &session);
+            let original = group.unwrap_or_else(|| session.clone());
+            // tako 自身が作ったラッパーを開き直す場合（退避からの復帰・再オープン等）は、
+            // **新しいラッパーを作らず元セッションをそのまま直接 attach** する（ユーザー指示）。
+            // この経路で開いたペインは元セッションそのものなので close 時に kill しない
+            let reopen = session.starts_with("tako-view-");
             // `TMUX=` はネストガードの回避（tako バックエンドペイン内からでも実行可）
             let mut command = vec!["env".to_string(), "TMUX=".to_string(), "tmux".to_string()];
             if let Some(socket) = &socket {
                 command.push("-L".into());
                 command.push(socket.clone());
             }
-            command.extend([
-                "new-session".to_string(),
-                "-t".to_string(),
-                format!("={session}"),
-            ]);
-            if let Some(w) = window {
-                command.extend(["-s".to_string(), format!("tako-view-{session}-{w}")]);
-                // 初期 window を指定（grouped session 内で表示する window を選ぶ）
-                // new-session -t では直接 window を指定できないので、作成後に
-                // select-window を ; で繋ぐ
+            let wrapper = if reopen {
+                // 復帰/再オープン: 元セッションを直接 attach（ラッパーを作らない）。
+                // window 選択は元セッション全体に効く（独立ラッパーが無いため）
+                command.extend([
+                    "attach-session".to_string(),
+                    "-t".to_string(),
+                    format!("={original}"),
+                ]);
+                if let Some(w) = window {
+                    command.extend([
+                        ";".to_string(),
+                        "select-window".to_string(),
+                        "-t".to_string(),
+                        format!("{w}"),
+                    ]);
+                }
+                None
+            } else {
+                // 新規取り込み: grouped session で独立表示する（FR-2.16.10）。
+                // `new-session -t <original>` は同じ window 群を共有しつつ表示 window は
+                // 独立なので、元クライアント（親）の表示を巻き込まない。ラッパー名はペイン
+                // ID で一意化し、同一セッションを複数ペインで開いても衝突しない。元では
+                // なくこの **ラッパー** を close 時に kill する（元セッションは無傷）
+                let name = format!("tako-view-{original}-{}", new_id.as_u64());
+                command.extend([
+                    "new-session".to_string(),
+                    "-t".to_string(),
+                    format!("={original}"),
+                    "-s".to_string(),
+                    name.clone(),
+                ]);
+                if let Some(w) = window {
+                    // new-session -t では window 指定不可。作成後に select-window を ; で繋ぐ
+                    command.extend([
+                        ";".to_string(),
+                        "select-window".to_string(),
+                        "-t".to_string(),
+                        format!("{w}"),
+                    ]);
+                }
+                // クライアント切断時の自動破棄（残骸防止の保険。明示 kill が主経路）
                 command.extend([
                     ";".to_string(),
-                    "select-window".to_string(),
-                    "-t".to_string(),
-                    format!("{w}"),
+                    "set".to_string(),
+                    "destroy-unattached".to_string(),
+                    "on".to_string(),
                 ]);
-            }
-            // grouped session のクリーンアップ: ペインクローズ時にクライアントが
-            // 切断されたら自動破棄される（残骸防止）
-            command.extend([
-                ";".to_string(),
-                "set".to_string(),
-                "destroy-unattached".to_string(),
-                "on".to_string(),
-            ]);
-            host.track_tmux_view(new_id, session.clone(), socket.clone());
+                Some(name)
+            };
+            host.track_tmux_view(new_id, original.clone(), wrapper.clone(), socket.clone());
             let mut command = command.into_iter();
             host.attach_session(
                 new_id,
@@ -511,9 +555,19 @@ pub fn dispatch(
             );
             Ok(json!({
                 "pane": new_id.as_u64(),
-                "session": session,
+                // 解決後の元セッション名（ラッパー名を渡されても元へ正規化して返す）
+                "session": original,
+                // 表示用ラッパー名（直接 attach した復帰経路では null）
+                "wrapper": wrapper,
                 "socket": socket,
             }))
+        }
+
+        Request::TmuxCleanup { socket } => {
+            // socket 省略時は tako バックエンドサーバーを対象にする（取り残しの主因）
+            let _ = socket; // 現状は backend socket 固定（host が protected を解決して実行）
+            let killed = host.cleanup_orphan_tmux();
+            Ok(json!({ "killed": killed }))
         }
 
         Request::TabRename { pane, tab, title } => {

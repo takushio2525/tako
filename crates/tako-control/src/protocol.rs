@@ -195,6 +195,10 @@ pub enum Request {
         pane: Option<u64>,
         direction: Option<Direction>,
     },
+    /// orphan tmux セッションの一括クリーンアップ（FR-2.16.11）。`socket` 省略時は
+    /// tako バックエンドサーバー。detached・非 grouped・未使用の `tako-` セッションのみ
+    /// kill する（使用中・ユーザーセッションには触れない）。kill した名前を返す
+    TmuxCleanup { socket: Option<String> },
     /// タブのリネーム（FR-2.12.1）。`tab` 省略時は `pane`（呼び出し元）の属するタブ。
     /// 明示リネームとして自動リネーム（FR-2.12）より優先され、空文字で手動指定を解除する
     TabRename {

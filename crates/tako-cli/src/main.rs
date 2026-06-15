@@ -126,6 +126,14 @@ enum TmuxCommand {
         #[arg(long)]
         socket: Option<String>,
     },
+    /// 取り残された orphan tmux セッションを一括クリーンアップする（FR-2.16.11）。
+    /// detached・非 grouped・未使用の `tako-` バックエンドセッションだけを kill する
+    /// （使用中・ユーザーのセッションには触れない）。kill した名前を JSON で返す
+    Cleanup {
+        /// tmux サーバー名（`tmux -L` 相当。省略時は tako バックエンドサーバー）
+        #[arg(long)]
+        socket: Option<String>,
+    },
     /// セッション（--window 指定時はその window）を kill する。確認なしで即実行されるため
     /// 対象は `tako tmux list` で確認してから指定すること
     Kill {
@@ -745,6 +753,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Tmux(TmuxCommand::List { socket }) => Request::TmuxList {
             socket: socket.clone(),
         },
+        Command::Tmux(TmuxCommand::Cleanup { socket }) => Request::TmuxCleanup {
+            socket: socket.clone(),
+        },
         Command::Tmux(TmuxCommand::Kill {
             session,
             window,
@@ -940,7 +951,7 @@ fn print_result(command: &Command, result: &Value) {
                 serde_json::to_string_pretty(result).unwrap_or_default()
             );
         }
-        Command::Tmux(TmuxCommand::List { .. }) => {
+        Command::Tmux(TmuxCommand::List { .. }) | Command::Tmux(TmuxCommand::Cleanup { .. }) => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(result).unwrap_or_default()

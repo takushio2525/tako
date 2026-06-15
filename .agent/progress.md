@@ -383,3 +383,20 @@
   tmux パネルに「⏏ 退避中」セクション追加（状態ドット + 復帰ボタン）
 - 関連コミット: `a37812e` `[修正] tmux D&D タブの orphan 化防止 + tmux ビューに退避中セクション追加`
 - 次: ユーザー再起動 → 実機確認
+
+## 2026-06-15（tmux ビューの二重表示 / 無限ネスト / orphan 根治）
+
+- 二重表示 + 退避ラベル（`b9584af`）: shelved backend を kill漏れ?から除外、退避ラベルを
+  pane ID → cwd ベース名へ
+- ラッパー orphan 根治: `TmuxViewTarget` を `session`（元・監視/再 attach）と `wrapper`
+  （`tako-view-*`・close 時 kill）に分離。`drop_tmux_view_session` はラッパーのみ kill
+  （`tako-view-` 接頭辞ガード）。旧実装の「元セッション名登録」= ①ラッパー orphan
+  ②実セッション誤 kill の二重バグを解消
+- 無限ネスト根治（`tako-view-tako-view-...`）: `TmuxOpen` で tmux `session_group` へ正規化 +
+  `tako-view-*` の開き直しは新ラッパーを作らず元を直接 attach（`dispatch.rs`）
+- orphan 一括クリーンアップ（FR-2.16.11）: 起動時自動 + dispatch `TmuxCleanup` + CLI
+  `tako tmux cleanup` + MCP `tako_tmux_cleanup`（計 31 ツール）。backend socket 上の
+  `tako-`・detached・非 grouped・protected 外のみ kill（grouped/attached/実セッションは不可侵）
+- 検証: clippy 緑 / cargo test 全緑 / セルフテスト = PDF（既知）以外緑。stale だった
+  セルフテスト 2 件（ツール数 29→31・× ボタン kill→退避）も修正
+- 次: ユーザー再起動（`build-app.sh --install`）→ 実機確認

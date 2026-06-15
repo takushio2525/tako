@@ -129,6 +129,24 @@ pub fn has_session(socket: Option<&str>, name: &str) -> bool {
     run_tmux(socket, &["has-session", "-t", &format!("={name}")]).is_ok()
 }
 
+/// grouped session の所属グループ名を返す。tmux はグループ名を「最初に作られた
+/// 元セッション名」にするため、これが事実上の「元セッション」になる
+/// （例: `tako-view-master-tako-2` → `master-tako`）。単独セッション（グループ無し）や
+/// 不在の場合は `None`。tako-view-* ラッパーの再ラップ（無限ネスト）解消に使う
+pub fn session_group(socket: Option<&str>, name: &str) -> Option<String> {
+    let out = run_tmux(
+        socket,
+        &["display-message", "-p", "-t", &format!("={name}"), "#{session_group}"],
+    )
+    .ok()?;
+    let group = out.trim();
+    if group.is_empty() {
+        None
+    } else {
+        Some(group.to_string())
+    }
+}
+
 /// セッションを kill する。誤爆防止の確認は呼び出し側（UI / AI）の責務
 pub fn kill_session(socket: Option<&str>, name: &str) -> Result<(), String> {
     run_tmux(socket, &["kill-session", "-t", &format!("={name}")]).map(|_| ())

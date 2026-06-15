@@ -472,7 +472,13 @@ struct GitCollapsed {
 /// TmuxOpen でペインに表示している外部 tmux セッションの監視情報
 #[derive(Debug, Clone)]
 struct TmuxViewTarget {
+    /// 監視・再 attach 対象の**元セッション**（ラッパー名は入れない）。
+    /// これが消滅したらペインを自動クローズする
     session: String,
+    /// 表示用の `tako-view-*` grouped session 名。ペイン close 時にこれを kill する。
+    /// `None` = 元セッションを直接 attach した（復帰経路）ので close 時も kill しない
+    wrapper: Option<String>,
+    /// 元セッションが居る tmux サーバーの socket（`-L` 値。既定サーバーは None）
     socket: Option<String>,
 }
 
@@ -865,6 +871,17 @@ impl TakoApp {
             for (pane, path, text) in std::mem::take(&mut app.pending_highlights) {
                 app.spawn_highlight(pane, path, text, cx);
             }
+        }
+
+        // 起動時の orphan 一括クリーンアップ（FR-2.16.11）。復元で backend_sessions が
+        // 出揃った後に実行し、前回クラッシュ等で取り残された detached・非 grouped の
+        // backend セッションだけを掃除する（現存・退避・表示中ビューは protected で除外）
+        let cleaned = app.cleanup_orphan_tmux();
+        if !cleaned.is_empty() {
+            eprintln!(
+                "info: orphan tmux セッションを {} 件クリーンアップした",
+                cleaned.len()
+            );
         }
 
         // IPC リクエストを UI スレッドで dispatch するループ。
@@ -1826,11 +1843,18 @@ impl TakoApp {
     /// ペイン閉じ/タブ閉じのときに呼び、orphan 化を防ぐ
     fn drop_tmux_view_session(&mut self, pane_id: PaneId) {
         if let Some(target) = self.tmux_view_panes.remove(&pane_id) {
+            // 表示用ラッパー grouped session だけを kill する。直接 attach（wrapper=None）の
+            // 場合は元セッション（ユーザーのもの）なので決して触らない。`tako-view-` 接頭辞の
+            // 二重ガードで、万一トラッキングがずれても元セッションを誤爆しない
+            let Some(wrapper) = target.wrapper else {
+                return;
+            };
+            if !wrapper.starts_with("tako-view-") {
+                return;
+            }
             let socket = target.socket;
-            let session = target.session;
             std::thread::spawn(move || {
-                let sock_arg = socket.as_deref();
-                let _ = tako_core::tmux::kill_session(sock_arg, &session);
+                let _ = tako_core::tmux::kill_session(socket.as_deref(), &wrapper);
             });
         }
     }
@@ -6191,9 +6215,48 @@ impl ControlHost for TakoApp {
         self.drop_backend_session(pane);
     }
 
-    fn track_tmux_view(&mut self, pane: PaneId, session: String, socket: Option<String>) {
-        self.tmux_view_panes
-            .insert(pane, TmuxViewTarget { session, socket });
+    fn track_tmux_view(
+        &mut self,
+        pane: PaneId,
+        session: String,
+        wrapper: Option<String>,
+        socket: Option<String>,
+    ) {
+        self.tmux_view_panes.insert(
+            pane,
+            TmuxViewTarget {
+                session,
+                wrapper,
+                socket,
+            },
+        );
+    }
+
+    /// orphan tmux セッションの一括クリーンアップ（FR-2.16.11）。現存ペイン・退避ペインの
+    /// backend セッション、表示中ビューの元/ラッパー名を protected として渡し、backend
+    /// socket 上の取り残しだけを kill する。tmux 永続化 OFF / tmux 不在では何もしない
+    fn cleanup_orphan_tmux(&self) -> Vec<String> {
+        if !self.tmux_persist || !tako_core::tmux_backend::available() {
+            return Vec::new();
+        }
+        let mut protected: std::collections::HashSet<String> =
+            self.backend_sessions.values().cloned().collect();
+        // 退避中ペインの backend セッションは backend_sessions に残るため上で網羅されるが、
+        // 念のため明示的に保護する（生かしたまま隠れている）
+        for pane in self.workspace.shelved_panes() {
+            if let Some(name) = self.backend_sessions.get(&pane.id()) {
+                protected.insert(name.clone());
+            }
+        }
+        // 表示中ビューの元セッション・ラッパーも保護（足元を崩さない）
+        for target in self.tmux_view_panes.values() {
+            protected.insert(target.session.clone());
+            if let Some(wrapper) = &target.wrapper {
+                protected.insert(wrapper.clone());
+            }
+        }
+        let socket = tako_core::tmux_backend::socket_name();
+        tako_core::tmux_backend::cleanup_orphans(&socket, &protected)
     }
 
     fn reattach_shelved(&mut self, _pane: PaneId) {
@@ -7996,7 +8059,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 29, "MCP tools/list は 29 ツール");
+            check(status == 200 && tool_count == 31, "MCP tools/list は 31 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -8533,7 +8596,8 @@ mod self_test {
             check(wide_hit, "全角行のクリックが正しいセルに解決");
 
             // 47. ペインの × ボタン（dispatch 共有経路）。split で増やして × 相当の操作で
-            //     片付き、フォーカスが残存ペインへ戻ること
+            //     アクティブタブから片付くこと。× は kill ではなくたまり場へ退避（FR-2.15）
+            //     なので、ターミナル（プロセス）は生かしたまま shelved へ移る
             type_text(any, cx, &format!("{cli} split --right >/dev/null"), true);
             wait(cx, 1500).await;
             let close_button_ok = window
@@ -8545,10 +8609,11 @@ mod self_test {
                     before == 2
                         && tree.len() == 1
                         && !tree.contains(target)
-                        && !app.terminals.contains_key(&target)
+                        && app.workspace.shelved_panes().iter().any(|p| p.id() == target)
+                        && app.terminals.contains_key(&target)
                 })
                 .unwrap_or(false);
-            check(close_button_ok, "ペインの × ボタンで閉じる（dispatch 経由）");
+            check(close_button_ok, "ペインの × ボタンで退避（dispatch 経由）");
 
             // 48. tmux 一覧と kill（FR-2.13）。専用 -L ソケットで隔離し、ユーザーの
             //     実 tmux サーバーには一切触れない。tmux 不在環境ではスキップする

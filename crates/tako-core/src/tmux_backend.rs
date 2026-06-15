@@ -202,6 +202,53 @@ pub fn kill_session(socket: &str, session: &str) {
     let _ = crate::tmux::kill_session(Some(socket), session);
 }
 
+/// orphan セッションの一括クリーンアップ（FR-2.16.11）。backend socket 上の
+/// `tako-` プレフィックス・**detached**・**非 grouped**・`protected` 外のセッションを
+/// kill し、kill した名前を返す。
+///
+/// 安全設計（誤爆防止の三重ガード）:
+/// - **attached**（= いずれかのペイン/クライアントが使用中）は決して触らない
+/// - **grouped**（= 表示中ビューの元セッション or その `tako-view-*` ラッパー）も触らない。
+///   生きているビューの足元を崩さないため
+/// - `protected`（現存ペイン・退避ペインの backend 名、表示中ビューの元/ラッパー名）は二重の安全網
+///
+/// これらにより、ユーザーの実セッション（既定サーバー・非 `tako-` 名）や使用中ビューは
+/// 構造上 kill されない。対象は「クラッシュ等で取り残された detached な裸のバックエンド
+/// セッション」だけになる
+pub fn cleanup_orphans(socket: &str, protected: &std::collections::HashSet<String>) -> Vec<String> {
+    let listing = crate::tmux::run_tmux(
+        Some(socket),
+        &[
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{session_attached}\t#{session_grouped}",
+        ],
+    )
+    .unwrap_or_default();
+    let mut killed = Vec::new();
+    for line in listing.lines() {
+        let mut f = line.split('\t');
+        let (Some(name), Some(attached), Some(grouped)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        if !name.starts_with("tako-") {
+            continue; // tako 由来でないものは対象外
+        }
+        if attached != "0" {
+            continue; // 使用中
+        }
+        if grouped != "0" {
+            continue; // 表示中ビュー関連（元 or ラッパー）
+        }
+        if protected.contains(name) {
+            continue; // 現存/退避ペイン・表示中ビューが使用中
+        }
+        kill_session(socket, name);
+        killed.push(name.to_string());
+    }
+    killed
+}
+
 /// バックエンドサーバーごと落とす（セルフテストの後片付け用）
 pub fn kill_server(socket: &str) {
     let _ = crate::tmux::tmux_command(Some(socket))

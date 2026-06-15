@@ -382,6 +382,7 @@ Phase 3 設計時の指針:
 | FR-2.16.8 | 統合 tmux ビューに**どのタブにも表示されていないものを検知・表示するセクション**を設ける。対象は (a) **tako 管理外**の tmux セッション（ユーザーが直接立てたもの等）と (b) **kill 漏れ?** = tako から起動されたが対応ペインを失った orphan バックエンドセッション。両者をラベルで見た目区別し、どちらも**確認つき kill** ができる（FR-2.18 の自動サーフェスとは別物 = こちらは可視化と手動 kill） | M | ✅ 2026-06-12 |
 | FR-2.16.9 | **タブ内 attach 済みセッションのタブ紐付け表示**: tako ペイン内で `tmux attach` されている外部 tmux セッション（例: orchestrator の master セッションを別サーバーから attach）は「管理外」へ落とさず、attach クライアントの tty と tako ペインの tty 突き合わせで**該当タブの枠内に紐付けて表示**する（セッション名 + attach 先ペイン + window 一覧。window 単位の確認つき kill も可能）。CLI / MCP は既存 `tako tmux list` / `tako_tmux_list` の `clients[].tab/pane` で同じ対応情報を取得できる（新規操作なし = 開発不変条件充足） | M | ✅ 2026-06-13 |
 | FR-2.16.10 | **tmux セッションの D&D 取り込み**: 統合 tmux ビューに並ぶセッション（タブ枠内の attach 済み・管理外・kill 漏れ? のすべて）を**ドラッグ&ドロップで現在のタブ内へ取り込み、ドロップ位置のペインを分割して表示**できる。実体は新ペインで `TMUX= tmux [-L socket] attach-session` クライアントを起動する（= ネスト attach。多重 attach は tmux の通常動作として許容）。**ドラッグ中はドロップ先ペインのハイライト + 挿入プレビュー必須**: カーソル位置の象限（上下左右）から分割方向を判定し、「ドロップしたら新ペインが占める半面」を強調表示してラベルで結果を示す。同等操作は dispatch `TmuxOpen` + CLI `tako tmux open` + MCP `tako_tmux_open`（開発不変条件） | M | ✅ 2026-06-13 |
+| FR-2.16.11 | **orphan tmux セッションの一括クリーンアップ**: 前回クラッシュ等で取り残された tako 由来の裸のバックエンドセッションを掃除する。**起動時に自動実行**するほか、同等操作を dispatch `TmuxCleanup` + CLI `tako tmux cleanup` + MCP `tako_tmux_cleanup`（開発不変条件）で公開する。対象は backend socket 上の **`tako-` プレフィックス・detached・非 grouped・protected 外**のみで、使用中（attached）・表示中ビュー（grouped）・ユーザーの実セッション（既定サーバー・非 `tako-` 名）には構造上一切触れない | M | ✅ 2026-06-15 |
 
 実装メモ（FR-2.16.4〜2.16.8。2026-06-12 仕様化・同日実装）:
 
@@ -399,6 +400,25 @@ Phase 3 設計時の指針:
 - kill 確認 UI は**メッセージ行（折り返し）+ ボタン行の縦積み**（`render_kill_confirm`）。
   flex_row 一列だと長い確認文言でボタンごとパネル右端へ見切れる（2026-06-13 実機バグ②）
 - localhost ポートパネル（FR-2.19）もこの情報パネルのビューとして追加予定
+
+実装メモ（tmux ビュー取り込みの orphan / 無限ネスト根治。2026-06-15）:
+
+- **表示用ラッパーは「元」と分離して追跡する**。`TmuxOpen` の grouped session
+  `tako-view-<元>-<paneId>` は表示専用の使い捨て。`TmuxViewTarget` は監視・再 attach
+  対象の**元セッション**（`session`）と**ラッパー名**（`wrapper: Option`）を別々に持ち、
+  ペイン close 時に **kill するのはラッパーだけ**（`drop_tmux_view_session`。`tako-view-`
+  接頭辞ガードで元セッションを誤爆しない）。直接 attach した復帰経路は `wrapper = None` で
+  「close 時も kill しない」になる。旧実装は元セッション名を登録していたため①ラッパーが
+  orphan 化②閉じると**ユーザーの実セッションを kill**しかねない二重バグだった
+- **無限ネストの根治**（`tako-view-tako-view-...`）: `TmuxOpen` は開く前に tmux の
+  `session_group`（= 最初に作られた元セッション名）へ正規化する。ラッパー名や grouped
+  session を渡されても group を辿れば必ず元へ戻るため再ラップが起きない。さらに名前が
+  `tako-view-` で始まる「ラッパーの開き直し（退避からの復帰等）」は**新しいラッパーを
+  作らず元セッションを直接 attach** する
+- 起動時 orphan 掃除（FR-2.16.11）は復元で `backend_sessions` が出揃った後に実行。
+  protected = 現存ペイン・退避ペインの backend 名 + 表示中ビューの元/ラッパー名。
+  **grouped と attached は対象外**にすることで、protected の構築タイミングに依らず
+  使用中セッションを誤爆しない三重ガードにしている
 
 ### ペインタイトルバー（FR-2.1.3 の表示更新。2026-06-12 実装）
 
