@@ -24,12 +24,12 @@ use std::time::Duration;
 use futures::channel::mpsc::unbounded;
 use futures::StreamExt;
 use gpui::{
-    actions, canvas, div, point, prelude::*, px, relative, size, App, Bounds, ClipboardItem,
-    Context, CursorStyle, DragMoveEvent, ElementInputHandler, EntityInputHandler, FocusHandle,
-    Font, FontStyle, FontWeight, HighlightStyle, Hsla, KeyBinding, Keystroke, Modifiers,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollDelta,
-    ScrollWheelEvent, SharedString, Size, StrikethroughStyle, StyledText, TextRun, TextStyle,
-    UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions,
+    actions, canvas, div, fill, point, prelude::*, px, quad, relative, size, App, BorderStyle,
+    Bounds, ClipboardItem, Context, CursorStyle, DragMoveEvent, ElementInputHandler,
+    EntityInputHandler, FocusHandle, Font, FontStyle, FontWeight, HighlightStyle, Hsla, KeyBinding,
+    Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    Rgba, ScrollDelta, ScrollWheelEvent, SharedString, Size, StrikethroughStyle, StyledText,
+    TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use tako_control::{ControlHost, IncomingRequest, IpcServer, McpServer};
@@ -457,6 +457,7 @@ struct GitPanelData {
     branches: Vec<tako_core::GitBranch>,
     status: Vec<tako_core::GitStatusEntry>,
     diff_files: Vec<tako_core::DiffFile>,
+    graph: tako_core::GraphLayout,
 }
 
 /// git パネルのアコーディオン折りたたみ状態
@@ -3087,14 +3088,13 @@ impl TakoApp {
                 let hash = commit.short_hash.clone();
                 let full_hash = commit.hash.clone();
                 let is_selected = selected_commit.as_deref() == Some(&commit.hash);
-                let is_merge = commit.parents.len() > 1;
                 let has_refs = !commit.refs.is_empty();
 
                 let mut row = div()
                     .id(("git-commit", i))
                     .flex()
                     .flex_row()
-                    .items_start()
+                    .items_stretch()
                     .px_2()
                     .py(px(2.0))
                     .cursor_pointer()
@@ -3124,15 +3124,41 @@ impl TakoApp {
                         cx.notify();
                     }));
 
-                // グラフドット列
-                let dot = if is_merge { "●─" } else { "● " };
+                // グラフ列（canvas 描画）
+                let graph_w = {
+                    const LANE_W: f32 = 14.0;
+                    (data.graph.max_lanes as f32 * LANE_W + 4.0).max(18.0)
+                };
+                let graph_lines: Vec<tako_core::GraphLine> = if i < data.graph.rows.len() {
+                    data.graph.rows[i].lines.clone()
+                } else {
+                    Vec::new()
+                };
+                let graph_commit_lane = if i < data.graph.rows.len() {
+                    data.graph.rows[i].lane
+                } else {
+                    0
+                };
+                let graph_commit_color = if i < data.graph.rows.len() {
+                    data.graph.rows[i].color_index
+                } else {
+                    0
+                };
                 row = row.child(
-                    div()
-                        .w(px(18.0))
-                        .flex_none()
-                        .text_size(px(10.0))
-                        .text_color(hsla(accent))
-                        .child(dot),
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            paint_graph_row(
+                                window,
+                                bounds,
+                                &graph_lines,
+                                graph_commit_lane,
+                                graph_commit_color,
+                            );
+                        },
+                    )
+                    .w(px(graph_w))
+                    .flex_none(),
                 );
 
                 // コミット情報
@@ -3148,18 +3174,19 @@ impl TakoApp {
                 );
                 if has_refs {
                     for r in commit.refs.split(", ") {
-                        let is_head = r.contains("HEAD");
+                        let badge_color = data
+                            .graph
+                            .ref_colors
+                            .get(r)
+                            .map(|&ci| tako_core::GRAPH_PALETTE[ci])
+                            .unwrap_or(accent);
                         first_line = first_line.child(
                             div()
                                 .px_1()
                                 .rounded(px(3.0))
                                 .text_size(px(9.0))
-                                .bg(if is_head {
-                                    rgba_alpha(accent, 0.3)
-                                } else {
-                                    rgba_alpha(fg, 0.15)
-                                })
-                                .text_color(if is_head { hsla(accent) } else { hsla(fg) })
+                                .bg(rgba_alpha(badge_color, 0.25))
+                                .text_color(hsla(badge_color))
                                 .child(r.to_string()),
                         );
                     }
@@ -6911,10 +6938,97 @@ impl Render for TakoApp {
     }
 }
 
+// ──────────────────────── グラフ描画 ────────────────────────
+
+const LANE_W: f32 = 14.0;
+const LINE_W: f32 = 2.0;
+const DOT_R: f32 = 4.0;
+const CURVE_STEPS: usize = 16;
+
+/// canvas の paint コールバックから呼ぶグラフ 1 行分の描画
+fn paint_graph_row(
+    window: &mut Window,
+    bounds: Bounds<Pixels>,
+    lines: &[tako_core::GraphLine],
+    commit_lane: usize,
+    commit_color: usize,
+) {
+    let ox = bounds.origin.x;
+    let oy = bounds.origin.y;
+    let h = bounds.size.height;
+    let mid = h * 0.5;
+    let lw = px(LINE_W);
+    let half_lw = px(LINE_W / 2.0);
+
+    for line in lines {
+        match *line {
+            tako_core::GraphLine::Vertical { lane, color_index } => {
+                let x = ox + px(LANE_W / 2.0 + lane as f32 * LANE_W);
+                window.paint_quad(fill(
+                    Bounds::new(point(x - half_lw, oy), size(lw, h)),
+                    hsla(tako_core::GRAPH_PALETTE[color_index]),
+                ));
+            }
+            tako_core::GraphLine::VerticalTop { lane, color_index } => {
+                let x = ox + px(LANE_W / 2.0 + lane as f32 * LANE_W);
+                window.paint_quad(fill(
+                    Bounds::new(point(x - half_lw, oy), size(lw, mid)),
+                    hsla(tako_core::GRAPH_PALETTE[color_index]),
+                ));
+            }
+            tako_core::GraphLine::VerticalBottom { lane, color_index } => {
+                let x = ox + px(LANE_W / 2.0 + lane as f32 * LANE_W);
+                window.paint_quad(fill(
+                    Bounds::new(point(x - half_lw, oy + mid), size(lw, h - mid)),
+                    hsla(tako_core::GRAPH_PALETTE[color_index]),
+                ));
+            }
+            tako_core::GraphLine::CurveDown {
+                from_lane,
+                to_lane,
+                color_index,
+            } => {
+                let x1 = ox + px(LANE_W / 2.0 + from_lane as f32 * LANE_W);
+                let x2 = ox + px(LANE_W / 2.0 + to_lane as f32 * LANE_W);
+                let y1 = oy + mid;
+                let y2 = oy + h;
+                let color = hsla(tako_core::GRAPH_PALETTE[color_index]);
+                let dot = px(LINE_W + 0.5);
+                let half_dot = dot * 0.5;
+                for s in 0..=CURVE_STEPS {
+                    let t = s as f32 / CURVE_STEPS as f32;
+                    let st = t * t * (3.0 - 2.0 * t);
+                    let x = x1 + (x2 - x1) * st;
+                    let y = y1 + (y2 - y1) * t;
+                    window.paint_quad(fill(
+                        Bounds::new(point(x - half_dot, y - half_dot), size(dot, dot)),
+                        color,
+                    ));
+                }
+            }
+        }
+    }
+
+    // コミットドット（円）
+    let dot_r = px(DOT_R);
+    let dot_d = dot_r + dot_r;
+    let cx_pos = ox + px(LANE_W / 2.0 + commit_lane as f32 * LANE_W);
+    let cy_pos = oy + mid;
+    window.paint_quad(quad(
+        Bounds::new(point(cx_pos - dot_r, cy_pos - dot_r), size(dot_d, dot_d)),
+        dot_r,
+        hsla(tako_core::GRAPH_PALETTE[commit_color]),
+        px(0.),
+        Hsla::default(),
+        BorderStyle::default(),
+    ));
+}
+
 /// background thread で git データを取得する（2 秒ポーリング用）
 fn fetch_git_data(cwd: &std::path::Path, selected_commit: Option<&str>) -> Option<GitPanelData> {
     let repo = tako_core::git::repo_root(cwd)?;
     let commits = tako_core::git::log_commits(&repo, 200);
+    let graph = tako_core::git::compute_graph_layout(&commits);
     let branches = tako_core::git::list_branches(&repo);
     let status = tako_core::git::status(&repo);
     let diff_files = if let Some(hash) = selected_commit {
@@ -6933,6 +7047,7 @@ fn fetch_git_data(cwd: &std::path::Path, selected_commit: Option<&str>) -> Optio
         branches,
         status: status.entries,
         diff_files,
+        graph,
     })
 }
 
@@ -8735,6 +8850,7 @@ mod self_test {
                         app,
                         tako_control::protocol::Request::Split {
                             pane: Some(target.as_u64()),
+                            tab: None,
                             direction: None,
                             ratio: None,
                             command: None,
@@ -9411,6 +9527,7 @@ mod self_test {
                         app,
                         tako_control::protocol::Request::Split {
                             pane: Some(base),
+                            tab: None,
                             direction: None,
                             ratio: None,
                             command: None,
@@ -9619,6 +9736,7 @@ mod self_test {
                         app,
                         tako_control::protocol::Request::Split {
                             pane: Some(base),
+                            tab: None,
                             direction: None,
                             ratio: None,
                             command: None,

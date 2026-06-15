@@ -10,6 +10,8 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
 
+use crate::theme::Rgb;
+
 /// git バイナリの場所（tmux_bin と同パターン、プロセス内 1 回解決）
 pub fn git_bin() -> &'static str {
     static BIN: OnceLock<String> = OnceLock::new();
@@ -392,6 +394,233 @@ fn parse_diff(raw: &str) -> Vec<DiffFile> {
     files
 }
 
+// ──────────────────────── グラフレイアウト ────────────────────────
+
+/// グラフ色パレット（Catppuccin Mocha ベース、8 色ローテーション）
+pub const GRAPH_PALETTE: [Rgb; 8] = [
+    Rgb::from_hex(0x89b4fa), // Blue
+    Rgb::from_hex(0xa6e3a1), // Green
+    Rgb::from_hex(0xf9e2af), // Yellow
+    Rgb::from_hex(0xf38ba8), // Red
+    Rgb::from_hex(0xcba6f7), // Mauve
+    Rgb::from_hex(0x94e2d5), // Teal
+    Rgb::from_hex(0xfab387), // Peach
+    Rgb::from_hex(0xf5c2e7), // Pink
+];
+
+/// グラフレイアウトの計算結果
+#[derive(Debug, Clone)]
+pub struct GraphLayout {
+    pub rows: Vec<GraphRow>,
+    /// ref 名 → 色パレットインデックスの対応（バッジ色用）
+    pub ref_colors: std::collections::HashMap<String, usize>,
+    /// 全行での最大レーン数（グラフ列の幅計算用）
+    pub max_lanes: usize,
+}
+
+/// 1 行分のグラフレイアウト
+#[derive(Debug, Clone)]
+pub struct GraphRow {
+    /// このコミットが配置されるレーン（0-indexed）
+    pub lane: usize,
+    /// 色パレットのインデックス
+    pub color_index: usize,
+    /// この行で使われるレーン数
+    pub num_lanes: usize,
+    /// 描画指示のリスト
+    pub lines: Vec<GraphLine>,
+}
+
+/// 1 本の描画指示
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GraphLine {
+    /// 縦線（行全体を貫通。パススルーまたは継続）
+    Vertical { lane: usize, color_index: usize },
+    /// 縦線上半分（上端→中央。到着側、下に親がない場合）
+    VerticalTop { lane: usize, color_index: usize },
+    /// 縦線下半分（中央→下端。新しいブランチの先端）
+    VerticalBottom { lane: usize, color_index: usize },
+    /// S 字カーブ（中央→下端。分岐 or マージの接続線）
+    CurveDown {
+        from_lane: usize,
+        to_lane: usize,
+        color_index: usize,
+    },
+}
+
+/// コミット列からグラフレイアウトを計算する（newest-first 順の入力を想定）
+pub fn compute_graph_layout(commits: &[GitCommit]) -> GraphLayout {
+    use std::collections::HashMap;
+
+    let mut active: Vec<Option<String>> = Vec::new();
+    let mut lane_colors: Vec<usize> = Vec::new();
+    let mut next_color: usize = 0;
+    let mut rows = Vec::with_capacity(commits.len());
+    let mut ref_colors: HashMap<String, usize> = HashMap::new();
+    let mut max_lanes: usize = 0;
+
+    for commit in commits {
+        // 1. このコミットのレーンを決定
+        let found = active
+            .iter()
+            .position(|s| s.as_deref() == Some(&*commit.hash));
+        let has_line_above = found.is_some();
+
+        let lane = if let Some(l) = found {
+            l
+        } else {
+            // ブランチの先端（まだどこにも予約されていない）→ 空きレーンを確保
+            let l = first_empty(&active);
+            if l >= active.len() {
+                active.push(Some(commit.hash.clone()));
+                lane_colors.push(next_color);
+            } else {
+                active[l] = Some(commit.hash.clone());
+                lane_colors[l] = next_color;
+            }
+            next_color = (next_color + 1) % GRAPH_PALETTE.len();
+            l
+        };
+
+        let color_index = lane_colors[lane];
+
+        // 2. ref 名 → 色の対応を記録
+        if !commit.refs.is_empty() {
+            for r in commit.refs.split(", ") {
+                ref_colors.insert(r.to_string(), color_index);
+            }
+        }
+
+        // 3. エッジを構築
+        struct Edge {
+            from: usize,
+            to: usize,
+            color: usize,
+        }
+        let mut edges: Vec<Edge> = Vec::new();
+
+        // 他のアクティブレーンのパススルーエッジ
+        for (i, slot) in active.iter().enumerate() {
+            if i != lane && slot.is_some() {
+                edges.push(Edge {
+                    from: i,
+                    to: i,
+                    color: lane_colors[i],
+                });
+            }
+        }
+
+        // コミットのレーンをクリア
+        active[lane] = None;
+
+        // 各親のエッジを処理
+        for (pi, parent) in commit.parents.iter().enumerate() {
+            let existing = active.iter().position(|s| s.as_deref() == Some(&**parent));
+            if let Some(pl) = existing {
+                // 親が既に別レーンにいる → マージエッジ
+                edges.push(Edge {
+                    from: lane,
+                    to: pl,
+                    color: lane_colors[pl],
+                });
+            } else if pi == 0 {
+                // 第 1 親はコミットのレーンを継承（直線継続）
+                active[lane] = Some(parent.clone());
+                edges.push(Edge {
+                    from: lane,
+                    to: lane,
+                    color: color_index,
+                });
+            } else {
+                // 第 2 親以降 → 新しいレーンを確保
+                let nl = first_empty(&active);
+                let c = next_color;
+                next_color = (next_color + 1) % GRAPH_PALETTE.len();
+                if nl >= active.len() {
+                    active.push(Some(parent.clone()));
+                    lane_colors.push(c);
+                } else {
+                    active[nl] = Some(parent.clone());
+                    lane_colors[nl] = c;
+                }
+                edges.push(Edge {
+                    from: lane,
+                    to: nl,
+                    color: c,
+                });
+            }
+        }
+
+        // 4. 末尾の空きレーンを除去してコンパクト化
+        while active.last() == Some(&None) {
+            active.pop();
+            lane_colors.pop();
+        }
+
+        let num_lanes = active.len().max(lane + 1);
+        if num_lanes > max_lanes {
+            max_lanes = num_lanes;
+        }
+
+        // 5. エッジを描画指示に変換
+        let has_continuation = edges.iter().any(|e| e.from == lane && e.to == lane);
+        let mut lines = Vec::new();
+
+        // パススルー縦線（他のレーンの直線通過）
+        for e in &edges {
+            if e.from == e.to && e.from != lane {
+                lines.push(GraphLine::Vertical {
+                    lane: e.from,
+                    color_index: e.color,
+                });
+            }
+        }
+
+        // コミット自身のレーンの縦線
+        if has_continuation {
+            if has_line_above {
+                lines.push(GraphLine::Vertical { lane, color_index });
+            } else {
+                lines.push(GraphLine::VerticalBottom { lane, color_index });
+            }
+        } else if has_line_above {
+            lines.push(GraphLine::VerticalTop { lane, color_index });
+        }
+
+        // 分岐・マージのカーブ線
+        for e in &edges {
+            if e.from != e.to {
+                lines.push(GraphLine::CurveDown {
+                    from_lane: e.from,
+                    to_lane: e.to,
+                    color_index: e.color,
+                });
+            }
+        }
+
+        rows.push(GraphRow {
+            lane,
+            color_index,
+            num_lanes,
+            lines,
+        });
+    }
+
+    GraphLayout {
+        rows,
+        ref_colors,
+        max_lanes,
+    }
+}
+
+/// アクティブレーン配列で最初の空きスロットを返す（無ければ末尾の次のインデックス）
+fn first_empty(active: &[Option<String>]) -> usize {
+    active
+        .iter()
+        .position(|s| s.is_none())
+        .unwrap_or(active.len())
+}
+
 // ──────────────────────── テスト ────────────────────────
 
 #[cfg(test)]
@@ -454,5 +683,76 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].path, "a.rs");
         assert_eq!(files[1].path, "b.rs");
+    }
+
+    // ──────────────────────── グラフレイアウトテスト ────────────────────────
+
+    fn test_commit(hash: &str, parents: &[&str], refs: &str) -> GitCommit {
+        GitCommit {
+            hash: hash.to_string(),
+            short_hash: hash[..1].to_string(),
+            author: String::new(),
+            date_relative: String::new(),
+            subject: String::new(),
+            refs: refs.to_string(),
+            parents: parents.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn graph_layout_線形() {
+        let commits = vec![
+            test_commit("A", &["B"], "HEAD -> main"),
+            test_commit("B", &["C"], ""),
+            test_commit("C", &[], ""),
+        ];
+        let layout = compute_graph_layout(&commits);
+        assert_eq!(layout.rows.len(), 3);
+        assert_eq!(layout.rows[0].lane, 0);
+        assert_eq!(layout.rows[1].lane, 0);
+        assert_eq!(layout.rows[2].lane, 0);
+        assert_eq!(layout.max_lanes, 1);
+        assert!(layout.ref_colors.contains_key("HEAD -> main"));
+    }
+
+    #[test]
+    fn graph_layout_ブランチとマージ() {
+        // A は B と C をマージ。B→D, C→D
+        let commits = vec![
+            test_commit("A", &["B", "C"], ""),
+            test_commit("B", &["D"], ""),
+            test_commit("C", &["D"], ""),
+            test_commit("D", &[], ""),
+        ];
+        let layout = compute_graph_layout(&commits);
+        assert_eq!(layout.rows[0].lane, 0); // A at lane 0
+        assert_eq!(layout.rows[1].lane, 0); // B inherits lane 0
+        assert_eq!(layout.rows[2].lane, 1); // C at lane 1
+        assert_eq!(layout.rows[3].lane, 0); // D at lane 0
+        assert!(layout.max_lanes >= 2);
+    }
+
+    #[test]
+    fn graph_layout_並行ブランチ() {
+        // A→C, B→C（独立した 2 ブランチがマージ）
+        let commits = vec![
+            test_commit("A", &["C"], ""),
+            test_commit("B", &["C"], ""),
+            test_commit("C", &[], ""),
+        ];
+        let layout = compute_graph_layout(&commits);
+        assert_eq!(layout.rows[0].lane, 0); // A
+        assert_eq!(layout.rows[1].lane, 1); // B（C は既にレーン 0）
+        assert_eq!(layout.rows[2].lane, 0); // C
+    }
+
+    #[test]
+    fn graph_layout_ルートコミット() {
+        let commits = vec![test_commit("A", &[], "")];
+        let layout = compute_graph_layout(&commits);
+        assert_eq!(layout.rows.len(), 1);
+        assert_eq!(layout.rows[0].lane, 0);
+        // ルートコミット（上に線なし・親なし）→ 描画指示なし
+        assert!(layout.rows[0].lines.is_empty());
     }
 }

@@ -21,7 +21,7 @@ pub mod workspace;
 
 pub use git::{
     DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffTarget, GitBranch, GitCommit, GitStatus,
-    GitStatusEntry,
+    GitStatusEntry, GraphLayout, GraphLine, GraphRow, GRAPH_PALETTE,
 };
 pub use osc_tap::{OscEvent, PromptMark};
 pub use pane::{Pane, PaneId, PaneOrigin, TitleSource};
