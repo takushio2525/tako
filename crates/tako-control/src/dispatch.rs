@@ -15,6 +15,16 @@ use tako_core::{
 
 use crate::protocol::{error_code, Direction, FileOpKind, PreviewModeWire, Request};
 
+/// ピン留め中のプレビュー 1 件分（FR-2.16.15。list / MCP 公開用）。
+/// `group=false` なら `id` はペイン ID、`group=true` なら閉じたタブグループの由来タブ ID
+#[derive(Debug, Clone, PartialEq)]
+pub struct PinnedView {
+    pub group: bool,
+    pub id: u64,
+    pub x: f32,
+    pub y: f32,
+}
+
 /// dispatch がドメイン状態へ触るためのホスト。UI 層（tako-app）とテストが実装する
 pub trait ControlHost {
     fn workspace(&self) -> &Workspace;
@@ -106,6 +116,14 @@ pub trait ControlHost {
     /// タブ枠の折りたたみを設定する（FR-2.16.14）。`collapsed` 省略時はトグル。
     /// 永続化は実装側の責務
     fn set_tmux_tab_collapsed(&mut self, _tab: TabId, _collapsed: Option<bool>) {}
+    /// ピン留め中のプレビュー一覧（FR-2.16.15）
+    fn pinned_previews(&self) -> Vec<PinnedView> {
+        Vec::new()
+    }
+    /// ペインのプレビューをピン留め / 解除する（FR-2.16.15）。`pinned` 省略時はトグル
+    fn set_pin_pane(&mut self, _pane: PaneId, _pinned: Option<bool>) {}
+    /// 閉じたタブグループのプレビューをピン留め / 解除する（FR-2.16.15 / FR-2.16.16）
+    fn set_pin_group(&mut self, _tab: TabId, _pinned: Option<bool>) {}
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -1123,6 +1141,31 @@ pub fn dispatch(
             }))
         }
 
+        Request::Pin {
+            pane,
+            group_tab,
+            pinned,
+        } => {
+            if let Some(t) = group_tab {
+                // 閉じたタブグループ: tab は閉じているので tabs() に無い。退避ペインの由来で検証
+                let tab = TabId::from_raw(t);
+                if !host
+                    .workspace()
+                    .shelved_panes()
+                    .iter()
+                    .any(|p| p.origin_tab() == tab)
+                {
+                    return Err(DispatchError::TabNotFound(t));
+                }
+                host.set_pin_group(tab, pinned);
+                Ok(json!({ "pinned": pinned_json(host), "group_tab": t }))
+            } else {
+                let (_, target) = resolve_pane(host.workspace(), pane)?;
+                host.set_pin_pane(target, pinned);
+                Ok(json!({ "pinned": pinned_json(host), "pane": target.as_u64() }))
+            }
+        }
+
         Request::ShelvedKill { pane } => {
             let pane_id = PaneId::from_raw(pane);
             if host.workspace_mut().remove_shelved(pane_id).is_none() {
@@ -1362,7 +1405,29 @@ fn list_json(host: &dyn ControlHost) -> Value {
             })
         })
         .collect();
-    json!({ "active_tab": ws.active_tab_id().as_u64(), "tabs": tabs })
+    json!({
+        "active_tab": ws.active_tab_id().as_u64(),
+        "tabs": tabs,
+        // ピン留め中のプレビューウィンドウ（FR-2.16.15。AI が現在のピンを把握できる）
+        "pinned": pinned_json(host),
+    })
+}
+
+/// ピン留め中のプレビュー一覧を JSON 配列へ（list / Pin 応答で共用。FR-2.16.15）
+fn pinned_json(host: &dyn ControlHost) -> Value {
+    Value::Array(
+        host.pinned_previews()
+            .into_iter()
+            .map(|p| {
+                json!({
+                    "kind": if p.group { "group" } else { "pane" },
+                    "id": p.id,
+                    "x": p.x,
+                    "y": p.y,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// タイトルの出どころの文字列表現（list / MCP 公開用。FR-2.12.1）
@@ -1480,6 +1545,8 @@ mod tests {
         detached: Vec<u64>,
         previews: std::collections::HashMap<u64, (String, PreviewModeWire)>,
         collapsed: std::collections::HashSet<u64>,
+        /// ピン留め: (group, id)
+        pins: Vec<(bool, u64)>,
     }
 
     impl MockHost {
@@ -1490,6 +1557,19 @@ mod tests {
                 detached: Vec::new(),
                 previews: std::collections::HashMap::new(),
                 collapsed: std::collections::HashSet::new(),
+                pins: Vec::new(),
+            }
+        }
+
+        fn toggle_pin(&mut self, group: bool, id: u64, pinned: Option<bool>) {
+            let pos = self.pins.iter().position(|p| *p == (group, id));
+            let want = pinned.unwrap_or(pos.is_none());
+            match (want, pos) {
+                (true, None) => self.pins.push((group, id)),
+                (false, Some(i)) => {
+                    self.pins.remove(i);
+                }
+                _ => {}
             }
         }
 
@@ -1540,6 +1620,23 @@ mod tests {
             } else {
                 self.collapsed.remove(&tab.as_u64());
             }
+        }
+        fn pinned_previews(&self) -> Vec<PinnedView> {
+            self.pins
+                .iter()
+                .map(|(group, id)| PinnedView {
+                    group: *group,
+                    id: *id,
+                    x: 0.0,
+                    y: 0.0,
+                })
+                .collect()
+        }
+        fn set_pin_pane(&mut self, pane: PaneId, pinned: Option<bool>) {
+            self.toggle_pin(false, pane.as_u64(), pinned);
+        }
+        fn set_pin_group(&mut self, tab: TabId, pinned: Option<bool>) {
+            self.toggle_pin(true, tab.as_u64(), pinned);
         }
     }
 
@@ -1918,6 +2015,61 @@ mod tests {
         )
         .unwrap();
         assert!(host.tmux_tab_collapsed(t1));
+    }
+
+    #[test]
+    fn pinはトグルとunpinができ_listのpinnedに出る() {
+        // FR-2.16.15: pane のピン留め / 解除が list の pinned に反映される
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        // 初期は空
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        assert_eq!(list["pinned"].as_array().unwrap().len(), 0);
+        // pinned 省略 = トグルでピン留め
+        dispatch(
+            &mut host,
+            Request::Pin {
+                pane: Some(root),
+                group_tab: None,
+                pinned: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        let pinned = list["pinned"].as_array().unwrap();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0]["kind"].as_str(), Some("pane"));
+        assert_eq!(pinned[0]["id"].as_u64(), Some(root));
+        // pinned=false で解除
+        dispatch(
+            &mut host,
+            Request::Pin {
+                pane: Some(root),
+                group_tab: None,
+                pinned: Some(false),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        assert_eq!(list["pinned"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn pinのgroup_tabは退避の由来が無いと弾く() {
+        // 閉じたタブグループのピンは、その由来を持つ退避ペインが居るときだけ通る
+        let mut host = MockHost::new();
+        let err = dispatch(
+            &mut host,
+            Request::Pin {
+                pane: None,
+                group_tab: Some(9999),
+                pinned: Some(true),
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(matches!(err, Err(DispatchError::TabNotFound(9999))));
     }
 
     #[test]

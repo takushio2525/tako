@@ -516,6 +516,23 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_pin_preview",
+            "description": "サイドバー tmux ビューのバックグラウンドペイン、または閉じたタブグループの\
+                実画面サムネイルを、アプリ内のフローティングウィンドウとして常駐させる（ライブ更新し続ける）。\
+                裏で動いているペインを画面に出さず見張りたいときに使う。pane = 対象ペイン、\
+                group_tab = 閉じたタブグループの由来タブ ID（排他、どちらも省略で呼び出し元ペイン）。\
+                pinned=false で解除、省略でトグル。現在のピンは tako_list_panes の pinned で確認できる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("ピン留めするペイン ID（省略時は呼び出し元）"),
+                    "group_tab": { "type": "integer", "description": "閉じたタブグループの由来タブ ID（pane と排他）" },
+                    "pinned": { "type": "boolean", "description": "true = ピン留め、false = 解除（省略時はトグル）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_open_file",
             "description": "ファイルをプレビューペインで開いてユーザーに見せる。\
                 コードはシンタックスハイライト付き、Markdown は既定でレンダリング表示\
@@ -904,6 +921,19 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             tab: u64_arg(args, "tab")?,
             collapsed: bool_arg(args, "collapsed")?,
         },
+        "tako_pin_preview" => {
+            let group_tab = u64_arg(args, "group_tab")?;
+            Request::Pin {
+                // group_tab 指定時は pane を補完しない（排他）
+                pane: if group_tab.is_some() {
+                    None
+                } else {
+                    u64_arg(args, "pane")?.or(caller)
+                },
+                group_tab,
+                pinned: bool_arg(args, "pinned")?,
+            }
+        }
         "tako_check_health" => Request::CheckHealth,
         _ => return Err(format!("不明なツール: {name}")),
     })
@@ -1320,7 +1350,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 32);
+        assert_eq!(tools.len(), 33);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

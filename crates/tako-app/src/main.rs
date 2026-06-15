@@ -140,6 +140,9 @@ const PREVIEW_POPUP_W: f32 = 380.0;
 const PREVIEW_POPUP_H: f32 = 240.0;
 /// ピン留めウィンドウのタイトルバー高さ（px。ドラッグ移動 + × の操作帯）
 const PIN_TITLE_BAR: f32 = 20.0;
+/// ピン留めウィンドウの既定サイズ（px。ホバーポップアップより小さい常駐窓）
+const PIN_W: f32 = 280.0;
+const PIN_H: f32 = 180.0;
 
 /// 右サイドバー情報パネルの内部タブ（固定タブ 0 個方針。2026-06-12）。
 /// FR-2.16.6 で agents は tmux ビューへ統合済み。Git は git graph（FR-3.6）の
@@ -466,6 +469,10 @@ struct TakoApp {
     /// サイドバー tmux ビューでホバー中のプレビュー（FR-2.16.13。バックグラウンド行 /
     /// 閉じたタブグループの中身をマウス位置のポップアップで覗く）
     hover_preview: Option<HoverPreview>,
+    /// ピン留めされた常駐プレビュー（FR-2.16.15。アプリ内フローティングウィンドウ）
+    pinned_previews: Vec<PinnedPreview>,
+    /// ドラッグ移動中のピン（対象 + 掴んだ位置からピン左上までのオフセット px）
+    dragging_pin: Option<(PreviewTarget, Point<Pixels>)>,
 }
 
 /// git パネルのデータスナップショット（FR-3.6 / FR-3.9）
@@ -573,6 +580,23 @@ struct HoverPreview {
     target: PreviewTarget,
     /// ホバー開始時のマウス位置（ウィンドウ座標 px）。ここを起点に左側へポップアップを出す
     anchor: Point<Pixels>,
+}
+
+/// ピン留めされた常駐プレビュー（FR-2.16.15）。アプリ内フローティングウィンドウとして
+/// 残り続け、ライブ更新する。`pos` はウィンドウ座標の左上（タイトルバー D&D で動かす）
+#[derive(Debug, Clone, Copy)]
+struct PinnedPreview {
+    target: PreviewTarget,
+    pos: Point<Pixels>,
+}
+
+/// ピン / プレビュー要素の安定 ID（GPUI の要素 id 用）。ペイン ID とタブ ID の
+/// 衝突を避けるためグループには最上位ビットを立てる
+fn pin_key(target: PreviewTarget) -> u64 {
+    match target {
+        PreviewTarget::Pane(id) => id.as_u64(),
+        PreviewTarget::ClosedGroup(tab) => tab.as_u64() | (1 << 63),
+    }
 }
 
 /// タブ内ペインで attach 中の外部 tmux セッション 1 件分（FR-2.16.9）。
@@ -885,6 +909,8 @@ impl TakoApp {
             drawer_height: DRAWER_DEFAULT_HEIGHT,
             shelved_pending_kill: None,
             hover_preview: None,
+            pinned_previews: Vec::new(),
+            dragging_pin: None,
         };
         if restored.is_empty() {
             let root_id = app.workspace.active_tab().tree().focused();
@@ -1646,6 +1672,27 @@ impl TakoApp {
             self.collapsed_tmux_tabs.insert(tab);
         } else {
             self.collapsed_tmux_tabs.remove(&tab);
+        }
+    }
+
+    /// プレビューのピン留めを設定する（FR-2.16.15）。pinned 省略時はトグル。
+    /// UI の 📌 ボタンと dispatch（CLI / MCP）の両方から呼ぶ（操作経路を一本化）。
+    /// 新規ピンは重ならないようカスケード配置する（以後 D&D で動かせる）
+    fn set_pin(&mut self, target: PreviewTarget, pinned: Option<bool>) {
+        let existing = self.pinned_previews.iter().position(|p| p.target == target);
+        let want = pinned.unwrap_or(existing.is_none());
+        match (want, existing) {
+            (true, None) => {
+                let n = self.pinned_previews.len() as f32;
+                self.pinned_previews.push(PinnedPreview {
+                    target,
+                    pos: point(px(160.0 + n * 28.0), px(120.0 + n * 28.0)),
+                });
+            }
+            (false, Some(i)) => {
+                self.pinned_previews.remove(i);
+            }
+            _ => {}
         }
     }
 
@@ -2802,6 +2849,10 @@ impl TakoApp {
                 std::collections::HashSet::new();
             for row in group_rows {
                 let pane = row.pane;
+                let pinned = self
+                    .pinned_previews
+                    .iter()
+                    .any(|p| p.target == PreviewTarget::Pane(pane));
                 let (color, state_label) = match row.state {
                     CommandState::Failed(code) => (theme.ansi[1], format!("エラー ({code})")),
                     CommandState::Idle => (theme.ansi[2], "入力待ち".to_string()),
@@ -2901,6 +2952,30 @@ impl TakoApp {
                                 .text_ellipsis()
                                 .child(SharedString::from(detail)),
                         )
+                        // バックグラウンド行に 📌 ピン留めボタン（FR-2.16.15。ピン中は常時表示、
+                        // 未ピンは行ホバー時のみ）。前面行はプレビュー対象外なので出さない
+                        .when(!is_active, |d| {
+                            d.child(
+                                div()
+                                    .id(("pane-pin", pane.as_u64()))
+                                    .px_1()
+                                    .flex_none()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_size(px(11.0))
+                                    .when(pinned, |d| d.text_color(hsla(theme.accent)))
+                                    .when(!pinned, |d| {
+                                        d.opacity(0.0).group_hover("tmux-row", |d| d.opacity(1.0))
+                                    })
+                                    .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.set_pin(PreviewTarget::Pane(pane), None);
+                                        cx.notify();
+                                    }))
+                                    .child("📌"),
+                            )
+                        })
                         .child(
                             div()
                                 .id(("pane-kill", pane.as_u64()))
@@ -3184,8 +3259,13 @@ impl TakoApp {
         }
         for shelf_group in &closed_origin {
             let group_tab = shelf_group.tab;
+            let group_pinned = self
+                .pinned_previews
+                .iter()
+                .any(|p| p.target == PreviewTarget::ClosedGroup(group_tab));
             let mut card = div()
                 .id(("tmux-closed-group", group_tab.as_u64()))
+                .group("tmux-closed-group")
                 .flex()
                 .flex_col()
                 .gap_1()
@@ -3211,17 +3291,47 @@ impl TakoApp {
                 }))
                 .child(
                     div()
-                        .text_size(px(11.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(hsla(theme.tab_inactive_foreground))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(SharedString::from(format!(
-                            "タブ {}（閉じたタブ・{} 件）",
-                            truncate(&shelf_group.title, 20),
-                            shelf_group.entries.len()
-                        ))),
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(hsla(theme.tab_inactive_foreground))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(SharedString::from(format!(
+                                    "タブ {}（閉じたタブ・{} 件）",
+                                    truncate(&shelf_group.title, 20),
+                                    shelf_group.entries.len()
+                                ))),
+                        )
+                        // グループ全体を 📌 ピン留め（FR-2.16.15 / FR-2.16.16）
+                        .child(
+                            div()
+                                .id(("group-pin", group_tab.as_u64()))
+                                .px_1()
+                                .flex_none()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_size(px(11.0))
+                                .when(group_pinned, |d| d.text_color(hsla(theme.accent)))
+                                .when(!group_pinned, |d| {
+                                    d.opacity(0.0)
+                                        .group_hover("tmux-closed-group", |d| d.opacity(1.0))
+                                })
+                                .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.set_pin(PreviewTarget::ClosedGroup(group_tab), None);
+                                    cx.notify();
+                                }))
+                                .child("📌"),
+                        ),
                 );
             for entry in &shelf_group.entries {
                 card = card.child(self.render_shelved_row(entry, cx));
@@ -4743,10 +4853,26 @@ impl TakoApp {
             if self.dragging_border.take().is_some()
                 | self.dragging_scrollbar.take().is_some()
                 | self.selecting.take().is_some()
+                | self.dragging_pin.take().is_some()
                 | std::mem::take(&mut self.dragging_panel)
             {
                 cx.notify();
             }
+            return;
+        }
+        // ピン留めウィンドウのタイトルバー D&D 移動（FR-2.16.15）
+        if let Some((target, offset)) = self.dragging_pin {
+            let vw = f32::from(window.viewport_size().width);
+            let vh = f32::from(window.viewport_size().height);
+            // タイトルバーが掴める範囲に左上をクランプ（画面外へ飛ばさない）
+            let x = (f32::from(event.position.x) - f32::from(offset.x))
+                .clamp(0.0, (vw - 40.0).max(0.0));
+            let y = (f32::from(event.position.y) - f32::from(offset.y))
+                .clamp(0.0, (vh - PIN_TITLE_BAR).max(0.0));
+            if let Some(p) = self.pinned_previews.iter_mut().find(|p| p.target == target) {
+                p.pos = point(px(x), px(y));
+            }
+            cx.notify();
             return;
         }
         // 情報パネルの幅ドラッグ
@@ -4797,6 +4923,7 @@ impl TakoApp {
         }
         if self.dragging_border.take().is_some()
             | self.dragging_scrollbar.take().is_some()
+            | self.dragging_pin.take().is_some()
             | std::mem::take(&mut self.dragging_panel)
         {
             cx.notify();
@@ -6083,6 +6210,104 @@ impl TakoApp {
         )
     }
 
+    /// ピン留めされた常駐プレビュー群（FR-2.16.15）。アプリ内フローティングウィンドウとして
+    /// 絶対配置で描き、タイトルバー D&D で移動・× で解除。中身（端末グリッド）はライブ更新される。
+    /// 対象が消えた（kill 等）ピンはこのフレームでは描かず、次の操作で掃除される
+    fn render_pinned_previews(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let theme = self.theme.clone();
+        // 借用衝突を避けるため対象リストを先に取り出す（PinnedPreview は Copy）
+        let pins: Vec<PinnedPreview> = self.pinned_previews.clone();
+        pins.into_iter()
+            .filter(|pin| self.preview_has_content(pin.target))
+            .map(|pin| {
+                let target = pin.target;
+                let key = pin_key(target);
+                let label = self.preview_label(target);
+                div()
+                    .id(("pin", key))
+                    .absolute()
+                    .left(pin.pos.x)
+                    .top(pin.pos.y)
+                    .w(px(PIN_W))
+                    .h(px(PIN_H))
+                    .flex()
+                    .flex_col()
+                    .rounded_md()
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(hsla(theme.accent))
+                    .bg(rgba(theme.background))
+                    // ピン上の操作が下のペインへ抜けないようにする
+                    .occlude()
+                    .child(
+                        // タイトルバー = ドラッグ移動ハンドル + ラベル + LIVE + × 解除
+                        div()
+                            .id(("pin-title", key))
+                            .h(px(PIN_TITLE_BAR))
+                            .flex_none()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .px_1()
+                            .bg(rgba(theme.tab_bar_background))
+                            .text_size(px(10.0))
+                            .text_color(hsla(theme.tab_inactive_foreground))
+                            .cursor(CursorStyle::OpenHand)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                                    if let Some(p) =
+                                        this.pinned_previews.iter().find(|p| p.target == target)
+                                    {
+                                        this.dragging_pin = Some((
+                                            target,
+                                            point(e.position.x - p.pos.x, e.position.y - p.pos.y),
+                                        ));
+                                    }
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(SharedString::from(truncate(&label, 28))),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(9.0))
+                                    .text_color(hsla(theme.accent))
+                                    .child("● LIVE"),
+                            )
+                            .child(
+                                div()
+                                    .id(("pin-close", key))
+                                    .flex_none()
+                                    .px_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
+                                    .hover(|d| {
+                                        d.bg(rgba_alpha(theme.ansi[1], 0.25))
+                                            .text_color(hsla(theme.foreground))
+                                    })
+                                    .child("×")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.set_pin(target, Some(false));
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(self.preview_content(target))
+                    .into_any_element()
+            })
+            .collect()
+    }
+
     /// ターミナルの現在画面を行 div のリストへ変換する（通常ペイン描画と退避プレビューで共用）。
     /// run ごとの色・太字・下線などの装飾を StyledText のハイライトへ写す
     fn terminal_screen_lines(&self, pane_id: PaneId, show_cursor: bool) -> Vec<gpui::Div> {
@@ -6962,6 +7187,34 @@ impl ControlHost for TakoApp {
         self.set_tmux_collapsed(tab, collapsed);
     }
 
+    fn pinned_previews(&self) -> Vec<tako_control::PinnedView> {
+        self.pinned_previews
+            .iter()
+            .map(|p| match p.target {
+                PreviewTarget::Pane(id) => tako_control::PinnedView {
+                    group: false,
+                    id: id.as_u64(),
+                    x: f32::from(p.pos.x),
+                    y: f32::from(p.pos.y),
+                },
+                PreviewTarget::ClosedGroup(tab) => tako_control::PinnedView {
+                    group: true,
+                    id: tab.as_u64(),
+                    x: f32::from(p.pos.x),
+                    y: f32::from(p.pos.y),
+                },
+            })
+            .collect()
+    }
+
+    fn set_pin_pane(&mut self, pane: PaneId, pinned: Option<bool>) {
+        self.set_pin(PreviewTarget::Pane(pane), pinned);
+    }
+
+    fn set_pin_group(&mut self, tab: TabId, pinned: Option<bool>) {
+        self.set_pin(PreviewTarget::ClosedGroup(tab), pinned);
+    }
+
     fn reattach_shelved(&mut self, _pane: PaneId) {
         // セッションは terminals HashMap に残っている。再描画のみ必要
     }
@@ -7536,6 +7789,8 @@ impl Render for TakoApp {
         let context_menu_overlay = self.render_context_menu(cx);
         // サイドバー tmux ビューのホバープレビュー（FR-2.16.13。マウス位置に実画面サムネイル）
         let hover_preview_overlay = self.render_hover_preview(window);
+        // ピン留めされた常駐プレビュー（FR-2.16.15。アプリ内フローティングウィンドウ）
+        let pinned_overlays = self.render_pinned_previews(cx);
 
         // IME 変換中テキストのインライン表示（FR-1.9）。変換対象ペインのカーソル位置に
         // 未確定文字列を重ね、全体に細下線・IME の注目文節に太下線 + 選択色を付ける
@@ -7733,6 +7988,7 @@ impl Render for TakoApp {
             .child(ime_registration)
             .children(context_menu_overlay)
             .children(hover_preview_overlay)
+            .children(pinned_overlays)
     }
 }
 
@@ -8765,7 +9021,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 32, "MCP tools/list は 32 ツール");
+            check(status == 200 && tool_count == 33, "MCP tools/list は 33 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)

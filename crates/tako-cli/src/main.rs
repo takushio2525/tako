@@ -78,6 +78,9 @@ enum Command {
     /// サイドバー tmux ビューのタブ枠を折りたたむ / 展開する
     /// （配下のバックグラウンド行 + 退避を隠し、前面表示中の行は残す）
     Collapse(CollapseArgs),
+    /// プレビューをピン留め / 解除する（バックグラウンドペイン / 閉じたタブグループの
+    /// 実画面をアプリ内フローティングウィンドウとして常駐・ライブ更新させる）
+    Pin(PinArgs),
     /// ペインをたまり場へ退避する（プロセスは生きたまま画面から外す）
     Shelve(ShelveArgs),
     /// たまり場のペインを画面に復帰させる
@@ -402,6 +405,19 @@ struct CollapseArgs {
     #[arg(long)]
     tab: Option<u64>,
     /// on = 折りたたむ、off = 展開（省略時はトグル）
+    #[arg(value_parser = ["on", "off"])]
+    state: Option<String>,
+}
+
+#[derive(Args)]
+struct PinArgs {
+    /// ピン留めするペイン ID（省略時は呼び出し元。--group-tab と排他）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// 閉じたタブグループの由来タブ ID（--pane と排他）
+    #[arg(long)]
+    group_tab: Option<u64>,
+    /// on = ピン留め、off = 解除（省略時はトグル）
     #[arg(value_parser = ["on", "off"])]
     state: Option<String>,
 }
@@ -764,6 +780,16 @@ fn build_request(command: &Command) -> Result<Request, String> {
             tab: args.tab,
             collapsed: args.state.as_deref().map(|s| s == "on"),
         },
+        Command::Pin(args) => Request::Pin {
+            // group-tab 指定時はペイン不要。pane / group-tab 省略時は呼び出し元ペイン
+            pane: if args.group_tab.is_some() {
+                None
+            } else {
+                target_pane(args.pane)?
+            },
+            group_tab: args.group_tab,
+            pinned: args.state.as_deref().map(|s| s == "on"),
+        },
         Command::Shelve(args) => Request::Shelve {
             pane: target_pane(args.pane)?,
         },
@@ -966,7 +992,8 @@ fn print_result(command: &Command, result: &Value) {
         | Command::Portdetect(_)
         | Command::Persist(_)
         | Command::Panel(_)
-        | Command::Collapse(_) => {
+        | Command::Collapse(_)
+        | Command::Pin(_) => {
             println!("{result}")
         }
         Command::Git(GitCommand::Log { .. }) | Command::Git(GitCommand::Diff { .. }) => {
