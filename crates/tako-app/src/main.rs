@@ -1804,8 +1804,20 @@ impl TakoApp {
     fn drop_backend_session(&mut self, pane_id: PaneId) {
         if let Some(name) = self.backend_sessions.remove(&pane_id) {
             let socket = tako_core::tmux_backend::socket_name();
-            // UI スレッドを塞がない（tmux 不調時の output() 待ちを避ける）
             std::thread::spawn(move || tako_core::tmux_backend::kill_session(&socket, &name));
+        }
+    }
+
+    /// TmuxOpen で attach した外部 tmux セッションを kill する。
+    /// ペイン閉じ/タブ閉じのときに呼び、orphan 化を防ぐ
+    fn drop_tmux_view_session(&mut self, pane_id: PaneId) {
+        if let Some(target) = self.tmux_view_panes.remove(&pane_id) {
+            let socket = target.socket;
+            let session = target.session;
+            std::thread::spawn(move || {
+                let sock_arg = socket.as_deref();
+                let _ = tako_core::tmux::kill_session(sock_arg, &session);
+            });
         }
     }
 
@@ -1829,7 +1841,7 @@ impl TakoApp {
                 self.previews.remove(&pane_id);
                 self.scroll_accum.remove(&pane_id);
                 self.scroll_ctls.remove(&pane_id);
-                self.tmux_view_panes.remove(&pane_id);
+                self.drop_tmux_view_session(pane_id);
                 self.drop_backend_session(pane_id);
             }
             Err(_) => {
@@ -1852,7 +1864,7 @@ impl TakoApp {
                     self.previews.remove(&id);
                     self.scroll_accum.remove(&id);
                     self.scroll_ctls.remove(&id);
-                    self.tmux_view_panes.remove(&id);
+                    self.drop_tmux_view_session(id);
                     self.drop_backend_session(id);
                 }
             }
@@ -1860,7 +1872,7 @@ impl TakoApp {
                 // LastTab: アプリ終了は UI 層の責務。最後のペインの明示 close なので
                 // セッションも破棄し、次回起動で空レイアウトを復元しないようファイルも消す
                 for id in pane_ids {
-                    self.tmux_view_panes.remove(&id);
+                    self.drop_tmux_view_session(id);
                     self.drop_backend_session(id);
                 }
                 if std::env::var_os("TAKO_SELF_TEST").is_none() {
@@ -2765,6 +2777,98 @@ impl TakoApp {
             }
             root = root.child(card);
         }
+
+        // 退避中セクション: たまり場にあるペインを表示（tmux ビュー内で視認可能にする）
+        let shelved: Vec<_> = self
+            .workspace
+            .shelved_panes()
+            .iter()
+            .map(|p| {
+                let label = p
+                    .title()
+                    .map(|s| s.to_string())
+                    .or_else(|| p.role().map(|s| s.to_string()))
+                    .unwrap_or_else(|| format!("pane {}", p.id()));
+                let state = self
+                    .terminals
+                    .get(&p.id())
+                    .map(|s| s.command_state())
+                    .unwrap_or(CommandState::Unknown);
+                (p.id(), label, state)
+            })
+            .collect();
+        if !shelved.is_empty() {
+            let mut shelved_card = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_1()
+                .rounded_md()
+                .border_1()
+                .border_color(hsla(theme.pane_border))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(hsla(theme.tab_inactive_foreground))
+                        .child(format!("⏏ 退避中 ({})", shelved.len())),
+                );
+            for (pane_id, label, state) in &shelved {
+                let pane_id = *pane_id;
+                let state_color = match state {
+                    CommandState::Failed(_) => Some(theme.ansi[1]),
+                    CommandState::Running => Some(theme.accent),
+                    CommandState::Idle => Some(theme.ansi[3]),
+                    _ => None,
+                };
+                let mut row = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px_1()
+                    .py(px(1.0))
+                    .rounded_sm()
+                    .text_size(px(11.0))
+                    .text_color(hsla(theme.tab_inactive_foreground));
+                if let Some(color) = state_color {
+                    row = row.child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color)));
+                }
+                row = row.child(
+                    div()
+                        .flex_1()
+                        .overflow_x_hidden()
+                        .text_ellipsis()
+                        .child(label.clone()),
+                );
+                row = row.child(
+                    div()
+                        .id(("tmux-unshelve", pane_id.as_u64()))
+                        .cursor_pointer()
+                        .text_size(px(10.0))
+                        .text_color(hsla(theme.accent))
+                        .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
+                        .px_1()
+                        .rounded_sm()
+                        .child("復帰")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let target = this.workspace.active_tab().tree().focused();
+                            if let Err(e) =
+                                this.workspace
+                                    .unshelve_pane(pane_id, target, SplitDirection::Right)
+                            {
+                                eprintln!("warning: たまり場から復帰できない: {e}");
+                            }
+                            if this.workspace.shelved_panes().is_empty() {
+                                this.drawer_visible = false;
+                            }
+                            cx.notify();
+                        })),
+                );
+                shelved_card = shelved_card.child(row);
+            }
+            root = root.child(shelved_card);
+        }
+
         root
     }
 
@@ -4906,6 +5010,7 @@ impl TakoApp {
                                         this.previews.remove(&pane_id);
                                         this.scroll_accum.remove(&pane_id);
                                         this.scroll_ctls.remove(&pane_id);
+                                        this.drop_tmux_view_session(pane_id);
                                         this.drop_backend_session(pane_id);
                                     }
                                     cx.notify();
@@ -6026,8 +6131,7 @@ impl ControlHost for TakoApp {
         self.previews.remove(&pane);
         self.scroll_accum.remove(&pane);
         self.scroll_ctls.remove(&pane);
-        self.tmux_view_panes.remove(&pane);
-        // CLI / MCP からの明示 close（FR-2.5.4）。バックエンドセッションも片付ける
+        self.drop_tmux_view_session(pane);
         self.drop_backend_session(pane);
     }
 
