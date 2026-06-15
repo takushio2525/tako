@@ -1779,8 +1779,18 @@ impl TakoApp {
     /// ペインの × ボタン（FR-1.3 の補助 UI）。CLI / MCP と同じコマンド層（dispatch）を
     /// 通す（開発不変条件の UI 側の一貫性）。「最後のタブの最後の 1 ペイン」は dispatch が
     /// 拒否するため、誤クリックでアプリが終了することはない（終了は cmd+W / cmd+Q のみ）
+    /// ペインタイトルバーの × ボタン = ペインを閉じる（kill）。タブの × と挙動を統一する。
+    /// 紐づく tmux セッション（backend の tako-* / view の tako-view-* ラッパー）を
+    /// `remove_pane` が確実に kill するため、管理外 / orphan として残らない。
+    /// 「閉じたいが処理は生かしたい」ときはタイトルバーの ー ボタン（`shelve_pane_button`）を使う
     fn close_pane_button(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
-        // FR-2.15.1: × ボタンは kill ではなくたまり場への退避
+        self.remove_pane(pane_id, cx);
+    }
+
+    /// ペインタイトルバーの ー ボタン = ペインをたまり場へ退避（FR-2.15.1）。
+    /// プロセス・tmux セッションは生かしたまま、ツリーから外してたまり場に移す。
+    /// 最後のタブの最後のペインのときは代替ペインを生やしてから退避する
+    fn shelve_pane_button(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
         match self.workspace.shelve_pane(pane_id) {
             Ok(()) => {}
             Err(WorkspaceError::LastTab) => {
@@ -5631,6 +5641,32 @@ impl TakoApp {
                             }))
                             .child("×"),
                     )
+                    .child(
+                        // ー ボタン = たまり場へ退避（プロセスは生かす。タブの ー と統一）
+                        div()
+                            .id(("pane-shelve", pane_id.as_u64()))
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
+                            .hover(|d| {
+                                d.bg(rgba_alpha(theme.accent, 0.25))
+                                    .text_color(hsla(theme.foreground))
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.shelve_pane_button(pane_id, cx);
+                            }))
+                            .child("ー"),
+                    )
                     .children(
                         state_dot.map(|color| {
                             div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color))
@@ -8595,9 +8631,10 @@ mod self_test {
                 .unwrap_or(false);
             check(wide_hit, "全角行のクリックが正しいセルに解決");
 
-            // 47. ペインの × ボタン（dispatch 共有経路）。split で増やして × 相当の操作で
-            //     アクティブタブから片付くこと。× は kill ではなくたまり場へ退避（FR-2.15）
-            //     なので、ターミナル（プロセス）は生かしたまま shelved へ移る
+            // 47. ペインの × ボタン = kill（dispatch 共有経路）。split で増やして × 相当の
+            //     操作でアクティブタブから片付き、ターミナル（プロセス）も破棄され、退避にも
+            //     残らないこと。タブの × と挙動を統一し、紐づく tmux セッションも
+            //     remove_pane が kill するため管理外 / orphan に残らない
             type_text(any, cx, &format!("{cli} split --right >/dev/null"), true);
             wait(cx, 1500).await;
             let close_button_ok = window
@@ -8609,11 +8646,30 @@ mod self_test {
                     before == 2
                         && tree.len() == 1
                         && !tree.contains(target)
+                        && !app.workspace.shelved_panes().iter().any(|p| p.id() == target)
+                        && !app.terminals.contains_key(&target)
+                })
+                .unwrap_or(false);
+            check(close_button_ok, "ペインの × ボタンで kill（dispatch 経由）");
+
+            // 47b. ペインの ー ボタン = たまり場へ退避（dispatch 共有経路）。プロセス
+            //      （ターミナル）は生かしたまま、ツリーから外れて shelved へ移ること（FR-2.15.1）
+            type_text(any, cx, &format!("{cli} split --right >/dev/null"), true);
+            wait(cx, 1500).await;
+            let shelve_button_ok = window
+                .update(cx, |app, _, cx| {
+                    let before = app.workspace.active_tab().tree().len();
+                    let target = app.focused_pane();
+                    app.shelve_pane_button(target, cx);
+                    let tree = app.workspace.active_tab().tree();
+                    before == 2
+                        && tree.len() == 1
+                        && !tree.contains(target)
                         && app.workspace.shelved_panes().iter().any(|p| p.id() == target)
                         && app.terminals.contains_key(&target)
                 })
                 .unwrap_or(false);
-            check(close_button_ok, "ペインの × ボタンで退避（dispatch 経由）");
+            check(shelve_button_ok, "ペインの ー ボタンで退避（dispatch 経由）");
 
             // 48. tmux 一覧と kill（FR-2.13）。専用 -L ソケットで隔離し、ユーザーの
             //     実 tmux サーバーには一切触れない。tmux 不在環境ではスキップする
