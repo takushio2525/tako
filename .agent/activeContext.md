@@ -46,7 +46,8 @@
   「ターミナルを実際に壊す経路」（remove_pane / remove_tab / shelved-kill / detach_session）に
   集約してある。これで orphan を防ぎつつ unshelve で view が生き残る。**もし「退避で
   ラッパーを消し、復帰で元へ attach し直す」挙動を望むなら** unshelve 側に再 spawn を足す
-  follow-up が必要（元名は `tmux_view_panes` の `session` に保持済み）
+  follow-up が必要（元名は `tmux_view_panes` の `session` に保持済み）。
+  **2026-06-15 ユーザー承認: 現設計（shelve はラッパー維持）で確定。厳密版は不要**
 - **セルフテストは保守が滞りがち**: 今回ツール数（29→31）と × ボタン（kill→退避）の stale を
   修正。項目追加時は `main.rs` のセルフテストと `mcp.rs` の `tools.len()` を同時更新する
 
