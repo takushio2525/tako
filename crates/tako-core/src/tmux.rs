@@ -136,7 +136,13 @@ pub fn has_session(socket: Option<&str>, name: &str) -> bool {
 pub fn session_group(socket: Option<&str>, name: &str) -> Option<String> {
     let out = run_tmux(
         socket,
-        &["display-message", "-p", "-t", &format!("={name}"), "#{session_group}"],
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            &format!("={name}"),
+            "#{session_group}",
+        ],
     )
     .ok()?;
     let group = out.trim();
