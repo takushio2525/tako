@@ -413,3 +413,14 @@
   `9791b6a` `[改善] 退避エリア横並びプレビュー化`
 - 検証: clippy / fmt 緑、セルフテスト PDF（既知）以外緑（47/47b/47c 追加・通過）
 - 次: ユーザー再起動（`build-app.sh --install` 実行予定）→ 実機確認
+
+## 2026-06-15（サイドバー tmux ビュー一本化: 二重化解消・表示分類・退避のタブ別分離）
+- 統合 tmux ビュー + 退避を 3 改修。①attach 外部セッションをホストペイン行下へ入れ子化し
+  二重表示解消（FR-2.16.9 統合）②各ペイン行に表示中/バックグラウンドのバッジ + list に
+  surface 公開（FR-2.16.12）③`Workspace::shelved` を `Vec<ShelvedPane>`（由来タブ記録）へ
+  し、タブツリー/ドロワーを由来タブ別に分離・閉じたタブは集約・復帰は由来タブへ（FR-2.15.6）
+- ShelvedList に origin_tab/surface 公開、unshelve は target 省略で由来タブ復帰、layout 永続化
+  に origin_tab 追加（後方互換）。dispatch/layout/workspace のテスト追加
+- 関連コミット: `f64d2a3` `[改善] サイドバー tmux ビュー一本化…`
+- 検証: build / clippy(-D warnings) / fmt / test 全緑、セルフテストは既知 PDF 以外緑
+- 次: push → `build-app.sh --install` → 再起動で実機確認

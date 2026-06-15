@@ -4,31 +4,33 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-06-15・退避 UI 刷新 + ×=kill バグ修正）
+## 現在の対象（2026-06-15・サイドバー tmux ビュー一本化 = 3 要望完了）
 
-- **緊急バグ修正（commit `16066b5`）**: ペインの × が `shelve_pane` だけを呼び、
-  `drop_tmux_view_session` / `drop_backend_session` を呼ばず、tmux セッション（backend
-  `tako-*` / view `tako-view-*` ラッパー）が kill されず「管理外」に残っていた。× を
-  `remove_pane`（tree close + terminal/preview 削除 + 両セッション kill、LastPane はタブごと）
-  へ変更し、タブの × と挙動統一。**ペイン単位の退避動線は失わないよう、タブと同じ
-  ー（退避 = `shelve_pane_button`）ボタンをペインタイトルバーに追加**
-- **退避エリア刷新（commit `9791b6a`）**: たまり場ドロワーを縦テキストリスト →
-  **横並びの実画面プレビューカード + 横スクロール**へ。各カードは通常ペインの行描画を
-  共通化した `terminal_screen_lines()` で実画面サムネイルを描き（カード本文サイズへ
-  退避ターミナルを resize）、上部に通常ペイン同様のタイトルバー（状態ドット + ラベル +
-  「復帰」+ 右上 × kill）。× は「完全に破棄?」確認 → tmux セッションごと kill
-- **検証済み**: clippy 緑 / fmt 緑 / セルフテスト = PDF（既知の Core Graphics 失敗）以外緑
-  （47=× kill / 47b=ー 退避 / 47c=ドロワー横並びプレビュー描画 を追加・通過）
-- **次**: tako 終了 → `scripts/build-app.sh --install` → 再起動で実機確認（push 済み）
+commit `f64d2a3` で統合 tmux ビュー + 退避を 3 点改修（全 QA 緑、未プッシュ → push 予定）。
+
+- **二重化解消（FR-2.16.9 統合）**: attach 中の外部 tmux セッションを独立ブロックで重複
+  表示せず、**ホストペイン行の下へインデント入れ子表示**（`render_attached_session_rows`）。
+  ホスト行 detail にセッション名を出し「1 セッション = タブツリー上 1 箇所」に統合。
+  データ層 `tmux_view_groups().sessions` は不変（self-test 61f 維持）
+- **表示分類（FR-2.16.12）**: 各ペイン行に表示中（アクティブタブ）/ バックグラウンドの
+  バッジ（`surface_badge`）。list の各ペインに `surface`（foreground/background）公開
+- **退避のタブ別分離（FR-2.15.6）**: `Workspace::shelved` を `Vec<ShelvedPane>`（由来タブ
+  ID + タブ名スナップショット）へ。タブツリーは各タブ枠内に由来退避をバックグラウンド行
+  表示、閉じたタブ由来は「タブ \<名前\>（閉じたタブ）」へ集約。ドロワーも由来タブごとに
+  グループ化。復帰は既定で由来タブへ。`ShelvedList` に origin_tab/origin_tab_title/surface、
+  `unshelve` は target 省略で由来タブ復帰（開発不変条件）
+- **検証済み**: build / clippy(-D warnings) / fmt / test 全緑（app33 / cli10 / control54 /
+  core103）。セルフテストは項目70 PDF（既知 Core Graphics）以外緑 = 1〜69 通過
+- **次**: `git push` → tako 終了 → `scripts/build-app.sh --install` → 再起動で実機確認
 - 最終更新: 2026-06-15
 
 ## 残作業・既知の制約
 
-- ドロワーは現状リサイズ不可（既定 240px 固定。必要なら上端ドラッグ handle を follow-up）
-- 退避にプレビューペイン（ターミナル無し）が含まれる場合カード本文はラベルのみ表示
-- コンテキストメニューの位置がサイドバー基準でなくウィンドウ基準になる可能性
-- PDF プレビューのセルフテストが Core Graphics 環境依存で失敗（既知）
-- git パネルのコミットグラフは現在テキストベース
+- ドロワーのグループは横並び（タブ見出し + カード行）。グループ見出し分 16px を本文高さから
+  減算（`DRAWER_GROUP_HEADER`）。サムネイル resize は冪等で近似
+- 閉じたタブ由来の退避は ID が後続新規タブに再利用されないよう `TabId::from_raw` で採番予約
+- PDF プレビューのセルフテストが Core Graphics 環境依存で失敗（既知・本変更と無関係）
+- ドロワーは現状リサイズ不可（既定 240px 固定）
 
 ## 未着手タスク（優先順はユーザーと相談）
 
@@ -40,26 +42,23 @@
 
 ## 直近の観点・指摘（実装時に踏みやすい点）
 
-- **CI（GitHub Actions）はリポ設定で意図的に無効化中**（2026-06-12〜）。fmt 漏れがそのまま
-  入る（今回 tmux.rs:136 の既存崩れを `da26023` で修正）。コミット前は必ず
-  `cargo fmt --all --check`（exit code）も確認する。パイプ + `&& echo OK` は `tail` の
-  exit を見てしまい誤判定するので注意
-- **× と ー の役割（2026-06-15 確定）**: ペイン / タブとも ー = 退避、× = kill。
-  × は `remove_pane`（= `tako close` 相当で CLI/MCP と動線一致）、ー は `shelve_pane`
-  （= `tako shelve` 相当）。開発不変条件は両方とも既存 dispatch にマップ済みで満たす
-- **退避プレビューは退避ターミナルを resize する**: カード本文 cols/rows に合わせて
-  `resize`（冪等）。復帰時は render_pane が元サイズへ戻す。TUI は SIGWINCH で再描画
-- **Edit ツールのフックが変更を巻き戻す**: 大きい置換は Bash + python3 が安全
-  （今回 render_drawer は python3 一括置換で通した）
-- **セルフテストは保守が滞りがち**: 項目追加時は `main.rs` のセルフテストと
-  `mcp.rs` の `tools.len()` を同時更新（今回 MCP ツール数の変化なし）
+- **CI（GitHub Actions）はリポ設定で意図的に無効化中**（2026-06-12〜）。コミット前は必ず
+  `cargo fmt --all --check`（exit code）を確認する。パイプ + `&& echo OK` は誤判定するので注意
+- **ShelvedPane の pass-through**: `id()/title()/role()` を備えるため既存呼び出しは無改修で
+  通る。pane 本体は `.pane()`、由来は `.origin_tab()/.origin_tab_title()`
+- **退避は最後のペイン/タブで由来タブが閉じる**: その場合も由来タブ名はスナップショット済み
+  なので「閉じたタブ」グループで親を明記できる（空タブは残さない方針 = ユーザー承認済み）
+- **大きい置換は Edit より Bash + python3 が安全**（描画ループ削除は python で実施）
+- **gpui の戻り型**: `.id()` を付けた要素は `Stateful<Div>`。ヘルパ戻り型に注意
 
 ## 現フェーズで Read すべき設計書
 
+- 退避/タブツリー再修正時: `requirements.md` FR-2.15 / FR-2.16
 - FR-3.5 軽い編集着手時: `architecture.md`「コンセプト②の実現」
-- 配布・オンボーディング着手時: `roadmap.md` Phase 7
 
 ## 関連ファイル / リンク
 
 - リポジトリ: https://github.com/takushio2525/tako（private）
-- 仕様一式: `.agent/concept.md` / `requirements.md` / `architecture.md` / `roadmap.md`
+- 主な変更: `crates/tako-core/src/workspace.rs`（ShelvedPane）/
+  `crates/tako-app/src/main.rs`（render_tmux_view / render_drawer）/
+  `crates/tako-control/src/{dispatch,layout}.rs`
