@@ -314,6 +314,23 @@ impl Workspace {
         self.shelved.iter().any(|p| p.id() == pane_id)
     }
 
+    /// タブ内の全ペインをたまり場へ退避する（FR-2.15 タブ単位退避）。
+    /// タブを閉じて全ペインを shelved に移す。最後の 1 タブの場合は LastTab を返す
+    /// （呼び出し側で新ペインを生やしてからリトライする想定）
+    pub fn shelve_tab(&mut self, tab_id: TabId) -> Result<Vec<PaneId>, WorkspaceError> {
+        if self.get_tab(tab_id).is_none() {
+            return Err(WorkspaceError::TabNotFound(tab_id));
+        }
+        if self.tabs.len() == 1 {
+            return Err(WorkspaceError::LastTab);
+        }
+        let tab = self.close_tab(tab_id).expect("複数タブ確認済み");
+        let panes = tab.into_tree().into_panes();
+        let ids: Vec<PaneId> = panes.iter().map(|p| p.id()).collect();
+        self.shelved.extend(panes);
+        Ok(ids)
+    }
+
     fn activate_by_offset(&mut self, offset: usize) -> TabId {
         let index = self
             .tabs
@@ -542,6 +559,35 @@ mod tests {
         let removed = ws.remove_shelved(p2_id);
         assert!(removed.is_some());
         assert_eq!(ws.shelved_panes().len(), 0);
+    }
+
+    #[test]
+    fn タブごとたまり場に退避できる() {
+        let mut ws = Workspace::new("t1", pane());
+        let p1 = ws.active_tab().tree().focused();
+        let p2 = pane();
+        let p2_id = p2.id();
+        ws.active_tab_mut()
+            .tree_mut()
+            .split(p1, SplitDirection::Right, p2)
+            .unwrap();
+        let t2 = ws.create_tab("t2", pane());
+        // t1（p1, p2）をまとめて退避
+        let t1 = ws.tabs()[0].id();
+        let shelved_ids = ws.shelve_tab(t1).unwrap();
+        assert_eq!(shelved_ids.len(), 2);
+        assert!(shelved_ids.contains(&p1));
+        assert!(shelved_ids.contains(&p2_id));
+        assert_eq!(ws.tabs().len(), 1);
+        assert_eq!(ws.active_tab_id(), t2);
+        assert_eq!(ws.shelved_panes().len(), 2);
+    }
+
+    #[test]
+    fn 最後のタブはタブ退避できない() {
+        let mut ws = Workspace::new("t1", pane());
+        let t1 = ws.active_tab_id();
+        assert_eq!(ws.shelve_tab(t1).unwrap_err(), WorkspaceError::LastTab);
     }
 
     #[test]

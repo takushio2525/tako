@@ -604,6 +604,12 @@ struct ShelvedPaneDrag {
     pane: PaneId,
 }
 
+/// D&D ペイロード: タブをたまり場へ退避（FR-2.15 タブ D&D 退避）
+#[derive(Debug, Clone, Copy)]
+struct TabDrag {
+    tab: TabId,
+}
+
 /// ドラッグ中のペイロード種別（`TakoApp::drag_kind`）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DragKind {
@@ -611,6 +617,7 @@ enum DragKind {
     File,
     Pane,
     ShelvedPane,
+    Tab,
 }
 
 /// ドロップ先の挿入位置。上下左右 = その方向へ分割、Center = ファイル D&D のみで
@@ -1766,6 +1773,27 @@ impl TakoApp {
                 }
             }
             Err(e) => eprintln!("warning: たまり場へ退避できない: {e}"),
+        }
+        cx.notify();
+    }
+
+    /// タブ内の全ペインをたまり場へ退避する（FR-2.15 タブ単位退避）
+    fn shelve_tab(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        match self.workspace.shelve_tab(tab_id) {
+            Ok(_shelved_ids) => {}
+            Err(WorkspaceError::LastTab) => {
+                let new_pane = Pane::new(PaneOrigin::User);
+                let new_id = new_pane.id();
+                let title = format!("{}", self.workspace.tabs().len() + 1);
+                self.workspace.create_tab(title, new_pane);
+                if let Err(e) = self.spawn_session(new_id, SpawnOptions::default(), cx) {
+                    eprintln!("warning: 代替ペインを起動できない: {e}");
+                }
+                if let Err(e) = self.workspace.shelve_tab(tab_id) {
+                    eprintln!("warning: タブをたまり場へ退避できない: {e}");
+                }
+            }
+            Err(e) => eprintln!("warning: タブをたまり場へ退避できない: {e}"),
         }
         cx.notify();
     }
@@ -4095,6 +4123,7 @@ impl TakoApp {
                 (DragKind::File, _) => "ここに分割して開く",
                 (DragKind::Pane, _) => "この位置に移動",
                 (DragKind::ShelvedPane, _) => "ここに復帰",
+                (DragKind::Tab, _) => "この位置に移動",
             };
             overlay = overlay.child(
                 div()
@@ -4695,7 +4724,24 @@ impl TakoApp {
                     .children(
                         dot.map(|color| div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color))),
                     )
+                    .on_drag(
+                        TabDrag { tab: id },
+                        self.drag_ghost_builder(DragKind::Tab, truncate(&label, 24), cx),
+                    )
                     .child(SharedString::from(truncate(&label, 24)))
+                    .child(
+                        div()
+                            .id(("tab-shelve", id.as_u64()))
+                            .px_1()
+                            .cursor_pointer()
+                            .text_color(hsla(theme.tab_inactive_foreground))
+                            .hover(|d| d.text_color(hsla(theme.foreground)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.shelve_tab(id, cx);
+                            }))
+                            .child("ー"),
+                    )
                     .child(
                         div()
                             .id(("tab-close", id.as_u64()))
@@ -4750,7 +4796,7 @@ impl TakoApp {
     }
 
     /// たまり場ドロワーの描画（FR-2.15。下部、ステータスバーの上に展開）
-    fn render_drawer(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+    fn render_drawer(&mut self, cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
         if !self.drawer_visible {
             return None;
         }
@@ -4903,6 +4949,7 @@ impl TakoApp {
 
         Some(
             div()
+                .id("drawer-drop-target")
                 .flex()
                 .flex_col()
                 .flex_none()
@@ -4911,6 +4958,9 @@ impl TakoApp {
                 .bg(rgba(theme.tab_bar_background))
                 .border_t_1()
                 .border_color(hsla(theme.pane_border))
+                .on_drop::<TabDrag>(cx.listener(|this, drag: &TabDrag, _, cx| {
+                    this.shelve_tab(drag.tab, cx);
+                }))
                 .child(
                     div()
                         .flex()
@@ -4996,6 +5046,9 @@ impl TakoApp {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.drawer_visible = !this.drawer_visible;
                         cx.notify();
+                    }))
+                    .on_drop::<TabDrag>(cx.listener(|this, drag: &TabDrag, _, cx| {
+                        this.shelve_tab(drag.tab, cx);
                     }))
                     .child(if shelved_count > 0 {
                         format!("⏏ 退避 ({})", shelved_count)
