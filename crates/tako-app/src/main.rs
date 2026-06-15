@@ -1398,12 +1398,25 @@ impl TakoApp {
     /// attach 中のセッションはタブ枠内の紐付け表示（FR-2.16.9）が代表するため除外し、
     /// 残りを「kill 漏れ?（orphan バックエンド）」と「管理外（ユーザー直起動等）」に分類する
     fn tmux_unlisted_sessions(&self) -> Vec<UnlistedTmuxSession> {
+        // 退避中ペインの backend セッションは「退避中」セクションで表示するため、
+        // ここ（kill漏れ?/管理外）からは除外する（二重表示の防止。2026-06-15）
+        let shelved_sessions: std::collections::HashSet<String> = self
+            .workspace
+            .shelved_panes()
+            .iter()
+            .filter_map(|p| self.backend_sessions.get(&p.id()).cloned())
+            .collect();
         self.tmux_sessions
             .iter()
             .filter_map(|session| {
                 let backend = session["backend"].as_bool().unwrap_or(false);
                 if backend && session["backend_pane"].as_u64().is_some() {
                     return None; // タブ枠内のペイン行で表示済み
+                }
+                if let Some(name) = session["name"].as_str() {
+                    if shelved_sessions.contains(name) {
+                        return None; // 退避中セクションで表示するため除外
+                    }
                 }
                 if Self::tmux_session_attached_at(session).is_some() {
                     return None; // tako ペイン内で attach 中 = タブ枠へ紐付け表示済み
@@ -2789,7 +2802,15 @@ impl TakoApp {
                     .title()
                     .map(|s| s.to_string())
                     .or_else(|| p.role().map(|s| s.to_string()))
-                    .unwrap_or_else(|| format!("pane {}", p.id()));
+                    .or_else(|| {
+                        // cwd のベース名（例: ~/projects/tako → 「tako」）で意味づけする
+                        self.terminals
+                            .get(&p.id())
+                            .and_then(|s| s.cwd())
+                            .and_then(|c| c.file_name())
+                            .map(|n| format!("ターミナル: {}", n.to_string_lossy()))
+                    })
+                    .unwrap_or_else(|| "ターミナル".to_string());
                 let state = self
                     .terminals
                     .get(&p.id())
@@ -4941,7 +4962,15 @@ impl TakoApp {
                     .title()
                     .map(|s| s.to_string())
                     .or_else(|| p.role().map(|s| s.to_string()))
-                    .unwrap_or_else(|| format!("pane {}", p.id()));
+                    .or_else(|| {
+                        // cwd のベース名（例: ~/projects/tako → 「tako」）で意味づけする
+                        self.terminals
+                            .get(&p.id())
+                            .and_then(|s| s.cwd())
+                            .and_then(|c| c.file_name())
+                            .map(|n| format!("ターミナル: {}", n.to_string_lossy()))
+                    })
+                    .unwrap_or_else(|| "ターミナル".to_string());
                 let state = self
                     .terminals
                     .get(&p.id())
