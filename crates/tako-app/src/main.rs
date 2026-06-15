@@ -134,6 +134,13 @@ const DRAWER_GROUP_HEADER: f32 = 16.0;
 /// たまり場の退避プレビューカード 1 枚の幅（px。横並び + 横スクロール）
 const SHELF_CARD_WIDTH: f32 = 300.0;
 
+/// タブツリーのホバープレビュー / ピン留めウィンドウの既定サイズ（px。FR-2.16.13）。
+/// 実画面サムネイル（terminal_screen_lines）をクリップ表示する箱の寸法
+const PREVIEW_POPUP_W: f32 = 380.0;
+const PREVIEW_POPUP_H: f32 = 240.0;
+/// ピン留めウィンドウのタイトルバー高さ（px。ドラッグ移動 + × の操作帯）
+const PIN_TITLE_BAR: f32 = 20.0;
+
 /// 右サイドバー情報パネルの内部タブ（固定タブ 0 個方針。2026-06-12）。
 /// FR-2.16.6 で agents は tmux ビューへ統合済み。Git は git graph（FR-3.6）の
 /// 実装までプレースホルダ（パネルは切り替え式コンテナとして設計）
@@ -455,6 +462,9 @@ struct TakoApp {
     drawer_height: f32,
     /// たまり場内のペインの kill 確認待ち
     shelved_pending_kill: Option<PaneId>,
+    /// サイドバー tmux ビューでホバー中のプレビュー（FR-2.16.13。バックグラウンド行 /
+    /// 閉じたタブグループの中身をマウス位置のポップアップで覗く）
+    hover_preview: Option<HoverPreview>,
 }
 
 /// git パネルのデータスナップショット（FR-3.6 / FR-3.9）
@@ -538,6 +548,25 @@ struct ShelvedEntry {
 struct ClosedOriginShelfGroup {
     title: String,
     entries: Vec<ShelvedEntry>,
+}
+
+/// ホバープレビュー / ピン留めの対象（FR-2.16.13）。サイドバー tmux ビューの
+/// バックグラウンド行（単一ペイン）や閉じたタブグループ全体の中身を覗くために使う。
+/// MCP / CLI からも同じ語彙で操作できるよう core の ID を直接持つ（設計原則 5）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewTarget {
+    /// 単一ペイン（バックグラウンド行のホバー。FR-2.16.13）
+    Pane(PaneId),
+}
+
+/// ホバー中のプレビュー（FR-2.16.13）。マウス位置を起点にポップアップを出す。
+/// ポップアップ自体は読み取り専用にし、ピン留め操作は行 / カード側のボタンへ置く
+/// （ポップアップへマウスを移すと行ホバーが切れる問題を避けるため）
+#[derive(Debug, Clone, Copy)]
+struct HoverPreview {
+    target: PreviewTarget,
+    /// ホバー開始時のマウス位置（ウィンドウ座標 px）。ここを起点に左側へポップアップを出す
+    anchor: Point<Pixels>,
 }
 
 /// タブ内ペインで attach 中の外部 tmux セッション 1 件分（FR-2.16.9）。
@@ -838,6 +867,7 @@ impl TakoApp {
             drawer_visible: false,
             drawer_height: DRAWER_DEFAULT_HEIGHT,
             shelved_pending_kill: None,
+            hover_preview: None,
         };
         if restored.is_empty() {
             let root_id = app.workspace.active_tab().tree().focused();
@@ -1573,6 +1603,9 @@ impl TakoApp {
     /// 集約センターからのジャンプ（FR-2.10.2）。CLI / MCP と同じコマンド層
     /// （dispatch の Focus = タブ切替も伴う）を通す。パネルは開いたまま
     fn jump_to_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        // ジャンプ後はホバープレビューを畳む（対象が前面化すると hover-leave が
+        // 発火せずポップアップが残るため。FR-2.16.13）
+        self.hover_preview = None;
         let result = tako_control::dispatch(
             self,
             tako_control::protocol::Request::Focus {
@@ -2775,6 +2808,25 @@ impl TakoApp {
                         .overflow_hidden()
                         .hover(|d| d.bg(rgba_alpha(theme.tab_bar_background, 0.8)))
                         .on_click(cx.listener(move |this, _, _, cx| this.jump_to_pane(pane, cx)))
+                        // バックグラウンド行はホバーで実画面プレビューを出す（FR-2.16.13）。
+                        // 前面表示中（アクティブタブ）はペインエリアで見えるので対象外
+                        .when(!is_active, |d| {
+                            d.on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+                                if *hovered {
+                                    this.hover_preview = Some(HoverPreview {
+                                        target: PreviewTarget::Pane(pane),
+                                        anchor: window.mouse_position(),
+                                    });
+                                } else if matches!(
+                                    this.hover_preview,
+                                    Some(HoverPreview { target: PreviewTarget::Pane(p), .. })
+                                        if p == pane
+                                ) {
+                                    this.hover_preview = None;
+                                }
+                                cx.notify();
+                            }))
+                        })
                         // 表示分類バッジ（FR-2.16.12。表示中 = アクティブタブ所属）
                         .child(self.surface_badge(is_active))
                         .child(
@@ -5774,6 +5826,150 @@ impl TakoApp {
         )
     }
 
+    /// プレビュー対象のラベル（ポップアップ / ピンのタイトルに使う。FR-2.16.13）
+    fn preview_label(&self, target: PreviewTarget) -> String {
+        match target {
+            PreviewTarget::Pane(pane_id) => self.pane_preview_label(pane_id),
+        }
+    }
+
+    /// ペインの表示名（title / role > プレビュー名 > OSC タイトル > 既定）。
+    /// tmux ビューの行ラベル（`tmux_view_groups`）と同じ優先順位で揃える。
+    /// ツリー内・退避中のどちらのペインも解決できる
+    fn pane_preview_label(&self, pane_id: PaneId) -> String {
+        let pane = self
+            .workspace
+            .tabs()
+            .iter()
+            .find_map(|t| t.tree().get(pane_id))
+            .or_else(|| self.workspace.shelved(pane_id).map(|s| s.pane()));
+        if let Some(p) = pane {
+            match (p.title(), p.role()) {
+                (Some(t), Some(r)) => return format!("{t} · {r}"),
+                (Some(t), None) => return t.to_string(),
+                (None, Some(r)) => return r.to_string(),
+                (None, None) => {}
+            }
+        }
+        if let Some(preview) = self.previews.get(&pane_id) {
+            return format!("📄 {}", preview.file_name());
+        }
+        self.terminals
+            .get(&pane_id)
+            .and_then(|s| s.title())
+            .unwrap_or("ターミナル")
+            .to_string()
+    }
+
+    /// プレビュー本文（実画面サムネイルの行 div 列）。Pane は端末の現在グリッドをそのまま
+    /// 読む（リサイズしない＝バックグラウンドのプログラムを乱さない）。ライブ更新は
+    /// `on_term_event` が出力ごとに呼ぶ `cx.notify()` の再描画で自動的に得られる
+    fn preview_lines(&self, target: PreviewTarget) -> Vec<gpui::Div> {
+        match target {
+            PreviewTarget::Pane(pane_id) => self.terminal_screen_lines(pane_id, false),
+        }
+    }
+
+    /// プレビューの本文ボックス（タイトルバー + 実画面サムネイル）を組む。
+    /// ホバーポップアップとピン留めウィンドウで共用する（FR-2.16.13）
+    fn preview_body(
+        &self,
+        target: PreviewTarget,
+        lines: Vec<gpui::Div>,
+        live: bool,
+        extra_title: Option<gpui::Div>,
+    ) -> gpui::Div {
+        let theme = &self.theme;
+        let label = self.preview_label(target);
+        let mut titlebar = div()
+            .h(px(PIN_TITLE_BAR))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .px_1()
+            .bg(rgba(theme.tab_bar_background))
+            .text_size(px(11.0))
+            .text_color(hsla(theme.tab_inactive_foreground))
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(SharedString::from(truncate(&label, 40))),
+            );
+        if live {
+            titlebar = titlebar.child(
+                div()
+                    .flex_none()
+                    .text_size(px(9.0))
+                    .text_color(hsla(theme.accent))
+                    .child("● LIVE"),
+            );
+        }
+        if let Some(extra) = extra_title {
+            titlebar = titlebar.child(extra);
+        }
+        let body = if lines.is_empty() {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(11.0))
+                .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.6))
+                .child(SharedString::from(truncate(&label, 24)))
+        } else {
+            div()
+                .flex_1()
+                .p(px(PANE_PADDING))
+                .overflow_hidden()
+                .bg(rgba(theme.background))
+                .children(lines)
+        };
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(titlebar)
+            .child(body)
+    }
+
+    /// ホバープレビューのポップアップ（FR-2.16.13）。マウス位置の左側に実画面サムネイルを
+    /// 出す（tmux ビューは右パネルにあるため左へ伸ばす）。読み取り専用（ピン留めは行 /
+    /// カード側のボタン）。ライブ更新は通常の再描画で得られる
+    fn render_hover_preview(&self, window: &Window) -> Option<gpui::AnyElement> {
+        let hp = self.hover_preview?;
+        let theme = &self.theme;
+        let lines = self.preview_lines(hp.target);
+        // 中身を持たない対象（プレビューペイン等でサムネイル無し）はポップアップを出さない
+        if lines.is_empty() {
+            return None;
+        }
+        let viewport = window.viewport_size();
+        let left = (f32::from(hp.anchor.x) - PREVIEW_POPUP_W - 12.0).max(8.0);
+        let top = f32::from(hp.anchor.y)
+            .min((f32::from(viewport.height) - PREVIEW_POPUP_H - 8.0).max(8.0))
+            .max(8.0);
+        Some(
+            div()
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .w(px(PREVIEW_POPUP_W))
+                .h(px(PREVIEW_POPUP_H))
+                .rounded_md()
+                .overflow_hidden()
+                .border_1()
+                .border_color(hsla(theme.accent))
+                .bg(rgba(theme.background))
+                .child(self.preview_body(hp.target, lines, true, None))
+                .into_any_element(),
+        )
+    }
+
     /// ターミナルの現在画面を行 div のリストへ変換する（通常ペイン描画と退避プレビューで共用）。
     /// run ごとの色・太字・下線などの装飾を StyledText のハイライトへ写す
     fn terminal_screen_lines(&self, pane_id: PaneId, show_cursor: bool) -> Vec<gpui::Div> {
@@ -7217,6 +7413,8 @@ impl Render for TakoApp {
             .collect();
 
         let context_menu_overlay = self.render_context_menu(cx);
+        // サイドバー tmux ビューのホバープレビュー（FR-2.16.13。マウス位置に実画面サムネイル）
+        let hover_preview_overlay = self.render_hover_preview(window);
 
         // IME 変換中テキストのインライン表示（FR-1.9）。変換対象ペインのカーソル位置に
         // 未確定文字列を重ね、全体に細下線・IME の注目文節に太下線 + 選択色を付ける
@@ -7413,6 +7611,7 @@ impl Render for TakoApp {
             .child(self.render_status_bar(cx))
             .child(ime_registration)
             .children(context_menu_overlay)
+            .children(hover_preview_overlay)
     }
 }
 
