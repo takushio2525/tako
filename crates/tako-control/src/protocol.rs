@@ -118,9 +118,12 @@ impl PreviewModeWire {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Request {
-    /// ペイン分割（FR-2.2.1 / FR-2.5.3）。`command` 指定時はシェルの代わりに実行する
+    /// ペイン分割（FR-2.2.1 / FR-2.5.3）。`command` 指定時はシェルの代わりに実行する。
+    /// `tab` 指定時はそのタブのフォーカス中ペインの隣に分割する（`pane` より優先）
     Split {
         pane: Option<u64>,
+        /// タブ ID 指定（そのタブのフォーカス中ペインの隣に分割する。pane と排他）
+        tab: Option<u64>,
         direction: Option<Direction>,
         /// 新ペイン側の取り分（0.0–1.0、省略時は等分）
         ratio: Option<f32>,
@@ -375,6 +378,7 @@ mod tests {
             "secret",
             Request::Split {
                 pane: Some(3),
+                tab: None,
                 direction: Some(Direction::Down),
                 ratio: None,
                 command: Some(vec!["npm".into(), "run".into(), "dev".into()]),

@@ -122,12 +122,25 @@ pub fn dispatch(
     match request {
         Request::Split {
             pane,
+            tab,
             direction,
             ratio,
             command,
             cwd,
         } => {
-            let (tab, target) = resolve_pane(host.workspace(), pane)?;
+            // tab 指定時はそのタブのフォーカス中ペインを基準にする（active tab 非依存）
+            let (tab, target) = if let Some(tab_raw) = tab {
+                let tab_id = find_tab(host.workspace(), tab_raw)?;
+                let focused = host
+                    .workspace()
+                    .get_tab(tab_id)
+                    .expect("find_tab で存在確認済み")
+                    .tree()
+                    .focused();
+                (tab_id, focused)
+            } else {
+                resolve_pane(host.workspace(), pane)?
+            };
             let new_pane = Pane::new(origin);
             let new_id = new_pane.id();
             // 呼び出し元（target）と同じタブに生える（FR-2.1.2）
@@ -1321,6 +1334,7 @@ mod tests {
             host,
             Request::Split {
                 pane: Some(pane),
+                tab: None,
                 direction: None,
                 ratio: None,
                 command: None,
@@ -1349,6 +1363,51 @@ mod tests {
             .unwrap()
             .origin();
         assert_eq!(origin, PaneOrigin::Cli);
+    }
+
+    #[test]
+    fn splitのtab指定は別タブ内に分割する() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        // タブ 2 を作り、タブ 1 に戻る
+        let result =
+            dispatch(&mut host, Request::TabNew { title: None }, PaneOrigin::Cli).unwrap();
+        let tab2 = result["tab"].as_u64().unwrap();
+        let tab2_pane = result["pane"].as_u64().unwrap();
+        let tab1 = host.ws.tabs()[0].id().as_u64();
+        dispatch(
+            &mut host,
+            Request::TabSelect { tab: tab1 },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(host.ws.active_tab_id().as_u64(), tab1);
+        // tab 指定でタブ 2 内に分割（active tab はタブ 1 のまま）
+        let result = dispatch(
+            &mut host,
+            Request::Split {
+                pane: None,
+                tab: Some(tab2),
+                direction: Some(Direction::Down),
+                ratio: None,
+                command: None,
+                cwd: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let new_pane = result["pane"].as_u64().unwrap();
+        // 新ペインはタブ 2 内にある
+        let t2 = host.ws.get_tab(find_tab(&host.ws, tab2).unwrap()).unwrap();
+        assert_eq!(t2.tree().len(), 2);
+        assert!(t2
+            .tree()
+            .panes()
+            .iter()
+            .any(|p| p.id().as_u64() == new_pane));
+        // active tab は変わっていない
+        assert_eq!(host.ws.active_tab_id().as_u64(), tab1);
+        let _ = tab2_pane;
     }
 
     #[test]

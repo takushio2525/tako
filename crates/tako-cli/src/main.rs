@@ -59,36 +59,36 @@ enum Command {
     Resize(ResizeArgs),
     /// タブ内の全ペインのサイズを均等化する
     Equalize(EqualizeArgs),
-    /// ファイルをプレビューペインで開く（FR-3.2 / FR-3.3。コード = ハイライト表示、
+    /// ファイルをプレビューペインで開く（コード = ハイライト表示、
     /// .md は既定でレンダリング表示。--mode code でソース表示へ切替）
     Open(OpenArgs),
     /// タブ操作（new / rename / select / move-pane）
     #[command(subcommand)]
     Tab(TabCommand),
-    /// タブ・ペイン名の AI 自動リネーム（FR-2.12）の ON/OFF・状態確認
+    /// タブ・ペイン名の AI 自動リネームの ON/OFF・状態確認
     Autorename(ToggleArgs),
-    /// listen ポート検知 + 提案チップ（FR-2.4.2〜2.4.4）の ON/OFF・状態確認
+    /// listen ポート検知 + 提案チップの ON/OFF・状態確認
     Portdetect(ToggleArgs),
-    /// セッション永続化 = tmux バックエンド（FR-5）の ON/OFF・状態確認。
+    /// セッション永続化（tmux バックエンド）の ON/OFF・状態確認。
     /// 有効時、tako を再起動してもタブ構成と実行中プロセスが復元される
     Persist(ToggleArgs),
     /// 右サイドバー情報パネル（tmux 一覧 / agents 集約センター）の表示・幅・ビュー切替。
     /// 引数なしで現在状態を表示する
     Panel(PanelArgs),
-    /// ペインをたまり場へ退避する（プロセスは生きたまま画面から外す。FR-2.15）
+    /// ペインをたまり場へ退避する（プロセスは生きたまま画面から外す）
     Shelve(ShelveArgs),
-    /// たまり場のペインを画面に復帰させる（FR-2.15）
+    /// たまり場のペインを画面に復帰させる
     Unshelve(UnshelveArgs),
-    /// たまり場に退避中のペイン一覧を JSON で出力する（FR-2.15）
+    /// たまり場に退避中のペイン一覧を JSON で出力する
     #[command(name = "shelved")]
     ShelvedList,
-    /// ファイルシステム操作（FR-3.12）
+    /// ファイル操作（パスコピー / Finder 表示 / cd / リネーム / 作成 / ゴミ箱）
     #[command(subcommand)]
     File(FileCommand),
-    /// git リポジトリ情報の取得（FR-3.6 git graph / FR-3.9 diff ビューア）
+    /// git リポジトリ情報の取得（コミット履歴 / diff）
     #[command(subcommand)]
     Git(GitCommand),
-    /// tmux セッションの一覧・kill（FR-2.13。消し忘れ tmux の発見と片付け）
+    /// tmux セッションの一覧・kill・取り込み（消し忘れ tmux の発見と片付け）
     #[command(subcommand)]
     Tmux(TmuxCommand),
     /// MCP 連携（serve = stdio ブリッジ。エージェントの MCP クライアントが起動する）
@@ -139,7 +139,7 @@ enum TmuxCommand {
         #[arg(long)]
         socket: Option<String>,
     },
-    /// セッションを現在のタブへ取り込む（FR-2.16.10。統合 tmux ビューの D&D と同等操作）。
+    /// セッションを現在のタブへ取り込んで表示する。
     /// 対象ペインを分割した新ペインで attach クライアントを起動する。
     /// 新ペインを閉じてもセッションは残る（kill ではない）
     Open {
@@ -168,6 +168,7 @@ enum TmuxCommand {
 
 #[derive(Subcommand)]
 enum FileCommand {
+    /// ファイルの絶対パスを出力する（--relative でペイン cwd 基準の相対パス）
     CopyPath {
         path: String,
         #[arg(long)]
@@ -175,29 +176,22 @@ enum FileCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
-    Reveal {
-        path: String,
-    },
+    /// Finder でファイルの場所を表示する（macOS のみ）
+    Reveal { path: String },
+    /// 指定パスのディレクトリへペイン内で cd する
     OpenTerminal {
         path: String,
         #[arg(long)]
         pane: Option<u64>,
     },
-    Rename {
-        path: String,
-        name: String,
-    },
-    Create {
-        path: String,
-        name: String,
-    },
-    Mkdir {
-        path: String,
-        name: String,
-    },
-    Trash {
-        path: String,
-    },
+    /// ファイル・フォルダの名前を変更する
+    Rename { path: String, name: String },
+    /// 新しいファイルを作成する（path 配下に name で作成）
+    Create { path: String, name: String },
+    /// 新しいフォルダを作成する（path 配下に name で作成）
+    Mkdir { path: String, name: String },
+    /// ファイル・フォルダをゴミ箱へ移動する
+    Trash { path: String },
 }
 
 #[derive(Subcommand)]
@@ -212,9 +206,12 @@ enum McpCommand {
 
 #[derive(Args)]
 struct SplitArgs {
-    /// 対象ペイン ID（省略時は呼び出し元 = TAKO_PANE_ID）
-    #[arg(long)]
+    /// 対象ペイン ID（省略時は呼び出し元 = TAKO_PANE_ID。--tab と排他）
+    #[arg(long, conflicts_with = "tab")]
     pane: Option<u64>,
+    /// 分割先タブ ID（そのタブのフォーカス中ペインの隣に分割。--pane と排他）
+    #[arg(long)]
+    tab: Option<u64>,
     /// 右に分割（既定）
     #[arg(long, conflicts_with_all = ["down", "up", "left"])]
     right: bool,
@@ -553,7 +550,13 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 _ => Some(Direction::Right),
             };
             Request::Split {
-                pane: target_pane(args.pane)?,
+                // --tab 指定時は pane を使わない（タブのフォーカスペインを dispatch が解決）
+                pane: if args.tab.is_some() {
+                    None
+                } else {
+                    target_pane(args.pane)?
+                },
+                tab: args.tab,
                 direction,
                 ratio: args.ratio,
                 command: (!args.command.is_empty()).then(|| args.command.clone()),
@@ -952,6 +955,12 @@ fn print_result(command: &Command, result: &Value) {
             }
         }
         Command::File(_) => println!("{result}"),
+        Command::ShelvedList => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(result).unwrap_or_default()
+            );
+        }
         _ => {}
     }
 }
@@ -1075,6 +1084,7 @@ mod tests {
             request,
             Request::Split {
                 pane: Some(3),
+                tab: None,
                 direction: Some(Direction::Down),
                 ratio: Some(0.3),
                 command: Some(vec!["npm".into(), "run".into(), "dev".into()]),

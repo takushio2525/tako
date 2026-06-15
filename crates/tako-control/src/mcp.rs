@@ -105,15 +105,23 @@ fn initialize_result(params: &Value, connected: bool) -> Value {
     })
 }
 
-/// initialize で配るサーバー指示。FR-2.7.5 の行動規範（ユースケース (a)〜(c) + 片付け）
+/// initialize で配るサーバー指示
 const INSTRUCTIONS: &str = "\
-tako は AI エージェントが画面（タブ / ペイン）を直接操作できる GUI ターミナル。\
-このツール群で、人間と同じようにペインの分割・コマンド実行・画面の読み取り・片付けができる。\n\
+あなたは今 tako ターミナル内で動いている。tako は AI エージェントが GUI ターミナルの画面\
+（タブ / ペイン）をプログラマブルに操作できる環境であり、以下のツール群を通じて\
+ペインの分割・コマンド実行・画面の読み取り・ファイルプレビュー・レイアウト管理ができる。\
+通常のターミナルでは手作業が必要な画面操作を、AI が自律的に行えるのが最大の特徴。\n\
+\n\
+重要な概念:\n\
+- タブ = 作業グループ（1 つのタスクや文脈ごとに 1 タブ）\n\
+- ペイン = タブ内の個別のターミナル画面（分割して並べられる）\n\
+- 各ペインには固有の ID があり、全操作はこの ID で対象を指定する\n\
+- ペインを分割して作業ペインを増やし、不要になったら閉じるのが基本フロー\n\
 \n\
 行動規範（ユーザー体験の一部。意識的に従うこと）:\n\
-- レビューを求めるときは見せろ: 作業を終えてユーザーに確認を求めるときは、口頭説明だけでなく\
+- レビューを求めるときは見せろ: 作業結果を確認してもらうときは、口頭説明だけでなく\
 成果物（diff・ファイル・実行結果）を tako_split_pane で新しいペインに開いて提示する\
-（例: command=[\"git\",\"diff\",\"HEAD\"] や [\"less\",\"README.md\"]）\n\
+（例: command=[\"git\",\"diff\",\"HEAD\"] や tako_open_file で差分やコードを見せる）\n\
 - 読んでほしければ開け: ユーザーに読んでほしいドキュメントは、実際にペインで開いて見せる\n\
 - 方針相談は例を作って並べろ: 複数案があるときは案ごとにペインを並べて同時に見せ、\
 ユーザーが見比べて選べるようにする（tako_equalize_layout で整える）\n\
@@ -146,11 +154,19 @@ pub fn tools() -> Vec<Value> {
                 command を指定するとシェルの代わりにそのコマンドを実行する\
                 （dev サーバーの起動、`git diff` やファイルビューアの表示に使う）。\
                 ユーザーに成果物を見せるとき・レビューを求めるときは、このツールで結果を\
-                開いて提示すること（見せたいものは口頭で説明せず実際に開く）。",
+                開いて提示すること（見せたいものは口頭で説明せず実際に開く）。\
+                対象の指定方法: pane（特定ペインの隣に生やす）または tab（そのタブの\
+                フォーカス中ペインの隣に生やす。ユーザーがどのタブを見ていても正確に\
+                対象タブ内に分割できる）。どちらも省略すると呼び出し元ペインの隣に生える。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pane": pane_schema("分割の基準ペイン ID（省略時は呼び出し元ペインの隣に生える）"),
+                    "pane": pane_schema("分割の基準ペイン ID（省略時は呼び出し元ペインの隣に生える。tab と排他）"),
+                    "tab": {
+                        "type": "integer", "minimum": 0,
+                        "description": "分割先タブ ID（そのタブのフォーカス中ペインの隣に生える。pane と排他。\
+                            特定タブ内に確実に分割したいときに使う）",
+                    },
                     "direction": {
                         "type": "string",
                         "enum": ["right", "down", "left", "up"],
@@ -208,7 +224,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_scroll_pane",
-            "description": "ペインのスクロールバック表示を動かす（FR-2.5.13）。\
+            "description": "ペインのスクロールバック表示を動かす。\
                 to は絶対位置（0 = 最下部、大きいほど過去）、delta は相対行数（正 = 過去方向）。\
                 どちらか一方を指定する。応答に現在の offset と history（保持行数）を返す。\
                 過去の出力を確認するときは tako_read_pane と組み合わせる。",
@@ -224,11 +240,11 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_tmux_list",
-            "description": "実行中の全 tmux セッションを一覧する（FR-2.13）。各セッションの\
+            "description": "実行中の全 tmux セッションを一覧する。各セッションの\
                 window 一覧・作成日時・attach 状態に加え、attach クライアントが tako の\
                 どのタブ・ペインに表示されているか（pane / tab が null なら tako 外の\
                 ターミナル由来）を返す。消し忘れて裏で動き続ける tmux の発見に使う。\
-                backend = true のセッションは tako 自身のペイン永続化用（FR-5）: kill すると\
+                backend = true のセッションは tako 自身のペイン永続化用: kill すると\
                 対応ペイン（backend_pane）の中身が消えるため、通常は対象にしないこと。",
             "inputSchema": {
                 "type": "object",
@@ -242,7 +258,7 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_tmux_kill",
             "description": "tmux セッション（window 指定時はその window）を kill する。\
                 **破壊的操作**: 中で動いているプロセスごと終了する。必ず tako_tmux_list で\
-                対象を確認し、ユーザーの同意を得てから実行すること（誤爆防止。FR-2.13.3）。",
+                対象を確認し、ユーザーの同意を得てから実行すること。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -256,7 +272,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_tmux_open",
-            "description": "tmux セッションを現在のタブへ取り込んで表示する（FR-2.16.10）。\
+            "description": "tmux セッションを現在のタブへ取り込んで表示する。\
                 pane を direction（省略時は右）へ分割した新ペインで attach クライアントを\
                 起動する。管理外・kill 漏れセッション（tako_tmux_list で発見したもの）の\
                 中身をユーザーに見せる・自分で確認するときに使う。\
@@ -363,7 +379,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_rename_tab",
-            "description": "タブの表示タイトルを変更する（FR-2.12.1）。明示リネームとして\
+            "description": "タブの表示タイトルを変更する。明示リネームとして\
                 自動リネームより優先される。空文字を渡すと手動指定を解除し、\
                 自動リネーム（有効時）が再びタブ名を更新するようになる。",
             "inputSchema": {
@@ -423,7 +439,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_port_detect",
-            "description": "listen ポート検知 + 提案チップ（FR-2.4.2〜2.4.4）の ON/OFF を\
+            "description": "listen ポート検知 + 提案チップの ON/OFF を\
                 切り替える（enabled 省略時は現在状態の取得のみ）。設定は永続化される。\
                 有効時、各ペインの listen 中 TCP ポートは tako_list_panes の listen_ports で読める。",
             "inputSchema": {
@@ -436,7 +452,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_auto_rename",
-            "description": "タブ・ペイン名の AI 自動リネーム（FR-2.12）の ON/OFF を切り替える\
+            "description": "タブ・ペイン名の AI 自動リネームの ON/OFF を切り替える\
                 （enabled 省略時は現在状態の取得のみ）。設定は永続化される。\
                 手動で付けた名前（tako_set_title / tako_rename_tab）は自動より常に優先される。",
             "inputSchema": {
@@ -467,7 +483,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_open_file",
-            "description": "ファイルをプレビューペインで開いてユーザーに見せる（FR-3.2 / FR-2.5.11）。\
+            "description": "ファイルをプレビューペインで開いてユーザーに見せる。\
                 コードはシンタックスハイライト付き、Markdown は既定でレンダリング表示\
                 （mode=code でソース表示へ切替可能 = プレビューの目アイコントグルと同じ操作）。\
                 ペインは再利用される: 対象がプレビューペインなら差し替え、同タブに既存の\
@@ -488,7 +504,7 @@ pub fn tools() -> Vec<Value> {
                     "direction": {
                         "type": "string",
                         "enum": ["right", "down", "left", "up"],
-                        "description": "指定時は既存プレビューを再利用せず pane をこの方向へ分割して開く（FR-3.11）",
+                        "description": "指定時は既存プレビューを再利用せず pane をこの方向へ分割して開く",
                     },
                 },
                 "required": ["path"],
@@ -497,14 +513,25 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_file_op",
-            "description": "ファイルシステム操作（FR-3.12）。op で操作種別を指定する",
+            "description": "ファイル操作を実行する。op で種別を指定:\n\
+                copy_absolute_path = 絶対パスを取得 / copy_relative_path = ペイン cwd 基準の相対パスを取得 /\n\
+                reveal = Finder でファイルの場所を表示（macOS）/\n\
+                open_terminal = 指定パスのディレクトリへペイン内で cd /\n\
+                rename = name でファイル名を変更 / create_file = path 配下に name でファイル作成 /\n\
+                create_dir = path 配下に name でフォルダ作成 / trash = ゴミ箱へ移動。\n\
+                rename / create_file / create_dir は name パラメータが必須。\
+                open_terminal / copy_relative_path は pane パラメータでペインを指定する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "op": { "type": "string", "enum": ["copy_absolute_path","copy_relative_path","reveal","open_terminal","rename","create_file","create_dir","trash"] },
-                    "path": { "type": "string", "description": "対象パス（必須）" },
-                    "name": { "type": "string" },
-                    "pane": pane_schema("cd 先ペイン"),
+                    "op": {
+                        "type": "string",
+                        "enum": ["copy_absolute_path","copy_relative_path","reveal","open_terminal","rename","create_file","create_dir","trash"],
+                        "description": "操作種別",
+                    },
+                    "path": { "type": "string", "description": "対象のファイル・フォルダパス（必須）" },
+                    "name": { "type": "string", "description": "新しい名前（rename / create_file / create_dir で必須）" },
+                    "pane": pane_schema("対象ペイン ID（open_terminal の cd 先 / copy_relative_path の基準。省略時は呼び出し元）"),
                 },
                 "required": ["op", "path"],
                 "additionalProperties": false,
@@ -512,7 +539,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_persist",
-            "description": "セッション永続化 = tmux バックエンド（FR-5）の ON/OFF を切り替える\
+            "description": "セッション永続化（tmux バックエンド）の ON/OFF を切り替える\
                 （enabled 省略時は現在状態の取得のみ）。有効時、各ペインは tako 専用 tmux\
                 サーバーのセッションとして保持され、tako を再起動しても実行中プロセスごと\
                 復元される。切替は以後生成されるペインに効く。available = false は tmux\
@@ -527,8 +554,8 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_git_log",
-            "description": "git リポジトリのコミット履歴・ブランチ一覧・変更状態を取得する\
-                （FR-3.6 git graph）。対象ペインの cwd から git リポジトリを解決する。\
+            "description": "git リポジトリのコミット履歴・ブランチ一覧・変更状態を取得する。\
+                対象ペインの cwd から git リポジトリを解決する。\
                 コミットグラフ描画・ブランチ操作の判断材料として使う。",
             "inputSchema": {
                 "type": "object",
@@ -541,7 +568,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_git_diff",
-            "description": "git diff を取得する（FR-3.9 diff ビューア）。対象ペインの cwd の\
+            "description": "git diff を取得する。対象ペインの cwd の\
                 リポジトリの diff をファイル・ハンク・行単位で返す。target で種別を指定: \
                 \"unstaged\"（ワーキングツリー変更。既定）/ \"staged\"（ステージ済み）/ \
                 コミットハッシュ（そのコミットの差分）。",
@@ -556,7 +583,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_shelve_pane",
-            "description": "ペインをたまり場へ退避する（FR-2.15）。プロセスは生きたまま\
+            "description": "ペインをたまり場へ退避する。プロセスは生きたまま\
                 画面から外す。邪魔なペインを画面外へ退避させるのに使う。退避中のペインは\
                 tako_shelved_list で確認でき、tako_unshelve_pane で画面に戻せる。",
             "inputSchema": {
@@ -569,7 +596,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_unshelve_pane",
-            "description": "たまり場のペインを画面に復帰させる（FR-2.15）。target ペインの\
+            "description": "たまり場のペインを画面に復帰させる。target ペインの\
                 direction 側を分割して表示する。退避中に使いたくなったペインを取り出すのに使う。",
             "inputSchema": {
                 "type": "object",
@@ -584,7 +611,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_shelved_list",
-            "description": "たまり場に退避中のペイン一覧を取得する（FR-2.15）。各ペインの\
+            "description": "たまり場に退避中のペイン一覧を取得する。各ペインの\
                 ID / title / role / state / cwd を返す。",
             "inputSchema": {
                 "type": "object",
@@ -594,7 +621,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_shelved_kill",
-            "description": "たまり場のペインを kill する（FR-2.15.2）。プロセスとバックエンド\
+            "description": "たまり場のペインを kill する。プロセスとバックエンド\
                 セッションも終了する。復帰不要なペインの片付けに使う。",
             "inputSchema": {
                 "type": "object",
@@ -635,13 +662,22 @@ fn call_tool(params: &Value, session: &mut McpSession) -> Result<Value, (i64, St
 fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Request, String> {
     Ok(match name {
         "tako_list_panes" => Request::List,
-        "tako_split_pane" => Request::Split {
-            pane: Some(target_pane(args, caller)?),
-            direction: direction_arg(args)?,
-            ratio: f32_arg(args, "ratio")?,
-            command: str_vec_arg(args, "command")?.filter(|c| !c.is_empty()),
-            cwd: str_arg(args, "cwd")?,
-        },
+        "tako_split_pane" => {
+            let tab = u64_arg(args, "tab")?;
+            Request::Split {
+                // tab 指定時は pane を使わない（タブのフォーカスペインを dispatch が解決）
+                pane: if tab.is_some() {
+                    None
+                } else {
+                    Some(target_pane(args, caller)?)
+                },
+                tab,
+                direction: direction_arg(args)?,
+                ratio: f32_arg(args, "ratio")?,
+                command: str_vec_arg(args, "command")?.filter(|c| !c.is_empty()),
+                cwd: str_arg(args, "cwd")?,
+            }
+        }
         "tako_send_input" => Request::Send {
             pane: Some(required_u64(args, "pane")?),
             text: str_arg(args, "text")?.ok_or("text を指定する")?,
@@ -1262,6 +1298,7 @@ mod tests {
             seen,
             vec![Request::Split {
                 pane: Some(3),
+                tab: None,
                 direction: Some(Direction::Down),
                 ratio: None,
                 command: None,
