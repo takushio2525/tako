@@ -121,8 +121,15 @@ const PANE_TITLE_BAR: f32 = 22.0;
 /// 下部ステータスバーの高さ（px。FR-2.16.4。Zed / VSCode 風）
 const STATUS_BAR_HEIGHT: f32 = 24.0;
 
-/// たまり場ドロワーの既定高さ（px。FR-2.15）
-const DRAWER_DEFAULT_HEIGHT: f32 = 150.0;
+/// たまり場ドロワーの既定高さ（px。FR-2.15）。横並びプレビュー（実画面サムネイル）が
+/// 読めるだけの高さを確保する
+const DRAWER_DEFAULT_HEIGHT: f32 = 240.0;
+
+/// たまり場ドロワー上端のヘッダ行の高さ（px）
+const DRAWER_HEADER_HEIGHT: f32 = 22.0;
+
+/// たまり場の退避プレビューカード 1 枚の幅（px。横並び + 横スクロール）
+const SHELF_CARD_WIDTH: f32 = 300.0;
 
 /// 右サイドバー情報パネルの内部タブ（固定タブ 0 個方針。2026-06-12）。
 /// FR-2.16.6 で agents は tmux ビューへ統合済み。Git は git graph（FR-3.6）の
@@ -5016,17 +5023,43 @@ impl TakoApp {
 
         let pending_kill = self.shelved_pending_kill;
 
-        let mut content = div()
-            .id("drawer-content")
+        // 退避ターミナルをカード本文の寸法へリサイズし、通常ペインと同じ見え方の
+        // プレビュー（実画面サムネイル）にする。resize は冪等なので毎フレーム呼んでも安全
+        let body_h = (self.drawer_height
+            - DRAWER_HEADER_HEIGHT
+            - PANE_TITLE_BAR
+            - PANE_PADDING * 2.0
+            - PANE_BORDER * 2.0
+            - 8.0)
+            .max(40.0);
+        if let Some(cell) = self.cell_size {
+            let cols = ((SHELF_CARD_WIDTH - PANE_BORDER * 2.0 - PANE_PADDING * 2.0)
+                / f32::from(cell.width))
+            .floor() as usize;
+            let rows = (body_h / f32::from(cell.height)).floor() as usize;
+            let cw = f32::from(cell.width).round() as u16;
+            let ch = f32::from(cell.height).round() as u16;
+            for (pane_id, _, _) in &shelved {
+                if let Some(session) = self.terminals.get_mut(pane_id) {
+                    session.resize(cols, rows, cw, ch);
+                }
+            }
+        }
+
+        // カードを横並びに配置し、横スクロールで全件閲覧できるようにする（FR-2.15）
+        let mut cards = div()
+            .id("drawer-cards")
             .flex()
-            .flex_col()
-            .overflow_y_scroll()
-            .h_full()
+            .flex_row()
+            .flex_1()
+            .min_h(px(0.0))
+            .gap_2()
             .px_2()
-            .py_1();
+            .py_1()
+            .overflow_x_scroll();
 
         if shelved.is_empty() {
-            content = content.child(
+            cards = cards.child(
                 div()
                     .text_size(px(11.0))
                     .text_color(hsla(theme.tab_inactive_foreground))
@@ -5043,51 +5076,44 @@ impl TakoApp {
                     _ => None,
                 };
                 let is_pending_kill = pending_kill == Some(pane_id);
+                // 実画面プレビュー（カーソルは出さずサムネイルらしくする）
+                let lines = self.terminal_screen_lines(pane_id, false);
 
-                let mut row = div()
-                    .id(("shelved-row", pane_id.as_u64()))
+                // カードタイトルバー（通常ペインと同じスタイル。D&D でペインエリアへ復帰可能）
+                let mut titlebar = div()
+                    .id(("shelf-titlebar", pane_id.as_u64()))
+                    .h(px(PANE_TITLE_BAR))
+                    .flex_none()
+                    .w_full()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_1()
                     .px_1()
-                    .py(px(2.0))
-                    .rounded_sm()
-                    .cursor_pointer()
+                    .bg(rgba(theme.tab_bar_background))
                     .text_size(px(11.0))
-                    .text_color(hsla(theme.foreground))
-                    .hover(|d| d.bg(rgba_alpha(theme.tab_active_background, 0.5)))
+                    .text_color(hsla(theme.tab_inactive_foreground))
+                    .cursor(CursorStyle::OpenHand)
                     .on_drag(
                         ShelvedPaneDrag { pane: pane_id },
                         self.drag_ghost_builder(DragKind::ShelvedPane, truncate(label, 24), cx),
                     );
 
-                if let Some(color) = state_color {
-                    row = row.child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color)));
-                }
-
-                row = row.child(
-                    div()
-                        .flex_1()
-                        .overflow_x_hidden()
-                        .text_ellipsis()
-                        .child(label.clone()),
-                );
-
                 if is_pending_kill {
-                    // kill 確認（FR-2.15.2）
-                    row = row
+                    // kill 確認（FR-2.15.2）。tmux セッションごと完全破棄する
+                    titlebar = titlebar
                         .child(
                             div()
-                                .text_size(px(10.0))
+                                .flex_1()
+                                .overflow_x_hidden()
+                                .text_ellipsis()
                                 .text_color(hsla(theme.ansi[1]))
-                                .child("kill?"),
+                                .child("完全に破棄?"),
                         )
                         .child(
                             div()
-                                .id(("shelved-kill-yes", pane_id.as_u64()))
+                                .id(("shelf-kill-yes", pane_id.as_u64()))
                                 .cursor_pointer()
-                                .text_size(px(10.0))
                                 .text_color(hsla(theme.ansi[1]))
                                 .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
                                 .px_1()
@@ -5095,7 +5121,7 @@ impl TakoApp {
                                 .child("はい")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.shelved_pending_kill = None;
-                                    if let Some(_pane) = this.workspace.remove_shelved(pane_id) {
+                                    if this.workspace.remove_shelved(pane_id).is_some() {
                                         this.terminals.remove(&pane_id);
                                         this.previews.remove(&pane_id);
                                         this.scroll_accum.remove(&pane_id);
@@ -5103,14 +5129,16 @@ impl TakoApp {
                                         this.drop_tmux_view_session(pane_id);
                                         this.drop_backend_session(pane_id);
                                     }
+                                    if this.workspace.shelved_panes().is_empty() {
+                                        this.drawer_visible = false;
+                                    }
                                     cx.notify();
                                 })),
                         )
                         .child(
                             div()
-                                .id(("shelved-kill-no", pane_id.as_u64()))
+                                .id(("shelf-kill-no", pane_id.as_u64()))
                                 .cursor_pointer()
-                                .text_size(px(10.0))
                                 .text_color(hsla(theme.tab_inactive_foreground))
                                 .hover(|d| d.bg(rgba_alpha(theme.tab_active_background, 0.5)))
                                 .px_1()
@@ -5122,23 +5150,108 @@ impl TakoApp {
                                 })),
                         );
                 } else {
-                    // × ボタン（kill 確認開始）
-                    row = row.child(
-                        div()
-                            .id(("shelved-close", pane_id.as_u64()))
-                            .cursor_pointer()
-                            .text_size(px(11.0))
-                            .text_color(hsla(theme.tab_inactive_foreground))
-                            .hover(|d| d.text_color(hsla(theme.ansi[1])))
-                            .child("×")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.shelved_pending_kill = Some(pane_id);
-                                cx.notify();
-                            })),
-                    );
+                    if let Some(color) = state_color {
+                        titlebar = titlebar
+                            .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color)));
+                    }
+                    titlebar = titlebar
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_x_hidden()
+                                .text_ellipsis()
+                                .text_color(hsla(theme.foreground))
+                                .child(SharedString::from(truncate(label, 40))),
+                        )
+                        // 復帰ボタン（× の隣。FR-2.15.3。たまり場から現在のタブへ戻す）
+                        .child(
+                            div()
+                                .id(("shelf-restore", pane_id.as_u64()))
+                                .px_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_color(hsla(theme.accent))
+                                .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
+                                .child("復帰")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let target = this.workspace.active_tab().tree().focused();
+                                    if let Err(e) = this.workspace.unshelve_pane(
+                                        pane_id,
+                                        target,
+                                        SplitDirection::Right,
+                                    ) {
+                                        eprintln!("warning: たまり場から復帰できない: {e}");
+                                    }
+                                    if this.workspace.shelved_panes().is_empty() {
+                                        this.drawer_visible = false;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        // kill ボタン（右上の ×。完全破棄の確認を開始。FR-2.15.2）
+                        .child(
+                            div()
+                                .id(("shelf-kill", pane_id.as_u64()))
+                                .w(px(16.0))
+                                .h(px(16.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
+                                .hover(|d| {
+                                    d.bg(rgba_alpha(theme.ansi[1], 0.25))
+                                        .text_color(hsla(theme.foreground))
+                                })
+                                .child("×")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.shelved_pending_kill = Some(pane_id);
+                                    cx.notify();
+                                })),
+                        );
                 }
 
-                content = content.child(row);
+                // カード本文 = ターミナルの実画面プレビュー（通常ペインと同じ行描画）。
+                // ターミナルを持たない退避（プレビューペイン等）はラベルだけ示す
+                let body = if lines.is_empty() {
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(11.0))
+                        .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.6))
+                        .child(SharedString::from(truncate(label, 24)))
+                } else {
+                    div()
+                        .flex_1()
+                        .p(px(PANE_PADDING))
+                        .overflow_hidden()
+                        .bg(rgba(theme.background))
+                        .children(lines)
+                };
+
+                let card = div()
+                    .id(("shelf-card", pane_id.as_u64()))
+                    .flex_none()
+                    .w(px(SHELF_CARD_WIDTH))
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .rounded_md()
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(if is_pending_kill {
+                        hsla(theme.ansi[1])
+                    } else {
+                        hsla(theme.pane_border)
+                    })
+                    .bg(rgba(theme.background))
+                    .child(titlebar)
+                    .child(body);
+
+                cards = cards.child(card);
             }
         }
 
@@ -5161,11 +5274,15 @@ impl TakoApp {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .h(px(20.0))
+                        .flex_none()
+                        .h(px(DRAWER_HEADER_HEIGHT))
                         .px_2()
                         .text_size(px(10.0))
                         .text_color(hsla(theme.tab_inactive_foreground))
-                        .child("退避中のターミナル")
+                        .child(SharedString::from(format!(
+                            "退避中のターミナル（{}）",
+                            shelved.len()
+                        )))
                         .child(div().flex_grow(1.0))
                         .child(
                             div()
@@ -5179,7 +5296,7 @@ impl TakoApp {
                                 })),
                         ),
                 )
-                .child(content),
+                .child(cards),
         )
     }
 
@@ -5426,6 +5543,54 @@ impl TakoApp {
         )
     }
 
+    /// ターミナルの現在画面を行 div のリストへ変換する（通常ペイン描画と退避プレビューで共用）。
+    /// run ごとの色・太字・下線などの装飾を StyledText のハイライトへ写す
+    fn terminal_screen_lines(&self, pane_id: PaneId, show_cursor: bool) -> Vec<gpui::Div> {
+        let theme = &self.theme;
+        let default_style = self.text_style();
+        let Some(screen) = self
+            .terminals
+            .get(&pane_id)
+            .map(|s| s.screen_opts(theme, show_cursor))
+        else {
+            return Vec::new();
+        };
+        screen
+            .lines
+            .into_iter()
+            .map(|line| {
+                let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = line
+                    .runs
+                    .iter()
+                    .map(|run| {
+                        (
+                            run.range.clone(),
+                            HighlightStyle {
+                                color: Some(hsla(run.fg)),
+                                background_color: run.bg.map(hsla),
+                                font_weight: run.bold.then_some(FontWeight::BOLD),
+                                font_style: run.italic.then_some(FontStyle::Italic),
+                                underline: run.underline.then_some(UnderlineStyle {
+                                    thickness: px(1.0),
+                                    color: None,
+                                    wavy: false,
+                                }),
+                                strikethrough: run.strikeout.then_some(StrikethroughStyle {
+                                    thickness: px(1.0),
+                                    color: None,
+                                }),
+                                fade_out: None,
+                            },
+                        )
+                    })
+                    .collect();
+                div().h(px(theme.line_height)).child(
+                    StyledText::new(line.text).with_default_highlights(&default_style, highlights),
+                )
+            })
+            .collect()
+    }
+
     fn render_pane(
         &mut self,
         pane_id: PaneId,
@@ -5441,7 +5606,6 @@ impl TakoApp {
                 .into_any_element();
         }
         let theme = self.theme.clone();
-        let default_style = self.text_style();
         let cell = self.cell_size.expect("render 冒頭で実測済み");
 
         // PTY リサイズ追従: テキスト領域に収まる cols/rows へ
@@ -5503,52 +5667,7 @@ impl TakoApp {
             .scroll_ctls
             .get(&pane_id)
             .is_some_and(|c| c.state.in_mode);
-        let screen = self
-            .terminals
-            .get(&pane_id)
-            .map(|s| s.screen_opts(&theme, !scrolled_in_tmux));
-
-        let lines: Vec<_> = screen
-            .map(|screen| {
-                screen
-                    .lines
-                    .into_iter()
-                    .map(|line| {
-                        let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = line
-                            .runs
-                            .iter()
-                            .map(|run| {
-                                (
-                                    run.range.clone(),
-                                    HighlightStyle {
-                                        color: Some(hsla(run.fg)),
-                                        background_color: run.bg.map(hsla),
-                                        font_weight: run.bold.then_some(FontWeight::BOLD),
-                                        font_style: run.italic.then_some(FontStyle::Italic),
-                                        underline: run.underline.then_some(UnderlineStyle {
-                                            thickness: px(1.0),
-                                            color: None,
-                                            wavy: false,
-                                        }),
-                                        strikethrough: run.strikeout.then_some(
-                                            StrikethroughStyle {
-                                                thickness: px(1.0),
-                                                color: None,
-                                            },
-                                        ),
-                                        fade_out: None,
-                                    },
-                                )
-                            })
-                            .collect();
-                        div().h(px(theme.line_height)).child(
-                            StyledText::new(line.text)
-                                .with_default_highlights(&default_style, highlights),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let lines = self.terminal_screen_lines(pane_id, !scrolled_in_tmux);
 
         div()
             .id(("pane", pane_id.as_u64()))
@@ -8670,6 +8789,26 @@ mod self_test {
                 })
                 .unwrap_or(false);
             check(shelve_button_ok, "ペインの ー ボタンで退避（dispatch 経由）");
+
+            // 47c. たまり場ドロワーを開き、横並びの実画面プレビューが描画されること（FR-2.15）。
+            //      47b で退避したペインが残っており、render_drawer がレイアウト含め panic しない
+            //      （panic すれば自己テスト全体が落ちる）。検証後はドロワーを閉じて後続へ影響させない
+            window
+                .update(cx, |app, _, cx| {
+                    app.drawer_visible = true;
+                    cx.notify();
+                })
+                .ok();
+            wait(cx, 400).await;
+            let drawer_ok = window
+                .update(cx, |app, _, cx| {
+                    let ok = app.drawer_visible && !app.workspace.shelved_panes().is_empty();
+                    app.drawer_visible = false;
+                    cx.notify();
+                    ok
+                })
+                .unwrap_or(false);
+            check(drawer_ok, "たまり場ドロワーが退避プレビューを描画");
 
             // 48. tmux 一覧と kill（FR-2.13）。専用 -L ソケットで隔離し、ユーザーの
             //     実 tmux サーバーには一切触れない。tmux 不在環境ではスキップする
