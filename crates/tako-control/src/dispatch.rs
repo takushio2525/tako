@@ -99,6 +99,13 @@ pub trait ControlHost {
     fn cleanup_orphan_tmux(&self) -> Vec<String> {
         Vec::new()
     }
+    /// サイドバー tmux ビューでタブ枠が折りたたまれているか（FR-2.16.14）
+    fn tmux_tab_collapsed(&self, _tab: TabId) -> bool {
+        false
+    }
+    /// タブ枠の折りたたみを設定する（FR-2.16.14）。`collapsed` 省略時はトグル。
+    /// 永続化は実装側の責務
+    fn set_tmux_tab_collapsed(&mut self, _tab: TabId, _collapsed: Option<bool>) {}
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -1100,6 +1107,22 @@ pub fn dispatch(
             Ok(json!({ "shelved": shelved }))
         }
 
+        Request::CollapseTab {
+            pane,
+            tab,
+            collapsed,
+        } => {
+            let tab_id = match tab {
+                Some(t) => find_tab(host.workspace(), t)?,
+                None => resolve_pane(host.workspace(), pane)?.0,
+            };
+            host.set_tmux_tab_collapsed(tab_id, collapsed);
+            Ok(json!({
+                "tab": tab_id.as_u64(),
+                "collapsed": host.tmux_tab_collapsed(tab_id),
+            }))
+        }
+
         Request::ShelvedKill { pane } => {
             let pane_id = PaneId::from_raw(pane);
             if host.workspace_mut().remove_shelved(pane_id).is_none() {
@@ -1331,6 +1354,8 @@ fn list_json(host: &dyn ControlHost) -> Value {
                 "title": tab.title(),
                 "title_source": title_source_str(tab.title_source()),
                 "active": tab_active,
+                // サイドバー tmux ビューでこのタブ枠が折りたたまれているか（FR-2.16.14）
+                "collapsed": host.tmux_tab_collapsed(tab.id()),
                 "focused_pane": tree.focused().as_u64(),
                 "panes": panes,
                 "tree": tree_json(tree.root()),
@@ -1454,6 +1479,7 @@ mod tests {
         attached: Vec<u64>,
         detached: Vec<u64>,
         previews: std::collections::HashMap<u64, (String, PreviewModeWire)>,
+        collapsed: std::collections::HashSet<u64>,
     }
 
     impl MockHost {
@@ -1463,6 +1489,7 @@ mod tests {
                 attached: Vec::new(),
                 detached: Vec::new(),
                 previews: std::collections::HashMap::new(),
+                collapsed: std::collections::HashSet::new(),
             }
         }
 
@@ -1502,6 +1529,17 @@ mod tests {
                 .into_iter()
                 .map(|p| p.id())
                 .find(|p| self.previews.contains_key(&p.as_u64()))
+        }
+        fn tmux_tab_collapsed(&self, tab: TabId) -> bool {
+            self.collapsed.contains(&tab.as_u64())
+        }
+        fn set_tmux_tab_collapsed(&mut self, tab: TabId, collapsed: Option<bool>) {
+            let now = collapsed.unwrap_or_else(|| !self.collapsed.contains(&tab.as_u64()));
+            if now {
+                self.collapsed.insert(tab.as_u64());
+            } else {
+                self.collapsed.remove(&tab.as_u64());
+            }
         }
     }
 
@@ -1830,6 +1868,56 @@ mod tests {
         assert_eq!(result["unshelved"].as_u64(), Some(p2));
         assert!(!host.ws.is_shelved(PaneId::from_raw(p2)));
         assert_eq!(host.ws.find_tab_of_pane(PaneId::from_raw(p2)), Some(t1));
+    }
+
+    #[test]
+    fn collapsetabはトグルとset両方ができ_listに出る() {
+        // FR-2.16.14: 折りたたみは tab 指定 / 呼び出し元タブの両方で操作でき、
+        // collapsed 省略でトグル、list の各タブ collapsed で状態取得できる
+        let mut host = MockHost::new();
+        let t1 = host.ws.active_tab_id();
+        // 初期は折りたたまれていない
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        assert_eq!(list["tabs"][0]["collapsed"].as_bool(), Some(false));
+        // collapsed 省略 = トグルで折りたたむ
+        let r = dispatch(
+            &mut host,
+            Request::CollapseTab {
+                pane: None,
+                tab: Some(t1.as_u64()),
+                collapsed: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(r["collapsed"].as_bool(), Some(true));
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        assert_eq!(list["tabs"][0]["collapsed"].as_bool(), Some(true));
+        // collapsed=false で明示展開
+        let r = dispatch(
+            &mut host,
+            Request::CollapseTab {
+                pane: None,
+                tab: Some(t1.as_u64()),
+                collapsed: Some(false),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(r["collapsed"].as_bool(), Some(false));
+        // tab 省略時は pane（呼び出し元）の属するタブを畳む
+        let root = host.root_pane();
+        dispatch(
+            &mut host,
+            Request::CollapseTab {
+                pane: Some(root),
+                tab: None,
+                collapsed: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!(host.tmux_tab_collapsed(t1));
     }
 
     #[test]

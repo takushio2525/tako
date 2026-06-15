@@ -33,6 +33,10 @@ pub struct LayoutFile {
     /// たまり場に退避中のペイン（FR-2.15.5）
     #[serde(default)]
     pub shelved: Vec<PaneLayout>,
+    /// サイドバー tmux ビューで折りたたみ中のタブ ID（FR-2.16.14）。
+    /// 旧ファイルには無いので serde default、空なら出力省略で後方互換
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collapsed: Vec<u64>,
 }
 
 /// OS ウィンドウのジオメトリ（復元時は起動時のウィンドウ生成オプションに使う）
@@ -169,6 +173,9 @@ pub fn capture(
                 }
             })
             .collect(),
+        // 折りたたみ状態（FR-2.16.14）は Workspace に無い UI 状態なので
+        // capture では空にし、save 時に UI 層が埋める
+        collapsed: Vec::new(),
     }
 }
 
@@ -574,6 +581,7 @@ mod tests {
             tabs: vec![],
             window: None,
             shelved: vec![],
+            collapsed: vec![],
         })
         .is_none());
         // バージョン不一致
@@ -602,5 +610,24 @@ mod tests {
         save_to(&path, &layout).unwrap();
         assert_eq!(load_from(&path), Some(layout));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 折りたたみ状態が永続化で往復し旧ファイルは空になる() {
+        // FR-2.16.14: capture は空、save 側が埋めた collapsed が往復する
+        let ws = sample_workspace();
+        let mut layout = capture(&ws, &|_| PaneMeta::default(), None);
+        assert!(layout.collapsed.is_empty());
+        layout.collapsed = vec![ws.active_tab_id().as_u64()];
+        let json = serde_json::to_string(&layout).unwrap();
+        let back: LayoutFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.collapsed, vec![ws.active_tab_id().as_u64()]);
+        // collapsed フィールドの無い旧ファイルは空で読める（後方互換）
+        let legacy = json.replace(
+            &format!(",\"collapsed\":[{}]", ws.active_tab_id().as_u64()),
+            "",
+        );
+        let legacy: LayoutFile = serde_json::from_str(&legacy).unwrap();
+        assert!(legacy.collapsed.is_empty());
     }
 }

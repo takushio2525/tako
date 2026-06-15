@@ -435,8 +435,9 @@ struct TakoApp {
     last_saved_layout: Option<String>,
     /// OS ウィンドウの現フレーム（render で採取し layout 保存に含める。FR-5）
     window_frame: Option<tako_control::layout::WindowFrame>,
-    /// tmux ビューのアコーディオン折りたたみ状態（タブ group_index → 折りたたみ）
-    collapsed_tmux_tabs: std::collections::HashSet<usize>,
+    /// tmux ビューのアコーディオン折りたたみ状態（FR-2.16.14。折りたたむと配下の
+    /// バックグラウンド行 + 退避を隠す）。タブ並べ替え / クローズに強い TabId キー
+    collapsed_tmux_tabs: std::collections::HashSet<TabId>,
     /// TmuxOpen で作成されたペインの監視対象。対象セッションが消滅したら
     /// ペインを自動クローズする（ポーリングで検知）
     tmux_view_panes: HashMap<PaneId, TmuxViewTarget>,
@@ -806,9 +807,20 @@ impl TakoApp {
             tako_core::tmux_backend::sync_conf(&tako_core::tmux_backend::socket_name());
         }
         let mut restored: Vec<tako_control::layout::RestoredPane> = Vec::new();
+        let mut collapsed_tmux_tabs: std::collections::HashSet<TabId> =
+            std::collections::HashSet::new();
         let workspace = if tmux_persist && tako_core::tmux_backend::available() {
             tako_control::layout::load()
-                .and_then(|file| tako_control::layout::restore(&file))
+                .and_then(|file| {
+                    // 折りたたみ状態（FR-2.16.14）を控えてから復元する。タブ ID は
+                    // Phase 5.5 で同一値に復元されるので再起動後も対応が保たれる
+                    collapsed_tmux_tabs = file
+                        .collapsed
+                        .iter()
+                        .map(|id| TabId::from_raw(*id))
+                        .collect();
+                    tako_control::layout::restore(&file)
+                })
                 .map(|(ws, panes)| {
                     restored = panes;
                     ws
@@ -845,7 +857,7 @@ impl TakoApp {
             tmux_sessions: Vec::new(),
             tmux_pending_kill: None,
             pending_pane_kill: None,
-            collapsed_tmux_tabs: std::collections::HashSet::new(),
+            collapsed_tmux_tabs,
             tmux_view_panes: HashMap::new(),
             context_menu: None,
             inline_edit: None,
@@ -1620,6 +1632,17 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// tmux ビューのタブ枠折りたたみを設定する（FR-2.16.14）。collapsed 省略時はトグル。
+    /// UI の逆三角トグルと dispatch（CLI / MCP）の両方から呼ぶ（操作経路を一本化）
+    fn set_tmux_collapsed(&mut self, tab: TabId, collapsed: Option<bool>) {
+        let now = collapsed.unwrap_or_else(|| !self.collapsed_tmux_tabs.contains(&tab));
+        if now {
+            self.collapsed_tmux_tabs.insert(tab);
+        } else {
+            self.collapsed_tmux_tabs.remove(&tab);
+        }
+    }
+
     /// tmux 一覧を更新する。UI も CLI / MCP と同じコマンド層（dispatch）を通す
     fn refresh_tmux(&mut self, cx: &mut Context<Self>) {
         self.refresh_tmux_data();
@@ -2081,7 +2104,7 @@ impl TakoApp {
         let backend_sessions = &self.backend_sessions;
         let terminals = &self.terminals;
         let previews = &self.previews;
-        let layout = tako_control::layout::capture(
+        let mut layout = tako_control::layout::capture(
             &self.workspace,
             &|pane| tako_control::layout::PaneMeta {
                 session: backend_sessions.get(&pane).cloned(),
@@ -2098,6 +2121,13 @@ impl TakoApp {
             },
             self.window_frame.clone(),
         );
+        // 折りたたみ状態（FR-2.16.14）を埋める。現存タブのみ（閉じたタブの残骸は除く）
+        layout.collapsed = self
+            .collapsed_tmux_tabs
+            .iter()
+            .filter(|t| self.workspace.get_tab(**t).is_some())
+            .map(|t| t.as_u64())
+            .collect();
         let Ok(json) = serde_json::to_string(&layout) else {
             return;
         };
@@ -2715,7 +2745,12 @@ impl TakoApp {
         // タブ枠: タブ名ラベル付き四角枠 + 枠内に全ペインの入れ子表示（FR-2.16.6）
         for (group_index, group) in groups.into_iter().enumerate() {
             let is_active = group.tab == active_tab;
-            let is_collapsed = self.collapsed_tmux_tabs.contains(&group_index);
+            let tab_id = group.tab;
+            let is_collapsed = self.collapsed_tmux_tabs.contains(&tab_id);
+            // 折りたたみ時はバックグラウンド項目（裏で実行中の行 + 退避）を隠し、前面表示中
+            // （アクティブタブ）の行は残す（FR-2.16.14。Q2 = バックグラウンド行＋退避だけ隠す）。
+            // タブ内の行は surface が一律（アクティブ＝全 foreground / 非アクティブ＝全 background）
+            let show_rows = is_active || !is_collapsed;
             let mut card = div()
                 .flex()
                 .flex_col()
@@ -2730,7 +2765,7 @@ impl TakoApp {
                 })
                 .child(
                     div()
-                        .id(("tmux-tab-header", group_index as u64))
+                        .id(("tmux-tab-header", tab_id.as_u64()))
                         .text_size(px(11.0))
                         .font_weight(FontWeight::BOLD)
                         .text_color(if is_active {
@@ -2742,12 +2777,9 @@ impl TakoApp {
                         .whitespace_nowrap()
                         .text_ellipsis()
                         .cursor_pointer()
+                        // 逆三角トグル: 折りたたみは TabId キーで管理（並べ替え / クローズに強い）
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            if this.collapsed_tmux_tabs.contains(&group_index) {
-                                this.collapsed_tmux_tabs.remove(&group_index);
-                            } else {
-                                this.collapsed_tmux_tabs.insert(group_index);
-                            }
+                            this.set_tmux_collapsed(tab_id, None);
                             cx.notify();
                         }))
                         .child(SharedString::from(format!(
@@ -2756,14 +2788,13 @@ impl TakoApp {
                             truncate(&group.title, 28)
                         ))),
                 );
-            if is_collapsed {
-                root = root.child(card);
-                continue;
-            }
+            // 折りたたみ時はバックグラウンド行を描かない（空にして既存ループをそのまま流す）。
+            // 前面表示中（アクティブタブ）の行は残す（FR-2.16.14）
+            let group_rows = if show_rows { group.rows } else { Vec::new() };
             // どの attach セッションをホスト行の下に出したか（取りこぼし防止に使う）
             let mut rendered_sessions: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
-            for row in group.rows {
+            for row in group_rows {
                 let pane = row.pane;
                 let (color, state_label) = match row.state {
                     CommandState::Failed(code) => (theme.ansi[1], format!("エラー ({code})")),
@@ -2907,9 +2938,10 @@ impl TakoApp {
                     ));
                 }
             }
-            // ホストペインが行に出ていない attach セッションの取りこぼし防止（防御的に表示）
+            // ホストペインが行に出ていない attach セッションの取りこぼし防止（防御的に表示）。
+            // 折りたたみ時（show_rows=false）は行ごと隠れているのでこれらも出さない
             for (s_index, session) in group.sessions.iter().enumerate() {
-                if rendered_sessions.contains(&s_index) {
+                if !show_rows || rendered_sessions.contains(&s_index) {
                     continue;
                 }
                 card = card.child(self.render_attached_session_rows(
@@ -2920,8 +2952,9 @@ impl TakoApp {
                     cx,
                 ));
             }
-            // このタブ由来の退避ペインをバックグラウンド表示（FR-2.15.6 タブ別分離）
-            if !group.shelved.is_empty() {
+            // このタブ由来の退避ペインをバックグラウンド表示（FR-2.15.6 タブ別分離）。
+            // 退避は常にバックグラウンド扱いなので折りたたみ時は隠す（FR-2.16.14）
+            if !is_collapsed && !group.shelved.is_empty() {
                 for entry in &group.shelved {
                     card = card.child(self.render_shelved_row(entry, cx));
                 }
@@ -6841,6 +6874,14 @@ impl ControlHost for TakoApp {
         tako_core::tmux_backend::cleanup_orphans(&socket, &protected)
     }
 
+    fn tmux_tab_collapsed(&self, tab: TabId) -> bool {
+        self.collapsed_tmux_tabs.contains(&tab)
+    }
+
+    fn set_tmux_tab_collapsed(&mut self, tab: TabId, collapsed: Option<bool>) {
+        self.set_tmux_collapsed(tab, collapsed);
+    }
+
     fn reattach_shelved(&mut self, _pane: PaneId) {
         // セッションは terminals HashMap に残っている。再描画のみ必要
     }
@@ -8644,7 +8685,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 31, "MCP tools/list は 31 ツール");
+            check(status == 200 && tool_count == 32, "MCP tools/list は 32 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)

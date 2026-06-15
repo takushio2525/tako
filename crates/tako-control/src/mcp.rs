@@ -499,6 +499,23 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_collapse_tab",
+            "description": "サイドバー tmux ビューのタブ枠を折りたたむ / 展開する。\
+                折りたたむと、そのタブ配下のバックグラウンド項目（裏で実行中のペイン行 + 退避）を\
+                隠し、前面表示中の行は残す。雑然とした一覧を畳んで注目すべきタブだけ見せたいときに使う。\
+                collapsed 省略でトグル、tab 省略で呼び出し元のタブ。現在状態は tako_list_panes の\
+                各タブ collapsed でも取得できる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tab": { "type": "integer", "description": "対象タブの ID（省略時は呼び出し元ペインのタブ）" },
+                    "pane": pane_schema("タブ解決に使う基準ペイン ID（tab 省略時。省略時は呼び出し元）"),
+                    "collapsed": { "type": "boolean", "description": "true = 折りたたむ、false = 展開（省略時はトグル）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_open_file",
             "description": "ファイルをプレビューペインで開いてユーザーに見せる。\
                 コードはシンタックスハイライト付き、Markdown は既定でレンダリング表示\
@@ -881,6 +898,11 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
                 Some(other) => return Err(format!("view が不正: {other}（tmux | git）")),
             },
             filetree: bool_arg(args, "filetree")?,
+        },
+        "tako_collapse_tab" => Request::CollapseTab {
+            pane: u64_arg(args, "pane")?.or(caller),
+            tab: u64_arg(args, "tab")?,
+            collapsed: bool_arg(args, "collapsed")?,
         },
         "tako_check_health" => Request::CheckHealth,
         _ => return Err(format!("不明なツール: {name}")),
@@ -1298,7 +1320,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 31);
+        assert_eq!(tools.len(), 32);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

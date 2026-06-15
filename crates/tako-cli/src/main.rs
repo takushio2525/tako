@@ -75,6 +75,9 @@ enum Command {
     /// 右サイドバー情報パネル（tmux 一覧 / agents 集約センター）の表示・幅・ビュー切替。
     /// 引数なしで現在状態を表示する
     Panel(PanelArgs),
+    /// サイドバー tmux ビューのタブ枠を折りたたむ / 展開する
+    /// （配下のバックグラウンド行 + 退避を隠し、前面表示中の行は残す）
+    Collapse(CollapseArgs),
     /// ペインをたまり場へ退避する（プロセスは生きたまま画面から外す）
     Shelve(ShelveArgs),
     /// たまり場のペインを画面に復帰させる
@@ -391,6 +394,16 @@ struct ShelveArgs {
     /// 退避するペイン ID（省略時は呼び出し元。TAKO_PANE_ID から自動解決）
     #[arg(long)]
     pane: Option<u64>,
+}
+
+#[derive(Args)]
+struct CollapseArgs {
+    /// 対象タブ ID（省略時は呼び出し元ペインのタブ）
+    #[arg(long)]
+    tab: Option<u64>,
+    /// on = 折りたたむ、off = 展開（省略時はトグル）
+    #[arg(value_parser = ["on", "off"])]
+    state: Option<String>,
 }
 
 #[derive(Args)]
@@ -741,6 +754,16 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane: target_pane(*pane)?,
             target: target.clone(),
         },
+        Command::Collapse(args) => Request::CollapseTab {
+            // tab 明示時はペイン不要。省略時は呼び出し元ペインのタブへ
+            pane: if args.tab.is_some() {
+                None
+            } else {
+                target_pane(None)?
+            },
+            tab: args.tab,
+            collapsed: args.state.as_deref().map(|s| s == "on"),
+        },
         Command::Shelve(args) => Request::Shelve {
             pane: target_pane(args.pane)?,
         },
@@ -942,7 +965,8 @@ fn print_result(command: &Command, result: &Value) {
         Command::Autorename(_)
         | Command::Portdetect(_)
         | Command::Persist(_)
-        | Command::Panel(_) => {
+        | Command::Panel(_)
+        | Command::Collapse(_) => {
             println!("{result}")
         }
         Command::Git(GitCommand::Log { .. }) | Command::Git(GitCommand::Diff { .. }) => {
