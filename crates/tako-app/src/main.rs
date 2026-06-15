@@ -547,6 +547,8 @@ struct ShelvedEntry {
 /// 「タブ <名前>（閉じたタブ）」としてまとめて表示する
 #[derive(Debug, Clone)]
 struct ClosedOriginShelfGroup {
+    /// 由来タブ ID（ホバープレビュー / ピンの対象解決に使う。FR-2.16.16）
+    tab: TabId,
     title: String,
     entries: Vec<ShelvedEntry>,
 }
@@ -558,6 +560,9 @@ struct ClosedOriginShelfGroup {
 enum PreviewTarget {
     /// 単一ペイン（バックグラウンド行のホバー。FR-2.16.13）
     Pane(PaneId),
+    /// 閉じたタブグループ全体（由来タブ ID。FR-2.16.16。グループ内の全退避ペインを
+    /// 並べてプレビューする）
+    ClosedGroup(TabId),
 }
 
 /// ホバー中のプレビュー（FR-2.16.13）。マウス位置を起点にポップアップを出す。
@@ -1491,6 +1496,7 @@ impl TakoApp {
                 Entry::Vacant(e) => {
                     e.insert(next);
                     groups.push(ClosedOriginShelfGroup {
+                        tab: origin,
                         title: p.origin_tab_title().to_string(),
                         entries: vec![entry],
                     });
@@ -3177,7 +3183,9 @@ impl TakoApp {
             );
         }
         for shelf_group in &closed_origin {
+            let group_tab = shelf_group.tab;
             let mut card = div()
+                .id(("tmux-closed-group", group_tab.as_u64()))
                 .flex()
                 .flex_col()
                 .gap_1()
@@ -3185,6 +3193,22 @@ impl TakoApp {
                 .rounded_md()
                 .border_1()
                 .border_color(hsla_alpha(theme.pane_border, 0.7))
+                // グループ全体をホバーで一括プレビュー（FR-2.16.16。全退避ペインを並べて出す）
+                .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+                    if *hovered {
+                        this.hover_preview = Some(HoverPreview {
+                            target: PreviewTarget::ClosedGroup(group_tab),
+                            anchor: window.mouse_position(),
+                        });
+                    } else if matches!(
+                        this.hover_preview,
+                        Some(HoverPreview { target: PreviewTarget::ClosedGroup(t), .. })
+                            if t == group_tab
+                    ) {
+                        this.hover_preview = None;
+                    }
+                    cx.notify();
+                }))
                 .child(
                     div()
                         .text_size(px(11.0))
@@ -5863,6 +5887,29 @@ impl TakoApp {
     fn preview_label(&self, target: PreviewTarget) -> String {
         match target {
             PreviewTarget::Pane(pane_id) => self.pane_preview_label(pane_id),
+            PreviewTarget::ClosedGroup(tab) => {
+                let title = self
+                    .workspace
+                    .shelved_panes()
+                    .iter()
+                    .find(|p| p.origin_tab() == tab)
+                    .map(|p| p.origin_tab_title().to_string())
+                    .unwrap_or_default();
+                let count = self.shelved_entries_of_tab(tab).len();
+                format!("タブ {}（閉じたタブ・{count} 件）", truncate(&title, 20))
+            }
+        }
+    }
+
+    /// プレビュー対象が中身（サムネイルにできる端末）を持つか。空ならポップアップ /
+    /// ピンを出さない（端末なしの単一ペイン・空グループ）
+    fn preview_has_content(&self, target: PreviewTarget) -> bool {
+        match target {
+            PreviewTarget::Pane(pane_id) => self.terminals.contains_key(&pane_id),
+            PreviewTarget::ClosedGroup(tab) => self
+                .shelved_entries_of_tab(tab)
+                .iter()
+                .any(|e| self.terminals.contains_key(&e.pane)),
         }
     }
 
@@ -5894,12 +5941,64 @@ impl TakoApp {
             .to_string()
     }
 
-    /// プレビュー本文（実画面サムネイルの行 div 列）。Pane は端末の現在グリッドをそのまま
-    /// 読む（リサイズしない＝バックグラウンドのプログラムを乱さない）。ライブ更新は
-    /// `on_term_event` が出力ごとに呼ぶ `cx.notify()` の再描画で自動的に得られる
-    fn preview_lines(&self, target: PreviewTarget) -> Vec<gpui::Div> {
+    /// プレビュー本文（実画面サムネイル）。Pane は端末の現在グリッドをそのまま読む
+    /// （リサイズしない＝バックグラウンドのプログラムを乱さない）。ClosedGroup はグループ内の
+    /// 全退避ペインを均等高で縦に積む（FR-2.16.16）。ライブ更新は `on_term_event` が出力ごとに
+    /// 呼ぶ `cx.notify()` の再描画で自動的に得られる
+    fn preview_content(&self, target: PreviewTarget) -> gpui::Div {
+        let theme = &self.theme;
         match target {
-            PreviewTarget::Pane(pane_id) => self.terminal_screen_lines(pane_id, false),
+            PreviewTarget::Pane(pane_id) => div()
+                .flex_1()
+                .p(px(PANE_PADDING))
+                .overflow_hidden()
+                .bg(rgba(theme.background))
+                .children(self.terminal_screen_lines(pane_id, false)),
+            PreviewTarget::ClosedGroup(tab) => {
+                let mut body = div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p(px(PANE_PADDING))
+                    .overflow_hidden()
+                    .bg(rgba(theme.background));
+                for entry in self.shelved_entries_of_tab(tab) {
+                    let lines = self.terminal_screen_lines(entry.pane, false);
+                    body = body.child(
+                        div()
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .overflow_hidden()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(hsla_alpha(theme.pane_border, 0.6))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .px_1()
+                                    .bg(rgba(theme.tab_bar_background))
+                                    .text_size(px(9.0))
+                                    .text_color(hsla(theme.tab_inactive_foreground))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(SharedString::from(truncate(&entry.label, 32))),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h(px(0.0))
+                                    .overflow_hidden()
+                                    .children(lines),
+                            ),
+                    );
+                }
+                body
+            }
         }
     }
 
@@ -5908,7 +6007,6 @@ impl TakoApp {
     fn preview_body(
         &self,
         target: PreviewTarget,
-        lines: Vec<gpui::Div>,
         live: bool,
         extra_title: Option<gpui::Div>,
     ) -> gpui::Div {
@@ -5945,40 +6043,22 @@ impl TakoApp {
         if let Some(extra) = extra_title {
             titlebar = titlebar.child(extra);
         }
-        let body = if lines.is_empty() {
-            div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(11.0))
-                .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.6))
-                .child(SharedString::from(truncate(&label, 24)))
-        } else {
-            div()
-                .flex_1()
-                .p(px(PANE_PADDING))
-                .overflow_hidden()
-                .bg(rgba(theme.background))
-                .children(lines)
-        };
         div()
             .flex()
             .flex_col()
             .size_full()
             .child(titlebar)
-            .child(body)
+            .child(self.preview_content(target))
     }
 
-    /// ホバープレビューのポップアップ（FR-2.16.13）。マウス位置の左側に実画面サムネイルを
-    /// 出す（tmux ビューは右パネルにあるため左へ伸ばす）。読み取り専用（ピン留めは行 /
-    /// カード側のボタン）。ライブ更新は通常の再描画で得られる
+    /// ホバープレビューのポップアップ（FR-2.16.13 / FR-2.16.16）。マウス位置の左側に実画面
+    /// サムネイルを出す（tmux ビューは右パネルにあるため左へ伸ばす）。読み取り専用（ピン留めは
+    /// 行 / カード側のボタン）。ライブ更新は通常の再描画で得られる
     fn render_hover_preview(&self, window: &Window) -> Option<gpui::AnyElement> {
         let hp = self.hover_preview?;
         let theme = &self.theme;
-        let lines = self.preview_lines(hp.target);
         // 中身を持たない対象（プレビューペイン等でサムネイル無し）はポップアップを出さない
-        if lines.is_empty() {
+        if !self.preview_has_content(hp.target) {
             return None;
         }
         let viewport = window.viewport_size();
@@ -5998,7 +6078,7 @@ impl TakoApp {
                 .border_1()
                 .border_color(hsla(theme.accent))
                 .bg(rgba(theme.background))
-                .child(self.preview_body(hp.target, lines, true, None))
+                .child(self.preview_body(hp.target, true, None))
                 .into_any_element(),
         )
     }
