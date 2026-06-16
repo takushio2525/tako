@@ -4,24 +4,30 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-06-16・GitHub Releases 配布整備完了）
+## 現在の対象（2026-06-16・tmux window タブツリー統合 完了）
 
-`scripts/release.sh` を新設し、ローカルビルド → zip 生成 → GitHub Release アップロードの
-一発スクリプトを整備。README にダウンロード・インストール手順（Gatekeeper 対処法含む）を追加。
+バックエンドセッション内の tmux window をタブツリーに表示し、既存のプレビュー/ピン留め
+機能を適用する実装が完了。子 worker が `tmux new-window` で作った window が tako のサイドバー
+tmux ビューに見えるようになった。
 
-- **release.sh**: `build-app.sh` → `ditto -c -k` zip → `gh release create`。デフォルトは
-  zip 生成まで、`--publish` で公開リリース、`--draft` でドラフト、`--skip-build` でビルド省略
-- **README**: 「ダウンロード / Download」セクション新設。zip DL → 展開 → /Applications ドラッグ
-  → Gatekeeper「このまま開く」の 4 ステップ
-- **バージョニング**: Cargo.toml `workspace.package.version`（現在 `0.1.0`）を build-app.sh /
-  release.sh が読む。zip 名は `tako-v0.1.0-macos-arm64.zip`（アーキテクチャ自動判定）
-- push 済み（`8c0ce17`）。実際のリリース作成はユーザー判断待ち
+- **tmux.rs**: `select_window()` + `capture_pane_text()` を追加（window 切替 + プレビュー用テキスト取得）
+- **protocol.rs**: `Request::TmuxSelectWindow { pane, window }` を追加
+- **dispatch.rs**: ハンドラ実装（pane → backend session 解決 → tmux select-window 実行）。
+  `ControlHost::backend_windows()` を追加し list 応答に `backend_windows` を含める
+- **main.rs**: `PreviewTarget::TmuxWindow(PaneId, u32)` 追加。`backend_windows` / `window_captures`
+  フィールドで 2 秒ポーリングから window 追跡 + 非アクティブ window のテキストキャプチャ。
+  render_tmux_view でペイン行の下に非アクティブ window の子行を表示（ホバープレビュー +
+  クリックで切替 + 📌 ピン留め）
+- **CLI**: `tako tmux select-window <window> [--pane <id>]`
+- **MCP**: `tako_tmux_select_window` ツール（計 34 ツール）
+- **検証**: build / clippy(-D warnings) / fmt / test 全緑。セルフテスト期待値 34 に更新
 - 最終更新: 2026-06-16
 
 ## 残作業・既知の制約
 
-- ホバーポップアップは読取専用（ピンは行/カードの 📌）。ポップアップへマウスを移すと行 hover が
-  切れるため、操作要素はポップアップに置かない設計（VSCode 流）
+- window キャプチャはプレーンテキスト（ANSI 色なし）。端末スタイル付きプレビューは将来課題
+- `sync_backend_windows` は tmux ポーリング内で capture-pane を呼ぶ（非アクティブ window 数 × 1 コマンド）。
+  大量 window でのパフォーマンスは実測で判断
 - PDF プレビューのセルフテストが Core Graphics 環境依存で失敗（既知・本変更と無関係）
 - ピンの永続化（再起動またぎ）は未実装＝意図的スコープ
 
@@ -37,8 +43,11 @@
 
 - **CI（GitHub Actions）はリポ設定で意図的に無効化中**（2026-06-12〜）。コミット前は必ず
   `cargo fmt --all --check`（exit code）を確認する
-- **リリース作成**: `scripts/release.sh --publish` で v0.1.0 を作成可能。初回リリース前に
-  バージョンを上げるなら Cargo.toml の `workspace.package.version` を編集
+- **ライブプレビューは追加実装不要**: `on_term_event` が全ペインの出力で `cx.notify()` を
+  呼ぶので、`terminal_screen_lines` ベースのプレビューは再描画で勝手にライブ化する
+- **TmuxWindow プレビューはキャプチャテキストベース**: `terminal_screen_lines` は使えない
+  （バックグラウンド window は in-memory 端末にない）。`capture_pane_text` で取得した
+  プレーンテキストを StyledText で描画
 
 ## 現フェーズで Read すべき設計書
 
@@ -48,5 +57,7 @@
 ## 関連ファイル / リンク
 
 - リポジトリ: https://github.com/takushio2525/tako（private）
-- リリーススクリプト: `scripts/release.sh`
-- ビルドスクリプト: `scripts/build-app.sh`
+- 主な変更: `crates/tako-core/src/tmux.rs`（select_window / capture_pane_text）/
+  `crates/tako-control/src/{protocol,dispatch,mcp}.rs`（TmuxSelectWindow）/
+  `crates/tako-app/src/main.rs`（PreviewTarget::TmuxWindow / backend_windows / window_captures /
+  render_tmux_view の window 子行）/ `crates/tako-cli/src/main.rs`（tako tmux select-window）

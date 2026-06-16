@@ -151,3 +151,11 @@
   README にダウンロード・インストール手順（Gatekeeper 対処法）追加。AGENTS.md コマンド追加
 - 関連コミット: `8c0ce17` `[機能追加] GitHub Releases 配布用スクリプト + README ダウンロード手順`
 - 次: ユーザー判断で `scripts/release.sh --publish` または `--draft` で初回リリース作成
+
+## 2026-06-16（tmux window タブツリー統合）
+- バックエンドセッション内の tmux window をサイドバー tmux ビューに表示。子 worker が
+  `tmux new-window` で作った window が見える + クリック切替 + ホバープレビュー + ピン留め。
+  `TmuxSelectWindow` dispatch + CLI `tako tmux select-window` + MCP `tako_tmux_select_window`（計 34 ツール）
+- 関連コミット: `f25373f` `3c250b8`
+- 検証: build / clippy / fmt / test 全緑
+- 次: `build-app.sh --install` → 再起動で実機確認
