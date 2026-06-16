@@ -42,6 +42,9 @@ pub struct ScreenLine {
     /// テキストから除いているため、次の文字との col 差が 2 になる。
     /// 描画（プロポーショナルな実フォント幅）とグリッド座標の写像に使う
     pub cell_cols: Vec<usize>,
+    /// 行に全角（2 セル幅）文字が含まれるか。描画時にセル幅固定レイアウトへ
+    /// 切り替える判定に使う
+    pub has_wide: bool,
 }
 
 /// 表示中グリッドのスナップショット
@@ -191,10 +194,12 @@ pub fn snapshot_opts<T: EventListener>(term: &Term<T>, theme: &Theme, show_curso
                     }),
                 }
             }
+            let has_wide = cell_cols.windows(2).any(|w| w[1] - w[0] > 1);
             ScreenLine {
                 text,
                 runs,
                 cell_cols,
+                has_wide,
             }
         })
         .collect();
