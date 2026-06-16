@@ -107,6 +107,8 @@ pub struct VideoPlayer {
     pub current_frame: Vec<u8>,
     /// 現在の再生位置（秒）
     pub current_time: f64,
+    /// フレーム世代カウンタ（grab_frame 成功ごとにインクリメント。描画キャッシュの無効化に使う）
+    pub frame_gen: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -220,6 +222,7 @@ impl VideoPlayer {
                 height,
                 current_frame: Vec::new(),
                 current_time: 0.0,
+                frame_gen: 0,
             };
 
             // 最初のフレームを取得
@@ -329,6 +332,7 @@ impl VideoPlayer {
                 self.width = width as u32;
                 self.height = height as u32;
                 self.current_frame = encode_rgba_to_png(&rgba, width as u32, height as u32);
+                self.frame_gen += 1;
             }
 
             CVPixelBufferUnlockBaseAddress(pixel_buffer, K_CV_PIXEL_BUFFER_LOCK_READ_ONLY);

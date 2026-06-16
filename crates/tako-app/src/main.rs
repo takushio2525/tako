@@ -482,6 +482,8 @@ struct TakoApp {
     video_players: HashMap<PaneId, video_player::VideoPlayer>,
     /// 動画フレーム更新ティッカーの稼働中フラグ（再生中ペインがある間だけ回す）
     video_ticker: bool,
+    /// 動画フレームの描画キャッシュ（frame_gen でダブルバッファリング: 新フレーム準備完了まで前フレームを表示）
+    video_frame_cache: HashMap<PaneId, (u64, std::sync::Arc<gpui::Image>)>,
 }
 
 /// git パネルのデータスナップショット（FR-3.6 / FR-3.9）
@@ -928,6 +930,7 @@ impl TakoApp {
             dragging_pin: None,
             video_players: HashMap::new(),
             video_ticker: false,
+            video_frame_cache: HashMap::new(),
         };
         if restored.is_empty() {
             let root_id = app.workspace.active_tab().tree().focused();
@@ -2169,6 +2172,7 @@ impl TakoApp {
                 self.terminals.remove(&pane_id);
                 self.previews.remove(&pane_id);
                 self.video_players.remove(&pane_id);
+                self.video_frame_cache.remove(&pane_id);
                 self.scroll_accum.remove(&pane_id);
                 self.scroll_ctls.remove(&pane_id);
                 self.drop_tmux_view_session(pane_id);
@@ -2193,6 +2197,7 @@ impl TakoApp {
                     self.terminals.remove(&id);
                     self.previews.remove(&id);
                     self.video_players.remove(&id);
+                    self.video_frame_cache.remove(&id);
                     self.scroll_accum.remove(&id);
                     self.scroll_ctls.remove(&id);
                     self.drop_tmux_view_session(id);
@@ -5314,13 +5319,16 @@ impl TakoApp {
                 let live = this
                     .update(cx, |app, cx| {
                         let mut any_playing = false;
+                        let mut any_new_frame = false;
                         for player in app.video_players.values_mut() {
                             if player.state == video_player::PlaybackState::Playing {
-                                player.grab_frame();
                                 any_playing = true;
+                                if player.grab_frame() {
+                                    any_new_frame = true;
+                                }
                             }
                         }
-                        if any_playing {
+                        if any_new_frame {
                             cx.notify();
                         }
                         any_playing
@@ -7100,13 +7108,22 @@ impl TakoApp {
                 let mut elements: Vec<gpui::AnyElement> = Vec::new();
 
                 if has_player {
-                    // AVFoundation プレイヤー起動中: デコード済みフレームを表示
+                    // AVFoundation プレイヤー起動中: キャッシュ済みフレームを表示
                     let player = self.video_players.get(&pane_id).unwrap();
-                    if !player.current_frame.is_empty() {
-                        let frame_image = std::sync::Arc::new(gpui::Image::from_bytes(
+                    let gen = player.frame_gen;
+                    let need_update = match self.video_frame_cache.get(&pane_id) {
+                        Some((cached_gen, _)) => *cached_gen != gen,
+                        None => true,
+                    };
+                    if need_update && !player.current_frame.is_empty() {
+                        let img = std::sync::Arc::new(gpui::Image::from_bytes(
                             gpui::ImageFormat::Png,
                             player.current_frame.clone(),
                         ));
+                        self.video_frame_cache.insert(pane_id, (gen, img));
+                    }
+                    if let Some((_, ref frame_image)) = self.video_frame_cache.get(&pane_id) {
+                        let frame_image = frame_image.clone();
                         elements.push(
                             div()
                                 .flex()
