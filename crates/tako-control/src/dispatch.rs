@@ -588,6 +588,23 @@ pub fn dispatch(
             }))
         }
 
+        Request::TmuxSelectWindow { pane, window } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let session = host
+                .backend_session(target)
+                .ok_or_else(|| DispatchError::Operation(format!(
+                    "ペイン {target} にバックエンドセッションがない（tmux 永続化が無効 or 直接 spawn）"
+                )))?;
+            let socket = tako_core::tmux_backend::socket_name();
+            tako_core::tmux::select_window(Some(&socket), &session, window)
+                .map_err(DispatchError::Operation)?;
+            Ok(json!({
+                "pane": target.as_u64(),
+                "session": session,
+                "window": window,
+            }))
+        }
+
         Request::TmuxCleanup { socket } => {
             // socket 省略時は tako バックエンドサーバーを対象にする（取り残しの主因）
             let _ = socket; // 現状は backend socket 固定（host が protected を解決して実行）

@@ -195,6 +195,9 @@ pub enum Request {
         pane: Option<u64>,
         direction: Option<Direction>,
     },
+    /// バックエンドセッションのアクティブ window を切り替える。`pane` のバックエンド
+    /// セッション内で `window` 番号の window に切り替える。`pane` 省略時は呼び出し元ペイン
+    TmuxSelectWindow { pane: Option<u64>, window: u32 },
     /// orphan tmux セッションの一括クリーンアップ（FR-2.16.11）。`socket` 省略時は
     /// tako バックエンドサーバー。detached・非 grouped・未使用の `tako-` セッションのみ
     /// kill する（使用中・ユーザーセッションには触れない）。kill した名前を返す

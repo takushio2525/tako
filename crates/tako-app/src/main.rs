@@ -570,6 +570,9 @@ enum PreviewTarget {
     /// 閉じたタブグループ全体（由来タブ ID。FR-2.16.16。グループ内の全退避ペインを
     /// 並べてプレビューする）
     ClosedGroup(TabId),
+    /// バックエンドセッション内の特定 tmux window（ペイン ID + window index）。
+    /// ペインが表示中の window 以外をプレビュー / ピン留めする
+    TmuxWindow(PaneId, u32),
 }
 
 /// ホバー中のプレビュー（FR-2.16.13）。マウス位置を起点にポップアップを出す。
@@ -596,6 +599,7 @@ fn pin_key(target: PreviewTarget) -> u64 {
     match target {
         PreviewTarget::Pane(id) => id.as_u64(),
         PreviewTarget::ClosedGroup(tab) => tab.as_u64() | (1 << 63),
+        PreviewTarget::TmuxWindow(pane, win) => pane.as_u64() ^ ((win as u64) << 32) | (1 << 62),
     }
 }
 
