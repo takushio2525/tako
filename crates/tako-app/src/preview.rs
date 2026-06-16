@@ -322,9 +322,88 @@ pub fn load_video(path: &Path) -> PreviewState {
     }
 }
 
+/// ffmpeg バイナリの場所（プロセス内で 1 回だけ解決してキャッシュする）。
+/// .app バンドルから起動すると PATH が最小構成で Homebrew の ffmpeg が
+/// 見えない（tmux_bin() と同じ問題）。同じフォールバック戦略で解決する
+fn ffmpeg_bin() -> &'static str {
+    static BIN: OnceLock<String> = OnceLock::new();
+    BIN.get_or_init(|| {
+        resolve_media_bin(
+            "ffmpeg",
+            "FFMPEG_PATH",
+            &[
+                "/opt/homebrew/bin/ffmpeg",
+                "/usr/local/bin/ffmpeg",
+                "/opt/local/bin/ffmpeg",
+            ],
+        )
+    })
+}
+
+/// ffprobe バイナリの場所（ffmpeg_bin() と同じ戦略）
+fn ffprobe_bin() -> &'static str {
+    static BIN: OnceLock<String> = OnceLock::new();
+    BIN.get_or_init(|| {
+        resolve_media_bin(
+            "ffprobe",
+            "FFPROBE_PATH",
+            &[
+                "/opt/homebrew/bin/ffprobe",
+                "/usr/local/bin/ffprobe",
+                "/opt/local/bin/ffprobe",
+            ],
+        )
+    })
+}
+
+/// 外部バイナリの解決（tmux_bin() と同じフォールバック: env → PATH → 既知パス → ログインシェル）
+fn resolve_media_bin(name: &str, env_var: &str, known_paths: &[&str]) -> String {
+    if let Some(bin) = std::env::var_os(env_var) {
+        if !bin.is_empty() {
+            return bin.to_string_lossy().into_owned();
+        }
+    }
+    if std::process::Command::new(name)
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        return name.into();
+    }
+    for candidate in known_paths {
+        if std::path::Path::new(candidate).is_file() {
+            return (*candidate).into();
+        }
+    }
+    #[cfg(unix)]
+    {
+        let shell = std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/bin/sh".into());
+        if let Ok(output) = std::process::Command::new(&shell)
+            .args(["-l", "-c", &format!("command -v {name}")])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() && std::path::Path::new(&path).is_file() {
+                    return path;
+                }
+            }
+        }
+    }
+    name.into()
+}
+
 /// ffprobe で動画のメタ情報を取得する。ffprobe が無ければすべて None
 fn video_probe(path: &Path) -> (Option<f64>, Option<(u32, u32)>, Option<String>) {
-    let output = std::process::Command::new("ffprobe")
+    let output = std::process::Command::new(ffprobe_bin())
         .args([
             "-v",
             "quiet",
@@ -374,7 +453,7 @@ fn video_thumbnail(path: &Path, duration: Option<f64>) -> Vec<u8> {
         Some(d) if d > 1.0 => format!("{:.1}", d * 0.1),
         _ => "0".to_string(),
     };
-    let output = std::process::Command::new("ffmpeg")
+    let output = std::process::Command::new(ffmpeg_bin())
         .args(["-ss", &seek, "-i"])
         .arg(path)
         .args([
