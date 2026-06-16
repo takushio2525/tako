@@ -26,7 +26,23 @@ Working with AI agents like Claude Code, a single task naturally splits into the
 Specs live in [`.agent/`](.agent/) (concept / requirements / architecture / roadmap).
 The terminal core (tabs, splits, IME), the `tako` CLI, and the built-in MCP server (Claude Code integration) are working.
 
-## ビルドとインストール / Build & Install
+## ダウンロード / Download
+
+[GitHub Releases](https://github.com/takushio2525/tako/releases) から最新の zip をダウンロードできます。
+Pre-built macOS binaries are available on the [Releases](https://github.com/takushio2525/tako/releases) page.
+
+### インストール手順 / Installation
+
+1. `tako-vX.X.X-macos-arm64.zip` をダウンロード / Download the zip
+2. ダブルクリックで展開 / Extract by double-clicking
+3. `tako.app` を `/Applications` へドラッグ / Drag `tako.app` into `/Applications`
+4. 初回起動時に Gatekeeper の警告が表示される（Developer ID 署名がないため） / macOS Gatekeeper will warn on first launch (not notarized yet):
+   - `tako.app` をダブルクリックして警告が出たら一旦キャンセル / Double-click, then cancel the warning
+   - **システム設定 → プライバシーとセキュリティ** を開く / Open **System Settings → Privacy & Security**
+   - 下部に「"tako"は開発元を確認できないため〜」と表示されるので **「このまま開く」** をクリック / Click **"Open Anyway"** next to the tako warning
+   - もう一度 `tako.app` を起動すると「開く」ボタンが表示される / Launch again and click **"Open"**
+
+## ソースからビルド / Build from Source
 
 macOS で `tako.app` を生成して `/Applications` へ配置するには:
 

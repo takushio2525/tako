@@ -64,6 +64,7 @@ tako/
 | Claude Code 実機検証（MCP 設定ゼロ接続） | `scripts/verify-claude-mcp.sh`（要 claude CLI + 認証） |
 | `tako` CLI ビルド | `cargo build -p tako-cli`（バイナリは `target/debug/tako`） |
 | .app バンドル生成（macOS） | `scripts/build-app.sh [--verify] [--install]`（`dist/tako.app`。tako CLI 同梱） |
+| リリース zip 生成 | `scripts/release.sh`（ビルド→zip。`--publish` で GitHub Release 作成、`--draft` でドラフト） |
 | build | `cargo build --workspace` |
 | lint | `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` |
 | test | `cargo test --workspace` |
