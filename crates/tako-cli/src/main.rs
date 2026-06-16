@@ -76,18 +76,20 @@ enum Command {
     /// 引数なしで現在状態を表示する
     Panel(PanelArgs),
     /// サイドバー tmux ビューのタブ枠を折りたたむ / 展開する
-    /// （配下のバックグラウンド行 + 退避を隠し、前面表示中の行は残す）
+    /// （配下のバックグラウンド行 + バックグラウンドを隠し、前面表示中の行は残す）
     Collapse(CollapseArgs),
     /// プレビューをピン留め / 解除する（バックグラウンドペイン / 閉じたタブグループの
     /// 実画面をアプリ内フローティングウィンドウとして常駐・ライブ更新させる）
     Pin(PinArgs),
-    /// ペインをたまり場へ退避する（プロセスは生きたまま画面から外す）
-    Shelve(ShelveArgs),
-    /// たまり場のペインを画面に復帰させる
-    Unshelve(UnshelveArgs),
-    /// たまり場に退避中のペイン一覧を JSON で出力する
-    #[command(name = "shelved")]
-    ShelvedList,
+    /// ペインをバックグラウンドへ送る（プロセスは生きたまま画面から外す）
+    #[command(name = "background")]
+    Background(BackgroundArgs),
+    /// バックグラウンドのペインを画面に復帰させる
+    #[command(name = "foreground")]
+    Foreground(ForegroundArgs),
+    /// バックグラウンドのペイン一覧を JSON で出力する
+    #[command(name = "backgrounded")]
+    BackgroundList,
     /// ファイル操作（パスコピー / Finder 表示 / cd / リネーム / 作成 / ゴミ箱）
     #[command(subcommand)]
     File(FileCommand),
@@ -404,8 +406,8 @@ struct ToggleArgs {
 }
 
 #[derive(Args)]
-struct ShelveArgs {
-    /// 退避するペイン ID（省略時は呼び出し元。TAKO_PANE_ID から自動解決）
+struct BackgroundArgs {
+    /// バックグラウンドへ送るペイン ID（省略時は呼び出し元。TAKO_PANE_ID から自動解決）
     #[arg(long)]
     pane: Option<u64>,
 }
@@ -434,10 +436,10 @@ struct PinArgs {
 }
 
 #[derive(Args)]
-struct UnshelveArgs {
-    /// 復帰させるペインの ID（tako shelved で確認）
+struct ForegroundArgs {
+    /// 復帰させるペインの ID（tako backgrounded で確認）
     pane: u64,
-    /// 挿入先ペインの ID（省略時は退避元の由来タブ。閉じていればアクティブタブ）
+    /// 挿入先ペインの ID（省略時は由来タブ。閉じていればアクティブタブ）
     #[arg(long)]
     target: Option<u64>,
     /// 分割方向（right / down / left / up。省略時は right）
@@ -842,15 +844,15 @@ fn build_request(command: &Command) -> Result<Request, String> {
             group_tab: args.group_tab,
             pinned: args.state.as_deref().map(|s| s == "on"),
         },
-        Command::Shelve(args) => Request::Shelve {
+        Command::Background(args) => Request::Background {
             pane: target_pane(args.pane)?,
         },
-        Command::Unshelve(args) => Request::Unshelve {
+        Command::Foreground(args) => Request::Foreground {
             pane: args.pane,
             target: args.target,
             direction: args.direction.as_deref().map(parse_direction).transpose()?,
         },
-        Command::ShelvedList => Request::ShelvedList,
+        Command::BackgroundList => Request::BackgroundList,
         Command::Tmux(TmuxCommand::List { socket }) => Request::TmuxList {
             socket: socket.clone(),
         },
@@ -1076,7 +1078,7 @@ fn print_result(command: &Command, result: &Value) {
             }
         }
         Command::File(_) => println!("{result}"),
-        Command::ShelvedList => {
+        Command::BackgroundList => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(result).unwrap_or_default()

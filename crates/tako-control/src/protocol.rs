@@ -100,6 +100,7 @@ pub enum PreviewModeWire {
     Markdown,
     Image,
     Pdf,
+    Video,
 }
 
 impl PreviewModeWire {
@@ -109,6 +110,7 @@ impl PreviewModeWire {
             PreviewModeWire::Markdown => "markdown",
             PreviewModeWire::Image => "image",
             PreviewModeWire::Pdf => "pdf",
+            PreviewModeWire::Video => "video",
         }
     }
 }
@@ -246,7 +248,7 @@ pub enum Request {
         filetree: Option<bool>,
     },
     /// サイドバー tmux ビューのタブ枠の折りたたみ（FR-2.16.14）。折りたたむと、その
-    /// タブ配下の**バックグラウンド項目（裏で実行中のペイン行 + 退避）を隠し、前面表示中の
+    /// タブ配下の**バックグラウンド項目（裏で実行中のペイン行 + バックグラウンド）を隠し、前面表示中の
     /// 行は残す**。`tab` 省略時は `pane`（呼び出し元）の属するタブ。`collapsed` 省略時は
     /// トグル（現在状態の反転）。設定は永続化される
     CollapseTab {
@@ -295,20 +297,20 @@ pub enum Request {
         pane: Option<u64>,
         target: Option<String>,
     },
-    /// ペインをたまり場へ退避する（FR-2.15.1）。プロセスは生きたまま画面から外す
-    Shelve { pane: Option<u64> },
-    /// たまり場からペインを復帰させる（FR-2.15.3 / FR-2.15.4）。`target` を
+    /// ペインをバックグラウンドへ送る（FR-2.15.1）。プロセスは生きたまま画面から外す
+    Background { pane: Option<u64> },
+    /// バックグラウンドからペインを復帰させる（FR-2.15.3 / FR-2.15.4）。`target` を
     /// `direction`（省略時は右）へ分割した位置に挿し直す。`target` 省略時は
     /// アクティブタブのフォーカス中ペインの隣
-    Unshelve {
+    Foreground {
         pane: u64,
         target: Option<u64>,
         direction: Option<Direction>,
     },
-    /// たまり場の一覧取得。shelved ペインの ID / title / role / 状態を返す
-    ShelvedList,
-    /// たまり場のペインを kill する（FR-2.15.2）。確認は呼び出し側の責務
-    ShelvedKill { pane: u64 },
+    /// バックグラウンドペインの一覧取得。ID / title / role / 状態を返す
+    BackgroundList,
+    /// バックグラウンドのペインを kill する（FR-2.15.2）。確認は呼び出し側の責務
+    BackgroundKill { pane: u64 },
     /// 環境の健全性診断。CLI の PATH / バージョン一致 / 外部ツールの有無等をチェックする
     CheckHealth,
     /// Claude Code の settings.json に tako MCP サーバーの接続設定を追加する（FR-2.14）。

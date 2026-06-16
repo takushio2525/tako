@@ -79,9 +79,9 @@ pub trait ControlHost {
     fn filetree_visible(&self) -> bool {
         false
     }
-    /// たまり場から復帰させたペインのセッションを再接続する（FR-2.15.3）。
-    /// セッション自体は shelve 時に破棄していないため、UI 層で再描画するだけでよい場合が多い
-    fn reattach_shelved(&mut self, _pane: PaneId) {}
+    /// バックグラウンドから復帰させたペインのセッションを再接続する（FR-2.15.3）。
+    /// セッション自体はバックグラウンド送り時に破棄していないため、UI 層で再描画するだけでよい場合が多い
+    fn reattach_backgrounded(&mut self, _pane: PaneId) {}
     /// ファイルツリーの表示・非表示（root の cwd 同期は実装側の責務）
     fn set_filetree(&mut self, _visible: bool) {}
     /// ペインのプレビュー状態（FR-3.2。`(path, mode)`。プレビューペインでなければ None）
@@ -108,7 +108,7 @@ pub trait ControlHost {
     ) {
     }
     /// orphan tmux セッションの一括クリーンアップ（FR-2.16.11）。実装側が現存ペイン・
-    /// 退避ペイン・表示中ビューを protected として除外し、backend socket 上の取り残し
+    /// バックグラウンドペイン・表示中ビューを protected として除外し、backend socket 上の取り残し
     /// セッションを kill する。kill した名前を返す
     fn cleanup_orphan_tmux(&self) -> Vec<String> {
         Vec::new()
@@ -510,7 +510,7 @@ pub fn dispatch(
             // 例: `tako-view-tako-view-master-tako-2-0`（group=master-tako）→ `master-tako`
             let group = tako_core::tmux::session_group(socket.as_deref(), &session);
             let original = group.unwrap_or_else(|| session.clone());
-            // tako 自身が作ったラッパーを開き直す場合（退避からの復帰・再オープン等）は、
+            // tako 自身が作ったラッパーを開き直す場合（バックグラウンドからの復帰・再オープン等）は、
             // **新しいラッパーを作らず元セッションをそのまま直接 attach** する（ユーザー指示）。
             // この経路で開いたペインは元セッションそのものなので close 時に kill しない
             let reopen = session.starts_with("tako-view-");
@@ -784,6 +784,14 @@ pub fn dispatch(
                         PreviewModeWire::Image
                     }
                     Some(ext) if ext.eq_ignore_ascii_case("pdf") => PreviewModeWire::Pdf,
+                    Some(ext)
+                        if matches!(
+                            ext.to_ascii_lowercase().as_str(),
+                            "mp4" | "webm" | "mov" | "avi" | "mkv"
+                        ) =>
+                    {
+                        PreviewModeWire::Video
+                    }
                     _ => PreviewModeWire::Code,
                 });
             // 表示先の解決: direction 指定（FR-3.11 = D&D のドロップ位置）なら再利用せず
@@ -1078,13 +1086,13 @@ pub fn dispatch(
             }))
         }
 
-        Request::Shelve { pane } => {
+        Request::Background { pane } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
             host.workspace_mut().shelve_pane(target).map_err(op_err)?;
-            Ok(json!({ "shelved": target.as_u64() }))
+            Ok(json!({ "backgrounded": target.as_u64() }))
         }
 
-        Request::Unshelve {
+        Request::Foreground {
             pane,
             target,
             direction,
@@ -1093,8 +1101,6 @@ pub fn dispatch(
             if !host.workspace().is_shelved(pane_id) {
                 return Err(DispatchError::PaneNotFound(pane));
             }
-            // target 省略時は由来タブ（FR-2.15.6）のフォーカスペインへ戻す。
-            // 由来タブが既に閉じていればアクティブタブへフォールバックする
             let target_id = if let Some(t) = target {
                 let (_, id) = resolve_pane(host.workspace(), Some(t))?;
                 id
@@ -1111,12 +1117,12 @@ pub fn dispatch(
             host.workspace_mut()
                 .unshelve_pane(pane_id, target_id, dir)
                 .map_err(op_err)?;
-            host.reattach_shelved(pane_id);
-            Ok(json!({ "unshelved": pane, "target": target_id.as_u64() }))
+            host.reattach_backgrounded(pane_id);
+            Ok(json!({ "foregrounded": pane, "target": target_id.as_u64() }))
         }
 
-        Request::ShelvedList => {
-            let shelved: Vec<serde_json::Value> = host
+        Request::BackgroundList => {
+            let items: Vec<serde_json::Value> = host
                 .workspace()
                 .shelved_panes()
                 .iter()
@@ -1135,15 +1141,13 @@ pub fn dispatch(
                         "role": p.role(),
                         "state": format!("{state:?}").to_lowercase(),
                         "cwd": cwd,
-                        // 由来タブ（FR-2.15.6。タブ別分離表示・復帰先の解決に使う）
                         "origin_tab": p.origin_tab().as_u64(),
                         "origin_tab_title": p.origin_tab_title(),
-                        // 退避ペインは常に裏で動いている（FR-2.16.12 の表示分類と一致）
                         "surface": "background",
                     })
                 })
                 .collect();
-            Ok(json!({ "shelved": shelved }))
+            Ok(json!({ "backgrounded": items }))
         }
 
         Request::CollapseTab {
@@ -1168,7 +1172,7 @@ pub fn dispatch(
             pinned,
         } => {
             if let Some(t) = group_tab {
-                // 閉じたタブグループ: tab は閉じているので tabs() に無い。退避ペインの由来で検証
+                // 閉じたタブグループ: tab は閉じているので tabs() に無い。バックグラウンドペインの由来で検証
                 let tab = TabId::from_raw(t);
                 if !host
                     .workspace()
@@ -1187,7 +1191,7 @@ pub fn dispatch(
             }
         }
 
-        Request::ShelvedKill { pane } => {
+        Request::BackgroundKill { pane } => {
             let pane_id = PaneId::from_raw(pane);
             if host.workspace_mut().remove_shelved(pane_id).is_none() {
                 return Err(DispatchError::PaneNotFound(pane));
@@ -1385,7 +1389,7 @@ fn check_health(host: &dyn ControlHost) -> Value {
     let ws = host.workspace();
     let tab_count = ws.tabs().len();
     let pane_count: usize = ws.tabs().iter().map(|t| t.tree().len()).sum();
-    let shelved_count = ws.shelved_panes().len();
+    let bg_count = ws.shelved_panes().len();
 
     let healthy = issues.is_empty();
 
@@ -1401,7 +1405,7 @@ fn check_health(host: &dyn ControlHost) -> Value {
         "workspace": {
             "tabs": tab_count,
             "panes": pane_count,
-            "shelved": shelved_count,
+            "backgrounded": bg_count,
         },
         "issues": issues,
     })
@@ -2053,46 +2057,43 @@ mod tests {
     }
 
     #[test]
-    fn shelvedリストは由来タブとbackgroundを返す() {
-        // FR-2.15.6: 退避ペインは由来タブを保持し、常に background 分類で返す
+    fn backgroundリストは由来タブとbackgroundを返す() {
         let mut host = MockHost::new();
         let root = host.root_pane();
         let t1 = host.ws.active_tab_id();
-        host.ws.create_tab("t2", Pane::new(PaneOrigin::User)); // 退避できるよう 2 タブに
+        host.ws.create_tab("t2", Pane::new(PaneOrigin::User));
         dispatch(
             &mut host,
-            Request::Shelve { pane: Some(root) },
+            Request::Background { pane: Some(root) },
             PaneOrigin::Cli,
         )
         .unwrap();
-        let result = dispatch(&mut host, Request::ShelvedList, PaneOrigin::Cli).unwrap();
-        let shelved = result["shelved"].as_array().unwrap();
-        assert_eq!(shelved.len(), 1);
-        assert_eq!(shelved[0]["pane"].as_u64(), Some(root));
-        assert_eq!(shelved[0]["origin_tab"].as_u64(), Some(t1.as_u64()));
-        assert_eq!(shelved[0]["origin_tab_title"].as_str(), Some("t1"));
-        assert_eq!(shelved[0]["surface"].as_str(), Some("background"));
+        let result = dispatch(&mut host, Request::BackgroundList, PaneOrigin::Cli).unwrap();
+        let items = result["backgrounded"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["pane"].as_u64(), Some(root));
+        assert_eq!(items[0]["origin_tab"].as_u64(), Some(t1.as_u64()));
+        assert_eq!(items[0]["origin_tab_title"].as_str(), Some("t1"));
+        assert_eq!(items[0]["surface"].as_str(), Some("background"));
     }
 
     #[test]
-    fn unshelveはtarget省略で由来タブへ戻す() {
-        // FR-2.15.6: 復帰先 target 省略時は由来タブ（生存していれば）へ戻す
+    fn foregroundはtarget省略で由来タブへ戻す() {
         let mut host = MockHost::new();
         let root = host.root_pane();
         let t1 = host.ws.active_tab_id();
-        let p2 = split(&mut host, root); // t1 に 2 ペイン目
-        host.ws.create_tab("t2", Pane::new(PaneOrigin::User)); // t2 をアクティブに
+        let p2 = split(&mut host, root);
+        host.ws.create_tab("t2", Pane::new(PaneOrigin::User));
         dispatch(
             &mut host,
-            Request::Shelve { pane: Some(p2) },
+            Request::Background { pane: Some(p2) },
             PaneOrigin::Cli,
         )
         .unwrap();
         assert!(host.ws.is_shelved(PaneId::from_raw(p2)));
-        // アクティブは t2 だが、由来タブ t1 へ戻ること
         let result = dispatch(
             &mut host,
-            Request::Unshelve {
+            Request::Foreground {
                 pane: p2,
                 target: None,
                 direction: None,
@@ -2100,7 +2101,7 @@ mod tests {
             PaneOrigin::Cli,
         )
         .unwrap();
-        assert_eq!(result["unshelved"].as_u64(), Some(p2));
+        assert_eq!(result["foregrounded"].as_u64(), Some(p2));
         assert!(!host.ws.is_shelved(PaneId::from_raw(p2)));
         assert_eq!(host.ws.find_tab_of_pane(PaneId::from_raw(p2)), Some(t1));
     }
@@ -2195,8 +2196,8 @@ mod tests {
     }
 
     #[test]
-    fn pinのgroup_tabは退避の由来が無いと弾く() {
-        // 閉じたタブグループのピンは、その由来を持つ退避ペインが居るときだけ通る
+    fn pinのgroup_tabはバックグラウンドの由来が無いと弾く() {
+        // 閉じたタブグループのピンは、その由来を持つバックグラウンドペインが居るときだけ通る
         let mut host = MockHost::new();
         let err = dispatch(
             &mut host,

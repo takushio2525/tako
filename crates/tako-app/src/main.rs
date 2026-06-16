@@ -121,18 +121,18 @@ const PANE_TITLE_BAR: f32 = 22.0;
 /// 下部ステータスバーの高さ（px。FR-2.16.4。Zed / VSCode 風）
 const STATUS_BAR_HEIGHT: f32 = 24.0;
 
-/// たまり場ドロワーの既定高さ（px。FR-2.15）。横並びプレビュー（実画面サムネイル）が
+/// バックグラウンドドロワーの既定高さ（px。FR-2.15）。横並びプレビュー（実画面サムネイル）が
 /// 読めるだけの高さを確保する
 const DRAWER_DEFAULT_HEIGHT: f32 = 240.0;
 
-/// たまり場ドロワー上端のヘッダ行の高さ（px）
+/// バックグラウンドドロワー上端のヘッダ行の高さ（px）
 const DRAWER_HEADER_HEIGHT: f32 = 22.0;
 
-/// たまり場ドロワーのタブ別グループ見出し行の高さ（px。FR-2.15.6）
+/// バックグラウンドドロワーのタブ別グループ見出し行の高さ（px。FR-2.15.6）
 const DRAWER_GROUP_HEADER: f32 = 16.0;
 
-/// たまり場の退避プレビューカード 1 枚の幅（px。横並び + 横スクロール）
-const SHELF_CARD_WIDTH: f32 = 300.0;
+/// バックグラウンドプレビューカード 1 枚の幅（px。横並び + 横スクロール）
+const BG_CARD_WIDTH: f32 = 300.0;
 
 /// タブツリーのホバープレビュー / ピン留めウィンドウの既定サイズ（px。FR-2.16.13）。
 /// 実画面サムネイル（terminal_screen_lines）をクリップ表示する箱の寸法
@@ -443,7 +443,7 @@ struct TakoApp {
     /// OS ウィンドウの現フレーム（render で採取し layout 保存に含める。FR-5）
     window_frame: Option<tako_control::layout::WindowFrame>,
     /// tmux ビューのアコーディオン折りたたみ状態（FR-2.16.14。折りたたむと配下の
-    /// バックグラウンド行 + 退避を隠す）。タブ並べ替え / クローズに強い TabId キー
+    /// バックグラウンド行 + バックグラウンドを隠す）。タブ並べ替え / クローズに強い TabId キー
     collapsed_tmux_tabs: std::collections::HashSet<TabId>,
     /// TmuxOpen で作成されたペインの監視対象。対象セッションが消滅したら
     /// ペインを自動クローズする（ポーリングで検知）
@@ -464,12 +464,12 @@ struct TakoApp {
     git_selected_commit: Option<String>,
     /// git パネルのアコーディオン折りたたみ
     git_collapsed: GitCollapsed,
-    /// たまり場ドロワーの表示状態（FR-2.15。下部ステータスバーのボタンでトグル）
+    /// バックグラウンドドロワーの表示状態（FR-2.15。下部ステータスバーのボタンでトグル）
     drawer_visible: bool,
-    /// たまり場ドロワーの高さ（px）
+    /// バックグラウンドドロワーの高さ（px）
     drawer_height: f32,
-    /// たまり場内のペインの kill 確認待ち
-    shelved_pending_kill: Option<PaneId>,
+    /// バックグラウンド内のペインの kill 確認待ち
+    bg_pending_kill: Option<PaneId>,
     /// サイドバー tmux ビューでホバー中のプレビュー（FR-2.16.13。バックグラウンド行 /
     /// 閉じたタブグループの中身をマウス位置のポップアップで覗く）
     hover_preview: Option<HoverPreview>,
@@ -542,26 +542,26 @@ struct TmuxViewTabGroup {
     rows: Vec<AgentEntry>,
     /// このタブのペイン内で attach 中の外部 tmux セッション（FR-2.16.9）
     sessions: Vec<AttachedTmuxSession>,
-    /// このタブ由来の退避ペイン（FR-2.15.6。タブ別分離してバックグラウンド表示する）
-    shelved: Vec<ShelvedEntry>,
+    /// このタブ由来のバックグラウンドペイン（FR-2.15.6。タブ別分離してバックグラウンド表示する）
+    backgrounded: Vec<BackgroundEntry>,
 }
 
-/// タブ別退避表示の 1 ペイン分（FR-2.15.6）。退避ペインは常にバックグラウンド扱い
+/// タブ別バックグラウンド表示の 1 ペイン分（FR-2.15.6）。バックグラウンドペインは常にバックグラウンド扱い
 #[derive(Debug, Clone)]
-struct ShelvedEntry {
+struct BackgroundEntry {
     pane: PaneId,
     label: String,
     state: CommandState,
 }
 
-/// 閉じた由来タブの退避ペイン群（FR-2.15.6）。由来タブが既に存在しない退避ペインを
+/// 閉じた由来タブのバックグラウンドペイン群（FR-2.15.6）。由来タブが既に存在しないバックグラウンドペインを
 /// 「タブ <名前>（閉じたタブ）」としてまとめて表示する
 #[derive(Debug, Clone)]
-struct ClosedOriginShelfGroup {
+struct ClosedOriginBackgroundGroup {
     /// 由来タブ ID（ホバープレビュー / ピンの対象解決に使う。FR-2.16.16）
     tab: TabId,
     title: String,
-    entries: Vec<ShelvedEntry>,
+    entries: Vec<BackgroundEntry>,
 }
 
 /// ホバープレビュー / ピン留めの対象（FR-2.16.13）。サイドバー tmux ビューの
@@ -571,7 +571,7 @@ struct ClosedOriginShelfGroup {
 enum PreviewTarget {
     /// 単一ペイン（バックグラウンド行のホバー。FR-2.16.13）
     Pane(PaneId),
-    /// 閉じたタブグループ全体（由来タブ ID。FR-2.16.16。グループ内の全退避ペインを
+    /// 閉じたタブグループ全体（由来タブ ID。FR-2.16.16。グループ内の全バックグラウンドペインを
     /// 並べてプレビューする）
     ClosedGroup(TabId),
     /// バックエンドセッション内の特定 tmux window（ペイン ID + window index）。
@@ -700,13 +700,13 @@ enum InlineEditKind {
     NewDir,
 }
 
-/// D&D ペイロード: たまり場のペイン（FR-2.15.3。ドロワーからペインエリアへ復帰）
+/// D&D ペイロード: バックグラウンドのペイン（FR-2.15.3。ドロワーからペインエリアへ復帰）
 #[derive(Debug, Clone, Copy)]
-struct ShelvedPaneDrag {
+struct BackgroundPaneDrag {
     pane: PaneId,
 }
 
-/// D&D ペイロード: タブをたまり場へ退避（FR-2.15 タブ D&D 退避）
+/// D&D ペイロード: タブをバックグラウンドへバックグラウンド（FR-2.15 タブ D&D バックグラウンド）
 #[derive(Debug, Clone, Copy)]
 struct TabDrag {
     tab: TabId,
@@ -718,7 +718,7 @@ enum DragKind {
     TmuxSession,
     File,
     Pane,
-    ShelvedPane,
+    BackgroundPane,
     Tab,
 }
 
@@ -917,7 +917,7 @@ impl TakoApp {
             git_collapsed: GitCollapsed::default(),
             drawer_visible: false,
             drawer_height: DRAWER_DEFAULT_HEIGHT,
-            shelved_pending_kill: None,
+            bg_pending_kill: None,
             hover_preview: None,
             pinned_previews: Vec::new(),
             dragging_pin: None,
@@ -986,7 +986,7 @@ impl TakoApp {
 
         // 起動時の orphan 一括クリーンアップ（FR-2.16.11）。復元で backend_sessions が
         // 出揃った後に実行し、前回クラッシュ等で取り残された detached・非 grouped の
-        // backend セッションだけを掃除する（現存・退避・表示中ビューは protected で除外）
+        // backend セッションだけを掃除する（現存・バックグラウンド・表示中ビューは protected で除外）
         let cleaned = app.cleanup_orphan_tmux();
         if !cleaned.is_empty() {
             eprintln!(
@@ -1458,21 +1458,21 @@ impl TakoApp {
                     })
                     .collect();
                 rows.sort_by_key(|e| state_rank(e.state));
-                let shelved = self.shelved_entries_of_tab(tab.id());
+                let backgrounded = self.background_entries_of_tab(tab.id());
                 TmuxViewTabGroup {
                     tab: tab.id(),
                     title: tab.title().to_string(),
                     rows,
                     sessions: self.tmux_sessions_attached_to(tab.id().as_u64()),
-                    shelved,
+                    backgrounded,
                 }
             })
             .collect()
     }
 
-    /// 退避ペインの表示ラベル（title > role > cwd ベース名 > 既定）。
+    /// バックグラウンドペインの表示ラベル（title > role > cwd ベース名 > 既定）。
     /// タブツリーのバックグラウンド行とドロワーのカードで共用する
-    fn shelved_label(&self, p: &tako_core::ShelvedPane) -> String {
+    fn background_label(&self, p: &tako_core::BackgroundPane) -> String {
         p.title()
             .map(|s| s.to_string())
             .or_else(|| p.role().map(|s| s.to_string()))
@@ -1487,33 +1487,33 @@ impl TakoApp {
             .unwrap_or_else(|| "ターミナル".to_string())
     }
 
-    /// 退避ペインのコマンド状態（ターミナル不在なら Unknown）
-    fn shelved_state(&self, pane_id: PaneId) -> CommandState {
+    /// バックグラウンドペインのコマンド状態（ターミナル不在なら Unknown）
+    fn background_state(&self, pane_id: PaneId) -> CommandState {
         self.terminals
             .get(&pane_id)
             .map(|s| s.command_state())
             .unwrap_or(CommandState::Unknown)
     }
 
-    /// 指定した由来タブの退避ペインのエントリ列（FR-2.15.6。タブ別分離表示用）
-    fn shelved_entries_of_tab(&self, origin: TabId) -> Vec<ShelvedEntry> {
+    /// 指定した由来タブのバックグラウンドペインのエントリ列（FR-2.15.6。タブ別分離表示用）
+    fn background_entries_of_tab(&self, origin: TabId) -> Vec<BackgroundEntry> {
         self.workspace
             .shelved_panes()
             .iter()
             .filter(|p| p.origin_tab() == origin)
-            .map(|p| ShelvedEntry {
+            .map(|p| BackgroundEntry {
                 pane: p.id(),
-                label: self.shelved_label(p),
-                state: self.shelved_state(p.id()),
+                label: self.background_label(p),
+                state: self.background_state(p.id()),
             })
             .collect()
     }
 
-    /// 由来タブが既に閉じている退避ペインを、由来タブごとにまとめて返す（FR-2.15.6）。
-    /// 生存タブの退避は各タブ枠（`tmux_view_groups` の `shelved`）が表示するためここでは除く
-    fn tmux_view_closed_origin_shelved(&self) -> Vec<ClosedOriginShelfGroup> {
+    /// 由来タブが既に閉じているバックグラウンドペインを、由来タブごとにまとめて返す（FR-2.15.6）。
+    /// 生存タブのバックグラウンドは各タブ枠（`tmux_view_groups` の `shelved`）が表示するためここでは除く
+    fn tmux_view_closed_origin_background(&self) -> Vec<ClosedOriginBackgroundGroup> {
         use std::collections::hash_map::Entry;
-        let mut groups: Vec<ClosedOriginShelfGroup> = Vec::new();
+        let mut groups: Vec<ClosedOriginBackgroundGroup> = Vec::new();
         // 由来タブ ID → groups 内の位置（初出順を保つ）
         let mut index: std::collections::HashMap<TabId, usize> = std::collections::HashMap::new();
         for p in self.workspace.shelved_panes() {
@@ -1522,17 +1522,17 @@ impl TakoApp {
             if self.workspace.get_tab(origin).is_some() {
                 continue;
             }
-            let entry = ShelvedEntry {
+            let entry = BackgroundEntry {
                 pane: p.id(),
-                label: self.shelved_label(p),
-                state: self.shelved_state(p.id()),
+                label: self.background_label(p),
+                state: self.background_state(p.id()),
             };
             let next = groups.len();
             match index.entry(origin) {
                 Entry::Occupied(e) => groups[*e.get()].entries.push(entry),
                 Entry::Vacant(e) => {
                     e.insert(next);
-                    groups.push(ClosedOriginShelfGroup {
+                    groups.push(ClosedOriginBackgroundGroup {
                         tab: origin,
                         title: p.origin_tab_title().to_string(),
                         entries: vec![entry],
@@ -1602,9 +1602,9 @@ impl TakoApp {
     /// attach 中のセッションはタブ枠内の紐付け表示（FR-2.16.9）が代表するため除外し、
     /// 残りを「kill 漏れ?（orphan バックエンド）」と「管理外（ユーザー直起動等）」に分類する
     fn tmux_unlisted_sessions(&self) -> Vec<UnlistedTmuxSession> {
-        // 退避中ペインの backend セッションは「退避中」セクションで表示するため、
+        // バックグラウンド中ペインの backend セッションは「バックグラウンド中」セクションで表示するため、
         // ここ（kill漏れ?/管理外）からは除外する（二重表示の防止。2026-06-15）
-        let shelved_sessions: std::collections::HashSet<String> = self
+        let bg_sessions: std::collections::HashSet<String> = self
             .workspace
             .shelved_panes()
             .iter()
@@ -1618,8 +1618,11 @@ impl TakoApp {
                     return None; // タブ枠内のペイン行で表示済み
                 }
                 if let Some(name) = session["name"].as_str() {
-                    if shelved_sessions.contains(name) {
-                        return None; // 退避中セクションで表示するため除外
+                    if name.starts_with("tako-view-") {
+                        return None; // tako 内部の viewer セッション（管理外に出さない）
+                    }
+                    if bg_sessions.contains(name) {
+                        return None; // バックグラウンド中セクションで表示するため除外
                     }
                 }
                 if Self::tmux_session_attached_at(session).is_some() {
@@ -2052,15 +2055,15 @@ impl TakoApp {
     /// ペインタイトルバーの × ボタン = ペインを閉じる（kill）。タブの × と挙動を統一する。
     /// 紐づく tmux セッション（backend の tako-* / view の tako-view-* ラッパー）を
     /// `remove_pane` が確実に kill するため、管理外 / orphan として残らない。
-    /// 「閉じたいが処理は生かしたい」ときはタイトルバーの ー ボタン（`shelve_pane_button`）を使う
+    /// 「閉じたいが処理は生かしたい」ときはタイトルバーの ー ボタン（`background_pane_button`）を使う
     fn close_pane_button(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
         self.remove_pane(pane_id, cx);
     }
 
-    /// ペインタイトルバーの ー ボタン = ペインをたまり場へ退避（FR-2.15.1）。
-    /// プロセス・tmux セッションは生かしたまま、ツリーから外してたまり場に移す。
-    /// 最後のタブの最後のペインのときは代替ペインを生やしてから退避する
-    fn shelve_pane_button(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+    /// ペインタイトルバーの ー ボタン = ペインをバックグラウンドへバックグラウンド（FR-2.15.1）。
+    /// プロセス・tmux セッションは生かしたまま、ツリーから外してバックグラウンドに移す。
+    /// 最後のタブの最後のペインのときは代替ペインを生やしてからバックグラウンドする
+    fn background_pane_button(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
         match self.workspace.shelve_pane(pane_id) {
             Ok(()) => {}
             Err(WorkspaceError::LastTab) => {
@@ -2079,17 +2082,17 @@ impl TakoApp {
                         eprintln!("warning: 代替ペインを起動できない: {e}");
                     }
                     if let Err(e) = self.workspace.shelve_pane(pane_id) {
-                        eprintln!("warning: たまり場へ退避できない: {e}");
+                        eprintln!("warning: バックグラウンドへバックグラウンドできない: {e}");
                     }
                 }
             }
-            Err(e) => eprintln!("warning: たまり場へ退避できない: {e}"),
+            Err(e) => eprintln!("warning: バックグラウンドへバックグラウンドできない: {e}"),
         }
         cx.notify();
     }
 
-    /// タブ内の全ペインをたまり場へ退避する（FR-2.15 タブ単位退避）
-    fn shelve_tab(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+    /// タブ内の全ペインをバックグラウンドへバックグラウンドする（FR-2.15 タブ単位バックグラウンド）
+    fn background_tab(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
         match self.workspace.shelve_tab(tab_id) {
             Ok(_shelved_ids) => {}
             Err(WorkspaceError::LastTab) => {
@@ -2101,10 +2104,10 @@ impl TakoApp {
                     eprintln!("warning: 代替ペインを起動できない: {e}");
                 }
                 if let Err(e) = self.workspace.shelve_tab(tab_id) {
-                    eprintln!("warning: タブをたまり場へ退避できない: {e}");
+                    eprintln!("warning: タブをバックグラウンドへバックグラウンドできない: {e}");
                 }
             }
-            Err(e) => eprintln!("warning: タブをたまり場へ退避できない: {e}"),
+            Err(e) => eprintln!("warning: タブをバックグラウンドへバックグラウンドできない: {e}"),
         }
         cx.notify();
     }
@@ -2553,7 +2556,7 @@ impl TakoApp {
     }
 
     /// 表示分類バッジ（FR-2.16.12）。前面表示中 = アクティブタブ所属、それ以外は裏で実行中。
-    /// タブツリーのペイン行・退避行で共用する
+    /// タブツリーのペイン行・バックグラウンド行で共用する
     fn surface_badge(&self, is_foreground: bool) -> gpui::Div {
         let theme = &self.theme;
         let (txt, col) = if is_foreground {
@@ -2734,12 +2737,12 @@ impl TakoApp {
         container
     }
 
-    /// 退避ペインのバックグラウンド行（FR-2.15.6）。タブ枠内（タブ別分離）と
+    /// バックグラウンドペインのバックグラウンド行（FR-2.15.6）。タブ枠内（タブ別分離）と
     /// 「閉じたタブ」グループで共用。バッジ + 状態ドット + ラベル + 復帰（由来タブへ戻す）。
-    /// D&D でもペインエリアへ復帰できる（ドロワーと同じ ShelvedPaneDrag）
-    fn render_shelved_row(
+    /// D&D でもペインエリアへ復帰できる（ドロワーと同じ BackgroundPaneDrag）
+    fn render_background_row(
         &self,
-        entry: &ShelvedEntry,
+        entry: &BackgroundEntry,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = &self.theme;
@@ -2751,7 +2754,7 @@ impl TakoApp {
             _ => None,
         };
         let mut row = div()
-            .id(("tmux-shelved-row", pane_id.as_u64()))
+            .id(("tmux-bg-row", pane_id.as_u64()))
             .flex()
             .flex_row()
             .items_center()
@@ -2762,8 +2765,8 @@ impl TakoApp {
             .text_color(hsla(theme.tab_inactive_foreground))
             .cursor(CursorStyle::OpenHand)
             .on_drag(
-                ShelvedPaneDrag { pane: pane_id },
-                self.drag_ghost_builder(DragKind::ShelvedPane, truncate(&entry.label, 24), cx),
+                BackgroundPaneDrag { pane: pane_id },
+                self.drag_ghost_builder(DragKind::BackgroundPane, truncate(&entry.label, 24), cx),
             )
             .child(self.surface_badge(false));
         if let Some(color) = state_color {
@@ -2783,13 +2786,13 @@ impl TakoApp {
                 .whitespace_nowrap()
                 .text_ellipsis()
                 .child(SharedString::from(format!(
-                    "{}（退避）",
+                    "{}（BG）",
                     truncate(&entry.label, 22)
                 ))),
         )
         .child(
             div()
-                .id(("tmux-shelved-restore", pane_id.as_u64()))
+                .id(("tmux-bg-restore", pane_id.as_u64()))
                 .px_1()
                 .rounded_sm()
                 .cursor_pointer()
@@ -2808,7 +2811,7 @@ impl TakoApp {
                         this.workspace
                             .unshelve_pane(pane_id, target, SplitDirection::Right)
                     {
-                        eprintln!("warning: たまり場から復帰できない: {e}");
+                        eprintln!("warning: バックグラウンドから復帰できない: {e}");
                     }
                     if this.workspace.shelved_panes().is_empty() {
                         this.drawer_visible = false;
@@ -2859,8 +2862,8 @@ impl TakoApp {
             let is_active = group.tab == active_tab;
             let tab_id = group.tab;
             let is_collapsed = self.collapsed_tmux_tabs.contains(&tab_id);
-            // 折りたたみ時はバックグラウンド項目（裏で実行中の行 + 退避）を隠し、前面表示中
-            // （アクティブタブ）の行は残す（FR-2.16.14。Q2 = バックグラウンド行＋退避だけ隠す）。
+            // 折りたたみ時はバックグラウンド項目（裏で実行中の行 + バックグラウンド）を隠し、前面表示中
+            // （アクティブタブ）の行は残す（FR-2.16.14。Q2 = バックグラウンド行＋バックグラウンドだけ隠す）。
             // タブ内の行は surface が一律（アクティブ＝全 foreground / 非アクティブ＝全 background）
             let show_rows = is_active || !is_collapsed;
             let mut card = div()
@@ -3196,11 +3199,11 @@ impl TakoApp {
                     cx,
                 ));
             }
-            // このタブ由来の退避ペインをバックグラウンド表示（FR-2.15.6 タブ別分離）。
-            // 退避は常にバックグラウンド扱いなので折りたたみ時は隠す（FR-2.16.14）
-            if !is_collapsed && !group.shelved.is_empty() {
-                for entry in &group.shelved {
-                    card = card.child(self.render_shelved_row(entry, cx));
+            // このタブ由来のバックグラウンドペインをバックグラウンド表示（FR-2.15.6 タブ別分離）。
+            // バックグラウンドは常にバックグラウンド扱いなので折りたたみ時は隠す（FR-2.16.14）
+            if !is_collapsed && !group.backgrounded.is_empty() {
+                for entry in &group.backgrounded {
+                    card = card.child(self.render_background_row(entry, cx));
                 }
             }
             root = root.child(card);
@@ -3408,16 +3411,16 @@ impl TakoApp {
             root = root.child(card);
         }
 
-        // 由来タブが閉じた退避ペインは「タブ <名前>（閉じたタブ）」にまとめて表示する。
-        // 生存タブ由来の退避は各タブ枠内へバックグラウンド表示済み（FR-2.15.6 タブ別分離）
-        let closed_origin = self.tmux_view_closed_origin_shelved();
+        // 由来タブが閉じたバックグラウンドペインは「タブ <名前>（閉じたタブ）」にまとめて表示する。
+        // 生存タブ由来のバックグラウンドは各タブ枠内へバックグラウンド表示済み（FR-2.15.6 タブ別分離）
+        let closed_origin = self.tmux_view_closed_origin_background();
         if !closed_origin.is_empty() {
             root = root.child(
                 div()
                     .mt_2()
                     .text_color(hsla(theme.tab_inactive_foreground))
                     .text_size(px(11.0))
-                    .child("閉じたタブの退避ターミナル（バックグラウンドで実行中）"),
+                    .child("閉じたタブのターミナル（バックグラウンドで実行中）"),
             );
         }
         for shelf_group in &closed_origin {
@@ -3436,7 +3439,7 @@ impl TakoApp {
                 .rounded_md()
                 .border_1()
                 .border_color(hsla_alpha(theme.pane_border, 0.7))
-                // グループ全体をホバーで一括プレビュー（FR-2.16.16。全退避ペインを並べて出す）
+                // グループ全体をホバーで一括プレビュー（FR-2.16.16。全バックグラウンドペインを並べて出す）
                 .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
                     if *hovered {
                         this.hover_preview = Some(HoverPreview {
@@ -3497,7 +3500,7 @@ impl TakoApp {
                         ),
                 );
             for entry in &shelf_group.entries {
-                card = card.child(self.render_shelved_row(entry, cx));
+                card = card.child(self.render_background_row(entry, cx));
             }
             root = root.child(card);
         }
@@ -4189,6 +4192,8 @@ impl TakoApp {
                                         "🖼 "
                                     } else if preview::is_pdf_path(p) {
                                         "📕 "
+                                    } else if preview::is_video_path(p) {
+                                        "🎬 "
                                     } else {
                                         ""
                                     }
@@ -4565,7 +4570,9 @@ impl TakoApp {
         let mode = match state.mode {
             preview::PreviewMode::Code => preview::PreviewMode::Markdown,
             preview::PreviewMode::Markdown => preview::PreviewMode::Code,
-            preview::PreviewMode::Image | preview::PreviewMode::Pdf => return,
+            preview::PreviewMode::Image
+            | preview::PreviewMode::Pdf
+            | preview::PreviewMode::Video => return,
         };
         let path = state.path.clone();
         let (new_state, raw) = preview::load_fast(&path, mode);
@@ -4849,13 +4856,13 @@ impl TakoApp {
                     );
                 },
             ))
-            .on_drag_move::<ShelvedPaneDrag>(cx.listener(
-                move |this, e: &DragMoveEvent<ShelvedPaneDrag>, _, cx| {
+            .on_drag_move::<BackgroundPaneDrag>(cx.listener(
+                move |this, e: &DragMoveEvent<BackgroundPaneDrag>, _, cx| {
                     this.update_drop_target(
                         pane_id,
                         e.bounds,
                         e.event.position,
-                        DragKind::ShelvedPane,
+                        DragKind::BackgroundPane,
                         cx,
                     );
                 },
@@ -4869,9 +4876,11 @@ impl TakoApp {
             .on_drop::<PaneDrag>(cx.listener(move |this, drag: &PaneDrag, _, cx| {
                 this.drop_pane(pane_id, *drag, cx);
             }))
-            .on_drop::<ShelvedPaneDrag>(cx.listener(move |this, drag: &ShelvedPaneDrag, _, cx| {
-                this.drop_shelved_pane(pane_id, *drag, cx);
-            }));
+            .on_drop::<BackgroundPaneDrag>(cx.listener(
+                move |this, drag: &BackgroundPaneDrag, _, cx| {
+                    this.drop_background_pane(pane_id, *drag, cx);
+                },
+            ));
         if let Some(zone) = zone {
             let (left, top, w, h) = match zone {
                 DropZone::Left => (0.0, 0.0, 0.5, 1.0),
@@ -4885,7 +4894,7 @@ impl TakoApp {
                 (DragKind::File, DropZone::Center) => "ここで開く",
                 (DragKind::File, _) => "ここに分割して開く",
                 (DragKind::Pane, _) => "この位置に移動",
-                (DragKind::ShelvedPane, _) => "ここに復帰",
+                (DragKind::BackgroundPane, _) => "ここに復帰",
                 (DragKind::Tab, _) => "この位置に移動",
             };
             overlay = overlay.child(
@@ -5511,14 +5520,14 @@ impl TakoApp {
                     .child(SharedString::from(truncate(&label, 24)))
                     .child(
                         div()
-                            .id(("tab-shelve", id.as_u64()))
+                            .id(("tab-bg", id.as_u64()))
                             .px_1()
                             .cursor_pointer()
                             .text_color(hsla(theme.tab_inactive_foreground))
                             .hover(|d| d.text_color(hsla(theme.foreground)))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                this.shelve_tab(id, cx);
+                                this.background_tab(id, cx);
                             }))
                             .child("ー"),
                     )
@@ -5547,11 +5556,11 @@ impl TakoApp {
         // 旧「◧ panel」トグルは下部ステータスバーへ集約済み（FR-2.16.4）
     }
 
-    /// たまり場からのドロップ（FR-2.15.3）
-    fn drop_shelved_pane(
+    /// バックグラウンドからのドロップ（FR-2.15.3）
+    fn drop_background_pane(
         &mut self,
         target_pane: PaneId,
-        drag: ShelvedPaneDrag,
+        drag: BackgroundPaneDrag,
         cx: &mut Context<Self>,
     ) {
         let zone = self.drop_target.take().map(|(_, z)| z);
@@ -5566,7 +5575,7 @@ impl TakoApp {
             .workspace
             .unshelve_pane(drag.pane, target_pane, direction)
         {
-            eprintln!("warning: たまり場から復帰できない: {e}");
+            eprintln!("warning: バックグラウンドから復帰できない: {e}");
         }
         self.drag_kind = None;
         if self.workspace.shelved_panes().is_empty() {
@@ -5575,11 +5584,11 @@ impl TakoApp {
         cx.notify();
     }
 
-    /// 退避ドロワーのカード 1 枚（実画面サムネイル + タイトルバー）。タブ別グループ内で
+    /// バックグラウンドドロワーのカード 1 枚（実画面サムネイル + タイトルバー）。タブ別グループ内で
     /// 1 ペインずつ描く（FR-2.15.6）。復帰は由来タブへ戻す（無ければアクティブタブ）
     fn render_shelf_card(
         &self,
-        entry: &ShelvedEntry,
+        entry: &BackgroundEntry,
         pending_kill: Option<PaneId>,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -5612,8 +5621,8 @@ impl TakoApp {
             .text_color(hsla(theme.tab_inactive_foreground))
             .cursor(CursorStyle::OpenHand)
             .on_drag(
-                ShelvedPaneDrag { pane: pane_id },
-                self.drag_ghost_builder(DragKind::ShelvedPane, truncate(&label, 24), cx),
+                BackgroundPaneDrag { pane: pane_id },
+                self.drag_ghost_builder(DragKind::BackgroundPane, truncate(&label, 24), cx),
             );
 
         if is_pending_kill {
@@ -5637,7 +5646,7 @@ impl TakoApp {
                         .rounded_sm()
                         .child("はい")
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.shelved_pending_kill = None;
+                            this.bg_pending_kill = None;
                             if this.workspace.remove_shelved(pane_id).is_some() {
                                 this.terminals.remove(&pane_id);
                                 this.previews.remove(&pane_id);
@@ -5662,7 +5671,7 @@ impl TakoApp {
                         .rounded_sm()
                         .child("いいえ")
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.shelved_pending_kill = None;
+                            this.bg_pending_kill = None;
                             cx.notify();
                         })),
                 );
@@ -5700,7 +5709,7 @@ impl TakoApp {
                                 this.workspace
                                     .unshelve_pane(pane_id, target, SplitDirection::Right)
                             {
-                                eprintln!("warning: たまり場から復帰できない: {e}");
+                                eprintln!("warning: バックグラウンドから復帰できない: {e}");
                             }
                             if this.workspace.shelved_panes().is_empty() {
                                 this.drawer_visible = false;
@@ -5726,14 +5735,14 @@ impl TakoApp {
                         })
                         .child("×")
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.shelved_pending_kill = Some(pane_id);
+                            this.bg_pending_kill = Some(pane_id);
                             cx.notify();
                         })),
                 );
         }
 
         // カード本文 = ターミナルの実画面プレビュー（通常ペインと同じ行描画）。
-        // ターミナルを持たない退避（プレビューペイン等）はラベルだけ示す
+        // ターミナルを持たないバックグラウンド（プレビューペイン等）はラベルだけ示す
         let body = if lines.is_empty() {
             div()
                 .flex_1()
@@ -5755,7 +5764,7 @@ impl TakoApp {
         div()
             .id(("shelf-card", pane_id.as_u64()))
             .flex_none()
-            .w(px(SHELF_CARD_WIDTH))
+            .w(px(BG_CARD_WIDTH))
             .h_full()
             .flex()
             .flex_col()
@@ -5772,30 +5781,30 @@ impl TakoApp {
             .child(body)
     }
 
-    /// たまり場ドロワーの描画（FR-2.15。下部、ステータスバーの上に展開）。
-    /// 退避ターミナルは由来タブごとにグループ分けして横並び表示する（FR-2.15.6）
+    /// バックグラウンドドロワーの描画（FR-2.15。下部、ステータスバーの上に展開）。
+    /// バックグラウンドターミナルは由来タブごとにグループ分けして横並び表示する（FR-2.15.6）
     fn render_drawer(&mut self, cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
         if !self.drawer_visible {
             return None;
         }
         let theme = self.theme.clone();
-        // 由来タブごとにグループ化（FR-2.15.6 退避エリアのタブ別分離）。生存タブはタブ順、
+        // 由来タブごとにグループ化（FR-2.15.6 バックグラウンドエリアのタブ別分離）。生存タブはタブ順、
         // 由来タブが閉じたものは「タブ <名前>（閉じたタブ）」として後ろにまとめる
-        let mut shelf_groups: Vec<(String, Vec<ShelvedEntry>)> = Vec::new();
+        let mut bg_groups: Vec<(String, Vec<BackgroundEntry>)> = Vec::new();
         for tab in self.workspace.tabs() {
-            let entries = self.shelved_entries_of_tab(tab.id());
+            let entries = self.background_entries_of_tab(tab.id());
             if !entries.is_empty() {
-                shelf_groups.push((tab.title().to_string(), entries));
+                bg_groups.push((tab.title().to_string(), entries));
             }
         }
-        for closed in self.tmux_view_closed_origin_shelved() {
-            shelf_groups.push((format!("{}（閉じたタブ）", closed.title), closed.entries));
+        for closed in self.tmux_view_closed_origin_background() {
+            bg_groups.push((format!("{}（閉じたタブ）", closed.title), closed.entries));
         }
-        let shelved_total: usize = shelf_groups.iter().map(|(_, e)| e.len()).sum();
+        let bg_total: usize = bg_groups.iter().map(|(_, e)| e.len()).sum();
 
-        let pending_kill = self.shelved_pending_kill;
+        let pending_kill = self.bg_pending_kill;
 
-        // 退避ターミナルをカード本文の寸法へリサイズし、通常ペインと同じ見え方の
+        // バックグラウンドターミナルをカード本文の寸法へリサイズし、通常ペインと同じ見え方の
         // プレビュー（実画面サムネイル）にする。resize は冪等なので毎フレーム呼んでも安全。
         // グループ見出しの高さ分も本文から差し引く
         let body_h = (self.drawer_height
@@ -5807,13 +5816,13 @@ impl TakoApp {
             - 8.0)
             .max(40.0);
         if let Some(cell) = self.cell_size {
-            let cols = ((SHELF_CARD_WIDTH - PANE_BORDER * 2.0 - PANE_PADDING * 2.0)
+            let cols = ((BG_CARD_WIDTH - PANE_BORDER * 2.0 - PANE_PADDING * 2.0)
                 / f32::from(cell.width))
             .floor() as usize;
             let rows = (body_h / f32::from(cell.height)).floor() as usize;
             let cw = f32::from(cell.width).round() as u16;
             let ch = f32::from(cell.height).round() as u16;
-            let ids: Vec<PaneId> = shelf_groups
+            let ids: Vec<PaneId> = bg_groups
                 .iter()
                 .flat_map(|(_, e)| e.iter().map(|x| x.pane))
                 .collect();
@@ -5836,16 +5845,16 @@ impl TakoApp {
             .py_1()
             .overflow_x_scroll();
 
-        if shelf_groups.is_empty() {
+        if bg_groups.is_empty() {
             cards = cards.child(
                 div()
                     .text_size(px(11.0))
                     .text_color(hsla(theme.tab_inactive_foreground))
                     .py_1()
-                    .child("退避中のターミナルはありません"),
+                    .child("バックグラウンドのターミナルはありません"),
             );
         } else {
-            for (gi, (title, entries)) in shelf_groups.iter().enumerate() {
+            for (gi, (title, entries)) in bg_groups.iter().enumerate() {
                 let mut group = div()
                     .id(("drawer-group", gi as u64))
                     .flex()
@@ -5859,7 +5868,7 @@ impl TakoApp {
                             .border_color(hsla_alpha(theme.pane_border, 0.6))
                     })
                     .child(
-                        // 親タブ見出し（FR-2.15.6。退避ペインの親タブを明記）
+                        // 親タブ見出し（FR-2.15.6。バックグラウンドペインの親タブを明記）
                         div()
                             .h(px(DRAWER_GROUP_HEADER))
                             .flex_none()
@@ -5897,7 +5906,7 @@ impl TakoApp {
                 .border_t_1()
                 .border_color(hsla(theme.pane_border))
                 .on_drop::<TabDrag>(cx.listener(|this, drag: &TabDrag, _, cx| {
-                    this.shelve_tab(drag.tab, cx);
+                    this.background_tab(drag.tab, cx);
                 }))
                 .child(
                     div()
@@ -5910,8 +5919,8 @@ impl TakoApp {
                         .text_size(px(10.0))
                         .text_color(hsla(theme.tab_inactive_foreground))
                         .child(SharedString::from(format!(
-                            "退避中のターミナル（{}）",
-                            shelved_total
+                            "バックグラウンドのターミナル（{}）",
+                            bg_total
                         )))
                         .child(div().flex_grow(1.0))
                         .child(
@@ -5982,20 +5991,20 @@ impl TakoApp {
                     .child("◫ ファイル"),
             )
             .child({
-                let shelved_count = self.workspace.shelved_panes().len();
+                let bg_count = self.workspace.shelved_panes().len();
                 let drawer_open = self.drawer_visible;
-                toggle("statusbar-shelved", drawer_open)
+                toggle("statusbar-bg", drawer_open)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.drawer_visible = !this.drawer_visible;
                         cx.notify();
                     }))
                     .on_drop::<TabDrag>(cx.listener(|this, drag: &TabDrag, _, cx| {
-                        this.shelve_tab(drag.tab, cx);
+                        this.background_tab(drag.tab, cx);
                     }))
-                    .child(if shelved_count > 0 {
-                        format!("⏏ 退避 ({})", shelved_count)
+                    .child(if bg_count > 0 {
+                        format!("⏏ BG ({})", bg_count)
                     } else {
-                        "⏏ 退避".into()
+                        "⏏ BG".into()
                     })
             })
             .child(div().flex_grow(1.0))
@@ -6185,7 +6194,7 @@ impl TakoApp {
                     .find(|p| p.origin_tab() == tab)
                     .map(|p| p.origin_tab_title().to_string())
                     .unwrap_or_default();
-                let count = self.shelved_entries_of_tab(tab).len();
+                let count = self.background_entries_of_tab(tab).len();
                 format!("タブ {}（閉じたタブ・{count} 件）", truncate(&title, 20))
             }
             PreviewTarget::TmuxWindow(pane_id, win) => {
@@ -6207,7 +6216,7 @@ impl TakoApp {
         match target {
             PreviewTarget::Pane(pane_id) => self.terminals.contains_key(&pane_id),
             PreviewTarget::ClosedGroup(tab) => self
-                .shelved_entries_of_tab(tab)
+                .background_entries_of_tab(tab)
                 .iter()
                 .any(|e| self.terminals.contains_key(&e.pane)),
             PreviewTarget::TmuxWindow(pane_id, win) => {
@@ -6218,7 +6227,7 @@ impl TakoApp {
 
     /// ペインの表示名（title / role > プレビュー名 > OSC タイトル > 既定）。
     /// tmux ビューの行ラベル（`tmux_view_groups`）と同じ優先順位で揃える。
-    /// ツリー内・退避中のどちらのペインも解決できる
+    /// ツリー内・バックグラウンド中のどちらのペインも解決できる
     fn pane_preview_label(&self, pane_id: PaneId) -> String {
         let pane = self
             .workspace
@@ -6246,7 +6255,7 @@ impl TakoApp {
 
     /// プレビュー本文（実画面サムネイル）。Pane は端末の現在グリッドをそのまま読む
     /// （リサイズしない＝バックグラウンドのプログラムを乱さない）。ClosedGroup はグループ内の
-    /// 全退避ペインを均等高で縦に積む（FR-2.16.16）。ライブ更新は `on_term_event` が出力ごとに
+    /// 全バックグラウンドペインを均等高で縦に積む（FR-2.16.16）。ライブ更新は `on_term_event` が出力ごとに
     /// 呼ぶ `cx.notify()` の再描画で自動的に得られる
     fn preview_content(&self, target: PreviewTarget) -> gpui::Div {
         let theme = &self.theme;
@@ -6267,7 +6276,7 @@ impl TakoApp {
                     .p(px(PANE_PADDING))
                     .overflow_hidden()
                     .bg(rgba(theme.background));
-                for entry in self.shelved_entries_of_tab(tab) {
+                for entry in self.background_entries_of_tab(tab) {
                     let lines = self.terminal_screen_lines(entry.pane, false);
                     body = body.child(
                         div()
@@ -6506,11 +6515,14 @@ impl TakoApp {
             .collect()
     }
 
-    /// ターミナルの現在画面を行 div のリストへ変換する（通常ペイン描画と退避プレビューで共用）。
-    /// run ごとの色・太字・下線などの装飾を StyledText のハイライトへ写す
+    /// ターミナルの現在画面を行 div のリストへ変換する（通常ペイン描画とバックグラウンドプレビューで共用）。
+    /// run ごとの色・太字・下線などの装飾を StyledText のハイライトへ写す。
+    /// 全角文字を含む行はランごとにセル幅固定 div で配置し、フォント advance と
+    /// グリッドセル幅のずれを吸収する（Markdown テーブル等の罫線崩れ防止）
     fn terminal_screen_lines(&self, pane_id: PaneId, show_cursor: bool) -> Vec<gpui::Div> {
         let theme = &self.theme;
         let default_style = self.text_style();
+        let cell_width = self.cell_size.map(|c| c.width);
         let Some(screen) = self
             .terminals
             .get(&pane_id)
@@ -6518,40 +6530,86 @@ impl TakoApp {
         else {
             return Vec::new();
         };
+        let total_cols = screen.cols;
         screen
             .lines
             .into_iter()
             .map(|line| {
-                let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = line
-                    .runs
-                    .iter()
-                    .map(|run| {
-                        (
-                            run.range.clone(),
-                            HighlightStyle {
-                                color: Some(hsla(run.fg)),
-                                background_color: run.bg.map(hsla),
-                                font_weight: run.bold.then_some(FontWeight::BOLD),
-                                font_style: run.italic.then_some(FontStyle::Italic),
-                                underline: run.underline.then_some(UnderlineStyle {
-                                    thickness: px(1.0),
-                                    color: None,
-                                    wavy: false,
-                                }),
-                                strikethrough: run.strikeout.then_some(StrikethroughStyle {
-                                    thickness: px(1.0),
-                                    color: None,
-                                }),
-                                fade_out: None,
-                            },
-                        )
-                    })
-                    .collect();
-                div().h(px(theme.line_height)).child(
-                    StyledText::new(line.text).with_default_highlights(&default_style, highlights),
-                )
+                if !line.has_wide || cell_width.is_none() {
+                    // 全角なし or セル幅未計測: 従来通り行全体を 1 つの StyledText
+                    let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = line
+                        .runs
+                        .iter()
+                        .map(|run| (run.range.clone(), self.run_highlight(run)))
+                        .collect();
+                    return div().h(px(theme.line_height)).child(
+                        StyledText::new(line.text)
+                            .with_default_highlights(&default_style, highlights),
+                    );
+                }
+                // 全角文字を含む行: ランごとにグリッド列数ベースの固定幅 div で配置
+                let cw = cell_width.unwrap();
+                let char_byte_offsets: Vec<usize> =
+                    line.text.char_indices().map(|(i, _)| i).collect();
+                let row = div()
+                    .h(px(theme.line_height))
+                    .flex()
+                    .flex_row()
+                    .overflow_hidden();
+                let mut children: Vec<gpui::AnyElement> = Vec::with_capacity(line.runs.len());
+                for run in &line.runs {
+                    let run_text: String = line.text[run.range.clone()].to_string();
+                    // ラン先頭・末尾の文字インデックスを求める
+                    let first_char_ix = char_byte_offsets
+                        .iter()
+                        .position(|&b| b >= run.range.start)
+                        .unwrap_or(0);
+                    let end_char_ix = char_byte_offsets
+                        .iter()
+                        .position(|&b| b >= run.range.end)
+                        .unwrap_or(line.cell_cols.len());
+                    // ランが占めるグリッド列数
+                    let start_col = line.cell_cols.get(first_char_ix).copied().unwrap_or(0);
+                    let end_col = line
+                        .cell_cols
+                        .get(end_char_ix)
+                        .copied()
+                        .unwrap_or(total_cols);
+                    let grid_cols = end_col.saturating_sub(start_col).max(1);
+                    let hl = self.run_highlight(run);
+                    let styled = StyledText::new(run_text)
+                        .with_default_highlights(&default_style, vec![(0..run.range.len(), hl)]);
+                    children.push(
+                        div()
+                            .w(cw * grid_cols as f32)
+                            .flex_none()
+                            .overflow_hidden()
+                            .child(styled)
+                            .into_any_element(),
+                    );
+                }
+                row.children(children)
             })
             .collect()
+    }
+
+    fn run_highlight(&self, run: &tako_core::screen::StyleRun) -> HighlightStyle {
+        HighlightStyle {
+            color: Some(hsla(run.fg)),
+            background_color: run.bg.map(hsla),
+            font_weight: run.bold.then_some(FontWeight::BOLD),
+            font_style: run.italic.then_some(FontStyle::Italic),
+            underline: run.underline.then_some(UnderlineStyle {
+                thickness: px(1.0),
+                color: None,
+                wavy: false,
+            }),
+            strikethrough: run.strikeout.then_some(StrikethroughStyle {
+                thickness: px(1.0),
+                color: None,
+            }),
+            fade_out: None,
+        }
     }
 
     fn render_pane(
@@ -6724,9 +6782,9 @@ impl TakoApp {
                             .child("×"),
                     )
                     .child(
-                        // ー ボタン = たまり場へ退避（プロセスは生かす。タブの ー と統一）
+                        // ー ボタン = バックグラウンドへバックグラウンド（プロセスは生かす。タブの ー と統一）
                         div()
-                            .id(("pane-shelve", pane_id.as_u64()))
+                            .id(("pane-bg", pane_id.as_u64()))
                             .w(px(16.0))
                             .h(px(16.0))
                             .flex()
@@ -6745,7 +6803,7 @@ impl TakoApp {
                             )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                this.shelve_pane_button(pane_id, cx);
+                                this.background_pane_button(pane_id, cx);
                             }))
                             .child("ー"),
                     )
@@ -6956,6 +7014,11 @@ impl TakoApp {
                         .into_any_element()
                 })
                 .collect(),
+            preview::PreviewContent::Video(_) => vec![div()
+                .p_2()
+                .text_color(hsla(theme.tab_inactive_foreground))
+                .child("動画プレビューは未実装です")
+                .into_any_element()],
             preview::PreviewContent::Error(message) => vec![div()
                 .p_2()
                 .text_color(hsla(theme.ansi[1]))
@@ -7350,7 +7413,7 @@ impl ControlHost for TakoApp {
         );
     }
 
-    /// orphan tmux セッションの一括クリーンアップ（FR-2.16.11）。現存ペイン・退避ペインの
+    /// orphan tmux セッションの一括クリーンアップ（FR-2.16.11）。現存ペイン・バックグラウンドペインの
     /// backend セッション、表示中ビューの元/ラッパー名を protected として渡し、backend
     /// socket 上の取り残しだけを kill する。tmux 永続化 OFF / tmux 不在では何もしない
     fn cleanup_orphan_tmux(&self) -> Vec<String> {
@@ -7359,7 +7422,7 @@ impl ControlHost for TakoApp {
         }
         let mut protected: std::collections::HashSet<String> =
             self.backend_sessions.values().cloned().collect();
-        // 退避中ペインの backend セッションは backend_sessions に残るため上で網羅されるが、
+        // バックグラウンド中ペインの backend セッションは backend_sessions に残るため上で網羅されるが、
         // 念のため明示的に保護する（生かしたまま隠れている）
         for pane in self.workspace.shelved_panes() {
             if let Some(name) = self.backend_sessions.get(&pane.id()) {
@@ -7419,7 +7482,7 @@ impl ControlHost for TakoApp {
         self.set_pin(PreviewTarget::ClosedGroup(tab), pinned);
     }
 
-    fn reattach_shelved(&mut self, _pane: PaneId) {
+    fn reattach_backgrounded(&mut self, _pane: PaneId) {
         // セッションは terminals HashMap に残っている。再描画のみ必要
     }
 
@@ -9766,7 +9829,7 @@ mod self_test {
             check(wide_hit, "全角行のクリックが正しいセルに解決");
 
             // 47. ペインの × ボタン = kill（dispatch 共有経路）。split で増やして × 相当の
-            //     操作でアクティブタブから片付き、ターミナル（プロセス）も破棄され、退避にも
+            //     操作でアクティブタブから片付き、ターミナル（プロセス）も破棄され、バックグラウンドにも
             //     残らないこと。タブの × と挙動を統一し、紐づく tmux セッションも
             //     remove_pane が kill するため管理外 / orphan に残らない
             type_text(any, cx, &format!("{cli} split --right >/dev/null"), true);
@@ -9786,7 +9849,7 @@ mod self_test {
                 .unwrap_or(false);
             check(close_button_ok, "ペインの × ボタンで kill（dispatch 経由）");
 
-            // 47b. ペインの ー ボタン = たまり場へ退避（dispatch 共有経路）。プロセス
+            // 47b. ペインの ー ボタン = バックグラウンドへバックグラウンド（dispatch 共有経路）。プロセス
             //      （ターミナル）は生かしたまま、ツリーから外れて shelved へ移ること（FR-2.15.1）
             type_text(any, cx, &format!("{cli} split --right >/dev/null"), true);
             wait(cx, 1500).await;
@@ -9794,7 +9857,7 @@ mod self_test {
                 .update(cx, |app, _, cx| {
                     let before = app.workspace.active_tab().tree().len();
                     let target = app.focused_pane();
-                    app.shelve_pane_button(target, cx);
+                    app.background_pane_button(target, cx);
                     let tree = app.workspace.active_tab().tree();
                     before == 2
                         && tree.len() == 1
@@ -9803,10 +9866,10 @@ mod self_test {
                         && app.terminals.contains_key(&target)
                 })
                 .unwrap_or(false);
-            check(shelve_button_ok, "ペインの ー ボタンで退避（dispatch 経由）");
+            check(shelve_button_ok, "ペインの ー ボタンでバックグラウンド（dispatch 経由）");
 
-            // 47c. たまり場ドロワーを開き、横並びの実画面プレビューが描画されること（FR-2.15）。
-            //      47b で退避したペインが残っており、render_drawer がレイアウト含め panic しない
+            // 47c. バックグラウンドドロワーを開き、横並びの実画面プレビューが描画されること（FR-2.15）。
+            //      47b でバックグラウンドしたペインが残っており、render_drawer がレイアウト含め panic しない
             //      （panic すれば自己テスト全体が落ちる）。検証後はドロワーを閉じて後続へ影響させない
             window
                 .update(cx, |app, _, cx| {
@@ -9823,7 +9886,7 @@ mod self_test {
                     ok
                 })
                 .unwrap_or(false);
-            check(drawer_ok, "たまり場ドロワーが退避プレビューを描画");
+            check(drawer_ok, "バックグラウンドドロワーがバックグラウンドプレビューを描画");
 
             // 48. tmux 一覧と kill（FR-2.13）。専用 -L ソケットで隔離し、ユーザーの
             //     実 tmux サーバーには一切触れない。tmux 不在環境ではスキップする

@@ -38,4 +38,4 @@ pub use terminal::{
 };
 pub use theme::{Rgb, Theme};
 pub use tmux::{TmuxSession, TmuxWindow};
-pub use workspace::{ShelvedPane, Workspace, WorkspaceError};
+pub use workspace::{BackgroundPane, Workspace, WorkspaceError};

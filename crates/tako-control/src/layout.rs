@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tako_core::{
-    Pane, PaneId, PaneNode, PaneOrigin, PaneTree, ShelvedPane, Tab, TabId, TitleSource, Workspace,
+    BackgroundPane, Pane, PaneId, PaneNode, PaneOrigin, PaneTree, Tab, TabId, TitleSource,
+    Workspace,
 };
 
 /// レイアウトファイルのフォーマットバージョン（互換のない変更で上げる）
@@ -30,9 +31,9 @@ pub struct LayoutFile {
     /// 旧ファイルには無いので serde default で後方互換）
     #[serde(default)]
     pub window: Option<WindowFrame>,
-    /// たまり場に退避中のペイン（FR-2.15.5）
-    #[serde(default)]
-    pub shelved: Vec<PaneLayout>,
+    /// バックグラウンドのペイン（FR-2.15.5）
+    #[serde(default, alias = "shelved")]
+    pub backgrounded: Vec<PaneLayout>,
     /// サイドバー tmux ビューで折りたたみ中のタブ ID（FR-2.16.14）。
     /// 旧ファイルには無いので serde default、空なら出力省略で後方互換
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -94,11 +95,11 @@ pub struct PaneLayout {
     /// 旧ファイルには無いので serde default で後方互換
     #[serde(default)]
     pub preview: Option<PreviewLayout>,
-    /// 退避ペインの由来タブ ID（FR-2.15.6。タブ別分離表示用）。tree 内のペインでは
+    /// バックグラウンドペインの由来タブ ID（FR-2.15.6。タブ別分離表示用）。tree 内のペインでは
     /// 常に None。旧ファイル後方互換のため default + 出力時は None を省略する
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_tab: Option<u64>,
-    /// 退避ペインの由来タブ名（同上。閉じたタブ由来でも親を明記できるよう保持）
+    /// バックグラウンドペインの由来タブ名（同上。閉じたタブ由来でも親を明記できるよう保持）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_tab_title: Option<String>,
 }
@@ -152,7 +153,7 @@ pub fn capture(
                 tree: capture_node(tab.tree().root(), meta),
             })
             .collect(),
-        shelved: ws
+        backgrounded: ws
             .shelved_panes()
             .iter()
             .map(|shelved| {
@@ -268,8 +269,8 @@ pub fn restore(file: &LayoutFile) -> Option<(Workspace, Vec<RestoredPane>)> {
         .find(|t| t.id() == fallback_tab)
         .map(|t| t.title().to_string())
         .unwrap_or_default();
-    let mut shelved_panes = Vec::new();
-    for p in &file.shelved {
+    let mut bg_panes = Vec::new();
+    for p in &file.backgrounded {
         if !pane_ids.insert(p.id) {
             return None;
         }
@@ -291,11 +292,11 @@ pub fn restore(file: &LayoutFile) -> Option<(Workspace, Vec<RestoredPane>)> {
             .origin_tab_title
             .clone()
             .unwrap_or_else(|| fallback_title.clone());
-        shelved_panes.push(ShelvedPane::from_pane(pane, origin_tab, origin_title));
+        bg_panes.push(BackgroundPane::from_pane(pane, origin_tab, origin_title));
     }
 
     let active = active.unwrap_or(tabs[0].id());
-    let ws = Workspace::restore_with_shelved(tabs, active, shelved_panes)?;
+    let ws = Workspace::restore_with_shelved(tabs, active, bg_panes)?;
     Some((ws, restored))
 }
 
@@ -537,9 +538,12 @@ mod tests {
         let json = serde_json::to_string(&layout).unwrap();
         let back: LayoutFile = serde_json::from_str(&json).unwrap();
         assert_eq!(back, layout);
-        assert_eq!(back.shelved.len(), 1);
-        assert_eq!(back.shelved[0].origin_tab, Some(origin_tab.as_u64()));
-        assert_eq!(back.shelved[0].origin_tab_title.as_deref(), Some("作業"));
+        assert_eq!(back.backgrounded.len(), 1);
+        assert_eq!(back.backgrounded[0].origin_tab, Some(origin_tab.as_u64()));
+        assert_eq!(
+            back.backgrounded[0].origin_tab_title.as_deref(),
+            Some("作業")
+        );
         // 復元後も由来タブが一致する
         let (restored_ws, _) = restore(&back).unwrap();
         assert_eq!(restored_ws.shelved_panes().len(), 1);
@@ -561,12 +565,15 @@ mod tests {
         let json = serde_json::to_string(&layout).unwrap();
         let legacy_json = json
             .replace(
-                &format!("\"origin_tab\":{}", layout.shelved[0].origin_tab.unwrap()),
+                &format!(
+                    "\"origin_tab\":{}",
+                    layout.backgrounded[0].origin_tab.unwrap()
+                ),
                 "\"_ot\":0",
             )
             .replace("\"origin_tab_title\":\"作業\"", "\"_ott\":\"x\"");
         let legacy: LayoutFile = serde_json::from_str(&legacy_json).unwrap();
-        assert_eq!(legacy.shelved[0].origin_tab, None);
+        assert_eq!(legacy.backgrounded[0].origin_tab, None);
         let (restored_ws, _) = restore(&legacy).unwrap();
         let active = restored_ws.active_tab_id();
         assert_eq!(restored_ws.shelved_panes()[0].origin_tab(), active);
@@ -580,7 +587,7 @@ mod tests {
             active_tab: 1,
             tabs: vec![],
             window: None,
-            shelved: vec![],
+            backgrounded: vec![],
             collapsed: vec![],
         })
         .is_none());

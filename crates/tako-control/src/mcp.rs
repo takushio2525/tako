@@ -516,7 +516,7 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_collapse_tab",
             "description": "サイドバー tmux ビューのタブ枠を折りたたむ / 展開する。\
-                折りたたむと、そのタブ配下のバックグラウンド項目（裏で実行中のペイン行 + 退避）を\
+                折りたたむと、そのタブ配下のバックグラウンド項目（裏で実行中のペイン行 + バックグラウンド）を\
                 隠し、前面表示中の行は残す。雑然とした一覧を畳んで注目すべきタブだけ見せたいときに使う。\
                 collapsed 省略でトグル、tab 省略で呼び出し元のタブ。現在状態は tako_list_panes の\
                 各タブ collapsed でも取得できる。",
@@ -648,27 +648,27 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
-            "name": "tako_shelve_pane",
-            "description": "ペインをたまり場へ退避する。プロセスは生きたまま\
-                画面から外す。邪魔なペインを画面外へ退避させるのに使う。退避中のペインは\
-                tako_shelved_list で確認でき、tako_unshelve_pane で画面に戻せる。",
+            "name": "tako_background_pane",
+            "description": "ペインをバックグラウンドへ送る。プロセスは生きたまま\
+                画面から外す。邪魔なペインを画面外へ送るのに使う。バックグラウンドのペインは\
+                tako_background_list で確認でき、tako_foreground_pane で画面に戻せる。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pane": { "type": "integer", "description": "退避するペインの ID（省略時は呼び出し元）" },
+                    "pane": { "type": "integer", "description": "バックグラウンドへ送るペインの ID（省略時は呼び出し元）" },
                 },
                 "additionalProperties": false,
             },
         }),
         json!({
-            "name": "tako_unshelve_pane",
-            "description": "たまり場のペインを画面に復帰させる。target ペインの\
-                direction 側を分割して表示する。target 省略時は退避元（由来）タブへ戻す\
-                （由来タブが閉じていればアクティブタブ）。退避中に使いたくなったペインを取り出すのに使う。",
+            "name": "tako_foreground_pane",
+            "description": "バックグラウンドのペインを画面に復帰させる。target ペインの\
+                direction 側を分割して表示する。target 省略時は由来タブへ戻す\
+                （由来タブが閉じていればアクティブタブ）。バックグラウンドで動かしていたペインを取り出すのに使う。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pane": { "type": "integer", "description": "復帰させるペインの ID（shelved list から取得）" },
+                    "pane": { "type": "integer", "description": "復帰させるペインの ID（background list から取得）" },
                     "target": { "type": "integer", "description": "挿入先ペインの ID（省略時はフォーカス中ペイン）" },
                     "direction": { "type": "string", "enum": ["right","down","left","up"], "description": "分割方向（省略時は right）" },
                 },
@@ -677,11 +677,11 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
-            "name": "tako_shelved_list",
-            "description": "たまり場に退避中のペイン一覧を取得する。各ペインの\
+            "name": "tako_background_list",
+            "description": "バックグラウンドのペイン一覧を取得する。各ペインの\
                 ID / title / role / state / cwd に加え、由来タブ（origin_tab / origin_tab_title）と\
-                surface（常に background = 裏で実行中）を返す。退避ペインはこの由来タブで\
-                グループ分けして表示され、tako_unshelve_pane で由来タブへ戻せる。",
+                surface（常に background = 裏で実行中）を返す。バックグラウンドペインはこの由来タブで\
+                グループ分けして表示され、tako_foreground_pane で由来タブへ戻せる。",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -689,8 +689,8 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
-            "name": "tako_shelved_kill",
-            "description": "たまり場のペインを kill する。プロセスとバックエンド\
+            "name": "tako_background_kill",
+            "description": "バックグラウンドのペインを kill する。プロセスとバックエンド\
                 セッションも終了する。復帰不要なペインの片付けに使う。",
             "inputSchema": {
                 "type": "object",
@@ -931,16 +931,16 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             pane: Some(target_pane(args, caller)?),
             target: str_arg(args, "target")?,
         },
-        "tako_shelve_pane" => Request::Shelve {
+        "tako_background_pane" => Request::Background {
             pane: Some(target_pane(args, caller)?),
         },
-        "tako_unshelve_pane" => Request::Unshelve {
+        "tako_foreground_pane" => Request::Foreground {
             pane: required_u64(args, "pane")?,
             target: u64_arg(args, "target")?,
             direction: direction_arg(args)?,
         },
-        "tako_shelved_list" => Request::ShelvedList,
-        "tako_shelved_kill" => Request::ShelvedKill {
+        "tako_background_list" => Request::BackgroundList,
+        "tako_background_kill" => Request::BackgroundKill {
             pane: required_u64(args, "pane")?,
         },
         "tako_panel" => Request::Panel {

@@ -210,7 +210,7 @@ pub fn kill_session(socket: &str, session: &str) {
 /// - **attached**（= いずれかのペイン/クライアントが使用中）は決して触らない
 /// - **grouped**（= 表示中ビューの元セッション or その `tako-view-*` ラッパー）も触らない。
 ///   生きているビューの足元を崩さないため
-/// - `protected`（現存ペイン・退避ペインの backend 名、表示中ビューの元/ラッパー名）は二重の安全網
+/// - `protected`（現存ペイン・バックグラウンドペインの backend 名、表示中ビューの元/ラッパー名）は二重の安全網
 ///
 /// これらにより、ユーザーの実セッション（既定サーバー・非 `tako-` 名）や使用中ビューは
 /// 構造上 kill されない。対象は「クラッシュ等で取り残された detached な裸のバックエンド
@@ -241,7 +241,7 @@ pub fn cleanup_orphans(socket: &str, protected: &std::collections::HashSet<Strin
             continue; // 表示中ビュー関連（元 or ラッパー）
         }
         if protected.contains(name) {
-            continue; // 現存/退避ペイン・表示中ビューが使用中
+            continue; // 現存/バックグラウンドペイン・表示中ビューが使用中
         }
         kill_session(socket, name);
         killed.push(name.to_string());

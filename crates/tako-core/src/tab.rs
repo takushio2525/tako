@@ -22,7 +22,7 @@ impl TabId {
         TAB_ID_COUNTER.fetch_max(id.saturating_add(1), Ordering::Relaxed);
     }
 
-    /// 既知の ID から TabId を構築する（退避ペインの由来タブ復元用。FR-2.15.6）。
+    /// 既知の ID から TabId を構築する（バックグラウンドペインの由来タブ復元用。FR-2.15.6）。
     /// 由来タブは既に閉じられていることがあり、その ID が後続の新規タブに再利用されると
     /// 別タブへ誤って紐付くため、採番カウンタを ID の先へ進めて再利用を防ぐ
     pub fn from_raw(id: u64) -> Self {

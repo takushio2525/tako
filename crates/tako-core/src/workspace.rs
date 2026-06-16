@@ -23,25 +23,25 @@ pub enum WorkspaceError {
 pub struct Workspace {
     tabs: Vec<Tab>,
     active: TabId,
-    /// たまり場（FR-2.15）: タブから外したがプロセスは生きているペイン。
-    /// 由来タブごとに分離表示する（FR-2.15.6）ため `ShelvedPane` で由来を保持する
-    shelved: Vec<ShelvedPane>,
+    /// バックグラウンド（FR-2.15）: タブから外したがプロセスは生きているペイン。
+    /// 由来タブごとに分離表示する（FR-2.15.6）ため `BackgroundPane` で由来を保持する
+    shelved: Vec<BackgroundPane>,
 }
 
-/// たまり場へ退避したペイン（FR-2.15）。「タブ別分離」表示（タブツリー・ドロワー）と
-/// 由来タブへの復帰のため由来タブを記録する。退避でタブごと閉じることがあり
+/// バックグラウンドへバックグラウンドしたペイン（FR-2.15）。「タブ別分離」表示（タブツリー・ドロワー）と
+/// 由来タブへの復帰のため由来タブを記録する。バックグラウンドでタブごと閉じることがあり
 /// 由来タブが実在しないこともあるため、ID に加えてタブ名をスナップショットしておく
 #[derive(Debug)]
-pub struct ShelvedPane {
+pub struct BackgroundPane {
     pane: Pane,
-    /// 退避元タブの ID（既に閉じられている場合もある）
+    /// バックグラウンド元タブの ID（既に閉じられている場合もある）
     origin_tab: TabId,
-    /// 退避時点のタブ名（閉じたタブ由来でも親タブを明記できるよう保持する）
+    /// バックグラウンド時点のタブ名（閉じたタブ由来でも親タブを明記できるよう保持する）
     origin_tab_title: String,
 }
 
-impl ShelvedPane {
-    /// 退避ペインを由来タブ情報とともに包む（退避時・レイアウト復元時の両方で使う）
+impl BackgroundPane {
+    /// バックグラウンドペインを由来タブ情報とともに包む（バックグラウンド時・レイアウト復元時の両方で使う）
     pub fn from_pane(pane: Pane, origin_tab: TabId, origin_tab_title: String) -> Self {
         Self {
             pane,
@@ -50,7 +50,7 @@ impl ShelvedPane {
         }
     }
 
-    /// 退避ペイン本体（タイトル・role・origin・title_source 等の参照に使う）
+    /// バックグラウンドペイン本体（タイトル・role・origin・title_source 等の参照に使う）
     pub fn pane(&self) -> &Pane {
         &self.pane
     }
@@ -67,12 +67,12 @@ impl ShelvedPane {
         self.pane.role()
     }
 
-    /// 退避元タブの ID（実在を保証しない。表示・復帰先解決に使う）
+    /// バックグラウンド元タブの ID（実在を保証しない。表示・復帰先解決に使う）
     pub fn origin_tab(&self) -> TabId {
         self.origin_tab
     }
 
-    /// 退避時点のタブ名（親タブの明記に使う）
+    /// バックグラウンド時点のタブ名（親タブの明記に使う）
     pub fn origin_tab_title(&self) -> &str {
         &self.origin_tab_title
     }
@@ -283,7 +283,7 @@ impl Workspace {
     pub fn restore_with_shelved(
         tabs: Vec<Tab>,
         active: TabId,
-        shelved: Vec<ShelvedPane>,
+        shelved: Vec<BackgroundPane>,
     ) -> Option<Self> {
         if tabs.is_empty() {
             return None;
@@ -300,24 +300,24 @@ impl Workspace {
         })
     }
 
-    pub fn shelved_panes(&self) -> &[ShelvedPane] {
+    pub fn shelved_panes(&self) -> &[BackgroundPane] {
         &self.shelved
     }
 
-    /// 退避ペインを 1 件引く（由来タブの参照・復帰先解決に使う）
-    pub fn shelved(&self, pane_id: PaneId) -> Option<&ShelvedPane> {
+    /// バックグラウンドペインを 1 件引く（由来タブの参照・復帰先解決に使う）
+    pub fn shelved(&self, pane_id: PaneId) -> Option<&BackgroundPane> {
         self.shelved.iter().find(|p| p.id() == pane_id)
     }
 
-    /// 退避ペインの由来タブ ID（タブ別分離表示・復帰先の解決に使う。FR-2.15.6）
+    /// バックグラウンドペインの由来タブ ID（タブ別分離表示・復帰先の解決に使う。FR-2.15.6）
     pub fn shelved_origin_tab(&self, pane_id: PaneId) -> Option<TabId> {
         self.shelved(pane_id).map(|p| p.origin_tab())
     }
 
-    /// ペインをたまり場へ退避する（FR-2.15.1）。ペインをツリーから外してたまり場に移す。
+    /// ペインをバックグラウンドへバックグラウンドする（FR-2.15.1）。ペインをツリーから外してバックグラウンドに移す。
     /// タブが空になる場合はタブを閉じる。最後のタブの最後のペインの場合は LastTab を返す
     /// （アプリ層で新ペインを生やしてからリトライする判断は呼び出し側の責務）。
-    /// 由来タブ（FR-2.15.6 のタブ別分離表示用）は退避時点の ID とタブ名を記録する
+    /// 由来タブ（FR-2.15.6 のタブ別分離表示用）はバックグラウンド時点の ID とタブ名を記録する
     pub fn shelve_pane(&mut self, pane_id: PaneId) -> Result<(), WorkspaceError> {
         let tab_id = self
             .find_tab_of_pane(pane_id)
@@ -332,7 +332,7 @@ impl Workspace {
         match tab.tree_mut().close(pane_id) {
             Ok(pane) => {
                 self.shelved
-                    .push(ShelvedPane::from_pane(pane, tab_id, origin_title));
+                    .push(BackgroundPane::from_pane(pane, tab_id, origin_title));
                 Ok(())
             }
             Err(PaneTreeError::LastPane) => {
@@ -341,7 +341,7 @@ impl Workspace {
                     let mut panes = tab.into_tree().into_panes();
                     let pane = panes.pop().expect("タブは常に 1 ペイン以上を持つ");
                     self.shelved
-                        .push(ShelvedPane::from_pane(pane, tab_id, origin_title));
+                        .push(BackgroundPane::from_pane(pane, tab_id, origin_title));
                     Ok(())
                 } else {
                     Err(WorkspaceError::LastTab)
@@ -351,7 +351,7 @@ impl Workspace {
         }
     }
 
-    /// たまり場からペインを復帰させる（FR-2.15.3）。target を direction 側に分割して挿入する
+    /// バックグラウンドからペインを復帰させる（FR-2.15.3）。target を direction 側に分割して挿入する
     pub fn unshelve_pane(
         &mut self,
         pane_id: PaneId,
@@ -375,18 +375,18 @@ impl Workspace {
         Ok(())
     }
 
-    /// たまり場からペインを削除する（FR-2.15.2 の kill 時に使う）
-    pub fn remove_shelved(&mut self, pane_id: PaneId) -> Option<ShelvedPane> {
+    /// バックグラウンドからペインを削除する（FR-2.15.2 の kill 時に使う）
+    pub fn remove_shelved(&mut self, pane_id: PaneId) -> Option<BackgroundPane> {
         let idx = self.shelved.iter().position(|p| p.id() == pane_id)?;
         Some(self.shelved.remove(idx))
     }
 
-    /// ペインがたまり場にあるか
+    /// ペインがバックグラウンドにあるか
     pub fn is_shelved(&self, pane_id: PaneId) -> bool {
         self.shelved.iter().any(|p| p.id() == pane_id)
     }
 
-    /// タブ内の全ペインをたまり場へ退避する（FR-2.15 タブ単位退避）。
+    /// タブ内の全ペインをバックグラウンドへバックグラウンドする（FR-2.15 タブ単位バックグラウンド）。
     /// タブを閉じて全ペインを shelved に移す。最後の 1 タブの場合は LastTab を返す
     /// （呼び出し側で新ペインを生やしてからリトライする想定）
     pub fn shelve_tab(&mut self, tab_id: TabId) -> Result<Vec<PaneId>, WorkspaceError> {
@@ -403,7 +403,7 @@ impl Workspace {
         self.shelved.extend(
             panes
                 .into_iter()
-                .map(|p| ShelvedPane::from_pane(p, tab_id, origin_title.clone())),
+                .map(|p| BackgroundPane::from_pane(p, tab_id, origin_title.clone())),
         );
         Ok(ids)
     }
@@ -579,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn ペインをたまり場に退避して復帰できる() {
+    fn ペインをバックグラウンドに送って復帰できる() {
         let mut ws = Workspace::new("t1", pane());
         let p1 = ws.active_tab().tree().focused();
         let p2 = pane();
@@ -588,7 +588,7 @@ mod tests {
             .tree_mut()
             .split(p1, SplitDirection::Right, p2)
             .unwrap();
-        // p2 を退避
+        // p2 をバックグラウンド
         ws.shelve_pane(p2_id).unwrap();
         assert_eq!(ws.shelved_panes().len(), 1);
         assert_eq!(ws.shelved_panes()[0].id(), p2_id);
@@ -602,13 +602,13 @@ mod tests {
     }
 
     #[test]
-    fn たまり場退避でタブが空になるとタブを閉じる() {
+    fn バックグラウンド送りでタブが空になるとタブを閉じる() {
         let mut ws = Workspace::new("t1", pane());
         let p1 = ws.active_tab().tree().focused();
         let t2_pane = pane();
         let t2_pane_id = t2_pane.id();
         let t2 = ws.create_tab("t2", t2_pane);
-        // t2 の唯一のペインを退避 → t2 はタブごと閉じる
+        // t2 の唯一のペインをバックグラウンド → t2 はタブごと閉じる
         ws.shelve_pane(t2_pane_id).unwrap();
         assert_eq!(ws.tabs().len(), 1);
         assert_eq!(ws.shelved_panes().len(), 1);
@@ -622,14 +622,14 @@ mod tests {
     }
 
     #[test]
-    fn 最後のタブの最後のペインは退避できない() {
+    fn 最後のタブの最後のペインはバックグラウンドに送れない() {
         let mut ws = Workspace::new("t1", pane());
         let p1 = ws.active_tab().tree().focused();
         assert_eq!(ws.shelve_pane(p1).unwrap_err(), WorkspaceError::LastTab);
     }
 
     #[test]
-    fn たまり場のペインをkillできる() {
+    fn バックグラウンドのペインをkillできる() {
         let mut ws = Workspace::new("t1", pane());
         let p1 = ws.active_tab().tree().focused();
         let p2 = pane();
@@ -645,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn タブごとたまり場に退避できる() {
+    fn タブごとバックグラウンドに送れる() {
         let mut ws = Workspace::new("t1", pane());
         let p1 = ws.active_tab().tree().focused();
         let p2 = pane();
@@ -655,7 +655,7 @@ mod tests {
             .split(p1, SplitDirection::Right, p2)
             .unwrap();
         let t2 = ws.create_tab("t2", pane());
-        // t1（p1, p2）をまとめて退避
+        // t1（p1, p2）をまとめてバックグラウンド
         let t1 = ws.tabs()[0].id();
         let shelved_ids = ws.shelve_tab(t1).unwrap();
         assert_eq!(shelved_ids.len(), 2);
@@ -664,7 +664,7 @@ mod tests {
         assert_eq!(ws.tabs().len(), 1);
         assert_eq!(ws.active_tab_id(), t2);
         assert_eq!(ws.shelved_panes().len(), 2);
-        // タブ単位退避では全ペインが同じ由来タブ（t1）を共有する（FR-2.15.6）
+        // タブ単位バックグラウンドでは全ペインが同じ由来タブ（t1）を共有する（FR-2.15.6）
         assert!(ws
             .shelved_panes()
             .iter()
@@ -672,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn 最後のタブはタブ退避できない() {
+    fn 最後のタブはタブごとバックグラウンドに送れない() {
         let mut ws = Workspace::new("t1", pane());
         let t1 = ws.active_tab_id();
         assert_eq!(ws.shelve_tab(t1).unwrap_err(), WorkspaceError::LastTab);
