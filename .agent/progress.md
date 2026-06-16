@@ -145,3 +145,9 @@
 - 検証: build / clippy(-D warnings exit 0) / fmt / test 全緑（app33/cli10/control58/core103）。
   セルフテストは既知 PDF 以外緑 = ツール数 33 通過
 - 次: push → tako 終了（Cmd-Q）→ `build-app.sh --install` → 再起動で実機確認
+
+## 2026-06-16（GitHub Releases 配布整備）
+- `scripts/release.sh` 新設: build-app.sh → ditto zip → gh release create の一発スクリプト。
+  README にダウンロード・インストール手順（Gatekeeper 対処法）追加。AGENTS.md コマンド追加
+- 関連コミット: `8c0ce17` `[機能追加] GitHub Releases 配布用スクリプト + README ダウンロード手順`
+- 次: ユーザー判断で `scripts/release.sh --publish` または `--draft` で初回リリース作成
