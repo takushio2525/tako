@@ -51,6 +51,7 @@ syntect = { version = "5", default-features = false, features = [
 ] }
 # Markdown プレビューのパーサ（FR-3.3。イベントストリーム型で GPUI 独自描画に写す）
 pulldown-cmark = { version = "0.13", default-features = false }
+image = "0.25"
 pathdiff = "0.2"
 # GPUI は zed リポの git rev 固定（自動更新しない。追従は意識的なタスク。.agent/architecture.md）
 gpui = { git = "https://github.com/zed-industries/zed", rev = "cafbf4b5df7fedb67fc0f248850a5654efcec5d9" }

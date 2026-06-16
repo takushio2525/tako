@@ -482,8 +482,8 @@ struct TakoApp {
     video_players: HashMap<PaneId, video_player::VideoPlayer>,
     /// 動画フレーム更新ティッカーの稼働中フラグ（再生中ペインがある間だけ回す）
     video_ticker: bool,
-    /// 動画フレームの描画キャッシュ（frame_gen でダブルバッファリング: 新フレーム準備完了まで前フレームを表示）
-    video_frame_cache: HashMap<PaneId, (u64, std::sync::Arc<gpui::Image>)>,
+    /// 動画フレームの描画キャッシュ（frame_gen で世代管理: 新フレーム準備完了まで前フレームを表示）
+    video_frame_cache: HashMap<PaneId, (u64, std::sync::Arc<gpui::RenderImage>)>,
 }
 
 /// git パネルのデータスナップショット（FR-3.6 / FR-3.9）
@@ -7115,12 +7115,16 @@ impl TakoApp {
                         Some((cached_gen, _)) => *cached_gen != gen,
                         None => true,
                     };
-                    if need_update && !player.current_frame.is_empty() {
-                        let img = std::sync::Arc::new(gpui::Image::from_bytes(
-                            gpui::ImageFormat::Png,
-                            player.current_frame.clone(),
-                        ));
-                        self.video_frame_cache.insert(pane_id, (gen, img));
+                    if need_update && !player.current_bgra.is_empty() {
+                        let w = player.width;
+                        let h = player.height;
+                        if let Some(rgba_img) =
+                            image::RgbaImage::from_raw(w, h, player.current_bgra.clone())
+                        {
+                            let frame = image::Frame::new(rgba_img);
+                            let render = std::sync::Arc::new(gpui::RenderImage::new(vec![frame]));
+                            self.video_frame_cache.insert(pane_id, (gen, render));
+                        }
                     }
                     if let Some((_, ref frame_image)) = self.video_frame_cache.get(&pane_id) {
                         let frame_image = frame_image.clone();

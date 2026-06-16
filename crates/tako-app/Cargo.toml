@@ -21,3 +21,4 @@ serde_json.workspace = true
 # プレビューペイン: コードハイライト（FR-3.2）と Markdown パース（FR-3.3）
 syntect.workspace = true
 pulldown-cmark.workspace = true
+image.workspace = true

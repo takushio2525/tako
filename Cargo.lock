@@ -5543,6 +5543,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui_platform",
+ "image",
  "pulldown-cmark",
  "serde_json",
  "syntect",

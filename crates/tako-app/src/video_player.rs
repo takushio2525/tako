@@ -103,8 +103,8 @@ pub struct VideoPlayer {
     pub duration: f64,
     pub width: u32,
     pub height: u32,
-    /// 現在のフレーム（RGBA PNG バイト列。img() で描画する）
-    pub current_frame: Vec<u8>,
+    /// 現在のフレーム（BGRA 生バイト。RenderImage に直接渡す）
+    pub current_bgra: Vec<u8>,
     /// 現在の再生位置（秒）
     pub current_time: f64,
     /// フレーム世代カウンタ（grab_frame 成功ごとにインクリメント。描画キャッシュの無効化に使う）
@@ -220,7 +220,7 @@ impl VideoPlayer {
                 duration,
                 width,
                 height,
-                current_frame: Vec::new(),
+                current_bgra: Vec::new(),
                 current_time: 0.0,
                 frame_gen: 0,
             };
@@ -275,7 +275,7 @@ impl VideoPlayer {
         self.current_time = seconds;
     }
 
-    /// 現在のフレームをキャプチャして current_frame に格納する。
+    /// 現在のフレームをキャプチャして current_bgra に格納する。
     /// 再生中は定期的に呼ぶ（タイマー駆動）
     pub fn grab_frame(&mut self) -> bool {
         unsafe {
@@ -305,7 +305,7 @@ impl VideoPlayer {
                 return false;
             }
 
-            // ピクセルバッファから RGBA データを取得
+            // ピクセルバッファから BGRA データを取得
             let width = CVPixelBufferGetWidth(pixel_buffer);
             let height = CVPixelBufferGetHeight(pixel_buffer);
             let bytes_per_row = CVPixelBufferGetBytesPerRow(pixel_buffer);
@@ -314,24 +314,17 @@ impl VideoPlayer {
             let base = CVPixelBufferGetBaseAddress(pixel_buffer);
 
             if !base.is_null() && width > 0 && height > 0 {
-                // BGRA → RGBA 変換して PNG エンコード
-                let mut rgba = vec![0u8; width * height * 4];
+                // BGRA データをそのままコピー（GPUI の RenderImage は BGRA を期待する）
+                let row_len = width * 4;
+                let mut bgra = vec![0u8; width * height * 4];
                 for y in 0..height {
-                    let src_row = base.add(y * bytes_per_row);
-                    let dst_offset = y * width * 4;
-                    for x in 0..width {
-                        let src = src_row.add(x * 4);
-                        let dst = dst_offset + x * 4;
-                        rgba[dst] = *src.add(2); // R ← B
-                        rgba[dst + 1] = *src.add(1); // G ← G
-                        rgba[dst + 2] = *src; // B ← R
-                        rgba[dst + 3] = *src.add(3); // A ← A
-                    }
+                    let src = std::slice::from_raw_parts(base.add(y * bytes_per_row), row_len);
+                    bgra[y * row_len..(y + 1) * row_len].copy_from_slice(src);
                 }
 
                 self.width = width as u32;
                 self.height = height as u32;
-                self.current_frame = encode_rgba_to_png(&rgba, width as u32, height as u32);
+                self.current_bgra = bgra;
                 self.frame_gen += 1;
             }
 
@@ -354,106 +347,6 @@ impl Drop for VideoPlayer {
             let _: () = msg_send_void(self.player, sel("release"));
         }
     }
-}
-
-// --- 最小限の PNG エンコーダ（外部依存なし） ---
-
-fn encode_rgba_to_png(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rgba.len() + 1024);
-
-    // PNG signature
-    out.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
-
-    // IHDR
-    let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&width.to_be_bytes());
-    ihdr.extend_from_slice(&height.to_be_bytes());
-    ihdr.push(8); // bit depth
-    ihdr.push(6); // color type = RGBA
-    ihdr.push(0); // compression
-    ihdr.push(0); // filter
-    ihdr.push(0); // interlace
-    write_png_chunk(&mut out, b"IHDR", &ihdr);
-
-    // IDAT — filter=None (0) の行を deflate で圧縮
-    let row_bytes = width as usize * 4;
-    let mut raw = Vec::with_capacity((row_bytes + 1) * height as usize);
-    for y in 0..height as usize {
-        raw.push(0); // filter type = None
-        raw.extend_from_slice(&rgba[y * row_bytes..(y + 1) * row_bytes]);
-    }
-    let compressed = miniz_compress(&raw);
-    write_png_chunk(&mut out, b"IDAT", &compressed);
-
-    // IEND
-    write_png_chunk(&mut out, b"IEND", &[]);
-
-    out
-}
-
-fn write_png_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
-    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    out.extend_from_slice(chunk_type);
-    out.extend_from_slice(data);
-    let mut hasher = Crc32::new();
-    hasher.update(chunk_type);
-    hasher.update(data);
-    out.extend_from_slice(&hasher.finish().to_be_bytes());
-}
-
-struct Crc32(u32);
-impl Crc32 {
-    fn new() -> Self {
-        Self(0xFFFFFFFF)
-    }
-    fn update(&mut self, data: &[u8]) {
-        for &byte in data {
-            self.0 ^= byte as u32;
-            for _ in 0..8 {
-                if self.0 & 1 != 0 {
-                    self.0 = (self.0 >> 1) ^ 0xEDB88320;
-                } else {
-                    self.0 >>= 1;
-                }
-            }
-        }
-    }
-    fn finish(self) -> u32 {
-        self.0 ^ 0xFFFFFFFF
-    }
-}
-
-/// 最小限の deflate 圧縮（stored blocks のみ。高品質な圧縮は不要 — フレーム更新速度が優先）
-fn miniz_compress(input: &[u8]) -> Vec<u8> {
-    // zlib header (deflate, no dict, default compression)
-    let mut out = vec![0x78, 0x01];
-
-    // stored blocks（65535 バイト以下のチャンクに分割）
-    let chunks: Vec<&[u8]> = input.chunks(65535).collect();
-    for (i, chunk) in chunks.iter().enumerate() {
-        let is_last = i == chunks.len() - 1;
-        out.push(if is_last { 0x01 } else { 0x00 }); // BFINAL + BTYPE=00(stored)
-        let len = chunk.len() as u16;
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(&(!len).to_le_bytes());
-        out.extend_from_slice(chunk);
-    }
-
-    // Adler-32
-    let adler = adler32(input);
-    out.extend_from_slice(&adler.to_be_bytes());
-
-    out
-}
-
-fn adler32(data: &[u8]) -> u32 {
-    let mut a: u32 = 1;
-    let mut b: u32 = 0;
-    for &byte in data {
-        a = (a + byte as u32) % 65521;
-        b = (b + a) % 65521;
-    }
-    (b << 16) | a
 }
 
 // --- Objective-C runtime FFI ヘルパー（既存の PDF 描画と同じパターン） ---
