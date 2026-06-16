@@ -480,7 +480,16 @@ unsafe fn msg_class_str(
     arg: &str,
 ) -> Result<*const c_void, String> {
     let cstr = std::ffi::CString::new(arg).map_err(|_| "CString 変換失敗".to_string())?;
-    let result: *const c_void = objc_msgSend(get_class(class_name), sel(sel_name), cstr.as_ptr());
+    let cls = get_class(class_name);
+    let selector = sel(sel_name);
+    // ARM64 では variadic 呼び出しの引数がスタックに置かれるため、
+    // 型付き関数ポインタ経由で呼ぶ（レジスタ渡しを保証）
+    let f: unsafe extern "C" fn(*const c_void, *const c_void, *const c_void) -> *const c_void =
+        std::mem::transmute(objc_msgSend as *const c_void);
+    let result = f(cls, selector, cstr.as_ptr() as *const c_void);
+    if result.is_null() {
+        return Err(format!("{class_name} {sel_name} が null を返した"));
+    }
     Ok(result)
 }
 
@@ -490,7 +499,9 @@ unsafe fn msg_send_id(
     selector: *const c_void,
     arg: *const c_void,
 ) -> *const c_void {
-    objc_msgSend(receiver, selector, arg)
+    let f: unsafe extern "C" fn(*const c_void, *const c_void, *const c_void) -> *const c_void =
+        std::mem::transmute(objc_msgSend as *const c_void);
+    f(receiver, selector, arg)
 }
 
 #[cfg(target_os = "macos")]
@@ -499,7 +510,9 @@ unsafe fn msg_send_u32(
     selector: *const c_void,
     arg: u32,
 ) -> *const c_void {
-    objc_msgSend(receiver, selector, arg)
+    let f: unsafe extern "C" fn(*const c_void, *const c_void, u32) -> *const c_void =
+        std::mem::transmute(objc_msgSend as *const c_void);
+    f(receiver, selector, arg)
 }
 
 #[cfg(target_os = "macos")]
@@ -510,7 +523,14 @@ unsafe fn msg_send_dict(
     keys: *const *const c_void,
     count: usize,
 ) -> *const c_void {
-    objc_msgSend(receiver, selector, objects, keys, count)
+    let f: unsafe extern "C" fn(
+        *const c_void,
+        *const c_void,
+        *const *const c_void,
+        *const *const c_void,
+        usize,
+    ) -> *const c_void = std::mem::transmute(objc_msgSend as *const c_void);
+    f(receiver, selector, objects, keys, count)
 }
 
 #[cfg(target_os = "macos")]
@@ -525,7 +545,9 @@ unsafe fn msg_send_void(receiver: *const c_void, selector: *const c_void) {
 
 #[cfg(target_os = "macos")]
 unsafe fn msg_send_void_id(receiver: *const c_void, selector: *const c_void, arg: *const c_void) {
-    objc_msgSend(receiver, selector, arg);
+    let f: unsafe extern "C" fn(*const c_void, *const c_void, *const c_void) =
+        std::mem::transmute(objc_msgSend as *const c_void);
+    f(receiver, selector, arg);
 }
 
 #[cfg(target_os = "macos")]
