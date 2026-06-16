@@ -434,6 +434,10 @@ struct TakoApp {
     tmux_persist: bool,
     /// ペインを保持する tmux バックエンドセッション名（persist 有効時のみ登録される）
     backend_sessions: HashMap<PaneId, String>,
+    /// バックエンドセッション内の window 一覧（tmux ポーリングで更新。2+ window のみ保持）
+    backend_windows: HashMap<PaneId, Vec<tako_core::TmuxWindow>>,
+    /// tmux window のキャプチャテキスト（ホバープレビュー用。ポーリングで非アクティブ window を取得）
+    window_captures: HashMap<(PaneId, u32), Vec<String>>,
     /// 直近に保存したレイアウトの JSON（変化したときだけ書き込むための比較用）
     last_saved_layout: Option<String>,
     /// OS ウィンドウの現フレーム（render で採取し layout 保存に含める。FR-5）
@@ -902,6 +906,8 @@ impl TakoApp {
             dismissed_ports: std::collections::HashSet::new(),
             tmux_persist,
             backend_sessions: HashMap::new(),
+            backend_windows: HashMap::new(),
+            window_captures: HashMap::new(),
             last_saved_layout: None,
             window_frame: None,
             drag_kind: None,
@@ -1088,6 +1094,7 @@ impl TakoApp {
             if let Some(sessions) = tmux_result {
                 let ok = this.update(cx, |app: &mut TakoApp, cx| {
                     app.tmux_sessions = sessions;
+                    app.sync_backend_windows();
                     cx.notify();
                 });
                 if ok.is_err() {
@@ -1716,6 +1723,54 @@ impl TakoApp {
         )
         .unwrap_or_else(|_| serde_json::json!({ "sessions": [] }));
         self.tmux_sessions = value["sessions"].as_array().cloned().unwrap_or_default();
+        self.sync_backend_windows();
+    }
+
+    /// tmux_sessions JSON からバックエンドペインの window 一覧を抽出する。
+    /// 2+ window のセッションのみ backend_windows に保持し、非アクティブ window の
+    /// テキストを capture_pane で取得して window_captures にキャッシュする
+    fn sync_backend_windows(&mut self) {
+        self.backend_windows.clear();
+        let socket = tako_core::tmux_backend::socket_name();
+        for (pane_id, session_name) in &self.backend_sessions {
+            let session = self.tmux_sessions.iter().find(|s| {
+                s["name"].as_str() == Some(session_name) && s["backend"].as_bool() == Some(true)
+            });
+            let Some(session) = session else { continue };
+            let windows: Vec<tako_core::TmuxWindow> = session["windows"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|w| {
+                    Some(tako_core::TmuxWindow {
+                        index: w["index"].as_u64()? as u32,
+                        name: w["name"].as_str()?.to_string(),
+                        active: w["active"].as_bool().unwrap_or(false),
+                        panes: w["panes"].as_u64().unwrap_or(1) as u32,
+                    })
+                })
+                .collect();
+            if windows.len() > 1 {
+                for w in &windows {
+                    if !w.active {
+                        let lines = tako_core::tmux::capture_pane_text(
+                            Some(&socket),
+                            session_name,
+                            w.index,
+                        );
+                        self.window_captures.insert((*pane_id, w.index), lines);
+                    }
+                }
+                self.backend_windows.insert(*pane_id, windows);
+            }
+        }
+        // 古いキャプチャを掃除する（対応するペインや window がなくなった分）
+        self.window_captures.retain(|(pane, win), _| {
+            self.backend_windows
+                .get(pane)
+                .map(|ws| ws.iter().any(|w| w.index == *win))
+                .unwrap_or(false)
+        });
     }
 
     /// アクティブタブの最初のペインの cwd を返す（git パネルの cwd 連動用）
@@ -3007,6 +3062,110 @@ impl TakoApp {
                         Some(pane),
                         cx,
                     ));
+                }
+                // バックエンドセッションに複数 window がある場合、非アクティブ window を
+                // 子行として表示する（tmux window 統合）。クリックで window 切替
+                if let Some(windows) = self.backend_windows.get(&pane) {
+                    for w in windows {
+                        if w.active {
+                            continue; // アクティブ window はペイン本体が表示
+                        }
+                        let win_index = w.index;
+                        let win_label = format!("  ↳ {}:{}", w.index, truncate(&w.name, 16));
+                        let win_pane_count = w.panes;
+                        let win_pinned = self
+                            .pinned_previews
+                            .iter()
+                            .any(|p| p.target == PreviewTarget::TmuxWindow(pane, win_index));
+                        card = card.child(
+                            div()
+                                .id(("tmux-win-row", pane.as_u64() * 100 + win_index as u64))
+                                .group("tmux-win-row")
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .px_1()
+                                .ml_4()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .overflow_hidden()
+                                .text_size(px(11.0))
+                                .text_color(hsla(theme.tab_inactive_foreground))
+                                .hover(|d| d.bg(rgba_alpha(theme.tab_bar_background, 0.8)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let _ = tako_control::dispatch(
+                                        this,
+                                        tako_control::protocol::Request::TmuxSelectWindow {
+                                            pane: Some(pane.as_u64()),
+                                            window: win_index,
+                                        },
+                                        PaneOrigin::User,
+                                    );
+                                    cx.notify();
+                                }))
+                                .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+                                    if *hovered {
+                                        this.hover_preview = Some(HoverPreview {
+                                            target: PreviewTarget::TmuxWindow(pane, win_index),
+                                            anchor: window.mouse_position(),
+                                        });
+                                    } else if matches!(
+                                        this.hover_preview,
+                                        Some(HoverPreview { target: PreviewTarget::TmuxWindow(p, w), .. })
+                                            if p == pane && w == win_index
+                                    ) {
+                                        this.hover_preview = None;
+                                    }
+                                    cx.notify();
+                                }))
+                                .child(
+                                    div()
+                                        .w(px(8.0))
+                                        .h(px(8.0))
+                                        .flex_none()
+                                        .rounded_full()
+                                        .bg(hsla(theme.tab_inactive_foreground)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(SharedString::from(win_label)),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .child(SharedString::from(format!("{win_pane_count} ペイン"))),
+                                )
+                                .child(
+                                    div()
+                                        .id(("win-pin", pane.as_u64() * 100 + win_index as u64))
+                                        .px_1()
+                                        .flex_none()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .text_size(px(11.0))
+                                        .when(win_pinned, |d| d.text_color(hsla(theme.accent)))
+                                        .when(!win_pinned, |d| {
+                                            d.opacity(0.0)
+                                                .group_hover("tmux-win-row", |d| d.opacity(1.0))
+                                        })
+                                        .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.set_pin(
+                                                PreviewTarget::TmuxWindow(pane, win_index),
+                                                None,
+                                            );
+                                            cx.notify();
+                                        }))
+                                        .child("📌"),
+                                ),
+                        );
+                    }
                 }
                 // ホストペイン配下に attach 中セッションを入れ子表示（FR-2.16.6 一本化）
                 for (s_index, session) in group.sessions.iter().enumerate() {
@@ -6029,6 +6188,16 @@ impl TakoApp {
                 let count = self.shelved_entries_of_tab(tab).len();
                 format!("タブ {}（閉じたタブ・{count} 件）", truncate(&title, 20))
             }
+            PreviewTarget::TmuxWindow(pane_id, win) => {
+                let win_name = self
+                    .backend_windows
+                    .get(&pane_id)
+                    .and_then(|ws| ws.iter().find(|w| w.index == win))
+                    .map(|w| w.name.clone())
+                    .unwrap_or_else(|| format!("{win}"));
+                let pane_label = self.pane_preview_label(pane_id);
+                format!("{pane_label} · window {win}:{win_name}")
+            }
         }
     }
 
@@ -6041,6 +6210,9 @@ impl TakoApp {
                 .shelved_entries_of_tab(tab)
                 .iter()
                 .any(|e| self.terminals.contains_key(&e.pane)),
+            PreviewTarget::TmuxWindow(pane_id, win) => {
+                self.window_captures.contains_key(&(pane_id, win))
+            }
         }
     }
 
@@ -6126,6 +6298,28 @@ impl TakoApp {
                                     .overflow_hidden()
                                     .children(lines),
                             ),
+                    );
+                }
+                body
+            }
+            PreviewTarget::TmuxWindow(pane_id, win) => {
+                let text_style = self.text_style();
+                let lines = self
+                    .window_captures
+                    .get(&(pane_id, win))
+                    .cloned()
+                    .unwrap_or_default();
+                let mut body = div()
+                    .flex_1()
+                    .p(px(PANE_PADDING))
+                    .overflow_hidden()
+                    .bg(rgba(theme.background));
+                for line in lines {
+                    body = body.child(
+                        div().whitespace_nowrap().child(
+                            StyledText::new(SharedString::from(line))
+                                .with_default_highlights(&text_style, Vec::new()),
+                        ),
                     );
                 }
                 body
@@ -7207,6 +7401,12 @@ impl ControlHost for TakoApp {
                     x: f32::from(p.pos.x),
                     y: f32::from(p.pos.y),
                 },
+                PreviewTarget::TmuxWindow(pane, win) => tako_control::PinnedView {
+                    group: false,
+                    id: pane.as_u64() ^ ((win as u64) << 32),
+                    x: f32::from(p.pos.x),
+                    y: f32::from(p.pos.y),
+                },
             })
             .collect()
     }
@@ -7292,6 +7492,10 @@ impl ControlHost for TakoApp {
 
     fn backend_session(&self, pane: PaneId) -> Option<String> {
         self.backend_sessions.get(&pane).cloned()
+    }
+
+    fn backend_windows(&self, pane: PaneId) -> Option<Vec<tako_core::TmuxWindow>> {
+        self.backend_windows.get(&pane).cloned()
     }
 
     fn panel_state(&self) -> (bool, f32, tako_control::protocol::PanelViewWire) {
@@ -9025,7 +9229,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 33, "MCP tools/list は 33 ツール");
+            check(status == 200 && tool_count == 34, "MCP tools/list は 34 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)

@@ -153,6 +153,14 @@ enum TmuxCommand {
         #[arg(long)]
         socket: Option<String>,
     },
+    /// バックエンドセッションのアクティブ window を切り替える
+    SelectWindow {
+        /// 切り替え先の window index
+        window: u32,
+        /// 対象ペイン ID（省略時は呼び出し元）
+        #[arg(long)]
+        pane: Option<u64>,
+    },
     /// セッションを現在のタブへ取り込んで表示する。
     /// 対象ペインを分割した新ペインで attach クライアントを起動する。
     /// 新ペインを閉じてもセッションは残る（kill ではない）
@@ -814,6 +822,10 @@ fn build_request(command: &Command) -> Result<Request, String> {
             session: session.clone(),
             window: *window,
         },
+        Command::Tmux(TmuxCommand::SelectWindow { window, pane }) => Request::TmuxSelectWindow {
+            pane: target_pane(*pane)?,
+            window: *window,
+        },
         Command::Tmux(TmuxCommand::Open {
             session,
             socket,
@@ -1008,7 +1020,9 @@ fn print_result(command: &Command, result: &Value) {
                 serde_json::to_string_pretty(result).unwrap_or_default()
             );
         }
-        Command::Tmux(TmuxCommand::Kill { .. }) | Command::Tmux(TmuxCommand::Open { .. }) => {
+        Command::Tmux(TmuxCommand::Kill { .. })
+        | Command::Tmux(TmuxCommand::Open { .. })
+        | Command::Tmux(TmuxCommand::SelectWindow { .. }) => {
             println!("{result}")
         }
         Command::File(FileCommand::CopyPath { .. }) => {

@@ -59,6 +59,10 @@ pub trait ControlHost {
     fn backend_session(&self, _pane: PaneId) -> Option<String> {
         None
     }
+    /// バックエンドセッション内の window 一覧（2+ window の場合のみ）
+    fn backend_windows(&self, _pane: PaneId) -> Option<Vec<tako_core::TmuxWindow>> {
+        None
+    }
     /// 右サイドバー情報パネルの状態 (visible, width, view)
     fn panel_state(&self) -> (bool, f32, crate::protocol::PanelViewWire) {
         (false, 0.0, crate::protocol::PanelViewWire::Tmux)
@@ -1406,6 +1410,12 @@ fn list_json(host: &dyn ControlHost) -> Value {
                             "path": path,
                             "mode": mode.as_str(),
                         })),
+                        "backend_windows": host.backend_windows(p.id()).map(|ws| ws.iter().map(|w| json!({
+                            "index": w.index,
+                            "name": w.name,
+                            "active": w.active,
+                            "panes": w.panes,
+                        })).collect::<Vec<_>>()),
                     })
                 })
                 .collect();

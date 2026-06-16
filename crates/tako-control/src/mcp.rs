@@ -311,6 +311,21 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_tmux_select_window",
+            "description": "バックエンドセッション内の tmux window を切り替える。\
+                pane のバックエンドセッション内で指定した window index をアクティブにする。\
+                tako tmux list でペインの backend セッションの windows を確認してから使う。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": { "type": "integer", "minimum": 0, "description": "対象ペイン ID（省略時は呼び出し元）" },
+                    "window": { "type": "integer", "minimum": 0, "description": "切り替え先 window index（必須）" },
+                },
+                "required": ["window"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_focus_pane",
             "description": "ペインへフォーカスを移す。pane（ID 指定。別タブならタブも切り替わる）か\
                 direction（アクティブタブ内の隣接移動）のどちらか一方を指定する。\
@@ -763,6 +778,10 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             socket: str_arg(args, "socket")?,
             session: str_arg(args, "session")?.ok_or("session を指定する")?,
             window: u64_arg(args, "window")?.map(|n| n as u32),
+        },
+        "tako_tmux_select_window" => Request::TmuxSelectWindow {
+            pane: Some(target_pane(args, caller)?),
+            window: u64_arg(args, "window")?.ok_or("window を指定する")? as u32,
         },
         "tako_tmux_open" => Request::TmuxOpen {
             socket: str_arg(args, "socket")?,
@@ -1350,7 +1369,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 33);
+        assert_eq!(tools.len(), 34);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
