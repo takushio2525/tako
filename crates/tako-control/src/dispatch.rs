@@ -1197,6 +1197,33 @@ pub fn dispatch(
         }
 
         Request::CheckHealth => Ok(check_health(host)),
+
+        Request::SetupMcp { scope, pane } => {
+            let scope_str = scope.as_deref().unwrap_or("global");
+            let settings_dir = match scope_str {
+                "project" => {
+                    let (_, target) = resolve_pane(host.workspace(), pane)?;
+                    let cwd = host
+                        .session(target)
+                        .and_then(|s| s.cwd())
+                        .ok_or(DispatchError::Operation("cwd が取得できない".into()))?;
+                    cwd.join(".claude")
+                }
+                _ => home_dir()
+                    .ok_or(DispatchError::Operation(
+                        "ホームディレクトリが取得できない".into(),
+                    ))?
+                    .join(".claude"),
+            };
+            let tako_bin = resolve_tako_binary();
+            let result = setup_mcp_settings(&tako_bin, &settings_dir.join("settings.json"))?;
+            Ok(json!({
+                "configured": result.configured,
+                "already_existed": result.already_existed,
+                "settings_path": settings_dir.join("settings.json").display().to_string(),
+                "command": tako_bin,
+            }))
+        }
     }
 }
 
@@ -1208,6 +1235,83 @@ fn shell_escape(s: &str) -> String {
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
     }
+}
+
+/// `setup_mcp_settings` の結果
+pub struct SetupMcpResult {
+    pub configured: bool,
+    pub already_existed: bool,
+}
+
+/// Claude Code の settings.json に tako MCP サーバーの接続設定を追加する。
+/// `tako_binary` は tako CLI のフルパス、`settings_path` は書き込む settings.json のパス。
+/// 既に設定済みなら `already_existed=true`、新規追加なら `configured=true`
+pub fn setup_mcp_settings(
+    tako_binary: &str,
+    settings_path: &std::path::Path,
+) -> Result<SetupMcpResult, DispatchError> {
+    let mut settings: serde_json::Map<String, Value> = if settings_path.is_file() {
+        let content = std::fs::read_to_string(settings_path).map_err(|e| {
+            DispatchError::Operation(format!("settings.json の読み取りに失敗: {e}"))
+        })?;
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        serde_json::Map::new()
+    };
+    let servers = settings.entry("mcpServers").or_insert_with(|| json!({}));
+    if let Some(obj) = servers.as_object() {
+        if obj.contains_key("tako") {
+            return Ok(SetupMcpResult {
+                configured: false,
+                already_existed: true,
+            });
+        }
+    }
+    let servers_obj = servers.as_object_mut().ok_or_else(|| {
+        DispatchError::Operation("settings.json の mcpServers がオブジェクトでない".into())
+    })?;
+    servers_obj.insert(
+        "tako".to_string(),
+        json!({
+            "command": tako_binary,
+            "args": ["mcp", "serve"],
+        }),
+    );
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            DispatchError::Operation(format!("{} の作成に失敗: {e}", parent.display()))
+        })?;
+    }
+    let json = serde_json::to_string_pretty(&settings)
+        .map_err(|e| DispatchError::Operation(format!("JSON のシリアライズに失敗: {e}")))?;
+    std::fs::write(settings_path, json).map_err(|e| {
+        DispatchError::Operation(format!(
+            "{} への書き込みに失敗: {e}",
+            settings_path.display()
+        ))
+    })?;
+    Ok(SetupMcpResult {
+        configured: true,
+        already_existed: false,
+    })
+}
+
+/// tako CLI バイナリのパスを解決する。
+/// ① `which tako`、② 実行中バイナリの隣（.app バンドル想定）、③ フォールバック "tako"
+pub fn resolve_tako_binary() -> String {
+    if let Some(path) = which("tako") {
+        return path;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        // .app バンドル: tako-app の隣に tako がある
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("tako");
+            if sibling.is_file() {
+                return sibling.display().to_string();
+            }
+        }
+    }
+    "tako".to_string()
 }
 
 fn check_health(host: &dyn ControlHost) -> Value {
@@ -1301,6 +1405,13 @@ fn check_health(host: &dyn ControlHost) -> Value {
         },
         "issues": issues,
     })
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
 }
 
 fn which(name: &str) -> Option<String> {

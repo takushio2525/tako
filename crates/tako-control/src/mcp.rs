@@ -713,6 +713,25 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "tako_setup_mcp",
+            "description": "Claude Code の settings.json に tako MCP サーバーの接続設定を\
+                自動追加する。初回セットアップ時に呼ぶ。既に設定済みなら何もしない。\
+                scope=global（既定）は ~/.claude/settings.json、scope=project は\
+                呼び出し元ペインの cwd 配下 .claude/settings.json に書き込む。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": ["global", "project"],
+                        "description": "設定の書き込み先スコープ（省略時は global = ~/.claude/settings.json）",
+                    },
+                    "pane": pane_schema("対象ペイン ID（scope=project 時の cwd 解決に使う。省略時は呼び出し元）"),
+                },
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -954,6 +973,10 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             }
         }
         "tako_check_health" => Request::CheckHealth,
+        "tako_setup_mcp" => Request::SetupMcp {
+            scope: str_arg(args, "scope")?,
+            pane: u64_arg(args, "pane")?.or(caller),
+        },
         _ => return Err(format!("不明なツール: {name}")),
     })
 }
@@ -1369,7 +1392,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 34);
+        assert_eq!(tools.len(), 35);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

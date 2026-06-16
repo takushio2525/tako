@@ -100,6 +100,9 @@ enum Command {
     /// MCP 連携（serve = stdio ブリッジ。エージェントの MCP クライアントが起動する）
     #[command(subcommand)]
     Mcp(McpCommand),
+    /// Claude Code の settings.json に tako MCP サーバーの接続設定を追加する。
+    /// アプリ未起動でも実行できる（settings.json の書き換えのみ）
+    SetupMcp(SetupMcpArgs),
 }
 
 #[derive(Subcommand)]
@@ -443,6 +446,16 @@ struct UnshelveArgs {
 }
 
 #[derive(Args)]
+struct SetupMcpArgs {
+    /// ~/.claude/settings.json（ユーザーグローバル）に書き込む（既定）
+    #[arg(long, conflicts_with = "project")]
+    global: bool,
+    /// カレントディレクトリの .claude/settings.json に書き込む
+    #[arg(long)]
+    project: bool,
+}
+
+#[derive(Args)]
 struct EqualizeArgs {
     /// 対象タブ ID（省略時は呼び出し元ペインの属するタブ）
     #[arg(long)]
@@ -497,6 +510,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Mcp(McpCommand::Serve) => mcp_serve(),
+        Command::SetupMcp(ref args) => setup_mcp_local(args),
         command => run(command),
     };
     match result {
@@ -563,6 +577,36 @@ fn mcp_serve() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// MCP セットアップ（アプリ未起動でも動作）。settings.json に tako MCP 設定を追加する
+fn setup_mcp_local(args: &SetupMcpArgs) -> Result<(), String> {
+    let tako_bin = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| tako_control::dispatch::resolve_tako_binary());
+    let settings_dir = if args.project {
+        std::env::current_dir()
+            .map_err(|e| format!("カレントディレクトリの取得に失敗: {e}"))?
+            .join(".claude")
+    } else {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(std::path::PathBuf::from)
+            .ok_or("ホームディレクトリが取得できない（$HOME 未設定）")?
+            .join(".claude")
+    };
+    let settings_path = settings_dir.join("settings.json");
+    match tako_control::dispatch::setup_mcp_settings(&tako_bin, &settings_path) {
+        Ok(result) => {
+            if result.already_existed {
+                eprintln!("既に設定されています: {}", settings_path.display());
+            } else {
+                eprintln!("設定を追加しました: {}", settings_path.display());
+            }
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn run(command: Command) -> Result<(), String> {
@@ -904,8 +948,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
             name: None,
             pane: None,
         },
-        // main() で mcp_serve() へ分岐済みのため論理的に到達不能
+        // main() で分岐済みのため論理的に到達不能
         Command::Mcp(_) => unreachable!("mcp serve は run() を通らない"),
+        Command::SetupMcp(_) => unreachable!("setup-mcp は run() を通らない"),
     })
 }
 

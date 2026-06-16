@@ -67,13 +67,46 @@ For development, plain `cargo run -p tako-app` works without bundling.
 ### Claude Code 連携 / Claude Code integration
 
 tako 内で Claude Code からペイン操作（分割・送信・読み取り等）を使うには、初回 1 回だけ
-MCP の stdio ブリッジを登録します（以後はどのプロジェクトでも設定ゼロ）:
+MCP サーバーの接続設定が必要です（以後はどのプロジェクトでも設定ゼロ）。
+
+**方法 1: コマンド一発（推奨） / One command (recommended)**
+
+```sh
+tako setup-mcp
+```
+
+`~/.claude/settings.json` に tako MCP サーバーの設定を自動追加します。
+プロジェクト単位で設定したい場合は `tako setup-mcp --project`（カレントディレクトリの `.claude/settings.json` に追加）。
+tako アプリが起動中なら、Claude Code に「tako の MCP を設定して」と頼んでも設定できます（MCP ツール `tako_setup_mcp`）。
+
+This adds the tako MCP server config to `~/.claude/settings.json` automatically.
+Use `--project` to write to the current directory's `.claude/settings.json` instead.
+If the tako app is running, you can also ask Claude Code "set up tako MCP" (via the `tako_setup_mcp` tool).
+
+**方法 2: 手動設定 / Manual setup**
+
+`~/.claude/settings.json`（または `.claude/settings.json`）に以下を追加:
+
+```json
+{
+  "mcpServers": {
+    "tako": {
+      "command": "/Applications/tako.app/Contents/MacOS/tako",
+      "args": ["mcp", "serve"]
+    }
+  }
+}
+```
+
+`command` のパスは tako CLI のインストール場所に合わせてください（`which tako` で確認可）。
+
+**方法 3: claude コマンド / Using claude CLI**
 
 ```sh
 claude mcp add --scope user tako -- /Applications/tako.app/Contents/MacOS/tako mcp serve
 ```
 
-Register the bundled stdio bridge once (`claude mcp add --scope user tako -- /Applications/tako.app/Contents/MacOS/tako mcp serve`); after that, pane-control tools are available with zero per-project setup. Outside tako the bridge exposes 0 tools and stays out of the way.
+Register the bundled stdio bridge with any of the methods above; after that, pane-control tools are available with zero per-project setup. Outside tako the bridge exposes 0 tools and stays out of the way.
 
 ## ライセンス / License
 

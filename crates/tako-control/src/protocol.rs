@@ -311,6 +311,13 @@ pub enum Request {
     ShelvedKill { pane: u64 },
     /// 環境の健全性診断。CLI の PATH / バージョン一致 / 外部ツールの有無等をチェックする
     CheckHealth,
+    /// Claude Code の settings.json に tako MCP サーバーの接続設定を追加する（FR-2.14）。
+    /// `scope` = "global"（`~/.claude/settings.json`、既定）/ "project"（ペインの cwd
+    /// 配下 `.claude/settings.json`）
+    SetupMcp {
+        scope: Option<String>,
+        pane: Option<u64>,
+    },
 }
 
 /// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。
