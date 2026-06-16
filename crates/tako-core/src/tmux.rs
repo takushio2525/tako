@@ -167,6 +167,26 @@ pub fn kill_window(socket: Option<&str>, session: &str, window: u32) -> Result<(
     .map(|_| ())
 }
 
+/// アクティブ window を切り替える（`session:index` 指定）
+pub fn select_window(socket: Option<&str>, session: &str, index: u32) -> Result<(), String> {
+    run_tmux(
+        socket,
+        &["select-window", "-t", &format!("={session}:{index}")],
+    )
+    .map(|_| ())
+}
+
+/// 特定 window のペイン内容をテキストとして取得する（ホバープレビュー用）。
+/// `-p` で標準出力へ、`-e` なし = ANSI 除去のプレーンテキスト
+pub fn capture_pane_text(socket: Option<&str>, session: &str, window: u32) -> Vec<String> {
+    run_tmux(
+        socket,
+        &["capture-pane", "-t", &format!("={session}:{window}"), "-p"],
+    )
+    .map(|output| output.lines().map(str::to_string).collect())
+    .unwrap_or_default()
+}
+
 /// tmux クライアント子プロセスの雛形。バイナリ解決（`tmux_bin`）と
 /// **UTF-8 ロケールの明示注入**を一手に引き受ける。
 ///
