@@ -7014,11 +7014,73 @@ impl TakoApp {
                         .into_any_element()
                 })
                 .collect(),
-            preview::PreviewContent::Video(_) => vec![div()
-                .p_2()
-                .text_color(hsla(theme.tab_inactive_foreground))
-                .child("動画プレビューは未実装です")
-                .into_any_element()],
+            preview::PreviewContent::Video(data) => {
+                let mut elements: Vec<gpui::AnyElement> = Vec::new();
+                if !data.thumbnail.is_empty() {
+                    let image = std::sync::Arc::new(gpui::Image::from_bytes(
+                        gpui::ImageFormat::Png,
+                        data.thumbnail.clone(),
+                    ));
+                    elements.push(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .p_2()
+                            .child(
+                                gpui::img(image)
+                                    .object_fit(gpui::ObjectFit::Contain)
+                                    .max_w_full()
+                                    .max_h(px(400.0)),
+                            )
+                            .into_any_element(),
+                    );
+                } else {
+                    elements.push(
+                        div()
+                            .p_2()
+                            .text_color(hsla(theme.ansi[3]))
+                            .child(SharedString::from(
+                                "ffmpeg が見つからないためサムネイルを生成できません",
+                            ))
+                            .into_any_element(),
+                    );
+                }
+                let mut info_lines = Vec::new();
+                if let Some((w, h)) = data.resolution {
+                    info_lines.push(format!("解像度: {w} x {h}"));
+                }
+                if let Some(dur) = data.duration {
+                    let mins = dur as u64 / 60;
+                    let secs = dur as u64 % 60;
+                    info_lines.push(format!("長さ: {mins}:{secs:02}"));
+                }
+                if let Some(codec) = &data.codec {
+                    info_lines.push(format!("コーデック: {codec}"));
+                }
+                let size_mb = data.file_size as f64 / 1_000_000.0;
+                if size_mb >= 1.0 {
+                    info_lines.push(format!("サイズ: {size_mb:.1} MB"));
+                } else {
+                    info_lines.push(format!("サイズ: {:.0} KB", data.file_size as f64 / 1_000.0));
+                }
+                elements.push(
+                    div()
+                        .p_2()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .text_size(px(13.0))
+                        .text_color(hsla_alpha(theme.foreground, 0.8))
+                        .children(
+                            info_lines.into_iter().map(|line| {
+                                div().child(SharedString::from(line)).into_any_element()
+                            }),
+                        )
+                        .into_any_element(),
+                );
+                elements
+            }
             preview::PreviewContent::Error(message) => vec![div()
                 .p_2()
                 .text_color(hsla(theme.ansi[1]))

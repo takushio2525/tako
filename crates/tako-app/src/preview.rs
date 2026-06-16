@@ -23,6 +23,7 @@ pub enum PreviewMode {
     Markdown,
     Image,
     Pdf,
+    Video,
 }
 
 impl PreviewMode {
@@ -32,6 +33,7 @@ impl PreviewMode {
             PreviewMode::Markdown => PreviewModeWire::Markdown,
             PreviewMode::Image => PreviewModeWire::Image,
             PreviewMode::Pdf => PreviewModeWire::Pdf,
+            PreviewMode::Video => PreviewModeWire::Video,
         }
     }
 
@@ -41,6 +43,7 @@ impl PreviewMode {
             PreviewModeWire::Markdown => PreviewMode::Markdown,
             PreviewModeWire::Image => PreviewMode::Image,
             PreviewModeWire::Pdf => PreviewMode::Pdf,
+            PreviewModeWire::Video => PreviewMode::Video,
         }
     }
 }
@@ -120,6 +123,21 @@ pub struct PdfData {
     pub total_pages: usize,
 }
 
+/// 動画のメタ情報 + サムネイル（ffmpeg で抽出）
+#[derive(Debug, Clone, PartialEq)]
+pub struct VideoData {
+    /// サムネイル画像（PNG バイト列。ffmpeg 未インストール時は空）
+    pub thumbnail: Vec<u8>,
+    /// 動画の長さ（秒。取得できなければ None）
+    pub duration: Option<f64>,
+    /// 解像度（幅 x 高さ。取得できなければ None）
+    pub resolution: Option<(u32, u32)>,
+    /// コーデック名（"h264" 等。取得できなければ None）
+    pub codec: Option<String>,
+    /// ファイルサイズ（バイト）
+    pub file_size: u64,
+}
+
 /// 読み込み済みのプレビュー内容
 #[derive(Debug, Clone, PartialEq)]
 pub enum PreviewContent {
@@ -127,6 +145,7 @@ pub enum PreviewContent {
     Markdown(Vec<MdBlock>),
     Image(ImageData),
     Pdf(PdfData),
+    Video(VideoData),
     /// 読めない・バイナリ等（正常系の劣化。ペインは開いたまま理由を表示する）
     Error(String),
 }
@@ -255,6 +274,124 @@ pub fn load_pdf(path: &Path, _page: usize) -> PreviewState {
             content: PreviewContent::Error("PDF プレビューは macOS のみ対応".into()),
             truncated: false,
         }
+    }
+}
+
+/// 動画ファイルの拡張子判定
+pub fn is_video_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some(ext) if matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "mp4" | "webm" | "mov" | "avi" | "mkv"
+        )
+    )
+}
+
+/// 動画ファイルのプレビュー読み込み（ffmpeg でサムネイル抽出 + メタ情報取得）
+pub fn load_video(path: &Path) -> PreviewState {
+    let file_size = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(e) => {
+            return PreviewState {
+                path: path.to_path_buf(),
+                mode: PreviewMode::Video,
+                content: PreviewContent::Error(format!("読み込めない: {e}")),
+                truncated: false,
+            };
+        }
+    };
+
+    // ffprobe でメタ情報を取得
+    let (duration, resolution, codec) = video_probe(path);
+
+    // ffmpeg でサムネイル抽出（10秒時点 or 先頭フレーム）
+    let thumbnail = video_thumbnail(path, duration);
+
+    PreviewState {
+        path: path.to_path_buf(),
+        mode: PreviewMode::Video,
+        content: PreviewContent::Video(VideoData {
+            thumbnail,
+            duration,
+            resolution,
+            codec,
+            file_size,
+        }),
+        truncated: false,
+    }
+}
+
+/// ffprobe で動画のメタ情報を取得する。ffprobe が無ければすべて None
+fn video_probe(path: &Path) -> (Option<f64>, Option<(u32, u32)>, Option<String>) {
+    let output = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+        ])
+        .arg(path)
+        .output();
+    let output = match output {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return (None, None, None),
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&output) {
+        Ok(v) => v,
+        Err(_) => return (None, None, None),
+    };
+
+    let duration = json["format"]["duration"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok());
+
+    let video_stream = json["streams"].as_array().and_then(|streams| {
+        streams
+            .iter()
+            .find(|s| s["codec_type"].as_str() == Some("video"))
+    });
+
+    let resolution = video_stream.and_then(|s| {
+        let w = s["width"].as_u64()? as u32;
+        let h = s["height"].as_u64()? as u32;
+        Some((w, h))
+    });
+
+    let codec = video_stream
+        .and_then(|s| s["codec_name"].as_str())
+        .map(|s| s.to_string());
+
+    (duration, resolution, codec)
+}
+
+/// ffmpeg でサムネイルを抽出する。seek 位置は 10 秒 or 動画の 10% or 先頭
+fn video_thumbnail(path: &Path, duration: Option<f64>) -> Vec<u8> {
+    let seek = match duration {
+        Some(d) if d > 10.0 => "10".to_string(),
+        Some(d) if d > 1.0 => format!("{:.1}", d * 0.1),
+        _ => "0".to_string(),
+    };
+    let output = std::process::Command::new("ffmpeg")
+        .args(["-ss", &seek, "-i"])
+        .arg(path)
+        .args([
+            "-frames:v",
+            "1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "-vf",
+            "scale='min(800,iw)':'min(600,ih)':force_original_aspect_ratio=decrease",
+            "-",
+        ])
+        .output();
+    match output {
+        Ok(o) if o.status.success() && !o.stdout.is_empty() => o.stdout,
+        _ => Vec::new(),
     }
 }
 
@@ -533,6 +670,7 @@ pub fn load(path: &Path, mode: PreviewMode) -> PreviewState {
     match mode {
         PreviewMode::Image => return load_image(path),
         PreviewMode::Pdf => return load_pdf(path, 0),
+        PreviewMode::Video => return load_video(path),
         _ => {}
     }
     let (text, truncated) = match read_text(path) {
@@ -549,7 +687,7 @@ pub fn load(path: &Path, mode: PreviewMode) -> PreviewState {
     let content = match mode {
         PreviewMode::Markdown => PreviewContent::Markdown(markdown_blocks(&text)),
         PreviewMode::Code => PreviewContent::Code(highlighter().highlight(path, &text)),
-        PreviewMode::Image | PreviewMode::Pdf => unreachable!(),
+        PreviewMode::Image | PreviewMode::Pdf | PreviewMode::Video => unreachable!(),
     };
     PreviewState {
         path: path.to_path_buf(),
@@ -568,6 +706,7 @@ pub fn load_fast(path: &Path, mode: PreviewMode) -> (PreviewState, Option<String
     match mode {
         PreviewMode::Image => return (load_image(path), None),
         PreviewMode::Pdf => return (load_pdf(path, 0), None),
+        PreviewMode::Video => return (load_video(path), None),
         _ => {}
     }
     let (text, truncated) = match read_text(path) {
@@ -590,7 +729,7 @@ pub fn load_fast(path: &Path, mode: PreviewMode) -> (PreviewState, Option<String
             let lines = text.lines().map(|l| vec![plain_span(l)]).collect();
             (PreviewContent::Code(lines), Some(text))
         }
-        PreviewMode::Image | PreviewMode::Pdf => unreachable!(),
+        PreviewMode::Image | PreviewMode::Pdf | PreviewMode::Video => unreachable!(),
     };
     (
         PreviewState {
@@ -1090,6 +1229,46 @@ mod tests {
         assert!(is_pdf_path(Path::new("/a/doc.pdf")));
         assert!(is_pdf_path(Path::new("/a/DOC.PDF")));
         assert!(!is_pdf_path(Path::new("/a/main.rs")));
+    }
+
+    #[test]
+    fn 動画ファイル判定() {
+        assert!(is_video_path(Path::new("/a/clip.mp4")));
+        assert!(is_video_path(Path::new("/a/CLIP.MP4")));
+        assert!(is_video_path(Path::new("/a/v.webm")));
+        assert!(is_video_path(Path::new("/a/v.mov")));
+        assert!(is_video_path(Path::new("/a/v.avi")));
+        assert!(is_video_path(Path::new("/a/v.mkv")));
+        assert!(!is_video_path(Path::new("/a/main.rs")));
+        assert!(!is_video_path(Path::new("/a/photo.png")));
+    }
+
+    #[test]
+    fn 不在動画ファイルはエラー() {
+        let state = load(Path::new("/tmp/no-such-video.mp4"), PreviewMode::Video);
+        assert_eq!(state.mode, PreviewMode::Video);
+        assert!(matches!(&state.content, PreviewContent::Error(_)));
+    }
+
+    #[test]
+    fn 存在する動画ファイルはvideoモードになる() {
+        let dir = std::env::temp_dir().join(format!("tako-preview-video-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // ダミーファイル（ffmpeg は動かないが file_size は取れる）
+        let path = dir.join("test.mp4");
+        std::fs::write(&path, b"dummy-video-content").unwrap();
+        let state = load(&path, PreviewMode::Video);
+        assert_eq!(state.mode, PreviewMode::Video);
+        match &state.content {
+            PreviewContent::Video(data) => {
+                assert_eq!(data.file_size, 19);
+                // ffmpeg/ffprobe が無い環境ではサムネイル空・メタ情報 None
+                // （テスト環境に ffmpeg がある場合はダミーなのでやはり空/None）
+            }
+            other => panic!("Video になる: {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
