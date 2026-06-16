@@ -24,10 +24,9 @@
    crates.io リリースは停滞しており、安定供給は期待できない。コミュニティフォーク
    gpui-ce（crates.io に 0.3.x あり、元 Zed 社員主導）が乗り換え先の保険。
    「ui/ に閉じ込める」方針がこのリスクの防波堤を兼ねる。
-4. **ライセンス互換性**: GPUI は Apache-2.0、alacritty_terminal は Apache-2.0 で、
-   tako の Apache-2.0 と互換。cmux（GPL-3.0）のコードは絶対に読まない（`concept.md` 参照）。
-   **zed リポ内の gpui 以外のクレート（terminal 等）は GPL 系のため同様にコードを読まない**
-   （gpui / gpui_platform 等 Apache-2.0 のものだけ参照可）。
+4. **ライセンス互換性**: GPUI は Apache-2.0、alacritty_terminal は Apache-2.0。
+   ただし GPUI の推移的依存に zlog/ztracing（GPL-3.0-or-later）が含まれるため、
+   tako 全体は GPL-3.0-or-later を採用。cmux のコードは引き続き絶対に読まない（`concept.md` 参照）。
 
 ### Phase 0 検証結果（2026-06-11、詳細は `poc/README.md`）
 

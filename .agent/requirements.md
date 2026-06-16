@@ -664,5 +664,5 @@ FR-2.7.6 は画像ペインを並べて実現する）。
 | NFR-3 | アイドル時メモリ（1 タブ 1 ペイン） | Electron 系より明確に軽いこと（目安 < 200MB） |
 | NFR-4 | 描画 | スクロール・大量出力で 60fps 維持 |
 | NFR-5 | 対応 OS | macOS（先行）、Windows（必須）。Linux は将来検討 |
-| NFR-6 | ライセンス | Apache-2.0。GPL コードの混入禁止（`concept.md` の cmux ルール参照） |
+| NFR-6 | ライセンス | GPL-3.0-or-later（依存クレート zlog/ztracing が GPL-3.0 のため）。cmux のコード参照は引き続き禁止（`concept.md` 参照） |
 | NFR-7 | 配布 | 単一バイナリ/アプリバンドル。ランタイム依存なし |

@@ -1,7 +1,7 @@
 # tako — エージェント向けガイド
 
 AI 駆動・エージェント集約監視に特化した OSS GUI ターミナル。
-iTerm2 + Zed の思想で Zed 級に高速・軽量。macOS 先行、Windows 対応必須。Apache-2.0。
+iTerm2 + Zed の思想で Zed 級に高速・軽量。macOS 先行、Windows 対応必須。GPL-3.0-or-later。
 
 > このリポジトリの AI 向け規約はここに集約してある。詳細仕様は `.agent/` を参照。
 > 人間向けの説明は `README.md` にある。
@@ -28,7 +28,7 @@ iTerm2 + Zed の思想で Zed 級に高速・軽量。macOS 先行、Windows 対
 tako/
 ├── AGENTS.md / CLAUDE.md   ← AI 向け規約（このファイル）
 ├── .agent/                 ← AI 向け詳細仕様（下記参照）
-├── README.md / LICENSE     ← 人間向け・Apache-2.0
+├── README.md / LICENSE     ← 人間向け・GPL-3.0-or-later
 ├── crates/
 │   ├── tako-core/          ← ドメインモデル（PaneTree / Workspace / TerminalSession、GPUI 非依存）
 │   ├── tako-control/       ← 制御プレーン（IPC + dispatch + MCP 実装済み。検知は Phase 4）

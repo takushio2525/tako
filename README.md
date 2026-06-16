@@ -77,4 +77,4 @@ Register the bundled stdio bridge once (`claude mcp add --scope user tako -- /Ap
 
 ## ライセンス / License
 
-[Apache-2.0](LICENSE)
+[GPL-3.0-or-later](LICENSE) — 依存クレート（zlog / ztracing、Zed リポ由来）が GPL-3.0 のため。

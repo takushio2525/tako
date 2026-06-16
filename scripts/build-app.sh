@@ -107,7 +107,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
-	<string>Apache-2.0</string>
+	<string>GPL-3.0-or-later</string>
 </dict>
 </plist>
 PLIST
