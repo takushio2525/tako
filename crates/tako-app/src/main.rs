@@ -484,6 +484,8 @@ struct TakoApp {
     video_ticker: bool,
     /// 動画フレームの描画キャッシュ（frame_gen で世代管理: 新フレーム準備完了まで前フレームを表示）
     video_frame_cache: HashMap<PaneId, (u64, std::sync::Arc<gpui::RenderImage>)>,
+    /// シークバー要素の実測 bounds（paint 時に canvas で記録）
+    video_seek_bar_bounds: HashMap<PaneId, Bounds<Pixels>>,
 }
 
 /// git パネルのデータスナップショット（FR-3.6 / FR-3.9）
@@ -931,6 +933,7 @@ impl TakoApp {
             video_players: HashMap::new(),
             video_ticker: false,
             video_frame_cache: HashMap::new(),
+            video_seek_bar_bounds: HashMap::new(),
         };
         if restored.is_empty() {
             let root_id = app.workspace.active_tab().tree().focused();
@@ -2173,6 +2176,7 @@ impl TakoApp {
                 self.previews.remove(&pane_id);
                 self.video_players.remove(&pane_id);
                 self.video_frame_cache.remove(&pane_id);
+                self.video_seek_bar_bounds.remove(&pane_id);
                 self.scroll_accum.remove(&pane_id);
                 self.scroll_ctls.remove(&pane_id);
                 self.drop_tmux_view_session(pane_id);
@@ -2198,6 +2202,7 @@ impl TakoApp {
                     self.previews.remove(&id);
                     self.video_players.remove(&id);
                     self.video_frame_cache.remove(&id);
+                    self.video_seek_bar_bounds.remove(&id);
                     self.scroll_accum.remove(&id);
                     self.scroll_ctls.remove(&id);
                     self.drop_tmux_view_session(id);
@@ -5344,7 +5349,7 @@ impl TakoApp {
     }
 
     /// シークバー上のクリック位置から再生位置を計算してシークする。
-    /// pane_text_areas のペイン bounds を使い、クリック x 座標→比率→秒数に変換
+    /// シークバー要素自体の bounds を使い、クリック x 座標→比率→秒数に変換
     fn video_seek_by_click(
         &mut self,
         pane_id: PaneId,
@@ -5352,12 +5357,8 @@ impl TakoApp {
         duration: f64,
         cx: &mut Context<Self>,
     ) {
-        let pane_bounds = self
-            .pane_text_areas
-            .iter()
-            .find(|(id, _)| *id == pane_id)
-            .map(|(_, b)| *b);
-        if let (Some(bounds), Some(player)) = (pane_bounds, self.video_players.get_mut(&pane_id)) {
+        let bar_bounds = self.video_seek_bar_bounds.get(&pane_id).copied();
+        if let (Some(bounds), Some(player)) = (bar_bounds, self.video_players.get_mut(&pane_id)) {
             let frac = ((f32::from(position.x) - f32::from(bounds.origin.x))
                 / f32::from(bounds.size.width))
             .clamp(0.0, 1.0);
@@ -7191,6 +7192,7 @@ impl TakoApp {
                             .child(
                                 div()
                                     .id(("video-seek", pane_id.as_u64()))
+                                    .relative()
                                     .flex_1()
                                     .h(px(6.0))
                                     .rounded(px(3.0))
@@ -7203,6 +7205,22 @@ impl TakoApp {
                                             .bg(hsla(theme.ansi[4]))
                                             .w(relative(progress_frac)),
                                     )
+                                    .child({
+                                        let entity = cx.entity().downgrade();
+                                        canvas(
+                                            |_, _, _| (),
+                                            move |bounds, _, _, cx| {
+                                                if let Some(e) = entity.upgrade() {
+                                                    e.update(cx, |app, _| {
+                                                        app.video_seek_bar_bounds
+                                                            .insert(pane_id, bounds);
+                                                    });
+                                                }
+                                            },
+                                        )
+                                        .absolute()
+                                        .size_full()
+                                    })
                                     .on_mouse_down(
                                         gpui::MouseButton::Left,
                                         cx.listener(
