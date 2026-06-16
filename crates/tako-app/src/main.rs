@@ -2373,36 +2373,15 @@ impl TakoApp {
     /// （`cell_at` の逆写像）。全角行は advance ≠ セル幅 × 2 のため、col × セル幅の
     /// 線形換算だと打ち進めるほど IME 候補ウィンドウ・未確定文字列が右へずれていく
     /// （2026-06-12 実機リグレッション (5) の根本原因）
-    fn pane_cursor_origin(&self, pane: PaneId, window: &mut Window) -> Option<Point<Pixels>> {
+    fn pane_cursor_origin(&self, pane: PaneId, _window: &mut Window) -> Option<Point<Pixels>> {
         let (_, area) = self.pane_text_areas.iter().find(|(id, _)| *id == pane)?;
         let cell = self.cell_size?;
         let screen = self.terminals.get(&pane)?.screen(&self.theme);
         let (col, row) = screen.cursor?;
-        let x = match screen.lines.get(row) {
-            Some(line) => {
-                // カーソル col に対応する文字（cell_cols は単調非減少）の描画位置
-                let char_ix = line
-                    .cell_cols
-                    .iter()
-                    .position(|&c| c >= col)
-                    .unwrap_or(line.cell_cols.len());
-                let byte_ix = line
-                    .text
-                    .char_indices()
-                    .nth(char_ix)
-                    .map(|(i, _)| i)
-                    .unwrap_or(line.text.len());
-                let shaped = window.text_system().shape_line(
-                    SharedString::from(line.text.clone()),
-                    px(self.theme.font_size),
-                    &[self.mono_text_run(line.text.len())],
-                    None,
-                );
-                f32::from(shaped.x_for_index(byte_ix))
-            }
-            // スナップショット外（起動直後等）は等幅前提の線形換算へフォールバック
-            None => f32::from(cell.width) * col as f32,
-        };
+        // ターミナルはセルグリッドなので x = col * cell_width が正。
+        // 旧実装は shape_line().x_for_index() でフォント advance から求めていたが、
+        // 全角文字の advance ≠ 2*cell_width でカーソルがずれる原因だった
+        let x = f32::from(cell.width) * col as f32;
         Some(point(
             area.origin.x + px(x),
             area.origin.y + cell.height * row as f32,
@@ -2444,7 +2423,7 @@ impl TakoApp {
         &self,
         pane_id: PaneId,
         position: Point<Pixels>,
-        window: &mut Window,
+        _window: &mut Window,
     ) -> Option<(usize, usize, bool)> {
         let (_, area) = self.pane_text_areas.iter().find(|(id, _)| *id == pane_id)?;
         let cell = self.cell_size?;
@@ -2454,38 +2433,14 @@ impl TakoApp {
         let y = (f32::from(local.y) / f32::from(cell.height)).max(0.0);
         let row = (y as usize).min(rows.saturating_sub(1));
         let local_x = f32::from(local.x).max(0.0);
+        let cw = f32::from(cell.width);
 
-        let screen = session.screen(&self.theme);
-        let Some(line) = screen.lines.get(row) else {
-            // スナップショット外（起動直後等）は等幅前提の線形換算へフォールバック
-            let col = ((local_x / f32::from(cell.width)) as usize).min(cols.saturating_sub(1));
-            return Some((col, row, false));
-        };
-        let shaped = window.text_system().shape_line(
-            SharedString::from(line.text.clone()),
-            px(self.theme.font_size),
-            &[self.mono_text_run(line.text.len())],
-            None,
-        );
-        let byte_ix = shaped.closest_index_for_x(px(local_x));
-        let char_ix = line.text[..byte_ix].chars().count();
-        let col = line
-            .cell_cols
-            .get(char_ix)
-            .copied()
-            // 行テキスト末尾より右は線形換算（テキストは全列を埋めるため通常は来ない）
-            .unwrap_or((local_x / f32::from(cell.width)) as usize)
-            .min(cols.saturating_sub(1));
-        // セル内の左右判定も描画上の文字幅で行う
-        let char_start = f32::from(shaped.x_for_index(byte_ix));
-        let next_ix = line.text[byte_ix..]
-            .chars()
-            .next()
-            .map(|c| byte_ix + c.len_utf8())
-            .unwrap_or(byte_ix);
-        let char_end = f32::from(shaped.x_for_index(next_ix));
-        let side_right =
-            char_end > char_start && (local_x - char_start) / (char_end - char_start) > 0.5;
+        // ターミナルはセルグリッドなので x / cell_width で列が決まる。
+        // 旧実装は shape_line で文字位置を求めていたが、全角文字の advance ≠ 2*cell_width
+        // で描画位置とクリック判定がずれる原因だった
+        let col = ((local_x / cw) as usize).min(cols.saturating_sub(1));
+        let cell_x = col as f32 * cw;
+        let side_right = (local_x - cell_x) / cw > 0.5;
         Some((col, row, side_right))
     }
 
@@ -6547,46 +6502,79 @@ impl TakoApp {
                             .with_default_highlights(&default_style, highlights),
                     );
                 }
-                // 全角文字を含む行: ランごとにグリッド列数ベースの固定幅 div で配置
+                // 全角文字を含む行: 1 文字ずつグリッド位置にスナップ。
+                // 全角文字はフォント advance ≠ 2*cell_width になり得るため
+                // 1 文字 = 1 div で吸収。半角の連続は同一 run 内でグループ化
                 let cw = cell_width.unwrap();
-                let char_byte_offsets: Vec<usize> =
-                    line.text.char_indices().map(|(i, _)| i).collect();
+                let chars: Vec<(usize, char)> = line.text.char_indices().collect();
                 let row = div()
                     .h(px(theme.line_height))
                     .flex()
                     .flex_row()
                     .overflow_hidden();
-                let mut children: Vec<gpui::AnyElement> = Vec::with_capacity(line.runs.len());
-                for run in &line.runs {
-                    let run_text: String = line.text[run.range.clone()].to_string();
-                    // ラン先頭・末尾の文字インデックスを求める
-                    let first_char_ix = char_byte_offsets
+                let mut children: Vec<gpui::AnyElement> = Vec::with_capacity(chars.len());
+                let mut ci = 0;
+                while ci < chars.len() {
+                    let (byte_off, _) = chars[ci];
+                    let run = line
+                        .runs
                         .iter()
-                        .position(|&b| b >= run.range.start)
-                        .unwrap_or(0);
-                    let end_char_ix = char_byte_offsets
-                        .iter()
-                        .position(|&b| b >= run.range.end)
-                        .unwrap_or(line.cell_cols.len());
-                    // ランが占めるグリッド列数
-                    let start_col = line.cell_cols.get(first_char_ix).copied().unwrap_or(0);
-                    let end_col = line
-                        .cell_cols
-                        .get(end_char_ix)
-                        .copied()
-                        .unwrap_or(total_cols);
-                    let grid_cols = end_col.saturating_sub(start_col).max(1);
-                    let hl = self.run_highlight(run);
-                    let styled = StyledText::new(run_text)
-                        .with_default_highlights(&default_style, vec![(0..run.range.len(), hl)]);
-                    children.push(
-                        div()
-                            .w(cw * grid_cols as f32)
-                            .flex_none()
-                            .overflow_hidden()
-                            .child(styled)
-                            .into_any_element(),
-                    );
+                        .find(|r| byte_off >= r.range.start && byte_off < r.range.end)
+                        .unwrap_or(line.runs.last().unwrap());
+                    let char_cols = if ci + 1 < line.cell_cols.len() {
+                        line.cell_cols[ci + 1] - line.cell_cols[ci]
+                    } else {
+                        total_cols.saturating_sub(line.cell_cols[ci]).max(1)
+                    };
+                    if char_cols > 1 {
+                        // 全角: 1 文字 = 1 div（advance ずれを吸収）
+                        let s: String = chars[ci].1.to_string();
+                        let hl = self.run_highlight(run);
+                        let styled = StyledText::new(SharedString::from(s.clone()))
+                            .with_default_highlights(&default_style, vec![(0..s.len(), hl)]);
+                        let mut d = div().w(cw * char_cols as f32).flex_none().overflow_hidden();
+                        if let Some(bg) = run.bg {
+                            d = d.bg(hsla(bg));
+                        }
+                        children.push(d.child(styled).into_any_element());
+                        ci += 1;
+                    } else {
+                        // 半角: 同一 run 内の連続半角をまとめて 1 div
+                        let start = ci;
+                        let run_end = run.range.end;
+                        while ci < chars.len() {
+                            let (bo, _) = chars[ci];
+                            if bo >= run_end {
+                                break;
+                            }
+                            let w = if ci + 1 < line.cell_cols.len() {
+                                line.cell_cols[ci + 1] - line.cell_cols[ci]
+                            } else {
+                                total_cols.saturating_sub(line.cell_cols[ci]).max(1)
+                            };
+                            if w > 1 {
+                                break;
+                            }
+                            ci += 1;
+                        }
+                        let seg: String = chars[start..ci].iter().map(|(_, c)| *c).collect();
+                        let grid_w = if ci < line.cell_cols.len() {
+                            line.cell_cols[ci] - line.cell_cols[start]
+                        } else {
+                            total_cols.saturating_sub(line.cell_cols[start]).max(1)
+                        };
+                        let hl = self.run_highlight(run);
+                        let styled = StyledText::new(SharedString::from(seg.clone()))
+                            .with_default_highlights(&default_style, vec![(0..seg.len(), hl)]);
+                        children.push(
+                            div()
+                                .w(cw * grid_w as f32)
+                                .flex_none()
+                                .overflow_hidden()
+                                .child(styled)
+                                .into_any_element(),
+                        );
+                    }
                 }
                 row.children(children)
             })
