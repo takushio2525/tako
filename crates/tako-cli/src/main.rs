@@ -105,6 +105,9 @@ enum Command {
     /// Claude Code の settings.json に tako MCP サーバーの接続設定を追加する。
     /// アプリ未起動でも実行できる（settings.json の書き換えのみ）
     SetupMcp(SetupMcpArgs),
+    /// 動画操作（play / pause / seek。プレビューペインが動画モードの場合のみ有効）
+    #[command(subcommand)]
+    Video(VideoCommand),
 }
 
 #[derive(Subcommand)]
@@ -219,6 +222,32 @@ enum FileCommand {
     Mkdir { path: String, name: String },
     /// ファイル・フォルダをゴミ箱へ移動する
     Trash { path: String },
+}
+
+#[derive(Subcommand)]
+enum VideoCommand {
+    /// 動画の再生を開始する
+    Play {
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// 動画の一時停止
+    Pause {
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// 動画の再生/一時停止トグル
+    Toggle {
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// 動画のシーク（秒単位）
+    Seek {
+        /// シーク先の秒数
+        seconds: f64,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -362,7 +391,7 @@ struct OpenArgs {
     #[arg(long)]
     pane: Option<u64>,
     /// 表示モード（省略時は拡張子から自動判定。md = markdown の別名）
-    #[arg(long, value_parser = ["code", "markdown", "md"])]
+    #[arg(long, value_parser = ["code", "markdown", "md", "image", "pdf", "video"])]
     mode: Option<String>,
     /// 既存プレビューを再利用せず右に分割して開く（FR-3.11 = D&D のドロップ位置相当）
     #[arg(long, conflicts_with_all = ["down", "up", "left"])]
@@ -743,6 +772,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 mode: match args.mode.as_deref() {
                     None => None,
                     Some("code") => Some(tako_control::protocol::PreviewModeWire::Code),
+                    Some("image") => Some(tako_control::protocol::PreviewModeWire::Image),
+                    Some("pdf") => Some(tako_control::protocol::PreviewModeWire::Pdf),
+                    Some("video") => Some(tako_control::protocol::PreviewModeWire::Video),
                     Some(_) => Some(tako_control::protocol::PreviewModeWire::Markdown),
                 },
                 // 方向指定なし = 既存プレビュー再利用の従来セマンティクス
@@ -950,6 +982,22 @@ fn build_request(command: &Command) -> Result<Request, String> {
             name: None,
             pane: None,
         },
+        Command::Video(VideoCommand::Play { pane }) => Request::VideoPlayback {
+            pane: target_pane(*pane)?,
+            action: "play".into(),
+        },
+        Command::Video(VideoCommand::Pause { pane }) => Request::VideoPlayback {
+            pane: target_pane(*pane)?,
+            action: "pause".into(),
+        },
+        Command::Video(VideoCommand::Toggle { pane }) => Request::VideoPlayback {
+            pane: target_pane(*pane)?,
+            action: "toggle".into(),
+        },
+        Command::Video(VideoCommand::Seek { seconds, pane }) => Request::VideoSeek {
+            pane: target_pane(*pane)?,
+            seconds: *seconds,
+        },
         // main() で分岐済みのため論理的に到達不能
         Command::Mcp(_) => unreachable!("mcp serve は run() を通らない"),
         Command::SetupMcp(_) => unreachable!("setup-mcp は run() を通らない"),
@@ -1078,6 +1126,7 @@ fn print_result(command: &Command, result: &Value) {
             }
         }
         Command::File(_) => println!("{result}"),
+        Command::Video(_) => println!("{result}"),
         Command::BackgroundList => {
             println!(
                 "{}",

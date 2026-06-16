@@ -326,6 +326,39 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_video_playback",
+            "description": "動画プレビューペインの再生/一時停止を操作する。\
+                対象ペインが動画プレビュー（tako open で .mp4/.mov 等を開いた状態）の場合のみ有効。\
+                action に play / pause / toggle を指定する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン ID（省略時は呼び出し元）"),
+                    "action": {
+                        "type": "string",
+                        "enum": ["play", "pause", "toggle"],
+                        "description": "再生操作（play=再生、pause=一時停止、toggle=切替）",
+                    },
+                },
+                "required": ["action"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_video_seek",
+            "description": "動画プレビューペインのシーク位置を指定する（秒単位の絶対位置）。\
+                対象ペインが動画プレビューの場合のみ有効。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン ID（省略時は呼び出し元）"),
+                    "seconds": { "type": "number", "minimum": 0, "description": "シーク先の秒数（絶対位置）" },
+                },
+                "required": ["seconds"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_focus_pane",
             "description": "ペインへフォーカスを移す。pane（ID 指定。別タブならタブも切り替わる）か\
                 direction（アクティブタブ内の隣接移動）のどちらか一方を指定する。\
@@ -977,6 +1010,14 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             scope: str_arg(args, "scope")?,
             pane: u64_arg(args, "pane")?.or(caller),
         },
+        "tako_video_playback" => Request::VideoPlayback {
+            pane: Some(target_pane(args, caller)?),
+            action: str_arg(args, "action")?.ok_or("action を指定する")?,
+        },
+        "tako_video_seek" => Request::VideoSeek {
+            pane: Some(target_pane(args, caller)?),
+            seconds: f64_arg(args, "seconds")?.ok_or("seconds を指定する")?,
+        },
         _ => return Err(format!("不明なツール: {name}")),
     })
 }
@@ -1020,6 +1061,16 @@ fn f32_arg(args: &Value, key: &str) -> Result<Option<f32>, String> {
         Some(v) => v
             .as_f64()
             .map(|f| Some(f as f32))
+            .ok_or_else(|| format!("{key} は数値で指定する")),
+    }
+}
+
+fn f64_arg(args: &Value, key: &str) -> Result<Option<f64>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_f64()
+            .map(Some)
             .ok_or_else(|| format!("{key} は数値で指定する")),
     }
 }
@@ -1392,7 +1443,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 35);
+        assert_eq!(tools.len(), 37);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

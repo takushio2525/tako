@@ -128,6 +128,15 @@ pub trait ControlHost {
     fn set_pin_pane(&mut self, _pane: PaneId, _pinned: Option<bool>) {}
     /// 閉じたタブグループのプレビューをピン留め / 解除する（FR-2.16.15 / FR-2.16.16）
     fn set_pin_group(&mut self, _tab: TabId, _pinned: Option<bool>) {}
+    /// 動画プレイヤーの操作（"play" / "pause" / "toggle"）。プレビューペインが Video
+    /// モードの場合のみ有効。戻り値は現在の state（"playing" / "paused"）
+    fn video_playback(&mut self, _pane: PaneId, _action: &str) -> Result<String, String> {
+        Err("動画再生は未対応".into())
+    }
+    /// 動画のシーク（秒）。戻り値は実際のシーク先の秒数
+    fn video_seek(&mut self, _pane: PaneId, _seconds: f64) -> Result<f64, String> {
+        Err("動画再生は未対応".into())
+    }
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -1227,6 +1236,32 @@ pub fn dispatch(
                 "settings_path": settings_dir.join("settings.json").display().to_string(),
                 "command": tako_bin,
             }))
+        }
+
+        Request::VideoPlayback { pane, action } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            if host.preview_state(target).map(|(_, m)| m) != Some(PreviewModeWire::Video) {
+                return Err(DispatchError::Operation(
+                    "対象ペインは動画プレビューではない".into(),
+                ));
+            }
+            let state = host
+                .video_playback(target, &action)
+                .map_err(DispatchError::Operation)?;
+            Ok(json!({ "pane": target.as_u64(), "state": state }))
+        }
+
+        Request::VideoSeek { pane, seconds } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            if host.preview_state(target).map(|(_, m)| m) != Some(PreviewModeWire::Video) {
+                return Err(DispatchError::Operation(
+                    "対象ペインは動画プレビューではない".into(),
+                ));
+            }
+            let actual = host
+                .video_seek(target, seconds)
+                .map_err(DispatchError::Operation)?;
+            Ok(json!({ "pane": target.as_u64(), "seconds": actual }))
         }
     }
 }

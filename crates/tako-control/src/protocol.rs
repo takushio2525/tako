@@ -320,6 +320,11 @@ pub enum Request {
         scope: Option<String>,
         pane: Option<u64>,
     },
+    /// 動画の再生/一時停止（プレビューペインが Video モードの場合のみ有効）。
+    /// `action` = "play" / "pause" / "toggle"。`pane` 省略時は呼び出し元ペイン
+    VideoPlayback { pane: Option<u64>, action: String },
+    /// 動画のシーク。`seconds` は絶対位置（秒）。`pane` 省略時は呼び出し元ペイン
+    VideoSeek { pane: Option<u64>, seconds: f64 },
 }
 
 /// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。

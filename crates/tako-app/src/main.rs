@@ -16,6 +16,7 @@
 mod autorename;
 mod filetree;
 mod preview;
+mod video_player;
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -477,6 +478,10 @@ struct TakoApp {
     pinned_previews: Vec<PinnedPreview>,
     /// ドラッグ移動中のピン（対象 + 掴んだ位置からピン左上までのオフセット px）
     dragging_pin: Option<(PreviewTarget, Point<Pixels>)>,
+    /// AVFoundation 動画プレイヤー（ペインごと。Video プレビューで「再生」した時に生成）
+    video_players: HashMap<PaneId, video_player::VideoPlayer>,
+    /// 動画フレーム更新ティッカーの稼働中フラグ（再生中ペインがある間だけ回す）
+    video_ticker: bool,
 }
 
 /// git パネルのデータスナップショット（FR-3.6 / FR-3.9）
@@ -921,6 +926,8 @@ impl TakoApp {
             hover_preview: None,
             pinned_previews: Vec::new(),
             dragging_pin: None,
+            video_players: HashMap::new(),
+            video_ticker: false,
         };
         if restored.is_empty() {
             let root_id = app.workspace.active_tab().tree().focused();
@@ -948,6 +955,7 @@ impl TakoApp {
                         "markdown" => preview::PreviewMode::Markdown,
                         "image" => preview::PreviewMode::Image,
                         "pdf" => preview::PreviewMode::Pdf,
+                        "video" => preview::PreviewMode::Video,
                         _ => preview::PreviewMode::Code,
                     };
                     let path = std::path::Path::new(&p.path);
@@ -2160,6 +2168,7 @@ impl TakoApp {
             Ok(_) => {
                 self.terminals.remove(&pane_id);
                 self.previews.remove(&pane_id);
+                self.video_players.remove(&pane_id);
                 self.scroll_accum.remove(&pane_id);
                 self.scroll_ctls.remove(&pane_id);
                 self.drop_tmux_view_session(pane_id);
@@ -2183,6 +2192,7 @@ impl TakoApp {
                 for id in pane_ids {
                     self.terminals.remove(&id);
                     self.previews.remove(&id);
+                    self.video_players.remove(&id);
                     self.scroll_accum.remove(&id);
                     self.scroll_ctls.remove(&id);
                     self.drop_tmux_view_session(id);
@@ -5267,6 +5277,89 @@ impl TakoApp {
         }
     }
 
+    /// 動画プレイヤーを起動し、再生を開始する
+    fn start_video_player(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        if self.video_players.contains_key(&pane_id) {
+            return;
+        }
+        let path = match self.previews.get(&pane_id) {
+            Some(state) => state.path.clone(),
+            None => return,
+        };
+        match video_player::VideoPlayer::open(&path) {
+            Ok(mut player) => {
+                player.play();
+                self.video_players.insert(pane_id, player);
+                self.ensure_video_ticker(cx);
+                cx.notify();
+            }
+            Err(e) => {
+                eprintln!("動画プレイヤー起動失敗: {e}");
+            }
+        }
+    }
+
+    /// 再生中の動画フレームを定期取得するティッカー（~30fps）。
+    /// 再生中プレイヤーが無くなったら自動停止する
+    fn ensure_video_ticker(&mut self, cx: &mut Context<Self>) {
+        if self.video_ticker {
+            return;
+        }
+        self.video_ticker = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(33))
+                    .await;
+                let live = this
+                    .update(cx, |app, cx| {
+                        let mut any_playing = false;
+                        for player in app.video_players.values_mut() {
+                            if player.state == video_player::PlaybackState::Playing {
+                                player.grab_frame();
+                                any_playing = true;
+                            }
+                        }
+                        if any_playing {
+                            cx.notify();
+                        }
+                        any_playing
+                    })
+                    .unwrap_or(false);
+                if !live {
+                    break;
+                }
+            }
+            this.update(cx, |app, _| app.video_ticker = false).ok();
+        })
+        .detach();
+    }
+
+    /// シークバー上のクリック位置から再生位置を計算してシークする。
+    /// pane_text_areas のペイン bounds を使い、クリック x 座標→比率→秒数に変換
+    fn video_seek_by_click(
+        &mut self,
+        pane_id: PaneId,
+        position: gpui::Point<Pixels>,
+        duration: f64,
+        cx: &mut Context<Self>,
+    ) {
+        let pane_bounds = self
+            .pane_text_areas
+            .iter()
+            .find(|(id, _)| *id == pane_id)
+            .map(|(_, b)| *b);
+        if let (Some(bounds), Some(player)) = (pane_bounds, self.video_players.get_mut(&pane_id)) {
+            let frac = ((f32::from(position.x) - f32::from(bounds.origin.x))
+                / f32::from(bounds.size.width))
+            .clamp(0.0, 1.0);
+            let new_time = frac as f64 * duration;
+            player.seek(new_time);
+            player.grab_frame();
+            cx.notify();
+        }
+    }
+
     /// スクロールバーのフェード再描画と copy-mode 状態の追従。
     /// 対象エントリが尽きたら自動停止する
     fn ensure_scroll_ticker(&mut self, cx: &mut Context<Self>) {
@@ -7003,70 +7096,196 @@ impl TakoApp {
                 })
                 .collect(),
             preview::PreviewContent::Video(data) => {
+                let has_player = self.video_players.contains_key(&pane_id);
                 let mut elements: Vec<gpui::AnyElement> = Vec::new();
-                if !data.thumbnail.is_empty() {
-                    let image = std::sync::Arc::new(gpui::Image::from_bytes(
-                        gpui::ImageFormat::Png,
-                        data.thumbnail.clone(),
-                    ));
+
+                if has_player {
+                    // AVFoundation プレイヤー起動中: デコード済みフレームを表示
+                    let player = self.video_players.get(&pane_id).unwrap();
+                    if !player.current_frame.is_empty() {
+                        let frame_image = std::sync::Arc::new(gpui::Image::from_bytes(
+                            gpui::ImageFormat::Png,
+                            player.current_frame.clone(),
+                        ));
+                        elements.push(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    gpui::img(frame_image)
+                                        .object_fit(gpui::ObjectFit::Contain)
+                                        .max_w_full()
+                                        .flex_1(),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                    let is_playing = player.state == video_player::PlaybackState::Playing;
+                    let current_time = player.current_time;
+                    let duration = player.duration;
+
+                    // コントロールバー: 再生/一時停止 + シークバー + 時間表示
+                    let play_btn_label: SharedString = if is_playing {
+                        "\u{23f8}".into() // ⏸
+                    } else {
+                        "\u{25b6}\u{fe0e}".into() // ▶︎
+                    };
+                    let cur_m = current_time as u64 / 60;
+                    let cur_s = current_time as u64 % 60;
+                    let dur_m = duration as u64 / 60;
+                    let dur_s = duration as u64 % 60;
+                    let time_label: SharedString =
+                        format!("{cur_m}:{cur_s:02} / {dur_m}:{dur_s:02}").into();
+                    let progress_frac = if duration > 0.0 {
+                        (current_time / duration).clamp(0.0, 1.0) as f32
+                    } else {
+                        0.0
+                    };
+                    let seek_dur = duration;
                     elements.push(
                         div()
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .p_2()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .bg(hsla_alpha(theme.background, 0.9))
                             .child(
-                                gpui::img(image)
-                                    .object_fit(gpui::ObjectFit::Contain)
-                                    .max_w_full()
-                                    .max_h(px(400.0)),
+                                div()
+                                    .id(("video-toggle", pane_id.as_u64()))
+                                    .cursor_pointer()
+                                    .text_size(px(18.0))
+                                    .child(play_btn_label)
+                                    .on_click(cx.listener(
+                                        move |this, _ev: &gpui::ClickEvent, _, cx| {
+                                            if let Some(p) = this.video_players.get_mut(&pane_id) {
+                                                p.toggle();
+                                                this.ensure_video_ticker(cx);
+                                                cx.notify();
+                                            }
+                                        },
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id(("video-seek", pane_id.as_u64()))
+                                    .flex_1()
+                                    .h(px(6.0))
+                                    .rounded(px(3.0))
+                                    .bg(hsla_alpha(theme.foreground, 0.2))
+                                    .cursor_pointer()
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .rounded(px(3.0))
+                                            .bg(hsla(theme.ansi[4]))
+                                            .w(relative(progress_frac)),
+                                    )
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(
+                                            move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                                this.video_seek_by_click(
+                                                    pane_id,
+                                                    ev.position,
+                                                    seek_dur,
+                                                    cx,
+                                                );
+                                            },
+                                        ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(hsla_alpha(theme.foreground, 0.7))
+                                    .child(time_label),
                             )
                             .into_any_element(),
                     );
                 } else {
+                    // プレイヤー未起動: ffmpeg サムネイル + 再生ボタン + メタ情報
+                    if !data.thumbnail.is_empty() {
+                        let image = std::sync::Arc::new(gpui::Image::from_bytes(
+                            gpui::ImageFormat::Png,
+                            data.thumbnail.clone(),
+                        ));
+                        elements.push(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .relative()
+                                .p_2()
+                                .child(
+                                    gpui::img(image)
+                                        .object_fit(gpui::ObjectFit::Contain)
+                                        .max_w_full()
+                                        .max_h(px(400.0)),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                    // 再生ボタン
+                    elements.push(
+                        div()
+                            .flex()
+                            .justify_center()
+                            .p_2()
+                            .child(
+                                div()
+                                    .id(("video-play", pane_id.as_u64()))
+                                    .cursor_pointer()
+                                    .px_4()
+                                    .py_1()
+                                    .rounded(px(6.0))
+                                    .bg(hsla(theme.ansi[4]))
+                                    .text_color(hsla(theme.background))
+                                    .text_size(px(14.0))
+                                    .child(SharedString::from("\u{25b6}\u{fe0e} 再生"))
+                                    .on_click(cx.listener(
+                                        move |this, _ev: &gpui::ClickEvent, _, cx| {
+                                            this.start_video_player(pane_id, cx);
+                                        },
+                                    )),
+                            )
+                            .into_any_element(),
+                    );
+                    // メタ情報
+                    let mut info_lines = Vec::new();
+                    if let Some((w, h)) = data.resolution {
+                        info_lines.push(format!("解像度: {w} x {h}"));
+                    }
+                    if let Some(dur) = data.duration {
+                        let mins = dur as u64 / 60;
+                        let secs = dur as u64 % 60;
+                        info_lines.push(format!("長さ: {mins}:{secs:02}"));
+                    }
+                    if let Some(codec) = &data.codec {
+                        info_lines.push(format!("コーデック: {codec}"));
+                    }
+                    let size_mb = data.file_size as f64 / 1_000_000.0;
+                    if size_mb >= 1.0 {
+                        info_lines.push(format!("サイズ: {size_mb:.1} MB"));
+                    } else {
+                        info_lines
+                            .push(format!("サイズ: {:.0} KB", data.file_size as f64 / 1_000.0));
+                    }
                     elements.push(
                         div()
                             .p_2()
-                            .text_color(hsla(theme.ansi[3]))
-                            .child(SharedString::from(
-                                "ffmpeg が見つからないためサムネイルを生成できません",
-                            ))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .text_size(px(13.0))
+                            .text_color(hsla_alpha(theme.foreground, 0.8))
+                            .children(info_lines.into_iter().map(|line| {
+                                div().child(SharedString::from(line)).into_any_element()
+                            }))
                             .into_any_element(),
                     );
                 }
-                let mut info_lines = Vec::new();
-                if let Some((w, h)) = data.resolution {
-                    info_lines.push(format!("解像度: {w} x {h}"));
-                }
-                if let Some(dur) = data.duration {
-                    let mins = dur as u64 / 60;
-                    let secs = dur as u64 % 60;
-                    info_lines.push(format!("長さ: {mins}:{secs:02}"));
-                }
-                if let Some(codec) = &data.codec {
-                    info_lines.push(format!("コーデック: {codec}"));
-                }
-                let size_mb = data.file_size as f64 / 1_000_000.0;
-                if size_mb >= 1.0 {
-                    info_lines.push(format!("サイズ: {size_mb:.1} MB"));
-                } else {
-                    info_lines.push(format!("サイズ: {:.0} KB", data.file_size as f64 / 1_000.0));
-                }
-                elements.push(
-                    div()
-                        .p_2()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .text_size(px(13.0))
-                        .text_color(hsla_alpha(theme.foreground, 0.8))
-                        .children(
-                            info_lines.into_iter().map(|line| {
-                                div().child(SharedString::from(line)).into_any_element()
-                            }),
-                        )
-                        .into_any_element(),
-                );
                 elements
             }
             preview::PreviewContent::Error(message) => vec![div()
@@ -7660,6 +7879,33 @@ impl ControlHost for TakoApp {
         self.previews
             .get(&pane)
             .map(|p| (p.path.display().to_string(), p.mode.to_wire()))
+    }
+
+    fn video_playback(&mut self, pane: PaneId, action: &str) -> Result<String, String> {
+        let player = self
+            .video_players
+            .get_mut(&pane)
+            .ok_or_else(|| "動画プレイヤーが起動していない".to_string())?;
+        match action {
+            "play" => player.play(),
+            "pause" => player.pause(),
+            "toggle" => player.toggle(),
+            _ => return Err(format!("不明なアクション: {action}")),
+        }
+        let state_str = match player.state {
+            video_player::PlaybackState::Playing => "playing",
+            video_player::PlaybackState::Paused => "paused",
+        };
+        Ok(state_str.to_string())
+    }
+
+    fn video_seek(&mut self, pane: PaneId, seconds: f64) -> Result<f64, String> {
+        let player = self
+            .video_players
+            .get_mut(&pane)
+            .ok_or_else(|| "動画プレイヤーが起動していない".to_string())?;
+        player.seek(seconds);
+        Ok(player.current_time)
     }
 
     fn set_preview(
@@ -9342,7 +9588,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 35, "MCP tools/list は 35 ツール");
+            check(status == 200 && tool_count == 37, "MCP tools/list は 37 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)

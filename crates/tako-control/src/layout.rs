@@ -108,7 +108,7 @@ pub struct PaneLayout {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreviewLayout {
     pub path: String,
-    /// "code" | "markdown"
+    /// "code" | "markdown" | "image" | "pdf" | "video"
     pub mode: String,
 }
 
