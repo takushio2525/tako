@@ -1398,11 +1398,12 @@ fn dispatch_orchestrator_spawn(
     cmd_bytes.push(b'\r');
     host.queue_write(new_id, cmd_bytes);
 
-    // タイトル設定
+    // タイトルと role 設定
     let pane_obj = tree_mut(host.workspace_mut(), tab)
         .get_mut(new_id)
         .expect("直前に split で追加済み");
     pane_obj.set_title(Some(window_title.clone()));
+    pane_obj.set_role(Some(format!("orchestrator-worker:{project}")));
 
     // prompt と session_id 取得はペインに claude が起動するまで時間がかかるため、
     // 呼び出し側（CLI の master コマンドやオーケストレーター）に返して

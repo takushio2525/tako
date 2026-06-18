@@ -6078,6 +6078,44 @@ impl TakoApp {
                         "⏏ BG".into()
                     })
             })
+            .children({
+                let focused = self.workspace.active_tab().tree().focused();
+                let focused_role = self
+                    .workspace
+                    .active_tab()
+                    .tree()
+                    .get(focused)
+                    .and_then(|p| p.role())
+                    .unwrap_or("");
+                let label = if focused_role == "orchestrator-master" {
+                    let worker_count: usize = self
+                        .workspace
+                        .tabs()
+                        .iter()
+                        .flat_map(|tab| tab.tree().panes())
+                        .filter(|p| {
+                            p.role()
+                                .is_some_and(|r| r.starts_with("orchestrator-worker:"))
+                        })
+                        .count();
+                    Some(format!("\u{1F419} master \u{00B7} workers: {worker_count}"))
+                } else {
+                    focused_role
+                        .strip_prefix("orchestrator-worker:")
+                        .map(|project| format!("\u{1F419} worker: {project}"))
+                };
+                label.map(|text| {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .h_full()
+                        .px_2()
+                        .text_size(px(11.0))
+                        .text_color(hsla(theme.tab_active_foreground))
+                        .child(text)
+                })
+            })
             .child(div().flex_grow(1.0))
             .child(
                 toggle(
