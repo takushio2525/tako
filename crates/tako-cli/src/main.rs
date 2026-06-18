@@ -264,9 +264,12 @@ enum OrchestratorCommand {
     /// worker が完了（idle）または消滅（gone）するまでブロックし、結果を 1 行出力する。
     /// Monitor ツールから呼ばれる想定。出力形式: WORKER_IDLE / WORKER_GONE
     Watch {
-        /// 監視対象ペイン ID
+        /// 監視対象ペイン ID（位置引数または --pane で指定）
         #[arg(long)]
-        pane: u64,
+        pane: Option<u64>,
+        /// 監視対象ペイン ID（位置引数）
+        #[arg(value_name = "PANE_ID")]
+        pane_pos: Option<u64>,
         /// claude の session ID（あれば精度向上）
         #[arg(long)]
         session_id: Option<String>,
@@ -622,8 +625,17 @@ fn main() -> ExitCode {
         Command::Master { ref suffix } => orchestrator_master(suffix.as_deref()),
         Command::Orchestrator(OrchestratorCommand::Watch {
             pane,
+            pane_pos,
             ref session_id,
-        }) => orchestrator_watch(pane, session_id.as_deref()),
+        }) => {
+            let resolved = pane.or(pane_pos).ok_or_else(|| {
+                "ペイン ID を指定してください（tako orchestrator watch <PANE_ID> または --pane <N>）".to_string()
+            });
+            match resolved {
+                Ok(p) => orchestrator_watch(p, session_id.as_deref()),
+                Err(e) => Err(e),
+            }
+        }
         Command::Orchestrator(OrchestratorCommand::Projects(ref sub)) => {
             orchestrator_projects_cli(sub)
         }

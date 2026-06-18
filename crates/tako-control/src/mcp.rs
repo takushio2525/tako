@@ -1088,7 +1088,7 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             label: str_arg(args, "label")?,
             model: str_arg(args, "model")?,
             effort: str_arg(args, "effort")?,
-            pane: Some(target_pane(args, caller)?),
+            pane: u64_arg(args, "pane")?.or(caller),
         },
         "tako_orchestrator_worker_status" => Request::OrchestratorWorkerStatus {
             pane_id: required_u64(args, "pane_id")?,

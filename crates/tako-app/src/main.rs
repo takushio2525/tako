@@ -388,6 +388,8 @@ struct TakoApp {
     token: Option<String>,
     /// dispatch 中に依頼されたセッション起動（GPUI の Context が要るため遅延実行する）
     pending_attach: Vec<(PaneId, SpawnOptions)>,
+    /// セッション起動後に遅延書き込みするデータ（attach_session が非同期のため）
+    pending_writes: Vec<(PaneId, Vec<u8>)>,
     /// dispatch 中に依頼されたプレビューの background ハイライト（ペイン, パス, 生テキスト）
     pending_highlights: Vec<(PaneId, std::path::PathBuf, String)>,
     /// IME 変換中の未確定文字列（FR-1.9。None = 変換中でない）
@@ -889,6 +891,7 @@ impl TakoApp {
             mcp,
             token,
             pending_attach: Vec::new(),
+            pending_writes: Vec::new(),
             pending_highlights: Vec::new(),
             ime: None,
             dragging_border: None,
@@ -1034,6 +1037,12 @@ impl TakoApp {
                             result = Err(tako_control::DispatchError::Operation(format!(
                                 "PTY を起動できなかった: {e}"
                             )));
+                        }
+                    }
+                    // セッション起動後の遅延書き込み（orchestrator spawn の claude 起動コマンド等）
+                    for (pane, data) in std::mem::take(&mut app.pending_writes) {
+                        if let Some(session) = app.terminals.get(&pane) {
+                            session.write(data);
                         }
                     }
                     // プレビューの syntect ハイライトを background で実行する
@@ -4689,6 +4698,11 @@ impl TakoApp {
                         self.remove_pane(pane, cx);
                     }
                 }
+                for (pane, data) in std::mem::take(&mut self.pending_writes) {
+                    if let Some(session) = self.terminals.get(&pane) {
+                        session.write(data);
+                    }
+                }
             }
             Err(e) => eprintln!("warning: tmux セッションを取り込めない: {e}"),
         }
@@ -7695,6 +7709,10 @@ impl ControlHost for TakoApp {
         self.pending_attach.push((pane, options));
     }
 
+    fn queue_write(&mut self, pane: PaneId, data: Vec<u8>) {
+        self.pending_writes.push((pane, data));
+    }
+
     fn detach_session(&mut self, pane: PaneId) {
         self.terminals.remove(&pane);
         self.previews.remove(&pane);
@@ -10568,6 +10586,11 @@ mod self_test {
                         app.spawn_session(pane, options, cx)
                             .expect("一時ペインの PTY 起動は成功する");
                     }
+                    for (pane, data) in std::mem::take(&mut app.pending_writes) {
+                        if let Some(session) = app.terminals.get(&pane) {
+                            session.write(data);
+                        }
+                    }
                     let temp_id = app
                         .workspace
                         .tabs()
@@ -11243,6 +11266,11 @@ mod self_test {
                         app.spawn_session(pane, options, cx)
                             .expect("一時ペインの PTY 起動は成功する");
                     }
+                    for (pane, data) in std::mem::take(&mut app.pending_writes) {
+                        if let Some(session) = app.terminals.get(&pane) {
+                            session.write(data);
+                        }
+                    }
                     app.set_filetree(true);
                     split["pane"].as_u64().expect("pane が返る")
                 })
@@ -11318,6 +11346,11 @@ mod self_test {
                         for (pane, options) in std::mem::take(&mut app.pending_attach) {
                             app.spawn_session(pane, options, cx)
                                 .expect("取り込みペインの PTY 起動は成功する");
+                        }
+                        for (pane, data) in std::mem::take(&mut app.pending_writes) {
+                            if let Some(session) = app.terminals.get(&pane) {
+                                session.write(data);
+                            }
                         }
                         opened["pane"].as_u64().expect("pane が返る")
                     })
@@ -11450,6 +11483,11 @@ mod self_test {
                     for (pane, options) in std::mem::take(&mut app.pending_attach) {
                         app.spawn_session(pane, options, cx)
                             .expect("一時ペインの PTY 起動は成功する");
+                    }
+                    for (pane, data) in std::mem::take(&mut app.pending_writes) {
+                        if let Some(session) = app.terminals.get(&pane) {
+                            session.write(data);
+                        }
                     }
                     let p2 = split["pane"].as_u64().expect("pane が返る");
                     tako_control::dispatch(

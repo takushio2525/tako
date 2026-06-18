@@ -137,6 +137,10 @@ pub trait ControlHost {
     fn video_seek(&mut self, _pane: PaneId, _seconds: f64) -> Result<f64, String> {
         Err("動画再生は未対応".into())
     }
+    /// セッション起動後にペインへ書き込む遅延キュー。`attach_session` が非同期（pending_attach）
+    /// のため、dispatch 内で直接 `session.write()` しても session がまだ存在しない。
+    /// この関数で登録すると、セッション起動後に自動的に書き込まれる
+    fn queue_write(&mut self, _pane: PaneId, _data: Vec<u8>) {}
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -1368,8 +1372,11 @@ fn dispatch_orchestrator_spawn(
         None => format!("{project}-worker"),
     };
 
-    // 呼び出し元ペインを右に split（ratio 0.45）
-    let (tab, target) = resolve_pane(host.workspace(), pane)?;
+    // 呼び出し元ペインを右に split（ratio 0.45）。pane 省略時はアクティブタブの
+    // フォーカス中ペインをフォールバック先にする（MCP 経由で caller が取れない場合の救済）
+    let pane_or_active =
+        pane.or_else(|| Some(host.workspace().active_tab().tree().focused().as_u64()));
+    let (tab, target) = resolve_pane(host.workspace(), pane_or_active)?;
     let new_pane = Pane::new(origin);
     let new_id = new_pane.id();
     tree_mut(host.workspace_mut(), tab)
@@ -1382,18 +1389,14 @@ fn dispatch_orchestrator_spawn(
     };
     host.attach_session(new_id, options);
 
-    // claude コマンドと prompt を送信するため、少し待機してからバックグラウンドで実行
-    // dispatch は同期なので、ここではコマンドを pane に書き込む準備だけする
     let claude_cmd = format!("claude --model '{}' --effort {}", model, effort);
     let oneline_prompt = prompt.replace('\n', " ");
 
-    // ペインにコマンドを送信する（session が存在するはず）
-    if let Some(session) = host.session(new_id) {
-        // claude 起動コマンドを送信
-        let mut cmd_bytes = claude_cmd.into_bytes();
-        cmd_bytes.push(b'\r');
-        session.write(cmd_bytes);
-    }
+    // attach_session は非同期（pending_attach）なのでセッションはまだ存在しない。
+    // queue_write で遅延書き込みを登録し、セッション起動後に自動送信する
+    let mut cmd_bytes = claude_cmd.clone().into_bytes();
+    cmd_bytes.push(b'\r');
+    host.queue_write(new_id, cmd_bytes);
 
     // タイトル設定
     let pane_obj = tree_mut(host.workspace_mut(), tab)
