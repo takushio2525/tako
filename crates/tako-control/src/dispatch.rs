@@ -1343,6 +1343,7 @@ fn dispatch_orchestrator_projects(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_orchestrator_spawn(
     host: &mut dyn ControlHost,
     origin: PaneOrigin,
