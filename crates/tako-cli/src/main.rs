@@ -776,14 +776,10 @@ fn orchestrator_master(suffix: Option<&str>) -> Result<(), String> {
         role: Some("orchestrator-master".into()),
     })?;
 
-    // claude を起動（system prompt 付き）
-    let session_name = match suffix {
-        Some(s) => format!("master-{s}"),
-        None => "master".into(),
-    };
+    // TAKO_ORCHESTRATOR_ROLE 環境変数を設定（statusline.sh が role 判定に使う）
     let claude_cmd = format!(
-        "claude --model 'claude-opus-4-6[1m]' --effort max --name '{}' --append-system-prompt-file '{}'",
-        session_name, prompt_path.display()
+        "TAKO_ORCHESTRATOR_ROLE=master claude --model 'claude-opus-4-6[1m]' --effort max --append-system-prompt-file '{}'",
+        prompt_path.display()
     );
     send_request(Request::Send {
         pane: Some(pane_id),
