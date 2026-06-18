@@ -194,7 +194,11 @@ pub fn snapshot_opts<T: EventListener>(term: &Term<T>, theme: &Theme, show_curso
                     }),
                 }
             }
-            let has_wide = cell_cols.windows(2).any(|w| w[1] - w[0] > 1);
+            // 連続するセル列の差が2以上 → スペーサーが挟まっている = 全角文字あり。
+            // 末尾の全角文字も検出する（スペーサーが行末でフィルタされると
+            // windows(2) では見えないため、最後のセル列と cols の差も確認）
+            let has_wide = cell_cols.windows(2).any(|w| w[1] - w[0] > 1)
+                || cell_cols.last().is_some_and(|&last| last + 1 < cols);
             ScreenLine {
                 text,
                 runs,
