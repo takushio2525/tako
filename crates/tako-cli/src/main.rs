@@ -778,7 +778,7 @@ fn orchestrator_master(suffix: Option<&str>) -> Result<(), String> {
 
     // claude を起動（system prompt 付き）
     let claude_cmd = format!(
-        "claude --model 'claude-opus-4-6[1m]' --effort max --append-system-prompt-file '{}'",
+        "claude --model 'claude-opus-4-6[1m]' --effort max --name '🐙 master' --append-system-prompt-file '{}'",
         prompt_path.display()
     );
     send_request(Request::Send {
