@@ -146,57 +146,57 @@ pub fn ensure_defaults() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// `claude agents --json` の出力から session_id を取得する
-pub fn find_session_id(cwd: &str) -> Option<String> {
-    let output = std::process::Command::new("claude")
-        .args(["agents", "--json"])
+/// `claude agents --json` をログインシェル経由で実行する。
+/// .app バンドル（Dock 起動）の PATH は最小構成で `claude` が見つからないため、
+/// `$SHELL -l -c "claude agents --json"` でユーザーの PATH を使う
+fn run_claude_agents_json() -> Option<Vec<u8>> {
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/bin/sh".into());
+    let output = std::process::Command::new(&shell)
+        .args(["-l", "-c", "claude agents --json"])
         .output()
         .ok()?;
-    if !output.status.success() {
-        return None;
+    if output.status.success() {
+        Some(output.stdout)
+    } else {
+        None
     }
-    let json_str = String::from_utf8(output.stdout).ok()?;
+}
+
+/// `claude agents --json` の出力から session_id を取得する
+pub fn find_session_id(cwd: &str) -> Option<String> {
+    let stdout = run_claude_agents_json()?;
+    let json_str = String::from_utf8(stdout).ok()?;
     let agents: serde_json::Value = serde_json::from_str(&json_str).ok()?;
     let agents = agents.as_array()?;
-    // cwd が一致する最新（startedAt で最大）のエントリから sessionId を取得
     agents
         .iter()
         .filter(|a| a["cwd"].as_str() == Some(cwd))
-        .max_by_key(|a| a["startedAt"].as_str().unwrap_or("").to_string())
+        .max_by_key(|a| a["startedAt"].as_i64().unwrap_or(0))
         .and_then(|a| a["sessionId"].as_str().map(|s| s.to_string()))
 }
 
 /// `claude agents --json` から指定 session_id の status と ctx% を取得する
 pub fn query_agent_status(session_id: &str) -> AgentStatus {
-    let output = match std::process::Command::new("claude")
-        .args(["agents", "--json"])
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => {
-            return AgentStatus {
-                status: "unknown".into(),
-                ctx_percent: None,
-            }
-        }
+    let Some(stdout) = run_claude_agents_json() else {
+        return AgentStatus {
+            status: "unknown".into(),
+            ctx_percent: None,
+        };
     };
-    let json_str = match String::from_utf8(output.stdout) {
-        Ok(s) => s,
-        Err(_) => {
-            return AgentStatus {
-                status: "unknown".into(),
-                ctx_percent: None,
-            }
-        }
+    let Ok(json_str) = String::from_utf8(stdout) else {
+        return AgentStatus {
+            status: "unknown".into(),
+            ctx_percent: None,
+        };
     };
-    let agents: serde_json::Value = match serde_json::from_str(&json_str) {
-        Ok(v) => v,
-        Err(_) => {
-            return AgentStatus {
-                status: "unknown".into(),
-                ctx_percent: None,
-            }
-        }
+    let Ok(agents) = serde_json::from_str::<serde_json::Value>(&json_str) else {
+        return AgentStatus {
+            status: "unknown".into(),
+            ctx_percent: None,
+        };
     };
     let Some(agents) = agents.as_array() else {
         return AgentStatus {

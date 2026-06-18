@@ -1372,11 +1372,15 @@ fn dispatch_orchestrator_spawn(
         None => format!("{project}-worker"),
     };
 
-    // 呼び出し元ペインを右に split（ratio 0.45）。pane 省略時はアクティブタブの
-    // フォーカス中ペインをフォールバック先にする（MCP 経由で caller が取れない場合の救済）
-    let pane_or_active =
-        pane.or_else(|| Some(host.workspace().active_tab().tree().focused().as_u64()));
-    let (tab, target) = resolve_pane(host.workspace(), pane_or_active)?;
+    // 呼び出し元ペインを右に split（ratio 0.45）。pane が stale（呼び出し元ペインが
+    // 既に閉じている等）の場合はアクティブタブのフォーカス中ペインにフォールバックする
+    let (tab, target) = match pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok()) {
+        Some(resolved) => resolved,
+        None => {
+            let focused = host.workspace().active_tab().tree().focused().as_u64();
+            resolve_pane(host.workspace(), Some(focused))?
+        }
+    };
     let new_pane = Pane::new(origin);
     let new_id = new_pane.id();
     tree_mut(host.workspace_mut(), tab)
@@ -1389,8 +1393,15 @@ fn dispatch_orchestrator_spawn(
     };
     host.attach_session(new_id, options);
 
-    let claude_cmd = format!("claude --model '{}' --effort {}", model, effort);
+    // prompt をシェルエスケープして claude コマンドの位置引数に含める。
+    // 別途 send_input で送ると bracket paste + Enter のタイミング問題で送信されないため、
+    // claude CLI の引数として渡してタイミング問題を回避する
     let oneline_prompt = prompt.replace('\n', " ");
+    let escaped_prompt = oneline_prompt.replace('\'', "'\\''");
+    let claude_cmd = format!(
+        "claude --model '{}' --effort {} '{}'",
+        model, effort, escaped_prompt
+    );
 
     // attach_session は非同期（pending_attach）なのでセッションはまだ存在しない。
     // queue_write で遅延書き込みを登録し、セッション起動後に自動送信する
@@ -1405,16 +1416,13 @@ fn dispatch_orchestrator_spawn(
     pane_obj.set_title(Some(window_title.clone()));
     pane_obj.set_role(Some(format!("orchestrator-worker:{project}")));
 
-    // prompt と session_id 取得はペインに claude が起動するまで時間がかかるため、
-    // 呼び出し側（CLI の master コマンドやオーケストレーター）に返して
-    // そちらが send + agents --json で回収する設計にする
     Ok(json!({
         "pane_id": new_id.as_u64(),
         "title": window_title,
         "cwd": cwd,
         "model": model,
         "effort": effort,
-        "claude_command": format!("claude --model '{}' --effort {}", model, effort),
+        "claude_command": claude_cmd,
         "prompt": oneline_prompt,
     }))
 }
