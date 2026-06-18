@@ -159,3 +159,9 @@
 - 関連コミット: `f25373f` `3c250b8`
 - 検証: build / clippy / fmt / test 全緑
 - 次: `build-app.sh --install` → 再起動で実機確認
+
+## 2026-06-18（オーケストレーター機能の完全内蔵）
+- tako にオーケストレーター機能を内蔵。外部スクリプト依存ゼロで `tako master` でマスター起動、
+  MCP 3 ツール + CLI 5 コマンド + デフォルト system prompt 埋め込み + docs（計 40 ツール）
+- 関連コミット: `6d764d7` `b68f190` `243dae6` `c27f5e5`
+- 検証: build / clippy(-D warnings) / fmt / test 全緑

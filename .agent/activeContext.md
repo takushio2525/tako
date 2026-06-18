@@ -4,32 +4,29 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-06-16・tmux window タブツリー統合 完了）
+## 現在の対象（2026-06-18・オーケストレーター機能 完了）
 
-バックエンドセッション内の tmux window をタブツリーに表示し、既存のプレビュー/ピン留め
-機能を適用する実装が完了。子 worker が `tmux new-window` で作った window が tako のサイドバー
-tmux ビューに見えるようになった。
+tako にオーケストレーター機能を完全内蔵。外部スクリプト依存ゼロで `tako master` で
+マスターエージェントを起動し、MCP / CLI から子 worker の spawn・監視・管理ができる。
 
-- **tmux.rs**: `select_window()` + `capture_pane_text()` を追加（window 切替 + プレビュー用テキスト取得）
-- **protocol.rs**: `Request::TmuxSelectWindow { pane, window }` を追加
-- **dispatch.rs**: ハンドラ実装（pane → backend session 解決 → tmux select-window 実行）。
-  `ControlHost::backend_windows()` を追加し list 応答に `backend_windows` を含める
-- **main.rs**: `PreviewTarget::TmuxWindow(PaneId, u32)` 追加。`backend_windows` / `window_captures`
-  フィールドで 2 秒ポーリングから window 追跡 + 非アクティブ window のテキストキャプチャ。
-  render_tmux_view でペイン行の下に非アクティブ window の子行を表示（ホバープレビュー +
-  クリックで切替 + 📌 ピン留め）
-- **CLI**: `tako tmux select-window <window> [--pane <id>]`
-- **MCP**: `tako_tmux_select_window` ツール（計 34 ツール）
-- **検証**: build / clippy(-D warnings) / fmt / test 全緑。セルフテスト期待値 34 に更新
-- 最終更新: 2026-06-16
+- **orchestrator モジュール**: `tako-control/src/orchestrator/`（projects.yaml パース、
+  設定管理、デフォルト system prompt 埋め込み、claude agents --json 連携）
+- **protocol**: `OrchestratorProjects` / `OrchestratorSpawn` / `OrchestratorWorkerStatus` の 3 Request
+- **dispatch**: 3 操作のハンドラ（projects CRUD / worker split+起動 / status 確認）
+- **MCP**: `tako_orchestrator_projects` / `tako_orchestrator_spawn` / `tako_orchestrator_worker_status`（計 40 ツール）
+- **CLI**: `tako master [suffix]` / `tako orchestrator watch` / `projects` / `spawn` / `status`
+- **ドキュメント**: `docs/orchestrator.md`（セットアップ・CLI リファレンス）
+- **検証**: build / clippy(-D warnings) / fmt / test 全緑。セルフテスト期待値 40 に更新
+- 最終更新: 2026-06-18
 
 ## 残作業・既知の制約
 
-- window キャプチャはプレーンテキスト（ANSI 色なし）。端末スタイル付きプレビューは将来課題
-- `sync_backend_windows` は tmux ポーリング内で capture-pane を呼ぶ（非アクティブ window 数 × 1 コマンド）。
-  大量 window でのパフォーマンスは実測で判断
-- PDF プレビューのセルフテストが Core Graphics 環境依存で失敗（既知・本変更と無関係）
-- ピンの永続化（再起動またぎ）は未実装＝意図的スコープ
+- spawn の prompt 送信は claude 起動後に send_input で行う設計（dispatch 内で待機しない）。
+  呼び出し側が send + sleep で claude 起動を待つ必要がある
+- `tako orchestrator watch` は 5 秒ポーリング。session_id ありなら連続 2 回 idle で確定、
+  なしなら grep フォールバック（連続 6 回）
+- system prompt はバイナリ埋め込み + カスタムファイル優先。カスタムファイルが無い場合は
+  config dir に `_default_system_prompt.md` として書き出す
 
 ## 未着手タスク（優先順はユーザーと相談）
 
@@ -43,21 +40,9 @@ tmux ビューに見えるようになった。
 
 - **CI（GitHub Actions）はリポ設定で意図的に無効化中**（2026-06-12〜）。コミット前は必ず
   `cargo fmt --all --check`（exit code）を確認する
-- **ライブプレビューは追加実装不要**: `on_term_event` が全ペインの出力で `cx.notify()` を
-  呼ぶので、`terminal_screen_lines` ベースのプレビューは再描画で勝手にライブ化する
-- **TmuxWindow プレビューはキャプチャテキストベース**: `terminal_screen_lines` は使えない
-  （バックグラウンド window は in-memory 端末にない）。`capture_pane_text` で取得した
-  プレーンテキストを StyledText で描画
 
 ## 現フェーズで Read すべき設計書
 
-- タブツリー/プレビュー/ピン再修正時: `requirements.md` FR-2.15 / FR-2.16（特に 13〜16）
+- オーケストレーター修正時: `docs/orchestrator.md`
+- タブツリー/プレビュー/ピン再修正時: `requirements.md` FR-2.15 / FR-2.16
 - FR-3.5 軽い編集着手時: `architecture.md`「コンセプト②の実現」
-
-## 関連ファイル / リンク
-
-- リポジトリ: https://github.com/takushio2525/tako（private）
-- 主な変更: `crates/tako-core/src/tmux.rs`（select_window / capture_pane_text）/
-  `crates/tako-control/src/{protocol,dispatch,mcp}.rs`（TmuxSelectWindow）/
-  `crates/tako-app/src/main.rs`（PreviewTarget::TmuxWindow / backend_windows / window_captures /
-  render_tmux_view の window 子行）/ `crates/tako-cli/src/main.rs`（tako tmux select-window）
