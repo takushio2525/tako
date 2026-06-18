@@ -1399,7 +1399,7 @@ fn dispatch_orchestrator_spawn(
     let oneline_prompt = prompt.replace('\n', " ");
     let escaped_prompt = oneline_prompt.replace('\'', "'\\''");
     let claude_cmd = format!(
-        "claude --model '{}' --effort {} --name '🐙 worker: {}' '{}'",
+        "claude --model '{}' --effort {} --name 'worker-{}' '{}'",
         model, effort, project, escaped_prompt
     );
 
