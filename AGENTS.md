@@ -66,6 +66,10 @@ tako/
 | `tako` CLI ビルド | `cargo build -p tako-cli`（バイナリは `target/debug/tako`） |
 | .app バンドル生成（macOS） | `scripts/build-app.sh [--verify] [--install]`（`dist/tako.app`。tako CLI 同梱） |
 | リリース zip 生成 | `scripts/release.sh`（ビルド→zip。`--publish` で GitHub Release 作成、`--draft` でドラフト） |
+| マスターオーケストレーター起動 | `tako master [suffix]`（claude を master system prompt 付きで起動） |
+| オーケストレーター worker spawn | `tako orchestrator spawn --project <key> --prompt "..."` |
+| オーケストレーター worker 監視 | `tako orchestrator watch --pane <N> --session-id <S>` |
+| オーケストレーター プロジェクト管理 | `tako orchestrator projects list/add/remove` |
 | build | `cargo build --workspace` |
 | lint | `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` |
 | test | `cargo test --workspace` |
@@ -79,6 +83,7 @@ CI（`.github/workflows/ci.yml`）は macOS / Windows の両ランナーで buil
 - 技術設計・リスク・3 層制御プレーン: `.agent/architecture.md`
 - 規約（命名・エラー・ログ）: `.agent/conventions.md`
 - 手動確認チェックリスト（IME・.app 等、機械検証できない項目）: `.agent/manual-checks.md`
+- オーケストレーター使い方ガイド: `docs/orchestrator.md`
 
 ### 作業履歴メモ（毎ターン参照・更新）
 
