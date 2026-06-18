@@ -769,16 +769,25 @@ fn orchestrator_master(suffix: Option<&str>) -> Result<(), String> {
         .as_u64()
         .ok_or("タブ作成の応答に pane が含まれない")?;
 
-    // master ペインに role を設定
+    // master ペインに role を設定（suffix があれば含める）
+    let role = match suffix {
+        Some(s) => format!("orchestrator-master:{s}"),
+        None => "orchestrator-master".into(),
+    };
     send_request(Request::Title {
         pane: Some(pane_id),
         title: None,
-        role: Some("orchestrator-master".into()),
+        role: Some(role.clone()),
     })?;
 
-    // TAKO_ORCHESTRATOR_ROLE 環境変数を設定（statusline.sh が role 判定に使う）
+    // TAKO_ORCHESTRATOR_ROLE 環境変数を設定
+    let role_env = match suffix {
+        Some(s) => format!("master:{s}"),
+        None => "master".into(),
+    };
     let claude_cmd = format!(
-        "TAKO_ORCHESTRATOR_ROLE=master claude --model 'claude-opus-4-6[1m]' --effort max --append-system-prompt-file '{}'",
+        "TAKO_ORCHESTRATOR_ROLE='{}' claude --model 'claude-opus-4-6[1m]' --effort max --append-system-prompt-file '{}'",
+        role_env,
         prompt_path.display()
     );
     send_request(Request::Send {

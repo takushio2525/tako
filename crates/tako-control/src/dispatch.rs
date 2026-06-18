@@ -141,6 +141,9 @@ pub trait ControlHost {
     /// のため、dispatch 内で直接 `session.write()` しても session がまだ存在しない。
     /// この関数で登録すると、セッション起動後に自動的に書き込まれる
     fn queue_write(&mut self, _pane: PaneId, _data: Vec<u8>) {}
+    /// alt_screen 遷移後にペインへ書き込む遅延キュー。claude TUI の起動完了（alt_screen 遷移）を
+    /// 待ってからプロンプトを送信するために使う。タイムアウト（60 秒）で自動破棄
+    fn queue_write_on_alt_screen(&mut self, _pane: PaneId, _data: Vec<u8>) {}
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -1393,14 +1396,13 @@ fn dispatch_orchestrator_spawn(
     };
     host.attach_session(new_id, options);
 
-    // prompt をシェルエスケープして claude コマンドの位置引数に含める。
-    // 別途 send_input で送ると bracket paste + Enter のタイミング問題で送信されないため、
-    // claude CLI の引数として渡してタイミング問題を回避する
-    let oneline_prompt = prompt.replace('\n', " ");
-    let escaped_prompt = oneline_prompt.replace('\'', "'\\''");
+    let role_value = match label {
+        Some(l) => format!("worker:{project}:{l}"),
+        None => format!("worker:{project}"),
+    };
     let claude_cmd = format!(
-        "TAKO_ORCHESTRATOR_ROLE='worker:{}' claude --model '{}' --effort {} '{}'",
-        project, model, effort, escaped_prompt
+        "TAKO_ORCHESTRATOR_ROLE='{}' claude --model '{}' --effort {}",
+        role_value, model, effort
     );
 
     // attach_session は非同期（pending_attach）なのでセッションはまだ存在しない。
@@ -1409,12 +1411,23 @@ fn dispatch_orchestrator_spawn(
     cmd_bytes.push(b'\r');
     host.queue_write(new_id, cmd_bytes);
 
+    // プロンプトは claude TUI の起動完了（alt_screen 遷移）を待ってから送信する。
+    // 位置引数方式だとコマンドが長大になり、起動前にシェルに流れ込むリスクがある
+    let oneline_prompt = prompt.replace('\n', "  ");
+    let mut prompt_bytes = oneline_prompt.clone().into_bytes();
+    prompt_bytes.push(b'\r');
+    host.queue_write_on_alt_screen(new_id, prompt_bytes);
+
     // タイトルと role 設定
     let pane_obj = tree_mut(host.workspace_mut(), tab)
         .get_mut(new_id)
         .expect("直前に split で追加済み");
     pane_obj.set_title(Some(window_title.clone()));
-    pane_obj.set_role(Some(format!("orchestrator-worker:{project}")));
+    let pane_role = match label {
+        Some(l) => format!("orchestrator-worker:{project}:{l}"),
+        None => format!("orchestrator-worker:{project}"),
+    };
+    pane_obj.set_role(Some(pane_role));
 
     Ok(json!({
         "pane_id": new_id.as_u64(),

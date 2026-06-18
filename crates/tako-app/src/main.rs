@@ -390,6 +390,8 @@ struct TakoApp {
     pending_attach: Vec<(PaneId, SpawnOptions)>,
     /// セッション起動後に遅延書き込みするデータ（attach_session が非同期のため）
     pending_writes: Vec<(PaneId, Vec<u8>)>,
+    /// alt_screen 遷移後に書き込むデータ（claude TUI 起動完了待ち）。(pane, data, 登録時刻)
+    alt_screen_writes: Vec<(PaneId, Vec<u8>, std::time::Instant)>,
     /// dispatch 中に依頼されたプレビューの background ハイライト（ペイン, パス, 生テキスト）
     pending_highlights: Vec<(PaneId, std::path::PathBuf, String)>,
     /// IME 変換中の未確定文字列（FR-1.9。None = 変換中でない）
@@ -892,6 +894,7 @@ impl TakoApp {
             token,
             pending_attach: Vec::new(),
             pending_writes: Vec::new(),
+            alt_screen_writes: Vec::new(),
             pending_highlights: Vec::new(),
             ime: None,
             dragging_border: None,
@@ -1045,6 +1048,8 @@ impl TakoApp {
                             session.write(data);
                         }
                     }
+                    // alt_screen 遷移待ちの遅延書き込み（orchestrator spawn のプロンプト送信）
+                    app.flush_alt_screen_writes();
                     // プレビューの syntect ハイライトを background で実行する
                     for (pane, path, text) in std::mem::take(&mut app.pending_highlights) {
                         app.spawn_highlight(pane, path, text, cx);
@@ -1061,6 +1066,23 @@ impl TakoApp {
                     }
                     Err(_) => break, // View が破棄された
                 }
+            }
+        })
+        .detach();
+
+        // alt_screen 遷移待ちの遅延書き込み専用ポーリング（500ms 間隔）。
+        // spawn 直後は他の IPC リクエストが来ない可能性があるため、短間隔で回す
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            let ok = this.update(cx, |app: &mut TakoApp, _| {
+                if !app.alt_screen_writes.is_empty() {
+                    app.flush_alt_screen_writes();
+                }
+            });
+            if ok.is_err() {
+                break;
             }
         })
         .detach();
@@ -1819,6 +1841,27 @@ impl TakoApp {
 
     /// background thread で tmux セッション一覧を取得するためのコンテキストを収集する。
     /// UI スレッドでの実行コスト: pane/tab の走査のみ（< 0.1ms）
+    /// alt_screen 遷移待ちの遅延書き込みを flush する。
+    /// 対象ペインが alt_screen に入っていれば書き込み、まだなら保留。60 秒超で破棄
+    fn flush_alt_screen_writes(&mut self) {
+        let mut remaining = Vec::new();
+        for (pane, data, created_at) in std::mem::take(&mut self.alt_screen_writes) {
+            if created_at.elapsed() > std::time::Duration::from_secs(60) {
+                continue;
+            }
+            if let Some(session) = self.terminals.get(&pane) {
+                if session.is_alt_screen() {
+                    session.write(data);
+                } else {
+                    remaining.push((pane, data, created_at));
+                }
+            } else {
+                remaining.push((pane, data, created_at));
+            }
+        }
+        self.alt_screen_writes = remaining;
+    }
+
     fn collect_tmux_context(&self) -> tako_control::TmuxContext {
         let ws = &self.workspace;
         let pane_of_tty: Vec<(String, u64, u64)> = ws
@@ -6087,7 +6130,12 @@ impl TakoApp {
                     .get(focused)
                     .and_then(|p| p.role())
                     .unwrap_or("");
-                let label = if focused_role == "orchestrator-master" {
+                let label = if focused_role == "orchestrator-master"
+                    || focused_role.starts_with("orchestrator-master:")
+                {
+                    let suffix = focused_role
+                        .strip_prefix("orchestrator-master:")
+                        .unwrap_or("");
                     let worker_count: usize = self
                         .workspace
                         .tabs()
@@ -6098,11 +6146,22 @@ impl TakoApp {
                                 .is_some_and(|r| r.starts_with("orchestrator-worker:"))
                         })
                         .count();
-                    Some(format!("\u{1F419} master \u{00B7} workers: {worker_count}"))
+                    let name = if suffix.is_empty() {
+                        "master".to_string()
+                    } else {
+                        format!("master {suffix}")
+                    };
+                    Some(format!("\u{1F419} {name} \u{00B7} workers: {worker_count}"))
+                } else if let Some(rest) = focused_role.strip_prefix("orchestrator-worker:") {
+                    // rest は "project" または "project:label"
+                    let display = if let Some((_project, label_part)) = rest.split_once(':') {
+                        format!("worker {label_part}")
+                    } else {
+                        format!("worker: {rest}")
+                    };
+                    Some(format!("\u{1F419} {display}"))
                 } else {
-                    focused_role
-                        .strip_prefix("orchestrator-worker:")
-                        .map(|project| format!("\u{1F419} worker: {project}"))
+                    None
                 };
                 label.map(|text| {
                     div()
@@ -7749,6 +7808,11 @@ impl ControlHost for TakoApp {
 
     fn queue_write(&mut self, pane: PaneId, data: Vec<u8>) {
         self.pending_writes.push((pane, data));
+    }
+
+    fn queue_write_on_alt_screen(&mut self, pane: PaneId, data: Vec<u8>) {
+        self.alt_screen_writes
+            .push((pane, data, std::time::Instant::now()));
     }
 
     fn detach_session(&mut self, pane: PaneId) {
