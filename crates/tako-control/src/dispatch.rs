@@ -1384,7 +1384,7 @@ fn dispatch_orchestrator_spawn(
 
     // claude コマンドと prompt を送信するため、少し待機してからバックグラウンドで実行
     // dispatch は同期なので、ここではコマンドを pane に書き込む準備だけする
-    let claude_cmd = format!("claude --model \"{}\" --effort {}", model, effort);
+    let claude_cmd = format!("claude --model '{}' --effort {}", model, effort);
     let oneline_prompt = prompt.replace('\n', " ");
 
     // ペインにコマンドを送信する（session が存在するはず）
@@ -1410,7 +1410,7 @@ fn dispatch_orchestrator_spawn(
         "cwd": cwd,
         "model": model,
         "effort": effort,
-        "claude_command": format!("claude --model \"{}\" --effort {}", model, effort),
+        "claude_command": format!("claude --model '{}' --effort {}", model, effort),
         "prompt": oneline_prompt,
     }))
 }
