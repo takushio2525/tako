@@ -1263,7 +1263,189 @@ pub fn dispatch(
                 .map_err(DispatchError::Operation)?;
             Ok(json!({ "pane": target.as_u64(), "seconds": actual }))
         }
+
+        Request::OrchestratorProjects {
+            action,
+            key,
+            cwd,
+            description,
+        } => dispatch_orchestrator_projects(&action, key, cwd, description),
+
+        Request::OrchestratorSpawn {
+            project,
+            prompt,
+            label,
+            model,
+            effort,
+            pane,
+        } => dispatch_orchestrator_spawn(host, origin, &project, &prompt, label.as_deref(), model.as_deref(), effort.as_deref(), pane),
+
+        Request::OrchestratorWorkerStatus {
+            pane_id,
+            session_id,
+        } => dispatch_orchestrator_worker_status(host, pane_id, session_id.as_deref()),
     }
+}
+
+// --- オーケストレーター dispatch ---
+
+fn dispatch_orchestrator_projects(
+    action: &str,
+    key: Option<String>,
+    cwd: Option<String>,
+    description: Option<String>,
+) -> Result<Value, DispatchError> {
+    use crate::orchestrator;
+    match action {
+        "list" => {
+            let config = orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
+            let projects: Vec<Value> = config
+                .list_resolved()
+                .into_iter()
+                .map(|p| json!({ "key": p.key, "cwd": p.cwd, "description": p.description }))
+                .collect();
+            Ok(json!({ "projects": projects }))
+        }
+        "add" => {
+            let key = key.ok_or(DispatchError::InvalidParams("key を指定する".into()))?;
+            let cwd = cwd.ok_or(DispatchError::InvalidParams("cwd を指定する".into()))?;
+            orchestrator::ensure_defaults().map_err(DispatchError::Operation)?;
+            let mut config = orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
+            config.add(key.clone(), cwd.clone(), description);
+            config.save().map_err(DispatchError::Operation)?;
+            Ok(json!({ "added": key, "cwd": cwd }))
+        }
+        "remove" => {
+            let key = key.ok_or(DispatchError::InvalidParams("key を指定する".into()))?;
+            let mut config = orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
+            if !config.remove(&key) {
+                return Err(DispatchError::Operation(format!(
+                    "プロジェクト '{key}' が見つからない"
+                )));
+            }
+            config.save().map_err(DispatchError::Operation)?;
+            Ok(json!({ "removed": key }))
+        }
+        _ => Err(DispatchError::InvalidParams(format!(
+            "action が不正: {action}（list / add / remove）"
+        ))),
+    }
+}
+
+fn dispatch_orchestrator_spawn(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    project: &str,
+    prompt: &str,
+    label: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    pane: Option<u64>,
+) -> Result<Value, DispatchError> {
+    use crate::orchestrator;
+
+    let config = orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
+    let cwd = config.resolve_cwd(project).map_err(DispatchError::Operation)?;
+
+    let model = model.unwrap_or("claude-opus-4-6[1m]");
+    let effort = effort.unwrap_or("max");
+    let window_title = match label {
+        Some(l) => format!("{project}: {l}"),
+        None => format!("{project}-worker"),
+    };
+
+    // 呼び出し元ペインを右に split（ratio 0.45）
+    let (tab, target) = resolve_pane(host.workspace(), pane)?;
+    let new_pane = Pane::new(origin);
+    let new_id = new_pane.id();
+    tree_mut(host.workspace_mut(), tab)
+        .split_with_ratio(target, SplitDirection::Right, 0.45, new_pane)
+        .map_err(op_err)?;
+    let options = SpawnOptions {
+        command: None,
+        cwd: Some(std::path::PathBuf::from(&cwd)),
+        env: Vec::new(),
+    };
+    host.attach_session(new_id, options);
+
+    // claude コマンドと prompt を送信するため、少し待機してからバックグラウンドで実行
+    // dispatch は同期なので、ここではコマンドを pane に書き込む準備だけする
+    let claude_cmd = format!("claude --model \"{}\" --effort {}", model, effort);
+    let oneline_prompt = prompt.replace('\n', " ");
+
+    // ペインにコマンドを送信する（session が存在するはず）
+    if let Some(session) = host.session(new_id) {
+        // claude 起動コマンドを送信
+        let mut cmd_bytes = claude_cmd.into_bytes();
+        cmd_bytes.push(b'\r');
+        session.write(cmd_bytes);
+    }
+
+    // タイトル設定
+    let pane_obj = tree_mut(host.workspace_mut(), tab)
+        .get_mut(new_id)
+        .expect("直前に split で追加済み");
+    pane_obj.set_title(Some(window_title.clone()));
+
+    // prompt と session_id 取得はペインに claude が起動するまで時間がかかるため、
+    // 呼び出し側（CLI の master コマンドやオーケストレーター）に返して
+    // そちらが send + agents --json で回収する設計にする
+    Ok(json!({
+        "pane_id": new_id.as_u64(),
+        "title": window_title,
+        "cwd": cwd,
+        "model": model,
+        "effort": effort,
+        "claude_command": format!("claude --model \"{}\" --effort {}", model, effort),
+        "prompt": oneline_prompt,
+    }))
+}
+
+fn dispatch_orchestrator_worker_status(
+    host: &dyn ControlHost,
+    pane_id: u64,
+    session_id: Option<&str>,
+) -> Result<Value, DispatchError> {
+    use crate::orchestrator;
+
+    // ペインの存在確認
+    let pane_exists = host.workspace().tabs().iter().any(|tab| {
+        tab.tree().panes().iter().any(|p| p.id().as_u64() == pane_id)
+    });
+    if !pane_exists {
+        return Ok(json!({
+            "status": "gone",
+            "ctx_percent": null,
+            "recent_output": null,
+        }));
+    }
+
+    // session_id があれば claude agents で状態確認
+    let (status, ctx_percent) = if let Some(sid) = session_id {
+        let agent = orchestrator::query_agent_status(sid);
+        (agent.status, agent.ctx_percent)
+    } else {
+        ("unknown".to_string(), None)
+    };
+
+    // ペインの最近の出力を取得
+    let target = PaneId::from_raw(pane_id);
+    let recent_output = host.session(target).map(|session| {
+        let mut lines = session.visible_lines();
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        if lines.len() > 30 {
+            lines.drain(..lines.len() - 30);
+        }
+        lines.join("\n")
+    });
+
+    Ok(json!({
+        "status": status,
+        "ctx_percent": ctx_percent,
+        "recent_output": recent_output,
+    }))
 }
 
 fn shell_escape(s: &str) -> String {

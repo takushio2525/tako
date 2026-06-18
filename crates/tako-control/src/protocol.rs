@@ -325,6 +325,27 @@ pub enum Request {
     VideoPlayback { pane: Option<u64>, action: String },
     /// 動画のシーク。`seconds` は絶対位置（秒）。`pane` 省略時は呼び出し元ペイン
     VideoSeek { pane: Option<u64>, seconds: f64 },
+    /// オーケストレーター: プロジェクト管理（list / add / remove）
+    OrchestratorProjects {
+        action: String,
+        key: Option<String>,
+        cwd: Option<String>,
+        description: Option<String>,
+    },
+    /// オーケストレーター: worker の spawn（split + claude 起動 + プロンプト送信）
+    OrchestratorSpawn {
+        project: String,
+        prompt: String,
+        label: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+        pane: Option<u64>,
+    },
+    /// オーケストレーター: worker の状態確認
+    OrchestratorWorkerStatus {
+        pane_id: u64,
+        session_id: Option<String>,
+    },
 }
 
 /// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。

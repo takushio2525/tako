@@ -765,6 +765,64 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // --- オーケストレーター MCP ツール ---
+        json!({
+            "name": "tako_orchestrator_projects",
+            "description": "オーケストレーターのプロジェクトを管理する。\
+                action=list で登録済みプロジェクト一覧、add で新規追加、remove で削除。\
+                プロジェクトは projects.yaml に保存され、tako_orchestrator_spawn の\
+                対象として使える。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "add", "remove"],
+                        "description": "操作種別（省略時は list）",
+                    },
+                    "key": { "type": "string", "description": "プロジェクトキー（add / remove 時に必須）" },
+                    "cwd": { "type": "string", "description": "作業ディレクトリ（add 時に必須。~ は $HOME に展開される）" },
+                    "description": { "type": "string", "description": "プロジェクトの説明（add 時に任意）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_orchestrator_spawn",
+            "description": "プロジェクトの作業ディレクトリで子 claude worker を spawn する。\
+                呼び出し元ペインを右に分割して新ペインを作り、claude を起動してプロンプトを送信する。\
+                worker の pane_id を返すので、以後は tako_read_pane / tako_send_input / \
+                tako_close_pane で操作し、tako orchestrator watch で完了監視する。\
+                起動からプロンプト送信まで 15〜20 秒かかる（これは想定内）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "プロジェクトキー（projects.yaml に登録済みであること）" },
+                    "prompt": { "type": "string", "description": "worker に渡す初期プロンプト" },
+                    "label": { "type": "string", "description": "ペインタイトルに付けるラベル（省略時は '<project>-worker'）" },
+                    "model": { "type": "string", "description": "claude のモデル（省略時は claude-opus-4-6[1m]）" },
+                    "effort": { "type": "string", "description": "thinking effort（省略時は max）" },
+                    "pane": pane_schema("分割元ペイン ID（省略時は呼び出し元。このペインの右に子が生える）"),
+                },
+                "required": ["project", "prompt"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_orchestrator_worker_status",
+            "description": "子 worker の状態を確認する。status は busy（作業中）/ idle（入力待ち・完了）/ \
+                gone（ペイン消滅）/ unknown（agents 不可）。session_id を渡すと claude agents --json \
+                で正確な状態を取得する。recent_output はペインの最近 30 行の出力。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane_id": { "type": "integer", "minimum": 0, "description": "worker のペイン ID（必須）" },
+                    "session_id": { "type": "string", "description": "claude の session ID（あれば精度向上）" },
+                },
+                "required": ["pane_id"],
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -1017,6 +1075,24 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
         "tako_video_seek" => Request::VideoSeek {
             pane: Some(target_pane(args, caller)?),
             seconds: f64_arg(args, "seconds")?.ok_or("seconds を指定する")?,
+        },
+        "tako_orchestrator_projects" => Request::OrchestratorProjects {
+            action: str_arg(args, "action")?.unwrap_or_else(|| "list".into()),
+            key: str_arg(args, "key")?,
+            cwd: str_arg(args, "cwd")?,
+            description: str_arg(args, "description")?,
+        },
+        "tako_orchestrator_spawn" => Request::OrchestratorSpawn {
+            project: str_arg(args, "project")?.ok_or("project を指定する")?,
+            prompt: str_arg(args, "prompt")?.ok_or("prompt を指定する")?,
+            label: str_arg(args, "label")?,
+            model: str_arg(args, "model")?,
+            effort: str_arg(args, "effort")?,
+            pane: Some(target_pane(args, caller)?),
+        },
+        "tako_orchestrator_worker_status" => Request::OrchestratorWorkerStatus {
+            pane_id: required_u64(args, "pane_id")?,
+            session_id: str_arg(args, "session_id")?,
         },
         _ => return Err(format!("不明なツール: {name}")),
     })
@@ -1443,7 +1519,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 37);
+        assert_eq!(tools.len(), 40);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

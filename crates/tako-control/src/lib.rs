@@ -14,6 +14,7 @@ pub mod dispatch;
 pub mod ipc;
 pub mod layout;
 pub mod mcp;
+pub mod orchestrator;
 pub mod protocol;
 pub mod settings;
 
