@@ -8,8 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// バイナリ埋め込みのデフォルト system prompt
-pub const DEFAULT_SYSTEM_PROMPT: &str =
-    include_str!("default_system_prompt.md");
+pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("default_system_prompt.md");
 
 /// オーケストレーター設定ディレクトリのパス。
 /// `~/Library/Application Support/tako/orchestrator/`
@@ -79,8 +78,7 @@ pub struct ResolvedProject {
 
 impl ProjectsConfig {
     pub fn load() -> Result<Self, String> {
-        let path = projects_yaml_path()
-            .ok_or("ホームディレクトリが取得できない")?;
+        let path = projects_yaml_path().ok_or("ホームディレクトリが取得できない")?;
         if !path.is_file() {
             return Ok(ProjectsConfig {
                 projects: std::collections::BTreeMap::new(),
@@ -88,21 +86,18 @@ impl ProjectsConfig {
         }
         let content = std::fs::read_to_string(&path)
             .map_err(|e| format!("projects.yaml の読み取りに失敗: {e}"))?;
-        serde_yaml::from_str(&content)
-            .map_err(|e| format!("projects.yaml のパースに失敗: {e}"))
+        serde_yaml::from_str(&content).map_err(|e| format!("projects.yaml のパースに失敗: {e}"))
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = projects_yaml_path()
-            .ok_or("ホームディレクトリが取得できない")?;
+        let path = projects_yaml_path().ok_or("ホームディレクトリが取得できない")?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
         }
-        let content = serde_yaml::to_string(self)
-            .map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
-        std::fs::write(&path, content)
-            .map_err(|e| format!("projects.yaml の書き込みに失敗: {e}"))
+        let content =
+            serde_yaml::to_string(self).map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
+        std::fs::write(&path, content).map_err(|e| format!("projects.yaml の書き込みに失敗: {e}"))
     }
 
     pub fn list_resolved(&self) -> Vec<ResolvedProject> {
@@ -117,7 +112,9 @@ impl ProjectsConfig {
     }
 
     pub fn resolve_cwd(&self, project: &str) -> Result<String, String> {
-        let entry = self.projects.get(project)
+        let entry = self
+            .projects
+            .get(project)
             .ok_or_else(|| format!("プロジェクト '{project}' が projects.yaml に見つからない"))?;
         let cwd = expand_tilde(&entry.cwd);
         if !Path::new(&cwd).is_dir() {
@@ -138,8 +135,7 @@ impl ProjectsConfig {
 /// 初回実行時にデフォルトのディレクトリとファイルを生成する
 pub fn ensure_defaults() -> Result<PathBuf, String> {
     let dir = config_dir().ok_or("ホームディレクトリが取得できない")?;
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
     let yaml_path = dir.join("projects.yaml");
     if !yaml_path.is_file() {
         let template = ProjectsConfig {
@@ -163,7 +159,8 @@ pub fn find_session_id(cwd: &str) -> Option<String> {
     let agents: serde_json::Value = serde_json::from_str(&json_str).ok()?;
     let agents = agents.as_array()?;
     // cwd が一致する最新（startedAt で最大）のエントリから sessionId を取得
-    agents.iter()
+    agents
+        .iter()
         .filter(|a| a["cwd"].as_str() == Some(cwd))
         .max_by_key(|a| a["startedAt"].as_str().unwrap_or("").to_string())
         .and_then(|a| a["sessionId"].as_str().map(|s| s.to_string()))
@@ -173,27 +170,55 @@ pub fn find_session_id(cwd: &str) -> Option<String> {
 pub fn query_agent_status(session_id: &str) -> AgentStatus {
     let output = match std::process::Command::new("claude")
         .args(["agents", "--json"])
-        .output() {
+        .output()
+    {
         Ok(o) if o.status.success() => o,
-        _ => return AgentStatus { status: "unknown".into(), ctx_percent: None },
+        _ => {
+            return AgentStatus {
+                status: "unknown".into(),
+                ctx_percent: None,
+            }
+        }
     };
     let json_str = match String::from_utf8(output.stdout) {
         Ok(s) => s,
-        Err(_) => return AgentStatus { status: "unknown".into(), ctx_percent: None },
+        Err(_) => {
+            return AgentStatus {
+                status: "unknown".into(),
+                ctx_percent: None,
+            }
+        }
     };
     let agents: serde_json::Value = match serde_json::from_str(&json_str) {
         Ok(v) => v,
-        Err(_) => return AgentStatus { status: "unknown".into(), ctx_percent: None },
+        Err(_) => {
+            return AgentStatus {
+                status: "unknown".into(),
+                ctx_percent: None,
+            }
+        }
     };
     let Some(agents) = agents.as_array() else {
-        return AgentStatus { status: "unknown".into(), ctx_percent: None };
+        return AgentStatus {
+            status: "unknown".into(),
+            ctx_percent: None,
+        };
     };
-    match agents.iter().find(|a| a["sessionId"].as_str() == Some(session_id)) {
-        None => AgentStatus { status: "gone".into(), ctx_percent: None },
+    match agents
+        .iter()
+        .find(|a| a["sessionId"].as_str() == Some(session_id))
+    {
+        None => AgentStatus {
+            status: "gone".into(),
+            ctx_percent: None,
+        },
         Some(agent) => {
             let status = agent["status"].as_str().unwrap_or("unknown").to_string();
             let ctx_percent = agent["contextPercentUsed"].as_f64().map(|v| v as u32);
-            AgentStatus { status, ctx_percent }
+            AgentStatus {
+                status,
+                ctx_percent,
+            }
         }
     }
 }

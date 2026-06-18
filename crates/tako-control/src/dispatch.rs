@@ -1278,7 +1278,16 @@ pub fn dispatch(
             model,
             effort,
             pane,
-        } => dispatch_orchestrator_spawn(host, origin, &project, &prompt, label.as_deref(), model.as_deref(), effort.as_deref(), pane),
+        } => dispatch_orchestrator_spawn(
+            host,
+            origin,
+            &project,
+            &prompt,
+            label.as_deref(),
+            model.as_deref(),
+            effort.as_deref(),
+            pane,
+        ),
 
         Request::OrchestratorWorkerStatus {
             pane_id,
@@ -1310,14 +1319,16 @@ fn dispatch_orchestrator_projects(
             let key = key.ok_or(DispatchError::InvalidParams("key を指定する".into()))?;
             let cwd = cwd.ok_or(DispatchError::InvalidParams("cwd を指定する".into()))?;
             orchestrator::ensure_defaults().map_err(DispatchError::Operation)?;
-            let mut config = orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
+            let mut config =
+                orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
             config.add(key.clone(), cwd.clone(), description);
             config.save().map_err(DispatchError::Operation)?;
             Ok(json!({ "added": key, "cwd": cwd }))
         }
         "remove" => {
             let key = key.ok_or(DispatchError::InvalidParams("key を指定する".into()))?;
-            let mut config = orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
+            let mut config =
+                orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
             if !config.remove(&key) {
                 return Err(DispatchError::Operation(format!(
                     "プロジェクト '{key}' が見つからない"
@@ -1345,7 +1356,9 @@ fn dispatch_orchestrator_spawn(
     use crate::orchestrator;
 
     let config = orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
-    let cwd = config.resolve_cwd(project).map_err(DispatchError::Operation)?;
+    let cwd = config
+        .resolve_cwd(project)
+        .map_err(DispatchError::Operation)?;
 
     let model = model.unwrap_or("claude-opus-4-6[1m]");
     let effort = effort.unwrap_or("max");
@@ -1410,7 +1423,10 @@ fn dispatch_orchestrator_worker_status(
 
     // ペインの存在確認
     let pane_exists = host.workspace().tabs().iter().any(|tab| {
-        tab.tree().panes().iter().any(|p| p.id().as_u64() == pane_id)
+        tab.tree()
+            .panes()
+            .iter()
+            .any(|p| p.id().as_u64() == pane_id)
     });
     if !pane_exists {
         return Ok(json!({

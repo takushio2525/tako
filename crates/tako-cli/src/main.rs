@@ -108,6 +108,15 @@ enum Command {
     /// 動画操作（play / pause / seek。プレビューペインが動画モードの場合のみ有効）
     #[command(subcommand)]
     Video(VideoCommand),
+    /// マスターオーケストレーターを起動する。新タブで claude を master system prompt 付きで起動する。
+    /// suffix を付けると複数 master を区別できる（例: tako master dev → "master-dev" タブ）
+    Master {
+        /// タブ名のサフィックス（例: dev → "master-dev"）
+        suffix: Option<String>,
+    },
+    /// オーケストレーター操作（projects / spawn / status / watch）
+    #[command(subcommand)]
+    Orchestrator(OrchestratorCommand),
 }
 
 #[derive(Subcommand)]
@@ -247,6 +256,74 @@ enum VideoCommand {
         seconds: f64,
         #[arg(long)]
         pane: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum OrchestratorCommand {
+    /// worker が完了（idle）または消滅（gone）するまでブロックし、結果を 1 行出力する。
+    /// Monitor ツールから呼ばれる想定。出力形式: WORKER_IDLE / WORKER_GONE
+    Watch {
+        /// 監視対象ペイン ID
+        #[arg(long)]
+        pane: u64,
+        /// claude の session ID（あれば精度向上）
+        #[arg(long)]
+        session_id: Option<String>,
+    },
+    /// プロジェクト管理（一覧 / 追加 / 削除）
+    #[command(subcommand)]
+    Projects(ProjectsCommand),
+    /// 子 worker を spawn する（split + claude 起動 + プロンプト送信）
+    Spawn {
+        /// プロジェクトキー（projects.yaml に登録済み）
+        #[arg(long)]
+        project: String,
+        /// worker に渡す初期プロンプト
+        #[arg(long)]
+        prompt: String,
+        /// ペインタイトルに付けるラベル
+        #[arg(long)]
+        label: Option<String>,
+        /// claude のモデル（省略時 claude-opus-4-6[1m]）
+        #[arg(long)]
+        model: Option<String>,
+        /// thinking effort（省略時 max）
+        #[arg(long)]
+        effort: Option<String>,
+    },
+    /// worker の状態確認
+    Status {
+        /// ペイン ID
+        #[arg(long)]
+        pane: u64,
+        /// claude の session ID
+        #[arg(long)]
+        session_id: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectsCommand {
+    /// 登録済みプロジェクトの一覧
+    List,
+    /// プロジェクトを追加する
+    Add {
+        /// プロジェクトキー
+        #[arg(long)]
+        key: String,
+        /// 作業ディレクトリ（~ は $HOME に展開される）
+        #[arg(long)]
+        cwd: String,
+        /// プロジェクトの説明
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// プロジェクトを削除する
+    Remove {
+        /// プロジェクトキー
+        #[arg(long)]
+        key: String,
     },
 }
 
@@ -542,6 +619,14 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Mcp(McpCommand::Serve) => mcp_serve(),
         Command::SetupMcp(ref args) => setup_mcp_local(args),
+        Command::Master { ref suffix } => orchestrator_master(suffix.as_deref()),
+        Command::Orchestrator(OrchestratorCommand::Watch {
+            pane,
+            ref session_id,
+        }) => orchestrator_watch(pane, session_id.as_deref()),
+        Command::Orchestrator(OrchestratorCommand::Projects(ref sub)) => {
+            orchestrator_projects_cli(sub)
+        }
         command => run(command),
     };
     match result {
@@ -637,6 +722,165 @@ fn setup_mcp_local(args: &SetupMcpArgs) -> Result<(), String> {
             Ok(())
         }
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// `tako master [suffix]` — 新タブで claude をマスター system prompt 付きで起動する
+fn orchestrator_master(suffix: Option<&str>) -> Result<(), String> {
+    use tako_control::orchestrator;
+
+    orchestrator::ensure_defaults().map_err(|e| format!("セットアップに失敗: {e}"))?;
+
+    // system prompt ファイルの準備
+    let prompt_path = if let Some(custom) = orchestrator::resolve_system_prompt_path() {
+        custom
+    } else {
+        // デフォルトを一時ファイルに書き出す
+        let dir = orchestrator::config_dir().ok_or("ホームディレクトリが取得できない")?;
+        let path = dir.join("_default_system_prompt.md");
+        std::fs::write(&path, orchestrator::DEFAULT_SYSTEM_PROMPT)
+            .map_err(|e| format!("system prompt の書き出しに失敗: {e}"))?;
+        path
+    };
+
+    // タブ名
+    let tab_title = match suffix {
+        Some(s) => format!("master-{s}"),
+        None => "master".into(),
+    };
+
+    // 新タブを作成
+    let tab_result = send_request(Request::TabNew {
+        title: Some(tab_title.clone()),
+    })?;
+    let pane_id = tab_result["pane"]
+        .as_u64()
+        .ok_or("タブ作成の応答に pane が含まれない")?;
+
+    // claude を起動（system prompt 付き）
+    let claude_cmd = format!(
+        "claude --model claude-opus-4-6[1m] --effort max --append-system-prompt-file {}",
+        prompt_path.display()
+    );
+    send_request(Request::Send {
+        pane: Some(pane_id),
+        text: claude_cmd,
+        newline: true,
+    })?;
+
+    eprintln!("master を起動しました: タブ '{tab_title}'（ペイン {pane_id}）");
+    eprintln!("system prompt: {}", prompt_path.display());
+    Ok(())
+}
+
+/// `tako orchestrator watch --pane N [--session-id S]` — worker の完了まで待機し 1 行出力する
+fn orchestrator_watch(pane: u64, session_id: Option<&str>) -> Result<(), String> {
+    let interval = std::time::Duration::from_secs(5);
+    // status モードは連続 2 回、grep モードは連続 6 回で確定
+    let need_streak: u32 = if session_id.is_some() { 2 } else { 6 };
+    let mut idle_streak: u32 = 0;
+
+    loop {
+        // ペインの存在確認（IPC 経由）
+        let result = send_request(Request::OrchestratorWorkerStatus {
+            pane_id: pane,
+            session_id: session_id.map(|s| s.to_string()),
+        });
+
+        match result {
+            Ok(val) => {
+                let status = val["status"].as_str().unwrap_or("unknown");
+                match status {
+                    "gone" => {
+                        println!("WORKER_GONE: tako:{pane}");
+                        return Ok(());
+                    }
+                    "idle" => {
+                        idle_streak += 1;
+                    }
+                    "busy" => {
+                        idle_streak = 0;
+                    }
+                    _ => {
+                        // unknown: grep フォールバック（recent_output からパターンを判定）
+                        if let Some(output) = val["recent_output"].as_str() {
+                            if output.contains("ed for ")
+                                && output.chars().any(|c| c.is_ascii_digit())
+                            {
+                                idle_streak += 1;
+                            } else if output.contains("esc to interrupt")
+                                || output.contains("ing… (")
+                            {
+                                idle_streak = 0;
+                            } else {
+                                idle_streak += 1;
+                            }
+                        } else {
+                            idle_streak += 1;
+                        }
+                    }
+                }
+
+                if idle_streak >= need_streak {
+                    let ctx = val["ctx_percent"].as_u64();
+                    if let Some(pct) = ctx {
+                        println!("WORKER_IDLE: tako:{pane} (ctx {pct}%)");
+                    } else {
+                        println!("WORKER_IDLE: tako:{pane}");
+                    }
+                    return Ok(());
+                }
+            }
+            Err(_) => {
+                println!("WORKER_GONE: tako:{pane}");
+                return Ok(());
+            }
+        }
+
+        std::thread::sleep(interval);
+    }
+}
+
+/// `tako orchestrator projects` — CLI 版プロジェクト管理
+fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
+    use tako_control::orchestrator;
+
+    match sub {
+        ProjectsCommand::List => {
+            let config = orchestrator::ProjectsConfig::load()?;
+            let projects = config.list_resolved();
+            if projects.is_empty() {
+                eprintln!("登録済みプロジェクトはありません。");
+                eprintln!("追加: tako orchestrator projects add --key <名前> --cwd <パス>");
+            } else {
+                for p in &projects {
+                    let desc = p.description.as_deref().unwrap_or("");
+                    println!("{:<16} {}  {}", p.key, p.cwd, desc);
+                }
+            }
+            Ok(())
+        }
+        ProjectsCommand::Add {
+            key,
+            cwd,
+            description,
+        } => {
+            orchestrator::ensure_defaults()?;
+            let mut config = orchestrator::ProjectsConfig::load()?;
+            config.add(key.clone(), cwd.clone(), description.clone());
+            config.save()?;
+            eprintln!("追加しました: {key} → {cwd}");
+            Ok(())
+        }
+        ProjectsCommand::Remove { key } => {
+            let mut config = orchestrator::ProjectsConfig::load()?;
+            if !config.remove(key) {
+                return Err(format!("プロジェクト '{key}' が見つかりません"));
+            }
+            config.save()?;
+            eprintln!("削除しました: {key}");
+            Ok(())
+        }
     }
 }
 
@@ -998,9 +1242,36 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane: target_pane(*pane)?,
             seconds: *seconds,
         },
+        Command::Orchestrator(OrchestratorCommand::Spawn {
+            project,
+            prompt,
+            label,
+            model,
+            effort,
+        }) => Request::OrchestratorSpawn {
+            project: project.clone(),
+            prompt: prompt.clone(),
+            label: label.clone(),
+            model: model.clone(),
+            effort: effort.clone(),
+            pane: target_pane(None)?,
+        },
+        Command::Orchestrator(OrchestratorCommand::Status { pane, session_id }) => {
+            Request::OrchestratorWorkerStatus {
+                pane_id: *pane,
+                session_id: session_id.clone(),
+            }
+        }
         // main() で分岐済みのため論理的に到達不能
         Command::Mcp(_) => unreachable!("mcp serve は run() を通らない"),
         Command::SetupMcp(_) => unreachable!("setup-mcp は run() を通らない"),
+        Command::Master { .. } => unreachable!("master は run() を通らない"),
+        Command::Orchestrator(OrchestratorCommand::Watch { .. }) => {
+            unreachable!("orchestrator watch は run() を通らない")
+        }
+        Command::Orchestrator(OrchestratorCommand::Projects(_)) => {
+            unreachable!("orchestrator projects は run() を通らない")
+        }
     })
 }
 
@@ -1127,6 +1398,18 @@ fn print_result(command: &Command, result: &Value) {
         }
         Command::File(_) => println!("{result}"),
         Command::Video(_) => println!("{result}"),
+        Command::Orchestrator(OrchestratorCommand::Spawn { .. }) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(result).unwrap_or_default()
+            );
+        }
+        Command::Orchestrator(OrchestratorCommand::Status { .. }) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(result).unwrap_or_default()
+            );
+        }
         Command::BackgroundList => {
             println!(
                 "{}",
