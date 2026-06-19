@@ -6765,18 +6765,14 @@ impl TakoApp {
             .collect()
     }
 
-    /// ターミナルの現在画面を行要素のリストへ変換する（通常ペイン描画とバックグラウンドプレビューで共用）。
-    /// Zed 方式: 各行を canvas 要素にし、paint コールバック内で shape_line を
-    /// cell_width ベースのグリッドスナップで描画。StyledText の advance 蓄積ずれを排除
-    fn terminal_screen_lines(&self, pane_id: PaneId, show_cursor: bool) -> Vec<gpui::AnyElement> {
+    /// ターミナルの現在画面を行 div のリストへ変換する（通常ペイン描画とバックグラウンドプレビューで共用）。
+    /// run ごとの色・太字・下線などの装飾を StyledText のハイライトへ写す。
+    /// 全角文字を含む行はランごとにセル幅固定 div で配置し、フォント advance と
+    /// グリッドセル幅のずれを吸収する（Markdown テーブル等の罫線崩れ防止）
+    fn terminal_screen_lines(&self, pane_id: PaneId, show_cursor: bool) -> Vec<gpui::Div> {
         let theme = &self.theme;
-        let Some(cell_size) = self.cell_size else {
-            return Vec::new();
-        };
-        let cw = cell_size.width;
-        let lh = px(theme.line_height);
-        let font_family = theme.font_family.clone();
-        let font_size = px(theme.font_size);
+        let default_style = self.text_style();
+        let cell_width = self.cell_size.map(|c| c.width);
         let Some(screen) = self
             .terminals
             .get(&pane_id)
@@ -6784,116 +6780,119 @@ impl TakoApp {
         else {
             return Vec::new();
         };
+        let total_cols = screen.cols;
         screen
             .lines
             .into_iter()
             .map(|line| {
-                // 各ランを (開始グリッド列, テキスト, スタイル) のバッチに変換
-                struct RunBatch {
-                    start_col: usize,
-                    grid_width: usize,
-                    text: String,
-                    fg: tako_core::Rgb,
-                    bg: Option<tako_core::Rgb>,
-                    bold: bool,
-                    italic: bool,
-                    underline: bool,
-                    strikeout: bool,
+                if !line.has_wide || cell_width.is_none() {
+                    // 全角なし or セル幅未計測: 従来通り行全体を 1 つの StyledText
+                    let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = line
+                        .runs
+                        .iter()
+                        .map(|run| (run.range.clone(), self.run_highlight(run)))
+                        .collect();
+                    return div().h(px(theme.line_height)).child(
+                        StyledText::new(line.text)
+                            .with_default_highlights(&default_style, highlights),
+                    );
                 }
-                let total_cols = screen.cols;
-                let mut batches: Vec<RunBatch> = Vec::with_capacity(line.runs.len());
-                for run in &line.runs {
-                    let run_text = &line.text[run.range.clone()];
-                    if run_text.is_empty() {
-                        continue;
+                // 全角文字を含む行: 1 文字ずつグリッド位置にスナップ。
+                // 全角文字はフォント advance ≠ 2*cell_width になり得るため
+                // 1 文字 = 1 div で吸収。半角の連続は同一 run 内でグループ化
+                let cw = cell_width.unwrap();
+                let chars: Vec<(usize, char)> = line.text.char_indices().collect();
+                let row = div()
+                    .h(px(theme.line_height))
+                    .flex()
+                    .flex_row()
+                    .overflow_hidden();
+                let mut children: Vec<gpui::AnyElement> = Vec::with_capacity(chars.len());
+                let mut ci = 0;
+                while ci < chars.len() {
+                    let (byte_off, _) = chars[ci];
+                    let run = line
+                        .runs
+                        .iter()
+                        .find(|r| byte_off >= r.range.start && byte_off < r.range.end)
+                        .unwrap_or(line.runs.last().unwrap());
+                    let char_cols = if ci + 1 < line.cell_cols.len() {
+                        line.cell_cols[ci + 1] - line.cell_cols[ci]
+                    } else {
+                        total_cols.saturating_sub(line.cell_cols[ci]).max(1)
+                    };
+                    if char_cols > 1 {
+                        // 全角: 1 文字 = 1 div（advance ずれを吸収）
+                        let s: String = chars[ci].1.to_string();
+                        let hl = self.run_highlight(run);
+                        let styled = StyledText::new(SharedString::from(s.clone()))
+                            .with_default_highlights(&default_style, vec![(0..s.len(), hl)]);
+                        let mut d = div().w(cw * char_cols as f32).flex_none().overflow_hidden();
+                        if let Some(bg) = run.bg {
+                            d = d.bg(hsla(bg));
+                        }
+                        children.push(d.child(styled).into_any_element());
+                        ci += 1;
+                    } else {
+                        // 半角: 同一 run 内の連続半角をまとめて 1 div
+                        let start = ci;
+                        let run_end = run.range.end;
+                        while ci < chars.len() {
+                            let (bo, _) = chars[ci];
+                            if bo >= run_end {
+                                break;
+                            }
+                            let w = if ci + 1 < line.cell_cols.len() {
+                                line.cell_cols[ci + 1] - line.cell_cols[ci]
+                            } else {
+                                total_cols.saturating_sub(line.cell_cols[ci]).max(1)
+                            };
+                            if w > 1 {
+                                break;
+                            }
+                            ci += 1;
+                        }
+                        let seg: String = chars[start..ci].iter().map(|(_, c)| *c).collect();
+                        let grid_w = if ci < line.cell_cols.len() {
+                            line.cell_cols[ci] - line.cell_cols[start]
+                        } else {
+                            total_cols.saturating_sub(line.cell_cols[start]).max(1)
+                        };
+                        let hl = self.run_highlight(run);
+                        let styled = StyledText::new(SharedString::from(seg.clone()))
+                            .with_default_highlights(&default_style, vec![(0..seg.len(), hl)]);
+                        children.push(
+                            div()
+                                .w(cw * grid_w as f32)
+                                .flex_none()
+                                .overflow_hidden()
+                                .child(styled)
+                                .into_any_element(),
+                        );
                     }
-                    // ラン先頭/末尾の char index → cell_cols でグリッド列幅を計算
-                    let start_char = line.text[..run.range.start].chars().count();
-                    let end_char = start_char + run_text.chars().count();
-                    let start_col = line.cell_cols.get(start_char).copied().unwrap_or(0);
-                    let end_col = line.cell_cols.get(end_char).copied().unwrap_or(total_cols);
-                    batches.push(RunBatch {
-                        start_col,
-                        grid_width: end_col.saturating_sub(start_col).max(1),
-                        text: run_text.to_string(),
-                        fg: run.fg,
-                        bg: run.bg,
-                        bold: run.bold,
-                        italic: run.italic,
-                        underline: run.underline,
-                        strikeout: run.strikeout,
-                    });
                 }
-                let font_family = font_family.clone();
-                canvas(
-                    |_, _, _| (),
-                    move |bounds, _, window, cx| {
-                        let origin = bounds.origin;
-                        // 背景矩形の描画
-                        for batch in &batches {
-                            if let Some(bg) = batch.bg {
-                                let rect_bounds = Bounds::new(
-                                    point(origin.x + cw * batch.start_col as f32, origin.y),
-                                    size(cw * batch.grid_width as f32, lh),
-                                );
-                                window.paint_quad(fill(rect_bounds, hsla(bg)));
-                            }
-                        }
-                        // テキスト描画
-                        for batch in &batches {
-                            if batch.text.chars().all(|c| c == ' ') {
-                                continue;
-                            }
-                            let x = origin.x + cw * batch.start_col as f32;
-                            let mut font = Font {
-                                family: SharedString::from(font_family.clone()),
-                                ..gpui::font(font_family.clone())
-                            };
-                            if batch.bold {
-                                font.weight = FontWeight::BOLD;
-                            }
-                            if batch.italic {
-                                font.style = FontStyle::Italic;
-                            }
-                            let underline = batch.underline.then_some(UnderlineStyle {
-                                thickness: px(1.0),
-                                color: None,
-                                wavy: false,
-                            });
-                            let strikethrough = batch.strikeout.then_some(StrikethroughStyle {
-                                thickness: px(1.0),
-                                color: None,
-                            });
-                            let text_run = TextRun {
-                                len: batch.text.len(),
-                                font,
-                                color: hsla(batch.fg),
-                                underline,
-                                strikethrough,
-                                background_color: None,
-                            };
-                            let shaped = window.text_system().shape_line(
-                                SharedString::from(batch.text.clone()),
-                                font_size,
-                                &[text_run],
-                                Some(cw),
-                            );
-                            let _ = shaped.paint(
-                                point(x, origin.y),
-                                lh,
-                                gpui::TextAlign::Left,
-                                None,
-                                window,
-                                cx,
-                            );
-                        }
-                    },
-                )
-                .h(lh)
-                .w_full()
-                .into_any_element()
+                row.children(children)
             })
             .collect()
+    }
+
+    fn run_highlight(&self, run: &tako_core::screen::StyleRun) -> HighlightStyle {
+        HighlightStyle {
+            color: Some(hsla(run.fg)),
+            background_color: run.bg.map(hsla),
+            font_weight: run.bold.then_some(FontWeight::BOLD),
+            font_style: run.italic.then_some(FontStyle::Italic),
+            underline: run.underline.then_some(UnderlineStyle {
+                thickness: px(1.0),
+                color: None,
+                wavy: false,
+            }),
+            strikethrough: run.strikeout.then_some(StrikethroughStyle {
+                thickness: px(1.0),
+                color: None,
+            }),
+            fade_out: None,
+        }
     }
 
     fn render_pane(
