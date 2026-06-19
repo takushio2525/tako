@@ -144,6 +144,9 @@ pub trait ControlHost {
     /// alt_screen 遷移後にペインへ書き込む遅延キュー。claude TUI の起動完了（alt_screen 遷移）を
     /// 待ってからプロンプトを送信するために使う。タイムアウト（60 秒）で自動破棄
     fn queue_write_on_alt_screen(&mut self, _pane: PaneId, _data: Vec<u8>) {}
+    /// claude TUI へのプロンプト送信フローを登録する。画面内容を確認しながら
+    /// ❯ 待ち → テキスト送信 → Enter 送信 のステートマシンを駆動する
+    fn queue_prompt_flow(&mut self, _pane: PaneId, _prompt: String) {}
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -1411,12 +1414,11 @@ fn dispatch_orchestrator_spawn(
     cmd_bytes.push(b'\r');
     host.queue_write(new_id, cmd_bytes);
 
-    // プロンプトは claude TUI の起動完了（alt_screen 遷移）を待ってから送信する。
-    // 位置引数方式だとコマンドが長大になり、起動前にシェルに流れ込むリスクがある
+    // プロンプトは claude TUI の起動完了を画面内容で確認してから送信する。
+    // ステートマシン駆動: alt_screen 遷移 → ❯ 表示待ち → テキスト送信 →
+    // 入力欄確認 → Enter 送信 → 処理開始確認
     let oneline_prompt = prompt.replace('\n', "  ");
-    let mut prompt_bytes = oneline_prompt.clone().into_bytes();
-    prompt_bytes.push(b'\r');
-    host.queue_write_on_alt_screen(new_id, prompt_bytes);
+    host.queue_prompt_flow(new_id, oneline_prompt.clone());
 
     // タイトルと role 設定
     let pane_obj = tree_mut(host.workspace_mut(), tab)
@@ -1463,7 +1465,7 @@ fn dispatch_orchestrator_worker_status(
     }
 
     // session_id があれば claude agents で状態確認
-    let (status, ctx_percent) = if let Some(sid) = session_id {
+    let (mut status, ctx_percent) = if let Some(sid) = session_id {
         let agent = orchestrator::query_agent_status(sid);
         (agent.status, agent.ctx_percent)
     } else {
@@ -1482,6 +1484,16 @@ fn dispatch_orchestrator_worker_status(
         }
         lines.join("\n")
     });
+
+    // idle 誤検知防止: サブエージェント完了の瞬間に claude agents --json が
+    // 一時的に idle を返すことがある。ペイン画面に入力プロンプト ❯ が表示
+    // されていなければメインはまだ作業中なので busy に補正する
+    if status == "idle" {
+        let screen_has_prompt = recent_output.as_ref().is_some_and(|out| out.contains('❯'));
+        if !screen_has_prompt {
+            status = "busy".to_string();
+        }
+    }
 
     Ok(json!({
         "status": status,

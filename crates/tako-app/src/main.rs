@@ -155,6 +155,30 @@ enum PanelView {
     Git,
 }
 
+/// claude TUI へのプロンプト送信フローの状態
+#[derive(Debug)]
+enum PromptFlowState {
+    /// alt_screen 遷移待ち
+    WaitAltScreen,
+    /// claude TUI の ❯ プロンプト表示待ち
+    WaitPromptReady,
+    /// プロンプトテキスト送信済み、入力欄への反映待ち
+    WaitTextEchoed,
+    /// Enter 送信済み、処理開始確認待ち
+    WaitProcessing,
+    /// 完了
+    Done,
+}
+
+/// claude TUI へのプロンプト送信ステートマシン
+#[derive(Debug)]
+struct PromptFlow {
+    pane: PaneId,
+    prompt: String,
+    state: PromptFlowState,
+    created_at: std::time::Instant,
+}
+
 actions!(
     tako,
     [
@@ -390,8 +414,10 @@ struct TakoApp {
     pending_attach: Vec<(PaneId, SpawnOptions)>,
     /// セッション起動後に遅延書き込みするデータ（attach_session が非同期のため）
     pending_writes: Vec<(PaneId, Vec<u8>)>,
-    /// alt_screen 遷移後に書き込むデータ（claude TUI 起動完了待ち）。(pane, data, 登録時刻)
+    /// alt_screen 遷移後に書き込むデータ（非プロンプト用の汎用遅延書き込み）
     alt_screen_writes: Vec<(PaneId, Vec<u8>, std::time::Instant)>,
+    /// claude TUI へのプロンプト送信ステートマシン
+    prompt_flows: Vec<PromptFlow>,
     /// dispatch 中に依頼されたプレビューの background ハイライト（ペイン, パス, 生テキスト）
     pending_highlights: Vec<(PaneId, std::path::PathBuf, String)>,
     /// IME 変換中の未確定文字列（FR-1.9。None = 変換中でない）
@@ -895,6 +921,7 @@ impl TakoApp {
             pending_attach: Vec::new(),
             pending_writes: Vec::new(),
             alt_screen_writes: Vec::new(),
+            prompt_flows: Vec::new(),
             pending_highlights: Vec::new(),
             ime: None,
             dragging_border: None,
@@ -1070,7 +1097,7 @@ impl TakoApp {
         })
         .detach();
 
-        // alt_screen 遷移待ちの遅延書き込み専用ポーリング（500ms 間隔）。
+        // alt_screen 遷移待ち + プロンプトフロー駆動のポーリング（500ms 間隔）。
         // spawn 直後は他の IPC リクエストが来ない可能性があるため、短間隔で回す
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
@@ -1079,6 +1106,9 @@ impl TakoApp {
             let ok = this.update(cx, |app: &mut TakoApp, _| {
                 if !app.alt_screen_writes.is_empty() {
                     app.flush_alt_screen_writes();
+                }
+                if !app.prompt_flows.is_empty() {
+                    app.drive_prompt_flows();
                 }
             });
             if ok.is_err() {
@@ -1841,7 +1871,7 @@ impl TakoApp {
 
     /// background thread で tmux セッション一覧を取得するためのコンテキストを収集する。
     /// UI スレッドでの実行コスト: pane/tab の走査のみ（< 0.1ms）
-    /// alt_screen 遷移待ちの遅延書き込みを flush する。
+    /// alt_screen 遷移待ちの遅延書き込みを flush する（汎用）。
     /// 対象ペインが alt_screen に入っていれば書き込み、まだなら保留。60 秒超で破棄
     fn flush_alt_screen_writes(&mut self) {
         let mut remaining = Vec::new();
@@ -1860,6 +1890,58 @@ impl TakoApp {
             }
         }
         self.alt_screen_writes = remaining;
+    }
+
+    /// claude TUI へのプロンプト送信フローを駆動する。
+    /// 画面内容を確認しながら各ステップを進める（sleep ベースではない）
+    fn drive_prompt_flows(&mut self) {
+        let mut remaining = Vec::new();
+        for mut flow in std::mem::take(&mut self.prompt_flows) {
+            if flow.created_at.elapsed() > std::time::Duration::from_secs(120) {
+                continue;
+            }
+            let session = match self.terminals.get(&flow.pane) {
+                Some(s) => s,
+                None => {
+                    remaining.push(flow);
+                    continue;
+                }
+            };
+            match flow.state {
+                PromptFlowState::WaitAltScreen => {
+                    if session.is_alt_screen() {
+                        flow.state = PromptFlowState::WaitPromptReady;
+                    }
+                    remaining.push(flow);
+                }
+                PromptFlowState::WaitPromptReady => {
+                    // claude TUI の入力受付プロンプト ❯ を画面から探す
+                    let lines = session.visible_lines();
+                    let has_prompt = lines.iter().any(|l| l.contains('❯'));
+                    if has_prompt {
+                        session.write(flow.prompt.as_bytes().to_vec());
+                        flow.state = PromptFlowState::WaitTextEchoed;
+                    }
+                    remaining.push(flow);
+                }
+                PromptFlowState::WaitTextEchoed => {
+                    // 入力したプロンプトの先頭部分が画面に表示されたか確認
+                    let lines = session.visible_lines();
+                    let prefix: String = flow.prompt.chars().take(20).collect();
+                    let echoed = lines.iter().any(|l| l.contains(&prefix));
+                    if echoed {
+                        session.write(b"\r".to_vec());
+                        flow.state = PromptFlowState::WaitProcessing;
+                    }
+                    remaining.push(flow);
+                }
+                PromptFlowState::WaitProcessing => {
+                    flow.state = PromptFlowState::Done;
+                }
+                PromptFlowState::Done => {}
+            }
+        }
+        self.prompt_flows = remaining;
     }
 
     fn collect_tmux_context(&self) -> tako_control::TmuxContext {
@@ -7931,6 +8013,15 @@ impl ControlHost for TakoApp {
     fn queue_write_on_alt_screen(&mut self, pane: PaneId, data: Vec<u8>) {
         self.alt_screen_writes
             .push((pane, data, std::time::Instant::now()));
+    }
+
+    fn queue_prompt_flow(&mut self, pane: PaneId, prompt: String) {
+        self.prompt_flows.push(PromptFlow {
+            pane,
+            prompt,
+            state: PromptFlowState::WaitAltScreen,
+            created_at: std::time::Instant::now(),
+        });
     }
 
     fn detach_session(&mut self, pane: PaneId) {
