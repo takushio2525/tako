@@ -6785,8 +6785,8 @@ impl TakoApp {
             .lines
             .into_iter()
             .map(|line| {
-                if !line.has_wide || cell_width.is_none() {
-                    // 全角なし or セル幅未計測: 従来通り行全体を 1 つの StyledText
+                if cell_width.is_none() {
+                    // セル幅未計測: フォールバック（起動直後の一瞬のみ）
                     let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = line
                         .runs
                         .iter()
