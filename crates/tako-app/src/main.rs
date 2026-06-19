@@ -6786,18 +6786,13 @@ impl TakoApp {
             .into_iter()
             .map(|line| {
                 if !line.has_wide || cell_width.is_none() {
-                    // 全角なし or セル幅未計測: 行全体を 1 つの StyledText。
-                    // 幅を明示してテキスト折り返しによる末尾消失を防ぐ
+                    // 全角なし or セル幅未計測: 従来通り行全体を 1 つの StyledText
                     let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = line
                         .runs
                         .iter()
                         .map(|run| (run.range.clone(), self.run_highlight(run)))
                         .collect();
-                    let mut d = div().h(px(theme.line_height));
-                    if let Some(cw) = cell_width {
-                        d = d.w(cw * total_cols as f32).overflow_hidden();
-                    }
-                    return d.child(
+                    return div().h(px(theme.line_height)).child(
                         StyledText::new(line.text)
                             .with_default_highlights(&default_style, highlights),
                     );
@@ -6866,11 +6861,14 @@ impl TakoApp {
                         let hl = self.run_highlight(run);
                         let styled = StyledText::new(SharedString::from(seg.clone()))
                             .with_default_highlights(&default_style, vec![(0..seg.len(), hl)]);
-                        let mut d = div().w(cw * grid_w as f32).flex_none();
-                        if let Some(bg) = run.bg {
-                            d = d.bg(hsla(bg));
-                        }
-                        children.push(d.child(styled).into_any_element());
+                        children.push(
+                            div()
+                                .w(cw * grid_w as f32)
+                                .flex_none()
+                                .overflow_hidden()
+                                .child(styled)
+                                .into_any_element(),
+                        );
                     }
                 }
                 row.children(children)
