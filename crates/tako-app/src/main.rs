@@ -6891,7 +6891,20 @@ impl TakoApp {
             .scroll_ctls
             .get(&pane_id)
             .is_some_and(|c| c.state.in_mode);
-        let lines = self.terminal_screen_lines(pane_id, !scrolled_in_tmux);
+
+        // Zed 方式: screen snapshot から BatchedTextRun を構築し、canvas 内で
+        // shape_line + 絶対位置配置。StyledText のプロポーショナル幅に頼らない
+        let screen = self
+            .terminals
+            .get(&pane_id)
+            .map(|s| s.screen_opts(&self.theme, !scrolled_in_tmux));
+        let term_theme = self.theme.clone();
+        let term_cell = cell;
+        let term_font = Font {
+            family: SharedString::from(self.theme.font_family.clone()),
+            ..gpui::font(self.theme.font_family.clone())
+        };
+        let term_font_size = px(self.theme.font_size);
 
         div()
             .id(("pane", pane_id.as_u64()))
@@ -7026,11 +7039,114 @@ impl TakoApp {
                     ),
             )
             .child(
-                div()
-                    .flex_1()
-                    .p(px(PANE_PADDING))
-                    .overflow_hidden()
-                    .children(lines),
+                // Zed 方式のグリッド描画: canvas の paint コールバック内で
+                // shape_line を呼び、各テキストランを cell_width ベースの
+                // 絶対位置に配置する。StyledText / div レイアウトは使わない
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, cx| {
+                        let origin = bounds.origin;
+                        let cw = term_cell.width;
+                        let lh = px(term_theme.line_height);
+                        let Some(screen) = screen else { return };
+
+                        // 背景矩形の描画（非デフォルト背景を持つセル）
+                        for (row_idx, line) in screen.lines.iter().enumerate() {
+                            let y = origin.y + lh * row_idx as f32;
+                            for run in &line.runs {
+                                if let Some(bg) = run.bg {
+                                    let start_char = line.text[..run.range.start].chars().count();
+                                    let end_char = line.text[..run.range.end].chars().count();
+                                    let start_col =
+                                        line.cell_cols.get(start_char).copied().unwrap_or(0);
+                                    let end_col = if end_char < line.cell_cols.len() {
+                                        line.cell_cols[end_char]
+                                    } else {
+                                        screen.cols
+                                    };
+                                    if end_col > start_col {
+                                        let rect_bounds = Bounds::new(
+                                            point(origin.x + cw * start_col as f32, y),
+                                            size(cw * (end_col - start_col) as f32, lh),
+                                        );
+                                        window.paint_quad(fill(rect_bounds, hsla(bg)));
+                                    }
+                                }
+                            }
+                        }
+
+                        // テキスト描画: 各行の各ランを shape_line で描画
+                        for (row_idx, line) in screen.lines.iter().enumerate() {
+                            let y = origin.y + lh * row_idx as f32;
+
+                            for run in &line.runs {
+                                let run_text = &line.text[run.range.clone()];
+                                // 空白のみのランはスキップ
+                                if run_text.chars().all(|c| c == ' ') {
+                                    continue;
+                                }
+
+                                // ラン開始位置のグリッド列を求める
+                                let start_char_idx = line.text[..run.range.start].chars().count();
+                                let start_col =
+                                    line.cell_cols.get(start_char_idx).copied().unwrap_or(0);
+                                let x = origin.x + cw * start_col as f32;
+
+                                let mut font = term_font.clone();
+                                if run.bold {
+                                    font.weight = FontWeight::BOLD;
+                                }
+                                if run.italic {
+                                    font.style = FontStyle::Italic;
+                                }
+
+                                let underline = if run.underline {
+                                    Some(UnderlineStyle {
+                                        thickness: px(1.0),
+                                        color: None,
+                                        wavy: false,
+                                    })
+                                } else {
+                                    None
+                                };
+                                let strikethrough = if run.strikeout {
+                                    Some(StrikethroughStyle {
+                                        thickness: px(1.0),
+                                        color: None,
+                                    })
+                                } else {
+                                    None
+                                };
+
+                                let text_run = TextRun {
+                                    len: run_text.len(),
+                                    font: font.clone(),
+                                    color: hsla(run.fg),
+                                    underline,
+                                    strikethrough,
+                                    background_color: None,
+                                };
+
+                                let shaped = window.text_system().shape_line(
+                                    SharedString::from(run_text.to_string()),
+                                    term_font_size,
+                                    &[text_run],
+                                    Some(cw),
+                                );
+                                let _ = shaped.paint(
+                                    point(x, y),
+                                    lh,
+                                    gpui::TextAlign::Left,
+                                    None,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }
+                    },
+                )
+                .flex_1()
+                .w_full(),
             )
             .children(scrollbar.map(|(top, thumb_h, track_h, alpha, dragging)| {
                 div()
