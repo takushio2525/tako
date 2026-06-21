@@ -6874,7 +6874,6 @@ impl TakoApp {
                             div()
                                 .w(cw * grid_w as f32)
                                 .flex_none()
-                                .overflow_hidden()
                                 .child(styled)
                                 .into_any_element(),
                         );
