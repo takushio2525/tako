@@ -802,7 +802,9 @@ pub fn tools() -> Vec<Value> {
                     "label": { "type": "string", "description": "ペインタイトルに付けるラベル（省略時は '<project>-worker'）" },
                     "model": { "type": "string", "description": "claude のモデル（省略時は claude-opus-4-6[1m]）" },
                     "effort": { "type": "string", "description": "thinking effort（省略時は max）" },
-                    "pane": pane_schema("分割元ペイン ID（省略時は呼び出し元。このペインの右に子が生える）"),
+                    "pane": pane_schema("分割元ペイン ID（省略時は呼び出し元。このペインの右に子が生える）。\
+                        オーケストレーター master から呼ぶ場合は master 自身のペイン ID を必ず指定すること（\
+                        省略すると別タブに出る場合がある）"),
                 },
                 "required": ["project", "prompt"],
                 "additionalProperties": false,

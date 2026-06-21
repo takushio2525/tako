@@ -1378,13 +1378,30 @@ fn dispatch_orchestrator_spawn(
         None => format!("{project}-worker"),
     };
 
-    // 呼び出し元ペインを右に split（ratio 0.45）。pane が stale（呼び出し元ペインが
-    // 既に閉じている等）の場合はアクティブタブのフォーカス中ペインにフォールバックする
+    // 呼び出し元ペインを右に split（ratio 0.45）。
+    // pane 未指定時は orchestrator-master role のペインを検索してそのタブに出す。
+    // どちらも見つからなければアクティブタブのフォーカス中ペインにフォールバックする
     let (tab, target) = match pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok()) {
         Some(resolved) => resolved,
         None => {
-            let focused = host.workspace().active_tab().tree().focused().as_u64();
-            resolve_pane(host.workspace(), Some(focused))?
+            // master role のペインを検索（MCP 経由で TAKO_PANE_ID が取れない場合の救済）
+            let master_pane = host.workspace().tabs().iter().find_map(|tab| {
+                tab.tree().panes().iter().find_map(|p| {
+                    let role = p.role()?;
+                    if role.starts_with("orchestrator-master") {
+                        Some((tab.id(), p.id()))
+                    } else {
+                        None
+                    }
+                })
+            });
+            match master_pane {
+                Some(resolved) => resolved,
+                None => {
+                    let focused = host.workspace().active_tab().tree().focused().as_u64();
+                    resolve_pane(host.workspace(), Some(focused))?
+                }
+            }
         }
     };
     let new_pane = Pane::new(origin);

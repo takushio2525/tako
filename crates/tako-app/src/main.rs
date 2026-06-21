@@ -177,6 +177,8 @@ struct PromptFlow {
     prompt: String,
     state: PromptFlowState,
     created_at: std::time::Instant,
+    /// 現在のステートに遷移した時刻（ステート内タイムアウト用）
+    state_entered_at: std::time::Instant,
 }
 
 actions!(
@@ -1896,6 +1898,7 @@ impl TakoApp {
     /// 画面内容を確認しながら各ステップを進める（sleep ベースではない）
     fn drive_prompt_flows(&mut self) {
         let mut remaining = Vec::new();
+        let now = std::time::Instant::now();
         for mut flow in std::mem::take(&mut self.prompt_flows) {
             if flow.created_at.elapsed() > std::time::Duration::from_secs(120) {
                 continue;
@@ -1911,27 +1914,33 @@ impl TakoApp {
                 PromptFlowState::WaitAltScreen => {
                     if session.is_alt_screen() {
                         flow.state = PromptFlowState::WaitPromptReady;
+                        flow.state_entered_at = now;
                     }
                     remaining.push(flow);
                 }
                 PromptFlowState::WaitPromptReady => {
-                    // claude TUI の入力受付プロンプト ❯ を画面から探す
                     let lines = session.visible_lines();
                     let has_prompt = lines.iter().any(|l| l.contains('❯'));
                     if has_prompt {
                         session.write(flow.prompt.as_bytes().to_vec());
                         flow.state = PromptFlowState::WaitTextEchoed;
+                        flow.state_entered_at = now;
                     }
                     remaining.push(flow);
                 }
                 PromptFlowState::WaitTextEchoed => {
-                    // 入力したプロンプトの先頭部分が画面に表示されたか確認
                     let lines = session.visible_lines();
-                    let prefix: String = flow.prompt.chars().take(20).collect();
+                    let prefix: String = flow.prompt.chars().take(10).collect();
                     let echoed = lines.iter().any(|l| l.contains(&prefix));
-                    if echoed {
+                    // テキスト確認 or 10秒タイムアウトで Enter を送信。
+                    // 長いプロンプトの折り返しや日本語テキストの幅計算でマッチしない
+                    // ケースを救済する
+                    let timed_out =
+                        flow.state_entered_at.elapsed() > std::time::Duration::from_secs(10);
+                    if echoed || timed_out {
                         session.write(b"\r".to_vec());
                         flow.state = PromptFlowState::WaitProcessing;
+                        flow.state_entered_at = now;
                     }
                     remaining.push(flow);
                 }
@@ -7898,11 +7907,13 @@ impl ControlHost for TakoApp {
     }
 
     fn queue_prompt_flow(&mut self, pane: PaneId, prompt: String) {
+        let now = std::time::Instant::now();
         self.prompt_flows.push(PromptFlow {
             pane,
             prompt,
             state: PromptFlowState::WaitAltScreen,
-            created_at: std::time::Instant::now(),
+            created_at: now,
+            state_entered_at: now,
         });
     }
 
