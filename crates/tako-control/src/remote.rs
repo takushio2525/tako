@@ -292,35 +292,38 @@ fn register_relay(machine_id: &str, tunnel_url: &str) -> Result<(), String> {
     }
 }
 
-/// QR コードに含める接続 URL を生成する
+/// QR コードに含める接続 URL を生成する。
+/// 常に Cloudflare Pages PWA 経由の URL を返す。
 pub fn connect_url(
     tunnel_url: Option<&str>,
     local_url: &str,
     token: &str,
-    machine_id: Option<&str>,
+    name: Option<&str>,
 ) -> String {
     let pages_url =
         std::env::var("TAKO_PAGES_URL").unwrap_or_else(|_| DEFAULT_PAGES_URL.to_string());
-
-    match (tunnel_url, machine_id) {
-        (Some(tunnel), Some(mid)) => {
-            // Phase 3: Pages 経由の接続（tunnel URL + machine ID 付き）
-            format!(
-                "{pages_url}/connect?host={}&token={}&machine={}",
-                urlencoding::encode(tunnel),
-                urlencoding::encode(token),
-                urlencoding::encode(mid),
-            )
-        }
-        (Some(tunnel), None) => {
-            // tunnel あり・machine ID なし: tunnel URL に直接トークン付き
-            format!("{tunnel}#token={token}")
-        }
-        _ => {
-            // LAN のみ: 従来の直接 URL
-            format!("{local_url}#token={token}")
-        }
+    let host = tunnel_url.unwrap_or(local_url);
+    let mut url = format!(
+        "{pages_url}/connect?host={}&token={}",
+        urlencoding::encode(host),
+        urlencoding::encode(token),
+    );
+    if let Some(n) = name {
+        url.push_str(&format!("&name={}", urlencoding::encode(n)));
     }
+    url
+}
+
+/// ホスト名を取得する（表示用）
+pub fn hostname() -> String {
+    Command::new("hostname")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 // --- HTTP サーバー（既存コード）---
@@ -559,8 +562,30 @@ fn handle_request(
     }
 }
 
-/// QR コードを PNG 画像として生成し、Preview.app で開く（macOS）。
-/// 生成先のパスを返す。
+/// macOS の LAN IP アドレスを取得する。取得できなければ None を返す
+pub fn lan_ip() -> Option<String> {
+    let output = Command::new("ifconfig")
+        .arg("en0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("inet ") {
+            if let Some(ip) = rest.split_whitespace().next() {
+                if ip != "127.0.0.1" {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// QR コードを PNG 画像として生成する。生成先のパスを返す。
+/// 表示は呼び出し側が行う（tako open 等）
 pub fn generate_qr_png(url: &str) -> io::Result<std::path::PathBuf> {
     use image::{GrayImage, Luma};
     use qrcode::QrCode;
@@ -591,9 +616,6 @@ pub fn generate_qr_png(url: &str) -> io::Result<std::path::PathBuf> {
     let path = std::env::temp_dir().join("tako-remote-qr.png");
     img.save(&path)
         .map_err(|e| io::Error::other(format!("PNG の保存に失敗: {e}")))?;
-
-    // macOS: Preview.app で開く
-    let _ = Command::new("open").arg(&path).spawn();
 
     Ok(path)
 }
@@ -693,6 +715,17 @@ mod tests {
         assert_eq!(extract_pane_id("/api/panes/0/close"), Some(0));
         assert_eq!(extract_pane_id("/api/panes/abc/input"), None);
         assert_eq!(extract_pane_id("/api/health"), None);
+    }
+
+    #[test]
+    fn lan_ipはipv4形式を返す() {
+        // macOS の en0 がある環境では Some("x.x.x.x") が返る
+        if let Some(ip) = lan_ip() {
+            let parts: Vec<&str> = ip.split('.').collect();
+            assert_eq!(parts.len(), 4, "IPv4 アドレスではない: {ip}");
+            assert_ne!(ip, "127.0.0.1", "ループバックは除外される");
+        }
+        // en0 が無い環境（CI 等）では None が返り、パニックしないことが重要
     }
 
     #[test]
@@ -850,19 +883,30 @@ mod tests {
 
     #[test]
     fn connect_urlの生成() {
-        // tunnel + machine ID あり → Pages 経由
+        // tunnel あり + name あり → Pages 経由、host は tunnel URL
         let url = connect_url(
             Some("https://foo.trycloudflare.com"),
             "http://localhost:7749",
             "abc123",
-            Some("m-uuid"),
+            Some("my-mac"),
         );
-        assert!(url.contains("connect?"));
-        assert!(url.contains("machine=m-uuid"));
+        assert!(url.starts_with("https://tako-remote.pages.dev/connect?"));
+        assert!(url.contains("host=https%3A%2F%2Ffoo.trycloudflare.com"));
+        assert!(url.contains("token=abc123"));
+        assert!(url.contains("name=my-mac"));
 
-        // tunnel なし → LAN 直接
+        // tunnel なし → Pages 経由、host は LAN URL
+        let url = connect_url(None, "http://192.168.1.10:7749", "tok456", Some("host1"));
+        assert!(url.starts_with("https://tako-remote.pages.dev/connect?"));
+        assert!(url.contains("host=http%3A%2F%2F192.168.1.10%3A7749"));
+        assert!(url.contains("token=tok456"));
+        assert!(url.contains("name=host1"));
+
+        // name なし → name パラメータ省略
         let url = connect_url(None, "http://localhost:7749", "abc123", None);
-        assert_eq!(url, "http://localhost:7749#token=abc123");
+        assert!(url.starts_with("https://tako-remote.pages.dev/connect?"));
+        assert!(url.contains("token=abc123"));
+        assert!(!url.contains("name="));
     }
 
     #[test]
@@ -1032,13 +1076,16 @@ mod tests {
     }
 
     #[test]
-    fn connect_urlはtunnelありmachineなしでfragmentを使う() {
+    fn connect_urlはtunnelありnameなしでもpages経由() {
         let url = connect_url(
             Some("https://foo.trycloudflare.com"),
             "http://localhost:7749",
             "tok123",
             None,
         );
-        assert_eq!(url, "https://foo.trycloudflare.com#token=tok123");
+        assert!(url.starts_with("https://tako-remote.pages.dev/connect?"));
+        assert!(url.contains("host=https%3A%2F%2Ffoo.trycloudflare.com"));
+        assert!(url.contains("token=tok123"));
+        assert!(!url.contains("name="));
     }
 }
