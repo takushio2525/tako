@@ -292,35 +292,38 @@ fn register_relay(machine_id: &str, tunnel_url: &str) -> Result<(), String> {
     }
 }
 
-/// QR コードに含める接続 URL を生成する
+/// QR コードに含める接続 URL を生成する。
+/// 常に Cloudflare Pages PWA 経由の URL を返す。
 pub fn connect_url(
     tunnel_url: Option<&str>,
     local_url: &str,
     token: &str,
-    machine_id: Option<&str>,
+    name: Option<&str>,
 ) -> String {
     let pages_url =
         std::env::var("TAKO_PAGES_URL").unwrap_or_else(|_| DEFAULT_PAGES_URL.to_string());
-
-    match (tunnel_url, machine_id) {
-        (Some(tunnel), Some(mid)) => {
-            // Phase 3: Pages 経由の接続（tunnel URL + machine ID 付き）
-            format!(
-                "{pages_url}/connect?host={}&token={}&machine={}",
-                urlencoding::encode(tunnel),
-                urlencoding::encode(token),
-                urlencoding::encode(mid),
-            )
-        }
-        (Some(tunnel), None) => {
-            // tunnel あり・machine ID なし: tunnel URL に直接トークン付き
-            format!("{tunnel}#token={token}")
-        }
-        _ => {
-            // LAN のみ: 従来の直接 URL
-            format!("{local_url}#token={token}")
-        }
+    let host = tunnel_url.unwrap_or(local_url);
+    let mut url = format!(
+        "{pages_url}/connect?host={}&token={}",
+        urlencoding::encode(host),
+        urlencoding::encode(token),
+    );
+    if let Some(n) = name {
+        url.push_str(&format!("&name={}", urlencoding::encode(n)));
     }
+    url
+}
+
+/// ホスト名を取得する（表示用）
+pub fn hostname() -> String {
+    Command::new("hostname")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 // --- HTTP サーバー（既存コード）---
@@ -880,19 +883,30 @@ mod tests {
 
     #[test]
     fn connect_urlの生成() {
-        // tunnel + machine ID あり → Pages 経由
+        // tunnel あり + name あり → Pages 経由、host は tunnel URL
         let url = connect_url(
             Some("https://foo.trycloudflare.com"),
             "http://localhost:7749",
             "abc123",
-            Some("m-uuid"),
+            Some("my-mac"),
         );
-        assert!(url.contains("connect?"));
-        assert!(url.contains("machine=m-uuid"));
+        assert!(url.starts_with("https://tako-remote.pages.dev/connect?"));
+        assert!(url.contains("host=https%3A%2F%2Ffoo.trycloudflare.com"));
+        assert!(url.contains("token=abc123"));
+        assert!(url.contains("name=my-mac"));
 
-        // tunnel なし → LAN 直接
+        // tunnel なし → Pages 経由、host は LAN URL
+        let url = connect_url(None, "http://192.168.1.10:7749", "tok456", Some("host1"));
+        assert!(url.starts_with("https://tako-remote.pages.dev/connect?"));
+        assert!(url.contains("host=http%3A%2F%2F192.168.1.10%3A7749"));
+        assert!(url.contains("token=tok456"));
+        assert!(url.contains("name=host1"));
+
+        // name なし → name パラメータ省略
         let url = connect_url(None, "http://localhost:7749", "abc123", None);
-        assert_eq!(url, "http://localhost:7749#token=abc123");
+        assert!(url.starts_with("https://tako-remote.pages.dev/connect?"));
+        assert!(url.contains("token=abc123"));
+        assert!(!url.contains("name="));
     }
 
     #[test]
@@ -1062,13 +1076,16 @@ mod tests {
     }
 
     #[test]
-    fn connect_urlはtunnelありmachineなしでfragmentを使う() {
+    fn connect_urlはtunnelありnameなしでもpages経由() {
         let url = connect_url(
             Some("https://foo.trycloudflare.com"),
             "http://localhost:7749",
             "tok123",
             None,
         );
-        assert_eq!(url, "https://foo.trycloudflare.com#token=tok123");
+        assert!(url.starts_with("https://tako-remote.pages.dev/connect?"));
+        assert!(url.contains("host=https%3A%2F%2Ffoo.trycloudflare.com"));
+        assert!(url.contains("token=tok123"));
+        assert!(!url.contains("name="));
     }
 }

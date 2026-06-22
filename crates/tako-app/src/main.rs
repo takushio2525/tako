@@ -8187,11 +8187,12 @@ impl ControlHost for TakoApp {
         let local_url = format!("http://{lan_host}:{port}");
         let tunnel_url = server.tunnel_url().map(|s| s.to_string());
         let machine_id = server.machine_id().map(|s| s.to_string());
+        let host_name = tako_control::remote::hostname();
         let connect = tako_control::remote::connect_url(
             tunnel_url.as_deref(),
             &local_url,
             &token,
-            machine_id.as_deref(),
+            Some(&host_name),
         );
         self.remote_server = Some(server);
         Ok(serde_json::json!({
@@ -8223,11 +8224,12 @@ impl ControlHost for TakoApp {
                 let local_url = format!("http://{}:{}", lan_host, server.port());
                 let tunnel_url = server.tunnel_url().map(|s| s.to_string());
                 let machine_id = server.machine_id().map(|s| s.to_string());
+                let host_name = tako_control::remote::hostname();
                 let connect = tako_control::remote::connect_url(
                     tunnel_url.as_deref(),
                     &local_url,
                     server.token(),
-                    machine_id.as_deref(),
+                    Some(&host_name),
                 );
                 serde_json::json!({
                     "running": true,
