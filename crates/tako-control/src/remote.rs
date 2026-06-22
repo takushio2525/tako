@@ -559,7 +559,10 @@ fn handle_request(
     }
 }
 
-/// QR コードをターミナルに表示する（Unicode ブロック文字で描画）
+/// QR コードをターミナルに表示する
+///
+/// ANSI カラーで白背景に黒モジュールを描画する。
+/// ダークターミナルでもスキャナーが正しく読める。
 pub fn print_qr(url: &str) {
     use qrcode::QrCode;
 
@@ -569,18 +572,24 @@ pub fn print_qr(url: &str) {
     };
     let colors = code.to_colors();
     let width = code.width();
-
     let height = width;
     let rows = height.div_ceil(2);
-    let quiet = 2;
 
-    for _ in 0..quiet {
-        print!("{}", " ".repeat(width + quiet * 2));
-        println!();
+    // QR 規格の最小 quiet zone = 4 モジュール
+    let quiet = 4_usize;
+    let quiet_cols = quiet * 2; // 各モジュール 2 文字幅
+    let full_width = (width + quiet * 2) * 2;
+    // ハーフブロック 1 行 = 2 モジュール高 → quiet zone 4 モジュール = 2 行
+    let quiet_rows = (quiet + 1) / 2;
+
+    let white_line = format!("\x1b[47m{}\x1b[0m", " ".repeat(full_width));
+
+    for _ in 0..quiet_rows {
+        println!("{white_line}");
     }
 
     for row in 0..rows {
-        print!("{}", " ".repeat(quiet));
+        print!("\x1b[47m{}", " ".repeat(quiet_cols));
         for col in 0..width {
             let top_idx = row * 2;
             let bot_idx = row * 2 + 1;
@@ -590,20 +599,19 @@ pub fn print_qr(url: &str) {
             } else {
                 false
             };
+            // ▀: 前景色 = 上半分、背景色 = 下半分
             match (top_dark, bot_dark) {
-                (true, true) => print!("█"),
-                (true, false) => print!("▀"),
-                (false, true) => print!("▄"),
-                (false, false) => print!(" "),
+                (true, true) => print!("\x1b[40m  "),
+                (true, false) => print!("\x1b[30;47m▀▀"),
+                (false, true) => print!("\x1b[37;40m▀▀"),
+                (false, false) => print!("\x1b[47m  "),
             }
         }
-        print!("{}", " ".repeat(quiet));
-        println!();
+        println!("\x1b[47m{}\x1b[0m", " ".repeat(quiet_cols));
     }
 
-    for _ in 0..quiet {
-        print!("{}", " ".repeat(width + quiet * 2));
-        println!();
+    for _ in 0..quiet_rows {
+        println!("{white_line}");
     }
 }
 
