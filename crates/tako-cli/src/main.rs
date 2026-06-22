@@ -1490,6 +1490,20 @@ fn print_result(command: &Command, result: &Value) {
                 serde_json::to_string_pretty(result).unwrap_or_default()
             );
         }
+        Command::Remote(RemoteCommand::Start { .. }) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(result).unwrap_or_default()
+            );
+            if let Some(url) = result["url"].as_str() {
+                if let Some(token) = result["token"].as_str() {
+                    let full_url = format!("{url}#token={token}");
+                    eprintln!("\nスキャンして接続:");
+                    tako_control::remote::print_qr(&full_url);
+                    eprintln!("URL: {full_url}");
+                }
+            }
+        }
         Command::Remote(_) => {
             println!(
                 "{}",

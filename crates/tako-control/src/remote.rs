@@ -371,6 +371,71 @@ pub fn print_qr(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::channel::mpsc;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpStream;
+
+    fn start_test_server() -> (RemoteServer, mpsc::UnboundedReceiver<IncomingRequest>) {
+        let (tx, rx) = mpsc::unbounded::<IncomingRequest>();
+        let token = "test-token-abc123".to_string();
+        let server = RemoteServer::start(tx, token, Some(0)).expect("テストサーバー起動");
+        (server, rx)
+    }
+
+    fn mock_dispatch(rx: &mut mpsc::UnboundedReceiver<IncomingRequest>, response: Value) {
+        if let Ok(req) = rx.try_recv() {
+            let _ = req.reply.send(Ok(response));
+        }
+    }
+
+    fn http_request(
+        port: u16,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<&str>,
+    ) -> (u16, String) {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("接続失敗");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let body_bytes = body.unwrap_or("").as_bytes();
+        let mut req = format!("{method} {path} HTTP/1.1\r\nHost: localhost:{port}\r\n");
+        if let Some(t) = token {
+            req.push_str(&format!("Authorization: Bearer {t}\r\n"));
+        }
+        if body.is_some() {
+            req.push_str("Content-Type: application/json\r\n");
+            req.push_str(&format!("Content-Length: {}\r\n", body_bytes.len()));
+        }
+        req.push_str("Connection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).unwrap();
+        if !body_bytes.is_empty() {
+            stream.write_all(body_bytes).unwrap();
+        }
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        let status_line = response.lines().next().unwrap_or("");
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let body_start = response
+            .find("\r\n\r\n")
+            .map(|i| i + 4)
+            .unwrap_or(response.len());
+        let resp_body = response[body_start..].to_string();
+        (status, resp_body)
+    }
+
+    fn get(port: u16, path: &str, token: Option<&str>) -> (u16, String) {
+        http_request(port, "GET", path, token, None)
+    }
+
+    fn post(port: u16, path: &str, token: &str, body: &str) -> (u16, String) {
+        http_request(port, "POST", path, Some(token), Some(body))
+    }
 
     #[test]
     fn extract_pane_id_からidを取り出せる() {
@@ -382,7 +447,111 @@ mod tests {
 
     #[test]
     fn qr生成がパニックしない() {
-        // 長い URL でもパニックしないことを確認
         print_qr("http://192.168.1.100:7749#token=abc123def456");
+    }
+
+    #[test]
+    fn healthは認証なしでアクセスできる() {
+        let (server, _rx) = start_test_server();
+        let (status, body) = get(server.port(), "/api/health", None);
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], "ok");
+        server.stop();
+    }
+
+    #[test]
+    fn 認証なしリクエストは401() {
+        let (server, _rx) = start_test_server();
+        let (status, _) = get(server.port(), "/api/panes", None);
+        assert_eq!(status, 401);
+        server.stop();
+    }
+
+    #[test]
+    fn 不正トークンは401() {
+        let (server, _rx) = start_test_server();
+        let (status, _) = get(server.port(), "/api/panes", Some("wrong-token"));
+        assert_eq!(status, 401);
+        server.stop();
+    }
+
+    #[test]
+    fn ペイン一覧を取得できる() {
+        let (server, mut rx) = start_test_server();
+        let port = server.port();
+        let token = server.token().to_string();
+
+        let handle = std::thread::spawn(move || get(port, "/api/panes", Some(&token)));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        mock_dispatch(&mut rx, json!({ "panes": [{"id": 1, "title": "zsh"}] }));
+        let (status, body) = handle.join().unwrap();
+
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["panes"][0]["id"], 1);
+        server.stop();
+    }
+
+    #[test]
+    fn 画面内容を取得できる() {
+        let (server, mut rx) = start_test_server();
+        let port = server.port();
+        let token = server.token().to_string();
+
+        let handle = std::thread::spawn(move || get(port, "/api/panes/1/screen", Some(&token)));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        mock_dispatch(&mut rx, json!({ "lines": ["$ hello", "world"] }));
+        let (status, body) = handle.join().unwrap();
+
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["lines"][0], "$ hello");
+        server.stop();
+    }
+
+    #[test]
+    fn テキスト送信ができる() {
+        let (server, mut rx) = start_test_server();
+        let port = server.port();
+        let token = server.token().to_string();
+
+        let handle = std::thread::spawn(move || {
+            post(
+                port,
+                "/api/panes/1/input",
+                &token,
+                r#"{"text":"ls","newline":true}"#,
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        mock_dispatch(&mut rx, json!({ "ok": true }));
+        let (status, _) = handle.join().unwrap();
+
+        assert_eq!(status, 200);
+        server.stop();
+    }
+
+    #[test]
+    fn 存在しないエンドポイントは404() {
+        let (server, _rx) = start_test_server();
+        let (status, _) = get(server.port(), "/api/unknown", Some(server.token()));
+        assert_eq!(status, 404);
+        server.stop();
+    }
+
+    #[test]
+    fn サーバーの起動と停止() {
+        let (server, _rx) = start_test_server();
+        let port = server.port();
+        assert!(port > 0);
+        assert_eq!(server.token(), "test-token-abc123");
+
+        let (status, _) = get(port, "/api/health", None);
+        assert_eq!(status, 200);
+
+        server.stop();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(TcpStream::connect(format!("127.0.0.1:{port}")).is_err());
     }
 }
