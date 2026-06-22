@@ -8183,7 +8183,8 @@ impl ControlHost for TakoApp {
             .map_err(|e| e.to_string())?;
         let port = server.port();
         let token = server.token().to_string();
-        let local_url = format!("http://localhost:{port}");
+        let lan_host = tako_control::remote::lan_ip().unwrap_or_else(|| "localhost".to_string());
+        let local_url = format!("http://{lan_host}:{port}");
         let tunnel_url = server.tunnel_url().map(|s| s.to_string());
         let machine_id = server.machine_id().map(|s| s.to_string());
         let connect = tako_control::remote::connect_url(
@@ -8217,7 +8218,9 @@ impl ControlHost for TakoApp {
     fn remote_status(&self) -> serde_json::Value {
         match &self.remote_server {
             Some(server) => {
-                let local_url = format!("http://localhost:{}", server.port());
+                let lan_host =
+                    tako_control::remote::lan_ip().unwrap_or_else(|| "localhost".to_string());
+                let local_url = format!("http://{}:{}", lan_host, server.port());
                 let tunnel_url = server.tunnel_url().map(|s| s.to_string());
                 let machine_id = server.machine_id().map(|s| s.to_string());
                 let connect = tako_control::remote::connect_url(

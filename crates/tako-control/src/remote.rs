@@ -559,8 +559,30 @@ fn handle_request(
     }
 }
 
-/// QR コードを PNG 画像として生成し、Preview.app で開く（macOS）。
-/// 生成先のパスを返す。
+/// macOS の LAN IP アドレスを取得する。取得できなければ None を返す
+pub fn lan_ip() -> Option<String> {
+    let output = Command::new("ifconfig")
+        .arg("en0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("inet ") {
+            if let Some(ip) = rest.split_whitespace().next() {
+                if ip != "127.0.0.1" {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// QR コードを PNG 画像として生成する。生成先のパスを返す。
+/// 表示は呼び出し側が行う（tako open 等）
 pub fn generate_qr_png(url: &str) -> io::Result<std::path::PathBuf> {
     use image::{GrayImage, Luma};
     use qrcode::QrCode;
@@ -591,9 +613,6 @@ pub fn generate_qr_png(url: &str) -> io::Result<std::path::PathBuf> {
     let path = std::env::temp_dir().join("tako-remote-qr.png");
     img.save(&path)
         .map_err(|e| io::Error::other(format!("PNG の保存に失敗: {e}")))?;
-
-    // macOS: Preview.app で開く
-    let _ = Command::new("open").arg(&path).spawn();
 
     Ok(path)
 }
@@ -693,6 +712,17 @@ mod tests {
         assert_eq!(extract_pane_id("/api/panes/0/close"), Some(0));
         assert_eq!(extract_pane_id("/api/panes/abc/input"), None);
         assert_eq!(extract_pane_id("/api/health"), None);
+    }
+
+    #[test]
+    fn lan_ipはipv4形式を返す() {
+        // macOS の en0 がある環境では Some("x.x.x.x") が返る
+        if let Some(ip) = lan_ip() {
+            let parts: Vec<&str> = ip.split('.').collect();
+            assert_eq!(parts.len(), 4, "IPv4 アドレスではない: {ip}");
+            assert_ne!(ip, "127.0.0.1", "ループバックは除外される");
+        }
+        // en0 が無い環境（CI 等）では None が返り、パニックしないことが重要
     }
 
     #[test]
