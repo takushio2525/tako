@@ -1503,10 +1503,13 @@ fn print_result(command: &Command, result: &Value) {
                 match tako_control::remote::generate_qr_png(connect) {
                     Ok(path) => {
                         eprintln!("\nQR コードを生成しました: {}", path.display());
-                        // tako CLI 経由でプレビュー表示（CLI が IPC を解決する）
-                        let _ = std::process::Command::new("tako")
-                            .args(["open", &path.to_string_lossy()])
-                            .spawn();
+                        // IPC 経由で直接 OpenFile を送る（外部プロセス経由だとペイン解決に失敗する）
+                        let _ = send_request(Request::OpenFile {
+                            pane: None,
+                            path: path.display().to_string(),
+                            mode: Some(tako_control::protocol::PreviewModeWire::Image),
+                            direction: None,
+                        });
                         eprintln!("スマホでスキャンしてください。");
                     }
                     Err(e) => eprintln!("\nQR コード画像の生成に失敗: {e}"),
