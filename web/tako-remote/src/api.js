@@ -45,6 +45,9 @@ export function createClient(host, token) {
     close(id) {
       return request('POST', `/api/panes/${id}/close`);
     },
+    base() {
+      return base;
+    },
   };
 }
 
@@ -64,4 +67,25 @@ export async function resolveHost(machineId) {
   } catch {
     return null;
   }
+}
+
+/**
+ * 指数バックオフ付きリトライ。接続復旧を待つ用途。
+ * callback が成功するまで最大 maxRetries 回リトライし、成功した結果を返す。
+ * 全リトライ失敗時は最後のエラーを throw する。
+ */
+export async function withRetry(callback, { maxRetries = 5, baseDelay = 1000 } = {}) {
+  let lastError;
+  for (let i = 0; i <= maxRetries; i++) {
+    try {
+      return await callback();
+    } catch (e) {
+      lastError = e;
+      if (i < maxRetries) {
+        const delay = baseDelay * Math.pow(2, i) + Math.random() * 500;
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+  }
+  throw lastError;
 }
