@@ -570,7 +570,6 @@ struct AgentEntry {
     /// 表示名（ペイン title / role > OSC タイトル > 既定）
     label: String,
     state: CommandState,
-    cwd: Option<String>,
     /// ペインを保持する tmux バックエンドセッション名（Phase 5.5。非永続化ペインは None）
     backend: Option<String>,
 }
@@ -1527,9 +1526,6 @@ impl TakoApp {
                             state: session
                                 .map(|s| s.command_state())
                                 .unwrap_or(CommandState::Unknown),
-                            cwd: session
-                                .and_then(|s| s.cwd())
-                                .map(|c| c.display().to_string()),
                             backend: self.backend_sessions.get(&p.id()).cloned(),
                         }
                     })
@@ -3048,18 +3044,14 @@ impl TakoApp {
                     .iter()
                     .filter(|s| s.pane == pane.as_u64())
                     .collect();
-                // 補足（cwd / 保持セッション / attach 先）は詰めすぎず省略（…）で見切れを防ぐ
+                // 補足（保持セッション / attach 先）は詰めすぎず省略（…）で見切れを防ぐ
                 let detail = if !hosted.is_empty() {
                     let names: Vec<String> = hosted.iter().map(|s| truncate(&s.name, 18)).collect();
                     format!("tmux: {}", names.join(" / "))
                 } else {
-                    match (&row.cwd, &row.backend) {
-                        (Some(cwd), Some(b)) => {
-                            format!("{} ・ tmux: {}", truncate(cwd, 24), truncate(b, 16))
-                        }
-                        (Some(cwd), None) => truncate(cwd, 36),
-                        (None, Some(b)) => format!("tmux: {}", truncate(b, 24)),
-                        (None, None) => String::new(),
+                    match &row.backend {
+                        Some(b) => format!("tmux: {}", truncate(b, 24)),
+                        None => String::new(),
                     }
                 };
                 card = card.child(
