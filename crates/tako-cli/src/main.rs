@@ -108,6 +108,9 @@ enum Command {
     /// 動画操作（play / pause / seek。プレビューペインが動画モードの場合のみ有効）
     #[command(subcommand)]
     Video(VideoCommand),
+    /// リモートアクセス API サーバーの操作（start / stop / status）
+    #[command(subcommand)]
+    Remote(RemoteCommand),
     /// マスターオーケストレーターを起動する。新タブで claude を master system prompt 付きで起動する。
     /// suffix を付けると複数 master を区別できる（例: tako master dev → "master-dev" タブ）
     Master {
@@ -117,6 +120,20 @@ enum Command {
     /// オーケストレーター操作（projects / spawn / status / watch）
     #[command(subcommand)]
     Orchestrator(OrchestratorCommand),
+}
+
+#[derive(Subcommand)]
+enum RemoteCommand {
+    /// リモートアクセス API サーバーを起動し、QR コードを表示する
+    Start {
+        /// サーバーのポート番号（省略時は 7749）
+        #[arg(long, default_value_t = 7749)]
+        port: u16,
+    },
+    /// リモートアクセス API サーバーを停止する
+    Stop,
+    /// リモートアクセス API サーバーの状態を表示する
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -273,6 +290,9 @@ enum OrchestratorCommand {
         /// claude の session ID（あれば精度向上）
         #[arg(long)]
         session_id: Option<String>,
+        /// tmux session 名（pane 消滅時のフォールバック追跡）
+        #[arg(long)]
+        tmux_session: Option<String>,
     },
     /// プロジェクト管理（一覧 / 追加 / 削除）
     #[command(subcommand)]
@@ -303,6 +323,9 @@ enum OrchestratorCommand {
         /// claude の session ID
         #[arg(long)]
         session_id: Option<String>,
+        /// tmux session 名（pane 消滅時のフォールバック追跡）
+        #[arg(long)]
+        tmux_session: Option<String>,
     },
 }
 
@@ -379,6 +402,9 @@ struct SendArgs {
     /// 末尾に改行を付けない（プロンプトへの部分入力などに使う）
     #[arg(long)]
     no_newline: bool,
+    /// tmux session 名（pane ID 解決不能時のフォールバック）
+    #[arg(long)]
+    tmux_session: Option<String>,
     /// 送信するテキスト（複数引数はスペース連結）
     #[arg(required = true)]
     text: Vec<String>,
@@ -410,6 +436,9 @@ struct ReadArgs {
     /// 末尾からの行数制限
     #[arg(long)]
     lines: Option<usize>,
+    /// tmux session 名（pane ID 解決不能時のフォールバック）
+    #[arg(long)]
+    tmux_session: Option<String>,
 }
 
 #[derive(Args)]
@@ -627,12 +656,13 @@ fn main() -> ExitCode {
             pane,
             pane_pos,
             ref session_id,
+            ref tmux_session,
         }) => {
             let resolved = pane.or(pane_pos).ok_or_else(|| {
                 "ペイン ID を指定してください（tako orchestrator watch <PANE_ID> または --pane <N>）".to_string()
             });
             match resolved {
-                Ok(p) => orchestrator_watch(p, session_id.as_deref()),
+                Ok(p) => orchestrator_watch(p, session_id.as_deref(), tmux_session.as_deref()),
                 Err(e) => Err(e),
             }
         }
@@ -794,6 +824,7 @@ fn orchestrator_master(suffix: Option<&str>) -> Result<(), String> {
         pane: Some(pane_id),
         text: claude_cmd,
         newline: true,
+        tmux_session: None,
     })?;
 
     eprintln!("master を起動しました: タブ '{tab_title}'（ペイン {pane_id}）");
@@ -802,17 +833,22 @@ fn orchestrator_master(suffix: Option<&str>) -> Result<(), String> {
 }
 
 /// `tako orchestrator watch --pane N [--session-id S]` — worker の完了まで待機し 1 行出力する
-fn orchestrator_watch(pane: u64, session_id: Option<&str>) -> Result<(), String> {
+fn orchestrator_watch(
+    pane: u64,
+    session_id: Option<&str>,
+    tmux_session: Option<&str>,
+) -> Result<(), String> {
     let interval = std::time::Duration::from_secs(5);
     // status モードは連続 2 回、grep モードは連続 6 回で確定
     let need_streak: u32 = if session_id.is_some() { 2 } else { 6 };
     let mut idle_streak: u32 = 0;
 
     loop {
-        // ペインの存在確認（IPC 経由）
+        // ペインの存在確認（IPC 経由。tmux_session 指定時は pane 消滅後も tmux で追跡）
         let result = send_request(Request::OrchestratorWorkerStatus {
             pane_id: pane,
             session_id: session_id.map(|s| s.to_string()),
+            tmux_session: tmux_session.map(|s| s.to_string()),
         });
 
         match result {
@@ -959,6 +995,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane: target_pane(args.pane)?,
             text: args.text.join(" "),
             newline: !args.no_newline,
+            tmux_session: args.tmux_session.clone(),
         },
         Command::Focus(args) => {
             let direction = match (args.left, args.right, args.up, args.down) {
@@ -980,6 +1017,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Read(args) => Request::Read {
             pane: target_pane(args.pane)?,
             lines: args.lines,
+            tmux_session: args.tmux_session.clone(),
         },
         Command::Scroll(args) => {
             if args.to.is_none() && args.delta.is_none() {
@@ -1284,12 +1322,20 @@ fn build_request(command: &Command) -> Result<Request, String> {
             effort: effort.clone(),
             pane: target_pane(None)?,
         },
-        Command::Orchestrator(OrchestratorCommand::Status { pane, session_id }) => {
-            Request::OrchestratorWorkerStatus {
-                pane_id: *pane,
-                session_id: session_id.clone(),
-            }
+        Command::Orchestrator(OrchestratorCommand::Status {
+            pane,
+            session_id,
+            tmux_session,
+        }) => Request::OrchestratorWorkerStatus {
+            pane_id: *pane,
+            session_id: session_id.clone(),
+            tmux_session: tmux_session.clone(),
+        },
+        Command::Remote(RemoteCommand::Start { port }) => {
+            Request::RemoteStart { port: Some(*port) }
         }
+        Command::Remote(RemoteCommand::Stop) => Request::RemoteStop,
+        Command::Remote(RemoteCommand::Status) => Request::RemoteStatus,
         // main() で分岐済みのため論理的に到達不能
         Command::Mcp(_) => unreachable!("mcp serve は run() を通らない"),
         Command::SetupMcp(_) => unreachable!("setup-mcp は run() を通らない"),
@@ -1444,6 +1490,12 @@ fn print_result(command: &Command, result: &Value) {
                 serde_json::to_string_pretty(result).unwrap_or_default()
             );
         }
+        Command::Remote(_) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(result).unwrap_or_default()
+            );
+        }
         _ => {}
     }
 }
@@ -1586,6 +1638,7 @@ mod tests {
                 pane: Some(2),
                 text: "echo hello".into(),
                 newline: true,
+                tmux_session: None,
             }
         );
     }

@@ -150,17 +150,23 @@ pub enum Request {
     Equalize { pane: Option<u64>, tab: Option<u64> },
     /// タブ / ペインのツリー構造・ジオメトリ・状態の取得（FR-2.2.4 / FR-2.5.1〜2）
     List,
-    /// ペインへのテキスト送信（FR-2.2.2）。`newline` で末尾に改行（CR）を付与
+    /// ペインへのテキスト送信（FR-2.2.2）。`newline` で末尾に改行（CR）を付与。
+    /// `tmux_session` 指定時はペインが見つからなくても tmux session 経由で送信する
     Send {
         pane: Option<u64>,
         text: String,
         #[serde(default = "default_true")]
         newline: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tmux_session: Option<String>,
     },
-    /// ペインの画面内容取得（FR-2.2.5）。`lines` は末尾からの行数制限
+    /// ペインの画面内容取得（FR-2.2.5）。`lines` は末尾からの行数制限。
+    /// `tmux_session` 指定時はペインが見つからなくても tmux session 経由で読む
     Read {
         pane: Option<u64>,
         lines: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tmux_session: Option<String>,
     },
     /// スクロールバック表示の操作（FR-2.5.13）。`to` は絶対位置（0 = 最下部）、
     /// `delta` は相対行数（正 = 過去方向）。両方省略はエラー
@@ -341,11 +347,20 @@ pub enum Request {
         effort: Option<String>,
         pane: Option<u64>,
     },
-    /// オーケストレーター: worker の状態確認
+    /// オーケストレーター: worker の状態確認。`tmux_session` 指定時は pane が gone でも
+    /// tmux session 経由で recent_output を取得する
     OrchestratorWorkerStatus {
         pane_id: u64,
         session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tmux_session: Option<String>,
     },
+    /// リモートアクセス API サーバーの起動。`port` 省略時は 7749
+    RemoteStart { port: Option<u16> },
+    /// リモートアクセス API サーバーの停止
+    RemoteStop,
+    /// リモートアクセス API サーバーの状態取得
+    RemoteStatus,
 }
 
 /// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。
@@ -472,7 +487,8 @@ mod tests {
             Request::Send {
                 pane: None,
                 text: "ls".into(),
-                newline: true
+                newline: true,
+                tmux_session: None,
             }
         );
     }

@@ -41,6 +41,8 @@ clap = { version = "4", features = ["derive"] }
 # 同期・スレッドベースの最小 HTTP サーバーで「tokio を持ち込まない」方針を維持する
 # （公式 Rust SDK の rmcp は tokio 必須のため不採用。.agent/architecture.md「Layer 2」節）
 tiny_http = "0.12"
+# リモートアクセスの QR コード生成（ターミナル表示用。pure Rust・軽量）
+qrcode = "0.14"
 # コードプレビューのシンタックスハイライト（FR-3.2）。純 Rust 構成（regex-fancy）で
 # oniguruma の C 依存を避ける（Windows CI。.agent/architecture.md「コンセプト②の実現」）
 syntect = { version = "5", default-features = false, features = [

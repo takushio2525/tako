@@ -16,6 +16,7 @@ pub mod layout;
 pub mod mcp;
 pub mod orchestrator;
 pub mod protocol;
+pub mod remote;
 pub mod settings;
 
 pub use dispatch::{
@@ -23,6 +24,7 @@ pub use dispatch::{
 };
 pub use ipc::{IncomingRequest, IpcServer};
 pub use mcp::McpServer;
+pub use remote::RemoteServer;
 
 /// 接続認証トークンを OS の CSPRNG から生成する（hex 64 文字。FR-2.3.4）。
 /// IPC と MCP はこのセッション共有トークンで認証する。ログに出さないこと

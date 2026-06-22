@@ -17,3 +17,4 @@ getrandom.workspace = true
 tiny_http.workspace = true
 pathdiff.workspace = true
 serde_yaml.workspace = true
+qrcode.workspace = true

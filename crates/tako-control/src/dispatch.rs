@@ -147,6 +147,18 @@ pub trait ControlHost {
     /// claude TUI へのプロンプト送信フローを登録する。画面内容を確認しながら
     /// ❯ 待ち → テキスト送信 → Enter 送信 のステートマシンを駆動する
     fn queue_prompt_flow(&mut self, _pane: PaneId, _prompt: String) {}
+    /// リモートアクセス API サーバーを起動する。成功時は状態 JSON を返す
+    fn remote_start(&mut self, _port: Option<u16>) -> Result<Value, String> {
+        Err("リモートアクセス API はこの環境では使えない".into())
+    }
+    /// リモートアクセス API サーバーを停止する
+    fn remote_stop(&mut self) -> Result<Value, String> {
+        Err("リモートアクセス API サーバーが起動していない".into())
+    }
+    /// リモートアクセス API サーバーの状態を返す
+    fn remote_status(&self) -> Value {
+        json!({ "running": false })
+    }
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -304,25 +316,64 @@ pub fn dispatch(
             pane,
             text,
             newline,
+            tmux_session,
         } => {
-            let (_, target) = resolve_pane(host.workspace(), pane)?;
-            let session = host
-                .session(target)
-                .ok_or(DispatchError::NoSession(target.as_u64()))?;
-            let mut bytes = text.into_bytes();
-            if newline {
-                bytes.push(b'\r');
+            let payload = if newline {
+                format!("{text}\r")
+            } else {
+                text.clone()
+            };
+
+            // pane ID で解決を試み、失敗時に tmux session フォールバック
+            match resolve_pane(host.workspace(), pane) {
+                Ok((_, target)) => {
+                    let session = host
+                        .session(target)
+                        .ok_or(DispatchError::NoSession(target.as_u64()))?;
+                    session.write(payload.into_bytes());
+                    Ok(Value::Null)
+                }
+                Err(e) => {
+                    if let Some(ref ts) = tmux_session {
+                        let socket = tako_core::tmux_backend::socket_name();
+                        tako_core::tmux::send_keys(Some(&socket), ts, &payload)
+                            .map_err(DispatchError::Operation)?;
+                        Ok(Value::Null)
+                    } else {
+                        Err(e)
+                    }
+                }
             }
-            session.write(bytes);
-            Ok(Value::Null)
         }
 
-        Request::Read { pane, lines } => {
-            let (_, target) = resolve_pane(host.workspace(), pane)?;
-            let session = host
-                .session(target)
-                .ok_or(DispatchError::NoSession(target.as_u64()))?;
-            let mut all = session.visible_lines();
+        Request::Read {
+            pane,
+            lines,
+            tmux_session,
+        } => {
+            // pane ID で解決を試み、失敗時に tmux session フォールバック
+            let read_result = resolve_pane(host.workspace(), pane)
+                .ok()
+                .and_then(|(_, target)| {
+                    host.session(target)
+                        .map(|session| (target.as_u64(), session.visible_lines()))
+                });
+
+            let (pane_id, mut all) = match read_result {
+                Some(r) => r,
+                None => {
+                    if let Some(ref ts) = tmux_session {
+                        let socket = tako_core::tmux_backend::socket_name();
+                        let captured = tako_core::tmux::capture_session(Some(&socket), ts)
+                            .map_err(DispatchError::Operation)?;
+                        (pane.unwrap_or(0), captured)
+                    } else {
+                        let (_, target) = resolve_pane(host.workspace(), pane)?;
+                        return Err(DispatchError::NoSession(target.as_u64()));
+                    }
+                }
+            };
+
             while all.last().is_some_and(|l| l.is_empty()) {
                 all.pop();
             }
@@ -331,7 +382,7 @@ pub fn dispatch(
                     all.drain(..all.len() - n);
                 }
             }
-            Ok(json!({ "pane": target.as_u64(), "text": all.join("\n") }))
+            Ok(json!({ "pane": pane_id, "text": all.join("\n") }))
         }
 
         Request::Scroll { pane, to, delta } => {
@@ -1308,7 +1359,17 @@ pub fn dispatch(
         Request::OrchestratorWorkerStatus {
             pane_id,
             session_id,
-        } => dispatch_orchestrator_worker_status(host, pane_id, session_id.as_deref()),
+            tmux_session,
+        } => dispatch_orchestrator_worker_status(
+            host,
+            pane_id,
+            session_id.as_deref(),
+            tmux_session.as_deref(),
+        ),
+
+        Request::RemoteStart { port } => host.remote_start(port).map_err(DispatchError::Operation),
+        Request::RemoteStop => host.remote_stop().map_err(DispatchError::Operation),
+        Request::RemoteStatus => Ok(host.remote_status()),
     }
 }
 
@@ -1454,6 +1515,8 @@ fn dispatch_orchestrator_spawn(
     };
     pane_obj.set_role(Some(pane_role));
 
+    let tmux_session = host.backend_session(new_id);
+
     Ok(json!({
         "pane_id": new_id.as_u64(),
         "title": window_title,
@@ -1462,6 +1525,7 @@ fn dispatch_orchestrator_spawn(
         "effort": effort,
         "claude_command": claude_cmd,
         "prompt": oneline_prompt,
+        "tmux_session": tmux_session,
     }))
 }
 
@@ -1469,6 +1533,7 @@ fn dispatch_orchestrator_worker_status(
     host: &dyn ControlHost,
     pane_id: u64,
     session_id: Option<&str>,
+    tmux_session: Option<&str>,
 ) -> Result<Value, DispatchError> {
     use crate::orchestrator;
 
@@ -1479,34 +1544,58 @@ fn dispatch_orchestrator_worker_status(
             .iter()
             .any(|p| p.id().as_u64() == pane_id)
     });
-    if !pane_exists {
-        return Ok(json!({
-            "status": "gone",
-            "ctx_percent": null,
-            "recent_output": null,
-        }));
-    }
 
     // session_id があれば claude agents で状態確認
     let (mut status, ctx_percent) = if let Some(sid) = session_id {
         let agent = orchestrator::query_agent_status(sid);
         (agent.status, agent.ctx_percent)
-    } else {
+    } else if pane_exists {
         ("unknown".to_string(), None)
+    } else {
+        ("gone".to_string(), None)
     };
 
-    // ペインの最近の出力を取得
+    // ペインの最近の出力を取得（pane → tmux session フォールバック）
     let target = PaneId::from_raw(pane_id);
-    let recent_output = host.session(target).map(|session| {
-        let mut lines = session.visible_lines();
-        while lines.last().is_some_and(|l| l.is_empty()) {
-            lines.pop();
+    let recent_output = host
+        .session(target)
+        .map(|session| {
+            let mut lines = session.visible_lines();
+            while lines.last().is_some_and(|l| l.is_empty()) {
+                lines.pop();
+            }
+            if lines.len() > 30 {
+                lines.drain(..lines.len() - 30);
+            }
+            lines.join("\n")
+        })
+        .or_else(|| {
+            // tmux session フォールバック: pane が gone でも tmux session が生きていれば読む
+            let ts = tmux_session?;
+            let socket = tako_core::tmux_backend::socket_name();
+            if !tako_core::tmux::session_alive(Some(&socket), ts) {
+                return None;
+            }
+            // tmux session が生きている = pane は gone だが worker は生存中
+            let mut lines = tako_core::tmux::capture_session(Some(&socket), ts).ok()?;
+            while lines.last().is_some_and(|l| l.is_empty()) {
+                lines.pop();
+            }
+            if lines.len() > 30 {
+                lines.drain(..lines.len() - 30);
+            }
+            Some(lines.join("\n"))
+        });
+
+    // tmux session が生きていれば gone を取り消す（pane は無いが worker は健在）
+    if status == "gone" {
+        if let Some(ts) = tmux_session {
+            let socket = tako_core::tmux_backend::socket_name();
+            if tako_core::tmux::session_alive(Some(&socket), ts) {
+                status = "unknown".to_string();
+            }
         }
-        if lines.len() > 30 {
-            lines.drain(..lines.len() - 30);
-        }
-        lines.join("\n")
-    });
+    }
 
     // idle 誤検知防止: サブエージェント完了の瞬間に claude agents --json が
     // 一時的に idle を返すことがある。ペイン画面に入力プロンプト ❯ が表示
@@ -2549,6 +2638,7 @@ mod tests {
                 pane: Some(root),
                 text: "ls".into(),
                 newline: true,
+                tmux_session: None,
             },
             PaneOrigin::Cli,
         )
@@ -2559,6 +2649,7 @@ mod tests {
             Request::Read {
                 pane: Some(root),
                 lines: None,
+                tmux_session: None,
             },
             PaneOrigin::Cli,
         )
