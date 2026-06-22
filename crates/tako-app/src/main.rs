@@ -33,7 +33,7 @@ use gpui::{
     TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
-use tako_control::{ControlHost, IncomingRequest, IpcServer, McpServer};
+use tako_control::{ControlHost, IncomingRequest, IpcServer, McpServer, RemoteServer};
 use tako_core::{
     ratio_for_position, CommandState, Pane, PaneId, PaneOrigin, Rect, SelectionKind, SessionNotice,
     SpawnOptions, SplitAxis, SplitDirection, TabId, TerminalSession, Theme, TitleSource, Workspace,
@@ -410,6 +410,10 @@ struct TakoApp {
     ipc: Option<IpcServer>,
     /// Layer 2 内蔵 MCP サーバー（FR-2.3 の受け口。起動失敗時は None で MCP なし動作）
     mcp: Option<McpServer>,
+    /// IPC / MCP / remote 共有の dispatch チャネル送信側（remote_start で clone して渡す）
+    control_tx: futures::channel::mpsc::UnboundedSender<IncomingRequest>,
+    /// リモートアクセス HTTP API サーバー（remote Phase 1。CLI / MCP から start/stop）
+    remote_server: Option<RemoteServer>,
     /// IPC / MCP 共有のセッション認証トークン（FR-2.3.4。ログに出さない）
     token: Option<String>,
     /// dispatch 中に依頼されたセッション起動（GPUI の Context が要るため遅延実行する）
@@ -847,18 +851,17 @@ impl TakoApp {
                 }
             }
         });
-        let mcp =
-            token
-                .as_ref()
-                .and_then(|token| match McpServer::start(control_tx, token.clone()) {
-                    Ok(server) => Some(server),
-                    Err(e) => {
-                        eprintln!(
+        let mcp = token.as_ref().and_then(|token| {
+            match McpServer::start(control_tx.clone(), token.clone()) {
+                Ok(server) => Some(server),
+                Err(e) => {
+                    eprintln!(
                         "warning: MCP サーバーを起動できない（エージェント連携は使えない）: {e}"
                     );
-                        None
-                    }
-                });
+                    None
+                }
+            }
+        });
 
         // 接続情報をファイルへ永続化（FR-2.2.9）。アプリ再起動後も外部の長寿命プロセス
         // から `tako` CLI が繋ぎ直せるようにする（CLI 側のフォールバック先）
@@ -920,6 +923,8 @@ impl TakoApp {
             pane_text_areas: Vec::new(),
             ipc,
             mcp,
+            control_tx,
+            remote_server: None,
             token,
             pending_attach: Vec::new(),
             pending_writes: Vec::new(),
@@ -8160,6 +8165,50 @@ impl ControlHost for TakoApp {
             .into_iter()
             .map(|p| p.id())
             .find(|id| self.previews.contains_key(id))
+    }
+
+    fn remote_start(&mut self, port: Option<u16>) -> Result<serde_json::Value, String> {
+        if self.remote_server.is_some() {
+            return Err("リモートアクセス API サーバーは既に起動中".into());
+        }
+        let token = self
+            .token
+            .clone()
+            .ok_or("認証トークンが未生成（IPC/MCP が初期化されていない）")?;
+        let server =
+            RemoteServer::start(self.control_tx.clone(), token, port).map_err(|e| e.to_string())?;
+        let port = server.port();
+        let token = server.token().to_string();
+        let url = format!("http://localhost:{port}");
+        self.remote_server = Some(server);
+        Ok(serde_json::json!({
+            "running": true,
+            "port": port,
+            "token": token,
+            "url": url,
+        }))
+    }
+
+    fn remote_stop(&mut self) -> Result<serde_json::Value, String> {
+        match self.remote_server.take() {
+            Some(server) => {
+                server.stop();
+                Ok(serde_json::json!({ "stopped": true }))
+            }
+            None => Err("リモートアクセス API サーバーが起動していない".into()),
+        }
+    }
+
+    fn remote_status(&self) -> serde_json::Value {
+        match &self.remote_server {
+            Some(server) => serde_json::json!({
+                "running": true,
+                "port": server.port(),
+                "token": server.token(),
+                "url": format!("http://localhost:{}", server.port()),
+            }),
+            None => serde_json::json!({ "running": false }),
+        }
     }
 }
 
