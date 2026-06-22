@@ -43,6 +43,8 @@ clap = { version = "4", features = ["derive"] }
 tiny_http = "0.12"
 # リモートアクセスの QR コード生成（ターミナル表示用。pure Rust・軽量）
 qrcode = "0.14"
+# マシン ID 生成（Phase 3 remote。UUID v4、CSPRNG ベース）
+uuid = { version = "1", features = ["v4"] }
 # コードプレビューのシンタックスハイライト（FR-3.2）。純 Rust 構成（regex-fancy）で
 # oniguruma の C 依存を避ける（Windows CI。.agent/architecture.md「コンセプト②の実現」）
 syntect = { version = "5", default-features = false, features = [

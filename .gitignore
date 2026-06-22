@@ -22,3 +22,11 @@
 
 # ログ
 *.log
+
+# Cloudflare Workers
+web/tako-remote-worker/.dev.vars
+web/tako-remote-worker/node_modules/
+
+# PWA
+web/tako-remote/node_modules/
+web/tako-remote/dist/

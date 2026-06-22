@@ -8167,7 +8167,11 @@ impl ControlHost for TakoApp {
             .find(|id| self.previews.contains_key(id))
     }
 
-    fn remote_start(&mut self, port: Option<u16>) -> Result<serde_json::Value, String> {
+    fn remote_start(
+        &mut self,
+        port: Option<u16>,
+        no_tunnel: bool,
+    ) -> Result<serde_json::Value, String> {
         if self.remote_server.is_some() {
             return Err("リモートアクセス API サーバーは既に起動中".into());
         }
@@ -8175,23 +8179,34 @@ impl ControlHost for TakoApp {
             .token
             .clone()
             .ok_or("認証トークンが未生成（IPC/MCP が初期化されていない）")?;
-        let server =
-            RemoteServer::start(self.control_tx.clone(), token, port).map_err(|e| e.to_string())?;
+        let server = RemoteServer::start(self.control_tx.clone(), token, port, no_tunnel)
+            .map_err(|e| e.to_string())?;
         let port = server.port();
         let token = server.token().to_string();
-        let url = format!("http://localhost:{port}");
+        let local_url = format!("http://localhost:{port}");
+        let tunnel_url = server.tunnel_url().map(|s| s.to_string());
+        let machine_id = server.machine_id().map(|s| s.to_string());
+        let connect = tako_control::remote::connect_url(
+            tunnel_url.as_deref(),
+            &local_url,
+            &token,
+            machine_id.as_deref(),
+        );
         self.remote_server = Some(server);
         Ok(serde_json::json!({
             "running": true,
             "port": port,
             "token": token,
-            "url": url,
+            "url": local_url,
+            "tunnel_url": tunnel_url,
+            "machine_id": machine_id,
+            "connect_url": connect,
         }))
     }
 
     fn remote_stop(&mut self) -> Result<serde_json::Value, String> {
         match self.remote_server.take() {
-            Some(server) => {
+            Some(mut server) => {
                 server.stop();
                 Ok(serde_json::json!({ "stopped": true }))
             }
@@ -8201,12 +8216,26 @@ impl ControlHost for TakoApp {
 
     fn remote_status(&self) -> serde_json::Value {
         match &self.remote_server {
-            Some(server) => serde_json::json!({
-                "running": true,
-                "port": server.port(),
-                "token": server.token(),
-                "url": format!("http://localhost:{}", server.port()),
-            }),
+            Some(server) => {
+                let local_url = format!("http://localhost:{}", server.port());
+                let tunnel_url = server.tunnel_url().map(|s| s.to_string());
+                let machine_id = server.machine_id().map(|s| s.to_string());
+                let connect = tako_control::remote::connect_url(
+                    tunnel_url.as_deref(),
+                    &local_url,
+                    server.token(),
+                    machine_id.as_deref(),
+                );
+                serde_json::json!({
+                    "running": true,
+                    "port": server.port(),
+                    "token": server.token(),
+                    "url": local_url,
+                    "tunnel_url": tunnel_url,
+                    "machine_id": machine_id,
+                    "connect_url": connect,
+                })
+            }
             None => serde_json::json!({ "running": false }),
         }
     }

@@ -1,7 +1,9 @@
 const TIMEOUT_MS = 10000;
+const DEFAULT_RELAY_URL = 'https://tako-remote-relay.shiozawa-takumi.workers.dev';
 
 export function createClient(host, token) {
-  const base = host.replace(/\/+$/, '');
+  const raw = host.replace(/\/+$/, '');
+  const base = /^https?:\/\//.test(raw) ? raw : `http://${raw}`;
 
   async function request(method, path, body) {
     const headers = { 'Authorization': `Bearer ${token}` };
@@ -44,4 +46,22 @@ export function createClient(host, token) {
       return request('POST', `/api/panes/${id}/close`);
     },
   };
+}
+
+/**
+ * Workers KV リレーから最新の tunnel URL を解決する。
+ * 失敗時は null を返す（フォールバックは呼び出し側で行う）
+ */
+export async function resolveHost(machineId) {
+  if (!machineId) return null;
+  try {
+    const resp = await fetch(`${DEFAULT_RELAY_URL}/api/resolve/${machineId}`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return data.tunnelUrl || null;
+  } catch {
+    return null;
+  }
 }

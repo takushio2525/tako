@@ -147,8 +147,9 @@ pub trait ControlHost {
     /// claude TUI へのプロンプト送信フローを登録する。画面内容を確認しながら
     /// ❯ 待ち → テキスト送信 → Enter 送信 のステートマシンを駆動する
     fn queue_prompt_flow(&mut self, _pane: PaneId, _prompt: String) {}
-    /// リモートアクセス API サーバーを起動する。成功時は状態 JSON を返す
-    fn remote_start(&mut self, _port: Option<u16>) -> Result<Value, String> {
+    /// リモートアクセス API サーバーを起動する。成功時は状態 JSON を返す。
+    /// `no_tunnel` = true で cloudflared を起動しない（LAN のみ）
+    fn remote_start(&mut self, _port: Option<u16>, _no_tunnel: bool) -> Result<Value, String> {
         Err("リモートアクセス API はこの環境では使えない".into())
     }
     /// リモートアクセス API サーバーを停止する
@@ -1367,7 +1368,9 @@ pub fn dispatch(
             tmux_session.as_deref(),
         ),
 
-        Request::RemoteStart { port } => host.remote_start(port).map_err(DispatchError::Operation),
+        Request::RemoteStart { port, no_tunnel } => host
+            .remote_start(port, no_tunnel)
+            .map_err(DispatchError::Operation),
         Request::RemoteStop => host.remote_stop().map_err(DispatchError::Operation),
         Request::RemoteStatus => Ok(host.remote_status()),
     }
