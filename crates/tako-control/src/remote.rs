@@ -570,38 +570,39 @@ pub fn print_qr(url: &str) {
     let colors = code.to_colors();
     let width = code.width();
 
-    let rows = width.div_ceil(2);
+    let height = width;
+    let rows = height.div_ceil(2);
     let quiet = 2;
 
     for _ in 0..quiet {
-        print!("{}", "  ".repeat(width + quiet * 2));
+        print!("{}", " ".repeat(width + quiet * 2));
         println!();
     }
 
     for row in 0..rows {
-        print!("{}", "  ".repeat(quiet));
+        print!("{}", " ".repeat(quiet));
         for col in 0..width {
             let top_idx = row * 2;
             let bot_idx = row * 2 + 1;
             let top_dark = colors[top_idx * width + col] == qrcode::Color::Dark;
-            let bot_dark = if bot_idx < width {
+            let bot_dark = if bot_idx < height {
                 colors[bot_idx * width + col] == qrcode::Color::Dark
             } else {
                 false
             };
             match (top_dark, bot_dark) {
-                (true, true) => print!("  "),
-                (true, false) => print!("▄▄"),
-                (false, true) => print!("▀▀"),
-                (false, false) => print!("██"),
+                (true, true) => print!("█"),
+                (true, false) => print!("▀"),
+                (false, true) => print!("▄"),
+                (false, false) => print!(" "),
             }
         }
-        print!("{}", "  ".repeat(quiet));
+        print!("{}", " ".repeat(quiet));
         println!();
     }
 
     for _ in 0..quiet {
-        print!("{}", "  ".repeat(width + quiet * 2));
+        print!("{}", " ".repeat(width + quiet * 2));
         println!();
     }
 }
