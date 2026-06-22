@@ -1505,7 +1505,7 @@ fn print_result(command: &Command, result: &Value) {
                         eprintln!("\nQR コードを生成しました: {}", path.display());
                         // tako 内でプレビュー表示（IPC 経由で OpenFile）
                         let open_req = Request::OpenFile {
-                            pane: None,
+                            pane: caller_pane(),
                             path: path.to_string_lossy().into_owned(),
                             mode: Some(tako_control::protocol::PreviewModeWire::Image),
                             direction: None,
