@@ -825,7 +825,15 @@ pub fn dispatch(
             mode,
             direction,
         } => {
-            let (tab, target) = resolve_pane(host.workspace(), pane)?;
+            let (tab, target) = match pane {
+                Some(_) => resolve_pane(host.workspace(), pane)?,
+                None => {
+                    let ws = host.workspace();
+                    let active = ws.active_tab_id();
+                    let focused = ws.active_tab().tree().focused();
+                    (active, focused)
+                }
+            };
             // 相対パスは対象ペインの cwd（OSC 7。無ければプロセスの cwd）基準で解決する
             let mut resolved = std::path::PathBuf::from(&path);
             if resolved.is_relative() {
