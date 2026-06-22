@@ -48,14 +48,14 @@ export function ConnectPage({ params }) {
   }
 
   useEffect(() => {
-    const host = params.get('host');
+    const host = params.get('host') || window.location.origin;
     const token = params.get('token');
     const id = params.get('machine') || `m-${Date.now()}`;
     const name = params.get('name') || id;
 
-    if (!host || !token) {
+    if (!token) {
       setStatus('error');
-      setError('接続情報が不足しています（host / token）');
+      setError('接続情報が不足しています（token）');
       return;
     }
 
@@ -63,12 +63,12 @@ export function ConnectPage({ params }) {
   }, []);
 
   function retry() {
-    const host = params.get('host');
+    const host = params.get('host') || window.location.origin;
     const token = params.get('token');
     const id = params.get('machine') || `m-${Date.now()}`;
     const name = params.get('name') || id;
 
-    if (!host || !token) return;
+    if (!token) return;
     setStatus('connecting');
     setError(null);
     tryConnect(host, token, id, name);

@@ -1503,27 +1503,11 @@ fn print_result(command: &Command, result: &Value) {
                 match tako_control::remote::generate_qr_png(connect) {
                     Ok(path) => {
                         eprintln!("\nQR コードを生成しました: {}", path.display());
-                        // tako 内でプレビュー表示（IPC 経由で OpenFile）
-                        let open_req = Request::OpenFile {
-                            pane: caller_pane(),
-                            path: path.to_string_lossy().into_owned(),
-                            mode: Some(tako_control::protocol::PreviewModeWire::Image),
-                            direction: None,
-                        };
-                        match send_request(open_req) {
-                            Ok(_) => {
-                                eprintln!(
-                                    "tako 内で QR コードを表示中。スマホでスキャンしてください。"
-                                );
-                            }
-                            Err(_) => {
-                                // tako 外や IPC 不通時は Preview.app にフォールバック
-                                let _ = std::process::Command::new("open").arg(&path).spawn();
-                                eprintln!(
-                                    "Preview.app で開いています。スマホでスキャンしてください。"
-                                );
-                            }
-                        }
+                        // tako CLI 経由でプレビュー表示（CLI が IPC を解決する）
+                        let _ = std::process::Command::new("tako")
+                            .args(["open", &path.to_string_lossy()])
+                            .spawn();
+                        eprintln!("スマホでスキャンしてください。");
                     }
                     Err(e) => eprintln!("\nQR コード画像の生成に失敗: {e}"),
                 }

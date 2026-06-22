@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures::channel::mpsc::UnboundedSender;
+use rust_embed::Embed;
 use serde_json::{json, Value};
 use tako_core::PaneOrigin;
 
@@ -32,8 +33,13 @@ const DEFAULT_PORT: u16 = 7749;
 const MAX_BODY_BYTES: u64 = 1024 * 1024;
 /// KV リレーの Workers URL（Cloudflare Pages / Workers のデプロイ先）
 const DEFAULT_RELAY_URL: &str = "https://tako-remote-relay.shiozawa-takumi.workers.dev";
-/// PWA のデプロイ先（Cloudflare Pages）
+/// PWA のデプロイ先（Cloudflare Pages）— tunnel モード時のみ使用
 const DEFAULT_PAGES_URL: &str = "https://tako-remote.pages.dev";
+
+/// PWA の dist/ を埋め込む（`npm run build` で生成済みのもの）
+#[derive(Embed)]
+#[folder = "../../web/tako-remote/dist/"]
+struct PwaAssets;
 
 /// リモート API サーバーのハンドル
 pub struct RemoteServer {
@@ -293,25 +299,35 @@ fn register_relay(machine_id: &str, tunnel_url: &str) -> Result<(), String> {
 }
 
 /// QR コードに含める接続 URL を生成する。
-/// 常に Cloudflare Pages PWA 経由の URL を返す。
+/// - no-tunnel: サーバー自身が PWA を配信するので `http://<LAN>:7749/connect?token=...`
+/// - tunnel: Cloudflare Pages PWA 経由 `https://pages.dev/connect?host=<TUNNEL>&token=...`
 pub fn connect_url(
     tunnel_url: Option<&str>,
     local_url: &str,
     token: &str,
     name: Option<&str>,
 ) -> String {
-    let pages_url =
-        std::env::var("TAKO_PAGES_URL").unwrap_or_else(|_| DEFAULT_PAGES_URL.to_string());
-    let host = tunnel_url.unwrap_or(local_url);
-    let mut url = format!(
-        "{pages_url}/connect?host={}&token={}",
-        urlencoding::encode(host),
-        urlencoding::encode(token),
-    );
-    if let Some(n) = name {
-        url.push_str(&format!("&name={}", urlencoding::encode(n)));
+    if let Some(tunnel) = tunnel_url {
+        // tunnel モード: pages.dev から HTTPS → HTTPS tunnel（混合コンテンツなし）
+        let pages_url =
+            std::env::var("TAKO_PAGES_URL").unwrap_or_else(|_| DEFAULT_PAGES_URL.to_string());
+        let mut url = format!(
+            "{pages_url}/connect?host={}&token={}",
+            urlencoding::encode(tunnel),
+            urlencoding::encode(token),
+        );
+        if let Some(n) = name {
+            url.push_str(&format!("&name={}", urlencoding::encode(n)));
+        }
+        url
+    } else {
+        // no-tunnel: サーバー自身が PWA を配信。host 省略 → PWA が window.location.origin を使う
+        let mut url = format!("{local_url}/connect?token={}", urlencoding::encode(token),);
+        if let Some(n) = name {
+            url.push_str(&format!("&name={}", urlencoding::encode(n)));
+        }
+        url
     }
-    url
 }
 
 /// ホスト名を取得する（表示用）
@@ -369,6 +385,49 @@ fn respond(request: tiny_http::Request, status: u16, body: Option<String>) {
     };
     if let Err(e) = result {
         tracing::debug!("remote 応答の送信に失敗: {e}");
+    }
+}
+
+fn content_type_for(path: &str) -> &'static [u8] {
+    if path.ends_with(".html") {
+        b"text/html; charset=utf-8"
+    } else if path.ends_with(".js") {
+        b"application/javascript; charset=utf-8"
+    } else if path.ends_with(".css") {
+        b"text/css; charset=utf-8"
+    } else if path.ends_with(".json") {
+        b"application/json; charset=utf-8"
+    } else if path.ends_with(".svg") {
+        b"image/svg+xml"
+    } else if path.ends_with(".png") {
+        b"image/png"
+    } else {
+        b"application/octet-stream"
+    }
+}
+
+fn serve_embedded(request: tiny_http::Request, asset_path: &str) {
+    let file_path = if asset_path.is_empty() || asset_path == "/" {
+        "index.html"
+    } else {
+        asset_path.trim_start_matches('/')
+    };
+    let data = PwaAssets::get(file_path).or_else(|| PwaAssets::get("index.html"));
+    match data {
+        Some(content) => {
+            let ct_path = if PwaAssets::get(file_path).is_some() {
+                file_path
+            } else {
+                "index.html"
+            };
+            let ct = tiny_http::Header::from_bytes(&b"Content-Type"[..], content_type_for(ct_path))
+                .expect("固定ヘッダ");
+            let resp = tiny_http::Response::from_data(content.data.to_vec()).with_header(ct);
+            let _ = request.respond(resp);
+        }
+        None => {
+            let _ = request.respond(tiny_http::Response::empty(404));
+        }
     }
 }
 
@@ -431,7 +490,12 @@ fn handle_request(
         );
     }
 
-    // 認証チェック
+    // API 以外のパスは PWA 静的ファイルとして配信（認証不要）
+    if !path.starts_with("/api/") {
+        return serve_embedded(request, &path);
+    }
+
+    // API エンドポイントの認証チェック
     if !check_auth(&request, token) {
         return respond(
             request,
@@ -440,7 +504,7 @@ fn handle_request(
         );
     }
 
-    // ルーティング
+    // API ルーティング
     match (method, path.as_str()) {
         (tiny_http::Method::Get, "/api/panes") => match exec_dispatch(Request::List, tx) {
             Ok(result) => {
@@ -557,7 +621,7 @@ fn handle_request(
         _ => respond(
             request,
             404,
-            Some(json!({ "error": "エンドポイントが見つからない" }).to_string()),
+            Some(json!({ "error": "API エンドポイントが見つからない" }).to_string()),
         ),
     }
 }
@@ -895,16 +959,16 @@ mod tests {
         assert!(url.contains("token=abc123"));
         assert!(url.contains("name=my-mac"));
 
-        // tunnel なし → Pages 経由、host は LAN URL
+        // tunnel なし → サーバー自身が PWA 配信。host パラメータなし
         let url = connect_url(None, "http://192.168.1.10:7749", "tok456", Some("host1"));
-        assert!(url.starts_with("https://tako-remote.pages.dev/connect?"));
-        assert!(url.contains("host=http%3A%2F%2F192.168.1.10%3A7749"));
+        assert!(url.starts_with("http://192.168.1.10:7749/connect?"));
+        assert!(!url.contains("host="));
         assert!(url.contains("token=tok456"));
         assert!(url.contains("name=host1"));
 
-        // name なし → name パラメータ省略
+        // tunnel なし + name なし → name パラメータ省略
         let url = connect_url(None, "http://localhost:7749", "abc123", None);
-        assert!(url.starts_with("https://tako-remote.pages.dev/connect?"));
+        assert!(url.starts_with("http://localhost:7749/connect?"));
         assert!(url.contains("token=abc123"));
         assert!(!url.contains("name="));
     }
@@ -1087,5 +1151,47 @@ mod tests {
         assert!(url.contains("host=https%3A%2F%2Ffoo.trycloudflare.com"));
         assert!(url.contains("token=tok123"));
         assert!(!url.contains("name="));
+    }
+
+    // --- PWA 静的ファイル配信テスト ---
+
+    #[test]
+    fn ルートパスでindex_htmlが返る() {
+        let (mut server, _rx) = start_test_server();
+        let (status, body) = http_request(server.port(), "GET", "/", None, None);
+        assert_eq!(status, 200);
+        assert!(body.contains("<!DOCTYPE html>") || body.contains("<html"));
+        server.stop();
+    }
+
+    #[test]
+    fn manifest_jsonが返る() {
+        let (mut server, _rx) = start_test_server();
+        let (status, body) = http_request(server.port(), "GET", "/manifest.json", None, None);
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["name"], "tako remote");
+        server.stop();
+    }
+
+    #[test]
+    fn connectパスはspaフォールバックでindex_htmlが返る() {
+        let (mut server, _rx) = start_test_server();
+        let (status, body) = http_request(server.port(), "GET", "/connect?token=abc", None, None);
+        assert_eq!(status, 200);
+        assert!(body.contains("<!DOCTYPE html>") || body.contains("<html"));
+        server.stop();
+    }
+
+    #[test]
+    fn pwa静的ファイルは認証不要() {
+        let (mut server, _rx) = start_test_server();
+        // 認証なしでも PWA は配信される
+        let (status, _) = http_request(server.port(), "GET", "/", None, None);
+        assert_eq!(status, 200);
+        // API は認証必須
+        let (api_status, _) = http_request(server.port(), "GET", "/api/panes", None, None);
+        assert_eq!(api_status, 401);
+        server.stop();
     }
 }
