@@ -572,6 +572,8 @@ struct AgentEntry {
     state: CommandState,
     /// ペインを保持する tmux バックエンドセッション名（Phase 5.5。非永続化ペインは None）
     backend: Option<String>,
+    /// 補足タイトル（OSC タイトル → tako ペインタイトルの順でフォールバック）
+    detail_title: String,
 }
 
 /// 統合 tmux ビューのタブ 1 枠分（FR-2.16.6。タブ名ラベル付き四角枠 + 全ペイン入れ子）
@@ -1520,6 +1522,12 @@ impl TakoApp {
                                     .to_string(),
                             },
                         };
+                        let osc = session.and_then(|s| s.title());
+                        let detail_title = osc
+                            .filter(|s| !s.is_empty())
+                            .or(p.title())
+                            .unwrap_or("")
+                            .to_string();
                         AgentEntry {
                             pane: p.id(),
                             label,
@@ -1527,6 +1535,7 @@ impl TakoApp {
                                 .map(|s| s.command_state())
                                 .unwrap_or(CommandState::Unknown),
                             backend: self.backend_sessions.get(&p.id()).cloned(),
+                            detail_title,
                         }
                     })
                     .collect();
@@ -3029,13 +3038,12 @@ impl TakoApp {
                     .pinned_previews
                     .iter()
                     .any(|p| p.target == PreviewTarget::Pane(pane));
+                let show_state = !matches!(row.state, CommandState::Unknown);
                 let (color, state_label) = match row.state {
                     CommandState::Failed(code) => (theme.ansi[1], format!("エラー ({code})")),
                     CommandState::Idle => (theme.ansi[2], "入力待ち".to_string()),
                     CommandState::Running => (theme.accent, "実行中".to_string()),
-                    CommandState::Unknown => {
-                        (theme.tab_inactive_foreground, "状態不明".to_string())
-                    }
+                    CommandState::Unknown => (theme.tab_inactive_foreground, String::new()),
                 };
                 // このペインが attach 表示している外部セッション（あれば detail に名前を出す。
                 // window 一覧はホスト行の下に入れ子表示するので二重化しない。FR-2.16.6）
@@ -3044,8 +3052,9 @@ impl TakoApp {
                     .iter()
                     .filter(|s| s.pane == pane.as_u64())
                     .collect();
-                // 補足（保持セッション / attach 先）は詰めすぎず省略（…）で見切れを防ぐ
-                let detail = if !hosted.is_empty() {
+                let detail = if !row.detail_title.is_empty() {
+                    truncate(&row.detail_title, 36)
+                } else if !hosted.is_empty() {
                     let names: Vec<String> = hosted.iter().map(|s| truncate(&s.name, 18)).collect();
                     format!("tmux: {}", names.join(" / "))
                 } else {
@@ -3087,25 +3096,30 @@ impl TakoApp {
                                 cx.notify();
                             }))
                         })
-                        // 表示分類バッジ（FR-2.16.12。表示中 = アクティブタブ所属）
-                        .child(self.surface_badge(is_active))
-                        .child(
-                            div()
-                                .w(px(8.0))
-                                .h(px(8.0))
-                                .flex_none()
-                                .rounded_full()
-                                .bg(hsla(color)),
-                        )
-                        .child(
-                            div()
-                                .w(px(52.0))
-                                .flex_none()
-                                .text_size(px(11.0))
-                                .text_color(hsla(color))
-                                .whitespace_nowrap()
-                                .child(SharedString::from(state_label)),
-                        )
+                        // 表示分類バッジ（FR-2.16.12。ツリー内のペインは全て「表示中」。
+                        // 「バックグラウンド」は退避済みペインのみ）
+                        .child(self.surface_badge(true))
+                        .when(show_state, |d| {
+                            d.child(
+                                div()
+                                    .w(px(8.0))
+                                    .h(px(8.0))
+                                    .flex_none()
+                                    .rounded_full()
+                                    .bg(hsla(color)),
+                            )
+                        })
+                        .when(show_state, |d| {
+                            d.child(
+                                div()
+                                    .w(px(52.0))
+                                    .flex_none()
+                                    .text_size(px(11.0))
+                                    .text_color(hsla(color))
+                                    .whitespace_nowrap()
+                                    .child(SharedString::from(state_label)),
+                            )
+                        })
                         .child(
                             div()
                                 .flex_1()
