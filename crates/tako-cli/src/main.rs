@@ -1500,8 +1500,13 @@ fn print_result(command: &Command, result: &Value) {
                 serde_json::to_string_pretty(result).unwrap_or_default()
             );
             if let Some(connect) = result["connect_url"].as_str() {
-                eprintln!("\nスキャンして接続:");
-                tako_control::remote::print_qr(connect);
+                match tako_control::remote::generate_qr_png(connect) {
+                    Ok(path) => {
+                        eprintln!("\nQR コードを生成しました: {}", path.display());
+                        eprintln!("Preview.app で開いています。スマホでスキャンしてください。");
+                    }
+                    Err(e) => eprintln!("\nQR コード画像の生成に失敗: {e}"),
+                }
                 eprintln!("URL: {connect}");
                 if let Some(tunnel) = result["tunnel_url"].as_str() {
                     eprintln!("Tunnel: {tunnel}");
