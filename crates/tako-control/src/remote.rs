@@ -155,7 +155,7 @@ fn start_cloudflared(port: u16) -> io::Result<(Child, String)> {
     let cloudflared = find_cloudflared()?;
     let mut child = Command::new(&cloudflared)
         .args(["tunnel", "--url", &format!("http://127.0.0.1:{port}")])
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| io::Error::other(format!("cloudflared の起動に失敗: {e}")))?;
@@ -201,12 +201,20 @@ fn parse_tunnel_url(stderr: std::process::ChildStderr) -> io::Result<String> {
     let reader = std::io::BufReader::new(stderr);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
-    for line in reader.lines() {
+    let mut lines = reader.lines();
+    while let Some(result) = lines.next() {
         if std::time::Instant::now() > deadline {
             break;
         }
-        let line = line?;
+        let line = result?;
         if let Some(url) = extract_trycloudflare_url(&line) {
+            // URL 取得後も stderr を読み続けるスレッドを起動（SIGPIPE 防止）
+            std::thread::Builder::new()
+                .name("cloudflared-stderr-drain".into())
+                .spawn(move || {
+                    for _ in lines {}
+                })
+                .ok();
             return Ok(url);
         }
     }
