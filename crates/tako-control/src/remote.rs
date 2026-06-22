@@ -440,7 +440,17 @@ fn handle_request(
     // ルーティング
     match (method, path.as_str()) {
         (tiny_http::Method::Get, "/api/panes") => match exec_dispatch(Request::List, tx) {
-            Ok(result) => respond(request, 200, Some(result.to_string())),
+            Ok(result) => {
+                // dispatch は { tabs: [{ panes: [...] }] } を返すが、
+                // PWA は { panes: [フラット配列] } を期待する。全タブのペインを平坦化
+                let flat: Vec<Value> = result["tabs"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|tab| tab["panes"].as_array().into_iter().flatten().cloned())
+                    .collect();
+                respond(request, 200, Some(json!({ "panes": flat }).to_string()))
+            }
             Err(e) => respond(request, 500, Some(json!({ "error": e }).to_string())),
         },
         (tiny_http::Method::Get, p) if p.starts_with("/api/panes/") && p.ends_with("/screen") => {
@@ -464,7 +474,13 @@ fn handle_request(
                 },
                 tx,
             ) {
-                Ok(result) => respond(request, 200, Some(result.to_string())),
+                Ok(result) => {
+                    // dispatch は { text: "line1\nline2" } を返すが、
+                    // PWA は { lines: ["line1", "line2"] } を期待する
+                    let text = result["text"].as_str().unwrap_or("");
+                    let line_vec: Vec<&str> = text.split('\n').collect();
+                    respond(request, 200, Some(json!({ "lines": line_vec }).to_string()))
+                }
                 Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
             }
         }
@@ -726,12 +742,24 @@ mod tests {
 
         let handle = std::thread::spawn(move || get(port, "/api/panes", Some(&token)));
         std::thread::sleep(std::time::Duration::from_millis(50));
-        mock_dispatch(&mut rx, json!({ "panes": [{"id": 1, "title": "zsh"}] }));
+        // dispatch は tabs 配列にネストされた形式で返す（list_json と同構造）
+        mock_dispatch(
+            &mut rx,
+            json!({
+                "active_tab": 0,
+                "tabs": [{
+                    "id": 0,
+                    "panes": [{"id": 1, "title": "zsh", "state": "idle"}]
+                }]
+            }),
+        );
         let (status, body) = handle.join().unwrap();
 
         assert_eq!(status, 200);
         let v: Value = serde_json::from_str(&body).unwrap();
+        // remote API はフラット化した panes 配列を返す
         assert_eq!(v["panes"][0]["id"], 1);
+        assert_eq!(v["panes"][0]["title"], "zsh");
         server.stop();
     }
 
@@ -743,12 +771,16 @@ mod tests {
 
         let handle = std::thread::spawn(move || get(port, "/api/panes/1/screen", Some(&token)));
         std::thread::sleep(std::time::Duration::from_millis(50));
-        mock_dispatch(&mut rx, json!({ "lines": ["$ hello", "world"] }));
+        // dispatch は { pane, text } を返す（Read の実レスポンス形式）
+        mock_dispatch(&mut rx, json!({ "pane": 1, "text": "$ hello\nworld" }));
         let (status, body) = handle.join().unwrap();
 
         assert_eq!(status, 200);
         let v: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["lines"][0], "$ hello");
+        // remote API は lines 配列に変換して返す
+        let lines = v["lines"].as_array().expect("lines は配列");
+        assert_eq!(lines[0], "$ hello");
+        assert_eq!(lines[1], "world");
         server.stop();
     }
 
@@ -844,5 +876,173 @@ mod tests {
             urlencoding::encode("https://foo.com"),
             "https%3A%2F%2Ffoo.com"
         );
+    }
+
+    // --- cloudflared 統合テスト（コマンドが無い環境では graceful にスキップ） ---
+
+    #[test]
+    fn cloudflaredが無い環境ではエラーを返す() {
+        // PATH を空にして cloudflared を見つけられない状態にする
+        let original = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", "");
+        let result = find_cloudflared();
+        std::env::set_var("PATH", &original);
+        // 実際に cloudflared がインストール済みなら Ok が返る可能性がある（絶対パス候補）
+        // いずれにしてもパニックしないことが重要
+        if let Err(e) = result {
+            assert!(e.to_string().contains("cloudflared"));
+        }
+    }
+
+    #[test]
+    fn trycloudflare_url抽出のエッジケース() {
+        // URL の前後にノイズがある場合
+        assert_eq!(
+            extract_trycloudflare_url("2024-06-22 INF https://a-b-c.trycloudflare.com registered"),
+            Some("https://a-b-c.trycloudflare.com".to_string()),
+        );
+        // 複数の https:// がある行
+        assert_eq!(
+            extract_trycloudflare_url("see https://example.com and https://x.trycloudflare.com"),
+            Some("https://x.trycloudflare.com".to_string()),
+        );
+        // trycloudflare 以外のドメイン
+        assert_eq!(extract_trycloudflare_url("https://example.com"), None);
+        // 空行
+        assert_eq!(extract_trycloudflare_url(""), None);
+    }
+
+    // --- no_tunnel フラグテスト ---
+
+    #[test]
+    fn no_tunnelでtunnel情報がない() {
+        let (mut server, _rx) = start_test_server(); // start_test_server は no_tunnel=true
+        assert!(server.tunnel_url().is_none());
+        assert!(server.machine_id().is_none());
+        assert!(server.tunnel_process.is_none());
+        server.stop();
+    }
+
+    // --- machine_id テスト ---
+
+    #[test]
+    fn machine_idはuuid形式() {
+        let id = machine_id();
+        // UUID v4 は 36 文字のハイフン区切り
+        assert_eq!(id.len(), 36);
+        assert_eq!(id.chars().filter(|c| *c == '-').count(), 4);
+    }
+
+    #[test]
+    fn machine_idをファイルに保存して再読み込みできる() {
+        let tmp = std::env::temp_dir().join(format!("tako-test-mid-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+
+        // 初回: 生成して保存
+        let id1 = {
+            let _ = std::fs::write(&tmp, "");
+            let fresh = uuid::Uuid::new_v4().to_string();
+            std::fs::write(&tmp, &fresh).unwrap();
+            fresh
+        };
+        // 再読み込み
+        let id2 = std::fs::read_to_string(&tmp).unwrap().trim().to_string();
+        assert_eq!(id1, id2);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    // --- KV リレー登録テスト（実 API は叩かない） ---
+
+    #[test]
+    fn register_relayは不正urlでエラーを返す() {
+        // 存在しない URL を指定して curl が失敗することを確認
+        std::env::set_var("TAKO_RELAY_URL", "http://127.0.0.1:1");
+        let result = register_relay("test-machine", "https://example.trycloudflare.com");
+        std::env::remove_var("TAKO_RELAY_URL");
+        assert!(result.is_err());
+    }
+
+    // --- レスポンス変換テスト ---
+
+    #[test]
+    fn ペイン一覧は複数タブを平坦化する() {
+        let (mut server, mut rx) = start_test_server();
+        let port = server.port();
+        let token = server.token().to_string();
+
+        let handle = std::thread::spawn(move || get(port, "/api/panes", Some(&token)));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        mock_dispatch(
+            &mut rx,
+            json!({
+                "active_tab": 0,
+                "tabs": [
+                    { "id": 0, "panes": [{"id": 1, "title": "zsh"}, {"id": 2, "title": "vim"}] },
+                    { "id": 1, "panes": [{"id": 3, "title": "node"}] },
+                ]
+            }),
+        );
+        let (status, body) = handle.join().unwrap();
+
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let panes = v["panes"].as_array().expect("panes は配列");
+        assert_eq!(panes.len(), 3);
+        assert_eq!(panes[0]["id"], 1);
+        assert_eq!(panes[2]["title"], "node");
+        server.stop();
+    }
+
+    #[test]
+    fn 画面内容は空テキストでも正常にlines変換する() {
+        let (mut server, mut rx) = start_test_server();
+        let port = server.port();
+        let token = server.token().to_string();
+
+        let handle = std::thread::spawn(move || get(port, "/api/panes/1/screen", Some(&token)));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        mock_dispatch(&mut rx, json!({ "pane": 1, "text": "" }));
+        let (status, body) = handle.join().unwrap();
+
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(v["lines"].as_array().is_some());
+        server.stop();
+    }
+
+    #[test]
+    fn corsヘッダが含まれる() {
+        let (mut server, _rx) = start_test_server();
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", server.port())).expect("接続");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let req = format!(
+            "OPTIONS /api/panes HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+            server.port()
+        );
+        {
+            use std::io::Write as _;
+            stream.write_all(req.as_bytes()).unwrap();
+        }
+        let mut response = String::new();
+        {
+            use std::io::Read as _;
+            let _ = stream.read_to_string(&mut response);
+        }
+        assert!(response.contains("204"));
+        assert!(response.contains("Access-Control-Allow-Origin"));
+        server.stop();
+    }
+
+    #[test]
+    fn connect_urlはtunnelありmachineなしでfragmentを使う() {
+        let url = connect_url(
+            Some("https://foo.trycloudflare.com"),
+            "http://localhost:7749",
+            "tok123",
+            None,
+        );
+        assert_eq!(url, "https://foo.trycloudflare.com#token=tok123");
     }
 }

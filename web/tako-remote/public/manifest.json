@@ -3,16 +3,27 @@
   "short_name": "tako",
   "description": "Remotely control tako terminal from your phone",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
   "background_color": "#0b0e14",
   "theme_color": "#0b0e14",
-  "orientation": "portrait",
+  "orientation": "portrait-primary",
+  "categories": ["developer-tools", "utilities"],
   "icons": [
     {
       "src": "/icons/icon.svg",
       "sizes": "any",
       "type": "image/svg+xml",
-      "purpose": "any maskable"
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
     }
-  ]
+  ],
+  "launch_handler": {
+    "client_mode": "navigate-existing"
+  }
 }

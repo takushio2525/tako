@@ -174,6 +174,7 @@ body {
 .card-list {
   flex: 1; overflow-y: auto; padding: 12px;
   -webkit-overflow-scrolling: touch;
+  transition: transform 0.15s ease-out;
 }
 
 .card {
@@ -270,12 +271,46 @@ body {
   flex-shrink: 0;
 }
 
-.terminal-output {
-  flex: 1; overflow-y: auto; overflow-x: hidden;
-  padding: 8px 12px;
-  font-family: var(--mono); font-size: 13px; line-height: 1.4;
-  color: var(--text);
-  -webkit-overflow-scrolling: touch;
+/* ---------- xterm.js container ---------- */
+
+.xterm-container {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  background: var(--bg);
+  padding: 4px 0;
+}
+
+.xterm-container .xterm {
+  height: 100%;
+}
+
+.xterm-loading {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--bg);
+  z-index: 10;
+}
+
+/* ---------- connection indicator ---------- */
+
+.conn-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+.conn-dot.on  { background: var(--success); box-shadow: 0 0 6px var(--success); }
+.conn-dot.off { background: var(--danger); box-shadow: 0 0 6px var(--danger); animation: pulse 1.4s infinite; }
+
+.reconnect-bar {
+  padding: 6px 16px;
+  background: rgba(239, 68, 68, 0.15);
+  border-top: 1px solid rgba(239, 68, 68, 0.3);
+  color: var(--danger);
+  font-size: 12px;
+  text-align: center;
+  flex-shrink: 0;
 }
 
 /* ---------- quick keys ---------- */
@@ -349,3 +384,43 @@ body {
 ::-webkit-scrollbar { width: 3px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+/* ---------- skeleton loading ---------- */
+
+.skeleton-card { pointer-events: none; }
+
+.skeleton {
+  background: linear-gradient(90deg, var(--card) 25%, var(--card-hover) 50%, var(--card) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+  border-radius: 4px;
+}
+
+.skeleton-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.skeleton-text {
+  height: 14px;
+  display: inline-block;
+}
+
+.skeleton-line {
+  height: 12px;
+  margin-bottom: 6px;
+  width: 100%;
+}
+
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* ---------- pull-to-refresh ---------- */
+
+.pull-indicator {
+  display: flex; justify-content: center;
+  padding: 12px; flex-shrink: 0;
+}
