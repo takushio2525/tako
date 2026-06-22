@@ -187,6 +187,35 @@ pub fn capture_pane_text(socket: Option<&str>, session: &str, window: u32) -> Ve
     .unwrap_or_default()
 }
 
+/// セッションのアクティブ window からペイン内容を取得する。
+/// GUI の表示状態に依存せず、tmux session が生きていれば常に読める
+pub fn capture_session(socket: Option<&str>, session: &str) -> Result<Vec<String>, String> {
+    run_tmux(
+        socket,
+        &["capture-pane", "-t", &format!("={session}"), "-p"],
+    )
+    .map(|output| output.lines().map(str::to_string).collect())
+}
+
+/// セッションのアクティブ window へキー入力を送信する。
+/// `text` はそのまま send-keys へ渡す（リテラルモード `-l`）
+pub fn send_keys(socket: Option<&str>, session: &str, text: &str) -> Result<(), String> {
+    run_tmux(
+        socket,
+        &["send-keys", "-t", &format!("={session}"), "-l", text],
+    )
+    .map(|_| ())
+}
+
+/// セッションが生きているか確認する（`has-session`）
+pub fn session_alive(socket: Option<&str>, session: &str) -> bool {
+    tmux_command(socket)
+        .args(["has-session", "-t", &format!("={session}")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// tmux クライアント子プロセスの雛形。バイナリ解決（`tmux_bin`）と
 /// **UTF-8 ロケールの明示注入**を一手に引き受ける。
 ///

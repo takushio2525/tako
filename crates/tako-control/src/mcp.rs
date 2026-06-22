@@ -195,7 +195,8 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_send_input",
             "description": "指定ペインの端末へテキストを書き込む（既定で末尾に改行を付けて実行する）。\
                 対象の誤指定はそのまま誤実行になるため、必ず tako_list_panes で確認した\
-                ペイン ID を渡すこと。",
+                ペイン ID を渡すこと。tmux_session を指定するとペインが見つからない場合でも \
+                tmux session 経由で送信できる。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -205,6 +206,10 @@ pub fn tools() -> Vec<Value> {
                         "type": "boolean",
                         "description": "末尾に改行を付けるか（省略時 true。プロンプトへの部分入力は false）",
                     },
+                    "tmux_session": {
+                        "type": "string",
+                        "description": "tmux session 名（pane ID 解決不能時のフォールバック。tako_orchestrator_spawn の返り値に含まれる）",
+                    },
                 },
                 "required": ["pane", "text"],
                 "additionalProperties": false,
@@ -213,12 +218,17 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_read_pane",
             "description": "指定ペインの画面内容（表示中のテキスト）を返す。\
-                別ペインで実行したコマンドの結果確認や、エージェント・dev サーバーの出力監視に使う。",
+                別ペインで実行したコマンドの結果確認や、エージェント・dev サーバーの出力監視に使う。\
+                tmux_session を指定するとペインが見つからない場合でも tmux session 経由で読める。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane": { "type": "integer", "minimum": 0, "description": "対象ペイン ID（必須）" },
                     "lines": { "type": "integer", "minimum": 1, "description": "末尾からの行数制限" },
+                    "tmux_session": {
+                        "type": "string",
+                        "description": "tmux session 名（pane ID 解決不能時のフォールバック。tako_orchestrator_spawn の返り値に含まれる）",
+                    },
                 },
                 "required": ["pane"],
                 "additionalProperties": false,
@@ -791,8 +801,9 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_orchestrator_spawn",
             "description": "プロジェクトの作業ディレクトリで子 claude worker を spawn する。\
                 呼び出し元ペインを右に分割して新ペインを作り、claude を起動してプロンプトを送信する。\
-                worker の pane_id を返すので、以後は tako_read_pane / tako_send_input / \
-                tako_close_pane で操作し、tako orchestrator watch で完了監視する。\
+                worker の pane_id と tmux_session を返す。tmux_session は pane ID が解決できない場合\
+                （BG タブ移動・tako 再起動後）のフォールバックとして tako_read_pane / tako_send_input / \
+                tako_orchestrator_worker_status に渡せる。\
                 起動からプロンプト送信まで 15〜20 秒かかる（これは想定内）。",
             "inputSchema": {
                 "type": "object",
@@ -813,15 +824,58 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_orchestrator_worker_status",
             "description": "子 worker の状態を確認する。status は busy（作業中）/ idle（入力待ち・完了）/ \
-                gone（ペイン消滅）/ unknown（agents 不可）。session_id を渡すと claude agents --json \
-                で正確な状態を取得する。recent_output はペインの最近 30 行の出力。",
+                gone（ペイン消滅かつ tmux session も消滅）/ unknown（agents 不可）。session_id を渡すと \
+                claude agents --json で正確な状態を取得する。tmux_session を渡すとペインが消えても \
+                tmux session が生きている限り recent_output を取得でき、gone にならない。\
+                recent_output はペインの最近 30 行の出力。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane_id": { "type": "integer", "minimum": 0, "description": "worker のペイン ID（必須）" },
                     "session_id": { "type": "string", "description": "claude の session ID（あれば精度向上）" },
+                    "tmux_session": {
+                        "type": "string",
+                        "description": "tmux session 名（pane 消滅時のフォールバック追跡。tako_orchestrator_spawn の返り値に含まれる）",
+                    },
                 },
                 "required": ["pane_id"],
+                "additionalProperties": false,
+            },
+        }),
+        // --- リモートアクセス MCP ツール ---
+        json!({
+            "name": "tako_remote_start",
+            "description": "リモートアクセス API サーバーを起動する。スマホからブラウザ経由で\
+                ペインを操作するための HTTP API サーバーが指定ポート（既定 7749）で開始される。\
+                起動後は /api/panes 等のエンドポイントで curl やブラウザから操作できる。\
+                ターミナルに接続用の QR コードが表示される。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "port": {
+                        "type": "integer", "minimum": 1, "maximum": 65535,
+                        "description": "サーバーのポート番号（省略時は 7749）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_remote_stop",
+            "description": "リモートアクセス API サーバーを停止する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_remote_status",
+            "description": "リモートアクセス API サーバーの状態を取得する。\
+                起動中なら running=true とポート番号・トークンを返す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
                 "additionalProperties": false,
             },
         }),
@@ -875,10 +929,12 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             pane: Some(required_u64(args, "pane")?),
             text: str_arg(args, "text")?.ok_or("text を指定する")?,
             newline: bool_arg(args, "newline")?.unwrap_or(true),
+            tmux_session: str_arg(args, "tmux_session")?,
         },
         "tako_read_pane" => Request::Read {
             pane: Some(required_u64(args, "pane")?),
             lines: u64_arg(args, "lines")?.map(|n| n as usize),
+            tmux_session: str_arg(args, "tmux_session")?,
         },
         "tako_tmux_list" => Request::TmuxList {
             socket: str_arg(args, "socket")?,
@@ -1095,7 +1151,13 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
         "tako_orchestrator_worker_status" => Request::OrchestratorWorkerStatus {
             pane_id: required_u64(args, "pane_id")?,
             session_id: str_arg(args, "session_id")?,
+            tmux_session: str_arg(args, "tmux_session")?,
         },
+        "tako_remote_start" => Request::RemoteStart {
+            port: u64_arg(args, "port")?.map(|v| v as u16),
+        },
+        "tako_remote_stop" => Request::RemoteStop,
+        "tako_remote_status" => Request::RemoteStatus,
         _ => return Err(format!("不明なツール: {name}")),
     })
 }
@@ -1521,7 +1583,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 40);
+        assert_eq!(tools.len(), 43);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
@@ -1598,6 +1660,7 @@ mod tests {
             vec![Request::Read {
                 pane: Some(4),
                 lines: Some(10),
+                tmux_session: None,
             }]
         );
     }
