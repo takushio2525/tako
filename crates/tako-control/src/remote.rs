@@ -559,28 +559,43 @@ fn handle_request(
     }
 }
 
-/// QR コードをターミナルに表示する
-///
-/// `qrcode` クレートの `.render()` で Unicode ブロック文字列を生成し、
-/// ANSI 白背景＋黒前景で囲んでダークターミナルでも読めるようにする。
-pub fn print_qr(url: &str) {
+/// QR コードを PNG 画像として生成し、Preview.app で開く（macOS）。
+/// 生成先のパスを返す。
+pub fn generate_qr_png(url: &str) -> io::Result<std::path::PathBuf> {
+    use image::{GrayImage, Luma};
     use qrcode::QrCode;
 
-    let Ok(code) = QrCode::new(url.as_bytes()) else {
-        eprintln!("QR コードの生成に失敗: URL が長すぎる可能性あり");
-        return;
-    };
+    let code = QrCode::new(url.as_bytes())
+        .map_err(|e| io::Error::other(format!("QR コードの生成に失敗: {e}")))?;
 
-    let string = code
-        .render::<char>()
-        .quiet_zone(true)
-        .module_dimensions(2, 1)
-        .build();
+    let module_count = code.width() as u32;
+    let module_px = 10u32;
+    let quiet_zone = 4u32;
+    let total = (module_count + quiet_zone * 2) * module_px;
 
-    // 白背景 + 黒前景で各行を囲む
-    for line in string.lines() {
-        println!("\x1b[47;30m{line}\x1b[0m");
+    let mut img = GrayImage::from_pixel(total, total, Luma([255u8]));
+    for y in 0..module_count {
+        for x in 0..module_count {
+            if code[(x as usize, y as usize)] == qrcode::Color::Dark {
+                for dy in 0..module_px {
+                    for dx in 0..module_px {
+                        let px = (x + quiet_zone) * module_px + dx;
+                        let py = (y + quiet_zone) * module_px + dy;
+                        img.put_pixel(px, py, Luma([0u8]));
+                    }
+                }
+            }
+        }
     }
+
+    let path = std::env::temp_dir().join("tako-remote-qr.png");
+    img.save(&path)
+        .map_err(|e| io::Error::other(format!("PNG の保存に失敗: {e}")))?;
+
+    // macOS: Preview.app で開く
+    let _ = Command::new("open").arg(&path).spawn();
+
+    Ok(path)
 }
 
 // --- URL エンコーディング（最小実装。外部依存なし）---
@@ -681,8 +696,12 @@ mod tests {
     }
 
     #[test]
-    fn qr生成がパニックしない() {
-        print_qr("http://192.168.1.100:7749#token=abc123def456");
+    fn qr_pngを生成できる() {
+        let path = super::generate_qr_png("http://192.168.1.100:7749#token=abc123def456")
+            .expect("PNG 生成に失敗");
+        assert!(path.exists());
+        assert!(std::fs::metadata(&path).unwrap().len() > 100);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

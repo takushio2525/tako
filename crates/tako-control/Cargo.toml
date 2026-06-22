@@ -18,4 +18,5 @@ tiny_http.workspace = true
 pathdiff.workspace = true
 serde_yaml.workspace = true
 qrcode.workspace = true
+image.workspace = true
 uuid.workspace = true
