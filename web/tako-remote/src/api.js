@@ -1,5 +1,5 @@
 const TIMEOUT_MS = 10000;
-const DEFAULT_RELAY_URL = 'https://tako-remote-relay.shiozawa-takumi.workers.dev';
+const DEFAULT_RELAY_URL = 'https://tako-remote-relay.takushio2525.workers.dev';
 
 export function createClient(host, token) {
   const raw = host.replace(/\/+$/, '');
