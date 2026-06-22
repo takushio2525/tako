@@ -129,6 +129,9 @@ enum RemoteCommand {
         /// サーバーのポート番号（省略時は 7749）
         #[arg(long, default_value_t = 7749)]
         port: u16,
+        /// cloudflared Quick Tunnel を起動しない（LAN のみモード）
+        #[arg(long)]
+        no_tunnel: bool,
     },
     /// リモートアクセス API サーバーを停止する
     Stop,
@@ -1331,9 +1334,10 @@ fn build_request(command: &Command) -> Result<Request, String> {
             session_id: session_id.clone(),
             tmux_session: tmux_session.clone(),
         },
-        Command::Remote(RemoteCommand::Start { port }) => {
-            Request::RemoteStart { port: Some(*port) }
-        }
+        Command::Remote(RemoteCommand::Start { port, no_tunnel }) => Request::RemoteStart {
+            port: Some(*port),
+            no_tunnel: *no_tunnel,
+        },
         Command::Remote(RemoteCommand::Stop) => Request::RemoteStop,
         Command::Remote(RemoteCommand::Status) => Request::RemoteStatus,
         // main() で分岐済みのため論理的に到達不能
@@ -1495,12 +1499,15 @@ fn print_result(command: &Command, result: &Value) {
                 "{}",
                 serde_json::to_string_pretty(result).unwrap_or_default()
             );
-            if let Some(url) = result["url"].as_str() {
-                if let Some(token) = result["token"].as_str() {
-                    let full_url = format!("{url}#token={token}");
-                    eprintln!("\nスキャンして接続:");
-                    tako_control::remote::print_qr(&full_url);
-                    eprintln!("URL: {full_url}");
+            if let Some(connect) = result["connect_url"].as_str() {
+                eprintln!("\nスキャンして接続:");
+                tako_control::remote::print_qr(connect);
+                eprintln!("URL: {connect}");
+                if let Some(tunnel) = result["tunnel_url"].as_str() {
+                    eprintln!("Tunnel: {tunnel}");
+                }
+                if let Some(mid) = result["machine_id"].as_str() {
+                    eprintln!("Machine ID: {mid}");
                 }
             }
         }

@@ -355,8 +355,13 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tmux_session: Option<String>,
     },
-    /// リモートアクセス API サーバーの起動。`port` 省略時は 7749
-    RemoteStart { port: Option<u16> },
+    /// リモートアクセス API サーバーの起動。`port` 省略時は 7749。
+    /// `no_tunnel` = true で cloudflared Quick Tunnel を起動せず LAN のみモードにする
+    RemoteStart {
+        port: Option<u16>,
+        #[serde(default)]
+        no_tunnel: bool,
+    },
     /// リモートアクセス API サーバーの停止
     RemoteStop,
     /// リモートアクセス API サーバーの状態取得

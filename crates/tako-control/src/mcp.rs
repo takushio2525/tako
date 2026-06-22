@@ -847,6 +847,7 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_remote_start",
             "description": "リモートアクセス API サーバーを起動する。スマホからブラウザ経由で\
                 ペインを操作するための HTTP API サーバーが指定ポート（既定 7749）で開始される。\
+                cloudflared Quick Tunnel を自動起動して外部からのアクセスも可能にする。\
                 起動後は /api/panes 等のエンドポイントで curl やブラウザから操作できる。\
                 ターミナルに接続用の QR コードが表示される。",
             "inputSchema": {
@@ -855,6 +856,10 @@ pub fn tools() -> Vec<Value> {
                     "port": {
                         "type": "integer", "minimum": 1, "maximum": 65535,
                         "description": "サーバーのポート番号（省略時は 7749）",
+                    },
+                    "no_tunnel": {
+                        "type": "boolean",
+                        "description": "true にすると cloudflared を起動しない（LAN のみモード）",
                     },
                 },
                 "additionalProperties": false,
@@ -1155,6 +1160,7 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
         },
         "tako_remote_start" => Request::RemoteStart {
             port: u64_arg(args, "port")?.map(|v| v as u16),
+            no_tunnel: bool_arg(args, "no_tunnel")?.unwrap_or(false),
         },
         "tako_remote_stop" => Request::RemoteStop,
         "tako_remote_status" => Request::RemoteStatus,

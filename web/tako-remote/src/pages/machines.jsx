@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'preact/hooks';
-import { getMachines, removeMachine, setActiveMachine } from '../store';
-import { createClient } from '../api';
+import { getMachines, removeMachine, setActiveMachine, updateMachineHost } from '../store';
+import { createClient, resolveHost } from '../api';
 
 export function MachinesPage() {
   const [machines, setMachines] = useState(getMachines);
@@ -8,13 +8,35 @@ export function MachinesPage() {
   const [deleteTarget, setDeleteTarget] = useState(null);
 
   useEffect(() => {
-    machines.forEach(m => {
+    machines.forEach(async (m) => {
       setStatuses(prev => ({ ...prev, [m.id]: 'checking' }));
-      createClient(m.host, m.token).health()
-        .then(() => setStatuses(prev => ({ ...prev, [m.id]: 'online' })))
-        .catch(() => setStatuses(prev => ({ ...prev, [m.id]: 'offline' })));
+
+      // まず保存済み host で直接接続を試みる
+      try {
+        await createClient(m.host, m.token).health();
+        setStatuses(prev => ({ ...prev, [m.id]: 'online' }));
+        return;
+      } catch {
+        // 直接接続失敗 → KV リレーで最新 URL を取得
+      }
+
+      // machine ID で resolve
+      const resolved = await resolveHost(m.id);
+      if (resolved && resolved !== m.host) {
+        try {
+          await createClient(resolved, m.token).health();
+          updateMachineHost(m.id, resolved);
+          setMachines(getMachines());
+          setStatuses(prev => ({ ...prev, [m.id]: 'online' }));
+          return;
+        } catch {
+          // resolve した URL でも接続失敗
+        }
+      }
+
+      setStatuses(prev => ({ ...prev, [m.id]: 'offline' }));
     });
-  }, [machines]);
+  }, [machines.length]);
 
   function connect(m) {
     setActiveMachine(m.id);
