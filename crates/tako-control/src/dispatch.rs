@@ -1005,6 +1005,12 @@ pub fn dispatch(
                     #[cfg(target_os = "macos")]
                     {
                         let posix = path.display().to_string();
+                        // 制御文字（0x00-0x1F, 0x7F）を含むパスは AppleScript インジェクション防止のため拒否
+                        if posix.bytes().any(|b| b <= 0x1F || b == 0x7F) {
+                            return Err(DispatchError::Operation(
+                                "パスに制御文字が含まれているため操作できません".to_string(),
+                            ));
+                        }
                         let script = format!(
                             "tell application \"Finder\" to delete (POSIX file \"{}\" as alias)",
                             posix.replace('\\', "\\\\").replace('"', "\\\"")

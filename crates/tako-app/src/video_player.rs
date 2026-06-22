@@ -111,6 +111,11 @@ pub struct VideoPlayer {
     pub frame_gen: u64,
 }
 
+// Safety: AVFoundation の API（AVPlayer / AVPlayerItemVideoOutput 等）は多くが
+// main-thread-only だが、VideoPlayer は GPUI のメインスレッドコールバック内
+// （on_next_frame / Entity コールバック）でのみ操作される。
+// バックグラウンドスレッドからのアクセスは行わない前提で Send を実装している。
+// この制約が崩れる場合は Send impl を除去し、MainThread<T> 等で保護すること。
 #[cfg(target_os = "macos")]
 unsafe impl Send for VideoPlayer {}
 

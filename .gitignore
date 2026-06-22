@@ -2,3 +2,23 @@
 /dist
 .DS_Store
 .claude/
+
+# 環境変数
+.env*
+
+# 鍵・証明書
+*.key
+*.pem
+*.p12
+
+# IDE 設定
+.vscode/
+.idea/
+
+# エディタ一時ファイル
+*.swp
+*.swo
+*~
+
+# ログ
+*.log
