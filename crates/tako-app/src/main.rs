@@ -3281,12 +3281,22 @@ impl TakoApp {
             let show_rows = is_active || !is_collapsed;
             let total_pane_count = group.rows.len();
 
-            let tab_focused = self
+            let tab_tree = self
                 .workspace
                 .tabs()
                 .iter()
                 .find(|t| t.id() == tab_id)
-                .map(|t| t.tree().focused());
+                .map(|t| t.tree());
+            let tab_focused = tab_tree.map(|t| t.focused());
+            // レイアウト順のペイン ID リスト（ミニマップとペインリストで番号を統一するため）
+            let layout_order: Vec<PaneId> = tab_tree
+                .map(|t| {
+                    t.layout(tako_core::Rect::UNIT)
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect()
+                })
+                .unwrap_or_default();
             let has_failure = group
                 .rows
                 .iter()
@@ -3448,13 +3458,7 @@ impl TakoApp {
                 });
             // ミニレイアウトマップ（ペイン配置を小さな矩形で可視化）
             if show_rows {
-                let tree = self
-                    .workspace
-                    .tabs()
-                    .iter()
-                    .find(|t| t.id() == tab_id)
-                    .map(|t| t.tree());
-                if let Some(tree) = tree {
+                if let Some(tree) = tab_tree {
                     let focused_pane = tree.focused();
                     let layout = tree.layout(tako_core::Rect::new(0.0, 0.0, 92.0, 76.0));
                     let mut map = div()
@@ -3467,7 +3471,7 @@ impl TakoApp {
                         .relative()
                         .overflow_hidden()
                         .mx_auto();
-                    for (pane_id, rect) in &layout {
+                    for (idx, (pane_id, rect)) in layout.iter().enumerate() {
                         let is_focused = *pane_id == focused_pane;
                         let pane_state = self
                             .terminals
@@ -3480,8 +3484,7 @@ impl TakoApp {
                             _ if is_focused => theme.accent,
                             _ => theme.border_strong,
                         };
-                        let pane_num =
-                            layout.iter().position(|(id, _)| id == pane_id).unwrap_or(0) + 1;
+                        let pane_num = idx + 1;
                         let cell = div()
                             .absolute()
                             .left(px(rect.x + 1.0))
@@ -3526,9 +3529,13 @@ impl TakoApp {
             // どの attach セッションをホスト行の下に出したか（取りこぼし防止に使う）
             let mut rendered_sessions: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
-            for (row_idx, row) in group_rows.into_iter().enumerate() {
+            for row in group_rows {
                 let pane = row.pane;
-                let pane_num = row_idx + 1;
+                let pane_num = layout_order
+                    .iter()
+                    .position(|id| *id == pane)
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
                 let pinned = self
                     .pinned_previews
                     .iter()
