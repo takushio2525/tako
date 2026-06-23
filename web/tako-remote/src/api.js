@@ -37,13 +37,13 @@ export function createClient(host, token) {
     },
     screen(id, lines) {
       const qs = lines ? `?lines=${lines}` : '';
-      return request('GET', `/api/panes/${id}/screen${qs}`);
+      return request('GET', `/api/panes/${encodeURIComponent(id)}/screen${qs}`);
     },
     input(id, text, newline = true) {
-      return request('POST', `/api/panes/${id}/input`, { text, newline });
+      return request('POST', `/api/panes/${encodeURIComponent(id)}/input`, { text, newline });
     },
     close(id) {
-      return request('POST', `/api/panes/${id}/close`);
+      return request('POST', `/api/panes/${encodeURIComponent(id)}/close`);
     },
     base() {
       return base;

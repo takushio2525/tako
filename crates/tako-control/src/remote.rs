@@ -526,6 +526,62 @@ pub fn hostname() -> String {
 
 // --- tmux 直接操作 ---
 
+const TMUX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// tmux コマンドをタイムアウト付きで実行する。
+/// `.output()` は tmux ハング時にスレッドを永久ブロックするため、
+/// `spawn` + `try_wait` ループでタイムアウトを実装する
+fn tmux_output_with_timeout(
+    tmux_socket: &str,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+
+    let mut child = tako_core::tmux::tmux_command(Some(tmux_socket))
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("tmux コマンドの起動に失敗: {e}"))?;
+
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(ref mut out) = child.stdout {
+                    let _ = out.read_to_end(&mut stdout);
+                }
+                if let Some(ref mut err) = child.stderr {
+                    let _ = err.read_to_end(&mut stderr);
+                }
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                if start.elapsed() > TMUX_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "tmux {} がタイムアウト（{}秒）",
+                        args.first().unwrap_or(&""),
+                        TMUX_TIMEOUT.as_secs()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(format!("プロセスの待機に失敗: {e}"));
+            }
+        }
+    }
+}
+
 /// tmux バックエンドから全セッション・ペイン情報を取得して JSON 配列に変換する。
 /// PWA が期待する `{ panes: [...] }` のフラット形式を返す
 fn tmux_list_panes(tmux_socket: &str) -> Value {
@@ -561,10 +617,10 @@ fn tmux_list_panes(tmux_socket: &str) -> Value {
 /// tmux の特定 window 内のペイン一覧を取得する
 fn tmux_list_window_panes(tmux_socket: &str, session: &str, window: u32) -> Vec<String> {
     let target = format!("={session}:{window}");
-    let output = tako_core::tmux::tmux_command(Some(tmux_socket))
-        .args(["list-panes", "-t", &target, "-F", "#{pane_tty}"])
-        .output();
-    match output {
+    match tmux_output_with_timeout(
+        tmux_socket,
+        &["list-panes", "-t", &target, "-F", "#{pane_tty}"],
+    ) {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
             .lines()
             .map(|l| l.to_string())
@@ -575,10 +631,7 @@ fn tmux_list_window_panes(tmux_socket: &str, session: &str, window: u32) -> Vec<
 
 /// tmux の特定ペインの画面内容を取得する
 fn tmux_capture_pane(tmux_socket: &str, target: &str) -> Result<Vec<String>, String> {
-    let output = tako_core::tmux::tmux_command(Some(tmux_socket))
-        .args(["capture-pane", "-t", target, "-p"])
-        .output()
-        .map_err(|e| format!("tmux capture-pane に失敗: {e}"))?;
+    let output = tmux_output_with_timeout(tmux_socket, &["capture-pane", "-t", target, "-p"])?;
     if !output.status.success() {
         return Err(format!(
             "tmux capture-pane がエラー: {}",
@@ -598,10 +651,7 @@ fn tmux_send_keys(
     text: &str,
     newline: bool,
 ) -> Result<(), String> {
-    let output = tako_core::tmux::tmux_command(Some(tmux_socket))
-        .args(["send-keys", "-t", target, "-l", text])
-        .output()
-        .map_err(|e| format!("tmux send-keys に失敗: {e}"))?;
+    let output = tmux_output_with_timeout(tmux_socket, &["send-keys", "-t", target, "-l", text])?;
     if !output.status.success() {
         return Err(format!(
             "tmux send-keys がエラー: {}",
@@ -609,10 +659,7 @@ fn tmux_send_keys(
         ));
     }
     if newline {
-        tako_core::tmux::tmux_command(Some(tmux_socket))
-            .args(["send-keys", "-t", target, "Enter"])
-            .output()
-            .map_err(|e| format!("tmux send-keys (Enter) に失敗: {e}"))?;
+        tmux_output_with_timeout(tmux_socket, &["send-keys", "-t", target, "Enter"])?;
     }
     Ok(())
 }
@@ -718,14 +765,14 @@ fn check_auth(request: &tiny_http::Request, token: &str) -> bool {
     header_value(request, "authorization").is_some_and(|v| v == format!("Bearer {token}"))
 }
 
-/// URL パスからペイン ID を抽出する（`/api/panes/session:0.1/screen` → Some("session:0.1")）
+/// URL パスからペイン ID を抽出する（`/api/panes/session%3A0.1/screen` → Some("session:0.1")）
 fn extract_pane_target(path: &str) -> Option<String> {
     let parts: Vec<&str> = path.splitn(5, '/').collect();
     // ["", "api", "panes", "<id>", "screen"]
     if parts.len() >= 4 && parts[1] == "api" && parts[2] == "panes" {
-        let id = parts[3];
+        let id = urlencoding::decode(parts[3]);
         if !id.is_empty() {
-            return Some(id.to_string());
+            return Some(id);
         }
     }
     None
@@ -909,6 +956,26 @@ mod urlencoding {
         }
         result
     }
+
+    pub fn decode(s: &str) -> String {
+        let mut result = Vec::with_capacity(s.len());
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                if let Ok(b) =
+                    u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+                {
+                    result.push(b);
+                    i += 3;
+                    continue;
+                }
+            }
+            result.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&result).into_owned()
+    }
 }
 
 #[cfg(test)]
@@ -927,6 +994,34 @@ mod tests {
         );
         assert_eq!(extract_pane_target("/api/panes//input"), None);
         assert_eq!(extract_pane_target("/api/health"), None);
+    }
+
+    #[test]
+    fn extract_pane_targetはurlエンコード済みidをデコードする() {
+        // コロンが %3A にエンコードされたケース
+        assert_eq!(
+            extract_pane_target("/api/panes/tako-abc123%3A0.0/screen"),
+            Some("tako-abc123:0.0".to_string())
+        );
+        // エンコードなし（コロンはパスセグメントで有効な文字）
+        assert_eq!(
+            extract_pane_target("/api/panes/tako-abc123:0.0/screen"),
+            Some("tako-abc123:0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn urlデコーディング() {
+        assert_eq!(urlencoding::decode("hello"), "hello");
+        assert_eq!(urlencoding::decode("sess%3A0.1"), "sess:0.1");
+        assert_eq!(
+            urlencoding::decode("tako-5728aacf5f80%3A0.0"),
+            "tako-5728aacf5f80:0.0"
+        );
+        // 不正な %XX はそのまま保持
+        assert_eq!(urlencoding::decode("bad%ZZend"), "bad%ZZend");
+        // 末尾の不完全な % はそのまま
+        assert_eq!(urlencoding::decode("end%2"), "end%2");
     }
 
     #[test]
