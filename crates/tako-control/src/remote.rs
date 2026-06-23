@@ -30,9 +30,6 @@ const DEFAULT_PORT: u16 = 7749;
 const MAX_BODY_BYTES: u64 = 1024 * 1024;
 /// KV リレーの Workers URL（Cloudflare Pages / Workers のデプロイ先）
 const DEFAULT_RELAY_URL: &str = "https://tako-remote-relay.shiozawa-takumi.workers.dev";
-/// PWA のデプロイ先（Cloudflare Pages）— tunnel モード時のみ使用
-const DEFAULT_PAGES_URL: &str = "https://tako-remote.pages.dev";
-
 // --- PID / トークン / ポートファイルのパス ---
 
 pub fn pid_path() -> std::path::PathBuf {
@@ -492,13 +489,8 @@ pub fn connect_url(
     name: Option<&str>,
 ) -> String {
     if let Some(tunnel) = tunnel_url {
-        let pages_url =
-            std::env::var("TAKO_PAGES_URL").unwrap_or_else(|_| DEFAULT_PAGES_URL.to_string());
-        let mut url = format!(
-            "{pages_url}/connect?host={}&token={}",
-            urlencoding::encode(tunnel),
-            urlencoding::encode(token),
-        );
+        // tunnel 自体が PWA を配信するので、tunnel URL に直接飛ばす（pages.dev 経由不要）
+        let mut url = format!("{tunnel}/connect?token={}", urlencoding::encode(token));
         if let Some(n) = name {
             url.push_str(&format!("&name={}", urlencoding::encode(n)));
         }
@@ -1073,8 +1065,8 @@ mod tests {
             "abc123",
             Some("my-mac"),
         );
-        assert!(url.starts_with("https://tako-remote.pages.dev/connect?"));
-        assert!(url.contains("host=https%3A%2F%2Ffoo.trycloudflare.com"));
+        assert!(url.starts_with("https://foo.trycloudflare.com/connect?"));
+        assert!(!url.contains("host="));
         assert!(url.contains("token=abc123"));
         assert!(url.contains("name=my-mac"));
 
@@ -1156,15 +1148,15 @@ mod tests {
     }
 
     #[test]
-    fn connect_urlはtunnelありnameなしでもpages経由() {
+    fn connect_urlはtunnelありnameなしでもtunnel直接() {
         let url = connect_url(
             Some("https://foo.trycloudflare.com"),
             "http://localhost:7749",
             "tok123",
             None,
         );
-        assert!(url.starts_with("https://tako-remote.pages.dev/connect?"));
-        assert!(url.contains("host=https%3A%2F%2Ffoo.trycloudflare.com"));
+        assert!(url.starts_with("https://foo.trycloudflare.com/connect?"));
+        assert!(!url.contains("host="));
         assert!(url.contains("token=tok123"));
         assert!(!url.contains("name="));
     }
