@@ -14,6 +14,7 @@
 //! stdio ブリッジ）、Phase 3.5 の IME 変換状態（marked text）を機械検証して終了する。
 
 mod autorename;
+mod file_icons;
 mod filetree;
 mod preview;
 mod video_player;
@@ -25,7 +26,7 @@ use std::time::Duration;
 use futures::channel::mpsc::unbounded;
 use futures::StreamExt;
 use gpui::{
-    actions, canvas, div, fill, point, prelude::*, px, quad, relative, size, App, BorderStyle,
+    actions, canvas, div, fill, point, prelude::*, px, quad, relative, size, svg, App, BorderStyle,
     Bounds, BoxShadow, ClipboardItem, Context, CursorStyle, DragMoveEvent, ElementInputHandler,
     EntityInputHandler, FocusHandle, Font, FontStyle, FontWeight, HighlightStyle, Hsla, KeyBinding,
     Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
@@ -210,7 +211,10 @@ actions!(
         ActivateTab6,
         ActivateTab7,
         ActivateTab8,
-        ActivateTab9
+        ActivateTab9,
+        ZoomIn,
+        ZoomOut,
+        ResetZoom
     ]
 );
 
@@ -244,6 +248,10 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-7", ActivateTab7, None),
         KeyBinding::new("cmd-8", ActivateTab8, None),
         KeyBinding::new("cmd-9", ActivateTab9, None),
+        KeyBinding::new("cmd-=", ZoomIn, None),
+        KeyBinding::new("cmd-+", ZoomIn, None),
+        KeyBinding::new("cmd--", ZoomOut, None),
+        KeyBinding::new("cmd-0", ResetZoom, None),
     ]
 }
 
@@ -400,8 +408,12 @@ struct TakoApp {
     terminals: HashMap<PaneId, TerminalSession>,
     theme: Theme,
     focus_handle: FocusHandle,
-    /// 実測したセル寸法（最初の render で確定）
+    /// 実測したセル寸法（最初の render で確定。デフォルトフォントサイズ用）
     cell_size: Option<Size<Pixels>>,
+    /// ペインごとのフォントサイズオーバーライド（未設定ならテーマ既定）
+    pane_font_sizes: HashMap<PaneId, f32>,
+    /// ペインごとのセル寸法キャッシュ（フォントサイズ変更時に無効化）
+    pane_cell_sizes: HashMap<PaneId, Size<Pixels>>,
     /// マウス選択中のペイン
     selecting: Option<PaneId>,
     /// 直近 render でのアクティブタブ各ペインのテキスト領域（マウス座標→セル変換用）
@@ -520,6 +532,14 @@ struct TakoApp {
     video_frame_cache: HashMap<PaneId, (u64, std::sync::Arc<gpui::RenderImage>)>,
     /// シークバー要素の実測 bounds（paint 時に canvas で記録）
     video_seek_bar_bounds: HashMap<PaneId, Bounds<Pixels>>,
+    /// プレビューペインのテキスト選択
+    preview_selections: HashMap<PaneId, PreviewSelection>,
+    /// プレビューで選択操作中のペイン
+    preview_selecting: Option<PaneId>,
+    /// プレビューの行ごとの bounds（paint 時に canvas で記録。選択のヒット判定用）
+    preview_line_bounds: HashMap<PaneId, Vec<Bounds<Pixels>>>,
+    /// プレビューの行ごとのプレーンテキスト（選択テキスト抽出用）
+    preview_line_texts: HashMap<PaneId, Vec<String>>,
 }
 
 /// git パネルのデータスナップショット（FR-3.6 / FR-3.9）
@@ -555,6 +575,42 @@ struct TmuxViewTarget {
     wrapper: Option<String>,
     /// 元セッションが居る tmux サーバーの socket（`-L` 値。既定サーバーは None）
     socket: Option<String>,
+}
+
+/// プレビューペインのテキスト選択状態
+#[derive(Debug, Clone)]
+struct PreviewSelection {
+    anchor: (usize, usize),
+    head: (usize, usize),
+}
+
+impl PreviewSelection {
+    fn ordered(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor.0 < self.head.0
+            || (self.anchor.0 == self.head.0 && self.anchor.1 <= self.head.1)
+        {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    fn range_for_line(&self, line: usize, line_len: usize) -> Option<(usize, usize)> {
+        let (start, end) = self.ordered();
+        if line < start.0 || line > end.0 {
+            return None;
+        }
+        let col_start = if line == start.0 { start.1 } else { 0 };
+        let col_end = if line == end.0 {
+            end.1.min(line_len)
+        } else {
+            line_len
+        };
+        if col_start >= col_end && !(line > start.0 && line < end.0) {
+            return None;
+        }
+        Some((col_start, col_end))
+    }
 }
 
 /// 提案チップ 1 件分（FR-2.4.3。「localhost:PORT をブラウザで開く？」）
@@ -917,6 +973,8 @@ impl TakoApp {
             theme: Theme::default(),
             focus_handle: cx.focus_handle(),
             cell_size: None,
+            pane_font_sizes: HashMap::new(),
+            pane_cell_sizes: HashMap::new(),
             selecting: None,
             pane_text_areas: Vec::new(),
             ipc,
@@ -972,6 +1030,10 @@ impl TakoApp {
             video_ticker: false,
             video_frame_cache: HashMap::new(),
             video_seek_bar_bounds: HashMap::new(),
+            preview_selections: HashMap::new(),
+            preview_selecting: None,
+            preview_line_bounds: HashMap::new(),
+            preview_line_texts: HashMap::new(),
         };
         if restored.is_empty() {
             let root_id = app.workspace.active_tab().tree().focused();
@@ -2222,6 +2284,27 @@ impl TakoApp {
         self.remove_pane(self.focused_pane(), cx);
     }
 
+    /// フォーカス中ペインのフォントサイズを delta 分だけ変更する
+    fn zoom_focused_pane(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let pane_id = self.focused_pane();
+        let current = self.pane_font_size(pane_id);
+        let new_size = (current + delta).clamp(Self::FONT_SIZE_MIN, Self::FONT_SIZE_MAX);
+        if (new_size - current).abs() < 0.01 {
+            return;
+        }
+        self.pane_font_sizes.insert(pane_id, new_size);
+        self.pane_cell_sizes.remove(&pane_id);
+        cx.notify();
+    }
+
+    /// フォーカス中ペインのフォントサイズをテーマ既定に戻す
+    fn reset_zoom_focused_pane(&mut self, cx: &mut Context<Self>) {
+        let pane_id = self.focused_pane();
+        self.pane_font_sizes.remove(&pane_id);
+        self.pane_cell_sizes.remove(&pane_id);
+        cx.notify();
+    }
+
     /// ペインの × ボタン（FR-1.3 の補助 UI）。CLI / MCP と同じコマンド層（dispatch）を
     /// 通す（開発不変条件の UI 側の一貫性）。「最後のタブの最後の 1 ペイン」は dispatch が
     /// 拒否するため、誤クリックでアプリが終了することはない（終了は cmd+W / cmd+Q のみ）
@@ -2369,8 +2452,13 @@ impl TakoApp {
                 self.video_players.remove(&pane_id);
                 self.video_frame_cache.remove(&pane_id);
                 self.video_seek_bar_bounds.remove(&pane_id);
+                self.preview_selections.remove(&pane_id);
+                self.preview_line_bounds.remove(&pane_id);
+                self.preview_line_texts.remove(&pane_id);
                 self.scroll_accum.remove(&pane_id);
                 self.scroll_ctls.remove(&pane_id);
+                self.pane_font_sizes.remove(&pane_id);
+                self.pane_cell_sizes.remove(&pane_id);
                 self.drop_tmux_view_session(pane_id);
                 self.drop_backend_session(pane_id);
             }
@@ -2395,6 +2483,9 @@ impl TakoApp {
                     self.video_players.remove(&id);
                     self.video_frame_cache.remove(&id);
                     self.video_seek_bar_bounds.remove(&id);
+                    self.preview_selections.remove(&id);
+                    self.preview_line_bounds.remove(&id);
+                    self.preview_line_texts.remove(&id);
                     self.scroll_accum.remove(&id);
                     self.scroll_ctls.remove(&id);
                     self.drop_tmux_view_session(id);
@@ -2506,9 +2597,75 @@ impl TakoApp {
     }
 
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        // プレビューペインの選択テキストを優先
+        if let Some(text) = self.preview_selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            return;
+        }
         if let Some(text) = self.focused_session().and_then(|s| s.selection_text()) {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
+    }
+
+    /// プレビューペインの選択テキストを抽出する
+    fn preview_selected_text(&self) -> Option<String> {
+        let pane_id = self.focused_pane();
+        let sel = self.preview_selections.get(&pane_id)?;
+        let texts = self.preview_line_texts.get(&pane_id)?;
+        if texts.is_empty() {
+            return None;
+        }
+        let ((sl, sc), (el, ec)) = sel.ordered();
+        if sl == el {
+            let line = texts.get(sl)?;
+            let sc = sc.min(line.len());
+            let ec = ec.min(line.len());
+            if sc >= ec {
+                return None;
+            }
+            return Some(line[sc..ec].to_string());
+        }
+        let mut result = String::new();
+        for i in sl..=el.min(texts.len() - 1) {
+            let line = &texts[i];
+            if i == sl {
+                let sc = sc.min(line.len());
+                result.push_str(&line[sc..]);
+            } else if i == el {
+                let ec = ec.min(line.len());
+                result.push_str(&line[..ec]);
+            } else {
+                result.push_str(line);
+            }
+            if i < el.min(texts.len() - 1) {
+                result.push('\n');
+            }
+        }
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
+        }
+    }
+
+    fn preview_hit_test(&self, pane_id: PaneId, position: Point<Pixels>) -> Option<(usize, usize)> {
+        let bounds_list = self.preview_line_bounds.get(&pane_id)?;
+        let texts = self.preview_line_texts.get(&pane_id)?;
+        let cell_w = self.cell_size.map(|c| c.width).unwrap_or(px(8.0));
+        for (i, b) in bounds_list.iter().enumerate() {
+            if position.y >= b.top() && position.y < b.bottom() {
+                let x_offset = (position.x - b.left()).max(px(0.0));
+                let char_col = (x_offset / cell_w).floor() as usize;
+                let line_text = texts.get(i).map(|t| t.as_str()).unwrap_or("");
+                let byte_offset = line_text
+                    .char_indices()
+                    .nth(char_col)
+                    .map(|(pos, _)| pos)
+                    .unwrap_or(line_text.len());
+                return Some((i, byte_offset));
+            }
+        }
+        texts.last().map(|last| (texts.len() - 1, last.len()))
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
@@ -2587,7 +2744,7 @@ impl TakoApp {
     /// （2026-06-12 実機リグレッション (5) の根本原因）
     fn pane_cursor_origin(&self, pane: PaneId, _window: &mut Window) -> Option<Point<Pixels>> {
         let (_, area) = self.pane_text_areas.iter().find(|(id, _)| *id == pane)?;
-        let cell = self.cell_size?;
+        let cell = self.cell_size_for_pane(pane)?;
         let screen = self.terminals.get(&pane)?.screen(&self.theme);
         let (col, row) = screen.cursor?;
         // ターミナルはセルグリッドなので x = col * cell_width が正。
@@ -2601,10 +2758,11 @@ impl TakoApp {
     }
 
     /// 未確定文字列の先頭から指定プレフィックスまでの描画幅（候補ウィンドウの位置出し用）
-    fn ime_prefix_width(&self, prefix: &str, window: &mut Window) -> Pixels {
+    fn ime_prefix_width(&self, prefix: &str, pane: PaneId, window: &mut Window) -> Pixels {
         if prefix.is_empty() {
             return px(0.0);
         }
+        let fs = self.pane_font_size(pane);
         let run = TextRun {
             len: prefix.len(),
             font: gpui::font(self.theme.font_family.clone()),
@@ -2615,12 +2773,7 @@ impl TakoApp {
         };
         window
             .text_system()
-            .shape_line(
-                SharedString::from(prefix.to_string()),
-                px(self.theme.font_size),
-                &[run],
-                None,
-            )
+            .shape_line(SharedString::from(prefix.to_string()), px(fs), &[run], None)
             .width
     }
 
@@ -2638,7 +2791,7 @@ impl TakoApp {
         _window: &mut Window,
     ) -> Option<(usize, usize, bool)> {
         let (_, area) = self.pane_text_areas.iter().find(|(id, _)| *id == pane_id)?;
-        let cell = self.cell_size?;
+        let cell = self.cell_size_for_pane(pane_id)?;
         let session = self.terminals.get(&pane_id)?;
         let (cols, rows) = session.size();
         let local = position - area.origin;
@@ -4772,42 +4925,21 @@ impl TakoApp {
                                 .gap(px(4.0))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(hsla(theme.tab_active_foreground))
-                                // chevron
+                                // chevron (SVG)
                                 .child(
-                                    div()
-                                        .w(px(12.0))
+                                    svg()
+                                        .path(file_icons::chevron_icon(row.expanded).svg_path())
+                                        .size(px(14.0))
                                         .flex_none()
-                                        .text_size(px(12.0))
-                                        .text_color(hsla(theme.tab_inactive_foreground))
-                                        .child(if row.expanded { "▾" } else { "▸" }),
+                                        .text_color(hsla(theme.tab_inactive_foreground)),
                                 )
-                                // folder icon
+                                // folder icon (SVG)
                                 .child(
-                                    div()
-                                        .w(px(14.0))
-                                        .h(px(11.0))
+                                    svg()
+                                        .path(file_icons::folder_icon(row.expanded).svg_path())
+                                        .size(px(16.0))
                                         .flex_none()
-                                        .relative()
-                                        .child(
-                                            div()
-                                                .absolute()
-                                                .top(px(0.0))
-                                                .left(px(0.0))
-                                                .w(px(6.0))
-                                                .h(px(4.0))
-                                                .rounded_t(px(1.5))
-                                                .bg(hsla(theme.accent)),
-                                        )
-                                        .child(
-                                            div()
-                                                .absolute()
-                                                .top(px(3.0))
-                                                .left(px(0.0))
-                                                .w(px(14.0))
-                                                .h(px(8.0))
-                                                .rounded(px(1.5))
-                                                .bg(hsla(theme.accent)),
-                                        ),
+                                        .text_color(hsla(theme.accent)),
                                 )
                                 .child(
                                     div()
@@ -4850,93 +4982,42 @@ impl TakoApp {
                                     } else {
                                         theme.tab_inactive_foreground
                                     };
-                                    // chevron (12px, #6c7086)
+                                    // chevron (SVG)
                                     row_el = row_el.child(
-                                        div()
-                                            .w(px(12.0))
+                                        svg()
+                                            .path(file_icons::chevron_icon(row.expanded).svg_path())
+                                            .size(px(14.0))
                                             .flex_none()
-                                            .text_size(px(12.0))
-                                            .text_color(hsla(theme.tab_inactive_foreground))
-                                            .child(if row.expanded { "▾" } else { "▸" }),
+                                            .text_color(hsla(theme.tab_inactive_foreground)),
                                     );
-                                    // folder icon (div 製。タブ + 本体の 2 層)
+                                    // folder icon (SVG)
                                     row_el = row_el.child(
-                                        div()
-                                            .w(px(14.0))
-                                            .h(px(11.0))
+                                        svg()
+                                            .path(file_icons::folder_icon(row.expanded).svg_path())
+                                            .size(px(16.0))
                                             .flex_none()
-                                            .relative()
-                                            .child(
-                                                div()
-                                                    .absolute()
-                                                    .top(px(0.0))
-                                                    .left(px(0.0))
-                                                    .w(px(6.0))
-                                                    .h(px(4.0))
-                                                    .rounded_t(px(1.5))
-                                                    .bg(hsla(folder_color)),
-                                            )
-                                            .child(
-                                                div()
-                                                    .absolute()
-                                                    .top(px(3.0))
-                                                    .left(px(0.0))
-                                                    .w(px(14.0))
-                                                    .h(px(8.0))
-                                                    .rounded(px(1.5))
-                                                    .bg(hsla(folder_color)),
-                                            ),
+                                            .text_color(hsla(folder_color)),
                                     );
                                 } else {
-                                    // file: chevron 分のスペーサー
-                                    row_el = row_el.child(div().w(px(12.0)).flex_none());
-                                    // file icon (div 製。角丸矩形 + 右上折り返し)
-                                    let file_color = {
-                                        let p = std::path::Path::new(&row.entry.name);
-                                        let ext =
-                                            p.extension().and_then(|e| e.to_str()).unwrap_or("");
-                                        match ext {
-                                            "toml" | "yaml" | "yml" | "json" | "ini" | "cfg"
-                                            | "conf" | "env" | "lock" => theme.peach,
-                                            "md" | "txt" | "rst" | "tex" | "adoc" | "pdf" => {
-                                                theme.accent
-                                            }
-                                            "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go"
-                                            | "c" | "cpp" | "h" | "hpp" | "java" | "rb" | "sh"
-                                            | "zsh" | "bash" | "fish" | "swift" | "kt" | "cs" => {
-                                                theme.green
-                                            }
-                                            "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp"
-                                            | "ico" | "bmp" => theme.mauve,
-                                            _ => theme.tab_inactive_foreground,
-                                        }
+                                    // file: chevron 分のスペーサー + SVG file icon
+                                    row_el = row_el.child(div().w(px(14.0)).flex_none());
+                                    let icon_kind = file_icons::resolve_file_icon(
+                                        std::path::Path::new(&row.entry.name),
+                                    );
+                                    let icon_color = match icon_kind.color_category() {
+                                        file_icons::IconColor::Green => theme.green,
+                                        file_icons::IconColor::Accent => theme.accent,
+                                        file_icons::IconColor::Peach => theme.peach,
+                                        file_icons::IconColor::Mauve => theme.mauve,
+                                        file_icons::IconColor::Yellow => theme.yellow,
+                                        file_icons::IconColor::Dim => theme.tab_inactive_foreground,
                                     };
                                     row_el = row_el.child(
-                                        div()
-                                            .w(px(12.0))
-                                            .h(px(14.0))
+                                        svg()
+                                            .path(icon_kind.svg_path())
+                                            .size(px(16.0))
                                             .flex_none()
-                                            .relative()
-                                            .child(
-                                                div()
-                                                    .absolute()
-                                                    .top(px(0.0))
-                                                    .left(px(0.0))
-                                                    .w(px(12.0))
-                                                    .h(px(14.0))
-                                                    .rounded(px(1.5))
-                                                    .border_1()
-                                                    .border_color(hsla(file_color)),
-                                            )
-                                            .child(
-                                                div()
-                                                    .absolute()
-                                                    .top(px(0.0))
-                                                    .right(px(0.0))
-                                                    .w(px(4.0))
-                                                    .h(px(4.0))
-                                                    .bg(hsla(file_color)),
-                                            ),
+                                            .text_color(hsla(icon_color)),
                                     );
                                 }
                                 // ファイル/フォルダ名
@@ -5875,7 +5956,7 @@ impl TakoApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(cell) = self.cell_size else {
+        let Some(cell) = self.cell_size_for_pane(pane_id) else {
             return;
         };
         let delta_lines = match event.delta {
@@ -6260,6 +6341,66 @@ impl TakoApp {
         let cell = size(width, px(self.theme.line_height));
         self.cell_size = Some(cell);
         cell
+    }
+
+    const FONT_SIZE_MIN: f32 = 8.0;
+    const FONT_SIZE_MAX: f32 = 32.0;
+    const FONT_SIZE_STEP: f32 = 1.0;
+
+    /// ペイン単位のフォントサイズ（オーバーライド未設定ならテーマ既定）
+    fn pane_font_size(&self, pane_id: PaneId) -> f32 {
+        self.pane_font_sizes
+            .get(&pane_id)
+            .copied()
+            .unwrap_or(self.theme.font_size)
+    }
+
+    /// ペイン単位のline_height（font_size と同じ比率でスケール）
+    fn pane_line_height(&self, pane_id: PaneId) -> f32 {
+        let fs = self.pane_font_size(pane_id);
+        self.theme.line_height * fs / self.theme.font_size
+    }
+
+    /// ペイン単位のセル寸法を計算（キャッシュあり）
+    fn measure_pane_cell(&mut self, pane_id: PaneId, window: &mut Window) -> Size<Pixels> {
+        if let Some(cell) = self.pane_cell_sizes.get(&pane_id) {
+            return *cell;
+        }
+        let fs = self.pane_font_size(pane_id);
+        let lh = self.pane_line_height(pane_id);
+        let font = Font {
+            family: SharedString::from(self.theme.font_family.clone()),
+            ..gpui::font(self.theme.font_family.clone())
+        };
+        let font_id = window.text_system().resolve_font(&font);
+        let width = window
+            .text_system()
+            .advance(font_id, px(fs), 'M')
+            .map(|advance| advance.width)
+            .unwrap_or(px(fs * 0.6));
+        let cell = size(width, px(lh));
+        self.pane_cell_sizes.insert(pane_id, cell);
+        cell
+    }
+
+    /// ペイン単位の TextStyle を生成する
+    fn pane_text_style(&self, pane_id: PaneId) -> TextStyle {
+        let fs = self.pane_font_size(pane_id);
+        let lh = self.pane_line_height(pane_id);
+        TextStyle {
+            color: hsla(self.theme.foreground),
+            font_family: SharedString::from(self.theme.font_family.clone()),
+            font_size: px(fs).into(),
+            line_height: px(lh).into(),
+            ..TextStyle::default()
+        }
+    }
+
+    fn cell_size_for_pane(&self, pane_id: PaneId) -> Option<Size<Pixels>> {
+        self.pane_cell_sizes
+            .get(&pane_id)
+            .copied()
+            .or(self.cell_size)
     }
 
     fn text_style(&self) -> TextStyle {
@@ -7636,8 +7777,22 @@ impl TakoApp {
     /// グリッドセル幅のずれを吸収する（Markdown テーブル等の罫線崩れ防止）
     fn terminal_screen_lines(&self, pane_id: PaneId, show_cursor: bool) -> Vec<gpui::Div> {
         let theme = &self.theme;
-        let default_style = self.text_style();
-        let cell_width = self.cell_size.map(|c| c.width);
+        let has_custom_font = self.pane_font_sizes.contains_key(&pane_id);
+        let default_style = if has_custom_font {
+            self.pane_text_style(pane_id)
+        } else {
+            self.text_style()
+        };
+        let line_h = if has_custom_font {
+            self.pane_line_height(pane_id)
+        } else {
+            theme.line_height
+        };
+        let cell_width = self
+            .pane_cell_sizes
+            .get(&pane_id)
+            .map(|c| c.width)
+            .or_else(|| self.cell_size.map(|c| c.width));
         let Some(screen) = self
             .terminals
             .get(&pane_id)
@@ -7657,7 +7812,7 @@ impl TakoApp {
                         .iter()
                         .map(|run| (run.range.clone(), self.run_highlight(run)))
                         .collect();
-                    return div().h(px(theme.line_height)).child(
+                    return div().h(px(line_h)).child(
                         StyledText::new(line.text)
                             .with_default_highlights(&default_style, highlights),
                     );
@@ -7667,11 +7822,7 @@ impl TakoApp {
                 // 文字消失を引き起こすため廃止（全角・半角とも個別 div）
                 let cw = cell_width.unwrap();
                 let chars: Vec<(usize, char)> = line.text.char_indices().collect();
-                let row = div()
-                    .h(px(theme.line_height))
-                    .flex()
-                    .flex_row()
-                    .overflow_hidden();
+                let row = div().h(px(line_h)).flex().flex_row().overflow_hidden();
                 let mut children: Vec<gpui::AnyElement> = Vec::with_capacity(chars.len());
                 for (ci, &(byte_off, ch)) in chars.iter().enumerate() {
                     let run = line
@@ -7736,7 +7887,12 @@ impl TakoApp {
                 .into_any_element();
         }
         let theme = self.theme.clone();
-        let cell = self.cell_size.expect("render 冒頭で実測済み");
+        let cell = self
+            .pane_cell_sizes
+            .get(&pane_id)
+            .copied()
+            .or(self.cell_size)
+            .expect("render 冒頭で実測済み");
 
         // PTY リサイズ追従: テキスト領域に収まる cols/rows へ
         let cols = (f32::from(area.size.width) / f32::from(cell.width)).floor() as usize;
@@ -8153,6 +8309,12 @@ impl TakoApp {
             None
         };
 
+        // 選択状態
+        let selection = self.preview_selections.get(&pane_id).cloned();
+
+        // テキスト行を収集（選択テキスト抽出 + bounds 追跡用）
+        let mut line_texts: Vec<String> = Vec::new();
+
         // 本文要素を先に組む（state の借用をここで終える）
         let body: Vec<gpui::AnyElement> = match &state.content {
             preview::PreviewContent::Code(lines) => {
@@ -8161,14 +8323,34 @@ impl TakoApp {
                     .iter()
                     .enumerate()
                     .map(|(i, line)| {
-                        self.preview_code_line(line, Some((i + 1, number_width)))
-                            .into_any_element()
+                        let text: String = line.iter().map(|s| s.text.as_str()).collect();
+                        let sel_range = selection
+                            .as_ref()
+                            .and_then(|s| s.range_for_line(i, text.len()));
+                        line_texts.push(text);
+                        self.preview_code_line_sel(
+                            line,
+                            Some((i + 1, number_width)),
+                            sel_range,
+                            pane_id,
+                            i,
+                            cx,
+                        )
+                        .into_any_element()
                     })
                     .collect()
             }
             preview::PreviewContent::Markdown(blocks) => blocks
                 .iter()
-                .map(|block| self.preview_md_block(block))
+                .enumerate()
+                .map(|(i, block)| {
+                    let text = md_block_plain_text(block);
+                    let sel_range = selection
+                        .as_ref()
+                        .and_then(|s| s.range_for_line(i, text.len()));
+                    line_texts.push(text);
+                    self.preview_md_block_sel(block, sel_range, pane_id, i, cx)
+                })
                 .collect(),
             preview::PreviewContent::Image(data) => {
                 let gpui_format = match data.format {
@@ -8618,7 +8800,12 @@ impl TakoApp {
                             .child(SharedString::from(truncate(&path_label, 40))),
                     ),
             )
-            .child(
+            .child({
+                // テキスト行を保存（選択テキスト抽出用）
+                self.preview_line_texts.insert(pane_id, line_texts);
+                // bounds 追跡用にリセット（各行の canvas で上書きされる）
+                self.preview_line_bounds.insert(pane_id, Vec::new());
+
                 div()
                     .id(("preview-scroll", pane_id.as_u64()))
                     .flex_1()
@@ -8626,6 +8813,43 @@ impl TakoApp {
                     .flex()
                     .flex_col()
                     .overflow_y_scroll()
+                    .cursor(CursorStyle::IBeam)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                            if let Some(pos) = this.preview_hit_test(pane_id, ev.position) {
+                                this.preview_selections.insert(
+                                    pane_id,
+                                    PreviewSelection {
+                                        anchor: pos,
+                                        head: pos,
+                                    },
+                                );
+                                this.preview_selecting = Some(pane_id);
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseUpEvent, _, _cx| {
+                            if this.preview_selecting == Some(pane_id) {
+                                this.preview_selecting = None;
+                            }
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
+                        if this.preview_selecting == Some(pane_id)
+                            && ev.pressed_button == Some(MouseButton::Left)
+                        {
+                            if let Some(pos) = this.preview_hit_test(pane_id, ev.position) {
+                                if let Some(sel) = this.preview_selections.get_mut(&pane_id) {
+                                    sel.head = pos;
+                                    cx.notify();
+                                }
+                            }
+                        }
+                    }))
                     .children(body)
                     .children(truncated.then(|| {
                         div()
@@ -8633,8 +8857,8 @@ impl TakoApp {
                             .text_size(px(11.0))
                             .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
                             .child("…（大きいファイルのため末尾を省略して表示）")
-                    })),
-            )
+                    }))
+            })
     }
 
     /// ハイライト済みコード 1 行（行番号は固定幅左列、本文は残り幅で折り返す）
@@ -8729,7 +8953,8 @@ impl TakoApp {
         (text, highlights)
     }
 
-    /// Markdown ブロック 1 つの描画（FR-3.3）
+    /// Markdown ブロック 1 つの描画（FR-3.3。選択なし版は preview_md_block_sel に統合済み）
+    #[allow(dead_code)]
     fn preview_md_block(&self, block: &preview::MdBlock) -> gpui::AnyElement {
         let theme = self.theme.clone();
         match block {
@@ -8821,6 +9046,267 @@ impl TakoApp {
                 .bg(hsla_alpha(theme.pane_border, 0.9))
                 .into_any_element(),
         }
+    }
+
+    /// 選択ハイライト付きコード行 + bounds 追跡 canvas
+    fn preview_code_line_sel(
+        &self,
+        line: &preview::Line,
+        number: Option<(usize, usize)>,
+        sel_range: Option<(usize, usize)>,
+        pane_id: PaneId,
+        line_idx: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let theme = &self.theme;
+        let mut text = String::new();
+        let mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
+        for span in line {
+            let start = text.len();
+            text.push_str(&span.text);
+            let style = HighlightStyle {
+                color: span.color.map(hsla),
+                font_weight: span.bold.then_some(FontWeight::BOLD),
+                font_style: span.italic.then_some(FontStyle::Italic),
+                ..HighlightStyle::default()
+            };
+            if span.color.is_some() || span.bold || span.italic {
+                highlights.push((start..text.len(), style));
+            }
+        }
+        if text.is_empty() {
+            text.push(' ');
+        }
+        // 選択ハイライト
+        if let Some((start, end)) = sel_range {
+            let s = start.min(text.len());
+            let e = end.min(text.len());
+            if s < e {
+                highlights.push((
+                    s..e,
+                    HighlightStyle {
+                        background_color: Some(hsla_alpha(theme.accent, 0.35)),
+                        ..HighlightStyle::default()
+                    },
+                ));
+            }
+        }
+        let code_el = StyledText::new(text).with_default_highlights(&self.text_style(), highlights);
+        let entity = cx.entity().downgrade();
+        let bounds_canvas = canvas(
+            |_, _, _| (),
+            move |bounds, _, _, cx| {
+                if let Some(e) = entity.upgrade() {
+                    e.update(cx, |app, _| {
+                        let list = app.preview_line_bounds.entry(pane_id).or_default();
+                        if list.len() <= line_idx {
+                            list.resize(line_idx + 1, Bounds::default());
+                        }
+                        list[line_idx] = bounds;
+                    });
+                }
+            },
+        )
+        .absolute()
+        .size_full();
+
+        if let Some((n, width)) = number {
+            let num_label = format!("{n:>width$}  ");
+            let num_len = num_label.len();
+            div()
+                .relative()
+                .flex()
+                .flex_row()
+                .child(
+                    div()
+                        .flex_none()
+                        .child(StyledText::new(num_label).with_default_highlights(
+                            &self.text_style(),
+                            vec![(
+                                0..num_len,
+                                HighlightStyle {
+                                    color: Some(hsla_alpha(theme.tab_inactive_foreground, 0.5)),
+                                    ..HighlightStyle::default()
+                                },
+                            )],
+                        )),
+                )
+                .child(div().flex_1().min_w(px(0.0)).child(code_el))
+                .child(bounds_canvas)
+        } else {
+            div().relative().child(code_el).child(bounds_canvas)
+        }
+    }
+
+    /// 選択ハイライト付き Markdown ブロック + bounds 追跡 canvas
+    fn preview_md_block_sel(
+        &self,
+        block: &preview::MdBlock,
+        sel_range: Option<(usize, usize)>,
+        pane_id: PaneId,
+        line_idx: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = self.theme.clone();
+        let entity = cx.entity().downgrade();
+        let bounds_canvas = canvas(
+            |_, _, _| (),
+            move |bounds, _, _, cx| {
+                if let Some(e) = entity.upgrade() {
+                    e.update(cx, |app, _| {
+                        let list = app.preview_line_bounds.entry(pane_id).or_default();
+                        if list.len() <= line_idx {
+                            list.resize(line_idx + 1, Bounds::default());
+                        }
+                        list[line_idx] = bounds;
+                    });
+                }
+            },
+        )
+        .absolute()
+        .size_full();
+
+        let add_sel = |highlights: &mut Vec<(std::ops::Range<usize>, HighlightStyle)>,
+                       text_len: usize| {
+            if let Some((start, end)) = sel_range {
+                let s = start.min(text_len);
+                let e = end.min(text_len);
+                if s < e {
+                    highlights.push((
+                        s..e,
+                        HighlightStyle {
+                            background_color: Some(hsla_alpha(theme.accent, 0.35)),
+                            ..HighlightStyle::default()
+                        },
+                    ));
+                }
+            }
+        };
+
+        match block {
+            preview::MdBlock::Heading { level, spans } => {
+                let (text, mut highlights) = self.preview_md_text(spans);
+                add_sel(&mut highlights, text.len());
+                let size = match level {
+                    1 => 19.0,
+                    2 => 16.0,
+                    3 => 14.0,
+                    _ => 13.0,
+                };
+                div()
+                    .relative()
+                    .pt_2()
+                    .pb_1()
+                    .text_size(px(size))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(hsla(theme.foreground))
+                    .when(*level <= 2, |d| {
+                        d.border_b_1()
+                            .border_color(hsla_alpha(theme.pane_border, 0.8))
+                    })
+                    .child(
+                        StyledText::new(text)
+                            .with_default_highlights(&self.text_style(), highlights),
+                    )
+                    .child(bounds_canvas)
+                    .into_any_element()
+            }
+            preview::MdBlock::Paragraph { spans } => {
+                let (text, mut highlights) = self.preview_md_text(spans);
+                add_sel(&mut highlights, text.len());
+                div()
+                    .relative()
+                    .py_1()
+                    .child(
+                        StyledText::new(text)
+                            .with_default_highlights(&self.text_style(), highlights),
+                    )
+                    .child(bounds_canvas)
+                    .into_any_element()
+            }
+            preview::MdBlock::ListItem {
+                depth,
+                marker,
+                spans,
+            } => {
+                let (text, mut highlights) = self.preview_md_text(spans);
+                add_sel(&mut highlights, text.len());
+                div()
+                    .relative()
+                    .flex()
+                    .flex_row()
+                    .pl(px(8.0 + 16.0 * *depth as f32))
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(hsla_alpha(theme.foreground, 0.7))
+                            .child(SharedString::from(marker.clone())),
+                    )
+                    .child(
+                        div().flex_1().min_w(px(0.0)).child(
+                            StyledText::new(text)
+                                .with_default_highlights(&self.text_style(), highlights),
+                        ),
+                    )
+                    .child(bounds_canvas)
+                    .into_any_element()
+            }
+            preview::MdBlock::CodeBlock { lines } => div()
+                .relative()
+                .my_1()
+                .p_2()
+                .rounded_md()
+                .bg(rgba_alpha(theme.tab_bar_background, 0.9))
+                .flex()
+                .flex_col()
+                .children(lines.iter().map(|line| self.preview_code_line(line, None)))
+                .child(bounds_canvas)
+                .into_any_element(),
+            preview::MdBlock::Quote { spans } => {
+                let (text, mut highlights) = self.preview_md_text(spans);
+                add_sel(&mut highlights, text.len());
+                div()
+                    .relative()
+                    .my_1()
+                    .pl_2()
+                    .border_l_2()
+                    .border_color(hsla_alpha(theme.accent, 0.6))
+                    .text_color(hsla_alpha(theme.foreground, 0.75))
+                    .child(
+                        StyledText::new(text)
+                            .with_default_highlights(&self.text_style(), highlights),
+                    )
+                    .child(bounds_canvas)
+                    .into_any_element()
+            }
+            preview::MdBlock::Rule => div()
+                .relative()
+                .my_2()
+                .h(px(1.0))
+                .bg(hsla_alpha(theme.pane_border, 0.9))
+                .child(bounds_canvas)
+                .into_any_element(),
+        }
+    }
+}
+
+/// Markdown ブロックのプレーンテキストを抽出する
+fn md_block_plain_text(block: &preview::MdBlock) -> String {
+    match block {
+        preview::MdBlock::Heading { spans, .. }
+        | preview::MdBlock::Paragraph { spans }
+        | preview::MdBlock::Quote { spans } => spans.iter().map(|s| s.text.as_str()).collect(),
+        preview::MdBlock::ListItem { spans, .. } => spans.iter().map(|s| s.text.as_str()).collect(),
+        preview::MdBlock::CodeBlock { lines } => lines
+            .iter()
+            .map(|line| line.iter().map(|s| s.text.as_str()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            ),
+        preview::MdBlock::Rule => String::new(),
     }
 }
 
@@ -9281,8 +9767,9 @@ impl EntityInputHandler for TakoApp {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         // 変換候補ウィンドウの位置出し。カーソルセル + 範囲先頭までの描画幅
-        let origin = self.pane_cursor_origin(self.ime_target(), window)?;
-        let cell = self.cell_size?;
+        let ime_pane = self.ime_target();
+        let origin = self.pane_cursor_origin(ime_pane, window)?;
+        let cell = self.cell_size_for_pane(ime_pane)?;
         let x_offset = match self.ime.as_ref() {
             Some(ime) => {
                 let start = clamp_ime_range_start(
@@ -9291,7 +9778,7 @@ impl EntityInputHandler for TakoApp {
                     ime.selected_utf16.as_ref(),
                 );
                 let end = utf16_to_byte_offset(&ime.text, start);
-                self.ime_prefix_width(&ime.text[..end], window)
+                self.ime_prefix_width(&ime.text[..end], ime_pane, window)
             }
             None => px(0.0),
         };
@@ -9437,6 +9924,12 @@ fn keystroke_to_bytes(ks: &Keystroke, csi_u: CsiUMode) -> Option<Vec<u8>> {
 impl Render for TakoApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let cell = self.measure_cell(window);
+        {
+            let pane_ids: Vec<PaneId> = self.pane_font_sizes.keys().copied().collect();
+            for pid in pane_ids {
+                self.measure_pane_cell(pid, window);
+            }
+        }
         let theme = self.theme.clone();
 
         // ファイルツリーの root をフォーカスペインの cwd に追従させる（FR-3.1）
@@ -9743,6 +10236,13 @@ impl Render for TakoApp {
             .on_action(cx.listener(|this, _: &ActivateTab7, _, cx| this.activate_tab_index(6, cx)))
             .on_action(cx.listener(|this, _: &ActivateTab8, _, cx| this.activate_tab_index(7, cx)))
             .on_action(cx.listener(|this, _: &ActivateTab9, _, cx| this.activate_tab_index(8, cx)))
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| {
+                this.zoom_focused_pane(Self::FONT_SIZE_STEP, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| {
+                this.zoom_focused_pane(-Self::FONT_SIZE_STEP, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ResetZoom, _, cx| this.reset_zoom_focused_pane(cx)))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 this.handle_key(&event.keystroke, cx);
             }))
@@ -9924,46 +10424,49 @@ fn main() {
             std::env::temp_dir().join(format!("tako-st-discovery-{}", std::process::id())),
         );
     }
-    application().run(|cx: &mut App| {
-        cx.bind_keys(key_bindings());
-        // 保存済みウィンドウフレームの復元（FR-5。終了前にフルスクリーンなら
-        // フルスクリーンで開く）。セルフテストは既定サイズで決定的に動かす
-        let saved_frame = if std::env::var_os("TAKO_SELF_TEST").is_none() {
-            tako_control::layout::load().and_then(|l| l.window)
-        } else {
-            None
-        };
-        let window_bounds = match saved_frame {
-            // 壊れた保存値（極端に小さい等）は既定へフォールバック
-            Some(f) if f.width >= 200.0 && f.height >= 150.0 => {
-                let bounds = Bounds::new(point(px(f.x), px(f.y)), size(px(f.width), px(f.height)));
-                match f.state.as_str() {
-                    "fullscreen" => WindowBounds::Fullscreen(bounds),
-                    "maximized" => WindowBounds::Maximized(bounds),
-                    _ => WindowBounds::Windowed(bounds),
+    application()
+        .with_assets(file_icons::TakoAssets)
+        .run(|cx: &mut App| {
+            cx.bind_keys(key_bindings());
+            // 保存済みウィンドウフレームの復元（FR-5。終了前にフルスクリーンなら
+            // フルスクリーンで開く）。セルフテストは既定サイズで決定的に動かす
+            let saved_frame = if std::env::var_os("TAKO_SELF_TEST").is_none() {
+                tako_control::layout::load().and_then(|l| l.window)
+            } else {
+                None
+            };
+            let window_bounds = match saved_frame {
+                // 壊れた保存値（極端に小さい等）は既定へフォールバック
+                Some(f) if f.width >= 200.0 && f.height >= 150.0 => {
+                    let bounds =
+                        Bounds::new(point(px(f.x), px(f.y)), size(px(f.width), px(f.height)));
+                    match f.state.as_str() {
+                        "fullscreen" => WindowBounds::Fullscreen(bounds),
+                        "maximized" => WindowBounds::Maximized(bounds),
+                        _ => WindowBounds::Windowed(bounds),
+                    }
                 }
-            }
-            _ => WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx)),
-        };
-        let window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(window_bounds),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    let view = cx.new(TakoApp::new);
-                    window.focus(&view.read(cx).focus_handle.clone(), cx);
-                    view
-                },
-            )
-            .expect("ウィンドウを開けなかった");
-        cx.activate(true);
+                _ => WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx)),
+            };
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        window_bounds: Some(window_bounds),
+                        ..Default::default()
+                    },
+                    |window, cx| {
+                        let view = cx.new(TakoApp::new);
+                        window.focus(&view.read(cx).focus_handle.clone(), cx);
+                        view
+                    },
+                )
+                .expect("ウィンドウを開けなかった");
+            cx.activate(true);
 
-        if std::env::var_os("TAKO_SELF_TEST").is_some() {
-            self_test::run(window, cx);
-        }
-    });
+            if std::env::var_os("TAKO_SELF_TEST").is_some() {
+                self_test::run(window, cx);
+            }
+        });
 }
 
 /// セルフテスト: キーディスパッチ経由で入力・分割・フォーカス・リサイズ・タブ・色・
@@ -11748,6 +12251,7 @@ mod self_test {
                             ratio: None,
                             command: None,
                             cwd: None,
+                            focus: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -12430,6 +12934,7 @@ mod self_test {
                             ratio: None,
                             command: None,
                             cwd: Some("/private/tmp".into()),
+                            focus: None,
                         },
                         PaneOrigin::Cli,
                     )
@@ -12649,6 +13154,7 @@ mod self_test {
                             ratio: None,
                             command: None,
                             cwd: None,
+                            focus: None,
                         },
                         PaneOrigin::Cli,
                     )
