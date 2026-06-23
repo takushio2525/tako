@@ -2958,7 +2958,7 @@ impl TakoApp {
                 .text_size(px(10.0))
                 .text_color(hsla(theme.accent))
                 .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
-                .child("↑")
+                .child("⬆")
                 .on_click(cx.listener(move |this, _, _, cx| {
                     // 由来タブが生きていればそこへ、無ければアクティブタブへ戻す
                     let origin = this.workspace.shelved_origin_tab(pane_id);
@@ -3028,33 +3028,66 @@ impl TakoApp {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(6.0))
+                            .gap(px(8.0))
                             .child(
-                                div().flex().flex_row().items_center().gap(px(2.0)).child(
-                                    div()
-                                        .w(px(6.0))
-                                        .h(px(6.0))
-                                        .rounded_full()
-                                        .bg(hsla(theme.accent)),
-                                ),
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(3.0))
+                                    .child(
+                                        div()
+                                            .w(px(6.0))
+                                            .h(px(6.0))
+                                            .rounded_full()
+                                            .bg(hsla(theme.accent)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(9.5))
+                                            .text_color(hsla(theme.tab_inactive_foreground))
+                                            .child("run"),
+                                    ),
                             )
                             .child(
-                                div().flex().flex_row().items_center().gap(px(2.0)).child(
-                                    div()
-                                        .w(px(6.0))
-                                        .h(px(6.0))
-                                        .rounded_full()
-                                        .bg(hsla(theme.red)),
-                                ),
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(3.0))
+                                    .child(
+                                        div()
+                                            .w(px(6.0))
+                                            .h(px(6.0))
+                                            .rounded_full()
+                                            .bg(hsla(theme.red)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(9.5))
+                                            .text_color(hsla(theme.tab_inactive_foreground))
+                                            .child("fail"),
+                                    ),
                             )
                             .child(
-                                div().flex().flex_row().items_center().gap(px(2.0)).child(
-                                    div()
-                                        .w(px(6.0))
-                                        .h(px(6.0))
-                                        .rounded_full()
-                                        .bg(hsla(theme.green)),
-                                ),
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(3.0))
+                                    .child(
+                                        div()
+                                            .w(px(6.0))
+                                            .h(px(6.0))
+                                            .rounded_full()
+                                            .bg(hsla(theme.green)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(9.5))
+                                            .text_color(hsla(theme.tab_inactive_foreground))
+                                            .child("idle"),
+                                    ),
                             ),
                     ),
             );
@@ -3162,7 +3195,14 @@ impl TakoApp {
                                 .h(px(7.0))
                                 .flex_none()
                                 .rounded_full()
-                                .bg(hsla(tab_agg_color)),
+                                .bg(hsla(tab_agg_color))
+                                .shadow(vec![BoxShadow {
+                                    color: hsla_alpha(tab_agg_color, 0.4),
+                                    offset: point(px(0.), px(0.)),
+                                    blur_radius: px(3.0),
+                                    spread_radius: px(0.),
+                                    inset: false,
+                                }]),
                         )
                         .child(
                             div()
@@ -3264,30 +3304,40 @@ impl TakoApp {
                         };
                         let pane_num =
                             layout.iter().position(|(id, _)| id == pane_id).unwrap_or(0) + 1;
-                        map = map.child(
-                            div()
-                                .absolute()
-                                .left(px(rect.x + 1.0))
-                                .top(px(rect.y + 1.0))
-                                .w(px((rect.width - 2.0).max(4.0)))
-                                .h(px((rect.height - 2.0).max(4.0)))
-                                .rounded(px(4.0))
-                                .border_1()
-                                .border_color(hsla(cell_border_color))
-                                .bg(rgba(theme.surface_1))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_size(px(11.0))
-                                .font_family("Monaco")
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(if is_focused {
-                                    hsla(theme.accent)
-                                } else {
-                                    hsla(theme.tab_inactive_foreground)
-                                })
-                                .child(SharedString::from(format!("{pane_num}"))),
-                        );
+                        let cell = div()
+                            .absolute()
+                            .left(px(rect.x + 1.0))
+                            .top(px(rect.y + 1.0))
+                            .w(px((rect.width - 2.0).max(4.0)))
+                            .h(px((rect.height - 2.0).max(4.0)))
+                            .rounded(px(4.0))
+                            .border_1()
+                            .border_color(hsla(cell_border_color))
+                            .bg(rgba(theme.surface_1))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(11.0))
+                            .font_family("Monaco")
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(if is_focused {
+                                hsla(theme.accent)
+                            } else {
+                                hsla(theme.tab_inactive_foreground)
+                            })
+                            .child(SharedString::from(format!("{pane_num}")));
+                        let cell = if is_focused || matches!(pane_state, CommandState::Failed(_)) {
+                            cell.shadow(vec![BoxShadow {
+                                color: hsla_alpha(cell_border_color, 0.4),
+                                offset: point(px(0.), px(0.)),
+                                blur_radius: px(4.0),
+                                spread_radius: px(0.),
+                                inset: false,
+                            }])
+                        } else {
+                            cell
+                        };
+                        map = map.child(cell);
                     }
                     card = card.child(map);
                 }
@@ -3399,7 +3449,7 @@ impl TakoApp {
                                 .text_color(hsla(color))
                                 .child(SharedString::from(format!("{pane_num}"))),
                         )
-                        // 状態ドット
+                        // 状態ドット（6px + pulse glow）
                         .when(show_state, |d| {
                             d.child(
                                 div()
@@ -3407,7 +3457,14 @@ impl TakoApp {
                                     .h(px(6.0))
                                     .flex_none()
                                     .rounded_full()
-                                    .bg(hsla(color)),
+                                    .bg(hsla(color))
+                                    .shadow(vec![BoxShadow {
+                                        color: hsla_alpha(color, 0.4),
+                                        offset: point(px(0.), px(0.)),
+                                        blur_radius: px(3.0),
+                                        spread_radius: px(0.),
+                                        inset: false,
+                                    }]),
                             )
                         })
                         .child(
@@ -3635,17 +3692,17 @@ impl TakoApp {
                     cx,
                 ));
             }
-            // バックグラウンド/shelved エリア（dashed border 風）
+            // バックグラウンド/shelved エリア（スペック準拠: border-top 1px dashed #2b2c3e）
             if !is_collapsed && !group.backgrounded.is_empty() {
                 let bg_count = group.backgrounded.len();
                 let mut bg_section = div()
                     .flex()
                     .flex_col()
                     .gap(px(2.0))
-                    .mt(px(4.0))
-                    .pt(px(4.0))
+                    .mt(px(6.0))
+                    .pt(px(6.0))
                     .border_t_1()
-                    .border_color(hsla(theme.border_strong))
+                    .border_color(hsla_alpha(theme.border_strong, 0.5))
                     .child(
                         div()
                             .text_size(px(9.5))
@@ -6310,7 +6367,14 @@ impl TakoApp {
                             .w(px(7.0))
                             .h(px(7.0))
                             .rounded_full()
-                            .bg(hsla(dot_color)),
+                            .bg(hsla(dot_color))
+                            .shadow(vec![BoxShadow {
+                                color: hsla_alpha(dot_color, 0.4),
+                                offset: point(px(0.), px(0.)),
+                                blur_radius: px(3.0),
+                                spread_radius: px(0.),
+                                inset: false,
+                            }]),
                     )
                     .on_drag(
                         TabDrag { tab: id },
@@ -6386,12 +6450,33 @@ impl TakoApp {
                     .cursor_pointer()
                     .text_size(px(15.0))
                     .text_color(hsla(theme.tab_inactive_foreground))
-                    .hover(|d| d.bg(rgba(theme.surface_highlight)))
+                    .hover(|d| {
+                        d.bg(rgba(theme.surface_highlight))
+                            .text_color(hsla(theme.tab_active_foreground))
+                    })
                     .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
                     .child("+"),
             )
             .child(div().flex_grow(1.0))
-        // 旧「◧ panel」トグルは下部ステータスバーへ集約済み（FR-2.16.4）
+            // 右端クローム: 設定アイコン（スペック準拠 30x30px border-radius 7px）
+            .child(
+                div()
+                    .id("tab-settings")
+                    .w(px(30.0))
+                    .h(px(30.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(7.0))
+                    .cursor_pointer()
+                    .text_size(px(14.0))
+                    .text_color(hsla(theme.tab_inactive_foreground))
+                    .hover(|d| {
+                        d.bg(rgba(theme.surface_highlight))
+                            .text_color(hsla(theme.tab_active_foreground))
+                    })
+                    .child("⚙"),
+            )
     }
 
     /// バックグラウンドからのドロップ（FR-2.15.3）
@@ -6797,7 +6882,7 @@ impl TakoApp {
                 .h_full()
                 .px_2()
                 .cursor_pointer()
-                .text_size(px(11.0))
+                .text_size(px(10.5))
                 .when(active, |d| {
                     d.text_color(hsla(theme.accent))
                         .bg(rgba_alpha(theme.accent, 0.1))
@@ -6896,23 +6981,23 @@ impl TakoApp {
                     .px_2()
                     .border_r_1()
                     .border_color(hsla(theme.border_subtle))
+                    .hover(|d| d.bg(rgba(theme.surface_hover)))
                     .child(
                         div()
-                            .text_size(px(11.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(hsla(theme.teal))
+                            .text_size(px(10.5))
+                            .text_color(hsla(theme.accent))
                             .child("⚙"),
                     )
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(px(10.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(hsla(theme.tab_active_foreground))
                             .child("master"),
                     )
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(px(10.5))
                             .text_color(hsla(theme.tab_inactive_foreground))
                             .child(SharedString::from(format!(
                                 "\u{00B7} {worker_count} workers"
@@ -6922,7 +7007,15 @@ impl TakoApp {
             .child(div().flex_grow(1.0))
             // usage 表示（Claude TUI フッターからの検出値）
             .children(usage_text.map(|text| {
-                div()
+                // トークン数とコストを分離（"12.3K tok · $0.45" 形式を想定）
+                let (tokens, cost) = if let Some(pos) = text.find('$') {
+                    let tok_part = text[..pos].trim().trim_end_matches('·').trim();
+                    let cost_part = text[pos..].trim();
+                    (tok_part.to_string(), Some(cost_part.to_string()))
+                } else {
+                    (text.clone(), None)
+                };
+                let mut row = div()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -6931,6 +7024,13 @@ impl TakoApp {
                     .px_2()
                     .border_r_1()
                     .border_color(hsla(theme.border_subtle))
+                    .hover(|d| d.bg(rgba(theme.surface_hover)))
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(hsla(theme.teal))
+                            .child("📊"),
+                    )
                     .child(
                         div()
                             .text_size(px(10.5))
@@ -6941,9 +7041,19 @@ impl TakoApp {
                         div()
                             .text_size(px(10.5))
                             .font_family("Monaco")
+                            .text_color(hsla(theme.tab_active_foreground))
+                            .child(SharedString::from(tokens)),
+                    );
+                if let Some(c) = cost {
+                    row = row.child(
+                        div()
+                            .text_size(px(10.5))
+                            .font_family("Monaco")
                             .text_color(hsla(theme.teal))
-                            .child(SharedString::from(text)),
-                    )
+                            .child(SharedString::from(c)),
+                    );
+                }
+                row
             }))
             // コンテキストメーター
             .child(
@@ -6956,6 +7066,7 @@ impl TakoApp {
                     .px_2()
                     .border_r_1()
                     .border_color(hsla(theme.border_subtle))
+                    .hover(|d| d.bg(rgba(theme.surface_hover)))
                     .child(
                         div()
                             .text_size(px(10.5))
@@ -7779,12 +7890,21 @@ impl TakoApp {
                             cx.notify();
                         }),
                     )
-                    // 状態ドット
-                    .children(
-                        state_dot.map(|color| {
-                            div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color))
-                        }),
-                    )
+                    // 状態ドット（スペック準拠: 6px + glow）
+                    .children(state_dot.map(|color| {
+                        div()
+                            .w(px(6.0))
+                            .h(px(6.0))
+                            .rounded_full()
+                            .bg(hsla(color))
+                            .shadow(vec![BoxShadow {
+                                color: hsla_alpha(color, 0.5),
+                                offset: point(px(0.), px(0.)),
+                                blur_radius: px(4.0),
+                                spread_radius: px(0.),
+                                inset: false,
+                            }])
+                    }))
                     // ペイン名
                     .child(
                         div()
@@ -7859,7 +7979,7 @@ impl TakoApp {
                                 cx.stop_propagation();
                                 this.split_pane_button(pane_id, SplitDirection::Right, cx);
                             }))
-                            .child("⊞"),
+                            .child("◫"),
                     )
                     // バックグラウンドボタン
                     .child(
