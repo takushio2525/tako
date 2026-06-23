@@ -4609,6 +4609,9 @@ impl TakoApp {
             return;
         }
         let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        let active_tab_id = self.workspace.active_tab().id();
+
+        // フォアグラウンドペイン
         for pane in self.workspace.active_tab().tree().panes() {
             let Some(cwd) = self.terminals.get(&pane.id()).and_then(|s| s.cwd()) else {
                 continue;
@@ -4618,6 +4621,21 @@ impl TakoApp {
                 roots.push(cwd);
             }
         }
+
+        // バックグラウンドペイン（同タブ由来のみ）
+        for bp in self.workspace.shelved_panes() {
+            if bp.origin_tab() != active_tab_id {
+                continue;
+            }
+            let Some(cwd) = self.terminals.get(&bp.id()).and_then(|s| s.cwd()) else {
+                continue;
+            };
+            let cwd = cwd.to_path_buf();
+            if !roots.contains(&cwd) {
+                roots.push(cwd);
+            }
+        }
+
         if roots.is_empty() {
             if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
                 roots.push(home);
