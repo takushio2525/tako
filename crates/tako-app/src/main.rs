@@ -45,7 +45,7 @@ const INITIAL_COLS: usize = 80;
 const INITIAL_ROWS: usize = 24;
 
 /// タブバーの高さ（px）
-const TAB_BAR_HEIGHT: f32 = 32.0;
+const TAB_BAR_HEIGHT: f32 = 40.0;
 /// ペイン枠線の太さ（px）
 const PANE_BORDER: f32 = 1.0;
 /// ペイン内側の余白（px）
@@ -110,7 +110,7 @@ impl Default for ScrollCtl {
 }
 
 /// 左サイドバー（ファイルツリー）の幅（px。FR-3.1）
-const SIDEBAR_WIDTH: f32 = 220.0;
+const SIDEBAR_WIDTH: f32 = 244.0;
 
 /// 右サイドバー（情報パネル）の既定幅・最小幅（px。ドラッグで可変）
 const PANEL_DEFAULT_WIDTH: f32 = 340.0;
@@ -120,7 +120,7 @@ const PANEL_MIN_WIDTH: f32 = 220.0;
 const PANE_TITLE_BAR: f32 = 22.0;
 
 /// 下部ステータスバーの高さ（px。FR-2.16.4。Zed / VSCode 風）
-const STATUS_BAR_HEIGHT: f32 = 24.0;
+const STATUS_BAR_HEIGHT: f32 = 30.0;
 
 /// バックグラウンドドロワーの既定高さ（px。FR-2.15）。横並びプレビュー（実画面サムネイル）が
 /// 読めるだけの高さを確保する
@@ -2630,7 +2630,7 @@ impl TakoApp {
             .pl_4()
             .w_full()
             .text_size(px(11.0))
-            .text_color(hsla(theme.ansi[1]))
+            .text_color(hsla(theme.red))
             .child(div().w_full().child(SharedString::from(message)))
             .child(
                 div()
@@ -2645,7 +2645,7 @@ impl TakoApp {
                             .flex_none()
                             .rounded_sm()
                             .cursor_pointer()
-                            .bg(rgba_alpha(theme.ansi[1], 0.25))
+                            .bg(rgba_alpha(theme.red, 0.25))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if confirm_pane.is_some() {
                                     this.pane_kill_confirmed(cx);
@@ -2765,10 +2765,10 @@ impl TakoApp {
                         .rounded_sm()
                         .cursor_pointer()
                         .text_size(px(11.0))
-                        .text_color(hsla_alpha(theme.ansi[1], 0.8))
+                        .text_color(hsla_alpha(theme.red, 0.8))
                         .opacity(0.0)
                         .group_hover("tmux-att-row", |d| d.opacity(1.0))
-                        .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
+                        .hover(|d| d.bg(rgba_alpha(theme.red, 0.2)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.tmux_pending_kill =
@@ -2827,10 +2827,10 @@ impl TakoApp {
                             .rounded_sm()
                             .cursor_pointer()
                             .text_size(px(10.0))
-                            .text_color(hsla_alpha(theme.ansi[1], 0.8))
+                            .text_color(hsla_alpha(theme.red, 0.8))
                             .opacity(0.0)
                             .group_hover("tmux-att-wrow", |d| d.opacity(1.0))
-                            .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
+                            .hover(|d| d.bg(rgba_alpha(theme.red, 0.2)))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.tmux_pending_kill =
                                     Some((kill_name.clone(), Some(w_index), kill_socket.clone()));
@@ -2870,9 +2870,9 @@ impl TakoApp {
         let theme = &self.theme;
         let pane_id = entry.pane;
         let state_color = match entry.state {
-            CommandState::Failed(_) => Some(theme.ansi[1]),
+            CommandState::Failed(_) => Some(theme.red),
             CommandState::Running => Some(theme.accent),
-            CommandState::Idle => Some(theme.ansi[3]),
+            CommandState::Idle => Some(theme.yellow),
             _ => None,
         };
         let mut row = div()
@@ -2966,17 +2966,18 @@ impl TakoApp {
             .flex_1()
             .flex()
             .flex_col()
-            .gap_1()
-            .p_1()
-            .bg(rgba(theme.background))
+            .gap(px(6.0))
+            .p(px(8.0))
+            .bg(rgba(theme.mantle))
             .text_color(hsla(theme.foreground))
             .text_size(px(12.0))
             .overflow_y_scroll()
             .child(
                 div()
+                    .text_size(px(10.5))
+                    .font_weight(FontWeight::BOLD)
                     .text_color(hsla(theme.tab_inactive_foreground))
-                    .text_size(px(11.0))
-                    .child("タブごとの全ペイン（クリックでジャンプ。kill は確認つき）"),
+                    .child("WORKSPACE"),
             );
 
         // タブ枠: タブ名ラベル付き四角枠 + 枠内に全ペインの入れ子表示（FR-2.16.6）
@@ -2988,42 +2989,72 @@ impl TakoApp {
             // （アクティブタブ）の行は残す（FR-2.16.14。Q2 = バックグラウンド行＋バックグラウンドだけ隠す）。
             // タブ内の行は surface が一律（アクティブ＝全 foreground / 非アクティブ＝全 background）
             let show_rows = is_active || !is_collapsed;
+            let group_pane_count = if show_rows { group.rows.len() } else { 0 };
             let mut card = div()
                 .flex()
                 .flex_col()
-                .gap_1()
-                .p_1()
-                .rounded_md()
+                .gap(px(4.0))
+                .p(px(8.0))
+                .rounded(px(9.0))
                 .border_1()
-                .border_color(if is_active {
-                    hsla_alpha(theme.accent, 0.6)
+                .border_color(hsla(theme.border_strong))
+                .bg(rgba(if is_active {
+                    theme.surface_1
                 } else {
-                    hsla(theme.pane_border)
-                })
+                    theme.surface_0
+                }))
+                .when(is_active, |d| d.border_color(hsla_alpha(theme.accent, 0.4)))
                 .child(
                     div()
                         .id(("tmux-tab-header", tab_id.as_u64()))
-                        .text_size(px(11.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(if is_active {
-                            hsla(theme.tab_active_foreground)
-                        } else {
-                            hsla(theme.tab_inactive_foreground)
-                        })
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
                         .cursor_pointer()
-                        // 逆三角トグル: 折りたたみは TabId キーで管理（並べ替え / クローズに強い）
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.set_tmux_collapsed(tab_id, None);
                             cx.notify();
                         }))
-                        .child(SharedString::from(format!(
-                            "{} タブ {}",
-                            if is_collapsed { "▸" } else { "▾" },
-                            truncate(&group.title, 28)
-                        ))),
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(hsla(theme.tab_inactive_foreground))
+                                .child(if is_collapsed { "▸" } else { "▾" }),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(if is_active {
+                                    hsla(theme.tab_active_foreground)
+                                } else {
+                                    hsla(theme.text_secondary)
+                                })
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(SharedString::from(truncate(&group.title, 28))),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(hsla(theme.tab_inactive_foreground))
+                                .child(SharedString::from(format!("{group_pane_count}"))),
+                        )
+                        .when(is_active, |d| {
+                            d.child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .font_weight(FontWeight::BOLD)
+                                    .px(px(6.0))
+                                    .py(px(2.0))
+                                    .rounded(px(4.0))
+                                    .text_color(hsla(theme.accent))
+                                    .bg(rgba_alpha(theme.accent, 0.14))
+                                    .child("ACTIVE"),
+                            )
+                        }),
                 );
             // 折りたたみ時はバックグラウンド行を描かない（空にして既存ループをそのまま流す）。
             // 前面表示中（アクティブタブ）の行は残す（FR-2.16.14）
@@ -3039,8 +3070,8 @@ impl TakoApp {
                     .any(|p| p.target == PreviewTarget::Pane(pane));
                 let show_state = !matches!(row.state, CommandState::Unknown);
                 let (color, state_label) = match row.state {
-                    CommandState::Failed(code) => (theme.ansi[1], format!("エラー ({code})")),
-                    CommandState::Idle => (theme.ansi[2], "入力待ち".to_string()),
+                    CommandState::Failed(code) => (theme.red, format!("エラー ({code})")),
+                    CommandState::Idle => (theme.green, "入力待ち".to_string()),
                     CommandState::Running => (theme.accent, "実行中".to_string()),
                     CommandState::Unknown => (theme.tab_inactive_foreground, String::new()),
                 };
@@ -3169,10 +3200,10 @@ impl TakoApp {
                                 .rounded_sm()
                                 .cursor_pointer()
                                 .text_size(px(11.0))
-                                .text_color(hsla_alpha(theme.ansi[1], 0.8))
+                                .text_color(hsla_alpha(theme.red, 0.8))
                                 .opacity(0.0)
                                 .group_hover("tmux-row", |d| d.opacity(1.0))
-                                .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
+                                .hover(|d| d.bg(rgba_alpha(theme.red, 0.2)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.pending_pane_kill = Some(pane);
@@ -3345,9 +3376,9 @@ impl TakoApp {
         }
         for (index, session) in unlisted.iter().enumerate() {
             let (badge_label, badge_color) = if session.orphan_backend {
-                ("kill漏れ?", theme.ansi[1]) // 赤: tako が起動して kill し損ねた残骸
+                ("kill漏れ?", theme.red) // 赤: tako が起動して kill し損ねた残骸
             } else {
-                ("管理外", theme.ansi[3]) // 黄: tako の外で立てられたセッション
+                ("管理外", theme.yellow) // 黄: tako の外で立てられたセッション
             };
             let kill_name = session.name.clone();
             let kill_socket = session.socket.clone();
@@ -3407,7 +3438,7 @@ impl TakoApp {
                                 .text_color(if session.attached {
                                     hsla(theme.accent)
                                 } else {
-                                    hsla(theme.ansi[3])
+                                    hsla(theme.yellow)
                                 })
                                 .child(if session.attached {
                                     "attached"
@@ -3437,10 +3468,10 @@ impl TakoApp {
                                 .rounded_sm()
                                 .cursor_pointer()
                                 .text_size(px(11.0))
-                                .text_color(hsla_alpha(theme.ansi[1], 0.8))
+                                .text_color(hsla_alpha(theme.red, 0.8))
                                 .opacity(0.0)
                                 .group_hover("tmux-unlisted", |d| d.opacity(1.0))
-                                .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
+                                .hover(|d| d.bg(rgba_alpha(theme.red, 0.2)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.tmux_pending_kill =
                                         Some((kill_name.clone(), None, kill_socket.clone()));
@@ -3497,10 +3528,10 @@ impl TakoApp {
                                 .rounded_sm()
                                 .cursor_pointer()
                                 .text_size(px(10.0))
-                                .text_color(hsla_alpha(theme.ansi[1], 0.8))
+                                .text_color(hsla_alpha(theme.red, 0.8))
                                 .opacity(0.0)
                                 .group_hover("tmux-unlisted-wrow", |d| d.opacity(1.0))
-                                .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
+                                .hover(|d| d.bg(rgba_alpha(theme.red, 0.2)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.tmux_pending_kill = Some((
                                         kill_name.clone(),
@@ -3644,7 +3675,7 @@ impl TakoApp {
             .flex()
             .flex_col()
             .overflow_y_scroll()
-            .bg(rgba(theme.background))
+            .bg(rgba(theme.mantle))
             .text_color(hsla(theme.tab_inactive_foreground))
             .text_size(px(11.0));
 
@@ -3780,10 +3811,10 @@ impl TakoApp {
             if !collapsed.changes {
                 for entry in &data.status {
                     let color = match (entry.index, entry.worktree) {
-                        ('?', _) => theme.ansi[2],            // 緑 = untracked
-                        (_, 'M') => theme.ansi[3],            // 黄 = modified
-                        ('D', _) | (_, 'D') => theme.ansi[1], // 赤 = deleted
-                        ('A', _) => theme.ansi[2],            // 緑 = added
+                        ('?', _) => theme.green,          // 緑 = untracked
+                        (_, 'M') => theme.yellow,         // 黄 = modified
+                        ('D', _) | (_, 'D') => theme.red, // 赤 = deleted
+                        ('A', _) => theme.green,          // 緑 = added
                         _ => fg,
                     };
                     let badge = match (entry.index, entry.worktree) {
@@ -4023,13 +4054,13 @@ impl TakoApp {
                             let (prefix, color, bg_color) = match line.kind {
                                 tako_core::DiffLineKind::Add => (
                                     "+",
-                                    theme.ansi[2], // 緑
-                                    rgba_alpha(theme.ansi[2], 0.1),
+                                    theme.green, // 緑
+                                    rgba_alpha(theme.green, 0.1),
                                 ),
                                 tako_core::DiffLineKind::Remove => (
                                     "-",
-                                    theme.ansi[1], // 赤
-                                    rgba_alpha(theme.ansi[1], 0.1),
+                                    theme.red, // 赤
+                                    rgba_alpha(theme.red, 0.1),
                                 ),
                                 tako_core::DiffLineKind::Context => (
                                     " ",
@@ -4151,24 +4182,34 @@ impl TakoApp {
                 .h_full()
                 .flex()
                 .flex_col()
-                .bg(rgba(theme.tab_bar_background))
+                .bg(rgba(theme.mantle))
                 .border_r_1()
-                .border_color(hsla(theme.pane_border))
+                .border_color(hsla(theme.border_subtle))
                 .text_size(px(12.0))
                 .text_color(hsla(theme.foreground))
                 .overflow_hidden()
                 .child(
-                    // ヘッダ: ワークスペース = アクティブタブ（VSCode のエクスプローラ相当）
                     div()
-                        .px_2()
-                        .py_1()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .h(px(38.0))
+                        .px(px(12.0))
                         .flex_none()
-                        .text_size(px(10.0))
-                        .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.9))
-                        .child(SharedString::from(format!(
-                            "ワークスペース — {}",
-                            truncate(&tab_title, 20)
-                        ))),
+                        .child(
+                            div()
+                                .text_size(px(14.0))
+                                .text_color(hsla(theme.accent))
+                                .child("📂"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(hsla(theme.text_secondary))
+                                .child(SharedString::from(truncate(&tab_title, 20))),
+                        ),
                 )
                 .child(
                     div()
@@ -4253,9 +4294,9 @@ impl TakoApp {
                                 .flex_row()
                                 .items_center()
                                 .w_full()
-                                .px_1()
+                                .py(px(1.0))
                                 .cursor_pointer()
-                                .hover(|d| d.bg(rgba(theme.tab_active_background)))
+                                .hover(|d| d.bg(rgba(theme.surface_hover)))
                                 .on_click(cx.listener({
                                     let ctx_path = path.clone();
                                     move |this, _: &gpui::ClickEvent, _, cx| {
@@ -4323,13 +4364,13 @@ impl TakoApp {
                                 } else {
                                     ""
                                 };
-                                base.pl(px(8.0 + 12.0 * row.depth as f32))
-                                    .when(!is_dir, |d| {
-                                        d.text_color(hsla_alpha(theme.foreground, 0.85))
-                                    })
+                                base.pl(px(12.0 + 12.0 * row.depth as f32))
+                                    .when(!is_dir, |d| d.text_color(hsla(theme.text_tertiary)))
                                     .when(is_open, |d| {
-                                        d.bg(rgba_alpha(theme.tab_active_background, 0.6))
-                                            .text_color(hsla(theme.accent))
+                                        d.bg(rgba_alpha(theme.accent, 0.13))
+                                            .text_color(hsla(theme.foreground))
+                                            .border_l_2()
+                                            .border_color(hsla(theme.accent))
                                     })
                                     .child(SharedString::from(format!(
                                         "{chevron}{file_icon}{}",
@@ -4396,7 +4437,7 @@ impl TakoApp {
                         this.context_menu = None;
                         this.handle_context_action(id, &path, is_dir, cx);
                     }))
-                    .when(id == "trash", |d| d.text_color(hsla(theme.ansi[1])))
+                    .when(id == "trash", |d| d.text_color(hsla(theme.red)))
                     .child(SharedString::from(label.to_string()))
                     .into_any_element()
             }));
@@ -5678,7 +5719,7 @@ impl TakoApp {
                         .filter_map(|p| self.terminals.get(&p.id()))
                         .map(|s| s.command_state()),
                 ) {
-                    CommandState::Failed(_) => Some(theme.ansi[1]), // 赤
+                    CommandState::Failed(_) => Some(theme.red), // 赤
                     CommandState::Running => Some(theme.accent),
                     _ => None,
                 };
@@ -5691,18 +5732,26 @@ impl TakoApp {
             .flex_row()
             .items_center()
             .h(px(TAB_BAR_HEIGHT))
-            // ルート flex 列が窮屈になっても高さを譲らない（ステータスバー消失と同根の予防）
             .flex_none()
             .w_full()
             .bg(rgba(theme.tab_bar_background))
+            .border_b_1()
+            .border_color(hsla(theme.border_subtle))
             .children(tabs.into_iter().map(|(id, label, dot)| {
                 let is_active = id == active;
+                let pane_count = self
+                    .workspace
+                    .tabs()
+                    .iter()
+                    .find(|t| t.id() == id)
+                    .map(|t| t.tree().panes().len())
+                    .unwrap_or(0);
                 div()
                     .id(("tab", id.as_u64()))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_1()
+                    .gap(px(6.0))
                     .h_full()
                     .px_3()
                     .cursor_pointer()
@@ -5711,31 +5760,53 @@ impl TakoApp {
                             .border_b_2()
                             .border_color(hsla(theme.accent))
                     })
+                    .when(!is_active, |d| d.hover(|d| d.bg(rgba(theme.surface_1))))
                     .text_color(if is_active {
                         hsla(theme.tab_active_foreground)
                     } else {
                         hsla(theme.tab_inactive_foreground)
                     })
-                    .text_size(px(12.0))
+                    .text_size(px(12.5))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let _ = this.workspace.activate_tab(id);
                         cx.notify();
                     }))
                     .children(
-                        dot.map(|color| div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color))),
+                        dot.map(|color| div().w(px(7.0)).h(px(7.0)).rounded_full().bg(hsla(color))),
                     )
                     .on_drag(
                         TabDrag { tab: id },
                         self.drag_ghost_builder(DragKind::Tab, truncate(&label, 24), cx),
                     )
-                    .child(SharedString::from(truncate(&label, 24)))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(SharedString::from(truncate(&label, 24))),
+                    )
+                    .when(pane_count > 1, |d| {
+                        d.child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(hsla(theme.tab_inactive_foreground))
+                                .child(SharedString::from(format!("{pane_count}"))),
+                        )
+                    })
                     .child(
                         div()
                             .id(("tab-bg", id.as_u64()))
-                            .px_1()
+                            .w(px(18.0))
+                            .h(px(18.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
                             .cursor_pointer()
+                            .text_size(px(13.0))
                             .text_color(hsla(theme.tab_inactive_foreground))
-                            .hover(|d| d.text_color(hsla(theme.foreground)))
+                            .hover(|d| {
+                                d.bg(rgba(theme.surface_highlight))
+                                    .text_color(hsla(theme.foreground))
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.background_tab(id, cx);
@@ -5745,8 +5816,19 @@ impl TakoApp {
                     .child(
                         div()
                             .id(("tab-close", id.as_u64()))
-                            .px_1()
+                            .w(px(18.0))
+                            .h(px(18.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
                             .cursor_pointer()
+                            .text_size(px(13.0))
+                            .text_color(hsla(theme.tab_inactive_foreground))
+                            .hover(|d| {
+                                d.bg(rgba(theme.surface_highlight))
+                                    .text_color(hsla(theme.red))
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.remove_tab(id, cx);
@@ -5757,9 +5839,16 @@ impl TakoApp {
             .child(
                 div()
                     .id("tab-new")
-                    .px_3()
+                    .w(px(34.0))
+                    .h(px(30.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(7.0))
                     .cursor_pointer()
+                    .text_size(px(15.0))
                     .text_color(hsla(theme.tab_inactive_foreground))
+                    .hover(|d| d.bg(rgba(theme.surface_highlight)))
                     .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
                     .child("+"),
             )
@@ -5807,9 +5896,9 @@ impl TakoApp {
         let pane_id = entry.pane;
         let label = entry.label.clone();
         let state_color = match entry.state {
-            CommandState::Failed(_) => Some(theme.ansi[1]),
+            CommandState::Failed(_) => Some(theme.red),
             CommandState::Running => Some(theme.accent),
-            CommandState::Idle => Some(theme.ansi[3]),
+            CommandState::Idle => Some(theme.yellow),
             _ => None,
         };
         let is_pending_kill = pending_kill == Some(pane_id);
@@ -5844,15 +5933,15 @@ impl TakoApp {
                         .flex_1()
                         .overflow_x_hidden()
                         .text_ellipsis()
-                        .text_color(hsla(theme.ansi[1]))
+                        .text_color(hsla(theme.red))
                         .child("完全に破棄?"),
                 )
                 .child(
                     div()
                         .id(("shelf-kill-yes", pane_id.as_u64()))
                         .cursor_pointer()
-                        .text_color(hsla(theme.ansi[1]))
-                        .hover(|d| d.bg(rgba_alpha(theme.ansi[1], 0.2)))
+                        .text_color(hsla(theme.red))
+                        .hover(|d| d.bg(rgba_alpha(theme.red, 0.2)))
                         .px_1()
                         .rounded_sm()
                         .child("はい")
@@ -5941,7 +6030,7 @@ impl TakoApp {
                         .cursor_pointer()
                         .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
                         .hover(|d| {
-                            d.bg(rgba_alpha(theme.ansi[1], 0.25))
+                            d.bg(rgba_alpha(theme.red, 0.25))
                                 .text_color(hsla(theme.foreground))
                         })
                         .child("×")
@@ -5983,7 +6072,7 @@ impl TakoApp {
             .overflow_hidden()
             .border_1()
             .border_color(if is_pending_kill {
-                hsla(theme.ansi[1])
+                hsla(theme.red)
             } else {
                 hsla(theme.pane_border)
             })
@@ -6113,9 +6202,9 @@ impl TakoApp {
                 .flex_none()
                 .h(px(self.drawer_height))
                 .w_full()
-                .bg(rgba(theme.tab_bar_background))
+                .bg(rgba(theme.crust))
                 .border_t_1()
-                .border_color(hsla(theme.pane_border))
+                .border_color(hsla(theme.border_subtle))
                 .on_drop::<TabDrag>(cx.listener(|this, drag: &TabDrag, _, cx| {
                     this.background_tab(drag.tab, cx);
                 }))
@@ -6158,7 +6247,7 @@ impl TakoApp {
         // 全ペイン集約の状態ドット（旧 agents 固定タブ → ◧ panel から引き継ぎ。FR-2.10）
         let agents_dot =
             match CommandState::aggregate(self.terminals.values().map(|s| s.command_state())) {
-                CommandState::Failed(_) => Some(theme.ansi[1]),
+                CommandState::Failed(_) => Some(theme.red),
                 CommandState::Running => Some(theme.accent),
                 _ => None,
             };
@@ -6173,26 +6262,25 @@ impl TakoApp {
                 .px_2()
                 .cursor_pointer()
                 .text_size(px(11.0))
-                .when(active, |d| d.bg(rgba(theme.tab_active_background)))
-                .text_color(if active {
-                    hsla(theme.tab_active_foreground)
-                } else {
-                    hsla(theme.tab_inactive_foreground)
+                .when(active, |d| {
+                    d.text_color(hsla(theme.accent))
+                        .bg(rgba_alpha(theme.accent, 0.1))
                 })
-                .hover(|d| d.bg(rgba_alpha(theme.tab_active_background, 0.7)))
+                .when(!active, |d| d.text_color(hsla(theme.text_tertiary)))
+                .hover(|d| d.bg(rgba(theme.surface_hover)))
+                .border_r_1()
+                .border_color(hsla(theme.border_subtle))
         };
         div()
             .flex()
             .flex_row()
             .items_center()
             .h(px(STATUS_BAR_HEIGHT))
-            // ルート flex 列が窮屈になっても高さを譲らない（消失バグの再発防止。
-            // 根本対策は中段の min_h(0) — 下の render 末尾コメント参照）
             .flex_none()
             .w_full()
             .bg(rgba(theme.tab_bar_background))
             .border_t_1()
-            .border_color(hsla(theme.pane_border))
+            .border_color(hsla(theme.border_subtle))
             .child(
                 toggle("statusbar-filetree", self.filetree.visible)
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -6377,20 +6465,19 @@ impl TakoApp {
                 .relative()
                 .flex()
                 .flex_col()
-                .bg(rgba(theme.background))
+                .bg(rgba(theme.mantle))
                 .border_l_1()
-                .border_color(hsla(theme.pane_border))
+                .border_color(hsla(theme.border_subtle))
                 .child(
-                    // 内部タブヘッダ（切り替え式コンテナ。右端 × でパネルを閉じる）
                     div()
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap_1()
+                        .gap(px(2.0))
                         .px_2()
-                        .h(px(26.0))
+                        .h(px(38.0))
                         .flex_none()
-                        .bg(rgba(theme.tab_bar_background))
+                        .bg(rgba(theme.mantle))
                         .child(
                             tab_button("tmux", PanelView::Tmux, view == PanelView::Tmux).on_click(
                                 cx.listener(|this, _, _, cx| {
@@ -6764,7 +6851,7 @@ impl TakoApp {
                                     .cursor_pointer()
                                     .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
                                     .hover(|d| {
-                                        d.bg(rgba_alpha(theme.ansi[1], 0.25))
+                                        d.bg(rgba_alpha(theme.red, 0.25))
                                             .text_color(hsla(theme.foreground))
                                     })
                                     .child("×")
@@ -6900,20 +6987,12 @@ impl TakoApp {
             );
         }
 
-        // タイトルバーの表示名（FR-2.1.3。iTerm2 風: 手動 / AI リネーム > role > OSC タイトル）。
-        // コマンド実行状態（FR-2.1.4）はドット色で添える: 赤 = エラー、アクセント = 実行中
-        let badge_label = self
-            .workspace
-            .active_tab()
-            .tree()
-            .get(pane_id)
-            .and_then(|p| match (p.title(), p.role()) {
-                (Some(t), Some(r)) => Some(format!("{t} · {r}")),
-                (Some(t), None) => Some(t.to_string()),
-                (None, Some(r)) => Some(r.to_string()),
-                (None, None) => None,
-            });
-        let title_label = badge_label
+        // タイトルとロールを分離取得（ロールは独立バッジとして表示）
+        let pane_info = self.workspace.active_tab().tree().get(pane_id);
+        let pane_title = pane_info.and_then(|p| p.title().map(str::to_string));
+        let pane_role = pane_info.and_then(|p| p.role().map(str::to_string));
+        let title_label = pane_title
+            .or_else(|| pane_role.clone())
             .or_else(|| {
                 self.terminals
                     .get(&pane_id)
@@ -6921,14 +7000,25 @@ impl TakoApp {
                     .map(str::to_string)
             })
             .unwrap_or_else(|| "ターミナル".to_string());
-        let state_dot = self
+        let role_badge = pane_role.as_deref().map(|r| {
+            if r.contains("orchestrator-master") || r == "master" {
+                ("ORCH", theme.accent)
+            } else if r.contains("orchestrator-worker") || r.starts_with("worker") {
+                ("WORKER", theme.teal)
+            } else {
+                (r.split(':').next().unwrap_or(r), theme.text_tertiary)
+            }
+        });
+        let (state_dot, state_label) = self
             .terminals
             .get(&pane_id)
-            .and_then(|s| match s.command_state() {
-                tako_core::CommandState::Failed(_) => Some(theme.ansi[1]),
-                tako_core::CommandState::Running => Some(theme.accent),
-                _ => None,
-            });
+            .map(|s| match s.command_state() {
+                tako_core::CommandState::Failed(_) => (Some(theme.red), Some("failed")),
+                tako_core::CommandState::Running => (Some(theme.accent), Some("running")),
+                tako_core::CommandState::Idle => (Some(theme.green), None),
+                tako_core::CommandState::Unknown => (None, None),
+            })
+            .unwrap_or((None, None));
 
         // スクロールバー（FR-2.5.13）: iTerm2 流にスクロール中だけ表示 → フェードアウト。
         // バックエンドペインは tmux 側（ネスト先含む）の位置・履歴を表示する
@@ -6958,10 +7048,11 @@ impl TakoApp {
             .h(relative(rect.height))
             .bg(rgba(theme.background))
             .border(px(PANE_BORDER))
+            .rounded(px(7.0))
             .border_color(if focused {
                 hsla(theme.accent)
             } else {
-                hsla(theme.pane_border)
+                hsla(theme.border_default)
             })
             .flex()
             .flex_col()
@@ -6978,8 +7069,6 @@ impl TakoApp {
                 }),
             )
             .child(
-                // ペイン上部のタイトルバー（iTerm2 風。FR-2.1.3 のバッジを置き換える主表示）:
-                // 左に分かりやすい × ボタン、状態ドット、ペイン名（手動 / AI リネーム）
                 div()
                     .id(("pane-titlebar", pane_id.as_u64()))
                     .h(px(PANE_TITLE_BAR))
@@ -6988,23 +7077,28 @@ impl TakoApp {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_1()
-                    .px_1()
-                    .bg(rgba_alpha(
-                        theme.tab_bar_background,
-                        if focused { 1.0 } else { 0.6 },
-                    ))
+                    .gap(px(6.0))
+                    .px(px(8.0))
+                    .bg(rgba(if focused {
+                        theme.surface_2
+                    } else {
+                        theme.surface_0
+                    }))
+                    .border_b_1()
+                    .border_color(hsla(if focused {
+                        theme.border_default
+                    } else {
+                        theme.border_subtle
+                    }))
                     .text_size(px(11.0))
                     .text_color(hsla(theme.tab_inactive_foreground))
                     .cursor(CursorStyle::OpenHand)
-                    // タイトルバーの D&D でペインを移動できる（FR-1.10。iTerm2 流）
                     .on_drag(
                         PaneDrag { pane: pane_id },
                         self.drag_ghost_builder(DragKind::Pane, truncate(&title_label, 24), cx),
                     )
                     .on_mouse_down(
                         MouseButton::Left,
-                        // タイトルバーからは選択を開始しない（フォーカスだけ移す）
                         cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
                             this.workspace
@@ -7015,45 +7109,59 @@ impl TakoApp {
                             cx.notify();
                         }),
                     )
+                    // 状態ドット
+                    .children(
+                        state_dot.map(|color| {
+                            div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color))
+                        }),
+                    )
+                    // ペイン名
                     .child(
                         div()
-                            .id(("pane-close", pane_id.as_u64()))
-                            .w(px(16.0))
-                            .h(px(16.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
-                            .hover(|d| {
-                                d.bg(rgba_alpha(theme.ansi[1], 0.25))
-                                    .text_color(hsla(theme.foreground))
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if focused {
+                                hsla(theme.foreground)
+                            } else {
+                                hsla(theme.tab_inactive_foreground)
                             })
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.close_pane_button(pane_id, cx);
-                            }))
-                            .child("×"),
+                            .child(SharedString::from(truncate(&title_label, 40))),
                     )
+                    // ロールバッジ
+                    .children(role_badge.map(|(label, color)| {
+                        div()
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .px(px(7.0))
+                            .py(px(2.0))
+                            .rounded(px(5.0))
+                            .text_color(hsla(color))
+                            .bg(rgba_alpha(color, 0.14))
+                            .child(SharedString::from(label.to_string()))
+                    }))
+                    // 状態ラベル
+                    .children(state_label.map(|label| {
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(hsla(theme.tab_inactive_foreground))
+                            .child(SharedString::from(label.to_string()))
+                    }))
+                    .child(div().flex_grow(1.0))
+                    // バックグラウンドボタン
                     .child(
-                        // ー ボタン = バックグラウンドへバックグラウンド（プロセスは生かす。タブの ー と統一）
                         div()
                             .id(("pane-bg", pane_id.as_u64()))
-                            .w(px(16.0))
-                            .h(px(16.0))
+                            .w(px(18.0))
+                            .h(px(18.0))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded_sm()
+                            .rounded(px(5.0))
                             .cursor_pointer()
-                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
+                            .text_size(px(13.0))
+                            .text_color(hsla(theme.tab_inactive_foreground))
                             .hover(|d| {
-                                d.bg(rgba_alpha(theme.accent, 0.25))
+                                d.bg(rgba(theme.surface_highlight))
                                     .text_color(hsla(theme.foreground))
                             })
                             .on_mouse_down(
@@ -7066,19 +7174,32 @@ impl TakoApp {
                             }))
                             .child("ー"),
                     )
-                    .children(
-                        state_dot.map(|color| {
-                            div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color))
-                        }),
-                    )
+                    // 閉じるボタン
                     .child(
                         div()
-                            .text_color(if focused {
-                                hsla(theme.foreground)
-                            } else {
-                                hsla(theme.tab_inactive_foreground)
+                            .id(("pane-close", pane_id.as_u64()))
+                            .w(px(18.0))
+                            .h(px(18.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .text_size(px(13.0))
+                            .text_color(hsla(theme.tab_inactive_foreground))
+                            .hover(|d| {
+                                d.bg(rgba_alpha(theme.red, 0.25))
+                                    .text_color(hsla(theme.red))
                             })
-                            .child(SharedString::from(truncate(&title_label, 48))),
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.close_pane_button(pane_id, cx);
+                            }))
+                            .child("×"),
                     ),
             )
             .child(
@@ -7498,7 +7619,7 @@ impl TakoApp {
             }
             preview::PreviewContent::Error(message) => vec![div()
                 .p_2()
-                .text_color(hsla(theme.ansi[1]))
+                .text_color(hsla(theme.red))
                 .child(SharedString::from(message.clone()))
                 .into_any_element()],
         };
@@ -7512,10 +7633,11 @@ impl TakoApp {
             .h(relative(rect.height))
             .bg(rgba(theme.background))
             .border(px(PANE_BORDER))
+            .rounded(px(7.0))
             .border_color(if focused {
                 hsla(theme.accent)
             } else {
-                hsla(theme.pane_border)
+                hsla(theme.border_default)
             })
             .flex()
             .flex_col()
@@ -7539,14 +7661,20 @@ impl TakoApp {
                     .items_center()
                     .gap_1()
                     .px_1()
-                    .bg(rgba_alpha(
-                        theme.tab_bar_background,
-                        if focused { 1.0 } else { 0.6 },
-                    ))
+                    .bg(rgba(if focused {
+                        theme.surface_2
+                    } else {
+                        theme.surface_0
+                    }))
+                    .border_b_1()
+                    .border_color(hsla(if focused {
+                        theme.border_default
+                    } else {
+                        theme.border_subtle
+                    }))
                     .text_size(px(11.0))
                     .text_color(hsla(theme.tab_inactive_foreground))
                     .cursor(CursorStyle::OpenHand)
-                    // プレビューペインもタイトルバー D&D で移動できる（FR-1.10）
                     .on_drag(
                         PaneDrag { pane: pane_id },
                         self.drag_ghost_builder(
@@ -7567,7 +7695,7 @@ impl TakoApp {
                             .cursor_pointer()
                             .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
                             .hover(|d| {
-                                d.bg(rgba_alpha(theme.ansi[1], 0.25))
+                                d.bg(rgba_alpha(theme.red, 0.25))
                                     .text_color(hsla(theme.foreground))
                             })
                             .on_mouse_down(
@@ -7724,7 +7852,7 @@ impl TakoApp {
                 start..text.len(),
                 HighlightStyle {
                     color: if span.code {
-                        Some(hsla(theme.ansi[3]))
+                        Some(hsla(theme.yellow))
                     } else if span.link {
                         Some(hsla(theme.accent))
                     } else {
@@ -8788,6 +8916,7 @@ impl Render for TakoApp {
                         div()
                             .flex_1()
                             .relative()
+                            .p(px(4.0))
                             .children(panes)
                             .children(border_handles)
                             .children(drop_overlays)
@@ -9427,7 +9556,7 @@ mod self_test {
                             screen.lines.iter().any(|line| {
                                 line.text.contains("TAKO-RED")
                                     && line.runs.iter().any(|run| {
-                                        run.fg == theme.ansi[1]
+                                        run.fg == theme.red
                                             && line.text[run.range.clone()].contains("TAKO-RED")
                                     })
                             })

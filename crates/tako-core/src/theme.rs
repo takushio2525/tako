@@ -40,37 +40,53 @@ impl Rgb {
 #[derive(Debug, Clone)]
 pub struct Theme {
     // --- ターミナル色 ---
-    /// デフォルト背景
     pub background: Rgb,
-    /// デフォルト前景
     pub foreground: Rgb,
-    /// ANSI 16 色（0–7: 通常、8–15: 明色）
     pub ansi: [Rgb; 16],
-    /// カーソル（ブロック）の塗り色
     pub cursor: Rgb,
-    /// カーソル上の文字色
     pub cursor_text: Rgb,
-    /// 選択範囲の背景
     pub selection_background: Rgb,
 
-    // --- UI クローム色 ---
-    /// アクセントカラー（フォーカスペインの枠・アクティブタブの下線）
+    // --- 背景階層（Catppuccin Mocha: 暗い順） ---
+    pub crust: Rgb,
+    pub mantle: Rgb,
+    pub surface_0: Rgb,
+    pub surface_1: Rgb,
+    pub surface_2: Rgb,
+    pub surface_hover: Rgb,
+    pub surface_highlight: Rgb,
+
+    // --- ボーダー階層（薄い順） ---
+    pub border_subtle: Rgb,
+    pub border_default: Rgb,
+    pub border_strong: Rgb,
+    pub border_heavy: Rgb,
+
+    // --- テキスト階層（明るい順） ---
+    pub text_secondary: Rgb,
+    pub text_tertiary: Rgb,
+    pub text_faint: Rgb,
+    pub text_overlay: Rgb,
+
+    // --- アクセント色 ---
     pub accent: Rgb,
-    /// 非フォーカスペインの枠
+    pub green: Rgb,
+    pub red: Rgb,
+    pub yellow: Rgb,
+    pub teal: Rgb,
+    pub mauve: Rgb,
+    pub peach: Rgb,
+
+    // --- UI クローム色（後方互換） ---
     pub pane_border: Rgb,
-    /// タブバーの背景
     pub tab_bar_background: Rgb,
-    /// アクティブタブの背景
     pub tab_active_background: Rgb,
-    /// アクティブタブの文字色
     pub tab_active_foreground: Rgb,
-    /// 非アクティブタブの文字色
     pub tab_inactive_foreground: Rgb,
 
     // --- フォント ---
     pub font_family: String,
     pub font_size: f32,
-    /// 行の高さ（px）。セル高さとしても使う
     pub line_height: f32,
 }
 
@@ -84,8 +100,8 @@ impl Theme {
     /// デフォルトダークテーマ（Catppuccin Mocha ベース）
     pub fn default_dark() -> Self {
         Self {
-            background: Rgb::from_hex(0x1e1e2e),
-            foreground: Rgb::from_hex(0xcdd6f4),
+            background: Rgb::from_hex(0x1e1e2e), // Base
+            foreground: Rgb::from_hex(0xcdd6f4), // Text primary
             ansi: [
                 Rgb::from_hex(0x45475a), // black
                 Rgb::from_hex(0xf38ba8), // red
@@ -104,15 +120,47 @@ impl Theme {
                 Rgb::from_hex(0x94e2d5), // bright cyan
                 Rgb::from_hex(0xa6adc8), // bright white
             ],
-            cursor: Rgb::from_hex(0xf5e0dc),
+            cursor: Rgb::from_hex(0xf5e0dc), // Rosewater
             cursor_text: Rgb::from_hex(0x1e1e2e),
             selection_background: Rgb::from_hex(0x45475a),
-            accent: Rgb::from_hex(0x89b4fa),
-            pane_border: Rgb::from_hex(0x313244),
-            tab_bar_background: Rgb::from_hex(0x11111b),
+
+            // 背景階層
+            crust: Rgb::from_hex(0x11111b),
+            mantle: Rgb::from_hex(0x181825),
+            surface_0: Rgb::from_hex(0x1b1c28),
+            surface_1: Rgb::from_hex(0x1c1d2b),
+            surface_2: Rgb::from_hex(0x20212f),
+            surface_hover: Rgb::from_hex(0x1f2030),
+            surface_highlight: Rgb::from_hex(0x313244),
+
+            // ボーダー階層
+            border_subtle: Rgb::from_hex(0x26273a),
+            border_default: Rgb::from_hex(0x2a2b3c),
+            border_strong: Rgb::from_hex(0x2b2c3e),
+            border_heavy: Rgb::from_hex(0x34354a),
+
+            // テキスト階層
+            text_secondary: Rgb::from_hex(0xbac2de),
+            text_tertiary: Rgb::from_hex(0xa6adc8),
+            text_faint: Rgb::from_hex(0x585b70),
+            text_overlay: Rgb::from_hex(0x45475a),
+
+            // アクセント色
+            accent: Rgb::from_hex(0x89b4fa), // Blue
+            green: Rgb::from_hex(0xa6e3a1),
+            red: Rgb::from_hex(0xf38ba8),
+            yellow: Rgb::from_hex(0xf9e2af),
+            teal: Rgb::from_hex(0x94e2d5),
+            mauve: Rgb::from_hex(0xcba6f7),
+            peach: Rgb::from_hex(0xfab387),
+
+            // UI クローム
+            pane_border: Rgb::from_hex(0x2a2b3c), // border_default に合わせた
+            tab_bar_background: Rgb::from_hex(0x181825), // Mantle（旧 Crust→スペック準拠）
             tab_active_background: Rgb::from_hex(0x1e1e2e),
             tab_active_foreground: Rgb::from_hex(0xcdd6f4),
             tab_inactive_foreground: Rgb::from_hex(0x6c7086),
+
             font_family: "Menlo".into(),
             font_size: 13.0,
             line_height: 17.0,
