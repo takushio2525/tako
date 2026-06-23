@@ -194,7 +194,7 @@ pub fn image_format_from_path(path: &Path) -> Option<ImageFileFormat> {
     }
 }
 
-/// PDF ファイルの拡張子判定
+#[allow(dead_code)]
 pub fn is_pdf_path(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),
@@ -277,7 +277,7 @@ pub fn load_pdf(path: &Path, _page: usize) -> PreviewState {
     }
 }
 
-/// 動画ファイルの拡張子判定
+#[allow(dead_code)]
 pub fn is_video_path(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),

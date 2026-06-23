@@ -1208,12 +1208,20 @@ impl TakoApp {
                 }
             }
             if let Some(targets) = filetree_targets {
+                let git_roots: Vec<std::path::PathBuf> =
+                    targets.iter().filter(|p| p.is_dir()).cloned().collect();
                 let task = cx
                     .background_executor()
                     .spawn(async move { filetree::scan_dirs(&targets) });
+                let git_task = cx
+                    .background_executor()
+                    .spawn(async move { filetree::scan_git_status(&git_roots) });
                 let results = task.await;
+                let git_status = git_task.await;
                 let ok = this.update(cx, |app: &mut TakoApp, cx| {
-                    if app.filetree.apply_refresh(results) {
+                    let mut changed = app.filetree.apply_refresh(results);
+                    changed |= app.filetree.apply_git_status(git_status);
+                    if changed {
                         cx.notify();
                     }
                 });
@@ -3056,24 +3064,97 @@ impl TakoApp {
                             )
                         }),
                 );
+            // ミニレイアウトマップ（ペイン配置を小さな矩形で可視化）
+            if show_rows {
+                let tree = self
+                    .workspace
+                    .tabs()
+                    .iter()
+                    .find(|t| t.id() == tab_id)
+                    .map(|t| t.tree());
+                if let Some(tree) = tree {
+                    let focused_pane = tree.focused();
+                    let layout = tree.layout(tako_core::Rect::new(0.0, 0.0, 92.0, 56.0));
+                    let mut map = div()
+                        .w(px(92.0))
+                        .h(px(56.0))
+                        .bg(rgba(theme.crust))
+                        .border_1()
+                        .border_color(hsla(theme.border_default))
+                        .rounded(px(6.0))
+                        .relative()
+                        .overflow_hidden()
+                        .mx_auto();
+                    for (pane_id, rect) in &layout {
+                        let is_focused = *pane_id == focused_pane;
+                        let pane_state = self
+                            .terminals
+                            .get(pane_id)
+                            .map(|s| s.command_state())
+                            .unwrap_or(CommandState::Unknown);
+                        let cell_border_color = match pane_state {
+                            CommandState::Failed(_) => theme.red,
+                            CommandState::Running if is_focused => theme.accent,
+                            _ if is_focused => theme.accent,
+                            _ => theme.border_strong,
+                        };
+                        let pane_num =
+                            layout.iter().position(|(id, _)| id == pane_id).unwrap_or(0) + 1;
+                        map = map.child(
+                            div()
+                                .absolute()
+                                .left(px(rect.x + 1.0))
+                                .top(px(rect.y + 1.0))
+                                .w(px((rect.width - 2.0).max(4.0)))
+                                .h(px((rect.height - 2.0).max(4.0)))
+                                .rounded(px(3.0))
+                                .border_1()
+                                .border_color(hsla(cell_border_color))
+                                .bg(rgba(theme.surface_1))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(9.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(if is_focused {
+                                    hsla(theme.accent)
+                                } else {
+                                    hsla(theme.tab_inactive_foreground)
+                                })
+                                .child(SharedString::from(format!("{pane_num}"))),
+                        );
+                    }
+                    card = card.child(map);
+                }
+            }
             // 折りたたみ時はバックグラウンド行を描かない（空にして既存ループをそのまま流す）。
             // 前面表示中（アクティブタブ）の行は残す（FR-2.16.14）
             let group_rows = if show_rows { group.rows } else { Vec::new() };
             // どの attach セッションをホスト行の下に出したか（取りこぼし防止に使う）
             let mut rendered_sessions: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
-            for row in group_rows {
+            for (row_idx, row) in group_rows.into_iter().enumerate() {
                 let pane = row.pane;
+                let pane_num = row_idx + 1;
                 let pinned = self
                     .pinned_previews
                     .iter()
                     .any(|p| p.target == PreviewTarget::Pane(pane));
+                let pane_role = self
+                    .workspace
+                    .tabs()
+                    .iter()
+                    .find(|t| t.id() == tab_id)
+                    .and_then(|t| t.tree().get(pane))
+                    .and_then(|p| p.role())
+                    .unwrap_or("")
+                    .to_string();
                 let show_state = !matches!(row.state, CommandState::Unknown);
-                let (color, state_label) = match row.state {
-                    CommandState::Failed(code) => (theme.red, format!("エラー ({code})")),
-                    CommandState::Idle => (theme.green, "入力待ち".to_string()),
-                    CommandState::Running => (theme.accent, "実行中".to_string()),
-                    CommandState::Unknown => (theme.tab_inactive_foreground, String::new()),
+                let color = match row.state {
+                    CommandState::Failed(_) => theme.red,
+                    CommandState::Idle => theme.green,
+                    CommandState::Running => theme.accent,
+                    CommandState::Unknown => theme.tab_inactive_foreground,
                 };
                 // このペインが attach 表示している外部セッション（あれば detail に名前を出す。
                 // window 一覧はホスト行の下に入れ子表示するので二重化しない。FR-2.16.6）
@@ -3082,7 +3163,7 @@ impl TakoApp {
                     .iter()
                     .filter(|s| s.pane == pane.as_u64())
                     .collect();
-                let detail = if !row.detail_title.is_empty() {
+                let _detail = if !row.detail_title.is_empty() {
                     truncate(&row.detail_title, 36)
                 } else if !hosted.is_empty() {
                     let names: Vec<String> = hosted.iter().map(|s| truncate(&s.name, 18)).collect();
@@ -3126,28 +3207,31 @@ impl TakoApp {
                                 cx.notify();
                             }))
                         })
-                        // 表示分類バッジ（FR-2.16.12。ツリー内のペインは全て「表示中」。
-                        // 「バックグラウンド」は退避済みペインのみ）
-                        .child(self.surface_badge(true))
+                        // ナンバーバッジ
+                        .child(
+                            div()
+                                .w(px(16.0))
+                                .h(px(16.0))
+                                .flex_none()
+                                .rounded(px(4.0))
+                                .bg(rgba_alpha(color, 0.2))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(10.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(hsla(color))
+                                .child(SharedString::from(format!("{pane_num}"))),
+                        )
+                        // 状態ドット
                         .when(show_state, |d| {
                             d.child(
                                 div()
-                                    .w(px(8.0))
-                                    .h(px(8.0))
+                                    .w(px(6.0))
+                                    .h(px(6.0))
                                     .flex_none()
                                     .rounded_full()
                                     .bg(hsla(color)),
-                            )
-                        })
-                        .when(show_state, |d| {
-                            d.child(
-                                div()
-                                    .w(px(52.0))
-                                    .flex_none()
-                                    .text_size(px(11.0))
-                                    .text_color(hsla(color))
-                                    .whitespace_nowrap()
-                                    .child(SharedString::from(state_label)),
                             )
                         })
                         .child(
@@ -3156,18 +3240,39 @@ impl TakoApp {
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_ellipsis()
-                                .font_weight(FontWeight::BOLD)
-                                .child(SharedString::from(truncate(&row.label, 24))),
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_size(px(12.0))
+                                .child(SharedString::from(truncate(&row.label, 20))),
                         )
-                        .child(
-                            div()
-                                .text_size(px(10.0))
-                                .text_color(hsla(theme.tab_inactive_foreground))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .child(SharedString::from(detail)),
-                        )
+                        // ロールタグ
+                        .when(pane_role.contains("orchestrator-master"), |d| {
+                            d.child(
+                                div()
+                                    .text_size(px(8.5))
+                                    .font_weight(FontWeight::BOLD)
+                                    .px(px(5.0))
+                                    .py(px(1.0))
+                                    .rounded(px(4.0))
+                                    .text_color(hsla(theme.accent))
+                                    .bg(rgba_alpha(theme.accent, 0.14))
+                                    .flex_none()
+                                    .child("ORCH"),
+                            )
+                        })
+                        .when(pane_role.contains("orchestrator-worker"), |d| {
+                            d.child(
+                                div()
+                                    .text_size(px(8.5))
+                                    .font_weight(FontWeight::BOLD)
+                                    .px(px(5.0))
+                                    .py(px(1.0))
+                                    .rounded(px(4.0))
+                                    .text_color(hsla(theme.teal))
+                                    .bg(rgba_alpha(theme.teal, 0.12))
+                                    .flex_none()
+                                    .child("WORK"),
+                            )
+                        })
                         // バックグラウンド行に 📌 ピン留めボタン（FR-2.16.15。ピン中は常時表示、
                         // 未ピンは行ホバー時のみ）。前面行はプレビュー対象外なので出さない
                         .when(!is_active, |d| {
@@ -3353,12 +3458,30 @@ impl TakoApp {
                     cx,
                 ));
             }
-            // このタブ由来のバックグラウンドペインをバックグラウンド表示（FR-2.15.6 タブ別分離）。
-            // バックグラウンドは常にバックグラウンド扱いなので折りたたみ時は隠す（FR-2.16.14）
+            // バックグラウンド/shelved エリア（dashed border 風）
             if !is_collapsed && !group.backgrounded.is_empty() {
+                let bg_count = group.backgrounded.len();
+                let mut bg_section = div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .mt(px(4.0))
+                    .pt(px(4.0))
+                    .border_t_1()
+                    .border_color(hsla(theme.border_strong))
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(hsla(theme.tab_inactive_foreground))
+                            .child(SharedString::from(format!(
+                                "BACKGROUND \u{00B7} {bg_count}"
+                            ))),
+                    );
                 for entry in &group.backgrounded {
-                    card = card.child(self.render_background_row(entry, cx));
+                    bg_section = bg_section.child(self.render_background_row(entry, cx));
                 }
+                card = card.child(bg_section);
             }
             root = root.child(card);
         }
@@ -4172,6 +4295,7 @@ impl TakoApp {
                     depth,
                     expanded: false,
                     root: false,
+                    git_status: None,
                 },
             );
         }
@@ -4346,24 +4470,66 @@ impl TakoApp {
                                 .py(px(2.0))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(hsla(theme.tab_active_foreground))
-                                .child(SharedString::from(
-                                    format!("{chevron}🗂 {}", truncate(&row.entry.name, 22)),
-                                ))
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(hsla(theme.tab_inactive_foreground))
+                                        .flex_none()
+                                        .child(SharedString::from(chevron.to_string())),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(14.0))
+                                        .text_color(hsla(theme.accent))
+                                        .flex_none()
+                                        .child("📂 "),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(SharedString::from(truncate(&row.entry.name, 22))),
+                                )
                             } else {
-                                let file_icon = if !is_dir {
-                                    let p = std::path::Path::new(&row.entry.name);
-                                    if preview::image_format_from_path(p).is_some() {
-                                        "🖼 "
-                                    } else if preview::is_pdf_path(p) {
-                                        "📕 "
-                                    } else if preview::is_video_path(p) {
-                                        "🎬 "
+                                let (icon, icon_color) = if is_dir {
+                                    if row.expanded {
+                                        ("▾ ", theme.accent)
                                     } else {
-                                        ""
+                                        ("▸ ", theme.tab_inactive_foreground)
                                     }
                                 } else {
-                                    ""
+                                    let p = std::path::Path::new(&row.entry.name);
+                                    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                                    match ext {
+                                        "toml" | "yaml" | "yml" | "json" | "ini" | "cfg"
+                                        | "conf" | "env" | "lock" => ("● ", theme.peach),
+                                        "md" | "txt" | "rst" | "tex" | "adoc" | "pdf" => {
+                                            ("◆ ", theme.accent)
+                                        }
+                                        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico"
+                                        | "bmp" => ("◈ ", theme.mauve),
+                                        "mp4" | "mov" | "avi" | "webm" | "mkv" => {
+                                            ("▶ ", theme.mauve)
+                                        }
+                                        "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "c"
+                                        | "cpp" | "h" | "hpp" | "java" | "rb" | "sh" | "zsh"
+                                        | "bash" | "fish" | "swift" | "kt" | "cs" => {
+                                            ("◇ ", theme.green)
+                                        }
+                                        _ => ("◦ ", theme.tab_inactive_foreground),
+                                    }
                                 };
+                                let git_marker = row.git_status.map(|gs| match gs {
+                                    filetree::GitChange::Modified => ("M", theme.yellow),
+                                    filetree::GitChange::Added => ("A", theme.green),
+                                    filetree::GitChange::Deleted => ("D", theme.red),
+                                    filetree::GitChange::Renamed => ("R", theme.accent),
+                                    filetree::GitChange::Untracked => {
+                                        ("?", theme.tab_inactive_foreground)
+                                    }
+                                });
                                 base.pl(px(12.0 + 12.0 * row.depth as f32))
                                     .when(!is_dir, |d| d.text_color(hsla(theme.text_tertiary)))
                                     .when(is_open, |d| {
@@ -4372,10 +4538,33 @@ impl TakoApp {
                                             .border_l_2()
                                             .border_color(hsla(theme.accent))
                                     })
-                                    .child(SharedString::from(format!(
-                                        "{chevron}{file_icon}{}",
-                                        truncate(&row.entry.name, 24)
-                                    )))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(hsla(icon_color))
+                                            .flex_none()
+                                            .child(SharedString::from(icon.to_string())),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .child(SharedString::from(truncate(
+                                                &row.entry.name,
+                                                24,
+                                            ))),
+                                    )
+                                    .children(git_marker.map(|(label, color)| {
+                                        div()
+                                            .text_size(px(10.5))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(hsla(color))
+                                            .flex_none()
+                                            .pr(px(8.0))
+                                            .child(SharedString::from(label.to_string()))
+                                    }))
                             }
                         })),
                 ),
@@ -5711,19 +5900,21 @@ impl TakoApp {
                 } else {
                     tab.title().to_string()
                 };
-                // タブ内ペイン状態の集約ドット（FR-2.1.4）: エラー > 実行中のみ表示
-                let dot = match CommandState::aggregate(
+                // タブ内ペイン状態の集約ドット（FR-2.1.4）
+                let agg = CommandState::aggregate(
                     tab.tree()
                         .panes()
                         .iter()
                         .filter_map(|p| self.terminals.get(&p.id()))
                         .map(|s| s.command_state()),
-                ) {
-                    CommandState::Failed(_) => Some(theme.red), // 赤
-                    CommandState::Running => Some(theme.accent),
-                    _ => None,
+                );
+                let dot_color = match agg {
+                    CommandState::Failed(_) => theme.red,
+                    CommandState::Running => theme.accent,
+                    CommandState::Idle => theme.green,
+                    CommandState::Unknown => theme.text_overlay,
                 };
-                (id, label, dot)
+                (id, label, dot_color)
             })
             .collect();
 
@@ -5737,7 +5928,7 @@ impl TakoApp {
             .bg(rgba(theme.tab_bar_background))
             .border_b_1()
             .border_color(hsla(theme.border_subtle))
-            .children(tabs.into_iter().map(|(id, label, dot)| {
+            .children(tabs.into_iter().map(|(id, label, dot_color)| {
                 let is_active = id == active;
                 let pane_count = self
                     .workspace
@@ -5771,8 +5962,12 @@ impl TakoApp {
                         let _ = this.workspace.activate_tab(id);
                         cx.notify();
                     }))
-                    .children(
-                        dot.map(|color| div().w(px(7.0)).h(px(7.0)).rounded_full().bg(hsla(color))),
+                    .child(
+                        div()
+                            .w(px(7.0))
+                            .h(px(7.0))
+                            .rounded_full()
+                            .bg(hsla(dot_color)),
                     )
                     .on_drag(
                         TabDrag { tab: id },
@@ -6240,11 +6435,9 @@ impl TakoApp {
     }
 
     /// 下部ステータスバー（FR-2.16.4。Zed / VSCode 風）。
-    /// 左 = ファイルツリートグル、右 = tmux 管理・git 管理トグル。
-    /// トグル状態は dispatch（`tako panel` / MCP `tako_panel`）からも取得・操作できる
+    /// 左 = トグル群（Files / BG）、中央 = フリート表示、右 = 使用量 / コンテキスト / tmux / git
     fn render_status_bar(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         let theme = self.theme.clone();
-        // 全ペイン集約の状態ドット（旧 agents 固定タブ → ◧ panel から引き継ぎ。FR-2.10）
         let agents_dot =
             match CommandState::aggregate(self.terminals.values().map(|s| s.command_state())) {
                 CommandState::Failed(_) => Some(theme.red),
@@ -6271,6 +6464,55 @@ impl TakoApp {
                 .border_r_1()
                 .border_color(hsla(theme.border_subtle))
         };
+        // オーケストレーター情報の収集
+        let fleet_label = {
+            let has_master = self
+                .workspace
+                .tabs()
+                .iter()
+                .flat_map(|tab| tab.tree().panes())
+                .any(|p| {
+                    p.role().is_some_and(|r| {
+                        r == "orchestrator-master" || r.starts_with("orchestrator-master:")
+                    })
+                });
+            if has_master {
+                let worker_count: usize = self
+                    .workspace
+                    .tabs()
+                    .iter()
+                    .flat_map(|tab| tab.tree().panes())
+                    .filter(|p| {
+                        p.role()
+                            .is_some_and(|r| r.starts_with("orchestrator-worker:"))
+                    })
+                    .count();
+                Some(format!("master \u{00B7} {worker_count} workers"))
+            } else {
+                None
+            }
+        };
+        // コンテキストメーター（フォーカスペインの scrollback 使用率で近似表示）
+        let ctx_pct = {
+            let focused = self.workspace.active_tab().tree().focused();
+            self.terminals
+                .get(&focused)
+                .map(|s| {
+                    let max_history = 10000_f32;
+                    let used = s.history_size() as f32;
+                    ((used / max_history) * 100.0).min(100.0) as u32
+                })
+                .unwrap_or(0)
+        };
+        let ctx_bar_color = if ctx_pct >= 90 {
+            theme.red
+        } else if ctx_pct >= 70 {
+            theme.yellow
+        } else {
+            theme.accent
+        };
+        let ctx_fill_frac = ctx_pct as f32 / 100.0;
+
         div()
             .flex()
             .flex_row()
@@ -6281,14 +6523,16 @@ impl TakoApp {
             .bg(rgba(theme.tab_bar_background))
             .border_t_1()
             .border_color(hsla(theme.border_subtle))
+            // Files トグル
             .child(
                 toggle("statusbar-filetree", self.filetree.visible)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_filetree();
                         cx.notify();
                     }))
-                    .child("◫ ファイル"),
+                    .child("Files"),
             )
+            // BG トグル
             .child({
                 let bg_count = self.workspace.shelved_panes().len();
                 let drawer_open = self.drawer_visible;
@@ -6301,66 +6545,78 @@ impl TakoApp {
                         this.background_tab(drag.tab, cx);
                     }))
                     .child(if bg_count > 0 {
-                        format!("⏏ BG ({})", bg_count)
+                        format!("BG {bg_count}")
                     } else {
-                        "⏏ BG".into()
+                        "BG".into()
                     })
             })
-            .children({
-                let focused = self.workspace.active_tab().tree().focused();
-                let focused_role = self
-                    .workspace
-                    .active_tab()
-                    .tree()
-                    .get(focused)
-                    .and_then(|p| p.role())
-                    .unwrap_or("");
-                let label = if focused_role == "orchestrator-master"
-                    || focused_role.starts_with("orchestrator-master:")
-                {
-                    let suffix = focused_role
-                        .strip_prefix("orchestrator-master:")
-                        .unwrap_or("");
-                    let worker_count: usize = self
-                        .workspace
-                        .tabs()
-                        .iter()
-                        .flat_map(|tab| tab.tree().panes())
-                        .filter(|p| {
-                            p.role()
-                                .is_some_and(|r| r.starts_with("orchestrator-worker:"))
-                        })
-                        .count();
-                    let name = if suffix.is_empty() {
-                        "master".to_string()
-                    } else {
-                        format!("master {suffix}")
-                    };
-                    Some(format!("\u{1F419} {name} \u{00B7} workers: {worker_count}"))
-                } else if let Some(rest) = focused_role.strip_prefix("orchestrator-worker:") {
-                    // rest は "project" または "project:label"
-                    let display = if let Some((_project, label_part)) = rest.split_once(':') {
-                        format!("worker {label_part}")
-                    } else {
-                        format!("worker: {rest}")
-                    };
-                    Some(format!("\u{1F419} {display}"))
-                } else {
-                    None
-                };
-                label.map(|text| {
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .h_full()
-                        .px_2()
-                        .text_size(px(11.0))
-                        .text_color(hsla(theme.tab_active_foreground))
-                        .child(text)
-                })
-            })
+            // フリート表示（オーケストレーター検出時のみ）
+            .children(fleet_label.map(|text| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .h_full()
+                    .px_2()
+                    .border_r_1()
+                    .border_color(hsla(theme.border_subtle))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(hsla(theme.teal))
+                            .child("⚙"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(hsla(theme.tab_active_foreground))
+                            .child(SharedString::from(text)),
+                    )
+            }))
             .child(div().flex_grow(1.0))
+            // コンテキストメーター
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .h_full()
+                    .px_2()
+                    .border_r_1()
+                    .border_color(hsla(theme.border_subtle))
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(hsla(theme.tab_inactive_foreground))
+                            .child("ctx"),
+                    )
+                    .child(
+                        div()
+                            .w(px(70.0))
+                            .h(px(6.0))
+                            .rounded(px(3.0))
+                            .bg(rgba(theme.surface_highlight))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .h_full()
+                                    .rounded(px(3.0))
+                                    .w(relative(ctx_fill_frac))
+                                    .bg(hsla(ctx_bar_color)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(hsla(theme.tab_active_foreground))
+                            .child(SharedString::from(format!("{ctx_pct}%"))),
+                    ),
+            )
+            // tmux トグル
             .child(
                 toggle(
                     "statusbar-tmux",
@@ -6373,8 +6629,9 @@ impl TakoApp {
                     agents_dot
                         .map(|color| div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color))),
                 )
-                .child("⌗ tmux"),
+                .child("tmux"),
             )
+            // git トグル
             .child(
                 toggle(
                     "statusbar-git",
@@ -6383,7 +6640,15 @@ impl TakoApp {
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.toggle_panel_view(PanelView::Git, cx);
                 }))
-                .child("⎇ git"),
+                .child({
+                    let branch = self
+                        .git_data
+                        .as_ref()
+                        .and_then(|d| d.branches.iter().find(|b| b.is_current))
+                        .map(|b| truncate(&b.name, 16))
+                        .unwrap_or_else(|| "git".into());
+                    SharedString::from(format!("⎇ {branch}"))
+                }),
             )
     }
 

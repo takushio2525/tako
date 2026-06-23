@@ -22,6 +22,16 @@ pub struct Entry {
     pub is_dir: bool,
 }
 
+/// git status の変更種別（`git status --porcelain` の 1 文字コードをマップ）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitChange {
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Untracked,
+}
+
 /// 表示用にフラット化した 1 行。`root` = ワークスペースフォルダの見出し行
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
@@ -29,6 +39,7 @@ pub struct Row {
     pub depth: usize,
     pub expanded: bool,
     pub root: bool,
+    pub git_status: Option<GitChange>,
 }
 
 /// ファイルツリーの状態。`visible` は FR-3.7（折りたたみで純粋なターミナルに戻る）
@@ -39,6 +50,8 @@ pub struct FileTree {
     /// 展開中ディレクトリ（ルート自身も含む。絶対パスがキーなのでルート間で共有できる）
     expanded: HashSet<PathBuf>,
     cache: HashMap<PathBuf, Vec<Entry>>,
+    /// git status キャッシュ: 絶対パス → 変更種別
+    git_cache: HashMap<PathBuf, GitChange>,
 }
 
 impl FileTree {
@@ -101,6 +114,15 @@ impl FileTree {
         }
     }
 
+    /// git status キャッシュを更新する。変化があれば true
+    pub fn apply_git_status(&mut self, status: HashMap<PathBuf, GitChange>) -> bool {
+        if self.git_cache == status {
+            return false;
+        }
+        self.git_cache = status;
+        true
+    }
+
     /// 表示行: ルート見出し行 + 展開状態に従った深さ優先の中身
     pub fn rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
@@ -118,6 +140,7 @@ impl FileTree {
                 depth: 0,
                 expanded,
                 root: true,
+                git_status: None,
             });
             if expanded {
                 self.collect_rows(root, 1, &mut rows);
@@ -135,11 +158,13 @@ impl FileTree {
         };
         for entry in entries {
             let expanded = entry.is_dir && self.expanded.contains(&entry.path);
+            let git_status = self.git_cache.get(&entry.path).copied();
             rows.push(Row {
                 entry: entry.clone(),
                 depth,
                 expanded,
                 root: false,
+                git_status,
             });
             if expanded {
                 self.collect_rows(&entry.path, depth + 1, rows);
@@ -193,6 +218,59 @@ pub fn scan_dirs(targets: &[PathBuf]) -> Vec<(PathBuf, Option<Vec<Entry>>)> {
             }
         })
         .collect()
+}
+
+/// ルートディレクトリ群の git status を取得する（background executor 向け）。
+/// 各ルートが git リポジトリ内にあれば `git status --porcelain` を叩き、
+/// 結果を絶対パスにマッピングして返す
+pub fn scan_git_status(roots: &[PathBuf]) -> HashMap<PathBuf, GitChange> {
+    let mut result = HashMap::new();
+    let mut visited_repos: HashSet<PathBuf> = HashSet::new();
+    for root in roots {
+        // git rev-parse --show-toplevel でリポジトリルートを取得
+        let repo_root = match std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(root)
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
+            }
+            _ => continue,
+        };
+        if !visited_repos.insert(repo_root.clone()) {
+            continue;
+        }
+        let Ok(output) = std::process::Command::new("git")
+            .args(["status", "--porcelain", "-uall"])
+            .current_dir(&repo_root)
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if line.len() < 4 {
+                continue;
+            }
+            let xy = &line[..2];
+            let rel_path = line[3..].trim();
+            // リネーム（R_ / C_）は " -> new" の形。新ファイル名を取る
+            let rel_path = rel_path.split(" -> ").last().unwrap_or(rel_path);
+            let abs_path = repo_root.join(rel_path);
+            let change = match xy.as_bytes() {
+                [b'?', b'?'] => GitChange::Untracked,
+                [b'A', _] | [_, b'A'] => GitChange::Added,
+                [b'D', _] | [_, b'D'] => GitChange::Deleted,
+                [b'R', _] | [_, b'R'] => GitChange::Renamed,
+                _ => GitChange::Modified,
+            };
+            result.insert(abs_path, change);
+        }
+    }
+    result
 }
 
 /// ディレクトリを読んで「ディレクトリ先・名前（大文字小文字無視）順」に並べる。
