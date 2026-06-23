@@ -26,7 +26,7 @@ use futures::channel::mpsc::unbounded;
 use futures::StreamExt;
 use gpui::{
     actions, canvas, div, fill, point, prelude::*, px, quad, relative, size, App, BorderStyle,
-    Bounds, ClipboardItem, Context, CursorStyle, DragMoveEvent, ElementInputHandler,
+    Bounds, BoxShadow, ClipboardItem, Context, CursorStyle, DragMoveEvent, ElementInputHandler,
     EntityInputHandler, FocusHandle, Font, FontStyle, FontWeight, HighlightStyle, Hsla, KeyBinding,
     Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
     Rgba, ScrollDelta, ScrollWheelEvent, SharedString, Size, StrikethroughStyle, StyledText,
@@ -48,8 +48,8 @@ const INITIAL_ROWS: usize = 24;
 const TAB_BAR_HEIGHT: f32 = 40.0;
 /// ペイン枠線の太さ（px）
 const PANE_BORDER: f32 = 1.0;
-/// ペイン内側の余白（px）
-const PANE_PADDING: f32 = 4.0;
+/// ペイン内側の余白（px。デザインスペック: 12–14px content padding）
+const PANE_PADDING: f32 = 10.0;
 /// キーボードリサイズ 1 回あたりの比率変化
 const RESIZE_STEP: f32 = 0.05;
 /// ペイン境界のドラッグ判定/カーソル変更の当たり幅（px。仕切り線を中心に左右各 BORDER_HANDLE/2）
@@ -116,8 +116,8 @@ const SIDEBAR_WIDTH: f32 = 244.0;
 const PANEL_DEFAULT_WIDTH: f32 = 340.0;
 const PANEL_MIN_WIDTH: f32 = 220.0;
 
-/// ペイン上部タイトルバーの高さ（px。iTerm2 風: × ボタン + ペイン名）
-const PANE_TITLE_BAR: f32 = 22.0;
+/// ペイン上部タイトルバーの高さ（px。デザインスペック: 30px）
+const PANE_TITLE_BAR: f32 = 30.0;
 
 /// 下部ステータスバーの高さ（px。FR-2.16.4。Zed / VSCode 風）
 const STATUS_BAR_HEIGHT: f32 = 30.0;
@@ -3015,7 +3015,15 @@ impl TakoApp {
                 } else {
                     theme.surface_0
                 }))
-                .when(is_active, |d| d.border_color(hsla_alpha(theme.accent, 0.4)))
+                .when(is_active, |d| {
+                    d.shadow(vec![BoxShadow {
+                        color: hsla_alpha(theme.accent, 0.18),
+                        offset: point(px(0.), px(0.)),
+                        blur_radius: px(0.),
+                        spread_radius: px(1.),
+                        inset: true,
+                    }])
+                })
                 .child(
                     div()
                         .id(("tmux-tab-header", tab_id.as_u64()))
@@ -3078,10 +3086,10 @@ impl TakoApp {
                     .map(|t| t.tree());
                 if let Some(tree) = tree {
                     let focused_pane = tree.focused();
-                    let layout = tree.layout(tako_core::Rect::new(0.0, 0.0, 92.0, 56.0));
+                    let layout = tree.layout(tako_core::Rect::new(0.0, 0.0, 92.0, 76.0));
                     let mut map = div()
                         .w(px(92.0))
-                        .h(px(56.0))
+                        .h(px(76.0))
                         .bg(rgba(theme.crust))
                         .border_1()
                         .border_color(hsla(theme.border_default))
@@ -3111,7 +3119,7 @@ impl TakoApp {
                                 .top(px(rect.y + 1.0))
                                 .w(px((rect.width - 2.0).max(4.0)))
                                 .h(px((rect.height - 2.0).max(4.0)))
-                                .rounded(px(3.0))
+                                .rounded(px(4.0))
                                 .border_1()
                                 .border_color(hsla(cell_border_color))
                                 .bg(rgba(theme.surface_1))
@@ -6018,7 +6026,7 @@ impl TakoApp {
                             div()
                                 .text_size(px(11.0))
                                 .text_color(hsla(theme.tab_inactive_foreground))
-                                .child(SharedString::from(format!("{pane_count}"))),
+                                .child(SharedString::from(format!("\u{00B7} {pane_count}"))),
                         )
                     })
                     .child(
@@ -6537,6 +6545,7 @@ impl TakoApp {
             theme.accent
         };
         let ctx_fill_frac = ctx_pct as f32 / 100.0;
+        let ctx_detail = self.agent_metrics.ctx_detail.clone();
         let usage_text = self.agent_metrics.usage_text.clone();
 
         div()
@@ -6666,7 +6675,14 @@ impl TakoApp {
                             .font_family("Monaco")
                             .text_color(hsla(theme.tab_active_foreground))
                             .child(SharedString::from(format!("{ctx_pct}%"))),
-                    ),
+                    )
+                    .children(ctx_detail.map(|detail| {
+                        div()
+                            .text_size(px(10.5))
+                            .font_family("Monaco")
+                            .text_color(hsla(theme.tab_inactive_foreground))
+                            .child(SharedString::from(detail))
+                    })),
             )
             // tmux トグル
             .child(
@@ -7371,6 +7387,24 @@ impl TakoApp {
             } else {
                 hsla(theme.border_default)
             })
+            .when(focused, |d| {
+                d.shadow(vec![
+                    BoxShadow {
+                        color: hsla_alpha(theme.accent, 0.25),
+                        offset: point(px(0.), px(0.)),
+                        blur_radius: px(0.),
+                        spread_radius: px(1.),
+                        inset: false,
+                    },
+                    BoxShadow {
+                        color: gpui::hsla(0., 0., 0., 0.35),
+                        offset: point(px(0.), px(8.)),
+                        blur_radius: px(24.),
+                        spread_radius: px(0.),
+                        inset: false,
+                    },
+                ])
+            })
             .flex()
             .flex_col()
             .overflow_hidden()
@@ -7464,6 +7498,22 @@ impl TakoApp {
                             .child(SharedString::from(label.to_string()))
                     }))
                     .child(div().flex_grow(1.0))
+                    // ターミナル情報（シェル名 · cols×rows）
+                    .child({
+                        let shell_name = self
+                            .terminals
+                            .get(&pane_id)
+                            .and_then(|s| s.title())
+                            .unwrap_or("zsh");
+                        let shell_short = shell_name.rsplit('/').next().unwrap_or(shell_name);
+                        div()
+                            .text_size(px(10.5))
+                            .font_family("Monaco")
+                            .text_color(hsla(theme.tab_inactive_foreground))
+                            .child(SharedString::from(format!(
+                                "{shell_short} \u{00B7} {cols}\u{00D7}{rows}"
+                            )))
+                    })
                     // バックグラウンドボタン
                     .child(
                         div()
@@ -7955,6 +8005,24 @@ impl TakoApp {
                 hsla(theme.accent)
             } else {
                 hsla(theme.border_default)
+            })
+            .when(focused, |d| {
+                d.shadow(vec![
+                    BoxShadow {
+                        color: hsla_alpha(theme.accent, 0.25),
+                        offset: point(px(0.), px(0.)),
+                        blur_radius: px(0.),
+                        spread_radius: px(1.),
+                        inset: false,
+                    },
+                    BoxShadow {
+                        color: gpui::hsla(0., 0., 0., 0.35),
+                        offset: point(px(0.), px(8.)),
+                        blur_radius: px(24.),
+                        spread_radius: px(0.),
+                        inset: false,
+                    },
+                ])
             })
             .flex()
             .flex_col()

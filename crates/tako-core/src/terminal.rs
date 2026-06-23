@@ -553,11 +553,10 @@ impl TerminalSession {
 
     /// Claude TUI のフッターからエージェントメトリクスを抽出する。
     /// alt screen（TUI モード）のペインの末尾数行を走査し、
-    /// `ctx NN%` や usage 情報をパースする
+    /// `ctx NN%` や usage 情報をパースする。
+    /// tmux バックエンド経由では alt screen フラグがホスト側に伝播しない
+    /// ことがあるため、alt screen でなくても末尾行にパターンがあれば抽出する
     pub fn agent_metrics(&self) -> Option<AgentMetrics> {
-        if !self.is_alt_screen() {
-            return None;
-        }
         let lines = self.visible_lines();
         parse_agent_metrics(&lines)
     }
@@ -568,32 +567,40 @@ impl TerminalSession {
 pub struct AgentMetrics {
     /// コンテキスト使用率（0–100）
     pub ctx_percent: Option<u32>,
+    /// コンテキスト詳細テキスト（例: "128K/200K"）
+    pub ctx_detail: Option<String>,
     /// usage 表示テキスト（例: "5h 23%", "$1.23" 等）
     pub usage_text: Option<String>,
 }
 
 /// 画面行リストから Claude TUI フッターのメトリクスをパースする
 fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
-    // Claude TUI のフッターは画面末尾 5 行以内にある
-    let scan_lines = lines.iter().rev().take(5);
+    // Claude TUI のフッターは画面末尾 8 行以内にある（ステータスバー + ヒント行）
+    let scan_lines: Vec<_> = lines.iter().rev().take(8).collect();
     let mut ctx_percent = None;
+    let mut ctx_detail = None;
     let mut usage_text = None;
 
-    for line in scan_lines {
-        // `ctx NN%` パターン（プログレスバー文字を含む行）
+    for line in &scan_lines {
+        // `ctx NN%` / `context NN%` パターン（プログレスバー文字を含む行）
         if ctx_percent.is_none() {
-            if let Some(pos) = line.find("ctx") {
-                let after = &line[pos + 3..];
-                // "ctx" の後の空白・バー文字をスキップして数字を探す
+            let after = line
+                .find("ctx")
+                .map(|pos| &line[pos + 3..])
+                .or_else(|| line.find("context").map(|pos| &line[pos + 7..]));
+            if let Some(after) = after {
                 if let Some(pct) = extract_percent(after) {
                     ctx_percent = Some(pct.min(100));
+                }
+                // ctx 詳細: `NNNK/NNNK` パターン（例: "128K/200K"）
+                if ctx_detail.is_none() {
+                    ctx_detail = extract_ctx_detail(after);
                 }
             }
         }
 
-        // usage パターン: `Nh NN%` (時間残量) や `$N.NN` (コスト) やトークン数 `NNNk`
+        // usage パターン: `Nh NN%` / `Nm NN%` (時間残量) や `$N.NN` (コスト) やトークン数
         if usage_text.is_none() {
-            // `Nh NN%` パターン (e.g. "5h 23%")
             if let Some(usage) = extract_usage_text(line) {
                 usage_text = Some(usage);
             }
@@ -605,8 +612,47 @@ fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
     }
     Some(AgentMetrics {
         ctx_percent,
+        ctx_detail,
         usage_text,
     })
+}
+
+/// `NNN.NK/NNNK` パターンの ctx 詳細テキストを抽出する（例: "128K/200K", "45.2K/200K"）
+fn extract_ctx_detail(s: &str) -> Option<String> {
+    let chars: Vec<char> = s.chars().collect();
+    for i in 0..chars.len() {
+        if chars[i].is_ascii_digit() {
+            let start = i;
+            let mut j = i + 1;
+            // 数字 + ドットの列を読む
+            while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == '.') {
+                j += 1;
+            }
+            // K/M の単位
+            if j < chars.len() && (chars[j] == 'K' || chars[j] == 'k' || chars[j] == 'M') {
+                let unit_pos = j;
+                j += 1;
+                // / の後にもう一つの数字+単位
+                if j < chars.len() && chars[j] == '/' {
+                    j += 1;
+                    let num2_start = j;
+                    while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == '.') {
+                        j += 1;
+                    }
+                    if j < chars.len()
+                        && j > num2_start
+                        && (chars[j] == 'K' || chars[j] == 'k' || chars[j] == 'M')
+                    {
+                        let text: String = chars[start..=j].iter().collect();
+                        return Some(text);
+                    }
+                }
+                // 単位だけ（K/M）で止まった場合は無視
+                let _ = unit_pos;
+            }
+        }
+    }
+    None
 }
 
 /// 文字列から最初のパーセント値を抽出する（"  45%" → 45）
@@ -641,7 +687,7 @@ fn extract_usage_text(line: &str) -> Option<String> {
             while j < chars.len() && chars[j].is_ascii_digit() {
                 j += 1;
             }
-            if j < chars.len() && chars[j] == 'h' {
+            if j < chars.len() && (chars[j] == 'h' || chars[j] == 'm') {
                 let h_pos = j;
                 j += 1;
                 // 空白スキップ
@@ -666,9 +712,7 @@ fn extract_usage_text(line: &str) -> Option<String> {
                     if k < chars.len() && chars[k] == '$' {
                         let cost_start = k;
                         k += 1;
-                        while k < chars.len()
-                            && (chars[k].is_ascii_digit() || chars[k] == '.')
-                        {
+                        while k < chars.len() && (chars[k].is_ascii_digit() || chars[k] == '.') {
                             k += 1;
                         }
                         if k > cost_start + 1 {
@@ -1007,6 +1051,7 @@ mod tests {
         ];
         let m = parse_agent_metrics(&lines).unwrap();
         assert_eq!(m.ctx_percent, Some(45));
+        assert_eq!(m.ctx_detail.as_deref(), Some("128K/200K"));
         assert_eq!(m.usage_text.as_deref(), Some("5h 23%"));
     }
 
@@ -1029,5 +1074,26 @@ mod tests {
     fn agent_metricsの該当なし() {
         let lines = vec!["normal shell output".into(), "$ ls".into()];
         assert!(parse_agent_metrics(&lines).is_none());
+    }
+
+    #[test]
+    fn agent_metricsのalt_screen外でも検出() {
+        // tmux バックエンド経由で alt screen フラグが伝播しないケース
+        let lines = vec![
+            "some output".into(),
+            "  Auto  ctx 67% ████░░░  5h 12%".into(),
+            " ❯ ".into(),
+        ];
+        let m = parse_agent_metrics(&lines).unwrap();
+        assert_eq!(m.ctx_percent, Some(67));
+        assert_eq!(m.usage_text.as_deref(), Some("5h 12%"));
+    }
+
+    #[test]
+    fn agent_metricsの分単位usage() {
+        let lines = vec!["  45m 78%  ctx 30%".into()];
+        let m = parse_agent_metrics(&lines).unwrap();
+        assert_eq!(m.ctx_percent, Some(30));
+        assert_eq!(m.usage_text.as_deref(), Some("45m 78%"));
     }
 }
