@@ -560,7 +560,7 @@ mod tests {
         let result = assets.load("icons/file_icons/rust.svg").unwrap();
         assert!(result.is_some());
         let bytes = result.unwrap();
-        assert!(bytes.len() > 0);
+        assert!(!bytes.is_empty());
         assert!(std::str::from_utf8(&bytes).unwrap().contains("<svg"));
     }
 

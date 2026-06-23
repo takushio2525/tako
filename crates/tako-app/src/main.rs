@@ -214,7 +214,8 @@ actions!(
         ActivateTab9,
         ZoomIn,
         ZoomOut,
-        ResetZoom
+        ResetZoom,
+        SelectAll
     ]
 );
 
@@ -252,6 +253,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-+", ZoomIn, None),
         KeyBinding::new("cmd--", ZoomOut, None),
         KeyBinding::new("cmd-0", ResetZoom, None),
+        KeyBinding::new("cmd-a", SelectAll, None),
     ]
 }
 
@@ -2593,6 +2595,29 @@ impl TakoApp {
         if let Some(id) = self.workspace.tabs().get(index).map(|t| t.id()) {
             let _ = self.workspace.activate_tab(id);
         }
+        cx.notify();
+    }
+
+    fn select_all_preview(&mut self, cx: &mut Context<Self>) {
+        let pane_id = self.focused_pane();
+        if !self.previews.contains_key(&pane_id) {
+            return;
+        }
+        let Some(texts) = self.preview_line_texts.get(&pane_id) else {
+            return;
+        };
+        if texts.is_empty() {
+            return;
+        }
+        let last_line = texts.len() - 1;
+        let last_col = texts[last_line].len();
+        self.preview_selections.insert(
+            pane_id,
+            PreviewSelection {
+                anchor: (0, 0),
+                head: (last_line, last_col),
+            },
+        );
         cx.notify();
     }
 
@@ -5878,6 +5903,7 @@ impl TakoApp {
             if self.dragging_border.take().is_some()
                 | self.dragging_scrollbar.take().is_some()
                 | self.selecting.take().is_some()
+                | self.preview_selecting.take().is_some()
                 | self.dragging_pin.take().is_some()
                 | std::mem::take(&mut self.dragging_panel)
             {
@@ -5928,6 +5954,15 @@ impl TakoApp {
             cx.notify();
             return;
         }
+        if let Some(pid) = self.preview_selecting {
+            if let Some(pos) = self.preview_hit_test(pid, event.position) {
+                if let Some(sel) = self.preview_selections.get_mut(&pid) {
+                    sel.head = pos;
+                    cx.notify();
+                }
+            }
+            return;
+        }
         let Some(pane_id) = self.selecting else {
             return;
         };
@@ -5954,6 +5989,7 @@ impl TakoApp {
             cx.notify();
             return;
         }
+        self.preview_selecting = None;
         if let Some(pane_id) = self.selecting.take() {
             // iTerm2 流の copy-on-select
             if let Some(text) = self
@@ -9132,7 +9168,6 @@ impl TakoApp {
             let num_label = format!("{n:>width$}  ");
             let num_len = num_label.len();
             div()
-                .relative()
                 .flex()
                 .flex_row()
                 .child(
@@ -9149,8 +9184,14 @@ impl TakoApp {
                             )],
                         )),
                 )
-                .child(div().flex_1().min_w(px(0.0)).child(code_el))
-                .child(bounds_canvas)
+                .child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(code_el)
+                        .child(bounds_canvas),
+                )
         } else {
             div().relative().child(code_el).child(bounds_canvas)
         }
@@ -10261,6 +10302,7 @@ impl Render for TakoApp {
                 this.zoom_focused_pane(-Self::FONT_SIZE_STEP, cx)
             }))
             .on_action(cx.listener(|this, _: &ResetZoom, _, cx| this.reset_zoom_focused_pane(cx)))
+            .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all_preview(cx)))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 this.handle_key(&event.keystroke, cx);
             }))
