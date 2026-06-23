@@ -274,11 +274,25 @@ pub fn spawn_daemon(port: Option<u16>, no_tunnel: bool) -> Result<Value, String>
         args.push("--no-tunnel".to_string());
     }
 
-    let mut child = Command::new(&tako_bin)
-        .args(&args)
+    let mut cmd = Command::new(&tako_bin);
+    cmd.args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+
+    // setsid でプロセスグループから切り離し、親（tmux セッション）終了時に巻き添えで死なないようにする
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("デーモンの起動に失敗: {e}"))?;
 

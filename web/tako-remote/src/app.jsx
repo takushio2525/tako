@@ -43,7 +43,7 @@ export function App() {
     return <ConnectPage params={route.params} />;
   }
   if (segments[0] === 'panes' && segments[1]) {
-    return <TerminalPage paneId={parseInt(segments[1], 10)} />;
+    return <TerminalPage paneId={segments[1]} />;
   }
   if (segments[0] === 'panes') {
     return <PanesPage />;
