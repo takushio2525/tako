@@ -4,29 +4,25 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-06-18・オーケストレーター機能 完了）
+## 現在の対象（2026-06-23・MCP/IPC 再起動耐性の強化 完了）
 
-tako にオーケストレーター機能を完全内蔵。外部スクリプト依存ゼロで `tako master` で
-マスターエージェントを起動し、MCP / CLI から子 worker の spawn・監視・管理ができる。
+tako の MCP サーバーとセッション管理の再起動耐性を改善。
+⌘Q → 再起動で MCP クライアントから全操作不能になる問題を 3 点の変更で解消:
 
-- **orchestrator モジュール**: `tako-control/src/orchestrator/`（projects.yaml パース、
-  設定管理、デフォルト system prompt 埋め込み、claude agents --json 連携）
-- **protocol**: `OrchestratorProjects` / `OrchestratorSpawn` / `OrchestratorWorkerStatus` の 3 Request
-- **dispatch**: 3 操作のハンドラ（projects CRUD / worker split+起動 / status 確認）
-- **MCP**: `tako_orchestrator_projects` / `tako_orchestrator_spawn` / `tako_orchestrator_worker_status`（計 40 ツール）
-- **CLI**: `tako master [suffix]` / `tako orchestrator watch` / `projects` / `spawn` / `status`
-- **ドキュメント**: `docs/orchestrator.md`（セットアップ・CLI リファレンス）
-- **検証**: build / clippy(-D warnings) / fmt / test 全緑。セルフテスト期待値 40 に更新
-- 最終更新: 2026-06-18
+1. **IPC ソケットの固定パス化**: `/tmp/tako-{PID}-{SEQ}.sock` → `<data_dir>/tako.sock`
+2. **認証トークンの永続化**: `<data_dir>/token` に保存し再起動をまたいで再利用
+3. **discovery cleanup の条件化**: persist ON 時の ⌘Q で接続情報を保持
+
+tmux セッション内の既存クライアント（古い TAKO_SOCKET/TAKO_TOKEN 環境変数を持つプロセス）が
+再起動後もそのまま再接続できるようになった。
 
 ## 残作業・既知の制約
 
-- spawn の prompt 送信は claude 起動後に send_input で行う設計（dispatch 内で待機しない）。
-  呼び出し側が send + sleep で claude 起動を待つ必要がある
-- `tako orchestrator watch` は 5 秒ポーリング。session_id ありなら連続 2 回 idle で確定、
-  なしなら grep フォールバック（連続 6 回）
-- system prompt はバイナリ埋め込み + カスタムファイル優先。カスタムファイルが無い場合は
-  config dir に `_default_system_prompt.md` として書き出す
+- MCP HTTP サーバー（Streamable HTTP）のポートはまだランダム。ただし Claude Code は
+  stdio ブリッジ（`tako mcp serve`）経由なので影響なし。直接 HTTP で接続する
+  クライアント向けにはポート固定化が今後の改善点
+- セルフテスト（`TAKO_SELF_TEST=1`）では従来通り一時パス・一時トークンを使用（隔離）
+- 多重起動時は 2 番目以降のインスタンスがフォールバックで一時パスを使用
 
 ## 未着手タスク（優先順はユーザーと相談）
 
@@ -40,6 +36,7 @@ tako にオーケストレーター機能を完全内蔵。外部スクリプト
 
 - **CI（GitHub Actions）はリポ設定で意図的に無効化中**（2026-06-12〜）。コミット前は必ず
   `cargo fmt --all --check`（exit code）を確認する
+- main.rs に未コミットの UI 変更（BoxShadow、padding 等）と terminal.rs の agent metrics 改善が残っている
 
 ## 現フェーズで Read すべき設計書
 

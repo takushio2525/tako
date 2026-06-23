@@ -165,3 +165,9 @@
   MCP 3 ツール + CLI 5 コマンド + デフォルト system prompt 埋め込み + docs（計 40 ツール）
 - 関連コミット: `6d764d7` `b68f190` `243dae6` `c27f5e5`
 - 検証: build / clippy(-D warnings) / fmt / test 全緑
+
+## 2026-06-23（MCP/IPC 再起動耐性の強化）
+- IPC ソケットを固定パス化（`<data_dir>/tako.sock`）、トークンを永続化（`<data_dir>/token`）、
+  persist ON 時の ⌘Q で discovery cleanup を省略。再起動後も同じソケット・トークンで再接続可能に
+- 関連コミット: `8037055` `[改善] MCP/IPC の再起動耐性を強化`
+- 検証: build / clippy(-D warnings) / test 全緑
