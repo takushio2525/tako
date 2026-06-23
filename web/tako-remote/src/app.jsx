@@ -28,11 +28,13 @@ export function App() {
     const sp = new URLSearchParams(window.location.search);
     const host = sp.get('host');
     const token = sp.get('token');
-    if (host && token) {
+    if (token) {
       const machine = sp.get('machine') || `m-${Date.now()}`;
       const name = sp.get('name') || '';
+      const parts = [`token=${encodeURIComponent(token)}`, `machine=${encodeURIComponent(machine)}`, `name=${encodeURIComponent(name)}`];
+      if (host) parts.unshift(`host=${encodeURIComponent(host)}`);
       window.location.replace(
-        `${window.location.pathname}#/connect?host=${encodeURIComponent(host)}&token=${encodeURIComponent(token)}&machine=${encodeURIComponent(machine)}&name=${encodeURIComponent(name)}`
+        `${window.location.pathname}#/connect?${parts.join('&')}`
       );
     }
   }, []);
