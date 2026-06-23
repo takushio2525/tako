@@ -21,3 +21,4 @@ qrcode.workspace = true
 image.workspace = true
 uuid.workspace = true
 rust-embed.workspace = true
+libc.workspace = true

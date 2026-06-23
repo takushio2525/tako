@@ -137,6 +137,15 @@ enum RemoteCommand {
     Stop,
     /// リモートアクセス API サーバーの状態を表示する
     Status,
+    /// [内部用] HTTP サーバーをフォアグラウンドで起動する（start から自動呼び出し）
+    Serve {
+        /// サーバーのポート番号（省略時は 7749）
+        #[arg(long, default_value_t = 7749)]
+        port: u16,
+        /// cloudflared Quick Tunnel を起動しない（LAN のみモード）
+        #[arg(long)]
+        no_tunnel: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -672,6 +681,11 @@ fn main() -> ExitCode {
         Command::Orchestrator(OrchestratorCommand::Projects(ref sub)) => {
             orchestrator_projects_cli(sub)
         }
+        // remote コマンドはローカル処理（IPC 不要）
+        Command::Remote(RemoteCommand::Start { port, no_tunnel }) => remote_start(port, no_tunnel),
+        Command::Remote(RemoteCommand::Stop) => remote_stop(),
+        Command::Remote(RemoteCommand::Status) => remote_status(),
+        Command::Remote(RemoteCommand::Serve { port, no_tunnel }) => remote_serve(port, no_tunnel),
         command => run(command),
     };
     match result {
@@ -949,6 +963,65 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// `tako remote start` — デーモンをバックグラウンドで fork 起動し QR を表示する
+fn remote_start(port: u16, no_tunnel: bool) -> Result<(), String> {
+    let result = tako_control::remote::spawn_daemon(Some(port), no_tunnel)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result).unwrap_or_default()
+    );
+    if let Some(connect) = result["connect_url"].as_str() {
+        match tako_control::remote::generate_qr_png(connect) {
+            Ok(path) => {
+                eprintln!("\nQR コードを生成しました: {}", path.display());
+                // tako-app が起動していれば IPC 経由で OpenFile を送る（エラーは握りつぶす）
+                let _ = send_request(Request::OpenFile {
+                    pane: None,
+                    path: path.display().to_string(),
+                    mode: Some(tako_control::protocol::PreviewModeWire::Image),
+                    direction: None,
+                });
+                eprintln!("スマホでスキャンしてください。");
+            }
+            Err(e) => eprintln!("\nQR コード画像の生成に失敗: {e}"),
+        }
+        eprintln!("URL: {connect}");
+        if let Some(tunnel) = result["tunnel_url"].as_str() {
+            eprintln!("Tunnel: {tunnel}");
+        }
+        if let Some(mid) = result["machine_id"].as_str() {
+            eprintln!("Machine ID: {mid}");
+        }
+    }
+    Ok(())
+}
+
+/// `tako remote stop` — デーモンを PID ファイルから kill する
+fn remote_stop() -> Result<(), String> {
+    let result = tako_control::remote::daemon_stop()?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result).unwrap_or_default()
+    );
+    eprintln!("リモートサーバーを停止しました");
+    Ok(())
+}
+
+/// `tako remote status` — デーモンの状態を表示する
+fn remote_status() -> Result<(), String> {
+    let status = tako_control::remote::daemon_status();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&status).unwrap_or_default()
+    );
+    Ok(())
+}
+
+/// `tako remote serve` — HTTP サーバーをフォアグラウンドで起動する（内部用）
+fn remote_serve(port: u16, no_tunnel: bool) -> Result<(), String> {
+    tako_control::remote::run_daemon(Some(port), no_tunnel).map_err(|e| e.to_string())
 }
 
 fn run(command: Command) -> Result<(), String> {
@@ -1334,12 +1407,8 @@ fn build_request(command: &Command) -> Result<Request, String> {
             session_id: session_id.clone(),
             tmux_session: tmux_session.clone(),
         },
-        Command::Remote(RemoteCommand::Start { port, no_tunnel }) => Request::RemoteStart {
-            port: Some(*port),
-            no_tunnel: *no_tunnel,
-        },
-        Command::Remote(RemoteCommand::Stop) => Request::RemoteStop,
-        Command::Remote(RemoteCommand::Status) => Request::RemoteStatus,
+        // remote コマンドは main() でローカル処理済みのため到達不能
+        Command::Remote(_) => unreachable!("remote は run() を通らない"),
         // main() で分岐済みのため論理的に到達不能
         Command::Mcp(_) => unreachable!("mcp serve は run() を通らない"),
         Command::SetupMcp(_) => unreachable!("setup-mcp は run() を通らない"),
@@ -1494,41 +1563,7 @@ fn print_result(command: &Command, result: &Value) {
                 serde_json::to_string_pretty(result).unwrap_or_default()
             );
         }
-        Command::Remote(RemoteCommand::Start { .. }) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(result).unwrap_or_default()
-            );
-            if let Some(connect) = result["connect_url"].as_str() {
-                match tako_control::remote::generate_qr_png(connect) {
-                    Ok(path) => {
-                        eprintln!("\nQR コードを生成しました: {}", path.display());
-                        // IPC 経由で直接 OpenFile を送る（外部プロセス経由だとペイン解決に失敗する）
-                        let _ = send_request(Request::OpenFile {
-                            pane: None,
-                            path: path.display().to_string(),
-                            mode: Some(tako_control::protocol::PreviewModeWire::Image),
-                            direction: None,
-                        });
-                        eprintln!("スマホでスキャンしてください。");
-                    }
-                    Err(e) => eprintln!("\nQR コード画像の生成に失敗: {e}"),
-                }
-                eprintln!("URL: {connect}");
-                if let Some(tunnel) = result["tunnel_url"].as_str() {
-                    eprintln!("Tunnel: {tunnel}");
-                }
-                if let Some(mid) = result["machine_id"].as_str() {
-                    eprintln!("Machine ID: {mid}");
-                }
-            }
-        }
-        Command::Remote(_) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(result).unwrap_or_default()
-            );
-        }
+        // remote は run() → print_result を通らない
         _ => {}
     }
 }
