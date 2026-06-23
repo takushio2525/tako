@@ -227,7 +227,7 @@ pub fn session_alive(socket: Option<&str>, session: &str) -> bool {
 /// ペイン側の CJK 対策（LC_CTYPE=UTF-8 既定注入）と同じ Terminal.app 方式で、
 /// クライアント側にも UTF-8 を明示する。LC_ALL は LC_CTYPE より優先されるため、
 /// 親から C が継承されても効くよう除去する
-pub(crate) fn tmux_command(socket: Option<&str>) -> Command {
+pub fn tmux_command(socket: Option<&str>) -> Command {
     let mut command = Command::new(tmux_bin());
     command.env_remove("LC_ALL").env("LC_CTYPE", "UTF-8");
     if let Some(name) = socket {
