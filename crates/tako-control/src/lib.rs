@@ -33,3 +33,33 @@ pub fn generate_token() -> std::io::Result<String> {
         .map_err(|e| std::io::Error::other(format!("CSPRNG が使えない: {e}")))?;
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
+
+/// 永続トークンを読み込むか、存在しなければ生成して保存する。
+/// 再起動をまたいで同じトークンを使うことで、tmux セッション内の既存クライアント
+/// （古い TAKO_TOKEN 環境変数を持つ）がそのまま再接続できる。
+/// セルフテスト中は永続ファイルに触れず一時トークンを返す
+pub fn load_or_create_token() -> std::io::Result<String> {
+    if std::env::var_os("TAKO_SELF_TEST").is_some() {
+        return generate_token();
+    }
+    let Some(path) = tako_core::paths::data_dir().map(|d| d.join("token")) else {
+        return generate_token();
+    };
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        let token = content.trim().to_string();
+        if token.len() >= 32 {
+            return Ok(token);
+        }
+    }
+    let token = generate_token()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, &token)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(token)
+}

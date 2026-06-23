@@ -833,7 +833,7 @@ impl TakoApp {
         // ルートペインのシェルにも TAKO_SOCKET / TAKO_MCP_URL / TAKO_TOKEN を注入できるようにする。
         // 認証トークンは両者で共有する（FR-2.3.4）
         let (control_tx, mut control_rx) = unbounded::<IncomingRequest>();
-        let token = match tako_control::generate_token() {
+        let token = match tako_control::load_or_create_token() {
             Ok(token) => Some(token),
             Err(e) => {
                 eprintln!("warning: 認証トークンを生成できない（IPC / MCP は使えない）: {e}");
@@ -9189,10 +9189,14 @@ impl Render for TakoApp {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &Quit, _, cx| {
-                // 終了直前の構成を保存してから抜ける（Phase 5.5。セッションは残る = 永続化）。
-                // 接続情報は片付け、死んだ接続先を CLI の候補に残さない（バグ (8)）
+                // 終了直前の構成を保存してから抜ける（Phase 5.5。セッションは残る = 永続化）
                 this.save_layout();
-                tako_control::discovery::cleanup(std::process::id());
+                // persist ON（セッション生存）なら接続情報を残す: ソケットパス・トークンが
+                // 再起動後も同一のため、既存クライアントがそのまま再接続できる。
+                // persist OFF なら旧来通り片付け（死んだ接続先を CLI の候補に残さない）
+                if !this.tmux_persist {
+                    tako_control::discovery::cleanup(std::process::id());
+                }
                 cx.quit()
             }))
             .on_action(cx.listener(|this, _: &ActivateTab1, _, cx| this.activate_tab_index(0, cx)))

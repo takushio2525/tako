@@ -77,14 +77,38 @@ mod unix_imp {
     use super::{IncomingRequest, IpcServer};
     use crate::protocol::{error_code, RequestEnvelope, ResponseEnvelope};
 
+    /// PID ベースの一時ソケットパス（テスト・セルフテスト・多重起動フォールバック用）
+    fn temp_socket_path() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("tako-{}-{seq}.sock", std::process::id()))
+    }
+
+    /// 再起動をまたいで安定するソケットパスを決定する。
+    /// - 単体テスト / セルフテスト: 一時パス（他インスタンスと衝突回避）
+    /// - 通常起動: `<data_dir>/tako.sock`（固定。既存クライアントがそのまま再接続可能）
+    /// - 別インスタンスが生きている: フォールバックで一時パス
+    fn preferred_socket_path() -> std::path::PathBuf {
+        if cfg!(test) || std::env::var_os("TAKO_SELF_TEST").is_some() {
+            return temp_socket_path();
+        }
+        if let Some(well_known) = tako_core::paths::data_dir().map(|d| d.join("tako.sock")) {
+            if well_known.exists() && UnixStream::connect(&well_known).is_ok() {
+                return temp_socket_path();
+            }
+            return well_known;
+        }
+        temp_socket_path()
+    }
+
     pub(super) fn start(
         tx: UnboundedSender<IncomingRequest>,
         token: String,
     ) -> std::io::Result<IpcServer> {
-        // pid + プロセス内連番でユニーク化（テスト等で複数サーバーを立てても衝突しない）
-        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("tako-{}-{seq}.sock", std::process::id()));
+        let path = preferred_socket_path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
         // 前回残骸（クラッシュ等で remove されなかったもの）を除去
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path)?;
