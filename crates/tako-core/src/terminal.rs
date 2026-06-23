@@ -550,6 +550,153 @@ impl TerminalSession {
             .map(|l| l.text.trim_end().to_string())
             .collect()
     }
+
+    /// Claude TUI のフッターからエージェントメトリクスを抽出する。
+    /// alt screen（TUI モード）のペインの末尾数行を走査し、
+    /// `ctx NN%` や usage 情報をパースする
+    pub fn agent_metrics(&self) -> Option<AgentMetrics> {
+        if !self.is_alt_screen() {
+            return None;
+        }
+        let lines = self.visible_lines();
+        parse_agent_metrics(&lines)
+    }
+}
+
+/// Claude TUI フッターから抽出したエージェントメトリクス
+#[derive(Debug, Clone, Default)]
+pub struct AgentMetrics {
+    /// コンテキスト使用率（0–100）
+    pub ctx_percent: Option<u32>,
+    /// usage 表示テキスト（例: "5h 23%", "$1.23" 等）
+    pub usage_text: Option<String>,
+}
+
+/// 画面行リストから Claude TUI フッターのメトリクスをパースする
+fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
+    // Claude TUI のフッターは画面末尾 5 行以内にある
+    let scan_lines = lines.iter().rev().take(5);
+    let mut ctx_percent = None;
+    let mut usage_text = None;
+
+    for line in scan_lines {
+        // `ctx NN%` パターン（プログレスバー文字を含む行）
+        if ctx_percent.is_none() {
+            if let Some(pos) = line.find("ctx") {
+                let after = &line[pos + 3..];
+                // "ctx" の後の空白・バー文字をスキップして数字を探す
+                if let Some(pct) = extract_percent(after) {
+                    ctx_percent = Some(pct.min(100));
+                }
+            }
+        }
+
+        // usage パターン: `Nh NN%` (時間残量) や `$N.NN` (コスト) やトークン数 `NNNk`
+        if usage_text.is_none() {
+            // `Nh NN%` パターン (e.g. "5h 23%")
+            if let Some(usage) = extract_usage_text(line) {
+                usage_text = Some(usage);
+            }
+        }
+    }
+
+    if ctx_percent.is_none() && usage_text.is_none() {
+        return None;
+    }
+    Some(AgentMetrics {
+        ctx_percent,
+        usage_text,
+    })
+}
+
+/// 文字列から最初のパーセント値を抽出する（"  45%" → 45）
+fn extract_percent(s: &str) -> Option<u32> {
+    let mut num_start = None;
+    for (i, ch) in s.char_indices() {
+        if ch.is_ascii_digit() {
+            if num_start.is_none() {
+                num_start = Some(i);
+            }
+        } else if ch == '%' {
+            if let Some(start) = num_start {
+                return s[start..i].parse().ok();
+            }
+        } else if num_start.is_some() && !ch.is_ascii_digit() {
+            // 数字列が途切れたら（バー文字等）リセット
+            num_start = None;
+        }
+    }
+    None
+}
+
+/// Claude TUI フッター行から usage テキストを抽出する。
+/// パターン: `Nh NN%` / `$N.NN` / `NNNk tokens` / `NNN.Nk`
+fn extract_usage_text(line: &str) -> Option<String> {
+    // `Nh NN%` パターン（最も一般的な usage 表示）
+    let chars: Vec<char> = line.chars().collect();
+    for i in 0..chars.len() {
+        // Nh パターン: 数字 + 'h' + 空白 + 数字 + '%'
+        if chars[i].is_ascii_digit() {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == 'h' {
+                let h_pos = j;
+                j += 1;
+                // 空白スキップ
+                while j < chars.len() && chars[j] == ' ' {
+                    j += 1;
+                }
+                let pct_start = j;
+                while j < chars.len() && chars[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j < chars.len() && chars[j] == '%' && j > pct_start {
+                    let text: String = chars[i..=j].iter().collect();
+                    return Some(text);
+                }
+                // `Nh` だけでも有用
+                if h_pos > i {
+                    // もう少し先にコスト表示がある場合: `5h $1.23`
+                    let mut k = h_pos + 1;
+                    while k < chars.len() && chars[k] == ' ' {
+                        k += 1;
+                    }
+                    if k < chars.len() && chars[k] == '$' {
+                        let cost_start = k;
+                        k += 1;
+                        while k < chars.len()
+                            && (chars[k].is_ascii_digit() || chars[k] == '.')
+                        {
+                            k += 1;
+                        }
+                        if k > cost_start + 1 {
+                            let text: String = chars[i..k].iter().collect();
+                            return Some(text);
+                        }
+                    }
+                }
+            }
+        }
+
+        // `$N.NN` コスト表示（単独）
+        if chars[i] == '$' {
+            let mut j = i + 1;
+            let mut has_digit = false;
+            while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == '.') {
+                if chars[j].is_ascii_digit() {
+                    has_digit = true;
+                }
+                j += 1;
+            }
+            if has_digit && j > i + 1 {
+                let text: String = chars[i..j].iter().collect();
+                return Some(text);
+            }
+        }
+    }
+    None
 }
 
 impl Drop for TerminalSession {
@@ -847,5 +994,40 @@ mod tests {
         // 空文字は無視（親 cwd 継承へフォールバック）
         assert_eq!(home_from(Some(OsString::new()), None), None);
         assert_eq!(home_from(None, None), None);
+    }
+
+    #[test]
+    fn agent_metricsのctxパース() {
+        // Claude TUI 典型フッター（プログレスバー文字を含む）
+        let lines = vec![
+            "some output".into(),
+            "".into(),
+            " ❯ ".into(),
+            " Auto  5h 23%   ctx 45% ████░░░░░░  128K/200K".into(),
+        ];
+        let m = parse_agent_metrics(&lines).unwrap();
+        assert_eq!(m.ctx_percent, Some(45));
+        assert_eq!(m.usage_text.as_deref(), Some("5h 23%"));
+    }
+
+    #[test]
+    fn agent_metricsのctxのみ() {
+        let lines = vec!["ctx 92%".into()];
+        let m = parse_agent_metrics(&lines).unwrap();
+        assert_eq!(m.ctx_percent, Some(92));
+    }
+
+    #[test]
+    fn agent_metricsのコスト表示() {
+        let lines = vec!["  $1.23  ctx 50%".into()];
+        let m = parse_agent_metrics(&lines).unwrap();
+        assert_eq!(m.ctx_percent, Some(50));
+        assert_eq!(m.usage_text.as_deref(), Some("$1.23"));
+    }
+
+    #[test]
+    fn agent_metricsの該当なし() {
+        let lines = vec!["normal shell output".into(), "$ ls".into()];
+        assert!(parse_agent_metrics(&lines).is_none());
     }
 }

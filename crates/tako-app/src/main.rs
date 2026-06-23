@@ -35,9 +35,9 @@ use gpui::{
 use gpui_platform::application;
 use tako_control::{ControlHost, IncomingRequest, IpcServer, McpServer};
 use tako_core::{
-    ratio_for_position, CommandState, Pane, PaneId, PaneOrigin, Rect, SelectionKind, SessionNotice,
-    SpawnOptions, SplitAxis, SplitDirection, TabId, TerminalSession, Theme, TitleSource, Workspace,
-    WorkspaceError,
+    ratio_for_position, AgentMetrics, CommandState, Pane, PaneId, PaneOrigin, Rect, SelectionKind,
+    SessionNotice, SpawnOptions, SplitAxis, SplitDirection, TabId, TerminalSession, Theme,
+    TitleSource, Workspace, WorkspaceError,
 };
 
 /// 新規セッションの初期グリッド。最初の render で実寸へリサイズされる
@@ -514,6 +514,8 @@ struct TakoApp {
     video_players: HashMap<PaneId, video_player::VideoPlayer>,
     /// 動画フレーム更新ティッカーの稼働中フラグ（再生中ペインがある間だけ回す）
     video_ticker: bool,
+    /// 全ペインから集約した Claude エージェントメトリクス（ctx/usage。ポーリングで更新）
+    agent_metrics: AgentMetrics,
     /// 動画フレームの描画キャッシュ（frame_gen で世代管理: 新フレーム準備完了まで前フレームを表示）
     video_frame_cache: HashMap<PaneId, (u64, std::sync::Arc<gpui::RenderImage>)>,
     /// シークバー要素の実測 bounds（paint 時に canvas で記録）
@@ -965,6 +967,7 @@ impl TakoApp {
             hover_preview: None,
             pinned_previews: Vec::new(),
             dragging_pin: None,
+            agent_metrics: AgentMetrics::default(),
             video_players: HashMap::new(),
             video_ticker: false,
             video_frame_cache: HashMap::new(),
@@ -1131,6 +1134,7 @@ impl TakoApp {
                     None
                 };
                 app.sync_filetree_roots();
+                app.refresh_agent_metrics();
                 app.save_layout();
                 let filetree_targets = if app.filetree.visible {
                     Some(app.filetree.refresh_targets())
@@ -4239,6 +4243,37 @@ impl TakoApp {
         self.filetree.set_roots(roots);
     }
 
+    /// 全ペインから Claude TUI のメトリクス（ctx%/usage）を収集・更新する
+    fn refresh_agent_metrics(&mut self) {
+        let mut best: Option<AgentMetrics> = None;
+        // フォーカスペインを優先し、なければ他の alt_screen ペインから取得
+        let focused = self.workspace.active_tab().tree().focused();
+        let pane_ids: Vec<PaneId> = std::iter::once(focused)
+            .chain(
+                self.workspace
+                    .tabs()
+                    .iter()
+                    .flat_map(|tab| tab.tree().panes().into_iter().map(|p| p.id()))
+                    .filter(|id| *id != focused),
+            )
+            .collect();
+        for pid in pane_ids {
+            if let Some(session) = self.terminals.get(&pid) {
+                if let Some(m) = session.agent_metrics() {
+                    if m.ctx_percent.is_some() || m.usage_text.is_some() {
+                        best = Some(m);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(m) = best {
+            self.agent_metrics = m;
+        } else {
+            self.agent_metrics = AgentMetrics::default();
+        }
+    }
+
     /// 左サイドバーのファイルツリー（FR-3.1。非表示なら None = 純粋なターミナル FR-3.7）。
     /// 「タブ = ワークスペース」: タブ内全ペインの cwd がワークスペースフォルダとして並ぶ
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
@@ -6492,18 +6527,8 @@ impl TakoApp {
                 None
             }
         };
-        // コンテキストメーター（フォーカスペインの scrollback 使用率で近似表示）
-        let ctx_pct = {
-            let focused = self.workspace.active_tab().tree().focused();
-            self.terminals
-                .get(&focused)
-                .map(|s| {
-                    let max_history = 10000_f32;
-                    let used = s.history_size() as f32;
-                    ((used / max_history) * 100.0).min(100.0) as u32
-                })
-                .unwrap_or(0)
-        };
+        // コンテキストメーター（Claude TUI フッターからの実データ）
+        let ctx_pct = self.agent_metrics.ctx_percent.unwrap_or(0);
         let ctx_bar_color = if ctx_pct >= 90 {
             theme.red
         } else if ctx_pct >= 70 {
@@ -6512,6 +6537,7 @@ impl TakoApp {
             theme.accent
         };
         let ctx_fill_frac = ctx_pct as f32 / 100.0;
+        let usage_text = self.agent_metrics.usage_text.clone();
 
         div()
             .flex()
@@ -6577,6 +6603,31 @@ impl TakoApp {
                     )
             }))
             .child(div().flex_grow(1.0))
+            // usage 表示（Claude TUI フッターからの検出値）
+            .children(usage_text.map(|text| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .h_full()
+                    .px_2()
+                    .border_r_1()
+                    .border_color(hsla(theme.border_subtle))
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(hsla(theme.tab_inactive_foreground))
+                            .child("usage"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .font_family("Monaco")
+                            .text_color(hsla(theme.teal))
+                            .child(SharedString::from(text)),
+                    )
+            }))
             // コンテキストメーター
             .child(
                 div()
@@ -6612,6 +6663,7 @@ impl TakoApp {
                     .child(
                         div()
                             .text_size(px(10.5))
+                            .font_family("Monaco")
                             .text_color(hsla(theme.tab_active_foreground))
                             .child(SharedString::from(format!("{ctx_pct}%"))),
                     ),
