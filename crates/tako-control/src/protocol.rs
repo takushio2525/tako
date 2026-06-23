@@ -131,6 +131,9 @@ pub enum Request {
         ratio: Option<f32>,
         command: Option<Vec<String>>,
         cwd: Option<String>,
+        /// 新ペインにフォーカスを移すか（省略時は false = 分割元を維持）
+        #[serde(default)]
+        focus: Option<bool>,
     },
     /// ペイン削除（FR-2.5.4。呼び出し元自身の削除 = 自己片付けを含む）
     Close { pane: Option<u64> },
@@ -465,6 +468,7 @@ mod tests {
                 ratio: None,
                 command: Some(vec!["npm".into(), "run".into(), "dev".into()]),
                 cwd: None,
+                focus: None,
             },
         );
         let json = serde_json::to_string(&envelope).unwrap();

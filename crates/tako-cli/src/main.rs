@@ -401,6 +401,9 @@ struct SplitArgs {
     /// 新ペインの作業ディレクトリ
     #[arg(long)]
     cwd: Option<String>,
+    /// 新ペインにフォーカスを移す（省略時は分割元を維持）
+    #[arg(long)]
+    focus: bool,
     /// シェルの代わりに実行するコマンド（`--` の後に指定）
     #[arg(last = true)]
     command: Vec<String>,
@@ -1065,6 +1068,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 ratio: args.ratio,
                 command: (!args.command.is_empty()).then(|| args.command.clone()),
                 cwd: args.cwd.clone(),
+                focus: Some(args.focus),
             }
         }
         Command::Send(args) => Request::Send {
@@ -1692,6 +1696,7 @@ mod tests {
                 ratio: Some(0.3),
                 command: Some(vec!["npm".into(), "run".into(), "dev".into()]),
                 cwd: None,
+                focus: Some(false),
             }
         );
     }

@@ -203,6 +203,7 @@ pub fn dispatch(
             ratio,
             command,
             cwd,
+            focus,
         } => {
             // tab 指定時はそのタブのフォーカス中ペインを基準にする（active tab 非依存）
             let (tab, target) = if let Some(tab_raw) = tab {
@@ -244,6 +245,10 @@ pub fn dispatch(
                 env: Vec::new(),
             };
             host.attach_session(new_id, options);
+            // MCP/CLI 経由のデフォルトはフォーカスを移さない（ユーザーの入力を奪わない）
+            if !focus.unwrap_or(false) {
+                let _ = tree_mut(host.workspace_mut(), tab).focus(target);
+            }
             Ok(json!({ "pane": new_id.as_u64() }))
         }
 
@@ -575,6 +580,8 @@ pub fn dispatch(
                     new_pane,
                 )
                 .map_err(op_err)?;
+            // MCP/CLI 経由ではフォーカスを分割元に維持（ユーザーの入力を奪わない）
+            let _ = tree_mut(host.workspace_mut(), tab).focus(target);
             // 元セッションの解決（無限ネスト防止 = 今回の根治）。tmux はグループ名を
             // 「最初に作られた元セッション名」にするため、`tako-view-*` ラッパーや grouped
             // session を開こうとしても group を辿れば必ず元へ戻る。
@@ -1487,6 +1494,8 @@ fn dispatch_orchestrator_spawn(
     tree_mut(host.workspace_mut(), tab)
         .split_with_ratio(target, SplitDirection::Right, 0.45, new_pane)
         .map_err(op_err)?;
+    // MCP/CLI 経由ではフォーカスを分割元に維持（ユーザーの入力を奪わない）
+    let _ = tree_mut(host.workspace_mut(), tab).focus(target);
     let options = SpawnOptions {
         command: None,
         cwd: Some(std::path::PathBuf::from(&cwd)),
@@ -2186,6 +2195,7 @@ mod tests {
                 ratio: None,
                 command: None,
                 cwd: None,
+                focus: None,
             },
             PaneOrigin::Cli,
         )
@@ -2233,6 +2243,7 @@ mod tests {
                 ratio: None,
                 command: None,
                 cwd: None,
+                focus: None,
             },
             PaneOrigin::Mcp,
         )
@@ -2324,7 +2335,19 @@ mod tests {
         let mut host = MockHost::new();
         let root = host.root_pane();
         let new_id = split(&mut host, root);
-        // split 後のフォーカスは新ペイン（右側）。左へ戻る
+        // dispatch 経由の split はフォーカスを分割元（左側 = root）に維持する。
+        // 右へ移動すると新ペインにフォーカスが移る
+        let result = dispatch(
+            &mut host,
+            Request::Focus {
+                pane: None,
+                direction: Some(Direction::Right),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["focused"].as_u64(), Some(new_id));
+        // 左へ戻ると root に戻る
         let result = dispatch(
             &mut host,
             Request::Focus {
@@ -2346,7 +2369,6 @@ mod tests {
         )
         .unwrap();
         assert!(result["focused"].is_null());
-        let _ = new_id;
     }
 
     #[test]
@@ -2632,7 +2654,8 @@ mod tests {
         assert_eq!(new_pane["title"].as_str(), Some("worker"));
         assert_eq!(new_pane["role"].as_str(), Some("dev-server"));
         assert_eq!(new_pane["origin"].as_str(), Some("cli"));
-        assert_eq!(new_pane["focused"].as_bool(), Some(true));
+        // dispatch 経由の split はフォーカスを移さない（分割元を維持）
+        assert_eq!(new_pane["focused"].as_bool(), Some(false));
         assert!((new_pane["rect"]["x"].as_f64().unwrap() - 0.5).abs() < 1e-5);
         // ツリー構造（ルートが split で leaf を 2 つ持つ）
         assert_eq!(tabs[0]["tree"]["type"].as_str(), Some("split"));

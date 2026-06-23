@@ -187,6 +187,11 @@ pub fn tools() -> Vec<Value> {
                             終了するとペインも閉じる。省略時は対話シェルが起動する",
                     },
                     "cwd": { "type": "string", "description": "新ペインの作業ディレクトリ" },
+                    "focus": {
+                        "type": "boolean",
+                        "description": "新ペインにフォーカスを移すか（省略時は false = 分割元を維持。\
+                            ユーザーの入力中にフォーカスを奪わない）",
+                    },
                 },
                 "additionalProperties": false,
             },
@@ -928,6 +933,7 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
                 ratio: f32_arg(args, "ratio")?,
                 command: str_vec_arg(args, "command")?.filter(|c| !c.is_empty()),
                 cwd: str_arg(args, "cwd")?,
+                focus: bool_arg(args, "focus")?,
             }
         }
         "tako_send_input" => Request::Send {
@@ -1630,6 +1636,7 @@ mod tests {
                 ratio: None,
                 command: None,
                 cwd: None,
+                focus: None,
             }]
         );
         let result = &response.unwrap()["result"];
