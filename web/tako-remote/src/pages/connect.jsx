@@ -8,7 +8,6 @@ export function ConnectPage({ params }) {
   const [detail, setDetail] = useState('');
 
   async function tryConnect(host, token, id, name) {
-    // まず直接接続を試みる
     setDetail('接続を確認中...');
     try {
       const client = createClient(host, token);
@@ -22,7 +21,6 @@ export function ConnectPage({ params }) {
       // 直接接続失敗 → KV リレー経由で最新 URL を取得
     }
 
-    // machine ID がある場合、KV リレーから最新 URL を resolve
     if (id) {
       setDetail('最新の接続先を検索中...');
       const resolved = await resolveHost(id);
@@ -41,7 +39,6 @@ export function ConnectPage({ params }) {
       }
     }
 
-    // 両方失敗 → エラー表示（マシン情報は保存しておく）
     addMachine({ id, name, host, token });
     setStatus('error');
     setError('接続に失敗しました。Mac で tako remote start が実行中か確認してください。');
@@ -87,18 +84,17 @@ export function ConnectPage({ params }) {
            status === 'connected' ? '接続完了' : '接続エラー'}
         </h1>
         {status === 'connecting' && detail && (
-          <p class="detail-text">{detail}</p>
+          <p style="color: var(--text-muted); font-size: 13px; font-family: var(--mono); margin-top: 8px;">
+            {detail}
+          </p>
         )}
         {error && <p class="error-text">{error}</p>}
         {status === 'error' && (
           <div class="connect-actions">
-            <button class="btn" onClick={retry}>再試行</button>
+            <button class="btn btn-primary" onClick={retry}>再試行</button>
             <button class="btn" onClick={() => { window.location.hash = '#/'; }}>
               マシン一覧
             </button>
-            <p class="hint-text">
-              接続先が変わった場合は、Mac で QR コードを再表示してスキャンしてください
-            </p>
           </div>
         )}
       </div>

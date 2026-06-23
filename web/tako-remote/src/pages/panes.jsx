@@ -4,19 +4,43 @@ import { createClient } from '../api';
 
 function SkeletonCard() {
   return (
-    <div class="pane-card skeleton-card">
+    <div class="pane-card skeleton-card" style="opacity: .5;">
       <div class="pane-card-header">
-        <span class="skeleton skeleton-dot" />
-        <span class="skeleton skeleton-text" style="width: 60%" />
-        <span class="skeleton skeleton-text" style="width: 30px" />
+        <div class="pane-card-left">
+          <span class="skeleton skeleton-dot" />
+          <span class="skeleton skeleton-text" style="width: 120px" />
+        </div>
+        <span class="skeleton skeleton-text" style="width: 40px" />
       </div>
       <div class="pane-card-preview">
-        <div class="skeleton skeleton-line" />
-        <div class="skeleton skeleton-line" style="width: 80%" />
-        <div class="skeleton skeleton-line" style="width: 50%" />
+        <div class="pane-card-preview-box">
+          <div class="skeleton skeleton-line" />
+          <div class="skeleton skeleton-line" style="width: 80%" />
+          <div class="skeleton skeleton-line" style="width: 50%" />
+        </div>
+      </div>
+      <div class="pane-card-footer">
+        <span class="skeleton skeleton-text" style="width: 60px" />
+        <span class="skeleton skeleton-text" style="width: 40px" />
       </div>
     </div>
   );
+}
+
+function stateOf(p) {
+  if (p.state === 'error' || p.exit_code) return 'error';
+  if (p.state === 'busy' || p.state === 'needs_input') return 'busy';
+  if (p.state === 'running') return 'running';
+  return 'idle';
+}
+
+function stateLabel(st) {
+  switch (st) {
+    case 'error': return 'exit 1';
+    case 'busy': return 'NEEDS INPUT';
+    case 'running': return 'running';
+    default: return 'idle';
+  }
 }
 
 const PULL_THRESHOLD = 80;
@@ -28,6 +52,7 @@ export function PanesPage() {
   const [error, setError] = useState(null);
   const [pulling, setPulling] = useState(false);
   const [pullY, setPullY] = useState(0);
+  const [filter, setFilter] = useState('all');
   const machine = getActiveMachine();
   const timerRef = useRef(null);
   const touchStartRef = useRef({ y: 0, scrollTop: 0 });
@@ -62,7 +87,6 @@ export function PanesPage() {
     return () => clearInterval(timerRef.current);
   }, []);
 
-  // プルダウンリフレッシュ
   function onTouchStart(e) {
     const el = listRef.current;
     touchStartRef.current = { y: e.touches[0].clientY, scrollTop: el?.scrollTop || 0 };
@@ -90,27 +114,50 @@ export function PanesPage() {
 
   if (!machine) return null;
 
+  const counts = { all: panes.length, busy: 0, running: 0, idle: 0, error: 0 };
+  panes.forEach(p => { counts[stateOf(p)]++; });
+  const filtered = filter === 'all' ? panes : panes.filter(p => stateOf(p) === filter);
+
   return (
     <div class="page">
-      <header class="page-header">
-        <button class="back-btn" onClick={() => { window.location.hash = '#/'; }}>
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
-        </button>
-        <div>
-          <h1>{machine.name}</h1>
-          <p class="subtitle">{loading ? '読み込み中...' : `${panes.length} ペイン`}</p>
+      <div class="panes-header" style={`padding-top: calc(8px + env(safe-area-inset-top, 0px))`}>
+        <div class="panes-header-row">
+          <div class="machine-chip" onClick={() => { window.location.hash = '#/'; }}>
+            <span class="dot online" style="width: 7px; height: 7px;" />
+            <span class="chip-name">{machine.name}</span>
+            <span class="chip-arrow">▾</span>
+          </div>
         </div>
-      </header>
+        <div style="display: flex; gap: 7px; overflow-x: auto;">
+          <button class={`filter-chip${filter === 'all' ? ' active' : ''}`} onClick={() => setFilter('all')}>
+            all {counts.all}
+          </button>
+          {counts.busy > 0 && (
+            <button class={`filter-chip${filter === 'busy' ? ' active' : ''}`} onClick={() => setFilter('busy')}>
+              <span class="chip-dot" style="background: var(--warning);" />
+              needs you {counts.busy}
+            </button>
+          )}
+          {counts.running > 0 && (
+            <button class={`filter-chip${filter === 'running' ? ' active' : ''}`} onClick={() => setFilter('running')}>
+              <span class="chip-dot" style="background: var(--success);" />
+              running {counts.running}
+            </button>
+          )}
+          {counts.error > 0 && (
+            <button class={`filter-chip${filter === 'error' ? ' active' : ''}`} onClick={() => setFilter('error')}>
+              <span class="chip-dot" style="background: var(--danger);" />
+              failed {counts.error}
+            </button>
+          )}
+        </div>
+      </div>
 
-      {pulling && (
-        <div class="pull-indicator"><div class="spinner" /></div>
-      )}
+      {pulling && <div class="pull-indicator"><div class="spinner" /></div>}
 
       {loading ? (
-        <div class="card-list">
-          <SkeletonCard />
-          <SkeletonCard />
-          <SkeletonCard />
+        <div class="card-list" style="padding-top: 14px;">
+          <SkeletonCard /><SkeletonCard /><SkeletonCard />
         </div>
       ) : error ? (
         <div class="center-fill">
@@ -129,23 +176,35 @@ export function PanesPage() {
           onTouchStart={onTouchStart}
           onTouchMove={onTouchMove}
           onTouchEnd={onTouchEnd}
-          style={pullY > 0 ? `transform: translateY(${pullY}px)` : ''}
+          style={`padding-top: 14px;${pullY > 0 ? ` transform: translateY(${pullY}px)` : ''}`}
         >
-          {panes.map(p => (
-            <div key={p.id} class="pane-card" onClick={() => { window.location.hash = `#/panes/${p.id}`; }}>
-              <div class="pane-card-header">
-                <span class={`dot ${p.state || 'idle'}`} />
-                <span class="pane-card-title">{p.title || `Pane ${p.id}`}</span>
-                <span class="pane-card-id">#{p.id}</span>
+          {filtered.map(p => {
+            const st = stateOf(p);
+            return (
+              <div key={p.id} class={`pane-card state-${st}`} onClick={() => { window.location.hash = `#/panes/${p.id}`; }}>
+                <div class="edge-bar" />
+                <div class="pane-card-header">
+                  <div class="pane-card-left">
+                    <span class={`dot ${st === 'busy' ? 'busy' : st === 'running' ? 'running' : st === 'error' ? 'error' : 'idle'}`} />
+                    <span class="pane-card-title">{p.title || `Pane ${p.id}`}</span>
+                  </div>
+                  <span class="state-badge">{stateLabel(st)}</span>
+                </div>
+                <div class="pane-card-preview">
+                  <div class="pane-card-preview-box">
+                    {(previews[p.id] || []).map((line, i) => (
+                      <div key={i} class="mono-line">{line || ' '}</div>
+                    ))}
+                    {!previews[p.id] && <div class="mono-line faded">...</div>}
+                  </div>
+                </div>
+                <div class="pane-card-footer">
+                  <span class="footer-meta">#{p.id}</span>
+                  <span class="footer-action">{st === 'busy' ? 'respond →' : 'view →'}</span>
+                </div>
               </div>
-              <div class="pane-card-preview">
-                {(previews[p.id] || []).map((line, i) => (
-                  <div key={i} class="mono-line">{line || ' '}</div>
-                ))}
-                {!previews[p.id] && <div class="mono-line faded">読み込み中...</div>}
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
