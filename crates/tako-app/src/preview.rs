@@ -194,14 +194,6 @@ pub fn image_format_from_path(path: &Path) -> Option<ImageFileFormat> {
     }
 }
 
-#[allow(dead_code)]
-pub fn is_pdf_path(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some(ext) if ext.eq_ignore_ascii_case("pdf")
-    )
-}
-
 const MAX_IMAGE_BYTES: usize = 50_000_000; // 50 MB
 
 /// 画像ファイルを読み込む（生バイト。デコードは GPUI 側）
@@ -275,17 +267,6 @@ pub fn load_pdf(path: &Path, _page: usize) -> PreviewState {
             truncated: false,
         }
     }
-}
-
-#[allow(dead_code)]
-pub fn is_video_path(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some(ext) if matches!(
-            ext.to_ascii_lowercase().as_str(),
-            "mp4" | "webm" | "mov" | "avi" | "mkv"
-        )
-    )
 }
 
 /// 動画ファイルのプレビュー読み込み（ffmpeg でサムネイル抽出 + メタ情報取得）
@@ -1113,6 +1094,23 @@ pub fn markdown_blocks(text: &str) -> Vec<MdBlock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_pdf_path(path: &Path) -> bool {
+        matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some(ext) if ext.eq_ignore_ascii_case("pdf")
+        )
+    }
+
+    fn is_video_path(path: &Path) -> bool {
+        matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some(ext) if matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "mp4" | "webm" | "mov" | "avi" | "mkv"
+            )
+        )
+    }
 
     #[test]
     fn rustコードがハイライトされる() {
