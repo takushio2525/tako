@@ -171,3 +171,9 @@
   persist ON 時の ⌘Q で discovery cleanup を省略。再起動後も同じソケット・トークンで再接続可能に
 - 関連コミット: `8037055` `[改善] MCP/IPC の再起動耐性を強化`
 - 検証: build / clippy(-D warnings) / test 全緑
+
+## 2026-06-24（main.rs 大規模リファクタリング — モジュール分割）
+- main.rs（13,736行）から 7 モジュールを分離し 8,359 行へ（39% 削減）。機能変更なし
+- 分離: keybindings / tab_bar / status_bar / drawer / sidebar / right_panel / preview_render
+- 関連コミット: `d0e2eda` `3baca26` `066c4df`
+- 検証: build / clippy(-D warnings) / fmt / test 全緑

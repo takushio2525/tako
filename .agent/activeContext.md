@@ -4,25 +4,18 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-06-23・MCP/IPC 再起動耐性の強化 完了）
+## 現在の対象（2026-06-24・main.rs モジュール分割完了）
 
-tako の MCP サーバーとセッション管理の再起動耐性を改善。
-⌘Q → 再起動で MCP クライアントから全操作不能になる問題を 3 点の変更で解消:
-
-1. **IPC ソケットの固定パス化**: `/tmp/tako-{PID}-{SEQ}.sock` → `<data_dir>/tako.sock`
-2. **認証トークンの永続化**: `<data_dir>/token` に保存し再起動をまたいで再利用
-3. **discovery cleanup の条件化**: persist ON 時の ⌘Q で接続情報を保持
-
-tmux セッション内の既存クライアント（古い TAKO_SOCKET/TAKO_TOKEN 環境変数を持つプロセス）が
-再起動後もそのまま再接続できるようになった。
+tako-app の main.rs（13,736行）を 7 モジュールに分割し 8,359 行（39% 削減）に縮小。
+機能変更なし、全テスト緑。roadmap のタスクチェックボックスを更新済み。
 
 ## 残作業・既知の制約
 
-- MCP HTTP サーバー（Streamable HTTP）のポートはまだランダム。ただし Claude Code は
-  stdio ブリッジ（`tako mcp serve`）経由なので影響なし。直接 HTTP で接続する
-  クライアント向けにはポート固定化が今後の改善点
-- セルフテスト（`TAKO_SELF_TEST=1`）では従来通り一時パス・一時トークンを使用（隔離）
-- 多重起動時は 2 番目以降のインスタンスがフォールバックで一時パスを使用
+- main.rs の残り 8,359 行にはまだ大きなブロックがある（render_pane 約400行、
+  マウス/スクロールハンドラ群、ControlHost 実装、セルフテスト 2,800行 等）
+- `pane_header.rs` は対象が 70 行で保留。`ui_helpers.rs`（共通ユーティリティ抽出）、
+  TakoApp サブ構造体委譲は未着手
+- MCP HTTP ポートのランダム問題は未解決（stdio ブリッジ経由なら影響なし）
 
 ## 未着手タスク（優先順はユーザーと相談）
 
@@ -36,7 +29,6 @@ tmux セッション内の既存クライアント（古い TAKO_SOCKET/TAKO_TOK
 
 - **CI（GitHub Actions）はリポ設定で意図的に無効化中**（2026-06-12〜）。コミット前は必ず
   `cargo fmt --all --check`（exit code）を確認する
-- main.rs に未コミットの UI 変更（BoxShadow、padding 等）と terminal.rs の agent metrics 改善が残っている
 
 ## 現フェーズで Read すべき設計書
 
