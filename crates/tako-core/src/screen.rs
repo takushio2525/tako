@@ -80,7 +80,11 @@ pub fn snapshot<T: EventListener>(term: &Term<T>, theme: &Theme) -> Screen {
 /// tmux copy-mode でスクロール中のバックエンドペインは、tmux が報告する
 /// copy-mode カーソルが画面に固定表示されて不自然なため UI 層が隠す
 /// （2026-06-12 実機フィードバック (b)）
-pub fn snapshot_opts<T: EventListener>(term: &Term<T>, theme: &Theme, show_cursor: bool) -> Screen {
+pub(crate) fn snapshot_opts<T: EventListener>(
+    term: &Term<T>,
+    theme: &Theme,
+    show_cursor: bool,
+) -> Screen {
     let cols = term.columns();
     let rows = term.screen_lines();
     let content = term.renderable_content();

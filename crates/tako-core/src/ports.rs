@@ -68,7 +68,7 @@ pub fn scan(_ttys: &[u64]) -> HashMap<u64, Vec<ListenPort>> {
 
 /// 1 プロセスの LISTEN 中 TCP ポートを列挙する（IPv4 / IPv6。ポートで重複排除）
 #[cfg(target_os = "macos")]
-pub fn listening_ports_of_pid(pid: i32) -> Vec<ListenPort> {
+pub(crate) fn listening_ports_of_pid(pid: i32) -> Vec<ListenPort> {
     let mut ports: Vec<u16> = socket_fds(pid)
         .into_iter()
         .filter_map(|fd| listen_port_of_fd(pid, fd))
@@ -90,7 +90,7 @@ pub fn listening_ports_of_pid(pid: i32) -> Vec<ListenPort> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn listening_ports_of_pid(_pid: i32) -> Vec<ListenPort> {
+pub(crate) fn listening_ports_of_pid(_pid: i32) -> Vec<ListenPort> {
     Vec::new()
 }
 

@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use crate::theme::Rgb;
 
 /// git バイナリの場所（tmux_bin と同パターン、プロセス内 1 回解決）
-pub fn git_bin() -> &'static str {
+pub(crate) fn git_bin() -> &'static str {
     static BIN: OnceLock<String> = OnceLock::new();
     BIN.get_or_init(resolve_git_bin)
 }

@@ -42,7 +42,12 @@ pub use workspace::{BackgroundPane, Workspace, WorkspaceError};
 
 /// 外部バイナリの解決（環境変数 → PATH 直 → 既知パス → ログインシェル）。
 /// `tmux_bin()` / `git_bin()` の共通基盤
-pub fn resolve_bin(env_var: &str, name: &str, version_flag: &str, candidates: &[&str]) -> String {
+pub(crate) fn resolve_bin(
+    env_var: &str,
+    name: &str,
+    version_flag: &str,
+    candidates: &[&str],
+) -> String {
     if let Some(bin) = std::env::var_os(env_var) {
         if !bin.is_empty() {
             return bin.to_string_lossy().into_owned();
