@@ -23,52 +23,16 @@ pub fn tmux_bin() -> &'static str {
 }
 
 fn resolve_tmux_bin() -> String {
-    if let Some(bin) = std::env::var_os("TAKO_TMUX_BIN") {
-        if !bin.is_empty() {
-            return bin.to_string_lossy().into_owned();
-        }
-    }
-    // PATH 直（ターミナルからの起動・開発時はこれで足りる）
-    if Command::new("tmux")
-        .arg("-V")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
-        return "tmux".into();
-    }
-    // 既知の場所（Homebrew arm64 / Intel / MacPorts）
-    for candidate in [
-        "/opt/homebrew/bin/tmux",
-        "/usr/local/bin/tmux",
-        "/opt/local/bin/tmux",
-    ] {
-        if std::path::Path::new(candidate).is_file() {
-            return candidate.into();
-        }
-    }
-    // ログインシェル経由でユーザーの PATH を引く（unix のみ）
-    #[cfg(unix)]
-    {
-        let shell = std::env::var("SHELL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "/bin/sh".into());
-        if let Ok(output) = Command::new(shell)
-            .args(["-l", "-c", "command -v tmux"])
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-        {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !path.is_empty() && std::path::Path::new(&path).is_file() {
-                    return path;
-                }
-            }
-        }
-    }
-    "tmux".into()
+    crate::resolve_bin(
+        "TAKO_TMUX_BIN",
+        "tmux",
+        "-V",
+        &[
+            "/opt/homebrew/bin/tmux",
+            "/usr/local/bin/tmux",
+            "/opt/local/bin/tmux",
+        ],
+    )
 }
 
 /// tmux の 1 window

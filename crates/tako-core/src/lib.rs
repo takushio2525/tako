@@ -39,3 +39,47 @@ pub use terminal::{
 pub use theme::{Rgb, Theme};
 pub use tmux::{TmuxSession, TmuxWindow};
 pub use workspace::{BackgroundPane, Workspace, WorkspaceError};
+
+/// 外部バイナリの解決（環境変数 → PATH 直 → 既知パス → ログインシェル）。
+/// `tmux_bin()` / `git_bin()` の共通基盤
+pub fn resolve_bin(env_var: &str, name: &str, version_flag: &str, candidates: &[&str]) -> String {
+    if let Some(bin) = std::env::var_os(env_var) {
+        if !bin.is_empty() {
+            return bin.to_string_lossy().into_owned();
+        }
+    }
+    if std::process::Command::new(name)
+        .arg(version_flag)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return name.into();
+    }
+    for candidate in candidates {
+        if std::path::Path::new(candidate).is_file() {
+            return (*candidate).into();
+        }
+    }
+    #[cfg(unix)]
+    {
+        let shell = std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/bin/sh".into());
+        if let Ok(output) = std::process::Command::new(shell)
+            .args(["-l", "-c", &format!("command -v {name}")])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() && std::path::Path::new(&path).is_file() {
+                    return path;
+                }
+            }
+        }
+    }
+    name.into()
+}

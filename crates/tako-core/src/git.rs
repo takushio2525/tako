@@ -19,49 +19,16 @@ pub fn git_bin() -> &'static str {
 }
 
 fn resolve_git_bin() -> String {
-    if let Some(bin) = std::env::var_os("TAKO_GIT_BIN") {
-        if !bin.is_empty() {
-            return bin.to_string_lossy().into_owned();
-        }
-    }
-    if Command::new("git")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
-        return "git".into();
-    }
-    for candidate in [
-        "/opt/homebrew/bin/git",
-        "/usr/local/bin/git",
-        "/usr/bin/git",
-    ] {
-        if Path::new(candidate).is_file() {
-            return candidate.into();
-        }
-    }
-    #[cfg(unix)]
-    {
-        let shell = std::env::var("SHELL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "/bin/sh".into());
-        if let Ok(output) = Command::new(shell)
-            .args(["-l", "-c", "command -v git"])
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-        {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !path.is_empty() && Path::new(&path).is_file() {
-                    return path;
-                }
-            }
-        }
-    }
-    "git".into()
+    crate::resolve_bin(
+        "TAKO_GIT_BIN",
+        "git",
+        "--version",
+        &[
+            "/opt/homebrew/bin/git",
+            "/usr/local/bin/git",
+            "/usr/bin/git",
+        ],
+    )
 }
 
 // ──────────────────────── データ構造 ────────────────────────
