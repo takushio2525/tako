@@ -320,15 +320,21 @@ mod tests {
             socket: socket.clone(),
             session: "tako-e2e-scr0".into(),
         };
+        // alt-screen 切替（\033[?1049h）の完了を待つ。
+        // 切替前は history > 0（通常画面のシェル履歴）だが、
+        // alt-screen に入ると history == 0 になる
         let mut state = None;
         for _ in 0..100 {
             state = scroll_state(&target);
-            if state.is_some() {
+            if state.is_some_and(|s| s.history == 0) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        assert!(state.is_some(), "セッションが立ち上がらない");
+        assert!(
+            state.is_some_and(|s| s.history == 0),
+            "alt-screen 切替が完了しない: {state:?}"
+        );
         let after = scroll_by(&target, 5).expect("状態が取れる");
         assert!(!after.in_mode, "履歴ゼロなのに copy-mode に入った");
         // 念のため: その後のキー入力が普通に届く
