@@ -172,6 +172,15 @@ impl PreviewState {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| self.path.display().to_string())
     }
+
+    pub fn error(path: &Path, mode: PreviewMode, message: impl Into<String>) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            mode,
+            content: PreviewContent::Error(message.into()),
+            truncated: false,
+        }
+    }
 }
 
 pub fn is_markdown_path(path: &Path) -> bool {
@@ -200,37 +209,24 @@ const MAX_IMAGE_BYTES: usize = 50_000_000; // 50 MB
 pub fn load_image(path: &Path) -> PreviewState {
     let format = match image_format_from_path(path) {
         Some(f) => f,
-        None => {
-            return PreviewState {
-                path: path.to_path_buf(),
-                mode: PreviewMode::Image,
-                content: PreviewContent::Error("対応していない画像形式".into()),
-                truncated: false,
-            }
-        }
+        None => return PreviewState::error(path, PreviewMode::Image, "対応していない画像形式"),
     };
     match std::fs::read(path) {
-        Ok(bytes) if bytes.len() > MAX_IMAGE_BYTES => PreviewState {
-            path: path.to_path_buf(),
-            mode: PreviewMode::Image,
-            content: PreviewContent::Error(format!(
+        Ok(bytes) if bytes.len() > MAX_IMAGE_BYTES => PreviewState::error(
+            path,
+            PreviewMode::Image,
+            format!(
                 "画像が大きすぎる（{:.1} MB、上限 50 MB）",
                 bytes.len() as f64 / 1_000_000.0
-            )),
-            truncated: false,
-        },
+            ),
+        ),
         Ok(bytes) => PreviewState {
             path: path.to_path_buf(),
             mode: PreviewMode::Image,
             content: PreviewContent::Image(ImageData { bytes, format }),
             truncated: false,
         },
-        Err(e) => PreviewState {
-            path: path.to_path_buf(),
-            mode: PreviewMode::Image,
-            content: PreviewContent::Error(format!("読み込めない: {e}")),
-            truncated: false,
-        },
+        Err(e) => PreviewState::error(path, PreviewMode::Image, format!("読み込めない: {e}")),
     }
 }
 
@@ -249,23 +245,13 @@ pub fn load_pdf(path: &Path, _page: usize) -> PreviewState {
                 }),
                 truncated: false,
             },
-            Err(e) => PreviewState {
-                path: path.to_path_buf(),
-                mode: PreviewMode::Pdf,
-                content: PreviewContent::Error(e),
-                truncated: false,
-            },
+            Err(e) => PreviewState::error(path, PreviewMode::Pdf, e),
         }
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = _page;
-        PreviewState {
-            path: path.to_path_buf(),
-            mode: PreviewMode::Pdf,
-            content: PreviewContent::Error("PDF プレビューは macOS のみ対応".into()),
-            truncated: false,
-        }
+        PreviewState::error(path, PreviewMode::Pdf, "PDF プレビューは macOS のみ対応")
     }
 }
 
@@ -274,12 +260,7 @@ pub fn load_video(path: &Path) -> PreviewState {
     let file_size = match std::fs::metadata(path) {
         Ok(m) => m.len(),
         Err(e) => {
-            return PreviewState {
-                path: path.to_path_buf(),
-                mode: PreviewMode::Video,
-                content: PreviewContent::Error(format!("読み込めない: {e}")),
-                truncated: false,
-            };
+            return PreviewState::error(path, PreviewMode::Video, format!("読み込めない: {e}"));
         }
     };
 
@@ -735,14 +716,7 @@ pub fn load(path: &Path, mode: PreviewMode) -> PreviewState {
     }
     let (text, truncated) = match read_text(path) {
         Ok(pair) => pair,
-        Err(message) => {
-            return PreviewState {
-                path: path.to_path_buf(),
-                mode,
-                content: PreviewContent::Error(message),
-                truncated: false,
-            }
-        }
+        Err(message) => return PreviewState::error(path, mode, message),
     };
     let content = match mode {
         PreviewMode::Markdown => PreviewContent::Markdown(markdown_blocks(&text)),
@@ -772,15 +746,7 @@ pub fn load_fast(path: &Path, mode: PreviewMode) -> (PreviewState, Option<String
     let (text, truncated) = match read_text(path) {
         Ok(pair) => pair,
         Err(message) => {
-            return (
-                PreviewState {
-                    path: path.to_path_buf(),
-                    mode,
-                    content: PreviewContent::Error(message),
-                    truncated: false,
-                },
-                None,
-            );
+            return (PreviewState::error(path, mode, message), None);
         }
     };
     let (content, raw) = match mode {

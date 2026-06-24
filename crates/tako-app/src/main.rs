@@ -2323,7 +2323,7 @@ impl TakoApp {
             Err(WorkspaceError::LastTab) => {
                 let new_pane = Pane::new(PaneOrigin::User);
                 let new_id = new_pane.id();
-                let title = format!("{}", self.workspace.tabs().len() + 1);
+                let title = (self.workspace.tabs().len() + 1).to_string();
                 self.workspace.create_tab(title, new_pane);
                 if let Err(e) = self.spawn_session(new_id, SpawnOptions::default(), cx) {
                     eprintln!("warning: 代替ペインを起動できない: {e}");
@@ -2514,7 +2514,7 @@ impl TakoApp {
     }
 
     fn new_tab(&mut self, cx: &mut Context<Self>) {
-        let title = format!("{}", self.workspace.tabs().len() + 1);
+        let title = (self.workspace.tabs().len() + 1).to_string();
         let pane = Pane::new(PaneOrigin::User);
         let pane_id = pane.id();
         self.workspace.create_tab(title, pane);

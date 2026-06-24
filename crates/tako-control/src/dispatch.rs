@@ -724,7 +724,7 @@ pub fn dispatch(
             let pane = Pane::new(origin);
             let pane_id = pane.id();
             let explicit = title.is_some();
-            let title = title.unwrap_or_else(|| format!("{}", host.workspace().tabs().len() + 1));
+            let title = title.unwrap_or_else(|| (host.workspace().tabs().len() + 1).to_string());
             let tab_id = host.workspace_mut().create_tab(title, pane);
             if explicit {
                 // 明示タイトル付きの作成は手動リネーム扱い（自動リネームに上書きさせない）
