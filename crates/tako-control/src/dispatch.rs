@@ -982,13 +982,7 @@ pub fn dispatch(
                     Ok(json!({ "revealed": path.display().to_string() }))
                 }
                 FileOpKind::OpenTerminal => {
-                    let dir = if path.is_dir() {
-                        path.clone()
-                    } else {
-                        path.parent()
-                            .map(|p| p.to_path_buf())
-                            .unwrap_or(path.clone())
-                    };
+                    let dir = dir_of(&path);
                     let (_, target) = resolve_pane(host.workspace(), pane)?;
                     host.session(target)
                         .ok_or(DispatchError::NoSession(target.as_u64()))?;
@@ -1001,9 +995,7 @@ pub fn dispatch(
                 FileOpKind::Rename => {
                     let new_name =
                         name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
-                    if new_name.is_empty() || new_name.contains('/') || new_name.contains('\\') {
-                        return Err(DispatchError::InvalidParams("無効なファイル名".into()));
-                    }
+                    validate_name(&new_name)?;
                     let parent = path.parent().ok_or(DispatchError::Operation(
                         "親ディレクトリが取得できない".into(),
                     ))?;
@@ -1023,17 +1015,8 @@ pub fn dispatch(
                 FileOpKind::CreateFile => {
                     let file_name =
                         name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
-                    if file_name.is_empty() || file_name.contains('/') || file_name.contains('\\') {
-                        return Err(DispatchError::InvalidParams("無効なファイル名".into()));
-                    }
-                    let parent = if path.is_dir() {
-                        path.clone()
-                    } else {
-                        path.parent()
-                            .map(|p| p.to_path_buf())
-                            .unwrap_or(path.clone())
-                    };
-                    let new_path = parent.join(&file_name);
+                    validate_name(&file_name)?;
+                    let new_path = dir_of(&path).join(&file_name);
                     if new_path.exists() {
                         return Err(DispatchError::Operation(format!(
                             "既に存在する: {}",
@@ -1048,17 +1031,8 @@ pub fn dispatch(
                 FileOpKind::CreateDir => {
                     let dir_name =
                         name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
-                    if dir_name.is_empty() || dir_name.contains('/') || dir_name.contains('\\') {
-                        return Err(DispatchError::InvalidParams("無効なフォルダ名".into()));
-                    }
-                    let parent = if path.is_dir() {
-                        path.clone()
-                    } else {
-                        path.parent()
-                            .map(|p| p.to_path_buf())
-                            .unwrap_or(path.clone())
-                    };
-                    let new_path = parent.join(&dir_name);
+                    validate_name(&dir_name)?;
+                    let new_path = dir_of(&path).join(&dir_name);
                     if new_path.exists() {
                         return Err(DispatchError::Operation(format!(
                             "既に存在する: {}",
@@ -1865,6 +1839,23 @@ fn tree_mut(ws: &mut Workspace, tab: TabId) -> &mut tako_core::PaneTree {
 
 fn op_err(e: impl std::fmt::Display) -> DispatchError {
     DispatchError::Operation(e.to_string())
+}
+
+fn validate_name(name: &str) -> Result<(), DispatchError> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return Err(DispatchError::InvalidParams("無効なファイル名".into()));
+    }
+    Ok(())
+}
+
+fn dir_of(path: &std::path::Path) -> std::path::PathBuf {
+    if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| path.to_path_buf())
+    }
 }
 
 /// ワークスペース全体の構造化スナップショット（FR-2.5.1〜2）。
