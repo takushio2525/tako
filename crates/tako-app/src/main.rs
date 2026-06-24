@@ -2643,8 +2643,8 @@ impl TakoApp {
         let ((sl, sc), (el, ec)) = sel.ordered();
         if sl == el {
             let line = texts.get(sl)?;
-            let sc = sc.min(line.len());
-            let ec = ec.min(line.len());
+            let sc = snap_to_char_boundary(line, sc.min(line.len()));
+            let ec = snap_to_char_boundary(line, ec.min(line.len()));
             if sc >= ec {
                 return None;
             }
@@ -2654,10 +2654,10 @@ impl TakoApp {
         for i in sl..=el.min(texts.len() - 1) {
             let line = &texts[i];
             if i == sl {
-                let sc = sc.min(line.len());
+                let sc = snap_to_char_boundary(line, sc.min(line.len()));
                 result.push_str(&line[sc..]);
             } else if i == el {
-                let ec = ec.min(line.len());
+                let ec = snap_to_char_boundary(line, ec.min(line.len()));
                 result.push_str(&line[..ec]);
             } else {
                 result.push_str(line);
@@ -9140,8 +9140,8 @@ impl TakoApp {
         }
         // 選択ハイライト
         if let Some((start, end)) = sel_range {
-            let s = start.min(text.len());
-            let e = end.min(text.len());
+            let s = snap_to_char_boundary(&text, start.min(text.len()));
+            let e = snap_to_char_boundary(&text, end.min(text.len()));
             if s < e {
                 highlights.push((
                     s..e,
@@ -9233,10 +9233,10 @@ impl TakoApp {
         .size_full();
 
         let add_sel = |highlights: &mut Vec<(std::ops::Range<usize>, HighlightStyle)>,
-                       text_len: usize| {
+                       text: &str| {
             if let Some((start, end)) = sel_range {
-                let s = start.min(text_len);
-                let e = end.min(text_len);
+                let s = snap_to_char_boundary(text, start.min(text.len()));
+                let e = snap_to_char_boundary(text, end.min(text.len()));
                 if s < e {
                     highlights.push((
                         s..e,
@@ -9252,7 +9252,7 @@ impl TakoApp {
         match block {
             preview::MdBlock::Heading { level, spans } => {
                 let (text, mut highlights) = self.preview_md_text(spans);
-                add_sel(&mut highlights, text.len());
+                add_sel(&mut highlights, &text);
                 let size = match level {
                     1 => 19.0,
                     2 => 16.0,
@@ -9279,7 +9279,7 @@ impl TakoApp {
             }
             preview::MdBlock::Paragraph { spans } => {
                 let (text, mut highlights) = self.preview_md_text(spans);
-                add_sel(&mut highlights, text.len());
+                add_sel(&mut highlights, &text);
                 div()
                     .relative()
                     .py_1()
@@ -9296,7 +9296,7 @@ impl TakoApp {
                 spans,
             } => {
                 let (text, mut highlights) = self.preview_md_text(spans);
-                add_sel(&mut highlights, text.len());
+                add_sel(&mut highlights, &text);
                 div()
                     .relative()
                     .flex()
@@ -9331,7 +9331,7 @@ impl TakoApp {
                 .into_any_element(),
             preview::MdBlock::Quote { spans } => {
                 let (text, mut highlights) = self.preview_md_text(spans);
-                add_sel(&mut highlights, text.len());
+                add_sel(&mut highlights, &text);
                 div()
                     .relative()
                     .my_1()
@@ -9358,6 +9358,17 @@ impl TakoApp {
 }
 
 /// Markdown ブロックのプレーンテキストを抽出する
+fn snap_to_char_boundary(s: &str, idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    let mut i = idx;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 fn md_block_plain_text(block: &preview::MdBlock) -> String {
     match block {
         preview::MdBlock::Heading { spans, .. }
