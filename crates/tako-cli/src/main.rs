@@ -1038,10 +1038,7 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
 /// `tako remote start` — デーモンをバックグラウンドで fork 起動し QR を表示する
 fn remote_start(port: u16, no_tunnel: bool) -> Result<(), String> {
     let result = tako_control::remote::spawn_daemon(Some(port), no_tunnel)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&result).unwrap_or_default()
-    );
+    println!("{}", pretty_json(&result));
     if let Some(connect) = result["connect_url"].as_str() {
         match tako_control::remote::generate_qr_png(connect) {
             Ok(path) => {
@@ -1071,10 +1068,7 @@ fn remote_start(port: u16, no_tunnel: bool) -> Result<(), String> {
 /// `tako remote stop` — デーモンを PID ファイルから kill する
 fn remote_stop() -> Result<(), String> {
     let result = tako_control::remote::daemon_stop()?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&result).unwrap_or_default()
-    );
+    println!("{}", pretty_json(&result));
     eprintln!("リモートサーバーを停止しました");
     Ok(())
 }
@@ -1082,10 +1076,7 @@ fn remote_stop() -> Result<(), String> {
 /// `tako remote status` — デーモンの状態を表示する
 fn remote_status() -> Result<(), String> {
     let status = tako_control::remote::daemon_status();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&status).unwrap_or_default()
-    );
+    println!("{}", pretty_json(&status));
     Ok(())
 }
 
@@ -1564,6 +1555,10 @@ fn send_request_via(request: Request, origin: Option<&str>) -> Result<Value, Str
     })
 }
 
+fn pretty_json(v: &Value) -> String {
+    serde_json::to_string_pretty(v).unwrap_or_default()
+}
+
 fn print_result(command: &Command, result: &Value) {
     match command {
         // 新ペイン ID をそのままスクリプトで使えるよう数値のみ出力する
@@ -1579,10 +1574,7 @@ fn print_result(command: &Command, result: &Value) {
         }
         Command::Scroll(_) => println!("{result}"),
         Command::List => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(result).unwrap_or_default()
-            );
+            println!("{}", pretty_json(result));
         }
         Command::Tab(TabCommand::New { .. }) => println!("{result}"),
         Command::Open(_) => println!("{result}"),
@@ -1595,16 +1587,10 @@ fn print_result(command: &Command, result: &Value) {
             println!("{result}")
         }
         Command::Git(GitCommand::Log { .. }) | Command::Git(GitCommand::Diff { .. }) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(result).unwrap_or_default()
-            );
+            println!("{}", pretty_json(result));
         }
         Command::Tmux(TmuxCommand::List { .. }) | Command::Tmux(TmuxCommand::Cleanup { .. }) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(result).unwrap_or_default()
-            );
+            println!("{}", pretty_json(result));
         }
         Command::Tmux(TmuxCommand::Kill { .. })
         | Command::Tmux(TmuxCommand::Open { .. })
@@ -1619,22 +1605,13 @@ fn print_result(command: &Command, result: &Value) {
         Command::File(_) => println!("{result}"),
         Command::Video(_) => println!("{result}"),
         Command::Orchestrator(OrchestratorCommand::Spawn { .. }) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(result).unwrap_or_default()
-            );
+            println!("{}", pretty_json(result));
         }
         Command::Orchestrator(OrchestratorCommand::Status { .. }) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(result).unwrap_or_default()
-            );
+            println!("{}", pretty_json(result));
         }
         Command::BackgroundList => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(result).unwrap_or_default()
-            );
+            println!("{}", pretty_json(result));
         }
         // remote は run() → print_result を通らない
         _ => {}
