@@ -461,12 +461,10 @@ impl TakoApp {
                 })
                 .collect(),
             preview::PreviewContent::Video(data) => {
-                let has_player = self.video_players.contains_key(&pane_id);
                 let mut elements: Vec<gpui::AnyElement> = Vec::new();
 
-                if has_player {
+                if let Some(player) = self.video_players.get(&pane_id) {
                     // AVFoundation プレイヤー起動中: キャッシュ済みフレームを表示
-                    let player = self.video_players.get(&pane_id).unwrap();
                     let gen = player.frame_gen;
                     let need_update = match self.video_frame_cache.get(&pane_id) {
                         Some((cached_gen, _)) => *cached_gen != gen,

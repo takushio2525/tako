@@ -42,6 +42,12 @@ pub fn port_path() -> std::path::PathBuf {
     std::path::PathBuf::from("/tmp/tako-remote.port")
 }
 
+fn cleanup_state_files() {
+    let _ = std::fs::remove_file(pid_path());
+    let _ = std::fs::remove_file(token_path());
+    let _ = std::fs::remove_file(port_path());
+}
+
 /// PWA の dist/ を埋め込む（`npm run build` で生成済みのもの）
 #[derive(Embed)]
 #[folder = "../../web/tako-remote/dist/"]
@@ -172,9 +178,7 @@ pub fn run_daemon(port: Option<u16>, no_tunnel: bool) -> io::Result<()> {
         let _ = child.kill();
         let _ = child.wait();
     }
-    let _ = std::fs::remove_file(pid_path());
-    let _ = std::fs::remove_file(token_path());
-    let _ = std::fs::remove_file(port_path());
+    cleanup_state_files();
 
     Ok(())
 }
@@ -191,10 +195,7 @@ pub fn daemon_status() -> Value {
         Err(_) => return json!({ "running": false }),
     };
     if !is_process_alive(pid_num) {
-        // stale PID ファイルの掃除
-        let _ = std::fs::remove_file(pid_path());
-        let _ = std::fs::remove_file(token_path());
-        let _ = std::fs::remove_file(port_path());
+        cleanup_state_files();
         return json!({ "running": false });
     }
     let port = std::fs::read_to_string(port_path())
@@ -228,9 +229,7 @@ pub fn daemon_stop() -> Result<Value, String> {
         .parse()
         .map_err(|_| "PID ファイルの内容が不正".to_string())?;
     if !is_process_alive(pid_num) {
-        let _ = std::fs::remove_file(pid_path());
-        let _ = std::fs::remove_file(token_path());
-        let _ = std::fs::remove_file(port_path());
+        cleanup_state_files();
         return Err("リモートサーバーが起動していない（プロセスは既に終了）".to_string());
     }
     #[cfg(unix)]
@@ -245,9 +244,7 @@ pub fn daemon_stop() -> Result<Value, String> {
     }
     // PID ファイル削除（デーモン側でも削除するが、念のため）
     std::thread::sleep(std::time::Duration::from_millis(500));
-    let _ = std::fs::remove_file(pid_path());
-    let _ = std::fs::remove_file(token_path());
-    let _ = std::fs::remove_file(port_path());
+    cleanup_state_files();
     Ok(json!({ "stopped": true }))
 }
 

@@ -3833,12 +3833,22 @@ impl TakoApp {
                 let chars: Vec<(usize, char)> = line.text.char_indices().collect();
                 let row = div().h(px(line_h)).flex().flex_row().overflow_hidden();
                 let mut children: Vec<gpui::AnyElement> = Vec::with_capacity(chars.len());
+                let fallback_run = tako_core::screen::StyleRun {
+                    range: 0..0,
+                    fg: theme.foreground,
+                    bg: None,
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    strikeout: false,
+                };
                 for (ci, &(byte_off, ch)) in chars.iter().enumerate() {
                     let run = line
                         .runs
                         .iter()
                         .find(|r| byte_off >= r.range.start && byte_off < r.range.end)
-                        .unwrap_or(line.runs.last().unwrap());
+                        .or_else(|| line.runs.last())
+                        .unwrap_or(&fallback_run);
                     let char_cols = if ci + 1 < line.cell_cols.len() {
                         line.cell_cols[ci + 1] - line.cell_cols[ci]
                     } else {

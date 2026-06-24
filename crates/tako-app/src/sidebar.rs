@@ -95,8 +95,7 @@ impl TakoApp {
             }
             _ => None,
         };
-        if let Some((pos, depth)) = inline_new_insert {
-            let edit = self.inline_edit.as_ref().unwrap();
+        if let (Some((pos, depth)), Some(edit)) = (inline_new_insert, self.inline_edit.as_ref()) {
             rows.insert(
                 pos,
                 filetree::Row {
@@ -203,8 +202,7 @@ impl TakoApp {
                                 Some(edit) if path == edit.parent.join("__inline_new__") => true,
                                 _ => false,
                             };
-                            if is_inline {
-                                let edit = inline_edit_snapshot.as_ref().unwrap();
+                            if let (true, Some(edit)) = (is_inline, inline_edit_snapshot.as_ref()) {
                                 let depth = row.depth;
                                 let indent = 8.0 + 12.0 * depth as f32;
                                 let icon = match edit.kind {
