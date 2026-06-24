@@ -177,3 +177,12 @@
 - 分離: keybindings / tab_bar / status_bar / drawer / sidebar / right_panel / preview_render
 - 関連コミット: `d0e2eda` `3baca26` `066c4df`
 - 検証: build / clippy(-D warnings) / fmt / test 全緑
+
+## 2026-06-24（コードベース品質改善 — 6コミット一括）
+- dead code 削除（preview_md_block 94行 / is_pdf_path / is_video_path をテスト内へ移動）
+- unwrap 除去 4箇所（preview_render / sidebar / main.rs の防御的フォールバック）
+- コード重複共通化: resolve_bin()（git/tmux 89→25行）、cleanup_state_files()（remote.rs 4箇所）、
+  PreviewState::error()（7箇所）、dir_of() / validate_name()（dispatch.rs 3箇所ずつ）、
+  pretty_json()（CLI 9箇所）
+- 関連コミット: `fa0428a` `ebbdb6e` `5a56f47` `8b0b3c3` `7efa810` `e31f27c`
+- 検証: 各コミットで build / clippy(-D warnings) / fmt / test 全緑
