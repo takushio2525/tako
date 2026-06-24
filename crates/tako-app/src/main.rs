@@ -5651,6 +5651,7 @@ impl TakoApp {
                     text: escaped,
                     newline: false,
                     tmux_session: None,
+                    await_prompt: false,
                 },
                 PaneOrigin::User,
             );

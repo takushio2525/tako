@@ -154,7 +154,8 @@ pub enum Request {
     /// タブ / ペインのツリー構造・ジオメトリ・状態の取得（FR-2.2.4 / FR-2.5.1〜2）
     List,
     /// ペインへのテキスト送信（FR-2.2.2）。`newline` で末尾に改行（CR）を付与。
-    /// `tmux_session` 指定時はペインが見つからなくても tmux session 経由で送信する
+    /// `tmux_session` 指定時はペインが見つからなくても tmux session 経由で送信する。
+    /// `await_prompt` が true の場合、claude TUI の ❯ プロンプト表示を待ってから送信する
     Send {
         pane: Option<u64>,
         text: String,
@@ -162,6 +163,8 @@ pub enum Request {
         newline: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tmux_session: Option<String>,
+        #[serde(default)]
+        await_prompt: bool,
     },
     /// ペインの画面内容取得（FR-2.2.5）。`lines` は末尾からの行数制限。
     /// `tmux_session` 指定時はペインが見つからなくても tmux session 経由で読む
@@ -498,6 +501,7 @@ mod tests {
                 text: "ls".into(),
                 newline: true,
                 tmux_session: None,
+                await_prompt: false,
             }
         );
     }

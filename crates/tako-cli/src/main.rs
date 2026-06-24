@@ -326,6 +326,9 @@ enum OrchestratorCommand {
         /// thinking effort（省略時 max）
         #[arg(long)]
         effort: Option<String>,
+        /// 分割元ペイン ID（省略時は呼び出し元 = TAKO_PANE_ID）
+        #[arg(long)]
+        pane: Option<u64>,
     },
     /// worker の状態確認
     Status {
@@ -420,6 +423,9 @@ struct SendArgs {
     /// tmux session 名（pane ID 解決不能時のフォールバック）
     #[arg(long)]
     tmux_session: Option<String>,
+    /// claude TUI の ❯ プロンプト表示を待ってから送信する
+    #[arg(long)]
+    await_prompt: bool,
     /// 送信するテキスト（複数引数はスペース連結）
     #[arg(required = true)]
     text: Vec<String>,
@@ -845,6 +851,7 @@ fn orchestrator_master(suffix: Option<&str>) -> Result<(), String> {
         text: claude_cmd,
         newline: true,
         tmux_session: None,
+        await_prompt: false,
     })?;
 
     eprintln!("master を起動しました: タブ '{tab_title}'（ペイン {pane_id}）");
@@ -859,9 +866,10 @@ fn orchestrator_watch(
     tmux_session: Option<&str>,
 ) -> Result<(), String> {
     let interval = std::time::Duration::from_secs(5);
-    // status モードは連続 2 回、grep モードは連続 6 回で確定
-    let need_streak: u32 = if session_id.is_some() { 2 } else { 6 };
+    // status モードは連続 3 回、grep モードは連続 8 回で確定（誤検知抑制）
+    let need_streak: u32 = if session_id.is_some() { 3 } else { 8 };
     let mut idle_streak: u32 = 0;
+    let mut gone_streak: u32 = 0;
 
     loop {
         // ペインの存在確認（IPC 経由。tmux_session 指定時は pane 消滅後も tmux で追跡）
@@ -874,33 +882,49 @@ fn orchestrator_watch(
         match result {
             Ok(val) => {
                 let status = val["status"].as_str().unwrap_or("unknown");
+                let recent = val["recent_output"].as_str().unwrap_or("");
+
                 match status {
                     "gone" => {
-                        println!("WORKER_GONE: tako:{pane}");
-                        return Ok(());
+                        // tmux session 経由でペインの実在を直接確認（tako 再起動時の誤検知防止）
+                        if let Some(ts) = tmux_session {
+                            if tmux_session_alive(ts) {
+                                // tmux session が生きている = ペインは生存中（tako が再起動しただけ）
+                                gone_streak = 0;
+                                idle_streak = 0;
+                                std::thread::sleep(interval);
+                                continue;
+                            }
+                        }
+                        gone_streak += 1;
+                        if gone_streak >= 2 {
+                            println!("WORKER_GONE: tako:{pane}");
+                            return Ok(());
+                        }
                     }
                     "idle" => {
-                        idle_streak += 1;
+                        gone_streak = 0;
+                        // 画面内容で busy パターンがあれば idle を取り消す
+                        if screen_looks_busy(recent) {
+                            idle_streak = 0;
+                        } else {
+                            idle_streak += 1;
+                        }
                     }
                     "busy" => {
+                        gone_streak = 0;
                         idle_streak = 0;
                     }
                     _ => {
-                        // unknown: grep フォールバック（recent_output からパターンを判定）
-                        if let Some(output) = val["recent_output"].as_str() {
-                            if output.contains("ed for ")
-                                && output.chars().any(|c| c.is_ascii_digit())
-                            {
-                                idle_streak += 1;
-                            } else if output.contains("esc to interrupt")
-                                || output.contains("ing… (")
-                            {
-                                idle_streak = 0;
-                            } else {
-                                idle_streak += 1;
-                            }
-                        } else {
+                        gone_streak = 0;
+                        // unknown: 画面内容から状態を推定（保守的 = busy 寄り）
+                        if screen_looks_busy(recent) {
+                            idle_streak = 0;
+                        } else if screen_looks_idle(recent) {
                             idle_streak += 1;
+                        } else {
+                            // 判定不能は busy 扱い（誤 idle 防止）
+                            idle_streak = 0;
                         }
                     }
                 }
@@ -916,13 +940,56 @@ fn orchestrator_watch(
                 }
             }
             Err(_) => {
-                println!("WORKER_GONE: tako:{pane}");
-                return Ok(());
+                // IPC エラー = tako が再起動中の可能性。tmux で実在確認
+                if let Some(ts) = tmux_session {
+                    if tmux_session_alive(ts) {
+                        gone_streak = 0;
+                        std::thread::sleep(interval);
+                        continue;
+                    }
+                }
+                gone_streak += 1;
+                if gone_streak >= 2 {
+                    println!("WORKER_GONE: tako:{pane}");
+                    return Ok(());
+                }
             }
         }
 
         std::thread::sleep(interval);
     }
+}
+
+/// tmux session が生きているか直接確認する（tako-core に依存せず CLI 単体で判定）
+fn tmux_session_alive(session: &str) -> bool {
+    let socket = std::env::var("TAKO_TMUX_SOCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "tako".into());
+    std::process::Command::new("tmux")
+        .args(["-L", &socket, "has-session", "-t", &format!("={session}")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// 画面内容が busy（作業中）を示すパターンを含むか
+fn screen_looks_busy(output: &str) -> bool {
+    output.contains("esc to interrupt")
+        || output.contains("ing… (")
+        || output.contains("Thinking")
+        || output.contains("Reading")
+        || output.contains("Editing")
+        || output.contains("Running")
+        || output.contains("Writing")
+        || output.contains("Searching")
+}
+
+/// 画面内容が idle（入力待ち）を示すパターンを含むか
+fn screen_looks_idle(output: &str) -> bool {
+    // ❯ プロンプトがある、または "Used for" + 数字（コスト表示 = 完了後の状態）
+    output.contains('❯')
+        || (output.contains("ed for ") && output.chars().any(|c| c.is_ascii_digit()))
 }
 
 /// `tako orchestrator projects` — CLI 版プロジェクト管理
@@ -1076,6 +1143,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             text: args.text.join(" "),
             newline: !args.no_newline,
             tmux_session: args.tmux_session.clone(),
+            await_prompt: args.await_prompt,
         },
         Command::Focus(args) => {
             let direction = match (args.left, args.right, args.up, args.down) {
@@ -1394,13 +1462,14 @@ fn build_request(command: &Command) -> Result<Request, String> {
             label,
             model,
             effort,
+            pane,
         }) => Request::OrchestratorSpawn {
             project: project.clone(),
             prompt: prompt.clone(),
             label: label.clone(),
             model: model.clone(),
             effort: effort.clone(),
-            pane: target_pane(None)?,
+            pane: target_pane(*pane)?,
         },
         Command::Orchestrator(OrchestratorCommand::Status {
             pane,
@@ -1712,6 +1781,7 @@ mod tests {
                 text: "echo hello".into(),
                 newline: true,
                 tmux_session: None,
+                await_prompt: false,
             }
         );
     }

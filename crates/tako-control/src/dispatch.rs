@@ -323,7 +323,15 @@ pub fn dispatch(
             text,
             newline,
             tmux_session,
+            await_prompt,
         } => {
+            // await_prompt: claude TUI の ❯ 表示を待ってから送信する（prompt_flow 経由）
+            if await_prompt {
+                let (_, target) = resolve_pane(host.workspace(), pane)?;
+                host.queue_prompt_flow(target, text.clone());
+                return Ok(json!({ "queued": true }));
+            }
+
             let payload = if newline {
                 format!("{text}\r")
             } else {
@@ -1465,7 +1473,7 @@ fn dispatch_orchestrator_spawn(
 
     // 呼び出し元ペインを右に split（ratio 0.45）。
     // pane 未指定時は orchestrator-master role のペインを検索してそのタブに出す。
-    // どちらも見つからなければアクティブタブのフォーカス中ペインにフォールバックする
+    // どちらも見つからなければエラー（active tab に依存しない）
     let (tab, target) = match pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok()) {
         Some(resolved) => resolved,
         None => {
@@ -1480,13 +1488,11 @@ fn dispatch_orchestrator_spawn(
                     }
                 })
             });
-            match master_pane {
-                Some(resolved) => resolved,
-                None => {
-                    let focused = host.workspace().active_tab().tree().focused().as_u64();
-                    resolve_pane(host.workspace(), Some(focused))?
-                }
-            }
+            master_pane.ok_or_else(|| {
+                DispatchError::InvalidParams(
+                    "分割元ペインを特定できない（--pane を指定するか、tako 内のターミナルから実行する）".into(),
+                )
+            })?
         }
     };
     let new_pane = Pane::new(origin);
@@ -2673,6 +2679,7 @@ mod tests {
                 text: "ls".into(),
                 newline: true,
                 tmux_session: None,
+                await_prompt: false,
             },
             PaneOrigin::Cli,
         )

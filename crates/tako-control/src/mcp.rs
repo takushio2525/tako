@@ -201,7 +201,8 @@ pub fn tools() -> Vec<Value> {
             "description": "指定ペインの端末へテキストを書き込む（既定で末尾に改行を付けて実行する）。\
                 対象の誤指定はそのまま誤実行になるため、必ず tako_list_panes で確認した\
                 ペイン ID を渡すこと。tmux_session を指定するとペインが見つからない場合でも \
-                tmux session 経由で送信できる。",
+                tmux session 経由で送信できる。await_prompt を true にすると、claude TUI の\
+                プロンプト（❯）が表示されるまで待ってからテキストを送信する（Enter 空振り防止）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -214,6 +215,12 @@ pub fn tools() -> Vec<Value> {
                     "tmux_session": {
                         "type": "string",
                         "description": "tmux session 名（pane ID 解決不能時のフォールバック。tako_orchestrator_spawn の返り値に含まれる）",
+                    },
+                    "await_prompt": {
+                        "type": "boolean",
+                        "description": "true にすると claude TUI の ❯ プロンプト表示を待ってから送信する（省略時 false）。\
+                            子の Claude Code にメッセージを送るときに使う。送信はバックグラウンドで行われ、\
+                            応答は即座に返る（queued: true）",
                     },
                 },
                 "required": ["pane", "text"],
@@ -941,6 +948,7 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             text: str_arg(args, "text")?.ok_or("text を指定する")?,
             newline: bool_arg(args, "newline")?.unwrap_or(true),
             tmux_session: str_arg(args, "tmux_session")?,
+            await_prompt: bool_arg(args, "await_prompt")?.unwrap_or(false),
         },
         "tako_read_pane" => Request::Read {
             pane: Some(required_u64(args, "pane")?),
