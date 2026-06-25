@@ -186,3 +186,10 @@
   pretty_json()（CLI 9箇所）
 - 関連コミット: `fa0428a` `ebbdb6e` `5a56f47` `8b0b3c3` `7efa810` `e31f27c`
 - 検証: 各コミットで build / clippy(-D warnings) / fmt / test 全緑
+
+## 2026-06-25（UI 描画パフォーマンス最適化 — 5項目）
+- on_term_event の notify を 16ms デバウンス、sync_filetree_roots を render 毎フレームからイベント駆動に移行、
+  terminal_screen_lines のスタイルラン検索を O(N+M) 化 + HL キャッシュ、filetree.rows() キャッシュ化、
+  screen snapshot のグリッドをフラット配列化
+- 関連コミット: `e4abc98` `4884630`
+- 検証: build / clippy(-D warnings) / fmt / test 全緑。build-app.sh --install 済み
