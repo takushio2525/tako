@@ -1343,6 +1343,7 @@ pub fn dispatch(
             model,
             effort,
             pane,
+            tab,
         } => dispatch_orchestrator_spawn(
             host,
             origin,
@@ -1352,6 +1353,7 @@ pub fn dispatch(
             model.as_deref(),
             effort.as_deref(),
             pane,
+            tab,
         ),
 
         Request::OrchestratorWorkerStatus {
@@ -1430,6 +1432,7 @@ fn dispatch_orchestrator_spawn(
     model: Option<&str>,
     effort: Option<&str>,
     pane: Option<u64>,
+    tab: Option<u64>,
 ) -> Result<Value, DispatchError> {
     use crate::orchestrator;
 
@@ -1445,37 +1448,40 @@ fn dispatch_orchestrator_spawn(
         None => format!("{project}-worker"),
     };
 
-    // 呼び出し元ペインを右に split（ratio 0.45）。
-    // pane 未指定時は orchestrator-master role のペインを検索してそのタブに出す。
-    // どちらも見つからなければエラー（active tab に依存しない）
-    let (tab, target) = match pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok()) {
-        Some(resolved) => resolved,
-        None => {
-            // master role のペインを検索（MCP 経由で TAKO_PANE_ID が取れない場合の救済）
-            let master_pane = host.workspace().tabs().iter().find_map(|tab| {
-                tab.tree().panes().iter().find_map(|p| {
-                    let role = p.role()?;
-                    if role.starts_with("orchestrator-master") {
-                        Some((tab.id(), p.id()))
-                    } else {
-                        None
-                    }
-                })
-            });
-            master_pane.ok_or_else(|| {
-                DispatchError::InvalidParams(
-                    "分割元ペインを特定できない（--pane を指定するか、tako 内のターミナルから実行する）".into(),
-                )
-            })?
-        }
+    // 分割元ペインの解決。優先順位: pane > tab > master role 検索
+    let (tab_id, target) = if let Some(resolved) =
+        pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok())
+    {
+        resolved
+    } else if let Some(raw_tab) = tab {
+        let tid = find_tab(host.workspace(), raw_tab)?;
+        let focused = host.workspace().get_tab(tid).unwrap().tree().focused();
+        (tid, focused)
+    } else {
+        // master role のペインを検索（MCP 経由で TAKO_PANE_ID が取れない場合の救済）
+        let master_pane = host.workspace().tabs().iter().find_map(|t| {
+            t.tree().panes().iter().find_map(|p| {
+                let role = p.role()?;
+                if role.starts_with("orchestrator-master") {
+                    Some((t.id(), p.id()))
+                } else {
+                    None
+                }
+            })
+        });
+        master_pane.ok_or_else(|| {
+            DispatchError::InvalidParams(
+                "分割元ペインを特定できない（--pane または --tab を指定するか、tako 内のターミナルから実行する）".into(),
+            )
+        })?
     };
     let new_pane = Pane::new(origin);
     let new_id = new_pane.id();
-    tree_mut(host.workspace_mut(), tab)
+    tree_mut(host.workspace_mut(), tab_id)
         .split_with_ratio(target, SplitDirection::Right, 0.45, new_pane)
         .map_err(op_err)?;
     // MCP/CLI 経由ではフォーカスを分割元に維持（ユーザーの入力を奪わない）
-    let _ = tree_mut(host.workspace_mut(), tab).focus(target);
+    let _ = tree_mut(host.workspace_mut(), tab_id).focus(target);
     let options = SpawnOptions {
         command: None,
         cwd: Some(std::path::PathBuf::from(&cwd)),
@@ -1505,7 +1511,7 @@ fn dispatch_orchestrator_spawn(
     host.queue_prompt_flow(new_id, oneline_prompt.clone());
 
     // タイトルと role 設定
-    let pane_obj = tree_mut(host.workspace_mut(), tab)
+    let pane_obj = tree_mut(host.workspace_mut(), tab_id)
         .get_mut(new_id)
         .expect("直前に split で追加済み");
     pane_obj.set_title(Some(window_title.clone()));

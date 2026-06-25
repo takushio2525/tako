@@ -326,9 +326,12 @@ enum OrchestratorCommand {
         /// thinking effort（省略時 max）
         #[arg(long)]
         effort: Option<String>,
-        /// 分割元ペイン ID（省略時は呼び出し元 = TAKO_PANE_ID）
+        /// 分割元ペイン ID（省略時は呼び出し元 = TAKO_PANE_ID。tab と両方指定時は pane を優先）
         #[arg(long)]
         pane: Option<u64>,
+        /// 子を出すタブ ID（そのタブのフォーカスペインを分割元にする）
+        #[arg(long)]
+        tab: Option<u64>,
     },
     /// worker の状態確認
     Status {
@@ -1454,6 +1457,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             model,
             effort,
             pane,
+            tab,
         }) => Request::OrchestratorSpawn {
             project: project.clone(),
             prompt: prompt.clone(),
@@ -1461,6 +1465,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             model: model.clone(),
             effort: effort.clone(),
             pane: target_pane(*pane)?,
+            tab: *tab,
         },
         Command::Orchestrator(OrchestratorCommand::Status {
             pane,

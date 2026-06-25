@@ -352,6 +352,7 @@ pub enum Request {
         model: Option<String>,
         effort: Option<String>,
         pane: Option<u64>,
+        tab: Option<u64>,
     },
     /// オーケストレーター: worker の状態確認。`tmux_session` 指定時は pane が gone でも
     /// tmux session 経由で recent_output を取得する

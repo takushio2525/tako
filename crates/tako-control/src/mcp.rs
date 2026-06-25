@@ -826,8 +826,10 @@ pub fn tools() -> Vec<Value> {
                     "model": { "type": "string", "description": "claude のモデル（省略時は claude-opus-4-6[1m]）" },
                     "effort": { "type": "string", "description": "thinking effort（省略時は max）" },
                     "pane": pane_schema("分割元ペイン ID（省略時は呼び出し元。このペインの右に子が生える）。\
-                        オーケストレーター master から呼ぶ場合は master 自身のペイン ID を必ず指定すること（\
-                        省略すると別タブに出る場合がある）"),
+                        pane と tab の両方を指定した場合は pane を優先する"),
+                    "tab": { "type": "integer", "minimum": 0, "description": "子を出すタブ ID。\
+                        指定するとそのタブのフォーカスペインを分割元にする。\
+                        複数マスター運用時は tab で出力先タブを明示指定することを推奨" },
                 },
                 "required": ["project", "prompt"],
                 "additionalProperties": false,
@@ -1166,6 +1168,7 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             model: str_arg(args, "model")?,
             effort: str_arg(args, "effort")?,
             pane: u64_arg(args, "pane")?.or(caller),
+            tab: u64_arg(args, "tab")?,
         },
         "tako_orchestrator_worker_status" => Request::OrchestratorWorkerStatus {
             pane_id: required_u64(args, "pane_id")?,
