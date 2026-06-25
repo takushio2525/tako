@@ -52,6 +52,8 @@ pub struct FileTree {
     cache: HashMap<PathBuf, Vec<Entry>>,
     /// git status キャッシュ: 絶対パス → 変更種別
     git_cache: HashMap<PathBuf, GitChange>,
+    /// rows() の結果キャッシュ（状態変化時に無効化し、render での再構築を回避する）
+    rows_cache: Option<Vec<Row>>,
 }
 
 impl FileTree {
@@ -79,8 +81,6 @@ impl FileTree {
             }
         }
         for root in &deduped {
-            // 新規ルートだけ展開済みで読み込む（VSCode のワークスペースフォルダ同様。
-            // 既存ルートはユーザーが畳んだ状態を尊重する）
             if !self.roots.contains(root) {
                 self.expanded.insert(root.clone());
                 self.cache
@@ -89,6 +89,7 @@ impl FileTree {
             }
         }
         self.roots = deduped;
+        self.rows_cache = None;
         true
     }
 
@@ -99,6 +100,7 @@ impl FileTree {
             self.cache
                 .entry(path.to_path_buf())
                 .or_insert_with(|| read_dir_sorted(path));
+            self.rows_cache = None;
         }
     }
 
@@ -112,6 +114,7 @@ impl FileTree {
                 .entry(path.to_path_buf())
                 .or_insert_with(|| read_dir_sorted(path));
         }
+        self.rows_cache = None;
     }
 
     /// git status キャッシュを更新する。変化があれば true
@@ -120,11 +123,22 @@ impl FileTree {
             return false;
         }
         self.git_cache = status;
+        self.rows_cache = None;
         true
     }
 
-    /// 表示行: ルート見出し行 + 展開状態に従った深さ優先の中身
-    pub fn rows(&self) -> Vec<Row> {
+    /// 表示行: ルート見出し行 + 展開状態に従った深さ優先の中身。
+    /// キャッシュがあればクローンを返し、なければ構築してキャッシュする
+    pub fn rows(&mut self) -> Vec<Row> {
+        if let Some(cached) = &self.rows_cache {
+            return cached.clone();
+        }
+        let rows = self.build_rows();
+        self.rows_cache = Some(rows.clone());
+        rows
+    }
+
+    fn build_rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
         for root in &self.roots {
             let expanded = self.expanded.contains(root);
@@ -200,6 +214,9 @@ impl FileTree {
                 changed |= self.cache.remove(&dir).is_some();
                 changed |= self.expanded.remove(&dir);
             }
+        }
+        if changed {
+            self.rows_cache = None;
         }
         changed
     }
@@ -316,7 +333,7 @@ mod tests {
     }
 
     /// (name, depth, root) のタプル列に写す（検証用）
-    fn names(tree: &FileTree) -> Vec<(String, usize, bool)> {
+    fn names(tree: &mut FileTree) -> Vec<(String, usize, bool)> {
         tree.rows()
             .iter()
             .map(|r| (r.entry.name.clone(), r.depth, r.root))
@@ -332,7 +349,7 @@ mod tests {
         assert!(!tree.set_roots(vec![dir.clone()]));
         let root_name = dir.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(
-            names(&tree),
+            names(&mut tree),
             vec![
                 (root_name, 0, true),
                 ("docs".to_string(), 1, false),
@@ -353,16 +370,16 @@ mod tests {
             dir.join("src"), // 重複は除かれる
         ]));
         assert_eq!(tree.roots(), &[dir.join("src"), dir.join("docs")]);
-        let rows = names(&tree);
+        let rows = names(&mut tree);
         let roots: Vec<_> = rows.iter().filter(|(_, _, root)| *root).collect();
         assert_eq!(roots.len(), 2);
         assert!(rows.contains(&("main.rs".to_string(), 1, false)));
         // ルート見出しの折りたたみで中身が消える
         tree.toggle_dir(&dir.join("src"));
-        assert!(!names(&tree).contains(&("main.rs".to_string(), 1, false)));
+        assert!(!names(&mut tree).contains(&("main.rs".to_string(), 1, false)));
         // ルートが減っても残りの展開状態は維持される
         assert!(tree.set_roots(vec![dir.join("docs")]));
-        assert_eq!(names(&tree).len(), 1, "docs は空ディレクトリ");
+        assert_eq!(names(&mut tree).len(), 1, "docs は空ディレクトリ");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

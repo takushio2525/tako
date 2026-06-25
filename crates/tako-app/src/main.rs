@@ -464,6 +464,10 @@ struct TakoApp {
     video_ticker: bool,
     /// 全ペインから集約した Claude エージェントメトリクス（ctx/usage。ポーリングで更新）
     agent_metrics: AgentMetrics,
+    /// 端末イベントの再描画デバウンス: 最後に notify した時刻
+    last_term_notify: std::time::Instant,
+    /// 端末イベントの再描画デバウンス: 遅延 notify のタイマーが稼働中か
+    term_notify_pending: bool,
     /// 動画フレームの描画キャッシュ（frame_gen で世代管理: 新フレーム準備完了まで前フレームを表示）
     video_frame_cache: HashMap<PaneId, (u64, std::sync::Arc<gpui::RenderImage>)>,
     /// シークバー要素の実測 bounds（paint 時に canvas で記録）
@@ -962,6 +966,8 @@ impl TakoApp {
             pinned_previews: Vec::new(),
             dragging_pin: None,
             agent_metrics: AgentMetrics::default(),
+            last_term_notify: std::time::Instant::now(),
+            term_notify_pending: false,
             video_players: HashMap::new(),
             video_ticker: false,
             video_frame_cache: HashMap::new(),
@@ -2166,14 +2172,42 @@ impl TakoApp {
         let Some(session) = self.terminals.get_mut(&pane_id) else {
             return;
         };
+        let mut need_immediate = false;
         match session.process_event(event) {
-            Some(SessionNotice::Exited) => self.remove_pane(pane_id, cx),
+            Some(SessionNotice::Exited) => {
+                self.remove_pane(pane_id, cx);
+                need_immediate = true;
+            }
             Some(SessionNotice::ClipboardStore(text)) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
+                need_immediate = true;
             }
             Some(SessionNotice::TitleChanged) | None => {}
         }
-        cx.notify();
+        // 16ms（~60fps）のフレームレート制限: 重要イベントは即座に再描画し、
+        // 通常の出力データは最大 16ms 遅延させてバッチ化する
+        if need_immediate {
+            self.last_term_notify = std::time::Instant::now();
+            cx.notify();
+            return;
+        }
+        let elapsed = self.last_term_notify.elapsed();
+        if elapsed >= Duration::from_millis(16) {
+            self.last_term_notify = std::time::Instant::now();
+            cx.notify();
+        } else if !self.term_notify_pending {
+            self.term_notify_pending = true;
+            let remaining = Duration::from_millis(16) - elapsed;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(remaining).await;
+                let _ = this.update(cx, |app, cx| {
+                    app.term_notify_pending = false;
+                    app.last_term_notify = std::time::Instant::now();
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
     }
 
     fn focused_pane(&self) -> PaneId {
@@ -2522,6 +2556,7 @@ impl TakoApp {
             eprintln!("warning: タブを開けない: {e}");
             self.remove_pane(pane_id, cx); // 最後の 1 ペイン → タブごと畳まれる
         }
+        self.sync_filetree_roots();
         cx.notify();
     }
 
@@ -2529,6 +2564,7 @@ impl TakoApp {
         if let Some(id) = self.workspace.tabs().get(index).map(|t| t.id()) {
             let _ = self.workspace.activate_tab(id);
         }
+        self.sync_filetree_roots();
         cx.notify();
     }
 
@@ -3842,20 +3878,31 @@ impl TakoApp {
                     underline: false,
                     strikeout: false,
                 };
+                // ランインデックスを前進させる方式でスタイル検索を O(N+M) に
+                let mut run_idx = 0;
+                // ランごとの HighlightStyle をキャッシュ（同じランを複数文字で再利用）
+                let run_highlights: Vec<HighlightStyle> =
+                    line.runs.iter().map(|r| self.run_highlight(r)).collect();
                 for (ci, &(byte_off, ch)) in chars.iter().enumerate() {
-                    let run = line
-                        .runs
-                        .iter()
-                        .find(|r| byte_off >= r.range.start && byte_off < r.range.end)
-                        .or_else(|| line.runs.last())
-                        .unwrap_or(&fallback_run);
+                    // 現在のランが byte_off を含まなければ前進
+                    while run_idx + 1 < line.runs.len() && byte_off >= line.runs[run_idx].range.end
+                    {
+                        run_idx += 1;
+                    }
+                    let (run, hl) = if run_idx < line.runs.len()
+                        && byte_off >= line.runs[run_idx].range.start
+                        && byte_off < line.runs[run_idx].range.end
+                    {
+                        (&line.runs[run_idx], run_highlights[run_idx])
+                    } else {
+                        (&fallback_run, self.run_highlight(&fallback_run))
+                    };
                     let char_cols = if ci + 1 < line.cell_cols.len() {
                         line.cell_cols[ci + 1] - line.cell_cols[ci]
                     } else {
                         1
                     };
                     let s = ch.to_string();
-                    let hl = self.run_highlight(run);
                     let styled = StyledText::new(SharedString::from(s.clone()))
                         .with_default_highlights(&default_style, vec![(0..s.len(), hl)]);
                     let mut d = div()
@@ -4863,8 +4910,8 @@ impl Render for TakoApp {
         }
         let theme = self.theme.clone();
 
-        // ファイルツリーの root をフォーカスペインの cwd に追従させる（FR-3.1）
-        self.sync_filetree_roots();
+        // ファイルツリーの root 同期は 2 秒ポーリングとイベント駆動に移した
+        // （render 毎フレームの呼び出しを廃止してパフォーマンス改善）
 
         // OS ウィンドウのフレームを採取する（layout 保存 = 再起動時のウィンドウ復元用。
         // window_bounds() は fullscreen / maximized 中でも復元サイズを返す）
@@ -5109,10 +5156,12 @@ impl Render for TakoApp {
             .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_tab(cx)))
             .on_action(cx.listener(|this, _: &NextTab, _, cx| {
                 this.workspace.activate_next_tab();
+                this.sync_filetree_roots();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &PrevTab, _, cx| {
                 this.workspace.activate_prev_tab();
+                this.sync_filetree_roots();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &FocusLeft, _, cx| {
@@ -7891,12 +7940,13 @@ mod self_test {
                 multiroot_ok = window
                     .update(cx, |app, _, _| {
                         app.sync_filetree_roots();
-                        let roots = app.filetree.roots();
+                        let root_count = app.filetree.roots().len();
+                        let has_tmp = app.filetree.roots().iter().any(|r| r.ends_with("tmp"));
                         let header_rows =
                             app.filetree.rows().iter().filter(|r| r.root).count();
-                        roots.len() >= 2
-                            && roots.iter().any(|r| r.ends_with("tmp"))
-                            && header_rows == roots.len()
+                        root_count >= 2
+                            && has_tmp
+                            && header_rows == root_count
                     })
                     .unwrap_or(false);
                 if multiroot_ok {
