@@ -77,6 +77,8 @@ pub struct Pane {
     title_source: TitleSource,
     /// 役割ラベル（例: worker-1, dev-server。FR-2.1.3）
     role: Option<String>,
+    /// spawn 元ペイン（オーケストレーター worker 用。セッション内で使い捨て、永続化不要）
+    spawned_by: Option<PaneId>,
 }
 
 impl Pane {
@@ -87,6 +89,7 @@ impl Pane {
             title: None,
             title_source: TitleSource::Default,
             role: None,
+            spawned_by: None,
         }
     }
 
@@ -106,6 +109,7 @@ impl Pane {
             title,
             title_source,
             role,
+            spawned_by: None,
         }
     }
 
@@ -152,6 +156,14 @@ impl Pane {
 
     pub fn set_role(&mut self, role: Option<String>) {
         self.role = role;
+    }
+
+    pub fn spawned_by(&self) -> Option<PaneId> {
+        self.spawned_by
+    }
+
+    pub fn set_spawned_by(&mut self, parent: Option<PaneId>) {
+        self.spawned_by = parent;
     }
 }
 
