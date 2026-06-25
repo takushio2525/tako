@@ -4493,6 +4493,10 @@ impl ControlHost for TakoApp {
         if !self.tmux_persist || !tako_core::tmux_backend::available() {
             return Vec::new();
         }
+        if tako_core::ports::other_tako_running() {
+            eprintln!("info: 別の tako プロセスが動作中のため orphan クリーンアップをスキップ");
+            return Vec::new();
+        }
         let mut protected: std::collections::HashSet<String> =
             self.backend_sessions.values().cloned().collect();
         // バックグラウンド中ペインの backend セッションは backend_sessions に残るため上で網羅されるが、

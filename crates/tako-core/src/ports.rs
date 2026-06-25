@@ -339,6 +339,26 @@ fn process_name(pid: i32) -> String {
     String::from_utf8_lossy(&buf[..len as usize]).into_owned()
 }
 
+/// 自分以外の `tako-app` プロセスが生きているか（二重起動ガード用）
+#[cfg(target_os = "macos")]
+pub fn other_tako_running() -> bool {
+    let my_pid = std::process::id() as i32;
+    for pid in all_pids() {
+        if pid == my_pid {
+            continue;
+        }
+        if process_name(pid) == "tako-app" {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn other_tako_running() -> bool {
+    false
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
