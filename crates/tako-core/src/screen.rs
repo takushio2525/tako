@@ -98,9 +98,8 @@ pub(crate) fn snapshot_opts<T: EventListener>(
         underline: false,
         strikeout: false,
     };
-    // '\0' は太幅文字のスペーサーセル（テキスト化時にスキップ）
-    let mut grid: Vec<Vec<(char, CellStyle)>> =
-        vec![vec![(' ', default_style.clone()); cols]; rows];
+    // フラット配列（rows 個の内側 Vec 割り当てを回避）
+    let mut grid: Vec<(char, CellStyle)> = vec![(' ', default_style.clone()); cols * rows];
 
     let cursor = (show_cursor && content.cursor.shape != CursorShape::Hidden)
         .then(|| point_to_viewport(display_offset, content.cursor.point))
@@ -149,7 +148,7 @@ pub(crate) fn snapshot_opts<T: EventListener>(
             bg = Some(theme.cursor);
         }
 
-        grid[row][col] = (
+        grid[row * cols + col] = (
             c,
             CellStyle {
                 fg,
@@ -162,15 +161,16 @@ pub(crate) fn snapshot_opts<T: EventListener>(
         );
     }
 
-    let lines = grid
-        .into_iter()
-        .map(|cells| {
+    let lines = (0..rows)
+        .map(|row| {
+            let row_start = row * cols;
             let mut text = String::with_capacity(cols);
             let mut runs: Vec<StyleRun> = Vec::new();
             let mut cell_cols = Vec::with_capacity(cols);
-            for (col, (c, style)) in cells.into_iter().enumerate() {
+            for col in 0..cols {
+                let (c, ref style) = grid[row_start + col];
                 if c == '\0' {
-                    continue; // 太幅文字のスペーサー: 直前の文字が 2 セル分を占める
+                    continue;
                 }
                 cell_cols.push(col);
                 let start = text.len();
