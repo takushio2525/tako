@@ -2000,9 +2000,25 @@ fn list_json(host: &dyn ControlHost) -> Value {
             })
         })
         .collect();
+    let shelved: Vec<Value> = ws
+        .shelved_panes()
+        .iter()
+        .map(|bp| {
+            json!({
+                "id": bp.id().as_u64(),
+                "title": bp.title(),
+                "role": bp.role(),
+                "origin": origin_str(bp.pane().origin()),
+                "spawned_by": bp.pane().spawned_by().map(|id| id.as_u64()),
+                "origin_tab": bp.origin_tab().as_u64(),
+                "origin_tab_title": bp.origin_tab_title(),
+            })
+        })
+        .collect();
     json!({
         "active_tab": ws.active_tab_id().as_u64(),
         "tabs": tabs,
+        "shelved_panes": shelved,
         // ピン留め中のプレビューウィンドウ（FR-2.16.15。AI が現在のピンを把握できる）
         "pinned": pinned_json(host),
     })

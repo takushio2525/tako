@@ -305,6 +305,9 @@ enum OrchestratorCommand {
         /// tmux session 名（pane 消滅時のフォールバック追跡）
         #[arg(long)]
         tmux_session: Option<String>,
+        /// タイムアウト秒数（省略時は無制限）
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// プロジェクト管理（一覧 / 追加 / 削除）
     #[command(subcommand)]
@@ -681,12 +684,15 @@ fn main() -> ExitCode {
             pane_pos,
             ref session_id,
             ref tmux_session,
+            timeout,
         }) => {
             let resolved = pane.or(pane_pos).ok_or_else(|| {
                 "ペイン ID を指定してください（tako orchestrator watch <PANE_ID> または --pane <N>）".to_string()
             });
             match resolved {
-                Ok(p) => orchestrator_watch(p, session_id.as_deref(), tmux_session.as_deref()),
+                Ok(p) => {
+                    orchestrator_watch(p, session_id.as_deref(), tmux_session.as_deref(), timeout)
+                }
                 Err(e) => Err(e),
             }
         }
@@ -862,19 +868,28 @@ fn orchestrator_master(suffix: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-/// `tako orchestrator watch --pane N [--session-id S]` — worker の完了まで待機し 1 行出力する
+/// `tako orchestrator watch --pane N [--session-id S] [--timeout T]` — worker の完了まで待機し 1 行出力する
 fn orchestrator_watch(
     pane: u64,
     session_id: Option<&str>,
     tmux_session: Option<&str>,
+    timeout_secs: Option<u64>,
 ) -> Result<(), String> {
     let interval = std::time::Duration::from_secs(5);
+    let deadline =
+        timeout_secs.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
     // status モードは連続 3 回、grep モードは連続 8 回で確定（誤検知抑制）
     let need_streak: u32 = if session_id.is_some() { 3 } else { 8 };
     let mut idle_streak: u32 = 0;
     let mut gone_streak: u32 = 0;
 
     loop {
+        if let Some(dl) = deadline {
+            if std::time::Instant::now() >= dl {
+                println!("WORKER_TIMEOUT: tako:{pane}");
+                return Ok(());
+            }
+        }
         // ペインの存在確認（IPC 経由。tmux_session 指定時は pane 消滅後も tmux で追跡）
         let result = send_request(Request::OrchestratorWorkerStatus {
             pane_id: pane,

@@ -141,6 +141,7 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_list_panes",
             "description": "タブとペインのツリー構造・ジオメトリ（位置・サイズ・分割比率）・\
                 状態（タイトル・role・origin・フォーカス・cwd・state・listen_ports・surface）を JSON で返す。\
+                shelved_panes（バックグラウンドに退避されたペイン）も含む。\
                 state はシェル統合（OSC 133）由来で idle / running / failed（exit_code 付き）\
                 / unknown（統合なし）。surface はそのペインが前面表示中か裏で実行中かの分類で\
                 foreground（アクティブタブ所属＝画面に出ている）/ background（非アクティブタブ＝裏で実行中）。\
@@ -813,7 +814,8 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_orchestrator_spawn",
             "description": "プロジェクトの作業ディレクトリで子 claude worker を spawn する。\
                 呼び出し元ペインを右に分割して新ペインを作り、claude を起動してプロンプトを送信する。\
-                worker の pane_id と tmux_session を返す。tmux_session は pane ID が解決できない場合\
+                worker の pane_id・tmux_session・spawned_by（spawn 元ペイン ID）を返す。\
+                tmux_session は pane ID が解決できない場合\
                 （BG タブ移動・tako 再起動後）のフォールバックとして tako_read_pane / tako_send_input / \
                 tako_orchestrator_worker_status に渡せる。\
                 起動からプロンプト送信まで 15〜20 秒かかる（これは想定内）。",
@@ -841,6 +843,7 @@ pub fn tools() -> Vec<Value> {
                 gone（ペイン消滅かつ tmux session も消滅）/ unknown（agents 不可）。session_id を渡すと \
                 claude agents --json で正確な状態を取得する。tmux_session を渡すとペインが消えても \
                 tmux session が生きている限り recent_output を取得でき、gone にならない。\
+                退避（shelved）されたペインも追跡可能（pane_exists で shelved を走査する）。\
                 recent_output はペインの最近 30 行の出力。",
             "inputSchema": {
                 "type": "object",
