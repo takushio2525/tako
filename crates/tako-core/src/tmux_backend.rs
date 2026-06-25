@@ -74,7 +74,7 @@ set -s escape-time 10
 set -s extended-keys always
 set -sq extended-keys-format csi-u
 set -as terminal-features 'xterm*:extkeys:RGB'
-set -g update-environment 'TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL TAKO_TAB_ID'
+set -g update-environment 'TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL TAKO_TAB_ID TAKO_PANE_ID'
 set -gq copy-mode-position-format ''
 ";
 
