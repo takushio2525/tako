@@ -193,3 +193,9 @@
   screen snapshot のグリッドをフラット配列化
 - 関連コミット: `e4abc98` `4884630`
 - 検証: build / clippy(-D warnings) / fmt / test 全緑。build-app.sh --install 済み
+
+## 2026-06-25（orchestrator spawn に tab パラメータ追加）
+- `tako_orchestrator_spawn` に `tab` パラメータ追加。指定タブのフォーカスペインを分割元にする。
+  複数マスター運用時の出力先タブ明示指定が可能に。優先順位: pane > tab > master role 検索
+- 関連コミット: `dc4b65c` `[機能追加] tako_orchestrator_spawn に tab パラメータを追加`
+- 検証: build / clippy(-D warnings) / fmt / test 全緑。build-app.sh --install 済み
