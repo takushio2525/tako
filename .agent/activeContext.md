@@ -4,11 +4,13 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-06-25・orchestrator spawn tab パラメータ追加完了）
+## 現在の対象（2026-06-25・spawn 信頼性 + セッション追跡の改善完了）
 
-`tako_orchestrator_spawn` に `tab` パラメータを追加。指定タブのフォーカスペインを
-分割元にする。複数マスター運用時に子 worker の出力先タブを明示指定可能に。
-MCP / CLI / dispatch / protocol の 4 ファイル修正。全テスト緑、.app 配置済み。
+オーケストレーター spawn の信頼性改善 4 項目を実装完了:
+1. 複数 master 時の role 検索を suffix マッチ対応（呼び出し元の `:tako` 等を優先）
+2. worker ペインに `spawned_by` フィールド追加（spawn 元を記録・list/レスポンスに公開）
+3. `worker_status` の `pane_exists` で shelved ペインも走査（退避時の誤 gone 防止）
+4. dead code `find_session_id` の除去
 
 ## 残作業・既知の制約
 
@@ -19,7 +21,6 @@ MCP / CLI / dispatch / protocol の 4 ファイル修正。全テスト緑、.ap
 
 ## 未着手タスク（優先順はユーザーと相談）
 
-- [x] ~~**orchestrator spawn のタブ配置問題**~~: `tab` パラメータ追加で解決済み（`dc4b65c`）
 - [ ] **Phase 5 続き**: FR-3.5 軽い編集
 - [ ] **FR-2.19 localhost ポートパネル**
 - [ ] **FR-2.18 未表示の子の自動サーフェス**

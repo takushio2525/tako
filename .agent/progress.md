@@ -199,3 +199,14 @@
   複数マスター運用時の出力先タブ明示指定が可能に。優先順位: pane > tab > master role 検索
 - 関連コミット: `dc4b65c` `[機能追加] tako_orchestrator_spawn に tab パラメータを追加`
 - 検証: build / clippy(-D warnings) / fmt / test 全緑。build-app.sh --install 済み
+
+## 2026-06-25（cleanup_orphan_tmux 二重起動ガード追加）
+- dev build 起動時に production の全 tmux backend セッションを誤 kill する事故を防止。
+  `ports::other_tako_running()` を tako-core に追加し、`cleanup_orphan_tmux` 冒頭でスキップ
+- 関連コミット: `8b81e48` `[修正] cleanup_orphan_tmux に二重起動ガードを追加`
+- 検証: build / clippy(-D warnings) / fmt / test 全緑。build-app.sh --install 済み
+
+## 2026-06-25（spawn 信頼性 + セッション追跡の改善）
+- 4項目: ①複数 master の suffix マッチ ②`spawned_by` フィールド追加 ③`worker_status` shelved 対応 ④dead code 除去
+- 関連コミット: `53520eb` `56f55eb` `7a0126f`
+- 検証: build / clippy(-D warnings) / fmt / test 全緑（109 passed）
