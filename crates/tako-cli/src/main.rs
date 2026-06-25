@@ -976,23 +976,45 @@ fn tmux_session_alive(session: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 画面内容が busy（作業中）を示すパターンを含むか
-fn screen_looks_busy(output: &str) -> bool {
-    output.contains("esc to interrupt")
-        || output.contains("ing… (")
-        || output.contains("Thinking")
-        || output.contains("Reading")
-        || output.contains("Editing")
-        || output.contains("Running")
-        || output.contains("Writing")
-        || output.contains("Searching")
+/// 空行を除いた末尾 N 行を返す
+fn tail_lines(output: &str, n: usize) -> Vec<&str> {
+    output
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(n)
+        .collect()
 }
 
-/// 画面内容が idle（入力待ち）を示すパターンを含むか
+/// 画面内容が busy（作業中）を示すパターンを含むか（末尾 5 行に限定）
+fn screen_looks_busy(output: &str) -> bool {
+    let lines = tail_lines(output, 5);
+    lines.iter().any(|l| {
+        l.contains("esc to interrupt")
+            || l.contains("ing… (")
+            || l.contains("Thinking")
+            || l.contains("Reading")
+            || l.contains("Editing")
+            || l.contains("Running")
+            || l.contains("Writing")
+            || l.contains("Searching")
+    })
+}
+
+/// 画面内容が idle（入力待ち）を示すパターンを含むか（最終行が ❯ で始まるか確認）
 fn screen_looks_idle(output: &str) -> bool {
-    // ❯ プロンプトがある、または "Used for" + 数字（コスト表示 = 完了後の状態）
-    output.contains('❯')
-        || (output.contains("ed for ") && output.chars().any(|c| c.is_ascii_digit()))
+    let lines = tail_lines(output, 1);
+    match lines.first() {
+        Some(last) => last.trim_start().starts_with('❯'),
+        None => false,
+    }
+}
+
+/// 最終行（空行除く）に ❯ プロンプトがあるか（dispatch 側の idle 補正と共用）
+pub fn last_line_has_prompt(output: &str) -> bool {
+    tail_lines(output, 1)
+        .first()
+        .is_some_and(|l| l.trim_start().starts_with('❯'))
 }
 
 /// `tako orchestrator projects` — CLI 版プロジェクト管理
