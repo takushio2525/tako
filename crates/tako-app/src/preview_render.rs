@@ -1044,6 +1044,7 @@ impl TakoApp {
                 ));
             }
         }
+        let highlights = merge_highlights(highlights);
         let code_el = StyledText::new(text).with_default_highlights(&self.text_style(), highlights);
         let entity = cx.entity().downgrade();
         let bounds_canvas = canvas(
@@ -1145,6 +1146,7 @@ impl TakoApp {
             preview::MdBlock::Heading { level, spans } => {
                 let (text, mut highlights) = self.preview_md_text(spans);
                 add_sel(&mut highlights, &text);
+                let highlights = merge_highlights(highlights);
                 let size = match level {
                     1 => 19.0,
                     2 => 16.0,
@@ -1172,6 +1174,7 @@ impl TakoApp {
             preview::MdBlock::Paragraph { spans } => {
                 let (text, mut highlights) = self.preview_md_text(spans);
                 add_sel(&mut highlights, &text);
+                let highlights = merge_highlights(highlights);
                 div()
                     .relative()
                     .py_1()
@@ -1189,6 +1192,7 @@ impl TakoApp {
             } => {
                 let (text, mut highlights) = self.preview_md_text(spans);
                 add_sel(&mut highlights, &text);
+                let highlights = merge_highlights(highlights);
                 div()
                     .relative()
                     .flex()
@@ -1224,6 +1228,7 @@ impl TakoApp {
             preview::MdBlock::Quote { spans } => {
                 let (text, mut highlights) = self.preview_md_text(spans);
                 add_sel(&mut highlights, &text);
+                let highlights = merge_highlights(highlights);
                 div()
                     .relative()
                     .my_1()

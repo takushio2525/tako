@@ -4353,7 +4353,6 @@ impl TakoApp {
     }
 }
 
-/// Markdown ブロックのプレーンテキストを抽出する
 fn snap_to_char_boundary(s: &str, idx: usize) -> usize {
     if idx >= s.len() {
         return s.len();
@@ -4363,6 +4362,44 @@ fn snap_to_char_boundary(s: &str, idx: usize) -> usize {
         i -= 1;
     }
     i
+}
+
+/// GPUI の StyledText::compute_runs は highlight 範囲がソート済み・非重複であることを
+/// 前提としている。構文ハイライトと選択ハイライトが重なると compute_runs が text.len()
+/// を超えるランを生成し panic する。この関数で重複を解消する。
+fn merge_highlights(
+    highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    if highlights.len() <= 1 {
+        return highlights;
+    }
+    let mut boundaries = std::collections::BTreeSet::new();
+    for (range, _) in &highlights {
+        boundaries.insert(range.start);
+        boundaries.insert(range.end);
+    }
+    let boundaries: Vec<usize> = boundaries.into_iter().collect();
+    let mut result = Vec::with_capacity(boundaries.len());
+    for w in boundaries.windows(2) {
+        let seg_start = w[0];
+        let seg_end = w[1];
+        if seg_start >= seg_end {
+            continue;
+        }
+        let mut merged: Option<HighlightStyle> = None;
+        for (range, style) in &highlights {
+            if range.start <= seg_start && seg_end <= range.end {
+                merged = Some(match merged {
+                    None => *style,
+                    Some(m) => m.highlight(*style),
+                });
+            }
+        }
+        if let Some(style) = merged {
+            result.push((seg_start..seg_end, style));
+        }
+    }
+    result
 }
 
 fn md_block_plain_text(block: &preview::MdBlock) -> String {
