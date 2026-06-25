@@ -1458,17 +1458,55 @@ fn dispatch_orchestrator_spawn(
         let focused = host.workspace().get_tab(tid).unwrap().tree().focused();
         (tid, focused)
     } else {
-        // master role のペインを検索（MCP 経由で TAKO_PANE_ID が取れない場合の救済）
-        let master_pane = host.workspace().tabs().iter().find_map(|t| {
-            t.tree().panes().iter().find_map(|p| {
-                let role = p.role()?;
-                if role.starts_with("orchestrator-master") {
-                    Some((t.id(), p.id()))
-                } else {
-                    None
-                }
+        // master role のペインを検索（MCP 経由で TAKO_PANE_ID が取れない場合の救済）。
+        // 複数 master 対応: 呼び出し元の role suffix（例: ":tako"）と一致する master を優先
+        let caller_suffix = pane
+            .and_then(|p| {
+                let pid = PaneId::from_raw(p);
+                host.workspace().tabs().iter().find_map(|t| {
+                    t.tree()
+                        .panes()
+                        .iter()
+                        .find(|pp| pp.id() == pid)
+                        .and_then(|pp| pp.role())
+                        .and_then(|r| r.strip_prefix("orchestrator-master"))
+                        .map(|s| s.to_string())
+                })
+            })
+            .unwrap_or_default();
+
+        let find_master = |suffix: &str| -> Option<(TabId, PaneId)> {
+            let target_role = format!("orchestrator-master{suffix}");
+            host.workspace().tabs().iter().find_map(|t| {
+                t.tree().panes().iter().find_map(|p| {
+                    let role = p.role()?;
+                    if role == target_role {
+                        Some((t.id(), p.id()))
+                    } else {
+                        None
+                    }
+                })
+            })
+        };
+
+        let master_pane = if !caller_suffix.is_empty() {
+            find_master(&caller_suffix)
+        } else {
+            None
+        }
+        .or_else(|| {
+            host.workspace().tabs().iter().find_map(|t| {
+                t.tree().panes().iter().find_map(|p| {
+                    let role = p.role()?;
+                    if role.starts_with("orchestrator-master") {
+                        Some((t.id(), p.id()))
+                    } else {
+                        None
+                    }
+                })
             })
         });
+
         master_pane.ok_or_else(|| {
             DispatchError::InvalidParams(
                 "分割元ペインを特定できない（--pane または --tab を指定するか、tako 内のターミナルから実行する）".into(),
@@ -1515,6 +1553,7 @@ fn dispatch_orchestrator_spawn(
         .get_mut(new_id)
         .expect("直前に split で追加済み");
     pane_obj.set_title(Some(window_title.clone()));
+    pane_obj.set_spawned_by(Some(target));
     let pane_role = match label {
         Some(l) => format!("orchestrator-worker:{project}:{l}"),
         None => format!("orchestrator-worker:{project}"),
@@ -1525,6 +1564,7 @@ fn dispatch_orchestrator_spawn(
 
     Ok(json!({
         "pane_id": new_id.as_u64(),
+        "spawned_by": target.as_u64(),
         "title": window_title,
         "cwd": cwd,
         "model": model,
@@ -1543,13 +1583,15 @@ fn dispatch_orchestrator_worker_status(
 ) -> Result<Value, DispatchError> {
     use crate::orchestrator;
 
-    // ペインの存在確認
-    let pane_exists = host.workspace().tabs().iter().any(|tab| {
+    // ペインの存在確認（ツリー上 + shelved の両方を走査）
+    let target = PaneId::from_raw(pane_id);
+    let in_tree = host.workspace().tabs().iter().any(|tab| {
         tab.tree()
             .panes()
             .iter()
             .any(|p| p.id().as_u64() == pane_id)
     });
+    let pane_exists = in_tree || host.workspace().is_shelved(target);
 
     // session_id があれば claude agents で状態確認
     let (mut status, ctx_percent) = if let Some(sid) = session_id {
@@ -1562,7 +1604,6 @@ fn dispatch_orchestrator_worker_status(
     };
 
     // ペインの最近の出力を取得（pane → tmux session フォールバック）
-    let target = PaneId::from_raw(pane_id);
     let recent_output = host
         .session(target)
         .map(|session| {
@@ -1896,6 +1937,7 @@ fn list_json(host: &dyn ControlHost) -> Value {
                         "title_source": title_source_str(p.title_source()),
                         "osc_title": session.and_then(|s| s.title()),
                         "role": p.role(),
+                        "spawned_by": p.spawned_by().map(|id| id.as_u64()),
                         "origin": origin_str(p.origin()),
                         "focused": p.id() == tree.focused(),
                         // OSC 7 / 133 シェル統合由来（未検知なら null / "unknown"。FR-2.1.4）
