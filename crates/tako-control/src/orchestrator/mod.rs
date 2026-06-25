@@ -165,19 +165,6 @@ fn run_claude_agents_json() -> Option<Vec<u8>> {
     }
 }
 
-/// `claude agents --json` の出力から session_id を取得する
-pub fn find_session_id(cwd: &str) -> Option<String> {
-    let stdout = run_claude_agents_json()?;
-    let json_str = String::from_utf8(stdout).ok()?;
-    let agents: serde_json::Value = serde_json::from_str(&json_str).ok()?;
-    let agents = agents.as_array()?;
-    agents
-        .iter()
-        .filter(|a| a["cwd"].as_str() == Some(cwd))
-        .max_by_key(|a| a["startedAt"].as_i64().unwrap_or(0))
-        .and_then(|a| a["sessionId"].as_str().map(|s| s.to_string()))
-}
-
 /// `claude agents --json` から指定 session_id の status と ctx% を取得する
 pub fn query_agent_status(session_id: &str) -> AgentStatus {
     let Some(stdout) = run_claude_agents_json() else {
