@@ -1647,14 +1647,15 @@ fn dispatch_orchestrator_worker_status(
     }
 
     // idle 誤検知防止: サブエージェント完了の瞬間に claude agents --json が
-    // 一時的に idle を返すことがある。最終行（空行除く）に ❯ プロンプトが
+    // 一時的に idle を返すことがある。末尾付近に ❯ プロンプトが
     // なければメインはまだ作業中なので busy に補正する
+    // （Claude TUI のフッター 4〜6 行を考慮して末尾 10 行をチェック）
     if status == "idle" {
         let has_prompt = recent_output.as_ref().is_some_and(|out| {
             out.lines()
                 .rev()
-                .find(|l| !l.trim().is_empty())
-                .is_some_and(|last| last.trim_start().starts_with('❯'))
+                .take(10)
+                .any(|l| l.trim_start().starts_with('❯'))
         });
         if !has_prompt {
             status = "busy".to_string();

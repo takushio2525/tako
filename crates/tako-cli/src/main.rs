@@ -1016,20 +1016,21 @@ fn screen_looks_busy(output: &str) -> bool {
     })
 }
 
-/// 画面内容が idle（入力待ち）を示すパターンを含むか（最終行が ❯ で始まるか確認）
+/// 画面内容が idle（入力待ち）を示すパターンを含むか
+/// Claude TUI は ❯ プロンプトの下にフッター（区切り線・モデル情報・ctx%等）が
+/// 4〜6 行あるため、末尾 10 行の範囲でチェックする
 fn screen_looks_idle(output: &str) -> bool {
-    let lines = tail_lines(output, 1);
-    match lines.first() {
-        Some(last) => last.trim_start().starts_with('❯'),
-        None => false,
-    }
+    tail_lines(output, 10)
+        .iter()
+        .any(|l| l.trim_start().starts_with('❯'))
 }
 
-/// 最終行（空行除く）に ❯ プロンプトがあるか（dispatch 側の idle 補正と共用）
+/// 末尾付近に ❯ プロンプトがあるか（dispatch 側の idle 補正と共用）
+/// Claude TUI のフッター行を考慮して末尾 10 行をチェック
 pub fn last_line_has_prompt(output: &str) -> bool {
-    tail_lines(output, 1)
-        .first()
-        .is_some_and(|l| l.trim_start().starts_with('❯'))
+    tail_lines(output, 10)
+        .iter()
+        .any(|l| l.trim_start().starts_with('❯'))
 }
 
 /// `tako orchestrator projects` — CLI 版プロジェクト管理
