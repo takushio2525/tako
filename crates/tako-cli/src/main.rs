@@ -348,6 +348,33 @@ enum OrchestratorCommand {
         #[arg(long)]
         tmux_session: Option<String>,
     },
+    /// spawn + 完了待ち + 出力取得 + close を 1 回で行う
+    Run {
+        /// プロジェクトキー（projects.yaml に登録済み）
+        #[arg(long)]
+        project: String,
+        /// worker に渡すプロンプト
+        #[arg(long)]
+        prompt: String,
+        /// ペインタイトルに付けるラベル
+        #[arg(long)]
+        label: Option<String>,
+        /// 分割元ペイン ID
+        #[arg(long)]
+        pane: Option<u64>,
+        /// 子を出すタブ ID
+        #[arg(long)]
+        tab: Option<u64>,
+        /// 完了待ちタイムアウト秒数（省略時 1800）
+        #[arg(long, default_value = "1800")]
+        timeout: u64,
+        /// 完了後にペインを自動 close するか（省略時 true）
+        #[arg(long, default_value = "true")]
+        auto_close: bool,
+        /// 返す出力の末尾行数（省略時 200）
+        #[arg(long, default_value = "200")]
+        output_lines: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -699,6 +726,25 @@ fn main() -> ExitCode {
         Command::Orchestrator(OrchestratorCommand::Projects(ref sub)) => {
             orchestrator_projects_cli(sub)
         }
+        Command::Orchestrator(OrchestratorCommand::Run {
+            ref project,
+            ref prompt,
+            ref label,
+            pane,
+            tab,
+            timeout,
+            auto_close,
+            output_lines,
+        }) => orchestrator_run(
+            project,
+            prompt,
+            label.as_deref(),
+            pane,
+            tab,
+            timeout,
+            auto_close,
+            output_lines,
+        ),
         // remote コマンドはローカル処理（IPC 不要）
         Command::Remote(RemoteCommand::Start { port, no_tunnel }) => remote_start(port, no_tunnel),
         Command::Remote(RemoteCommand::Stop) => remote_stop(),
@@ -1031,6 +1077,163 @@ pub fn last_line_has_prompt(output: &str) -> bool {
     tail_lines(output, 10)
         .iter()
         .any(|l| l.trim_start().starts_with('❯'))
+}
+
+/// `tako orchestrator run` — spawn + 完了待ち + 出力取得 + close を 1 回で行う
+#[allow(clippy::too_many_arguments)]
+fn orchestrator_run(
+    project: &str,
+    prompt: &str,
+    label: Option<&str>,
+    pane: Option<u64>,
+    tab: Option<u64>,
+    timeout_secs: u64,
+    auto_close: bool,
+    output_lines: usize,
+) -> Result<(), String> {
+    // 1. Spawn
+    let pane_arg = if tab.is_some() {
+        None
+    } else {
+        target_pane(pane)?
+    };
+    let spawn_result = send_request(Request::OrchestratorSpawn {
+        project: project.to_string(),
+        prompt: prompt.to_string(),
+        label: label.map(|s| s.to_string()),
+        model: None,
+        effort: None,
+        pane: pane_arg,
+        tab,
+    })?;
+    let pane_id = spawn_result["pane_id"].as_u64().unwrap_or(0);
+    let spawned_by = spawn_result["spawned_by"].as_u64().unwrap_or(0);
+    let tmux_session = spawn_result["tmux_session"].as_str().map(String::from);
+    eprintln!(
+        "spawned pane {pane_id} (tmux: {})",
+        tmux_session.as_deref().unwrap_or("none")
+    );
+
+    // 2. 完了待ちポーリング（orchestrator_watch と同じ判定ロジック）
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    let interval = std::time::Duration::from_secs(5);
+    let need_streak: u32 = 8;
+    let mut idle_streak: u32 = 0;
+    let mut gone_streak: u32 = 0;
+    let mut final_status = "timeout".to_string();
+
+    // claude 起動 + プロンプト送信を待つ
+    std::thread::sleep(std::time::Duration::from_secs(20));
+
+    loop {
+        if start.elapsed() > timeout {
+            break;
+        }
+
+        let result = send_request(Request::OrchestratorWorkerStatus {
+            pane_id,
+            session_id: None,
+            tmux_session: tmux_session.clone(),
+        });
+
+        match result {
+            Ok(val) => {
+                let status = val["status"].as_str().unwrap_or("unknown");
+                let recent = val["recent_output"].as_str().unwrap_or("");
+                match status {
+                    "gone" => {
+                        if let Some(ref ts) = tmux_session {
+                            if tmux_session_alive(ts) {
+                                gone_streak = 0;
+                                idle_streak = 0;
+                                std::thread::sleep(interval);
+                                continue;
+                            }
+                        }
+                        gone_streak += 1;
+                        if gone_streak >= 2 {
+                            final_status = "error".to_string();
+                            break;
+                        }
+                    }
+                    "idle" => {
+                        gone_streak = 0;
+                        if screen_looks_busy(recent) {
+                            idle_streak = 0;
+                        } else {
+                            idle_streak += 1;
+                        }
+                    }
+                    "busy" => {
+                        gone_streak = 0;
+                        idle_streak = 0;
+                    }
+                    _ => {
+                        gone_streak = 0;
+                        if screen_looks_busy(recent) {
+                            idle_streak = 0;
+                        } else if screen_looks_idle(recent) {
+                            idle_streak += 1;
+                        } else {
+                            idle_streak = 0;
+                        }
+                    }
+                }
+                if idle_streak >= need_streak {
+                    final_status = "completed".to_string();
+                    break;
+                }
+            }
+            Err(_) => {
+                if let Some(ref ts) = tmux_session {
+                    if tmux_session_alive(ts) {
+                        gone_streak = 0;
+                        std::thread::sleep(interval);
+                        continue;
+                    }
+                }
+                gone_streak += 1;
+                if gone_streak >= 2 {
+                    final_status = "error".to_string();
+                    break;
+                }
+            }
+        }
+
+        std::thread::sleep(interval);
+    }
+
+    // 3. 出力取得
+    let output = send_request(Request::Read {
+        pane: Some(pane_id),
+        lines: Some(output_lines),
+        tmux_session: tmux_session.clone(),
+    })
+    .ok()
+    .and_then(|v| v["content"].as_str().map(String::from))
+    .unwrap_or_default();
+
+    // 4. 自動 close
+    let closed = if auto_close {
+        send_request(Request::Close {
+            pane: Some(pane_id),
+        })
+        .is_ok()
+    } else {
+        false
+    };
+
+    let result = serde_json::json!({
+        "pane_id": pane_id,
+        "spawned_by": spawned_by,
+        "status": final_status,
+        "output": output,
+        "duration_seconds": start.elapsed().as_secs(),
+        "closed": closed,
+    });
+    println!("{}", pretty_json(&result));
+    Ok(())
 }
 
 /// `tako orchestrator projects` — CLI 版プロジェクト管理
@@ -1525,6 +1728,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }
         Command::Orchestrator(OrchestratorCommand::Projects(_)) => {
             unreachable!("orchestrator projects は run() を通らない")
+        }
+        Command::Orchestrator(OrchestratorCommand::Run { .. }) => {
+            unreachable!("orchestrator run は run() を通らない")
         }
     })
 }

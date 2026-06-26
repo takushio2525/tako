@@ -859,6 +859,38 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "tako_orchestrator_run",
+            "description": "子 worker を spawn し、完了まで待って結果を返す。spawn + 完了待ち + \
+                出力取得 + close を 1 回で行うアトミック操作。Monitor や手動ポーリングは不要。\
+                完了判定は OrchestratorWorkerStatus と同じロジック（claude agents --json + \
+                端末出力の ❯ プロンプト検知）を内部で繰り返し呼ぶ。\
+                タイムアウト（既定 1800 秒）に達した場合は status=timeout で途中結果を返す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "プロジェクトキー（projects.yaml に登録済み）" },
+                    "prompt": { "type": "string", "description": "worker に渡すプロンプト" },
+                    "label": { "type": "string", "description": "ペインタイトルのラベル（省略時は '<project>-worker'）" },
+                    "pane": pane_schema("分割元ペイン ID（省略時は呼び出し元）"),
+                    "tab": { "type": "integer", "minimum": 0, "description": "子を出すタブ ID" },
+                    "timeout_seconds": {
+                        "type": "integer", "minimum": 10, "default": 1800,
+                        "description": "完了待ちタイムアウト秒数（省略時 1800 = 30 分）",
+                    },
+                    "auto_close": {
+                        "type": "boolean", "default": true,
+                        "description": "完了後にペインを自動 close するか（省略時 true）",
+                    },
+                    "output_lines": {
+                        "type": "integer", "minimum": 1, "default": 200,
+                        "description": "返す出力の末尾行数（省略時 200）",
+                    },
+                },
+                "required": ["project", "prompt"],
+                "additionalProperties": false,
+            },
+        }),
         // --- リモートアクセス MCP ツール ---
         json!({
             "name": "tako_remote_start",
@@ -910,7 +942,18 @@ fn call_tool(params: &Value, session: &mut McpSession) -> Result<Value, (i64, St
         .and_then(Value::as_str)
         .ok_or((-32602, "ツール名（name）が無い".to_string()))?;
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
+
+    // orchestrator_run はポーリングループを伴うため MCP ハンドラスレッドで合成する
+    // （dispatch は同期・UI スレッド実行のため長時間ブロック不可）
+    if name == "tako_orchestrator_run" {
+        return orchestrator_run(&args, session);
+    }
+
     let request = build_request(name, &args, session.caller_pane).map_err(|e| (-32602, e))?;
+    exec_and_wrap(request, session)
+}
+
+fn exec_and_wrap(request: Request, session: &mut McpSession) -> Result<Value, (i64, String)> {
     // 実行失敗は「ツール実行エラー」としてエージェントへ返す（MCP の isError。
     // エージェントが読んで自己修正できるよう、JSON-RPC エラーにはしない）
     Ok(match (session.exec)(request) {
@@ -925,6 +968,203 @@ fn call_tool(params: &Value, session: &mut McpSession) -> Result<Value, (i64, St
             json!({ "content": [{ "type": "text", "text": message }], "isError": true })
         }
     })
+}
+
+/// `tako_orchestrator_run` — spawn + 完了待ち + 出力取得 + close の合成操作。
+/// ポーリングループは MCP ハンドラスレッドで実行される（UI スレッドはブロックしない）。
+/// 各ステップは exec 経由で dispatch を呼ぶため、UI スレッドは短時間しか占有しない
+fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i64, String)> {
+    let map_err = |e: String| (-32602i64, e);
+
+    // --- パラメータ解析 ---
+    let project = str_arg(args, "project")
+        .map_err(map_err)?
+        .ok_or((-32602, "project を指定する".to_string()))?;
+    let prompt = str_arg(args, "prompt")
+        .map_err(map_err)?
+        .ok_or((-32602, "prompt を指定する".to_string()))?;
+    let label = str_arg(args, "label").map_err(map_err)?;
+    let tab = u64_arg(args, "tab").map_err(map_err)?;
+    let pane = if tab.is_some() {
+        None
+    } else {
+        u64_arg(args, "pane")
+            .map_err(map_err)?
+            .or(session.caller_pane)
+    };
+    let timeout_secs = u64_arg(args, "timeout_seconds")
+        .map_err(map_err)?
+        .unwrap_or(1800);
+    let auto_close = bool_arg(args, "auto_close")
+        .map_err(map_err)?
+        .unwrap_or(true);
+    let output_lines = u64_arg(args, "output_lines")
+        .map_err(map_err)?
+        .unwrap_or(200) as usize;
+
+    // --- 1. Spawn ---
+    let spawn_req = Request::OrchestratorSpawn {
+        project: project.clone(),
+        prompt: prompt.clone(),
+        label: label.clone(),
+        model: None,
+        effort: None,
+        pane,
+        tab,
+    };
+    let spawn_result = (session.exec)(spawn_req).map_err(|e| (-32602, e))?;
+    let pane_id = spawn_result["pane_id"].as_u64().unwrap_or(0);
+    let spawned_by = spawn_result["spawned_by"].as_u64().unwrap_or(0);
+    let tmux_session = spawn_result["tmux_session"].as_str().map(String::from);
+
+    // --- 2. 完了待ちポーリング ---
+    // orchestrator_watch と同じ判定ロジック: OrchestratorWorkerStatus を繰り返し呼び、
+    // status + 端末出力パターンで idle/gone を判定する。
+    // session_id は spawn 直後には不明なので None で開始し、端末出力ベースの判定に頼る。
+    // 連続 8 回の idle 検知で確定（session_id なし時の watch と同じ閾値）
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    let interval = std::time::Duration::from_secs(5);
+    let need_streak: u32 = 8;
+    let mut idle_streak: u32 = 0;
+    let mut gone_streak: u32 = 0;
+    let mut final_status = "timeout".to_string();
+
+    // claude 起動 + プロンプト送信を待つ（prompt_flow は 15〜20 秒かかる）
+    std::thread::sleep(std::time::Duration::from_secs(20));
+
+    loop {
+        if start.elapsed() > timeout {
+            break;
+        }
+
+        let status_req = Request::OrchestratorWorkerStatus {
+            pane_id,
+            session_id: None,
+            tmux_session: tmux_session.clone(),
+        };
+
+        match (session.exec)(status_req) {
+            Ok(val) => {
+                let status = val["status"].as_str().unwrap_or("unknown");
+                let recent = val["recent_output"].as_str().unwrap_or("");
+
+                match status {
+                    "gone" => {
+                        gone_streak += 1;
+                        if gone_streak >= 2 {
+                            final_status = "error".to_string();
+                            break;
+                        }
+                    }
+                    "idle" => {
+                        gone_streak = 0;
+                        if screen_looks_busy(recent) {
+                            idle_streak = 0;
+                        } else {
+                            idle_streak += 1;
+                        }
+                    }
+                    "busy" => {
+                        gone_streak = 0;
+                        idle_streak = 0;
+                    }
+                    _ => {
+                        // unknown: 端末出力から推定
+                        gone_streak = 0;
+                        if screen_looks_busy(recent) {
+                            idle_streak = 0;
+                        } else if screen_looks_idle(recent) {
+                            idle_streak += 1;
+                        } else {
+                            idle_streak = 0;
+                        }
+                    }
+                }
+
+                if idle_streak >= need_streak {
+                    final_status = "completed".to_string();
+                    break;
+                }
+            }
+            Err(_) => {
+                gone_streak += 1;
+                if gone_streak >= 2 {
+                    final_status = "error".to_string();
+                    break;
+                }
+            }
+        }
+
+        std::thread::sleep(interval);
+    }
+
+    // --- 3. 出力取得 ---
+    let output = {
+        let read_req = Request::Read {
+            pane: Some(pane_id),
+            lines: Some(output_lines),
+            tmux_session: tmux_session.clone(),
+        };
+        match (session.exec)(read_req) {
+            Ok(result) => result["content"].as_str().unwrap_or("").to_string(),
+            Err(_) => String::new(),
+        }
+    };
+
+    // --- 4. 自動 close ---
+    let closed = if auto_close {
+        let close_req = Request::Close {
+            pane: Some(pane_id),
+        };
+        (session.exec)(close_req).is_ok()
+    } else {
+        false
+    };
+
+    let result = json!({
+        "pane_id": pane_id,
+        "spawned_by": spawned_by,
+        "status": final_status,
+        "output": output,
+        "duration_seconds": start.elapsed().as_secs(),
+        "closed": closed,
+    });
+    Ok(json!({
+        "content": [{ "type": "text", "text": result.to_string() }],
+        "isError": false,
+    }))
+}
+
+/// 端末出力が busy を示すパターンを含むか（末尾 5 行に限定）
+fn screen_looks_busy(output: &str) -> bool {
+    tail_lines(output, 5).iter().any(|l| {
+        l.contains("esc to interrupt")
+            || l.contains("ing… (")
+            || l.contains("Thinking")
+            || l.contains("Reading")
+            || l.contains("Editing")
+            || l.contains("Running")
+            || l.contains("Writing")
+            || l.contains("Searching")
+    })
+}
+
+/// 端末出力が idle（❯ プロンプト）を示すか（末尾 10 行でチェック）
+fn screen_looks_idle(output: &str) -> bool {
+    tail_lines(output, 10)
+        .iter()
+        .any(|l| l.trim_start().starts_with('❯'))
+}
+
+/// 空行を除いた末尾 N 行を返す
+fn tail_lines(output: &str, n: usize) -> Vec<&str> {
+    output
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(n)
+        .collect()
 }
 
 /// ツール呼び出しを操作プロトコル（[`Request`]）へ写す。エラーは引数バリデーション失敗
@@ -1616,7 +1856,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 43);
+        assert_eq!(tools.len(), 44);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

@@ -27,9 +27,30 @@ target repositories.**
   2. Read the summary from the pane output, then kill the scout
   3. Use the summary to write a focused prompt for the implementation worker
 
-## Spawning Workers
+## Running Workers (Recommended)
 
-Use the `tako_orchestrator_spawn` MCP tool:
+Use `tako_orchestrator_run` for one-shot tasks. It spawns, waits for completion,
+reads output, and closes the pane — all in a single MCP call. No Monitor setup needed.
+
+```
+tako_orchestrator_run({
+  project: "project-key",
+  prompt: "Your task description here",
+  label: "short-label"
+})
+```
+
+Returns `{ status, output, pane_id, duration_seconds, ... }`.
+- `status: "completed"` — worker finished successfully
+- `status: "timeout"` — hit the timeout (default 30 min); output contains partial results
+- `status: "error"` — worker pane disappeared
+
+Optional params: `timeout_seconds` (default 1800), `auto_close` (default true),
+`output_lines` (default 200), `pane`, `tab`.
+
+## Spawning Workers (Advanced)
+
+For long-running or interactive workers, use `tako_orchestrator_spawn` + manual monitoring.
 
 ```
 tako_orchestrator_spawn({
@@ -43,9 +64,9 @@ This will:
 1. Look up the project's working directory from the configuration
 2. Split a new pane and start `claude` in it
 3. Send your prompt to the worker
-4. Return the pane ID and session ID for monitoring
+4. Return the pane ID and tmux_session for monitoring
 
-## Monitoring Workers (Required)
+## Monitoring Workers (for spawn, not needed for run)
 
 **After spawning a worker, always set up monitoring. No exceptions.**
 
