@@ -2011,6 +2011,7 @@ impl TakoApp {
             self,
             tako_control::protocol::Request::Close {
                 pane: Some(pane.as_u64()),
+                force: true,
             },
             PaneOrigin::User,
         );
@@ -7884,7 +7885,7 @@ mod self_test {
                     // close で片付く（previews からも消える）
                     let closed = tako_control::dispatch(
                         app,
-                        tako_control::protocol::Request::Close { pane: Some(pane) },
+                        tako_control::protocol::Request::Close { pane: Some(pane), force: true },
                         PaneOrigin::Cli,
                     )
                     .is_ok()
@@ -7930,6 +7931,7 @@ mod self_test {
                             app,
                             tako_control::protocol::Request::Close {
                                 pane: Some(pane.as_u64()),
+                                force: true,
                             },
                             PaneOrigin::Cli,
                         );
@@ -8005,6 +8007,7 @@ mod self_test {
                         app,
                         tako_control::protocol::Request::Close {
                             pane: Some(temp_pane),
+                            force: true,
                         },
                         PaneOrigin::Cli,
                     );
@@ -8097,6 +8100,7 @@ mod self_test {
                         app,
                         tako_control::protocol::Request::Close {
                             pane: Some(opened_pane),
+                            force: true,
                         },
                         PaneOrigin::Cli,
                     );
@@ -8150,7 +8154,7 @@ mod self_test {
                     for pane in [first, second["pane"].as_u64().unwrap_or(0)] {
                         let _ = tako_control::dispatch(
                             app,
-                            tako_control::protocol::Request::Close { pane: Some(pane) },
+                            tako_control::protocol::Request::Close { pane: Some(pane), force: true },
                             PaneOrigin::Cli,
                         );
                     }
@@ -8223,7 +8227,7 @@ mod self_test {
                     // 後片付け: 一時ペインを閉じて 1 ペイン構成へ戻す
                     let _ = tako_control::dispatch(
                         app,
-                        tako_control::protocol::Request::Close { pane: Some(p2) },
+                        tako_control::protocol::Request::Close { pane: Some(p2), force: true },
                         PaneOrigin::Cli,
                     );
                     moved
@@ -8299,6 +8303,7 @@ mod self_test {
                         app,
                         tako_control::protocol::Request::Close {
                             pane: Some(pane_id),
+                            force: true,
                         },
                         PaneOrigin::Cli,
                     );
@@ -8352,6 +8357,7 @@ mod self_test {
                             app,
                             tako_control::protocol::Request::Close {
                                 pane: Some(pane_id),
+                                force: true,
                             },
                             PaneOrigin::Cli,
                         );

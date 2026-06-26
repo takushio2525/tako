@@ -252,8 +252,28 @@ pub fn dispatch(
             Ok(json!({ "pane": new_id.as_u64() }))
         }
 
-        Request::Close { pane } => {
+        Request::Close { pane, force } => {
             let (tab, target) = resolve_pane(host.workspace(), pane)?;
+
+            // worker 保護: orchestrator-worker role のペインが busy なら拒否
+            if !force {
+                let is_worker = host
+                    .workspace()
+                    .get_tab(tab)
+                    .and_then(|t| t.tree().get(target))
+                    .and_then(|p| p.role())
+                    .is_some_and(|r| r.starts_with("orchestrator-worker"));
+                if is_worker {
+                    let busy = is_worker_busy(host, target);
+                    if busy {
+                        return Err(DispatchError::Operation(format!(
+                            "Worker is still active. Use force: true to close anyway. pane_id={}",
+                            target.as_u64()
+                        )));
+                    }
+                }
+            }
+
             let closed = tree_mut(host.workspace_mut(), tab).close(target);
             match closed {
                 Ok(_) => {}
@@ -1669,6 +1689,25 @@ fn dispatch_orchestrator_worker_status(
     }))
 }
 
+/// worker が busy かどうかを画面出力で判定する。
+/// false negative より false positive を優先（殺すより残す方が安全）。
+fn is_worker_busy(host: &dyn ControlHost, target: PaneId) -> bool {
+    let Some(session) = host.session(target) else {
+        return true; // 画面取得不可 = busy 寄りに倒す
+    };
+    let mut lines = session.visible_lines();
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    // フッター行（4〜6行）を考慮して末尾 10 行をチェック
+    let has_prompt = lines
+        .iter()
+        .rev()
+        .take(10)
+        .any(|l| l.trim_start().starts_with('❯'));
+    !has_prompt
+}
+
 fn shell_escape(s: &str) -> String {
     if s.chars()
         .all(|c| c.is_alphanumeric() || c == '/' || c == '.' || c == '-' || c == '_')
@@ -2338,7 +2377,10 @@ mod tests {
         let new_id = split(&mut host, root);
         let result = dispatch(
             &mut host,
-            Request::Close { pane: Some(new_id) },
+            Request::Close {
+                pane: Some(new_id),
+                force: false,
+            },
             PaneOrigin::Cli,
         )
         .unwrap();
@@ -2355,7 +2397,10 @@ mod tests {
         assert_eq!(host.ws.tabs().len(), 2);
         dispatch(
             &mut host,
-            Request::Close { pane: Some(root) },
+            Request::Close {
+                pane: Some(root),
+                force: false,
+            },
             PaneOrigin::Cli,
         )
         .unwrap();
@@ -2369,7 +2414,10 @@ mod tests {
         let root = host.root_pane();
         let err = dispatch(
             &mut host,
-            Request::Close { pane: Some(root) },
+            Request::Close {
+                pane: Some(root),
+                force: false,
+            },
             PaneOrigin::Cli,
         )
         .unwrap_err();
@@ -3087,11 +3135,22 @@ mod tests {
     #[test]
     fn 不正な対象はエラー() {
         let mut host = MockHost::new();
-        let err = dispatch(&mut host, Request::Close { pane: None }, PaneOrigin::Cli).unwrap_err();
+        let err = dispatch(
+            &mut host,
+            Request::Close {
+                pane: None,
+                force: false,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
         assert_eq!(err, DispatchError::NoTargetPane);
         let err = dispatch(
             &mut host,
-            Request::Close { pane: Some(99999) },
+            Request::Close {
+                pane: Some(99999),
+                force: false,
+            },
             PaneOrigin::Cli,
         )
         .unwrap_err();

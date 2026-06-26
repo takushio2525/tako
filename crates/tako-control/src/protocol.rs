@@ -136,7 +136,12 @@ pub enum Request {
         focus: Option<bool>,
     },
     /// ペイン削除（FR-2.5.4。呼び出し元自身の削除 = 自己片付けを含む）
-    Close { pane: Option<u64> },
+    Close {
+        pane: Option<u64>,
+        /// true にすると busy な worker でも強制 close（省略時 false）
+        #[serde(default)]
+        force: bool,
+    },
     /// フォーカス移動（FR-2.5.5）。`direction` 指定時はアクティブタブ内の方向移動
     Focus {
         pane: Option<u64>,

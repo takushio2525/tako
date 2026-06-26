@@ -513,6 +513,9 @@ struct CloseArgs {
     /// 対象ペイン ID（省略時は呼び出し元 = 自己片付け）
     #[arg(long)]
     pane: Option<u64>,
+    /// busy な worker でも強制的に close する
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Args)]
@@ -1214,10 +1217,11 @@ fn orchestrator_run(
     .and_then(|v| v["content"].as_str().map(String::from))
     .unwrap_or_default();
 
-    // 4. 自動 close
+    // 4. 自動 close（orchestrator run の完了後なので force: true）
     let closed = if auto_close {
         send_request(Request::Close {
             pane: Some(pane_id),
+            force: true,
         })
         .is_ok()
     } else {
@@ -1414,6 +1418,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }
         Command::Close(args) => Request::Close {
             pane: target_pane(args.pane)?,
+            force: args.force,
         },
         Command::Title(args) => Request::Title {
             pane: target_pane(args.pane)?,

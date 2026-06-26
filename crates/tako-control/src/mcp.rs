@@ -403,11 +403,17 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_close_pane",
             "description": "ペインを閉じる。pane 省略時は呼び出し元自身（自分のペイン）を閉じる。\
                 役目を終えた作業ペインはこのツールで片付けること。\
-                タブ最後の 1 ペインならタブごと閉じる（最後のタブの最後のペインは閉じられない）。",
+                タブ最後の 1 ペインならタブごと閉じる（最後のタブの最後のペインは閉じられない）。\
+                orchestrator-worker role のペインは busy 時に close が拒否される。\
+                強制 close するには force: true を指定する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane": pane_schema("対象ペイン ID（省略時は呼び出し元 = 自己片付け）"),
+                    "force": {
+                        "type": "boolean",
+                        "description": "true にすると busy な worker でも強制的に close する（省略時 false）",
+                    },
                 },
                 "additionalProperties": false,
             },
@@ -1112,10 +1118,11 @@ fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i6
         }
     };
 
-    // --- 4. 自動 close ---
+    // --- 4. 自動 close（orchestrator run の完了後なので force: true）---
     let closed = if auto_close {
         let close_req = Request::Close {
             pane: Some(pane_id),
+            force: true,
         };
         (session.exec)(close_req).is_ok()
     } else {
@@ -1237,6 +1244,7 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
         }
         "tako_close_pane" => Request::Close {
             pane: Some(target_pane(args, caller)?),
+            force: bool_arg(args, "force")?.unwrap_or(false),
         },
         "tako_resize_pane" => Request::Resize {
             pane: Some(target_pane(args, caller)?),
@@ -2078,7 +2086,10 @@ mod tests {
                     // X-Tako-Pane がデフォルト対象として解決されている（FR-2.3.3）
                     assert_eq!(
                         incoming.request,
-                        Request::Close { pane: Some(42) },
+                        Request::Close {
+                            pane: Some(42),
+                            force: false
+                        },
                         "X-Tako-Pane が呼び出し元として使われる"
                     );
                     let _ = incoming.reply.send(Ok(json!({ "closed": 42 })));
