@@ -84,6 +84,7 @@ impl Drop for WebViewState {
         self.stop_flag.store(true, Ordering::Relaxed);
         if let Some(mut child) = self.chrome_process.take() {
             let _ = child.kill();
+            let _ = std::fs::remove_dir_all("/tmp/tako-chrome-cdp");
         }
     }
 }
@@ -135,6 +136,7 @@ pub fn launch_chrome(
     } else {
         let child = Command::new(&chrome_path)
             .arg(format!("--remote-debugging-port={port}"))
+            .arg("--user-data-dir=/tmp/tako-chrome-cdp")
             .arg(format!("--window-size={viewport_width},{viewport_height}"))
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
