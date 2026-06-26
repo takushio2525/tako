@@ -83,7 +83,7 @@ CI（`.github/workflows/ci.yml`）は macOS / Windows の両ランナーで buil
 - 技術設計・リスク・3 層制御プレーン: `.agent/architecture.md`
 - 規約（命名・エラー・ログ）: `.agent/conventions.md`
 - 手動確認チェックリスト（IME・.app 等、機械検証できない項目）: `.agent/manual-checks.md`
-- オーケストレーター使い方ガイド: `docs/orchestrator.md`
+- オーケストレーター使い方ガイド: `.agent/orchestrator.md`
 
 ### 作業履歴メモ（毎ターン参照・更新）
 

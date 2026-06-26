@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- 案A: ダークターミナル背景にコーラルピンクのタコ + 緑のプロンプト >_ -->
+  <defs>
+    <linearGradient id="a-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#252c40"/>
+      <stop offset="1" stop-color="#10131c"/>
+    </linearGradient>
+    <linearGradient id="a-octo" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff9eb2"/>
+      <stop offset="1" stop-color="#ef5e8e"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="234" fill="url(#a-bg)"/>
+  <!-- 外側の触手カール（左右） -->
+  <path d="M330,520 C260,630 185,645 152,580" fill="none" stroke="#ef5e8e"
+        stroke-width="62" stroke-linecap="round"/>
+  <path d="M694,520 C764,630 839,645 872,580" fill="none" stroke="#ef5e8e"
+        stroke-width="62" stroke-linecap="round"/>
+  <!-- 頭 + 触手フリル（下縁スカラップ） -->
+  <path d="M297,400 A215,215 0 0 1 727,400 L727,565
+           a43,43 0 0 1 -86,0 a43,43 0 0 1 -86,0 a43,43 0 0 1 -86,0
+           a43,43 0 0 1 -86,0 a43,43 0 0 1 -86,0 Z"
+        fill="url(#a-octo)"/>
+  <!-- 目 -->
+  <circle cx="432" cy="430" r="48" fill="#ffffff"/>
+  <circle cx="592" cy="430" r="48" fill="#ffffff"/>
+  <circle cx="440" cy="438" r="22" fill="#27212e"/>
+  <circle cx="584" cy="438" r="22" fill="#27212e"/>
+  <circle cx="448" cy="428" r="8" fill="#ffffff"/>
+  <circle cx="592" cy="428" r="8" fill="#ffffff"/>
+  <!-- 頬と口 -->
+  <ellipse cx="362" cy="498" rx="34" ry="22" fill="#ffc2cf" opacity="0.85"/>
+  <ellipse cx="662" cy="498" rx="34" ry="22" fill="#ffc2cf" opacity="0.85"/>
+  <path d="M472,506 q40,34 80,0" fill="none" stroke="#b03a64"
+        stroke-width="16" stroke-linecap="round"/>
+  <!-- プロンプト >_ -->
+  <path d="M384,736 L474,800 L384,864" fill="none" stroke="#4ade80"
+        stroke-width="54" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="524" y="836" width="132" height="46" rx="12" fill="#4ade80"/>
+</svg>

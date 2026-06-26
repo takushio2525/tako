@@ -30,3 +30,8 @@ web/tako-remote-worker/node_modules/
 # PWA
 web/tako-remote/node_modules/
 web/tako-remote/dist/
+
+# Docs
+docs/node_modules/
+docs/dist/
+docs/.astro/

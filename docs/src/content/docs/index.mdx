@@ -1,0 +1,56 @@
+---
+title: tako
+description: AI エージェントのための次世代ターミナル
+template: splash
+hero:
+  title: tako
+  tagline: AI エージェントが画面を自由に操る、次世代ターミナル。Claude Code の子エージェント・dev サーバー・ファイルプレビューを「1 タブ = 1 作業グループ」で集約管理。設定ゼロで AI が自分のワークスペースを組み立てる。
+  image:
+    file: ../../assets/tako-icon.svg
+  actions:
+    - text: ダウンロード
+      link: https://github.com/takushio2525/tako/releases
+      icon: external
+      variant: primary
+    - text: セットアップガイド
+      link: /getting-started/
+      variant: secondary
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## tako でできること
+
+<CardGrid>
+  <Card title="内蔵 MCP サーバー" icon="puzzle">
+    tako の中で Claude Code を起動すれば、AI は設定ゼロで自動的にペインの分割・コマンド実行・ファイル表示ができる。「隣のペインで dev サーバー起動して」が一言で通る。
+  </Card>
+  <Card title="タブ＆ペイン管理" icon="laptop">
+    iTerm2 ライクな分割レイアウトにドラッグ&ドロップ対応。AI エージェント・dev サーバー・ログを「1 タブ = 1 作業グループ」にまとめて全体像を把握できる。
+  </Card>
+  <Card title="再起動しても消えない" icon="rocket">
+    tmux バックエンド により、tako を閉じて再起動しても実行中のプロセスと画面内容がそのまま復元される。エージェントの長時間タスクも安心。
+  </Card>
+  <Card title="ファイルプレビュー" icon="document">
+    AI が「このファイル見て」と言ったら、シンタックスハイライト付きのコードプレビューや Markdown レンダリングがペイン内に直接表示される。エディタを開く必要なし。
+  </Card>
+</CardGrid>
+
+## なぜ tako？
+
+通常のターミナルで Claude Code を使うと、子エージェントや dev サーバーが別タブ・別ウィンドウに散らばり、AI が何をしているのか見失いがちです。
+
+tako は**AI エージェントが自分の作業環境を自律的に組み立てる**ことを前提に設計されたターミナルです。内蔵 MCP サーバーにより、AI は設定ゼロで画面分割・コマンド実行・ファイル表示・ポート検知を操作できます。人間はタブを眺めるだけで、複数エージェントの進捗と成果物を一目で把握できます。
+
+## はじめよう
+
+```bash
+# 1. GitHub Releases からダウンロード＆インストール
+# 2. MCP サーバーを登録（初回のみ）
+tako setup-mcp
+
+# 3. tako 内で Claude Code を起動 — もう AI は tako を使える
+claude
+```
+
+詳しい手順は [セットアップガイド](/getting-started/) をご覧ください。
