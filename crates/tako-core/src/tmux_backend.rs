@@ -16,6 +16,7 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use crate::pane::PaneId;
 use crate::paths::data_dir;
 use crate::terminal::{SpawnCommand, SpawnOptions};
 
@@ -52,9 +53,12 @@ pub fn available() -> bool {
 /// - `allow-passthrough on`: シェル統合の OSC 7 / 133 をパススルーで外（tako）へ届かせる
 /// - `extended-keys` + `terminal-features extkeys`: kitty keyboard / CSI u
 ///   （Shift+Enter 等の区別。FR の常用要件）を tmux 越しに維持する
-/// - `update-environment`: 再 attach 時にセッション環境の TAKO_* を新インスタンスの値へ
-///   更新する（既存プロセスには届かないが、それは CLI の control.json フォールバック
-///   = FR-2.2.9 が吸収する）
+/// - `update-environment`: 再 attach 時にセッション環境の TAKO_SOCKET / TAKO_TOKEN /
+///   TAKO_MCP_URL を新インスタンスの値へ更新する（既存プロセスには届かないが、
+///   それは CLI の control.json フォールバック = FR-2.2.9 が吸収する）。
+///   TAKO_PANE_ID / TAKO_TAB_ID はペイン固有の値のため update-environment ではなく
+///   `set_pane_env` で個別設定する（tako は単一プロセスなので update-environment で
+///   コピーすると全セッションが同じ値になる）
 /// - `copy-mode-position-format ''`: copy-mode（ホイールスクロール）右上の
 ///   位置インジケータを消す。tmux 3.6 の既定フォーマットは先頭行タイムスタンプ
 ///   （`15:13 [10/77]` のような時刻表示）を含み、通常ペインのスクロール中に
@@ -74,7 +78,7 @@ set -s escape-time 10
 set -s extended-keys always
 set -sq extended-keys-format csi-u
 set -as terminal-features 'xterm*:extkeys:RGB'
-set -g update-environment 'TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL TAKO_TAB_ID TAKO_PANE_ID'
+set -g update-environment 'TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL'
 set -gq copy-mode-position-format ''
 ";
 
@@ -165,6 +169,22 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
             args,
         }),
         ..options
+    }
+}
+
+/// セッション環境に TAKO_PANE_ID / TAKO_TAB_ID を個別設定する。
+/// `update-environment` は attach 時にクライアント（= tako プロセス）の環境変数をコピーするが、
+/// tako は単一プロセスなので全セッションに同じ値が入る。この関数で各セッション固有の値を書く
+pub fn set_pane_env(socket: &str, session: &str, pane_id: PaneId, tab_id: &str) {
+    let target = format!("={session}");
+    let pane_str = pane_id.to_string();
+    for (key, val) in [("TAKO_PANE_ID", pane_str.as_str()), ("TAKO_TAB_ID", tab_id)] {
+        if val.is_empty() {
+            continue;
+        }
+        let _ = crate::tmux::tmux_command(Some(socket))
+            .args(["set-environment", "-t", &target, key, val])
+            .output();
     }
 }
 

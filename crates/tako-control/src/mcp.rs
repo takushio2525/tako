@@ -1164,15 +1164,22 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             cwd: str_arg(args, "cwd")?,
             description: str_arg(args, "description")?,
         },
-        "tako_orchestrator_spawn" => Request::OrchestratorSpawn {
-            project: str_arg(args, "project")?.ok_or("project を指定する")?,
-            prompt: str_arg(args, "prompt")?.ok_or("prompt を指定する")?,
-            label: str_arg(args, "label")?,
-            model: str_arg(args, "model")?,
-            effort: str_arg(args, "effort")?,
-            pane: u64_arg(args, "pane")?.or(caller),
-            tab: u64_arg(args, "tab")?,
-        },
+        "tako_orchestrator_spawn" => {
+            let tab = u64_arg(args, "tab")?;
+            Request::OrchestratorSpawn {
+                project: str_arg(args, "project")?.ok_or("project を指定する")?,
+                prompt: str_arg(args, "prompt")?.ok_or("prompt を指定する")?,
+                label: str_arg(args, "label")?,
+                model: str_arg(args, "model")?,
+                effort: str_arg(args, "effort")?,
+                pane: if tab.is_some() {
+                    None
+                } else {
+                    u64_arg(args, "pane")?.or(caller)
+                },
+                tab,
+            }
+        }
         "tako_orchestrator_worker_status" => Request::OrchestratorWorkerStatus {
             pane_id: required_u64(args, "pane_id")?,
             session_id: str_arg(args, "session_id")?,

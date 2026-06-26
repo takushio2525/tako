@@ -1449,20 +1449,22 @@ fn dispatch_orchestrator_spawn(
     };
 
     // 分割元ペインの解決。優先順位: pane > tab > master role 検索
-    let (tab_id, target) = if let Some(resolved) =
-        pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok())
-    {
+    let resolved_pane = pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok());
+    let (tab_id, target) = if let Some(resolved) = resolved_pane {
         resolved
     } else if let Some(raw_tab) = tab {
         let tid = find_tab(host.workspace(), raw_tab)?;
         let focused = host.workspace().get_tab(tid).unwrap().tree().focused();
         (tid, focused)
     } else {
-        // master role のペインを検索（MCP 経由で TAKO_PANE_ID が取れない場合の救済）。
-        // 複数 master 対応: 呼び出し元の role suffix（例: ":tako"）と一致する master を優先
-        let caller_suffix = pane
-            .and_then(|p| {
-                let pid = PaneId::from_raw(p);
+        // master role のペインを検索。pane が指定されていても resolve に失敗した場合
+        // （再起動で PaneId が変わった stale な値）はここに落ちる。
+        // 複数 master 対応: caller の role suffix（例: ":tako"）と一致する master を優先。
+        // stale な pane からは suffix を取れないため、全 master の中から orchestrator-worker
+        // の spawned_by チェーンを遡って呼び出し元を推定する手段は無い。
+        // → suffix マッチは pane が有効な場合のみ動作する
+        let caller_suffix = resolved_pane
+            .and_then(|(_, pid)| {
                 host.workspace().tabs().iter().find_map(|t| {
                     t.tree()
                         .panes()
