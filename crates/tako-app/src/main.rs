@@ -2115,19 +2115,6 @@ impl TakoApp {
         } else {
             self.backend_sessions.remove(&pane_id);
         }
-        // tmux セッション環境に TAKO_PANE_ID を個別設定する。update-environment は
-        // attach 時にクライアント環境からコピーするが、tako は単一プロセスなので全セッションが
-        // 同じ値になってしまう。set-environment -t で各セッション固有の値を書き込むことで、
-        // 以後にそのセッション内で起動されるプロセス（MCP stdio ブリッジ等）が正しい値を取得する
-        if let Some(ref name) = backend_session {
-            let socket = tako_core::tmux_backend::socket_name();
-            let tab_str = self
-                .workspace
-                .find_tab_of_pane(pane_id)
-                .map(|t| t.to_string())
-                .unwrap_or_default();
-            tako_core::tmux_backend::set_pane_env(&socket, name, pane_id, &tab_str);
-        }
         let (session, mut rx) = TerminalSession::spawn(INITIAL_COLS, INITIAL_ROWS, options)?;
         self.terminals.insert(pane_id, session);
         cx.spawn(async move |this, cx| {

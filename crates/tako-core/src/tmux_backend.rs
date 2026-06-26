@@ -16,7 +16,6 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use crate::pane::PaneId;
 use crate::paths::data_dir;
 use crate::terminal::{SpawnCommand, SpawnOptions};
 
@@ -56,9 +55,8 @@ pub fn available() -> bool {
 /// - `update-environment`: 再 attach 時にセッション環境の TAKO_SOCKET / TAKO_TOKEN /
 ///   TAKO_MCP_URL を新インスタンスの値へ更新する（既存プロセスには届かないが、
 ///   それは CLI の control.json フォールバック = FR-2.2.9 が吸収する）。
-///   TAKO_PANE_ID / TAKO_TAB_ID はペイン固有の値のため update-environment ではなく
-///   `set_pane_env` で個別設定する（tako は単一プロセスなので update-environment で
-///   コピーすると全セッションが同じ値になる）
+///   TAKO_PANE_ID / TAKO_TAB_ID はペイン固有の値のため update-environment には入れず、
+///   `wrap_options` で `new-session -e` により各セッションに直接注入する
 /// - `copy-mode-position-format ''`: copy-mode（ホイールスクロール）右上の
 ///   位置インジケータを消す。tmux 3.6 の既定フォーマットは先頭行タイムスタンプ
 ///   （`15:13 [10/77]` のような時刻表示）を含み、通常ペインのスクロール中に
@@ -149,6 +147,16 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
         "-s".to_string(),
         session.to_string(),
     ];
+    // ペイン固有の環境変数を tmux new-session -e で直接注入する（tmux 3.2+）。
+    // tmux サーバーのグローバル環境は最初のクライアントから継承され、後続セッションも
+    // その stale な値を使う。-e はセッション作成時に値を確定させるため、
+    // シェル起動後の set-environment（タイミング問題）やクライアント環境の継承に依存しない
+    for (key, val) in &options.env {
+        if key == "TAKO_PANE_ID" || key == "TAKO_TAB_ID" {
+            args.push("-e".to_string());
+            args.push(format!("{key}={val}"));
+        }
+    }
     if let Some(cwd) = &options.cwd {
         args.push("-c".to_string());
         args.push(cwd.display().to_string());
@@ -169,22 +177,6 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
             args,
         }),
         ..options
-    }
-}
-
-/// セッション環境に TAKO_PANE_ID / TAKO_TAB_ID を個別設定する。
-/// `update-environment` は attach 時にクライアント（= tako プロセス）の環境変数をコピーするが、
-/// tako は単一プロセスなので全セッションに同じ値が入る。この関数で各セッション固有の値を書く
-pub fn set_pane_env(socket: &str, session: &str, pane_id: PaneId, tab_id: &str) {
-    let target = format!("={session}");
-    let pane_str = pane_id.to_string();
-    for (key, val) in [("TAKO_PANE_ID", pane_str.as_str()), ("TAKO_TAB_ID", tab_id)] {
-        if val.is_empty() {
-            continue;
-        }
-        let _ = crate::tmux::tmux_command(Some(socket))
-            .args(["set-environment", "-t", &target, key, val])
-            .output();
     }
 }
 
@@ -353,7 +345,10 @@ mod tests {
         assert_eq!(args[c + 1], "/tmp");
         // 内側コマンドはクォート済みの 1 引数
         assert_eq!(args.last().unwrap(), "/bin/sh -c 'echo hi'");
-        // env / cwd は維持される（env はセッション作成時の環境になる）
+        // TAKO_PANE_ID は -e フラグでセッション環境に直接注入される
+        let e_pos = args.iter().position(|a| a == "-e").unwrap();
+        assert_eq!(args[e_pos + 1], "TAKO_PANE_ID=3");
+        // env / cwd は維持される（env はクライアントプロセスの環境にもなる）
         assert_eq!(wrapped.env.len(), 1);
         assert_eq!(wrapped.cwd.as_deref(), Some(std::path::Path::new("/tmp")));
     }
