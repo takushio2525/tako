@@ -160,8 +160,11 @@ pub trait ControlHost {
     fn remote_status(&self) -> Value {
         json!({ "running": false })
     }
-    /// Chrome を CDP ミラー方式で開く（FR-3.8 PoC）。UI 層で WebViewState を生成する
-    fn open_chrome(&mut self, _pane: PaneId, _url: &str) {}
+    /// Chrome を CDP ミラー方式で開く（FR-3.8 PoC）。UI 層で WebViewState を生成する。
+    /// 失敗時は Err を返し、呼び出し元がペインを巻き戻す
+    fn open_chrome(&mut self, _pane: PaneId, _url: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -1417,7 +1420,10 @@ pub fn dispatch(
             tree_mut(host.workspace_mut(), tab)
                 .split_with_ratio(target, dir, 0.5, new_pane)
                 .map_err(op_err)?;
-            host.open_chrome(new_id, &url);
+            if let Err(e) = host.open_chrome(new_id, &url) {
+                let _ = tree_mut(host.workspace_mut(), tab).close(new_id);
+                return Err(DispatchError::Operation(format!("Chrome 起動失敗: {e}")));
+            }
             tree_mut(host.workspace_mut(), tab)
                 .focus(new_id)
                 .map_err(op_err)?;

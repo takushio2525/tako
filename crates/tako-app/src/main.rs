@@ -4854,15 +4854,10 @@ impl ControlHost for TakoApp {
         tako_control::remote::daemon_status()
     }
 
-    fn open_chrome(&mut self, pane: PaneId, url: &str) {
-        match webview::launch_chrome(url, 9222, 1280, 800) {
-            Ok(state) => {
-                self.webviews.insert(pane, state);
-            }
-            Err(e) => {
-                eprintln!("Chrome 起動失敗（{url}）: {e}");
-            }
-        }
+    fn open_chrome(&mut self, pane: PaneId, url: &str) -> Result<(), String> {
+        let state = webview::launch_chrome(url, 9222, 1280, 800)?;
+        self.webviews.insert(pane, state);
+        Ok(())
     }
 }
 
