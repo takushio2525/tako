@@ -65,7 +65,7 @@ tako/
 | MCP セットアップ | `tako setup-mcp`（`~/.claude/settings.json` に自動追加。`--project` でプロジェクト単位） |
 | `tako` CLI ビルド | `cargo build -p tako-cli`（バイナリは `target/debug/tako`） |
 | .app バンドル生成（macOS） | `scripts/build-app.sh [--verify] [--install]`（`dist/tako.app`。tako CLI 同梱） |
-| リリース zip 生成 | `scripts/release.sh`（ビルド→zip。`--publish` で GitHub Release 作成、`--draft` でドラフト） |
+| リリース | `scripts/release.sh`（Cargo.toml バージョン自動読み取り + CHANGELOG.md 連携。`--publish` でタグ + GitHub Release 作成、`--draft` でドラフト） |
 | マスターオーケストレーター起動 | `tako master [suffix]`（claude を master system prompt 付きで起動） |
 | オーケストレーター worker spawn | `tako orchestrator spawn --project <key> --prompt "..."` |
 | オーケストレーター worker 監視 | `tako orchestrator watch --pane <N> --session-id <S>` |
@@ -100,3 +100,10 @@ CI（`.github/workflows/ci.yml`）は macOS / Windows の両ランナーで buil
 
 グローバル CLAUDE.md（`~/.claude/CLAUDE.md`）の「Git コミット」節に従う。
 push 運用: リポジトリ公開（Phase 7）までは main 直 push 可。公開後はブランチ + PR 経由に切り替える。
+
+## リリース運用
+
+- 機能追加・バグ修正が一段落したら `CHANGELOG.md` に追記（日英併記、Keep a Changelog 形式）
+- `Cargo.toml`（ワークスペースルート）の `[workspace.package] version` を bump
+- `scripts/release.sh --publish` でタグ + GitHub Release 作成（CHANGELOG から自動抽出）
+- リリースノートは日英併記

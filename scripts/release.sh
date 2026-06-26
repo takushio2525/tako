@@ -11,6 +11,9 @@
 #   - macOS（build-app.sh と同じ）
 #   - --publish / --draft には gh CLI（`brew install gh`）+ 認証済み
 #   - リポジトリのリモートが origin に設定されていること
+#
+# バージョンは Cargo.toml [workspace.package] から自動読み取り。
+# リリースノートは CHANGELOG.md から該当バージョンのセクションを自動抽出。
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -39,6 +42,21 @@ if [[ "$(uname)" != "Darwin" ]]; then
   echo "エラー: macOS 専用" >&2
   exit 1
 fi
+
+# --- CHANGELOG.md から該当バージョンのセクションを抽出 ---
+extract_changelog() {
+  local ver="$1"
+  local file="$REPO_ROOT/CHANGELOG.md"
+  if [[ ! -f "$file" ]]; then
+    return
+  fi
+  local escaped_ver="${ver//./\\.}"
+  sed -n "/^## \\[${escaped_ver}\\]/,/^## \\[/{
+    /^## \\[${escaped_ver}\\]/d
+    /^## \\[/d
+    p
+  }" "$file"
+}
 
 # --- ビルド ---
 if [[ $SKIP_BUILD -eq 0 ]]; then
@@ -72,25 +90,40 @@ if [[ $PUBLISH -eq 1 ]] || [[ $DRAFT -eq 1 ]]; then
     DRAFT_FLAG="--draft"
   fi
 
-  echo "==> GitHub Release 作成: $TAG"
-  gh release create "$TAG" \
-    --title "tako $TAG" \
-    --notes "## tako $TAG
+  # CHANGELOG からリリースノートを組み立て
+  CHANGELOG_BODY=$(extract_changelog "$VERSION")
 
-### インストール（macOS）
+  RELEASE_NOTES="## tako $TAG
+"
+  if [[ -n "$CHANGELOG_BODY" ]]; then
+    RELEASE_NOTES+="
+${CHANGELOG_BODY}
+---
+"
+  fi
 
-1. **${ZIP_NAME}** をダウンロード
-2. zip を展開（ダブルクリック）
-3. \`tako.app\` を \`/Applications\` フォルダへドラッグ
+  RELEASE_NOTES+="
+### インストール（macOS） / Install (macOS)
+
+1. **${ZIP_NAME}** をダウンロード / Download **${ZIP_NAME}**
+2. zip を展開（ダブルクリック） / Extract the zip
+3. \`tako.app\` を \`/Applications\` フォルダへドラッグ / Drag \`tako.app\` to \`/Applications\`
 4. 初回起動時に Gatekeeper の警告が出たら:
    **システム設定 → プライバシーとセキュリティ → 「tako」のブロック解除 → このまま開く**
+   If Gatekeeper warns on first launch:
+   **System Settings → Privacy & Security → Unblock \"tako\" → Open Anyway**
 
-### Claude Code 連携（初回 1 回）
+### Claude Code 連携（初回 1 回） / Claude Code Setup (one-time)
 
 \`\`\`sh
 claude mcp add --scope user tako -- /Applications/tako.app/Contents/MacOS/tako mcp serve
 \`\`\`
-" \
+"
+
+  echo "==> GitHub Release 作成: $TAG"
+  gh release create "$TAG" \
+    --title "tako $TAG" \
+    --notes "$RELEASE_NOTES" \
     $DRAFT_FLAG \
     "$ZIP_PATH"
 
