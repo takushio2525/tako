@@ -210,3 +210,8 @@
 - 4項目: ①複数 master の suffix マッチ ②`spawned_by` フィールド追加 ③`worker_status` shelved 対応 ④dead code 除去
 - 関連コミット: `53520eb` `56f55eb` `7a0126f`
 - 検証: build / clippy(-D warnings) / fmt / test 全緑（109 passed）
+
+## 2026-06-26（spawn TAKO_PANE_ID stale 問題の根治）
+- `new-session -e` で TAKO_PANE_ID/TAB_ID を直接注入。旧 `set_pane_env`（セッション未存在時に呼ばれ常に no-op）を除去
+- 関連コミット: `0156b9a` `[修正] spawn 配置: TAKO_PANE_ID を new-session -e で直接注入し stale ID 問題を根治`
+- 検証: build / clippy(-D warnings) / fmt / test 全緑（109 passed）

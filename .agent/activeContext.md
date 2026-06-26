@@ -4,13 +4,11 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-06-25・spawn 信頼性 + セッション追跡の改善完了）
+## 現在の対象（2026-06-26・spawn TAKO_PANE_ID stale 問題の根治完了）
 
-オーケストレーター spawn の信頼性改善 4 項目を実装完了:
-1. 複数 master 時の role 検索を suffix マッチ対応（呼び出し元の `:tako` 等を優先）
-2. worker ペインに `spawned_by` フィールド追加（spawn 元を記録・list/レスポンスに公開）
-3. `worker_status` の `pane_exists` で shelved ペインも走査（退避時の誤 gone 防止）
-4. dead code `find_session_id` の除去
+spawn ペイン配置バグの根本修正（3回目）を完了。tmux `new-session -e` で
+TAKO_PANE_ID / TAKO_TAB_ID をセッション作成時に直接注入する方式に変更。
+旧方式（`set-environment -t`）はセッション作成前に呼ばれるため常に no-op だった。
 
 ## 残作業・既知の制約
 
