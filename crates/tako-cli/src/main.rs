@@ -120,6 +120,33 @@ enum Command {
     /// オーケストレーター操作（projects / spawn / status / watch）
     #[command(subcommand)]
     Orchestrator(OrchestratorCommand),
+    /// URL を Chrome CDP ミラー方式で Web ビューペインとして開く（FR-3.8 PoC）
+    #[command(subcommand)]
+    Chrome(ChromeCommand),
+}
+
+#[derive(Subcommand)]
+enum ChromeCommand {
+    /// URL を Chrome Web ビューペインで開く
+    Open {
+        /// 開く URL
+        url: String,
+        /// 基準ペイン ID（省略時は呼び出し元）
+        #[arg(long)]
+        pane: Option<u64>,
+        /// 右に分割
+        #[arg(long)]
+        right: bool,
+        /// 下に分割
+        #[arg(long)]
+        down: bool,
+        /// 左に分割
+        #[arg(long)]
+        left: bool,
+        /// 上に分割
+        #[arg(long)]
+        up: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1737,6 +1764,27 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Orchestrator(OrchestratorCommand::Run { .. }) => {
             unreachable!("orchestrator run は run() を通らない")
         }
+        Command::Chrome(ChromeCommand::Open {
+            ref url,
+            pane,
+            right,
+            down,
+            left,
+            up,
+        }) => {
+            let direction = match (down, left, up) {
+                (true, _, _) => Some(Direction::Down),
+                (_, true, _) => Some(Direction::Left),
+                (_, _, true) => Some(Direction::Up),
+                _ if *right => Some(Direction::Right),
+                _ => None,
+            };
+            Request::ChromeOpen {
+                url: url.clone(),
+                pane: target_pane(*pane)?,
+                direction,
+            }
+        }
     })
 }
 
@@ -1867,6 +1915,7 @@ fn print_result(command: &Command, result: &Value) {
         Command::BackgroundList => {
             println!("{}", pretty_json(result));
         }
+        Command::Chrome(_) => println!("{result}"),
         // remote は run() → print_result を通らない
         _ => {}
     }

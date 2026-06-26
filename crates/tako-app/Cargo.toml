@@ -22,3 +22,6 @@ serde_json.workspace = true
 syntect.workspace = true
 pulldown-cmark.workspace = true
 image.workspace = true
+tungstenite.workspace = true
+data-encoding.workspace = true
+ureq.workspace = true

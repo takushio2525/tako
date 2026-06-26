@@ -60,6 +60,12 @@ rust-embed = "8"
 pathdiff = "0.2"
 serde_yaml = "0.9"
 # GPUI は zed リポの git rev 固定（自動更新しない。追従は意識的なタスク。.agent/architecture.md）
+# CDP ミラー方式 Web ビュー PoC: Chrome DevTools Protocol 通信用の同期 WebSocket
+tungstenite = "0.26"
+# CDP の Page.captureScreenshot が返す base64 PNG のデコード
+data-encoding = "2"
+# CDP 接続先 URL の取得（http://localhost:9222/json の GET）
+ureq = "3"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "cafbf4b5df7fedb67fc0f248850a5654efcec5d9" }
 # font-kit feature 必須: 無いとテキストシステムがスタブ化し文字が一切描画されない（poc/README.md）
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cafbf4b5df7fedb67fc0f248850a5654efcec5d9", features = ["font-kit"] }

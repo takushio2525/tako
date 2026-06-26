@@ -939,6 +939,27 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "tako_chrome_open",
+            "description": "URL を Chrome CDP ミラー方式で Web ビューペインとして開く（FR-3.8 PoC）。\
+                Chrome を --remote-debugging-port 付きで起動し、ページのスクリーンショットを \
+                ペインにミラー表示する。ペイン内のクリックは Chrome に中継される。\
+                dev サーバーのプレビュー表示やドキュメント参照に使う。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "開く URL（必須）" },
+                    "pane": pane_schema("基準ペイン ID（省略時は呼び出し元。この隣に Web ビューペインを分割する）"),
+                    "direction": {
+                        "type": "string",
+                        "enum": ["right", "down", "left", "up"],
+                        "description": "分割方向（省略時は右）",
+                    },
+                },
+                "required": ["url"],
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -1439,6 +1460,17 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
         },
         "tako_remote_stop" => Request::RemoteStop,
         "tako_remote_status" => Request::RemoteStatus,
+        "tako_chrome_open" => Request::ChromeOpen {
+            url: str_arg(args, "url")?.ok_or("url は必須")?.to_string(),
+            pane: u64_arg(args, "pane")?.or(caller),
+            direction: str_arg(args, "direction")?.map(|d| match d.as_str() {
+                "right" => Direction::Right,
+                "down" => Direction::Down,
+                "left" => Direction::Left,
+                "up" => Direction::Up,
+                _ => Direction::Right,
+            }),
+        },
         _ => return Err(format!("不明なツール: {name}")),
     })
 }
@@ -1864,7 +1896,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 44);
+        assert_eq!(tools.len(), 45);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

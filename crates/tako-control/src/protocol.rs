@@ -378,6 +378,13 @@ pub enum Request {
     RemoteStop,
     /// リモートアクセス API サーバーの状態取得
     RemoteStatus,
+    /// Chrome を CDP ミラー方式で開く（FR-3.8 PoC）。`pane` を `direction` 方向に分割し、
+    /// Web ビューペインを生やす。Chrome が未起動なら `--remote-debugging-port` 付きで起動する
+    ChromeOpen {
+        url: String,
+        pane: Option<u64>,
+        direction: Option<Direction>,
+    },
 }
 
 /// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。

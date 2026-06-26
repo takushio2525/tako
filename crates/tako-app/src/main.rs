@@ -25,6 +25,7 @@ mod sidebar;
 mod status_bar;
 mod tab_bar;
 mod video_player;
+mod webview;
 
 use keybindings::*;
 
@@ -480,6 +481,8 @@ struct TakoApp {
     preview_line_bounds: HashMap<PaneId, Vec<Bounds<Pixels>>>,
     /// プレビューの行ごとのプレーンテキスト（選択テキスト抽出用）
     preview_line_texts: HashMap<PaneId, Vec<String>>,
+    /// CDP ミラー方式 Web ビュー（FR-3.8 PoC）
+    webviews: webview::WebViews,
 }
 
 /// git パネルのデータスナップショット（FR-3.6 / FR-3.9）
@@ -976,6 +979,7 @@ impl TakoApp {
             preview_selecting: None,
             preview_line_bounds: HashMap::new(),
             preview_line_texts: HashMap::new(),
+            webviews: HashMap::new(),
         };
         if restored.is_empty() {
             let root_id = app.workspace.active_tab().tree().focused();
@@ -3939,6 +3943,90 @@ impl TakoApp {
         }
     }
 
+    fn render_webview_pane(
+        &mut self,
+        pane_id: PaneId,
+        area: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        use gpui::prelude::*;
+
+        let theme = &self.theme;
+        let wv = self.webviews.get(&pane_id);
+
+        let url_label = wv.map(|w| w.url.clone()).unwrap_or_default();
+        let screenshot_bytes = wv.and_then(|w| w.screenshot.lock().ok()?.clone());
+
+        let vp_width = wv.map(|w| w.viewport_width).unwrap_or(1280) as f32;
+        let vp_height = wv.map(|w| w.viewport_height).unwrap_or(800) as f32;
+        let area_width = f32::from(area.size.width);
+        let area_height = f32::from(area.size.height);
+
+        let mut container = div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgba(theme.background));
+
+        // タイトルバー
+        container = container.child(
+            div()
+                .flex()
+                .items_center()
+                .px_2()
+                .py_1()
+                .bg(rgba(theme.tab_active_background))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(hsla(theme.foreground))
+                        .child(SharedString::from(format!("🌐 {url_label}"))),
+                ),
+        );
+
+        // スクリーンショット画像
+        if let Some(bytes) = screenshot_bytes {
+            let image = std::sync::Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes));
+
+            let pane_for_click = pane_id;
+            container = container.child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .overflow_hidden()
+                    .child(
+                        gpui::img(image)
+                            .object_fit(gpui::ObjectFit::Contain)
+                            .max_w_full()
+                            .max_h_full(),
+                    )
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, ev: &gpui::MouseDownEvent, _window, _cx| {
+                            let click_x = f32::from(ev.position.x) / area_width * vp_width;
+                            let click_y = f32::from(ev.position.y) / area_height * vp_height;
+                            if let Some(wv) = this.webviews.get(&pane_for_click) {
+                                webview::send_click(wv, click_x as f64, click_y as f64);
+                            }
+                        }),
+                    ),
+            );
+        } else {
+            container = container.child(
+                div().flex_1().flex().items_center().justify_center().child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(hsla(theme.tab_inactive_foreground))
+                        .child("Chrome に接続中..."),
+                ),
+            );
+        }
+
+        container
+    }
+
     fn render_pane(
         &mut self,
         pane_id: PaneId,
@@ -3947,6 +4035,12 @@ impl TakoApp {
         focused: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        // CDP ミラー方式 Web ビューペイン（FR-3.8 PoC）
+        if self.webviews.contains_key(&pane_id) {
+            return self
+                .render_webview_pane(pane_id, area, cx)
+                .into_any_element();
+        }
         // プレビューペイン（FR-3.2 / FR-3.3）はターミナルではなくファイル内容を描く
         if self.previews.contains_key(&pane_id) {
             return self
@@ -4464,6 +4558,7 @@ impl ControlHost for TakoApp {
     fn detach_session(&mut self, pane: PaneId) {
         self.terminals.remove(&pane);
         self.previews.remove(&pane);
+        self.webviews.remove(&pane);
         self.scroll_accum.remove(&pane);
         self.scroll_ctls.remove(&pane);
         self.drop_tmux_view_session(pane);
@@ -4757,6 +4852,17 @@ impl ControlHost for TakoApp {
 
     fn remote_status(&self) -> serde_json::Value {
         tako_control::remote::daemon_status()
+    }
+
+    fn open_chrome(&mut self, pane: PaneId, url: &str) {
+        match webview::launch_chrome(url, 9222, 1280, 800) {
+            Ok(state) => {
+                self.webviews.insert(pane, state);
+            }
+            Err(e) => {
+                eprintln!("Chrome 起動失敗（{url}）: {e}");
+            }
+        }
     }
 }
 
@@ -6344,7 +6450,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 44, "MCP tools/list は 44 ツール");
+            check(status == 200 && tool_count == 45, "MCP tools/list は 45 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)

@@ -160,6 +160,8 @@ pub trait ControlHost {
     fn remote_status(&self) -> Value {
         json!({ "running": false })
     }
+    /// Chrome を CDP ミラー方式で開く（FR-3.8 PoC）。UI 層で WebViewState を生成する
+    fn open_chrome(&mut self, _pane: PaneId, _url: &str) {}
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -1392,6 +1394,35 @@ pub fn dispatch(
             .map_err(DispatchError::Operation),
         Request::RemoteStop => host.remote_stop().map_err(DispatchError::Operation),
         Request::RemoteStatus => Ok(host.remote_status()),
+
+        Request::ChromeOpen {
+            url,
+            pane,
+            direction,
+        } => {
+            let (tab, target) = match pane {
+                Some(_) => resolve_pane(host.workspace(), pane)?,
+                None => {
+                    let ws = host.workspace();
+                    let active = ws.active_tab_id();
+                    let focused = ws.active_tab().tree().focused();
+                    (active, focused)
+                }
+            };
+            let dir = direction
+                .map(|d| d.to_core())
+                .unwrap_or(SplitDirection::Right);
+            let new_pane = Pane::new(origin);
+            let new_id = new_pane.id();
+            tree_mut(host.workspace_mut(), tab)
+                .split_with_ratio(target, dir, 0.5, new_pane)
+                .map_err(op_err)?;
+            host.open_chrome(new_id, &url);
+            tree_mut(host.workspace_mut(), tab)
+                .focus(new_id)
+                .map_err(op_err)?;
+            Ok(json!({ "pane": new_id.as_u64(), "url": url }))
+        }
     }
 }
 
