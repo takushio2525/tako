@@ -824,7 +824,9 @@ pub fn tools() -> Vec<Value> {
                 tmux_session は pane ID が解決できない場合\
                 （BG タブ移動・tako 再起動後）のフォールバックとして tako_read_pane / tako_send_input / \
                 tako_orchestrator_worker_status に渡せる。\
-                起動からプロンプト送信まで 15〜20 秒かかる（これは想定内）。",
+                起動からプロンプト送信まで 15〜20 秒かかる（これは想定内）。\
+                pane または tab のいずれかを必ず指定すること。省略すると呼び出し元タブに出るため、\
+                master が別タブにいる場合に意図しないタブに子が生える。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1019,6 +1021,9 @@ fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i6
             .map_err(map_err)?
             .or(session.caller_pane)
     };
+    if pane.is_none() && tab.is_none() {
+        return Err((-32602, "pane または tab を指定してください".into()));
+    }
     let timeout_secs = u64_arg(args, "timeout_seconds")
         .map_err(map_err)?
         .unwrap_or(1800);

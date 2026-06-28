@@ -1121,6 +1121,9 @@ fn orchestrator_run(
     auto_close: bool,
     output_lines: usize,
 ) -> Result<(), String> {
+    if pane.is_none() && tab.is_none() {
+        return Err("--pane または --tab を指定してください".into());
+    }
     // 1. Spawn
     let pane_arg = if tab.is_some() {
         None
@@ -1731,15 +1734,20 @@ fn build_request(command: &Command) -> Result<Request, String> {
             effort,
             pane,
             tab,
-        }) => Request::OrchestratorSpawn {
-            project: project.clone(),
-            prompt: prompt.clone(),
-            label: label.clone(),
-            model: model.clone(),
-            effort: effort.clone(),
-            pane: target_pane(*pane)?,
-            tab: *tab,
-        },
+        }) => {
+            if pane.is_none() && tab.is_none() {
+                return Err("--pane または --tab を指定してください".into());
+            }
+            Request::OrchestratorSpawn {
+                project: project.clone(),
+                prompt: prompt.clone(),
+                label: label.clone(),
+                model: model.clone(),
+                effort: effort.clone(),
+                pane: target_pane(*pane)?,
+                tab: *tab,
+            }
+        }
         Command::Orchestrator(OrchestratorCommand::Status {
             pane,
             session_id,

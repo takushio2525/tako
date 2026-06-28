@@ -1491,6 +1491,12 @@ fn dispatch_orchestrator_spawn(
     pane: Option<u64>,
     tab: Option<u64>,
 ) -> Result<Value, DispatchError> {
+    if pane.is_none() && tab.is_none() {
+        return Err(DispatchError::Operation(
+            "pane または tab を指定してください".into(),
+        ));
+    }
+
     use crate::orchestrator;
 
     let config = orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
