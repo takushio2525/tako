@@ -135,6 +135,7 @@ pub fn launch_chrome(
         None
     } else {
         let child = Command::new(&chrome_path)
+            .arg("--headless=new")
             .arg(format!("--remote-debugging-port={port}"))
             .arg("--user-data-dir=/tmp/tako-chrome-cdp")
             .arg(format!("--window-size={viewport_width},{viewport_height}"))
