@@ -1,0 +1,38 @@
+# 全テキストは自動判定＋コミット時LF統一
+* text=auto eol=lf
+
+# 明示的にテキスト扱い
+*.c      text eol=lf
+*.cpp    text eol=lf
+*.h      text eol=lf
+*.hpp    text eol=lf
+*.ino    text eol=lf
+*.pde    text eol=lf
+*.py     text eol=lf
+*.tex    text eol=lf
+*.cls    text eol=lf
+*.sty    text eol=lf
+*.bib    text eol=lf
+*.md     text eol=lf
+*.json   text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.ini    text eol=lf
+*.toml   text eol=lf
+*.sh     text eol=lf
+
+# バイナリ扱い
+*.pdf    binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.zip    binary
+*.bin    binary
+*.elf    binary
+*.hex    binary
+
+# LFS
+*.dmg filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
