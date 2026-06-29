@@ -3946,12 +3946,11 @@ impl TakoApp {
     fn render_webview_pane(
         &mut self,
         pane_id: PaneId,
-        area: Bounds<Pixels>,
+        rect: Rect,
+        focused: bool,
         cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        use gpui::prelude::*;
-
-        let theme = &self.theme;
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = self.theme.clone();
         let wv = self.webviews.get(&pane_id);
 
         let url_label = wv.map(|w| w.url.clone()).unwrap_or_default();
@@ -3959,72 +3958,167 @@ impl TakoApp {
 
         let vp_width = wv.map(|w| w.viewport_width).unwrap_or(1280) as f32;
         let vp_height = wv.map(|w| w.viewport_height).unwrap_or(800) as f32;
-        let area_width = f32::from(area.size.width);
-        let area_height = f32::from(area.size.height);
 
-        let mut container = div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .bg(rgba(theme.background));
-
-        // タイトルバー
-        container = container.child(
+        let body: gpui::AnyElement = if let Some(bytes) = screenshot_bytes {
+            let image = std::sync::Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes));
             div()
+                .flex_1()
                 .flex()
                 .items_center()
-                .px_2()
-                .py_1()
-                .bg(rgba(theme.tab_active_background))
+                .justify_center()
+                .overflow_hidden()
                 .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(hsla(theme.foreground))
-                        .child(SharedString::from(format!("🌐 {url_label}"))),
-                ),
-        );
-
-        // スクリーンショット画像
-        if let Some(bytes) = screenshot_bytes {
-            let image = std::sync::Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes));
-
-            let pane_for_click = pane_id;
-            container = container.child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .overflow_hidden()
-                    .child(
-                        gpui::img(image)
-                            .object_fit(gpui::ObjectFit::Contain)
-                            .max_w_full()
-                            .max_h_full(),
-                    )
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(move |this, ev: &gpui::MouseDownEvent, _window, _cx| {
-                            let click_x = f32::from(ev.position.x) / area_width * vp_width;
-                            let click_y = f32::from(ev.position.y) / area_height * vp_height;
-                            if let Some(wv) = this.webviews.get(&pane_for_click) {
-                                webview::send_click(wv, click_x as f64, click_y as f64);
-                            }
-                        }),
-                    ),
-            );
+                    gpui::img(image)
+                        .object_fit(gpui::ObjectFit::Contain)
+                        .max_w_full()
+                        .max_h_full(),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _window, _cx| {
+                        let click_x = f32::from(ev.position.x) / vp_width;
+                        let click_y = f32::from(ev.position.y) / vp_height;
+                        if let Some(wv) = this.webviews.get(&pane_id) {
+                            webview::send_click(
+                                wv,
+                                (click_x * vp_width) as f64,
+                                (click_y * vp_height) as f64,
+                            );
+                        }
+                    }),
+                )
+                .into_any_element()
         } else {
-            container = container.child(
-                div().flex_1().flex().items_center().justify_center().child(
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
                     div()
                         .text_size(px(14.0))
                         .text_color(hsla(theme.tab_inactive_foreground))
                         .child("Chrome に接続中..."),
-                ),
-            );
-        }
+                )
+                .into_any_element()
+        };
 
-        container
+        div()
+            .id(("pane", pane_id.as_u64()))
+            .absolute()
+            .left(relative(rect.x))
+            .top(relative(rect.y))
+            .w(relative(rect.width))
+            .h(relative(rect.height))
+            .bg(rgba(theme.background))
+            .border(px(PANE_BORDER))
+            .rounded(px(7.0))
+            .border_color(if focused {
+                hsla(theme.accent)
+            } else {
+                hsla(theme.border_default)
+            })
+            .when(focused, |d| {
+                d.shadow(vec![
+                    BoxShadow {
+                        color: hsla_alpha(theme.accent, 0.25),
+                        offset: point(px(0.), px(0.)),
+                        blur_radius: px(0.),
+                        spread_radius: px(1.),
+                        inset: false,
+                    },
+                    BoxShadow {
+                        color: gpui::hsla(0., 0., 0., 0.35),
+                        offset: point(px(0.), px(8.)),
+                        blur_radius: px(24.),
+                        spread_radius: px(0.),
+                        inset: false,
+                    },
+                ])
+            })
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    let _ = this.workspace.active_tab_mut().tree_mut().focus(pane_id);
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .id(("pane-titlebar", pane_id.as_u64()))
+                    .h(px(PANE_TITLE_BAR))
+                    .flex_none()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(8.0))
+                    .bg(rgba(if focused {
+                        theme.surface_2
+                    } else {
+                        theme.surface_0
+                    }))
+                    .border_b_1()
+                    .border_color(hsla(if focused {
+                        theme.border_default
+                    } else {
+                        theme.border_subtle
+                    }))
+                    .text_size(px(11.0))
+                    .text_color(hsla(theme.tab_inactive_foreground))
+                    .cursor(CursorStyle::OpenHand)
+                    .on_drag(
+                        PaneDrag { pane: pane_id },
+                        self.drag_ghost_builder(
+                            DragKind::Pane,
+                            format!("🌐 {}", truncate(&url_label, 24)),
+                            cx,
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id(("pane-close", pane_id.as_u64()))
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
+                            .hover(|d| {
+                                d.bg(rgba_alpha(theme.red, 0.25))
+                                    .text_color(hsla(theme.foreground))
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.close_pane_button(pane_id, cx);
+                            }))
+                            .child("×"),
+                    )
+                    .child(
+                        div()
+                            .text_color(if focused {
+                                hsla(theme.foreground)
+                            } else {
+                                hsla(theme.tab_inactive_foreground)
+                            })
+                            .child(SharedString::from(format!(
+                                "🌐 {}",
+                                truncate(&url_label, 36)
+                            ))),
+                    )
+                    .child(div().flex_grow(1.0)),
+            )
+            .child(body)
     }
 
     fn render_pane(
@@ -4038,7 +4132,7 @@ impl TakoApp {
         // CDP ミラー方式 Web ビューペイン（FR-3.8 PoC）
         if self.webviews.contains_key(&pane_id) {
             return self
-                .render_webview_pane(pane_id, area, cx)
+                .render_webview_pane(pane_id, rect, focused, cx)
                 .into_any_element();
         }
         // プレビューペイン（FR-3.2 / FR-3.3）はターミナルではなくファイル内容を描く
