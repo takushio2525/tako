@@ -1443,20 +1443,25 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
         "tako_orchestrator_spawn" => {
             let pane = u64_arg(args, "pane")?;
             let tab = u64_arg(args, "tab")?;
+            let resolved_pane = if pane.is_some() {
+                pane
+            } else if tab.is_some() {
+                None
+            } else {
+                caller
+            };
+            let resolved_tab = if pane.is_some() { None } else { tab };
+            if resolved_pane.is_none() && resolved_tab.is_none() {
+                return Err("pane または tab を指定してください".into());
+            }
             Request::OrchestratorSpawn {
                 project: str_arg(args, "project")?.ok_or("project を指定する")?,
                 prompt: str_arg(args, "prompt")?.ok_or("prompt を指定する")?,
                 label: str_arg(args, "label")?,
                 model: str_arg(args, "model")?,
                 effort: str_arg(args, "effort")?,
-                pane: if pane.is_some() {
-                    pane
-                } else if tab.is_some() {
-                    None
-                } else {
-                    caller
-                },
-                tab: if pane.is_some() { None } else { tab },
+                pane: resolved_pane,
+                tab: resolved_tab,
             }
         }
         "tako_orchestrator_worker_status" => Request::OrchestratorWorkerStatus {

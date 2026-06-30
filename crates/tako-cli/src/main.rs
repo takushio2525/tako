@@ -1121,23 +1121,26 @@ fn orchestrator_run(
     auto_close: bool,
     output_lines: usize,
 ) -> Result<(), String> {
-    if pane.is_none() && tab.is_none() {
+    let pane_resolved = if pane.is_some() {
+        pane
+    } else if tab.is_some() {
+        None
+    } else {
+        caller_pane()
+    };
+    let tab_resolved = if pane.is_some() { None } else { tab };
+    if pane_resolved.is_none() && tab_resolved.is_none() {
         return Err("--pane または --tab を指定してください".into());
     }
     // 1. Spawn
-    let pane_arg = if tab.is_some() {
-        None
-    } else {
-        target_pane(pane)?
-    };
     let spawn_result = send_request(Request::OrchestratorSpawn {
         project: project.to_string(),
         prompt: prompt.to_string(),
         label: label.map(|s| s.to_string()),
         model: None,
         effort: None,
-        pane: pane_arg,
-        tab,
+        pane: pane_resolved,
+        tab: tab_resolved,
     })?;
     let pane_id = spawn_result["pane_id"].as_u64().unwrap_or(0);
     let spawned_by = spawn_result["spawned_by"].as_u64().unwrap_or(0);
@@ -1735,7 +1738,15 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane,
             tab,
         }) => {
-            if pane.is_none() && tab.is_none() {
+            let pane_resolved = if pane.is_some() {
+                *pane
+            } else if tab.is_some() {
+                None
+            } else {
+                caller_pane()
+            };
+            let tab_resolved = if pane.is_some() { None } else { *tab };
+            if pane_resolved.is_none() && tab_resolved.is_none() {
                 return Err("--pane または --tab を指定してください".into());
             }
             Request::OrchestratorSpawn {
@@ -1744,8 +1755,8 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 label: label.clone(),
                 model: model.clone(),
                 effort: effort.clone(),
-                pane: target_pane(*pane)?,
-                tab: *tab,
+                pane: pane_resolved,
+                tab: tab_resolved,
             }
         }
         Command::Orchestrator(OrchestratorCommand::Status {
