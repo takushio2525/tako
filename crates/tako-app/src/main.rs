@@ -38,10 +38,10 @@ use futures::StreamExt;
 use gpui::{
     canvas, div, fill, point, prelude::*, px, quad, relative, size, svg, App, BorderStyle, Bounds,
     BoxShadow, ClipboardItem, Context, CursorStyle, DragMoveEvent, ElementInputHandler,
-    EntityInputHandler, FocusHandle, Font, FontStyle, FontWeight, HighlightStyle, Hsla, Keystroke,
-    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba,
-    ScrollDelta, ScrollWheelEvent, SharedString, Size, StrikethroughStyle, StyledText, TextRun,
-    TextStyle, UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions,
+    EntityInputHandler, ExternalPaths, FocusHandle, Font, FontStyle, FontWeight, HighlightStyle,
+    Hsla, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, Rgba, ScrollDelta, ScrollWheelEvent, SharedString, Size, StrikethroughStyle, StyledText,
+    TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use tako_control::{ControlHost, IncomingRequest, IpcServer, McpServer};
@@ -2974,27 +2974,39 @@ impl TakoApp {
         cx.notify();
     }
 
-    /// ファイル行のドロップ（FR-3.11 / FR-3.13）:
-    /// ターミナルペイン中央 → パス文字列を send、それ以外 → ファイルを開く
-    fn drop_file(&mut self, pane_id: PaneId, path: std::path::PathBuf, cx: &mut Context<Self>) {
+    /// ファイルのドロップ（FR-3.11 / FR-3.13 / Issue #21）:
+    /// ターミナルペイン中央 → パス文字列を send（複数はスペース区切り）、それ以外 → ファイルを開く
+    fn drop_files(
+        &mut self,
+        pane_id: PaneId,
+        paths: &[std::path::PathBuf],
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
         let zone = self.take_drop_zone(pane_id).unwrap_or(DropZone::Center);
         let is_terminal =
             self.terminals.contains_key(&pane_id) && !self.previews.contains_key(&pane_id);
         if is_terminal && zone == DropZone::Center {
-            let path_str = path.display().to_string();
-            let escaped = if path_str
-                .chars()
-                .any(|c| c == ' ' || c == '\'' || c == '"' || c == '(' || c == ')')
-            {
-                format!("'{}'", path_str.replace('\'', "'\\\\''"))
-            } else {
-                path_str
-            };
+            let escaped: Vec<String> = paths
+                .iter()
+                .map(|p| {
+                    let s = p.display().to_string();
+                    if s.chars()
+                        .any(|c| c == ' ' || c == '\'' || c == '"' || c == '(' || c == ')')
+                    {
+                        format!("'{}'", s.replace('\'', "'\\\\''"))
+                    } else {
+                        s
+                    }
+                })
+                .collect();
             let _ = tako_control::dispatch(
                 self,
                 tako_control::protocol::Request::Send {
                     pane: Some(pane_id.as_u64()),
-                    text: escaped,
+                    text: escaped.join(" "),
                     newline: false,
                     tmux_session: None,
                     await_prompt: false,
@@ -3004,22 +3016,28 @@ impl TakoApp {
             cx.notify();
             return;
         }
-        let direction = match zone {
-            DropZone::Center => None,
-            zone => Some(zone_to_direction(zone)),
-        };
-        let result = tako_control::dispatch(
-            self,
-            tako_control::protocol::Request::OpenFile {
-                pane: Some(pane_id.as_u64()),
-                path: path.display().to_string(),
-                mode: None,
-                direction,
-            },
-            PaneOrigin::User,
-        );
-        if let Err(e) = result {
-            eprintln!("warning: ファイルを開けない: {e}");
+        for (i, path) in paths.iter().enumerate() {
+            let direction = if i == 0 {
+                match zone {
+                    DropZone::Center => None,
+                    zone => Some(zone_to_direction(zone)),
+                }
+            } else {
+                Some(tako_control::protocol::Direction::Right)
+            };
+            let result = tako_control::dispatch(
+                self,
+                tako_control::protocol::Request::OpenFile {
+                    pane: Some(pane_id.as_u64()),
+                    path: path.display().to_string(),
+                    mode: None,
+                    direction,
+                },
+                PaneOrigin::User,
+            );
+            if let Err(e) = result {
+                eprintln!("warning: ファイルを開けない: {e}");
+            }
         }
         self.drain_pending_highlights(cx);
         cx.notify();
@@ -3103,7 +3121,21 @@ impl TakoApp {
                 this.drop_tmux_session(pane_id, drag.clone(), cx);
             }))
             .on_drop::<FileDrag>(cx.listener(move |this, drag: &FileDrag, _, cx| {
-                this.drop_file(pane_id, drag.path.clone(), cx);
+                this.drop_files(pane_id, std::slice::from_ref(&drag.path), cx);
+            }))
+            .on_drag_move::<ExternalPaths>(cx.listener(
+                move |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
+                    this.update_drop_target(
+                        pane_id,
+                        e.bounds,
+                        e.event.position,
+                        DragKind::File,
+                        cx,
+                    );
+                },
+            ))
+            .on_drop::<ExternalPaths>(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                this.drop_files(pane_id, paths.paths(), cx);
             }))
             .on_drop::<PaneDrag>(cx.listener(move |this, drag: &PaneDrag, _, cx| {
                 this.drop_pane(pane_id, *drag, cx);
