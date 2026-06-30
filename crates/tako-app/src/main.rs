@@ -2568,6 +2568,55 @@ impl TakoApp {
         cx.notify();
     }
 
+    fn open_directory(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(dir) = paths.into_iter().next() {
+                    let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                        app.change_directory(dir, cx);
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn open_repository(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(dir) = paths.into_iter().next() {
+                    let git_root = find_git_root(&dir).unwrap_or(dir);
+                    let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                        app.change_directory(git_root, cx);
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn change_directory(&mut self, dir: std::path::PathBuf, cx: &mut Context<Self>) {
+        let pane_id = self.focused_pane();
+        if let Some(session) = self.terminals.get(&pane_id) {
+            let cd_cmd = format!("cd {}\n", shell_escape(&dir));
+            session.write(cd_cmd.into_bytes());
+        }
+        self.sync_filetree_roots();
+        cx.notify();
+    }
+
     fn activate_tab_index(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(id) = self.workspace.tabs().get(index).map(|t| t.id()) {
             let _ = self.workspace.activate_tab(id);
@@ -5597,6 +5646,12 @@ impl Render for TakoApp {
             }))
             .on_action(cx.listener(|this, _: &ResetZoom, _, cx| this.reset_zoom_focused_pane(cx)))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all_preview(cx)))
+            .on_action(cx.listener(|this, _: &OpenDirectory, _, cx| {
+                this.open_directory(cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenRepository, _, cx| {
+                this.open_repository(cx);
+            }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 this.handle_key(&event.keystroke, cx);
             }))
@@ -5756,6 +5811,104 @@ fn fetch_git_data(cwd: &std::path::Path, selected_commit: Option<&str>) -> Optio
     })
 }
 
+fn parse_initial_dir() -> Option<std::path::PathBuf> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir" => {
+                if let Some(dir) = args.get(i + 1) {
+                    let path = std::path::PathBuf::from(dir);
+                    let path = if path.is_absolute() {
+                        path
+                    } else {
+                        std::env::current_dir().unwrap_or_default().join(&path)
+                    };
+                    if path.is_dir() {
+                        return Some(path);
+                    } else {
+                        eprintln!("warning: --dir の指定先が存在しない: {}", path.display());
+                    }
+                }
+                i += 2;
+            }
+            arg if arg.starts_with("--dir=") => {
+                let dir = &arg["--dir=".len()..];
+                let path = std::path::PathBuf::from(dir);
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    std::env::current_dir().unwrap_or_default().join(&path)
+                };
+                if path.is_dir() {
+                    return Some(path);
+                } else {
+                    eprintln!("warning: --dir の指定先が存在しない: {}", path.display());
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// アプリメニューバーを構成する（File / Edit / Window）
+fn app_menus() -> Vec<gpui::Menu> {
+    use gpui::{Menu, MenuItem};
+    vec![
+        Menu::new("tako").items(vec![
+            MenuItem::action("About tako", gpui::NoAction),
+            MenuItem::separator(),
+            MenuItem::action("Quit tako", Quit),
+        ]),
+        Menu::new("File").items(vec![
+            MenuItem::action("New Window", NewWindow),
+            MenuItem::separator(),
+            MenuItem::action("Open Directory…", OpenDirectory),
+            MenuItem::action("Open Repository…", OpenRepository),
+        ]),
+        Menu::new("Edit").items(vec![
+            MenuItem::action("Copy", CopySelection),
+            MenuItem::action("Paste", PasteClipboard),
+            MenuItem::action("Select All", SelectAll),
+        ]),
+        Menu::new("View").items(vec![
+            MenuItem::action("Toggle Sidebar", ToggleSidebar),
+            MenuItem::separator(),
+            MenuItem::action("Zoom In", ZoomIn),
+            MenuItem::action("Zoom Out", ZoomOut),
+            MenuItem::action("Reset Zoom", ResetZoom),
+        ]),
+        Menu::new("Window").items(vec![
+            MenuItem::action("New Tab", NewTab),
+            MenuItem::separator(),
+            MenuItem::action("Next Tab", NextTab),
+            MenuItem::action("Previous Tab", PrevTab),
+        ]),
+    ]
+}
+
+fn open_new_window(cx: &mut App) {
+    let _ = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(960.), px(600.)),
+                    cx,
+                ))),
+                ..Default::default()
+            },
+            |window, cx| {
+                let view = cx.new(TakoApp::new);
+                window.focus(&view.read(cx).focus_handle.clone(), cx);
+                view
+            },
+        )
+        .expect("新規ウィンドウを開けなかった");
+}
+
 fn main() {
     // セルフテストの tmux バックエンド項目は、ユーザーの実バックエンド（tako サーバー）を
     // 汚さない隔離ソケットで行う（終了時に self_test 側が kill-server で片付ける）
@@ -5778,10 +5931,20 @@ fn main() {
             std::env::temp_dir().join(format!("tako-st-discovery-{}", std::process::id())),
         );
     }
+    let initial_dir = parse_initial_dir();
+    if let Some(ref dir) = initial_dir {
+        if let Err(e) = std::env::set_current_dir(dir) {
+            eprintln!("warning: --dir で指定されたディレクトリに移動できない: {e}");
+        }
+    }
     application()
         .with_assets(file_icons::TakoAssets)
         .run(|cx: &mut App| {
             cx.bind_keys(key_bindings());
+            cx.set_menus(app_menus());
+            cx.on_action(|_: &NewWindow, cx| {
+                open_new_window(cx);
+            });
             // 保存済みウィンドウフレームの復元（FR-5。終了前にフルスクリーンなら
             // フルスクリーンで開く）。セルフテストは既定サイズで決定的に動かす
             let saved_frame = if std::env::var_os("TAKO_SELF_TEST").is_none() {
@@ -8715,6 +8878,34 @@ mod self_test {
 /// 実 IME / GUI を起動できない CI でもキーエンコードの退行を捕まえる
 /// ホイールデルタの行換算。整数化できた行数と持ち越す端数を返す。
 /// 方向が反転したら端数を捨てる（逆向きの貯金で初動が重くなるのを防ぐ）
+fn find_git_root(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(output.stdout).ok()?;
+    let root = root.trim();
+    if root.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(root))
+}
+
+fn shell_escape(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    if s.contains(|c: char| c.is_whitespace() || "\"'\\$`!#&|;(){}[]<>?*~".contains(c)) {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    } else {
+        s.into_owned()
+    }
+}
+
 fn accumulate_scroll(carry: f32, delta_lines: f32) -> (i32, f32) {
     let carry = if carry * delta_lines < 0.0 {
         0.0

@@ -33,7 +33,10 @@ actions!(
         ZoomIn,
         ZoomOut,
         ResetZoom,
-        SelectAll
+        SelectAll,
+        OpenDirectory,
+        OpenRepository,
+        NewWindow
     ]
 );
 
@@ -72,6 +75,9 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd--", ZoomOut, None),
         KeyBinding::new("cmd-0", ResetZoom, None),
         KeyBinding::new("cmd-a", SelectAll, None),
+        KeyBinding::new("cmd-o", OpenDirectory, None),
+        KeyBinding::new("cmd-shift-o", OpenRepository, None),
+        KeyBinding::new("cmd-shift-n", NewWindow, None),
     ]
 }
 
