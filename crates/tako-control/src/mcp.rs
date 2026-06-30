@@ -1013,14 +1013,16 @@ fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i6
         .map_err(map_err)?
         .ok_or((-32602, "prompt を指定する".to_string()))?;
     let label = str_arg(args, "label").map_err(map_err)?;
+    let pane_raw = u64_arg(args, "pane").map_err(map_err)?;
     let tab = u64_arg(args, "tab").map_err(map_err)?;
-    let pane = if tab.is_some() {
+    let pane = if pane_raw.is_some() {
+        pane_raw
+    } else if tab.is_some() {
         None
     } else {
-        u64_arg(args, "pane")
-            .map_err(map_err)?
-            .or(session.caller_pane)
+        session.caller_pane
     };
+    let tab = if pane_raw.is_some() { None } else { tab };
     if pane.is_none() && tab.is_none() {
         return Err((-32602, "pane または tab を指定してください".into()));
     }
@@ -1439,6 +1441,7 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             description: str_arg(args, "description")?,
         },
         "tako_orchestrator_spawn" => {
+            let pane = u64_arg(args, "pane")?;
             let tab = u64_arg(args, "tab")?;
             Request::OrchestratorSpawn {
                 project: str_arg(args, "project")?.ok_or("project を指定する")?,
@@ -1446,12 +1449,14 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
                 label: str_arg(args, "label")?,
                 model: str_arg(args, "model")?,
                 effort: str_arg(args, "effort")?,
-                pane: if tab.is_some() {
+                pane: if pane.is_some() {
+                    pane
+                } else if tab.is_some() {
                     None
                 } else {
-                    u64_arg(args, "pane")?.or(caller)
+                    caller
                 },
-                tab,
+                tab: if pane.is_some() { None } else { tab },
             }
         }
         "tako_orchestrator_worker_status" => Request::OrchestratorWorkerStatus {
@@ -1468,13 +1473,7 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
         "tako_chrome_open" => Request::ChromeOpen {
             url: str_arg(args, "url")?.ok_or("url は必須")?.to_string(),
             pane: u64_arg(args, "pane")?.or(caller),
-            direction: str_arg(args, "direction")?.map(|d| match d.as_str() {
-                "right" => Direction::Right,
-                "down" => Direction::Down,
-                "left" => Direction::Left,
-                "up" => Direction::Up,
-                _ => Direction::Right,
-            }),
+            direction: direction_arg(args)?,
         },
         _ => return Err(format!("不明なツール: {name}")),
     })
@@ -2013,6 +2012,306 @@ mod tests {
             true,
         );
         assert_eq!(response.unwrap()["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn pin_previewはペインまたはグループタブをトグルする() {
+        // pane 指定（呼び出し元フォールバック）
+        let (_, requests) = run(
+            call("tako_pin_preview", json!({ "pinned": true })),
+            Some(5),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::Pin {
+                pane: Some(5),
+                group_tab: None,
+                pinned: Some(true),
+            }]
+        );
+        // group_tab 指定時は pane を補完しない（排他）
+        let (_, requests) = run(
+            call("tako_pin_preview", json!({ "group_tab": 2 })),
+            Some(5),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::Pin {
+                pane: None,
+                group_tab: Some(2),
+                pinned: None,
+            }]
+        );
+        // 両方省略 = 呼び出し元ペインでトグル
+        let (_, requests) = run(call("tako_pin_preview", json!({})), Some(5), true);
+        assert_eq!(
+            requests,
+            vec![Request::Pin {
+                pane: Some(5),
+                group_tab: None,
+                pinned: None,
+            }]
+        );
+        // pinned に不正な型を渡すとエラー
+        let (response, requests) = run(
+            call("tako_pin_preview", json!({ "pinned": "yes" })),
+            Some(5),
+            true,
+        );
+        assert!(requests.is_empty());
+        assert!(response.unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("pinned"));
+    }
+
+    #[test]
+    fn video_playbackはaction必須でペインへフォールバックする() {
+        let (_, requests) = run(
+            call("tako_video_playback", json!({ "action": "toggle" })),
+            Some(3),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::VideoPlayback {
+                pane: Some(3),
+                action: "toggle".into(),
+            }]
+        );
+        // pane 明示指定
+        let (_, requests) = run(
+            call(
+                "tako_video_playback",
+                json!({ "pane": 10, "action": "play" }),
+            ),
+            Some(3),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::VideoPlayback {
+                pane: Some(10),
+                action: "play".into(),
+            }]
+        );
+        // action 欠落はエラー
+        let (response, requests) = run(call("tako_video_playback", json!({})), Some(3), true);
+        assert!(requests.is_empty());
+        assert!(response.unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("action"));
+        // 呼び出し元なし + pane 省略もエラー
+        let (response, requests) = run(
+            call("tako_video_playback", json!({ "action": "pause" })),
+            None,
+            true,
+        );
+        assert!(requests.is_empty());
+        assert!(response.unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("pane"));
+    }
+
+    #[test]
+    fn video_seekはseconds必須でペインへフォールバックする() {
+        let (_, requests) = run(
+            call("tako_video_seek", json!({ "seconds": 42.5 })),
+            Some(3),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::VideoSeek {
+                pane: Some(3),
+                seconds: 42.5,
+            }]
+        );
+        // seconds 欠落はエラー
+        let (response, requests) = run(call("tako_video_seek", json!({})), Some(3), true);
+        assert!(requests.is_empty());
+        assert!(response.unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("seconds"));
+        // seconds に負値（スキーマでは minimum: 0 だが、f64_arg は型のみ検証。
+        // ここではパース層が通ることを確認。意味検証は dispatch 側の責務）
+        let (_, requests) = run(
+            call("tako_video_seek", json!({ "seconds": 0.0 })),
+            Some(3),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::VideoSeek {
+                pane: Some(3),
+                seconds: 0.0,
+            }]
+        );
+        // seconds に文字列を渡すとエラー
+        let (response, requests) = run(
+            call("tako_video_seek", json!({ "seconds": "ten" })),
+            Some(3),
+            true,
+        );
+        assert!(requests.is_empty());
+        assert!(response.unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("seconds"));
+    }
+
+    #[test]
+    fn chrome_openはurl必須でdirectionを解釈する() {
+        let (_, requests) = run(
+            call(
+                "tako_chrome_open",
+                json!({ "url": "http://localhost:3000" }),
+            ),
+            Some(5),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::ChromeOpen {
+                url: "http://localhost:3000".into(),
+                pane: Some(5),
+                direction: None,
+            }]
+        );
+        // direction 指定
+        let (_, requests) = run(
+            call(
+                "tako_chrome_open",
+                json!({ "url": "http://localhost:3000", "direction": "down" }),
+            ),
+            Some(5),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::ChromeOpen {
+                url: "http://localhost:3000".into(),
+                pane: Some(5),
+                direction: Some(Direction::Down),
+            }]
+        );
+        // url 欠落はエラー
+        let (response, requests) = run(call("tako_chrome_open", json!({})), Some(5), true);
+        assert!(requests.is_empty());
+        assert!(response.unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("url"));
+        // 不正な direction はエラー
+        let (response, requests) = run(
+            call(
+                "tako_chrome_open",
+                json!({ "url": "http://localhost:3000", "direction": "diagonal" }),
+            ),
+            Some(5),
+            true,
+        );
+        assert!(requests.is_empty());
+        assert!(response.unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("direction"));
+    }
+
+    #[test]
+    fn orchestrator_spawnのpaneとtab優先順位() {
+        // pane のみ → pane が使われ tab は None
+        let (_, requests) = run(
+            call(
+                "tako_orchestrator_spawn",
+                json!({ "project": "p", "prompt": "hi", "pane": 5 }),
+            ),
+            Some(99),
+            true,
+        );
+        assert_eq!(requests.len(), 1);
+        match &requests[0] {
+            Request::OrchestratorSpawn { pane, tab, .. } => {
+                assert_eq!(*pane, Some(5));
+                assert_eq!(*tab, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // tab のみ → tab が使われ pane は None（caller もフォールバックしない）
+        let (_, requests) = run(
+            call(
+                "tako_orchestrator_spawn",
+                json!({ "project": "p", "prompt": "hi", "tab": 2 }),
+            ),
+            Some(99),
+            true,
+        );
+        match &requests[0] {
+            Request::OrchestratorSpawn { pane, tab, .. } => {
+                assert_eq!(*pane, None);
+                assert_eq!(*tab, Some(2));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // pane と tab 両方 → pane 優先、tab は None
+        let (_, requests) = run(
+            call(
+                "tako_orchestrator_spawn",
+                json!({ "project": "p", "prompt": "hi", "pane": 5, "tab": 2 }),
+            ),
+            Some(99),
+            true,
+        );
+        match &requests[0] {
+            Request::OrchestratorSpawn { pane, tab, .. } => {
+                assert_eq!(*pane, Some(5), "pane が tab より優先される");
+                assert_eq!(*tab, None, "pane 指定時は tab を無視する");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 両方省略、caller あり → caller がフォールバック
+        let (_, requests) = run(
+            call(
+                "tako_orchestrator_spawn",
+                json!({ "project": "p", "prompt": "hi" }),
+            ),
+            Some(42),
+            true,
+        );
+        match &requests[0] {
+            Request::OrchestratorSpawn { pane, tab, .. } => {
+                assert_eq!(*pane, Some(42), "caller へフォールバック");
+                assert_eq!(*tab, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 両方省略、caller なし → エラー
+        let (response, requests) = run(
+            call(
+                "tako_orchestrator_spawn",
+                json!({ "project": "p", "prompt": "hi" }),
+            ),
+            None,
+            true,
+        );
+        assert!(requests.is_empty());
+        let error = &response.unwrap()["error"];
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("pane または tab"),
+            "pane も tab も無い場合はエラー"
+        );
     }
 
     // --- HTTP トランスポート（実ポートで往復） ---
