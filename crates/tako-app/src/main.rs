@@ -473,6 +473,8 @@ struct TakoApp {
     video_frame_cache: HashMap<PaneId, (u64, std::sync::Arc<gpui::RenderImage>)>,
     /// シークバー要素の実測 bounds（paint 時に canvas で記録）
     video_seek_bar_bounds: HashMap<PaneId, Bounds<Pixels>>,
+    /// シークバーのドラッグ中フラグ（ペイン ID。ドラッグ中はマウス移動でシーク位置を追従）
+    video_seek_dragging: Option<PaneId>,
     /// プレビューペインのテキスト選択
     preview_selections: HashMap<PaneId, PreviewSelection>,
     /// プレビューで選択操作中のペイン
@@ -975,6 +977,7 @@ impl TakoApp {
             video_ticker: false,
             video_frame_cache: HashMap::new(),
             video_seek_bar_bounds: HashMap::new(),
+            video_seek_dragging: None,
             preview_selections: HashMap::new(),
             preview_selecting: None,
             preview_line_bounds: HashMap::new(),
@@ -2686,6 +2689,13 @@ impl TakoApp {
             cx.stop_propagation();
             return;
         }
+
+        // フォーカスペインが動画プレビュー中ならキーボードショートカットを処理
+        if self.handle_video_key(keystroke, cx) {
+            cx.stop_propagation();
+            return;
+        }
+
         // cmd を含む未バインドのキーはシェルへ流さない
         if keystroke.modifiers.platform {
             return;
@@ -3292,9 +3302,15 @@ impl TakoApp {
                 | self.preview_selecting.take().is_some()
                 | self.dragging_pin.take().is_some()
                 | std::mem::take(&mut self.dragging_panel)
+                | self.video_seek_dragging.take().is_some()
             {
                 cx.notify();
             }
+            return;
+        }
+        // シークバードラッグ中はシーク位置を追従
+        if let Some(pane_id) = self.video_seek_dragging {
+            self.video_seek_by_drag(pane_id, event.position, cx);
             return;
         }
         // ピン留めウィンドウのタイトルバー D&D 移動（FR-2.16.15）
@@ -3371,6 +3387,7 @@ impl TakoApp {
             | self.dragging_scrollbar.take().is_some()
             | self.dragging_pin.take().is_some()
             | std::mem::take(&mut self.dragging_panel)
+            | self.video_seek_dragging.take().is_some()
         {
             cx.notify();
             return;
@@ -3666,6 +3683,83 @@ impl TakoApp {
             player.seek(new_time);
             player.grab_frame();
             cx.notify();
+        }
+    }
+
+    /// シークバー上のドラッグ移動でシーク位置を追従する
+    fn video_seek_by_drag(
+        &mut self,
+        pane_id: PaneId,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let bar_bounds = self.video_seek_bar_bounds.get(&pane_id).copied();
+        if let (Some(bounds), Some(player)) = (bar_bounds, self.video_players.get_mut(&pane_id)) {
+            let frac = ((f32::from(position.x) - f32::from(bounds.origin.x))
+                / f32::from(bounds.size.width))
+            .clamp(0.0, 1.0);
+            let new_time = frac as f64 * player.duration;
+            player.seek(new_time);
+            player.grab_frame();
+            cx.notify();
+        }
+    }
+
+    /// フォーカスペインが動画プレビューならキーボードショートカットを処理する。
+    /// 処理した場合 true を返す
+    fn handle_video_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+        let pane_id = self.focused_pane();
+        if !self.video_players.contains_key(&pane_id) {
+            return false;
+        }
+        let key = keystroke.key.as_str();
+        let shift = keystroke.modifiers.shift;
+        match key {
+            "space" => {
+                if let Some(p) = self.video_players.get_mut(&pane_id) {
+                    p.toggle();
+                    self.ensure_video_ticker(cx);
+                    cx.notify();
+                }
+                true
+            }
+            "left" => {
+                let delta = if shift { -10.0 } else { -5.0 };
+                if let Some(p) = self.video_players.get_mut(&pane_id) {
+                    p.seek_relative(delta);
+                    p.grab_frame();
+                    cx.notify();
+                }
+                true
+            }
+            "right" => {
+                let delta = if shift { 10.0 } else { 5.0 };
+                if let Some(p) = self.video_players.get_mut(&pane_id) {
+                    p.seek_relative(delta);
+                    p.grab_frame();
+                    cx.notify();
+                }
+                true
+            }
+            "," => {
+                if let Some(p) = self.video_players.get_mut(&pane_id) {
+                    p.pause();
+                    p.seek_relative(-1.0 / 30.0);
+                    p.grab_frame();
+                    cx.notify();
+                }
+                true
+            }
+            "." => {
+                if let Some(p) = self.video_players.get_mut(&pane_id) {
+                    p.pause();
+                    p.seek_relative(1.0 / 30.0);
+                    p.grab_frame();
+                    cx.notify();
+                }
+                true
+            }
+            _ => false,
         }
     }
 
@@ -4916,6 +5010,16 @@ impl ControlHost for TakoApp {
             .video_players
             .get_mut(&pane)
             .ok_or_else(|| "動画プレイヤーが起動していない".to_string())?;
+        if let Some(rate_str) = action.strip_prefix("rate:") {
+            let rate: f32 = rate_str
+                .parse()
+                .map_err(|_| format!("不正な速度値: {rate_str}"))?;
+            if !(0.1..=4.0).contains(&rate) {
+                return Err(format!("速度は 0.1〜4.0 の範囲: {rate}"));
+            }
+            player.set_rate(rate);
+            return Ok(format!("rate:{rate}"));
+        }
         match action {
             "play" => player.play(),
             "pause" => player.pause(),

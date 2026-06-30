@@ -109,6 +109,8 @@ pub struct VideoPlayer {
     pub current_time: f64,
     /// フレーム世代カウンタ（grab_frame 成功ごとにインクリメント。描画キャッシュの無効化に使う）
     pub frame_gen: u64,
+    /// 再生速度（0.5 / 1.0 / 1.5 / 2.0）
+    pub rate: f32,
 }
 
 // Safety: AVFoundation の API（AVPlayer / AVPlayerItemVideoOutput 等）は多くが
@@ -228,6 +230,7 @@ impl VideoPlayer {
                 current_bgra: Vec::new(),
                 current_time: 0.0,
                 frame_gen: 0,
+                rate: 1.0,
             };
 
             // 最初のフレームを取得
@@ -245,7 +248,7 @@ impl VideoPlayer {
             return;
         }
         unsafe {
-            let _: () = msg_send_void(self.player, sel("play"));
+            let _: () = msg_send_void_f32(self.player, sel("setRate:"), self.rate);
         }
         self.state = PlaybackState::Playing;
     }
@@ -270,6 +273,16 @@ impl VideoPlayer {
         }
     }
 
+    /// 再生速度を設定（0.5 / 1.0 / 1.5 / 2.0）
+    pub fn set_rate(&mut self, rate: f32) {
+        self.rate = rate;
+        if self.state == PlaybackState::Playing {
+            unsafe {
+                let _: () = msg_send_void_f32(self.player, sel("setRate:"), rate);
+            }
+        }
+    }
+
     /// 指定位置へシーク（秒）
     pub fn seek(&mut self, seconds: f64) {
         let seconds = seconds.clamp(0.0, self.duration);
@@ -278,6 +291,11 @@ impl VideoPlayer {
             let _: () = msg_send_cmtime_arg(self.player, sel("seekToTime:"), time);
         }
         self.current_time = seconds;
+    }
+
+    /// 相対シーク（±秒。現在位置 + delta、0〜duration にクランプ）
+    pub fn seek_relative(&mut self, delta: f64) {
+        self.seek(self.current_time + delta);
     }
 
     /// 現在のフレームをキャプチャして current_bgra に格納する。
@@ -446,6 +464,13 @@ unsafe fn msg_send_void(receiver: *const c_void, selector: *const c_void) {
 }
 
 #[cfg(target_os = "macos")]
+unsafe fn msg_send_void_f32(receiver: *const c_void, selector: *const c_void, arg: f32) {
+    let f: unsafe extern "C" fn(*const c_void, *const c_void, f32) =
+        std::mem::transmute(objc_msgSend as *const c_void);
+    f(receiver, selector, arg);
+}
+
+#[cfg(target_os = "macos")]
 unsafe fn msg_send_void_id(receiver: *const c_void, selector: *const c_void, arg: *const c_void) {
     let f: unsafe extern "C" fn(*const c_void, *const c_void, *const c_void) =
         std::mem::transmute(objc_msgSend as *const c_void);
@@ -535,7 +560,16 @@ unsafe fn msg_send_copy_pixel_buffer(
 
 // Windows スタブ（コンパイルは通る）
 #[cfg(not(target_os = "macos"))]
-pub struct VideoPlayer;
+pub struct VideoPlayer {
+    pub state: PlaybackState,
+    pub duration: f64,
+    pub width: u32,
+    pub height: u32,
+    pub current_bgra: Vec<u8>,
+    pub current_time: f64,
+    pub frame_gen: u64,
+    pub rate: f32,
+}
 
 #[cfg(not(target_os = "macos"))]
 impl VideoPlayer {
@@ -545,7 +579,9 @@ impl VideoPlayer {
     pub fn play(&mut self) {}
     pub fn pause(&mut self) {}
     pub fn toggle(&mut self) {}
+    pub fn set_rate(&mut self, _rate: f32) {}
     pub fn seek(&mut self, _seconds: f64) {}
+    pub fn seek_relative(&mut self, _delta: f64) {}
     pub fn grab_frame(&mut self) -> bool {
         false
     }

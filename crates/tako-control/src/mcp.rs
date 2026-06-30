@@ -350,17 +350,16 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_video_playback",
-            "description": "動画プレビューペインの再生/一時停止を操作する。\
+            "description": "動画プレビューペインの再生/一時停止/再生速度を操作する。\
                 対象ペインが動画プレビュー（tako open で .mp4/.mov 等を開いた状態）の場合のみ有効。\
-                action に play / pause / toggle を指定する。",
+                action に play / pause / toggle / rate:N（N は 0.1〜4.0 の速度倍率、例: rate:2.0）を指定する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane": pane_schema("対象ペイン ID（省略時は呼び出し元）"),
                     "action": {
                         "type": "string",
-                        "enum": ["play", "pause", "toggle"],
-                        "description": "再生操作（play=再生、pause=一時停止、toggle=切替）",
+                        "description": "再生操作（play=再生、pause=一時停止、toggle=切替、rate:N=速度変更）",
                     },
                 },
                 "required": ["action"],

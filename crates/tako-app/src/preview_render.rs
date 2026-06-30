@@ -1,6 +1,6 @@
 use gpui::{
-    div, point, prelude::*, px, BoxShadow, Context, CursorStyle, FontWeight, HighlightStyle,
-    MouseButton, SharedString, StyledText, UnderlineStyle, Window,
+    div, point, prelude::*, px, relative, BoxShadow, Context, CursorStyle, FontWeight,
+    HighlightStyle, MouseButton, MouseMoveEvent, SharedString, StyledText, UnderlineStyle, Window,
 };
 use tako_core::{PaneId, Rect};
 
@@ -500,8 +500,8 @@ impl TakoApp {
                     let is_playing = player.state == video_player::PlaybackState::Playing;
                     let current_time = player.current_time;
                     let duration = player.duration;
+                    let current_rate = player.rate;
 
-                    // コントロールバー: 再生/一時停止 + シークバー + 時間表示
                     let play_btn_label: SharedString = if is_playing {
                         "\u{23f8}".into() // ⏸
                     } else {
@@ -519,6 +519,119 @@ impl TakoApp {
                         0.0
                     };
                     let seek_dur = duration;
+
+                    // シークバー（クリック + ドラッグ対応 + つまみノブ）
+                    let seek_bar = div()
+                        .id(("video-seek", pane_id.as_u64()))
+                        .relative()
+                        .flex_1()
+                        .h(px(14.0))
+                        .cursor_pointer()
+                        .child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .top(px(4.0))
+                                .h(px(6.0))
+                                .rounded(px(3.0))
+                                .bg(hsla_alpha(theme.foreground, 0.2))
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .rounded(px(3.0))
+                                        .bg(hsla(theme.ansi[4]))
+                                        .w(relative(progress_frac)),
+                                ),
+                        )
+                        // つまみノブ
+                        .child(
+                            div()
+                                .absolute()
+                                .top(px(1.0))
+                                .left(relative(progress_frac))
+                                .ml(px(-6.0))
+                                .w(px(12.0))
+                                .h(px(12.0))
+                                .rounded_full()
+                                .bg(hsla(theme.ansi[4])),
+                        )
+                        .child({
+                            let entity = cx.entity().downgrade();
+                            canvas(
+                                |_, _, _| (),
+                                move |bounds, _, _, cx| {
+                                    if let Some(e) = entity.upgrade() {
+                                        e.update(cx, |app, _| {
+                                            app.video_seek_bar_bounds.insert(pane_id, bounds);
+                                        });
+                                    }
+                                },
+                            )
+                            .absolute()
+                            .size_full()
+                        })
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                this.video_seek_dragging = Some(pane_id);
+                                this.video_seek_by_click(pane_id, ev.position, seek_dur, cx);
+                            }),
+                        )
+                        .on_mouse_up(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, _ev: &gpui::MouseUpEvent, _, _cx| {
+                                if this.video_seek_dragging == Some(pane_id) {
+                                    this.video_seek_dragging = None;
+                                }
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
+                            if this.video_seek_dragging == Some(pane_id) {
+                                this.video_seek_by_drag(pane_id, ev.position, cx);
+                            }
+                        }));
+
+                    // 再生速度ボタン
+                    let rates: &[(f32, &str)] =
+                        &[(0.5, "0.5x"), (1.0, "1x"), (1.5, "1.5x"), (2.0, "2x")];
+                    let speed_buttons =
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(2.0))
+                            .children(rates.iter().map(|&(rate, label)| {
+                                let is_active = (current_rate - rate).abs() < 0.01;
+                                div()
+                                    .id((
+                                        "video-rate",
+                                        pane_id.as_u64() * 100 + (rate * 10.0) as u64,
+                                    ))
+                                    .cursor_pointer()
+                                    .px(px(4.0))
+                                    .py(px(1.0))
+                                    .rounded(px(3.0))
+                                    .text_size(px(11.0))
+                                    .when(is_active, |d| {
+                                        d.bg(hsla(theme.ansi[4])).text_color(hsla(theme.background))
+                                    })
+                                    .when(!is_active, |d| {
+                                        d.text_color(hsla_alpha(theme.foreground, 0.6))
+                                            .hover(|s| s.bg(hsla_alpha(theme.foreground, 0.1)))
+                                    })
+                                    .child(SharedString::from(label))
+                                    .on_click(cx.listener(
+                                        move |this, _ev: &gpui::ClickEvent, _, cx| {
+                                            if let Some(p) = this.video_players.get_mut(&pane_id) {
+                                                p.set_rate(rate);
+                                                cx.notify();
+                                            }
+                                        },
+                                    ))
+                                    .into_any_element()
+                            }));
+
+                    // コントロールバー: 再生/一時停止 + シークバー + 時間 + 速度
                     elements.push(
                         div()
                             .flex()
@@ -543,58 +656,14 @@ impl TakoApp {
                                         },
                                     )),
                             )
-                            .child(
-                                div()
-                                    .id(("video-seek", pane_id.as_u64()))
-                                    .relative()
-                                    .flex_1()
-                                    .h(px(6.0))
-                                    .rounded(px(3.0))
-                                    .bg(hsla_alpha(theme.foreground, 0.2))
-                                    .cursor_pointer()
-                                    .child(
-                                        div()
-                                            .h_full()
-                                            .rounded(px(3.0))
-                                            .bg(hsla(theme.ansi[4]))
-                                            .w(relative(progress_frac)),
-                                    )
-                                    .child({
-                                        let entity = cx.entity().downgrade();
-                                        canvas(
-                                            |_, _, _| (),
-                                            move |bounds, _, _, cx| {
-                                                if let Some(e) = entity.upgrade() {
-                                                    e.update(cx, |app, _| {
-                                                        app.video_seek_bar_bounds
-                                                            .insert(pane_id, bounds);
-                                                    });
-                                                }
-                                            },
-                                        )
-                                        .absolute()
-                                        .size_full()
-                                    })
-                                    .on_mouse_down(
-                                        gpui::MouseButton::Left,
-                                        cx.listener(
-                                            move |this, ev: &gpui::MouseDownEvent, _, cx| {
-                                                this.video_seek_by_click(
-                                                    pane_id,
-                                                    ev.position,
-                                                    seek_dur,
-                                                    cx,
-                                                );
-                                            },
-                                        ),
-                                    ),
-                            )
+                            .child(seek_bar)
                             .child(
                                 div()
                                     .text_size(px(12.0))
                                     .text_color(hsla_alpha(theme.foreground, 0.7))
                                     .child(time_label),
                             )
+                            .child(speed_buttons)
                             .into_any_element(),
                     );
                 } else {
