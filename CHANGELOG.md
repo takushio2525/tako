@@ -5,6 +5,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-02
+
+### Added
+
+- In-app auto-update notification: a status bar notification appears when a new stable release is available, with one-click update
+  アプリ内自動更新通知機能を追加。新しい安定版がリリースされるとステータスバーに通知が表示され、ワンクリックで更新できます
+
 ## [0.2.0] - 2026-07-02
 
 ### Added
