@@ -1,0 +1,66 @@
+---
+/**
+ * Starlight の Sidebar を拡張して「こまったら？」ウィジェットを追加。
+ */
+import MobileMenuFooter from 'virtual:starlight/components/MobileMenuFooter';
+import SidebarPersister from '@astrojs/starlight/components/SidebarPersister.astro';
+import SidebarSublist from '@astrojs/starlight/components/SidebarSublist.astro';
+
+const { sidebar } = Astro.locals.starlightRoute;
+---
+
+<SidebarPersister>
+  <SidebarSublist sublist={sidebar} />
+</SidebarPersister>
+
+<div class="md:sl-hidden">
+  <MobileMenuFooter />
+</div>
+
+<div class="tako-help-widget">
+  <p class="tako-help-title">こまったら？</p>
+  <ul class="tako-help-links">
+    <li><a href="https://github.com/takushio2525/tako/issues" target="_blank" rel="noopener">GitHub Issues で質問</a></li>
+    <li><a href="/guides/cli-reference/">CLI リファレンス</a></li>
+    <li><a href="/features/mcp-server/">MCP ツール一覧</a></li>
+  </ul>
+</div>
+
+<style>
+  .tako-help-widget {
+    margin: 1.5rem 0.75rem 1rem;
+    padding: 0.8rem 1rem;
+    border-radius: 12px;
+    background: var(--tako-accent-soft, rgba(232, 93, 138, 0.10));
+    border: 1px solid var(--tako-accent-line, rgba(232, 93, 138, 0.22));
+    font-size: 0.85rem;
+  }
+
+  .tako-help-title {
+    margin: 0 0 0.5rem;
+    font-weight: 700;
+    color: var(--tako-accent, #e85d8a);
+    font-size: 0.82rem;
+  }
+
+  .tako-help-links {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .tako-help-links li {
+    margin: 0.25rem 0;
+  }
+
+  .tako-help-links a {
+    color: var(--tako-ink-muted, #6f6875) !important;
+    text-decoration: none !important;
+    font-size: 0.82rem;
+    transition: color 0.15s;
+  }
+
+  .tako-help-links a:hover {
+    color: var(--tako-accent, #e85d8a) !important;
+  }
+</style>

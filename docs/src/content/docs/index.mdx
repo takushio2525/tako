@@ -42,25 +42,25 @@ head:
 <div class="tako-card">
 <div class="tako-card-icon tako-card-icon-pink">⚡</div>
 <h3>内蔵 MCP サーバー</h3>
-<p>tako の中で Claude Code を起動すれば、AI は設定ゼロで自動的にペインの分割・コマンド実行・ファイル表示ができる。「隣のペインで dev サーバー起動して」が一言で通る。</p>
+<p>tako の中で Claude Code を起動すれば、AI が設定ゼロでペインの分割・コマンド実行・ファイル表示を行える。「隣のペインで dev サーバー起動して」と言うだけ。40 以上の MCP ツールを内蔵。</p>
 </div>
 
 <div class="tako-card">
 <div class="tako-card-icon tako-card-icon-pink">⊞</div>
 <h3>タブ＆ペイン管理</h3>
-<p>iTerm2 ライクな分割レイアウトにドラッグ＆ドロップ対応。AI エージェント・dev サーバー・ログを「1 タブ = 1 作業グループ」にまとめて全体像を把握できる。</p>
+<p>iTerm2 ライクな分割レイアウトにドラッグ＆ドロップ対応。エージェント・dev サーバー・ログを「1 タブ = 1 作業グループ」にまとめて、どのプロジェクトで何が動いているかが一目でわかる。</p>
 </div>
 
 <div class="tako-card">
 <div class="tako-card-icon tako-card-icon-green">↻</div>
 <h3>再起動しても消えない</h3>
-<p>tmux バックエンドにより、tako を閉じて再起動しても実行中のプロセスと画面内容がそのまま復元される。エージェントの長時間タスクも安心。</p>
+<p>tmux バックエンドにより、tako を閉じて再起動しても実行中のプロセスと画面内容がそのまま復元される。エージェントの長時間タスクも、dev サーバーもそのまま。</p>
 </div>
 
 <div class="tako-card">
 <div class="tako-card-icon tako-card-icon-green">◇</div>
 <h3>ファイルプレビュー</h3>
-<p>AI が「このファイル見て」と言ったら、シンタックスハイライト付きのコードプレビューや Markdown レンダリングがペイン内に直接表示される。</p>
+<p>AI が「このファイル見て」と言ったら、シンタックスハイライト付きのコードプレビューや Markdown レンダリングがペイン内に直接表示される。ターミナルから出ずにレビューできる。</p>
 </div>
 </div>
 </section>
@@ -76,7 +76,8 @@ head:
 <span class="tako-terminal-title">Terminal</span>
 </div>
 <div class="tako-terminal-body">
-<div class="tako-terminal-line"><span class="tako-terminal-comment"># 1. GitHub Releases からダウンロード＆インストール</span></div>
+<div class="tako-terminal-line"><span class="tako-terminal-comment"># 1. Homebrew でインストール（推奨）</span></div>
+<div class="tako-terminal-line"><span class="tako-terminal-prompt">$</span> <span class="tako-terminal-cmd">brew tap takushio2525/tako && brew install --cask takushio2525/tako/tako</span></div>
 <div class="tako-terminal-line">&nbsp;</div>
 <div class="tako-terminal-line"><span class="tako-terminal-comment"># 2. MCP サーバーを登録（初回のみ）</span></div>
 <div class="tako-terminal-line"><span class="tako-terminal-prompt">$</span> <span class="tako-terminal-cmd">tako setup-mcp</span></div>
@@ -86,7 +87,7 @@ head:
 </div>
 </div>
 
-<p class="tako-guide-link">詳しい手順は <a href="/getting-started/">セットアップガイド →</a> をご覧ください。</p>
+<p class="tako-guide-link">ZIP からのインストールなど詳しい手順は <a href="/getting-started/">セットアップガイド →</a> をご覧ください。</p>
 </section>
 
 </div>

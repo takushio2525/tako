@@ -18,6 +18,9 @@ export default defineConfig({
 			social: [
 				{ icon: 'github', label: 'GitHub', href: 'https://github.com/takushio2525/tako' },
 			],
+			components: {
+				Sidebar: './src/components/SidebarHelp.astro',
+			},
 			sidebar: [
 				{
 					label: 'はじめに',
