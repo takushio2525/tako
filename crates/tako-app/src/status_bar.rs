@@ -140,6 +140,7 @@ impl TakoApp {
                     )
             }))
             .child(div().flex_grow(1.0))
+            .children(self.render_update_banner(&theme, cx))
             .children(usage_text.map(|text| {
                 let (tokens, cost) = if let Some(pos) = text.find('$') {
                     let tok_part = text[..pos].trim().trim_end_matches('·').trim();
@@ -277,6 +278,156 @@ impl TakoApp {
                     SharedString::from(format!("⎇ {branch}"))
                 }),
             )
+    }
+
+    fn render_update_banner(
+        &self,
+        theme: &tako_core::Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let theme = theme.clone();
+        let pill = || {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .h_full()
+                .px_2()
+                .border_r_1()
+                .border_color(hsla(theme.border_subtle))
+        };
+        match &self.update_state {
+            super::update_checker::UpdateState::Available(info) => {
+                let ver = info.version.clone();
+                Some(
+                    pill()
+                        .id("update-banner")
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(hsla(theme.accent))
+                                .child(SharedString::from(format!("v{ver} が利用可能"))),
+                        )
+                        .child(
+                            div()
+                                .id("update-btn")
+                                .cursor_pointer()
+                                .px_1()
+                                .rounded(px(3.0))
+                                .bg(hsla(theme.accent))
+                                .text_size(px(10.0))
+                                .text_color(hsla(theme.background))
+                                .hover(|d| d.opacity(0.8))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.start_update(cx);
+                                }))
+                                .child("更新"),
+                        )
+                        .child(
+                            div()
+                                .id("update-dismiss")
+                                .cursor_pointer()
+                                .text_size(px(10.5))
+                                .text_color(hsla(theme.text_tertiary))
+                                .hover(|d| d.text_color(hsla(theme.text_secondary)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.update_state =
+                                        super::update_checker::UpdateState::Dismissed;
+                                    cx.notify();
+                                }))
+                                .child("×"),
+                        )
+                        .into_any_element(),
+                )
+            }
+            super::update_checker::UpdateState::Updating(msg) => Some(
+                pill()
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(hsla(theme.yellow))
+                            .child(SharedString::from(msg.clone())),
+                    )
+                    .into_any_element(),
+            ),
+            super::update_checker::UpdateState::Done(msg) => Some(
+                pill()
+                    .id("update-done")
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(hsla(theme.green))
+                            .child(SharedString::from(msg.clone())),
+                    )
+                    .child(
+                        div()
+                            .id("update-done-dismiss")
+                            .cursor_pointer()
+                            .text_size(px(10.5))
+                            .text_color(hsla(theme.text_tertiary))
+                            .hover(|d| d.text_color(hsla(theme.text_secondary)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.update_state = super::update_checker::UpdateState::Dismissed;
+                                cx.notify();
+                            }))
+                            .child("×"),
+                    )
+                    .into_any_element(),
+            ),
+            super::update_checker::UpdateState::Failed(msg) => Some(
+                pill()
+                    .id("update-failed")
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(hsla(theme.red))
+                            .child(SharedString::from(msg.clone())),
+                    )
+                    .child(
+                        div()
+                            .id("update-failed-dismiss")
+                            .cursor_pointer()
+                            .text_size(px(10.5))
+                            .text_color(hsla(theme.text_tertiary))
+                            .hover(|d| d.text_color(hsla(theme.text_secondary)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.update_state = super::update_checker::UpdateState::Dismissed;
+                                cx.notify();
+                            }))
+                            .child("×"),
+                    )
+                    .into_any_element(),
+            ),
+            _ => None,
+        }
+    }
+
+    fn start_update(&mut self, cx: &mut Context<Self>) {
+        let info = match &self.update_state {
+            super::update_checker::UpdateState::Available(info) => info.clone(),
+            _ => return,
+        };
+        self.update_state = super::update_checker::UpdateState::Updating("更新中...".into());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { super::update_checker::perform_update(&info) })
+                .await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                match result {
+                    Ok(msg) => {
+                        app.update_state = super::update_checker::UpdateState::Done(msg);
+                    }
+                    Err(msg) => {
+                        app.update_state = super::update_checker::UpdateState::Failed(msg);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn toggle_filetree(&mut self) {

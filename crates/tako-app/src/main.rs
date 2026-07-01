@@ -24,6 +24,7 @@ mod right_panel;
 mod sidebar;
 mod status_bar;
 mod tab_bar;
+mod update_checker;
 mod video_player;
 mod webview;
 
@@ -485,6 +486,8 @@ struct TakoApp {
     preview_line_texts: HashMap<PaneId, Vec<String>>,
     /// CDP ミラー方式 Web ビュー（FR-3.8 PoC）
     webviews: webview::WebViews,
+    /// アプリ内自動更新の状態
+    update_state: update_checker::UpdateState,
 }
 
 /// git パネルのデータスナップショット（FR-3.6 / FR-3.9）
@@ -983,6 +986,7 @@ impl TakoApp {
             preview_line_bounds: HashMap::new(),
             preview_line_texts: HashMap::new(),
             webviews: HashMap::new(),
+            update_state: update_checker::UpdateState::Idle,
         };
         if restored.is_empty() {
             let root_id = app.workspace.active_tab().tree().focused();
@@ -1374,6 +1378,31 @@ impl TakoApp {
             }
         })
         .detach();
+
+        // アプリ内自動更新チェック（起動時 + 24 時間ごと）
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            cx.spawn(async move |this, cx| loop {
+                let task = cx
+                    .background_executor()
+                    .spawn(async { update_checker::check_latest() });
+                let result = task.await;
+                if let Some(info) = result {
+                    let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                        if !matches!(app.update_state, update_checker::UpdateState::Dismissed) {
+                            app.update_state = update_checker::UpdateState::Available(info);
+                            cx.notify();
+                        }
+                    });
+                    if ok.is_err() {
+                        break;
+                    }
+                }
+                cx.background_executor()
+                    .timer(update_checker::CHECK_INTERVAL)
+                    .await;
+            })
+            .detach();
+        }
 
         app
     }

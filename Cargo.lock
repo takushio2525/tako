@@ -5640,6 +5640,7 @@ dependencies = [
  "gpui_platform",
  "image",
  "pulldown-cmark",
+ "serde",
  "serde_json",
  "syntect",
  "tako-control",
