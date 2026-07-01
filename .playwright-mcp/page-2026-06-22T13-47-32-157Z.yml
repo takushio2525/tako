@@ -1,0 +1,68 @@
+- generic [ref=e108]:
+  - banner [ref=e109]:
+    - button [ref=e110] [cursor=pointer]:
+      - img [ref=e111]
+    - generic [ref=e113]:
+      - heading "test-mac" [level=1] [ref=e114]
+      - paragraph [ref=e115]: 6 ペイン
+  - generic [ref=e116]:
+    - generic [ref=e117] [cursor=pointer]:
+      - generic [ref=e118]:
+        - generic [ref=e120]: orchestrator 起動
+        - generic [ref=e121]: "#6"
+      - generic [ref=e122]:
+        - generic [ref=e123]: "[shiozawatakumi@shiozawaMacPro:~]$ tako master alarm"
+        - generic [ref=e124]: "master を起動しました: タブ 'master-alarm'（ペイン 23）"
+        - generic [ref=e125]: "system prompt: /Users/shiozawatakumi/Library/Application Support/tako/orchestrat"
+        - generic [ref=e126]: or/master-system.md
+        - generic [ref=e127]: "[shiozawatakumi@shiozawaMacPro:~]$"
+    - generic [ref=e128] [cursor=pointer]:
+      - generic [ref=e129]:
+        - generic [ref=e131]: リソース監視
+        - generic [ref=e132]: "#7"
+      - generic [ref=e133]:
+        - generic [ref=e134]: 5h 30% ███░░░░░░░ (→4h15m)
+        - generic [ref=e135]: 7d 8% ░░░░░░░░░░ (→5d07h)
+        - generic [ref=e136]: ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+        - generic [ref=e137]: ✘ Auto-update failed · Run /doctor
+        - generic [ref=e138]: new task? /clear to save 103.8k tokens
+    - generic [ref=e139] [cursor=pointer]:
+      - generic [ref=e140]:
+        - generic [ref=e142]: "system-theory: 練習問題解説の強化"
+        - generic [ref=e143]: "#13"
+      - generic [ref=e144]:
+        - generic [ref=e145]: 5h 43% ████░░░░░░ (→4h05m)
+        - generic [ref=e146]: 7d 10% █░░░░░░░░░ (→5d07h)
+        - generic [ref=e147]: ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+        - generic [ref=e148]: ✘ Auto-update failed · Run /doctor
+        - generic [ref=e149]: new task? /clear to save 170.4k tokens
+    - generic [ref=e150] [cursor=pointer]:
+      - generic [ref=e151]:
+        - generic [ref=e153]: Master-tako
+        - generic [ref=e154]: "#10"
+      - generic [ref=e155]:
+        - generic [ref=e156]: "[Opus 4.6 (1M context) · MAX] ✘ Auto-update failed · Run /doctor"
+        - generic [ref=e157]: ctx 26% ██░░░░░░░░
+        - generic [ref=e158]: 5h 50% █████░░░░░ (→1h13m)
+        - generic [ref=e159]: 7d 17% █░░░░░░░░░ (→4d23h)
+        - generic [ref=e160]: ⏵⏵ auto mode on · 1 monitor · ← for agents
+    - generic [ref=e161] [cursor=pointer]:
+      - generic [ref=e162]:
+        - generic [ref=e164]: "tako: 実機ビルド + 動作確認"
+        - generic [ref=e165]: "#31"
+      - generic [ref=e166]:
+        - generic [ref=e167]: "[Opus 4.6 (1M context) · MAX] 🔧 worker: tako:実機ビルド + 動作確認"
+        - generic [ref=e168]: ctx 10% █░░░░░░░░░
+        - generic [ref=e169]: 5h 51% █████░░░░░ (→1h12m)
+        - generic [ref=e170]: 7d 17% █░░░░░░░░░ (→4d23h)
+        - generic [ref=e171]: ⏵⏵ auto mode on (shift+tab to cycle)
+    - generic [ref=e172] [cursor=pointer]:
+      - generic [ref=e173]:
+        - generic [ref=e175]: Agent 実行監視
+        - generic [ref=e176]: "#23"
+      - generic [ref=e177]:
+        - generic [ref=e178]: "[Opus 4.6 (1M context) · MAX]"
+        - generic [ref=e179]: ctx 8% ░░░░░░░░░░
+        - generic [ref=e180]: 5h 35% ███░░░░░░░ (→1h38m)
+        - generic [ref=e181]: 7d 15% █░░░░░░░░░ (→4d23h)
+        - generic [ref=e182]: ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

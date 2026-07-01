@@ -1,0 +1,12 @@
+- generic [ref=e3]:
+  - banner [ref=e4]:
+    - generic [ref=e5]:
+      - heading "tako remote" [level=1] [ref=e6]
+      - paragraph [ref=e7]: 登録済みマシン
+  - generic [ref=e8]:
+    - generic [ref=e9]: 📱
+    - heading "マシン未登録" [level=2] [ref=e10]
+    - paragraph [ref=e11]:
+      - text: Mac で
+      - code [ref=e12]: tako remote start
+      - text: を実行し、 表示される QR コードをスキャンしてください

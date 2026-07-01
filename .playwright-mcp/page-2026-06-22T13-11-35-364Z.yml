@@ -1,0 +1,25 @@
+- generic [ref=e89]:
+  - banner [ref=e90]:
+    - button [ref=e91] [cursor=pointer]:
+      - img [ref=e92]
+    - generic [ref=e94]:
+      - generic [ref=e95]: claude-code
+      - generic [ref=e96]: 2/3
+  - generic [ref=e97]:
+    - generic [ref=e98]: claude> I will implement the feature now.
+    - generic [ref=e100]: "> Reading src/main.rs..."
+    - generic [ref=e101]: "> Editing src/lib.rs..."
+    - generic [ref=e103]: Changes applied. Running tests...
+    - generic [ref=e104]: "test result: ok. 42 passed; 0 failed"
+  - generic [ref=e105]:
+    - button "Tab" [ref=e106] [cursor=pointer]
+    - button "Ctrl+C" [ref=e107] [cursor=pointer]
+    - button "Ctrl+D" [ref=e108] [cursor=pointer]
+    - button "Ctrl+Z" [ref=e109] [cursor=pointer]
+    - button "↑" [ref=e110] [cursor=pointer]
+    - button "↓" [ref=e111] [cursor=pointer]
+    - button "Esc" [ref=e112] [cursor=pointer]
+  - generic [ref=e113]:
+    - textbox "コマンドを入力..." [ref=e114]
+    - button [disabled] [ref=e115] [cursor=pointer]:
+      - img [ref=e116]

@@ -1,0 +1,69 @@
+- generic [ref=e78]:
+  - banner [ref=e79]:
+    - button [ref=e80] [cursor=pointer]:
+      - img [ref=e81]
+    - generic [ref=e83]:
+      - generic [ref=e85]: orchestrator 起動
+      - generic [ref=e86]: 1/6
+  - generic [ref=e90]:
+    - textbox "Terminal input" [ref=e91]
+    - generic:
+      - generic:
+        - generic: "system prompt: /Users/shiozawatakumi/Library/Application Support/tako/orche"
+      - generic:
+        - generic: strat
+      - generic:
+        - generic: or/master-system.md
+      - generic:
+        - generic: "[shiozawatakumi@shiozawaMacPro:~]$ tako master tako"
+      - generic:
+        - generic: master
+        - generic: を起動しました
+        - generic: ":"
+        - generic: タブ
+        - generic: "'master-tako'"
+        - generic: （
+        - generic: ペイン
+        - generic: "10"
+        - generic: ）
+      - generic:
+        - generic: "system prompt: /Users/shiozawatakumi/Library/Application Support/tako/orche"
+      - generic:
+        - generic: strat
+      - generic:
+        - generic: or/master-system.md
+      - generic:
+        - generic: "[shiozawatakumi@shiozawaMacPro:~]$ tako master alarm"
+      - generic:
+        - generic: master
+        - generic: を起動しました
+        - generic: ":"
+        - generic: タブ
+        - generic: "'master-alarm'"
+        - generic: （
+        - generic: ペイン
+        - generic: "23"
+        - generic: ）
+      - generic:
+        - generic: "system prompt: /Users/shiozawatakumi/Library/Application Support/tako/orche"
+      - generic:
+        - generic: strat
+      - generic:
+        - generic: or/master-system.md
+      - generic:
+        - generic: "[shiozawatakumi@shiozawaMacPro:~]$"
+  - generic [ref=e92]:
+    - button "Tab" [ref=e93] [cursor=pointer]
+    - button "Ctrl+C" [ref=e94] [cursor=pointer]
+    - button "Ctrl+D" [ref=e95] [cursor=pointer]
+    - button "Ctrl+Z" [ref=e96] [cursor=pointer]
+    - button "↑" [ref=e97] [cursor=pointer]
+    - button "↓" [ref=e98] [cursor=pointer]
+    - button "←" [ref=e99] [cursor=pointer]
+    - button "→" [ref=e100] [cursor=pointer]
+    - button "Esc" [ref=e101] [cursor=pointer]
+    - button "Enter" [ref=e102] [cursor=pointer]
+  - generic [ref=e103]:
+    - textbox "コマンドを入力..." [ref=e104]
+    - button [disabled] [ref=e105] [cursor=pointer]:
+      - img [ref=e106]

@@ -1,0 +1,7 @@
+- generic [ref=e4]:
+  - generic [ref=e6]: "!"
+  - heading "接続エラー" [level=1] [ref=e7]
+  - paragraph [ref=e8]: "接続失敗: Failed to fetch"
+  - generic [ref=e9]:
+    - button "再試行" [ref=e10] [cursor=pointer]
+    - button "マシン一覧" [ref=e11] [cursor=pointer]

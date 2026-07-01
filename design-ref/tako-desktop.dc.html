@@ -1,0 +1,161 @@
+# tako Desktop UI Design Specification
+# Source: Claude Design project f35bd54d-4d36-4d98-bb5f-168247d365f1
+# File: tako Desktop.dc.html
+
+## Color Palette (Catppuccin Mocha based)
+
+### Backgrounds
+- Crust (deepest):    #11111b
+- Mantle (sidebars):  #181825
+- Base (main):        #1e1e2e
+- Surface 0:          #1b1c28
+- Surface 1:          #1c1d2b
+- Surface 2:          #20212f
+- Surface hover:      #1f2030
+
+### Borders
+- Border 0:           #21222f
+- Border 1:           #26273a
+- Border 2:           #2a2b3c
+- Border 3:           #2b2c3e
+- Border 4:           #34354a
+
+### Text
+- Text primary:       #cdd6f4
+- Text secondary:     #bac2de
+- Text tertiary:      #a6adc8
+- Text muted:         #6c7086
+- Text faintest:      #585b70
+- Text overlay:       #45475a
+- Surface highlight:  #313244
+
+### Accent Colors
+- Blue (accent/focus):   #89b4fa   glow: rgba(137,180,250,0.7)
+- Green (success/idle):  #a6e3a1
+- Red (error/fail):      #f38ba8   glow: rgba(243,139,168,0.6)
+- Yellow (warn/modified):#f9e2af
+- Teal (worker badge):   #94e2d5
+- Mauve (progress):      #cba6f7
+- Peach (file accent):   #fab387
+- Rosewater (cursor):    #f5e0dc
+
+## Typography
+- UI text:     -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; 13px
+- Monospace:   'JetBrains Mono', monospace
+- Tab label:   12.5px, weight 600
+- Badge:       10px, weight 600, letter-spacing 0.04em
+- Status:      10.5px
+- Section:     10.5px, weight 700, letter-spacing 0.09em, uppercase
+- Mini:        9.5px
+
+## Layout Structure (1440x900)
+
+### Tab Bar (height: 40px)
+- Background: #181825
+- Border bottom: 1px solid #26273a
+- Traffic lights: 12px circles (red #f38ba8, yellow #f9e2af, green #a6e3a1), gap 8px
+- Active tab: bg #1e1e2e, box-shadow inset 0 -2px 0 #89b4fa
+  - Status dot: 7px, color matches state, pulse animation if running
+  - Label: 12.5px weight 600 #cdd6f4
+  - Count: 11px #6c7086
+  - Close: 18x18px, 13px X icon, hover bg #313244
+- Inactive tab: no bg, text #6c7086, hover bg #1c1d2b
+  - Status dot: 7px #45475a (no activity) or state color
+- New tab button: 34px wide, + icon 15px
+- Right chrome: 30x30 icon buttons (search, settings), border-radius 7px
+
+### Left Sidebar (width: 244px)
+- Background: #181825
+- Header: 38px, folder icon #89b4fa, project name 12px weight 600 #bac2de, path in mono 10.5px #6c7086
+- File tree item: 
+  - Normal: padding 4px 12px, text #a6adc8
+  - Selected: bg rgba(137,180,250,0.13), box-shadow inset 2px 0 0 #89b4fa, text #cdd6f4
+  - Hover: bg #1f2030
+  - Indent: 30px for nested
+  - Chevron: 12px, open=down closed=right
+  - Folder icon: 14px stroke #89b4fa (open) or #6c7086 (closed)
+  - File icon: 14px, color varies by type (#6c7086 default, #fab387 config, #89b4fa docs)
+  - Git status: mono 10.5px, M=#f9e2af, right-aligned
+
+### Center Panes
+- Container: flex row, gap 8px, padding 8px, bg #1e1e2e
+- Focused pane: border 1px solid #89b4fa, border-radius 7px,
+  box-shadow: 0 0 0 1px rgba(137,180,250,0.25), 0 8px 24px rgba(0,0,0,0.35)
+- Unfocused pane: border 1px solid #2a2b3c, border-radius 7px
+- Pane header (30px):
+  - Focused bg: #20212f, border-bottom 1px solid #2a2b3c
+  - Unfocused bg: #1b1c28, border-bottom 1px solid #26273a
+  - Role icon: custom SVG, color matches role
+  - Name: mono 12px weight 600
+  - Role badge: 10px weight 600, letter-spacing 0.04em, padding 2px 7px, border-radius 5px
+    - ORCHESTRATOR: text #89b4fa, bg rgba(137,180,250,0.14)
+    - WORKER: text #94e2d5, bg rgba(148,226,213,0.12)
+  - Status: 10.5px, dot 6px with pulse animation
+    - running: #89b4fa
+    - failed: #f38ba8 with X icon
+    - idle: #a6e3a1
+  - Terminal info: mono 10.5px #6c7086 "zsh · 80×24"
+  - Split button: 13px icon #6c7086, hover #cdd6f4
+  - Close button: 13px X icon #6c7086, hover #f38ba8
+- Pane content: padding 12px 14px (focused) / 11px 13px (unfocused)
+  - Font: JetBrains Mono 12.5px/12px, line-height 1.65/1.6
+  - Cursor: 8x16px #f5e0dc, blink animation
+
+### Right Panel (width: 320px)
+- Background: #181825
+- Header tabs (38px): tmux/git toggle, active has inset bottom border #89b4fa
+- Section label: "WORKSPACE" 10.5px weight 700 letter-spacing 0.09em #6c7086
+- Legend dots: 6px circles with labels (run=#89b4fa, fail=#f38ba8, idle=#a6e3a1)
+
+#### Tab Group Card (expanded)
+- Border: 1px solid #2b2c3e, border-radius 9px, bg #1c1d2b
+- Active highlight: inset 0 0 0 1px rgba(137,180,250,0.18)
+- Header: chevron, status dot 7px, tab name 13px weight 700, pane count, ACTIVE badge
+- Mini layout map: 92x76px, bg #11111b, border 1px solid #2a2b3c, border-radius 6px
+  - Pane cells: border-radius 4px, focused has blue border + glow, failed has red border
+  - Numbers: mono 11px weight 700
+- Pane list items:
+  - Focused: bg rgba(137,180,250,0.1), inset 2px 0 0 #89b4fa
+  - Number badge: 16x16px, border-radius 4px
+  - Name: mono 12px weight 600
+  - Role tag: 8.5px weight 700 (ORCH=#89b4fa, WORK=#94e2d5)
+  - Status dot: 6px, pulse if running
+- Background/shelved area:
+  - Border-top: 1px dashed #2b2c3e
+  - Label: "BACKGROUND · N" 9.5px weight 700 #6c7086
+  - Item: dashed border #34354a, bg #161620, drag handle (6-dot grip), hover border #45475a
+  - Promote arrow icon for bringing to foreground
+
+#### Tab Group Card (collapsed)
+- Border: 1px solid #2b2c3e, border-radius 9px, bg #1a1b27
+- Right chevron (not down), status dot, name, inline pane-state chips (mini rectangles)
+- If has failure: border tint #3a2b35, bg #1f1a22, "1 fail" label in red
+
+### Background Drawer (toggle, 150px)
+- Background: #11111b, border-top 1px solid #26273a
+- Thumbnail panes: 200px wide, header 24px with status dot + label, content 9.5px mono #585b70
+
+### Status Bar (height: 30px)
+- Background: #181825, border-top 1px solid #26273a
+- Items separated by 1px solid #26273a borders
+- Active toggle: text #89b4fa, bg rgba(137,180,250,0.1)
+- Inactive toggle: text #a6adc8, hover bg #1f2030
+- Agent fleet: orchestrator icon, "master" weight 600, "· 3 workers" #6c7086
+- Usage: chart icon #94e2d5, "usage" #6c7086, tokens mono #cdd6f4, cost mono #94e2d5
+- Context meter: "ctx" #6c7086, progress bar 70x6px bg #313244 border-radius 3px
+  - Fill: #89b4fa (<70%), #f9e2af (70-89%), #f38ba8 (>=90%)
+  - Percent: mono #cdd6f4
+  - Detail: mono 10.5px #6c7086 "128K/200K"
+- tmux toggle: active dot 6px #89b4fa with glow
+- git toggle: branch icon, "main"
+
+## Animations
+- blink: 0%,49% opacity 1; 50%,100% opacity 0 (cursor)
+- pulse: 0%,100% opacity 1; 50% opacity 0.35 (running status dots)
+
+## Interactive States
+- Hover on buttons: bg #313244, text brightens to #cdd6f4
+- Hover on close: stroke #f38ba8
+- Hover on list items: bg #1f2030 or #232434
+- Focus: blue border + box-shadow glow
+- Selected file: left blue bar + blue-tinted bg
