@@ -753,7 +753,7 @@ fn main() -> ExitCode {
             if args.check {
                 setup::run_check()
             } else if args.reset {
-                setup::run_reset()
+                setup::run_reset().and_then(|()| setup::run_setup())
             } else {
                 setup::run_setup()
             }
