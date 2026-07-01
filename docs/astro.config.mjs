@@ -31,7 +31,7 @@ export default defineConfig({
 					items: [
 						{ label: 'タブ＆ペイン管理', slug: 'features/tabs-and-panes' },
 						{ label: '内蔵 MCP サーバー', slug: 'features/mcp-server' },
-						{ label: 'ファイルツリー＆プレビュー', slug: 'features/file-preview' },
+						{ label: 'ファイルプレビュー', slug: 'features/file-preview' },
 						{ label: 'tmux バックエンド', slug: 'features/tmux-backend' },
 						{ label: 'ポート検知', slug: 'features/port-detection' },
 						{ label: 'たまり場', slug: 'features/shelving' },

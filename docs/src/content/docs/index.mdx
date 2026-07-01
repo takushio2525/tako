@@ -1,7 +1,15 @@
 ---
-title: tako
+title: tako とは
 description: AI エージェントのための次世代ターミナル
-template: splash
+tableOfContents: false
+head:
+  - tag: style
+    content: |
+      main:has(.tako-landing) .content-panel:first-child,
+      main:has(.tako-landing) + aside,
+      [data-pagefind-ignore]:has(.tako-landing) + aside {
+        display: none !important;
+      }
 ---
 
 <div class="tako-landing">
@@ -11,7 +19,7 @@ template: splash
 <div class="tako-hero-content">
 <div class="tako-badge"><span class="tako-badge-dot"></span> AI エージェント時代のターミナル</div>
 
-<h1 class="tako-hero-title">画面を自由に操る、<br /><span class="tako-highlight">tako</span>にようこそ。</h1>
+<h1 class="tako-hero-title">画面を自由に操る、<br /><span class="tako-highlight">tako</span> にようこそ。</h1>
 
 <p class="tako-hero-tagline">Claude Code の子エージェント・dev サーバー・ファイルプレビューを「1タブ＝1作業グループ」で集約。設定ゼロで、AI が自分のワークスペースを組み立てます。</p>
 
@@ -28,7 +36,7 @@ template: splash
 </section>
 
 <section class="tako-section">
-<h2 class="tako-section-title"><span class="tako-section-num">01</span> tako でできること</h2>
+<h2 class="tako-section-title"><span class="tako-section-dash">—</span> tako でできること</h2>
 
 <div class="tako-card-grid">
 <div class="tako-card">
@@ -58,7 +66,7 @@ template: splash
 </section>
 
 <section class="tako-section">
-<h2 class="tako-section-title"><span class="tako-section-num">02</span> はじめよう</h2>
+<h2 class="tako-section-title"><span class="tako-section-dash">—</span> はじめよう</h2>
 
 <div class="tako-terminal-block">
 <div class="tako-terminal-header">
