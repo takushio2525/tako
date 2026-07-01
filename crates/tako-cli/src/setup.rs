@@ -340,18 +340,16 @@ pub fn run_setup() -> Result<(), String> {
         .unwrap_or_else(|| "/bin/sh".into());
 
     let greeting = if is_first_run {
-        "これは初回セットアップです。Step 1（環境チェック）は完了しました。\
-         Step 2（Claude Code 環境セットアップ）から始めてください。\
-         ユーザーにヒアリング項目を順に聞いて、~/.claude/CLAUDE.md を生成してください。"
+        "tako のセットアップを始めます。いくつか質問に答えてください。"
     } else {
-        "2回目以降のセットアップです。メニューを表示してください: \
-         1. CLAUDE.md の確認・編集 / 2. オーケストレーター設定の変更 / \
-         3. MCP 接続の再設定 / 4. 環境チェックの再実行"
+        "tako の設定を変更します。何をしますか？"
     };
 
     let claude_cmd = format!(
-        "cd '{}' && claude '{}'",
+        "cd '{}' && claude --model '{}' --effort '{}' '{}'",
         dir.display(),
+        config.orchestrator.master_model.replace('\'', "'\\''"),
+        config.orchestrator.effort.replace('\'', "'\\''"),
         greeting.replace('\'', "'\\''"),
     );
 
