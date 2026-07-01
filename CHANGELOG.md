@@ -5,6 +5,66 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-02
+
+### Added
+
+#### Interactive Setup / 対話式セットアップ
+
+- `tako setup`: interactive setup command for Claude Code configuration (model selection, effort, CLAUDE.md backup)
+  `tako setup`: Claude Code 設定の対話式セットアップコマンド（モデル選択・effort 設定・CLAUDE.md 自動バックアップ）
+- `tako setup --reset`: reset and restart setup in one step
+  `tako setup --reset`: リセット後にそのままセットアップを再開
+
+#### Menu Bar & Window Management / メニューバー・ウィンドウ管理
+
+- Menu bar: Open Directory, Open Repository, New Window; CLI `tako --dir` for launching with a specific directory
+  メニューバー拡充: ディレクトリを開く・リポジトリを開く・新規ウィンドウ + CLI `tako --dir`
+
+#### Media & File Preview / メディア・ファイルプレビュー
+
+- mp4 preview: seek with arrow keys/click, keyboard shortcuts for playback control
+  mp4 プレビュー: 矢印キー/クリックでシーク、キーボードショートカットで再生制御
+- WebView pane: embedded Chrome-based web view within pane (headless mode, isolated profile)
+  WebView ペイン: ペイン内の埋め込み Chrome ベース Web ビュー（headless モード、一時プロファイル）
+
+#### Drag & Drop / ドラッグ＆ドロップ
+
+- OS-level drag & drop: drop files/folders onto tako with context-aware behavior per drop target
+  OS レベル D&D: ファイル/フォルダを tako にドロップ、ドロップ先に応じた挙動の出し分け
+
+### Improved
+
+#### Documentation Site / ドキュメントサイト
+
+- Documentation site (tako-docs.pages.dev): Claude Design theme, improved content, sidebar widgets, mascot fix
+  ドキュメントサイト（tako-docs.pages.dev）: Claude Design テーマ刷新・コンテンツ充実・サイドバーウィジェット・マスコット修正
+- Distribution research and implementation draft (.pkg, Homebrew Cask)
+  配布方法の調査結果と実装ドラフト（.pkg、Homebrew Cask）
+
+#### Distribution / 配布
+
+- Homebrew Cask support: `brew install --cask takushio2525/tako/tako`
+  Homebrew Cask 対応: `brew install --cask takushio2525/tako/tako`
+
+#### Project Infrastructure / プロジェクト基盤
+
+- Issue templates for bug reports and feature requests
+  Issue テンプレートの追加（バグ報告・機能リクエスト）
+- .gitattributes for consistent line endings and binary detection
+  .gitattributes 追加（改行コード統一・バイナリ判定）
+
+### Fixed
+
+- `orchestrator_spawn` CLI/MCP: pane/tab priority order was inverted
+  `orchestrator_spawn` CLI/MCP: pane/tab 優先順位の逆転を修正
+- `orchestrator_spawn`: pane/tab parameter now required to prevent ambiguous placement
+  `orchestrator_spawn`: pane/tab 指定を必須化し配置の曖昧さを解消
+- WebView Chrome launch: use temporary profile to avoid conflicts with existing Chrome sessions
+  WebView Chrome 起動: 一時プロファイルで既存 Chrome との競合を回避
+- `tako setup`: model suggestion based on user context + latest info; effort fixed to high; interactive mode
+  `tako setup`: モデル提案をユーザー状況ベースに改善、effort を high 固定、対話モード修正
+
 ## [0.1.0] - 2026-06-26
 
 ### Added

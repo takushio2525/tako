@@ -331,9 +331,7 @@ pub fn run_setup() -> Result<(), String> {
         if claude_md.is_file() {
             let backup = find_backup_path(&home.join(".claude"), "CLAUDE.md");
             if let Err(e) = std::fs::copy(&claude_md, &backup) {
-                eprintln!(
-                    "  ⚠ CLAUDE.md のバックアップに失敗: {e}"
-                );
+                eprintln!("  ⚠ CLAUDE.md のバックアップに失敗: {e}");
             } else {
                 eprintln!(
                     "  ✓ CLAUDE.md をバックアップ: {}",
