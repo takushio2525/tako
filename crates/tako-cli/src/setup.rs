@@ -325,6 +325,24 @@ pub fn run_setup() -> Result<(), String> {
     let is_first_run = !config.setup.completed;
 
     // 5. claude を setup cwd で起動
+    // ~/.claude/CLAUDE.md が存在すればバックアップ
+    if let Some(home) = home_dir() {
+        let claude_md = home.join(".claude/CLAUDE.md");
+        if claude_md.is_file() {
+            let backup = find_backup_path(&home.join(".claude"), "CLAUDE.md");
+            if let Err(e) = std::fs::copy(&claude_md, &backup) {
+                eprintln!(
+                    "  ⚠ CLAUDE.md のバックアップに失敗: {e}"
+                );
+            } else {
+                eprintln!(
+                    "  ✓ CLAUDE.md をバックアップ: {}",
+                    backup.file_name().unwrap_or_default().to_string_lossy()
+                );
+            }
+        }
+    }
+
     eprintln!();
     if is_first_run {
         eprintln!("初回セットアップを開始します。claude が対話で設定をガイドします。");
@@ -346,10 +364,9 @@ pub fn run_setup() -> Result<(), String> {
     };
 
     let claude_cmd = format!(
-        "cd '{}' && claude --model '{}' --effort '{}' '{}'",
+        "cd '{}' && claude --model '{}' --effort high '{}'",
         dir.display(),
         config.orchestrator.master_model.replace('\'', "'\\''"),
-        config.orchestrator.effort.replace('\'', "'\\''"),
         greeting.replace('\'', "'\\''"),
     );
 
@@ -377,6 +394,30 @@ pub fn run_setup() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn find_backup_path(dir: &Path, filename: &str) -> PathBuf {
+    let today = {
+        let output = std::process::Command::new("date")
+            .args(["+%Y-%m-%d"])
+            .output();
+        match output {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            _ => "unknown".into(),
+        }
+    };
+    let base = dir.join(format!("{filename}.backup-{today}"));
+    if !base.exists() {
+        return base;
+    }
+    let mut n = 2u32;
+    loop {
+        let candidate = dir.join(format!("{filename}.backup-{today}-{n}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 fn now_iso8601() -> String {
