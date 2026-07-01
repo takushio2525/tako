@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 380">
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff9eb2"/>
+      <stop offset="1" stop-color="#ef5e8e"/>
+    </linearGradient>
+    <linearGradient id="tentacle" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ef5e8e"/>
+      <stop offset="1" stop-color="#e04878"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 外側の触手（左右カール） -->
+  <path d="M88,200 C40,290 -5,310 -15,260" fill="none" stroke="url(#tentacle)"
+        stroke-width="22" stroke-linecap="round" opacity="0.9"/>
+  <path d="M232,200 C280,290 325,310 335,260" fill="none" stroke="url(#tentacle)"
+        stroke-width="22" stroke-linecap="round" opacity="0.9"/>
+
+  <!-- 中央の触手（下に垂れる） -->
+  <path d="M120,240 C115,300 100,340 90,355" fill="none" stroke="url(#tentacle)"
+        stroke-width="18" stroke-linecap="round" opacity="0.7"/>
+  <path d="M160,248 C160,310 155,345 150,365" fill="none" stroke="url(#tentacle)"
+        stroke-width="18" stroke-linecap="round" opacity="0.7"/>
+  <path d="M200,240 C205,300 220,340 230,355" fill="none" stroke="url(#tentacle)"
+        stroke-width="18" stroke-linecap="round" opacity="0.7"/>
+
+  <!-- 頭 + 胴体（スカラップ下縁） -->
+  <path d="M75,150 A85,85 0 0 1 245,150 L245,225
+           a18,18 0 0 1 -36,0 a18,18 0 0 1 -36,0 a18,18 0 0 1 -36,0
+           a18,18 0 0 1 -36,0 a18,18 0 0 1 -36,0 Z"
+        fill="url(#body)"/>
+
+  <!-- 頭頂のハイライト -->
+  <ellipse cx="140" cy="105" rx="40" ry="20" fill="#ffb8c8" opacity="0.4"/>
+
+  <!-- 目（左） -->
+  <ellipse cx="130" cy="160" rx="20" ry="22" fill="#ffffff"/>
+  <circle cx="134" cy="166" r="10" fill="#27212e"/>
+  <circle cx="138" cy="160" r="4" fill="#ffffff"/>
+
+  <!-- 目（右） -->
+  <ellipse cx="190" cy="160" rx="20" ry="22" fill="#ffffff"/>
+  <circle cx="186" cy="166" r="10" fill="#27212e"/>
+  <circle cx="190" cy="160" r="4" fill="#ffffff"/>
+
+  <!-- 頬 -->
+  <ellipse cx="100" cy="190" rx="14" ry="9" fill="#ffc2cf" opacity="0.75"/>
+  <ellipse cx="220" cy="190" rx="14" ry="9" fill="#ffc2cf" opacity="0.75"/>
+
+  <!-- 口 -->
+  <path d="M145,195 q15,14 30,0" fill="none" stroke="#b03a64"
+        stroke-width="5" stroke-linecap="round"/>
+</svg>

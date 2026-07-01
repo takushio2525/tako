@@ -2,55 +2,83 @@
 title: tako
 description: AI エージェントのための次世代ターミナル
 template: splash
-hero:
-  title: tako
-  tagline: AI エージェントが画面を自由に操る、次世代ターミナル。Claude Code の子エージェント・dev サーバー・ファイルプレビューを「1 タブ = 1 作業グループ」で集約管理。設定ゼロで AI が自分のワークスペースを組み立てる。
-  image:
-    file: ../../assets/tako-icon.svg
-  actions:
-    - text: ダウンロード
-      link: https://github.com/takushio2525/tako/releases
-      icon: external
-      variant: primary
-    - text: セットアップガイド
-      link: /getting-started/
-      variant: secondary
 ---
 
-import { Card, CardGrid } from '@astrojs/starlight/components';
+<div class="tako-landing">
 
-## tako でできること
+<section class="tako-hero">
+<div class="tako-hero-inner">
+<div class="tako-hero-content">
+<div class="tako-badge"><span class="tako-badge-dot"></span> AI エージェント時代のターミナル</div>
 
-<CardGrid>
-  <Card title="内蔵 MCP サーバー" icon="puzzle">
-    tako の中で Claude Code を起動すれば、AI は設定ゼロで自動的にペインの分割・コマンド実行・ファイル表示ができる。「隣のペインで dev サーバー起動して」が一言で通る。
-  </Card>
-  <Card title="タブ＆ペイン管理" icon="laptop">
-    iTerm2 ライクな分割レイアウトにドラッグ&ドロップ対応。AI エージェント・dev サーバー・ログを「1 タブ = 1 作業グループ」にまとめて全体像を把握できる。
-  </Card>
-  <Card title="再起動しても消えない" icon="rocket">
-    tmux バックエンド により、tako を閉じて再起動しても実行中のプロセスと画面内容がそのまま復元される。エージェントの長時間タスクも安心。
-  </Card>
-  <Card title="ファイルプレビュー" icon="document">
-    AI が「このファイル見て」と言ったら、シンタックスハイライト付きのコードプレビューや Markdown レンダリングがペイン内に直接表示される。エディタを開く必要なし。
-  </Card>
-</CardGrid>
+<h1 class="tako-hero-title">画面を自由に操る、<br /><span class="tako-highlight">tako</span>にようこそ。</h1>
 
-## なぜ tako？
+<p class="tako-hero-tagline">Claude Code の子エージェント・dev サーバー・ファイルプレビューを「1タブ＝1作業グループ」で集約。設定ゼロで、AI が自分のワークスペースを組み立てます。</p>
 
-通常のターミナルで Claude Code を使うと、子エージェントや dev サーバーが別タブ・別ウィンドウに散らばり、AI が何をしているのか見失いがちです。
+<div class="tako-hero-actions">
+<a href="https://github.com/takushio2525/tako/releases" class="tako-btn tako-btn-primary">ダウンロード ↓</a>
+<a href="/getting-started/" class="tako-btn tako-btn-secondary">セットアップガイド</a>
+</div>
+</div>
 
-tako は**AI エージェントが自分の作業環境を自律的に組み立てる**ことを前提に設計されたターミナルです。内蔵 MCP サーバーにより、AI は設定ゼロで画面分割・コマンド実行・ファイル表示・ポート検知を操作できます。人間はタブを眺めるだけで、複数エージェントの進捗と成果物を一目で把握できます。
+<div class="tako-hero-visual">
+<img src="/tako-mascot.svg" alt="tako マスコット" class="tako-mascot" />
+</div>
+</div>
+</section>
 
-## はじめよう
+<section class="tako-section">
+<h2 class="tako-section-title"><span class="tako-section-num">01</span> tako でできること</h2>
 
-```bash
-# 1. GitHub Releases からダウンロード＆インストール
-# 2. MCP サーバーを登録（初回のみ）
-tako setup-mcp
+<div class="tako-card-grid">
+<div class="tako-card">
+<div class="tako-card-icon tako-card-icon-pink">⚡</div>
+<h3>内蔵 MCP サーバー</h3>
+<p>tako の中で Claude Code を起動すれば、AI は設定ゼロで自動的にペインの分割・コマンド実行・ファイル表示ができる。「隣のペインで dev サーバー起動して」が一言で通る。</p>
+</div>
 
-# 3. tako 内で Claude Code を起動 — もう AI は tako を使える
-claude
-```
+<div class="tako-card">
+<div class="tako-card-icon tako-card-icon-pink">⊞</div>
+<h3>タブ＆ペイン管理</h3>
+<p>iTerm2 ライクな分割レイアウトにドラッグ＆ドロップ対応。AI エージェント・dev サーバー・ログを「1 タブ = 1 作業グループ」にまとめて全体像を把握できる。</p>
+</div>
 
-詳しい手順は [セットアップガイド](/getting-started/) をご覧ください。
+<div class="tako-card">
+<div class="tako-card-icon tako-card-icon-green">↻</div>
+<h3>再起動しても消えない</h3>
+<p>tmux バックエンドにより、tako を閉じて再起動しても実行中のプロセスと画面内容がそのまま復元される。エージェントの長時間タスクも安心。</p>
+</div>
+
+<div class="tako-card">
+<div class="tako-card-icon tako-card-icon-green">◇</div>
+<h3>ファイルプレビュー</h3>
+<p>AI が「このファイル見て」と言ったら、シンタックスハイライト付きのコードプレビューや Markdown レンダリングがペイン内に直接表示される。</p>
+</div>
+</div>
+</section>
+
+<section class="tako-section">
+<h2 class="tako-section-title"><span class="tako-section-num">02</span> はじめよう</h2>
+
+<div class="tako-terminal-block">
+<div class="tako-terminal-header">
+<span class="tako-dot tako-dot-red"></span>
+<span class="tako-dot tako-dot-yellow"></span>
+<span class="tako-dot tako-dot-green"></span>
+<span class="tako-terminal-title">Terminal</span>
+</div>
+<div class="tako-terminal-body">
+<div class="tako-terminal-line"><span class="tako-terminal-comment"># 1. GitHub Releases からダウンロード＆インストール</span></div>
+<div class="tako-terminal-line">&nbsp;</div>
+<div class="tako-terminal-line"><span class="tako-terminal-comment"># 2. MCP サーバーを登録（初回のみ）</span></div>
+<div class="tako-terminal-line"><span class="tako-terminal-prompt">$</span> <span class="tako-terminal-cmd">tako setup-mcp</span></div>
+<div class="tako-terminal-line">&nbsp;</div>
+<div class="tako-terminal-line"><span class="tako-terminal-comment"># 3. tako 内で Claude Code を起動</span></div>
+<div class="tako-terminal-line"><span class="tako-terminal-prompt">$</span> <span class="tako-terminal-cmd">claude</span></div>
+</div>
+</div>
+
+<p class="tako-guide-link">詳しい手順は <a href="/getting-started/">セットアップガイド →</a> をご覧ください。</p>
+</section>
+
+</div>
