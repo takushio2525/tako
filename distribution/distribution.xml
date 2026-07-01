@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  distribution.xml — productbuild 用のインストーラー UI 定義
+  build-pkg.sh から参照される。
+
+  インストーラーの動作:
+  - タイトル: "tako"
+  - ライセンス表示なし（GPL-3.0 はインストーラーで同意を求める必要なし）
+  - /Applications に tako.app を配置
+  - macOS 11.0 (Big Sur) 以降を要求
+-->
+<installer-gui-script minSpecVersion="2">
+    <title>tako</title>
+    <options customize="never" require-scripts="false" hostArchitectures="arm64,x86_64"/>
+
+    <!-- macOS 11.0 以降 -->
+    <os-version min="11.0"/>
+
+    <choices-outline>
+        <line choice="default">
+            <line choice="tako"/>
+        </line>
+    </choices-outline>
+
+    <choice id="default"/>
+
+    <choice id="tako"
+            visible="false"
+            customLocation="/Applications"
+            title="tako"
+            description="AI-driven terminal for agent-intensive monitoring">
+        <pkg-ref id="dev.takushio.tako"/>
+    </choice>
+
+    <pkg-ref id="dev.takushio.tako"
+             version="0.1.0"
+             onConclusion="none">tako-component.pkg</pkg-ref>
+</installer-gui-script>
