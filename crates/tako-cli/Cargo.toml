@@ -14,3 +14,5 @@ path = "src/main.rs"
 tako-control.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
+serde = { workspace = true }

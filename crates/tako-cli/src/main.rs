@@ -15,6 +15,8 @@
 //! tako read --pane "$worker" --lines 20
 //! ```
 
+mod setup;
+
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
@@ -102,6 +104,9 @@ enum Command {
     /// MCP 連携（serve = stdio ブリッジ。エージェントの MCP クライアントが起動する）
     #[command(subcommand)]
     Mcp(McpCommand),
+    /// 対話式セットアップ。claude と対話しながら環境を最適化する。
+    /// アプリ未起動でも実行できる
+    Setup(SetupArgs),
     /// Claude Code の settings.json に tako MCP サーバーの接続設定を追加する。
     /// アプリ未起動でも実行できる（settings.json の書き換えのみ）
     SetupMcp(SetupMcpArgs),
@@ -670,6 +675,16 @@ struct ForegroundArgs {
 }
 
 #[derive(Args)]
+struct SetupArgs {
+    /// 環境チェックだけ実行して終了する
+    #[arg(long)]
+    check: bool,
+    /// セットアップ状態をリセットして初回扱いに戻す
+    #[arg(long, conflicts_with = "check")]
+    reset: bool,
+}
+
+#[derive(Args)]
 struct SetupMcpArgs {
     /// ~/.claude/settings.json（ユーザーグローバル）に書き込む（既定）
     #[arg(long, conflicts_with = "project")]
@@ -734,6 +749,15 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Mcp(McpCommand::Serve) => mcp_serve(),
+        Command::Setup(ref args) => {
+            if args.check {
+                setup::run_check()
+            } else if args.reset {
+                setup::run_reset()
+            } else {
+                setup::run_setup()
+            }
+        }
         Command::SetupMcp(ref args) => setup_mcp_local(args),
         Command::Master { ref suffix } => orchestrator_master(suffix.as_deref()),
         Command::Orchestrator(OrchestratorCommand::Watch {
@@ -1772,6 +1796,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Remote(_) => unreachable!("remote は run() を通らない"),
         // main() で分岐済みのため論理的に到達不能
         Command::Mcp(_) => unreachable!("mcp serve は run() を通らない"),
+        Command::Setup(_) => unreachable!("setup は run() を通らない"),
         Command::SetupMcp(_) => unreachable!("setup-mcp は run() を通らない"),
         Command::Master { .. } => unreachable!("master は run() を通らない"),
         Command::Orchestrator(OrchestratorCommand::Watch { .. }) => {

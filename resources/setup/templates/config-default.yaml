@@ -1,0 +1,9 @@
+orchestrator:
+  master_model: claude-opus-4-6[1m]
+  worker_model: claude-opus-4-6[1m]
+  effort: max
+  auto_close: true
+  auto_push: true
+setup:
+  completed: false
+  completed_at: null
