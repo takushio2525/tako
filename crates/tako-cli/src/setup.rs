@@ -350,7 +350,7 @@ pub fn run_setup() -> Result<(), String> {
     };
 
     let claude_cmd = format!(
-        "cd '{}' && claude -p '{}'",
+        "cd '{}' && claude '{}'",
         dir.display(),
         greeting.replace('\'', "'\\''"),
     );
