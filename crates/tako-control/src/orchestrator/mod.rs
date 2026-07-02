@@ -132,6 +132,117 @@ impl ProjectsConfig {
     }
 }
 
+// --- プロファイル ---
+
+/// プロファイルの保存ディレクトリ
+/// `~/Library/Application Support/tako/orchestrator/profiles/`
+pub fn profiles_dir() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("profiles"))
+}
+
+/// プロファイル設定
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Profile {
+    #[serde(default = "default_profile_model")]
+    pub model: String,
+    #[serde(default = "default_profile_effort")]
+    pub effort: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projects: Option<Vec<String>>,
+}
+
+fn default_profile_model() -> String {
+    "claude-opus-4-6[1m]".into()
+}
+fn default_profile_effort() -> String {
+    "max".into()
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        Self {
+            model: default_profile_model(),
+            effort: default_profile_effort(),
+            system_prompt: None,
+            projects: None,
+        }
+    }
+}
+
+impl Profile {
+    /// プロファイルを YAML ファイルから読み込む
+    pub fn load(name: &str) -> Result<Self, String> {
+        let path = profile_path(name)?;
+        if !path.is_file() {
+            return Err(format!(
+                "プロファイル '{name}' が見つからない: {}",
+                path.display()
+            ));
+        }
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("プロファイルの読み取りに失敗: {e}"))?;
+        serde_yaml::from_str(&content).map_err(|e| format!("プロファイルのパースに失敗: {e}"))
+    }
+
+    /// プロファイルを YAML ファイルに保存する
+    pub fn save(&self, name: &str) -> Result<PathBuf, String> {
+        let path = profile_path(name)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
+        }
+        let content =
+            serde_yaml::to_string(self).map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
+        std::fs::write(&path, &content)
+            .map_err(|e| format!("プロファイルの書き込みに失敗: {e}"))?;
+        Ok(path)
+    }
+
+    /// system prompt のパスを解決する。
+    /// profile.system_prompt が指定されていればその絶対パス、
+    /// なければカスタム master-system.md → デフォルト埋め込みの順
+    pub fn resolve_system_prompt(&self) -> Option<PathBuf> {
+        if let Some(ref custom) = self.system_prompt {
+            let expanded = expand_tilde(custom);
+            let p = PathBuf::from(&expanded);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        resolve_system_prompt_path()
+    }
+}
+
+/// プロファイルのファイルパスを返す
+fn profile_path(name: &str) -> Result<PathBuf, String> {
+    profiles_dir()
+        .map(|d| d.join(format!("{name}.yaml")))
+        .ok_or_else(|| "ホームディレクトリが取得できない".into())
+}
+
+/// 利用可能なプロファイル名の一覧を返す
+pub fn list_profiles() -> Result<Vec<String>, String> {
+    let dir = match profiles_dir() {
+        Some(d) if d.is_dir() => d,
+        _ => return Ok(vec![]),
+    };
+    let mut names = Vec::new();
+    let entries = std::fs::read_dir(&dir)
+        .map_err(|e| format!("プロファイルディレクトリの読み取りに失敗: {e}"))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("yaml") {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                names.push(stem.to_string());
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
 /// 初回実行時にデフォルトのディレクトリとファイルを生成する
 pub fn ensure_defaults() -> Result<PathBuf, String> {
     let dir = config_dir().ok_or("ホームディレクトリが取得できない")?;
@@ -142,6 +253,14 @@ pub fn ensure_defaults() -> Result<PathBuf, String> {
             projects: std::collections::BTreeMap::new(),
         };
         template.save()?;
+    }
+    // デフォルトプロファイルが無ければ作成
+    let profiles = profiles_dir().ok_or("ホームディレクトリが取得できない")?;
+    std::fs::create_dir_all(&profiles)
+        .map_err(|e| format!("profiles ディレクトリの作成に失敗: {e}"))?;
+    let default_profile = profiles.join("default.yaml");
+    if !default_profile.is_file() {
+        Profile::default().save("default")?;
     }
     Ok(dir)
 }
@@ -237,5 +356,60 @@ mod tests {
         let back: ProjectsConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(back.projects.len(), 1);
         assert_eq!(back.projects["demo"].cwd, "~/my-project");
+    }
+
+    #[test]
+    fn profile_default_values() {
+        let p = Profile::default();
+        assert_eq!(p.model, "claude-opus-4-6[1m]");
+        assert_eq!(p.effort, "max");
+        assert!(p.system_prompt.is_none());
+        assert!(p.projects.is_none());
+    }
+
+    #[test]
+    fn profile_roundtrip() {
+        let p = Profile {
+            model: "claude-sonnet-5".into(),
+            effort: "high".into(),
+            system_prompt: Some("~/my-prompt.md".into()),
+            projects: Some(vec!["tako".into(), "demo".into()]),
+        };
+        let yaml = serde_yaml::to_string(&p).unwrap();
+        let back: Profile = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back.model, "claude-sonnet-5");
+        assert_eq!(back.effort, "high");
+        assert_eq!(back.system_prompt.as_deref(), Some("~/my-prompt.md"));
+        assert_eq!(back.projects.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn profile_deserialize_minimal() {
+        let yaml = "model: claude-opus-4-6[1m]\n";
+        let p: Profile = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.effort, "max");
+        assert!(p.projects.is_none());
+    }
+
+    #[test]
+    fn profile_save_load_roundtrip() {
+        let tmp = std::env::temp_dir().join("tako-test-profiles");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let name = "test-roundtrip";
+        let path = tmp.join(format!("{name}.yaml"));
+        let p = Profile {
+            model: "test-model".into(),
+            effort: "low".into(),
+            system_prompt: None,
+            projects: Some(vec!["a".into()]),
+        };
+        let yaml = serde_yaml::to_string(&p).unwrap();
+        std::fs::write(&path, &yaml).unwrap();
+        let loaded: Profile =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(loaded.model, "test-model");
+        assert_eq!(loaded.projects.as_ref().unwrap(), &["a"]);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

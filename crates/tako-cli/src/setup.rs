@@ -274,6 +274,19 @@ pub fn run_check() -> Result<(), String> {
         }
     }
 
+    // プロファイル一覧
+    match tako_control::orchestrator::list_profiles() {
+        Ok(profiles) if !profiles.is_empty() => {
+            eprintln!(
+                "  ✓ プロファイル: {} 個（{}）",
+                profiles.len(),
+                profiles.join(", ")
+            );
+        }
+        Ok(_) => eprintln!("  △ プロファイル: 未作成（tako master で自動生成されます）"),
+        Err(e) => eprintln!("  △ プロファイル: 確認失敗 ({e})"),
+    }
+
     Ok(())
 }
 
@@ -389,6 +402,29 @@ pub fn run_setup() -> Result<(), String> {
             "claude が終了しました（exit code: {}）",
             status.code().unwrap_or(-1)
         );
+    }
+
+    // 6. デフォルトプロファイルの確認・作成
+    use tako_control::orchestrator;
+    if let Err(e) = orchestrator::ensure_defaults() {
+        eprintln!("  ⚠ プロファイルの初期化に失敗: {e}");
+    } else {
+        eprintln!("  ✓ デフォルトのオーケストレータープロファイルを確認しました");
+        match orchestrator::list_profiles() {
+            Ok(profiles) if profiles.len() > 1 => {
+                eprintln!("    既存プロファイル: {}", profiles.join(", "));
+            }
+            _ => {}
+        }
+        eprintln!();
+        eprintln!("別のプロファイルを作成するには:");
+        eprintln!(
+            "  {}orchestrator/profiles/<名前>.yaml を編集",
+            orchestrator::config_dir()
+                .map(|d| format!("{}/", d.display()))
+                .unwrap_or_default()
+        );
+        eprintln!("  tako master -<名前> で起動");
     }
 
     Ok(())

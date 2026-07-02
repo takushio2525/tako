@@ -5,6 +5,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-02
+
+### Added
+
+- Orchestrator profiles: `tako master -<name>` to launch with different configurations (model, effort, system prompt, project subset)
+  オーケストレータープロファイル機能: `tako master -<名前>` で設定別のマスターを起動可能（モデル・effort・システムプロンプト・プロジェクトサブセット）
+- Profile management: profiles stored in `~/Library/Application Support/tako/orchestrator/profiles/`
+  プロファイル管理: `~/Library/Application Support/tako/orchestrator/profiles/` に YAML で保存
+- `tako setup --check` now shows available profiles
+  `tako setup --check` でプロファイル一覧を表示
+- Default profile auto-created on first `tako master` run
+  初回 `tako master` 実行時にデフォルトプロファイルを自動生成
+- Backward compatible: `tako master dev` (old suffix form) still works
+  後方互換: `tako master dev`（旧サフィックス形式）も引き続き動作
+
 ## [0.2.1] - 2026-07-02
 
 ### Added

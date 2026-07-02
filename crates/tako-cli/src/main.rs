@@ -117,10 +117,11 @@ enum Command {
     #[command(subcommand)]
     Remote(RemoteCommand),
     /// マスターオーケストレーターを起動する。新タブで claude を master system prompt 付きで起動する。
-    /// suffix を付けると複数 master を区別できる（例: tako master dev → "master-dev" タブ）
+    /// プロファイル名を指定して設定を切り替えられる（例: tako master -2 → "2" プロファイル）。
+    /// 引数なしは default プロファイル。旧形式（tako master dev）も後方互換で動作する
     Master {
-        /// タブ名のサフィックス（例: dev → "master-dev"）
-        suffix: Option<String>,
+        /// プロファイル名（-2, -difficult 等）またはサフィックス（旧形式: dev 等）
+        profile: Option<String>,
     },
     /// オーケストレーター操作（projects / spawn / status / watch）
     #[command(subcommand)]
@@ -759,7 +760,7 @@ fn main() -> ExitCode {
             }
         }
         Command::SetupMcp(ref args) => setup_mcp_local(args),
-        Command::Master { ref suffix } => orchestrator_master(suffix.as_deref()),
+        Command::Master { ref profile } => orchestrator_master(profile.as_deref()),
         Command::Orchestrator(OrchestratorCommand::Watch {
             pane,
             pane_pos,
@@ -902,15 +903,39 @@ fn setup_mcp_local(args: &SetupMcpArgs) -> Result<(), String> {
     }
 }
 
-/// `tako master [suffix]` — 新タブで claude をマスター system prompt 付きで起動する
-fn orchestrator_master(suffix: Option<&str>) -> Result<(), String> {
+/// `tako master [-profile]` — 新タブで claude をマスター system prompt 付きで起動する。
+/// `-<名前>` でプロファイルを指定、引数なしは default、旧形式（suffix のみ）も後方互換で動作
+fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
     use tako_control::orchestrator;
 
     orchestrator::ensure_defaults().map_err(|e| format!("セットアップに失敗: {e}"))?;
 
+    // 引数をパース: "-<name>" → プロファイル名、それ以外 → 旧 suffix として扱う
+    let (profile_name, suffix) = match arg {
+        None => ("default", None),
+        Some(s) if s.starts_with('-') => {
+            let name = &s[1..];
+            if name.is_empty() {
+                return Err("プロファイル名が空です（例: tako master -2）".into());
+            }
+            (name, Some(name))
+        }
+        Some(s) => {
+            // 旧形式の後方互換: `tako master dev` → suffix "dev"、プロファイル "default"
+            ("default", Some(s))
+        }
+    };
+
+    // プロファイルを読み込む（存在しなければデフォルト値で作成）
+    let profile = match orchestrator::Profile::load(profile_name) {
+        Ok(p) => p,
+        Err(_) if profile_name == "default" => orchestrator::Profile::default(),
+        Err(e) => return Err(e),
+    };
+
     // system prompt ファイルの準備
-    let prompt_path = if let Some(custom) = orchestrator::resolve_system_prompt_path() {
-        custom
+    let prompt_path = if let Some(resolved) = profile.resolve_system_prompt() {
+        resolved
     } else {
         // デフォルトを一時ファイルに書き出す
         let dir = orchestrator::config_dir().ok_or("ホームディレクトリが取得できない")?;
@@ -934,7 +959,7 @@ fn orchestrator_master(suffix: Option<&str>) -> Result<(), String> {
         .as_u64()
         .ok_or("タブ作成の応答に pane が含まれない")?;
 
-    // master ペインに role を設定（suffix があれば含める）
+    // master ペインに role を設定
     let role = match suffix {
         Some(s) => format!("orchestrator-master:{s}"),
         None => "orchestrator-master".into(),
@@ -951,8 +976,10 @@ fn orchestrator_master(suffix: Option<&str>) -> Result<(), String> {
         None => "master".into(),
     };
     let claude_cmd = format!(
-        "TAKO_ORCHESTRATOR_ROLE='{}' claude --model 'claude-opus-4-6[1m]' --effort max --append-system-prompt-file '{}'",
+        "TAKO_ORCHESTRATOR_ROLE='{}' claude --model '{}' --effort {} --append-system-prompt-file '{}'",
         role_env,
+        profile.model,
+        profile.effort,
         prompt_path.display()
     );
     send_request(Request::Send {
@@ -964,6 +991,10 @@ fn orchestrator_master(suffix: Option<&str>) -> Result<(), String> {
     })?;
 
     eprintln!("master を起動しました: タブ '{tab_title}'（ペイン {pane_id}）");
+    eprintln!(
+        "プロファイル: {profile_name}（モデル: {}、effort: {}）",
+        profile.model, profile.effort
+    );
     eprintln!("system prompt: {}", prompt_path.display());
     Ok(())
 }
@@ -1798,7 +1829,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Mcp(_) => unreachable!("mcp serve は run() を通らない"),
         Command::Setup(_) => unreachable!("setup は run() を通らない"),
         Command::SetupMcp(_) => unreachable!("setup-mcp は run() を通らない"),
-        Command::Master { .. } => unreachable!("master は run() を通らない"),
+        Command::Master { .. } => {
+            unreachable!("master は run() を通らない（直接 orchestrator_master() を呼ぶ）")
+        }
         Command::Orchestrator(OrchestratorCommand::Watch { .. }) => {
             unreachable!("orchestrator watch は run() を通らない")
         }
