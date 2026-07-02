@@ -203,7 +203,11 @@ pub fn tools() -> Vec<Value> {
                 対象の誤指定はそのまま誤実行になるため、必ず tako_list_panes で確認した\
                 ペイン ID を渡すこと。tmux_session を指定するとペインが見つからない場合でも \
                 tmux session 経由で送信できる。await_prompt を true にすると、claude TUI の\
-                プロンプト（❯）が表示されるまで待ってからテキストを送信する（Enter 空振り防止）。",
+                プロンプト（❯）が表示されるまで待ってからテキストを送信する。\
+                claude 等の全画面 TUI への改行つき送信は送達確認ループで配送される: \
+                信頼ダイアログの自動承諾 → bracketed paste 貼り付け → 分離 Enter → \
+                入力欄が空になったことの検証 + Enter 単独再送（マルチラインもそのまま送れる。\
+                応答は queued: true が即座に返り、実際の送達確認はバックグラウンドで行われる）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

@@ -4,12 +4,18 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-02・Issue #23 フェーズ A 完了）
+## 現在の対象（2026-07-02・Issue #23 フェーズ A 完了 / Issue #32 送達確認ループ完了）
 
 スマホリモート接続改善（Issue #23）のフェーズ A（接続基盤・バックエンド API）を完了。
 WS 画面プッシュ / ANSI screen / resize / 認証 fragment 化 / agents・messages 構造化 API /
 不整合解消（リレー URL・close ハンドラ）。次はフェーズ B（フロントエンド刷新）を
 別 worker が担当する予定。
+
+並行 worker が Issue #32（spawn / send のプロンプト送達不安定）を修正済み:
+`tako-control::claude_tui` 新設（TUI 状態検出・事前信頼・tmux 送達確認配送）+
+PromptFlow 刷新（信頼ダイアログ承諾 → bracketed paste → 分離 Enter → 空検証 + 再送）。
+仕様メモは `requirements.md` FR-2.2.2 実装メモと `orchestrator.md` spawn 節。
+**プロンプト送達系の dispatch 変更も tako 本体の再起動後に有効**（下記と同様）。
 
 ## フェーズ B worker への引き継ぎ事項
 

@@ -145,8 +145,13 @@ pub trait ControlHost {
     /// 待ってからプロンプトを送信するために使う。タイムアウト（60 秒）で自動破棄
     fn queue_write_on_alt_screen(&mut self, _pane: PaneId, _data: Vec<u8>) {}
     /// claude TUI へのプロンプト送信フローを登録する。画面内容を確認しながら
-    /// ❯ 待ち → テキスト送信 → Enter 送信 のステートマシンを駆動する
+    /// 信頼ダイアログ承諾 → ❯ 待ち → 貼り付け → 分離 Enter → 入力欄の空検証 + 再送
+    /// のステートマシンを駆動する（Issue #32 送達確認ループ）
     fn queue_prompt_flow(&mut self, _pane: PaneId, _prompt: String) {}
+    /// 送達確認つき送信フローを登録する（Issue #32）。`queue_prompt_flow` と同じ
+    /// ステートマシンだが claude TUI の起動を待たず、現画面へ即座に貼り付ける
+    /// （全画面 TUI への newline つき送信用）。既定実装は何もしない（テスト用モック等）
+    fn queue_send_flow(&mut self, _pane: PaneId, _text: String) {}
     /// リモートアクセス API サーバーを起動する。成功時は状態 JSON を返す。
     /// `no_tunnel` = true で cloudflared を起動しない（LAN のみ）
     fn remote_start(&mut self, _port: Option<u16>, _no_tunnel: bool) -> Result<Value, String> {
@@ -350,18 +355,23 @@ pub fn dispatch(
             tmux_session,
             await_prompt,
         } => {
-            // await_prompt: claude TUI の ❯ 表示を待ってから送信する（prompt_flow 経由）
+            // await_prompt: claude TUI の起動（❯ 表示）を待ってから送達確認つきで送信する。
+            // pane が解決できず tmux_session がある場合はバックグラウンドの tmux 経路で同等を行う
             if await_prompt {
-                let (_, target) = resolve_pane(host.workspace(), pane)?;
-                host.queue_prompt_flow(target, text.clone());
-                return Ok(json!({ "queued": true }));
+                return match resolve_pane(host.workspace(), pane) {
+                    Ok((_, target)) => {
+                        host.queue_prompt_flow(target, text.clone());
+                        Ok(json!({ "queued": true }))
+                    }
+                    Err(e) => match tmux_session {
+                        Some(ref ts) => {
+                            spawn_tmux_delivery(ts.clone(), text.clone(), true);
+                            Ok(json!({ "queued": true }))
+                        }
+                        None => Err(e),
+                    },
+                };
             }
-
-            let payload = if newline {
-                format!("{text}\r")
-            } else {
-                text.clone()
-            };
 
             // pane ID で解決を試み、失敗時に tmux session フォールバック
             match resolve_pane(host.workspace(), pane) {
@@ -369,15 +379,34 @@ pub fn dispatch(
                     let session = host
                         .session(target)
                         .ok_or(DispatchError::NoSession(target.as_u64()))?;
+                    // 全画面 TUI（claude 等）への改行つき送信は送達確認フローへ（Issue #32:
+                    // 一括書き込みは改行が「送信」と解釈されず入力欄に残留する）。
+                    // シェルへの送信は従来どおり即時書き込み（挙動・レイテンシ据え置き）
+                    if newline && session.is_alt_screen() {
+                        host.queue_send_flow(target, text.clone());
+                        return Ok(json!({ "queued": true }));
+                    }
+                    let payload = if newline {
+                        format!("{text}\r")
+                    } else {
+                        text.clone()
+                    };
                     session.write(payload.into_bytes());
                     Ok(Value::Null)
                 }
                 Err(e) => {
                     if let Some(ref ts) = tmux_session {
-                        let socket = tako_core::tmux_backend::socket_name();
-                        tako_core::tmux::send_keys(Some(&socket), ts, &payload)
-                            .map_err(DispatchError::Operation)?;
-                        Ok(Value::Null)
+                        if newline {
+                            // 改行つき送信は送達確認つき配送（対象が claude TUI なら
+                            // 貼り付け + 分離 Enter + 検証、シェルなら即時に無害劣化）
+                            spawn_tmux_delivery(ts.clone(), text.clone(), false);
+                            Ok(json!({ "queued": true }))
+                        } else {
+                            let socket = tako_core::tmux_backend::socket_name();
+                            tako_core::tmux::send_keys(Some(&socket), ts, &text)
+                                .map_err(DispatchError::Operation)?;
+                            Ok(Value::Null)
+                        }
                     } else {
                         Err(e)
                     }
@@ -1652,6 +1681,24 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
     }
 }
 
+/// tmux セッションへの送達確認つき配送をバックグラウンドスレッドで実行する
+/// （Issue #32）。`deliver_via_tmux` は内部で sleep するブロッキング関数のため、
+/// UI スレッド上の dispatch から直接呼ばない。結果はログのみ（fire-and-forget）
+fn spawn_tmux_delivery(session: String, text: String, wait_ready: bool) {
+    std::thread::spawn(move || {
+        let socket = tako_core::tmux_backend::socket_name();
+        match crate::claude_tui::deliver_via_tmux(Some(&socket), &session, &text, wait_ready) {
+            Ok(report) if !report.verified => {
+                eprintln!("warning: tmux 経由のプロンプト送達を検証できない（session={session}）");
+            }
+            Err(e) => {
+                eprintln!("warning: tmux 経由のプロンプト送達に失敗（session={session}）: {e}");
+            }
+            Ok(_) => {}
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_orchestrator_spawn(
     host: &mut dyn ControlHost,
@@ -1785,17 +1832,26 @@ fn dispatch_orchestrator_spawn(
     };
     let claude_cmd = orchestrator::build_worker_claude_cmd(&role_value, model.as_deref(), effort);
 
+    // 事前信頼: 未信頼フォルダで claude を起動すると信頼ダイアログが出て、送信した
+    // プロンプトがダイアログへの応答として消費される（Issue #32 問題 1）。起動前に
+    // ~/.claude.json へ信頼済みを書き込んでダイアログ自体を出さない。失敗しても
+    // PromptFlow のダイアログ検出 → 承諾がフォールバックするため継続する
+    let pre_trusted = crate::claude_tui::ensure_trusted(&cwd).unwrap_or_else(|e| {
+        eprintln!("warning: 事前信頼の書き込みに失敗（ダイアログ検出で継続）: {e}");
+        false
+    });
+
     // attach_session は非同期（pending_attach）なのでセッションはまだ存在しない。
     // queue_write で遅延書き込みを登録し、セッション起動後に自動送信する
     let mut cmd_bytes = claude_cmd.clone().into_bytes();
     cmd_bytes.push(b'\r');
     host.queue_write(new_id, cmd_bytes);
 
-    // プロンプトは claude TUI の起動完了を画面内容で確認してから送信する。
-    // ステートマシン駆動: alt_screen 遷移 → ❯ 表示待ち → テキスト送信 →
-    // 入力欄確認 → Enter 送信 → 処理開始確認
-    let oneline_prompt = prompt.replace('\n', "  ");
-    host.queue_prompt_flow(new_id, oneline_prompt.clone());
+    // プロンプトは claude TUI の起動完了を画面内容で確認してから送達確認つきで送る。
+    // ステートマシン駆動: alt_screen 遷移 → 信頼ダイアログ承諾 → ❯ 表示待ち →
+    // bracketed paste → 分離 Enter → 入力欄の空検証 + Enter 再送（Issue #32）。
+    // マルチラインは bracketed paste でそのまま渡るため改行の平坦化はしない
+    host.queue_prompt_flow(new_id, prompt.to_string());
 
     // タイトルと role 設定
     let pane_obj = tree_mut(host.workspace_mut(), tab_id)
@@ -1819,7 +1875,8 @@ fn dispatch_orchestrator_spawn(
         "model": model,
         "effort": effort,
         "claude_command": claude_cmd,
-        "prompt": oneline_prompt,
+        "prompt": prompt,
+        "pre_trusted": pre_trusted,
         "tmux_session": tmux_session,
     }))
 }

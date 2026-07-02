@@ -45,6 +45,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - KV relay URL mismatch between daemon and PWA (unified to the live worker)
   デーモンと PWA で KV リレー URL が不一致だった問題を修正（稼働中の Worker に統一）
+- Prompt delivery to claude TUI is now verified (#32): text is pasted via bracketed paste, the submitting Enter is sent as a separate delayed key event, and the input box is checked to be empty afterwards (with standalone Enter retries) — fixes multiline prompts stuck in the input box and intermittent Enter misses in `tako orchestrator spawn` / `tako send` / MCP `tako_send_input`
+  claude TUI へのプロンプト送達を検証付きに（#32）: 本文は bracketed paste で貼り付け、送信の Enter は分離した単独キーとして遅延送信し、送信後に入力欄が空へ戻ったことを検証（残留時は Enter 単独再送）— `tako orchestrator spawn` / `tako send` / MCP `tako_send_input` のマルチライン残留・Enter 空振りを修正
+- Trust dialog no longer consumes the spawn prompt (#32): the worker cwd is pre-trusted in `~/.claude.json` before launch, with on-screen dialog detection → auto-accept as fallback
+  信頼確認ダイアログが spawn プロンプトを消費する問題を修正（#32）: 起動前に worker の cwd を `~/.claude.json` で事前信頼し、フォールバックとしてダイアログ検出 → 自動承諾も実装
+- tmux session-targeted send/read fallback was broken on tmux 3.6 (`can't find pane: =<session>`) — target-pane commands now use the explicit `=<session>:` form
+  tmux session 指定の send/read フォールバックが tmux 3.6 で壊れていた問題を修正（`can't find pane: =<session>`）— target-pane 系コマンドは `=<session>:` 形式に統一
 
 ## [0.2.2] - 2026-07-02
 

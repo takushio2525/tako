@@ -10,8 +10,10 @@
 //! - detect: パッシブ検知（Layer 3。listen ポート検知は Phase 4 後半で実装）
 //! - remote / agents / transcript: スマホリモートアクセス（Issue #23。HTTP+WS API と
 //!   claude agents プロキシ・会話ログ正規化）
+//! - claude_tui: Claude Code TUI の画面状態検出とプロンプト送達確認（Issue #32）
 
 pub mod agents;
+pub mod claude_tui;
 pub mod discovery;
 pub mod dispatch;
 pub mod ipc;

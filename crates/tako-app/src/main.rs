@@ -167,22 +167,25 @@ enum PanelView {
     Git,
 }
 
-/// claude TUI へのプロンプト送信フローの状態
+/// claude TUI へのプロンプト送信フローの状態（Issue #32 送達確認ループ）
 #[derive(Debug)]
 enum PromptFlowState {
-    /// alt_screen 遷移待ち
+    /// alt_screen 遷移待ち（claude TUI の起動待ち。spawn / await_prompt 経路のみ）
     WaitAltScreen,
-    /// claude TUI の ❯ プロンプト表示待ち
+    /// 送信可能待ち: 信頼ダイアログが出ていれば承諾し、入力欄（❯）表示で貼り付ける。
+    /// 信頼ダイアログも選択カーソルに ❯ を含むため、ダイアログ判定を先に行う
     WaitPromptReady,
-    /// プロンプトテキスト送信済み、入力欄への反映待ち
-    WaitTextEchoed,
-    /// Enter 送信済み、処理開始確認待ち
-    WaitProcessing,
+    /// 貼り付け済み、入力欄への反映待ち。反映確認後に送信の Enter を
+    /// 貼り付けと分離した単独キーとして送る（次 tick = 500ms 以上の遅延）
+    WaitTextInInput,
+    /// Enter 送信済み。入力欄が空へ戻った（= 送信された）ことを検証し、
+    /// 残っていれば Enter を単独再送する
+    VerifySubmitted,
     /// 完了
     Done,
 }
 
-/// claude TUI へのプロンプト送信ステートマシン
+/// claude TUI へのプロンプト送達ステートマシン（500ms tick で `drive_prompt_flows` が駆動）
 #[derive(Debug)]
 struct PromptFlow {
     pane: PaneId,
@@ -191,6 +194,34 @@ struct PromptFlow {
     created_at: std::time::Instant,
     /// 現在のステートに遷移した時刻（ステート内タイムアウト用）
     state_entered_at: std::time::Instant,
+    /// 信頼ダイアログを承諾した回数（無限承諾ループ防止。上限 3）
+    trust_accepts: u8,
+    /// 入力欄残留に対する Enter 単独再送の残り回数
+    enter_retries_left: u8,
+    /// true = claude TUI の起動（alt_screen + ❯）を待つ（spawn / await_prompt）。
+    /// false = 現画面へ即貼り付けの汎用送信（TUI でなければ 2 秒待って貼る）
+    wait_tui: bool,
+}
+
+impl PromptFlow {
+    fn new(pane: PaneId, prompt: String, wait_tui: bool) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            pane,
+            // 送信の Enter は分離して送るため末尾改行は落とす
+            prompt: prompt.trim_end_matches(['\n', '\r']).to_string(),
+            state: if wait_tui {
+                PromptFlowState::WaitAltScreen
+            } else {
+                PromptFlowState::WaitPromptReady
+            },
+            created_at: now,
+            state_entered_at: now,
+            trust_accepts: 0,
+            enter_retries_left: 4,
+            wait_tui,
+        }
+    }
 }
 
 fn rgba(c: tako_core::Rgb) -> Rgba {
@@ -1950,18 +1981,32 @@ impl TakoApp {
         self.alt_screen_writes = remaining;
     }
 
-    /// claude TUI へのプロンプト送信フローを駆動する。
-    /// 画面内容を確認しながら各ステップを進める（sleep ベースではない）
+    /// claude TUI へのプロンプト送達フローを駆動する（Issue #32 送達確認ループ）。
+    /// 画面内容を確認しながら各ステップを進める（sleep ベースではない）。
+    /// 検出ロジックは実 TUI の採取画面に基づく `tako_control::claude_tui` を使う
     fn drive_prompt_flows(&mut self) {
+        use tako_control::claude_tui;
         let mut remaining = Vec::new();
+        // 同一ペインへ複数フローが重なると貼り付けと Enter が混線するため、
+        // 先行フローが完了するまで後続は待たせる（Vec の順序 = 送信順）
+        let mut active_panes: std::collections::HashSet<PaneId> = std::collections::HashSet::new();
         let now = std::time::Instant::now();
         for mut flow in std::mem::take(&mut self.prompt_flows) {
             if flow.created_at.elapsed() > std::time::Duration::from_secs(120) {
+                eprintln!(
+                    "warning: プロンプト送達フローがタイムアウト（pane={}）",
+                    flow.pane.as_u64()
+                );
+                continue;
+            }
+            if active_panes.contains(&flow.pane) {
+                remaining.push(flow);
                 continue;
             }
             let session = match self.terminals.get(&flow.pane) {
                 Some(s) => s,
                 None => {
+                    active_panes.insert(flow.pane);
                     remaining.push(flow);
                     continue;
                 }
@@ -1972,38 +2017,74 @@ impl TakoApp {
                         flow.state = PromptFlowState::WaitPromptReady;
                         flow.state_entered_at = now;
                     }
-                    remaining.push(flow);
                 }
                 PromptFlowState::WaitPromptReady => {
                     let lines = session.visible_lines();
-                    let has_prompt = lines.iter().any(|l| l.contains('❯'));
-                    if has_prompt {
-                        session.write(flow.prompt.as_bytes().to_vec());
-                        flow.state = PromptFlowState::WaitTextEchoed;
+                    if claude_tui::is_trust_dialog(&lines) {
+                        // 信頼ダイアログがプロンプトを消費するのを防ぐ: 先に Enter で承諾する
+                        // （事前信頼が書けなかった場合のフォールバック）。tick 間隔 500ms が
+                        // 承諾間の自然な遅延になる。3 回で打ち切り（総合タイムアウトに委ねる）
+                        if flow.trust_accepts < 3 {
+                            session.write(b"\r".to_vec());
+                            flow.trust_accepts += 1;
+                            flow.state_entered_at = now;
+                        }
+                    } else if claude_tui::input_line(&lines).is_some()
+                        || (!flow.wait_tui
+                            && flow.state_entered_at.elapsed() > std::time::Duration::from_secs(2))
+                    {
+                        // 入力欄（❯）を確認して貼り付け。汎用送信（wait_tui=false）は
+                        // 対象が claude TUI でなくても 2 秒待って貼る（他 TUI への送信）。
+                        // bracketed paste はアプリが要求していれば paste() が括りを付ける
+                        session.paste(&flow.prompt);
+                        flow.state = PromptFlowState::WaitTextInInput;
                         flow.state_entered_at = now;
                     }
-                    remaining.push(flow);
                 }
-                PromptFlowState::WaitTextEchoed => {
+                PromptFlowState::WaitTextInInput => {
                     let lines = session.visible_lines();
-                    let prefix: String = flow.prompt.chars().take(10).collect();
-                    let echoed = lines.iter().any(|l| l.contains(&prefix));
-                    // テキスト確認 or 10秒タイムアウトで Enter を送信。
-                    // 長いプロンプトの折り返しや日本語テキストの幅計算でマッチしない
-                    // ケースを救済する
+                    let head = claude_tui::prompt_head(&flow.prompt);
+                    // 入力欄への反映（マルチラインは [Pasted text #N] 表示）を確認。
+                    // 折り返し・全角幅で入力欄行にマッチしないケースは画面全体 or
+                    // 10 秒タイムアウトで救済（従来挙動の維持）
+                    let reflected = claude_tui::text_in_input(&lines, &flow.prompt)
+                        || (!head.is_empty() && lines.iter().any(|l| l.contains(head.as_str())));
                     let timed_out =
                         flow.state_entered_at.elapsed() > std::time::Duration::from_secs(10);
-                    if echoed || timed_out {
+                    if reflected || timed_out {
+                        // 送信の Enter は貼り付けと分離した単独キーとして送る
+                        // （貼り付けバーストに混ざると「次の行」と解釈される）
                         session.write(b"\r".to_vec());
-                        flow.state = PromptFlowState::WaitProcessing;
+                        flow.state = PromptFlowState::VerifySubmitted;
                         flow.state_entered_at = now;
                     }
-                    remaining.push(flow);
                 }
-                PromptFlowState::WaitProcessing => {
-                    flow.state = PromptFlowState::Done;
+                PromptFlowState::VerifySubmitted => {
+                    // Enter の画面反映を 1 tick 待ってから検証する
+                    if flow.state_entered_at.elapsed() >= std::time::Duration::from_millis(400) {
+                        let lines = session.visible_lines();
+                        if !claude_tui::input_residual(&lines, &flow.prompt) {
+                            // 入力欄が空へ戻った = 送信された
+                            flow.state = PromptFlowState::Done;
+                        } else if flow.enter_retries_left > 0 {
+                            // Enter が「送信」と解釈されず残留 → Enter を単独再送
+                            session.write(b"\r".to_vec());
+                            flow.enter_retries_left -= 1;
+                            flow.state_entered_at = now;
+                        } else {
+                            eprintln!(
+                                "warning: プロンプト送達を検証できない（pane={} 入力欄に残留）",
+                                flow.pane.as_u64()
+                            );
+                            flow.state = PromptFlowState::Done;
+                        }
+                    }
                 }
                 PromptFlowState::Done => {}
+            }
+            if !matches!(flow.state, PromptFlowState::Done) {
+                active_panes.insert(flow.pane);
+                remaining.push(flow);
             }
         }
         self.prompt_flows = remaining;
@@ -4843,14 +4924,11 @@ impl ControlHost for TakoApp {
     }
 
     fn queue_prompt_flow(&mut self, pane: PaneId, prompt: String) {
-        let now = std::time::Instant::now();
-        self.prompt_flows.push(PromptFlow {
-            pane,
-            prompt,
-            state: PromptFlowState::WaitAltScreen,
-            created_at: now,
-            state_entered_at: now,
-        });
+        self.prompt_flows.push(PromptFlow::new(pane, prompt, true));
+    }
+
+    fn queue_send_flow(&mut self, pane: PaneId, text: String) {
+        self.prompt_flows.push(PromptFlow::new(pane, text, false));
     }
 
     fn detach_session(&mut self, pane: PaneId) {
