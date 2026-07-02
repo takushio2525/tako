@@ -43,7 +43,8 @@ struct Cli {
 enum Command {
     /// 対象ペインの隣に新ペインを生やす（既定は右）。新ペイン ID を出力する
     Split(SplitArgs),
-    /// ペインへテキストを送信する（既定で末尾に改行を付与）
+    /// ペインへテキストを送信する（既定で末尾に改行を付与）。claude 等の全画面 TUI へは
+    /// 送達確認ループ（貼り付け → 分離 Enter → 入力欄の空検証 + 再送）で配送する
     Send(SendArgs),
     /// ペインへフォーカスを移す（ID 指定または --left 等の方向指定）
     Focus(FocusArgs),
@@ -559,7 +560,7 @@ struct SendArgs {
     /// tmux session 名（pane ID 解決不能時のフォールバック）
     #[arg(long)]
     tmux_session: Option<String>,
-    /// claude TUI の ❯ プロンプト表示を待ってから送信する
+    /// claude TUI の起動（❯ プロンプト表示）を待ってから送信する（信頼ダイアログは自動承諾）
     #[arg(long)]
     await_prompt: bool,
     /// 送信するテキスト（複数引数はスペース連結）

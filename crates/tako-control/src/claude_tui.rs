@@ -1,0 +1,466 @@
+//! claude_tui — Claude Code TUI の画面状態検出とプロンプト送達確認（Issue #32）
+//!
+//! spawn / send のプロンプト送達を「書いて祈る」から「見て・貼って・送って・確かめる」へ
+//! 変えるための部品。実 TUI（v2.1.198）の tmux capture で採取した画面を根拠にしている。
+//!
+//! - **検出**: 画面テキスト（`visible_lines` / `capture-pane`）から TUI 状態を判定する純関数群。
+//!   信頼ダイアログは選択カーソルに `❯` を含むため「`❯` があれば送信可」という旧判定は誤爆する
+//! - **送達**: テキスト本体は bracketed paste で貼り付け、送信の Enter は貼り付けと分離した
+//!   単独キーとして遅延送信する（一括書き込みは改行が「送信」と解釈されず入力欄に残留する）。
+//!   送信後に入力欄が空へ戻ったことを検証し、残っていれば Enter を単独再送する
+//! - **事前信頼**: `~/.claude.json` の `projects.<cwd>.hasTrustDialogAccepted` を spawn 前に
+//!   立てることで信頼ダイアログ自体を出さない。ダイアログ検出 → 承諾はそのフォールバック
+//!
+//! 検出はヒューリスティック（TUI の文言はバージョンで変わり得る）だが、誤検知時の副作用が
+//! 無害になるよう設計している: 空の入力欄への Enter は claude TUI では no-op。
+
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use serde_json::json;
+
+// --- 画面状態の検出（純関数） ---
+
+/// claude TUI の画面状態
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeScreen {
+    /// 信頼確認ダイアログ表示中（キー入力はダイアログに食われる。プロンプト送信不可）
+    TrustDialog,
+    /// 入力欄（❯）が空で送信可能
+    Ready,
+    /// 入力欄にテキストが残っている（Enter が「送信」と解釈されなかった等）
+    InputPending,
+    /// 応答生成中に見える（入力欄が見えない場合のみ。入力欄が見えていれば claude は
+    /// busy 中でも入力を受け付ける = Ready / InputPending を優先する）
+    Busy,
+    /// claude TUI と判定できない（シェル・別 TUI・起動前）
+    Unknown,
+}
+
+/// 画面から claude TUI の状態を判定する
+pub fn detect(lines: &[String]) -> ClaudeScreen {
+    if is_trust_dialog(lines) {
+        return ClaudeScreen::TrustDialog;
+    }
+    match input_line(lines) {
+        Some(content) if input_content_is_empty(content) => ClaudeScreen::Ready,
+        Some(_) => ClaudeScreen::InputPending,
+        None if is_busy(lines) => ClaudeScreen::Busy,
+        None => ClaudeScreen::Unknown,
+    }
+}
+
+/// 信頼確認ダイアログが表示されているか。
+/// 実画面の文言（v2.1.198: 「❯ 1. Yes, I trust this folder」）と旧文言
+/// （"Do you trust the files in this folder?"）の両方を拾う。
+/// 誤検知して Enter を送っても、通常画面の空入力欄では no-op なので無害
+pub fn is_trust_dialog(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .any(|l| l.contains("trust this folder") || l.contains("trust the files"))
+}
+
+/// 入力欄の内容を返す。会話ログの送信済みメッセージも `❯` で始まるため、
+/// 入力欄 = **画面の一番下にある** `❯` 行とみなし、`❯` 以降を trim して返す。
+/// `❯` 行が無ければ None（claude TUI ではない）
+pub fn input_line(lines: &[String]) -> Option<&str> {
+    lines
+        .iter()
+        .rev()
+        .find_map(|l| l.trim_start().strip_prefix('❯').map(str::trim))
+}
+
+/// 入力欄の内容が「空」か。空の入力欄は `❯ ` 単独、または `Try "..."` の
+/// プレースホルダ付きで描画される（実画面採取より）
+fn input_content_is_empty(content: &str) -> bool {
+    content.is_empty() || content.starts_with("Try \"")
+}
+
+/// 応答生成中に見えるか（advisory）。「esc to interrupt」ヒント、または
+/// スピナーの経過秒表示（`(2s · thinking)` / `Baked for 3s` 等）を拾う
+pub fn is_busy(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .any(|l| l.contains("esc to interrupt") || has_elapsed_marker(l))
+}
+
+/// 「3s」のような経過秒トークンを含むか（`for 3s` / `(2s · thinking)`）
+fn has_elapsed_marker(line: &str) -> bool {
+    line.split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+        .any(|tok| {
+            tok.len() >= 2
+                && tok.ends_with('s')
+                && tok[..tok.len() - 1].chars().all(|c| c.is_ascii_digit())
+        })
+}
+
+/// プロンプト照合用の先頭断片（最初の非空行の先頭 10 文字）。
+/// 画面上での折り返し・省略に耐えるよう短い断片で照合する
+pub fn prompt_head(prompt: &str) -> String {
+    prompt
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim_start()
+        .chars()
+        .take(10)
+        .collect()
+}
+
+/// 貼り付けたテキストが入力欄へ反映されたか。マルチラインの bracketed paste は
+/// `[Pasted text #N +M lines]` に畳まれるため、その表示も反映とみなす
+pub fn text_in_input(lines: &[String], prompt: &str) -> bool {
+    let head = prompt_head(prompt);
+    match input_line(lines) {
+        Some(content) => {
+            (!head.is_empty() && content.contains(head.as_str()))
+                || content.contains("[Pasted text")
+        }
+        None => false,
+    }
+}
+
+/// 送信（Enter）後の残留検証: 入力欄にまだプロンプト断片 / paste 表示が残っているか。
+/// 残っていれば Enter が「送信」でなく「次の行」と解釈された等で未送信
+pub fn input_residual(lines: &[String], prompt: &str) -> bool {
+    text_in_input(lines, prompt)
+}
+
+// --- 事前信頼（Issue #32 問題 1） ---
+
+/// spawn 前の事前信頼: `~/.claude.json` の `projects.<cwd>.hasTrustDialogAccepted` を
+/// true にする。claude 起動前に呼ぶことで信頼ダイアログ自体を出さない（実機で
+/// スキップされることを確認済み）。実行中の別 claude が設定ファイルを書き戻す
+/// レースで負ける可能性があるため best-effort とし、失敗しても呼び出し側は
+/// ダイアログ検出 → 承諾のフォールバックで継続する。
+/// 戻り値: 新たに書き込んだ / 既に信頼済みなら Ok(true)
+pub fn ensure_trusted(cwd: &str) -> Result<bool, String> {
+    let home = crate::orchestrator::home_dir().ok_or("ホームディレクトリを特定できない")?;
+    ensure_trusted_at(&home.join(".claude.json"), cwd)
+}
+
+fn ensure_trusted_at(path: &Path, cwd: &str) -> Result<bool, String> {
+    let mut root: serde_json::Value = match std::fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s)
+            .map_err(|e| format!("{} を解釈できない: {e}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(e) => return Err(format!("{} を読めない: {e}", path.display())),
+    };
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| format!("{} のトップレベルがオブジェクトでない", path.display()))?;
+    let projects = obj
+        .entry("projects")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| format!("{} の projects がオブジェクトでない", path.display()))?;
+    let entry = projects
+        .entry(cwd.to_string())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| format!("{} の projects.{cwd} がオブジェクトでない", path.display()))?;
+    if entry
+        .get("hasTrustDialogAccepted")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        return Ok(true); // 既に信頼済み（書き込み不要）
+    }
+    entry.insert("hasTrustDialogAccepted".into(), json!(true));
+
+    // claude 本体も読み書きするファイルのため、一時ファイル + rename で原子的に置き換える
+    let tmp = path.with_extension("json.tako-tmp");
+    let serialized =
+        serde_json::to_string_pretty(&root).map_err(|e| format!("設定を直列化できない: {e}"))?;
+    std::fs::write(&tmp, serialized).map_err(|e| format!("{} を書けない: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("{} を置換できない: {e}", path.display()))?;
+    Ok(true)
+}
+
+// --- tmux 経由の送達確認つき配送 ---
+
+/// 送達レポート（E2E 検証とログ用。規約により送信テキスト自体は含めない）
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DeliveryReport {
+    /// 承諾した信頼ダイアログの回数
+    pub trust_dialogs_accepted: u32,
+    /// 入力欄残留に対する Enter 単独再送の回数
+    pub enter_retries: u32,
+    /// 入力欄が空へ戻ったことを確認できたか（false = 未検証のまま打ち切り）
+    pub verified: bool,
+}
+
+/// tmux セッションへの送達確認つきプロンプト配送。
+/// capture-pane で画面を見ながら 信頼ダイアログ承諾 → 貼り付け（bracketed paste）→
+/// 分離 Enter → 入力欄の空検証 → Enter 単独再送 を行う。
+/// `wait_ready` = true で claude TUI の入力欄（❯）表示まで待ってから貼る
+/// （spawn / await_prompt 用）。false は現画面へ即貼り付け（シェル等の汎用送信。
+/// 信頼ダイアログが見えている場合の承諾だけは行う）。
+///
+/// **ブロッキング関数**（内部で sleep する）。UI スレッドから直接呼ばず、
+/// バックグラウンドスレッドで実行すること
+pub fn deliver_via_tmux(
+    socket: Option<&str>,
+    session: &str,
+    text: &str,
+    wait_ready: bool,
+) -> Result<DeliveryReport, String> {
+    let text = text.trim_end_matches(['\n', '\r']); // 送信の Enter は分離して送るため末尾改行は落とす
+    let mut report = DeliveryReport::default();
+
+    // ① 信頼ダイアログの処理と（必要なら）入力欄待ち
+    let ready_deadline = Instant::now()
+        + if wait_ready {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(4)
+        };
+    loop {
+        let lines = tako_core::tmux::capture_session(socket, session)?;
+        if is_trust_dialog(&lines) {
+            if report.trust_dialogs_accepted >= 3 {
+                return Err("信頼ダイアログを承諾しても消えない".into());
+            }
+            tako_core::tmux::send_key(socket, session, "Enter")?;
+            report.trust_dialogs_accepted += 1;
+            std::thread::sleep(Duration::from_millis(700));
+            continue;
+        }
+        if input_line(&lines).is_some() {
+            break; // claude TUI の入力欄あり → 貼り付け可
+        }
+        if Instant::now() >= ready_deadline {
+            if wait_ready {
+                return Err("claude TUI の入力欄（❯）が現れない（タイムアウト）".into());
+            }
+            break; // 汎用送信: claude TUI でなくても貼り付けは通す（シェル等）
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    // ② 本体を bracketed paste で貼り付け（アプリが要求していれば tmux -p が括りを付ける）
+    tako_core::tmux::paste_text(socket, session, text)?;
+
+    // ③ 反映確認（最大 3 秒）: 入力欄 or 画面のどこかに断片が見えるまで
+    let head = prompt_head(text);
+    let reflect_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < reflect_deadline {
+        let lines = tako_core::tmux::capture_session(socket, session)?;
+        if text_in_input(&lines, text)
+            || (!head.is_empty() && lines.iter().any(|l| l.contains(head.as_str())))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // ④ 送信の Enter は貼り付けと分離した単独キーとして遅延送信する
+    //    （貼り付けバーストに混ざると「次の行」と解釈される）
+    std::thread::sleep(Duration::from_millis(400));
+    tako_core::tmux::send_key(socket, session, "Enter")?;
+
+    // ⑤ 検証: 入力欄が空へ戻ったか。残っていれば Enter を単独再送（最大 4 回）
+    loop {
+        std::thread::sleep(Duration::from_millis(700));
+        let lines = tako_core::tmux::capture_session(socket, session)?;
+        if !input_residual(&lines, text) {
+            report.verified = true;
+            return Ok(report);
+        }
+        if report.enter_retries >= 4 {
+            return Ok(report); // verified = false のまま返す（呼び出し側がログ）
+        }
+        tako_core::tmux::send_key(socket, session, "Enter")?;
+        report.enter_retries += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn screen(text: &str) -> Vec<String> {
+        text.lines().map(str::to_string).collect()
+    }
+
+    // 実 claude TUI（v2.1.198）の tmux capture-pane から採取（個人情報はサニタイズ済み）
+
+    const TRUST_DIALOG: &str = r#"────────────────────────────────────────────────
+ Accessing workspace:
+
+ /private/tmp/example/workdir
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a
+ well-known open source project, or work from your team). If not, take a moment to review what's in
+ this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ 1. Yes, I trust this folder
+   2. No, exit
+
+ Enter to confirm · Esc to cancel"#;
+
+    const READY_PLACEHOLDER: &str = r#"╭─── Claude Code v2.1.198 ───────────────────────╮
+│  Welcome back ユーザー!                        │
+╰────────────────────────────────────────────────╯
+────────────────────────────────────────────────────
+❯ Try "refactor <filepath>"
+────────────────────────────────────────────────────
+  ctx   0% ░░░░░░░░░░"#;
+
+    const READY_BARE: &str = r#"❯ say only: ok
+
+⏺ ok
+
+✻ Baked for 3s
+
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  ctx  20% ██░░░░░░░░"#;
+
+    const INPUT_PENDING: &str = r#"────────────────────────────────────────────────────
+❯ say only: ok
+────────────────────────────────────────────────────
+  ctx   0% ░░░░░░░░░░"#;
+
+    const INPUT_PENDING_PASTED: &str = r#"────────────────────────────────────────────────────
+❯ [Pasted text #1 +3 lines]
+────────────────────────────────────────────────────
+  paste again to expand"#;
+
+    const INPUT_PENDING_STUCK: &str = r#"────────────────────────────────────────────────────
+❯ first line of burstsecond line of burstsay only: BURST2
+────────────────────────────────────────────────────
+  ctx  20% ██░░░░░░░░"#;
+
+    #[test]
+    fn 信頼ダイアログを検出する() {
+        let lines = screen(TRUST_DIALOG);
+        assert!(is_trust_dialog(&lines));
+        assert_eq!(detect(&lines), ClaudeScreen::TrustDialog);
+        // ダイアログの選択カーソル ❯ を入力欄と誤認しない（旧実装の誤爆点）
+        assert_ne!(detect(&lines), ClaudeScreen::Ready);
+    }
+
+    #[test]
+    fn 旧文言の信頼ダイアログも検出する() {
+        let lines = screen("Do you trust the files in this folder?\n❯ 1. Yes, proceed");
+        assert!(is_trust_dialog(&lines));
+    }
+
+    #[test]
+    fn 空入力欄をreadyと判定する() {
+        // プレースホルダ付き（起動直後）と素の ❯（送信直後）の両方
+        assert_eq!(detect(&screen(READY_PLACEHOLDER)), ClaudeScreen::Ready);
+        assert_eq!(detect(&screen(READY_BARE)), ClaudeScreen::Ready);
+    }
+
+    #[test]
+    fn 入力欄は画面最下部の行を採用する() {
+        // READY_BARE は会話ログに送信済みメッセージの ❯ 行を含むが、
+        // 入力欄は一番下の空の ❯ 行
+        assert_eq!(input_line(&screen(READY_BARE)), Some(""));
+    }
+
+    #[test]
+    fn 入力欄のテキスト残留を検出する() {
+        let lines = screen(INPUT_PENDING);
+        assert_eq!(detect(&lines), ClaudeScreen::InputPending);
+        assert!(input_residual(&lines, "say only: ok"));
+        // 別のプロンプトの断片では残留と判定しない
+        assert!(!input_residual(&lines, "全く別のテキスト"));
+    }
+
+    #[test]
+    fn マルチライン貼り付けはpasted_text表示で反映と判定する() {
+        let lines = screen(INPUT_PENDING_PASTED);
+        assert!(text_in_input(&lines, "line one\nline two\nline three"));
+        assert!(input_residual(&lines, "line one\nline two\nline three"));
+    }
+
+    #[test]
+    fn 改行が食われた残留テキストも先頭断片で検出する() {
+        // 一括書き込みで改行が連結された実採取画面（Issue #32 問題 2 の再現）
+        let lines = screen(INPUT_PENDING_STUCK);
+        assert!(input_residual(
+            &lines,
+            "first line of burst\nsecond line of burst\nsay only: BURST2"
+        ));
+    }
+
+    #[test]
+    fn シェル画面はunknownと判定する() {
+        let lines = screen("$ ls\nfoo bar\n$ ");
+        assert_eq!(detect(&lines), ClaudeScreen::Unknown);
+        assert_eq!(input_line(&lines), None);
+    }
+
+    #[test]
+    fn busyはスピナー経過秒とescヒントで判定する() {
+        assert!(is_busy(&screen("✽ Coalescing… (2s · thinking)")));
+        assert!(is_busy(&screen("✻ Baked for 3s")));
+        assert!(is_busy(&screen("Press esc to interrupt")));
+        assert!(!is_busy(&screen("$ ls -la")));
+        // 「80s」のような単語も経過秒とみなす誤検知は許容（advisory 用途のため）
+    }
+
+    #[test]
+    fn prompt_headはマルチラインの最初の非空行から取る() {
+        assert_eq!(
+            prompt_head("\n\n  こんにちは世界これはテスト\n次の行"),
+            "こんにちは世界これは"
+        );
+        assert_eq!(prompt_head("short"), "short");
+        assert_eq!(prompt_head(""), "");
+    }
+
+    #[test]
+    fn ensure_trustedは新規エントリを追加し既存キーを保持する() {
+        let dir = std::env::temp_dir().join(format!("tako-trust-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("claude.json");
+        std::fs::write(
+            &path,
+            r#"{"installMethod":"brew","projects":{"/existing":{"hasTrustDialogAccepted":false,"history":[1,2]}}}"#,
+        )
+        .unwrap();
+
+        // 新規プロジェクトの追加
+        assert_eq!(ensure_trusted_at(&path, "/new/project"), Ok(true));
+        // 既存プロジェクト（false）の昇格
+        assert_eq!(ensure_trusted_at(&path, "/existing"), Ok(true));
+        // 冪等
+        assert_eq!(ensure_trusted_at(&path, "/new/project"), Ok(true));
+
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["installMethod"], "brew"); // 無関係キーを保持
+        assert_eq!(
+            root["projects"]["/new/project"]["hasTrustDialogAccepted"],
+            true
+        );
+        assert_eq!(
+            root["projects"]["/existing"]["hasTrustDialogAccepted"],
+            true
+        );
+        assert_eq!(root["projects"]["/existing"]["history"], json!([1, 2])); // 既存の他キーを保持
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_trustedはファイル不在でも新規作成する() {
+        let dir = std::env::temp_dir().join(format!("tako-trust-new-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("claude.json");
+        assert_eq!(ensure_trusted_at(&path, "/fresh"), Ok(true));
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["projects"]["/fresh"]["hasTrustDialogAccepted"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

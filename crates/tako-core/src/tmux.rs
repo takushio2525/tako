@@ -191,22 +191,95 @@ pub fn capture_pane_text(socket: Option<&str>, session: &str, window: u32) -> Ve
     .unwrap_or_default()
 }
 
+/// target-pane 系コマンド（capture-pane / send-keys / paste-buffer）向けの
+/// セッション exact-match ターゲット。tmux 3.6 は裸の `=session` を target-pane として
+/// 解決できず "can't find pane" になるため、末尾コロンでセッション部を明示する
+/// （`=session:` = そのセッションのアクティブ window / pane。Issue #32 の E2E で発覚）
+fn session_pane_target(session: &str) -> String {
+    format!("={session}:")
+}
+
 /// セッションのアクティブ window からペイン内容を取得する。
 /// GUI の表示状態に依存せず、tmux session が生きていれば常に読める
 pub fn capture_session(socket: Option<&str>, session: &str) -> Result<Vec<String>, String> {
     run_tmux(
         socket,
-        &["capture-pane", "-t", &format!("={session}"), "-p"],
+        &["capture-pane", "-t", &session_pane_target(session), "-p"],
     )
     .map(|output| output.lines().map(str::to_string).collect())
 }
 
 /// セッションのアクティブ window へキー入力を送信する。
-/// `text` はそのまま send-keys へ渡す（リテラルモード `-l`）
+/// `text` はそのまま send-keys へ渡す（リテラルモード `-l`）。
+/// 注意: 改行を含むテキストの一括送信は TUI 側で貼り付けと誤認され崩れる
+/// （Issue #32）。マルチラインは `paste_text` + `send_key(…, "Enter")` を使う
 pub fn send_keys(socket: Option<&str>, session: &str, text: &str) -> Result<(), String> {
     run_tmux(
         socket,
-        &["send-keys", "-t", &format!("={session}"), "-l", text],
+        &["send-keys", "-t", &session_pane_target(session), "-l", text],
+    )
+    .map(|_| ())
+}
+
+/// キー名指定でセッションへ 1 キーを送る（`Enter` / `Escape` 等。`-l` なしの send-keys）。
+/// プロンプト送達では送信の Enter を貼り付けと分離した単独キーとして送る（Issue #32）
+pub fn send_key(socket: Option<&str>, session: &str, key: &str) -> Result<(), String> {
+    run_tmux(
+        socket,
+        &["send-keys", "-t", &session_pane_target(session), key],
+    )
+    .map(|_| ())
+}
+
+/// テキストを tmux バッファ経由でセッションのアクティブ window へ貼り付ける。
+/// `paste-buffer -p` はアプリが bracketed paste を要求している場合のみ貼り付け括りを
+/// 付けるため、claude TUI にはマルチラインがそのまま入力欄へ載り、シェル等にも
+/// 無害に劣化する（Issue #32）。バッファ名は並行配送で混線しないよう呼び出しごとに一意
+pub fn paste_text(socket: Option<&str>, session: &str, text: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let buf_name = format!(
+        "tako-paste-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+
+    // load-buffer は stdin から読ませる（引数渡しはサイズ・エスケープの制約があるため）
+    let mut child = tmux_command(socket)
+        .args(["load-buffer", "-b", &buf_name, "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("tmux を実行できない: {e}"))?;
+    child
+        .stdin
+        .take()
+        .expect("直前に Stdio::piped() を設定済み")
+        .write_all(text.as_bytes())
+        .map_err(|e| format!("tmux load-buffer へ書き込めない: {e}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("tmux load-buffer の終了を待てない: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    // -d でバッファを使い捨てにする（tmux バッファ一覧を汚さない）
+    run_tmux(
+        socket,
+        &[
+            "paste-buffer",
+            "-p",
+            "-d",
+            "-b",
+            &buf_name,
+            "-t",
+            &session_pane_target(session),
+        ],
     )
     .map(|_| ())
 }

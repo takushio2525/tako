@@ -235,3 +235,12 @@
 - 検証: build / clippy(-D warnings) / fmt / test 全緑 + スクラッチ HOME で実バイナリの
   マイグレーション・profiles CLI e2e（セルフテストは別 worker と競合するため未実施、ツール数のみ更新）
 - 次: squash merge → v0.2.4 リリース（release.sh --publish + homebrew-tako cask 更新）
+
+## 2026-07-02（Issue #32: プロンプト送達の確認ループ化）
+- spawn / send の送達を検証付きに: `tako-control::claude_tui` 新設（実 TUI 採取画面での状態
+  検出 + `~/.claude.json` 事前信頼 + tmux 送達確認配送）、PromptFlow 刷新（信頼ダイアログ
+  承諾 → bracketed paste → 分離 Enter → 入力欄空検証 + Enter 再送、同一ペイン直列化）、
+  Send は alt_screen で送達フロー経由に。tmux 3.6 で `=session` target-pane が解決不能な
+  既存バグ（send/read フォールバック全滅）も `=session:` 化で修正
+- 検証: build / clippy(-D warnings) / fmt / test 全緑（+12 unit）+ 実 claude E2E 3 本
+  （未信頼フォルダ spawn / 事前信頼 / 長文マルチライン。`claude_tui_e2e --ignored`）

@@ -185,6 +185,19 @@ master は結果を確認してユーザーに報告する。
 | `--model` | | claude のモデル（省略時は master のプロファイル → 未設定なら claude 既定） |
 | `--effort` | | thinking effort（省略時は master のプロファイル設定） |
 
+プロンプト送達は送達確認ループで行う（Issue #32）:
+
+1. **事前信頼**: spawn 時に `~/.claude.json` の `projects.<cwd>.hasTrustDialogAccepted` を
+   立て、初回フォルダの信頼ダイアログ自体を出さない（ダイアログが送信プロンプトを
+   消費する問題の根治）。書けなかった場合もダイアログ検出 → Enter 承諾でフォールバック
+2. **貼り付けと送信の分離**: プロンプト本体は bracketed paste で入力欄へ貼り、送信の
+   Enter は分離した単独キーとして遅延送信する（マルチラインもそのまま渡る。
+   改行の 2 スペース平坦化は廃止）
+3. **送達検証**: 送信後に入力欄が空へ戻ったことを画面で検証し、残っていれば Enter を
+   単独再送する（最大 4 回）
+
+`tako send --await-prompt` / MCP `tako_send_input`（newline つき）も同じループで配送される。
+
 ### `tako orchestrator status`
 
 worker の状態を確認する。
