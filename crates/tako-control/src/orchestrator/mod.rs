@@ -140,6 +140,32 @@ pub fn profiles_dir() -> Option<PathBuf> {
     config_dir().map(|d| d.join("profiles"))
 }
 
+/// 子 worker のモデル決定ポリシー
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerModelPolicy {
+    /// master 自身の model/effort を子にも使う
+    #[default]
+    Inherit,
+    /// worker_model / worker_effort で指定した値に全子統一
+    Fixed,
+    /// master がタスク内容を見て子ごとに model/effort を判断
+    Delegate,
+}
+
+/// system prompt のブロック単位制御
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PromptBlocks {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disable: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub append: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub override_blocks: std::collections::BTreeMap<String, String>,
+}
+
 /// プロファイル設定
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
@@ -147,8 +173,20 @@ pub struct Profile {
     pub model: String,
     #[serde(default = "default_profile_effort")]
     pub effort: String,
+
+    #[serde(default)]
+    pub worker_model_policy: WorkerModelPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegate_guidance: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_blocks: Option<PromptBlocks>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projects: Option<Vec<String>>,
 }
@@ -165,13 +203,34 @@ impl Default for Profile {
         Self {
             model: default_profile_model(),
             effort: default_profile_effort(),
+            worker_model_policy: WorkerModelPolicy::default(),
+            worker_model: None,
+            worker_effort: None,
+            delegate_guidance: None,
             system_prompt: None,
+            prompt_blocks: None,
             projects: None,
         }
     }
 }
 
 impl Profile {
+    /// worker_model_policy に従って子 worker の既定 model を解決する
+    pub fn resolve_worker_model(&self) -> &str {
+        match self.worker_model_policy {
+            WorkerModelPolicy::Inherit | WorkerModelPolicy::Delegate => &self.model,
+            WorkerModelPolicy::Fixed => self.worker_model.as_deref().unwrap_or(&self.model),
+        }
+    }
+
+    /// worker_model_policy に従って子 worker の既定 effort を解決する
+    pub fn resolve_worker_effort(&self) -> &str {
+        match self.worker_model_policy {
+            WorkerModelPolicy::Inherit | WorkerModelPolicy::Delegate => &self.effort,
+            WorkerModelPolicy::Fixed => self.worker_effort.as_deref().unwrap_or(&self.effort),
+        }
+    }
+
     /// プロファイルを YAML ファイルから読み込む
     pub fn load(name: &str) -> Result<Self, String> {
         let path = profile_path(name)?;
@@ -212,6 +271,238 @@ impl Profile {
             }
         }
         resolve_system_prompt_path()
+    }
+
+    /// プロファイル設定に基づいて system prompt テキストを合成する。
+    /// system_prompt フィールドが指定されている場合はそのファイルの内容をそのまま返す。
+    /// そうでなければ DEFAULT_SYSTEM_PROMPT をブロック分割し、prompt_blocks と
+    /// worker_model_policy に基づいて合成する。
+    pub fn build_system_prompt(&self, profile_name: &str) -> String {
+        // system_prompt フィールドが指定されていればファイルを丸ごと返す（既存互換）
+        if let Some(ref custom) = self.system_prompt {
+            let expanded = expand_tilde(custom);
+            let p = std::path::PathBuf::from(&expanded);
+            if p.is_file() {
+                if let Ok(content) = std::fs::read_to_string(&p) {
+                    return content;
+                }
+            }
+        }
+        // カスタム master-system.md があればそれを使う（ブロック制御はスキップ）
+        if let Some(custom_path) = resolve_system_prompt_path() {
+            if let Ok(content) = std::fs::read_to_string(&custom_path) {
+                return content;
+            }
+        }
+
+        self.build_from_template(DEFAULT_SYSTEM_PROMPT, profile_name)
+    }
+
+    /// テンプレートテキストからブロック制御・identity / model-policy 注入を行って合成する
+    pub fn build_from_template(&self, template: &str, profile_name: &str) -> String {
+        let blocks = parse_prompt_blocks(template);
+        let pb = self.prompt_blocks.as_ref();
+
+        let mut result = String::new();
+
+        if let Some(text) = pb.and_then(|b| b.prepend.as_ref()) {
+            result.push_str(&resolve_text_or_file(text));
+            result.push_str("\n\n");
+        }
+
+        let mut identity_injected = false;
+
+        for (name, content) in &blocks {
+            // identity ブロックは disable 不可: role ブロックの直後に注入する
+            if !identity_injected && name != "role" {
+                result.push_str(&self.generate_identity_section(profile_name, &blocks, pb));
+                result.push_str("\n\n");
+                identity_injected = true;
+            }
+
+            if let Some(b) = pb {
+                if b.disable.iter().any(|d| d == name) {
+                    continue;
+                }
+            }
+
+            if name == "model-policy" {
+                result.push_str(&self.generate_model_policy_section());
+                result.push('\n');
+                continue;
+            }
+
+            if let Some(override_text) = pb.and_then(|b| b.override_blocks.get(name.as_str())) {
+                result.push_str(&resolve_text_or_file(override_text));
+                result.push('\n');
+                continue;
+            }
+
+            result.push_str(content);
+            result.push('\n');
+        }
+
+        // ブロックが role のみ or 空の場合のフォールバック
+        if !identity_injected {
+            result.push_str(&self.generate_identity_section(profile_name, &blocks, pb));
+            result.push('\n');
+        }
+
+        if let Some(text) = pb.and_then(|b| b.append.as_ref()) {
+            result.push_str(&resolve_text_or_file(text));
+            result.push('\n');
+        }
+
+        result.trim_end().to_string()
+    }
+
+    /// worker_model_policy に基づいて model-policy セクションのテキストを生成する
+    fn generate_model_policy_section(&self) -> String {
+        match self.worker_model_policy {
+            WorkerModelPolicy::Inherit => {
+                format!(
+                    "## Worker Model Policy\n\n\
+                     All workers use the same model and effort as this master session:\n\
+                     - **Model**: {}\n\
+                     - **Effort**: {}\n\n\
+                     When calling `tako_orchestrator_spawn` or `tako_orchestrator_run`, do NOT specify\n\
+                     `model` or `effort` — the defaults already match this session's configuration.",
+                    self.model, self.effort
+                )
+            }
+            WorkerModelPolicy::Fixed => {
+                format!(
+                    "## Worker Model Policy\n\n\
+                     All workers use a fixed model/effort configuration:\n\
+                     - **Model**: {}\n\
+                     - **Effort**: {}\n\n\
+                     When calling `tako_orchestrator_spawn` or `tako_orchestrator_run`, do NOT specify\n\
+                     `model` or `effort` unless the user explicitly requests a different model for a\n\
+                     specific task.",
+                    self.resolve_worker_model(),
+                    self.resolve_worker_effort()
+                )
+            }
+            WorkerModelPolicy::Delegate => {
+                let guidance = self
+                    .delegate_guidance
+                    .as_ref()
+                    .map(|g| resolve_text_or_file(g))
+                    .unwrap_or_else(|| "タスクの複雑さに応じて判断してください。".to_string());
+                format!(
+                    "## Worker Model Policy\n\n\
+                     You decide the model and effort for each worker based on the task content.\n\
+                     **Always** specify `model` and `effort` explicitly in `tako_orchestrator_spawn`\n\
+                     and `tako_orchestrator_run` calls.\n\n\
+                     If you cannot determine the appropriate model, use the default:\n\
+                     - **Default Model**: {}\n\
+                     - **Default Effort**: {}\n\n\
+                     ### Delegation Guidance\n\n\
+                     {guidance}",
+                    self.model, self.effort
+                )
+            }
+        }
+    }
+
+    /// master の自己認識ブロックを生成する（disable 不可、role 直後に注入）
+    fn generate_identity_section(
+        &self,
+        profile_name: &str,
+        blocks: &[(String, String)],
+        pb: Option<&PromptBlocks>,
+    ) -> String {
+        let policy_str = match self.worker_model_policy {
+            WorkerModelPolicy::Inherit => {
+                format!("inherit（master と同じ {} / {}）", self.model, self.effort)
+            }
+            WorkerModelPolicy::Fixed => format!(
+                "fixed（{} / {}）",
+                self.resolve_worker_model(),
+                self.resolve_worker_effort()
+            ),
+            WorkerModelPolicy::Delegate => "delegate（master がタスクごとに判断）".into(),
+        };
+
+        let profile_path = profile_path(profile_name)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "(不明)".into());
+
+        let mut customizations = Vec::new();
+        if let Some(b) = pb {
+            for d in &b.disable {
+                customizations.push(format!("  - disabled: `{d}`"));
+            }
+            for k in b.override_blocks.keys() {
+                customizations.push(format!("  - overridden: `{k}`"));
+            }
+            if b.prepend.is_some() {
+                customizations.push("  - prepend: あり".into());
+            }
+            if b.append.is_some() {
+                customizations.push("  - append: あり".into());
+            }
+        }
+        let customization_summary = if customizations.is_empty() {
+            "なし（共通テンプレートをそのまま使用）".into()
+        } else {
+            format!("\n{}", customizations.join("\n"))
+        };
+
+        let all_blocks: Vec<&str> = blocks.iter().map(|(n, _)| n.as_str()).collect();
+
+        format!(
+            "## Session Identity\n\n\
+             - **Profile**: `{profile_name}`\n\
+             - **Launch command**: `tako master -{profile_name}`\n\
+             - **Master model**: {}\n\
+             - **Master effort**: {}\n\
+             - **Worker model policy**: {policy_str}\n\
+             - **Profile config**: `{profile_path}`\n\
+             - **Prompt blocks**: {}\n\
+             - **Customizations**: {customization_summary}",
+            self.model,
+            self.effort,
+            all_blocks.join(", "),
+        )
+    }
+}
+
+/// `<!-- block: name -->` マーカーで区切られたブロックをパースする
+fn parse_prompt_blocks(text: &str) -> Vec<(String, String)> {
+    let mut blocks = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut current_content = String::new();
+
+    for line in text.lines() {
+        if let Some(name) = line
+            .trim()
+            .strip_prefix("<!-- block: ")
+            .and_then(|s| s.strip_suffix(" -->"))
+        {
+            if let Some(prev_name) = current_name.take() {
+                blocks.push((prev_name, current_content.trim_end().to_string()));
+            }
+            current_name = Some(name.to_string());
+            current_content = String::new();
+        } else {
+            current_content.push_str(line);
+            current_content.push('\n');
+        }
+    }
+    if let Some(name) = current_name {
+        blocks.push((name, current_content.trim_end().to_string()));
+    }
+    blocks
+}
+
+/// テキストが `~/` で始まる場合はファイルとして読み込み、それ以外はそのまま返す
+fn resolve_text_or_file(text: &str) -> String {
+    if text.starts_with("~/") {
+        let expanded = expand_tilde(text);
+        std::fs::read_to_string(&expanded).unwrap_or_else(|_| text.to_string())
+    } else {
+        text.to_string()
     }
 }
 
@@ -363,7 +654,12 @@ mod tests {
         let p = Profile::default();
         assert_eq!(p.model, "claude-opus-4-6[1m]");
         assert_eq!(p.effort, "max");
+        assert_eq!(p.worker_model_policy, WorkerModelPolicy::Inherit);
+        assert!(p.worker_model.is_none());
+        assert!(p.worker_effort.is_none());
+        assert!(p.delegate_guidance.is_none());
         assert!(p.system_prompt.is_none());
+        assert!(p.prompt_blocks.is_none());
         assert!(p.projects.is_none());
     }
 
@@ -374,6 +670,7 @@ mod tests {
             effort: "high".into(),
             system_prompt: Some("~/my-prompt.md".into()),
             projects: Some(vec!["tako".into(), "demo".into()]),
+            ..Default::default()
         };
         let yaml = serde_yaml::to_string(&p).unwrap();
         let back: Profile = serde_yaml::from_str(&yaml).unwrap();
@@ -388,6 +685,7 @@ mod tests {
         let yaml = "model: claude-opus-4-6[1m]\n";
         let p: Profile = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(p.effort, "max");
+        assert_eq!(p.worker_model_policy, WorkerModelPolicy::Inherit);
         assert!(p.projects.is_none());
     }
 
@@ -401,8 +699,8 @@ mod tests {
         let p = Profile {
             model: "test-model".into(),
             effort: "low".into(),
-            system_prompt: None,
             projects: Some(vec!["a".into()]),
+            ..Default::default()
         };
         let yaml = serde_yaml::to_string(&p).unwrap();
         std::fs::write(&path, &yaml).unwrap();
@@ -411,5 +709,245 @@ mod tests {
         assert_eq!(loaded.model, "test-model");
         assert_eq!(loaded.projects.as_ref().unwrap(), &["a"]);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn worker_model_policy_inherit() {
+        let p = Profile {
+            model: "claude-fable-5".into(),
+            effort: "high".into(),
+            ..Default::default()
+        };
+        assert_eq!(p.resolve_worker_model(), "claude-fable-5");
+        assert_eq!(p.resolve_worker_effort(), "high");
+    }
+
+    #[test]
+    fn worker_model_policy_fixed() {
+        let p = Profile {
+            model: "claude-opus-4-6[1m]".into(),
+            effort: "max".into(),
+            worker_model_policy: WorkerModelPolicy::Fixed,
+            worker_model: Some("claude-sonnet-5".into()),
+            worker_effort: Some("medium".into()),
+            ..Default::default()
+        };
+        assert_eq!(p.resolve_worker_model(), "claude-sonnet-5");
+        assert_eq!(p.resolve_worker_effort(), "medium");
+    }
+
+    #[test]
+    fn worker_model_policy_fixed_fallback() {
+        let p = Profile {
+            model: "claude-opus-4-6[1m]".into(),
+            effort: "max".into(),
+            worker_model_policy: WorkerModelPolicy::Fixed,
+            ..Default::default()
+        };
+        assert_eq!(p.resolve_worker_model(), "claude-opus-4-6[1m]");
+        assert_eq!(p.resolve_worker_effort(), "max");
+    }
+
+    #[test]
+    fn worker_model_policy_delegate() {
+        let p = Profile {
+            model: "claude-fable-5".into(),
+            effort: "high".into(),
+            worker_model_policy: WorkerModelPolicy::Delegate,
+            delegate_guidance: Some("タスクの複雑さで判断".into()),
+            ..Default::default()
+        };
+        assert_eq!(p.resolve_worker_model(), "claude-fable-5");
+        assert_eq!(p.resolve_worker_effort(), "high");
+    }
+
+    #[test]
+    fn worker_model_policy_deserialize() {
+        let yaml = "model: claude-fable-5\neffort: high\nworker_model_policy: fixed\nworker_model: claude-sonnet-5\n";
+        let p: Profile = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.worker_model_policy, WorkerModelPolicy::Fixed);
+        assert_eq!(p.worker_model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(p.resolve_worker_model(), "claude-sonnet-5");
+    }
+
+    #[test]
+    fn prompt_blocks_deserialize() {
+        let yaml = r##"
+model: claude-fable-5
+effort: high
+prompt_blocks:
+  disable:
+    - no-investigate
+  prepend: "# Custom Header"
+  append: "# Custom Footer"
+  override_blocks:
+    behavior: "Custom behavior text"
+"##;
+        let p: Profile = serde_yaml::from_str(yaml).unwrap();
+        let blocks = p.prompt_blocks.unwrap();
+        assert_eq!(blocks.disable, vec!["no-investigate"]);
+        assert_eq!(blocks.prepend.as_deref(), Some("# Custom Header"));
+        assert_eq!(blocks.append.as_deref(), Some("# Custom Footer"));
+        assert_eq!(
+            blocks.override_blocks.get("behavior").map(|s| s.as_str()),
+            Some("Custom behavior text")
+        );
+    }
+
+    #[test]
+    fn parse_prompt_blocks_basic() {
+        let text = "<!-- block: a -->\nline1\nline2\n<!-- block: b -->\nline3\n";
+        let blocks = parse_prompt_blocks(text);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, "a");
+        assert!(blocks[0].1.contains("line1"));
+        assert_eq!(blocks[1].0, "b");
+        assert!(blocks[1].1.contains("line3"));
+    }
+
+    #[test]
+    fn build_system_prompt_default() {
+        let p = Profile::default();
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
+        assert!(prompt.contains("Master Orchestrator Agent"));
+        assert!(prompt.contains("Worker Model Policy"));
+        assert!(prompt.contains("claude-opus-4-6[1m]"));
+    }
+
+    #[test]
+    fn build_system_prompt_inherit_model() {
+        let p = Profile {
+            model: "claude-fable-5".into(),
+            effort: "high".into(),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
+        assert!(prompt.contains("claude-fable-5"));
+        assert!(prompt.contains("high"));
+    }
+
+    #[test]
+    fn build_system_prompt_fixed_policy() {
+        let p = Profile {
+            model: "claude-opus-4-6[1m]".into(),
+            effort: "max".into(),
+            worker_model_policy: WorkerModelPolicy::Fixed,
+            worker_model: Some("claude-sonnet-5".into()),
+            worker_effort: Some("medium".into()),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
+        assert!(prompt.contains("claude-sonnet-5"));
+        assert!(prompt.contains("medium"));
+        assert!(prompt.contains("fixed model/effort"));
+    }
+
+    #[test]
+    fn build_system_prompt_delegate_policy() {
+        let p = Profile {
+            model: "claude-opus-4-6[1m]".into(),
+            effort: "max".into(),
+            worker_model_policy: WorkerModelPolicy::Delegate,
+            delegate_guidance: Some("複雑なタスクは Opus、単純なタスクは Sonnet".into()),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
+        assert!(prompt.contains("Delegation Guidance"));
+        assert!(prompt.contains("複雑なタスクは Opus"));
+    }
+
+    #[test]
+    fn build_system_prompt_disable_block() {
+        let p = Profile {
+            prompt_blocks: Some(PromptBlocks {
+                disable: vec!["no-investigate".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
+        assert!(!prompt.contains("The Master Does Not Investigate"));
+        assert!(prompt.contains("Master Orchestrator Agent"));
+    }
+
+    #[test]
+    fn build_system_prompt_override_block() {
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("behavior".into(), "Custom behavior rules here".into());
+        let p = Profile {
+            prompt_blocks: Some(PromptBlocks {
+                override_blocks: overrides,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
+        assert!(prompt.contains("Custom behavior rules here"));
+        assert!(!prompt.contains("Act on hypotheses"));
+    }
+
+    #[test]
+    fn build_system_prompt_prepend_append() {
+        let p = Profile {
+            prompt_blocks: Some(PromptBlocks {
+                prepend: Some("PREPEND_MARKER".into()),
+                append: Some("APPEND_MARKER".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
+        assert!(prompt.starts_with("PREPEND_MARKER"));
+        assert!(prompt.ends_with("APPEND_MARKER"));
+    }
+
+    #[test]
+    fn identity_block_injected() {
+        let p = Profile {
+            model: "claude-fable-5".into(),
+            effort: "high".into(),
+            worker_model_policy: WorkerModelPolicy::Fixed,
+            worker_model: Some("claude-sonnet-5".into()),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "fable");
+        assert!(prompt.contains("Session Identity"));
+        assert!(prompt.contains("Profile**: `fable`"));
+        assert!(prompt.contains("tako master -fable"));
+        assert!(prompt.contains("claude-fable-5"));
+        assert!(prompt.contains("fixed"));
+        assert!(prompt.contains("claude-sonnet-5"));
+    }
+
+    #[test]
+    fn identity_block_shows_customizations() {
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("behavior".into(), "custom".into());
+        let p = Profile {
+            prompt_blocks: Some(PromptBlocks {
+                disable: vec!["no-investigate".into()],
+                override_blocks: overrides,
+                prepend: Some("header".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "custom");
+        assert!(prompt.contains("disabled: `no-investigate`"));
+        assert!(prompt.contains("overridden: `behavior`"));
+        assert!(prompt.contains("prepend: あり"));
+    }
+
+    #[test]
+    fn identity_block_not_disableable() {
+        let p = Profile {
+            prompt_blocks: Some(PromptBlocks {
+                disable: vec!["identity".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
+        assert!(prompt.contains("Session Identity"));
     }
 }

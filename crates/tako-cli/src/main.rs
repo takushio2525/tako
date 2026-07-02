@@ -970,17 +970,12 @@ fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
         Err(e) => return Err(e),
     };
 
-    // system prompt ファイルの準備
-    let prompt_path = if let Some(resolved) = profile.resolve_system_prompt() {
-        resolved
-    } else {
-        // デフォルトを一時ファイルに書き出す
-        let dir = orchestrator::config_dir().ok_or("ホームディレクトリが取得できない")?;
-        let path = dir.join("_default_system_prompt.md");
-        std::fs::write(&path, orchestrator::DEFAULT_SYSTEM_PROMPT)
-            .map_err(|e| format!("system prompt の書き出しに失敗: {e}"))?;
-        path
-    };
+    // system prompt をプロファイル設定に基づいて合成し、一時ファイルに書き出す
+    let prompt_content = profile.build_system_prompt(profile_name);
+    let dir = orchestrator::config_dir().ok_or("ホームディレクトリが取得できない")?;
+    let prompt_path = dir.join(format!("_system_prompt_{profile_name}.md"));
+    std::fs::write(&prompt_path, &prompt_content)
+        .map_err(|e| format!("system prompt の書き出しに失敗: {e}"))?;
 
     // タブ名
     let tab_title = match suffix {
@@ -1032,6 +1027,19 @@ fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
         "プロファイル: {profile_name}（モデル: {}、effort: {}）",
         profile.model, profile.effort
     );
+    let policy_desc = match profile.worker_model_policy {
+        orchestrator::WorkerModelPolicy::Inherit => format!(
+            "inherit（master と同じ {} / {}）",
+            profile.model, profile.effort
+        ),
+        orchestrator::WorkerModelPolicy::Fixed => format!(
+            "fixed（{} / {}）",
+            profile.resolve_worker_model(),
+            profile.resolve_worker_effort()
+        ),
+        orchestrator::WorkerModelPolicy::Delegate => "delegate（master が判断）".into(),
+    };
+    eprintln!("worker モデルポリシー: {policy_desc}");
     eprintln!("system prompt: {}", prompt_path.display());
     Ok(())
 }

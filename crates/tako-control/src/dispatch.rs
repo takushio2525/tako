@@ -1542,8 +1542,25 @@ fn dispatch_orchestrator_spawn(
         .resolve_cwd(project)
         .map_err(DispatchError::Operation)?;
 
-    let model = model.unwrap_or("claude-opus-4-6[1m]");
-    let effort = effort.unwrap_or("max");
+    // model/effort が明示指定されていない場合、呼び出し元 master のプロファイルから解決する
+    let caller_pane = pane.map(PaneId::from_raw);
+    let profile = resolve_caller_profile(host.workspace(), caller_pane);
+    let resolved_model;
+    let resolved_effort;
+    let model = match model {
+        Some(m) => m,
+        None => {
+            resolved_model = profile.resolve_worker_model().to_string();
+            &resolved_model
+        }
+    };
+    let effort = match effort {
+        Some(e) => e,
+        None => {
+            resolved_effort = profile.resolve_worker_effort().to_string();
+            &resolved_effort
+        }
+    };
     let window_title = match label {
         Some(l) => format!("{project}: {l}"),
         None => format!("{project}-worker"),
@@ -2265,6 +2282,66 @@ pub fn fetch_tmux_sessions(ctx: &TmuxContext) -> Vec<Value> {
             .map(|s| session_json(s, true, &backend_socket.clone().into())),
     );
     sessions
+}
+
+/// 呼び出し元ペインに紐づく master プロファイルを解決する。
+/// caller の role（orchestrator-master:X）から直接、または spawned_by チェーンを辿って
+/// master を見つけ、suffix からプロファイルを引く。
+/// 見つからなければ default プロファイルにフォールバック。
+fn resolve_caller_profile(
+    workspace: &tako_core::Workspace,
+    caller: Option<PaneId>,
+) -> crate::orchestrator::Profile {
+    let suffix = caller
+        .and_then(|pid| find_master_suffix_from(workspace, pid))
+        .unwrap_or_default();
+    let name = if suffix.is_empty() {
+        "default"
+    } else {
+        &suffix
+    };
+    crate::orchestrator::Profile::load(name).unwrap_or_default()
+}
+
+/// caller ペインから master の role suffix を検索する。
+/// caller 自身が master なら直接返し、そうでなければ spawned_by を辿る。
+fn find_master_suffix_from(workspace: &tako_core::Workspace, start: PaneId) -> Option<String> {
+    if let Some(suffix) = pane_master_suffix(workspace, start) {
+        return Some(suffix);
+    }
+    let mut current = start;
+    for _ in 0..10 {
+        let parent = workspace.tabs().iter().find_map(|t| {
+            t.tree()
+                .panes()
+                .iter()
+                .find(|p| p.id() == current)
+                .and_then(|p| p.spawned_by())
+        })?;
+        if let Some(suffix) = pane_master_suffix(workspace, parent) {
+            return Some(suffix);
+        }
+        current = parent;
+    }
+    None
+}
+
+fn pane_master_suffix(workspace: &tako_core::Workspace, pane_id: PaneId) -> Option<String> {
+    workspace.tabs().iter().find_map(|t| {
+        t.tree().panes().iter().find_map(|p| {
+            if p.id() != pane_id {
+                return None;
+            }
+            let role = p.role()?;
+            if let Some(suffix) = role.strip_prefix("orchestrator-master:") {
+                Some(suffix.to_string())
+            } else if role == "orchestrator-master" {
+                Some(String::new())
+            } else {
+                None
+            }
+        })
+    })
 }
 
 #[cfg(test)]
