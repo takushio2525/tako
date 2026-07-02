@@ -689,11 +689,13 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_persist",
-            "description": "セッション永続化（tmux バックエンド）の ON/OFF を切り替える\
-                （enabled 省略時は現在状態の取得のみ）。有効時、各ペインは tako 専用 tmux\
-                サーバーのセッションとして保持され、tako を再起動しても実行中プロセスごと\
-                復元される。切替は以後生成されるペインに効く。available = false は tmux\
-                不在環境で直接 spawn へ劣化していることを示す。設定は永続化される。",
+            "description": "セッション永続化の ON/OFF を切り替える（enabled 省略時は現在\
+                状態の取得のみ）。有効時、タブ / ペイン構成は tmux の有無に関わらず保存・\
+                復元される。tmux があれば各ペインは tako 専用 tmux サーバーのセッションと\
+                して保持され、実行中プロセスごと復元される。available = false は tmux 不在で\
+                構成のみ永続化（復元時は保存 cwd の新シェル）に劣化していることを示す。\
+                切替は以後生成されるペインに効く。設定は永続化される。応答の layout_path /\
+                layout_exists / last_restore / log_path で保存先と直近の復元結果を診断できる。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

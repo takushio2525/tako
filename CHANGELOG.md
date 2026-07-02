@@ -3,6 +3,20 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- Tab/pane layout persistence no longer requires tmux (#30): saving and restoring the layout was silently disabled on machines without tmux (e.g. Homebrew installs), losing all tabs across restarts. Without tmux, the layout is still saved and restored with fresh shells at the saved cwd; with tmux, full restore (running processes) works as before
+  タブ / ペイン構成の永続化が tmux 必須でなくなった（#30）: tmux 未導入マシン（Homebrew 配布先等）では保存・復元が無音で無効化され、再起動で全タブが消えていた。tmux 不在でも構成は保存され、保存 cwd の新シェルで復元される。tmux があれば従来通り実行中プロセスごと完全復元
+- PTY deaths (shell exit, tmux client kicked, backend tmux server killed) no longer kill backend sessions nor delete layout.json (#30): only user/AI-initiated closes (× button, cmd+W, CLI/MCP close) do. When every pane dies at once (e.g. the backend tmux server is killed externally), tako now keeps layout.json and restores the full tab structure on next launch
+  PTY 死亡（シェル exit・tmux クライアント kick・バックエンドサーバー kill）ではバックエンドセッションの kill と layout.json の削除を行わなくなった（#30）: 削除はユーザー / AI の明示 close（× / cmd+W / CLI・MCP close）に限定。バックエンド tmux サーバーが外部から kill され全ペインが一斉終了しても layout.json は保持され、次回起動でタブ構成が復元される
+
+### Added
+
+- Persistence diagnostics (#30): restore outcome/reason and explicit layout deletions are logged to `<data_dir>/persist.log` (rotated at 256KB); corrupted layout files are stashed as `layout.json.corrupt`; `tako persist` / MCP `tako_persist` now report `layout_path` / `layout_exists` / `last_restore` / `log_path`
+  永続化の診断機能（#30）: 復元の成否・理由・layout.json の明示削除を `<data_dir>/persist.log` に記録（256KB でローテート）。破損した layout.json は `layout.json.corrupt` へ退避。`tako persist` / MCP `tako_persist` が `layout_path` / `layout_exists` / `last_restore` / `log_path` を返すようになった
+
 ## [0.2.4] - 2026-07-02
 
 ### Fixed

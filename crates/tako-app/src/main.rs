@@ -314,6 +314,32 @@ fn initial_tmux_persist() -> bool {
     tako_control::settings::load().tmux_persist
 }
 
+/// ペインが閉じられる理由（Issue #30）。バックエンドセッションの kill と
+/// layout.json の削除は**ユーザー / AI の明示操作に限る**。PTY 子プロセスの死
+/// （シェル exit・tmux クライアント死）でセッションやレイアウトを道連れにしない:
+/// tmux サーバー側の異常（サーバー死・クライアント kick）で全ペインの PTY が
+/// 一斉終了したとき、旧実装は「明示 close」と同じ経路でセッションを kill し
+/// layout.json も削除していた（2026-07-03 実機で全タブ消失）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseReason {
+    /// × ボタン・cmd+W・CLI / MCP の close 等、ユーザー / AI の明示操作
+    Explicit,
+    /// PTY 子プロセスの終了（SessionNotice::Exited）
+    Exited,
+}
+
+/// persist 診断ログ（Issue #30）: `<data_dir>/persist.log` へ追記 + stderr へも出す
+/// （ターミナル起動時に見える）。Dock 起動の .app では stderr が届かないため、
+/// 「再起動でタブが消えた」原因をファイルで追えるようにする。
+/// セルフテスト中はユーザーの persist.log を汚さない
+fn persist_diag(msg: &str) {
+    if std::env::var_os("TAKO_SELF_TEST").is_some() {
+        return;
+    }
+    eprintln!("persist: {msg}");
+    tako_control::diag::persist_log(msg);
+}
+
 /// バックエンドセッション名の払い出し（`tako-<hex12>`）。
 /// 乱数ベースなので多重起動・PID 再利用でも過去の残骸セッションと衝突しない
 fn new_backend_session_name() -> String {
@@ -454,6 +480,9 @@ struct TakoApp {
     window_captures: HashMap<(PaneId, u32), Vec<String>>,
     /// 直近に保存したレイアウトの JSON（変化したときだけ書き込むための比較用）
     last_saved_layout: Option<String>,
+    /// 起動時のレイアウト復元結果（人間可読 1 行。Issue #30 の診断用。
+    /// `tako persist` / MCP `tako_persist` の `last_restore` として公開する）
+    restore_report: Option<String>,
     /// OS ウィンドウの現フレーム（render で採取し layout 保存に含める。FR-5）
     window_frame: Option<tako_control::layout::WindowFrame>,
     /// tmux ビューのアコーディオン折りたたみ状態（FR-2.16.14。折りたたむと配下の
@@ -911,11 +940,14 @@ impl TakoApp {
             }
         }
 
-        // 再起動からの復元（Phase 5.5 / FR-5）。persist 有効 + tmux ありなら
-        // レイアウトファイルから同じ ID・同じ構成でワークスペースを再現し、
-        // 各ペインは下の spawn ループで tmux バックエンドセッションへ再 attach する
+        // 再起動からの復元（Phase 5.5 / FR-5）。persist 有効ならレイアウトファイルから
+        // 同じ ID・同じ構成でワークスペースを再現する。tmux があれば各ペインは下の
+        // spawn ループでバックエンドセッションへ再 attach（実行中プロセスごと復元）、
+        // tmux 不在なら保存 cwd で新しいシェルを開く**構造のみ復元**に劣化する
+        // （Issue #30: tmux の有無でレイアウト永続化そのものを無効化しない）
         let tmux_persist = initial_tmux_persist();
-        if tmux_persist && tako_core::tmux_backend::available() {
+        let tmux_available = tako_core::tmux_backend::available();
+        if tmux_persist && tmux_available {
             // 生き残っている既存サーバーへ最新 conf を再適用する（conf は
             // サーバー起動時にしか読まれないため、バージョン更新の設定変更が
             // ここで同期されないと永久に届かない）
@@ -924,26 +956,62 @@ impl TakoApp {
         let mut restored: Vec<tako_control::layout::RestoredPane> = Vec::new();
         let mut collapsed_tmux_tabs: std::collections::HashSet<TabId> =
             std::collections::HashSet::new();
-        let workspace = if tmux_persist && tako_core::tmux_backend::available() {
-            tako_control::layout::load()
-                .and_then(|file| {
-                    // 折りたたみ状態（FR-2.16.14）を控えてから復元する。タブ ID は
-                    // Phase 5.5 で同一値に復元されるので再起動後も対応が保たれる
-                    collapsed_tmux_tabs = file
-                        .collapsed
-                        .iter()
-                        .map(|id| TabId::from_raw(*id))
-                        .collect();
-                    tako_control::layout::restore(&file)
-                })
-                .map(|(ws, panes)| {
+        let (workspace, restore_report) = if tmux_persist {
+            let loaded = tako_control::layout::try_load().and_then(|file| {
+                // 折りたたみ状態（FR-2.16.14）を控えてから復元する。タブ ID は
+                // Phase 5.5 で同一値に復元されるので再起動後も対応が保たれる
+                collapsed_tmux_tabs = file
+                    .collapsed
+                    .iter()
+                    .map(|id| TabId::from_raw(*id))
+                    .collect();
+                tako_control::layout::restore(&file)
+            });
+            match loaded {
+                Ok((ws, panes)) => {
                     restored = panes;
-                    ws
-                })
-                .unwrap_or_else(|| Workspace::new("1", Pane::new(PaneOrigin::User)))
+                    let msg = format!(
+                        "復元成功: {} タブ / {} ペイン（{}）",
+                        ws.tabs().len(),
+                        restored.len(),
+                        if tmux_available {
+                            "tmux あり: 実行中プロセスごと再 attach"
+                        } else {
+                            "tmux 不在: タブ構成のみ・新シェルで開き直し"
+                        }
+                    );
+                    persist_diag(&msg);
+                    (ws, msg)
+                }
+                Err(e) => {
+                    let msg = if e == tako_control::layout::LayoutError::NotFound {
+                        // 初回起動・明示クローズ後の正常系。理由だけ記録する
+                        format!("復元なし: {e}")
+                    } else {
+                        // 破損・不整合ファイルは .corrupt へ退避して原因調査に残す
+                        // （放置すると次の定期保存で黙って上書きされるため）
+                        let stashed = tako_control::layout::layout_path()
+                            .map(|p| std::fs::rename(&p, p.with_extension("json.corrupt")).is_ok())
+                            .unwrap_or(false);
+                        format!(
+                            "復元失敗: {e}{}",
+                            if stashed {
+                                "（layout.json.corrupt へ退避）"
+                            } else {
+                                ""
+                            }
+                        )
+                    };
+                    persist_diag(&msg);
+                    (Workspace::new("1", Pane::new(PaneOrigin::User)), msg)
+                }
+            }
         } else {
-            Workspace::new("1", Pane::new(PaneOrigin::User))
+            let msg = "復元なし: persist 無効（設定または環境変数で OFF）".to_string();
+            persist_diag(&msg);
+            (Workspace::new("1", Pane::new(PaneOrigin::User)), msg)
         };
+        let restore_report = Some(restore_report);
 
         let mut app = Self {
             // ルートペイン（復元時は全ペイン）は下の spawn_session でセッションを張る
@@ -992,6 +1060,7 @@ impl TakoApp {
             backend_windows: HashMap::new(),
             window_captures: HashMap::new(),
             last_saved_layout: None,
+            restore_report,
             window_frame: None,
             drag_kind: None,
             drop_target: None,
@@ -2293,7 +2362,8 @@ impl TakoApp {
         let mut need_immediate = false;
         match session.process_event(event) {
             Some(SessionNotice::Exited) => {
-                self.remove_pane(pane_id, cx);
+                // PTY 死亡由来の close: セッション kill・layout 削除はしない（Issue #30）
+                self.remove_pane_with(pane_id, CloseReason::Exited, cx);
                 need_immediate = true;
             }
             Some(SessionNotice::ClipboardStore(text)) => {
@@ -2520,6 +2590,24 @@ impl TakoApp {
     }
 
     fn remove_pane(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        self.remove_pane_with(pane_id, CloseReason::Explicit, cx);
+    }
+
+    /// ペインを閉じたときのバックエンドセッション後始末を理由で出し分ける（Issue #30）。
+    /// 明示 close = kill（孤児を残さない）。PTY 死亡 = 登録だけ外して kill しない
+    /// （シェル exit なら既にセッションは消えており、クライアント kick / サーバー異常なら
+    /// セッションは生きているか他インスタンスが引き継いでいる。残骸は起動時の
+    /// orphan クリーンアップ（FR-2.16.11）と tmux ビューの「kill漏れ?」表示が拾う）
+    fn drop_backend_session_with(&mut self, pane_id: PaneId, reason: CloseReason) {
+        match reason {
+            CloseReason::Explicit => self.drop_backend_session(pane_id),
+            CloseReason::Exited => {
+                self.backend_sessions.remove(&pane_id);
+            }
+        }
+    }
+
+    fn remove_pane_with(&mut self, pane_id: PaneId, reason: CloseReason, cx: &mut Context<Self>) {
         let Some(tab_id) = self
             .workspace
             .tabs()
@@ -2548,17 +2636,21 @@ impl TakoApp {
                 self.pane_font_sizes.remove(&pane_id);
                 self.pane_cell_sizes.remove(&pane_id);
                 self.drop_tmux_view_session(pane_id);
-                self.drop_backend_session(pane_id);
+                self.drop_backend_session_with(pane_id, reason);
             }
             Err(_) => {
                 // LastPane: タブごと閉じる
-                self.remove_tab(tab_id, cx);
+                self.remove_tab_with(tab_id, reason, cx);
             }
         }
         cx.notify();
     }
 
     fn remove_tab(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        self.remove_tab_with(tab_id, CloseReason::Explicit, cx);
+    }
+
+    fn remove_tab_with(&mut self, tab_id: TabId, reason: CloseReason, cx: &mut Context<Self>) {
         let Some(tab) = self.workspace.get_tab(tab_id) else {
             return;
         };
@@ -2577,20 +2669,40 @@ impl TakoApp {
                     self.scroll_accum.remove(&id);
                     self.scroll_ctls.remove(&id);
                     self.drop_tmux_view_session(id);
-                    self.drop_backend_session(id);
+                    self.drop_backend_session_with(id, reason);
                 }
             }
             Err(_) => {
-                // LastTab: アプリ終了は UI 層の責務。最後のペインの明示 close なので
-                // セッションも破棄し、次回起動で空レイアウトを復元しないようファイルも消す
+                // LastTab: アプリ終了は UI 層の責務。
+                // 明示 close = セッションも破棄し、次回起動で空レイアウトを復元しないよう
+                // ファイルも消す。PTY 死亡由来（tmux サーバー死・クライアント kick・
+                // シェル exit）= セッションは kill せず layout.json も保持し、
+                // 次回起動でタブ構成を復元できるようにする（Issue #30。
+                // 2026-07-03 実機: サーバー死で全タブが道連れ削除された）
                 for id in pane_ids {
                     self.drop_tmux_view_session(id);
-                    self.drop_backend_session(id);
+                    self.drop_backend_session_with(id, reason);
                 }
                 if std::env::var_os("TAKO_SELF_TEST").is_none() {
-                    tako_control::layout::remove();
+                    match reason {
+                        CloseReason::Explicit => {
+                            tako_control::layout::remove();
+                            persist_diag(
+                                "layout.json 削除: 最後のペインの明示クローズ（次回は空で起動）",
+                            );
+                        }
+                        CloseReason::Exited => {
+                            persist_diag(
+                                "全ペイン終了（PTY 死亡）: layout.json は保持して終了（次回起動で復元）",
+                            );
+                        }
+                    }
                 }
-                tako_control::discovery::cleanup(std::process::id());
+                // 明示 close は空で再開するため接続情報も片付ける。PTY 死亡由来は
+                // ⌘Q と同様、persist ON なら次回の同一ソケット再接続のため残す
+                if reason == CloseReason::Explicit || !self.tmux_persist {
+                    tako_control::discovery::cleanup(std::process::id());
+                }
                 cx.quit();
             }
         }
@@ -2599,12 +2711,11 @@ impl TakoApp {
 
     /// レイアウトの保存（Phase 5.5 / FR-5）。構造が変わったときだけ書き込む。
     /// 定期ループ（2 秒）・dispatch 後・終了時に呼ばれる。セルフテスト中は
-    /// ユーザーのレイアウトファイルを汚さない
+    /// ユーザーのレイアウトファイルを汚さない。
+    /// tmux 不在でも保存する（Issue #30: その場合 session は None になり、
+    /// 復元時は保存 cwd で新シェルを開く「構造のみ永続化」として機能する）
     fn save_layout(&mut self) {
-        if !self.tmux_persist
-            || !tako_core::tmux_backend::available()
-            || std::env::var_os("TAKO_SELF_TEST").is_some()
-        {
+        if !self.tmux_persist || std::env::var_os("TAKO_SELF_TEST").is_some() {
             return;
         }
         let backend_sessions = &self.backend_sessions;
@@ -2642,7 +2753,8 @@ impl TakoApp {
         }
         match tako_control::layout::save(&layout) {
             Ok(_) => self.last_saved_layout = Some(json),
-            Err(e) => eprintln!("warning: レイアウトを保存できない: {e}"),
+            // 保存失敗は復元不能に直結するので診断ログにも残す（Issue #30）
+            Err(e) => persist_diag(&format!("保存失敗: {e}")),
         }
     }
 
@@ -5098,8 +5210,13 @@ impl ControlHost for TakoApp {
                 // OFF 中は復元しない。次回起動が古いレイアウトを拾わないよう消しておく
                 tako_control::layout::remove();
                 self.last_saved_layout = None;
+                persist_diag("layout.json 削除: persist を OFF に切替（次回は空で起動）");
             }
         }
+    }
+
+    fn persist_restore_report(&self) -> Option<String> {
+        self.restore_report.clone()
     }
 
     fn backend_session(&self, pane: PaneId) -> Option<String> {
@@ -7973,13 +8090,15 @@ mod self_test {
             check(sidebar_closed, "ファイルツリーの折りたたみ（cmd+B）");
 
             // 58. tako persist の ON/OFF と状態取得（Phase 5.5 / FR-5。CLI / MCP と同じ
-            //     dispatch 経路。セルフテスト中は設定・レイアウトを永続化しない）
+            //     dispatch 経路。セルフテスト中は設定・レイアウトを永続化しない）。
+            //     診断フィールド（layout_path / last_restore。Issue #30）の露出も確認する
             type_text(
                 any,
                 cx,
                 &format!(
                     "{cli} persist on >/dev/null && {cli} persist \
-                     | grep -q '\"enabled\":true' && echo TAKO-PS-$((50+8))"
+                     | grep -q '\"enabled\":true' && {cli} persist \
+                     | grep -q '\"last_restore\"' && echo TAKO-PS-$((50+8))"
                 ),
                 true,
             );

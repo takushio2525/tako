@@ -244,3 +244,16 @@
   既存バグ（send/read フォールバック全滅）も `=session:` 化で修正
 - 検証: build / clippy(-D warnings) / fmt / test 全緑（+12 unit）+ 実 claude E2E 3 本
   （未信頼フォルダ spawn / 事前信頼 / 長文マルチライン。`claude_tui_e2e --ignored`）
+
+## 2026-07-03（Issue #30: タブ永続化の根治 — tmux 依存除去 + PTY 死亡の防御 + 診断）
+- 根因 1: 保存・復元の両方が `tmux_backend::available()` にゲートされ、tmux 無し（Homebrew
+  配布先）では layout.json が一度も書かれず無音で全タブ消失。ゲート除去で「tmux 不在 =
+  構造のみ永続化（復元は保存 cwd の新シェル）」へ
+- 根因 2（2026-07-03 実機で全タブ消失）: PTY 死亡（tmux サーバー外部 kill・クライアント kick）を
+  明示 close と同一視し、バックエンドセッション kill + layout.json 削除で全損。`CloseReason`
+  （Explicit/Exited）を導入し、Exited ではセッション kill も layout 削除もしない
+- 診断: `<data_dir>/persist.log`（復元成否・理由・明示削除。256KB ローテート）、破損ファイルの
+  `.corrupt` 退避、`tako persist` / MCP に layout_path / layout_exists / last_restore / log_path
+- 検証: release .app + クリーン HOME で e2e 3 ラウンド（tmux 不在復元 / tmux 完全復元 /
+  サーバー外部 kill → layout 保持 → 復元）
+- 次: なし（#30 クローズ）

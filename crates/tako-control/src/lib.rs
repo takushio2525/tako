@@ -7,6 +7,7 @@
 //! - discovery: 接続情報（ソケット・トークン）の永続化と発見（FR-2.2.9）
 //! - settings: ユーザー設定の永続化（自動リネーム ON/OFF 等。FR-2.12.4）
 //! - layout: タブ / ペイン構成の永続化と復元（Phase 5.5 / FR-5）
+//! - diag: 永続化まわりの診断ログ（Issue #30。`<data_dir>/persist.log`）
 //! - detect: パッシブ検知（Layer 3。listen ポート検知は Phase 4 後半で実装）
 //! - remote / agents / transcript: スマホリモートアクセス（Issue #23。HTTP+WS API と
 //!   claude agents プロキシ・会話ログ正規化）
@@ -14,6 +15,7 @@
 
 pub mod agents;
 pub mod claude_tui;
+pub mod diag;
 pub mod discovery;
 pub mod dispatch;
 pub mod ipc;

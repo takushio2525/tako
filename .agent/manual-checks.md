@@ -159,6 +159,10 @@ role / title の設定・取得自体はセルフテスト（`tako title / role 
       `on` に戻すと新規ペインが再び永続化される
 - [ ] 異常系: `tmux -L tako kill-server` で全セッションを消してから tako を起動しても、
       レイアウトだけ復元され各ペインは保存 cwd の新しいシェルで開く（落ちない）
+- [ ] tmux 未導入環境相当（`TAKO_TMUX_BIN=/nonexistent tako-app` で起動）でもタブ構成が
+      保存され、再起動で復元される（各ペインは保存 cwd の新シェル。Issue #30）。
+      `tako persist` が available=false + last_restore に「tmux 不在」の復元結果を返し、
+      `<data_dir>/persist.log` に復元成否が記録されている
 
 ## 実機リグレッション修正一括（2026-06-12 夕）
 
