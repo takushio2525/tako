@@ -960,6 +960,35 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_remote_agents",
+            "description": "動作中の Claude Code エージェント一覧を取得する\
+                （claude agents --json のプロキシ）。各エージェントの session_id / status / \
+                ctx_percent / model / name / cwd に加え、tmux バックエンドのどのペインで\
+                動いているか（pane）をプロセス祖先の突き合わせで対応付けて返す。\
+                スマホリモートのエージェント監視やセッション ID の特定に使う。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_remote_messages",
+            "description": "Claude Code セッションの会話ログ（transcript）の末尾を\
+                正規化 JSON で取得する。user / assistant メッセージ・ツール使用サマリ・\
+                thinking（折りたたみ用に分離）を返す。session_id は tako_remote_agents で\
+                確認できる。エージェントの進捗確認や会話の振り返りに使う。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "対象セッション ID（必須。claude の sessionId）" },
+                    "tail": { "type": "integer", "minimum": 1, "default": 30, "description": "取得する末尾件数（省略時は 30）" },
+                },
+                "required": ["session_id"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_chrome_open",
             "description": "URL を Chrome CDP ミラー方式で Web ビューペインとして開く（FR-3.8 PoC）。\
                 Chrome を --remote-debugging-port 付きで起動し、ページのスクリーンショットを \
@@ -1501,6 +1530,11 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
         },
         "tako_remote_stop" => Request::RemoteStop,
         "tako_remote_status" => Request::RemoteStatus,
+        "tako_remote_agents" => Request::RemoteAgents,
+        "tako_remote_messages" => Request::RemoteMessages {
+            session_id: str_arg(args, "session_id")?.ok_or("session_id を指定する")?,
+            tail: u64_arg(args, "tail")?.map(|n| n as usize),
+        },
         "tako_chrome_open" => Request::ChromeOpen {
             url: str_arg(args, "url")?.ok_or("url は必須")?.to_string(),
             pane: u64_arg(args, "pane")?.or(caller),
@@ -1931,7 +1965,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 46);
+        assert_eq!(tools.len(), 48);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

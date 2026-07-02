@@ -13,6 +13,8 @@
 //! - `POST /api/panes/:id/close` — ペインを閉じる（tmux kill-pane）
 //! - `POST /api/panes/:id/resize` — ビューポート連動リサイズ（`{cols, rows}` で
 //!   tmux resize-window、`{reset: true}` で manual 解除）
+//! - `GET  /api/agents` — claude agents --json プロキシ + tmux ペイン対応付け
+//! - `GET  /api/sessions/:id/messages?tail=N` — Claude Code transcript の正規化読み取り
 //! - `GET  /ws?pane=<id>` — WebSocket 画面プッシュ（250ms 差分検知。操作系は REST を使う）
 //!
 //! 認証: `Authorization: Bearer <token>` ヘッダ必須（/api/health 以外）。
@@ -1046,6 +1048,20 @@ fn query_param(url: &str, key: &str) -> Option<String> {
     None
 }
 
+/// URL パスからセッション ID を抽出する
+/// （`/api/sessions/<uuid>/messages` → Some("<uuid>")）
+fn extract_session_id(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.splitn(5, '/').collect();
+    // ["", "api", "sessions", "<id>", "messages"]
+    if parts.len() >= 5 && parts[1] == "api" && parts[2] == "sessions" && parts[4] == "messages" {
+        let id = urlencoding::decode(parts[3]);
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+    None
+}
+
 /// URL パスからペイン ID を抽出する（`/api/panes/session%3A0.1/screen` → Some("session:0.1")）
 fn extract_pane_target(path: &str) -> Option<String> {
     let parts: Vec<&str> = path.splitn(5, '/').collect();
@@ -1097,6 +1113,32 @@ fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &st
         (tiny_http::Method::Get, "/api/panes") => {
             let result = tmux_list_panes(tmux_socket);
             respond(request, 200, Some(result.to_string()))
+        }
+        (tiny_http::Method::Get, "/api/agents") => {
+            // claude agents --json のプロキシ + pane 対応付け（Issue #23）
+            match crate::agents::list_agents_with_panes(Some(tmux_socket)) {
+                Ok(result) => respond(request, 200, Some(result.to_string())),
+                Err(e) => respond(request, 502, Some(json!({ "error": e }).to_string())),
+            }
+        }
+        (tiny_http::Method::Get, p)
+            if p.starts_with("/api/sessions/") && p.ends_with("/messages") =>
+        {
+            // /api/sessions/:id/messages — Claude Code transcript の正規化読み取り
+            let Some(session_id) = extract_session_id(p) else {
+                return respond(
+                    request,
+                    400,
+                    Some(json!({ "error": "無効なセッション ID" }).to_string()),
+                );
+            };
+            let tail = query_param(&url_full, "tail")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(30);
+            match crate::transcript::read_messages(&session_id, tail) {
+                Ok(result) => respond(request, 200, Some(result.to_string())),
+                Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
+            }
         }
         (tiny_http::Method::Get, p) if p.starts_with("/api/panes/") && p.ends_with("/screen") => {
             let Some(target) = extract_pane_target(p) else {
@@ -1358,6 +1400,17 @@ mod tests {
         );
         assert_eq!(extract_pane_target("/api/panes//input"), None);
         assert_eq!(extract_pane_target("/api/health"), None);
+    }
+
+    #[test]
+    fn extract_session_idの抽出() {
+        assert_eq!(
+            extract_session_id("/api/sessions/a45899a8-96a6-4fa6/messages"),
+            Some("a45899a8-96a6-4fa6".to_string())
+        );
+        assert_eq!(extract_session_id("/api/sessions//messages"), None);
+        assert_eq!(extract_session_id("/api/panes/x/screen"), None);
+        assert_eq!(extract_session_id("/api/sessions/abc/other"), None);
     }
 
     #[test]

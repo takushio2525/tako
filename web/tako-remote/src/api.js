@@ -54,6 +54,12 @@ export function createClient(host, token) {
     resizeReset(id) {
       return request('POST', `/api/panes/${encodeURIComponent(id)}/resize`, { reset: true });
     },
+    agents() {
+      return request('GET', '/api/agents');
+    },
+    messages(sessionId, tail = 30) {
+      return request('GET', `/api/sessions/${encodeURIComponent(sessionId)}/messages?tail=${tail}`);
+    },
     base() {
       return base;
     },

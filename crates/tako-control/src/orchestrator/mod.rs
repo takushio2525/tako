@@ -268,7 +268,7 @@ pub fn ensure_defaults() -> Result<PathBuf, String> {
 /// `claude agents --json` をログインシェル経由で実行する。
 /// .app バンドル（Dock 起動）の PATH は最小構成で `claude` が見つからないため、
 /// `$SHELL -l -c "claude agents --json"` でユーザーの PATH を使う
-fn run_claude_agents_json() -> Option<Vec<u8>> {
+pub(crate) fn run_claude_agents_json() -> Option<Vec<u8>> {
     let shell = std::env::var("SHELL")
         .ok()
         .filter(|s| !s.is_empty())

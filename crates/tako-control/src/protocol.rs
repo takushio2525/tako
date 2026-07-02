@@ -390,6 +390,13 @@ pub enum Request {
     RemoteStop,
     /// リモートアクセス API サーバーの状態取得
     RemoteStatus,
+    /// エージェント一覧（`claude agents --json` プロキシ + tmux ペイン対応付け。Issue #23）
+    RemoteAgents,
+    /// Claude Code の会話ログ（transcript）の末尾 `tail` 件を正規化して取得（Issue #23）
+    RemoteMessages {
+        session_id: String,
+        tail: Option<usize>,
+    },
     /// Chrome を CDP ミラー方式で開く（FR-3.8 PoC）。`pane` を `direction` 方向に分割し、
     /// Web ビューペインを生やす。Chrome が未起動なら `--remote-debugging-port` 付きで起動する
     ChromeOpen {

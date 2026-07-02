@@ -1426,6 +1426,16 @@ pub fn dispatch(
         Request::RemoteStop => host.remote_stop().map_err(DispatchError::Operation),
         Request::RemoteStatus => Ok(host.remote_status()),
 
+        // エージェント一覧と会話ログはどのプロセスでも取得できる（ControlHost 不要）
+        Request::RemoteAgents => {
+            crate::agents::list_agents_with_panes(None).map_err(DispatchError::Operation)
+        }
+
+        Request::RemoteMessages { session_id, tail } => {
+            crate::transcript::read_messages(&session_id, tail.unwrap_or(30))
+                .map_err(DispatchError::Operation)
+        }
+
         Request::ChromeOpen {
             url,
             pane,

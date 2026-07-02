@@ -171,6 +171,16 @@ enum RemoteCommand {
     Stop,
     /// リモートアクセス API サーバーの状態を表示する
     Status,
+    /// エージェント一覧を表示する（claude agents --json + tmux ペイン対応付け）
+    Agents,
+    /// Claude Code の会話ログ（transcript）の末尾を正規化 JSON で表示する
+    Messages {
+        /// 対象セッション ID（claude の sessionId。`tako remote agents` で確認できる）
+        session_id: String,
+        /// 取得する末尾件数（省略時は 30）
+        #[arg(long, default_value_t = 30)]
+        tail: usize,
+    },
     /// [内部用] HTTP サーバーをフォアグラウンドで起動する（start から自動呼び出し）
     Serve {
         /// サーバーのポート番号（省略時は 7749）
@@ -828,6 +838,10 @@ fn main() -> ExitCode {
         Command::Remote(RemoteCommand::Stop) => remote_stop(),
         Command::Remote(RemoteCommand::Status) => remote_status(),
         Command::Remote(RemoteCommand::Serve { port, no_tunnel }) => remote_serve(port, no_tunnel),
+        Command::Remote(RemoteCommand::Agents) => remote_agents(),
+        Command::Remote(RemoteCommand::Messages { session_id, tail }) => {
+            remote_messages(&session_id, tail)
+        }
         command => run(command),
     };
     match result {
@@ -1442,6 +1456,20 @@ fn remote_status() -> Result<(), String> {
 /// `tako remote serve` — HTTP サーバーをフォアグラウンドで起動する（内部用）
 fn remote_serve(port: u16, no_tunnel: bool) -> Result<(), String> {
     tako_control::remote::run_daemon(Some(port), no_tunnel).map_err(|e| e.to_string())
+}
+
+/// `tako remote agents` — claude agents --json + tmux ペイン対応付けを表示する
+fn remote_agents() -> Result<(), String> {
+    let result = tako_control::agents::list_agents_with_panes(None)?;
+    println!("{}", pretty_json(&result));
+    Ok(())
+}
+
+/// `tako remote messages` — transcript の末尾を正規化 JSON で表示する
+fn remote_messages(session_id: &str, tail: usize) -> Result<(), String> {
+    let result = tako_control::transcript::read_messages(session_id, tail)?;
+    println!("{}", pretty_json(&result));
+    Ok(())
 }
 
 fn run(command: Command) -> Result<(), String> {
