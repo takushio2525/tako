@@ -586,6 +586,34 @@ pub fn dispatch(
             Ok(json!({ "killed": session, "window": window }))
         }
 
+        Request::TmuxResize {
+            socket,
+            session,
+            window,
+            cols,
+            rows,
+            reset,
+        } => {
+            if reset {
+                tako_core::tmux::reset_window_size(socket.as_deref(), &session, window)
+                    .map_err(DispatchError::Operation)?;
+                return Ok(json!({ "session": session, "window": window, "reset": true }));
+            }
+            let (Some(cols), Some(rows)) = (cols, rows) else {
+                return Err(DispatchError::InvalidParams(
+                    "cols と rows の両方を指定するか、reset を使うこと".into(),
+                ));
+            };
+            tako_core::tmux::resize_window(socket.as_deref(), &session, window, cols, rows)
+                .map_err(DispatchError::Operation)?;
+            Ok(json!({
+                "session": session,
+                "window": window,
+                "cols": cols,
+                "rows": rows,
+            }))
+        }
+
         Request::TmuxOpen {
             socket,
             session,

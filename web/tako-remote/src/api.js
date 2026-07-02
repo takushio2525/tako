@@ -48,6 +48,12 @@ export function createClient(host, token) {
     close(id) {
       return request('POST', `/api/panes/${encodeURIComponent(id)}/close`);
     },
+    resize(id, cols, rows) {
+      return request('POST', `/api/panes/${encodeURIComponent(id)}/resize`, { cols, rows });
+    },
+    resizeReset(id) {
+      return request('POST', `/api/panes/${encodeURIComponent(id)}/resize`, { reset: true });
+    },
     base() {
       return base;
     },

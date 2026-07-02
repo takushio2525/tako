@@ -11,6 +11,8 @@
 //!   `?lines=N` で履歴 N 行込み。cursor / size も返す）
 //! - `POST /api/panes/:id/input` — テキスト送信（tmux send-keys）
 //! - `POST /api/panes/:id/close` — ペインを閉じる（tmux kill-pane）
+//! - `POST /api/panes/:id/resize` — ビューポート連動リサイズ（`{cols, rows}` で
+//!   tmux resize-window、`{reset: true}` で manual 解除）
 //! - `GET  /ws?pane=<id>` — WebSocket 画面プッシュ（250ms 差分検知。操作系は REST を使う）
 //!
 //! 認証: `Authorization: Bearer <token>` ヘッダ必須（/api/health 以外）。
@@ -696,6 +698,65 @@ fn tmux_pane_geometry(tmux_socket: &str, target: &str) -> Option<(u32, u32, u32,
     Some((x, y, w, h))
 }
 
+/// ペイン target（`sess:0.1`）から window target（`sess:0`）を導出する
+fn window_target_of(pane_target: &str) -> String {
+    pane_target
+        .rsplit_once('.')
+        .map(|(w, _)| w.to_string())
+        .unwrap_or_else(|| pane_target.to_string())
+}
+
+/// tmux window を指定サイズへリサイズする（`resize-window -x -y`。window-size は manual になる）
+fn tmux_resize_window(
+    tmux_socket: &str,
+    window_target: &str,
+    cols: u32,
+    rows: u32,
+) -> Result<(), String> {
+    let cols_s = cols.to_string();
+    let rows_s = rows.to_string();
+    let output = tmux_output_with_timeout(
+        tmux_socket,
+        &[
+            "resize-window",
+            "-t",
+            window_target,
+            "-x",
+            &cols_s,
+            "-y",
+            &rows_s,
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "tmux resize-window がエラー: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// tmux window の manual サイズを解除しサーバー既定へ戻す
+fn tmux_reset_window_size(tmux_socket: &str, window_target: &str) -> Result<(), String> {
+    let output = tmux_output_with_timeout(
+        tmux_socket,
+        &[
+            "set-window-option",
+            "-t",
+            window_target,
+            "-u",
+            "window-size",
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "tmux set-window-option がエラー: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
 /// tmux の特定ペインを kill する。
 /// 最後のペインなら window ごと、最後の window ならセッションごと消える（tmux の標準挙動）
 fn tmux_kill_pane(tmux_socket: &str, target: &str) -> Result<(), String> {
@@ -1121,6 +1182,65 @@ fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &st
                 Err(e) => respond(request, 500, Some(json!({ "error": e }).to_string())),
             }
         }
+        (tiny_http::Method::Post, p) if p.starts_with("/api/panes/") && p.ends_with("/resize") => {
+            let Some(target) = extract_pane_target(p) else {
+                return respond(
+                    request,
+                    400,
+                    Some(json!({ "error": "無効なペイン ID" }).to_string()),
+                );
+            };
+            let mut body = String::new();
+            {
+                use std::io::Read as _;
+                if request
+                    .as_reader()
+                    .take(MAX_BODY_BYTES)
+                    .read_to_string(&mut body)
+                    .is_err()
+                {
+                    return respond(
+                        request,
+                        400,
+                        Some(json!({ "error": "リクエストボディの読み取りに失敗" }).to_string()),
+                    );
+                }
+            }
+            let parsed: Value = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return respond(
+                        request,
+                        400,
+                        Some(json!({ "error": format!("JSON パースエラー: {e}") }).to_string()),
+                    );
+                }
+            };
+            let window_target = format!("={}", window_target_of(&target));
+            let result = if parsed["reset"].as_bool() == Some(true) {
+                tmux_reset_window_size(tmux_socket, &window_target)
+            } else {
+                match (parsed["cols"].as_u64(), parsed["rows"].as_u64()) {
+                    (Some(cols), Some(rows)) if cols > 0 && rows > 0 => {
+                        tmux_resize_window(tmux_socket, &window_target, cols as u32, rows as u32)
+                    }
+                    _ => {
+                        return respond(
+                            request,
+                            400,
+                            Some(
+                                json!({ "error": "cols と rows（正の整数）か reset=true を指定する" })
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                }
+            };
+            match result {
+                Ok(()) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
+                Err(e) => respond(request, 500, Some(json!({ "error": e }).to_string())),
+            }
+        }
         _ => respond(
             request,
             404,
@@ -1242,6 +1362,14 @@ mod tests {
         );
         assert_eq!(extract_pane_target("/api/panes//input"), None);
         assert_eq!(extract_pane_target("/api/health"), None);
+    }
+
+    #[test]
+    fn window_target_ofの導出() {
+        assert_eq!(window_target_of("sess:0.1"), "sess:0");
+        assert_eq!(window_target_of("tako-abc123:2.0"), "tako-abc123:2");
+        // ペイン部が無い場合はそのまま
+        assert_eq!(window_target_of("sess:0"), "sess:0");
     }
 
     #[test]

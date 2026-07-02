@@ -233,6 +233,28 @@ enum TmuxCommand {
         #[arg(long)]
         socket: Option<String>,
     },
+    /// window を指定サイズへリサイズする（スマホリモートのビューポート連動用）。
+    /// tmux の window-size が manual になるため、戻すときは --reset を使う
+    Resize {
+        /// 対象セッション名
+        #[arg(long)]
+        session: String,
+        /// window index（省略時は 0）
+        #[arg(long, default_value_t = 0)]
+        window: u32,
+        /// 幅（桁数）。--reset なしなら --rows と併せて必須
+        #[arg(long)]
+        cols: Option<u32>,
+        /// 高さ（行数）。--reset なしなら --cols と併せて必須
+        #[arg(long)]
+        rows: Option<u32>,
+        /// manual サイズを解除してサーバー既定へ戻す
+        #[arg(long)]
+        reset: bool,
+        /// tmux サーバー名（`tmux -L` 相当）
+        #[arg(long)]
+        socket: Option<String>,
+    },
     /// バックエンドセッションのアクティブ window を切り替える
     SelectWindow {
         /// 切り替え先の window index
@@ -1687,6 +1709,21 @@ fn build_request(command: &Command) -> Result<Request, String> {
             session: session.clone(),
             window: *window,
         },
+        Command::Tmux(TmuxCommand::Resize {
+            session,
+            window,
+            cols,
+            rows,
+            reset,
+            socket,
+        }) => Request::TmuxResize {
+            socket: socket.clone(),
+            session: session.clone(),
+            window: *window,
+            cols: *cols,
+            rows: *rows,
+            reset: *reset,
+        },
         Command::Tmux(TmuxCommand::SelectWindow { window, pane }) => Request::TmuxSelectWindow {
             pane: target_pane(*pane)?,
             window: *window,
@@ -1973,6 +2010,7 @@ fn print_result(command: &Command, result: &Value) {
             println!("{}", pretty_json(result));
         }
         Command::Tmux(TmuxCommand::Kill { .. })
+        | Command::Tmux(TmuxCommand::Resize { .. })
         | Command::Tmux(TmuxCommand::Open { .. })
         | Command::Tmux(TmuxCommand::SelectWindow { .. }) => {
             println!("{result}")

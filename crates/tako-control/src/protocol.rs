@@ -202,6 +202,18 @@ pub enum Request {
         session: String,
         window: Option<u32>,
     },
+    /// tmux window のリサイズ（スマホリモートのビューポート連動用。Issue #23）。
+    /// `cols` / `rows` 指定で `resize-window -x -y`（window-size が manual になる）、
+    /// `reset` = true で manual を解除しサーバー既定へ戻す
+    TmuxResize {
+        socket: Option<String>,
+        session: String,
+        window: u32,
+        cols: Option<u32>,
+        rows: Option<u32>,
+        #[serde(default)]
+        reset: bool,
+    },
     /// tmux セッションをタブ内へ取り込む（FR-2.16.10。統合 tmux ビューの D&D と同等操作）。
     /// `pane` を `direction`（省略時は右）へ分割した新ペインで attach クライアント
     /// （`TMUX= tmux [-L socket] attach-session -t =session`）を起動する。

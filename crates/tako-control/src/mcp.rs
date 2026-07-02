@@ -296,6 +296,25 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_tmux_resize",
+            "description": "tmux window を指定サイズ（cols × rows）へリサイズする。\
+                スマホリモート（Issue #23）のビューポート連動用で、tmux の window-size が \
+                manual に切り替わる。PC 側の表示に合わせ直すときは reset=true で解除する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": { "type": "string", "description": "対象セッション名（必須）" },
+                    "window": { "type": "integer", "minimum": 0, "default": 0, "description": "window index（省略時は 0）" },
+                    "cols": { "type": "integer", "minimum": 1, "description": "幅（桁数）。reset なしなら rows と併せて必須" },
+                    "rows": { "type": "integer", "minimum": 1, "description": "高さ（行数）。reset なしなら cols と併せて必須" },
+                    "reset": { "type": "boolean", "description": "true で manual サイズを解除しサーバー既定へ戻す" },
+                    "socket": { "type": "string", "description": "tmux サーバー名（tmux -L 相当）" },
+                },
+                "required": ["session"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_tmux_open",
             "description": "tmux セッションを現在のタブへ取り込んで表示する。\
                 pane を direction（省略時は右）へ分割した新ペインで attach クライアントを\
@@ -1245,6 +1264,14 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             session: str_arg(args, "session")?.ok_or("session を指定する")?,
             window: u64_arg(args, "window")?.map(|n| n as u32),
         },
+        "tako_tmux_resize" => Request::TmuxResize {
+            socket: str_arg(args, "socket")?,
+            session: str_arg(args, "session")?.ok_or("session を指定する")?,
+            window: u64_arg(args, "window")?.map(|n| n as u32).unwrap_or(0),
+            cols: u64_arg(args, "cols")?.map(|n| n as u32),
+            rows: u64_arg(args, "rows")?.map(|n| n as u32),
+            reset: bool_arg(args, "reset")?.unwrap_or(false),
+        },
         "tako_tmux_select_window" => Request::TmuxSelectWindow {
             pane: Some(target_pane(args, caller)?),
             window: u64_arg(args, "window")?.ok_or("window を指定する")? as u32,
@@ -1904,7 +1931,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 45);
+        assert_eq!(tools.len(), 46);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

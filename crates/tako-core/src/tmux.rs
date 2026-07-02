@@ -131,6 +131,46 @@ pub fn kill_window(socket: Option<&str>, session: &str, window: u32) -> Result<(
     .map(|_| ())
 }
 
+/// window を指定サイズへリサイズする（`resize-window -x -y`）。
+/// tmux は window-size を manual に切り替えるため、attach クライアントのリサイズが
+/// 効かなくなる。元へ戻すには `reset_window_size` を呼ぶこと
+pub fn resize_window(
+    socket: Option<&str>,
+    session: &str,
+    window: u32,
+    cols: u32,
+    rows: u32,
+) -> Result<(), String> {
+    run_tmux(
+        socket,
+        &[
+            "resize-window",
+            "-t",
+            &format!("={session}:{window}"),
+            "-x",
+            &cols.to_string(),
+            "-y",
+            &rows.to_string(),
+        ],
+    )
+    .map(|_| ())
+}
+
+/// `resize_window` による manual サイズを解除し、window-size をサーバー既定へ戻す
+pub fn reset_window_size(socket: Option<&str>, session: &str, window: u32) -> Result<(), String> {
+    run_tmux(
+        socket,
+        &[
+            "set-window-option",
+            "-t",
+            &format!("={session}:{window}"),
+            "-u",
+            "window-size",
+        ],
+    )
+    .map(|_| ())
+}
+
 /// アクティブ window を切り替える（`session:index` 指定）
 pub fn select_window(socket: Option<&str>, session: &str, index: u32) -> Result<(), String> {
     run_tmux(
