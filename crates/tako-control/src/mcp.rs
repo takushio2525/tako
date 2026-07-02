@@ -832,8 +832,8 @@ pub fn tools() -> Vec<Value> {
                     "project": { "type": "string", "description": "プロジェクトキー（projects.yaml に登録済みであること）" },
                     "prompt": { "type": "string", "description": "worker に渡す初期プロンプト" },
                     "label": { "type": "string", "description": "ペインタイトルに付けるラベル（省略時は '<project>-worker'）" },
-                    "model": { "type": "string", "description": "claude のモデル（省略時は claude-opus-4-6[1m]）" },
-                    "effort": { "type": "string", "description": "thinking effort（省略時は max）" },
+                    "model": { "type": "string", "description": "claude のモデル（省略時はマスターのプロファイル設定に従う）" },
+                    "effort": { "type": "string", "description": "thinking effort（省略時はマスターのプロファイル設定に従う）" },
                     "pane": pane_schema("分割元ペイン ID（省略時は呼び出し元。このペインの右に子が生える）。\
                         pane と tab の両方を指定した場合は pane を優先する"),
                     "tab": { "type": "integer", "minimum": 0, "description": "子を出すタブ ID。\
@@ -879,6 +879,8 @@ pub fn tools() -> Vec<Value> {
                     "project": { "type": "string", "description": "プロジェクトキー（projects.yaml に登録済み）" },
                     "prompt": { "type": "string", "description": "worker に渡すプロンプト" },
                     "label": { "type": "string", "description": "ペインタイトルのラベル（省略時は '<project>-worker'）" },
+                    "model": { "type": "string", "description": "claude のモデル（省略時はマスターのプロファイル設定に従う）" },
+                    "effort": { "type": "string", "description": "thinking effort（省略時はマスターのプロファイル設定に従う）" },
                     "pane": pane_schema("分割元ペイン ID（省略時は呼び出し元）"),
                     "tab": { "type": "integer", "minimum": 0, "description": "子を出すタブ ID" },
                     "timeout_seconds": {
@@ -1034,14 +1036,16 @@ fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i6
     let output_lines = u64_arg(args, "output_lines")
         .map_err(map_err)?
         .unwrap_or(200) as usize;
+    let model = str_arg(args, "model").map_err(map_err)?;
+    let effort = str_arg(args, "effort").map_err(map_err)?;
 
     // --- 1. Spawn ---
     let spawn_req = Request::OrchestratorSpawn {
         project: project.clone(),
         prompt: prompt.clone(),
         label: label.clone(),
-        model: None,
-        effort: None,
+        model,
+        effort,
         pane,
         tab,
     };
