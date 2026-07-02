@@ -835,6 +835,34 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_orchestrator_profiles",
+            "description": "オーケストレーターのプロファイル（tako master の起動設定）を管理する。\
+                action=list で一覧、show で単一表示、set で作成・更新。\
+                プロファイルは profiles/<name>.yaml に保存され、master のモデル・effort と\
+                子 worker のモデル決定に使われる。model が null / 未指定のプロファイルは\
+                claude CLI の既定モデルで起動する（プラン非依存・推奨）。\
+                1M コンテキスト版（[1m] サフィックス）は Max / API プラン限定のため、\
+                set で明示指定した場合のみ使われる（Pro プランでは起動不能になる点に注意）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "show", "set"],
+                        "description": "操作種別（省略時は list）",
+                    },
+                    "name": { "type": "string", "description": "プロファイル名（set 時に必須。show 省略時は default）" },
+                    "model": { "type": "string", "description": "master のモデル（set 時。省略で現状維持）" },
+                    "clear_model": { "type": "boolean", "description": "master のモデル指定を解除して claude 既定に戻す（set 時）" },
+                    "worker_model": { "type": "string", "description": "worker_model_policy=fixed 時の子 worker モデル（set 時）" },
+                    "clear_worker_model": { "type": "boolean", "description": "子 worker のモデル指定を解除する（set 時）" },
+                    "effort": { "type": "string", "description": "master の thinking effort（set 時。省略で現状維持）" },
+                    "worker_effort": { "type": "string", "description": "子 worker の thinking effort（set 時）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_orchestrator_spawn",
             "description": "プロジェクトの作業ディレクトリで子 claude worker を spawn する。\
                 呼び出し元ペインを右に分割して新ペインを作り、claude を起動してプロンプトを送信する。\
@@ -1499,6 +1527,16 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             cwd: str_arg(args, "cwd")?,
             description: str_arg(args, "description")?,
         },
+        "tako_orchestrator_profiles" => Request::OrchestratorProfiles {
+            action: str_arg(args, "action")?.unwrap_or_else(|| "list".into()),
+            name: str_arg(args, "name")?,
+            model: str_arg(args, "model")?,
+            worker_model: str_arg(args, "worker_model")?,
+            effort: str_arg(args, "effort")?,
+            worker_effort: str_arg(args, "worker_effort")?,
+            clear_model: bool_arg(args, "clear_model")?.unwrap_or(false),
+            clear_worker_model: bool_arg(args, "clear_worker_model")?.unwrap_or(false),
+        },
         "tako_orchestrator_spawn" => {
             let pane = u64_arg(args, "pane")?;
             let tab = u64_arg(args, "tab")?;
@@ -1974,7 +2012,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 48);
+        assert_eq!(tools.len(), 49);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
@@ -2481,7 +2519,7 @@ mod tests {
 
         #[test]
         fn tools_listはhttp経由で全カタログを返す() {
-            // 48 ツール（日本語説明文込みで数十 KB）の大きな応答が HTTP 層で
+            // 49 ツール（日本語説明文込みで数十 KB）の大きな応答が HTTP 層で
             // 欠けずに返ることを検証する（セルフテスト項目 32 のユニット版）
             let server = start_server();
             let body = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;

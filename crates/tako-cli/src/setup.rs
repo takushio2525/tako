@@ -34,14 +34,11 @@ pub struct SetupConfig {
     pub setup: SetupState,
 }
 
+/// config.yaml の orchestrator セクション。
+/// モデル・effort は master が一切参照しないため、ここには置かない（Issue #27 で廃止。
+/// 起動設定の正は profiles/*.yaml。旧ファイルに残る master_model 等のキーは無視される）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrchestratorConfig {
-    #[serde(default = "default_model")]
-    pub master_model: String,
-    #[serde(default = "default_model")]
-    pub worker_model: String,
-    #[serde(default = "default_effort")]
-    pub effort: String,
     #[serde(default = "default_true")]
     pub auto_close: bool,
     #[serde(default = "default_true")]
@@ -56,12 +53,6 @@ pub struct SetupState {
     pub completed_at: Option<String>,
 }
 
-fn default_model() -> String {
-    "claude-opus-4-6[1m]".into()
-}
-fn default_effort() -> String {
-    "max".into()
-}
 fn default_true() -> bool {
     true
 }
@@ -69,9 +60,6 @@ fn default_true() -> bool {
 impl Default for OrchestratorConfig {
     fn default() -> Self {
         Self {
-            master_model: default_model(),
-            worker_model: default_model(),
-            effort: default_effort(),
             auto_close: true,
             auto_push: true,
         }
@@ -409,6 +397,10 @@ pub fn run_setup() -> Result<(), String> {
         eprintln!("  ⚠ プロファイルの初期化に失敗: {e}");
     } else {
         eprintln!("  ✓ デフォルトのオーケストレータープロファイルを確認しました");
+        // 旧バージョンが書き込んだ [1m] 既定値のマイグレーション（Issue #27）
+        if let Some(notice) = orchestrator::migrate_legacy_default_profile() {
+            eprintln!("  ℹ {notice}");
+        }
         match orchestrator::list_profiles() {
             Ok(profiles) if profiles.len() > 1 => {
                 eprintln!("    既存プロファイル: {}", profiles.join(", "));
@@ -438,7 +430,7 @@ fn run_profile_setup() -> Result<(), String> {
 
     // 既定のままにする選択肢を最初に提示
     eprintln!("プロファイルを設定しますか？");
-    eprintln!("  1) 既定のままにする（推奨: Opus / max / inherit）");
+    eprintln!("  1) 既定のままにする（推奨: claude 既定モデル / max / inherit。全プランで動作）");
     eprintln!("  2) 設定する");
     eprint!("選択 [1]: ");
     input.clear();
@@ -469,14 +461,18 @@ fn run_profile_setup() -> Result<(), String> {
 
     // master のモデル
     eprintln!();
-    eprintln!("master のモデル（Pro プランの場合は空欄で既定値を推奨）:");
-    eprintln!("  現在: {}", profile.model);
-    eprint!("モデル [{}]: ", profile.model);
+    eprintln!("master のモデル（未指定 = claude CLI の既定モデル。プラン非依存で推奨）:");
+    eprintln!("  現在: {}", profile.model_label());
+    eprintln!("  空欄 = 現状維持、`-` = 指定を解除して claude 既定に戻す");
+    eprintln!("  注意: [1m] 付き（1M コンテキスト版）は Max / API プラン限定");
+    eprint!("モデル [{}]: ", profile.model_label());
     input.clear();
     let _ = stdin.read_line(&mut input);
     let model_input = input.trim();
-    if !model_input.is_empty() {
-        profile.model = model_input.to_string();
+    if model_input == "-" {
+        profile.model = None;
+    } else if !model_input.is_empty() {
+        profile.model = Some(model_input.to_string());
     }
 
     // master の effort
@@ -505,7 +501,7 @@ fn run_profile_setup() -> Result<(), String> {
         "2" => {
             profile.worker_model_policy = orchestrator::WorkerModelPolicy::Fixed;
             eprintln!();
-            eprint!("子 worker のモデル [{}]: ", profile.model);
+            eprint!("子 worker のモデル [{}]: ", profile.model_label());
             input.clear();
             let _ = stdin.read_line(&mut input);
             let wm = input.trim();
@@ -546,19 +542,27 @@ fn run_profile_setup() -> Result<(), String> {
     eprintln!("  ✓ プロファイルを保存しました: {}", saved_path.display());
     let policy_desc = match profile.worker_model_policy {
         orchestrator::WorkerModelPolicy::Inherit => {
-            format!("inherit（{} / {}）", profile.model, profile.effort)
+            format!("inherit（{} / {}）", profile.model_label(), profile.effort)
         }
         orchestrator::WorkerModelPolicy::Fixed => format!(
             "fixed（{} / {}）",
-            profile.resolve_worker_model(),
+            profile.worker_model_label(),
             profile.resolve_worker_effort()
         ),
         orchestrator::WorkerModelPolicy::Delegate => "delegate（master が判断）".into(),
     };
     eprintln!(
         "    master: {} / {}、worker: {policy_desc}",
-        profile.model, profile.effort
+        profile.model_label(),
+        profile.effort
     );
+    if let Some(warning) = profile
+        .model
+        .as_deref()
+        .and_then(|m| orchestrator::one_m_model_warning(m, "master"))
+    {
+        eprintln!("{warning}");
+    }
     show_profile_paths()?;
     Ok(())
 }
@@ -631,15 +635,31 @@ mod tests {
         let config = SetupConfig::default();
         let yaml = serde_yaml::to_string(&config).unwrap();
         let back: SetupConfig = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(back.orchestrator.master_model, "claude-opus-4-6[1m]");
+        assert!(back.orchestrator.auto_close);
+        assert!(back.orchestrator.auto_push);
         assert!(!back.setup.completed);
+        // モデル・effort は profiles/*.yaml が正。config.yaml には書かない（Issue #27）
+        assert!(!yaml.contains("model"));
+        assert!(!yaml.contains("[1m]"));
+    }
+
+    #[test]
+    fn config_ignores_legacy_model_keys() {
+        // 旧バージョンの config.yaml（master_model 等入り）も読める後方互換
+        let legacy = "orchestrator:\n  master_model: claude-opus-4-6[1m]\n  worker_model: claude-opus-4-6[1m]\n  effort: max\n  auto_close: false\nsetup:\n  completed: true\n";
+        let config: SetupConfig = serde_yaml::from_str(legacy).unwrap();
+        assert!(!config.orchestrator.auto_close);
+        assert!(config.setup.completed);
     }
 
     #[test]
     fn config_from_default_yaml() {
         let config: SetupConfig = serde_yaml::from_str(CONFIG_DEFAULT).unwrap();
-        assert_eq!(config.orchestrator.effort, "max");
+        assert!(config.orchestrator.auto_close);
         assert!(!config.setup.completed);
+        // モデル設定キーはテンプレに含まれない（profiles/*.yaml が正。Issue #27）
+        assert!(!CONFIG_DEFAULT.contains("master_model"));
+        assert!(!CONFIG_DEFAULT.contains("worker_model"));
     }
 
     #[test]

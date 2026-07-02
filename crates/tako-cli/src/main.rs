@@ -378,6 +378,9 @@ enum OrchestratorCommand {
     /// プロジェクト管理（一覧 / 追加 / 削除）
     #[command(subcommand)]
     Projects(ProjectsCommand),
+    /// プロファイル管理（一覧 / 表示 / 設定）
+    #[command(subcommand)]
+    Profiles(ProfilesCommand),
     /// 子 worker を spawn する（split + claude 起動 + プロンプト送信）
     Spawn {
         /// プロジェクトキー（projects.yaml に登録済み）
@@ -389,10 +392,10 @@ enum OrchestratorCommand {
         /// ペインタイトルに付けるラベル
         #[arg(long)]
         label: Option<String>,
-        /// claude のモデル（省略時 claude-opus-4-6[1m]）
+        /// claude のモデル（省略時は master のプロファイル設定 → 未設定なら claude 既定）
         #[arg(long)]
         model: Option<String>,
-        /// thinking effort（省略時 max）
+        /// thinking effort（省略時は master のプロファイル設定）
         #[arg(long)]
         effort: Option<String>,
         /// 分割元ペイン ID（省略時は呼び出し元 = TAKO_PANE_ID。tab と両方指定時は pane を優先）
@@ -464,6 +467,40 @@ enum ProjectsCommand {
         /// プロジェクトキー
         #[arg(long)]
         key: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfilesCommand {
+    /// プロファイルの一覧（model が null のものは claude CLI の既定モデルで起動する）
+    List,
+    /// プロファイルの内容と解決結果を表示する
+    Show {
+        /// プロファイル名（省略時 default）
+        name: Option<String>,
+    },
+    /// プロファイルを作成・更新する。[1m] 付きモデルは Max / API プラン限定なので注意
+    Set {
+        /// プロファイル名
+        name: String,
+        /// master のモデル（--clear-model と排他）
+        #[arg(long, conflicts_with = "clear_model")]
+        model: Option<String>,
+        /// master のモデル指定を解除して claude 既定に戻す
+        #[arg(long)]
+        clear_model: bool,
+        /// worker_model_policy=fixed 時の子 worker モデル（--clear-worker-model と排他）
+        #[arg(long, conflicts_with = "clear_worker_model")]
+        worker_model: Option<String>,
+        /// 子 worker のモデル指定を解除する
+        #[arg(long)]
+        clear_worker_model: bool,
+        /// master の thinking effort
+        #[arg(long)]
+        effort: Option<String>,
+        /// 子 worker の thinking effort
+        #[arg(long)]
+        worker_effort: Option<String>,
     },
 }
 
@@ -814,6 +851,9 @@ fn main() -> ExitCode {
         Command::Orchestrator(OrchestratorCommand::Projects(ref sub)) => {
             orchestrator_projects_cli(sub)
         }
+        Command::Orchestrator(OrchestratorCommand::Profiles(ref sub)) => {
+            orchestrator_profiles_cli(sub)
+        }
         Command::Orchestrator(OrchestratorCommand::Run {
             ref project,
             ref prompt,
@@ -947,6 +987,12 @@ fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
 
     orchestrator::ensure_defaults().map_err(|e| format!("セットアップに失敗: {e}"))?;
 
+    // 旧バージョンが default.yaml に書き込んだ [1m] 既定値のマイグレーション（Issue #27）
+    if let Some(notice) = orchestrator::migrate_legacy_default_profile() {
+        eprintln!("ℹ {notice}");
+        eprintln!();
+    }
+
     // 引数をパース: "-<name>" → プロファイル名、それ以外 → 旧 suffix として扱う
     let (profile_name, suffix) = match arg {
         None => ("default", None),
@@ -969,6 +1015,23 @@ fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
         Err(_) if profile_name == "default" => orchestrator::Profile::default(),
         Err(e) => return Err(e),
     };
+
+    // プロファイルに明示された [1m] モデルは opt-in として尊重するが、
+    // Pro プランでは起動不能になるため警告を出す（Issue #27）
+    if let Some(warning) = profile
+        .model
+        .as_deref()
+        .and_then(|m| orchestrator::one_m_model_warning(m, "master"))
+    {
+        eprintln!("{warning}");
+    }
+    if let Some(warning) = profile
+        .resolve_worker_model()
+        .filter(|m| Some(*m) != profile.model.as_deref())
+        .and_then(|m| orchestrator::one_m_model_warning(m, "worker"))
+    {
+        eprintln!("{warning}");
+    }
 
     // system prompt をプロファイル設定に基づいて合成し、一時ファイルに書き出す
     let prompt_content = profile.build_system_prompt(profile_name);
@@ -1007,13 +1070,8 @@ fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
         Some(s) => format!("master:{s}"),
         None => "master".into(),
     };
-    let claude_cmd = format!(
-        "TAKO_ORCHESTRATOR_ROLE='{}' claude --model '{}' --effort {} --append-system-prompt-file '{}'",
-        role_env,
-        profile.model,
-        profile.effort,
-        prompt_path.display()
-    );
+    // model 未指定のプロファイルは --model を付けず claude CLI の既定に委ねる（Issue #27）
+    let claude_cmd = orchestrator::build_master_claude_cmd(&role_env, &profile, &prompt_path);
     send_request(Request::Send {
         pane: Some(pane_id),
         text: claude_cmd,
@@ -1025,16 +1083,18 @@ fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
     eprintln!("master を起動しました: タブ '{tab_title}'（ペイン {pane_id}）");
     eprintln!(
         "プロファイル: {profile_name}（モデル: {}、effort: {}）",
-        profile.model, profile.effort
+        profile.model_label(),
+        profile.effort
     );
     let policy_desc = match profile.worker_model_policy {
         orchestrator::WorkerModelPolicy::Inherit => format!(
             "inherit（master と同じ {} / {}）",
-            profile.model, profile.effort
+            profile.model_label(),
+            profile.effort
         ),
         orchestrator::WorkerModelPolicy::Fixed => format!(
             "fixed（{} / {}）",
-            profile.resolve_worker_model(),
+            profile.worker_model_label(),
             profile.resolve_worker_effort()
         ),
         orchestrator::WorkerModelPolicy::Delegate => "delegate（master が判断）".into(),
@@ -1414,6 +1474,63 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// `tako orchestrator profiles` — CLI 版プロファイル管理。
+/// dispatch と同じ実装（ファイル直読み）を呼ぶため、tako アプリの起動は不要
+fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
+    use tako_control::dispatch::{dispatch_orchestrator_profiles, ProfilesParams};
+
+    let params = match sub {
+        ProfilesCommand::List => ProfilesParams {
+            action: "list".into(),
+            name: None,
+            model: None,
+            worker_model: None,
+            effort: None,
+            worker_effort: None,
+            clear_model: false,
+            clear_worker_model: false,
+        },
+        ProfilesCommand::Show { name } => ProfilesParams {
+            action: "show".into(),
+            name: name.clone(),
+            model: None,
+            worker_model: None,
+            effort: None,
+            worker_effort: None,
+            clear_model: false,
+            clear_worker_model: false,
+        },
+        ProfilesCommand::Set {
+            name,
+            model,
+            clear_model,
+            worker_model,
+            clear_worker_model,
+            effort,
+            worker_effort,
+        } => ProfilesParams {
+            action: "set".into(),
+            name: Some(name.clone()),
+            model: model.clone(),
+            worker_model: worker_model.clone(),
+            effort: effort.clone(),
+            worker_effort: worker_effort.clone(),
+            clear_model: *clear_model,
+            clear_worker_model: *clear_worker_model,
+        },
+    };
+    let result = dispatch_orchestrator_profiles(params).map_err(|e| e.to_string())?;
+    if let Some(warnings) = result["warnings"].as_array() {
+        for w in warnings {
+            if let Some(text) = w.as_str() {
+                eprintln!("{text}");
+            }
+        }
+    }
+    println!("{}", pretty_json(&result));
+    Ok(())
 }
 
 /// `tako remote start` — デーモンをバックグラウンドで fork 起動し QR を表示する
@@ -1911,6 +2028,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }
         Command::Orchestrator(OrchestratorCommand::Projects(_)) => {
             unreachable!("orchestrator projects は run() を通らない")
+        }
+        Command::Orchestrator(OrchestratorCommand::Profiles(_)) => {
+            unreachable!("orchestrator profiles は run() を通らない")
         }
         Command::Orchestrator(OrchestratorCommand::Run { .. }) => {
             unreachable!("orchestrator run は run() を通らない")
