@@ -3,10 +3,26 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.2.4] - 2026-07-02
+
+### Fixed
+
+- **Hotfix (#27)**: default orchestrator profile no longer hardcodes `claude-opus-4-6[1m]`, which made `tako master` unusable on Pro plans (1M-context models are Max/API-only). New default is **no model specification** — the master launches with the claude CLI's default model. `[1m]` models now require explicit opt-in in the profile and print a warning at launch
+  **緊急修正（#27）**: 既定プロファイルの `claude-opus-4-6[1m]` ハードコードを廃止（1M コンテキスト版は Max/API プラン限定のため、Pro プランで `tako master` が起動不能だった）。新しい既定は**モデル無指定** = claude CLI の既定モデルで起動。`[1m]` モデルはプロファイルへの明示 opt-in のみとなり、起動時に警告を表示
+- Automatic migration (#27): a `default.yaml` still containing the old hardcoded `model: claude-opus-4-6[1m]` is detected at startup (`tako master` / `tako setup` / spawn) and the model line is removed with a backup (`default.yaml.backup-1m`). User-specified models other than the old default are respected
+  自動マイグレーション（#27）: 旧既定値 `model: claude-opus-4-6[1m]` が残る `default.yaml` を起動時（`tako master` / `tako setup` / spawn）に検出し、バックアップ（`default.yaml.backup-1m`）を取って model 行を除去。旧既定値以外のユーザー指定モデルは尊重する
+
+### Changed
+
+- Config precedence clarified (#27): `profiles/*.yaml` is the single source of truth for master/worker launch settings. The unused `master_model` / `worker_model` / `effort` keys in `config.yaml` are removed (legacy keys are ignored); `config.yaml` now only holds setup state and `auto_close` / `auto_push`. The setup assistant now writes model settings to profiles and no longer recommends 1M-context models to Pro-plan users
+  設定の優先順位を明文化（#27）: master/worker の起動設定の正は `profiles/*.yaml` に一本化。誰にも読まれていなかった `config.yaml` の `master_model` / `worker_model` / `effort` キーを廃止（旧キーが残っていても無視される）。`config.yaml` は setup 状態と `auto_close` / `auto_push` のみに。セットアップアシスタントはモデル設定を profiles に書き込み、Pro プランユーザーに 1M コンテキスト版を提案しないよう修正
 
 ### Added
 
+- Profile management CLI/MCP (#27): `tako orchestrator profiles list/show/set` (`--model` / `--clear-model` / `--effort` etc.) + MCP `tako_orchestrator_profiles` (49 MCP tools total) — fix a broken profile without editing YAML by hand
+  プロファイル管理 CLI/MCP（#27）: `tako orchestrator profiles list/show/set`（`--model` / `--clear-model` / `--effort` 等）+ MCP `tako_orchestrator_profiles`（MCP 計 49 ツール）— YAML 手編集なしでプロファイルを修復可能に
+- Orchestrator profile extensions (#25): per-profile worker model policy (`inherit` / `fixed` / `delegate`), system prompt block control (`disable` / `override` / `prepend` / `append`), and session identity injection
+  オーケストレータープロファイル拡張（#25）: プロファイル単位の子 worker モデル制御（`inherit` / `fixed` / `delegate`）、system prompt のブロック単位制御（`disable` / `override` / `prepend` / `append`）、セッション identity 注入
 - Remote access (#23 Phase A): WebSocket screen push channel `GET /ws?pane=<id>` — server-side 250ms diff detection, ANSI-colored screen + cursor/size (HTTP polling remains as fallback)
   リモートアクセス（#23 フェーズ A）: WebSocket 画面プッシュ `GET /ws?pane=<id>` — サーバー側 250ms 差分検知、ANSI 色付き画面 + カーソル/サイズ（HTTP ポーリングはフォールバックとして維持）
 - Remote screen API: `?ansi=1` (colored output for xterm.js), `?lines=N` (scrollback history), cursor position and pane size in response
@@ -15,8 +31,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   ビューポート連動リサイズ: `POST /api/panes/:id/resize` + CLI `tako tmux resize` + MCP `tako_tmux_resize`
 - Agent list API: `GET /api/agents` (claude agents --json proxy with tmux pane mapping) + CLI `tako remote agents` + MCP `tako_remote_agents`
   エージェント一覧 API: `GET /api/agents`（claude agents --json プロキシ + tmux ペイン対応付け）+ CLI `tako remote agents` + MCP `tako_remote_agents`
-- Conversation log API: `GET /api/sessions/:id/messages?tail=N` (normalized Claude Code transcript) + CLI `tako remote messages` + MCP `tako_remote_messages` (48 MCP tools total)
-  会話ログ API: `GET /api/sessions/:id/messages?tail=N`（Claude Code transcript の正規化）+ CLI `tako remote messages` + MCP `tako_remote_messages`（MCP 計 48 ツール）
+- Conversation log API: `GET /api/sessions/:id/messages?tail=N` (normalized Claude Code transcript) + CLI `tako remote messages` + MCP `tako_remote_messages`
+  会話ログ API: `GET /api/sessions/:id/messages?tail=N`（Claude Code transcript の正規化）+ CLI `tako remote messages` + MCP `tako_remote_messages`
 - Pane close endpoint: `POST /api/panes/:id/close`
   ペインを閉じるエンドポイント: `POST /api/panes/:id/close`
 
