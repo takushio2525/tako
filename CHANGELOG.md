@@ -57,6 +57,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Shift+Enter now inserts a newline in Claude Code on machines without tmux (#28) — modified-key CSI u encoding is now enabled for all panes, not just tmux-backend panes; the setup assistant no longer claims to configure Claude Code keybindings
+  tmux 未導入環境でも Claude Code の Shift+Enter 改行が効くように修正 (#28) — 修飾付きキーの CSI u 送出を tmux バックエンドペイン限定から全ペインに拡大。setup アシスタントが Claude Code 側キーバインドの設定を掲げる案内も廃止
 - KV relay URL mismatch between daemon and PWA (unified to the live worker)
   デーモンと PWA で KV リレー URL が不一致だった問題を修正（稼働中の Worker に統一）
 - Prompt delivery to claude TUI is now verified (#32): text is pasted via bracketed paste, the submitting Enter is sent as a separate delayed key event, and the input box is checked to be empty afterwards (with standalone Enter retries) — fixes multiline prompts stuck in the input box and intermittent Enter misses in `tako orchestrator spawn` / `tako send` / MCP `tako_send_input`

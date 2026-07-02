@@ -55,6 +55,11 @@ PromptFlow 刷新（信頼ダイアログ承諾 → bracketed paste → 分離 E
   `cargo fmt --all --check`（exit code）を確認する
 - **並行 worker と同一ワークツリーで作業する場合、未コミット変更が他者の commit/reset に
   巻き込まれる**（2026-07-02 に実際に発生）。編集 → 即コミット → 即 push を徹底する
+- **Issue #28（Shift+Enter 改行）は修正済み**（2026-07-02、fix/28 worktree → squash merge）。
+  修飾キーの CSI u 送出は全ペイン既定（CsiUMode::Off 廃止）。キー入力を触るときは
+  keybindings.rs の CsiUMode コメント + セルフテスト 45b/45c を正とする。
+  新規 worktree では `web/tako-remote/dist/`（npm 生成物・git 管理外）が無く
+  tako-control のビルドが落ちる → main ワークツリーからコピーするか `npm run build`
 
 ## 現フェーズで Read すべき設計書
 

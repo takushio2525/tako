@@ -2971,26 +2971,31 @@ impl TakoApp {
         if keystroke.modifiers.platform {
             return;
         }
-        // tmux バックエンドペインでは修飾付きキーの CSI u 送出を常に有効化する。
-        // 内側アプリ（claude 等）が kitty protocol を要求しても tmux は外側端末へ
-        // 伝えない（core の e2e で確認済み）ため、外側 Term のモードだけでは
-        // Shift+Enter を区別できない。tmux は extended-keys always で CSI u を解釈し
-        // 内側ペインへ届けるので、修飾付きキーは常時 CSI u で安全。
+        // 修飾付きキー（Shift+Enter 等）の CSI u 送出は**全ペインで**常時有効化する
+        // （ModifiedOnly）。修飾付き Enter はレガシー形式だと素の \r に潰れて区別不能な
+        // 一方、Claude Code は kitty protocol を要求・クエリせずとも CSI u 入力を解釈する
+        // （2026-07-02 v2.1.198 素の PTY で実測）ため、内側アプリの要求は観測できなくても
+        // CSI u で送るのが正しい。tmux バックエンドペインは extended-keys always +
+        // extended-keys-format csi-u が解釈して内側へ届け、直接 spawn ペイン
+        // （tmux 無し環境 = Homebrew 配布の既定）はそのまま届く。
+        // 旧実装はバックエンドペイン限定だったため tmux 無し環境で Shift+Enter 改行が
+        // 死んでいた（Issue #28 の根因）。CSI u 非対応アプリ（素の zsh 等）では修飾付き
+        // Enter が「3;2u」風の文字列になるが、バックエンドペインは 2026-06-12 から
+        // 同挙動で実害報告なし（受容済みトレードオフ）。
         // ただし **Esc 単押しは CSI 27u にしない**（ModifiedOnly）: tmux 3.6 は受信した
         // CSI 27u を内側ペインの kitty 要求の有無に関係なく素通しするため、CSI u
         // 非対応アプリ（素の zsh 等）の入力欄に「27u」が文字として挿入される
         // （2026-06-12 実機バグ）。素の \e は tmux が escape-time で正しく解釈し
-        // 内側へ素のまま届く（core e2e で固定）
+        // 内側へ素のまま届く（core e2e で固定）。Esc 単押しの CSI 27u はアプリ自身が
+        // kitty disambiguate を push 済み（= 確実に解釈できる）ときだけ（Full）
         let kitty_requested = self
             .focused_session()
             .map(|s| s.disambiguate_keys())
             .unwrap_or(false);
         let csi_u = if kitty_requested {
             CsiUMode::Full
-        } else if self.backend_sessions.contains_key(&self.focused_pane()) {
-            CsiUMode::ModifiedOnly
         } else {
-            CsiUMode::Off
+            CsiUMode::ModifiedOnly
         };
         if let Some(bytes) = keystroke_to_bytes(keystroke, csi_u) {
             // tmux スクロール中（copy-mode）は iTerm2 流に最下部へ戻してから流す
@@ -7581,6 +7586,124 @@ mod self_test {
                 })
                 .unwrap_or(false);
             check(disambiguate_off, "kitty protocol pop で解除");
+
+            // 45b. Shift+Enter が GUI キー経路で CSI u（\e[13;2u）としてペインへ届く
+            //     （Issue #28 回帰防止: kitty 未要求でも ModifiedOnly が全ペイン既定。
+            //     tmux バックエンドは extended-keys always が csi-u のまま内側へ届け、
+            //     直接 spawn はそのまま届く。cat 実行中の cooked TTY は ECHOCTL で
+            //     ESC を ^[ とエコーするため、届いたバイト列が ^[[13;2u として見える）
+            type_text(any, cx, "cat", true);
+            wait(cx, 800).await;
+            press(any, cx, "shift-enter");
+            let mut shift_enter_csi_u = false;
+            for _ in 0..20 {
+                wait(cx, 200).await;
+                if focused_contains(window, cx, "[13;2u") {
+                    shift_enter_csi_u = true;
+                    break;
+                }
+            }
+            check(
+                shift_enter_csi_u,
+                "Shift+Enter が CSI u で届く（Issue #28）",
+            );
+            press(any, cx, "ctrl-c");
+            wait(cx, 500).await;
+
+            // 45c.（任意・TAKO_SELF_TEST_CLAUDE=1 のときだけ）実 claude で Shift+Enter が
+            //     改行として入力欄に入る e2e（Issue #28 の受け入れ検証そのもの。
+            //     セルフテストは tmux バックエンド OFF = 直接 spawn なので、
+            //     まさに Issue #28 で死んでいた経路を実 claude で通す。
+            //     claude CLI + 認証が必要なため既定ではスキップ。verify-claude-mcp.sh と同格の
+            //     実機検証ツールという位置付け）
+            if std::env::var_os("TAKO_SELF_TEST_CLAUDE").is_some() {
+                type_text(any, cx, "claude", true);
+                let mut claude_ready = false;
+                for _ in 0..80 {
+                    wait(cx, 500).await;
+                    if focused_contains(window, cx, "trust this folder")
+                        || focused_contains(window, cx, "Yes, I trust")
+                    {
+                        press(any, cx, "enter");
+                        continue;
+                    }
+                    if focused_contains(window, cx, "shift+tab to cycle") {
+                        claude_ready = true;
+                        break;
+                    }
+                }
+                check(claude_ready, "45c: claude TUI 起動");
+                wait(cx, 2000).await;
+                type_text(any, cx, "hello28", false);
+                wait(cx, 1000).await;
+                press(any, cx, "shift-enter");
+                wait(cx, 1000).await;
+                type_text(any, cx, "world28", false);
+                // 入力欄内で hello28 の直下の行に world28 が来る = 改行挿入
+                // （送信されてしまった場合は transcript とセパレータを挟むため隣接しない。
+                //  改行されなかった場合は同一行に連結される）
+                let mut newline_ok = false;
+                for _ in 0..20 {
+                    wait(cx, 400).await;
+                    let ok = window
+                        .update(cx, |app, _, _| {
+                            app.focused_session()
+                                .map(|s| {
+                                    let lines = s.visible_lines();
+                                    let joined = lines
+                                        .iter()
+                                        .any(|l| l.contains("hello28") && l.contains("world28"));
+                                    let hello =
+                                        lines.iter().position(|l| l.contains("hello28"));
+                                    let world =
+                                        lines.iter().position(|l| l.contains("world28"));
+                                    matches!((hello, world), (Some(h), Some(w)) if w == h + 1)
+                                        && !joined
+                                })
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if ok {
+                        newline_ok = true;
+                        break;
+                    }
+                }
+                // 判定根拠の画面証跡を出力（成否に関わらず。ペインの spawn 経路も明示）
+                let _ = window.update(cx, |app, _, _| {
+                    let pane = app.focused_pane();
+                    println!(
+                        "45c-PANE: pane={pane} backend={}",
+                        app.backend_sessions.contains_key(&pane)
+                    );
+                    if let Some(s) = app.focused_session() {
+                        for l in s.visible_lines() {
+                            if !l.trim().is_empty() {
+                                println!("45c-SCREEN: {l}");
+                            }
+                        }
+                    }
+                });
+                check(newline_ok, "45c: 実claudeでShift+Enterが改行（#28）");
+                // 片付け: 入力破棄 → claude 終了 → シェル復帰を確認。
+                // claude は「非空入力の ctrl-c = クリア」「空入力の ctrl-c = 終了確認 →
+                // もう一度で終了」のため 3 連打（終了後の余分な ctrl-c はシェルに無害）
+                press(any, cx, "ctrl-c");
+                wait(cx, 400).await;
+                press(any, cx, "ctrl-c");
+                wait(cx, 400).await;
+                press(any, cx, "ctrl-c");
+                wait(cx, 2500).await;
+                type_text(any, cx, "echo BACK28", true);
+                let mut back_to_shell = false;
+                for _ in 0..20 {
+                    wait(cx, 400).await;
+                    if focused_contains(window, cx, "BACK28") {
+                        back_to_shell = true;
+                        break;
+                    }
+                }
+                check(back_to_shell, "45c: claude 終了後にシェルへ復帰");
+            }
 
             // 46. 全角行のマウス座標→セル変換（回帰: 範囲選択が見た目よりだいぶ左から始まる）。
             //     全角の描画幅はセル幅 × 2 と一致しないため、描画上の「う」の位置をクリック

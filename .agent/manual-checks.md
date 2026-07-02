@@ -173,7 +173,10 @@ tmux バイナリ解決・マウス / CSI u の生配送・明示コマンド sp
       + `tako persist` が `"available":true`（tmux_bin のログインシェル解決）
 - [ ] バックエンドペインの claude 内でホイール → チャットが遡れる（copy-mode）。
       入力履歴が暴発しない（矢印キー化の根絶）
-- [ ] バックエンドペインの claude で Shift+Enter 改行が効く（CSI u 強制 + csi-u 形式）
+- [ ] バックエンドペインの claude で Shift+Enter 改行が効く（CSI u 強制 + csi-u 形式）。
+      **tmux 未導入環境（直接 spawn）でも同様に効く**（Issue #28 で全ペイン既定化。
+      GUI 実キー経路はセルフテスト 45b、実 claude e2e は `TAKO_SELF_TEST_CLAUDE=1` の
+      45c で機械検証可。残るは Homebrew 配布ビルド実機での確認のみ）
 - [ ] 日本語の長文入力で IME 候補ウィンドウがカーソル直下に出続ける（全角行の shaping 位置）
 - [ ] `tako split --pane N --down -- tmux attach -t xxx` が通る（ログインシェル経由実行）
 - [ ] 右サイドバーパネル: ~~タブバー右端の「◧ panel」で開閉~~ → 下部ステータスバーの

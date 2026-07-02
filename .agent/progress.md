@@ -265,3 +265,12 @@
   Content-Length 固定 + 回帰テスト）③タイミング検査 3 件のリトライ化（17/40b/46）
 - 関連コミット: `79c3272` `7d71d84` `1801509` `d3f75a1`
 - 残: 項目 46「全角行のクリック」が決定的に失敗（GUI 座標解決。#23 と無関係、要調査 → activeContext）
+
+## 2026-07-03（Issue #28: Shift+Enter 改行の根治）
+- 根因 = 修飾キーの CSI u 送出が tmux バックエンドペイン限定で、tmux 無し環境
+  （Homebrew cask は tmux 非依存 = 配布先の既定）の直接 spawn ペインが素の \r に潰れていた。
+  claude は kitty 未要求でも CSI u を解釈（v2.1.198 素の PTY 実測）→ ModifiedOnly を全ペイン
+  既定化（CsiUMode::Off 廃止）。setup prompt に「キーバインド変更をしない・案内しない」を明記。
+  セルフテスト 45b（GUI キー経路で CSI u 着弾）+ 45c（TAKO_SELF_TEST_CLAUDE=1 で実 claude 改行 e2e）追加
+- 関連コミット: `[修正] tmux 無し環境で Shift+Enter 改行が効かない問題を根治 (#28)`（fix/28 worktree → PR squash merge）
+- 次: Homebrew 配布ビルド更新後にテスター実機で最終確認
