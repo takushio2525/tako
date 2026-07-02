@@ -1703,8 +1703,13 @@ fn respond(request: tiny_http::Request, status: u16, body: Option<String>) {
             let header =
                 tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
                     .expect("固定値のヘッダ構築は失敗しない");
+            // 応答サイズは既知なので常に Content-Length で送る。tiny_http の既定は
+            // 32KB 超で chunked に切り替わり、チャンク境界がマルチバイト文字の途中に
+            // 落ちると素朴なクライアントの read_to_string が壊れる（ツールカタログが
+            // 32KB を超えた際にセルフテストで顕在化）
             request.respond(
                 tiny_http::Response::from_string(body)
+                    .with_chunked_threshold(usize::MAX)
                     .with_header(header)
                     .with_status_code(status),
             )
@@ -2472,6 +2477,21 @@ mod tests {
                 &body,
             );
             assert_eq!(status, 403);
+        }
+
+        #[test]
+        fn tools_listはhttp経由で全カタログを返す() {
+            // 48 ツール（日本語説明文込みで数十 KB）の大きな応答が HTTP 層で
+            // 欠けずに返ることを検証する（セルフテスト項目 32 のユニット版）
+            let server = start_server();
+            let body = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+            let (status, response) = post(server.url(), Some(TOKEN), &[], body);
+            assert_eq!(status, 200);
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(
+                response["result"]["tools"].as_array().unwrap().len(),
+                tools().len()
+            );
         }
 
         #[test]
