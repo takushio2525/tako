@@ -415,17 +415,165 @@ pub fn run_setup() -> Result<(), String> {
             }
             _ => {}
         }
-        eprintln!();
-        eprintln!("別のプロファイルを作成するには:");
-        eprintln!(
-            "  {}orchestrator/profiles/<名前>.yaml を編集",
-            orchestrator::config_dir()
-                .map(|d| format!("{}/", d.display()))
-                .unwrap_or_default()
-        );
-        eprintln!("  tako master -<名前> で起動");
     }
 
+    // 7. オーケストレータープロファイルの設定（対話・スキップ可能）
+    eprintln!();
+    eprintln!("━━━ オーケストレータープロファイル設定 ━━━");
+    eprintln!();
+    eprintln!("tako master で子 worker を管理するときのモデル・effort 設定を行います。");
+    eprintln!("Pro プランではモデル指定が制限される場合があるため、既定のままでも構いません。");
+    eprintln!();
+    run_profile_setup()?;
+
+    Ok(())
+}
+
+/// オーケストレータープロファイルの対話式設定
+fn run_profile_setup() -> Result<(), String> {
+    use tako_control::orchestrator;
+
+    let stdin = std::io::stdin();
+    let mut input = String::new();
+
+    // 既定のままにする選択肢を最初に提示
+    eprintln!("プロファイルを設定しますか？");
+    eprintln!("  1) 既定のままにする（推奨: Opus / max / inherit）");
+    eprintln!("  2) 設定する");
+    eprint!("選択 [1]: ");
+    input.clear();
+    let _ = stdin.read_line(&mut input);
+    let choice = input.trim();
+    if choice.is_empty() || choice == "1" {
+        eprintln!();
+        eprintln!("  既定のプロファイルを維持します。");
+        show_profile_paths()?;
+        return Ok(());
+    }
+
+    // プロファイル名
+    eprintln!();
+    eprint!("プロファイル名 [default]: ");
+    input.clear();
+    let _ = stdin.read_line(&mut input);
+    let profile_name = input.trim();
+    let profile_name = if profile_name.is_empty() {
+        "default"
+    } else {
+        profile_name
+    }
+    .to_string();
+
+    // 既存プロファイルがあれば読み込む
+    let mut profile = orchestrator::Profile::load(&profile_name).unwrap_or_default();
+
+    // master のモデル
+    eprintln!();
+    eprintln!("master のモデル（Pro プランの場合は空欄で既定値を推奨）:");
+    eprintln!("  現在: {}", profile.model);
+    eprint!("モデル [{}]: ", profile.model);
+    input.clear();
+    let _ = stdin.read_line(&mut input);
+    let model_input = input.trim();
+    if !model_input.is_empty() {
+        profile.model = model_input.to_string();
+    }
+
+    // master の effort
+    eprintln!();
+    eprintln!("master の effort:");
+    eprintln!("  現在: {}", profile.effort);
+    eprint!("effort [{}]: ", profile.effort);
+    input.clear();
+    let _ = stdin.read_line(&mut input);
+    let effort_input = input.trim();
+    if !effort_input.is_empty() {
+        profile.effort = effort_input.to_string();
+    }
+
+    // 子 worker のモデル決定ポリシー
+    eprintln!();
+    eprintln!("子 worker のモデル決定ポリシー:");
+    eprintln!("  1) inherit — master と同じモデル・effort を使う（推奨）");
+    eprintln!("  2) fixed — 子 worker は別の固定モデルを使う");
+    eprintln!("  3) delegate — master がタスク内容を見て判断する");
+    eprint!("選択 [1]: ");
+    input.clear();
+    let _ = stdin.read_line(&mut input);
+    let policy_choice = input.trim();
+    match policy_choice {
+        "2" => {
+            profile.worker_model_policy = orchestrator::WorkerModelPolicy::Fixed;
+            eprintln!();
+            eprint!("子 worker のモデル [{}]: ", profile.model);
+            input.clear();
+            let _ = stdin.read_line(&mut input);
+            let wm = input.trim();
+            if !wm.is_empty() {
+                profile.worker_model = Some(wm.to_string());
+            }
+            eprint!("子 worker の effort [{}]: ", profile.effort);
+            input.clear();
+            let _ = stdin.read_line(&mut input);
+            let we = input.trim();
+            if !we.is_empty() {
+                profile.worker_effort = Some(we.to_string());
+            }
+        }
+        "3" => {
+            profile.worker_model_policy = orchestrator::WorkerModelPolicy::Delegate;
+            eprintln!();
+            eprintln!("振り分け方針のテキスト（master の system prompt に注入されます）。");
+            eprintln!("空欄で既定の雛形を使います。ファイルパス（~/...）も指定可能。");
+            eprint!("guidance: ");
+            input.clear();
+            let _ = stdin.read_line(&mut input);
+            let guidance = input.trim();
+            if !guidance.is_empty() {
+                profile.delegate_guidance = Some(guidance.to_string());
+            }
+        }
+        _ => {
+            profile.worker_model_policy = orchestrator::WorkerModelPolicy::Inherit;
+        }
+    }
+
+    // 保存
+    let saved_path = profile
+        .save(&profile_name)
+        .map_err(|e| format!("プロファイルの保存に失敗: {e}"))?;
+    eprintln!();
+    eprintln!("  ✓ プロファイルを保存しました: {}", saved_path.display());
+    let policy_desc = match profile.worker_model_policy {
+        orchestrator::WorkerModelPolicy::Inherit => {
+            format!("inherit（{} / {}）", profile.model, profile.effort)
+        }
+        orchestrator::WorkerModelPolicy::Fixed => format!(
+            "fixed（{} / {}）",
+            profile.resolve_worker_model(),
+            profile.resolve_worker_effort()
+        ),
+        orchestrator::WorkerModelPolicy::Delegate => "delegate（master が判断）".into(),
+    };
+    eprintln!(
+        "    master: {} / {}、worker: {policy_desc}",
+        profile.model, profile.effort
+    );
+    show_profile_paths()?;
+    Ok(())
+}
+
+fn show_profile_paths() -> Result<(), String> {
+    use tako_control::orchestrator;
+    eprintln!();
+    eprintln!("プロファイル設定の変更:");
+    eprintln!(
+        "  {}orchestrator/profiles/<名前>.yaml を編集",
+        orchestrator::config_dir()
+            .map(|d| format!("{}/", d.display()))
+            .unwrap_or_default()
+    );
+    eprintln!("  tako master -<名前> で起動");
     Ok(())
 }
 
