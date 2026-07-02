@@ -490,27 +490,23 @@ fn register_relay(machine_id: &str, tunnel_url: &str) -> Result<(), String> {
     }
 }
 
-/// QR コードに含める接続 URL を生成する
+/// QR コードに含める接続 URL を生成する。
+/// トークンは URL fragment（`/#/connect?token=...`）に載せる: fragment はブラウザが
+/// サーバーへ送信しないため、アクセスログ・cloudflared のログ・Referer に平文トークンが
+/// 残らない（Issue #23 認証改善）。PWA はハッシュルーターなのでこの形式を直接解釈できる
 pub fn connect_url(
     tunnel_url: Option<&str>,
     local_url: &str,
     token: &str,
     name: Option<&str>,
 ) -> String {
-    if let Some(tunnel) = tunnel_url {
-        // tunnel 自体が PWA を配信するので、tunnel URL に直接飛ばす（pages.dev 経由不要）
-        let mut url = format!("{tunnel}/connect?token={}", urlencoding::encode(token));
-        if let Some(n) = name {
-            url.push_str(&format!("&name={}", urlencoding::encode(n)));
-        }
-        url
-    } else {
-        let mut url = format!("{local_url}/connect?token={}", urlencoding::encode(token));
-        if let Some(n) = name {
-            url.push_str(&format!("&name={}", urlencoding::encode(n)));
-        }
-        url
+    // tunnel があれば tunnel 自体が PWA を配信するので、tunnel URL に直接飛ばす
+    let base = tunnel_url.unwrap_or(local_url);
+    let mut url = format!("{base}/#/connect?token={}", urlencoding::encode(token));
+    if let Some(n) = name {
+        url.push_str(&format!("&name={}", urlencoding::encode(n)));
     }
+    url
 }
 
 /// ホスト名を取得する（表示用）
@@ -1496,21 +1492,31 @@ mod tests {
             "abc123",
             Some("my-mac"),
         );
-        assert!(url.starts_with("https://foo.trycloudflare.com/connect?"));
+        assert!(url.starts_with("https://foo.trycloudflare.com/#/connect?"));
         assert!(!url.contains("host="));
         assert!(url.contains("token=abc123"));
         assert!(url.contains("name=my-mac"));
 
         let url = connect_url(None, "http://192.168.1.10:7749", "tok456", Some("host1"));
-        assert!(url.starts_with("http://192.168.1.10:7749/connect?"));
+        assert!(url.starts_with("http://192.168.1.10:7749/#/connect?"));
         assert!(!url.contains("host="));
         assert!(url.contains("token=tok456"));
         assert!(url.contains("name=host1"));
 
         let url = connect_url(None, "http://localhost:7749", "abc123", None);
-        assert!(url.starts_with("http://localhost:7749/connect?"));
+        assert!(url.starts_with("http://localhost:7749/#/connect?"));
         assert!(url.contains("token=abc123"));
         assert!(!url.contains("name="));
+    }
+
+    #[test]
+    fn connect_urlのトークンはfragmentに載る() {
+        // fragment（# 以降）はブラウザがサーバーへ送らない = ログ・Referer に残らない。
+        // token が # より後ろにあることを検証する
+        let url = connect_url(None, "http://192.168.1.10:7749", "secret", None);
+        let hash_pos = url.find('#').expect("fragment がある");
+        let token_pos = url.find("token=").expect("token がある");
+        assert!(token_pos > hash_pos, "token は fragment 内: {url}");
     }
 
     #[test]
@@ -1586,7 +1592,7 @@ mod tests {
             "tok123",
             None,
         );
-        assert!(url.starts_with("https://foo.trycloudflare.com/connect?"));
+        assert!(url.starts_with("https://foo.trycloudflare.com/#/connect?"));
         assert!(!url.contains("host="));
         assert!(url.contains("token=tok123"));
         assert!(!url.contains("name="));
