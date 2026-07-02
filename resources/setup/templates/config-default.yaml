@@ -1,7 +1,9 @@
+# tako オーケストレーターの設定（setup の状態と挙動フラグ）
+# モデル・effort は config.yaml ではなく profiles/*.yaml に書く（master が読むのはそちら）:
+#   ~/Library/Application Support/tako/orchestrator/profiles/default.yaml
+#   model 未指定 = claude CLI の既定モデルで起動（プラン非依存・推奨）
+#   [1m] 付きモデル（1M コンテキスト版）は Max / API プラン限定
 orchestrator:
-  master_model: claude-opus-4-6[1m]
-  worker_model: claude-opus-4-6[1m]
-  effort: max
   auto_close: true
   auto_push: true
 setup:

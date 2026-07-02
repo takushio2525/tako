@@ -166,11 +166,22 @@ pub struct PromptBlocks {
     pub override_blocks: std::collections::BTreeMap<String, String>,
 }
 
-/// プロファイル設定
+/// 0.2.3 以前が default.yaml に書き込んでいた旧既定モデル。
+/// Pro プランでは 1M コンテキスト版が使えず master が起動不能になるため、
+/// この値のままのファイルは起動時に自動マイグレーションする（Issue #27）
+pub const LEGACY_DEFAULT_MODEL: &str = "claude-opus-4-6[1m]";
+
+/// model 未指定時の表示ラベル（起動コマンドには --model 自体を付けない）
+pub const CLAUDE_DEFAULT_LABEL: &str = "(claude CLI default)";
+
+/// プロファイル設定。
+/// `model` が `None` の場合は claude CLI の既定モデルに委ねる（`--model` を付けない）。
+/// 1M コンテキスト版（`[1m]` サフィックス）は Max / API プラン限定のため、
+/// ユーザーがプロファイルに明示した場合のみ使われる（既定にはしない）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
-    #[serde(default = "default_profile_model")]
-    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default = "default_profile_effort")]
     pub effort: String,
 
@@ -191,9 +202,6 @@ pub struct Profile {
     pub projects: Option<Vec<String>>,
 }
 
-fn default_profile_model() -> String {
-    "claude-opus-4-6[1m]".into()
-}
 fn default_profile_effort() -> String {
     "max".into()
 }
@@ -201,7 +209,7 @@ fn default_profile_effort() -> String {
 impl Default for Profile {
     fn default() -> Self {
         Self {
-            model: default_profile_model(),
+            model: None,
             effort: default_profile_effort(),
             worker_model_policy: WorkerModelPolicy::default(),
             worker_model: None,
@@ -215,12 +223,23 @@ impl Default for Profile {
 }
 
 impl Profile {
-    /// worker_model_policy に従って子 worker の既定 model を解決する
-    pub fn resolve_worker_model(&self) -> &str {
+    /// worker_model_policy に従って子 worker の既定 model を解決する。
+    /// `None` は claude CLI の既定モデルに委ねることを意味する
+    pub fn resolve_worker_model(&self) -> Option<&str> {
         match self.worker_model_policy {
-            WorkerModelPolicy::Inherit | WorkerModelPolicy::Delegate => &self.model,
-            WorkerModelPolicy::Fixed => self.worker_model.as_deref().unwrap_or(&self.model),
+            WorkerModelPolicy::Inherit | WorkerModelPolicy::Delegate => self.model.as_deref(),
+            WorkerModelPolicy::Fixed => self.worker_model.as_deref().or(self.model.as_deref()),
         }
+    }
+
+    /// master のモデル表示ラベル（プロンプト・ログ用）
+    pub fn model_label(&self) -> &str {
+        self.model.as_deref().unwrap_or(CLAUDE_DEFAULT_LABEL)
+    }
+
+    /// 子 worker のモデル表示ラベル（プロンプト・ログ用）
+    pub fn worker_model_label(&self) -> &str {
+        self.resolve_worker_model().unwrap_or(CLAUDE_DEFAULT_LABEL)
     }
 
     /// worker_model_policy に従って子 worker の既定 effort を解決する
@@ -367,7 +386,8 @@ impl Profile {
                      - **Effort**: {}\n\n\
                      When calling `tako_orchestrator_spawn` or `tako_orchestrator_run`, do NOT specify\n\
                      `model` or `effort` — the defaults already match this session's configuration.",
-                    self.model, self.effort
+                    self.model_label(),
+                    self.effort
                 )
             }
             WorkerModelPolicy::Fixed => {
@@ -379,7 +399,7 @@ impl Profile {
                      When calling `tako_orchestrator_spawn` or `tako_orchestrator_run`, do NOT specify\n\
                      `model` or `effort` unless the user explicitly requests a different model for a\n\
                      specific task.",
-                    self.resolve_worker_model(),
+                    self.worker_model_label(),
                     self.resolve_worker_effort()
                 )
             }
@@ -399,7 +419,8 @@ impl Profile {
                      - **Default Effort**: {}\n\n\
                      ### Delegation Guidance\n\n\
                      {guidance}",
-                    self.model, self.effort
+                    self.model_label(),
+                    self.effort
                 )
             }
         }
@@ -414,11 +435,15 @@ impl Profile {
     ) -> String {
         let policy_str = match self.worker_model_policy {
             WorkerModelPolicy::Inherit => {
-                format!("inherit（master と同じ {} / {}）", self.model, self.effort)
+                format!(
+                    "inherit（master と同じ {} / {}）",
+                    self.model_label(),
+                    self.effort
+                )
             }
             WorkerModelPolicy::Fixed => format!(
                 "fixed（{} / {}）",
-                self.resolve_worker_model(),
+                self.worker_model_label(),
                 self.resolve_worker_effort()
             ),
             WorkerModelPolicy::Delegate => "delegate（master がタスクごとに判断）".into(),
@@ -461,11 +486,48 @@ impl Profile {
              - **Profile config**: `{profile_path}`\n\
              - **Prompt blocks**: {}\n\
              - **Customizations**: {customization_summary}",
-            self.model,
+            self.model_label(),
             self.effort,
             all_blocks.join(", "),
         )
     }
+}
+
+/// master 起動用の claude コマンドを組み立てる。
+/// profile.model が None の場合は `--model` を付けず claude CLI の既定に委ねる
+pub fn build_master_claude_cmd(role_env: &str, profile: &Profile, prompt_path: &Path) -> String {
+    let mut cmd = format!("TAKO_ORCHESTRATOR_ROLE='{role_env}' claude");
+    if let Some(model) = profile.model.as_deref() {
+        cmd.push_str(&format!(" --model '{model}'"));
+    }
+    cmd.push_str(&format!(" --effort {}", profile.effort));
+    cmd.push_str(&format!(
+        " --append-system-prompt-file '{}'",
+        prompt_path.display()
+    ));
+    cmd
+}
+
+/// worker 起動用の claude コマンドを組み立てる。
+/// model が None の場合は `--model` を付けず claude CLI の既定に委ねる
+pub fn build_worker_claude_cmd(role: &str, model: Option<&str>, effort: &str) -> String {
+    let mut cmd = format!("TAKO_ORCHESTRATOR_ROLE='{role}' claude");
+    if let Some(model) = model {
+        cmd.push_str(&format!(" --model '{model}'"));
+    }
+    cmd.push_str(&format!(" --effort {effort}"));
+    cmd
+}
+
+/// 1M コンテキスト版モデル（`[1m]` サフィックス）への警告文を生成する。
+/// プロファイルへの明示 opt-in は尊重して起動は継続するため、警告のみ（Issue #27）
+pub fn one_m_model_warning(model: &str, source: &str) -> Option<String> {
+    if !model.contains("[1m]") {
+        return None;
+    }
+    Some(format!(
+        "⚠ {source} のモデル '{model}' は 1M コンテキスト版のため、Pro プランでは起動できない可能性があります（Max / API プラン向け）。\n  起動に失敗する場合は `tako orchestrator profiles set <プロファイル名> --clear-model` で解除してください"
+    ))
 }
 
 /// `<!-- block: name -->` マーカーで区切られたブロックをパースする
@@ -534,6 +596,17 @@ pub fn list_profiles() -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+/// 新規生成する default.yaml の内容。
+/// model は意図的に未指定 = claude CLI の既定モデルで起動する（プラン非依存。Issue #27）
+const DEFAULT_PROFILE_YAML: &str = "\
+# tako master のプロファイル設定
+# model 未指定 = claude CLI の既定モデルで起動する（プラン非依存・推奨）
+#   例: model: claude-opus-4-6        … モデルを固定する場合
+#   例: model: claude-opus-4-6[1m]    … 1M コンテキスト版（Max / API プラン限定）
+effort: max
+worker_model_policy: inherit
+";
+
 /// 初回実行時にデフォルトのディレクトリとファイルを生成する
 pub fn ensure_defaults() -> Result<PathBuf, String> {
     let dir = config_dir().ok_or("ホームディレクトリが取得できない")?;
@@ -551,9 +624,72 @@ pub fn ensure_defaults() -> Result<PathBuf, String> {
         .map_err(|e| format!("profiles ディレクトリの作成に失敗: {e}"))?;
     let default_profile = profiles.join("default.yaml");
     if !default_profile.is_file() {
-        Profile::default().save("default")?;
+        std::fs::write(&default_profile, DEFAULT_PROFILE_YAML)
+            .map_err(|e| format!("default.yaml の書き込みに失敗: {e}"))?;
     }
     Ok(dir)
+}
+
+/// 旧バージョン（0.2.3 以前）が default.yaml に書き込んだ `model: claude-opus-4-6[1m]` を
+/// 検出し、バックアップを取って model 行を除去する（Issue #27）。
+/// 旧既定値と完全一致する場合のみ対象（ユーザーが別の値を明示した場合は触らない）。
+/// 戻り値: マイグレーションを実行した場合は通知メッセージ
+pub fn migrate_legacy_default_profile() -> Option<String> {
+    let path = profiles_dir()?.join("default.yaml");
+    migrate_legacy_model_file(&path)
+}
+
+/// マイグレーション本体（パス指定・テスト用に分離）。
+/// model 行だけを行単位で除去し、他の設定・コメントは保持する
+fn migrate_legacy_model_file(path: &Path) -> Option<String> {
+    if !path.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    let profile: Profile = serde_yaml::from_str(&content).ok()?;
+    if profile.model.as_deref() != Some(LEGACY_DEFAULT_MODEL) {
+        return None;
+    }
+
+    // トップレベル（行頭）の model 行だけを除去。ネスト行（インデント付き）は対象外
+    let is_legacy_model_line = |line: &str| {
+        line.strip_prefix("model:").is_some_and(|rest| {
+            let value = rest.trim();
+            value == LEGACY_DEFAULT_MODEL
+                || value == format!("'{LEGACY_DEFAULT_MODEL}'")
+                || value == format!("\"{LEGACY_DEFAULT_MODEL}\"")
+        })
+    };
+    // まず model 行だけを行単位で除去した候補を作り、Profile として読めるか検証する。
+    // 読めない場合（model 1 行のみ・特殊な書式等）は serde 経由の再構成にフォールバック
+    let line_surgery = || -> Option<String> {
+        if !content.lines().any(is_legacy_model_line) {
+            return None;
+        }
+        let kept: Vec<&str> = content
+            .lines()
+            .filter(|l| !is_legacy_model_line(l))
+            .collect();
+        let mut text = kept.join("\n");
+        text.push('\n');
+        serde_yaml::from_str::<Profile>(&text).ok()?;
+        Some(text)
+    };
+    let migrated = line_surgery().or_else(|| {
+        let mut p = profile;
+        p.model = None;
+        serde_yaml::to_string(&p).ok()
+    })?;
+
+    let backup = path.with_extension("yaml.backup-1m");
+    if !backup.exists() {
+        let _ = std::fs::copy(path, &backup);
+    }
+    std::fs::write(path, &migrated).ok()?;
+    Some(format!(
+        "profiles/default.yaml の model: {LEGACY_DEFAULT_MODEL}（旧既定値。Pro プランでは起動不能）を\n  削除しました。今後は claude CLI の既定モデルで起動します。\n  1M コンテキスト版を使う場合（Max / API プラン）は model を明示的に再設定してください。\n  バックアップ: {}",
+        backup.display()
+    ))
 }
 
 /// `claude agents --json` をログインシェル経由で実行する。
@@ -652,7 +788,8 @@ mod tests {
     #[test]
     fn profile_default_values() {
         let p = Profile::default();
-        assert_eq!(p.model, "claude-opus-4-6[1m]");
+        // model 無指定 = claude CLI の既定に委ねる（Issue #27。[1m] を既定にしない）
+        assert_eq!(p.model, None);
         assert_eq!(p.effort, "max");
         assert_eq!(p.worker_model_policy, WorkerModelPolicy::Inherit);
         assert!(p.worker_model.is_none());
@@ -664,9 +801,25 @@ mod tests {
     }
 
     #[test]
+    fn profile_default_serializes_without_model() {
+        let yaml = serde_yaml::to_string(&Profile::default()).unwrap();
+        assert!(!yaml.contains("model:") || yaml.contains("worker_model_policy"));
+        assert!(!yaml.contains("claude-opus"));
+        assert!(!yaml.contains("[1m]"));
+    }
+
+    #[test]
+    fn default_profile_yaml_template_parses() {
+        let p: Profile = serde_yaml::from_str(DEFAULT_PROFILE_YAML).unwrap();
+        assert_eq!(p.model, None);
+        assert_eq!(p.effort, "max");
+        assert_eq!(p.worker_model_policy, WorkerModelPolicy::Inherit);
+    }
+
+    #[test]
     fn profile_roundtrip() {
         let p = Profile {
-            model: "claude-sonnet-5".into(),
+            model: Some("claude-sonnet-5".into()),
             effort: "high".into(),
             system_prompt: Some("~/my-prompt.md".into()),
             projects: Some(vec!["tako".into(), "demo".into()]),
@@ -674,7 +827,7 @@ mod tests {
         };
         let yaml = serde_yaml::to_string(&p).unwrap();
         let back: Profile = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(back.model, "claude-sonnet-5");
+        assert_eq!(back.model.as_deref(), Some("claude-sonnet-5"));
         assert_eq!(back.effort, "high");
         assert_eq!(back.system_prompt.as_deref(), Some("~/my-prompt.md"));
         assert_eq!(back.projects.as_ref().unwrap().len(), 2);
@@ -682,11 +835,22 @@ mod tests {
 
     #[test]
     fn profile_deserialize_minimal() {
+        // 旧形式（model 明示）も読める後方互換
         let yaml = "model: claude-opus-4-6[1m]\n";
         let p: Profile = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.model.as_deref(), Some("claude-opus-4-6[1m]"));
         assert_eq!(p.effort, "max");
         assert_eq!(p.worker_model_policy, WorkerModelPolicy::Inherit);
         assert!(p.projects.is_none());
+    }
+
+    #[test]
+    fn profile_deserialize_empty() {
+        // model 行が無いファイル = claude 既定
+        let yaml = "effort: high\n";
+        let p: Profile = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.model, None);
+        assert_eq!(p.effort, "high");
     }
 
     #[test]
@@ -697,7 +861,7 @@ mod tests {
         let name = "test-roundtrip";
         let path = tmp.join(format!("{name}.yaml"));
         let p = Profile {
-            model: "test-model".into(),
+            model: Some("test-model".into()),
             effort: "low".into(),
             projects: Some(vec!["a".into()]),
             ..Default::default()
@@ -706,7 +870,7 @@ mod tests {
         std::fs::write(&path, &yaml).unwrap();
         let loaded: Profile =
             serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(loaded.model, "test-model");
+        assert_eq!(loaded.model.as_deref(), Some("test-model"));
         assert_eq!(loaded.projects.as_ref().unwrap(), &["a"]);
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -714,50 +878,59 @@ mod tests {
     #[test]
     fn worker_model_policy_inherit() {
         let p = Profile {
-            model: "claude-fable-5".into(),
+            model: Some("claude-fable-5".into()),
             effort: "high".into(),
             ..Default::default()
         };
-        assert_eq!(p.resolve_worker_model(), "claude-fable-5");
+        assert_eq!(p.resolve_worker_model(), Some("claude-fable-5"));
         assert_eq!(p.resolve_worker_effort(), "high");
+    }
+
+    #[test]
+    fn worker_model_policy_inherit_unspecified() {
+        // model 無指定の master → worker も claude 既定
+        let p = Profile::default();
+        assert_eq!(p.resolve_worker_model(), None);
+        assert_eq!(p.model_label(), CLAUDE_DEFAULT_LABEL);
+        assert_eq!(p.worker_model_label(), CLAUDE_DEFAULT_LABEL);
     }
 
     #[test]
     fn worker_model_policy_fixed() {
         let p = Profile {
-            model: "claude-opus-4-6[1m]".into(),
+            model: Some("claude-opus-4-6[1m]".into()),
             effort: "max".into(),
             worker_model_policy: WorkerModelPolicy::Fixed,
             worker_model: Some("claude-sonnet-5".into()),
             worker_effort: Some("medium".into()),
             ..Default::default()
         };
-        assert_eq!(p.resolve_worker_model(), "claude-sonnet-5");
+        assert_eq!(p.resolve_worker_model(), Some("claude-sonnet-5"));
         assert_eq!(p.resolve_worker_effort(), "medium");
     }
 
     #[test]
     fn worker_model_policy_fixed_fallback() {
         let p = Profile {
-            model: "claude-opus-4-6[1m]".into(),
+            model: Some("claude-opus-4-6[1m]".into()),
             effort: "max".into(),
             worker_model_policy: WorkerModelPolicy::Fixed,
             ..Default::default()
         };
-        assert_eq!(p.resolve_worker_model(), "claude-opus-4-6[1m]");
+        assert_eq!(p.resolve_worker_model(), Some("claude-opus-4-6[1m]"));
         assert_eq!(p.resolve_worker_effort(), "max");
     }
 
     #[test]
     fn worker_model_policy_delegate() {
         let p = Profile {
-            model: "claude-fable-5".into(),
+            model: Some("claude-fable-5".into()),
             effort: "high".into(),
             worker_model_policy: WorkerModelPolicy::Delegate,
             delegate_guidance: Some("タスクの複雑さで判断".into()),
             ..Default::default()
         };
-        assert_eq!(p.resolve_worker_model(), "claude-fable-5");
+        assert_eq!(p.resolve_worker_model(), Some("claude-fable-5"));
         assert_eq!(p.resolve_worker_effort(), "high");
     }
 
@@ -767,7 +940,7 @@ mod tests {
         let p: Profile = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(p.worker_model_policy, WorkerModelPolicy::Fixed);
         assert_eq!(p.worker_model.as_deref(), Some("claude-sonnet-5"));
-        assert_eq!(p.resolve_worker_model(), "claude-sonnet-5");
+        assert_eq!(p.resolve_worker_model(), Some("claude-sonnet-5"));
     }
 
     #[test]
@@ -811,13 +984,15 @@ prompt_blocks:
         let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
         assert!(prompt.contains("Master Orchestrator Agent"));
         assert!(prompt.contains("Worker Model Policy"));
-        assert!(prompt.contains("claude-opus-4-6[1m]"));
+        // 既定はモデル無指定 = claude CLI の既定（[1m] を含まない）
+        assert!(prompt.contains(CLAUDE_DEFAULT_LABEL));
+        assert!(!prompt.contains("[1m]"));
     }
 
     #[test]
     fn build_system_prompt_inherit_model() {
         let p = Profile {
-            model: "claude-fable-5".into(),
+            model: Some("claude-fable-5".into()),
             effort: "high".into(),
             ..Default::default()
         };
@@ -829,7 +1004,7 @@ prompt_blocks:
     #[test]
     fn build_system_prompt_fixed_policy() {
         let p = Profile {
-            model: "claude-opus-4-6[1m]".into(),
+            model: Some("claude-opus-4-6[1m]".into()),
             effort: "max".into(),
             worker_model_policy: WorkerModelPolicy::Fixed,
             worker_model: Some("claude-sonnet-5".into()),
@@ -845,7 +1020,7 @@ prompt_blocks:
     #[test]
     fn build_system_prompt_delegate_policy() {
         let p = Profile {
-            model: "claude-opus-4-6[1m]".into(),
+            model: Some("claude-opus-4-6[1m]".into()),
             effort: "max".into(),
             worker_model_policy: WorkerModelPolicy::Delegate,
             delegate_guidance: Some("複雑なタスクは Opus、単純なタスクは Sonnet".into()),
@@ -904,7 +1079,7 @@ prompt_blocks:
     #[test]
     fn identity_block_injected() {
         let p = Profile {
-            model: "claude-fable-5".into(),
+            model: Some("claude-fable-5".into()),
             effort: "high".into(),
             worker_model_policy: WorkerModelPolicy::Fixed,
             worker_model: Some("claude-sonnet-5".into()),
@@ -949,5 +1124,111 @@ prompt_blocks:
         };
         let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
         assert!(prompt.contains("Session Identity"));
+    }
+
+    #[test]
+    fn master_cmd_without_model() {
+        let p = Profile::default();
+        let cmd = build_master_claude_cmd("master", &p, Path::new("/tmp/p.md"));
+        assert_eq!(
+            cmd,
+            "TAKO_ORCHESTRATOR_ROLE='master' claude --effort max --append-system-prompt-file '/tmp/p.md'"
+        );
+        assert!(!cmd.contains("--model"));
+    }
+
+    #[test]
+    fn master_cmd_with_model() {
+        let p = Profile {
+            model: Some("claude-opus-4-6[1m]".into()),
+            ..Default::default()
+        };
+        let cmd = build_master_claude_cmd("master:x", &p, Path::new("/tmp/p.md"));
+        assert!(cmd.contains("--model 'claude-opus-4-6[1m]'"));
+        assert!(cmd.contains("--effort max"));
+    }
+
+    #[test]
+    fn worker_cmd_model_optional() {
+        let with = build_worker_claude_cmd("worker:demo", Some("claude-sonnet-5"), "high");
+        assert_eq!(
+            with,
+            "TAKO_ORCHESTRATOR_ROLE='worker:demo' claude --model 'claude-sonnet-5' --effort high"
+        );
+        let without = build_worker_claude_cmd("worker:demo", None, "max");
+        assert_eq!(
+            without,
+            "TAKO_ORCHESTRATOR_ROLE='worker:demo' claude --effort max"
+        );
+    }
+
+    #[test]
+    fn one_m_warning_only_for_1m_models() {
+        assert!(one_m_model_warning("claude-opus-4-6[1m]", "master").is_some());
+        assert!(one_m_model_warning("claude-opus-4-6", "master").is_none());
+        assert!(one_m_model_warning("claude-sonnet-5", "worker").is_none());
+    }
+
+    #[test]
+    fn migrate_removes_legacy_default_model_line() {
+        let tmp = std::env::temp_dir().join("tako-test-migrate-legacy");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("default.yaml");
+        // 旧バージョンが生成した形 + ユーザー追記のコメント・設定
+        std::fs::write(
+            &path,
+            "# user comment\nmodel: claude-opus-4-6[1m]\neffort: high\nworker_model_policy: inherit\n",
+        )
+        .unwrap();
+
+        let msg = migrate_legacy_model_file(&path);
+        assert!(msg.is_some(), "旧既定値はマイグレーションされる");
+
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(!migrated.contains("model:"), "model 行が除去される");
+        assert!(migrated.contains("# user comment"), "コメントは保持");
+        assert!(migrated.contains("effort: high"), "他の設定は保持");
+        let p: Profile = serde_yaml::from_str(&migrated).unwrap();
+        assert_eq!(p.model, None);
+        assert_eq!(p.effort, "high");
+        // バックアップが作成される
+        assert!(path.with_extension("yaml.backup-1m").is_file());
+        // 2 回目は no-op
+        assert!(migrate_legacy_model_file(&path).is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn migrate_keeps_user_specified_models() {
+        let tmp = std::env::temp_dir().join("tako-test-migrate-keep");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("default.yaml");
+        // 旧既定値と異なる明示指定（[1m] を含んでいても）は opt-in として尊重
+        std::fs::write(&path, "model: claude-fable-5[1m]\neffort: max\n").unwrap();
+        assert!(migrate_legacy_model_file(&path).is_none());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("claude-fable-5[1m]"), "ファイルは無変更");
+
+        // model 無しのファイルも no-op
+        std::fs::write(&path, "effort: max\n").unwrap();
+        assert!(migrate_legacy_model_file(&path).is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn migrate_model_only_file() {
+        let tmp = std::env::temp_dir().join("tako-test-migrate-only");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("default.yaml");
+        std::fs::write(&path, "model: claude-opus-4-6[1m]\n").unwrap();
+        assert!(migrate_legacy_model_file(&path).is_some());
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        let p: Profile = serde_yaml::from_str(&migrated).unwrap();
+        assert_eq!(p.model, None);
+        assert_eq!(p.effort, "max", "serde default で補われる");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

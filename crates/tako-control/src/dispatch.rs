@@ -1389,6 +1389,26 @@ pub fn dispatch(
             description,
         } => dispatch_orchestrator_projects(&action, key, cwd, description),
 
+        Request::OrchestratorProfiles {
+            action,
+            name,
+            model,
+            worker_model,
+            effort,
+            worker_effort,
+            clear_model,
+            clear_worker_model,
+        } => dispatch_orchestrator_profiles(ProfilesParams {
+            action,
+            name,
+            model,
+            worker_model,
+            effort,
+            worker_effort,
+            clear_model,
+            clear_worker_model,
+        }),
+
         Request::OrchestratorSpawn {
             project,
             prompt,
@@ -1517,6 +1537,121 @@ fn dispatch_orchestrator_projects(
     }
 }
 
+/// OrchestratorProfiles のパラメータ（Request と 1:1）。
+/// ファイル直読みで tako-core の状態に依存しないため、CLI からも直接呼べるよう公開する
+pub struct ProfilesParams {
+    pub action: String,
+    pub name: Option<String>,
+    pub model: Option<String>,
+    pub worker_model: Option<String>,
+    pub effort: Option<String>,
+    pub worker_effort: Option<String>,
+    pub clear_model: bool,
+    pub clear_worker_model: bool,
+}
+
+/// プロファイルを JSON 化する（list / show / set の共通形）。
+/// model が null のときは claude CLI の既定モデルで起動することを表す
+fn profile_to_json(name: &str, profile: &crate::orchestrator::Profile) -> Value {
+    use crate::orchestrator;
+    json!({
+        "name": name,
+        "model": profile.model,
+        "effort": profile.effort,
+        "worker_model_policy": profile.worker_model_policy,
+        "worker_model": profile.worker_model,
+        "worker_effort": profile.worker_effort,
+        "resolved_worker_model": profile.resolve_worker_model(),
+        "resolved_worker_effort": profile.resolve_worker_effort(),
+        "path": orchestrator::profiles_dir()
+            .map(|d| d.join(format!("{name}.yaml")).display().to_string()),
+    })
+}
+
+/// プロファイル管理（list / show / set）。ファイル直読みなので tako-core の状態に依存しない
+pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, DispatchError> {
+    use crate::orchestrator;
+    match params.action.as_str() {
+        "list" => {
+            let names = orchestrator::list_profiles().map_err(DispatchError::Operation)?;
+            let profiles: Vec<Value> = names
+                .iter()
+                .map(|n| {
+                    let p = orchestrator::Profile::load(n).unwrap_or_default();
+                    profile_to_json(n, &p)
+                })
+                .collect();
+            Ok(json!({ "profiles": profiles }))
+        }
+        "show" => {
+            let name = params.name.as_deref().unwrap_or("default");
+            let profile = match orchestrator::Profile::load(name) {
+                Ok(p) => p,
+                Err(_) if name == "default" => orchestrator::Profile::default(),
+                Err(e) => return Err(DispatchError::Operation(e)),
+            };
+            Ok(profile_to_json(name, &profile))
+        }
+        "set" => {
+            let name = params
+                .name
+                .ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+            if params.model.is_some() && params.clear_model {
+                return Err(DispatchError::InvalidParams(
+                    "model と clear_model は同時に指定できない".into(),
+                ));
+            }
+            if params.worker_model.is_some() && params.clear_worker_model {
+                return Err(DispatchError::InvalidParams(
+                    "worker_model と clear_worker_model は同時に指定できない".into(),
+                ));
+            }
+            let mut profile = orchestrator::Profile::load(&name).unwrap_or_default();
+            if let Some(m) = params.model {
+                profile.model = Some(m);
+            } else if params.clear_model {
+                profile.model = None;
+            }
+            if let Some(m) = params.worker_model {
+                profile.worker_model = Some(m);
+            } else if params.clear_worker_model {
+                profile.worker_model = None;
+            }
+            if let Some(e) = params.effort {
+                profile.effort = e;
+            }
+            if let Some(e) = params.worker_effort {
+                profile.worker_effort = Some(e);
+            }
+            let path = profile.save(&name).map_err(DispatchError::Operation)?;
+            let mut result = profile_to_json(&name, &profile);
+            result["path"] = json!(path.display().to_string());
+            // [1m] は Max / API プラン限定 → 明示 opt-in は許容しつつ警告を返す
+            // （inherit で master と同一モデルの場合は master 分のみ警告）
+            let warnings: Vec<String> = [
+                profile
+                    .model
+                    .as_deref()
+                    .and_then(|m| orchestrator::one_m_model_warning(m, "master")),
+                profile
+                    .resolve_worker_model()
+                    .filter(|m| Some(*m) != profile.model.as_deref())
+                    .and_then(|m| orchestrator::one_m_model_warning(m, "worker")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if !warnings.is_empty() {
+                result["warnings"] = json!(warnings);
+            }
+            Ok(result)
+        }
+        other => Err(DispatchError::InvalidParams(format!(
+            "action が不正: {other}（list / show / set）"
+        ))),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_orchestrator_spawn(
     host: &mut dyn ControlHost,
@@ -1542,18 +1677,15 @@ fn dispatch_orchestrator_spawn(
         .resolve_cwd(project)
         .map_err(DispatchError::Operation)?;
 
-    // model/effort が明示指定されていない場合、呼び出し元 master のプロファイルから解決する
+    // model/effort が明示指定されていない場合、呼び出し元 master のプロファイルから解決する。
+    // model が None に解決された場合は --model を付けず claude CLI の既定に委ねる（Issue #27）
     let caller_pane = pane.map(PaneId::from_raw);
     let profile = resolve_caller_profile(host.workspace(), caller_pane);
-    let resolved_model;
-    let resolved_effort;
-    let model = match model {
-        Some(m) => m,
-        None => {
-            resolved_model = profile.resolve_worker_model().to_string();
-            &resolved_model
-        }
+    let model: Option<String> = match model {
+        Some(m) => Some(m.to_string()),
+        None => profile.resolve_worker_model().map(str::to_string),
     };
+    let resolved_effort;
     let effort = match effort {
         Some(e) => e,
         None => {
@@ -1651,10 +1783,7 @@ fn dispatch_orchestrator_spawn(
         Some(l) => format!("worker:{project}:{l}"),
         None => format!("worker:{project}"),
     };
-    let claude_cmd = format!(
-        "TAKO_ORCHESTRATOR_ROLE='{}' claude --model '{}' --effort {}",
-        role_value, model, effort
-    );
+    let claude_cmd = orchestrator::build_worker_claude_cmd(&role_value, model.as_deref(), effort);
 
     // attach_session は非同期（pending_attach）なのでセッションはまだ存在しない。
     // queue_write で遅延書き込みを登録し、セッション起動後に自動送信する
@@ -2292,6 +2421,9 @@ fn resolve_caller_profile(
     workspace: &tako_core::Workspace,
     caller: Option<PaneId>,
 ) -> crate::orchestrator::Profile {
+    // master が旧バージョンのまま再起動されていない場合でも spawn 経路で
+    // 旧既定値 [1m] を引き継がないよう、読み込み前にマイグレーションする（Issue #27）
+    let _ = crate::orchestrator::migrate_legacy_default_profile();
     let suffix = caller
         .and_then(|pid| find_master_suffix_from(workspace, pid))
         .unwrap_or_default();

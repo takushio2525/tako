@@ -225,3 +225,13 @@
 - 関連コミット: `d66a7e7` `4496109` `4b94e68` `f3edb4b` `3e1c296` `61c0fe9`
 - 検証: build / clippy(-D warnings) / fmt / test 全緑 + 実デーモンで HTTP/WS e2e（401/101/差分プッシュ/resize 実寸/close 消滅）
 - 次: フェーズ B（フロント刷新）は別 worker。引き継ぎは activeContext.md 参照
+
+## 2026-07-02（Issue #27 ホットフィックス: 既定プロファイル [1m] ハードコード廃止 → v0.2.4）
+- 既定プロファイルを model 無指定（claude CLI 既定）化。旧既定値 `claude-opus-4-6[1m]` は
+  起動時（master / setup / spawn）に自動マイグレーション（backup-1m 付き）、明示 opt-in は警告のみ。
+  config.yaml の死に設定 master_model/worker_model/effort を廃止し profiles/*.yaml に一本化
+  （setup アシスタントの「Pro に 1M 推奨」誤りと書き先も修正）。
+  `tako orchestrator profiles list/show/set` + MCP `tako_orchestrator_profiles`（計 49 ツール）新設
+- 検証: build / clippy(-D warnings) / fmt / test 全緑 + スクラッチ HOME で実バイナリの
+  マイグレーション・profiles CLI e2e（セルフテストは別 worker と競合するため未実施、ツール数のみ更新）
+- 次: squash merge → v0.2.4 リリース（release.sh --publish + homebrew-tako cask 更新）

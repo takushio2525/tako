@@ -361,6 +361,26 @@ pub enum Request {
         cwd: Option<String>,
         description: Option<String>,
     },
+    /// オーケストレーター: プロファイル管理（list / show / set）。
+    /// model 未指定のプロファイルは claude CLI の既定モデルで起動する（Issue #27）。
+    /// set は model / worker_model / effort / worker_effort の更新と、
+    /// clear_model / clear_worker_model による解除（claude 既定へ戻す）に対応
+    OrchestratorProfiles {
+        action: String,
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_effort: Option<String>,
+        #[serde(default)]
+        clear_model: bool,
+        #[serde(default)]
+        clear_worker_model: bool,
+    },
     /// オーケストレーター: worker の spawn（split + claude 起動 + プロンプト送信）
     OrchestratorSpawn {
         project: String,
