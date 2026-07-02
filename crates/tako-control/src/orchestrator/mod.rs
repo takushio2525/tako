@@ -140,6 +140,32 @@ pub fn profiles_dir() -> Option<PathBuf> {
     config_dir().map(|d| d.join("profiles"))
 }
 
+/// 子 worker のモデル決定ポリシー
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerModelPolicy {
+    /// master 自身の model/effort を子にも使う
+    #[default]
+    Inherit,
+    /// worker_model / worker_effort で指定した値に全子統一
+    Fixed,
+    /// master がタスク内容を見て子ごとに model/effort を判断
+    Delegate,
+}
+
+/// system prompt のブロック単位制御
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PromptBlocks {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disable: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub append: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub override_blocks: std::collections::BTreeMap<String, String>,
+}
+
 /// プロファイル設定
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
@@ -147,8 +173,20 @@ pub struct Profile {
     pub model: String,
     #[serde(default = "default_profile_effort")]
     pub effort: String,
+
+    #[serde(default)]
+    pub worker_model_policy: WorkerModelPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegate_guidance: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_blocks: Option<PromptBlocks>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projects: Option<Vec<String>>,
 }
@@ -165,13 +203,34 @@ impl Default for Profile {
         Self {
             model: default_profile_model(),
             effort: default_profile_effort(),
+            worker_model_policy: WorkerModelPolicy::default(),
+            worker_model: None,
+            worker_effort: None,
+            delegate_guidance: None,
             system_prompt: None,
+            prompt_blocks: None,
             projects: None,
         }
     }
 }
 
 impl Profile {
+    /// worker_model_policy に従って子 worker の既定 model を解決する
+    pub fn resolve_worker_model(&self) -> &str {
+        match self.worker_model_policy {
+            WorkerModelPolicy::Inherit | WorkerModelPolicy::Delegate => &self.model,
+            WorkerModelPolicy::Fixed => self.worker_model.as_deref().unwrap_or(&self.model),
+        }
+    }
+
+    /// worker_model_policy に従って子 worker の既定 effort を解決する
+    pub fn resolve_worker_effort(&self) -> &str {
+        match self.worker_model_policy {
+            WorkerModelPolicy::Inherit | WorkerModelPolicy::Delegate => &self.effort,
+            WorkerModelPolicy::Fixed => self.worker_effort.as_deref().unwrap_or(&self.effort),
+        }
+    }
+
     /// プロファイルを YAML ファイルから読み込む
     pub fn load(name: &str) -> Result<Self, String> {
         let path = profile_path(name)?;
@@ -363,7 +422,12 @@ mod tests {
         let p = Profile::default();
         assert_eq!(p.model, "claude-opus-4-6[1m]");
         assert_eq!(p.effort, "max");
+        assert_eq!(p.worker_model_policy, WorkerModelPolicy::Inherit);
+        assert!(p.worker_model.is_none());
+        assert!(p.worker_effort.is_none());
+        assert!(p.delegate_guidance.is_none());
         assert!(p.system_prompt.is_none());
+        assert!(p.prompt_blocks.is_none());
         assert!(p.projects.is_none());
     }
 
@@ -374,6 +438,7 @@ mod tests {
             effort: "high".into(),
             system_prompt: Some("~/my-prompt.md".into()),
             projects: Some(vec!["tako".into(), "demo".into()]),
+            ..Default::default()
         };
         let yaml = serde_yaml::to_string(&p).unwrap();
         let back: Profile = serde_yaml::from_str(&yaml).unwrap();
@@ -388,6 +453,7 @@ mod tests {
         let yaml = "model: claude-opus-4-6[1m]\n";
         let p: Profile = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(p.effort, "max");
+        assert_eq!(p.worker_model_policy, WorkerModelPolicy::Inherit);
         assert!(p.projects.is_none());
     }
 
@@ -401,8 +467,8 @@ mod tests {
         let p = Profile {
             model: "test-model".into(),
             effort: "low".into(),
-            system_prompt: None,
             projects: Some(vec!["a".into()]),
+            ..Default::default()
         };
         let yaml = serde_yaml::to_string(&p).unwrap();
         std::fs::write(&path, &yaml).unwrap();
@@ -411,5 +477,88 @@ mod tests {
         assert_eq!(loaded.model, "test-model");
         assert_eq!(loaded.projects.as_ref().unwrap(), &["a"]);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn worker_model_policy_inherit() {
+        let p = Profile {
+            model: "claude-fable-5".into(),
+            effort: "high".into(),
+            ..Default::default()
+        };
+        assert_eq!(p.resolve_worker_model(), "claude-fable-5");
+        assert_eq!(p.resolve_worker_effort(), "high");
+    }
+
+    #[test]
+    fn worker_model_policy_fixed() {
+        let p = Profile {
+            model: "claude-opus-4-6[1m]".into(),
+            effort: "max".into(),
+            worker_model_policy: WorkerModelPolicy::Fixed,
+            worker_model: Some("claude-sonnet-5".into()),
+            worker_effort: Some("medium".into()),
+            ..Default::default()
+        };
+        assert_eq!(p.resolve_worker_model(), "claude-sonnet-5");
+        assert_eq!(p.resolve_worker_effort(), "medium");
+    }
+
+    #[test]
+    fn worker_model_policy_fixed_fallback() {
+        let p = Profile {
+            model: "claude-opus-4-6[1m]".into(),
+            effort: "max".into(),
+            worker_model_policy: WorkerModelPolicy::Fixed,
+            ..Default::default()
+        };
+        assert_eq!(p.resolve_worker_model(), "claude-opus-4-6[1m]");
+        assert_eq!(p.resolve_worker_effort(), "max");
+    }
+
+    #[test]
+    fn worker_model_policy_delegate() {
+        let p = Profile {
+            model: "claude-fable-5".into(),
+            effort: "high".into(),
+            worker_model_policy: WorkerModelPolicy::Delegate,
+            delegate_guidance: Some("タスクの複雑さで判断".into()),
+            ..Default::default()
+        };
+        assert_eq!(p.resolve_worker_model(), "claude-fable-5");
+        assert_eq!(p.resolve_worker_effort(), "high");
+    }
+
+    #[test]
+    fn worker_model_policy_deserialize() {
+        let yaml = "model: claude-fable-5\neffort: high\nworker_model_policy: fixed\nworker_model: claude-sonnet-5\n";
+        let p: Profile = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.worker_model_policy, WorkerModelPolicy::Fixed);
+        assert_eq!(p.worker_model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(p.resolve_worker_model(), "claude-sonnet-5");
+    }
+
+    #[test]
+    fn prompt_blocks_deserialize() {
+        let yaml = r##"
+model: claude-fable-5
+effort: high
+prompt_blocks:
+  disable:
+    - no-investigate
+  prepend: "# Custom Header"
+  append: "# Custom Footer"
+  override_blocks:
+    behavior: "Custom behavior text"
+"##;
+        let p: Profile = serde_yaml::from_str(yaml).unwrap();
+        let blocks = p.prompt_blocks.unwrap();
+        assert_eq!(blocks.disable, vec!["no-investigate"]);
+        assert_eq!(blocks.prepend.as_deref(), Some("# Custom Header"));
+        assert_eq!(blocks.append.as_deref(), Some("# Custom Footer"));
+        assert_eq!(
+            blocks.override_blocks.get("behavior").map(|s| s.as_str()),
+            Some("Custom behavior text")
+        );
     }
 }

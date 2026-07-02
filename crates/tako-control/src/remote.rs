@@ -823,7 +823,7 @@ fn check_auth(request: &tiny_http::Request, token: &str) -> bool {
 
 /// URL のクエリ文字列から指定キーの値を取り出す（`/path?ansi=1&lines=200` の類）
 fn query_param(url: &str, key: &str) -> Option<String> {
-    let qs = url.splitn(2, '?').nth(1)?;
+    let qs = url.split_once('?')?.1;
     for pair in qs.split('&') {
         let mut it = pair.splitn(2, '=');
         if it.next() == Some(key) {
