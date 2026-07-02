@@ -7,10 +7,14 @@
 //! エンドポイント:
 //! - `GET  /api/health` — ヘルスチェック
 //! - `GET  /api/panes` — ペイン一覧（tmux list-sessions + list-panes）
-//! - `GET  /api/panes/:id/screen` — 画面内容（tmux capture-pane）
+//! - `GET  /api/panes/:id/screen` — 画面内容（tmux capture-pane。`?ansi=1` で色付き、
+//!   `?lines=N` で履歴 N 行込み。cursor / size も返す）
 //! - `POST /api/panes/:id/input` — テキスト送信（tmux send-keys）
+//! - `POST /api/panes/:id/close` — ペインを閉じる（tmux kill-pane）
+//! - `GET  /ws?pane=<id>` — WebSocket 画面プッシュ（250ms 差分検知。操作系は REST を使う）
 //!
 //! 認証: `Authorization: Bearer <token>` ヘッダ必須（/api/health 以外）。
+//! WS は Sec-WebSocket-Protocol の `token.<T>` で検証（ブラウザ WS API はヘッダ不可のため）。
 //! CORS: PWA からのアクセス用にワイルドカード許可。
 //!
 //! デーモン管理:
@@ -167,7 +171,12 @@ pub fn run_daemon(port: Option<u16>, no_tunnel: bool) -> io::Result<()> {
     while !shutdown.load(Ordering::Relaxed) {
         match server.recv_timeout(std::time::Duration::from_millis(200)) {
             Ok(Some(request)) => {
-                handle_request(request, &token, &tmux_socket);
+                let path = request.url().split('?').next().unwrap_or("");
+                if path == "/ws" && is_ws_upgrade(&request) {
+                    handle_ws(request, &token, &tmux_socket, shutdown.clone());
+                } else {
+                    handle_request(request, &token, &tmux_socket);
+                }
             }
             Ok(None) => {}
             Err(_) => break,
@@ -821,13 +830,160 @@ fn check_auth(request: &tiny_http::Request, token: &str) -> bool {
     header_value(request, "authorization").is_some_and(|v| v == format!("Bearer {token}"))
 }
 
+// --- WebSocket（画面プッシュ専用チャンネル） ---
+//
+// `GET /ws?pane=<id>` を WebSocket にアップグレードし、250ms 間隔の差分検知で
+// 画面内容（ANSI 付き + cursor + size）をサーバー側からプッシュする。
+// 操作系（input / close / resize）は既存 REST を使う設計（プッシュ専用の一方向）。
+// tiny_http の upgrade が返すソケットは read タイムアウトを設定できないため、
+// 接続後にクライアントからの受信を待つ設計にはできない（受信待ちでスレッドが
+// 永久ブロックする）。認証をハンドシェイクの HTTP ヘッダで完結させることで
+// 接続後の read を不要にしている。
+
+/// WS サブプロトコル名。ブラウザの WebSocket API は任意ヘッダを付けられないため、
+/// クライアントは `new WebSocket(url, ["tako-remote", "token.<TOKEN>"])` の
+/// サブプロトコル列でトークンを渡す（Sec-WebSocket-Protocol ヘッダに乗る）
+const WS_PROTOCOL: &str = "tako-remote";
+/// 画面差分のポーリング間隔
+const WS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+/// 無変化時のキープアライブ送信間隔（プロキシの idle 切断対策）
+const WS_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// リクエストが WebSocket アップグレードかどうか
+fn is_ws_upgrade(request: &tiny_http::Request) -> bool {
+    header_value(request, "upgrade").is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+}
+
+/// Sec-WebSocket-Protocol の値からトークンを取り出す（`token.<T>` エントリ）
+fn ws_token_from_protocols(protocols: &str) -> Option<String> {
+    protocols
+        .split(',')
+        .map(|p| p.trim())
+        .find_map(|p| p.strip_prefix("token.").map(|t| t.to_string()))
+}
+
+/// `GET /ws?pane=<id>` の WebSocket アップグレードを処理する。
+/// 認証はハンドシェイク時の Sec-WebSocket-Protocol（`token.<T>`）で検証し、
+/// 不一致なら 101 を返さない（= 認証なしでは WS 接続できない）
+fn handle_ws(
+    request: tiny_http::Request,
+    token: &str,
+    tmux_socket: &str,
+    shutdown: Arc<AtomicBool>,
+) {
+    let url_full = request.url().to_string();
+    let client_token =
+        header_value(&request, "sec-websocket-protocol").and_then(|v| ws_token_from_protocols(&v));
+    if client_token.as_deref() != Some(token) {
+        return respond(
+            request,
+            401,
+            Some(json!({ "error": "認証が必要" }).to_string()),
+        );
+    }
+    let Some(pane) = query_param(&url_full, "pane") else {
+        return respond(
+            request,
+            400,
+            Some(json!({ "error": "pane クエリが必要" }).to_string()),
+        );
+    };
+    let Some(ws_key) = header_value(&request, "sec-websocket-key") else {
+        return respond(
+            request,
+            400,
+            Some(json!({ "error": "Sec-WebSocket-Key ヘッダが無い" }).to_string()),
+        );
+    };
+
+    // 101 Switching Protocols（Upgrade / Connection ヘッダは tiny_http が付与する）
+    let accept = tungstenite::handshake::derive_accept_key(ws_key.as_bytes());
+    let response = tiny_http::Response::empty(101)
+        .with_header(
+            tiny_http::Header::from_bytes(&b"Sec-WebSocket-Accept"[..], accept.as_bytes())
+                .expect("固定ヘッダ"),
+        )
+        .with_header(
+            tiny_http::Header::from_bytes(&b"Sec-WebSocket-Protocol"[..], WS_PROTOCOL.as_bytes())
+                .expect("固定ヘッダ"),
+        );
+    let stream = request.upgrade("websocket", response);
+
+    let tmux_socket = tmux_socket.to_string();
+    let _ = std::thread::Builder::new()
+        .name("tako-remote-ws".into())
+        .spawn(move || ws_push_loop(stream, &pane, &tmux_socket, shutdown));
+}
+
+/// 画面プッシュループ。250ms 間隔で capture-pane（ANSI 付き）+ cursor/size を取得し、
+/// 内容が変わったときだけ `{"type":"screen",...}` を送る。無変化でも WS_KEEPALIVE ごとに
+/// `{"type":"keepalive"}` を送って接続を維持する。送信失敗（クライアント切断）で終了
+fn ws_push_loop(
+    stream: Box<dyn tiny_http::ReadWrite + Send>,
+    pane: &str,
+    tmux_socket: &str,
+    shutdown: Arc<AtomicBool>,
+) {
+    use std::hash::{Hash, Hasher};
+    use tungstenite::protocol::{Role, WebSocket};
+
+    let mut ws = WebSocket::from_raw_socket(stream, Role::Server, None);
+    let target = format!("={pane}");
+    let mut prev_hash: u64 = 0;
+    let mut last_sent = std::time::Instant::now();
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            let _ = ws.close(None);
+            break;
+        }
+        let payload = match tmux_capture_pane(tmux_socket, &target, true, None) {
+            Ok(lines) => {
+                let mut body = json!({ "type": "screen", "lines": lines });
+                if let Some((x, y, w, h)) = tmux_pane_geometry(tmux_socket, &target) {
+                    body["cursor"] = json!({ "x": x, "y": y });
+                    body["size"] = json!({ "cols": w, "rows": h });
+                }
+                body.to_string()
+            }
+            Err(e) => {
+                // ペイン消滅など。エラーを伝えて切断する
+                let _ = ws.send(tungstenite::Message::text(
+                    json!({ "type": "error", "message": e }).to_string(),
+                ));
+                let _ = ws.close(None);
+                break;
+            }
+        };
+        let hash = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            payload.hash(&mut h);
+            h.finish()
+        };
+        if hash != prev_hash {
+            if ws.send(tungstenite::Message::text(payload)).is_err() {
+                break;
+            }
+            prev_hash = hash;
+            last_sent = std::time::Instant::now();
+        } else if last_sent.elapsed() >= WS_KEEPALIVE {
+            let keepalive = json!({ "type": "keepalive" }).to_string();
+            if ws.send(tungstenite::Message::text(keepalive)).is_err() {
+                break;
+            }
+            last_sent = std::time::Instant::now();
+        }
+        std::thread::sleep(WS_POLL_INTERVAL);
+    }
+}
+
 /// URL のクエリ文字列から指定キーの値を取り出す（`/path?ansi=1&lines=200` の類）
 fn query_param(url: &str, key: &str) -> Option<String> {
-    let qs = url.splitn(2, '?').nth(1)?;
+    let qs = url.split_once('?')?.1;
     for pair in qs.split('&') {
-        let mut it = pair.splitn(2, '=');
-        if it.next() == Some(key) {
-            return Some(urlencoding::decode(it.next().unwrap_or("")));
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if k == key {
+            return Some(urlencoding::decode(v));
         }
     }
     None
@@ -1086,6 +1242,22 @@ mod tests {
         );
         assert_eq!(extract_pane_target("/api/panes//input"), None);
         assert_eq!(extract_pane_target("/api/health"), None);
+    }
+
+    #[test]
+    fn ws_token_from_protocolsの抽出() {
+        assert_eq!(
+            ws_token_from_protocols("tako-remote, token.abc123"),
+            Some("abc123".to_string())
+        );
+        assert_eq!(
+            ws_token_from_protocols("token.xyz"),
+            Some("xyz".to_string())
+        );
+        assert_eq!(ws_token_from_protocols("tako-remote"), None);
+        assert_eq!(ws_token_from_protocols(""), None);
+        // token. 接頭辞のみ（空トークン）は Some("") となり、実トークンと一致しないため安全
+        assert_eq!(ws_token_from_protocols("token."), Some(String::new()));
     }
 
     #[test]
