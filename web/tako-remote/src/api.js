@@ -35,8 +35,11 @@ export function createClient(host, token) {
     panes() {
       return request('GET', '/api/panes');
     },
-    screen(id, lines) {
-      const qs = lines ? `?lines=${lines}` : '';
+    screen(id, lines, ansi = false) {
+      const params = [];
+      if (lines) params.push(`lines=${lines}`);
+      if (ansi) params.push('ansi=1');
+      const qs = params.length ? `?${params.join('&')}` : '';
       return request('GET', `/api/panes/${encodeURIComponent(id)}/screen${qs}`);
     },
     input(id, text, newline = true) {

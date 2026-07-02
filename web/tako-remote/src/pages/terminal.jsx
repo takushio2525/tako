@@ -111,7 +111,7 @@ export function TerminalPage({ paneId }) {
     if (!clientRef.current) return;
     try {
       const [screen, panesList] = await Promise.all([
-        clientRef.current.screen(paneId, 200),
+        clientRef.current.screen(paneId, null, true),
         clientRef.current.panes(),
       ]);
       const lines = screen.lines || [];
@@ -119,8 +119,12 @@ export function TerminalPage({ paneId }) {
       if (content !== prevContentRef.current && termRef.current) {
         prevContentRef.current = content;
         let buf = '\x1b[H';
-        for (const line of lines) { buf += '\x1b[2K' + line + '\r\n'; }
+        // 行末に SGR リセットを付け、ANSI 色が次行へ漏れないようにする
+        for (const line of lines) { buf += '\x1b[2K' + line + '\x1b[0m\r\n'; }
         buf += '\x1b[J';
+        if (screen.cursor) {
+          buf += `\x1b[${screen.cursor.y + 1};${screen.cursor.x + 1}H`;
+        }
         termRef.current.write(buf);
       }
       const list = panesList.panes || [];
