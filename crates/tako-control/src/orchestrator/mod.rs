@@ -272,6 +272,161 @@ impl Profile {
         }
         resolve_system_prompt_path()
     }
+
+    /// プロファイル設定に基づいて system prompt テキストを合成する。
+    /// system_prompt フィールドが指定されている場合はそのファイルの内容をそのまま返す。
+    /// そうでなければ DEFAULT_SYSTEM_PROMPT をブロック分割し、prompt_blocks と
+    /// worker_model_policy に基づいて合成する。
+    pub fn build_system_prompt(&self) -> String {
+        // system_prompt フィールドが指定されていればファイルを丸ごと返す（既存互換）
+        if let Some(ref custom) = self.system_prompt {
+            let expanded = expand_tilde(custom);
+            let p = std::path::PathBuf::from(&expanded);
+            if p.is_file() {
+                if let Ok(content) = std::fs::read_to_string(&p) {
+                    return content;
+                }
+            }
+        }
+        // カスタム master-system.md があればそれを使う（ブロック制御はスキップ）
+        if let Some(custom_path) = resolve_system_prompt_path() {
+            if let Ok(content) = std::fs::read_to_string(&custom_path) {
+                return content;
+            }
+        }
+
+        self.build_from_template(DEFAULT_SYSTEM_PROMPT)
+    }
+
+    /// テンプレートテキストからブロック制御・model-policy 注入を行って合成する
+    pub fn build_from_template(&self, template: &str) -> String {
+        let blocks = parse_prompt_blocks(template);
+        let pb = self.prompt_blocks.as_ref();
+
+        let mut result = String::new();
+
+        if let Some(text) = pb.and_then(|b| b.prepend.as_ref()) {
+            result.push_str(&resolve_text_or_file(text));
+            result.push_str("\n\n");
+        }
+
+        for (name, content) in &blocks {
+            if let Some(b) = pb {
+                if b.disable.iter().any(|d| d == name) {
+                    continue;
+                }
+            }
+
+            if name == "model-policy" {
+                result.push_str(&self.generate_model_policy_section());
+                result.push('\n');
+                continue;
+            }
+
+            if let Some(override_text) = pb.and_then(|b| b.override_blocks.get(name.as_str())) {
+                result.push_str(&resolve_text_or_file(override_text));
+                result.push('\n');
+                continue;
+            }
+
+            result.push_str(content);
+            result.push('\n');
+        }
+
+        if let Some(text) = pb.and_then(|b| b.append.as_ref()) {
+            result.push_str(&resolve_text_or_file(text));
+            result.push('\n');
+        }
+
+        result.trim_end().to_string()
+    }
+
+    /// worker_model_policy に基づいて model-policy セクションのテキストを生成する
+    fn generate_model_policy_section(&self) -> String {
+        match self.worker_model_policy {
+            WorkerModelPolicy::Inherit => {
+                format!(
+                    "## Worker Model Policy\n\n\
+                     All workers use the same model and effort as this master session:\n\
+                     - **Model**: {}\n\
+                     - **Effort**: {}\n\n\
+                     When calling `tako_orchestrator_spawn` or `tako_orchestrator_run`, do NOT specify\n\
+                     `model` or `effort` — the defaults already match this session's configuration.",
+                    self.model, self.effort
+                )
+            }
+            WorkerModelPolicy::Fixed => {
+                format!(
+                    "## Worker Model Policy\n\n\
+                     All workers use a fixed model/effort configuration:\n\
+                     - **Model**: {}\n\
+                     - **Effort**: {}\n\n\
+                     When calling `tako_orchestrator_spawn` or `tako_orchestrator_run`, do NOT specify\n\
+                     `model` or `effort` unless the user explicitly requests a different model for a\n\
+                     specific task.",
+                    self.resolve_worker_model(),
+                    self.resolve_worker_effort()
+                )
+            }
+            WorkerModelPolicy::Delegate => {
+                let guidance = self
+                    .delegate_guidance
+                    .as_ref()
+                    .map(|g| resolve_text_or_file(g))
+                    .unwrap_or_else(|| "タスクの複雑さに応じて判断してください。".to_string());
+                format!(
+                    "## Worker Model Policy\n\n\
+                     You decide the model and effort for each worker based on the task content.\n\
+                     **Always** specify `model` and `effort` explicitly in `tako_orchestrator_spawn`\n\
+                     and `tako_orchestrator_run` calls.\n\n\
+                     If you cannot determine the appropriate model, use the default:\n\
+                     - **Default Model**: {}\n\
+                     - **Default Effort**: {}\n\n\
+                     ### Delegation Guidance\n\n\
+                     {guidance}",
+                    self.model, self.effort
+                )
+            }
+        }
+    }
+}
+
+/// `<!-- block: name -->` マーカーで区切られたブロックをパースする
+fn parse_prompt_blocks(text: &str) -> Vec<(String, String)> {
+    let mut blocks = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut current_content = String::new();
+
+    for line in text.lines() {
+        if let Some(name) = line
+            .trim()
+            .strip_prefix("<!-- block: ")
+            .and_then(|s| s.strip_suffix(" -->"))
+        {
+            if let Some(prev_name) = current_name.take() {
+                blocks.push((prev_name, current_content.trim_end().to_string()));
+            }
+            current_name = Some(name.to_string());
+            current_content = String::new();
+        } else {
+            current_content.push_str(line);
+            current_content.push('\n');
+        }
+    }
+    if let Some(name) = current_name {
+        blocks.push((name, current_content.trim_end().to_string()));
+    }
+    blocks
+}
+
+/// テキストが `~/` で始まる場合はファイルとして読み込み、それ以外はそのまま返す
+fn resolve_text_or_file(text: &str) -> String {
+    if text.starts_with("~/") {
+        let expanded = expand_tilde(text);
+        std::fs::read_to_string(&expanded).unwrap_or_else(|_| text.to_string())
+    } else {
+        text.to_string()
+    }
 }
 
 /// プロファイルのファイルパスを返す
@@ -560,5 +715,112 @@ prompt_blocks:
             blocks.override_blocks.get("behavior").map(|s| s.as_str()),
             Some("Custom behavior text")
         );
+    }
+
+    #[test]
+    fn parse_prompt_blocks_basic() {
+        let text = "<!-- block: a -->\nline1\nline2\n<!-- block: b -->\nline3\n";
+        let blocks = parse_prompt_blocks(text);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, "a");
+        assert!(blocks[0].1.contains("line1"));
+        assert_eq!(blocks[1].0, "b");
+        assert!(blocks[1].1.contains("line3"));
+    }
+
+    #[test]
+    fn build_system_prompt_default() {
+        let p = Profile::default();
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT);
+        assert!(prompt.contains("Master Orchestrator Agent"));
+        assert!(prompt.contains("Worker Model Policy"));
+        assert!(prompt.contains("claude-opus-4-6[1m]"));
+    }
+
+    #[test]
+    fn build_system_prompt_inherit_model() {
+        let p = Profile {
+            model: "claude-fable-5".into(),
+            effort: "high".into(),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT);
+        assert!(prompt.contains("claude-fable-5"));
+        assert!(prompt.contains("high"));
+    }
+
+    #[test]
+    fn build_system_prompt_fixed_policy() {
+        let p = Profile {
+            model: "claude-opus-4-6[1m]".into(),
+            effort: "max".into(),
+            worker_model_policy: WorkerModelPolicy::Fixed,
+            worker_model: Some("claude-sonnet-5".into()),
+            worker_effort: Some("medium".into()),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT);
+        assert!(prompt.contains("claude-sonnet-5"));
+        assert!(prompt.contains("medium"));
+        assert!(prompt.contains("fixed model/effort"));
+    }
+
+    #[test]
+    fn build_system_prompt_delegate_policy() {
+        let p = Profile {
+            model: "claude-opus-4-6[1m]".into(),
+            effort: "max".into(),
+            worker_model_policy: WorkerModelPolicy::Delegate,
+            delegate_guidance: Some("複雑なタスクは Opus、単純なタスクは Sonnet".into()),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT);
+        assert!(prompt.contains("Delegation Guidance"));
+        assert!(prompt.contains("複雑なタスクは Opus"));
+    }
+
+    #[test]
+    fn build_system_prompt_disable_block() {
+        let p = Profile {
+            prompt_blocks: Some(PromptBlocks {
+                disable: vec!["no-investigate".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT);
+        assert!(!prompt.contains("The Master Does Not Investigate"));
+        assert!(prompt.contains("Master Orchestrator Agent"));
+    }
+
+    #[test]
+    fn build_system_prompt_override_block() {
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("behavior".into(), "Custom behavior rules here".into());
+        let p = Profile {
+            prompt_blocks: Some(PromptBlocks {
+                override_blocks: overrides,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT);
+        assert!(prompt.contains("Custom behavior rules here"));
+        assert!(!prompt.contains("Act on hypotheses"));
+    }
+
+    #[test]
+    fn build_system_prompt_prepend_append() {
+        let p = Profile {
+            prompt_blocks: Some(PromptBlocks {
+                prepend: Some("PREPEND_MARKER".into()),
+                append: Some("APPEND_MARKER".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT);
+        assert!(prompt.starts_with("PREPEND_MARKER"));
+        assert!(prompt.ends_with("APPEND_MARKER"));
     }
 }
