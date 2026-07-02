@@ -121,6 +121,7 @@ enum Command {
     /// 引数なしは default プロファイル。旧形式（tako master dev）も後方互換で動作する
     Master {
         /// プロファイル名（-2, -difficult 等）またはサフィックス（旧形式: dev 等）
+        #[arg(allow_hyphen_values = true)]
         profile: Option<String>,
     },
     /// オーケストレーター操作（projects / spawn / status / watch）
