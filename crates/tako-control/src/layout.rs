@@ -22,6 +22,28 @@ use tako_core::{
 /// レイアウトファイルのフォーマットバージョン（互換のない変更で上げる）
 pub const LAYOUT_VERSION: u32 = 1;
 
+/// 読み込み・復元の失敗理由（Issue #30: 黙って空のワークスペースに
+/// フォールバックせず、理由をログ・`tako persist` の診断に出すための型）
+#[derive(Debug, PartialEq, thiserror::Error)]
+pub enum LayoutError {
+    #[error("レイアウトファイルが無い（初回起動または明示クローズ・OFF 切替後）")]
+    NotFound,
+    #[error("レイアウトファイルを読めない: {0}")]
+    Io(String),
+    #[error("レイアウトファイルを解釈できない（破損）: {0}")]
+    Parse(String),
+    #[error("フォーマットバージョン不一致（ファイル={0}, 対応={LAYOUT_VERSION}）")]
+    Version(u32),
+    #[error("タブが空")]
+    Empty,
+    #[error("ペイン / タブ ID が重複している（破損・継ぎ接ぎされたファイル）")]
+    DuplicateId,
+    #[error("分割軸が不正")]
+    InvalidAxis,
+    #[error("ワークスペースを再構成できない")]
+    Workspace,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LayoutFile {
     pub version: u32,
@@ -216,24 +238,28 @@ fn capture_node(node: &PaneNode, meta: &dyn Fn(PaneId) -> PaneMeta) -> NodeLayou
 }
 
 /// レイアウトから Workspace を復元する。ID はそのまま再現される（採番カウンタは
-/// tako-core 側で先へ進む）。バージョン不一致・空・ID 重複・不正値は None
-pub fn restore(file: &LayoutFile) -> Option<(Workspace, Vec<RestoredPane>)> {
-    if file.version != LAYOUT_VERSION || file.tabs.is_empty() {
-        return None;
+/// tako-core 側で先へ進む）。バージョン不一致・空・ID 重複・不正値は理由付きで拒否し、
+/// 呼び出し側が新規ワークスペースへフォールバック + 理由をログに残す
+pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), LayoutError> {
+    if file.version != LAYOUT_VERSION {
+        return Err(LayoutError::Version(file.version));
+    }
+    if file.tabs.is_empty() {
+        return Err(LayoutError::Empty);
     }
     // ID 重複（壊れた・継ぎ接ぎされたファイル）の拒否
     let mut pane_ids = HashSet::new();
     let mut tab_ids = HashSet::new();
     for tab in &file.tabs {
         if !tab_ids.insert(tab.id) {
-            return None;
+            return Err(LayoutError::DuplicateId);
         }
         let mut stack = vec![&tab.tree];
         while let Some(node) = stack.pop() {
             match node {
                 NodeLayout::Pane(p) => {
                     if !pane_ids.insert(p.id) {
-                        return None;
+                        return Err(LayoutError::DuplicateId);
                     }
                 }
                 NodeLayout::Split { first, second, .. } => {
@@ -248,7 +274,8 @@ pub fn restore(file: &LayoutFile) -> Option<(Workspace, Vec<RestoredPane>)> {
     let mut tabs = Vec::new();
     let mut active = None;
     for tab_layout in &file.tabs {
-        let (root, focused) = restore_node(&tab_layout.tree, tab_layout.focused, &mut restored)?;
+        let (root, focused) = restore_node(&tab_layout.tree, tab_layout.focused, &mut restored)
+            .ok_or(LayoutError::InvalidAxis)?;
         let tree = PaneTree::from_root(root, focused);
         let tab = Tab::restore(
             tab_layout.id,
@@ -272,7 +299,7 @@ pub fn restore(file: &LayoutFile) -> Option<(Workspace, Vec<RestoredPane>)> {
     let mut bg_panes = Vec::new();
     for p in &file.backgrounded {
         if !pane_ids.insert(p.id) {
-            return None;
+            return Err(LayoutError::DuplicateId);
         }
         let pane = Pane::restore(
             p.id,
@@ -296,8 +323,9 @@ pub fn restore(file: &LayoutFile) -> Option<(Workspace, Vec<RestoredPane>)> {
     }
 
     let active = active.unwrap_or(tabs[0].id());
-    let ws = Workspace::restore_with_shelved(tabs, active, bg_panes)?;
-    Some((ws, restored))
+    let ws =
+        Workspace::restore_with_shelved(tabs, active, bg_panes).ok_or(LayoutError::Workspace)?;
+    Ok((ws, restored))
 }
 
 /// ノードを PaneNode へ写す。戻りの PaneId は「focused 指定に一致した葉」（無ければ先頭葉）
@@ -395,14 +423,29 @@ pub fn layout_path() -> Option<PathBuf> {
     tako_core::paths::data_dir().map(|d| d.join("layout.json"))
 }
 
-/// 読み込み。不在・破損は None（呼び出し側で新規作成へフォールバック）
+/// 読み込み。不在・破損は None（理由が要らない呼び出し向け。窓ジオメトリ復元等）
 pub fn load() -> Option<LayoutFile> {
-    load_from(&layout_path()?)
+    try_load().ok()
 }
 
-fn load_from(path: &Path) -> Option<LayoutFile> {
-    let json = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&json).ok()
+/// 読み込み（理由付き）。不在と破損を区別できるので、起動時の復元は
+/// こちらを使って失敗理由をログに残す（Issue #30）
+pub fn try_load() -> Result<LayoutFile, LayoutError> {
+    let path = layout_path().ok_or_else(|| {
+        LayoutError::Io("データディレクトリを解決できない（HOME 未設定等）".into())
+    })?;
+    load_from(&path)
+}
+
+fn load_from(path: &Path) -> Result<LayoutFile, LayoutError> {
+    let json = std::fs::read_to_string(path).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            LayoutError::NotFound
+        } else {
+            LayoutError::Io(e.to_string())
+        }
+    })?;
+    serde_json::from_str(&json).map_err(|e| LayoutError::Parse(e.to_string()))
 }
 
 /// 書き出し（tmp + rename。settings と同方式）
@@ -580,22 +623,25 @@ mod tests {
     }
 
     #[test]
-    fn 壊れたレイアウトは拒否して新規作成へ倒す() {
+    fn 壊れたレイアウトは理由付きで拒否して新規作成へ倒す() {
         // 空タブ
-        assert!(restore(&LayoutFile {
-            version: LAYOUT_VERSION,
-            active_tab: 1,
-            tabs: vec![],
-            window: None,
-            backgrounded: vec![],
-            collapsed: vec![],
-        })
-        .is_none());
+        assert_eq!(
+            restore(&LayoutFile {
+                version: LAYOUT_VERSION,
+                active_tab: 1,
+                tabs: vec![],
+                window: None,
+                backgrounded: vec![],
+                collapsed: vec![],
+            })
+            .err(),
+            Some(LayoutError::Empty)
+        );
         // バージョン不一致
         let ws = sample_workspace();
         let mut layout = capture(&ws, &|_| PaneMeta::default(), None);
         layout.version = 99;
-        assert!(restore(&layout).is_none());
+        assert_eq!(restore(&layout).err(), Some(LayoutError::Version(99)));
         // ペイン ID 重複
         let mut layout = capture(&ws, &|_| PaneMeta::default(), None);
         layout.version = LAYOUT_VERSION;
@@ -604,7 +650,7 @@ mod tests {
             id: dup.id + 1000,
             ..dup
         });
-        assert!(restore(&layout).is_none());
+        assert_eq!(restore(&layout).err(), Some(LayoutError::DuplicateId));
     }
 
     #[test]
@@ -615,7 +661,25 @@ mod tests {
         let ws = sample_workspace();
         let layout = capture(&ws, &|_| PaneMeta::default(), None);
         save_to(&path, &layout).unwrap();
-        assert_eq!(load_from(&path), Some(layout));
+        assert_eq!(load_from(&path), Ok(layout));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 読み込み失敗は不在と破損を区別する() {
+        // Issue #30: 復元が黙って空になる原因を診断できるよう、理由を型で返す
+        let dir = std::env::temp_dir().join(format!("tako-layout-err-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("layout.json");
+        // 不在 = NotFound（初回起動。異常ではない）
+        assert_eq!(load_from(&path).err(), Some(LayoutError::NotFound));
+        // 破損 = Parse（理由文字列付き）
+        std::fs::write(&path, "{ こわれた json").unwrap();
+        assert!(matches!(
+            load_from(&path).err(),
+            Some(LayoutError::Parse(_))
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

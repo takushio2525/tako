@@ -54,6 +54,11 @@ pub trait ControlHost {
     }
     /// tmux バックエンド永続化の ON/OFF 切替（永続化は実装側の責務。以後のペインに効く）
     fn set_tmux_persist(&mut self, _enabled: bool) {}
+    /// 起動時のレイアウト復元結果（人間可読の 1 行。Issue #30 の診断用）。
+    /// 復元を試みていない実装（テストホスト等）では None
+    fn persist_restore_report(&self) -> Option<String> {
+        None
+    }
     /// ペインを保持している tmux バックエンドセッション名（tmuxview の区別表示用。
     /// バックエンドでないペイン・非対応実装では None）
     fn backend_session(&self, _pane: PaneId) -> Option<String> {
@@ -885,8 +890,18 @@ pub fn dispatch(
             }
             Ok(json!({
                 "enabled": host.tmux_persist_enabled(),
-                // tmux 不在環境では enabled でも直接 spawn へ劣化していることを示す
+                // tmux 不在環境では PTY が直接 spawn へ劣化していることを示す
+                // （その場合もタブ構成の保存・復元は機能する。復元は新シェル）
                 "available": tako_core::tmux_backend::available(),
+                // 診断（Issue #30）: 保存先の実パスと存在有無・起動時の復元結果・ログ
+                "layout_path": crate::layout::layout_path()
+                    .map(|p| p.display().to_string()),
+                "layout_exists": crate::layout::layout_path()
+                    .map(|p| p.is_file())
+                    .unwrap_or(false),
+                "last_restore": host.persist_restore_report(),
+                "log_path": crate::diag::persist_log_path()
+                    .map(|p| p.display().to_string()),
             }))
         }
 
@@ -2129,8 +2144,9 @@ fn check_health(host: &dyn ControlHost) -> Value {
         issues.push(json!({
             "level": "warning",
             "check": "tmux",
-            "message": "tmux がインストールされていない。セッション永続化（tako 再起動時の復元）が\
-                使えない。brew install tmux でインストール可能",
+            "message": "tmux がインストールされていない。タブ構成の保存・復元は機能するが、\
+                実行中プロセス・画面内容の復元（完全復元）は使えない。\
+                brew install tmux でインストール可能",
         }));
     }
 
