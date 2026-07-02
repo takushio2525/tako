@@ -6600,15 +6600,24 @@ mod self_test {
                 "TAKO_SOCKET / TAKO_TOKEN 注入",
             );
 
-            // 17. tako list がペイン内シェルから成功する（FR-2.2.4 / FR-2.2.7）
+            // 17. tako list がペイン内シェルから成功する（FR-2.2.4 / FR-2.2.7）。
+            //     高負荷環境では debug ビルドの CLI 起動 + IPC 往復が 1 秒を超えることが
+            //     あるため、リトライループで待つ（フレーキー対策）
             type_text(
                 any,
                 cx,
                 &format!("{cli} list >/dev/null && echo TAKO-LIST-$((40+2))"),
                 true,
             );
-            wait(cx, 1000).await;
-            check(focused_contains(window, cx, "TAKO-LIST-42"), "tako list");
+            let mut list_ok = false;
+            for _ in 0..8 {
+                wait(cx, 800).await;
+                list_ok = focused_contains(window, cx, "TAKO-LIST-42");
+                if list_ok {
+                    break;
+                }
+            }
+            check(list_ok, "tako list");
 
             // 18. tako split --down --focus（呼び出し元の自動特定 + origin=cli + フォーカス移動）。
             // 既定はフォーカスを分割元に維持する仕様（3c9d363）のため、--focus を明示して
@@ -7060,7 +7069,8 @@ mod self_test {
             let reg_pane_a = window
                 .update(cx, |app, _, _| app.workspace.active_tab().tree().focused())
                 .unwrap_or_else(|_| fail("回帰 40: タブ作成後の状態取得"));
-            type_text(any, cx, &format!("{cli} split --right"), true);
+            // 既定はフォーカス維持の仕様（3c9d363）のため --focus で新ペインへ移す
+            type_text(any, cx, &format!("{cli} split --right --focus"), true);
             wait(cx, 1500).await;
             let reg_pane_b = window
                 .update(cx, |app, _, _| app.workspace.active_tab().tree().focused())
@@ -7104,10 +7114,22 @@ mod self_test {
                 })
                 .unwrap_or(false);
             check(stress_stable, "ストレス後もツリーが安定");
-            let fd_after = std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0);
+            // close 後の PTY / プロセス破棄は非同期のため、高負荷環境では回収が
+            // 遅延する。fd 数が落ち着くまでリトライして待つ（真のリークなら待っても
+            // 減らないので検査の意味は変わらない）
+            let mut fd_ok = false;
+            let mut fd_after = 0;
+            for _ in 0..10 {
+                fd_after = std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0);
+                if fd_after <= fd_before + 8 {
+                    fd_ok = true;
+                    break;
+                }
+                wait(cx, 800).await;
+            }
             check(
-                fd_after <= fd_before + 8,
-                "split/close で fd が漏れない",
+                fd_ok,
+                &format!("split/close で fd が漏れない（before={fd_before}, after={fd_after}）"),
             );
 
             // 片付け（最後の 1 ペイン close = タブごと閉じる経路も通す）
@@ -7177,8 +7199,9 @@ mod self_test {
                 .unwrap_or(false);
             check(list_exposes, "list が state / exit_code / cwd を公開");
 
-            // 41b. split が分割元の cwd を継承する（OSC 7 連携。FR-2.4.1）
-            type_text(any, cx, &format!("{cli} split --right"), true);
+            // 41b. split が分割元の cwd を継承する（OSC 7 連携。FR-2.4.1）。
+            //     --focus で新ペインへ移り、新ペイン側の cwd 継承を検証する（3c9d363 追従）
+            type_text(any, cx, &format!("{cli} split --right --focus"), true);
             wait(cx, 2000).await;
             let inherited = window
                 .update(cx, |app, _, _| {
@@ -7408,8 +7431,14 @@ mod self_test {
             // 47. ペインの × ボタン = kill（dispatch 共有経路）。split で増やして × 相当の
             //     操作でアクティブタブから片付き、ターミナル（プロセス）も破棄され、バックグラウンドにも
             //     残らないこと。タブの × と挙動を統一し、紐づく tmux セッションも
-            //     remove_pane が kill するため管理外 / orphan に残らない
-            type_text(any, cx, &format!("{cli} split --right >/dev/null"), true);
+            //     remove_pane が kill するため管理外 / orphan に残らない。
+            //     --focus で新ペインを対象にする（3c9d363 追従。分割元の誤 kill 防止）
+            type_text(
+                any,
+                cx,
+                &format!("{cli} split --right --focus >/dev/null"),
+                true,
+            );
             wait(cx, 1500).await;
             let close_button_ok = window
                 .update(cx, |app, _, cx| {
@@ -7427,8 +7456,14 @@ mod self_test {
             check(close_button_ok, "ペインの × ボタンで kill（dispatch 経由）");
 
             // 47b. ペインの ー ボタン = バックグラウンドへバックグラウンド（dispatch 共有経路）。プロセス
-            //      （ターミナル）は生かしたまま、ツリーから外れて shelved へ移ること（FR-2.15.1）
-            type_text(any, cx, &format!("{cli} split --right >/dev/null"), true);
+            //      （ターミナル）は生かしたまま、ツリーから外れて shelved へ移ること（FR-2.15.1）。
+            //      --focus で新ペインを対象にする（3c9d363 追従。分割元の誤退避防止）
+            type_text(
+                any,
+                cx,
+                &format!("{cli} split --right --focus >/dev/null"),
+                true,
+            );
             wait(cx, 1500).await;
             let shelve_button_ok = window
                 .update(cx, |app, _, cx| {
@@ -8215,7 +8250,7 @@ mod self_test {
             type_text(
                 any,
                 cx,
-                &format!("{cli} split --down -- sh -c 'echo TAKO-CMD-\"OK\"; sleep 15'"),
+                &format!("{cli} split --down --focus -- sh -c 'echo TAKO-CMD-\"OK\"; sleep 15'"),
                 true,
             );
             let mut cmd_ok = false;
