@@ -28,8 +28,9 @@ use serde_json::{json, Value};
 
 const DEFAULT_PORT: u16 = 7749;
 const MAX_BODY_BYTES: u64 = 1024 * 1024;
-/// KV リレーの Workers URL（Cloudflare Pages / Workers のデプロイ先）
-const DEFAULT_RELAY_URL: &str = "https://tako-remote-relay.shiozawa-takumi.workers.dev";
+/// KV リレーの Workers URL（Cloudflare Pages / Workers のデプロイ先）。
+/// PWA 側（web/tako-remote/src/api.js）の DEFAULT_RELAY_URL と一致させること
+const DEFAULT_RELAY_URL: &str = "https://tako-remote-relay.takushio2525.workers.dev";
 // --- PID / トークン / ポートファイルのパス ---
 
 pub fn pid_path() -> std::path::PathBuf {
@@ -633,6 +634,19 @@ fn tmux_capture_pane(tmux_socket: &str, target: &str) -> Result<Vec<String>, Str
         .collect())
 }
 
+/// tmux の特定ペインを kill する。
+/// 最後のペインなら window ごと、最後の window ならセッションごと消える（tmux の標準挙動）
+fn tmux_kill_pane(tmux_socket: &str, target: &str) -> Result<(), String> {
+    let output = tmux_output_with_timeout(tmux_socket, &["kill-pane", "-t", target])?;
+    if !output.status.success() {
+        return Err(format!(
+            "tmux kill-pane がエラー: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
 /// tmux の特定ペインへテキストを送信する
 fn tmux_send_keys(
     tmux_socket: &str,
@@ -858,6 +872,20 @@ fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &st
             let newline = parsed["newline"].as_bool().unwrap_or(true);
             let tmux_target = format!("={target}");
             match tmux_send_keys(tmux_socket, &tmux_target, &text, newline) {
+                Ok(()) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
+                Err(e) => respond(request, 500, Some(json!({ "error": e }).to_string())),
+            }
+        }
+        (tiny_http::Method::Post, p) if p.starts_with("/api/panes/") && p.ends_with("/close") => {
+            let Some(target) = extract_pane_target(p) else {
+                return respond(
+                    request,
+                    400,
+                    Some(json!({ "error": "無効なペイン ID" }).to_string()),
+                );
+            };
+            let tmux_target = format!("={target}");
+            match tmux_kill_pane(tmux_socket, &tmux_target) {
                 Ok(()) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
                 Err(e) => respond(request, 500, Some(json!({ "error": e }).to_string())),
             }
