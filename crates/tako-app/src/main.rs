@@ -6610,8 +6610,10 @@ mod self_test {
             wait(cx, 1000).await;
             check(focused_contains(window, cx, "TAKO-LIST-42"), "tako list");
 
-            // 18. tako split --down（呼び出し元の自動特定 + origin=cli + フォーカス移動）
-            type_text(any, cx, &format!("{cli} split --down"), true);
+            // 18. tako split --down --focus（呼び出し元の自動特定 + origin=cli + フォーカス移動）。
+            // 既定はフォーカスを分割元に維持する仕様（3c9d363）のため、--focus を明示して
+            // 新ペインへ移す（後続テストは新ペインからの入力を前提とする）
+            type_text(any, cx, &format!("{cli} split --down --focus"), true);
             wait(cx, 1500).await;
             let (pane_count, pane4, origin_cli) = window
                 .update(cx, |app, _, _| {
@@ -6625,7 +6627,7 @@ mod self_test {
                 })
                 .unwrap_or_else(|_| fail("tako split 後の状態取得"));
             check(pane_count == 2, "tako split で 2 ペイン");
-            check(pane4 != pane2, "split 後フォーカスは新ペイン");
+            check(pane4 != pane2, "split --focus 後フォーカスは新ペイン");
             check(origin_cli, "新ペインの origin は cli");
 
             // 19. tako send で別ペインへコマンドを流し込む（FR-2.2.2。pane4 から pane2 へ）
