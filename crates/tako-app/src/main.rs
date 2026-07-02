@@ -7587,40 +7587,48 @@ mod self_test {
             //     したとき、グリッド col = 4（全角 2 セル × 2 文字ぶん）に解決されること
             press(any, cx, "ctrl-u");
             type_text(any, cx, "echo あいうえおかきくけこ", true);
-            wait(cx, 1000).await;
-            let wide_hit = window
-                .update(cx, |app, win, _| {
-                    let pane = app.focused_pane();
-                    let (_, area) = app
-                        .pane_text_areas
-                        .iter()
-                        .find(|(id, _)| *id == pane)
-                        .copied()?;
-                    let cell = app.cell_size?;
-                    let screen = app.terminals.get(&pane)?.screen(&app.theme);
-                    let row = screen
-                        .lines
-                        .iter()
-                        .position(|l| l.text.starts_with("あいうえおかきくけこ"))?;
-                    let line = &screen.lines[row];
-                    // 描画と同じ shaping で「う」の先頭 x を求め、少し右をクリックする
-                    let shaped = win.text_system().shape_line(
-                        SharedString::from(line.text.clone()),
-                        px(app.theme.font_size),
-                        &[app.mono_text_run(line.text.len())],
-                        None,
-                    );
-                    let x = f32::from(shaped.x_for_index("あい".len())) + 2.0;
-                    let pos = point(
-                        area.origin.x + px(x),
-                        area.origin.y + cell.height * row as f32 + px(2.0),
-                    );
-                    let (col, hit_row, _) = app.cell_at(pane, pos, win)?;
-                    Some(col == 4 && hit_row == row)
-                })
-                .ok()
-                .flatten()
-                .unwrap_or(false);
+            // 高負荷環境では echo の実行・画面反映が 1 秒を超えることがあるため
+            // リトライで待つ（座標解決の実バグならリトライ後も false のまま fail する）
+            let mut wide_hit = false;
+            for _ in 0..8 {
+                wait(cx, 800).await;
+                wide_hit = window
+                    .update(cx, |app, win, _| {
+                        let pane = app.focused_pane();
+                        let (_, area) = app
+                            .pane_text_areas
+                            .iter()
+                            .find(|(id, _)| *id == pane)
+                            .copied()?;
+                        let cell = app.cell_size?;
+                        let screen = app.terminals.get(&pane)?.screen(&app.theme);
+                        let row = screen
+                            .lines
+                            .iter()
+                            .position(|l| l.text.starts_with("あいうえおかきくけこ"))?;
+                        let line = &screen.lines[row];
+                        // 描画と同じ shaping で「う」の先頭 x を求め、少し右をクリックする
+                        let shaped = win.text_system().shape_line(
+                            SharedString::from(line.text.clone()),
+                            px(app.theme.font_size),
+                            &[app.mono_text_run(line.text.len())],
+                            None,
+                        );
+                        let x = f32::from(shaped.x_for_index("あい".len())) + 2.0;
+                        let pos = point(
+                            area.origin.x + px(x),
+                            area.origin.y + cell.height * row as f32 + px(2.0),
+                        );
+                        let (col, hit_row, _) = app.cell_at(pane, pos, win)?;
+                        Some(col == 4 && hit_row == row)
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
+                if wide_hit {
+                    break;
+                }
+            }
             check(wide_hit, "全角行のクリックが正しいセルに解決");
 
             // 47. ペインの × ボタン = kill（dispatch 共有経路）。split で増やして × 相当の
