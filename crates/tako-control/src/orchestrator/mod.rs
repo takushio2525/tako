@@ -277,7 +277,7 @@ impl Profile {
     /// system_prompt フィールドが指定されている場合はそのファイルの内容をそのまま返す。
     /// そうでなければ DEFAULT_SYSTEM_PROMPT をブロック分割し、prompt_blocks と
     /// worker_model_policy に基づいて合成する。
-    pub fn build_system_prompt(&self) -> String {
+    pub fn build_system_prompt(&self, profile_name: &str) -> String {
         // system_prompt フィールドが指定されていればファイルを丸ごと返す（既存互換）
         if let Some(ref custom) = self.system_prompt {
             let expanded = expand_tilde(custom);
@@ -295,11 +295,11 @@ impl Profile {
             }
         }
 
-        self.build_from_template(DEFAULT_SYSTEM_PROMPT)
+        self.build_from_template(DEFAULT_SYSTEM_PROMPT, profile_name)
     }
 
-    /// テンプレートテキストからブロック制御・model-policy 注入を行って合成する
-    pub fn build_from_template(&self, template: &str) -> String {
+    /// テンプレートテキストからブロック制御・identity / model-policy 注入を行って合成する
+    pub fn build_from_template(&self, template: &str, profile_name: &str) -> String {
         let blocks = parse_prompt_blocks(template);
         let pb = self.prompt_blocks.as_ref();
 
@@ -310,7 +310,16 @@ impl Profile {
             result.push_str("\n\n");
         }
 
+        let mut identity_injected = false;
+
         for (name, content) in &blocks {
+            // identity ブロックは disable 不可: role ブロックの直後に注入する
+            if !identity_injected && name != "role" {
+                result.push_str(&self.generate_identity_section(profile_name, &blocks, pb));
+                result.push_str("\n\n");
+                identity_injected = true;
+            }
+
             if let Some(b) = pb {
                 if b.disable.iter().any(|d| d == name) {
                     continue;
@@ -330,6 +339,12 @@ impl Profile {
             }
 
             result.push_str(content);
+            result.push('\n');
+        }
+
+        // ブロックが role のみ or 空の場合のフォールバック
+        if !identity_injected {
+            result.push_str(&self.generate_identity_section(profile_name, &blocks, pb));
             result.push('\n');
         }
 
@@ -388,6 +403,68 @@ impl Profile {
                 )
             }
         }
+    }
+
+    /// master の自己認識ブロックを生成する（disable 不可、role 直後に注入）
+    fn generate_identity_section(
+        &self,
+        profile_name: &str,
+        blocks: &[(String, String)],
+        pb: Option<&PromptBlocks>,
+    ) -> String {
+        let policy_str = match self.worker_model_policy {
+            WorkerModelPolicy::Inherit => {
+                format!("inherit（master と同じ {} / {}）", self.model, self.effort)
+            }
+            WorkerModelPolicy::Fixed => format!(
+                "fixed（{} / {}）",
+                self.resolve_worker_model(),
+                self.resolve_worker_effort()
+            ),
+            WorkerModelPolicy::Delegate => "delegate（master がタスクごとに判断）".into(),
+        };
+
+        let profile_path = profile_path(profile_name)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "(不明)".into());
+
+        let mut customizations = Vec::new();
+        if let Some(b) = pb {
+            for d in &b.disable {
+                customizations.push(format!("  - disabled: `{d}`"));
+            }
+            for k in b.override_blocks.keys() {
+                customizations.push(format!("  - overridden: `{k}`"));
+            }
+            if b.prepend.is_some() {
+                customizations.push("  - prepend: あり".into());
+            }
+            if b.append.is_some() {
+                customizations.push("  - append: あり".into());
+            }
+        }
+        let customization_summary = if customizations.is_empty() {
+            "なし（共通テンプレートをそのまま使用）".into()
+        } else {
+            format!("\n{}", customizations.join("\n"))
+        };
+
+        let all_blocks: Vec<&str> = blocks.iter().map(|(n, _)| n.as_str()).collect();
+
+        format!(
+            "## Session Identity\n\n\
+             - **Profile**: `{profile_name}`\n\
+             - **Launch command**: `tako master -{profile_name}`\n\
+             - **Master model**: {}\n\
+             - **Master effort**: {}\n\
+             - **Worker model policy**: {policy_str}\n\
+             - **Profile config**: `{profile_path}`\n\
+             - **Prompt blocks**: {}\n\
+             - **Customizations**: {customization_summary}",
+            self.model,
+            self.effort,
+            all_blocks.join(", "),
+        )
     }
 }
 
@@ -731,7 +808,7 @@ prompt_blocks:
     #[test]
     fn build_system_prompt_default() {
         let p = Profile::default();
-        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT);
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
         assert!(prompt.contains("Master Orchestrator Agent"));
         assert!(prompt.contains("Worker Model Policy"));
         assert!(prompt.contains("claude-opus-4-6[1m]"));
@@ -744,7 +821,7 @@ prompt_blocks:
             effort: "high".into(),
             ..Default::default()
         };
-        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT);
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
         assert!(prompt.contains("claude-fable-5"));
         assert!(prompt.contains("high"));
     }
@@ -759,7 +836,7 @@ prompt_blocks:
             worker_effort: Some("medium".into()),
             ..Default::default()
         };
-        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT);
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
         assert!(prompt.contains("claude-sonnet-5"));
         assert!(prompt.contains("medium"));
         assert!(prompt.contains("fixed model/effort"));
@@ -774,7 +851,7 @@ prompt_blocks:
             delegate_guidance: Some("複雑なタスクは Opus、単純なタスクは Sonnet".into()),
             ..Default::default()
         };
-        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT);
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
         assert!(prompt.contains("Delegation Guidance"));
         assert!(prompt.contains("複雑なタスクは Opus"));
     }
@@ -788,7 +865,7 @@ prompt_blocks:
             }),
             ..Default::default()
         };
-        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT);
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
         assert!(!prompt.contains("The Master Does Not Investigate"));
         assert!(prompt.contains("Master Orchestrator Agent"));
     }
@@ -804,7 +881,7 @@ prompt_blocks:
             }),
             ..Default::default()
         };
-        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT);
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
         assert!(prompt.contains("Custom behavior rules here"));
         assert!(!prompt.contains("Act on hypotheses"));
     }
@@ -819,8 +896,58 @@ prompt_blocks:
             }),
             ..Default::default()
         };
-        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT);
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
         assert!(prompt.starts_with("PREPEND_MARKER"));
         assert!(prompt.ends_with("APPEND_MARKER"));
+    }
+
+    #[test]
+    fn identity_block_injected() {
+        let p = Profile {
+            model: "claude-fable-5".into(),
+            effort: "high".into(),
+            worker_model_policy: WorkerModelPolicy::Fixed,
+            worker_model: Some("claude-sonnet-5".into()),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "fable");
+        assert!(prompt.contains("Session Identity"));
+        assert!(prompt.contains("Profile**: `fable`"));
+        assert!(prompt.contains("tako master -fable"));
+        assert!(prompt.contains("claude-fable-5"));
+        assert!(prompt.contains("fixed"));
+        assert!(prompt.contains("claude-sonnet-5"));
+    }
+
+    #[test]
+    fn identity_block_shows_customizations() {
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("behavior".into(), "custom".into());
+        let p = Profile {
+            prompt_blocks: Some(PromptBlocks {
+                disable: vec!["no-investigate".into()],
+                override_blocks: overrides,
+                prepend: Some("header".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "custom");
+        assert!(prompt.contains("disabled: `no-investigate`"));
+        assert!(prompt.contains("overridden: `behavior`"));
+        assert!(prompt.contains("prepend: あり"));
+    }
+
+    #[test]
+    fn identity_block_not_disableable() {
+        let p = Profile {
+            prompt_blocks: Some(PromptBlocks {
+                disable: vec!["identity".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
+        assert!(prompt.contains("Session Identity"));
     }
 }
