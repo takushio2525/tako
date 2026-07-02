@@ -375,9 +375,8 @@ pub fn run_setup() -> Result<(), String> {
     };
 
     let claude_cmd = format!(
-        "cd '{}' && claude --model '{}' --effort high '{}'",
+        "cd '{}' && claude '{}'",
         dir.display(),
-        config.orchestrator.master_model.replace('\'', "'\\''"),
         greeting.replace('\'', "'\\''"),
     );
 

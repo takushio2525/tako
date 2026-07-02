@@ -619,9 +619,36 @@ fn tmux_list_window_panes(tmux_socket: &str, session: &str, window: u32) -> Vec<
     }
 }
 
+/// capture-pane の引数を組み立てる。
+/// `ansi` = true で `-e`（色・属性のエスケープシーケンス付き。xterm.js 描画用）、
+/// `history_lines` = Some(N) で `-S -N`（履歴を N 行さかのぼって含める）
+fn capture_pane_args(target: &str, ansi: bool, history_lines: Option<u32>) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "capture-pane".into(),
+        "-t".into(),
+        target.into(),
+        "-p".into(),
+    ];
+    if ansi {
+        args.push("-e".into());
+    }
+    if let Some(n) = history_lines {
+        args.push("-S".into());
+        args.push(format!("-{n}"));
+    }
+    args
+}
+
 /// tmux の特定ペインの画面内容を取得する
-fn tmux_capture_pane(tmux_socket: &str, target: &str) -> Result<Vec<String>, String> {
-    let output = tmux_output_with_timeout(tmux_socket, &["capture-pane", "-t", target, "-p"])?;
+fn tmux_capture_pane(
+    tmux_socket: &str,
+    target: &str,
+    ansi: bool,
+    history_lines: Option<u32>,
+) -> Result<Vec<String>, String> {
+    let args = capture_pane_args(target, ansi, history_lines);
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let output = tmux_output_with_timeout(tmux_socket, &arg_refs)?;
     if !output.status.success() {
         return Err(format!(
             "tmux capture-pane がエラー: {}",
@@ -632,6 +659,32 @@ fn tmux_capture_pane(tmux_socket: &str, target: &str) -> Result<Vec<String>, Str
         .lines()
         .map(|l| l.to_string())
         .collect())
+}
+
+/// ペインのカーソル位置とサイズを取得する（cursor_x, cursor_y, pane_width, pane_height）。
+/// 取得失敗時は None（screen API はカーソル無しで応答を続行する）
+fn tmux_pane_geometry(tmux_socket: &str, target: &str) -> Option<(u32, u32, u32, u32)> {
+    let output = tmux_output_with_timeout(
+        tmux_socket,
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "#{cursor_x} #{cursor_y} #{pane_width} #{pane_height}",
+        ],
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut it = text.split_whitespace();
+    let x = it.next()?.parse().ok()?;
+    let y = it.next()?.parse().ok()?;
+    let w = it.next()?.parse().ok()?;
+    let h = it.next()?.parse().ok()?;
+    Some((x, y, w, h))
 }
 
 /// tmux の特定ペインを kill する。
@@ -768,6 +821,18 @@ fn check_auth(request: &tiny_http::Request, token: &str) -> bool {
     header_value(request, "authorization").is_some_and(|v| v == format!("Bearer {token}"))
 }
 
+/// URL のクエリ文字列から指定キーの値を取り出す（`/path?ansi=1&lines=200` の類）
+fn query_param(url: &str, key: &str) -> Option<String> {
+    let qs = url.splitn(2, '?').nth(1)?;
+    for pair in qs.split('&') {
+        let mut it = pair.splitn(2, '=');
+        if it.next() == Some(key) {
+            return Some(urlencoding::decode(it.next().unwrap_or("")));
+        }
+    }
+    None
+}
+
 /// URL パスからペイン ID を抽出する（`/api/panes/session%3A0.1/screen` → Some("session:0.1")）
 fn extract_pane_target(path: &str) -> Option<String> {
     let parts: Vec<&str> = path.splitn(5, '/').collect();
@@ -783,7 +848,8 @@ fn extract_pane_target(path: &str) -> Option<String> {
 
 fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &str) {
     let method = request.method().clone();
-    let path = request.url().split('?').next().unwrap_or("").to_string();
+    let url_full = request.url().to_string();
+    let path = url_full.split('?').next().unwrap_or("").to_string();
 
     // CORS preflight
     if method == tiny_http::Method::Options {
@@ -829,8 +895,17 @@ fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &st
             };
             // tmux target は URL デコード不要（session:window.pane）
             let tmux_target = format!("={target}");
-            match tmux_capture_pane(tmux_socket, &tmux_target) {
-                Ok(lines) => respond(request, 200, Some(json!({ "lines": lines }).to_string())),
+            let ansi = query_param(&url_full, "ansi").is_some_and(|v| v == "1" || v == "true");
+            let history = query_param(&url_full, "lines").and_then(|v| v.parse::<u32>().ok());
+            match tmux_capture_pane(tmux_socket, &tmux_target, ansi, history) {
+                Ok(lines) => {
+                    let mut body = json!({ "lines": lines });
+                    if let Some((x, y, w, h)) = tmux_pane_geometry(tmux_socket, &tmux_target) {
+                        body["cursor"] = json!({ "x": x, "y": y });
+                        body["size"] = json!({ "cols": w, "rows": h });
+                    }
+                    respond(request, 200, Some(body.to_string()))
+                }
                 Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
             }
         }
@@ -1011,6 +1086,37 @@ mod tests {
         );
         assert_eq!(extract_pane_target("/api/panes//input"), None);
         assert_eq!(extract_pane_target("/api/health"), None);
+    }
+
+    #[test]
+    fn capture_pane_argsの組み立て() {
+        assert_eq!(
+            capture_pane_args("=s:0.0", false, None),
+            vec!["capture-pane", "-t", "=s:0.0", "-p"]
+        );
+        assert_eq!(
+            capture_pane_args("=s:0.0", true, None),
+            vec!["capture-pane", "-t", "=s:0.0", "-p", "-e"]
+        );
+        assert_eq!(
+            capture_pane_args("=s:0.0", true, Some(200)),
+            vec!["capture-pane", "-t", "=s:0.0", "-p", "-e", "-S", "-200"]
+        );
+    }
+
+    #[test]
+    fn query_paramの抽出() {
+        assert_eq!(
+            query_param("/api/panes/s:0.0/screen?ansi=1&lines=200", "ansi"),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            query_param("/api/panes/s:0.0/screen?ansi=1&lines=200", "lines"),
+            Some("200".to_string())
+        );
+        assert_eq!(query_param("/api/panes/s:0.0/screen", "ansi"), None);
+        assert_eq!(query_param("/path?a=%3A", "a"), Some(":".to_string()));
+        assert_eq!(query_param("/path?flag", "flag"), Some("".to_string()));
     }
 
     #[test]
