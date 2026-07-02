@@ -375,7 +375,7 @@ pub fn run_setup() -> Result<(), String> {
     };
 
     let claude_cmd = format!(
-        "cd '{}' && claude '{}'",
+        "cd '{}' && claude --model 'claude-opus-4-6' '{}'",
         dir.display(),
         greeting.replace('\'', "'\\''"),
     );
