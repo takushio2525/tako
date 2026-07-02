@@ -215,3 +215,13 @@
 - `new-session -e` で TAKO_PANE_ID/TAB_ID を直接注入。旧 `set_pane_env`（セッション未存在時に呼ばれ常に no-op）を除去
 - 関連コミット: `0156b9a` `[修正] spawn 配置: TAKO_PANE_ID を new-session -e で直接注入し stale ID 問題を根治`
 - 検証: build / clippy(-D warnings) / fmt / test 全緑（109 passed）
+
+## 2026-07-02（Issue #23 フェーズ A: リモート接続基盤・バックエンド API）
+- WS 画面プッシュ（tiny_http upgrade + tungstenite、認証は Sec-WebSocket-Protocol）、
+  screen API の ANSI/cursor/lines、resize API（+ `tako tmux resize` + MCP）、connect URL の
+  token fragment 化、/api/agents（pid 祖先辿りで pane 対応付け）+ /api/sessions/:id/messages
+  （transcript 正規化。tako-control::agents / transcript 新設）、リレー URL 統一 + close ハンドラ。
+  CLI `tako remote agents/messages` + MCP 3 ツール追加（計 48）
+- 関連コミット: `d66a7e7` `4496109` `4b94e68` `f3edb4b` `3e1c296` `61c0fe9`
+- 検証: build / clippy(-D warnings) / fmt / test 全緑 + 実デーモンで HTTP/WS e2e（401/101/差分プッシュ/resize 実寸/close 消滅）
+- 次: フェーズ B（フロント刷新）は別 worker。引き継ぎは activeContext.md 参照

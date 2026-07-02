@@ -286,7 +286,7 @@ pub fn spawn_daemon(port: Option<u16>, no_tunnel: bool) -> Result<Value, String>
     cmd.args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
 
     // setsid でプロセスグループから切り離し、親（tmux セッション）終了時に巻き添えで死なないようにする
     #[cfg(unix)]
@@ -325,7 +325,25 @@ pub fn spawn_daemon(port: Option<u16>, no_tunnel: bool) -> Result<Value, String>
                 break;
             }
         }
-        result.ok_or("デーモンからの起動情報を受信できなかった")?
+        result
+    };
+
+    let Some(info) = info else {
+        // 起動情報が来なかった。子が即死していれば stderr から原因を拾う
+        // （例: ポート使用中で bind 失敗。orphan デーモンの残骸が典型）
+        if let Ok(Some(status)) = child.try_wait() {
+            let mut detail = String::new();
+            if let Some(mut err) = child.stderr.take() {
+                use std::io::Read as _;
+                let _ = (&mut err).take(4096).read_to_string(&mut detail);
+            }
+            let detail = detail.trim();
+            return Err(format!(
+                "デーモンが起動情報を返さず終了した（{status}）: {detail}"
+            ));
+        }
+        let _ = child.kill();
+        return Err("デーモンからの起動情報を受信できなかった（30 秒タイムアウト）".into());
     };
 
     // 子プロセスを切り離す（wait しない → init が引き取る）

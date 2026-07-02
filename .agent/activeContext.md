@@ -4,34 +4,50 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-06-26・spawn TAKO_PANE_ID stale 問題の根治完了）
+## 現在の対象（2026-07-02・Issue #23 フェーズ A 完了）
 
-spawn ペイン配置バグの根本修正（3回目）を完了。tmux `new-session -e` で
-TAKO_PANE_ID / TAKO_TAB_ID をセッション作成時に直接注入する方式に変更。
-旧方式（`set-environment -t`）はセッション作成前に呼ばれるため常に no-op だった。
+スマホリモート接続改善（Issue #23）のフェーズ A（接続基盤・バックエンド API）を完了。
+WS 画面プッシュ / ANSI screen / resize / 認証 fragment 化 / agents・messages 構造化 API /
+不整合解消（リレー URL・close ハンドラ）。次はフェーズ B（フロントエンド刷新）を
+別 worker が担当する予定。
+
+## フェーズ B worker への引き継ぎ事項
+
+- WS プロトコル: `GET /ws?pane=<id>` + `Sec-WebSocket-Protocol: tako-remote, token.<T>`。
+  **プッシュ専用**（`{"type":"screen"|"keepalive"|"error"}` が届く）。操作系は REST を使う。
+  仕様の正は `crates/tako-control/src/remote.rs` のモジュールコメント
+- PWA の api.js に screen(ansi)/resize/agents/messages クライアント実装済み。UI 接続は未
+- connect URL は `/#/connect?token=...`（fragment）。app.jsx のハッシュルーターがそのまま解釈
+- terminal.jsx は暫定で ANSI ポーリング表示（WS 未使用）。フェーズ B で WS + fit → resize 連動へ
 
 ## 残作業・既知の制約
 
+- **リモート系 dispatch（RemoteAgents / RemoteMessages / TmuxResize）は tako 本体の
+  再起動後に MCP から有効**（実行中の旧バイナリは新 Request を知らない）
+- `tako remote start` は **PATH の tako を子デーモンとして起動する**（resolve_tako_binary）。
+  dev 検証では PATH の release 版が動く点に注意。ポート占有時のエラーは stderr 転記で
+  原因が出るよう改善済み（2026-07-02。6/23 の orphan デーモンの 7749 占有が発端 → kill 済み）
 - main.rs の残り 8,359 行にはまだ大きなブロックがある（render_pane 約450行、
   ControlHost 実装 966行、セルフテスト 2,800行 等）
 - MCP HTTP ポートのランダム問題は未解決（stdio ブリッジ経由なら影響なし）
-- scroll テスト「履歴ゼロではcopy_modeに入らない」がフレーキー（環境依存のタイミング問題）
 
 ## 未着手タスク（優先順はユーザーと相談）
 
+- [ ] **Issue #23 フェーズ B**: スマホ UI 刷新（WS 接続・xterm.js 色付き・エージェントビュー）
 - [ ] **Phase 5 続き**: FR-3.5 軽い編集
 - [ ] **FR-2.19 localhost ポートパネル**
 - [ ] **FR-2.18 未表示の子の自動サーフェス**
 - [ ] **FR-2.14 MCP ゼロコンフィグオンボーディング**（配布前必須）
-- [ ] **FR-2.17 ネスト tmux の検出・診断・ワンタップ適用**（Phase 7）
 
 ## 直近の観点・指摘（実装時に踏みやすい点）
 
 - **CI（GitHub Actions）はリポ設定で意図的に無効化中**（2026-06-12〜）。コミット前は必ず
   `cargo fmt --all --check`（exit code）を確認する
+- **並行 worker と同一ワークツリーで作業する場合、未コミット変更が他者の commit/reset に
+  巻き込まれる**（2026-07-02 に実際に発生）。編集 → 即コミット → 即 push を徹底する
 
 ## 現フェーズで Read すべき設計書
 
+- リモート API 修正時: `crates/tako-control/src/remote.rs` モジュールコメント（API 仕様の正）
 - オーケストレーター修正時: `docs/orchestrator.md`
-- タブツリー/プレビュー/ピン再修正時: `requirements.md` FR-2.15 / FR-2.16
 - FR-3.5 軽い編集着手時: `architecture.md`「コンセプト②の実現」

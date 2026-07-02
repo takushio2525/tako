@@ -5,6 +5,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Remote access (#23 Phase A): WebSocket screen push channel `GET /ws?pane=<id>` — server-side 250ms diff detection, ANSI-colored screen + cursor/size (HTTP polling remains as fallback)
+  リモートアクセス（#23 フェーズ A）: WebSocket 画面プッシュ `GET /ws?pane=<id>` — サーバー側 250ms 差分検知、ANSI 色付き画面 + カーソル/サイズ（HTTP ポーリングはフォールバックとして維持）
+- Remote screen API: `?ansi=1` (colored output for xterm.js), `?lines=N` (scrollback history), cursor position and pane size in response
+  リモート画面取得 API: `?ansi=1`（xterm.js 用色付き出力）、`?lines=N`（スクロールバック履歴）、カーソル位置・ペインサイズを応答に追加
+- Viewport-linked resize: `POST /api/panes/:id/resize` + CLI `tako tmux resize` + MCP `tako_tmux_resize`
+  ビューポート連動リサイズ: `POST /api/panes/:id/resize` + CLI `tako tmux resize` + MCP `tako_tmux_resize`
+- Agent list API: `GET /api/agents` (claude agents --json proxy with tmux pane mapping) + CLI `tako remote agents` + MCP `tako_remote_agents`
+  エージェント一覧 API: `GET /api/agents`（claude agents --json プロキシ + tmux ペイン対応付け）+ CLI `tako remote agents` + MCP `tako_remote_agents`
+- Conversation log API: `GET /api/sessions/:id/messages?tail=N` (normalized Claude Code transcript) + CLI `tako remote messages` + MCP `tako_remote_messages` (48 MCP tools total)
+  会話ログ API: `GET /api/sessions/:id/messages?tail=N`（Claude Code transcript の正規化）+ CLI `tako remote messages` + MCP `tako_remote_messages`（MCP 計 48 ツール）
+- Pane close endpoint: `POST /api/panes/:id/close`
+  ペインを閉じるエンドポイント: `POST /api/panes/:id/close`
+
+### Changed
+
+- Connect URL token moved to URL fragment (`/#/connect?token=...`) — no longer appears in server/tunnel access logs or Referer
+  接続 URL のトークンを URL fragment 化（`/#/connect?token=...`）— サーバー/トンネルのアクセスログや Referer に残らない
+
+### Fixed
+
+- KV relay URL mismatch between daemon and PWA (unified to the live worker)
+  デーモンと PWA で KV リレー URL が不一致だった問題を修正（稼働中の Worker に統一）
+
 ## [0.2.2] - 2026-07-02
 
 ### Added
