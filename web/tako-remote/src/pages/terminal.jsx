@@ -116,6 +116,9 @@ export function TerminalPage({ paneId }) {
   const connectWs = useCallback(() => {
     if (!clientRef.current || !paneId) return;
     if (wsRef.current) {
+      wsRef.current.onclose = null;
+      wsRef.current.onerror = null;
+      wsRef.current.onmessage = null;
       wsRef.current.close();
       wsRef.current = null;
     }
@@ -201,6 +204,9 @@ export function TerminalPage({ paneId }) {
       clearInterval(paneListTimerRef.current);
       clearTimeout(reconnectTimerRef.current);
       if (wsRef.current) {
+        wsRef.current.onclose = null;
+        wsRef.current.onerror = null;
+        wsRef.current.onmessage = null;
         wsRef.current.close();
         wsRef.current = null;
       }
@@ -272,6 +278,13 @@ export function TerminalPage({ paneId }) {
   // #41 の isComposing ガード + Shift+Enter で改行（#26）
   function onInputKeyDown(e) {
     if (e.isComposing) return;
+    if (ctrlMode && e.key.length === 1 && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      setCtrlMode(false);
+      if (navigator.vibrate) navigator.vibrate(10);
+      clientRef.current?.sendKeys(paneId, `C-${e.key}`).catch(() => {});
+      return;
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       send();
@@ -365,9 +378,10 @@ export function TerminalPage({ paneId }) {
           autocorrect="off"
           autocapitalize="off"
           spellcheck={false}
+          enterkeyhint="send"
           rows={1}
         />
-        <button type="submit" class="send-btn" disabled={!input.trim()}>↑</button>
+        <button type="submit" class="send-btn">{input.trim() ? '↑' : '↵'}</button>
       </form>
     </div>
   );
