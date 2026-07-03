@@ -5,10 +5,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-07-03
+
+### Added
+
+- Remote PWA overhaul — two-layer architecture (#42, #26): history layer (`GET /api/panes/:id/scrollback` + client-side rendering with free scroll and text selection) + live screen layer (REST polling → WebSocket push with viewport-linked auto-resize on connect and reset on disconnect). `<input>` → `<textarea>` for Shift+Enter multiline input (#26). Quick keys via tmux send-keys raw sequences + ctrl toggle mode. CLI `tako remote scrollback` / MCP `tako_remote_scrollback` (51 MCP tools total)
+  リモート PWA 二層構成刷新（#42, #26）: 履歴レイヤー（`GET /api/panes/:id/scrollback` + クライアント側描画、自由スクロール・テキスト選択対応）+ ライブ画面レイヤー（REST ポーリング → WebSocket プッシュ、接続時ビューポート連動自動リサイズ + 切断時リセット）。`<input>` → `<textarea>` で Shift+Enter 改行対応（#26）。Quick keys を tmux send-keys 生キーシーケンス経由に変更 + ctrl トグルモード。CLI `tako remote scrollback` / MCP `tako_remote_scrollback`（MCP 計 51 ツール）
+- Homebrew update failure recovery (#50): detects "broken-brew" state (app exists but cask ledger is missing after a failed `brew upgrade`), offers zip-based fallback update via status bar button, and adds `tako update repair` (re-register cask ledger) / `tako update apply-zip` (force update via GitHub Releases zip). README troubleshooting section updated
+  brew 更新失敗の復旧導線（#50）: `brew upgrade` 失敗後の「.app 実体あり・cask 台帳なし」詰み状態を自動検知し、ステータスバーに zip 更新ボタンを表示。`tako update repair`（cask 台帳の再締結）/ `tako update apply-zip`（zip 強制更新）を追加。README トラブルシューティングに復旧手順を追記
+
+### Changed
+
+- Orchestrator master system prompt now includes 6 quality-ops principles derived from cross-PR review (#53): root-cause-first instructions, same-file serialization, DoD for untested areas, integration review layer, master-owned Closes decisions, and completion definition
+  オーケストレーター master 共通 system prompt に品質運用原則 6 点を組み込み（#53）: 根因先行の指示、同一ファイル直列化、機械検証なし領域の DoD、統合レビュー層、master が持つ Closes 判断、完遂の定義
+
 ### Fixed
 
 - TCC permission prompts ("access data from other apps") no longer reset across rebuilds and in-app updates (#54): the code signature's designated requirement is now pinned to the bundle identifier instead of the signing certificate. Previously the requirement changed whenever the signing identity changed (multiple Apple Development certificates in the keychain, certificate expiry, or ad-hoc fallback), making macOS treat each build as a different app and invalidate previously granted permissions. Note: updating from ≤0.2.5 requires re-granting once due to the requirement migration; granting Full Disk Access to tako.app suppresses the per-target dialogs entirely (see README troubleshooting)
   TCC の許可（「ほかのアプリからのデータへのアクセス」等）が再ビルド・アプリ内更新でリセットされる問題を修正（#54）: コード署名の designated requirement を署名証明書依存から bundle identifier 固定に変更。従来は署名 identity が変わるたび（キーチェーンに複数の Apple Development 証明書・証明書失効・ad-hoc への劣化）に requirement が変わり、macOS が別アプリと判定して付与済み許可を無効化していた。注意: 0.2.5 以前からの更新時は requirement 移行のため 1 回だけ再許可が必要。tako.app にフルディスクアクセスを付与すると対象別ダイアログ自体が出なくなる（README トラブルシューティング参照）
+- Remote PWA: soft keyboard Enter now works on mobile (#41): removed empty-input guard in `send()` that blocked bare Enter (needed for Claude Code permission prompts), added `<form>` submit event capture as reliable mobile Enter path, and `enterkeyhint="send"` for soft keyboard send button
+  リモート PWA: スマホのソフトキーボードから Enter が送信可能に（#41）: 空入力をブロックしていた `send()` のガードを除去（Claude Code の許可プロンプトに空 Enter で応答するケースに対応）、`<form>` submit イベントで確実にモバイル Enter を捕捉、`enterkeyhint="send"` でソフトキーボードに送信ボタンを表示
+- Remote PWA: empty Enter regression from #45 restored + WebSocket zombie reconnection prevented (#51, #52): re-enabled empty-input send button that was disabled during the textarea migration; WS event handlers are now nullified before `close()` to prevent stale pane connections from triggering reconnection timers
+  リモート PWA: #45 で落ちた空 Enter 送信経路を復旧 + WS ゾンビ再接続を防止（#51, #52）: textarea 移行で無効化されていた空入力送信ボタンを復活、`close()` 前に WS イベントハンドラを null 化して旧ペインの非同期 onclose による再接続タイマー設定を根治
+- Full-width character click now resolves to the correct cell (#37): click coordinate calculation used font shaping advance instead of grid-based `cell_width × column` — unified to the grid coordinate system
+  全角文字行のクリックが正しいセルに解決するように修正（#37）: クリック座標計算がフォント shaping の advance 値を使用しておりグリッド座標系（`cell_width × 列番号`）と不一致だった問題を統一
+- `orchestrator watch` no longer false-fires WORKER_IDLE when session_id is omitted (#44): pane → backend session → pid ancestor traversal now auto-resolves the session, using `claude agents --json` status as primary signal (screen pattern matching is fallback only)
+  `orchestrator watch` が session_id 未指定時に WORKER_IDLE を空振りする問題を根治（#44）: pane → バックエンドセッション → pid 祖先辿りで session を自動解決し、`claude agents --json` の status を一次シグナル化（画面パターン推定はフォールバック）
+- Self-test no longer hangs under CPU contention (#39): terminal rendering changed from one-div-per-character to grouped runs of same-style half-width characters, reducing GPUI element count by 60–90%
+  CPU 競合下でセルフテストがハングする問題を解消（#39）: ターミナル描画を「1 文字 = 1 div」から同スタイル連続半角文字のグループ化に変更、GPUI 描画要素数を 60〜90% 削減
+- IME candidate window no longer appears at bottom-left when cursor is hidden (#29): added `ime_cursor` field to `Screen` that tracks cursor position even when `CursorShape::Hidden` (used by TUI apps like Claude Code). `bounds_for_range` now always returns a valid position
+  カーソル非表示時に IME 変換候補ウィンドウが画面左下に出る問題を修正（#29）: `Screen` に `ime_cursor` フィールドを追加し、`CursorShape::Hidden`（Claude Code 等の TUI アプリが使用）でもカーソル位置を追跡。`bounds_for_range` が常に有効な位置を返すよう修正
 
 ## [0.2.5] - 2026-07-03
 
