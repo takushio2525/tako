@@ -4,12 +4,15 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-02・Issue #23 フェーズ A 完了 / Issue #32 送達確認ループ完了）
+## 現在の対象（2026-07-03・Issue #36 完了 / Issue #28 完了 / Issue #23 フェーズ A 完了）
 
-スマホリモート接続改善（Issue #23）のフェーズ A（接続基盤・バックエンド API）を完了。
-WS 画面プッシュ / ANSI screen / resize / 認証 fragment 化 / agents・messages 構造化 API /
-不整合解消（リレー URL・close ハンドラ）。次はフェーズ B（フロントエンド刷新）を
-別 worker が担当する予定。
+Issue #36（アプリ内更新）を完了: 配布系統自動判別 + 更新前確認ダイアログ + 自動再起動 +
+CLI 重複検知 + CLI/MCP 操作（計 50 ツール）。PR #40 squash merge → build-app.sh --install 済み。
+
+Issue #28（Shift+Enter 改行）も別 worker が完了（CSI u 全ペイン既定化）。
+
+スマホリモート接続改善（Issue #23）のフェーズ A（接続基盤・バックエンド API）は完了済み。
+次はフェーズ B（フロントエンド刷新）を別 worker が担当する予定。
 
 並行 worker が Issue #32（spawn / send のプロンプト送達不安定）を修正済み:
 `tako-control::claude_tui` 新設（TUI 状態検出・事前信頼・tmux 送達確認配送）+

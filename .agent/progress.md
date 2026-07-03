@@ -274,3 +274,10 @@
   セルフテスト 45b（GUI キー経路で CSI u 着弾）+ 45c（TAKO_SELF_TEST_CLAUDE=1 で実 claude 改行 e2e）追加
 - 関連コミット: `[修正] tmux 無し環境で Shift+Enter 改行が効かない問題を根治 (#28)`（fix/28 worktree → PR squash merge）
 - 次: Homebrew 配布ビルド更新後にテスター実機で最終確認
+
+## 2026-07-03（Issue #36: アプリ内更新の配布系統自動判別 + 更新前確認 + 自動再起動）
+- 配布系統自動判別（Caskroom パス判定）、更新前確認ダイアログ（プロセス消失警告）、
+  更新完了後の自動再起動（layout 保存 → open -n → quit）、PATH 上の CLI 重複検知。
+  Request::Update + CLI `tako update status/check/apply` + MCP `tako_update`（計 50 ツール）
+- 関連コミット: `942d692`（worktree → PR #40 squash merge）
+- 次: なし（#36 クローズ）
