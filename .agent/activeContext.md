@@ -4,71 +4,43 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-03・Issue #36 完了 / Issue #28 完了 / Issue #23 フェーズ A 完了）
+## 現在の対象（2026-07-03・Issue #42 完了 / Issue #26 完了）
 
-Issue #36（アプリ内更新）を完了: 配布系統自動判別 + 更新前確認ダイアログ + 自動再起動 +
-CLI 重複検知 + CLI/MCP 操作（計 50 ツール）。PR #40 squash merge → build-app.sh --install 済み。
+Issue #42（リモートフロントエンド刷新 = #23 フェーズ B）を完了:
+二層構成（履歴レイヤー + ライブ WS + 自動リサイズ）で PWA を刷新。
+Issue #26（Shift+Enter 改行）も textarea 化で同時解決。PR #45 squash merge 済み。
 
-Issue #28（Shift+Enter 改行）も別 worker が完了（CSI u 全ペイン既定化）。
+## 実装した二層構成
 
-スマホリモート接続改善（Issue #23）のフェーズ A（接続基盤・バックエンド API）は完了済み。
-次はフェーズ B（フロントエンド刷新）を別 worker が担当する予定。
+- **履歴レイヤー**: `GET /api/panes/:id/scrollback` でプレーンテキスト取得 → クライアント側
+  `<pre>` で描画。スマホ幅折り返し・自由スクロール・テキスト選択/コピー対応
+- **ライブ画面レイヤー**: REST ポーリング → WS プッシュに移行。`GET /ws?pane=<id>&cols=N&rows=N`
+  で接続時にペインを自動リサイズ、切断時にリセット
 
-並行 worker が Issue #32（spawn / send のプロンプト送達不安定）を修正済み:
-`tako-control::claude_tui` 新設（TUI 状態検出・事前信頼・tmux 送達確認配送）+
-PromptFlow 刷新（信頼ダイアログ承諾 → bracketed paste → 分離 Enter → 空検証 + 再送）。
-仕様メモは `requirements.md` FR-2.2.2 実装メモと `orchestrator.md` spawn 節。
-**プロンプト送達系の dispatch 変更も tako 本体の再起動後に有効**（下記と同様）。
+## サーバー側追加
 
-## フェーズ B worker への引き継ぎ事項
-
-- WS プロトコル: `GET /ws?pane=<id>` + `Sec-WebSocket-Protocol: tako-remote, token.<T>`。
-  **プッシュ専用**（`{"type":"screen"|"keepalive"|"error"}` が届く）。操作系は REST を使う。
-  仕様の正は `crates/tako-control/src/remote.rs` のモジュールコメント
-- PWA の api.js に screen(ansi)/resize/agents/messages クライアント実装済み。UI 接続は未
-- connect URL は `/#/connect?token=...`（fragment）。app.jsx のハッシュルーターがそのまま解釈
-- terminal.jsx は暫定で ANSI ポーリング表示（WS 未使用）。フェーズ B で WS + fit → resize 連動へ
+- `GET /api/panes/:id/scrollback?lines=N` — スクロールバック API
+- WS に `cols`/`rows` パラメータ（接続時自動リサイズ + 切断時リセット）
+- `POST input` に `keys` フィールド（tmux send-keys 生キーシーケンス送信）
+- `tmux_send_raw_keys()` 関数（`-l` なし = 特殊キー名解釈）
+- CLI: `tako remote scrollback` / MCP: `tako_remote_scrollback`（計 51 ツール）
 
 ## 残作業・既知の制約
 
-- **リモート系 dispatch（RemoteAgents / RemoteMessages / TmuxResize）は tako 本体の
-  再起動後に MCP から有効**（実行中の旧バイナリは新 Request を知らない）
-- `tako remote start` は **PATH の tako を子デーモンとして起動する**（resolve_tako_binary）。
-  dev 検証では PATH の release 版が動く点に注意。ポート占有時のエラーは stderr 転記で
-  原因が出るよう改善済み（2026-07-02。6/23 の orphan デーモンの 7749 占有が発端 → kill 済み）
-- main.rs の残り 8,359 行にはまだ大きなブロックがある（render_pane 約450行、
-  ControlHost 実装 966行、セルフテスト 2,800行 等）
+- **スマホ実機テスト未実施**: WS 接続・自動リサイズ・履歴レイヤー・Shift+Enter・Quick keys の
+  実機確認が必要（PR の Test plan 参照）
+- **リモート系 dispatch（RemoteAgents / RemoteMessages / RemoteScrollback / TmuxResize）は
+  tako 本体の再起動後に MCP から有効**
+- main.rs の残り 8,359 行にはまだ大きなブロックがある
 - MCP HTTP ポートのランダム問題は未解決（stdio ブリッジ経由なら影響なし）
-- **セルフテスト項目 46「全角行のクリックが正しいセルに解決」が決定的に失敗** = **Issue #37**。
-  6/23 の 3c9d363 以降セルフテスト自体が手前で止まり続けていたため発生時期不明。
-  リトライ化（6.4 秒）でも解決せずタイミングではない。実測は col=3（期待 4）・hit_row は
-  一致（#28 検証中に採取、詳細は #37）。GUI 座標解決（cell_at / shape_line）まわりで
-  Issue #23 とは無関係。それ以外の項目は 2026-07-03 に全回復済み
+- **セルフテスト項目 46「全角行のクリックが正しいセルに解決」が決定的に失敗** = Issue #37
 
 ## 未着手タスク（優先順はユーザーと相談）
 
-- [ ] **Issue #23 フェーズ B**: スマホ UI 刷新（WS 接続・xterm.js 色付き・エージェントビュー）
 - [ ] **Phase 5 続き**: FR-3.5 軽い編集
 - [ ] **FR-2.19 localhost ポートパネル**
 - [ ] **FR-2.18 未表示の子の自動サーフェス**
 - [ ] **FR-2.14 MCP ゼロコンフィグオンボーディング**（配布前必須）
-
-## 直近の観点・指摘（実装時に踏みやすい点）
-
-- **CI（GitHub Actions）はリポ設定で意図的に無効化中**（2026-06-12〜）。コミット前は必ず
-  `cargo fmt --all --check`（exit code）を確認する
-- **並行 worker と同一ワークツリーで作業する場合、未コミット変更が他者の commit/reset に
-  巻き込まれる**（2026-07-02 に実際に発生）。編集 → 即コミット → 即 push を徹底する
-- **Issue #28（Shift+Enter 改行）は修正済み**（2026-07-02、fix/28 worktree → squash merge）。
-  修飾キーの CSI u 送出は全ペイン既定（CsiUMode::Off 廃止）。キー入力を触るときは
-  keybindings.rs の CsiUMode コメント + セルフテスト 45b/45c を正とする。
-  新規 worktree では `web/tako-remote/dist/`（npm 生成物・git 管理外）が無く
-  tako-control のビルドが落ちる → main ワークツリーからコピーするか `npm run build`
-- **セルフテストが不定期に激遅化し実質ハングする**（2026-07-03、#28 検証中に発見・main でも
-  発生 = #28 と無関係）: キーイベント毎の draw が数秒かかり type_text が進まない。sample では
-  GPUI bounds_tree::insert_leaf がホット（描画プリミティブ爆発）。発生位置は実行ごとに異なる
-  （項目 25 / 49 以降で観測、完走することもある）。未起票。
-  セルフテスト全緑判定は本件 + 項目 46（#37）を除外して読むこと
 
 ## 現フェーズで Read すべき設計書
 

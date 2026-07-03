@@ -281,3 +281,10 @@
   Request::Update + CLI `tako update status/check/apply` + MCP `tako_update`（計 50 ツール）
 - 関連コミット: `942d692`（worktree → PR #40 squash merge）
 - 次: なし（#36 クローズ）
+
+## 2026-07-03（Issue #42 + #26: リモートフロントエンド二層構成刷新）
+- 二層構成で PWA 全面刷新: 履歴レイヤー（scrollback API + クライアント描画 + スクロール/コピー）+
+  ライブ画面レイヤー（REST→WS 移行 + 接続時自動リサイズ + 切断時リセット）。input API に keys
+  フィールド追加。textarea 化で Shift+Enter 改行対応（#26）。CLI/MCP scrollback（計 51 ツール）
+- 関連コミット: `8673993`（feature/42-remote-frontend-v2 worktree → PR #45 squash merge）
+- 次: スマホ実機での最終確認（WS・リサイズ・履歴・Quick keys）
