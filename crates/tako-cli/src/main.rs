@@ -196,6 +196,14 @@ enum RemoteCommand {
         #[arg(long, default_value_t = 30)]
         tail: usize,
     },
+    /// ペインのスクロールバック履歴をプレーンテキストで表示する
+    Scrollback {
+        /// 対象ペイン ID（session:window.pane）
+        pane_id: String,
+        /// 取得する履歴行数（省略時は 1000）
+        #[arg(long, default_value_t = 1000)]
+        lines: u32,
+    },
     /// [内部用] HTTP サーバーをフォアグラウンドで起動する（start から自動呼び出し）
     Serve {
         /// サーバーのポート番号（省略時は 7749）
@@ -896,6 +904,9 @@ fn main() -> ExitCode {
         Command::Remote(RemoteCommand::Agents) => remote_agents(),
         Command::Remote(RemoteCommand::Messages { session_id, tail }) => {
             remote_messages(&session_id, tail)
+        }
+        Command::Remote(RemoteCommand::Scrollback { pane_id, lines }) => {
+            remote_scrollback(&pane_id, lines)
         }
         command => run(command),
     };
@@ -1609,6 +1620,15 @@ fn remote_agents() -> Result<(), String> {
 fn remote_messages(session_id: &str, tail: usize) -> Result<(), String> {
     let result = tako_control::transcript::read_messages(session_id, tail)?;
     println!("{}", pretty_json(&result));
+    Ok(())
+}
+
+/// `tako remote scrollback` — ペインのスクロールバック履歴をプレーンテキストで表示する
+fn remote_scrollback(pane_id: &str, lines: u32) -> Result<(), String> {
+    let result = tako_control::remote::scrollback(pane_id, lines)?;
+    for line in result {
+        println!("{line}");
+    }
     Ok(())
 }
 

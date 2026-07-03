@@ -419,6 +419,8 @@ pub enum Request {
         session_id: String,
         tail: Option<usize>,
     },
+    /// ペインのスクロールバック履歴をプレーンテキストで取得（Issue #42 履歴レイヤー用）
+    RemoteScrollback { pane_id: String, lines: Option<u32> },
     /// Chrome を CDP ミラー方式で開く（FR-3.8 PoC）。`pane` を `direction` 方向に分割し、
     /// Web ビューペインを生やす。Chrome が未起動なら `--remote-debugging-port` 付きで起動する
     ChromeOpen {
