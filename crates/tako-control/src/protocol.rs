@@ -426,6 +426,14 @@ pub enum Request {
         pane: Option<u64>,
         direction: Option<Direction>,
     },
+    /// アプリ内更新の診断・実行（Issue #36）。
+    /// `action` 省略 or `"status"` → 配布系統・現在バージョン・重複 CLI の診断情報。
+    /// `"check"` → GitHub Releases を問い合わせて最新版の有無を返す（更新しない）。
+    /// `"apply"` → 配布系統に応じた更新を実行する（再起動は UI 側の責務）
+    Update {
+        #[serde(default)]
+        action: Option<String>,
+    },
 }
 
 /// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。

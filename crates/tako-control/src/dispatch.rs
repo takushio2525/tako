@@ -175,6 +175,24 @@ pub trait ControlHost {
     fn open_chrome(&mut self, _pane: PaneId, _url: &str) -> Result<(), String> {
         Ok(())
     }
+    /// アプリ内更新の診断情報（Issue #36）。配布系統・バージョン・重複 CLI を JSON で返す
+    fn update_status(&self) -> Value {
+        json!({
+            "current_version": "unknown",
+            "install_method": "zip",
+            "duplicate_cli": [],
+        })
+    }
+    /// 更新チェック（Issue #36）。最新版の有無を JSON で返す（ブロッキング不可のため
+    /// 同期呼び出しは非推奨。CLI / MCP はこの既定実装を使う）
+    fn update_check(&self) -> Value {
+        json!({ "available": false })
+    }
+    /// 更新の実行（Issue #36）。配布系統に応じて brew upgrade or zip 差し替えを行う。
+    /// UI 層は更新完了後に自動再起動する（dispatch は再起動しない）
+    fn update_apply(&mut self) -> Result<Value, String> {
+        Err("この環境では更新を実行できない".into())
+    }
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -1530,6 +1548,18 @@ pub fn dispatch(
                 .focus(new_id)
                 .map_err(op_err)?;
             Ok(json!({ "pane": new_id.as_u64(), "url": url }))
+        }
+
+        Request::Update { action } => {
+            let action = action.as_deref().unwrap_or("status");
+            match action {
+                "status" => Ok(host.update_status()),
+                "check" => Ok(host.update_check()),
+                "apply" => host.update_apply().map_err(DispatchError::Operation),
+                other => Err(DispatchError::InvalidParams(format!(
+                    "不明な action: {other:?}（status / check / apply のいずれか）"
+                ))),
+            }
         }
     }
 }

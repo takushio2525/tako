@@ -131,6 +131,10 @@ enum Command {
     /// URL を Chrome CDP ミラー方式で Web ビューペインとして開く（FR-3.8 PoC）
     #[command(subcommand)]
     Chrome(ChromeCommand),
+    /// アプリ内更新の診断・チェック・実行（Issue #36）。
+    /// 引数なしで配布系統・現在バージョン・重複 CLI を表示する
+    #[command(subcommand)]
+    Update(UpdateCommand),
 }
 
 #[derive(Subcommand)]
@@ -155,6 +159,16 @@ enum ChromeCommand {
         #[arg(long)]
         up: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum UpdateCommand {
+    /// 配布系統・現在バージョン・重複 CLI の診断情報を表示する
+    Status,
+    /// GitHub Releases から最新版の有無を確認する（更新は行わない）
+    Check,
+    /// 配布系統に応じた更新を実行する
+    Apply,
 }
 
 #[derive(Subcommand)]
@@ -2057,6 +2071,13 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 direction,
             }
         }
+        Command::Update(sub) => Request::Update {
+            action: Some(match sub {
+                UpdateCommand::Status => "status".to_string(),
+                UpdateCommand::Check => "check".to_string(),
+                UpdateCommand::Apply => "apply".to_string(),
+            }),
+        },
     })
 }
 
@@ -2189,6 +2210,7 @@ fn print_result(command: &Command, result: &Value) {
             println!("{}", pretty_json(result));
         }
         Command::Chrome(_) => println!("{result}"),
+        Command::Update(_) => println!("{}", pretty_json(result)),
         // remote は run() → print_result を通らない
         _ => {}
     }

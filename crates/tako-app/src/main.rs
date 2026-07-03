@@ -5367,6 +5367,29 @@ impl ControlHost for TakoApp {
         self.webviews.insert(pane, state);
         Ok(())
     }
+    fn update_status(&self) -> serde_json::Value {
+        update_checker::update_status_json()
+    }
+    fn update_check(&self) -> serde_json::Value {
+        match update_checker::check_latest() {
+            Some(info) => serde_json::json!({
+                "available": true,
+                "version": info.version,
+                "download_url": info.download_url,
+            }),
+            None => serde_json::json!({ "available": false }),
+        }
+    }
+    fn update_apply(&mut self) -> Result<serde_json::Value, String> {
+        let info = update_checker::check_latest()
+            .ok_or_else(|| "新しいバージョンが見つからない（既に最新版です）".to_string())?;
+        update_checker::perform_update(&info)?;
+        Ok(serde_json::json!({
+            "updated": true,
+            "version": info.version,
+            "install_method": update_checker::detect_install_method().label(),
+        }))
+    }
 }
 
 /// IME（macOS では NSTextInputClient 相当）との接点（FR-1.9）。
@@ -7078,7 +7101,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 49, "MCP tools/list は 49 ツール");
+            check(status == 200 && tool_count == 50, "MCP tools/list は 50 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)

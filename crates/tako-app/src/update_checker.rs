@@ -1,9 +1,10 @@
 //! アプリ内自動更新チェッカー
 //!
 //! GitHub Releases API を定期確認し、新しい安定版があればステータスバーに通知。
-//! ボタン押下で Homebrew or ZIP 差し替えによる自動更新を実行する。
+//! 配布系統（Homebrew / zip 手動配置）を自動判別し、系統内で更新を実行する。
+//! 更新完了後は自動再起動する（#30 のタブ永続化で構成は復元される）。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// 更新チェック間隔（24 時間）
@@ -47,14 +48,102 @@ pub enum UpdateState {
     Idle,
     /// 新しいバージョンが利用可能
     Available(UpdateInfo),
+    /// 更新確認ダイアログ表示中
+    ConfirmPending(UpdateInfo),
     /// ダウンロード/更新中
     Updating(String),
-    /// 更新完了（再起動を促す）
+    /// 更新完了 — 自動再起動する
     Done(String),
     /// 更新失敗
     Failed(String),
     /// ユーザーが閉じた（次回起動まで非表示）
     Dismissed,
+}
+
+/// 配布系統の判定結果
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum InstallMethod {
+    /// Homebrew Cask で管理されている
+    Homebrew,
+    /// zip ダウンロード等の手動配置
+    Zip,
+}
+
+impl InstallMethod {
+    pub fn label(&self) -> &'static str {
+        match self {
+            InstallMethod::Homebrew => "homebrew",
+            InstallMethod::Zip => "zip",
+        }
+    }
+}
+
+/// 配布系統の判別 — 実行中の .app が Caskroom 配下にあるかで判定する。
+/// `/opt/homebrew/bin/tako` のシンボリックリンク存在だけでは zip 版に brew を
+/// 被せたケースと区別できないため、**バンドル自体の出自**を見る。
+pub fn detect_install_method() -> InstallMethod {
+    if let Some(bundle) = app_bundle_path() {
+        let resolved = std::fs::canonicalize(&bundle).unwrap_or(bundle);
+        let s = resolved.to_string_lossy();
+        // Homebrew Cask は /opt/homebrew/Caskroom/tako/... or /usr/local/Caskroom/tako/...
+        // にインストールし、/Applications にシンボリックリンクを張る
+        if s.contains("/Caskroom/") {
+            return InstallMethod::Homebrew;
+        }
+    }
+    // バンドルパスが取れない場合（CLI 単体実行）は tako バイナリの出自で判定
+    if let Ok(exe) = std::env::current_exe() {
+        let resolved = std::fs::canonicalize(&exe).unwrap_or(exe);
+        let s = resolved.to_string_lossy();
+        if s.contains("/Caskroom/") || s.contains("/Cellar/") {
+            return InstallMethod::Homebrew;
+        }
+    }
+    InstallMethod::Zip
+}
+
+/// 実行中の .app バンドルのパス（macOS 固有）
+fn app_bundle_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    // /Applications/tako.app/Contents/MacOS/tako-app -> /Applications/tako.app
+    let mut p = exe.as_path();
+    loop {
+        if p.extension().is_some_and(|e| e == "app") {
+            return Some(p.to_path_buf());
+        }
+        p = p.parent()?;
+    }
+}
+
+/// PATH 上の `tako` CLI 重複を検出する。
+/// 自分のバンドル内 CLI と異なるパスに tako があれば警告対象。
+pub fn detect_duplicate_cli() -> Vec<PathBuf> {
+    let own_bundle = app_bundle_path();
+    let mut seen = Vec::new();
+    let Ok(path_var) = std::env::var("PATH") else {
+        return seen;
+    };
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join("tako");
+        if !candidate.is_file() && !candidate.is_symlink() {
+            continue;
+        }
+        let resolved = std::fs::canonicalize(&candidate).unwrap_or(candidate.clone());
+        // 同じバンドル内なら OK
+        if let Some(ref bundle) = own_bundle {
+            let bundle_resolved = std::fs::canonicalize(bundle).unwrap_or_else(|_| bundle.clone());
+            if resolved.starts_with(&bundle_resolved) {
+                continue;
+            }
+        }
+        if !seen
+            .iter()
+            .any(|p: &PathBuf| std::fs::canonicalize(p).unwrap_or(p.clone()) == resolved)
+        {
+            seen.push(candidate);
+        }
+    }
+    seen
 }
 
 /// GitHub Releases から最新の安定版を取得する（ブロッキング。background executor で呼ぶ）
@@ -68,7 +157,6 @@ pub fn check_latest() -> Option<UpdateInfo> {
         .read_to_string()
         .ok()?;
     let releases: Vec<GhRelease> = serde_json::from_str(&body).ok()?;
-    // 安定版のみ（draft でも prerelease でもない）
     let stable: Vec<&GhRelease> = releases
         .iter()
         .filter(|r| !r.draft && !r.prerelease)
@@ -78,7 +166,6 @@ pub fn check_latest() -> Option<UpdateInfo> {
     if !is_newer(latest_ver, CURRENT_VERSION) {
         return None;
     }
-    // macOS 用 ZIP アセットを探す
     let zip_asset = latest.assets.iter().find(|a| {
         let name = a.name.to_lowercase();
         name.ends_with(".zip")
@@ -92,7 +179,7 @@ pub fn check_latest() -> Option<UpdateInfo> {
 }
 
 /// semver 比較（a > b なら true）。不正な形式は false
-fn is_newer(a: &str, b: &str) -> bool {
+pub fn is_newer(a: &str, b: &str) -> bool {
     let parse = |s: &str| -> Option<(u32, u32, u32)> {
         let parts: Vec<&str> = s.split('.').collect();
         if parts.len() != 3 {
@@ -110,33 +197,11 @@ fn is_newer(a: &str, b: &str) -> bool {
     }
 }
 
-/// インストール方式の判定
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InstallMethod {
-    Homebrew,
-    Manual,
-}
-
-pub fn detect_install_method() -> InstallMethod {
-    // Homebrew Cask 経由のシンボリックリンクの存在で判定
-    let homebrew_path = Path::new("/opt/homebrew/bin/tako");
-    if homebrew_path.exists() || homebrew_path.is_symlink() {
-        return InstallMethod::Homebrew;
-    }
-    // Intel Mac
-    let usr_local = Path::new("/usr/local/bin/tako");
-    if usr_local.exists() || usr_local.is_symlink() {
-        return InstallMethod::Homebrew;
-    }
-    InstallMethod::Manual
-}
-
-/// 更新を実行する（ブロッキング。background executor で呼ぶ）。
-/// 戻り値は (成功メッセージ or エラーメッセージ, 成功したか)
+/// 更新を実行する（ブロッキング。background executor で呼ぶ）
 pub fn perform_update(info: &UpdateInfo) -> Result<String, String> {
     match detect_install_method() {
         InstallMethod::Homebrew => update_via_homebrew(),
-        InstallMethod::Manual => update_via_zip(info),
+        InstallMethod::Zip => update_via_zip(info),
     }
 }
 
@@ -146,10 +211,9 @@ fn update_via_homebrew() -> Result<String, String> {
         .output()
         .map_err(|e| format!("brew の実行に失敗: {e}"))?;
     if output.status.success() {
-        Ok("Homebrew で更新完了。アプリを再起動してください".into())
+        Ok("Homebrew で更新完了".into())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // "already installed" は成功扱い
         if stderr.contains("already installed") {
             Ok("既に最新版です".into())
         } else {
@@ -169,7 +233,6 @@ fn update_via_zip(info: &UpdateInfo) -> Result<String, String> {
     std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("一時ディレクトリの作成に失敗: {e}"))?;
     let zip_path = tmp_dir.join("tako.zip");
 
-    // ダウンロード
     let mut body = ureq::get(url)
         .header("User-Agent", &format!("tako/{CURRENT_VERSION}"))
         .call()
@@ -181,7 +244,6 @@ fn update_via_zip(info: &UpdateInfo) -> Result<String, String> {
         .map_err(|e| format!("ダウンロードの書き込みに失敗: {e}"))?;
     drop(file);
 
-    // ditto で展開（macOS のフレームワーク・署名を正しく扱う）
     let output = std::process::Command::new("ditto")
         .args([
             "-xk",
@@ -197,20 +259,16 @@ fn update_via_zip(info: &UpdateInfo) -> Result<String, String> {
         ));
     }
 
-    // tako.app を探す
     let extracted_app = find_app_bundle(&tmp_dir)
         .ok_or_else(|| "展開した ZIP に tako.app が見つかりません".to_string())?;
 
-    // /Applications/tako.app を差し替え
     let dest = Path::new("/Applications/tako.app");
     if dest.exists() {
-        // バックアップを作ってから差し替え（rm -rf は危険なのでリネーム）
         let backup = Path::new("/Applications/tako.app.bak");
         let _ = std::fs::remove_dir_all(backup);
         std::fs::rename(dest, backup)
             .map_err(|e| format!("/Applications/tako.app のバックアップに失敗: {e}"))?;
     }
-    // ditto でコピー（cp -R より安全）
     let output = std::process::Command::new("ditto")
         .args([
             &extracted_app.to_string_lossy().to_string(),
@@ -219,7 +277,6 @@ fn update_via_zip(info: &UpdateInfo) -> Result<String, String> {
         .output()
         .map_err(|e| format!("アプリのコピーに失敗: {e}"))?;
     if !output.status.success() {
-        // バックアップから復旧
         let backup = Path::new("/Applications/tako.app.bak");
         if backup.exists() {
             let _ = std::fs::rename(backup, dest);
@@ -230,15 +287,14 @@ fn update_via_zip(info: &UpdateInfo) -> Result<String, String> {
         ));
     }
 
-    // クリーンアップ
     let _ = std::fs::remove_dir_all(&tmp_dir);
     let _ = std::fs::remove_dir_all(Path::new("/Applications/tako.app.bak"));
 
-    Ok("更新完了。アプリを再起動してください".into())
+    Ok("ZIP で更新完了".into())
 }
 
 /// ディレクトリ内の *.app バンドルを再帰的に探す
-fn find_app_bundle(dir: &Path) -> Option<std::path::PathBuf> {
+fn find_app_bundle(dir: &Path) -> Option<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -255,6 +311,29 @@ fn find_app_bundle(dir: &Path) -> Option<std::path::PathBuf> {
     None
 }
 
+/// .app バンドルを自動再起動する。呼び出し元プロセスは exit(0) で終了する想定。
+/// macOS の `open -n` でバンドルを新プロセスとして起動し、自分は終了する。
+pub fn restart_app() -> Result<(), String> {
+    let bundle = app_bundle_path()
+        .ok_or_else(|| ".app バンドルのパスが特定できない（CLI 単体実行？）".to_string())?;
+    std::process::Command::new("open")
+        .args(["-n", &bundle.to_string_lossy()])
+        .spawn()
+        .map_err(|e| format!("再起動に失敗: {e}"))?;
+    Ok(())
+}
+
+/// dispatch 層に公開する更新情報の JSON 表現
+pub fn update_status_json() -> serde_json::Value {
+    let method = detect_install_method();
+    let duplicates = detect_duplicate_cli();
+    serde_json::json!({
+        "current_version": CURRENT_VERSION,
+        "install_method": method.label(),
+        "duplicate_cli": duplicates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,5 +346,30 @@ mod tests {
         assert!(!is_newer("0.2.0", "0.2.0"));
         assert!(!is_newer("0.1.0", "0.2.0"));
         assert!(!is_newer("invalid", "0.2.0"));
+    }
+
+    #[test]
+    fn test_detect_install_method_returns_value() {
+        let method = detect_install_method();
+        assert!(method == InstallMethod::Homebrew || method == InstallMethod::Zip);
+    }
+
+    #[test]
+    fn test_install_method_label() {
+        assert_eq!(InstallMethod::Homebrew.label(), "homebrew");
+        assert_eq!(InstallMethod::Zip.label(), "zip");
+    }
+
+    #[test]
+    fn test_detect_duplicate_cli_runs() {
+        let _ = detect_duplicate_cli();
+    }
+
+    #[test]
+    fn test_update_status_json() {
+        let json = update_status_json();
+        assert!(json.get("current_version").is_some());
+        assert!(json.get("install_method").is_some());
+        assert!(json.get("duplicate_cli").is_some());
     }
 }

@@ -1045,6 +1045,27 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "tako_update",
+            "description": "アプリ内更新の診断・チェック・実行（Issue #36）。\
+                action=status で配布系統（homebrew / zip）・現在バージョン・PATH 上の重複 CLI を返す。\
+                action=check で GitHub Releases から最新版の有無を確認する（更新は行わない）。\
+                action=apply で配布系統に応じた更新を実行する \
+                （homebrew → brew upgrade --cask、zip → GitHub Releases から zip を DL して .app を差し替え）。\
+                zip 系統に brew を被せない（管理台帳と実体のズレを防ぐため）。\
+                apply 成功後の再起動は UI 側で行う（CLI / MCP からは apply 結果の確認まで）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "check", "apply"],
+                        "description": "操作種別（省略時は status）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -1588,6 +1609,9 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             pane: u64_arg(args, "pane")?.or(caller),
             direction: direction_arg(args)?,
         },
+        "tako_update" => Request::Update {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
+        },
         _ => return Err(format!("不明なツール: {name}")),
     })
 }
@@ -2018,7 +2042,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 49);
+        assert_eq!(tools.len(), 50);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
@@ -2525,7 +2549,7 @@ mod tests {
 
         #[test]
         fn tools_listはhttp経由で全カタログを返す() {
-            // 49 ツール（日本語説明文込みで数十 KB）の大きな応答が HTTP 層で
+            // 50 ツール（日本語説明文込みで数十 KB）の大きな応答が HTTP 層で
             // 欠けずに返ることを検証する（セルフテスト項目 32 のユニット版）
             let server = start_server();
             let body = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
