@@ -128,6 +128,42 @@ pub fn tmux_pane_pids(socket: Option<&str>) -> Vec<(String, u32)> {
         .collect()
 }
 
+/// 特定 tmux セッション配下で動いている claude エージェントの session_id を解決する。
+/// `backend_session` は tako の tmux バックエンドセッション名（例: `tako-s3`）。
+/// そのセッション内の pane_pid から `claude agents --json` の pid を祖先辿りでマッチする
+pub fn resolve_session_id_for_backend(backend_session: &str) -> Option<String> {
+    let socket = tako_core::tmux_backend::socket_name();
+    let panes = tmux_pane_pids(Some(&socket));
+    let target_panes: Vec<_> = panes
+        .into_iter()
+        .filter(|(id, _)| id.starts_with(&format!("{backend_session}:")))
+        .collect();
+    if target_panes.is_empty() {
+        return None;
+    }
+
+    let agents = list_agents().ok()?;
+    if agents.is_empty() {
+        return None;
+    }
+
+    let parents = process_parent_map();
+    let pane_by_pid: HashMap<u32, &str> = target_panes
+        .iter()
+        .map(|(id, pid)| (*pid, id.as_str()))
+        .collect();
+
+    for agent in &agents {
+        let Some(pid) = agent["pid"].as_u64().map(|p| p as u32) else {
+            continue;
+        };
+        if find_ancestor_pane(pid, &parents, &pane_by_pid).is_some() {
+            return agent["session_id"].as_str().map(|s| s.to_string());
+        }
+    }
+    None
+}
+
 /// エージェント一覧に tmux ペイン対応を付与した完全版を返す（remote / dispatch / CLI 共用）。
 /// `socket` 省略時は tako バックエンドソケットを使う
 pub fn list_agents_with_panes(socket: Option<&str>) -> Result<Value, String> {

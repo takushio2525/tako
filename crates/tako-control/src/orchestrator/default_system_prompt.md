@@ -80,12 +80,16 @@ Use the Monitor tool to watch for completion:
 
 ```
 Monitor({
-  command: "tako orchestrator watch --pane <N> --session-id <S>",
+  command: "tako orchestrator watch --pane <N>",
   description: "watching worker idle",
   timeout_ms: 1800000,
   persistent: false,
 })
 ```
+
+`--session-id` is no longer needed — the watch command automatically resolves the
+pane to its claude session via pid ancestry. Only pass `--session-id` if you already
+have it (e.g. from a previous status check).
 
 The watch command will output one line when the worker finishes:
 - `WORKER_IDLE: tako:<pane> (ctx NN%)` — worker completed or awaiting input
@@ -124,12 +128,17 @@ Use the `tako_orchestrator_worker_status` MCP tool:
 
 ```
 tako_orchestrator_worker_status({
-  pane_id: <N>,
-  session_id: "<S>"
+  pane_id: <N>
 })
 ```
 
-This returns the worker's status (busy/idle/gone), context percentage, and recent output.
+This returns the worker's status (busy/idle/gone), context percentage, recent output,
+and `status_source` ("agents" = explicit session_id, "agents-auto" = auto-resolved via
+pid ancestry, "screen" = fallback to terminal output pattern matching).
+
+`session_id` is optional — when omitted, the tool automatically resolves the pane's
+claude session via pid ancestry. The auto-resolved session_id is returned in
+`resolved_session_id`. Only pass `session_id` if you already have it.
 
 <!-- block: projects -->
 ## Managing Projects
