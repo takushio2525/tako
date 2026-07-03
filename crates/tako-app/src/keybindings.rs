@@ -84,13 +84,15 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
 /// CSI u（kitty keyboard protocol）の送出範囲
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CsiUMode {
-    /// レガシー端末モード（CSI u を送らない）
-    Off,
-    /// 修飾付き Enter / Tab / Backspace / Esc のみ CSI u（tmux バックエンドペイン）。
+    /// 修飾付き Enter / Tab / Backspace / Esc のみ CSI u。**全ペインの既定**
+    /// （Issue #28: tmux バックエンド限定にしていたため、tmux 無し環境の直接 spawn
+    /// ペインで Shift+Enter が素の \r に潰れ Claude Code の改行が死んでいた）。
+    /// 修飾付きキーはレガシー形式だと区別不能（Shift+Enter = \r）な一方、
+    /// Claude Code は kitty 要求・クエリなしでも CSI u 入力を解釈する
+    /// （2026-07-02 v2.1.198 素の PTY で実測）ため、常時 CSI u で送る。
     /// Esc 単押しは素の \e のまま — tmux 3.6 は受信した CSI 27u を内側ペインの
     /// kitty 要求の有無に関係なく素通しするため、CSI u 非対応アプリの入力欄に
-    /// 「27u」が文字として挿入される（2026-06-12 実機バグ）。修飾付きキーは
-    /// レガシー形式だと区別不能（Shift+Enter = \r）なので CSI u を維持する
+    /// 「27u」が文字として挿入される（2026-06-12 実機バグ）
     ModifiedOnly,
     /// Esc 単押しも CSI 27u（アプリ自身が kitty disambiguate を要求済み = 確実に解釈できる）
     Full,
@@ -106,25 +108,23 @@ pub(crate) fn encode_modifiers(m: &Modifiers) -> u8 {
 
 /// キー入力 → PTY バイト列。`csi_u` は kitty keyboard protocol（disambiguate
 /// フラグ。TUI が `CSI > 1 u` で有効化。Claude Code 等が Shift+Enter を
-/// 区別するために使う）の送出範囲。
+/// 区別するために使う）の送出範囲。UI 層は常に ModifiedOnly 以上を渡す。
 /// それ以外のフラグ（REPORT_ALL_KEYS 等）は未対応（必要になったら拡張する）
 pub(crate) fn keystroke_to_bytes(ks: &Keystroke, csi_u: CsiUMode) -> Option<Vec<u8>> {
     let mods = encode_modifiers(&ks.modifiers);
-    if csi_u != CsiUMode::Off {
-        let code: Option<u32> = match ks.key.as_str() {
-            "escape" if csi_u == CsiUMode::Full || mods > 1 => Some(27),
-            "enter" if mods > 1 => Some(13),
-            "tab" if mods > 1 => Some(9),
-            "backspace" if mods > 1 => Some(127),
-            _ => None,
-        };
-        if let Some(code) = code {
-            return Some(if mods > 1 {
-                format!("\x1b[{code};{mods}u").into_bytes()
-            } else {
-                format!("\x1b[{code}u").into_bytes()
-            });
-        }
+    let csi_u_code: Option<u32> = match ks.key.as_str() {
+        "escape" if csi_u == CsiUMode::Full || mods > 1 => Some(27),
+        "enter" if mods > 1 => Some(13),
+        "tab" if mods > 1 => Some(9),
+        "backspace" if mods > 1 => Some(127),
+        _ => None,
+    };
+    if let Some(code) = csi_u_code {
+        return Some(if mods > 1 {
+            format!("\x1b[{code};{mods}u").into_bytes()
+        } else {
+            format!("\x1b[{code}u").into_bytes()
+        });
     }
     // Ctrl+英字 → C0 制御コード
     if ks.modifiers.control {
@@ -214,59 +214,60 @@ mod tests {
         }
     }
 
-    fn keystroke_to_bytes_legacy(ks: &Keystroke) -> Option<Vec<u8>> {
-        keystroke_to_bytes(ks, CsiUMode::Off)
+    /// 既定モード（ModifiedOnly = 全ペイン共通）でのバイト変換
+    fn keystroke_to_bytes_default(ks: &Keystroke) -> Option<Vec<u8>> {
+        keystroke_to_bytes(ks, CsiUMode::ModifiedOnly)
     }
 
     #[test]
     fn 特殊キーは正しいバイト列を送る() {
         assert_eq!(
-            keystroke_to_bytes_legacy(&ks("backspace")),
+            keystroke_to_bytes_default(&ks("backspace")),
             Some(b"\x7f".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes_legacy(&ks("enter")),
+            keystroke_to_bytes_default(&ks("enter")),
             Some(b"\r".to_vec())
         );
-        assert_eq!(keystroke_to_bytes_legacy(&ks("tab")), Some(b"\t".to_vec()));
+        assert_eq!(keystroke_to_bytes_default(&ks("tab")), Some(b"\t".to_vec()));
         assert_eq!(
-            keystroke_to_bytes_legacy(&ks("escape")),
+            keystroke_to_bytes_default(&ks("escape")),
             Some(b"\x1b".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes_legacy(&ks("up")),
+            keystroke_to_bytes_default(&ks("up")),
             Some(b"\x1b[A".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes_legacy(&ks("down")),
+            keystroke_to_bytes_default(&ks("down")),
             Some(b"\x1b[B".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes_legacy(&ks("right")),
+            keystroke_to_bytes_default(&ks("right")),
             Some(b"\x1b[C".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes_legacy(&ks("left")),
+            keystroke_to_bytes_default(&ks("left")),
             Some(b"\x1b[D".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes_legacy(&ks("home")),
+            keystroke_to_bytes_default(&ks("home")),
             Some(b"\x1b[H".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes_legacy(&ks("end")),
+            keystroke_to_bytes_default(&ks("end")),
             Some(b"\x1b[F".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes_legacy(&ks("pageup")),
+            keystroke_to_bytes_default(&ks("pageup")),
             Some(b"\x1b[5~".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes_legacy(&ks("pagedown")),
+            keystroke_to_bytes_default(&ks("pagedown")),
             Some(b"\x1b[6~".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes_legacy(&ks("delete")),
+            keystroke_to_bytes_default(&ks("delete")),
             Some(b"\x1b[3~".to_vec())
         );
     }
@@ -274,17 +275,15 @@ mod tests {
     #[test]
     fn 修飾付き機能キーはxterm形式で送る() {
         assert_eq!(
-            keystroke_to_bytes_legacy(&ks_shift("up")),
+            keystroke_to_bytes_default(&ks_shift("up")),
             Some(b"\x1b[1;2A".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes_legacy(&ks_shift("delete")),
+            keystroke_to_bytes_default(&ks_shift("delete")),
             Some(b"\x1b[3;2~".to_vec())
         );
-        assert_eq!(
-            keystroke_to_bytes_legacy(&ks_shift("enter")),
-            Some(b"\r".to_vec())
-        );
+        // Shift+Enter は xterm 形式に修飾表現が無いため CSI u で送る
+        // （既定モードのアサートは「バックエンドペインは…」テスト側）
     }
 
     #[test]
@@ -324,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn バックエンドペインはesc単押しを素のescで送る() {
+    fn 既定モードはesc単押しを素のescで送り修飾付きキーはcsi_uで送る() {
         assert_eq!(
             keystroke_to_bytes(&ks("escape"), CsiUMode::ModifiedOnly),
             Some(b"\x1b".to_vec())
@@ -345,27 +344,27 @@ mod tests {
 
     #[test]
     fn ctrl英字はc0制御コードを送る() {
-        assert_eq!(keystroke_to_bytes_legacy(&ks_ctrl("a")), Some(vec![0x01]));
-        assert_eq!(keystroke_to_bytes_legacy(&ks_ctrl("c")), Some(vec![0x03]));
-        assert_eq!(keystroke_to_bytes_legacy(&ks_ctrl("u")), Some(vec![0x15]));
-        assert_eq!(keystroke_to_bytes_legacy(&ks_ctrl("z")), Some(vec![0x1a]));
+        assert_eq!(keystroke_to_bytes_default(&ks_ctrl("a")), Some(vec![0x01]));
+        assert_eq!(keystroke_to_bytes_default(&ks_ctrl("c")), Some(vec![0x03]));
+        assert_eq!(keystroke_to_bytes_default(&ks_ctrl("u")), Some(vec![0x15]));
+        assert_eq!(keystroke_to_bytes_default(&ks_ctrl("z")), Some(vec![0x1a]));
     }
 
     #[test]
     fn 印字可能文字はkey_charをそのまま送る() {
         assert_eq!(
-            keystroke_to_bytes_legacy(&ks_char("a", "a")),
+            keystroke_to_bytes_default(&ks_char("a", "a")),
             Some(b"a".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes_legacy(&ks_char("space", " ")),
+            keystroke_to_bytes_default(&ks_char("space", " ")),
             Some(b" ".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes_legacy(&ks_char("a", "あ")),
+            keystroke_to_bytes_default(&ks_char("a", "あ")),
             Some("あ".as_bytes().to_vec())
         );
-        assert_eq!(keystroke_to_bytes_legacy(&ks("f5")), None);
+        assert_eq!(keystroke_to_bytes_default(&ks("f5")), None);
     }
 
     #[test]

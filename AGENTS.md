@@ -61,6 +61,7 @@ tako/
 |---|---|
 | dev（最小ターミナル起動） | `cargo run -p tako-app` |
 | セルフテスト起動（入力経路 + CLI / MCP e2e の機械検証） | `TAKO_SELF_TEST=1 cargo run -p tako-app` |
+| 実 claude の Shift+Enter 改行 e2e（#28。要 claude CLI + 認証） | `TAKO_SELF_TEST=1 TAKO_SELF_TEST_CLAUDE=1 cargo run -p tako-app`（セルフテスト 45c として実行） |
 | Claude Code 実機検証（MCP 設定ゼロ接続） | `scripts/verify-claude-mcp.sh`（要 claude CLI + 認証） |
 | MCP セットアップ | `tako setup-mcp`（`~/.claude/settings.json` に自動追加。`--project` でプロジェクト単位） |
 | `tako` CLI ビルド | `cargo build -p tako-cli`（バイナリは `target/debug/tako`） |
