@@ -428,10 +428,12 @@ pub enum Request {
         pane: Option<u64>,
         direction: Option<Direction>,
     },
-    /// アプリ内更新の診断・実行（Issue #36）。
+    /// アプリ内更新の診断・実行（Issue #36 + #50）。
     /// `action` 省略 or `"status"` → 配布系統・現在バージョン・重複 CLI の診断情報。
     /// `"check"` → GitHub Releases を問い合わせて最新版の有無を返す（更新しない）。
-    /// `"apply"` → 配布系統に応じた更新を実行する（再起動は UI 側の責務）
+    /// `"apply"` → 配布系統に応じた更新を実行する（再起動は UI 側の責務）。
+    /// `"apply-zip"` → 配布系統を問わず zip 経由で強制更新する（brew 失敗時のフォールバック）。
+    /// `"repair"` → broken-brew 状態を修復する（brew install --cask --force で台帳を再締結）
     Update {
         #[serde(default)]
         action: Option<String>,

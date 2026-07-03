@@ -108,6 +108,36 @@ claude mcp add --scope user tako -- /Applications/tako.app/Contents/MacOS/tako m
 
 Register the bundled stdio bridge with any of the methods above; after that, pane-control tools are available with zero per-project setup. Outside tako the bridge exposes 0 tools and stays out of the way.
 
+## トラブルシューティング / Troubleshooting
+
+### brew upgrade が失敗して更新できなくなった場合
+
+Homebrew の Swift toolchain（`copy-xattrs.swift`）が CommandLineTools/SDK のバージョン不整合でビルド失敗し、`brew upgrade --cask tako` が中断されると、cask 台帳から tako が消えているのに `/Applications/tako.app` の実体は残る「詰み状態」が発生することがあります。
+
+この状態では `brew install --cask tako` も「It seems there is already an App at '/Applications/tako.app'」で失敗します。
+
+**復旧方法（いずれか）:**
+
+```sh
+# 方法 1: tako CLI で修復（推奨。tako が起動している場合）
+tako update repair
+
+# 方法 2: brew で台帳を再締結
+brew install --cask takushio2525/tako/tako --force
+
+# 方法 3: brew を諦めて zip で手動更新
+tako update apply-zip
+```
+
+`tako update status` で現在の配布系統を確認できます。`install_method` が `broken-brew` と表示される場合、上記の復旧が必要です。
+
+**根本原因の解消:** Homebrew の Swift toolchain エラーが根本原因の場合、以下で Xcode CommandLineTools を再インストールすると brew 側の問題も解消します:
+
+```sh
+sudo rm -rf /Library/Developer/CommandLineTools
+xcode-select --install
+```
+
 ## ライセンス / License
 
 [GPL-3.0-or-later](LICENSE) — 依存クレート（zlog / ztracing、Zed リポ由来）が GPL-3.0 のため。

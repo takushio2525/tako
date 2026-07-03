@@ -304,6 +304,7 @@ impl TakoApp {
                 let method_label = match method {
                     super::update_checker::InstallMethod::Homebrew => "brew",
                     super::update_checker::InstallMethod::Zip => "zip",
+                    super::update_checker::InstallMethod::BrokenBrew => "zip (brew 破損)",
                 };
                 Some(
                     pill()
@@ -353,7 +354,8 @@ impl TakoApp {
                 let method = super::update_checker::detect_install_method();
                 let method_label = match method {
                     super::update_checker::InstallMethod::Homebrew => "Homebrew",
-                    super::update_checker::InstallMethod::Zip => "ZIP 差し替え",
+                    super::update_checker::InstallMethod::Zip
+                    | super::update_checker::InstallMethod::BrokenBrew => "ZIP 差し替え",
                 };
                 Some(
                     pill()
@@ -445,6 +447,53 @@ impl TakoApp {
                     )
                     .into_any_element(),
             ),
+            super::update_checker::UpdateState::BrewFailedFallback { brew_error, .. } => {
+                let err_short = if brew_error.len() > 80 {
+                    format!("{}…", &brew_error[..77])
+                } else {
+                    brew_error.clone()
+                };
+                Some(
+                    pill()
+                        .id("update-brew-fallback")
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(hsla(theme.red))
+                                .child(SharedString::from(format!("brew 更新失敗: {err_short}"))),
+                        )
+                        .child(
+                            div()
+                                .id("update-fallback-zip")
+                                .cursor_pointer()
+                                .px_1()
+                                .rounded(px(3.0))
+                                .bg(hsla(theme.accent))
+                                .text_size(px(10.0))
+                                .text_color(hsla(theme.background))
+                                .hover(|d| d.opacity(0.8))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.start_zip_fallback(cx);
+                                }))
+                                .child("zip で更新"),
+                        )
+                        .child(
+                            div()
+                                .id("update-fallback-dismiss")
+                                .cursor_pointer()
+                                .text_size(px(10.5))
+                                .text_color(hsla(theme.text_tertiary))
+                                .hover(|d| d.text_color(hsla(theme.text_secondary)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.update_state =
+                                        super::update_checker::UpdateState::Dismissed;
+                                    cx.notify();
+                                }))
+                                .child("×"),
+                        )
+                        .into_any_element(),
+                )
+            }
             _ => None,
         }
     }
@@ -465,6 +514,7 @@ impl TakoApp {
         };
         self.update_state = super::update_checker::UpdateState::Updating("更新中...".into());
         cx.notify();
+        let info_for_fallback = info.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -477,7 +527,58 @@ impl TakoApp {
                             "{msg} — 再起動中..."
                         ));
                         cx.notify();
-                        // 自動再起動: layout を保存してから再起動
+                        app.save_layout();
+                        if let Err(e) = super::update_checker::restart_app() {
+                            app.update_state = super::update_checker::UpdateState::Failed(format!(
+                                "更新は完了しましたが再起動に失敗: {e}"
+                            ));
+                            cx.notify();
+                            return;
+                        }
+                        cx.quit();
+                    }
+                    Err(msg) => {
+                        // brew 失敗で zip フォールバック可能な場合は専用状態に遷移（#50）
+                        let method = super::update_checker::detect_install_method();
+                        if method == super::update_checker::InstallMethod::Homebrew
+                            && info_for_fallback.download_url.is_some()
+                        {
+                            app.update_state =
+                                super::update_checker::UpdateState::BrewFailedFallback {
+                                    brew_error: msg,
+                                    info: info_for_fallback.clone(),
+                                };
+                        } else {
+                            app.update_state = super::update_checker::UpdateState::Failed(msg);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn start_zip_fallback(&mut self, cx: &mut Context<Self>) {
+        let info = match &self.update_state {
+            super::update_checker::UpdateState::BrewFailedFallback { info, .. } => info.clone(),
+            _ => return,
+        };
+        self.update_state =
+            super::update_checker::UpdateState::Updating("zip フォールバックで更新中...".into());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { super::update_checker::perform_update_zip(&info) })
+                .await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                match result {
+                    Ok(msg) => {
+                        app.update_state = super::update_checker::UpdateState::Done(format!(
+                            "{msg} — 再起動中..."
+                        ));
+                        cx.notify();
                         app.save_layout();
                         if let Err(e) = super::update_checker::restart_app() {
                             app.update_state = super::update_checker::UpdateState::Failed(format!(

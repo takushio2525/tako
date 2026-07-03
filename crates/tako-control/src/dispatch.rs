@@ -193,6 +193,14 @@ pub trait ControlHost {
     fn update_apply(&mut self) -> Result<Value, String> {
         Err("この環境では更新を実行できない".into())
     }
+    /// zip 強制更新（#50）。brew 失敗時のフォールバック。配布系統を問わず zip で更新する
+    fn update_apply_zip(&mut self) -> Result<Value, String> {
+        Err("この環境では更新を実行できない".into())
+    }
+    /// broken-brew の修復（#50）。`brew install --cask --force` で台帳を再締結する
+    fn update_repair(&mut self) -> Result<Value, String> {
+        Err("この環境では修復を実行できない".into())
+    }
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -1562,8 +1570,10 @@ pub fn dispatch(
                 "status" => Ok(host.update_status()),
                 "check" => Ok(host.update_check()),
                 "apply" => host.update_apply().map_err(DispatchError::Operation),
+                "apply-zip" => host.update_apply_zip().map_err(DispatchError::Operation),
+                "repair" => host.update_repair().map_err(DispatchError::Operation),
                 other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / check / apply のいずれか）"
+                    "不明な action: {other:?}（status / check / apply / apply-zip / repair のいずれか）"
                 ))),
             }
         }
