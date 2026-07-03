@@ -300,6 +300,11 @@ impl TakoApp {
         match &self.update_state {
             super::update_checker::UpdateState::Available(info) => {
                 let ver = info.version.clone();
+                let method = super::update_checker::detect_install_method();
+                let method_label = match method {
+                    super::update_checker::InstallMethod::Homebrew => "brew",
+                    super::update_checker::InstallMethod::Zip => "zip",
+                };
                 Some(
                     pill()
                         .id("update-banner")
@@ -307,7 +312,9 @@ impl TakoApp {
                             div()
                                 .text_size(px(10.5))
                                 .text_color(hsla(theme.accent))
-                                .child(SharedString::from(format!("v{ver} が利用可能"))),
+                                .child(SharedString::from(format!(
+                                    "v{ver} が利用可能（{method_label}）"
+                                ))),
                         )
                         .child(
                             div()
@@ -320,7 +327,7 @@ impl TakoApp {
                                 .text_color(hsla(theme.background))
                                 .hover(|d| d.opacity(0.8))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.start_update(cx);
+                                    this.show_update_confirm(cx);
                                 }))
                                 .child("更新"),
                         )
@@ -337,6 +344,58 @@ impl TakoApp {
                                     cx.notify();
                                 }))
                                 .child("×"),
+                        )
+                        .into_any_element(),
+                )
+            }
+            super::update_checker::UpdateState::ConfirmPending(info) => {
+                let ver = info.version.clone();
+                let method = super::update_checker::detect_install_method();
+                let method_label = match method {
+                    super::update_checker::InstallMethod::Homebrew => "Homebrew",
+                    super::update_checker::InstallMethod::Zip => "ZIP 差し替え",
+                };
+                Some(
+                    pill()
+                        .id("update-confirm")
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(hsla(theme.yellow))
+                                .child(SharedString::from(format!(
+                                    "v{ver} に更新して再起動しますか？（{method_label}。実行中のプロセスは失われます）"
+                                ))),
+                        )
+                        .child(
+                            div()
+                                .id("update-confirm-yes")
+                                .cursor_pointer()
+                                .px_1()
+                                .rounded(px(3.0))
+                                .bg(hsla(theme.accent))
+                                .text_size(px(10.0))
+                                .text_color(hsla(theme.background))
+                                .hover(|d| d.opacity(0.8))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.start_update(cx);
+                                }))
+                                .child("実行"),
+                        )
+                        .child(
+                            div()
+                                .id("update-confirm-no")
+                                .cursor_pointer()
+                                .px_1()
+                                .rounded(px(3.0))
+                                .text_size(px(10.0))
+                                .text_color(hsla(theme.text_secondary))
+                                .hover(|d| d.text_color(hsla(theme.text_secondary)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.update_state =
+                                        super::update_checker::UpdateState::Dismissed;
+                                    cx.notify();
+                                }))
+                                .child("キャンセル"),
                         )
                         .into_any_element(),
                 )
@@ -359,19 +418,6 @@ impl TakoApp {
                             .text_size(px(10.5))
                             .text_color(hsla(theme.green))
                             .child(SharedString::from(msg.clone())),
-                    )
-                    .child(
-                        div()
-                            .id("update-done-dismiss")
-                            .cursor_pointer()
-                            .text_size(px(10.5))
-                            .text_color(hsla(theme.text_tertiary))
-                            .hover(|d| d.text_color(hsla(theme.text_secondary)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_state = super::update_checker::UpdateState::Dismissed;
-                                cx.notify();
-                            }))
-                            .child("×"),
                     )
                     .into_any_element(),
             ),
@@ -403,9 +449,18 @@ impl TakoApp {
         }
     }
 
-    fn start_update(&mut self, cx: &mut Context<Self>) {
+    fn show_update_confirm(&mut self, cx: &mut Context<Self>) {
         let info = match &self.update_state {
             super::update_checker::UpdateState::Available(info) => info.clone(),
+            _ => return,
+        };
+        self.update_state = super::update_checker::UpdateState::ConfirmPending(info);
+        cx.notify();
+    }
+
+    fn start_update(&mut self, cx: &mut Context<Self>) {
+        let info = match &self.update_state {
+            super::update_checker::UpdateState::ConfirmPending(info) => info.clone(),
             _ => return,
         };
         self.update_state = super::update_checker::UpdateState::Updating("更新中...".into());
@@ -418,7 +473,20 @@ impl TakoApp {
             let _ = this.update(cx, |app: &mut TakoApp, cx| {
                 match result {
                     Ok(msg) => {
-                        app.update_state = super::update_checker::UpdateState::Done(msg);
+                        app.update_state = super::update_checker::UpdateState::Done(format!(
+                            "{msg} — 再起動中..."
+                        ));
+                        cx.notify();
+                        // 自動再起動: layout を保存してから再起動
+                        app.save_layout();
+                        if let Err(e) = super::update_checker::restart_app() {
+                            app.update_state = super::update_checker::UpdateState::Failed(format!(
+                                "更新は完了しましたが再起動に失敗: {e}"
+                            ));
+                            cx.notify();
+                            return;
+                        }
+                        cx.quit();
                     }
                     Err(msg) => {
                         app.update_state = super::update_checker::UpdateState::Failed(msg);
