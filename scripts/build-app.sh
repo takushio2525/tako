@@ -112,34 +112,54 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# 署名 identity の解決。ad-hoc（-s -）はビルドごとに CDHash が変わり、macOS の
-# TCC がビルドのたびに別アプリ扱いして権限（フォルダアクセス等）をリセットする
-# （2026-06-12 実機バグ: 何回承認してもダイアログが再出現）。安定 identity =
-# キーチェーンの Apple Development 証明書（Xcode が管理。無ければ TAKO_CODESIGN_IDENTITY
-# で自己署名証明書等を指定）で署名し、権限の承認をビルドをまたいで保持する。
-# 配布署名（Developer ID + notarization）は Phase 7 で別途
+# 署名。designated requirement（DR）を identifier 固定で明示する（Issue #54 根治）。
+#
+# macOS の TCC は付与済み権限をアプリの DR（csreq）に紐付けて保存する。codesign
+# 既定の DR は署名証明書に依存し（例: certificate leaf[subject.CN] = "Apple
+# Development: ..."）、以下のいずれでも DR が変わって TCC が「別アプリ」と判定し、
+# 付与済み権限（ほかのアプリのデータ / フォルダアクセス等）が無効化されていた:
+#   - キーチェーンに Apple Development 証明書が複数あり選択が揺れる
+#     （find-identity の列挙順は不定。2026-07-03 実機で 2 枚を確認）
+#   - 証明書の失効・再発行（Apple Development は 1 年で失効する）
+#   - ad-hoc への劣化（DR が CDHash 単位になり毎ビルドで変わる）
+# DR を identifier のみに固定すると、どの identity で署名しても・何度ビルドしても・
+# アプリ内更新（zip 差し替え。ditto コピーで署名は保持される）の後も DR が不変になり、
+# TCC の許可がビルド・更新をまたいで保持される。
+# トレードオフ: 同じ identifier を名乗るローカルの別バイナリも DR を満たせる
+# （なりすまし耐性は低下）。ローカル開発ツールの脅威モデルでは許容し、Phase 7 の
+# Developer ID 配布時に anchor + Team ID を含む DR へ強化する（強化時は 1 回だけ
+# TCC の再許可が発生する）。
+REQ_APP='designated => identifier "dev.takushio.tako"'
+REQ_CLI='designated => identifier "dev.takushio.tako.cli"'
 resolve_sign_identity() {
   if [[ -n "${TAKO_CODESIGN_IDENTITY:-}" ]]; then
     echo "$TAKO_CODESIGN_IDENTITY"
     return
   fi
-  # 最初の有効な Apple Development identity の SHA-1 を使う（名前指定は重複時に
-  # codesign が ambiguous で落ちるため、ハッシュ指定で一意化する）
+  # Apple Development identity の SHA-1 を昇順ソートの先頭で選ぶ（複数枚あるとき
+  # find-identity の列挙順が不定でも選択が揺れないよう決定論化。DR は identifier
+  # 固定なのでどれが選ばれても TCC には影響しない。名前指定は重複時に codesign が
+  # ambiguous で落ちるため、ハッシュ指定で一意化する）
   security find-identity -p codesigning -v 2>/dev/null \
-    | sed -n 's/^ *[0-9]*) \([0-9A-F]\{40\}\) "Apple Development:.*/\1/p' | head -1
+    | sed -n 's/^ *[0-9]*) \([0-9A-F]\{40\}\) "Apple Development:.*/\1/p' | sort | head -1
 }
 IDENTITY=$(resolve_sign_identity)
 if [[ -n "$IDENTITY" ]]; then
-  echo "==> 署名（identity: ${IDENTITY}。TCC 権限がビルドをまたいで保持される）"
-  codesign --force -s "$IDENTITY" "$APP/Contents/MacOS/tako"
-  codesign --force -s "$IDENTITY" "$APP"
+  IDENTITY_NAME=$(security find-identity -p codesigning -v 2>/dev/null \
+    | grep -F "$IDENTITY" | sed -E 's/.*"(.*)"/\1/' | head -1)
+  echo "==> 署名（identity: ${IDENTITY_NAME:-$IDENTITY} / DR: identifier 固定）"
+  codesign --force -s "$IDENTITY" -i dev.takushio.tako.cli -r="$REQ_CLI" "$APP/Contents/MacOS/tako"
+  codesign --force -s "$IDENTITY" -r="$REQ_APP" "$APP"
 else
-  echo "==> ad-hoc 署名（注意: 安定 identity が無いため、ビルドごとに TCC の"
-  echo "    フォルダアクセス権限がリセットされる。Xcode で Apple Development 証明書を"
-  echo "    作るか TAKO_CODESIGN_IDENTITY を指定すると解消する）"
-  codesign --force -s - "$APP/Contents/MacOS/tako"
-  codesign --force -s - "$APP"
+  echo "==> ad-hoc 署名（identity なし。DR は identifier 固定のため、ad-hoc でも"
+  echo "    TCC の権限承認はビルドをまたいで保持される）"
+  codesign --force -s - -i dev.takushio.tako.cli -r="$REQ_CLI" "$APP/Contents/MacOS/tako"
+  codesign --force -s - -r="$REQ_APP" "$APP"
 fi
+
+echo "==> 署名検証（designated requirement の固定を機械確認）"
+codesign --verify -R='identifier "dev.takushio.tako"' "$APP"
+codesign --verify -R='identifier "dev.takushio.tako.cli"' "$APP/Contents/MacOS/tako"
 
 echo "==> 生成完了: ${APP}（バージョン ${VERSION}）"
 
