@@ -288,3 +288,11 @@
   フィールド追加。textarea 化で Shift+Enter 改行対応（#26）。CLI/MCP scrollback（計 51 ツール）
 - 関連コミット: `8673993`（feature/42-remote-frontend-v2 worktree → PR #45 squash merge）
 - 次: スマホ実機での最終確認（WS・リサイズ・履歴・Quick keys）
+
+## 2026-07-03（Issue #54: TCC 許可ダイアログ頻発の根治 — 署名 DR の identifier 固定）
+- 根因を実測で特定: ダイアログ = macOS 26 の kTCCServiceSystemPolicyAppData（per-target 許可。
+  トリガーは claude sandbox の iCloud/Google Drive アクセス、tako 名義は responsible process のため）+
+  署名 DR が証明書依存で不安定（Apple Development 2 枚 + head -1 選択）だと許可が全リセット。
+  build-app.sh の codesign に explicit DR（identifier 固定）+ identity 選択の決定論化 + 署名検証を追加
+- 関連コミット: `fix/54-tcc-signing` worktree → PR squash merge
+- 次: 実機 TCC 検証（tccutil reset はユーザー同意が必要 → manual-checks.md 参照）
