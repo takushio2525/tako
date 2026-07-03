@@ -1025,6 +1025,21 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_remote_scrollback",
+            "description": "ペインのスクロールバック履歴をプレーンテキストで取得する。\
+                tmux capture-pane で指定行数の履歴を取得し、ANSI なしのテキストとして返す。\
+                リモートからの画面履歴確認やログ検索に使う。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane_id": { "type": "string", "description": "対象ペイン ID（必須。session:window.pane）" },
+                    "lines": { "type": "integer", "minimum": 1, "default": 1000, "description": "取得する履歴行数（省略時は 1000）" },
+                },
+                "required": ["pane_id"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_chrome_open",
             "description": "URL を Chrome CDP ミラー方式で Web ビューペインとして開く（FR-3.8 PoC）。\
                 Chrome を --remote-debugging-port 付きで起動し、ページのスクリーンショットを \
@@ -1604,6 +1619,12 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
             session_id: str_arg(args, "session_id")?.ok_or("session_id を指定する")?,
             tail: u64_arg(args, "tail")?.map(|n| n as usize),
         },
+        "tako_remote_scrollback" => Request::RemoteScrollback {
+            pane_id: str_arg(args, "pane_id")?
+                .ok_or("pane_id を指定する")?
+                .to_string(),
+            lines: u64_arg(args, "lines")?.map(|n| n as u32),
+        },
         "tako_chrome_open" => Request::ChromeOpen {
             url: str_arg(args, "url")?.ok_or("url は必須")?.to_string(),
             pane: u64_arg(args, "pane")?.or(caller),
@@ -2042,7 +2063,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 50);
+        assert_eq!(tools.len(), 51);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

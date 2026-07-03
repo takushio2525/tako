@@ -7,16 +7,16 @@ import { getActiveMachine } from '../store';
 import { createClient } from '../api';
 
 const QUICK_KEYS = [
-  { label: 'esc',    seq: '\x1b' },
-  { label: 'tab',    seq: '\t' },
-  { label: 'ctrl',   seq: null },
-  { label: '^C',     seq: '\x03', accent: true },
-  { label: '↑',      seq: '\x1b[A' },
-  { label: '↓',      seq: '\x1b[B' },
-  { label: '←',      seq: '\x1b[D' },
-  { label: '→',      seq: '\x1b[C' },
-  { label: '|',      seq: '|' },
-  { label: '~',      seq: '~' },
+  { label: 'esc',    seq: 'Escape' },
+  { label: 'tab',    seq: 'Tab' },
+  { label: 'ctrl',   seq: null, toggle: true },
+  { label: '^C',     seq: 'C-c', accent: true },
+  { label: '↑',      seq: 'Up' },
+  { label: '↓',      seq: 'Down' },
+  { label: '←',      seq: 'Left' },
+  { label: '→',      seq: 'Right' },
+  { label: '|',      literal: '|' },
+  { label: '~',      literal: '~' },
 ];
 
 const TAKO_THEME = {
@@ -44,14 +44,16 @@ const TAKO_THEME = {
   brightWhite: '#f1f5f9',
 };
 
-const POLL_INTERVAL = 1000;
-
 export function TerminalPage({ paneId }) {
   const [loading, setLoading] = useState(true);
   const [info, setInfo] = useState(null);
   const [allPanes, setAllPanes] = useState([]);
-  const [connected, setConnected] = useState(true);
+  const [connected, setConnected] = useState(false);
   const [input, setInput] = useState('');
+  const [layer, setLayer] = useState('live');
+  const [scrollbackLines, setScrollbackLines] = useState([]);
+  const [scrollbackLoading, setScrollbackLoading] = useState(false);
+  const [ctrlMode, setCtrlMode] = useState(false);
   const machine = getActiveMachine();
 
   const termRef = useRef(null);
@@ -59,15 +61,18 @@ export function TerminalPage({ paneId }) {
   const containerRef = useRef(null);
   const inputRef = useRef(null);
   const clientRef = useRef(null);
-  const timerRef = useRef(null);
-  const prevContentRef = useRef('');
+  const wsRef = useRef(null);
   const touchRef = useRef({ x: 0, y: 0 });
-  const failCountRef = useRef(0);
+  const prevContentRef = useRef('');
+  const scrollbackRef = useRef(null);
+  const reconnectTimerRef = useRef(null);
+  const paneListTimerRef = useRef(null);
 
   if (machine && !clientRef.current) {
     clientRef.current = createClient(machine.host, machine.token);
   }
 
+  // xterm.js 初期化
   useEffect(() => {
     if (!containerRef.current) return;
     const term = new Terminal({
@@ -75,9 +80,9 @@ export function TerminalPage({ paneId }) {
       fontFamily: "'Geist Mono', 'SF Mono', 'JetBrains Mono', 'Fira Code', ui-monospace, monospace",
       fontSize: 14,
       lineHeight: 1.2,
-      cursorBlink: false,
+      cursorBlink: true,
       cursorStyle: 'block',
-      scrollback: 500,
+      scrollback: 0,
       disableStdin: true,
       convertEol: true,
     });
@@ -107,37 +112,77 @@ export function TerminalPage({ paneId }) {
     };
   }, []);
 
-  const refresh = useCallback(async () => {
+  // WS 接続（ライブレイヤー）
+  const connectWs = useCallback(() => {
+    if (!clientRef.current || !paneId) return;
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+
+    const term = termRef.current;
+    const fit = fitRef.current;
+    let cols, rows;
+    if (term) {
+      try { fit?.fit(); } catch {}
+      cols = term.cols;
+      rows = term.rows;
+    }
+
+    const url = clientRef.current.wsUrl(paneId, cols, rows);
+    const protocols = clientRef.current.wsProtocols();
+    const ws = new WebSocket(url, protocols);
+
+    ws.onopen = () => {
+      setConnected(true);
+      setLoading(false);
+      prevContentRef.current = '';
+    };
+
+    ws.onmessage = (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
+        if (data.type === 'screen' && term) {
+          const lines = data.lines || [];
+          const content = lines.join('\n');
+          if (content !== prevContentRef.current) {
+            prevContentRef.current = content;
+            let buf = '\x1b[H';
+            for (const line of lines) {
+              buf += '\x1b[2K' + line + '\x1b[0m\r\n';
+            }
+            buf += '\x1b[J';
+            if (data.cursor) {
+              buf += `\x1b[${data.cursor.y + 1};${data.cursor.x + 1}H`;
+            }
+            term.write(buf);
+          }
+        }
+      } catch {}
+    };
+
+    ws.onclose = () => {
+      setConnected(false);
+      wsRef.current = null;
+      reconnectTimerRef.current = setTimeout(connectWs, 3000);
+    };
+
+    ws.onerror = () => {
+      ws.close();
+    };
+
+    wsRef.current = ws;
+  }, [paneId]);
+
+  // ペイン一覧の定期取得
+  const refreshPanes = useCallback(async () => {
     if (!clientRef.current) return;
     try {
-      const [screen, panesList] = await Promise.all([
-        clientRef.current.screen(paneId, null, true),
-        clientRef.current.panes(),
-      ]);
-      const lines = screen.lines || [];
-      const content = lines.join('\n');
-      if (content !== prevContentRef.current && termRef.current) {
-        prevContentRef.current = content;
-        let buf = '\x1b[H';
-        // 行末に SGR リセットを付け、ANSI 色が次行へ漏れないようにする
-        for (const line of lines) { buf += '\x1b[2K' + line + '\x1b[0m\r\n'; }
-        buf += '\x1b[J';
-        if (screen.cursor) {
-          buf += `\x1b[${screen.cursor.y + 1};${screen.cursor.x + 1}H`;
-        }
-        termRef.current.write(buf);
-      }
-      const list = panesList.panes || [];
+      const result = await clientRef.current.panes();
+      const list = result.panes || [];
       setAllPanes(list);
       setInfo(list.find(p => p.id === paneId) || null);
-      setLoading(false);
-      setConnected(true);
-      failCountRef.current = 0;
-    } catch {
-      failCountRef.current++;
-      if (failCountRef.current >= 3) setConnected(false);
-      setLoading(false);
-    }
+    } catch {}
   }, [paneId]);
 
   useEffect(() => {
@@ -146,26 +191,69 @@ export function TerminalPage({ paneId }) {
     prevContentRef.current = '';
     if (termRef.current) termRef.current.clear();
     setLoading(true);
-    setConnected(true);
-    failCountRef.current = 0;
-    refresh();
-    timerRef.current = setInterval(refresh, POLL_INTERVAL);
-    return () => clearInterval(timerRef.current);
-  }, [paneId, refresh]);
+    setConnected(false);
+
+    connectWs();
+    refreshPanes();
+    paneListTimerRef.current = setInterval(refreshPanes, 5000);
+
+    return () => {
+      clearInterval(paneListTimerRef.current);
+      clearTimeout(reconnectTimerRef.current);
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    };
+  }, [paneId, connectWs, refreshPanes]);
+
+  // 履歴レイヤーのデータ取得
+  const loadScrollback = useCallback(async () => {
+    if (!clientRef.current) return;
+    setScrollbackLoading(true);
+    try {
+      const result = await clientRef.current.scrollback(paneId, 2000);
+      setScrollbackLines(result.lines || []);
+    } catch {
+      setScrollbackLines(['(スクロールバックの取得に失敗しました)']);
+    }
+    setScrollbackLoading(false);
+  }, [paneId]);
+
+  useEffect(() => {
+    if (layer === 'history') loadScrollback();
+  }, [layer, loadScrollback]);
+
+  useEffect(() => {
+    if (layer === 'history' && scrollbackRef.current && scrollbackLines.length > 0) {
+      scrollbackRef.current.scrollTop = scrollbackRef.current.scrollHeight;
+    }
+  }, [layer, scrollbackLines]);
 
   async function send() {
     if (!clientRef.current) return;
     const text = input;
     setInput('');
     if (navigator.vibrate) navigator.vibrate(10);
-    try { await clientRef.current.input(paneId, text, true); setTimeout(refresh, 200); } catch {}
+    try {
+      await clientRef.current.input(paneId, text, true);
+    } catch {}
     inputRef.current?.focus();
   }
 
-  async function sendKey(seq) {
-    if (!clientRef.current || !seq) return;
+  async function sendKey(k) {
+    if (!clientRef.current) return;
     if (navigator.vibrate) navigator.vibrate(10);
-    try { await clientRef.current.input(paneId, seq, false); setTimeout(refresh, 200); } catch {}
+    if (k.literal) {
+      try { await clientRef.current.input(paneId, k.literal, false); } catch {}
+    } else if (k.seq) {
+      let seq = k.seq;
+      if (ctrlMode && seq.length === 1) {
+        seq = `C-${seq}`;
+        setCtrlMode(false);
+      }
+      try { await clientRef.current.sendKeys(paneId, seq); } catch {}
+    }
   }
 
   function onTouchStart(e) {
@@ -181,8 +269,13 @@ export function TerminalPage({ paneId }) {
     else if (dx < 0 && idx < allPanes.length - 1) window.location.hash = `#/panes/${allPanes[idx + 1].id}`;
   }
 
-  function onKeyDown(e) {
-    if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); send(); }
+  // #41 の isComposing ガード + Shift+Enter で改行（#26）
+  function onInputKeyDown(e) {
+    if (e.isComposing) return;
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
   }
 
   function onSubmit(e) {
@@ -207,28 +300,74 @@ export function TerminalPage({ paneId }) {
             <span class="terminal-meta">{machine.name}{pos ? ` · ${pos}` : ''}</span>
           </div>
         </div>
+        <div class="terminal-header-right">
+          <button
+            class={`layer-toggle${layer === 'history' ? ' active' : ''}`}
+            onClick={() => setLayer(layer === 'live' ? 'history' : 'live')}
+            title={layer === 'live' ? '履歴を表示' : 'ライブに戻る'}
+          >
+            {layer === 'live' ? '↑履歴' : '●ライブ'}
+          </button>
+        </div>
       </header>
 
-      <div class="xterm-container" ref={containerRef} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd} onClick={() => inputRef.current?.focus()}>
-        {loading && <div class="xterm-loading"><div class="spinner" /></div>}
-      </div>
+      {layer === 'live' ? (
+        <div
+          class="xterm-container"
+          ref={containerRef}
+          onTouchStart={onTouchStart}
+          onTouchEnd={onTouchEnd}
+          onClick={() => inputRef.current?.focus()}
+        >
+          {loading && <div class="xterm-loading"><div class="spinner" /></div>}
+        </div>
+      ) : (
+        <div class="scrollback-container" ref={scrollbackRef}>
+          {scrollbackLoading ? (
+            <div class="xterm-loading"><div class="spinner" /></div>
+          ) : (
+            <pre class="scrollback-content">{scrollbackLines.join('\n')}</pre>
+          )}
+        </div>
+      )}
 
-      {!connected && <div class="reconnect-bar">接続が切れています — 再接続中...</div>}
+      {!connected && layer === 'live' && (
+        <div class="reconnect-bar">接続が切れています — 再接続中...</div>
+      )}
 
       <div class="quick-keys">
         {QUICK_KEYS.map(k => (
-          <button key={k.label} class={`quick-key${k.accent ? ' key-accent' : ''}`} onClick={() => sendKey(k.seq)}>{k.label}</button>
+          <button
+            key={k.label}
+            class={`quick-key${k.accent ? ' key-accent' : ''}${k.toggle && ctrlMode ? ' key-active' : ''}`}
+            onClick={() => {
+              if (k.toggle) {
+                setCtrlMode(!ctrlMode);
+              } else {
+                sendKey(k);
+              }
+            }}
+          >
+            {k.label}
+          </button>
         ))}
       </div>
 
-      <form class="input-bar" onSubmit={onSubmit} action="javascript:void(0)">
-        <input
-          ref={inputRef} type="text" class="input-field" value={input}
-          onInput={e => setInput(e.target.value)} onKeyDown={onKeyDown}
-          enterkeyhint="send"
-          placeholder="$ command..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck={false}
+      <form class="input-bar" onSubmit={onSubmit}>
+        <textarea
+          ref={inputRef}
+          class="input-field input-textarea"
+          value={input}
+          onInput={e => setInput(e.target.value)}
+          onKeyDown={onInputKeyDown}
+          placeholder="$ command..."
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="off"
+          spellcheck={false}
+          rows={1}
         />
-        <button type="submit" class="send-btn">{input ? '↑' : '↵'}</button>
+        <button type="submit" class="send-btn" disabled={!input.trim()}>↑</button>
       </form>
     </div>
   );

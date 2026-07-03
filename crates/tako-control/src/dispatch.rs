@@ -1518,6 +1518,12 @@ pub fn dispatch(
                 .map_err(DispatchError::Operation)
         }
 
+        Request::RemoteScrollback { pane_id, lines } => {
+            let result = crate::remote::scrollback(&pane_id, lines.unwrap_or(1000))
+                .map_err(DispatchError::Operation)?;
+            Ok(json!({ "lines": result }))
+        }
+
         Request::ChromeOpen {
             url,
             pane,

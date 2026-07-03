@@ -9,13 +9,19 @@
 //! - `GET  /api/panes` — ペイン一覧（tmux list-sessions + list-panes）
 //! - `GET  /api/panes/:id/screen` — 画面内容（tmux capture-pane。`?ansi=1` で色付き、
 //!   `?lines=N` で履歴 N 行込み。cursor / size も返す）
-//! - `POST /api/panes/:id/input` — テキスト送信（tmux send-keys）
+//! - `GET  /api/panes/:id/scrollback` — スクロールバック履歴（プレーンテキスト。
+//!   `?lines=N` で履歴 N 行。履歴レイヤー用 — クライアント側でモバイル幅折り返し・
+//!   スクロール・テキスト選択を行う）
+//! - `POST /api/panes/:id/input` — テキスト送信（tmux send-keys。`{text, newline}` か
+//!   `{keys: "..."}` で生キーシーケンス送信）
 //! - `POST /api/panes/:id/close` — ペインを閉じる（tmux kill-pane）
 //! - `POST /api/panes/:id/resize` — ビューポート連動リサイズ（`{cols, rows}` で
 //!   tmux resize-window、`{reset: true}` で manual 解除）
 //! - `GET  /api/agents` — claude agents --json プロキシ + tmux ペイン対応付け
 //! - `GET  /api/sessions/:id/messages?tail=N` — Claude Code transcript の正規化読み取り
-//! - `GET  /ws?pane=<id>` — WebSocket 画面プッシュ（250ms 差分検知。操作系は REST を使う）
+//! - `GET  /ws?pane=<id>[&cols=N&rows=N]` — WebSocket 画面プッシュ（250ms 差分検知。
+//!   `cols`/`rows` を指定すると接続時にペインを自動リサイズし、切断時にリセットする。
+//!   操作系は REST を使う）
 //!
 //! 認証: `Authorization: Bearer <token>` ヘッダ必須（/api/health 以外）。
 //! WS は Sec-WebSocket-Protocol の `token.<T>` で検証（ブラウザ WS API はヘッダ不可のため）。
@@ -195,6 +201,34 @@ pub fn run_daemon(port: Option<u16>, no_tunnel: bool) -> io::Result<()> {
     cleanup_state_files();
 
     Ok(())
+}
+
+/// ペインのスクロールバック履歴をプレーンテキストで取得する。
+/// CLI (`tako remote scrollback`) から使う
+pub fn scrollback(pane_id: &str, lines: u32) -> Result<Vec<String>, String> {
+    let tmux_socket = tako_core::tmux_backend::socket_name();
+    let target = format!("={pane_id}");
+    let output = tako_core::tmux::tmux_command(Some(&tmux_socket))
+        .args([
+            "capture-pane",
+            "-t",
+            &target,
+            "-p",
+            "-S",
+            &format!("-{lines}"),
+        ])
+        .output()
+        .map_err(|e| format!("tmux capture-pane の実行に失敗: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "tmux capture-pane がエラー: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .collect())
 }
 
 /// デーモンの状態を PID ファイルから確認する。
@@ -806,6 +840,24 @@ fn tmux_send_keys(
     Ok(())
 }
 
+/// tmux の特定ペインへ生キーシーケンスを送信する（`-l` なし = 特殊キー名を解釈する）。
+/// スペース区切りで複数キーを渡せる（例: `"Enter"`, `"C-c"`, `"Escape \\x1b[13;2u"`）
+fn tmux_send_raw_keys(tmux_socket: &str, target: &str, keys: &str) -> Result<(), String> {
+    let mut args = vec!["send-keys", "-t", target];
+    let parts: Vec<&str> = keys.split(' ').filter(|s| !s.is_empty()).collect();
+    for part in &parts {
+        args.push(part);
+    }
+    let output = tmux_output_with_timeout(tmux_socket, &args)?;
+    if !output.status.success() {
+        return Err(format!(
+            "tmux send-keys がエラー: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
 // --- HTTP サーバー ---
 
 fn cors_headers() -> Vec<tiny_http::Header> {
@@ -986,28 +1038,45 @@ fn handle_ws(
         );
     let stream = request.upgrade("websocket", response);
 
+    let ws_cols = query_param(&url_full, "cols").and_then(|v| v.parse::<u32>().ok());
+    let ws_rows = query_param(&url_full, "rows").and_then(|v| v.parse::<u32>().ok());
+
     let tmux_socket = tmux_socket.to_string();
     let _ = std::thread::Builder::new()
         .name("tako-remote-ws".into())
-        .spawn(move || ws_push_loop(stream, &pane, &tmux_socket, shutdown));
+        .spawn(move || ws_push_loop(stream, &pane, &tmux_socket, shutdown, ws_cols, ws_rows));
 }
 
 /// 画面プッシュループ。250ms 間隔で capture-pane（ANSI 付き）+ cursor/size を取得し、
 /// 内容が変わったときだけ `{"type":"screen",...}` を送る。無変化でも WS_KEEPALIVE ごとに
-/// `{"type":"keepalive"}` を送って接続を維持する。送信失敗（クライアント切断）で終了
+/// `{"type":"keepalive"}` を送って接続を維持する。送信失敗（クライアント切断）で終了。
+/// `cols`/`rows` が指定されていれば接続時にペインをリサイズし、切断時にリセットする
 fn ws_push_loop(
     stream: Box<dyn tiny_http::ReadWrite + Send>,
     pane: &str,
     tmux_socket: &str,
     shutdown: Arc<AtomicBool>,
+    resize_cols: Option<u32>,
+    resize_rows: Option<u32>,
 ) {
     use std::hash::{Hash, Hasher};
     use tungstenite::protocol::{Role, WebSocket};
 
     let mut ws = WebSocket::from_raw_socket(stream, Role::Server, None);
     let target = format!("={pane}");
+    let window_target = format!("={}", window_target_of(pane));
     let mut prev_hash: u64 = 0;
     let mut last_sent = std::time::Instant::now();
+
+    let did_resize = if let (Some(cols), Some(rows)) = (resize_cols, resize_rows) {
+        if cols > 0 && rows > 0 {
+            tmux_resize_window(tmux_socket, &window_target, cols, rows).is_ok()
+        } else {
+            false
+        }
+    } else {
+        false
+    };
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -1024,7 +1093,6 @@ fn ws_push_loop(
                 body.to_string()
             }
             Err(e) => {
-                // ペイン消滅など。エラーを伝えて切断する
                 let _ = ws.send(tungstenite::Message::text(
                     json!({ "type": "error", "message": e }).to_string(),
                 ));
@@ -1051,6 +1119,10 @@ fn ws_push_loop(
             last_sent = std::time::Instant::now();
         }
         std::thread::sleep(WS_POLL_INTERVAL);
+    }
+
+    if did_resize {
+        let _ = tmux_reset_window_size(tmux_socket, &window_target);
     }
 }
 
@@ -1182,6 +1254,31 @@ fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &st
                 Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
             }
         }
+        (tiny_http::Method::Get, p)
+            if p.starts_with("/api/panes/") && p.ends_with("/scrollback") =>
+        {
+            let Some(target) = extract_pane_target(p) else {
+                return respond(
+                    request,
+                    400,
+                    Some(json!({ "error": "無効なペイン ID" }).to_string()),
+                );
+            };
+            let tmux_target = format!("={target}");
+            let history = query_param(&url_full, "lines")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(1000);
+            match tmux_capture_pane(tmux_socket, &tmux_target, false, Some(history)) {
+                Ok(lines) => {
+                    let mut body = json!({ "lines": lines });
+                    if let Some((_, _, w, h)) = tmux_pane_geometry(tmux_socket, &tmux_target) {
+                        body["size"] = json!({ "cols": w, "rows": h });
+                    }
+                    respond(request, 200, Some(body.to_string()))
+                }
+                Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
+            }
+        }
         (tiny_http::Method::Post, p) if p.starts_with("/api/panes/") && p.ends_with("/input") => {
             let Some(target) = extract_pane_target(p) else {
                 return respond(
@@ -1216,12 +1313,19 @@ fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &st
                     );
                 }
             };
-            let text = parsed["text"].as_str().unwrap_or("").to_string();
-            let newline = parsed["newline"].as_bool().unwrap_or(true);
             let tmux_target = format!("={target}");
-            match tmux_send_keys(tmux_socket, &tmux_target, &text, newline) {
-                Ok(()) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
-                Err(e) => respond(request, 500, Some(json!({ "error": e }).to_string())),
+            if let Some(keys) = parsed["keys"].as_str() {
+                match tmux_send_raw_keys(tmux_socket, &tmux_target, keys) {
+                    Ok(()) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
+                    Err(e) => respond(request, 500, Some(json!({ "error": e }).to_string())),
+                }
+            } else {
+                let text = parsed["text"].as_str().unwrap_or("").to_string();
+                let newline = parsed["newline"].as_bool().unwrap_or(true);
+                match tmux_send_keys(tmux_socket, &tmux_target, &text, newline) {
+                    Ok(()) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
+                    Err(e) => respond(request, 500, Some(json!({ "error": e }).to_string())),
+                }
             }
         }
         (tiny_http::Method::Post, p) if p.starts_with("/api/panes/") && p.ends_with("/close") => {

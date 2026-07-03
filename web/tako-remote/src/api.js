@@ -42,8 +42,14 @@ export function createClient(host, token) {
       const qs = params.length ? `?${params.join('&')}` : '';
       return request('GET', `/api/panes/${encodeURIComponent(id)}/screen${qs}`);
     },
+    scrollback(id, lines = 1000) {
+      return request('GET', `/api/panes/${encodeURIComponent(id)}/scrollback?lines=${lines}`);
+    },
     input(id, text, newline = true) {
       return request('POST', `/api/panes/${encodeURIComponent(id)}/input`, { text, newline });
+    },
+    sendKeys(id, keys) {
+      return request('POST', `/api/panes/${encodeURIComponent(id)}/input`, { keys });
     },
     close(id) {
       return request('POST', `/api/panes/${encodeURIComponent(id)}/close`);
@@ -59,6 +65,16 @@ export function createClient(host, token) {
     },
     messages(sessionId, tail = 30) {
       return request('GET', `/api/sessions/${encodeURIComponent(sessionId)}/messages?tail=${tail}`);
+    },
+    wsUrl(paneId, cols, rows) {
+      const proto = base.startsWith('https') ? 'wss' : 'ws';
+      const hostPart = base.replace(/^https?:\/\//, '');
+      let url = `${proto}://${hostPart}/ws?pane=${encodeURIComponent(paneId)}`;
+      if (cols && rows) url += `&cols=${cols}&rows=${rows}`;
+      return url;
+    },
+    wsProtocols() {
+      return ['tako-remote', `token.${token}`];
     },
     base() {
       return base;
