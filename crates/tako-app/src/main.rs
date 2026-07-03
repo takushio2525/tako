@@ -5461,6 +5461,24 @@ impl ControlHost for TakoApp {
             "install_method": update_checker::detect_install_method().label(),
         }))
     }
+    fn update_apply_zip(&mut self) -> Result<serde_json::Value, String> {
+        let info = update_checker::check_latest()
+            .ok_or_else(|| "新しいバージョンが見つからない（既に最新版です）".to_string())?;
+        update_checker::perform_update_zip(&info)?;
+        Ok(serde_json::json!({
+            "updated": true,
+            "version": info.version,
+            "install_method": "zip (fallback)",
+        }))
+    }
+    fn update_repair(&mut self) -> Result<serde_json::Value, String> {
+        let msg = update_checker::repair_brew()?;
+        Ok(serde_json::json!({
+            "repaired": true,
+            "message": msg,
+            "install_method": update_checker::detect_install_method_full().label(),
+        }))
+    }
 }
 
 /// IME（macOS では NSTextInputClient 相当）との接点（FR-1.9）。

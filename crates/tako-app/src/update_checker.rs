@@ -3,6 +3,9 @@
 //! GitHub Releases API を定期確認し、新しい安定版があればステータスバーに通知。
 //! 配布系統（Homebrew / zip 手動配置）を自動判別し、系統内で更新を実行する。
 //! 更新完了後は自動再起動する（#30 のタブ永続化で構成は復元される）。
+//!
+//! broken-brew 検知（#50）: brew upgrade 失敗等で「.app 実体あり・cask 台帳なし」の
+//! 詰み状態を検知し、修復（`brew install --cask --force`）または zip フォールバックを提供。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -54,8 +57,13 @@ pub enum UpdateState {
     Updating(String),
     /// 更新完了 — 自動再起動する
     Done(String),
-    /// 更新失敗
+    /// 更新失敗（brew 失敗時は zip フォールバックを提案）
     Failed(String),
+    /// brew 更新失敗 → zip フォールバック提案中
+    BrewFailedFallback {
+        brew_error: String,
+        info: UpdateInfo,
+    },
     /// ユーザーが閉じた（次回起動まで非表示）
     Dismissed,
 }
@@ -67,6 +75,9 @@ pub enum InstallMethod {
     Homebrew,
     /// zip ダウンロード等の手動配置
     Zip,
+    /// .app 実体はあるが brew の cask 台帳に登録されていない（#50）。
+    /// brew upgrade 失敗等で台帳と実体が乖離した詰み状態
+    BrokenBrew,
 }
 
 impl InstallMethod {
@@ -74,32 +85,125 @@ impl InstallMethod {
         match self {
             InstallMethod::Homebrew => "homebrew",
             InstallMethod::Zip => "zip",
+            InstallMethod::BrokenBrew => "broken-brew",
         }
     }
 }
 
-/// 配布系統の判別 — 実行中の .app が Caskroom 配下にあるかで判定する。
-/// `/opt/homebrew/bin/tako` のシンボリックリンク存在だけでは zip 版に brew を
-/// 被せたケースと区別できないため、**バンドル自体の出自**を見る。
+/// 配布系統の判別（高速パス: ファイルパスのみ。brew サブプロセスを呼ばない）。
+/// broken-brew の検知には `detect_install_method_full()` を使う
 pub fn detect_install_method() -> InstallMethod {
+    detect_install_method_inner(is_app_in_caskroom(), is_exe_in_caskroom())
+}
+
+/// broken-brew を含む完全な配布系統判別（低速: brew サブプロセスを呼ぶ可能性あり）。
+/// background executor や CLI/MCP の status から呼ぶ。render パスでは呼ばない
+pub fn detect_install_method_full() -> InstallMethod {
+    let app_in_caskroom = is_app_in_caskroom();
+    let exe_in_caskroom = is_exe_in_caskroom();
+    let fast = detect_install_method_inner(app_in_caskroom, exe_in_caskroom);
+    if fast != InstallMethod::Zip {
+        return fast;
+    }
+    // Zip 判定だが、実は broken-brew かもしれない — brew の台帳を確認
+    if applications_tako_app_exists() && is_brew_available() && !is_brew_cask_registered() {
+        return InstallMethod::BrokenBrew;
+    }
+    InstallMethod::Zip
+}
+
+fn is_app_in_caskroom() -> bool {
     if let Some(bundle) = app_bundle_path() {
         let resolved = std::fs::canonicalize(&bundle).unwrap_or(bundle);
-        let s = resolved.to_string_lossy();
-        // Homebrew Cask は /opt/homebrew/Caskroom/tako/... or /usr/local/Caskroom/tako/...
-        // にインストールし、/Applications にシンボリックリンクを張る
-        if s.contains("/Caskroom/") {
-            return InstallMethod::Homebrew;
-        }
+        return resolved.to_string_lossy().contains("/Caskroom/");
     }
-    // バンドルパスが取れない場合（CLI 単体実行）は tako バイナリの出自で判定
+    false
+}
+
+fn is_exe_in_caskroom() -> bool {
     if let Ok(exe) = std::env::current_exe() {
         let resolved = std::fs::canonicalize(&exe).unwrap_or(exe);
         let s = resolved.to_string_lossy();
-        if s.contains("/Caskroom/") || s.contains("/Cellar/") {
-            return InstallMethod::Homebrew;
-        }
+        return s.contains("/Caskroom/") || s.contains("/Cellar/");
     }
-    InstallMethod::Zip
+    false
+}
+
+/// 高速パスの判定ロジック（テスト用に公開）
+fn detect_install_method_inner(app_in_caskroom: bool, exe_in_caskroom: bool) -> InstallMethod {
+    if app_in_caskroom || exe_in_caskroom {
+        InstallMethod::Homebrew
+    } else {
+        InstallMethod::Zip
+    }
+}
+
+/// `/Applications/tako.app` が存在するか（シンボリックリンクでも実体でも OK）
+fn applications_tako_app_exists() -> bool {
+    Path::new("/Applications/tako.app").exists()
+}
+
+/// brew コマンドが使えるか
+fn is_brew_available() -> bool {
+    std::process::Command::new("brew")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// brew の cask 台帳に tako が登録されているか
+fn is_brew_cask_registered() -> bool {
+    std::process::Command::new("brew")
+        .args(["list", "--cask", "takushio2525/tako/tako"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// broken-brew 状態の詳細診断（CLI/MCP の status 用）
+pub fn diagnose_broken_brew() -> Option<BrokenBrewDiagnosis> {
+    if detect_install_method_full() != InstallMethod::BrokenBrew {
+        return None;
+    }
+    Some(BrokenBrewDiagnosis {
+        app_path: "/Applications/tako.app".into(),
+        brew_available: true,
+        cask_registered: false,
+        repair_command: "brew install --cask takushio2525/tako/tako --force".into(),
+    })
+}
+
+/// broken-brew 診断結果
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BrokenBrewDiagnosis {
+    pub app_path: String,
+    pub brew_available: bool,
+    pub cask_registered: bool,
+    pub repair_command: String,
+}
+
+/// broken-brew の修復: `brew install --cask --force` で台帳を再締結する
+pub fn repair_brew() -> Result<String, String> {
+    let method = detect_install_method_full();
+    if method != InstallMethod::BrokenBrew {
+        return Err(format!(
+            "現在の配布系統は {0} のため修復は不要です",
+            method.label()
+        ));
+    }
+    let output = std::process::Command::new("brew")
+        .args(["install", "--cask", "takushio2525/tako/tako", "--force"])
+        .output()
+        .map_err(|e| format!("brew の実行に失敗: {e}"))?;
+    if output.status.success() {
+        Ok("brew の cask 台帳を再締結しました。以後 brew upgrade で更新できます".into())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("brew install --force が失敗: {stderr}"))
+    }
 }
 
 /// 実行中の .app バンドルのパス（macOS 固有）
@@ -197,15 +301,25 @@ pub fn is_newer(a: &str, b: &str) -> bool {
     }
 }
 
-/// 更新を実行する（ブロッキング。background executor で呼ぶ）
+/// 更新を実行する（ブロッキング。background executor で呼ぶ）。
+/// broken-brew 状態では zip フォールバックを使う
 pub fn perform_update(info: &UpdateInfo) -> Result<String, String> {
-    match detect_install_method() {
-        InstallMethod::Homebrew => update_via_homebrew(),
+    match detect_install_method_full() {
+        InstallMethod::Homebrew => update_via_homebrew(info),
         InstallMethod::Zip => update_via_zip(info),
+        InstallMethod::BrokenBrew => {
+            // broken-brew では brew 経由の更新は不可能 → zip で直接更新
+            update_via_zip(info)
+        }
     }
 }
 
-fn update_via_homebrew() -> Result<String, String> {
+/// zip 強制更新（brew 失敗時のフォールバック用。配布系統を問わず zip で更新する）
+pub fn perform_update_zip(info: &UpdateInfo) -> Result<String, String> {
+    update_via_zip(info)
+}
+
+fn update_via_homebrew(info: &UpdateInfo) -> Result<String, String> {
     let output = std::process::Command::new("brew")
         .args(["upgrade", "--cask", "takushio2525/tako/tako"])
         .output()
@@ -217,7 +331,14 @@ fn update_via_homebrew() -> Result<String, String> {
         if stderr.contains("already installed") {
             Ok("既に最新版です".into())
         } else {
-            Err(format!("brew upgrade が失敗: {stderr}"))
+            // brew 失敗時は zip フォールバック可能であることを含めてエラーを返す（#50）
+            let has_zip = info.download_url.is_some();
+            let fallback_hint = if has_zip {
+                "\n[zip-fallback-available] brew 更新に失敗しました。`tako update apply-zip` で zip 経由の更新が可能です"
+            } else {
+                ""
+            };
+            Err(format!("brew upgrade が失敗: {stderr}{fallback_hint}"))
         }
     }
 }
@@ -323,15 +444,27 @@ pub fn restart_app() -> Result<(), String> {
     Ok(())
 }
 
-/// dispatch 層に公開する更新情報の JSON 表現
+/// dispatch 層に公開する更新情報の JSON 表現（broken-brew 診断を含む）
 pub fn update_status_json() -> serde_json::Value {
-    let method = detect_install_method();
+    let method = detect_install_method_full();
     let duplicates = detect_duplicate_cli();
-    serde_json::json!({
+    let mut json = serde_json::json!({
         "current_version": CURRENT_VERSION,
         "install_method": method.label(),
         "duplicate_cli": duplicates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(diag) = diagnose_broken_brew() {
+        json["broken_brew"] = serde_json::json!({
+            "app_path": diag.app_path,
+            "brew_available": diag.brew_available,
+            "cask_registered": diag.cask_registered,
+            "repair_command": diag.repair_command,
+            "hint": "brew の cask 台帳と .app 実体が乖離しています。\
+                     `tako update repair` で台帳を再締結するか、\
+                     `tako update apply-zip` で zip 経由の更新に切り替えてください",
+        });
+    }
+    json
 }
 
 #[cfg(test)]
@@ -351,13 +484,18 @@ mod tests {
     #[test]
     fn test_detect_install_method_returns_value() {
         let method = detect_install_method();
-        assert!(method == InstallMethod::Homebrew || method == InstallMethod::Zip);
+        assert!(
+            method == InstallMethod::Homebrew
+                || method == InstallMethod::Zip
+                || method == InstallMethod::BrokenBrew
+        );
     }
 
     #[test]
     fn test_install_method_label() {
         assert_eq!(InstallMethod::Homebrew.label(), "homebrew");
         assert_eq!(InstallMethod::Zip.label(), "zip");
+        assert_eq!(InstallMethod::BrokenBrew.label(), "broken-brew");
     }
 
     #[test]
@@ -371,5 +509,112 @@ mod tests {
         assert!(json.get("current_version").is_some());
         assert!(json.get("install_method").is_some());
         assert!(json.get("duplicate_cli").is_some());
+    }
+
+    // --- broken-brew 判定ロジックの単体テスト（サブプロセス不要） ---
+
+    #[test]
+    fn test_inner_caskroom_detected_as_homebrew() {
+        assert_eq!(
+            detect_install_method_inner(true, false),
+            InstallMethod::Homebrew
+        );
+        assert_eq!(
+            detect_install_method_inner(false, true),
+            InstallMethod::Homebrew
+        );
+        assert_eq!(
+            detect_install_method_inner(true, true),
+            InstallMethod::Homebrew
+        );
+    }
+
+    #[test]
+    fn test_inner_no_caskroom_detected_as_zip() {
+        assert_eq!(
+            detect_install_method_inner(false, false),
+            InstallMethod::Zip
+        );
+    }
+
+    #[test]
+    fn test_broken_brew_detection_logic() {
+        // broken-brew = Caskroom パスでない + app 実体あり + brew あり + cask 未登録
+        // この関数はロジックのみテスト（実際の brew は呼ばない）
+        struct Case {
+            app_in_caskroom: bool,
+            app_exists: bool,
+            brew_available: bool,
+            cask_registered: bool,
+            expected: InstallMethod,
+        }
+        let cases = [
+            // 正常な Homebrew（Caskroom 経由）
+            Case {
+                app_in_caskroom: true,
+                app_exists: true,
+                brew_available: true,
+                cask_registered: true,
+                expected: InstallMethod::Homebrew,
+            },
+            // 正常な zip（brew なし）
+            Case {
+                app_in_caskroom: false,
+                app_exists: true,
+                brew_available: false,
+                cask_registered: false,
+                expected: InstallMethod::Zip,
+            },
+            // 正常な zip（brew あるが tako は未導入）
+            Case {
+                app_in_caskroom: false,
+                app_exists: false,
+                brew_available: true,
+                cask_registered: false,
+                expected: InstallMethod::Zip,
+            },
+            // broken-brew: app あり + brew あり + 台帳なし
+            Case {
+                app_in_caskroom: false,
+                app_exists: true,
+                brew_available: true,
+                cask_registered: false,
+                expected: InstallMethod::BrokenBrew,
+            },
+            // app あり + brew あり + 台帳あり → ただの zip（Caskroom 外だが台帳にはある特殊ケース）
+            Case {
+                app_in_caskroom: false,
+                app_exists: true,
+                brew_available: true,
+                cask_registered: true,
+                expected: InstallMethod::Zip,
+            },
+        ];
+        for (i, c) in cases.iter().enumerate() {
+            let fast = detect_install_method_inner(c.app_in_caskroom, false);
+            let result = if fast != InstallMethod::Zip {
+                fast
+            } else if c.app_exists && c.brew_available && !c.cask_registered {
+                InstallMethod::BrokenBrew
+            } else {
+                InstallMethod::Zip
+            };
+            assert_eq!(
+                result, c.expected,
+                "case {i}: expected {:?}, got {:?}",
+                c.expected, result
+            );
+        }
+    }
+
+    #[test]
+    fn test_repair_brew_rejects_non_broken() {
+        // 開発環境では broken-brew ではないため Err を返すはず
+        let result = repair_brew();
+        // broken-brew でなければ「修復は不要」エラー
+        if detect_install_method_full() != InstallMethod::BrokenBrew {
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("修復は不要"));
+        }
     }
 }

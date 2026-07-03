@@ -1066,19 +1066,23 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_update",
-            "description": "アプリ内更新の診断・チェック・実行（Issue #36）。\
-                action=status で配布系統（homebrew / zip）・現在バージョン・PATH 上の重複 CLI を返す。\
+            "description": "アプリ内更新の診断・チェック・実行（Issue #36 + #50）。\
+                action=status で配布系統（homebrew / zip / broken-brew）・現在バージョン・\
+                PATH 上の重複 CLI を返す。broken-brew 検知時は診断情報と修復コマンドも含む。\
                 action=check で GitHub Releases から最新版の有無を確認する（更新は行わない）。\
                 action=apply で配布系統に応じた更新を実行する \
-                （homebrew → brew upgrade --cask、zip → GitHub Releases から zip を DL して .app を差し替え）。\
-                zip 系統に brew を被せない（管理台帳と実体のズレを防ぐため）。\
+                （homebrew → brew upgrade --cask、zip/broken-brew → zip DL で .app 差し替え）。\
+                action=apply-zip で配布系統を問わず zip 経由で強制更新する \
+                （brew upgrade 失敗時のフォールバック）。\
+                action=repair で broken-brew 状態を修復する \
+                （brew install --cask --force で cask 台帳を再締結）。\
                 apply 成功後の再起動は UI 側で行う（CLI / MCP からは apply 結果の確認まで）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "check", "apply"],
+                        "enum": ["status", "check", "apply", "apply-zip", "repair"],
                         "description": "操作種別（省略時は status）",
                     },
                 },

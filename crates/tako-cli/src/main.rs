@@ -169,6 +169,10 @@ enum UpdateCommand {
     Check,
     /// 配布系統に応じた更新を実行する
     Apply,
+    /// zip 経由で強制更新する（brew 失敗時のフォールバック）
+    ApplyZip,
+    /// broken-brew 状態の修復（brew install --cask --force で台帳を再締結）
+    Repair,
 }
 
 #[derive(Subcommand)]
@@ -2099,6 +2103,8 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 UpdateCommand::Status => "status".to_string(),
                 UpdateCommand::Check => "check".to_string(),
                 UpdateCommand::Apply => "apply".to_string(),
+                UpdateCommand::ApplyZip => "apply-zip".to_string(),
+                UpdateCommand::Repair => "repair".to_string(),
             }),
         },
     })
