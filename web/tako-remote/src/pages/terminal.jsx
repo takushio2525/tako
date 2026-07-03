@@ -154,8 +154,8 @@ export function TerminalPage({ paneId }) {
   }, [paneId, refresh]);
 
   async function send() {
-    const text = input.trim();
-    if (!text || !clientRef.current) return;
+    if (!clientRef.current) return;
+    const text = input;
     setInput('');
     if (navigator.vibrate) navigator.vibrate(10);
     try { await clientRef.current.input(paneId, text, true); setTimeout(refresh, 200); } catch {}
@@ -182,7 +182,12 @@ export function TerminalPage({ paneId }) {
   }
 
   function onKeyDown(e) {
-    if (e.key === 'Enter') { e.preventDefault(); send(); }
+    if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); send(); }
+  }
+
+  function onSubmit(e) {
+    e.preventDefault();
+    send();
   }
 
   if (!machine) return null;
@@ -216,14 +221,15 @@ export function TerminalPage({ paneId }) {
         ))}
       </div>
 
-      <div class="input-bar">
+      <form class="input-bar" onSubmit={onSubmit} action="javascript:void(0)">
         <input
           ref={inputRef} type="text" class="input-field" value={input}
           onInput={e => setInput(e.target.value)} onKeyDown={onKeyDown}
+          enterkeyhint="send"
           placeholder="$ command..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck={false}
         />
-        <button class="send-btn" onClick={send} disabled={!input.trim()}>↑</button>
-      </div>
+        <button type="submit" class="send-btn">{input ? '↑' : '↵'}</button>
+      </form>
     </div>
   );
 }
