@@ -1140,8 +1140,7 @@ fn orchestrator_watch(
     let interval = std::time::Duration::from_secs(5);
     let deadline =
         timeout_secs.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
-    // status モードは連続 3 回、grep モードは連続 8 回で確定（誤検知抑制）
-    let need_streak: u32 = if session_id.is_some() { 3 } else { 8 };
+    // agents 一次（明示/自動解決）は streak 3、画面推定フォールバックは streak 8
     let mut idle_streak: u32 = 0;
     let mut gone_streak: u32 = 0;
 
@@ -1163,6 +1162,9 @@ fn orchestrator_watch(
             Ok(val) => {
                 let status = val["status"].as_str().unwrap_or("unknown");
                 let recent = val["recent_output"].as_str().unwrap_or("");
+                let source = val["status_source"].as_str().unwrap_or("screen");
+                // agents 一次シグナル（明示 or 自動解決）は streak 3、画面推定は streak 8
+                let need_streak: u32 = if source == "screen" { 8 } else { 3 };
 
                 match status {
                     "gone" => {
@@ -1340,7 +1342,6 @@ fn orchestrator_run(
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(timeout_secs);
     let interval = std::time::Duration::from_secs(5);
-    let need_streak: u32 = 8;
     let mut idle_streak: u32 = 0;
     let mut gone_streak: u32 = 0;
     let mut final_status = "timeout".to_string();
@@ -1363,6 +1364,8 @@ fn orchestrator_run(
             Ok(val) => {
                 let status = val["status"].as_str().unwrap_or("unknown");
                 let recent = val["recent_output"].as_str().unwrap_or("");
+                let source = val["status_source"].as_str().unwrap_or("screen");
+                let need_streak: u32 = if source == "screen" { 8 } else { 3 };
                 match status {
                     "gone" => {
                         if let Some(ref ts) = tmux_session {

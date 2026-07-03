@@ -1950,8 +1950,31 @@ fn dispatch_orchestrator_worker_status(
     });
     let pane_exists = in_tree || host.workspace().is_shelved(target);
 
-    // session_id があれば claude agents で状態確認
-    let (mut status, ctx_percent) = if let Some(sid) = session_id {
+    // session_id の解決: 明示指定 > pane→session 自動解決 > フォールバック
+    let (resolved_sid, status_source);
+    if let Some(sid) = session_id {
+        resolved_sid = Some(sid.to_string());
+        status_source = "agents";
+    } else if pane_exists {
+        // pane→session 自動解決: backend_session から pid 祖先辿り
+        if let Some(backend) = host.backend_session(target) {
+            if let Some(sid) = crate::agents::resolve_session_id_for_backend(&backend) {
+                resolved_sid = Some(sid);
+                status_source = "agents-auto";
+            } else {
+                resolved_sid = None;
+                status_source = "screen";
+            }
+        } else {
+            resolved_sid = None;
+            status_source = "screen";
+        }
+    } else {
+        resolved_sid = None;
+        status_source = "none";
+    };
+
+    let (mut status, ctx_percent) = if let Some(ref sid) = resolved_sid {
         let agent = orchestrator::query_agent_status(sid);
         (agent.status, agent.ctx_percent)
     } else if pane_exists {
@@ -2021,6 +2044,8 @@ fn dispatch_orchestrator_worker_status(
         "status": status,
         "ctx_percent": ctx_percent,
         "recent_output": recent_output,
+        "status_source": status_source,
+        "resolved_session_id": resolved_sid,
     }))
 }
 

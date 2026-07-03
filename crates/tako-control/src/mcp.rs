@@ -874,8 +874,8 @@ pub fn tools() -> Vec<Value> {
                 呼び出し元ペインを右に分割して新ペインを作り、claude を起動してプロンプトを送信する。\
                 worker の pane_id・tmux_session・spawned_by（spawn 元ペイン ID）を返す。\
                 tmux_session は pane ID が解決できない場合\
-                （BG タブ移動・tako 再起動後）のフォールバックとして tako_read_pane / tako_send_input / \
-                tako_orchestrator_worker_status に渡せる。\
+                （BG タブ移動・tako 再起動後）のフォールバックとして tako_read_pane / tako_send_input に渡せる。\
+                worker_status / watch は pane_id だけで session を自動解決するため session_id は不要。\
                 起動からプロンプト送信まで 15〜20 秒かかる（これは想定内）。\
                 pane または tab のいずれかを必ず指定すること。省略すると呼び出し元タブに出るため、\
                 master が別タブにいる場合に意図しないタブに子が生える。",
@@ -900,11 +900,14 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_orchestrator_worker_status",
             "description": "子 worker の状態を確認する。status は busy（作業中）/ idle（入力待ち・完了）/ \
-                gone（ペイン消滅かつ tmux session も消滅）/ unknown（agents 不可）。session_id を渡すと \
-                claude agents --json で正確な状態を取得する。tmux_session を渡すとペインが消えても \
-                tmux session が生きている限り recent_output を取得でき、gone にならない。\
-                退避（shelved）されたペインも追跡可能（pane_exists で shelved を走査する）。\
-                recent_output はペインの最近 30 行の出力。",
+                gone（ペイン消滅かつ tmux session も消滅）/ unknown（agents 不可）。\
+                session_id を省略しても pane→session の自動解決（pid 祖先辿り）で claude agents --json の \
+                正確な status を取得する（status_source が agents-auto になる）。自動解決失敗時のみ \
+                画面パターン推定にフォールバック（status_source が screen）。\
+                tmux_session を渡すとペインが消えても tmux session が生きている限り \
+                recent_output を取得でき、gone にならない。\
+                退避（shelved）されたペインも追跡可能。recent_output はペインの最近 30 行の出力。\
+                resolved_session_id に自動解決された session_id が入る。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -923,8 +926,9 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_orchestrator_run",
             "description": "子 worker を spawn し、完了まで待って結果を返す。spawn + 完了待ち + \
                 出力取得 + close を 1 回で行うアトミック操作。Monitor や手動ポーリングは不要。\
-                完了判定は OrchestratorWorkerStatus と同じロジック（claude agents --json + \
-                端末出力の ❯ プロンプト検知）を内部で繰り返し呼ぶ。\
+                完了判定は OrchestratorWorkerStatus と同じロジック（pane→session 自動解決 + \
+                claude agents --json の status 一次シグナル、フォールバックで端末出力パターン）を \
+                内部で繰り返し呼ぶ。\
                 タイムアウト（既定 1800 秒）に達した場合は status=timeout で途中結果を返す。",
             "inputSchema": {
                 "type": "object",
@@ -1175,12 +1179,10 @@ fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i6
     // --- 2. 完了待ちポーリング ---
     // orchestrator_watch と同じ判定ロジック: OrchestratorWorkerStatus を繰り返し呼び、
     // status + 端末出力パターンで idle/gone を判定する。
-    // session_id は spawn 直後には不明なので None で開始し、端末出力ベースの判定に頼る。
-    // 連続 8 回の idle 検知で確定（session_id なし時の watch と同じ閾値）
+    // session_id は spawn 直後には不明だが、dispatch 側で pane→session 自動解決する
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(timeout_secs);
     let interval = std::time::Duration::from_secs(5);
-    let need_streak: u32 = 8;
     let mut idle_streak: u32 = 0;
     let mut gone_streak: u32 = 0;
     let mut final_status = "timeout".to_string();
@@ -1203,6 +1205,8 @@ fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i6
             Ok(val) => {
                 let status = val["status"].as_str().unwrap_or("unknown");
                 let recent = val["recent_output"].as_str().unwrap_or("");
+                let source = val["status_source"].as_str().unwrap_or("screen");
+                let need_streak: u32 = if source == "screen" { 8 } else { 3 };
 
                 match status {
                     "gone" => {
