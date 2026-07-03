@@ -3033,9 +3033,28 @@ impl TakoApp {
         let cell = self.cell_size_for_pane(pane)?;
         let screen = self.terminals.get(&pane)?.screen(&self.theme);
         let (col, row) = screen.cursor?;
-        // ターミナルはセルグリッドなので x = col * cell_width が正。
-        // 旧実装は shape_line().x_for_index() でフォント advance から求めていたが、
-        // 全角文字の advance ≠ 2*cell_width でカーソルがずれる原因だった
+        let x = f32::from(cell.width) * col as f32;
+        Some(point(
+            area.origin.x + px(x),
+            area.origin.y + cell.height * row as f32,
+        ))
+    }
+
+    /// IME 候補ウィンドウ用のカーソル位置。CursorShape::Hidden でもビューポート内なら返す。
+    /// カーソルが表示中なら通常カーソル位置、非表示でもビューポート内なら ime_cursor、
+    /// どちらも無い（スクロールバック中）なら None
+    fn pane_cursor_origin_for_ime(
+        &self,
+        pane: PaneId,
+        window: &mut Window,
+    ) -> Option<Point<Pixels>> {
+        if let Some(origin) = self.pane_cursor_origin(pane, window) {
+            return Some(origin);
+        }
+        let (_, area) = self.pane_text_areas.iter().find(|(id, _)| *id == pane)?;
+        let cell = self.cell_size_for_pane(pane)?;
+        let screen = self.terminals.get(&pane)?.screen(&self.theme);
+        let (col, row) = screen.ime_cursor?;
         let x = f32::from(cell.width) * col as f32;
         Some(point(
             area.origin.x + px(x),
@@ -5561,14 +5580,20 @@ impl EntityInputHandler for TakoApp {
     fn bounds_for_range(
         &mut self,
         range_utf16: Range<usize>,
-        _element_bounds: Bounds<Pixels>,
+        element_bounds: Bounds<Pixels>,
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        // 変換候補ウィンドウの位置出し。カーソルセル + 範囲先頭までの描画幅
+        // 変換候補ウィンドウの位置出し。カーソルセル + 範囲先頭までの描画幅。
+        // CursorShape::Hidden（claude 等の TUI アプリ）でもカーソル位置は有効なので
+        // ime_cursor をフォールバックに使う（#29: 候補ウィンドウが画面左下に出る問題の修正）
         let ime_pane = self.ime_target();
-        let origin = self.pane_cursor_origin(ime_pane, window)?;
-        let cell = self.cell_size_for_pane(ime_pane)?;
+        let origin = self
+            .pane_cursor_origin_for_ime(ime_pane, window)
+            .unwrap_or(element_bounds.origin);
+        let cell = self
+            .cell_size_for_pane(ime_pane)
+            .unwrap_or(size(px(8.0), px(16.0)));
         let x_offset = match self.ime.as_ref() {
             Some(ime) => {
                 let start = clamp_ime_range_start(

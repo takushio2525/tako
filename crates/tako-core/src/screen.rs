@@ -56,6 +56,9 @@ pub struct Screen {
     /// ブロックカーソルの表示位置（col, row）。非表示・画面外なら None。
     /// カーソル色はラン側にも反映済みなので、描画はランだけ見れば足りる
     pub cursor: Option<(usize, usize)>,
+    /// IME 候補ウィンドウ用カーソル位置。CursorShape::Hidden でもビューポート内なら返す。
+    /// カーソルが表示領域外（スクロールバック中）のときだけ None
+    pub ime_cursor: Option<(usize, usize)>,
     /// スクロールバック表示中のオフセット（0 = 最下部）
     pub display_offset: usize,
 }
@@ -104,6 +107,11 @@ pub(crate) fn snapshot_opts<T: EventListener>(
     let cursor = (show_cursor && content.cursor.shape != CursorShape::Hidden)
         .then(|| point_to_viewport(display_offset, content.cursor.point))
         .flatten()
+        .map(|p| (p.column.0, p.line))
+        .filter(|&(col, row)| col < cols && row < rows);
+
+    // IME 用: CursorShape::Hidden でもビューポート内なら位置を返す
+    let ime_cursor = point_to_viewport(display_offset, content.cursor.point)
         .map(|p| (p.column.0, p.line))
         .filter(|&(col, row)| col < cols && row < rows);
 
@@ -213,6 +221,7 @@ pub(crate) fn snapshot_opts<T: EventListener>(
         rows,
         lines,
         cursor,
+        ime_cursor,
         display_offset,
     }
 }
@@ -335,8 +344,13 @@ mod tests {
         let term = term_with(b"ab");
         let s = snapshot_opts(&term, &theme(), false);
         assert_eq!(s.cursor, None);
+        // IME 用カーソルは show_cursor=false でも返る
+        assert_eq!(s.ime_cursor, Some((2, 0)));
         let hidden = term_with(b"\x1b[?25lab");
-        assert_eq!(snapshot(&hidden, &theme()).cursor, None);
+        let sh = snapshot(&hidden, &theme());
+        assert_eq!(sh.cursor, None);
+        // DECTCEM 非表示でも IME 用カーソルは返る（#29 修正の核心）
+        assert_eq!(sh.ime_cursor, Some((2, 0)));
     }
 
     #[test]
@@ -366,6 +380,8 @@ mod tests {
         let s = snapshot(&term, &theme());
         assert_eq!(s.display_offset, 10);
         assert_eq!(s.cursor, None);
+        // スクロールバック中は IME 用カーソルもビューポート外
+        assert_eq!(s.ime_cursor, None);
         // 10 行ぶん過去が見えている
         assert!(s.lines[0].text.starts_with("line6"));
     }
