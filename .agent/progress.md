@@ -296,3 +296,9 @@
   build-app.sh の codesign に explicit DR（identifier 固定）+ identity 選択の決定論化 + 署名検証を追加
 - 関連コミット: `fix/54-tcc-signing` worktree → PR squash merge
 - 次: 実機 TCC 検証（tccutil reset はユーザー同意が必要 → manual-checks.md 参照）
+
+## 2026-07-03（Issue #60: リリースビルドに PWA ビルド工程を組み込み → v0.2.7）
+- build-app.sh に npm ci + npm run build を追加（cargo build の前に実行）、release.sh に
+  dist 鮮度の機械検証（JS に「履歴」マーカーが含まれるか）を追加。PR #61 squash merge
+- 関連コミット: `2b9f85a`（#61）、`20a0bd3`（v0.2.7 リリース）
+- v0.2.7 パッチリリース完了（GitHub Release + homebrew cask 更新）

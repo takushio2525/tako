@@ -4,11 +4,11 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-03・Issue #42 完了 / Issue #26 完了）
+## 現在の対象（2026-07-03・v0.2.7 リリース完了）
 
-Issue #42（リモートフロントエンド刷新 = #23 フェーズ B）を完了:
-二層構成（履歴レイヤー + ライブ WS + 自動リサイズ）で PWA を刷新。
-Issue #26（Shift+Enter 改行）も textarea 化で同時解決。PR #45 squash merge 済み。
+Issue #60（リリースビルドに PWA ビルド工程が含まれず stale な dist が同梱される）を修正し
+v0.2.7 としてパッチリリース完了。build-app.sh に npm ci + npm run build を組み込み、
+release.sh に dist 鮮度の機械検証を追加。
 
 ## 実装した二層構成
 
