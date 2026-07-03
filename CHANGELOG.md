@@ -5,6 +5,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-07-03
+
+### Fixed
+
+- Release build now includes PWA rebuild (#60): `build-app.sh` runs `npm ci && npm run build` for `web/tako-remote` before `cargo build`, ensuring `rust_embed` always bundles the latest PWA dist. `release.sh` verifies that the bundled JS contains source-derived markers (e.g. history UI strings) to prevent stale dist from shipping again. Without npm, a warning is shown if an existing dist is available; otherwise the build errors
+  リリースビルドに PWA ビルド工程を組み込み（#60）: `build-app.sh` が `cargo build` の前に `web/tako-remote` の `npm ci && npm run build` を実行し、`rust_embed` に常に最新の PWA dist を埋め込む。`release.sh` は同梱 JS にソース由来マーカー（履歴 UI 文字列等）が含まれることを機械検証し、stale な dist の再発を防止。npm 不在時は既存 dist があれば警告スキップ、なければエラー終了
+
 ## [0.2.6] - 2026-07-03
 
 ### Added
