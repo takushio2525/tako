@@ -70,6 +70,30 @@ else
   echo "==> ビルドをスキップ（既存の $APP を使用）"
 fi
 
+# --- PWA dist 鮮度検証（Issue #60 再発防止）---
+# ビルド後の dist の JS にソース由来のマーカーが含まれることを確認する。
+# stale な dist が同梱されるとリモート PWA の機能が欠落する。
+echo "==> PWA dist 鮮度検証"
+PWA_DIST="$REPO_ROOT/web/tako-remote/dist"
+if [[ ! -d "$PWA_DIST/assets" ]]; then
+  echo "エラー: PWA dist が存在しない（$PWA_DIST/assets）" >&2
+  echo "  build-app.sh が npm build を実行したか確認してください" >&2
+  exit 1
+fi
+PWA_MARKER_FOUND=0
+for jsfile in "$PWA_DIST"/assets/*.js; do
+  if grep -q "履歴" "$jsfile" 2>/dev/null; then
+    PWA_MARKER_FOUND=1
+    break
+  fi
+done
+if [[ $PWA_MARKER_FOUND -eq 0 ]]; then
+  echo "エラー: PWA dist の JS に「履歴」マーカーが見つからない" >&2
+  echo "  dist が stale です。npm run build を実行してから再試行してください" >&2
+  exit 1
+fi
+echo "    OK: dist の JS にソース由来マーカーを確認"
+
 # --- zip 生成 ---
 echo "==> zip 生成: $ZIP_NAME"
 rm -f "$ZIP_PATH"
