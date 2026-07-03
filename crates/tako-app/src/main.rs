@@ -4269,13 +4269,15 @@ impl TakoApp {
                             .with_default_highlights(&default_style, highlights),
                     );
                 }
-                // 1 文字 = 1 div でグリッド位置に確実にスナップ。
-                // 半角のグループ化は GPUI のテキストレイアウトとの不整合で
-                // 文字消失を引き起こすため廃止（全角・半角とも個別 div）
+                // 同スタイルの連続半角文字をグループ化して描画要素数を削減。
+                // 全角文字（char_cols > 1）はグリッドスナップのため個別 div を維持。
+                // 旧実装（1 文字 = 1 div）は描画プリミティブ数が cols×rows に
+                // 比例し、GPUI bounds_tree 挿入の O(N log N) が支配的になって
+                // セルフテスト等で実質ハングを引き起こしていた (#39)
                 let cw = cell_width.unwrap();
                 let chars: Vec<(usize, char)> = line.text.char_indices().collect();
                 let row = div().h(px(line_h)).flex().flex_row().overflow_hidden();
-                let mut children: Vec<gpui::AnyElement> = Vec::with_capacity(chars.len());
+                let mut children: Vec<gpui::AnyElement> = Vec::new();
                 let fallback_run = tako_core::screen::StyleRun {
                     range: 0..0,
                     fg: theme.foreground,
@@ -4285,41 +4287,103 @@ impl TakoApp {
                     underline: false,
                     strikeout: false,
                 };
-                // ランインデックスを前進させる方式でスタイル検索を O(N+M) に
                 let mut run_idx = 0;
-                // ランごとの HighlightStyle をキャッシュ（同じランを複数文字で再利用）
                 let run_highlights: Vec<HighlightStyle> =
                     line.runs.iter().map(|r| self.run_highlight(r)).collect();
+
+                // 各文字のスタイルとセル幅を事前計算
+                struct CharInfo {
+                    ch: char,
+                    char_cols: usize,
+                    run_idx: usize,
+                    bg: Option<tako_core::theme::Rgb>,
+                }
+                let mut infos: Vec<CharInfo> = Vec::with_capacity(chars.len());
                 for (ci, &(byte_off, ch)) in chars.iter().enumerate() {
-                    // 現在のランが byte_off を含まなければ前進
                     while run_idx + 1 < line.runs.len() && byte_off >= line.runs[run_idx].range.end
                     {
                         run_idx += 1;
                     }
-                    let (run, hl) = if run_idx < line.runs.len()
+                    let (cur_run_idx, bg) = if run_idx < line.runs.len()
                         && byte_off >= line.runs[run_idx].range.start
                         && byte_off < line.runs[run_idx].range.end
                     {
-                        (&line.runs[run_idx], run_highlights[run_idx])
+                        (run_idx, line.runs[run_idx].bg)
                     } else {
-                        (&fallback_run, self.run_highlight(&fallback_run))
+                        (usize::MAX, fallback_run.bg)
                     };
                     let char_cols = if ci + 1 < line.cell_cols.len() {
                         line.cell_cols[ci + 1] - line.cell_cols[ci]
                     } else {
                         1
                     };
-                    let s = ch.to_string();
-                    let styled = StyledText::new(SharedString::from(s.clone()))
-                        .with_default_highlights(&default_style, vec![(0..s.len(), hl)]);
-                    let mut d = div()
-                        .w(cw * char_cols.max(1) as f32)
-                        .flex_none()
-                        .overflow_hidden();
-                    if let Some(bg) = run.bg {
-                        d = d.bg(hsla(bg));
+                    infos.push(CharInfo {
+                        ch,
+                        char_cols,
+                        run_idx: cur_run_idx,
+                        bg,
+                    });
+                }
+
+                let mut i = 0;
+                while i < infos.len() {
+                    let info = &infos[i];
+                    if info.char_cols > 1 {
+                        // 全角文字: 個別 div（グリッドスナップ維持）
+                        let hl = if info.run_idx < run_highlights.len() {
+                            run_highlights[info.run_idx]
+                        } else {
+                            self.run_highlight(&fallback_run)
+                        };
+                        let s = info.ch.to_string();
+                        let styled = StyledText::new(SharedString::from(s.clone()))
+                            .with_default_highlights(&default_style, vec![(0..s.len(), hl)]);
+                        let mut d = div()
+                            .w(cw * info.char_cols as f32)
+                            .flex_none()
+                            .overflow_hidden();
+                        if let Some(bg) = info.bg {
+                            d = d.bg(hsla(bg));
+                        }
+                        children.push(d.child(styled).into_any_element());
+                        i += 1;
+                    } else {
+                        // 半角文字: 同スタイルの連続をグループ化
+                        let group_run_idx = info.run_idx;
+                        let group_bg = info.bg;
+                        let mut group_cols = info.char_cols;
+                        let mut group_text = String::new();
+                        group_text.push(info.ch);
+                        i += 1;
+                        while i < infos.len() {
+                            let next = &infos[i];
+                            if next.char_cols > 1
+                                || next.run_idx != group_run_idx
+                                || next.bg != group_bg
+                            {
+                                break;
+                            }
+                            group_text.push(next.ch);
+                            group_cols += next.char_cols;
+                            i += 1;
+                        }
+                        let hl = if group_run_idx < run_highlights.len() {
+                            run_highlights[group_run_idx]
+                        } else {
+                            self.run_highlight(&fallback_run)
+                        };
+                        let text_len = group_text.len();
+                        let styled = StyledText::new(SharedString::from(group_text))
+                            .with_default_highlights(&default_style, vec![(0..text_len, hl)]);
+                        let mut d = div()
+                            .w(cw * group_cols.max(1) as f32)
+                            .flex_none()
+                            .overflow_hidden();
+                        if let Some(bg) = group_bg {
+                            d = d.bg(hsla(bg));
+                        }
+                        children.push(d.child(styled).into_any_element());
                     }
-                    children.push(d.child(styled).into_any_element());
                 }
                 row.children(children)
             })
