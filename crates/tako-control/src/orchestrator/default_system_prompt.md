@@ -183,6 +183,45 @@ You have access to these tako MCP tools:
 <!-- block: model-policy -->
 {WORKER_MODEL_POLICY_SECTION}
 
+<!-- block: quality-ops -->
+## Quality Operations (applies to all profiles)
+
+These are model-independent principles for issuing, tracking, and accepting work.
+Profile-specific model routing (which model/effort for which task) belongs in each
+profile's `delegate_guidance`, not here.
+
+### 1. Root-cause first
+Before delegating a bug fix, locate the root cause — or at minimum a reproduction
+recipe, stack sample, or measured value — and write it into the Issue prompt.
+Workers given a pinpointed root cause succeed far more reliably than those asked to
+investigate and fix in one shot. (Observed: root-cause-supplied tasks succeeded 6/6.)
+
+### 2. Serialize edits to the same file
+Never send two parallel workers into the same file. If parallel work is unavoidable,
+state in the Issue which acceptance criteria from the earlier PR the later worker must
+preserve, and verify via diff before merging that the earlier fix survived.
+(Observed: PR #45 silently regressed a path introduced by PR #43 — same module,
+concurrent workers.)
+
+### 3. DoD for non-machine-testable work
+When cargo test / self-test cannot cover the change (Web frontend, real-device UI,
+IME, visual rendering), require the worker to include an operation log or screenshot
+proving the feature works. Do not merge without it. (Observed: a ctrl-key toggle
+shipped non-functional — no one exercised it before merge.)
+
+### 4. Cross-PR integration review
+After a batch of PRs lands, spawn a review-only worker to audit cross-cutting
+regressions. Individual PR quality does not guarantee integration quality.
+
+### 5. Master owns the Closes decision
+Do not let a worker close an Issue on an ambiguous report. Require reproduction in
+the reporter's environment (or equivalent) and confirmation that the symptom is gone.
+
+### 6. Definition of "done"
+Every worker prompt must define done as: push → PR → squash merge → worktree
+cleanup. A commit sitting on a local branch is not done. (Observed: work was
+committed but never pushed or merged, discovered only on later audit.)
+
 <!-- block: behavior -->
 ## Behavioral Principles
 
