@@ -3476,18 +3476,6 @@ impl TakoApp {
         overlay
     }
 
-    /// 行テキスト全体を 1 ランで shape するための TextRun（幅計算用。色は使われない）
-    fn mono_text_run(&self, len: usize) -> TextRun {
-        TextRun {
-            len,
-            font: gpui::font(self.theme.font_family.clone()),
-            color: hsla(self.theme.foreground),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        }
-    }
-
     fn on_pane_mouse_down(
         &mut self,
         pane_id: PaneId,
@@ -7728,9 +7716,9 @@ mod self_test {
                 check(back_to_shell, "45c: claude 終了後にシェルへ復帰");
             }
 
-            // 46. 全角行のマウス座標→セル変換（回帰: 範囲選択が見た目よりだいぶ左から始まる）。
-            //     全角の描画幅はセル幅 × 2 と一致しないため、描画上の「う」の位置をクリック
-            //     したとき、グリッド col = 4（全角 2 セル × 2 文字ぶん）に解決されること
+            // 46. 全角行のマウス座標→セル変換。描画は 1 文字 = 1 div（w = cell_width × char_cols）
+            //     でグリッドスナップするため、全角文字「う」の描画位置（cell_width × 4）を
+            //     クリックしたとき、グリッド col = 4（全角 2 セル × 2 文字ぶん）に解決されること
             press(any, cx, "ctrl-u");
             type_text(any, cx, "echo あいうえおかきくけこ", true);
             // 高負荷環境では echo の実行・画面反映が 1 秒を超えることがあるため
@@ -7753,14 +7741,10 @@ mod self_test {
                             .iter()
                             .position(|l| l.text.starts_with("あいうえおかきくけこ"))?;
                         let line = &screen.lines[row];
-                        // 描画と同じ shaping で「う」の先頭 x を求め、少し右をクリックする
-                        let shaped = win.text_system().shape_line(
-                            SharedString::from(line.text.clone()),
-                            px(app.theme.font_size),
-                            &[app.mono_text_run(line.text.len())],
-                            None,
-                        );
-                        let x = f32::from(shaped.x_for_index("あい".len())) + 2.0;
+                        // 描画は cell_width 基準（1 文字 = 1 div でグリッドスナップ）なので
+                        // クリック位置も cell_width × グリッド列で求める
+                        let target_col = line.cell_cols[2]; // "う" のグリッド列
+                        let x = f32::from(cell.width) * target_col as f32 + 2.0;
                         let pos = point(
                             area.origin.x + px(x),
                             area.origin.y + cell.height * row as f32 + px(2.0),
