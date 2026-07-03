@@ -1479,27 +1479,56 @@ impl TakoApp {
         })
         .detach();
 
-        // アプリ内自動更新チェック（起動時 + 24 時間ごと）
+        // アプリ内自動更新チェック（起動時 + 24 時間ごと。失敗時は静かにリトライ）
         if std::env::var_os("TAKO_SELF_TEST").is_none() {
             cx.spawn(async move |this, cx| loop {
                 let task = cx
                     .background_executor()
                     .spawn(async { update_checker::check_latest() });
                 let result = task.await;
-                if let Some(info) = result {
-                    let ok = this.update(cx, |app: &mut TakoApp, cx| {
-                        if !matches!(app.update_state, update_checker::UpdateState::Dismissed) {
-                            app.update_state = update_checker::UpdateState::Available(info);
-                            cx.notify();
+                let wait = match result {
+                    Ok(Some(info)) => {
+                        let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                            if !matches!(app.update_state, update_checker::UpdateState::Dismissed) {
+                                app.update_state = update_checker::UpdateState::Available(info);
+                                cx.notify();
+                            }
+                        });
+                        if ok.is_err() {
+                            break;
                         }
-                    });
-                    if ok.is_err() {
-                        break;
+                        update_checker::CHECK_INTERVAL
                     }
-                }
-                cx.background_executor()
-                    .timer(update_checker::CHECK_INTERVAL)
-                    .await;
+                    Ok(None) => {
+                        // 既に最新 — CheckFailed 状態だったらクリアする
+                        let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                            if matches!(
+                                app.update_state,
+                                update_checker::UpdateState::CheckFailed(_)
+                            ) {
+                                app.update_state = update_checker::UpdateState::Idle;
+                                cx.notify();
+                            }
+                        });
+                        update_checker::CHECK_INTERVAL
+                    }
+                    Err(e) => {
+                        let retry = e.retry_duration();
+                        let msg = e.to_string();
+                        let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                            if !matches!(
+                                app.update_state,
+                                update_checker::UpdateState::Dismissed
+                                    | update_checker::UpdateState::Available(_)
+                            ) {
+                                app.update_state = update_checker::UpdateState::CheckFailed(msg);
+                                cx.notify();
+                            }
+                        });
+                        retry
+                    }
+                };
+                cx.background_executor().timer(wait).await;
             })
             .detach();
         }
@@ -5443,16 +5472,25 @@ impl ControlHost for TakoApp {
     }
     fn update_check(&self) -> serde_json::Value {
         match update_checker::check_latest() {
-            Some(info) => serde_json::json!({
+            Ok(Some(info)) => serde_json::json!({
                 "available": true,
                 "version": info.version,
                 "download_url": info.download_url,
             }),
-            None => serde_json::json!({ "available": false }),
+            Ok(None) => serde_json::json!({ "available": false }),
+            Err(e) => {
+                let mut json = serde_json::json!({
+                    "available": false,
+                    "error": e.to_json(),
+                });
+                json["error_message"] = serde_json::Value::String(e.to_string());
+                json
+            }
         }
     }
     fn update_apply(&mut self) -> Result<serde_json::Value, String> {
         let info = update_checker::check_latest()
+            .map_err(|e| format!("更新チェックに失敗: {e}"))?
             .ok_or_else(|| "新しいバージョンが見つからない（既に最新版です）".to_string())?;
         update_checker::perform_update(&info)?;
         Ok(serde_json::json!({
@@ -5463,6 +5501,7 @@ impl ControlHost for TakoApp {
     }
     fn update_apply_zip(&mut self) -> Result<serde_json::Value, String> {
         let info = update_checker::check_latest()
+            .map_err(|e| format!("更新チェックに失敗: {e}"))?
             .ok_or_else(|| "新しいバージョンが見つからない（既に最新版です）".to_string())?;
         update_checker::perform_update_zip(&info)?;
         Ok(serde_json::json!({

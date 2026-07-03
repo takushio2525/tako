@@ -494,6 +494,38 @@ impl TakoApp {
                         .into_any_element(),
                 )
             }
+            super::update_checker::UpdateState::CheckFailed(msg) => {
+                let short = if msg.len() > 60 {
+                    format!("{}…", &msg[..msg.floor_char_boundary(57)])
+                } else {
+                    msg.clone()
+                };
+                Some(
+                    pill()
+                        .id("update-check-failed")
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(hsla(theme.text_tertiary))
+                                .child(SharedString::from(short)),
+                        )
+                        .child(
+                            div()
+                                .id("update-check-failed-dismiss")
+                                .cursor_pointer()
+                                .text_size(px(10.5))
+                                .text_color(hsla(theme.text_tertiary))
+                                .hover(|d| d.text_color(hsla(theme.text_secondary)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.update_state =
+                                        super::update_checker::UpdateState::Dismissed;
+                                    cx.notify();
+                                }))
+                                .child("×"),
+                        )
+                        .into_any_element(),
+                )
+            }
             _ => None,
         }
     }

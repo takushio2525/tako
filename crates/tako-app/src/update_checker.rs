@@ -1,8 +1,8 @@
 //! アプリ内自動更新チェッカー
 //!
-//! GitHub Releases API を定期確認し、新しい安定版があればステータスバーに通知。
-//! 配布系統（Homebrew / zip 手動配置）を自動判別し、系統内で更新を実行する。
-//! 更新完了後は自動再起動する（#30 のタブ永続化で構成は復元される）。
+//! GitHub Web リダイレクト（API レート制限の対象外）で最新リリースを検知し、
+//! ステータスバーに通知。配布系統（Homebrew / zip 手動配置）を自動判別し、
+//! 系統内で更新を実行する。更新完了後は自動再起動する（#30 のタブ永続化で構成は復元される）。
 //!
 //! broken-brew 検知（#50）: brew upgrade 失敗等で「.app 実体あり・cask 台帳なし」の
 //! 詰み状態を検知し、修復（`brew install --cask --force`）または zip フォールバックを提供。
@@ -13,27 +13,16 @@ use std::time::Duration;
 /// 更新チェック間隔（24 時間）
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// チェック失敗時のリトライ間隔（1 時間）
+pub const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
 /// 現在のバージョン（Cargo.toml から埋め込み）
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const RELEASES_URL: &str = "https://api.github.com/repos/takushio2525/tako/releases";
+const OWNER_REPO: &str = "takushio2525/tako";
 
-/// GitHub Release の最小構造（API レスポンスの必要フィールドだけ）
-#[derive(Debug, Clone, serde::Deserialize)]
-struct GhRelease {
-    tag_name: String,
-    draft: bool,
-    prerelease: bool,
-    html_url: String,
-    assets: Vec<GhAsset>,
-}
-
-/// リリースアセット
-#[derive(Debug, Clone, serde::Deserialize)]
-struct GhAsset {
-    name: String,
-    browser_download_url: String,
-}
+/// Web 側の latest リリース URL（API レート制限の対象外。302 で /releases/tag/vX.Y.Z へ飛ぶ）
+const LATEST_WEB_URL: &str = "https://github.com/takushio2525/tako/releases/latest";
 
 /// 更新チェック結果
 #[derive(Debug, Clone)]
@@ -42,6 +31,92 @@ pub struct UpdateInfo {
     #[allow(dead_code)]
     pub html_url: String,
     pub download_url: Option<String>,
+}
+
+/// 更新チェックのエラー（#59: エラーと「更新なし」を区別する）
+#[derive(Debug, Clone)]
+pub enum CheckError {
+    /// GitHub API / Web のレート制限（X-RateLimit-Reset の UNIX timestamp を含む）
+    RateLimit { retry_after: Option<u64> },
+    /// ネットワークエラー（DNS 解決失敗、接続タイムアウト等）
+    Network(String),
+    /// レスポンスのパースに失敗
+    Parse(String),
+}
+
+impl std::fmt::Display for CheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckError::RateLimit {
+                retry_after: Some(ts),
+            } => {
+                write!(
+                    f,
+                    "GitHub レート制限中（リセット: {}）",
+                    format_reset_time(*ts)
+                )
+            }
+            CheckError::RateLimit { retry_after: None } => {
+                write!(f, "GitHub レート制限中")
+            }
+            CheckError::Network(msg) => write!(f, "ネットワークエラー: {msg}"),
+            CheckError::Parse(msg) => write!(f, "レスポンス解析エラー: {msg}"),
+        }
+    }
+}
+
+impl CheckError {
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            CheckError::RateLimit { retry_after } => serde_json::json!({
+                "type": "rate_limit",
+                "message": self.to_string(),
+                "retry_after": retry_after,
+            }),
+            CheckError::Network(msg) => serde_json::json!({
+                "type": "network",
+                "message": msg,
+            }),
+            CheckError::Parse(msg) => serde_json::json!({
+                "type": "parse",
+                "message": msg,
+            }),
+        }
+    }
+
+    /// レート制限エラーならリセット時刻までの Duration を返す（最低 60 秒）
+    pub fn retry_duration(&self) -> Duration {
+        match self {
+            CheckError::RateLimit {
+                retry_after: Some(ts),
+            } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                Duration::from_secs(ts.saturating_sub(now).max(60))
+            }
+            _ => RETRY_INTERVAL,
+        }
+    }
+}
+
+fn format_reset_time(unix_ts: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if unix_ts > now {
+        let remaining = unix_ts - now;
+        let minutes = remaining / 60;
+        if minutes > 0 {
+            format!("約{minutes}分後")
+        } else {
+            format!("約{remaining}秒後")
+        }
+    } else {
+        "まもなく".into()
+    }
 }
 
 /// UI に公開する更新状態
@@ -64,6 +139,8 @@ pub enum UpdateState {
         brew_error: String,
         info: UpdateInfo,
     },
+    /// 更新チェック失敗（#59: エラーの可視化。静かにリトライする）
+    CheckFailed(String),
     /// ユーザーが閉じた（次回起動まで非表示）
     Dismissed,
 }
@@ -250,36 +327,70 @@ pub fn detect_duplicate_cli() -> Vec<PathBuf> {
     seen
 }
 
-/// GitHub Releases から最新の安定版を取得する（ブロッキング。background executor で呼ぶ）
-pub fn check_latest() -> Option<UpdateInfo> {
-    let body: String = ureq::get(RELEASES_URL)
-        .header("Accept", "application/vnd.github+json")
+/// 最新版をチェック（Web リダイレクト方式。API レート制限の対象外）。
+/// 新しいバージョンがあれば Some(info)、既に最新なら None、エラー時は Err。
+pub fn check_latest() -> Result<Option<UpdateInfo>, CheckError> {
+    let agent = ureq::Agent::config_builder()
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+
+    let resp = agent
+        .get(LATEST_WEB_URL)
         .header("User-Agent", &format!("tako/{CURRENT_VERSION}"))
         .call()
-        .ok()?
-        .body_mut()
-        .read_to_string()
-        .ok()?;
-    let releases: Vec<GhRelease> = serde_json::from_str(&body).ok()?;
-    let stable: Vec<&GhRelease> = releases
-        .iter()
-        .filter(|r| !r.draft && !r.prerelease)
-        .collect();
-    let latest = stable.first()?;
-    let latest_ver = latest.tag_name.trim_start_matches('v');
-    if !is_newer(latest_ver, CURRENT_VERSION) {
-        return None;
+        .map_err(|e| CheckError::Network(e.to_string()))?;
+
+    let status = resp.status().as_u16();
+    match status {
+        301 | 302 => {
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| CheckError::Parse("Location ヘッダーがない".into()))?;
+
+            // Location: https://github.com/takushio2525/tako/releases/tag/v0.2.6
+            let version = location
+                .rsplit('/')
+                .next()
+                .and_then(|tag| tag.strip_prefix('v'))
+                .ok_or_else(|| CheckError::Parse(format!("タグをパースできない: {location}")))?;
+
+            if !is_newer(version, CURRENT_VERSION) {
+                return Ok(None);
+            }
+
+            let arch = match std::env::consts::ARCH {
+                "aarch64" => "arm64",
+                other => other,
+            };
+            let download_url = format!(
+                "https://github.com/{OWNER_REPO}/releases/download/v{version}/tako-v{version}-macos-{arch}.zip"
+            );
+
+            Ok(Some(UpdateInfo {
+                version: version.to_string(),
+                html_url: location.to_string(),
+                download_url: Some(download_url),
+            }))
+        }
+        404 => Err(CheckError::Network(
+            "リリースが見つからない（リポジトリ未公開または未リリース）".into(),
+        )),
+        429 | 403 => {
+            let retry_after = resp
+                .headers()
+                .get("x-ratelimit-reset")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            Err(CheckError::RateLimit { retry_after })
+        }
+        _ => Err(CheckError::Network(format!(
+            "予期しないステータスコード: {status}"
+        ))),
     }
-    let zip_asset = latest.assets.iter().find(|a| {
-        let name = a.name.to_lowercase();
-        name.ends_with(".zip")
-            && (name.contains("macos") || name.contains("darwin") || name.contains("tako"))
-    });
-    Some(UpdateInfo {
-        version: latest_ver.to_string(),
-        html_url: latest.html_url.clone(),
-        download_url: zip_asset.map(|a| a.browser_download_url.clone()),
-    })
 }
 
 /// semver 比較（a > b なら true）。不正な形式は false
@@ -511,6 +622,58 @@ mod tests {
         assert!(json.get("duplicate_cli").is_some());
     }
 
+    // --- CheckError ---
+
+    #[test]
+    fn test_check_error_display() {
+        let e = CheckError::Network("connection refused".into());
+        assert!(e.to_string().contains("connection refused"));
+
+        let e = CheckError::RateLimit { retry_after: None };
+        assert!(e.to_string().contains("レート制限"));
+
+        let e = CheckError::Parse("bad json".into());
+        assert!(e.to_string().contains("bad json"));
+    }
+
+    #[test]
+    fn test_check_error_to_json() {
+        let e = CheckError::RateLimit {
+            retry_after: Some(1234567890),
+        };
+        let json = e.to_json();
+        assert_eq!(json["type"], "rate_limit");
+        assert_eq!(json["retry_after"], 1234567890);
+
+        let e = CheckError::Network("timeout".into());
+        let json = e.to_json();
+        assert_eq!(json["type"], "network");
+    }
+
+    #[test]
+    fn test_check_error_retry_duration() {
+        let e = CheckError::Network("timeout".into());
+        assert_eq!(e.retry_duration(), RETRY_INTERVAL);
+
+        let e = CheckError::RateLimit { retry_after: None };
+        assert_eq!(e.retry_duration(), RETRY_INTERVAL);
+    }
+
+    #[test]
+    fn test_format_reset_time() {
+        // 遠い未来の timestamp → 「約N分後」形式
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 300;
+        let s = format_reset_time(future);
+        assert!(s.contains("分後") || s.contains("秒後"));
+
+        // 過去の timestamp → 「まもなく」
+        assert_eq!(format_reset_time(0), "まもなく");
+    }
+
     // --- broken-brew 判定ロジックの単体テスト（サブプロセス不要） ---
 
     #[test]
@@ -539,8 +702,6 @@ mod tests {
 
     #[test]
     fn test_broken_brew_detection_logic() {
-        // broken-brew = Caskroom パスでない + app 実体あり + brew あり + cask 未登録
-        // この関数はロジックのみテスト（実際の brew は呼ばない）
         struct Case {
             app_in_caskroom: bool,
             app_exists: bool,
@@ -549,7 +710,6 @@ mod tests {
             expected: InstallMethod,
         }
         let cases = [
-            // 正常な Homebrew（Caskroom 経由）
             Case {
                 app_in_caskroom: true,
                 app_exists: true,
@@ -557,7 +717,6 @@ mod tests {
                 cask_registered: true,
                 expected: InstallMethod::Homebrew,
             },
-            // 正常な zip（brew なし）
             Case {
                 app_in_caskroom: false,
                 app_exists: true,
@@ -565,7 +724,6 @@ mod tests {
                 cask_registered: false,
                 expected: InstallMethod::Zip,
             },
-            // 正常な zip（brew あるが tako は未導入）
             Case {
                 app_in_caskroom: false,
                 app_exists: false,
@@ -573,7 +731,6 @@ mod tests {
                 cask_registered: false,
                 expected: InstallMethod::Zip,
             },
-            // broken-brew: app あり + brew あり + 台帳なし
             Case {
                 app_in_caskroom: false,
                 app_exists: true,
@@ -581,7 +738,6 @@ mod tests {
                 cask_registered: false,
                 expected: InstallMethod::BrokenBrew,
             },
-            // app あり + brew あり + 台帳あり → ただの zip（Caskroom 外だが台帳にはある特殊ケース）
             Case {
                 app_in_caskroom: false,
                 app_exists: true,
@@ -609,9 +765,7 @@ mod tests {
 
     #[test]
     fn test_repair_brew_rejects_non_broken() {
-        // 開発環境では broken-brew ではないため Err を返すはず
         let result = repair_brew();
-        // broken-brew でなければ「修復は不要」エラー
         if detect_install_method_full() != InstallMethod::BrokenBrew {
             assert!(result.is_err());
             assert!(result.unwrap_err().contains("修復は不要"));
