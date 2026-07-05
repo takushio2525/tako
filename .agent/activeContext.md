@@ -4,33 +4,39 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-05・Issue #63 完了）
+## 現在の対象（2026-07-05・Issue #64 完了）
 
-リモート UI 再設計 v3（PR #69 squash merge 済み）。#42 方式の 2 大設計不良
-（スマホ接続が PC のペインをリサイズして表示破壊 / ライブ・履歴の切替式 UI）を根治した。
+PC 版描画で半角文字が確率的に消える問題（#64）を根治し PR #70 squash merge 済み。
+根因 = 半角グループ div の幅を GPUI が wrap_width として扱い、シェイプ幅の f32 ヘアライン
+超過で末尾の単語/文字が行 div の overflow_hidden 外へ折り返されて不可視化（実測プローブで
+確定。純 ASCII の「UI」「Fable 5 + max」でも幅が完全一致表示のまま wrap が発生）。
+
+## #64 の修正構成（crates/tako-app/src/main.rs）
+
+- 行 div に `whitespace_nowrap()` — GPUI の折り返し経路（wrap_width）を構造的に禁止（根治）
+- `glyph_snaps_to_cell()`（advance 実測 + char 単位キャッシュ）でセル幅不一致グリフ
+  （⏺ ⎿ 等のフォールバックフォント記号）をグループから除外し個別 div 化（ずれ累積の遮断）。
+  ASCII は無条件グループ化なので #39 のハング解消効果（描画要素数削減）は維持
+- グループ分割は純関数 `chunk_line_chars`（unit test 5 本）+ セルフテスト 69b（根因実在・
+  nowrap 構造・グリフ隔離の 3 検査）。zed の `apply_force_width_to_layout` と比較裏取り済み
 
 ## リモート UI の現行構成（#63）
 
 - **PC 非破壊**: WS の cols/rows 自動リサイズを全廃。`/ws?pane=<id>` は読み取り専用で
   ペインサイズに影響する経路が存在しない。REST `POST /resize` は CLI / MCP 用の明示操作として存置
 - **WS プロトコル**: 接続時 `init`（履歴 2000 行 + 現画面 + カーソル、ANSI 付き）→
-  250ms 差分で `update`（`#{history_size}` 増分から切り出した押し出し行 + 現画面）。
-  clear / サイズ変更 / 大量出力時は init 再送。`display-message ; capture-pane` の
-  1 回呼びでメタと内容の一貫性を確保（`parse_snapshot` にテスト 7 本）
-- **クライアント**: xterm.js 廃止（依存 3 つ削除、バンドル 37KB）。折り返しリーダービュー =
-  履歴 + ライブ画面を 1 本の縦スクロール（下端追従・上スクロールで過去・下端復帰で追従再開 +
-  「↓最新へ」）。ANSI SGR は自前パーサ `web/tako-remote/src/ansi.js`。フォント A−/A＋、
-  ペイン切替はスワイプ + ヘッダー ‹ ›
-- **検証用**: `TAKO_REMOTE_STATE_DIR` で pid/token/port を隔離でき、検証デーモンを
-  本番（port 7749）と並走可能
+  250ms 差分で `update`。clear / サイズ変更 / 大量出力時は init 再送
+- **クライアント**: xterm.js 廃止。折り返しリーダービュー + 自前 ANSI SGR パーサ
+  （`web/tako-remote/src/ansi.js`）。フォント A−/A＋、ペイン切替はスワイプ + ヘッダー ‹ ›
+- **検証用**: `TAKO_REMOTE_STATE_DIR` で pid/token/port を隔離、検証デーモンを本番と並走可能
 
 ## 残作業・既知の制約
 
-- **スマホ実機テスト未実施**: リーダービューの実機確認（タッチスクロール・慣性・選択・
-  ソフトキーボード）が必要。devtools エミュレーションは PR #69 に記録済み
-- main.rs の残り 8,359 行にはまだ大きなブロックがある
+- **スマホ実機テスト未実施**（#63 リーダービュー: タッチスクロール・慣性・選択・ソフトキーボード）
+- main.rs は 9,801 行（#64 で検証コード込み +370 行）。さらなる分割は別タスク
 - MCP HTTP ポートのランダム問題は未解決（stdio ブリッジ経由なら影響なし）
-- **セルフテスト項目 46「全角行のクリックが正しいセルに解決」が決定的に失敗** = Issue #37
+- セルフテストの既知失敗は PDF（項目 70、CoreGraphics 環境依存）のみ。
+  項目 46「全角行のクリック」は #37 修正済みで通過する（旧記述を訂正）
 - CI（GitHub Actions）が 6/12 以降トリガーされていない（直近 PR はすべて CI なしでマージ）— 要調査
 
 ## 未着手タスク（優先順はユーザーと相談）
@@ -42,6 +48,8 @@
 
 ## 現フェーズで Read すべき設計書
 
+- ターミナル描画（グループ化 / グリフ整合）修正時: `crates/tako-app/src/main.rs` の
+  `chunk_line_chars` / `terminal_screen_lines` 周辺コメント（#39 / #64 の設計の正）
 - リモート API 修正時: `crates/tako-control/src/remote.rs` モジュールコメント（API 仕様の正）
 - リモート PWA 修正時: `web/tako-remote/src/pages/terminal.jsx` 冒頭コメント（リーダービュー設計）
 - オーケストレーター修正時: `docs/orchestrator.md`

@@ -310,3 +310,11 @@
   隔離 tmux で 93x50 不変の機械検証 + Playwright モバイル操作記録 + #51/#52 維持を PR に記録
 - 関連コミット: `d99db5d`（feature/63-remote-ui-v3 worktree → PR #69 squash merge）
 - 次: スマホ実機での最終確認（タッチスクロール・ソフトキーボード）
+
+## 2026-07-05（Issue #64: 日本語混在行の半角文字消失を根治）
+- 根因を実測で確定: 半角グループ div の幅を GPUI が wrap_width として扱い、シェイプ幅の
+  f32 ヘアライン超過で末尾単語/文字が折り返されて overflow_hidden 外へ消失（純 ASCII でも発生、
+  「max」丸ごと/「I」単体消失の観測と一致）。行 div whitespace_nowrap + セル幅不一致グリフ
+  （⏺ 等）の個別 div 隔離で根治。#39 の要素数削減は維持、zed の force_width 方式で裏取り
+- 関連コミット: `9ec7cd2`（fix/64 worktree → PR #70 squash merge）。セルフテスト 69b + unit 5 本追加
+- 次: なし（#64 クローズ。見た目の最終確認は通常利用で）
