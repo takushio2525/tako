@@ -5,7 +5,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [0.2.7] - 2026-07-03
+### Fixed
+
+- Half-width characters no longer vanish sporadically in mixed Japanese/ASCII lines (#64): grouped half-width runs (#39) rendered text inside a grid-width div, and GPUI treated that width as a wrap width — a hairline (f32 ULP) overshoot of the shaped width made GPUI wrap the tail word/character onto an invisible second line inside the `overflow_hidden` row (e.g. "ターミナルUI" → "ターミナルU", "Fable 5 + max" → "Fable 5 + "). Rows now set `whitespace_nowrap` (structurally disables wrapping), and glyphs whose advance differs from the cell width (fallback-font symbols like ⏺ ⎿) are excluded from grouping into their own cell-width div so misalignment cannot accumulate. The #39 hang fix (element count reduction) is preserved: ASCII runs stay grouped
+  日本語混在行で半角文字が確率的に消える問題を根治（#64）: 半角グループ化描画（#39）はグリッド幅の div 内にテキストを置くが、GPUI はその幅を折り返し幅として扱うため、シェイプ幅がヘアライン（f32 ULP）でも超えると末尾の単語/文字が折り返されて行 div の `overflow_hidden` 外へ消えていた（例:「ターミナルUI」→「ターミナルU」、「Fable 5 + max」→「Fable 5 + 」）。行 div に `whitespace_nowrap` を指定して折り返しを構造的に禁止し、advance がセル幅と一致しないグリフ（⏺ ⎿ 等のフォールバックフォント記号）はグループから除外してセル幅固定の個別 div に隔離、ずれの累積も遮断。#39 のハング解消効果（描画要素数削減）は維持（ASCII 連続はグループ化のまま）
 
 ### Fixed
 
