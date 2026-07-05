@@ -302,3 +302,11 @@
   dist 鮮度の機械検証（JS に「履歴」マーカーが含まれるか）を追加。PR #61 squash merge
 - 関連コミット: `2b9f85a`（#61）、`20a0bd3`（v0.2.7 リリース）
 - v0.2.7 パッチリリース完了（GitHub Release + homebrew cask 更新）
+
+## 2026-07-05（Issue #63: リモート UI 再設計 v3 — PC 非破壊・連続スクロール・リーダービュー化）
+- WS の cols/rows 自動リサイズ全廃（PC 非破壊）+ init/update プッシュプロトコル刷新
+  （`#{history_size}` 増分で押し出し行を切り出し）。xterm.js 廃止 → 折り返しリーダービュー
+  （1 本の連続スクロール、下端追従/過去閲覧/追従再開）+ 自前 ANSI SGR パーサ。
+  隔離 tmux で 93x50 不変の機械検証 + Playwright モバイル操作記録 + #51/#52 維持を PR に記録
+- 関連コミット: `d99db5d`（feature/63-remote-ui-v3 worktree → PR #69 squash merge）
+- 次: スマホ実機での最終確認（タッチスクロール・ソフトキーボード）
