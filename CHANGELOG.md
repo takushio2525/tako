@@ -5,10 +5,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-07-05
+
+### Changed
+
+- Remote UI redesign v3 — PC-safe read-only WebSocket + continuous-scroll reader view (#63): WebSocket auto-resize of cols/rows is completely removed — `/ws?pane=<id>` is now read-only and never affects the PC pane size. Protocol changed to push `init` (history + current screen with ANSI, cursor) on connect, then `update` diffs every 250ms. xterm.js is replaced with a self-contained reader view: one continuous scroll with bottom-following (scroll up to browse history, scroll to bottom to re-follow), line-wrapping for mobile readability, and a custom ANSI SGR parser (`web/tako-remote/src/ansi.js`) — zero added dependencies. Font size A−/A+, pane switching via swipe + header ‹ ›
+  リモート UI を再設計 v3 — PC 非破壊の読み取り専用 WebSocket + 連続スクロールリーダービュー（#63）: WS の cols/rows 自動リサイズを全廃し、`/ws?pane=<id>` は読み取り専用で PC のペインサイズに一切影響しなくなった。プロトコルを接続時 `init`（履歴 + 現画面、ANSI 付き + カーソル）→ 250ms 差分 `update` のプッシュ方式に刷新。xterm.js を廃止し、折り返しリーダービュー（1 本の連続スクロール、下端追従・上スクロールで過去閲覧・下端復帰で追従再開）+ 自前 ANSI SGR パーサ（`web/tako-remote/src/ansi.js`）で再実装。依存追加ゼロ。フォント A−/A+、スワイプ + ヘッダー ‹ › でペイン切替
+
 ### Fixed
 
 - Half-width characters no longer vanish sporadically in mixed Japanese/ASCII lines (#64): grouped half-width runs (#39) rendered text inside a grid-width div, and GPUI treated that width as a wrap width — a hairline (f32 ULP) overshoot of the shaped width made GPUI wrap the tail word/character onto an invisible second line inside the `overflow_hidden` row (e.g. "ターミナルUI" → "ターミナルU", "Fable 5 + max" → "Fable 5 + "). Rows now set `whitespace_nowrap` (structurally disables wrapping), and glyphs whose advance differs from the cell width (fallback-font symbols like ⏺ ⎿) are excluded from grouping into their own cell-width div so misalignment cannot accumulate. The #39 hang fix (element count reduction) is preserved: ASCII runs stay grouped
   日本語混在行で半角文字が確率的に消える問題を根治（#64）: 半角グループ化描画（#39）はグリッド幅の div 内にテキストを置くが、GPUI はその幅を折り返し幅として扱うため、シェイプ幅がヘアライン（f32 ULP）でも超えると末尾の単語/文字が折り返されて行 div の `overflow_hidden` 外へ消えていた（例:「ターミナルUI」→「ターミナルU」、「Fable 5 + max」→「Fable 5 + 」）。行 div に `whitespace_nowrap` を指定して折り返しを構造的に禁止し、advance がセル幅と一致しないグリフ（⏺ ⎿ 等のフォールバックフォント記号）はグループから除外してセル幅固定の個別 div に隔離、ずれの累積も遮断。#39 のハング解消効果（描画要素数削減）は維持（ASCII 連続はグループ化のまま）
+- `migrate_legacy_default_profile` no longer strips user-configured model on every master launch (#67): when the backup file (`default.yaml.backup-1m`) already exists, the migration is considered done and skipped. Previously, each `tako master` / `tako setup` / spawn run re-triggered the migration, removing any model that had been set via `tako orchestrator profiles set --model`
+  `migrate_legacy_default_profile` が master 起動のたびにユーザー設定の model を消す問題を修正（#67）: backup ファイル（`default.yaml.backup-1m`）が存在する場合はマイグレーション済みと判断してスキップするようにした。従来は `tako master` / `tako setup` / spawn の実行ごとにマイグレーションが再発火し、`tako orchestrator profiles set --model` で設定した model が消えていた
+- Update checker no longer misreports GitHub API rate limits as "no update available" (#59): switched from GitHub API to web redirect-based version detection (not subject to API rate limits), introduced `CheckError` type to distinguish errors from genuine "no update" state, added silent retry on failure (waits until rate-limit reset for 403, 1 hour for others), and surfaced error details in CLI/MCP JSON and status bar
+  更新チェッカーが GitHub API レート制限を「更新なし」と誤報告する問題を修正（#59）: GitHub API から Web リダイレクト方式（API レート制限の対象外）に移行し、`CheckError` 型でエラーと「更新なし」を区別、自動チェック失敗時の静かなリトライ（レート制限は reset 時刻まで、他は 1 時間後）を追加、CLI/MCP の JSON とステータスバーにエラー詳細を表示
+
+## [0.2.7] - 2026-07-03
 
 ### Fixed
 
