@@ -548,6 +548,12 @@ struct TakoApp {
     webviews: webview::WebViews,
     /// アプリ内自動更新の状態
     update_state: update_checker::UpdateState,
+    /// グリフ advance がセル幅（半角 1 セル）と一致するかのキャッシュ（Issue #64）。
+    /// テーマフォントに無いグリフ（⏺ ⎿ 等）はフォールバックフォントで描画され
+    /// advance がセル幅とずれるため、描画グループ化から除外する判定に使う
+    glyph_snap_cache: std::cell::RefCell<HashMap<char, bool>>,
+    /// グリフ advance 実測用のテキストシステム（new で App から取得して保持）
+    text_system: std::sync::Arc<gpui::TextSystem>,
 }
 
 /// git パネルのデータスナップショット（FR-3.6 / FR-3.9）
@@ -583,6 +589,70 @@ struct TmuxViewTarget {
     wrapper: Option<String>,
     /// 元セッションが居る tmux サーバーの socket（`-L` 値。既定サーバーは None）
     socket: Option<String>,
+}
+
+/// terminal_screen_lines の 1 文字ぶんの描画情報（#39 / #64）
+#[derive(Debug, Clone)]
+struct CharInfo {
+    ch: char,
+    /// 占有セル数（全角 = 2、半角 = 1、結合文字等 = 0）
+    char_cols: usize,
+    /// line.runs のインデックス（範囲外 = フォールバックスタイル）
+    run_idx: usize,
+    bg: Option<tako_core::theme::Rgb>,
+    /// グリフ advance が半角セル幅と一致するか（char_cols == 1 のときのみ意味を持つ）
+    snaps: bool,
+}
+
+/// 描画 div 1 つぶんのチャンク（CharInfo 列の半開区間）
+#[derive(Debug, Clone, PartialEq)]
+struct RenderChunk {
+    start: usize,
+    end: usize,
+    /// 合計セル数
+    cols: usize,
+    run_idx: usize,
+    bg: Option<tako_core::theme::Rgb>,
+}
+
+/// 同スタイル・セル幅整合の連続半角文字を 1 チャンクへまとめ、全角文字と
+/// セル幅不一致グリフ（snaps == false）は単独チャンクに分離する。
+/// グループ化は #39（描画要素数の削減）、不一致グリフの分離は #64
+/// （フォールバックフォントの advance ずれがグループ内で累積し後続文字を
+/// 押し出すのを、セル幅固定の個別 div で遮断する）。
+/// ゼロ幅文字（結合文字）は直前のグループに含める（分離するとベース文字と合成されない）
+fn chunk_line_chars(infos: &[CharInfo]) -> Vec<RenderChunk> {
+    let mut chunks = Vec::new();
+    let mut i = 0;
+    while i < infos.len() {
+        let info = &infos[i];
+        let start = i;
+        let mut cols = info.char_cols;
+        let solo = info.char_cols > 1 || (info.char_cols == 1 && !info.snaps);
+        i += 1;
+        if !solo {
+            while i < infos.len() {
+                let next = &infos[i];
+                if next.char_cols > 1
+                    || (next.char_cols == 1 && !next.snaps)
+                    || next.run_idx != info.run_idx
+                    || next.bg != info.bg
+                {
+                    break;
+                }
+                cols += next.char_cols;
+                i += 1;
+            }
+        }
+        chunks.push(RenderChunk {
+            start,
+            end: i,
+            cols,
+            run_idx: info.run_idx,
+            bg: info.bg,
+        });
+    }
+    chunks
 }
 
 /// プレビューペインのテキスト選択状態
@@ -1087,6 +1157,8 @@ impl TakoApp {
             preview_line_texts: HashMap::new(),
             webviews: HashMap::new(),
             update_state: update_checker::UpdateState::Idle,
+            glyph_snap_cache: std::cell::RefCell::new(HashMap::new()),
+            text_system: cx.text_system().clone(),
         };
         if restored.is_empty() {
             let root_id = app.workspace.active_tab().tree().focused();
@@ -4259,6 +4331,71 @@ impl TakoApp {
         }
     }
 
+    /// ch のテーマフォントのグリフ advance が半角セル幅と一致するか（Issue #64）。
+    /// テーマフォントにグリフが無い文字（⏺ ⎿ 等）はフォールバックフォントで描画され
+    /// advance がセル幅とずれる。そのままグループ化するとずれが累積して後続文字を
+    /// 押し出すため、この判定でグループから除外して個別 div（セル幅固定）に隔離する
+    fn glyph_snaps_to_cell(&self, ch: char) -> bool {
+        // ASCII 印字文字はモノスペースフォント自身のグリフで advance == セル幅
+        if ch.is_ascii() {
+            return true;
+        }
+        if let Some(&snaps) = self.glyph_snap_cache.borrow().get(&ch) {
+            return snaps;
+        }
+        // テーマフォントでの advance を実測し、セル幅基準の 'M' と比較する。
+        // フォントにグリフが無ければ advance() が Err を返す（フォールバック解決は
+        // シェイプ時にしか起きない）ので、不一致扱いに倒れる
+        let snaps = (|| {
+            let font = Font {
+                family: SharedString::from(self.theme.font_family.clone()),
+                ..gpui::font(self.theme.font_family.clone())
+            };
+            let font_id = self.text_system.resolve_font(&font);
+            let fs = px(self.theme.font_size);
+            let cw = self.text_system.advance(font_id, fs, 'M').ok()?.width;
+            let adv = self.text_system.advance(font_id, fs, ch).ok()?.width;
+            Some((adv - cw).abs() <= cw * 0.02)
+        })()
+        .unwrap_or(false);
+        self.glyph_snap_cache.borrow_mut().insert(ch, snaps);
+        snaps
+    }
+
+    /// 1 行分の文字ごとの描画情報（スタイルラン・セル幅・セル幅整合）を組み立てる。
+    /// `terminal_screen_lines` の描画とセルフテストの検証で共用する
+    fn line_char_infos(&self, line: &tako_core::screen::ScreenLine) -> Vec<CharInfo> {
+        let chars: Vec<(usize, char)> = line.text.char_indices().collect();
+        let mut infos: Vec<CharInfo> = Vec::with_capacity(chars.len());
+        let mut run_idx = 0;
+        for (ci, &(byte_off, ch)) in chars.iter().enumerate() {
+            while run_idx + 1 < line.runs.len() && byte_off >= line.runs[run_idx].range.end {
+                run_idx += 1;
+            }
+            let (cur_run_idx, bg) = if run_idx < line.runs.len()
+                && byte_off >= line.runs[run_idx].range.start
+                && byte_off < line.runs[run_idx].range.end
+            {
+                (run_idx, line.runs[run_idx].bg)
+            } else {
+                (usize::MAX, None)
+            };
+            let char_cols = if ci + 1 < line.cell_cols.len() {
+                line.cell_cols[ci + 1] - line.cell_cols[ci]
+            } else {
+                1
+            };
+            infos.push(CharInfo {
+                ch,
+                char_cols,
+                run_idx: cur_run_idx,
+                bg,
+                snaps: char_cols == 1 && self.glyph_snaps_to_cell(ch),
+            });
+        }
+        infos
+    }
+
     /// ターミナルの現在画面を行 div のリストへ変換する（通常ペイン描画とバックグラウンドプレビューで共用）。
     /// run ごとの色・太字・下線などの装飾を StyledText のハイライトへ写す。
     /// 全角文字を含む行はランごとにセル幅固定 div で配置し、フォント advance と
@@ -4300,20 +4437,28 @@ impl TakoApp {
                         .iter()
                         .map(|run| (run.range.clone(), self.run_highlight(run)))
                         .collect();
-                    return div().h(px(line_h)).child(
+                    return div().h(px(line_h)).whitespace_nowrap().child(
                         StyledText::new(line.text)
                             .with_default_highlights(&default_style, highlights),
                     );
                 }
                 // 同スタイルの連続半角文字をグループ化して描画要素数を削減。
-                // 全角文字（char_cols > 1）はグリッドスナップのため個別 div を維持。
+                // 全角文字（char_cols > 1）とセル幅不一致グリフ（snaps == false）は
+                // グリッドスナップのため個別 div に分離する。
                 // 旧実装（1 文字 = 1 div）は描画プリミティブ数が cols×rows に
                 // 比例し、GPUI bounds_tree 挿入の O(N log N) が支配的になって
-                // セルフテスト等で実質ハングを引き起こしていた (#39)
+                // セルフテスト等で実質ハングを引き起こしていた (#39)。
+                // whitespace_nowrap は必須: グループのシェイプ幅が div 幅
+                // （セル幅 × セル数）をヘアラインでも超えると GPUI のテキスト
+                // レイアウトが折り返しを起こし、折り返された文字が行 div の
+                // overflow_hidden の外に出て見えなくなる（Issue #64）
                 let cw = cell_width.unwrap();
-                let chars: Vec<(usize, char)> = line.text.char_indices().collect();
-                let row = div().h(px(line_h)).flex().flex_row().overflow_hidden();
-                let mut children: Vec<gpui::AnyElement> = Vec::new();
+                let row = div()
+                    .h(px(line_h))
+                    .flex()
+                    .flex_row()
+                    .overflow_hidden()
+                    .whitespace_nowrap();
                 let fallback_run = tako_core::screen::StyleRun {
                     range: 0..0,
                     fg: theme.foreground,
@@ -4323,103 +4468,29 @@ impl TakoApp {
                     underline: false,
                     strikeout: false,
                 };
-                let mut run_idx = 0;
                 let run_highlights: Vec<HighlightStyle> =
                     line.runs.iter().map(|r| self.run_highlight(r)).collect();
-
-                // 各文字のスタイルとセル幅を事前計算
-                struct CharInfo {
-                    ch: char,
-                    char_cols: usize,
-                    run_idx: usize,
-                    bg: Option<tako_core::theme::Rgb>,
-                }
-                let mut infos: Vec<CharInfo> = Vec::with_capacity(chars.len());
-                for (ci, &(byte_off, ch)) in chars.iter().enumerate() {
-                    while run_idx + 1 < line.runs.len() && byte_off >= line.runs[run_idx].range.end
-                    {
-                        run_idx += 1;
-                    }
-                    let (cur_run_idx, bg) = if run_idx < line.runs.len()
-                        && byte_off >= line.runs[run_idx].range.start
-                        && byte_off < line.runs[run_idx].range.end
-                    {
-                        (run_idx, line.runs[run_idx].bg)
+                let infos = self.line_char_infos(&line);
+                let chunks = chunk_line_chars(&infos);
+                let mut children: Vec<gpui::AnyElement> = Vec::with_capacity(chunks.len());
+                for chunk in chunks {
+                    let hl = if chunk.run_idx < run_highlights.len() {
+                        run_highlights[chunk.run_idx]
                     } else {
-                        (usize::MAX, fallback_run.bg)
+                        self.run_highlight(&fallback_run)
                     };
-                    let char_cols = if ci + 1 < line.cell_cols.len() {
-                        line.cell_cols[ci + 1] - line.cell_cols[ci]
-                    } else {
-                        1
-                    };
-                    infos.push(CharInfo {
-                        ch,
-                        char_cols,
-                        run_idx: cur_run_idx,
-                        bg,
-                    });
-                }
-
-                let mut i = 0;
-                while i < infos.len() {
-                    let info = &infos[i];
-                    if info.char_cols > 1 {
-                        // 全角文字: 個別 div（グリッドスナップ維持）
-                        let hl = if info.run_idx < run_highlights.len() {
-                            run_highlights[info.run_idx]
-                        } else {
-                            self.run_highlight(&fallback_run)
-                        };
-                        let s = info.ch.to_string();
-                        let styled = StyledText::new(SharedString::from(s.clone()))
-                            .with_default_highlights(&default_style, vec![(0..s.len(), hl)]);
-                        let mut d = div()
-                            .w(cw * info.char_cols as f32)
-                            .flex_none()
-                            .overflow_hidden();
-                        if let Some(bg) = info.bg {
-                            d = d.bg(hsla(bg));
-                        }
-                        children.push(d.child(styled).into_any_element());
-                        i += 1;
-                    } else {
-                        // 半角文字: 同スタイルの連続をグループ化
-                        let group_run_idx = info.run_idx;
-                        let group_bg = info.bg;
-                        let mut group_cols = info.char_cols;
-                        let mut group_text = String::new();
-                        group_text.push(info.ch);
-                        i += 1;
-                        while i < infos.len() {
-                            let next = &infos[i];
-                            if next.char_cols > 1
-                                || next.run_idx != group_run_idx
-                                || next.bg != group_bg
-                            {
-                                break;
-                            }
-                            group_text.push(next.ch);
-                            group_cols += next.char_cols;
-                            i += 1;
-                        }
-                        let hl = if group_run_idx < run_highlights.len() {
-                            run_highlights[group_run_idx]
-                        } else {
-                            self.run_highlight(&fallback_run)
-                        };
-                        let text_len = group_text.len();
-                        let styled = StyledText::new(SharedString::from(group_text))
-                            .with_default_highlights(&default_style, vec![(0..text_len, hl)]);
-                        let mut d = div()
-                            .w(cw * group_cols.max(1) as f32)
-                            .flex_none()
-                            .overflow_hidden();
-                        if let Some(bg) = group_bg {
-                            d = d.bg(hsla(bg));
-                        }
-                        children.push(d.child(styled).into_any_element());
+                    let text: String = infos[chunk.start..chunk.end].iter().map(|x| x.ch).collect();
+                    let text_len = text.len();
+                    let styled = StyledText::new(SharedString::from(text))
+                        .with_default_highlights(&default_style, vec![(0..text_len, hl)]);
+                    let mut d = div()
+                        .w(cw * chunk.cols.max(1) as f32)
+                        .flex_none()
+                        .overflow_hidden();
+                    if let Some(bg) = chunk.bg {
+                        d = d.bg(hsla(bg));
                     }
+                    children.push(d.child(styled).into_any_element());
                 }
                 row.children(children)
             })
@@ -9354,6 +9425,118 @@ mod self_test {
             check(img_ok, "画像プレビュー（FR-3.10。PNG / JPEG の OpenFile と list 公開）");
             let _ = std::fs::remove_dir_all(&img_dir);
 
+            // 69b. Issue #64: 全角半角混在行で半角グリフが折り返しで消えないこと。
+            //      根因: グループ div の幅（セル幅 × セル数）を GPUI が wrap_width として
+            //      テキストを折り返し、折り返された文字（「ターミナルUI」の I、
+            //      「Fable 5 + max」の max）が行 div の overflow_hidden の外へ出て消える。
+            //      既知失敗の PDF（70）で exit する前に検証するためここに置く
+            press(any, cx, "ctrl-u");
+            type_text(
+                any,
+                cx,
+                "echo '⏺ Fable 5 + max'; echo 'ターミナルUI'",
+                true,
+            );
+            let mut issue64 = (false, false, false);
+            for _ in 0..8 {
+                wait(cx, 800).await;
+                issue64 = window
+                    .update(cx, |app, win, _| {
+                        // a. 根因の実在証明: グリッド幅ちょうどの wrap_width で ASCII を
+                        //    シェイプすると折り返しが起きる（旧実装はこれが文字消失だった）
+                        let ts = win.text_system().clone();
+                        let family = app.theme.font_family.clone();
+                        let font = Font {
+                            family: SharedString::from(family.clone()),
+                            ..gpui::font(family)
+                        };
+                        let font_id = ts.resolve_font(&font);
+                        let fs = px(app.theme.font_size);
+                        let cw = ts.advance(font_id, fs, 'M').ok()?.width;
+                        let wraps = |text: &str| {
+                            let run = TextRun {
+                                len: text.len(),
+                                font: font.clone(),
+                                color: gpui::black(),
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            let cols = text.chars().count();
+                            ts.shape_text(
+                                SharedString::from(text.to_string()),
+                                fs,
+                                &[run],
+                                Some(cw * cols as f32),
+                                None,
+                            )
+                            .ok()
+                            .and_then(|lines| {
+                                lines.first().map(|l| l.wrap_boundaries().len())
+                            })
+                            .unwrap_or(0)
+                        };
+                        let repro = wraps("Fable 5 + max") >= 1 && wraps("UI") >= 1;
+
+                        // b. 修正の構造検証: 行 div は whitespace_nowrap
+                        //    （wrap_width = None になり折り返し経路が呼ばれない）
+                        let pane = app.focused_pane();
+                        let mut lines = app.terminal_screen_lines(pane, false);
+                        let nowrap = !lines.is_empty()
+                            && lines.iter_mut().all(|d| {
+                                d.style().text.white_space == Some(gpui::WhiteSpace::Nowrap)
+                            });
+
+                        // c. セル幅不一致グリフの隔離: ⏺（テーマフォント外）は単独
+                        //    チャンク、ASCII 連続はグループ維持（#39 の要素数削減）、
+                        //    全角は個別 div のまま
+                        let screen = app.terminals.get(&pane)?.screen(&app.theme);
+                        let line = screen
+                            .lines
+                            .iter()
+                            .find(|l| l.text.starts_with("⏺ Fable 5 + max"))?;
+                        let infos = app.line_char_infos(line);
+                        let chunks = chunk_line_chars(&infos);
+                        let mark = infos.iter().position(|i| i.ch == '⏺')?;
+                        let mark_solo =
+                            chunks.iter().any(|c| c.start == mark && c.end == mark + 1);
+                        let f = infos.iter().position(|i| i.ch == 'F')?;
+                        let x = infos.iter().rposition(|i| i.ch == 'x')?;
+                        let ascii_grouped = chunks.iter().any(|c| c.start <= f && x < c.end);
+                        let line2 = screen
+                            .lines
+                            .iter()
+                            .find(|l| l.text.starts_with("ターミナルUI"))?;
+                        let infos2 = app.line_char_infos(line2);
+                        let chunks2 = chunk_line_chars(&infos2);
+                        let ta = infos2.iter().position(|i| i.ch == 'タ')?;
+                        let ta_solo = chunks2
+                            .iter()
+                            .any(|c| c.start == ta && c.end == ta + 1 && c.cols == 2);
+                        let u = infos2.iter().position(|i| i.ch == 'U')?;
+                        let ui_grouped = chunks2.iter().any(|c| c.start <= u && u + 2 <= c.end);
+                        let snap_judge =
+                            !app.glyph_snaps_to_cell('⏺') && app.glyph_snaps_to_cell('a');
+                        Some((
+                            repro,
+                            nowrap,
+                            mark_solo && ascii_grouped && ta_solo && ui_grouped && snap_judge,
+                        ))
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or((false, false, false));
+                if issue64.0 && issue64.1 && issue64.2 {
+                    break;
+                }
+            }
+            check(
+                issue64.0,
+                "半角消失の根因が実在（グリッド幅シェイプで折り返し発生）",
+            );
+            check(issue64.1, "行 div の whitespace_nowrap（折り返しの構造的禁止）");
+            check(issue64.2, "セル幅不一致グリフの隔離 + ASCII グループ化維持");
+
             // 70. PDF プレビュー（FR-3.4 macOS）: dispatch OpenFile で PDF を開き、
             //     Pdf モードで Core Graphics レンダリングされたページが表示される
             #[cfg(target_os = "macos")]
@@ -9462,6 +9645,89 @@ fn accumulate_scroll(carry: f32, delta_lines: f32) -> (i32, f32) {
     let total = carry + delta_lines;
     let lines = total.trunc() as i32;
     (lines, total - lines as f32)
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::{chunk_line_chars, CharInfo};
+
+    fn ci(ch: char, char_cols: usize, run_idx: usize, snaps: bool) -> CharInfo {
+        CharInfo {
+            ch,
+            char_cols,
+            run_idx,
+            bg: None,
+            snaps,
+        }
+    }
+
+    fn text(infos: &[CharInfo], start: usize, end: usize) -> String {
+        infos[start..end].iter().map(|x| x.ch).collect()
+    }
+
+    #[test]
+    fn 同スタイルの半角は1チャンクにまとまる() {
+        let infos: Vec<CharInfo> = "Fable 5 + max".chars().map(|c| ci(c, 1, 0, true)).collect();
+        let chunks = chunk_line_chars(&infos);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].cols, 13);
+        assert_eq!(
+            text(&infos, chunks[0].start, chunks[0].end),
+            "Fable 5 + max"
+        );
+    }
+
+    #[test]
+    fn 全角は単独チャンクで半角グループと分離される() {
+        // 「ターミナルUI」: 全角 5 + 半角 2
+        let mut infos: Vec<CharInfo> = "ターミナル".chars().map(|c| ci(c, 2, 0, false)).collect();
+        infos.push(ci('U', 1, 0, true));
+        infos.push(ci('I', 1, 0, true));
+        let chunks = chunk_line_chars(&infos);
+        assert_eq!(chunks.len(), 6); // 全角 5 個 + "UI" 1 グループ
+        for c in &chunks[..5] {
+            assert_eq!(c.end - c.start, 1);
+            assert_eq!(c.cols, 2);
+        }
+        assert_eq!(text(&infos, chunks[5].start, chunks[5].end), "UI");
+        assert_eq!(chunks[5].cols, 2);
+    }
+
+    #[test]
+    fn セル幅不一致グリフは単独チャンクに隔離される() {
+        // 「⏺ Fable」: ⏺ はフォールバックフォント（advance ≠ セル幅）想定
+        let mut infos = vec![ci('⏺', 1, 0, false)];
+        infos.extend(" Fable".chars().map(|c| ci(c, 1, 0, true)));
+        let chunks = chunk_line_chars(&infos);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].end - chunks[0].start, 1); // ⏺ 単独
+        assert_eq!(chunks[0].cols, 1);
+        assert_eq!(text(&infos, chunks[1].start, chunks[1].end), " Fable");
+    }
+
+    #[test]
+    fn スタイル境界で分割される() {
+        let mut infos: Vec<CharInfo> = "ab".chars().map(|c| ci(c, 1, 0, true)).collect();
+        infos.extend("cd".chars().map(|c| ci(c, 1, 1, true)));
+        let chunks = chunk_line_chars(&infos);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].run_idx, 0);
+        assert_eq!(chunks[1].run_idx, 1);
+    }
+
+    #[test]
+    fn ゼロ幅文字は直前のグループに含まれる() {
+        // 結合文字（char_cols == 0）はベース文字と同じ StyledText に居ないと合成されない
+        let infos = vec![
+            ci('a', 1, 0, true),
+            ci('\u{0301}', 0, 0, false), // 結合アクセント
+            ci('b', 1, 0, true),
+        ];
+        let chunks = chunk_line_chars(&infos);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].cols, 2);
+        assert_eq!(chunks[0].end, 3);
+    }
 }
 
 #[cfg(test)]
