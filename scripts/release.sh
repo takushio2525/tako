@@ -82,13 +82,13 @@ if [[ ! -d "$PWA_DIST/assets" ]]; then
 fi
 PWA_MARKER_FOUND=0
 for jsfile in "$PWA_DIST"/assets/*.js; do
-  if grep -q "履歴" "$jsfile" 2>/dev/null; then
+  if grep -q "ペイン" "$jsfile" 2>/dev/null; then
     PWA_MARKER_FOUND=1
     break
   fi
 done
 if [[ $PWA_MARKER_FOUND -eq 0 ]]; then
-  echo "エラー: PWA dist の JS に「履歴」マーカーが見つからない" >&2
+  echo "エラー: PWA dist の JS に「ペイン」マーカーが見つからない" >&2
   echo "  dist が stale です。npm run build を実行してから再試行してください" >&2
   exit 1
 fi
