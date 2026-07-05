@@ -54,24 +54,17 @@ export function createClient(host, token) {
     close(id) {
       return request('POST', `/api/panes/${encodeURIComponent(id)}/close`);
     },
-    resize(id, cols, rows) {
-      return request('POST', `/api/panes/${encodeURIComponent(id)}/resize`, { cols, rows });
-    },
-    resizeReset(id) {
-      return request('POST', `/api/panes/${encodeURIComponent(id)}/resize`, { reset: true });
-    },
     agents() {
       return request('GET', '/api/agents');
     },
     messages(sessionId, tail = 30) {
       return request('GET', `/api/sessions/${encodeURIComponent(sessionId)}/messages?tail=${tail}`);
     },
-    wsUrl(paneId, cols, rows) {
+    // リサイズ要求は存在しない: リモート表示は PC 側のペインサイズに一切影響しない（#63）
+    wsUrl(paneId) {
       const proto = base.startsWith('https') ? 'wss' : 'ws';
       const hostPart = base.replace(/^https?:\/\//, '');
-      let url = `${proto}://${hostPart}/ws?pane=${encodeURIComponent(paneId)}`;
-      if (cols && rows) url += `&cols=${cols}&rows=${rows}`;
-      return url;
+      return `${proto}://${hostPart}/ws?pane=${encodeURIComponent(paneId)}`;
     },
     wsProtocols() {
       return ['tako-remote', `token.${token}`];
