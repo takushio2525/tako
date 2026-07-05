@@ -10,18 +10,19 @@
 //! - `GET  /api/panes/:id/screen` — 画面内容（tmux capture-pane。`?ansi=1` で色付き、
 //!   `?lines=N` で履歴 N 行込み。cursor / size も返す）
 //! - `GET  /api/panes/:id/scrollback` — スクロールバック履歴（プレーンテキスト。
-//!   `?lines=N` で履歴 N 行。履歴レイヤー用 — クライアント側でモバイル幅折り返し・
-//!   スクロール・テキスト選択を行う）
+//!   `?lines=N` で履歴 N 行。CLI `tako remote scrollback` / MCP 用）
 //! - `POST /api/panes/:id/input` — テキスト送信（tmux send-keys。`{text, newline}` か
 //!   `{keys: "..."}` で生キーシーケンス送信）
 //! - `POST /api/panes/:id/close` — ペインを閉じる（tmux kill-pane）
-//! - `POST /api/panes/:id/resize` — ビューポート連動リサイズ（`{cols, rows}` で
-//!   tmux resize-window、`{reset: true}` で manual 解除）
+//! - `POST /api/panes/:id/resize` — 明示リサイズ（`{cols, rows}` で tmux resize-window、
+//!   `{reset: true}` で manual 解除。CLI `tako tmux resize` / MCP 用。
+//!   PWA のリモート表示はこれを呼ばない — Issue #63「PC 非破壊」）
 //! - `GET  /api/agents` — claude agents --json プロキシ + tmux ペイン対応付け
 //! - `GET  /api/sessions/:id/messages?tail=N` — Claude Code transcript の正規化読み取り
-//! - `GET  /ws?pane=<id>[&cols=N&rows=N]` — WebSocket 画面プッシュ（250ms 差分検知。
-//!   `cols`/`rows` を指定すると接続時にペインを自動リサイズし、切断時にリセットする。
-//!   操作系は REST を使う）
+//! - `GET  /ws?pane=<id>` — WebSocket 画面プッシュ（読み取り専用・ペインサイズ不干渉。
+//!   接続時に init（履歴 + 現画面 + カーソル、ANSI 付き）、以後 250ms 差分検知で
+//!   update（履歴へ押し出された行 + 現画面）をプッシュ。描画・スクロール・折り返しは
+//!   クライアント側の責務（Issue #63）。操作系は REST を使う）
 //!
 //! 認証: `Authorization: Bearer <token>` ヘッダ必須（/api/health 以外）。
 //! WS は Sec-WebSocket-Protocol の `token.<T>` で検証（ブラウザ WS API はヘッダ不可のため）。
@@ -47,14 +48,21 @@ const MAX_BODY_BYTES: u64 = 1024 * 1024;
 const DEFAULT_RELAY_URL: &str = "https://tako-remote-relay.takushio2525.workers.dev";
 // --- PID / トークン / ポートファイルのパス ---
 
+/// state ファイルの置き場所。`TAKO_REMOTE_STATE_DIR` で差し替え可能
+/// （検証用デーモンを本番デーモンと衝突させず並走させるため）
+fn state_dir() -> std::path::PathBuf {
+    std::env::var("TAKO_REMOTE_STATE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+}
 pub fn pid_path() -> std::path::PathBuf {
-    std::path::PathBuf::from("/tmp/tako-remote.pid")
+    state_dir().join("tako-remote.pid")
 }
 pub fn token_path() -> std::path::PathBuf {
-    std::path::PathBuf::from("/tmp/tako-remote.token")
+    state_dir().join("tako-remote.token")
 }
 pub fn port_path() -> std::path::PathBuf {
-    std::path::PathBuf::from("/tmp/tako-remote.port")
+    state_dir().join("tako-remote.port")
 }
 
 fn cleanup_state_files() {
@@ -961,8 +969,20 @@ fn check_auth(request: &tiny_http::Request, token: &str) -> bool {
 
 // --- WebSocket（画面プッシュ専用チャンネル） ---
 //
-// `GET /ws?pane=<id>` を WebSocket にアップグレードし、250ms 間隔の差分検知で
-// 画面内容（ANSI 付き + cursor + size）をサーバー側からプッシュする。
+// `GET /ws?pane=<id>` を WebSocket にアップグレードし、ペインの「中身」を
+// サーバー側からプッシュする（Issue #63 の再設計）:
+//
+// - 接続時: `{"type":"init", history, screen, cursor, size}` —
+//   スクロールバック履歴（最大 WS_INIT_HISTORY 行）+ 現画面 + カーソル位置（ANSI 付き）
+// - 以後 250ms 間隔の差分検知: `{"type":"update", pushed, screen, cursor}` —
+//   `pushed` = 前回以降に履歴へ押し出された行（`#{history_size}` の増分で検出）、
+//   `screen` = 現画面。クライアントは pushed を履歴ビューへ追記し、screen を置き換える
+//   ことで、履歴とライブ画面を 1 本の連続スクロールとして再構成できる
+// - 履歴の減少（clear-history）・ペインサイズ変化・押し出し量が大きすぎる場合は
+//   init を再送してクライアント側を作り直す
+//
+// このチャンネルは読み取り専用で、**ペインのサイズ・表示状態には一切影響を与えない**
+// （PC 非破壊の絶対原則。旧実装の cols/rows 自動リサイズは廃止）。
 // 操作系（input / close / resize）は既存 REST を使う設計（プッシュ専用の一方向）。
 // tiny_http の upgrade が返すソケットは read タイムアウトを設定できないため、
 // 接続後にクライアントからの受信を待つ設計にはできない（受信待ちでスレッドが
@@ -977,6 +997,12 @@ const WS_PROTOCOL: &str = "tako-remote";
 const WS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 /// 無変化時のキープアライブ送信間隔（プロキシの idle 切断対策）
 const WS_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(15);
+/// init で送るスクロールバック履歴の最大行数。update の押し出し行がこれを超えた場合も
+/// init を再送する（250ms にこれ以上流れる出力は差分として追う価値が薄い）
+const WS_INIT_HISTORY: u64 = 2000;
+/// update で押し出し行を取り直すときの余裕行数。1 回目の観測と取り直しの間に
+/// さらに出力が進んでも取りこぼさないためのマージン
+const WS_PUSH_MARGIN: u64 = 50;
 
 /// リクエストが WebSocket アップグレードかどうか
 fn is_ws_upgrade(request: &tiny_http::Request) -> bool {
@@ -1038,60 +1064,143 @@ fn handle_ws(
         );
     let stream = request.upgrade("websocket", response);
 
-    let ws_cols = query_param(&url_full, "cols").and_then(|v| v.parse::<u32>().ok());
-    let ws_rows = query_param(&url_full, "rows").and_then(|v| v.parse::<u32>().ok());
-
     let tmux_socket = tmux_socket.to_string();
     let _ = std::thread::Builder::new()
         .name("tako-remote-ws".into())
-        .spawn(move || ws_push_loop(stream, &pane, &tmux_socket, shutdown, ws_cols, ws_rows));
+        .spawn(move || ws_push_loop(stream, &pane, &tmux_socket, shutdown));
 }
 
-/// 画面プッシュループ。250ms 間隔で capture-pane（ANSI 付き）+ cursor/size を取得し、
-/// 内容が変わったときだけ `{"type":"screen",...}` を送る。無変化でも WS_KEEPALIVE ごとに
-/// `{"type":"keepalive"}` を送って接続を維持する。送信失敗（クライアント切断）で終了。
-/// `cols`/`rows` が指定されていれば接続時にペインをリサイズし、切断時にリセットする
+/// ペインの一貫スナップショット。`display-message` と `capture-pane` を 1 回の
+/// tmux コマンドシーケンス（`;` 連結）で実行した結果で、`history_size` と行内容の
+/// 間に別コマンドが挟まらない（250ms ポーリング間の race を最小化する）
+struct PaneSnapshot {
+    /// スクロールバックに積まれている総行数（`#{history_size}`）
+    history_size: u64,
+    cursor_x: u32,
+    cursor_y: u32,
+    cols: u32,
+    rows: u32,
+    /// capture-pane の出力行。先頭 `history_lines` 行が履歴、残りが現画面
+    /// （tmux は画面下端の連続空行をトリムして返すことがあるため、
+    /// 画面部分の行数は rows 以下になりうる）
+    lines: Vec<String>,
+    /// lines のうち履歴部分の行数（= min(history_size, 要求した履歴行数)）
+    history_lines: usize,
+}
+
+impl PaneSnapshot {
+    fn history(&self) -> &[String] {
+        &self.lines[..self.history_lines]
+    }
+    fn screen(&self) -> &[String] {
+        &self.lines[self.history_lines..]
+    }
+    /// 画面内容 + カーソルのハッシュ（update の差分検知用）
+    fn screen_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.screen().hash(&mut h);
+        (self.cursor_x, self.cursor_y).hash(&mut h);
+        h.finish()
+    }
+}
+
+/// display-message + capture-pane を 1 回の tmux 呼び出しで実行し、
+/// 一貫したスナップショットを取得する。`history_back` > 0 なら履歴を
+/// 最大その行数さかのぼって含める（0 なら現画面のみ）
+fn ws_snapshot(tmux_socket: &str, target: &str, history_back: u64) -> Result<PaneSnapshot, String> {
+    let start = format!("-{history_back}");
+    let mut args = vec![
+        "display-message",
+        "-p",
+        "-t",
+        target,
+        "#{history_size} #{cursor_x} #{cursor_y} #{pane_width} #{pane_height}",
+        ";",
+        "capture-pane",
+        "-e",
+        "-p",
+        "-t",
+        target,
+    ];
+    if history_back > 0 {
+        args.push("-S");
+        args.push(&start);
+    }
+    let output = tmux_output_with_timeout(tmux_socket, &args)?;
+    if !output.status.success() {
+        return Err(format!(
+            "tmux display-message;capture-pane がエラー: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    parse_snapshot(&String::from_utf8_lossy(&output.stdout), history_back)
+}
+
+/// ws_snapshot の出力パース。1 行目がメタ
+/// （`history_size cursor_x cursor_y pane_width pane_height`）、2 行目以降が
+/// capture-pane の行。先頭 min(history_size, history_back) 行が履歴部分
+fn parse_snapshot(raw: &str, history_back: u64) -> Result<PaneSnapshot, String> {
+    let mut it = raw.lines();
+    let meta = it.next().ok_or("スナップショット出力が空")?;
+    let mut m = meta.split_whitespace();
+    let mut next_num = |name: &str| -> Result<u64, String> {
+        m.next()
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or_else(|| format!("スナップショットのメタ行に {name} が無い: {meta}"))
+    };
+    let history_size = next_num("history_size")?;
+    let cursor_x = next_num("cursor_x")? as u32;
+    let cursor_y = next_num("cursor_y")? as u32;
+    let cols = next_num("pane_width")? as u32;
+    let rows = next_num("pane_height")? as u32;
+    let lines: Vec<String> = it.map(|l| l.to_string()).collect();
+    let history_lines = (history_size.min(history_back) as usize).min(lines.len());
+    Ok(PaneSnapshot {
+        history_size,
+        cursor_x,
+        cursor_y,
+        cols,
+        rows,
+        lines,
+        history_lines,
+    })
+}
+
+/// 前回送信時の状態（update の差分基準）
+struct WsPrevState {
+    history_size: u64,
+    size: (u32, u32),
+    screen_hash: u64,
+}
+
+/// 画面プッシュループ。接続時に init（履歴 + 現画面）を送り、以後 250ms 間隔で
+/// 差分（履歴へ押し出された行 + 現画面）を update として送る。読み取り専用で
+/// ペインサイズには一切影響しない（Issue #63「PC 非破壊」）。無変化でも
+/// WS_KEEPALIVE ごとに keepalive を送って接続を維持する。
+/// 送信失敗（クライアント切断）・ペイン消失で終了
 fn ws_push_loop(
     stream: Box<dyn tiny_http::ReadWrite + Send>,
     pane: &str,
     tmux_socket: &str,
     shutdown: Arc<AtomicBool>,
-    resize_cols: Option<u32>,
-    resize_rows: Option<u32>,
 ) {
-    use std::hash::{Hash, Hasher};
     use tungstenite::protocol::{Role, WebSocket};
 
     let mut ws = WebSocket::from_raw_socket(stream, Role::Server, None);
     let target = format!("={pane}");
-    let window_target = format!("={}", window_target_of(pane));
-    let mut prev_hash: u64 = 0;
+    let mut prev: Option<WsPrevState> = None;
     let mut last_sent = std::time::Instant::now();
-
-    let did_resize = if let (Some(cols), Some(rows)) = (resize_cols, resize_rows) {
-        if cols > 0 && rows > 0 {
-            tmux_resize_window(tmux_socket, &window_target, cols, rows).is_ok()
-        } else {
-            false
-        }
-    } else {
-        false
-    };
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
             let _ = ws.close(None);
             break;
         }
-        let payload = match tmux_capture_pane(tmux_socket, &target, true, None) {
-            Ok(lines) => {
-                let mut body = json!({ "type": "screen", "lines": lines });
-                if let Some((x, y, w, h)) = tmux_pane_geometry(tmux_socket, &target) {
-                    body["cursor"] = json!({ "x": x, "y": y });
-                    body["size"] = json!({ "cols": w, "rows": h });
-                }
-                body.to_string()
-            }
+
+        // 現画面のみの軽量スナップショットで差分の有無を判定する
+        let snap = match ws_snapshot(tmux_socket, &target, 0) {
+            Ok(s) => s,
             Err(e) => {
                 let _ = ws.send(tungstenite::Message::text(
                     json!({ "type": "error", "message": e }).to_string(),
@@ -1100,16 +1209,105 @@ fn ws_push_loop(
                 break;
             }
         };
-        let hash = {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            payload.hash(&mut h);
-            h.finish()
+
+        // init が必要: 初回 / 履歴の減少（clear-history）/ PC 側でのサイズ変更 /
+        // 押し出し量が大きすぎて差分で追う価値がない
+        let need_init = match &prev {
+            None => true,
+            Some(p) => {
+                snap.history_size < p.history_size
+                    || (snap.cols, snap.rows) != p.size
+                    || snap.history_size - p.history_size > WS_INIT_HISTORY
+            }
         };
-        if hash != prev_hash {
+
+        let msg = if need_init {
+            match ws_snapshot(tmux_socket, &target, WS_INIT_HISTORY) {
+                Ok(full) => {
+                    let payload = json!({
+                        "type": "init",
+                        "history": full.history(),
+                        "screen": full.screen(),
+                        "cursor": { "x": full.cursor_x, "y": full.cursor_y },
+                        "size": { "cols": full.cols, "rows": full.rows },
+                    })
+                    .to_string();
+                    prev = Some(WsPrevState {
+                        history_size: full.history_size,
+                        size: (full.cols, full.rows),
+                        screen_hash: full.screen_hash(),
+                    });
+                    Some(payload)
+                }
+                Err(e) => {
+                    let _ = ws.send(tungstenite::Message::text(
+                        json!({ "type": "error", "message": e }).to_string(),
+                    ));
+                    let _ = ws.close(None);
+                    break;
+                }
+            }
+        } else {
+            let p = prev.as_mut().expect("need_init=false なら prev はある");
+            let delta = snap.history_size - p.history_size;
+            if delta > 0 {
+                // 押し出された行を含めて取り直す（マージン付き）。取り直しまでの間に
+                // さらに履歴が進んでいても、マージン内なら取りこぼさない
+                match ws_snapshot(tmux_socket, &target, delta + WS_PUSH_MARGIN) {
+                    Ok(full) => {
+                        let need = full.history_size.saturating_sub(p.history_size) as usize;
+                        if full.history_size < p.history_size
+                            || need > full.history_lines
+                            || need as u64 > WS_INIT_HISTORY
+                        {
+                            // 取り直しの間に clear された / マージンを超えて進んだ。
+                            // 次周期で init を再送する
+                            prev = None;
+                            None
+                        } else {
+                            let payload = json!({
+                                "type": "update",
+                                "pushed": full.lines[full.history_lines - need..full.history_lines],
+                                "screen": full.screen(),
+                                "cursor": { "x": full.cursor_x, "y": full.cursor_y },
+                            })
+                            .to_string();
+                            p.history_size = full.history_size;
+                            p.screen_hash = full.screen_hash();
+                            Some(payload)
+                        }
+                    }
+                    Err(e) => {
+                        let _ = ws.send(tungstenite::Message::text(
+                            json!({ "type": "error", "message": e }).to_string(),
+                        ));
+                        let _ = ws.close(None);
+                        break;
+                    }
+                }
+            } else {
+                let hash = snap.screen_hash();
+                if hash != p.screen_hash {
+                    p.screen_hash = hash;
+                    Some(
+                        json!({
+                            "type": "update",
+                            "pushed": [],
+                            "screen": snap.screen(),
+                            "cursor": { "x": snap.cursor_x, "y": snap.cursor_y },
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    None
+                }
+            }
+        };
+
+        if let Some(payload) = msg {
             if ws.send(tungstenite::Message::text(payload)).is_err() {
                 break;
             }
-            prev_hash = hash;
             last_sent = std::time::Instant::now();
         } else if last_sent.elapsed() >= WS_KEEPALIVE {
             let keepalive = json!({ "type": "keepalive" }).to_string();
@@ -1119,10 +1317,6 @@ fn ws_push_loop(
             last_sent = std::time::Instant::now();
         }
         std::thread::sleep(WS_POLL_INTERVAL);
-    }
-
-    if did_resize {
-        let _ = tmux_reset_window_size(tmux_socket, &window_target);
     }
 }
 
@@ -1573,6 +1767,66 @@ mod tests {
             capture_pane_args("=s:0.0", true, Some(200)),
             vec!["capture-pane", "-t", "=s:0.0", "-p", "-e", "-S", "-200"]
         );
+    }
+
+    #[test]
+    fn parse_snapshotはメタと履歴と画面を分離する() {
+        let raw = "5 3 1 93 50\nhist1\nhist2\nline1\nline2\n";
+        let snap = parse_snapshot(raw, 2).unwrap();
+        assert_eq!(snap.history_size, 5);
+        assert_eq!((snap.cursor_x, snap.cursor_y), (3, 1));
+        assert_eq!((snap.cols, snap.rows), (93, 50));
+        assert_eq!(snap.history(), ["hist1".to_string(), "hist2".to_string()]);
+        assert_eq!(snap.screen(), ["line1".to_string(), "line2".to_string()]);
+    }
+
+    #[test]
+    fn parse_snapshotは履歴なしで全行を画面とする() {
+        let raw = "0 0 0 80 24\nprompt $ \n";
+        let snap = parse_snapshot(raw, 0).unwrap();
+        assert_eq!(snap.history_lines, 0);
+        assert_eq!(snap.screen(), ["prompt $ ".to_string()]);
+    }
+
+    #[test]
+    fn parse_snapshotは履歴が要求より少なければあるだけ切り出す() {
+        let raw = "1 0 0 80 24\nold\nscreen\n";
+        let snap = parse_snapshot(raw, 2000).unwrap();
+        assert_eq!(snap.history(), ["old".to_string()]);
+        assert_eq!(snap.screen(), ["screen".to_string()]);
+    }
+
+    #[test]
+    fn parse_snapshotは画面全トリムでも壊れない() {
+        // capture-pane が画面下端の空行を全部トリムし、画面部分が 0 行になるケース
+        let raw = "2 0 0 80 24\nh1\nh2\n";
+        let snap = parse_snapshot(raw, 10).unwrap();
+        assert_eq!(snap.history_lines, 2);
+        assert!(snap.screen().is_empty());
+    }
+
+    #[test]
+    fn parse_snapshotは画面中の空行を保持する() {
+        let raw = "0 0 4 80 24\nline1\n\n\nline4\n";
+        let snap = parse_snapshot(raw, 0).unwrap();
+        assert_eq!(snap.screen().len(), 4);
+        assert_eq!(snap.screen()[1], "");
+    }
+
+    #[test]
+    fn parse_snapshotは不正メタをエラーにする() {
+        assert!(parse_snapshot("", 0).is_err());
+        assert!(parse_snapshot("abc def ghi jkl mno\nx\n", 0).is_err());
+        assert!(parse_snapshot("1 2 3\nx\n", 0).is_err());
+    }
+
+    #[test]
+    fn screen_hashはカーソル位置を含み履歴サイズを含まない() {
+        let a = parse_snapshot("0 0 0 80 24\nx\n", 0).unwrap();
+        let b = parse_snapshot("0 1 0 80 24\nx\n", 0).unwrap();
+        assert_ne!(a.screen_hash(), b.screen_hash());
+        let c = parse_snapshot("5 0 0 80 24\nx\n", 0).unwrap();
+        assert_eq!(a.screen_hash(), c.screen_hash());
     }
 
     #[test]
