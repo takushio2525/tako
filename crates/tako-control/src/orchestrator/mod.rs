@@ -645,6 +645,11 @@ fn migrate_legacy_model_file(path: &Path) -> Option<String> {
     if !path.is_file() {
         return None;
     }
+    // backup が既に存在 = 一度マイグレ済み。ユーザーが profiles set で再設定した可能性があるためスキップ
+    let backup = path.with_extension("yaml.backup-1m");
+    if backup.exists() {
+        return None;
+    }
     let content = std::fs::read_to_string(path).ok()?;
     let profile: Profile = serde_yaml::from_str(&content).ok()?;
     if profile.model.as_deref() != Some(LEGACY_DEFAULT_MODEL) {
@@ -681,10 +686,7 @@ fn migrate_legacy_model_file(path: &Path) -> Option<String> {
         serde_yaml::to_string(&p).ok()
     })?;
 
-    let backup = path.with_extension("yaml.backup-1m");
-    if !backup.exists() {
-        let _ = std::fs::copy(path, &backup);
-    }
+    let _ = std::fs::copy(path, &backup);
     std::fs::write(path, &migrated).ok()?;
     Some(format!(
         "profiles/default.yaml の model: {LEGACY_DEFAULT_MODEL}（旧既定値。Pro プランでは起動不能）を\n  削除しました。今後は claude CLI の既定モデルで起動します。\n  1M コンテキスト版を使う場合（Max / API プラン）は model を明示的に再設定してください。\n  バックアップ: {}",
@@ -1214,6 +1216,36 @@ prompt_blocks:
         // model 無しのファイルも no-op
         std::fs::write(&path, "effort: max\n").unwrap();
         assert!(migrate_legacy_model_file(&path).is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn migrate_skips_when_backup_exists_after_user_re_set() {
+        // Issue #67: profiles set で [1m] を再設定 → master 起動相当 → model が保持される
+        let tmp = std::env::temp_dir().join("tako-test-migrate-issue67");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("default.yaml");
+
+        // 1. 初回マイグレーション（旧既定値がある状態）
+        std::fs::write(&path, "model: claude-opus-4-6[1m]\neffort: high\n").unwrap();
+        assert!(migrate_legacy_model_file(&path).is_some());
+        let backup = path.with_extension("yaml.backup-1m");
+        assert!(backup.is_file(), "backup が作成される");
+
+        // 2. ユーザーが profiles set で [1m] を意図的に再設定
+        std::fs::write(&path, "model: claude-opus-4-6[1m]\neffort: high\n").unwrap();
+
+        // 3. 次の master 起動（migrate が再度呼ばれる）→ スキップされる
+        assert!(
+            migrate_legacy_model_file(&path).is_none(),
+            "backup 存在時はマイグレーションをスキップ"
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("model: claude-opus-4-6[1m]"),
+            "ユーザーが再設定した model は保持される"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
