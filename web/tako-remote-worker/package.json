@@ -1,11 +1,13 @@
 {
   "name": "tako-remote-relay",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "license": "GPL-3.0-or-later",
+  "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test": "node --test test/*.test.mjs"
   },
   "devDependencies": {
     "wrangler": "^3.0.0"

@@ -4,8 +4,16 @@
 // スマホ PWA が 2 回目以降も最新 URL を解決できるようにする。
 //
 // エンドポイント:
-//   POST /api/register  — { machineId, tunnelUrl } を KV に保存（TTL 24h）
+//   POST /api/register  — { machineId, tunnelUrl, secret? } を KV に保存（TTL 24h）
 //   GET  /api/resolve/:machineId — 最新の tunnelUrl を返す
+//
+// 登録の保護（first-write-wins。#78）:
+//   secret 付きで登録された machineId は、以後同じ secret（の SHA-256 一致）でしか
+//   上書きできない。secret ハッシュは `secret:<machineId>` キーに TTL 30 日で保存し、
+//   登録のたびに延長する。secret なしのレガシー登録は「secret 未登録の ID」に限り許可
+//   （旧クライアント互換。新クライアントが一度 secret 登録すれば以後は保護される）。
+//   resolve は従来どおり無認証: machineId 自体が能力トークンで、tunnel 先の tako は
+//   別途トークン認証を持つ。
 //
 // KV バインディング: RELAY_KV（wrangler.toml で設定）
 
@@ -16,12 +24,18 @@ const CORS_HEADERS = {
 };
 
 const TTL_SECONDS = 24 * 60 * 60; // 24 時間
+const SECRET_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 日（register ごとに延長）
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
   });
+}
+
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 export default {
@@ -37,7 +51,7 @@ export default {
     if (request.method === 'POST' && path === '/api/register') {
       try {
         const body = await request.json();
-        const { machineId, tunnelUrl } = body;
+        const { machineId, tunnelUrl, secret } = body;
 
         if (!machineId || !tunnelUrl) {
           return json({ error: 'machineId と tunnelUrl は必須' }, 400);
@@ -53,6 +67,27 @@ export default {
           return json({ error: '無効な tunnelUrl 形式' }, 400);
         }
 
+        // secret の形式チェック（指定時は hex 64 文字のみ許可）
+        if (secret !== undefined && !/^[0-9a-f]{64}$/i.test(String(secret))) {
+          return json({ error: '無効な secret 形式' }, 400);
+        }
+
+        // first-write-wins の登録保護（#78）
+        const secretKey = `secret:${machineId}`;
+        const storedHash = await env.RELAY_KV.get(secretKey);
+        const providedHash = secret ? await sha256Hex(String(secret).toLowerCase()) : null;
+        if (storedHash) {
+          if (providedHash !== storedHash) {
+            return json({ error: 'この machineId は登録済みで、secret が一致しない' }, 403);
+          }
+          // 一致 → TTL を延長
+          await env.RELAY_KV.put(secretKey, storedHash, { expirationTtl: SECRET_TTL_SECONDS });
+        } else if (providedHash) {
+          // 初回 secret 登録（以後この machineId は secret 必須になる）
+          await env.RELAY_KV.put(secretKey, providedHash, { expirationTtl: SECRET_TTL_SECONDS });
+        }
+        // storedHash も providedHash も無い → レガシー登録（保護なし）として許可
+
         const entry = {
           tunnelUrl,
           updatedAt: new Date().toISOString(),
@@ -64,7 +99,7 @@ export default {
           { expirationTtl: TTL_SECONDS }
         );
 
-        return json({ ok: true, machineId });
+        return json({ ok: true, machineId, protected: Boolean(storedHash || providedHash) });
       } catch (e) {
         return json({ error: 'リクエストの処理に失敗' }, 400);
       }

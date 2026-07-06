@@ -5,6 +5,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- Relay registration is now protected by a per-machine secret (#78): `tako remote start` auto-generates `<data_dir>/relay_secret` (hex 64, mode 0600) and sends it to `/api/register`; the relay worker stores only its SHA-256 hash and rejects overwrites with a mismatched secret (first-write-wins — legacy secret-less registration is still accepted for unclaimed machine IDs, so old clients keep working). The default relay is now documented as a best-effort public instance that stores only machineId → tunnel URL (no terminal content, no tokens) and can be replaced via `TAKO_RELAY_URL`; self-hosting steps live in `web/tako-remote-worker/README.md`, and the worker gained an offline test suite (`npm test`)
+  リレー登録を端末ごとのシークレットで保護（#78）: `tako remote start` が `<data_dir>/relay_secret`（hex 64・0600）を自動生成して `/api/register` に送り、リレー worker は SHA-256 ハッシュのみ保存して secret 不一致の上書きを 403 で拒否（first-write-wins。secret 無しの旧クライアントは未保護 ID に限り従来どおり登録可能で互換維持）。デフォルトリレーは「machineId → tunnel URL のみを保存するベストエフォート公共インスタンス（画面内容・トークンは通らない）」として文書化し、`TAKO_RELAY_URL` で自前リレーへ差し替え可能に。セルフホスト手順は `web/tako-remote-worker/README.md`、worker にオフラインテスト（`npm test`）を追加
+
 ### Changed
 
 - License declarations unified to GPL-3.0-or-later across all manifests (#75): added the `license` field to the three `poc/` crates and the three `docs/` / `web/` package.json files. The license itself is unchanged — the repository has declared GPL-3.0-or-later throughout (LICENSE / Cargo.toml / README); this completes manifest-level consistency for the public release

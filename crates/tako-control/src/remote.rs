@@ -513,16 +513,51 @@ fn machine_id_path() -> Option<std::path::PathBuf> {
     tako_core::paths::data_dir().map(|d| d.join("machine_id"))
 }
 
+// --- リレー登録シークレット ---
+
+/// リレー登録シークレットを読み込むか、初回は CSPRNG で生成して保存する（hex 64 文字）。
+/// リレー worker 側で machineId エントリを first-write-wins で保護するためのもの
+/// （worker には SHA-256 ハッシュのみ保存される）。token と同様、ログに出さないこと
+fn relay_secret() -> Option<String> {
+    let path = tako_core::paths::data_dir().map(|d| d.join("relay_secret"))?;
+    relay_secret_at(&path)
+}
+
+fn relay_secret_at(path: &std::path::Path) -> Option<String> {
+    if let Ok(content) = std::fs::read_to_string(path) {
+        let secret = content.trim().to_string();
+        if secret.len() >= 32 {
+            return Some(secret);
+        }
+    }
+    let secret = crate::generate_token().ok()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).ok()?;
+    }
+    std::fs::write(path, &secret).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Some(secret)
+}
+
 // --- KV リレー登録 ---
 
 fn register_relay(machine_id: &str, tunnel_url: &str) -> Result<(), String> {
     let relay_url =
         std::env::var("TAKO_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY_URL.to_string());
     let url = format!("{relay_url}/api/register");
-    let body = json!({
+    let mut body = json!({
         "machineId": machine_id,
         "tunnelUrl": tunnel_url,
     });
+    // secret が用意できない環境（data_dir なし）では従来どおり無 secret で登録する
+    // （worker 側もレガシー登録として受理する。保護は効かないが機能は壊れない）
+    if let Some(secret) = relay_secret() {
+        body["secret"] = json!(secret);
+    }
 
     let status = Command::new("curl")
         .args([
@@ -2011,6 +2046,29 @@ mod tests {
         let result = register_relay("test-machine", "https://example.trycloudflare.com");
         std::env::remove_var("TAKO_RELAY_URL");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn relay_secretは初回生成後に安定して返る() {
+        let tmp = std::env::temp_dir().join(format!("tako-test-rsec-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+
+        let s1 = relay_secret_at(&tmp).expect("初回生成");
+        assert_eq!(s1.len(), 64, "hex 64 文字");
+        assert!(s1.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let s2 = relay_secret_at(&tmp).expect("再読み込み");
+        assert_eq!(s1, s2, "永続化された同じ値が返る");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn relay_secretは短すぎる既存値を再生成する() {
+        let tmp = std::env::temp_dir().join(format!("tako-test-rsec2-{}", std::process::id()));
+        std::fs::write(&tmp, "short").unwrap();
+        let s = relay_secret_at(&tmp).expect("再生成");
+        assert_eq!(s.len(), 64);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
