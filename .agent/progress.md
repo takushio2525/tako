@@ -369,3 +369,9 @@
   根因 = cloudflared 不在時の LAN-only フォールバック警告が spawn_daemon の未読 stderr に消え、
   無警告で `http://10.x.x.x:7749` の URL/QR を提示（AP isolation 下で到達不能）。#89 起票 + #78 相互リンク
 - 次: 修正はリレー worker 並行作業の完了と #78 認証方針の決定後（修正方針 5 点は #89 に記載）
+
+## 2026-07-06（#88: tako setup に依存ツールチェック段階を追加）
+- 実地報告（tmux 無しで `tako remote start` 失敗）を受け、setup 冒頭で claude（必須）/
+  tmux・cloudflared・git（任意）を検出し、用途説明 + brew 案内 + その場インストール（y/N）を追加。
+  cloudflared は #89 を受けて対象化。`--check` にも同一覧を表示。docs の依存表も同期
+- 関連: PR #92 squash merge → `build-app.sh --install` で実機反映（3 経路の実バイナリ検証済み）

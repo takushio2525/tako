@@ -17,6 +17,8 @@
 - リモート接続バグ調査（#89 起票済み・修正未着手）: `tako remote start` が cloudflared 未導入時に
   無警告で LAN 限定 URL（プライベート IP 直）を出す。spawn_daemon が成功パスで stderr を読まず
   フォールバック警告が消える（remote.rs:167/331）。**修正はリレー worker 並行作業 + #78 認証方針の決定後**
+- #88 対応済み（PR #92）: `tako setup` に依存ツールチェック段階（claude 必須 / tmux・cloudflared・git 任意、
+  brew でその場インストール可）を追加。#89 のセットアップ側の入口はこれでカバー
 
 ## v0.2.8 の内容
 
