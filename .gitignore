@@ -26,6 +26,10 @@
 # Cloudflare Workers
 web/tako-remote-worker/.dev.vars
 web/tako-remote-worker/node_modules/
+.wrangler/
+
+# 検証アーティファクト（ユーザー名等の環境情報を含みうるため commit しない。#76 / #77）
+.playwright-mcp/
 
 # PWA
 web/tako-remote/node_modules/
