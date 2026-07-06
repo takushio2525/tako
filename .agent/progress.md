@@ -325,3 +325,10 @@
   セクション新設（#60 入れ忘れ回収）。homebrew-tako cask 0.2.8 更新済み
 - 関連コミット: `4abad45` `61fca52`、tag `v0.2.8`
 - 次: スマホ実機テスト（#63 リーダービュー）+ PC で #64 半角消失の目視確認
+
+## 2026-07-06（docs サイト内容刷新 → PR #73）
+- セットアップページを tako setup 対応で全面刷新、CLI リファレンスを全コマンド詳細版に
+  （shelve→background 等の実装乖離を多数修正）、MCP ツール一覧を実 51 ツールへ更新。
+  リリースノート `/releases/` とオーケストレーション紹介 `/features/orchestration/` を新設
+- 関連: ブランチ `docs/refresh-setup-releases`（3 コミット）→ PR #73（公開サイトのため main 直 push 回避）
+- 次: PR #73 のレビュー・マージ（ユーザー判断）
