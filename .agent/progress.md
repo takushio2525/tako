@@ -403,3 +403,11 @@
   `scripts/deploy-pages.sh` 新設（release.sh --publish に組込み）で Pages へ実デプロイ済み
 - e2e: 実トンネル + 本番リレー + Pages PWA（別オリジン）で resolve → 接続 → ペイン一覧まで全 200 確認
 - 関連: PR #99 squash merge。リリースは master 側で別途
+
+## 2026-07-06（v0.3.0 リリース）
+- 今日の全変更（#88/#94/#78/#80/#82/#83/#75/#91）を v0.3.0 としてリリース。CHANGELOG に
+  #88 エントリを回収し Unreleased を [0.3.0] へ、release.sh に --generate-notes 併用を追加。
+  annotated tag `v0.3.0` + GitHub Release（zip 添付）+ cask 0.3.0 + Pages デプロイ +
+  /Applications へ v0.3.0 配置済み
+- 関連コミット: `4886300`（tako）/ `5aaf98a`（homebrew-tako）、tag `v0.3.0`
+- 次: ユーザーが tako を再起動（Cmd-Q → 起動）で v0.3.0 反映
