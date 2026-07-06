@@ -3,10 +3,12 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.3.0] - 2026-07-06
 
 ### Added
 
+- `tako setup` now starts with a dependency check stage (#88): claude (required) and tmux / cloudflared / git (optional) are detected with a one-line purpose note each, and missing tools can be installed on the spot via Homebrew (per-tool y/N prompt). cloudflared joined the list following #89 (tunnel-less silent LAN fallback). The same list is shown by `tako setup --check`, and the docs dependency table is kept in sync
+  `tako setup` の冒頭に依存ツールチェック段階を追加（#88）: claude（必須）と tmux / cloudflared / git（任意）を用途の一言説明付きで検出し、不足分は Homebrew でその場インストールできる（ツールごとに y/N 確認）。cloudflared は #89（トンネル不成立時の無音 LAN フォールバック）を受けて対象化。同じ一覧は `tako setup --check` にも表示され、docs の依存表も同期
 - `tako setup` now tracks setup-related changes across updates (#94): the binary embeds a machine-readable setup changelog (`resources/setup/changes.yaml`, revision-numbered), and the revision applied at the last setup is recorded in `config.yaml` (`setup.applied_revision`). Re-running `tako setup` after an update lists what changed since, writes a `pending-changes.md` brief into the setup directory, and the setup agent follows up in conversation — `auto` entries (new checks, template updates) are applied by the re-run itself and only announced, while `guided` entries (anything touching user-owned files such as a custom `master-system.md`) are confirmed interactively and never overwrite customizations silently. Inspect anytime with `tako setup --changes [--json]` (CLI) or `tako_setup_changes` (MCP, 52 tools total); `tako setup --check` also reports the follow-up status
   `tako setup` にアップデート追従機能を追加（#94）: バイナリに機械可読の setup changelog（`resources/setup/changes.yaml`、リビジョン番号付き）を同梱し、最後に setup したときの適用リビジョンを `config.yaml`（`setup.applied_revision`）に記録。アップデート後に `tako setup` を再実行すると前回以降の変更が一覧表示され、setup ディレクトリに書き出される `pending-changes.md` をもとに setup エージェントが対話で追従する。`auto` の変更（チェック項目追加・テンプレート更新等）は再実行自体が適用を兼ねて通知のみ、`guided` の変更（カスタム `master-system.md` などユーザー所有ファイルに関わるもの）は対話で確認し、カスタマイズを黙って上書きしない。`tako setup --changes [--json]`（CLI）/ `tako_setup_changes`（MCP、計 52 ツール）でいつでも確認でき、`tako setup --check` にも追従状況が表示される
 

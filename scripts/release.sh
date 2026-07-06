@@ -153,9 +153,11 @@ claude mcp add --scope user tako -- /Applications/tako.app/Contents/MacOS/tako m
 "
 
   echo "==> GitHub Release 作成: $TAG"
+  # --generate-notes: CHANGELOG 由来の --notes に加えて PR 一覧の自動生成ノートを追記する
   gh release create "$TAG" \
     --title "tako $TAG" \
     --notes "$RELEASE_NOTES" \
+    --generate-notes \
     $DRAFT_FLAG \
     "$ZIP_PATH"
 
