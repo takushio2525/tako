@@ -410,4 +410,5 @@
   annotated tag `v0.3.0` + GitHub Release（zip 添付）+ cask 0.3.0 + Pages デプロイ +
   /Applications へ v0.3.0 配置済み
 - 関連コミット: `4886300`（tako）/ `5aaf98a`（homebrew-tako）、tag `v0.3.0`
-- 次: ユーザーが tako を再起動（Cmd-Q → 起動）で v0.3.0 反映
+- 反映確認済み（2026-07-06 21:05 再起動）: 実行中アプリ 0.3.0 / MCP 52 ツール（tako_setup_changes 含む）/
+  リモート固定 URL のリンク継続・setup --check の新依存チェックも実機確認済み
