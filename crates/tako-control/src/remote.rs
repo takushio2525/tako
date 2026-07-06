@@ -28,6 +28,16 @@
 //! WS は Sec-WebSocket-Protocol の `token.<T>` で検証（ブラウザ WS API はヘッダ不可のため）。
 //! CORS: PWA からのアクセス用にワイルドカード許可。
 //!
+//! 接続リンクの構成（Issue #91）:
+//! - トンネル成功 + リレー登録成功 → `https://tako-remote.pages.dev/#/connect?machine=...`
+//!   （固定 URL。PWA は Cloudflare Pages が配信し、KV リレーで machineId → 現在の
+//!   トンネル URL を解決してデータだけトンネル経由で流す。トンネルが再起動しても
+//!   リンク / ブックマークは不変）。トンネル直 URL は `fallback_url` として併記
+//!   （リレー障害時の予備。デーモン内蔵 PWA がトンネル経由で配信される）
+//! - トンネル成功 + リレー登録失敗 → トンネル直 URL（従来形式）
+//! - トンネル失敗（cloudflared 不在等）→ LAN URL 直（内蔵 PWA。`tunnel_error` を
+//!   起動情報 JSON に含め、CLI が LAN 限定の警告を表示する。#89 の可視化）
+//!
 //! デーモン管理:
 //! - `tako remote start` → `tako remote serve` をバックグラウンド fork
 //! - PID ファイル（`/tmp/tako-remote.pid`）で管理
@@ -46,6 +56,15 @@ const MAX_BODY_BYTES: u64 = 1024 * 1024;
 /// KV リレーの Workers URL（Cloudflare Pages / Workers のデプロイ先）。
 /// PWA 側（web/tako-remote/src/api.js）の DEFAULT_RELAY_URL と一致させること
 const DEFAULT_RELAY_URL: &str = "https://tako-remote-relay.takushio2525.workers.dev";
+/// 接続入口の Cloudflare Pages URL（PWA の固定ホスティング先。scripts/deploy-pages.sh で更新）。
+/// トンネル有効時の接続リンクはこの固定 URL をベースにし、PWA が KV リレー経由で実際の
+/// トンネル URL を解決する（Issue #91: trycloudflare のランダム URL をユーザーに見せず、
+/// ブックマークを恒久化する）。`TAKO_PAGES_URL` で差し替え可能（セルフホスト・検証用）
+const DEFAULT_PAGES_URL: &str = "https://tako-remote.pages.dev";
+
+fn pages_url() -> String {
+    std::env::var("TAKO_PAGES_URL").unwrap_or_else(|_| DEFAULT_PAGES_URL.to_string())
+}
 // --- PID / トークン / ポートファイルのパス ---
 
 /// state ファイルの置き場所。`TAKO_REMOTE_STATE_DIR` で差し替え可能
@@ -64,11 +83,17 @@ pub fn token_path() -> std::path::PathBuf {
 pub fn port_path() -> std::path::PathBuf {
     state_dir().join("tako-remote.port")
 }
+/// トンネル状態（tunnel URL / machineId / リレー登録成否）の JSON。
+/// デーモンがトンネル確立時に書き、`daemon_status` が接続リンクの再構成に使う
+pub fn tunnel_path() -> std::path::PathBuf {
+    state_dir().join("tako-remote.tunnel")
+}
 
 fn cleanup_state_files() {
     let _ = std::fs::remove_file(pid_path());
     let _ = std::fs::remove_file(token_path());
     let _ = std::fs::remove_file(port_path());
+    let _ = std::fs::remove_file(tunnel_path());
 }
 
 /// PWA の dist/ を埋め込む（`npm run build` で生成済みのもの）
@@ -151,37 +176,69 @@ pub fn run_daemon(port: Option<u16>, no_tunnel: bool) -> io::Result<()> {
     let mut tunnel_url: Option<String> = None;
     let mut tunnel_process: Option<Child> = None;
     let mut mid: Option<String> = None;
+    let mut tunnel_error: Option<String> = None;
+    let mut relay_ok = false;
 
     if !no_tunnel {
         match start_cloudflared(actual_port) {
             Ok((child, url)) => {
                 let machine = machine_id();
-                mid = Some(machine.clone());
-                if let Err(e) = register_relay(&machine, &url) {
-                    eprintln!("KV リレー登録失敗（tunnel は有効）: {e}");
+                match register_relay(&machine, &url) {
+                    Ok(()) => relay_ok = true,
+                    Err(e) => eprintln!("KV リレー登録失敗（トンネル直 URL で継続）: {e}"),
                 }
+                mid = Some(machine);
                 tunnel_url = Some(url);
                 tunnel_process = Some(child);
             }
             Err(e) => {
+                tunnel_error = Some(e.to_string());
                 eprintln!("cloudflared の起動に失敗（LAN のみモードで継続）: {e}");
             }
         }
     }
 
-    // 起動情報を JSON で stdout に出力（start コマンドが読み取る）
+    // トンネル状態を state ファイルに残す（`tako remote status` が接続リンクを再構成するため）
+    if let Some(ref t) = tunnel_url {
+        let state = json!({ "tunnel_url": t, "machine_id": mid, "relay_ok": relay_ok });
+        let _ = std::fs::write(tunnel_path(), state.to_string());
+    }
+
+    // 起動情報を JSON で stdout に出力（start コマンドが読み取る）。
+    // 接続リンク: リレー登録済みなら Pages 固定 URL + トンネル直 URL を予備として併記
+    // （リレーが単一障害点にならないように。Issue #91 留意点）
     let lan_host = lan_ip().unwrap_or_else(|| "localhost".to_string());
     let local_url = format!("http://{lan_host}:{actual_port}");
     let host_name = hostname();
-    let connect = connect_url(tunnel_url.as_deref(), &local_url, &token, Some(&host_name));
+    let mid_for_link = if relay_ok { mid.as_deref() } else { None };
+    let connect = connect_url(
+        tunnel_url.as_deref(),
+        &local_url,
+        &token,
+        Some(&host_name),
+        mid_for_link,
+    );
+    let fallback = if relay_ok && tunnel_url.is_some() {
+        Some(connect_url(
+            tunnel_url.as_deref(),
+            &local_url,
+            &token,
+            Some(&host_name),
+            None,
+        ))
+    } else {
+        None
+    };
     let info = json!({
         "running": true,
         "port": actual_port,
         "token": token,
         "url": local_url,
         "tunnel_url": tunnel_url,
+        "tunnel_error": tunnel_error,
         "machine_id": mid,
         "connect_url": connect,
+        "fallback_url": fallback,
     });
     println!("{info}");
 
@@ -265,13 +322,36 @@ pub fn daemon_status() -> Value {
     let lan_host = lan_ip().unwrap_or_else(|| "localhost".to_string());
     let local_url = format!("http://{lan_host}:{port}");
     let host_name = hostname();
-    let connect = connect_url(None, &local_url, &token, Some(&host_name));
+    // トンネル状態ファイルがあれば、起動時と同じ規則で接続リンクを再構成する
+    let tunnel_state: Option<Value> = std::fs::read_to_string(tunnel_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let tunnel_url = tunnel_state
+        .as_ref()
+        .and_then(|v| v["tunnel_url"].as_str().map(String::from));
+    let mid = tunnel_state
+        .as_ref()
+        .and_then(|v| v["machine_id"].as_str().map(String::from));
+    let relay_ok = tunnel_state
+        .as_ref()
+        .and_then(|v| v["relay_ok"].as_bool())
+        .unwrap_or(false);
+    let mid_for_link = if relay_ok { mid.as_deref() } else { None };
+    let connect = connect_url(
+        tunnel_url.as_deref(),
+        &local_url,
+        &token,
+        Some(&host_name),
+        mid_for_link,
+    );
     json!({
         "running": true,
         "pid": pid_num,
         "port": port,
         "token": token,
         "url": local_url,
+        "tunnel_url": tunnel_url,
+        "machine_id": mid,
         "connect_url": connect,
     })
 }
@@ -590,16 +670,47 @@ fn register_relay(machine_id: &str, tunnel_url: &str) -> Result<(), String> {
 /// QR コードに含める接続 URL を生成する。
 /// トークンは URL fragment（`/#/connect?token=...`）に載せる: fragment はブラウザが
 /// サーバーへ送信しないため、アクセスログ・cloudflared のログ・Referer に平文トークンが
-/// 残らない（Issue #23 認証改善）。PWA はハッシュルーターなのでこの形式を直接解釈できる
+/// 残らない（Issue #23 認証改善）。PWA はハッシュルーターなのでこの形式を直接解釈できる。
+///
+/// トンネル有効時（`tunnel_url` と `machine_id` の両方あり）は Cloudflare Pages の
+/// 固定 URL をベースにし、`machine` パラメータで PWA に KV リレー解決させる（Issue #91）。
+/// トンネル URL はリンクに現れず KV 内部の値に留まるため、トンネル再起動でもリンク不変。
+/// `machine_id` の呼び出し側契約: リレー登録が成功しているときだけ渡す（未登録の
+/// machineId で Pages リンクを出すと PWA が接続先を解決できない）。
+/// LAN-only 時は従来どおり内蔵 PWA の LAN URL 直リンク（https の Pages から
+/// プライベート IP の http へは mixed content で接続できないため、Pages 化しない）
 pub fn connect_url(
     tunnel_url: Option<&str>,
     local_url: &str,
     token: &str,
     name: Option<&str>,
+    machine_id: Option<&str>,
 ) -> String {
-    // tunnel があれば tunnel 自体が PWA を配信するので、tunnel URL に直接飛ばす
-    let base = tunnel_url.unwrap_or(local_url);
-    let mut url = format!("{base}/#/connect?token={}", urlencoding::encode(token));
+    connect_url_with_pages(&pages_url(), tunnel_url, local_url, token, name, machine_id)
+}
+
+/// connect_url の本体（Pages ベース URL を引数化。env 非依存でテスト可能にするため分離）
+fn connect_url_with_pages(
+    pages_base: &str,
+    tunnel_url: Option<&str>,
+    local_url: &str,
+    token: &str,
+    name: Option<&str>,
+    machine_id: Option<&str>,
+) -> String {
+    let mut url = match (tunnel_url, machine_id) {
+        // トンネル + machineId → Pages 固定 URL（リレー解決経路）
+        (Some(_), Some(mid)) => format!(
+            "{}/#/connect?machine={}&token={}",
+            pages_base.trim_end_matches('/'),
+            urlencoding::encode(mid),
+            urlencoding::encode(token),
+        ),
+        // トンネルはあるが machineId が無い（リレー登録失敗）→ トンネル直（トンネルが PWA を配信）
+        (Some(t), None) => format!("{t}/#/connect?token={}", urlencoding::encode(token)),
+        // LAN-only → LAN URL 直（内蔵 PWA）
+        (None, _) => format!("{local_url}/#/connect?token={}", urlencoding::encode(token)),
+    };
     if let Some(n) = name {
         url.push_str(&format!("&name={}", urlencoding::encode(n)));
     }
@@ -1950,37 +2061,110 @@ mod tests {
 
     #[test]
     fn connect_urlの生成() {
+        // machineId なし（リレー登録失敗）→ トンネル直 URL
         let url = connect_url(
             Some("https://foo.trycloudflare.com"),
             "http://localhost:7749",
             "abc123",
             Some("my-mac"),
+            None,
         );
         assert!(url.starts_with("https://foo.trycloudflare.com/#/connect?"));
         assert!(!url.contains("host="));
         assert!(url.contains("token=abc123"));
         assert!(url.contains("name=my-mac"));
 
-        let url = connect_url(None, "http://192.168.1.10:7749", "tok456", Some("host1"));
+        let url = connect_url(
+            None,
+            "http://192.168.1.10:7749",
+            "tok456",
+            Some("host1"),
+            None,
+        );
         assert!(url.starts_with("http://192.168.1.10:7749/#/connect?"));
         assert!(!url.contains("host="));
         assert!(url.contains("token=tok456"));
         assert!(url.contains("name=host1"));
 
-        let url = connect_url(None, "http://localhost:7749", "abc123", None);
+        let url = connect_url(None, "http://localhost:7749", "abc123", None, None);
         assert!(url.starts_with("http://localhost:7749/#/connect?"));
         assert!(url.contains("token=abc123"));
         assert!(!url.contains("name="));
     }
 
     #[test]
+    fn connect_urlはトンネルとmachine_idが揃うとpages固定urlになる() {
+        // Issue #91: トンネル有効 + リレー登録済みの正常系はランダムな trycloudflare URL を
+        // 見せず、Pages 固定 URL + machine パラメータで PWA にリレー解決させる
+        let url = connect_url_with_pages(
+            "https://tako-remote.pages.dev",
+            Some("https://foo.trycloudflare.com"),
+            "http://localhost:7749",
+            "tok123",
+            Some("my-mac"),
+            Some("aaaabbbb-cccc-4ddd-8eee-ffff00001111"),
+        );
+        assert!(url.starts_with("https://tako-remote.pages.dev/#/connect?"));
+        assert!(url.contains("machine=aaaabbbb-cccc-4ddd-8eee-ffff00001111"));
+        assert!(url.contains("token=tok123"));
+        assert!(url.contains("name=my-mac"));
+        assert!(
+            !url.contains("trycloudflare"),
+            "トンネル URL を露出させない: {url}"
+        );
+    }
+
+    #[test]
+    fn connect_urlはlan_onlyならmachine_idがあってもlan直リンク() {
+        // https の Pages からプライベート IP の http へは mixed content で接続できないため、
+        // LAN-only では Pages 化しない
+        let url = connect_url_with_pages(
+            "https://tako-remote.pages.dev",
+            None,
+            "http://192.168.1.10:7749",
+            "tok123",
+            None,
+            Some("aaaabbbb-cccc-4ddd-8eee-ffff00001111"),
+        );
+        assert!(url.starts_with("http://192.168.1.10:7749/#/connect?"));
+        assert!(!url.contains("pages.dev"));
+    }
+
+    #[test]
+    fn connect_urlのpagesベース末尾スラッシュは正規化される() {
+        let url = connect_url_with_pages(
+            "https://tako-remote.pages.dev/",
+            Some("https://foo.trycloudflare.com"),
+            "http://localhost:7749",
+            "t",
+            None,
+            Some("m-1"),
+        );
+        assert!(url.starts_with("https://tako-remote.pages.dev/#/connect?"));
+    }
+
+    #[test]
     fn connect_urlのトークンはfragmentに載る() {
         // fragment（# 以降）はブラウザがサーバーへ送らない = ログ・Referer に残らない。
-        // token が # より後ろにあることを検証する
-        let url = connect_url(None, "http://192.168.1.10:7749", "secret", None);
+        // token が # より後ろにあることを検証する（LAN 直 / Pages の両形式）
+        let url = connect_url(None, "http://192.168.1.10:7749", "secret", None, None);
         let hash_pos = url.find('#').expect("fragment がある");
         let token_pos = url.find("token=").expect("token がある");
         assert!(token_pos > hash_pos, "token は fragment 内: {url}");
+
+        let url = connect_url_with_pages(
+            "https://tako-remote.pages.dev",
+            Some("https://foo.trycloudflare.com"),
+            "http://localhost:7749",
+            "secret",
+            None,
+            Some("m-1"),
+        );
+        let hash_pos = url.find('#').expect("fragment がある");
+        let token_pos = url.find("token=").expect("token がある");
+        let machine_pos = url.find("machine=").expect("machine がある");
+        assert!(token_pos > hash_pos, "token は fragment 内: {url}");
+        assert!(machine_pos > hash_pos, "machine も fragment 内: {url}");
     }
 
     #[test]
@@ -2077,6 +2261,7 @@ mod tests {
             Some("https://foo.trycloudflare.com"),
             "http://localhost:7749",
             "tok123",
+            None,
             None,
         );
         assert!(url.starts_with("https://foo.trycloudflare.com/#/connect?"));

@@ -1338,8 +1338,20 @@ fn remote_start(port: u16, no_tunnel: bool) -> Result<(), String> {
             Err(e) => eprintln!("\nQR コード画像の生成に失敗: {e}"),
         }
         eprintln!("URL: {connect}");
+        if let Some(fallback) = result["fallback_url"].as_str() {
+            // 接続リンクは Pages 固定 URL（#91）。リレー障害時の予備にトンネル直 URL も出す
+            eprintln!("予備 URL（上のリンクで繋がらないとき）: {fallback}");
+        }
         if let Some(tunnel) = result["tunnel_url"].as_str() {
             eprintln!("Tunnel: {tunnel}");
+        } else if !no_tunnel {
+            // トンネルが張れず LAN 限定 URL に落ちた（#89: 無音フォールバックの可視化）
+            eprintln!("⚠ トンネルが張れなかったため LAN 限定 URL です。");
+            eprintln!("  同一 Wi-Fi 以外や AP isolation 環境のスマホからは開けません。");
+            if let Some(err) = result["tunnel_error"].as_str() {
+                eprintln!("  原因: {err}");
+            }
+            eprintln!("  どこからでも繋がるリンクにするには: brew install cloudflared");
         }
         if let Some(mid) = result["machine_id"].as_str() {
             eprintln!("Machine ID: {mid}");
