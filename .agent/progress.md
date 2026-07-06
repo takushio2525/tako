@@ -363,3 +363,9 @@
   CLI のみだった tako 再起動時の gone 誤検知防止が MCP 版にも入り挙動統一。全テスト 351 緑
 - 関連: PR #87 squash merge（`25ed398`）→ `build-app.sh --install` で実機反映
 - 次: 実機で tako_orchestrator_run の output 動作確認（ユーザー）。レビュー残 Issue は #84〜#86
+
+## 2026-07-06（リモート接続バグ調査: cloudflared 未導入時の無音 LAN フォールバック → Issue #89）
+- 友人環境の「接続リンクがプライベート IP でページが開けない」を調査（コード変更なし）。
+  根因 = cloudflared 不在時の LAN-only フォールバック警告が spawn_daemon の未読 stderr に消え、
+  無警告で `http://10.x.x.x:7749` の URL/QR を提示（AP isolation 下で到達不能）。#89 起票 + #78 相互リンク
+- 次: 修正はリレー worker 並行作業の完了と #78 認証方針の決定後（修正方針 5 点は #89 に記載）
