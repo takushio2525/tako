@@ -1090,6 +1090,22 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "tako_setup_changes",
+            "description": "tako setup のアップデート追従状況を照会する（Issue #94）。\
+                前回 `tako setup` 完了時に適用したリビジョン（applied_revision）と\
+                バイナリ同梱の setup changelog の現在リビジョンを突き合わせ、\
+                未適用の setup 関連変更（セットアップ項目・設定フォーマット・\
+                master 用システムプロンプト等の変更）の一覧を返す。読み取り専用。\
+                pending の各エントリの kind が auto なら `tako setup` の再実行だけで追従が\
+                完了する。guided ならユーザー所有ファイル（CLAUDE.md・profiles 等）に関わる\
+                ため、setup の対話で確認しながら適用する。適用は `tako setup` を案内すること。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -1500,6 +1516,7 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
         "tako_update" => Request::Update {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
         },
+        "tako_setup_changes" => Request::SetupChanges,
         _ => return Err(format!("不明なツール: {name}")),
     })
 }
@@ -1928,9 +1945,16 @@ mod tests {
     }
 
     #[test]
+    fn tako_setup_changesはsetup_changesリクエストに変換される() {
+        let (response, requests) = run(call("tako_setup_changes", json!({})), None, true);
+        assert_eq!(requests, vec![Request::SetupChanges]);
+        assert_eq!(response.unwrap()["result"]["isError"], false);
+    }
+
+    #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 51);
+        assert_eq!(tools.len(), 52);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

@@ -30,9 +30,17 @@ tako setup
 # 環境チェックだけ実行（claude の有無・MCP 登録・セットアップ状態を表示）
 tako setup --check
 
+# アップデート追従状況を表示（前回セットアップ以降に setup へ入った変更の一覧）
+tako setup --changes
+
+# 同じ内容を JSON で出力（MCP ツール tako_setup_changes と同一ペイロード）
+tako setup --changes --json
+
 # セットアップ状態をリセットして最初からやり直す
 tako setup --reset
 ```
+
+tako のアップデートでセットアップ項目・設定フォーマット・master 用システムプロンプトが変わることがあります。`--changes` で未適用の変更を確認でき、`tako setup` を再実行すると対話の中で最新状態へ追従できます（詳細は[セットアップガイド](/getting-started/#アップデート後の追従-tako-setup-の再実行)）。
 
 ### tako setup-mcp
 

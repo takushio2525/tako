@@ -387,3 +387,11 @@
   上書きが 403 になることを実地検証。#80 FileOp::Trash を argv 渡し化し AppleScript インジェクションを
   構造排除（PR #96、決定的テスト + e2e #[ignore]）。#79 は cargo update 不可を確認しコメントのみ
 - 関連コミット: `d24cf55`（#96）。#79 は GPUI 依存更新待ち・macOS/Win 非配布のため OPEN 継続
+
+## 2026-07-06（#94: tako setup にアップデート追従機能を追加）
+- setup changelog（`resources/setup/changes.yaml`、revision 連番 + kind auto/guided）をバイナリ同梱し、
+  config.yaml の `setup.applied_revision` と突き合わせて未適用変更を検出・対話追従。
+  `tako-control::setup` 新設（config スキーマ移動 + CLI/MCP 共有）、CLI `tako setup --changes [--json]` +
+  MCP `tako_setup_changes`（52 ツール）+ pending-changes.md + system prompt 追従フロー
+- 検証: build / clippy(-D warnings) / fmt / test 全緑（362+）、セルフテスト既知 PDF 以外緑、CLI 実機 3 経路確認
+- 次: PR squash merge → `build-app.sh --install` で実機反映

@@ -781,6 +781,12 @@ struct SetupArgs {
     /// セットアップ状態をリセットして初回扱いに戻す
     #[arg(long, conflicts_with = "check")]
     reset: bool,
+    /// アップデート追従状況（前回セットアップ以降の setup 関連変更）を表示して終了する
+    #[arg(long, conflicts_with_all = ["check", "reset"])]
+    changes: bool,
+    /// --changes の出力を JSON にする（MCP tako_setup_changes と同一ペイロード）
+    #[arg(long, requires = "changes")]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -851,6 +857,8 @@ fn main() -> ExitCode {
         Command::Setup(ref args) => {
             if args.check {
                 setup::run_check()
+            } else if args.changes {
+                setup::run_changes(args.json)
             } else if args.reset {
                 setup::run_reset().and_then(|()| setup::run_setup())
             } else {

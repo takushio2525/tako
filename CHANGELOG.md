@@ -5,6 +5,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `tako setup` now tracks setup-related changes across updates (#94): the binary embeds a machine-readable setup changelog (`resources/setup/changes.yaml`, revision-numbered), and the revision applied at the last setup is recorded in `config.yaml` (`setup.applied_revision`). Re-running `tako setup` after an update lists what changed since, writes a `pending-changes.md` brief into the setup directory, and the setup agent follows up in conversation — `auto` entries (new checks, template updates) are applied by the re-run itself and only announced, while `guided` entries (anything touching user-owned files such as a custom `master-system.md`) are confirmed interactively and never overwrite customizations silently. Inspect anytime with `tako setup --changes [--json]` (CLI) or `tako_setup_changes` (MCP, 52 tools total); `tako setup --check` also reports the follow-up status
+  `tako setup` にアップデート追従機能を追加（#94）: バイナリに機械可読の setup changelog（`resources/setup/changes.yaml`、リビジョン番号付き）を同梱し、最後に setup したときの適用リビジョンを `config.yaml`（`setup.applied_revision`）に記録。アップデート後に `tako setup` を再実行すると前回以降の変更が一覧表示され、setup ディレクトリに書き出される `pending-changes.md` をもとに setup エージェントが対話で追従する。`auto` の変更（チェック項目追加・テンプレート更新等）は再実行自体が適用を兼ねて通知のみ、`guided` の変更（カスタム `master-system.md` などユーザー所有ファイルに関わるもの）は対話で確認し、カスタマイズを黙って上書きしない。`tako setup --changes [--json]`（CLI）/ `tako_setup_changes`（MCP、計 52 ツール）でいつでも確認でき、`tako setup --check` にも追従状況が表示される
+
 ### Security
 
 - `FileOp::Trash` (macOS) now passes the path to `osascript` as an argument instead of concatenating it into the AppleScript source (#80): the Finder delete script uses `on run argv` and reads the path from `item 1 of argv`, so filenames containing `"`, `\`, or newlines can no longer break out of the string literal and inject AppleScript. This removes the reliance on escape correctness (and the prior control-character reject guard is no longer needed). A deterministic test proves an injection payload passed via argv is treated as data (no side effect), and an `#[ignore]` e2e trashes a file whose name contains quotes/backslash/newline

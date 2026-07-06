@@ -1,0 +1,89 @@
+# tako setup のアップデート追従用 changelog（Issue #94）
+#
+# tako のアップデートで setup の内容（セットアップ項目・設定フォーマット・
+# master 用システムプロンプト等の配布物）に入った変更を機械可読で記録する。
+# バイナリに埋め込まれ、`tako setup` 実行時に config.yaml の
+# setup.applied_revision と突き合わせて未適用の変更を検出する。
+#
+# 記入ルール（開発者向け）:
+# - setup に関わる変更を入れたら、このファイルに revision を 1 増やしてエントリを追記する
+# - revision は単調増加・欠番なし（テストで検証される）。既存エントリは書き換えない
+# - version はその変更が最初に入る tako リリースのバージョン
+# - kind の使い分け:
+#     auto   = tako setup の再実行だけで追従が完了する変更
+#              （setup の Rust コードが自動処理する / 毎回上書き展開されるリソースの更新）。
+#              ユーザーへは変更概要の通知のみ行う
+#     guided = ユーザー所有ファイル（~/.claude/CLAUDE.md・profiles/*.yaml・
+#              カスタム master-system.md 等）に関わり、カスタマイズ保全のため
+#              setup エージェントが対話で確認してから適用すべき変更
+# - description は setup エージェントがそのまま読む前提で書く:
+#   何が変わったか / 影響を受ける条件 / 確認・適用の手順。
+#   guided は「ユーザーの同意なしに上書きしない」手順になっていること
+
+changes:
+  - revision: 1
+    version: "0.2.4"
+    date: "2026-07-02"
+    kind: auto
+    title: モデル・effort 設定を profiles/*.yaml へ一本化（旧 [1m] 既定値の自動移行）
+    description: |
+      オーケストレーターの起動設定（モデル・effort・worker ポリシー）の正が
+      config.yaml から profiles/*.yaml に移った（Issue #27）。config.yaml の
+      master_model / worker_model / effort キーは廃止され、残っていても無視される。
+      旧バージョンが default.yaml に書き込んだ既定値 `claude-opus-4-6[1m]` は
+      Pro プランで master が起動できないため、setup / master 起動時に自動で
+      モデル未指定（claude CLI の既定）へ移行され、バックアップ
+      （default.yaml.backup-1m）が残る。ユーザーが明示指定した他のモデルは触らない。
+      確認事項: ユーザーの config.yaml に旧モデルキーが残っていたら、意図した設定は
+      profiles/default.yaml へ転記が必要なことを伝える（config.yaml 側は放置で無害）。
+
+  - revision: 2
+    version: "0.2.4"
+    date: "2026-07-02"
+    kind: guided
+    title: master 用システムプロンプトがブロック合成式に（カスタム master-system.md は要確認）
+    description: |
+      デフォルトの master 用システムプロンプトは `<!-- block: name -->` 単位で
+      合成され、Session Identity / Worker Model Policy ブロックがプロファイル設定から
+      自動注入されるようになった。カスタム `orchestrator/master-system.md` や
+      profiles の `system_prompt` フィールドを使っている場合、そのファイル全文が
+      そのまま使われるため、新ブロックやデフォルトプロンプトの更新は反映されない。
+      確認手順:
+      (1) `~/Library/Application Support/tako/orchestrator/master-system.md` の有無と
+          profiles/*.yaml の `system_prompt` 指定を確認する
+      (2) どちらも無ければこのエントリは対象外（デフォルトが使われており追従済み）
+      (3) ある場合、カスタムの意図が「全文差し替え」か「一部調整」かをユーザーに聞く。
+          一部調整なら profiles の `prompt_blocks`（disable / override_blocks /
+          prepend / append）への移行を提案する。移行すればカスタムの意図を保ったまま
+          デフォルトプロンプトの今後の更新にも自動追従できる
+      (4) ユーザーの同意なしに master-system.md を削除・上書きしない
+
+  - revision: 3
+    version: "0.2.9"
+    date: "2026-07-06"
+    kind: auto
+    title: setup 冒頭に依存ツールチェック段階を追加（claude 必須 / tmux・cloudflared・git 任意）
+    description: |
+      tako setup の最初に依存ツールの検出が走るようになった（Issue #88）。
+      claude は必須、tmux（リモート接続・セッション復元・worker 管理）と
+      cloudflared（tako remote のトンネル公開）と git（git パネル）は任意で、
+      未導入のものはその場で brew インストールを選べる。cloudflared が無いと
+      tako remote の URL が同一 LAN 限定に劣化する（Issue #89）ため、
+      リモート接続を使うユーザーには導入を勧めるとよい。
+      setup 再実行でチェックが自動で走るため、個別の適用作業は不要。
+      `tako setup --check` でも同じ一覧を確認できる。
+
+  - revision: 4
+    version: "0.2.9"
+    date: "2026-07-06"
+    kind: auto
+    title: setup にアップデート追従機能を追加（この検出のしくみ自体）
+    description: |
+      前回セットアップ以降に setup 関連へ入った変更を検出し、自動適用と対話案内で
+      追従できるようになった（Issue #94）。適用済みリビジョンは config.yaml の
+      setup.applied_revision に記録され、setup の対話が正常終了すると最新へ更新される。
+      未適用の変更は `tako setup --changes`（CLI）/ `tako_setup_changes`（MCP）で
+      いつでも確認でき、setup ディレクトリの changes.yaml（全履歴）と
+      pending-changes.md（未適用分）としても書き出される。
+      ユーザーには「今後は tako setup を実行するだけで最新の設定フォーマットに
+      追従できる」ことを伝えればよい。

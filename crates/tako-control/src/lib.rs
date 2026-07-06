@@ -25,6 +25,7 @@ pub mod orchestrator;
 pub mod protocol;
 pub mod remote;
 pub mod settings;
+pub mod setup;
 pub mod transcript;
 
 pub use dispatch::{
