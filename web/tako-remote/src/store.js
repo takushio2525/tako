@@ -16,10 +16,13 @@ export function getMachines() {
   return load().machines;
 }
 
-export function addMachine({ id, name, host, token }) {
+export function addMachine({ id, name, host, token, version }) {
   const data = load();
   const idx = data.machines.findIndex(m => m.id === id);
   const entry = { id, name: name || id, host, token, lastSeen: Date.now() };
+  // デーモンのバージョン（/api/health の version）。PWA との互換判断用（Issue #91）。
+  // 未取得（undefined）のときは既存の記録を上書きしない
+  if (version !== undefined) entry.version = version;
   if (idx >= 0) {
     Object.assign(data.machines[idx], entry);
   } else {
