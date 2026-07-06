@@ -449,11 +449,13 @@ tako remote scrollback <pane-id> --lines 1000
 
 ## オーケストレーター
 
-複数の AI エージェントを親子で連携させる機能です。考え方は[オーケストレーションとは](/features/orchestration/)、使い方の全体像は[オーケストレーター](/features/orchestrator/)を参照してください。
+複数の AI エージェントを親子で連携させる機能です。考え方は[オーケストレーションとは](/features/orchestration/)、使い方は [tako master 実践ガイド](/features/orchestrator/)を参照してください。
+
+このうち、**日常であなたが打つのは `tako master` だけ**です。それ以外の `tako orchestrator` 系コマンドは、通常は master（AI）自身が内部で実行するもので、手動操作やスクリプトからの自動化用に公開されています。
 
 ### tako master
 
-マスター（司令塔となる claude）を新しいタブで起動します。以後はこのマスターに自然言語で作業を依頼するだけで、子 worker の起動・監視・回収が自動で回ります。
+マスター（司令塔となる claude）を新しいタブで起動します。以後はこのマスターに自然言語で作業を依頼するだけで、子 worker の起動・監視・回収が自動で回ります。プロジェクトの登録やモデル設定も master に頼めます。
 
 ```bash
 # default プロファイルで起動
@@ -468,7 +470,7 @@ tako master dev
 
 ### tako orchestrator projects
 
-マスターが作業対象にできるプロジェクトの登録・管理です。登録内容は `~/Library/Application Support/tako/orchestrator/projects.yaml` に保存されます。
+マスターが作業対象にできるプロジェクトの登録・管理です。**通常は master に「◯◯のリポジトリを追加して」と頼むだけで済みます**。手動やスクリプトから登録したいとき用のコマンドで、登録内容は `~/Library/Application Support/tako/orchestrator/projects.yaml` に保存されます。
 
 ```bash
 # 一覧
@@ -483,7 +485,7 @@ tako orchestrator projects remove --key webapp
 
 ### tako orchestrator profiles
 
-マスター・worker が使うモデルや思考量（effort）の設定です。YAML を手で編集しなくてもコマンドで変更できます。
+マスター・worker が使うモデルや思考量（effort）の設定です。**通常は `tako setup` の対話や master への依頼で変更すれば済みます**。コマンドで直接変更したいとき用です。
 
 ```bash
 # プロファイル一覧（model: null は「claude の既定モデルで起動」の意味）

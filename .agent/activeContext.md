@@ -4,17 +4,16 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-06・docs サイト刷新 PR #73 レビュー待ち）
+## 現在の対象（2026-07-06・docs オーケストレーション解説のユーザー視点刷新）
 
-docs サイト（tako-docs.pages.dev で公開中）の内容刷新を PR #73 として提出。
-ブランチ `docs/refresh-setup-releases`（3 コミット）。docs は公開配信中のため
-main 直 push せず PR 経由。**マージは未実施（ユーザー判断待ち）**。
+PR #73（docs 刷新）マージ後のユーザーレビューを反映し、オーケストレーション関連を
+「人間は設定を書かず、master に日本語で頼むだけ」の世界観に書き直した。
+ブランチ `docs/orchestration-user-first` → PR → squash merge（docs は公開配信中のため PR 経由）。
 
-- セットアップページ全面刷新（tako setup 中心・初心者向け）
-- CLI リファレンス詳細化 + shelve→background 等の実装乖離を修正
-- MCP ツール一覧を実 51 ツールへ更新
-- 新設: `/releases/`（リリースノート。CHANGELOG から起こす運用）、
-  `/features/orchestration/`（オーケストレーション紹介・売り込みページ）
+- orchestrator.md → 「tako master 実践ガイド」（会話例・つまずき・仕組みは格下げ）
+- orchestration.md → 魅力紹介に簡潔化（内部手順を削除）
+- getting-started: tako setup の設定項目一覧（実装 setup.rs + system-prompt.md から起こした）
+- getting-started/quickstart.md 新設（setup → master → 話しかける最短 3 ステップ）
 - ビルド緑 + dist 全内部リンク/アンカー機械チェック済み
 
 ## v0.2.8 の内容

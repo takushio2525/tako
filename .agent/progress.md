@@ -332,3 +332,9 @@
   リリースノート `/releases/` とオーケストレーション紹介 `/features/orchestration/` を新設
 - 関連: ブランチ `docs/refresh-setup-releases`（3 コミット）→ PR #73（公開サイトのため main 直 push 回避）
 - 次: PR #73 のレビュー・マージ（ユーザー判断）
+
+## 2026-07-06（docs オーケストレーション解説をユーザー視点に刷新）
+- orchestrator.md を「tako master 実践ガイド」に全面改稿（会話例・つまずき中心、設定ファイルは
+  上級者向け参考に格下げ）、orchestration.md 簡潔化、getting-started に setup 設定項目一覧、
+  quickstart.md 新設。「設定は master に頼むだけ」の世界観へ統一
+- 関連: ブランチ `docs/orchestration-user-first` → PR squash merge（マージで自動デプロイ）

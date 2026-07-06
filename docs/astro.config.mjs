@@ -27,6 +27,7 @@ export default defineConfig({
 					items: [
 						{ label: 'tako とは', slug: 'index' },
 						{ label: 'セットアップ', slug: 'getting-started' },
+						{ label: 'クイックスタート', slug: 'getting-started/quickstart' },
 						{ label: 'リリースノート', slug: 'releases' },
 					],
 				},
@@ -40,7 +41,7 @@ export default defineConfig({
 						{ label: 'ポート検知', slug: 'features/port-detection' },
 						{ label: 'たまり場', slug: 'features/shelving' },
 						{ label: 'オーケストレーションとは', slug: 'features/orchestration' },
-						{ label: 'オーケストレーター', slug: 'features/orchestrator' },
+						{ label: 'tako master 実践ガイド', slug: 'features/orchestrator' },
 						{ label: 'git 連携', slug: 'features/git-integration' },
 					],
 				},
