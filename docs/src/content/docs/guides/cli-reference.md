@@ -447,6 +447,10 @@ tako remote messages <session-id> --tail 30
 tako remote scrollback <pane-id> --lines 1000
 ```
 
+:::note[リレーの仕組みと差し替え]
+トンネル URL の再解決（2 回目以降の QR 再スキャン不要化）には、作者がベストエフォートで運用する公共リレー（Cloudflare Workers・SLA なし）を使います。リレーに保存されるのは machineId とトンネル URL のみで、**画面内容やトークンは通りません**（それらはトンネル経由で tako 本体と直接やり取りされ、トークン認証で保護されます）。リレーへの登録は端末ごとに自動生成されるシークレットで first-write-wins 保護されます。`TAKO_RELAY_URL` 環境変数で自前のリレーに差し替えることもできます（構築手順はリポジトリの `web/tako-remote-worker/README.md`）。
+:::
+
 ## オーケストレーター
 
 複数の AI エージェントを親子で連携させる機能です。考え方は[オーケストレーションとは](/features/orchestration/)、使い方は [tako master 実践ガイド](/features/orchestrator/)を参照してください。
