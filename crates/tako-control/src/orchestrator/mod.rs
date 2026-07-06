@@ -4,6 +4,8 @@
 //! 子 worker の spawn・監視・プロジェクト管理を行う。外部スクリプト依存ゼロで
 //! tako をインストールするだけで使える。
 
+pub mod wait;
+
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 

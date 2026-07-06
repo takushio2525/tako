@@ -5,6 +5,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Orchestrator completion-wait polling unified into tako-control (#83): the polling state machine duplicated across MCP `tako_orchestrator_run` and CLI `tako orchestrator run` / `watch` (~300 lines) is now a single engine (`orchestrator::wait`). The tmux-liveness guard against false "gone" during tako restarts — previously CLI-only — now also applies to the MCP path, so `tako_orchestrator_run` no longer misreports `error` while tako restarts
+  オーケストレーターの完了待ちポーリングを tako-control へ一本化（#83）: MCP `tako_orchestrator_run` と CLI `tako orchestrator run` / `watch` に重複していたポーリング状態機械（約 300 行）を単一エンジン（`orchestrator::wait`）に統合。CLI のみにあった tmux 生存確認による gone 誤検知防止（tako 再起動中の対策）が MCP 経路にも効くようになり、再起動中の `tako_orchestrator_run` が `error` を誤報告しなくなった
+
+### Fixed
+
+- `tako_orchestrator_run` / `tako orchestrator run` no longer return an empty `output` (#82): the result-read step referenced a nonexistent `content` field of the Read response (actual field: `text`), so the worker's final output was always empty — with `auto_close` defaulting to true, the pane was closed before the master could re-read it. A regression test now asserts the output round-trip
+  `tako_orchestrator_run` / `tako orchestrator run` の `output` が常に空になる問題を修正（#82): 出力取得ステップが Read 応答に存在しない `content` フィールド（実際は `text`）を参照していたため worker の成果が常に空だった。`auto_close` 既定 true のため master が読み直す前にペインも閉じられていた。出力の往復を検証する回帰テストを追加
+
 ## [0.2.8] - 2026-07-05
 
 ### Changed

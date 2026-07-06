@@ -21,6 +21,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
+use tako_control::orchestrator::wait;
 use tako_control::protocol::{Axis, Direction, Request};
 
 /// tako の外で実行されたときのエラー（FR-2.2.8）。
@@ -1134,174 +1135,36 @@ fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-/// `tako orchestrator watch --pane N [--session-id S] [--timeout T]` — worker の完了まで待機し 1 行出力する
+/// `tako orchestrator watch --pane N [--session-id S] [--timeout T]` — worker の完了まで待機し 1 行出力する。
+/// 判定は tako-control の完了待ちエンジン（`orchestrator::wait`。MCP の run と共通。#83）
 fn orchestrator_watch(
     pane: u64,
     session_id: Option<&str>,
     tmux_session: Option<&str>,
     timeout_secs: Option<u64>,
 ) -> Result<(), String> {
-    let interval = std::time::Duration::from_secs(5);
-    let deadline =
-        timeout_secs.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
-    // agents 一次（明示/自動解決）は streak 3、画面推定フォールバックは streak 8
-    let mut idle_streak: u32 = 0;
-    let mut gone_streak: u32 = 0;
-
-    loop {
-        if let Some(dl) = deadline {
-            if std::time::Instant::now() >= dl {
-                println!("WORKER_TIMEOUT: tako:{pane}");
-                return Ok(());
-            }
-        }
-        // ペインの存在確認（IPC 経由。tmux_session 指定時は pane 消滅後も tmux で追跡）
-        let result = send_request(Request::OrchestratorWorkerStatus {
-            pane_id: pane,
-            session_id: session_id.map(|s| s.to_string()),
-            tmux_session: tmux_session.map(|s| s.to_string()),
-        });
-
-        match result {
-            Ok(val) => {
-                let status = val["status"].as_str().unwrap_or("unknown");
-                let recent = val["recent_output"].as_str().unwrap_or("");
-                let source = val["status_source"].as_str().unwrap_or("screen");
-                // agents 一次シグナル（明示 or 自動解決）は streak 3、画面推定は streak 8
-                let need_streak: u32 = if source == "screen" { 8 } else { 3 };
-
-                match status {
-                    "gone" => {
-                        // tmux session 経由でペインの実在を直接確認（tako 再起動時の誤検知防止）
-                        if let Some(ts) = tmux_session {
-                            if tmux_session_alive(ts) {
-                                // tmux session が生きている = ペインは生存中（tako が再起動しただけ）
-                                gone_streak = 0;
-                                idle_streak = 0;
-                                std::thread::sleep(interval);
-                                continue;
-                            }
-                        }
-                        gone_streak += 1;
-                        if gone_streak >= 2 {
-                            println!("WORKER_GONE: tako:{pane}");
-                            return Ok(());
-                        }
-                    }
-                    "idle" => {
-                        gone_streak = 0;
-                        // 画面内容で busy パターンがあれば idle を取り消す
-                        if screen_looks_busy(recent) {
-                            idle_streak = 0;
-                        } else {
-                            idle_streak += 1;
-                        }
-                    }
-                    "busy" => {
-                        gone_streak = 0;
-                        idle_streak = 0;
-                    }
-                    _ => {
-                        gone_streak = 0;
-                        // unknown: 画面内容から状態を推定（保守的 = busy 寄り）
-                        if screen_looks_busy(recent) {
-                            idle_streak = 0;
-                        } else if screen_looks_idle(recent) {
-                            idle_streak += 1;
-                        } else {
-                            // 判定不能は busy 扱い（誤 idle 防止）
-                            idle_streak = 0;
-                        }
-                    }
-                }
-
-                if idle_streak >= need_streak {
-                    let ctx = val["ctx_percent"].as_u64();
-                    if let Some(pct) = ctx {
-                        println!("WORKER_IDLE: tako:{pane} (ctx {pct}%)");
-                    } else {
-                        println!("WORKER_IDLE: tako:{pane}");
-                    }
-                    return Ok(());
-                }
-            }
-            Err(_) => {
-                // IPC エラー = tako が再起動中の可能性。tmux で実在確認
-                if let Some(ts) = tmux_session {
-                    if tmux_session_alive(ts) {
-                        gone_streak = 0;
-                        std::thread::sleep(interval);
-                        continue;
-                    }
-                }
-                gone_streak += 1;
-                if gone_streak >= 2 {
-                    println!("WORKER_GONE: tako:{pane}");
-                    return Ok(());
-                }
-            }
-        }
-
-        std::thread::sleep(interval);
+    let mut exec = |req: Request| send_request(req);
+    let opts = wait::WatchOptions {
+        pane_id: pane,
+        session_id: session_id.map(|s| s.to_string()),
+        tmux_session: tmux_session.map(|s| s.to_string()),
+        timeout: timeout_secs.map(std::time::Duration::from_secs),
+        initial_delay: std::time::Duration::ZERO,
+        interval: std::time::Duration::from_secs(5),
+    };
+    match wait::wait_for_worker(&mut exec, &opts) {
+        wait::WatchOutcome::Idle {
+            ctx_percent: Some(pct),
+        } => println!("WORKER_IDLE: tako:{pane} (ctx {pct}%)"),
+        wait::WatchOutcome::Idle { .. } => println!("WORKER_IDLE: tako:{pane}"),
+        wait::WatchOutcome::Gone => println!("WORKER_GONE: tako:{pane}"),
+        wait::WatchOutcome::Timeout => println!("WORKER_TIMEOUT: tako:{pane}"),
     }
+    Ok(())
 }
 
-/// tmux session が生きているか直接確認する（tako-core に依存せず CLI 単体で判定）
-fn tmux_session_alive(session: &str) -> bool {
-    let socket = std::env::var("TAKO_TMUX_SOCKET")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "tako".into());
-    std::process::Command::new("tmux")
-        .args(["-L", &socket, "has-session", "-t", &format!("={session}")])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// 空行を除いた末尾 N 行を返す
-fn tail_lines(output: &str, n: usize) -> Vec<&str> {
-    output
-        .lines()
-        .rev()
-        .filter(|l| !l.trim().is_empty())
-        .take(n)
-        .collect()
-}
-
-/// 画面内容が busy（作業中）を示すパターンを含むか（末尾 5 行に限定）
-fn screen_looks_busy(output: &str) -> bool {
-    let lines = tail_lines(output, 5);
-    lines.iter().any(|l| {
-        l.contains("esc to interrupt")
-            || l.contains("ing… (")
-            || l.contains("Thinking")
-            || l.contains("Reading")
-            || l.contains("Editing")
-            || l.contains("Running")
-            || l.contains("Writing")
-            || l.contains("Searching")
-    })
-}
-
-/// 画面内容が idle（入力待ち）を示すパターンを含むか
-/// Claude TUI は ❯ プロンプトの下にフッター（区切り線・モデル情報・ctx%等）が
-/// 4〜6 行あるため、末尾 10 行の範囲でチェックする
-fn screen_looks_idle(output: &str) -> bool {
-    tail_lines(output, 10)
-        .iter()
-        .any(|l| l.trim_start().starts_with('❯'))
-}
-
-/// 末尾付近に ❯ プロンプトがあるか（dispatch 側の idle 補正と共用）
-/// Claude TUI のフッター行を考慮して末尾 10 行をチェック
-pub fn last_line_has_prompt(output: &str) -> bool {
-    tail_lines(output, 10)
-        .iter()
-        .any(|l| l.trim_start().starts_with('❯'))
-}
-
-/// `tako orchestrator run` — spawn + 完了待ち + 出力取得 + close を 1 回で行う
+/// `tako orchestrator run` — spawn + 完了待ち + 出力取得 + close を 1 回で行う。
+/// 本体は tako-control の `wait::run_worker`（MCP `tako_orchestrator_run` と共通。#83）
 #[allow(clippy::too_many_arguments)]
 fn orchestrator_run(
     project: &str,
@@ -1324,8 +1187,7 @@ fn orchestrator_run(
     if pane_resolved.is_none() && tab_resolved.is_none() {
         return Err("--pane または --tab を指定してください".into());
     }
-    // 1. Spawn
-    let spawn_result = send_request(Request::OrchestratorSpawn {
+    let opts = wait::RunOptions {
         project: project.to_string(),
         prompt: prompt.to_string(),
         label: label.map(|s| s.to_string()),
@@ -1333,135 +1195,17 @@ fn orchestrator_run(
         effort: None,
         pane: pane_resolved,
         tab: tab_resolved,
-    })?;
-    let pane_id = spawn_result["pane_id"].as_u64().unwrap_or(0);
-    let spawned_by = spawn_result["spawned_by"].as_u64().unwrap_or(0);
-    let tmux_session = spawn_result["tmux_session"].as_str().map(String::from);
-    eprintln!(
-        "spawned pane {pane_id} (tmux: {})",
-        tmux_session.as_deref().unwrap_or("none")
-    );
-
-    // 2. 完了待ちポーリング（orchestrator_watch と同じ判定ロジック）
-    let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(timeout_secs);
-    let interval = std::time::Duration::from_secs(5);
-    let mut idle_streak: u32 = 0;
-    let mut gone_streak: u32 = 0;
-    let mut final_status = "timeout".to_string();
-
-    // claude 起動 + プロンプト送信を待つ
-    std::thread::sleep(std::time::Duration::from_secs(20));
-
-    loop {
-        if start.elapsed() > timeout {
-            break;
-        }
-
-        let result = send_request(Request::OrchestratorWorkerStatus {
-            pane_id,
-            session_id: None,
-            tmux_session: tmux_session.clone(),
-        });
-
-        match result {
-            Ok(val) => {
-                let status = val["status"].as_str().unwrap_or("unknown");
-                let recent = val["recent_output"].as_str().unwrap_or("");
-                let source = val["status_source"].as_str().unwrap_or("screen");
-                let need_streak: u32 = if source == "screen" { 8 } else { 3 };
-                match status {
-                    "gone" => {
-                        if let Some(ref ts) = tmux_session {
-                            if tmux_session_alive(ts) {
-                                gone_streak = 0;
-                                idle_streak = 0;
-                                std::thread::sleep(interval);
-                                continue;
-                            }
-                        }
-                        gone_streak += 1;
-                        if gone_streak >= 2 {
-                            final_status = "error".to_string();
-                            break;
-                        }
-                    }
-                    "idle" => {
-                        gone_streak = 0;
-                        if screen_looks_busy(recent) {
-                            idle_streak = 0;
-                        } else {
-                            idle_streak += 1;
-                        }
-                    }
-                    "busy" => {
-                        gone_streak = 0;
-                        idle_streak = 0;
-                    }
-                    _ => {
-                        gone_streak = 0;
-                        if screen_looks_busy(recent) {
-                            idle_streak = 0;
-                        } else if screen_looks_idle(recent) {
-                            idle_streak += 1;
-                        } else {
-                            idle_streak = 0;
-                        }
-                    }
-                }
-                if idle_streak >= need_streak {
-                    final_status = "completed".to_string();
-                    break;
-                }
-            }
-            Err(_) => {
-                if let Some(ref ts) = tmux_session {
-                    if tmux_session_alive(ts) {
-                        gone_streak = 0;
-                        std::thread::sleep(interval);
-                        continue;
-                    }
-                }
-                gone_streak += 1;
-                if gone_streak >= 2 {
-                    final_status = "error".to_string();
-                    break;
-                }
-            }
-        }
-
-        std::thread::sleep(interval);
-    }
-
-    // 3. 出力取得（dispatch の Read 応答は {"pane", "text"}。#82: 旧実装は "content" で常に空）
-    let output = send_request(Request::Read {
-        pane: Some(pane_id),
-        lines: Some(output_lines),
-        tmux_session: tmux_session.clone(),
-    })
-    .ok()
-    .and_then(|v| v["text"].as_str().map(String::from))
-    .unwrap_or_default();
-
-    // 4. 自動 close（orchestrator run の完了後なので force: true）
-    let closed = if auto_close {
-        send_request(Request::Close {
-            pane: Some(pane_id),
-            force: true,
-        })
-        .is_ok()
-    } else {
-        false
+        timeout: std::time::Duration::from_secs(timeout_secs),
+        auto_close,
+        output_lines,
+        // claude 起動 + プロンプト送信を待つ
+        initial_delay: std::time::Duration::from_secs(20),
+        interval: std::time::Duration::from_secs(5),
     };
-
-    let result = serde_json::json!({
-        "pane_id": pane_id,
-        "spawned_by": spawned_by,
-        "status": final_status,
-        "output": output,
-        "duration_seconds": start.elapsed().as_secs(),
-        "closed": closed,
-    });
+    let mut exec = |req: Request| send_request(req);
+    let result = wait::run_worker(&mut exec, &opts, &mut |pane_id, tmux| {
+        eprintln!("spawned pane {pane_id} (tmux: {})", tmux.unwrap_or("none"));
+    })?;
     println!("{}", pretty_json(&result));
     Ok(())
 }
