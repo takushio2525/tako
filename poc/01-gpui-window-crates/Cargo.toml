@@ -3,6 +3,7 @@ name = "gpui-window-crates"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "GPL-3.0-or-later"
 
 # Phase 0 検証スパイク: crates.io 版 gpui で最小ウィンドウが出るか
 [dependencies]

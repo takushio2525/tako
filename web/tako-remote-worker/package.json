@@ -2,6 +2,7 @@
   "name": "tako-remote-relay",
   "version": "0.2.1",
   "private": true,
+  "license": "GPL-3.0-or-later",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
