@@ -338,3 +338,9 @@
   上級者向け参考に格下げ）、orchestration.md 簡潔化、getting-started に setup 設定項目一覧、
   quickstart.md 新設。「設定は master に頼むだけ」の世界観へ統一
 - 関連: ブランチ `docs/orchestration-user-first` → PR squash merge（マージで自動デプロイ）
+
+## 2026-07-06（公開前セキュリティ・公開可否監査）
+- 全ブランチ 370 コミット + 現行を gitleaks / cargo audit / パターン grep で監査。秘匿情報ゼロ、
+  判定「条件付き OK」（GPL-3.0-or-later のまま公開が必須条件。Apache-2.0 化は GPL 依存で不可）。
+  レポート `reviews/2026-07-06_公開前セキュリティ監査.md` を main へ直接コミット（e37e585）、発見 7 件を Issue #75〜#81 に起票
+- 次: #75 方針確定 → #76/#77 削除 → #81 履歴の扱い決定 → public 化
