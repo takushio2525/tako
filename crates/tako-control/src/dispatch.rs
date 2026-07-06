@@ -1175,32 +1175,7 @@ pub fn dispatch(
                         )));
                     }
                     #[cfg(target_os = "macos")]
-                    {
-                        let posix = path.display().to_string();
-                        // 制御文字（0x00-0x1F, 0x7F）を含むパスは AppleScript インジェクション防止のため拒否
-                        if posix.bytes().any(|b| b <= 0x1F || b == 0x7F) {
-                            return Err(DispatchError::Operation(
-                                "パスに制御文字が含まれているため操作できません".to_string(),
-                            ));
-                        }
-                        let script = format!(
-                            "tell application \"Finder\" to delete (POSIX file \"{}\" as alias)",
-                            posix.replace('\\', "\\\\").replace('"', "\\\"")
-                        );
-                        let out = std::process::Command::new("osascript")
-                            .arg("-e")
-                            .arg(&script)
-                            .output()
-                            .map_err(|e| {
-                                DispatchError::Operation(format!("ゴミ箱への移動に失敗: {e}"))
-                            })?;
-                        if !out.status.success() {
-                            let msg = String::from_utf8_lossy(&out.stderr);
-                            return Err(DispatchError::Operation(format!(
-                                "ゴミ箱への移動に失敗: {msg}"
-                            )));
-                        }
-                    }
+                    trash_path_macos(&path).map_err(DispatchError::Operation)?;
                     #[cfg(not(target_os = "macos"))]
                     {
                         std::fs::remove_file(&path)
@@ -2608,6 +2583,32 @@ fn pane_master_suffix(workspace: &tako_core::Workspace, pane_id: PaneId) -> Opti
     })
 }
 
+/// パスを Finder 経由でゴミ箱へ移す（macOS）。
+///
+/// パスは AppleScript ソースへ文字列連結せず、`osascript` の引数（`on run argv` の
+/// `item 1 of argv`）として渡す。これにより、ファイル名に含まれる `"` `\` 改行などが
+/// スクリプトの構文に割り込む余地が構造的に消え、AppleScript インジェクションを防ぐ
+/// （エスケープの正しさに依存しない）。`Command::arg` は `OsStr` をそのまま `execve`
+/// へ渡すためシェルも経由しない。
+#[cfg(target_os = "macos")]
+fn trash_path_macos(path: &std::path::Path) -> Result<(), String> {
+    // argv 経由でパスを受け取るため、スクリプト本体にパスは一切現れない
+    const SCRIPT: &str = "on run argv\n\
+        tell application \"Finder\" to delete (POSIX file (item 1 of argv) as alias)\n\
+        end run";
+    let out = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(SCRIPT)
+        .arg(path)
+        .output()
+        .map_err(|e| format!("ゴミ箱への移動に失敗: {e}"))?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("ゴミ箱への移動に失敗: {msg}"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3584,5 +3585,67 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, DispatchError::TabNotFound(99999));
+    }
+
+    /// FileOp::Trash の argv 渡しがインジェクションされないことを、Finder を使わず
+    /// osascript の argv 挙動そのもので検証する（CI の macOS ランナーで決定的に通る）。
+    /// 悪意ある文字列を argv item 1 に渡しても、AppleScript の構文（`do shell script`）
+    /// として解釈されず、単なるデータとして扱われることを確認する。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trash_argvは悪意ある文字列をデータとして扱う() {
+        // インジェクションが成功すると作られてしまう副作用ファイル（cwd 相対 = パスに / を含めない）
+        let marker = std::env::temp_dir().join(format!("tako_trash_pwned_{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let marker_str = marker.display().to_string();
+        // " で文字列を閉じ do shell script を差し込もうとする典型的なインジェクション文字列
+        let evil = format!("x\" do shell script \"touch {marker_str}\" ignoring \"");
+
+        // trash_path_macos と同じ argv 渡し方式（Finder 部分だけ「argv をそのまま返す」に差し替え）
+        let out = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg("on run argv\nreturn item 1 of argv\nend run")
+            .arg(&evil)
+            .output()
+            .expect("osascript の実行に失敗");
+        assert!(out.status.success(), "osascript が失敗: {out:?}");
+
+        // データとしてそのまま返る = スクリプト構文に割り込んでいない
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("do shell script"),
+            "argv がデータとして扱われていない: {stdout:?}"
+        );
+        // 副作用ファイルが作られていない = インジェクション不成立
+        assert!(
+            !marker.exists(),
+            "AppleScript インジェクションで副作用ファイルが作られた: {marker_str}"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// 実ファイルの e2e: 改行・引用符・バックスラッシュを含む悪意あるファイル名でも
+    /// 安全にゴミ箱へ移動でき、かつインジェクションの副作用が起きないこと。
+    /// 実際に Finder を操作しゴミ箱へ移すため、GUI セッションのある手元で明示実行する。
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "Finder を操作しファイルをゴミ箱へ移すため手動確認用（cargo test -- --ignored）"]
+    fn trash_path_macosは悪意あるファイル名を安全に削除する() {
+        let dir = std::env::temp_dir().join(format!("tako_trash_e2e_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = std::env::temp_dir().join("tako_trash_e2e_pwned");
+        let _ = std::fs::remove_file(&marker);
+
+        // 改行 / " / \ / do shell script を含むファイル名（/ と NUL 以外は macOS で合法）
+        let evil_name = "ev\"il\n `do shell script` \\ .txt";
+        let evil = dir.join(evil_name);
+        std::fs::write(&evil, b"x").unwrap();
+        assert!(evil.exists(), "テストファイルが作れていない");
+
+        trash_path_macos(&evil).expect("ゴミ箱への移動に失敗");
+
+        assert!(!evil.exists(), "ファイルが削除されていない");
+        assert!(!marker.exists(), "インジェクションの副作用が発生した");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
