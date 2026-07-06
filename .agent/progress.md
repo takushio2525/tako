@@ -375,3 +375,9 @@
   tmux・cloudflared・git（任意）を検出し、用途説明 + brew 案内 + その場インストール（y/N）を追加。
   cloudflared は #89 を受けて対象化。`--check` にも同一覧を表示。docs の依存表も同期
 - 関連: PR #92 squash merge → `build-app.sh --install` で実機反映（3 経路の実バイナリ検証済み）
+
+## 2026-07-06（公開前条件の解消: #75 ライセンス統一 + #78 リレー認証 → 判定 OK）
+- #75: GPL-3.0-or-later へ完全統一（欠けていた 6 マニフェストに license 追加。PR #90）。
+  #78: リレー登録を端末シークレットで first-write-wins 保護 + 公共インスタンス明記 + worker テスト（PR #93）。
+  監査レポートの判定を「条件付き OK」→「OK」へ更新。残 OPEN は #79/#80（公開ブロッカーではない）
+- 次: public 化可能。本番 worker デプロイ（npm run deploy・wrangler 認証要）はユーザー作業
