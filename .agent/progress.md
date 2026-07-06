@@ -395,3 +395,11 @@
   MCP `tako_setup_changes`（52 ツール）+ pending-changes.md + system prompt 追従フロー
 - 検証: build / clippy(-D warnings) / fmt / test 全緑（362+）、セルフテスト既知 PDF 以外緑、CLI 実機 3 経路確認
 - 次: PR squash merge → `build-app.sh --install` で実機反映
+
+## 2026-07-06（#91: リモート接続の入口を tako-remote.pages.dev 固定 URL に一本化）
+- トンネル + リレー登録成功時の connect_url を Pages 固定 URL（machine パラメータ付き）へ切替。
+  トンネル直 URL は fallback_url で併記、LAN-only 落ちは CLI が明示警告（#89 の可視化に部分対応）、
+  status 用に tunnel state 永続化、PWA は pages.dev 配信時の自己 health スキップ + version 互換警告。
+  `scripts/deploy-pages.sh` 新設（release.sh --publish に組込み）で Pages へ実デプロイ済み
+- e2e: 実トンネル + 本番リレー + Pages PWA（別オリジン）で resolve → 接続 → ペイン一覧まで全 200 確認
+- 関連: PR #99 squash merge。リリースは master 側で別途
