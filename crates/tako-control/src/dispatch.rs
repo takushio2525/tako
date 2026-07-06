@@ -2037,14 +2037,11 @@ fn dispatch_orchestrator_worker_status(
     // idle 誤検知防止: サブエージェント完了の瞬間に claude agents --json が
     // 一時的に idle を返すことがある。末尾付近に ❯ プロンプトが
     // なければメインはまだ作業中なので busy に補正する
-    // （Claude TUI のフッター 4〜6 行を考慮して末尾 10 行をチェック）
+    // （判定は orchestrator::wait の完了監視ヒューリスティックと共通。#83）
     if status == "idle" {
-        let has_prompt = recent_output.as_ref().is_some_and(|out| {
-            out.lines()
-                .rev()
-                .take(10)
-                .any(|l| l.trim_start().starts_with('❯'))
-        });
+        let has_prompt = recent_output
+            .as_ref()
+            .is_some_and(|out| crate::orchestrator::wait::screen_looks_idle(out));
         if !has_prompt {
             status = "busy".to_string();
         }
@@ -2061,21 +2058,12 @@ fn dispatch_orchestrator_worker_status(
 
 /// worker が busy かどうかを画面出力で判定する。
 /// false negative より false positive を優先（殺すより残す方が安全）。
+/// 判定は orchestrator::wait の完了監視ヒューリスティックと共通（#83）
 fn is_worker_busy(host: &dyn ControlHost, target: PaneId) -> bool {
     let Some(session) = host.session(target) else {
         return true; // 画面取得不可 = busy 寄りに倒す
     };
-    let mut lines = session.visible_lines();
-    while lines.last().is_some_and(|l| l.is_empty()) {
-        lines.pop();
-    }
-    // フッター行（4〜6行）を考慮して末尾 10 行をチェック
-    let has_prompt = lines
-        .iter()
-        .rev()
-        .take(10)
-        .any(|l| l.trim_start().starts_with('❯'));
-    !has_prompt
+    !crate::orchestrator::wait::screen_looks_idle(&session.visible_lines().join("\n"))
 }
 
 fn shell_escape(s: &str) -> String {

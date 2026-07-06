@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use tako_core::PaneOrigin;
 
 use crate::ipc::IncomingRequest;
+use crate::orchestrator::wait;
 use crate::protocol::{Axis, Direction, Request};
 
 /// サーバーが既定で名乗る MCP プロトコルバージョン
@@ -1127,8 +1128,9 @@ fn exec_and_wrap(request: Request, session: &mut McpSession) -> Result<Value, (i
 }
 
 /// `tako_orchestrator_run` — spawn + 完了待ち + 出力取得 + close の合成操作。
-/// ポーリングループは MCP ハンドラスレッドで実行される（UI スレッドはブロックしない）。
-/// 各ステップは exec 経由で dispatch を呼ぶため、UI スレッドは短時間しか占有しない
+/// 本体は [`crate::orchestrator::wait::run_worker`]（CLI `tako orchestrator run` と共通。#83）。
+/// ポーリングは MCP ハンドラスレッドで実行される（UI スレッドはブロックしない。
+/// 各ステップは exec 経由で dispatch を呼ぶため、UI スレッドは短時間しか占有しない）
 fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i64, String)> {
     let map_err = |e: String| (-32602i64, e);
 
@@ -1165,170 +1167,27 @@ fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i6
     let model = str_arg(args, "model").map_err(map_err)?;
     let effort = str_arg(args, "effort").map_err(map_err)?;
 
-    // --- 1. Spawn ---
-    let spawn_req = Request::OrchestratorSpawn {
-        project: project.clone(),
-        prompt: prompt.clone(),
-        label: label.clone(),
+    let opts = wait::RunOptions {
+        project,
+        prompt,
+        label,
         model,
         effort,
         pane,
         tab,
+        timeout: std::time::Duration::from_secs(timeout_secs),
+        auto_close,
+        output_lines,
+        // claude 起動 + プロンプト送信を待つ（prompt_flow は 15〜20 秒かかる）
+        initial_delay: std::time::Duration::from_secs(20),
+        interval: std::time::Duration::from_secs(5),
     };
-    let spawn_result = (session.exec)(spawn_req).map_err(|e| (-32602, e))?;
-    let pane_id = spawn_result["pane_id"].as_u64().unwrap_or(0);
-    let spawned_by = spawn_result["spawned_by"].as_u64().unwrap_or(0);
-    let tmux_session = spawn_result["tmux_session"].as_str().map(String::from);
-
-    // --- 2. 完了待ちポーリング ---
-    // orchestrator_watch と同じ判定ロジック: OrchestratorWorkerStatus を繰り返し呼び、
-    // status + 端末出力パターンで idle/gone を判定する。
-    // session_id は spawn 直後には不明だが、dispatch 側で pane→session 自動解決する
-    let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(timeout_secs);
-    let interval = std::time::Duration::from_secs(5);
-    let mut idle_streak: u32 = 0;
-    let mut gone_streak: u32 = 0;
-    let mut final_status = "timeout".to_string();
-
-    // claude 起動 + プロンプト送信を待つ（prompt_flow は 15〜20 秒かかる）
-    std::thread::sleep(std::time::Duration::from_secs(20));
-
-    loop {
-        if start.elapsed() > timeout {
-            break;
-        }
-
-        let status_req = Request::OrchestratorWorkerStatus {
-            pane_id,
-            session_id: None,
-            tmux_session: tmux_session.clone(),
-        };
-
-        match (session.exec)(status_req) {
-            Ok(val) => {
-                let status = val["status"].as_str().unwrap_or("unknown");
-                let recent = val["recent_output"].as_str().unwrap_or("");
-                let source = val["status_source"].as_str().unwrap_or("screen");
-                let need_streak: u32 = if source == "screen" { 8 } else { 3 };
-
-                match status {
-                    "gone" => {
-                        gone_streak += 1;
-                        if gone_streak >= 2 {
-                            final_status = "error".to_string();
-                            break;
-                        }
-                    }
-                    "idle" => {
-                        gone_streak = 0;
-                        if screen_looks_busy(recent) {
-                            idle_streak = 0;
-                        } else {
-                            idle_streak += 1;
-                        }
-                    }
-                    "busy" => {
-                        gone_streak = 0;
-                        idle_streak = 0;
-                    }
-                    _ => {
-                        // unknown: 端末出力から推定
-                        gone_streak = 0;
-                        if screen_looks_busy(recent) {
-                            idle_streak = 0;
-                        } else if screen_looks_idle(recent) {
-                            idle_streak += 1;
-                        } else {
-                            idle_streak = 0;
-                        }
-                    }
-                }
-
-                if idle_streak >= need_streak {
-                    final_status = "completed".to_string();
-                    break;
-                }
-            }
-            Err(_) => {
-                gone_streak += 1;
-                if gone_streak >= 2 {
-                    final_status = "error".to_string();
-                    break;
-                }
-            }
-        }
-
-        std::thread::sleep(interval);
-    }
-
-    // --- 3. 出力取得 ---
-    let output = {
-        let read_req = Request::Read {
-            pane: Some(pane_id),
-            lines: Some(output_lines),
-            tmux_session: tmux_session.clone(),
-        };
-        match (session.exec)(read_req) {
-            Ok(result) => result["content"].as_str().unwrap_or("").to_string(),
-            Err(_) => String::new(),
-        }
-    };
-
-    // --- 4. 自動 close（orchestrator run の完了後なので force: true）---
-    let closed = if auto_close {
-        let close_req = Request::Close {
-            pane: Some(pane_id),
-            force: true,
-        };
-        (session.exec)(close_req).is_ok()
-    } else {
-        false
-    };
-
-    let result = json!({
-        "pane_id": pane_id,
-        "spawned_by": spawned_by,
-        "status": final_status,
-        "output": output,
-        "duration_seconds": start.elapsed().as_secs(),
-        "closed": closed,
-    });
+    let result =
+        wait::run_worker(&mut *session.exec, &opts, &mut |_, _| {}).map_err(|e| (-32602, e))?;
     Ok(json!({
         "content": [{ "type": "text", "text": result.to_string() }],
         "isError": false,
     }))
-}
-
-/// 端末出力が busy を示すパターンを含むか（末尾 5 行に限定）
-fn screen_looks_busy(output: &str) -> bool {
-    tail_lines(output, 5).iter().any(|l| {
-        l.contains("esc to interrupt")
-            || l.contains("ing… (")
-            || l.contains("Thinking")
-            || l.contains("Reading")
-            || l.contains("Editing")
-            || l.contains("Running")
-            || l.contains("Writing")
-            || l.contains("Searching")
-    })
-}
-
-/// 端末出力が idle（❯ プロンプト）を示すか（末尾 10 行でチェック）
-fn screen_looks_idle(output: &str) -> bool {
-    tail_lines(output, 10)
-        .iter()
-        .any(|l| l.trim_start().starts_with('❯'))
-}
-
-/// 空行を除いた末尾 N 行を返す
-fn tail_lines(output: &str, n: usize) -> Vec<&str> {
-    output
-        .lines()
-        .rev()
-        .filter(|l| !l.trim().is_empty())
-        .take(n)
-        .collect()
 }
 
 /// ツール呼び出しを操作プロトコル（[`Request`]）へ写す。エラーは引数バリデーション失敗
