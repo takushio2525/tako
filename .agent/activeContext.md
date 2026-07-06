@@ -4,17 +4,16 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-06・docs オーケストレーション解説のユーザー視点刷新）
+## 現在の対象（2026-07-06・レビュー起点の修正: #82/#83 完了、残 Issue #84〜#86）
 
-PR #73（docs 刷新）マージ後のユーザーレビューを反映し、オーケストレーション関連を
-「人間は設定を書かず、master に日本語で頼むだけ」の世界観に書き直した。
-ブランチ `docs/orchestration-user-first` → PR → squash merge（docs は公開配信中のため PR 経由）。
+コードベース全体レビュー（`reviews/2026-07-06_構造・MCPリファクタ提案.md`、提案 17 件）を実施し、
+高優先度 #82〜#86 を起票。うち #82（orchestrator run の output 常時空バグ）+
+#83（完了待ちポーリングの MCP/CLI 二重実装）を PR #87 で修正・squash merge 済み
+（`tako-control::orchestrator::wait` 新設、テスト 9 本追加）。`build-app.sh --install` で実機反映済み。
 
-- orchestrator.md → 「tako master 実践ガイド」（会話例・つまずき・仕組みは格下げ）
-- orchestration.md → 魅力紹介に簡潔化（内部手順を削除）
-- getting-started: tako setup の設定項目一覧（実装 setup.rs + system-prompt.md から起こした）
-- getting-started/quickstart.md 新設（setup → master → 話しかける最短 3 ステップ）
-- ビルド緑 + dist 全内部リンク/アンカー機械チェック済み
+- 残 Issue: #84（MCP HTTP 直列処理）/ #85（タブ退避の CLI/MCP 対応）/ #86（ControlHost 分割）
+- 公開監査（別セッション）: #75〜#81 起票済み、#76/#77 は削除対応済み
+- docs 刷新（PR #73/#74）はマージ済み・自動デプロイ済み
 
 ## v0.2.8 の内容
 

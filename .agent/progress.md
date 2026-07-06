@@ -356,3 +356,10 @@
 - `.playwright-mcp/`（20 点）と `.wrangler/cache/` を index から削除（ローカル保持）、
   `pwa-*.png` 2 点を完全削除、.gitignore に `.playwright-mcp/` `.wrangler/` を追加
 - 履歴上の個人情報は「受容」で決定（#81 close。実名は author 名で公開前提・SHA 保持を優先）
+
+## 2026-07-06（#82 + #83: orchestrator run の output バグ修正 + 完了待ちポーリング一本化）
+- #82（Read 応答の text を content で参照し output 常時空）を修正、#83 で MCP / CLI に
+  二重実装だった完了待ちポーリングを `tako-control::orchestrator::wait` へ一本化（単体テスト 9 本追加）。
+  CLI のみだった tako 再起動時の gone 誤検知防止が MCP 版にも入り挙動統一。全テスト 351 緑
+- 関連: PR #87 squash merge（`25ed398`）→ `build-app.sh --install` で実機反映
+- 次: 実機で tako_orchestrator_run の output 動作確認（ユーザー）。レビュー残 Issue は #84〜#86
