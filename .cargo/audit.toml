@@ -1,0 +1,23 @@
+# cargo-audit 設定。
+#
+# tako の配布バイナリ（macOS / Windows）に影響しない既知の advisory を、理由付きで
+# ignore する。CI で `cargo audit` を回す際に、非該当・対処不能の advisory で
+# ビルドを落とさないため。ignore した項目は対応する Issue で棚卸しを追跡する。
+#
+# cargo-audit はリポジトリルートの .cargo/audit.toml を自動で読む（v0.22.2 で実測確認）。
+# CI でもリポジトリルートで `cargo audit` を実行すれば、この ignore が効く（追加の引数は不要）。
+
+[advisories]
+ignore = [
+    # quick-xml の DoS 2 件（#79）:
+    #   RUSTSEC-2026-0194 = 開始タグの重複属性チェックが二次時間
+    #   RUSTSEC-2026-0195 = namespace 宣言のメモリ枯渇（NsReader）
+    # 解は quick-xml >= 0.41.0 だが、依存元が旧メジャーに固定しており cargo update では上げられない:
+    #   - xcb 1.7.0        が quick-xml "0.30"（X11・Linux 限定。scap 経由）
+    #   - zbus_xml         が quick-xml "0.39"（D-Bus/AT-SPI・Linux 限定。accesskit_unix → gpui_linux 経由）
+    # いずれも GPUI(Zed) のトランジティブ依存で、macOS / Windows の配布バイナリには含まれない
+    # （cargo tree --target aarch64-apple-darwin / x86_64-pc-windows-msvc で不在を確認済み）。
+    # GPUI 側が scap / accesskit を更新した rev に上げれば解消する。詳細と代替案は Issue #79。
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
