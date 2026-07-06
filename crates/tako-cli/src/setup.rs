@@ -1,6 +1,7 @@
 //! `tako setup` — 対話式セットアップコマンド。
 //!
-//! claude コマンドの存在確認 → MCP 登録確認 → リソースファイル書き出し →
+//! 依存ツールチェック（claude 必須 / tmux・cloudflared・git 任意。未導入は brew で
+//! その場インストール可）→ MCP 登録確認 → リソースファイル書き出し →
 //! config.yaml の初回/2回目判定 → claude を setup cwd で起動する。
 //! IPC 不要（tako アプリ未起動でも動作）。
 
@@ -111,13 +112,17 @@ fn save_config(config: &SetupConfig) -> Result<(), String> {
 
 // --- 環境チェック ---
 
-fn find_claude() -> Option<String> {
-    let shell = std::env::var("SHELL")
+fn login_shell() -> String {
+    std::env::var("SHELL")
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/bin/sh".into());
-    let output = std::process::Command::new(&shell)
-        .args(["-l", "-c", "which claude"])
+        .unwrap_or_else(|| "/bin/sh".into())
+}
+
+/// ログインシェル経由でコマンドを探す（GUI 起動や Homebrew の PATH 差異に対応）
+fn find_command(name: &str) -> Option<String> {
+    let output = std::process::Command::new(login_shell())
+        .args(["-l", "-c", &format!("command -v {name}")])
         .output()
         .ok()?;
     if output.status.success() {
@@ -129,12 +134,142 @@ fn find_claude() -> Option<String> {
     None
 }
 
+// --- 依存ツールチェック ---
+
+/// tako が実行時に使う外部コマンドの定義
+struct ExternalDep {
+    /// コマンド名
+    bin: &'static str,
+    /// 必須依存か（false = 任意。無くても tako 自体は動く）
+    required: bool,
+    /// 影響する機能の説明
+    purpose: &'static str,
+    /// brew でインストールする場合のパッケージ名（None = brew 非対応）
+    brew_pkg: Option<&'static str>,
+    /// brew 以外の導入案内
+    install_hint: &'static str,
+}
+
+const EXTERNAL_DEPS: &[ExternalDep] = &[
+    ExternalDep {
+        bin: "claude",
+        required: true,
+        purpose: "setup の対話・tako master・オーケストレーター・タブの自動リネーム",
+        brew_pkg: None,
+        install_hint: "https://docs.anthropic.com/en/docs/claude-code",
+    },
+    ExternalDep {
+        bin: "tmux",
+        required: false,
+        purpose: "リモート接続（tako remote）・再起動時のセッション完全復元・オーケストレーターの worker 管理",
+        brew_pkg: Some("tmux"),
+        install_hint: "https://github.com/tmux/tmux/wiki/Installing",
+    },
+    ExternalDep {
+        bin: "cloudflared",
+        required: false,
+        purpose: "リモート接続（tako remote）のトンネル公開。未導入だと同一 LAN 内限定の URL になります",
+        brew_pkg: Some("cloudflared"),
+        install_hint: "https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/",
+    },
+    ExternalDep {
+        bin: "git",
+        required: false,
+        purpose: "git パネル（ブランチ・コミットグラフ・diff 表示）",
+        brew_pkg: Some("git"),
+        install_hint: "xcode-select --install でも導入できます",
+    },
+];
+
+/// 依存ツールのチェック段階。検出結果を ✓ / △ / ✗ で表示し、
+/// interactive = true なら未導入の依存をその場で brew インストールできる。
+/// 戻り値はチェック後も欠けている必須依存のコマンド名一覧。
+fn run_dependency_check(interactive: bool) -> Vec<&'static str> {
+    let brew = find_command("brew");
+    let mut missing_required = Vec::new();
+    for dep in EXTERNAL_DEPS {
+        if let Some(path) = find_command(dep.bin) {
+            eprintln!("  ✓ {}: {path}", dep.bin);
+            continue;
+        }
+        let (mark, kind) = if dep.required {
+            ("✗", "必須")
+        } else {
+            ("△", "任意")
+        };
+        eprintln!("  {mark} {}: 見つかりません（{kind}）", dep.bin);
+        eprintln!("      用途: {}", dep.purpose);
+        if !dep.required {
+            eprintln!("      無くても tako 自体は動きますが、上記の機能が使えません");
+        }
+        let mut installed = false;
+        match (dep.brew_pkg, brew.as_deref()) {
+            (Some(pkg), Some(brew_bin)) => {
+                eprintln!("      導入方法: brew install {pkg}");
+                if interactive {
+                    installed = offer_brew_install(pkg, brew_bin);
+                }
+            }
+            (Some(pkg), None) => {
+                eprintln!(
+                    "      導入方法: brew install {pkg}（要 Homebrew）/ {}",
+                    dep.install_hint
+                );
+            }
+            (None, _) => {
+                eprintln!("      導入方法: {}", dep.install_hint);
+            }
+        }
+        if installed {
+            match find_command(dep.bin) {
+                Some(path) => eprintln!("  ✓ {}: {path}（インストール完了）", dep.bin),
+                None => {
+                    eprintln!(
+                        "  ⚠ {}: インストール後も検出できません。シェルを開き直してから再実行してください",
+                        dep.bin
+                    );
+                    if dep.required {
+                        missing_required.push(dep.bin);
+                    }
+                }
+            }
+        } else if dep.required {
+            missing_required.push(dep.bin);
+        }
+    }
+    missing_required
+}
+
+/// 未導入の依存をその場で brew インストールするか確認して実行する。
+/// インストールが成功したら true
+fn offer_brew_install(pkg: &str, brew_bin: &str) -> bool {
+    eprint!("      今すぐ brew install {pkg} を実行しますか？ [y/N]: ");
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+    let answer = input.trim().to_ascii_lowercase();
+    if answer != "y" && answer != "yes" {
+        eprintln!("      スキップしました（後から brew install {pkg} で導入できます）");
+        return false;
+    }
+    let status = std::process::Command::new(brew_bin)
+        .args(["install", pkg])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status();
+    match status {
+        Ok(s) if s.success() => true,
+        _ => {
+            eprintln!("      ⚠ brew install {pkg} が失敗しました。手動で導入してください");
+            false
+        }
+    }
+}
+
 fn check_mcp_registered() -> bool {
-    let shell = std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/bin/sh".into());
-    let output = std::process::Command::new(&shell)
+    let output = std::process::Command::new(login_shell())
         .args(["-l", "-c", "claude mcp list 2>/dev/null"])
         .output();
     match output {
@@ -221,13 +356,8 @@ pub fn run_check() -> Result<(), String> {
     eprintln!("tako セットアップ 環境チェック");
     eprintln!("─────────────────────────────");
 
-    // claude コマンド
-    match find_claude() {
-        Some(path) => eprintln!("  ✓ claude: {path}"),
-        None => eprintln!(
-            "  ✗ claude: 見つかりません（https://docs.anthropic.com/en/docs/claude-code）"
-        ),
-    }
+    // 依存ツール（claude / tmux / git。--check では表示のみ）
+    let _ = run_dependency_check(false);
 
     // MCP 登録
     if check_mcp_registered() {
@@ -294,13 +424,15 @@ pub fn run_setup() -> Result<(), String> {
     eprintln!("═════════════════");
     eprintln!();
 
-    // 1. claude コマンドの存在確認
-    let claude_path = find_claude().ok_or(
-        "claude コマンドが見つかりません。\n\
-         Claude Code をインストールしてください:\n  \
-         https://docs.anthropic.com/en/docs/claude-code",
-    )?;
-    eprintln!("  ✓ claude: {claude_path}");
+    // 1. 依存ツールのチェック（必須 = claude、任意 = tmux / git。未導入はその場インストール可）
+    let missing = run_dependency_check(true);
+    if !missing.is_empty() {
+        return Err(format!(
+            "必須の依存ツールが不足しています: {}。\n\
+             導入後に tako setup を再実行してください",
+            missing.join(", ")
+        ));
+    }
 
     // 2. MCP 登録確認
     if !check_mcp_registered() {
@@ -351,10 +483,7 @@ pub fn run_setup() -> Result<(), String> {
     eprintln!("─────────────────────────────────────────────────────");
     eprintln!();
 
-    let shell = std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/bin/sh".into());
+    let shell = login_shell();
 
     let greeting = if is_first_run {
         "tako のセットアップを始めます。いくつか質問に答えてください。"
@@ -660,6 +789,34 @@ mod tests {
         // モデル設定キーはテンプレに含まれない（profiles/*.yaml が正。Issue #27）
         assert!(!CONFIG_DEFAULT.contains("master_model"));
         assert!(!CONFIG_DEFAULT.contains("worker_model"));
+    }
+
+    #[test]
+    fn external_deps_table_is_consistent() {
+        // claude は必須依存として先頭に置く（setup の対話自体が claude を使うため）
+        assert_eq!(EXTERNAL_DEPS[0].bin, "claude");
+        assert!(EXTERNAL_DEPS[0].required);
+        // tmux は任意依存（remote / 永続化 / オーケストレーターが対象機能）
+        let tmux = EXTERNAL_DEPS.iter().find(|d| d.bin == "tmux").unwrap();
+        assert!(!tmux.required);
+        assert!(tmux.purpose.contains("tako remote"));
+        assert_eq!(tmux.brew_pkg, Some("tmux"));
+        // cloudflared は任意依存（トンネル公開。未導入だと LAN 限定 URL = #89）
+        let cf = EXTERNAL_DEPS
+            .iter()
+            .find(|d| d.bin == "cloudflared")
+            .unwrap();
+        assert!(!cf.required);
+        assert_eq!(cf.brew_pkg, Some("cloudflared"));
+        // 全依存に用途説明と導入案内がある
+        for dep in EXTERNAL_DEPS {
+            assert!(!dep.purpose.is_empty(), "{} の purpose が空", dep.bin);
+            assert!(
+                !dep.install_hint.is_empty(),
+                "{} の install_hint が空",
+                dep.bin
+            );
+        }
     }
 
     #[test]
