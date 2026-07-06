@@ -1,61 +1,36 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="-30 0 380 390">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="90 150 844 770">
+  <!-- アプリアイコン（assets/icon/icon-a.svg）のタコ絵柄をそのまま抽出した透明背景版。
+       形・色・座標は icon-a.svg と同一に保つこと（Issue #71） -->
   <defs>
-    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+    <linearGradient id="m-octo" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#ff9eb2"/>
       <stop offset="1" stop-color="#ef5e8e"/>
     </linearGradient>
-    <linearGradient id="tentacle" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#ef5e8e"/>
-      <stop offset="1" stop-color="#e04878"/>
-    </linearGradient>
   </defs>
-
-  <!-- 外側の触手（左右カール・8本足のうち最外） -->
-  <path d="M80,215 C30,280 -10,310 -18,265" fill="none" stroke="url(#tentacle)"
-        stroke-width="20" stroke-linecap="round" opacity="0.85"/>
-  <path d="M240,215 C290,280 330,310 338,265" fill="none" stroke="url(#tentacle)"
-        stroke-width="20" stroke-linecap="round" opacity="0.85"/>
-
-  <!-- 外側の触手（内寄り・8本足のうち2番目） -->
-  <path d="M95,228 C60,290 30,330 25,345" fill="none" stroke="url(#tentacle)"
-        stroke-width="17" stroke-linecap="round" opacity="0.75"/>
-  <path d="M225,228 C260,290 290,330 295,345" fill="none" stroke="url(#tentacle)"
-        stroke-width="17" stroke-linecap="round" opacity="0.75"/>
-
-  <!-- 中央の触手（下に垂れる・8本足のうち中央4本） -->
-  <path d="M120,240 C115,300 100,345 92,362" fill="none" stroke="url(#tentacle)"
-        stroke-width="16" stroke-linecap="round" opacity="0.7"/>
-  <path d="M147,246 C145,310 138,350 132,370" fill="none" stroke="url(#tentacle)"
-        stroke-width="16" stroke-linecap="round" opacity="0.7"/>
-  <path d="M173,246 C175,310 182,350 188,370" fill="none" stroke="url(#tentacle)"
-        stroke-width="16" stroke-linecap="round" opacity="0.7"/>
-  <path d="M200,240 C205,300 220,345 228,362" fill="none" stroke="url(#tentacle)"
-        stroke-width="16" stroke-linecap="round" opacity="0.7"/>
-
-  <!-- 頭 + 胴体（スカラップ下縁） -->
-  <path d="M75,150 A85,85 0 0 1 245,150 L245,225
-           a18,18 0 0 1 -36,0 a18,18 0 0 1 -36,0 a18,18 0 0 1 -36,0
-           a18,18 0 0 1 -36,0 a18,18 0 0 1 -36,0 Z"
-        fill="url(#body)"/>
-
-  <!-- 頭頂のハイライト -->
-  <ellipse cx="140" cy="105" rx="40" ry="20" fill="#ffb8c8" opacity="0.4"/>
-
-  <!-- 目（左） -->
-  <ellipse cx="130" cy="160" rx="20" ry="22" fill="#ffffff"/>
-  <circle cx="134" cy="166" r="10" fill="#27212e"/>
-  <circle cx="138" cy="160" r="4" fill="#ffffff"/>
-
-  <!-- 目（右） -->
-  <ellipse cx="190" cy="160" rx="20" ry="22" fill="#ffffff"/>
-  <circle cx="186" cy="166" r="10" fill="#27212e"/>
-  <circle cx="190" cy="160" r="4" fill="#ffffff"/>
-
-  <!-- 頬 -->
-  <ellipse cx="100" cy="190" rx="14" ry="9" fill="#ffc2cf" opacity="0.75"/>
-  <ellipse cx="220" cy="190" rx="14" ry="9" fill="#ffc2cf" opacity="0.75"/>
-
-  <!-- 口 -->
-  <path d="M145,195 q15,14 30,0" fill="none" stroke="#b03a64"
-        stroke-width="5" stroke-linecap="round"/>
+  <!-- 外側の触手カール（左右） -->
+  <path d="M330,520 C260,630 185,645 152,580" fill="none" stroke="#ef5e8e"
+        stroke-width="62" stroke-linecap="round"/>
+  <path d="M694,520 C764,630 839,645 872,580" fill="none" stroke="#ef5e8e"
+        stroke-width="62" stroke-linecap="round"/>
+  <!-- 頭 + 触手フリル（下縁スカラップ） -->
+  <path d="M297,400 A215,215 0 0 1 727,400 L727,565
+           a43,43 0 0 1 -86,0 a43,43 0 0 1 -86,0 a43,43 0 0 1 -86,0
+           a43,43 0 0 1 -86,0 a43,43 0 0 1 -86,0 Z"
+        fill="url(#m-octo)"/>
+  <!-- 目 -->
+  <circle cx="432" cy="430" r="48" fill="#ffffff"/>
+  <circle cx="592" cy="430" r="48" fill="#ffffff"/>
+  <circle cx="440" cy="438" r="22" fill="#27212e"/>
+  <circle cx="584" cy="438" r="22" fill="#27212e"/>
+  <circle cx="448" cy="428" r="8" fill="#ffffff"/>
+  <circle cx="592" cy="428" r="8" fill="#ffffff"/>
+  <!-- 頬と口 -->
+  <ellipse cx="362" cy="498" rx="34" ry="22" fill="#ffc2cf" opacity="0.85"/>
+  <ellipse cx="662" cy="498" rx="34" ry="22" fill="#ffc2cf" opacity="0.85"/>
+  <path d="M472,506 q40,34 80,0" fill="none" stroke="#b03a64"
+        stroke-width="16" stroke-linecap="round"/>
+  <!-- プロンプト >_ -->
+  <path d="M384,736 L474,800 L384,864" fill="none" stroke="#4ade80"
+        stroke-width="54" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="524" y="836" width="132" height="46" rx="12" fill="#4ade80"/>
 </svg>
