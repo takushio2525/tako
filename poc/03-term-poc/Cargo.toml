@@ -3,6 +3,7 @@ name = "term-poc"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "GPL-3.0-or-later"
 
 # Phase 0 検証スパイク (b): alacritty_terminal + PTY + GPUI の最小ターミナル
 # gpui は本実装で採用予定の「zed git rev 固定」版を使う（poc/02 と同 rev）

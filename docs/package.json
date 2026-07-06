@@ -3,6 +3,7 @@
   "type": "module",
   "version": "0.0.1",
   "private": true,
+  "license": "GPL-3.0-or-later",
   "description": "tako 公式ドキュメントサイト",
   "scripts": {
     "dev": "astro dev",
