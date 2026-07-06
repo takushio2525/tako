@@ -1269,8 +1269,9 @@ fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i6
             lines: Some(output_lines),
             tmux_session: tmux_session.clone(),
         };
+        // dispatch の Read 応答は {"pane", "text"}（#82: 旧実装は "content" を読んでいて常に空だった）
         match (session.exec)(read_req) {
-            Ok(result) => result["content"].as_str().unwrap_or("").to_string(),
+            Ok(result) => result["text"].as_str().unwrap_or("").to_string(),
             Err(_) => String::new(),
         }
     };

@@ -1433,14 +1433,14 @@ fn orchestrator_run(
         std::thread::sleep(interval);
     }
 
-    // 3. 出力取得
+    // 3. 出力取得（dispatch の Read 応答は {"pane", "text"}。#82: 旧実装は "content" で常に空）
     let output = send_request(Request::Read {
         pane: Some(pane_id),
         lines: Some(output_lines),
         tmux_session: tmux_session.clone(),
     })
     .ok()
-    .and_then(|v| v["content"].as_str().map(String::from))
+    .and_then(|v| v["text"].as_str().map(String::from))
     .unwrap_or_default();
 
     // 4. 自動 close（orchestrator run の完了後なので force: true）
