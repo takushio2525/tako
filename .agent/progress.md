@@ -381,3 +381,9 @@
   #78: リレー登録を端末シークレットで first-write-wins 保護 + 公共インスタンス明記 + worker テスト（PR #93）。
   監査レポートの判定を「条件付き OK」→「OK」へ更新。残 OPEN は #79/#80（公開ブロッカーではない）
 - 次: public 化可能。本番 worker デプロイ（npm run deploy・wrangler 認証要）はユーザー作業
+
+## 2026-07-06（#78 本番デプロイ + #80 Trash argv 化 — 監査由来タスク完了）
+- #78 リレー worker を本番デプロイ（version 5acac8f5）、稼働中インスタンスで別 secret/secret 無しの
+  上書きが 403 になることを実地検証。#80 FileOp::Trash を argv 渡し化し AppleScript インジェクションを
+  構造排除（PR #96、決定的テスト + e2e #[ignore]）。#79 は cargo update 不可を確認しコメントのみ
+- 関連コミット: `d24cf55`（#96）。#79 は GPUI 依存更新待ち・macOS/Win 非配布のため OPEN 継続
