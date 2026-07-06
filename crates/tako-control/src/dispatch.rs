@@ -1552,6 +1552,12 @@ pub fn dispatch(
                 ))),
             }
         }
+
+        Request::SetupChanges => {
+            // 読み取り専用・プロセス内完結（アプリ状態に依存しない）。
+            // 追従の適用は `tako setup` の対話フロー側の責務（Issue #94）
+            crate::setup::changes_status().map_err(DispatchError::Operation)
+        }
     }
 }
 

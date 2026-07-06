@@ -2,11 +2,16 @@
 //!
 //! 依存ツールチェック（claude 必須 / tmux・cloudflared・git 任意。未導入は brew で
 //! その場インストール可）→ MCP 登録確認 → リソースファイル書き出し →
-//! config.yaml の初回/2回目判定 → claude を setup cwd で起動する。
-//! IPC 不要（tako アプリ未起動でも動作）。
+//! config.yaml の初回/2回目判定 + アップデート追従（Issue #94）→
+//! claude を setup cwd で起動する。IPC 不要（tako アプリ未起動でも動作）。
+//!
+//! config.yaml のスキーマと setup changelog は `tako_control::setup` にある
+//! （MCP `tako_setup_changes` と共有。二重実装を作らない）。
 
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use tako_control::setup::{
+    load_config, pending_changes, save_config, ChangeKind, SetupChange, CHANGES_YAML,
+};
 
 // --- バイナリ埋め込みリソース ---
 
@@ -25,48 +30,6 @@ const TPL_05_PROPOSAL: &str =
     include_str!("../../../resources/setup/templates/sections/05-proposal-quality.md");
 const CONFIG_DEFAULT: &str = include_str!("../../../resources/setup/templates/config-default.yaml");
 
-// --- config.yaml のスキーマ ---
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SetupConfig {
-    #[serde(default)]
-    pub orchestrator: OrchestratorConfig,
-    #[serde(default)]
-    pub setup: SetupState,
-}
-
-/// config.yaml の orchestrator セクション。
-/// モデル・effort は master が一切参照しないため、ここには置かない（Issue #27 で廃止。
-/// 起動設定の正は profiles/*.yaml。旧ファイルに残る master_model 等のキーは無視される）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrchestratorConfig {
-    #[serde(default = "default_true")]
-    pub auto_close: bool,
-    #[serde(default = "default_true")]
-    pub auto_push: bool,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SetupState {
-    #[serde(default)]
-    pub completed: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completed_at: Option<String>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl Default for OrchestratorConfig {
-    fn default() -> Self {
-        Self {
-            auto_close: true,
-            auto_push: true,
-        }
-    }
-}
-
 // --- パスユーティリティ ---
 
 fn home_dir() -> Option<PathBuf> {
@@ -80,34 +43,6 @@ fn setup_dir() -> Result<PathBuf, String> {
     home_dir()
         .map(|h| h.join("Library/Application Support/tako/setup"))
         .ok_or_else(|| "ホームディレクトリが取得できない（$HOME 未設定）".into())
-}
-
-fn config_yaml_path() -> Result<PathBuf, String> {
-    home_dir()
-        .map(|h| h.join("Library/Application Support/tako/orchestrator/config.yaml"))
-        .ok_or_else(|| "ホームディレクトリが取得できない（$HOME 未設定）".into())
-}
-
-// --- config.yaml の読み書き ---
-
-fn load_config() -> Result<SetupConfig, String> {
-    let path = config_yaml_path()?;
-    if !path.is_file() {
-        return Ok(SetupConfig::default());
-    }
-    let content =
-        std::fs::read_to_string(&path).map_err(|e| format!("config.yaml の読み取りに失敗: {e}"))?;
-    serde_yaml::from_str(&content).map_err(|e| format!("config.yaml のパースに失敗: {e}"))
-}
-
-fn save_config(config: &SetupConfig) -> Result<(), String> {
-    let path = config_yaml_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
-    }
-    let content =
-        serde_yaml::to_string(config).map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
-    std::fs::write(&path, content).map_err(|e| format!("config.yaml の書き込みに失敗: {e}"))
 }
 
 // --- 環境チェック ---
@@ -346,7 +281,52 @@ fn write_all_resources(setup_dir: &Path) -> Result<(), String> {
         TPL_05_PROPOSAL,
     )?;
     write_resource(setup_dir, "templates/config-default.yaml", CONFIG_DEFAULT)?;
+    // setup changelog の全履歴（setup エージェントが Read できるように毎回最新を展開）
+    write_resource(setup_dir, "changes.yaml", CHANGES_YAML)?;
     Ok(())
+}
+
+// --- アップデート追従（Issue #94） ---
+
+/// pending-changes.md のパス（setup ディレクトリ直下。setup エージェントが Read する）
+fn pending_changes_path(setup_dir: &Path) -> PathBuf {
+    setup_dir.join("pending-changes.md")
+}
+
+/// 未適用の変更一覧を CLI に表示する
+fn print_pending_changes(pending: &[SetupChange], applied_revision: u32) {
+    eprintln!(
+        "  ℹ 前回のセットアップ（rev {applied_revision}）以降、アップデートで setup に {} 件の変更が入っています:",
+        pending.len()
+    );
+    for change in pending {
+        let kind = match change.kind {
+            ChangeKind::Auto => "自動適用",
+            ChangeKind::Guided => "対話で確認",
+        };
+        eprintln!(
+            "      [rev {} / v{} / {kind}] {}",
+            change.revision, change.version, change.title
+        );
+    }
+}
+
+/// 未適用の変更に応じて pending-changes.md を書き出す / 追従不要なら消す（stale 防止）
+fn sync_pending_changes_file(
+    setup_dir: &Path,
+    pending: &[SetupChange],
+    applied_revision: u32,
+) -> Result<(), String> {
+    let path = pending_changes_path(setup_dir);
+    if pending.is_empty() {
+        if path.is_file() {
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("pending-changes.md の削除に失敗: {e}"))?;
+        }
+        return Ok(());
+    }
+    let md = tako_control::setup::render_pending_markdown(pending, applied_revision);
+    std::fs::write(&path, md).map_err(|e| format!("pending-changes.md の書き出しに失敗: {e}"))
 }
 
 // --- メインエントリ ---
@@ -367,7 +347,7 @@ pub fn run_check() -> Result<(), String> {
     }
 
     // config.yaml
-    let config_path = config_yaml_path()?;
+    let config_path = tako_control::setup::config_yaml_path()?;
     if config_path.is_file() {
         let config = load_config()?;
         if config.setup.completed {
@@ -375,6 +355,19 @@ pub fn run_check() -> Result<(), String> {
                 "  ✓ セットアップ: 完了済み ({})",
                 config.setup.completed_at.as_deref().unwrap_or("日時不明")
             );
+            // アップデート追従状況（Issue #94）
+            let pending = pending_changes(config.setup.applied_revision)?;
+            if pending.is_empty() {
+                eprintln!(
+                    "  ✓ アップデート追従: 最新（rev {}）",
+                    config.setup.applied_revision
+                );
+            } else {
+                eprintln!(
+                    "  △ アップデート追従: 未適用の setup 変更が {} 件（tako setup --changes で詳細）",
+                    pending.len()
+                );
+            }
         } else {
             eprintln!("  △ セットアップ: 未完了");
         }
@@ -418,6 +411,60 @@ pub fn run_reset() -> Result<(), String> {
     Ok(())
 }
 
+/// `tako setup --changes` — アップデート追従状況の表示（Issue #94）。
+/// MCP `tako_setup_changes` と同じ照会（`--json` で同一ペイロードを出力）
+pub fn run_changes(json: bool) -> Result<(), String> {
+    if json {
+        let status = tako_control::setup::changes_status()?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status).map_err(|e| format!("JSON 変換に失敗: {e}"))?
+        );
+        return Ok(());
+    }
+    let config = load_config()?;
+    let current = tako_control::setup::current_revision()?;
+    let applied = config.setup.applied_revision;
+    eprintln!("tako setup アップデート追従状況");
+    eprintln!("─────────────────────────────");
+    eprintln!(
+        "  現在の setup リビジョン: {current}（tako v{}）",
+        env!("CARGO_PKG_VERSION")
+    );
+    if !config.setup.completed {
+        eprintln!("  セットアップ: 未実施（tako setup を実行すると最新の設定で導入されます）");
+        return Ok(());
+    }
+    match &config.setup.applied_version {
+        Some(v) => eprintln!("  適用済みリビジョン: {applied}（tako v{v} で setup 実行）"),
+        None => eprintln!("  適用済みリビジョン: {applied}"),
+    }
+    let pending = pending_changes(applied)?;
+    if pending.is_empty() {
+        eprintln!("  ✓ 最新です。追従が必要な変更はありません");
+        return Ok(());
+    }
+    eprintln!("  未適用の変更: {} 件", pending.len());
+    eprintln!();
+    for change in &pending {
+        let kind = match change.kind {
+            ChangeKind::Auto => "auto（setup 再実行で自動適用）",
+            ChangeKind::Guided => "guided（setup の対話で確認・適用）",
+        };
+        eprintln!(
+            "  [rev {} / v{} / {}] {}",
+            change.revision, change.version, change.date, change.title
+        );
+        eprintln!("      区分: {kind}");
+        for line in change.description.lines() {
+            eprintln!("      {line}");
+        }
+        eprintln!();
+    }
+    eprintln!("  `tako setup` を実行すると追従できます");
+    Ok(())
+}
+
 /// `tako setup` — メインのセットアップフロー
 pub fn run_setup() -> Result<(), String> {
     eprintln!("tako セットアップ");
@@ -457,6 +504,22 @@ pub fn run_setup() -> Result<(), String> {
     let mut config = load_config()?;
     let is_first_run = !config.setup.completed;
 
+    // 4.5 アップデート追従（Issue #94）: 前回セットアップ以降に setup へ入った変更を検出。
+    // 初回はすべて最新の内容で導入されるため対象外（完了時に最新リビジョンを記録するのみ）
+    let pending = if is_first_run {
+        Vec::new()
+    } else {
+        pending_changes(config.setup.applied_revision)?
+    };
+    if !pending.is_empty() {
+        eprintln!();
+        print_pending_changes(&pending, config.setup.applied_revision);
+        eprintln!(
+            "      詳細を pending-changes.md に書き出しました。claude が対話の中で追従を案内します"
+        );
+    }
+    sync_pending_changes_file(&dir, &pending, config.setup.applied_revision)?;
+
     // 5. claude を setup cwd で起動
     // ~/.claude/CLAUDE.md が存在すればバックアップ
     if let Some(home) = home_dir() {
@@ -487,6 +550,8 @@ pub fn run_setup() -> Result<(), String> {
 
     let greeting = if is_first_run {
         "tako のセットアップを始めます。いくつか質問に答えてください。"
+    } else if !pending.is_empty() {
+        "tako の設定を更新します。まず pending-changes.md を読んで、前回セットアップ以降のアップデート変更への追従から始めてください。"
     } else {
         "tako の設定を変更します。何をしますか？"
     };
@@ -506,10 +571,14 @@ pub fn run_setup() -> Result<(), String> {
         .map_err(|e| format!("claude の起動に失敗: {e}"))?;
 
     if status.success() {
-        // セットアップ完了を記録
+        // セットアップ完了を記録（適用済み setup リビジョンを含む。Issue #94）
         config.setup.completed = true;
         config.setup.completed_at = Some(now_iso8601());
+        config.setup.applied_revision = tako_control::setup::current_revision()?;
+        config.setup.applied_version = Some(env!("CARGO_PKG_VERSION").to_string());
         save_config(&config)?;
+        // 追従が完了したので pending-changes.md を消す（stale 防止）
+        sync_pending_changes_file(&dir, &[], config.setup.applied_revision)?;
         eprintln!();
         eprintln!("セットアップが完了しました。");
     } else {
@@ -758,28 +827,9 @@ fn now_iso8601() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tako_control::setup::SetupConfig;
 
-    #[test]
-    fn config_roundtrip() {
-        let config = SetupConfig::default();
-        let yaml = serde_yaml::to_string(&config).unwrap();
-        let back: SetupConfig = serde_yaml::from_str(&yaml).unwrap();
-        assert!(back.orchestrator.auto_close);
-        assert!(back.orchestrator.auto_push);
-        assert!(!back.setup.completed);
-        // モデル・effort は profiles/*.yaml が正。config.yaml には書かない（Issue #27）
-        assert!(!yaml.contains("model"));
-        assert!(!yaml.contains("[1m]"));
-    }
-
-    #[test]
-    fn config_ignores_legacy_model_keys() {
-        // 旧バージョンの config.yaml（master_model 等入り）も読める後方互換
-        let legacy = "orchestrator:\n  master_model: claude-opus-4-6[1m]\n  worker_model: claude-opus-4-6[1m]\n  effort: max\n  auto_close: false\nsetup:\n  completed: true\n";
-        let config: SetupConfig = serde_yaml::from_str(legacy).unwrap();
-        assert!(!config.orchestrator.auto_close);
-        assert!(config.setup.completed);
-    }
+    // config.yaml のスキーマ・後方互換のテストは tako_control::setup 側にある（Issue #94）
 
     #[test]
     fn config_from_default_yaml() {
@@ -789,6 +839,27 @@ mod tests {
         // モデル設定キーはテンプレに含まれない（profiles/*.yaml が正。Issue #27）
         assert!(!CONFIG_DEFAULT.contains("master_model"));
         assert!(!CONFIG_DEFAULT.contains("worker_model"));
+    }
+
+    #[test]
+    fn pending_changes_file_sync() {
+        let tmp = std::env::temp_dir().join("tako-test-pending-sync");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let pending = pending_changes(0).unwrap();
+        assert!(!pending.is_empty(), "初期エントリが存在する");
+        // 未適用あり → pending-changes.md が書き出される
+        sync_pending_changes_file(&tmp, &pending, 0).unwrap();
+        let path = pending_changes_path(&tmp);
+        assert!(path.is_file());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("rev 1"));
+        // 追従完了（未適用ゼロ）→ 消える（stale 防止）
+        sync_pending_changes_file(&tmp, &[], 4).unwrap();
+        assert!(!path.exists());
+        // 無い状態での再同期も no-op で成功する
+        sync_pending_changes_file(&tmp, &[], 4).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -829,5 +900,14 @@ mod tests {
         assert!(!TPL_04_SAFETY.is_empty());
         assert!(!TPL_05_PROPOSAL.is_empty());
         assert!(!CONFIG_DEFAULT.is_empty());
+        assert!(!CHANGES_YAML.is_empty());
+    }
+
+    #[test]
+    fn system_prompt_mentions_update_follow_flow() {
+        // setup エージェントがアップデート追従を実施できるよう、system prompt に
+        // pending-changes.md への言及がある（Issue #94）
+        assert!(SYSTEM_PROMPT.contains("pending-changes.md"));
+        assert!(SYSTEM_PROMPT.contains("changes.yaml"));
     }
 }

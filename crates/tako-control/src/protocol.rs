@@ -438,6 +438,10 @@ pub enum Request {
         #[serde(default)]
         action: Option<String>,
     },
+    /// setup のアップデート追従状況の照会（Issue #94）。
+    /// 適用済みリビジョン・現在リビジョン・未適用の setup 関連変更の一覧を返す。
+    /// 適用自体は `tako setup`（対話）が行い、これは読み取り専用
+    SetupChanges,
 }
 
 /// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。

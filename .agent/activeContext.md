@@ -4,21 +4,21 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-06・レビュー起点の修正: #82/#83 完了、残 Issue #84〜#86）
+## 現在の対象（2026-07-06・#94 setup アップデート追従を実装）
 
-コードベース全体レビュー（`reviews/2026-07-06_構造・MCPリファクタ提案.md`、提案 17 件）を実施し、
-高優先度 #82〜#86 を起票。うち #82（orchestrator run の output 常時空バグ）+
-#83（完了待ちポーリングの MCP/CLI 二重実装）を PR #87 で修正・squash merge 済み
-（`tako-control::orchestrator::wait` 新設、テスト 9 本追加）。`build-app.sh --install` で実機反映済み。
+`tako setup` にアップデート追従機能を追加（Issue #94）。バイナリ同梱の setup changelog
+（`resources/setup/changes.yaml`、revision 連番 + kind auto/guided）と config.yaml の
+`setup.applied_revision` の突き合わせで未適用変更を検出。共有ロジックは
+`tako-control::setup` 新設（config.yaml スキーマもここへ移動、CLI/MCP 共有 = #83 の教訓）。
+CLI `tako setup --changes [--json]` + MCP `tako_setup_changes`（計 52 ツール）+
+pending-changes.md 書き出し + setup 用 system prompt に追従フロー追記。
 
+- setup 関連の変更を入れたら `resources/setup/changes.yaml` に revision を 1 増やして追記する
+  （運用ルール。記入方法はファイル冒頭コメント。連番・非空はテストで機械検証）
 - 残 Issue: #84（MCP HTTP 直列処理）/ #85（タブ退避の CLI/MCP 対応）/ #86（ControlHost 分割）
-- 公開監査（別セッション）: #75〜#81 起票済み、#76/#77 は削除対応済み
-- docs 刷新（PR #73/#74）はマージ済み・自動デプロイ済み
-- リモート接続バグ調査（#89 起票済み・修正未着手）: `tako remote start` が cloudflared 未導入時に
-  無警告で LAN 限定 URL（プライベート IP 直）を出す。spawn_daemon が成功パスで stderr を読まず
-  フォールバック警告が消える（remote.rs:167/331）。**修正はリレー worker 並行作業 + #78 認証方針の決定後**
-- #88 対応済み（PR #92）: `tako setup` に依存ツールチェック段階（claude 必須 / tmux・cloudflared・git 任意、
-  brew でその場インストール可）を追加。#89 のセットアップ側の入口はこれでカバー
+- リモート接続バグ #89（cloudflared 不在時の無音 LAN フォールバック）: 修正未着手。
+  #78 認証は解決済みのため、着手可能になった
+- 公開監査は全条件クリア（判定 OK）。#79 は ignore 登録済み（PR #97）、#80 対応済み（PR #96）
 
 ## v0.2.8 の内容
 
