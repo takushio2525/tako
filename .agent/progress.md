@@ -431,6 +431,18 @@
   profiles の prompt_blocks.append へ移行。`build-app.sh --install` 済み（反映は tako 再起動後）
 - 次: tako 再起動後に `tako master` で分担計画・検収挙動を実運用確認
 
+## 2026-07-07（#104: tako remote セキュリティ監査 + 推奨対応6件実装）
+- 再監査レポート `reviews/2026-07-07_takoremote再監査.md`（認証/暗号化/外部依存/漏えい/
+  任意コマンド実行 + 日本法リスク整理）を作成。推奨6件を実装: ①暗号化トンネル必須化
+  （張れなければ起動拒否、平文は --insecure で明示 opt-in）②token/QR を 0o600 ③status の
+  トークン既定マスク（--show-token / MCP show_token）④トークン比較の定数時間化 ⑤リレー
+  worker のレートリミット（IP 単位）⑥README/docs 注意追記
+- 検証: build/clippy(-D)/fmt/test 全緑、worker npm test 7/7、insecure serve を実バイナリで
+  e2e 観測（平文警告・LAN 直 URL・token 0o600・status マスク）。secure 拒否は cloudflared を
+  隠せず runtime 未観測（コード+build で担保、レポートに明記）
+- 関連: PR #105 squash merge（`5782367`）→ `build-app.sh --install` で 0.3.0 実機反映済み
+- 次: tako 再起動で GUI 経路の実機確認（`remote start` が新 CLI で --insecure/拒否を反映）
+
 ## 2026-07-07（#95 実機検証完了 + #103 起票）
 - tako 再起動（14:08、新プロセス確認）後に #95 修正を実機検証: プローブのバイト観測で
   Enter 代行が「括りなし CR 即発火」（旧: 空括り+13 秒）、残留テキストの Enter 代行
