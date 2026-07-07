@@ -4,63 +4,27 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-07・#107 ゴーストテキスト判別機能を実装・マージ済み）
+## 現在の対象（2026-07-07・v0.3.2 リリース済み + リレー worker デプロイ済み）
 
-**#107 完了**（PR #108 squash merge `2ac8ce9`）。`tako_read_pane` / `tako read` の応答に
-`input_status` フィールドを追加。Claude Code TUI の ❯ 行のテキストが自動提案（dim =
-ghost）かユーザー手動入力（user）かを判別する。build-app.sh --install 済み。
-**tako 本体の再起動が必要**（稼働中プロセスは旧バイナリのまま。再起動後に新機能が有効化）。
+**v0.3.2 リリース完了**。#109（複数 master 並行時に spawn worker が意図しないタブに出る）を修正。
+MCP セッションに `caller_role`（`TAKO_ORCHESTRATOR_ROLE` 環境変数由来）を追加し、
+`caller_pane` が stale で `resolve_pane` に失敗した場合でも role suffix から正しい master を
+特定するフォールバックを実装。回帰テスト 3 本追加。
 
-- v0.3.1 + #107 の状態。次リリースで Unreleased に #107 を含める
-- **未反映（既存）**: リレー worker のレートリミットは live relay に未デプロイ
-- cask 0.3.1 更新は未実施（`homebrew-tako` 側）
+- v0.3.2 tag + GitHub Release + Pages デプロイ + build-app.sh --install 済み
+- リレー worker レートリミットを本番反映済み（`npm run deploy`、正常系 register/resolve 確認済み）
+- **tako 本体の再起動が必要**（稼働中プロセスは旧バイナリのまま）
 
 ---
-
-## 参考: 直前フェーズ（2026-07-07・#95 + #100 マージ済み、実機反映完了）
-
-main = `4c62786`（#95 Enter 空振り修正 = PR #101、#100 品質パイプライン = PR #102 の両方入り）。
-tako 再起動済み（2026-07-07 14:08、新プロセス確認済み）。**#95 は実機検証まで完了**:
-Enter 代行が括りなし CR 即発火（旧: 空括り+13 秒をプローブのバイト観測で確認）/
-残留テキストの Enter 代行 4 連続成功 / busy（生成）中の Enter 送達が queue 成立 →
-タスク完了後の自動送達まで実 claude で確認。
-副産物: Cmd-Q で終了しない事象を発見 → #103 起票（Dock 右クリック終了は正常。未修正）。
-
-- #100 品質パイプライン: master 用 default prompt に task-intake / worker-prompt-template /
-  acceptance を新設（既存ブロック名は prompt_blocks 互換のため維持）。setup 配布物に
-  CLAUDE.md セクション `06-completion-verification` 新設 + changes.yaml rev 5（guided）。
-  設計意図 = `reviews/2026-07-07_オーケストレーション品質設計.md`
-- ローカル環境の移行済み: 旧カスタム `orchestrator/master-system.md` は
-  `master-system.md.bak-20260707` へ退避（シャドウ解除）。個人ルールは
-  `orchestrator/local-rules.md` に集約し、profiles/{default,fable}.yaml の
-  `prompt_blocks.append` で注入する構成へ（default の今後の更新に自動追従）
-- この環境の `setup.applied_revision` は 0（フル `tako setup` 対話を v0.3.0 以降未完走）。
-  次回 `tako setup` で rev 1〜5 の追従案内が出るのは正常（rev 2/5 の guided は
-  master-system.md 退避済みなので「デフォルト使用中」で即通過するはず）
-- setup 関連の変更を入れたら `resources/setup/changes.yaml` に revision を 1 増やして追記する
-  （運用ルール。記入方法はファイル冒頭コメント。連番・非空はテストで機械検証）
-- 残 Issue: #84（MCP HTTP 直列処理）/ #85（タブ退避の CLI/MCP 対応）/ #86（ControlHost 分割）。
-  将来候補: worker への直接 system prompt 注入（`build_worker_claude_cmd` に
-  --append-system-prompt-file。reviews/2026-07-07 の「今後の候補」参照）
-- リモート接続バグ #89 残り: lan_ip の en0 固定解消・cask への cloudflared 依存追加など
-- 公開監査は全条件クリア（判定 OK）。次リリース（0.3.1 tag / Release / cask）は未実施 —
-  Unreleased に #95 / #100 が溜まっている
-
-## 未検証（スマホ実機テスト — #63 リーダービュー）
-
-- [ ] タッチでの連続スクロール(上下)が滑らかに動作するか
-- [ ] 下端追従: 新しい出力が来たとき自動スクロールするか
-- [ ] 「↓最新へ」ボタン: 過去を見た後に押すと最下部に戻り追従再開するか
-- [ ] ソフトキーボード入力: 文字入力 + Enter 送信が機能するか
-- [ ] #64 PC 側確認: 日本語混在行で半角文字が消えないこと
 
 ## 残作業・既知の制約
 
 - main.rs は 9,800 行前後。さらなる分割は別タスク
 - MCP HTTP ポートのランダム問題は未解決（stdio ブリッジ経由なら影響なし）
 - セルフテストの既知失敗は PDF（項目 70、CoreGraphics 環境依存）のみ
-- CI（GitHub Actions）が 6/12 以降トリガーされていない — Actions 無料枠逼迫で停止中。
-  品質保証はローカル全緑で代替
+- CI（GitHub Actions）が 6/12 以降トリガーされていない — Actions 無料枠逼迫で停止中
+- cask 0.3.2 更新は未実施（`homebrew-tako` 側）
+- KV の eventual consistency でレートリミットのバースト耐性は緩い（1 分窓では効く）
 
 ## 未着手タスク（優先順はユーザーと相談）
 

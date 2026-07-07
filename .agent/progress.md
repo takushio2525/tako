@@ -468,3 +468,11 @@
   フィールド追加（MCP + CLI 両対応）。テスト 6 本追加、全 115 テスト緑
 - 関連コミット: `2ac8ce9`（PR #108 squash merge）、build-app.sh --install 済み
 - 次: tako 再起動で実ペインでの input_status 実機確認
+
+## 2026-07-07（#109: 複数 master 並行時の spawn 混線を修正 → v0.3.2 リリース）
+- MCP セッションに `caller_role`（`TAKO_ORCHESTRATOR_ROLE` 由来）を追加。`caller_pane` が
+  stale で `resolve_pane` 失敗時、role suffix で正しい master を特定するフォールバック実装。
+  回帰テスト 3 本追加。v0.3.2 リリース（tag + Release + Pages + /Applications 配置）。
+  リレー worker レートリミットも本番反映（register/resolve 正常系確認済み）
+- 関連コミット: `b3ed19d`（PR #110）、`665d541`（v0.3.2）、tag `v0.3.2`
+- 次: tako 再起動で新バイナリ反映
