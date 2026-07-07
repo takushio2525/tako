@@ -393,15 +393,43 @@ pub fn daemon_status() -> Value {
     })
 }
 
+/// URL のクエリ / fragment 内の `token=<値>` を `token=***` に置換する。
+/// 次の `&` または文字列末尾までを値とみなす。`token=` が無ければそのまま返す
+fn mask_token_in_url(url: &str) -> String {
+    let mut out = String::with_capacity(url.len());
+    let mut rest = url;
+    while let Some(pos) = rest.find("token=") {
+        let val_start = pos + "token=".len();
+        out.push_str(&rest[..val_start]);
+        out.push_str("***");
+        // 値の終端（次の `&` まで。無ければ末尾）以降を残す
+        let after = &rest[val_start..];
+        match after.find('&') {
+            Some(amp) => rest = &after[amp..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// `daemon_status()` が返す状態 JSON のトークンをマスクする（`***` へ置換）。
 /// スクリーンショット・画面共有経由でのトークン漏えいを防ぐため、CLI / MCP の
 /// `remote status` は既定でこれを通す（`--show-token` 指定時のみ生値を出す）。
-/// 接続 URL（`connect_url` / `fallback_url`）にもトークンは含まれるが、接続に必須で
-/// 隠せないため対象外。単体の `token` フィールドだけを伏せる
+/// 単体の `token` フィールドに加え、接続 URL（`connect_url` / `fallback_url` / `url`）の
+/// クエリに載る `token=<生値>` もマスクする（#104。URL だけ生値が残るとマスクの意味がないため）
 pub fn mask_status_token(status: &mut Value) {
     if let Some(obj) = status.as_object_mut() {
         if obj.get("token").and_then(|t| t.as_str()).is_some() {
             obj.insert("token".to_string(), json!("***"));
+        }
+        for key in ["connect_url", "fallback_url", "url"] {
+            if let Some(masked) = obj.get(key).and_then(|v| v.as_str()).map(mask_token_in_url) {
+                obj.insert(key.to_string(), json!(masked));
+            }
         }
     }
 }
@@ -2385,5 +2413,51 @@ mod tests {
         let mut v2 = json!({ "running": false });
         mask_status_token(&mut v2);
         assert_eq!(v2, json!({ "running": false }));
+    }
+
+    #[test]
+    fn mask_token_in_urlはクエリのtokenを伏せる() {
+        // fragment 内 + 後続パラメータあり
+        assert_eq!(
+            mask_token_in_url("https://x.pages.dev/#/connect?machine=m1&token=deadbeef&name=mac"),
+            "https://x.pages.dev/#/connect?machine=m1&token=***&name=mac"
+        );
+        // token が末尾
+        assert_eq!(
+            mask_token_in_url("http://10.0.0.1:7749/#/connect?token=secretvalue"),
+            "http://10.0.0.1:7749/#/connect?token=***"
+        );
+        // token 無しはそのまま
+        assert_eq!(
+            mask_token_in_url("http://10.0.0.1:7749/"),
+            "http://10.0.0.1:7749/"
+        );
+    }
+
+    #[test]
+    fn mask_status_tokenはconnect_url内のtokenもマスクする() {
+        // #104: token フィールドだけでなく URL クエリの生トークンも伏せる
+        let mut v = json!({
+            "running": true,
+            "token": "aabbccdd",
+            "url": "http://10.0.0.5:7749",
+            "connect_url": "https://tako-remote.pages.dev/#/connect?machine=m1&token=aabbccdd&name=mac",
+            "fallback_url": "https://foo.trycloudflare.com/#/connect?token=aabbccdd&name=mac",
+        });
+        mask_status_token(&mut v);
+        assert_eq!(v["token"], json!("***"));
+        let connect = v["connect_url"].as_str().unwrap();
+        let fallback = v["fallback_url"].as_str().unwrap();
+        assert!(
+            !connect.contains("aabbccdd"),
+            "connect_url に生トークンが残る: {connect}"
+        );
+        assert!(
+            !fallback.contains("aabbccdd"),
+            "fallback_url に生トークンが残る: {fallback}"
+        );
+        assert!(connect.contains("token=***"));
+        assert!(connect.contains("machine=m1"), "他のクエリは保持する");
+        assert!(connect.contains("name=mac"));
     }
 }
