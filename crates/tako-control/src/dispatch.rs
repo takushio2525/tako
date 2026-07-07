@@ -162,8 +162,8 @@ pub trait ControlHost {
     /// 単独再送する。既定実装は何もしない（テスト用モック等）
     fn queue_enter_flow(&mut self, _pane: PaneId) {}
     /// リモートアクセス API サーバーを起動する。成功時は状態 JSON を返す。
-    /// `no_tunnel` = true で cloudflared を起動しない（LAN のみ）
-    fn remote_start(&mut self, _port: Option<u16>, _no_tunnel: bool) -> Result<Value, String> {
+    /// 既定は暗号化トンネル必須。`insecure` = true のときだけ平文 LAN 直モードを許可する（#104）
+    fn remote_start(&mut self, _port: Option<u16>, _insecure: bool) -> Result<Value, String> {
         Err("リモートアクセス API はこの環境では使えない".into())
     }
     /// リモートアクセス API サーバーを停止する
@@ -1507,11 +1507,17 @@ pub fn dispatch(
             tmux_session.as_deref(),
         ),
 
-        Request::RemoteStart { port, no_tunnel } => host
-            .remote_start(port, no_tunnel)
+        Request::RemoteStart { port, insecure } => host
+            .remote_start(port, insecure)
             .map_err(DispatchError::Operation),
         Request::RemoteStop => host.remote_stop().map_err(DispatchError::Operation),
-        Request::RemoteStatus => Ok(host.remote_status()),
+        Request::RemoteStatus { show_token } => {
+            let mut status = host.remote_status();
+            if !show_token {
+                crate::remote::mask_status_token(&mut status);
+            }
+            Ok(status)
+        }
 
         // エージェント一覧と会話ログはどのプロセスでも取得できる（ControlHost 不要）
         Request::RemoteAgents => {

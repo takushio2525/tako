@@ -108,6 +108,22 @@ claude mcp add --scope user tako -- /Applications/tako.app/Contents/MacOS/tako m
 
 Register the bundled stdio bridge with any of the methods above; after that, pane-control tools are available with zero per-project setup. Outside tako the bridge exposes 0 tools and stays out of the way.
 
+## リモートアクセス / Remote access
+
+`tako remote start` はスマホのブラウザから tako のペインを操作するための HTTP API サーバーを起動します（既定ポート 7749）。**この機能は既定で無効**で、明示的に起動したときだけ動きます。**既定では暗号化トンネル（cloudflared）経由でのみホスト**し、トンネルを張れない場合は暗号化されていない状態で公開しないために**起動を拒否**します（`brew install cloudflared` で導入）。
+
+**⚠ セキュリティ上の注意（使う前に必ず読んでください）:**
+
+- **これは正規の遠隔操作ツールです。** 接続すると、リモートのブラウザから**あなたのターミナルへ任意のキー入力・コマンドを送信できます**（＝実質的にシェルへのフルアクセス）。自分の端末を自分で操作する目的でのみ使ってください。他人の端末に無断で導入・接続する用途のものではありません。
+- **接続 URL・QR コードは秘密情報です。** URL の `#token=...` 部分は端末を操作できる鍵そのものです。SNS・スクリーンショット・画面共有で他人に見せないでください。トークンはサーバー起動のたびに新しく生成され、停止で無効になります。
+- **エンドツーエンド暗号化（E2E）ではありません。** トンネル経由（cloudflared・既定）の区間は HTTPS で暗号化されますが、Cloudflare のエッジで一度復号されます（通信内容が Cloudflare を経由します）。機微な内容を扱う場合はこの点を理解した上で使ってください。
+- **`--insecure`（LAN 直モード）は平文 HTTP です。** 既定は暗号化トンネル必須で、`--insecure` を明示したときだけ平文 LAN モードで起動します。同じ Wi-Fi / LAN 上の第三者に通信（トークンを含む）を盗聴されうるため、信頼できるネットワークでのみ使ってください。
+- 接続先の名前解決には作者がベストエフォートで運用する公共リレー（Cloudflare Workers・SLA なし）を使いますが、**画面内容やトークンはリレーを通りません**（マシン ID とトンネル URL のみ）。自前リレーへの差し替えは `TAKO_RELAY_URL` で可能です。
+
+---
+
+`tako remote start` launches an HTTP API server that lets you drive tako's panes from a phone browser. **It is disabled by default** and only runs when you explicitly start it. Treat it as a legitimate remote-control tool: once connected, the remote browser can send **arbitrary keystrokes and commands to your terminal** (effectively full shell access). The connection URL/QR embeds a token that is the key to your machine — never share it. **By default it only hosts over an encrypted cloudflared tunnel and refuses to start if a tunnel cannot be established** (`brew install cloudflared`). Traffic is **not end-to-end encrypted**: the tunnel is HTTPS but is decrypted at Cloudflare's edge, and `--insecure` (LAN mode) is plain HTTP that can be sniffed on the same network. Use it only to control your own machine over networks you trust.
+
 ## トラブルシューティング / Troubleshooting
 
 ### brew upgrade が失敗して更新できなくなった場合

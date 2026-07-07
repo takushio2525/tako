@@ -94,3 +94,47 @@ test('resolve は登録済み tunnelUrl を返し、未登録は 404', async () 
   assert.equal(res.status, 200);
   assert.equal((await res.json()).tunnelUrl, URL1);
 });
+
+test('register は同一 IP からの過剰リクエストを 429 で弾く（#104）', async () => {
+  const env = { RELAY_KV: mockKV() };
+  const ip = '203.0.113.7';
+  function reg() {
+    return worker.fetch(
+      new Request('https://relay.example/api/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': ip },
+        body: JSON.stringify({ machineId: MID, tunnelUrl: URL1 }),
+      }),
+      env
+    );
+  }
+  // 上限（60/分）までは通り、超えたら 429
+  let got429 = false;
+  for (let i = 0; i < 62; i++) {
+    const r = await reg();
+    if (r.status === 429) {
+      got429 = true;
+      break;
+    }
+  }
+  assert.equal(got429, true, '上限超過で 429 が返るべき');
+});
+
+test('別 IP はレート制限バケットを共有しない（#104）', async () => {
+  const env = { RELAY_KV: mockKV() };
+  function regFrom(ip) {
+    return worker.fetch(
+      new Request('https://relay.example/api/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': ip },
+        body: JSON.stringify({ machineId: MID, tunnelUrl: URL1 }),
+      }),
+      env
+    );
+  }
+  // IP-A を上限まで消費
+  for (let i = 0; i < 61; i++) await regFrom('198.51.100.1');
+  // IP-B は影響を受けず通る
+  const other = await regFrom('198.51.100.2');
+  assert.equal(other.status, 200);
+});

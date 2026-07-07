@@ -35,8 +35,9 @@
 //!   リンク / ブックマークは不変）。トンネル直 URL は `fallback_url` として併記
 //!   （リレー障害時の予備。デーモン内蔵 PWA がトンネル経由で配信される）
 //! - トンネル成功 + リレー登録失敗 → トンネル直 URL（従来形式）
-//! - トンネル失敗（cloudflared 不在等）→ LAN URL 直（内蔵 PWA。`tunnel_error` を
-//!   起動情報 JSON に含め、CLI が LAN 限定の警告を表示する。#89 の可視化）
+//! - トンネル失敗（cloudflared 不在等）→ **起動を拒否する**（#104。暗号化経路を確立できない
+//!   状態では安全に提供できないため）。信頼できる LAN 内で平文のまま使いたい場合のみ
+//!   `--insecure`（明示 opt-in・非推奨）で LAN URL 直（内蔵 PWA）を許可する
 //!
 //! デーモン管理:
 //! - `tako remote start` → `tako remote serve` をバックグラウンド fork
@@ -89,6 +90,20 @@ pub fn tunnel_path() -> std::path::PathBuf {
     state_dir().join("tako-remote.tunnel")
 }
 
+/// ファイルを所有者のみ読み書き可（0o600）に制限する。unix 以外では何もしない。
+/// トークン・QR（トークン入り URL を含む）など秘密を含むファイルに使う（#104）
+fn restrict_permissions(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
 fn cleanup_state_files() {
     let _ = std::fs::remove_file(pid_path());
     let _ = std::fs::remove_file(token_path());
@@ -102,8 +117,13 @@ fn cleanup_state_files() {
 struct PwaAssets;
 
 /// 独立デーモンとして HTTP サーバーを起動し、SIGTERM まで待機する。
-/// `tako remote serve` から呼ばれる内部用関数
-pub fn run_daemon(port: Option<u16>, no_tunnel: bool) -> io::Result<()> {
+/// `tako remote serve` から呼ばれる内部用関数。
+///
+/// セキュリティ方針（#104）: 既定では**暗号化されたトンネル経由でのみ**ホストする。
+/// cloudflared トンネルが張れなければ起動を**拒否**する（平文 LAN へフォールバックしない）。
+/// `insecure = true` のときだけ、平文 HTTP の LAN 直モードを許可する（明示 opt-in。
+/// 同一 LAN 上の第三者にトークンを盗聴されうるため、信頼できるネットワーク限定）
+pub fn run_daemon(port: Option<u16>, insecure: bool) -> io::Result<()> {
     let port = port.unwrap_or(DEFAULT_PORT);
     let addr = format!("0.0.0.0:{port}");
     let server = tiny_http::Server::http(&addr)
@@ -127,11 +147,14 @@ pub fn run_daemon(port: Option<u16>, no_tunnel: bool) -> io::Result<()> {
     // トークン生成
     let token = crate::generate_token()?;
 
-    // PID / トークン / ポートを書き出す
+    // PID / トークン / ポートを書き出す。トークンは秘密なので所有者のみ読み書き（0o600）に絞る
+    // （既定 state_dir = /tmp はマルチユーザーで共有されるため、umask 依存の 0644 だと他ユーザーに
+    // トークンが読まれうる。#104）
     std::fs::write(pid_path(), std::process::id().to_string())
         .map_err(|e| io::Error::other(format!("PID ファイルの書き出しに失敗: {e}")))?;
     std::fs::write(token_path(), &token)
         .map_err(|e| io::Error::other(format!("トークンファイルの書き出しに失敗: {e}")))?;
+    restrict_permissions(&token_path());
     std::fs::write(port_path(), actual_port.to_string())
         .map_err(|e| io::Error::other(format!("ポートファイルの書き出しに失敗: {e}")))?;
 
@@ -172,14 +195,22 @@ pub fn run_daemon(port: Option<u16>, no_tunnel: bool) -> io::Result<()> {
             })?;
     }
 
-    // cloudflared tunnel（オプション）
+    // cloudflared tunnel
     let mut tunnel_url: Option<String> = None;
     let mut tunnel_process: Option<Child> = None;
     let mut mid: Option<String> = None;
-    let mut tunnel_error: Option<String> = None;
+    // 起動失敗はもう Err で中止するため、この情報 JSON では常に null（後方互換のため残す）
+    let tunnel_error: Option<String> = None;
     let mut relay_ok = false;
 
-    if !no_tunnel {
+    if insecure {
+        // 平文 LAN 直モード（明示 opt-in）。トンネルを張らない。強い警告を出す
+        eprintln!("⚠ insecure モード: 暗号化されていない平文 HTTP で LAN に公開します。");
+        eprintln!(
+            "  同一 Wi-Fi / LAN 上の第三者にトークンを含む通信を盗聴されうる。信頼できるネットワークでのみ使うこと。"
+        );
+    } else {
+        // secure モード（既定）: 暗号化トンネル必須。張れなければ起動を拒否する
         match start_cloudflared(actual_port) {
             Ok((child, url)) => {
                 let machine = machine_id();
@@ -192,8 +223,14 @@ pub fn run_daemon(port: Option<u16>, no_tunnel: bool) -> io::Result<()> {
                 tunnel_process = Some(child);
             }
             Err(e) => {
-                tunnel_error = Some(e.to_string());
-                eprintln!("cloudflared の起動に失敗（LAN のみモードで継続）: {e}");
+                // 暗号化経路を確立できない = 安全に提供できない。起動を中止する（#104）。
+                // 書き込んだ state ファイルを片付けてから Err を返す
+                cleanup_state_files();
+                return Err(io::Error::other(format!(
+                    "暗号化トンネルを確立できないため remote サーバーの起動を中止しました: {e}\n\
+                     cloudflared を導入してください（brew install cloudflared）。\
+                     信頼できる LAN 内で平文のまま使うには `tako remote start --insecure` を指定します（非推奨）。"
+                )));
             }
         }
     }
@@ -356,6 +393,34 @@ pub fn daemon_status() -> Value {
     })
 }
 
+/// `daemon_status()` が返す状態 JSON のトークンをマスクする（`***` へ置換）。
+/// スクリーンショット・画面共有経由でのトークン漏えいを防ぐため、CLI / MCP の
+/// `remote status` は既定でこれを通す（`--show-token` 指定時のみ生値を出す）。
+/// 接続 URL（`connect_url` / `fallback_url`）にもトークンは含まれるが、接続に必須で
+/// 隠せないため対象外。単体の `token` フィールドだけを伏せる
+pub fn mask_status_token(status: &mut Value) {
+    if let Some(obj) = status.as_object_mut() {
+        if obj.get("token").and_then(|t| t.as_str()).is_some() {
+            obj.insert("token".to_string(), json!("***"));
+        }
+    }
+}
+
+/// 2 つのバイト列を定数時間で比較する（長さと内容の両方を一定時間で判定）。
+/// トークン認証のタイミング攻撃対策。外部依存を増やさない自前の最小実装
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    // 長さ不一致は即 false だが、内容比較は常に一定回数回して早期 return しない。
+    // 長さが漏れても 256bit ランダムトークンの探索は不能なので実害はない
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// デーモンを停止する（PID ファイルから kill）
 pub fn daemon_stop() -> Result<Value, String> {
     let pid = std::fs::read_to_string(pid_path())
@@ -385,9 +450,10 @@ pub fn daemon_stop() -> Result<Value, String> {
 }
 
 /// デーモンをバックグラウンドで fork 起動する。
-/// `tako remote serve --port N [--no-tunnel]` を子プロセスとして起動し、
-/// stdout から起動情報 JSON を読み取って返す
-pub fn spawn_daemon(port: Option<u16>, no_tunnel: bool) -> Result<Value, String> {
+/// `tako remote serve --port N [--insecure]` を子プロセスとして起動し、
+/// stdout から起動情報 JSON を読み取って返す。
+/// `insecure = true` のときだけ平文 LAN 直モードを許可する（既定は暗号化トンネル必須。#104）
+pub fn spawn_daemon(port: Option<u16>, insecure: bool) -> Result<Value, String> {
     // 既に起動中か確認
     let status = daemon_status();
     if status["running"].as_bool() == Some(true) {
@@ -400,8 +466,8 @@ pub fn spawn_daemon(port: Option<u16>, no_tunnel: bool) -> Result<Value, String>
         args.push("--port".to_string());
         args.push(p.to_string());
     }
-    if no_tunnel {
-        args.push("--no-tunnel".to_string());
+    if insecure {
+        args.push("--insecure".to_string());
     }
 
     let mut cmd = Command::new(&tako_bin);
@@ -1110,7 +1176,9 @@ fn header_value(request: &tiny_http::Request, name: &'static str) -> Option<Stri
 }
 
 fn check_auth(request: &tiny_http::Request, token: &str) -> bool {
-    header_value(request, "authorization").is_some_and(|v| v == format!("Bearer {token}"))
+    let expected = format!("Bearer {token}");
+    header_value(request, "authorization")
+        .is_some_and(|v| constant_time_eq(v.as_bytes(), expected.as_bytes()))
 }
 
 // --- WebSocket（画面プッシュ専用チャンネル） ---
@@ -1175,7 +1243,10 @@ fn handle_ws(
     let url_full = request.url().to_string();
     let client_token =
         header_value(&request, "sec-websocket-protocol").and_then(|v| ws_token_from_protocols(&v));
-    if client_token.as_deref() != Some(token) {
+    let token_ok = client_token
+        .as_deref()
+        .is_some_and(|t| constant_time_eq(t.as_bytes(), token.as_bytes()));
+    if !token_ok {
         return respond(
             request,
             401,
@@ -1802,6 +1873,8 @@ pub fn generate_qr_png(url: &str) -> io::Result<std::path::PathBuf> {
     let path = std::env::temp_dir().join("tako-remote-qr.png");
     img.save(&path)
         .map_err(|e| io::Error::other(format!("PNG の保存に失敗: {e}")))?;
+    // QR はトークン入りの接続 URL をエンコードしているため所有者のみ読取可に制限する（#104）
+    restrict_permissions(&path);
 
     Ok(path)
 }
@@ -2288,5 +2361,29 @@ mod tests {
     fn is_process_aliveは存在しないpidをfalseで返す() {
         // 99999999 は通常存在しない PID
         assert!(!is_process_alive(99_999_999));
+    }
+
+    #[test]
+    fn constant_time_eqは一致判定と長さ違いを正しく扱う() {
+        assert!(constant_time_eq(b"abc123", b"abc123"));
+        assert!(!constant_time_eq(b"abc123", b"abc124"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"", b"x"));
+    }
+
+    #[test]
+    fn mask_status_tokenはトークンをマスクしそれ以外を残す() {
+        let mut v =
+            json!({ "running": true, "port": 7749, "token": "deadbeef", "url": "http://x" });
+        mask_status_token(&mut v);
+        assert_eq!(v["token"], json!("***"));
+        assert_eq!(v["port"], json!(7749));
+        assert_eq!(v["running"], json!(true));
+
+        // token フィールドが無ければ何も壊さない
+        let mut v2 = json!({ "running": false });
+        mask_status_token(&mut v2);
+        assert_eq!(v2, json!({ "running": false }));
     }
 }
