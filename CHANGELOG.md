@@ -5,6 +5,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-07-07
+
+### Fixed
+
+- Multi-master orchestrator spawn no longer sends workers to the wrong tab (#109): when multiple masters run in parallel (`tako master -fable`, `tako master -aram`, etc.) and the caller's `TAKO_PANE_ID` is stale, the spawn fallback now uses `TAKO_ORCHESTRATOR_ROLE` to identify the correct master instead of blindly picking the first one found. The role is propagated through the MCP session (`caller_role` field) from the stdio bridge / HTTP transport to the dispatch layer
+  複数 master 並行時に `tako_orchestrator_spawn` の worker が意図しないタブに出る問題を修正（#109）: 呼び出し元の `TAKO_PANE_ID` が stale な場合のフォールバックで、`TAKO_ORCHESTRATOR_ROLE` 環境変数を使って正しい master を特定する。role は MCP セッション（`caller_role` フィールド）を通じて stdio ブリッジ / HTTP トランスポートから dispatch 層まで伝搬する
+
 ## [0.3.1] - 2026-07-07
 
 ### Security
