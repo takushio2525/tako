@@ -4,19 +4,16 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-07・v0.3.1 リリース済み。remote セキュリティ強化 #104 完了）
+## 現在の対象（2026-07-07・#107 ゴーストテキスト判別機能を実装・マージ済み）
 
-**v0.3.1 リリース完了**（tag `v0.3.1` / GitHub Release / cask は未更新 / Pages デプロイ済み /
-`/Applications` に 0.3.1 配置済み）。内容 = #104 remote セキュリティ強化（secure-by-default =
-暗号化トンネル必須・不成立で起動拒否 / `--insecure` opt-in / トークン定数時間比較 / token・QR 0o600 /
-status のトークン既定マスク（connect_url 内も）/ リレー IP レートリミット）+ #95 + #100。
-tako は再起動済み（master が CLI 経路で secure 挙動を実機確認済み。connect_url マスクも live 確認）。
-remote デーモンはローテーション後の新トークンで稼働中（pid 19941・secure トンネル）。
+**#107 完了**（PR #108 squash merge `2ac8ce9`）。`tako_read_pane` / `tako read` の応答に
+`input_status` フィールドを追加。Claude Code TUI の ❯ 行のテキストが自動提案（dim =
+ghost）かユーザー手動入力（user）かを判別する。build-app.sh --install 済み。
+**tako 本体の再起動が必要**（稼働中プロセスは旧バイナリのまま。再起動後に新機能が有効化）。
 
-- **未反映**: リレー worker のレートリミットは live relay に未デプロイ。
-  `cd web/tako-remote-worker && npm run deploy`（wrangler 認証済み）でユーザーが反映する
-- cask 0.3.1 更新は未実施（`homebrew-tako` 側。過去リリース同様ユーザー判断で）
-- 監査レポート: `reviews/2026-07-07_takoremote再監査.md`
+- v0.3.1 + #107 の状態。次リリースで Unreleased に #107 を含める
+- **未反映（既存）**: リレー worker のレートリミットは live relay に未デプロイ
+- cask 0.3.1 更新は未実施（`homebrew-tako` 側）
 
 ---
 

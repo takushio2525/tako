@@ -461,3 +461,10 @@
   4 連続成功、busy（生成）中の Enter 送達が queue 成立 → タスク完了後の自動送達まで確認
 - 副産物: Cmd-Q で tako が終了しない事象（2 回再現、Dock 終了は正常）を #103 に起票（未修正）
 - 次: なし（#95 クローズ済み。次リリースで Unreleased の #95/#100 を出荷）
+
+## 2026-07-07（#107: read_pane でゴーストテキスト/手動入力の判別機能を追加）
+- screen.rs の StyleRun/CellStyle に dim フラグ追加、analyze_input_line() で ❯ 行の
+  dim 状態を分析し ghost/user/mixed/none を判定。dispatch の Read 応答に input_status
+  フィールド追加（MCP + CLI 両対応）。テスト 6 本追加、全 115 テスト緑
+- 関連コミット: `2ac8ce9`（PR #108 squash merge）、build-app.sh --install 済み
+- 次: tako 再起動で実ペインでの input_status 実機確認
