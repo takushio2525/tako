@@ -5608,10 +5608,10 @@ impl ControlHost for TakoApp {
     fn remote_start(
         &mut self,
         port: Option<u16>,
-        no_tunnel: bool,
+        insecure: bool,
     ) -> Result<serde_json::Value, String> {
-        // デーモンをバックグラウンドで fork 起動する
-        tako_control::remote::spawn_daemon(port, no_tunnel)
+        // デーモンをバックグラウンドで fork 起動する（既定は暗号化トンネル必須。#104）
+        tako_control::remote::spawn_daemon(port, insecure)
     }
 
     fn remote_stop(&mut self) -> Result<serde_json::Value, String> {

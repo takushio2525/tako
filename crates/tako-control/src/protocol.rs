@@ -402,16 +402,23 @@ pub enum Request {
         tmux_session: Option<String>,
     },
     /// リモートアクセス API サーバーの起動。`port` 省略時は 7749。
-    /// `no_tunnel` = true で cloudflared Quick Tunnel を起動せず LAN のみモードにする
+    /// 既定では暗号化トンネル（cloudflared）経由でのみホストし、トンネルを張れなければ
+    /// 起動を拒否する。`insecure` = true のときだけ平文 HTTP の LAN 直モードを許可する
+    /// （明示 opt-in・非推奨。同一 LAN 上の盗聴リスクあり。#104）
     RemoteStart {
         port: Option<u16>,
         #[serde(default)]
-        no_tunnel: bool,
+        insecure: bool,
     },
     /// リモートアクセス API サーバーの停止
     RemoteStop,
-    /// リモートアクセス API サーバーの状態取得
-    RemoteStatus,
+    /// リモートアクセス API サーバーの状態取得。
+    /// `show_token` = true のときだけ応答にトークンを平文で含める（既定はマスク。
+    /// スクリーンショット・画面共有経由でのトークン漏えいを防ぐため）
+    RemoteStatus {
+        #[serde(default)]
+        show_token: bool,
+    },
     /// エージェント一覧（`claude agents --json` プロキシ + tmux ペイン対応付け。Issue #23）
     RemoteAgents,
     /// Claude Code の会話ログ（transcript）の末尾 `tail` 件を正規化して取得（Issue #23）

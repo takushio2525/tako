@@ -183,14 +183,19 @@ enum RemoteCommand {
         /// サーバーのポート番号（省略時は 7749）
         #[arg(long, default_value_t = 7749)]
         port: u16,
-        /// cloudflared Quick Tunnel を起動しない（LAN のみモード）
+        /// 暗号化トンネルを使わず平文 HTTP の LAN 直モードで起動する（明示 opt-in・非推奨。
+        /// 既定は暗号化トンネル必須で、張れなければ起動を拒否する。#104）
         #[arg(long)]
-        no_tunnel: bool,
+        insecure: bool,
     },
     /// リモートアクセス API サーバーを停止する
     Stop,
     /// リモートアクセス API サーバーの状態を表示する
-    Status,
+    Status {
+        /// トークンをマスクせず生値で表示する（既定はマスク。#104）
+        #[arg(long)]
+        show_token: bool,
+    },
     /// エージェント一覧を表示する（claude agents --json + tmux ペイン対応付け）
     Agents,
     /// Claude Code の会話ログ（transcript）の末尾を正規化 JSON で表示する
@@ -214,9 +219,9 @@ enum RemoteCommand {
         /// サーバーのポート番号（省略時は 7749）
         #[arg(long, default_value_t = 7749)]
         port: u16,
-        /// cloudflared Quick Tunnel を起動しない（LAN のみモード）
+        /// 暗号化トンネルを使わず平文 HTTP の LAN 直モードで起動する（明示 opt-in・非推奨。#104）
         #[arg(long)]
-        no_tunnel: bool,
+        insecure: bool,
     },
 }
 
@@ -910,10 +915,10 @@ fn main() -> ExitCode {
             output_lines,
         ),
         // remote コマンドはローカル処理（IPC 不要）
-        Command::Remote(RemoteCommand::Start { port, no_tunnel }) => remote_start(port, no_tunnel),
+        Command::Remote(RemoteCommand::Start { port, insecure }) => remote_start(port, insecure),
         Command::Remote(RemoteCommand::Stop) => remote_stop(),
-        Command::Remote(RemoteCommand::Status) => remote_status(),
-        Command::Remote(RemoteCommand::Serve { port, no_tunnel }) => remote_serve(port, no_tunnel),
+        Command::Remote(RemoteCommand::Status { show_token }) => remote_status(show_token),
+        Command::Remote(RemoteCommand::Serve { port, insecure }) => remote_serve(port, insecure),
         Command::Remote(RemoteCommand::Agents) => remote_agents(),
         Command::Remote(RemoteCommand::Messages { session_id, tail }) => {
             remote_messages(&session_id, tail)
@@ -1318,9 +1323,11 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
     Ok(())
 }
 
-/// `tako remote start` — デーモンをバックグラウンドで fork 起動し QR を表示する
-fn remote_start(port: u16, no_tunnel: bool) -> Result<(), String> {
-    let result = tako_control::remote::spawn_daemon(Some(port), no_tunnel)?;
+/// `tako remote start` — デーモンをバックグラウンドで fork 起動し QR を表示する。
+/// 既定は暗号化トンネル必須（張れなければ spawn_daemon が起動を拒否しエラーを返す）。
+/// `insecure` = true のときだけ平文 LAN 直モードで起動する（#104）
+fn remote_start(port: u16, insecure: bool) -> Result<(), String> {
+    let result = tako_control::remote::spawn_daemon(Some(port), insecure)?;
     println!("{}", pretty_json(&result));
     if let Some(connect) = result["connect_url"].as_str() {
         match tako_control::remote::generate_qr_png(connect) {
@@ -1344,14 +1351,13 @@ fn remote_start(port: u16, no_tunnel: bool) -> Result<(), String> {
         }
         if let Some(tunnel) = result["tunnel_url"].as_str() {
             eprintln!("Tunnel: {tunnel}");
-        } else if !no_tunnel {
-            // トンネルが張れず LAN 限定 URL に落ちた（#89: 無音フォールバックの可視化）
-            eprintln!("⚠ トンネルが張れなかったため LAN 限定 URL です。");
+        }
+        if insecure {
+            // 平文 LAN 直モード（明示 opt-in）。暗号化されていないことを明示する（#104）
+            eprintln!("⚠ insecure モード: LAN 直リンクは暗号化されません（平文 HTTP）。");
+            eprintln!("  同一 Wi-Fi / LAN 上の第三者に通信（トークン含む）を盗聴されうる。");
+            eprintln!("  信頼できる LAN でのみ使い、接続 URL / QR は共有しないでください。");
             eprintln!("  同一 Wi-Fi 以外や AP isolation 環境のスマホからは開けません。");
-            if let Some(err) = result["tunnel_error"].as_str() {
-                eprintln!("  原因: {err}");
-            }
-            eprintln!("  どこからでも繋がるリンクにするには: brew install cloudflared");
         }
         if let Some(mid) = result["machine_id"].as_str() {
             eprintln!("Machine ID: {mid}");
@@ -1368,16 +1374,20 @@ fn remote_stop() -> Result<(), String> {
     Ok(())
 }
 
-/// `tako remote status` — デーモンの状態を表示する
-fn remote_status() -> Result<(), String> {
-    let status = tako_control::remote::daemon_status();
+/// `tako remote status` — デーモンの状態を表示する。
+/// 既定ではトークンをマスクし、`--show-token` 指定時のみ生値を出す（#104）
+fn remote_status(show_token: bool) -> Result<(), String> {
+    let mut status = tako_control::remote::daemon_status();
+    if !show_token {
+        tako_control::remote::mask_status_token(&mut status);
+    }
     println!("{}", pretty_json(&status));
     Ok(())
 }
 
 /// `tako remote serve` — HTTP サーバーをフォアグラウンドで起動する（内部用）
-fn remote_serve(port: u16, no_tunnel: bool) -> Result<(), String> {
-    tako_control::remote::run_daemon(Some(port), no_tunnel).map_err(|e| e.to_string())
+fn remote_serve(port: u16, insecure: bool) -> Result<(), String> {
+    tako_control::remote::run_daemon(Some(port), insecure).map_err(|e| e.to_string())
 }
 
 /// `tako remote agents` — claude agents --json + tmux ペイン対応付けを表示する
