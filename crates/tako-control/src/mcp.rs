@@ -38,6 +38,9 @@ pub struct McpSession<'a> {
     /// 呼び出し元ペイン（stdio: `TAKO_PANE_ID`、HTTP: `X-Tako-Pane` ヘッダ。FR-2.3.3）。
     /// pane 引数が省略されたツール呼び出しのデフォルト対象になる
     pub caller_pane: Option<u64>,
+    /// 呼び出し元のオーケストレーター role（stdio: `TAKO_ORCHESTRATOR_ROLE`）。
+    /// 複数 master 並行時に caller_pane が stale でも正しい master を特定する（#109）
+    pub caller_role: Option<String>,
     /// false のとき tools/list は空を返す（tako の外で起動された stdio ブリッジ用。
     /// 登録済みでも tako 外の Claude Code セッションを邪魔しない）
     pub connected: bool,
@@ -1138,7 +1141,13 @@ fn call_tool(params: &Value, session: &mut McpSession) -> Result<Value, (i64, St
         return orchestrator_run(&args, session);
     }
 
-    let request = build_request(name, &args, session.caller_pane).map_err(|e| (-32602, e))?;
+    let request = build_request(
+        name,
+        &args,
+        session.caller_pane,
+        session.caller_role.as_deref(),
+    )
+    .map_err(|e| (-32602, e))?;
     exec_and_wrap(request, session)
 }
 
@@ -1207,6 +1216,7 @@ fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i6
         effort,
         pane,
         tab,
+        caller_role: session.caller_role.clone(),
         timeout: std::time::Duration::from_secs(timeout_secs),
         auto_close,
         output_lines,
@@ -1223,7 +1233,12 @@ fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i6
 }
 
 /// ツール呼び出しを操作プロトコル（[`Request`]）へ写す。エラーは引数バリデーション失敗
-fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Request, String> {
+fn build_request(
+    name: &str,
+    args: &Value,
+    caller: Option<u64>,
+    caller_role: Option<&str>,
+) -> Result<Request, String> {
     Ok(match name {
         "tako_list_panes" => Request::List,
         "tako_split_pane" => {
@@ -1500,6 +1515,7 @@ fn build_request(name: &str, args: &Value, caller: Option<u64>) -> Result<Reques
                 effort: str_arg(args, "effort")?,
                 pane: resolved_pane,
                 tab: resolved_tab,
+                caller_role: caller_role.map(str::to_string),
             }
         }
         "tako_orchestrator_worker_status" => Request::OrchestratorWorkerStatus {
@@ -1778,8 +1794,10 @@ fn handle_http(
             Err(_) => Err("アプリ側から応答が返らなかった".into()),
         }
     };
+    let caller_role = header_value(&request, "x-tako-role").map(|v| v.to_string());
     let mut session = McpSession {
         caller_pane,
+        caller_role,
         connected: true,
         exec: &mut exec,
     };
@@ -1803,6 +1821,7 @@ mod tests {
         };
         let mut session = McpSession {
             caller_pane: caller,
+            caller_role: None,
             connected,
             exec: &mut exec,
         };
@@ -2062,6 +2081,7 @@ mod tests {
         };
         let mut session = McpSession {
             caller_pane: None,
+            caller_role: None,
             connected: true,
             exec: &mut exec,
         };

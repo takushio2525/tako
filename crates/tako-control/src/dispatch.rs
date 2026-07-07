@@ -1499,6 +1499,7 @@ pub fn dispatch(
             effort,
             pane,
             tab,
+            caller_role,
         } => dispatch_orchestrator_spawn(
             host,
             origin,
@@ -1509,6 +1510,7 @@ pub fn dispatch(
             effort.as_deref(),
             pane,
             tab,
+            caller_role.as_deref(),
         ),
 
         Request::OrchestratorWorkerStatus {
@@ -1810,6 +1812,7 @@ fn dispatch_orchestrator_spawn(
     effort: Option<&str>,
     pane: Option<u64>,
     tab: Option<u64>,
+    caller_role: Option<&str>,
 ) -> Result<Value, DispatchError> {
     if pane.is_none() && tab.is_none() {
         return Err(DispatchError::Operation(
@@ -1824,10 +1827,15 @@ fn dispatch_orchestrator_spawn(
         .resolve_cwd(project)
         .map_err(DispatchError::Operation)?;
 
+    // caller_role から master suffix を抽出する（#109: pane が stale でも正しい master を特定）
+    let role_suffix = caller_role
+        .and_then(|r| r.strip_prefix("master:"))
+        .map(str::to_string);
+
     // model/effort が明示指定されていない場合、呼び出し元 master のプロファイルから解決する。
     // model が None に解決された場合は --model を付けず claude CLI の既定に委ねる（Issue #27）
     let caller_pane = pane.map(PaneId::from_raw);
-    let profile = resolve_caller_profile(host.workspace(), caller_pane);
+    let profile = resolve_caller_profile_with_role(host.workspace(), caller_pane, &role_suffix);
     let model: Option<String> = match model {
         Some(m) => Some(m.to_string()),
         None => profile.resolve_worker_model().map(str::to_string),
@@ -1845,7 +1853,7 @@ fn dispatch_orchestrator_spawn(
         None => format!("{project}-worker"),
     };
 
-    // 分割元ペインの解決。優先順位: pane > tab > master role 検索
+    // 分割元ペインの解決。優先順位: pane > tab > caller_role の suffix > 任意 master
     let resolved_pane = pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok());
     let (tab_id, target) = if let Some(resolved) = resolved_pane {
         resolved
@@ -1856,20 +1864,23 @@ fn dispatch_orchestrator_spawn(
     } else {
         // master role のペインを検索。pane が指定されていても resolve に失敗した場合
         // （再起動で PaneId が変わった stale な値）はここに落ちる。
-        // 複数 master 対応: caller の role suffix（例: ":tako"）と一致する master を優先。
-        // stale な pane からは suffix を取れないため、全 master の中から orchestrator-worker
-        // の spawned_by チェーンを遡って呼び出し元を推定する手段は無い。
-        // → suffix マッチは pane が有効な場合のみ動作する
-        let caller_suffix = resolved_pane
-            .and_then(|(_, pid)| {
-                host.workspace().tabs().iter().find_map(|t| {
-                    t.tree()
-                        .panes()
-                        .iter()
-                        .find(|pp| pp.id() == pid)
-                        .and_then(|pp| pp.role())
-                        .and_then(|r| r.strip_prefix("orchestrator-master"))
-                        .map(|s| s.to_string())
+        // 複数 master 対応（#109）: caller_role（TAKO_ORCHESTRATOR_ROLE）の suffix を
+        // 第一候補にし、pane の role は第二候補。role_suffix があれば pane が stale でも
+        // 正しい master を特定できる
+        let caller_suffix = role_suffix
+            .as_deref()
+            .map(|s| format!(":{s}"))
+            .or_else(|| {
+                resolved_pane.and_then(|(_, pid)| {
+                    host.workspace().tabs().iter().find_map(|t| {
+                        t.tree()
+                            .panes()
+                            .iter()
+                            .find(|pp| pp.id() == pid)
+                            .and_then(|pp| pp.role())
+                            .and_then(|r| r.strip_prefix("orchestrator-master"))
+                            .map(|s| s.to_string())
+                    })
                 })
             })
             .unwrap_or_default();
@@ -2588,15 +2599,17 @@ pub fn fetch_tmux_sessions(ctx: &TmuxContext) -> Vec<Value> {
 /// caller の role（orchestrator-master:X）から直接、または spawned_by チェーンを辿って
 /// master を見つけ、suffix からプロファイルを引く。
 /// 見つからなければ default プロファイルにフォールバック。
-fn resolve_caller_profile(
+/// 呼び出し元 master のプロファイル解決。pane が stale でも role_suffix（TAKO_ORCHESTRATOR_ROLE
+/// 由来）があれば正しいプロファイルを読む（#109）
+fn resolve_caller_profile_with_role(
     workspace: &tako_core::Workspace,
     caller: Option<PaneId>,
+    role_suffix: &Option<String>,
 ) -> crate::orchestrator::Profile {
-    // master が旧バージョンのまま再起動されていない場合でも spawn 経路で
-    // 旧既定値 [1m] を引き継がないよう、読み込み前にマイグレーションする（Issue #27）
     let _ = crate::orchestrator::migrate_legacy_default_profile();
-    let suffix = caller
-        .and_then(|pid| find_master_suffix_from(workspace, pid))
+    let suffix = role_suffix
+        .clone()
+        .or_else(|| caller.and_then(|pid| find_master_suffix_from(workspace, pid)))
         .unwrap_or_default();
     let name = if suffix.is_empty() {
         "default"
@@ -3735,5 +3748,177 @@ mod tests {
         assert!(!evil.exists(), "ファイルが削除されていない");
         assert!(!marker.exists(), "インジェクションの副作用が発生した");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #109: 複数 master 並行時の caller_role による正しい master 特定 ---
+
+    /// テスト用に一時プロジェクトを projects.yaml に追加し、テスト後に削除する
+    fn with_test_project<F: FnOnce()>(f: F) {
+        use crate::orchestrator;
+        let _ = orchestrator::ensure_defaults();
+        let key = "_tako_test_109_";
+        let mut config = orchestrator::ProjectsConfig::load().unwrap();
+        let had = config.projects.contains_key(key);
+        if !had {
+            config.add(key.to_string(), "/tmp".to_string(), None);
+            config.save().unwrap();
+        }
+        f();
+        if !had {
+            let mut config = orchestrator::ProjectsConfig::load().unwrap();
+            config.projects.remove(key);
+            config.save().unwrap();
+        }
+    }
+
+    const TEST_PROJECT: &str = "_tako_test_109_";
+
+    /// 複数 master が存在するとき、caller_role の suffix で正しい master のタブに
+    /// worker が配置されることを検証する（#109 の根本修正）
+    #[test]
+    fn spawn_caller_roleで正しいmasterを特定する() {
+        with_test_project(|| {
+            let mut host = MockHost::new();
+            let tab1_pane = host.root_pane();
+            dispatch(
+                &mut host,
+                Request::Title {
+                    pane: Some(tab1_pane),
+                    title: None,
+                    role: Some("orchestrator-master:fable".into()),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+            let tab2_result =
+                dispatch(&mut host, Request::TabNew { title: None }, PaneOrigin::Cli).unwrap();
+            let tab2_pane = tab2_result["pane"].as_u64().unwrap();
+            dispatch(
+                &mut host,
+                Request::Title {
+                    pane: Some(tab2_pane),
+                    title: None,
+                    role: Some("orchestrator-master:aram".into()),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+
+            // stale な pane を caller_pane として渡し、caller_role でフォールバック
+            let result = dispatch_orchestrator_spawn(
+                &mut host,
+                PaneOrigin::Mcp,
+                TEST_PROJECT,
+                "テスト",
+                None,
+                None,
+                Some("high"),
+                Some(99999),
+                None,
+                Some("master:aram"),
+            );
+            let value = result.expect("caller_role フォールバックで spawn 成功するべき");
+            assert_eq!(
+                value["spawned_by"].as_u64().unwrap(),
+                tab2_pane,
+                "worker は caller_role が示す master:aram のペイン（tab2）から分割されるべき"
+            );
+        });
+    }
+
+    /// caller_role がない場合の旧来フォールバック（最初の master を使う）が維持されること
+    #[test]
+    fn spawn_caller_roleなしはフォールバックで最初のmasterを使う() {
+        with_test_project(|| {
+            let mut host = MockHost::new();
+            let tab1_pane = host.root_pane();
+            dispatch(
+                &mut host,
+                Request::Title {
+                    pane: Some(tab1_pane),
+                    title: None,
+                    role: Some("orchestrator-master".into()),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+
+            let result = dispatch_orchestrator_spawn(
+                &mut host,
+                PaneOrigin::Mcp,
+                TEST_PROJECT,
+                "テスト",
+                None,
+                None,
+                Some("high"),
+                Some(99999),
+                None,
+                None,
+            );
+            let value = result.expect("caller_role なしでも既存フォールバックで成功するべき");
+            assert_eq!(value["spawned_by"].as_u64().unwrap(), tab1_pane);
+        });
+    }
+
+    /// caller_role の suffix が prefix 付きで正しくマッチすること
+    #[test]
+    fn spawn_caller_roleのsuffix抽出が正しい() {
+        with_test_project(|| {
+            let mut host = MockHost::new();
+            let tab1_pane = host.root_pane();
+            dispatch(
+                &mut host,
+                Request::Title {
+                    pane: Some(tab1_pane),
+                    title: None,
+                    role: Some("orchestrator-master:hck".into()),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+            let tab2_result =
+                dispatch(&mut host, Request::TabNew { title: None }, PaneOrigin::Cli).unwrap();
+            let tab2_pane = tab2_result["pane"].as_u64().unwrap();
+            dispatch(
+                &mut host,
+                Request::Title {
+                    pane: Some(tab2_pane),
+                    title: None,
+                    role: Some("orchestrator-master:fable".into()),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+
+            let result = dispatch_orchestrator_spawn(
+                &mut host,
+                PaneOrigin::Mcp,
+                TEST_PROJECT,
+                "テスト",
+                None,
+                None,
+                Some("high"),
+                Some(99999),
+                None,
+                Some("master:hck"),
+            )
+            .unwrap();
+            assert_eq!(result["spawned_by"].as_u64().unwrap(), tab1_pane);
+
+            let result = dispatch_orchestrator_spawn(
+                &mut host,
+                PaneOrigin::Mcp,
+                TEST_PROJECT,
+                "テスト 2",
+                None,
+                None,
+                Some("high"),
+                Some(99999),
+                None,
+                Some("master:fable"),
+            )
+            .unwrap();
+            assert_eq!(result["spawned_by"].as_u64().unwrap(), tab2_pane);
+        });
     }
 }

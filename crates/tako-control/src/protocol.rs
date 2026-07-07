@@ -392,6 +392,10 @@ pub enum Request {
         effort: Option<String>,
         pane: Option<u64>,
         tab: Option<u64>,
+        /// 呼び出し元の TAKO_ORCHESTRATOR_ROLE。複数 master 並行時に pane が stale でも
+        /// 正しい master を特定するフォールバック（#109）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_role: Option<String>,
     },
     /// オーケストレーター: worker の状態確認。`tmux_session` 指定時は pane が gone でも
     /// tmux session 経由で recent_output を取得する
