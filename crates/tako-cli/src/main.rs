@@ -1969,6 +1969,13 @@ fn print_result(command: &Command, result: &Value) {
             if let Some(text) = result["text"].as_str() {
                 println!("{text}");
             }
+            if let Some(status) = result.get("input_status").filter(|v| !v.is_null()) {
+                eprintln!(
+                    "[input_status] style={} text={:?}",
+                    status["style"].as_str().unwrap_or("?"),
+                    status["text"].as_str().unwrap_or(""),
+                );
+            }
         }
         Command::Scroll(_) => println!("{result}"),
         Command::List => {

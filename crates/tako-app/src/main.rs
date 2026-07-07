@@ -4552,6 +4552,7 @@ impl TakoApp {
                     italic: false,
                     underline: false,
                     strikeout: false,
+                    dim: false,
                 };
                 let run_highlights: Vec<HighlightStyle> =
                     line.runs.iter().map(|r| self.run_highlight(r)).collect();

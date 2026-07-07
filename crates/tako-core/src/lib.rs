@@ -30,7 +30,7 @@ pub use pane_tree::{
     SplitDirection,
 };
 pub use ports::ListenPort;
-pub use screen::{Screen, ScreenLine, StyleRun};
+pub use screen::{InputStatus, InputStyle, Screen, ScreenLine, StyleRun};
 pub use tab::{Tab, TabId};
 pub use terminal::{
     login_shell_command, AgentMetrics, CommandState, SelectionKind, SessionError, SessionEvent,

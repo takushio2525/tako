@@ -239,7 +239,11 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_read_pane",
             "description": "指定ペインの画面内容（表示中のテキスト）を返す。\
                 別ペインで実行したコマンドの結果確認や、エージェント・dev サーバーの出力監視に使う。\
-                tmux_session を指定するとペインが見つからない場合でも tmux session 経由で読める。",
+                tmux_session を指定するとペインが見つからない場合でも tmux session 経由で読める。\
+                応答の input_status は Claude Code TUI の入力行（❯）のテキスト属性を示す: \
+                style が ghost なら自動提案（ゴーストテキスト）、user なら手動入力、\
+                mixed なら混在、none なら入力テキストなし。❯ 行が見つからなければ null。\
+                重要: ghost の場合はユーザーの意図した入力ではないため、送信してはならない。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

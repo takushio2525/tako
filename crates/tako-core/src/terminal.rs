@@ -560,6 +560,13 @@ impl TerminalSession {
         let lines = self.visible_lines();
         parse_agent_metrics(&lines)
     }
+
+    /// Claude TUI の入力行（❯）のテキストがゴースト（自動提案）か手動入力かを分析する。
+    /// screen snapshot のスタイルラン（dim フラグ）を検査して判定する
+    pub fn analyze_input(&self) -> Option<screen::InputStatus> {
+        let scr = self.screen(&Theme::default());
+        screen::analyze_input_line(&scr)
+    }
 }
 
 /// Claude TUI フッターから抽出したエージェントメトリクス
