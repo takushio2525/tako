@@ -4,14 +4,19 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-07・#104 remote セキュリティ強化をマージ・実機反映）
+## 現在の対象（2026-07-07・v0.3.1 リリース済み。remote セキュリティ強化 #104 完了）
 
-直近作業 = #104（tako remote 監査 + 推奨6件実装、PR #105 = `5782367` マージ済み、
-`build-app.sh --install` で 0.3.0 反映済み）。**要 tako 再起動**で新 CLI 経路
-（`remote start` の暗号化トンネル必須化 / `--insecure` opt-in / `--show-token`）が GUI に反映される。
-remote は secure-by-default（トンネル不成立で起動拒否）に変わった。secure 拒否の runtime 観測は
-cloudflared を隠せず未実施（コード+build 担保。監査レポート `reviews/2026-07-07_takoremote再監査.md`）。
-Unreleased に #95 / #100 / #104 が溜まっている（次リリース 0.3.1 未実施）。
+**v0.3.1 リリース完了**（tag `v0.3.1` / GitHub Release / cask は未更新 / Pages デプロイ済み /
+`/Applications` に 0.3.1 配置済み）。内容 = #104 remote セキュリティ強化（secure-by-default =
+暗号化トンネル必須・不成立で起動拒否 / `--insecure` opt-in / トークン定数時間比較 / token・QR 0o600 /
+status のトークン既定マスク（connect_url 内も）/ リレー IP レートリミット）+ #95 + #100。
+tako は再起動済み（master が CLI 経路で secure 挙動を実機確認済み。connect_url マスクも live 確認）。
+remote デーモンはローテーション後の新トークンで稼働中（pid 19941・secure トンネル）。
+
+- **未反映**: リレー worker のレートリミットは live relay に未デプロイ。
+  `cd web/tako-remote-worker && npm run deploy`（wrangler 認証済み）でユーザーが反映する
+- cask 0.3.1 更新は未実施（`homebrew-tako` 側。過去リリース同様ユーザー判断で）
+- 監査レポート: `reviews/2026-07-07_takoremote再監査.md`
 
 ---
 

@@ -431,6 +431,18 @@
   profiles の prompt_blocks.append へ移行。`build-app.sh --install` 済み（反映は tako 再起動後）
 - 次: tako 再起動後に `tako master` で分担計画・検収挙動を実運用確認
 
+## 2026-07-07（v0.3.1 リリース + connect_url トークンマスク修正）
+- 追加バグ修正（#104）: `remote status` の既定マスクで token フィールドは *** だが
+  connect_url/fallback_url のクエリに token=生値が残っていた → `mask_token_in_url` 新設で
+  URL 内 token= も伏せる（--show-token/MCP show_token=true で生値）。単体テスト 2 本追加（PR #106）
+- v0.3.1 リリース: version bump + CHANGELOG [0.3.1]（#104 を Security 記載、#95/#100 同梱）。
+  annotated tag `v0.3.1` + `release.sh --publish --skip-build`（zip + Pages デプロイ +
+  gh release --generate-notes）+ `build-app.sh --install`（/Applications 0.3.1）
+- トークンローテーション実施: remote stop→start（旧 pid 10485 の leaked token を無効化 →
+  新 pid 19941・新トンネル・token マスク確認）。secure start が実トンネルを張って成立まで観測
+- 関連コミット: `1636683`（#106）、tag `v0.3.1`、Release https://github.com/takushio2525/tako/releases/tag/v0.3.1
+- 次: リレー worker のレートリミットは live relay 未反映（`cd web/tako-remote-worker && npm run deploy` が別途必要 = ユーザー作業）
+
 ## 2026-07-07（#104: tako remote セキュリティ監査 + 推奨対応6件実装）
 - 再監査レポート `reviews/2026-07-07_takoremote再監査.md`（認証/暗号化/外部依存/漏えい/
   任意コマンド実行 + 日本法リスク整理）を作成。推奨6件を実装: ①暗号化トンネル必須化
