@@ -31,6 +31,7 @@ pub struct StyleRun {
     pub italic: bool,
     pub underline: bool,
     pub strikeout: bool,
+    pub dim: bool,
 }
 
 /// 1 行分の表示内容
@@ -72,6 +73,7 @@ struct CellStyle {
     italic: bool,
     underline: bool,
     strikeout: bool,
+    dim: bool,
 }
 
 /// Term の表示内容を色解決済みスナップショットへ変換する
@@ -100,6 +102,7 @@ pub(crate) fn snapshot_opts<T: EventListener>(
         italic: false,
         underline: false,
         strikeout: false,
+        dim: false,
     };
     // フラット配列（rows 個の内側 Vec 割り当てを回避）
     let mut grid: Vec<(char, CellStyle)> = vec![(' ', default_style.clone()); cols * rows];
@@ -165,6 +168,7 @@ pub(crate) fn snapshot_opts<T: EventListener>(
                 italic: flags.intersects(Flags::ITALIC),
                 underline: flags.intersects(Flags::ALL_UNDERLINES),
                 strikeout: flags.intersects(Flags::STRIKEOUT),
+                dim: flags.contains(Flags::DIM),
             },
         );
     }
@@ -191,7 +195,8 @@ pub(crate) fn snapshot_opts<T: EventListener>(
                             && last.bold == style.bold
                             && last.italic == style.italic
                             && last.underline == style.underline
-                            && last.strikeout == style.strikeout =>
+                            && last.strikeout == style.strikeout
+                            && last.dim == style.dim =>
                     {
                         last.range.end = end;
                     }
@@ -203,6 +208,7 @@ pub(crate) fn snapshot_opts<T: EventListener>(
                         italic: style.italic,
                         underline: style.underline,
                         strikeout: style.strikeout,
+                        dim: style.dim,
                     }),
                 }
             }
@@ -256,6 +262,108 @@ fn named_color(n: NamedColor, theme: &Theme) -> Rgb {
         // DimBlack..=DimWhite は対応する通常色の減光
         _ => theme.ansi[idx - NamedColor::DimBlack as usize].dim(DIM_FACTOR),
     }
+}
+
+/// Claude TUI 入力行のテキストの属性分類
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputStyle {
+    /// 全セルが dim — 自動提案（ゴーストテキスト）
+    Ghost,
+    /// 全セルが non-dim — ユーザー手動入力
+    User,
+    /// dim / non-dim が混在
+    Mixed,
+    /// 入力テキストなし（❯ の右が空）
+    None,
+}
+
+/// Claude TUI 入力行の分析結果
+#[derive(Debug, Clone)]
+pub struct InputStatus {
+    /// ❯ を含む行全体
+    pub line: String,
+    /// ❯ の右側のテキスト（trim 済み）
+    pub text: String,
+    /// テキストの属性分類
+    pub style: InputStyle,
+}
+
+/// Screen の行リストから Claude TUI の入力行（❯）を探し、入力テキストの
+/// dim 状態を分析する。❯ 行が見つからなければ None
+pub fn analyze_input_line(screen: &Screen) -> Option<InputStatus> {
+    // Claude TUI は ❯ の下にフッター（区切り線・モデル情報・ctx%）が 4〜6 行あるため、
+    // 末尾 10 行の範囲で最後の ❯ 行を探す（wait.rs の screen_looks_idle と同じ走査範囲）
+    let start = screen.lines.len().saturating_sub(10);
+    let mut found: Option<(usize, usize)> = None; // (行 index, ❯ のバイト位置)
+    for i in start..screen.lines.len() {
+        let trimmed = screen.lines[i].text.trim_start();
+        if trimmed.starts_with('❯') {
+            let leading_spaces = screen.lines[i].text.len() - trimmed.len();
+            found = Some((i, leading_spaces));
+        }
+    }
+    let (line_idx, prompt_byte_pos) = found?;
+    let line = &screen.lines[line_idx];
+    let full_line = line.text.trim_end().to_string();
+
+    // ❯ の右側のテキストを抽出
+    let after_prompt = &line.text[prompt_byte_pos..];
+    let after_char = after_prompt
+        .strip_prefix('❯')
+        .unwrap_or(after_prompt)
+        .trim_start();
+    let input_text = after_char.trim_end().to_string();
+
+    if input_text.is_empty() {
+        return Some(InputStatus {
+            line: full_line,
+            text: input_text,
+            style: InputStyle::None,
+        });
+    }
+
+    // 入力テキスト部分のバイト範囲を特定
+    // ❯ の後のスペースを飛ばした位置が入力テキストの開始
+    let prompt_str = &line.text[prompt_byte_pos..];
+    let after_prompt_marker = &prompt_str['❯'.len_utf8()..];
+    let trimmed_len = after_prompt_marker.trim_start().len();
+    let input_byte_start = line.text.len() - trimmed_len;
+    // trim_end 後のテキスト長が input_text
+    let input_byte_end = input_byte_start + input_text.len();
+
+    // 入力テキスト範囲に重なるランの dim 状態を集計
+    let mut has_dim = false;
+    let mut has_normal = false;
+    for run in &line.runs {
+        // ランと入力テキスト範囲が重なるかチェック
+        if run.range.end <= input_byte_start || run.range.start >= input_byte_end {
+            continue;
+        }
+        // 重なる範囲のテキストが空白だけならスキップ
+        let overlap_start = run.range.start.max(input_byte_start);
+        let overlap_end = run.range.end.min(input_byte_end);
+        if line.text[overlap_start..overlap_end].trim().is_empty() {
+            continue;
+        }
+        if run.dim {
+            has_dim = true;
+        } else {
+            has_normal = true;
+        }
+    }
+
+    let style = match (has_dim, has_normal) {
+        (true, false) => InputStyle::Ghost,
+        (false, true) => InputStyle::User,
+        (true, true) => InputStyle::Mixed,
+        (false, false) => InputStyle::None,
+    };
+
+    Some(InputStatus {
+        line: full_line,
+        text: input_text,
+        style,
+    })
 }
 
 #[cfg(test)]
@@ -335,6 +443,62 @@ mod tests {
         let s = snapshot(&term, &theme());
         let run = run_for(&s.lines[0], "X");
         assert!(run.bold && run.italic && run.underline && run.strikeout);
+        assert!(!run.dim);
+    }
+
+    #[test]
+    fn dimフラグがランへ写る() {
+        let term = term_with(b"\x1b[2mDIM\x1b[0mNORMAL");
+        let s = snapshot(&term, &theme());
+        let dim_run = run_for(&s.lines[0], "DIM");
+        assert!(dim_run.dim);
+        let normal_run = run_for(&s.lines[0], "NORMAL");
+        assert!(!normal_run.dim);
+    }
+
+    fn make_screen(text_bytes: &[u8]) -> Screen {
+        let term = term_with(text_bytes);
+        snapshot(&term, &theme())
+    }
+
+    #[test]
+    fn 入力行分析_ゴーストテキスト検出() {
+        // ❯ の後に dim テキスト = ghost
+        let s = make_screen("output\r\n❯ \x1b[2mghost suggestion\x1b[0m".as_bytes());
+        let status = analyze_input_line(&s).expect("❯ 行がある");
+        assert_eq!(status.text, "ghost suggestion");
+        assert_eq!(status.style, InputStyle::Ghost);
+    }
+
+    #[test]
+    fn 入力行分析_ユーザー入力検出() {
+        // ❯ の後に通常テキスト = user
+        let s = make_screen("output\r\n❯ user typed text".as_bytes());
+        let status = analyze_input_line(&s).expect("❯ 行がある");
+        assert_eq!(status.text, "user typed text");
+        assert_eq!(status.style, InputStyle::User);
+    }
+
+    #[test]
+    fn 入力行分析_空入力() {
+        let s = make_screen("output\r\n❯ ".as_bytes());
+        let status = analyze_input_line(&s).expect("❯ 行がある");
+        assert_eq!(status.text, "");
+        assert_eq!(status.style, InputStyle::None);
+    }
+
+    #[test]
+    fn 入力行分析_プロンプトなし() {
+        let s = make_screen(b"just some output\r\nno prompt here");
+        assert!(analyze_input_line(&s).is_none());
+    }
+
+    #[test]
+    fn 入力行分析_混在() {
+        // dim + non-dim の混在
+        let s = make_screen("❯ \x1b[2mghost\x1b[0m real".as_bytes());
+        let status = analyze_input_line(&s).expect("❯ 行がある");
+        assert_eq!(status.style, InputStyle::Mixed);
     }
 
     #[test]

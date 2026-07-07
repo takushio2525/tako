@@ -211,8 +211,8 @@ fn 残留テキストをenter単独送達で送信できる() {
     // 入力欄（❯）の表示を待つ
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let lines = tako_core::tmux::capture_session(Some(SOCKET), &guard.session)
-            .expect("画面を読める");
+        let lines =
+            tako_core::tmux::capture_session(Some(SOCKET), &guard.session).expect("画面を読める");
         if claude_tui::input_line(&lines).is_some() {
             break;
         }

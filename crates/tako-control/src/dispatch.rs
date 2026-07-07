@@ -476,18 +476,21 @@ pub fn dispatch(
             let read_result = resolve_pane(host.workspace(), pane)
                 .ok()
                 .and_then(|(_, target)| {
-                    host.session(target)
-                        .map(|session| (target.as_u64(), session.visible_lines()))
+                    host.session(target).map(|session| {
+                        let lines = session.visible_lines();
+                        let input = session.analyze_input();
+                        (target.as_u64(), lines, input)
+                    })
                 });
 
-            let (pane_id, mut all) = match read_result {
+            let (pane_id, mut all, input_status) = match read_result {
                 Some(r) => r,
                 None => {
                     if let Some(ref ts) = tmux_session {
                         let socket = tako_core::tmux_backend::socket_name();
                         let captured = tako_core::tmux::capture_session(Some(&socket), ts)
                             .map_err(DispatchError::Operation)?;
-                        (pane.unwrap_or(0), captured)
+                        (pane.unwrap_or(0), captured, None)
                     } else {
                         let (_, target) = resolve_pane(host.workspace(), pane)?;
                         return Err(DispatchError::NoSession(target.as_u64()));
@@ -503,7 +506,19 @@ pub fn dispatch(
                     all.drain(..all.len() - n);
                 }
             }
-            Ok(json!({ "pane": pane_id, "text": all.join("\n") }))
+            let input_json = input_status.map(|s| {
+                json!({
+                    "line": s.line,
+                    "text": s.text,
+                    "style": match s.style {
+                        tako_core::InputStyle::Ghost => "ghost",
+                        tako_core::InputStyle::User => "user",
+                        tako_core::InputStyle::Mixed => "mixed",
+                        tako_core::InputStyle::None => "none",
+                    },
+                })
+            });
+            Ok(json!({ "pane": pane_id, "text": all.join("\n"), "input_status": input_json }))
         }
 
         Request::Scroll { pane, to, delta } => {
