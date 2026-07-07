@@ -87,3 +87,30 @@ changes:
       pending-changes.md（未適用分）としても書き出される。
       ユーザーには「今後は tako setup を実行するだけで最新の設定フォーマットに
       追従できる」ことを伝えればよい。
+
+  - revision: 5
+    version: "0.3.1"
+    date: "2026-07-07"
+    kind: guided
+    title: オーケストレーション品質パイプラインを標準化（タスク分割・worker プロンプトの型・受け入れ検査 + CLAUDE.md 完了検証セクション）
+    description: |
+      master 用デフォルトシステムプロンプトに品質パイプラインが入った（Issue #100）:
+      task-intake（依頼を列挙し「1 worker = 1 成果物」で割り当てる必須手順）、
+      worker-prompt-template（受け入れ条件・検証手順・証拠つき報告様式を必須化した
+      worker プロンプトの型）、acceptance（worker の完了報告を証拠と diff で検査して
+      からユーザーに報告する手順）。既存ブロック名は維持されているため、
+      prompt_blocks によるカスタマイズはそのまま動く。
+      加えて CLAUDE.md セクションテンプレートに 06-completion-verification
+      （完了報告前の自己検証ゲートと証拠つき報告のルール）が新設された。
+      確認手順:
+      (1) `~/Library/Application Support/tako/orchestrator/master-system.md` と
+          profiles/*.yaml の `system_prompt` 指定の有無を確認する。どちらも無ければ
+          master 側はバイナリ更新だけで自動追従済み（変更概要を伝えるのみでよい）
+      (2) カスタム master-system.md / system_prompt がある場合、新しい品質パイプラインは
+          反映されない。カスタムの意図（全文差し替えか一部調整か）をユーザーに確認し、
+          一部調整なら profiles の prompt_blocks（disable / override_blocks / prepend /
+          append）への移行を提案する。ユーザーの同意なしに削除・上書きしない
+      (3) ~/.claude/CLAUDE.md を Read し、完了検証（完了報告前の自己検証）に相当する
+          節が既にあるかを確認する。無ければ templates/sections/06-completion-verification.md
+          を参考に追加を提案する。既にあれば対象外。追記はユーザーの同意を得てから行い、
+          既存の記述は書き換えない
