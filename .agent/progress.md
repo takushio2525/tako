@@ -430,3 +430,10 @@
 - ローカル反映済み: master-system.md → .bak-20260707 退避、個人ルールは local-rules.md +
   profiles の prompt_blocks.append へ移行。`build-app.sh --install` 済み（反映は tako 再起動後）
 - 次: tako 再起動後に `tako master` で分担計画・検収挙動を実運用確認
+
+## 2026-07-07（#95 実機検証完了 + #103 起票）
+- tako 再起動（14:08、新プロセス確認）後に #95 修正を実機検証: プローブのバイト観測で
+  Enter 代行が「括りなし CR 即発火」（旧: 空括り+13 秒）、残留テキストの Enter 代行
+  4 連続成功、busy（生成）中の Enter 送達が queue 成立 → タスク完了後の自動送達まで確認
+- 副産物: Cmd-Q で tako が終了しない事象（2 回再現、Dock 終了は正常）を #103 に起票（未修正）
+- 次: なし（#95 クローズ済み。次リリースで Unreleased の #95/#100 を出荷）
