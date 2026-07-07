@@ -427,4 +427,6 @@
   （証拠と diff で検収してから報告）を新設。setup 配布物に CLAUDE.md セクション
   06-completion-verification 新設 + changes.yaml rev 5（guided）で既存ユーザー追従
 - 設計意図は `reviews/2026-07-07_オーケストレーション品質設計.md`。docs 2 ページ更新
-- 次: ローカル master-system.md のシャドウ解除（prompt_blocks 移行）+ build-app.sh --install
+- ローカル反映済み: master-system.md → .bak-20260707 退避、個人ルールは local-rules.md +
+  profiles の prompt_blocks.append へ移行。`build-app.sh --install` 済み（反映は tako 再起動後）
+- 次: tako 再起動後に `tako master` で分担計画・検収挙動を実運用確認
