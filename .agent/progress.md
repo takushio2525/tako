@@ -420,3 +420,11 @@
 - 検証: build / clippy(-D warnings) / fmt / test 全緑（unit +3）、実 claude e2e 2 本
   （Enter 単独送達 新規 + 事前信頼送達 回帰）緑
 - 次: PR squash merge → `build-app.sh --install` → tako 再起動（ユーザー）で GUI 経路の実機確認
+
+## 2026-07-07（#100: オーケストレーション品質パイプラインの標準化）
+- master 用 default system prompt に task-intake（依頼列挙 → 1 worker = 1 成果物）/
+  worker-prompt-template（受け入れ条件・検証手順・証拠つき報告の型）/ acceptance
+  （証拠と diff で検収してから報告）を新設。setup 配布物に CLAUDE.md セクション
+  06-completion-verification 新設 + changes.yaml rev 5（guided）で既存ユーザー追従
+- 設計意図は `reviews/2026-07-07_オーケストレーション品質設計.md`。docs 2 ページ更新
+- 次: ローカル master-system.md のシャドウ解除（prompt_blocks 移行）+ build-app.sh --install

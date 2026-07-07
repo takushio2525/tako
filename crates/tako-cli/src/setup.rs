@@ -28,6 +28,8 @@ const TPL_04_SAFETY: &str =
     include_str!("../../../resources/setup/templates/sections/04-safety-rules.md");
 const TPL_05_PROPOSAL: &str =
     include_str!("../../../resources/setup/templates/sections/05-proposal-quality.md");
+const TPL_06_VERIFICATION: &str =
+    include_str!("../../../resources/setup/templates/sections/06-completion-verification.md");
 const CONFIG_DEFAULT: &str = include_str!("../../../resources/setup/templates/config-default.yaml");
 
 // --- パスユーティリティ ---
@@ -279,6 +281,11 @@ fn write_all_resources(setup_dir: &Path) -> Result<(), String> {
         setup_dir,
         "templates/sections/05-proposal-quality.md",
         TPL_05_PROPOSAL,
+    )?;
+    write_resource(
+        setup_dir,
+        "templates/sections/06-completion-verification.md",
+        TPL_06_VERIFICATION,
     )?;
     write_resource(setup_dir, "templates/config-default.yaml", CONFIG_DEFAULT)?;
     // setup changelog の全履歴（setup エージェントが Read できるように毎回最新を展開）
@@ -899,6 +906,7 @@ mod tests {
         assert!(!TPL_03_CODE.is_empty());
         assert!(!TPL_04_SAFETY.is_empty());
         assert!(!TPL_05_PROPOSAL.is_empty());
+        assert!(!TPL_06_VERIFICATION.is_empty());
         assert!(!CONFIG_DEFAULT.is_empty());
         assert!(!CHANGES_YAML.is_empty());
     }
