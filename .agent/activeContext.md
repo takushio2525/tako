@@ -4,14 +4,15 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-06・#94 setup アップデート追従を実装）
+## 現在の対象（2026-07-07・#95 Enter 空振り修正）
 
-`tako setup` にアップデート追従機能を追加（Issue #94）。バイナリ同梱の setup changelog
-（`resources/setup/changes.yaml`、revision 連番 + kind auto/guided）と config.yaml の
-`setup.applied_revision` の突き合わせで未適用変更を検出。共有ロジックは
-`tako-control::setup` 新設（config.yaml スキーマもここへ移動、CLI/MCP 共有 = #83 の教訓）。
-CLI `tako setup --changes [--json]` + MCP `tako_setup_changes`（計 52 ツール）+
-pending-changes.md 書き出し + setup 用 system prompt に追従フロー追記。
+worker ペインの claude TUI で Enter が空振りする問題（#95）を修正（fix/95-enter-delivery）。
+調査で確定した事実: claude TUI は LF を「改行挿入」と解釈し送信にならない（B-2 の根因）/
+`text:""+newline:true` は空 paste + 10 秒無駄待ち + 検証常時成功扱いで再送ゼロ（B-1 の根因）/
+busy 中の claude は Enter を取りこぼすことがあり、CR 1 発の代行では残留が復旧しない
+（実機 transcript の pane192 事例）。修正 = ①人間の Enter に送達検証 + 自動再送
+（handle_key で baseline 記録 → PromptFlow enter_only）②Enter 単独送達フロー新設
+（即 CR + 入力欄空検証 + 再送。dispatch / deliver_via_tmux 両経路）③直接 write の LF→CR 正規化。
 
 - setup 関連の変更を入れたら `resources/setup/changes.yaml` に revision を 1 増やして追記する
   （運用ルール。記入方法はファイル冒頭コメント。連番・非空はテストで機械検証）

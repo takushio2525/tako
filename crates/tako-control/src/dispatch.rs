@@ -157,6 +157,10 @@ pub trait ControlHost {
     /// ステートマシンだが claude TUI の起動を待たず、現画面へ即座に貼り付ける
     /// （全画面 TUI への newline つき送信用）。既定実装は何もしない（テスト用モック等）
     fn queue_send_flow(&mut self, _pane: PaneId, _text: String) {}
+    /// Enter 単独の送達確認フローを登録する（Issue #95）。入力欄に残留した
+    /// テキストの送信代行: 貼り付けせず Enter を送り、入力欄が空へ戻るまで
+    /// 単独再送する。既定実装は何もしない（テスト用モック等）
+    fn queue_enter_flow(&mut self, _pane: PaneId) {}
     /// リモートアクセス API サーバーを起動する。成功時は状態 JSON を返す。
     /// `no_tunnel` = true で cloudflared を起動しない（LAN のみ）
     fn remote_start(&mut self, _port: Option<u16>, _no_tunnel: bool) -> Result<Value, String> {
@@ -410,17 +414,30 @@ pub fn dispatch(
                     let session = host
                         .session(target)
                         .ok_or(DispatchError::NoSession(target.as_u64()))?;
-                    // 全画面 TUI（claude 等）への改行つき送信は送達確認フローへ（Issue #32:
-                    // 一括書き込みは改行が「送信」と解釈されず入力欄に残留する）。
-                    // シェルへの送信は従来どおり即時書き込み（挙動・レイテンシ据え置き）
-                    if newline && session.is_alt_screen() {
-                        host.queue_send_flow(target, text.clone());
-                        return Ok(json!({ "queued": true }));
+                    if session.is_alt_screen() {
+                        // Enter 単独送信（text が空 / 改行のみ）は送達確認つき Enter フローへ
+                        // （Issue #95: 素の CR 1 発は claude TUI に取りこぼされることがあり、
+                        // LF は「改行挿入」と解釈され送信にならない）
+                        if send_is_enter_only(&text, newline) {
+                            host.queue_enter_flow(target);
+                            return Ok(json!({ "queued": true }));
+                        }
+                        // 全画面 TUI（claude 等）への改行つき送信は送達確認フローへ（Issue #32:
+                        // 一括書き込みは改行が「送信」と解釈されず入力欄に残留する）
+                        if newline {
+                            host.queue_send_flow(target, text.clone());
+                            return Ok(json!({ "queued": true }));
+                        }
                     }
+                    // シェルへの送信は従来どおり即時書き込み（挙動・レイテンシ据え置き）。
+                    // キーボード入力の意味論で書くため LF は Enter（CR）へ正規化する
+                    // （Issue #95: 端末の Enter は CR。LF のままだと claude 等の TUI で
+                    // 送信にならない）
+                    let normalized = normalize_newlines_for_keys(&text);
                     let payload = if newline {
-                        format!("{text}\r")
+                        format!("{normalized}\r")
                     } else {
-                        text.clone()
+                        normalized
                     };
                     session.write(payload.into_bytes());
                     Ok(Value::Null)
@@ -429,13 +446,18 @@ pub fn dispatch(
                     if let Some(ref ts) = tmux_session {
                         if newline {
                             // 改行つき送信は送達確認つき配送（対象が claude TUI なら
-                            // 貼り付け + 分離 Enter + 検証、シェルなら即時に無害劣化）
+                            // 貼り付け + 分離 Enter + 検証、シェルなら即時に無害劣化。
+                            // text が空 / 改行のみなら Enter 単独送達 = Issue #95）
                             spawn_tmux_delivery(ts.clone(), text.clone(), false);
                             Ok(json!({ "queued": true }))
                         } else {
                             let socket = tako_core::tmux_backend::socket_name();
-                            tako_core::tmux::send_keys(Some(&socket), ts, &text)
-                                .map_err(DispatchError::Operation)?;
+                            tako_core::tmux::send_keys(
+                                Some(&socket),
+                                ts,
+                                &normalize_newlines_for_keys(&text),
+                            )
+                            .map_err(DispatchError::Operation)?;
                             Ok(Value::Null)
                         }
                     } else {
@@ -1721,6 +1743,21 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
             "action が不正: {other}（list / show / set）"
         ))),
     }
+}
+
+/// 「Enter 単独送信」の意図判定（Issue #95）: text が空 / 改行のみなら、意図は
+/// テキスト入力ではなく Enter キー（入力欄に残ったテキストの送信代行等）。
+/// `text:"" + newline:true`（Enter 代行）と `text:"\n"`（改行そのもの）の両方を拾う。
+/// `text:"" + newline:false` は「何も送らない」なので対象外
+fn send_is_enter_only(text: &str, newline: bool) -> bool {
+    text.chars().all(|c| c == '\n' || c == '\r') && (newline || !text.is_empty())
+}
+
+/// キーボード入力の意味論での改行正規化（Issue #95）: 端末の Enter キーは CR であり、
+/// LF は claude TUI で「改行挿入」と解釈され送信にならない。PTY へ直接書く経路では
+/// LF / CRLF を CR へ揃える（bracketed paste 経由の貼り付けは対象外）
+fn normalize_newlines_for_keys(text: &str) -> String {
+    text.replace("\r\n", "\r").replace('\n', "\r")
 }
 
 /// tmux セッションへの送達確認つき配送をバックグラウンドスレッドで実行する
@@ -3206,6 +3243,30 @@ mod tests {
         // ツリー構造（ルートが split で leaf を 2 つ持つ）
         assert_eq!(tabs[0]["tree"]["type"].as_str(), Some("split"));
         assert_eq!(tabs[0]["tree"]["second"]["id"].as_u64(), Some(new_id));
+    }
+
+    #[test]
+    fn enter単独送信の意図判定() {
+        // Enter 代行（text 空 + newline）と改行のみのテキスト（Issue #95）
+        assert!(send_is_enter_only("", true));
+        assert!(send_is_enter_only("\n", false));
+        assert!(send_is_enter_only("\n", true));
+        assert!(send_is_enter_only("\r", false));
+        assert!(send_is_enter_only("\r\n", false));
+        // 通常テキストは対象外
+        assert!(!send_is_enter_only("ls", true));
+        assert!(!send_is_enter_only("a\nb", true));
+        // text 空 + newline なしは「何も送らない」指示のため対象外
+        assert!(!send_is_enter_only("", false));
+    }
+
+    #[test]
+    fn キーボード改行正規化はlfをcrへ揃える() {
+        // 端末の Enter は CR。LF のままだと claude TUI で送信にならない（Issue #95）
+        assert_eq!(normalize_newlines_for_keys("ls\n"), "ls\r");
+        assert_eq!(normalize_newlines_for_keys("a\r\nb\nc"), "a\rb\rc");
+        assert_eq!(normalize_newlines_for_keys("そのまま"), "そのまま");
+        assert_eq!(normalize_newlines_for_keys("\n"), "\r");
     }
 
     #[test]

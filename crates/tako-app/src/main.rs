@@ -201,6 +201,12 @@ struct PromptFlow {
     /// true = claude TUI の起動（alt_screen + ❯）を待つ（spawn / await_prompt）。
     /// false = 現画面へ即貼り付けの汎用送信（TUI でなければ 2 秒待って貼る）
     wait_tui: bool,
+    /// Enter 単独送達モード（Issue #95）: 貼り付けせず Enter を送り、入力欄が
+    /// 空へ戻るまで単独再送する（入力欄に残留したテキストの送信代行）
+    enter_only: bool,
+    /// enter_only の残留判定基準: Enter 送信時点の入力欄内容。検証時に
+    /// 同じ内容が残っていれば未送達とみなし Enter を再送する
+    baseline: Option<String>,
 }
 
 impl PromptFlow {
@@ -220,7 +226,28 @@ impl PromptFlow {
             trust_accepts: 0,
             enter_retries_left: 4,
             wait_tui,
+            enter_only: false,
+            baseline: None,
         }
+    }
+
+    /// Enter 単独送達フロー（Issue #95）: dispatch の Enter 単独送信
+    /// （text が空 / 改行のみ）用。信頼ダイアログ処理 → Enter → 空検証 + 再送
+    fn new_enter_only(pane: PaneId) -> Self {
+        let mut flow = Self::new(pane, String::new(), false);
+        flow.enter_only = true;
+        flow
+    }
+
+    /// 人間の Enter の送達検証フロー（Issue #95）: Enter は handle_key で書き込み済み
+    /// のため検証（VerifySubmitted）から開始する。`baseline` は Enter 書き込み直前の
+    /// 入力欄内容（同じ内容が残っていれば未送達 = Enter を単独再送）
+    fn new_enter_verify(pane: PaneId, baseline: String) -> Self {
+        let mut flow = Self::new(pane, String::new(), false);
+        flow.enter_only = true;
+        flow.baseline = Some(baseline);
+        flow.state = PromptFlowState::VerifySubmitted;
+        flow
     }
 }
 
@@ -2199,6 +2226,20 @@ impl TakoApp {
                             flow.trust_accepts += 1;
                             flow.state_entered_at = now;
                         }
+                    } else if flow.enter_only {
+                        // Enter 単独送達（Issue #95）: 貼り付けせず、入力欄の現内容を
+                        // 残留判定の基準に控えて Enter を送る。❯ が見えない画面
+                        // （他 TUI 等）へも 2 秒待って Enter だけ送る（検証は不能 = 1 発）
+                        if claude_tui::input_line(&lines).is_some()
+                            || flow.state_entered_at.elapsed() > std::time::Duration::from_secs(2)
+                        {
+                            flow.baseline = claude_tui::input_line(&lines)
+                                .filter(|s| !claude_tui::input_content_is_empty(s))
+                                .map(str::to_string);
+                            session.write(b"\r".to_vec());
+                            flow.state = PromptFlowState::VerifySubmitted;
+                            flow.state_entered_at = now;
+                        }
                     } else if claude_tui::input_line(&lines).is_some()
                         || (!flow.wait_tui
                             && flow.state_entered_at.elapsed() > std::time::Duration::from_secs(2))
@@ -2233,7 +2274,18 @@ impl TakoApp {
                     // Enter の画面反映を 1 tick 待ってから検証する
                     if flow.state_entered_at.elapsed() >= std::time::Duration::from_millis(400) {
                         let lines = session.visible_lines();
-                        if !claude_tui::input_residual(&lines, &flow.prompt) {
+                        let residual = if flow.enter_only {
+                            // Enter 単独送達（Issue #95）: 基準と同じ非空テキストが
+                            // 入力欄に残っている = Enter 未送達。空 / プレースホルダ /
+                            // 別内容（ユーザーが打ち直した等）なら完了とみなし干渉しない
+                            match (claude_tui::input_line(&lines), flow.baseline.as_deref()) {
+                                (Some(content), Some(base)) => content == base,
+                                _ => false,
+                            }
+                        } else {
+                            claude_tui::input_residual(&lines, &flow.prompt)
+                        };
+                        if !residual {
                             // 入力欄が空へ戻った = 送信された
                             flow.state = PromptFlowState::Done;
                         } else if flow.enter_retries_left > 0 {
@@ -2258,6 +2310,20 @@ impl TakoApp {
             }
         }
         self.prompt_flows = remaining;
+    }
+
+    /// 人間の Enter の送達検証フロー（Issue #95）を登録する。同一ペインに
+    /// enter_only フローが既にあれば積まない（連打対策。先行フローの再送が代表する）
+    fn queue_enter_verify(&mut self, pane: PaneId, baseline: String) {
+        if self
+            .prompt_flows
+            .iter()
+            .any(|f| f.pane == pane && f.enter_only)
+        {
+            return;
+        }
+        self.prompt_flows
+            .push(PromptFlow::new_enter_verify(pane, baseline));
     }
 
     fn collect_tmux_context(&self) -> tako_control::TmuxContext {
@@ -3101,10 +3167,29 @@ impl TakoApp {
         if let Some(bytes) = keystroke_to_bytes(keystroke, csi_u) {
             // tmux スクロール中（copy-mode）は iTerm2 流に最下部へ戻してから流す
             // （copy-mode にキーが飲まれて「入力が反映されない」症状の根治）
-            self.cancel_scroll_before_input(self.focused_pane());
+            let pane = self.focused_pane();
+            self.cancel_scroll_before_input(pane);
+            let mut enter_baseline = None;
+            let mut wrote = false;
             if let Some(session) = self.focused_session() {
                 session.clear_selection();
+                // Enter 送達検証の基準（Issue #95）: claude TUI の入力欄に非空テキストが
+                // ある状態への Enter は busy 中などに取りこぼされることがある。
+                // 書き込み前の入力欄内容を控え、残留していれば Enter を単独再送する
+                if bytes.as_slice() == b"\r" && session.is_alt_screen() {
+                    use tako_control::claude_tui;
+                    let lines = session.visible_lines();
+                    enter_baseline = claude_tui::input_line(&lines)
+                        .filter(|s| !claude_tui::input_content_is_empty(s))
+                        .map(str::to_string);
+                }
                 session.write(bytes);
+                wrote = true;
+            }
+            if wrote {
+                if let Some(baseline) = enter_baseline {
+                    self.queue_enter_verify(pane, baseline);
+                }
                 // ここで処理済みを宣言しないと、macOS が未処理キーを IME（input handler）へ
                 // 回送し insertText → replace_text_in_range で二重入力になる（FR-1.9）
                 cx.stop_propagation();
@@ -5217,6 +5302,10 @@ impl ControlHost for TakoApp {
 
     fn queue_send_flow(&mut self, pane: PaneId, text: String) {
         self.prompt_flows.push(PromptFlow::new(pane, text, false));
+    }
+
+    fn queue_enter_flow(&mut self, pane: PaneId) {
+        self.prompt_flows.push(PromptFlow::new_enter_only(pane));
     }
 
     fn detach_session(&mut self, pane: PaneId) {

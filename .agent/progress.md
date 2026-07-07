@@ -412,3 +412,11 @@
 - 関連コミット: `4886300`（tako）/ `5aaf98a`（homebrew-tako）、tag `v0.3.0`
 - 反映確認済み（2026-07-06 21:05 再起動）: 実行中アプリ 0.3.0 / MCP 52 ツール（tako_setup_changes 含む）/
   リモート固定 URL のリンク継続・setup --check の新依存チェックも実機確認済み
+
+## 2026-07-07（#95: claude TUI の Enter 空振りを修正）
+- 実機 transcript + 実 claude 実験で根因を確定（LF=改行挿入 / Enter 代行の検証欠陥 /
+  busy 中の CR 取りこぼし）。人間 Enter の送達検証 + 自動再送、Enter 単独送達フロー
+  （dispatch + deliver_via_tmux）、直接 write の LF→CR 正規化を実装
+- 検証: build / clippy(-D warnings) / fmt / test 全緑（unit +3）、実 claude e2e 2 本
+  （Enter 単独送達 新規 + 事前信頼送達 回帰）緑
+- 次: PR squash merge → `build-app.sh --install` → tako 再起動（ユーザー）で GUI 経路の実機確認

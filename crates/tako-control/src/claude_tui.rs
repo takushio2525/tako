@@ -71,8 +71,9 @@ pub fn input_line(lines: &[String]) -> Option<&str> {
 }
 
 /// 入力欄の内容が「空」か。空の入力欄は `❯ ` 単独、または `Try "..."` の
-/// プレースホルダ付きで描画される（実画面採取より）
-fn input_content_is_empty(content: &str) -> bool {
+/// プレースホルダ付きで描画される（実画面採取より）。
+/// Enter 単独送達（Issue #95）の残留判定にも使うため公開
+pub fn input_content_is_empty(content: &str) -> bool {
     content.is_empty() || content.starts_with("Try \"")
 }
 
@@ -196,6 +197,9 @@ pub struct DeliveryReport {
 /// `wait_ready` = true で claude TUI の入力欄（❯）表示まで待ってから貼る
 /// （spawn / await_prompt 用）。false は現画面へ即貼り付け（シェル等の汎用送信。
 /// 信頼ダイアログが見えている場合の承諾だけは行う）。
+/// `text` が空（改行のみ含む）なら Enter 単独送達（Issue #95）: 貼り付けを
+/// スキップして Enter を送り、入力欄が空へ戻るまで単独再送する
+/// （入力欄に残留したテキストの送信代行）。
 ///
 /// **ブロッキング関数**（内部で sleep する）。UI スレッドから直接呼ばず、
 /// バックグラウンドスレッドで実行すること
@@ -236,6 +240,28 @@ pub fn deliver_via_tmux(
             break; // 汎用送信: claude TUI でなくても貼り付けは通す（シェル等）
         }
         std::thread::sleep(Duration::from_millis(300));
+    }
+
+    // ①' Enter 単独送達（Issue #95）: 入力欄の残留テキストの送信代行。
+    //    素の CR 1 発は claude TUI に取りこぼされることがある（busy 中に
+    //    入力欄へ溜まったテキスト等）ため、入力欄が空へ戻るまで再送する
+    if text.is_empty() {
+        loop {
+            tako_core::tmux::send_key(socket, session, "Enter")?;
+            std::thread::sleep(Duration::from_millis(700));
+            let lines = tako_core::tmux::capture_session(socket, session)?;
+            if input_line(&lines)
+                .map(input_content_is_empty)
+                .unwrap_or(true)
+            {
+                report.verified = true;
+                return Ok(report);
+            }
+            if report.enter_retries >= 4 {
+                return Ok(report); // verified = false のまま返す（呼び出し側がログ）
+            }
+            report.enter_retries += 1;
+        }
     }
 
     // ② 本体を bracketed paste で貼り付け（アプリが要求していれば tmux -p が括りを付ける）
@@ -397,6 +423,28 @@ mod tests {
         let lines = screen("$ ls\nfoo bar\n$ ");
         assert_eq!(detect(&lines), ClaudeScreen::Unknown);
         assert_eq!(input_line(&lines), None);
+    }
+
+    #[test]
+    fn 入力欄の空判定はプレースホルダも空とみなす() {
+        // Enter 単独送達（Issue #95）の残留判定: 空 / プレースホルダ = 送信済み
+        assert!(input_content_is_empty(""));
+        assert!(input_content_is_empty("Try \"refactor <filepath>\""));
+        assert!(!input_content_is_empty("PR #73 をマージして"));
+        // 画面と組み合わせた判定（入力欄行 → 空 / 残留）
+        assert_eq!(
+            input_line(&screen(READY_PLACEHOLDER)).map(input_content_is_empty),
+            Some(true)
+        );
+        assert_eq!(
+            input_line(&screen(INPUT_PENDING)).map(input_content_is_empty),
+            Some(false)
+        );
+        // ❯ 行が無い画面（シェル等）は None = 検証不能
+        assert_eq!(
+            input_line(&screen("$ ls")).map(input_content_is_empty),
+            None
+        );
     }
 
     #[test]

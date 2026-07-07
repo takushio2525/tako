@@ -193,6 +193,68 @@ fn 事前信頼でダイアログなしの送達が通る() {
     );
 }
 
+/// Issue #95: 入力欄に残留したテキストを Enter 単独送達（text = ""）で送信できる。
+/// 人間のタイプ相当（tmux send-keys -l）でテキストだけ入力欄に載せた状態から、
+/// deliver_via_tmux("") が Enter を送り、入力欄が空へ戻ることを検証する
+#[test]
+#[ignore = "実 tmux + 実 claude + API を使う（手動実行専用）"]
+fn 残留テキストをenter単独送達で送信できる() {
+    let dir = untrusted_base_dir("enter-only");
+    std::fs::create_dir_all(&dir).expect("作業ディレクトリを作れる");
+    assert_eq!(
+        claude_tui::ensure_trusted(&dir.display().to_string()),
+        Ok(true),
+        "事前信頼を書き込める"
+    );
+    let guard = launch_claude("enter-only", &dir);
+
+    // 入力欄（❯）の表示を待つ
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let lines = tako_core::tmux::capture_session(Some(SOCKET), &guard.session)
+            .expect("画面を読める");
+        if claude_tui::input_line(&lines).is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "claude TUI の入力欄が現れるはず。画面:\n{}",
+            dump_screen(&guard.session)
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // 人間のタイプ相当: テキストだけ入力欄に載せる（Enter は送らない = 残留状態）
+    let status = Command::new("tmux")
+        .args([
+            "-L",
+            SOCKET,
+            "send-keys",
+            "-t",
+            &format!("={}:", guard.session),
+            "-l",
+            &format!("What is 3 * 7? {SPELL_SUFFIX}"),
+        ])
+        .status()
+        .expect("tmux を実行できる");
+    assert!(status.success(), "send-keys が失敗した");
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // Enter 単独送達（tako_send_input text:"" + newline:true の tmux 経路と同じ）
+    let report = claude_tui::deliver_via_tmux(Some(SOCKET), &guard.session, "", false)
+        .expect("送達が完了する");
+    assert!(
+        report.verified,
+        "入力欄が空へ戻ったことを検証できるはず: {report:?}\n画面:\n{}",
+        dump_screen(&guard.session)
+    );
+    assert!(
+        wait_for_marker(&guard.session, "twenty-one", Duration::from_secs(90)),
+        "残留テキストが送信され claude が応答するはず。画面:\n{}",
+        dump_screen(&guard.session)
+    );
+}
+
 /// Issue #32 問題 2: 長文マルチラインが bracketed paste + 分離 Enter で
 /// 「入力欄に貼り付いたまま」にならず 1 メッセージとして送達される
 #[test]

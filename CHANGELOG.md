@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- Enter no longer goes missing in claude TUI worker panes (#95): three delivery paths are hardened. (1) A human Enter pressed on a claude TUI pane is now verified — tako snapshots the input line (`❯ …`) before writing `\r`, and if the same text is still sitting there afterwards (claude occasionally drops Enter while busy), the Enter is automatically re-sent (up to 4 times). (2) `tako_send_input` with empty `text` + `newline: true` becomes a proper "Enter only" delivery: it no longer waits out a pointless 10-second reflection timeout, and its verification actually checks that the input line emptied (previously the empty-prompt check always passed, so it never retried — one silently dropped CR meant permanent stuck text). (3) LF characters written directly to a pane (`text: "\n"`, etc.) are normalized to CR — claude TUI interprets LF as "insert newline", never "submit", so raw-LF sends could clear-looking-but-unsent input. The same Enter-only delivery (send → verify emptied → resend) also applies to the tmux fallback path
+  claude TUI の worker ペインで Enter が空振りする問題を修正（#95）: 送達 3 経路を強化。(1) claude TUI ペインへの人間の Enter を検証つきに — `\r` 書き込み前に入力欄（`❯ …`）の内容を控え、書き込み後も同じテキストが残っていれば（busy 中の claude は Enter を取りこぼすことがある）Enter を自動再送する（最大 4 回）。(2) `tako_send_input` の空 `text` + `newline: true` を正式な「Enter 単独送達」に — 無意味な 10 秒の反映待ちタイムアウトを廃止し、検証も「入力欄が空へ戻ったか」を実際に確認する（従来は空プロンプトの検証が常に成功扱いで再送ゼロのため、CR 1 発の取りこぼし = 恒久残留だった）。(3) ペインへ直接書く経路の LF を CR へ正規化 — claude TUI は LF を「改行挿入」と解釈し決して送信しないため、生 LF 送信は「消えたように見えて未送信」になっていた。tmux フォールバック経路にも同じ Enter 単独送達（送信 → 空検証 → 再送）を適用
+
 ## [0.3.0] - 2026-07-06
 
 ### Added

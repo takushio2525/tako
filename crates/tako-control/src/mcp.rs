@@ -208,7 +208,9 @@ pub fn tools() -> Vec<Value> {
                 claude 等の全画面 TUI への改行つき送信は送達確認ループで配送される: \
                 信頼ダイアログの自動承諾 → bracketed paste 貼り付け → 分離 Enter → \
                 入力欄が空になったことの検証 + Enter 単独再送（マルチラインもそのまま送れる。\
-                応答は queued: true が即座に返り、実際の送達確認はバックグラウンドで行われる）。",
+                応答は queued: true が即座に返り、実際の送達確認はバックグラウンドで行われる）。\
+                text を空にして newline: true にすると Enter 単独送信になる: 入力欄に残った\
+                テキストの送信代行に使え、入力欄が空へ戻るまで Enter を自動再送する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
