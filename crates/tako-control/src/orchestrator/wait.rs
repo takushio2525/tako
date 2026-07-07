@@ -158,6 +158,8 @@ pub struct RunOptions {
     pub pane: Option<u64>,
     /// 子を出すタブ ID
     pub tab: Option<u64>,
+    /// 呼び出し元の TAKO_ORCHESTRATOR_ROLE（#109: 複数 master 識別）
+    pub caller_role: Option<String>,
     /// 完了待ちタイムアウト
     pub timeout: Duration,
     /// 完了後にペインを自動 close するか
@@ -188,6 +190,7 @@ pub fn run_worker(
         effort: opts.effort.clone(),
         pane: opts.pane,
         tab: opts.tab,
+        caller_role: opts.caller_role.clone(),
     })?;
     let pane_id = spawn_result["pane_id"].as_u64().unwrap_or(0);
     let spawned_by = spawn_result["spawned_by"].as_u64().unwrap_or(0);
@@ -435,6 +438,7 @@ mod tests {
             effort: None,
             pane: Some(1),
             tab: None,
+            caller_role: None,
             timeout: Duration::from_secs(60),
             auto_close: true,
             output_lines: 200,
@@ -490,6 +494,7 @@ mod tests {
             effort: None,
             pane: Some(1),
             tab: None,
+            caller_role: None,
             timeout: Duration::ZERO,
             auto_close: true,
             output_lines: 50,

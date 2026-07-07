@@ -953,6 +953,7 @@ fn mcp_serve() -> Result<(), String> {
         (Ok(s), Ok(t)) if !s.is_empty() && !t.is_empty()
     );
     let caller = caller_pane();
+    let caller_role = std::env::var("TAKO_ORCHESTRATOR_ROLE").ok();
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
@@ -972,6 +973,7 @@ fn mcp_serve() -> Result<(), String> {
                 };
                 let mut session = tako_control::mcp::McpSession {
                     caller_pane: caller,
+                    caller_role: caller_role.clone(),
                     connected,
                     exec: &mut exec,
                 };
@@ -1208,6 +1210,7 @@ fn orchestrator_run(
         effort: None,
         pane: pane_resolved,
         tab: tab_resolved,
+        caller_role: std::env::var("TAKO_ORCHESTRATOR_ROLE").ok(),
         timeout: std::time::Duration::from_secs(timeout_secs),
         auto_close,
         output_lines,
@@ -1819,6 +1822,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 effort: effort.clone(),
                 pane: pane_resolved,
                 tab: tab_resolved,
+                caller_role: std::env::var("TAKO_ORCHESTRATOR_ROLE").ok(),
             }
         }
         Command::Orchestrator(OrchestratorCommand::Status {
