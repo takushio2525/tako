@@ -5,6 +5,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-07
+
+### Security
+
+- `tako remote` is now secure-by-default (#104): the remote server hosts only over an encrypted cloudflared tunnel and **refuses to start** if a tunnel cannot be established (the old silent plaintext-LAN fallback is gone). Plain HTTP LAN mode is available only via the explicit, opt-in `--no-tunnel` replacement `--insecure` (off by default). Token comparison is now constant-time (HTTP Bearer + WebSocket), token/QR state files are written `0o600`, and `remote status` masks the token by default — both the standalone `token` field and the `token=` query embedded in `connect_url` / `fallback_url` — revealing raw values only with `--show-token` (CLI) / `show_token=true` (MCP). The public relay worker gained per-source-IP rate limiting (register 60/min, resolve 240/min). README / docs document that remote access is a legitimate remote-control tool granting arbitrary command execution and is not end-to-end encrypted
+  `tako remote` を secure-by-default 化（#104）: リモートサーバーは暗号化された cloudflared トンネル経由でのみホストし、トンネルを張れない場合は**起動を拒否**する（従来の無音の平文 LAN フォールバックを廃止）。平文 HTTP の LAN モードは明示 opt-in の `--insecure`（既定 off）でのみ有効。トークン比較を定数時間化（HTTP Bearer + WebSocket）、token / QR の state ファイルを `0o600` で書き出し、`remote status` は既定でトークンをマスクする — 単体の `token` フィールドに加え `connect_url` / `fallback_url` に埋め込まれた `token=` クエリも伏せ、生値は `--show-token`（CLI）/ `show_token=true`（MCP）でのみ表示。公共リレー worker に送信元 IP 単位のレートリミット（register 60/分・resolve 240/分）を追加。README / docs に、リモートアクセスが任意コマンド実行を許す正規の遠隔操作ツールであり E2E 暗号化ではない旨を明記
+
 ### Added
 
 - New CLAUDE.md section template `06-completion-verification` distributed by `tako setup` (#100): defines a completion-verification quality gate — build / lint / tests green, exercise the change end-to-end ("a passing build is not evidence it works"), probe edge cases, re-read the full diff — and an evidence-based report format with an explicit "not verified" section. Registered as setup changelog rev 5 (guided), so existing users are offered the addition interactively on their next `tako setup` without overwriting customizations
