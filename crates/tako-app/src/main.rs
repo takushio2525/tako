@@ -508,6 +508,9 @@ struct TakoApp {
     /// ウィンドウ）がプライマリとして生きている間 true。復元・layout.json への書き込み /
     /// 削除・tmux バックエンド・persist トグルを封じ、プライマリの作業を一切壊さない
     secondary: bool,
+    /// 最後のタブの終了処理（remove_tab_with の LastTab 分岐）を通過済み（Issue #113:
+    /// PTY の Exit / ChildExit 二重イベントによる「全ペイン終了」ログ + quit の重複発火防止）
+    quitting: bool,
     /// ペインを保持する tmux バックエンドセッション名（persist 有効時のみ登録される）
     backend_sessions: HashMap<PaneId, String>,
     /// バックエンドセッション内の window 一覧（tmux ポーリングで更新。2+ window のみ保持）
@@ -1202,6 +1205,7 @@ impl TakoApp {
             dismissed_ports: std::collections::HashSet::new(),
             tmux_persist,
             secondary,
+            quitting: false,
             backend_sessions: HashMap::new(),
             backend_windows: HashMap::new(),
             window_captures: HashMap::new(),
@@ -2973,6 +2977,16 @@ impl TakoApp {
                 // シェル exit）= セッションは kill せず layout.json も保持し、
                 // 次回起動でタブ構成を復元できるようにする（Issue #30。
                 // 2026-07-03 実機: サーバー死で全タブが道連れ削除された）
+                //
+                // 冪等化ラッチ（Issue #113）: この分岐は最後のペインを workspace /
+                // terminals から取り除かないため、同一 PTY の Exit と ChildExit
+                // （terminal.rs で両方 SessionNotice::Exited になる）が二重に届くと
+                // ここを 2 回通り、「全ペイン終了」ログと quit が重複発火していた
+                // （実機 persist.log の同時刻二重行の正体）
+                if self.quitting {
+                    return;
+                }
+                self.quitting = true;
                 for id in pane_ids {
                     self.drop_tmux_view_session(id);
                     self.drop_backend_session_with(id, reason);
