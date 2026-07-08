@@ -1416,6 +1416,79 @@ fn remote_scrollback(pane_id: &str, lines: u32) -> Result<(), String> {
     Ok(())
 }
 
+fn sessions_command(sub: &SessionsCommand) -> Result<(), String> {
+    match sub {
+        SessionsCommand::List {
+            project,
+            limit,
+            json,
+        } => {
+            let result =
+                tako_control::sessions::list_sessions(project.as_deref(), Some(*limit))?;
+            if *json {
+                println!("{}", pretty_json(&result));
+            } else {
+                let sessions = result["sessions"].as_array().unwrap();
+                if sessions.is_empty() {
+                    println!("セッションが見つかりません");
+                    return Ok(());
+                }
+                for (i, s) in sessions.iter().enumerate() {
+                    let title = s["title"].as_str().unwrap_or("(タイトルなし)");
+                    let sid = s["session_id"].as_str().unwrap_or("?");
+                    let project_path = s["project"].as_str().unwrap_or("?");
+                    let last = s["last_active"].as_str().unwrap_or("?");
+                    println!("{:>3}. {} [{}]", i + 1, title, last);
+                    println!("     ID: {}  project: {}", sid, project_path);
+                    println!("     復帰: claude --resume {}", sid);
+                    if i < sessions.len() - 1 {
+                        println!();
+                    }
+                }
+            }
+            Ok(())
+        }
+        SessionsCommand::Export { session_id, output } => {
+            let result =
+                tako_control::sessions::export_session(session_id, output.as_deref())?;
+            let path = result["path"].as_str().unwrap_or("?");
+            let messages = result["messages"].as_u64().unwrap_or(0);
+            let title = result["title"].as_str().unwrap_or("(タイトルなし)");
+            println!("エクスポート完了: {title}");
+            println!("  メッセージ数: {messages}");
+            println!("  出力先: {path}");
+            println!();
+            println!("会話を引き継ぐには:");
+            println!("  1. claude --resume {session_id}（セッション直接復帰・最適）");
+            println!(
+                "  2. 新セッションで Read {path} → 「この会話の続きを」と依頼"
+            );
+            Ok(())
+        }
+        SessionsCommand::Resume { session_id } => {
+            let result = tako_control::sessions::resume_hint(session_id)?;
+            let can_resume = result["can_resume"].as_bool().unwrap_or(false);
+            if can_resume {
+                let title = result["title"].as_str().unwrap_or("(タイトルなし)");
+                let cmd = result["resume_command"].as_str().unwrap_or("?");
+                println!("セッション「{title}」は復帰可能です");
+                println!();
+                println!("  {cmd}");
+                if let Some(cwd) = result["cwd"].as_str() {
+                    println!("  作業ディレクトリ: {cwd}");
+                }
+                println!();
+                println!(
+                    "復帰できない場合は `tako sessions export {session_id}` で markdown 化して引き継げます"
+                );
+            } else {
+                println!("セッション {session_id} の transcript が見つかりません");
+            }
+            Ok(())
+        }
+    }
+}
+
 fn run(command: Command) -> Result<(), String> {
     let request = build_request(&command)?;
     let result = send_request(request)?;
@@ -1885,6 +1958,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 UpdateCommand::Repair => "repair".to_string(),
             }),
         },
+        Command::Sessions(_) => {
+            unreachable!("sessions は run() を通らない（直接 sessions_command() を呼ぶ）")
+        }
     })
 }
 
