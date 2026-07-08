@@ -476,3 +476,12 @@
   リレー worker レートリミットも本番反映（register/resolve 正常系確認済み）
 - 関連コミット: `b3ed19d`（PR #110）、`665d541`（v0.3.2）、tag `v0.3.2`
 - 次: tako 再起動で新バイナリ反映
+
+## 2026-07-08（#111: tako solo コマンド実装完了）
+- 前任 WIP を仕上げ。mod.rs 側（solo ロジック + テスト）は完成済みだったが CLI に solo が
+  無く、別機能 sessions の未定義型断片が混入しビルド不能だった。solo CLI（`orchestrator_solo`、
+  master 対称・`build_master_claude_cmd` 共用・role/env `solo`/`solo:<suffix>`・effort=high・
+  solo-profiles/ 分離）を新規実装。sessions 断片は除去（無関係・保全コミット `9783c33` に保存）、
+  tako-app ツール数を 52 へ戻す。実バイナリで構築コマンド/role/effort/prompt 注入 + エッジ 2 件を検証
+- 関連コミット: `9783c33`（WIP 保全）、`99a1f4c`（`[機能追加]` Refs #111）
+- 次: push → PR 作成。squash merge / build-app.sh --install は master 検収後に別途指示
