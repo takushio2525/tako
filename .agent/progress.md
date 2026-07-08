@@ -476,3 +476,10 @@
   リレー worker レートリミットも本番反映（register/resolve 正常系確認済み）
 - 関連コミット: `b3ed19d`（PR #110）、`665d541`（v0.3.2）、tag `v0.3.2`
 - 次: tako 再起動で新バイナリ反映
+## 2026-07-08（#113: 多重起動によるペイン消失を根治 + フリーズ診断導入）
+- 根因 = 多重インスタンスの並行復元（`-A -D` クライアント強奪 → Exited 途中状態が layout.json を
+  上書き → 次回起動の orphan cleanup が実行中 worker を kill する三段連鎖）。修正 = 多重ガード
+  （セカンダリモード FR-5.8）+ cleanup の activity 1h 猶予 + 二重発火冪等化 + perf.log 診断
+  （UI ストール / dispatch 遅延）+ window capture の background 化。隔離環境で修正前後を実演
+- 関連: PR #114 squash merge（`fe73b60`）。副産物 #115（GitLog 2431ms UI 専有）/ #116（テストソケット残骸）
+- 次: tako 再起動 → 実機確認（セカンダリモード / 復元回帰）→ #113 close 判断（フリーズ根因は perf.log で追跡）
