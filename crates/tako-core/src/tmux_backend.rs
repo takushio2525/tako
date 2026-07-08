@@ -218,25 +218,38 @@ pub fn kill_session(socket: &str, session: &str) {
 /// `tako-` プレフィックス・**detached**・**非 grouped**・`protected` 外のセッションを
 /// kill し、kill した名前を返す。
 ///
-/// 安全設計（誤爆防止の三重ガード）:
+/// 安全設計（誤爆防止の四重ガード）:
 /// - **attached**（= いずれかのペイン/クライアントが使用中）は決して触らない
 /// - **grouped**（= 表示中ビューの元セッション or その `tako-view-*` ラッパー）も触らない。
 ///   生きているビューの足元を崩さないため
 /// - `protected`（現存ペイン・バックグラウンドペインの backend 名、表示中ビューの元/ラッパー名）は二重の安全網
+/// - `min_idle_secs` を指定すると、最終アクティビティ（`session_activity`）がそれより
+///   新しいセッションも触らない。起動時の自動実行が「直前まで動いていた実行中セッション」を
+///   巻き込まないための猶予（Issue #113: 多重起動の layout.json 汚染で protected から
+///   漏れた実行中 worker を、次回起動の自動 cleanup が実プロセスごと kill した）。
+///   明示操作（`tako tmux cleanup` / MCP）は None = 従来どおり全対象
 ///
 /// これらにより、ユーザーの実セッション（既定サーバー・非 `tako-` 名）や使用中ビューは
 /// 構造上 kill されない。対象は「クラッシュ等で取り残された detached な裸のバックエンド
 /// セッション」だけになる
-pub fn cleanup_orphans(socket: &str, protected: &std::collections::HashSet<String>) -> Vec<String> {
+pub fn cleanup_orphans(
+    socket: &str,
+    protected: &std::collections::HashSet<String>,
+    min_idle_secs: Option<u64>,
+) -> Vec<String> {
     let listing = crate::tmux::run_tmux(
         Some(socket),
         &[
             "list-sessions",
             "-F",
-            "#{session_name}\t#{session_attached}\t#{session_grouped}",
+            "#{session_name}\t#{session_attached}\t#{session_grouped}\t#{session_activity}",
         ],
     )
     .unwrap_or_default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let mut killed = Vec::new();
     for line in listing.lines() {
         let mut f = line.split('\t');
@@ -254,6 +267,14 @@ pub fn cleanup_orphans(socket: &str, protected: &std::collections::HashSet<Strin
         }
         if protected.contains(name) {
             continue; // 現存/バックグラウンドペイン・表示中ビューが使用中
+        }
+        if let Some(min_idle) = min_idle_secs {
+            // activity が取れない（古い tmux・パース不能 = 0）場合は「idle 十分」に倒し
+            // 従来挙動（掃除する）へ劣化する
+            let activity: u64 = f.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            if now.saturating_sub(activity) < min_idle {
+                continue; // 直近までアクティブ = 実行中プロセスの可能性が高い。この回は見送る
+            }
         }
         kill_session(socket, name);
         killed.push(name.to_string());
@@ -360,6 +381,70 @@ mod tests {
         // コマンドを渡さない（zsh -c ラッパーがシェル統合の ZDOTDIR を消費するのを
         // 避け、tmux がログインシェルを直接 spawn する経路に乗せる）
         assert_eq!(command.args.last().unwrap(), "tako-x");
+    }
+
+    /// Issue #113 回帰: 「detached だが直近までアクティブ」なセッション（多重起動事故で
+    /// layout.json から漏れた実行中 worker 相当）は、起動時経路（min_idle_secs 付き）では
+    /// kill されず、明示操作（None = 従来挙動）では従来どおり kill される。
+    /// 修正前の cleanup（猶予なし相当）ならこのセッションは消えていた
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_orphansは直近アクティブなdetachedセッションを猶予する() {
+        if !available() {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-{}-grace", std::process::id());
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                kill_server(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(socket.clone());
+        // detached セッションを直接作る（クライアント無し = attached 0。
+        // 作成直後なので session_activity は「今」= 実行中 worker の状態を再現）
+        let session = "tako-grace-victim";
+        let created = crate::tmux::tmux_command(Some(&socket))
+            .args([
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "sleep",
+                "300",
+            ])
+            .output()
+            .expect("tmux new-session を実行できる");
+        assert!(
+            created.status.success(),
+            "detached セッションを作成できる: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let unprotected: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // 起動時経路（猶予 1 時間）: protected から漏れていても直近アクティブなら生き残る
+        let killed = cleanup_orphans(&socket, &unprotected, Some(3600));
+        assert!(
+            killed.is_empty(),
+            "猶予内のセッションは kill されない: {killed:?}"
+        );
+        assert!(
+            crate::tmux::session_alive(Some(&socket), session),
+            "セッションが生き残る"
+        );
+        // 明示操作（猶予なし）: 従来どおり kill される（= 修正前の起動時挙動でもある）
+        let killed = cleanup_orphans(&socket, &unprotected, None);
+        assert_eq!(
+            killed,
+            vec![session.to_string()],
+            "明示 cleanup は従来どおり kill する"
+        );
+        assert!(
+            !crate::tmux::session_alive(Some(&socket), session),
+            "kill 後はセッションが消える"
+        );
     }
 
     /// 永続化の根幹 e2e: クライアント（tako 側）を破棄してもセッションが生き、

@@ -359,6 +359,21 @@ pub fn other_tako_running() -> bool {
     false
 }
 
+/// `pid` が生きている `tako-app` プロセスか（多重起動ガード用。Issue #113）。
+/// 死んだ pid は `proc_name` が失敗して空文字になるため生存確認を兼ねる。
+/// pid 再利用（別プロセスに割り当て直し）はプロセス名の不一致で除外される
+#[cfg(target_os = "macos")]
+pub fn is_live_tako_app(pid: u32) -> bool {
+    pid <= i32::MAX as u32 && process_name(pid as i32) == "tako-app"
+}
+
+/// 非 macOS はプロセス名の取得手段が未整備のため常に false
+/// （多重起動ガードは効かない = 従来挙動。Phase 6 の Windows 対応で実装する）
+#[cfg(not(target_os = "macos"))]
+pub fn is_live_tako_app(_pid: u32) -> bool {
+    false
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
@@ -404,5 +419,16 @@ mod tests {
         assert!(listening_ports_of_pid(0x7fff_fff0).is_empty());
         assert!(scan(&[]).is_empty());
         assert!(tty_rdev("/dev/no-such-tty").is_none());
+    }
+
+    /// Issue #113 多重起動ガードの生存判定: 死んだ pid と tako-app でないプロセス
+    /// （このテストランナー自身）はどちらも false（誤ってセカンダリ化させない）
+    #[test]
+    fn is_live_tako_appは死んだpidや別名プロセスをfalseにする() {
+        assert!(!is_live_tako_app(0x7fff_fff0), "存在しない pid は false");
+        assert!(
+            !is_live_tako_app(std::process::id()),
+            "テストランナー（プロセス名が tako-app でない）は false"
+        );
     }
 }
