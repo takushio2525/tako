@@ -3,6 +3,25 @@
 tako に内蔵されたマスターオーケストレーター機能。複数プロジェクトの作業を
 子 claude worker に委任し、監視・管理する。外部スクリプト依存ゼロ。
 
+## オーケストレーション不要なら `tako solo`
+
+worker への分担が要らず、AI と 1 対 1 で直接作業したいだけなら `tako solo` を使う。
+master と違い**オーケストレーション（worker spawn / sub-agent / Workflow）を禁止**し、
+solo セッション自身がファイル編集・テスト・コミットを直接行う。エコ運用（既定
+`effort=high`。master の `max` より低い）で Pro プランでも使いやすい。
+
+```bash
+tako solo            # default プロファイル、role=solo
+tako solo -fast      # "fast" プロファイル（solo-profiles/fast.yaml）、role=solo:fast
+tako solo docs       # 旧形式サフィックス、role=solo:docs
+```
+
+- プロファイル引数パターンは master と同一（`-<名前>` = プロファイル、引数なし = default、
+  裸の語 = 後方互換サフィックス）。設定は `~/Library/Application Support/tako/orchestrator/solo-profiles/`
+- `projects.yaml` は master と共有。solo は `tako_orchestrator_projects` でプロジェクトの
+  作業ディレクトリを引き、`cd` して直接作業する（「demo の README 直して」で通る）
+- 「最近やってること」は起動時にロードせず、必要なとき各プロジェクトで `git log` を見る
+
 ## 前提条件
 
 - tako がインストール済み（`tako` CLI が PATH に通っている）

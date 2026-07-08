@@ -126,6 +126,16 @@ enum Command {
         #[arg(allow_hyphen_values = true)]
         profile: Option<String>,
     },
+    /// ソロエージェントを起動する。新タブで claude を solo system prompt 付きで起動する。
+    /// オーケストレーション無しの 1 対 1 対話モード（worker spawn を禁止、作業は自分で行う）。
+    /// エコ運用（既定 effort=high）で Pro プランでも使える。master と同じプロファイル引数パターン。
+    /// プロファイル名を指定して設定を切り替えられる（例: tako solo -fast → "fast" プロファイル）。
+    /// 引数なしは default プロファイル。旧形式（tako solo docs）も後方互換で動作する
+    Solo {
+        /// プロファイル名（-fast 等）またはサフィックス（旧形式: docs 等）。role は solo:<suffix>
+        #[arg(allow_hyphen_values = true)]
+        profile: Option<String>,
+    },
     /// オーケストレーター操作（projects / spawn / status / watch）
     #[command(subcommand)]
     Orchestrator(OrchestratorCommand),
@@ -872,6 +882,7 @@ fn main() -> ExitCode {
         }
         Command::SetupMcp(ref args) => setup_mcp_local(args),
         Command::Master { ref profile } => orchestrator_master(profile.as_deref()),
+        Command::Solo { ref profile } => orchestrator_solo(profile.as_deref()),
         Command::Orchestrator(OrchestratorCommand::Watch {
             pane,
             pane_pos,
@@ -1150,6 +1161,103 @@ fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+/// `tako solo [-profile]` — 新タブで claude を solo system prompt 付きで起動する。
+/// オーケストレーション無しの 1 対 1 対話モード。worker spawn を禁止し、作業は自分で行う。
+/// `-<名前>` でプロファイルを指定、引数なしは default、旧形式（suffix のみ）も後方互換。
+/// role / TAKO_ORCHESTRATOR_ROLE は `solo` / `solo:<suffix>`（master と区別）。
+/// claude コマンドの組み立ては master と `build_master_claude_cmd` を共用する。
+fn orchestrator_solo(arg: Option<&str>) -> Result<(), String> {
+    use tako_control::orchestrator;
+
+    orchestrator::ensure_solo_defaults().map_err(|e| format!("セットアップに失敗: {e}"))?;
+
+    // 引数をパース: "-<name>" → プロファイル名、それ以外 → 旧 suffix として扱う（master と同じパターン）
+    let (profile_name, suffix) = match arg {
+        None => ("default", None),
+        Some(s) if s.starts_with('-') => {
+            let name = &s[1..];
+            if name.is_empty() {
+                return Err("プロファイル名が空です（例: tako solo -fast）".into());
+            }
+            (name, Some(name))
+        }
+        Some(s) => {
+            // 旧形式の後方互換: `tako solo docs` → suffix "docs"、プロファイル "default"
+            ("default", Some(s))
+        }
+    };
+
+    // solo プロファイルを読み込む（存在しなければ default 値で起動する）
+    let profile = match orchestrator::load_solo_profile(profile_name) {
+        Ok(p) => p,
+        Err(_) if profile_name == "default" => orchestrator::solo_default_profile(),
+        Err(e) => return Err(e),
+    };
+
+    // プロファイルに明示された [1m] モデルは opt-in として尊重するが、
+    // Pro プランでは起動不能になるため警告を出す（Issue #27）
+    if let Some(warning) = profile
+        .model
+        .as_deref()
+        .and_then(|m| orchestrator::one_m_model_warning(m, "solo"))
+    {
+        eprintln!("{warning}");
+    }
+
+    // solo 用 system prompt を合成し、一時ファイルに書き出す
+    let prompt_content = profile.build_solo_system_prompt(profile_name);
+    let dir = orchestrator::config_dir().ok_or("ホームディレクトリが取得できない")?;
+    let prompt_path = dir.join(format!("_solo_system_prompt_{profile_name}.md"));
+    std::fs::write(&prompt_path, &prompt_content)
+        .map_err(|e| format!("system prompt の書き出しに失敗: {e}"))?;
+
+    // タブ名
+    let tab_title = match suffix {
+        Some(s) => format!("solo-{s}"),
+        None => "solo".into(),
+    };
+
+    // 新タブを作成
+    let tab_result = send_request(Request::TabNew {
+        title: Some(tab_title.clone()),
+    })?;
+    let pane_id = tab_result["pane"]
+        .as_u64()
+        .ok_or("タブ作成の応答に pane が含まれない")?;
+
+    // solo ペインに role を設定（master の orchestrator-master と区別する）
+    let role = match suffix {
+        Some(s) => format!("solo:{s}"),
+        None => "solo".into(),
+    };
+    send_request(Request::Title {
+        pane: Some(pane_id),
+        title: None,
+        role: Some(role.clone()),
+    })?;
+
+    // TAKO_ORCHESTRATOR_ROLE 環境変数を設定（solo / solo:<suffix>）。
+    // model 未指定のプロファイルは --model を付けず claude CLI の既定に委ねる（Issue #27）
+    let claude_cmd = orchestrator::build_master_claude_cmd(&role, &profile, &prompt_path);
+    send_request(Request::Send {
+        pane: Some(pane_id),
+        text: claude_cmd,
+        newline: true,
+        tmux_session: None,
+        await_prompt: false,
+    })?;
+
+    eprintln!("solo を起動しました: タブ '{tab_title}'（ペイン {pane_id}）");
+    eprintln!(
+        "プロファイル: {profile_name}（モデル: {}、effort: {}）",
+        profile.model_label(),
+        profile.effort
+    );
+    eprintln!("モード: solo（オーケストレーション無し・1 対 1 対話・worker spawn 禁止）");
+    eprintln!("system prompt: {}", prompt_path.display());
+    Ok(())
+}
+
 /// `tako orchestrator watch --pane N [--session-id S] [--timeout T]` — worker の完了まで待機し 1 行出力する。
 /// 判定は tako-control の完了待ちエンジン（`orchestrator::wait`。MCP の run と共通。#83）
 fn orchestrator_watch(
@@ -1414,79 +1522,6 @@ fn remote_scrollback(pane_id: &str, lines: u32) -> Result<(), String> {
         println!("{line}");
     }
     Ok(())
-}
-
-fn sessions_command(sub: &SessionsCommand) -> Result<(), String> {
-    match sub {
-        SessionsCommand::List {
-            project,
-            limit,
-            json,
-        } => {
-            let result =
-                tako_control::sessions::list_sessions(project.as_deref(), Some(*limit))?;
-            if *json {
-                println!("{}", pretty_json(&result));
-            } else {
-                let sessions = result["sessions"].as_array().unwrap();
-                if sessions.is_empty() {
-                    println!("セッションが見つかりません");
-                    return Ok(());
-                }
-                for (i, s) in sessions.iter().enumerate() {
-                    let title = s["title"].as_str().unwrap_or("(タイトルなし)");
-                    let sid = s["session_id"].as_str().unwrap_or("?");
-                    let project_path = s["project"].as_str().unwrap_or("?");
-                    let last = s["last_active"].as_str().unwrap_or("?");
-                    println!("{:>3}. {} [{}]", i + 1, title, last);
-                    println!("     ID: {}  project: {}", sid, project_path);
-                    println!("     復帰: claude --resume {}", sid);
-                    if i < sessions.len() - 1 {
-                        println!();
-                    }
-                }
-            }
-            Ok(())
-        }
-        SessionsCommand::Export { session_id, output } => {
-            let result =
-                tako_control::sessions::export_session(session_id, output.as_deref())?;
-            let path = result["path"].as_str().unwrap_or("?");
-            let messages = result["messages"].as_u64().unwrap_or(0);
-            let title = result["title"].as_str().unwrap_or("(タイトルなし)");
-            println!("エクスポート完了: {title}");
-            println!("  メッセージ数: {messages}");
-            println!("  出力先: {path}");
-            println!();
-            println!("会話を引き継ぐには:");
-            println!("  1. claude --resume {session_id}（セッション直接復帰・最適）");
-            println!(
-                "  2. 新セッションで Read {path} → 「この会話の続きを」と依頼"
-            );
-            Ok(())
-        }
-        SessionsCommand::Resume { session_id } => {
-            let result = tako_control::sessions::resume_hint(session_id)?;
-            let can_resume = result["can_resume"].as_bool().unwrap_or(false);
-            if can_resume {
-                let title = result["title"].as_str().unwrap_or("(タイトルなし)");
-                let cmd = result["resume_command"].as_str().unwrap_or("?");
-                println!("セッション「{title}」は復帰可能です");
-                println!();
-                println!("  {cmd}");
-                if let Some(cwd) = result["cwd"].as_str() {
-                    println!("  作業ディレクトリ: {cwd}");
-                }
-                println!();
-                println!(
-                    "復帰できない場合は `tako sessions export {session_id}` で markdown 化して引き継げます"
-                );
-            } else {
-                println!("セッション {session_id} の transcript が見つかりません");
-            }
-            Ok(())
-        }
-    }
 }
 
 fn run(command: Command) -> Result<(), String> {
@@ -1916,6 +1951,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Master { .. } => {
             unreachable!("master は run() を通らない（直接 orchestrator_master() を呼ぶ）")
         }
+        Command::Solo { .. } => {
+            unreachable!("solo は run() を通らない（直接 orchestrator_solo() を呼ぶ）")
+        }
         Command::Orchestrator(OrchestratorCommand::Watch { .. }) => {
             unreachable!("orchestrator watch は run() を通らない")
         }
@@ -1958,9 +1996,6 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 UpdateCommand::Repair => "repair".to_string(),
             }),
         },
-        Command::Sessions(_) => {
-            unreachable!("sessions は run() を通らない（直接 sessions_command() を呼ぶ）")
-        }
     })
 }
 

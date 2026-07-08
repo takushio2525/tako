@@ -606,8 +606,8 @@ pub fn load_solo_profile(name: &str) -> Result<Profile, String> {
             path.display()
         ));
     }
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("プロファイルの読み取りに失敗: {e}"))?;
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("プロファイルの読み取りに失敗: {e}"))?;
     serde_yaml::from_str(&content).map_err(|e| format!("プロファイルのパースに失敗: {e}"))
 }
 
@@ -1276,6 +1276,26 @@ prompt_blocks:
         assert!(cmd.contains("--effort max"));
     }
 
+    /// solo は build_master_claude_cmd を共用する。既定プロファイルは model 無指定・
+    /// effort=high で、TAKO_ORCHESTRATOR_ROLE は 'solo'（suffix 付きは 'solo:<suffix>'）になる。
+    #[test]
+    fn solo_cmd_uses_solo_role_and_high_effort() {
+        let p = solo_default_profile();
+        let cmd = build_master_claude_cmd("solo", &p, Path::new("/tmp/solo.md"));
+        assert_eq!(
+            cmd,
+            "TAKO_ORCHESTRATOR_ROLE='solo' claude --effort high --append-system-prompt-file '/tmp/solo.md'"
+        );
+        assert!(
+            !cmd.contains("--model"),
+            "model 未指定は claude 既定に委ねる"
+        );
+
+        let cmd_suffix = build_master_claude_cmd("solo:docs", &p, Path::new("/tmp/solo.md"));
+        assert!(cmd_suffix.contains("TAKO_ORCHESTRATOR_ROLE='solo:docs'"));
+        assert!(cmd_suffix.contains("--effort high"));
+    }
+
     #[test]
     fn worker_cmd_model_optional() {
         let with = build_worker_claude_cmd("worker:demo", Some("claude-sonnet-5"), "high");
@@ -1412,6 +1432,9 @@ prompt_blocks:
         assert!(prompt.contains("Solo Agent"));
         assert!(prompt.contains("Eco Mode"));
         assert!(prompt.contains("No orchestration"));
+        // projects.yaml を把握して cd 無しで話せる（FR 要件・AC4）
+        assert!(prompt.contains("Project Awareness"));
+        assert!(prompt.contains("tako_orchestrator_projects"));
         assert!(prompt.contains("Session Identity"));
         assert!(prompt.contains("solo"));
         assert!(prompt.contains(CLAUDE_DEFAULT_LABEL));
