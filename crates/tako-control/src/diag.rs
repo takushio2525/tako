@@ -20,11 +20,30 @@ pub fn persist_log_path() -> Option<PathBuf> {
     tako_core::paths::data_dir().map(|d| d.join("persist.log"))
 }
 
+/// パフォーマンス診断ログのパス（`<data_dir>/perf.log`。Issue #113）
+pub fn perf_log_path() -> Option<PathBuf> {
+    tako_core::paths::data_dir().map(|d| d.join("perf.log"))
+}
+
 /// 1 行追記する（UTC タイムスタンプ付き）。失敗は握りつぶす（診断ログの失敗で
 /// 本体を巻き込まない）。呼び出し頻度は起動・終了・エラー時のみを想定し、
 /// 定期保存の成功のような高頻度イベントは書かないこと
 pub fn persist_log(msg: &str) {
-    let Some(path) = persist_log_path() else {
+    append_log(persist_log_path(), msg);
+}
+
+/// UI ストール・dispatch 遅延など性能異常の記録（Issue #113: 多ペイン時の無応答の
+/// 犯人特定用）。**しきい値超えのときだけ**呼ぶこと（正常時は何も書かない = 高頻度
+/// 呼び出し禁止は persist_log と同じ方針）。セルフテスト中はユーザーのログを汚さない
+pub fn perf_log(msg: &str) {
+    if std::env::var_os("TAKO_SELF_TEST").is_some() {
+        return;
+    }
+    append_log(perf_log_path(), msg);
+}
+
+fn append_log(path: Option<PathBuf>, msg: &str) {
+    let Some(path) = path else {
         return;
     };
     let Some(dir) = path.parent() else {

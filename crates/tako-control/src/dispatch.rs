@@ -54,6 +54,11 @@ pub trait ControlHost {
     }
     /// tmux バックエンド永続化の ON/OFF 切替（永続化は実装側の責務。以後のペインに効く）
     fn set_tmux_persist(&mut self, _enabled: bool) {}
+    /// セカンダリモード（Issue #113: 多重起動の後発。復元・layout 書き込み・persist 切替が
+    /// 無効化されている）か。診断用に `tako persist` / MCP の応答へ含める
+    fn is_secondary(&self) -> bool {
+        false
+    }
     /// 起動時のレイアウト復元結果（人間可読の 1 行。Issue #30 の診断用）。
     /// 復元を試みていない実装（テストホスト等）では None
     fn persist_restore_report(&self) -> Option<String> {
@@ -235,7 +240,31 @@ impl DispatchError {
 
 /// リクエストを実行し、成功時の `result` 値を返す。
 /// `origin` は新規生成ペインの生成主体（Layer 1 CLI なら `Cli`、Phase 3 の MCP なら `Mcp`）
+/// dispatch は UI スレッド（GPUI のイベントループ）で実行されるため、ここでの遅延は
+/// そのまま UI 全体の固まりになる。処理時間を計測し、しきい値超えを perf.log へ残す
+/// （Issue #113: 多ペイン・多 worker 時の無応答の犯人特定。種別名のみ記録し
+/// ペイロードは書かない）
 pub fn dispatch(
+    host: &mut dyn ControlHost,
+    request: Request,
+    origin: PaneOrigin,
+) -> Result<Value, DispatchError> {
+    /// UI スレッド専有としてログに残す処理時間のしきい値。1 フレーム 16ms（60fps）の
+    /// 数フレーム分 = 体感で引っかかりが分かり始める長さ
+    const DISPATCH_SLOW_MS: u128 = 100;
+    let kind = request.kind_name();
+    let t0 = std::time::Instant::now();
+    let result = dispatch_inner(host, request, origin);
+    let took = t0.elapsed().as_millis();
+    if took >= DISPATCH_SLOW_MS {
+        crate::diag::perf_log(&format!(
+            "dispatch 遅延: {kind} が {took}ms（UI スレッド専有）"
+        ));
+    }
+    result
+}
+
+fn dispatch_inner(
     host: &mut dyn ControlHost,
     request: Request,
     origin: PaneOrigin,
@@ -953,6 +982,9 @@ pub fn dispatch(
             }
             Ok(json!({
                 "enabled": host.tmux_persist_enabled(),
+                // セカンダリモード（Issue #113: 多重起動の後発）では復元・保存・切替が
+                // 無効。AI / CLI が「切替したのに enabled が変わらない」理由を判別できる
+                "secondary": host.is_secondary(),
                 // tmux 不在環境では PTY が直接 spawn へ劣化していることを示す
                 // （その場合もタブ構成の保存・復元は機能する。復元は新シェル）
                 "available": tako_core::tmux_backend::available(),

@@ -37,13 +37,24 @@ impl IpcServer {
     /// `token` はセッション共有の認証トークン（[`crate::generate_token`] で生成し、
     /// MCP サーバーとも共有する。FR-2.3.4）
     pub fn start(tx: UnboundedSender<IncomingRequest>, token: String) -> io::Result<Self> {
+        Self::start_with(tx, token, false)
+    }
+
+    /// `prefer_temp_socket` = true は固定ソケット（`<data_dir>/tako.sock`）を候補にせず
+    /// PID 入り一時パスで起動する。セカンダリモード（多重起動の後発。Issue #113）が
+    /// プライマリの固定ソケットを unlink + bind で乗っ取らないための経路
+    pub fn start_with(
+        tx: UnboundedSender<IncomingRequest>,
+        token: String,
+        prefer_temp_socket: bool,
+    ) -> io::Result<Self> {
         #[cfg(unix)]
         {
-            unix_imp::start(tx, token)
+            unix_imp::start(tx, token, prefer_temp_socket)
         }
         #[cfg(windows)]
         {
-            let _ = (tx, token);
+            let _ = (tx, token, prefer_temp_socket);
             // TODO(Phase 6): named pipe（`\\.\pipe\tako-<pid>` 等）での実装
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -85,11 +96,12 @@ mod unix_imp {
     }
 
     /// 再起動をまたいで安定するソケットパスを決定する。
-    /// - 単体テスト / セルフテスト: 一時パス（他インスタンスと衝突回避）
+    /// - 単体テスト / セルフテスト / セカンダリモード（`prefer_temp`）: 一時パス
+    ///   （他インスタンスと衝突回避・プライマリの固定ソケットを乗っ取らない）
     /// - 通常起動: `<data_dir>/tako.sock`（固定。既存クライアントがそのまま再接続可能）
     /// - 別インスタンスが生きている: フォールバックで一時パス
-    fn preferred_socket_path() -> std::path::PathBuf {
-        if cfg!(test) || std::env::var_os("TAKO_SELF_TEST").is_some() {
+    fn preferred_socket_path(prefer_temp: bool) -> std::path::PathBuf {
+        if prefer_temp || cfg!(test) || std::env::var_os("TAKO_SELF_TEST").is_some() {
             return temp_socket_path();
         }
         if let Some(well_known) = tako_core::paths::data_dir().map(|d| d.join("tako.sock")) {
@@ -104,8 +116,9 @@ mod unix_imp {
     pub(super) fn start(
         tx: UnboundedSender<IncomingRequest>,
         token: String,
+        prefer_temp_socket: bool,
     ) -> std::io::Result<IpcServer> {
-        let path = preferred_socket_path();
+        let path = preferred_socket_path(prefer_temp_socket);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
