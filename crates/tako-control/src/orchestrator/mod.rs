@@ -9,8 +9,14 @@ pub mod wait;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// バイナリ埋め込みのデフォルト system prompt
+/// バイナリ埋め込みのデフォルト system prompt（master 用）
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("default_system_prompt.md");
+
+/// バイナリ埋め込みの solo system prompt
+pub const SOLO_SYSTEM_PROMPT: &str = include_str!("solo_system_prompt.md");
+
+/// solo のデフォルト effort。master の "max" より低くしてエコ運用を既定にする
+pub const SOLO_DEFAULT_EFFORT: &str = "high";
 
 /// オーケストレーター設定ディレクトリのパス。
 /// `~/Library/Application Support/tako/orchestrator/`
@@ -492,6 +498,124 @@ impl Profile {
             self.effort,
             all_blocks.join(", "),
         )
+    }
+
+    /// solo 用の system prompt を合成する
+    pub fn build_solo_system_prompt(&self, profile_name: &str) -> String {
+        let blocks = parse_prompt_blocks(SOLO_SYSTEM_PROMPT);
+        let pb = self.prompt_blocks.as_ref();
+
+        let mut result = String::new();
+
+        if let Some(text) = pb.and_then(|b| b.prepend.as_ref()) {
+            result.push_str(&resolve_text_or_file(text));
+            result.push_str("\n\n");
+        }
+
+        for (name, content) in &blocks {
+            if let Some(b) = pb {
+                if b.disable.iter().any(|d| d == name) {
+                    continue;
+                }
+            }
+
+            if name == "model-policy" {
+                result.push_str(&self.generate_solo_model_section(profile_name));
+                result.push('\n');
+                continue;
+            }
+
+            if let Some(override_text) = pb.and_then(|b| b.override_blocks.get(name.as_str())) {
+                result.push_str(&resolve_text_or_file(override_text));
+                result.push('\n');
+                continue;
+            }
+
+            result.push_str(content);
+            result.push('\n');
+        }
+
+        if let Some(text) = pb.and_then(|b| b.append.as_ref()) {
+            result.push_str(&resolve_text_or_file(text));
+            result.push('\n');
+        }
+
+        result.trim_end().to_string()
+    }
+
+    /// solo 用のモデル情報セクションを生成する
+    fn generate_solo_model_section(&self, profile_name: &str) -> String {
+        let profile_path = solo_profile_path(profile_name)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "(不明)".into());
+
+        format!(
+            "## Session Identity\n\n\
+             - **Mode**: solo (direct execution, no orchestration)\n\
+             - **Profile**: `{profile_name}`\n\
+             - **Launch command**: `tako solo -{profile_name}`\n\
+             - **Model**: {}\n\
+             - **Effort**: {}\n\
+             - **Profile config**: `{profile_path}`",
+            self.model_label(),
+            self.effort,
+        )
+    }
+}
+
+// --- solo プロファイル ---
+
+/// solo 用の新規生成する default プロファイル内容
+const SOLO_DEFAULT_PROFILE_YAML: &str = "\
+# tako solo のプロファイル設定
+# model 未指定 = claude CLI の既定モデルで起動する（プラン非依存・推奨）
+effort: high
+";
+
+/// solo 用のプロファイルディレクトリ
+pub fn solo_profiles_dir() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("solo-profiles"))
+}
+
+/// solo 用にデフォルトのディレクトリとプロファイルを生成する
+pub fn ensure_solo_defaults() -> Result<PathBuf, String> {
+    ensure_defaults()?;
+    let dir = solo_profiles_dir().ok_or("ホームディレクトリが取得できない")?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
+    let default_profile = dir.join("default.yaml");
+    if !default_profile.is_file() {
+        std::fs::write(&default_profile, SOLO_DEFAULT_PROFILE_YAML)
+            .map_err(|e| format!("default.yaml の書き込みに失敗: {e}"))?;
+    }
+    Ok(dir)
+}
+
+/// solo 用のプロファイルパスを返す
+fn solo_profile_path(name: &str) -> Result<PathBuf, String> {
+    solo_profiles_dir()
+        .map(|d| d.join(format!("{name}.yaml")))
+        .ok_or_else(|| "ホームディレクトリが取得できない".into())
+}
+
+/// solo 用のプロファイルを読み込む
+pub fn load_solo_profile(name: &str) -> Result<Profile, String> {
+    let path = solo_profile_path(name)?;
+    if !path.is_file() {
+        return Err(format!(
+            "solo プロファイル '{name}' が見つからない: {}",
+            path.display()
+        ));
+    }
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("プロファイルの読み取りに失敗: {e}"))?;
+    serde_yaml::from_str(&content).map_err(|e| format!("プロファイルのパースに失敗: {e}"))
+}
+
+/// solo 用のデフォルトプロファイルを返す（master より effort が低い）
+pub fn solo_default_profile() -> Profile {
+    Profile {
+        effort: SOLO_DEFAULT_EFFORT.into(),
+        ..Default::default()
     }
 }
 
@@ -1152,6 +1276,26 @@ prompt_blocks:
         assert!(cmd.contains("--effort max"));
     }
 
+    /// solo は build_master_claude_cmd を共用する。既定プロファイルは model 無指定・
+    /// effort=high で、TAKO_ORCHESTRATOR_ROLE は 'solo'（suffix 付きは 'solo:<suffix>'）になる。
+    #[test]
+    fn solo_cmd_uses_solo_role_and_high_effort() {
+        let p = solo_default_profile();
+        let cmd = build_master_claude_cmd("solo", &p, Path::new("/tmp/solo.md"));
+        assert_eq!(
+            cmd,
+            "TAKO_ORCHESTRATOR_ROLE='solo' claude --effort high --append-system-prompt-file '/tmp/solo.md'"
+        );
+        assert!(
+            !cmd.contains("--model"),
+            "model 未指定は claude 既定に委ねる"
+        );
+
+        let cmd_suffix = build_master_claude_cmd("solo:docs", &p, Path::new("/tmp/solo.md"));
+        assert!(cmd_suffix.contains("TAKO_ORCHESTRATOR_ROLE='solo:docs'"));
+        assert!(cmd_suffix.contains("--effort high"));
+    }
+
     #[test]
     fn worker_cmd_model_optional() {
         let with = build_worker_claude_cmd("worker:demo", Some("claude-sonnet-5"), "high");
@@ -1264,5 +1408,69 @@ prompt_blocks:
         assert_eq!(p.model, None);
         assert_eq!(p.effort, "max", "serde default で補われる");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn solo_default_profile_values() {
+        let p = solo_default_profile();
+        assert_eq!(p.model, None);
+        assert_eq!(p.effort, SOLO_DEFAULT_EFFORT);
+        assert_eq!(p.effort, "high");
+    }
+
+    #[test]
+    fn solo_default_profile_yaml_parses() {
+        let p: Profile = serde_yaml::from_str(SOLO_DEFAULT_PROFILE_YAML).unwrap();
+        assert_eq!(p.model, None);
+        assert_eq!(p.effort, "high");
+    }
+
+    #[test]
+    fn build_solo_system_prompt_basic() {
+        let p = solo_default_profile();
+        let prompt = p.build_solo_system_prompt("test");
+        assert!(prompt.contains("Solo Agent"));
+        assert!(prompt.contains("Eco Mode"));
+        assert!(prompt.contains("No orchestration"));
+        // projects.yaml を把握して cd 無しで話せる（FR 要件・AC4）
+        assert!(prompt.contains("Project Awareness"));
+        assert!(prompt.contains("tako_orchestrator_projects"));
+        assert!(prompt.contains("Session Identity"));
+        assert!(prompt.contains("solo"));
+        assert!(prompt.contains(CLAUDE_DEFAULT_LABEL));
+        assert!(!prompt.contains("Master Orchestrator"));
+    }
+
+    #[test]
+    fn build_solo_system_prompt_with_model() {
+        let p = Profile {
+            model: Some("claude-sonnet-5".into()),
+            effort: "medium".into(),
+            ..Default::default()
+        };
+        let prompt = p.build_solo_system_prompt("fast");
+        assert!(prompt.contains("claude-sonnet-5"));
+        assert!(prompt.contains("medium"));
+        assert!(prompt.contains("`fast`"));
+    }
+
+    #[test]
+    fn solo_prompt_blocks_customization() {
+        let p = Profile {
+            effort: "high".into(),
+            prompt_blocks: Some(PromptBlocks {
+                disable: vec!["eco".into()],
+                append: Some("SOLO_APPEND_MARKER".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let prompt = p.build_solo_system_prompt("custom");
+        assert!(
+            !prompt.contains("Eco Mode"),
+            "eco ブロックは disable される"
+        );
+        assert!(prompt.contains("SOLO_APPEND_MARKER"));
+        assert!(prompt.contains("Solo Agent"), "role ブロックは維持");
     }
 }

@@ -482,4 +482,15 @@
   （セカンダリモード FR-5.8）+ cleanup の activity 1h 猶予 + 二重発火冪等化 + perf.log 診断
   （UI ストール / dispatch 遅延）+ window capture の background 化。隔離環境で修正前後を実演
 - 関連: PR #114 squash merge（`fe73b60`）。副産物 #115（GitLog 2431ms UI 専有）/ #116（テストソケット残骸）
-- 次: tako 再起動 → 実機確認（セカンダリモード / 復元回帰）→ #113 close 判断（フリーズ根因は perf.log で追跡）
+- 実機確認済み → #113 close: 再起動復元に回帰なし / 2 個目起動でセカンダリモード（persist.log
+  「復元スキップ」）/ プロンプト無し worker 20 匹スポーンで tako 74MB・CPU16%・ペイン消失ゼロ
+  （UI ストールは 0.83s が 1 回のみ）。フリーズ恒久根因は perf.log で追跡継続
+
+## 2026-07-08（#111: tako solo コマンド実装完了 → merge）
+- 前任 WIP を仕上げ。mod.rs 側（solo ロジック + テスト）は完成済みだったが CLI に solo が
+  無く、別機能 sessions の未定義型断片が混入しビルド不能だった。solo CLI（`orchestrator_solo`、
+  master 対称・`build_master_claude_cmd` 共用・role/env `solo`/`solo:<suffix>`・effort=high・
+  solo-profiles/ 分離）を新規実装。sessions 断片は除去（無関係・保全コミット `9783c33` に保存）、
+  tako-app ツール数を 52 へ戻す。実バイナリで構築コマンド/role/effort/prompt 注入 + エッジ 2 件を検証
+- 関連コミット: `9783c33`（WIP 保全）、`99a1f4c`（solo 実装）→ PR #117 squash merge（`main` へ）
+- 次: tako 再起動後に `tako solo` で実対話を確認 → #111 close（実対話のみ未検証）

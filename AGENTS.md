@@ -68,6 +68,7 @@ tako/
 | .app バンドル生成（macOS） | `scripts/build-app.sh [--verify] [--install]`（`dist/tako.app`。tako CLI 同梱） |
 | リリース | `scripts/release.sh`（Cargo.toml バージョン自動読み取り + CHANGELOG.md 連携。`--publish` でタグ + GitHub Release 作成、`--draft` でドラフト） |
 | マスターオーケストレーター起動 | `tako master [suffix]`（claude を master system prompt 付きで起動） |
+| ソロエージェント起動（オーケストレーション無しの 1 対 1 対話） | `tako solo [-profile]`（claude を solo system prompt 付きで起動。worker spawn 禁止・エコ運用 effort=high。master と同じプロファイル引数） |
 | オーケストレーター worker spawn | `tako orchestrator spawn --project <key> --prompt "..."` |
 | オーケストレーター worker 監視 | `tako orchestrator watch --pane <N> --session-id <S>` |
 | オーケストレーター プロジェクト管理 | `tako orchestrator projects list/add/remove` |
