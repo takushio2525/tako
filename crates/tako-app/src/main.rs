@@ -367,6 +367,11 @@ fn persist_diag(msg: &str) {
     tako_control::diag::persist_log(msg);
 }
 
+/// 起動時 orphan cleanup の猶予（秒）。最終アクティビティがこれより新しい detached
+/// セッションは自動 kill しない（Issue #113）。多重起動事故の時間スケール（分単位）より
+/// 十分長く、真の残骸（前回クラッシュの取り残し）の滞留（時間〜日単位）より短い値
+const CLEANUP_STARTUP_GRACE_SECS: u64 = 3600;
+
 /// バックエンドセッション名の払い出し（`tako-<hex12>`）。
 /// 乱数ベースなので多重起動・PID 再利用でも過去の残骸セッションと衝突しない
 fn new_backend_session_name() -> String {
@@ -499,6 +504,13 @@ struct TakoApp {
     dismissed_ports: std::collections::HashSet<(PaneId, u16)>,
     /// tmux バックエンド永続化（Phase 5.5 / FR-5）の有効状態（dispatch から切替）
     tmux_persist: bool,
+    /// セカンダリモード（Issue #113）: 別インスタンス（別プロセス or 同一プロセスの先行
+    /// ウィンドウ）がプライマリとして生きている間 true。復元・layout.json への書き込み /
+    /// 削除・tmux バックエンド・persist トグルを封じ、プライマリの作業を一切壊さない
+    secondary: bool,
+    /// 最後のタブの終了処理（remove_tab_with の LastTab 分岐）を通過済み（Issue #113:
+    /// PTY の Exit / ChildExit 二重イベントによる「全ペイン終了」ログ + quit の重複発火防止）
+    quitting: bool,
     /// ペインを保持する tmux バックエンドセッション名（persist 有効時のみ登録される）
     backend_sessions: HashMap<PaneId, String>,
     /// バックエンドセッション内の window 一覧（tmux ポーリングで更新。2+ window のみ保持）
@@ -990,6 +1002,30 @@ impl Render for DragGhost {
 
 impl TakoApp {
     fn new(cx: &mut Context<Self>) -> Self {
+        // 多重インスタンスガード（Issue #113）: 別の生きたインスタンスがプライマリである間は
+        // **セカンダリモード**で起動する（復元しない・layout.json に触らない・tmux バックエンドに
+        // 乗らない・固定ソケットを乗っ取らない）。ガード無しだと、後発の復元 spawn が
+        // `new-session -A -D` でプライマリの全クライアントを強奪 → プライマリ側の Exited 連鎖の
+        // 途中状態が layout.json を上書き → 次回起動の orphan cleanup が protected から漏れた
+        // 実行中セッションを kill する三段連鎖が起きる（2026-07-08 実機: 19→13 ペイン消失）。
+        // - プロセス内: NewWindow で 2 つ目以降の TakoApp（最初の 1 つだけがプライマリ）
+        // - プロセス間: control.json の主がまだ生きた tako-app（SIGKILL 残骸は pid 死亡で除外）
+        // TAKO_FORCE_PRIMARY=1 は検証・緊急脱出用の明示オーバーライド（多重復元の保護も切れる）
+        static PRIMARY_CLAIMED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let in_process_secondary = PRIMARY_CLAIMED.swap(true, std::sync::atomic::Ordering::SeqCst);
+        let secondary_reason: Option<String> = if std::env::var_os("TAKO_SELF_TEST").is_some()
+            || std::env::var_os("TAKO_FORCE_PRIMARY").is_some()
+        {
+            None
+        } else if in_process_secondary {
+            Some("同一プロセスの先行ウィンドウがプライマリ".into())
+        } else {
+            tako_control::discovery::live_primary_pid()
+                .map(|pid| format!("別の tako プロセス（pid {pid}）が稼働中"))
+        };
+        let secondary = secondary_reason.is_some();
+
         // IPC（Layer 1）と MCP（Layer 2）の受け口。最初のセッション起動より前に立てて
         // ルートペインのシェルにも TAKO_SOCKET / TAKO_MCP_URL / TAKO_TOKEN を注入できるようにする。
         // 認証トークンは両者で共有する（FR-2.3.4）
@@ -1002,7 +1038,7 @@ impl TakoApp {
             }
         };
         let ipc = token.as_ref().and_then(|token| {
-            match IpcServer::start(control_tx.clone(), token.clone()) {
+            match IpcServer::start_with(control_tx.clone(), token.clone(), secondary) {
                 Ok(server) => Some(server),
                 Err(e) => {
                     eprintln!("warning: IPC サーバーを起動できない（tako CLI は使えない）: {e}");
@@ -1023,7 +1059,9 @@ impl TakoApp {
         });
 
         // 接続情報をファイルへ永続化（FR-2.2.9）。アプリ再起動後も外部の長寿命プロセス
-        // から `tako` CLI が繋ぎ直せるようにする（CLI 側のフォールバック先）
+        // から `tako` CLI が繋ぎ直せるようにする（CLI 側のフォールバック先）。
+        // セカンダリモードは current ポインタ（control.json）を奪わず instances/ のみに書く
+        // （プライマリへの既存 CLI / MCP 接続を壊さない。Issue #113）
         if let (Some(ipc), Some(token)) = (&ipc, &token) {
             let info = tako_control::discovery::ControlInfo {
                 version: 1,
@@ -1032,7 +1070,12 @@ impl TakoApp {
                 token: token.clone(),
                 mcp_url: mcp.as_ref().map(|m| m.url().to_string()),
             };
-            if let Err(e) = tako_control::discovery::write(&info) {
+            let written = if secondary {
+                tako_control::discovery::write_instance_only(&info)
+            } else {
+                tako_control::discovery::write(&info)
+            };
+            if let Err(e) = written {
                 eprintln!("warning: 接続情報ファイルを書き出せない（再起動後の外部接続は環境変数頼みになる）: {e}");
             }
         }
@@ -1041,8 +1084,9 @@ impl TakoApp {
         // 同じ ID・同じ構成でワークスペースを再現する。tmux があれば各ペインは下の
         // spawn ループでバックエンドセッションへ再 attach（実行中プロセスごと復元）、
         // tmux 不在なら保存 cwd で新しいシェルを開く**構造のみ復元**に劣化する
-        // （Issue #30: tmux の有無でレイアウト永続化そのものを無効化しない）
-        let tmux_persist = initial_tmux_persist();
+        // （Issue #30: tmux の有無でレイアウト永続化そのものを無効化しない）。
+        // セカンダリモードは persist 一式（復元・保存・バックエンド）を無効化する（Issue #113）
+        let tmux_persist = initial_tmux_persist() && !secondary;
         let tmux_available = tako_core::tmux_backend::available();
         if tmux_persist && tmux_available {
             // 生き残っている既存サーバーへ最新 conf を再適用する（conf は
@@ -1053,7 +1097,14 @@ impl TakoApp {
         let mut restored: Vec<tako_control::layout::RestoredPane> = Vec::new();
         let mut collapsed_tmux_tabs: std::collections::HashSet<TabId> =
             std::collections::HashSet::new();
-        let (workspace, restore_report) = if tmux_persist {
+        let (workspace, restore_report) = if let Some(reason) = &secondary_reason {
+            let msg = format!(
+                "復元スキップ: {reason}のためセカンダリモードで起動\
+                 （このウィンドウのタブは永続化されず、既存側の復元・保存を妨げない）"
+            );
+            persist_diag(&msg);
+            (Workspace::new("1", Pane::new(PaneOrigin::User)), msg)
+        } else if tmux_persist {
             let loaded = tako_control::layout::try_load().and_then(|file| {
                 // 折りたたみ状態（FR-2.16.14）を控えてから復元する。タブ ID は
                 // Phase 5.5 で同一値に復元されるので再起動後も対応が保たれる
@@ -1153,6 +1204,8 @@ impl TakoApp {
             port_suggestions: Vec::new(),
             dismissed_ports: std::collections::HashSet::new(),
             tmux_persist,
+            secondary,
+            quitting: false,
             backend_sessions: HashMap::new(),
             backend_windows: HashMap::new(),
             window_captures: HashMap::new(),
@@ -1252,8 +1305,11 @@ impl TakoApp {
 
         // 起動時の orphan 一括クリーンアップ（FR-2.16.11）。復元で backend_sessions が
         // 出揃った後に実行し、前回クラッシュ等で取り残された detached・非 grouped の
-        // backend セッションだけを掃除する（現存・バックグラウンド・表示中ビューは protected で除外）
-        let cleaned = app.cleanup_orphan_tmux();
+        // backend セッションだけを掃除する（現存・バックグラウンド・表示中ビューは protected で除外）。
+        // 直近 1 時間にアクティビティのあるセッションは対象外（Issue #113: layout.json が
+        // 多重起動で巻き戻った場合に protected から漏れる実行中 worker を巻き込まない猶予。
+        // 真の残骸はクラッシュから時間が経っており、次回以降の起動で掃除される）
+        let cleaned = app.cleanup_orphan_tmux_with(Some(CLEANUP_STARTUP_GRACE_SECS));
         if !cleaned.is_empty() {
             eprintln!(
                 "info: orphan tmux セッションを {} 件クリーンアップした",
@@ -1316,6 +1372,27 @@ impl TakoApp {
         })
         .detach();
 
+        // UI ストールウォッチドッグ（Issue #113 診断）: この async タスクは UI スレッド
+        // （foreground executor）上で走るため、1 秒 timer からの再開遅延 = 「UI スレッドが
+        // 他の処理で塞がっていた時間」になる。しきい値超えを perf.log に記録し、
+        // 次に無応答が起きたとき時刻と長さがファイルに残るようにする（正常時は何も書かない）
+        cx.spawn(async move |this, cx| loop {
+            let t0 = std::time::Instant::now();
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let lag = t0.elapsed().saturating_sub(Duration::from_secs(1));
+            if lag >= Duration::from_millis(500) {
+                tako_control::diag::perf_log(&format!(
+                    "UI ストール: イベントループ再開が {:.2}s 遅延",
+                    lag.as_secs_f64()
+                ));
+            }
+            // View 破棄でループ終了（他の定期ループと同じ生存判定）
+            if this.update(cx, |_, _| {}).is_err() {
+                break;
+            }
+        })
+        .detach();
+
         // alt_screen 遷移待ち + プロンプトフロー駆動のポーリング（500ms 間隔）。
         // spawn 直後は他の IPC リクエストが来ない可能性があるため、短間隔で回す
         cx.spawn(async move |this, cx| loop {
@@ -1341,6 +1418,7 @@ impl TakoApp {
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(2)).await;
             // ① main thread: tmux コンテキスト + filetree 対象 + view 監視対象 + git を収集（高速）
+            let t0 = std::time::Instant::now();
             let prep = this.update(cx, |app: &mut TakoApp, _| {
                 let tmux_ctx = if app.panel_visible && app.panel_view == PanelView::Tmux {
                     Some(app.collect_tmux_context())
@@ -1374,6 +1452,13 @@ impl TakoApp {
                     git_selected,
                 )
             });
+            // UI スレッド専有時間の計測（Issue #113 診断。しきい値超えのみ記録）
+            let prep_ms = t0.elapsed().as_millis();
+            if prep_ms >= 100 {
+                tako_control::diag::perf_log(&format!(
+                    "定期更新（UI 部）遅延: 収集 + save_layout が {prep_ms}ms"
+                ));
+            }
             let Ok((tmux_ctx, filetree_targets, view_targets, git_cwd, git_selected)) = prep else {
                 break;
             };
@@ -1387,13 +1472,44 @@ impl TakoApp {
                 None
             };
             if let Some(sessions) = tmux_result {
-                let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                // 構造の更新（メモリ操作）だけ UI スレッドで行い、window キャプチャ
+                // （tmux サブプロセス実行）は background へ逃がす（Issue #113: 旧実装は
+                // ここで window 数ぶん capture-pane を同期実行し、多 worker 時の定常的な
+                // UI ブロック源だった）
+                let targets = this.update(cx, |app: &mut TakoApp, cx| {
                     app.tmux_sessions = sessions;
-                    app.sync_backend_windows();
+                    let targets = app.sync_backend_windows();
                     cx.notify();
+                    targets
                 });
-                if ok.is_err() {
+                let Ok(targets) = targets else {
                     break;
+                };
+                if !targets.is_empty() {
+                    let socket = tako_core::tmux_backend::socket_name();
+                    let captures = cx
+                        .background_executor()
+                        .spawn(async move {
+                            targets
+                                .into_iter()
+                                .map(|(pane, session, win)| {
+                                    let lines = tako_core::tmux::capture_pane_text(
+                                        Some(&socket),
+                                        &session,
+                                        win,
+                                    );
+                                    ((pane, win), lines)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .await;
+                    let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                        app.apply_window_captures(captures);
+                        cx.notify();
+                    });
+                    if ok.is_err() {
+                        break;
+                    }
                 }
             }
             // TmuxOpen ペインの監視: 対象セッションが消滅したら自動クローズ
@@ -2087,15 +2203,20 @@ impl TakoApp {
         )
         .unwrap_or_else(|_| serde_json::json!({ "sessions": [] }));
         self.tmux_sessions = value["sessions"].as_array().cloned().unwrap_or_default();
-        self.sync_backend_windows();
+        // 構造のみ即時更新。window キャプチャ（サブプロセス実行）は次の 2 秒 tick が
+        // background で埋める（UI スレッドで tmux を同期実行しない。Issue #113）
+        let _ = self.sync_backend_windows();
     }
 
-    /// tmux_sessions JSON からバックエンドペインの window 一覧を抽出する。
-    /// 2+ window のセッションのみ backend_windows に保持し、非アクティブ window の
-    /// テキストを capture_pane で取得して window_captures にキャッシュする
-    fn sync_backend_windows(&mut self) {
+    /// tmux_sessions JSON からバックエンドペインの window 一覧を抽出する（メモリ操作のみ）。
+    /// 2+ window のセッションのみ backend_windows に保持し、ホバープレビュー用に
+    /// キャプチャすべき非アクティブ window（pane, session, window index）を返す。
+    /// capture-pane はサブプロセス実行のため呼び出し側が background で行い、結果を
+    /// `apply_window_captures` で適用する（Issue #113: 旧実装はここで UI スレッドの
+    /// 同期実行をしており、多 worker = 多 window 時の定常的な UI ブロック源だった）
+    fn sync_backend_windows(&mut self) -> Vec<(PaneId, String, u32)> {
         self.backend_windows.clear();
-        let socket = tako_core::tmux_backend::socket_name();
+        let mut capture_targets = Vec::new();
         for (pane_id, session_name) in &self.backend_sessions {
             let session = self.tmux_sessions.iter().find(|s| {
                 s["name"].as_str() == Some(session_name) && s["backend"].as_bool() == Some(true)
@@ -2117,12 +2238,7 @@ impl TakoApp {
             if windows.len() > 1 {
                 for w in &windows {
                     if !w.active {
-                        let lines = tako_core::tmux::capture_pane_text(
-                            Some(&socket),
-                            session_name,
-                            w.index,
-                        );
-                        self.window_captures.insert((*pane_id, w.index), lines);
+                        capture_targets.push((*pane_id, session_name.clone(), w.index));
                     }
                 }
                 self.backend_windows.insert(*pane_id, windows);
@@ -2135,6 +2251,21 @@ impl TakoApp {
                 .map(|ws| ws.iter().any(|w| w.index == *win))
                 .unwrap_or(false)
         });
+        capture_targets
+    }
+
+    /// background で採取した window キャプチャを適用する（`sync_backend_windows` と対）。
+    /// 採取中に対象が消えていたら捨てる（retain と同じ整合条件）
+    fn apply_window_captures(&mut self, captures: Vec<((PaneId, u32), Vec<String>)>) {
+        for ((pane, win), lines) in captures {
+            if self
+                .backend_windows
+                .get(&pane)
+                .is_some_and(|ws| ws.iter().any(|w| w.index == win))
+            {
+                self.window_captures.insert((pane, win), lines);
+            }
+        }
     }
 
     /// アクティブタブの最初のペインの cwd を返す（git パネルの cwd 連動用）
@@ -2846,11 +2977,23 @@ impl TakoApp {
                 // シェル exit）= セッションは kill せず layout.json も保持し、
                 // 次回起動でタブ構成を復元できるようにする（Issue #30。
                 // 2026-07-03 実機: サーバー死で全タブが道連れ削除された）
+                //
+                // 冪等化ラッチ（Issue #113）: この分岐は最後のペインを workspace /
+                // terminals から取り除かないため、同一 PTY の Exit と ChildExit
+                // （terminal.rs で両方 SessionNotice::Exited になる）が二重に届くと
+                // ここを 2 回通り、「全ペイン終了」ログと quit が重複発火していた
+                // （実機 persist.log の同時刻二重行の正体）
+                if self.quitting {
+                    return;
+                }
+                self.quitting = true;
                 for id in pane_ids {
                     self.drop_tmux_view_session(id);
                     self.drop_backend_session_with(id, reason);
                 }
-                if std::env::var_os("TAKO_SELF_TEST").is_none() {
+                // セカンダリモードは layout.json の所有者ではないため削除もログも行わない
+                // （プライマリの復元情報を道連れにしない。Issue #113）
+                if std::env::var_os("TAKO_SELF_TEST").is_none() && !self.secondary {
                     match reason {
                         CloseReason::Explicit => {
                             tako_control::layout::remove();
@@ -2876,13 +3019,48 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// orphan tmux セッションの一括クリーンアップ本体（FR-2.16.11）。
+    /// `min_idle_secs` は起動時の自動実行だけが渡す猶予（Issue #113: 直前まで動いていた
+    /// セッションを protected 漏れ時にも巻き込まない）。判定は `cleanup_orphans` を参照
+    fn cleanup_orphan_tmux_with(&self, min_idle_secs: Option<u64>) -> Vec<String> {
+        // セカンダリモードは backend_sessions（= protected）が空でプライマリの
+        // セッションを全部 orphan と誤認するため、判定自体を行わない（Issue #113）
+        if self.secondary || !self.tmux_persist || !tako_core::tmux_backend::available() {
+            return Vec::new();
+        }
+        if tako_core::ports::other_tako_running() {
+            eprintln!("info: 別の tako プロセスが動作中のため orphan クリーンアップをスキップ");
+            return Vec::new();
+        }
+        let mut protected: std::collections::HashSet<String> =
+            self.backend_sessions.values().cloned().collect();
+        // バックグラウンド中ペインの backend セッションは backend_sessions に残るため上で網羅されるが、
+        // 念のため明示的に保護する（生かしたまま隠れている）
+        for pane in self.workspace.shelved_panes() {
+            if let Some(name) = self.backend_sessions.get(&pane.id()) {
+                protected.insert(name.clone());
+            }
+        }
+        // 表示中ビューの元セッション・ラッパーも保護（足元を崩さない）
+        for target in self.tmux_view_panes.values() {
+            protected.insert(target.session.clone());
+            if let Some(wrapper) = &target.wrapper {
+                protected.insert(wrapper.clone());
+            }
+        }
+        let socket = tako_core::tmux_backend::socket_name();
+        tako_core::tmux_backend::cleanup_orphans(&socket, &protected, min_idle_secs)
+    }
+
     /// レイアウトの保存（Phase 5.5 / FR-5）。構造が変わったときだけ書き込む。
     /// 定期ループ（2 秒）・dispatch 後・終了時に呼ばれる。セルフテスト中は
     /// ユーザーのレイアウトファイルを汚さない。
     /// tmux 不在でも保存する（Issue #30: その場合 session は None になり、
-    /// 復元時は保存 cwd で新シェルを開く「構造のみ永続化」として機能する）
+    /// 復元時は保存 cwd で新シェルを開く「構造のみ永続化」として機能する）。
+    /// セカンダリモードは書かない（プライマリの layout.json を汚さない。Issue #113。
+    /// tmux_persist=false で実質届かないが、persist トグル等の経路変更に耐える明示ガード）
     fn save_layout(&mut self) {
-        if !self.tmux_persist || std::env::var_os("TAKO_SELF_TEST").is_some() {
+        if self.secondary || !self.tmux_persist || std::env::var_os("TAKO_SELF_TEST").is_some() {
             return;
         }
         let backend_sessions = &self.backend_sessions;
@@ -5340,31 +5518,8 @@ impl ControlHost for TakoApp {
     /// backend セッション、表示中ビューの元/ラッパー名を protected として渡し、backend
     /// socket 上の取り残しだけを kill する。tmux 永続化 OFF / tmux 不在では何もしない
     fn cleanup_orphan_tmux(&self) -> Vec<String> {
-        if !self.tmux_persist || !tako_core::tmux_backend::available() {
-            return Vec::new();
-        }
-        if tako_core::ports::other_tako_running() {
-            eprintln!("info: 別の tako プロセスが動作中のため orphan クリーンアップをスキップ");
-            return Vec::new();
-        }
-        let mut protected: std::collections::HashSet<String> =
-            self.backend_sessions.values().cloned().collect();
-        // バックグラウンド中ペインの backend セッションは backend_sessions に残るため上で網羅されるが、
-        // 念のため明示的に保護する（生かしたまま隠れている）
-        for pane in self.workspace.shelved_panes() {
-            if let Some(name) = self.backend_sessions.get(&pane.id()) {
-                protected.insert(name.clone());
-            }
-        }
-        // 表示中ビューの元セッション・ラッパーも保護（足元を崩さない）
-        for target in self.tmux_view_panes.values() {
-            protected.insert(target.session.clone());
-            if let Some(wrapper) = &target.wrapper {
-                protected.insert(wrapper.clone());
-            }
-        }
-        let socket = tako_core::tmux_backend::socket_name();
-        tako_core::tmux_backend::cleanup_orphans(&socket, &protected)
+        // 明示操作（tako tmux cleanup / MCP）は従来どおり猶予なし
+        self.cleanup_orphan_tmux_with(None)
     }
 
     fn tmux_tab_collapsed(&self, tab: TabId) -> bool {
@@ -5458,6 +5613,15 @@ impl ControlHost for TakoApp {
     }
 
     fn set_tmux_persist(&mut self, enabled: bool) {
+        if self.secondary {
+            // セカンダリモードでは persist を切り替えさせない（Issue #113）:
+            // ON = プライマリと layout.json の書き込み競合、OFF = プライマリの
+            // layout.json 削除（set_tmux_persist の OFF 経路）につながる
+            eprintln!(
+                "warning: セカンダリモードのため persist 切替を無視（プライマリ側で操作してください）"
+            );
+            return;
+        }
         self.tmux_persist = enabled;
         if enabled && tako_core::tmux_backend::available() {
             // 過去の起動から生き残っているサーバーがあれば最新 conf を再適用する
@@ -5483,6 +5647,10 @@ impl ControlHost for TakoApp {
 
     fn persist_restore_report(&self) -> Option<String> {
         self.restore_report.clone()
+    }
+
+    fn is_secondary(&self) -> bool {
+        self.secondary
     }
 
     fn backend_session(&self, pane: PaneId) -> Option<String> {

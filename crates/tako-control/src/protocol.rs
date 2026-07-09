@@ -455,6 +455,16 @@ pub enum Request {
     SetupChanges,
 }
 
+impl Request {
+    /// ログ・計測用の種別名（Issue #113 の dispatch 遅延計測）。
+    /// Debug 表記の先頭トークン = variant 名だけを返し、ペイロード（送信テキスト・
+    /// パス等）は含めない（conventions: ペイン内容・送信テキストをログに出さない）
+    pub fn kind_name(&self) -> String {
+        let dbg = format!("{self:?}");
+        dbg.split([' ', '{', '(']).next().unwrap_or("?").to_string()
+    }
+}
+
 /// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。
 /// `origin` は生成主体の自己申告（`"mcp"` = MCP 経由。省略時は CLI）。
 /// トークンを持つプロセスは信頼済みのため、これは UI 表示・ポリシー用のラベルであって
@@ -595,5 +605,23 @@ mod tests {
         let err =
             serde_json::to_string(&ResponseEnvelope::err(1, error_code::AUTH, "認証失敗")).unwrap();
         assert!(err.contains(r#""error""#) && !err.contains(r#""result""#));
+    }
+
+    /// Issue #113: dispatch 遅延計測のログには種別名のみが載り、ペイロード
+    /// （送信テキスト・パス等）を含まない（conventions: 内容をログに出さない）
+    #[test]
+    fn kind_nameは種別名のみでペイロードを含まない() {
+        let send = Request::Send {
+            pane: Some(1),
+            text: "secret-prompt-text".into(),
+            newline: true,
+            tmux_session: None,
+            await_prompt: false,
+        };
+        assert_eq!(send.kind_name(), "Send");
+        // フィールド無し variant / struct variant の両形
+        assert_eq!(Request::List.kind_name(), "List");
+        assert_eq!(Request::SetupChanges.kind_name(), "SetupChanges");
+        assert_eq!(Request::TmuxList { socket: None }.kind_name(), "TmuxList");
     }
 }

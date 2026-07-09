@@ -84,6 +84,30 @@ pub fn write(info: &ControlInfo) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+/// 接続情報を instances/ のみへ書く（current ポインタ = `control.json` は更新しない）。
+/// セカンダリモード（多重起動の後発。Issue #113）用: 生きているプライマリへの
+/// CLI / MCP 接続（control.json 経由）を奪わずに、自分もフォールバック候補列には載る
+pub fn write_instance_only(info: &ControlInfo) -> io::Result<PathBuf> {
+    let instance = instance_path(info.pid).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "データディレクトリを解決できない",
+        )
+    })?;
+    write_to(&instance, info)?;
+    Ok(instance)
+}
+
+/// この data_dir を最後に所有したインスタンス（control.json の主）がまだ生きていれば
+/// その pid を返す（多重起動ガード。Issue #113）。判定は「pid が自分以外」かつ
+/// 「その pid が生きた tako-app プロセス」。SIGKILL 済みの残骸 control.json は
+/// pid 死亡（または pid 再利用でプロセス名不一致）で None になり通常起動を妨げない
+pub fn live_primary_pid() -> Option<u32> {
+    let info = read()?;
+    (info.pid != std::process::id() && tako_core::ports::is_live_tako_app(info.pid))
+        .then_some(info.pid)
+}
+
 /// 明示終了時のクリーンアップ（アプリの Quit 経路から呼ぶ）。
 /// 自分のインスタンスファイルを消し、current が自分を指していたらそれも消す
 /// （死んだ接続先を新規 CLI に掴ませない）。クラッシュ時は呼ばれないが、
@@ -295,6 +319,20 @@ mod tests {
             candidates.iter().all(|c| c.pid != 200),
             "死骸が掃除される: {candidates:?}"
         );
+        // セカンダリモードの書き込み（Issue #113）: current ポインタを奪わず
+        // instances/ のみに載る（プライマリへの既存接続を壊さない）
+        let secondary = info(300, dir.join("secondary.sock").to_str().unwrap());
+        write_instance_only(&secondary).unwrap();
+        assert_eq!(
+            read().map(|i| i.pid),
+            Some(100),
+            "current はプライマリのまま"
+        );
+        assert!(
+            read_candidates().iter().any(|c| c.pid == 300),
+            "セカンダリはフォールバック候補列に載る"
+        );
+        cleanup(300);
         // 明示終了のクリーンアップ: 自分のファイルと current が消える
         cleanup(100);
         assert_eq!(read(), None);
