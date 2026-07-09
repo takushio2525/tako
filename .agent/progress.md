@@ -492,5 +492,6 @@
   master 対称・`build_master_claude_cmd` 共用・role/env `solo`/`solo:<suffix>`・effort=high・
   solo-profiles/ 分離）を新規実装。sessions 断片は除去（無関係・保全コミット `9783c33` に保存）、
   tako-app ツール数を 52 へ戻す。実バイナリで構築コマンド/role/effort/prompt 注入 + エッジ 2 件を検証
-- 関連コミット: `9783c33`（WIP 保全）、`99a1f4c`（solo 実装）→ PR #117 squash merge（`main` へ）
-- 次: tako 再起動後に `tako solo` で実対話を確認 → #111 close（実対話のみ未検証）
+- 関連コミット: `9783c33`（WIP 保全）、`99a1f4c`（solo 実装）→ PR #117 squash merge（`53bdf1b`）
+- 実機確認済み → #111 close: `tako solo` でタブ 'solo' 起動・effort=high 実測（`· H`）・
+  solo prompt の 3 本柱（エコ運用 / spawn 禁止 / projects 把握）を確認。実対話の細部は通常利用で

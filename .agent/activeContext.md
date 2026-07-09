@@ -17,12 +17,12 @@
 - **#111**（tako solo = オーケストレーション無しの 1 対 1 対話モード）: `tako solo [-profile]`、
   role/env `solo` / `solo:<suffix>`、既定 effort=high、worker spawn 禁止、solo-profiles/ 分離。
   前任 WIP に混入していた別機能 sessions 断片は保全コミット `9783c33` に退避。PR #117 squash merge。
-  **実対話（信頼ダイアログ・GUI 実挙動）のみ未検証 = 再起動後に確認**
+  **実機確認済み → #111 close**（`tako solo` 起動でタブ 'solo'・effort=high 実測・
+  solo prompt の 3 本柱＝エコ運用/spawn 禁止/projects 把握 を確認。実対話の細部は通常利用で）
 
 ## 残作業・既知の制約
 
-- **tako 再起動が必要**（稼働中プロセスは旧バイナリ。build-app.sh --install 済み）。
-  再起動後に `tako solo` の実対話を確認 → #111 close
+- **#113 / #111 とも完了・close 済み**。solo 反映済みバイナリで稼働中（pid 82237）
 - sessions 断片（#112 会話ログ管理の書きかけ）は `9783c33` に保全。#112 再開時に復元可
 - main.rs は 9,900 行前後。さらなる分割は別タスク
 - 多重インスタンスガードは macOS のみ（Windows は Phase 6）。`TAKO_FORCE_PRIMARY=1` で無効化可
