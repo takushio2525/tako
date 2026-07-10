@@ -1441,7 +1441,7 @@ prompt_blocks:
             ..Default::default()
         };
         let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "multi");
-        assert!(prompt.contains("Available Worker Agents"));
+        assert!(prompt.contains("### Available Worker Agents"));
         assert!(prompt.contains("default agent is **codex**"));
         assert!(prompt.contains("gpt-5.6-terra"));
         assert!(prompt.contains("Gemini 3.5 Flash (High)"));
@@ -1452,10 +1452,11 @@ prompt_blocks:
 
     #[test]
     fn build_system_prompt_without_worker_agents_unchanged() {
-        // worker_agent 系が未設定なら従来のプロンプトに新セクションは出ない（回帰なし）
+        // worker_agent 系が未設定なら従来のプロンプトに新セクション（見出し）は出ない
+        // （回帰なし。テンプレ本文にはセクション名への言及があるため見出しで判定する）
         let p = Profile::default();
         let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
-        assert!(!prompt.contains("Available Worker Agents"));
+        assert!(!prompt.contains("### Available Worker Agents"));
         assert!(!prompt.contains("Worker agent**:"));
     }
 
