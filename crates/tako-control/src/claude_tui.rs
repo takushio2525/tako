@@ -1,8 +1,13 @@
-//! claude_tui — Claude Code TUI の画面状態検出とプロンプト送達確認（Issue #32）
+//! claude_tui — エージェント TUI の画面状態検出とプロンプト送達確認（Issue #32 / #120）
 //!
 //! spawn / send のプロンプト送達を「書いて祈る」から「見て・貼って・送って・確かめる」へ
-//! 変えるための部品。実 TUI（v2.1.198）の tmux capture で採取した画面を根拠にしている。
+//! 変えるための部品。実 TUI（claude v2.1.198 / codex 0.144.1 / agy 1.1.0）の
+//! tmux capture で採取した画面を根拠にしている。
 //!
+//! - **対象 TUI**（Issue #120 で codex / agy に拡張）: 検出パターンは 3 種の**和集合**で、
+//!   送達フロー（PromptFlow / deliver_via_tmux）はエージェント非依存。
+//!   入力欄プロンプトは claude `❯`(U+276F) / codex `›`(U+203A) / agy `>`(ASCII)。
+//!   `>` はシェルの PS2 等と衝突しうるため「`>` 単独 or `> `＋内容」のみ入力欄とみなす
 //! - **検出**: 画面テキスト（`visible_lines` / `capture-pane`）から TUI 状態を判定する純関数群。
 //!   信頼ダイアログは選択カーソルに `❯` を含むため「`❯` があれば送信可」という旧判定は誤爆する
 //! - **送達**: テキスト本体は bracketed paste で貼り付け、送信の Enter は貼り付けと分離した
@@ -10,9 +15,11 @@
 //!   送信後に入力欄が空へ戻ったことを検証し、残っていれば Enter を単独再送する
 //! - **事前信頼**: `~/.claude.json` の `projects.<cwd>.hasTrustDialogAccepted` を spawn 前に
 //!   立てることで信頼ダイアログ自体を出さない。ダイアログ検出 → 承諾はそのフォールバック
+//!   （codex / agy の事前信頼は `orchestrator::agent::ensure_trusted` が対応）
 //!
 //! 検出はヒューリスティック（TUI の文言はバージョンで変わり得る）だが、誤検知時の副作用が
-//! 無害になるよう設計している: 空の入力欄への Enter は claude TUI では no-op。
+//! 無害になるよう設計している: 空の入力欄への Enter は claude / codex / agy いずれも no-op
+//! （3 種とも実測確認済み）。
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -51,23 +58,42 @@ pub fn detect(lines: &[String]) -> ClaudeScreen {
 }
 
 /// 信頼確認ダイアログが表示されているか。
-/// 実画面の文言（v2.1.198: 「❯ 1. Yes, I trust this folder」）と旧文言
-/// （"Do you trust the files in this folder?"）の両方を拾う。
-/// 誤検知して Enter を送っても、通常画面の空入力欄では no-op なので無害
+/// claude（v2.1.198: 「❯ 1. Yes, I trust this folder」）・旧文言
+/// （"Do you trust the files in this folder?"）に加え、codex
+/// （"Do you trust the contents of this directory?"）と agy
+/// （"Do you trust the contents of this project?"）を拾う（Issue #120）。
+/// いずれも承諾候補が選択済みで Enter 承諾できる。
+/// 誤検知して Enter を送っても、通常画面の空入力欄では no-op なので無害。
+/// agy の**許可**ダイアログ（"Do you want to proceed?"）はここに含めない
+/// （コマンド実行の自動承諾はしない。skip_permissions opt-in か master の対応に委ねる）
 pub fn is_trust_dialog(lines: &[String]) -> bool {
-    lines
-        .iter()
-        .any(|l| l.contains("trust this folder") || l.contains("trust the files"))
+    lines.iter().any(|l| {
+        l.contains("trust this folder")
+            || l.contains("trust the files")
+            || l.contains("trust the contents")
+    })
 }
 
-/// 入力欄の内容を返す。会話ログの送信済みメッセージも `❯` で始まるため、
-/// 入力欄 = **画面の一番下にある** `❯` 行とみなし、`❯` 以降を trim して返す。
-/// `❯` 行が無ければ None（claude TUI ではない）
+/// 入力欄の内容を返す。会話ログの送信済みメッセージも同じプロンプト文字で始まるため、
+/// 入力欄 = **画面の一番下にある**プロンプト行とみなし、プロンプト文字以降を trim して返す。
+/// プロンプト文字は claude `❯` / codex `›` / agy `>` の和集合（Issue #120）。
+/// ASCII の `>` はシェルの PS2・リダイレクト・引用と衝突しうるため
+/// 「`>` 単独 or `> `＋内容」の形のみ入力欄とみなす。
+/// プロンプト行が無ければ None（エージェント TUI ではない）
 pub fn input_line(lines: &[String]) -> Option<&str> {
-    lines
-        .iter()
-        .rev()
-        .find_map(|l| l.trim_start().strip_prefix('❯').map(str::trim))
+    lines.iter().rev().find_map(|l| prompt_content(l))
+}
+
+/// 1 行がエージェント TUI の入力欄（プロンプト行）ならその内容を返す
+fn prompt_content(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    t.strip_prefix('❯')
+        .or_else(|| t.strip_prefix('›'))
+        .or_else(|| match t.strip_prefix('>') {
+            Some(rest) if rest.is_empty() || rest.starts_with(' ') => Some(rest),
+            _ => None,
+        })
+        .map(str::trim)
 }
 
 /// 入力欄の内容が「空」か。空の入力欄は `❯ ` 単独、または `Try "..."` の
@@ -77,12 +103,16 @@ pub fn input_content_is_empty(content: &str) -> bool {
     content.is_empty() || content.starts_with("Try \"")
 }
 
-/// 応答生成中に見えるか（advisory）。「esc to interrupt」ヒント、または
-/// スピナーの経過秒表示（`(2s · thinking)` / `Baked for 3s` 等）を拾う
+/// 応答生成中に見えるか（advisory）。claude / codex の「esc to interrupt」ヒント、
+/// agy の「esc to cancel」＋スピナー行「Generating...」、または
+/// スピナーの経過秒表示（`(2s · thinking)` / `Baked for 3s` / `Working (3s` 等）を拾う
 pub fn is_busy(lines: &[String]) -> bool {
-    lines
-        .iter()
-        .any(|l| l.contains("esc to interrupt") || has_elapsed_marker(l))
+    lines.iter().any(|l| {
+        l.contains("esc to interrupt")
+            || l.contains("esc to cancel")
+            || l.contains("Generating")
+            || has_elapsed_marker(l)
+    })
 }
 
 /// 「3s」のような経過秒トークンを含むか（`for 3s` / `(2s · thinking)`）
@@ -510,5 +540,152 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(root["projects"]["/fresh"]["hasTrustDialogAccepted"], true);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- codex / agy の実採取画面（Issue #120。0.144.1 / 1.1.0 の tmux capture-pane より） ---
+
+    const CODEX_TRUST_DIALOG: &str = r#"> You are in /private/tmp/example/workdir
+
+  Do you trust the contents of this directory? Working with untrusted contents comes with higher
+  risk of prompt injection. Trusting the directory allows project-local config, hooks, and exec
+  policies to load.
+
+› 1. Yes, continue
+  2. No, quit
+
+  Press enter to continue"#;
+
+    const CODEX_READY: &str = r#"╭─────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.144.1)                      │
+│                                                 │
+│ model:     gpt-5.6-sol high   /model to change  │
+│ directory: /private/tmp/…/scratchpad/agentprobe │
+╰─────────────────────────────────────────────────╯
+
+  Tip: When the composer is empty, press Esc to step back and edit your last message; Enter
+  confirms.
+
+
+› Summarize recent commits
+
+  gpt-5.6-sol high · /private/tmp/example/workdir"#;
+
+    const CODEX_BUSY: &str = r#"› Run this shell command: sleep 8 && echo DONE_PROBE
+• I’m running the requested command now.
+• Working (3s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close
+› Summarize recent commits
+  gpt-5.6-sol high · /private/tmp/example/workdir"#;
+
+    const CODEX_INPUT_PENDING: &str = r#"• DONE_PROBE
+────────────────────────────────────────────────────
+› Reply with exactly: PROBE_OK (nothing else)
+  gpt-5.6-sol high · /private/tmp/example/workdir"#;
+
+    const AGY_TRUST_DIALOG: &str = r#"Accessing workspace:
+/private/tmp/example/workdir
+Do you trust the contents of this project?
+Antigravity CLI requires permission to read, edit, and execute files here.
+> Yes, I trust this folder
+  No, exit
+  ↑/↓ Navigate · enter Confirm
+                                                    Claude Opus 4.6 (Thinking)"#;
+
+    const AGY_READY: &str = r#"  Antigravity CLI 1.1.0
+  Claude Opus 4.6 (Thinking)
+  /private/tmp/example/workdir
+────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────
+? for shortcuts                                     Claude Opus 4.6 (Thinking)"#;
+
+    const AGY_BUSY: &str = r#"> Run this shell command: sleep 8 && echo AGY_DONE
+▸ Thought Process
+  The user wants me to run a simple shell command.
+⣻  Generating...
+────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────
+esc to cancel                                       Claude Opus 4.6 (Thinking)"#;
+
+    const AGY_PERMISSION_DIALOG: &str = r#"Requesting permission for:
+   sleep 8
+Full command:
+   sleep 8 && echo AGY_DONE
+Do you want to proceed?
+> 1. Yes
+  2. Yes, and always allow in this conversation for commands that start with 'sleep'
+  3. Yes, and always allow for commands that start with 'sleep' (Persist to settings.json)
+  4. No
+  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command
+esc to cancel                                       Claude Opus 4.6 (Thinking)"#;
+
+    #[test]
+    fn codexの信頼ダイアログを検出する() {
+        let lines = screen(CODEX_TRUST_DIALOG);
+        assert!(is_trust_dialog(&lines));
+        assert_eq!(detect(&lines), ClaudeScreen::TrustDialog);
+    }
+
+    #[test]
+    fn codexの入力欄を検出する() {
+        // プレースホルダ（動的サジェスト）付きの起動直後画面。
+        // codex のプレースホルダは動的で空とは判定できないが、残留検証は
+        // text_in_input（貼ったプロンプト断片との一致）なので干渉しない
+        let lines = screen(CODEX_READY);
+        assert_eq!(input_line(&lines), Some("Summarize recent commits"));
+        // 枠線内の ">_ OpenAI Codex" を入力欄と誤認しない
+        let pending = screen(CODEX_INPUT_PENDING);
+        assert!(input_residual(&pending, "Reply with exactly: PROBE_OK (nothing else)"));
+        assert!(!input_residual(&pending, "全く別のテキスト"));
+    }
+
+    #[test]
+    fn codexのbusyを検出する() {
+        let lines = screen(CODEX_BUSY);
+        assert!(is_busy(&lines), "Working (3s • esc to interrupt) を拾う");
+        assert!(!is_busy(&screen(CODEX_READY)));
+    }
+
+    #[test]
+    fn agyの信頼ダイアログを検出する() {
+        let lines = screen(AGY_TRUST_DIALOG);
+        assert!(is_trust_dialog(&lines));
+        assert_eq!(detect(&lines), ClaudeScreen::TrustDialog);
+    }
+
+    #[test]
+    fn agyの入力欄を検出する() {
+        // 空入力欄（`>` 単独行）を Ready と判定する
+        let lines = screen(AGY_READY);
+        assert_eq!(input_line(&lines), Some(""));
+        assert_eq!(detect(&lines), ClaudeScreen::Ready);
+    }
+
+    #[test]
+    fn agyのbusyを検出する() {
+        let lines = screen(AGY_BUSY);
+        assert!(is_busy(&lines), "Generating... / esc to cancel を拾う");
+        assert!(!is_busy(&screen(AGY_READY)));
+    }
+
+    #[test]
+    fn agyの許可ダイアログは信頼ダイアログと誤認しない() {
+        // コマンド実行の許可（Do you want to proceed?）は自動承諾の対象外。
+        // trust 系マーカーに一致しないことを固定する（誤って Enter 自動承諾すると
+        // 任意コマンドが承認されてしまう）
+        let lines = screen(AGY_PERMISSION_DIALOG);
+        assert!(!is_trust_dialog(&lines));
+    }
+
+    #[test]
+    fn ascii山括弧の誤検知を防ぐ() {
+        // シェルの PS2・リダイレクト・引用行を入力欄と誤認しない（`>` 直後に
+        // 空白か行末が必要）。ただし PS2 の "> " は構造上区別できず許容
+        assert_eq!(prompt_content(">foo"), None, "リダイレクト風は不一致");
+        assert_eq!(prompt_content(">>file"), None);
+        assert_eq!(prompt_content("> quoted text"), Some("quoted text"));
+        assert_eq!(prompt_content(">"), Some(""));
+        // 全角・枠線行は不一致
+        assert_eq!(prompt_content("│ >_ OpenAI Codex │"), None);
     }
 }

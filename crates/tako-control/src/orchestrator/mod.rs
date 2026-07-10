@@ -4,10 +4,13 @@
 //! 子 worker の spawn・監視・プロジェクト管理を行う。外部スクリプト依存ゼロで
 //! tako をインストールするだけで使える。
 
+pub mod agent;
 pub mod wait;
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+pub use agent::WorkerAgent;
 
 /// バイナリ埋め込みのデフォルト system prompt（master 用）
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("default_system_prompt.md");
@@ -182,6 +185,35 @@ pub const LEGACY_DEFAULT_MODEL: &str = "claude-opus-4-6[1m]";
 /// model 未指定時の表示ラベル（起動コマンドには --model 自体を付けない）
 pub const CLAUDE_DEFAULT_LABEL: &str = "(claude CLI default)";
 
+/// エージェント別の worker 設定（`worker_agents.<agent>` の値。Issue #120）。
+/// model / effort はそのエージェント CLI のネイティブ表記
+/// （codex: `gpt-5.6-terra` 等、agy: `Gemini 3.5 Flash (High)` 等の表示名）
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentWorkerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// claude: `--effort` / codex: `-c model_reasoning_effort=` / agy: 無視される
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// 許可プロンプトのスキップ（明示 opt-in。agy は既定でサブコマンド毎に
+    /// 許可が出るため、自律 worker 運用では実用上ほぼ必須）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_permissions: bool,
+    /// 追加 CLI 引数（上級者向け。例: codex の `--search`）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+}
+
+/// `Profile::resolve_agent_launch` の解決結果（spawn で使う worker 起動パラメータ）
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedWorkerLaunch {
+    pub agent: WorkerAgent,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub skip_permissions: bool,
+    pub extra_args: Vec<String>,
+}
+
 /// プロファイル設定。
 /// `model` が `None` の場合は claude CLI の既定モデルに委ねる（`--model` を付けない）。
 /// 1M コンテキスト版（`[1m]` サフィックス）は Max / API プラン限定のため、
@@ -201,6 +233,15 @@ pub struct Profile {
     pub worker_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegate_guidance: Option<String>,
+
+    /// worker の既定エージェント種別（claude / codex / agy。省略時 claude。Issue #120）。
+    /// String で保持し spawn 時に検証する（不正値は診断つきエラーになる）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_agent: Option<String>,
+    /// エージェント別の worker 設定。agent≠claude のモデル・effort・許可スキップ・
+    /// 追加引数はここで指定する（claude はここに無ければ従来の worker_model_policy 解決）
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub worker_agents: std::collections::BTreeMap<String, AgentWorkerConfig>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
@@ -223,6 +264,8 @@ impl Default for Profile {
             worker_model: None,
             worker_effort: None,
             delegate_guidance: None,
+            worker_agent: None,
+            worker_agents: std::collections::BTreeMap::new(),
             system_prompt: None,
             prompt_blocks: None,
             projects: None,
@@ -255,6 +298,62 @@ impl Profile {
         match self.worker_model_policy {
             WorkerModelPolicy::Inherit | WorkerModelPolicy::Delegate => &self.effort,
             WorkerModelPolicy::Fixed => self.worker_effort.as_deref().unwrap_or(&self.effort),
+        }
+    }
+
+    /// worker のエージェント種別を解決する（spawn の明示指定 → プロファイル既定 → claude）。
+    /// 不正な種別名は spawn 時のエラーとして返す（Issue #120）
+    pub fn resolve_worker_agent(&self, explicit: Option<&str>) -> Result<WorkerAgent, String> {
+        let name = explicit
+            .or(self.worker_agent.as_deref())
+            .unwrap_or("claude");
+        WorkerAgent::parse(name).map_err(|e| {
+            if explicit.is_some() {
+                e
+            } else {
+                format!("プロファイルの worker_agent が不正: {e}")
+            }
+        })
+    }
+
+    /// worker 起動パラメータ（モデル・effort・許可スキップ・追加引数）を解決する。
+    /// - claude: 明示指定 → `worker_agents.claude` → 従来の worker_model_policy 解決
+    ///   （effort は既定 "max" まで必ず埋まる = 従来挙動の維持）
+    /// - codex / agy: 明示指定 → `worker_agents.<agent>` → CLI 既定（None のまま）
+    pub fn resolve_agent_launch(
+        &self,
+        agent: WorkerAgent,
+        explicit_model: Option<&str>,
+        explicit_effort: Option<&str>,
+    ) -> ResolvedWorkerLaunch {
+        let cfg = self.worker_agents.get(agent.as_str());
+        let cfg_model = cfg.and_then(|c| c.model.as_deref());
+        let cfg_effort = cfg.and_then(|c| c.effort.as_deref());
+        let (model, effort) = if agent == WorkerAgent::Claude {
+            (
+                explicit_model
+                    .or(cfg_model)
+                    .or_else(|| self.resolve_worker_model())
+                    .map(str::to_string),
+                Some(
+                    explicit_effort
+                        .or(cfg_effort)
+                        .unwrap_or_else(|| self.resolve_worker_effort())
+                        .to_string(),
+                ),
+            )
+        } else {
+            (
+                explicit_model.or(cfg_model).map(str::to_string),
+                explicit_effort.or(cfg_effort).map(str::to_string),
+            )
+        };
+        ResolvedWorkerLaunch {
+            agent,
+            model,
+            effort,
+            skip_permissions: cfg.map(|c| c.skip_permissions).unwrap_or(false),
+            extra_args: cfg.map(|c| c.args.clone()).unwrap_or_default(),
         }
     }
 
@@ -383,8 +482,66 @@ impl Profile {
         result.trim_end().to_string()
     }
 
+    /// worker_agent / worker_agents 設定に基づいて「利用可能な worker エージェント」の
+    /// 説明テキストを生成する（model-policy セクションに追記。Issue #120）。
+    /// どちらも未設定（= claude のみの従来運用）なら空文字列
+    fn generate_worker_agents_section(&self) -> String {
+        if self.worker_agent.is_none() && self.worker_agents.is_empty() {
+            return String::new();
+        }
+        let default_agent = self.worker_agent.as_deref().unwrap_or("claude");
+        let mut lines = vec![
+            "\n### Available Worker Agents\n".to_string(),
+            format!(
+                "This profile can spawn workers on multiple agent CLIs. \
+                 The default agent is **{default_agent}** (used when `agent` is omitted).\n"
+            ),
+        ];
+        for agent in WorkerAgent::ALL {
+            let name = agent.as_str();
+            let cfg = self.worker_agents.get(name);
+            let model = cfg
+                .and_then(|c| c.model.as_deref())
+                .map(|m| format!("model `{m}`"))
+                .unwrap_or_else(|| {
+                    if agent == WorkerAgent::Claude {
+                        format!("model {}", self.worker_model_label())
+                    } else {
+                        "model (CLI default)".to_string()
+                    }
+                });
+            let mut extras = Vec::new();
+            if let Some(e) = cfg.and_then(|c| c.effort.as_deref()) {
+                extras.push(format!("effort {e}"));
+            }
+            if cfg.is_some_and(|c| c.skip_permissions) {
+                extras.push("skip_permissions".to_string());
+            }
+            let extras = if extras.is_empty() {
+                String::new()
+            } else {
+                format!(", {}", extras.join(", "))
+            };
+            lines.push(format!("- `{name}`: {model}{extras}"));
+        }
+        lines.push(
+            "\nPass `agent: \"codex\"` etc. to `tako_orchestrator_spawn` / `tako_orchestrator_run` \
+             to pick the agent per task. `model` / `effort` given at spawn time are interpreted \
+             in that agent's native vocabulary. codex / agy workers report status via screen \
+             heuristics (no `claude agents` signal), so completion detection can take slightly \
+             longer than claude workers."
+                .to_string(),
+        );
+        lines.join("\n")
+    }
+
     /// worker_model_policy に基づいて model-policy セクションのテキストを生成する
     fn generate_model_policy_section(&self) -> String {
+        let base = self.generate_model_policy_base();
+        format!("{base}{}", self.generate_worker_agents_section())
+    }
+
+    fn generate_model_policy_base(&self) -> String {
         match self.worker_model_policy {
             WorkerModelPolicy::Inherit => {
                 format!(
@@ -484,13 +641,29 @@ impl Profile {
 
         let all_blocks: Vec<&str> = blocks.iter().map(|(n, _)| n.as_str()).collect();
 
+        // worker のエージェント種別（claude / codex / agy）が設定されていれば明示（#120）
+        let agent_line = if self.worker_agent.is_some() || !self.worker_agents.is_empty() {
+            let configured: Vec<&str> = self.worker_agents.keys().map(String::as_str).collect();
+            format!(
+                "\n- **Worker agent**: {}（configured: {}）",
+                self.worker_agent.as_deref().unwrap_or("claude"),
+                if configured.is_empty() {
+                    "-".to_string()
+                } else {
+                    configured.join(", ")
+                }
+            )
+        } else {
+            String::new()
+        };
+
         format!(
             "## Session Identity\n\n\
              - **Profile**: `{profile_name}`\n\
              - **Launch command**: `tako master -{profile_name}`\n\
              - **Master model**: {}\n\
              - **Master effort**: {}\n\
-             - **Worker model policy**: {policy_str}\n\
+             - **Worker model policy**: {policy_str}{agent_line}\n\
              - **Profile config**: `{profile_path}`\n\
              - **Prompt blocks**: {}\n\
              - **Customizations**: {customization_summary}",
@@ -634,15 +807,17 @@ pub fn build_master_claude_cmd(role_env: &str, profile: &Profile, prompt_path: &
     cmd
 }
 
-/// worker 起動用の claude コマンドを組み立てる。
+/// worker 起動用のコマンドを組み立てる（エージェント種別対応は
+/// `agent::build_worker_cmd`。ここは claude 用の互換ラッパー）。
 /// model が None の場合は `--model` を付けず claude CLI の既定に委ねる
 pub fn build_worker_claude_cmd(role: &str, model: Option<&str>, effort: &str) -> String {
-    let mut cmd = format!("TAKO_ORCHESTRATOR_ROLE='{role}' claude");
-    if let Some(model) = model {
-        cmd.push_str(&format!(" --model '{model}'"));
-    }
-    cmd.push_str(&format!(" --effort {effort}"));
-    cmd
+    agent::build_worker_cmd(&agent::WorkerLaunch {
+        agent: WorkerAgent::Claude,
+        role,
+        model,
+        effort: Some(effort),
+        ..Default::default()
+    })
 }
 
 /// 1M コンテキスト版モデル（`[1m]` サフィックス）への警告文を生成する。
@@ -1242,6 +1417,49 @@ prompt_blocks:
     }
 
     #[test]
+    fn build_system_prompt_with_worker_agents() {
+        let mut agents = std::collections::BTreeMap::new();
+        agents.insert(
+            "codex".to_string(),
+            AgentWorkerConfig {
+                model: Some("gpt-5.6-terra".into()),
+                effort: Some("medium".into()),
+                ..Default::default()
+            },
+        );
+        agents.insert(
+            "agy".to_string(),
+            AgentWorkerConfig {
+                model: Some("Gemini 3.5 Flash (High)".into()),
+                skip_permissions: true,
+                ..Default::default()
+            },
+        );
+        let p = Profile {
+            worker_agent: Some("codex".into()),
+            worker_agents: agents,
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "multi");
+        assert!(prompt.contains("Available Worker Agents"));
+        assert!(prompt.contains("default agent is **codex**"));
+        assert!(prompt.contains("gpt-5.6-terra"));
+        assert!(prompt.contains("Gemini 3.5 Flash (High)"));
+        assert!(prompt.contains("skip_permissions"));
+        // identity にも worker agent 既定が出る
+        assert!(prompt.contains("Worker agent**: codex"));
+    }
+
+    #[test]
+    fn build_system_prompt_without_worker_agents_unchanged() {
+        // worker_agent 系が未設定なら従来のプロンプトに新セクションは出ない（回帰なし）
+        let p = Profile::default();
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
+        assert!(!prompt.contains("Available Worker Agents"));
+        assert!(!prompt.contains("Worker agent**:"));
+    }
+
+    #[test]
     fn identity_block_not_disableable() {
         let p = Profile {
             prompt_blocks: Some(PromptBlocks {
@@ -1298,16 +1516,186 @@ prompt_blocks:
 
     #[test]
     fn worker_cmd_model_optional() {
+        // #120 のエージェント抽象化でモデル名のクオートは安全文字のみなら省く形へ
+        // 変わった（シェル解釈後は従来と等価）
         let with = build_worker_claude_cmd("worker:demo", Some("claude-sonnet-5"), "high");
         assert_eq!(
             with,
-            "TAKO_ORCHESTRATOR_ROLE='worker:demo' claude --model 'claude-sonnet-5' --effort high"
+            "TAKO_ORCHESTRATOR_ROLE='worker:demo' claude --model claude-sonnet-5 --effort high"
         );
         let without = build_worker_claude_cmd("worker:demo", None, "max");
         assert_eq!(
             without,
             "TAKO_ORCHESTRATOR_ROLE='worker:demo' claude --effort max"
         );
+    }
+
+    #[test]
+    fn resolve_worker_agent_priority() {
+        // 明示指定 > プロファイル既定 > claude
+        let p = Profile::default();
+        assert_eq!(p.resolve_worker_agent(None), Ok(WorkerAgent::Claude));
+        assert_eq!(
+            p.resolve_worker_agent(Some("codex")),
+            Ok(WorkerAgent::Codex)
+        );
+
+        let p2 = Profile {
+            worker_agent: Some("agy".into()),
+            ..Default::default()
+        };
+        assert_eq!(p2.resolve_worker_agent(None), Ok(WorkerAgent::Agy));
+        assert_eq!(
+            p2.resolve_worker_agent(Some("codex")),
+            Ok(WorkerAgent::Codex),
+            "spawn の明示指定がプロファイル既定より優先"
+        );
+    }
+
+    #[test]
+    fn resolve_worker_agent_rejects_unknown() {
+        let p = Profile::default();
+        let err = p.resolve_worker_agent(Some("gemini")).unwrap_err();
+        assert!(err.contains("claude / codex / agy"));
+
+        // プロファイル既定が不正な場合も spawn 時に診断つきエラー
+        let p2 = Profile {
+            worker_agent: Some("cursor".into()),
+            ..Default::default()
+        };
+        let err2 = p2.resolve_worker_agent(None).unwrap_err();
+        assert!(err2.contains("worker_agent が不正"));
+    }
+
+    #[test]
+    fn resolve_agent_launch_claude_keeps_legacy_resolution() {
+        // claude は worker_agents 未設定なら従来の worker_model_policy 解決を維持
+        let p = Profile {
+            model: Some("claude-fable-5".into()),
+            effort: "high".into(),
+            ..Default::default()
+        };
+        let launch = p.resolve_agent_launch(WorkerAgent::Claude, None, None);
+        assert_eq!(launch.model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(launch.effort.as_deref(), Some("high"));
+        assert!(!launch.skip_permissions);
+        assert!(launch.extra_args.is_empty());
+
+        // 明示指定が最優先
+        let launch2 = p.resolve_agent_launch(WorkerAgent::Claude, Some("claude-sonnet-5"), Some("low"));
+        assert_eq!(launch2.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(launch2.effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn resolve_agent_launch_claude_worker_agents_overrides_policy() {
+        // worker_agents.claude はポリシー解決より優先（args / skip_permissions も有効）
+        let mut agents = std::collections::BTreeMap::new();
+        agents.insert(
+            "claude".to_string(),
+            AgentWorkerConfig {
+                model: Some("claude-haiku-4-5".into()),
+                effort: Some("low".into()),
+                skip_permissions: true,
+                args: vec!["--verbose".into()],
+            },
+        );
+        let p = Profile {
+            model: Some("claude-fable-5".into()),
+            worker_agents: agents,
+            ..Default::default()
+        };
+        let launch = p.resolve_agent_launch(WorkerAgent::Claude, None, None);
+        assert_eq!(launch.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(launch.effort.as_deref(), Some("low"));
+        assert!(launch.skip_permissions);
+        assert_eq!(launch.extra_args, vec!["--verbose".to_string()]);
+    }
+
+    #[test]
+    fn resolve_agent_launch_codex_uses_agent_config() {
+        let mut agents = std::collections::BTreeMap::new();
+        agents.insert(
+            "codex".to_string(),
+            AgentWorkerConfig {
+                model: Some("gpt-5.6-terra".into()),
+                effort: Some("medium".into()),
+                ..Default::default()
+            },
+        );
+        let p = Profile {
+            model: Some("claude-fable-5".into()), // master のモデルは codex に波及しない
+            worker_agents: agents,
+            ..Default::default()
+        };
+        let launch = p.resolve_agent_launch(WorkerAgent::Codex, None, None);
+        assert_eq!(launch.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(launch.effort.as_deref(), Some("medium"));
+
+        // 明示指定が最優先
+        let launch2 = p.resolve_agent_launch(WorkerAgent::Codex, Some("gpt-5.6-luna"), None);
+        assert_eq!(launch2.model.as_deref(), Some("gpt-5.6-luna"));
+    }
+
+    #[test]
+    fn resolve_agent_launch_non_claude_defaults_to_cli() {
+        // worker_agents 未設定の codex / agy は CLI 既定（model / effort とも None）。
+        // master の model・effort（claude 用）は波及しない
+        let p = Profile {
+            model: Some("claude-fable-5".into()),
+            effort: "max".into(),
+            ..Default::default()
+        };
+        for agent in [WorkerAgent::Codex, WorkerAgent::Agy] {
+            let launch = p.resolve_agent_launch(agent, None, None);
+            assert_eq!(launch.model, None, "{agent:?} は CLI 既定");
+            assert_eq!(launch.effort, None, "{agent:?} に claude の effort を波及させない");
+        }
+    }
+
+    #[test]
+    fn profile_with_worker_agents_roundtrip() {
+        let yaml = r#"
+effort: max
+worker_agent: codex
+worker_agents:
+  codex:
+    model: gpt-5.6-terra
+    effort: medium
+  agy:
+    model: "Gemini 3.5 Flash (High)"
+    skip_permissions: true
+"#;
+        let p: Profile = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.worker_agent.as_deref(), Some("codex"));
+        assert_eq!(
+            p.worker_agents["codex"].model.as_deref(),
+            Some("gpt-5.6-terra")
+        );
+        assert!(p.worker_agents["agy"].skip_permissions);
+        assert_eq!(
+            p.worker_agents["agy"].model.as_deref(),
+            Some("Gemini 3.5 Flash (High)")
+        );
+
+        // 再シリアライズしても保持される
+        let back: Profile = serde_yaml::from_str(&serde_yaml::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back.worker_agent.as_deref(), Some("codex"));
+        assert_eq!(back.worker_agents.len(), 2);
+    }
+
+    #[test]
+    fn profile_without_worker_agents_is_backward_compatible() {
+        // 既存プロファイル（worker_agent 系なし）がそのまま読め、
+        // シリアライズ時に新フィールドが出力されない
+        let yaml = "effort: max\nworker_model_policy: inherit\n";
+        let p: Profile = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.worker_agent, None);
+        assert!(p.worker_agents.is_empty());
+        assert_eq!(p.resolve_worker_agent(None), Ok(WorkerAgent::Claude));
+
+        let out = serde_yaml::to_string(&p).unwrap();
+        assert!(!out.contains("worker_agent"), "未設定時は出力しない: {out}");
     }
 
     #[test]

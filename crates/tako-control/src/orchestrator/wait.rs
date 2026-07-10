@@ -269,10 +269,15 @@ pub fn tail_lines(output: &str, n: usize) -> Vec<&str> {
         .collect()
 }
 
-/// worker の画面が busy（作業中）を示すパターンを含むか（末尾 5 行に限定）
+/// worker の画面が busy（作業中）を示すパターンを含むか（末尾 5 行に限定）。
+/// claude / codex は「esc to interrupt」、agy は「esc to cancel」＋
+/// スピナー行「Generating」を拾う（Issue #120。実採取画面より）
 pub fn screen_looks_busy(output: &str) -> bool {
     tail_lines(output, 5).iter().any(|l| {
         l.contains("esc to interrupt")
+            || l.contains("esc to cancel")
+            || l.contains("Generating")
+            || l.contains("Working (")
             || l.contains("ing… (")
             || l.contains("Thinking")
             || l.contains("Reading")
@@ -283,13 +288,16 @@ pub fn screen_looks_busy(output: &str) -> bool {
     })
 }
 
-/// worker の画面が idle（❯ プロンプト表示 = 入力待ち）を示すか。
-/// Claude TUI は ❯ の下にフッター（区切り線・モデル情報・ctx% 等）が 4〜6 行
-/// あるため、末尾 10 行の範囲でチェックする
+/// worker の画面が idle（入力欄プロンプト表示 = 入力待ち）を示すか。
+/// プロンプト文字は claude `❯` / codex `›` / agy `>` の和集合（Issue #120）。
+/// ASCII の `>` は「`>` 単独 or `> `＋内容」のみ入力欄とみなす（PS2 等との誤検知対策）。
+/// いずれの TUI もプロンプトの下にフッター（区切り線・モデル情報・ctx% 等）が
+/// 1〜6 行あるため、末尾 10 行の範囲でチェックする
 pub fn screen_looks_idle(output: &str) -> bool {
-    tail_lines(output, 10)
-        .iter()
-        .any(|l| l.trim_start().starts_with('❯'))
+    tail_lines(output, 10).iter().any(|l| {
+        let t = l.trim_start();
+        t.starts_with('❯') || t.starts_with('›') || t == ">" || t.starts_with("> ")
+    })
 }
 
 #[cfg(test)]
@@ -524,5 +532,39 @@ mod tests {
         // 末尾 5 行より前の busy パターンは無視される
         let old_busy = format!("esc to interrupt\n{}", "行\n".repeat(6));
         assert!(!screen_looks_busy(&old_busy));
+    }
+
+    /// codex 0.144.1 の実採取画面（Issue #120）
+    const CODEX_IDLE_SCREEN: &str =
+        "• DONE_PROBE\n› Summarize recent commits\n  gpt-5.6-sol high · /work/dir";
+    const CODEX_BUSY_SCREEN: &str = "• Working (3s • esc to interrupt) · 1 background terminal running\n› Summarize recent commits\n  gpt-5.6-sol high · /work/dir";
+
+    /// agy 1.1.0 の実採取画面（Issue #120）
+    const AGY_IDLE_SCREEN: &str =
+        "● Bash(echo done)\n  完了しました\n────\n>\n────\n? for shortcuts";
+    const AGY_BUSY_SCREEN: &str =
+        "▸ Thought Process\n⣻  Generating...\n────\n>\n────\nesc to cancel";
+
+    #[test]
+    fn codexとagyの画面判定() {
+        assert!(screen_looks_idle(CODEX_IDLE_SCREEN), "codex の › を拾う");
+        assert!(!screen_looks_busy(CODEX_IDLE_SCREEN));
+        assert!(screen_looks_busy(CODEX_BUSY_SCREEN), "Working ( を拾う");
+
+        assert!(screen_looks_idle(AGY_IDLE_SCREEN), "agy の > 単独行を拾う");
+        assert!(!screen_looks_busy(AGY_IDLE_SCREEN));
+        assert!(
+            screen_looks_busy(AGY_BUSY_SCREEN),
+            "Generating / esc to cancel を拾う"
+        );
+        // busy 中も > は見えるが busy 判定が優先される（wait_for_worker の構造）
+        assert!(screen_looks_idle(AGY_BUSY_SCREEN));
+    }
+
+    #[test]
+    fn ascii山括弧はリダイレクト行を入力欄と誤認しない() {
+        assert!(!screen_looks_idle("$ echo foo >file\ndone"));
+        assert!(!screen_looks_idle(">>append"));
+        assert!(screen_looks_idle("some output\n> "));
     }
 }
