@@ -87,10 +87,9 @@ pub fn build_worker_cmd(launch: &WorkerLaunch) -> String {
     if let Some(effort) = launch.effort {
         match launch.agent {
             WorkerAgent::Claude => cmd.push_str(&format!(" --effort {effort}")),
-            WorkerAgent::Codex => cmd.push_str(&format!(
-                " -c model_reasoning_effort={}",
-                sh_quote(effort)
-            )),
+            WorkerAgent::Codex => {
+                cmd.push_str(&format!(" -c model_reasoning_effort={}", sh_quote(effort)))
+            }
             // agy に effort 指定は無い（モデル名の "(High)" 等に組込み）
             WorkerAgent::Agy => {}
         }
@@ -229,7 +228,10 @@ mod tests {
     fn agent_parse_rejects_unknown() {
         let err = WorkerAgent::parse("gemini").unwrap_err();
         assert!(err.contains("gemini"));
-        assert!(err.contains("claude / codex / agy"), "対応一覧を含む: {err}");
+        assert!(
+            err.contains("claude / codex / agy"),
+            "対応一覧を含む: {err}"
+        );
         assert!(WorkerAgent::parse("").is_err());
     }
 

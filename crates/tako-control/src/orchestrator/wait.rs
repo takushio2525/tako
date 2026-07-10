@@ -154,6 +154,8 @@ pub struct RunOptions {
     pub label: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// worker のエージェント種別（claude / codex / agy。省略時はプロファイル既定。#120）
+    pub agent: Option<String>,
     /// 分割元ペイン ID（`tab` と排他。両方 None は spawn 側でエラー）
     pub pane: Option<u64>,
     /// 子を出すタブ ID
@@ -191,6 +193,7 @@ pub fn run_worker(
         pane: opts.pane,
         tab: opts.tab,
         caller_role: opts.caller_role.clone(),
+        agent: opts.agent.clone(),
     })?;
     let pane_id = spawn_result["pane_id"].as_u64().unwrap_or(0);
     let spawned_by = spawn_result["spawned_by"].as_u64().unwrap_or(0);
@@ -444,6 +447,7 @@ mod tests {
             label: None,
             model: None,
             effort: None,
+            agent: None,
             pane: Some(1),
             tab: None,
             caller_role: None,
@@ -500,6 +504,7 @@ mod tests {
             label: None,
             model: None,
             effort: None,
+            agent: None,
             pane: Some(1),
             tab: None,
             caller_role: None,

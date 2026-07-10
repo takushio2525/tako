@@ -366,7 +366,9 @@ pub enum Request {
     /// オーケストレーター: プロファイル管理（list / show / set）。
     /// model 未指定のプロファイルは claude CLI の既定モデルで起動する（Issue #27）。
     /// set は model / worker_model / effort / worker_effort の更新と、
-    /// clear_model / clear_worker_model による解除（claude 既定へ戻す）に対応
+    /// clear_model / clear_worker_model による解除（claude 既定へ戻す）に対応。
+    /// worker_agent（既定エージェント種別）と agent_* 系（`worker_agents.<agent>` の
+    /// エージェント別 worker 設定）は Issue #120 で追加
     OrchestratorProfiles {
         action: String,
         name: Option<String>,
@@ -382,8 +384,33 @@ pub enum Request {
         clear_model: bool,
         #[serde(default)]
         clear_worker_model: bool,
+        /// worker の既定エージェント種別（claude / codex / agy）を設定する
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_agent: Option<String>,
+        /// worker_agent の指定を解除して claude 既定へ戻す
+        #[serde(default)]
+        clear_worker_agent: bool,
+        /// `worker_agents.<agent>` を編集する対象エージェント名（agent_* 系の指定に必須）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        /// 対象エージェントの worker 既定モデル（CLI ネイティブ表記）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_model: Option<String>,
+        #[serde(default)]
+        clear_agent_model: bool,
+        /// 対象エージェントの worker 既定 effort（agy は無視される）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_effort: Option<String>,
+        #[serde(default)]
+        clear_agent_effort: bool,
+        /// 対象エージェントの許可プロンプトスキップ（明示 opt-in）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_skip_permissions: Option<bool>,
+        /// 対象エージェントの追加 CLI 引数（丸ごと置き換え。空配列でクリア）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_args: Option<Vec<String>>,
     },
-    /// オーケストレーター: worker の spawn（split + claude 起動 + プロンプト送信）
+    /// オーケストレーター: worker の spawn（split + エージェント CLI 起動 + プロンプト送信）
     OrchestratorSpawn {
         project: String,
         prompt: String,
@@ -396,6 +423,9 @@ pub enum Request {
         /// 正しい master を特定するフォールバック（#109）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_role: Option<String>,
+        /// worker のエージェント種別（claude / codex / agy。省略時はプロファイル既定。#120）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
     },
     /// オーケストレーター: worker の状態確認。`tmux_session` 指定時は pane が gone でも
     /// tmux session 経由で recent_output を取得する

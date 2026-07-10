@@ -436,7 +436,7 @@ enum OrchestratorCommand {
     /// プロファイル管理（一覧 / 表示 / 設定）
     #[command(subcommand)]
     Profiles(ProfilesCommand),
-    /// 子 worker を spawn する（split + claude 起動 + プロンプト送信）
+    /// 子 worker を spawn する（split + エージェント CLI 起動 + プロンプト送信）
     Spawn {
         /// プロジェクトキー（projects.yaml に登録済み）
         #[arg(long)]
@@ -447,10 +447,13 @@ enum OrchestratorCommand {
         /// ペインタイトルに付けるラベル
         #[arg(long)]
         label: Option<String>,
-        /// claude のモデル（省略時は master のプロファイル設定 → 未設定なら claude 既定）
+        /// worker のエージェント CLI（claude / codex / agy。省略時はプロファイルの worker_agent → claude）
+        #[arg(long)]
+        agent: Option<String>,
+        /// worker のモデル（agent のネイティブ表記。省略時は master のプロファイル設定）
         #[arg(long)]
         model: Option<String>,
-        /// thinking effort（省略時は master のプロファイル設定）
+        /// thinking / reasoning effort（claude・codex のみ。省略時は master のプロファイル設定）
         #[arg(long)]
         effort: Option<String>,
         /// 分割元ペイン ID（省略時は呼び出し元 = TAKO_PANE_ID。tab と両方指定時は pane を優先）
@@ -483,6 +486,9 @@ enum OrchestratorCommand {
         /// ペインタイトルに付けるラベル
         #[arg(long)]
         label: Option<String>,
+        /// worker のエージェント CLI（claude / codex / agy。省略時はプロファイルの worker_agent → claude）
+        #[arg(long)]
+        agent: Option<String>,
         /// 分割元ペイン ID
         #[arg(long)]
         pane: Option<u64>,
@@ -525,6 +531,9 @@ enum ProjectsCommand {
     },
 }
 
+// Set のオプション数で variant サイズ差 lint が出るが、CLI 引数のパースは
+// プロセスで 1 回きりのため実害がなく許容する（clap は Box variant を扱えない）
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum ProfilesCommand {
     /// プロファイルの一覧（model が null のものは claude CLI の既定モデルで起動する）
@@ -556,6 +565,33 @@ enum ProfilesCommand {
         /// 子 worker の thinking effort
         #[arg(long)]
         worker_effort: Option<String>,
+        /// worker の既定エージェント種別（claude / codex / agy。--clear-worker-agent と排他）
+        #[arg(long, conflicts_with = "clear_worker_agent")]
+        worker_agent: Option<String>,
+        /// worker_agent の指定を解除して claude 既定に戻す
+        #[arg(long)]
+        clear_worker_agent: bool,
+        /// --agent-* 系で編集する対象エージェント名（claude / codex / agy）
+        #[arg(long)]
+        agent: Option<String>,
+        /// 対象エージェントの worker 既定モデル（CLI ネイティブ表記。--clear-agent-model と排他）
+        #[arg(long, requires = "agent", conflicts_with = "clear_agent_model")]
+        agent_model: Option<String>,
+        /// 対象エージェントのモデル指定を解除する
+        #[arg(long, requires = "agent")]
+        clear_agent_model: bool,
+        /// 対象エージェントの worker 既定 effort（agy は無視。--clear-agent-effort と排他）
+        #[arg(long, requires = "agent", conflicts_with = "clear_agent_effort")]
+        agent_effort: Option<String>,
+        /// 対象エージェントの effort 指定を解除する
+        #[arg(long, requires = "agent")]
+        clear_agent_effort: bool,
+        /// 対象エージェントの許可プロンプトスキップ（true / false。明示 opt-in）
+        #[arg(long, requires = "agent")]
+        agent_skip_permissions: Option<bool>,
+        /// 対象エージェントの追加 CLI 引数（カンマ区切り。丸ごと置き換え。空文字でクリア）
+        #[arg(long, requires = "agent", value_delimiter = ',')]
+        agent_args: Option<Vec<String>>,
     },
 }
 
@@ -922,6 +958,7 @@ fn main() -> ExitCode {
             ref project,
             ref prompt,
             ref label,
+            ref agent,
             pane,
             tab,
             timeout,
@@ -931,6 +968,7 @@ fn main() -> ExitCode {
             project,
             prompt,
             label.as_deref(),
+            agent.as_deref(),
             pane,
             tab,
             timeout,
@@ -1307,6 +1345,7 @@ fn orchestrator_run(
     project: &str,
     prompt: &str,
     label: Option<&str>,
+    agent: Option<&str>,
     pane: Option<u64>,
     tab: Option<u64>,
     timeout_secs: u64,
@@ -1330,6 +1369,7 @@ fn orchestrator_run(
         label: label.map(|s| s.to_string()),
         model: None,
         effort: None,
+        agent: agent.map(|s| s.to_string()),
         pane: pane_resolved,
         tab: tab_resolved,
         caller_role: std::env::var("TAKO_ORCHESTRATOR_ROLE").ok(),
@@ -1399,23 +1439,12 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
     let params = match sub {
         ProfilesCommand::List => ProfilesParams {
             action: "list".into(),
-            name: None,
-            model: None,
-            worker_model: None,
-            effort: None,
-            worker_effort: None,
-            clear_model: false,
-            clear_worker_model: false,
+            ..Default::default()
         },
         ProfilesCommand::Show { name } => ProfilesParams {
             action: "show".into(),
             name: name.clone(),
-            model: None,
-            worker_model: None,
-            effort: None,
-            worker_effort: None,
-            clear_model: false,
-            clear_worker_model: false,
+            ..Default::default()
         },
         ProfilesCommand::Set {
             name,
@@ -1425,6 +1454,15 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             clear_worker_model,
             effort,
             worker_effort,
+            worker_agent,
+            clear_worker_agent,
+            agent,
+            agent_model,
+            clear_agent_model,
+            agent_effort,
+            clear_agent_effort,
+            agent_skip_permissions,
+            agent_args,
         } => ProfilesParams {
             action: "set".into(),
             name: Some(name.clone()),
@@ -1434,6 +1472,15 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             worker_effort: worker_effort.clone(),
             clear_model: *clear_model,
             clear_worker_model: *clear_worker_model,
+            worker_agent: worker_agent.clone(),
+            clear_worker_agent: *clear_worker_agent,
+            agent: agent.clone(),
+            agent_model: agent_model.clone(),
+            clear_agent_model: *clear_agent_model,
+            agent_effort: agent_effort.clone(),
+            clear_agent_effort: *clear_agent_effort,
+            agent_skip_permissions: *agent_skip_permissions,
+            agent_args: agent_args.clone(),
         },
     };
     let result = dispatch_orchestrator_profiles(params).map_err(|e| e.to_string())?;
@@ -1949,6 +1996,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             project,
             prompt,
             label,
+            agent,
             model,
             effort,
             pane,
@@ -1974,6 +2022,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 pane: pane_resolved,
                 tab: tab_resolved,
                 caller_role: std::env::var("TAKO_ORCHESTRATOR_ROLE").ok(),
+                agent: agent.clone(),
             }
         }
         Command::Orchestrator(OrchestratorCommand::Status {

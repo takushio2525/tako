@@ -1582,7 +1582,8 @@ prompt_blocks:
         assert!(launch.extra_args.is_empty());
 
         // 明示指定が最優先
-        let launch2 = p.resolve_agent_launch(WorkerAgent::Claude, Some("claude-sonnet-5"), Some("low"));
+        let launch2 =
+            p.resolve_agent_launch(WorkerAgent::Claude, Some("claude-sonnet-5"), Some("low"));
         assert_eq!(launch2.model.as_deref(), Some("claude-sonnet-5"));
         assert_eq!(launch2.effort.as_deref(), Some("low"));
     }
@@ -1649,7 +1650,10 @@ prompt_blocks:
         for agent in [WorkerAgent::Codex, WorkerAgent::Agy] {
             let launch = p.resolve_agent_launch(agent, None, None);
             assert_eq!(launch.model, None, "{agent:?} は CLI 既定");
-            assert_eq!(launch.effort, None, "{agent:?} に claude の effort を波及させない");
+            assert_eq!(
+                launch.effort, None,
+                "{agent:?} に claude の effort を波及させない"
+            );
         }
     }
 

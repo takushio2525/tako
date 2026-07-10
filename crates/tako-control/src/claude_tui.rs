@@ -635,7 +635,10 @@ esc to cancel                                       Claude Opus 4.6 (Thinking)"#
         assert_eq!(input_line(&lines), Some("Summarize recent commits"));
         // 枠線内の ">_ OpenAI Codex" を入力欄と誤認しない
         let pending = screen(CODEX_INPUT_PENDING);
-        assert!(input_residual(&pending, "Reply with exactly: PROBE_OK (nothing else)"));
+        assert!(input_residual(
+            &pending,
+            "Reply with exactly: PROBE_OK (nothing else)"
+        ));
         assert!(!input_residual(&pending, "全く別のテキスト"));
     }
 
