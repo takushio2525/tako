@@ -274,7 +274,10 @@ pub fn tail_lines(output: &str, n: usize) -> Vec<&str> {
 
 /// worker の画面が busy（作業中）を示すパターンを含むか（末尾 5 行に限定）。
 /// claude / codex は「esc to interrupt」、agy は「esc to cancel」＋
-/// スピナー行「Generating」を拾う（Issue #120。実採取画面より）
+/// スピナー行「Generating」を拾う（Issue #120。実採取画面より）。
+/// 「Thinking」は素のままだと agy フッターのモデル名表記
+/// 「Claude Opus 4.6 (Thinking)」（常時表示）に誤爆して永遠に busy 判定になるため、
+/// claude スピナーの実表示「Thinking…」に限定する（実機検証 2026-07-10 で発見）
 pub fn screen_looks_busy(output: &str) -> bool {
     tail_lines(output, 5).iter().any(|l| {
         l.contains("esc to interrupt")
@@ -282,7 +285,8 @@ pub fn screen_looks_busy(output: &str) -> bool {
             || l.contains("Generating")
             || l.contains("Working (")
             || l.contains("ing… (")
-            || l.contains("Thinking")
+            || l.contains("Thinking…")
+            || l.contains("Thinking...")
             || l.contains("Reading")
             || l.contains("Editing")
             || l.contains("Running")
@@ -544,11 +548,13 @@ mod tests {
         "• DONE_PROBE\n› Summarize recent commits\n  gpt-5.6-sol high · /work/dir";
     const CODEX_BUSY_SCREEN: &str = "• Working (3s • esc to interrupt) · 1 background terminal running\n› Summarize recent commits\n  gpt-5.6-sol high · /work/dir";
 
-    /// agy 1.1.0 の実採取画面（Issue #120）
+    /// agy 1.1.0 の実採取画面（Issue #120）。フッターのモデル名表記
+    /// 「Claude Opus 4.6 (Thinking)」は**常時表示**のため、busy 判定が
+    /// これに誤爆しないことが完了検知の生命線（実機検証 2026-07-10 で発見した回帰）
     const AGY_IDLE_SCREEN: &str =
-        "● Bash(echo done)\n  完了しました\n────\n>\n────\n? for shortcuts";
+        "● Bash(echo done)\n  完了しました\n────\n>\n────\n? for shortcuts   Claude Opus 4.6 (Thinking)";
     const AGY_BUSY_SCREEN: &str =
-        "▸ Thought Process\n⣻  Generating...\n────\n>\n────\nesc to cancel";
+        "▸ Thought Process\n⣻  Generating...\n────\n>\n────\nesc to cancel   Claude Opus 4.6 (Thinking)";
 
     #[test]
     fn codexとagyの画面判定() {
@@ -557,13 +563,18 @@ mod tests {
         assert!(screen_looks_busy(CODEX_BUSY_SCREEN), "Working ( を拾う");
 
         assert!(screen_looks_idle(AGY_IDLE_SCREEN), "agy の > 単独行を拾う");
-        assert!(!screen_looks_busy(AGY_IDLE_SCREEN));
+        assert!(
+            !screen_looks_busy(AGY_IDLE_SCREEN),
+            "フッターのモデル名 (Thinking) に誤爆しない"
+        );
         assert!(
             screen_looks_busy(AGY_BUSY_SCREEN),
             "Generating / esc to cancel を拾う"
         );
         // busy 中も > は見えるが busy 判定が優先される（wait_for_worker の構造）
         assert!(screen_looks_idle(AGY_BUSY_SCREEN));
+        // claude スピナーの実表示（Thinking…）は引き続き busy と判定する
+        assert!(screen_looks_busy("✻ Thinking…\n出力中"));
     }
 
     #[test]
