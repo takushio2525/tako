@@ -2258,6 +2258,20 @@ fn dispatch_orchestrator_worker_status(
         }
     }
 
+    // agents シグナルの無い worker（codex / agy、または claude の解決失敗）は
+    // 画面推定で busy / idle を判定する（#120。wait_for_worker の unknown ブランチと
+    // 同じロジックを単発クエリの応答にも反映する。status_source=screen のため
+    // watch / run 側は従来どおり idle 連続 8 回を要求し、単発の誤判定では完了しない）
+    if status == "unknown" {
+        if let Some(ref out) = recent_output {
+            if crate::orchestrator::wait::screen_looks_busy(out) {
+                status = "busy".to_string();
+            } else if crate::orchestrator::wait::screen_looks_idle(out) {
+                status = "idle".to_string();
+            }
+        }
+    }
+
     Ok(json!({
         "status": status,
         "ctx_percent": ctx_percent,
