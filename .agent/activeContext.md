@@ -4,18 +4,21 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-10・#118 FDA ガイド実装完了）
+## 現在の対象（2026-07-10・#120 worker の codex/agy 対応 merge 済み + #118 マージ待ち）
 
-macOS の TCC フォルダアクセス許可ダイアログが毎回表示される問題への対策として、
-フルディスクアクセス（FDA）の検出・案内機能を実装。
+worker のエージェント CLI を claude / codex / agy から選択可能にする #120 が完了
+（PR #122 squash merge `f8a8b3c` + build-app.sh --install 済み。反映は tako 再起動後）。
 
-- `tako-control::fda` モジュール新設（FDA 状態検出 + システム設定オープン）
-- dispatch `Fda` + MCP `tako_fda`（計 53 ツール）+ CLI `tako fda status/open`
-- `tako setup --check` に FDA チェックを追加（未付与時にシステム設定を開く提案）
-- ブランチ `fix/118-fda-guide` → PR → squash merge 待ち
+- `orchestrator::agent` 新設 + TUI 検出の和集合化（❯/›/>）+ Profile `worker_agent`/`worker_agents`
+- spawn / run / profiles の agent 系を MCP・CLI に 1:1 公開（ツール数 53 のまま）
+- codex / agy の status は画面推定（agents API 非対応）。agy は
+  `profiles set --agent agy --agent-skip-permissions true` が実用上ほぼ必須
+- 並行作業: #118 FDA ガイド（`fix/118-fda-guide` → PR → squash merge 待ち）、
+  全体 / remote の監査は `reviews/2026-07-10_gpt5.6solレビュー.md` ほかに保存済み
 
 ## 残作業・既知の制約
 
+- tako 再起動で新バイナリ（#120 入り 0.3.2）反映 → codex/agy worker の通常利用確認
 - #118 のコミット・PR・マージ・build-app.sh --install・実機検証が残
 - セルフテストの既知失敗は PDF（項目 70、CoreGraphics 環境依存）のみ
 - CI（GitHub Actions）は 6/12 以降停止中（無料枠逼迫）。品質保証はローカル全緑で代替

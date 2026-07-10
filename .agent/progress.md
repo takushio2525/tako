@@ -499,9 +499,19 @@
 ## 2026-07-10（コードベース全体 / tako remote 再レビュー）
 - daemon・Cloudflare relay / Pages PWA・REST/WS・tmux を横断監査。remote は P0 対応前提、全体本体は層分離・テスト文化を高評価。コード変更なし
 - 検証: Worker 7/7・PWA build・npm audit 緑
+- 全760行の詳細レポート: `reviews/2026-07-10_gpt5.6solレビュー.md`（実施日時・対象 commit・全所見・対応ロードマップを収録）
+- 接続方式の設計検討を `reviews/2026-07-10_tako-remote接続方式・認証設計.md` に保存（Cloudflare Access + tako機器認証、Tailscale、SSH、専用クラウドを比較）
 
 ## 2026-07-10（#118: FDA ガイド機能の実装）
 - macOS TCC の毎回フォルダアクセス許可ダイアログ対策。`tako-control::fda` 新設（FDA 状態検出 +
   システム設定オープン）+ dispatch `Fda` + MCP `tako_fda`（計 53 ツール）+ CLI `tako fda status/open`
   + `tako setup --check` に FDA チェック追加。build / clippy / fmt / test 全緑（117 passed）
 - 次: PR squash merge → `build-app.sh --install` → 実機検証
+
+## 2026-07-10（#120: worker の codex / agy 対応 → merge + 実機反映）
+- worker のエージェント CLI を claude / codex / agy から選択可能に。`orchestrator::agent` 新設 +
+  TUI 検出の和集合化 + Profile `worker_agent`/`worker_agents` + spawn/run/profiles の agent 系を
+  MCP・CLI に 1:1 公開。agy フッター「(Thinking)」への busy 誤爆（永遠に完了しない）を実機検証で発見・修正
+- 関連: PR #122 squash merge（`f8a8b3c`）。全緑（429 tests）+ セカンダリモード併走で
+  codex / agy / claude 3 種の spawn → 完遂 → send_input → WORKER_IDLE を実機検証済み
+- 次: tako 再起動で新バイナリ反映（agy worker は profiles set --agent agy --agent-skip-permissions true 推奨）
