@@ -1630,6 +1630,20 @@ fn dispatch_inner(
             }
         }
 
+        Request::Fda { action } => {
+            let action = action.as_deref().unwrap_or("status");
+            match action {
+                "status" => Ok(crate::fda::status_info().to_json()),
+                "open" => {
+                    crate::fda::open_settings().map_err(DispatchError::Operation)?;
+                    Ok(serde_json::json!({ "opened": true }))
+                }
+                other => Err(DispatchError::InvalidParams(format!(
+                    "不明な action: {other:?}（status / open のいずれか）"
+                ))),
+            }
+        }
+
         Request::SetupChanges => {
             // 読み取り専用・プロセス内完結（アプリ状態に依存しない）。
             // 追従の適用は `tako setup` の対話フロー側の責務（Issue #94）

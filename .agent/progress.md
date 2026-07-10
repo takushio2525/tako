@@ -495,3 +495,13 @@
 - 関連コミット: `9783c33`（WIP 保全）、`99a1f4c`（solo 実装）→ PR #117 squash merge（`53bdf1b`）
 - 実機確認済み → #111 close: `tako solo` でタブ 'solo' 起動・effort=high 実測（`· H`）・
   solo prompt の 3 本柱（エコ運用 / spawn 禁止 / projects 把握）を確認。実対話の細部は通常利用で
+
+## 2026-07-10（コードベース全体 / tako remote 再レビュー）
+- daemon・Cloudflare relay / Pages PWA・REST/WS・tmux を横断監査。remote は P0 対応前提、全体本体は層分離・テスト文化を高評価。コード変更なし
+- 検証: Worker 7/7・PWA build・npm audit 緑
+
+## 2026-07-10（#118: FDA ガイド機能の実装）
+- macOS TCC の毎回フォルダアクセス許可ダイアログ対策。`tako-control::fda` 新設（FDA 状態検出 +
+  システム設定オープン）+ dispatch `Fda` + MCP `tako_fda`（計 53 ツール）+ CLI `tako fda status/open`
+  + `tako setup --check` に FDA チェック追加。build / clippy / fmt / test 全緑（117 passed）
+- 次: PR squash merge → `build-app.sh --install` → 実機検証

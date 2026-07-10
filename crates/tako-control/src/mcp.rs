@@ -1110,6 +1110,26 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_fda",
+            "description": "macOS のフルディスクアクセス (FDA) の状態確認と設定画面の起動（Issue #118）。\
+                フォルダアクセス許可ダイアログが頻発する場合、FDA を付与すれば一括で消せる。\
+                action=status で FDA の付与状態を返す（granted: true/false）。\
+                action=open でシステム設定のフルディスクアクセスパネルを開く。\
+                ユーザーが「フォルダの許可が何度も出る」と言った場合は、\
+                まず status で確認し、未付与なら open で設定画面を案内すること。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "open"],
+                        "description": "操作種別（省略時は status）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_setup_changes",
             "description": "tako setup のアップデート追従状況を照会する（Issue #94）。\
                 前回 `tako setup` 完了時に適用したリビジョン（applied_revision）と\
@@ -1548,6 +1568,9 @@ fn build_request(
             direction: direction_arg(args)?,
         },
         "tako_update" => Request::Update {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
+        },
+        "tako_fda" => Request::Fda {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
         },
         "tako_setup_changes" => Request::SetupChanges,
@@ -1991,7 +2014,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 52);
+        assert_eq!(tools.len(), 53);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

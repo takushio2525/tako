@@ -174,6 +174,33 @@ fn run_dependency_check(interactive: bool) -> Vec<&'static str> {
             missing_required.push(dep.bin);
         }
     }
+    // FDA チェック（macOS のみ。任意だが推奨）
+    #[cfg(target_os = "macos")]
+    {
+        if tako_control::fda::is_granted() {
+            eprintln!("  ✓ フルディスクアクセス: 付与済み");
+        } else {
+            eprintln!("  △ フルディスクアクセス: 未付与（任意・推奨）");
+            eprintln!(
+                "      フォルダアクセス時に macOS の許可ダイアログが表示されることがあります"
+            );
+            eprintln!(
+                "      付与方法: tako fda open でシステム設定を開き、tako を追加してください"
+            );
+            if interactive {
+                eprint!("      今すぐシステム設定を開きますか？ [y/N]: ");
+                let mut input = String::new();
+                if std::io::stdin().read_line(&mut input).is_ok() {
+                    let answer = input.trim().to_ascii_lowercase();
+                    if answer == "y" || answer == "yes" {
+                        if let Err(e) = tako_control::fda::open_settings() {
+                            eprintln!("      ⚠ {e}");
+                        }
+                    }
+                }
+            }
+        }
+    }
     missing_required
 }
 

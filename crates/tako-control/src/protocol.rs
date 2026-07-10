@@ -449,6 +449,12 @@ pub enum Request {
         #[serde(default)]
         action: Option<String>,
     },
+    /// フルディスクアクセス (FDA) の状態確認と設定画面を開く操作（Issue #118）。
+    /// `action` = "status"（既定）/ "open"（システム設定を開く）
+    Fda {
+        #[serde(default)]
+        action: Option<String>,
+    },
     /// setup のアップデート追従状況の照会（Issue #94）。
     /// 適用済みリビジョン・現在リビジョン・未適用の setup 関連変更の一覧を返す。
     /// 適用自体は `tako setup`（対話）が行い、これは読み取り専用
