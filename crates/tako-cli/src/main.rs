@@ -146,6 +146,10 @@ enum Command {
     /// 引数なしで配布系統・現在バージョン・重複 CLI を表示する
     #[command(subcommand)]
     Update(UpdateCommand),
+    /// フルディスクアクセス (FDA) の状態確認と設定画面の起動（Issue #118）。
+    /// FDA を付与するとフォルダアクセス許可ダイアログが一括で出なくなる
+    #[command(subcommand)]
+    Fda(FdaCommand),
 }
 
 #[derive(Subcommand)]
@@ -184,6 +188,14 @@ enum UpdateCommand {
     ApplyZip,
     /// broken-brew 状態の修復（brew install --cask --force で台帳を再締結）
     Repair,
+}
+
+#[derive(Subcommand)]
+enum FdaCommand {
+    /// FDA の付与状態を確認する
+    Status,
+    /// システム設定のフルディスクアクセスパネルを開く
+    Open,
 }
 
 #[derive(Subcommand)]
@@ -937,6 +949,8 @@ fn main() -> ExitCode {
         Command::Remote(RemoteCommand::Scrollback { pane_id, lines }) => {
             remote_scrollback(&pane_id, lines)
         }
+        // FDA チェックはローカル処理（IPC 不要。ファイルシステムのみ）
+        Command::Fda(ref sub) => fda_local(sub),
         command => run(command),
     };
     match result {
@@ -1524,6 +1538,35 @@ fn remote_scrollback(pane_id: &str, lines: u32) -> Result<(), String> {
     Ok(())
 }
 
+fn fda_local(sub: &FdaCommand) -> Result<(), String> {
+    match sub {
+        FdaCommand::Status => {
+            let status = tako_control::fda::status_info();
+            if status.granted {
+                eprintln!("✓ フルディスクアクセス: 付与済み");
+            } else {
+                eprintln!("△ フルディスクアクセス: 未付与");
+                eprintln!(
+                    "  フォルダアクセス時に macOS の許可ダイアログが表示されることがあります"
+                );
+                eprintln!("  付与方法: tako fda open → システム設定で tako を追加");
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&status.to_json()).unwrap()
+            );
+            Ok(())
+        }
+        FdaCommand::Open => {
+            tako_control::fda::open_settings()?;
+            eprintln!(
+                "システム設定を開きました。tako を「フルディスクアクセス」に追加してください"
+            );
+            Ok(())
+        }
+    }
+}
+
 fn run(command: Command) -> Result<(), String> {
     let request = build_request(&command)?;
     let result = send_request(request)?;
@@ -1994,6 +2037,12 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 UpdateCommand::Apply => "apply".to_string(),
                 UpdateCommand::ApplyZip => "apply-zip".to_string(),
                 UpdateCommand::Repair => "repair".to_string(),
+            }),
+        },
+        Command::Fda(sub) => Request::Fda {
+            action: Some(match sub {
+                FdaCommand::Status => "status".to_string(),
+                FdaCommand::Open => "open".to_string(),
             }),
         },
     })

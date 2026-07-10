@@ -18,6 +18,7 @@ pub mod claude_tui;
 pub mod diag;
 pub mod discovery;
 pub mod dispatch;
+pub mod fda;
 pub mod ipc;
 pub mod layout;
 pub mod mcp;

@@ -4,38 +4,27 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-08・#113 修正 + #111 solo コマンド 両方 merge 済み）
+## 現在の対象（2026-07-10・#118 FDA ガイド実装完了）
 
-直近クラッシュ（多ペイン並列でフリーズ → 強制終了でペイン消失）を **#113 で根治**し、
-クラッシュ前に実装途中だった **#111 tako solo コマンドを仕上げて merge** した。
+macOS の TCC フォルダアクセス許可ダイアログが毎回表示される問題への対策として、
+フルディスクアクセス（FDA）の検出・案内機能を実装。
 
-- **#113**（多重起動によるペイン消失）: 多重インスタンスガード（セカンダリモード FR-5.8）+
-  起動時 orphan cleanup の activity 1 時間猶予（FR-2.16.11）+「全ペイン終了」二重発火の冪等化。
-  フリーズは単一根因未特定のため診断を導入（UI ストールウォッチドッグ + dispatch 遅延計測 →
-  `<data_dir>/perf.log`）+ 実証済みブロック源（tmux window capture の UI 同期）を除去。
-  PR #114 merge（`fe73b60`）。**実機確認済み（20 匹スポーン負荷 OK・セカンダリモード確認）→ #113 close**
-- **#111**（tako solo = オーケストレーション無しの 1 対 1 対話モード）: `tako solo [-profile]`、
-  role/env `solo` / `solo:<suffix>`、既定 effort=high、worker spawn 禁止、solo-profiles/ 分離。
-  前任 WIP に混入していた別機能 sessions 断片は保全コミット `9783c33` に退避。PR #117 squash merge。
-  **実機確認済み → #111 close**（`tako solo` 起動でタブ 'solo'・effort=high 実測・
-  solo prompt の 3 本柱＝エコ運用/spawn 禁止/projects 把握 を確認。実対話の細部は通常利用で）
+- `tako-control::fda` モジュール新設（FDA 状態検出 + システム設定オープン）
+- dispatch `Fda` + MCP `tako_fda`（計 53 ツール）+ CLI `tako fda status/open`
+- `tako setup --check` に FDA チェックを追加（未付与時にシステム設定を開く提案）
+- ブランチ `fix/118-fda-guide` → PR → squash merge 待ち
 
 ## 残作業・既知の制約
 
-- **#113 / #111 とも完了・close 済み**。solo 反映済みバイナリで稼働中（pid 82237）
-- sessions 断片（#112 会話ログ管理の書きかけ）は `9783c33` に保全。#112 再開時に復元可
-- main.rs は 9,900 行前後。さらなる分割は別タスク
-- 多重インスタンスガードは macOS のみ（Windows は Phase 6）。`TAKO_FORCE_PRIMARY=1` で無効化可
-- フリーズが再発したら `<data_dir>/perf.log`（犯人の dispatch 種別と UI 専有時間が残る）
+- #118 のコミット・PR・マージ・build-app.sh --install・実機検証が残
 - セルフテストの既知失敗は PDF（項目 70、CoreGraphics 環境依存）のみ
 - CI（GitHub Actions）は 6/12 以降停止中（無料枠逼迫）。品質保証はローカル全緑で代替
-- cask 更新は未実施（`homebrew-tako` 側）
 
 ## 未着手タスク（優先順はユーザーと相談）
 
-- [ ] **#115 GitLog / GitDiff dispatch の background 化**（zed 級リポで 2431ms UI 専有の実測あり）
-- [ ] **#116 tako-coretest-* ソケット残骸の掃除・再発防止**（/tmp に 2,791 個堆積）
-- [ ] **#112 セッション会話ログの管理と復元**（sessions 断片が `9783c33` に保全済み）
+- [ ] **#115 GitLog / GitDiff dispatch の background 化**
+- [ ] **#116 tako-coretest-* ソケット残骸の掃除・再発防止**
+- [ ] **#112 セッション会話ログの管理と復元**
 - [ ] **Phase 5 続き**: FR-3.5 軽い編集
 - [ ] **FR-2.19 localhost ポートパネル**
 - [ ] **FR-2.18 未表示の子の自動サーフェス**
@@ -43,10 +32,7 @@
 
 ## 現フェーズで Read すべき設計書
 
-- solo / オーケストレーター修正時: `.agent/orchestrator.md` +
-  `crates/tako-control/src/orchestrator/mod.rs`（solo_* 関数群）+ `solo_system_prompt.md`
-- persist / 多重起動 / cleanup 修正時: `.agent/requirements.md` FR-5.8 / FR-2.16.11 +
-  `crates/tako-app/src/main.rs` の `TakoApp::new` 冒頭（セカンダリモード判定）
+- FDA / setup 修正時: `crates/tako-control/src/fda.rs` + `crates/tako-cli/src/setup.rs`
+- solo / オーケストレーター修正時: `.agent/orchestrator.md`
 - ターミナル描画修正時: `crates/tako-app/src/main.rs` の `chunk_line_chars` / `terminal_screen_lines` 周辺
 - リモート API 修正時: `crates/tako-control/src/remote.rs` モジュールコメント
-- リモート PWA 修正時: `web/tako-remote/src/pages/terminal.jsx` 冒頭コメント
