@@ -858,7 +858,10 @@ pub fn tools() -> Vec<Value> {
                 子 worker のモデル決定に使われる。model が null / 未指定のプロファイルは\
                 claude CLI の既定モデルで起動する（プラン非依存・推奨）。\
                 1M コンテキスト版（[1m] サフィックス）は Max / API プラン限定のため、\
-                set で明示指定した場合のみ使われる（Pro プランでは起動不能になる点に注意）。",
+                set で明示指定した場合のみ使われる（Pro プランでは起動不能になる点に注意）。\
+                worker のエージェント種別（claude / codex / agy）は worker_agent（既定種別）と\
+                agent_* 系（worker_agents.<agent> のエージェント別 worker 設定: モデル・effort・\
+                許可スキップ・追加引数）で指定する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -874,18 +877,40 @@ pub fn tools() -> Vec<Value> {
                     "clear_worker_model": { "type": "boolean", "description": "子 worker のモデル指定を解除する（set 時）" },
                     "effort": { "type": "string", "description": "master の thinking effort（set 時。省略で現状維持）" },
                     "worker_effort": { "type": "string", "description": "子 worker の thinking effort（set 時）" },
+                    "worker_agent": {
+                        "type": "string",
+                        "enum": ["claude", "codex", "agy"],
+                        "description": "worker の既定エージェント種別（set 時。省略時の spawn はこの種別で起動する）",
+                    },
+                    "clear_worker_agent": { "type": "boolean", "description": "worker_agent の指定を解除して claude 既定に戻す（set 時）" },
+                    "agent": {
+                        "type": "string",
+                        "enum": ["claude", "codex", "agy"],
+                        "description": "agent_* 系で編集する対象エージェント名（set 時。agent_* 指定に必須）",
+                    },
+                    "agent_model": { "type": "string", "description": "対象エージェントの worker 既定モデル（CLI ネイティブ表記。codex: gpt-5.6-terra 等 / agy: 'Gemini 3.5 Flash (High)' 等）" },
+                    "clear_agent_model": { "type": "boolean", "description": "対象エージェントのモデル指定を解除する" },
+                    "agent_effort": { "type": "string", "description": "対象エージェントの worker 既定 effort（claude: --effort / codex: model_reasoning_effort。agy は無視される）" },
+                    "clear_agent_effort": { "type": "boolean", "description": "対象エージェントの effort 指定を解除する" },
+                    "agent_skip_permissions": { "type": "boolean", "description": "対象エージェントの許可プロンプトをスキップして起動する（明示 opt-in。agy は既定でコマンド毎に許可が出るため自律 worker 運用ではほぼ必須）" },
+                    "agent_args": {
+                        "type": "array", "items": { "type": "string" },
+                        "description": "対象エージェントの追加 CLI 引数（丸ごと置き換え。空配列でクリア）",
+                    },
                 },
                 "additionalProperties": false,
             },
         }),
         json!({
             "name": "tako_orchestrator_spawn",
-            "description": "プロジェクトの作業ディレクトリで子 claude worker を spawn する。\
-                呼び出し元ペインを右に分割して新ペインを作り、claude を起動してプロンプトを送信する。\
-                worker の pane_id・tmux_session・spawned_by（spawn 元ペイン ID）を返す。\
+            "description": "プロジェクトの作業ディレクトリで子 worker を spawn する。\
+                worker のエージェント CLI は claude（既定）/ codex / agy から選べる（agent パラメータ）。\
+                呼び出し元ペインを右に分割して新ペインを作り、エージェントを起動してプロンプトを送信する。\
+                worker の pane_id・tmux_session・spawned_by（spawn 元ペイン ID）・agent を返す。\
                 tmux_session は pane ID が解決できない場合\
                 （BG タブ移動・tako 再起動後）のフォールバックとして tako_read_pane / tako_send_input に渡せる。\
-                worker_status / watch は pane_id だけで session を自動解決するため session_id は不要。\
+                worker_status / watch は pane_id だけで session を自動解決するため session_id は不要\
+                （codex / agy は画面推定で判定される）。\
                 起動からプロンプト送信まで 15〜20 秒かかる（これは想定内）。\
                 pane または tab のいずれかを必ず指定すること。省略すると呼び出し元タブに出るため、\
                 master が別タブにいる場合に意図しないタブに子が生える。",
@@ -895,8 +920,13 @@ pub fn tools() -> Vec<Value> {
                     "project": { "type": "string", "description": "プロジェクトキー（projects.yaml に登録済みであること）" },
                     "prompt": { "type": "string", "description": "worker に渡す初期プロンプト" },
                     "label": { "type": "string", "description": "ペインタイトルに付けるラベル（省略時は '<project>-worker'）" },
-                    "model": { "type": "string", "description": "claude のモデル（省略時はマスターのプロファイル設定に従う）" },
-                    "effort": { "type": "string", "description": "thinking effort（省略時はマスターのプロファイル設定に従う）" },
+                    "agent": {
+                        "type": "string",
+                        "enum": ["claude", "codex", "agy"],
+                        "description": "worker のエージェント CLI（省略時はプロファイルの worker_agent → claude）",
+                    },
+                    "model": { "type": "string", "description": "worker のモデル（agent のネイティブ表記。省略時はプロファイル設定に従う）" },
+                    "effort": { "type": "string", "description": "thinking / reasoning effort（claude・codex のみ。agy はモデル名に組込みのため無視。省略時はプロファイル設定に従う）" },
                     "pane": pane_schema("分割元ペイン ID（省略時は呼び出し元。このペインの右に子が生える）。\
                         pane と tab の両方を指定した場合は pane を優先する"),
                     "tab": { "type": "integer", "minimum": 0, "description": "子を出すタブ ID。\
@@ -914,6 +944,8 @@ pub fn tools() -> Vec<Value> {
                 session_id を省略しても pane→session の自動解決（pid 祖先辿り）で claude agents --json の \
                 正確な status を取得する（status_source が agents-auto になる）。自動解決失敗時のみ \
                 画面パターン推定にフォールバック（status_source が screen）。\
+                codex / agy worker は agents API が無いため常に画面推定で判定される（claude / codex / agy \
+                すべての入力欄・busy パターンに対応済み）。\
                 tmux_session を渡すとペインが消えても tmux session が生きている限り \
                 recent_output を取得でき、gone にならない。\
                 退避（shelved）されたペインも追跡可能。recent_output はペインの最近 30 行の出力。\
@@ -936,9 +968,10 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_orchestrator_run",
             "description": "子 worker を spawn し、完了まで待って結果を返す。spawn + 完了待ち + \
                 出力取得 + close を 1 回で行うアトミック操作。Monitor や手動ポーリングは不要。\
+                worker のエージェント CLI は claude（既定）/ codex / agy から選べる（agent パラメータ）。\
                 完了判定は OrchestratorWorkerStatus と同じロジック（pane→session 自動解決 + \
-                claude agents --json の status 一次シグナル、フォールバックで端末出力パターン）を \
-                内部で繰り返し呼ぶ。\
+                claude agents --json の status 一次シグナル、フォールバックで端末出力パターン。\
+                codex / agy は画面推定のみ）を内部で繰り返し呼ぶ。\
                 タイムアウト（既定 1800 秒）に達した場合は status=timeout で途中結果を返す。",
             "inputSchema": {
                 "type": "object",
@@ -946,8 +979,13 @@ pub fn tools() -> Vec<Value> {
                     "project": { "type": "string", "description": "プロジェクトキー（projects.yaml に登録済み）" },
                     "prompt": { "type": "string", "description": "worker に渡すプロンプト" },
                     "label": { "type": "string", "description": "ペインタイトルのラベル（省略時は '<project>-worker'）" },
-                    "model": { "type": "string", "description": "claude のモデル（省略時はマスターのプロファイル設定に従う）" },
-                    "effort": { "type": "string", "description": "thinking effort（省略時はマスターのプロファイル設定に従う）" },
+                    "agent": {
+                        "type": "string",
+                        "enum": ["claude", "codex", "agy"],
+                        "description": "worker のエージェント CLI（省略時はプロファイルの worker_agent → claude）",
+                    },
+                    "model": { "type": "string", "description": "worker のモデル（agent のネイティブ表記。省略時はマスターのプロファイル設定に従う）" },
+                    "effort": { "type": "string", "description": "thinking / reasoning effort（claude・codex のみ。省略時はマスターのプロファイル設定に従う）" },
                     "pane": pane_schema("分割元ペイン ID（省略時は呼び出し元）"),
                     "tab": { "type": "integer", "minimum": 0, "description": "子を出すタブ ID" },
                     "timeout_seconds": {
@@ -1227,6 +1265,7 @@ fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i6
         .unwrap_or(200) as usize;
     let model = str_arg(args, "model").map_err(map_err)?;
     let effort = str_arg(args, "effort").map_err(map_err)?;
+    let agent = str_arg(args, "agent").map_err(map_err)?;
 
     let opts = wait::RunOptions {
         project,
@@ -1234,6 +1273,7 @@ fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i6
         label,
         model,
         effort,
+        agent,
         pane,
         tab,
         caller_role: session.caller_role.clone(),
@@ -1512,6 +1552,15 @@ fn build_request(
             worker_effort: str_arg(args, "worker_effort")?,
             clear_model: bool_arg(args, "clear_model")?.unwrap_or(false),
             clear_worker_model: bool_arg(args, "clear_worker_model")?.unwrap_or(false),
+            worker_agent: str_arg(args, "worker_agent")?,
+            clear_worker_agent: bool_arg(args, "clear_worker_agent")?.unwrap_or(false),
+            agent: str_arg(args, "agent")?,
+            agent_model: str_arg(args, "agent_model")?,
+            clear_agent_model: bool_arg(args, "clear_agent_model")?.unwrap_or(false),
+            agent_effort: str_arg(args, "agent_effort")?,
+            clear_agent_effort: bool_arg(args, "clear_agent_effort")?.unwrap_or(false),
+            agent_skip_permissions: bool_arg(args, "agent_skip_permissions")?,
+            agent_args: str_vec_arg(args, "agent_args")?,
         },
         "tako_orchestrator_spawn" => {
             let pane = u64_arg(args, "pane")?;
@@ -1536,6 +1585,7 @@ fn build_request(
                 pane: resolved_pane,
                 tab: resolved_tab,
                 caller_role: caller_role.map(str::to_string),
+                agent: str_arg(args, "agent")?,
             }
         }
         "tako_orchestrator_worker_status" => Request::OrchestratorWorkerStatus {

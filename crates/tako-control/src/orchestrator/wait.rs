@@ -154,6 +154,8 @@ pub struct RunOptions {
     pub label: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// worker のエージェント種別（claude / codex / agy。省略時はプロファイル既定。#120）
+    pub agent: Option<String>,
     /// 分割元ペイン ID（`tab` と排他。両方 None は spawn 側でエラー）
     pub pane: Option<u64>,
     /// 子を出すタブ ID
@@ -191,6 +193,7 @@ pub fn run_worker(
         pane: opts.pane,
         tab: opts.tab,
         caller_role: opts.caller_role.clone(),
+        agent: opts.agent.clone(),
     })?;
     let pane_id = spawn_result["pane_id"].as_u64().unwrap_or(0);
     let spawned_by = spawn_result["spawned_by"].as_u64().unwrap_or(0);
@@ -269,12 +272,21 @@ pub fn tail_lines(output: &str, n: usize) -> Vec<&str> {
         .collect()
 }
 
-/// worker の画面が busy（作業中）を示すパターンを含むか（末尾 5 行に限定）
+/// worker の画面が busy（作業中）を示すパターンを含むか（末尾 5 行に限定）。
+/// claude / codex は「esc to interrupt」、agy は「esc to cancel」＋
+/// スピナー行「Generating」を拾う（Issue #120。実採取画面より）。
+/// 「Thinking」は素のままだと agy フッターのモデル名表記
+/// 「Claude Opus 4.6 (Thinking)」（常時表示）に誤爆して永遠に busy 判定になるため、
+/// claude スピナーの実表示「Thinking…」に限定する（実機検証 2026-07-10 で発見）
 pub fn screen_looks_busy(output: &str) -> bool {
     tail_lines(output, 5).iter().any(|l| {
         l.contains("esc to interrupt")
+            || l.contains("esc to cancel")
+            || l.contains("Generating")
+            || l.contains("Working (")
             || l.contains("ing… (")
-            || l.contains("Thinking")
+            || l.contains("Thinking…")
+            || l.contains("Thinking...")
             || l.contains("Reading")
             || l.contains("Editing")
             || l.contains("Running")
@@ -283,13 +295,16 @@ pub fn screen_looks_busy(output: &str) -> bool {
     })
 }
 
-/// worker の画面が idle（❯ プロンプト表示 = 入力待ち）を示すか。
-/// Claude TUI は ❯ の下にフッター（区切り線・モデル情報・ctx% 等）が 4〜6 行
-/// あるため、末尾 10 行の範囲でチェックする
+/// worker の画面が idle（入力欄プロンプト表示 = 入力待ち）を示すか。
+/// プロンプト文字は claude `❯` / codex `›` / agy `>` の和集合（Issue #120）。
+/// ASCII の `>` は「`>` 単独 or `> `＋内容」のみ入力欄とみなす（PS2 等との誤検知対策）。
+/// いずれの TUI もプロンプトの下にフッター（区切り線・モデル情報・ctx% 等）が
+/// 1〜6 行あるため、末尾 10 行の範囲でチェックする
 pub fn screen_looks_idle(output: &str) -> bool {
-    tail_lines(output, 10)
-        .iter()
-        .any(|l| l.trim_start().starts_with('❯'))
+    tail_lines(output, 10).iter().any(|l| {
+        let t = l.trim_start();
+        t.starts_with('❯') || t.starts_with('›') || t == ">" || t.starts_with("> ")
+    })
 }
 
 #[cfg(test)]
@@ -436,6 +451,7 @@ mod tests {
             label: None,
             model: None,
             effort: None,
+            agent: None,
             pane: Some(1),
             tab: None,
             caller_role: None,
@@ -492,6 +508,7 @@ mod tests {
             label: None,
             model: None,
             effort: None,
+            agent: None,
             pane: Some(1),
             tab: None,
             caller_role: None,
@@ -524,5 +541,46 @@ mod tests {
         // 末尾 5 行より前の busy パターンは無視される
         let old_busy = format!("esc to interrupt\n{}", "行\n".repeat(6));
         assert!(!screen_looks_busy(&old_busy));
+    }
+
+    /// codex 0.144.1 の実採取画面（Issue #120）
+    const CODEX_IDLE_SCREEN: &str =
+        "• DONE_PROBE\n› Summarize recent commits\n  gpt-5.6-sol high · /work/dir";
+    const CODEX_BUSY_SCREEN: &str = "• Working (3s • esc to interrupt) · 1 background terminal running\n› Summarize recent commits\n  gpt-5.6-sol high · /work/dir";
+
+    /// agy 1.1.0 の実採取画面（Issue #120）。フッターのモデル名表記
+    /// 「Claude Opus 4.6 (Thinking)」は**常時表示**のため、busy 判定が
+    /// これに誤爆しないことが完了検知の生命線（実機検証 2026-07-10 で発見した回帰）
+    const AGY_IDLE_SCREEN: &str =
+        "● Bash(echo done)\n  完了しました\n────\n>\n────\n? for shortcuts   Claude Opus 4.6 (Thinking)";
+    const AGY_BUSY_SCREEN: &str =
+        "▸ Thought Process\n⣻  Generating...\n────\n>\n────\nesc to cancel   Claude Opus 4.6 (Thinking)";
+
+    #[test]
+    fn codexとagyの画面判定() {
+        assert!(screen_looks_idle(CODEX_IDLE_SCREEN), "codex の › を拾う");
+        assert!(!screen_looks_busy(CODEX_IDLE_SCREEN));
+        assert!(screen_looks_busy(CODEX_BUSY_SCREEN), "Working ( を拾う");
+
+        assert!(screen_looks_idle(AGY_IDLE_SCREEN), "agy の > 単独行を拾う");
+        assert!(
+            !screen_looks_busy(AGY_IDLE_SCREEN),
+            "フッターのモデル名 (Thinking) に誤爆しない"
+        );
+        assert!(
+            screen_looks_busy(AGY_BUSY_SCREEN),
+            "Generating / esc to cancel を拾う"
+        );
+        // busy 中も > は見えるが busy 判定が優先される（wait_for_worker の構造）
+        assert!(screen_looks_idle(AGY_BUSY_SCREEN));
+        // claude スピナーの実表示（Thinking…）は引き続き busy と判定する
+        assert!(screen_looks_busy("✻ Thinking…\n出力中"));
+    }
+
+    #[test]
+    fn ascii山括弧はリダイレクト行を入力欄と誤認しない() {
+        assert!(!screen_looks_idle("$ echo foo >file\ndone"));
+        assert!(!screen_looks_idle(">>append"));
+        assert!(screen_looks_idle("some output\n> "));
     }
 }

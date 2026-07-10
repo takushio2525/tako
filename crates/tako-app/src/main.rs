@@ -2341,7 +2341,15 @@ impl TakoApp {
             };
             match flow.state {
                 PromptFlowState::WaitAltScreen => {
-                    if session.is_alt_screen() {
+                    // agy 1.1.0 は inline モード（非 alt_screen）で動くため、alt_screen 遷移
+                    // だけを待つと永遠に進まない（#120）。入力欄 / 信頼ダイアログが画面に
+                    // 見えたら即進み、どちらも来なければ 15 秒で先へ進む（未知 TUI 耐性）
+                    let lines = session.visible_lines();
+                    if session.is_alt_screen()
+                        || claude_tui::is_trust_dialog(&lines)
+                        || claude_tui::input_line(&lines).is_some()
+                        || flow.state_entered_at.elapsed() > std::time::Duration::from_secs(15)
+                    {
                         flow.state = PromptFlowState::WaitPromptReady;
                         flow.state_entered_at = now;
                     }

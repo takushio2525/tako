@@ -217,14 +217,21 @@ tako_orchestrator_spawn({
 
 This will:
 1. Look up the project's working directory from the configuration
-2. Split a new pane and start `claude` in it
+2. Split a new pane and start the worker agent CLI in it (`claude` by default)
 3. Send your prompt to the worker (with delivery verification)
 4. Return the pane ID and tmux_session for monitoring
 
 Always pass a `label` (2-4 words naming the deliverable) — without it the pane
 title is just the project name and the user cannot tell workers apart. Check the
-returned `model` / `effort` fields and correct course if they are not what you
-intended.
+returned `agent` / `model` / `effort` fields and correct course if they are not
+what you intended.
+
+Workers can also run on other agent CLIs via the `agent` parameter
+(`"claude"` / `"codex"` / `"agy"`, both spawn and run). Only pick a non-default
+agent when the profile's Available Worker Agents section (below) lists it or the
+user asks for it. `model` / `effort` are interpreted in that agent's native
+vocabulary. codex / agy workers are monitored by screen heuristics (no
+`claude agents` signal), so allow extra time before judging them idle.
 
 <!-- block: monitoring -->
 ## Monitoring Workers (for spawn, not needed for run)
@@ -375,8 +382,9 @@ You have access to these tako MCP tools:
 ### Orchestrator-specific
 - `tako_orchestrator_projects` — Manage the project registry
 - `tako_orchestrator_run` — Run a one-shot worker (spawn + wait + read + close)
-- `tako_orchestrator_spawn` — Spawn a worker in a project directory
+- `tako_orchestrator_spawn` — Spawn a worker in a project directory (agent: claude / codex / agy)
 - `tako_orchestrator_worker_status` — Check worker status
+- `tako_orchestrator_profiles` — Manage launch profiles (models, efforts, worker agents)
 
 ### Pane operations (for interacting with workers)
 - `tako_read_pane` — Read worker output

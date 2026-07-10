@@ -1512,6 +1512,15 @@ fn dispatch_inner(
             worker_effort,
             clear_model,
             clear_worker_model,
+            worker_agent,
+            clear_worker_agent,
+            agent,
+            agent_model,
+            clear_agent_model,
+            agent_effort,
+            clear_agent_effort,
+            agent_skip_permissions,
+            agent_args,
         } => dispatch_orchestrator_profiles(ProfilesParams {
             action,
             name,
@@ -1521,6 +1530,15 @@ fn dispatch_inner(
             worker_effort,
             clear_model,
             clear_worker_model,
+            worker_agent,
+            clear_worker_agent,
+            agent,
+            agent_model,
+            clear_agent_model,
+            agent_effort,
+            clear_agent_effort,
+            agent_skip_permissions,
+            agent_args,
         }),
 
         Request::OrchestratorSpawn {
@@ -1532,17 +1550,21 @@ fn dispatch_inner(
             pane,
             tab,
             caller_role,
+            agent,
         } => dispatch_orchestrator_spawn(
             host,
             origin,
-            &project,
-            &prompt,
-            label.as_deref(),
-            model.as_deref(),
-            effort.as_deref(),
-            pane,
-            tab,
-            caller_role.as_deref(),
+            SpawnParams {
+                project: &project,
+                prompt: &prompt,
+                label: label.as_deref(),
+                model: model.as_deref(),
+                effort: effort.as_deref(),
+                pane,
+                tab,
+                caller_role: caller_role.as_deref(),
+                agent: agent.as_deref(),
+            },
         ),
 
         Request::OrchestratorWorkerStatus {
@@ -1701,6 +1723,7 @@ fn dispatch_orchestrator_projects(
 
 /// OrchestratorProfiles のパラメータ（Request と 1:1）。
 /// ファイル直読みで tako-core の状態に依存しないため、CLI からも直接呼べるよう公開する
+#[derive(Default)]
 pub struct ProfilesParams {
     pub action: String,
     pub name: Option<String>,
@@ -1710,13 +1733,24 @@ pub struct ProfilesParams {
     pub worker_effort: Option<String>,
     pub clear_model: bool,
     pub clear_worker_model: bool,
+    /// worker の既定エージェント種別（claude / codex / agy。#120）
+    pub worker_agent: Option<String>,
+    pub clear_worker_agent: bool,
+    /// `worker_agents.<agent>` を編集する対象エージェント名
+    pub agent: Option<String>,
+    pub agent_model: Option<String>,
+    pub clear_agent_model: bool,
+    pub agent_effort: Option<String>,
+    pub clear_agent_effort: bool,
+    pub agent_skip_permissions: Option<bool>,
+    pub agent_args: Option<Vec<String>>,
 }
 
 /// プロファイルを JSON 化する（list / show / set の共通形）。
 /// model が null のときは claude CLI の既定モデルで起動することを表す
 fn profile_to_json(name: &str, profile: &crate::orchestrator::Profile) -> Value {
     use crate::orchestrator;
-    json!({
+    let mut v = json!({
         "name": name,
         "model": profile.model,
         "effort": profile.effort,
@@ -1727,7 +1761,13 @@ fn profile_to_json(name: &str, profile: &crate::orchestrator::Profile) -> Value 
         "resolved_worker_effort": profile.resolve_worker_effort(),
         "path": orchestrator::profiles_dir()
             .map(|d| d.join(format!("{name}.yaml")).display().to_string()),
-    })
+    });
+    // worker エージェント設定（#120）は使用時のみ出力（既存出力形の互換維持）
+    if profile.worker_agent.is_some() || !profile.worker_agents.is_empty() {
+        v["worker_agent"] = json!(profile.worker_agent.as_deref().unwrap_or("claude"));
+        v["worker_agents"] = serde_json::to_value(&profile.worker_agents).unwrap_or_default();
+    }
+    v
 }
 
 /// プロファイル管理（list / show / set）。ファイル直読みなので tako-core の状態に依存しない
@@ -1768,6 +1808,30 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                     "worker_model と clear_worker_model は同時に指定できない".into(),
                 ));
             }
+            if params.worker_agent.is_some() && params.clear_worker_agent {
+                return Err(DispatchError::InvalidParams(
+                    "worker_agent と clear_worker_agent は同時に指定できない".into(),
+                ));
+            }
+            // agent_* 系の指定には対象エージェント名（agent）が必須
+            let has_agent_edit = params.agent_model.is_some()
+                || params.clear_agent_model
+                || params.agent_effort.is_some()
+                || params.clear_agent_effort
+                || params.agent_skip_permissions.is_some()
+                || params.agent_args.is_some();
+            if has_agent_edit && params.agent.is_none() {
+                return Err(DispatchError::InvalidParams(
+                    "agent_* 系の設定には agent（対象エージェント名）を指定する".into(),
+                ));
+            }
+            // エージェント名は設定時点で検証する（spawn 時の不意のエラーを防ぐ）
+            if let Some(a) = params.worker_agent.as_deref() {
+                orchestrator::WorkerAgent::parse(a).map_err(DispatchError::InvalidParams)?;
+            }
+            if let Some(a) = params.agent.as_deref() {
+                orchestrator::WorkerAgent::parse(a).map_err(DispatchError::InvalidParams)?;
+            }
             let mut profile = orchestrator::Profile::load(&name).unwrap_or_default();
             if let Some(m) = params.model {
                 profile.model = Some(m);
@@ -1785,6 +1849,34 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
             if let Some(e) = params.worker_effort {
                 profile.worker_effort = Some(e);
             }
+            if let Some(a) = params.worker_agent {
+                profile.worker_agent = Some(a);
+            } else if params.clear_worker_agent {
+                profile.worker_agent = None;
+            }
+            if let Some(agent_name) = params.agent {
+                let cfg = profile.worker_agents.entry(agent_name).or_default();
+                if let Some(m) = params.agent_model {
+                    cfg.model = Some(m);
+                } else if params.clear_agent_model {
+                    cfg.model = None;
+                }
+                if let Some(e) = params.agent_effort {
+                    cfg.effort = Some(e);
+                } else if params.clear_agent_effort {
+                    cfg.effort = None;
+                }
+                if let Some(s) = params.agent_skip_permissions {
+                    cfg.skip_permissions = s;
+                }
+                if let Some(a) = params.agent_args {
+                    cfg.args = a;
+                }
+            }
+            // 既定値のみになったエントリは掃除する（YAML を汚さない）
+            profile
+                .worker_agents
+                .retain(|_, c| *c != orchestrator::AgentWorkerConfig::default());
             let path = profile.save(&name).map_err(DispatchError::Operation)?;
             let mut result = profile_to_json(&name, &profile);
             result["path"] = json!(path.display().to_string());
@@ -1848,18 +1940,36 @@ fn spawn_tmux_delivery(session: String, text: String, wait_ready: bool) {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// OrchestratorSpawn のパラメータ（Request と 1:1）
+struct SpawnParams<'a> {
+    project: &'a str,
+    prompt: &'a str,
+    label: Option<&'a str>,
+    model: Option<&'a str>,
+    effort: Option<&'a str>,
+    pane: Option<u64>,
+    tab: Option<u64>,
+    caller_role: Option<&'a str>,
+    /// worker のエージェント種別（claude / codex / agy。省略時はプロファイル既定。#120）
+    agent: Option<&'a str>,
+}
+
 fn dispatch_orchestrator_spawn(
     host: &mut dyn ControlHost,
     origin: PaneOrigin,
-    project: &str,
-    prompt: &str,
-    label: Option<&str>,
-    model: Option<&str>,
-    effort: Option<&str>,
-    pane: Option<u64>,
-    tab: Option<u64>,
-    caller_role: Option<&str>,
+    params: SpawnParams,
 ) -> Result<Value, DispatchError> {
+    let SpawnParams {
+        project,
+        prompt,
+        label,
+        model,
+        effort,
+        pane,
+        tab,
+        caller_role,
+        agent,
+    } = params;
     if pane.is_none() && tab.is_none() {
         return Err(DispatchError::Operation(
             "pane または tab を指定してください".into(),
@@ -1878,22 +1988,16 @@ fn dispatch_orchestrator_spawn(
         .and_then(|r| r.strip_prefix("master:"))
         .map(str::to_string);
 
-    // model/effort が明示指定されていない場合、呼び出し元 master のプロファイルから解決する。
-    // model が None に解決された場合は --model を付けず claude CLI の既定に委ねる（Issue #27）
+    // エージェント種別と model / effort を解決する（#120）。明示指定 → プロファイル。
+    // agent=claude は従来の worker_model_policy 解決を維持し、model が None に解決された
+    // 場合は --model を付けず CLI の既定に委ねる（Issue #27）。
+    // 検証はペイン分割の**前**に行う（不正 agent でペインだけ生える事故を防ぐ）
     let caller_pane = pane.map(PaneId::from_raw);
     let profile = resolve_caller_profile_with_role(host.workspace(), caller_pane, &role_suffix);
-    let model: Option<String> = match model {
-        Some(m) => Some(m.to_string()),
-        None => profile.resolve_worker_model().map(str::to_string),
-    };
-    let resolved_effort;
-    let effort = match effort {
-        Some(e) => e,
-        None => {
-            resolved_effort = profile.resolve_worker_effort().to_string();
-            &resolved_effort
-        }
-    };
+    let worker_agent = profile
+        .resolve_worker_agent(agent)
+        .map_err(DispatchError::InvalidParams)?;
+    let launch = profile.resolve_agent_launch(worker_agent, model, effort);
     let window_title = match label {
         Some(l) => format!("{project}: {l}"),
         None => format!("{project}-worker"),
@@ -1987,20 +2091,28 @@ fn dispatch_orchestrator_spawn(
         Some(l) => format!("worker:{project}:{l}"),
         None => format!("worker:{project}"),
     };
-    let claude_cmd = orchestrator::build_worker_claude_cmd(&role_value, model.as_deref(), effort);
+    let worker_cmd = orchestrator::agent::build_worker_cmd(&orchestrator::agent::WorkerLaunch {
+        agent: worker_agent,
+        role: &role_value,
+        model: launch.model.as_deref(),
+        effort: launch.effort.as_deref(),
+        skip_permissions: launch.skip_permissions,
+        extra_args: &launch.extra_args,
+    });
 
-    // 事前信頼: 未信頼フォルダで claude を起動すると信頼ダイアログが出て、送信した
-    // プロンプトがダイアログへの応答として消費される（Issue #32 問題 1）。起動前に
-    // ~/.claude.json へ信頼済みを書き込んでダイアログ自体を出さない。失敗しても
-    // PromptFlow のダイアログ検出 → 承諾がフォールバックするため継続する
-    let pre_trusted = crate::claude_tui::ensure_trusted(&cwd).unwrap_or_else(|e| {
+    // 事前信頼: 未信頼フォルダでエージェント CLI を起動すると信頼ダイアログが出て、
+    // 送信したプロンプトがダイアログへの応答として消費される（Issue #32 問題 1）。
+    // 起動前に各 CLI の設定ファイル（claude: ~/.claude.json / codex: ~/.codex/config.toml /
+    // agy: ~/.gemini/antigravity-cli/settings.json）へ信頼済みを書き込んでダイアログ自体を
+    // 出さない。失敗しても PromptFlow のダイアログ検出 → 承諾がフォールバックするため継続する
+    let pre_trusted = orchestrator::agent::ensure_trusted(worker_agent, &cwd).unwrap_or_else(|e| {
         eprintln!("warning: 事前信頼の書き込みに失敗（ダイアログ検出で継続）: {e}");
         false
     });
 
     // attach_session は非同期（pending_attach）なのでセッションはまだ存在しない。
     // queue_write で遅延書き込みを登録し、セッション起動後に自動送信する
-    let mut cmd_bytes = claude_cmd.clone().into_bytes();
+    let mut cmd_bytes = worker_cmd.clone().into_bytes();
     cmd_bytes.push(b'\r');
     host.queue_write(new_id, cmd_bytes);
 
@@ -2029,9 +2141,12 @@ fn dispatch_orchestrator_spawn(
         "spawned_by": target.as_u64(),
         "title": window_title,
         "cwd": cwd,
-        "model": model,
-        "effort": effort,
-        "claude_command": claude_cmd,
+        "agent": worker_agent.as_str(),
+        "model": launch.model,
+        "effort": launch.effort,
+        "command": worker_cmd,
+        // 旧フィールド名の互換（#120 以前のクライアント / ドキュメント向け）
+        "claude_command": worker_cmd,
         "prompt": prompt,
         "pre_trusted": pre_trusted,
         "tmux_session": tmux_session,
@@ -2140,6 +2255,20 @@ fn dispatch_orchestrator_worker_status(
             .is_some_and(|out| crate::orchestrator::wait::screen_looks_idle(out));
         if !has_prompt {
             status = "busy".to_string();
+        }
+    }
+
+    // agents シグナルの無い worker（codex / agy、または claude の解決失敗）は
+    // 画面推定で busy / idle を判定する（#120。wait_for_worker の unknown ブランチと
+    // 同じロジックを単発クエリの応答にも反映する。status_source=screen のため
+    // watch / run 側は従来どおり idle 連続 8 回を要求し、単発の誤判定では完了しない）
+    if status == "unknown" {
+        if let Some(ref out) = recent_output {
+            if crate::orchestrator::wait::screen_looks_busy(out) {
+                status = "busy".to_string();
+            } else if crate::orchestrator::wait::screen_looks_idle(out) {
+                status = "idle".to_string();
+            }
         }
     }
 
@@ -3798,9 +3927,17 @@ mod tests {
 
     // --- #109: 複数 master 並行時の caller_role による正しい master 特定 ---
 
+    /// with_test_project の直列化ロック。共有キーを並列テストが同時に
+    /// 追加・削除すると解決失敗のレースが起きるため（#120 でテストが増えて顕在化）
+    static TEST_PROJECT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// テスト用に一時プロジェクトを projects.yaml に追加し、テスト後に削除する
     fn with_test_project<F: FnOnce()>(f: F) {
         use crate::orchestrator;
+        // panic したテストの poison は無視して続行する（後続テストを巻き込まない）
+        let _guard = TEST_PROJECT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _ = orchestrator::ensure_defaults();
         let key = "_tako_test_109_";
         let mut config = orchestrator::ProjectsConfig::load().unwrap();
@@ -3818,6 +3955,21 @@ mod tests {
     }
 
     const TEST_PROJECT: &str = "_tako_test_109_";
+
+    /// caller_role 系テストの共通 SpawnParams（stale pane 99999 + effort 明示）
+    fn test_spawn_params<'a>(prompt: &'a str, caller_role: Option<&'a str>) -> SpawnParams<'a> {
+        SpawnParams {
+            project: TEST_PROJECT,
+            prompt,
+            label: None,
+            model: None,
+            effort: Some("high"),
+            pane: Some(99999),
+            tab: None,
+            caller_role,
+            agent: None,
+        }
+    }
 
     /// 複数 master が存在するとき、caller_role の suffix で正しい master のタブに
     /// worker が配置されることを検証する（#109 の根本修正）
@@ -3854,14 +4006,7 @@ mod tests {
             let result = dispatch_orchestrator_spawn(
                 &mut host,
                 PaneOrigin::Mcp,
-                TEST_PROJECT,
-                "テスト",
-                None,
-                None,
-                Some("high"),
-                Some(99999),
-                None,
-                Some("master:aram"),
+                test_spawn_params("テスト", Some("master:aram")),
             );
             let value = result.expect("caller_role フォールバックで spawn 成功するべき");
             assert_eq!(
@@ -3892,14 +4037,7 @@ mod tests {
             let result = dispatch_orchestrator_spawn(
                 &mut host,
                 PaneOrigin::Mcp,
-                TEST_PROJECT,
-                "テスト",
-                None,
-                None,
-                Some("high"),
-                Some(99999),
-                None,
-                None,
+                test_spawn_params("テスト", None),
             );
             let value = result.expect("caller_role なしでも既存フォールバックで成功するべき");
             assert_eq!(value["spawned_by"].as_u64().unwrap(), tab1_pane);
@@ -3939,14 +4077,7 @@ mod tests {
             let result = dispatch_orchestrator_spawn(
                 &mut host,
                 PaneOrigin::Mcp,
-                TEST_PROJECT,
-                "テスト",
-                None,
-                None,
-                Some("high"),
-                Some(99999),
-                None,
-                Some("master:hck"),
+                test_spawn_params("テスト", Some("master:hck")),
             )
             .unwrap();
             assert_eq!(result["spawned_by"].as_u64().unwrap(), tab1_pane);
@@ -3954,17 +4085,129 @@ mod tests {
             let result = dispatch_orchestrator_spawn(
                 &mut host,
                 PaneOrigin::Mcp,
-                TEST_PROJECT,
-                "テスト 2",
-                None,
-                None,
-                Some("high"),
-                Some(99999),
-                None,
-                Some("master:fable"),
+                test_spawn_params("テスト 2", Some("master:fable")),
             )
             .unwrap();
             assert_eq!(result["spawned_by"].as_u64().unwrap(), tab2_pane);
+        });
+    }
+
+    // --- #120: worker エージェント種別（claude / codex / agy） ---
+
+    fn pane_count(host: &MockHost) -> usize {
+        host.workspace()
+            .tabs()
+            .iter()
+            .map(|t| t.tree().panes().len())
+            .sum()
+    }
+
+    /// 不正なエージェント種別はペイン分割の前に拒否される（ペインが生えない）
+    #[test]
+    fn spawn_不正なagent種別はエラーでペインが生えない() {
+        with_test_project(|| {
+            let mut host = MockHost::new();
+            let root = host.root_pane();
+            dispatch(
+                &mut host,
+                Request::Title {
+                    pane: Some(root),
+                    title: None,
+                    role: Some("orchestrator-master".into()),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+            let before = pane_count(&host);
+
+            let mut params = test_spawn_params("テスト", None);
+            params.agent = Some("gemini");
+            let err = dispatch_orchestrator_spawn(&mut host, PaneOrigin::Mcp, params)
+                .expect_err("不正 agent はエラーになるべき");
+            assert!(
+                err.to_string().contains("claude / codex / agy"),
+                "対応一覧つきの診断: {err}"
+            );
+            assert_eq!(pane_count(&host), before, "エラー時にペインが生えない");
+        });
+    }
+
+    /// agent=codex / agy の spawn は各 CLI のコマンドを組み立て、応答に agent を含む
+    #[test]
+    fn spawn_agent種別ごとのコマンド組み立て() {
+        with_test_project(|| {
+            let mut host = MockHost::new();
+            let root = host.root_pane();
+            dispatch(
+                &mut host,
+                Request::Title {
+                    pane: Some(root),
+                    title: None,
+                    role: Some("orchestrator-master".into()),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+
+            let mut params = test_spawn_params("テスト", None);
+            params.agent = Some("codex");
+            params.model = Some("gpt-5.6-terra");
+            params.effort = Some("medium");
+            let result = dispatch_orchestrator_spawn(&mut host, PaneOrigin::Mcp, params).unwrap();
+            assert_eq!(result["agent"], "codex");
+            let cmd = result["command"].as_str().unwrap();
+            assert!(cmd.contains(" codex"), "codex を起動する: {cmd}");
+            assert!(cmd.contains("--model gpt-5.6-terra"), "{cmd}");
+            assert!(
+                cmd.contains("model_reasoning_effort=medium"),
+                "effort は codex の config へ写像: {cmd}"
+            );
+            assert_eq!(
+                result["command"], result["claude_command"],
+                "旧フィールド名の互換を維持"
+            );
+
+            // agy は effort を無視し、モデル表示名をクオートして渡す
+            let mut params = test_spawn_params("テスト", None);
+            params.agent = Some("agy");
+            params.model = Some("Gemini 3.5 Flash (High)");
+            params.effort = Some("high");
+            let result = dispatch_orchestrator_spawn(&mut host, PaneOrigin::Mcp, params).unwrap();
+            assert_eq!(result["agent"], "agy");
+            let cmd = result["command"].as_str().unwrap();
+            assert!(cmd.contains(" agy"), "{cmd}");
+            assert!(cmd.contains("--model 'Gemini 3.5 Flash (High)'"), "{cmd}");
+            assert!(!cmd.contains("effort"), "agy に effort は渡さない: {cmd}");
+        });
+    }
+
+    /// agent 省略時は claude で従来のコマンド形式（回帰なし）
+    #[test]
+    fn spawn_agent省略はclaude既定() {
+        with_test_project(|| {
+            let mut host = MockHost::new();
+            let root = host.root_pane();
+            dispatch(
+                &mut host,
+                Request::Title {
+                    pane: Some(root),
+                    title: None,
+                    role: Some("orchestrator-master".into()),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+
+            let result = dispatch_orchestrator_spawn(
+                &mut host,
+                PaneOrigin::Mcp,
+                test_spawn_params("テスト", None),
+            )
+            .unwrap();
+            assert_eq!(result["agent"], "claude");
+            let cmd = result["command"].as_str().unwrap();
+            assert!(cmd.contains(" claude"), "{cmd}");
+            assert!(cmd.contains("--effort high"), "{cmd}");
         });
     }
 }
