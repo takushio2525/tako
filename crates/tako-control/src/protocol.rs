@@ -425,6 +425,9 @@ pub enum Request {
         /// 対象エージェントの追加 CLI 引数（丸ごと置き換え。空配列でクリア）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_args: Option<Vec<String>>,
+        /// worker_model_policy（inherit / delegate / fixed）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_model_policy: Option<String>,
     },
     /// オーケストレーター: worker の spawn（split + エージェント CLI 起動 + プロンプト送信）
     OrchestratorSpawn {

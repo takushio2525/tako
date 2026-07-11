@@ -1588,6 +1588,7 @@ fn dispatch_inner(
             clear_agent_effort,
             agent_skip_permissions,
             agent_args,
+            worker_model_policy,
         } => dispatch_orchestrator_profiles(ProfilesParams {
             action,
             name,
@@ -1607,6 +1608,7 @@ fn dispatch_inner(
             agent_effort,
             clear_agent_effort,
             agent_skip_permissions,
+            worker_model_policy,
             agent_args,
         }),
 
@@ -1816,6 +1818,8 @@ pub struct ProfilesParams {
     pub clear_agent_effort: bool,
     pub agent_skip_permissions: Option<bool>,
     pub agent_args: Option<Vec<String>>,
+    /// worker_model_policy（inherit / delegate / fixed）
+    pub worker_model_policy: Option<String>,
 }
 
 /// プロファイルを JSON 化する（list / show / set の共通形）。
@@ -1943,6 +1947,18 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                 profile.worker_agent = Some(a);
             } else if params.clear_worker_agent {
                 profile.worker_agent = None;
+            }
+            if let Some(policy) = params.worker_model_policy {
+                profile.worker_model_policy = match policy.as_str() {
+                    "inherit" => orchestrator::WorkerModelPolicy::Inherit,
+                    "delegate" => orchestrator::WorkerModelPolicy::Delegate,
+                    "fixed" => orchestrator::WorkerModelPolicy::Fixed,
+                    _ => {
+                        return Err(DispatchError::InvalidParams(format!(
+                            "worker_model_policy が不正: '{policy}'（inherit / delegate / fixed）"
+                        )));
+                    }
+                };
             }
             if let Some(agent_name) = params.agent {
                 let cfg = profile.worker_agents.entry(agent_name).or_default();

@@ -945,6 +945,7 @@ pub fn tools() -> Vec<Value> {
                         "type": "array", "items": { "type": "string" },
                         "description": "対象エージェントの追加 CLI 引数（丸ごと置き換え。空配列でクリア）",
                     },
+                    "worker_model_policy": { "type": "string", "enum": ["inherit", "delegate", "fixed"], "description": "worker のモデル選択ポリシー（inherit: master と同じ / delegate: master が都度選ぶ / fixed: worker_model 固定）" },
                 },
                 "additionalProperties": false,
             },
@@ -1622,6 +1623,7 @@ fn build_request(
             clear_agent_effort: bool_arg(args, "clear_agent_effort")?.unwrap_or(false),
             agent_skip_permissions: bool_arg(args, "agent_skip_permissions")?,
             agent_args: str_vec_arg(args, "agent_args")?,
+            worker_model_policy: str_arg(args, "worker_model_policy")?,
         },
         "tako_orchestrator_spawn" => {
             let pane = u64_arg(args, "pane")?;

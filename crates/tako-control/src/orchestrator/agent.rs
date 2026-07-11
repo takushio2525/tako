@@ -53,6 +53,16 @@ impl WorkerAgent {
     pub fn has_agents_api(&self) -> bool {
         matches!(self, Self::Claude)
     }
+
+    /// プロファイルで明示設定されていない場合の skip_permissions 既定値。
+    /// codex / agy は承認ダイアログで worker が停止するため既定でスキップする。
+    /// claude は従来どおり承認あり（auto accept は Claude Code 側の設定に委ねる）
+    pub fn default_skip_permissions(&self) -> bool {
+        match self {
+            Self::Claude => false,
+            Self::Codex | Self::Agy => true,
+        }
+    }
 }
 
 /// worker 起動コマンドの組み立てパラメータ
@@ -66,7 +76,7 @@ pub struct WorkerLaunch<'a> {
     /// `-c model_reasoning_effort=`、agy は指定手段が無いため無視される
     pub effort: Option<&'a str>,
     /// 許可プロンプトのスキップ（claude / agy: `--dangerously-skip-permissions`、
-    /// codex: `--dangerously-bypass-approvals-and-sandbox`）。明示 opt-in のみ
+    /// codex: `--dangerously-bypass-approvals-and-sandbox`）。codex / agy は既定 true
     pub skip_permissions: bool,
     /// プロファイル worker_agents.<agent>.args の追加 CLI 引数（上級者向け）
     pub extra_args: &'a [String],

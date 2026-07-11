@@ -631,6 +631,9 @@ enum ProfilesCommand {
         /// 対象エージェントの追加 CLI 引数（カンマ区切り。丸ごと置き換え。空文字でクリア）
         #[arg(long, requires = "agent", value_delimiter = ',')]
         agent_args: Option<Vec<String>>,
+        /// worker のモデル選択ポリシー（inherit / delegate / fixed）
+        #[arg(long)]
+        worker_model_policy: Option<String>,
     },
 }
 
@@ -1530,6 +1533,7 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             clear_agent_effort,
             agent_skip_permissions,
             agent_args,
+            worker_model_policy,
         } => ProfilesParams {
             action: "set".into(),
             name: Some(name.clone()),
@@ -1550,6 +1554,7 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             clear_agent_effort: *clear_agent_effort,
             agent_skip_permissions: *agent_skip_permissions,
             agent_args: agent_args.clone(),
+            worker_model_policy: worker_model_policy.clone(),
         },
     };
     let result = dispatch_orchestrator_profiles(params).map_err(|e| e.to_string())?;
