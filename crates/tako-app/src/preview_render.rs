@@ -1,6 +1,7 @@
 use gpui::{
-    div, point, prelude::*, px, relative, BoxShadow, Context, CursorStyle, FontWeight,
-    HighlightStyle, MouseButton, MouseMoveEvent, SharedString, StyledText, UnderlineStyle, Window,
+    canvas, div, fill, point, prelude::*, px, relative, Bounds, BoxShadow, Context, CursorStyle,
+    FontWeight, HighlightStyle, MouseButton, MouseMoveEvent, SharedString, StyledText,
+    UnderlineStyle, Window,
 };
 use tako_core::{PaneId, Rect};
 
@@ -425,41 +426,166 @@ impl TakoApp {
                     )
                     .into_any_element()]
             }
-            preview::PreviewContent::Pdf(data) => data
-                .pages
-                .iter()
-                .enumerate()
-                .filter(|(_, png)| !png.is_empty())
-                .map(|(i, png)| {
-                    let image = std::sync::Arc::new(gpui::Image::from_bytes(
-                        gpui::ImageFormat::Png,
-                        png.clone(),
-                    ));
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .w_full()
-                        .pb_2()
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.6))
-                                .pb_1()
-                                .child(SharedString::from(format!(
-                                    "— {} / {} —",
-                                    i + 1,
-                                    data.total_pages
-                                ))),
+            preview::PreviewContent::Pdf(data) => {
+                // テキスト行を line_texts に登録（選択テキスト抽出用）
+                let mut global_line_idx: usize = 0;
+                for page_lines in &data.text_layers {
+                    for tl in page_lines {
+                        line_texts.push(tl.text.clone());
+                        global_line_idx += 1;
+                    }
+                }
+                let _ = global_line_idx;
+
+                let mut line_offset: usize = 0;
+                data.pages
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, png)| !png.is_empty())
+                    .map(|(i, png)| {
+                        let image = std::sync::Arc::new(gpui::Image::from_bytes(
+                            gpui::ImageFormat::Png,
+                            png.clone(),
+                        ));
+                        let page_text_lines = data.text_layers.get(i);
+                        let page_size = data.page_sizes.get(i).copied().unwrap_or([612.0, 792.0]);
+                        let page_line_offset = line_offset;
+                        let n_lines = page_text_lines.map(|l| l.len()).unwrap_or(0);
+                        line_offset += n_lines;
+
+                        let sel_highlight = selection.as_ref().and_then(|sel| {
+                            let (start, end) = sel.ordered();
+                            if end.0 < page_line_offset || start.0 >= page_line_offset + n_lines {
+                                return None;
+                            }
+                            Some((sel.clone(), page_line_offset))
+                        });
+
+                        let entity = cx.entity().downgrade();
+                        let text_lines_for_canvas: Vec<preview::PdfTextLine> =
+                            page_text_lines.map(|l| l.to_vec()).unwrap_or_default();
+                        let pdf_w = page_size[0];
+                        let pdf_h = page_size[1];
+                        let sel_color = theme.selection_background;
+
+                        let overlay = canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, cx| {
+                                if text_lines_for_canvas.is_empty() {
+                                    return;
+                                }
+                                let img_w = f32::from(bounds.size.width) as f64;
+                                let img_h = f32::from(bounds.size.height) as f64;
+                                if img_w <= 0.0 || img_h <= 0.0 {
+                                    return;
+                                }
+                                let scale_x = img_w / pdf_w;
+                                let scale_y = img_h / pdf_h;
+
+                                // bounds 追跡: 各行の画面座標を preview_line_bounds に登録
+                                if let Some(e) = entity.upgrade() {
+                                    e.update(cx, |app, _| {
+                                        let list =
+                                            app.preview_line_bounds.entry(pane_id).or_default();
+                                        for (j, tl) in text_lines_for_canvas.iter().enumerate() {
+                                            let idx = page_line_offset + j;
+                                            if list.len() <= idx {
+                                                list.resize(idx + 1, Bounds::default());
+                                            }
+                                            // PDF 座標（左下原点）→ スクリーン座標（左上原点）
+                                            let sx = bounds.origin.x
+                                                + px(tl.bbox[0] as f32 * scale_x as f32);
+                                            let sy = bounds.origin.y
+                                                + px((pdf_h - tl.bbox[1] - tl.bbox[3]) as f32
+                                                    * scale_y as f32);
+                                            let sw = px(tl.bbox[2] as f32 * scale_x as f32);
+                                            let sh = px(tl.bbox[3] as f32 * scale_y as f32);
+                                            list[idx] = Bounds {
+                                                origin: point(sx, sy),
+                                                size: gpui::size(sw, sh),
+                                            };
+                                        }
+                                    });
+                                }
+
+                                // 選択ハイライトの描画
+                                if let Some((ref sel, offset)) = sel_highlight {
+                                    for (j, tl) in text_lines_for_canvas.iter().enumerate() {
+                                        let global_j = offset + j;
+                                        let line_range =
+                                            sel.range_for_line(global_j, tl.text.len());
+                                        if let Some((sc, ec)) = line_range {
+                                            if tl.text.is_empty() || tl.bbox[2] <= 0.0 {
+                                                continue;
+                                            }
+                                            let char_count = tl.text.chars().count().max(1);
+                                            let char_w = tl.bbox[2] / char_count as f64;
+
+                                            let sc_chars =
+                                                tl.text[..sc.min(tl.text.len())].chars().count();
+                                            let ec_chars =
+                                                tl.text[..ec.min(tl.text.len())].chars().count();
+
+                                            let x_start = tl.bbox[0] + sc_chars as f64 * char_w;
+                                            let x_end = tl.bbox[0] + ec_chars as f64 * char_w;
+
+                                            let sx = bounds.origin.x
+                                                + px(x_start as f32 * scale_x as f32);
+                                            let sy = bounds.origin.y
+                                                + px((pdf_h - tl.bbox[1] - tl.bbox[3]) as f32
+                                                    * scale_y as f32);
+                                            let sw = px((x_end - x_start) as f32 * scale_x as f32);
+                                            let sh = px(tl.bbox[3] as f32 * scale_y as f32);
+
+                                            if f32::from(sw) > 0.0 && f32::from(sh) > 0.0 {
+                                                window.paint_quad(fill(
+                                                    Bounds {
+                                                        origin: point(sx, sy),
+                                                        size: gpui::size(sw, sh),
+                                                    },
+                                                    hsla_alpha(sel_color, 0.35),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            },
                         )
-                        .child(
-                            gpui::img(image)
-                                .object_fit(gpui::ObjectFit::Contain)
-                                .max_w_full(),
-                        )
-                        .into_any_element()
-                })
-                .collect(),
+                        .absolute()
+                        .size_full();
+
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .w_full()
+                            .pb_2()
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.6))
+                                    .pb_1()
+                                    .child(SharedString::from(format!(
+                                        "— {} / {} —",
+                                        i + 1,
+                                        data.total_pages
+                                    ))),
+                            )
+                            .child(
+                                div()
+                                    .relative()
+                                    .w_full()
+                                    .child(
+                                        gpui::img(image)
+                                            .object_fit(gpui::ObjectFit::Contain)
+                                            .max_w_full(),
+                                    )
+                                    .child(overlay),
+                            )
+                            .into_any_element()
+                    })
+                    .collect()
+            }
             preview::PreviewContent::Video(data) => {
                 let mut elements: Vec<gpui::AnyElement> = Vec::new();
 
