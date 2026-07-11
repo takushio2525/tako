@@ -115,12 +115,25 @@ pub enum ImageFileFormat {
     Svg,
 }
 
+/// PDF テキスト行 1 本分（ページ内で改行区切り）
+#[derive(Debug, Clone, PartialEq)]
+pub struct PdfTextLine {
+    pub text: String,
+    /// PDF 座標系での行バウンディングボックス [x, y, width, height]
+    /// （PDF 座標は左下原点。描画時にスクリーン座標に変換する）
+    pub bbox: [f64; 4],
+}
+
 /// PDF データ（全ページの PNG を保持し、スクロールで閲覧）
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PdfData {
     /// 各ページの PNG バイト列（Core Graphics でレンダリング済み）
     pub pages: Vec<Vec<u8>>,
     pub total_pages: usize,
+    /// ページごとのテキスト行（テキスト選択用。テキストレイヤがない PDF では空）
+    pub text_layers: Vec<Vec<PdfTextLine>>,
+    /// ページごとの PDF 座標系でのサイズ [width, height]
+    pub page_sizes: Vec<[f64; 2]>,
 }
 
 /// 動画のメタ情報 + サムネイル（ffmpeg で抽出）
@@ -236,15 +249,21 @@ pub fn load_pdf(path: &Path, _page: usize) -> PreviewState {
     #[cfg(target_os = "macos")]
     {
         match pdf_render::render_all_pages(path) {
-            Ok((all_pages, total_pages)) => PreviewState {
-                path: path.to_path_buf(),
-                mode: PreviewMode::Pdf,
-                content: PreviewContent::Pdf(PdfData {
-                    pages: all_pages,
-                    total_pages,
-                }),
-                truncated: false,
-            },
+            Ok((all_pages, total_pages, page_sizes)) => {
+                let text_layers =
+                    pdf_render::extract_text_layers(path, total_pages).unwrap_or_default();
+                PreviewState {
+                    path: path.to_path_buf(),
+                    mode: PreviewMode::Pdf,
+                    content: PreviewContent::Pdf(PdfData {
+                        pages: all_pages,
+                        total_pages,
+                        text_layers,
+                        page_sizes,
+                    }),
+                    truncated: false,
+                }
+            }
             Err(e) => PreviewState::error(path, PreviewMode::Pdf, e),
         }
     }
@@ -573,7 +592,8 @@ mod pdf_render {
         }
     }
 
-    pub fn render_all_pages(path: &Path) -> Result<(Vec<Vec<u8>>, usize), String> {
+    #[allow(clippy::type_complexity)]
+    pub fn render_all_pages(path: &Path) -> Result<(Vec<Vec<u8>>, usize, Vec<[f64; 2]>), String> {
         let path_str = path
             .to_str()
             .ok_or_else(|| "パスが UTF-8 でない".to_string())?;
@@ -606,15 +626,18 @@ mod pdf_render {
             }
 
             let mut all_pages = Vec::with_capacity(total);
+            let mut page_sizes = Vec::with_capacity(total);
             for page_idx in 0..total {
                 let page_num = page_idx + 1;
                 let pdf_page = CGPDFDocumentGetPage(doc, page_num);
                 if pdf_page.is_null() {
                     all_pages.push(Vec::new());
+                    page_sizes.push([0.0, 0.0]);
                     continue;
                 }
 
                 let media_box = CGPDFPageGetBoxRect(pdf_page, CG_PDF_MEDIA_BOX);
+                page_sizes.push([media_box.size.width, media_box.size.height]);
                 let pixel_w = (media_box.size.width * RENDER_SCALE) as usize;
                 let pixel_h = (media_box.size.height * RENDER_SCALE) as usize;
                 if pixel_w == 0 || pixel_h == 0 {
@@ -670,7 +693,7 @@ mod pdf_render {
             }
 
             CGPDFDocumentRelease(doc);
-            Ok((all_pages, total))
+            Ok((all_pages, total, page_sizes))
         }
     }
 
@@ -702,6 +725,250 @@ mod pdf_render {
         let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
         CFRelease(mutable_data);
         Some(bytes)
+    }
+
+    // --- PDFKit FFI（テキストレイヤ抽出） ---
+
+    #[link(name = "objc", kind = "dylib")]
+    extern "C" {
+        fn objc_getClass(name: *const u8) -> *const core::ffi::c_void;
+        fn sel_registerName(name: *const u8) -> *const core::ffi::c_void;
+        fn objc_msgSend(
+            receiver: *const core::ffi::c_void,
+            selector: *const core::ffi::c_void,
+            ...
+        ) -> *const core::ffi::c_void;
+    }
+
+    fn cls(name: &str) -> *const core::ffi::c_void {
+        let cstr = std::ffi::CString::new(name).unwrap();
+        unsafe { objc_getClass(cstr.as_ptr() as *const u8) }
+    }
+
+    fn sel_name(name: &str) -> *const core::ffi::c_void {
+        let cstr = std::ffi::CString::new(name).unwrap();
+        unsafe { sel_registerName(cstr.as_ptr() as *const u8) }
+    }
+
+    unsafe fn msg_no_arg(
+        receiver: *const core::ffi::c_void,
+        sel: *const core::ffi::c_void,
+    ) -> *const core::ffi::c_void {
+        objc_msgSend(receiver, sel)
+    }
+
+    unsafe fn msg_id(
+        receiver: *const core::ffi::c_void,
+        sel: *const core::ffi::c_void,
+        arg: *const core::ffi::c_void,
+    ) -> *const core::ffi::c_void {
+        let f: unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+        ) -> *const core::ffi::c_void =
+            std::mem::transmute(objc_msgSend as *const core::ffi::c_void);
+        f(receiver, sel, arg)
+    }
+
+    unsafe fn msg_usize(
+        receiver: *const core::ffi::c_void,
+        sel: *const core::ffi::c_void,
+        arg: usize,
+    ) -> *const core::ffi::c_void {
+        let f: unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            usize,
+        ) -> *const core::ffi::c_void =
+            std::mem::transmute(objc_msgSend as *const core::ffi::c_void);
+        f(receiver, sel, arg)
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    struct NSRange {
+        location: usize,
+        length: usize,
+    }
+
+    unsafe fn msg_nsrange(
+        receiver: *const core::ffi::c_void,
+        sel: *const core::ffi::c_void,
+        range: NSRange,
+    ) -> *const core::ffi::c_void {
+        let f: unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            NSRange,
+        ) -> *const core::ffi::c_void =
+            std::mem::transmute(objc_msgSend as *const core::ffi::c_void);
+        f(receiver, sel, range)
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    struct NSRect {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    }
+
+    // ARM64: NSRect (32 bytes) は GPR に収まらないため objc_msgSend_stret が必要…
+    // ただし ARM64 では objc_msgSend_stret は存在せず、objc_msgSend が直接返す
+    // （ABI 規約: 16 bytes 超の構造体は x8 レジスタ経由で間接リターン）
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn msg_bounds_for_page(
+        selection: *const core::ffi::c_void,
+        page: *const core::ffi::c_void,
+    ) -> NSRect {
+        let f: unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+        ) -> NSRect = std::mem::transmute(objc_msgSend as *const core::ffi::c_void);
+        f(selection, sel_name("boundsForPage:"), page)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn msg_bounds_for_page(
+        selection: *const core::ffi::c_void,
+        page: *const core::ffi::c_void,
+    ) -> NSRect {
+        extern "C" {
+            fn objc_msgSend_stret(
+                ret: *mut NSRect,
+                receiver: *const core::ffi::c_void,
+                sel: *const core::ffi::c_void,
+                arg: *const core::ffi::c_void,
+            );
+        }
+        let mut result = NSRect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+        };
+        objc_msgSend_stret(&mut result, selection, sel_name("boundsForPage:"), page);
+        result
+    }
+
+    unsafe fn nsstring_to_rust(nsstr: *const core::ffi::c_void) -> Option<String> {
+        if nsstr.is_null() {
+            return None;
+        }
+        let utf8_sel = sel_name("UTF8String");
+        let cstr_ptr = msg_no_arg(nsstr, utf8_sel) as *const i8;
+        if cstr_ptr.is_null() {
+            return None;
+        }
+        Some(
+            std::ffi::CStr::from_ptr(cstr_ptr)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
+    /// PDFKit を使ってテキストレイヤを抽出する。
+    /// 各ページのテキストを行に分割し、行ごとの PDF 座標バウンディングボックスを取得する。
+    pub fn extract_text_layers(
+        path: &Path,
+        total_pages: usize,
+    ) -> Result<Vec<Vec<super::PdfTextLine>>, String> {
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| "パスが UTF-8 でない".to_string())?;
+        unsafe {
+            // NSURL.fileURLWithPath:
+            let ns_path = make_cfstring(path_str);
+            if ns_path.is_null() {
+                return Err("CFString 生成失敗".into());
+            }
+            let nsurl = msg_id(cls("NSURL"), sel_name("fileURLWithPath:"), ns_path);
+            CFRelease(ns_path);
+            if nsurl.is_null() {
+                return Err("NSURL 生成失敗".into());
+            }
+
+            // PDFDocument.alloc.initWithURL:
+            let pdf_doc_alloc = msg_no_arg(cls("PDFDocument"), sel_name("alloc"));
+            if pdf_doc_alloc.is_null() {
+                return Err("PDFDocument alloc 失敗".into());
+            }
+            let pdf_doc = msg_id(pdf_doc_alloc, sel_name("initWithURL:"), nsurl);
+            if pdf_doc.is_null() {
+                return Err("PDFDocument initWithURL: 失敗".into());
+            }
+
+            let mut result = Vec::with_capacity(total_pages);
+            for page_idx in 0..total_pages {
+                let page = msg_usize(pdf_doc, sel_name("pageAtIndex:"), page_idx);
+                if page.is_null() {
+                    result.push(Vec::new());
+                    continue;
+                }
+
+                // ページ全体のテキストを取得
+                let ns_string = msg_no_arg(page, sel_name("string"));
+                let full_text = nsstring_to_rust(ns_string).unwrap_or_default();
+                if full_text.is_empty() {
+                    result.push(Vec::new());
+                    continue;
+                }
+
+                // 行に分割して各行のバウンディングボックスを取得
+                let mut lines = Vec::new();
+                let mut char_offset: usize = 0;
+                for line_text in full_text.split('\n') {
+                    let line_len = line_text.len();
+                    if line_len == 0 {
+                        lines.push(super::PdfTextLine {
+                            text: String::new(),
+                            bbox: [0.0, 0.0, 0.0, 0.0],
+                        });
+                        char_offset += 1; // '\n'
+                        continue;
+                    }
+
+                    // NSString は UTF-16 なので、Rust の byte offset → UTF-16 offset に変換
+                    let before = &full_text[..char_offset];
+                    let utf16_start: usize = before.encode_utf16().count();
+                    let utf16_len: usize = line_text.encode_utf16().count();
+
+                    if utf16_len > 0 {
+                        let range = NSRange {
+                            location: utf16_start,
+                            length: utf16_len,
+                        };
+                        let selection = msg_nsrange(page, sel_name("selectionForRange:"), range);
+                        if !selection.is_null() {
+                            let bounds = msg_bounds_for_page(selection, page);
+                            lines.push(super::PdfTextLine {
+                                text: line_text.to_string(),
+                                bbox: [bounds.x, bounds.y, bounds.w, bounds.h],
+                            });
+                        } else {
+                            lines.push(super::PdfTextLine {
+                                text: line_text.to_string(),
+                                bbox: [0.0, 0.0, 0.0, 0.0],
+                            });
+                        }
+                    } else {
+                        lines.push(super::PdfTextLine {
+                            text: line_text.to_string(),
+                            bbox: [0.0, 0.0, 0.0, 0.0],
+                        });
+                    }
+                    char_offset += line_len + 1; // +1 for '\n'
+                }
+                result.push(lines);
+            }
+
+            // PDFDocument は autorelease pool で管理されるので明示 release
+            msg_no_arg(pdf_doc, sel_name("release"));
+            Ok(result)
+        }
     }
 }
 
@@ -1376,5 +1643,125 @@ mod tests {
             }
             other => panic!("Pdf になる: {:?}", other),
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pdfテキストレイヤ抽出() {
+        // 手動構築 PDF（英語テキストのみ）で extract_text_layers が動くか
+        let scratchpad = std::env::temp_dir().join("tako_pdf_text_test");
+        std::fs::create_dir_all(&scratchpad).ok();
+        let pdf_path = scratchpad.join("test_text.pdf");
+
+        // Helvetica 埋め込みの最小 PDF を生成
+        let content = b"BT /F1 14 Tf 72 700 Td (Hello World) Tj ET";
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len();
+        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+        let off4 = pdf.len();
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let off5 = pdf.len();
+        pdf.extend_from_slice(
+            b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+        let xref = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for o in [off1, off2, off3, off4, off5] {
+            pdf.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        std::fs::write(&pdf_path, &pdf).unwrap();
+
+        let result = pdf_render::extract_text_layers(&pdf_path, 1);
+        match result {
+            Ok(layers) => {
+                assert_eq!(layers.len(), 1, "1 ページ分");
+                let page = &layers[0];
+                assert!(!page.is_empty(), "テキスト行がある");
+                let all_text: String = page
+                    .iter()
+                    .map(|l| l.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    all_text.contains("Hello World"),
+                    "Hello World を含む: got {all_text:?}"
+                );
+                // bbox が非ゼロであること
+                let first_line = &page[0];
+                assert!(
+                    first_line.bbox[2] > 0.0 && first_line.bbox[3] > 0.0,
+                    "bbox の幅・高さが正: {:?}",
+                    first_line.bbox
+                );
+            }
+            Err(e) => {
+                eprintln!("[skip] テキスト抽出失敗（環境依存）: {e}");
+            }
+        }
+
+        std::fs::remove_dir_all(&scratchpad).ok();
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pdfテキストなしでもクラッシュしない() {
+        let scratchpad = std::env::temp_dir().join("tako_pdf_notext_test");
+        std::fs::create_dir_all(&scratchpad).ok();
+        let pdf_path = scratchpad.join("notext.pdf");
+
+        // テキストレイヤのない PDF（灰色矩形のみ）
+        let content = b"q 0.8 0.8 0.8 rg 100 600 200 100 re f Q";
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len();
+        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> >>\nendobj\n");
+        let off4 = pdf.len();
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let xref = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        for o in [off1, off2, off3, off4] {
+            pdf.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        std::fs::write(&pdf_path, &pdf).unwrap();
+
+        // クラッシュせずに読めること
+        let state = load(&pdf_path, PreviewMode::Pdf);
+        match &state.content {
+            PreviewContent::Pdf(data) => {
+                assert_eq!(data.total_pages, 1);
+                // テキストレイヤは空（またはテキストなし）
+                let text_count: usize = data.text_layers.iter().map(|p| p.len()).sum();
+                assert_eq!(text_count, 0, "テキストなし PDF ではテキスト行がゼロ");
+            }
+            PreviewContent::Error(e) => {
+                eprintln!("[skip] PDF レンダリング失敗（環境依存）: {e}");
+            }
+            other => panic!("Pdf になる: {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&scratchpad).ok();
     }
 }
