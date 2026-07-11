@@ -521,3 +521,13 @@
   ⌘C コピー・ハイライト描画が Code/Markdown と同パス。テキストなし PDF 防御 + テスト 2 本
 - 関連: PR #125 squash merge（`ba0bc7a`）。build / clippy / fmt / test 全緑（354 passed）
 - 次: ユーザーによる GUI テキスト選択の実機確認（マウスドラッグ→⌘C→pbpaste）
+
+## 2026-07-11（#127: master の codex 対応 → merge + 実機反映）
+- プロファイル `master_agent`（claude / codex）で master / solo のエージェント CLI を選択可能に。
+  codex は developer_instructions で system prompt 注入 + `-c mcp_servers.tako.*` 一時注入
+  （env_vars で TAKO_* 引き継ぎ）。波及ガード（master≠claude の model/effort を claude worker へ
+  非継承）+ agy は master 非対応の明示エラー。CLI `--master-agent` / MCP master_agent で 1:1
+- 関連: PR #128 squash merge（`954330c`）。全緑（437 tests）+ 実 e2e（codex master 起動 →
+  /mcp で tako 全 53 ツール列挙）+ エッジ 3 種（gemini / agy master / agy solo が起動前エラー）
+- 次: tako 再起動で新バイナリ反映 → sol プロファイル作成（ユーザー）。codex への実プロンプト
+  送信検証は利用上限解除（7/11 20:40）後
