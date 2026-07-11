@@ -1966,10 +1966,7 @@ prompt_blocks:
                 launch.effort, None,
                 "{agent:?} に claude の effort を波及させない"
             );
-            assert!(
-                launch.skip_permissions,
-                "{agent:?} は既定で承認スキップ"
-            );
+            assert!(launch.skip_permissions, "{agent:?} は既定で承認スキップ");
         }
         // claude は既定で承認あり
         let launch_claude = p.resolve_agent_launch(WorkerAgent::Claude, None, None);
