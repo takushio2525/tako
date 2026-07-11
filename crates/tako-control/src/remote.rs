@@ -449,14 +449,28 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// デーモンを停止する（PID ファイルから kill）
+/// デーモンを停止する（PID ファイルから kill → 終了確認 → state クリーンアップ）。
+/// PID ファイルが無い場合はポート占有者を探して stale デーモンなら回収する
 pub fn daemon_stop() -> Result<Value, String> {
-    let pid = std::fs::read_to_string(pid_path())
-        .map_err(|_| "リモートサーバーが起動していない（PID ファイルが無い）".to_string())?;
-    let pid_num: u32 = pid
-        .trim()
-        .parse()
-        .map_err(|_| "PID ファイルの内容が不正".to_string())?;
+    let pid_num = match std::fs::read_to_string(pid_path()) {
+        Ok(s) => s
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| "PID ファイルの内容が不正".to_string())?,
+        Err(_) => {
+            // PID ファイルが無い → ポート占有者を探す
+            if let Some((occupant, is_tako)) = find_port_occupant(DEFAULT_PORT) {
+                if is_tako {
+                    eprintln!(
+                        "PID ファイルが消失していますが、stale デーモン（PID {occupant}）を検出。停止します…"
+                    );
+                    kill_stale_daemon(occupant);
+                    return Ok(json!({ "stopped": true, "stale_pid": occupant }));
+                }
+            }
+            return Err("リモートサーバーが起動していない（PID ファイルが無い）".to_string());
+        }
+    };
     if !is_process_alive(pid_num) {
         cleanup_state_files();
         return Err("リモートサーバーが起動していない（プロセスは既に終了）".to_string());
@@ -471,8 +485,22 @@ pub fn daemon_stop() -> Result<Value, String> {
     {
         return Err("Windows での停止は未実装".to_string());
     }
-    // PID ファイル削除（デーモン側でも削除するが、念のため）
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // プロセスの終了をポーリングで確認（最大 5 秒、超過時は SIGKILL）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if !is_process_alive(pid_num) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid_num as libc::pid_t, libc::SIGKILL);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     cleanup_state_files();
     Ok(json!({ "stopped": true }))
 }
@@ -482,10 +510,35 @@ pub fn daemon_stop() -> Result<Value, String> {
 /// stdout から起動情報 JSON を読み取って返す。
 /// `insecure = true` のときだけ平文 LAN 直モードを許可する（既定は暗号化トンネル必須。#104）
 pub fn spawn_daemon(port: Option<u16>, insecure: bool) -> Result<Value, String> {
+    let actual_port = port.unwrap_or(DEFAULT_PORT);
+
     // 既に起動中か確認
     let status = daemon_status();
     if status["running"].as_bool() == Some(true) {
         return Err("リモートサーバーは既に起動中".to_string());
+    }
+
+    // PID ファイルが無くてもポートが占有されている場合がある（state ファイル消失 + プロセス生存）
+    if let Some((occupant_pid, is_tako)) = find_port_occupant(actual_port) {
+        if is_tako {
+            eprintln!(
+                "stale な tako remote デーモン（PID {occupant_pid}）がポート {actual_port} を\
+                 保持しています。自動回収します…"
+            );
+            kill_stale_daemon(occupant_pid);
+            if find_port_occupant(actual_port).is_some() {
+                return Err(format!(
+                    "stale デーモン（PID {occupant_pid}）を kill しましたが、\
+                     ポート {actual_port} がまだ解放されません"
+                ));
+            }
+        } else {
+            return Err(format!(
+                "ポート {actual_port} は別のプロセス（PID {occupant_pid}）が使用中です。\
+                 `tako remote start --port <別のポート>` で別ポートを指定するか、\
+                 該当プロセスを停止してください"
+            ));
+        }
     }
 
     let tako_bin = crate::dispatch::resolve_tako_binary();
@@ -578,6 +631,69 @@ fn is_process_alive(pid: u32) -> bool {
         let _ = pid;
         false
     }
+}
+
+/// 指定ポートを LISTEN しているプロセスを探す。
+/// 返り値: `Some((pid, is_tako_remote))` — `is_tako_remote` は `tako remote serve` かどうか
+#[cfg(unix)]
+fn find_port_occupant(port: u16) -> Option<(u32, bool)> {
+    let output = Command::new("lsof")
+        .args(["-t", "-i", &format!(":{port}"), "-sTCP:LISTEN"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let pid: u32 = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .parse()
+        .ok()?;
+    let is_tako = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "args="])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .map(|o| {
+            let cmd = String::from_utf8_lossy(&o.stdout);
+            cmd.contains("tako") && cmd.contains("remote") && cmd.contains("serve")
+        })
+        .unwrap_or(false);
+    Some((pid, is_tako))
+}
+
+#[cfg(not(unix))]
+fn find_port_occupant(_port: u16) -> Option<(u32, bool)> {
+    None
+}
+
+/// stale なデーモンプロセスを kill し、終了を確認して state ファイルを掃除する。
+/// SIGTERM → 最大 5 秒ポーリング → 終了しなければ SIGKILL
+fn kill_stale_daemon(pid: u32) {
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if !is_process_alive(pid) {
+                cleanup_state_files();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+    cleanup_state_files();
 }
 
 // --- cloudflared Quick Tunnel ---
@@ -2432,6 +2548,30 @@ mod tests {
             mask_token_in_url("http://10.0.0.1:7749/"),
             "http://10.0.0.1:7749/"
         );
+    }
+
+    #[test]
+    fn find_port_occupantは未使用ポートでnoneを返す() {
+        // 存在しないであろう高番号ポート
+        assert!(find_port_occupant(59999).is_none());
+    }
+
+    #[test]
+    fn kill_stale_daemonは存在しないpidで安全に完了する() {
+        // is_process_alive が false なので即 cleanup_state_files して return
+        kill_stale_daemon(999_999_999);
+    }
+
+    #[test]
+    fn daemon_statusはpidファイルが無ければnot_running() {
+        // state_dir をテンポラリに差し替えて検証
+        let dir = std::env::temp_dir().join(format!("tako-test-remote-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
+        let status = daemon_status();
+        assert_eq!(status["running"], json!(false));
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
