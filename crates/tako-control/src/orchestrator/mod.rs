@@ -930,9 +930,9 @@ pub fn build_master_cmd(
                 agent::sh_quote(&profile.effort)
             ));
             // MCP ツール呼び出し・コマンド実行の承認をスキップ（#132）。
-            // codex の approval_policy は MCP tool call にも適用される（mcp_tool_call.rs）。
-            // サンドボックスは維持し、承認ダイアログだけを抑止する
-            cmd.push_str(" -a never");
+            // `-a never` はコマンド承認のみでMCPツール承認はバイパスしない（実測）。
+            // `--dangerously-bypass-approvals-and-sandbox` は両方バイパスする
+            cmd.push_str(" --dangerously-bypass-approvals-and-sandbox");
             // MCP 接続は起動時の -c 一時注入（~/.codex/config.toml を汚さず、
             // tako 外で起動した codex にツールを公開しない = FR-2.3.2 と同方針）
             cmd.push_str(&format!(
@@ -1671,7 +1671,7 @@ prompt_blocks:
             "TAKO_ORCHESTRATOR_ROLE='master:sol' codex \
              --model gpt-5.6-sol \
              -c model_reasoning_effort=xhigh \
-             -a never \
+             --dangerously-bypass-approvals-and-sandbox \
              -c 'mcp_servers.tako.command=\"/usr/local/bin/tako\"' \
              -c 'mcp_servers.tako.args=[\"mcp\",\"serve\"]' \
              -c 'mcp_servers.tako.env_vars=[\"TAKO_SOCKET\",\"TAKO_TOKEN\",\"TAKO_PANE_ID\",\"TAKO_TAB_ID\",\"TAKO_ORCHESTRATOR_ROLE\"]' \
@@ -1822,7 +1822,10 @@ prompt_blocks:
         let cmd = build_master_cmd("solo", &p, Path::new("/tmp/solo.md"), "tako").unwrap();
         assert!(cmd.starts_with("TAKO_ORCHESTRATOR_ROLE='solo' codex "));
         assert!(cmd.contains("-c model_reasoning_effort=high"));
-        assert!(cmd.contains("-a never"), "codex master/solo は承認スキップ");
+        assert!(
+            cmd.contains("--dangerously-bypass-approvals-and-sandbox"),
+            "codex master/solo は承認スキップ"
+        );
         assert!(cmd.contains("mcp_servers.tako.command"));
     }
 
