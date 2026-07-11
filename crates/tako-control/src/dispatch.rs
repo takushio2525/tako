@@ -99,7 +99,29 @@ pub trait ControlHost {
         None
     }
     /// ペインをプレビューペインにする / 表示内容を差し替える（読み込みは実装側の責務）
-    fn set_preview(&mut self, _pane: PaneId, _path: &str, _mode: crate::protocol::PreviewModeWire) {
+    fn set_preview(
+        &mut self,
+        _pane: PaneId,
+        _path: &str,
+        _mode: crate::protocol::PreviewModeWire,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    /// プレビュー編集状態（editing, dirty）。編集セッション未開始なら (false, false)。
+    fn preview_edit_state(&self, _pane: PaneId) -> Option<(bool, bool)> {
+        None
+    }
+    /// 編集モード切替。開始時のファイル読み込み・UTF-8 検査は実装側が core API で行う。
+    fn set_preview_editing(&mut self, _pane: PaneId, _enabled: bool) -> Result<(), String> {
+        Err("プレビュー編集は未対応".into())
+    }
+    /// 編集バッファの全文置換。
+    fn apply_preview_text(&mut self, _pane: PaneId, _text: String) -> Result<(), String> {
+        Err("プレビュー編集は未対応".into())
+    }
+    /// 編集バッファを保存。外部変更検知を含む保存セマンティクスは core API が担う。
+    fn save_preview(&mut self, _pane: PaneId) -> Result<(), String> {
+        Err("プレビュー編集は未対応".into())
     }
     /// タブ内の既存プレビューペイン（OpenFile の再利用先。VSCode のプレビュータブ相当）
     fn preview_pane_of_tab(&self, _tab: TabId) -> Option<PaneId> {
@@ -1103,7 +1125,8 @@ fn dispatch_inner(
                 (new_id, true)
             };
             let path_str = resolved.display().to_string();
-            host.set_preview(view_pane, &path_str, mode);
+            host.set_preview(view_pane, &path_str, mode)
+                .map_err(DispatchError::Operation)?;
             // 開いたものへフォーカスを移す（タブ切替はしない。見せる導線は Focus / FR-2.7）
             tree_mut(host.workspace_mut(), tab)
                 .focus(view_pane)
@@ -1113,6 +1136,48 @@ fn dispatch_inner(
                 "path": path_str,
                 "mode": mode.as_str(),
                 "created": created,
+            }))
+        }
+        Request::PreviewEdit { pane, enabled } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            if host.preview_state(target).is_none() {
+                return Err(DispatchError::Operation(format!(
+                    "プレビューペインではない: {}",
+                    target.as_u64()
+                )));
+            }
+            if let Some(enabled) = enabled {
+                host.set_preview_editing(target, enabled)
+                    .map_err(DispatchError::Operation)?;
+            }
+            let (editing, dirty) = host.preview_edit_state(target).unwrap_or((false, false));
+            Ok(json!({
+                "pane": target.as_u64(),
+                "editing": editing,
+                "dirty": dirty,
+            }))
+        }
+        Request::PreviewApply { pane, text } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            host.apply_preview_text(target, text)
+                .map_err(DispatchError::Operation)?;
+            let (editing, dirty) = host.preview_edit_state(target).unwrap_or((false, false));
+            Ok(json!({
+                "pane": target.as_u64(),
+                "editing": editing,
+                "dirty": dirty,
+            }))
+        }
+        Request::PreviewSave { pane } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            host.save_preview(target)
+                .map_err(DispatchError::Operation)?;
+            let (editing, dirty) = host.preview_edit_state(target).unwrap_or((false, false));
+            Ok(json!({
+                "pane": target.as_u64(),
+                "editing": editing,
+                "dirty": dirty,
+                "saved": true,
             }))
         }
         Request::FileOp {
@@ -2627,10 +2692,16 @@ fn list_json(host: &dyn ControlHost) -> Value {
                             "alt_screen": s.is_alt_screen(),
                         })),
                         // プレビューペイン（FR-3.2 / FR-3.3）。ターミナルペインでは null
-                        "preview": host.preview_state(p.id()).map(|(path, mode)| json!({
-                            "path": path,
-                            "mode": mode.as_str(),
-                        })),
+                        "preview": host.preview_state(p.id()).map(|(path, mode)| {
+                            let (editing, dirty) =
+                                host.preview_edit_state(p.id()).unwrap_or((false, false));
+                            json!({
+                                "path": path,
+                                "mode": mode.as_str(),
+                                "editing": editing,
+                                "dirty": dirty,
+                            })
+                        }),
                         "backend_windows": host.backend_windows(p.id()).map(|ws| ws.iter().map(|w| json!({
                             "index": w.index,
                             "name": w.name,
@@ -2899,6 +2970,7 @@ mod tests {
         attached: Vec<u64>,
         detached: Vec<u64>,
         previews: std::collections::HashMap<u64, (String, PreviewModeWire)>,
+        preview_edits: std::collections::HashMap<u64, (bool, bool, String)>,
         collapsed: std::collections::HashSet<u64>,
         /// ピン留め: (group, id)
         pins: Vec<(bool, u64)>,
@@ -2911,6 +2983,7 @@ mod tests {
                 attached: Vec::new(),
                 detached: Vec::new(),
                 previews: std::collections::HashMap::new(),
+                preview_edits: std::collections::HashMap::new(),
                 collapsed: std::collections::HashSet::new(),
                 pins: Vec::new(),
             }
@@ -2949,12 +3022,62 @@ mod tests {
         fn detach_session(&mut self, pane: PaneId) {
             self.detached.push(pane.as_u64());
             self.previews.remove(&pane.as_u64());
+            self.preview_edits.remove(&pane.as_u64());
         }
         fn preview_state(&self, pane: PaneId) -> Option<(String, PreviewModeWire)> {
             self.previews.get(&pane.as_u64()).cloned()
         }
-        fn set_preview(&mut self, pane: PaneId, path: &str, mode: PreviewModeWire) {
+        fn set_preview(
+            &mut self,
+            pane: PaneId,
+            path: &str,
+            mode: PreviewModeWire,
+        ) -> Result<(), String> {
+            if self
+                .preview_edits
+                .get(&pane.as_u64())
+                .is_some_and(|(_, dirty, _)| *dirty)
+            {
+                return Err("未保存の変更があるため別ファイルを開けない".into());
+            }
             self.previews.insert(pane.as_u64(), (path.into(), mode));
+            self.preview_edits.remove(&pane.as_u64());
+            Ok(())
+        }
+        fn preview_edit_state(&self, pane: PaneId) -> Option<(bool, bool)> {
+            self.previews.get(&pane.as_u64())?;
+            Some(
+                self.preview_edits
+                    .get(&pane.as_u64())
+                    .map(|(editing, dirty, _)| (*editing, *dirty))
+                    .unwrap_or((false, false)),
+            )
+        }
+        fn set_preview_editing(&mut self, pane: PaneId, enabled: bool) -> Result<(), String> {
+            if !self.previews.contains_key(&pane.as_u64()) {
+                return Err("プレビューペインではない".into());
+            }
+            let edit =
+                self.preview_edits
+                    .entry(pane.as_u64())
+                    .or_insert((false, false, String::new()));
+            edit.0 = enabled;
+            Ok(())
+        }
+        fn apply_preview_text(&mut self, pane: PaneId, text: String) -> Result<(), String> {
+            self.set_preview_editing(pane, true)?;
+            let edit = self.preview_edits.get_mut(&pane.as_u64()).unwrap();
+            edit.1 = true;
+            edit.2 = text;
+            Ok(())
+        }
+        fn save_preview(&mut self, pane: PaneId) -> Result<(), String> {
+            let edit = self
+                .preview_edits
+                .get_mut(&pane.as_u64())
+                .ok_or_else(|| "編集セッションがない".to_string())?;
+            edit.1 = false;
+            Ok(())
         }
         fn preview_pane_of_tab(&self, tab: TabId) -> Option<PaneId> {
             self.ws
@@ -3834,6 +3957,88 @@ mod tests {
         assert_eq!(host.ws.active_tab().tree().len(), 3);
         assert!(host.attached.is_empty(), "プレビューは PTY を起動しない");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preview編集の開始適用保存を同じdispatchで操作できる() {
+        let dir =
+            std::env::temp_dir().join(format!("tako-dispatch-preview-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("a.rs");
+        let second = dir.join("b.rs");
+        std::fs::write(&first, "before").unwrap();
+        std::fs::write(&second, "second").unwrap();
+
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let opened = dispatch(
+            &mut host,
+            Request::OpenFile {
+                pane: Some(root),
+                path: first.display().to_string(),
+                mode: Some(PreviewModeWire::Code),
+                direction: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let pane = opened["pane"].as_u64().unwrap();
+        let started = dispatch(
+            &mut host,
+            Request::PreviewEdit {
+                pane: Some(pane),
+                enabled: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(started["editing"].as_bool(), Some(true));
+        assert_eq!(started["dirty"].as_bool(), Some(false));
+
+        let applied = dispatch(
+            &mut host,
+            Request::PreviewApply {
+                pane: Some(pane),
+                text: "日本語\n".into(),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(applied["dirty"].as_bool(), Some(true));
+        let blocked = dispatch(
+            &mut host,
+            Request::OpenFile {
+                pane: Some(pane),
+                path: second.display().to_string(),
+                mode: None,
+                direction: None,
+            },
+            PaneOrigin::User,
+        );
+        assert!(
+            blocked.is_err(),
+            "未保存変更があるペインの差し替えを拒否する"
+        );
+
+        let saved = dispatch(
+            &mut host,
+            Request::PreviewSave { pane: Some(pane) },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(saved["saved"].as_bool(), Some(true));
+        assert_eq!(saved["dirty"].as_bool(), Some(false));
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        let preview = list["tabs"][0]["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"].as_u64() == Some(pane))
+            .unwrap();
+        assert_eq!(preview["preview"]["editing"].as_bool(), Some(true));
+        assert_eq!(preview["preview"]["dirty"].as_bool(), Some(false));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

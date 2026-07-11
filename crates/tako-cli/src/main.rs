@@ -66,6 +66,9 @@ enum Command {
     /// ファイルをプレビューペインで開く（コード = ハイライト表示、
     /// .md は既定でレンダリング表示。--mode code でソース表示へ切替）
     Open(OpenArgs),
+    /// コードプレビューの軽量編集（開始 / 全文適用 / 保存）
+    #[command(subcommand)]
+    Edit(EditCommand),
     /// タブ操作（new / rename / select / move-pane）
     #[command(subcommand)]
     Tab(TabCommand),
@@ -381,6 +384,36 @@ enum FileCommand {
     Mkdir { path: String, name: String },
     /// ファイル・フォルダをゴミ箱へ移動する
     Trash { path: String },
+}
+
+#[derive(Subcommand)]
+enum EditCommand {
+    /// 編集モードを開始する
+    Start {
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// 編集モードを終了する（未保存バッファは保持）
+    Stop {
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// 編集状態（editing / dirty）を取得する
+    Status {
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// 編集バッファの全文を置き換える（保存はしない）
+    Apply {
+        text: String,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// 編集バッファをファイルへ保存する
+    Save {
+        #[arg(long)]
+        pane: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1802,6 +1835,27 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 },
             }
         }
+        Command::Edit(command) => match command {
+            EditCommand::Start { pane } => Request::PreviewEdit {
+                pane: target_pane(*pane)?,
+                enabled: Some(true),
+            },
+            EditCommand::Stop { pane } => Request::PreviewEdit {
+                pane: target_pane(*pane)?,
+                enabled: Some(false),
+            },
+            EditCommand::Status { pane } => Request::PreviewEdit {
+                pane: target_pane(*pane)?,
+                enabled: None,
+            },
+            EditCommand::Apply { text, pane } => Request::PreviewApply {
+                pane: target_pane(*pane)?,
+                text: text.clone(),
+            },
+            EditCommand::Save { pane } => Request::PreviewSave {
+                pane: target_pane(*pane)?,
+            },
+        },
         Command::Tab(TabCommand::New { title }) => Request::TabNew {
             title: title.clone(),
         },
@@ -2231,7 +2285,7 @@ fn print_result(command: &Command, result: &Value) {
             println!("{}", pretty_json(result));
         }
         Command::Tab(TabCommand::New { .. }) => println!("{result}"),
-        Command::Open(_) => println!("{result}"),
+        Command::Open(_) | Command::Edit(_) => println!("{result}"),
         Command::Autorename(_)
         | Command::Portdetect(_)
         | Command::Persist(_)
@@ -2551,6 +2605,31 @@ mod tests {
             panic!("OpenFile になる");
         };
         assert_eq!(direction, Some(Direction::Down));
+    }
+
+    #[test]
+    fn editサブコマンドを3操作へ写す() {
+        let command = parse(&["tako", "edit", "start", "--pane", "5"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewEdit {
+                pane: Some(5),
+                enabled: Some(true),
+            }
+        );
+        let command = parse(&["tako", "edit", "apply", "日本語\n", "--pane", "5"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewApply {
+                pane: Some(5),
+                text: "日本語\n".into(),
+            }
+        );
+        let command = parse(&["tako", "edit", "save", "--pane", "5"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewSave { pane: Some(5) }
+        );
     }
 
     #[test]

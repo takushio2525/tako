@@ -4,42 +4,32 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-11・#127 master codex 対応 merge 済み）
+## 現在の対象（2026-07-12・#126 コードプレビュー編集）
 
-#127 オーケストレーション master の codex 対応が完了
-（PR #128 squash merge `954330c` + build-app.sh --install 済み）。
+FR-3.5 コードプレビューの軽量編集を実装。テキスト／コードファイルをその場で編集し、
+dirty 表示と ⌘S 保存、外部変更競合の拒否に対応する。
 
-- プロファイル `master_agent: codex` + model / effort（ネイティブ表記）で codex master / solo を起動
-- system prompt は `-c developer_instructions="$(cat …)"`、MCP は `-c mcp_servers.tako.*` 一時注入
-  （env_vars で TAKO_* を stdio ブリッジへ引き継ぎ。config.toml は汚さない）
-- 波及ガード: master_agent≠claude のとき model / effort を claude worker へ継承しない
-- agy は master 非対応（明示エラー。worker のみ）
-- 実 e2e 済み: codex master 起動 → /mcp で tako 全 53 ツール列挙を確認
+- core: UTF-8 安全な `TextBuffer`（入力・削除・改行・選択・カーソル移動・保存）
+- control: `PreviewEdit` / `PreviewApply` / `PreviewSave`
+- CLI: `tako edit start|status|apply|save|stop`
+- MCP: `tako_preview_edit` / `tako_preview_apply` / `tako_preview_save`（計 56 ツール）
+- UI: 編集切替、キャレット、dirty「●」、保存ボタン、IME 振り分け
+- 安全制限: 非テキスト・非 UTF-8・バイナリ・末尾省略ファイルは編集不可
 
-## 残作業・既知の制約
+## 直近の観点
 
-- **ユーザーの sol プロファイル作成は未実施**（機能のみ提供。`tako orchestrator profiles set sol
-  --master-agent codex --model gpt-5.6-sol --effort xhigh` + worker 設定で作れる）
-- codex master への実プロンプト送信（MCP ツール実呼び出し）は codex 利用上限（7/11 20:40 解除）
-  のため未検証。ツール列挙まで実証済み
-- GUI テキスト選択（#124）の実機検証が未了（ユーザーによるマウスドラッグ操作が必要）
-- セルフテストの既知失敗は PDF（項目 70、CoreGraphics 環境依存）のみ
-- CI（GitHub Actions）は 6/12 以降停止中（無料枠逼迫）。品質保証はローカル全緑で代替
+- 保存時は編集開始時の元バイト列と現ファイルを比較し、外部変更なら上書きしない
+- Unix は一時ファイル + rename、Windows は比較後の truncate + sync（原子性差を仕様化）
+- PDF #124 の `preview_line_bounds` / `preview_line_texts` と選択分岐は維持
+- GUI の実 IME・マウス操作は実 .app で手動確認する
+- CI は停止中。ローカル build / test / fmt / clippy を品質ゲートにする
 
-## 未着手タスク（優先順はユーザーと相談）
+## 次の一手
 
-- [ ] **#115 GitLog / GitDiff dispatch の background 化**
-- [ ] **#116 tako-coretest-* ソケット残骸の掃除・再発防止**
-- [ ] **#112 セッション会話ログの管理と復元**
-- [ ] **Phase 5 続き**: FR-3.5 軽い編集
-- [ ] **FR-2.19 localhost ポートパネル**
-- [ ] **FR-2.18 未表示の子の自動サーフェス**
-- [ ] **FR-2.14 MCP ゼロコンフィグオンボーディング**（配布前必須）
+- FR-3.5 の実機常用フィードバックを反映
+- Phase 5 の次候補は FR-3.8 Web ビューまたは FR-2.19 localhost ポートパネル
 
 ## 現フェーズで Read すべき設計書
 
-- solo / オーケストレーター修正時: `.agent/orchestrator.md`（master_agent の設計は
-  「master のエージェント種別」節 + `crates/tako-control/src/orchestrator/mod.rs` の build_master_cmd）
-- PDF プレビュー修正時: `crates/tako-app/src/preview.rs` の `pdf_render` モジュール + `preview_render.rs` の PDF body 生成
-- ターミナル描画修正時: `crates/tako-app/src/main.rs` の `chunk_line_chars` / `terminal_screen_lines` 周辺
-- リモート API 修正時: `crates/tako-control/src/remote.rs` モジュールコメント
+- プレビュー編集: `.agent/requirements.md` FR-3.5、`.agent/architecture.md`「コンセプト②の実現」
+- UI 手動確認: `.agent/manual-checks.md`「コードプレビュー軽量編集」

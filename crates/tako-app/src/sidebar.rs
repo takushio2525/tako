@@ -778,6 +778,19 @@ impl TakoApp {
     /// 同じ状態は dispatch（OpenFile の mode 指定）= CLI / MCP からも切り替えられる。
     /// Image / Pdf モードではトグルしない
     pub(crate) fn toggle_preview_mode(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        if self
+            .preview_edits
+            .get(&pane_id)
+            .is_some_and(preview::EditState::dirty)
+        {
+            if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
+                edit.message =
+                    Some("未保存の変更を保存してから表示モードを切り替えてください".into());
+            }
+            cx.notify();
+            return;
+        }
+        self.preview_edits.remove(&pane_id);
         let Some(state) = self.previews.get(&pane_id) else {
             return;
         };

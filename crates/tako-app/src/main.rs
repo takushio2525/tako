@@ -430,6 +430,11 @@ fn utf16_len(text: &str) -> usize {
     text.chars().map(char::len_utf16).sum()
 }
 
+fn byte_to_utf16_offset(text: &str, byte_offset: usize) -> usize {
+    let offset = snap_to_char_boundary(text, byte_offset.min(text.len()));
+    text[..offset].chars().map(char::len_utf16).sum()
+}
+
 struct TakoApp {
     workspace: Workspace,
     terminals: HashMap<PaneId, TerminalSession>,
@@ -494,6 +499,8 @@ struct TakoApp {
     /// プレビューペイン（FR-3.2 / FR-3.3）。キーに居るペインはターミナルではなく
     /// ファイル内容（コードハイライト / Markdown レンダリング）を描画する
     previews: HashMap<PaneId, preview::PreviewState>,
+    /// コードプレビューの編集セッション。未保存バッファは表示モードを OFF にしても保持する。
+    preview_edits: HashMap<PaneId, preview::EditState>,
     /// タブ・ペイン名の AI 自動リネームの検知状態（FR-2.12。ループは new で張る）
     autorename: autorename::AutoRenamer,
     /// listen ポート検知 + 提案チップの有効状態（FR-2.4.4。dispatch から切替）
@@ -1199,6 +1206,7 @@ impl TakoApp {
             inline_edit: None,
             filetree: filetree::FileTree::default(),
             previews: HashMap::new(),
+            preview_edits: HashMap::new(),
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
             port_detect: initial_port_detect(),
             port_suggestions: Vec::new(),
@@ -2931,6 +2939,7 @@ impl TakoApp {
             Ok(_) => {
                 self.terminals.remove(&pane_id);
                 self.previews.remove(&pane_id);
+                self.preview_edits.remove(&pane_id);
                 self.video_players.remove(&pane_id);
                 self.video_frame_cache.remove(&pane_id);
                 self.video_seek_bar_bounds.remove(&pane_id);
@@ -2966,6 +2975,7 @@ impl TakoApp {
                 for id in pane_ids {
                     self.terminals.remove(&id);
                     self.previews.remove(&id);
+                    self.preview_edits.remove(&id);
                     self.video_players.remove(&id);
                     self.video_frame_cache.remove(&id);
                     self.video_seek_bar_bounds.remove(&id);
@@ -3202,6 +3212,14 @@ impl TakoApp {
 
     fn select_all_preview(&mut self, cx: &mut Context<Self>) {
         let pane_id = self.focused_pane();
+        if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
+            if edit.editing {
+                edit.buffer.select_all();
+                self.sync_preview_selection_from_editor(pane_id);
+                cx.notify();
+                return;
+            }
+        }
         if !self.previews.contains_key(&pane_id) {
             return;
         }
@@ -3295,11 +3313,193 @@ impl TakoApp {
         texts.last().map(|last| (texts.len() - 1, last.len()))
     }
 
+    fn refresh_preview_from_editor(&mut self, pane_id: PaneId) {
+        let (previews, edits) = (&mut self.previews, &self.preview_edits);
+        if let (Some(state), Some(edit)) = (previews.get_mut(&pane_id), edits.get(&pane_id)) {
+            preview::apply_editor_text(state, edit);
+        }
+        self.sync_preview_selection_from_editor(pane_id);
+    }
+
+    fn sync_preview_selection_from_editor(&mut self, pane_id: PaneId) {
+        let Some(edit) = self.preview_edits.get(&pane_id) else {
+            return;
+        };
+        let anchor = edit.buffer.anchor().unwrap_or(edit.buffer.cursor());
+        let head = edit.buffer.cursor();
+        self.preview_selections.insert(
+            pane_id,
+            PreviewSelection {
+                anchor: edit.buffer.line_byte_col(anchor),
+                head: edit.buffer.line_byte_col(head),
+            },
+        );
+    }
+
+    fn sync_editor_selection_from_preview(&mut self, pane_id: PaneId) {
+        let Some(selection) = self.preview_selections.get(&pane_id).cloned() else {
+            return;
+        };
+        let Some(edit) = self.preview_edits.get_mut(&pane_id) else {
+            return;
+        };
+        let anchor = edit
+            .buffer
+            .offset_for_line_byte_col(selection.anchor.0, selection.anchor.1);
+        let head = edit
+            .buffer
+            .offset_for_line_byte_col(selection.head.0, selection.head.1);
+        edit.buffer.set_cursor(anchor, false);
+        edit.buffer.set_cursor(head, true);
+    }
+
+    fn set_preview_editing_local(&mut self, pane_id: PaneId, enabled: bool) -> Result<(), String> {
+        if !self.previews.contains_key(&pane_id) {
+            return Err("プレビューペインではない".into());
+        }
+        if enabled && !self.preview_edits.contains_key(&pane_id) {
+            let state = self.previews.get(&pane_id).expect("上で確認済み");
+            self.preview_edits
+                .insert(pane_id, preview::EditState::open(state)?);
+        }
+        if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
+            edit.editing = enabled;
+            edit.message = None;
+        }
+        if enabled {
+            self.refresh_preview_from_editor(pane_id);
+        } else if self
+            .preview_edits
+            .get(&pane_id)
+            .is_some_and(|edit| !edit.dirty())
+        {
+            self.preview_edits.remove(&pane_id);
+        }
+        Ok(())
+    }
+
+    fn apply_preview_text_local(&mut self, pane_id: PaneId, text: String) -> Result<(), String> {
+        self.set_preview_editing_local(pane_id, true)?;
+        let edit = self.preview_edits.get_mut(&pane_id).expect("編集開始済み");
+        edit.buffer.set_text(text);
+        edit.message = None;
+        self.refresh_preview_from_editor(pane_id);
+        Ok(())
+    }
+
+    fn save_preview_local(&mut self, pane_id: PaneId) -> Result<(), String> {
+        let edit = self
+            .preview_edits
+            .get_mut(&pane_id)
+            .ok_or_else(|| "編集モードを開始していない".to_string())?;
+        match edit.buffer.save() {
+            Ok(()) => {
+                edit.message = Some("保存しました".into());
+                self.refresh_preview_from_editor(pane_id);
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                edit.message = Some(message.clone());
+                Err(message)
+            }
+        }
+    }
+
+    fn save_focused_preview(&mut self, cx: &mut Context<Self>) {
+        let pane_id = self.focused_pane();
+        let _ = self.save_preview_local(pane_id);
+        cx.notify();
+    }
+
+    fn handle_preview_edit_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+        use tako_core::CursorMovement;
+
+        let pane_id = self.focused_pane();
+        if !self
+            .preview_edits
+            .get(&pane_id)
+            .is_some_and(|edit| edit.editing)
+        {
+            return false;
+        }
+        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+            return false;
+        }
+        if keystroke.key == "escape" {
+            let _ = self.set_preview_editing_local(pane_id, false);
+            cx.notify();
+            return true;
+        }
+        self.sync_editor_selection_from_preview(pane_id);
+        let shift = keystroke.modifiers.shift;
+        let Some(edit) = self.preview_edits.get_mut(&pane_id) else {
+            return false;
+        };
+        let handled = match keystroke.key.as_str() {
+            "backspace" => {
+                edit.buffer.delete_backward();
+                true
+            }
+            "delete" => {
+                edit.buffer.delete_forward();
+                true
+            }
+            "enter" => {
+                edit.buffer.newline();
+                true
+            }
+            "left" => {
+                edit.buffer.move_cursor(CursorMovement::Left, shift);
+                true
+            }
+            "right" => {
+                edit.buffer.move_cursor(CursorMovement::Right, shift);
+                true
+            }
+            "up" => {
+                edit.buffer.move_cursor(CursorMovement::Up, shift);
+                true
+            }
+            "down" => {
+                edit.buffer.move_cursor(CursorMovement::Down, shift);
+                true
+            }
+            "home" => {
+                edit.buffer.move_cursor(CursorMovement::LineStart, shift);
+                true
+            }
+            "end" => {
+                edit.buffer.move_cursor(CursorMovement::LineEnd, shift);
+                true
+            }
+            _ => false,
+        };
+        if handled {
+            edit.message = None;
+            self.refresh_preview_from_editor(pane_id);
+            cx.notify();
+        }
+        handled
+    }
+
     fn paste(&mut self, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
-        if let Some(session) = self.focused_session() {
+        let pane_id = self.focused_pane();
+        if self
+            .preview_edits
+            .get(&pane_id)
+            .is_some_and(|edit| edit.editing)
+        {
+            self.sync_editor_selection_from_preview(pane_id);
+            if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
+                edit.buffer.insert(&text);
+                edit.message = None;
+            }
+            self.refresh_preview_from_editor(pane_id);
+        } else if let Some(session) = self.focused_session() {
             session.paste(&text);
         }
         cx.notify();
@@ -3310,6 +3510,11 @@ impl TakoApp {
     fn handle_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
         if self.inline_edit.is_some() {
             self.handle_inline_edit_key(keystroke, cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.handle_preview_edit_key(keystroke, cx) {
             cx.stop_propagation();
             return;
         }
@@ -3401,6 +3606,15 @@ impl TakoApp {
     /// 線形換算だと打ち進めるほど IME 候補ウィンドウ・未確定文字列が右へずれていく
     /// （2026-06-12 実機リグレッション (5) の根本原因）
     fn pane_cursor_origin(&self, pane: PaneId, _window: &mut Window) -> Option<Point<Pixels>> {
+        if let Some(edit) = self.preview_edits.get(&pane).filter(|edit| edit.editing) {
+            let (line, byte_col) = edit.buffer.line_byte_col(edit.buffer.cursor());
+            let bounds = *self.preview_line_bounds.get(&pane)?.get(line)?;
+            let text = self.preview_line_texts.get(&pane)?.get(line)?;
+            let byte_col = snap_to_char_boundary(text, byte_col.min(text.len()));
+            let char_col = text[..byte_col].chars().count() as f32;
+            let cell = self.cell_size.unwrap_or(size(px(8.0), px(16.0)));
+            return Some(point(bounds.left() + cell.width * char_col, bounds.top()));
+        }
         let (_, area) = self.pane_text_areas.iter().find(|(id, _)| *id == pane)?;
         let cell = self.cell_size_for_pane(pane)?;
         let screen = self.terminals.get(&pane)?.screen(&self.theme);
@@ -4015,8 +4229,9 @@ impl TakoApp {
             if let Some(pos) = self.preview_hit_test(pid, event.position) {
                 if let Some(sel) = self.preview_selections.get_mut(&pid) {
                     sel.head = pos;
-                    cx.notify();
                 }
+                self.sync_editor_selection_from_preview(pid);
+                cx.notify();
             }
             return;
         }
@@ -5498,6 +5713,7 @@ impl ControlHost for TakoApp {
     fn detach_session(&mut self, pane: PaneId) {
         self.terminals.remove(&pane);
         self.previews.remove(&pane);
+        self.preview_edits.remove(&pane);
         self.webviews.remove(&pane);
         self.scroll_accum.remove(&pane);
         self.scroll_ctls.remove(&pane);
@@ -5762,14 +5978,50 @@ impl ControlHost for TakoApp {
         pane: PaneId,
         path: &str,
         mode: tako_control::protocol::PreviewModeWire,
-    ) {
+    ) -> Result<(), String> {
+        if self
+            .preview_edits
+            .get(&pane)
+            .is_some_and(preview::EditState::dirty)
+        {
+            let message = "未保存の変更があるため別ファイルを開けない（先に保存してください）";
+            if let Some(edit) = self.preview_edits.get_mut(&pane) {
+                edit.message = Some(message.into());
+            }
+            return Err(message.into());
+        }
         let path = std::path::Path::new(path);
         let (state, raw) = preview::load_fast(path, preview::PreviewMode::from_wire(mode));
         if let Some(text) = raw {
             self.pending_highlights
                 .push((pane, path.to_path_buf(), text));
         }
+        self.preview_edits.remove(&pane);
+        self.preview_selections.remove(&pane);
         self.previews.insert(pane, state);
+        Ok(())
+    }
+
+    fn preview_edit_state(&self, pane: PaneId) -> Option<(bool, bool)> {
+        self.previews.get(&pane)?;
+        Some(
+            self.preview_edits
+                .get(&pane)
+                .map(|edit| (edit.editing, edit.dirty()))
+                .unwrap_or((false, false)),
+        )
+    }
+
+    fn set_preview_editing(&mut self, pane: PaneId, enabled: bool) -> Result<(), String> {
+        self.set_preview_editing_local(pane, enabled)
+    }
+
+    fn apply_preview_text(&mut self, pane: PaneId, text: String) -> Result<(), String> {
+        self.apply_preview_text_local(pane, text)
+    }
+
+    fn save_preview(&mut self, pane: PaneId) -> Result<(), String> {
+        self.save_preview_local(pane)
     }
 
     fn preview_pane_of_tab(&self, tab: TabId) -> Option<PaneId> {
@@ -5869,6 +6121,14 @@ impl EntityInputHandler for TakoApp {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
+        if self.ime.is_none() {
+            let pane = self.ime_target();
+            if let Some(edit) = self.preview_edits.get(&pane).filter(|edit| edit.editing) {
+                let start = utf16_to_byte_offset(edit.buffer.text(), range_utf16.start);
+                let end = utf16_to_byte_offset(edit.buffer.text(), range_utf16.end);
+                return edit.buffer.text().get(start..end).map(str::to_string);
+            }
+        }
         let ime = self.ime.as_ref()?;
         let start = utf16_to_byte_offset(&ime.text, range_utf16.start);
         let end = utf16_to_byte_offset(&ime.text, range_utf16.end);
@@ -5881,6 +6141,20 @@ impl EntityInputHandler for TakoApp {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        let pane = self.ime_target();
+        if self.ime.is_none() {
+            if let Some(edit) = self.preview_edits.get(&pane).filter(|edit| edit.editing) {
+                let range = edit
+                    .buffer
+                    .selection()
+                    .unwrap_or_else(|| edit.buffer.cursor()..edit.buffer.cursor());
+                return Some(UTF16Selection {
+                    range: byte_to_utf16_offset(edit.buffer.text(), range.start)
+                        ..byte_to_utf16_offset(edit.buffer.text(), range.end),
+                    reversed: false,
+                });
+            }
+        }
         // 変換中は IME の注目文節（無ければ末尾キャレット）、非変換中は空ドキュメントの先頭
         let range = match self.ime.as_ref() {
             Some(ime) => ime.selected_utf16.clone().unwrap_or_else(|| {
@@ -5906,7 +6180,15 @@ impl EntityInputHandler for TakoApp {
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         // NSTextInputClient の規約: unmark は「未確定文字列をそのまま挿入扱いにする」
         if let Some(ime) = self.ime.take() {
-            if let Some(session) = self.terminals.get(&ime.pane) {
+            if let Some(edit) = self
+                .preview_edits
+                .get_mut(&ime.pane)
+                .filter(|edit| edit.editing)
+            {
+                edit.buffer.insert(&ime.text);
+                edit.message = None;
+                self.refresh_preview_from_editor(ime.pane);
+            } else if let Some(session) = self.terminals.get(&ime.pane) {
                 session.write(ime.text.into_bytes());
             }
         }
@@ -5927,6 +6209,29 @@ impl EntityInputHandler for TakoApp {
                 edit.cursor += text.len();
             }
             self.ime = None;
+            cx.notify();
+            return;
+        }
+        let pane = self
+            .ime
+            .as_ref()
+            .map(|ime| ime.pane)
+            .unwrap_or_else(|| self.focused_pane());
+        if let Some(edit) = self
+            .preview_edits
+            .get_mut(&pane)
+            .filter(|edit| edit.editing)
+        {
+            if let Some(range_utf16) = _range_utf16 {
+                let start = utf16_to_byte_offset(edit.buffer.text(), range_utf16.start);
+                let end = utf16_to_byte_offset(edit.buffer.text(), range_utf16.end);
+                edit.buffer.set_cursor(start, false);
+                edit.buffer.set_cursor(end, true);
+            }
+            edit.buffer.insert(text);
+            edit.message = None;
+            self.ime = None;
+            self.refresh_preview_from_editor(pane);
             cx.notify();
             return;
         }
@@ -6337,6 +6642,7 @@ impl Render for TakoApp {
             }))
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.copy_selection(cx)))
             .on_action(cx.listener(|this, _: &PasteClipboard, _, cx| this.paste(cx)))
+            .on_action(cx.listener(|this, _: &SavePreview, _, cx| this.save_focused_preview(cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.toggle_filetree();
                 cx.notify();
@@ -6590,6 +6896,8 @@ fn app_menus() -> Vec<gpui::Menu> {
             MenuItem::separator(),
             MenuItem::action("Open Directory…", OpenDirectory),
             MenuItem::action("Open Repository…", OpenRepository),
+            MenuItem::separator(),
+            MenuItem::action("Save Preview", SavePreview),
         ]),
         Menu::new("Edit").items(vec![
             MenuItem::action("Copy", CopySelection),
@@ -7572,7 +7880,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 53, "MCP tools/list は 53 ツール");
+            check(status == 200 && tool_count == 56, "MCP tools/list は 56 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -9300,6 +9608,74 @@ mod self_test {
                 }
             }
             check(cli_open_ok, "tako open CLI でプレビューが開く");
+            // 66c. 軽量編集（FR-3.5）: 実 CLI で開始 → 全文適用 → 保存し、シェルの
+            //      grep で書き戻しを確認する。続けて MCP と同じ dispatch 起点でも保存する。
+            let (edit_preview_pane, edit_terminal_pane) = window
+                .update(cx, |app, _, _| {
+                    let preview = app.previews.keys().next().copied().expect("preview がある");
+                    let terminal = app.terminals.keys().next().copied().expect("terminal がある");
+                    let _ = app.workspace.active_tab_mut().tree_mut().focus(terminal);
+                    (preview.as_u64(), terminal.as_u64())
+                })
+                .unwrap_or((0, 0));
+            type_text(
+                any,
+                cx,
+                &format!(
+                    "{cli} edit start --pane {edit_preview_pane} >/dev/null && \
+                     {cli} edit apply --pane {edit_preview_pane} 'CLI-日本語' >/dev/null && \
+                     {cli} edit save --pane {edit_preview_pane} >/dev/null && \
+                     grep -qx 'CLI-日本語' {} && echo TAKO-EDIT-66C",
+                    preview_dir.join("note.md").display()
+                ),
+                true,
+            );
+            let mut cli_edit_ok = false;
+            for _ in 0..12 {
+                wait(cx, 300).await;
+                cli_edit_ok = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .iter()
+                            .find(|(pane, _)| pane.as_u64() == edit_terminal_pane)
+                            .is_some_and(|(_, session)| {
+                                session.visible_lines().join("\n").contains("TAKO-EDIT-66C")
+                            })
+                            && app
+                                .preview_edits
+                                .values()
+                                .any(|edit| !edit.dirty() && edit.buffer.text() == "CLI-日本語")
+                    })
+                    .unwrap_or(false);
+                if cli_edit_ok {
+                    break;
+                }
+            }
+            check(cli_edit_ok, "tako edit CLI の開始 / 適用 / 保存とファイル書き戻し");
+            let mcp_edit_ok = window
+                .update(cx, |app, _, _| {
+                    let applied = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::PreviewApply {
+                            pane: Some(edit_preview_pane),
+                            text: "MCP-日本語\n".into(),
+                        },
+                        PaneOrigin::Mcp,
+                    );
+                    let saved = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::PreviewSave {
+                            pane: Some(edit_preview_pane),
+                        },
+                        PaneOrigin::Mcp,
+                    );
+                    applied.is_ok()
+                        && saved.is_ok()
+                        && std::fs::read_to_string(preview_dir.join("note.md"))
+                            .is_ok_and(|text| text == "MCP-日本語\n")
+                })
+                .unwrap_or(false);
+            check(mcp_edit_ok, "MCP dispatch の編集適用 / 保存と日本語書き戻し");
             // 後片付け: プレビューを閉じる（フォーカスはターミナルへ戻る）
             let cleaned = window
                 .update(cx, |app, _, _| {

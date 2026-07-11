@@ -531,3 +531,7 @@
   /mcp で tako 全 53 ツール列挙）+ エッジ 3 種（gemini / agy master / agy solo が起動前エラー）
 - 次: tako 再起動で新バイナリ反映 → sol プロファイル作成（ユーザー）。codex への実プロンプト
   送信検証は利用上限解除（7/11 20:40）後
+
+## 2026-07-12（コードプレビュー軽量編集 #126）
+- FR-3.5: UTF-8 安全なその場編集、dirty / ⌘S、外部変更拒否を実装。dispatch 3 操作 + `tako edit` + MCP 3 ツールで AI 操作も同期
+- 検証: workspace build / test（446 pass）/ fmt / clippy 緑。PDF #124 テストも緑。セルフテストは既知の CoreGraphics PDF 項目70のみ失敗
