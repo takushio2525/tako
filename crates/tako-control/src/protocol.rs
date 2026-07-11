@@ -368,10 +368,16 @@ pub enum Request {
     /// set は model / worker_model / effort / worker_effort の更新と、
     /// clear_model / clear_worker_model による解除（claude 既定へ戻す）に対応。
     /// worker_agent（既定エージェント種別）と agent_* 系（`worker_agents.<agent>` の
-    /// エージェント別 worker 設定）は Issue #120 で追加
+    /// エージェント別 worker 設定）は Issue #120、master_agent は Issue #127 で追加
     OrchestratorProfiles {
         action: String,
         name: Option<String>,
+        /// master のエージェント種別（claude / codex。agy は master 非対応）を設定する
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        master_agent: Option<String>,
+        /// master_agent の指定を解除して claude 既定へ戻す
+        #[serde(default)]
+        clear_master_agent: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

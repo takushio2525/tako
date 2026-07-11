@@ -530,14 +530,25 @@ tako orchestrator profiles set default --model claude-opus-4-6 --effort max
 
 # モデル指定を解除して claude 既定に戻す（全プランで動作する推奨状態）
 tako orchestrator profiles set default --clear-model
+
+# codex master のプロファイルを作る（model / effort は codex のネイティブ表記で）
+tako orchestrator profiles set sol --master-agent codex --model gpt-5.6-sol --effort xhigh
 ```
 
 | `set` の主なオプション | 説明 |
 |---|---|
-| `--model` / `--clear-model` | master のモデル指定 / 解除 |
-| `--effort` | master の思考量（thinking effort） |
+| `--master-agent` / `--clear-master-agent` | master のエージェント CLI（claude / codex。省略時 claude。agy は master 非対応） |
+| `--model` / `--clear-model` | master のモデル指定 / 解除（master_agent のネイティブ表記） |
+| `--effort` | master の思考量（thinking / reasoning effort） |
 | `--worker-model` / `--clear-worker-model` | 子 worker 用の固定モデル / 解除 |
 | `--worker-effort` | 子 worker の思考量 |
+| `--worker-agent` / `--clear-worker-agent` | worker の既定エージェント CLI（claude / codex / agy） |
+| `--agent` + `--agent-model` 等 | エージェント別の worker 設定（`worker_agents.<agent>` の編集） |
+
+master のエージェント CLI を codex にすると、`tako master -<プロファイル名>` で codex が
+tako の MCP ツール（ペイン操作・worker spawn 等）に接続された状態で立ち上がります。
+master が claude 以外のとき、プロファイルの `model` / `effort` は claude worker へ
+継承されません（worker 側は `--worker-model` や `--agent claude --agent-model` で明示します）。
 
 :::caution
 `[1m]` 付きモデル（1M コンテキスト版）は Max / API プラン限定です。Pro プランで指定すると master が起動できません。

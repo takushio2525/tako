@@ -854,11 +854,15 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_orchestrator_profiles",
             "description": "オーケストレーターのプロファイル（tako master の起動設定）を管理する。\
                 action=list で一覧、show で単一表示、set で作成・更新。\
-                プロファイルは profiles/<name>.yaml に保存され、master のモデル・effort と\
-                子 worker のモデル決定に使われる。model が null / 未指定のプロファイルは\
-                claude CLI の既定モデルで起動する（プラン非依存・推奨）。\
+                プロファイルは profiles/<name>.yaml に保存され、master のエージェント種別・\
+                モデル・effort と子 worker のモデル決定に使われる。model が null / 未指定の\
+                プロファイルはその CLI の既定モデルで起動する（プラン非依存・推奨）。\
                 1M コンテキスト版（[1m] サフィックス）は Max / API プラン限定のため、\
                 set で明示指定した場合のみ使われる（Pro プランでは起動不能になる点に注意）。\
+                master のエージェント種別は master_agent（claude / codex。agy は master 非対応）で\
+                指定し、model / effort はその CLI のネイティブ表記で書く\
+                （codex 例: model=gpt-5.6-sol / effort=xhigh）。master_agent が claude 以外のとき\
+                master の model / effort は claude worker へ継承されない。\
                 worker のエージェント種別（claude / codex / agy）は worker_agent（既定種別）と\
                 agent_* 系（worker_agents.<agent> のエージェント別 worker 設定: モデル・effort・\
                 許可スキップ・追加引数）で指定する。",
@@ -871,7 +875,13 @@ pub fn tools() -> Vec<Value> {
                         "description": "操作種別（省略時は list）",
                     },
                     "name": { "type": "string", "description": "プロファイル名（set 時に必須。show 省略時は default）" },
-                    "model": { "type": "string", "description": "master のモデル（set 時。省略で現状維持）" },
+                    "master_agent": {
+                        "type": "string",
+                        "enum": ["claude", "codex"],
+                        "description": "master のエージェント種別（set 時。tako master / solo がこの CLI で起動する。agy は master 非対応）",
+                    },
+                    "clear_master_agent": { "type": "boolean", "description": "master_agent の指定を解除して claude 既定に戻す（set 時）" },
+                    "model": { "type": "string", "description": "master のモデル（master_agent のネイティブ表記。set 時。省略で現状維持）" },
                     "clear_model": { "type": "boolean", "description": "master のモデル指定を解除して claude 既定に戻す（set 時）" },
                     "worker_model": { "type": "string", "description": "worker_model_policy=fixed 時の子 worker モデル（set 時）" },
                     "clear_worker_model": { "type": "boolean", "description": "子 worker のモデル指定を解除する（set 時）" },
@@ -1547,6 +1557,8 @@ fn build_request(
             action: str_arg(args, "action")?.unwrap_or_else(|| "list".into()),
             name: str_arg(args, "name")?,
             model: str_arg(args, "model")?,
+            master_agent: str_arg(args, "master_agent")?,
+            clear_master_agent: bool_arg(args, "clear_master_agent")?.unwrap_or(false),
             worker_model: str_arg(args, "worker_model")?,
             effort: str_arg(args, "effort")?,
             worker_effort: str_arg(args, "worker_effort")?,

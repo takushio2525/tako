@@ -220,6 +220,13 @@ pub struct ResolvedWorkerLaunch {
 /// ユーザーがプロファイルに明示した場合のみ使われる（既定にはしない）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
+    /// master のエージェント種別（claude / codex。省略時 claude = 完全後方互換。Issue #127）。
+    /// String で保持し起動・設定時に検証する。agy は MCP のペイン毎接続情報（TAKO_*）を
+    /// 渡す手段と system prompt 注入手段が無いため master 非対応（worker のみ）。
+    /// model / effort は master_agent のネイティブ表記で指定する
+    /// （codex: `gpt-5.6-sol` / `none|minimal|low|medium|high|xhigh|max|ultra` 等）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default = "default_profile_effort")]
@@ -251,13 +258,17 @@ pub struct Profile {
     pub projects: Option<Vec<String>>,
 }
 
+/// master / claude worker の既定 effort
+pub const DEFAULT_PROFILE_EFFORT: &str = "max";
+
 fn default_profile_effort() -> String {
-    "max".into()
+    DEFAULT_PROFILE_EFFORT.into()
 }
 
 impl Default for Profile {
     fn default() -> Self {
         Self {
+            master_agent: None,
             model: None,
             effort: default_profile_effort(),
             worker_model_policy: WorkerModelPolicy::default(),
@@ -274,12 +285,36 @@ impl Default for Profile {
 }
 
 impl Profile {
+    /// master のエージェント種別が claude か（未指定 = claude）。
+    /// false のとき、profile.model / effort はそのエージェントのネイティブ表記なので
+    /// claude worker への継承・claude 固有の警告（[1m] 等）から除外する（Issue #127）
+    pub fn master_agent_is_claude(&self) -> bool {
+        self.master_agent.as_deref().is_none_or(|a| a == "claude")
+    }
+
+    /// master のエージェント種別を解決する（プロファイル → claude 既定）。
+    /// 不正・未対応の種別は起動前のエラーとして返す（Issue #127）
+    pub fn resolve_master_agent(&self) -> Result<WorkerAgent, String> {
+        match self.master_agent.as_deref() {
+            None => Ok(WorkerAgent::Claude),
+            Some(name) => validate_master_agent(name)
+                .map_err(|e| format!("プロファイルの master_agent が不正: {e}")),
+        }
+    }
+
     /// worker_model_policy に従って子 worker の既定 model を解決する。
-    /// `None` は claude CLI の既定モデルに委ねることを意味する
+    /// `None` は claude CLI の既定モデルに委ねることを意味する。
+    /// master_agent が claude 以外のとき、master の model はそのエージェントの
+    /// ネイティブ表記なので claude worker へは継承しない（Issue #127）
     pub fn resolve_worker_model(&self) -> Option<&str> {
+        let master_model_for_claude = if self.master_agent_is_claude() {
+            self.model.as_deref()
+        } else {
+            None
+        };
         match self.worker_model_policy {
-            WorkerModelPolicy::Inherit | WorkerModelPolicy::Delegate => self.model.as_deref(),
-            WorkerModelPolicy::Fixed => self.worker_model.as_deref().or(self.model.as_deref()),
+            WorkerModelPolicy::Inherit | WorkerModelPolicy::Delegate => master_model_for_claude,
+            WorkerModelPolicy::Fixed => self.worker_model.as_deref().or(master_model_for_claude),
         }
     }
 
@@ -288,16 +323,38 @@ impl Profile {
         self.model.as_deref().unwrap_or(CLAUDE_DEFAULT_LABEL)
     }
 
+    /// master のモデル表示ラベル（エージェント種別対応版）。
+    /// model 未指定時は master_agent の CLI 既定であることを示す
+    pub fn master_model_label(&self) -> String {
+        match self.model.as_deref() {
+            Some(m) => m.to_string(),
+            None => match self.master_agent.as_deref() {
+                None | Some("claude") => CLAUDE_DEFAULT_LABEL.to_string(),
+                Some(agent) => format!("({agent} CLI default)"),
+            },
+        }
+    }
+
     /// 子 worker のモデル表示ラベル（プロンプト・ログ用）
     pub fn worker_model_label(&self) -> &str {
         self.resolve_worker_model().unwrap_or(CLAUDE_DEFAULT_LABEL)
     }
 
-    /// worker_model_policy に従って子 worker の既定 effort を解決する
+    /// worker_model_policy に従って子 worker の既定 effort を解決する。
+    /// master_agent が claude 以外のときは master の effort を継承せず
+    /// claude worker の既定（max）へフォールバックする（Issue #127）
     pub fn resolve_worker_effort(&self) -> &str {
+        let master_effort_for_claude = if self.master_agent_is_claude() {
+            self.effort.as_str()
+        } else {
+            DEFAULT_PROFILE_EFFORT
+        };
         match self.worker_model_policy {
-            WorkerModelPolicy::Inherit | WorkerModelPolicy::Delegate => &self.effort,
-            WorkerModelPolicy::Fixed => self.worker_effort.as_deref().unwrap_or(&self.effort),
+            WorkerModelPolicy::Inherit | WorkerModelPolicy::Delegate => master_effort_for_claude,
+            WorkerModelPolicy::Fixed => self
+                .worker_effort
+                .as_deref()
+                .unwrap_or(master_effort_for_claude),
         }
     }
 
@@ -599,13 +656,21 @@ impl Profile {
         pb: Option<&PromptBlocks>,
     ) -> String {
         let policy_str = match self.worker_model_policy {
-            WorkerModelPolicy::Inherit => {
+            WorkerModelPolicy::Inherit if self.master_agent_is_claude() => {
                 format!(
                     "inherit（master と同じ {} / {}）",
                     self.model_label(),
                     self.effort
                 )
             }
+            // master が claude 以外のとき master の model / effort は claude worker へ
+            // 継承されない（Issue #127）。実際に解決される値を明示する
+            WorkerModelPolicy::Inherit => format!(
+                "inherit（master は {} のため claude worker へは非継承: {} / {}）",
+                self.master_agent.as_deref().unwrap_or("claude"),
+                self.worker_model_label(),
+                self.resolve_worker_effort()
+            ),
             WorkerModelPolicy::Fixed => format!(
                 "fixed（{} / {}）",
                 self.worker_model_label(),
@@ -657,17 +722,23 @@ impl Profile {
             String::new()
         };
 
+        // master のエージェント種別（設定時のみ明示。Issue #127）
+        let master_agent_line = match self.master_agent.as_deref() {
+            Some(agent) => format!("\n- **Master agent**: {agent}"),
+            None => String::new(),
+        };
+
         format!(
             "## Session Identity\n\n\
              - **Profile**: `{profile_name}`\n\
-             - **Launch command**: `tako master -{profile_name}`\n\
+             - **Launch command**: `tako master -{profile_name}`{master_agent_line}\n\
              - **Master model**: {}\n\
              - **Master effort**: {}\n\
              - **Worker model policy**: {policy_str}{agent_line}\n\
              - **Profile config**: `{profile_path}`\n\
              - **Prompt blocks**: {}\n\
              - **Customizations**: {customization_summary}",
-            self.model_label(),
+            self.master_model_label(),
             self.effort,
             all_blocks.join(", "),
         )
@@ -722,15 +793,21 @@ impl Profile {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "(不明)".into());
 
+        // solo でも master_agent 設定が効く（コマンド組み立てを master と共用。Issue #127）
+        let agent_line = match self.master_agent.as_deref() {
+            Some(agent) => format!("\n- **Agent**: {agent}"),
+            None => String::new(),
+        };
+
         format!(
             "## Session Identity\n\n\
              - **Mode**: solo (direct execution, no orchestration)\n\
              - **Profile**: `{profile_name}`\n\
-             - **Launch command**: `tako solo -{profile_name}`\n\
+             - **Launch command**: `tako solo -{profile_name}`{agent_line}\n\
              - **Model**: {}\n\
              - **Effort**: {}\n\
              - **Profile config**: `{profile_path}`",
-            self.model_label(),
+            self.master_model_label(),
             self.effort,
         )
     }
@@ -792,19 +869,86 @@ pub fn solo_default_profile() -> Profile {
     }
 }
 
-/// master 起動用の claude コマンドを組み立てる。
-/// profile.model が None の場合は `--model` を付けず claude CLI の既定に委ねる
-pub fn build_master_claude_cmd(role_env: &str, profile: &Profile, prompt_path: &Path) -> String {
-    let mut cmd = format!("TAKO_ORCHESTRATOR_ROLE='{role_env}' claude");
-    if let Some(model) = profile.model.as_deref() {
-        cmd.push_str(&format!(" --model '{model}'"));
+/// master として利用可能なエージェント種別の検証（Issue #127）。
+/// agy は MCP のペイン毎接続情報（TAKO_SOCKET / TAKO_PANE_ID 等）を子プロセスへ
+/// 引き継ぐ設定手段と system prompt 注入手段が無いため master 非対応（worker のみ）
+pub fn validate_master_agent(name: &str) -> Result<WorkerAgent, String> {
+    let agent = WorkerAgent::parse(name)?;
+    match agent {
+        WorkerAgent::Claude | WorkerAgent::Codex => Ok(agent),
+        WorkerAgent::Agy => Err(
+            "agy は master 非対応（master は claude / codex のみ。worker としては利用可能）".into(),
+        ),
     }
-    cmd.push_str(&format!(" --effort {}", profile.effort));
-    cmd.push_str(&format!(
-        " --append-system-prompt-file '{}'",
-        prompt_path.display()
-    ));
-    cmd
+}
+
+/// codex の MCP stdio サーバー（`tako mcp serve`）へ親環境から引き継ぐ環境変数。
+/// codex は既定で MCP 子プロセスの環境を最小構成（PATH / HOME 等）に絞るため、
+/// tako の接続情報は `mcp_servers.<name>.env_vars`（引き継ぎホワイトリスト）で明示する。
+/// TAKO_ORCHESTRATOR_ROLE は MCP セッションの caller_role（Issue #109 の複数 master
+/// 混線対策）に使われる
+const CODEX_MCP_ENV_VARS: &str =
+    r#"["TAKO_SOCKET","TAKO_TOKEN","TAKO_PANE_ID","TAKO_TAB_ID","TAKO_ORCHESTRATOR_ROLE"]"#;
+
+/// master 起動用のコマンドを組み立てる（master_agent 対応。Issue #127）。
+/// claude の出力は従来の claude 固定実装と同一文字列（完全後方互換）。
+/// profile.model が None の場合は `--model` を付けずその CLI の既定に委ねる。
+/// `tako_bin` は codex の MCP stdio ブリッジ（`<tako_bin> mcp serve`）の起動パス
+pub fn build_master_cmd(
+    role_env: &str,
+    profile: &Profile,
+    prompt_path: &Path,
+    tako_bin: &str,
+) -> Result<String, String> {
+    let agent = profile.resolve_master_agent()?;
+    let mut cmd = format!("TAKO_ORCHESTRATOR_ROLE='{role_env}' {}", agent.as_str());
+    match agent {
+        WorkerAgent::Claude => {
+            if let Some(model) = profile.model.as_deref() {
+                cmd.push_str(&format!(" --model '{model}'"));
+            }
+            cmd.push_str(&format!(" --effort {}", profile.effort));
+            cmd.push_str(&format!(
+                " --append-system-prompt-file '{}'",
+                prompt_path.display()
+            ));
+        }
+        WorkerAgent::Codex => {
+            if let Some(model) = profile.model.as_deref() {
+                cmd.push_str(&format!(" --model {}", agent::sh_quote(model)));
+            }
+            // codex 0.144 の effort は none/minimal/low/medium/high/xhigh/max/ultra
+            // （バイナリの enum で確認）。ネイティブ表記をそのまま渡す（worker と同じ思想）
+            cmd.push_str(&format!(
+                " -c model_reasoning_effort={}",
+                agent::sh_quote(&profile.effort)
+            ));
+            // MCP 接続は起動時の -c 一時注入（~/.codex/config.toml を汚さず、
+            // tako 外で起動した codex にツールを公開しない = FR-2.3.2 と同方針）
+            cmd.push_str(&format!(
+                " -c {}",
+                agent::sh_quote(&format!(
+                    "mcp_servers.tako.command={}",
+                    agent::toml_quote(tako_bin)
+                ))
+            ));
+            cmd.push_str(r#" -c 'mcp_servers.tako.args=["mcp","serve"]'"#);
+            cmd.push_str(&format!(
+                " -c 'mcp_servers.tako.env_vars={CODEX_MCP_ENV_VARS}'"
+            ));
+            // system prompt は developer_instructions（developer ロールメッセージとして
+            // モデル可視プロンプトへ注入されることを codex debug prompt-input で実証済み）。
+            // "$(cat …)" はダブルクォート内コマンド置換のため、ファイル内容の $ / " / '
+            // はシェルに再解釈されない
+            cmd.push_str(&format!(
+                " -c developer_instructions=\"$(cat {})\"",
+                agent::sh_quote(&prompt_path.display().to_string())
+            ));
+        }
+        // resolve_master_agent が拒否する（master 非対応）
+        WorkerAgent::Agy => unreachable!("agy は resolve_master_agent で拒否される"),
+    }
+    Ok(cmd)
 }
 
 /// worker 起動用のコマンドを組み立てる（エージェント種別対応は
@@ -1475,8 +1619,9 @@ prompt_blocks:
 
     #[test]
     fn master_cmd_without_model() {
+        // 既定（master_agent 未指定 = claude）の出力は #127 以前と完全一致（後方互換）
         let p = Profile::default();
-        let cmd = build_master_claude_cmd("master", &p, Path::new("/tmp/p.md"));
+        let cmd = build_master_cmd("master", &p, Path::new("/tmp/p.md"), "tako").unwrap();
         assert_eq!(
             cmd,
             "TAKO_ORCHESTRATOR_ROLE='master' claude --effort max --append-system-prompt-file '/tmp/p.md'"
@@ -1490,17 +1635,156 @@ prompt_blocks:
             model: Some("claude-opus-4-6[1m]".into()),
             ..Default::default()
         };
-        let cmd = build_master_claude_cmd("master:x", &p, Path::new("/tmp/p.md"));
+        let cmd = build_master_cmd("master:x", &p, Path::new("/tmp/p.md"), "tako").unwrap();
         assert!(cmd.contains("--model 'claude-opus-4-6[1m]'"));
         assert!(cmd.contains("--effort max"));
     }
 
-    /// solo は build_master_claude_cmd を共用する。既定プロファイルは model 無指定・
+    #[test]
+    fn master_cmd_codex() {
+        // codex master: model/effort のネイティブ表記 + MCP 一時注入 + developer_instructions
+        let p = Profile {
+            master_agent: Some("codex".into()),
+            model: Some("gpt-5.6-sol".into()),
+            effort: "xhigh".into(),
+            ..Default::default()
+        };
+        let cmd = build_master_cmd(
+            "master:sol",
+            &p,
+            Path::new("/tmp/_system_prompt_sol.md"),
+            "/usr/local/bin/tako",
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            "TAKO_ORCHESTRATOR_ROLE='master:sol' codex \
+             --model gpt-5.6-sol \
+             -c model_reasoning_effort=xhigh \
+             -c 'mcp_servers.tako.command=\"/usr/local/bin/tako\"' \
+             -c 'mcp_servers.tako.args=[\"mcp\",\"serve\"]' \
+             -c 'mcp_servers.tako.env_vars=[\"TAKO_SOCKET\",\"TAKO_TOKEN\",\"TAKO_PANE_ID\",\"TAKO_TAB_ID\",\"TAKO_ORCHESTRATOR_ROLE\"]' \
+             -c developer_instructions=\"$(cat /tmp/_system_prompt_sol.md)\""
+        );
+    }
+
+    #[test]
+    fn master_cmd_codex_without_model_quotes_special_paths() {
+        // model 未指定は --model を付けず codex 既定に委ねる。
+        // 空白入りパス（.app 内の tako CLI 等）は TOML/シェルの二重クオートで守る
+        let p = Profile {
+            master_agent: Some("codex".into()),
+            ..Default::default()
+        };
+        let cmd = build_master_cmd(
+            "master",
+            &p,
+            Path::new("/tmp/pro file.md"),
+            "/Applications/tako.app/Contents/Resources/tako bin/tako",
+        )
+        .unwrap();
+        assert!(!cmd.contains("--model"));
+        assert!(cmd.contains(" -c model_reasoning_effort=max"), "{cmd}");
+        assert!(cmd.contains(
+            r#" -c 'mcp_servers.tako.command="/Applications/tako.app/Contents/Resources/tako bin/tako"'"#
+        ));
+        assert!(cmd.contains(r#" -c developer_instructions="$(cat '/tmp/pro file.md')""#));
+    }
+
+    #[test]
+    fn master_agent_validation() {
+        // 未指定 → claude（後方互換）
+        assert_eq!(
+            Profile::default().resolve_master_agent(),
+            Ok(WorkerAgent::Claude)
+        );
+        // codex → OK
+        let codex = Profile {
+            master_agent: Some("codex".into()),
+            ..Default::default()
+        };
+        assert_eq!(codex.resolve_master_agent(), Ok(WorkerAgent::Codex));
+        // agy → master 非対応の明示エラー（worker では使える旨を含む）
+        let agy = Profile {
+            master_agent: Some("agy".into()),
+            ..Default::default()
+        };
+        let err = agy.resolve_master_agent().unwrap_err();
+        assert!(err.contains("master 非対応"), "{err}");
+        assert!(err.contains("worker"), "{err}");
+        assert!(
+            build_master_cmd("master", &agy, Path::new("/tmp/p.md"), "tako").is_err(),
+            "agy はコマンド組み立ても拒否"
+        );
+        // 不正値 → 対応一覧つきエラー
+        let bad = Profile {
+            master_agent: Some("gemini".into()),
+            ..Default::default()
+        };
+        let err = bad.resolve_master_agent().unwrap_err();
+        assert!(err.contains("master_agent が不正"), "{err}");
+        assert!(err.contains("gemini"), "{err}");
+    }
+
+    #[test]
+    fn codex_master_does_not_leak_model_to_claude_workers() {
+        // master が codex のとき、gpt モデル名・codex 用 effort を claude worker へ
+        // 継承しない（inherit / delegate / fixed フォールバックの全経路。#127）
+        for policy in [
+            WorkerModelPolicy::Inherit,
+            WorkerModelPolicy::Delegate,
+            WorkerModelPolicy::Fixed,
+        ] {
+            let p = Profile {
+                master_agent: Some("codex".into()),
+                model: Some("gpt-5.6-sol".into()),
+                effort: "xhigh".into(),
+                worker_model_policy: policy,
+                ..Default::default()
+            };
+            assert_eq!(p.resolve_worker_model(), None, "policy={policy:?}");
+            assert_eq!(p.resolve_worker_effort(), "max", "policy={policy:?}");
+        }
+        // fixed で worker_model / worker_effort が明示されていればそれを使う（従来通り）
+        let fixed = Profile {
+            master_agent: Some("codex".into()),
+            model: Some("gpt-5.6-sol".into()),
+            effort: "xhigh".into(),
+            worker_model_policy: WorkerModelPolicy::Fixed,
+            worker_model: Some("claude-sonnet-5".into()),
+            worker_effort: Some("high".into()),
+            ..Default::default()
+        };
+        assert_eq!(fixed.resolve_worker_model(), Some("claude-sonnet-5"));
+        assert_eq!(fixed.resolve_worker_effort(), "high");
+    }
+
+    #[test]
+    fn master_model_label_reflects_agent() {
+        // model 未指定時のラベルは master_agent の CLI 既定を指す
+        assert_eq!(
+            Profile::default().master_model_label(),
+            CLAUDE_DEFAULT_LABEL
+        );
+        let codex = Profile {
+            master_agent: Some("codex".into()),
+            ..Default::default()
+        };
+        assert_eq!(codex.master_model_label(), "(codex CLI default)");
+        let with_model = Profile {
+            master_agent: Some("codex".into()),
+            model: Some("gpt-5.6-sol".into()),
+            ..Default::default()
+        };
+        assert_eq!(with_model.master_model_label(), "gpt-5.6-sol");
+    }
+
+    /// solo は build_master_cmd を共用する。既定プロファイルは model 無指定・
     /// effort=high で、TAKO_ORCHESTRATOR_ROLE は 'solo'（suffix 付きは 'solo:<suffix>'）になる。
     #[test]
     fn solo_cmd_uses_solo_role_and_high_effort() {
         let p = solo_default_profile();
-        let cmd = build_master_claude_cmd("solo", &p, Path::new("/tmp/solo.md"));
+        let cmd = build_master_cmd("solo", &p, Path::new("/tmp/solo.md"), "tako").unwrap();
         assert_eq!(
             cmd,
             "TAKO_ORCHESTRATOR_ROLE='solo' claude --effort high --append-system-prompt-file '/tmp/solo.md'"
@@ -1510,9 +1794,24 @@ prompt_blocks:
             "model 未指定は claude 既定に委ねる"
         );
 
-        let cmd_suffix = build_master_claude_cmd("solo:docs", &p, Path::new("/tmp/solo.md"));
+        let cmd_suffix =
+            build_master_cmd("solo:docs", &p, Path::new("/tmp/solo.md"), "tako").unwrap();
         assert!(cmd_suffix.contains("TAKO_ORCHESTRATOR_ROLE='solo:docs'"));
         assert!(cmd_suffix.contains("--effort high"));
+    }
+
+    /// solo プロファイルでも master_agent: codex が効く（コマンド組み立て共用。#127）
+    #[test]
+    fn solo_cmd_codex_agent() {
+        let p = Profile {
+            master_agent: Some("codex".into()),
+            effort: "high".into(),
+            ..Default::default()
+        };
+        let cmd = build_master_cmd("solo", &p, Path::new("/tmp/solo.md"), "tako").unwrap();
+        assert!(cmd.starts_with("TAKO_ORCHESTRATOR_ROLE='solo' codex "));
+        assert!(cmd.contains("-c model_reasoning_effort=high"));
+        assert!(cmd.contains("mcp_servers.tako.command"));
     }
 
     #[test]
