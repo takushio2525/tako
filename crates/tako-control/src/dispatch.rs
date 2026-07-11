@@ -1506,6 +1506,8 @@ fn dispatch_inner(
         Request::OrchestratorProfiles {
             action,
             name,
+            master_agent,
+            clear_master_agent,
             model,
             worker_model,
             effort,
@@ -1524,6 +1526,8 @@ fn dispatch_inner(
         } => dispatch_orchestrator_profiles(ProfilesParams {
             action,
             name,
+            master_agent,
+            clear_master_agent,
             model,
             worker_model,
             effort,
@@ -1727,6 +1731,9 @@ fn dispatch_orchestrator_projects(
 pub struct ProfilesParams {
     pub action: String,
     pub name: Option<String>,
+    /// master のエージェント種別（claude / codex。agy は master 非対応。#127）
+    pub master_agent: Option<String>,
+    pub clear_master_agent: bool,
     pub model: Option<String>,
     pub worker_model: Option<String>,
     pub effort: Option<String>,
@@ -1766,6 +1773,10 @@ fn profile_to_json(name: &str, profile: &crate::orchestrator::Profile) -> Value 
     if profile.worker_agent.is_some() || !profile.worker_agents.is_empty() {
         v["worker_agent"] = json!(profile.worker_agent.as_deref().unwrap_or("claude"));
         v["worker_agents"] = serde_json::to_value(&profile.worker_agents).unwrap_or_default();
+    }
+    // master エージェント設定（#127）も使用時のみ出力
+    if profile.master_agent.is_some() {
+        v["master_agent"] = json!(profile.master_agent);
     }
     v
 }
@@ -1813,6 +1824,11 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                     "worker_agent と clear_worker_agent は同時に指定できない".into(),
                 ));
             }
+            if params.master_agent.is_some() && params.clear_master_agent {
+                return Err(DispatchError::InvalidParams(
+                    "master_agent と clear_master_agent は同時に指定できない".into(),
+                ));
+            }
             // agent_* 系の指定には対象エージェント名（agent）が必須
             let has_agent_edit = params.agent_model.is_some()
                 || params.clear_agent_model
@@ -1825,14 +1841,23 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                     "agent_* 系の設定には agent（対象エージェント名）を指定する".into(),
                 ));
             }
-            // エージェント名は設定時点で検証する（spawn 時の不意のエラーを防ぐ）
+            // エージェント名は設定時点で検証する（spawn / master 起動時の不意のエラーを防ぐ）
             if let Some(a) = params.worker_agent.as_deref() {
                 orchestrator::WorkerAgent::parse(a).map_err(DispatchError::InvalidParams)?;
             }
             if let Some(a) = params.agent.as_deref() {
                 orchestrator::WorkerAgent::parse(a).map_err(DispatchError::InvalidParams)?;
             }
+            // master は claude / codex のみ（agy は非対応。#127）
+            if let Some(a) = params.master_agent.as_deref() {
+                orchestrator::validate_master_agent(a).map_err(DispatchError::InvalidParams)?;
+            }
             let mut profile = orchestrator::Profile::load(&name).unwrap_or_default();
+            if let Some(a) = params.master_agent {
+                profile.master_agent = Some(a);
+            } else if params.clear_master_agent {
+                profile.master_agent = None;
+            }
             if let Some(m) = params.model {
                 profile.model = Some(m);
             } else if params.clear_model {
@@ -1881,11 +1906,13 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
             let mut result = profile_to_json(&name, &profile);
             result["path"] = json!(path.display().to_string());
             // [1m] は Max / API プラン限定 → 明示 opt-in は許容しつつ警告を返す
-            // （inherit で master と同一モデルの場合は master 分のみ警告）
+            // （inherit で master と同一モデルの場合は master 分のみ警告。
+            //  claude 以外の master の model は claude 表記でないため対象外。#127）
             let warnings: Vec<String> = [
                 profile
                     .model
                     .as_deref()
+                    .filter(|_| profile.master_agent_is_claude())
                     .and_then(|m| orchestrator::one_m_model_warning(m, "master")),
                 profile
                     .resolve_worker_model()

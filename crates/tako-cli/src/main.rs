@@ -547,7 +547,13 @@ enum ProfilesCommand {
     Set {
         /// プロファイル名
         name: String,
-        /// master のモデル（--clear-model と排他）
+        /// master のエージェント種別（claude / codex。agy は master 非対応。--clear-master-agent と排他）
+        #[arg(long, conflicts_with = "clear_master_agent")]
+        master_agent: Option<String>,
+        /// master_agent の指定を解除して claude 既定に戻す
+        #[arg(long)]
+        clear_master_agent: bool,
+        /// master のモデル（master_agent のネイティブ表記。--clear-model と排他）
         #[arg(long, conflicts_with = "clear_model")]
         model: Option<String>,
         /// master のモデル指定を解除して claude 既定に戻す
@@ -1125,14 +1131,19 @@ fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
         Err(e) => return Err(e),
     };
 
+    // master のエージェント種別を検証する（不正・未対応はコマンド送信前にエラー。#127）
+    let master_agent = profile.resolve_master_agent()?;
+
     // プロファイルに明示された [1m] モデルは opt-in として尊重するが、
-    // Pro プランでは起動不能になるため警告を出す（Issue #27）
-    if let Some(warning) = profile
-        .model
-        .as_deref()
-        .and_then(|m| orchestrator::one_m_model_warning(m, "master"))
-    {
-        eprintln!("{warning}");
+    // Pro プランでは起動不能になるため警告を出す（Issue #27。claude master のみ）
+    if profile.master_agent_is_claude() {
+        if let Some(warning) = profile
+            .model
+            .as_deref()
+            .and_then(|m| orchestrator::one_m_model_warning(m, "master"))
+        {
+            eprintln!("{warning}");
+        }
     }
     if let Some(warning) = profile
         .resolve_worker_model()
@@ -1179,11 +1190,15 @@ fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
         Some(s) => format!("master:{s}"),
         None => "master".into(),
     };
-    // model 未指定のプロファイルは --model を付けず claude CLI の既定に委ねる（Issue #27）
-    let claude_cmd = orchestrator::build_master_claude_cmd(&role_env, &profile, &prompt_path);
+    // model 未指定のプロファイルは --model を付けずその CLI の既定に委ねる（Issue #27）。
+    // codex master の MCP stdio ブリッジ（`<tako> mcp serve`）は自分自身のパスで起動する
+    let tako_bin = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| tako_control::dispatch::resolve_tako_binary());
+    let master_cmd = orchestrator::build_master_cmd(&role_env, &profile, &prompt_path, &tako_bin)?;
     send_request(Request::Send {
         pane: Some(pane_id),
-        text: claude_cmd,
+        text: master_cmd,
         newline: true,
         tmux_session: None,
         await_prompt: false,
@@ -1191,8 +1206,9 @@ fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
 
     eprintln!("master を起動しました: タブ '{tab_title}'（ペイン {pane_id}）");
     eprintln!(
-        "プロファイル: {profile_name}（モデル: {}、effort: {}）",
-        profile.model_label(),
+        "プロファイル: {profile_name}（エージェント: {}、モデル: {}、effort: {}）",
+        master_agent.as_str(),
+        profile.master_model_label(),
         profile.effort
     );
     let policy_desc = match profile.worker_model_policy {
@@ -1246,14 +1262,19 @@ fn orchestrator_solo(arg: Option<&str>) -> Result<(), String> {
         Err(e) => return Err(e),
     };
 
+    // solo のエージェント種別を検証する（master とコマンド組み立てを共用。#127）
+    let solo_agent = profile.resolve_master_agent()?;
+
     // プロファイルに明示された [1m] モデルは opt-in として尊重するが、
-    // Pro プランでは起動不能になるため警告を出す（Issue #27）
-    if let Some(warning) = profile
-        .model
-        .as_deref()
-        .and_then(|m| orchestrator::one_m_model_warning(m, "solo"))
-    {
-        eprintln!("{warning}");
+    // Pro プランでは起動不能になるため警告を出す（Issue #27。claude のみ）
+    if profile.master_agent_is_claude() {
+        if let Some(warning) = profile
+            .model
+            .as_deref()
+            .and_then(|m| orchestrator::one_m_model_warning(m, "solo"))
+        {
+            eprintln!("{warning}");
+        }
     }
 
     // solo 用 system prompt を合成し、一時ファイルに書き出す
@@ -1289,11 +1310,14 @@ fn orchestrator_solo(arg: Option<&str>) -> Result<(), String> {
     })?;
 
     // TAKO_ORCHESTRATOR_ROLE 環境変数を設定（solo / solo:<suffix>）。
-    // model 未指定のプロファイルは --model を付けず claude CLI の既定に委ねる（Issue #27）
-    let claude_cmd = orchestrator::build_master_claude_cmd(&role, &profile, &prompt_path);
+    // model 未指定のプロファイルは --model を付けずその CLI の既定に委ねる（Issue #27）
+    let tako_bin = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| tako_control::dispatch::resolve_tako_binary());
+    let solo_cmd = orchestrator::build_master_cmd(&role, &profile, &prompt_path, &tako_bin)?;
     send_request(Request::Send {
         pane: Some(pane_id),
-        text: claude_cmd,
+        text: solo_cmd,
         newline: true,
         tmux_session: None,
         await_prompt: false,
@@ -1301,8 +1325,9 @@ fn orchestrator_solo(arg: Option<&str>) -> Result<(), String> {
 
     eprintln!("solo を起動しました: タブ '{tab_title}'（ペイン {pane_id}）");
     eprintln!(
-        "プロファイル: {profile_name}（モデル: {}、effort: {}）",
-        profile.model_label(),
+        "プロファイル: {profile_name}（エージェント: {}、モデル: {}、effort: {}）",
+        solo_agent.as_str(),
+        profile.master_model_label(),
         profile.effort
     );
     eprintln!("モード: solo（オーケストレーション無し・1 対 1 対話・worker spawn 禁止）");
@@ -1448,6 +1473,8 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
         },
         ProfilesCommand::Set {
             name,
+            master_agent,
+            clear_master_agent,
             model,
             clear_model,
             worker_model,
@@ -1466,6 +1493,8 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
         } => ProfilesParams {
             action: "set".into(),
             name: Some(name.clone()),
+            master_agent: master_agent.clone(),
+            clear_master_agent: *clear_master_agent,
             model: model.clone(),
             worker_model: worker_model.clone(),
             effort: effort.clone(),

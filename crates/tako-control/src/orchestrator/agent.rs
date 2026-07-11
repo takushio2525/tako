@@ -112,7 +112,7 @@ pub fn build_worker_cmd(launch: &WorkerLaunch) -> String {
 /// 単一引数のシェルクオート。英数と安全な記号のみなら素通し、
 /// それ以外（role のコロン・agy モデル名の空白等）は single quote で囲む
 /// （内部の `'` は `'\''`）
-fn sh_quote(s: &str) -> String {
+pub(crate) fn sh_quote(s: &str) -> String {
     if !s.is_empty()
         && s.chars()
             .all(|c| c.is_alphanumeric() || matches!(c, '/' | '.' | '-' | '_'))
@@ -170,7 +170,7 @@ fn ensure_codex_trusted_at(path: &Path, cwd: &str) -> Result<bool, String> {
 }
 
 /// TOML の basic string としてクオートする（`"` と `\` をエスケープ）
-fn toml_quote(s: &str) -> String {
+pub(crate) fn toml_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
