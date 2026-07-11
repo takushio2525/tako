@@ -515,3 +515,9 @@
 - 関連: PR #122 squash merge（`f8a8b3c`）。全緑（429 tests）+ セカンダリモード併走で
   codex / agy / claude 3 種の spawn → 完遂 → send_input → WORKER_IDLE を実機検証済み
 - 次: tako 再起動で新バイナリ反映（agy worker は profiles set --agent agy --agent-skip-permissions true 推奨）
+
+## 2026-07-11（#124: PDF プレビューのテキスト選択・クリップボードコピー）
+- PDFKit FFI でテキストレイヤ抽出 → 既存 preview_line_bounds/texts に統合。ドラッグ選択・
+  ⌘C コピー・ハイライト描画が Code/Markdown と同パス。テキストなし PDF 防御 + テスト 2 本
+- 関連: PR #125 squash merge（`ba0bc7a`）。build / clippy / fmt / test 全緑（354 passed）
+- 次: ユーザーによる GUI テキスト選択の実機確認（マウスドラッグ→⌘C→pbpaste）
