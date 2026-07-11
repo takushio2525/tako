@@ -195,8 +195,9 @@ pub struct AgentWorkerConfig {
     /// claude: `--effort` / codex: `-c model_reasoning_effort=` / agy: 無視される
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    /// 許可プロンプトのスキップ（明示 opt-in。agy は既定でサブコマンド毎に
-    /// 許可が出るため、自律 worker 運用では実用上ほぼ必須）
+    /// 許可プロンプトのスキップ。codex / agy は `WorkerAgent::default_skip_permissions()`
+    /// が true のためプロファイル未設定でも承認なしで起動する。明示的に false を設定すると
+    /// 承認ありに戻る。claude は既定 false（Claude Code 側の設定に委ねる）
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skip_permissions: bool,
     /// 追加 CLI 引数（上級者向け。例: codex の `--search`）
@@ -409,7 +410,9 @@ impl Profile {
             agent,
             model,
             effort,
-            skip_permissions: cfg.map(|c| c.skip_permissions).unwrap_or(false),
+            skip_permissions: cfg
+                .map(|c| c.skip_permissions)
+                .unwrap_or_else(|| agent.default_skip_permissions()),
             extra_args: cfg.map(|c| c.args.clone()).unwrap_or_default(),
         }
     }
@@ -571,7 +574,10 @@ impl Profile {
             if let Some(e) = cfg.and_then(|c| c.effort.as_deref()) {
                 extras.push(format!("effort {e}"));
             }
-            if cfg.is_some_and(|c| c.skip_permissions) {
+            let effective_skip = cfg
+                .map(|c| c.skip_permissions)
+                .unwrap_or_else(|| agent.default_skip_permissions());
+            if effective_skip {
                 extras.push("skip_permissions".to_string());
             }
             let extras = if extras.is_empty() {
@@ -1953,6 +1959,38 @@ prompt_blocks:
             assert_eq!(
                 launch.effort, None,
                 "{agent:?} に claude の effort を波及させない"
+            );
+            assert!(
+                launch.skip_permissions,
+                "{agent:?} は既定で承認スキップ"
+            );
+        }
+        // claude は既定で承認あり
+        let launch_claude = p.resolve_agent_launch(WorkerAgent::Claude, None, None);
+        assert!(!launch_claude.skip_permissions, "claude は既定で承認あり");
+    }
+
+    #[test]
+    fn resolve_agent_launch_explicit_false_overrides_default() {
+        // codex / agy でも skip_permissions: false を明示すると承認ありになる
+        for agent_name in ["codex", "agy"] {
+            let mut agents = std::collections::BTreeMap::new();
+            agents.insert(
+                agent_name.to_string(),
+                AgentWorkerConfig {
+                    skip_permissions: false,
+                    ..Default::default()
+                },
+            );
+            let p = Profile {
+                worker_agents: agents,
+                ..Default::default()
+            };
+            let agent = WorkerAgent::parse(agent_name).unwrap();
+            let launch = p.resolve_agent_launch(agent, None, None);
+            assert!(
+                !launch.skip_permissions,
+                "{agent_name} は明示 false で承認あり"
             );
         }
     }
