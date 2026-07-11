@@ -1212,10 +1212,17 @@ fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
         profile.effort
     );
     let policy_desc = match profile.worker_model_policy {
-        orchestrator::WorkerModelPolicy::Inherit => format!(
+        orchestrator::WorkerModelPolicy::Inherit if profile.master_agent_is_claude() => format!(
             "inherit（master と同じ {} / {}）",
             profile.model_label(),
             profile.effort
+        ),
+        // master が claude 以外のときは model / effort が claude worker へ継承されない（#127）
+        orchestrator::WorkerModelPolicy::Inherit => format!(
+            "inherit（master は {} のため claude worker へは非継承: {} / {}）",
+            master_agent.as_str(),
+            profile.worker_model_label(),
+            profile.resolve_worker_effort()
         ),
         orchestrator::WorkerModelPolicy::Fixed => format!(
             "fixed（{} / {}）",
