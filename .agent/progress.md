@@ -535,3 +535,9 @@
 ## 2026-07-12（コードプレビュー軽量編集 #126）
 - FR-3.5: UTF-8 安全なその場編集、dirty / ⌘S、外部変更拒否を実装。dispatch 3 操作 + `tako edit` + MCP 3 ツールで AI 操作も同期
 - 検証: workspace build / test（446 pass）/ fmt / clippy 緑。PDF #124 テストも緑。セルフテストは既知の CoreGraphics PDF 項目70のみ失敗
+
+## 2026-07-12（#132: codex/agy 承認既定スキップ + profiles set --worker-model-policy + target 掃除）
+- codex/agy worker は既定 skip_permissions=true、codex master は --dangerously-bypass-approvals-and-sandbox でMCPツール承認もバイパス。
+  CLI `--worker-model-policy` + MCP `worker_model_policy` 追加。`scripts/clean-target.sh` 新設
+- 検証: 450 tests / fmt / clippy 緑。codex exec --dangerously で MCP 呼び出し承認バイパス実証。profiles set --worker-model-policy delegate → YAML 反映確認
+- 関連コミット: PR #133 squash merge（`b9b5b33`）+ `3739385`（-a never→bypass修正）
