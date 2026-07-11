@@ -75,6 +75,7 @@ tako/
 | build | `cargo build --workspace` |
 | lint | `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` |
 | test | `cargo test --workspace` |
+| target 掃除 | `scripts/clean-target.sh`（dry-run。`--run` で実行。cargo clean + worktree prune） |
 
 CI（`.github/workflows/ci.yml`）は macOS / Windows の両ランナーで build + test を回す。
 
