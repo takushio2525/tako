@@ -2,8 +2,9 @@
 
 tako に内蔵されたマスターオーケストレーター機能。複数プロジェクトの作業を
 子 worker に委任し、監視・管理する。外部スクリプト依存ゼロ。
-worker のエージェント CLI は **claude（既定）/ codex / agy** から選べる（Issue #120。
-master 自体は claude のまま）。
+worker のエージェント CLI は **claude（既定）/ codex / agy** から選べる（Issue #120）。
+master / solo のエージェント CLI も **claude（既定）/ codex** から選べる（Issue #127。
+agy は master 非対応 = worker のみ）。
 
 ## オーケストレーション不要なら `tako solo`
 
@@ -29,7 +30,7 @@ tako solo docs       # 旧形式サフィックス、role=solo:docs
 - tako がインストール済み（`tako` CLI が PATH に通っている）
 - `claude` CLI がインストール済み（`claude --version` で確認）
 - tako MCP が登録済み（`tako setup-mcp` で自動登録）
-- codex / agy worker を使う場合はそれぞれの CLI（`codex` / `agy`）がインストール済みであること（任意）
+- codex master / worker・agy worker を使う場合はそれぞれの CLI（`codex` / `agy`）がインストール済みであること（任意）
 
 ## セットアップ
 
@@ -108,9 +109,37 @@ worker_model_policy: inherit
 
 | 対象 | 優先順位 |
 |---|---|
-| master | プロファイルの `model` → 未指定なら claude CLI 既定 |
+| master | プロファイルの `model`（`master_agent` のネイティブ表記）→ 未指定ならその CLI の既定 |
 | worker（claude） | spawn の `model` 引数 → `worker_agents.claude.model` → プロファイルの worker ポリシー（inherit / fixed / delegate）→ 未指定なら claude CLI 既定 |
 | worker（codex / agy） | spawn の `model` 引数 → `worker_agents.<agent>.model` → 未指定ならその CLI の既定 |
+
+### master のエージェント種別（claude / codex。Issue #127）
+
+master / solo は claude 以外に codex でも起動できる。プロファイルに `master_agent` を書く:
+
+```yaml
+# profiles/<name>.yaml — codex master の例（tako master -<name> で起動）
+master_agent: codex     # 省略時 claude（完全後方互換）。agy は master 非対応
+model: gpt-5.6-sol      # master_agent のネイティブ表記で書く
+effort: xhigh           # codex: none/minimal/low/medium/high/xhigh/max/ultra
+```
+
+- **system prompt**: codex には `-c developer_instructions="$(cat <プロンプトファイル>)"` で
+  注入する（developer ロールメッセージとしてモデル可視プロンプトに入る）。
+  プロンプト合成（prompt_blocks / Session Identity）は claude master と共通
+- **MCP 接続**: 起動コマンドに `-c mcp_servers.tako.*` を一時注入する（`~/.codex/config.toml`
+  は汚さない。tako 外で起動した codex にはツールが出ない）。`env_vars`（親環境からの
+  引き継ぎホワイトリスト）で `TAKO_SOCKET` / `TAKO_TOKEN` / `TAKO_PANE_ID` / `TAKO_TAB_ID` /
+  `TAKO_ORCHESTRATOR_ROLE` が stdio ブリッジ（`tako mcp serve`）へ渡る
+- **worker への波及ガード**: `master_agent` が claude 以外のとき、プロファイルの `model` /
+  `effort` は claude worker へ**継承されない**（inherit / delegate / fixed フォールバックの
+  全経路で claude CLI 既定 / max に落ちる）。codex master + claude worker を混在させる場合、
+  worker のモデルは `worker_agents.claude` か `worker_model`（fixed）で明示する
+- **agy が master 非対応の理由**: agy の MCP 設定（JSON ファイル）にはペイン毎の接続情報
+  （TAKO_* 環境変数）を子プロセスへ引き継ぐ手段が無く、system prompt 注入オプションも無い。
+  `master_agent: agy` は設定時・起動時ともに明示エラーになる
+- **初回のフォルダ信頼**: codex は初回起動時に作業フォルダの信頼確認を出すことがある。
+  master は対話セッションなのでその場で承認すればよい（worker と違い事前信頼は書き込まない）
 
 ### worker のエージェント種別（claude / codex / agy。Issue #120）
 
@@ -163,10 +192,14 @@ tako orchestrator profiles set default --worker-agent codex
 tako orchestrator profiles set default --agent codex --agent-model gpt-5.6-terra --agent-effort medium
 tako orchestrator profiles set default --agent agy --agent-model "Gemini 3.5 Flash (High)" --agent-skip-permissions true
 tako orchestrator profiles set default --clear-worker-agent   # claude 既定へ戻す
+
+# master のエージェント種別（#127。model / effort はそのエージェントのネイティブ表記で）
+tako orchestrator profiles set sol --master-agent codex --model gpt-5.6-sol --effort xhigh
+tako orchestrator profiles set sol --clear-master-agent       # claude 既定へ戻す
 ```
 
-MCP からは `tako_orchestrator_profiles`（action: list / show / set。worker_agent /
-agent_* パラメータ対応）で同じ操作ができる。
+MCP からは `tako_orchestrator_profiles`（action: list / show / set。master_agent /
+worker_agent / agent_* パラメータ対応）で同じ操作ができる。
 
 ## 基本的な使い方
 
