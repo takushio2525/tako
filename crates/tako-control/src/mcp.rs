@@ -672,6 +672,44 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_preview_edit",
+            "description": "コードプレビューの編集モードを開始・終了する。enabled 省略時は状態取得。\
+                PDF・画像・動画・末尾省略された巨大ファイルは編集できない。状態は editing / dirty で返す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象プレビューペイン ID（省略時は呼び出し元）"),
+                    "enabled": { "type": "boolean", "description": "true = 編集開始、false = 編集終了（省略時は状態取得）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_preview_apply",
+            "description": "コードプレビューの編集バッファ全文を text で置き換える。編集モード未開始なら開始する。\
+                ファイルへはまだ書き込まず dirty になるため、続けて tako_preview_save を呼ぶ。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象プレビューペイン ID（省略時は呼び出し元）"),
+                    "text": { "type": "string", "description": "適用するファイル全文（UTF-8）" },
+                },
+                "required": ["text"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_preview_save",
+            "description": "コードプレビューの未保存編集をファイルへ書き戻す。読み込み後に外部変更があれば競合として拒否し、上書きしない。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象プレビューペイン ID（省略時は呼び出し元）"),
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_file_op",
             "description": "ファイル操作を実行する。op で種別を指定:\n\
                 copy_absolute_path = 絶対パスを取得 / copy_relative_path = ペイン cwd 基準の相対パスを取得 /\n\
@@ -1459,6 +1497,17 @@ fn build_request(
             },
             direction: direction_arg(args)?,
         },
+        "tako_preview_edit" => Request::PreviewEdit {
+            pane: Some(target_pane(args, caller)?),
+            enabled: bool_arg(args, "enabled")?,
+        },
+        "tako_preview_apply" => Request::PreviewApply {
+            pane: Some(target_pane(args, caller)?),
+            text: str_arg(args, "text")?.ok_or("text を指定する")?,
+        },
+        "tako_preview_save" => Request::PreviewSave {
+            pane: Some(target_pane(args, caller)?),
+        },
         "tako_file_op" => {
             let op_str = str_arg(args, "op")?.ok_or("op を指定する")?;
             let op = match op_str.as_str() {
@@ -2038,6 +2087,39 @@ mod tests {
     }
 
     #[test]
+    fn preview編集3操作をrequestへ写す() {
+        let (_, requests) = run(
+            call("tako_preview_edit", json!({ "enabled": true })),
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::PreviewEdit {
+                pane: Some(7),
+                enabled: Some(true),
+            }]
+        );
+        let (_, requests) = run(
+            call(
+                "tako_preview_apply",
+                json!({ "pane": 9, "text": "日本語\n" }),
+            ),
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::PreviewApply {
+                pane: Some(9),
+                text: "日本語\n".into(),
+            }]
+        );
+        let (_, requests) = run(call("tako_preview_save", json!({})), Some(7), true);
+        assert_eq!(requests, vec![Request::PreviewSave { pane: Some(7) }]);
+    }
+
+    #[test]
     fn tmux_openはセッション必須でドロップ位置相当を写す() {
         let (_, requests) = run(
             call(
@@ -2076,7 +2158,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 53);
+        assert_eq!(tools.len(), 56);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

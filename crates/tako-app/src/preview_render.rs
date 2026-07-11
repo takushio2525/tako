@@ -353,6 +353,22 @@ impl TakoApp {
         let md_capable = state.markdown_capable();
         let mode = state.mode;
         let truncated = state.truncated;
+        let edit_info = self.preview_edits.get(&pane_id).map(|edit| {
+            (
+                edit.editing,
+                edit.dirty(),
+                edit.message.clone(),
+                edit.buffer.line_byte_col(edit.buffer.cursor()),
+            )
+        });
+        let editing = edit_info.as_ref().is_some_and(|info| info.0);
+        let dirty = edit_info.as_ref().is_some_and(|info| info.1);
+        let edit_message = edit_info.as_ref().and_then(|info| info.2.clone());
+        let edit_cursor = edit_info.as_ref().filter(|info| info.0).map(|info| info.3);
+        let editable = matches!(
+            &state.content,
+            preview::PreviewContent::Code(_) | preview::PreviewContent::Markdown(_)
+        ) && !truncated;
 
         let pdf_info: Option<usize> = if let preview::PreviewContent::Pdf(data) = &state.content {
             Some(data.total_pages)
@@ -379,10 +395,13 @@ impl TakoApp {
                             .as_ref()
                             .and_then(|s| s.range_for_line(i, text.len()));
                         line_texts.push(text);
+                        let cursor_col = edit_cursor
+                            .filter(|(line, _)| *line == i)
+                            .map(|(_, col)| col);
                         self.preview_code_line_sel(
                             line,
                             Some((i + 1, number_width)),
-                            sel_range,
+                            (sel_range, cursor_col),
                             pane_id,
                             i,
                             cx,
@@ -998,11 +1017,15 @@ impl TakoApp {
                                     preview::PreviewMode::Pdf => "📕",
                                     _ => "📄",
                                 };
-                                format!("{icon} {}", truncate(&file_name, 36))
+                                format!(
+                                    "{icon} {}{}",
+                                    truncate(&file_name, 36),
+                                    if dirty { " ●" } else { "" }
+                                )
                             })),
                     )
                     .child(div().flex_grow(1.0))
-                    .children(md_capable.then(|| {
+                    .children((md_capable && edit_info.is_none()).then(|| {
                         // 目アイコンのトグル（FR-3.3）: コード表示 ⇔ md レンダリング
                         let (icon, label) = match mode {
                             preview::PreviewMode::Markdown => ("</>", "コードとして表示"),
@@ -1030,11 +1053,65 @@ impl TakoApp {
                             }))
                             .child(SharedString::from(format!("{icon} {label}")))
                     }))
+                    .children(editable.then(|| {
+                        div()
+                            .id(("preview-edit-toggle", pane_id.as_u64()))
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(hsla(if editing { theme.green } else { theme.accent }))
+                            .hover(|d| d.bg(rgba_alpha(theme.tab_active_background, 0.8)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if let Err(message) =
+                                    this.set_preview_editing_local(pane_id, !editing)
+                                {
+                                    if let Some(edit) = this.preview_edits.get_mut(&pane_id) {
+                                        edit.message = Some(message);
+                                    }
+                                }
+                                cx.notify();
+                            }))
+                            .child(if editing {
+                                "✓ 編集中"
+                            } else {
+                                "✎ 編集"
+                            })
+                    }))
+                    .children(dirty.then(|| {
+                        div()
+                            .id(("preview-save", pane_id.as_u64()))
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(hsla(theme.accent))
+                            .hover(|d| d.bg(rgba_alpha(theme.tab_active_background, 0.8)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                let _ = this.save_preview_local(pane_id);
+                                cx.notify();
+                            }))
+                            .child("保存 ⌘S")
+                    }))
                     .children(pdf_info.map(|total| {
                         div()
                             .text_size(px(11.0))
                             .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.6))
                             .child(SharedString::from(format!("{} ページ", total)))
+                    }))
+                    .children(edit_message.map(|message| {
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(hsla(if dirty { theme.yellow } else { theme.green }))
+                            .child(SharedString::from(truncate(&message, 36)))
                     }))
                     .child(
                         div()
@@ -1069,6 +1146,7 @@ impl TakoApp {
                                     },
                                 );
                                 this.preview_selecting = Some(pane_id);
+                                this.sync_editor_selection_from_preview(pane_id);
                                 cx.notify();
                             }
                         }),
@@ -1088,8 +1166,9 @@ impl TakoApp {
                             if let Some(pos) = this.preview_hit_test(pane_id, ev.position) {
                                 if let Some(sel) = this.preview_selections.get_mut(&pane_id) {
                                     sel.head = pos;
-                                    cx.notify();
                                 }
+                                this.sync_editor_selection_from_preview(pane_id);
+                                cx.notify();
                             }
                         }
                     }))
@@ -1201,11 +1280,12 @@ impl TakoApp {
         &self,
         line: &preview::Line,
         number: Option<(usize, usize)>,
-        sel_range: Option<(usize, usize)>,
+        interaction: (Option<(usize, usize)>, Option<usize>),
         pane_id: PaneId,
         line_idx: usize,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        let (sel_range, cursor_col) = interaction;
         let theme = &self.theme;
         let mut text = String::new();
         let mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
@@ -1240,11 +1320,17 @@ impl TakoApp {
             }
         }
         let highlights = merge_highlights(highlights);
+        let caret_char_col = cursor_col.map(|col| {
+            let col = snap_to_char_boundary(&text, col.min(text.len()));
+            text[..col].chars().count() as f32
+        });
+        let caret_cell_width = self.cell_size.map(|cell| cell.width).unwrap_or(px(8.0));
         let code_el = StyledText::new(text).with_default_highlights(&self.text_style(), highlights);
+        let caret_color = hsla(theme.accent);
         let entity = cx.entity().downgrade();
         let bounds_canvas = canvas(
             |_, _, _| (),
-            move |bounds, _, _, cx| {
+            move |bounds, _, window, cx| {
                 if let Some(e) = entity.upgrade() {
                     e.update(cx, |app, _| {
                         let list = app.preview_line_bounds.entry(pane_id).or_default();
@@ -1253,6 +1339,15 @@ impl TakoApp {
                         }
                         list[line_idx] = bounds;
                     });
+                }
+                if let Some(col) = caret_char_col {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(bounds.left() + caret_cell_width * col, bounds.top()),
+                            gpui::size(px(1.5), bounds.size.height),
+                        ),
+                        caret_color,
+                    ));
                 }
             },
         )

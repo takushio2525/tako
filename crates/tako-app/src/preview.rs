@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use tako_control::protocol::PreviewModeWire;
+use tako_core::TextBuffer;
 
 /// 読み込みの上限（巨大ファイルで UI を固めない。超過分は切り詰めて明示する）
 const MAX_BYTES: usize = 1_000_000;
@@ -171,6 +172,53 @@ pub struct PreviewState {
     pub content: PreviewContent,
     /// 上限超過で切り詰めたか（フッタで明示する）
     pub truncated: bool,
+}
+
+/// コードプレビューの軽量編集セッション（FR-3.5）。表示状態とは分離し、編集モードを
+/// OFF にしても未保存バッファを保持する。別ファイルで差し替える前に dirty を検査できる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditState {
+    pub buffer: TextBuffer,
+    pub editing: bool,
+    pub message: Option<String>,
+}
+
+impl EditState {
+    pub fn open(preview: &PreviewState) -> Result<Self, String> {
+        if preview.truncated {
+            return Err("末尾を省略した大きいファイルは安全のため編集できない".into());
+        }
+        if !matches!(preview.mode, PreviewMode::Code | PreviewMode::Markdown) {
+            return Err("テキスト以外のプレビューは編集できない".into());
+        }
+        let buffer = TextBuffer::open(&preview.path).map_err(|e| e.to_string())?;
+        if buffer.text().contains('\0') {
+            return Err("バイナリファイルは編集できない".into());
+        }
+        Ok(Self {
+            buffer,
+            editing: true,
+            message: None,
+        })
+    }
+
+    pub fn dirty(&self) -> bool {
+        self.buffer.dirty()
+    }
+}
+
+/// 編集中は入力ごとの全 syntect 再解析を避け、平文行へ即座に反映する。保存または
+/// 編集再開時のファイル読み込みで通常の background ハイライトへ戻る。
+pub fn apply_editor_text(preview: &mut PreviewState, edit: &EditState) {
+    preview.mode = PreviewMode::Code;
+    preview.content = PreviewContent::Code(
+        edit.buffer
+            .text()
+            .split('\n')
+            .map(|line| vec![plain_span(line)])
+            .collect(),
+    );
+    preview.truncated = false;
 }
 
 impl PreviewState {

@@ -309,6 +309,16 @@ pub enum Request {
         mode: Option<PreviewModeWire>,
         direction: Option<Direction>,
     },
+    /// コードプレビューの編集モードを切り替える（FR-3.5）。`enabled` 省略時は状態取得。
+    PreviewEdit {
+        pane: Option<u64>,
+        enabled: Option<bool>,
+    },
+    /// 編集バッファの全文を置き換える（GUI の個々のキー入力ではなく、CLI / MCP から
+    /// 編集内容を自然に適用するための操作）。保存は PreviewSave で明示する。
+    PreviewApply { pane: Option<u64>, text: String },
+    /// 編集バッファをファイルへ保存する。外部変更を検知した場合は上書きしない。
+    PreviewSave { pane: Option<u64> },
     /// ファイルシステム操作（FR-3.12）
     FileOp {
         op: FileOpKind,
