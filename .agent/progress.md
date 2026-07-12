@@ -541,3 +541,10 @@
   CLI `--worker-model-policy` + MCP `worker_model_policy` 追加。`scripts/clean-target.sh` 新設
 - 検証: 450 tests / fmt / clippy 緑。codex exec --dangerously で MCP 呼び出し承認バイパス実証。profiles set --worker-model-policy delegate → YAML 反映確認
 - 関連コミット: PR #133 squash merge（`b9b5b33`）+ `3739385`（-a never→bypass修正）
+
+## 2026-07-12（#134: ファイルツリーへの AI フォルダ追加・削除）
+- `tako tree add/remove/list` + MCP `tako_tree_folder`（計 57 ツール）。タブ単位・layout.json 永続化。
+  Tab に pinned_folders を追加し、sync_filetree_roots で cwd 由来 roots と合流表示。
+  master/solo system prompt にフォルダ追加ガイド追記
+- 検証: テスト 5 本 + build / fmt / clippy 全緑。実機は tako 再起動後に確認
+- 関連コミット: PR #135 squash merge（`cd57d77`）
