@@ -25,7 +25,7 @@ pub use git::{
     DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffTarget, GitBranch, GitCommit, GitStatus,
     GitStatusEntry, GraphLayout, GraphLine, GraphRow, GRAPH_PALETTE,
 };
-pub use links::{detect_links, link_at, DetectedLink, LinkKind};
+pub use links::{detect_links, detect_links_with_cwd, link_at, DetectedLink, LinkKind};
 pub use osc_tap::{OscEvent, PromptMark};
 pub use pane::{Pane, PaneId, PaneOrigin, TitleSource};
 pub use pane_tree::{
