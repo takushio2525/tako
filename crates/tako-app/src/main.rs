@@ -4140,21 +4140,57 @@ impl TakoApp {
         cx.notify();
     }
 
-    /// リンクを開く。URL はデフォルトブラウザ、パスはペイン分割。
+    /// リンクを開く。URL はデフォルトブラウザ、パスはペイン分割して表示。
     /// 将来 webview ペインに差し替える場合はここを変更する。
     fn open_link(
         &mut self,
         target: &str,
         kind: tako_core::LinkKind,
-        _pane_id: PaneId,
-        _cx: &mut Context<Self>,
+        pane_id: PaneId,
+        cx: &mut Context<Self>,
     ) {
         match kind {
             tako_core::LinkKind::Url => {
                 let _ = std::process::Command::new("open").arg(target).spawn();
             }
             tako_core::LinkKind::Path => {
-                // Phase 2（#147）で実装
+                let path = std::path::Path::new(target);
+                if path.is_dir() {
+                    // ディレクトリ: 右に分割して cd
+                    let result = tako_control::dispatch(
+                        self,
+                        tako_control::protocol::Request::Split {
+                            pane: Some(pane_id.as_u64()),
+                            tab: None,
+                            direction: Some(tako_control::protocol::Direction::Right),
+                            ratio: None,
+                            command: None,
+                            cwd: Some(target.to_string()),
+                            focus: Some(true),
+                        },
+                        PaneOrigin::User,
+                    );
+                    if let Err(e) = result {
+                        eprintln!("warning: ディレクトリを開けない: {e}");
+                    }
+                } else {
+                    // ファイル: 右に分割してプレビュー
+                    let result = tako_control::dispatch(
+                        self,
+                        tako_control::protocol::Request::OpenFile {
+                            pane: Some(pane_id.as_u64()),
+                            path: target.to_string(),
+                            mode: None,
+                            direction: Some(tako_control::protocol::Direction::Right),
+                        },
+                        PaneOrigin::User,
+                    );
+                    if let Err(e) = result {
+                        eprintln!("warning: ファイルを開けない: {e}");
+                    }
+                }
+                self.drain_pending_highlights(cx);
+                cx.notify();
             }
         }
     }
@@ -4358,7 +4394,8 @@ impl TakoApp {
             return;
         };
         let screen = session.screen(&self.theme);
-        let links = tako_core::detect_links(&screen);
+        let cwd = session.cwd().map(std::path::Path::to_path_buf);
+        let links = tako_core::detect_links_with_cwd(&screen, cwd.as_deref());
         self.pane_links.insert(pane_id, links);
     }
 
