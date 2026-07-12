@@ -4,24 +4,25 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-12・#143 setup FDA 案内ステップ強化）
+## 現在の対象（2026-07-13・#146 + #147 cmd+クリックリンク）
 
-#143 完了・merge 済み・install 済み。tako 再起動で新バイナリが反映される。
+#146（URL）・#147（パス）ともに完了・merge 済み・build-app.sh --install 済み。
+tako 再起動で新バイナリが反映される。
 
-- setup の依存チェック段階で FDA 案内を強化: TCC ダイアログが消える旨の説明、設定画面を開く対話、再起動案内
-- changes.yaml rev 6 追加で既存ユーザーにも配信
+- cmd+ホバーで URL / ファイルパスに下線表示、cmd+クリックで開く
+- URL → デフォルトブラウザ、ディレクトリ → 右分割 cd、ファイル → 右分割プレビュー
+- パス解決: cwd 相対 + ~ 展開 + 絶対パス（実在チェック付き）
 
 ## 直近の観点
 
-- この環境は FDA 付与済みのため「✓ 付与済み」パスを実機確認。未付与パスはコードレビューとテストで担保
-- 非対話（パイプ）環境でも壊れないことを確認
+- links.rs は GPUI 非依存（tako-core）で全テスト済み（URL 12 本 + パス 10 本）
+- open_link() は将来の webview 差し替えポイント
 
 ## 次の一手
 
+- tako 再起動で実機確認（cmd+クリックの動作）
 - Phase 5 の次候補は FR-3.8 Web ビューまたは FR-2.19 localhost ポートパネル
-- ユーザーの config.yaml に agents_sync セクションを設定（`tako setup` または手動）
 
 ## 現フェーズで Read すべき設計書
 
-- オーケストレーター: `.agent/orchestrator.md`
-- 要件: `.agent/requirements.md` FR-3.1 / FR-2.16
+- 要件: `.agent/requirements.md` FR-3.1 / FR-3.8 / FR-2.19

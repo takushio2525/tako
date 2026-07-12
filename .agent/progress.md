@@ -563,3 +563,10 @@
 - TCC ダイアログ頻発の原因説明・設定画面を開く対話・再起動案内を追加。changes.yaml rev 6 で既存ユーザーにも配信
 - 検証: 460 tests / fmt / clippy 全緑。実機 `setup --check` で付与済みパス確認、`--changes` で rev 6 配信確認
 - 関連コミット: PR #144 squash merge（`f97ca1a`）。build-app.sh --install 済み
+
+## 2026-07-13（#146 + #147: cmd+クリックリンク機能）
+- URL（#146）とファイル/ディレクトリパス（#147）の cmd+ホバー下線 + cmd+クリック開くを実装。
+  links.rs を tako-core に新設（GPUI 非依存）。URL テスト 12 本 + パステスト 10 本。
+  パス解決は cwd 相対 / ~ 展開 / 絶対パスの 3 戦略 + 実在チェック。:行:列 サフィックス除去対応
+- 関連コミット: PR #148（`c4af877`、#146）+ PR #149（`42a7322`、#147）。build-app.sh --install 済み
+- 次: tako 再起動で実機確認
