@@ -5854,11 +5854,35 @@ fn preview_text_layout_hit_test(
             return Some((i, 0));
         }
         if position.y <= bounds.bottom() {
-            let byte_offset = layout
+            // GPUI の index_for_position は glyph の内側判定で、キャレット境界ちょうどでは
+            // 直前 glyph の開始 byte を返す。raw と次の UTF-8 境界それぞれの実キャレット
+            // 座標を比較し、クリック点に近い挿入位置へ丸める。
+            let raw = layout
                 .index_for_position(position)
                 .unwrap_or_else(|nearest| nearest)
                 .min(line_text.len());
-            return Some((i, snap_to_char_boundary(line_text, byte_offset)));
+            let before = snap_to_char_boundary(line_text, raw);
+            let after = line_text[before..]
+                .chars()
+                .next()
+                .map(|ch| before + ch.len_utf8())
+                .unwrap_or(before);
+            let distance = |byte| {
+                layout
+                    .position_for_index(byte)
+                    .map(|caret| {
+                        let dx = f32::from(caret.x - position.x);
+                        let dy = f32::from(caret.y - position.y);
+                        dx * dx + dy * dy
+                    })
+                    .unwrap_or(f32::INFINITY)
+            };
+            let byte_offset = if distance(after) < distance(before) {
+                after
+            } else {
+                before
+            };
+            return Some((i, byte_offset));
         }
         last_text_line = Some(i);
     }
@@ -6265,6 +6289,11 @@ impl ControlHost for TakoApp {
         }
         self.preview_edits.remove(&pane);
         self.preview_selections.remove(&pane);
+        // 内容差し替えから次の paint まで旧ファイルの座標を hit-test に使わせない。
+        self.preview_line_bounds.remove(&pane);
+        self.preview_pdf_char_bounds.remove(&pane);
+        self.preview_text_layouts.remove(&pane);
+        self.preview_line_texts.remove(&pane);
         self.previews.insert(pane, state);
         Ok(())
     }
@@ -7305,6 +7334,38 @@ mod self_test {
         }
     }
 
+    /// CoreGraphics / PDFKit の両方が受理する xref 付き最小 PDF を生成する。
+    fn write_test_pdf(path: &std::path::Path) {
+        let content = b"BT /F1 14 Tf 14 TL 72 700 Td (Hello PDF) Tj T* (World 123) Tj ET";
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len();
+        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+        let off4 = pdf.len();
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let off5 = pdf.len();
+        pdf.extend_from_slice(
+            b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+        let xref = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for offset in [off1, off2, off3, off4, off5] {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        std::fs::write(path, pdf).expect("テスト PDF を書ける");
+    }
+
     /// 文字列をキーストローク列としてウィンドウへ流し込む
     fn type_text(any: AnyWindowHandle, cx: &mut AsyncApp, text: &str, enter: bool) {
         let text = text.to_string();
@@ -7413,6 +7474,89 @@ mod self_test {
                 bridge_roundtrip(&cli, &envs, &inputs)
             })
             .await
+    }
+
+    /// 実 `tako` CLI をバックグラウンドで完了まで待つ。
+    ///
+    /// PTY へ文字入力して固定時間待つ方式では、シェルのコマンド開始・終了と app 状態の観測が
+    /// 同期せず、処理が正しくても selftest 40 が偽失敗していた。CLI の IPC 応答は dispatch
+    /// 完了後に返るため、子プロセス終了を状態検証の同期点にする。
+    async fn cli_output_bg(
+        cx: &AsyncApp,
+        cli: &std::path::Path,
+        endpoint: &str,
+        token: &str,
+        pane: PaneId,
+        tab: TabId,
+        args: Vec<String>,
+    ) -> Option<std::process::Output> {
+        let cli = cli.to_path_buf();
+        let endpoint = endpoint.to_string();
+        let token = token.to_string();
+        let pane = pane.to_string();
+        let tab = tab.to_string();
+        cx.background_executor()
+            .spawn(async move {
+                std::process::Command::new(cli)
+                    .args(args)
+                    .env("TAKO_SOCKET", endpoint)
+                    .env("TAKO_TOKEN", token)
+                    .env("TAKO_PANE_ID", pane)
+                    .env("TAKO_TAB_ID", tab)
+                    .output()
+                    .ok()
+            })
+            .await
+    }
+
+    /// preview の次の paint で座標キャッシュが揃うまで待つ。
+    /// `set_preview` が旧キャッシュを破棄するため、存在確認は新しい内容の描画完了を表す。
+    async fn wait_for_preview_maps(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: PaneId,
+        pdf: bool,
+    ) -> bool {
+        for _ in 0..40 {
+            // typed WindowHandle<TakoApp>::update の内側で draw すると TakoApp の二重借用に
+            // なる。root entity を借用しない AnyWindowHandle 境界から描画する。
+            let _ = any.update(cx, |_, preview_window, cx| {
+                let _ = preview_window.draw(cx);
+            });
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+            let ready = window
+                .update(cx, |app, _, _| {
+                    let has_text = app
+                        .preview_line_texts
+                        .get(&pane)
+                        .is_some_and(|texts| !texts.is_empty());
+                    if pdf {
+                        has_text
+                            && app
+                                .preview_line_bounds
+                                .get(&pane)
+                                .is_some_and(|bounds| !bounds.is_empty())
+                            && app
+                                .preview_pdf_char_bounds
+                                .get(&pane)
+                                .is_some_and(|bounds| !bounds.is_empty())
+                    } else {
+                        has_text
+                            && app
+                                .preview_text_layouts
+                                .get(&pane)
+                                .is_some_and(|layouts| layouts.iter().any(Option::is_some))
+                    }
+                })
+                .unwrap_or(false);
+            if ready {
+                return true;
+            }
+        }
+        false
     }
 
     /// stdio ブリッジ（`tako mcp serve`）へ MCP メッセージ列を流し、応答行を回収する。
@@ -8330,40 +8474,81 @@ mod self_test {
             );
 
             // 40. 【回帰】2 ペイン構成（左右分割）で非フォーカス側を CLI close しても落ちない
-            //     （2026-06-11 常用報告: 根分割の崩しで panic→SIGABRT）。
-            //     直前の IME テストが入力行に残した「かくてい」を ctrl-u で消してから打つ
-            press(any, cx, "ctrl-u");
-            type_text(any, cx, &format!("{cli} tab new --title close-reg"), true);
-            wait(cx, 1200).await;
+            //     （2026-06-11 常用報告: 根分割の崩しで panic→SIGABRT）。実 CLI の終了を
+            //     同期点にし、固定待ち時間でコマンド完了を推測しない（#145 引き継ぎ時の偽失敗）。
+            let (caller_pane, caller_tab) = window
+                .update(cx, |app, _, _| {
+                    (app.focused_pane(), app.workspace.active_tab_id())
+                })
+                .unwrap_or_else(|_| fail("回帰 40: 呼び出し元の状態取得"));
+            let tab_new = cli_output_bg(
+                cx,
+                &cli_path,
+                &ipc_endpoint,
+                &token,
+                caller_pane,
+                caller_tab,
+                vec!["tab".into(), "new".into(), "--title".into(), "close-reg".into()],
+            )
+            .await
+            .unwrap_or_else(|| fail("回帰 40: tab new CLI 起動"));
+            check(tab_new.status.success(), "回帰 40: tab new CLI 応答");
             let reg_pane_a = window
                 .update(cx, |app, _, _| app.workspace.active_tab().tree().focused())
                 .unwrap_or_else(|_| fail("回帰 40: タブ作成後の状態取得"));
             // 既定はフォーカス維持の仕様（3c9d363）のため --focus で新ペインへ移す
-            type_text(any, cx, &format!("{cli} split --right --focus"), true);
-            wait(cx, 1500).await;
+            let reg_tab = window
+                .update(cx, |app, _, _| app.workspace.active_tab_id())
+                .unwrap_or_else(|_| fail("回帰 40: split 前のタブ取得"));
+            let split = cli_output_bg(
+                cx,
+                &cli_path,
+                &ipc_endpoint,
+                &token,
+                reg_pane_a,
+                reg_tab,
+                vec!["split".into(), "--right".into(), "--focus".into()],
+            )
+            .await
+            .unwrap_or_else(|| fail("回帰 40: split CLI 起動"));
+            check(split.status.success(), "回帰 40: split CLI 応答");
             let reg_pane_b = window
                 .update(cx, |app, _, _| app.workspace.active_tab().tree().focused())
                 .unwrap_or_else(|_| fail("回帰 40: split 後の状態取得"));
             check(reg_pane_b != reg_pane_a, "回帰 40: split で新ペイン");
             // 旧ペインへフォーカスを戻し、新ペイン（非フォーカス側）を外から閉じる
-            type_text(any, cx, &format!("{cli} focus {reg_pane_a}"), true);
-            wait(cx, 800).await;
-            type_text(any, cx, &format!("{cli} close --pane {reg_pane_b}"), true);
-            let mut collapsed = false;
-            for _ in 0..10 {
-                wait(cx, 300).await;
-                collapsed = window
-                    .update(cx, |app, _, _| {
-                        let tree = app.workspace.active_tab().tree();
-                        tree.len() == 1
-                            && tree.focused() == reg_pane_a
-                            && !app.terminals.contains_key(&reg_pane_b)
-                    })
-                    .unwrap_or(false);
-                if collapsed {
-                    break;
-                }
-            }
+            let focus = cli_output_bg(
+                cx,
+                &cli_path,
+                &ipc_endpoint,
+                &token,
+                reg_pane_b,
+                reg_tab,
+                vec!["focus".into(), reg_pane_a.to_string()],
+            )
+            .await
+            .unwrap_or_else(|| fail("回帰 40: focus CLI 起動"));
+            check(focus.status.success(), "回帰 40: focus CLI 応答");
+            let close = cli_output_bg(
+                cx,
+                &cli_path,
+                &ipc_endpoint,
+                &token,
+                reg_pane_a,
+                reg_tab,
+                vec!["close".into(), "--pane".into(), reg_pane_b.to_string()],
+            )
+            .await
+            .unwrap_or_else(|| fail("回帰 40: close CLI 起動"));
+            check(close.status.success(), "回帰 40: close CLI 応答");
+            let collapsed = window
+                .update(cx, |app, _, _| {
+                    let tree = app.workspace.active_tab().tree();
+                    tree.len() == 1
+                        && tree.focused() == reg_pane_a
+                        && !app.terminals.contains_key(&reg_pane_b)
+                })
+                .unwrap_or(false);
             check(collapsed, "CLI close 非フォーカスペインで根分割が崩れる");
 
             // 40b. split→close を 10 周しても落ちず fd が漏れない（PTY 起動は fd を食うため、
@@ -9769,35 +9954,8 @@ mod self_test {
             )
             .unwrap();
             let pdf_path = preview_dir.join("sample.pdf");
-            let pdf_content = b"BT /F1 14 Tf 72 700 Td (Hello PDF) Tj T* (World 123) Tj ET";
-            let mut pdf = Vec::new();
-            pdf.extend_from_slice(b"%PDF-1.4\n");
-            let off1 = pdf.len();
-            pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-            let off2 = pdf.len();
-            pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
-            let off3 = pdf.len();
-            pdf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
-            let off4 = pdf.len();
-            pdf.extend_from_slice(
-                format!("4 0 obj\n<< /Length {} >>\nstream\n", pdf_content.len()).as_bytes(),
-            );
-            pdf.extend_from_slice(pdf_content);
-            pdf.extend_from_slice(b"\nendstream\nendobj\n");
-            let off5 = pdf.len();
-            pdf.extend_from_slice(
-                b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
-            );
-            let xref = pdf.len();
-            pdf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
-            for o in [off1, off2, off3, off4, off5] {
-                pdf.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
-            }
-            pdf.extend_from_slice(
-                format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
-            );
-            std::fs::write(&pdf_path, &pdf).unwrap();
-            let preview_ok = window
+            write_test_pdf(&pdf_path);
+            let (code_ok, md_ok, pdf_ok, mode_ok, toggle_ok, list_ok, closed) = window
                 .update(cx, |app, _, cx| {
                     let base = app.focused_pane().as_u64();
                     let open = |app: &mut TakoApp, path: String, mode| {
@@ -9906,10 +10064,16 @@ mod self_test {
                     )
                     .is_ok()
                         && app.previews.is_empty();
-                    code_ok && md_ok && pdf_ok && mode_ok && toggle_ok && list_ok && closed
+                    (code_ok, md_ok, pdf_ok, mode_ok, toggle_ok, list_ok, closed)
                 })
-                .unwrap_or(false);
-            check(preview_ok, "プレビューペインの open / 再利用 / モード切替 / close");
+                .unwrap_or((false, false, false, false, false, false, false));
+            check(code_ok, "コードプレビューの open");
+            check(md_ok, "Markdown プレビューの再利用");
+            check(pdf_ok, "PDF プレビューの文字矩形抽出");
+            check(mode_ok, "プレビューモード指定");
+            check(toggle_ok, "プレビューモードの UI トグル");
+            check(list_ok, "プレビュー状態の list 公開");
+            check(closed, "プレビューペインの close");
 
             // 66b. `tako open` CLI e2e（開発不変条件）: ペイン内シェルから実 CLI で開く。
             //      開いた後のフォーカスはプレビューペインに在るため、検証は app 状態で行う
@@ -9942,25 +10106,30 @@ mod self_test {
             // 66b-2. プレビュー座標の機械検証（#145）。描画に使った GPUI TextLayout の
             // position_for_index → 実 preview_hit_test を往復し、行頭 / 行末 / 日本語 /
             // タブを確認する。旧 cell_width 換算値も証拠として出力する。
-            window
+            let md_pane = window
                 .update(cx, |app, preview_window, cx| {
-                    if let Some(pane) = app.previews.keys().next().copied() {
-                        if let Some(tab) = app
-                            .workspace
-                            .tabs()
-                            .iter()
-                            .find(|tab| tab.tree().contains(pane))
-                            .map(|tab| tab.id())
-                        {
-                            let _ = app.workspace.activate_tab(tab);
-                            let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
-                        }
+                    let pane = app.previews.keys().next().copied()?;
+                    if let Some(tab) = app
+                        .workspace
+                        .tabs()
+                        .iter()
+                        .find(|tab| tab.tree().contains(pane))
+                        .map(|tab| tab.id())
+                    {
+                        let _ = app.workspace.activate_tab(tab);
+                        let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
                     }
                     preview_window.refresh();
                     cx.notify();
+                    Some(pane)
                 })
-                .ok();
-            wait(cx, 300).await;
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| fail("座標検証用 Markdown preview がある"));
+            check(
+                wait_for_preview_maps(any, window, cx, md_pane, false).await,
+                "Markdown の座標キャッシュ生成",
+            );
             let (md_coordinates_ok, md_coordinate_record) = window
                 .update(cx, |app, _, _| {
                     let pane = *app.previews.keys().next().expect("preview がある");
@@ -9969,13 +10138,13 @@ mod self_test {
                         .preview_text_layouts
                         .get(&pane)
                         .expect("md layouts がある");
-                    let roundtrip = |line: usize, byte: usize| {
+                    let hit = |line: usize, byte: usize| {
                         let layout = layouts[line].as_ref().expect("text layout がある");
                         let mut position = layout
                             .position_for_index(byte)
                             .expect("byte の描画位置がある");
                         position.y += layout.line_height() / 2.0;
-                        app.preview_hit_test(pane, position) == Some((line, byte))
+                        app.preview_hit_test(pane, position)
                     };
                     let paragraph = texts
                         .iter()
@@ -9995,16 +10164,25 @@ mod self_test {
                         .nth(old_col)
                         .map(|(byte, _)| byte)
                         .unwrap_or(texts[0].len());
+                    let expected = [
+                        (0, 0),
+                        (0, 3),
+                        (0, texts[0].len()),
+                        (paragraph, 0),
+                        (paragraph, "日本語 ".len()),
+                        (paragraph, tab_end),
+                        (paragraph, paragraph_text.len()),
+                    ];
+                    let samples: Vec<_> = expected
+                        .into_iter()
+                        .map(|expected| (expected, hit(expected.0, expected.1)))
+                        .collect();
                     (
-                        roundtrip(0, 0)
-                            && roundtrip(0, 3)
-                            && roundtrip(0, texts[0].len())
-                            && roundtrip(paragraph, 0)
-                            && roundtrip(paragraph, "日本語 ".len())
-                            && roundtrip(paragraph, tab_end)
-                            && roundtrip(paragraph, paragraph_text.len()),
+                        samples
+                            .iter()
+                            .all(|(expected, actual)| Some(*expected) == *actual),
                         format!(
-                            "md heading byte=3 x={:.2} old_cell_byte={} shaped_byte=3; 日本語tab byte={}",
+                            "md heading byte=3 x={:.2} old_cell_byte={} shaped_byte=3; 日本語tab byte={}; hits={samples:?}",
                             f32::from(heading_position.x - heading_layout.bounds().left()),
                             old_byte,
                             tab_end,
@@ -10037,7 +10215,10 @@ mod self_test {
                     opened["pane"].as_u64().expect("pane が返る")
                 })
                 .unwrap_or(0);
-            wait(cx, 500).await;
+            check(
+                wait_for_preview_maps(any, window, cx, PaneId::from_raw(code_pane), false).await,
+                "コードの座標キャッシュ生成",
+            );
             let (code_coordinates_ok, code_coordinate_record, line0_before) = window
                 .update(cx, |app, _, _| {
                     let pane = PaneId::from_raw(code_pane);
@@ -10100,14 +10281,22 @@ mod self_test {
                     window.dispatch_event(
                         gpui::PlatformInput::ScrollWheel(ScrollWheelEvent {
                             position,
-                            delta: ScrollDelta::Pixels(point(px(0.0), px(500.0))),
+                            delta: ScrollDelta::Pixels(point(px(0.0), px(-500.0))),
                             ..ScrollWheelEvent::default()
                         }),
                         cx,
                     );
+                    // 次の paint 完了を存在で同期できるよう、旧位置のキャッシュを破棄する。
+                    app.preview_line_bounds.remove(&pane);
+                    app.preview_pdf_char_bounds.remove(&pane);
+                    app.preview_text_layouts.remove(&pane);
+                    app.preview_line_texts.remove(&pane);
                 })
                 .ok();
-            wait(cx, 500).await;
+            check(
+                wait_for_preview_maps(any, window, cx, PaneId::from_raw(code_pane), false).await,
+                "スクロール後の座標キャッシュ更新",
+            );
             let scroll_coordinates_ok = window
                 .update(cx, |app, _, _| {
                     let pane = PaneId::from_raw(code_pane);
@@ -10139,7 +10328,7 @@ mod self_test {
                 "スクロール後も code 座標が更新されて同じ文字位置へ往復する",
             );
 
-            let pdf_coordinates_ok = window
+            let pdf_opened = window
                 .update(cx, |app, _, cx| {
                     let pane = PaneId::from_raw(code_pane);
                     let opened = tako_control::dispatch(
@@ -10154,6 +10343,17 @@ mod self_test {
                     )
                     .expect("pdf を開ける");
                     cx.notify();
+                    opened["mode"].as_str() == Some("pdf")
+                })
+                .unwrap_or(false);
+            check(pdf_opened, "座標検証用 PDF を開く");
+            check(
+                wait_for_preview_maps(any, window, cx, PaneId::from_raw(code_pane), true).await,
+                "PDF の座標キャッシュ生成",
+            );
+            let pdf_coordinates_ok = window
+                .update(cx, |app, _, _| {
+                    let pane = PaneId::from_raw(code_pane);
                     let texts = app
                         .preview_line_texts
                         .get(&pane)
@@ -10170,16 +10370,24 @@ mod self_test {
                     let line0_chars = char_bounds.first().expect("pdf char line 0 がある");
                     let first = line0_chars.first().expect("pdf char 0 がある");
                     let last = line0_chars.last().expect("pdf 末尾 char がある");
-                    let first_center = first.center();
-                    let last_center = last.center();
+                    let caret_point = |bounds: &Bounds<Pixels>, fraction: f32| {
+                        point(
+                            bounds.left() + (bounds.right() - bounds.left()) * fraction,
+                            bounds.center().y,
+                        )
+                    };
+                    let first_start = caret_point(first, 0.25);
+                    let last_start = caret_point(last, 0.25);
+                    let last_end = caret_point(last, 0.75);
                     let first_byte = 0usize;
                     let last_byte = line0
                         .char_indices()
                         .last()
                         .map(|(byte, _)| byte)
                         .unwrap_or(0);
-                    let hit_start = app.preview_hit_test(pane, first_center) == Some((0, first_byte));
-                    let hit_end = app.preview_hit_test(pane, last_center) == Some((0, last_byte));
+                    let hit_start = app.preview_hit_test(pane, first_start);
+                    let hit_last_start = app.preview_hit_test(pane, last_start);
+                    let hit_end = app.preview_hit_test(pane, last_end);
                     app.preview_selections.insert(
                         pane,
                         PreviewSelection {
@@ -10188,11 +10396,16 @@ mod self_test {
                         },
                     );
                     let copied = app.preview_selected_text().as_deref() == Some("Hello");
-                    opened["mode"].as_str() == Some("pdf")
-                        && !line_bounds.is_empty()
+                    println!(
+                        "TAKO_PREVIEW_COORD: pdf first_x={:.2} last_x={:.2} hits={hit_start:?}/{hit_last_start:?}/{hit_end:?}",
+                        f32::from(first_start.x),
+                        f32::from(last_end.x),
+                    );
+                    !line_bounds.is_empty()
                         && !char_bounds.is_empty()
-                        && hit_start
-                        && hit_end
+                        && hit_start == Some((0, first_byte))
+                        && hit_last_start == Some((0, last_byte))
+                        && hit_end == Some((0, line0.len()))
                         && copied
                 })
                 .unwrap_or(false);
@@ -10218,50 +10431,76 @@ mod self_test {
                 })
                 .ok();
             wait(cx, 300).await;
-            // 66c. 軽量編集（FR-3.5）: 実 CLI で開始 → 全文適用 → 保存し、シェルの
-            //      grep で書き戻しを確認する。続けて MCP と同じ dispatch 起点でも保存する。
-            let (edit_preview_pane, edit_terminal_pane) = window
+            // 66c. 軽量編集（FR-3.5）: 実 CLI で開始 → 全文適用 → 保存し、子プロセスの
+            //      成功終了を同期点として書き戻しを確認する。続けて MCP と同じ dispatch
+            //      起点でも保存する。
+            let (edit_preview_pane, edit_terminal_pane, edit_tab) = window
                 .update(cx, |app, _, _| {
                     let preview = app.previews.keys().next().copied().expect("preview がある");
                     let terminal = app.terminals.keys().next().copied().expect("terminal がある");
                     let _ = app.workspace.active_tab_mut().tree_mut().focus(terminal);
-                    (preview.as_u64(), terminal.as_u64())
+                    (preview.as_u64(), terminal, app.workspace.active_tab_id())
                 })
-                .unwrap_or((0, 0));
-            type_text(
-                any,
-                cx,
-                &format!(
-                    "{cli} edit start --pane {edit_preview_pane} >/dev/null && \
-                     {cli} edit apply --pane {edit_preview_pane} 'CLI-日本語' >/dev/null && \
-                     {cli} edit save --pane {edit_preview_pane} >/dev/null && \
-                     grep -qx 'CLI-日本語' {} && echo TAKO-EDIT-66C",
-                    preview_dir.join("note.md").display()
+                .unwrap_or_else(|_| fail("編集 CLI の対象取得"));
+            for (label, args) in [
+                (
+                    "start",
+                    vec![
+                        "edit".into(),
+                        "start".into(),
+                        "--pane".into(),
+                        edit_preview_pane.to_string(),
+                    ],
                 ),
-                true,
-            );
-            let mut cli_edit_ok = false;
-            for _ in 0..12 {
-                wait(cx, 300).await;
-                cli_edit_ok = window
-                    .update(cx, |app, _, _| {
-                        app.terminals
-                            .iter()
-                            .find(|(pane, _)| pane.as_u64() == edit_terminal_pane)
-                            .is_some_and(|(_, session)| {
-                                session.visible_lines().join("\n").contains("TAKO-EDIT-66C")
-                            })
-                            && app
-                                .preview_edits
-                                .values()
-                                .any(|edit| !edit.dirty() && edit.buffer.text() == "CLI-日本語")
-                    })
-                    .unwrap_or(false);
-                if cli_edit_ok {
-                    break;
-                }
+                (
+                    "apply",
+                    vec![
+                        "edit".into(),
+                        "apply".into(),
+                        "--pane".into(),
+                        edit_preview_pane.to_string(),
+                        "CLI-日本語".into(),
+                    ],
+                ),
+                (
+                    "save",
+                    vec![
+                        "edit".into(),
+                        "save".into(),
+                        "--pane".into(),
+                        edit_preview_pane.to_string(),
+                    ],
+                ),
+            ] {
+                let output = cli_output_bg(
+                    cx,
+                    &cli_path,
+                    &ipc_endpoint,
+                    &token,
+                    edit_terminal_pane,
+                    edit_tab,
+                    args,
+                )
+                .await
+                .unwrap_or_else(|| fail(&format!("tako edit {label} CLI 起動")));
+                check(
+                    output.status.success(),
+                    &format!("tako edit {label} CLI 応答"),
+                );
             }
-            check(cli_edit_ok, "tako edit CLI の開始 / 適用 / 保存とファイル書き戻し");
+            let cli_edit_ok = window
+                .update(cx, |app, _, _| {
+                    std::fs::read_to_string(preview_dir.join("note.md"))
+                        .is_ok_and(|text| text == "CLI-日本語")
+                        && app.preview_edits.values().any(|edit| {
+                            !edit.dirty() && edit.buffer.text() == "CLI-日本語"
+                        })
+                })
+                .unwrap_or(false);
+            check(
+                cli_edit_ok,
+                "tako edit CLI の開始 / 適用 / 保存とファイル書き戻し",
+            );
             let mcp_edit_ok = window
                 .update(cx, |app, _, _| {
                     let applied = tako_control::dispatch(
@@ -10797,9 +11036,8 @@ mod self_test {
                     std::env::temp_dir().join(format!("tako-selftest-pdf-{}", std::process::id()));
                 let _ = std::fs::remove_dir_all(&pdf_dir);
                 std::fs::create_dir_all(&pdf_dir).expect("一時ディレクトリを作れる");
-                // 最小の有効な PDF（1 ページ・空白）
-                let pdf_content = b"%PDF-1.0\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj 2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj 3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj\nxref\n0 4\n0000000000 65535 f \n0000000009 00065 n \n0000000058 00000 n \n0000000115 00000 n \ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n190\n%%EOF";
-                std::fs::write(pdf_dir.join("test.pdf"), pdf_content).unwrap();
+                let pdf_path = pdf_dir.join("test.pdf");
+                write_test_pdf(&pdf_path);
                 let pdf_ok = window
                     .update(cx, |app, _, _cx| {
                         let base = app.focused_pane().as_u64();
@@ -10807,7 +11045,7 @@ mod self_test {
                             app,
                             tako_control::protocol::Request::OpenFile {
                                 pane: Some(base),
-                                path: pdf_dir.join("test.pdf").display().to_string(),
+                                path: pdf_path.display().to_string(),
                                 mode: None,
                                 direction: None,
                             },

@@ -1740,8 +1740,8 @@ mod tests {
         std::fs::create_dir_all(&scratchpad).ok();
         let pdf_path = scratchpad.join("test_text.pdf");
 
-        // Helvetica 埋め込みの最小 PDF を生成
-        let content = b"BT /F1 14 Tf 72 700 Td (Hello World) Tj ET";
+        // Helvetica 埋め込みの最小 2 行 PDF を生成。T* に使う leading は TL で明示する
+        let content = b"BT /F1 14 Tf 14 TL 72 700 Td (Hello World) Tj T* (Second Line) Tj ET";
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
         let off1 = pdf.len();
@@ -1770,11 +1770,11 @@ mod tests {
         );
         std::fs::write(&pdf_path, &pdf).unwrap();
 
-        let layers = pdf_render::extract_text_layers(&pdf_path, 1)
-            .expect("PDFKit のテキスト抽出は成功する");
+        let layers =
+            pdf_render::extract_text_layers(&pdf_path, 1).expect("PDFKit のテキスト抽出は成功する");
         assert_eq!(layers.len(), 1, "1 ページ分");
         let page = &layers[0];
-        assert!(!page.is_empty(), "テキスト行がある");
+        assert!(page.len() >= 2, "2 行のテキストがある: {page:?}");
         let all_text: String = page
             .iter()
             .map(|l| l.text.as_str())
@@ -1784,20 +1784,25 @@ mod tests {
             all_text.contains("Hello World"),
             "Hello World を含む: got {all_text:?}"
         );
-        // bbox と各文字矩形が非ゼロで、表示座標への変換元として使えること
-        let first_line = &page[0];
+        assert!(all_text.contains("Second Line"));
+        // 全行の bbox と各文字矩形が非ゼロで、表示座標への変換元として使えること
         assert!(
-            first_line.bbox[2] > 0.0 && first_line.bbox[3] > 0.0,
-            "bbox の幅・高さが正: {:?}",
-            first_line.bbox
+            page.iter().all(|line| line.bbox[2] > 0.0
+                && line.bbox[3] > 0.0
+                && line.char_boxes.len() == line.text.chars().count()
+                && line
+                    .char_boxes
+                    .iter()
+                    .all(|char_box| char_box.bbox[2] > 0.0 && char_box.bbox[3] > 0.0)),
+            "全行・全文字の bbox の幅・高さが正: {page:?}"
         );
-        assert_eq!(first_line.char_boxes.len(), first_line.text.chars().count());
         assert!(
-            first_line
+            page[0]
                 .char_boxes
                 .iter()
-                .all(|char_box| char_box.bbox[2] > 0.0 && char_box.bbox[3] > 0.0),
-            "全文字の bbox の幅・高さが正"
+                .zip(&page[1].char_boxes)
+                .any(|(first, second)| first.bbox[1] != second.bbox[1]),
+            "2 行の文字矩形は異なる y 座標を持つ"
         );
 
         std::fs::remove_dir_all(&scratchpad).ok();
