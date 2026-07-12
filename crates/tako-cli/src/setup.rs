@@ -419,6 +419,34 @@ pub fn run_check() -> Result<(), String> {
         }
     }
 
+    // エージェント共通ルール同期（Issue #136）
+    match tako_control::agents_sync::status() {
+        Ok(status) => {
+            let st = status["status"].as_str().unwrap_or("unknown");
+            match st {
+                "not_configured" => {
+                    eprintln!("  △ エージェント共通ルール同期: 未設定");
+                }
+                "up_to_date" => {
+                    eprintln!("  ✓ エージェント共通ルール同期: 最新");
+                }
+                "outdated" => {
+                    eprintln!(
+                        "  △ エージェント共通ルール同期: ずれあり（tako agents sync-rules で同期）"
+                    );
+                }
+                "source_missing" => {
+                    let path = status["source_path"].as_str().unwrap_or("?");
+                    eprintln!("  ✗ エージェント共通ルール同期: 正本が見つからない ({path})");
+                }
+                _ => {
+                    eprintln!("  ? エージェント共通ルール同期: {st}");
+                }
+            }
+        }
+        Err(e) => eprintln!("  △ エージェント共通ルール同期: 確認失敗 ({e})"),
+    }
+
     // プロファイル一覧
     match tako_control::orchestrator::list_profiles() {
         Ok(profiles) if !profiles.is_empty() => {

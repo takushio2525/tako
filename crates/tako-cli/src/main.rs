@@ -157,6 +157,10 @@ enum Command {
     /// AI が作業対象プロジェクトのフォルダを明示追加する
     #[command(subcommand)]
     Tree(TreeCommand),
+    /// エージェント共通ルールの同期（#136）。
+    /// 正本ファイルの内容を各エージェントのグローバル指示ファイルにマーカーブロックで埋め込む
+    #[command(subcommand, name = "agents")]
+    Agents(AgentsCommand),
 }
 
 #[derive(Subcommand)]
@@ -228,6 +232,28 @@ enum TreeCommand {
         /// 対象タブ ID（省略時は呼び出し元ペインのタブ）
         #[arg(long)]
         tab: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentsCommand {
+    /// 共通ルールを各エージェントのグローバル指示ファイルに同期する
+    SyncRules {
+        /// 正本ファイルの絶対パス（省略時は config.yaml の設定値）
+        #[arg(long)]
+        source: Option<String>,
+        /// 対象エージェント（複数指定可。省略時は設定値 or 全対象）
+        #[arg(long)]
+        targets: Option<Vec<String>>,
+        /// JSON で結果を出力する
+        #[arg(long)]
+        json: bool,
+    },
+    /// 同期の設定状態を確認する
+    Status {
+        /// JSON で結果を出力する
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1061,6 +1087,8 @@ fn main() -> ExitCode {
         }
         // FDA チェックはローカル処理（IPC 不要。ファイルシステムのみ）
         Command::Fda(ref sub) => fda_local(sub),
+        // エージェント共通ルール同期もローカル処理（IPC 不要）
+        Command::Agents(ref sub) => agents_local(sub),
         command => run(command),
     };
     match result {
@@ -1718,6 +1746,93 @@ fn fda_local(sub: &FdaCommand) -> Result<(), String> {
     }
 }
 
+fn agents_local(sub: &AgentsCommand) -> Result<(), String> {
+    match sub {
+        AgentsCommand::SyncRules {
+            source,
+            targets,
+            json,
+        } => {
+            let result =
+                tako_control::agents_sync::run_sync(source.as_deref(), targets.as_deref())?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_default()
+                );
+            } else {
+                if let Some(results) = result.get("results").and_then(|v| v.as_array()) {
+                    for r in results {
+                        let agent = r["agent"].as_str().unwrap_or("?");
+                        let action = r["action"].as_str().unwrap_or("?");
+                        let path = r["path"].as_str().unwrap_or("");
+                        let mark = match action {
+                            "updated" | "created" => "✓",
+                            "unchanged" => "─",
+                            "skipped" => "△",
+                            _ => "✗",
+                        };
+                        eprintln!("  {mark} {agent}: {action} ({path})");
+                        if let Some(bak) = r["backup"].as_str() {
+                            eprintln!("      バックアップ: {bak}");
+                        }
+                        if let Some(err) = r["error"].as_str() {
+                            eprintln!("      {err}");
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        AgentsCommand::Status { json } => {
+            let result = tako_control::agents_sync::status()?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_default()
+                );
+            } else {
+                let status = result["status"].as_str().unwrap_or("unknown");
+                match status {
+                    "not_configured" => {
+                        eprintln!("△ エージェント共通ルール同期: 未設定");
+                        eprintln!("  tako setup で正本ファイルを設定できます");
+                    }
+                    "source_missing" => {
+                        let path = result["source_path"].as_str().unwrap_or("?");
+                        eprintln!("✗ 正本ファイルが見つかりません: {path}");
+                    }
+                    "up_to_date" => {
+                        eprintln!("✓ エージェント共通ルール同期: 最新");
+                    }
+                    "outdated" => {
+                        eprintln!("△ エージェント共通ルール同期: ずれあり");
+                        eprintln!("  tako agents sync-rules で同期できます");
+                    }
+                    _ => {
+                        eprintln!("? 状態: {status}");
+                    }
+                }
+                if let Some(agents) = result["agents"].as_array() {
+                    for a in agents {
+                        let name = a["agent"].as_str().unwrap_or("?");
+                        let st = a["status"].as_str().unwrap_or("?");
+                        let mark = match st {
+                            "up_to_date" => "✓",
+                            "not_installed" => "─",
+                            "outdated" => "△",
+                            "not_synced" => "△",
+                            _ => "✗",
+                        };
+                        eprintln!("    {mark} {name}: {st}");
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 fn run(command: Command) -> Result<(), String> {
     let request = build_request(&command)?;
     let result = send_request(request)?;
@@ -2239,6 +2354,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 pane: caller_pane(),
             },
         },
+        Command::Agents(_) => unreachable!("agents は run() を通らない"),
     })
 }
 

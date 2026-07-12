@@ -1233,6 +1233,35 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_agents_sync_rules",
+            "description": "エージェント共通ルールの同期（#136）。\
+                正本ファイルの内容を各エージェント（claude / codex / agy）のグローバル指示ファイルに\
+                マーカーブロックで埋め込む。ブロック外の既存内容は一切変更しない。\
+                action=sync（既定）: 同期を実行し結果を返す。書き換え前にバックアップ(.bak)を生成する。\
+                action=status: 設定と現在の同期状態を返す（読み取り専用）。\
+                正本パスは tako setup で設定済みの値を使うが、source で一時的に上書きできる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["sync", "status"],
+                        "description": "操作種別（省略時は sync）",
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "正本ファイルの絶対パス（省略時は config.yaml の設定値）",
+                    },
+                    "targets": {
+                        "type": "array",
+                        "items": { "type": "string", "enum": ["claude", "codex", "agy"] },
+                        "description": "同期対象エージェント（省略時は設定値 or 全対象）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_tree_folder",
             "description": "ファイルツリーへのフォルダの追加・削除・一覧（#134）。\
                 AI が作業対象プロジェクトのフォルダをファイルツリーに明示追加する。\
@@ -1715,6 +1744,19 @@ fn build_request(
             action: str_arg(args, "action")?.map(|s| s.to_string()),
         },
         "tako_setup_changes" => Request::SetupChanges,
+        "tako_agents_sync_rules" => Request::AgentsSyncRules {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
+            source: str_arg(args, "source")?.map(|s| s.to_string()),
+            targets: {
+                let arr = args.get("targets").and_then(Value::as_array);
+                arr.map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect()
+                })
+            },
+        },
         "tako_tree_folder" => Request::TreeFolder {
             action: str_arg(args, "action")?
                 .ok_or("action を指定する")?
@@ -2196,7 +2238,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 57);
+        assert_eq!(tools.len(), 58);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
