@@ -548,3 +548,9 @@
   master/solo system prompt にフォルダ追加ガイド追記
 - 検証: テスト 5 本 + build / fmt / clippy 全緑。実機は tako 再起動後に確認
 - 関連コミット: PR #135 squash merge（`cd57d77`）
+
+## 2026-07-12（#136: エージェント共通ルール同期機能の追加）
+- `tako agents sync-rules` / `tako agents status` + MCP `tako_agents_sync_rules`（計 58 ツール）。
+  正本ファイルの内容を各エージェント指示ファイルにマーカーブロックで埋め込む。ブロック外不変・バックアップ付き
+- 検証: テスト 5 本 + build / fmt / clippy 全緑。一時 HOME で初回/再同期/unchanged/マーカー壊れ/正本空のエッジケース全通過
+- 関連コミット: PR #137 squash merge（`744c3c5`）
