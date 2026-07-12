@@ -153,6 +153,10 @@ enum Command {
     /// FDA を付与するとフォルダアクセス許可ダイアログが一括で出なくなる
     #[command(subcommand)]
     Fda(FdaCommand),
+    /// ファイルツリーへのフォルダの追加・削除・一覧（#134）。
+    /// AI が作業対象プロジェクトのフォルダを明示追加する
+    #[command(subcommand)]
+    Tree(TreeCommand),
 }
 
 #[derive(Subcommand)]
@@ -199,6 +203,32 @@ enum FdaCommand {
     Status,
     /// システム設定のフルディスクアクセスパネルを開く
     Open,
+}
+
+#[derive(Subcommand)]
+enum TreeCommand {
+    /// フォルダをファイルツリーに追加する
+    Add {
+        /// 追加するフォルダの絶対パス
+        path: String,
+        /// 対象タブ ID（省略時は呼び出し元ペインのタブ）
+        #[arg(long)]
+        tab: Option<u64>,
+    },
+    /// フォルダをファイルツリーから削除する
+    Remove {
+        /// 削除するフォルダの絶対パス
+        path: String,
+        /// 対象タブ ID（省略時は呼び出し元ペインのタブ）
+        #[arg(long)]
+        tab: Option<u64>,
+    },
+    /// 追加済みフォルダの一覧を表示する
+    List {
+        /// 対象タブ ID（省略時は呼び出し元ペインのタブ）
+        #[arg(long)]
+        tab: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2189,6 +2219,26 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 FdaCommand::Open => "open".to_string(),
             }),
         },
+        Command::Tree(sub) => match sub {
+            TreeCommand::Add { path, tab } => Request::TreeFolder {
+                action: "add".to_string(),
+                path: Some(resolve_cli_path(path)),
+                tab: *tab,
+                pane: caller_pane(),
+            },
+            TreeCommand::Remove { path, tab } => Request::TreeFolder {
+                action: "remove".to_string(),
+                path: Some(resolve_cli_path(path)),
+                tab: *tab,
+                pane: caller_pane(),
+            },
+            TreeCommand::List { tab } => Request::TreeFolder {
+                action: "list".to_string(),
+                path: None,
+                tab: *tab,
+                pane: caller_pane(),
+            },
+        },
     })
 }
 
@@ -2329,6 +2379,7 @@ fn print_result(command: &Command, result: &Value) {
         }
         Command::Chrome(_) => println!("{result}"),
         Command::Update(_) => println!("{}", pretty_json(result)),
+        Command::Tree(_) => println!("{}", pretty_json(result)),
         // remote は run() → print_result を通らない
         _ => {}
     }

@@ -426,3 +426,8 @@ These apply across tasks and PRs, on top of Task Intake and Acceptance Inspectio
    lines. Don't paste raw worker output at the user.
 5. **Guide the user**: after spawning, say which pane each worker is in; the
    panes are visible in the tab, and the user may click into them directly.
+6. **Register project folders**: when the user mentions a project or you spawn
+   workers for a specific repository, call `tako_tree_folder` with action "add"
+   and the project's absolute path. This pins the folder in the file tree
+   sidebar so the user can browse the code without leaving the tab. Remove it
+   when the work is done and the context shifts.

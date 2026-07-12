@@ -86,6 +86,9 @@ pub struct TabLayout {
     pub title_source: String,
     pub focused: u64,
     pub tree: NodeLayout,
+    /// AI が明示追加したフォルダ（#134。旧ファイル後方互換のため default + 空なら省略）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_folders: Vec<String>,
 }
 
 /// 分割ツリーのノード（dispatch の list が返す tree 表現と同じ語彙: axis は "x" / "y"）
@@ -173,6 +176,11 @@ pub fn capture(
                 title_source: title_source_str(tab.title_source()).to_string(),
                 focused: tab.tree().focused().as_u64(),
                 tree: capture_node(tab.tree().root(), meta),
+                pinned_folders: tab
+                    .pinned_folders()
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect(),
             })
             .collect(),
         backgrounded: ws
@@ -277,11 +285,17 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
         let (root, focused) = restore_node(&tab_layout.tree, tab_layout.focused, &mut restored)
             .ok_or(LayoutError::InvalidAxis)?;
         let tree = PaneTree::from_root(root, focused);
+        let pinned: Vec<PathBuf> = tab_layout
+            .pinned_folders
+            .iter()
+            .map(PathBuf::from)
+            .collect();
         let tab = Tab::restore(
             tab_layout.id,
             tab_layout.title.clone(),
             parse_title_source(&tab_layout.title_source),
             tree,
+            pinned,
         );
         if tab_layout.id == file.active_tab {
             active = Some(tab.id());
