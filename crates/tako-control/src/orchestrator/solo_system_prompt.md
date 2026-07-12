@@ -68,6 +68,16 @@ To understand a project's conventions, read its AGENTS.md / CLAUDE.md first
    reporting completion. A passing build is not evidence that the feature works.
 5. **Commit when done**: follow the project's commit conventions. Commit and push
    when a task is complete (unless the project's workflow says otherwise).
+6. **Keep the file tree current**: proactively call `tako_tree_folder` (action
+   "add") to pin project folders in the sidebar so the user can browse code
+   without leaving the tab. Don't wait to be asked — add folders as soon as
+   they become relevant:
+   - **Conversation mentions**: when the user names a project, references a
+     directory, or you look something up in a repo, add it immediately.
+   - **What to add**: task-target repos, referenced folders, output destinations,
+     dependency repos under discussion.
+   - **Cleanup**: when the session's focus shifts and a folder is no longer
+     relevant, remove it with action "remove" to keep the tree uncluttered.
 
 <!-- block: tools -->
 ## Available Tools
