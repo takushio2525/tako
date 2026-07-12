@@ -591,6 +591,9 @@ struct TakoApp {
     preview_line_bounds: HashMap<PaneId, Vec<Bounds<Pixels>>>,
     /// PDF プレビューの文字ごとの bounds（paint 時に canvas で記録。選択のヒット判定用）
     preview_pdf_char_bounds: HashMap<PaneId, Vec<Vec<Bounds<Pixels>>>>,
+    /// PDF 選択の最前面 canvas が直近フレームで発行した矩形数。
+    /// selftest が座標計算だけでなく paint 経路まで到達したことを検証する。
+    preview_pdf_highlight_paint_count: HashMap<PaneId, usize>,
     /// コード / Markdown の行ごとの GPUI 実描画レイアウト。
     /// 描画と同じ shaping 結果で座標を UTF-8 byte index へ逆写像する。
     preview_text_layouts: HashMap<PaneId, Vec<Option<TextLayout>>>,
@@ -1262,6 +1265,7 @@ impl TakoApp {
             preview_selecting: None,
             preview_line_bounds: HashMap::new(),
             preview_pdf_char_bounds: HashMap::new(),
+            preview_pdf_highlight_paint_count: HashMap::new(),
             preview_text_layouts: HashMap::new(),
             preview_line_texts: HashMap::new(),
             webviews: HashMap::new(),
@@ -2969,6 +2973,7 @@ impl TakoApp {
                 self.preview_selections.remove(&pane_id);
                 self.preview_line_bounds.remove(&pane_id);
                 self.preview_pdf_char_bounds.remove(&pane_id);
+                self.preview_pdf_highlight_paint_count.remove(&pane_id);
                 self.preview_text_layouts.remove(&pane_id);
                 self.preview_line_texts.remove(&pane_id);
                 self.scroll_accum.remove(&pane_id);
@@ -3007,6 +3012,7 @@ impl TakoApp {
                     self.preview_selections.remove(&id);
                     self.preview_line_bounds.remove(&id);
                     self.preview_pdf_char_bounds.remove(&id);
+                    self.preview_pdf_highlight_paint_count.remove(&id);
                     self.preview_text_layouts.remove(&id);
                     self.preview_line_texts.remove(&id);
                     self.scroll_accum.remove(&id);
@@ -6292,6 +6298,7 @@ impl ControlHost for TakoApp {
         // 内容差し替えから次の paint まで旧ファイルの座標を hit-test に使わせない。
         self.preview_line_bounds.remove(&pane);
         self.preview_pdf_char_bounds.remove(&pane);
+        self.preview_pdf_highlight_paint_count.remove(&pane);
         self.preview_text_layouts.remove(&pane);
         self.preview_line_texts.remove(&pane);
         self.previews.insert(pane, state);
@@ -7307,6 +7314,18 @@ fn main() {
                 .expect("ウィンドウを開けなかった");
             cx.activate(true);
 
+            if std::env::var_os("TAKO_VISUAL_TEST").is_some() {
+                #[cfg(feature = "visual-test")]
+                {
+                    self_test::run_visual(window, cx);
+                    return;
+                }
+                #[cfg(not(feature = "visual-test"))]
+                {
+                    eprintln!("TAKO_VISUAL_TEST には --features visual-test が必要");
+                    std::process::exit(1);
+                }
+            }
             if std::env::var_os("TAKO_SELF_TEST").is_some() {
                 self_test::run(window, cx);
             }
@@ -7521,9 +7540,7 @@ mod self_test {
         for _ in 0..40 {
             // typed WindowHandle<TakoApp>::update の内側で draw すると TakoApp の二重借用に
             // なる。root entity を借用しない AnyWindowHandle 境界から描画する。
-            let _ = any.update(cx, |_, preview_window, cx| {
-                let _ = preview_window.draw(cx);
-            });
+            let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
             cx.background_executor()
                 .timer(Duration::from_millis(50))
                 .await;
@@ -7557,6 +7574,138 @@ mod self_test {
             }
         }
         false
+    }
+
+    /// PDF 選択の最前面 canvas が実際に paint_quad を発行するまで、draw 完了を条件に待つ。
+    async fn wait_for_pdf_highlight_paint(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: PaneId,
+    ) -> bool {
+        for _ in 0..40 {
+            let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+            if window
+                .update(cx, |app, _, _| {
+                    app.preview_pdf_highlight_paint_count
+                        .get(&pane)
+                        .copied()
+                        .unwrap_or(0)
+                        > 0
+                })
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// background syntect の完了と、その色付き内容を使った TextLayout の paint を待つ。
+    async fn wait_for_preview_highlight(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: PaneId,
+    ) -> bool {
+        for _ in 0..80 {
+            let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+            let ready = window
+                .update(cx, |app, _, _| {
+                    let color_count = match app.previews.get(&pane).map(|state| &state.content) {
+                        Some(preview::PreviewContent::Code(lines)) => lines
+                            .iter()
+                            .flat_map(|line| line.iter())
+                            .filter_map(|span| span.color)
+                            .map(|color| (color.r, color.g, color.b))
+                            .collect::<std::collections::HashSet<_>>()
+                            .len(),
+                        _ => 0,
+                    };
+                    color_count > 1
+                        && app
+                            .preview_text_layouts
+                            .get(&pane)
+                            .is_some_and(|layouts| layouts.iter().any(Option::is_some))
+                })
+                .unwrap_or(false);
+            if ready {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Metal の最終 scene を直接 RGBA へ読み戻す。画面収録権限やウィンドウ前面化に
+    /// 依存しない実ピクセル検証で、`--features visual-test` のときだけ有効。
+    #[cfg(feature = "visual-test")]
+    fn capture_frame(any: AnyWindowHandle, cx: &mut AsyncApp) -> Option<(image::RgbaImage, f32)> {
+        any.update(cx, |_, window, cx| {
+            window.draw(cx).clear();
+            let scale = window.scale_factor();
+            match window.render_to_image() {
+                Ok(image) => Some((image, scale)),
+                Err(error) => {
+                    eprintln!("TAKO_VISUAL_CAPTURE_ERROR: {error:#}");
+                    None
+                }
+            }
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// 指定した論理座標矩形内で RGBA が変化したピクセル数。Metal 読み戻しの上下方向が
+    /// プラットフォームで異なる可能性を考慮し、通常 / Y 反転の多い方を採用する。
+    #[cfg(feature = "visual-test")]
+    fn changed_pixels_in_bounds(
+        before: &image::RgbaImage,
+        after: &image::RgbaImage,
+        bounds: &[Bounds<Pixels>],
+        scale: f32,
+    ) -> usize {
+        if before.dimensions() != after.dimensions() {
+            return 0;
+        }
+        let (width, height) = before.dimensions();
+        let count = |flip_y: bool| {
+            let mut pixels = std::collections::HashSet::new();
+            for bounds in bounds {
+                let left = (f32::from(bounds.left()) * scale).floor().max(0.0) as u32;
+                let right = (f32::from(bounds.right()) * scale)
+                    .ceil()
+                    .max(0.0)
+                    .min(width as f32) as u32;
+                let raw_top = (f32::from(bounds.top()) * scale).floor().max(0.0) as u32;
+                let raw_bottom = (f32::from(bounds.bottom()) * scale)
+                    .ceil()
+                    .max(0.0)
+                    .min(height as f32) as u32;
+                let (top, bottom) = if flip_y {
+                    (
+                        height.saturating_sub(raw_bottom),
+                        height.saturating_sub(raw_top),
+                    )
+                } else {
+                    (raw_top.min(height), raw_bottom.min(height))
+                };
+                for y in top..bottom {
+                    for x in left..right {
+                        if before.get_pixel(x, y) != after.get_pixel(x, y) {
+                            pixels.insert((x, y));
+                        }
+                    }
+                }
+            }
+            pixels.len()
+        };
+        count(false).max(count(true))
     }
 
     /// stdio ブリッジ（`tako mcp serve`）へ MCP メッセージ列を流し、応答行を回収する。
@@ -7613,6 +7762,227 @@ mod self_test {
                     .unwrap_or(false)
             })
             .unwrap_or(false)
+    }
+
+    /// #152 専用の実描画ピクセル検証。通常セルフテストから独立させ、既存の PTY / fd
+    /// ストレス項目のタイミングに左右されず PDF・C++・Python の scene だけを検査する。
+    #[cfg(feature = "visual-test")]
+    pub fn run_visual(window: WindowHandle<TakoApp>, cx: &mut App) {
+        cx.spawn(async move |cx| {
+            let any: AnyWindowHandle = window.into();
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            let dir = std::env::temp_dir()
+                .join(format!("tako-visual-preview-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("visual-test 一時ディレクトリを作れる");
+            let pdf_path = dir.join("sample.pdf");
+            write_test_pdf(&pdf_path);
+            std::fs::write(
+                dir.join("sample.cpp"),
+                "#include <iostream>\nint main() { std::cout << \"hello\"; return 0; }\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("sample.py"),
+                "def greet(name):\n    message = f\"Hello {name}\"\n    return message\n",
+            )
+            .unwrap();
+
+            let (base, pdf_pane) = window
+                .update(cx, |app, _, cx| {
+                    let base = app.focused_pane().as_u64();
+                    let opened = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::OpenFile {
+                            pane: Some(base),
+                            path: pdf_path.display().to_string(),
+                            mode: Some(tako_control::protocol::PreviewModeWire::Pdf),
+                            direction: None,
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .expect("visual-test PDF を dispatch で開ける");
+                    cx.notify();
+                    (
+                        base,
+                        PaneId::from_raw(
+                            opened["pane"]
+                                .as_u64()
+                                .expect("OpenFile 応答には pane がある"),
+                        ),
+                    )
+                })
+                .unwrap_or_else(|_| fail("visual-test PDF dispatch"));
+            check(
+                wait_for_preview_maps(any, window, cx, pdf_pane, true).await,
+                "visual-test PDF 文字矩形の paint",
+            );
+            let pdf_before = capture_frame(any, cx);
+            window
+                .update(cx, |app, _, cx| {
+                    app.preview_selections.insert(
+                        pdf_pane,
+                        PreviewSelection {
+                            anchor: (0, 0),
+                            head: (0, "Hello".len()),
+                        },
+                    );
+                    cx.notify();
+                })
+                .ok();
+            check(
+                wait_for_pdf_highlight_paint(any, window, cx, pdf_pane).await,
+                "visual-test PDF 最前面 paint_quad",
+            );
+            let pdf_bounds: Vec<Bounds<Pixels>> = window
+                .update(cx, |app, _, _| {
+                    app.preview_pdf_char_bounds
+                        .get(&pdf_pane)
+                        .and_then(|lines| lines.first())
+                        .map(|bounds| {
+                            bounds
+                                .iter()
+                                .take("Hello".len())
+                                .copied()
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            let pdf_after = capture_frame(any, cx);
+            let pdf_changed = match (pdf_before.as_ref(), pdf_after.as_ref()) {
+                (Some((before, scale)), Some((after, _))) => {
+                    changed_pixels_in_bounds(before, after, &pdf_bounds, *scale)
+                }
+                _ => 0,
+            };
+            println!("TAKO_VISUAL_PIXEL: pdf_selection changed={pdf_changed}");
+            check(
+                pdf_changed >= 8,
+                "visual-test PDF 選択領域の RGBA ピクセル変化",
+            );
+
+            for (language, file_name) in [("cpp", "sample.cpp"), ("python", "sample.py")] {
+                let opened = window
+                    .update(cx, |app, _, cx| {
+                        let opened = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::OpenFile {
+                                pane: Some(pdf_pane.as_u64()),
+                                path: dir.join(file_name).display().to_string(),
+                                mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                                direction: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .is_ok();
+                        cx.notify();
+                        opened
+                    })
+                    .unwrap_or(false);
+                check(opened, &format!("visual-test {language} dispatch"));
+                check(
+                    wait_for_preview_maps(any, window, cx, pdf_pane, false).await,
+                    &format!("visual-test {language} 平文 paint"),
+                );
+                let plain_frame = capture_frame(any, cx);
+                window
+                    .update(cx, |app, _, cx| app.drain_pending_highlights(cx))
+                    .ok();
+                check(
+                    wait_for_preview_highlight(any, window, cx, pdf_pane).await,
+                    &format!("visual-test {language} 読み取り色 paint"),
+                );
+                let read_frame = capture_frame(any, cx);
+                let edit_colors = window
+                    .update(cx, |app, _, cx| {
+                        app.set_preview_editing_local(pdf_pane, true)
+                            .expect("visual-test 編集開始");
+                        cx.notify();
+                        match app.previews.get(&pdf_pane).map(|state| &state.content) {
+                            Some(preview::PreviewContent::Code(lines)) => lines
+                                .iter()
+                                .flat_map(|line| line.iter())
+                                .filter_map(|span| span.color)
+                                .map(|color| (color.r, color.g, color.b))
+                                .collect::<std::collections::HashSet<_>>()
+                                .len(),
+                            _ => 0,
+                        }
+                    })
+                    .unwrap_or(0);
+                check(
+                    edit_colors > 1,
+                    &format!("visual-test {language} 編集構文色"),
+                );
+                let edit_frame = capture_frame(any, cx);
+                let text_bounds = window
+                    .update(cx, |app, _, _| {
+                        app.preview_text_layouts
+                            .get(&pdf_pane)
+                            .map(|layouts| {
+                                layouts
+                                    .iter()
+                                    .filter_map(|layout| layout.as_ref().map(TextLayout::bounds))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                let read_changed = match (plain_frame.as_ref(), read_frame.as_ref()) {
+                    (Some((plain, scale)), Some((read, _))) => {
+                        changed_pixels_in_bounds(plain, read, &text_bounds, *scale)
+                    }
+                    _ => 0,
+                };
+                let edit_changed = match (plain_frame.as_ref(), edit_frame.as_ref()) {
+                    (Some((plain, scale)), Some((edit, _))) => {
+                        changed_pixels_in_bounds(plain, edit, &text_bounds, *scale)
+                    }
+                    _ => 0,
+                };
+                println!(
+                    "TAKO_VISUAL_PIXEL: {language} read_changed={read_changed} edit_changed={edit_changed}"
+                );
+                check(
+                    read_changed >= 8,
+                    &format!("visual-test {language} 読み取り RGBA"),
+                );
+                check(
+                    edit_changed >= 8,
+                    &format!("visual-test {language} 編集 RGBA"),
+                );
+                window
+                    .update(cx, |app, _, _| {
+                        app.set_preview_editing_local(pdf_pane, false)
+                            .expect("visual-test 編集終了");
+                    })
+                    .ok();
+            }
+
+            window
+                .update(cx, |app, _, _| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Close {
+                            pane: Some(pdf_pane.as_u64()),
+                            force: true,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    let _ = app.workspace.active_tab_mut().tree_mut().focus(PaneId::from_raw(base));
+                })
+                .ok();
+            let _ = std::fs::remove_dir_all(&dir);
+            if let Some(discovery) = std::env::var_os("TAKO_DISCOVERY_DIR") {
+                let _ = std::fs::remove_dir_all(discovery);
+            }
+            println!("TAKO_VISUAL_TEST_OK");
+            std::process::exit(0);
+        })
+        .detach();
     }
 
     pub fn run(window: WindowHandle<TakoApp>, cx: &mut App) {
@@ -9953,6 +10323,16 @@ mod self_test {
                 "# Title\n\n日本語 abc\tend\n\n- item\n",
             )
             .unwrap();
+            std::fs::write(
+                preview_dir.join("sample.cpp"),
+                "#include <iostream>\nint main() { std::cout << \"hello\"; return 0; }\n",
+            )
+            .unwrap();
+            std::fs::write(
+                preview_dir.join("sample.py"),
+                "def greet(name):\n    message = f\"Hello {name}\"\n    return message\n",
+            )
+            .unwrap();
             let pdf_path = preview_dir.join("sample.pdf");
             write_test_pdf(&pdf_path);
             let (code_ok, md_ok, pdf_ok, mode_ok, toggle_ok, list_ok, closed) = window
@@ -10352,7 +10732,7 @@ mod self_test {
                 "PDF の座標キャッシュ生成",
             );
             let pdf_coordinates_ok = window
-                .update(cx, |app, _, _| {
+                .update(cx, |app, _, cx| {
                     let pane = PaneId::from_raw(code_pane);
                     let texts = app
                         .preview_line_texts
@@ -10395,6 +10775,7 @@ mod self_test {
                             head: (0, "Hello".len()),
                         },
                     );
+                    cx.notify();
                     let copied = app.preview_selected_text().as_deref() == Some("Hello");
                     println!(
                         "TAKO_PREVIEW_COORD: pdf first_x={:.2} last_x={:.2} hits={hit_start:?}/{hit_last_start:?}/{hit_end:?}",
@@ -10413,7 +10794,77 @@ mod self_test {
                 pdf_coordinates_ok,
                 "PDF の文字矩形ヒットテストと選択コピーが往復する",
             );
-
+            check(
+                wait_for_pdf_highlight_paint(
+                    any,
+                    window,
+                    cx,
+                    PaneId::from_raw(code_pane),
+                )
+                .await,
+                "PDF 選択が最前面 canvas の paint_quad へ到達",
+            );
+            // C++ / Python は background syntect 完了後の読み取り状態と編集状態で
+            // 複数色を確認する。実ピクセル比較は独立した TAKO_VISUAL_TEST で行う。
+            for (language, file_name) in [("cpp", "sample.cpp"), ("python", "sample.py")] {
+                let pane = PaneId::from_raw(code_pane);
+                let opened = window
+                    .update(cx, |app, _, cx| {
+                        let opened = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::OpenFile {
+                                pane: Some(code_pane),
+                                path: preview_dir.join(file_name).display().to_string(),
+                                mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                                direction: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .is_ok();
+                        cx.notify();
+                        opened
+                    })
+                    .unwrap_or(false);
+                check(opened, &format!("{language} の読み取りプレビューを開く"));
+                check(
+                    wait_for_preview_maps(any, window, cx, pane, false).await,
+                    &format!("{language} 平文フレームの描画"),
+                );
+                window
+                    .update(cx, |app, _, cx| app.drain_pending_highlights(cx))
+                    .ok();
+                check(
+                    wait_for_preview_highlight(any, window, cx, pane).await,
+                    &format!("{language} 読み取りの syntect 色付き描画"),
+                );
+                let editing_colors = window
+                    .update(cx, |app, _, cx| {
+                        app.set_preview_editing_local(pane, true)
+                            .expect("コード編集を開始できる");
+                        cx.notify();
+                        match app.previews.get(&pane).map(|state| &state.content) {
+                            Some(preview::PreviewContent::Code(lines)) => lines
+                                .iter()
+                                .flat_map(|line| line.iter())
+                                .filter_map(|span| span.color)
+                                .map(|color| (color.r, color.g, color.b))
+                                .collect::<std::collections::HashSet<_>>()
+                                .len(),
+                            _ => 0,
+                        }
+                    })
+                    .unwrap_or(0);
+                check(
+                    editing_colors > 1,
+                    &format!("{language} 編集表示も複数の構文色を保持"),
+                );
+                window
+                    .update(cx, |app, _, _| {
+                        app.set_preview_editing_local(pane, false)
+                            .expect("コード編集を終了できる");
+                    })
+                    .ok();
+            }
             // 後続の編集 e2e は note.md を対象にするため Markdown へ戻す。
             window
                 .update(cx, |app, _, cx| {
