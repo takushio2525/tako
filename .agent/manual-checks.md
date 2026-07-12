@@ -307,6 +307,17 @@ unit test とセルフテスト 66c で機械検証する。実 .app では GPUI
 - [ ] PDF の選択を ⌘C し、貼り付け先で同じ文字列（日本語を含む）が得られる
 - [ ] 編集モードでも読み取りモードと同等の構文色が付き、選択ハイライトとキャレットが同時に見える
 
+## PDF 選択描画・標準言語セット色分け（2026-07-13、#152）
+
+`TAKO_DISCOVERY_DIR=<一時dir> TAKO_PERSIST=0 TAKO_VISUAL_TEST=1 cargo run -p tako-app --features visual-test`
+は Metal の最終 scene を直接 RGBA へ読み戻し、PDF 選択前後と C++ / Python の平文→読み取り色→
+編集色の対象矩形ピクセル差分を機械検証する。実 .app では次を最終確認:
+
+- [ ] PDF の文字列を実マウスでドラッグし、青い半透明ハイライトが文字の真上へ出る
+- [ ] PDF を縦スクロール・ウィンドウリサイズした後も、選択位置とハイライトが追従する
+- [ ] `.cpp` / `.py` を読み取り表示と編集表示で開き、キーワード・文字列・数値等が複数色になる
+- [ ] `.rs` / `.js` / `.ts` / `.sh` も同様に複数色になり、編集・保存後も色が維持される
+
 ## ドラッグ&ドロップ 3 件（FR-2.16.10 / FR-3.11 / FR-1.10、2026-06-13）
 
 同等操作（dispatch TmuxOpen / OpenFile direction / MovePane target）と attach 実接続は

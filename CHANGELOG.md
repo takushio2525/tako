@@ -15,6 +15,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- PDF drag selection is visible again (#152): the PDF text canvas is now pinned to the page image's top-left instead of inheriting a static position below the image, and selection rectangles are composited in a dedicated topmost GPUI layer. Syntax highlighting now preserves line endings required by syntect's parser and uses one path/filename/shebang resolver for both read and edit modes across the bundled standard language set (including C++ and Python), with JavaScript fallback for TypeScript files
+  PDF のドラッグ選択ハイライトを再修正（#152）: PDF テキスト canvas を画像直後の static position ではなくページ画像左上へ固定し、選択矩形を GPUI の専用最前面 layer で合成する。シンタックスハイライトは syntect パーサが必要とする行末改行を保持し、読み取り／編集の両モードを同一のパス・特殊ファイル名・shebang 解決器へ統一した。C++／Python を含む同梱標準言語セット全体を対象とし、TypeScript は JavaScript 文法へ安全にフォールバックする
+
 - Preview selection now follows the actual GPUI-shaped text coordinates instead of terminal-cell estimates (#145), including Markdown font sizes, mixed Japanese/ASCII text, tabs, and vertical scrolling. PDF selection uses PDFKit line/character rectangles transformed onto the rendered page, and editable previews keep syntax colors while composing selection/caret highlights. Preview swaps invalidate stale coordinate caches, and self-tests synchronize on real CLI/paint completion instead of fixed delays
   プレビュー選択の座標ずれを修正（#145）: ターミナル固定セル換算をやめ、GPUI が実際に shaping した座標から Markdown の文字サイズ・日本語／半角混在・タブ・縦スクロール後の byte 位置を逆算する。PDF は PDFKit の行／文字矩形を表示ページへ変換して選択し、編集モードでも構文色と選択／キャレットを合成する。ファイル差し替え時は旧座標キャッシュを破棄し、セルフテストは固定待ちではなく実 CLI／paint 完了へ同期する
 
