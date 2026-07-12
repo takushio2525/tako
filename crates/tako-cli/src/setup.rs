@@ -174,32 +174,10 @@ fn run_dependency_check(interactive: bool) -> Vec<&'static str> {
             missing_required.push(dep.bin);
         }
     }
-    // FDA チェック（macOS のみ。任意だが推奨）
+    // FDA チェック（macOS のみ。任意だが強く推奨）
     #[cfg(target_os = "macos")]
     {
-        if tako_control::fda::is_granted() {
-            eprintln!("  ✓ フルディスクアクセス: 付与済み");
-        } else {
-            eprintln!("  △ フルディスクアクセス: 未付与（任意・推奨）");
-            eprintln!(
-                "      フォルダアクセス時に macOS の許可ダイアログが表示されることがあります"
-            );
-            eprintln!(
-                "      付与方法: tako fda open でシステム設定を開き、tako を追加してください"
-            );
-            if interactive {
-                eprint!("      今すぐシステム設定を開きますか？ [y/N]: ");
-                let mut input = String::new();
-                if std::io::stdin().read_line(&mut input).is_ok() {
-                    let answer = input.trim().to_ascii_lowercase();
-                    if answer == "y" || answer == "yes" {
-                        if let Err(e) = tako_control::fda::open_settings() {
-                            eprintln!("      ⚠ {e}");
-                        }
-                    }
-                }
-            }
-        }
+        run_fda_check(interactive);
     }
     missing_required
 }
@@ -229,6 +207,60 @@ fn offer_brew_install(pkg: &str, brew_bin: &str) -> bool {
             eprintln!("      ⚠ brew install {pkg} が失敗しました。手動で導入してください");
             false
         }
+    }
+}
+
+/// FDA（フルディスクアクセス）の案内ステップ。
+/// macOS の TCC（Transparency, Consent, and Control）による「ほかのアプリからの
+/// データへのアクセス権を求められています」ダイアログを一括で消す方法を案内する。
+#[cfg(target_os = "macos")]
+fn run_fda_check(interactive: bool) {
+    if tako_control::fda::is_granted() {
+        eprintln!("  ✓ フルディスクアクセス: 付与済み（許可ダイアログは表示されません）");
+        return;
+    }
+    eprintln!("  △ フルディスクアクセス: 未付与（推奨）");
+    eprintln!("      macOS が「tako.app から、ほかのアプリからのデータへのアクセス権を");
+    eprintln!("      求められています」と頻繁に表示する原因です。フルディスクアクセスを");
+    eprintln!("      付与すると、このダイアログが出なくなります。");
+    eprintln!(
+        "      設定方法: システム設定 → プライバシーとセキュリティ → フルディスクアクセス → tako を追加"
+    );
+    if !interactive {
+        eprintln!("      付与方法: tako fda open でシステム設定を開き、tako を追加してください");
+        return;
+    }
+    eprint!("      今すぐシステム設定を開きますか？ [y/N]: ");
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return;
+    }
+    let answer = input.trim().to_ascii_lowercase();
+    if answer != "y" && answer != "yes" {
+        eprintln!("      スキップしました（後から tako fda open で設定画面を開けます）");
+        return;
+    }
+    if let Err(e) = tako_control::fda::open_settings() {
+        eprintln!("      ⚠ {e}");
+        return;
+    }
+    eprintln!(
+        "      システム設定を開きました。tako を「フルディスクアクセス」に追加してください。"
+    );
+    eprintln!("      ⚠ 付与後、tako アプリの再起動が必要です（⌘Q で終了 → 再度起動）。");
+    eprintln!("        再起動するまで許可ダイアログが表示され続けることがあります。");
+
+    // 再チェック（FDA は再起動後に有効になるため通常ここでは検出できないが、
+    // 過去に付与済みで検出が遅延していた場合は拾える）
+    eprintln!();
+    eprint!("      設定しましたか？ 確認します... ");
+    // 設定画面での操作を待つ猶予
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    if tako_control::fda::is_granted() {
+        eprintln!("✓ 付与を確認しました！ tako を再起動すると反映されます。");
+    } else {
+        eprintln!("まだ検出できません。");
+        eprintln!("        付与後に tako を再起動すれば反映されます。今は先に進みます。");
     }
 }
 
