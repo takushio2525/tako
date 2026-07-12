@@ -563,16 +563,13 @@ impl TakoApp {
                                                 {
                                                     if ch.byte_range.end > sc
                                                         && ch.byte_range.start < ec
+                                                        && f32::from(ch_bounds.size.width) > 0.0
+                                                        && f32::from(ch_bounds.size.height) > 0.0
                                                     {
-                                                        if f32::from(ch_bounds.size.width) > 0.0
-                                                            && f32::from(ch_bounds.size.height)
-                                                                > 0.0
-                                                        {
-                                                            window.paint_quad(fill(
-                                                                *ch_bounds,
-                                                                hsla_alpha(sel_color, 0.35),
-                                                            ));
-                                                        }
+                                                        window.paint_quad(fill(
+                                                            *ch_bounds,
+                                                            hsla_alpha(sel_color, 0.35),
+                                                        ));
                                                     }
                                                 }
                                             }
