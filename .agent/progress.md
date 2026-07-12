@@ -570,3 +570,7 @@
   パス解決は cwd 相対 / ~ 展開 / 絶対パスの 3 戦略 + 実在チェック。:行:列 サフィックス除去対応
 - 関連コミット: PR #148（`c4af877`、#146）+ PR #149（`42a7322`、#147）。build-app.sh --install 済み
 - 次: tako 再起動で実機確認
+
+## 2026-07-13（#145: プレビュー選択座標 / PDF / 編集色）
+- GPUI 実 shaping + 最近傍 UTF-8 キャレット、PDFKit 文字矩形、編集時 syntect 色を統合。selftest 40 の固定待ちと 66b-2 の二重 update、既存 PDF fixture も修正し全セルフテスト完走
+- 関連: PR #151 squash merge（`c5618ca`）+ install 済み。#150 は 3 件とも selftest panic と確認して close
