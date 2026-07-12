@@ -39,6 +39,13 @@ impl TakoApp {
             }
         }
 
+        // #134: AI が明示追加したフォルダを合流
+        for folder in self.workspace.active_tab().pinned_folders() {
+            if !roots.contains(folder) {
+                roots.push(folder.clone());
+            }
+        }
+
         if roots.is_empty() {
             if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
                 roots.push(home);

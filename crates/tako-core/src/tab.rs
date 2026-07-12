@@ -1,6 +1,7 @@
 //! Tab — エージェントグループの単位（1 グループ = 1 タブ、`.agent/concept.md`）
 
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::pane::{Pane, TitleSource};
@@ -49,6 +50,8 @@ pub struct Tab {
     /// `title` の出どころ（FR-2.12.3。Default = 初期連番のまま）
     title_source: TitleSource,
     tree: PaneTree,
+    /// AI が明示追加したフォルダ（#134。ファイルツリーの root に cwd と並んで表示される）
+    pinned_folders: Vec<PathBuf>,
 }
 
 impl Tab {
@@ -58,18 +61,26 @@ impl Tab {
             title: title.into(),
             title_source: TitleSource::Default,
             tree: PaneTree::new(root_pane),
+            pinned_folders: Vec::new(),
         }
     }
 
     /// レイアウト復元用（Phase 5.5）。保存済み ID をそのまま再現する
     /// （`TAKO_TAB_ID` を再起動をまたいで有効に保つ）
-    pub fn restore(id: u64, title: String, title_source: TitleSource, tree: PaneTree) -> Self {
+    pub fn restore(
+        id: u64,
+        title: String,
+        title_source: TitleSource,
+        tree: PaneTree,
+        pinned_folders: Vec<PathBuf>,
+    ) -> Self {
         TabId::reserve(id);
         Self {
             id: TabId(id),
             title,
             title_source,
             tree,
+            pinned_folders,
         }
     }
 
@@ -122,6 +133,31 @@ impl Tab {
     /// タブを消費してペインツリーを取り出す（ペインの別タブ移送で使う）
     pub fn into_tree(self) -> PaneTree {
         self.tree
+    }
+
+    // --- pinned_folders（#134: AI からのフォルダ追加） ---
+
+    pub fn pinned_folders(&self) -> &[PathBuf] {
+        &self.pinned_folders
+    }
+
+    /// フォルダを追加する。既に含まれていれば false
+    pub fn add_pinned_folder(&mut self, path: PathBuf) -> bool {
+        if self.pinned_folders.contains(&path) {
+            return false;
+        }
+        self.pinned_folders.push(path);
+        true
+    }
+
+    /// フォルダを削除する。含まれていなければ false
+    pub fn remove_pinned_folder(&mut self, path: &PathBuf) -> bool {
+        if let Some(pos) = self.pinned_folders.iter().position(|p| p == path) {
+            self.pinned_folders.remove(pos);
+            true
+        } else {
+            false
+        }
     }
 }
 

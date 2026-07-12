@@ -94,6 +94,8 @@ pub trait ControlHost {
     fn reattach_backgrounded(&mut self, _pane: PaneId) {}
     /// ファイルツリーの表示・非表示（root の cwd 同期は実装側の責務）
     fn set_filetree(&mut self, _visible: bool) {}
+    /// ファイルツリーの root 同期をトリガーする（#134: pinned_folders 変更後に呼ぶ）
+    fn sync_filetree(&mut self) {}
     /// ペインのプレビュー状態（FR-3.2。`(path, mode)`。プレビューペインでなければ None）
     fn preview_state(&self, _pane: PaneId) -> Option<(String, crate::protocol::PreviewModeWire)> {
         None
@@ -1742,6 +1744,13 @@ fn dispatch_inner(
             // 追従の適用は `tako setup` の対話フロー側の責務（Issue #94）
             crate::setup::changes_status().map_err(DispatchError::Operation)
         }
+
+        Request::TreeFolder {
+            action,
+            path,
+            tab,
+            pane,
+        } => dispatch_tree_folder(host, &action, path, tab, pane),
     }
 }
 
@@ -2973,6 +2982,105 @@ fn trash_path_macos(path: &std::path::Path) -> Result<(), String> {
         return Err(format!("ゴミ箱への移動に失敗: {msg}"));
     }
     Ok(())
+}
+
+// --- ファイルツリーフォルダ操作 (#134) ---
+
+fn dispatch_tree_folder(
+    host: &mut dyn ControlHost,
+    action: &str,
+    path: Option<String>,
+    tab: Option<u64>,
+    pane: Option<u64>,
+) -> Result<Value, DispatchError> {
+    use std::path::PathBuf;
+
+    let tab_id = resolve_tab(host.workspace(), tab, pane)?;
+
+    match action {
+        "add" => {
+            let path_str = path.ok_or(DispatchError::InvalidParams("path を指定する".into()))?;
+            let abs = PathBuf::from(&path_str);
+            if !abs.is_absolute() {
+                return Err(DispatchError::InvalidParams("絶対パスを指定する".into()));
+            }
+            if !abs.is_dir() {
+                return Err(DispatchError::Operation(format!(
+                    "ディレクトリが存在しない: {path_str}"
+                )));
+            }
+            let canonical = abs.canonicalize().unwrap_or_else(|_| abs.clone());
+            let tab_mut = host
+                .workspace_mut()
+                .get_tab_mut(tab_id)
+                .ok_or(DispatchError::InvalidParams("タブが見つからない".into()))?;
+            if !tab_mut.add_pinned_folder(canonical.clone()) {
+                return Ok(
+                    json!({ "status": "already_exists", "path": canonical.display().to_string() }),
+                );
+            }
+            host.sync_filetree();
+            Ok(json!({ "status": "added", "path": canonical.display().to_string() }))
+        }
+        "remove" => {
+            let path_str = path.ok_or(DispatchError::InvalidParams("path を指定する".into()))?;
+            let abs = PathBuf::from(&path_str);
+            let canonical = abs.canonicalize().unwrap_or_else(|_| abs.clone());
+            let tab_mut = host
+                .workspace_mut()
+                .get_tab_mut(tab_id)
+                .ok_or(DispatchError::InvalidParams("タブが見つからない".into()))?;
+            if !tab_mut.remove_pinned_folder(&canonical) {
+                return Err(DispatchError::Operation(format!(
+                    "指定フォルダはピン留めされていない: {}",
+                    canonical.display()
+                )));
+            }
+            host.sync_filetree();
+            Ok(json!({ "status": "removed", "path": canonical.display().to_string() }))
+        }
+        "list" => {
+            let tab_ref = host
+                .workspace()
+                .get_tab(tab_id)
+                .ok_or(DispatchError::InvalidParams("タブが見つからない".into()))?;
+            let folders: Vec<String> = tab_ref
+                .pinned_folders()
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            Ok(json!({ "folders": folders, "tab": tab_id.as_u64() }))
+        }
+        _ => Err(DispatchError::InvalidParams(format!(
+            "action は add / remove / list のいずれか（受け取った値: {action}）"
+        ))),
+    }
+}
+
+/// タブ ID を解決する（tab 明示 > pane のタブ > アクティブタブ）
+fn resolve_tab(
+    ws: &Workspace,
+    tab: Option<u64>,
+    pane: Option<u64>,
+) -> Result<TabId, DispatchError> {
+    if let Some(t) = tab {
+        let tid = TabId::from_raw(t);
+        if ws.get_tab(tid).is_none() {
+            return Err(DispatchError::InvalidParams(format!(
+                "タブ {t} が見つからない"
+            )));
+        }
+        return Ok(tid);
+    }
+    if let Some(p) = pane {
+        let pid = PaneId::from_raw(p);
+        for t in ws.tabs() {
+            if t.tree().contains(pid) {
+                return Ok(t.id());
+            }
+        }
+    }
+    Ok(ws.active_tab().id())
 }
 
 #[cfg(test)]
@@ -4457,5 +4565,166 @@ mod tests {
             assert!(cmd.contains(" claude"), "{cmd}");
             assert!(cmd.contains("--effort high"), "{cmd}");
         });
+    }
+
+    // --- TreeFolder テスト (#134) ---
+
+    #[test]
+    fn tree_folder_追加と一覧と削除() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+
+        // 一覧: 初期は空
+        let list = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "list".into(),
+                path: None,
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(list["folders"].as_array().unwrap().len(), 0);
+
+        // 追加: /tmp（存在するディレクトリ）
+        let added = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "add".into(),
+                path: Some("/tmp".into()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(added["status"], "added");
+
+        // 一覧: 1 件
+        let list = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "list".into(),
+                path: None,
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(list["folders"].as_array().unwrap().len(), 1);
+
+        // 二重追加: already_exists
+        let dup = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "add".into(),
+                path: Some("/tmp".into()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(dup["status"], "already_exists");
+
+        // 削除
+        let removed = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "remove".into(),
+                path: Some("/tmp".into()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(removed["status"], "removed");
+
+        // 一覧: 0 件に戻る
+        let list = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "list".into(),
+                path: None,
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(list["folders"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn tree_folder_存在しないパスはエラー() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let result = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "add".into(),
+                path: Some("/nonexistent_path_xyz_12345".into()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn tree_folder_ファイルはエラー() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        // /etc/hosts は macOS に存在するファイル
+        let result = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "add".into(),
+                path: Some("/etc/hosts".into()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn tree_folder_相対パスはエラー() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let result = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "add".into(),
+                path: Some("relative/path".into()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn tree_folder_削除対象なしはエラー() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let result = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "remove".into(),
+                path: Some("/tmp".into()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(result.is_err());
     }
 }

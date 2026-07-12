@@ -508,6 +508,18 @@ pub enum Request {
     /// 適用済みリビジョン・現在リビジョン・未適用の setup 関連変更の一覧を返す。
     /// 適用自体は `tako setup`（対話）が行い、これは読み取り専用
     SetupChanges,
+    /// ファイルツリーへのフォルダ追加・削除・一覧（#134）。
+    /// AI が作業対象プロジェクトのフォルダをファイルツリーに明示追加する。タブ単位スコープ
+    TreeFolder {
+        /// "add" / "remove" / "list"
+        action: String,
+        /// 追加・削除するフォルダの絶対パス（list 時は省略可）
+        path: Option<String>,
+        /// 対象タブ ID（省略時は pane の属するタブ）
+        tab: Option<u64>,
+        /// 呼び出し元ペイン（タブ解決用）
+        pane: Option<u64>,
+    },
 }
 
 impl Request {

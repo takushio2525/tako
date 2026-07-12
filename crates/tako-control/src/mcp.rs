@@ -1232,6 +1232,34 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "tako_tree_folder",
+            "description": "ファイルツリーへのフォルダの追加・削除・一覧（#134）。\
+                AI が作業対象プロジェクトのフォルダをファイルツリーに明示追加する。\
+                追加されたフォルダは cwd 由来のエントリと並んでツリーに表示される。\
+                プロジェクトの指示を受けたらそのルートフォルダを追加し、\
+                作業対象外になったら削除する。タブ単位スコープ（永続化される）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["add", "remove", "list"],
+                        "description": "add: フォルダを追加, remove: フォルダを削除, list: 追加済み一覧"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "追加・削除するフォルダの絶対パス（list 時は省略可）"
+                    },
+                    "tab": {
+                        "type": "integer",
+                        "description": "対象タブ ID（省略時は呼び出し元ペインのタブ）"
+                    },
+                },
+                "required": ["action"],
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -1687,6 +1715,14 @@ fn build_request(
             action: str_arg(args, "action")?.map(|s| s.to_string()),
         },
         "tako_setup_changes" => Request::SetupChanges,
+        "tako_tree_folder" => Request::TreeFolder {
+            action: str_arg(args, "action")?
+                .ok_or("action を指定する")?
+                .to_string(),
+            path: str_arg(args, "path")?.map(|s| s.to_string()),
+            tab: u64_arg(args, "tab")?,
+            pane: caller,
+        },
         _ => return Err(format!("不明なツール: {name}")),
     })
 }
@@ -2160,7 +2196,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 56);
+        assert_eq!(tools.len(), 57);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
