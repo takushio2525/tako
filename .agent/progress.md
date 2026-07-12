@@ -558,3 +558,8 @@
 ## 2026-07-12（#141: ファイルツリー追加をプロンプトで積極指示）
 - master / solo 両方のデフォルト system prompt behavior 項目 6 を強化。会話中のプロジェクト・関連フォルダを聞かれる前に追加する行動規範に
 - 関連コミット: PR #142 squash merge（`8bb2104`）。build-app.sh --install 済み
+
+## 2026-07-12（#143: setup の FDA 案内ステップ強化）
+- TCC ダイアログ頻発の原因説明・設定画面を開く対話・再起動案内を追加。changes.yaml rev 6 で既存ユーザーにも配信
+- 検証: 460 tests / fmt / clippy 全緑。実機 `setup --check` で付与済みパス確認、`--changes` で rev 6 配信確認
+- 関連コミット: PR #144 squash merge（`f97ca1a`）。build-app.sh --install 済み
