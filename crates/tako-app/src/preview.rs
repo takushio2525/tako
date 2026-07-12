@@ -783,6 +783,12 @@ mod pdf_render {
 
     // --- PDFKit FFI（テキストレイヤ抽出） ---
 
+    // クラス名を Objective-C runtime から引くだけでは PDFKit がロードされる保証がない。
+    // 明示リンクしないと `objc_getClass("PDFDocument")` が null になり、テキストレイヤが
+    // 常に空へ劣化する（ページ画像は CoreGraphics 側なので表示だけは成功してしまう）。
+    #[link(name = "PDFKit", kind = "framework")]
+    extern "C" {}
+
     #[link(name = "objc", kind = "dylib")]
     extern "C" {
         fn objc_getClass(name: *const u8) -> *const core::ffi::c_void;
@@ -1764,33 +1770,35 @@ mod tests {
         );
         std::fs::write(&pdf_path, &pdf).unwrap();
 
-        let result = pdf_render::extract_text_layers(&pdf_path, 1);
-        match result {
-            Ok(layers) => {
-                assert_eq!(layers.len(), 1, "1 ページ分");
-                let page = &layers[0];
-                assert!(!page.is_empty(), "テキスト行がある");
-                let all_text: String = page
-                    .iter()
-                    .map(|l| l.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                assert!(
-                    all_text.contains("Hello World"),
-                    "Hello World を含む: got {all_text:?}"
-                );
-                // bbox が非ゼロであること
-                let first_line = &page[0];
-                assert!(
-                    first_line.bbox[2] > 0.0 && first_line.bbox[3] > 0.0,
-                    "bbox の幅・高さが正: {:?}",
-                    first_line.bbox
-                );
-            }
-            Err(e) => {
-                eprintln!("[skip] テキスト抽出失敗（環境依存）: {e}");
-            }
-        }
+        let layers = pdf_render::extract_text_layers(&pdf_path, 1)
+            .expect("PDFKit のテキスト抽出は成功する");
+        assert_eq!(layers.len(), 1, "1 ページ分");
+        let page = &layers[0];
+        assert!(!page.is_empty(), "テキスト行がある");
+        let all_text: String = page
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all_text.contains("Hello World"),
+            "Hello World を含む: got {all_text:?}"
+        );
+        // bbox と各文字矩形が非ゼロで、表示座標への変換元として使えること
+        let first_line = &page[0];
+        assert!(
+            first_line.bbox[2] > 0.0 && first_line.bbox[3] > 0.0,
+            "bbox の幅・高さが正: {:?}",
+            first_line.bbox
+        );
+        assert_eq!(first_line.char_boxes.len(), first_line.text.chars().count());
+        assert!(
+            first_line
+                .char_boxes
+                .iter()
+                .all(|char_box| char_box.bbox[2] > 0.0 && char_box.bbox[3] > 0.0),
+            "全文字の bbox の幅・高さが正"
+        );
 
         std::fs::remove_dir_all(&scratchpad).ok();
     }
