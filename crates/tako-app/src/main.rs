@@ -600,6 +600,19 @@ struct TakoApp {
     glyph_snap_cache: std::cell::RefCell<HashMap<char, bool>>,
     /// グリフ advance 実測用のテキストシステム（new で App から取得して保持）
     text_system: std::sync::Arc<gpui::TextSystem>,
+    /// cmd+ホバー中のリンク検出結果キャッシュ（ペインごと）
+    pane_links: HashMap<PaneId, Vec<tako_core::DetectedLink>>,
+    /// cmd+ホバーでヒットしているリンクのターゲット（視覚フィードバック用）
+    hovered_link: Option<HoveredLink>,
+}
+
+/// cmd+ホバーで検出されたリンク情報
+#[derive(Debug, Clone)]
+struct HoveredLink {
+    pane: PaneId,
+    target: String,
+    kind: tako_core::LinkKind,
+    spans: Vec<(usize, usize, usize)>,
 }
 
 /// git パネルのデータスナップショット（FR-3.6 / FR-3.9）
@@ -1247,6 +1260,8 @@ impl TakoApp {
             update_state: update_checker::UpdateState::Idle,
             glyph_snap_cache: std::cell::RefCell::new(HashMap::new()),
             text_system: cx.text_system().clone(),
+            pane_links: HashMap::new(),
+            hovered_link: None,
         };
         if restored.is_empty() {
             let root_id = app.workspace.active_tab().tree().focused();
@@ -4089,7 +4104,28 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) {
         let _ = self.workspace.active_tab_mut().tree_mut().focus(pane_id);
-        if let Some((col, row, right)) = self.cell_at(pane_id, event.position, window) {
+        if let Some((col, row, _right)) = self.cell_at(pane_id, event.position, window) {
+            // cmd+クリック: リンクを開く
+            if event.modifiers.platform && event.click_count == 1 {
+                if let Some(link) = self.hovered_link.take() {
+                    if link.pane == pane_id {
+                        self.open_link(&link.target, link.kind, pane_id, cx);
+                        cx.notify();
+                        return;
+                    }
+                }
+                // hovered_link が無くてもその場で検出を試みる
+                let links = self.pane_links.get(&pane_id);
+                if let Some(links) = links {
+                    if let Some(link) = tako_core::link_at(links, row, col) {
+                        let target = link.target.clone();
+                        let kind = link.kind;
+                        self.open_link(&target, kind, pane_id, cx);
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
             if let Some(session) = self.terminals.get(&pane_id) {
                 let kind = match event.click_count {
                     1 => SelectionKind::Simple,
@@ -4097,11 +4133,30 @@ impl TakoApp {
                     _ => SelectionKind::Line,
                 };
                 session.clear_selection();
-                session.start_selection(kind, col, row, right);
+                session.start_selection(kind, col, row, _right);
                 self.selecting = Some(pane_id);
             }
         }
         cx.notify();
+    }
+
+    /// リンクを開く。URL はデフォルトブラウザ、パスはペイン分割。
+    /// 将来 webview ペインに差し替える場合はここを変更する。
+    fn open_link(
+        &mut self,
+        target: &str,
+        kind: tako_core::LinkKind,
+        _pane_id: PaneId,
+        _cx: &mut Context<Self>,
+    ) {
+        match kind {
+            tako_core::LinkKind::Url => {
+                let _ = std::process::Command::new("open").arg(target).spawn();
+            }
+            tako_core::LinkKind::Path => {
+                // Phase 2（#147）で実装
+            }
+        }
     }
 
     /// 境界ハンドルの押下でドラッグ開始（リサイズ）。選択は始めない
@@ -4161,6 +4216,9 @@ impl TakoApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // cmd+ホバーでリンク検出（ボタン押下状態に関係なく判定）
+        self.update_hovered_link(event, window, cx);
+
         if event.pressed_button != Some(MouseButton::Left) {
             // ウィンドウ外でボタンが離されると MouseUp が届かないことがある。
             // 取り残したドラッグ・選択状態はここで畳む（残留すると以後どこを
@@ -4244,6 +4302,64 @@ impl TakoApp {
                 cx.notify();
             }
         }
+    }
+
+    /// cmd+ホバー時のリンク検出更新
+    fn update_hovered_link(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cmd = event.modifiers.platform;
+        let old = self.hovered_link.is_some();
+
+        if !cmd {
+            if self.hovered_link.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+
+        // マウス位置がどのペインのどのセルか判定
+        let mut found = None;
+        for &(pane_id, _) in &self.pane_text_areas {
+            if let Some((col, row, _)) = self.cell_at(pane_id, event.position, window) {
+                // リンクキャッシュを更新（ペインの画面が変わるたびにリフレッシュ）
+                self.refresh_pane_links(pane_id);
+                if let Some(links) = self.pane_links.get(&pane_id) {
+                    if let Some(link) = tako_core::link_at(links, row, col) {
+                        found = Some(HoveredLink {
+                            pane: pane_id,
+                            target: link.target.clone(),
+                            kind: link.kind,
+                            spans: link.spans.clone(),
+                        });
+                    }
+                }
+                break;
+            }
+        }
+
+        let changed = match (&self.hovered_link, &found) {
+            (Some(a), Some(b)) => a.target != b.target || a.pane != b.pane,
+            (None, None) => false,
+            _ => true,
+        };
+        self.hovered_link = found;
+        if changed || old {
+            cx.notify();
+        }
+    }
+
+    /// ペインのリンク検出キャッシュを更新する
+    fn refresh_pane_links(&mut self, pane_id: PaneId) {
+        let Some(session) = self.terminals.get(&pane_id) else {
+            return;
+        };
+        let screen = session.screen(&self.theme);
+        let links = tako_core::detect_links(&screen);
+        self.pane_links.insert(pane_id, links);
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, cx: &mut Context<Self>) {
@@ -4911,11 +5027,25 @@ impl TakoApp {
         else {
             return Vec::new();
         };
+        // cmd+ホバー中のリンクスパン（行番号→(start_col, end_col) のマップ）
+        let link_spans: HashMap<usize, (usize, usize)> = self
+            .hovered_link
+            .as_ref()
+            .filter(|h| h.pane == pane_id)
+            .map(|h| {
+                h.spans
+                    .iter()
+                    .map(|&(row, sc, ec)| (row, (sc, ec)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let _total_cols = screen.cols;
         screen
             .lines
             .into_iter()
-            .map(|line| {
+            .enumerate()
+            .map(|(row_idx, line)| {
                 if cell_width.is_none() {
                     // セル幅未計測: フォールバック（起動直後の一瞬のみ）
                     let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = line
@@ -4960,12 +5090,38 @@ impl TakoApp {
                 let infos = self.line_char_infos(&line);
                 let chunks = chunk_line_chars(&infos);
                 let mut children: Vec<gpui::AnyElement> = Vec::with_capacity(chunks.len());
+                let link_span = link_spans.get(&row_idx);
                 for chunk in chunks {
-                    let hl = if chunk.run_idx < run_highlights.len() {
+                    let mut hl = if chunk.run_idx < run_highlights.len() {
                         run_highlights[chunk.run_idx]
                     } else {
                         self.run_highlight(&fallback_run)
                     };
+                    // cmd+ホバー中のリンク範囲にチャンクが重なるなら下線を追加
+                    if let Some(&(link_sc, link_ec)) = link_span {
+                        let chunk_sc = line
+                            .cell_cols
+                            .get(chunk.start)
+                            .copied()
+                            .unwrap_or(chunk.start);
+                        let chunk_ec = if chunk.end > 0 {
+                            line.cell_cols
+                                .get(chunk.end - 1)
+                                .copied()
+                                .unwrap_or(chunk.end - 1)
+                                + infos.get(chunk.end - 1).map_or(1, |i| i.char_cols)
+                        } else {
+                            chunk_sc
+                        };
+                        if chunk_ec > link_sc && chunk_sc < link_ec {
+                            hl.underline = Some(UnderlineStyle {
+                                thickness: px(1.0),
+                                color: Some(hsla(theme.accent)),
+                                wavy: false,
+                            });
+                            hl.color = Some(hsla(theme.accent));
+                        }
+                    }
                     let text: String = infos[chunk.start..chunk.end].iter().map(|x| x.ch).collect();
                     let text_len = text.len();
                     let styled = StyledText::new(SharedString::from(text))
@@ -5272,6 +5428,10 @@ impl TakoApp {
             .get(&pane_id)
             .is_some_and(|c| c.state.in_mode);
         let lines = self.terminal_screen_lines(pane_id, !scrolled_in_tmux);
+        let has_link_hover = self
+            .hovered_link
+            .as_ref()
+            .is_some_and(|h| h.pane == pane_id);
 
         div()
             .id(("pane", pane_id.as_u64()))
@@ -5512,6 +5672,7 @@ impl TakoApp {
                     .flex_1()
                     .p(px(PANE_PADDING))
                     .overflow_hidden()
+                    .when(has_link_hover, |d| d.cursor(CursorStyle::PointingHand))
                     .children(lines),
             )
             .children(scrollbar.map(|(top, thumb_h, track_h, alpha, dragging)| {
