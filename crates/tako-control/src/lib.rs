@@ -14,6 +14,7 @@
 //! - claude_tui: Claude Code TUI の画面状態検出とプロンプト送達確認（Issue #32）
 
 pub mod agents;
+pub mod agents_sync;
 pub mod claude_tui;
 pub mod diag;
 pub mod discovery;

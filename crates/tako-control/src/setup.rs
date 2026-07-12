@@ -23,6 +23,12 @@ pub struct SetupConfig {
     pub orchestrator: OrchestratorConfig,
     #[serde(default)]
     pub setup: SetupState,
+    /// エージェント共通ルール同期の設定（Issue #136）
+    #[serde(
+        default,
+        skip_serializing_if = "crate::agents_sync::AgentsSyncConfig::is_default"
+    )]
+    pub agents_sync: crate::agents_sync::AgentsSyncConfig,
 }
 
 /// config.yaml の orchestrator セクション。

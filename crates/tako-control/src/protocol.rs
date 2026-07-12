@@ -508,6 +508,18 @@ pub enum Request {
     /// 適用済みリビジョン・現在リビジョン・未適用の setup 関連変更の一覧を返す。
     /// 適用自体は `tako setup`（対話）が行い、これは読み取り専用
     SetupChanges,
+    /// エージェント共通ルールの同期（Issue #136）。
+    /// `action` = "sync"（同期実行）/ "status"（状態確認）
+    AgentsSyncRules {
+        #[serde(default)]
+        action: Option<String>,
+        /// 正本パスの一時上書き（config.yaml の設定より優先。省略時は設定値）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        /// 対象エージェントの絞り込み（省略時は設定値、設定値も無ければ全対象）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        targets: Option<Vec<String>>,
+    },
     /// ファイルツリーへのフォルダ追加・削除・一覧（#134）。
     /// AI が作業対象プロジェクトのフォルダをファイルツリーに明示追加する。タブ単位スコープ
     TreeFolder {

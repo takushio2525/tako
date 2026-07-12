@@ -1745,6 +1745,22 @@ fn dispatch_inner(
             crate::setup::changes_status().map_err(DispatchError::Operation)
         }
 
+        Request::AgentsSyncRules {
+            action,
+            source,
+            targets,
+        } => {
+            let action = action.as_deref().unwrap_or("sync");
+            match action {
+                "sync" => crate::agents_sync::run_sync(source.as_deref(), targets.as_deref())
+                    .map_err(DispatchError::Operation),
+                "status" => crate::agents_sync::status().map_err(DispatchError::Operation),
+                other => Err(DispatchError::InvalidParams(format!(
+                    "不明な action: {other:?}（sync / status のいずれか）"
+                ))),
+            }
+        }
+
         Request::TreeFolder {
             action,
             path,
