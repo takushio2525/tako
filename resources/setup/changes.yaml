@@ -114,3 +114,16 @@ changes:
           節が既にあるかを確認する。無ければ templates/sections/06-completion-verification.md
           を参考に追加を提案する。既にあれば対象外。追記はユーザーの同意を得てから行い、
           既存の記述は書き換えない
+
+  - revision: 6
+    version: "0.3.3"
+    date: "2026-07-12"
+    kind: auto
+    title: setup の FDA 案内ステップを強化（TCC ダイアログ頻発の解消案内）
+    description: |
+      setup の依存チェック段階で FDA（フルディスクアクセス）の案内を強化した（Issue #143）。
+      macOS の「ほかのアプリからのデータへのアクセス権を求められています」ダイアログが
+      頻繁に表示される原因が FDA 未付与であること、付与方法（システム設定を開く）、
+      付与後に tako アプリの再起動が必要なことを案内する。
+      setup 再実行でチェックが自動で走るため、個別の適用作業は不要。
+      `tako setup --check` でも同じチェックを確認できる。
