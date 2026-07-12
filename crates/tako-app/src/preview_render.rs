@@ -381,6 +381,9 @@ impl TakoApp {
 
         // テキスト行を収集（選択テキスト抽出 + bounds 追跡用）
         let mut line_texts: Vec<String> = Vec::new();
+        // Code / Markdown は StyledText 自身の TextLayout を保持し、ヒットテストと
+        // キャレット描画を実際の shaping 結果に一致させる。
+        let mut line_layouts: Vec<Option<TextLayout>> = Vec::new();
 
         // 本文要素を先に組む（state の借用をここで終える）
         let body: Vec<gpui::AnyElement> = match &state.content {
@@ -398,15 +401,14 @@ impl TakoApp {
                         let cursor_col = edit_cursor
                             .filter(|(line, _)| *line == i)
                             .map(|(_, col)| col);
-                        self.preview_code_line_sel(
+                        let (element, layout) = self.preview_code_line_sel(
                             line,
                             Some((i + 1, number_width)),
                             (sel_range, cursor_col),
-                            pane_id,
-                            i,
                             cx,
-                        )
-                        .into_any_element()
+                        );
+                        line_layouts.push(Some(layout));
+                        element.into_any_element()
                     })
                     .collect()
             }
@@ -419,7 +421,9 @@ impl TakoApp {
                         .as_ref()
                         .and_then(|s| s.range_for_line(i, text.len()));
                     line_texts.push(text);
-                    self.preview_md_block_sel(block, sel_range, pane_id, i, cx)
+                    let (element, layout) = self.preview_md_block_sel(block, sel_range);
+                    line_layouts.push(layout);
+                    element
                 })
                 .collect(),
             preview::PreviewContent::Image(data) => {
@@ -500,6 +504,8 @@ impl TakoApp {
                                 }
                                 let scale_x = img_w / pdf_w;
                                 let scale_y = img_h / pdf_h;
+                                let mut page_char_bounds: Vec<Vec<Bounds<Pixels>>> =
+                                    Vec::with_capacity(text_lines_for_canvas.len());
 
                                 // bounds 追跡: 各行の画面座標を preview_line_bounds に登録
                                 if let Some(e) = entity.upgrade() {
@@ -530,43 +536,83 @@ impl TakoApp {
                                 // 選択ハイライトの描画
                                 if let Some((ref sel, offset)) = sel_highlight {
                                     for (j, tl) in text_lines_for_canvas.iter().enumerate() {
+                                        let mut line_char_bounds =
+                                            Vec::with_capacity(tl.char_boxes.len());
+                                        for ch in &tl.char_boxes {
+                                            let sx = bounds.origin.x
+                                                + px(ch.bbox[0] as f32 * scale_x as f32);
+                                            let sy = bounds.origin.y
+                                                + px((pdf_h - ch.bbox[1] - ch.bbox[3]) as f32
+                                                    * scale_y as f32);
+                                            let sw = px(ch.bbox[2] as f32 * scale_x as f32);
+                                            let sh = px(ch.bbox[3] as f32 * scale_y as f32);
+                                            line_char_bounds.push(Bounds {
+                                                origin: point(sx, sy),
+                                                size: gpui::size(sw, sh),
+                                            });
+                                        }
                                         let global_j = offset + j;
                                         let line_range =
                                             sel.range_for_line(global_j, tl.text.len());
                                         if let Some((sc, ec)) = line_range {
-                                            if tl.text.is_empty() || tl.bbox[2] <= 0.0 {
-                                                continue;
-                                            }
-                                            let char_count = tl.text.chars().count().max(1);
-                                            let char_w = tl.bbox[2] / char_count as f64;
-
-                                            let sc_chars =
-                                                tl.text[..sc.min(tl.text.len())].chars().count();
-                                            let ec_chars =
-                                                tl.text[..ec.min(tl.text.len())].chars().count();
-
-                                            let x_start = tl.bbox[0] + sc_chars as f64 * char_w;
-                                            let x_end = tl.bbox[0] + ec_chars as f64 * char_w;
-
-                                            let sx = bounds.origin.x
-                                                + px(x_start as f32 * scale_x as f32);
-                                            let sy = bounds.origin.y
-                                                + px((pdf_h - tl.bbox[1] - tl.bbox[3]) as f32
-                                                    * scale_y as f32);
-                                            let sw = px((x_end - x_start) as f32 * scale_x as f32);
-                                            let sh = px(tl.bbox[3] as f32 * scale_y as f32);
-
-                                            if f32::from(sw) > 0.0 && f32::from(sh) > 0.0 {
-                                                window.paint_quad(fill(
-                                                    Bounds {
-                                                        origin: point(sx, sy),
-                                                        size: gpui::size(sw, sh),
-                                                    },
-                                                    hsla_alpha(sel_color, 0.35),
-                                                ));
+                                            if !tl.text.is_empty() && tl.bbox[2] > 0.0 {
+                                                for (ch, ch_bounds) in tl
+                                                    .char_boxes
+                                                    .iter()
+                                                    .zip(line_char_bounds.iter())
+                                                {
+                                                    if ch.byte_range.end > sc
+                                                        && ch.byte_range.start < ec
+                                                    {
+                                                        if f32::from(ch_bounds.size.width) > 0.0
+                                                            && f32::from(ch_bounds.size.height)
+                                                                > 0.0
+                                                        {
+                                                            window.paint_quad(fill(
+                                                                *ch_bounds,
+                                                                hsla_alpha(sel_color, 0.35),
+                                                            ));
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
+                                        page_char_bounds.push(line_char_bounds);
                                     }
+                                } else {
+                                    for tl in &text_lines_for_canvas {
+                                        let mut line_char_bounds =
+                                            Vec::with_capacity(tl.char_boxes.len());
+                                        for ch in &tl.char_boxes {
+                                            let sx = bounds.origin.x
+                                                + px(ch.bbox[0] as f32 * scale_x as f32);
+                                            let sy = bounds.origin.y
+                                                + px((pdf_h - ch.bbox[1] - ch.bbox[3]) as f32
+                                                    * scale_y as f32);
+                                            let sw = px(ch.bbox[2] as f32 * scale_x as f32);
+                                            let sh = px(ch.bbox[3] as f32 * scale_y as f32);
+                                            line_char_bounds.push(Bounds {
+                                                origin: point(sx, sy),
+                                                size: gpui::size(sw, sh),
+                                            });
+                                        }
+                                        page_char_bounds.push(line_char_bounds);
+                                    }
+                                }
+
+                                if let Some(e) = entity.upgrade() {
+                                    e.update(cx, |app, _| {
+                                        let list =
+                                            app.preview_pdf_char_bounds.entry(pane_id).or_default();
+                                        for (j, line_bounds) in page_char_bounds.iter().enumerate()
+                                        {
+                                            let idx = page_line_offset + j;
+                                            if list.len() <= idx {
+                                                list.resize(idx + 1, Vec::new());
+                                            }
+                                            list[idx] = line_bounds.clone();
+                                        }
+                                    });
                                 }
                             },
                         )
@@ -1125,6 +1171,7 @@ impl TakoApp {
                 self.preview_line_texts.insert(pane_id, line_texts);
                 // bounds 追跡用にリセット（各行の canvas で上書きされる）
                 self.preview_line_bounds.insert(pane_id, Vec::new());
+                self.preview_text_layouts.insert(pane_id, line_layouts);
 
                 div()
                     .id(("preview-scroll", pane_id.as_u64()))
@@ -1183,54 +1230,6 @@ impl TakoApp {
             })
     }
 
-    /// ハイライト済みコード 1 行（行番号は固定幅左列、本文は残り幅で折り返す）
-    fn preview_code_line(&self, line: &preview::Line, number: Option<(usize, usize)>) -> gpui::Div {
-        let theme = &self.theme;
-        let mut text = String::new();
-        let mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
-        for span in line {
-            let start = text.len();
-            text.push_str(&span.text);
-            let style = HighlightStyle {
-                color: span.color.map(hsla),
-                font_weight: span.bold.then_some(FontWeight::BOLD),
-                font_style: span.italic.then_some(FontStyle::Italic),
-                ..HighlightStyle::default()
-            };
-            if span.color.is_some() || span.bold || span.italic {
-                highlights.push((start..text.len(), style));
-            }
-        }
-        if text.is_empty() {
-            text.push(' ');
-        }
-        let code_el = StyledText::new(text).with_default_highlights(&self.text_style(), highlights);
-        if let Some((n, width)) = number {
-            let num_label = format!("{n:>width$}  ");
-            let num_len = num_label.len();
-            div()
-                .flex()
-                .flex_row()
-                .child(
-                    div()
-                        .flex_none()
-                        .child(StyledText::new(num_label).with_default_highlights(
-                            &self.text_style(),
-                            vec![(
-                                0..num_len,
-                                HighlightStyle {
-                                    color: Some(hsla_alpha(theme.tab_inactive_foreground, 0.5)),
-                                    ..HighlightStyle::default()
-                                },
-                            )],
-                        )),
-                )
-                .child(div().flex_1().min_w(px(0.0)).child(code_el))
-        } else {
-            div().child(code_el)
-        }
-    }
-
     /// Markdown インラインスパン列 → (テキスト, ハイライト範囲)
     fn preview_md_text(
         &self,
@@ -1275,16 +1274,15 @@ impl TakoApp {
         (text, highlights)
     }
 
-    /// 選択ハイライト付きコード行 + bounds 追跡 canvas
+    /// 選択ハイライト付きコード行。返した TextLayout は StyledText と共有され、
+    /// ヒットテストとキャレット位置を実描画の shaping に一致させる。
     fn preview_code_line_sel(
         &self,
         line: &preview::Line,
         number: Option<(usize, usize)>,
         interaction: (Option<(usize, usize)>, Option<usize>),
-        pane_id: PaneId,
-        line_idx: usize,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
+        _cx: &mut Context<Self>,
+    ) -> (gpui::Div, TextLayout) {
         let (sel_range, cursor_col) = interaction;
         let theme = &self.theme;
         let mut text = String::new();
@@ -1320,32 +1318,19 @@ impl TakoApp {
             }
         }
         let highlights = merge_highlights(highlights);
-        let caret_char_col = cursor_col.map(|col| {
-            let col = snap_to_char_boundary(&text, col.min(text.len()));
-            text[..col].chars().count() as f32
-        });
-        let caret_cell_width = self.cell_size.map(|cell| cell.width).unwrap_or(px(8.0));
+        let caret_byte = cursor_col.map(|col| snap_to_char_boundary(&text, col.min(text.len())));
         let code_el = StyledText::new(text).with_default_highlights(&self.text_style(), highlights);
+        let text_layout = code_el.layout().clone();
+        let caret_layout = text_layout.clone();
         let caret_color = hsla(theme.accent);
-        let entity = cx.entity().downgrade();
-        let bounds_canvas = canvas(
+        let caret_canvas = canvas(
             |_, _, _| (),
-            move |bounds, _, window, cx| {
-                if let Some(e) = entity.upgrade() {
-                    e.update(cx, |app, _| {
-                        let list = app.preview_line_bounds.entry(pane_id).or_default();
-                        if list.len() <= line_idx {
-                            list.resize(line_idx + 1, Bounds::default());
-                        }
-                        list[line_idx] = bounds;
-                    });
-                }
-                if let Some(col) = caret_char_col {
+            move |_, _, window, _| {
+                if let Some(origin) =
+                    caret_byte.and_then(|byte| caret_layout.position_for_index(byte))
+                {
                     window.paint_quad(fill(
-                        Bounds::new(
-                            point(bounds.left() + caret_cell_width * col, bounds.top()),
-                            gpui::size(px(1.5), bounds.size.height),
-                        ),
+                        Bounds::new(origin, gpui::size(px(1.5), caret_layout.line_height())),
                         caret_color,
                     ));
                 }
@@ -1354,16 +1339,15 @@ impl TakoApp {
         .absolute()
         .size_full();
 
-        if let Some((n, width)) = number {
-            let num_label = format!("{n:>width$}  ");
-            let num_len = num_label.len();
-            div()
-                .flex()
-                .flex_row()
-                .child(
-                    div()
-                        .flex_none()
-                        .child(StyledText::new(num_label).with_default_highlights(
+        let element =
+            if let Some((n, width)) = number {
+                let num_label = format!("{n:>width$}  ");
+                let num_len = num_label.len();
+                div()
+                    .flex()
+                    .flex_row()
+                    .child(div().flex_none().child(
+                        StyledText::new(num_label).with_default_highlights(
                             &self.text_style(),
                             vec![(
                                 0..num_len,
@@ -1372,48 +1356,29 @@ impl TakoApp {
                                     ..HighlightStyle::default()
                                 },
                             )],
-                        )),
-                )
-                .child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .child(code_el)
-                        .child(bounds_canvas),
-                )
-        } else {
-            div().relative().child(code_el).child(bounds_canvas)
-        }
+                        ),
+                    ))
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(code_el)
+                            .child(caret_canvas),
+                    )
+            } else {
+                div().relative().child(code_el).child(caret_canvas)
+            };
+        (element, text_layout)
     }
 
-    /// 選択ハイライト付き Markdown ブロック + bounds 追跡 canvas
+    /// 選択ハイライト付き Markdown ブロック + 実描画 TextLayout。
     fn preview_md_block_sel(
         &self,
         block: &preview::MdBlock,
         sel_range: Option<(usize, usize)>,
-        pane_id: PaneId,
-        line_idx: usize,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> (gpui::AnyElement, Option<TextLayout>) {
         let theme = self.theme.clone();
-        let entity = cx.entity().downgrade();
-        let bounds_canvas = canvas(
-            |_, _, _| (),
-            move |bounds, _, _, cx| {
-                if let Some(e) = entity.upgrade() {
-                    e.update(cx, |app, _| {
-                        let list = app.preview_line_bounds.entry(pane_id).or_default();
-                        if list.len() <= line_idx {
-                            list.resize(line_idx + 1, Bounds::default());
-                        }
-                        list[line_idx] = bounds;
-                    });
-                }
-            },
-        )
-        .absolute()
-        .size_full();
 
         let add_sel = |highlights: &mut Vec<(std::ops::Range<usize>, HighlightStyle)>,
                        text: &str| {
@@ -1443,7 +1408,10 @@ impl TakoApp {
                     3 => 14.0,
                     _ => 13.0,
                 };
-                div()
+                let styled =
+                    StyledText::new(text).with_default_highlights(&self.text_style(), highlights);
+                let layout = styled.layout().clone();
+                let element = div()
                     .relative()
                     .pt_2()
                     .pb_1()
@@ -1454,26 +1422,19 @@ impl TakoApp {
                         d.border_b_1()
                             .border_color(hsla_alpha(theme.pane_border, 0.8))
                     })
-                    .child(
-                        StyledText::new(text)
-                            .with_default_highlights(&self.text_style(), highlights),
-                    )
-                    .child(bounds_canvas)
-                    .into_any_element()
+                    .child(styled)
+                    .into_any_element();
+                (element, Some(layout))
             }
             preview::MdBlock::Paragraph { spans } => {
                 let (text, mut highlights) = self.preview_md_text(spans);
                 add_sel(&mut highlights, &text);
                 let highlights = merge_highlights(highlights);
-                div()
-                    .relative()
-                    .py_1()
-                    .child(
-                        StyledText::new(text)
-                            .with_default_highlights(&self.text_style(), highlights),
-                    )
-                    .child(bounds_canvas)
-                    .into_any_element()
+                let styled =
+                    StyledText::new(text).with_default_highlights(&self.text_style(), highlights);
+                let layout = styled.layout().clone();
+                let element = div().relative().py_1().child(styled).into_any_element();
+                (element, Some(layout))
             }
             preview::MdBlock::ListItem {
                 depth,
@@ -1483,7 +1444,10 @@ impl TakoApp {
                 let (text, mut highlights) = self.preview_md_text(spans);
                 add_sel(&mut highlights, &text);
                 let highlights = merge_highlights(highlights);
-                div()
+                let styled =
+                    StyledText::new(text).with_default_highlights(&self.text_style(), highlights);
+                let layout = styled.layout().clone();
+                let element = div()
                     .relative()
                     .flex()
                     .flex_row()
@@ -1495,51 +1459,77 @@ impl TakoApp {
                             .text_color(hsla_alpha(theme.foreground, 0.7))
                             .child(SharedString::from(marker.clone())),
                     )
-                    .child(
-                        div().flex_1().min_w(px(0.0)).child(
-                            StyledText::new(text)
-                                .with_default_highlights(&self.text_style(), highlights),
-                        ),
-                    )
-                    .child(bounds_canvas)
-                    .into_any_element()
+                    .child(div().flex_1().min_w(px(0.0)).child(styled))
+                    .into_any_element();
+                (element, Some(layout))
             }
-            preview::MdBlock::CodeBlock { lines } => div()
-                .relative()
-                .my_1()
-                .p_2()
-                .rounded_md()
-                .bg(rgba_alpha(theme.tab_bar_background, 0.9))
-                .flex()
-                .flex_col()
-                .children(lines.iter().map(|line| self.preview_code_line(line, None)))
-                .child(bounds_canvas)
-                .into_any_element(),
+            preview::MdBlock::CodeBlock { lines } => {
+                let mut text = String::new();
+                let mut highlights = Vec::new();
+                for (line_i, line) in lines.iter().enumerate() {
+                    if line_i > 0 {
+                        text.push('\n');
+                    }
+                    for span in line {
+                        let start = text.len();
+                        text.push_str(&span.text);
+                        if span.color.is_some() || span.bold || span.italic {
+                            highlights.push((
+                                start..text.len(),
+                                HighlightStyle {
+                                    color: span.color.map(hsla),
+                                    font_weight: span.bold.then_some(FontWeight::BOLD),
+                                    font_style: span.italic.then_some(FontStyle::Italic),
+                                    ..HighlightStyle::default()
+                                },
+                            ));
+                        }
+                    }
+                }
+                add_sel(&mut highlights, &text);
+                if text.is_empty() {
+                    text.push(' ');
+                }
+                let styled = StyledText::new(text)
+                    .with_default_highlights(&self.text_style(), merge_highlights(highlights));
+                let layout = styled.layout().clone();
+                let element = div()
+                    .relative()
+                    .my_1()
+                    .p_2()
+                    .rounded_md()
+                    .bg(rgba_alpha(theme.tab_bar_background, 0.9))
+                    .child(styled)
+                    .into_any_element();
+                (element, Some(layout))
+            }
             preview::MdBlock::Quote { spans } => {
                 let (text, mut highlights) = self.preview_md_text(spans);
                 add_sel(&mut highlights, &text);
                 let highlights = merge_highlights(highlights);
-                div()
+                let styled =
+                    StyledText::new(text).with_default_highlights(&self.text_style(), highlights);
+                let layout = styled.layout().clone();
+                let element = div()
                     .relative()
                     .my_1()
                     .pl_2()
                     .border_l_2()
                     .border_color(hsla_alpha(theme.accent, 0.6))
                     .text_color(hsla_alpha(theme.foreground, 0.75))
-                    .child(
-                        StyledText::new(text)
-                            .with_default_highlights(&self.text_style(), highlights),
-                    )
-                    .child(bounds_canvas)
-                    .into_any_element()
+                    .child(styled)
+                    .into_any_element();
+                (element, Some(layout))
             }
-            preview::MdBlock::Rule => div()
-                .relative()
-                .my_2()
-                .h(px(1.0))
-                .bg(hsla_alpha(theme.pane_border, 0.9))
-                .child(bounds_canvas)
-                .into_any_element(),
+            preview::MdBlock::Rule => (
+                div()
+                    .relative()
+                    .my_2()
+                    .h(px(1.0))
+                    .bg(hsla_alpha(theme.pane_border, 0.9))
+                    .into_any_element(),
+                None,
+            ),
         }
     }
 }

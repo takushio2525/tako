@@ -118,11 +118,21 @@ pub enum ImageFileFormat {
 
 /// PDF テキスト行 1 本分（ページ内で改行区切り）
 #[derive(Debug, Clone, PartialEq)]
+pub struct PdfCharBox {
+    pub byte_range: std::ops::Range<usize>,
+    /// PDF 座標系での文字バウンディングボックス [x, y, width, height]
+    pub bbox: [f64; 4],
+}
+
+/// PDF テキスト行 1 本分（ページ内で改行区切り）
+#[derive(Debug, Clone, PartialEq)]
 pub struct PdfTextLine {
     pub text: String,
     /// PDF 座標系での行バウンディングボックス [x, y, width, height]
     /// （PDF 座標は左下原点。描画時にスクリーン座標に変換する）
     pub bbox: [f64; 4],
+    /// 文字単位の矩形。ヒットテストと選択ハイライトはこれを使う
+    pub char_boxes: Vec<PdfCharBox>,
 }
 
 /// PDF データ（全ページの PNG を保持し、スクロールで閲覧）
@@ -207,17 +217,13 @@ impl EditState {
     }
 }
 
-/// 編集中は入力ごとの全 syntect 再解析を避け、平文行へ即座に反映する。保存または
-/// 編集再開時のファイル読み込みで通常の background ハイライトへ戻る。
+/// 編集中も既存の syntect ハイライト基盤を再利用して、読み取り時と同じ色分けで
+/// 表示する。`apply_editor_text` は UI スレッドから呼ばれるので、ファイルが巨大な
+/// 場合は上限で切り詰められたテキストを対象にする。
 pub fn apply_editor_text(preview: &mut PreviewState, edit: &EditState) {
     preview.mode = PreviewMode::Code;
-    preview.content = PreviewContent::Code(
-        edit.buffer
-            .text()
-            .split('\n')
-            .map(|line| vec![plain_span(line)])
-            .collect(),
-    );
+    preview.content =
+        PreviewContent::Code(highlighter().highlight(&preview.path, edit.buffer.text()));
     preview.truncated = false;
 }
 
@@ -974,6 +980,7 @@ mod pdf_render {
                         lines.push(super::PdfTextLine {
                             text: String::new(),
                             bbox: [0.0, 0.0, 0.0, 0.0],
+                            char_boxes: Vec::new(),
                         });
                         char_offset += 1; // '\n'
                         continue;
@@ -992,20 +999,46 @@ mod pdf_render {
                         let selection = msg_nsrange(page, sel_name("selectionForRange:"), range);
                         if !selection.is_null() {
                             let bounds = msg_bounds_for_page(selection, page);
+                            let mut char_boxes = Vec::new();
+                            let mut utf16_char_offset = 0usize;
+                            for (byte_start, ch) in line_text.char_indices() {
+                                let char_range = NSRange {
+                                    location: utf16_start + utf16_char_offset,
+                                    length: ch.len_utf16(),
+                                };
+                                let char_selection =
+                                    msg_nsrange(page, sel_name("selectionForRange:"), char_range);
+                                if !char_selection.is_null() {
+                                    let char_bounds = msg_bounds_for_page(char_selection, page);
+                                    char_boxes.push(super::PdfCharBox {
+                                        byte_range: byte_start..byte_start + ch.len_utf8(),
+                                        bbox: [
+                                            char_bounds.x,
+                                            char_bounds.y,
+                                            char_bounds.w,
+                                            char_bounds.h,
+                                        ],
+                                    });
+                                }
+                                utf16_char_offset += ch.len_utf16();
+                            }
                             lines.push(super::PdfTextLine {
                                 text: line_text.to_string(),
                                 bbox: [bounds.x, bounds.y, bounds.w, bounds.h],
+                                char_boxes,
                             });
                         } else {
                             lines.push(super::PdfTextLine {
                                 text: line_text.to_string(),
                                 bbox: [0.0, 0.0, 0.0, 0.0],
+                                char_boxes: Vec::new(),
                             });
                         }
                     } else {
                         lines.push(super::PdfTextLine {
                             text: line_text.to_string(),
                             bbox: [0.0, 0.0, 0.0, 0.0],
+                            char_boxes: Vec::new(),
                         });
                     }
                     char_offset += line_len + 1; // +1 for '\n'
@@ -1808,6 +1841,35 @@ mod tests {
                 eprintln!("[skip] PDF レンダリング失敗（環境依存）: {e}");
             }
             other => panic!("Pdf になる: {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&scratchpad).ok();
+    }
+
+    #[test]
+    fn 編集モードでもシンタックスハイライトを使う() {
+        let scratchpad = std::env::temp_dir().join("tako_editor_highlight_test");
+        std::fs::create_dir_all(&scratchpad).ok();
+        let path = scratchpad.join("sample.rs");
+        std::fs::write(&path, "fn main() {\n    let answer = 42;\n}\n").unwrap();
+
+        let mut preview = load(&path, PreviewMode::Code);
+        let edit = EditState::open(&preview).expect("編集を開始できる");
+        apply_editor_text(&mut preview, &edit);
+
+        match &preview.content {
+            PreviewContent::Code(lines) => {
+                let has_color = lines
+                    .iter()
+                    .flat_map(|line| line.iter())
+                    .any(|span| span.color.is_some());
+                assert!(has_color, "編集モードでも色が付く");
+                assert!(
+                    lines.iter().any(|line| line.len() > 1),
+                    "少なくとも 1 行は平文 1 区間ではない"
+                );
+            }
+            other => panic!("Code になる: {:?}", other),
         }
 
         std::fs::remove_dir_all(&scratchpad).ok();
