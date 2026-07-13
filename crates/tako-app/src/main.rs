@@ -730,6 +730,17 @@ struct TakoApp {
     pane_links: HashMap<PaneId, Vec<tako_core::DetectedLink>>,
     /// cmd+ホバーでヒットしているリンクのターゲット（視覚フィードバック用）
     hovered_link: Option<HoveredLink>,
+    /// × ボタン close の確認ダイアログ（Issue #172。config.yaml で永続化）
+    confirm_close: bool,
+    /// 確認ダイアログ表示中の対象（None = ダイアログ非表示）
+    pending_close_confirm: Option<CloseConfirmTarget>,
+}
+
+/// × ボタン close の確認ダイアログ対象（Issue #172）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseConfirmTarget {
+    Pane(PaneId),
+    Tab(TabId),
 }
 
 /// cmd+ホバーで検出されたリンク情報
@@ -1450,6 +1461,8 @@ impl TakoApp {
             text_system: cx.text_system().clone(),
             pane_links: HashMap::new(),
             hovered_link: None,
+            confirm_close: tako_control::setup::confirm_close_enabled(),
+            pending_close_confirm: None,
         };
         // 終了処理（layout 保存 + 接続情報の後片付け）はアプリ終了フックで一元化する
         // （#103）。Cmd-Q（グローバル Quit アクション）・メニュー・Dock 右クリック終了・
@@ -3179,6 +3192,134 @@ impl TakoApp {
         self.remove_pane(pane_id, cx);
     }
 
+    /// × ボタン close の確認ダイアログ付きハンドラ（Issue #172）。
+    /// `cmd_held` = true なら確認スキップ（パワーユーザー動線）
+    fn close_pane_with_confirm(&mut self, pane_id: PaneId, cmd_held: bool, cx: &mut Context<Self>) {
+        if cmd_held || !self.confirm_close {
+            self.close_pane_button(pane_id, cx);
+        } else {
+            self.pending_close_confirm = Some(CloseConfirmTarget::Pane(pane_id));
+            cx.notify();
+        }
+    }
+
+    /// タブの × ボタン close の確認ダイアログ付きハンドラ（Issue #172）
+    fn close_tab_with_confirm(&mut self, tab_id: TabId, cmd_held: bool, cx: &mut Context<Self>) {
+        if cmd_held || !self.confirm_close {
+            self.remove_tab(tab_id, cx);
+        } else {
+            self.pending_close_confirm = Some(CloseConfirmTarget::Tab(tab_id));
+            cx.notify();
+        }
+    }
+
+    /// 確認ダイアログで「閉じる」が選ばれたとき
+    fn close_confirm_accepted(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.pending_close_confirm.take() else {
+            return;
+        };
+        match target {
+            CloseConfirmTarget::Pane(id) => self.close_pane_button(id, cx),
+            CloseConfirmTarget::Tab(id) => self.remove_tab(id, cx),
+        }
+        cx.notify();
+    }
+
+    /// 確認ダイアログでキャンセルされたとき
+    fn close_confirm_cancelled(&mut self, cx: &mut Context<Self>) {
+        self.pending_close_confirm = None;
+        cx.notify();
+    }
+
+    /// タブ/ペインの close で「失われるもの」の要約を生成する（Issue #172）
+    fn close_summary(&self, target: CloseConfirmTarget) -> String {
+        match target {
+            CloseConfirmTarget::Pane(pane_id) => {
+                let mut parts = Vec::new();
+                if let Some(session) = self.terminals.get(&pane_id) {
+                    if session.command_state() == CommandState::Running {
+                        parts.push("実行中のプロセス".to_string());
+                    }
+                }
+                if let Some(pane) = self
+                    .workspace
+                    .tabs()
+                    .iter()
+                    .flat_map(|t| t.tree().panes())
+                    .find(|p| p.id() == pane_id)
+                {
+                    if let Some(role) = pane.role() {
+                        if role.starts_with("orchestrator-worker") {
+                            let busy = self
+                                .terminals
+                                .get(&pane_id)
+                                .is_some_and(|s| s.command_state() == CommandState::Running);
+                            if busy {
+                                parts.push("稼働中の worker".to_string());
+                            }
+                        }
+                    }
+                }
+                if self.backend_sessions.contains_key(&pane_id) {
+                    parts.push("tmux セッション".to_string());
+                }
+                if parts.is_empty() {
+                    "このペインを閉じますか？".to_string()
+                } else {
+                    format!("閉じると失われるもの: {}", parts.join("、"))
+                }
+            }
+            CloseConfirmTarget::Tab(tab_id) => {
+                let Some(tab) = self.workspace.get_tab(tab_id) else {
+                    return "このタブを閉じますか？".to_string();
+                };
+                let pane_count = tab.tree().panes().len();
+                let running = tab
+                    .tree()
+                    .panes()
+                    .iter()
+                    .filter(|p| {
+                        self.terminals
+                            .get(&p.id())
+                            .is_some_and(|s| s.command_state() == CommandState::Running)
+                    })
+                    .count();
+                let workers = tab
+                    .tree()
+                    .panes()
+                    .iter()
+                    .filter(|p| {
+                        p.role()
+                            .is_some_and(|r| r.starts_with("orchestrator-worker"))
+                            && self
+                                .terminals
+                                .get(&p.id())
+                                .is_some_and(|s| s.command_state() == CommandState::Running)
+                    })
+                    .count();
+                let tmux = tab
+                    .tree()
+                    .panes()
+                    .iter()
+                    .filter(|p| self.backend_sessions.contains_key(&p.id()))
+                    .count();
+
+                let mut parts = Vec::new();
+                parts.push(format!("{pane_count} ペイン"));
+                if running > 0 {
+                    parts.push(format!("{running} 個の実行中プロセス"));
+                }
+                if workers > 0 {
+                    parts.push(format!("{workers} 個の稼働中 worker"));
+                }
+                if tmux > 0 {
+                    parts.push(format!("{tmux} 個の tmux セッション"));
+                }
+                format!("閉じると失われるもの: {}", parts.join("、"))
+            }
+        }
+    }
+
     /// ペインタイトルバーの ー ボタン = ペインをバックグラウンドへバックグラウンド（FR-2.15.1）。
     /// プロセス・tmux セッションは生かしたまま、ツリーから外してバックグラウンドに移す。
     /// 最後のタブの最後のペインのときは代替ペインを生やしてからバックグラウンドする
@@ -3961,6 +4102,15 @@ impl TakoApp {
     // --- キー入力 ---
 
     fn handle_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
+        if self.pending_close_confirm.is_some() {
+            match keystroke.key.as_str() {
+                "enter" => self.close_confirm_accepted(cx),
+                "escape" => self.close_confirm_cancelled(cx),
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
         if self.inline_edit.is_some() {
             self.handle_inline_edit_key(keystroke, cx);
             cx.stop_propagation();
@@ -6756,9 +6906,13 @@ impl TakoApp {
                                 MouseButton::Left,
                                 cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
                             )
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                                 cx.stop_propagation();
-                                this.close_pane_button(pane_id, cx);
+                                this.close_pane_with_confirm(
+                                    pane_id,
+                                    event.modifiers().platform,
+                                    cx,
+                                );
                             }))
                             .child("×"),
                     ),
@@ -7210,6 +7364,14 @@ impl ControlHost for TakoApp {
                 persist_diag("layout.json 削除: persist を OFF に切替（次回は空で起動）");
             }
         }
+    }
+
+    fn confirm_close_enabled(&self) -> bool {
+        self.confirm_close
+    }
+
+    fn set_confirm_close(&mut self, enabled: bool) {
+        self.confirm_close = enabled;
     }
 
     fn persist_restore_report(&self) -> Option<String> {
@@ -8282,6 +8444,118 @@ impl Render for TakoApp {
             .children(context_menu_overlay)
             .children(hover_preview_overlay)
             .children(pinned_overlays)
+            .children(self.render_close_confirm_dialog(cx))
+    }
+}
+
+impl TakoApp {
+    /// 確認ダイアログ（Issue #172）。ウィンドウ全面を半透明背景で覆い、中央にダイアログを配置する
+    fn render_close_confirm_dialog(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let target = self.pending_close_confirm?;
+        let summary = self.close_summary(target);
+        let theme = &self.theme;
+
+        let label = match target {
+            CloseConfirmTarget::Pane(_) => "ペインを閉じる",
+            CloseConfirmTarget::Tab(_) => "タブを閉じる",
+        };
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x00000088))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.close_confirm_cancelled(cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(360.0))
+                        .p_4()
+                        .rounded(px(12.0))
+                        .bg(rgba(theme.tab_bar_background))
+                        .border_1()
+                        .border_color(hsla(theme.border_subtle))
+                        .shadow(vec![BoxShadow {
+                            color: gpui::rgba(0x00000066).into(),
+                            offset: point(px(0.), px(4.)),
+                            blur_radius: px(24.0),
+                            spread_radius: px(0.),
+                            inset: false,
+                        }])
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                        )
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_size(px(14.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(hsla(theme.foreground))
+                                .child(SharedString::from(label.to_string())),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .text_color(hsla(theme.tab_inactive_foreground))
+                                .child(SharedString::from(summary)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    div()
+                                        .id("confirm-close-cancel")
+                                        .px_3()
+                                        .py_1()
+                                        .rounded(px(6.0))
+                                        .cursor_pointer()
+                                        .bg(rgba(theme.surface_highlight))
+                                        .text_color(hsla(theme.foreground))
+                                        .text_size(px(12.5))
+                                        .hover(|d| d.bg(rgba_alpha(theme.surface_highlight, 1.5)))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.close_confirm_cancelled(cx);
+                                        }))
+                                        .child("キャンセル (Esc)"),
+                                )
+                                .child(
+                                    div()
+                                        .id("confirm-close-ok")
+                                        .px_3()
+                                        .py_1()
+                                        .rounded(px(6.0))
+                                        .cursor_pointer()
+                                        .bg(rgba_alpha(theme.red, 0.3))
+                                        .text_color(hsla(theme.red))
+                                        .text_size(px(12.5))
+                                        .hover(|d| d.bg(rgba_alpha(theme.red, 0.5)))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.close_confirm_accepted(cx);
+                                        }))
+                                        .child("閉じる (Enter)"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(hsla(theme.text_overlay))
+                                .child("⌘クリックで確認なしで閉じる"),
+                        ),
+                ),
+        )
     }
 }
 
@@ -10091,7 +10365,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 59, "MCP tools/list は 59 ツール");
+            check(status == 200 && tool_count == 60, "MCP tools/list は 60 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -13807,6 +14081,111 @@ mod self_test {
                     config.save()
                 })();
                 let _ = std::fs::remove_dir_all(&scratch);
+            }
+
+            // 73. 確認ダイアログ（Issue #172）: × ボタン close の確認ダイアログが
+            //     正しく表示・承認・キャンセルされること。cmd+クリック相当のスキップ。
+            //     設定 OFF で即クローズ。
+            {
+                // ペインを 2 つにして対象を作る
+                type_text(
+                    any,
+                    cx,
+                    &format!("{cli} split --right --focus >/dev/null"),
+                    true,
+                );
+                wait(cx, 1500).await;
+
+                // 73a. 確認ダイアログの表示 + Esc キャンセル
+                let esc_ok = window
+                    .update(cx, |app, _, cx| {
+                        let before = app.workspace.active_tab().tree().len();
+                        let target = app.focused_pane();
+                        app.confirm_close = true;
+                        app.close_pane_with_confirm(target, false, cx);
+                        let dialog_shown = app.pending_close_confirm
+                            == Some(CloseConfirmTarget::Pane(target));
+                        let not_closed = app.workspace.active_tab().tree().len() == before;
+                        app.close_confirm_cancelled(cx);
+                        let dialog_gone = app.pending_close_confirm.is_none();
+                        let still_there = app.workspace.active_tab().tree().len() == before;
+                        dialog_shown && not_closed && dialog_gone && still_there
+                    })
+                    .unwrap_or(false);
+                check(esc_ok, "確認ダイアログ: 表示 + Esc キャンセル");
+
+                // 73b. 確認ダイアログの表示 + Enter 承認
+                let enter_ok = window
+                    .update(cx, |app, _, cx| {
+                        let before = app.workspace.active_tab().tree().len();
+                        let target = app.focused_pane();
+                        app.confirm_close = true;
+                        app.close_pane_with_confirm(target, false, cx);
+                        let dialog_shown = app.pending_close_confirm.is_some();
+                        app.close_confirm_accepted(cx);
+                        let after = app.workspace.active_tab().tree().len();
+                        dialog_shown && after == before - 1
+                    })
+                    .unwrap_or(false);
+                check(enter_ok, "確認ダイアログ: Enter で閉じる");
+
+                // 73c. cmd+クリック = ダイアログスキップ
+                type_text(
+                    any,
+                    cx,
+                    &format!("{cli} split --right --focus >/dev/null"),
+                    true,
+                );
+                wait(cx, 1500).await;
+                let cmd_ok = window
+                    .update(cx, |app, _, cx| {
+                        let before = app.workspace.active_tab().tree().len();
+                        let target = app.focused_pane();
+                        app.confirm_close = true;
+                        app.close_pane_with_confirm(target, true, cx);
+                        let no_dialog = app.pending_close_confirm.is_none();
+                        let after = app.workspace.active_tab().tree().len();
+                        no_dialog && after == before - 1
+                    })
+                    .unwrap_or(false);
+                check(cmd_ok, "確認ダイアログ: cmd+クリックでスキップ");
+
+                // 73d. confirm_close=false で即クローズ
+                type_text(
+                    any,
+                    cx,
+                    &format!("{cli} split --right --focus >/dev/null"),
+                    true,
+                );
+                wait(cx, 1500).await;
+                let off_ok = window
+                    .update(cx, |app, _, cx| {
+                        let before = app.workspace.active_tab().tree().len();
+                        let target = app.focused_pane();
+                        app.confirm_close = false;
+                        app.close_pane_with_confirm(target, false, cx);
+                        let no_dialog = app.pending_close_confirm.is_none();
+                        let after = app.workspace.active_tab().tree().len();
+                        app.confirm_close = true; // 元に戻す
+                        no_dialog && after == before - 1
+                    })
+                    .unwrap_or(false);
+                check(off_ok, "確認ダイアログ: 設定 OFF で即クローズ");
+
+                // 73e. タブの確認ダイアログ + キャンセル
+                let tab_ok = window
+                    .update(cx, |app, _, cx| {
+                        let tab_id = app.workspace.active_tab_id();
+                        app.confirm_close = true;
+                        app.close_tab_with_confirm(tab_id, false, cx);
+                        let dialog_shown = app.pending_close_confirm
+                            == Some(CloseConfirmTarget::Tab(tab_id));
+                        app.close_confirm_cancelled(cx);
+                        let dialog_gone = app.pending_close_confirm.is_none();
+                        dialog_shown && dialog_gone
+                    })
+                    .unwrap_or(false);
+                check(tab_ok, "確認ダイアログ: タブの × でダイアログ表示 + キャンセル");
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す
