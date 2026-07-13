@@ -490,9 +490,16 @@ impl TakoApp {
             search_cursor: usize,
             search_total: usize,
             search_index: usize,
+            search_hits: Vec<tako_core::SearchHit>,
             replace_text: String,
             replace_cursor: usize,
+            ime_text: Option<String>,
         }
+        let ime_for_search = self
+            .ime
+            .as_ref()
+            .filter(|ime| ime.pane == pane_id)
+            .map(|ime| ime.text.clone());
         let edit_snap = self.preview_edits.get(&pane_id).map(|edit| EditSnapshot {
             editing: edit.editing,
             dirty: edit.dirty(),
@@ -506,8 +513,14 @@ impl TakoApp {
             search_cursor: edit.search_cursor,
             search_total: edit.search_hits.len(),
             search_index: edit.search_index,
+            search_hits: edit.search_hits.clone(),
             replace_text: edit.replace_text.clone(),
             replace_cursor: edit.replace_cursor,
+            ime_text: if edit.search_visible {
+                ime_for_search.clone()
+            } else {
+                None
+            },
         });
         let editing = edit_snap.as_ref().is_some_and(|s| s.editing);
         let dirty = edit_snap.as_ref().is_some_and(|s| s.dirty);
@@ -566,18 +579,33 @@ impl TakoApp {
         // キャレット描画を実際の shaping 結果に一致させる。
         let mut line_layouts: Vec<Option<TextLayout>> = Vec::new();
 
+        // 検索ヒット情報（ハイライト描画用）
+        let search_hits = edit_snap
+            .as_ref()
+            .filter(|s| s.search_visible && !s.search_hits.is_empty())
+            .map(|s| (s.search_hits.as_slice(), s.search_index));
+
         // 本文要素を先に組む（state の借用をここで終える）
         let body: Vec<gpui::AnyElement> = match &state.content {
             preview::PreviewContent::Code(lines) => {
                 let number_width = lines.len().to_string().len();
+                let mut doc_offset: usize = 0;
                 lines
                     .iter()
                     .enumerate()
                     .map(|(i, line)| {
                         let text: String = line.iter().map(|s| s.text.as_str()).collect();
+                        let line_start = doc_offset;
+                        let line_end = doc_offset + text.len();
+                        doc_offset = line_end + 1; // +1 for '\n'
                         let sel_range = selection
                             .as_ref()
                             .and_then(|s| s.range_for_line(i, text.len()));
+                        let hit_ranges = search_hits
+                            .map(|(hits, idx)| {
+                                search_hits_for_line(hits, idx, line_start, line_end)
+                            })
+                            .unwrap_or_default();
                         line_texts.push(text);
                         let cursor_col = edit_cursor
                             .filter(|(line, _)| *line == i)
@@ -586,6 +614,7 @@ impl TakoApp {
                             line,
                             Some((i + 1, number_width)),
                             (sel_range, cursor_col),
+                            &hit_ranges,
                             cx,
                         );
                         line_layouts.push(Some(layout));
@@ -593,20 +622,32 @@ impl TakoApp {
                     })
                     .collect()
             }
-            preview::PreviewContent::Markdown(blocks) => blocks
-                .iter()
-                .enumerate()
-                .map(|(i, block)| {
-                    let text = md_block_plain_text(block);
-                    let sel_range = selection
-                        .as_ref()
-                        .and_then(|s| s.range_for_line(i, text.len()));
-                    line_texts.push(text);
-                    let (element, layout) = self.preview_md_block_sel(block, sel_range);
-                    line_layouts.push(layout);
-                    element
-                })
-                .collect(),
+            preview::PreviewContent::Markdown(blocks) => {
+                let mut doc_offset: usize = 0;
+                blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, block)| {
+                        let text = md_block_plain_text(block);
+                        let line_start = doc_offset;
+                        let line_end = doc_offset + text.len();
+                        doc_offset = line_end + 1;
+                        let sel_range = selection
+                            .as_ref()
+                            .and_then(|s| s.range_for_line(i, text.len()));
+                        let hit_ranges = search_hits
+                            .map(|(hits, idx)| {
+                                search_hits_for_line(hits, idx, line_start, line_end)
+                            })
+                            .unwrap_or_default();
+                        line_texts.push(text);
+                        let (element, layout) =
+                            self.preview_md_block_sel(block, sel_range, &hit_ranges);
+                        line_layouts.push(layout);
+                        element
+                    })
+                    .collect()
+            }
             preview::PreviewContent::Image(_) => {
                 // Issue #168: Image はキャッシュ済み（ensure_preview_image_cache）
                 let image = self
@@ -1340,6 +1381,13 @@ impl TakoApp {
             .when(search_visible, |el| {
                 let query_focused = search_focus == preview::SearchFieldFocus::Query;
                 let replace_focused = search_focus == preview::SearchFieldFocus::Replace;
+                let ime_text = edit_snap.as_ref().and_then(|s| s.ime_text.clone());
+                let query_ime = if query_focused {
+                    ime_text.clone()
+                } else {
+                    None
+                };
+                let replace_ime = if replace_focused { ime_text } else { None };
                 let sq = search_query.clone();
                 let sq2 = sq.clone();
                 let rt = replace_text.clone();
@@ -1365,10 +1413,12 @@ impl TakoApp {
                                 .child("🔍")
                                 .child(
                                     div()
+                                        .id(("search-query-field", pane_id.as_u64()))
                                         .flex_1()
                                         .px_1()
                                         .py(px(1.0))
                                         .rounded_sm()
+                                        .cursor(CursorStyle::IBeam)
                                         .bg(rgba_alpha(
                                             if query_focused {
                                                 theme.accent
@@ -1382,10 +1432,24 @@ impl TakoApp {
                                             theme.accent,
                                             if query_focused { 0.6 } else { 0.15 },
                                         ))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                                if let Some(edit) =
+                                                    this.preview_edits.get_mut(&pane_id)
+                                                {
+                                                    edit.search_focus =
+                                                        preview::SearchFieldFocus::Query;
+                                                }
+                                                cx.stop_propagation();
+                                                cx.notify();
+                                            }),
+                                        )
                                         .child(SharedString::from(render_field_with_cursor(
                                             &sq,
                                             sc,
                                             query_focused,
+                                            query_ime.as_deref(),
                                         ))),
                                 )
                                 .when(st > 0, |el| {
@@ -1422,10 +1486,12 @@ impl TakoApp {
                                     .child("↔")
                                     .child(
                                         div()
+                                            .id(("search-replace-field", pane_id.as_u64()))
                                             .flex_1()
                                             .px_1()
                                             .py(px(1.0))
                                             .rounded_sm()
+                                            .cursor(CursorStyle::IBeam)
                                             .bg(rgba_alpha(
                                                 if replace_focused {
                                                     theme.accent
@@ -1439,10 +1505,26 @@ impl TakoApp {
                                                 theme.accent,
                                                 if replace_focused { 0.6 } else { 0.15 },
                                             ))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    move |this, _: &MouseDownEvent, _, cx| {
+                                                        if let Some(edit) =
+                                                            this.preview_edits.get_mut(&pane_id)
+                                                        {
+                                                            edit.search_focus =
+                                                                preview::SearchFieldFocus::Replace;
+                                                        }
+                                                        cx.stop_propagation();
+                                                        cx.notify();
+                                                    },
+                                                ),
+                                            )
                                             .child(SharedString::from(render_field_with_cursor(
                                                 &rt,
                                                 rc,
                                                 replace_focused,
+                                                replace_ime.as_deref(),
                                             ))),
                                     ),
                             )
@@ -1585,13 +1667,14 @@ impl TakoApp {
         (text, highlights)
     }
 
-    /// 選択ハイライト付きコード行。返した TextLayout は StyledText と共有され、
-    /// ヒットテストとキャレット位置を実描画の shaping に一致させる。
+    /// 選択ハイライト + 検索ヒットハイライト付きコード行。返した TextLayout は
+    /// StyledText と共有され、ヒットテストとキャレット位置を実描画の shaping に一致させる。
     fn preview_code_line_sel(
         &self,
         line: &preview::Line,
         number: Option<(usize, usize)>,
         interaction: (Option<(usize, usize)>, Option<usize>),
+        search_hit_ranges: &[(usize, usize, bool)],
         _cx: &mut Context<Self>,
     ) -> (gpui::Div, TextLayout) {
         let (sel_range, cursor_col) = interaction;
@@ -1613,6 +1696,24 @@ impl TakoApp {
         }
         if text.is_empty() {
             text.push(' ');
+        }
+        // 検索ヒットハイライト（選択より先に追加し、選択が上に重なるようにする）
+        for &(start, end, is_current) in search_hit_ranges {
+            let s = snap_to_char_boundary(&text, start.min(text.len()));
+            let e = snap_to_char_boundary(&text, end.min(text.len()));
+            if s < e {
+                highlights.push((
+                    s..e,
+                    HighlightStyle {
+                        background_color: Some(if is_current {
+                            hsla_alpha(theme.yellow, 0.5)
+                        } else {
+                            hsla_alpha(theme.yellow, 0.2)
+                        }),
+                        ..HighlightStyle::default()
+                    },
+                ));
+            }
         }
         // 選択ハイライト
         if let Some((start, end)) = sel_range {
@@ -1685,35 +1786,53 @@ impl TakoApp {
         (element, text_layout)
     }
 
-    /// 選択ハイライト付き Markdown ブロック + 実描画 TextLayout。
+    /// 選択ハイライト + 検索ヒットハイライト付き Markdown ブロック + 実描画 TextLayout。
     fn preview_md_block_sel(
         &self,
         block: &preview::MdBlock,
         sel_range: Option<(usize, usize)>,
+        search_hit_ranges: &[(usize, usize, bool)],
     ) -> (gpui::AnyElement, Option<TextLayout>) {
         let theme = self.theme.clone();
 
-        let add_sel = |highlights: &mut Vec<(std::ops::Range<usize>, HighlightStyle)>,
-                       text: &str| {
-            if let Some((start, end)) = sel_range {
-                let s = snap_to_char_boundary(text, start.min(text.len()));
-                let e = snap_to_char_boundary(text, end.min(text.len()));
-                if s < e {
-                    highlights.push((
-                        s..e,
-                        HighlightStyle {
-                            background_color: Some(hsla_alpha(theme.accent, 0.35)),
-                            ..HighlightStyle::default()
-                        },
-                    ));
+        let add_search_and_sel =
+            |highlights: &mut Vec<(std::ops::Range<usize>, HighlightStyle)>, text: &str| {
+                for &(start, end, is_current) in search_hit_ranges {
+                    let s = snap_to_char_boundary(text, start.min(text.len()));
+                    let e = snap_to_char_boundary(text, end.min(text.len()));
+                    if s < e {
+                        highlights.push((
+                            s..e,
+                            HighlightStyle {
+                                background_color: Some(if is_current {
+                                    hsla_alpha(theme.yellow, 0.5)
+                                } else {
+                                    hsla_alpha(theme.yellow, 0.2)
+                                }),
+                                ..HighlightStyle::default()
+                            },
+                        ));
+                    }
                 }
-            }
-        };
+                if let Some((start, end)) = sel_range {
+                    let s = snap_to_char_boundary(text, start.min(text.len()));
+                    let e = snap_to_char_boundary(text, end.min(text.len()));
+                    if s < e {
+                        highlights.push((
+                            s..e,
+                            HighlightStyle {
+                                background_color: Some(hsla_alpha(theme.accent, 0.35)),
+                                ..HighlightStyle::default()
+                            },
+                        ));
+                    }
+                }
+            };
 
         match block {
             preview::MdBlock::Heading { level, spans } => {
                 let (text, mut highlights) = self.preview_md_text(spans);
-                add_sel(&mut highlights, &text);
+                add_search_and_sel(&mut highlights, &text);
                 let highlights = merge_highlights(highlights);
                 let size = match level {
                     1 => 19.0,
@@ -1741,7 +1860,7 @@ impl TakoApp {
             }
             preview::MdBlock::Paragraph { spans } => {
                 let (text, mut highlights) = self.preview_md_text(spans);
-                add_sel(&mut highlights, &text);
+                add_search_and_sel(&mut highlights, &text);
                 let highlights = merge_highlights(highlights);
                 let styled =
                     StyledText::new(text).with_default_highlights(&self.text_style(), highlights);
@@ -1755,7 +1874,7 @@ impl TakoApp {
                 spans,
             } => {
                 let (text, mut highlights) = self.preview_md_text(spans);
-                add_sel(&mut highlights, &text);
+                add_search_and_sel(&mut highlights, &text);
                 let highlights = merge_highlights(highlights);
                 let styled =
                     StyledText::new(text).with_default_highlights(&self.text_style(), highlights);
@@ -1799,7 +1918,7 @@ impl TakoApp {
                         }
                     }
                 }
-                add_sel(&mut highlights, &text);
+                add_search_and_sel(&mut highlights, &text);
                 if text.is_empty() {
                     text.push(' ');
                 }
@@ -1818,7 +1937,7 @@ impl TakoApp {
             }
             preview::MdBlock::Quote { spans } => {
                 let (text, mut highlights) = self.preview_md_text(spans);
-                add_sel(&mut highlights, &text);
+                add_search_and_sel(&mut highlights, &text);
                 let highlights = merge_highlights(highlights);
                 let styled =
                     StyledText::new(text).with_default_highlights(&self.text_style(), highlights);
@@ -1847,8 +1966,14 @@ impl TakoApp {
     }
 }
 
-/// 検索/置換フィールドのテキストにカーソル（|）を差し込んで表示用文字列を作る
-fn render_field_with_cursor(text: &str, cursor: usize, focused: bool) -> String {
+/// 検索/置換フィールドのテキストにカーソル（|）と IME 未確定テキストを差し込んで
+/// 表示用文字列を作る。`ime_text` が Some の場合はカーソル位置に [未確定] を挿入する。
+fn render_field_with_cursor(
+    text: &str,
+    cursor: usize,
+    focused: bool,
+    ime_text: Option<&str>,
+) -> String {
     if !focused {
         if text.is_empty() {
             return " ".into();
@@ -1858,9 +1983,70 @@ fn render_field_with_cursor(text: &str, cursor: usize, focused: bool) -> String 
     let cursor = cursor.min(text.len());
     let before = &text[..cursor];
     let after = &text[cursor..];
+    if let Some(ime) = ime_text.filter(|t| !t.is_empty()) {
+        return format!("{before}[{ime}]{after}");
+    }
     if text.is_empty() {
         "|".to_string()
     } else {
         format!("{before}|{after}")
+    }
+}
+
+/// 検索ヒットのうち行に重なる部分を行内バイト範囲のリストとして返す。
+/// `is_current` が true のヒットは `(start, end, true)` で区別する。
+/// `line_start` / `line_end` は文書全体のバイト位置。
+fn search_hits_for_line(
+    hits: &[tako_core::SearchHit],
+    current_index: usize,
+    line_start: usize,
+    line_end: usize,
+) -> Vec<(usize, usize, bool)> {
+    let mut result = Vec::new();
+    for (i, hit) in hits.iter().enumerate() {
+        if hit.end <= line_start || hit.start >= line_end {
+            continue;
+        }
+        let s = hit.start.max(line_start) - line_start;
+        let e = hit.end.min(line_end) - line_start;
+        result.push((s, e, i == current_index));
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_field_cursor_and_ime() {
+        assert_eq!(render_field_with_cursor("abc", 1, true, None), "a|bc");
+        assert_eq!(render_field_with_cursor("abc", 0, true, None), "|abc");
+        assert_eq!(render_field_with_cursor("", 0, true, None), "|");
+        assert_eq!(render_field_with_cursor("abc", 0, false, None), "abc");
+        assert_eq!(render_field_with_cursor("", 0, false, None), " ");
+        assert_eq!(
+            render_field_with_cursor("ab", 1, true, Some("変換")),
+            "a[変換]b"
+        );
+        assert_eq!(render_field_with_cursor("ab", 1, true, Some("")), "a|b");
+    }
+
+    #[test]
+    fn search_hits_line_intersection() {
+        use tako_core::SearchHit;
+        let hits = vec![
+            SearchHit { start: 2, end: 5 },
+            SearchHit { start: 8, end: 11 },
+            SearchHit { start: 14, end: 17 },
+        ];
+        let r = search_hits_for_line(&hits, 1, 0, 6);
+        assert_eq!(r, vec![(2, 5, false)]);
+        let r = search_hits_for_line(&hits, 1, 7, 13);
+        assert_eq!(r, vec![(1, 4, true)]);
+        let r = search_hits_for_line(&hits, 0, 20, 30);
+        assert!(r.is_empty());
+        let r = search_hits_for_line(&hits, 0, 4, 9);
+        assert_eq!(r, vec![(0, 1, true), (4, 5, false)]);
     }
 }
