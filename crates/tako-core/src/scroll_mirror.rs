@@ -108,9 +108,20 @@ pub fn capture_history(
     Some((lines, history))
 }
 
-/// 現在の `#{history_size}` と `#{mouse_any_flag}` を取得する（ミラー更新の増分検知 +
-/// マウス要求アプリの判定）。セッション消滅では None
-pub fn history_state(target: &ScrollTarget) -> Option<(usize, bool)> {
+/// ペインの履歴・マウス要求状態（`history_state` の結果）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryState {
+    /// `#{history_size}`（ミラー更新の増分検知）
+    pub history: usize,
+    /// `#{mouse_any_flag}`（内側アプリがマウスレポートを要求しているか）
+    pub mouse: bool,
+    /// `#{mouse_sgr_flag}`（SGR 形式か。false なら X10 レガシー形式で送る）
+    pub sgr: bool,
+}
+
+/// 現在の履歴行数とマウス要求状態を取得する（ミラー更新の増分検知 +
+/// マウス要求アプリの判定 + レポート形式の判定）。セッション消滅では None
+pub fn history_state(target: &ScrollTarget) -> Option<HistoryState> {
     let (socket, t) = target.locate();
     let output = run_tmux(
         socket,
@@ -119,7 +130,7 @@ pub fn history_state(target: &ScrollTarget) -> Option<(usize, bool)> {
             "-p",
             "-t",
             &t,
-            "#{history_size} #{mouse_any_flag}",
+            "#{history_size} #{mouse_any_flag} #{mouse_sgr_flag}",
         ],
     )
     .ok()?;
@@ -127,7 +138,36 @@ pub fn history_state(target: &ScrollTarget) -> Option<(usize, bool)> {
     let mut m = line.split_whitespace();
     let history: usize = m.next()?.parse().ok()?;
     let mouse = m.next()? == "1";
-    Some((history, mouse))
+    let sgr = m.next() == Some("1");
+    Some(HistoryState {
+        history,
+        mouse,
+        sgr,
+    })
+}
+
+/// マウス要求アプリへのホイールレポートを tmux サーバーへ**直接注入**する（#167）。
+/// 外側クライアント PTY への書き込みは、書き込み停滞（UI / イベントループのストール、
+/// PTY バッファ詰まり）でシーケンスが途中分割され escape-time（10ms）を跨ぐと、
+/// tmux が ESC を単独キー確定して残骸（`4;45;18M` 等）が平文として内側 TUI の
+/// 入力欄へ入る（実 claude で再現済み）。`send-keys -H` はソケット越しの
+/// 構造化データのため、この経路の断片化が構造的に起きない。
+/// `delta_lines` 正 = 上（過去）方向。呼び出し側でレート制限
+/// （`TerminalSession::take_wheel_budget`）を通してから使うこと
+pub fn send_wheel(target: &ScrollTarget, delta_lines: i32, col: usize, row: usize, sgr: bool) {
+    if delta_lines == 0 {
+        return;
+    }
+    let (socket, t) = target.locate();
+    let event = crate::terminal::wheel_report_bytes(sgr, delta_lines > 0, col, row);
+    let mut args: Vec<String> = vec!["send-keys".into(), "-t".into(), t, "-H".into()];
+    for _ in 0..delta_lines.unsigned_abs() {
+        for byte in &event {
+            args.push(format!("{byte:02x}"));
+        }
+    }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let _ = run_tmux(socket, &arg_refs);
 }
 
 /// ANSI（SGR 主体）付きの capture-pane 出力行を色解決済み [`ScreenLine`] へパースする。
@@ -266,12 +306,12 @@ mod tests {
             socket: socket.clone(),
             session: "tako-e2e-mir".into(),
         };
-        let (state, mouse) = history_state(&target).expect("履歴状態が取れる");
-        assert!(state > 0, "履歴が積もっている");
-        assert!(!mouse, "シェル画面はマウス要求なし");
+        let state = history_state(&target).expect("履歴状態が取れる");
+        assert!(state.history > 0, "履歴が積もっている");
+        assert!(!state.mouse, "シェル画面はマウス要求なし");
         // 最新側 10 行を取得: 履歴末尾は L-99 の 1 行上まで（L-99 はライブ画面内）
         let (lines, history) = capture_history(&target, 0, 10, &theme()).expect("capture できる");
-        assert_eq!(history, state);
+        assert_eq!(history, state.history);
         assert_eq!(lines.len(), 10);
         // 色が解決されている（赤ラン）
         let has_red = lines
@@ -298,6 +338,76 @@ mod tests {
                 "行番号が読めない: newest_first={:?} older_last={:?}",
                 lines[0].text, older[9].text
             );
+        }
+    }
+
+    /// `send_wheel`（tmux 直接注入。#167）でホイールレポートが内側アプリへ
+    /// **生のまま**届く e2e。外側クライアント PTY を経由しない（= tty_keys パース・
+    /// 部分 write・escape-time と無縁）ことがこの経路の存在意義
+    #[test]
+    #[cfg(unix)]
+    fn ホイールレポートのtmux直接注入が内側に生で届く() {
+        use crate::terminal::{SpawnCommand, SpawnOptions};
+        use crate::tmux_backend::{available, kill_server, wrap_options};
+        if !available() {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-sw-{}", std::process::id());
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                kill_server(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(socket.clone());
+        // 内側アプリ: raw mode + 受信バイトの ESC を「^[」に可視化して即時 echo
+        let inner = r#"stty raw -echo; printf '\033[?1000h\033[?1006h'; exec perl -e '$|=1; while (sysread(STDIN,$b,4096)) { $b =~ s/\x1b/^[/g; syswrite(STDOUT,$b) }'"#;
+        let options = SpawnOptions {
+            command: Some(SpawnCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), inner.into()],
+            }),
+            cwd: Some(std::env::temp_dir()),
+            env: vec![],
+        };
+        let (session, _rx) =
+            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-sw"))
+                .expect("spawn できる");
+        let mut mouse_on = false;
+        for _ in 0..100 {
+            if session.mouse_reporting() {
+                mouse_on = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(mouse_on, "内側のマウス要求が伝わる");
+        let target = ScrollTarget::Backend {
+            socket: socket.clone(),
+            session: "tako-e2e-sw".into(),
+        };
+        // SGR 上方向 3 イベント + 下方向 1 イベント + X10 上方向 1 イベント
+        send_wheel(&target, 3, 5, 5, true);
+        send_wheel(&target, -1, 5, 5, true);
+        send_wheel(&target, 1, 5, 5, false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let expect_sgr_up = "^[[<64;6;6M^[[<64;6;6M^[[<64;6;6M";
+        let expect_sgr_down = "^[[<65;6;6M";
+        let expect_x10 = "^[[M`&&"; // 32+64=0x60(`)、32+6=0x26(&)
+        loop {
+            let screen = session.visible_lines().join("\n");
+            if screen.contains(expect_sgr_up)
+                && screen.contains(expect_sgr_down)
+                && screen.contains(expect_x10)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "直接注入のレポートが内側へ届かない。画面: {screen:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 }

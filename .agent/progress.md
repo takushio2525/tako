@@ -653,3 +653,14 @@
   + `tako recover`（一覧 / --apply / --force）+ persist.log 行に pid + README 復旧手順
 - 検証: 全緑 + 隔離セルフテスト完走 + 実機 e2e（強奪防止・事故再現・bak 退避・recover 復旧の通し）
 - 次: PR squash merge → install → Issue クローズ
+
+## 2026-07-13（#167: マウスエスケープ断片の入力欄混入を根治 — send-keys 直接注入 + レート制限）
+- 機序を隔離 tmux + 実 claude で実測確定: SGR シーケンスが途中で 10ms+ 途切れる（洪水の
+  部分 write + UI 停滞）と tmux（escape-time 10ms）が ESC を単独確定し残りを平文転送。
+  `\x1b[<6` + 600ms + `4;45;18M` で観測断片と完全一致の混入を再現。仮説①②の単純形は棄却
+- 二層対策: バックエンドのホイールレポートを `send-keys -H` 直接注入へ（外側 PTY 非経由 =
+  構造的根絶。`scroll_mirror::send_wheel` + `pump_wheel` 直列化 + `#{mouse_sgr_flag}` 出し分け）
+  + 全転送にトークンバケット 150 ev/s・バースト 8（`terminal.rs`）
+- 検証: 551 tests / fmt / clippy 全緑 + 隔離セルフテスト完走 + 実 claude before/after
+  （before = 入力欄へ断片大量混入、after = idle 1500 + busy 588 イベントで断片ゼロ）
+- 次: PR squash merge → install。並行 #181 へ変更点を Issue コメントで共有済み

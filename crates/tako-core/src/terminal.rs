@@ -229,6 +229,14 @@ pub struct TerminalSession {
     /// 転送系ホイール（mouse reporting / alternate scroll）の行未満端数の持ち越し。
     /// トラックパッドの微小デルタを都度切り捨てると無反応になるため積分する
     wheel_carry: std::sync::Mutex<f32>,
+    /// 転送系ホイールのレート制限状態（トークンバケット。#167）
+    wheel_rate: std::sync::Mutex<WheelRateState>,
+}
+
+/// ホイール転送レート制限（#167）の状態。tokens = 残イベント数、last = 最終補充時刻
+struct WheelRateState {
+    tokens: f32,
+    last: std::time::Instant,
 }
 
 impl TerminalSession {
@@ -328,6 +336,10 @@ impl TerminalSession {
                 listen_ports: Vec::new(),
                 scroll_fract: std::sync::Mutex::new(0.0),
                 wheel_carry: std::sync::Mutex::new(0.0),
+                wheel_rate: std::sync::Mutex::new(WheelRateState {
+                    tokens: WHEEL_FORWARD_BURST,
+                    last: std::time::Instant::now(),
+                }),
             },
             rx,
         ))
@@ -450,6 +462,11 @@ impl TerminalSession {
     /// `col` / `row` は表示セル座標（mouse reporting の座標に使う）
     pub fn scroll_wheel(&self, delta_lines: i32, col: usize, row: usize) {
         let mode = *self.term.lock().mode();
+        let delta_lines = if wheel_forwarded_to_pty(mode) {
+            self.limit_forwarded_wheel(delta_lines)
+        } else {
+            delta_lines
+        };
         match wheel_action(mode, delta_lines, col, row) {
             // 転送はスクロールバック表示を動かさない（write() の bottom 戻しも不要）
             WheelAction::Write(bytes) => self.notifier.notify(bytes),
@@ -470,6 +487,11 @@ impl TerminalSession {
             let lines = carry.trunc() as i32;
             *carry -= lines as f32;
             drop(carry);
+            let lines = if wheel_forwarded_to_pty(mode) {
+                self.limit_forwarded_wheel(lines)
+            } else {
+                lines
+            };
             if lines != 0 {
                 match wheel_action(mode, lines, col, row) {
                     WheelAction::Write(bytes) => self.notifier.notify(bytes),
@@ -481,6 +503,36 @@ impl TerminalSession {
             *self.carry_lock() = 0.0;
             self.scroll_pixels(delta_rows);
         }
+    }
+
+    /// 転送系ホイール（PTY へ書く経路）のイベント数をトークンバケットで制限する（#167）。
+    /// 慣性スクロールの洪水をそのまま PTY へ流すと、下流（tmux / 内側アプリ）の
+    /// 読み取りが追いつかず macOS の tty 入力キューがバイトを黙って捨て、ESC を失った
+    /// 断片（`4;45;18M` 等）が内側 TUI の入力欄へ平文として入る（実 claude で再現済み）。
+    /// 超過イベントは捨てる（ホイールは相対量のため縮退しても壊れない。
+    /// 表示スクロール（PTY に書かない経路）には適用しない）
+    fn limit_forwarded_wheel(&self, delta_lines: i32) -> i32 {
+        let now = std::time::Instant::now();
+        let mut state = self
+            .wheel_rate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let elapsed = now.duration_since(state.last).as_secs_f32();
+        state.last = now;
+        let (allowed, rest) = wheel_rate_take(state.tokens, elapsed, delta_lines.unsigned_abs());
+        state.tokens = rest;
+        if delta_lines < 0 {
+            -(allowed as i32)
+        } else {
+            allowed as i32
+        }
+    }
+
+    /// バックエンドペインの tmux 直接注入（`scroll_mirror::send_wheel`。#167）用に
+    /// 転送レート制限だけを消費する。PTY へは書かない。
+    /// send-keys のサブプロセス起動レートを抑える意味も兼ねる
+    pub fn take_wheel_budget(&self, delta_lines: i32) -> i32 {
+        self.limit_forwarded_wheel(delta_lines)
     }
 
     /// スクロールバック表示のオフセット（行。0 = 最下部）
@@ -902,6 +954,53 @@ enum WheelAction {
     None,
 }
 
+/// 転送系ホイールのレート上限（イベント/秒）と瞬間バースト上限（#167）。
+/// レート 150/秒は「実 claude（tmux 越し・busy 中）で断片漏れゼロ」の実測値で、
+/// ホイール高速回し（〜60 イベント/秒）には影響しない。
+/// バーストは瞬間書き込みサイズを決める（8 イベント = 約 104 バイト）。
+/// macOS の PTY 書き込みバッファ（1024B）に対し十分小さく保つことで、
+/// 下流が詰まった際の部分 write がシーケンス途中で切れて escape-time を
+/// 跨ぐ（= tmux が ESC を単独キー確定して残りが平文化する）事故を防ぐ
+const WHEEL_FORWARD_RATE: f32 = 150.0;
+const WHEEL_FORWARD_BURST: f32 = 8.0;
+
+/// ホイール転送レート制限のトークン計算（純関数）。
+/// tokens へ経過時間ぶんを補充（上限 `WHEEL_FORWARD_BURST`）し、
+/// requested のうち通せるイベント数を返す。戻り値は（許可イベント数, 残トークン）
+fn wheel_rate_take(tokens: f32, elapsed_secs: f32, requested: u32) -> (u32, f32) {
+    let filled = (tokens + elapsed_secs.max(0.0) * WHEEL_FORWARD_RATE).min(WHEEL_FORWARD_BURST);
+    let allowed = requested.min(filled as u32);
+    (allowed, filled - allowed as f32)
+}
+
+/// マウスホイールレポート 1 イベント分のバイト列（SGR / X10 形式。up = 上方向）。
+/// 直接ペインの PTY 転送（`wheel_action`）とバックエンドペインの tmux 直接注入
+/// （`scroll_mirror::send_wheel`。#167）で共用する
+pub fn wheel_report_bytes(sgr: bool, up: bool, col: usize, row: usize) -> Vec<u8> {
+    // ホイールボタン: 64 = 上、65 = 下
+    let button: u8 = if up { 64 } else { 65 };
+    if sgr {
+        format!("\x1b[<{button};{};{}M", col + 1, row + 1).into_bytes()
+    } else {
+        // X10 形式（各値 +32 の 1 バイト。座標は 223 が上限）
+        vec![
+            0x1b,
+            b'[',
+            b'M',
+            32 + button,
+            32 + (col + 1).min(223) as u8,
+            32 + (row + 1).min(223) as u8,
+        ]
+    }
+}
+
+/// ホイールが PTY への書き込み（mouse reporting / alternate scroll の矢印変換）に
+/// なるモードか。`wheel_action` が `Write` を返す条件と 1:1 に保つこと
+fn wheel_forwarded_to_pty(mode: TermMode) -> bool {
+    mode.intersects(TermMode::MOUSE_MODE)
+        || (mode.contains(TermMode::ALT_SCREEN) && mode.contains(TermMode::ALTERNATE_SCROLL))
+}
+
 /// ホイールの定石出し分け（alacritty / iTerm2 と同様）。`delta_lines` 正 = 上（過去）方向:
 /// ① mouse reporting 中 → SGR / X10 のホイールボタンイベントを送る（TUI が自前処理）
 /// ② alternate screen + alternate scroll（ESC[?1007、既定 ON）→ 上下矢印キーに変換
@@ -913,21 +1012,12 @@ fn wheel_action(mode: TermMode, delta_lines: i32, col: usize, row: usize) -> Whe
     }
     let count = delta_lines.unsigned_abs() as usize;
     if mode.intersects(TermMode::MOUSE_MODE) {
-        // ホイールボタン: 64 = 上、65 = 下
-        let button: u8 = if delta_lines > 0 { 64 } else { 65 };
-        let event: Vec<u8> = if mode.contains(TermMode::SGR_MOUSE) {
-            format!("\x1b[<{button};{};{}M", col + 1, row + 1).into_bytes()
-        } else {
-            // X10 形式（各値 +32 の 1 バイト。座標は 223 が上限）
-            vec![
-                0x1b,
-                b'[',
-                b'M',
-                32 + button,
-                32 + (col + 1).min(223) as u8,
-                32 + (row + 1).min(223) as u8,
-            ]
-        };
+        let event = wheel_report_bytes(
+            mode.contains(TermMode::SGR_MOUSE),
+            delta_lines > 0,
+            col,
+            row,
+        );
         WheelAction::Write(event.repeat(count))
     } else if mode.contains(TermMode::ALT_SCREEN) {
         if mode.contains(TermMode::ALTERNATE_SCROLL) {
@@ -1090,6 +1180,51 @@ mod tests {
         );
         // 0 行は無視
         assert_eq!(wheel_action(base, 0, 0, 0), WheelAction::None);
+    }
+
+    #[test]
+    fn ホイール転送レート制限のトークン計算() {
+        // バースト内は全部通る
+        let (allowed, rest) = wheel_rate_take(WHEEL_FORWARD_BURST, 0.0, 3);
+        assert_eq!(allowed, 3);
+        assert!((rest - (WHEEL_FORWARD_BURST - 3.0)).abs() < 0.01);
+        // 枯渇したら通らない（1 未満の端数では 1 イベントも許可しない）
+        let (allowed, _) = wheel_rate_take(0.5, 0.0, 10);
+        assert_eq!(allowed, 0);
+        // 時間経過で補充される（150/秒 × 0.02 秒 = 3）
+        let (allowed, _) = wheel_rate_take(0.0, 0.02, 100);
+        assert_eq!(allowed, 3);
+        // 補充はバースト上限まで（長時間放置しても溜め込まない）
+        let (allowed, rest) = wheel_rate_take(0.0, 10.0, 1000);
+        assert_eq!(allowed, WHEEL_FORWARD_BURST as u32);
+        assert_eq!(rest, 0.0);
+        // 慣性スクロール洪水（700 回 × 3 行を 0.07 秒で連打）の総転送量は
+        // バースト + レート × 時間 に制限される（#167 の防御そのもの）
+        let mut tokens = WHEEL_FORWARD_BURST;
+        let mut total = 0;
+        for _ in 0..700 {
+            let (a, r) = wheel_rate_take(tokens, 0.0001, 3);
+            total += a;
+            tokens = r;
+        }
+        // 8 (burst) + 150/s × 0.07s ≈ 19
+        assert!(total <= 19, "洪水は burst + rate 以内に制限される: {total}");
+        assert!(total >= 8, "バーストぶんは即座に通る: {total}");
+    }
+
+    #[test]
+    fn ホイール転送のpty書き込み判定はwheel_actionと一致する() {
+        let base = TermMode::default();
+        // 通常画面 = 表示スクロール（制限対象外）
+        assert!(!wheel_forwarded_to_pty(base));
+        // mouse reporting = PTY 転送
+        assert!(wheel_forwarded_to_pty(base | TermMode::MOUSE_REPORT_CLICK));
+        // alt screen + alternate scroll = 矢印キー変換（PTY 転送）
+        assert!(wheel_forwarded_to_pty(base | TermMode::ALT_SCREEN));
+        // alt screen で alternate scroll OFF = 何も書かない（制限対象外）
+        assert!(!wheel_forwarded_to_pty(
+            (base | TermMode::ALT_SCREEN) - TermMode::ALTERNATE_SCROLL
+        ));
     }
 
     #[test]
