@@ -19,6 +19,7 @@
 //! プロダクトの一部である。
 
 use std::io;
+use std::sync::Arc;
 
 use futures::channel::mpsc::UnboundedSender;
 use serde_json::{json, Value};
@@ -2425,11 +2426,19 @@ impl McpServer {
             .ok_or_else(|| io::Error::other("MCP サーバーのポートを特定できない"))?
             .port();
         let url = format!("http://127.0.0.1:{port}/mcp");
+        let token = Arc::new(token);
         std::thread::Builder::new()
             .name("tako-mcp-http".into())
             .spawn(move || {
                 for request in server.incoming_requests() {
-                    handle_http(request, &token, &tx);
+                    let tx = tx.clone();
+                    let token = Arc::clone(&token);
+                    std::thread::Builder::new()
+                        .name("tako-mcp-req".into())
+                        .spawn(move || {
+                            handle_http(request, &token, &tx);
+                        })
+                        .ok();
                 }
             })?;
         Ok(Self { url })
@@ -3366,6 +3375,59 @@ mod tests {
             assert_eq!(status, 200);
             let response: Value = serde_json::from_str(&response).unwrap();
             assert_eq!(response["result"]["isError"], false);
+        }
+
+        #[test]
+        fn 遅いdispatch中も並行リクエストがブロックされない() {
+            let (tx, mut rx) = unbounded::<IncomingRequest>();
+            let server = McpServer::start(tx, TOKEN.into()).unwrap();
+            // dispatch ハンドラ: 重い dispatch は別スレッドへ offload（実 app の
+            // OffloadJob と同じパターン。UI スレッドは即座に次のリクエストへ進む）
+            std::thread::spawn(move || {
+                while let Some(incoming) = futures::executor::block_on(rx.next()) {
+                    match &incoming.request {
+                        Request::Read { .. } => {
+                            std::thread::spawn(move || {
+                                std::thread::sleep(std::time::Duration::from_millis(500));
+                                let _ = incoming.reply.send(Ok(json!({ "slow": true })));
+                            });
+                        }
+                        _ => {
+                            let _ = incoming.reply.send(Ok(json!({ "tabs": [] })));
+                        }
+                    }
+                }
+            });
+            let url = server.url().to_string();
+            // 遅い read_pane を先に投げる
+            let url_slow = url.clone();
+            let slow = std::thread::spawn(move || {
+                let body = call("tako_read_pane", json!({"pane": 1})).to_string();
+                let start = std::time::Instant::now();
+                let (status, _) = post(&url_slow, Some(TOKEN), &[], &body);
+                (status, start.elapsed())
+            });
+            // 少し待ってから高速な list_panes を投げる
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let url_fast = url.clone();
+            let fast = std::thread::spawn(move || {
+                let body = call("tako_list_panes", json!({})).to_string();
+                let start = std::time::Instant::now();
+                let (status, _) = post(&url_fast, Some(TOKEN), &[], &body);
+                (status, start.elapsed())
+            });
+            let (slow_status, slow_elapsed) = slow.join().unwrap();
+            let (fast_status, fast_elapsed) = fast.join().unwrap();
+            assert_eq!(slow_status, 200);
+            assert_eq!(fast_status, 200);
+            // 並行化されていれば fast は slow を待たず 200ms 以内に返る
+            // （直列なら slow の 500ms 完了後にしか処理されない）
+            assert!(
+                fast_elapsed < std::time::Duration::from_millis(200),
+                "list_panes が read_pane の完了を待ってしまった（{:?}、並行化されていない）",
+                fast_elapsed,
+            );
+            assert!(slow_elapsed >= std::time::Duration::from_millis(400));
         }
     }
 }
