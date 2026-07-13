@@ -1681,10 +1681,17 @@ fn dispatch_inner(
             run_git_diff(&cwd, target.as_deref())
         }
 
-        Request::Background { pane } => {
-            let (_, target) = resolve_pane(host.workspace(), pane)?;
-            host.workspace_mut().shelve_pane(target).map_err(op_err)?;
-            Ok(json!({ "backgrounded": target.as_u64() }))
+        Request::Background { pane, tab } => {
+            if let Some(t) = tab {
+                let tab_id = find_tab(host.workspace(), t)?;
+                let ids = host.workspace_mut().shelve_tab(tab_id).map_err(op_err)?;
+                let pane_ids: Vec<u64> = ids.iter().map(|p| p.as_u64()).collect();
+                Ok(json!({ "backgrounded_tab": t, "panes": pane_ids }))
+            } else {
+                let (_, target) = resolve_pane(host.workspace(), pane)?;
+                host.workspace_mut().shelve_pane(target).map_err(op_err)?;
+                Ok(json!({ "backgrounded": target.as_u64() }))
+            }
         }
 
         Request::Foreground {
@@ -4703,7 +4710,10 @@ mod tests {
         host.ws.create_tab("t2", Pane::new(PaneOrigin::User));
         dispatch(
             &mut host,
-            Request::Background { pane: Some(root) },
+            Request::Background {
+                pane: Some(root),
+                tab: None,
+            },
             PaneOrigin::Cli,
         )
         .unwrap();
@@ -4725,7 +4735,10 @@ mod tests {
         host.ws.create_tab("t2", Pane::new(PaneOrigin::User));
         dispatch(
             &mut host,
-            Request::Background { pane: Some(p2) },
+            Request::Background {
+                pane: Some(p2),
+                tab: None,
+            },
             PaneOrigin::Cli,
         )
         .unwrap();
@@ -4743,6 +4756,58 @@ mod tests {
         assert_eq!(result["foregrounded"].as_u64(), Some(p2));
         assert!(!host.ws.is_shelved(PaneId::from_raw(p2)));
         assert_eq!(host.ws.find_tab_of_pane(PaneId::from_raw(p2)), Some(t1));
+    }
+
+    #[test]
+    fn background_tabでタブ内全ペインがバックグラウンドへ移る() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let t1 = host.ws.active_tab_id();
+        let p2 = split(&mut host, root);
+        host.ws.create_tab("t2", Pane::new(PaneOrigin::User));
+        let result = dispatch(
+            &mut host,
+            Request::Background {
+                pane: None,
+                tab: Some(t1.as_u64()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["backgrounded_tab"].as_u64(), Some(t1.as_u64()));
+        let panes = result["panes"].as_array().unwrap();
+        assert_eq!(panes.len(), 2);
+        assert!(host.ws.is_shelved(PaneId::from_raw(root)));
+        assert!(host.ws.is_shelved(PaneId::from_raw(p2)));
+    }
+
+    #[test]
+    fn background_tabで最後の1タブはエラー() {
+        let mut host = MockHost::new();
+        let t1 = host.ws.active_tab_id();
+        let result = dispatch(
+            &mut host,
+            Request::Background {
+                pane: None,
+                tab: Some(t1.as_u64()),
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn background_tabで存在しないタブはエラー() {
+        let mut host = MockHost::new();
+        let result = dispatch(
+            &mut host,
+            Request::Background {
+                pane: None,
+                tab: Some(99999),
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
