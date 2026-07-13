@@ -514,6 +514,16 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tmux_session: Option<String>,
     },
+    /// オーケストレーター: 非同期 run の進捗照会（#121）。
+    /// run_id が不明なら Err。run_id 省略時は全 run の一覧を返す
+    OrchestratorRunStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+    },
+    /// オーケストレーター: 完了した非同期 run の結果回収（#121）。
+    /// 未完了なら `phase: "running"` を返す。完了済みなら出力取得 + auto_close +
+    /// レジストリから除去
+    OrchestratorRunResult { run_id: String },
     /// リモートアクセス API サーバーの起動。`port` 省略時は 7749。
     /// 既定では暗号化トンネル（cloudflared）経由でのみホストし、トンネルを張れなければ
     /// 起動を拒否する。`insecure` = true のときだけ平文 HTTP の LAN 直モードを許可する

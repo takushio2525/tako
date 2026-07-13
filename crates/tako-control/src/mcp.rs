@@ -47,6 +47,9 @@ pub struct McpSession<'a> {
     /// 操作の実行係（HTTP: dispatch チャネル往復、stdio: IPC 往復）。
     /// Err は「ツール実行エラー」として isError 付き結果になる
     pub exec: &'a mut dyn FnMut(Request) -> Result<Value, String>,
+    /// 非同期 run のポーリングスレッド用 IPC チャネル（#121）。
+    /// HTTP 経路では tx.clone() でスレッドに渡す。stdio ブリッジでは None（sync のみ）
+    pub ipc_tx: Option<UnboundedSender<IncomingRequest>>,
 }
 
 /// MCP メッセージを 1 件処理する。応答すべき JSON-RPC レスポンスを返す
@@ -1163,16 +1166,14 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_orchestrator_run",
-            "description": "子 worker を spawn し、完了まで待って結果を返す。spawn + 完了待ち + \
-                出力取得 + close を 1 回で行うアトミック操作。Monitor や手動ポーリングは不要。\
+            "description": "子 worker を spawn し、即座に run_id を返す（非同期。#121）。\
+                MCP 呼び出しが中断されても worker は孤児化せず、run_id で追跡できる。\
+                進捗確認は tako_orchestrator_run_status、結果回収は tako_orchestrator_run_result を使う。\
                 worker のエージェント CLI は claude（既定）/ codex / agy から選べる（agent パラメータ）。\
-                完了判定は OrchestratorWorkerStatus と同じロジック（pane→session 自動解決 + \
-                claude agents --json の status 一次シグナル、フォールバックで端末出力パターン。\
-                codex / agy は画面推定のみ）を内部で繰り返し呼ぶ。\
-                タイムアウト（既定 1800 秒）に達した場合は status=timeout で途中結果を返す。\
-                worker が API エラー・usage limit 等の異常で停止した場合は status=worker_error + \
-                error オブジェクト（kind / detail / recommended_action）を返し、復帰の余地を残すため \
-                auto_close でもペインを閉じない（#157）。",
+                完了判定はバックグラウンドで OrchestratorWorkerStatus と同じロジックを繰り返す。\
+                タイムアウト（既定 1800 秒）に達した場合は run_status が status=timeout を返す。\
+                worker が API エラー等で停止した場合は status=worker_error + error オブジェクト。\
+                sync=true を指定すると旧挙動（完了までブロッキング）に戻る（後方互換）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1200,8 +1201,43 @@ pub fn tools() -> Vec<Value> {
                         "type": "integer", "minimum": 1, "default": 200,
                         "description": "返す出力の末尾行数（省略時 200）",
                     },
+                    "sync": {
+                        "type": "boolean", "default": false,
+                        "description": "true にすると完了までブロッキングする旧挙動（後方互換。既定 false = 非同期）",
+                    },
                 },
                 "required": ["project", "prompt"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_orchestrator_run_status",
+            "description": "非同期 run の進捗を照会する（#121）。run_id を指定すると \
+                {run_id, pane_id, status, phase, elapsed_seconds} を返す。\
+                phase は 'running'（進行中）または 'finished'（完了済み）。\
+                status は busy / idle / error / gone / starting / completed / worker_error / timeout。\
+                run_id を省略すると全 run の一覧を返す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "run_id": { "type": "string", "description": "照会する run_id（省略時は全 run 一覧）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_orchestrator_run_result",
+            "description": "完了した非同期 run の結果を回収する（#121）。\
+                未完了なら phase='running' を返す（エラーにはならない）。\
+                完了済みなら出力取得 + auto_close を行い、レジストリから除去して \
+                {run_id, pane_id, status, output, duration_seconds, closed} を返す。\
+                run ごとに 1 回だけ呼べる（2 回目は run_id が見つからないエラー）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "run_id": { "type": "string", "description": "回収する run_id" },
+                },
+                "required": ["run_id"],
                 "additionalProperties": false,
             },
         }),
@@ -1608,7 +1644,8 @@ fn call_tool(params: &Value, session: &mut McpSession) -> Result<Value, (i64, St
     // orchestrator_run はポーリングループを伴うため MCP ハンドラスレッドで合成する
     // （dispatch は同期・UI スレッド実行のため長時間ブロック不可）
     if name == "tako_orchestrator_run" {
-        return orchestrator_run(&args, session);
+        let ipc_tx = session.ipc_tx.as_ref().cloned();
+        return orchestrator_run(&args, session, ipc_tx.as_ref());
     }
 
     let request = build_request(
@@ -1679,11 +1716,16 @@ fn list_panes_with_caller(
     }
 }
 
-/// `tako_orchestrator_run` — spawn + 完了待ち + 出力取得 + close の合成操作。
-/// 本体は [`crate::orchestrator::wait::run_worker`]（CLI `tako orchestrator run` と共通。#83）。
-/// ポーリングは MCP ハンドラスレッドで実行される（UI スレッドはブロックしない。
-/// 各ステップは exec 経由で dispatch を呼ぶため、UI スレッドは短時間しか占有しない）
-fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i64, String)> {
+/// `tako_orchestrator_run` — spawn + 完了待ち + 出力取得 + close の合成操作（#121 で非同期化）。
+/// 既定（sync=false）は spawn 後に即座に `{run_id, pane_id, ...}` を返す非同期モード。
+/// sync=true は旧挙動（完了までブロッキング）を維持する後方互換モード。
+/// `ipc_tx` は非同期モードのポーリングスレッド用 IPC チャネル。None のとき
+/// 非同期モードは「IPC チャネルが渡されていない」エラーを返す（stdio ブリッジ等）
+fn orchestrator_run(
+    args: &Value,
+    session: &mut McpSession,
+    ipc_tx: Option<&UnboundedSender<IncomingRequest>>,
+) -> Result<Value, (i64, String)> {
     let map_err = |e: String| (-32602i64, e);
 
     // --- パラメータ解析 ---
@@ -1719,6 +1761,7 @@ fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i6
     let model = str_arg(args, "model").map_err(map_err)?;
     let effort = str_arg(args, "effort").map_err(map_err)?;
     let agent = str_arg(args, "agent").map_err(map_err)?;
+    let sync_mode = bool_arg(args, "sync").map_err(map_err)?.unwrap_or(false);
 
     let opts = wait::RunOptions {
         project,
@@ -1733,12 +1776,46 @@ fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i6
         timeout: std::time::Duration::from_secs(timeout_secs),
         auto_close,
         output_lines,
-        // claude 起動 + プロンプト送信を待つ（prompt_flow は 15〜20 秒かかる）
         initial_delay: std::time::Duration::from_secs(20),
         interval: std::time::Duration::from_secs(5),
     };
-    let result =
-        wait::run_worker(&mut *session.exec, &opts, &mut |_, _| {}).map_err(|e| (-32602, e))?;
+
+    if sync_mode {
+        // 後方互換: 完了までブロッキング
+        let result =
+            wait::run_worker(&mut *session.exec, &opts, &mut |_, _| {}).map_err(|e| (-32602, e))?;
+        return Ok(json!({
+            "content": [{ "type": "text", "text": result.to_string() }],
+            "isError": false,
+        }));
+    }
+
+    // 非同期モード（#121）
+    let tx = ipc_tx
+        .ok_or((
+            -32602,
+            "非同期 run は HTTP MCP 経由でのみ利用可能（stdio は sync=true を指定してください）"
+                .to_string(),
+        ))?
+        .clone();
+    let result = wait::run_start(&mut *session.exec, &opts, move || {
+        let tx = tx;
+        Box::new(move |req: Request| -> Result<Value, String> {
+            let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+            tx.unbounded_send(IncomingRequest {
+                request: req,
+                origin: PaneOrigin::Mcp,
+                reply: reply_tx,
+            })
+            .map_err(|_| "アプリ側の受け口が閉じている".to_string())?;
+            match reply_rx.recv() {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("アプリ側から応答が返らなかった".into()),
+            }
+        })
+    })
+    .map_err(|e| (-32602, e))?;
     Ok(json!({
         "content": [{ "type": "text", "text": result.to_string() }],
         "isError": false,
@@ -2098,6 +2175,12 @@ fn build_request(
             session_id: str_arg(args, "session_id")?,
             tmux_session: str_arg(args, "tmux_session")?,
         },
+        "tako_orchestrator_run_status" => Request::OrchestratorRunStatus {
+            run_id: str_arg(args, "run_id")?,
+        },
+        "tako_orchestrator_run_result" => Request::OrchestratorRunResult {
+            run_id: str_arg(args, "run_id")?.ok_or("run_id を指定する")?,
+        },
         "tako_remote_start" => Request::RemoteStart {
             port: u64_arg(args, "port")?.map(|v| v as u16),
             insecure: bool_arg(args, "insecure")?.unwrap_or(false),
@@ -2452,6 +2535,7 @@ fn handle_http(
         caller_role,
         connected: true,
         exec: &mut exec,
+        ipc_tx: Some(tx.clone()),
     };
     match handle_message(&message, &mut session) {
         Some(response) => respond(request, 200, Some(response.to_string())),
@@ -2476,6 +2560,7 @@ mod tests {
             caller_role: None,
             connected,
             exec: &mut exec,
+            ipc_tx: None,
         };
         let response = handle_message(&message, &mut session);
         (response, seen)
@@ -2709,7 +2794,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 70);
+        assert_eq!(tools.len(), 72);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
@@ -2802,6 +2887,7 @@ mod tests {
             caller_role: None,
             connected: true,
             exec: &mut exec,
+            ipc_tx: None,
         };
         let response = handle_message(&call("tako_list_panes", json!({})), &mut session).unwrap();
         let result = &response["result"];

@@ -859,6 +859,18 @@ enum OrchestratorCommand {
         #[arg(long, default_value = "200")]
         output_lines: usize,
     },
+    /// 非同期 run の進捗照会（#121）。run_id 省略時は全 run の一覧
+    #[command(name = "run-status")]
+    RunStatus {
+        /// 照会する run_id（省略時は全 run 一覧）
+        run_id: Option<String>,
+    },
+    /// 完了した非同期 run の結果回収（#121）。未完了なら pending を返す
+    #[command(name = "run-result")]
+    RunResult {
+        /// 回収する run_id
+        run_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1369,6 +1381,18 @@ fn main() -> ExitCode {
             auto_close,
             output_lines,
         ),
+        Command::Orchestrator(OrchestratorCommand::RunStatus { ref run_id }) => {
+            let request = Request::OrchestratorRunStatus {
+                run_id: run_id.clone(),
+            };
+            send_request(request).map(|v| println!("{}", pretty_json(&v)))
+        }
+        Command::Orchestrator(OrchestratorCommand::RunResult { ref run_id }) => {
+            let request = Request::OrchestratorRunResult {
+                run_id: run_id.clone(),
+            };
+            send_request(request).map(|v| println!("{}", pretty_json(&v)))
+        }
         // remote コマンドはローカル処理（IPC 不要）
         Command::Remote(RemoteCommand::Start { port, insecure }) => remote_start(port, insecure),
         Command::Remote(RemoteCommand::Stop) => remote_stop(),
@@ -1439,6 +1463,7 @@ fn mcp_serve() -> Result<(), String> {
                     caller_role: caller_role.clone(),
                     connected,
                     exec: &mut exec,
+                    ipc_tx: None,
                 };
                 tako_control::mcp::handle_message(&message, &mut session)
             }
@@ -1754,7 +1779,7 @@ fn orchestrator_watch(
         initial_delay: std::time::Duration::ZERO,
         interval: std::time::Duration::from_secs(5),
     };
-    match wait::wait_for_worker(&mut exec, &opts) {
+    match wait::wait_for_worker(&mut exec, &opts, None) {
         wait::WatchOutcome::Idle {
             ctx_percent: Some(pct),
         } => println!("WORKER_IDLE: tako:{pane} (ctx {pct}%)"),
@@ -2820,6 +2845,12 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }
         Command::Orchestrator(OrchestratorCommand::Run { .. }) => {
             unreachable!("orchestrator run は run() を通らない")
+        }
+        Command::Orchestrator(OrchestratorCommand::RunStatus { .. }) => {
+            unreachable!("orchestrator run-status は run() を通らない")
+        }
+        Command::Orchestrator(OrchestratorCommand::RunResult { .. }) => {
+            unreachable!("orchestrator run-result は run() を通らない")
         }
         Command::Orchestrator(OrchestratorCommand::Layout { .. }) => {
             unreachable!("orchestrator layout は run() を通らない（ローカルで config.yaml を操作）")
