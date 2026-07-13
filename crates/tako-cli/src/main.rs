@@ -2422,7 +2422,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     left,
                     up,
                 } => {
-                    let pane = target_pane(*pane)?;
+                    // 基準ペインは任意: tako 外（別インスタンス操作・スクリプト）からは
+                    // 省略のまま送り、アプリ側がフォーカスペインへ解決する（OpenFile と同じ）
+                    let pane = pane.or_else(caller_pane);
                     let d = dir(*right, *down, *left, *up);
                     web("open", Some(url.clone()), None, pane, d, None, None, None)
                 }
@@ -2435,7 +2437,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     left,
                     up,
                 } => {
-                    let pane = target_pane(*pane)?;
+                    let pane = pane.or_else(caller_pane);
                     let d = dir(*right, *down, *left, *up);
                     web("show", None, Some(*id), pane, d, None, None, None)
                 }
