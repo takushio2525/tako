@@ -9455,6 +9455,120 @@ mod self_test {
                 "スクロールバードラッグで最下部へ（解放でクリア）",
             );
 
+            // 44b. ピクセル単位スムーススクロール（#159）: トラックパッドの Pixels デルタが
+            //      display_offset（整数）+ fract（サブライン端数）へ分解され、部分行描画用の
+            //      extra_bottom が付く。端数計算はユニットテスト側（subline_scroll）で網羅
+            let wheel_pixels = |app: &mut TakoApp,
+                                win: &mut Window,
+                                cx: &mut Context<TakoApp>,
+                                dy: f32| {
+                let pane = app.focused_pane();
+                let center = app
+                    .pane_text_areas
+                    .iter()
+                    .find(|(id, _)| *id == pane)
+                    .map(|(_, b)| b.center())
+                    .unwrap_or_default();
+                app.on_pane_scroll(
+                    pane,
+                    &ScrollWheelEvent {
+                        position: center,
+                        delta: ScrollDelta::Pixels(point(px(0.0), px(dy))),
+                        ..ScrollWheelEvent::default()
+                    },
+                    win,
+                    cx,
+                );
+            };
+            let (half_offset, half_fract, half_extra, half_shift_px) = window
+                .update(cx, |app, win, cx| {
+                    let pane = app.focused_pane();
+                    if let Some(s) = app.terminals.get(&pane) {
+                        s.scroll_to_bottom();
+                    }
+                    let cell_h = app
+                        .cell_size_for_pane(pane)
+                        .map(|c| f32::from(c.height))
+                        .unwrap_or(17.0);
+                    // 半行ぶん上（過去）へ = 正のピクセルデルタ
+                    wheel_pixels(app, win, cx, cell_h * 0.5);
+                    let session = app.terminals.get(&pane).expect("セッションはある");
+                    let screen = session.screen(&app.theme);
+                    (
+                        session.display_offset(),
+                        session.scroll_subline_fract(),
+                        screen.extra_bottom.is_some(),
+                        session.scroll_subline_fract() * cell_h,
+                    )
+                })
+                .unwrap_or((0, 0.0, false, 0.0));
+            check(
+                half_offset == 1 && (half_fract - 0.5).abs() < 0.01,
+                "Pixels 半行で display_offset 1 + fract 0.5 に分解",
+            );
+            check(half_extra, "サブライン中は extra_bottom（部分行）が付く");
+            check(half_shift_px > 1.0, "描画シフト量が正のピクセル値");
+            let (back_offset, back_fract, typed_reset) = window
+                .update(cx, |app, win, cx| {
+                    let pane = app.focused_pane();
+                    let cell_h = app
+                        .cell_size_for_pane(pane)
+                        .map(|c| f32::from(c.height))
+                        .unwrap_or(17.0);
+                    // 半行戻す → 最下部（offset 0 / fract 0）
+                    wheel_pixels(app, win, cx, -cell_h * 0.5);
+                    let session = app.terminals.get(&pane).expect("セッションはある");
+                    let back = (session.display_offset(), session.scroll_subline_fract());
+                    // 再び半行遡ってからキー入力 → write() が最下部へ戻し fract もリセット
+                    wheel_pixels(app, win, cx, cell_h * 0.5);
+                    if let Some(s) = app.terminals.get(&pane) {
+                        s.write(b" ".to_vec());
+                    }
+                    let session = app.terminals.get(&pane).expect("セッションはある");
+                    let reset = session.display_offset() == 0
+                        && session.scroll_subline_fract() == 0.0;
+                    (back.0, back.1, reset)
+                })
+                .unwrap_or((99, 9.0, false));
+            check(
+                back_offset == 0 && back_fract == 0.0,
+                "半行戻しで最下部へスナップ",
+            );
+            check(typed_reset, "キー入力でサブライン位置がリセット");
+
+            // 任意のピクセル検証停止点（通常の self-test では待機しない）。
+            // fract=0 と fract=0.5 の 2 状態で停止し、外部の screencapture が
+            // サブライン描画（同一内容が半行ずれる）を実ピクセルで比較できるようにする
+            if std::env::var_os("TAKO_SELF_TEST_SCROLL_VISUAL").is_some() {
+                let _ = window.update(cx, |app, _, cx| {
+                    let pane = app.focused_pane();
+                    if let Some(s) = app.terminals.get(&pane) {
+                        s.scroll_to_bottom();
+                    }
+                    cx.notify();
+                });
+                println!("TAKO_SCROLL_VISUAL_BASELINE_READY");
+                wait(cx, 15_000).await;
+                let _ = window.update(cx, |app, win, cx| {
+                    let pane = app.focused_pane();
+                    let cell_h = app
+                        .cell_size_for_pane(pane)
+                        .map(|c| f32::from(c.height))
+                        .unwrap_or(17.0);
+                    wheel_pixels(app, win, cx, cell_h * 0.5);
+                    cx.notify();
+                });
+                println!("TAKO_SCROLL_VISUAL_HALF_READY");
+                wait(cx, 15_000).await;
+                let _ = window.update(cx, |app, _, cx| {
+                    let pane = app.focused_pane();
+                    if let Some(s) = app.terminals.get(&pane) {
+                        s.scroll_to_bottom();
+                    }
+                    cx.notify();
+                });
+            }
+
             // 45. kitty keyboard protocol（disambiguate）の有効化を検知する
             //     （回帰: Claude Code TUI で Shift+Enter 改行が効かない。
             //     CSI u へのバイト変換はユニットテスト側で網羅）
