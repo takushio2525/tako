@@ -128,7 +128,8 @@ pub fn wait_for_worker(
     opts: &WatchOptions,
     progress: Option<&Arc<Mutex<RunSnapshot>>>,
 ) -> WatchOutcome {
-    let deadline = opts.timeout.map(|t| Instant::now() + t);
+    let start = Instant::now();
+    let deadline = opts.timeout.map(|t| start + t);
     std::thread::sleep(opts.initial_delay);
 
     let mut idle_streak: u32 = 0;
@@ -159,14 +160,7 @@ pub fn wait_for_worker(
                 if let Some(snap) = progress {
                     if let Ok(mut s) = snap.lock() {
                         s.worker_status = status.to_string();
-                        s.elapsed_secs = deadline
-                            .map(|dl| {
-                                let total = opts.timeout.unwrap_or(Duration::ZERO);
-                                total
-                                    .saturating_sub(dl.saturating_duration_since(Instant::now()))
-                                    .as_secs()
-                            })
-                            .unwrap_or(0);
+                        s.elapsed_secs = start.elapsed().as_secs();
                     }
                 }
 
