@@ -8,6 +8,7 @@
 //! 座標系は抽象的な矩形（`Rect`）で持ち、ピクセルへの対応付けは UI 層が行う。
 
 use crate::pane::{Pane, PaneId};
+use crate::spawn_layout::{SpawnLayoutConfig, SpawnLayoutPolicy, WorkerLayoutAlgorithm};
 
 /// 分割の軸。`Horizontal` は子が左右に並ぶ（縦の境界線）、`Vertical` は上下に並ぶ
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,8 +101,8 @@ pub enum PaneTreeError {
 }
 
 /// 分割比率のクランプ範囲。極端な比率でペインが潰れるのを防ぐ
-const MIN_SHARE: f32 = 0.1;
-const MAX_SHARE: f32 = 0.9;
+pub(crate) const MIN_SHARE: f32 = 0.1;
+pub(crate) const MAX_SHARE: f32 = 0.9;
 
 /// 浮動小数の比較誤差吸収（focus_direction の隣接判定に使う）
 const EPS: f32 = 1e-4;
@@ -617,6 +618,188 @@ impl PaneTree {
     }
 }
 
+// --- spawn レイアウトエンジン（Issue #165、FR-2.20） ---
+
+impl PaneTree {
+    /// spawn レイアウトポリシーに従い worker ペインを配置する（Issue #165）。
+    ///
+    /// - `Legacy`: anchor の右に等分割（従来挙動）
+    /// - `MasterReserved`: anchor に「worker 領域」（anchor から spawn された worker だけの
+    ///   サブツリー）が無ければ anchor を右分割して新設し、anchor 側に `master_ratio` を
+    ///   残す。既にあれば領域内を `algorithm` で再構築して新ペインを加える
+    ///   （anchor と領域外ペインの矩形は変わらない）
+    ///
+    /// フォーカスは新ペインへ移る（`split` と同じ。呼び出し側が必要なら戻す）。
+    /// worker 領域の判定は各ペインの `spawned_by` チェーンに依るため、
+    /// 呼び出し側は配置後に新ペインへ `set_spawned_by(anchor)` を設定すること
+    pub fn spawn_worker(
+        &mut self,
+        anchor: PaneId,
+        pane: Pane,
+        config: &SpawnLayoutConfig,
+    ) -> Result<PaneId, PaneTreeError> {
+        if config.policy == SpawnLayoutPolicy::Legacy {
+            return self.split_with_ratio(
+                anchor,
+                SplitDirection::Right,
+                crate::spawn_layout::LEGACY_WORKER_SHARE,
+                pane,
+            );
+        }
+        if !self.contains(anchor) {
+            return Err(PaneTreeError::PaneNotFound(anchor));
+        }
+        let new_id = pane.id();
+        let mut slot = Some(pane);
+        if self.rebuild_worker_area(anchor, &mut slot, config.algorithm) {
+            self.focused = new_id;
+            Ok(new_id)
+        } else {
+            // worker 領域がまだ無い → anchor を右分割して新設。
+            // 新ペイン（worker 領域）側の取り分 = 1 - master_ratio
+            let worker_share = 1.0 - crate::spawn_layout::clamp_master_ratio(config.master_ratio);
+            let pane = slot.take().expect("領域未発見時は消費されない");
+            self.split_with_ratio(anchor, SplitDirection::Right, worker_share, pane)
+        }
+    }
+
+    /// worker close 後のリフロー（Issue #165）。anchor の worker 領域を `algorithm` で
+    /// 組み直し、空いた場所を残りの worker で再配分する。master・ユーザー由来ペインの
+    /// 矩形は変わらない。worker 領域が無い（全 worker が閉じた・anchor が消えた等）
+    /// 場合は何もせず false を返す
+    pub fn reflow_workers(&mut self, anchor: PaneId, algorithm: WorkerLayoutAlgorithm) -> bool {
+        if !self.contains(anchor) {
+            return false;
+        }
+        self.rebuild_worker_area(anchor, &mut None, algorithm)
+    }
+
+    /// anchor の worker 領域を見つけ、（あれば `extra` を末尾に加えて）`algorithm` で
+    /// 再構築する。worker 領域 = anchor Leaf から根へのパス上で anchor と反対側にあり、
+    /// 全リーフの `spawned_by` チェーンが anchor へ到達するサブツリー
+    /// （anchor に最も近い祖先を優先）。見つからなければ何もせず false
+    fn rebuild_worker_area(
+        &mut self,
+        anchor: PaneId,
+        extra: &mut Option<Pane>,
+        algorithm: WorkerLayoutAlgorithm,
+    ) -> bool {
+        use std::collections::{HashMap, HashSet};
+
+        // spawned_by チェーン判定表を先に作る（木の再帰中に self を再借用しないため）
+        let spawn_map: HashMap<PaneId, Option<PaneId>> = self
+            .panes()
+            .iter()
+            .map(|p| (p.id(), p.spawned_by()))
+            .collect();
+        let mut workers: HashSet<PaneId> = HashSet::new();
+        for &id in spawn_map.keys() {
+            let mut cur = id;
+            let mut seen = HashSet::new();
+            while let Some(Some(parent)) = spawn_map.get(&cur).copied() {
+                if !seen.insert(cur) {
+                    break; // 保存データ破損などによる循環の防御
+                }
+                if parent == anchor {
+                    workers.insert(id);
+                    break;
+                }
+                cur = parent;
+            }
+        }
+        if workers.is_empty() {
+            return false;
+        }
+
+        fn subtree_contains(node: &PaneNode, id: PaneId) -> bool {
+            match node {
+                PaneNode::Leaf(p) => p.id() == id,
+                PaneNode::Split { first, second, .. } => {
+                    subtree_contains(first, id) || subtree_contains(second, id)
+                }
+            }
+        }
+
+        fn all_workers(node: &PaneNode, workers: &std::collections::HashSet<PaneId>) -> bool {
+            match node {
+                PaneNode::Leaf(p) => workers.contains(&p.id()),
+                PaneNode::Split { first, second, .. } => {
+                    all_workers(first, workers) && all_workers(second, workers)
+                }
+            }
+        }
+
+        fn collect_leaves(node: PaneNode, out: &mut Vec<Pane>) {
+            match node {
+                PaneNode::Leaf(p) => out.push(p),
+                PaneNode::Split { first, second, .. } => {
+                    collect_leaves(*first, out);
+                    collect_leaves(*second, out);
+                }
+            }
+        }
+
+        /// anchor を含む側を先に深く処理し（= anchor に最も近い祖先を優先）、
+        /// 見つからなければ自分の反対側サブツリーが worker 領域かを判定する
+        fn rec(
+            node: PaneNode,
+            anchor: PaneId,
+            workers: &std::collections::HashSet<PaneId>,
+            extra: &mut Option<Pane>,
+            algorithm: WorkerLayoutAlgorithm,
+            done: &mut bool,
+        ) -> PaneNode {
+            let PaneNode::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } = node
+            else {
+                return node;
+            };
+            let in_first = subtree_contains(&first, anchor);
+            if !in_first && !subtree_contains(&second, anchor) {
+                return PaneNode::Split {
+                    axis,
+                    ratio,
+                    first,
+                    second,
+                };
+            }
+            let (near, far) = if in_first {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            let near = Box::new(rec(*near, anchor, workers, extra, algorithm, done));
+            let far = if !*done && all_workers(&far, workers) {
+                let mut panes = Vec::new();
+                collect_leaves(*far, &mut panes);
+                if let Some(p) = extra.take() {
+                    panes.push(p);
+                }
+                *done = true;
+                Box::new(crate::spawn_layout::build_worker_area(panes, algorithm))
+            } else {
+                far
+            };
+            let (first, second) = if in_first { (near, far) } else { (far, near) };
+            PaneNode::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            }
+        }
+
+        let mut done = false;
+        let root = self.root.take().expect("PaneTree.root は常に Some");
+        self.root = Some(rec(root, anchor, &workers, extra, algorithm, &mut done));
+        done
+    }
+}
+
 /// 矩形 `r` を `axis` 軸・`ratio`（first 側取り分）で 2 分割する
 fn split_rects(r: Rect, axis: SplitAxis, ratio: f32) -> (Rect, Rect) {
     match axis {
@@ -1053,5 +1236,264 @@ mod tests {
         pane.set_role(Some("dev-server".into()));
         assert_eq!(t.get(root).unwrap().title(), Some("dev"));
         assert_eq!(t.get(root).unwrap().role(), Some("dev-server"));
+    }
+
+    // --- spawn レイアウトエンジン（Issue #165） ---
+
+    mod spawn_layout_engine {
+        use super::*;
+        use crate::spawn_layout::{SpawnLayoutConfig, SpawnLayoutPolicy, WorkerLayoutAlgorithm};
+
+        fn grid_config() -> SpawnLayoutConfig {
+            SpawnLayoutConfig {
+                policy: SpawnLayoutPolicy::MasterReserved,
+                master_ratio: 0.5,
+                algorithm: WorkerLayoutAlgorithm::Grid,
+            }
+        }
+
+        fn spiral_config() -> SpawnLayoutConfig {
+            SpawnLayoutConfig {
+                algorithm: WorkerLayoutAlgorithm::Spiral,
+                ..grid_config()
+            }
+        }
+
+        /// spawn_worker + spawned_by 設定（dispatch 側の実処理と同じ手順）
+        fn spawn(t: &mut PaneTree, anchor: PaneId, config: &SpawnLayoutConfig) -> PaneId {
+            let id = t
+                .spawn_worker(anchor, Pane::new(PaneOrigin::Mcp), config)
+                .unwrap();
+            t.get_mut(id).unwrap().set_spawned_by(Some(anchor));
+            id
+        }
+
+        fn assert_rect(t: &PaneTree, id: PaneId, x: f32, y: f32, w: f32, h: f32) {
+            let r = rect_of(t, id);
+            for (actual, expected, name) in [
+                (r.x, x, "x"),
+                (r.y, y, "y"),
+                (r.width, w, "width"),
+                (r.height, h, "height"),
+            ] {
+                assert!(
+                    (actual - expected).abs() < 1e-4,
+                    "ペイン {id} の {name}: 期待 {expected} に対して実際 {actual}"
+                );
+            }
+        }
+
+        #[test]
+        fn grid_spawn1から4のrect() {
+            let (mut t, master) = tree();
+            let config = grid_config();
+
+            // 1 体: master 左半分維持、worker は右半分全面
+            let w1 = spawn(&mut t, master, &config);
+            assert_rect(&t, master, 0.0, 0.0, 0.5, 1.0);
+            assert_rect(&t, w1, 0.5, 0.0, 0.5, 1.0);
+
+            // 2 体: 右半分が上下に割れる。master 不変
+            let w2 = spawn(&mut t, master, &config);
+            assert_rect(&t, master, 0.0, 0.0, 0.5, 1.0);
+            assert_rect(&t, w1, 0.5, 0.0, 0.5, 0.5);
+            assert_rect(&t, w2, 0.5, 0.5, 0.5, 0.5);
+
+            // 3 体: 左列 2（w1/w2）+ 右列 1（w3 全高）
+            let w3 = spawn(&mut t, master, &config);
+            assert_rect(&t, master, 0.0, 0.0, 0.5, 1.0);
+            assert_rect(&t, w1, 0.5, 0.0, 0.25, 0.5);
+            assert_rect(&t, w2, 0.5, 0.5, 0.25, 0.5);
+            assert_rect(&t, w3, 0.75, 0.0, 0.25, 1.0);
+
+            // 4 体: 十字四分割
+            let w4 = spawn(&mut t, master, &config);
+            assert_rect(&t, master, 0.0, 0.0, 0.5, 1.0);
+            assert_rect(&t, w1, 0.5, 0.0, 0.25, 0.5);
+            assert_rect(&t, w2, 0.5, 0.5, 0.25, 0.5);
+            assert_rect(&t, w3, 0.75, 0.0, 0.25, 0.5);
+            assert_rect(&t, w4, 0.75, 0.5, 0.25, 0.5);
+
+            // フォーカスは最後に spawn した worker
+            assert_eq!(t.focused(), w4);
+        }
+
+        #[test]
+        fn grid_close後に右領域がリフローされる() {
+            let (mut t, master) = tree();
+            let config = grid_config();
+            let w1 = spawn(&mut t, master, &config);
+            let w2 = spawn(&mut t, master, &config);
+            let w3 = spawn(&mut t, master, &config);
+            let w4 = spawn(&mut t, master, &config);
+
+            // w2 を閉じてリフロー → 残り 3 体が左列 2 + 右列 1 の形へ戻る
+            t.close(w2).unwrap();
+            assert!(t.reflow_workers(master, config.algorithm));
+            assert_rect(&t, master, 0.0, 0.0, 0.5, 1.0);
+            assert_rect(&t, w1, 0.5, 0.0, 0.25, 0.5);
+            assert_rect(&t, w3, 0.5, 0.5, 0.25, 0.5);
+            assert_rect(&t, w4, 0.75, 0.0, 0.25, 1.0);
+
+            // さらに 2 体閉じて 1 体 → 右半分全面
+            t.close(w3).unwrap();
+            assert!(t.reflow_workers(master, config.algorithm));
+            t.close(w4).unwrap();
+            assert!(t.reflow_workers(master, config.algorithm));
+            assert_rect(&t, w1, 0.5, 0.0, 0.5, 1.0);
+
+            // 最後の worker を閉じると領域ごと消え master が全面へ（リフローは no-op）
+            t.close(w1).unwrap();
+            assert!(!t.reflow_workers(master, config.algorithm));
+            assert_rect(&t, master, 0.0, 0.0, 1.0, 1.0);
+        }
+
+        #[test]
+        fn ユーザーペインのrectはspawnとcloseで変わらない() {
+            let (mut t, master) = tree();
+            let config = grid_config();
+            // ユーザーが master の下に手動で開いたペイン（下半分）
+            let user = t
+                .split(master, SplitDirection::Down, Pane::new(PaneOrigin::User))
+                .unwrap();
+            let user_rect = rect_of(&t, user);
+
+            // spawn 1→3 体 + close リフローを通してユーザーペインの矩形は不変
+            let w1 = spawn(&mut t, master, &config);
+            let w2 = spawn(&mut t, master, &config);
+            let _w3 = spawn(&mut t, master, &config);
+            assert_eq!(rect_of(&t, user), user_rect);
+            // master は上半分の中で左 50% を維持し、worker 領域は右上 1/4 に収まる
+            assert_rect(&t, master, 0.0, 0.0, 0.5, 0.5);
+            assert_rect(&t, w1, 0.5, 0.0, 0.25, 0.25);
+
+            t.close(w2).unwrap();
+            assert!(t.reflow_workers(master, config.algorithm));
+            assert_eq!(rect_of(&t, user), user_rect);
+        }
+
+        #[test]
+        fn 混在サブツリーはworker領域と見なされない() {
+            let (mut t, master) = tree();
+            let config = grid_config();
+            let w1 = spawn(&mut t, master, &config);
+            // ユーザーが worker 領域内に手動でペインを開いた（w1 の右）
+            let user = t
+                .split(w1, SplitDirection::Right, Pane::new(PaneOrigin::User))
+                .unwrap();
+            let user_rect = rect_of(&t, user);
+            let w1_rect = rect_of(&t, w1);
+
+            // 次の spawn は混在領域を再構築せず、master をさらに右分割して新設する
+            let w2 = spawn(&mut t, master, &config);
+            assert_eq!(rect_of(&t, user), user_rect, "ユーザーペインは不変");
+            assert_eq!(rect_of(&t, w1), w1_rect, "混在領域内の worker も不変");
+            // master は自身の残り幅（0.5）の中で 50% を維持
+            assert_rect(&t, master, 0.0, 0.0, 0.25, 1.0);
+            assert_rect(&t, w2, 0.25, 0.0, 0.25, 1.0);
+        }
+
+        #[test]
+        fn spiral_spawn1から4のrect() {
+            let (mut t, master) = tree();
+            let config = spiral_config();
+
+            let w1 = spawn(&mut t, master, &config);
+            assert_rect(&t, w1, 0.5, 0.0, 0.5, 1.0);
+
+            // 2 体: 上下半分
+            let w2 = spawn(&mut t, master, &config);
+            assert_rect(&t, w1, 0.5, 0.0, 0.5, 0.5);
+            assert_rect(&t, w2, 0.5, 0.5, 0.5, 0.5);
+
+            // 3 体: 下半分が左右に割れる
+            let w3 = spawn(&mut t, master, &config);
+            assert_rect(&t, w1, 0.5, 0.0, 0.5, 0.5);
+            assert_rect(&t, w2, 0.5, 0.5, 0.25, 0.5);
+            assert_rect(&t, w3, 0.75, 0.5, 0.25, 0.5);
+
+            // 4 体: 右下がさらに上下へ（縦横交互）
+            let w4 = spawn(&mut t, master, &config);
+            assert_rect(&t, master, 0.0, 0.0, 0.5, 1.0);
+            assert_rect(&t, w1, 0.5, 0.0, 0.5, 0.5);
+            assert_rect(&t, w2, 0.5, 0.5, 0.25, 0.5);
+            assert_rect(&t, w3, 0.75, 0.5, 0.25, 0.25);
+            assert_rect(&t, w4, 0.75, 0.75, 0.25, 0.25);
+        }
+
+        #[test]
+        fn legacyポリシーは従来の右等分割() {
+            let (mut t, master) = tree();
+            let config = SpawnLayoutConfig {
+                policy: SpawnLayoutPolicy::Legacy,
+                ..grid_config()
+            };
+            let w1 = spawn(&mut t, master, &config);
+            // 従来の spawn 比率（新ペイン側 0.45）
+            assert_rect(&t, master, 0.0, 0.0, 0.55, 1.0);
+            assert_rect(&t, w1, 0.55, 0.0, 0.45, 1.0);
+            // 2 体目は master ではなく直前の分割先の右ではなく、同じ anchor の右
+            let w2 = spawn(&mut t, master, &config);
+            assert_close_to(rect_of(&t, master).width, 0.55 * 0.55);
+            assert_close_to(rect_of(&t, w2).width, 0.55 * 0.45);
+        }
+
+        #[test]
+        fn master_ratioが反映される() {
+            let (mut t, master) = tree();
+            let config = SpawnLayoutConfig {
+                master_ratio: 0.7,
+                ..grid_config()
+            };
+            let w1 = spawn(&mut t, master, &config);
+            assert_rect(&t, master, 0.0, 0.0, 0.7, 1.0);
+            assert_rect(&t, w1, 0.7, 0.0, 0.3, 1.0);
+            // 2 体目以降は領域内の再構築なので master_ratio は影響しない
+            let _w2 = spawn(&mut t, master, &config);
+            assert_rect(&t, master, 0.0, 0.0, 0.7, 1.0);
+        }
+
+        #[test]
+        fn 孫workerもチェーンで領域に含まれる() {
+            let (mut t, master) = tree();
+            let config = grid_config();
+            let w1 = spawn(&mut t, master, &config);
+            // w1 が孫 worker を spawn（anchor は w1）
+            let w1a = spawn(&mut t, w1, &config);
+            // master 起点のリフロー: w1a も spawned_by チェーンで master に到達するため
+            // 領域内に含まれ、grid で再配置される
+            assert!(t.reflow_workers(master, config.algorithm));
+            assert_rect(&t, master, 0.0, 0.0, 0.5, 1.0);
+            assert_rect(&t, w1, 0.5, 0.0, 0.5, 0.5);
+            assert_rect(&t, w1a, 0.5, 0.5, 0.5, 0.5);
+        }
+
+        #[test]
+        fn 存在しないanchorはエラーまたはfalse() {
+            let (mut t, master) = tree();
+            let ghost = Pane::new(PaneOrigin::User).id();
+            assert_eq!(
+                t.spawn_worker(ghost, Pane::new(PaneOrigin::Mcp), &grid_config()),
+                Err(PaneTreeError::PaneNotFound(ghost))
+            );
+            assert!(!t.reflow_workers(ghost, WorkerLayoutAlgorithm::Grid));
+            // master に worker がいなければリフローは no-op
+            assert!(!t.reflow_workers(master, WorkerLayoutAlgorithm::Grid));
+        }
+
+        #[test]
+        fn grid_5体以上は列が増える() {
+            let (mut t, master) = tree();
+            let config = grid_config();
+            let ws: Vec<PaneId> = (0..5).map(|_| spawn(&mut t, master, &config)).collect();
+            // 5 体: rows=3, cols=2 → 左列 3 + 右列 2
+            assert_rect(&t, master, 0.0, 0.0, 0.5, 1.0);
+            let h3 = 1.0 / 3.0;
+            assert_rect(&t, ws[0], 0.5, 0.0, 0.25, h3);
+            assert_rect(&t, ws[1], 0.5, h3, 0.25, h3);
+            assert_rect(&t, ws[2], 0.5, 2.0 * h3, 0.25, h3);
+            assert_rect(&t, ws[3], 0.75, 0.0, 0.25, 0.5);
+            assert_rect(&t, ws[4], 0.75, 0.5, 0.25, 0.5);
+        }
     }
 }

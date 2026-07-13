@@ -951,6 +951,39 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_orchestrator_layout",
+            "description": "worker spawn のレイアウト設定を取得・変更する（config.yaml の spawn_layout）。\
+                全パラメータ省略で現在値の取得、いずれか指定でその項目を更新して結果を返す。\
+                policy=master-reserved（既定）は spawn 元（master）の取り分を維持し、\
+                worker を右側の worker 領域内に配置する。legacy は従来の右等分割\
+                （worker が増えるほど全ペインが横に圧縮される）。\
+                master_ratio は master 側へ残す取り分（0.1〜0.9。既定 0.5 = 画面半分）。\
+                algorithm は worker 領域内の配置: grid（1 体=全面 → 2 体=上下 → 3〜4 体=十字四分割）/ \
+                spiral（縦横交互に半分ずつの渦巻き分割）。\
+                worker close 時は領域内だけがリフローされ、master とユーザーが自分で開いた\
+                ペインの矩形は変わらない。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "policy": {
+                        "type": "string",
+                        "enum": ["master-reserved", "legacy"],
+                        "description": "配置ポリシー（省略で現状維持）",
+                    },
+                    "master_ratio": {
+                        "type": "number",
+                        "description": "master 側へ残す取り分 0.1〜0.9（省略で現状維持）",
+                    },
+                    "algorithm": {
+                        "type": "string",
+                        "enum": ["grid", "spiral"],
+                        "description": "worker 領域内の配置アルゴリズム（省略で現状維持）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_orchestrator_spawn",
             "description": "プロジェクトの作業ディレクトリで子 worker を spawn する。\
                 worker のエージェント CLI は claude（既定）/ codex / agy から選べる（agent パラメータ）。\
@@ -1699,6 +1732,11 @@ fn build_request(
             agent_args: str_vec_arg(args, "agent_args")?,
             worker_model_policy: str_arg(args, "worker_model_policy")?,
         },
+        "tako_orchestrator_layout" => Request::OrchestratorLayout {
+            policy: str_arg(args, "policy")?,
+            master_ratio: f64_arg(args, "master_ratio")?.map(|v| v as f32),
+            algorithm: str_arg(args, "algorithm")?,
+        },
         "tako_orchestrator_spawn" => {
             let pane = u64_arg(args, "pane")?;
             let tab = u64_arg(args, "tab")?;
@@ -2267,9 +2305,42 @@ mod tests {
     }
 
     #[test]
+    fn tako_orchestrator_layoutはリクエストに変換される() {
+        // 全省略 = 取得
+        let (response, requests) = run(call("tako_orchestrator_layout", json!({})), None, true);
+        assert_eq!(
+            requests,
+            vec![Request::OrchestratorLayout {
+                policy: None,
+                master_ratio: None,
+                algorithm: None,
+            }]
+        );
+        assert_eq!(response.unwrap()["result"]["isError"], false);
+
+        // 指定あり = 設定
+        let (_, requests) = run(
+            call(
+                "tako_orchestrator_layout",
+                json!({ "policy": "legacy", "master_ratio": 0.6, "algorithm": "spiral" }),
+            ),
+            None,
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::OrchestratorLayout {
+                policy: Some("legacy".into()),
+                master_ratio: Some(0.6),
+                algorithm: Some("spiral".into()),
+            }]
+        );
+    }
+
+    #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 58);
+        assert_eq!(tools.len(), 59);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

@@ -115,6 +115,36 @@ Workspace
 - Pane は `role`（任意ラベル）と `origin`（user / cli / mcp / suggestion）を持ち、
   UI 表示とポリシー制御（FR-2.3.5）に使う
 
+### spawn レイアウトエンジン（FR-2.20、#165。2026-07-13 実装）
+
+worker spawn の配置を「呼び出し元の右に等分割」から差し替えるレイヤ。
+
+- **型とアルゴリズム**: `tako-core::spawn_layout`。`SpawnLayoutPolicy`
+  （master-reserved 既定 / legacy）・`WorkerLayoutAlgorithm`（grid 既定 / spiral）・
+  `SpawnLayoutConfig { policy, master_ratio, algorithm }` と、worker 領域サブツリーを
+  組み立てる純関数（grid = 行優先の格子: rows = ceil(sqrt(n))・列等幅・列内等高、
+  spiral = 先頭が半分を取り残りを直交軸で再帰分割。初回軸は Vertical = 上下）
+- **PaneTree への適用**: `PaneTree::spawn_worker(anchor, pane, config)` と
+  `PaneTree::reflow_workers(anchor, algorithm)`（`pane_tree.rs`）。
+  **worker 領域 = anchor Leaf から根へのパス上で anchor と反対側にあり、全リーフの
+  `spawned_by` チェーンが anchor へ到達するサブツリー**（最も近い祖先を優先）。
+  領域が無ければ anchor を右分割して新設（anchor 側に master_ratio を残す）、
+  あれば領域内の Pane を集めて理想形に再構築する（= anchor・領域外ペインの
+  ratio / rect には一切触れない）。ユーザーペインが混在したサブツリーは領域と
+  見なされないため、手動ペインの矩形が spawn / close で変わることはない
+- **接続点**: spawn = `dispatch_orchestrator_spawn`（dispatch.rs）。close リフロー =
+  dispatch `Request::Close` と tako-app `remove_pane_with`（UI × / exit 由来）の両方で、
+  close 前に対象の role（orchestrator-worker）と spawned_by を記録 → close 成功後に
+  `reflow_workers`。設定は `tako-control::setup::spawn_layout_config()`
+  （config.yaml `spawn_layout` セクション。不正値・読み取り失敗は既定へフォールバック）
+- **設定変更経路**: `dispatch_orchestrator_layout`（host 非依存）を dispatch
+  `Request::OrchestratorLayout` と CLI `tako orchestrator layout` が共用（#83 の教訓）。
+  MCP は `tako_orchestrator_layout`（計 59 ツール）
+- **注意**: `spawned_by` は永続化されない（セッション内使い捨て）。tako 再起動後の
+  spawn は既存 worker を領域と認識できず新設パスに落ちる（許容。worker はタスク単位で
+  使い捨てる運用のため）。grid の列数は n ≤ 100 で ratio ≥ 0.1 に収まり MIN_SHARE
+  クランプと整合する
+
 ### ⚠️ PTY セッション破棄のハマりどころ（2026-06-11 常用クラッシュの教訓）
 
 - **alacritty に既定シェル解決を任せない**（`tty::Options.shell = None` 禁止）。macOS では

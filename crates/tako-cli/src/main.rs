@@ -625,6 +625,18 @@ enum OrchestratorCommand {
     /// プロファイル管理（一覧 / 表示 / 設定）
     #[command(subcommand)]
     Profiles(ProfilesCommand),
+    /// worker spawn のレイアウト設定（全オプション省略で現在値を表示）
+    Layout {
+        /// 配置ポリシー: master-reserved（master の取り分を維持。既定）/ legacy（従来の右等分割）
+        #[arg(long)]
+        policy: Option<String>,
+        /// master 側へ残す取り分（0.1〜0.9。既定 0.5 = 画面半分）
+        #[arg(long)]
+        master_ratio: Option<f32>,
+        /// worker 領域内の配置アルゴリズム: grid（十字四分割系。既定）/ spiral（縦横交互の半分割）
+        #[arg(long)]
+        algorithm: Option<String>,
+    },
     /// 子 worker を spawn する（split + エージェント CLI 起動 + プロンプト送信）
     Spawn {
         /// プロジェクトキー（projects.yaml に登録済み）
@@ -1151,6 +1163,21 @@ fn main() -> ExitCode {
         }
         Command::Orchestrator(OrchestratorCommand::Profiles(ref sub)) => {
             orchestrator_profiles_cli(sub)
+        }
+        Command::Orchestrator(OrchestratorCommand::Layout {
+            ref policy,
+            master_ratio,
+            ref algorithm,
+        }) => {
+            // config.yaml のみの操作のため IPC 不要。dispatch と同一関数を共用する
+            // （MCP `tako_orchestrator_layout` と 1:1。二重実装を作らない）
+            tako_control::dispatch_orchestrator_layout(
+                policy.as_deref(),
+                master_ratio,
+                algorithm.as_deref(),
+            )
+            .map_err(|e| e.to_string())
+            .map(|result| println!("{}", pretty_json(&result)))
         }
         Command::Orchestrator(OrchestratorCommand::Run {
             ref project,
@@ -2498,6 +2525,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }
         Command::Orchestrator(OrchestratorCommand::Run { .. }) => {
             unreachable!("orchestrator run は run() を通らない")
+        }
+        Command::Orchestrator(OrchestratorCommand::Layout { .. }) => {
+            unreachable!("orchestrator layout は run() を通らない（ローカルで config.yaml を操作）")
         }
         Command::Web(sub) => {
             let dir = |right: bool, down: bool, left: bool, up: bool| match (down, left, up) {

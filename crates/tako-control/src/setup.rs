@@ -29,6 +29,61 @@ pub struct SetupConfig {
         skip_serializing_if = "crate::agents_sync::AgentsSyncConfig::is_default"
     )]
     pub agents_sync: crate::agents_sync::AgentsSyncConfig,
+    /// worker spawn のレイアウト設定（Issue #165）
+    #[serde(default, skip_serializing_if = "SpawnLayoutSection::is_default")]
+    pub spawn_layout: SpawnLayoutSection,
+}
+
+/// config.yaml の spawn_layout セクション（Issue #165）。
+/// 未設定キーは既定値（master-reserved / 0.5 / grid）に解決される。
+/// 不正値は spawn を止めないよう警告なしで既定へフォールバックする
+/// （検証つきの変更経路は CLI `tako orchestrator layout` / MCP `tako_orchestrator_layout`）
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SpawnLayoutSection {
+    /// 配置ポリシー（"master-reserved" / "legacy"）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    /// master-reserved 時に master 側へ残す取り分（0.1〜0.9）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_ratio: Option<f32>,
+    /// worker 領域内の配置アルゴリズム（"grid" / "spiral"）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub algorithm: Option<String>,
+}
+
+impl SpawnLayoutSection {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// tako-core のレイアウト設定へ解決する。不正値・未設定は既定値へ
+    pub fn resolve(&self) -> tako_core::SpawnLayoutConfig {
+        let defaults = tako_core::SpawnLayoutConfig::default();
+        tako_core::SpawnLayoutConfig {
+            policy: self
+                .policy
+                .as_deref()
+                .and_then(|s| tako_core::SpawnLayoutPolicy::parse(s).ok())
+                .unwrap_or(defaults.policy),
+            master_ratio: self
+                .master_ratio
+                .map(tako_core::spawn_layout::clamp_master_ratio)
+                .unwrap_or(defaults.master_ratio),
+            algorithm: self
+                .algorithm
+                .as_deref()
+                .and_then(|s| tako_core::WorkerLayoutAlgorithm::parse(s).ok())
+                .unwrap_or(defaults.algorithm),
+        }
+    }
+}
+
+/// spawn レイアウト設定を config.yaml から解決する（Issue #165）。
+/// 読み取り失敗（$HOME 無し・パース不能）は既定値へフォールバックし、spawn を止めない
+pub fn spawn_layout_config() -> tako_core::SpawnLayoutConfig {
+    load_config()
+        .map(|c| c.spawn_layout.resolve())
+        .unwrap_or_default()
 }
 
 /// config.yaml の orchestrator セクション。
@@ -295,6 +350,49 @@ mod tests {
             "無関係のフィールドは保持される"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spawn_layoutセクションのroundtripと解決() {
+        // 既定（未設定）はシリアライズされず、既定値へ解決される（Issue #165）
+        let config = SetupConfig::default();
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(!yaml.contains("spawn_layout"));
+        let resolved = config.spawn_layout.resolve();
+        assert_eq!(resolved, tako_core::SpawnLayoutConfig::default());
+        assert_eq!(
+            resolved.policy,
+            tako_core::SpawnLayoutPolicy::MasterReserved
+        );
+        assert_eq!(resolved.master_ratio, 0.5);
+        assert_eq!(resolved.algorithm, tako_core::WorkerLayoutAlgorithm::Grid);
+
+        // 設定値の round-trip
+        let mut config = SetupConfig::default();
+        config.spawn_layout.policy = Some("legacy".into());
+        config.spawn_layout.master_ratio = Some(0.6);
+        config.spawn_layout.algorithm = Some("spiral".into());
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let back: SetupConfig = serde_yaml::from_str(&yaml).unwrap();
+        let resolved = back.spawn_layout.resolve();
+        assert_eq!(resolved.policy, tako_core::SpawnLayoutPolicy::Legacy);
+        assert_eq!(resolved.master_ratio, 0.6);
+        assert_eq!(resolved.algorithm, tako_core::WorkerLayoutAlgorithm::Spiral);
+    }
+
+    #[test]
+    fn spawn_layoutの不正値は既定へフォールバックする() {
+        // 手編集の不正値で spawn を止めない（Issue #165）
+        let yaml = "spawn_layout:\n  policy: golden\n  master_ratio: 7.5\n  algorithm: mosaic\n";
+        let config: SetupConfig = serde_yaml::from_str(yaml).unwrap();
+        let resolved = config.spawn_layout.resolve();
+        assert_eq!(
+            resolved.policy,
+            tako_core::SpawnLayoutPolicy::MasterReserved
+        );
+        // 範囲外の比率はクランプ
+        assert_eq!(resolved.master_ratio, 0.9);
+        assert_eq!(resolved.algorithm, tako_core::WorkerLayoutAlgorithm::Grid);
     }
 
     #[test]
