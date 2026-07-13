@@ -377,4 +377,25 @@ mod tests {
         assert_eq!(clamp_ime_range_start(100, 4, Some(&(2..4))), 2);
         assert_eq!(clamp_ime_range_start(100, 4, None), 4);
     }
+
+    /// #103: cmd-q → Quit のバインドが存在し、コンテキスト述語なし
+    /// （= フォーカス喪失で context stack が空でもマッチする）であることを固定する。
+    /// 発火側（グローバル on_action）はセルフテスト最終項目が e2e で検証する
+    #[test]
+    fn cmd_qはコンテキスト述語なしでquitにバインドされている() {
+        let bindings = key_bindings();
+        let quit: Vec<_> = bindings
+            .iter()
+            .filter(|b| b.action().name() == "tako::Quit")
+            .collect();
+        assert_eq!(quit.len(), 1, "Quit のバインドはちょうど 1 個");
+        let ks = quit[0].keystrokes();
+        assert_eq!(ks.len(), 1, "単発キーストローク");
+        assert_eq!(ks[0].inner().key, "q");
+        assert!(ks[0].inner().modifiers.platform, "cmd 修飾");
+        assert!(
+            quit[0].predicate().is_none(),
+            "コンテキスト述語なし（どのフォーカス状態でもマッチ）"
+        );
+    }
 }
