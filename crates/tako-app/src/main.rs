@@ -773,6 +773,14 @@ struct GitCollapsed {
     diff: bool,
 }
 
+/// ミラースクロールの実体解決の起点（#181）。
+/// Backend はスクロール開始時にネスト tmux を辿って解決する（background executor）、
+/// Fixed は解決済み（TmuxOpen ビュー）
+enum MirrorSource {
+    Backend(String),
+    Fixed(tako_core::scroll::ScrollTarget),
+}
+
 /// TmuxOpen でペインに表示している外部 tmux セッションの監視情報
 #[derive(Debug, Clone)]
 struct TmuxViewTarget {
@@ -1623,6 +1631,38 @@ impl TakoApp {
         // 操作セマンティクスは tako-control::dispatch に一元化されている（設計原則 5）
         cx.spawn(async move |this, cx| {
             while let Some(incoming) = control_rx.next().await {
+                // WorkerStatus は `claude agents --json` のサブプロセス起動（実測 500〜1100ms）を
+                // 含み、UI スレッドの dispatch で実行すると master のポーリング（1〜3 秒間隔）
+                // ごとに UI 全体が固まる（#181: スクロールのカクつきの正体。perf.log で特定）。
+                // UI 依存のスナップショットだけ UI スレッドで取り、重い合成は background で
+                // 実行して応答する（読み取り専用のため並行実行しても安全）
+                if let tako_control::protocol::Request::OrchestratorWorkerStatus {
+                    pane_id,
+                    session_id,
+                    tmux_session,
+                } = &incoming.request
+                {
+                    let pane_id = *pane_id;
+                    let session_id = session_id.clone();
+                    let tmux_session = tmux_session.clone();
+                    let Ok(snap) = this.update(cx, |app: &mut TakoApp, _| {
+                        tako_control::worker_status_snapshot(app, pane_id)
+                    }) else {
+                        break; // View が破棄された
+                    };
+                    let reply = incoming.reply.clone();
+                    cx.background_executor()
+                        .spawn(async move {
+                            let result = tako_control::worker_status_compute(
+                                snap,
+                                session_id.as_deref(),
+                                tmux_session.as_deref(),
+                            );
+                            let _ = reply.send(Ok(result));
+                        })
+                        .detach();
+                    continue;
+                }
                 let result = this.update(cx, |app: &mut TakoApp, cx| {
                     let was_scroll = matches!(
                         incoming.request,
@@ -4700,7 +4740,7 @@ impl TakoApp {
             return;
         };
         let area = *area;
-        let backend = self.backend_sessions.contains_key(&pane_id);
+        let backend = self.mirror_scroll_pane(pane_id);
         let Some(session) = self.terminals.get(&pane_id) else {
             return;
         };
@@ -4963,6 +5003,37 @@ impl TakoApp {
         }
     }
 
+    /// ペインのスクロール実体が tmux 側にあるか（tako 管理のバックエンドセッション、
+    /// または `tako tmux open` で表示している外部セッション）。ミラースクロール・
+    /// スクロールバー・CLI/MCP Scroll の分岐はすべてこれで判定する（#181: 再アタッチ・
+    /// ビューラッパーペインは外側 alacritty が alt screen（履歴なし）のため、
+    /// backend_sessions だけの判定では直接ペイン扱いに落ちてスクロール不能だった）
+    fn mirror_scroll_pane(&self, pane_id: PaneId) -> bool {
+        self.backend_sessions.contains_key(&pane_id) || self.tmux_view_panes.contains_key(&pane_id)
+    }
+
+    /// ミラースクロールの実体解決の起点。**TmuxOpen ビューを最優先**する: persist ON では
+    /// ビューペインの外側 PTY（tmux attach クライアント）も spawn 時に backend セッションで
+    /// ラップされ backend_sessions に入るが、それは輸送層で、表示実体（履歴）は常にビュー先に
+    /// ある。backend を先に見ると resolve_target が外側ラッパー（history 0、かつネスト候補は
+    /// 既定サーバーのみで別 socket のビュー先を辿れない）へ解決しスクロール不能になる
+    /// （#181 実機「効かない」の第二の根因。persist OFF の隔離検証だけでは踏まない）。
+    /// ビュー先は wrapper（無ければ元セッション）@ socket がそのまま実体
+    /// （grouped session の表示 window は wrapper 側にあるため）。
+    /// バックエンドペインは従来どおりネスト tmux を辿る resolve が必要
+    fn mirror_source(&self, pane_id: PaneId) -> Option<MirrorSource> {
+        if let Some(view) = self.tmux_view_panes.get(&pane_id) {
+            return Some(MirrorSource::Fixed(
+                tako_core::scroll::ScrollTarget::Nested {
+                    socket: view.socket.clone(),
+                    session: view.wrapper.clone().unwrap_or_else(|| view.session.clone()),
+                },
+            ));
+        }
+        let backend = self.backend_sessions.get(&pane_id)?;
+        Some(MirrorSource::Backend(backend.clone()))
+    }
+
     fn on_pane_scroll(
         &mut self,
         pane_id: PaneId,
@@ -4984,9 +5055,9 @@ impl TakoApp {
             .cell_at(pane_id, event.position, window)
             .map(|(c, r, _)| (c, r))
             .unwrap_or((0, 0));
-        if self.backend_sessions.contains_key(&pane_id) {
-            // バックエンドペイン: tmux 履歴のローカルミラー上でピクセル単位に
-            // スクロールする（マウス要求アプリへの SGR 転送も内部で出し分け。#159）
+        if self.mirror_scroll_pane(pane_id) {
+            // バックエンド / TmuxOpen ビューペイン: tmux 履歴のローカルミラー上で
+            // ピクセル単位にスクロールする（マウス要求アプリへの SGR 転送も内部で出し分け。#159/#181）
             self.backend_scroll_px(pane_id, delta_rows, (col, row), cx);
         } else if let Some(session) = self.terminals.get(&pane_id) {
             // 直接ペイン: 行小数のままセッションへ（ピクセル単位スムーススクロール #159）。
@@ -5058,7 +5129,7 @@ impl TakoApp {
     /// 初回はスクロール実体の解決 + マウス要求判定 + 最新チャンク取得、
     /// 以降はさらに過去のチャンクを先頭へ足す。完了時に必要なら再ポンプする
     fn pump_mirror(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
-        let Some(backend) = self.backend_sessions.get(&pane_id).cloned() else {
+        let Some(source) = self.mirror_source(pane_id) else {
             return;
         };
         let Some(ctl) = self.scroll_ctls.get_mut(&pane_id) else {
@@ -5077,8 +5148,16 @@ impl TakoApp {
         cx.spawn(async move |this, cx| {
             let task = cx.background_executor().spawn(async move {
                 use tako_core::{scroll, scroll_mirror};
-                let target =
-                    target.unwrap_or_else(|| scroll::resolve_target(&socket, &backend, &[None]));
+                let target = target.unwrap_or_else(|| match source {
+                    MirrorSource::Backend(backend) => {
+                        // ネスト候補は既定サーバー + backend socket 自身（#181: persist 復元で
+                        // 戻ったビューペインは tmux_view_panes に載らないが、外側 PTY の
+                        // tmux client（`--socket tako` のビュー先 = backend socket 上）を
+                        // tty 突き合わせで検出してビュー先セッションへ解決できる）
+                        scroll::resolve_target(&socket, &backend, &[None, Some(&socket)])
+                    }
+                    MirrorSource::Fixed(t) => t,
+                });
                 // 旧 tako（copy-mode 方式）や CLI が copy-mode を残していたら初回に掃除する
                 // （新方式は copy-mode に入らないため、居残りはキー飲まれ事故になる）
                 if first_load {
@@ -5271,7 +5350,7 @@ impl TakoApp {
         else {
             return;
         };
-        if self.backend_sessions.contains_key(&pane_id) {
+        if self.mirror_scroll_pane(pane_id) {
             let need_load = self
                 .scroll_ctls
                 .get(&pane_id)
@@ -5532,7 +5611,7 @@ impl TakoApp {
             return None;
         }
         let session = self.terminals.get(&pane_id)?;
-        let (offset, history) = if self.backend_sessions.contains_key(&pane_id) {
+        let (offset, history) = if self.mirror_scroll_pane(pane_id) {
             // バックエンドのスクロールバックは tmux 側（ネスト先含む）のミラー
             (
                 ctl.mirror
@@ -5555,6 +5634,10 @@ impl TakoApp {
         let (_, rows) = session.size();
         let total = (history + rows) as f32;
         let track_h = f32::from(area.size.height);
+        // サム最小長（20px）より低い極小領域では描かない（clamp の min > max panic 防止。#181）
+        if track_h < 20.0 {
+            return None;
+        }
         let thumb_h = (rows as f32 / total * track_h).clamp(20.0, track_h);
         let top = ((history as f32 - offset.min(history as f32)) / total * track_h)
             .min(track_h - thumb_h);
@@ -5728,7 +5811,7 @@ impl TakoApp {
         pane_id: PaneId,
         screen: &tako_core::Screen,
     ) -> Option<Vec<tako_core::ScreenLine>> {
-        if !self.backend_sessions.contains_key(&pane_id) {
+        if !self.mirror_scroll_pane(pane_id) {
             return None;
         }
         let ctl = self.scroll_ctls.get(&pane_id)?;
@@ -7224,6 +7307,10 @@ impl ControlHost for TakoApp {
         self.backend_sessions.get(&pane).cloned()
     }
 
+    fn is_mirror_scroll_pane(&self, pane: PaneId) -> bool {
+        self.mirror_scroll_pane(pane)
+    }
+
     fn backend_windows(&self, pane: PaneId) -> Option<Vec<tako_core::TmuxWindow>> {
         self.backend_windows.get(&pane).cloned()
     }
@@ -7238,16 +7325,18 @@ impl ControlHost for TakoApp {
         to: Option<usize>,
         delta: Option<i32>,
     ) -> Option<(usize, usize)> {
-        let backend = self.backend_sessions.get(&pane)?.clone();
+        let source = self.mirror_source(pane)?;
         let ctl = self.scroll_ctls.entry(pane).or_default();
         ctl.last_activity = std::time::Instant::now();
         if ctl.target.is_none() {
-            let socket = tako_core::tmux_backend::socket_name();
-            ctl.target = Some(tako_core::scroll::resolve_target(
-                &socket,
-                &backend,
-                &[None],
-            ));
+            ctl.target = Some(match source {
+                MirrorSource::Backend(backend) => {
+                    let socket = tako_core::tmux_backend::socket_name();
+                    // pump_mirror と同じ候補（既定サーバー + backend socket。#181）
+                    tako_core::scroll::resolve_target(&socket, &backend, &[None, Some(&socket)])
+                }
+                MirrorSource::Fixed(t) => t,
+            });
         }
         let target = ctl.target.as_ref().expect("直前に解決済み");
         if let Some((history, mouse)) = tako_core::scroll_mirror::history_state(target) {
@@ -12750,6 +12839,225 @@ mod self_test {
                     .status();
             } else {
                 eprintln!("（tmux 不在のため項目 68 をスキップ）");
+            }
+
+            // 73. TmuxOpen ビューペインのミラースクロール（#181）: `tako tmux open` で
+            //      取り込んだ再アタッチ・ビューラッパーペインも #159 のローカルミラー +
+            //      スクロールバー + CLI/MCP Scroll に乗る（backend_sessions に無いペインが
+            //      直接ペイン扱いに落ち、alt screen（履歴なし）でスクロール不能だった
+            //      実機バグの回帰検知）
+            if has_tmux {
+                let view_sock = format!("tako-selftest-view-{}", std::process::id());
+                let created = std::process::Command::new("tmux")
+                    .args(["-L", &view_sock, "new-session", "-d", "-s", "view-src"])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                check(created, "TmuxOpen ミラー用 tmux セッション作成");
+                // 履歴 200 行を積む（ミラー capture の対象）
+                let _ = std::process::Command::new("tmux")
+                    .args([
+                        "-L",
+                        &view_sock,
+                        "send-keys",
+                        "-t",
+                        "=view-src:",
+                        "seq 200",
+                        "Enter",
+                    ])
+                    .status();
+                wait(cx, 800).await;
+                let view_pane_raw = window
+                    .update(cx, |app, _, cx| {
+                        let base = app.focused_pane().as_u64();
+                        let opened = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TmuxOpen {
+                                socket: Some(view_sock.clone()),
+                                session: "view-src".into(),
+                                window: None,
+                                pane: Some(base),
+                                direction: Some(tako_control::protocol::Direction::Down),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .expect("tmux open は成功する");
+                        for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                            app.spawn_session(pane, options, cx)
+                                .expect("取り込みペインの PTY 起動は成功する");
+                        }
+                        opened["pane"].as_u64().expect("pane が返る")
+                    })
+                    .unwrap_or(0);
+                let view_pane = PaneId::from_raw(view_pane_raw);
+                // attach クライアント成立 + 画面に seq 出力が映るまで待つ
+                let mut view_ready = false;
+                for _ in 0..25 {
+                    wait(cx, 400).await;
+                    view_ready = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&view_pane)
+                                .map(|s| {
+                                    s.visible_lines().iter().any(|l| l.contains("200"))
+                                })
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if view_ready {
+                        break;
+                    }
+                }
+                check(view_ready, "TmuxOpen ペインに外部セッションの画面が映る");
+                // ホイール = ミラー表示 + スクロールバー表示（#159 と同じ機構に乗る）
+                window
+                    .update(cx, |app, win, cx| {
+                        let center = app
+                            .pane_text_areas
+                            .iter()
+                            .find(|(id, _)| *id == view_pane)
+                            .map(|(_, b)| b.center())
+                            .unwrap_or_default();
+                        app.on_pane_scroll(
+                            view_pane,
+                            &ScrollWheelEvent {
+                                position: center,
+                                delta: ScrollDelta::Lines(point(0.0, 4.0)),
+                                ..ScrollWheelEvent::default()
+                            },
+                            win,
+                            cx,
+                        );
+                    })
+                    .ok();
+                let mut view_scrolled = false;
+                for _ in 0..20 {
+                    wait(cx, 300).await;
+                    view_scrolled = window
+                        .update(cx, |app, _, _| {
+                            let mirrored = app
+                                .scroll_ctls
+                                .get(&view_pane)
+                                .is_some_and(|c| c.mirror_scrolling());
+                            // 合成行列がライブ viewport と異なる = 過去が見えている
+                            let composed_differs = app
+                                .terminals
+                                .get(&view_pane)
+                                .map(|s| s.screen(&app.theme))
+                                .and_then(|screen| {
+                                    let composed =
+                                        app.compose_mirror_lines(view_pane, &screen)?;
+                                    Some(composed.first()?.text != screen.lines.first()?.text)
+                                })
+                                .unwrap_or(false);
+                            // バーは幾何計算の成立で判定する（実描画の text_area は
+                            // ウィンドウが背面だと新設ペインに対して確立しないため、
+                            // 固定サイズの仮領域を渡す。実 area での検証は 61c が担保）
+                            let bar = app
+                                .scrollbar_overlay(
+                                    view_pane,
+                                    Bounds {
+                                        origin: point(px(0.0), px(0.0)),
+                                        size: size(px(400.0), px(600.0)),
+                                    },
+                                )
+                                .is_some();
+                            mirrored && composed_differs && bar
+                        })
+                        .unwrap_or(false);
+                    if view_scrolled {
+                        break;
+                    }
+                }
+                check(
+                    view_scrolled,
+                    "TmuxOpen ペインのホイールがミラー表示 + スクロールバーに乗る（#181）",
+                );
+                // CLI / MCP と共有の dispatch Scroll も同じミラーに効く（開発不変条件）
+                let view_cli_scrolled = window
+                    .update(cx, |app, _, _| {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Scroll {
+                                pane: Some(view_pane_raw),
+                                to: Some(8),
+                                delta: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        app.scroll_ctls
+                            .get(&view_pane)
+                            .map(|c| {
+                                let pos = c
+                                    .mirror
+                                    .as_ref()
+                                    .map(|m| m.position)
+                                    .unwrap_or(c.pending_rows);
+                                (pos - 8.0).abs() < 0.5
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                check(
+                    view_cli_scrolled,
+                    "dispatch Scroll が TmuxOpen ペインのミラー表示位置に効く（#181）",
+                );
+                // 後片付け: ペイン close（wrapper kill）+ サーバー kill
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Close {
+                            pane: Some(view_pane_raw),
+                            force: true,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                });
+                wait(cx, 500).await;
+                let _ = std::process::Command::new("tmux")
+                    .args(["-L", &view_sock, "kill-server"])
+                    .status();
+            } else {
+                eprintln!("（tmux 不在のため項目 73 をスキップ）");
+            }
+
+            // 74. worker_status の IPC 応答（#181）: OrchestratorWorkerStatus は IPC ループで
+            //      snapshot（UI スレッド）→ compute（background executor）に分離して応答する
+            //      （claude CLI 起動 500〜1100ms の UI 専有 = スクロールのカクつき根治）。
+            //      分離後も実 CLI → IPC 経由で応答が返ることを機械検証する
+            {
+                let ws_pane = window
+                    .update(cx, |app, _, _| app.focused_pane().as_u64())
+                    .unwrap_or(0);
+                let ws_out = std::env::temp_dir()
+                    .join(format!("tako-selftest-ws-{}.json", std::process::id()));
+                let _ = std::fs::remove_file(&ws_out);
+                press(any, cx, "ctrl-u");
+                type_text(
+                    any,
+                    cx,
+                    &format!(
+                        "{cli} orchestrator status --pane {ws_pane} > {}",
+                        ws_out.display()
+                    ),
+                    true,
+                );
+                let mut ws_ok = false;
+                for _ in 0..25 {
+                    wait(cx, 400).await;
+                    ws_ok = std::fs::read_to_string(&ws_out)
+                        .map(|s| s.contains("\"status\""))
+                        .unwrap_or(false);
+                    if ws_ok {
+                        break;
+                    }
+                }
+                check(
+                    ws_ok,
+                    "worker_status が IPC（background 合成）経由で応答する（#181）",
+                );
+                let _ = std::fs::remove_file(&ws_out);
             }
 
             // 68b. OpenFile の direction（ファイル D&D のドロップ位置。FR-3.11）:
