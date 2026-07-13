@@ -605,3 +605,13 @@
   修正 = `cx.on_action` グローバル化 + 終了処理を `cx.on_app_quit` へ（Dock/OS 終了でも layout 保存。quitting ガードで #30/#113 維持）
 - 検証: 同一セルフテスト（blur + cmd-q）が旧構造 FAILED → 新構造 OK / 実 Cmd-Q キーイベントで隔離インスタンス終了 /
   exit 全ペイン終了経路の回帰なし / 486 tests + fmt + clippy 全緑
+
+## 2026-07-13（v0.4.0 正規リリース + 夜間リリースのローカル launchd 化 #166）
+- v0.4.0 リリース: CHANGELOG に v0.3.2 以降の未記載 13 件（#113/#118/#120/#124/#127/#129/
+  #132/#134/#136/#141/#143/#146-147+#153/#103）を英日併記で回収 → tag `v0.4.0` +
+  バイナリ付き GitHub Release + Pages デプロイ + homebrew-tako cask 0.4.0（`c18dcae`）
+- 夜間リリースを scripts/nightly-release.sh（launchd 毎日 5:00）へ移行。クラウドルーチンの
+  三重苦（バージョン計算・main 直 push・macOS バイナリ不能）を解消。スキップ 3 経路 +
+  dry-run bump 判定を実機検証、bash 3.2 の変数名境界バグも修正
+- 関連: `98b17ea`（リリース）/ PR #170 squash merge（`1c2c48a`）、Issue #166 クローズ
+- 次: 明朝 5:00 の初回 launchd 実行で v0.4.1 自動リリースの通し検証
