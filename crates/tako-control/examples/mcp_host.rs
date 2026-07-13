@@ -16,26 +16,39 @@ use futures::channel::mpsc::unbounded;
 use futures::StreamExt;
 use tako_core::{Pane, PaneId, PaneOrigin, SpawnOptions, TerminalSession, Workspace};
 
-use tako_control::{ControlHost, IncomingRequest, IpcServer, McpServer};
+use tako_control::{
+    IncomingRequest, IpcServer, McpServer, PreviewHost, RemoteHost, SessionHost, SystemHost,
+    TmuxHost, UiStateHost, WebViewHost, WorkspaceHost,
+};
 
 /// セッションを持たないヘッドレスホスト（dispatch の検証用）
 struct HeadlessHost {
     workspace: Workspace,
 }
 
-impl ControlHost for HeadlessHost {
+impl WorkspaceHost for HeadlessHost {
     fn workspace(&self) -> &Workspace {
         &self.workspace
     }
     fn workspace_mut(&mut self) -> &mut Workspace {
         &mut self.workspace
     }
+}
+
+impl SessionHost for HeadlessHost {
     fn session(&self, _pane: PaneId) -> Option<&TerminalSession> {
         None
     }
     fn attach_session(&mut self, _pane: PaneId, _options: SpawnOptions) {}
     fn detach_session(&mut self, _pane: PaneId) {}
 }
+
+impl TmuxHost for HeadlessHost {}
+impl UiStateHost for HeadlessHost {}
+impl PreviewHost for HeadlessHost {}
+impl WebViewHost for HeadlessHost {}
+impl RemoteHost for HeadlessHost {}
+impl SystemHost for HeadlessHost {}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();

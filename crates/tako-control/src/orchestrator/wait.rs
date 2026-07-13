@@ -1302,7 +1302,7 @@ mod tests {
                     .collect();
                 let inner_script = std::sync::Arc::clone(&script_for_factory);
                 let mut responses: VecDeque<Result<Value, String>> = idle_responses.into();
-                Box::new(move |req: Request| -> Result<Value, String> {
+                Box::new(move |_req: Request| -> Result<Value, String> {
                     let _ = inner_script; // keep alive
                     responses.pop_front().unwrap_or(Ok(json!({})))
                 })

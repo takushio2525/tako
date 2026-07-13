@@ -47,7 +47,10 @@ use gpui::{
     WindowOptions,
 };
 use gpui_platform::application;
-use tako_control::{ControlHost, IncomingRequest, IpcServer, McpServer};
+use tako_control::{
+    IncomingRequest, IpcServer, McpServer, PreviewHost, RemoteHost, SessionHost, SystemHost,
+    TmuxHost, UiStateHost, WebViewHost, WorkspaceHost,
+};
 use tako_core::{
     ratio_for_position, AgentMetrics, CommandState, Pane, PaneId, PaneOrigin, Rect, SelectionKind,
     SessionNotice, SpawnOptions, SplitAxis, SplitDirection, TabId, TerminalSession, Theme,
@@ -8256,8 +8259,9 @@ fn md_block_plain_text(block: &preview::MdBlock) -> String {
 
 /// tako-control の dispatch がドメイン状態へ触るためのホスト実装。
 /// セッション起動だけは GPUI の Context が要るため `pending_attach` へ積み、
-/// dispatch 直後（IPC リクエストループ内）で実行する
-impl ControlHost for TakoApp {
+/// dispatch 直後（IPC リクエストループ内）で実行する。
+/// ControlHost は blanket impl で自動導出される（全サブトレイトを実装すれば成立）
+impl WorkspaceHost for TakoApp {
     fn workspace(&self) -> &Workspace {
         &self.workspace
     }
@@ -8265,7 +8269,9 @@ impl ControlHost for TakoApp {
     fn workspace_mut(&mut self) -> &mut Workspace {
         &mut self.workspace
     }
+}
 
+impl SessionHost for TakoApp {
     fn session(&self, pane: PaneId) -> Option<&TerminalSession> {
         self.terminals.get(&pane)
     }
@@ -8311,6 +8317,12 @@ impl ControlHost for TakoApp {
         self.drop_backend_session(pane);
     }
 
+    fn reattach_backgrounded(&mut self, _pane: PaneId) {
+        // セッションは terminals HashMap に残っている。再描画のみ必要
+    }
+}
+
+impl TmuxHost for TakoApp {
     fn track_tmux_view(
         &mut self,
         pane: PaneId,
@@ -8344,44 +8356,103 @@ impl ControlHost for TakoApp {
         self.set_tmux_collapsed(tab, collapsed);
     }
 
-    fn pinned_previews(&self) -> Vec<tako_control::PinnedView> {
-        self.pinned_previews
-            .iter()
-            .map(|p| match p.target {
-                PreviewTarget::Pane(id) => tako_control::PinnedView {
-                    group: false,
-                    id: id.as_u64(),
-                    x: f32::from(p.pos.x),
-                    y: f32::from(p.pos.y),
-                },
-                PreviewTarget::ClosedGroup(tab) => tako_control::PinnedView {
-                    group: true,
-                    id: tab.as_u64(),
-                    x: f32::from(p.pos.x),
-                    y: f32::from(p.pos.y),
-                },
-                PreviewTarget::TmuxWindow(pane, win) => tako_control::PinnedView {
-                    group: false,
-                    id: pane.as_u64() ^ ((win as u64) << 32),
-                    x: f32::from(p.pos.x),
-                    y: f32::from(p.pos.y),
-                },
-            })
-            .collect()
+    fn tmux_persist_enabled(&self) -> bool {
+        self.tmux_persist
     }
 
-    fn set_pin_pane(&mut self, pane: PaneId, pinned: Option<bool>) {
-        self.set_pin(PreviewTarget::Pane(pane), pinned);
+    fn set_tmux_persist(&mut self, enabled: bool) {
+        if self.secondary {
+            eprintln!(
+                "warning: セカンダリモードのため persist 切替を無視（プライマリ側で操作してください）"
+            );
+            return;
+        }
+        self.tmux_persist = enabled;
+        if enabled && tako_core::tmux_backend::available() {
+            tako_core::tmux_backend::sync_conf(&tako_core::tmux_backend::socket_name());
+        }
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.tmux_persist = enabled;
+            if let Err(e) = tako_control::settings::save(&settings) {
+                eprintln!("warning: 設定を保存できない: {e}");
+            }
+            if !enabled {
+                tako_control::layout::remove();
+                self.last_saved_layout = None;
+                persist_diag("layout.json 削除: persist を OFF に切替（次回は空で起動）");
+            }
+        }
     }
 
-    fn set_pin_group(&mut self, tab: TabId, pinned: Option<bool>) {
-        self.set_pin(PreviewTarget::ClosedGroup(tab), pinned);
+    fn backend_session(&self, pane: PaneId) -> Option<String> {
+        self.backend_sessions.get(&pane).cloned()
     }
 
-    fn reattach_backgrounded(&mut self, _pane: PaneId) {
-        // セッションは terminals HashMap に残っている。再描画のみ必要
+    fn is_mirror_scroll_pane(&self, pane: PaneId) -> bool {
+        self.mirror_scroll_pane(pane)
     }
 
+    fn backend_windows(&self, pane: PaneId) -> Option<Vec<tako_core::TmuxWindow>> {
+        self.backend_windows.get(&pane).cloned()
+    }
+
+    fn backend_scroll_view(
+        &mut self,
+        pane: PaneId,
+        to: Option<usize>,
+        delta: Option<i32>,
+    ) -> Option<(usize, usize)> {
+        let source = self.mirror_source(pane)?;
+        let ctl = self.scroll_ctls.entry(pane).or_default();
+        ctl.last_activity = std::time::Instant::now();
+        if ctl.target.is_none() {
+            ctl.target = Some(match source {
+                MirrorSource::Backend(backend) => {
+                    let socket = tako_core::tmux_backend::socket_name();
+                    tako_core::scroll::resolve_target(&socket, &backend, &[None, Some(&socket)])
+                }
+                MirrorSource::Fixed(t) => t,
+            });
+        }
+        let target = ctl.target.as_ref().expect("直前に解決済み");
+        if let Some(s) = tako_core::scroll_mirror::history_state(target) {
+            ctl.known_history = s.history;
+            ctl.wants_mouse = Some(s.mouse);
+            ctl.wants_sgr = s.sgr;
+            if let Some(m) = ctl.mirror.as_mut() {
+                m.total_history = m.total_history.max(s.history);
+            }
+        }
+        let history = ctl.known_history;
+        let current = ctl
+            .mirror
+            .as_ref()
+            .map(|m| m.position)
+            .unwrap_or(ctl.pending_rows);
+        let goal = match (to, delta) {
+            (Some(t), None) => t as f32,
+            (None, Some(d)) => current + d as f32,
+            _ => current,
+        }
+        .clamp(0.0, history as f32);
+        match ctl.mirror.as_mut() {
+            Some(m) => {
+                m.position = goal;
+                if m.position <= 0.0 {
+                    ctl.mirror = None;
+                }
+                ctl.pending_rows = 0.0;
+            }
+            None => {
+                ctl.pending_rows = goal;
+            }
+        }
+        Some((goal.round() as usize, history))
+    }
+}
+
+impl UiStateHost for TakoApp {
     fn auto_rename_enabled(&self) -> bool {
         self.autorename.enabled
     }
@@ -8422,132 +8493,12 @@ impl ControlHost for TakoApp {
         }
     }
 
-    fn tmux_persist_enabled(&self) -> bool {
-        self.tmux_persist
-    }
-
-    fn set_tmux_persist(&mut self, enabled: bool) {
-        if self.secondary {
-            // セカンダリモードでは persist を切り替えさせない（Issue #113）:
-            // ON = プライマリと layout.json の書き込み競合、OFF = プライマリの
-            // layout.json 削除（set_tmux_persist の OFF 経路）につながる
-            eprintln!(
-                "warning: セカンダリモードのため persist 切替を無視（プライマリ側で操作してください）"
-            );
-            return;
-        }
-        self.tmux_persist = enabled;
-        if enabled && tako_core::tmux_backend::available() {
-            // 過去の起動から生き残っているサーバーがあれば最新 conf を再適用する
-            tako_core::tmux_backend::sync_conf(&tako_core::tmux_backend::socket_name());
-        }
-        // 切替は以後生成されるペインに効く。既存のバックエンドペインはそのまま
-        // （close 時の kill は backend_sessions に残っているため引き続き行われる）。
-        // 永続化（FR-5）。セルフテスト中はユーザー設定・レイアウトを汚さない
-        if std::env::var_os("TAKO_SELF_TEST").is_none() {
-            let mut settings = tako_control::settings::load();
-            settings.tmux_persist = enabled;
-            if let Err(e) = tako_control::settings::save(&settings) {
-                eprintln!("warning: 設定を保存できない: {e}");
-            }
-            if !enabled {
-                // OFF 中は復元しない。次回起動が古いレイアウトを拾わないよう消しておく
-                tako_control::layout::remove();
-                self.last_saved_layout = None;
-                persist_diag("layout.json 削除: persist を OFF に切替（次回は空で起動）");
-            }
-        }
-    }
-
     fn confirm_close_enabled(&self) -> bool {
         self.confirm_close
     }
 
     fn set_confirm_close(&mut self, enabled: bool) {
         self.confirm_close = enabled;
-    }
-
-    fn persist_restore_report(&self) -> Option<String> {
-        self.restore_report.clone()
-    }
-
-    fn is_secondary(&self) -> bool {
-        self.secondary
-    }
-
-    fn recovered_sessions_count(&self) -> usize {
-        self.recovered_count
-    }
-
-    fn backend_session(&self, pane: PaneId) -> Option<String> {
-        self.backend_sessions.get(&pane).cloned()
-    }
-
-    fn is_mirror_scroll_pane(&self, pane: PaneId) -> bool {
-        self.mirror_scroll_pane(pane)
-    }
-
-    fn backend_windows(&self, pane: PaneId) -> Option<Vec<tako_core::TmuxWindow>> {
-        self.backend_windows.get(&pane).cloned()
-    }
-
-    /// CLI / MCP のバックエンドスクロール（#159）: ミラー位置を同期更新し、
-    /// 履歴チャンクの取得は dispatch 後の `sync_scroll_from_dispatch` が非同期で起動する
-    /// （ControlHost は同期文脈のため spawn できない）。
-    /// スクロール実体の解決と履歴サイズ取得（tmux 各 1 呼び出し・数 ms）のみ同期実行
-    fn backend_scroll_view(
-        &mut self,
-        pane: PaneId,
-        to: Option<usize>,
-        delta: Option<i32>,
-    ) -> Option<(usize, usize)> {
-        let source = self.mirror_source(pane)?;
-        let ctl = self.scroll_ctls.entry(pane).or_default();
-        ctl.last_activity = std::time::Instant::now();
-        if ctl.target.is_none() {
-            ctl.target = Some(match source {
-                MirrorSource::Backend(backend) => {
-                    let socket = tako_core::tmux_backend::socket_name();
-                    // pump_mirror と同じ候補（既定サーバー + backend socket。#181）
-                    tako_core::scroll::resolve_target(&socket, &backend, &[None, Some(&socket)])
-                }
-                MirrorSource::Fixed(t) => t,
-            });
-        }
-        let target = ctl.target.as_ref().expect("直前に解決済み");
-        if let Some(s) = tako_core::scroll_mirror::history_state(target) {
-            ctl.known_history = s.history;
-            ctl.wants_mouse = Some(s.mouse);
-            ctl.wants_sgr = s.sgr;
-            if let Some(m) = ctl.mirror.as_mut() {
-                m.total_history = m.total_history.max(s.history);
-            }
-        }
-        let history = ctl.known_history;
-        let current = ctl
-            .mirror
-            .as_ref()
-            .map(|m| m.position)
-            .unwrap_or(ctl.pending_rows);
-        let goal = match (to, delta) {
-            (Some(t), None) => t as f32,
-            (None, Some(d)) => current + d as f32,
-            _ => current,
-        }
-        .clamp(0.0, history as f32);
-        match ctl.mirror.as_mut() {
-            Some(m) => {
-                m.position = goal;
-                if m.position <= 0.0 {
-                    ctl.mirror = None;
-                }
-                ctl.pending_rows = 0.0;
-            }
-            None => {
-                ctl.pending_rows = goal;
-            }
-        }
-        Some((goal.round() as usize, history))
     }
 
     fn panel_state(&self) -> (bool, f32, tako_control::protocol::PanelViewWire) {
@@ -8596,6 +8547,42 @@ impl ControlHost for TakoApp {
         self.sync_filetree_roots();
     }
 
+    fn pinned_previews(&self) -> Vec<tako_control::PinnedView> {
+        self.pinned_previews
+            .iter()
+            .map(|p| match p.target {
+                PreviewTarget::Pane(id) => tako_control::PinnedView {
+                    group: false,
+                    id: id.as_u64(),
+                    x: f32::from(p.pos.x),
+                    y: f32::from(p.pos.y),
+                },
+                PreviewTarget::ClosedGroup(tab) => tako_control::PinnedView {
+                    group: true,
+                    id: tab.as_u64(),
+                    x: f32::from(p.pos.x),
+                    y: f32::from(p.pos.y),
+                },
+                PreviewTarget::TmuxWindow(pane, win) => tako_control::PinnedView {
+                    group: false,
+                    id: pane.as_u64() ^ ((win as u64) << 32),
+                    x: f32::from(p.pos.x),
+                    y: f32::from(p.pos.y),
+                },
+            })
+            .collect()
+    }
+
+    fn set_pin_pane(&mut self, pane: PaneId, pinned: Option<bool>) {
+        self.set_pin(PreviewTarget::Pane(pane), pinned);
+    }
+
+    fn set_pin_group(&mut self, tab: TabId, pinned: Option<bool>) {
+        self.set_pin(PreviewTarget::ClosedGroup(tab), pinned);
+    }
+}
+
+impl PreviewHost for TakoApp {
     fn preview_state(
         &self,
         pane: PaneId,
@@ -8665,15 +8652,10 @@ impl ControlHost for TakoApp {
             mode,
             preview::PreviewMode::Pdf | preview::PreviewMode::Video
         ) {
-            // Issue #168: PDF 全ページラスタライズ（71 ページ実測 1354ms）と
-            // ffmpeg サムネ抽出は UI スレッドで行わない。Loading を置いて
-            // background で読み込む（drain_pending_preview_loads が引き継ぐ）
             self.pending_preview_loads
                 .push((pane, path.to_path_buf(), mode));
             preview::PreviewState::loading(path, mode)
         } else {
-            // コード / Markdown / 画像は軽量（ファイル読みのみ。ハイライトは
-            // 従来から background）なので同期のまま
             let _span = tako_control::diag::perf_span("preview_load");
             let (state, raw) = preview::load_fast(path, mode);
             if let Some(text) = raw {
@@ -8684,13 +8666,11 @@ impl ControlHost for TakoApp {
         };
         self.preview_edits.remove(&pane);
         self.preview_selections.remove(&pane);
-        // 内容差し替えから次の paint まで旧ファイルの座標を hit-test に使わせない。
         self.preview_line_bounds.remove(&pane);
         self.preview_pdf_char_bounds.remove(&pane);
         self.preview_pdf_highlight_paint_count.remove(&pane);
         self.preview_text_layouts.remove(&pane);
         self.preview_line_texts.remove(&pane);
-        // 同一 path の開き直し（内容更新）でも描画キャッシュを作り直す（Issue #168）
         self.preview_image_cache.remove(&pane);
         self.previews.insert(pane, state);
         Ok(())
@@ -8767,13 +8747,14 @@ impl ControlHost for TakoApp {
             .map(|p| p.id())
             .find(|id| self.previews.contains_key(id))
     }
+}
 
+impl RemoteHost for TakoApp {
     fn remote_start(
         &mut self,
         port: Option<u16>,
         insecure: bool,
     ) -> Result<serde_json::Value, String> {
-        // デーモンをバックグラウンドで fork 起動する（既定は暗号化トンネル必須。#104）
         tako_control::remote::spawn_daemon(port, insecure)
     }
 
@@ -8784,7 +8765,9 @@ impl ControlHost for TakoApp {
     fn remote_status(&self) -> serde_json::Value {
         tako_control::remote::daemon_status()
     }
+}
 
+impl WebViewHost for TakoApp {
     fn web_open(&mut self, pane: PaneId, url: &str) -> Result<serde_json::Value, String> {
         let id = self.create_webview(&webview::normalize_url(url))?;
         let e = self
@@ -8855,7 +8838,6 @@ impl ControlHost for TakoApp {
                 .ok_or(format!("ペイン {raw} に Web ビューは表示されていない"))?;
             return Ok((e.id.as_u64(), e.pane));
         }
-        // 省略時: 表示中がちょうど 1 つならそれを対象にする
         let shown: Vec<&webview::WebViewEntry> =
             self.webviews.iter().filter(|e| e.pane.is_some()).collect();
         match shown.len() {
@@ -8905,7 +8887,6 @@ impl ControlHost for TakoApp {
             .ok_or(format!("Web ビュー {id} が見つからない"))?;
         match e.take_eval_result(token) {
             Some(result) => {
-                // wry の callback は評価結果を JSON 文字列で渡す。可能なら構造化して返す
                 let value: serde_json::Value =
                     serde_json::from_str(&result).unwrap_or(serde_json::Value::String(result));
                 Ok(serde_json::json!({ "id": id, "token": token, "result": value }))
@@ -8928,6 +8909,34 @@ impl ControlHost for TakoApp {
             "pane": e.pane.map(|p| p.as_u64()),
         }))
     }
+}
+
+impl SystemHost for TakoApp {
+    fn is_secondary(&self) -> bool {
+        self.secondary
+    }
+
+    fn persist_restore_report(&self) -> Option<String> {
+        self.restore_report.clone()
+    }
+
+    fn recovered_sessions_count(&self) -> usize {
+        self.recovered_count
+    }
+
+    fn reserve_backend_session(&mut self, pane: PaneId) -> Option<String> {
+        if self.tmux_persist && tako_core::tmux_backend::available() {
+            Some(
+                self.backend_sessions
+                    .entry(pane)
+                    .or_insert_with(new_backend_session_name)
+                    .clone(),
+            )
+        } else {
+            None
+        }
+    }
+
     fn update_status(&self) -> serde_json::Value {
         update_checker::update_status_json()
     }
@@ -8978,20 +8987,6 @@ impl ControlHost for TakoApp {
             "message": msg,
             "install_method": update_checker::detect_install_method_full().label(),
         }))
-    }
-
-    fn reserve_backend_session(&mut self, pane: PaneId) -> Option<String> {
-        // spawn_session と同じ条件・同じ採番（entry API なので二重採番しない）
-        if self.tmux_persist && tako_core::tmux_backend::available() {
-            Some(
-                self.backend_sessions
-                    .entry(pane)
-                    .or_insert_with(new_backend_session_name)
-                    .clone(),
-            )
-        } else {
-            None
-        }
     }
 
     fn pane_log_config(&self) -> tako_core::pane_log::PaneLogConfig {
