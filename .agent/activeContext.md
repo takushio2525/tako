@@ -4,46 +4,52 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-13・#159 スクロール改善 + #165 spawn レイアウトが完了）
+## 現在の対象（2026-07-13・#177 全ペイン消失の根治。#159 / #165 も同日完了）
 
-main 側の完了分: **v0.4.0 リリース済み**（tag `v0.4.0`、cask 0.4.0）、夜間パッチ
-リリースは launchd ジョブへ移行（#166。毎日 5:00）、#169 projects.yaml 全消失の根治
-（`config_io` 新設。**設定更新は load→save ではなく `mutate_config` 系を使うこと**）、
-#159 スクロール大幅改善（ピクセル単位化 + tmux ペインのローカル履歴ミラー +
-スクロールバー強化。PR #176 マージ済み）。
+**#177（UI から全ターミナルペイン消失）を根本修正**。根本原因は多重起動ガード（#113）の
+構造的な穴: ガードの判定材料が discovery（control.json）だけなのに、守るべき資源
+（layout.json = HOME 固定 / tmux セッション = TAKO_TMUX_SOCKET）は別の環境変数で
+差し替わる。`TAKO_DISCOVERY_DIR` だけ隔離した dev 検証起動（#165 検証中の実験、16:53:47）が
+プライマリ判定 → 本番 layout.json を復元 → `new-session -A -D` が本番 GUI の
+クライアント 13 本を強奪 → PTY 一斉死亡 → 定期保存が縮退 layout を上書き、の連鎖。
+**#178（同事故の起票）はこの修正が本質対応**（討議の案 1 プロセスベース判定は
+セカンダリ残存で本物の再起動を阻害するため、資源ベースのクライアントガードを採用）。
 
-#165 実装完了（fix/165-spawn-layout-engine → PR #179）: worker spawn を
-master-reserved（master の取り分維持 + 右側 worker 領域内 grid/spiral 配置）へ刷新。
+対策（三層防御 + 復旧）:
+- **復元強奪ガード**（FR-5.10）: 復元前に `tmux list-clients` を走査し、生きた別
+  tako-app 配下のクライアントが attach 中ならセカンダリ降格
+- **縮退保存ガード**（FR-5.11）: ペイン数半減の保存前に `.bak.1`〜`.bak.3` 世代退避
+  （bak.1 が 10 分以内は回転しない = 連鎖縮退での押し出し防止）
+- **`TAKO_ISOLATED=1`**: discovery / persist / tmux socket の一括隔離（片脚隔離の根絶。
+  実験起動はこれを必須とする。AGENTS.md コマンド表に明記）
+- **`tako recover`**: バックアップ一覧 / `--apply <世代>` 復元（稼働中は拒否、--force あり）
+- persist.log 全行に `[pid N]` 付与
 
-- レイアウト計算 = `tako-core::spawn_layout`（型 + 領域構築純関数）+
-  `PaneTree::spawn_worker` / `reflow_workers`。worker 領域 = spawned_by チェーンが
-  anchor に到達するリーフのみのサブツリー（ユーザーペイン混在は領域外 = 不変）
-- 設定 = config.yaml `spawn_layout`（policy / master_ratio / algorithm）。
-  CLI `tako orchestrator layout` と MCP `tako_orchestrator_layout`（59 ツール）は
-  `dispatch_orchestrator_layout` を共用（更新は #169 の mutate_config 経由）
-- close リフロー = dispatch `Close` + tako-app `remove_pane_with` の両経路
-- 検証済み: tako-core 単体 10 本 + セルフテスト項目 72 完走 + セカンダリ実機
-  spawn ×4 → 十字四分割 → close リフローを screencapture ピクセル確認
+詳細は `.agent/architecture.md`「多重インスタンスの資源保護」節。
 
-## 検証時インシデント（解決済み・#178 起票）
+main 側の同日完了分: #159 スクロール大幅改善（ピクセル単位化 + ローカル履歴ミラー）、
+#165 spawn レイアウトエンジン（master-reserved + grid/spiral。59 ツール）。
 
-TAKO_DISCOVERY_DIR 指定の dev 起動で多重起動ガードが無効化され、production の
-tmux バックエンド 13 セッションを強奪（タブ 8 → 3。実プロセス損失ゼロ、
-ユーザーが復旧済み）。根因 = プライマリ判定が discovery のみ依存 → #178。
-**dev 併走検証は素の `cargo run -p tako-app`（セカンダリモード）で行うこと**
+## 検証済み（#177）
+
+- workspace build / test（521 passed）/ fmt / clippy(-D warnings) 全緑 + 隔離セルフテスト完走
+- 実機 e2e（隔離 HOME + 専用 socket、本番不接触）: 修正後 = 事故条件（discovery のみ隔離）の
+  後発インスタンスがセカンダリ降格し先発の 4 クライアント無傷 / FORCE_PRIMARY バイパスで
+  事故経路を再現（クライアント全交代 = 強奪）→ 縮退保存直前に bak.1（5 ペイン版）自動退避 →
+  `tako recover --apply 1` → 再起動で「2 タブ / 5 ペイン（tmux 再 attach 4）」完全復旧
 
 ## 次の一手
 
-- PR #179 の squash merge → `build-app.sh --install` → tako 再起動で実機反映
+- fix/177 の PR #180 を squash merge（#177 / #178 クローズ）→ `build-app.sh --install`
 - tako 再起動後の GUI 確認（manual-checks.md）: 「ターミナルスクロールの大幅改善」節
   （#159）+「Web ビューペイン」節（#155）+ #153/#152 節 + Cmd-Q 経過観察（#103）
 - 明朝 5:00 の夜間ジョブ初回実行を監視（v0.4.1 自動リリース見込み。#166）
-- #178（多重起動ガードのプロセスベース判定併用）の着手判断
 - Phase 5 の次候補は FR-2.19 localhost ポートパネル・FR-3.10 画像プレビュー等
 
 ## 現フェーズで Read すべき設計書
 
-- spawn レイアウトの設計: `.agent/architecture.md`「spawn レイアウトエンジン」節
+- 多重インスタンスの資源保護（#177）: `.agent/architecture.md` 該当節
+- spawn レイアウトの設計（#165）: `.agent/architecture.md`「spawn レイアウトエンジン」節
 - スクロールの要件（#159 で全面改稿）: `.agent/requirements.md` FR-2.5.13 +
   手動確認 `.agent/manual-checks.md`「ターミナルスクロールの大幅改善」
 - 設定ファイル I/O の安全化（#169）: `.agent/architecture.md` 該当節

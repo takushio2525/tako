@@ -162,6 +162,23 @@ enum Command {
     /// 正本ファイルの内容を各エージェントのグローバル指示ファイルにマーカーブロックで埋め込む
     #[command(subcommand, name = "agents")]
     Agents(AgentsCommand),
+    /// レイアウトの世代バックアップからの復旧（#177）。
+    /// 引数なしで現在の layout.json とバックアップ世代の一覧を表示する。
+    /// タブ・ペインが大量消失したときは tako を終了してから
+    /// `tako recover --apply <世代>` で直前の構成へ戻し、tako を再起動する
+    Recover(RecoverArgs),
+}
+
+#[derive(Args)]
+struct RecoverArgs {
+    /// このバックアップ世代（1〜3）を layout.json へ復元する。
+    /// 現在の layout.json は layout.json.pre-recover へ退避される
+    #[arg(long, value_name = "世代")]
+    apply: Option<u32>,
+    /// 稼働中チェックをスキップして強制実行する（プロセス走査は別データ
+    /// ディレクトリで動く無関係な tako も検出するため、その場合の明示上書き用）
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Subcommand)]
@@ -1199,6 +1216,8 @@ fn main() -> ExitCode {
         Command::Fda(ref sub) => fda_local(sub),
         // エージェント共通ルール同期もローカル処理（IPC 不要）
         Command::Agents(ref sub) => agents_local(sub),
+        // レイアウト復旧もローカル処理（GUI 死亡・縮退保存後の復旧手段のため IPC 不要が本質）
+        Command::Recover(ref args) => recover_local(args),
         command => run(command),
     };
     match result {
@@ -1854,6 +1873,105 @@ fn fda_local(sub: &FdaCommand) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// レイアウト世代バックアップからの復旧（#177。ローカル処理・IPC 不要）。
+/// GUI 死亡・縮退 layout 保存後の復旧手段なので、GUI 内蔵の MCP からは提供できない
+/// （GUI が生きていれば復旧は不要。開発不変条件の例外は requirements.md FR-5 参照）
+fn recover_local(args: &RecoverArgs) -> Result<(), String> {
+    let path = tako_control::layout::layout_path()
+        .ok_or_else(|| "データディレクトリを解決できない（HOME 未設定等）".to_string())?;
+    match args.apply {
+        None => recover_list(&path),
+        Some(generation) => recover_apply(&path, generation, args.force),
+    }
+}
+
+/// layout.json とバックアップ世代の一覧（タブ数 / ペイン数 / 更新時刻）を表示する
+fn recover_list(path: &std::path::Path) -> Result<(), String> {
+    fn describe(path: &std::path::Path) -> String {
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => return "（無し）".into(),
+        };
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| {
+                let secs = d.as_secs();
+                if secs < 60 {
+                    format!("{secs} 秒前")
+                } else if secs < 3600 {
+                    format!("{} 分前", secs / 60)
+                } else if secs < 86400 {
+                    format!("{} 時間前", secs / 3600)
+                } else {
+                    format!("{} 日前", secs / 86400)
+                }
+            })
+            .unwrap_or_else(|| "更新時刻不明".into());
+        match tako_control::layout::load_file(path) {
+            Ok(layout) => format!(
+                "{} タブ / {} ペイン（{age} 更新）",
+                layout.tabs.len(),
+                layout.pane_count()
+            ),
+            Err(e) => format!("読めない: {e}（{age} 更新）"),
+        }
+    }
+    println!("layout.json         : {}", describe(path));
+    for generation in 1..=3u32 {
+        let bak = tako_control::config_io::backup_path(path, generation);
+        println!("layout.json.bak.{generation}   : {}", describe(&bak));
+    }
+    eprintln!();
+    eprintln!("復元するには: tako を終了（Cmd-Q）してから `tako recover --apply <世代>` →");
+    eprintln!("tako を再起動すると復元されたレイアウトで立ち上がります。");
+    eprintln!("実体の tmux セッションが生きていれば、実行中プロセスごと画面に戻ります。");
+    Ok(())
+}
+
+/// バックアップ世代を layout.json へ復元する（現行は layout.json.pre-recover へ退避）
+fn recover_apply(path: &std::path::Path, generation: u32, force: bool) -> Result<(), String> {
+    if !(1..=3).contains(&generation) {
+        return Err(format!(
+            "世代は 1〜3 で指定してください（指定: {generation}）"
+        ));
+    }
+    // 稼働中の tako があると、復元した layout.json を定期保存が即上書きしてしまう。
+    // discovery（control.json）と全プロセス走査の両方で確認する（#177 の教訓:
+    // control.json は消えている・別を指していることがある）
+    if !force {
+        if let Some(pid) = tako_control::discovery::live_primary_pid() {
+            return Err(format!(
+                "tako（pid {pid}）が稼働中です。終了（Cmd-Q）してから実行してください（--force で強制実行）"
+            ));
+        }
+        if tako_core::ports::other_tako_running() {
+            return Err(
+                "tako が稼働中です（定期保存が復元結果を上書きします）。終了してから実行するか、\
+                 別のデータディレクトリの tako だと確かなら --force を付けてください"
+                    .to_string(),
+            );
+        }
+    }
+    let bak = tako_control::config_io::backup_path(path, generation);
+    let layout = tako_control::layout::load_file(&bak)
+        .map_err(|e| format!("バックアップ {} を読めない: {e}", bak.display()))?;
+    if path.is_file() {
+        let stash = path.with_extension("json.pre-recover");
+        std::fs::copy(path, &stash).map_err(|e| format!("現在の layout.json の退避に失敗: {e}"))?;
+        eprintln!("現在の layout.json → {} へ退避", stash.display());
+    }
+    std::fs::copy(&bak, path).map_err(|e| format!("復元コピーに失敗: {e}"))?;
+    eprintln!(
+        "layout.json.bak.{generation}（{} タブ / {} ペイン）→ layout.json へ復元しました。",
+        layout.tabs.len(),
+        layout.pane_count()
+    );
+    eprintln!("tako を起動すると、このレイアウトで復元されます。");
+    Ok(())
 }
 
 fn agents_local(sub: &AgentsCommand) -> Result<(), String> {
@@ -2541,6 +2659,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             },
         },
         Command::Agents(_) => unreachable!("agents は run() を通らない"),
+        Command::Recover(_) => unreachable!("recover は run() を通らない（ローカル処理）"),
     })
 }
 
