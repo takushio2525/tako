@@ -1653,39 +1653,47 @@ impl TakoApp {
         // 操作セマンティクスは tako-control::dispatch に一元化されている（設計原則 5）
         cx.spawn(async move |this, cx| {
             while let Some(incoming) = control_rx.next().await {
-                // WorkerStatus は `claude agents --json` のサブプロセス起動（実測 500〜1100ms）を
-                // 含み、UI スレッドの dispatch で実行すると master のポーリング（1〜3 秒間隔）
-                // ごとに UI 全体が固まる（#181: スクロールのカクつきの正体。perf.log で特定）。
-                // UI 依存のスナップショットだけ UI スレッドで取り、重い合成は background で
-                // 実行して応答する（読み取り専用のため並行実行しても安全）
-                if let tako_control::protocol::Request::OrchestratorWorkerStatus {
-                    pane_id,
-                    session_id,
-                    tmux_session,
-                } = &incoming.request
-                {
-                    let pane_id = *pane_id;
-                    let session_id = session_id.clone();
-                    let tmux_session = tmux_session.clone();
-                    let Ok(snap) = this.update(cx, |app: &mut TakoApp, _| {
-                        tako_control::worker_status_snapshot(app, pane_id)
-                    }) else {
-                        break; // View が破棄された
-                    };
-                    let reply = incoming.reply.clone();
-                    cx.background_executor()
-                        .spawn(async move {
-                            let result = tako_control::worker_status_compute(
-                                snap,
-                                session_id.as_deref(),
-                                tmux_session.as_deref(),
-                            );
-                            let _ = reply.send(Ok(result));
-                        })
-                        .detach();
+                // Issue #168 / #115 / #181: サブプロセス実行（claude CLI / git）を伴う
+                // read-only リクエスト（OrchestratorWorkerStatus / GitLog / GitDiff）は
+                // UI スレッドで文脈収集だけ行い、実行と応答を background へ逃がす
+                // （UI 非ブロック化 + 直列詰まりの解消。perf.log 実測の上位 2 種:
+                // OrchestratorWorkerStatus avg 687ms×4124 回 / GitLog 2431ms。
+                // #181 の worker_status_snapshot/compute 分離と同じ構造をここへ一本化）
+                // TAKO_OFFLOAD=0 で従来の同期実行に戻せる（A/B 計測・問題切り分け用）
+                let offload_enabled = !matches!(
+                    std::env::var("TAKO_OFFLOAD").ok().as_deref(),
+                    Some("0" | "false" | "off")
+                );
+                let offload = this.update(cx, |app: &mut TakoApp, _| {
+                    if offload_enabled {
+                        tako_control::prepare_offload(app, &incoming.request)
+                    } else {
+                        None
+                    }
+                });
+                let Ok(offload) = offload else {
+                    break; // View が破棄された
+                };
+                if let Some(prepared) = offload {
+                    let reply = incoming.reply;
+                    match prepared {
+                        Ok(job) => {
+                            cx.background_executor()
+                                .spawn(async move {
+                                    let _ = reply.send(job.run());
+                                })
+                                .detach();
+                        }
+                        Err(e) => {
+                            let _ = reply.send(Err(e));
+                        }
+                    }
                     continue;
                 }
                 let result = this.update(cx, |app: &mut TakoApp, cx| {
+                    // Issue #168: dispatch + 後処理（pending 消化 + save_layout）込みの
+                    // IPC 1 件あたりのメインスレッド専有を計測（dispatch 単体とネスト計測）
+                    let _span = tako_control::diag::perf_span("ipc_turn");
                     let was_scroll = matches!(
                         incoming.request,
                         tako_control::protocol::Request::Scroll { .. }
@@ -1822,6 +1830,8 @@ impl TakoApp {
             // ① main thread: tmux コンテキスト + filetree 対象 + view 監視対象 + git を収集（高速）
             let t0 = std::time::Instant::now();
             let prep = this.update(cx, |app: &mut TakoApp, _| {
+                // Issue #168: 定期更新の UI スレッド部（収集 + save_layout）を計測
+                let _span = tako_control::diag::perf_span("periodic_prep");
                 let tmux_ctx = if app.panel_visible && app.panel_view == PanelView::Tmux {
                     Some(app.collect_tmux_context())
                 } else {
@@ -3662,6 +3672,9 @@ impl TakoApp {
         if self.secondary || !self.tmux_persist || std::env::var_os("TAKO_SELF_TEST").is_some() {
             return;
         }
+        // Issue #168: 2 秒ポーリング + dispatch 毎に呼ばれる。capture + 変化検出 +
+        // （変化時のみ）ディスク書き込みのメインスレッド専有を計測
+        let _span = tako_control::diag::perf_span("save_layout");
         let backend_sessions = &self.backend_sessions;
         let claude_resume_sessions = &self.claude_resume_sessions;
         let terminals = &self.terminals;
@@ -4151,6 +4164,8 @@ impl TakoApp {
     // --- キー入力 ---
 
     fn handle_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
+        // Issue #168: キーストローク毎の処理コストを計測（入力レイテンシの内訳）
+        let _span = tako_control::diag::perf_span("key_input");
         if self.pending_close_confirm.is_some() {
             match keystroke.key.as_str() {
                 "enter" => self.close_confirm_accepted(cx),
@@ -5123,6 +5138,9 @@ impl TakoApp {
 
     /// ペインのリンク検出キャッシュを更新する
     fn refresh_pane_links(&mut self, pane_id: PaneId) {
+        // Issue #168: cmd+ホバー毎の画面スナップショット + 正規表現走査 + パス実在
+        // チェック（syscall）のコストを計測
+        let _span = tako_control::diag::perf_span("link_scan");
         let Some(session) = self.terminals.get(&pane_id) else {
             return;
         };
@@ -7705,6 +7723,8 @@ impl ControlHost for TakoApp {
             return Err(message.into());
         }
         let path = std::path::Path::new(path);
+        // Issue #168: PDF 全ページラスタライズ / 動画 ffmpeg サムネ等の同期ロードを計測
+        let _span = tako_control::diag::perf_span("preview_load");
         let (state, raw) = preview::load_fast(path, preview::PreviewMode::from_wire(mode));
         if let Some(text) = raw {
             self.pending_highlights
@@ -8209,6 +8229,8 @@ fn clamp_ime_range_start(
 
 impl Render for TakoApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Issue #168: フレーム構築（element tree 生成）のメインスレッド専有を計測
+        let _span = tako_control::diag::perf_span("render");
         // Web ビュー（FR-3.8）: wry の親にするウィンドウハンドルは render でしか
         // 採取できないため、初回 render で保存し、復元待ちの Web ビューを開き直す
         if self.window_raw_handle.is_none() {
@@ -8922,6 +8944,9 @@ fn open_new_window(cx: &mut App) {
 }
 
 fn main() {
+    // Issue #168: メインスレッド・ストール診断。重い区間（dispatch / render /
+    // save_layout 等）の 2 秒超え継続を drop を待たず perf.log に記録する
+    tako_control::diag::spawn_stall_watchdog();
     // 一括隔離モード（#177）: TAKO_ISOLATED=1 だけで本番リソース（layout.json /
     // tmux バックエンド / discovery）に一切触れない起動になる。実験・検証で個別の
     // 隔離変数を指定し漏らす事故（TAKO_DISCOVERY_DIR だけ隔離した dev 起動が
@@ -13356,8 +13381,9 @@ mod self_test {
                 eprintln!("（tmux 不在のため項目 73 をスキップ）");
             }
 
-            // 74. worker_status の IPC 応答（#181）: OrchestratorWorkerStatus は IPC ループで
-            //      snapshot（UI スレッド）→ compute（background executor）に分離して応答する
+            // 74. worker_status の IPC 応答（#181 → #168 で OffloadJob へ一本化）:
+            //      OrchestratorWorkerStatus は IPC ループで prepare_offload（UI スレッドで
+            //      文脈収集）→ OffloadJob::run（background executor）に分離して応答する
             //      （claude CLI 起動 500〜1100ms の UI 専有 = スクロールのカクつき根治）。
             //      分離後も実 CLI → IPC 経由で応答が返ることを機械検証する
             {
