@@ -7971,6 +7971,72 @@ mod self_test {
         count(false).max(count(true))
     }
 
+    /// サブラインスクロール（#159）の実ピクセル検証: `after` を `dy_logical`（論理 px）
+    /// ぶん y 方向へ戻して `before` と比較する。ピクセル単位スクロールが機能していれば
+    /// 「そのまま比較 = 大差分 / 戻して比較 = ほぼ一致」になる。
+    /// 戻り値は (そのまま比較の差分, 戻して比較の差分)。Metal 読み戻しの上下方向差は
+    /// changed_pixels_in_bounds と同様に両方向を試し、戻して比較が小さい方を採用する
+    #[cfg(feature = "visual-test")]
+    fn subline_shift_diff(
+        before: &image::RgbaImage,
+        after: &image::RgbaImage,
+        bounds: &Bounds<Pixels>,
+        scale: f32,
+        dy_logical: f32,
+    ) -> (usize, usize) {
+        if before.dimensions() != after.dimensions() {
+            return (0, usize::MAX);
+        }
+        let (width, height) = before.dimensions();
+        let dy = (dy_logical * scale).round() as i64;
+        let diff_pair = |flip_y: bool| -> (usize, usize) {
+            let left = (f32::from(bounds.left()) * scale).floor().max(0.0) as u32;
+            let right = (f32::from(bounds.right()) * scale)
+                .ceil()
+                .max(0.0)
+                .min(width as f32) as u32;
+            let raw_top = (f32::from(bounds.top()) * scale).floor().max(0.0) as u32;
+            let raw_bottom = (f32::from(bounds.bottom()) * scale)
+                .ceil()
+                .max(0.0)
+                .min(height as f32) as u32;
+            let (top, bottom) = if flip_y {
+                (
+                    height.saturating_sub(raw_bottom),
+                    height.saturating_sub(raw_top),
+                )
+            } else {
+                (raw_top.min(height), raw_bottom.min(height))
+            };
+            // flip 時は論理 y とピクセル y が逆向きなのでシフトも反転する
+            let shift = if flip_y { -dy } else { dy };
+            let mut direct = 0usize;
+            let mut shifted = 0usize;
+            for y in top..bottom {
+                let sy = y as i64 + shift;
+                if sy < 0 || sy >= height as i64 {
+                    continue;
+                }
+                for x in left..right {
+                    if before.get_pixel(x, y) != after.get_pixel(x, y) {
+                        direct += 1;
+                    }
+                    if before.get_pixel(x, y) != after.get_pixel(x, sy as u32) {
+                        shifted += 1;
+                    }
+                }
+            }
+            (direct, shifted)
+        };
+        let a = diff_pair(false);
+        let b = diff_pair(true);
+        if a.1 <= b.1 {
+            a
+        } else {
+            b
+        }
+    }
+
     /// stdio ブリッジ（`tako mcp serve`）へ MCP メッセージ列を流し、応答行を回収する。
     /// 指定した TAKO_* 以外は環境から除去し、tako 内 / 外の両状態を再現できるようにする
     fn bridge_roundtrip(
@@ -8239,6 +8305,82 @@ mod self_test {
                 })
                 .ok();
             let _ = std::fs::remove_dir_all(&dir);
+
+            // ターミナルのサブラインスクロール（#159）: 半行スクロールの前後フレームを
+            // 「そのまま」と「半行戻して」比較する。ピクセル単位で描画されていれば
+            // 戻して比較のみほぼ一致する（行単位描画だと 1 行ずれとなりどちらも大差分）
+            type_text(any, cx, "seq 100", true);
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            let (term_area, cell_h) = window
+                .update(cx, |app, _, cx| {
+                    let pane = app.focused_pane();
+                    if let Some(s) = app.terminals.get(&pane) {
+                        s.scroll_to_bottom();
+                    }
+                    cx.notify();
+                    let area = app
+                        .pane_text_areas
+                        .iter()
+                        .find(|(id, _)| *id == pane)
+                        .map(|(_, b)| *b);
+                    let ch = app
+                        .cell_size_for_pane(pane)
+                        .map(|c| f32::from(c.height))
+                        .unwrap_or(17.0);
+                    (area, ch)
+                })
+                .unwrap_or((None, 17.0));
+            let term_area = term_area.unwrap_or_else(|| fail("visual-test ターミナル領域"));
+            let scroll_before = capture_frame(any, cx);
+            window
+                .update(cx, |app, win, cx| {
+                    let pane = app.focused_pane();
+                    app.on_pane_scroll(
+                        pane,
+                        &ScrollWheelEvent {
+                            position: term_area.center(),
+                            delta: ScrollDelta::Pixels(point(px(0.0), px(cell_h * 0.5))),
+                            ..ScrollWheelEvent::default()
+                        },
+                        win,
+                        cx,
+                    );
+                    cx.notify();
+                })
+                .ok();
+            let scroll_after = capture_frame(any, cx);
+            // 上下 2 行（部分行・カーソル行）と右端 16px（スクロールバー）を除いた内側で比較
+            let inset = Bounds::new(
+                point(term_area.origin.x, term_area.origin.y + px(cell_h * 2.0)),
+                size(
+                    term_area.size.width - px(16.0),
+                    term_area.size.height - px(cell_h * 4.0),
+                ),
+            );
+            let (direct, shifted) = match (scroll_before.as_ref(), scroll_after.as_ref()) {
+                (Some((b, scale)), Some((a, _))) => {
+                    subline_shift_diff(b, a, &inset, *scale, cell_h * 0.5)
+                }
+                _ => (0, usize::MAX),
+            };
+            println!("TAKO_VISUAL_PIXEL: subline direct={direct} shifted={shifted}");
+            check(direct > 200, "visual-test サブライン: 半行スクロールで画面が動く");
+            check(
+                shifted.saturating_mul(4) < direct,
+                "visual-test サブライン: 半行戻しでほぼ一致（ピクセル単位描画）",
+            );
+            window
+                .update(cx, |app, _, cx| {
+                    let pane = app.focused_pane();
+                    if let Some(s) = app.terminals.get(&pane) {
+                        s.scroll_to_bottom();
+                    }
+                    cx.notify();
+                })
+                .ok();
+
             if let Some(discovery) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(discovery);
             }
