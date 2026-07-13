@@ -23,6 +23,7 @@ pub mod diag;
 pub mod discovery;
 pub mod dispatch;
 pub mod fda;
+pub mod host;
 pub mod ipc;
 pub mod layout;
 pub mod mcp;
@@ -38,6 +39,10 @@ pub mod transcript;
 pub use dispatch::{
     dispatch, dispatch_orchestrator_layout, fetch_tmux_sessions, prepare_offload, ControlHost,
     DispatchError, OffloadJob, PinnedView, TmuxContext,
+};
+pub use host::{
+    PreviewHost, RemoteHost, SessionHost, SystemHost, TmuxHost, UiStateHost, WebViewHost,
+    WorkspaceHost,
 };
 pub use ipc::{IncomingRequest, IpcServer};
 pub use mcp::McpServer;
