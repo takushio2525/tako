@@ -477,38 +477,64 @@ impl TakoApp {
         let md_capable = state.markdown_capable();
         let mode = state.mode;
         let truncated = state.truncated;
-        let edit_info = self.preview_edits.get(&pane_id).map(|edit| {
-            (
-                edit.editing,
-                edit.dirty(),
-                edit.message.clone(),
-                edit.buffer.line_byte_col(edit.buffer.cursor()),
-                edit.save_status.clone(),
-                edit.autosave,
-                edit.search_visible,
-                edit.search_query.clone(),
-                edit.search_hits.len(),
-                edit.search_index,
-                edit.replace_text.clone(),
-            )
+        struct EditSnapshot {
+            editing: bool,
+            dirty: bool,
+            message: Option<String>,
+            cursor_pos: (usize, usize),
+            save_status: Option<preview::SaveStatus>,
+            autosave: bool,
+            search_visible: bool,
+            search_focus: preview::SearchFieldFocus,
+            search_query: String,
+            search_cursor: usize,
+            search_total: usize,
+            search_index: usize,
+            replace_text: String,
+            replace_cursor: usize,
+        }
+        let edit_snap = self.preview_edits.get(&pane_id).map(|edit| EditSnapshot {
+            editing: edit.editing,
+            dirty: edit.dirty(),
+            message: edit.message.clone(),
+            cursor_pos: edit.buffer.line_byte_col(edit.buffer.cursor()),
+            save_status: edit.save_status.clone(),
+            autosave: edit.autosave,
+            search_visible: edit.search_visible,
+            search_focus: edit.search_focus,
+            search_query: edit.search_query.clone(),
+            search_cursor: edit.search_cursor,
+            search_total: edit.search_hits.len(),
+            search_index: edit.search_index,
+            replace_text: edit.replace_text.clone(),
+            replace_cursor: edit.replace_cursor,
         });
-        let editing = edit_info.as_ref().is_some_and(|info| info.0);
-        let dirty = edit_info.as_ref().is_some_and(|info| info.1);
-        let edit_message = edit_info.as_ref().and_then(|info| info.2.clone());
-        let edit_cursor = edit_info.as_ref().filter(|info| info.0).map(|info| info.3);
-        let save_status = edit_info.as_ref().and_then(|info| info.4.clone());
-        let autosave = edit_info.as_ref().is_some_and(|info| info.5);
-        let search_visible = edit_info.as_ref().is_some_and(|info| info.6);
-        let search_query = edit_info
+        let editing = edit_snap.as_ref().is_some_and(|s| s.editing);
+        let dirty = edit_snap.as_ref().is_some_and(|s| s.dirty);
+        let edit_message = edit_snap.as_ref().and_then(|s| s.message.clone());
+        let edit_cursor = edit_snap
             .as_ref()
-            .map(|info| info.7.clone())
-            .unwrap_or_default();
-        let search_total = edit_info.as_ref().map(|info| info.8).unwrap_or(0);
-        let search_index = edit_info.as_ref().map(|info| info.9).unwrap_or(0);
-        let _replace_text = edit_info
+            .filter(|s| s.editing)
+            .map(|s| s.cursor_pos);
+        let save_status = edit_snap.as_ref().and_then(|s| s.save_status.clone());
+        let autosave = edit_snap.as_ref().is_some_and(|s| s.autosave);
+        let search_visible = edit_snap.as_ref().is_some_and(|s| s.search_visible);
+        let search_focus = edit_snap
             .as_ref()
-            .map(|info| info.10.clone())
+            .map(|s| s.search_focus)
+            .unwrap_or(preview::SearchFieldFocus::Query);
+        let search_query = edit_snap
+            .as_ref()
+            .map(|s| s.search_query.clone())
             .unwrap_or_default();
+        let search_cursor = edit_snap.as_ref().map(|s| s.search_cursor).unwrap_or(0);
+        let search_total = edit_snap.as_ref().map(|s| s.search_total).unwrap_or(0);
+        let search_index = edit_snap.as_ref().map(|s| s.search_index).unwrap_or(0);
+        let replace_text = edit_snap
+            .as_ref()
+            .map(|s| s.replace_text.clone())
+            .unwrap_or_default();
+        let replace_cursor = edit_snap.as_ref().map(|s| s.replace_cursor).unwrap_or(0);
         let editable = matches!(
             &state.content,
             preview::PreviewContent::Code(_) | preview::PreviewContent::Markdown(_)
@@ -1216,7 +1242,7 @@ impl TakoApp {
                             })),
                     )
                     .child(div().flex_grow(1.0))
-                    .children((md_capable && edit_info.is_none()).then(|| {
+                    .children((md_capable && edit_snap.is_none()).then(|| {
                         // 目アイコンのトグル（FR-3.3）: コード表示 ⇔ md レンダリング
                         let (icon, label) = match mode {
                             preview::PreviewMode::Markdown => ("</>", "コードとして表示"),
@@ -1312,33 +1338,114 @@ impl TakoApp {
                     ),
             )
             .when(search_visible, |el| {
+                let query_focused = search_focus == preview::SearchFieldFocus::Query;
+                let replace_focused = search_focus == preview::SearchFieldFocus::Replace;
                 let sq = search_query.clone();
+                let sq2 = sq.clone();
+                let rt = replace_text.clone();
+                let sc = search_cursor;
+                let rc = replace_cursor;
                 let si = search_index;
                 let st = search_total;
                 el.child(
                     div()
                         .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
+                        .flex_col()
                         .px_2()
-                        .py(px(4.0))
+                        .py(px(3.0))
+                        .gap(px(2.0))
                         .bg(rgba_alpha(theme.tab_active_background, 0.9))
                         .text_size(px(12.0))
-                        .child(SharedString::from(format!(
-                            "🔍 {}",
-                            if sq.is_empty() {
-                                "(⌘F で検索)"
-                            } else {
-                                &sq
-                            }
-                        )))
-                        .child(div().flex_grow(1.0))
-                        .when(st > 0, |el| {
-                            el.child(SharedString::from(format!("{}/{st}", si + 1)))
-                        })
-                        .when(st == 0 && !sq.is_empty(), |el| {
-                            el.child(div().text_color(hsla(theme.yellow)).child("見つかりません"))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .child("🔍")
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .px_1()
+                                        .py(px(1.0))
+                                        .rounded_sm()
+                                        .bg(rgba_alpha(
+                                            if query_focused {
+                                                theme.accent
+                                            } else {
+                                                theme.tab_active_background
+                                            },
+                                            if query_focused { 0.2 } else { 0.5 },
+                                        ))
+                                        .border_1()
+                                        .border_color(hsla_alpha(
+                                            theme.accent,
+                                            if query_focused { 0.6 } else { 0.15 },
+                                        ))
+                                        .child(SharedString::from(render_field_with_cursor(
+                                            &sq,
+                                            sc,
+                                            query_focused,
+                                        ))),
+                                )
+                                .when(st > 0, |el| {
+                                    el.child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .text_color(hsla_alpha(
+                                                theme.tab_inactive_foreground,
+                                                0.7,
+                                            ))
+                                            .child(SharedString::from(format!(
+                                                "{}/{}",
+                                                si + 1,
+                                                st
+                                            ))),
+                                    )
+                                })
+                                .when(st == 0 && !sq2.is_empty(), |el| {
+                                    el.child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .text_color(hsla(theme.yellow))
+                                            .child("0"),
+                                    )
+                                }),
+                        )
+                        .when(editing, |el| {
+                            el.child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .child("↔")
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .px_1()
+                                            .py(px(1.0))
+                                            .rounded_sm()
+                                            .bg(rgba_alpha(
+                                                if replace_focused {
+                                                    theme.accent
+                                                } else {
+                                                    theme.tab_active_background
+                                                },
+                                                if replace_focused { 0.2 } else { 0.5 },
+                                            ))
+                                            .border_1()
+                                            .border_color(hsla_alpha(
+                                                theme.accent,
+                                                if replace_focused { 0.6 } else { 0.15 },
+                                            ))
+                                            .child(SharedString::from(render_field_with_cursor(
+                                                &rt,
+                                                rc,
+                                                replace_focused,
+                                            ))),
+                                    ),
+                            )
                         }),
                 )
             })
@@ -1737,5 +1844,23 @@ impl TakoApp {
                 None,
             ),
         }
+    }
+}
+
+/// 検索/置換フィールドのテキストにカーソル（|）を差し込んで表示用文字列を作る
+fn render_field_with_cursor(text: &str, cursor: usize, focused: bool) -> String {
+    if !focused {
+        if text.is_empty() {
+            return " ".into();
+        }
+        return text.to_string();
+    }
+    let cursor = cursor.min(text.len());
+    let before = &text[..cursor];
+    let after = &text[cursor..];
+    if text.is_empty() {
+        "|".to_string()
+    } else {
+        format!("{before}|{after}")
     }
 }

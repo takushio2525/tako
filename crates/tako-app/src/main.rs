@@ -4779,6 +4779,22 @@ impl TakoApp {
         use tako_core::CursorMovement;
 
         let pane_id = self.focused_pane();
+
+        // 検索バー表示中: キーを検索/置換フィールドにルーティング
+        if self
+            .preview_edits
+            .get(&pane_id)
+            .is_some_and(|edit| edit.search_visible)
+        {
+            if keystroke.modifiers.platform
+                || keystroke.modifiers.control
+                || keystroke.modifiers.alt
+            {
+                return false;
+            }
+            return self.handle_search_bar_key(pane_id, keystroke, cx);
+        }
+
         if !self
             .preview_edits
             .get(&pane_id)
@@ -4849,6 +4865,188 @@ impl TakoApp {
             cx.notify();
         }
         handled
+    }
+
+    fn handle_search_bar_key(
+        &mut self,
+        pane_id: PaneId,
+        keystroke: &Keystroke,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(edit) = self.preview_edits.get_mut(&pane_id) else {
+            return false;
+        };
+        match keystroke.key.as_str() {
+            "escape" => {
+                edit.search_visible = false;
+                cx.notify();
+                true
+            }
+            "enter" => {
+                let shift = keystroke.modifiers.shift;
+                let do_replace =
+                    edit.search_focus == preview::SearchFieldFocus::Replace && edit.editing;
+                let q = edit.search_query.clone();
+                let r = edit.replace_text.clone();
+                if shift {
+                    let _ = self.preview_search_local(pane_id, None, Some("prev"));
+                } else if do_replace {
+                    let _ = self.preview_replace_local(pane_id, &q, &r, false);
+                } else {
+                    let _ = self.preview_search_local(pane_id, None, Some("next"));
+                }
+                self.refresh_preview_from_editor(pane_id);
+                cx.notify();
+                true
+            }
+            "tab" => {
+                edit.search_focus = match edit.search_focus {
+                    preview::SearchFieldFocus::Query => preview::SearchFieldFocus::Replace,
+                    preview::SearchFieldFocus::Replace => preview::SearchFieldFocus::Query,
+                };
+                cx.notify();
+                true
+            }
+            "backspace" => {
+                match edit.search_focus {
+                    preview::SearchFieldFocus::Query => {
+                        if edit.search_cursor > 0 {
+                            let prev = edit.search_query[..edit.search_cursor]
+                                .char_indices()
+                                .next_back()
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            edit.search_query.drain(prev..edit.search_cursor);
+                            edit.search_cursor = prev;
+                            self.update_search_hits(pane_id);
+                        }
+                    }
+                    preview::SearchFieldFocus::Replace => {
+                        if edit.replace_cursor > 0 {
+                            let prev = edit.replace_text[..edit.replace_cursor]
+                                .char_indices()
+                                .next_back()
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            edit.replace_text.drain(prev..edit.replace_cursor);
+                            edit.replace_cursor = prev;
+                        }
+                    }
+                }
+                cx.notify();
+                true
+            }
+            "delete" => {
+                match edit.search_focus {
+                    preview::SearchFieldFocus::Query => {
+                        if edit.search_cursor < edit.search_query.len() {
+                            let next = edit.search_cursor
+                                + edit.search_query[edit.search_cursor..]
+                                    .chars()
+                                    .next()
+                                    .map(char::len_utf8)
+                                    .unwrap_or(0);
+                            edit.search_query.drain(edit.search_cursor..next);
+                            self.update_search_hits(pane_id);
+                        }
+                    }
+                    preview::SearchFieldFocus::Replace => {
+                        if edit.replace_cursor < edit.replace_text.len() {
+                            let next = edit.replace_cursor
+                                + edit.replace_text[edit.replace_cursor..]
+                                    .chars()
+                                    .next()
+                                    .map(char::len_utf8)
+                                    .unwrap_or(0);
+                            edit.replace_text.drain(edit.replace_cursor..next);
+                        }
+                    }
+                }
+                cx.notify();
+                true
+            }
+            "left" => {
+                match edit.search_focus {
+                    preview::SearchFieldFocus::Query => {
+                        if edit.search_cursor > 0 {
+                            edit.search_cursor = edit.search_query[..edit.search_cursor]
+                                .char_indices()
+                                .next_back()
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                        }
+                    }
+                    preview::SearchFieldFocus::Replace => {
+                        if edit.replace_cursor > 0 {
+                            edit.replace_cursor = edit.replace_text[..edit.replace_cursor]
+                                .char_indices()
+                                .next_back()
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                        }
+                    }
+                }
+                cx.notify();
+                true
+            }
+            "right" => {
+                match edit.search_focus {
+                    preview::SearchFieldFocus::Query => {
+                        if edit.search_cursor < edit.search_query.len() {
+                            edit.search_cursor += edit.search_query[edit.search_cursor..]
+                                .chars()
+                                .next()
+                                .map(char::len_utf8)
+                                .unwrap_or(0);
+                        }
+                    }
+                    preview::SearchFieldFocus::Replace => {
+                        if edit.replace_cursor < edit.replace_text.len() {
+                            edit.replace_cursor += edit.replace_text[edit.replace_cursor..]
+                                .chars()
+                                .next()
+                                .map(char::len_utf8)
+                                .unwrap_or(0);
+                        }
+                    }
+                }
+                cx.notify();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn insert_search_char(&mut self, pane_id: PaneId, text: &str) {
+        let Some(edit) = self.preview_edits.get_mut(&pane_id) else {
+            return;
+        };
+        if !edit.search_visible {
+            return;
+        }
+        match edit.search_focus {
+            preview::SearchFieldFocus::Query => {
+                edit.search_query.insert_str(edit.search_cursor, text);
+                edit.search_cursor += text.len();
+                self.update_search_hits(pane_id);
+            }
+            preview::SearchFieldFocus::Replace => {
+                edit.replace_text.insert_str(edit.replace_cursor, text);
+                edit.replace_cursor += text.len();
+            }
+        }
+    }
+
+    fn update_search_hits(&mut self, pane_id: PaneId) {
+        let Some(edit) = self.preview_edits.get_mut(&pane_id) else {
+            return;
+        };
+        edit.search_hits = edit.buffer.find_all(&edit.search_query);
+        edit.search_index = 0;
+        if let Some(hit) = edit.buffer.find_next(&edit.search_query, 0) {
+            edit.buffer.set_cursor(hit.start, false);
+            self.refresh_preview_from_editor(pane_id);
+        }
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
@@ -8880,7 +9078,16 @@ impl EntityInputHandler for TakoApp {
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         // NSTextInputClient の規約: unmark は「未確定文字列をそのまま挿入扱いにする」
         if let Some(ime) = self.ime.take() {
-            if let Some(edit) = self
+            // 検索バー表示中は検索/置換フィールドへ
+            if self
+                .preview_edits
+                .get(&ime.pane)
+                .is_some_and(|edit| edit.search_visible)
+            {
+                if !ime.text.is_empty() {
+                    self.insert_search_char(ime.pane, &ime.text);
+                }
+            } else if let Some(edit) = self
                 .preview_edits
                 .get_mut(&ime.pane)
                 .filter(|edit| edit.editing)
@@ -8920,6 +9127,19 @@ impl EntityInputHandler for TakoApp {
             .as_ref()
             .map(|ime| ime.pane)
             .unwrap_or_else(|| self.focused_pane());
+        // 検索バー表示中は入力文字を検索/置換フィールドへ
+        if self
+            .preview_edits
+            .get(&pane)
+            .is_some_and(|edit| edit.search_visible)
+        {
+            if !text.is_empty() {
+                self.insert_search_char(pane, text);
+            }
+            self.ime = None;
+            cx.notify();
+            return;
+        }
         if let Some(edit) = self
             .preview_edits
             .get_mut(&pane)
