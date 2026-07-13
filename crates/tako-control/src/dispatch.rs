@@ -71,6 +71,10 @@ pub trait ControlHost {
     fn persist_restore_report(&self) -> Option<String> {
         None
     }
+    /// 起動時に orphan 自動復帰した tmux セッション数（Issue #191）
+    fn recovered_sessions_count(&self) -> usize {
+        0
+    }
     /// ペインを保持している tmux バックエンドセッション名（tmuxview の区別表示用。
     /// バックエンドでないペイン・非対応実装では None）
     fn backend_session(&self, _pane: PaneId) -> Option<String> {
@@ -1238,6 +1242,8 @@ fn dispatch_inner(
                     .map(|p| p.is_file())
                     .unwrap_or(false),
                 "last_restore": host.persist_restore_report(),
+                // 起動時に orphan 自動復帰した tmux セッション数（Issue #191）
+                "recovered_count": host.recovered_sessions_count(),
                 "log_path": crate::diag::persist_log_path()
                     .map(|p| p.display().to_string()),
             }))
