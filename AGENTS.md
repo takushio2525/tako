@@ -82,6 +82,7 @@ tako/
 | Web ビューペイン操作 | `tako web open <url>` / `list` / `show <id>` / `hide` / `close` / `nav <to>` / `eval <js>` / `eval-result <token>` / `read`（ネイティブ WKWebView ペイン。#155） |
 | エージェント共通ルール同期 | `tako agents sync-rules` / `tako agents status`（正本から各エージェントのグローバル指示ファイルへマーカーブロック同期。#136） |
 | レイアウト復旧（タブ・ペイン大量消失時。#177） | `tako recover`（バックアップ世代一覧）→ tako 終了 → `tako recover --apply <世代>` → tako 再起動。実体 tmux セッションの個別取り込みは `tako tmux open --socket tako --pane <N> <session>` |
+| スリープ防止 | `tako sleep-guard status` / `tako sleep-guard set --mode <off\|on\|while-agents-running> --power-condition <ac-only\|always>`（IOKit 電源アサーション。#173） |
 | target 掃除 | `scripts/clean-target.sh`（dry-run。`--run` で実行。cargo clean + worktree prune） |
 
 CI（`.github/workflows/ci.yml`）は macOS / Windows の両ランナーで build + test を回す。

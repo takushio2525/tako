@@ -153,6 +153,31 @@ impl TakoApp {
                             ))),
                     )
             }))
+            .when(self.sleep_guard_active, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.0))
+                        .h_full()
+                        .px_2()
+                        .border_r_1()
+                        .border_color(hsla(theme.border_subtle))
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(hsla(theme.teal))
+                                .child("☕"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(hsla(theme.tab_inactive_foreground))
+                                .child("awake"),
+                        ),
+                )
+            })
             .child(div().flex_grow(1.0))
             .children(self.render_update_banner(&theme, cx))
             .children(usage_text.map(|text| {

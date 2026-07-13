@@ -127,3 +127,18 @@ changes:
       付与後に tako アプリの再起動が必要なことを案内する。
       setup 再実行でチェックが自動で走るため、個別の適用作業は不要。
       `tako setup --check` でも同じチェックを確認できる。
+
+  - revision: 7
+    version: "0.5.0"
+    date: "2026-07-13"
+    kind: auto
+    title: スリープ防止機能の標準搭載（IOKit 電源アサーション + App Nap 無効化）
+    description: |
+      エージェント稼働中の macOS アイドルスリープを IOKit 電源アサーションで防止する
+      機能が追加された（Issue #173）。ディスプレイスリープは妨げない。
+      setup の依存チェック段階で L0〜L3 の稼働レベルを対話で選択できるようになった:
+      L0=OS 任せ（オフ）、L1=AC 接続時のみ（推奨）、L2=バッテリー時も、
+      L3=蓋閉じ稼働の案内（手動設定）。既定は L1 相当（while-agents-running + ac-only）。
+      CLI: `tako sleep-guard status/set`、MCP: `tako_sleep_guard`。
+      `tako setup --check` にも状態が表示される。
+      setup 再実行でチェックが自動で走るため、個別の適用作業は不要。

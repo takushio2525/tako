@@ -157,6 +157,10 @@ enum Command {
     /// FDA を付与するとフォルダアクセス許可ダイアログが一括で出なくなる
     #[command(subcommand)]
     Fda(FdaCommand),
+    /// スリープ防止機能の状態確認・設定変更（Issue #173）。
+    /// macOS のアイドルスリープを IOKit 電源アサーションで防止する
+    #[command(subcommand, name = "sleep-guard")]
+    SleepGuard(SleepGuardCommand),
     /// ファイルツリーへのフォルダの追加・削除・一覧（#134）。
     /// AI が作業対象プロジェクトのフォルダを明示追加する
     #[command(subcommand)]
@@ -310,6 +314,21 @@ enum FdaCommand {
     Status,
     /// システム設定のフルディスクアクセスパネルを開く
     Open,
+}
+
+#[derive(Subcommand)]
+enum SleepGuardCommand {
+    /// スリープ防止の状態を確認する
+    Status,
+    /// スリープ防止の設定を変更する
+    Set {
+        /// モード: off / on / while-agents-running
+        #[arg(long)]
+        mode: Option<String>,
+        /// 電源条件: ac-only / always
+        #[arg(long, name = "power")]
+        power_condition: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1217,6 +1236,8 @@ fn main() -> ExitCode {
         }
         // FDA チェックはローカル処理（IPC 不要。ファイルシステムのみ）
         Command::Fda(ref sub) => fda_local(sub),
+        // スリープ防止もローカル処理（IPC 不要。設定ファイルの読み書きのみ）
+        Command::SleepGuard(ref sub) => sleep_guard_local(sub),
         // エージェント共通ルール同期もローカル処理（IPC 不要）
         Command::Agents(ref sub) => agents_local(sub),
         // レイアウト復旧もローカル処理（GUI 死亡・縮退保存後の復旧手段のため IPC 不要が本質）
@@ -1977,6 +1998,81 @@ fn recover_apply(path: &std::path::Path, generation: u32, force: bool) -> Result
     Ok(())
 }
 
+fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
+    match sub {
+        SleepGuardCommand::Status => {
+            let settings = tako_control::settings::load();
+            let state = tako_control::sleep_guard::status(
+                settings.sleep_guard_mode,
+                settings.sleep_guard_power,
+            );
+            if state.assertion_held {
+                eprintln!("✓ スリープ防止: アサーション保持中");
+            } else {
+                eprintln!("  スリープ防止: アサーション未保持");
+            }
+            eprintln!("  モード: {}", state.mode.as_str());
+            eprintln!("  電源条件: {}", state.power_condition.as_str());
+            eprintln!(
+                "  AC 電源: {}",
+                if state.on_ac_power {
+                    "接続中"
+                } else {
+                    "未接続"
+                }
+            );
+            eprintln!(
+                "  説明: {}",
+                state.to_json()["description"].as_str().unwrap_or("")
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&state.to_json()).unwrap()
+            );
+            Ok(())
+        }
+        SleepGuardCommand::Set {
+            mode,
+            power_condition,
+        } => {
+            let mut settings = tako_control::settings::load();
+            if let Some(m) = mode {
+                settings.sleep_guard_mode =
+                    tako_control::sleep_guard::SleepGuardMode::from_str_opt(m).ok_or_else(
+                        || {
+                            format!(
+                                "不明な mode: {m:?}（off / on / while-agents-running のいずれか）"
+                            )
+                        },
+                    )?;
+            }
+            if let Some(pc) = power_condition {
+                settings.sleep_guard_power =
+                    tako_control::sleep_guard::PowerCondition::from_str_opt(pc).ok_or_else(
+                        || format!("不明な power: {pc:?}（ac-only / always のいずれか）"),
+                    )?;
+            }
+            tako_control::settings::save(&settings)
+                .map_err(|e| format!("設定の保存に失敗: {e}"))?;
+            eprintln!(
+                "✓ スリープ防止の設定を変更しました: mode={}, power={}",
+                settings.sleep_guard_mode.as_str(),
+                settings.sleep_guard_power.as_str()
+            );
+            eprintln!("  ⚠ tako アプリの再起動後に反映されます");
+            let state = tako_control::sleep_guard::status(
+                settings.sleep_guard_mode,
+                settings.sleep_guard_power,
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&state.to_json()).unwrap()
+            );
+            Ok(())
+        }
+    }
+}
+
 fn agents_local(sub: &AgentsCommand) -> Result<(), String> {
     match sub {
         AgentsCommand::SyncRules {
@@ -2643,6 +2739,21 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 FdaCommand::Status => "status".to_string(),
                 FdaCommand::Open => "open".to_string(),
             }),
+        },
+        Command::SleepGuard(sub) => match sub {
+            SleepGuardCommand::Status => Request::SleepGuard {
+                action: Some("status".to_string()),
+                mode: None,
+                power_condition: None,
+            },
+            SleepGuardCommand::Set {
+                mode,
+                power_condition,
+            } => Request::SleepGuard {
+                action: Some("set".to_string()),
+                mode: mode.clone(),
+                power_condition: power_condition.clone(),
+            },
         },
         Command::Tree(sub) => match sub {
             TreeCommand::Add { path, tab } => Request::TreeFolder {

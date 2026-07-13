@@ -177,6 +177,8 @@ fn run_dependency_check(interactive: bool) -> Vec<&'static str> {
     {
         run_fda_check(interactive);
     }
+    // スリープ防止の設定案内
+    run_sleep_guard_check(interactive);
     missing_required
 }
 
@@ -205,6 +207,92 @@ fn offer_brew_install(pkg: &str, brew_bin: &str) -> bool {
             eprintln!("      ⚠ brew install {pkg} が失敗しました。手動で導入してください");
             false
         }
+    }
+}
+
+/// スリープ防止（Issue #173）の設定案内。
+/// L0〜L3 の段階式で、ユーザーの利用スタイルに合わせたスリープ防止を設定する
+fn run_sleep_guard_check(interactive: bool) {
+    let settings = tako_control::settings::load();
+    let mode = settings.sleep_guard_mode;
+    let power = settings.sleep_guard_power;
+    eprintln!();
+    eprintln!(
+        "  スリープ防止: mode={}, power={}",
+        mode.as_str(),
+        power.as_str()
+    );
+    if !interactive {
+        eprintln!("      設定変更: tako sleep-guard set --mode <mode> --power <condition>");
+        return;
+    }
+    eprintln!("      エージェントが長時間動いている間に PC がスリープすると作業が止まります。");
+    eprintln!("      スリープ防止の稼働レベルを選んでください:");
+    eprintln!();
+    eprintln!("      [0] OS 任せ（機能オフ）");
+    eprintln!("      [1] AC 接続時のみアイドルスリープ防止（推奨）");
+    eprintln!("      [2] バッテリー時もアイドルスリープ防止（電池消耗に注意）");
+    eprintln!("      [3] 蓋閉じでも稼働（案内のみ — 手動設定が必要）");
+    eprintln!();
+    let current_level = match (mode, power) {
+        (tako_control::sleep_guard::SleepGuardMode::Off, _) => 0,
+        (_, tako_control::sleep_guard::PowerCondition::AcOnly) => 1,
+        (_, tako_control::sleep_guard::PowerCondition::Always) => 2,
+    };
+    eprint!("      レベルを選択 [0-3]（現在: L{current_level}、Enter でスキップ）: ");
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return;
+    }
+    let choice = input.trim();
+    if choice.is_empty() {
+        eprintln!("      現在の設定を維持します");
+        return;
+    }
+    let mut new_settings = settings;
+    match choice {
+        "0" => {
+            new_settings.sleep_guard_mode = tako_control::sleep_guard::SleepGuardMode::Off;
+            eprintln!("      ✓ L0: スリープ防止を無効にしました（OS 任せ）");
+        }
+        "1" => {
+            new_settings.sleep_guard_mode =
+                tako_control::sleep_guard::SleepGuardMode::WhileAgentsRunning;
+            new_settings.sleep_guard_power = tako_control::sleep_guard::PowerCondition::AcOnly;
+            eprintln!("      ✓ L1: AC 接続時のみ、エージェント稼働中にスリープを防止します");
+        }
+        "2" => {
+            new_settings.sleep_guard_mode =
+                tako_control::sleep_guard::SleepGuardMode::WhileAgentsRunning;
+            new_settings.sleep_guard_power = tako_control::sleep_guard::PowerCondition::Always;
+            eprintln!("      ✓ L2: バッテリー時もエージェント稼働中にスリープを防止します");
+            eprintln!("      ⚠ 電池消耗が速くなります。AC 接続での利用を推奨します");
+        }
+        "3" => {
+            new_settings.sleep_guard_mode =
+                tako_control::sleep_guard::SleepGuardMode::WhileAgentsRunning;
+            new_settings.sleep_guard_power = tako_control::sleep_guard::PowerCondition::AcOnly;
+            eprintln!("      ✓ L3: L1 の設定を適用しました（AC 接続時のみ防止）");
+            eprintln!();
+            eprintln!("      蓋閉じでの継続稼働には追加の手動設定が必要です:");
+            eprintln!("      ─────────────────────────────────────────────");
+            eprintln!("      方法 1（推奨）: クラムシェルモード");
+            eprintln!("        AC 接続 + 外部ディスプレイ接続時に蓋を閉じても稼働します。");
+            eprintln!("        macOS 標準機能のため追加設定不要。外部ディスプレイが必要です。");
+            eprintln!();
+            eprintln!("      方法 2: sudo pmset disablesleep 1");
+            eprintln!("        管理者権限が必要。蓋を閉じてもスリープしなくなります。");
+            eprintln!("        ⚠ 発熱・電池劣化のリスクがあります。AC 接続時のみ推奨。");
+            eprintln!("        解除: sudo pmset disablesleep 0");
+            eprintln!("      ─────────────────────────────────────────────");
+        }
+        other => {
+            eprintln!("      不明な選択: {other}。現在の設定を維持します");
+            return;
+        }
+    }
+    if let Err(e) = tako_control::settings::save(&new_settings) {
+        eprintln!("      ⚠ 設定の保存に失敗: {e}");
     }
 }
 
@@ -475,6 +563,25 @@ pub fn run_check() -> Result<(), String> {
             }
         }
         Err(e) => eprintln!("  △ エージェント共通ルール同期: 確認失敗 ({e})"),
+    }
+
+    // スリープ防止（Issue #173）
+    {
+        let settings = tako_control::settings::load();
+        let mode = settings.sleep_guard_mode;
+        let power = settings.sleep_guard_power;
+        match mode {
+            tako_control::sleep_guard::SleepGuardMode::Off => {
+                eprintln!("  △ スリープ防止: 無効（tako sleep-guard set --mode while-agents-running で有効化）");
+            }
+            _ => {
+                eprintln!(
+                    "  ✓ スリープ防止: mode={}, power={}",
+                    mode.as_str(),
+                    power.as_str()
+                );
+            }
+        }
     }
 
     // プロファイル一覧

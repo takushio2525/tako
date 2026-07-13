@@ -752,6 +752,8 @@ struct TakoApp {
     confirm_close: bool,
     /// 確認ダイアログ表示中の対象（None = ダイアログ非表示）
     pending_close_confirm: Option<CloseConfirmTarget>,
+    /// スリープ防止のアサーションが現在保持中か（ステータスバー表示用。ポーリングで更新）
+    sleep_guard_active: bool,
 }
 
 /// × ボタン close の確認ダイアログ対象（Issue #172）
@@ -1491,7 +1493,12 @@ impl TakoApp {
             hovered_link: None,
             confirm_close: tako_control::setup::confirm_close_enabled(),
             pending_close_confirm: None,
+            sleep_guard_active: false,
         };
+        // App Nap 無効化 + 初回スリープ防止更新（Issue #173）
+        tako_control::sleep_guard::disable_app_nap();
+        app.update_sleep_guard();
+
         // 終了処理（layout 保存 + 接続情報の後片付け）はアプリ終了フックで一元化する
         // （#103）。Cmd-Q（グローバル Quit アクション）・メニュー・Dock 右クリック終了・
         // OS シャットダウンのどの経路でも走る（従来はルート div の Quit ハンドラ限定で、
@@ -1865,6 +1872,7 @@ impl TakoApp {
                 app.sync_filetree_roots();
                 app.refresh_agent_metrics();
                 app.poll_webview_state();
+                app.update_sleep_guard();
                 app.save_layout();
                 let filetree_targets = if app.filetree.visible {
                     Some(app.filetree.refresh_targets())
@@ -4445,6 +4453,22 @@ impl TakoApp {
         } else {
             self.agent_metrics = AgentMetrics::default();
         }
+    }
+
+    fn update_sleep_guard(&mut self) {
+        use tako_core::CommandState;
+        let settings = tako_control::settings::load();
+        let busy_agents = self
+            .terminals
+            .values()
+            .filter(|s| matches!(s.command_state(), CommandState::Running))
+            .count();
+        let state = tako_control::sleep_guard::update(
+            settings.sleep_guard_mode,
+            settings.sleep_guard_power,
+            busy_agents,
+        );
+        self.sleep_guard_active = state.assertion_held;
     }
 
     // --- D&D（FR-2.16.10 tmux セッション取り込み / FR-3.11 ファイルプレビュー） ---
@@ -10583,7 +10607,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 60, "MCP tools/list は 60 ツール");
+            check(status == 200 && tool_count == 61, "MCP tools/list は 61 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
