@@ -1214,8 +1214,30 @@ fn migrate_legacy_model_file(path: &Path) -> Option<String> {
 
 /// `claude agents --json` をログインシェル経由で実行する。
 /// .app バンドル（Dock 起動）の PATH は最小構成で `claude` が見つからないため、
-/// `$SHELL -l -c "claude agents --json"` でユーザーの PATH を使う
+/// `$SHELL -l -c "claude agents --json"` でユーザーの PATH を使う。
+///
+/// Issue #168: ログインシェル + Node CLI の起動は 1 回 500ms〜1s かかる。master の
+/// watch / worker_status が数秒間隔 × worker 数で呼ぶため、TTL 内は前回結果を返し、
+/// 実行自体もロック保持で直列化する（多重呼び出しでプロセスが並んで起動しない。
+/// 並行呼び出しは実行完了を待って fresh な結果を受け取る）
 pub(crate) fn run_claude_agents_json() -> Option<Vec<u8>> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(Instant, Option<Vec<u8>>)>> = Mutex::new(None);
+    /// watch のポーリング間隔（数秒）より短く、判定の鮮度に影響しない長さ
+    const TTL: Duration = Duration::from_secs(2);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, value)) = cache.as_ref() {
+        if at.elapsed() < TTL {
+            return value.clone();
+        }
+    }
+    let result = run_claude_agents_json_uncached();
+    *cache = Some((Instant::now(), result.clone()));
+    result
+}
+
+fn run_claude_agents_json_uncached() -> Option<Vec<u8>> {
     let shell = std::env::var("SHELL")
         .ok()
         .filter(|s| !s.is_empty())

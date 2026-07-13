@@ -170,6 +170,9 @@ pub enum PreviewContent {
     Image(ImageData),
     Pdf(PdfData),
     Video(VideoData),
+    /// background で読み込み中（Issue #168: PDF ラスタライズ / ffmpeg サムネ抽出は
+    /// UI スレッドで行わない。完了時に本内容へ差し替わる）
+    Loading,
     /// 読めない・バイナリ等（正常系の劣化。ペインは開いたまま理由を表示する）
     Error(String),
 }
@@ -245,6 +248,16 @@ impl PreviewState {
             path: path.to_path_buf(),
             mode,
             content: PreviewContent::Error(message.into()),
+            truncated: false,
+        }
+    }
+
+    /// background 読み込み中のプレースホルダ（Issue #168）
+    pub fn loading(path: &Path, mode: PreviewMode) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            mode,
+            content: PreviewContent::Loading,
             truncated: false,
         }
     }

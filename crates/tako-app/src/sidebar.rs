@@ -862,5 +862,43 @@ impl TakoApp {
         for (pane, path, text) in std::mem::take(&mut self.pending_highlights) {
             self.spawn_highlight(pane, path, text, cx);
         }
+        self.drain_pending_preview_loads(cx);
+    }
+
+    /// 重量プレビュー（PDF ラスタライズ / 動画 ffmpeg）を background executor で
+    /// 読み込み、完了後に Loading プレースホルダを本内容へ差し替える（Issue #168）
+    pub(crate) fn spawn_preview_load(
+        &self,
+        pane: PaneId,
+        path: std::path::PathBuf,
+        mode: preview::PreviewMode,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let p = path.clone();
+            // PDF / Video は load_fast がそのまま完成版を返す（raw は常に None）
+            let task = cx
+                .background_executor()
+                .spawn(async move { preview::load_fast(&p, mode).0 });
+            let state = task.await;
+            let _ = this.update(cx, |app, cx| {
+                // 読み込み中に別ファイルへ差し替わっていたら破棄（後勝ち）
+                let still_loading = app.previews.get(&pane).is_some_and(|s| {
+                    s.path == path && matches!(s.content, preview::PreviewContent::Loading)
+                });
+                if still_loading {
+                    app.previews.insert(pane, state);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// dispatch 中に積まれた重量プレビュー読み込みを background へ流す（Issue #168）
+    pub(crate) fn drain_pending_preview_loads(&mut self, cx: &mut Context<Self>) {
+        for (pane, path, mode) in std::mem::take(&mut self.pending_preview_loads) {
+            self.spawn_preview_load(pane, path, mode, cx);
+        }
     }
 }

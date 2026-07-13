@@ -8,6 +8,7 @@
 //! [`ControlHost`] trait の向こう側（UI 層）に置く。
 
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use tako_core::{
     CommandState, Pane, PaneId, PaneNode, PaneOrigin, PaneTreeError, Rect, SpawnCommand,
     SpawnOptions, SplitAxis, SplitDirection, TabId, TerminalSession, Workspace,
@@ -337,19 +338,154 @@ pub fn dispatch(
     request: Request,
     origin: PaneOrigin,
 ) -> Result<Value, DispatchError> {
-    /// UI スレッド専有としてログに残す処理時間のしきい値。1 フレーム 16ms（60fps）の
-    /// 数フレーム分 = 体感で引っかかりが分かり始める長さ
-    const DISPATCH_SLOW_MS: u128 = 100;
-    let kind = request.kind_name();
-    let t0 = std::time::Instant::now();
-    let result = dispatch_inner(host, request, origin);
-    let took = t0.elapsed().as_millis();
-    if took >= DISPATCH_SLOW_MS {
-        crate::diag::perf_log(&format!(
-            "dispatch 遅延: {kind} が {took}ms（UI スレッド専有）"
-        ));
+    // Issue #168: 計測は diag::perf_span に一元化（32ms 超えを記録 + 2 秒超え継続の
+    // ハング級は watchdog が drop を待たず記録。verbose 時はタグ別分布も出る）
+    let _span = crate::diag::perf_span(format!("dispatch:{}", request.kind_name()));
+    dispatch_inner(host, request, origin)
+}
+
+/// UI スレッドを離れて完了できる重い read-only リクエストの分割実行ジョブ（Issue #168 / #115）。
+/// `prepare_offload` が UI スレッドで文脈（workspace / ライブ画面）を収集して返し、
+/// `run()` は任意のスレッド（GPUI background executor 等）でサブプロセス実行を行う。
+/// dispatch と同じ応答形が得られる（操作セマンティクスの一元化は保たれる）
+pub enum OffloadJob {
+    WorkerStatus {
+        ctx: WorkerStatusCtx,
+        session_id: Option<String>,
+        tmux_session: Option<String>,
+    },
+    GitLog {
+        cwd: PathBuf,
+        max_count: Option<usize>,
+    },
+    GitDiff {
+        cwd: PathBuf,
+        target: Option<String>,
+    },
+}
+
+/// リクエストが offload 対象なら UI スレッド必須の文脈を収集してジョブ化する。
+/// 対象外は None（従来どおり dispatch を同期実行する）。
+/// 対象: サブプロセス実行（claude CLI / git / tmux）を伴い、workspace を変更しない
+/// リクエストのみ（UI スレッド専有の実測上位。perf.log: OrchestratorWorkerStatus
+/// avg 687ms / GitLog 2431ms）
+pub fn prepare_offload(
+    host: &dyn ControlHost,
+    request: &Request,
+) -> Option<Result<OffloadJob, DispatchError>> {
+    match request {
+        Request::OrchestratorWorkerStatus {
+            pane_id,
+            session_id,
+            tmux_session,
+        } => Some(Ok(OffloadJob::WorkerStatus {
+            ctx: collect_worker_status_ctx(host, *pane_id),
+            session_id: session_id.clone(),
+            tmux_session: tmux_session.clone(),
+        })),
+        Request::GitLog { pane, max_count } => {
+            Some(git_pane_cwd(host, *pane).map(|cwd| OffloadJob::GitLog {
+                cwd,
+                max_count: *max_count,
+            }))
+        }
+        Request::GitDiff { pane, target } => {
+            Some(git_pane_cwd(host, *pane).map(|cwd| OffloadJob::GitDiff {
+                cwd,
+                target: target.clone(),
+            }))
+        }
+        _ => None,
     }
-    result
+}
+
+impl OffloadJob {
+    /// ジョブ本体（サブプロセス実行）。UI スレッドで呼ばないこと
+    pub fn run(self) -> Result<Value, DispatchError> {
+        match self {
+            OffloadJob::WorkerStatus {
+                ctx,
+                session_id,
+                tmux_session,
+            } => finish_worker_status(ctx, session_id.as_deref(), tmux_session.as_deref()),
+            OffloadJob::GitLog { cwd, max_count } => run_git_log(&cwd, max_count),
+            OffloadJob::GitDiff { cwd, target } => run_git_diff(&cwd, target.as_deref()),
+        }
+    }
+}
+
+/// GitLog / GitDiff の UI スレッド必須部分: ペインの cwd 解決（キャッシュ済み値の読み取り）
+fn git_pane_cwd(host: &dyn ControlHost, pane: Option<u64>) -> Result<PathBuf, DispatchError> {
+    let (_, target) = resolve_pane(host.workspace(), pane)?;
+    host.session(target)
+        .and_then(|s| s.cwd())
+        .map(Path::to_path_buf)
+        .ok_or(DispatchError::Operation("cwd が取得できない".into()))
+}
+
+/// git log + branches + status の取得と応答整形（サブプロセス実行を伴う）
+fn run_git_log(cwd: &Path, max_count: Option<usize>) -> Result<Value, DispatchError> {
+    let repo = tako_core::git::repo_root(cwd)
+        .ok_or(DispatchError::Operation("git リポジトリではない".into()))?;
+    let max = max_count.unwrap_or(200);
+    let commits = tako_core::git::log_commits(&repo, max);
+    let branches = tako_core::git::list_branches(&repo);
+    let status = tako_core::git::status(&repo);
+    Ok(json!({
+        "repo": repo.display().to_string(),
+        "branch": status.branch,
+        "upstream": status.upstream,
+        "commits": commits.iter().map(|c| json!({
+            "hash": c.hash,
+            "short_hash": c.short_hash,
+            "author": c.author,
+            "date": c.date_relative,
+            "subject": c.subject,
+            "refs": c.refs,
+            "parents": c.parents,
+        })).collect::<Vec<_>>(),
+        "branches": branches.iter().map(|b| json!({
+            "name": b.name,
+            "current": b.is_current,
+            "remote": b.is_remote,
+            "hash": b.commit_hash,
+            "subject": b.subject,
+        })).collect::<Vec<_>>(),
+        "status": status.entries.iter().map(|e| json!({
+            "path": e.path,
+            "index": e.index.to_string(),
+            "worktree": e.worktree.to_string(),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+/// git diff の取得と応答整形（サブプロセス実行を伴う）
+fn run_git_diff(cwd: &Path, target: Option<&str>) -> Result<Value, DispatchError> {
+    let repo = tako_core::git::repo_root(cwd)
+        .ok_or(DispatchError::Operation("git リポジトリではない".into()))?;
+    let diff_target = match target {
+        None | Some("unstaged") => tako_core::git::DiffTarget::Unstaged,
+        Some("staged") => tako_core::git::DiffTarget::Staged,
+        Some(hash) => tako_core::git::DiffTarget::Commit(hash.to_string()),
+    };
+    let files = tako_core::git::diff(&repo, &diff_target);
+    Ok(json!({
+        "repo": repo.display().to_string(),
+        "files": files.iter().map(|f| json!({
+            "path": f.path,
+            "hunks": f.hunks.iter().map(|h| json!({
+                "header": h.header,
+                "lines": h.lines.iter().map(|l| json!({
+                    "kind": match l.kind {
+                        tako_core::DiffLineKind::Context => "context",
+                        tako_core::DiffLineKind::Add => "add",
+                        tako_core::DiffLineKind::Remove => "remove",
+                    },
+                    "content": l.content,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    }))
 }
 
 fn dispatch_inner(
@@ -1406,75 +1542,14 @@ fn dispatch_inner(
             }
         }
         Request::GitLog { pane, max_count } => {
-            let (_, target) = resolve_pane(host.workspace(), pane)?;
-            let cwd = host
-                .session(target)
-                .and_then(|s| s.cwd())
-                .ok_or(DispatchError::Operation("cwd が取得できない".into()))?;
-            let repo = tako_core::git::repo_root(cwd)
-                .ok_or(DispatchError::Operation("git リポジトリではない".into()))?;
-            let max = max_count.unwrap_or(200);
-            let commits = tako_core::git::log_commits(&repo, max);
-            let branches = tako_core::git::list_branches(&repo);
-            let status = tako_core::git::status(&repo);
-            Ok(json!({
-                "repo": repo.display().to_string(),
-                "branch": status.branch,
-                "upstream": status.upstream,
-                "commits": commits.iter().map(|c| json!({
-                    "hash": c.hash,
-                    "short_hash": c.short_hash,
-                    "author": c.author,
-                    "date": c.date_relative,
-                    "subject": c.subject,
-                    "refs": c.refs,
-                    "parents": c.parents,
-                })).collect::<Vec<_>>(),
-                "branches": branches.iter().map(|b| json!({
-                    "name": b.name,
-                    "current": b.is_current,
-                    "remote": b.is_remote,
-                    "hash": b.commit_hash,
-                    "subject": b.subject,
-                })).collect::<Vec<_>>(),
-                "status": status.entries.iter().map(|e| json!({
-                    "path": e.path,
-                    "index": e.index.to_string(),
-                    "worktree": e.worktree.to_string(),
-                })).collect::<Vec<_>>(),
-            }))
+            // 同期経路（テスト・直呼び用）。IPC / MCP 経由は prepare_offload が
+            // cwd 解決（UI）と git 実行（background）に分割する（Issue #115 / #168）
+            let cwd = git_pane_cwd(host, pane)?;
+            run_git_log(&cwd, max_count)
         }
         Request::GitDiff { pane, target } => {
-            let (_, pane_id) = resolve_pane(host.workspace(), pane)?;
-            let cwd = host
-                .session(pane_id)
-                .and_then(|s| s.cwd())
-                .ok_or(DispatchError::Operation("cwd が取得できない".into()))?;
-            let repo = tako_core::git::repo_root(cwd)
-                .ok_or(DispatchError::Operation("git リポジトリではない".into()))?;
-            let diff_target = match target.as_deref() {
-                None | Some("unstaged") => tako_core::git::DiffTarget::Unstaged,
-                Some("staged") => tako_core::git::DiffTarget::Staged,
-                Some(hash) => tako_core::git::DiffTarget::Commit(hash.to_string()),
-            };
-            let files = tako_core::git::diff(&repo, &diff_target);
-            Ok(json!({
-                "repo": repo.display().to_string(),
-                "files": files.iter().map(|f| json!({
-                    "path": f.path,
-                    "hunks": f.hunks.iter().map(|h| json!({
-                        "header": h.header,
-                        "lines": h.lines.iter().map(|l| json!({
-                            "kind": match l.kind {
-                                tako_core::DiffLineKind::Context => "context",
-                                tako_core::DiffLineKind::Add => "add",
-                                tako_core::DiffLineKind::Remove => "remove",
-                            },
-                            "content": l.content,
-                        })).collect::<Vec<_>>(),
-                    })).collect::<Vec<_>>(),
-                })).collect::<Vec<_>>(),
-            }))
+            let cwd = git_pane_cwd(host, pane)?;
+            run_git_diff(&cwd, target.as_deref())
         }
 
         Request::Background { pane } => {
@@ -1736,11 +1811,12 @@ fn dispatch_inner(
             pane_id,
             session_id,
             tmux_session,
-        } => Ok(worker_status_compute(
-            worker_status_snapshot(host, pane_id),
-            session_id.as_deref(),
-            tmux_session.as_deref(),
-        )),
+        } => {
+            // 同期経路（テスト・直呼び用）。IPC / MCP 経由は prepare_offload が
+            // collect（UI）と finish（background）に分割して実行する（#168 / #181）
+            let ctx = collect_worker_status_ctx(host, pane_id);
+            finish_worker_status(ctx, session_id.as_deref(), tmux_session.as_deref())
+        }
 
         Request::RemoteStart { port, insecure } => host
             .remote_start(port, insecure)
@@ -2539,19 +2615,31 @@ fn dispatch_orchestrator_spawn(
     }))
 }
 
-/// WorkerStatus の UI 依存部分のスナップショット（#181）。
-/// UI スレッドで `worker_status_snapshot` により取得し、外部プロセスを叩く重い合成
-/// （`worker_status_compute`）へ渡す。二分することで claude CLI / tmux の起動待ちが
-/// UI スレッドを専有しない
-pub struct WorkerPaneSnapshot {
-    pub pane_exists: bool,
-    pub backend_session: Option<String>,
-    pub visible_lines: Option<Vec<String>>,
+/// OrchestratorWorkerStatus の UI スレッド必須部分（workspace / ライブ画面の読み取り）の
+/// 収集結果。残り（claude CLI / tmux / ps のサブプロセス実行）はこの文脈だけで
+/// UI スレッド外で完了できる（#168 / #181: UI 非ブロック化の分割点。
+/// #181 の worker_status_snapshot/compute と同時期に同じ分割で実装され、
+/// GitLog / GitDiff も扱う OffloadJob 機構へ一本化した）
+pub struct WorkerStatusCtx {
+    pane_exists: bool,
+    backend_session: Option<String>,
+    /// ライブ画面の末尾（空行除去 + 最大 30 行に整形済み）。ペインが GUI に無ければ None
+    live_tail: Option<String>,
 }
 
-/// WorkerStatus のうち UI 状態（workspace / セッション画面）だけを軽く写し取る。
-/// 外部プロセスは呼ばない（UI スレッドで安全に実行できる）
-pub fn worker_status_snapshot(host: &dyn ControlHost, pane_id: u64) -> WorkerPaneSnapshot {
+/// 末尾の空行を除去し、最大 30 行に切り詰めて 1 本のテキストへ
+fn tail_join(mut lines: Vec<String>) -> String {
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    if lines.len() > 30 {
+        lines.drain(..lines.len() - 30);
+    }
+    lines.join("\n")
+}
+
+fn collect_worker_status_ctx(host: &dyn ControlHost, pane_id: u64) -> WorkerStatusCtx {
+    // ペインの存在確認（ツリー上 + shelved の両方を走査）
     let target = PaneId::from_raw(pane_id);
     let in_tree = host.workspace().tabs().iter().any(|tab| {
         tab.tree()
@@ -2559,25 +2647,27 @@ pub fn worker_status_snapshot(host: &dyn ControlHost, pane_id: u64) -> WorkerPan
             .iter()
             .any(|p| p.id().as_u64() == pane_id)
     });
-    WorkerPaneSnapshot {
+    WorkerStatusCtx {
         pane_exists: in_tree || host.workspace().is_shelved(target),
         backend_session: host.backend_session(target),
-        visible_lines: host.session(target).map(|s| s.visible_lines()),
+        live_tail: host
+            .session(target)
+            .map(|session| tail_join(session.visible_lines())),
     }
 }
 
-/// スナップショットから worker 状態を合成する。`claude agents --json` のサブプロセス
-/// 起動（実測 500〜1100ms）と tmux 往復を含むため、UI スレッドでは実行しないこと
-/// （#181: master のポーリングごとに UI が固まりスクロールがカクつく）。
-/// ControlHost 不要 = background executor で実行できる
-pub fn worker_status_compute(
-    snap: WorkerPaneSnapshot,
+fn finish_worker_status(
+    ctx: WorkerStatusCtx,
     session_id: Option<&str>,
     tmux_session: Option<&str>,
-) -> Value {
+) -> Result<Value, DispatchError> {
     use crate::orchestrator;
 
-    let pane_exists = snap.pane_exists;
+    let WorkerStatusCtx {
+        pane_exists,
+        backend_session,
+        live_tail,
+    } = ctx;
 
     // session_id の解決: 明示指定 > pane→session 自動解決 > フォールバック
     let (resolved_sid, status_source);
@@ -2586,8 +2676,8 @@ pub fn worker_status_compute(
         status_source = "agents";
     } else if pane_exists {
         // pane→session 自動解決: backend_session から pid 祖先辿り
-        if let Some(backend) = &snap.backend_session {
-            if let Some(sid) = crate::agents::resolve_session_id_for_backend(backend) {
+        if let Some(backend) = backend_session {
+            if let Some(sid) = crate::agents::resolve_session_id_for_backend(&backend) {
                 resolved_sid = Some(sid);
                 status_source = "agents-auto";
             } else {
@@ -2612,35 +2702,18 @@ pub fn worker_status_compute(
         ("gone".to_string(), None)
     };
 
-    // ペインの最近の出力を取得（pane → tmux session フォールバック）
-    let recent_output = snap
-        .visible_lines
-        .map(|mut lines| {
-            while lines.last().is_some_and(|l| l.is_empty()) {
-                lines.pop();
-            }
-            if lines.len() > 30 {
-                lines.drain(..lines.len() - 30);
-            }
-            lines.join("\n")
-        })
-        .or_else(|| {
-            // tmux session フォールバック: pane が gone でも tmux session が生きていれば読む
-            let ts = tmux_session?;
-            let socket = tako_core::tmux_backend::socket_name();
-            if !tako_core::tmux::session_alive(Some(&socket), ts) {
-                return None;
-            }
-            // tmux session が生きている = pane は gone だが worker は生存中
-            let mut lines = tako_core::tmux::capture_session(Some(&socket), ts).ok()?;
-            while lines.last().is_some_and(|l| l.is_empty()) {
-                lines.pop();
-            }
-            if lines.len() > 30 {
-                lines.drain(..lines.len() - 30);
-            }
-            Some(lines.join("\n"))
-        });
+    // ペインの最近の出力（pane のライブ画面 → tmux session フォールバック）
+    let recent_output = live_tail.or_else(|| {
+        // tmux session フォールバック: pane が gone でも tmux session が生きていれば読む
+        let ts = tmux_session?;
+        let socket = tako_core::tmux_backend::socket_name();
+        if !tako_core::tmux::session_alive(Some(&socket), ts) {
+            return None;
+        }
+        // tmux session が生きている = pane は gone だが worker は生存中
+        let lines = tako_core::tmux::capture_session(Some(&socket), ts).ok()?;
+        Some(tail_join(lines))
+    });
 
     // tmux session が生きていれば gone を取り消す（pane は無いが worker は健在）
     if status == "gone" {
@@ -2679,13 +2752,13 @@ pub fn worker_status_compute(
         }
     }
 
-    json!({
+    Ok(json!({
         "status": status,
         "ctx_percent": ctx_percent,
         "recent_output": recent_output,
         "status_source": status_source,
         "resolved_session_id": resolved_sid,
-    })
+    }))
 }
 
 /// worker が busy かどうかを画面出力で判定する。
@@ -5187,90 +5260,84 @@ mod tests {
         assert_eq!(list2["folders"].as_array().unwrap().len(), 0);
     }
 
-    // --- worker_status の snapshot / compute 分離（#181）---
+    // --- worker_status の collect / finish 分離（#181 → #168 で OffloadJob へ一本化）---
     // 以下は backend_session = None / session_id = None / tmux_session = None に固定し、
     // claude CLI / tmux のサブプロセスを一切呼ばない決定的な範囲だけを検証する
 
     #[test]
-    fn worker_status_snapshotがui状態を写し取る() {
+    fn collect_worker_status_ctxがui状態を写し取る() {
         let host = MockHost::new();
         let pane = host.root_pane();
-        let snap = worker_status_snapshot(&host, pane);
-        assert!(snap.pane_exists);
+        let ctx = collect_worker_status_ctx(&host, pane);
+        assert!(ctx.pane_exists);
         // MockHost は backend / セッション画面を持たない
-        assert_eq!(snap.backend_session, None);
-        assert!(snap.visible_lines.is_none());
+        assert_eq!(ctx.backend_session, None);
+        assert!(ctx.live_tail.is_none());
         // 存在しないペイン
-        let gone = worker_status_snapshot(&host, 999_999);
+        let gone = collect_worker_status_ctx(&host, 999_999);
         assert!(!gone.pane_exists);
     }
 
     #[test]
-    fn worker_status_computeがペイン不在でgoneを返す() {
-        let snap = WorkerPaneSnapshot {
+    fn finish_worker_statusがペイン不在でgoneを返す() {
+        let ctx = WorkerStatusCtx {
             pane_exists: false,
             backend_session: None,
-            visible_lines: None,
+            live_tail: None,
         };
-        let v = worker_status_compute(snap, None, None);
+        let v = finish_worker_status(ctx, None, None).unwrap();
         assert_eq!(v["status"], "gone");
         assert_eq!(v["status_source"], "none");
         assert!(v["recent_output"].is_null());
     }
 
     #[test]
-    fn worker_status_computeが画面からidle_busyを推定する() {
+    fn finish_worker_statusが画面からidle_busyを推定する() {
         // ❯ プロンプト行 = idle（backend 無しなので status_source は screen）
-        let idle = worker_status_compute(
-            WorkerPaneSnapshot {
+        let idle = finish_worker_status(
+            WorkerStatusCtx {
                 pane_exists: true,
                 backend_session: None,
-                visible_lines: Some(vec!["done".into(), "❯ ".into()]),
+                live_tail: Some("done\n❯ ".into()),
             },
             None,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(idle["status"], "idle");
         assert_eq!(idle["status_source"], "screen");
         // busy マーカー行 = busy
-        let busy = worker_status_compute(
-            WorkerPaneSnapshot {
+        let busy = finish_worker_status(
+            WorkerStatusCtx {
                 pane_exists: true,
                 backend_session: None,
-                visible_lines: Some(vec!["Thinking…".into(), "esc to interrupt".into()]),
+                live_tail: Some("Thinking…\nesc to interrupt".into()),
             },
             None,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(busy["status"], "busy");
         // 画面なし = unknown のまま
-        let unknown = worker_status_compute(
-            WorkerPaneSnapshot {
+        let unknown = finish_worker_status(
+            WorkerStatusCtx {
                 pane_exists: true,
                 backend_session: None,
-                visible_lines: None,
+                live_tail: None,
             },
             None,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(unknown["status"], "unknown");
     }
 
     #[test]
-    fn worker_status_computeが末尾空行を刈り30行に制限する() {
+    fn tail_joinが末尾空行を刈り30行に制限する() {
         let mut lines: Vec<String> = (1..=40).map(|i| format!("L{i}")).collect();
         lines.push(String::new());
         lines.push(String::new());
-        let v = worker_status_compute(
-            WorkerPaneSnapshot {
-                pane_exists: true,
-                backend_session: None,
-                visible_lines: Some(lines),
-            },
-            None,
-            None,
-        );
-        let out = v["recent_output"].as_str().unwrap();
+        let out = tail_join(lines);
         assert!(out.starts_with("L11"), "先頭 10 行が刈られる: {out}");
         assert!(out.ends_with("L40"), "末尾の空行が刈られる: {out}");
         assert_eq!(out.lines().count(), 30);
