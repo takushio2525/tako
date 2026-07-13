@@ -587,3 +587,12 @@
   分離で旧挙動維持（引き継ぎ検証で発見・修正）
 - 検証: 隔離セルフテスト完走（69c 全 7 判定パス）+ build / test / fmt / clippy 全緑
 - 次: tako 再起動 → manual-checks.md #153 節の GUI 確認
+
+## 2026-07-13（#159: ターミナルスクロールの大幅改善 — ピクセル単位化・ミラー方式・スクロールバー）
+- Zed エディタの行小数 scroll_position 方式をターミナルへ翻案: 直接ペインは
+  display_offset - fract 分解 + サブライン描画（visual-test 実ピクセル実証 direct=22197/shifted=0）。
+  バックエンド(tmux)ペインは copy-mode 駆動を廃止し capture ベースのローカル履歴ミラーへ
+  （tako-core::scroll_mirror 新設。行単位・往復レイテンシ・キー飲まれを構造解消）。
+  スクロールバーはホバー維持 + サム強調。CLI/MCP Scroll は ControlHost::backend_scroll_view で同一経路
+- 検証: 全テスト・隔離セルフテスト（44b/61b-61e 新設・更新）・visual-test 全緑
+- 次: merge + install 後に manual-checks.md「ターミナルスクロールの大幅改善」節の人手確認
