@@ -322,6 +322,28 @@ pub enum Request {
     PreviewApply { pane: Option<u64>, text: String },
     /// 編集バッファをファイルへ保存する。外部変更を検知した場合は上書きしない。
     PreviewSave { pane: Option<u64> },
+    /// undo（#195）
+    PreviewUndo { pane: Option<u64> },
+    /// redo（#195）
+    PreviewRedo { pane: Option<u64> },
+    /// 検索（#195）。query を指定してヒット一覧を返す。direction で次/前を移動
+    PreviewSearch {
+        pane: Option<u64>,
+        query: Option<String>,
+        direction: Option<String>,
+    },
+    /// 置換（#195）。query に一致する箇所を replacement で置換。all=true で全置換
+    PreviewReplace {
+        pane: Option<u64>,
+        query: String,
+        replacement: String,
+        all: Option<bool>,
+    },
+    /// 自動保存設定の取得・変更（#195）。enabled 省略時は状態取得のみ
+    PreviewAutosave {
+        pane: Option<u64>,
+        enabled: Option<bool>,
+    },
     /// ファイルシステム操作（FR-3.12）
     FileOp {
         op: FileOpKind,

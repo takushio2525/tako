@@ -37,7 +37,10 @@ actions!(
         SelectAll,
         OpenDirectory,
         OpenRepository,
-        NewWindow
+        NewWindow,
+        UndoPreview,
+        RedoPreview,
+        FindPreview
     ]
 );
 
@@ -80,6 +83,9 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-o", OpenDirectory, None),
         KeyBinding::new("cmd-shift-o", OpenRepository, None),
         KeyBinding::new("cmd-shift-n", NewWindow, None),
+        KeyBinding::new("cmd-z", UndoPreview, None),
+        KeyBinding::new("cmd-shift-z", RedoPreview, None),
+        KeyBinding::new("cmd-f", FindPreview, None),
     ]
 }
 
