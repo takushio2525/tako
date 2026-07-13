@@ -655,6 +655,26 @@ mod tests {
     }
 
     #[test]
+    fn agents一覧からの検出はpane対応と有効idだけを拾う() {
+        // 旧 agents::claude_session_ids_by_backend のマッピング検証を新 API で維持
+        let value = serde_json::json!({"agents": [
+            {"pane": "tako-a:0.0", "session_id": "session-a", "cwd": "/w/a", "model": "claude-fable-5"},
+            {"pane": "tako-b:1.2", "session_id": "session-b"},
+            {"pane": "tako-c:0.0", "session_id": "../../invalid"},
+            {"session_id": "pane-missing"},
+        ]});
+        let detected = detect_from_agents_value(&value);
+        assert_eq!(detected.len(), 2);
+        assert_eq!(detected[0].session_id, "session-a");
+        assert_eq!(detected[0].tmux_session, "tako-a");
+        assert_eq!(detected[0].agent_cwd.as_deref(), Some("/w/a"));
+        assert_eq!(detected[0].model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(detected[1].tmux_session, "tako-b");
+        // 空 agents は空
+        assert!(detect_from_agents_value(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
     fn issue番号の抽出() {
         assert_eq!(
             extract_issues("Issue #112 を実装。#157 と衝突注意"),
