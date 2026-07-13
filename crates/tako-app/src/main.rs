@@ -1492,6 +1492,7 @@ impl TakoApp {
                 };
                 app.sync_filetree_roots();
                 app.refresh_agent_metrics();
+                app.poll_webview_state();
                 app.save_layout();
                 let filetree_targets = if app.filetree.visible {
                     Some(app.filetree.refresh_targets())
@@ -5582,6 +5583,16 @@ impl TakoApp {
         self.webview_next_id += 1;
         self.webviews.push(entry);
         Ok(id)
+    }
+
+    /// 表示中の Web ビューのタイトル・URL を JS 評価で更新する（2 秒ポーリング）。
+    /// 結果はコールバック（次の runloop）で shared に届き、次回 render で反映される
+    fn poll_webview_state(&self) {
+        for e in &self.webviews {
+            if e.pane.is_some() {
+                e.poll_state();
+            }
+        }
     }
 
     /// dock の「表示」ボタン / dispatch 以外からの呼び出し口。表示中ならそのペインへ

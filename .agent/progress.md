@@ -574,3 +574,12 @@
 ## 2026-07-13（#145: プレビュー選択座標 / PDF / 編集色）
 - GPUI 実 shaping + 最近傍 UTF-8 キャレット、PDFKit 文字矩形、編集時 syntect 色を統合。selftest 40 の固定待ちと 66b-2 の二重 update、既存 PDF fixture も修正し全セルフテスト完走
 - 関連: PR #151 squash merge（`c5618ca`）+ install 済み。#150 は 3 件とも selftest panic と確認して close
+
+## 2026-07-13（#155: Web ビューを wry (WKWebView) ネイティブ統合へ全面刷新）
+- CDP ミラー PoC（座標ずれ・クリックのみ・Chrome 依存）を wry `build_as_child` へ置換。
+  直接操作（クリック/スクロール/IME = OS 配送）+ dock 退避/復帰（ページ生存）+ 永続化 +
+  ポート検知チップ統合。dispatch `Web` / CLI `tako web` / MCP `tako_web`（9 action、58 ツール不変）
+- タイトル追跡は ipc 不達（data: URL、実機診断で確定）のため eval 2 秒ポーリングへ。
+  検証: 487 tests / fmt / clippy 緑 + セルフテスト完走（項目 71 = webview e2e 8 操作）
+- 関連コミット: `03c3c45` `7b52c2f` + ポーリング修正（PR squash merge 予定）
+- 次: merge → install → 実機確認（manual-checks「Web ビューペイン」節）

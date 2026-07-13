@@ -211,6 +211,37 @@ impl WebViewEntry {
         }
     }
 
+    /// タイトル・URL を JS 評価で採取して shared へ書き戻す（2 秒ポーリングから呼ぶ）。
+    /// ipc（WKScriptMessageHandler）は data: URL 等で通知が届かないケースを実機で
+    /// 確認したため（#155 セルフテスト診断: eval は届くが ipc の title が空のまま）、
+    /// 実証済みの evaluate_script_with_callback 経路を正とし、ipc は http(s) ページでの
+    /// 即時更新用に併存させる
+    pub fn poll_state(&self) {
+        let shared = Arc::clone(&self.shared);
+        let _ = self.view.evaluate_script_with_callback(
+            "JSON.stringify({t:document.title||'',u:location.href||''})",
+            move |result| {
+                // 評価値は JS 文字列 = 「JSON 文字列を更に JSON 文字列化」した二重包み
+                let Ok(serde_json::Value::String(inner)) =
+                    serde_json::from_str::<serde_json::Value>(&result)
+                else {
+                    return;
+                };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&inner) else {
+                    return;
+                };
+                if let Ok(mut s) = shared.lock() {
+                    if let Some(t) = v.get("t").and_then(|x| x.as_str()) {
+                        s.title = t.to_string();
+                    }
+                    if let Some(u) = v.get("u").and_then(|x| x.as_str()) {
+                        s.url = u.to_string();
+                    }
+                }
+            },
+        );
+    }
+
     /// ナビゲーション操作。`to` は "back" / "forward" / "reload" / URL 文字列
     pub fn navigate(&self, to: &str) -> Result<(), String> {
         match to {
