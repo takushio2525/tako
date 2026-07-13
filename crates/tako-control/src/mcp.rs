@@ -863,13 +863,15 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_background_pane",
-            "description": "ペインをバックグラウンドへ送る。プロセスは生きたまま\
-                画面から外す。邪魔なペインを画面外へ送るのに使う。バックグラウンドのペインは\
-                tako_background_list で確認でき、tako_foreground_pane で画面に戻せる。",
+            "description": "ペインまたはタブをバックグラウンドへ送る。プロセスは生きたまま\
+                画面から外す。邪魔なペインやタブを画面外へ送るのに使う。バックグラウンドのペインは\
+                tako_background_list で確認でき、tako_foreground_pane で画面に戻せる。\
+                tab 指定時はタブ内全ペインを一括退避する（pane と tab は排他）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pane": { "type": "integer", "description": "バックグラウンドへ送るペインの ID（省略時は呼び出し元）" },
+                    "pane": { "type": "integer", "description": "バックグラウンドへ送るペインの ID（省略時は呼び出し元。tab と排他）" },
+                    "tab": { "type": "integer", "description": "バックグラウンドへ送るタブの ID（タブ内全ペインを一括退避。pane と排他）" },
                 },
                 "additionalProperties": false,
             },
@@ -2048,9 +2050,17 @@ fn build_request(
             pane: Some(target_pane(args, caller)?),
             target: str_arg(args, "target")?,
         },
-        "tako_background_pane" => Request::Background {
-            pane: Some(target_pane(args, caller)?),
-        },
+        "tako_background_pane" => {
+            let tab = u64_arg(args, "tab")?;
+            Request::Background {
+                pane: if tab.is_some() {
+                    None
+                } else {
+                    Some(target_pane(args, caller)?)
+                },
+                tab,
+            }
+        }
         "tako_foreground_pane" => Request::Foreground {
             pane: required_u64(args, "pane")?,
             target: u64_arg(args, "target")?,

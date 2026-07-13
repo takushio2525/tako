@@ -1171,9 +1171,12 @@ struct ToggleArgs {
 
 #[derive(Args)]
 struct BackgroundArgs {
-    /// バックグラウンドへ送るペイン ID（省略時は呼び出し元。TAKO_PANE_ID から自動解決）
+    /// バックグラウンドへ送るペイン ID（省略時は呼び出し元。--tab と排他）
     #[arg(long)]
     pane: Option<u64>,
+    /// バックグラウンドへ送るタブ ID（タブ内全ペインを一括退避。--pane と排他）
+    #[arg(long)]
+    tab: Option<u64>,
 }
 
 #[derive(Args)]
@@ -2638,7 +2641,12 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pinned: args.state.as_deref().map(|s| s == "on"),
         },
         Command::Background(args) => Request::Background {
-            pane: target_pane(args.pane)?,
+            pane: if args.tab.is_some() {
+                None
+            } else {
+                target_pane(args.pane)?
+            },
+            tab: args.tab,
         },
         Command::Foreground(args) => Request::Foreground {
             pane: args.pane,

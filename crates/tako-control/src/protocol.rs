@@ -363,8 +363,9 @@ pub enum Request {
         pane: Option<u64>,
         target: Option<String>,
     },
-    /// ペインをバックグラウンドへ送る（FR-2.15.1）。プロセスは生きたまま画面から外す
-    Background { pane: Option<u64> },
+    /// ペインまたはタブをバックグラウンドへ送る（FR-2.15.1）。プロセスは生きたまま画面から外す。
+    /// pane と tab は排他。tab 指定時はタブ内全ペインを一括退避する
+    Background { pane: Option<u64>, tab: Option<u64> },
     /// バックグラウンドからペインを復帰させる（FR-2.15.3 / FR-2.15.4）。`target` を
     /// `direction`（省略時は右）へ分割した位置に挿し直す。`target` 省略時は
     /// アクティブタブのフォーカス中ペインの隣
