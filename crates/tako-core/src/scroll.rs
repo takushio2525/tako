@@ -74,7 +74,7 @@ impl ScrollTarget {
     /// 末尾コロン必須: `=name` 単体はペインターゲットとして解決されない
     /// （copy-mode / send-keys が "can't find pane" になる。2026-06-12 検証）。
     /// ネスト先が分割されている場合はアクティブペインへの近似（制約は FR-2.17 メモ）
-    fn locate(&self) -> (Option<&str>, String) {
+    pub(crate) fn locate(&self) -> (Option<&str>, String) {
         match self {
             ScrollTarget::Backend { socket, session } => {
                 (Some(socket.as_str()), format!("={session}:"))

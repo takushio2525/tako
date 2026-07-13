@@ -12,6 +12,7 @@ pub mod paths;
 pub mod ports;
 pub mod screen;
 pub mod scroll;
+pub mod scroll_mirror;
 pub mod shell_integration;
 pub mod spawn_layout;
 pub mod tab;

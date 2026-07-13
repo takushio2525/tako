@@ -456,6 +456,8 @@ mod tests {
             cursor: None,
             ime_cursor: None,
             display_offset: 0,
+            fract: 0.0,
+            extra_bottom: None,
         }
     }
 
