@@ -106,6 +106,20 @@ impl TakoApp {
                         "BG".into()
                     })
             })
+            .child({
+                // Web ビュー dock（FR-3.8 / #155）: 開いたページの一覧・呼び出し・破棄
+                let web_count = self.webviews.len();
+                toggle("statusbar-web", self.webview_dock_open)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.webview_dock_open = !this.webview_dock_open;
+                        cx.notify();
+                    }))
+                    .child(if web_count > 0 {
+                        format!("🌐 {web_count}")
+                    } else {
+                        "🌐".into()
+                    })
+            })
             .children(fleet_label.map(|worker_count| {
                 div()
                     .flex()

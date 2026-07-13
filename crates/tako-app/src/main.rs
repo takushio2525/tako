@@ -620,8 +620,20 @@ struct TakoApp {
     preview_text_layouts: HashMap<PaneId, Vec<Option<TextLayout>>>,
     /// プレビューの行ごとのプレーンテキスト（選択テキスト抽出用）
     preview_line_texts: HashMap<PaneId, Vec<String>>,
-    /// CDP ミラー方式 Web ビュー（FR-3.8 PoC）
-    webviews: webview::WebViews,
+    /// ネイティブ Web ビュー（FR-3.8 / #155）。表示中 + dock 退避中の全ページを
+    /// ペインから独立に保持する（ペインを閉じてもページ = wry WebView が生きる）
+    webviews: Vec<webview::WebViewEntry>,
+    /// Web ビューの dock 管理用 ID 採番
+    webview_next_id: u64,
+    /// 今フレームで描画された Web ビュー（render 末尾の可視性同期で使う）
+    webview_marks: std::collections::HashSet<webview::WebViewId>,
+    /// Web ビュー dock パネルの開閉（ステータスバーの 🌐 ボタン）
+    webview_dock_open: bool,
+    /// wry の親にする GPUI ウィンドウの生ハンドル（初回 render で採取）
+    window_raw_handle: Option<webview::WindowHandleBox>,
+    /// 起動復元で開き直す Web ビュー（ペイン対応, URL）。ウィンドウハンドルが
+    /// 要るため初回 render で消費する
+    pending_webview_restore: Vec<(Option<u64>, String)>,
     /// アプリ内自動更新の状態
     update_state: update_checker::UpdateState,
     /// グリフ advance がセル幅（半角 1 セル）と一致するかのキャッシュ（Issue #64）。
@@ -1192,6 +1204,8 @@ impl TakoApp {
         let mut restored: Vec<tako_control::layout::RestoredPane> = Vec::new();
         let mut collapsed_tmux_tabs: std::collections::HashSet<TabId> =
             std::collections::HashSet::new();
+        // Web ビュー dock の退避分（#155。表示分は RestoredPane.webview で運ばれる）
+        let mut webview_dock_restore: Vec<String> = Vec::new();
         let (workspace, restore_report) = if let Some(reason) = &secondary_reason {
             let msg = format!(
                 "復元スキップ: {reason}のためセカンダリモードで起動\
@@ -1208,6 +1222,7 @@ impl TakoApp {
                     .iter()
                     .map(|id| TabId::from_raw(*id))
                     .collect();
+                webview_dock_restore = file.webview_dock.clone();
                 tako_control::layout::restore(&file)
             });
             match loaded {
@@ -1335,7 +1350,12 @@ impl TakoApp {
             preview_pdf_highlight_paint_count: HashMap::new(),
             preview_text_layouts: HashMap::new(),
             preview_line_texts: HashMap::new(),
-            webviews: HashMap::new(),
+            webviews: Vec::new(),
+            webview_next_id: 1,
+            webview_marks: std::collections::HashSet::new(),
+            webview_dock_open: false,
+            window_raw_handle: None,
+            pending_webview_restore: Vec::new(),
             update_state: update_checker::UpdateState::Idle,
             glyph_snap_cache: std::cell::RefCell::new(HashMap::new()),
             text_system: cx.text_system().clone(),
@@ -1383,6 +1403,13 @@ impl TakoApp {
                     }
                     app.previews.insert(pane, state);
                     restored_previews += 1;
+                    continue;
+                }
+                // Web ビューペイン（FR-3.8 / #155）は URL を開き直すだけ（PTY は起動しない）。
+                // wry の生成にはウィンドウハンドルが要るため初回 render まで遅延する
+                if let Some(url) = &r.webview {
+                    app.pending_webview_restore
+                        .push((Some(r.pane), url.clone()));
                     continue;
                 }
                 let backend_alive = r.session.as_ref().is_some_and(|name| {
@@ -1435,7 +1462,10 @@ impl TakoApp {
                     fresh_shells += 1;
                 }
             }
-            if app.terminals.is_empty() && app.previews.is_empty() {
+            if app.terminals.is_empty()
+                && app.previews.is_empty()
+                && app.pending_webview_restore.is_empty()
+            {
                 eprintln!("fatal: 復元したペインを 1 つも起動できない");
                 std::process::exit(1);
             }
@@ -1454,6 +1484,10 @@ impl TakoApp {
             for (pane, path, text) in std::mem::take(&mut app.pending_highlights) {
                 app.spawn_highlight(pane, path, text, cx);
             }
+        }
+        // Web ビュー dock の退避分（ペイン無し）も初回 render で開き直す（#155）
+        for url in webview_dock_restore {
+            app.pending_webview_restore.push((None, url));
         }
 
         // 起動時の orphan 一括クリーンアップ（FR-2.16.11）。復元で backend_sessions が
@@ -1618,6 +1652,7 @@ impl TakoApp {
                 };
                 app.sync_filetree_roots();
                 app.refresh_agent_metrics();
+                app.poll_webview_state();
                 app.save_layout();
                 let filetree_targets = if app.filetree.visible {
                     Some(app.filetree.refresh_targets())
@@ -2065,11 +2100,36 @@ impl TakoApp {
         cx.notify();
     }
 
-    /// 提案チップの承諾（FR-2.4.3）。プレビューを開いてチップを畳む
+    /// 提案チップの承諾（FR-2.4.3）。Web ビューペイン（FR-3.8 / #155）で検知元ペインの
+    /// 隣にプレビューを開いてチップを畳む。webview を作れない場合は外部ブラウザへ
+    /// フォールバックする
     fn accept_port_suggestion(&mut self, pane: PaneId, port: u16, cx: &mut Context<Self>) {
         self.port_suggestions
             .retain(|s| !(s.pane == pane && s.port == port));
-        open_preview(&format!("http://localhost:{port}"));
+        let url = format!("http://localhost:{port}");
+        // セルフテスト中は実ページを開かずチップの状態遷移だけ検証する（既存方針）
+        if std::env::var_os("TAKO_SELF_TEST").is_some() {
+            cx.notify();
+            return;
+        }
+        let opened = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::Web {
+                action: "open".into(),
+                url: Some(url.clone()),
+                id: None,
+                pane: Some(pane.as_u64()),
+                direction: None,
+                to: None,
+                js: None,
+                token: None,
+            },
+            PaneOrigin::User,
+        );
+        if let Err(e) = opened {
+            eprintln!("warning: Web ビューを開けないため外部ブラウザへ委譲: {e}");
+            open_preview(&url);
+        }
         cx.notify();
     }
 
@@ -3008,6 +3068,12 @@ impl TakoApp {
     /// プロセス・tmux セッションは生かしたまま、ツリーから外してバックグラウンドに移す。
     /// 最後のタブの最後のペインのときは代替ペインを生やしてからバックグラウンドする
     fn background_pane_button(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        // Web ビューペインはターミナル用のたまり場ではなく Web ビュー dock へ退避する
+        // （たまり場はスクリーンサムネイル前提で、webview には端末画面が無い）
+        if self.webviews.iter().any(|e| e.pane == Some(pane_id)) {
+            self.webview_hide_button(pane_id, cx);
+            return;
+        }
         match self.workspace.shelve_pane(pane_id) {
             Ok(()) => {}
             Err(WorkspaceError::LastTab) => {
@@ -3137,6 +3203,7 @@ impl TakoApp {
                 self.scroll_ctls.remove(&pane_id);
                 self.pane_font_sizes.remove(&pane_id);
                 self.pane_cell_sizes.remove(&pane_id);
+                self.dock_webview_of(pane_id);
                 self.drop_tmux_view_session(pane_id);
                 self.drop_backend_session_with(pane_id, reason);
             }
@@ -3174,6 +3241,7 @@ impl TakoApp {
                     self.preview_line_texts.remove(&id);
                     self.scroll_accum.remove(&id);
                     self.scroll_ctls.remove(&id);
+                    self.dock_webview_of(id);
                     self.drop_tmux_view_session(id);
                     self.drop_backend_session_with(id, reason);
                 }
@@ -3275,6 +3343,7 @@ impl TakoApp {
         let claude_resume_sessions = &self.claude_resume_sessions;
         let terminals = &self.terminals;
         let previews = &self.previews;
+        let webviews = &self.webviews;
         let mut layout = tako_control::layout::capture(
             &self.workspace,
             &|pane| tako_control::layout::PaneMeta {
@@ -3290,6 +3359,10 @@ impl TakoApp {
                         path: p.path.display().to_string(),
                         mode: p.mode.to_wire().as_str().to_string(),
                     }),
+                webview: webviews
+                    .iter()
+                    .find(|e| e.pane == Some(pane))
+                    .map(|e| e.current_url()),
             },
             self.window_frame.clone(),
         );
@@ -3299,6 +3372,20 @@ impl TakoApp {
             .iter()
             .filter(|t| self.workspace.get_tab(**t).is_some())
             .map(|t| t.as_u64())
+            .collect();
+        // Web ビュー dock の退避分（#155）。表示分は PaneMeta.webview で tree に載る。
+        // まだ開き直していない復元待ち（初回 render 前の保存）も失わずに引き継ぐ
+        layout.webview_dock = self
+            .webviews
+            .iter()
+            .filter(|e| e.pane.is_none())
+            .map(|e| e.current_url())
+            .chain(
+                self.pending_webview_restore
+                    .iter()
+                    .filter(|(pane, _)| pane.is_none())
+                    .map(|(_, url)| url.clone()),
+            )
             .collect();
         let Ok(json) = serde_json::to_string(&layout) else {
             return;
@@ -5463,61 +5550,74 @@ impl TakoApp {
         &mut self,
         pane_id: PaneId,
         rect: Rect,
+        area: Bounds<Pixels>,
         focused: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme.clone();
-        let wv = self.webviews.get(&pane_id);
+        let Some(idx) = self.webviews.iter().position(|e| e.pane == Some(pane_id)) else {
+            // 呼び出し側で存在確認済み。万一消えていたら空枠だけ描く
+            return div().id(("pane", pane_id.as_u64()));
+        };
+        let id = self.webviews[idx].id;
+        let url = self.webviews[idx].current_url();
+        let title = self.webviews[idx].current_title();
+        let loading = self.webviews[idx].is_loading();
 
-        let url_label = wv.map(|w| w.url.clone()).unwrap_or_default();
-        let screenshot_bytes = wv.and_then(|w| w.screenshot.lock().ok()?.clone());
+        // 本文領域 = pane_text_areas と同じ絶対座標（タイトルバー・枠・パディングの内側）。
+        // GPUI の Pixels は論理座標なので wry の Logical bounds へそのまま渡せる。
+        // 実描画はネイティブ webview 自身が行い、GPUI 側は枠とタイトルバーだけを描く
+        self.webview_marks.insert(id);
+        let bounds = (
+            f64::from(f32::from(area.origin.x)),
+            f64::from(f32::from(area.origin.y)),
+            f64::from(f32::from(area.size.width)),
+            f64::from(f32::from(area.size.height)),
+        );
+        self.webviews[idx].sync_frame(Some(bounds));
 
-        let vp_width = wv.map(|w| w.viewport_width).unwrap_or(1280) as f32;
-        let vp_height = wv.map(|w| w.viewport_height).unwrap_or(800) as f32;
-
-        let body: gpui::AnyElement = if let Some(bytes) = screenshot_bytes {
-            let image = std::sync::Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes));
+        let display_title = if title.trim().is_empty() {
+            url.clone()
+        } else {
+            title
+        };
+        // ← / → / ⟳ のナビゲーションボタン（webview 本体はネイティブが処理するため、
+        // GPUI 側 UI はタイトルバーに限られる）
+        let nav_button = |icon: &'static str,
+                          to: &'static str,
+                          cx: &mut Context<Self>|
+         -> gpui::Stateful<gpui::Div> {
             div()
-                .flex_1()
+                .id((to, pane_id.as_u64()))
+                .w(px(20.0))
+                .h(px(18.0))
                 .flex()
                 .items_center()
                 .justify_center()
-                .overflow_hidden()
-                .child(
-                    gpui::img(image)
-                        .object_fit(gpui::ObjectFit::Contain)
-                        .max_w_full()
-                        .max_h_full(),
-                )
+                .rounded_sm()
+                .cursor_pointer()
+                .text_size(px(12.0))
+                .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.9))
+                .hover(|d| {
+                    d.bg(rgba_alpha(theme.surface_2, 0.9))
+                        .text_color(hsla(theme.foreground))
+                })
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, ev: &MouseDownEvent, _window, _cx| {
-                        let click_x = f32::from(ev.position.x) / vp_width;
-                        let click_y = f32::from(ev.position.y) / vp_height;
-                        if let Some(wv) = this.webviews.get(&pane_id) {
-                            webview::send_click(
-                                wv,
-                                (click_x * vp_width) as f64,
-                                (click_y * vp_height) as f64,
-                            );
+                    cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if let Some(e) = this.webviews.iter().find(|e| e.pane == Some(pane_id)) {
+                        if let Err(err) = e.navigate(to) {
+                            eprintln!("warning: webview navigate({to}) 失敗: {err}");
                         }
-                    }),
-                )
-                .into_any_element()
-        } else {
-            div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    div()
-                        .text_size(px(14.0))
-                        .text_color(hsla(theme.tab_inactive_foreground))
-                        .child("Chrome に接続中..."),
-                )
-                .into_any_element()
+                    }
+                    cx.notify();
+                }))
+                .child(icon)
         };
+        let body = div().flex_1().bg(rgba(theme.background));
 
         div()
             .id(("pane", pane_id.as_u64()))
@@ -5591,7 +5691,7 @@ impl TakoApp {
                         PaneDrag { pane: pane_id },
                         self.drag_ghost_builder(
                             DragKind::Pane,
-                            format!("🌐 {}", truncate(&url_label, 24)),
+                            format!("🌐 {}", truncate(&display_title, 24)),
                             cx,
                         ),
                     )
@@ -5616,10 +5716,39 @@ impl TakoApp {
                             )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                this.close_pane_button(pane_id, cx);
+                                this.webview_close_button(pane_id, cx);
                             }))
                             .child("×"),
                     )
+                    .child(
+                        // ー = dock へ退避（ページは生きたまま。たまり場の ー と同じ作法）
+                        div()
+                            .id(("pane-web-hide", pane_id.as_u64()))
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
+                            .hover(|d| {
+                                d.bg(rgba_alpha(theme.surface_2, 0.9))
+                                    .text_color(hsla(theme.foreground))
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.webview_hide_button(pane_id, cx);
+                            }))
+                            .child("ー"),
+                    )
+                    .child(nav_button("←", "back", cx))
+                    .child(nav_button("→", "forward", cx))
+                    .child(nav_button(if loading { "…" } else { "⟳" }, "reload", cx))
                     .child(
                         div()
                             .text_color(if focused {
@@ -5629,12 +5758,286 @@ impl TakoApp {
                             })
                             .child(SharedString::from(format!(
                                 "🌐 {}",
-                                truncate(&url_label, 36)
+                                truncate(&display_title, 32)
                             ))),
                     )
-                    .child(div().flex_grow(1.0)),
+                    .child(
+                        // URL 表示（タイトルの右に控えめに。編集は CLI / MCP / cmd+K 経由）
+                        div()
+                            .flex_grow(1.0)
+                            .overflow_hidden()
+                            .text_size(px(10.0))
+                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.7))
+                            .child(SharedString::from(truncate(&url, 48))),
+                    ),
             )
             .child(body)
+    }
+
+    /// Web ビューペインの × = ページごと完全破棄（ブラウザのタブ × と同じ）。
+    /// 先に webviews から外す（remove_pane 側の dock 退避を発火させない）
+    fn webview_close_button(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        if let Some(idx) = self.webviews.iter().position(|e| e.pane == Some(pane_id)) {
+            self.webviews.remove(idx);
+        }
+        self.remove_pane(pane_id, cx);
+    }
+
+    /// Web ビューペインの ー = ペインから外して dock へ退避（ページは生きたまま）。
+    /// remove_pane 側の webview 後始末が pane 紐付けを解いて dock 落ちさせる
+    fn webview_hide_button(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        self.remove_pane(pane_id, cx);
+    }
+
+    /// ペインから外れた Web ビューを dock 退避に落とす（ページ = wry インスタンスは
+    /// 生かす。#155「ブラウザタブの維持」）。ペイン close の全経路
+    /// （×・ー・タブ close・dispatch close）から呼ばれる。完全破棄は
+    /// `webview_close_button` / dispatch `web close` が先に webviews から外して行う
+    fn dock_webview_of(&mut self, pane: PaneId) {
+        if let Some(e) = self.webviews.iter_mut().find(|e| e.pane == Some(pane)) {
+            e.pane = None;
+            e.sync_frame(None);
+        }
+    }
+
+    /// wry WebView を生成して webviews に登録する（表示先ペインは呼び出し側が設定）
+    fn create_webview(&mut self, url: &str) -> Result<webview::WebViewId, String> {
+        let handle = self
+            .window_raw_handle
+            .as_ref()
+            .ok_or("ウィンドウ初期化前のため Web ビューを作れない（直後に再試行）")?;
+        let id = webview::WebViewId(self.webview_next_id);
+        let entry = webview::WebViewEntry::build(handle, id, url)?;
+        self.webview_next_id += 1;
+        self.webviews.push(entry);
+        Ok(id)
+    }
+
+    /// 表示中の Web ビューのタイトル・URL を JS 評価で更新する（2 秒ポーリング）。
+    /// 結果はコールバック（次の runloop）で shared に届き、次回 render で反映される
+    fn poll_webview_state(&self) {
+        for e in &self.webviews {
+            if e.pane.is_some() {
+                e.poll_state();
+            }
+        }
+    }
+
+    /// dock の「表示」ボタン / dispatch 以外からの呼び出し口。表示中ならそのペインへ
+    /// フォーカス（タブ切替込み）、dock 退避中ならフォーカスペインを右分割して表示する
+    fn webview_show_from_dock(&mut self, id: webview::WebViewId, cx: &mut Context<Self>) {
+        let Some(entry) = self.webviews.iter().find(|e| e.id == id) else {
+            return;
+        };
+        if let Some(p) = entry.pane {
+            let tab = self
+                .workspace
+                .tabs()
+                .iter()
+                .find(|t| t.tree().contains(p))
+                .map(|t| t.id());
+            if let Some(tab) = tab {
+                if let Some(t) = self.workspace.get_tab_mut(tab) {
+                    let _ = t.tree_mut().focus(p);
+                }
+                let _ = self.workspace.activate_tab(tab);
+            }
+        } else {
+            let target = self.workspace.active_tab().tree().focused();
+            let new_pane = Pane::new(PaneOrigin::User);
+            let new_id = new_pane.id();
+            if self
+                .workspace
+                .active_tab_mut()
+                .tree_mut()
+                .split_with_ratio(target, SplitDirection::Right, 0.5, new_pane)
+                .is_ok()
+            {
+                if let Some(e) = self.webviews.iter_mut().find(|e| e.id == id) {
+                    e.pane = Some(new_id);
+                }
+                let _ = self.workspace.active_tab_mut().tree_mut().focus(new_id);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Web ビュー dock（#155）。ステータスバーの Web ボタンで開閉する下部パネル。
+    /// 全ページ（表示中 + 退避中）を一覧し、ワンクリックで呼び出し / 破棄できる。
+    /// flex 列（ドロワーと同じ層）に挟まるためペインエリアが縮み、webview とは重ならない
+    fn render_webview_dock(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if !self.webview_dock_open {
+            return None;
+        }
+        let theme = self.theme.clone();
+        let entries: Vec<(webview::WebViewId, String, String, Option<PaneId>)> = self
+            .webviews
+            .iter()
+            .map(|e| (e.id, e.current_title(), e.current_url(), e.pane))
+            .collect();
+        let empty = entries.is_empty();
+        let rows: Vec<_> = entries
+            .into_iter()
+            .map(|(id, title, url, pane)| {
+                let display_title = if title.trim().is_empty() {
+                    url.clone()
+                } else {
+                    title
+                };
+                div()
+                    .id(("webdock-row", id.as_u64()))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .h(px(26.0))
+                    .px(px(8.0))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgba(theme.surface_hover)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.webview_show_from_dock(id, cx);
+                    }))
+                    .child(
+                        div()
+                            .w(px(6.0))
+                            .h(px(6.0))
+                            .rounded_full()
+                            .bg(if pane.is_some() {
+                                hsla(theme.accent)
+                            } else {
+                                hsla_alpha(theme.tab_inactive_foreground, 0.5)
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(hsla(theme.foreground))
+                            .child(SharedString::from(format!(
+                                "🌐 {}",
+                                truncate(&display_title, 36)
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_size(px(10.0))
+                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.7))
+                            .child(SharedString::from(truncate(&url, 56))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
+                            .child(if pane.is_some() {
+                                "表示中"
+                            } else {
+                                "退避中"
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id(("webdock-close", id.as_u64()))
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
+                            .hover(|d| {
+                                d.bg(rgba_alpha(theme.red, 0.25))
+                                    .text_color(hsla(theme.foreground))
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if let Some(shown) = this.web_destroy(id.as_u64()) {
+                                    this.remove_pane(shown, cx);
+                                }
+                                if this.webviews.is_empty() {
+                                    this.webview_dock_open = false;
+                                }
+                                cx.notify();
+                            }))
+                            .child("×"),
+                    )
+            })
+            .collect();
+        Some(
+            div()
+                .flex_none()
+                .w_full()
+                .max_h(px(180.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .p(px(6.0))
+                .bg(rgba(theme.surface_0))
+                .border_t_1()
+                .border_color(hsla(theme.border_subtle))
+                .overflow_hidden()
+                .when(empty, |d| {
+                    d.child(
+                        div()
+                            .p(px(8.0))
+                            .text_size(px(11.0))
+                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.7))
+                            .child(
+                                "Web ビューは無い（tako web open <URL> または AI に依頼で開く）",
+                            ),
+                    )
+                })
+                .children(rows),
+        )
+    }
+
+    /// render 末尾の可視性同期。今フレームで描画されなかった Web ビュー
+    /// （非アクティブタブ・dock 退避中）と、D&D 中の全 Web ビューを隠す
+    /// （ネイティブビューは GPUI のドロップターゲット描画より上に来るため）。
+    /// 描画済み集合（webview_marks）はここで消費する
+    fn sync_webview_visibility(&mut self, hide_all: bool) {
+        let marks = std::mem::take(&mut self.webview_marks);
+        for e in &mut self.webviews {
+            if hide_all || !marks.contains(&e.id) {
+                e.sync_frame(None);
+            }
+        }
+    }
+
+    /// 起動復元分の Web ビューを開き直す（初回 render でハンドル採取後に呼ぶ）。
+    /// 保存時のペイン ID は Phase 5.5 の同一 ID 復元で現ワークスペースにも存在する
+    fn restore_webviews(&mut self) {
+        let pending = std::mem::take(&mut self.pending_webview_restore);
+        for (pane, url) in pending {
+            match self.create_webview(&url) {
+                Ok(id) => {
+                    if let Some(raw) = pane {
+                        let target = self
+                            .workspace
+                            .tabs()
+                            .iter()
+                            .flat_map(|t| t.tree().panes())
+                            .map(|p| p.id())
+                            .find(|p| p.as_u64() == raw);
+                        if target.is_none() {
+                            eprintln!(
+                                "warning: Web ビュー復元: ペイン {raw} が見つからないため dock へ退避 ({url})"
+                            );
+                        }
+                        if let Some(e) = self.webviews.iter_mut().find(|e| e.id == id) {
+                            e.pane = target;
+                        }
+                    }
+                }
+                Err(err) => eprintln!("warning: Web ビュー復元失敗 ({url}): {err}"),
+            }
+        }
     }
 
     fn render_pane(
@@ -5645,10 +6048,10 @@ impl TakoApp {
         focused: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        // CDP ミラー方式 Web ビューペイン（FR-3.8 PoC）
-        if self.webviews.contains_key(&pane_id) {
+        // ネイティブ Web ビューペイン（FR-3.8 / #155）
+        if self.webviews.iter().any(|e| e.pane == Some(pane_id)) {
             return self
-                .render_webview_pane(pane_id, rect, focused, cx)
+                .render_webview_pane(pane_id, rect, area, focused, cx)
                 .into_any_element();
         }
         // プレビューペイン（FR-3.2 / FR-3.3）はターミナルではなくファイル内容を描く
@@ -6229,7 +6632,7 @@ impl ControlHost for TakoApp {
         self.terminals.remove(&pane);
         self.previews.remove(&pane);
         self.preview_edits.remove(&pane);
-        self.webviews.remove(&pane);
+        self.dock_webview_of(pane);
         self.scroll_accum.remove(&pane);
         self.scroll_ctls.remove(&pane);
         self.drop_tmux_view_session(pane);
@@ -6576,10 +6979,148 @@ impl ControlHost for TakoApp {
         tako_control::remote::daemon_status()
     }
 
-    fn open_chrome(&mut self, pane: PaneId, url: &str) -> Result<(), String> {
-        let state = webview::launch_chrome(url, 9222, 1280, 800)?;
-        self.webviews.insert(pane, state);
-        Ok(())
+    fn web_open(&mut self, pane: PaneId, url: &str) -> Result<serde_json::Value, String> {
+        let id = self.create_webview(&webview::normalize_url(url))?;
+        let e = self
+            .webviews
+            .iter_mut()
+            .find(|e| e.id == id)
+            .expect("直前に生成した webview");
+        e.pane = Some(pane);
+        Ok(serde_json::json!({
+            "id": id.as_u64(),
+            "pane": pane.as_u64(),
+            "url": e.current_url(),
+        }))
+    }
+
+    fn web_show(&mut self, pane: PaneId, id: u64) -> Result<serde_json::Value, String> {
+        let e = self
+            .webviews
+            .iter_mut()
+            .find(|e| e.id.as_u64() == id)
+            .ok_or(format!("Web ビュー {id} が見つからない（web list で確認）"))?;
+        if e.pane.is_some() {
+            return Err(format!("Web ビュー {id} は表示中"));
+        }
+        e.pane = Some(pane);
+        Ok(serde_json::json!({
+            "id": id,
+            "pane": pane.as_u64(),
+            "url": e.current_url(),
+        }))
+    }
+
+    fn web_list(&self) -> serde_json::Value {
+        serde_json::Value::Array(
+            self.webviews
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "id": e.id.as_u64(),
+                        "url": e.current_url(),
+                        "title": e.current_title(),
+                        "pane": e.pane.map(|p| p.as_u64()),
+                        "loading": e.is_loading(),
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn web_target(
+        &self,
+        id: Option<u64>,
+        pane: Option<u64>,
+    ) -> Result<(u64, Option<PaneId>), String> {
+        if let Some(id) = id {
+            let e = self
+                .webviews
+                .iter()
+                .find(|e| e.id.as_u64() == id)
+                .ok_or(format!("Web ビュー {id} が見つからない（web list で確認）"))?;
+            return Ok((id, e.pane));
+        }
+        if let Some(raw) = pane {
+            let e = self
+                .webviews
+                .iter()
+                .find(|e| e.pane.map(|p| p.as_u64()) == Some(raw))
+                .ok_or(format!("ペイン {raw} に Web ビューは表示されていない"))?;
+            return Ok((e.id.as_u64(), e.pane));
+        }
+        // 省略時: 表示中がちょうど 1 つならそれを対象にする
+        let shown: Vec<&webview::WebViewEntry> =
+            self.webviews.iter().filter(|e| e.pane.is_some()).collect();
+        match shown.len() {
+            0 => Err("表示中の Web ビューが無い（id か pane で指定）".into()),
+            1 => Ok((shown[0].id.as_u64(), shown[0].pane)),
+            n => Err(format!(
+                "表示中の Web ビューが {n} 個ある（id か pane で指定）"
+            )),
+        }
+    }
+
+    fn web_destroy(&mut self, id: u64) -> Option<PaneId> {
+        let idx = self.webviews.iter().position(|e| e.id.as_u64() == id)?;
+        let entry = self.webviews.remove(idx);
+        entry.pane
+    }
+
+    fn web_navigate(&mut self, id: u64, to: &str) -> Result<serde_json::Value, String> {
+        let e = self
+            .webviews
+            .iter()
+            .find(|e| e.id.as_u64() == id)
+            .ok_or(format!("Web ビュー {id} が見つからない"))?;
+        e.navigate(to)?;
+        Ok(serde_json::json!({ "id": id, "navigated": to }))
+    }
+
+    fn web_eval(&mut self, id: u64, js: &str) -> Result<serde_json::Value, String> {
+        let e = self
+            .webviews
+            .iter_mut()
+            .find(|e| e.id.as_u64() == id)
+            .ok_or(format!("Web ビュー {id} が見つからない"))?;
+        let token = e.eval(js)?;
+        Ok(serde_json::json!({
+            "id": id,
+            "token": token,
+            "hint": "結果は action=eval_result で回収（未完なら pending: true）",
+        }))
+    }
+
+    fn web_eval_result(&mut self, id: u64, token: u64) -> Result<serde_json::Value, String> {
+        let e = self
+            .webviews
+            .iter()
+            .find(|e| e.id.as_u64() == id)
+            .ok_or(format!("Web ビュー {id} が見つからない"))?;
+        match e.take_eval_result(token) {
+            Some(result) => {
+                // wry の callback は評価結果を JSON 文字列で渡す。可能なら構造化して返す
+                let value: serde_json::Value =
+                    serde_json::from_str(&result).unwrap_or(serde_json::Value::String(result));
+                Ok(serde_json::json!({ "id": id, "token": token, "result": value }))
+            }
+            None => Ok(serde_json::json!({ "id": id, "token": token, "pending": true })),
+        }
+    }
+
+    fn web_read(&self, id: u64) -> Result<serde_json::Value, String> {
+        let e = self
+            .webviews
+            .iter()
+            .find(|e| e.id.as_u64() == id)
+            .ok_or(format!("Web ビュー {id} が見つからない"))?;
+        Ok(serde_json::json!({
+            "id": id,
+            "url": e.current_url(),
+            "title": e.current_title(),
+            "loading": e.is_loading(),
+            "pane": e.pane.map(|p| p.as_u64()),
+        }))
     }
     fn update_status(&self) -> serde_json::Value {
         update_checker::update_status_json()
@@ -6876,6 +7417,14 @@ fn clamp_ime_range_start(
 
 impl Render for TakoApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Web ビュー（FR-3.8）: wry の親にするウィンドウハンドルは render でしか
+        // 採取できないため、初回 render で保存し、復元待ちの Web ビューを開き直す
+        if self.window_raw_handle.is_none() {
+            self.window_raw_handle = webview::WindowHandleBox::from_window(window);
+            if self.window_raw_handle.is_some() {
+                self.restore_webviews();
+            }
+        }
         let cell = self.measure_cell(window);
         {
             let pane_ids: Vec<PaneId> = self.pane_font_sizes.keys().copied().collect();
@@ -6960,6 +7509,12 @@ impl Render for TakoApp {
             })
             .collect();
         let _ = cell;
+
+        // Web ビューの可視性同期: 今フレームで描画されなかったもの（非アクティブタブ・
+        // dock 退避中）と、D&D 中の全 Web ビューを隠す（ネイティブビューは GPUI の
+        // ドロップターゲット描画より上に来るため、ドラッグ中は GPUI 描画を優先する）
+        let hide_webviews = self.drag_kind.is_some() && cx.has_active_drag();
+        self.sync_webview_visibility(hide_webviews);
 
         // D&D 中のみ、各ペインにドロップ先オーバーレイを重ねる（FR-2.16.10 / FR-3.11）。
         // gpui 側のドラッグが外部要因（Esc 等）で消えたフレームでは出さない
@@ -7249,6 +7804,7 @@ impl Render for TakoApp {
                     .children(self.render_panel(cx)),
             )
             .children(self.render_drawer(cx))
+            .children(self.render_webview_dock(cx))
             .child(self.render_status_bar(cx))
             .child(ime_registration)
             .children(context_menu_overlay)
@@ -11975,6 +12531,297 @@ mod self_test {
                     .unwrap_or(false);
                 check(pdf_ok, "PDF プレビュー（FR-3.4。Core Graphics レンダリング）");
                 let _ = std::fs::remove_dir_all(&pdf_dir);
+            }
+
+            // 71. Web ビューペイン e2e（FR-3.8 / #155）: wry ネイティブ webview の
+            //     open → list → read（タイトル追跡）→ navigate → eval → hide → show → close。
+            //     ページは data: URL（外部ネットワーク不要）。dispatch 直呼び = CLI / MCP と
+            //     同一経路（開発不変条件。引数変換は mcp.rs / tako-cli の単体テストが担保）
+            {
+                #[allow(clippy::too_many_arguments)]
+                fn web_req(
+                    action: &str,
+                    url: Option<&str>,
+                    id: Option<u64>,
+                    to: Option<&str>,
+                    js: Option<&str>,
+                    token: Option<u64>,
+                ) -> tako_control::protocol::Request {
+                    tako_control::protocol::Request::Web {
+                        action: action.into(),
+                        url: url.map(String::from),
+                        id,
+                        pane: None,
+                        direction: None,
+                        to: to.map(String::from),
+                        js: js.map(String::from),
+                        token,
+                    }
+                }
+                let base_panes = window
+                    .update(cx, |app, _, _| app.workspace.active_tab().tree().len())
+                    .unwrap_or(0);
+                // open: フォーカスペインを分割して wry WebView を生成
+                let opened = window
+                    .update(cx, |app, _, _cx| {
+                        tako_control::dispatch(
+                            app,
+                            web_req(
+                                "open",
+                                Some("data:text/html,<title>tako-wv-test</title><h1>hi</h1>"),
+                                None,
+                                None,
+                                None,
+                                None,
+                            ),
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| Some((v["id"].as_u64()?, v["pane"].as_u64()?)))
+                    })
+                    .ok()
+                    .flatten();
+                let Some((web_id, web_pane)) = opened else {
+                    fail("Web ビュー open（wry 生成）");
+                };
+                // list: id・ペイン対応・URL が載る
+                let listed = window
+                    .update(cx, |app, _, _cx| {
+                        let r = tako_control::dispatch(
+                            app,
+                            web_req("list", None, None, None, None, None),
+                            PaneOrigin::Cli,
+                        )
+                        .ok()?;
+                        let arr = r.as_array()?;
+                        Some(arr.iter().any(|e| {
+                            e["id"].as_u64() == Some(web_id)
+                                && e["pane"].as_u64() == Some(web_pane)
+                        }))
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
+                check(listed, "Web ビュー list（id / ペイン対応）");
+                // read: 実ページからのタイトル追跡（初期化スクリプト → ipc 往復）を待つ
+                let mut title_ok = false;
+                for _ in 0..25 {
+                    wait(cx, 200).await;
+                    title_ok = window
+                        .update(cx, |app, _, _cx| {
+                            let r = tako_control::dispatch(
+                                app,
+                                web_req("read", None, Some(web_id), None, None, None),
+                                PaneOrigin::Cli,
+                            )
+                            .ok()?;
+                            Some(r["title"].as_str() == Some("tako-wv-test"))
+                        })
+                        .ok()
+                        .flatten()
+                        .unwrap_or(false);
+                    if title_ok {
+                        break;
+                    }
+                }
+                if !title_ok {
+                    // 切り分け診断: ipc（タイトル追跡）不達時に read の生値と
+                    // evaluate_script_with_callback の生存を出力してから fail する
+                    let diag = window
+                        .update(cx, |app, _, _cx| {
+                            let read = tako_control::dispatch(
+                                app,
+                                web_req("read", None, Some(web_id), None, None, None),
+                                PaneOrigin::Cli,
+                            );
+                            let ev = tako_control::dispatch(
+                                app,
+                                web_req(
+                                    "eval",
+                                    None,
+                                    Some(web_id),
+                                    None,
+                                    Some("document.title"),
+                                    None,
+                                ),
+                                PaneOrigin::Cli,
+                            );
+                            format!("read={read:?} eval={ev:?}")
+                        })
+                        .unwrap_or_default();
+                    println!("TAKO_WV_DIAG1: {diag}");
+                    wait(cx, 2000).await;
+                    let diag2 = window
+                        .update(cx, |app, _, _cx| {
+                            let r = tako_control::dispatch(
+                                app,
+                                web_req("eval_result", None, Some(web_id), None, None, Some(1)),
+                                PaneOrigin::Cli,
+                            );
+                            format!("eval_result(token=1)={r:?}")
+                        })
+                        .unwrap_or_default();
+                    println!("TAKO_WV_DIAG2: {diag2}");
+                }
+                check(title_ok, "Web ビュー read（実ページのタイトル追跡）");
+                // navigate: URL 遷移でタイトルが変わる
+                let _ = window.update(cx, |app, _, _cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        web_req(
+                            "navigate",
+                            None,
+                            Some(web_id),
+                            Some("data:text/html,<title>tako-wv-2</title>ok"),
+                            None,
+                            None,
+                        ),
+                        PaneOrigin::Cli,
+                    );
+                });
+                let mut nav_ok = false;
+                for _ in 0..25 {
+                    wait(cx, 200).await;
+                    nav_ok = window
+                        .update(cx, |app, _, _cx| {
+                            let r = tako_control::dispatch(
+                                app,
+                                web_req("read", None, Some(web_id), None, None, None),
+                                PaneOrigin::Cli,
+                            )
+                            .ok()?;
+                            Some(r["title"].as_str() == Some("tako-wv-2"))
+                        })
+                        .ok()
+                        .flatten()
+                        .unwrap_or(false);
+                    if nav_ok {
+                        break;
+                    }
+                }
+                check(nav_ok, "Web ビュー navigate（URL 遷移 + タイトル更新）");
+                // eval → eval_result: JS 評価（AI の画面操作経路）
+                let eval_token = window
+                    .update(cx, |app, _, _cx| {
+                        tako_control::dispatch(
+                            app,
+                            web_req("eval", None, Some(web_id), None, Some("1+2"), None),
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["token"].as_u64())
+                    })
+                    .ok()
+                    .flatten();
+                let Some(eval_token) = eval_token else {
+                    fail("Web ビュー eval 発行");
+                };
+                let mut eval_ok = false;
+                for _ in 0..25 {
+                    wait(cx, 200).await;
+                    eval_ok = window
+                        .update(cx, |app, _, _cx| {
+                            let r = tako_control::dispatch(
+                                app,
+                                web_req(
+                                    "eval_result",
+                                    None,
+                                    Some(web_id),
+                                    None,
+                                    None,
+                                    Some(eval_token),
+                                ),
+                                PaneOrigin::Cli,
+                            )
+                            .ok()?;
+                            Some(r["result"].as_i64() == Some(3))
+                        })
+                        .ok()
+                        .flatten()
+                        .unwrap_or(false);
+                    if eval_ok {
+                        break;
+                    }
+                }
+                check(eval_ok, "Web ビュー eval → eval_result（JS 評価）");
+                // hide: dock 退避（ページは生存、ペインは閉じる）
+                let hidden = window
+                    .update(cx, |app, _, _cx| {
+                        let _ = tako_control::dispatch(
+                            app,
+                            web_req("hide", None, Some(web_id), None, None, None),
+                            PaneOrigin::Cli,
+                        )
+                        .ok()?;
+                        let r = tako_control::dispatch(
+                            app,
+                            web_req("list", None, None, None, None, None),
+                            PaneOrigin::Cli,
+                        )
+                        .ok()?;
+                        let arr = r.as_array()?;
+                        Some(
+                            arr.iter().any(|e| {
+                                e["id"].as_u64() == Some(web_id) && e["pane"].is_null()
+                            }) && app.workspace.active_tab().tree().len() == base_panes,
+                        )
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
+                check(hidden, "Web ビュー hide（dock 退避 + ペイン後始末）");
+                // show: dock からワンクリック復帰。ページ状態（タイトル）が維持されている
+                let shown_alive = window
+                    .update(cx, |app, _, _cx| {
+                        let r = tako_control::dispatch(
+                            app,
+                            web_req("show", None, Some(web_id), None, None, None),
+                            PaneOrigin::Cli,
+                        )
+                        .ok()?;
+                        let shown_pane = r["pane"].as_u64()?;
+                        let read = tako_control::dispatch(
+                            app,
+                            web_req("read", None, Some(web_id), None, None, None),
+                            PaneOrigin::Cli,
+                        )
+                        .ok()?;
+                        Some(
+                            shown_pane != web_pane
+                                && read["title"].as_str() == Some("tako-wv-2"),
+                        )
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
+                check(
+                    shown_alive,
+                    "Web ビュー show（復帰後もページ状態が維持 = インスタンス保持）",
+                );
+                // close: 完全破棄 + ペイン数が元に戻る
+                let closed = window
+                    .update(cx, |app, _, _cx| {
+                        let _ = tako_control::dispatch(
+                            app,
+                            web_req("close", None, Some(web_id), None, None, None),
+                            PaneOrigin::Cli,
+                        )
+                        .ok()?;
+                        let r = tako_control::dispatch(
+                            app,
+                            web_req("list", None, None, None, None, None),
+                            PaneOrigin::Cli,
+                        )
+                        .ok()?;
+                        Some(
+                            r.as_array().map(|a| a.is_empty()).unwrap_or(false)
+                                && app.workspace.active_tab().tree().len() == base_panes,
+                        )
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
+                check(closed, "Web ビュー close（完全破棄 + ペイン後始末）");
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

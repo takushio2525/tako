@@ -142,9 +142,10 @@ enum Command {
     /// オーケストレーター操作（projects / spawn / status / watch）
     #[command(subcommand)]
     Orchestrator(OrchestratorCommand),
-    /// URL を Chrome CDP ミラー方式で Web ビューペインとして開く（FR-3.8 PoC）
+    /// ネイティブ Web ビューペインの操作（FR-3.8 / #155）。
+    /// URL をペインで開く・dock への退避と呼び出し・ナビゲーション・JS 評価
     #[command(subcommand)]
-    Chrome(ChromeCommand),
+    Web(WebCommand),
     /// アプリ内更新の診断・チェック・実行（Issue #36）。
     /// 引数なしで配布系統・現在バージョン・重複 CLI を表示する
     #[command(subcommand)]
@@ -164,12 +165,12 @@ enum Command {
 }
 
 #[derive(Subcommand)]
-enum ChromeCommand {
-    /// URL を Chrome Web ビューペインで開く
+enum WebCommand {
+    /// URL を新しい Web ビューペインで開く
     Open {
-        /// 開く URL
+        /// 開く URL（スキーム省略時は https、localhost 系は http に正規化）
         url: String,
-        /// 基準ペイン ID（省略時は呼び出し元）
+        /// 分割の基準ペイン ID（省略時は呼び出し元）
         #[arg(long)]
         pane: Option<u64>,
         /// 右に分割
@@ -184,6 +185,88 @@ enum ChromeCommand {
         /// 上に分割
         #[arg(long)]
         up: bool,
+    },
+    /// Web ビューの一覧（表示中 + dock 退避中。id・URL・タイトル・ペイン）
+    List,
+    /// dock 退避中の Web ビューをペインへ呼び出す
+    Show {
+        /// 対象 Web ビュー ID（`tako web list` で確認）
+        id: u64,
+        /// 分割の基準ペイン ID（省略時は呼び出し元）
+        #[arg(long)]
+        pane: Option<u64>,
+        /// 右に分割
+        #[arg(long)]
+        right: bool,
+        /// 下に分割
+        #[arg(long)]
+        down: bool,
+        /// 左に分割
+        #[arg(long)]
+        left: bool,
+        /// 上に分割
+        #[arg(long)]
+        up: bool,
+    },
+    /// Web ビューをペインから外して dock へ退避する（ページは生きたまま）
+    Hide {
+        /// 対象 Web ビュー ID（省略時は表示中が 1 つならそれ）
+        #[arg(long)]
+        id: Option<u64>,
+        /// 対象が表示中のペイン ID
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// Web ビューを完全に破棄する（表示中ならペインも閉じる）
+    Close {
+        /// 対象 Web ビュー ID（省略時は表示中が 1 つならそれ）
+        #[arg(long)]
+        id: Option<u64>,
+        /// 対象が表示中のペイン ID
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// ページ遷移（back / forward / reload / URL）
+    Nav {
+        /// 遷移先: back / forward / reload / URL
+        to: String,
+        /// 対象 Web ビュー ID（省略時は表示中が 1 つならそれ）
+        #[arg(long)]
+        id: Option<u64>,
+        /// 対象が表示中のペイン ID
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// JavaScript を非同期評価して token を返す（結果は eval-result で回収）
+    Eval {
+        /// 実行する JavaScript
+        js: String,
+        /// 対象 Web ビュー ID（省略時は表示中が 1 つならそれ）
+        #[arg(long)]
+        id: Option<u64>,
+        /// 対象が表示中のペイン ID
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// eval の評価結果を回収する（未完なら pending: true）
+    EvalResult {
+        /// eval が返した token
+        token: u64,
+        /// 対象 Web ビュー ID（省略時は表示中が 1 つならそれ）
+        #[arg(long)]
+        id: Option<u64>,
+        /// 対象が表示中のペイン ID
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// URL・タイトル・読み込み状態を取得する
+    Read {
+        /// 対象 Web ビュー ID（省略時は表示中が 1 つならそれ）
+        #[arg(long)]
+        id: Option<u64>,
+        /// 対象が表示中のペイン ID
+        #[arg(long)]
+        pane: Option<u64>,
     },
 }
 
@@ -2298,25 +2381,96 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Orchestrator(OrchestratorCommand::Run { .. }) => {
             unreachable!("orchestrator run は run() を通らない")
         }
-        Command::Chrome(ChromeCommand::Open {
-            ref url,
-            pane,
-            right,
-            down,
-            left,
-            up,
-        }) => {
-            let direction = match (down, left, up) {
+        Command::Web(sub) => {
+            let dir = |right: bool, down: bool, left: bool, up: bool| match (down, left, up) {
                 (true, _, _) => Some(Direction::Down),
                 (_, true, _) => Some(Direction::Left),
                 (_, _, true) => Some(Direction::Up),
-                _ if *right => Some(Direction::Right),
+                _ if right => Some(Direction::Right),
                 _ => None,
             };
-            Request::ChromeOpen {
-                url: url.clone(),
-                pane: target_pane(*pane)?,
-                direction,
+            // Request::Web は enum バリアントのため record update が使えない。
+            // 全フィールドを引数で受けるビルダで各アームの重複を抑える
+            #[allow(clippy::too_many_arguments)]
+            fn web(
+                action: &str,
+                url: Option<String>,
+                id: Option<u64>,
+                pane: Option<u64>,
+                direction: Option<Direction>,
+                to: Option<String>,
+                js: Option<String>,
+                token: Option<u64>,
+            ) -> Request {
+                Request::Web {
+                    action: action.to_string(),
+                    url,
+                    id,
+                    pane,
+                    direction,
+                    to,
+                    js,
+                    token,
+                }
+            }
+            match sub {
+                WebCommand::Open {
+                    url,
+                    pane,
+                    right,
+                    down,
+                    left,
+                    up,
+                } => {
+                    let pane = target_pane(*pane)?;
+                    let d = dir(*right, *down, *left, *up);
+                    web("open", Some(url.clone()), None, pane, d, None, None, None)
+                }
+                WebCommand::List => web("list", None, None, None, None, None, None, None),
+                WebCommand::Show {
+                    id,
+                    pane,
+                    right,
+                    down,
+                    left,
+                    up,
+                } => {
+                    let pane = target_pane(*pane)?;
+                    let d = dir(*right, *down, *left, *up);
+                    web("show", None, Some(*id), pane, d, None, None, None)
+                }
+                WebCommand::Hide { id, pane } => {
+                    web("hide", None, *id, *pane, None, None, None, None)
+                }
+                WebCommand::Close { id, pane } => {
+                    web("close", None, *id, *pane, None, None, None, None)
+                }
+                WebCommand::Nav { to, id, pane } => web(
+                    "navigate",
+                    None,
+                    *id,
+                    *pane,
+                    None,
+                    Some(to.clone()),
+                    None,
+                    None,
+                ),
+                WebCommand::Eval { js, id, pane } => {
+                    web("eval", None, *id, *pane, None, None, Some(js.clone()), None)
+                }
+                WebCommand::EvalResult { token, id, pane } => web(
+                    "eval_result",
+                    None,
+                    *id,
+                    *pane,
+                    None,
+                    None,
+                    None,
+                    Some(*token),
+                ),
+                WebCommand::Read { id, pane } => {
+                    web("read", None, *id, *pane, None, None, None, None)
+                }
             }
         }
         Command::Update(sub) => Request::Update {
@@ -2493,7 +2647,7 @@ fn print_result(command: &Command, result: &Value) {
         Command::BackgroundList => {
             println!("{}", pretty_json(result));
         }
-        Command::Chrome(_) => println!("{result}"),
+        Command::Web(_) => println!("{}", pretty_json(result)),
         Command::Update(_) => println!("{}", pretty_json(result)),
         Command::Tree(_) => println!("{}", pretty_json(result)),
         // remote は run() → print_result を通らない

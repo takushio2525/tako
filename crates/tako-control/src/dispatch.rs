@@ -203,10 +203,49 @@ pub trait ControlHost {
     fn remote_status(&self) -> Value {
         json!({ "running": false })
     }
-    /// Chrome を CDP ミラー方式で開く（FR-3.8 PoC）。UI 層で WebViewState を生成する。
-    /// 失敗時は Err を返し、呼び出し元がペインを巻き戻す
-    fn open_chrome(&mut self, _pane: PaneId, _url: &str) -> Result<(), String> {
-        Ok(())
+    /// Web ビューを生成してペインへ表示する（FR-3.8 / #155）。UI 層で wry WebView を
+    /// 生成する。失敗時は Err を返し、呼び出し元がペインを巻き戻す。
+    /// 成功時は `{ "id": u64, "pane": u64, "url": String }` を返す
+    fn web_open(&mut self, _pane: PaneId, _url: &str) -> Result<Value, String> {
+        Err("Web ビューはこの環境では使えない".into())
+    }
+    /// dock 退避中の Web ビュー `id` をペインへ表示する（FR-3.8 / #155）
+    fn web_show(&mut self, _pane: PaneId, _id: u64) -> Result<Value, String> {
+        Err("Web ビューはこの環境では使えない".into())
+    }
+    /// Web ビューの一覧（表示中 + dock 退避中）
+    fn web_list(&self) -> Value {
+        json!([])
+    }
+    /// Web ビュー操作の対象解決。`id` 優先 → `pane`（表示中のもの）→ 省略時は
+    /// 表示中が 1 つだけならそれ。戻り値は (id, 表示中ペイン)
+    fn web_target(
+        &self,
+        _id: Option<u64>,
+        _pane: Option<u64>,
+    ) -> Result<(u64, Option<PaneId>), String> {
+        Err("Web ビューはこの環境では使えない".into())
+    }
+    /// Web ビュー `id` を完全に破棄する。表示中だった場合はそのペイン ID を返す
+    /// （ペイン自体の close は呼び出し元 = dispatch の責務）
+    fn web_destroy(&mut self, _id: u64) -> Option<PaneId> {
+        None
+    }
+    /// ナビゲーション（`to` = "back" / "forward" / "reload" / URL）
+    fn web_navigate(&mut self, _id: u64, _to: &str) -> Result<Value, String> {
+        Err("Web ビューはこの環境では使えない".into())
+    }
+    /// JS の非同期評価を発行し token を返す（結果は `web_eval_result` で回収）
+    fn web_eval(&mut self, _id: u64, _js: &str) -> Result<Value, String> {
+        Err("Web ビューはこの環境では使えない".into())
+    }
+    /// eval 結果の回収。未完なら `{ "pending": true }`
+    fn web_eval_result(&mut self, _id: u64, _token: u64) -> Result<Value, String> {
+        Err("Web ビューはこの環境では使えない".into())
+    }
+    /// URL・タイトル・読み込み状態を返す
+    fn web_read(&self, _id: u64) -> Result<Value, String> {
+        Err("Web ビューはこの環境では使えない".into())
     }
     /// アプリ内更新の診断情報（Issue #36）。配布系統・バージョン・重複 CLI を JSON で返す
     fn update_status(&self) -> Value {
@@ -1679,36 +1718,128 @@ fn dispatch_inner(
             Ok(json!({ "lines": result }))
         }
 
-        Request::ChromeOpen {
+        Request::Web {
+            action,
             url,
+            id,
             pane,
             direction,
+            to,
+            js,
+            token,
         } => {
-            let (tab, target) = match pane {
-                Some(_) => resolve_pane(host.workspace(), pane)?,
-                None => {
-                    let ws = host.workspace();
-                    let active = ws.active_tab_id();
-                    let focused = ws.active_tab().tree().focused();
-                    (active, focused)
+            // ペイン分割を伴う action（open / show）の共通処理。
+            // 分割 → host フック → 失敗なら巻き戻し、成功ならフォーカス
+            let split_and =
+                |host: &mut dyn ControlHost,
+                 pane: Option<u64>,
+                 attach: &dyn Fn(&mut dyn ControlHost, PaneId) -> Result<Value, String>|
+                 -> Result<Value, DispatchError> {
+                    let (tab, target) = match pane {
+                        Some(_) => resolve_pane(host.workspace(), pane)?,
+                        None => {
+                            let ws = host.workspace();
+                            (ws.active_tab_id(), ws.active_tab().tree().focused())
+                        }
+                    };
+                    let dir = direction
+                        .map(|d| d.to_core())
+                        .unwrap_or(SplitDirection::Right);
+                    let new_pane = Pane::new(origin);
+                    let new_id = new_pane.id();
+                    tree_mut(host.workspace_mut(), tab)
+                        .split_with_ratio(target, dir, 0.5, new_pane)
+                        .map_err(op_err)?;
+                    match attach(host, new_id) {
+                        Ok(v) => {
+                            tree_mut(host.workspace_mut(), tab)
+                                .focus(new_id)
+                                .map_err(op_err)?;
+                            Ok(v)
+                        }
+                        Err(e) => {
+                            let _ = tree_mut(host.workspace_mut(), tab).close(new_id);
+                            Err(DispatchError::Operation(e))
+                        }
+                    }
+                };
+            // 表示中の Web ビューをペインから外す共通処理（hide / close）。
+            // Request::Close と同じ後始末（LastPane はタブごと閉じる + detach_session）
+            let close_pane_of =
+                |host: &mut dyn ControlHost, pane_id: PaneId| -> Result<(), DispatchError> {
+                    let (tab, target) = resolve_pane(host.workspace(), Some(pane_id.as_u64()))?;
+                    match tree_mut(host.workspace_mut(), tab).close(target) {
+                        Ok(_) => {}
+                        Err(PaneTreeError::LastPane) => {
+                            host.workspace_mut().close_tab(tab).map_err(op_err)?;
+                        }
+                        Err(e) => return Err(op_err(e)),
+                    }
+                    host.detach_session(target);
+                    Ok(())
+                };
+            match action.as_str() {
+                "open" => {
+                    let url = url.ok_or(DispatchError::InvalidParams("url は必須".into()))?;
+                    split_and(host, pane, &|h, new_id| h.web_open(new_id, &url))
                 }
-            };
-            let dir = direction
-                .map(|d| d.to_core())
-                .unwrap_or(SplitDirection::Right);
-            let new_pane = Pane::new(origin);
-            let new_id = new_pane.id();
-            tree_mut(host.workspace_mut(), tab)
-                .split_with_ratio(target, dir, 0.5, new_pane)
-                .map_err(op_err)?;
-            if let Err(e) = host.open_chrome(new_id, &url) {
-                let _ = tree_mut(host.workspace_mut(), tab).close(new_id);
-                return Err(DispatchError::Operation(format!("Chrome 起動失敗: {e}")));
+                "show" => {
+                    let id =
+                        id.ok_or(DispatchError::InvalidParams("id は必須（web list で確認）".into()))?;
+                    // 既に表示中なら分割せずそのペインへフォーカスする
+                    let (_, showing) = host.web_target(Some(id), None).map_err(op_err)?;
+                    if let Some(p) = showing {
+                        let (tab, target) = resolve_pane(host.workspace(), Some(p.as_u64()))?;
+                        let ws = host.workspace_mut();
+                        tree_mut(ws, tab).focus(target).map_err(op_err)?;
+                        ws.activate_tab(tab).map_err(op_err)?;
+                        return Ok(json!({ "id": id, "pane": target.as_u64(), "already_shown": true }));
+                    }
+                    split_and(host, pane, &|h, new_id| h.web_show(new_id, id))
+                }
+                "list" => Ok(host.web_list()),
+                "hide" => {
+                    let (id, showing) = host.web_target(id, pane).map_err(op_err)?;
+                    let shown = showing.ok_or(DispatchError::Operation(format!(
+                        "Web ビュー {id} は既に dock 退避中"
+                    )))?;
+                    close_pane_of(host, shown)?;
+                    Ok(json!({ "id": id, "hidden": true }))
+                }
+                "close" => {
+                    let (id, _) = host.web_target(id, pane).map_err(op_err)?;
+                    if let Some(shown) = host.web_destroy(id) {
+                        close_pane_of(host, shown)?;
+                    }
+                    Ok(json!({ "id": id, "closed": true }))
+                }
+                "navigate" => {
+                    let to =
+                        to.ok_or(DispatchError::InvalidParams(
+                            "to は必須（back / forward / reload / URL）".into(),
+                        ))?;
+                    let (id, _) = host.web_target(id, pane).map_err(op_err)?;
+                    host.web_navigate(id, &to).map_err(op_err)
+                }
+                "eval" => {
+                    let js = js.ok_or(DispatchError::InvalidParams("js は必須".into()))?;
+                    let (id, _) = host.web_target(id, pane).map_err(op_err)?;
+                    host.web_eval(id, &js).map_err(op_err)
+                }
+                "eval_result" => {
+                    let token =
+                        token.ok_or(DispatchError::InvalidParams("token は必須".into()))?;
+                    let (id, _) = host.web_target(id, pane).map_err(op_err)?;
+                    host.web_eval_result(id, token).map_err(op_err)
+                }
+                "read" => {
+                    let (id, _) = host.web_target(id, pane).map_err(op_err)?;
+                    host.web_read(id).map_err(op_err)
+                }
+                other => Err(DispatchError::InvalidParams(format!(
+                    "未知の action: {other}（open / list / show / hide / close / navigate / eval / eval_result / read）"
+                ))),
             }
-            tree_mut(host.workspace_mut(), tab)
-                .focus(new_id)
-                .map_err(op_err)?;
-            Ok(json!({ "pane": new_id.as_u64(), "url": url }))
         }
 
         Request::Update { action } => {

@@ -60,6 +60,10 @@ pub struct LayoutFile {
     /// 旧ファイルには無いので serde default、空なら出力省略で後方互換
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collapsed: Vec<u64>,
+    /// Web ビュー dock で退避中のページ URL（FR-3.8 / #155。表示中のものは
+    /// PaneLayout.webview に載る）。旧ファイル後方互換のため default + 空省略
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub webview_dock: Vec<String>,
 }
 
 /// OS ウィンドウのジオメトリ（復元時は起動時のウィンドウ生成オプションに使う）
@@ -124,6 +128,10 @@ pub struct PaneLayout {
     /// 旧ファイルには無いので serde default で後方互換
     #[serde(default)]
     pub preview: Option<PreviewLayout>,
+    /// Web ビューペイン（FR-3.8 / #155）の表示 URL。None = ターミナル / プレビュー。
+    /// 復元時は URL を開き直す（ページ内状態までは復元しない）。旧ファイル後方互換
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webview: Option<String>,
     /// バックグラウンドペインの由来タブ ID（FR-2.15.6。タブ別分離表示用）。tree 内のペインでは
     /// 常に None。旧ファイル後方互換のため default + 出力時は None を省略する
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -148,6 +156,8 @@ pub struct PaneMeta {
     pub cwd: Option<String>,
     pub claude_session_id: Option<String>,
     pub preview: Option<PreviewLayout>,
+    /// Web ビューペインなら表示中の URL（FR-3.8 / #155）
+    pub webview: Option<String>,
 }
 
 /// 復元されたペインの spawn 指示（Workspace へ挿入済み。セッション起動は呼び出し側）
@@ -160,6 +170,8 @@ pub struct RestoredPane {
     pub claude_session_id: Option<String>,
     /// Some ならプレビューペインとして復元する（spawn しない）
     pub preview: Option<PreviewLayout>,
+    /// Some なら Web ビューペインとして復元する（spawn しない。URL を開き直す）
+    pub webview: Option<String>,
 }
 
 /// 現在の Workspace 構造をレイアウト表現へ写す。`meta` でペインごとの
@@ -206,15 +218,17 @@ pub fn capture(
                     cwd: m.cwd,
                     claude_session_id: m.claude_session_id,
                     preview: m.preview,
+                    webview: m.webview,
                     // 由来タブ（FR-2.15.6）。再起動後もタブ別分離表示を保つ
                     origin_tab: Some(shelved.origin_tab().as_u64()),
                     origin_tab_title: Some(shelved.origin_tab_title().to_string()),
                 }
             })
             .collect(),
-        // 折りたたみ状態（FR-2.16.14）は Workspace に無い UI 状態なので
-        // capture では空にし、save 時に UI 層が埋める
+        // 折りたたみ状態（FR-2.16.14）と Web ビュー dock（#155）は Workspace に
+        // 無い UI 状態なので capture では空にし、save 時に UI 層が埋める
         collapsed: Vec::new(),
+        webview_dock: Vec::new(),
     }
 }
 
@@ -232,6 +246,7 @@ fn capture_node(node: &PaneNode, meta: &dyn Fn(PaneId) -> PaneMeta) -> NodeLayou
                 cwd: m.cwd,
                 claude_session_id: m.claude_session_id,
                 preview: m.preview,
+                webview: m.webview,
                 // tree 内のペインは退避ではないので由来タブを持たない
                 origin_tab: None,
                 origin_tab_title: None,
@@ -337,6 +352,7 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
             cwd: p.cwd.clone(),
             claude_session_id: p.claude_session_id.clone(),
             preview: p.preview.clone(),
+            webview: p.webview.clone(),
         });
         let origin_tab = p.origin_tab.map(TabId::from_raw).unwrap_or(fallback_tab);
         let origin_title = p
@@ -374,6 +390,7 @@ fn restore_node(
                 cwd: p.cwd.clone(),
                 claude_session_id: p.claude_session_id.clone(),
                 preview: p.preview.clone(),
+                webview: p.webview.clone(),
             });
             Some((PaneNode::Leaf(pane), id))
         }
@@ -550,6 +567,7 @@ mod tests {
                     path: format!("/tmp/p{}.md", pane.as_u64()),
                     mode: "markdown".into(),
                 }),
+                webview: Some(format!("http://localhost:300{}", pane.as_u64())),
             },
             Some(frame.clone()),
         );
@@ -587,6 +605,11 @@ mod tests {
             .preview
             .as_ref()
             .is_some_and(|p| p.mode == "markdown" && p.path == format!("/tmp/p{}.md", r.pane))));
+        // Web ビュー URL（FR-3.8 / #155）も往復する
+        assert!(restored
+            .iter()
+            .all(|r| r.webview.as_deref()
+                == Some(format!("http://localhost:300{}", r.pane).as_str())));
         // フォーカスも保たれる（タブ 1 は split 後の新ペイン）
         assert_eq!(
             restored_ws.tabs()[0].tree().focused().as_u64(),
@@ -651,6 +674,20 @@ mod tests {
     }
 
     #[test]
+    fn webビューdockが永続化で往復する() {
+        let ws = sample_workspace();
+        let mut layout = capture(&ws, &|_| PaneMeta::default(), None);
+        layout.webview_dock = vec!["http://localhost:5173".into(), "https://docs.rs".into()];
+        let json = serde_json::to_string(&layout).unwrap();
+        let back: LayoutFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.webview_dock, layout.webview_dock);
+        // dock の無い旧ファイルも読める（後方互換）
+        let legacy: LayoutFile =
+            serde_json::from_str(&json.replace("\"webview_dock\":", "\"_wd\":")).unwrap();
+        assert!(legacy.webview_dock.is_empty());
+    }
+
+    #[test]
     fn 壊れたレイアウトは理由付きで拒否して新規作成へ倒す() {
         // 空タブ
         assert_eq!(
@@ -661,6 +698,7 @@ mod tests {
                 window: None,
                 backgrounded: vec![],
                 collapsed: vec![],
+                webview_dock: vec![],
             })
             .err(),
             Some(LayoutError::Empty)

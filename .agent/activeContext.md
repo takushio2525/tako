@@ -4,30 +4,34 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-13・#153 ターミナルリンク実機修正）
+## 現在の対象（2026-07-13・#155 Web ビュー wry ネイティブ統合）
 
-#153 完了（codex → Fable 引き継ぎ）。パスリンク cmd+クリック不動作の根本原因 5 件
-（ペイン判定誤ヒット / ディレクトリ空ペイン / TUI cwd 不明 / cwd=None 検出スキップ /
-走査無限ループ）+ cmd 押下中の下線・背景ハイライト・即時装飾更新を実装。
-直前の #152（PDF 選択描画・標準言語色分け）も merge・install 済み。
+FR-3.8 Web ビューペインを CDP ミラー PoC から wry 0.55（WKWebView の
+`build_as_child`）へ全面刷新。ブランチ `fix/155-webview-wry`（worktree
+tako-wt-webview）。並行 worker の #152 / #153 / #156 / #158 は main へ
+マージ済みで、origin/main を取り込み統合済み。
 
-- 起動時 working directory をセッション初期 cwd に保持（OSC 7 で上書き）
-- リンク装飾は `link_byte_range_in_chunk` でリンク文字列だけに限定
-- 選択ドラッグは `cell_at_clamped` 分離でペイン外でも伸びる旧挙動を維持（引き継ぎ検証で追加）
+- ページ = `WebViewEntry`（ペインから独立）。ー = dock 退避（ページ生存）、× = 破棄
+- ステータスバー 🌐 → dock パネル（flex 内 = webview と重ならない）
+- dispatch `Web` + CLI `tako web` + MCP `tako_web`（9 action、計 58 ツール不変）
+- タイトル/URL 追跡は eval 2 秒ポーリングが正（ipc は data: URL で不達を実機確認）
+- 永続化: PaneLayout.webview + LayoutFile.webview_dock（後方互換）
 
 ## 検証済み
 
-- 隔離セルフテスト（TAKO_DISCOVERY_DIR + TAKO_PERSIST=0 + TAKO_TMUX_SOCKET）完走
-  = 69c 全 7 判定（3 形式検出 / OSC 7 cwd 一致 / ファイル→プレビュー / ディレクトリ→PTY 分割)パス
-- workspace build / test / fmt / clippy（-D warnings）全緑
+- workspace build / test（487）/ fmt / clippy（-D warnings）全緑（マージ前。
+  マージ後の再検証は実施中）
+- セルフテスト完走（`TAKO_APP_SELF_TEST_OK`。項目 71 = webview e2e 8 操作を
+  実 WKWebView で通過。失敗時診断コード入り）
 
 ## 次の一手
 
-- tako 再起動後、`.agent/manual-checks.md` #153 節（cmd ホバー装飾・実マウスクリック）と
-  #152 節（PDF ドラッグ選択・コード色分け）を GUI で確認
-- Phase 5 の次候補は FR-3.8 Web ビューまたは FR-2.19 localhost ポートパネル
+- マージ後の全緑再確認 → PR #160 squash merge → `build-app.sh --install` →
+  隔離インスタンス + screencapture でピクセル実証 → Issue #155 完了コメント
+- ユーザー再起動後の GUI 確認（manual-checks.md）: 「Web ビューペイン」節（#155）、
+  「#153 節」（cmd ホバー装飾・実マウスクリック）、「#152 節」（PDF ドラッグ選択・色分け）
 
 ## 現フェーズで Read すべき設計書
 
-- 要件: `.agent/requirements.md` FR-3.2〜FR-3.5
-- 手動確認: `.agent/manual-checks.md`「ターミナルリンクの cmd+クリック・cmd ホバー装飾」
+- 実装詳細と z オーダー制約: `.agent/architecture.md`「Web ビューペイン」節
+- 手動確認: `.agent/manual-checks.md`「Web ビューペイン」節

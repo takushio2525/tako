@@ -481,12 +481,37 @@ pub enum Request {
     },
     /// ペインのスクロールバック履歴をプレーンテキストで取得（Issue #42 履歴レイヤー用）
     RemoteScrollback { pane_id: String, lines: Option<u32> },
-    /// Chrome を CDP ミラー方式で開く（FR-3.8 PoC）。`pane` を `direction` 方向に分割し、
-    /// Web ビューペインを生やす。Chrome が未起動なら `--remote-debugging-port` 付きで起動する
-    ChromeOpen {
-        url: String,
+    /// Web ビューペインの操作（FR-3.8、Issue #155）。ネイティブ webview
+    /// （macOS = WKWebView）をペインとして表示・管理する。`action`:
+    /// - "open": `url` を新しい Web ビューペインで開く（`pane` を `direction` 方向に分割）
+    /// - "list": 全 Web ビュー（表示中 + dock 退避中）の一覧
+    /// - "show": dock 退避中の `id` をペインへ呼び出す（`pane` を `direction` 方向に分割）
+    /// - "hide": 対象をペインから外して dock へ退避する（ページは生きたまま）
+    /// - "close": 対象を完全に破棄する（表示中ならペインも閉じる）
+    /// - "navigate": `to`（"back" / "forward" / "reload" / URL）でページ遷移
+    /// - "eval": `js` を非同期評価し `token` を返す（結果は "eval_result" で回収）
+    /// - "eval_result": `token` の評価結果を回収する（未完なら pending: true）
+    /// - "read": URL・タイトル・読み込み状態を返す
+    ///
+    /// 対象解決（hide / close / navigate / eval / eval_result / read）: `id` 優先、
+    /// 次に `pane`（そのペインに表示中の Web ビュー）、どちらも省略時は
+    /// 表示中の Web ビューが 1 つだけならそれ
+    Web {
+        action: String,
+        #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        id: Option<u64>,
+        #[serde(default)]
         pane: Option<u64>,
+        #[serde(default)]
         direction: Option<Direction>,
+        #[serde(default)]
+        to: Option<String>,
+        #[serde(default)]
+        js: Option<String>,
+        #[serde(default)]
+        token: Option<u64>,
     },
     /// アプリ内更新の診断・実行（Issue #36 + #50）。
     /// `action` 省略 or `"status"` → 配布系統・現在バージョン・重複 CLI の診断情報。
