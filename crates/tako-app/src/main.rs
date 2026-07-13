@@ -7894,6 +7894,11 @@ impl ControlHost for TakoApp {
     }
 
     fn detach_session(&mut self, pane: PaneId) {
+        // ペインログの最終フラッシュ（Issue #112 B。CLI / MCP の close はこの経路で
+        // セッションを破棄するため、terminals から外す前に可視画面を書き残す）
+        if let Some(data) = self.pane_log_close_data(pane) {
+            self.apply_pane_log_close(pane, data, CloseReason::Explicit);
+        }
         self.terminals.remove(&pane);
         self.previews.remove(&pane);
         self.preview_edits.remove(&pane);
@@ -8531,6 +8536,20 @@ impl ControlHost for TakoApp {
             "message": msg,
             "install_method": update_checker::detect_install_method_full().label(),
         }))
+    }
+
+    fn reserve_backend_session(&mut self, pane: PaneId) -> Option<String> {
+        // spawn_session と同じ条件・同じ採番（entry API なので二重採番しない）
+        if self.tmux_persist && tako_core::tmux_backend::available() {
+            Some(
+                self.backend_sessions
+                    .entry(pane)
+                    .or_insert_with(new_backend_session_name)
+                    .clone(),
+            )
+        } else {
+            None
+        }
     }
 
     fn pane_log_config(&self) -> tako_core::pane_log::PaneLogConfig {
@@ -9528,6 +9547,15 @@ fn main() {
             std::env::set_var(
                 "TAKO_DISCOVERY_DIR",
                 std::env::temp_dir().join(format!("tako-iso-discovery-{}", std::process::id())),
+            );
+        }
+        // データディレクトリ（layout.json / settings.json / token / persist.log）も
+        // 一括隔離する（#177 の穴: TAKO_ISOLATED + TAKO_PERSIST=1 の組み合わせで
+        // 本番 layout.json を復元・上書きし得た）
+        if std::env::var_os("TAKO_DATA_DIR").is_none() {
+            std::env::set_var(
+                "TAKO_DATA_DIR",
+                std::env::temp_dir().join(format!("tako-iso-data-{}", std::process::id())),
             );
         }
         // セッションカタログ / ペインログ（Issue #112）も本番ファイルから隔離する

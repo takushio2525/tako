@@ -303,6 +303,13 @@ pub trait ControlHost {
     fn update_repair(&mut self) -> Result<Value, String> {
         Err("この環境では修復を実行できない".into())
     }
+    /// バックエンド tmux セッション名の事前予約（Issue #112）。
+    /// attach は非同期（pending_attach）のため、dispatch 時点では `backend_session` が
+    /// まだ無い。spawn 応答の `tmux_session` とカタログの pending 記録のために、
+    /// GUI は spawn_session と同じ採番でここで先に確定させる（persist OFF / tmux 不在は None）
+    fn reserve_backend_session(&mut self, _pane: PaneId) -> Option<String> {
+        None
+    }
     /// ペインログの現在設定（Issue #112 B）。GUI はライブの PaneLogManager から返す
     fn pane_log_config(&self) -> tako_core::pane_log::PaneLogConfig {
         crate::settings::load().pane_log_config()
@@ -2280,6 +2287,9 @@ fn dispatch_sessions_resume(
     let session_id = session_id.clone();
     let entry = entry.clone();
 
+    // エージェント種別の検証を先に行う（codex / agy は resume 非対応の明示メッセージ）
+    let resume_cmd =
+        crate::sessions::resume_command(&session_id, &entry).map_err(DispatchError::Operation)?;
     // 会話ログ（claude transcript）の実在確認。無ければ resume は成立しない
     if crate::transcript::find_transcript(&session_id).is_none() {
         return Err(DispatchError::Operation(format!(
@@ -2288,10 +2298,10 @@ fn dispatch_sessions_resume(
             crate::sessions::short_id(&session_id)
         )));
     }
-    let resume_cmd =
-        crate::sessions::resume_command(&session_id, &entry).map_err(DispatchError::Operation)?;
 
-    // 分割元の解決: pane > tab > 呼び出し元（resolve_pane の既定）
+    // 分割元の解決: pane > tab > 呼び出し元 > アクティブタブ。
+    // 消失復旧が主用途のため、tako 外の CLI（TAKO_PANE_ID 無し）からも
+    // アクティブタブへのフォールバックで実行できるようにする
     let (tab_id, target) = if let Some(tab_raw) = tab {
         let tab_id = find_tab(host.workspace(), tab_raw)?;
         let focused = host
@@ -2302,7 +2312,14 @@ fn dispatch_sessions_resume(
             .focused();
         (tab_id, focused)
     } else {
-        resolve_pane(host.workspace(), pane)?
+        match resolve_pane(host.workspace(), pane) {
+            Ok(resolved) => resolved,
+            Err(_) if pane.is_none() => {
+                let active = host.workspace().active_tab();
+                (active.id(), active.tree().focused())
+            }
+            Err(e) => return Err(e),
+        }
     };
 
     let cwd = entry
@@ -2942,7 +2959,12 @@ fn dispatch_orchestrator_spawn(
     };
     pane_obj.set_role(Some(pane_role));
 
-    let tmux_session = host.backend_session(new_id);
+    // attach は非同期のため backend セッション名をここで事前予約する（Issue #112。
+    // 従来の `backend_session(new_id)` は spawn 時点で常に None = 応答の tmux_session が
+    // 空で、pane 消失時の tmux フォールバック用の値を master へ渡せていなかった）
+    let tmux_session = host
+        .reserve_backend_session(new_id)
+        .or_else(|| host.backend_session(new_id));
 
     // セッションカタログへ spawn 記録を残す（Issue #112 A）。session_id は claude 起動後に
     // GUI の定期スキャンが検出して昇格する。失敗してもカタログの都合で spawn は止めない

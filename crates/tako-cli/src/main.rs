@@ -2898,10 +2898,13 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 role: None,
                 project: None,
                 limit: None,
+                // 明示指定 → 呼び出し元ペイン（TAKO_PANE_ID）→ None。
+                // None は dispatch がアクティブタブへフォールバックする
+                // （tako 外の CLI からの消失復旧を想定）
                 pane: if tab.is_some() {
                     None
                 } else {
-                    target_pane(*pane)?
+                    pane.or_else(caller_pane)
                 },
                 tab: *tab,
                 direction: direction.as_deref().map(parse_direction).transpose()?,
