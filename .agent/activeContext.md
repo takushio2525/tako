@@ -4,7 +4,11 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-13・#169 projects.yaml 全消失の根治）
+## 現在の対象（2026-07-13・v0.4.0 リリース済み + #169 projects.yaml 全消失の根治）
+
+**v0.4.0 リリース済み**（tag `v0.4.0` = `98b17ea`、バイナリ付き GitHub Release、
+Pages デプロイ、homebrew-tako cask 0.4.0 更新済み）。夜間リリースは launchd
+ローカルジョブへ移行（#166 / PR #170。`com.takushio.tako-nightly-release` 毎日 5:00）。
 
 #169（orchestrator projects.yaml が並行 add で 58 件 → 1 件に全消失）を根本修正。
 根本原因は三段連鎖: ①旧 save = `std::fs::write`（truncate → write の窓で並行プロセスに
@@ -20,7 +24,7 @@
   ロック化、`ensure_defaults` の TOCTOU 解消
 - 詳細は `.agent/architecture.md`「設定ファイル I/O の安全化」節
 
-## 検証済み
+## 検証済み（#169）
 
 - workspace build / test（507 tests）/ fmt / clippy（-D warnings）全緑
 - 根本原因の実証テスト 2 本（空 YAML の 0 件成功パース / truncate 窓での 58→1 再現）
@@ -30,9 +34,11 @@
 
 ## 次の一手
 
-- PR → squash merge → `build-app.sh --install` → Issue #169 クローズ
+- #169: squash merge → `build-app.sh --install` → Issue クローズ
+- 明朝 5:00 の夜間ジョブ初回実行を監視: main が v0.4.0 タグより先行しているため
+  v0.4.1 が自動リリースされる見込み = 全経路の初通し検証
 - tako 再起動後の GUI 確認（manual-checks.md）: 「Web ビューペイン」節（#155）、
-  「#153 節」「#152 節」+ Cmd-Q 経過観察（#103）は継続
+  「#153 節」（cmd ホバー装飾）、「#152 節」（PDF 選択・色分け）+ Cmd-Q 経過観察（#103）
 - Phase 5 の次候補は FR-2.19 localhost ポートパネル・FR-3.10 画像プレビュー等
 
 ## 現フェーズで Read すべき設計書
