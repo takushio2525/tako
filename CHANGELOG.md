@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- Fixed a data-loss bug where a concurrent `projects add` could wipe the entire orchestrator projects.yaml (58 entries → only the added one) (#169). Root cause was a three-part chain: the old save used `std::fs::write` (truncate → write, exposing an empty/partial file to concurrent readers), serde_yaml successfully parses empty/partial content as "0 projects" instead of erroring, and read-modify-write had no cross-process serialization. All config-file writes (projects.yaml, profiles/*.yaml, config.yaml) now go through a new `config_io` layer: atomic writes (tmp + fsync + rename), an exclusive `<path>.lock` file lock serializing read-modify-write across processes, fail-loud behavior that refuses to overwrite an unparseable file (including the profiles-set path that silently reset corrupt profiles to defaults), and automatic rotated backups (`.bak.1`–`.bak.3`) before every content change
+  並行 `projects add` で orchestrator の projects.yaml が全消失する（58 件 → add した 1 件だけになる）データ消失バグを修正（#169）。根本原因は三段連鎖: 旧 save が `std::fs::write`（truncate → write の 2 段階で並行プロセスに空 / 部分ファイルが見える）、serde_yaml が空 / 部分内容をエラーにせず「0 件」として成功パース、read-modify-write のプロセス間直列化なし。設定ファイル（projects.yaml / profiles/*.yaml / config.yaml）の書き込みを新設の `config_io` 層へ集約: アトミック書き込み（tmp + fsync + rename）、`<path>.lock` の排他ロックによるプロセス間 read-modify-write 直列化、パース不能ファイルを絶対に上書きしない fail-loud 化（破損プロファイルを黙って default に戻していた profiles set 経路も修正）、変更のたびの自動世代バックアップ（`.bak.1`〜`.bak.3`）
+
 ## [0.4.0] - 2026-07-13
 
 ### Added

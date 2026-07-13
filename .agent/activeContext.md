@@ -4,39 +4,38 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-13・#155 Web ビュー + #103 Cmd-Q 完了）
+## 現在の対象（2026-07-13・#169 projects.yaml 全消失の根治）
 
-本日 main へマージ済み: #155（Web ビュー wry 化。PR #160 + #163）/ #103（Cmd-Q
-グローバルアクション化。#162。Issue クローズ済み）/ #152 / #153 / #156 / #158。
-`build-app.sh --install` は #162 込みの最新 main で実施済み（0.4.0。反映は tako 再起動後）。
+#169（orchestrator projects.yaml が並行 add で 58 件 → 1 件に全消失）を根本修正。
+根本原因は三段連鎖: ①旧 save = `std::fs::write`（truncate → write の窓で並行プロセスに
+空 / 部分ファイルが見える）②serde_yaml が空 / 部分内容を「0 件」として**成功**パース
+（`#[serde(default)]` + 空 = null。エラーにならない）③read-modify-write のプロセス間
+直列化なし（GUI の MCP dispatch と CLI が別プロセス）。
 
-- Web ビュー = wry `build_as_child`（WKWebView）。直接操作は OS 配送。
-  ページ = `WebViewEntry`（ペイン独立）。ー = dock 退避（生存）、× = 破棄。
-  ステータスバー 🌐 → dock パネル。layout.json 永続化（後方互換）。
-  dispatch `Web` + CLI `tako web` + MCP `tako_web`（9 action、58 ツール不変）。
-  タイトル/URL 追跡 = eval 2 秒ポーリング（ipc は data: URL 不達を実機確認）
-- #103 = Quit を `cx.on_action` グローバル登録へ + 終了処理を `cx.on_app_quit` へ
-  （Dock/OS 終了でも layout 保存。quitting ガードで #30/#113 維持）。
-  根因はフォーカスパス依存: blur（focus=None）で dispatch path が root node のみになり
-  キーバインド・メニュー両経路とも不発（Dock 終了だけ AppKit 経路で生存）
+- 新設 `tako-control::config_io`: アトミック書き込み（tmp + fsync + rename）/
+  `<path>.lock` 排他 flock（std `File::lock`）/ `.bak.1`〜`.bak.3` 世代バックアップ
+- `ProjectsConfig::mutate`・`Profile::mutate_named`・`setup::mutate_config` で
+  ロック付き RMW に統一。パース失敗時は**一切書き込まず Err**（fail-loud）
+- 横展開: profiles set の `unwrap_or_default()` 握りつぶし修正、config.yaml の RMW
+  ロック化、`ensure_defaults` の TOCTOU 解消
+- 詳細は `.agent/architecture.md`「設定ファイル I/O の安全化」節
 
 ## 検証済み
 
-- workspace build / test / fmt / clippy（-D warnings）全緑（#103 rebase 後 494 tests）
-- セルフテスト完走（#155 項目 71 = webview e2e 8 操作を実 WKWebView で通過。
-  #103 最終項目 = blur + cmd-q e2e: 旧構造 FAILED を実測 → 新構造 OK）
-- #155 実機 e2e: セカンダリインスタンス + CLI で open → read（title=Example Domain）→
-  list → close 成功、screencapture でネイティブ描画・🌐 バッジをピクセル確認
-- #103 実機: osascript の実 Cmd-Q キーイベントで隔離インスタンス終了、
-  インストール済み .app（md5 一致 + codesign 検証済み）でセルフテスト完走
+- workspace build / test（507 tests）/ fmt / clippy（-D warnings）全緑
+- 根本原因の実証テスト 2 本（空 YAML の 0 件成功パース / truncate 窓での 58→1 再現）
+- 実機 before/after: 修正前バイナリ = 並行 add 60 件で 48 件消失を再現 →
+  修正後 = 118/118 全件残存 + bak 3 世代生成 + 破損 YAML add 拒否（exit=1・ファイル不変）+
+  bak.1 からの復元 → add 再開成功（すべて隔離 HOME、本物の projects.yaml 不使用）
 
 ## 次の一手
 
+- PR → squash merge → `build-app.sh --install` → Issue #169 クローズ
 - tako 再起動後の GUI 確認（manual-checks.md）: 「Web ビューペイン」節（#155）、
-  「#153 節」（cmd ホバー装飾）、「#152 節」（PDF 選択・色分け）+ Cmd-Q 経過観察（#103）
+  「#153 節」「#152 節」+ Cmd-Q 経過観察（#103）は継続
 - Phase 5 の次候補は FR-2.19 localhost ポートパネル・FR-3.10 画像プレビュー等
 
 ## 現フェーズで Read すべき設計書
 
+- 設定ファイル I/O の安全化（#169）: `.agent/architecture.md` 該当節
 - Web ビュー実装詳細と z オーダー制約: `.agent/architecture.md`「Web ビューペイン」節
-- 手動確認: `.agent/manual-checks.md`「Web ビューペイン」節

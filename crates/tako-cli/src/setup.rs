@@ -9,9 +9,7 @@
 //! （MCP `tako_setup_changes` と共有。二重実装を作らない）。
 
 use std::path::{Path, PathBuf};
-use tako_control::setup::{
-    load_config, pending_changes, save_config, ChangeKind, SetupChange, CHANGES_YAML,
-};
+use tako_control::setup::{load_config, pending_changes, ChangeKind, SetupChange, CHANGES_YAML};
 
 // --- バイナリ埋め込みリソース ---
 
@@ -497,10 +495,11 @@ pub fn run_check() -> Result<(), String> {
 
 /// `tako setup --reset` — config.yaml の setup.completed を false にリセット
 pub fn run_reset() -> Result<(), String> {
-    let mut config = load_config()?;
-    config.setup.completed = false;
-    config.setup.completed_at = None;
-    save_config(&config)?;
+    // ロック付き read-modify-write（#169: 他フィールドの並行更新を巻き戻さない）
+    tako_control::setup::mutate_config(|config| {
+        config.setup.completed = false;
+        config.setup.completed_at = None;
+    })?;
     eprintln!("セットアップ状態をリセットしました。tako setup で再実行できます");
     Ok(())
 }
@@ -595,7 +594,7 @@ pub fn run_setup() -> Result<(), String> {
         .map_err(|e| format!("CLAUDE.md の書き出しに失敗: {e}"))?;
 
     // 4. config.yaml の初回 / 2 回目判定
-    let mut config = load_config()?;
+    let config = load_config()?;
     let is_first_run = !config.setup.completed;
 
     // 4.5 アップデート追従（Issue #94）: 前回セットアップ以降に setup へ入った変更を検出。
@@ -665,14 +664,18 @@ pub fn run_setup() -> Result<(), String> {
         .map_err(|e| format!("claude の起動に失敗: {e}"))?;
 
     if status.success() {
-        // セットアップ完了を記録（適用済み setup リビジョンを含む。Issue #94）
-        config.setup.completed = true;
-        config.setup.completed_at = Some(now_iso8601());
-        config.setup.applied_revision = tako_control::setup::current_revision()?;
-        config.setup.applied_version = Some(env!("CARGO_PKG_VERSION").to_string());
-        save_config(&config)?;
+        // セットアップ完了を記録（適用済み setup リビジョンを含む。Issue #94）。
+        // claude 対話中に他プロセスが config.yaml を更新していても巻き戻さないよう、
+        // 完了フィールドだけをロック付き read-modify-write で更新する（#169）
+        let revision = tako_control::setup::current_revision()?;
+        tako_control::setup::mutate_config(|config| {
+            config.setup.completed = true;
+            config.setup.completed_at = Some(now_iso8601());
+            config.setup.applied_revision = revision;
+            config.setup.applied_version = Some(env!("CARGO_PKG_VERSION").to_string());
+        })?;
         // 追従が完了したので pending-changes.md を消す（stale 防止）
-        sync_pending_changes_file(&dir, &[], config.setup.applied_revision)?;
+        sync_pending_changes_file(&dir, &[], revision)?;
         eprintln!();
         eprintln!("セットアップが完了しました。");
     } else {

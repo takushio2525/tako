@@ -90,25 +90,55 @@ pub struct ResolvedProject {
 impl ProjectsConfig {
     pub fn load() -> Result<Self, String> {
         let path = projects_yaml_path().ok_or("ホームディレクトリが取得できない")?;
+        Self::load_from(&path)
+    }
+
+    /// パス指定版 load（テスト用に公開）。
+    /// ファイル不在は「初期状態」として空を返す。読み取り / パースの失敗は
+    /// **0 件に丸めず Err を返す**（#169: 失敗を空として扱うと後続の save が全件を消す）
+    pub fn load_from(path: &Path) -> Result<Self, String> {
         if !path.is_file() {
             return Ok(ProjectsConfig {
                 projects: std::collections::BTreeMap::new(),
             });
         }
-        let content = std::fs::read_to_string(&path)
+        let content = std::fs::read_to_string(path)
             .map_err(|e| format!("projects.yaml の読み取りに失敗: {e}"))?;
         serde_yaml::from_str(&content).map_err(|e| format!("projects.yaml のパースに失敗: {e}"))
     }
 
+    /// 保存（アトミック書き込み + 世代バックアップ。#169）。
+    /// 注意: `load()` → 変更 → `save()` の素朴な組み合わせは、間に割り込んだ
+    /// 他プロセスの変更を巻き戻す。add / remove は必ず [`Self::mutate`] を使うこと
     pub fn save(&self) -> Result<(), String> {
         let path = projects_yaml_path().ok_or("ホームディレクトリが取得できない")?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
-        }
+        self.save_to(&path)
+    }
+
+    /// パス指定版 save（テスト用に公開）
+    pub fn save_to(&self, path: &Path) -> Result<(), String> {
         let content =
             serde_yaml::to_string(self).map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
-        std::fs::write(&path, content).map_err(|e| format!("projects.yaml の書き込みに失敗: {e}"))
+        crate::config_io::atomic_write_with_backup(path, &content)
+    }
+
+    /// ロック付き read-modify-write（#169 の再発防止本体）。
+    /// `projects.yaml.lock` の排他ロック下で load → f → save を行い、
+    /// 複数プロセス（GUI の MCP dispatch / CLI / 複数 master）の並行 add / remove でも
+    /// 更新が失われない。既存ファイルのパースに失敗した場合は **f を呼ばず、
+    /// 一切書き込まずに** Err を返す
+    pub fn mutate<R>(f: impl FnOnce(&mut Self) -> R) -> Result<R, String> {
+        let path = projects_yaml_path().ok_or("ホームディレクトリが取得できない")?;
+        Self::mutate_at(&path, f)
+    }
+
+    /// パス指定版 mutate（テスト用に公開）
+    pub fn mutate_at<R>(path: &Path, f: impl FnOnce(&mut Self) -> R) -> Result<R, String> {
+        let _lock = crate::config_io::lock_exclusive(path)?;
+        let mut config = Self::load_from(path)?;
+        let result = f(&mut config);
+        config.save_to(path)?;
+        Ok(result)
     }
 
     pub fn list_resolved(&self) -> Vec<ResolvedProject> {
@@ -431,18 +461,40 @@ impl Profile {
         serde_yaml::from_str(&content).map_err(|e| format!("プロファイルのパースに失敗: {e}"))
     }
 
-    /// プロファイルを YAML ファイルに保存する
+    /// プロファイルを YAML ファイルに保存する（アトミック書き込み + 世代バックアップ。#169）
     pub fn save(&self, name: &str) -> Result<PathBuf, String> {
         let path = profile_path(name)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
-        }
         let content =
             serde_yaml::to_string(self).map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
-        std::fs::write(&path, &content)
-            .map_err(|e| format!("プロファイルの書き込みに失敗: {e}"))?;
+        crate::config_io::atomic_write_with_backup(&path, &content)?;
         Ok(path)
+    }
+
+    /// ロック付き read-modify-write（#169。profiles set 用）。
+    /// ファイル不在は default から開始、**パースに失敗した既存ファイルは
+    /// default に丸めず Err で中断する**（丸めて save すると設定が消えるため）
+    pub fn mutate_named<R>(
+        name: &str,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Result<(PathBuf, R), String> {
+        let path = profile_path(name)?;
+        let _lock = crate::config_io::lock_exclusive(&path)?;
+        let mut profile = Self::load_from_or_default(&path)?;
+        let result = f(&mut profile);
+        let content = serde_yaml::to_string(&profile)
+            .map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
+        crate::config_io::atomic_write_with_backup(&path, &content)?;
+        Ok((path, result))
+    }
+
+    /// パス指定版 load。不在なら default、パース失敗は Err（テスト用に公開）
+    pub fn load_from_or_default(path: &Path) -> Result<Self, String> {
+        if !path.is_file() {
+            return Ok(Self::default());
+        }
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("プロファイルの読み取りに失敗: {e}"))?;
+        serde_yaml::from_str(&content).map_err(|e| format!("プロファイルのパースに失敗: {e}"))
     }
 
     /// system prompt のパスを解決する。
@@ -1066,13 +1118,11 @@ worker_model_policy: inherit
 pub fn ensure_defaults() -> Result<PathBuf, String> {
     let dir = config_dir().ok_or("ホームディレクトリが取得できない")?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
+    // projects.yaml が無ければ空テンプレートを作る。ロック付き mutate 経由なので
+    // 「is_file 確認と書き込みの間に他プロセスが実データを書き、それを空で潰す」
+    // TOCTOU が起きない（既存があれば内容不変でスキップ、破損なら Err で中断。#169）
     let yaml_path = dir.join("projects.yaml");
-    if !yaml_path.is_file() {
-        let template = ProjectsConfig {
-            projects: std::collections::BTreeMap::new(),
-        };
-        template.save()?;
-    }
+    ProjectsConfig::mutate_at(&yaml_path, |_| ())?;
     // デフォルトプロファイルが無ければ作成
     let profiles = profiles_dir().ok_or("ホームディレクトリが取得できない")?;
     std::fs::create_dir_all(&profiles)
@@ -1228,6 +1278,203 @@ mod tests {
         let expanded = expand_tilde("~/Documents/test");
         assert!(!expanded.starts_with("~/"));
         assert!(expanded.contains("Documents/test"));
+    }
+
+    /// テスト用の隔離ディレクトリ（実運用の projects.yaml には絶対に触らない）
+    fn isolated_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tako-issue169-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// n 件のエントリを持つ ProjectsConfig を作る
+    fn config_with_entries(n: usize) -> ProjectsConfig {
+        let mut config = ProjectsConfig {
+            projects: std::collections::BTreeMap::new(),
+        };
+        for i in 0..n {
+            config.add(
+                format!("proj-{i:02}"),
+                format!("~/Documents/proj-{i:02}"),
+                Some(format!(
+                    "テスト用プロジェクト {i}（日本語 description: URL https://example.com/{i}）"
+                )),
+            );
+        }
+        config
+    }
+
+    /// #169 根本原因の実証（その 1）: serde_yaml は空文字列・`projects:` だけの
+    /// 部分内容を「0 件」として**成功**パースする（エラーにならない）。
+    /// 旧実装の `std::fs::write`（truncate → write）の窓で並行プロセスが読んだ
+    /// 空 / 部分ファイルが正常な 0 件と区別できず、0 件ベースの add → save が
+    /// 全エントリを消した。この性質が serde_yaml 更新で変わったら気付くための固定
+    #[test]
+    fn issue_169_empty_and_partial_yaml_parse_as_zero_projects() {
+        // 空文字列（truncate 直後の 0 バイトファイル相当）→ Ok(0 件)
+        let empty: ProjectsConfig = serde_yaml::from_str("").unwrap();
+        assert_eq!(empty.projects.len(), 0);
+        // `projects:` ヘッダ行までの部分書き込み相当 → Ok(0 件)
+        let partial_header: ProjectsConfig = serde_yaml::from_str("projects:\n").unwrap();
+        assert_eq!(partial_header.projects.len(), 0);
+        // 値の途中で切れた場合だけはパースエラーになる
+        assert!(serde_yaml::from_str::<ProjectsConfig>("projects:\n  tako:\n    cw").is_err());
+    }
+
+    /// #169 根本原因の実証（その 2）: 旧実装の消失機序をファイル操作で再現する。
+    /// 58 件のファイルに対し「別プロセスの save が truncate した瞬間」を再現すると、
+    /// load は Err ではなく Ok(0 件) を返し、その 0 件へ add → save した結果が
+    /// 「add した 1 件だけのファイル」= 事故当日の projects.yaml と一致する
+    #[test]
+    fn issue_169_truncate_window_reproduces_total_loss() {
+        let dir = isolated_dir("truncate-window");
+        let path = dir.join("projects.yaml");
+        config_with_entries(58).save_to(&path).unwrap();
+
+        // 旧 save = std::fs::write は File::create（truncate）→ write の 2 段階。
+        // truncate と write の間に他プロセスの load が走った状況を再現する
+        drop(std::fs::File::create(&path).unwrap());
+
+        let loaded = ProjectsConfig::load_from(&path).unwrap();
+        assert_eq!(
+            loaded.projects.len(),
+            0,
+            "空ファイルが 0 件として成功パースされる（エラーにならない）"
+        );
+
+        // 0 件ベースに add → save = 事故の書き込み。結果は 1 件だけのファイル
+        let mut lost = loaded;
+        lost.add(
+            "tako-wt-release".into(),
+            "~/Documents/tako-wt-release".into(),
+            None,
+        );
+        lost.save_to(&path).unwrap();
+        let after = ProjectsConfig::load_from(&path).unwrap();
+        assert_eq!(after.projects.len(), 1, "58 件 → 1 件の全消失が再現された");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #169 修正の固定: mutate_at はアトミック書き込み（tmp + rename）なので
+    /// truncate 状態がそもそも発生せず、並行プロセスの add が互いを消さない。
+    /// 16 スレッド × 各 4 件 = 64 件の並行 add 後、初期 58 件 + 64 件が全件残る
+    #[test]
+    fn issue_169_concurrent_mutate_preserves_all_entries() {
+        let dir = isolated_dir("concurrent");
+        let path = dir.join("projects.yaml");
+        config_with_entries(58).save_to(&path).unwrap();
+
+        let mut handles = Vec::new();
+        for t in 0..16 {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..4 {
+                    ProjectsConfig::mutate_at(&path, |config| {
+                        config.add(
+                            format!("thread-{t:02}-entry-{i}"),
+                            format!("~/tmp/t{t}-{i}"),
+                            None,
+                        );
+                    })
+                    .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let after = ProjectsConfig::load_from(&path).unwrap();
+        assert_eq!(
+            after.projects.len(),
+            58 + 16 * 4,
+            "並行 add で 1 件も消えない（修正前は read-modify-write 競合で消えた）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #169 修正の固定: 破損 YAML への mutate は Err で中断し、ファイルには
+    /// 1 バイトも書かない（バックアップ回転も起こさない）
+    #[test]
+    fn issue_169_mutate_rejects_corrupted_yaml_without_touching_file() {
+        let dir = isolated_dir("corrupted");
+        let path = dir.join("projects.yaml");
+        // 値の途中で切れた壊れ YAML（truncate 事故や手編集ミス相当）
+        let corrupted = "projects:\n  tako:\n    cw";
+        std::fs::write(&path, corrupted).unwrap();
+
+        let result = ProjectsConfig::mutate_at(&path, |config| {
+            config.add("new".into(), "~/tmp/new".into(), None);
+        });
+        assert!(result.is_err(), "破損 YAML への add はエラーになる");
+        assert!(
+            result.unwrap_err().contains("パースに失敗"),
+            "パース失敗を明示するエラーメッセージ"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            corrupted,
+            "破損ファイルは 1 バイトも書き換えられない"
+        );
+        assert!(
+            !crate::config_io::backup_path(&path, 1).exists(),
+            "書き込みが走っていないのでバックアップも生まれない"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// mutate_at はファイル不在から空で開始してファイルを作る
+    /// （ensure_defaults の TOCTOU 置き換えと CLI 初回 add の経路）
+    #[test]
+    fn mutate_creates_file_when_missing() {
+        let dir = isolated_dir("create");
+        let path = dir.join("projects.yaml");
+        ProjectsConfig::mutate_at(&path, |config| {
+            config.add("first".into(), "~/tmp/first".into(), None);
+        })
+        .unwrap();
+        let after = ProjectsConfig::load_from(&path).unwrap();
+        assert_eq!(after.projects.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #169: 書き込み前の自動バックアップ。直前世代が .bak.1 に残り、
+    /// 誤消去してもロールバックできる
+    #[test]
+    fn issue_169_backup_generation_on_each_change() {
+        let dir = isolated_dir("backup");
+        let path = dir.join("projects.yaml");
+        config_with_entries(3).save_to(&path).unwrap();
+        ProjectsConfig::mutate_at(&path, |config| {
+            config.add("added".into(), "~/tmp/added".into(), None);
+        })
+        .unwrap();
+
+        let backup = crate::config_io::backup_path(&path, 1);
+        assert!(backup.is_file(), "変更前の内容が .bak.1 に残る");
+        let backed_up = ProjectsConfig::load_from(&backup).unwrap();
+        assert_eq!(backed_up.projects.len(), 3, "バックアップは変更前の 3 件");
+        let current = ProjectsConfig::load_from(&path).unwrap();
+        assert_eq!(current.projects.len(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #169 横展開: パースできないプロファイルへの mutate_named 相当も
+    /// default に丸めて上書きせず Err で中断する（旧実装は unwrap_or_default で
+    /// 破損プロファイルを default に丸めて保存 = 設定消失だった）
+    #[test]
+    fn issue_169_profile_load_from_or_default_fails_loud_on_corruption() {
+        let dir = isolated_dir("profile-corrupt");
+        let path = dir.join("broken.yaml");
+        std::fs::write(&path, "effort: [unclosed").unwrap();
+        let result = Profile::load_from_or_default(&path);
+        assert!(result.is_err(), "破損プロファイルは default に丸めない");
+        // 不在は default から開始できる（初回 set の正当ケース）
+        let missing = Profile::load_from_or_default(&dir.join("missing.yaml")).unwrap();
+        assert_eq!(missing.effort, Profile::default().effort);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

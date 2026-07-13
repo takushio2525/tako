@@ -605,3 +605,11 @@
   修正 = `cx.on_action` グローバル化 + 終了処理を `cx.on_app_quit` へ（Dock/OS 終了でも layout 保存。quitting ガードで #30/#113 維持）
 - 検証: 同一セルフテスト（blur + cmd-q）が旧構造 FAILED → 新構造 OK / 実 Cmd-Q キーイベントで隔離インスタンス終了 /
   exit 全ペイン終了経路の回帰なし / 486 tests + fmt + clippy 全緑
+
+## 2026-07-13（#169: projects.yaml 並行 add 全消失の根治 — config_io 新設）
+- 根本原因を実証テストで確定: ①旧 save = fs::write の truncate→write 窓 ②serde_yaml が
+  空 / 部分 YAML を「0 件」で成功パース ③RMW のプロセス間直列化なし、の三段連鎖。
+  新設 `config_io`（アトミック書き込み + `<path>.lock` flock + .bak.1〜3 世代バックアップ）へ
+  projects.yaml / profiles/*.yaml / config.yaml の書き込みを集約、mutate 系 API で fail-loud 化
+- 検証: 507 tests / fmt / clippy 全緑 + 実機 before/after（修正前 = 並行 add 60 件で 48 件消失、
+  修正後 = 118/118 全件残存・破損 YAML 拒否・bak 復元成功。隔離 HOME）
