@@ -483,12 +483,32 @@ impl TakoApp {
                 edit.dirty(),
                 edit.message.clone(),
                 edit.buffer.line_byte_col(edit.buffer.cursor()),
+                edit.save_status.clone(),
+                edit.autosave,
+                edit.search_visible,
+                edit.search_query.clone(),
+                edit.search_hits.len(),
+                edit.search_index,
+                edit.replace_text.clone(),
             )
         });
         let editing = edit_info.as_ref().is_some_and(|info| info.0);
         let dirty = edit_info.as_ref().is_some_and(|info| info.1);
         let edit_message = edit_info.as_ref().and_then(|info| info.2.clone());
         let edit_cursor = edit_info.as_ref().filter(|info| info.0).map(|info| info.3);
+        let save_status = edit_info.as_ref().and_then(|info| info.4.clone());
+        let autosave = edit_info.as_ref().is_some_and(|info| info.5);
+        let search_visible = edit_info.as_ref().is_some_and(|info| info.6);
+        let search_query = edit_info
+            .as_ref()
+            .map(|info| info.7.clone())
+            .unwrap_or_default();
+        let search_total = edit_info.as_ref().map(|info| info.8).unwrap_or(0);
+        let search_index = edit_info.as_ref().map(|info| info.9).unwrap_or(0);
+        let _replace_text = edit_info
+            .as_ref()
+            .map(|info| info.10.clone())
+            .unwrap_or_default();
         let editable = matches!(
             &state.content,
             preview::PreviewContent::Code(_) | preview::PreviewContent::Markdown(_)
@@ -1177,11 +1197,22 @@ impl TakoApp {
                                     preview::PreviewMode::Pdf => "📕",
                                     _ => "📄",
                                 };
-                                format!(
-                                    "{icon} {}{}",
-                                    truncate(&file_name, 36),
-                                    if dirty { " ●" } else { "" }
-                                )
+                                {
+                                    let suffix = if autosave {
+                                        match &save_status {
+                                            Some(preview::SaveStatus::Saved) => " ✓",
+                                            Some(preview::SaveStatus::Conflict) => " ⚠ 競合",
+                                            Some(preview::SaveStatus::Error(_)) => " ⚠ エラー",
+                                            None if dirty => " ●",
+                                            None => "",
+                                        }
+                                    } else if dirty {
+                                        " ●"
+                                    } else {
+                                        ""
+                                    };
+                                    format!("{icon} {}{suffix}", truncate(&file_name, 36))
+                                }
                             })),
                     )
                     .child(div().flex_grow(1.0))
@@ -1242,7 +1273,7 @@ impl TakoApp {
                                 "✎ 編集"
                             })
                     }))
-                    .children(dirty.then(|| {
+                    .children((dirty && !autosave).then(|| {
                         div()
                             .id(("preview-save", pane_id.as_u64()))
                             .px_1()
@@ -1280,6 +1311,37 @@ impl TakoApp {
                             .child(SharedString::from(truncate(&path_label, 40))),
                     ),
             )
+            .when(search_visible, |el| {
+                let sq = search_query.clone();
+                let si = search_index;
+                let st = search_total;
+                el.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .py(px(4.0))
+                        .bg(rgba_alpha(theme.tab_active_background, 0.9))
+                        .text_size(px(12.0))
+                        .child(SharedString::from(format!(
+                            "🔍 {}",
+                            if sq.is_empty() {
+                                "(⌘F で検索)"
+                            } else {
+                                &sq
+                            }
+                        )))
+                        .child(div().flex_grow(1.0))
+                        .when(st > 0, |el| {
+                            el.child(SharedString::from(format!("{}/{st}", si + 1)))
+                        })
+                        .when(st == 0 && !sq.is_empty(), |el| {
+                            el.child(div().text_color(hsla(theme.yellow)).child("見つかりません"))
+                        }),
+                )
+            })
             .child({
                 // テキスト行を保存（選択テキスト抽出用）
                 self.preview_line_texts.insert(pane_id, line_texts);

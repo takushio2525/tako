@@ -756,10 +756,10 @@ struct TakoApp {
     sleep_guard_active: bool,
     /// 起動時に orphan 自動復帰した tmux セッション数（Issue #191。診断用）
     recovered_count: usize,
-    /// ペインの平文ログ管理（Issue #112 B）。UI スレッド（直接ペインの増分取り込み・
-    /// クローズフラッシュ）と background（tmux バックエンドの capture 取り込み）の
-    /// 両方から Mutex 越しに使う（クリティカルセクションは小さな追記のみ）
+    /// ペインの平文ログ管理（Issue #112 B）
     pane_logs: std::sync::Arc<std::sync::Mutex<tako_core::pane_log::PaneLogManager>>,
+    /// 自動保存が必要なプレビューペイン（デバウンスタイマーで消費。#195）
+    autosave_pending: std::collections::HashSet<PaneId>,
 }
 
 /// × ボタン close の確認ダイアログ対象（Issue #172）
@@ -1583,6 +1583,7 @@ impl TakoApp {
                     tako_control::settings::load().pane_log_config(),
                 ),
             )),
+            autosave_pending: std::collections::HashSet::new(),
         };
         // App Nap 無効化 + 初回スリープ防止更新（Issue #173）
         tako_control::sleep_guard::disable_app_nap();
@@ -4578,6 +4579,202 @@ impl TakoApp {
         cx.notify();
     }
 
+    fn preview_undo_local(&mut self, pane_id: PaneId) -> Result<bool, String> {
+        let edit = self
+            .preview_edits
+            .get_mut(&pane_id)
+            .ok_or_else(|| "編集モードを開始していない".to_string())?;
+        let undone = edit.buffer.undo();
+        if undone {
+            edit.message = None;
+            edit.save_status = None;
+            self.refresh_preview_from_editor(pane_id);
+        }
+        Ok(undone)
+    }
+
+    fn preview_redo_local(&mut self, pane_id: PaneId) -> Result<bool, String> {
+        let edit = self
+            .preview_edits
+            .get_mut(&pane_id)
+            .ok_or_else(|| "編集モードを開始していない".to_string())?;
+        let redone = edit.buffer.redo();
+        if redone {
+            edit.message = None;
+            edit.save_status = None;
+            self.refresh_preview_from_editor(pane_id);
+        }
+        Ok(redone)
+    }
+
+    fn preview_search_local(
+        &mut self,
+        pane_id: PaneId,
+        query: Option<String>,
+        direction: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        // 閲覧中でも検索可能にするため、編集セッションが無ければバッファを開く
+        if !self.preview_edits.contains_key(&pane_id) && self.previews.contains_key(&pane_id) {
+            let state = self.previews.get(&pane_id).unwrap();
+            if let Ok(mut new_edit) = preview::EditState::open(state) {
+                new_edit.editing = false;
+                self.preview_edits.insert(pane_id, new_edit);
+            }
+        }
+        let edit = self
+            .preview_edits
+            .get_mut(&pane_id)
+            .ok_or_else(|| "プレビューペインではない".to_string())?;
+        if let Some(q) = query {
+            edit.search_query = q;
+            edit.search_hits = edit.buffer.find_all(&edit.search_query);
+            edit.search_index = 0;
+        }
+        match direction.unwrap_or("next") {
+            "prev" => {
+                if let Some(hit) = edit
+                    .buffer
+                    .find_prev(&edit.search_query, edit.buffer.cursor())
+                {
+                    edit.buffer.set_cursor(hit.start, false);
+                    edit.search_index = edit
+                        .search_hits
+                        .iter()
+                        .position(|h| h.start == hit.start)
+                        .unwrap_or(0);
+                }
+            }
+            _ => {
+                let from = if edit.search_hits.is_empty() {
+                    0
+                } else {
+                    edit.buffer.cursor()
+                        + edit.buffer.text()[edit.buffer.cursor()..]
+                            .chars()
+                            .next()
+                            .map(char::len_utf8)
+                            .unwrap_or(0)
+                };
+                if let Some(hit) = edit.buffer.find_next(&edit.search_query, from) {
+                    edit.buffer.set_cursor(hit.start, false);
+                    edit.search_index = edit
+                        .search_hits
+                        .iter()
+                        .position(|h| h.start == hit.start)
+                        .unwrap_or(0);
+                }
+            }
+        }
+        let total = edit.search_hits.len();
+        let index = if total > 0 { edit.search_index + 1 } else { 0 };
+        Ok(serde_json::json!({
+            "query": edit.search_query,
+            "total": total,
+            "index": index,
+        }))
+    }
+
+    fn preview_replace_local(
+        &mut self,
+        pane_id: PaneId,
+        query: &str,
+        replacement: &str,
+        all: bool,
+    ) -> Result<serde_json::Value, String> {
+        let edit = self
+            .preview_edits
+            .get_mut(&pane_id)
+            .ok_or_else(|| "編集モードを開始していない".to_string())?;
+        if !edit.editing {
+            return Err("編集モードが無効".into());
+        }
+        if all {
+            let count = edit.buffer.replace_all(query, replacement);
+            edit.search_hits = edit.buffer.find_all(&edit.search_query);
+            self.refresh_preview_from_editor(pane_id);
+            self.schedule_autosave(pane_id);
+            Ok(serde_json::json!({ "replaced": count }))
+        } else {
+            let hits = edit.buffer.find_all(query);
+            if let Some(hit) = hits.into_iter().find(|h| h.start >= edit.buffer.cursor()) {
+                edit.buffer.replace_range(hit.start..hit.end, replacement);
+                edit.search_hits = edit.buffer.find_all(&edit.search_query);
+                self.refresh_preview_from_editor(pane_id);
+                self.schedule_autosave(pane_id);
+                Ok(serde_json::json!({ "replaced": 1 }))
+            } else if let Some(hit) = edit.buffer.find_all(query).into_iter().next() {
+                edit.buffer.replace_range(hit.start..hit.end, replacement);
+                edit.search_hits = edit.buffer.find_all(&edit.search_query);
+                self.refresh_preview_from_editor(pane_id);
+                self.schedule_autosave(pane_id);
+                Ok(serde_json::json!({ "replaced": 1 }))
+            } else {
+                Ok(serde_json::json!({ "replaced": 0 }))
+            }
+        }
+    }
+
+    fn schedule_autosave(&mut self, pane_id: PaneId) {
+        if !self
+            .preview_edits
+            .get(&pane_id)
+            .is_some_and(|edit| edit.autosave && edit.editing && edit.dirty())
+        {
+            return;
+        }
+        if self.autosave_pending.contains(&pane_id) {
+            return;
+        }
+        self.autosave_pending.insert(pane_id);
+    }
+
+    fn start_autosave_timer(&self, pane_id: PaneId, cx: &mut Context<Self>) {
+        if !self.autosave_pending.contains(&pane_id) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(500))
+                .await;
+            this.update(cx, |this, cx| {
+                this.run_autosave(pane_id);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn run_autosave(&mut self, pane_id: PaneId) {
+        if !self.autosave_pending.remove(&pane_id) {
+            return;
+        }
+        if !self
+            .preview_edits
+            .get(&pane_id)
+            .is_some_and(|edit| edit.autosave && edit.editing && edit.dirty())
+        {
+            return;
+        }
+        match self.save_preview_local(pane_id) {
+            Ok(()) => {
+                if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
+                    edit.save_status = Some(preview::SaveStatus::Saved);
+                    edit.message = None;
+                }
+            }
+            Err(msg) => {
+                if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
+                    if msg.contains("外部") {
+                        edit.save_status = Some(preview::SaveStatus::Conflict);
+                    } else {
+                        edit.save_status = Some(preview::SaveStatus::Error(msg));
+                    }
+                }
+            }
+        }
+    }
+
     fn handle_preview_edit_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
         use tako_core::CursorMovement;
 
@@ -4641,9 +4838,14 @@ impl TakoApp {
             }
             _ => false,
         };
+        let is_text_change = matches!(keystroke.key.as_str(), "backspace" | "delete" | "enter");
         if handled {
             edit.message = None;
             self.refresh_preview_from_editor(pane_id);
+            if is_text_change {
+                self.schedule_autosave(pane_id);
+                self.start_autosave_timer(pane_id, cx);
+            }
             cx.notify();
         }
         handled
@@ -4665,6 +4867,8 @@ impl TakoApp {
                 edit.message = None;
             }
             self.refresh_preview_from_editor(pane_id);
+            self.schedule_autosave(pane_id);
+            self.start_autosave_timer(pane_id, cx);
         } else if let Some(session) = self.focused_session() {
             session.paste(&text);
         }
@@ -8316,6 +8520,46 @@ impl ControlHost for TakoApp {
         self.save_preview_local(pane)
     }
 
+    fn preview_undo(&mut self, pane: PaneId) -> Result<bool, String> {
+        self.preview_undo_local(pane)
+    }
+
+    fn preview_redo(&mut self, pane: PaneId) -> Result<bool, String> {
+        self.preview_redo_local(pane)
+    }
+
+    fn preview_autosave(&self, pane: PaneId) -> Option<bool> {
+        self.preview_edits.get(&pane).map(|edit| edit.autosave)
+    }
+
+    fn set_preview_autosave(&mut self, pane: PaneId, enabled: bool) -> Result<(), String> {
+        let edit = self
+            .preview_edits
+            .get_mut(&pane)
+            .ok_or_else(|| "編集モードを開始していない".to_string())?;
+        edit.autosave = enabled;
+        Ok(())
+    }
+
+    fn preview_search(
+        &mut self,
+        pane: PaneId,
+        query: Option<String>,
+        direction: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        self.preview_search_local(pane, query, direction)
+    }
+
+    fn preview_replace(
+        &mut self,
+        pane: PaneId,
+        query: &str,
+        replacement: &str,
+        all: bool,
+    ) -> Result<serde_json::Value, String> {
+        self.preview_replace_local(pane, query, replacement, all)
+    }
+
     fn preview_pane_of_tab(&self, tab: TabId) -> Option<PaneId> {
         self.workspace
             .get_tab(tab)?
@@ -8641,9 +8885,12 @@ impl EntityInputHandler for TakoApp {
                 .get_mut(&ime.pane)
                 .filter(|edit| edit.editing)
             {
+                let p = ime.pane;
                 edit.buffer.insert(&ime.text);
                 edit.message = None;
-                self.refresh_preview_from_editor(ime.pane);
+                self.refresh_preview_from_editor(p);
+                self.schedule_autosave(p);
+                self.start_autosave_timer(p, cx);
             } else if let Some(session) = self.terminals.get(&ime.pane) {
                 session.write(ime.text.into_bytes());
             }
@@ -8688,6 +8935,8 @@ impl EntityInputHandler for TakoApp {
             edit.message = None;
             self.ime = None;
             self.refresh_preview_from_editor(pane);
+            self.schedule_autosave(pane);
+            self.start_autosave_timer(pane, cx);
             cx.notify();
             return;
         }
@@ -9115,6 +9364,31 @@ impl Render for TakoApp {
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.copy_selection(cx)))
             .on_action(cx.listener(|this, _: &PasteClipboard, _, cx| this.paste(cx)))
             .on_action(cx.listener(|this, _: &SavePreview, _, cx| this.save_focused_preview(cx)))
+            .on_action(cx.listener(|this, _: &UndoPreview, _, cx| {
+                let pane_id = this.focused_pane();
+                let _ = this.preview_undo_local(pane_id);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &RedoPreview, _, cx| {
+                let pane_id = this.focused_pane();
+                let _ = this.preview_redo_local(pane_id);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &FindPreview, _, cx| {
+                let pane_id = this.focused_pane();
+                if let Some(edit) = this.preview_edits.get_mut(&pane_id) {
+                    edit.search_visible = !edit.search_visible;
+                } else if this.previews.contains_key(&pane_id) {
+                    if let Ok(mut new_edit) =
+                        preview::EditState::open(this.previews.get(&pane_id).unwrap())
+                    {
+                        new_edit.editing = false;
+                        new_edit.search_visible = true;
+                        this.preview_edits.insert(pane_id, new_edit);
+                    }
+                }
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.toggle_filetree();
                 cx.notify();
@@ -11154,7 +11428,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 63, "MCP tools/list は 63 ツール");
+            check(status == 200 && tool_count == 68, "MCP tools/list は 68 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)

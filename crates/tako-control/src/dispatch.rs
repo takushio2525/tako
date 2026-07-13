@@ -155,6 +155,41 @@ pub trait ControlHost {
     fn save_preview(&mut self, _pane: PaneId) -> Result<(), String> {
         Err("プレビュー編集は未対応".into())
     }
+    /// undo（#195）
+    fn preview_undo(&mut self, _pane: PaneId) -> Result<bool, String> {
+        Err("プレビュー編集は未対応".into())
+    }
+    /// redo（#195）
+    fn preview_redo(&mut self, _pane: PaneId) -> Result<bool, String> {
+        Err("プレビュー編集は未対応".into())
+    }
+    /// 自動保存の状態取得（#195）
+    fn preview_autosave(&self, _pane: PaneId) -> Option<bool> {
+        None
+    }
+    /// 自動保存の設定変更（#195）
+    fn set_preview_autosave(&mut self, _pane: PaneId, _enabled: bool) -> Result<(), String> {
+        Err("プレビュー編集は未対応".into())
+    }
+    /// 検索クエリの設定とヒット取得（#195）
+    fn preview_search(
+        &mut self,
+        _pane: PaneId,
+        _query: Option<String>,
+        _direction: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        Err("プレビュー編集は未対応".into())
+    }
+    /// 置換（#195）
+    fn preview_replace(
+        &mut self,
+        _pane: PaneId,
+        _query: &str,
+        _replacement: &str,
+        _all: bool,
+    ) -> Result<serde_json::Value, String> {
+        Err("プレビュー編集は未対応".into())
+    }
     /// タブ内の既存プレビューペイン（OpenFile の再利用先。VSCode のプレビュータブ相当）
     fn preview_pane_of_tab(&self, _tab: TabId) -> Option<PaneId> {
         None
@@ -1423,6 +1458,76 @@ fn dispatch_inner(
                 "editing": editing,
                 "dirty": dirty,
                 "saved": true,
+            }))
+        }
+        Request::PreviewUndo { pane } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let undone = host
+                .preview_undo(target)
+                .map_err(DispatchError::Operation)?;
+            let (editing, dirty) = host.preview_edit_state(target).unwrap_or((false, false));
+            Ok(json!({
+                "pane": target.as_u64(),
+                "editing": editing,
+                "dirty": dirty,
+                "undone": undone,
+            }))
+        }
+        Request::PreviewRedo { pane } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let redone = host
+                .preview_redo(target)
+                .map_err(DispatchError::Operation)?;
+            let (editing, dirty) = host.preview_edit_state(target).unwrap_or((false, false));
+            Ok(json!({
+                "pane": target.as_u64(),
+                "editing": editing,
+                "dirty": dirty,
+                "redone": redone,
+            }))
+        }
+        Request::PreviewAutosave { pane, enabled } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            if let Some(enabled) = enabled {
+                host.set_preview_autosave(target, enabled)
+                    .map_err(DispatchError::Operation)?;
+            }
+            let autosave = host.preview_autosave(target).unwrap_or(true);
+            Ok(json!({
+                "pane": target.as_u64(),
+                "autosave": autosave,
+            }))
+        }
+        Request::PreviewSearch {
+            pane,
+            query,
+            direction,
+        } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let result = host
+                .preview_search(target, query, direction.as_deref())
+                .map_err(DispatchError::Operation)?;
+            Ok(json!({
+                "pane": target.as_u64(),
+                "search": result,
+            }))
+        }
+        Request::PreviewReplace {
+            pane,
+            query,
+            replacement,
+            all,
+        } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let result = host
+                .preview_replace(target, &query, &replacement, all.unwrap_or(false))
+                .map_err(DispatchError::Operation)?;
+            let (editing, dirty) = host.preview_edit_state(target).unwrap_or((false, false));
+            Ok(json!({
+                "pane": target.as_u64(),
+                "editing": editing,
+                "dirty": dirty,
+                "replace": result,
             }))
         }
         Request::FileOp {

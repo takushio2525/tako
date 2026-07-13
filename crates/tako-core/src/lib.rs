@@ -43,7 +43,7 @@ pub use terminal::{
     login_shell_command, AgentMetrics, CommandState, SelectionKind, SessionError, SessionEvent,
     SessionNotice, SpawnCommand, SpawnOptions, TermEvent, TerminalSession,
 };
-pub use text_edit::{CursorMovement, TextBuffer, TextEditError};
+pub use text_edit::{CursorMovement, SearchHit, TextBuffer, TextEditError};
 pub use theme::{Rgb, Theme};
 pub use tmux::{TmuxSession, TmuxWindow};
 pub use workspace::{BackgroundPane, Workspace, WorkspaceError};

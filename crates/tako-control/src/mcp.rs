@@ -710,6 +710,69 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_preview_undo",
+            "description": "コードプレビュー編集の undo。直前の編集操作を取り消す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象プレビューペイン ID（省略時は呼び出し元）"),
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_preview_redo",
+            "description": "コードプレビュー編集の redo。取り消した操作をやり直す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象プレビューペイン ID（省略時は呼び出し元）"),
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_preview_search",
+            "description": "コードプレビューのテキスト検索。query でインクリメンタル検索し、direction で移動（next/prev）。\
+                編集モードでなくても使える。query 省略時は現在の検索状態を返す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象プレビューペイン ID（省略時は呼び出し元）"),
+                    "query": { "type": "string", "description": "検索文字列（大文字小文字区別なし）" },
+                    "direction": { "type": "string", "enum": ["next", "prev"], "description": "移動方向（省略時は next）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_preview_replace",
+            "description": "コードプレビューのテキスト置換。query に一致する箇所を replacement で置換する。all=true で全置換。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象プレビューペイン ID（省略時は呼び出し元）"),
+                    "query": { "type": "string", "description": "検索文字列" },
+                    "replacement": { "type": "string", "description": "置換文字列" },
+                    "all": { "type": "boolean", "description": "true = 全置換、false = 1 件（既定 false）" },
+                },
+                "required": ["query", "replacement"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_preview_autosave",
+            "description": "コードプレビュー編集の自動保存設定。enabled 省略時は状態取得のみ。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象プレビューペイン ID（省略時は呼び出し元）"),
+                    "enabled": { "type": "boolean", "description": "true = 自動保存 ON（既定）、false = 手動保存" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_file_op",
             "description": "ファイル操作を実行する。op で種別を指定:\n\
                 copy_absolute_path = 絶対パスを取得 / copy_relative_path = ペイン cwd 基準の相対パスを取得 /\n\
@@ -1778,6 +1841,27 @@ fn build_request(
         "tako_preview_save" => Request::PreviewSave {
             pane: Some(target_pane(args, caller)?),
         },
+        "tako_preview_undo" => Request::PreviewUndo {
+            pane: Some(target_pane(args, caller)?),
+        },
+        "tako_preview_redo" => Request::PreviewRedo {
+            pane: Some(target_pane(args, caller)?),
+        },
+        "tako_preview_search" => Request::PreviewSearch {
+            pane: Some(target_pane(args, caller)?),
+            query: str_arg(args, "query")?,
+            direction: str_arg(args, "direction")?,
+        },
+        "tako_preview_replace" => Request::PreviewReplace {
+            pane: Some(target_pane(args, caller)?),
+            query: str_arg(args, "query")?.ok_or("query を指定する")?,
+            replacement: str_arg(args, "replacement")?.ok_or("replacement を指定する")?,
+            all: bool_arg(args, "all")?,
+        },
+        "tako_preview_autosave" => Request::PreviewAutosave {
+            pane: Some(target_pane(args, caller)?),
+            enabled: bool_arg(args, "enabled")?,
+        },
         "tako_file_op" => {
             let op_str = str_arg(args, "op")?.ok_or("op を指定する")?;
             let op = match op_str.as_str() {
@@ -2541,7 +2625,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 63);
+        assert_eq!(tools.len(), 68);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

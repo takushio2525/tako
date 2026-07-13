@@ -667,6 +667,45 @@ enum EditCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
+    /// 直前の編集を取り消す（undo）
+    Undo {
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// 取り消した編集をやり直す（redo）
+    Redo {
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// テキスト検索（query 省略時は現在の検索状態を返す）
+    Search {
+        /// 検索文字列
+        query: Option<String>,
+        /// 移動方向（next / prev）
+        #[arg(long, default_value = "next")]
+        direction: String,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// テキスト置換（1 件または全置換）
+    Replace {
+        /// 検索文字列
+        query: String,
+        /// 置換文字列
+        replacement: String,
+        /// 全置換
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// 自動保存の設定（enabled 省略時は状態取得）
+    Autosave {
+        /// true = ON、false = OFF（省略時は状態取得）
+        enabled: Option<bool>,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2418,6 +2457,36 @@ fn build_request(command: &Command) -> Result<Request, String> {
             EditCommand::Save { pane } => Request::PreviewSave {
                 pane: target_pane(*pane)?,
             },
+            EditCommand::Undo { pane } => Request::PreviewUndo {
+                pane: target_pane(*pane)?,
+            },
+            EditCommand::Redo { pane } => Request::PreviewRedo {
+                pane: target_pane(*pane)?,
+            },
+            EditCommand::Search {
+                query,
+                direction,
+                pane,
+            } => Request::PreviewSearch {
+                pane: target_pane(*pane)?,
+                query: query.clone(),
+                direction: Some(direction.clone()),
+            },
+            EditCommand::Replace {
+                query,
+                replacement,
+                all,
+                pane,
+            } => Request::PreviewReplace {
+                pane: target_pane(*pane)?,
+                query: query.clone(),
+                replacement: replacement.clone(),
+                all: Some(*all),
+            },
+            EditCommand::Autosave { enabled, pane } => Request::PreviewAutosave {
+                pane: target_pane(*pane)?,
+                enabled: *enabled,
+            },
         },
         Command::Tab(TabCommand::New { title }) => Request::TabNew {
             title: title.clone(),
@@ -3476,7 +3545,7 @@ mod tests {
     }
 
     #[test]
-    fn editサブコマンドを3操作へ写す() {
+    fn editサブコマンドを操作へ写す() {
         let command = parse(&["tako", "edit", "start", "--pane", "5"]);
         assert_eq!(
             build_request(&command).unwrap(),
@@ -3497,6 +3566,45 @@ mod tests {
         assert_eq!(
             build_request(&command).unwrap(),
             Request::PreviewSave { pane: Some(5) }
+        );
+        let command = parse(&["tako", "edit", "undo", "--pane", "5"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewUndo { pane: Some(5) }
+        );
+        let command = parse(&["tako", "edit", "redo", "--pane", "5"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewRedo { pane: Some(5) }
+        );
+        let command = parse(&["tako", "edit", "search", "hello", "--pane", "5"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewSearch {
+                pane: Some(5),
+                query: Some("hello".into()),
+                direction: Some("next".into()),
+            }
+        );
+        let command = parse(&[
+            "tako", "edit", "replace", "old", "new", "--all", "--pane", "5",
+        ]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewReplace {
+                pane: Some(5),
+                query: "old".into(),
+                replacement: "new".into(),
+                all: Some(true),
+            }
+        );
+        let command = parse(&["tako", "edit", "autosave", "true", "--pane", "5"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewAutosave {
+                pane: Some(5),
+                enabled: Some(true),
+            }
         );
     }
 

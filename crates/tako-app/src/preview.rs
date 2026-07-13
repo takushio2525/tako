@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use tako_control::protocol::PreviewModeWire;
-use tako_core::TextBuffer;
+use tako_core::{SearchHit, TextBuffer};
 
 /// 読み込みの上限（巨大ファイルで UI を固めない。超過分は切り詰めて明示する）
 const MAX_BYTES: usize = 1_000_000;
@@ -189,11 +189,33 @@ pub struct PreviewState {
 
 /// コードプレビューの軽量編集セッション（FR-3.5）。表示状態とは分離し、編集モードを
 /// OFF にしても未保存バッファを保持する。別ファイルで差し替える前に dirty を検査できる。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct EditState {
     pub buffer: TextBuffer,
     pub editing: bool,
     pub message: Option<String>,
+    /// 自動保存の有効状態（既定 true。config.yaml の editor.autosave で変更可能）
+    pub autosave: bool,
+    /// 自動保存後の表示メッセージ（タイトルバーに「保存済み」等を表示する）
+    pub save_status: Option<SaveStatus>,
+    /// 検索バーの表示状態
+    pub search_visible: bool,
+    /// 検索クエリ
+    pub search_query: String,
+    /// 検索ヒット一覧（検索クエリ変更時に更新）
+    pub search_hits: Vec<SearchHit>,
+    /// 現在フォーカス中のヒットインデックス
+    pub search_index: usize,
+    /// 置換テキスト
+    pub replace_text: String,
+}
+
+/// 自動保存の表示状態
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveStatus {
+    Saved,
+    Conflict,
+    Error(String),
 }
 
 impl EditState {
@@ -212,6 +234,13 @@ impl EditState {
             buffer,
             editing: true,
             message: None,
+            autosave: true,
+            save_status: None,
+            search_visible: false,
+            search_query: String::new(),
+            search_hits: Vec::new(),
+            search_index: 0,
+            replace_text: String::new(),
         })
     }
 
