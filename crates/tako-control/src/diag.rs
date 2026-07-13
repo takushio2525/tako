@@ -335,19 +335,28 @@ mod tests {
         {
             let _outer = perf_span_over("outer", u64::MAX);
             assert_eq!(
-                watch_lock().current.as_ref().map(|s| s.tag.as_ref().to_string()),
+                watch_lock()
+                    .current
+                    .as_ref()
+                    .map(|s| s.tag.as_ref().to_string()),
                 Some("outer".to_string())
             );
             {
                 let _inner = perf_span_over("inner", u64::MAX);
                 assert_eq!(
-                    watch_lock().current.as_ref().map(|s| s.tag.as_ref().to_string()),
+                    watch_lock()
+                        .current
+                        .as_ref()
+                        .map(|s| s.tag.as_ref().to_string()),
                     Some("inner".to_string())
                 );
             }
             // 内側 drop で外側が復元される
             assert_eq!(
-                watch_lock().current.as_ref().map(|s| s.tag.as_ref().to_string()),
+                watch_lock()
+                    .current
+                    .as_ref()
+                    .map(|s| s.tag.as_ref().to_string()),
                 Some("outer".to_string())
             );
         }

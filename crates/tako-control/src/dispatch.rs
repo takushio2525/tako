@@ -383,18 +383,18 @@ pub fn prepare_offload(
             session_id: session_id.clone(),
             tmux_session: tmux_session.clone(),
         })),
-        Request::GitLog { pane, max_count } => Some(
-            git_pane_cwd(host, *pane).map(|cwd| OffloadJob::GitLog {
+        Request::GitLog { pane, max_count } => {
+            Some(git_pane_cwd(host, *pane).map(|cwd| OffloadJob::GitLog {
                 cwd,
                 max_count: *max_count,
-            }),
-        ),
-        Request::GitDiff { pane, target } => Some(git_pane_cwd(host, *pane).map(|cwd| {
-            OffloadJob::GitDiff {
+            }))
+        }
+        Request::GitDiff { pane, target } => {
+            Some(git_pane_cwd(host, *pane).map(|cwd| OffloadJob::GitDiff {
                 cwd,
                 target: target.clone(),
-            }
-        })),
+            }))
+        }
         _ => None,
     }
 }

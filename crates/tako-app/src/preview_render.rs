@@ -3,9 +3,24 @@ use gpui::{
     FontWeight, HighlightStyle, MouseButton, MouseMoveEvent, Pixels, SharedString, StyledText,
     UnderlineStyle, Window,
 };
+use std::path::PathBuf;
 use tako_core::{PaneId, Rect};
 
 use super::*;
+
+/// PDF / 画像 / 動画サムネの描画用 gpui::Image キャッシュ（Issue #168）。
+/// `gpui::Image::from_bytes` は id 生成のために全バイトのハッシュを計算するので、
+/// render 毎に呼ぶと「全ページ PNG の clone + フルハッシュ」が毎フレーム走り、
+/// 71 ページ PDF の実測で 1 フレーム p50 96ms（通常 2ms）まで劣化する。
+/// path が変わらない限り load 時に 1 回だけ構築した Arc を使い回す
+pub(crate) struct PreviewImageCache {
+    path: PathBuf,
+    /// PDF: ページごと（描画失敗の空ページは None）。画像 / サムネ: 先頭 1 要素
+    images: Vec<Option<std::sync::Arc<gpui::Image>>>,
+    /// PDF テキストレイヤのページごと Arc（paint の canvas クロージャへ毎フレーム
+    /// move する分を to_vec から Arc clone に置き換える）
+    text_layers: Vec<std::sync::Arc<Vec<preview::PdfTextLine>>>,
+}
 
 /// PDFKit の文字矩形キャッシュから、現在の UTF-8 選択範囲に含まれる描画矩形を返す。
 /// ページ画像とは別の最前面 canvas で使い、画像 sprite に隠れない描画順を保証する。
@@ -372,6 +387,81 @@ impl TakoApp {
             })
             .collect()
     }
+    /// プレビュー描画用の画像キャッシュを整える（Issue #168）。
+    /// path が変わったとき（別ファイルを開いた・開き直した）だけ再構築し、
+    /// それ以外のフレームは既存の Arc をそのまま使う
+    fn ensure_preview_image_cache(&mut self, pane_id: PaneId) {
+        let Some(state) = self.previews.get(&pane_id) else {
+            self.preview_image_cache.remove(&pane_id);
+            return;
+        };
+        if self
+            .preview_image_cache
+            .get(&pane_id)
+            .is_some_and(|c| c.path == state.path)
+        {
+            return;
+        }
+        let built = match &state.content {
+            preview::PreviewContent::Pdf(data) => Some(PreviewImageCache {
+                path: state.path.clone(),
+                images: data
+                    .pages
+                    .iter()
+                    .map(|png| {
+                        (!png.is_empty()).then(|| {
+                            std::sync::Arc::new(gpui::Image::from_bytes(
+                                gpui::ImageFormat::Png,
+                                png.clone(),
+                            ))
+                        })
+                    })
+                    .collect(),
+                text_layers: data
+                    .text_layers
+                    .iter()
+                    .map(|lines| std::sync::Arc::new(lines.clone()))
+                    .collect(),
+            }),
+            preview::PreviewContent::Image(data) => {
+                let gpui_format = match data.format {
+                    preview::ImageFileFormat::Png => gpui::ImageFormat::Png,
+                    preview::ImageFileFormat::Jpeg => gpui::ImageFormat::Jpeg,
+                    preview::ImageFileFormat::Gif => gpui::ImageFormat::Gif,
+                    preview::ImageFileFormat::WebP => gpui::ImageFormat::Webp,
+                    preview::ImageFileFormat::Svg => gpui::ImageFormat::Svg,
+                };
+                Some(PreviewImageCache {
+                    path: state.path.clone(),
+                    images: vec![Some(std::sync::Arc::new(gpui::Image::from_bytes(
+                        gpui_format,
+                        data.bytes.clone(),
+                    )))],
+                    text_layers: Vec::new(),
+                })
+            }
+            preview::PreviewContent::Video(data) if !data.thumbnail.is_empty() => {
+                Some(PreviewImageCache {
+                    path: state.path.clone(),
+                    images: vec![Some(std::sync::Arc::new(gpui::Image::from_bytes(
+                        gpui::ImageFormat::Png,
+                        data.thumbnail.clone(),
+                    )))],
+                    text_layers: Vec::new(),
+                })
+            }
+            _ => None,
+        };
+        match built {
+            Some(cache) => {
+                self.preview_image_cache.insert(pane_id, cache);
+            }
+            None => {
+                self.preview_image_cache.remove(&pane_id);
+            }
+        }
+    }
+
     pub(crate) fn render_preview_pane(
         &mut self,
         pane_id: PaneId,
@@ -380,6 +470,7 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme.clone();
+        self.ensure_preview_image_cache(pane_id);
         let state = self.previews.get(&pane_id).expect("呼び出し前に確認済み");
         let file_name = state.file_name();
         let path_label = state.path.display().to_string();
@@ -470,28 +561,28 @@ impl TakoApp {
                     element
                 })
                 .collect(),
-            preview::PreviewContent::Image(data) => {
-                let gpui_format = match data.format {
-                    preview::ImageFileFormat::Png => gpui::ImageFormat::Png,
-                    preview::ImageFileFormat::Jpeg => gpui::ImageFormat::Jpeg,
-                    preview::ImageFileFormat::Gif => gpui::ImageFormat::Gif,
-                    preview::ImageFileFormat::WebP => gpui::ImageFormat::Webp,
-                    preview::ImageFileFormat::Svg => gpui::ImageFormat::Svg,
-                };
-                let image =
-                    std::sync::Arc::new(gpui::Image::from_bytes(gpui_format, data.bytes.clone()));
-                vec![div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        gpui::img(image)
-                            .object_fit(gpui::ObjectFit::Contain)
-                            .max_w_full()
-                            .max_h_full(),
-                    )
-                    .into_any_element()]
+            preview::PreviewContent::Image(_) => {
+                // Issue #168: Image はキャッシュ済み（ensure_preview_image_cache）
+                let image = self
+                    .preview_image_cache
+                    .get(&pane_id)
+                    .and_then(|c| c.images.first())
+                    .and_then(|i| i.clone());
+                match image {
+                    Some(image) => vec![div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            gpui::img(image)
+                                .object_fit(gpui::ObjectFit::Contain)
+                                .max_w_full()
+                                .max_h_full(),
+                        )
+                        .into_any_element()],
+                    None => Vec::new(),
+                }
             }
             preview::PreviewContent::Pdf(data) => {
                 // テキスト行を line_texts に登録（選択テキスト抽出用）
@@ -505,15 +596,28 @@ impl TakoApp {
                 let _ = global_line_idx;
 
                 let mut line_offset: usize = 0;
+                // Issue #168: ページ画像とテキストレイヤは ensure_preview_image_cache が
+                // 構築済み。ここでは Arc clone だけ行う（旧実装は毎フレーム全ページの
+                // PNG clone + Image::from_bytes のフルハッシュで p50 96ms/frame だった）
+                let empty_cache = PreviewImageCache {
+                    path: PathBuf::new(),
+                    images: Vec::new(),
+                    text_layers: Vec::new(),
+                };
+                let cache = self
+                    .preview_image_cache
+                    .get(&pane_id)
+                    .unwrap_or(&empty_cache);
                 data.pages
                     .iter()
                     .enumerate()
                     .filter(|(_, png)| !png.is_empty())
-                    .map(|(i, png)| {
-                        let image = std::sync::Arc::new(gpui::Image::from_bytes(
-                            gpui::ImageFormat::Png,
-                            png.clone(),
-                        ));
+                    .map(|(i, _)| {
+                        // ensure_preview_image_cache 直後なので None は起きない想定
+                        // （防御: 欠損時は空要素を返し、次フレームの再構築に任せる）
+                        let Some(image) = cache.images.get(i).and_then(|img| img.clone()) else {
+                            return div().into_any_element();
+                        };
                         let page_text_lines = data.text_layers.get(i);
                         let page_size = data.page_sizes.get(i).copied().unwrap_or([612.0, 792.0]);
                         let page_line_offset = line_offset;
@@ -521,8 +625,8 @@ impl TakoApp {
                         line_offset += n_lines;
 
                         let entity = cx.entity().downgrade();
-                        let text_lines_for_canvas: Vec<preview::PdfTextLine> =
-                            page_text_lines.map(|l| l.to_vec()).unwrap_or_default();
+                        let text_lines_for_canvas: std::sync::Arc<Vec<preview::PdfTextLine>> =
+                            cache.text_layers.get(i).cloned().unwrap_or_default();
                         let pdf_w = page_size[0];
                         let pdf_h = page_size[1];
 
@@ -568,7 +672,7 @@ impl TakoApp {
                                     });
                                 }
 
-                                for tl in &text_lines_for_canvas {
+                                for tl in text_lines_for_canvas.iter() {
                                     let mut line_char_bounds =
                                         Vec::with_capacity(tl.char_boxes.len());
                                     for ch in &tl.char_boxes {
@@ -857,11 +961,14 @@ impl TakoApp {
                     );
                 } else {
                     // プレイヤー未起動: ffmpeg サムネイル + 再生ボタン + メタ情報
-                    if !data.thumbnail.is_empty() {
-                        let image = std::sync::Arc::new(gpui::Image::from_bytes(
-                            gpui::ImageFormat::Png,
-                            data.thumbnail.clone(),
-                        ));
+                    if let Some(image) = self
+                        .preview_image_cache
+                        .get(&pane_id)
+                        .and_then(|c| c.images.first())
+                        .and_then(|i| i.clone())
+                    {
+                        // Issue #168: サムネもキャッシュ済み Arc を使う（毎フレームの
+                        // from_bytes ハッシュ計算を避ける）
                         elements.push(
                             div()
                                 .flex()
@@ -939,6 +1046,15 @@ impl TakoApp {
                 }
                 elements
             }
+            preview::PreviewContent::Loading => vec![div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_2()
+                .text_color(hsla_alpha(theme.foreground, 0.6))
+                .child(SharedString::from("読み込み中…"))
+                .into_any_element()],
             preview::PreviewContent::Error(message) => vec![div()
                 .p_2()
                 .text_color(hsla(theme.red))

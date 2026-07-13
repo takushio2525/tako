@@ -678,3 +678,18 @@
   worker_status 15 連打中 scroll 24〜34ms 安定・perf.log 0 件
 - 副産物: 調査 CLI の TAKO_SOCKET 注入による本番誤接続（ビューペイン 1 個生成 → close 復旧済み、
   Issue に記録）。alt screen TUI 内スクロール粒度はアプリ依存 = 仕様と明確化（manual-checks 記載）
+
+## 2026-07-13（#168 + #115: パフォーマンス改善 — メインスレッド非ブロック化 + PDF 描画キャッシュ）
+- perf.log 実測（本番 3.3h）で 3 犯確定: ①OrchestratorWorkerStatus dispatch が claude agents
+  --json（Node 起動）+ tmux + ps を UI で同期実行（4124 回 avg687ms、UI ストール全件と共起）
+  ②PDF 表示中の毎フレーム Image::from_bytes 全バイトハッシュ（71p で render p50 96ms）
+  ③PDF/動画ロード同期実行（open 1354ms）。白: save_layout/flock・リンク走査・通常 render
+- 三本柱: dispatch offload（prepare_offload/OffloadJob。worker_status/git log/diff を
+  background 化 + claude agents TTL 2s キャッシュ）/ PreviewImageCache（Arc<gpui::Image>
+  再利用）/ 重量プレビューの background ロード（Loading → 差し替え）。恒久診断 perf_span +
+  watchdog + TAKO_PERF_VERBOSE/TAKO_PERF_LOG 追加
+- 実測: 並行 list 159〜204ms → 4〜5ms / PDF render p50 96ms → 1〜3ms / open 1354ms → 48ms
+- 検証: 553 tests / fmt / clippy 全緑 + 隔離セルフテスト完走（PDF 3 項目は完了待ちポーリング化）。
+  #181（worker_status snapshot/compute の先行修正）とは rebase 時に OffloadJob へ一本化
+  （#181 のテストは検証内容を維持して新 API へ移植）
+- 次: PR #187 squash merge → install → tako 再起動 → ユーザー体感の再確認依頼

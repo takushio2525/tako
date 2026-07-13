@@ -4,50 +4,48 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-13・#181 スクロール体感問題の根治。#167 は main へマージ済み）
+## 現在の対象（2026-07-13・#168 パフォーマンス改善: メインスレッド非ブロック化）
 
-**#181（#159 スクロール改善が実機で体感できない）を根本修正**。根因は 3 つ + カクつき 1 つ:
+**#168（アプリ全体の間欠フリーズ・PDF/入力モサモサ）+ #115（GitLog の UI 同期実行）を根本修正**。
+perf.log 実測（本番 3.3h 分）で 3 犯を確定し、いずれも before/after 実測済み:
 
-1. ミラー経路の分岐が `backend_sessions` のみ → `tako tmux open` の TmuxOpen ビューペインが
-   直接ペイン扱いに落ち、外側 alacritty は alt screen（履歴 0）でホイール・スクロールバー不発
-2. persist ON ではビューペインの外側 PTY 自体も backend ラップされる（実測: ラッパー client_tty
-   = backend pane_tty）→ backend 優先の実体解決だと外側（history 0）へ誤解決
-3. persist 復元で戻ったビューペインは `tmux_view_panes` 未登録 + ネスト候補が既定サーバーのみで
-   `--socket tako` のビュー先を辿れない → ネスト候補に backend socket を追加して tty 突き合わせ
-4. カクつき = `OrchestratorWorkerStatus` dispatch が `claude agents --json`（550〜1100ms）を
-   UI スレッド同期実行（perf.log 2h で 2000 件超、時刻がユーザー報告と一致）→
-   IPC ループで snapshot（UI）/ compute（background executor）に分離
+1. **OrchestratorWorkerStatus dispatch**（4124 回 × avg687ms の UI 専有。UI ストール全件と共起）
+   → `dispatch::prepare_offload` / `OffloadJob` で UI は文脈収集のみ・実行は background
+   （IPC/MCP 両経路。`TAKO_OFFLOAD=0` で旧経路）。`claude agents --json` に TTL 2s キャッシュ。
+   実測: 並行 list 159〜204ms → 4〜5ms、専有記録 5/5 回 → 0 件。
+   **#181（PR #186）が同じ問題を worker_status_snapshot/compute で先行修正しており、
+   マージ時に OffloadJob 機構へ一本化した**（GitLog/GitDiff + TAKO_OFFLOAD + キャッシュを包含。
+   #181 のテストは検証内容を維持して新 API へ移植: unit 4 本 + セルフテスト 74）
+2. **PDF 表示中の毎フレーム Image 再構築**（71p PDF で render p50 96ms）
+   → `preview_render::PreviewImageCache`（Arc<gpui::Image> を path 不変の間再利用）。
+   実測: p50 96ms → 1〜3ms（初回構築 110ms × 1 回のみ）
+3. **PDF/動画ロードの UI 同期実行**（open 1354ms ブロック）
+   → Loading プレースホルダ + `pending_preview_loads` → `spawn_preview_load` で background 化。
+   実測: open 応答 1354ms → 48ms
 
-既知制約（仕様化）: alt screen TUI（claude Code / vim）内のスクロール粒度はアプリ依存で
-スムーススクロール対象外。カスタム `-L` 外部サーバーのビューは復元後にネスト検出不能
-（開き直せば回復）。いずれも manual-checks.md / requirements.md FR-2.5.13 に記載。
+恒久診断: `diag::perf_span`（32ms 超をタグ付き記録・2s 超ハングの中間報告・
+`TAKO_PERF_VERBOSE=1` で 10s ごとタグ別分布・`TAKO_PERF_LOG` でログ先差し替え）。
+白判定: save_layout/flock（p50 0〜7ms）・リンク走査（cmd 押下中のみ）・通常 render（2ms）。
 
-**main 取り込み済み（#167 = PR #184）**: マウスレポートは `send-keys -H` 直接注入 +
-レート制限へ（wants_mouse=true 側の転送経路。#181 対象の mirror 経路とは独立）。
-`history_state` の `HistoryState` 構造体化・`ScrollCtl` 新フィールドとの整合を
-マージ後ビルド + セルフテストで確認する。
+## 検証済み（#168）
 
-## 検証済み（#181。マージ前の fix/181 単体）
-
-- 全 551 テスト / fmt / clippy(-D warnings) / 隔離セルフテスト完走（項目 73 = TmuxOpen ミラー
-  e2e、74 = worker_status IPC 応答を新設）/ visual-test subline direct=22197 shifted=0（#176 一致）
-- 隔離実機 e2e（TAKO_ISOLATED + 隔離 HOME、本番不接触）: バックエンド（history 275）/
-  ビュー（276）/ 復元通常（275）/ 復元ビュー = backend socket 上（273）の各ミラー + スクロール
-  バー描画をキャプチャ実証。worker_status 15 連打（各 174〜239ms 実負荷）中の scroll 応答
-  24〜34ms 安定・隔離 perf.log 0 件
-- 調査中の事故: CLI が TAKO_SOCKET 注入で本番へ誤接続（ビューペイン 1 個生成 → close 復旧済み）。
-  以降の検証は `env -u TAKO_*` を徹底。Issue #181 コメントに記録済み
+- workspace build / test / fmt / clippy(-D warnings) 全緑 + 隔離セルフテスト完走
+  （PDF 3 項目 66/66b-2/70 は background 読み込みの完了待ちポーリングへ更新）
+- 隔離 A/B 計測（TAKO_ISOLATED=1 + TAKO_PERF_LOG 分離 + env -u TAKO_* で本番不接触）
+- GitLog offload: 200 commits 応答 104ms・メインスレッド専有記録なし（#115 受け入れ条件）
+- origin/main（#181 = PR #186）との rebase 整合: worker_status 分離実装を OffloadJob へ
+  一本化し、rebase 後に build / test / セルフテスト再実行
 
 ## 次の一手
 
-- origin/main（#167）とのマージ整合を検証（ビルド + テスト + 隔離セルフテスト再実行）→
-  PR #186 を squash merge --delete-branch → fetch + detach → `scripts/build-app.sh --install`
-- ユーザー再確認: 本番の tako-view ペイン（405/400/420）でスクロール + カクつき解消の体感確認
-- 明朝 5:00 の夜間ジョブ監視（v0.4.1 自動リリース見込み。#166）は継続
+- PR #187 squash merge → fetch + detach → `build-app.sh --install` → tako 再起動 →
+  ユーザー体感の再確認依頼（PDF 閲覧・プロンプト入力・master 稼働中の全体カクつき）
+- 明朝 5:00 の夜間ジョブ初回実行を監視（v0.4.1 自動リリース見込み。#166）
+- 将来の最適化候補（スコープ外）: PDF 初回キャッシュ構築 110ms の background 化、
+  #84（MCP HTTP 直列）は offload で dispatch 詰まり解消後に実害を再計測してから
 
 ## 現フェーズで Read すべき設計書
 
-- スクロールのミラー経路・実体解決（#181 で改稿）: `.agent/architecture.md`「スクロール制御」節
-- マウスレポート転送（#167）: `.agent/architecture.md` 該当節
-- スクロール要件・既知制約: `.agent/requirements.md` FR-2.5.13
-- UI スレッドで外部プロセス禁止の教訓: `.agent/architecture.md`「UI スレッド同期処理」節
+- メインスレッド非ブロック化の設計（#168）: `.agent/architecture.md` 該当節 + NFR-8
+- スクロールのミラー経路・実体解決（#181）: `.agent/architecture.md`「スクロール制御」節
+- 多重インスタンスの資源保護（#177）: `.agent/architecture.md` 該当節

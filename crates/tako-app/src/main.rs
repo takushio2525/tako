@@ -29,6 +29,7 @@ mod video_player;
 mod webview;
 
 use keybindings::*;
+use preview_render::PreviewImageCache;
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -574,6 +575,9 @@ struct TakoApp {
     prompt_flows: Vec<PromptFlow>,
     /// dispatch 中に依頼されたプレビューの background ハイライト（ペイン, パス, 生テキスト）
     pending_highlights: Vec<(PaneId, std::path::PathBuf, String)>,
+    /// dispatch 中に依頼された重量プレビュー（PDF / 動画）の background 読み込み
+    /// （Issue #168。Loading 表示 → 完了時差し替え。GPUI の Context が要るため遅延実行）
+    pending_preview_loads: Vec<(PaneId, std::path::PathBuf, preview::PreviewMode)>,
     /// IME 変換中の未確定文字列（FR-1.9。None = 変換中でない）
     ime: Option<ImeComposition>,
     /// ドラッグ中のペイン境界（None = ドラッグしていない）
@@ -693,6 +697,11 @@ struct TakoApp {
     term_notify_pending: bool,
     /// 動画フレームの描画キャッシュ（frame_gen で世代管理: 新フレーム準備完了まで前フレームを表示）
     video_frame_cache: HashMap<PaneId, (u64, std::sync::Arc<gpui::RenderImage>)>,
+    /// PDF / 画像 / 動画サムネの描画用 gpui::Image キャッシュ（Issue #168）。
+    /// `Image::from_bytes` は id 生成で全バイトのハッシュ計算を行うため、毎フレーム
+    /// 生成すると PDF 全ページの PNG コピー + ハッシュだけで 1 フレーム 100ms 級になる
+    /// （71 ページ PDF の実測 p50 96ms/frame）。path 不変の間は Arc を再利用する
+    preview_image_cache: HashMap<PaneId, PreviewImageCache>,
     /// シークバー要素の実測 bounds（paint 時に canvas で記録）
     video_seek_bar_bounds: HashMap<PaneId, Bounds<Pixels>>,
     /// シークバーのドラッグ中フラグ（ペイン ID。ドラッグ中はマウス移動でシーク位置を追従）
@@ -1406,6 +1415,7 @@ impl TakoApp {
             alt_screen_writes: Vec::new(),
             prompt_flows: Vec::new(),
             pending_highlights: Vec::new(),
+            pending_preview_loads: Vec::new(),
             ime: None,
             dragging_border: None,
             dragging_scrollbar: None,
@@ -1458,6 +1468,7 @@ impl TakoApp {
             video_players: HashMap::new(),
             video_ticker: false,
             video_frame_cache: HashMap::new(),
+            preview_image_cache: HashMap::new(),
             video_seek_bar_bounds: HashMap::new(),
             video_seek_dragging: None,
             preview_selections: HashMap::new(),
@@ -1541,11 +1552,22 @@ impl TakoApp {
                         _ => preview::PreviewMode::Code,
                     };
                     let path = std::path::Path::new(&p.path);
-                    let (state, raw) = preview::load_fast(path, mode);
-                    if let Some(text) = raw {
-                        app.pending_highlights
-                            .push((pane, path.to_path_buf(), text));
-                    }
+                    // Issue #168: PDF / 動画は復元時も background 読み込み（起動を塞がない）
+                    let state = if matches!(
+                        mode,
+                        preview::PreviewMode::Pdf | preview::PreviewMode::Video
+                    ) {
+                        app.pending_preview_loads
+                            .push((pane, path.to_path_buf(), mode));
+                        preview::PreviewState::loading(path, mode)
+                    } else {
+                        let (state, raw) = preview::load_fast(path, mode);
+                        if let Some(text) = raw {
+                            app.pending_highlights
+                                .push((pane, path.to_path_buf(), text));
+                        }
+                        state
+                    };
                     app.previews.insert(pane, state);
                     restored_previews += 1;
                     continue;
@@ -1625,10 +1647,11 @@ impl TakoApp {
             );
             app.restore_report = Some(report.clone());
             persist_diag(&report);
-            // 復元時のプレビューも background でハイライトする
+            // 復元時のプレビューも background でハイライト / 読み込みする
             for (pane, path, text) in std::mem::take(&mut app.pending_highlights) {
                 app.spawn_highlight(pane, path, text, cx);
             }
+            app.drain_pending_preview_loads(cx);
         }
         // Web ビュー dock の退避分（ペイン無し）も初回 render で開き直す（#155）
         for url in webview_dock_restore {
@@ -1728,6 +1751,8 @@ impl TakoApp {
                     for (pane, path, text) in std::mem::take(&mut app.pending_highlights) {
                         app.spawn_highlight(pane, path, text, cx);
                     }
+                    // 重量プレビュー（PDF / 動画）の background 読み込み（Issue #168）
+                    app.drain_pending_preview_loads(cx);
                     // AI / CLI 操作によるレイアウト変化を即座に永続化する（Phase 5.5）
                     app.save_layout();
                     cx.notify();
@@ -3525,6 +3550,7 @@ impl TakoApp {
                 self.preview_edits.remove(&pane_id);
                 self.video_players.remove(&pane_id);
                 self.video_frame_cache.remove(&pane_id);
+                self.preview_image_cache.remove(&pane_id);
                 self.video_seek_bar_bounds.remove(&pane_id);
                 self.preview_selections.remove(&pane_id);
                 self.preview_line_bounds.remove(&pane_id);
@@ -3565,6 +3591,7 @@ impl TakoApp {
                     self.preview_edits.remove(&id);
                     self.video_players.remove(&id);
                     self.video_frame_cache.remove(&id);
+                    self.preview_image_cache.remove(&id);
                     self.video_seek_bar_bounds.remove(&id);
                     self.preview_selections.remove(&id);
                     self.preview_line_bounds.remove(&id);
@@ -7723,13 +7750,28 @@ impl ControlHost for TakoApp {
             return Err(message.into());
         }
         let path = std::path::Path::new(path);
-        // Issue #168: PDF 全ページラスタライズ / 動画 ffmpeg サムネ等の同期ロードを計測
-        let _span = tako_control::diag::perf_span("preview_load");
-        let (state, raw) = preview::load_fast(path, preview::PreviewMode::from_wire(mode));
-        if let Some(text) = raw {
-            self.pending_highlights
-                .push((pane, path.to_path_buf(), text));
-        }
+        let mode = preview::PreviewMode::from_wire(mode);
+        let state = if matches!(
+            mode,
+            preview::PreviewMode::Pdf | preview::PreviewMode::Video
+        ) {
+            // Issue #168: PDF 全ページラスタライズ（71 ページ実測 1354ms）と
+            // ffmpeg サムネ抽出は UI スレッドで行わない。Loading を置いて
+            // background で読み込む（drain_pending_preview_loads が引き継ぐ）
+            self.pending_preview_loads
+                .push((pane, path.to_path_buf(), mode));
+            preview::PreviewState::loading(path, mode)
+        } else {
+            // コード / Markdown / 画像は軽量（ファイル読みのみ。ハイライトは
+            // 従来から background）なので同期のまま
+            let _span = tako_control::diag::perf_span("preview_load");
+            let (state, raw) = preview::load_fast(path, mode);
+            if let Some(text) = raw {
+                self.pending_highlights
+                    .push((pane, path.to_path_buf(), text));
+            }
+            state
+        };
         self.preview_edits.remove(&pane);
         self.preview_selections.remove(&pane);
         // 内容差し替えから次の paint まで旧ファイルの座標を hit-test に使わせない。
@@ -7738,6 +7780,8 @@ impl ControlHost for TakoApp {
         self.preview_pdf_highlight_paint_count.remove(&pane);
         self.preview_text_layouts.remove(&pane);
         self.preview_line_texts.remove(&pane);
+        // 同一 path の開き直し（内容更新）でも描画キャッシュを作り直す（Issue #168）
+        self.preview_image_cache.remove(&pane);
         self.previews.insert(pane, state);
         Ok(())
     }
@@ -12361,24 +12405,26 @@ mod self_test {
             .unwrap();
             let pdf_path = preview_dir.join("sample.pdf");
             write_test_pdf(&pdf_path);
-            let (code_ok, md_ok, pdf_ok, mode_ok, toggle_ok, list_ok, closed) = window
-                .update(cx, |app, _, cx| {
-                    let base = app.focused_pane().as_u64();
-                    let open = |app: &mut TakoApp, path: String, mode| {
-                        tako_control::dispatch(
-                            app,
-                            tako_control::protocol::Request::OpenFile {
-                                pane: Some(base),
-                                path,
-                                mode,
-                                direction: None,
-                            },
-                            PaneOrigin::Cli,
-                        )
-                    };
-                    // コードを開く: ペインが生え、PTY は起動しない。フォーカスは移る
-                    let opened = open(
+            let selftest_open =
+                |app: &mut TakoApp, base: u64, path: String, mode| {
+                    tako_control::dispatch(
                         app,
+                        tako_control::protocol::Request::OpenFile {
+                            pane: Some(base),
+                            path,
+                            mode,
+                            direction: None,
+                        },
+                        PaneOrigin::Cli,
+                    )
+                };
+            let (base, pane, code_ok, md_ok) = window
+                .update(cx, |app, _, _| {
+                    let base = app.focused_pane().as_u64();
+                    // コードを開く: ペインが生え、PTY は起動しない。フォーカスは移る
+                    let opened = selftest_open(
+                        app,
+                        base,
                         preview_dir.join("hello.rs").display().to_string(),
                         None,
                     )
@@ -12394,8 +12440,13 @@ mod self_test {
                             Some(preview::PreviewContent::Code(lines)) if !lines.is_empty()
                         );
                     // md を開く: 同じプレビューペインを再利用し、既定で markdown 表示
-                    let opened = open(app, preview_dir.join("note.md").display().to_string(), None)
-                        .expect("md の open_file は成功する");
+                    let opened = selftest_open(
+                        app,
+                        base,
+                        preview_dir.join("note.md").display().to_string(),
+                        None,
+                    )
+                    .expect("md の open_file は成功する");
                     let md_ok = opened["pane"].as_u64() == Some(pane)
                         && opened["created"].as_bool() == Some(false)
                         && opened["mode"].as_str() == Some("markdown")
@@ -12405,27 +12456,54 @@ mod self_test {
                                 if matches!(blocks.first(),
                                     Some(preview::MdBlock::Heading { level: 1, .. }))
                         );
-                    let opened = open(
+                    (base, pane, code_ok, md_ok)
+                })
+                .unwrap_or((0, 0, false, false));
+            // PDF を開く: 応答は即返り（Loading プレースホルダ）、全ページラスタライズは
+            // background（Issue #168）。実運用では IPC ループ / UI が drain するが、
+            // ここは直接 dispatch のため手動で流し、完了をポーリングで待つ
+            let pdf_open_ok = window
+                .update(cx, |app, _, cx| {
+                    let opened = selftest_open(
                         app,
+                        base,
                         pdf_path.display().to_string(),
                         Some(tako_control::protocol::PreviewModeWire::Pdf),
                     )
                     .expect("pdf の open_file は成功する");
-                    let pdf_ok = opened["pane"].as_u64() == Some(pane)
+                    app.drain_pending_preview_loads(cx);
+                    opened["pane"].as_u64() == Some(pane)
                         && opened["created"].as_bool() == Some(false)
                         && opened["mode"].as_str() == Some("pdf")
-                        && matches!(
-                            app.previews.values().next().map(|p| &p.content),
-                            Some(preview::PreviewContent::Pdf(data))
-                                if !data.pages.is_empty()
-                                    && !data.text_layers.is_empty()
-                                    && data.text_layers[0].len() >= 2
-                                    && data.text_layers[0][0].char_boxes.len()
-                                        == data.text_layers[0][0].text.chars().count()
-                        );
+                })
+                .unwrap_or(false);
+            let mut pdf_ok = false;
+            for _ in 0..30 {
+                wait(cx, 200).await;
+                pdf_ok = pdf_open_ok
+                    && window
+                        .update(cx, |app, _, _| {
+                            matches!(
+                                app.previews.values().next().map(|p| &p.content),
+                                Some(preview::PreviewContent::Pdf(data))
+                                    if !data.pages.is_empty()
+                                        && !data.text_layers.is_empty()
+                                        && data.text_layers[0].len() >= 2
+                                        && data.text_layers[0][0].char_boxes.len()
+                                            == data.text_layers[0][0].text.chars().count()
+                            )
+                        })
+                        .unwrap_or(false);
+                if pdf_ok {
+                    break;
+                }
+            }
+            let (mode_ok, toggle_ok, list_ok, closed) = window
+                .update(cx, |app, _, cx| {
                     // dispatch の mode 指定（CLI --mode / MCP mode と同じ）でコード表示へ
-                    let opened = open(
+                    let opened = selftest_open(
                         app,
+                        base,
                         preview_dir.join("note.md").display().to_string(),
                         Some(tako_control::protocol::PreviewModeWire::Code),
                     )
@@ -12470,12 +12548,12 @@ mod self_test {
                     )
                     .is_ok()
                         && app.previews.is_empty();
-                    (code_ok, md_ok, pdf_ok, mode_ok, toggle_ok, list_ok, closed)
+                    (mode_ok, toggle_ok, list_ok, closed)
                 })
-                .unwrap_or((false, false, false, false, false, false, false));
+                .unwrap_or((false, false, false, false));
             check(code_ok, "コードプレビューの open");
             check(md_ok, "Markdown プレビューの再利用");
-            check(pdf_ok, "PDF プレビューの文字矩形抽出");
+            check(pdf_ok, "PDF プレビューの文字矩形抽出（background 読み込み完了後）");
             check(mode_ok, "プレビューモード指定");
             check(toggle_ok, "プレビューモードの UI トグル");
             check(list_ok, "プレビュー状態の list 公開");
@@ -12748,6 +12826,9 @@ mod self_test {
                         PaneOrigin::Cli,
                     )
                     .expect("pdf を開ける");
+                    // PDF は background 読み込み（Issue #168）: 直接 dispatch のため手動 drain。
+                    // 完了は直後の wait_for_preview_maps が待つ
+                    app.drain_pending_preview_loads(cx);
                     cx.notify();
                     opened["mode"].as_str() == Some("pdf")
                 })
@@ -13952,8 +14033,10 @@ mod self_test {
                 std::fs::create_dir_all(&pdf_dir).expect("一時ディレクトリを作れる");
                 let pdf_path = pdf_dir.join("test.pdf");
                 write_test_pdf(&pdf_path);
-                let pdf_ok = window
-                    .update(cx, |app, _, _cx| {
+                // PDF は background 読み込み（Issue #168）: open 応答は即返り、
+                // 内容はポーリングで完了を待ってから検証する
+                let pdf_pane = window
+                    .update(cx, |app, _, cx| {
                         let base = app.focused_pane().as_u64();
                         let r = tako_control::dispatch(
                             app,
@@ -13966,21 +14049,35 @@ mod self_test {
                             PaneOrigin::Cli,
                         )
                         .expect("PDF を開ける");
+                        app.drain_pending_preview_loads(cx);
                         let pane_id = r["pane"].as_u64().expect("pane が返る");
-                        let mode_ok = r["mode"].as_str() == Some("pdf");
-                        let content_ok = app
-                            .previews
-                            .iter()
-                            .any(|(pid, p)| {
-                                pid.as_u64() == pane_id
-                                    && matches!(
-                                        &p.content,
-                                        preview::PreviewContent::Pdf(d)
-                                            if d.total_pages == 1
-                                                && d.pages.len() == 1
-                                                && !d.pages[0].is_empty()
-                                    )
-                            });
+                        (r["mode"].as_str() == Some("pdf")).then_some(pane_id)
+                    })
+                    .ok()
+                    .flatten();
+                let mut pdf_ok = false;
+                if let Some(pane_id) = pdf_pane {
+                    for _ in 0..30 {
+                        wait(cx, 200).await;
+                        pdf_ok = window
+                            .update(cx, |app, _, _| {
+                                app.previews.iter().any(|(pid, p)| {
+                                    pid.as_u64() == pane_id
+                                        && matches!(
+                                            &p.content,
+                                            preview::PreviewContent::Pdf(d)
+                                                if d.total_pages == 1
+                                                    && d.pages.len() == 1
+                                                    && !d.pages[0].is_empty()
+                                        )
+                                })
+                            })
+                            .unwrap_or(false);
+                        if pdf_ok {
+                            break;
+                        }
+                    }
+                    let _ = window.update(cx, |app, _, _| {
                         let _ = tako_control::dispatch(
                             app,
                             tako_control::protocol::Request::Close {
@@ -13989,9 +14086,8 @@ mod self_test {
                             },
                             PaneOrigin::Cli,
                         );
-                        mode_ok && content_ok
-                    })
-                    .unwrap_or(false);
+                    });
+                }
                 check(pdf_ok, "PDF プレビュー（FR-3.4。Core Graphics レンダリング）");
                 let _ = std::fs::remove_dir_all(&pdf_dir);
             }

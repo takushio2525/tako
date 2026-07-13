@@ -737,3 +737,4 @@ FR-2.7.6 は画像ペインを並べて実現する）。
 | NFR-5 | 対応 OS | macOS（先行）、Windows（必須）。Linux は将来検討 |
 | NFR-6 | ライセンス | GPL-3.0-or-later（依存クレート zlog/ztracing が GPL-3.0 のため）。cmux のコード参照は引き続き禁止（`concept.md` 参照） |
 | NFR-7 | 配布 | 単一バイナリ/アプリバンドル。ランタイム依存なし |
+| NFR-8 | メインスレッド非ブロック（#168） | UI スレッド（GPUI イベントループ）でサブプロセス実行・重 I/O・重計算をしない。dispatch は文脈収集のみ UI で行い実行は background（`dispatch::prepare_offload`）。32ms 超の専有は `diag::perf_span` が perf.log に記録し、新機能はこの記録が出ないことを確認する（実装指針は `architecture.md`「メインスレッド非ブロック化」節） |
