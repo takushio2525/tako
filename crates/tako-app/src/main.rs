@@ -744,8 +744,7 @@ fn link_byte_range_in_chunk(
     let mut start = None;
     let mut end = 0;
 
-    for index in chunk.start..chunk.end {
-        let info = &infos[index];
+    for (index, info) in infos.iter().enumerate().take(chunk.end).skip(chunk.start) {
         let cell_start = cell_cols.get(index).copied().unwrap_or(index);
         let cell_end = cell_start + info.char_cols;
         let next_byte = byte_offset + info.ch.len_utf8();
@@ -3775,12 +3774,24 @@ impl TakoApp {
         &self,
         pane_id: PaneId,
         position: Point<Pixels>,
-        _window: &mut Window,
+        window: &mut Window,
     ) -> Option<(usize, usize, bool)> {
         let (_, area) = self.pane_text_areas.iter().find(|(id, _)| *id == pane_id)?;
         if !area.contains(&position) {
             return None;
         }
+        self.cell_at_clamped(pane_id, position, window)
+    }
+
+    /// `cell_at` のクランプ版。テキスト領域外の座標も最寄りセルへ写像する。
+    /// 選択ドラッグ中はペインを外れても選択を伸ばし続ける必要があるためこちらを使う
+    fn cell_at_clamped(
+        &self,
+        pane_id: PaneId,
+        position: Point<Pixels>,
+        _window: &mut Window,
+    ) -> Option<(usize, usize, bool)> {
+        let (_, area) = self.pane_text_areas.iter().find(|(id, _)| *id == pane_id)?;
         let cell = self.cell_size_for_pane(pane_id)?;
         let session = self.terminals.get(&pane_id)?;
         let (cols, rows) = session.size();
@@ -4433,7 +4444,8 @@ impl TakoApp {
         let Some(pane_id) = self.selecting else {
             return;
         };
-        if let Some((col, row, right)) = self.cell_at(pane_id, event.position, window) {
+        // ドラッグ選択はテキスト領域を外れても最寄りセルへ伸ばし続ける（クランプ版）
+        if let Some((col, row, right)) = self.cell_at_clamped(pane_id, event.position, window) {
             if let Some(session) = self.terminals.get(&pane_id) {
                 session.extend_selection(col, row, right);
                 cx.notify();

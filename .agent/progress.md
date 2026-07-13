@@ -574,3 +574,12 @@
 ## 2026-07-13（#145: プレビュー選択座標 / PDF / 編集色）
 - GPUI 実 shaping + 最近傍 UTF-8 キャレット、PDFKit 文字矩形、編集時 syntect 色を統合。selftest 40 の固定待ちと 66b-2 の二重 update、既存 PDF fixture も修正し全セルフテスト完走
 - 関連: PR #151 squash merge（`c5618ca`）+ install 済み。#150 は 3 件とも selftest panic と確認して close
+
+## 2026-07-13（#153: パスリンク cmd+クリック不動作の根治 + cmd 押下中の下線・ハイライト）
+- 根本原因 5 件を修正: ①cell_at のクランプでリンクホバーが最初のペインへ誤ヒット ②ディレクトリ
+  クリックが pending_attach 後処理欠落で空ペイン ③TUI（OSC 7 なし）で cwd 不明 → 起動時 cwd を
+  セッション初期値に ④cwd=None でパス検出ごとスキップ ⑤リンク走査の無限ループ。装飾は下線 +
+  accent + 背景をリンク文字列だけに限定、cmd 単独押下でも即時更新。選択ドラッグは cell_at_clamped
+  分離で旧挙動維持（引き継ぎ検証で発見・修正）
+- 検証: 隔離セルフテスト完走（69c 全 7 判定パス）+ build / test / fmt / clippy 全緑
+- 次: tako 再起動 → manual-checks.md #153 節の GUI 確認
