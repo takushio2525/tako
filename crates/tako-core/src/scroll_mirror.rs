@@ -265,19 +265,13 @@ mod tests {
     #[cfg(unix)]
     fn tmux履歴をミラーとして取得できる() {
         use crate::terminal::{SpawnCommand, SpawnOptions};
-        use crate::tmux_backend::{available, kill_server, wrap_options};
+        use crate::tmux_backend::{available, wrap_options, TmuxTestGuard};
         if !available() {
             eprintln!("skip: tmux が無い環境");
             return;
         }
         let socket = format!("tako-coretest-mir-{}", std::process::id());
-        struct Cleanup(String);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                kill_server(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(socket.clone());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
         let options = SpawnOptions {
             command: Some(SpawnCommand {
                 program: "/bin/sh".into(),
@@ -348,19 +342,13 @@ mod tests {
     #[cfg(unix)]
     fn ホイールレポートのtmux直接注入が内側に生で届く() {
         use crate::terminal::{SpawnCommand, SpawnOptions};
-        use crate::tmux_backend::{available, kill_server, wrap_options};
+        use crate::tmux_backend::{available, wrap_options, TmuxTestGuard};
         if !available() {
             eprintln!("skip: tmux が無い環境");
             return;
         }
         let socket = format!("tako-coretest-sw-{}", std::process::id());
-        struct Cleanup(String);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                kill_server(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(socket.clone());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
         // 内側アプリ: raw mode + 受信バイトの ESC を「^[」に可視化して即時 echo
         let inner = r#"stty raw -echo; printf '\033[?1000h\033[?1006h'; exec perl -e '$|=1; while (sysread(STDIN,$b,4096)) { $b =~ s/\x1b/^[/g; syswrite(STDOUT,$b) }'"#;
         let options = SpawnOptions {

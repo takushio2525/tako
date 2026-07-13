@@ -479,13 +479,7 @@ mod tests {
         }
         let socket = format!("tako-coretest-loc-{}", std::process::id());
         let _ = run_tmux(Some(&socket), &["new-session", "-d", "-s", "loc-e2e"]);
-        struct Cleanup(String);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                crate::tmux_backend::kill_server(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(socket.clone());
+        let _cleanup = crate::tmux_backend::TmuxTestGuard::new(vec![socket.clone()]);
 
         // カナリア（観測のみ）: C ロケールの素のクライアントでは TAB が `_` に
         // サニタイズされる、が元バグの前提。2026-06-12 夜、同一 tmux 3.6b バイナリ・
