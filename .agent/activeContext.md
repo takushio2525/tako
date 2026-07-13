@@ -9,6 +9,7 @@
 #153 完了（codex → Fable 引き継ぎ）。パスリンク cmd+クリック不動作の根本原因 5 件
 （ペイン判定誤ヒット / ディレクトリ空ペイン / TUI cwd 不明 / cwd=None 検出スキップ /
 走査無限ループ）+ cmd 押下中の下線・背景ハイライト・即時装飾更新を実装。
+直前の #152（PDF 選択描画・標準言語色分け）も merge・install 済み。
 
 - 起動時 working directory をセッション初期 cwd に保持（OSC 7 で上書き）
 - リンク装飾は `link_byte_range_in_chunk` でリンク文字列だけに限定
@@ -22,7 +23,8 @@
 
 ## 次の一手
 
-- tako 再起動後、`.agent/manual-checks.md` #153 節（cmd ホバー装飾・実マウスクリック）を GUI で確認
+- tako 再起動後、`.agent/manual-checks.md` #153 節（cmd ホバー装飾・実マウスクリック）と
+  #152 節（PDF ドラッグ選択・コード色分け）を GUI で確認
 - Phase 5 の次候補は FR-3.8 Web ビューまたは FR-2.19 localhost ポートパネル
 
 ## 現フェーズで Read すべき設計書

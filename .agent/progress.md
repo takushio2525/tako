@@ -575,6 +575,10 @@
 - GPUI 実 shaping + 最近傍 UTF-8 キャレット、PDFKit 文字矩形、編集時 syntect 色を統合。selftest 40 の固定待ちと 66b-2 の二重 update、既存 PDF fixture も修正し全セルフテスト完走
 - 関連: PR #151 squash merge（`c5618ca`）+ install 済み。#150 は 3 件とも selftest panic と確認して close
 
+## 2026-07-13（#152: PDF 選択実描画 / 標準言語シンタックス色）
+- PDF canvas の画像下端 static position を根治し、syntect の改行保持 + 全標準言語共通解決を実装。Metal RGBA で PDF / C++ / Python の実ピクセル変化を確認
+- 関連: PR #154 squash merge（`6f7cd1c`）+ `/Applications/tako.app` install・署名検証済み
+
 ## 2026-07-13（#153: パスリンク cmd+クリック不動作の根治 + cmd 押下中の下線・ハイライト）
 - 根本原因 5 件を修正: ①cell_at のクランプでリンクホバーが最初のペインへ誤ヒット ②ディレクトリ
   クリックが pending_attach 後処理欠落で空ペイン ③TUI（OSC 7 なし）で cwd 不明 → 起動時 cwd を

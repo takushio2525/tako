@@ -147,6 +147,11 @@ role / title の設定・取得自体はセルフテスト（`tako title / role 
       作り、tako を cmd+Q → 再起動。タブ構成・分割・実行中プロセス・画面内容が戻る
 - [ ] **AI 操作の継続**: 再起動前から動いている claude（tmux セッション内で生存）が、
       再起動後も MCP ツール（`tako_list_panes` 等）を叩ける（control.json フォールバック）
+- [ ] **PC 再起動相当の Claude 会話復旧（#139）**: Claude を起動して layout.json に
+      `claude_session_id` が保存されたことを確認 → tako 終了 + 専用 tmux server kill →
+      tako 再起動。同じペインで `claude --resume` が起動し、直前の会話が表示される。
+      tmux server を残す通常再起動では既存 Claude への再 attach だけで二重起動しない。
+      `tako persist` / MCP `tako_persist` の `last_restore` に resume 件数が出る
 - [ ] 体感レイテンシ・描画が直接 spawn と変わらない（キー入力・大量出力・vim / claude の TUI）
 - [ ] ホイールスクロールで過去出力が見える（tmux copy-mode。`q` か最下部までスクロールで戻る。
       従来の自前スクロールバック・スクロールバーは backend ペインでは出ない = 既知の仕様変更）
@@ -306,6 +311,17 @@ unit test とセルフテスト 66c で機械検証する。実 .app では GPUI
 - [ ] PDF を通常表示・ウィンドウ幅変更後の各状態でドラッグ選択し、半透明ハイライトが文字上に出る
 - [ ] PDF の選択を ⌘C し、貼り付け先で同じ文字列（日本語を含む）が得られる
 - [ ] 編集モードでも読み取りモードと同等の構文色が付き、選択ハイライトとキャレットが同時に見える
+
+## PDF 選択描画・標準言語セット色分け（2026-07-13、#152）
+
+`TAKO_DISCOVERY_DIR=<一時dir> TAKO_PERSIST=0 TAKO_VISUAL_TEST=1 cargo run -p tako-app --features visual-test`
+は Metal の最終 scene を直接 RGBA へ読み戻し、PDF 選択前後と C++ / Python の平文→読み取り色→
+編集色の対象矩形ピクセル差分を機械検証する。実 .app では次を最終確認:
+
+- [ ] PDF の文字列を実マウスでドラッグし、青い半透明ハイライトが文字の真上へ出る
+- [ ] PDF を縦スクロール・ウィンドウリサイズした後も、選択位置とハイライトが追従する
+- [ ] `.cpp` / `.py` を読み取り表示と編集表示で開き、キーワード・文字列・数値等が複数色になる
+- [ ] `.rs` / `.js` / `.ts` / `.sh` も同様に複数色になり、編集・保存後も色が維持される
 
 ## ターミナルリンクの cmd+クリック・cmd ホバー装飾（2026-07-13、#153）
 

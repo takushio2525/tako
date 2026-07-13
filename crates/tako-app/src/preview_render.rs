@@ -1,11 +1,44 @@
 use gpui::{
     canvas, div, fill, point, prelude::*, px, relative, Bounds, BoxShadow, Context, CursorStyle,
-    FontWeight, HighlightStyle, MouseButton, MouseMoveEvent, SharedString, StyledText,
+    FontWeight, HighlightStyle, MouseButton, MouseMoveEvent, Pixels, SharedString, StyledText,
     UnderlineStyle, Window,
 };
 use tako_core::{PaneId, Rect};
 
 use super::*;
+
+/// PDFKit の文字矩形キャッシュから、現在の UTF-8 選択範囲に含まれる描画矩形を返す。
+/// ページ画像とは別の最前面 canvas で使い、画像 sprite に隠れない描画順を保証する。
+fn pdf_selection_highlight_bounds(
+    data: &preview::PdfData,
+    char_bounds: &[Vec<Bounds<Pixels>>],
+    selection: &PreviewSelection,
+) -> Vec<Bounds<Pixels>> {
+    let mut result = Vec::new();
+    let mut line_idx = 0usize;
+    for page in &data.text_layers {
+        for line in page {
+            if let Some((start, end)) = selection.range_for_line(line_idx, line.text.len()) {
+                if let Some(bounds) = char_bounds.get(line_idx) {
+                    result.extend(
+                        line.char_boxes
+                            .iter()
+                            .zip(bounds)
+                            .filter(|(ch, bounds)| {
+                                ch.byte_range.end > start
+                                    && ch.byte_range.start < end
+                                    && f32::from(bounds.size.width) > 0.0
+                                    && f32::from(bounds.size.height) > 0.0
+                            })
+                            .map(|(_, bounds)| *bounds),
+                    );
+                }
+            }
+            line_idx += 1;
+        }
+    }
+    result
+}
 
 impl TakoApp {
     fn preview_label(&self, target: PreviewTarget) -> String {
@@ -378,6 +411,17 @@ impl TakoApp {
 
         // 選択状態
         let selection = self.preview_selections.get(&pane_id).cloned();
+        let pdf_highlight_bounds = match (&state.content, selection.as_ref()) {
+            (preview::PreviewContent::Pdf(data), Some(selection)) => self
+                .preview_pdf_char_bounds
+                .get(&pane_id)
+                .map(|bounds| pdf_selection_highlight_bounds(data, bounds, selection))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if pdf_highlight_bounds.is_empty() {
+            self.preview_pdf_highlight_paint_count.remove(&pane_id);
+        }
 
         // テキスト行を収集（選択テキスト抽出 + bounds 追跡用）
         let mut line_texts: Vec<String> = Vec::new();
@@ -476,24 +520,15 @@ impl TakoApp {
                         let n_lines = page_text_lines.map(|l| l.len()).unwrap_or(0);
                         line_offset += n_lines;
 
-                        let sel_highlight = selection.as_ref().and_then(|sel| {
-                            let (start, end) = sel.ordered();
-                            if end.0 < page_line_offset || start.0 >= page_line_offset + n_lines {
-                                return None;
-                            }
-                            Some((sel.clone(), page_line_offset))
-                        });
-
                         let entity = cx.entity().downgrade();
                         let text_lines_for_canvas: Vec<preview::PdfTextLine> =
                             page_text_lines.map(|l| l.to_vec()).unwrap_or_default();
                         let pdf_w = page_size[0];
                         let pdf_h = page_size[1];
-                        let sel_color = theme.selection_background;
 
                         let overlay = canvas(
                             |_, _, _| (),
-                            move |bounds, _, window, cx| {
+                            move |bounds, _, _window, cx| {
                                 if text_lines_for_canvas.is_empty() {
                                     return;
                                 }
@@ -533,87 +568,53 @@ impl TakoApp {
                                     });
                                 }
 
-                                // 選択ハイライトの描画
-                                if let Some((ref sel, offset)) = sel_highlight {
-                                    for (j, tl) in text_lines_for_canvas.iter().enumerate() {
-                                        let mut line_char_bounds =
-                                            Vec::with_capacity(tl.char_boxes.len());
-                                        for ch in &tl.char_boxes {
-                                            let sx = bounds.origin.x
-                                                + px(ch.bbox[0] as f32 * scale_x as f32);
-                                            let sy = bounds.origin.y
-                                                + px((pdf_h - ch.bbox[1] - ch.bbox[3]) as f32
-                                                    * scale_y as f32);
-                                            let sw = px(ch.bbox[2] as f32 * scale_x as f32);
-                                            let sh = px(ch.bbox[3] as f32 * scale_y as f32);
-                                            line_char_bounds.push(Bounds {
-                                                origin: point(sx, sy),
-                                                size: gpui::size(sw, sh),
-                                            });
-                                        }
-                                        let global_j = offset + j;
-                                        let line_range =
-                                            sel.range_for_line(global_j, tl.text.len());
-                                        if let Some((sc, ec)) = line_range {
-                                            if !tl.text.is_empty() && tl.bbox[2] > 0.0 {
-                                                for (ch, ch_bounds) in tl
-                                                    .char_boxes
-                                                    .iter()
-                                                    .zip(line_char_bounds.iter())
-                                                {
-                                                    if ch.byte_range.end > sc
-                                                        && ch.byte_range.start < ec
-                                                        && f32::from(ch_bounds.size.width) > 0.0
-                                                        && f32::from(ch_bounds.size.height) > 0.0
-                                                    {
-                                                        window.paint_quad(fill(
-                                                            *ch_bounds,
-                                                            hsla_alpha(sel_color, 0.35),
-                                                        ));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        page_char_bounds.push(line_char_bounds);
+                                for tl in &text_lines_for_canvas {
+                                    let mut line_char_bounds =
+                                        Vec::with_capacity(tl.char_boxes.len());
+                                    for ch in &tl.char_boxes {
+                                        let sx = bounds.origin.x
+                                            + px(ch.bbox[0] as f32 * scale_x as f32);
+                                        let sy = bounds.origin.y
+                                            + px((pdf_h - ch.bbox[1] - ch.bbox[3]) as f32
+                                                * scale_y as f32);
+                                        let sw = px(ch.bbox[2] as f32 * scale_x as f32);
+                                        let sh = px(ch.bbox[3] as f32 * scale_y as f32);
+                                        line_char_bounds.push(Bounds {
+                                            origin: point(sx, sy),
+                                            size: gpui::size(sw, sh),
+                                        });
                                     }
-                                } else {
-                                    for tl in &text_lines_for_canvas {
-                                        let mut line_char_bounds =
-                                            Vec::with_capacity(tl.char_boxes.len());
-                                        for ch in &tl.char_boxes {
-                                            let sx = bounds.origin.x
-                                                + px(ch.bbox[0] as f32 * scale_x as f32);
-                                            let sy = bounds.origin.y
-                                                + px((pdf_h - ch.bbox[1] - ch.bbox[3]) as f32
-                                                    * scale_y as f32);
-                                            let sw = px(ch.bbox[2] as f32 * scale_x as f32);
-                                            let sh = px(ch.bbox[3] as f32 * scale_y as f32);
-                                            line_char_bounds.push(Bounds {
-                                                origin: point(sx, sy),
-                                                size: gpui::size(sw, sh),
-                                            });
-                                        }
-                                        page_char_bounds.push(line_char_bounds);
-                                    }
+                                    page_char_bounds.push(line_char_bounds);
                                 }
 
                                 if let Some(e) = entity.upgrade() {
-                                    e.update(cx, |app, _| {
+                                    e.update(cx, |app, cx| {
                                         let list =
                                             app.preview_pdf_char_bounds.entry(pane_id).or_default();
+                                        let mut changed = false;
                                         for (j, line_bounds) in page_char_bounds.iter().enumerate()
                                         {
                                             let idx = page_line_offset + j;
                                             if list.len() <= idx {
                                                 list.resize(idx + 1, Vec::new());
                                             }
-                                            list[idx] = line_bounds.clone();
+                                            if list[idx] != *line_bounds {
+                                                list[idx] = line_bounds.clone();
+                                                changed = true;
+                                            }
+                                        }
+                                        if changed {
+                                            // リサイズ / スクロール後は次フレームで最前面の
+                                            // ハイライト矩形を新しい座標へ追従させる。
+                                            cx.notify();
                                         }
                                     });
                                 }
                             },
                         )
                         .absolute()
+                        .top_0()
+                        .left_0()
                         .size_full();
 
                         div()
@@ -1225,6 +1226,34 @@ impl TakoApp {
                             .child("…（大きいファイルのため末尾を省略して表示）")
                     }))
             })
+            .children((!pdf_highlight_bounds.is_empty()).then(|| {
+                let entity = cx.entity().downgrade();
+                let count = pdf_highlight_bounds.len();
+                let color = hsla_alpha(theme.accent, 0.32);
+                canvas(
+                    |_, _, _| (),
+                    move |overlay_bounds, _, window, cx| {
+                        // ページ画像の子 canvas では画像 sprite に隠れる実機回帰があったため、
+                        // ペインの最後の子かつ専用 stacking layer として最前面へ描く。
+                        // 親と同じ layer では primitive 種別のバッチ順で Quad が PDF の
+                        // PolychromeSprite より先に描かれ、発行済みでも完全に隠れる。
+                        window.paint_layer(overlay_bounds, |window| {
+                            for bounds in &pdf_highlight_bounds {
+                                window.paint_quad(fill(*bounds, color));
+                            }
+                        });
+                        if let Some(entity) = entity.upgrade() {
+                            entity.update(cx, |app, _| {
+                                app.preview_pdf_highlight_paint_count.insert(pane_id, count);
+                            });
+                        }
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+            }))
     }
 
     /// Markdown インラインスパン列 → (テキスト, ハイライト範囲)
@@ -1334,6 +1363,8 @@ impl TakoApp {
             },
         )
         .absolute()
+        .top_0()
+        .left_0()
         .size_full();
 
         let element =
