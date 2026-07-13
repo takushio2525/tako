@@ -96,12 +96,10 @@ pub struct TabLayout {
 }
 
 /// 分割ツリーのノード（dispatch の list が返す tree 表現と同じ語彙: axis は "x" / "y"）
-/// 保存・復元時にしか使わないため、Pane バリアントの大きさは Box 化せず許容する
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NodeLayout {
-    Pane(PaneLayout),
+    Pane(Box<PaneLayout>),
     Split {
         axis: String,
         ratio: f32,
@@ -122,6 +120,10 @@ pub struct PaneLayout {
     pub origin: String,
     /// 保存時点の cwd（OSC 7 由来）。セッションが消えていた場合の開き直しに使う
     pub cwd: Option<String>,
+    /// 実行中だった Claude Code の session ID。PC 再起動等で tmux セッション自体が
+    /// 消えていた場合だけ `claude --resume` へ渡す。旧ファイルは None で後方互換
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_session_id: Option<String>,
     /// プレビューペイン（FR-3.2 / FR-3.3）の表示内容。None = ターミナルペイン。
     /// 旧ファイルには無いので serde default で後方互換
     #[serde(default)]
@@ -152,6 +154,7 @@ pub struct PreviewLayout {
 pub struct PaneMeta {
     pub session: Option<String>,
     pub cwd: Option<String>,
+    pub claude_session_id: Option<String>,
     pub preview: Option<PreviewLayout>,
     /// Web ビューペインなら表示中の URL（FR-3.8 / #155）
     pub webview: Option<String>,
@@ -163,6 +166,8 @@ pub struct RestoredPane {
     pub pane: u64,
     pub session: Option<String>,
     pub cwd: Option<String>,
+    /// tmux セッション消失時に復旧する Claude Code の session ID
+    pub claude_session_id: Option<String>,
     /// Some ならプレビューペインとして復元する（spawn しない）
     pub preview: Option<PreviewLayout>,
     /// Some なら Web ビューペインとして復元する（spawn しない。URL を開き直す）
@@ -211,6 +216,7 @@ pub fn capture(
                     role: pane.role().map(str::to_string),
                     origin: origin_str(pane.origin()).to_string(),
                     cwd: m.cwd,
+                    claude_session_id: m.claude_session_id,
                     preview: m.preview,
                     webview: m.webview,
                     // 由来タブ（FR-2.15.6）。再起動後もタブ別分離表示を保つ
@@ -230,7 +236,7 @@ fn capture_node(node: &PaneNode, meta: &dyn Fn(PaneId) -> PaneMeta) -> NodeLayou
     match node {
         PaneNode::Leaf(pane) => {
             let m = meta(pane.id());
-            NodeLayout::Pane(PaneLayout {
+            NodeLayout::Pane(Box::new(PaneLayout {
                 id: pane.id().as_u64(),
                 session: m.session,
                 title: pane.title().map(str::to_string),
@@ -238,12 +244,13 @@ fn capture_node(node: &PaneNode, meta: &dyn Fn(PaneId) -> PaneMeta) -> NodeLayou
                 role: pane.role().map(str::to_string),
                 origin: origin_str(pane.origin()).to_string(),
                 cwd: m.cwd,
+                claude_session_id: m.claude_session_id,
                 preview: m.preview,
                 webview: m.webview,
                 // tree 内のペインは退避ではないので由来タブを持たない
                 origin_tab: None,
                 origin_tab_title: None,
-            })
+            }))
         }
         PaneNode::Split {
             axis,
@@ -343,6 +350,7 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
             pane: p.id,
             session: p.session.clone(),
             cwd: p.cwd.clone(),
+            claude_session_id: p.claude_session_id.clone(),
             preview: p.preview.clone(),
             webview: p.webview.clone(),
         });
@@ -380,6 +388,7 @@ fn restore_node(
                 pane: p.id,
                 session: p.session.clone(),
                 cwd: p.cwd.clone(),
+                claude_session_id: p.claude_session_id.clone(),
                 preview: p.preview.clone(),
                 webview: p.webview.clone(),
             });
@@ -553,6 +562,7 @@ mod tests {
             &|pane| PaneMeta {
                 session: Some(format!("tako-s{}", pane.as_u64())),
                 cwd: Some("/tmp".into()),
+                claude_session_id: Some(format!("claude-session-{}", pane.as_u64())),
                 preview: Some(PreviewLayout {
                     path: format!("/tmp/p{}.md", pane.as_u64()),
                     mode: "markdown".into(),
@@ -588,6 +598,8 @@ mod tests {
         assert!(restored
             .iter()
             .all(|r| r.session.as_deref() == Some(format!("tako-s{}", r.pane).as_str())));
+        assert!(restored.iter().all(|r| r.claude_session_id.as_deref()
+            == Some(format!("claude-session-{}", r.pane).as_str())));
         // プレビュー情報（FR-3.2）も往復する
         assert!(restored.iter().all(|r| r
             .preview

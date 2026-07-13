@@ -1176,31 +1176,82 @@ impl SyntectHighlighter {
         Self { syntaxes, theme }
     }
 
+    /// 読み取り / 編集で共用する構文解決。syntect 標準セットに含まれる全構文を
+    /// 拡張子・特殊ファイル名・shebang の順で解決し、標準セットに TypeScript 文法が
+    /// 無い版では JavaScript 文法へ安全に劣化させる。
+    fn syntax_for_path<'a>(
+        &'a self,
+        path: &Path,
+        text: &str,
+    ) -> &'a syntect::parsing::SyntaxReference {
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase);
+        extension
+            .as_deref()
+            .and_then(|ext| self.syntaxes.find_syntax_by_extension(ext))
+            .or_else(|| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .and_then(|name| self.syntaxes.find_syntax_by_extension(name))
+            })
+            .or_else(|| {
+                text.lines()
+                    .next()
+                    .and_then(|line| self.syntaxes.find_syntax_by_first_line(line))
+            })
+            .or_else(|| {
+                matches!(extension.as_deref(), Some("ts" | "tsx"))
+                    .then(|| self.syntaxes.find_syntax_by_name("JavaScript"))
+                    .flatten()
+            })
+            .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text())
+    }
+
     fn run(&self, syntax: &syntect::parsing::SyntaxReference, text: &str) -> Vec<Line> {
         use syntect::easy::HighlightLines;
+        use syntect::util::LinesWithEndings;
         let mut hl = HighlightLines::new(syntax, &self.theme);
-        text.lines()
+        // `load_defaults_newlines` の構文は改行込みの入力を前提にする。`str::lines()` で
+        // 改行を落とすと shell の shebang 後などで状態遷移が閉じず、標準言語でも行全体が
+        // 同じ色になる。パーサには改行を渡し、UI の 1 行要素からは末尾改行だけ除く。
+        LinesWithEndings::from(text)
             .map(|line| {
                 match hl.highlight_line(line, &self.syntaxes) {
-                    Ok(regions) => regions
-                        .into_iter()
-                        .map(|(style, fragment)| Span {
-                            text: fragment.to_string(),
-                            color: Some(tako_core::Rgb {
-                                r: style.foreground.r,
-                                g: style.foreground.g,
-                                b: style.foreground.b,
-                            }),
-                            bold: style
-                                .font_style
-                                .contains(syntect::highlighting::FontStyle::BOLD),
-                            italic: style
-                                .font_style
-                                .contains(syntect::highlighting::FontStyle::ITALIC),
-                        })
-                        .collect(),
+                    Ok(regions) => {
+                        let visible_len = line
+                            .strip_suffix("\r\n")
+                            .or_else(|| line.strip_suffix('\n'))
+                            .map_or(line.len(), str::len);
+                        let mut remaining = visible_len;
+                        regions
+                            .into_iter()
+                            .filter_map(|(style, fragment)| {
+                                if remaining == 0 {
+                                    return None;
+                                }
+                                let len = fragment.len().min(remaining);
+                                remaining -= len;
+                                Some(Span {
+                                    text: fragment[..len].to_string(),
+                                    color: Some(tako_core::Rgb {
+                                        r: style.foreground.r,
+                                        g: style.foreground.g,
+                                        b: style.foreground.b,
+                                    }),
+                                    bold: style
+                                        .font_style
+                                        .contains(syntect::highlighting::FontStyle::BOLD),
+                                    italic: style
+                                        .font_style
+                                        .contains(syntect::highlighting::FontStyle::ITALIC),
+                                })
+                            })
+                            .collect()
+                    }
                     // ハイライト失敗行は素のテキストへ劣化（表示を欠けさせない）
-                    Err(_) => vec![plain_span(line)],
+                    Err(_) => vec![plain_span(line.trim_end_matches(['\r', '\n']))],
                 }
             })
             .collect()
@@ -1218,17 +1269,7 @@ fn plain_span(text: &str) -> Span {
 
 impl Highlighter for SyntectHighlighter {
     fn highlight(&self, path: &Path, text: &str) -> Vec<Line> {
-        let syntax = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .and_then(|ext| self.syntaxes.find_syntax_by_extension(ext))
-            .or_else(|| {
-                text.lines()
-                    .next()
-                    .and_then(|line| self.syntaxes.find_syntax_by_first_line(line))
-            })
-            .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text());
-        self.run(syntax, text)
+        self.run(self.syntax_for_path(path, text), text)
     }
 
     fn highlight_lang(&self, lang: &str, text: &str) -> Vec<Line> {
@@ -1859,30 +1900,60 @@ mod tests {
         std::fs::remove_dir_all(&scratchpad).ok();
     }
 
+    fn 色数(lines: &[Line]) -> usize {
+        lines
+            .iter()
+            .flat_map(|line| line.iter())
+            .filter_map(|span| span.color)
+            .map(|color| (color.r, color.g, color.b))
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
     #[test]
-    fn 編集モードでもシンタックスハイライトを使う() {
+    fn 読み取りと編集で標準言語セットのシンタックスハイライトを使う() {
         let scratchpad = std::env::temp_dir().join("tako_editor_highlight_test");
         std::fs::create_dir_all(&scratchpad).ok();
-        let path = scratchpad.join("sample.rs");
-        std::fs::write(&path, "fn main() {\n    let answer = 42;\n}\n").unwrap();
+        let fixtures = [
+            ("sample.rs", "fn main() { let answer = 42; }\n"),
+            (
+                "sample.py",
+                "def greet(name):\n    return f\"Hello {name}\"\n",
+            ),
+            (
+                "sample.cpp",
+                "#include <iostream>\nint main() { return 0; }\n",
+            ),
+            ("sample.js", "const answer = () => 42;\n"),
+            ("sample.ts", "const answer: number = 42;\n"),
+            (
+                "sample.sh",
+                "#!/bin/sh\nfor value in one two; do echo \"$value\"; done\n",
+            ),
+        ];
 
-        let mut preview = load(&path, PreviewMode::Code);
-        let edit = EditState::open(&preview).expect("編集を開始できる");
-        apply_editor_text(&mut preview, &edit);
+        for (name, source) in fixtures {
+            let path = scratchpad.join(name);
+            std::fs::write(&path, source).unwrap();
 
-        match &preview.content {
-            PreviewContent::Code(lines) => {
-                let has_color = lines
-                    .iter()
-                    .flat_map(|line| line.iter())
-                    .any(|span| span.color.is_some());
-                assert!(has_color, "編集モードでも色が付く");
-                assert!(
-                    lines.iter().any(|line| line.len() > 1),
-                    "少なくとも 1 行は平文 1 区間ではない"
-                );
-            }
-            other => panic!("Code になる: {:?}", other),
+            let mut preview = load(&path, PreviewMode::Code);
+            let read_colors = match &preview.content {
+                PreviewContent::Code(lines) => 色数(lines),
+                other => panic!("{name} の読み取り表示は Code になる: {other:?}"),
+            };
+            assert!(read_colors > 1, "{name} の読み取り表示に複数の構文色が付く");
+
+            let edit = EditState::open(&preview).expect("編集を開始できる");
+            apply_editor_text(&mut preview, &edit);
+            let edit_colors = match &preview.content {
+                PreviewContent::Code(lines) => 色数(lines),
+                other => panic!("{name} の編集表示は Code になる: {other:?}"),
+            };
+            assert!(edit_colors > 1, "{name} の編集表示に複数の構文色が付く");
+            assert_eq!(
+                edit_colors, read_colors,
+                "読み取りと編集で同じ構文判定を使う"
+            );
         }
 
         std::fs::remove_dir_all(&scratchpad).ok();

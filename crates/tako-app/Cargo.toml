@@ -10,6 +10,11 @@ repository.workspace = true
 name = "tako-app"
 path = "src/main.rs"
 
+[features]
+# Metal の描画結果を直接 RGBA へ読み戻す実画面ピクセル検証専用。
+# 通常ビルドには test-support を含めない。
+visual-test = ["gpui_platform/test-support"]
+
 [dependencies]
 tako-core.workspace = true
 tako-control.workspace = true

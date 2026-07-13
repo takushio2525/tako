@@ -4,7 +4,10 @@
 //! GPUI 非依存。UI 層は検出結果を使って cmd+ホバー下線や cmd+クリック開く処理を行う。
 
 use crate::screen::Screen;
-use std::path::{Path, PathBuf};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+};
 
 /// 検出されたリンク 1 件
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,7 +30,9 @@ pub enum LinkKind {
 
 /// 画面上のリンクを検出する（URL のみ。パス検出不要な呼び出し用）
 pub fn detect_links(screen: &Screen) -> Vec<DetectedLink> {
-    detect_links_with_cwd(screen, None)
+    let mut links = Vec::new();
+    detect_urls(screen, &mut links);
+    links
 }
 
 /// 画面上のリンクを検出する。cwd を渡すとファイル/ディレクトリパスも検出する。
@@ -35,35 +40,29 @@ pub fn detect_links(screen: &Screen) -> Vec<DetectedLink> {
 pub fn detect_links_with_cwd(screen: &Screen, cwd: Option<&Path>) -> Vec<DetectedLink> {
     let mut links = Vec::new();
     detect_urls(screen, &mut links);
-    if let Some(cwd) = cwd {
-        let url_links = links.clone();
-        detect_paths(screen, cwd, &url_links, &mut links);
-    }
+    let url_links = links.clone();
+    detect_paths(screen, cwd, &url_links, &mut links);
     links
 }
 
-/// URL（http:// / https://）を検出する。
-/// 行末で折り返された URL は次行の先頭と連結して 1 つの URL として扱う。
-fn detect_urls(screen: &Screen, out: &mut Vec<DetectedLink>) {
-    // 全行のテキストを連結し、行折り返しの境界を記録
+/// 画面行を論理テキストへ連結し、各文字の画面座標を記録する。
+///
+/// 右端まで埋まった行はターミナルの soft wrap とみなして次行へ直結し、それ以外は
+/// 改行で区切る。URL とパスで同じ規則を使うことで、TUI の装飾付き折り返しでも
+/// 検出範囲と hit-test 座標を一致させる。
+fn combined_screen_text(screen: &Screen) -> (String, Vec<(usize, usize, usize)>) {
     let mut combined = String::new();
     // (combined 上の byte offset, row, col) の写像
-    let mut byte_map: Vec<(usize, usize, usize)> = Vec::new();
+    let mut byte_map = Vec::new();
 
     for (row, line) in screen.lines.iter().enumerate() {
         let trimmed = line.text.trim_end();
         for (char_idx, ch) in trimmed.chars().enumerate() {
-            let col = if char_idx < line.cell_cols.len() {
-                line.cell_cols[char_idx]
-            } else {
-                char_idx
-            };
+            let col = line.cell_cols.get(char_idx).copied().unwrap_or(char_idx);
             let offset = combined.len();
             combined.push(ch);
             byte_map.push((offset, row, col));
         }
-        // 行末が画面幅いっぱいなら折り返しの可能性がある → 連結
-        // そうでなければ区切りを入れる
         let line_fills_width = trimmed.chars().count() >= screen.cols
             || (!trimmed.is_empty()
                 && line.cell_cols.last().copied().unwrap_or(0) + 1 >= screen.cols);
@@ -73,6 +72,14 @@ fn detect_urls(screen: &Screen, out: &mut Vec<DetectedLink>) {
             byte_map.push((offset, row, screen.cols));
         }
     }
+
+    (combined, byte_map)
+}
+
+/// URL（http:// / https://）を検出する。
+/// 行末で折り返された URL は次行の先頭と連結して 1 つの URL として扱う。
+fn detect_urls(screen: &Screen, out: &mut Vec<DetectedLink>) {
+    let (combined, byte_map) = combined_screen_text(screen);
 
     // URL パターンの検出
     let mut search_start = 0;
@@ -235,52 +242,36 @@ fn byte_offsets_to_spans(
 /// 実在チェックに通ったものだけリンク化する。URL と重複する範囲はスキップ。
 fn detect_paths(
     screen: &Screen,
-    cwd: &Path,
+    cwd: Option<&Path>,
     existing_links: &[DetectedLink],
     out: &mut Vec<DetectedLink>,
 ) {
     let home = dirs_hint();
 
-    for (row, line) in screen.lines.iter().enumerate() {
-        let text = line.text.trim_end();
-        if text.is_empty() {
+    let (text, byte_map) = combined_screen_text(screen);
+    for (token, byte_range) in extract_path_tokens(&text) {
+        let spans = byte_offsets_to_spans(&byte_map, byte_range.start, byte_range.end, screen.cols);
+        if spans.is_empty() || overlaps_existing(existing_links, &spans) {
             continue;
         }
 
-        for (token, start_col) in extract_path_tokens(text, &line.cell_cols) {
-            // URL リンクと重複する範囲はスキップ
-            let end_col = start_col + token.chars().count();
-            if overlaps_existing(existing_links, row, start_col, end_col) {
-                continue;
-            }
-
-            // 行番号サフィックスを分離（`src/main.rs:42:5` → `src/main.rs`）
-            let path_part = strip_line_col_suffix(&token);
-
-            if let Some(resolved) = resolve_path(path_part, cwd, home.as_deref()) {
-                out.push(DetectedLink {
-                    kind: LinkKind::Path,
-                    target: resolved.to_string_lossy().into_owned(),
-                    spans: vec![(row, start_col, end_col)],
-                });
-            }
+        // 行番号サフィックスを分離（`src/main.rs:42:5` → `src/main.rs`）
+        let path_part = strip_line_col_suffix(&token);
+        if let Some(resolved) = resolve_path(path_part, cwd, home.as_deref()) {
+            out.push(DetectedLink {
+                kind: LinkKind::Path,
+                target: resolved.to_string_lossy().into_owned(),
+                spans,
+            });
         }
     }
 }
 
 /// パスらしきトークンを行テキストから抽出する。
 /// `/` `.` `~` で始まるか、内部に `/` を含む空白区切りトークンを候補とする。
-fn extract_path_tokens(text: &str, cell_cols: &[usize]) -> Vec<(String, usize)> {
+fn extract_path_tokens(text: &str) -> Vec<(String, Range<usize>)> {
     let mut tokens = Vec::new();
     let chars: Vec<(usize, char)> = text.char_indices().collect();
-    // char_index → col の写像
-    let col_of = |char_idx: usize| -> usize {
-        if char_idx < cell_cols.len() {
-            cell_cols[char_idx]
-        } else {
-            char_idx
-        }
-    };
 
     let mut i = 0;
     while i < chars.len() {
@@ -317,8 +308,18 @@ fn extract_path_tokens(text: &str, cell_cols: &[usize]) -> Vec<(String, usize)> 
             j += 1;
         }
 
+        // 区切り文字そのもの（`(`, `[`, `{` 等）から始まった場合は空トークンになる。
+        // index を進めないと同じ文字を永久に再走査するため、必ず 1 文字消費する。
+        if j == token_start {
+            i = j + 1;
+            continue;
+        }
+
         let token_text: String = chars[token_start..j].iter().map(|&(_, c)| c).collect();
-        let col = col_of(token_start);
+        let byte_start = chars
+            .get(token_start)
+            .map(|&(offset, _)| offset)
+            .unwrap_or(text.len());
 
         // 閉じ引用符があればスキップ
         let skip_end = if quote_end.is_some() && j < chars.len() {
@@ -333,13 +334,10 @@ fn extract_path_tokens(text: &str, cell_cols: &[usize]) -> Vec<(String, usize)> 
             // 末尾のコロンや句読点を剥がす（`path/to/file:` 等）
             let cleaned = token_text.trim_end_matches([':', '.', ',']);
             if !cleaned.is_empty() {
-                tokens.push((cleaned.to_string(), col));
+                tokens.push((cleaned.to_string(), byte_start..byte_start + cleaned.len()));
             }
         }
     }
-
-    // chars は使われていないが実際は上の while ループで走査済み
-    let _ = chars;
     tokens
 }
 
@@ -378,7 +376,7 @@ fn strip_line_col_suffix(token: &str) -> &str {
 
 /// パスを解決する。cwd 基準の相対 / `~` 展開 / 絶対パスの 3 戦略を試し、
 /// 実在するものを返す。
-fn resolve_path(raw: &str, cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
+fn resolve_path(raw: &str, cwd: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
     if raw.is_empty() || raw.len() < 2 {
         return None;
     }
@@ -398,11 +396,8 @@ fn resolve_path(raw: &str, cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
         } else {
             None
         },
-        if !raw.starts_with('/') && !raw.starts_with('~') {
-            Some(cwd.join(raw))
-        } else {
-            None
-        },
+        cwd.filter(|_| !raw.starts_with('/') && !raw.starts_with('~'))
+            .map(|cwd| cwd.join(raw)),
     ]
     .into_iter()
     .flatten()
@@ -412,11 +407,13 @@ fn resolve_path(raw: &str, cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// 既存リンクと範囲が重複するか判定する
-fn overlaps_existing(links: &[DetectedLink], row: usize, start: usize, end: usize) -> bool {
+fn overlaps_existing(links: &[DetectedLink], spans: &[(usize, usize, usize)]) -> bool {
     links.iter().any(|link| {
-        link.spans
-            .iter()
-            .any(|&(r, sc, ec)| r == row && start < ec && end > sc)
+        link.spans.iter().any(|&(row, start, end)| {
+            spans
+                .iter()
+                .any(|&(r, sc, ec)| r == row && start < ec && end > sc)
+        })
     })
 }
 
@@ -650,6 +647,67 @@ mod tests {
     }
 
     #[test]
+    fn cwd不明でも絶対パスとホーム起点は検出する() {
+        let dir = setup_test_dir("without_cwd");
+        let abs = dir.join("README.md");
+        let home = std::env::var("HOME").unwrap();
+        let line = format!("{} ~/", abs.display());
+        let screen = make_screen(&[&line], 240);
+        let links = detect_links_with_cwd(&screen, None);
+        let targets: Vec<_> = links
+            .iter()
+            .filter(|link| link.kind == LinkKind::Path)
+            .map(|link| link.target.as_str())
+            .collect();
+        assert!(targets.contains(&abs.to_str().unwrap()));
+        assert!(
+            targets
+                .iter()
+                .any(|target| Path::new(target) == Path::new(&home)),
+            "targets={targets:?}"
+        );
+
+        let relative = make_screen(&["src/main.rs"], 80);
+        assert!(detect_links_with_cwd(&relative, None).is_empty());
+        cleanup_test_dir(&dir);
+    }
+
+    #[test]
+    fn tuiの装飾付きsoft_wrapをまたぐパスを検出する() {
+        use crate::screen::StyleRun;
+
+        let dir = setup_test_dir("tui_wrapped");
+        let abs = dir.join("deep/nested/file.txt");
+        let quoted = format!("`{}`", abs.display());
+        let cols = 24;
+        let (first, second) = quoted.split_at(cols);
+        let mut screen = make_screen(&[first, second], cols);
+        for line in &mut screen.lines {
+            line.runs.push(StyleRun {
+                range: 0..line.text.len(),
+                fg: crate::Theme::default().foreground,
+                bg: None,
+                bold: true,
+                italic: false,
+                underline: false,
+                strikeout: false,
+                dim: false,
+            });
+        }
+
+        let links = detect_links_with_cwd(&screen, None);
+        let link = links
+            .iter()
+            .find(|link| link.kind == LinkKind::Path)
+            .expect("折り返された絶対パスを検出する");
+        assert_eq!(link.target, abs.to_string_lossy());
+        assert_eq!(link.spans.len(), 2);
+        assert_eq!(link.spans[0].0, 0);
+        assert_eq!(link.spans[1].0, 1);
+        cleanup_test_dir(&dir);
+    }
+
+    #[test]
     fn nonexistent_path_excluded() {
         let dir = setup_test_dir("nonexistent");
         let screen = make_screen(&["open src/nonexistent.rs here"], 80);
@@ -720,5 +778,11 @@ mod tests {
         assert!(!is_path_like("plain"));
         assert!(!is_path_like("http://example.com"));
         assert!(!is_path_like(""));
+    }
+
+    #[test]
+    fn 区切り文字だけの画面でも走査が停止する() {
+        let screen = make_screen(&["() [] {} <> ,; plain"], 80);
+        assert!(detect_links_with_cwd(&screen, None).is_empty());
     }
 }

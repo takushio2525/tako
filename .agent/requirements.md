@@ -569,6 +569,10 @@ FR-3.5 実装メモ（2026-07-12、#126）:
   BS / Delete、改行、上下左右・行頭末移動を担う。GUI は `preview_line_texts` と、GPUI が
   実描画に使った行別 `TextLayout` を同モデルへ同期する。固定セル幅の近似は使わず、行頭・
   行末・日本語・タブ・スクロール後の座標を描画の shaping 結果から逆写像する（#145）
+- **構文色（#152）**: 読み取り / 編集は同じ syntect 構文解決器を使い、同梱標準セット全体を
+  拡張子・特殊ファイル名・shebang から判定する。`load_defaults_newlines` に合わせてパーサへ
+  行末改行を渡し、C++ / Python / Rust / JavaScript / Shell 等の複数色を維持する。標準セットに
+  TypeScript 文法が無い場合は JavaScript へ劣化し、特定言語だけのホワイトリストにはしない
 - **保存競合**: 編集開始時の元バイト列を保持し、保存直前のファイル内容と完全比較する。
   不一致なら外部変更として保存を拒否し、dirty バッファを保持する。Unix は同一ディレクトリの
   一時ファイルを `sync_all` 後に rename、Windows は既存依存だけで置換 API を使えないため
@@ -671,6 +675,7 @@ FR-2.7.6 は画像ペインを並べて実現する）。
 | FR-5.6 | tmuxview（FR-2.13）で tako 自身のバックエンドセッションを**区別表示**する（`backend: true` + 保持ペイン / orphan 表示。kill 確認文言も専用） | M | ✅ 2026-06-12 |
 | FR-5.7 | 保存・復元の結果を**黙殺せず診断可能**にする（Issue #30）: 復元の成否・理由（不在 / 破損 / バージョン不一致等）・layout.json の明示削除を `<data_dir>/persist.log` に記録（256KB で `.old` ローテート）。破損ファイルは `layout.json.corrupt` へ退避。`tako persist` / MCP `tako_persist` の応答に `layout_path` / `layout_exists` / `last_restore` / `log_path` を含める | M | ✅ 2026-07-02 |
 | FR-5.8 | **多重インスタンスガード（セカンダリモード）**（Issue #113）: 別の生きたインスタンス（別プロセス = control.json の主が生存 tako-app / 同一プロセス = NewWindow の 2 窓目以降）がある間、後発は**セカンダリモード**で起動する — 復元しない・layout.json を書かない/消さない・tmux バックエンドに乗らない・固定ソケット（tako.sock）と control.json の current を乗っ取らない・persist 切替を拒否（`tako persist` 応答の `secondary` で判別可）。ガード無しの旧挙動では、後発の復元 spawn（`new-session -A -D`）がプライマリの全クライアントを強奪 → Exited 連鎖の途中状態が layout.json を上書き → 次回起動の orphan cleanup が実行中セッションを kill する三段連鎖が起きた（2026-07-08 実機: 19→13 ペイン消失）。`TAKO_FORCE_PRIMARY=1` は検証・緊急脱出用オーバーライド | M | ✅ 2026-07-08 |
+| FR-5.9 | **PC 再起動後の Claude 会話復旧**（Issue #139）: persist 有効中は、PID 祖先照合で確定できた Claude Code session ID をペインに紐づけて `layout.json` へ保存する。復元時は保存済み tmux backend が生存していれば従来どおりプロセスごと再 attach し、PC 再起動等で backend が消失している場合だけ、transcript の存在と session ID 形式を検証して新シェルから `claude --resume <session-id>` を実行する。検出不能なペイン・明示終了済み Claude・Codex 等を推測で resume しない。新規設定は追加せず、既存 `tako persist` / MCP `tako_persist` が 1:1 の制御点 | M | ✅ 2026-07-13 |
 
 ### close 操作とバックエンドセッションの整合（2026-06-12 仕様化）
 

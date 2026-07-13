@@ -57,6 +57,24 @@ use tako_core::{
 const INITIAL_COLS: usize = 80;
 const INITIAL_ROWS: usize = 24;
 
+/// 実行中 Claude Code とペインの対応を layout.json へ反映する間隔。
+/// 外部 CLI を呼ぶため描画ループとは分離し、成功時だけ保存キャッシュを更新する。
+const CLAUDE_SESSION_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// 復元時に新しいシェルへ投入する Claude resume コマンドを安全条件つきで組み立てる。
+/// backend 生存時はプロセスごと再 attach するため、二重起動を避けて None。
+fn claude_resume_command(
+    backend_alive: bool,
+    session_id: Option<&str>,
+    transcript_exists: bool,
+) -> Option<Vec<u8>> {
+    let session_id = (!backend_alive && transcript_exists)
+        .then_some(session_id)
+        .flatten()
+        .filter(|id| tako_control::transcript::is_valid_session_id(id))?;
+    Some(format!("claude --resume {session_id}\r").into_bytes())
+}
+
 /// タブバーの高さ（px）
 const TAB_BAR_HEIGHT: f32 = 40.0;
 /// ペイン枠線の太さ（px）
@@ -521,6 +539,9 @@ struct TakoApp {
     quitting: bool,
     /// ペインを保持する tmux バックエンドセッション名（persist 有効時のみ登録される）
     backend_sessions: HashMap<PaneId, String>,
+    /// PC 再起動で tmux セッション自体が消えたときに resume する Claude session ID。
+    /// `claude agents --json` と PID 祖先照合が成功した結果だけを保持する
+    claude_resume_sessions: HashMap<PaneId, String>,
     /// バックエンドセッション内の window 一覧（tmux ポーリングで更新。2+ window のみ保持）
     backend_windows: HashMap<PaneId, Vec<tako_core::TmuxWindow>>,
     /// tmux window のキャプチャテキスト（ホバープレビュー用。ポーリングで非アクティブ window を取得）
@@ -591,6 +612,9 @@ struct TakoApp {
     preview_line_bounds: HashMap<PaneId, Vec<Bounds<Pixels>>>,
     /// PDF プレビューの文字ごとの bounds（paint 時に canvas で記録。選択のヒット判定用）
     preview_pdf_char_bounds: HashMap<PaneId, Vec<Vec<Bounds<Pixels>>>>,
+    /// PDF 選択の最前面 canvas が直近フレームで発行した矩形数。
+    /// selftest が座標計算だけでなく paint 経路まで到達したことを検証する。
+    preview_pdf_highlight_paint_count: HashMap<PaneId, usize>,
     /// コード / Markdown の行ごとの GPUI 実描画レイアウト。
     /// 描画と同じ shaping 結果で座標を UTF-8 byte index へ逆写像する。
     preview_text_layouts: HashMap<PaneId, Vec<Option<TextLayout>>>,
@@ -631,6 +655,16 @@ struct HoveredLink {
     target: String,
     kind: tako_core::LinkKind,
     spans: Vec<(usize, usize, usize)>,
+}
+
+impl HoveredLink {
+    fn contains(&self, pane: PaneId, row: usize, col: usize) -> bool {
+        self.pane == pane
+            && self
+                .spans
+                .iter()
+                .any(|&(r, start, end)| r == row && start <= col && col < end)
+    }
 }
 
 /// git パネルのデータスナップショット（FR-3.6 / FR-3.9）
@@ -730,6 +764,41 @@ fn chunk_line_chars(infos: &[CharInfo]) -> Vec<RenderChunk> {
         });
     }
     chunks
+}
+
+/// 描画チャンク内でリンクのセル範囲に重なる UTF-8 バイト範囲を返す。
+/// StyledText のハイライトをリンク部分だけへ限定し、同じ ANSI style run の行全体へ
+/// 下線・背景色が広がるのを防ぐ。
+fn link_byte_range_in_chunk(
+    infos: &[CharInfo],
+    cell_cols: &[usize],
+    chunk: &RenderChunk,
+    link_start: usize,
+    link_end: usize,
+) -> Option<Range<usize>> {
+    let mut byte_offset = 0;
+    let mut start = None;
+    let mut end = 0;
+
+    for (index, info) in infos.iter().enumerate().take(chunk.end).skip(chunk.start) {
+        let cell_start = cell_cols.get(index).copied().unwrap_or(index);
+        let cell_end = cell_start + info.char_cols;
+        let next_byte = byte_offset + info.ch.len_utf8();
+        let overlaps = if info.char_cols == 0 {
+            cell_start >= link_start && cell_start < link_end
+        } else {
+            cell_end > link_start && cell_start < link_end
+        };
+        if overlaps {
+            start.get_or_insert(byte_offset);
+            end = next_byte;
+        } else if start.is_some() {
+            break;
+        }
+        byte_offset = next_byte;
+    }
+
+    start.map(|start| start..end)
 }
 
 /// プレビューペインのテキスト選択状態
@@ -1249,6 +1318,7 @@ impl TakoApp {
             secondary,
             quitting: false,
             backend_sessions: HashMap::new(),
+            claude_resume_sessions: HashMap::new(),
             backend_windows: HashMap::new(),
             window_captures: HashMap::new(),
             last_saved_layout: None,
@@ -1277,6 +1347,7 @@ impl TakoApp {
             preview_selecting: None,
             preview_line_bounds: HashMap::new(),
             preview_pdf_char_bounds: HashMap::new(),
+            preview_pdf_highlight_paint_count: HashMap::new(),
             preview_text_layouts: HashMap::new(),
             preview_line_texts: HashMap::new(),
             webviews: Vec::new(),
@@ -1307,6 +1378,10 @@ impl TakoApp {
                 .iter()
                 .flat_map(|t| t.tree().panes().into_iter().map(|p| p.id()))
                 .collect();
+            let mut reattached = 0usize;
+            let mut resumed_claude = 0usize;
+            let mut fresh_shells = 0usize;
+            let mut restored_previews = 0usize;
             for r in &restored {
                 let Some(&pane) = pane_ids.iter().find(|p| p.as_u64() == r.pane) else {
                     continue;
@@ -1327,6 +1402,7 @@ impl TakoApp {
                             .push((pane, path.to_path_buf(), text));
                     }
                     app.previews.insert(pane, state);
+                    restored_previews += 1;
                     continue;
                 }
                 // Web ビューペイン（FR-3.8 / #155）は URL を開き直すだけ（PTY は起動しない）。
@@ -1336,8 +1412,29 @@ impl TakoApp {
                         .push((Some(r.pane), url.clone()));
                     continue;
                 }
+                let backend_alive = r.session.as_ref().is_some_and(|name| {
+                    tmux_available
+                        && tako_core::tmux::has_session(
+                            Some(&tako_core::tmux_backend::socket_name()),
+                            name,
+                        )
+                });
                 if let Some(name) = &r.session {
                     app.backend_sessions.insert(pane, name.clone());
+                }
+                let transcript_exists = r
+                    .claude_session_id
+                    .as_deref()
+                    .is_some_and(|id| tako_control::transcript::find_transcript(id).is_some());
+                let resume_command = claude_resume_command(
+                    backend_alive,
+                    r.claude_session_id.as_deref(),
+                    transcript_exists,
+                );
+                if let Some(session_id) = &r.claude_session_id {
+                    if tako_control::transcript::is_valid_session_id(session_id) {
+                        app.claude_resume_sessions.insert(pane, session_id.clone());
+                    }
                 }
                 let options = SpawnOptions {
                     cwd: r
@@ -1349,6 +1446,20 @@ impl TakoApp {
                 };
                 if let Err(e) = app.spawn_session(pane, options, cx) {
                     eprintln!("warning: ペイン {pane} を復元できない: {e}");
+                    continue;
+                }
+                if backend_alive {
+                    reattached += 1;
+                } else if let Some(command) = resume_command {
+                    // tmux サーバーごと消える PC 再起動では新しいログインシェルを起動し、
+                    // 保存済みの会話だけを明示 resume する。入力を PTY にキューすることで、
+                    // Claude 終了後は元のシェルへ戻れる（明示コマンド spawn だとペインも終了する）。
+                    if let Some(session) = app.terminals.get(&pane) {
+                        session.write(command);
+                        resumed_claude += 1;
+                    }
+                } else {
+                    fresh_shells += 1;
                 }
             }
             if app.terminals.is_empty()
@@ -1358,6 +1469,17 @@ impl TakoApp {
                 eprintln!("fatal: 復元したペインを 1 つも起動できない");
                 std::process::exit(1);
             }
+            let report = format!(
+                "復元成功: {} タブ / {} ペイン（tmux 再 attach {} / Claude resume {} / 新規シェル {} / プレビュー {}）",
+                app.workspace.tabs().len(),
+                restored.len(),
+                reattached,
+                resumed_claude,
+                fresh_shells,
+                restored_previews
+            );
+            app.restore_report = Some(report.clone());
+            persist_diag(&report);
             // 復元時のプレビューも background でハイライトする
             for (pane, path, text) in std::mem::take(&mut app.pending_highlights) {
                 app.spawn_highlight(pane, path, text, cx);
@@ -1433,6 +1555,44 @@ impl TakoApp {
                     }
                     Err(_) => break, // View が破棄された
                 }
+            }
+        })
+        .detach();
+
+        // PC 再起動では tmux プロセスも消えるため、実行中 Claude Code の session ID を
+        // ペインごとに保存して `claude --resume` へ使う。外部コマンドは background で実行し、
+        // 検出失敗時は直前の成功値を壊さない。既存 persist トグルが CLI / MCP 共通の制御点。
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(CLAUDE_SESSION_SCAN_INTERVAL)
+                .await;
+            let should_scan = this
+                .update(cx, |app: &mut TakoApp, _| {
+                    app.tmux_persist
+                        && !app.secondary
+                        && !app.backend_sessions.is_empty()
+                        // self-test は外部 Claude CLI を呼ばず決定的に完走させる
+                        && std::env::var_os("TAKO_SELF_TEST").is_none()
+                })
+                .unwrap_or(false);
+            if !should_scan {
+                continue;
+            }
+            let detected = cx
+                .background_executor()
+                .spawn(async { tako_control::agents::claude_session_ids_by_backend() })
+                .await;
+            let Ok(detected) = detected else {
+                continue;
+            };
+            if this
+                .update(cx, |app: &mut TakoApp, _| {
+                    app.apply_claude_resume_sessions(&detected);
+                    app.save_layout();
+                })
+                .is_err()
+            {
+                break;
             }
         })
         .detach();
@@ -3002,6 +3162,7 @@ impl TakoApp {
     /// セッションは生きているか他インスタンスが引き継いでいる。残骸は起動時の
     /// orphan クリーンアップ（FR-2.16.11）と tmux ビューの「kill漏れ?」表示が拾う）
     fn drop_backend_session_with(&mut self, pane_id: PaneId, reason: CloseReason) {
+        self.claude_resume_sessions.remove(&pane_id);
         match reason {
             CloseReason::Explicit => self.drop_backend_session(pane_id),
             CloseReason::Exited => {
@@ -3035,6 +3196,7 @@ impl TakoApp {
                 self.preview_selections.remove(&pane_id);
                 self.preview_line_bounds.remove(&pane_id);
                 self.preview_pdf_char_bounds.remove(&pane_id);
+                self.preview_pdf_highlight_paint_count.remove(&pane_id);
                 self.preview_text_layouts.remove(&pane_id);
                 self.preview_line_texts.remove(&pane_id);
                 self.scroll_accum.remove(&pane_id);
@@ -3074,6 +3236,7 @@ impl TakoApp {
                     self.preview_selections.remove(&id);
                     self.preview_line_bounds.remove(&id);
                     self.preview_pdf_char_bounds.remove(&id);
+                    self.preview_pdf_highlight_paint_count.remove(&id);
                     self.preview_text_layouts.remove(&id);
                     self.preview_line_texts.remove(&id);
                     self.scroll_accum.remove(&id);
@@ -3177,6 +3340,7 @@ impl TakoApp {
             return;
         }
         let backend_sessions = &self.backend_sessions;
+        let claude_resume_sessions = &self.claude_resume_sessions;
         let terminals = &self.terminals;
         let previews = &self.previews;
         let webviews = &self.webviews;
@@ -3188,6 +3352,7 @@ impl TakoApp {
                     .get(&pane)
                     .and_then(|s| s.cwd())
                     .map(|p| p.display().to_string()),
+                claude_session_id: claude_resume_sessions.get(&pane).cloned(),
                 preview: previews
                     .get(&pane)
                     .map(|p| tako_control::layout::PreviewLayout {
@@ -3233,6 +3398,22 @@ impl TakoApp {
             // 保存失敗は復元不能に直結するので診断ログにも残す（Issue #30）
             Err(e) => persist_diag(&format!("保存失敗: {e}")),
         }
+    }
+
+    /// 1 回の `claude agents --json` 成功結果を現在の backend ペインへ反映する。
+    /// 成功結果に存在しないペインは Claude が終了済みなので関連を外し、次回 PC 起動で
+    /// 古い会話を勝手に resume しない。スキャン自体が失敗した場合は呼ばれない。
+    fn apply_claude_resume_sessions(&mut self, by_backend: &HashMap<String, String>) {
+        self.claude_resume_sessions = self
+            .backend_sessions
+            .iter()
+            .filter_map(|(pane, backend)| {
+                by_backend
+                    .get(backend)
+                    .filter(|id| tako_control::transcript::is_valid_session_id(id))
+                    .map(|id| (*pane, id.clone()))
+            })
+            .collect();
     }
 
     fn focus_direction(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
@@ -3816,6 +3997,21 @@ impl TakoApp {
         &self,
         pane_id: PaneId,
         position: Point<Pixels>,
+        window: &mut Window,
+    ) -> Option<(usize, usize, bool)> {
+        let (_, area) = self.pane_text_areas.iter().find(|(id, _)| *id == pane_id)?;
+        if !area.contains(&position) {
+            return None;
+        }
+        self.cell_at_clamped(pane_id, position, window)
+    }
+
+    /// `cell_at` のクランプ版。テキスト領域外の座標も最寄りセルへ写像する。
+    /// 選択ドラッグ中はペインを外れても選択を伸ばし続ける必要があるためこちらを使う
+    fn cell_at_clamped(
+        &self,
+        pane_id: PaneId,
+        position: Point<Pixels>,
         _window: &mut Window,
     ) -> Option<(usize, usize, bool)> {
         let (_, area) = self.pane_text_areas.iter().find(|(id, _)| *id == pane_id)?;
@@ -4230,13 +4426,14 @@ impl TakoApp {
             // cmd+クリック: リンクを開く
             if event.modifiers.platform && event.click_count == 1 {
                 if let Some(link) = self.hovered_link.take() {
-                    if link.pane == pane_id {
+                    if link.contains(pane_id, row, col) {
                         self.open_link(&link.target, link.kind, pane_id, cx);
                         cx.notify();
                         return;
                     }
                 }
-                // hovered_link が無くてもその場で検出を試みる
+                // cmd を押してからマウスを動かさずクリックした場合も、その場で最新画面を検出する
+                self.refresh_pane_links(pane_id);
                 let links = self.pane_links.get(&pane_id);
                 if let Some(links) = links {
                     if let Some(link) = tako_core::link_at(links, row, col) {
@@ -4292,8 +4489,24 @@ impl TakoApp {
                         },
                         PaneOrigin::User,
                     );
-                    if let Err(e) = result {
-                        eprintln!("warning: ディレクトリを開けない: {e}");
+                    match result {
+                        Ok(_) => {
+                            // UI から dispatch を直接呼ぶため、IPC / MCP ループと同じ
+                            // pending_attach 後処理をここで実行する。これを欠くとツリー上に
+                            // 空ペインだけができ、PTY も cwd も存在しない（#153）。
+                            for (pane, options) in std::mem::take(&mut self.pending_attach) {
+                                if let Err(e) = self.spawn_session(pane, options, cx) {
+                                    eprintln!("warning: ディレクトリペインを開けない: {e}");
+                                    self.remove_pane(pane, cx);
+                                }
+                            }
+                            for (pane, data) in std::mem::take(&mut self.pending_writes) {
+                                if let Some(session) = self.terminals.get(&pane) {
+                                    session.write(data);
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("warning: ディレクトリを開けない: {e}"),
                     }
                 } else {
                     // ファイル: 右に分割してプレビュー
@@ -4375,7 +4588,7 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) {
         // cmd+ホバーでリンク検出（ボタン押下状態に関係なく判定）
-        self.update_hovered_link(event, window, cx);
+        self.update_hovered_link_at(event.position, event.modifiers.platform, window, cx);
 
         if event.pressed_button != Some(MouseButton::Left) {
             // ウィンドウ外でボタンが離されると MouseUp が届かないことがある。
@@ -4454,7 +4667,8 @@ impl TakoApp {
         let Some(pane_id) = self.selecting else {
             return;
         };
-        if let Some((col, row, right)) = self.cell_at(pane_id, event.position, window) {
+        // ドラッグ選択はテキスト領域を外れても最寄りセルへ伸ばし続ける（クランプ版）
+        if let Some((col, row, right)) = self.cell_at_clamped(pane_id, event.position, window) {
             if let Some(session) = self.terminals.get(&pane_id) {
                 session.extend_selection(col, row, right);
                 cx.notify();
@@ -4463,13 +4677,13 @@ impl TakoApp {
     }
 
     /// cmd+ホバー時のリンク検出更新
-    fn update_hovered_link(
+    fn update_hovered_link_at(
         &mut self,
-        event: &MouseMoveEvent,
+        position: Point<Pixels>,
+        cmd: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let cmd = event.modifiers.platform;
         let old = self.hovered_link.is_some();
 
         if !cmd {
@@ -4482,7 +4696,7 @@ impl TakoApp {
         // マウス位置がどのペインのどのセルか判定
         let mut found = None;
         for &(pane_id, _) in &self.pane_text_areas {
-            if let Some((col, row, _)) = self.cell_at(pane_id, event.position, window) {
+            if let Some((col, row, _)) = self.cell_at(pane_id, position, window) {
                 // リンクキャッシュを更新（ペインの画面が変わるたびにリフレッシュ）
                 self.refresh_pane_links(pane_id);
                 if let Some(links) = self.pane_links.get(&pane_id) {
@@ -4508,6 +4722,21 @@ impl TakoApp {
         if changed || old {
             cx.notify();
         }
+    }
+
+    /// cmd 単独の押下・解放でも、現在のマウス位置にあるリンク装飾を即時更新する。
+    fn on_modifiers_changed(
+        &mut self,
+        event: &gpui::ModifiersChangedEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_hovered_link_at(
+            window.mouse_position(),
+            event.modifiers.platform,
+            window,
+            cx,
+        );
     }
 
     /// ペインのリンク検出キャッシュを更新する
@@ -5251,40 +5480,39 @@ impl TakoApp {
                 let mut children: Vec<gpui::AnyElement> = Vec::with_capacity(chunks.len());
                 let link_span = link_spans.get(&row_idx);
                 for chunk in chunks {
-                    let mut hl = if chunk.run_idx < run_highlights.len() {
+                    let hl = if chunk.run_idx < run_highlights.len() {
                         run_highlights[chunk.run_idx]
                     } else {
                         self.run_highlight(&fallback_run)
                     };
-                    // cmd+ホバー中のリンク範囲にチャンクが重なるなら下線を追加
-                    if let Some(&(link_sc, link_ec)) = link_span {
-                        let chunk_sc = line
-                            .cell_cols
-                            .get(chunk.start)
-                            .copied()
-                            .unwrap_or(chunk.start);
-                        let chunk_ec = if chunk.end > 0 {
-                            line.cell_cols
-                                .get(chunk.end - 1)
-                                .copied()
-                                .unwrap_or(chunk.end - 1)
-                                + infos.get(chunk.end - 1).map_or(1, |i| i.char_cols)
-                        } else {
-                            chunk_sc
-                        };
-                        if chunk_ec > link_sc && chunk_sc < link_ec {
-                            hl.underline = Some(UnderlineStyle {
-                                thickness: px(1.0),
-                                color: Some(hsla(theme.accent)),
-                                wavy: false,
-                            });
-                            hl.color = Some(hsla(theme.accent));
-                        }
-                    }
                     let text: String = infos[chunk.start..chunk.end].iter().map(|x| x.ch).collect();
                     let text_len = text.len();
+                    let link_range = link_span.and_then(|&(link_sc, link_ec)| {
+                        link_byte_range_in_chunk(&infos, &line.cell_cols, &chunk, link_sc, link_ec)
+                    });
+                    let highlights = if let Some(link_range) = link_range {
+                        let mut link_hl = hl;
+                        link_hl.underline = Some(UnderlineStyle {
+                            thickness: px(1.0),
+                            color: Some(hsla(theme.accent)),
+                            wavy: false,
+                        });
+                        link_hl.color = Some(hsla(theme.accent));
+                        link_hl.background_color = Some(hsla_alpha(theme.accent, 0.22));
+                        let mut ranges = Vec::with_capacity(3);
+                        if link_range.start > 0 {
+                            ranges.push((0..link_range.start, hl));
+                        }
+                        ranges.push((link_range.clone(), link_hl));
+                        if link_range.end < text_len {
+                            ranges.push((link_range.end..text_len, hl));
+                        }
+                        ranges
+                    } else {
+                        vec![(0..text_len, hl)]
+                    };
                     let styled = StyledText::new(SharedString::from(text))
-                        .with_default_highlights(&default_style, vec![(0..text_len, hl)]);
+                        .with_default_highlights(&default_style, highlights);
                     let mut d = div()
                         .w(cw * chunk.cols.max(1) as f32)
                         .flex_none()
@@ -6695,6 +6923,7 @@ impl ControlHost for TakoApp {
         // 内容差し替えから次の paint まで旧ファイルの座標を hit-test に使わせない。
         self.preview_line_bounds.remove(&pane);
         self.preview_pdf_char_bounds.remove(&pane);
+        self.preview_pdf_highlight_paint_count.remove(&pane);
         self.preview_text_layouts.remove(&pane);
         self.preview_line_texts.remove(&pane);
         self.previews.insert(pane, state);
@@ -7535,6 +7764,11 @@ impl Render for TakoApp {
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 this.handle_key(&event.keystroke, cx);
             }))
+            .on_modifiers_changed(cx.listener(
+                |this, event: &gpui::ModifiersChangedEvent, window, cx| {
+                    this.on_modifiers_changed(event, window, cx);
+                },
+            ))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 this.on_mouse_move(event, window, cx);
             }))
@@ -7863,6 +8097,18 @@ fn main() {
                 .expect("ウィンドウを開けなかった");
             cx.activate(true);
 
+            if std::env::var_os("TAKO_VISUAL_TEST").is_some() {
+                #[cfg(feature = "visual-test")]
+                {
+                    self_test::run_visual(window, cx);
+                    return;
+                }
+                #[cfg(not(feature = "visual-test"))]
+                {
+                    eprintln!("TAKO_VISUAL_TEST には --features visual-test が必要");
+                    std::process::exit(1);
+                }
+            }
             if std::env::var_os("TAKO_SELF_TEST").is_some() {
                 self_test::run(window, cx);
             }
@@ -8077,9 +8323,7 @@ mod self_test {
         for _ in 0..40 {
             // typed WindowHandle<TakoApp>::update の内側で draw すると TakoApp の二重借用に
             // なる。root entity を借用しない AnyWindowHandle 境界から描画する。
-            let _ = any.update(cx, |_, preview_window, cx| {
-                let _ = preview_window.draw(cx);
-            });
+            let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
             cx.background_executor()
                 .timer(Duration::from_millis(50))
                 .await;
@@ -8113,6 +8357,138 @@ mod self_test {
             }
         }
         false
+    }
+
+    /// PDF 選択の最前面 canvas が実際に paint_quad を発行するまで、draw 完了を条件に待つ。
+    async fn wait_for_pdf_highlight_paint(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: PaneId,
+    ) -> bool {
+        for _ in 0..40 {
+            let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+            if window
+                .update(cx, |app, _, _| {
+                    app.preview_pdf_highlight_paint_count
+                        .get(&pane)
+                        .copied()
+                        .unwrap_or(0)
+                        > 0
+                })
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// background syntect の完了と、その色付き内容を使った TextLayout の paint を待つ。
+    async fn wait_for_preview_highlight(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: PaneId,
+    ) -> bool {
+        for _ in 0..80 {
+            let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+            let ready = window
+                .update(cx, |app, _, _| {
+                    let color_count = match app.previews.get(&pane).map(|state| &state.content) {
+                        Some(preview::PreviewContent::Code(lines)) => lines
+                            .iter()
+                            .flat_map(|line| line.iter())
+                            .filter_map(|span| span.color)
+                            .map(|color| (color.r, color.g, color.b))
+                            .collect::<std::collections::HashSet<_>>()
+                            .len(),
+                        _ => 0,
+                    };
+                    color_count > 1
+                        && app
+                            .preview_text_layouts
+                            .get(&pane)
+                            .is_some_and(|layouts| layouts.iter().any(Option::is_some))
+                })
+                .unwrap_or(false);
+            if ready {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Metal の最終 scene を直接 RGBA へ読み戻す。画面収録権限やウィンドウ前面化に
+    /// 依存しない実ピクセル検証で、`--features visual-test` のときだけ有効。
+    #[cfg(feature = "visual-test")]
+    fn capture_frame(any: AnyWindowHandle, cx: &mut AsyncApp) -> Option<(image::RgbaImage, f32)> {
+        any.update(cx, |_, window, cx| {
+            window.draw(cx).clear();
+            let scale = window.scale_factor();
+            match window.render_to_image() {
+                Ok(image) => Some((image, scale)),
+                Err(error) => {
+                    eprintln!("TAKO_VISUAL_CAPTURE_ERROR: {error:#}");
+                    None
+                }
+            }
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// 指定した論理座標矩形内で RGBA が変化したピクセル数。Metal 読み戻しの上下方向が
+    /// プラットフォームで異なる可能性を考慮し、通常 / Y 反転の多い方を採用する。
+    #[cfg(feature = "visual-test")]
+    fn changed_pixels_in_bounds(
+        before: &image::RgbaImage,
+        after: &image::RgbaImage,
+        bounds: &[Bounds<Pixels>],
+        scale: f32,
+    ) -> usize {
+        if before.dimensions() != after.dimensions() {
+            return 0;
+        }
+        let (width, height) = before.dimensions();
+        let count = |flip_y: bool| {
+            let mut pixels = std::collections::HashSet::new();
+            for bounds in bounds {
+                let left = (f32::from(bounds.left()) * scale).floor().max(0.0) as u32;
+                let right = (f32::from(bounds.right()) * scale)
+                    .ceil()
+                    .max(0.0)
+                    .min(width as f32) as u32;
+                let raw_top = (f32::from(bounds.top()) * scale).floor().max(0.0) as u32;
+                let raw_bottom = (f32::from(bounds.bottom()) * scale)
+                    .ceil()
+                    .max(0.0)
+                    .min(height as f32) as u32;
+                let (top, bottom) = if flip_y {
+                    (
+                        height.saturating_sub(raw_bottom),
+                        height.saturating_sub(raw_top),
+                    )
+                } else {
+                    (raw_top.min(height), raw_bottom.min(height))
+                };
+                for y in top..bottom {
+                    for x in left..right {
+                        if before.get_pixel(x, y) != after.get_pixel(x, y) {
+                            pixels.insert((x, y));
+                        }
+                    }
+                }
+            }
+            pixels.len()
+        };
+        count(false).max(count(true))
     }
 
     /// stdio ブリッジ（`tako mcp serve`）へ MCP メッセージ列を流し、応答行を回収する。
@@ -8169,6 +8545,227 @@ mod self_test {
                     .unwrap_or(false)
             })
             .unwrap_or(false)
+    }
+
+    /// #152 専用の実描画ピクセル検証。通常セルフテストから独立させ、既存の PTY / fd
+    /// ストレス項目のタイミングに左右されず PDF・C++・Python の scene だけを検査する。
+    #[cfg(feature = "visual-test")]
+    pub fn run_visual(window: WindowHandle<TakoApp>, cx: &mut App) {
+        cx.spawn(async move |cx| {
+            let any: AnyWindowHandle = window.into();
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            let dir = std::env::temp_dir()
+                .join(format!("tako-visual-preview-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("visual-test 一時ディレクトリを作れる");
+            let pdf_path = dir.join("sample.pdf");
+            write_test_pdf(&pdf_path);
+            std::fs::write(
+                dir.join("sample.cpp"),
+                "#include <iostream>\nint main() { std::cout << \"hello\"; return 0; }\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("sample.py"),
+                "def greet(name):\n    message = f\"Hello {name}\"\n    return message\n",
+            )
+            .unwrap();
+
+            let (base, pdf_pane) = window
+                .update(cx, |app, _, cx| {
+                    let base = app.focused_pane().as_u64();
+                    let opened = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::OpenFile {
+                            pane: Some(base),
+                            path: pdf_path.display().to_string(),
+                            mode: Some(tako_control::protocol::PreviewModeWire::Pdf),
+                            direction: None,
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .expect("visual-test PDF を dispatch で開ける");
+                    cx.notify();
+                    (
+                        base,
+                        PaneId::from_raw(
+                            opened["pane"]
+                                .as_u64()
+                                .expect("OpenFile 応答には pane がある"),
+                        ),
+                    )
+                })
+                .unwrap_or_else(|_| fail("visual-test PDF dispatch"));
+            check(
+                wait_for_preview_maps(any, window, cx, pdf_pane, true).await,
+                "visual-test PDF 文字矩形の paint",
+            );
+            let pdf_before = capture_frame(any, cx);
+            window
+                .update(cx, |app, _, cx| {
+                    app.preview_selections.insert(
+                        pdf_pane,
+                        PreviewSelection {
+                            anchor: (0, 0),
+                            head: (0, "Hello".len()),
+                        },
+                    );
+                    cx.notify();
+                })
+                .ok();
+            check(
+                wait_for_pdf_highlight_paint(any, window, cx, pdf_pane).await,
+                "visual-test PDF 最前面 paint_quad",
+            );
+            let pdf_bounds: Vec<Bounds<Pixels>> = window
+                .update(cx, |app, _, _| {
+                    app.preview_pdf_char_bounds
+                        .get(&pdf_pane)
+                        .and_then(|lines| lines.first())
+                        .map(|bounds| {
+                            bounds
+                                .iter()
+                                .take("Hello".len())
+                                .copied()
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            let pdf_after = capture_frame(any, cx);
+            let pdf_changed = match (pdf_before.as_ref(), pdf_after.as_ref()) {
+                (Some((before, scale)), Some((after, _))) => {
+                    changed_pixels_in_bounds(before, after, &pdf_bounds, *scale)
+                }
+                _ => 0,
+            };
+            println!("TAKO_VISUAL_PIXEL: pdf_selection changed={pdf_changed}");
+            check(
+                pdf_changed >= 8,
+                "visual-test PDF 選択領域の RGBA ピクセル変化",
+            );
+
+            for (language, file_name) in [("cpp", "sample.cpp"), ("python", "sample.py")] {
+                let opened = window
+                    .update(cx, |app, _, cx| {
+                        let opened = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::OpenFile {
+                                pane: Some(pdf_pane.as_u64()),
+                                path: dir.join(file_name).display().to_string(),
+                                mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                                direction: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .is_ok();
+                        cx.notify();
+                        opened
+                    })
+                    .unwrap_or(false);
+                check(opened, &format!("visual-test {language} dispatch"));
+                check(
+                    wait_for_preview_maps(any, window, cx, pdf_pane, false).await,
+                    &format!("visual-test {language} 平文 paint"),
+                );
+                let plain_frame = capture_frame(any, cx);
+                window
+                    .update(cx, |app, _, cx| app.drain_pending_highlights(cx))
+                    .ok();
+                check(
+                    wait_for_preview_highlight(any, window, cx, pdf_pane).await,
+                    &format!("visual-test {language} 読み取り色 paint"),
+                );
+                let read_frame = capture_frame(any, cx);
+                let edit_colors = window
+                    .update(cx, |app, _, cx| {
+                        app.set_preview_editing_local(pdf_pane, true)
+                            .expect("visual-test 編集開始");
+                        cx.notify();
+                        match app.previews.get(&pdf_pane).map(|state| &state.content) {
+                            Some(preview::PreviewContent::Code(lines)) => lines
+                                .iter()
+                                .flat_map(|line| line.iter())
+                                .filter_map(|span| span.color)
+                                .map(|color| (color.r, color.g, color.b))
+                                .collect::<std::collections::HashSet<_>>()
+                                .len(),
+                            _ => 0,
+                        }
+                    })
+                    .unwrap_or(0);
+                check(
+                    edit_colors > 1,
+                    &format!("visual-test {language} 編集構文色"),
+                );
+                let edit_frame = capture_frame(any, cx);
+                let text_bounds = window
+                    .update(cx, |app, _, _| {
+                        app.preview_text_layouts
+                            .get(&pdf_pane)
+                            .map(|layouts| {
+                                layouts
+                                    .iter()
+                                    .filter_map(|layout| layout.as_ref().map(TextLayout::bounds))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                let read_changed = match (plain_frame.as_ref(), read_frame.as_ref()) {
+                    (Some((plain, scale)), Some((read, _))) => {
+                        changed_pixels_in_bounds(plain, read, &text_bounds, *scale)
+                    }
+                    _ => 0,
+                };
+                let edit_changed = match (plain_frame.as_ref(), edit_frame.as_ref()) {
+                    (Some((plain, scale)), Some((edit, _))) => {
+                        changed_pixels_in_bounds(plain, edit, &text_bounds, *scale)
+                    }
+                    _ => 0,
+                };
+                println!(
+                    "TAKO_VISUAL_PIXEL: {language} read_changed={read_changed} edit_changed={edit_changed}"
+                );
+                check(
+                    read_changed >= 8,
+                    &format!("visual-test {language} 読み取り RGBA"),
+                );
+                check(
+                    edit_changed >= 8,
+                    &format!("visual-test {language} 編集 RGBA"),
+                );
+                window
+                    .update(cx, |app, _, _| {
+                        app.set_preview_editing_local(pdf_pane, false)
+                            .expect("visual-test 編集終了");
+                    })
+                    .ok();
+            }
+
+            window
+                .update(cx, |app, _, _| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Close {
+                            pane: Some(pdf_pane.as_u64()),
+                            force: true,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    let _ = app.workspace.active_tab_mut().tree_mut().focus(PaneId::from_raw(base));
+                })
+                .ok();
+            let _ = std::fs::remove_dir_all(&dir);
+            if let Some(discovery) = std::env::var_os("TAKO_DISCOVERY_DIR") {
+                let _ = std::fs::remove_dir_all(discovery);
+            }
+            println!("TAKO_VISUAL_TEST_OK");
+            std::process::exit(0);
+        })
+        .detach();
     }
 
     pub fn run(window: WindowHandle<TakoApp>, cx: &mut App) {
@@ -10509,6 +11106,16 @@ mod self_test {
                 "# Title\n\n日本語 abc\tend\n\n- item\n",
             )
             .unwrap();
+            std::fs::write(
+                preview_dir.join("sample.cpp"),
+                "#include <iostream>\nint main() { std::cout << \"hello\"; return 0; }\n",
+            )
+            .unwrap();
+            std::fs::write(
+                preview_dir.join("sample.py"),
+                "def greet(name):\n    message = f\"Hello {name}\"\n    return message\n",
+            )
+            .unwrap();
             let pdf_path = preview_dir.join("sample.pdf");
             write_test_pdf(&pdf_path);
             let (code_ok, md_ok, pdf_ok, mode_ok, toggle_ok, list_ok, closed) = window
@@ -10908,7 +11515,7 @@ mod self_test {
                 "PDF の座標キャッシュ生成",
             );
             let pdf_coordinates_ok = window
-                .update(cx, |app, _, _| {
+                .update(cx, |app, _, cx| {
                     let pane = PaneId::from_raw(code_pane);
                     let texts = app
                         .preview_line_texts
@@ -10951,6 +11558,7 @@ mod self_test {
                             head: (0, "Hello".len()),
                         },
                     );
+                    cx.notify();
                     let copied = app.preview_selected_text().as_deref() == Some("Hello");
                     println!(
                         "TAKO_PREVIEW_COORD: pdf first_x={:.2} last_x={:.2} hits={hit_start:?}/{hit_last_start:?}/{hit_end:?}",
@@ -10969,7 +11577,77 @@ mod self_test {
                 pdf_coordinates_ok,
                 "PDF の文字矩形ヒットテストと選択コピーが往復する",
             );
-
+            check(
+                wait_for_pdf_highlight_paint(
+                    any,
+                    window,
+                    cx,
+                    PaneId::from_raw(code_pane),
+                )
+                .await,
+                "PDF 選択が最前面 canvas の paint_quad へ到達",
+            );
+            // C++ / Python は background syntect 完了後の読み取り状態と編集状態で
+            // 複数色を確認する。実ピクセル比較は独立した TAKO_VISUAL_TEST で行う。
+            for (language, file_name) in [("cpp", "sample.cpp"), ("python", "sample.py")] {
+                let pane = PaneId::from_raw(code_pane);
+                let opened = window
+                    .update(cx, |app, _, cx| {
+                        let opened = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::OpenFile {
+                                pane: Some(code_pane),
+                                path: preview_dir.join(file_name).display().to_string(),
+                                mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                                direction: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .is_ok();
+                        cx.notify();
+                        opened
+                    })
+                    .unwrap_or(false);
+                check(opened, &format!("{language} の読み取りプレビューを開く"));
+                check(
+                    wait_for_preview_maps(any, window, cx, pane, false).await,
+                    &format!("{language} 平文フレームの描画"),
+                );
+                window
+                    .update(cx, |app, _, cx| app.drain_pending_highlights(cx))
+                    .ok();
+                check(
+                    wait_for_preview_highlight(any, window, cx, pane).await,
+                    &format!("{language} 読み取りの syntect 色付き描画"),
+                );
+                let editing_colors = window
+                    .update(cx, |app, _, cx| {
+                        app.set_preview_editing_local(pane, true)
+                            .expect("コード編集を開始できる");
+                        cx.notify();
+                        match app.previews.get(&pane).map(|state| &state.content) {
+                            Some(preview::PreviewContent::Code(lines)) => lines
+                                .iter()
+                                .flat_map(|line| line.iter())
+                                .filter_map(|span| span.color)
+                                .map(|color| (color.r, color.g, color.b))
+                                .collect::<std::collections::HashSet<_>>()
+                                .len(),
+                            _ => 0,
+                        }
+                    })
+                    .unwrap_or(0);
+                check(
+                    editing_colors > 1,
+                    &format!("{language} 編集表示も複数の構文色を保持"),
+                );
+                window
+                    .update(cx, |app, _, _| {
+                        app.set_preview_editing_local(pane, false)
+                            .expect("コード編集を終了できる");
+                    })
+                    .ok();
+            }
             // 後続の編集 e2e は note.md を対象にするため Markdown へ戻す。
             window
                 .update(cx, |app, _, cx| {
@@ -11584,6 +12262,223 @@ mod self_test {
             check(issue64.1, "行 div の whitespace_nowrap（折り返しの構造的禁止）");
             check(issue64.2, "セル幅不一致グリフの隔離 + ASCII グループ化維持");
 
+            // 69c. ターミナルリンク（#153）: 実 PTY に絶対 / ~/ / cwd 相対パスを表示し、
+            //      画面スナップショットからの検出と cmd+クリック相当の MouseDown を通す。
+            //      ファイルは OpenFile プレビュー、ディレクトリは Split + PTY 起動まで実測する。
+            let link_dir = std::path::PathBuf::from("/private/tmp")
+                .join(format!("tako-selftest-link-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&link_dir);
+            std::fs::create_dir_all(link_dir.join("sub"))
+                .expect("リンク用一時ディレクトリを作れる");
+            let link_file = link_dir.join("sub/relative.txt");
+            let absolute_file = link_dir.join("absolute.txt");
+            std::fs::write(&link_file, "link selftest\n").unwrap();
+            std::fs::write(&absolute_file, "absolute link selftest\n").unwrap();
+            let link_command = format!(
+                "cd {} && printf '%s\\n' LINK_SELFTEST {} '~/' sub/relative.txt {}",
+                shell_escape(&link_dir),
+                shell_escape(&absolute_file),
+                shell_escape(&link_dir),
+            );
+            press(any, cx, "ctrl-u");
+            type_text(any, cx, &link_command, true);
+            let mut link_screen_ready = false;
+            for _ in 0..12 {
+                wait(cx, 300).await;
+                link_screen_ready = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&app.focused_pane())
+                            .is_some_and(|session| {
+                                session.cwd() == Some(link_dir.as_path())
+                                    && session
+                                        .visible_lines()
+                                        .iter()
+                                        .any(|line| line.trim() == "LINK_SELFTEST")
+                            })
+                    })
+                    .unwrap_or(false);
+                if link_screen_ready {
+                    break;
+                }
+            }
+            check(link_screen_ready, "リンク検証テキストを実 PTY 画面へ表示");
+
+            let (absolute_ok, home_ok, relative_ok, cwd_ok) = window
+                .update(cx, |app, _, _| {
+                    let base = app.focused_pane();
+                    app.refresh_pane_links(base);
+                    let links = app.pane_links.get(&base).cloned().unwrap_or_default();
+                    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                    let has_absolute = links.iter().any(|link| {
+                        link.kind == tako_core::LinkKind::Path
+                            && std::path::Path::new(&link.target) == absolute_file
+                    });
+                    let has_relative = links.iter().any(|link| {
+                        link.kind == tako_core::LinkKind::Path
+                            && std::path::Path::new(&link.target) == link_file
+                    });
+                    let has_home = home.is_some_and(|home| {
+                        links.iter().any(|link| {
+                            link.kind == tako_core::LinkKind::Path
+                                && std::path::Path::new(&link.target) == home
+                        })
+                    });
+                    let cwd_matches = app
+                        .terminals
+                        .get(&base)
+                        .and_then(|session| session.cwd())
+                        == Some(link_dir.as_path());
+                    (has_absolute, has_home, has_relative, cwd_matches)
+                })
+                .unwrap_or((false, false, false, false));
+            check(absolute_ok, "絶対パスを実画面から検出・解決");
+            check(home_ok, "~/ 起点パスを実画面から検出・解決");
+            check(relative_ok, "cwd 相対パスを実画面から検出・解決");
+            check(cwd_ok, "リンク解決 cwd が実 PTY の OSC 7 と一致");
+
+            // 任意のピクセル検証停止点。通常の self-test では待機しない。
+            // 実画面の検出結果とセル座標から cmd ホバーと同じ更新関数を通し、外部の
+            // screencapture が装飾前後を同一ウィンドウで取得できるようにする。
+            if std::env::var_os("TAKO_SELF_TEST_LINK_VISUAL").is_some() {
+                println!("TAKO_LINK_VISUAL_BASELINE_READY");
+                wait(cx, 15_000).await;
+                let visual_hovered = window
+                    .update(cx, |app, win, cx| {
+                        let base = app.focused_pane();
+                        app.refresh_pane_links(base);
+                        let link = app
+                            .pane_links
+                            .get(&base)?
+                            .iter()
+                            .find(|link| std::path::Path::new(&link.target) == link_file)?
+                            .clone();
+                        let &(row, start, _) = link.spans.first()?;
+                        let area = app
+                            .pane_text_areas
+                            .iter()
+                            .find(|(pane, _)| *pane == base)
+                            .map(|(_, area)| *area)?;
+                        let cell = app.cell_size_for_pane(base)?;
+                        let position = point(
+                            area.origin.x + cell.width * (start as f32 + 0.5),
+                            area.origin.y + cell.height * (row as f32 + 0.5),
+                        );
+                        app.update_hovered_link_at(position, true, win, cx);
+                        app.hovered_link
+                            .as_ref()
+                            .is_some_and(|hovered| hovered.contains(base, row, start))
+                            .then_some(())
+                    })
+                    .ok()
+                    .flatten()
+                    .is_some();
+                check(visual_hovered, "ピクセル検証用 cmd ホバー状態を構築");
+                println!("TAKO_LINK_VISUAL_HOVER_READY");
+                wait(cx, 60_000).await;
+                let _ = window.update(cx, |app, _, cx| {
+                    app.hovered_link = None;
+                    cx.notify();
+                });
+            }
+
+            let (file_click_ok, directory_click_ok) = window
+                .update(cx, |app, win, cx| {
+                    let base = app.focused_pane();
+                    app.refresh_pane_links(base);
+                    let links = app.pane_links.get(&base)?.clone();
+
+                    let click = |app: &mut TakoApp,
+                                 link: &tako_core::DetectedLink,
+                                 win: &mut Window,
+                                 cx: &mut Context<TakoApp>| {
+                        let &(row, start, _) = link.spans.first()?;
+                        let area = app
+                            .pane_text_areas
+                            .iter()
+                            .find(|(pane, _)| *pane == base)
+                            .map(|(_, area)| *area)?;
+                        let cell = app.cell_size_for_pane(base)?;
+                        let position = point(
+                            area.origin.x + cell.width * (start as f32 + 0.5),
+                            area.origin.y + cell.height * (row as f32 + 0.5),
+                        );
+                        app.hovered_link = None;
+                        app.on_pane_mouse_down(
+                            base,
+                            &MouseDownEvent {
+                                button: MouseButton::Left,
+                                position,
+                                modifiers: Modifiers {
+                                    platform: true,
+                                    ..Modifiers::default()
+                                },
+                                click_count: 1,
+                                first_mouse: false,
+                            },
+                            win,
+                            cx,
+                        );
+                        Some(())
+                    };
+
+                    let file_link = links
+                        .iter()
+                        .find(|link| std::path::Path::new(&link.target) == link_file)?;
+                    click(app, file_link, win, cx)?;
+                    let preview = app.previews.iter().find_map(|(pane, state)| {
+                        (state.path == link_file).then_some(*pane)
+                    });
+                    let file_click_ok = preview.is_some();
+                    if let Some(preview) = preview {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Close {
+                                pane: Some(preview.as_u64()),
+                                force: true,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                    }
+
+                    app.refresh_pane_links(base);
+                    let dir_link = app
+                        .pane_links
+                        .get(&base)?
+                        .iter()
+                        .find(|link| std::path::Path::new(&link.target) == link_dir)?
+                        .clone();
+                    let terminals_before: std::collections::HashSet<_> =
+                        app.terminals.keys().copied().collect();
+                    click(app, &dir_link, win, cx)?;
+                    let directory_pane = app.terminals.iter().find_map(|(pane, session)| {
+                        (!terminals_before.contains(pane)
+                            && session.cwd() == Some(link_dir.as_path()))
+                        .then_some(*pane)
+                    });
+                    let directory_click_ok = directory_pane.is_some();
+                    if let Some(pane) = directory_pane {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Close {
+                                pane: Some(pane.as_u64()),
+                                force: true,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                    }
+                    Some((file_click_ok, directory_click_ok))
+                })
+                .ok()
+                .flatten()
+                .unwrap_or((false, false));
+            check(file_click_ok, "cmd+クリックでファイルを分割プレビュー表示");
+            check(
+                directory_click_ok,
+                "cmd+クリックでディレクトリを分割し PTY を cwd 付きで起動",
+            );
+            let _ = std::fs::remove_dir_all(&link_dir);
+
             // 70. PDF プレビュー（FR-3.4 macOS）: dispatch OpenFile で PDF を開き、
             //     Pdf モードで Core Graphics レンダリングされたページが表示される
             #[cfg(target_os = "macos")]
@@ -11986,7 +12881,7 @@ fn accumulate_scroll(carry: f32, delta_lines: f32) -> (i32, f32) {
 
 #[cfg(test)]
 mod chunk_tests {
-    use super::{chunk_line_chars, CharInfo};
+    use super::{chunk_line_chars, link_byte_range_in_chunk, CharInfo};
 
     fn ci(ch: char, char_cols: usize, run_idx: usize, snaps: bool) -> CharInfo {
         CharInfo {
@@ -12065,6 +12960,20 @@ mod chunk_tests {
         assert_eq!(chunks[0].cols, 2);
         assert_eq!(chunks[0].end, 3);
     }
+
+    #[test]
+    fn リンク装飾は同一styleチャンク内のリンク範囲だけに限定する() {
+        let text = "prefix https://example.com suffix";
+        let infos: Vec<CharInfo> = text.chars().map(|c| ci(c, 1, 0, true)).collect();
+        let cell_cols: Vec<usize> = (0..infos.len()).collect();
+        let chunks = chunk_line_chars(&infos);
+        assert_eq!(chunks.len(), 1, "同じ ANSI style なので描画チャンクは1つ");
+        let start = text.find("https://").unwrap();
+        let end = start + "https://example.com".len();
+        let range = link_byte_range_in_chunk(&infos, &cell_cols, &chunks[0], start, end)
+            .expect("リンク部分がチャンク内にある");
+        assert_eq!(&text[range], "https://example.com");
+    }
 }
 
 #[cfg(test)]
@@ -12134,5 +13043,25 @@ mod scroll_tests {
         let (lines, carry) = accumulate_scroll(0.9, -0.4);
         assert_eq!(lines, 0);
         assert!((carry + 0.4).abs() < 1e-5);
+    }
+}
+
+#[cfg(test)]
+mod persist_resume_tests {
+    use super::claude_resume_command;
+
+    #[test]
+    fn backend消失時だけ検証済みclaudeをresumeする() {
+        let id = "a45899a8-96a6-4fa6-9bf6-71df53307878";
+        assert_eq!(
+            claude_resume_command(false, Some(id), true),
+            Some(format!("claude --resume {id}\r").into_bytes())
+        );
+        // 通常の tako 再起動は既存プロセスへ再 attach し、Claude を二重起動しない
+        assert_eq!(claude_resume_command(true, Some(id), true), None);
+        // transcript 不在・不正 ID・ID 不明を推測で起動しない
+        assert_eq!(claude_resume_command(false, Some(id), false), None);
+        assert_eq!(claude_resume_command(false, Some("../../bad"), true), None);
+        assert_eq!(claude_resume_command(false, None, true), None);
     }
 }

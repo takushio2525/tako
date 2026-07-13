@@ -575,11 +575,24 @@
 - GPUI 実 shaping + 最近傍 UTF-8 キャレット、PDFKit 文字矩形、編集時 syntect 色を統合。selftest 40 の固定待ちと 66b-2 の二重 update、既存 PDF fixture も修正し全セルフテスト完走
 - 関連: PR #151 squash merge（`c5618ca`）+ install 済み。#150 は 3 件とも selftest panic と確認して close
 
+## 2026-07-13（#152: PDF 選択実描画 / 標準言語シンタックス色）
+- PDF canvas の画像下端 static position を根治し、syntect の改行保持 + 全標準言語共通解決を実装。Metal RGBA で PDF / C++ / Python の実ピクセル変化を確認
+- 関連: PR #154 squash merge（`6f7cd1c`）+ `/Applications/tako.app` install・署名検証済み
+
+## 2026-07-13（#153: パスリンク cmd+クリック不動作の根治 + cmd 押下中の下線・ハイライト）
+- 根本原因 5 件を修正: ①cell_at のクランプでリンクホバーが最初のペインへ誤ヒット ②ディレクトリ
+  クリックが pending_attach 後処理欠落で空ペイン ③TUI（OSC 7 なし）で cwd 不明 → 起動時 cwd を
+  セッション初期値に ④cwd=None でパス検出ごとスキップ ⑤リンク走査の無限ループ。装飾は下線 +
+  accent + 背景をリンク文字列だけに限定、cmd 単独押下でも即時更新。選択ドラッグは cell_at_clamped
+  分離で旧挙動維持（引き継ぎ検証で発見・修正）
+- 検証: 隔離セルフテスト完走（69c 全 7 判定パス）+ build / test / fmt / clippy 全緑
+- 次: tako 再起動 → manual-checks.md #153 節の GUI 確認
+
 ## 2026-07-13（#155: Web ビューを wry (WKWebView) ネイティブ統合へ全面刷新）
 - CDP ミラー PoC（座標ずれ・クリックのみ・Chrome 依存）を wry `build_as_child` へ置換。
   直接操作（クリック/スクロール/IME = OS 配送）+ dock 退避/復帰（ページ生存）+ 永続化 +
   ポート検知チップ統合。dispatch `Web` / CLI `tako web` / MCP `tako_web`（9 action、58 ツール不変）
 - タイトル追跡は ipc 不達（data: URL、実機診断で確定）のため eval 2 秒ポーリングへ。
   検証: 487 tests / fmt / clippy 緑 + セルフテスト完走（項目 71 = webview e2e 8 操作）
-- 関連コミット: `03c3c45` `7b52c2f` + ポーリング修正（PR squash merge 予定）
+- 関連コミット: `03c3c45` `7b52c2f` + ポーリング修正（PR #160 squash merge 予定）
 - 次: merge → install → 実機確認（manual-checks「Web ビューペイン」節）
