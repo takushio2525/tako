@@ -72,6 +72,8 @@ tako/
 | 夜間パッチリリース（自動） | `scripts/nightly-release.sh`（launchd から毎日 5:00 実行。`--dry-run` で判定のみ、`--install-launchd` でジョブ登録。#166） |
 | マスターオーケストレーター起動 | `tako master [-profile]`（master system prompt 付きでエージェント CLI を起動。プロファイルの `master_agent` で claude（既定）/ codex を選択。#127） |
 | ソロエージェント起動（オーケストレーション無しの 1 対 1 対話） | `tako solo [-profile]`（solo system prompt 付きで起動。worker spawn 禁止・エコ運用 effort=high。master と同じプロファイル引数・`master_agent` 対応） |
+| オーケストレーター master 自己情報 | `tako orchestrator self [--pane N]`（自 pane/tab/ctx%/handoff 状態。#123/#193） |
+| オーケストレーター master 引き継ぎ | `tako orchestrator handoff [--pane N] [--tab T]`（handoff ファイルを読み新 master spawn。#193） |
 | オーケストレーター worker spawn | `tako orchestrator spawn --project <key> --prompt "..."` |
 | オーケストレーター worker 監視 | `tako orchestrator watch --pane <N> --session-id <S>` |
 | オーケストレーター プロジェクト管理 | `tako orchestrator projects list/add/remove` |

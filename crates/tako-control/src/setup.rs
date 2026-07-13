@@ -35,6 +35,9 @@ pub struct SetupConfig {
     /// タブ/ペインの × ボタン close 時の確認ダイアログ（Issue #172。既定 true）
     #[serde(default = "default_true")]
     pub confirm_close: bool,
+    /// master の ctx% 閾値（#193。この値を超えると MASTER_CTX_HIGH 通知。既定 60）
+    #[serde(default = "default_ctx_threshold")]
+    pub ctx_threshold: u32,
 }
 
 /// config.yaml の spawn_layout セクション（Issue #165）。
@@ -122,6 +125,10 @@ pub struct SetupState {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_ctx_threshold() -> u32 {
+    60
 }
 
 impl Default for OrchestratorConfig {

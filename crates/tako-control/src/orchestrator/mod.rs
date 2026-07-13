@@ -60,6 +60,19 @@ pub fn resolve_system_prompt_path() -> Option<PathBuf> {
     }
 }
 
+/// handoff ファイルのパス（`<config_dir>/handoff/<profile>.md`）
+pub fn handoff_path(profile: &str) -> Option<PathBuf> {
+    config_dir().map(|d| d.join("handoff").join(format!("{profile}.md")))
+}
+
+/// handoff ファイルの内容を読む。不在なら None
+pub fn read_handoff(profile: &str) -> Option<String> {
+    let path = handoff_path(profile)?;
+    std::fs::read_to_string(&path)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
 /// `~` を `$HOME` に展開する
 pub fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
