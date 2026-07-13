@@ -200,14 +200,27 @@ pub struct EditState {
     pub save_status: Option<SaveStatus>,
     /// 検索バーの表示状態
     pub search_visible: bool,
+    /// 検索バー内のフォーカス先（検索フィールド or 置換フィールド）
+    pub search_focus: SearchFieldFocus,
     /// 検索クエリ
     pub search_query: String,
+    /// 検索フィールドのカーソル位置（バイトオフセット）
+    pub search_cursor: usize,
     /// 検索ヒット一覧（検索クエリ変更時に更新）
     pub search_hits: Vec<SearchHit>,
     /// 現在フォーカス中のヒットインデックス
     pub search_index: usize,
     /// 置換テキスト
     pub replace_text: String,
+    /// 置換フィールドのカーソル位置（バイトオフセット）
+    pub replace_cursor: usize,
+}
+
+/// 検索バー内のフォーカス先
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchFieldFocus {
+    Query,
+    Replace,
 }
 
 /// 自動保存の表示状態
@@ -237,10 +250,13 @@ impl EditState {
             autosave: true,
             save_status: None,
             search_visible: false,
+            search_focus: SearchFieldFocus::Query,
             search_query: String::new(),
+            search_cursor: 0,
             search_hits: Vec::new(),
             search_index: 0,
             replace_text: String::new(),
+            replace_cursor: 0,
         })
     }
 
