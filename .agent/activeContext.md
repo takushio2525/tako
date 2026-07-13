@@ -7,7 +7,7 @@
 ## 現在の対象（2026-07-13・#155 Web ビュー + #103 Cmd-Q 完了）
 
 本日 main へマージ済み: #155（Web ビュー wry 化。PR #160 + #163）/ #103（Cmd-Q
-グローバルアクション化。#162）/ #152 / #153 / #156 / #158。
+グローバルアクション化。#162。Issue クローズ済み）/ #152 / #153 / #156 / #158。
 `build-app.sh --install` は #162 込みの最新 main で実施済み（0.4.0。反映は tako 再起動後）。
 
 - Web ビュー = wry `build_as_child`（WKWebView）。直接操作は OS 配送。
@@ -16,15 +16,19 @@
   dispatch `Web` + CLI `tako web` + MCP `tako_web`（9 action、58 ツール不変）。
   タイトル/URL 追跡 = eval 2 秒ポーリング（ipc は data: URL 不達を実機確認）
 - #103 = Quit を `cx.on_action` グローバル登録へ + 終了処理を `cx.on_app_quit` へ
-  （Dock/OS 終了でも layout 保存。quitting ガードで #30/#113 維持）
+  （Dock/OS 終了でも layout 保存。quitting ガードで #30/#113 維持）。
+  根因はフォーカスパス依存: blur（focus=None）で dispatch path が root node のみになり
+  キーバインド・メニュー両経路とも不発（Dock 終了だけ AppKit 経路で生存）
 
 ## 検証済み
 
-- workspace build / test / fmt / clippy（-D warnings）全緑（#155 時点 493 tests）
+- workspace build / test / fmt / clippy（-D warnings）全緑（#103 rebase 後 494 tests）
 - セルフテスト完走（#155 項目 71 = webview e2e 8 操作を実 WKWebView で通過。
-  #103 の blur + cmd-q 経路も新構造で OK）
+  #103 最終項目 = blur + cmd-q e2e: 旧構造 FAILED を実測 → 新構造 OK）
 - #155 実機 e2e: セカンダリインスタンス + CLI で open → read（title=Example Domain）→
   list → close 成功、screencapture でネイティブ描画・🌐 バッジをピクセル確認
+- #103 実機: osascript の実 Cmd-Q キーイベントで隔離インスタンス終了、
+  インストール済み .app（md5 一致 + codesign 検証済み）でセルフテスト完走
 
 ## 次の一手
 
