@@ -588,6 +588,42 @@
 - 検証: 隔離セルフテスト完走（69c 全 7 判定パス）+ build / test / fmt / clippy 全緑
 - 次: tako 再起動 → manual-checks.md #153 節の GUI 確認
 
+## 2026-07-13（#155: Web ビューを wry (WKWebView) ネイティブ統合へ全面刷新）
+- CDP ミラー PoC（座標ずれ・クリックのみ・Chrome 依存）を wry `build_as_child` へ置換。
+  直接操作（クリック/スクロール/IME = OS 配送）+ dock 退避/復帰（ページ生存）+ 永続化 +
+  ポート検知チップ統合。dispatch `Web` / CLI `tako web` / MCP `tako_web`（9 action、58 ツール不変）
+- タイトル追跡は ipc 不達（data: URL、実機診断で確定）のため eval 2 秒ポーリングへ。
+  検証: 487 tests / fmt / clippy 緑 + セルフテスト完走（項目 71 = webview e2e 8 操作）
+- 関連: PR #160 squash merge（`6705c39`）+ #163（CLI 基準ペイン任意化、実機検証で発見）+
+  install 済み。実機 e2e（セカンダリ + CLI: open → read title=Example Domain → close）+
+  screencapture ピクセル確認済み
+- 次: tako 再起動 → manual-checks「Web ビューペイン」節の GUI 確認
+
+## 2026-07-13（#103: Cmd-Q 不発の根治 — Quit のグローバルアクション化）
+- 根因を GPUI ソースで確定: Quit がルート div の on_action のみでフォーカスパス依存。blur（focus=None）時は
+  dispatch path が root node へフォールバックしキーバインド・メニュー両経路とも不発（Dock 終了のみ AppKit 経路で生存）。
+  修正 = `cx.on_action` グローバル化 + 終了処理を `cx.on_app_quit` へ（Dock/OS 終了でも layout 保存。quitting ガードで #30/#113 維持）
+- 検証: 同一セルフテスト（blur + cmd-q）が旧構造 FAILED → 新構造 OK / 実 Cmd-Q キーイベントで隔離インスタンス終了 /
+  exit 全ペイン終了経路の回帰なし / 486 tests + fmt + clippy 全緑
+
+## 2026-07-13（v0.4.0 正規リリース + 夜間リリースのローカル launchd 化 #166）
+- v0.4.0 リリース: CHANGELOG に v0.3.2 以降の未記載 13 件（#113/#118/#120/#124/#127/#129/
+  #132/#134/#136/#141/#143/#146-147+#153/#103）を英日併記で回収 → tag `v0.4.0` +
+  バイナリ付き GitHub Release + Pages デプロイ + homebrew-tako cask 0.4.0（`c18dcae`）
+- 夜間リリースを scripts/nightly-release.sh（launchd 毎日 5:00）へ移行。クラウドルーチンの
+  三重苦（バージョン計算・main 直 push・macOS バイナリ不能）を解消。スキップ 3 経路 +
+  dry-run bump 判定を実機検証、bash 3.2 の変数名境界バグも修正
+- 関連: `98b17ea`（リリース）/ PR #170 squash merge（`1c2c48a`）、Issue #166 クローズ
+- 次: 明朝 5:00 の初回 launchd 実行で v0.4.1 自動リリースの通し検証
+
+## 2026-07-13（#169: projects.yaml 並行 add 全消失の根治 — config_io 新設）
+- 根本原因を実証テストで確定: ①旧 save = fs::write の truncate→write 窓 ②serde_yaml が
+  空 / 部分 YAML を「0 件」で成功パース ③RMW のプロセス間直列化なし、の三段連鎖。
+  新設 `config_io`（アトミック書き込み + `<path>.lock` flock + .bak.1〜3 世代バックアップ）へ
+  projects.yaml / profiles/*.yaml / config.yaml の書き込みを集約、mutate 系 API で fail-loud 化
+- 検証: 507 tests / fmt / clippy 全緑 + 実機 before/after（修正前 = 並行 add 60 件で 48 件消失、
+  修正後 = 118/118 全件残存・破損 YAML 拒否・bak 復元成功。隔離 HOME）
+
 ## 2026-07-13（#159: ターミナルスクロールの大幅改善 — ピクセル単位化・ミラー方式・スクロールバー）
 - Zed エディタの行小数 scroll_position 方式をターミナルへ翻案: 直接ペインは
   display_offset - fract 分解 + サブライン描画（visual-test 実ピクセル実証 direct=22197/shifted=0）。

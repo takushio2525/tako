@@ -215,10 +215,49 @@ pub trait ControlHost {
     fn remote_status(&self) -> Value {
         json!({ "running": false })
     }
-    /// Chrome を CDP ミラー方式で開く（FR-3.8 PoC）。UI 層で WebViewState を生成する。
-    /// 失敗時は Err を返し、呼び出し元がペインを巻き戻す
-    fn open_chrome(&mut self, _pane: PaneId, _url: &str) -> Result<(), String> {
-        Ok(())
+    /// Web ビューを生成してペインへ表示する（FR-3.8 / #155）。UI 層で wry WebView を
+    /// 生成する。失敗時は Err を返し、呼び出し元がペインを巻き戻す。
+    /// 成功時は `{ "id": u64, "pane": u64, "url": String }` を返す
+    fn web_open(&mut self, _pane: PaneId, _url: &str) -> Result<Value, String> {
+        Err("Web ビューはこの環境では使えない".into())
+    }
+    /// dock 退避中の Web ビュー `id` をペインへ表示する（FR-3.8 / #155）
+    fn web_show(&mut self, _pane: PaneId, _id: u64) -> Result<Value, String> {
+        Err("Web ビューはこの環境では使えない".into())
+    }
+    /// Web ビューの一覧（表示中 + dock 退避中）
+    fn web_list(&self) -> Value {
+        json!([])
+    }
+    /// Web ビュー操作の対象解決。`id` 優先 → `pane`（表示中のもの）→ 省略時は
+    /// 表示中が 1 つだけならそれ。戻り値は (id, 表示中ペイン)
+    fn web_target(
+        &self,
+        _id: Option<u64>,
+        _pane: Option<u64>,
+    ) -> Result<(u64, Option<PaneId>), String> {
+        Err("Web ビューはこの環境では使えない".into())
+    }
+    /// Web ビュー `id` を完全に破棄する。表示中だった場合はそのペイン ID を返す
+    /// （ペイン自体の close は呼び出し元 = dispatch の責務）
+    fn web_destroy(&mut self, _id: u64) -> Option<PaneId> {
+        None
+    }
+    /// ナビゲーション（`to` = "back" / "forward" / "reload" / URL）
+    fn web_navigate(&mut self, _id: u64, _to: &str) -> Result<Value, String> {
+        Err("Web ビューはこの環境では使えない".into())
+    }
+    /// JS の非同期評価を発行し token を返す（結果は `web_eval_result` で回収）
+    fn web_eval(&mut self, _id: u64, _js: &str) -> Result<Value, String> {
+        Err("Web ビューはこの環境では使えない".into())
+    }
+    /// eval 結果の回収。未完なら `{ "pending": true }`
+    fn web_eval_result(&mut self, _id: u64, _token: u64) -> Result<Value, String> {
+        Err("Web ビューはこの環境では使えない".into())
+    }
+    /// URL・タイトル・読み込み状態を返す
+    fn web_read(&self, _id: u64) -> Result<Value, String> {
+        Err("Web ビューはこの環境では使えない".into())
     }
     /// アプリ内更新の診断情報（Issue #36）。配布系統・バージョン・重複 CLI を JSON で返す
     fn update_status(&self) -> Value {
@@ -1687,36 +1726,128 @@ fn dispatch_inner(
             Ok(json!({ "lines": result }))
         }
 
-        Request::ChromeOpen {
+        Request::Web {
+            action,
             url,
+            id,
             pane,
             direction,
+            to,
+            js,
+            token,
         } => {
-            let (tab, target) = match pane {
-                Some(_) => resolve_pane(host.workspace(), pane)?,
-                None => {
-                    let ws = host.workspace();
-                    let active = ws.active_tab_id();
-                    let focused = ws.active_tab().tree().focused();
-                    (active, focused)
+            // ペイン分割を伴う action（open / show）の共通処理。
+            // 分割 → host フック → 失敗なら巻き戻し、成功ならフォーカス
+            let split_and =
+                |host: &mut dyn ControlHost,
+                 pane: Option<u64>,
+                 attach: &dyn Fn(&mut dyn ControlHost, PaneId) -> Result<Value, String>|
+                 -> Result<Value, DispatchError> {
+                    let (tab, target) = match pane {
+                        Some(_) => resolve_pane(host.workspace(), pane)?,
+                        None => {
+                            let ws = host.workspace();
+                            (ws.active_tab_id(), ws.active_tab().tree().focused())
+                        }
+                    };
+                    let dir = direction
+                        .map(|d| d.to_core())
+                        .unwrap_or(SplitDirection::Right);
+                    let new_pane = Pane::new(origin);
+                    let new_id = new_pane.id();
+                    tree_mut(host.workspace_mut(), tab)
+                        .split_with_ratio(target, dir, 0.5, new_pane)
+                        .map_err(op_err)?;
+                    match attach(host, new_id) {
+                        Ok(v) => {
+                            tree_mut(host.workspace_mut(), tab)
+                                .focus(new_id)
+                                .map_err(op_err)?;
+                            Ok(v)
+                        }
+                        Err(e) => {
+                            let _ = tree_mut(host.workspace_mut(), tab).close(new_id);
+                            Err(DispatchError::Operation(e))
+                        }
+                    }
+                };
+            // 表示中の Web ビューをペインから外す共通処理（hide / close）。
+            // Request::Close と同じ後始末（LastPane はタブごと閉じる + detach_session）
+            let close_pane_of =
+                |host: &mut dyn ControlHost, pane_id: PaneId| -> Result<(), DispatchError> {
+                    let (tab, target) = resolve_pane(host.workspace(), Some(pane_id.as_u64()))?;
+                    match tree_mut(host.workspace_mut(), tab).close(target) {
+                        Ok(_) => {}
+                        Err(PaneTreeError::LastPane) => {
+                            host.workspace_mut().close_tab(tab).map_err(op_err)?;
+                        }
+                        Err(e) => return Err(op_err(e)),
+                    }
+                    host.detach_session(target);
+                    Ok(())
+                };
+            match action.as_str() {
+                "open" => {
+                    let url = url.ok_or(DispatchError::InvalidParams("url は必須".into()))?;
+                    split_and(host, pane, &|h, new_id| h.web_open(new_id, &url))
                 }
-            };
-            let dir = direction
-                .map(|d| d.to_core())
-                .unwrap_or(SplitDirection::Right);
-            let new_pane = Pane::new(origin);
-            let new_id = new_pane.id();
-            tree_mut(host.workspace_mut(), tab)
-                .split_with_ratio(target, dir, 0.5, new_pane)
-                .map_err(op_err)?;
-            if let Err(e) = host.open_chrome(new_id, &url) {
-                let _ = tree_mut(host.workspace_mut(), tab).close(new_id);
-                return Err(DispatchError::Operation(format!("Chrome 起動失敗: {e}")));
+                "show" => {
+                    let id =
+                        id.ok_or(DispatchError::InvalidParams("id は必須（web list で確認）".into()))?;
+                    // 既に表示中なら分割せずそのペインへフォーカスする
+                    let (_, showing) = host.web_target(Some(id), None).map_err(op_err)?;
+                    if let Some(p) = showing {
+                        let (tab, target) = resolve_pane(host.workspace(), Some(p.as_u64()))?;
+                        let ws = host.workspace_mut();
+                        tree_mut(ws, tab).focus(target).map_err(op_err)?;
+                        ws.activate_tab(tab).map_err(op_err)?;
+                        return Ok(json!({ "id": id, "pane": target.as_u64(), "already_shown": true }));
+                    }
+                    split_and(host, pane, &|h, new_id| h.web_show(new_id, id))
+                }
+                "list" => Ok(host.web_list()),
+                "hide" => {
+                    let (id, showing) = host.web_target(id, pane).map_err(op_err)?;
+                    let shown = showing.ok_or(DispatchError::Operation(format!(
+                        "Web ビュー {id} は既に dock 退避中"
+                    )))?;
+                    close_pane_of(host, shown)?;
+                    Ok(json!({ "id": id, "hidden": true }))
+                }
+                "close" => {
+                    let (id, _) = host.web_target(id, pane).map_err(op_err)?;
+                    if let Some(shown) = host.web_destroy(id) {
+                        close_pane_of(host, shown)?;
+                    }
+                    Ok(json!({ "id": id, "closed": true }))
+                }
+                "navigate" => {
+                    let to =
+                        to.ok_or(DispatchError::InvalidParams(
+                            "to は必須（back / forward / reload / URL）".into(),
+                        ))?;
+                    let (id, _) = host.web_target(id, pane).map_err(op_err)?;
+                    host.web_navigate(id, &to).map_err(op_err)
+                }
+                "eval" => {
+                    let js = js.ok_or(DispatchError::InvalidParams("js は必須".into()))?;
+                    let (id, _) = host.web_target(id, pane).map_err(op_err)?;
+                    host.web_eval(id, &js).map_err(op_err)
+                }
+                "eval_result" => {
+                    let token =
+                        token.ok_or(DispatchError::InvalidParams("token は必須".into()))?;
+                    let (id, _) = host.web_target(id, pane).map_err(op_err)?;
+                    host.web_eval_result(id, token).map_err(op_err)
+                }
+                "read" => {
+                    let (id, _) = host.web_target(id, pane).map_err(op_err)?;
+                    host.web_read(id).map_err(op_err)
+                }
+                other => Err(DispatchError::InvalidParams(format!(
+                    "未知の action: {other}（open / list / show / hide / close / navigate / eval / eval_result / read）"
+                ))),
             }
-            tree_mut(host.workspace_mut(), tab)
-                .focus(new_id)
-                .map_err(op_err)?;
-            Ok(json!({ "pane": new_id.as_u64(), "url": url }))
         }
 
         Request::Update { action } => {
@@ -1801,22 +1932,22 @@ fn dispatch_orchestrator_projects(
             let key = key.ok_or(DispatchError::InvalidParams("key を指定する".into()))?;
             let cwd = cwd.ok_or(DispatchError::InvalidParams("cwd を指定する".into()))?;
             orchestrator::ensure_defaults().map_err(DispatchError::Operation)?;
-            let mut config =
-                orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
-            config.add(key.clone(), cwd.clone(), description);
-            config.save().map_err(DispatchError::Operation)?;
+            // ロック付き read-modify-write（#169: 並行 add で他エントリを消さない）
+            orchestrator::ProjectsConfig::mutate(|config| {
+                config.add(key.clone(), cwd.clone(), description);
+            })
+            .map_err(DispatchError::Operation)?;
             Ok(json!({ "added": key, "cwd": cwd }))
         }
         "remove" => {
             let key = key.ok_or(DispatchError::InvalidParams("key を指定する".into()))?;
-            let mut config =
-                orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
-            if !config.remove(&key) {
+            let removed = orchestrator::ProjectsConfig::mutate(|config| config.remove(&key))
+                .map_err(DispatchError::Operation)?;
+            if !removed {
                 return Err(DispatchError::Operation(format!(
                     "プロジェクト '{key}' が見つからない"
                 )));
             }
-            config.save().map_err(DispatchError::Operation)?;
             Ok(json!({ "removed": key }))
         }
         _ => Err(DispatchError::InvalidParams(format!(
@@ -1954,69 +2085,76 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
             if let Some(a) = params.master_agent.as_deref() {
                 orchestrator::validate_master_agent(a).map_err(DispatchError::InvalidParams)?;
             }
-            let mut profile = orchestrator::Profile::load(&name).unwrap_or_default();
-            if let Some(a) = params.master_agent {
-                profile.master_agent = Some(a);
-            } else if params.clear_master_agent {
-                profile.master_agent = None;
-            }
-            if let Some(m) = params.model {
-                profile.model = Some(m);
-            } else if params.clear_model {
-                profile.model = None;
-            }
-            if let Some(m) = params.worker_model {
-                profile.worker_model = Some(m);
-            } else if params.clear_worker_model {
-                profile.worker_model = None;
-            }
-            if let Some(e) = params.effort {
-                profile.effort = e;
-            }
-            if let Some(e) = params.worker_effort {
-                profile.worker_effort = Some(e);
-            }
-            if let Some(a) = params.worker_agent {
-                profile.worker_agent = Some(a);
-            } else if params.clear_worker_agent {
-                profile.worker_agent = None;
-            }
-            if let Some(policy) = params.worker_model_policy {
-                profile.worker_model_policy = match policy.as_str() {
-                    "inherit" => orchestrator::WorkerModelPolicy::Inherit,
-                    "delegate" => orchestrator::WorkerModelPolicy::Delegate,
-                    "fixed" => orchestrator::WorkerModelPolicy::Fixed,
-                    _ => {
-                        return Err(DispatchError::InvalidParams(format!(
-                            "worker_model_policy が不正: '{policy}'（inherit / delegate / fixed）"
-                        )));
+            // worker_model_policy は mutate 閉包内から early return できないため事前に解析
+            let policy = match params.worker_model_policy.as_deref() {
+                Some("inherit") => Some(orchestrator::WorkerModelPolicy::Inherit),
+                Some("delegate") => Some(orchestrator::WorkerModelPolicy::Delegate),
+                Some("fixed") => Some(orchestrator::WorkerModelPolicy::Fixed),
+                Some(p) => {
+                    return Err(DispatchError::InvalidParams(format!(
+                        "worker_model_policy が不正: '{p}'（inherit / delegate / fixed）"
+                    )));
+                }
+                None => None,
+            };
+            // ロック付き read-modify-write（#169）。パースできない既存プロファイルを
+            // default に丸めて上書き保存すると設定が消えるため、Err で中断する
+            let (path, profile) = orchestrator::Profile::mutate_named(&name, |profile| {
+                if let Some(a) = params.master_agent {
+                    profile.master_agent = Some(a);
+                } else if params.clear_master_agent {
+                    profile.master_agent = None;
+                }
+                if let Some(m) = params.model {
+                    profile.model = Some(m);
+                } else if params.clear_model {
+                    profile.model = None;
+                }
+                if let Some(m) = params.worker_model {
+                    profile.worker_model = Some(m);
+                } else if params.clear_worker_model {
+                    profile.worker_model = None;
+                }
+                if let Some(e) = params.effort {
+                    profile.effort = e;
+                }
+                if let Some(e) = params.worker_effort {
+                    profile.worker_effort = Some(e);
+                }
+                if let Some(a) = params.worker_agent {
+                    profile.worker_agent = Some(a);
+                } else if params.clear_worker_agent {
+                    profile.worker_agent = None;
+                }
+                if let Some(policy) = policy {
+                    profile.worker_model_policy = policy;
+                }
+                if let Some(agent_name) = params.agent {
+                    let cfg = profile.worker_agents.entry(agent_name).or_default();
+                    if let Some(m) = params.agent_model {
+                        cfg.model = Some(m);
+                    } else if params.clear_agent_model {
+                        cfg.model = None;
                     }
-                };
-            }
-            if let Some(agent_name) = params.agent {
-                let cfg = profile.worker_agents.entry(agent_name).or_default();
-                if let Some(m) = params.agent_model {
-                    cfg.model = Some(m);
-                } else if params.clear_agent_model {
-                    cfg.model = None;
+                    if let Some(e) = params.agent_effort {
+                        cfg.effort = Some(e);
+                    } else if params.clear_agent_effort {
+                        cfg.effort = None;
+                    }
+                    if let Some(s) = params.agent_skip_permissions {
+                        cfg.skip_permissions = s;
+                    }
+                    if let Some(a) = params.agent_args {
+                        cfg.args = a;
+                    }
                 }
-                if let Some(e) = params.agent_effort {
-                    cfg.effort = Some(e);
-                } else if params.clear_agent_effort {
-                    cfg.effort = None;
-                }
-                if let Some(s) = params.agent_skip_permissions {
-                    cfg.skip_permissions = s;
-                }
-                if let Some(a) = params.agent_args {
-                    cfg.args = a;
-                }
-            }
-            // 既定値のみになったエントリは掃除する（YAML を汚さない）
-            profile
-                .worker_agents
-                .retain(|_, c| *c != orchestrator::AgentWorkerConfig::default());
-            let path = profile.save(&name).map_err(DispatchError::Operation)?;
+                // 既定値のみになったエントリは掃除する（YAML を汚さない）
+                profile
+                    .worker_agents
+                    .retain(|_, c| *c != orchestrator::AgentWorkerConfig::default());
+                profile.clone()
+            })
+            .map_err(DispatchError::Operation)?;
             let mut result = profile_to_json(&name, &profile);
             result["path"] = json!(path.display().to_string());
             // [1m] は Max / API プラン限定 → 明示 opt-in は許容しつつ警告を返す
@@ -3064,6 +3202,10 @@ fn dispatch_tree_folder(
             Ok(json!({ "status": "removed", "path": canonical.display().to_string() }))
         }
         "list" => {
+            // 実体が消えたエントリを自動除去してから返す（#171）
+            if let Some(tab_mut) = host.workspace_mut().get_tab_mut(tab_id) {
+                tab_mut.prune_dead_folders();
+            }
             let tab_ref = host
                 .workspace()
                 .get_tab(tab_id)
@@ -4311,13 +4453,21 @@ mod tests {
     /// 追加・削除すると解決失敗のレースが起きるため（#120 でテストが増えて顕在化）
     static TEST_PROJECT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// テスト用に一時プロジェクトを projects.yaml に追加し、テスト後に削除する
+    /// テスト用に一時プロジェクトを projects.yaml に追加し、テスト後に削除する。
+    /// config_dir を隔離ディレクトリへ差し替え、実運用の projects.yaml と
+    /// その世代バックアップには絶対に触らない（#169）
     fn with_test_project<F: FnOnce()>(f: F) {
         use crate::orchestrator;
         // panic したテストの poison は無視して続行する（後続テストを巻き込まない）
         let _guard = TEST_PROJECT_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        orchestrator::test_config_dir_override().get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("tako-dispatch-test-config-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        });
         let _ = orchestrator::ensure_defaults();
         let key = "_tako_test_109_";
         let mut config = orchestrator::ProjectsConfig::load().unwrap();
@@ -4750,5 +4900,162 @@ mod tests {
             PaneOrigin::Cli,
         );
         assert!(result.is_err());
+    }
+
+    // --- #171: 重複排除・プルーニング ---
+
+    #[test]
+    fn tree_folder_symlink経由の重複追加は1エントリに畳まれる() {
+        // macOS: /tmp は /private/tmp へのシンボリックリンク
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+
+        // /tmp で追加（canonicalize → /private/tmp）
+        let r1 = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "add".into(),
+                path: Some("/tmp".into()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(r1["status"], "added");
+
+        // /private/tmp で追加（同じ正規パス → already_exists）
+        let r2 = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "add".into(),
+                path: Some("/private/tmp".into()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(r2["status"], "already_exists");
+
+        // list は 1 件
+        let list = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "list".into(),
+                path: None,
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(list["folders"].as_array().unwrap().len(), 1);
+
+        // 表示名は basename（/private/tmp の file_name = "tmp"）
+        let folder_path = list["folders"][0].as_str().unwrap();
+        let basename = std::path::Path::new(folder_path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        assert_eq!(basename, "tmp");
+    }
+
+    #[test]
+    fn tree_folder_symlink経由でも削除できる() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+
+        // /tmp で追加
+        dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "add".into(),
+                path: Some("/tmp".into()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        // /private/tmp で削除（同じ正規パスなので成功する）
+        let removed = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "remove".into(),
+                path: Some("/private/tmp".into()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(removed["status"], "removed");
+
+        let list = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "list".into(),
+                path: None,
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(list["folders"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn tree_folder_実体消失エントリはlistで自動プルーニングされる() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+
+        // 一時ディレクトリを作って追加
+        let tmp = std::env::temp_dir().join("tako_test_prune_171");
+        std::fs::create_dir_all(&tmp).unwrap();
+        dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "add".into(),
+                path: Some(tmp.display().to_string()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        // 追加されたことを確認
+        let list = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "list".into(),
+                path: None,
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(list["folders"].as_array().unwrap().len(), 1);
+
+        // ディレクトリを削除
+        std::fs::remove_dir_all(&tmp).unwrap();
+
+        // list で自動プルーニング → 0 件に
+        let list2 = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "list".into(),
+                path: None,
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(list2["folders"].as_array().unwrap().len(), 0);
     }
 }

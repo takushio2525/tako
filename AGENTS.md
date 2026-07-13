@@ -67,6 +67,7 @@ tako/
 | `tako` CLI ビルド | `cargo build -p tako-cli`（バイナリは `target/debug/tako`） |
 | .app バンドル生成（macOS） | `scripts/build-app.sh [--verify] [--install]`（`dist/tako.app`。tako CLI 同梱） |
 | リリース | `scripts/release.sh`（Cargo.toml バージョン自動読み取り + CHANGELOG.md 連携。`--publish` でタグ + GitHub Release 作成、`--draft` でドラフト） |
+| 夜間パッチリリース（自動） | `scripts/nightly-release.sh`（launchd から毎日 5:00 実行。`--dry-run` で判定のみ、`--install-launchd` でジョブ登録。#166） |
 | マスターオーケストレーター起動 | `tako master [-profile]`（master system prompt 付きでエージェント CLI を起動。プロファイルの `master_agent` で claude（既定）/ codex を選択。#127） |
 | ソロエージェント起動（オーケストレーション無しの 1 対 1 対話） | `tako solo [-profile]`（solo system prompt 付きで起動。worker spawn 禁止・エコ運用 effort=high。master と同じプロファイル引数・`master_agent` 対応） |
 | オーケストレーター worker spawn | `tako orchestrator spawn --project <key> --prompt "..."` |
@@ -76,6 +77,7 @@ tako/
 | lint | `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` |
 | test | `cargo test --workspace` |
 | ファイルツリーフォルダ操作 | `tako tree add <path>` / `tako tree remove <path>` / `tako tree list`（AI がプロジェクトフォルダを明示追加。#134） |
+| Web ビューペイン操作 | `tako web open <url>` / `list` / `show <id>` / `hide` / `close` / `nav <to>` / `eval <js>` / `eval-result <token>` / `read`（ネイティブ WKWebView ペイン。#155） |
 | エージェント共通ルール同期 | `tako agents sync-rules` / `tako agents status`（正本から各エージェントのグローバル指示ファイルへマーカーブロック同期。#136） |
 | target 掃除 | `scripts/clean-target.sh`（dry-run。`--run` で実行。cargo clean + worktree prune） |
 
@@ -112,3 +114,15 @@ push 運用: リポジトリ公開（Phase 7）までは main 直 push 可。公
 - `Cargo.toml`（ワークスペースルート）の `[workspace.package] version` を bump
 - `scripts/release.sh --publish` でタグ + GitHub Release 作成（CHANGELOG から自動抽出）
 - リリースノートは日英併記
+
+### 夜間パッチリリース（自動。#166）
+
+- `scripts/nightly-release.sh` が launchd（`com.takushio.tako-nightly-release`、毎日 5:00）から
+  実行され、前回タグ以降に main へ変更があった夜だけパッチバージョンを自動リリースする
+  （patch bump → CHANGELOG 自動節 → コミット → annotated tag → release.sh でバイナリ付き
+  GitHub Release）。クラウドルーチンでの夜間リリースはバイナリを作れず廃止した（経緯は #166）
+- 自動スキップ条件: 変更なし / worktree dirty / 手動リリース進行中（Cargo.toml version ≠ 最新タグ）/
+  多重起動。ログは `~/.claude-orchestrator/logs/tako-nightly-release.log`
+- ジョブ登録は `scripts/nightly-release.sh --install-launchd`（解除は `--uninstall-launchd`、
+  確認は `launchctl list | grep tako-nightly`）。plist はリポに置かず実行時に生成する
+- minor / major リリース・Homebrew cask 更新・リリースノートの日英併記は従来どおり手動で行う

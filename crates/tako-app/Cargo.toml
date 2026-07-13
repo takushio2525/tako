@@ -28,6 +28,8 @@ serde_json.workspace = true
 syntect.workspace = true
 pulldown-cmark.workspace = true
 image.workspace = true
-tungstenite.workspace = true
-data-encoding.workspace = true
+# アプリ内更新の GitHub Releases チェック（update_checker）
 ureq.workspace = true
+# Web ビューペイン（FR-3.8）: OS ネイティブ webview の GPUI 子ビュー統合
+wry.workspace = true
+raw-window-handle.workspace = true

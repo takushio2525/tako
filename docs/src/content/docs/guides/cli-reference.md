@@ -332,12 +332,21 @@ tako video toggle --pane 4   # 再生 / 一時停止の切替
 tako video seek 90 --pane 4  # 90 秒地点へシーク
 ```
 
-### tako chrome
+### tako web
 
-URL を Chrome ベースの Web ビューペインとして開きます（実験的機能）。
+URL をネイティブ Web ビューペイン（macOS = WKWebView）として開きます。
+ペイン内ではクリック・スクロール・文字入力を普通のブラウザ同様に行えます。
+`hide` でページを生かしたまま dock（ステータスバーの 🌐）へ退避し、`show` で呼び戻せます。
 
 ```bash
-tako chrome open http://localhost:5173 --right
+tako web open http://localhost:5173 --right  # 右分割で開く
+tako web list                                # 一覧（id / URL / タイトル / 表示中ペイン）
+tako web hide                                # dock へ退避（ページは生きたまま）
+tako web show 3                              # id=3 を呼び出し
+tako web nav back                            # 戻る（forward / reload / URL も可）
+tako web eval 'document.title'               # JS 評価（結果は eval-result <token> で回収）
+tako web read                                # URL・タイトル・読み込み状態
+tako web close                               # 完全破棄
 ```
 
 ## バックグラウンド退避（たまり場）

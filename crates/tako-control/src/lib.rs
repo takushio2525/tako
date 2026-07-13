@@ -12,10 +12,13 @@
 //! - remote / agents / transcript: スマホリモートアクセス（Issue #23。HTTP+WS API と
 //!   claude agents プロキシ・会話ログ正規化）
 //! - claude_tui: Claude Code TUI の画面状態検出とプロンプト送達確認（Issue #32）
+//! - config_io: 設定ファイルの安全な読み書き共通部品（アトミック書き込み・
+//!   プロセス間ロック・世代バックアップ。Issue #169）
 
 pub mod agents;
 pub mod agents_sync;
 pub mod claude_tui;
+pub mod config_io;
 pub mod diag;
 pub mod discovery;
 pub mod dispatch;
