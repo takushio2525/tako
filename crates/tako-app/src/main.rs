@@ -756,6 +756,10 @@ struct TakoApp {
     sleep_guard_active: bool,
     /// 起動時に orphan 自動復帰した tmux セッション数（Issue #191。診断用）
     recovered_count: usize,
+    /// ペインの平文ログ管理（Issue #112 B）。UI スレッド（直接ペインの増分取り込み・
+    /// クローズフラッシュ）と background（tmux バックエンドの capture 取り込み）の
+    /// 両方から Mutex 越しに使う（クリティカルセクションは小さな追記のみ）
+    pane_logs: std::sync::Arc<std::sync::Mutex<tako_core::pane_log::PaneLogManager>>,
 }
 
 /// × ボタン close の確認ダイアログ対象（Issue #172）
@@ -763,6 +767,81 @@ struct TakoApp {
 enum CloseConfirmTarget {
     Pane(PaneId),
     Tab(TabId),
+}
+
+/// tmux バックエンドペインのペインログ取り込みジョブ（Issue #112 B）。
+/// UI スレッドで文脈だけ集め、probe / capture（サブプロセス実行）は background で行う
+struct PaneLogJob {
+    pane: PaneId,
+    session: String,
+    meta: tako_core::pane_log::PaneLogMeta,
+    last_history: usize,
+    last_bytes: u64,
+}
+
+/// ペインログのクローズフラッシュ素材（close 前に UI で採取する）
+struct PaneLogCloseData {
+    meta: tako_core::pane_log::PaneLogMeta,
+    visible: Vec<String>,
+    /// 直接ペインの最終履歴増分（取り込み行, delta, 現在履歴行数）
+    catch_up: Option<(Vec<String>, usize, usize)>,
+}
+
+/// バックエンドペインのペインログ取り込み本体（Issue #112 B。background で実行）。
+/// probe → 増分 capture → manager へ反映。セッション消滅・tmux 不在はスキップする
+fn process_pane_log_jobs(
+    manager: &std::sync::Arc<std::sync::Mutex<tako_core::pane_log::PaneLogManager>>,
+    socket: &str,
+    jobs: Vec<PaneLogJob>,
+) {
+    use tako_core::pane_log::{ChunkKind, PaneObservation, CAPTURE_CHUNK};
+    for job in jobs {
+        let Some(probe) = tako_core::tmux::pane_log_probe(Some(socket), &job.session) else {
+            continue;
+        };
+        let chunk = if probe.history < job.last_history {
+            ChunkKind::None
+        } else {
+            let delta = probe.history - job.last_history;
+            if delta > 0 {
+                let take = delta.min(CAPTURE_CHUNK);
+                match tako_core::tmux::capture_history_plain(Some(socket), &job.session, take) {
+                    Some(lines) => ChunkKind::Counted { lines, delta },
+                    None => continue,
+                }
+            } else if probe.history >= probe.limit
+                && !probe.alternate
+                && probe.bytes != job.last_bytes
+            {
+                // 履歴が history-limit で飽和するとカウンタが増えない。バイト数の変化を
+                // 合図に末尾チャンクを取り、取り込み済み tail と照合して新規行だけ追記する
+                match tako_core::tmux::capture_history_plain(
+                    Some(socket),
+                    &job.session,
+                    CAPTURE_CHUNK,
+                ) {
+                    Some(captured) => ChunkKind::Overlap { captured },
+                    None => continue,
+                }
+            } else {
+                ChunkKind::None
+            }
+        };
+        let mut mgr = manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        mgr.apply(
+            job.pane.as_u64(),
+            &job.meta,
+            PaneObservation {
+                history: probe.history,
+                history_limit: probe.limit,
+                bytes: probe.bytes,
+                alt_screen: probe.alternate,
+                chunk,
+            },
+        );
+    }
 }
 
 /// cmd+ホバーで検出されたリンク情報
@@ -1497,6 +1576,13 @@ impl TakoApp {
             pending_close_confirm: None,
             sleep_guard_active: false,
             recovered_count: 0,
+            pane_logs: std::sync::Arc::new(std::sync::Mutex::new(
+                tako_core::pane_log::PaneLogManager::new(
+                    tako_core::pane_log::log_dir()
+                        .unwrap_or_else(|| std::env::temp_dir().join("tako-pane-logs")),
+                    tako_control::settings::load().pane_log_config(),
+                ),
+            )),
         };
         // App Nap 無効化 + 初回スリープ防止更新（Issue #173）
         tako_control::sleep_guard::disable_app_nap();
@@ -1510,6 +1596,20 @@ impl TakoApp {
         // close_pane 側で確定済みのため、ここでは触らない（#30 / #113 の挙動を維持）
         cx.on_app_quit(|this: &mut TakoApp, _cx| {
             if !this.quitting {
+                // ペインログ（Issue #112 B）: バックエンドの無い直接ペインはアプリと共に
+                // プロセスが死ぬため、可視画面をフラッシュして書き残す。バックエンドペインは
+                // tmux 側で生き続け、再起動後に logged_history から差分取り込みするので触らない
+                let direct_panes: Vec<PaneId> = this
+                    .terminals
+                    .keys()
+                    .filter(|p| !this.backend_sessions.contains_key(p))
+                    .copied()
+                    .collect();
+                for pane in direct_panes {
+                    if let Some(data) = this.pane_log_close_data(pane) {
+                        this.apply_pane_log_close(pane, data, CloseReason::Exited);
+                    }
+                }
                 // 終了直前の構成を保存してから抜ける（Phase 5.5。セッションは残る = 永続化）
                 this.save_layout();
                 // persist ON（セッション生存）なら接続情報を残す: ソケットパス・トークンが
@@ -1598,6 +1698,13 @@ impl TakoApp {
                 });
                 if let Some(name) = &r.session {
                     app.backend_sessions.insert(pane, name.clone());
+                }
+                // ペインログ（Issue #112 B）: 前回の取り込み位置を復元し、tako 停止中に
+                // tmux 側へ積もった出力を次回 tick の差分として取り込む
+                if let Some(history) = r.logged_history {
+                    let meta = app.pane_log_meta(pane);
+                    app.pane_logs_lock()
+                        .seed_history(pane.as_u64(), &meta, history as usize);
                 }
                 let transcript_exists = r
                     .claude_session_id
@@ -1815,21 +1922,38 @@ impl TakoApp {
             if !should_scan {
                 continue;
             }
-            let detected = cx
+            // 1 回の `claude agents --json` 取得から resume マップ（従来）と
+            // セッションカタログの検出（Issue #112 A）の両方を導出する
+            let agents_value = cx
                 .background_executor()
-                .spawn(async { tako_control::agents::claude_session_ids_by_backend() })
+                .spawn(async { tako_control::agents::list_agents_with_panes(None) })
                 .await;
-            let Ok(detected) = detected else {
+            let Ok(agents_value) = agents_value else {
                 continue;
             };
-            if this
-                .update(cx, |app: &mut TakoApp, _| {
-                    app.apply_claude_resume_sessions(&detected);
-                    app.save_layout();
-                })
-                .is_err()
-            {
+            let detected = tako_control::sessions::detect_from_agents_value(&agents_value);
+            let resume_map: HashMap<String, String> = detected
+                .iter()
+                .map(|d| (d.tmux_session.clone(), d.session_id.clone()))
+                .collect();
+            let pane_meta = this.update(cx, |app: &mut TakoApp, _| {
+                app.apply_claude_resume_sessions(&resume_map);
+                app.save_layout();
+                app.collect_pane_meta_snapshots()
+            });
+            let Ok(pane_meta) = pane_meta else {
                 break;
+            };
+            // カタログの書き込み（ファイルロック + アトミック書き込み）は background で
+            if !detected.is_empty() {
+                cx.background_executor()
+                    .spawn(async move {
+                        if let Err(e) = tako_control::sessions::sync_detected(&detected, &pane_meta)
+                        {
+                            eprintln!("warning: セッションカタログの同期に失敗: {e}");
+                        }
+                    })
+                    .await;
             }
         })
         .detach();
@@ -1875,173 +1999,219 @@ impl TakoApp {
         })
         .detach();
 
-        // 2 秒毎の定期更新: tmux 一覧（FR-2.13）+ ファイルツリー（FR-3.1）+ git（FR-3.6）。
-        // 外部コマンド実行は background で行い、UI スレッドではコンテキスト収集と結果適用のみ
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(Duration::from_secs(2)).await;
-            // ① main thread: tmux コンテキスト + filetree 対象 + view 監視対象 + git を収集（高速）
-            let t0 = std::time::Instant::now();
-            let prep = this.update(cx, |app: &mut TakoApp, _| {
-                // Issue #168: 定期更新の UI スレッド部（収集 + save_layout）を計測
-                let _span = tako_control::diag::perf_span("periodic_prep");
-                let tmux_ctx = if app.panel_visible && app.panel_view == PanelView::Tmux {
-                    Some(app.collect_tmux_context())
-                } else {
-                    None
-                };
-                app.sync_filetree_roots();
-                app.refresh_agent_metrics();
-                app.poll_webview_state();
-                app.update_sleep_guard();
-                app.save_layout();
-                let filetree_targets = if app.filetree.visible {
-                    Some(app.filetree.refresh_targets())
-                } else {
-                    None
-                };
-                let view_targets: Vec<(PaneId, String, Option<String>)> = app
-                    .tmux_view_panes
-                    .iter()
-                    .map(|(id, t)| (*id, t.session.clone(), t.socket.clone()))
-                    .collect();
-                let git_cwd = if app.panel_visible && app.panel_view == PanelView::Git {
-                    app.active_tab_cwd()
-                } else {
-                    None
-                };
-                let git_selected = app.git_selected_commit.clone();
-                (
+        // 2 秒毎の定期更新: tmux 一覧（FR-2.13）+ ファイルツリー（FR-3.1）+ git（FR-3.6）+
+        // ペインログ（Issue #112 B）。外部コマンド実行は background で行い、
+        // UI スレッドではコンテキスト収集と結果適用のみ
+        cx.spawn(async move |this, cx| {
+            let mut pane_log_tick: u32 = 0;
+            loop {
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+                // ① main thread: tmux コンテキスト + filetree 対象 + view 監視対象 + git を収集（高速）
+                let t0 = std::time::Instant::now();
+                let prep = this.update(cx, |app: &mut TakoApp, _| {
+                    // Issue #168: 定期更新の UI スレッド部（収集 + save_layout）を計測
+                    let _span = tako_control::diag::perf_span("periodic_prep");
+                    let tmux_ctx = if app.panel_visible && app.panel_view == PanelView::Tmux {
+                        Some(app.collect_tmux_context())
+                    } else {
+                        None
+                    };
+                    app.sync_filetree_roots();
+                    app.refresh_agent_metrics();
+                    app.poll_webview_state();
+                    app.update_sleep_guard();
+                    // ペインログ: 直接ペインはここで取り込み、バックエンドはジョブ化（Issue #112 B）
+                    let log_jobs = app.collect_pane_log_work();
+                    app.save_layout();
+                    let filetree_targets = if app.filetree.visible {
+                        Some(app.filetree.refresh_targets())
+                    } else {
+                        None
+                    };
+                    let view_targets: Vec<(PaneId, String, Option<String>)> = app
+                        .tmux_view_panes
+                        .iter()
+                        .map(|(id, t)| (*id, t.session.clone(), t.socket.clone()))
+                        .collect();
+                    let git_cwd = if app.panel_visible && app.panel_view == PanelView::Git {
+                        app.active_tab_cwd()
+                    } else {
+                        None
+                    };
+                    let git_selected = app.git_selected_commit.clone();
+                    (
+                        tmux_ctx,
+                        filetree_targets,
+                        view_targets,
+                        git_cwd,
+                        git_selected,
+                        log_jobs,
+                        app.pane_logs.clone(),
+                    )
+                });
+                // UI スレッド専有時間の計測（Issue #113 診断。しきい値超えのみ記録）
+                let prep_ms = t0.elapsed().as_millis();
+                if prep_ms >= 100 {
+                    tako_control::diag::perf_log(&format!(
+                        "定期更新（UI 部）遅延: 収集 + save_layout が {prep_ms}ms"
+                    ));
+                }
+                let Ok((
                     tmux_ctx,
                     filetree_targets,
                     view_targets,
                     git_cwd,
                     git_selected,
-                )
-            });
-            // UI スレッド専有時間の計測（Issue #113 診断。しきい値超えのみ記録）
-            let prep_ms = t0.elapsed().as_millis();
-            if prep_ms >= 100 {
-                tako_control::diag::perf_log(&format!(
-                    "定期更新（UI 部）遅延: 収集 + save_layout が {prep_ms}ms"
-                ));
-            }
-            let Ok((tmux_ctx, filetree_targets, view_targets, git_cwd, git_selected)) = prep else {
-                break;
-            };
-            // ② background: tmux コマンド実行 + ディレクトリ読み取り
-            let tmux_result = if let Some(ctx) = tmux_ctx {
-                let task = cx
-                    .background_executor()
-                    .spawn(async move { tako_control::fetch_tmux_sessions(&ctx) });
-                Some(task.await)
-            } else {
-                None
-            };
-            if let Some(sessions) = tmux_result {
-                // 構造の更新（メモリ操作）だけ UI スレッドで行い、window キャプチャ
-                // （tmux サブプロセス実行）は background へ逃がす（Issue #113: 旧実装は
-                // ここで window 数ぶん capture-pane を同期実行し、多 worker 時の定常的な
-                // UI ブロック源だった）
-                let targets = this.update(cx, |app: &mut TakoApp, cx| {
-                    app.tmux_sessions = sessions;
-                    let targets = app.sync_backend_windows();
-                    cx.notify();
-                    targets
-                });
-                let Ok(targets) = targets else {
+                    log_jobs,
+                    pane_logs,
+                )) = prep
+                else {
                     break;
                 };
-                if !targets.is_empty() {
+                // ② background: バックエンドペインのペインログ取り込み（probe + capture。
+                // await して tick 内の順序を保つ = 同一ペインの増分が並行取り込みで重複しない）
+                if !log_jobs.is_empty() {
                     let socket = tako_core::tmux_backend::socket_name();
-                    let captures = cx
-                        .background_executor()
-                        .spawn(async move {
-                            targets
-                                .into_iter()
-                                .map(|(pane, session, win)| {
-                                    let lines = tako_core::tmux::capture_pane_text(
-                                        Some(&socket),
-                                        &session,
-                                        win,
-                                    );
-                                    ((pane, win), lines)
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .await;
-                    let ok = this.update(cx, |app: &mut TakoApp, cx| {
-                        app.apply_window_captures(captures);
-                        cx.notify();
-                    });
-                    if ok.is_err() {
-                        break;
-                    }
-                }
-            }
-            // TmuxOpen ペインの監視: 対象セッションが消滅したら自動クローズ
-            if !view_targets.is_empty() {
-                let dead_panes: Vec<PaneId> = {
-                    let targets = view_targets;
+                    let mgr = pane_logs.clone();
                     cx.background_executor()
                         .spawn(async move {
-                            targets
-                                .into_iter()
-                                .filter(|(_, session, socket)| {
-                                    !tako_core::tmux::has_session(socket.as_deref(), session)
-                                })
-                                .map(|(id, _, _)| id)
-                                .collect()
+                            process_pane_log_jobs(&mgr, &socket, log_jobs);
                         })
-                        .await
-                };
-                if !dead_panes.is_empty() {
-                    let ok = this.update(cx, |app: &mut TakoApp, cx| {
-                        for pane_id in dead_panes {
-                            if app.tmux_view_panes.contains_key(&pane_id) {
-                                app.remove_pane(pane_id, cx);
+                        .await;
+                }
+                // 全体上限の強制は低頻度（約 60 秒ごと）で十分
+                pane_log_tick = pane_log_tick.wrapping_add(1);
+                if pane_log_tick % 30 == 1 {
+                    let mgr = pane_logs.clone();
+                    cx.background_executor()
+                        .spawn(async move {
+                            let removed = {
+                                let guard = mgr.lock().unwrap_or_else(|p| p.into_inner());
+                                guard.enforce_total_cap()
+                            };
+                            if removed > 0 {
+                                eprintln!(
+                                    "info: ペインログの全体上限で {removed} ファイルを削除した"
+                                );
                             }
+                        })
+                        .detach();
+                }
+                // ② background: tmux コマンド実行 + ディレクトリ読み取り
+                let tmux_result = if let Some(ctx) = tmux_ctx {
+                    let task = cx
+                        .background_executor()
+                        .spawn(async move { tako_control::fetch_tmux_sessions(&ctx) });
+                    Some(task.await)
+                } else {
+                    None
+                };
+                if let Some(sessions) = tmux_result {
+                    // 構造の更新（メモリ操作）だけ UI スレッドで行い、window キャプチャ
+                    // （tmux サブプロセス実行）は background へ逃がす（Issue #113: 旧実装は
+                    // ここで window 数ぶん capture-pane を同期実行し、多 worker 時の定常的な
+                    // UI ブロック源だった）
+                    let targets = this.update(cx, |app: &mut TakoApp, cx| {
+                        app.tmux_sessions = sessions;
+                        let targets = app.sync_backend_windows();
+                        cx.notify();
+                        targets
+                    });
+                    let Ok(targets) = targets else {
+                        break;
+                    };
+                    if !targets.is_empty() {
+                        let socket = tako_core::tmux_backend::socket_name();
+                        let captures = cx
+                            .background_executor()
+                            .spawn(async move {
+                                targets
+                                    .into_iter()
+                                    .map(|(pane, session, win)| {
+                                        let lines = tako_core::tmux::capture_pane_text(
+                                            Some(&socket),
+                                            &session,
+                                            win,
+                                        );
+                                        ((pane, win), lines)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .await;
+                        let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                            app.apply_window_captures(captures);
+                            cx.notify();
+                        });
+                        if ok.is_err() {
+                            break;
+                        }
+                    }
+                }
+                // TmuxOpen ペインの監視: 対象セッションが消滅したら自動クローズ
+                if !view_targets.is_empty() {
+                    let dead_panes: Vec<PaneId> = {
+                        let targets = view_targets;
+                        cx.background_executor()
+                            .spawn(async move {
+                                targets
+                                    .into_iter()
+                                    .filter(|(_, session, socket)| {
+                                        !tako_core::tmux::has_session(socket.as_deref(), session)
+                                    })
+                                    .map(|(id, _, _)| id)
+                                    .collect()
+                            })
+                            .await
+                    };
+                    if !dead_panes.is_empty() {
+                        let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                            for pane_id in dead_panes {
+                                if app.tmux_view_panes.contains_key(&pane_id) {
+                                    app.remove_pane(pane_id, cx);
+                                }
+                            }
+                        });
+                        if ok.is_err() {
+                            break;
+                        }
+                    }
+                }
+                if let Some(targets) = filetree_targets {
+                    let git_roots: Vec<std::path::PathBuf> =
+                        targets.iter().filter(|p| p.is_dir()).cloned().collect();
+                    let task = cx
+                        .background_executor()
+                        .spawn(async move { filetree::scan_dirs(&targets) });
+                    let git_task = cx
+                        .background_executor()
+                        .spawn(async move { filetree::scan_git_status(&git_roots) });
+                    let results = task.await;
+                    let git_status = git_task.await;
+                    let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                        let mut changed = app.filetree.apply_refresh(results);
+                        changed |= app.filetree.apply_git_status(git_status);
+                        if changed {
+                            cx.notify();
                         }
                     });
                     if ok.is_err() {
                         break;
                     }
                 }
-            }
-            if let Some(targets) = filetree_targets {
-                let git_roots: Vec<std::path::PathBuf> =
-                    targets.iter().filter(|p| p.is_dir()).cloned().collect();
-                let task = cx
-                    .background_executor()
-                    .spawn(async move { filetree::scan_dirs(&targets) });
-                let git_task = cx
-                    .background_executor()
-                    .spawn(async move { filetree::scan_git_status(&git_roots) });
-                let results = task.await;
-                let git_status = git_task.await;
-                let ok = this.update(cx, |app: &mut TakoApp, cx| {
-                    let mut changed = app.filetree.apply_refresh(results);
-                    changed |= app.filetree.apply_git_status(git_status);
-                    if changed {
+                // ③ background: git データ取得
+                if let Some(cwd) = git_cwd {
+                    let selected = git_selected;
+                    let task = cx
+                        .background_executor()
+                        .spawn(async move { fetch_git_data(&cwd, selected.as_deref()) });
+                    let data = task.await;
+                    let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                        app.git_data = data;
                         cx.notify();
+                    });
+                    if ok.is_err() {
+                        break;
                     }
-                });
-                if ok.is_err() {
-                    break;
-                }
-            }
-            // ③ background: git データ取得
-            if let Some(cwd) = git_cwd {
-                let selected = git_selected;
-                let task = cx
-                    .background_executor()
-                    .spawn(async move { fetch_git_data(&cwd, selected.as_deref()) });
-                let data = task.await;
-                let ok = this.update(cx, |app: &mut TakoApp, cx| {
-                    app.git_data = data;
-                    cx.notify();
-                });
-                if ok.is_err() {
-                    break;
                 }
             }
         })
@@ -3549,6 +3719,9 @@ impl TakoApp {
         else {
             return;
         };
+        // ペインログの最終フラッシュ素材（Issue #112 B）。close 成功後に書き込む
+        // （LastPane 分岐は remove_tab_with 側が全ペイン分をフラッシュする）
+        let log_close = self.pane_log_close_data(pane_id);
         let tab = self
             .workspace
             .get_tab_mut(tab_id)
@@ -3572,6 +3745,10 @@ impl TakoApp {
                     if layout.policy != tako_core::SpawnLayoutPolicy::Legacy {
                         let _ = tab.tree_mut().reflow_workers(anchor, layout.algorithm);
                     }
+                }
+                // ペインログの最終フラッシュ（Issue #112 B。セッション破棄前に書き残す）
+                if let Some(data) = log_close {
+                    self.apply_pane_log_close(pane_id, data, reason);
                 }
                 self.terminals.remove(&pane_id);
                 self.previews.remove(&pane_id);
@@ -3611,8 +3788,17 @@ impl TakoApp {
             return;
         };
         let pane_ids: Vec<PaneId> = tab.tree().panes().iter().map(|p| p.id()).collect();
+        // ペインログの最終フラッシュ（Issue #112 B）。タブ close / 全ペイン終了の両分岐で
+        // 素材を close 前に採取し、どちらの経路でも書き残す
+        let log_closes: Vec<(PaneId, PaneLogCloseData)> = pane_ids
+            .iter()
+            .filter_map(|id| self.pane_log_close_data(*id).map(|d| (*id, d)))
+            .collect();
         match self.workspace.close_tab(tab_id) {
             Ok(_) => {
+                for (id, data) in log_closes {
+                    self.apply_pane_log_close(id, data, reason);
+                }
                 for id in pane_ids {
                     self.terminals.remove(&id);
                     self.previews.remove(&id);
@@ -3654,6 +3840,10 @@ impl TakoApp {
                 for id in pane_ids {
                     self.drop_tmux_view_session(id);
                     self.drop_backend_session_with(id, reason);
+                }
+                // ペインログの最終フラッシュ（Issue #112 B。アプリ終了直前に書き残す）
+                for (id, data) in log_closes {
+                    self.apply_pane_log_close(id, data, reason);
                 }
                 // セカンダリモードは layout.json の所有者ではないため削除もログも行わない
                 // （プライマリの復元情報を道連れにしない。Issue #113）
@@ -3794,6 +3984,13 @@ impl TakoApp {
         let terminals = &self.terminals;
         let previews = &self.previews;
         let webviews = &self.webviews;
+        // ペインログの取り込み位置（Issue #112 B。再起動後の差分取り込み基準として保存）
+        let pane_log_history: HashMap<u64, u64> = self
+            .pane_logs_lock()
+            .all_logged_history()
+            .into_iter()
+            .map(|(pane, h)| (pane, h as u64))
+            .collect();
         let mut layout = tako_control::layout::capture(
             &self.workspace,
             &|pane| tako_control::layout::PaneMeta {
@@ -3803,6 +4000,7 @@ impl TakoApp {
                     .and_then(|s| s.cwd())
                     .map(|p| p.display().to_string()),
                 claude_session_id: claude_resume_sessions.get(&pane).cloned(),
+                logged_history: pane_log_history.get(&pane.as_u64()).copied(),
                 preview: previews
                     .get(&pane)
                     .map(|p| tako_control::layout::PreviewLayout {
@@ -3864,6 +4062,204 @@ impl TakoApp {
                     .map(|id| (*pane, id.clone()))
             })
             .collect();
+    }
+
+    /// ペインログ（Issue #112 B）のロック（毒化耐性: 追記状態の破損より継続を優先）
+    fn pane_logs_lock(&self) -> std::sync::MutexGuard<'_, tako_core::pane_log::PaneLogManager> {
+        self.pane_logs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// ペインのログ命名メタ（タブ ID + role / title 由来のラベル）。
+    /// タブツリーに無ければバックグラウンド（退避中）の由来タブ情報から引く
+    fn pane_log_meta(&self, pane: PaneId) -> tako_core::pane_log::PaneLogMeta {
+        for tab in self.workspace.tabs() {
+            if let Some(p) = tab.tree().panes().iter().find(|p| p.id() == pane) {
+                return tako_core::pane_log::PaneLogMeta {
+                    tab: tab.id().as_u64(),
+                    label: p.role().or(p.title()).map(str::to_string),
+                };
+            }
+        }
+        if let Some(bp) = self
+            .workspace
+            .shelved_panes()
+            .iter()
+            .find(|b| b.pane().id() == pane)
+        {
+            return tako_core::pane_log::PaneLogMeta {
+                tab: bp.origin_tab().as_u64(),
+                label: bp.pane().role().or(bp.pane().title()).map(str::to_string),
+            };
+        }
+        tako_core::pane_log::PaneLogMeta::default()
+    }
+
+    /// ペインログの 1 tick 分の走査（Issue #112 B。2 秒ポーリングから呼ばれる）。
+    /// 直接ペインは Term のメモリ読みでここで取り込み、tmux バックエンドペインは
+    /// capture（サブプロセス）が要るため background 用のジョブとして返す
+    fn collect_pane_log_work(&self) -> Vec<PaneLogJob> {
+        if self.secondary {
+            return Vec::new();
+        }
+        use tako_core::pane_log::{ChunkKind, PaneObservation, CAPTURE_CHUNK};
+        let mut jobs = Vec::new();
+        let mut mgr = self.pane_logs_lock();
+        for (pane_id, session) in &self.terminals {
+            // TmuxOpen ビューペイン（外部セッションの attach クライアント）は対象外
+            if self.tmux_view_panes.contains_key(pane_id) {
+                continue;
+            }
+            let meta = self.pane_log_meta(*pane_id);
+            if let Some(backend) = self.backend_sessions.get(pane_id) {
+                let (last_history, last_bytes) =
+                    mgr.scan_baseline(pane_id.as_u64()).unwrap_or((0, 0));
+                jobs.push(PaneLogJob {
+                    pane: *pane_id,
+                    session: backend.clone(),
+                    meta,
+                    last_history,
+                    last_bytes,
+                });
+                continue;
+            }
+            // 直接ペイン: alacritty history の増分をメモリ読みで取り込む
+            let history = session.history_size();
+            let limit = session.scrollback_limit();
+            let alt = session.is_alt_screen();
+            let (last, _) = mgr.scan_baseline(pane_id.as_u64()).unwrap_or((0, 0));
+            let chunk = if history < last {
+                ChunkKind::None
+            } else {
+                let delta = history - last;
+                if delta > 0 {
+                    ChunkKind::Counted {
+                        lines: session.history_plain_lines(0, delta.min(CAPTURE_CHUNK)),
+                        delta,
+                    }
+                } else if history >= limit && !alt {
+                    // 履歴が保持上限で飽和するとカウンタが増えない。末尾チャンクを
+                    // 取り込み済み tail と照合して新規行だけ追記する
+                    ChunkKind::Overlap {
+                        captured: session.history_plain_lines(0, CAPTURE_CHUNK),
+                    }
+                } else {
+                    ChunkKind::None
+                }
+            };
+            mgr.apply(
+                pane_id.as_u64(),
+                &meta,
+                PaneObservation {
+                    history,
+                    history_limit: limit,
+                    bytes: 0,
+                    alt_screen: alt,
+                    chunk,
+                },
+            );
+        }
+        jobs
+    }
+
+    /// クローズ前のペインログフラッシュ素材（メタ + 直接ペインの履歴取りこぼし + 可視画面）。
+    /// ペイン内容が空でログ状態も無い場合は None（空ログファイルを作らない）
+    fn pane_log_close_data(&self, pane: PaneId) -> Option<PaneLogCloseData> {
+        if self.secondary {
+            return None;
+        }
+        let session = self.terminals.get(&pane)?;
+        let visible = session.visible_lines();
+        let has_state = self.pane_logs_lock().path_of(pane.as_u64()).is_some();
+        if !has_state && !visible.iter().any(|l| !l.trim().is_empty()) {
+            return None;
+        }
+        // 直接ペインは最終 tick 以降の履歴増分もここで拾い切る
+        let catch_up = if self.backend_sessions.contains_key(&pane) {
+            None
+        } else {
+            let history = session.history_size();
+            let (last, _) = self
+                .pane_logs_lock()
+                .scan_baseline(pane.as_u64())
+                .unwrap_or((0, 0));
+            (history > last).then(|| {
+                let delta = history - last;
+                let take = delta.min(tako_core::pane_log::CAPTURE_CHUNK);
+                (session.history_plain_lines(0, take), delta, history)
+            })
+        };
+        Some(PaneLogCloseData {
+            meta: self.pane_log_meta(pane),
+            visible,
+            catch_up,
+        })
+    }
+
+    /// ペインログのクローズフラッシュ本体（`pane_log_close_data` と対）
+    fn apply_pane_log_close(&self, pane: PaneId, data: PaneLogCloseData, reason: CloseReason) {
+        use tako_core::pane_log::{ChunkKind, PaneObservation};
+        let mut mgr = self.pane_logs_lock();
+        if let Some((lines, delta, history)) = data.catch_up {
+            mgr.apply(
+                pane.as_u64(),
+                &data.meta,
+                PaneObservation {
+                    history,
+                    history_limit: usize::MAX,
+                    bytes: 0,
+                    alt_screen: false,
+                    chunk: ChunkKind::Counted { lines, delta },
+                },
+            );
+        }
+        let reason_str = match reason {
+            CloseReason::Explicit => "close",
+            CloseReason::Exited => "exit",
+        };
+        mgr.flush_close(pane.as_u64(), &data.meta, &data.visible, reason_str);
+    }
+
+    /// カタログ同期用のペインメタ（Issue #112 A。backend セッション対応のあるペインのみ）
+    fn collect_pane_meta_snapshots(&self) -> Vec<tako_control::sessions::PaneMetaSnapshot> {
+        let logs = self.pane_logs_lock();
+        let mut out = Vec::new();
+        for (pane, backend) in &self.backend_sessions {
+            let mut snap = tako_control::sessions::PaneMetaSnapshot {
+                pane: pane.as_u64(),
+                tmux_session: backend.clone(),
+                ..Default::default()
+            };
+            for tab in self.workspace.tabs() {
+                if let Some(p) = tab.tree().panes().iter().find(|p| p.id() == *pane) {
+                    snap.tab = tab.id().as_u64();
+                    snap.role = p.role().map(str::to_string);
+                    snap.title = p.title().map(str::to_string);
+                    break;
+                }
+            }
+            if snap.tab == 0 {
+                if let Some(bp) = self
+                    .workspace
+                    .shelved_panes()
+                    .iter()
+                    .find(|b| b.pane().id() == *pane)
+                {
+                    snap.tab = bp.origin_tab().as_u64();
+                    snap.role = bp.pane().role().map(str::to_string);
+                    snap.title = bp.pane().title().map(str::to_string);
+                }
+            }
+            snap.cwd = self
+                .terminals
+                .get(pane)
+                .and_then(|s| s.cwd())
+                .map(|p| p.display().to_string());
+            snap.log_file = logs.path_of(pane.as_u64()).map(|p| p.display().to_string());
+            out.push(snap);
+        }
+        out
     }
 
     fn focus_direction(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
@@ -7498,6 +7894,11 @@ impl ControlHost for TakoApp {
     }
 
     fn detach_session(&mut self, pane: PaneId) {
+        // ペインログの最終フラッシュ（Issue #112 B。CLI / MCP の close はこの経路で
+        // セッションを破棄するため、terminals から外す前に可視画面を書き残す）
+        if let Some(data) = self.pane_log_close_data(pane) {
+            self.apply_pane_log_close(pane, data, CloseReason::Explicit);
+        }
         self.terminals.remove(&pane);
         self.previews.remove(&pane);
         self.preview_edits.remove(&pane);
@@ -8135,6 +8536,32 @@ impl ControlHost for TakoApp {
             "message": msg,
             "install_method": update_checker::detect_install_method_full().label(),
         }))
+    }
+
+    fn reserve_backend_session(&mut self, pane: PaneId) -> Option<String> {
+        // spawn_session と同じ条件・同じ採番（entry API なので二重採番しない）
+        if self.tmux_persist && tako_core::tmux_backend::available() {
+            Some(
+                self.backend_sessions
+                    .entry(pane)
+                    .or_insert_with(new_backend_session_name)
+                    .clone(),
+            )
+        } else {
+            None
+        }
+    }
+
+    fn pane_log_config(&self) -> tako_core::pane_log::PaneLogConfig {
+        self.pane_logs_lock().config()
+    }
+
+    fn apply_pane_log_config(&mut self, config: tako_core::pane_log::PaneLogConfig) {
+        self.pane_logs_lock().set_config(config);
+    }
+
+    fn pane_log_file(&self, pane: PaneId) -> Option<std::path::PathBuf> {
+        self.pane_logs_lock().path_of(pane.as_u64())
     }
 }
 
@@ -9122,6 +9549,28 @@ fn main() {
                 std::env::temp_dir().join(format!("tako-iso-discovery-{}", std::process::id())),
             );
         }
+        // データディレクトリ（layout.json / settings.json / token / persist.log）も
+        // 一括隔離する（#177 の穴: TAKO_ISOLATED + TAKO_PERSIST=1 の組み合わせで
+        // 本番 layout.json を復元・上書きし得た）
+        if std::env::var_os("TAKO_DATA_DIR").is_none() {
+            std::env::set_var(
+                "TAKO_DATA_DIR",
+                std::env::temp_dir().join(format!("tako-iso-data-{}", std::process::id())),
+            );
+        }
+        // セッションカタログ / ペインログ（Issue #112）も本番ファイルから隔離する
+        if std::env::var_os("TAKO_SESSIONS_FILE").is_none() {
+            std::env::set_var(
+                "TAKO_SESSIONS_FILE",
+                std::env::temp_dir().join(format!("tako-iso-sessions-{}.yaml", std::process::id())),
+            );
+        }
+        if std::env::var_os("TAKO_PANE_LOG_DIR").is_none() {
+            std::env::set_var(
+                "TAKO_PANE_LOG_DIR",
+                std::env::temp_dir().join(format!("tako-iso-pane-logs-{}", std::process::id())),
+            );
+        }
     }
     // セルフテストの tmux バックエンド項目は、ユーザーの実バックエンド（tako サーバー）を
     // 汚さない隔離ソケットで行う（終了時に self_test 側が kill-server で片付ける）
@@ -9143,6 +9592,21 @@ fn main() {
             "TAKO_DISCOVERY_DIR",
             std::env::temp_dir().join(format!("tako-st-discovery-{}", std::process::id())),
         );
+    }
+    // セルフテストはセッションカタログ / ペインログ（Issue #112）も本番から隔離する
+    if std::env::var_os("TAKO_SELF_TEST").is_some() {
+        if std::env::var_os("TAKO_SESSIONS_FILE").is_none() {
+            std::env::set_var(
+                "TAKO_SESSIONS_FILE",
+                std::env::temp_dir().join(format!("tako-st-sessions-{}.yaml", std::process::id())),
+            );
+        }
+        if std::env::var_os("TAKO_PANE_LOG_DIR").is_none() {
+            std::env::set_var(
+                "TAKO_PANE_LOG_DIR",
+                std::env::temp_dir().join(format!("tako-st-pane-logs-{}", std::process::id())),
+            );
+        }
     }
     let initial_dir = parse_initial_dir();
     if let Some(ref dir) = initial_dir {
@@ -10690,7 +11154,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 61, "MCP tools/list は 61 ツール");
+            check(status == 200 && tool_count == 63, "MCP tools/list は 63 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)

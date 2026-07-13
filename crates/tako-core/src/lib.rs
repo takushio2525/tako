@@ -7,6 +7,7 @@ pub mod git;
 pub mod links;
 pub mod osc_tap;
 pub mod pane;
+pub mod pane_log;
 pub mod pane_tree;
 pub mod paths;
 pub mod ports;

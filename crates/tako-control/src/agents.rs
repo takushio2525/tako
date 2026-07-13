@@ -164,32 +164,6 @@ pub fn resolve_session_id_for_backend(backend_session: &str) -> Option<String> {
     None
 }
 
-/// 現在動いている Claude Code を tmux バックエンドセッション名へ一括対応付けする。
-///
-/// layout 永続化がペインごとに `claude agents --json` を呼ばず、1 回の一覧取得で
-/// session ID を保存するための経路。検出に失敗したときは Err を返し、呼び出し側が
-/// 直前の成功キャッシュを保持できるようにする。
-pub fn claude_session_ids_by_backend() -> Result<HashMap<String, String>, String> {
-    let value = list_agents_with_panes(None)?;
-    let agents = value["agents"]
-        .as_array()
-        .ok_or("claude agents の正規化結果が配列でない")?;
-    Ok(session_ids_by_backend_from_agents(agents))
-}
-
-fn session_ids_by_backend_from_agents(agents: &[Value]) -> HashMap<String, String> {
-    agents
-        .iter()
-        .filter_map(|agent| {
-            let pane = agent["pane"].as_str()?;
-            let backend = pane.split_once(':')?.0;
-            let session_id = agent["session_id"].as_str()?;
-            crate::transcript::is_valid_session_id(session_id)
-                .then(|| (backend.to_string(), session_id.to_string()))
-        })
-        .collect()
-}
-
 /// エージェント一覧に tmux ペイン対応を付与した完全版を返す（remote / dispatch / CLI 共用）。
 /// `socket` 省略時は tako バックエンドソケットを使う
 pub fn list_agents_with_panes(socket: Option<&str>) -> Result<Value, String> {
@@ -270,20 +244,5 @@ mod tests {
     fn process_parent_mapは自プロセスを含む() {
         let map = process_parent_map();
         assert!(map.contains_key(&std::process::id()));
-    }
-
-    #[test]
-    fn agent一覧からbackendごとのsession_idを抽出する() {
-        let agents = vec![
-            json!({"pane": "tako-a:0.0", "session_id": "session-a"}),
-            json!({"pane": "tako-b:1.2", "session_id": "session-b"}),
-            json!({"pane": "tako-c:0.0", "session_id": "../../invalid"}),
-            json!({"session_id": "pane-missing"}),
-        ];
-        let mapped = session_ids_by_backend_from_agents(&agents);
-        assert_eq!(mapped.get("tako-a").map(String::as_str), Some("session-a"));
-        assert_eq!(mapped.get("tako-b").map(String::as_str), Some("session-b"));
-        assert!(!mapped.contains_key("tako-c"));
-        assert_eq!(mapped.len(), 2);
     }
 }

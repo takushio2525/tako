@@ -305,6 +305,72 @@ pub fn paste_text(socket: Option<&str>, session: &str, text: &str) -> Result<(),
     .map(|_| ())
 }
 
+/// ペインログ用の観測結果（Issue #112）。バックエンドセッションのアクティブペインの
+/// 履歴状態を 1 コマンドで取得する
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneLogProbe {
+    /// `#{history_size}`（履歴行数。増分検知の基準）
+    pub history: usize,
+    /// `#{history_limit}`（保持上限。飽和判定に使う）
+    pub limit: usize,
+    /// `#{history_bytes}`（履歴の格納バイト数。飽和後の変化検知に使う）
+    pub bytes: u64,
+    /// `#{alternate_on}`（内側アプリが alt screen = TUI 実行中か）
+    pub alternate: bool,
+}
+
+/// バックエンドセッションのペインログ観測（Issue #112）。セッション消滅では None
+pub fn pane_log_probe(socket: Option<&str>, session: &str) -> Option<PaneLogProbe> {
+    let output = run_tmux(
+        socket,
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            &session_pane_target(session),
+            "#{history_size} #{history_limit} #{history_bytes} #{alternate_on}",
+        ],
+    )
+    .ok()?;
+    let line = output.lines().next()?;
+    let mut f = line.split_whitespace();
+    Some(PaneLogProbe {
+        history: f.next()?.parse().ok()?,
+        limit: f.next()?.parse().ok()?,
+        bytes: f.next()?.parse().ok()?,
+        alternate: f.next() == Some("1"),
+    })
+}
+
+/// 履歴末尾の `count` 行を平文で取得する（Issue #112 ペインログ用）。
+/// `-e` なし = ANSI 除去済み、`-J` なし = 折り返し行のまま（`#{history_size}` の
+/// 行数カウントと 1:1 に対応する）。履歴が足りなければ取れた分だけ返す
+pub fn capture_history_plain(
+    socket: Option<&str>,
+    session: &str,
+    count: usize,
+) -> Option<Vec<String>> {
+    if count == 0 {
+        return Some(Vec::new());
+    }
+    let start = format!("-{count}");
+    let output = run_tmux(
+        socket,
+        &[
+            "capture-pane",
+            "-p",
+            "-t",
+            &session_pane_target(session),
+            "-S",
+            &start,
+            "-E",
+            "-1",
+        ],
+    )
+    .ok()?;
+    Some(output.lines().map(|l| l.trim_end().to_string()).collect())
+}
+
 /// セッションが生きているか確認する（`has-session`）
 pub fn session_alive(socket: Option<&str>, session: &str) -> bool {
     tmux_command(socket)

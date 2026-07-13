@@ -585,6 +585,53 @@ pub enum Request {
         /// 呼び出し元ペイン（タブ解決用）
         pane: Option<u64>,
     },
+    /// セッションカタログの参照と復元（Issue #112 A）。
+    /// `action`:
+    /// - "list": カタログ一覧（`role` / `project` で絞り込み、`limit` 件まで）
+    /// - "show": `id`（session_id の前方一致可）のメタ + 会話冒頭の抜粋
+    /// - "resume": `id` の会話を新しいペインで復元する（該当 cwd でシェルを起動し
+    ///   `claude --resume <session_id>` を注入。claude セッションのみ対応）。
+    ///   配置は `pane`（省略時は呼び出し元）を `direction`（省略時は右）へ分割、
+    ///   `tab` 指定時はそのタブのフォーカスペインの隣
+    Sessions {
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direction: Option<Direction>,
+    },
+    /// ペインの平文ターミナルログの参照・設定（Issue #112 B）。
+    /// `action`:
+    /// - "list": ログファイル一覧（ペイン ID・サイズ・更新時刻）
+    /// - "read": ログの末尾 `lines` 行（既定 200）。対象は `pane`（クローズ済み可）
+    ///   または `session_id`（カタログ経由でそのセッションの端末ログを引く）
+    /// - "status": 有効/無効・上限・保存先の取得
+    /// - "set": `enabled` / `max_mb` / `total_max_mb` の変更（設定は永続化）
+    Logs {
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lines: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_mb: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total_max_mb: Option<u64>,
+    },
 }
 
 impl Request {

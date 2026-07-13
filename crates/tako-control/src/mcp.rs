@@ -1394,6 +1394,110 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "tako_sessions",
+            "description": "セッションカタログの参照と会話の復元（Issue #112）。\
+                tako が起動した master / worker / solo / 手動 claude の会話セッションを、\
+                ラベル・ロール・プロジェクト・Issue 番号つきで発見できるインデックス。\
+                会話本文は claude の transcript（~/.claude/projects/）への参照のみ持つ。\
+                action=list: 一覧（role / project で絞り込み、last_seen の新しい順に limit 件）。\
+                action=show: id（前方一致可）のメタ情報 + 会話冒頭の抜粋。\
+                action=resume: ペイン / タブ / tmux が全滅していても、記録された cwd で\
+                新しいペインを分割起動し `claude --resume <session_id>` で会話文脈ごと復元する。\
+                「昨日の #159 の子を呼び戻して」のような依頼は list で特定 → resume で復元する。\
+                制限: resume は claude セッションのみ（codex / agy は list に載るが復元不可）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "show", "resume"],
+                        "description": "操作種別",
+                    },
+                    "id": {
+                        "type": "string",
+                        "description": "session_id（前方一致可。show / resume で必須）",
+                    },
+                    "role": {
+                        "type": "string",
+                        "enum": ["master", "worker", "solo", "pane"],
+                        "description": "list の種別絞り込み",
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "list のプロジェクト絞り込み",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "list の最大件数（既定 30）",
+                    },
+                    "pane": {
+                        "type": "integer",
+                        "description": "resume の分割元ペイン ID（省略時は呼び出し元）",
+                    },
+                    "tab": {
+                        "type": "integer",
+                        "description": "resume の分割先タブ ID（そのタブのフォーカスペインの隣）",
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["right", "down", "left", "up"],
+                        "description": "resume の分割方向（省略時 right）",
+                    },
+                },
+                "required": ["action"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_logs",
+            "description": "ペインの平文ターミナルログの参照・設定（Issue #112）。\
+                全ペインのスクロールバック確定行を平文でローテーション保存しており、\
+                ペイン / タブ / アプリが死んだ後でもビルド・テスト出力を遡れる。\
+                TUI（claude 等）の描画は保存されない（「TUI 実行中」マーカーのみ。\
+                会話の復元は tako_sessions を使う）。\
+                action=list: ログファイル一覧。action=read: 末尾 lines 行（既定 200）を返す。\
+                対象は pane（クローズ済み可）か session_id（カタログ経由）。\
+                action=status: 有効/無効・上限・保存先。action=set: enabled / max_mb / \
+                total_max_mb の変更（永続化）。ログはユーザーローカル保存で、\
+                トークン等が写り込み得るため内容を外部へ送らないこと。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "read", "status", "set"],
+                        "description": "操作種別",
+                    },
+                    "pane": {
+                        "type": "integer",
+                        "description": "read 対象のペイン ID（クローズ済みでも可）",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "read 対象のセッション ID（カタログ経由で端末ログを引く）",
+                    },
+                    "lines": {
+                        "type": "integer",
+                        "description": "read の表示行数（既定 200）",
+                    },
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "set: ログ保存の ON/OFF",
+                    },
+                    "max_mb": {
+                        "type": "integer",
+                        "description": "set: ペインあたりの上限（MB）",
+                    },
+                    "total_max_mb": {
+                        "type": "integer",
+                        "description": "set: ログ全体の上限（MB）",
+                    },
+                },
+                "required": ["action"],
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -1896,6 +2000,40 @@ fn build_request(
             path: str_arg(args, "path")?.map(|s| s.to_string()),
             tab: u64_arg(args, "tab")?,
             pane: caller,
+        },
+        "tako_sessions" => {
+            let action = str_arg(args, "action")?.ok_or("action を指定する")?;
+            Request::Sessions {
+                // resume はペイン省略時に呼び出し元（master 自身の隣）へ分割する
+                pane: if action == "resume" && u64_arg(args, "tab")?.is_none() {
+                    u64_arg(args, "pane")?.or(caller)
+                } else {
+                    u64_arg(args, "pane")?
+                },
+                action,
+                id: str_arg(args, "id")?,
+                role: str_arg(args, "role")?,
+                project: str_arg(args, "project")?,
+                limit: u64_arg(args, "limit")?.map(|v| v as usize),
+                tab: u64_arg(args, "tab")?,
+                direction: direction_arg(args)?,
+            }
+        }
+        "tako_logs" => Request::Logs {
+            action: str_arg(args, "action")?
+                .ok_or("action を指定する")?
+                .to_string(),
+            // read はペイン・セッション未指定なら呼び出し元ペインのログを引く
+            pane: match (u64_arg(args, "pane")?, str_arg(args, "session_id")?) {
+                (Some(p), _) => Some(p),
+                (None, None) => caller,
+                (None, Some(_)) => None,
+            },
+            session_id: str_arg(args, "session_id")?,
+            lines: u64_arg(args, "lines")?.map(|v| v as usize),
+            enabled: bool_arg(args, "enabled")?,
+            max_mb: u64_arg(args, "max_mb")?,
+            total_max_mb: u64_arg(args, "total_max_mb")?,
         },
         _ => return Err(format!("不明なツール: {name}")),
     })
@@ -2403,7 +2541,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 61);
+        assert_eq!(tools.len(), 63);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
