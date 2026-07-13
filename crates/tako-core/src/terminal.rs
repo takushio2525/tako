@@ -362,7 +362,7 @@ impl TerminalSession {
             return;
         }
         // リサイズは reflow で行構成が変わるため端数はリセット（整数位置へスナップ）
-        *self.scroll_fract.lock().unwrap() = 0.0;
+        *self.fract_lock() = 0.0;
         self.term.lock().resize(TermSize::new(cols, rows));
         self.notifier.on_resize(WindowSize {
             num_lines: rows as u16,
@@ -387,10 +387,25 @@ impl TerminalSession {
         self.write(paste_payload(text, bracketed));
     }
 
+    /// `scroll_fract` のロック。毒化しても継続する（描画専用の端数 f32 なので
+    /// 壊れても実害がなく、パニック連鎖でセッションを失う方が重い）
+    fn fract_lock(&self) -> std::sync::MutexGuard<'_, f32> {
+        self.scroll_fract
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// `wheel_carry` のロック（毒化耐性は `fract_lock` と同じ理由）
+    fn carry_lock(&self) -> std::sync::MutexGuard<'_, f32> {
+        self.wheel_carry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// スクロールバック表示を行数ぶん動かす（正で過去方向）。
     /// 行単位 API（CLI / MCP・キーボード）なので端数はリセットして整数位置へスナップする
     pub fn scroll_display(&self, delta_lines: i32) {
-        let mut fract = self.scroll_fract.lock().unwrap();
+        let mut fract = self.fract_lock();
         *fract = 0.0;
         self.term.lock().scroll_display(Scroll::Delta(delta_lines));
     }
@@ -400,7 +415,7 @@ impl TerminalSession {
     /// display_offset、端数は `scroll_fract`（描画時のサブラインオフセット）に
     /// 分解して保持する。表示位置 pos = display_offset - fract（fract ∈ [0,1)）
     pub fn scroll_pixels(&self, delta_rows: f32) {
-        let mut fract = self.scroll_fract.lock().unwrap();
+        let mut fract = self.fract_lock();
         let mut term = self.term.lock();
         let offset = term.grid().display_offset();
         let history = term.grid().history_size();
@@ -413,7 +428,7 @@ impl TerminalSession {
 
     /// 表示位置（行。0.0 = 最下部、増えると過去方向）。スクロールバーの位置計算用
     pub fn scroll_position(&self) -> f32 {
-        let fract = *self.scroll_fract.lock().unwrap();
+        let fract = *self.fract_lock();
         let offset = self.term.lock().grid().display_offset() as f32;
         (offset - fract).max(0.0)
     }
@@ -421,7 +436,7 @@ impl TerminalSession {
     /// サブライン表示の下方向端数（0.0..1.0 行）。描画側のピクセルシフト量と
     /// マウス座標→セル座標変換の補正に使う
     pub fn scroll_subline_fract(&self) -> f32 {
-        *self.scroll_fract.lock().unwrap()
+        *self.fract_lock()
     }
 
     /// 表示位置を行の小数で直接指定する（スクロールバードラッグ用）
@@ -450,7 +465,7 @@ impl TerminalSession {
         let mode = *self.term.lock().mode();
         let forwards = mode.intersects(TermMode::MOUSE_MODE) || mode.contains(TermMode::ALT_SCREEN);
         if forwards {
-            let mut carry = self.wheel_carry.lock().unwrap();
+            let mut carry = self.carry_lock();
             *carry += delta_rows;
             let lines = carry.trunc() as i32;
             *carry -= lines as f32;
@@ -463,7 +478,7 @@ impl TerminalSession {
                 }
             }
         } else {
-            *self.wheel_carry.lock().unwrap() = 0.0;
+            *self.carry_lock() = 0.0;
             self.scroll_pixels(delta_rows);
         }
     }
@@ -481,7 +496,7 @@ impl TerminalSession {
     /// スクロールバック表示を絶対位置へ動かす（0 = 最下部。history を超えると先頭へクランプ）。
     /// 行単位 API なので端数はリセットして整数位置へスナップする
     pub fn scroll_to(&self, offset: usize) {
-        let mut fract = self.scroll_fract.lock().unwrap();
+        let mut fract = self.fract_lock();
         *fract = 0.0;
         let mut term = self.term.lock();
         let current = term.grid().display_offset() as i32;
@@ -512,7 +527,7 @@ impl TerminalSession {
     }
 
     pub fn scroll_to_bottom(&self) {
-        let mut fract = self.scroll_fract.lock().unwrap();
+        let mut fract = self.fract_lock();
         *fract = 0.0;
         let mut term = self.term.lock();
         if term.grid().display_offset() != 0 {
@@ -623,7 +638,7 @@ impl TerminalSession {
 
     /// カーソル強調を抑止できる版（tmux copy-mode スクロール中の描画用）
     pub fn screen_opts(&self, theme: &Theme, show_cursor: bool) -> Screen {
-        let fract = *self.scroll_fract.lock().unwrap();
+        let fract = *self.fract_lock();
         screen::snapshot_opts(&self.term.lock(), theme, show_cursor, fract)
     }
 
