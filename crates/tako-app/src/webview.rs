@@ -189,9 +189,7 @@ impl WebViewEntry {
             Some((x, y, w, h)) => {
                 if self.bounds_now != Some((x, y, w, h)) {
                     let _ = self.view.set_bounds(wry::Rect {
-                        position: wry::dpi::Position::Logical(wry::dpi::LogicalPosition::new(
-                            x, y,
-                        )),
+                        position: wry::dpi::Position::Logical(wry::dpi::LogicalPosition::new(x, y)),
                         size: wry::dpi::Size::Logical(wry::dpi::LogicalSize::new(w, h)),
                     });
                     self.bounds_now = Some((x, y, w, h));
@@ -312,7 +310,10 @@ mod tests {
     #[test]
     fn normalize_url_はスキーム付きをそのまま返す() {
         assert_eq!(normalize_url("https://example.com"), "https://example.com");
-        assert_eq!(normalize_url("http://localhost:3000"), "http://localhost:3000");
+        assert_eq!(
+            normalize_url("http://localhost:3000"),
+            "http://localhost:3000"
+        );
         assert_eq!(normalize_url("data:text/html,hi"), "data:text/html,hi");
         assert_eq!(normalize_url("about:blank"), "about:blank");
     }

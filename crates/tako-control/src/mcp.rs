@@ -1750,9 +1750,7 @@ fn build_request(
             lines: u64_arg(args, "lines")?.map(|n| n as u32),
         },
         "tako_web" => {
-            let action = str_arg(args, "action")?
-                .ok_or("action は必須")?
-                .to_string();
+            let action = str_arg(args, "action")?.ok_or("action は必須")?.to_string();
             // 分割系（open / show）だけ、基準ペイン省略時に呼び出し元を分割元とする。
             // 対象指定系で caller を埋めると「AI 自身のペイン」を対象と誤解するため埋めない
             let pane = match action.as_str() {

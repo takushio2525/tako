@@ -1730,54 +1730,54 @@ fn dispatch_inner(
         } => {
             // ペイン分割を伴う action（open / show）の共通処理。
             // 分割 → host フック → 失敗なら巻き戻し、成功ならフォーカス
-            let split_and = |host: &mut dyn ControlHost,
-                             pane: Option<u64>,
-                             attach: &dyn Fn(&mut dyn ControlHost, PaneId) -> Result<Value, String>|
-             -> Result<Value, DispatchError> {
-                let (tab, target) = match pane {
-                    Some(_) => resolve_pane(host.workspace(), pane)?,
-                    None => {
-                        let ws = host.workspace();
-                        (ws.active_tab_id(), ws.active_tab().tree().focused())
+            let split_and =
+                |host: &mut dyn ControlHost,
+                 pane: Option<u64>,
+                 attach: &dyn Fn(&mut dyn ControlHost, PaneId) -> Result<Value, String>|
+                 -> Result<Value, DispatchError> {
+                    let (tab, target) = match pane {
+                        Some(_) => resolve_pane(host.workspace(), pane)?,
+                        None => {
+                            let ws = host.workspace();
+                            (ws.active_tab_id(), ws.active_tab().tree().focused())
+                        }
+                    };
+                    let dir = direction
+                        .map(|d| d.to_core())
+                        .unwrap_or(SplitDirection::Right);
+                    let new_pane = Pane::new(origin);
+                    let new_id = new_pane.id();
+                    tree_mut(host.workspace_mut(), tab)
+                        .split_with_ratio(target, dir, 0.5, new_pane)
+                        .map_err(op_err)?;
+                    match attach(host, new_id) {
+                        Ok(v) => {
+                            tree_mut(host.workspace_mut(), tab)
+                                .focus(new_id)
+                                .map_err(op_err)?;
+                            Ok(v)
+                        }
+                        Err(e) => {
+                            let _ = tree_mut(host.workspace_mut(), tab).close(new_id);
+                            Err(DispatchError::Operation(e))
+                        }
                     }
                 };
-                let dir = direction
-                    .map(|d| d.to_core())
-                    .unwrap_or(SplitDirection::Right);
-                let new_pane = Pane::new(origin);
-                let new_id = new_pane.id();
-                tree_mut(host.workspace_mut(), tab)
-                    .split_with_ratio(target, dir, 0.5, new_pane)
-                    .map_err(op_err)?;
-                match attach(host, new_id) {
-                    Ok(v) => {
-                        tree_mut(host.workspace_mut(), tab)
-                            .focus(new_id)
-                            .map_err(op_err)?;
-                        Ok(v)
-                    }
-                    Err(e) => {
-                        let _ = tree_mut(host.workspace_mut(), tab).close(new_id);
-                        Err(DispatchError::Operation(e))
-                    }
-                }
-            };
             // 表示中の Web ビューをペインから外す共通処理（hide / close）。
             // Request::Close と同じ後始末（LastPane はタブごと閉じる + detach_session）
-            let close_pane_of = |host: &mut dyn ControlHost,
-                                 pane_id: PaneId|
-             -> Result<(), DispatchError> {
-                let (tab, target) = resolve_pane(host.workspace(), Some(pane_id.as_u64()))?;
-                match tree_mut(host.workspace_mut(), tab).close(target) {
-                    Ok(_) => {}
-                    Err(PaneTreeError::LastPane) => {
-                        host.workspace_mut().close_tab(tab).map_err(op_err)?;
+            let close_pane_of =
+                |host: &mut dyn ControlHost, pane_id: PaneId| -> Result<(), DispatchError> {
+                    let (tab, target) = resolve_pane(host.workspace(), Some(pane_id.as_u64()))?;
+                    match tree_mut(host.workspace_mut(), tab).close(target) {
+                        Ok(_) => {}
+                        Err(PaneTreeError::LastPane) => {
+                            host.workspace_mut().close_tab(tab).map_err(op_err)?;
+                        }
+                        Err(e) => return Err(op_err(e)),
                     }
-                    Err(e) => return Err(op_err(e)),
-                }
-                host.detach_session(target);
-                Ok(())
-            };
+                    host.detach_session(target);
+                    Ok(())
+                };
             match action.as_str() {
                 "open" => {
                     let url = url.ok_or(DispatchError::InvalidParams("url は必須".into()))?;

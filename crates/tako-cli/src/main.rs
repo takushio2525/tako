@@ -2445,15 +2445,29 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 WebCommand::Close { id, pane } => {
                     web("close", None, *id, *pane, None, None, None, None)
                 }
-                WebCommand::Nav { to, id, pane } => {
-                    web("navigate", None, *id, *pane, None, Some(to.clone()), None, None)
-                }
+                WebCommand::Nav { to, id, pane } => web(
+                    "navigate",
+                    None,
+                    *id,
+                    *pane,
+                    None,
+                    Some(to.clone()),
+                    None,
+                    None,
+                ),
                 WebCommand::Eval { js, id, pane } => {
                     web("eval", None, *id, *pane, None, None, Some(js.clone()), None)
                 }
-                WebCommand::EvalResult { token, id, pane } => {
-                    web("eval_result", None, *id, *pane, None, None, None, Some(*token))
-                }
+                WebCommand::EvalResult { token, id, pane } => web(
+                    "eval_result",
+                    None,
+                    *id,
+                    *pane,
+                    None,
+                    None,
+                    None,
+                    Some(*token),
+                ),
                 WebCommand::Read { id, pane } => {
                     web("read", None, *id, *pane, None, None, None, None)
                 }
