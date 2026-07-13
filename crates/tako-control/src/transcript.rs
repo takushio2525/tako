@@ -65,6 +65,35 @@ pub fn read_messages(session_id: &str, tail: usize) -> Result<Value, String> {
     }))
 }
 
+/// 会話の最初のユーザー発話を返す（`max_chars` で切り詰め）。
+/// セッションカタログ（Issue #112）の `show` 用。ファイルは先頭から
+/// ストリーム読みして最初の該当行で打ち切るため、巨大 transcript でも軽い
+pub fn first_user_text(session_id: &str, max_chars: usize) -> Option<String> {
+    let path = find_transcript(session_id)?;
+    let file = std::fs::File::open(&path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(obj) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if obj["isSidechain"].as_bool() == Some(true) {
+            continue;
+        }
+        if obj["type"].as_str() != Some("user") {
+            continue;
+        }
+        let Some(text) = obj["message"]["content"].as_str() else {
+            continue;
+        };
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        return Some(truncate_chars(trimmed, max_chars));
+    }
+    None
+}
+
 /// JSONL の行イテレータを正規化メッセージ列（末尾 tail 件）へ変換する。
 /// メモリは tail 件分のみ保持する（大きな transcript でも安全）
 pub fn normalize_lines(lines: impl Iterator<Item = String>, tail: usize) -> Vec<Value> {

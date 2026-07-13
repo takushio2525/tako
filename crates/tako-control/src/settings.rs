@@ -27,10 +27,27 @@ pub struct Settings {
     /// スリープ防止の電源条件（Issue #173。既定 ac-only）
     #[serde(default)]
     pub sleep_guard_power: crate::sleep_guard::PowerCondition,
+    /// ペインの平文ログ保存（Issue #112 B。既定 ON）
+    #[serde(default = "default_true")]
+    pub pane_logs: bool,
+    /// ペインあたりのログ上限（MB。超過でローテーション）
+    #[serde(default = "default_pane_log_max_mb")]
+    pub pane_log_max_mb: u64,
+    /// ログディレクトリ全体の上限（MB。超過で古いファイルから削除）
+    #[serde(default = "default_pane_log_total_max_mb")]
+    pub pane_log_total_max_mb: u64,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_pane_log_max_mb() -> u64 {
+    5
+}
+
+fn default_pane_log_total_max_mb() -> u64 {
+    200
 }
 
 impl Default for Settings {
@@ -41,6 +58,20 @@ impl Default for Settings {
             tmux_persist: true,
             sleep_guard_mode: crate::sleep_guard::SleepGuardMode::default(),
             sleep_guard_power: crate::sleep_guard::PowerCondition::default(),
+            pane_logs: true,
+            pane_log_max_mb: default_pane_log_max_mb(),
+            pane_log_total_max_mb: default_pane_log_total_max_mb(),
+        }
+    }
+}
+
+impl Settings {
+    /// ペインログ設定を tako-core の設定型へ解決する（Issue #112）
+    pub fn pane_log_config(&self) -> tako_core::pane_log::PaneLogConfig {
+        tako_core::pane_log::PaneLogConfig {
+            enabled: self.pane_logs,
+            max_bytes_per_pane: self.pane_log_max_mb.max(1) * 1024 * 1024,
+            max_total_bytes: self.pane_log_total_max_mb.max(1) * 1024 * 1024,
         }
     }
 }
@@ -107,6 +138,9 @@ mod tests {
             tmux_persist: false,
             sleep_guard_mode: crate::sleep_guard::SleepGuardMode::On,
             sleep_guard_power: crate::sleep_guard::PowerCondition::Always,
+            pane_logs: false,
+            pane_log_max_mb: 10,
+            pane_log_total_max_mb: 300,
         };
         save_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), Some(settings));
@@ -130,5 +164,13 @@ mod tests {
             parsed.sleep_guard_power,
             crate::sleep_guard::PowerCondition::AcOnly
         );
+        // ペインログ設定の既定（Issue #112。旧ファイル後方互換）
+        assert!(parsed.pane_logs);
+        assert_eq!(parsed.pane_log_max_mb, 5);
+        assert_eq!(parsed.pane_log_total_max_mb, 200);
+        let config = parsed.pane_log_config();
+        assert!(config.enabled);
+        assert_eq!(config.max_bytes_per_pane, 5 * 1024 * 1024);
+        assert_eq!(config.max_total_bytes, 200 * 1024 * 1024);
     }
 }

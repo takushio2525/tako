@@ -303,6 +303,17 @@ pub trait ControlHost {
     fn update_repair(&mut self) -> Result<Value, String> {
         Err("この環境では修復を実行できない".into())
     }
+    /// ペインログの現在設定（Issue #112 B）。GUI はライブの PaneLogManager から返す
+    fn pane_log_config(&self) -> tako_core::pane_log::PaneLogConfig {
+        crate::settings::load().pane_log_config()
+    }
+    /// ペインログ設定の反映（`tako logs set`）。GUI はライブの PaneLogManager へ適用する
+    fn apply_pane_log_config(&mut self, _config: tako_core::pane_log::PaneLogConfig) {}
+    /// ライブペインの現行ログファイル（Issue #112 B。クローズ済みペインは
+    /// `pane_log::latest_for_pane` のファイル名検索にフォールバックする）
+    fn pane_log_file(&self, _pane: PaneId) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -2083,7 +2094,285 @@ fn dispatch_inner(
             tab,
             pane,
         } => dispatch_tree_folder(host, &action, path, tab, pane),
+
+        Request::Sessions {
+            action,
+            id,
+            role,
+            project,
+            limit,
+            pane,
+            tab,
+            direction,
+        } => match action.as_str() {
+            "list" => crate::sessions::list_payload(
+                role.as_deref(),
+                project.as_deref(),
+                limit.unwrap_or(30),
+            )
+            .map_err(DispatchError::Operation),
+            "show" => {
+                let id =
+                    id.ok_or_else(|| DispatchError::InvalidParams("show には id が必要".into()))?;
+                crate::sessions::show_payload(&id).map_err(DispatchError::Operation)
+            }
+            "resume" => {
+                let id =
+                    id.ok_or_else(|| DispatchError::InvalidParams("resume には id が必要".into()))?;
+                dispatch_sessions_resume(host, origin, &id, pane, tab, direction)
+            }
+            other => Err(DispatchError::InvalidParams(format!(
+                "不明な action: {other:?}（list / show / resume のいずれか）"
+            ))),
+        },
+
+        Request::Logs {
+            action,
+            pane,
+            session_id,
+            lines,
+            enabled,
+            max_mb,
+            total_max_mb,
+        } => match action.as_str() {
+            "list" => {
+                let dir = tako_core::pane_log::log_dir().ok_or_else(|| {
+                    DispatchError::Operation("データディレクトリを解決できない".into())
+                })?;
+                let files: Vec<Value> = tako_core::pane_log::list_files(&dir)
+                    .into_iter()
+                    .map(|f| {
+                        json!({
+                            "path": f.path,
+                            "pane": f.pane,
+                            "tab": f.tab,
+                            "size": f.size,
+                            "modified": f.modified,
+                        })
+                    })
+                    .collect();
+                Ok(json!({ "dir": dir, "files": files }))
+            }
+            "read" => dispatch_logs_read(host, pane, session_id.as_deref(), lines),
+            "status" => {
+                let config = host.pane_log_config();
+                Ok(pane_log_status_json(&config))
+            }
+            "set" => {
+                let mut settings = crate::settings::load();
+                if let Some(e) = enabled {
+                    settings.pane_logs = e;
+                }
+                if let Some(m) = max_mb {
+                    if m == 0 {
+                        return Err(DispatchError::InvalidParams(
+                            "max_mb は 1 以上を指定する".into(),
+                        ));
+                    }
+                    settings.pane_log_max_mb = m;
+                }
+                if let Some(t) = total_max_mb {
+                    if t == 0 {
+                        return Err(DispatchError::InvalidParams(
+                            "total_max_mb は 1 以上を指定する".into(),
+                        ));
+                    }
+                    settings.pane_log_total_max_mb = t;
+                }
+                crate::settings::save(&settings)
+                    .map_err(|e| DispatchError::Operation(format!("設定の保存に失敗: {e}")))?;
+                let config = settings.pane_log_config();
+                host.apply_pane_log_config(config);
+                Ok(pane_log_status_json(&config))
+            }
+            other => Err(DispatchError::InvalidParams(format!(
+                "不明な action: {other:?}（list / read / status / set のいずれか）"
+            ))),
+        },
     }
+}
+
+/// ペインログ設定の状態ペイロード（status / set 共通）
+fn pane_log_status_json(config: &tako_core::pane_log::PaneLogConfig) -> Value {
+    json!({
+        "enabled": config.enabled,
+        "max_mb": config.max_bytes_per_pane / (1024 * 1024),
+        "total_max_mb": config.max_total_bytes / (1024 * 1024),
+        "dir": tako_core::pane_log::log_dir(),
+    })
+}
+
+/// `tako logs read` の対象ログファイルを解決して末尾を返す。
+/// 対象解決: `session_id`（カタログの log_file → 記録ペインの最新ファイル）→
+/// `pane`（ライブペインの現行ファイル → クローズ済みでもファイル名から検索）
+fn dispatch_logs_read(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    session_id: Option<&str>,
+    lines: Option<usize>,
+) -> Result<Value, DispatchError> {
+    let dir = tako_core::pane_log::log_dir()
+        .ok_or_else(|| DispatchError::Operation("データディレクトリを解決できない".into()))?;
+    let (path, resolved_pane) = if let Some(sid) = session_id {
+        let catalog = crate::sessions::SessionCatalog::load().map_err(DispatchError::Operation)?;
+        let (_, entry) = catalog.resolve_id(sid).map_err(DispatchError::Operation)?;
+        let from_entry = entry
+            .log_file
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_file());
+        let path = from_entry
+            .or_else(|| {
+                entry
+                    .pane
+                    .and_then(|p| tako_core::pane_log::latest_for_pane(&dir, p))
+            })
+            .ok_or_else(|| {
+                DispatchError::Operation(format!(
+                    "セッション '{}' の端末ログが見つからない（ログ保存が OFF だったか、上限で削除済み）",
+                    crate::sessions::short_id(sid)
+                ))
+            })?;
+        (path, entry.pane)
+    } else if let Some(p) = pane {
+        // ライブペインなら現行ファイル、無ければファイル名から検索（クローズ済み対応）
+        let path = host
+            .pane_log_file(PaneId::from_raw(p))
+            .filter(|f| f.is_file())
+            .or_else(|| tako_core::pane_log::latest_for_pane(&dir, p))
+            .ok_or_else(|| {
+                DispatchError::Operation(format!(
+                    "ペイン {p} のログが見つからない（ログ保存が OFF だったか、上限で削除済み）"
+                ))
+            })?;
+        (path, Some(p))
+    } else {
+        return Err(DispatchError::InvalidParams(
+            "read には pane または session_id が必要".into(),
+        ));
+    };
+    let max_lines = lines.unwrap_or(200).clamp(1, 100_000);
+    let content =
+        tako_core::pane_log::read_tail(&path, max_lines).map_err(DispatchError::Operation)?;
+    Ok(json!({
+        "path": path,
+        "pane": resolved_pane,
+        "lines": max_lines,
+        "content": content,
+    }))
+}
+
+/// セッションカタログからの会話復元（Issue #112 A）。
+/// 該当エントリの cwd でシェルペインを分割起動し、`claude --resume <session_id>` を
+/// 注入する（#30 の復元経路と同方式。Claude 終了後もシェルが残る）
+fn dispatch_sessions_resume(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    id_prefix: &str,
+    pane: Option<u64>,
+    tab: Option<u64>,
+    direction: Option<Direction>,
+) -> Result<Value, DispatchError> {
+    let catalog = crate::sessions::SessionCatalog::load().map_err(DispatchError::Operation)?;
+    let (session_id, entry) = catalog
+        .resolve_id(id_prefix)
+        .map_err(DispatchError::Operation)?;
+    let session_id = session_id.clone();
+    let entry = entry.clone();
+
+    // 会話ログ（claude transcript）の実在確認。無ければ resume は成立しない
+    if crate::transcript::find_transcript(&session_id).is_none() {
+        return Err(DispatchError::Operation(format!(
+            "セッション {} の会話ログ（~/.claude/projects/ の transcript）が見つからない。\
+             claude 側で削除された可能性がある",
+            crate::sessions::short_id(&session_id)
+        )));
+    }
+    let resume_cmd =
+        crate::sessions::resume_command(&session_id, &entry).map_err(DispatchError::Operation)?;
+
+    // 分割元の解決: pane > tab > 呼び出し元（resolve_pane の既定）
+    let (tab_id, target) = if let Some(tab_raw) = tab {
+        let tab_id = find_tab(host.workspace(), tab_raw)?;
+        let focused = host
+            .workspace()
+            .get_tab(tab_id)
+            .expect("find_tab で存在確認済み")
+            .tree()
+            .focused();
+        (tab_id, focused)
+    } else {
+        resolve_pane(host.workspace(), pane)?
+    };
+
+    let cwd = entry
+        .cwd
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_dir());
+    let new_pane = Pane::new(origin);
+    let new_id = new_pane.id();
+    tree_mut(host.workspace_mut(), tab_id)
+        .split_with_ratio(
+            target,
+            direction.unwrap_or(Direction::Right).to_core(),
+            0.5,
+            new_pane,
+        )
+        .map_err(op_err)?;
+    // フォーカスは分割元を維持（ユーザーの入力を奪わない。spawn と同方針）
+    let _ = tree_mut(host.workspace_mut(), tab_id).focus(target);
+    let options = SpawnOptions {
+        command: None,
+        cwd: cwd.clone(),
+        env: Vec::new(),
+    };
+    host.attach_session(new_id, options);
+    // シェル起動後に resume コマンドを注入する（attach は非同期のため遅延書き込み）
+    let mut cmd_bytes = resume_cmd.clone().into_bytes();
+    cmd_bytes.push(b'\r');
+    host.queue_write(new_id, cmd_bytes);
+
+    // タイトル・role をカタログのメタから復元する
+    let title = match (&entry.project, &entry.label) {
+        (Some(p), Some(l)) => Some(format!("{p}: {l}")),
+        (_, Some(l)) => Some(l.clone()),
+        (Some(p), None) => Some(format!("{p}-resumed")),
+        _ => None,
+    };
+    let role = match entry.kind.as_str() {
+        "worker" => {
+            let project = entry.project.as_deref().unwrap_or("resumed");
+            Some(match entry.label.as_deref() {
+                Some(l) => format!("orchestrator-worker:{project}:{l}"),
+                None => format!("orchestrator-worker:{project}"),
+            })
+        }
+        "master" => Some(match entry.profile.as_deref() {
+            Some(p) if p != "default" => format!("orchestrator-master:{p}"),
+            _ => "orchestrator-master".into(),
+        }),
+        "solo" => Some(match entry.profile.as_deref() {
+            Some(p) if p != "default" => format!("solo:{p}"),
+            _ => "solo".into(),
+        }),
+        _ => None,
+    };
+    let pane_obj = tree_mut(host.workspace_mut(), tab_id)
+        .get_mut(new_id)
+        .expect("直前に split で追加済み");
+    if title.is_some() {
+        pane_obj.set_title(title.clone());
+    }
+    pane_obj.set_role(role);
+
+    Ok(json!({
+        "pane": new_id.as_u64(),
+        "session_id": session_id,
+        "cwd": cwd,
+        "command": resume_cmd,
+        "title": title,
+    }))
 }
 
 // --- オーケストレーター dispatch ---
@@ -2654,6 +2943,31 @@ fn dispatch_orchestrator_spawn(
     pane_obj.set_role(Some(pane_role));
 
     let tmux_session = host.backend_session(new_id);
+
+    // セッションカタログへ spawn 記録を残す（Issue #112 A）。session_id は claude 起動後に
+    // GUI の定期スキャンが検出して昇格する。失敗してもカタログの都合で spawn は止めない
+    if let Some(ref ts) = tmux_session {
+        let issues =
+            crate::sessions::extract_issues(&format!("{} {prompt}", label.unwrap_or_default()));
+        let record = crate::sessions::PendingSpawn {
+            tmux_session: ts.clone(),
+            kind: "worker".into(),
+            label: label.map(str::to_string),
+            project: Some(project.to_string()),
+            agent: Some(worker_agent.as_str().to_string()),
+            model: launch.model.clone(),
+            effort: launch.effort.clone(),
+            issues,
+            prompt_head: Some(crate::sessions::prompt_head(prompt, 200)),
+            cwd: Some(cwd.clone()),
+            tab: Some(tab_id.as_u64()),
+            pane: Some(new_id.as_u64()),
+            recorded_at: crate::sessions::now_iso(),
+        };
+        if let Err(e) = crate::sessions::record_spawn(record) {
+            eprintln!("warning: セッションカタログへの spawn 記録に失敗: {e}");
+        }
+    }
 
     Ok(json!({
         "pane_id": new_id.as_u64(),

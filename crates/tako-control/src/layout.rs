@@ -167,6 +167,10 @@ pub struct PaneLayout {
     /// 消えていた場合だけ `claude --resume` へ渡す。旧ファイルは None で後方互換
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_session_id: Option<String>,
+    /// ペインログ（Issue #112 B）が取り込み済みの履歴行数。tako 停止中に tmux 側へ
+    /// 積もった出力を再起動後の差分として取り込むための基準値。旧ファイル後方互換
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logged_history: Option<u64>,
     /// プレビューペイン（FR-3.2 / FR-3.3）の表示内容。None = ターミナルペイン。
     /// 旧ファイルには無いので serde default で後方互換
     #[serde(default)]
@@ -198,6 +202,8 @@ pub struct PaneMeta {
     pub session: Option<String>,
     pub cwd: Option<String>,
     pub claude_session_id: Option<String>,
+    /// ペインログの取り込み済み履歴行数（Issue #112 B）
+    pub logged_history: Option<u64>,
     pub preview: Option<PreviewLayout>,
     /// Web ビューペインなら表示中の URL（FR-3.8 / #155）
     pub webview: Option<String>,
@@ -211,6 +217,8 @@ pub struct RestoredPane {
     pub cwd: Option<String>,
     /// tmux セッション消失時に復旧する Claude Code の session ID
     pub claude_session_id: Option<String>,
+    /// ペインログの取り込み済み履歴行数（Issue #112 B。再起動後の差分取り込み基準）
+    pub logged_history: Option<u64>,
     /// Some ならプレビューペインとして復元する（spawn しない）
     pub preview: Option<PreviewLayout>,
     /// Some なら Web ビューペインとして復元する（spawn しない。URL を開き直す）
@@ -260,6 +268,7 @@ pub fn capture(
                     origin: origin_str(pane.origin()).to_string(),
                     cwd: m.cwd,
                     claude_session_id: m.claude_session_id,
+                    logged_history: m.logged_history,
                     preview: m.preview,
                     webview: m.webview,
                     // 由来タブ（FR-2.15.6）。再起動後もタブ別分離表示を保つ
@@ -288,6 +297,7 @@ fn capture_node(node: &PaneNode, meta: &dyn Fn(PaneId) -> PaneMeta) -> NodeLayou
                 origin: origin_str(pane.origin()).to_string(),
                 cwd: m.cwd,
                 claude_session_id: m.claude_session_id,
+                logged_history: m.logged_history,
                 preview: m.preview,
                 webview: m.webview,
                 // tree 内のペインは退避ではないので由来タブを持たない
@@ -404,6 +414,7 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
             session: p.session.clone(),
             cwd: p.cwd.clone(),
             claude_session_id: p.claude_session_id.clone(),
+            logged_history: p.logged_history,
             preview: p.preview.clone(),
             webview: p.webview.clone(),
         });
@@ -442,6 +453,7 @@ fn restore_node(
                 session: p.session.clone(),
                 cwd: p.cwd.clone(),
                 claude_session_id: p.claude_session_id.clone(),
+                logged_history: p.logged_history,
                 preview: p.preview.clone(),
                 webview: p.webview.clone(),
             });
@@ -656,6 +668,7 @@ mod tests {
                 session: Some(format!("tako-s{}", pane.as_u64())),
                 cwd: Some("/tmp".into()),
                 claude_session_id: Some(format!("claude-session-{}", pane.as_u64())),
+                logged_history: None,
                 preview: Some(PreviewLayout {
                     path: format!("/tmp/p{}.md", pane.as_u64()),
                     mode: "markdown".into(),
@@ -873,6 +886,7 @@ mod tests {
                 origin: "user".into(),
                 cwd: None,
                 claude_session_id: None,
+                logged_history: None,
                 preview: None,
                 webview: None,
                 origin_tab: None,
@@ -928,6 +942,7 @@ mod tests {
             origin: "user".into(),
             cwd: None,
             claude_session_id: None,
+            logged_history: None,
             preview: None,
             webview: None,
             origin_tab: Some(1),

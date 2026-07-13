@@ -545,6 +545,48 @@ impl TerminalSession {
         self.term.lock().grid().history_size()
     }
 
+    /// スクロールバックの保持上限（ペインログの飽和判定用。Issue #112）
+    pub fn scrollback_limit(&self) -> usize {
+        SCROLLBACK_LINES
+    }
+
+    /// スクロールバック履歴の末尾から `skip_newest` 行飛ばして `count` 行を
+    /// 平文（装飾なし・古い→新しい順）で返す。ペインログ（Issue #112）の増分取り込み用。
+    /// 履歴が足りない分は取れた範囲だけ返す
+    pub fn history_plain_lines(&self, skip_newest: usize, count: usize) -> Vec<String> {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+
+        let term = self.term.lock();
+        let grid = term.grid();
+        let history = grid.history_size();
+        let available = history.saturating_sub(skip_newest);
+        let take = count.min(available);
+        if take == 0 {
+            return Vec::new();
+        }
+        let cols = grid.columns();
+        let mut out = Vec::with_capacity(take);
+        // 履歴行は負の Line 番号（-1 = 最新の履歴行）。古い側から順に読む
+        for offset in (skip_newest + 1..=skip_newest + take).rev() {
+            let line = Line(-(offset as i32));
+            let row = &grid[line];
+            let mut text = String::with_capacity(cols);
+            for col in 0..cols {
+                let cell = &row[Column(col)];
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                text.push(cell.c);
+            }
+            out.push(text.trim_end().to_string());
+        }
+        out
+    }
+
     /// スクロールバック表示を絶対位置へ動かす（0 = 最下部。history を超えると先頭へクランプ）。
     /// 行単位 API なので端数はリセットして整数位置へスナップする
     pub fn scroll_to(&self, offset: usize) {

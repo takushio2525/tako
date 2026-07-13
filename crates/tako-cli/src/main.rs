@@ -169,6 +169,12 @@ enum Command {
     /// 正本ファイルの内容を各エージェントのグローバル指示ファイルにマーカーブロックで埋め込む
     #[command(subcommand, name = "agents")]
     Agents(AgentsCommand),
+    /// セッションカタログの参照・復元（Issue #112。worker / master / solo の会話を発見して呼び戻す）
+    #[command(subcommand)]
+    Sessions(SessionsCommand),
+    /// ペインの平文ターミナルログの参照・設定（Issue #112。ペインが死んでも出力を遡る）
+    #[command(subcommand)]
+    Logs(LogsCommand),
     /// レイアウトの世代バックアップからの復旧（#177）。
     /// 引数なしで現在の layout.json とバックアップ世代の一覧を表示する。
     /// タブ・ペインが大量消失したときは tako を終了してから
@@ -354,6 +360,75 @@ enum TreeCommand {
         /// 対象タブ ID（省略時は呼び出し元ペインのタブ）
         #[arg(long)]
         tab: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionsCommand {
+    /// カタログの一覧（last_seen の新しい順）
+    List {
+        /// 種別で絞り込む: master / worker / solo / pane
+        #[arg(long)]
+        role: Option<String>,
+        /// プロジェクトで絞り込む
+        #[arg(long)]
+        project: Option<String>,
+        /// 最大表示件数（既定 30）
+        #[arg(long)]
+        limit: Option<usize>,
+        /// JSON で出力する
+        #[arg(long)]
+        json: bool,
+    },
+    /// セッションのメタ情報と会話冒頭を表示する
+    Show {
+        /// session_id（前方一致可）
+        id: String,
+    },
+    /// 会話を新しいペインで復元する（記録された cwd で claude --resume を起動）
+    Resume {
+        /// session_id（前方一致可）
+        id: String,
+        /// 分割元ペイン ID（省略時は呼び出し元ペイン）
+        #[arg(long)]
+        pane: Option<u64>,
+        /// 分割先タブ ID（そのタブのフォーカスペインの隣に開く）
+        #[arg(long)]
+        tab: Option<u64>,
+        /// 分割方向: right / down / left / up（省略時 right）
+        #[arg(long)]
+        direction: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LogsCommand {
+    /// ログファイルの一覧
+    List,
+    /// ログの末尾を表示する（クローズ済みペインも可）
+    Show {
+        /// ペイン ID
+        pane: Option<u64>,
+        /// セッション ID で引く（カタログ経由。前方一致可）
+        #[arg(long)]
+        session: Option<String>,
+        /// 表示行数（既定 200）
+        #[arg(long)]
+        lines: Option<usize>,
+    },
+    /// ログ保存の状態（ON/OFF・上限・保存先）
+    Status,
+    /// ログ保存の設定を変更する（設定は永続化）
+    Set {
+        /// 保存の ON/OFF
+        #[arg(long)]
+        enabled: Option<bool>,
+        /// ペインあたりの上限（MB）
+        #[arg(long = "max-mb")]
+        max_mb: Option<u64>,
+        /// ログ全体の上限（MB）
+        #[arg(long = "total-max-mb")]
+        total_max_mb: Option<u64>,
     },
 }
 
@@ -2786,6 +2861,103 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 pane: caller_pane(),
             },
         },
+        Command::Sessions(sub) => match sub {
+            SessionsCommand::List {
+                role,
+                project,
+                limit,
+                ..
+            } => Request::Sessions {
+                action: "list".to_string(),
+                id: None,
+                role: role.clone(),
+                project: project.clone(),
+                limit: *limit,
+                pane: None,
+                tab: None,
+                direction: None,
+            },
+            SessionsCommand::Show { id } => Request::Sessions {
+                action: "show".to_string(),
+                id: Some(id.clone()),
+                role: None,
+                project: None,
+                limit: None,
+                pane: None,
+                tab: None,
+                direction: None,
+            },
+            SessionsCommand::Resume {
+                id,
+                pane,
+                tab,
+                direction,
+            } => Request::Sessions {
+                action: "resume".to_string(),
+                id: Some(id.clone()),
+                role: None,
+                project: None,
+                limit: None,
+                pane: if tab.is_some() {
+                    None
+                } else {
+                    target_pane(*pane)?
+                },
+                tab: *tab,
+                direction: direction.as_deref().map(parse_direction).transpose()?,
+            },
+        },
+        Command::Logs(sub) => match sub {
+            LogsCommand::List => Request::Logs {
+                action: "list".to_string(),
+                pane: None,
+                session_id: None,
+                lines: None,
+                enabled: None,
+                max_mb: None,
+                total_max_mb: None,
+            },
+            LogsCommand::Show {
+                pane,
+                session,
+                lines,
+            } => Request::Logs {
+                action: "read".to_string(),
+                // セッション指定が無ければペイン（省略時は呼び出し元）のログを引く
+                pane: if session.is_some() {
+                    *pane
+                } else {
+                    target_pane(*pane)?
+                },
+                session_id: session.clone(),
+                lines: *lines,
+                enabled: None,
+                max_mb: None,
+                total_max_mb: None,
+            },
+            LogsCommand::Status => Request::Logs {
+                action: "status".to_string(),
+                pane: None,
+                session_id: None,
+                lines: None,
+                enabled: None,
+                max_mb: None,
+                total_max_mb: None,
+            },
+            LogsCommand::Set {
+                enabled,
+                max_mb,
+                total_max_mb,
+            } => Request::Logs {
+                action: "set".to_string(),
+                pane: None,
+                session_id: None,
+                lines: None,
+                enabled: *enabled,
+                max_mb: *max_mb,
+                total_max_mb: *total_max_mb,
+            },
+        },
         Command::Agents(_) => unreachable!("agents は run() を通らない"),
         Command::Recover(_) => unreachable!("recover は run() を通らない（ローカル処理）"),
     })
@@ -2864,6 +3036,62 @@ fn pretty_json(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_default()
 }
 
+/// `tako sessions list` の人間向け表示（1 セッション 1 行 + pending 節）
+fn print_sessions_list(result: &Value) {
+    let sessions = result["sessions"].as_array().cloned().unwrap_or_default();
+    if sessions.is_empty() {
+        println!("カタログにセッションが無い（claude ペインの検出後に記録される）");
+    }
+    for s in &sessions {
+        let issues = s["issues"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64())
+                    .map(|n| format!("#{n}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .filter(|t| !t.is_empty())
+            .map(|t| format!(" [{t}]"))
+            .unwrap_or_default();
+        let name = match (s["project"].as_str(), s["label"].as_str()) {
+            (Some(p), Some(l)) => format!("{p}: {l}"),
+            (_, Some(l)) => l.to_string(),
+            (Some(p), None) => p.to_string(),
+            _ => "-".into(),
+        };
+        let resumable = if s["resumable"].as_bool() == Some(true) {
+            ""
+        } else {
+            "（resume 不可）"
+        };
+        println!(
+            "{}  {}  {:6}  {}{}{}",
+            s["short_id"].as_str().unwrap_or("-"),
+            s["last_seen_at"].as_str().unwrap_or("-"),
+            s["kind"].as_str().unwrap_or("-"),
+            name,
+            issues,
+            resumable,
+        );
+    }
+    let pending = result["pending"].as_array().cloned().unwrap_or_default();
+    if !pending.is_empty() {
+        println!("--- session 未検出の spawn 記録（codex / agy・起動直後の claude）---");
+        for p in &pending {
+            println!(
+                "{}  {}  {}  {}",
+                p["recorded_at"].as_str().unwrap_or("-"),
+                p["agent"].as_str().unwrap_or("-"),
+                p["tmux_session"].as_str().unwrap_or("-"),
+                p["label"].as_str().or(p["project"].as_str()).unwrap_or("-"),
+            );
+        }
+    }
+    eprintln!("(resume: tako sessions resume <id> / 詳細: tako sessions show <id>)");
+}
+
 fn print_result(command: &Command, result: &Value) {
     match command {
         // 新ペイン ID をそのままスクリプトで使えるよう数値のみ出力する
@@ -2930,6 +3158,37 @@ fn print_result(command: &Command, result: &Value) {
         Command::Web(_) => println!("{}", pretty_json(result)),
         Command::Update(_) => println!("{}", pretty_json(result)),
         Command::Tree(_) => println!("{}", pretty_json(result)),
+        Command::Sessions(SessionsCommand::List { json, .. }) => {
+            if *json {
+                println!("{}", pretty_json(result));
+            } else {
+                print_sessions_list(result);
+            }
+        }
+        Command::Sessions(SessionsCommand::Show { .. }) => {
+            println!("{}", pretty_json(result));
+        }
+        Command::Sessions(SessionsCommand::Resume { .. }) => {
+            if let (Some(pane), Some(sid)) =
+                (result["pane"].as_u64(), result["session_id"].as_str())
+            {
+                eprintln!(
+                    "復元しました: ペイン {pane}（session {}…, cwd {}）",
+                    &sid[..sid.len().min(8)],
+                    result["cwd"].as_str().unwrap_or("-"),
+                );
+            }
+            println!("{result}");
+        }
+        Command::Logs(LogsCommand::Show { .. }) => {
+            if let Some(content) = result["content"].as_str() {
+                println!("{content}");
+            }
+            if let Some(path) = result["path"].as_str() {
+                eprintln!("[log] {path}");
+            }
+        }
+        Command::Logs(_) => println!("{}", pretty_json(result)),
         // remote は run() → print_result を通らない
         _ => {}
     }

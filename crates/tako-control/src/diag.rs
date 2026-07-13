@@ -84,7 +84,7 @@ fn append_log(path: Option<PathBuf>, msg: &str) {
 
 /// unix 秒 → `YYYY-MM-DDTHH:MM:SSZ`。外部クレート（chrono 等）を増やさないための
 /// 自前変換（civil_from_days アルゴリズム。うるう年対応・グレゴリオ暦）
-fn format_utc(secs: i64) -> String {
+pub(crate) fn format_utc(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let tod = secs.rem_euclid(86_400);
     let z = days + 719_468;
