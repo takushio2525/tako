@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// バイナリ埋め込みの setup changelog
 pub const CHANGES_YAML: &str = include_str!("../../../resources/setup/changes.yaml");
@@ -134,22 +134,49 @@ pub fn config_yaml_path() -> Result<PathBuf, String> {
 
 pub fn load_config() -> Result<SetupConfig, String> {
     let path = config_yaml_path()?;
+    load_config_from(&path)
+}
+
+/// パス指定版 load（テスト用に公開）。
+/// 不在は default、パース失敗は Err（default に丸めて後続 save で消さない。#169）
+pub fn load_config_from(path: &Path) -> Result<SetupConfig, String> {
     if !path.is_file() {
         return Ok(SetupConfig::default());
     }
     let content =
-        std::fs::read_to_string(&path).map_err(|e| format!("config.yaml の読み取りに失敗: {e}"))?;
+        std::fs::read_to_string(path).map_err(|e| format!("config.yaml の読み取りに失敗: {e}"))?;
     serde_yaml::from_str(&content).map_err(|e| format!("config.yaml のパースに失敗: {e}"))
 }
 
+/// 保存（アトミック書き込み + 世代バックアップ。#169）。
+/// 注意: `load_config()` → 変更 → `save_config()` の素朴な組み合わせは並行更新を
+/// 巻き戻す。更新は [`mutate_config`] を使うこと
 pub fn save_config(config: &SetupConfig) -> Result<(), String> {
     let path = config_yaml_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
-    }
     let content =
         serde_yaml::to_string(config).map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
-    std::fs::write(&path, content).map_err(|e| format!("config.yaml の書き込みに失敗: {e}"))
+    crate::config_io::atomic_write_with_backup(&path, &content)
+}
+
+/// ロック付き read-modify-write（#169）。
+/// パースに失敗した既存 config.yaml は上書きせず Err で中断する
+pub fn mutate_config<R>(f: impl FnOnce(&mut SetupConfig) -> R) -> Result<R, String> {
+    let path = config_yaml_path()?;
+    mutate_config_at(&path, f)
+}
+
+/// パス指定版 mutate（テスト用に公開）
+pub fn mutate_config_at<R>(
+    path: &Path,
+    f: impl FnOnce(&mut SetupConfig) -> R,
+) -> Result<R, String> {
+    let _lock = crate::config_io::lock_exclusive(path)?;
+    let mut config = load_config_from(path)?;
+    let result = f(&mut config);
+    let content =
+        serde_yaml::to_string(&config).map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
+    crate::config_io::atomic_write_with_backup(path, &content)?;
+    Ok(result)
 }
 
 // --- setup changelog（アップデート追従） ---
@@ -280,6 +307,49 @@ mod tests {
         // applied_revision 無し = 0（全変更が未適用扱い。Issue #94）
         assert_eq!(config.setup.applied_revision, 0);
         assert!(config.setup.applied_version.is_none());
+    }
+
+    /// #169 横展開: 破損 config.yaml への mutate は Err で中断しファイル不変
+    #[test]
+    fn issue_169_mutate_config_rejects_corrupted_yaml() {
+        let dir =
+            std::env::temp_dir().join(format!("tako-issue169-setup-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let corrupted = "setup:\n  completed: [broken";
+        std::fs::write(&path, corrupted).unwrap();
+
+        let result = mutate_config_at(&path, |c| c.setup.completed = true);
+        assert!(result.is_err(), "破損 config.yaml は default に丸めず Err");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            corrupted,
+            "破損ファイルは書き換えられない"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #169 横展開: mutate_config_at は既存フィールドを保持したまま部分更新する
+    #[test]
+    fn issue_169_mutate_config_preserves_other_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "tako-issue169-setup-preserve-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, "orchestrator:\n  auto_close: false\n").unwrap();
+
+        mutate_config_at(&path, |c| c.setup.completed = true).unwrap();
+        let after = load_config_from(&path).unwrap();
+        assert!(after.setup.completed, "変更したフィールドが反映される");
+        assert!(
+            !after.orchestrator.auto_close,
+            "無関係のフィールドは保持される"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

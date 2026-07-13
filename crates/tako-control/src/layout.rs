@@ -309,11 +309,21 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
         let (root, focused) = restore_node(&tab_layout.tree, tab_layout.focused, &mut restored)
             .ok_or(LayoutError::InvalidAxis)?;
         let tree = PaneTree::from_root(root, focused);
-        let pinned: Vec<PathBuf> = tab_layout
-            .pinned_folders
-            .iter()
-            .map(PathBuf::from)
-            .collect();
+        let pinned: Vec<PathBuf> = {
+            let mut seen = std::collections::HashSet::new();
+            tab_layout
+                .pinned_folders
+                .iter()
+                .map(PathBuf::from)
+                .filter_map(|p| {
+                    let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
+                    if !canon.is_dir() || !seen.insert(canon.clone()) {
+                        return None;
+                    }
+                    Some(canon)
+                })
+                .collect()
+        };
         let tab = Tab::restore(
             tab_layout.id,
             tab_layout.title.clone(),

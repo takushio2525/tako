@@ -1945,22 +1945,22 @@ fn dispatch_orchestrator_projects(
             let key = key.ok_or(DispatchError::InvalidParams("key を指定する".into()))?;
             let cwd = cwd.ok_or(DispatchError::InvalidParams("cwd を指定する".into()))?;
             orchestrator::ensure_defaults().map_err(DispatchError::Operation)?;
-            let mut config =
-                orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
-            config.add(key.clone(), cwd.clone(), description);
-            config.save().map_err(DispatchError::Operation)?;
+            // ロック付き read-modify-write（#169: 並行 add で他エントリを消さない）
+            orchestrator::ProjectsConfig::mutate(|config| {
+                config.add(key.clone(), cwd.clone(), description);
+            })
+            .map_err(DispatchError::Operation)?;
             Ok(json!({ "added": key, "cwd": cwd }))
         }
         "remove" => {
             let key = key.ok_or(DispatchError::InvalidParams("key を指定する".into()))?;
-            let mut config =
-                orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
-            if !config.remove(&key) {
+            let removed = orchestrator::ProjectsConfig::mutate(|config| config.remove(&key))
+                .map_err(DispatchError::Operation)?;
+            if !removed {
                 return Err(DispatchError::Operation(format!(
                     "プロジェクト '{key}' が見つからない"
                 )));
             }
-            config.save().map_err(DispatchError::Operation)?;
             Ok(json!({ "removed": key }))
         }
         _ => Err(DispatchError::InvalidParams(format!(
@@ -2098,69 +2098,76 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
             if let Some(a) = params.master_agent.as_deref() {
                 orchestrator::validate_master_agent(a).map_err(DispatchError::InvalidParams)?;
             }
-            let mut profile = orchestrator::Profile::load(&name).unwrap_or_default();
-            if let Some(a) = params.master_agent {
-                profile.master_agent = Some(a);
-            } else if params.clear_master_agent {
-                profile.master_agent = None;
-            }
-            if let Some(m) = params.model {
-                profile.model = Some(m);
-            } else if params.clear_model {
-                profile.model = None;
-            }
-            if let Some(m) = params.worker_model {
-                profile.worker_model = Some(m);
-            } else if params.clear_worker_model {
-                profile.worker_model = None;
-            }
-            if let Some(e) = params.effort {
-                profile.effort = e;
-            }
-            if let Some(e) = params.worker_effort {
-                profile.worker_effort = Some(e);
-            }
-            if let Some(a) = params.worker_agent {
-                profile.worker_agent = Some(a);
-            } else if params.clear_worker_agent {
-                profile.worker_agent = None;
-            }
-            if let Some(policy) = params.worker_model_policy {
-                profile.worker_model_policy = match policy.as_str() {
-                    "inherit" => orchestrator::WorkerModelPolicy::Inherit,
-                    "delegate" => orchestrator::WorkerModelPolicy::Delegate,
-                    "fixed" => orchestrator::WorkerModelPolicy::Fixed,
-                    _ => {
-                        return Err(DispatchError::InvalidParams(format!(
-                            "worker_model_policy が不正: '{policy}'（inherit / delegate / fixed）"
-                        )));
+            // worker_model_policy は mutate 閉包内から early return できないため事前に解析
+            let policy = match params.worker_model_policy.as_deref() {
+                Some("inherit") => Some(orchestrator::WorkerModelPolicy::Inherit),
+                Some("delegate") => Some(orchestrator::WorkerModelPolicy::Delegate),
+                Some("fixed") => Some(orchestrator::WorkerModelPolicy::Fixed),
+                Some(p) => {
+                    return Err(DispatchError::InvalidParams(format!(
+                        "worker_model_policy が不正: '{p}'（inherit / delegate / fixed）"
+                    )));
+                }
+                None => None,
+            };
+            // ロック付き read-modify-write（#169）。パースできない既存プロファイルを
+            // default に丸めて上書き保存すると設定が消えるため、Err で中断する
+            let (path, profile) = orchestrator::Profile::mutate_named(&name, |profile| {
+                if let Some(a) = params.master_agent {
+                    profile.master_agent = Some(a);
+                } else if params.clear_master_agent {
+                    profile.master_agent = None;
+                }
+                if let Some(m) = params.model {
+                    profile.model = Some(m);
+                } else if params.clear_model {
+                    profile.model = None;
+                }
+                if let Some(m) = params.worker_model {
+                    profile.worker_model = Some(m);
+                } else if params.clear_worker_model {
+                    profile.worker_model = None;
+                }
+                if let Some(e) = params.effort {
+                    profile.effort = e;
+                }
+                if let Some(e) = params.worker_effort {
+                    profile.worker_effort = Some(e);
+                }
+                if let Some(a) = params.worker_agent {
+                    profile.worker_agent = Some(a);
+                } else if params.clear_worker_agent {
+                    profile.worker_agent = None;
+                }
+                if let Some(policy) = policy {
+                    profile.worker_model_policy = policy;
+                }
+                if let Some(agent_name) = params.agent {
+                    let cfg = profile.worker_agents.entry(agent_name).or_default();
+                    if let Some(m) = params.agent_model {
+                        cfg.model = Some(m);
+                    } else if params.clear_agent_model {
+                        cfg.model = None;
                     }
-                };
-            }
-            if let Some(agent_name) = params.agent {
-                let cfg = profile.worker_agents.entry(agent_name).or_default();
-                if let Some(m) = params.agent_model {
-                    cfg.model = Some(m);
-                } else if params.clear_agent_model {
-                    cfg.model = None;
+                    if let Some(e) = params.agent_effort {
+                        cfg.effort = Some(e);
+                    } else if params.clear_agent_effort {
+                        cfg.effort = None;
+                    }
+                    if let Some(s) = params.agent_skip_permissions {
+                        cfg.skip_permissions = s;
+                    }
+                    if let Some(a) = params.agent_args {
+                        cfg.args = a;
+                    }
                 }
-                if let Some(e) = params.agent_effort {
-                    cfg.effort = Some(e);
-                } else if params.clear_agent_effort {
-                    cfg.effort = None;
-                }
-                if let Some(s) = params.agent_skip_permissions {
-                    cfg.skip_permissions = s;
-                }
-                if let Some(a) = params.agent_args {
-                    cfg.args = a;
-                }
-            }
-            // 既定値のみになったエントリは掃除する（YAML を汚さない）
-            profile
-                .worker_agents
-                .retain(|_, c| *c != orchestrator::AgentWorkerConfig::default());
-            let path = profile.save(&name).map_err(DispatchError::Operation)?;
+                // 既定値のみになったエントリは掃除する（YAML を汚さない）
+                profile
+                    .worker_agents
+                    .retain(|_, c| *c != orchestrator::AgentWorkerConfig::default());
+                profile.clone()
+            })
+            .map_err(DispatchError::Operation)?;
             let mut result = profile_to_json(&name, &profile);
             result["path"] = json!(path.display().to_string());
             // [1m] は Max / API プラン限定 → 明示 opt-in は許容しつつ警告を返す
@@ -2224,40 +2231,55 @@ fn spawn_tmux_delivery(session: String, text: String, wait_ready: bool) {
     });
 }
 
-#[allow(clippy::too_many_arguments)]
 /// spawn レイアウト設定の取得・変更（Issue #165）。host 非依存（config.yaml の読み書きのみ）
 /// のため pub にし、CLI `tako orchestrator layout` からもローカル呼び出しで共用する
 /// （二重実装を作らない。#83 の教訓）。
-/// 全パラメータ None = 取得、いずれか Some = 検証して更新。応答は解決済みの現在値
+/// 全パラメータ None = 取得、いずれか Some = 検証して更新。更新はロック付き
+/// read-modify-write（#169。並行する他プロセスの設定更新を巻き戻さない）。
+/// 応答は解決済みの現在値
 pub fn dispatch_orchestrator_layout(
     policy: Option<&str>,
     master_ratio: Option<f32>,
     algorithm: Option<&str>,
 ) -> Result<Value, DispatchError> {
-    let mut config = crate::setup::load_config().map_err(DispatchError::Operation)?;
-    let changed = policy.is_some() || master_ratio.is_some() || algorithm.is_some();
-    if let Some(p) = policy {
-        let parsed =
-            tako_core::SpawnLayoutPolicy::parse(p).map_err(DispatchError::InvalidParams)?;
-        config.spawn_layout.policy = Some(parsed.as_str().to_string());
-    }
+    // 検証は書き込み前に完了させる（不正値ではロックを取らない）
+    let policy = policy
+        .map(tako_core::SpawnLayoutPolicy::parse)
+        .transpose()
+        .map_err(DispatchError::InvalidParams)?;
     if let Some(r) = master_ratio {
         if !r.is_finite() || !(0.1..=0.9).contains(&r) {
             return Err(DispatchError::InvalidParams(format!(
                 "master_ratio は 0.1〜0.9 で指定してください（指定値: {r}）"
             )));
         }
-        config.spawn_layout.master_ratio = Some(r);
     }
-    if let Some(a) = algorithm {
-        let parsed =
-            tako_core::WorkerLayoutAlgorithm::parse(a).map_err(DispatchError::InvalidParams)?;
-        config.spawn_layout.algorithm = Some(parsed.as_str().to_string());
-    }
-    if changed {
-        crate::setup::save_config(&config).map_err(DispatchError::Operation)?;
-    }
-    let resolved = config.spawn_layout.resolve();
+    let algorithm = algorithm
+        .map(tako_core::WorkerLayoutAlgorithm::parse)
+        .transpose()
+        .map_err(DispatchError::InvalidParams)?;
+
+    let changed = policy.is_some() || master_ratio.is_some() || algorithm.is_some();
+    let resolved = if changed {
+        crate::setup::mutate_config(|config| {
+            if let Some(p) = policy {
+                config.spawn_layout.policy = Some(p.as_str().to_string());
+            }
+            if let Some(r) = master_ratio {
+                config.spawn_layout.master_ratio = Some(r);
+            }
+            if let Some(a) = algorithm {
+                config.spawn_layout.algorithm = Some(a.as_str().to_string());
+            }
+            config.spawn_layout.resolve()
+        })
+        .map_err(DispatchError::Operation)?
+    } else {
+        crate::setup::load_config()
+            .map_err(DispatchError::Operation)?
+            .spawn_layout
+            .resolve()
+    };
     // f32 → f64 の昇格ノイズ（0.6 → 0.6000000238…）を応答から除く
     let ratio = (f64::from(resolved.master_ratio) * 1000.0).round() / 1000.0;
     Ok(json!({
@@ -3256,6 +3278,10 @@ fn dispatch_tree_folder(
             Ok(json!({ "status": "removed", "path": canonical.display().to_string() }))
         }
         "list" => {
+            // 実体が消えたエントリを自動除去してから返す（#171）
+            if let Some(tab_mut) = host.workspace_mut().get_tab_mut(tab_id) {
+                tab_mut.prune_dead_folders();
+            }
             let tab_ref = host
                 .workspace()
                 .get_tab(tab_id)
@@ -4503,13 +4529,21 @@ mod tests {
     /// 追加・削除すると解決失敗のレースが起きるため（#120 でテストが増えて顕在化）
     static TEST_PROJECT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// テスト用に一時プロジェクトを projects.yaml に追加し、テスト後に削除する
+    /// テスト用に一時プロジェクトを projects.yaml に追加し、テスト後に削除する。
+    /// config_dir を隔離ディレクトリへ差し替え、実運用の projects.yaml と
+    /// その世代バックアップには絶対に触らない（#169）
     fn with_test_project<F: FnOnce()>(f: F) {
         use crate::orchestrator;
         // panic したテストの poison は無視して続行する（後続テストを巻き込まない）
         let _guard = TEST_PROJECT_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        orchestrator::test_config_dir_override().get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("tako-dispatch-test-config-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        });
         let _ = orchestrator::ensure_defaults();
         let key = "_tako_test_109_";
         let mut config = orchestrator::ProjectsConfig::load().unwrap();
@@ -4942,5 +4976,162 @@ mod tests {
             PaneOrigin::Cli,
         );
         assert!(result.is_err());
+    }
+
+    // --- #171: 重複排除・プルーニング ---
+
+    #[test]
+    fn tree_folder_symlink経由の重複追加は1エントリに畳まれる() {
+        // macOS: /tmp は /private/tmp へのシンボリックリンク
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+
+        // /tmp で追加（canonicalize → /private/tmp）
+        let r1 = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "add".into(),
+                path: Some("/tmp".into()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(r1["status"], "added");
+
+        // /private/tmp で追加（同じ正規パス → already_exists）
+        let r2 = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "add".into(),
+                path: Some("/private/tmp".into()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(r2["status"], "already_exists");
+
+        // list は 1 件
+        let list = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "list".into(),
+                path: None,
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(list["folders"].as_array().unwrap().len(), 1);
+
+        // 表示名は basename（/private/tmp の file_name = "tmp"）
+        let folder_path = list["folders"][0].as_str().unwrap();
+        let basename = std::path::Path::new(folder_path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        assert_eq!(basename, "tmp");
+    }
+
+    #[test]
+    fn tree_folder_symlink経由でも削除できる() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+
+        // /tmp で追加
+        dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "add".into(),
+                path: Some("/tmp".into()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        // /private/tmp で削除（同じ正規パスなので成功する）
+        let removed = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "remove".into(),
+                path: Some("/private/tmp".into()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(removed["status"], "removed");
+
+        let list = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "list".into(),
+                path: None,
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(list["folders"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn tree_folder_実体消失エントリはlistで自動プルーニングされる() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+
+        // 一時ディレクトリを作って追加
+        let tmp = std::env::temp_dir().join("tako_test_prune_171");
+        std::fs::create_dir_all(&tmp).unwrap();
+        dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "add".into(),
+                path: Some(tmp.display().to_string()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        // 追加されたことを確認
+        let list = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "list".into(),
+                path: None,
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(list["folders"].as_array().unwrap().len(), 1);
+
+        // ディレクトリを削除
+        std::fs::remove_dir_all(&tmp).unwrap();
+
+        // list で自動プルーニング → 0 件に
+        let list2 = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "list".into(),
+                path: None,
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(list2["folders"].as_array().unwrap().len(), 0);
     }
 }
