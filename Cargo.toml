@@ -59,13 +59,16 @@ image = "0.25"
 rust-embed = "8"
 pathdiff = "0.2"
 serde_yaml = "0.9"
-# GPUI は zed リポの git rev 固定（自動更新しない。追従は意識的なタスク。.agent/architecture.md）
-# CDP ミラー方式 Web ビュー PoC: Chrome DevTools Protocol 通信用の同期 WebSocket
+# Web ビューペイン（FR-3.8）: OS ネイティブ webview（macOS = WKWebView / Windows = WebView2）を
+# GPUI ウィンドウの子ビューとして統合する。Apache-2.0 OR MIT。追加ランタイム同梱不要（NFR-3/7）
+wry = { version = "0.55", default-features = false, features = ["os-webview"] }
+# GPUI ウィンドウから wry へ渡す親ウィンドウハンドル（gpui と同じ 0.6 系）
+raw-window-handle = "0.6"
+# リモート接続の WS 画面プッシュ（tako-control::remote）
 tungstenite = "0.26"
-# CDP の Page.captureScreenshot が返す base64 PNG のデコード
-data-encoding = "2"
-# CDP 接続先 URL の取得（http://localhost:9222/json の GET）
+# アプリ内更新の GitHub Releases チェック（tako-app::update_checker）
 ureq = "3"
+# GPUI は zed リポの git rev 固定（自動更新しない。追従は意識的なタスク。.agent/architecture.md）
 gpui = { git = "https://github.com/zed-industries/zed", rev = "cafbf4b5df7fedb67fc0f248850a5654efcec5d9" }
 # font-kit feature 必須: 無いとテキストシステムがスタブ化し文字が一切描画されない（poc/README.md）
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cafbf4b5df7fedb67fc0f248850a5654efcec5d9", features = ["font-kit"] }

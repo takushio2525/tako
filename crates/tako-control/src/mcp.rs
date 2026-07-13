@@ -1151,23 +1151,40 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
-            "name": "tako_chrome_open",
-            "description": "URL を Chrome CDP ミラー方式で Web ビューペインとして開く（FR-3.8 PoC）。\
-                Chrome を --remote-debugging-port 付きで起動し、ページのスクリーンショットを \
-                ペインにミラー表示する。ペイン内のクリックは Chrome に中継される。\
-                dev サーバーのプレビュー表示やドキュメント参照に使う。",
+            "name": "tako_web",
+            "description": "ネイティブ Web ビューペインの操作（FR-3.8）。macOS の WKWebView を \
+                ペインとして表示し、ユーザーはクリック・スクロール・文字入力を直接行える。\
+                dev サーバーのプレビュー表示・ドキュメント提示・成果物の URL 提示に使う。\
+                ペインから外しても（hide）ページは dock に生きたまま維持され、show で呼び戻せる。\
+                action: open = url を新規ペインで開く / list = 一覧（id・URL・タイトル・表示中ペイン）/ \
+                show = dock から id をペインへ呼び出す / hide = ペインから外して dock へ退避 / \
+                close = 完全破棄 / navigate = to（back・forward・reload・URL）でページ遷移 / \
+                eval = js を非同期評価して token を返す / eval_result = token の結果回収 \
+                （eval 発行後 200ms 程度おいて呼ぶ。pending: true なら再試行）/ \
+                read = URL・タイトル・読み込み状態の取得。\
+                ページ内の操作（クリック・入力・スクロール・テキスト取得）は eval の JS で行う \
+                （例: document.querySelector('button').click()）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "url": { "type": "string", "description": "開く URL（必須）" },
-                    "pane": pane_schema("基準ペイン ID（省略時は呼び出し元。この隣に Web ビューペインを分割する）"),
+                    "action": {
+                        "type": "string",
+                        "enum": ["open", "list", "show", "hide", "close", "navigate", "eval", "eval_result", "read"],
+                        "description": "実行する操作（必須）",
+                    },
+                    "url": { "type": "string", "description": "open: 開く URL（必須）" },
+                    "id": { "type": "integer", "description": "対象 Web ビュー ID（list で確認。show では必須）" },
+                    "pane": pane_schema("open / show: 分割の基準ペイン ID（省略時は呼び出し元）。その他: 対象 Web ビューが表示中のペイン ID"),
                     "direction": {
                         "type": "string",
                         "enum": ["right", "down", "left", "up"],
-                        "description": "分割方向（省略時は右）",
+                        "description": "open / show: 分割方向（省略時は右）",
                     },
+                    "to": { "type": "string", "description": "navigate: back / forward / reload / URL（必須）" },
+                    "js": { "type": "string", "description": "eval: 実行する JavaScript（必須）" },
+                    "token": { "type": "integer", "description": "eval_result: eval が返した token（必須）" },
                 },
-                "required": ["url"],
+                "required": ["action"],
                 "additionalProperties": false,
             },
         }),
@@ -1732,11 +1749,27 @@ fn build_request(
                 .to_string(),
             lines: u64_arg(args, "lines")?.map(|n| n as u32),
         },
-        "tako_chrome_open" => Request::ChromeOpen {
-            url: str_arg(args, "url")?.ok_or("url は必須")?.to_string(),
-            pane: u64_arg(args, "pane")?.or(caller),
-            direction: direction_arg(args)?,
-        },
+        "tako_web" => {
+            let action = str_arg(args, "action")?
+                .ok_or("action は必須")?
+                .to_string();
+            // 分割系（open / show）だけ、基準ペイン省略時に呼び出し元を分割元とする。
+            // 対象指定系で caller を埋めると「AI 自身のペイン」を対象と誤解するため埋めない
+            let pane = match action.as_str() {
+                "open" | "show" => u64_arg(args, "pane")?.or(caller),
+                _ => u64_arg(args, "pane")?,
+            };
+            Request::Web {
+                action,
+                url: str_arg(args, "url")?.map(|s| s.to_string()),
+                id: u64_arg(args, "id")?,
+                pane,
+                direction: direction_arg(args)?,
+                to: str_arg(args, "to")?.map(|s| s.to_string()),
+                js: str_arg(args, "js")?.map(|s| s.to_string()),
+                token: u64_arg(args, "token")?,
+            }
+        }
         "tako_update" => Request::Update {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
         },
@@ -2505,52 +2538,60 @@ mod tests {
     }
 
     #[test]
-    fn chrome_openはurl必須でdirectionを解釈する() {
+    fn webはactionごとにcaller既定を使い分ける() {
+        // open: pane 省略 → caller が分割元になる
         let (_, requests) = run(
             call(
-                "tako_chrome_open",
-                json!({ "url": "http://localhost:3000" }),
+                "tako_web",
+                json!({ "action": "open", "url": "http://localhost:3000" }),
             ),
             Some(5),
             true,
         );
         assert_eq!(
             requests,
-            vec![Request::ChromeOpen {
-                url: "http://localhost:3000".into(),
+            vec![Request::Web {
+                action: "open".into(),
+                url: Some("http://localhost:3000".into()),
+                id: None,
                 pane: Some(5),
                 direction: None,
+                to: None,
+                js: None,
+                token: None,
             }]
         );
-        // direction 指定
+        // navigate: pane 省略でも caller を埋めない（対象は表示中 Web ビューの自動解決）
         let (_, requests) = run(
-            call(
-                "tako_chrome_open",
-                json!({ "url": "http://localhost:3000", "direction": "down" }),
-            ),
+            call("tako_web", json!({ "action": "navigate", "to": "reload" })),
             Some(5),
             true,
         );
         assert_eq!(
             requests,
-            vec![Request::ChromeOpen {
-                url: "http://localhost:3000".into(),
-                pane: Some(5),
-                direction: Some(Direction::Down),
+            vec![Request::Web {
+                action: "navigate".into(),
+                url: None,
+                id: None,
+                pane: None,
+                direction: None,
+                to: Some("reload".into()),
+                js: None,
+                token: None,
             }]
         );
-        // url 欠落はエラー
-        let (response, requests) = run(call("tako_chrome_open", json!({})), Some(5), true);
+        // action 欠落はエラー
+        let (response, requests) = run(call("tako_web", json!({})), Some(5), true);
         assert!(requests.is_empty());
         assert!(response.unwrap()["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("url"));
+            .contains("action"));
         // 不正な direction はエラー
         let (response, requests) = run(
             call(
-                "tako_chrome_open",
-                json!({ "url": "http://localhost:3000", "direction": "diagonal" }),
+                "tako_web",
+                json!({ "action": "open", "url": "http://localhost:3000", "direction": "diagonal" }),
             ),
             Some(5),
             true,
