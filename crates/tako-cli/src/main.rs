@@ -1622,18 +1622,18 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
             description,
         } => {
             orchestrator::ensure_defaults()?;
-            let mut config = orchestrator::ProjectsConfig::load()?;
-            config.add(key.clone(), cwd.clone(), description.clone());
-            config.save()?;
+            // ロック付き read-modify-write（#169: 並行 add で他エントリを消さない）
+            orchestrator::ProjectsConfig::mutate(|config| {
+                config.add(key.clone(), cwd.clone(), description.clone());
+            })?;
             eprintln!("追加しました: {key} → {cwd}");
             Ok(())
         }
         ProjectsCommand::Remove { key } => {
-            let mut config = orchestrator::ProjectsConfig::load()?;
-            if !config.remove(key) {
+            let removed = orchestrator::ProjectsConfig::mutate(|config| config.remove(key))?;
+            if !removed {
                 return Err(format!("プロジェクト '{key}' が見つかりません"));
             }
-            config.save()?;
             eprintln!("削除しました: {key}");
             Ok(())
         }

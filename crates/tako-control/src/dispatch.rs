@@ -1924,22 +1924,22 @@ fn dispatch_orchestrator_projects(
             let key = key.ok_or(DispatchError::InvalidParams("key を指定する".into()))?;
             let cwd = cwd.ok_or(DispatchError::InvalidParams("cwd を指定する".into()))?;
             orchestrator::ensure_defaults().map_err(DispatchError::Operation)?;
-            let mut config =
-                orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
-            config.add(key.clone(), cwd.clone(), description);
-            config.save().map_err(DispatchError::Operation)?;
+            // ロック付き read-modify-write（#169: 並行 add で他エントリを消さない）
+            orchestrator::ProjectsConfig::mutate(|config| {
+                config.add(key.clone(), cwd.clone(), description);
+            })
+            .map_err(DispatchError::Operation)?;
             Ok(json!({ "added": key, "cwd": cwd }))
         }
         "remove" => {
             let key = key.ok_or(DispatchError::InvalidParams("key を指定する".into()))?;
-            let mut config =
-                orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
-            if !config.remove(&key) {
+            let removed = orchestrator::ProjectsConfig::mutate(|config| config.remove(&key))
+                .map_err(DispatchError::Operation)?;
+            if !removed {
                 return Err(DispatchError::Operation(format!(
                     "プロジェクト '{key}' が見つからない"
                 )));
             }
-            config.save().map_err(DispatchError::Operation)?;
             Ok(json!({ "removed": key }))
         }
         _ => Err(DispatchError::InvalidParams(format!(
@@ -2077,69 +2077,76 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
             if let Some(a) = params.master_agent.as_deref() {
                 orchestrator::validate_master_agent(a).map_err(DispatchError::InvalidParams)?;
             }
-            let mut profile = orchestrator::Profile::load(&name).unwrap_or_default();
-            if let Some(a) = params.master_agent {
-                profile.master_agent = Some(a);
-            } else if params.clear_master_agent {
-                profile.master_agent = None;
-            }
-            if let Some(m) = params.model {
-                profile.model = Some(m);
-            } else if params.clear_model {
-                profile.model = None;
-            }
-            if let Some(m) = params.worker_model {
-                profile.worker_model = Some(m);
-            } else if params.clear_worker_model {
-                profile.worker_model = None;
-            }
-            if let Some(e) = params.effort {
-                profile.effort = e;
-            }
-            if let Some(e) = params.worker_effort {
-                profile.worker_effort = Some(e);
-            }
-            if let Some(a) = params.worker_agent {
-                profile.worker_agent = Some(a);
-            } else if params.clear_worker_agent {
-                profile.worker_agent = None;
-            }
-            if let Some(policy) = params.worker_model_policy {
-                profile.worker_model_policy = match policy.as_str() {
-                    "inherit" => orchestrator::WorkerModelPolicy::Inherit,
-                    "delegate" => orchestrator::WorkerModelPolicy::Delegate,
-                    "fixed" => orchestrator::WorkerModelPolicy::Fixed,
-                    _ => {
-                        return Err(DispatchError::InvalidParams(format!(
-                            "worker_model_policy が不正: '{policy}'（inherit / delegate / fixed）"
-                        )));
+            // worker_model_policy は mutate 閉包内から early return できないため事前に解析
+            let policy = match params.worker_model_policy.as_deref() {
+                Some("inherit") => Some(orchestrator::WorkerModelPolicy::Inherit),
+                Some("delegate") => Some(orchestrator::WorkerModelPolicy::Delegate),
+                Some("fixed") => Some(orchestrator::WorkerModelPolicy::Fixed),
+                Some(p) => {
+                    return Err(DispatchError::InvalidParams(format!(
+                        "worker_model_policy が不正: '{p}'（inherit / delegate / fixed）"
+                    )));
+                }
+                None => None,
+            };
+            // ロック付き read-modify-write（#169）。パースできない既存プロファイルを
+            // default に丸めて上書き保存すると設定が消えるため、Err で中断する
+            let (path, profile) = orchestrator::Profile::mutate_named(&name, |profile| {
+                if let Some(a) = params.master_agent {
+                    profile.master_agent = Some(a);
+                } else if params.clear_master_agent {
+                    profile.master_agent = None;
+                }
+                if let Some(m) = params.model {
+                    profile.model = Some(m);
+                } else if params.clear_model {
+                    profile.model = None;
+                }
+                if let Some(m) = params.worker_model {
+                    profile.worker_model = Some(m);
+                } else if params.clear_worker_model {
+                    profile.worker_model = None;
+                }
+                if let Some(e) = params.effort {
+                    profile.effort = e;
+                }
+                if let Some(e) = params.worker_effort {
+                    profile.worker_effort = Some(e);
+                }
+                if let Some(a) = params.worker_agent {
+                    profile.worker_agent = Some(a);
+                } else if params.clear_worker_agent {
+                    profile.worker_agent = None;
+                }
+                if let Some(policy) = policy {
+                    profile.worker_model_policy = policy;
+                }
+                if let Some(agent_name) = params.agent {
+                    let cfg = profile.worker_agents.entry(agent_name).or_default();
+                    if let Some(m) = params.agent_model {
+                        cfg.model = Some(m);
+                    } else if params.clear_agent_model {
+                        cfg.model = None;
                     }
-                };
-            }
-            if let Some(agent_name) = params.agent {
-                let cfg = profile.worker_agents.entry(agent_name).or_default();
-                if let Some(m) = params.agent_model {
-                    cfg.model = Some(m);
-                } else if params.clear_agent_model {
-                    cfg.model = None;
+                    if let Some(e) = params.agent_effort {
+                        cfg.effort = Some(e);
+                    } else if params.clear_agent_effort {
+                        cfg.effort = None;
+                    }
+                    if let Some(s) = params.agent_skip_permissions {
+                        cfg.skip_permissions = s;
+                    }
+                    if let Some(a) = params.agent_args {
+                        cfg.args = a;
+                    }
                 }
-                if let Some(e) = params.agent_effort {
-                    cfg.effort = Some(e);
-                } else if params.clear_agent_effort {
-                    cfg.effort = None;
-                }
-                if let Some(s) = params.agent_skip_permissions {
-                    cfg.skip_permissions = s;
-                }
-                if let Some(a) = params.agent_args {
-                    cfg.args = a;
-                }
-            }
-            // 既定値のみになったエントリは掃除する（YAML を汚さない）
-            profile
-                .worker_agents
-                .retain(|_, c| *c != orchestrator::AgentWorkerConfig::default());
-            let path = profile.save(&name).map_err(DispatchError::Operation)?;
+                // 既定値のみになったエントリは掃除する（YAML を汚さない）
+                profile
+                    .worker_agents
+                    .retain(|_, c| *c != orchestrator::AgentWorkerConfig::default());
+                profile.clone()
+            })
+            .map_err(DispatchError::Operation)?;
             let mut result = profile_to_json(&name, &profile);
             result["path"] = json!(path.display().to_string());
             // [1m] は Max / API プラン限定 → 明示 opt-in は許容しつつ警告を返す
@@ -4438,13 +4445,21 @@ mod tests {
     /// 追加・削除すると解決失敗のレースが起きるため（#120 でテストが増えて顕在化）
     static TEST_PROJECT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// テスト用に一時プロジェクトを projects.yaml に追加し、テスト後に削除する
+    /// テスト用に一時プロジェクトを projects.yaml に追加し、テスト後に削除する。
+    /// config_dir を隔離ディレクトリへ差し替え、実運用の projects.yaml と
+    /// その世代バックアップには絶対に触らない（#169）
     fn with_test_project<F: FnOnce()>(f: F) {
         use crate::orchestrator;
         // panic したテストの poison は無視して続行する（後続テストを巻き込まない）
         let _guard = TEST_PROJECT_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        orchestrator::test_config_dir_override().get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("tako-dispatch-test-config-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        });
         let _ = orchestrator::ensure_defaults();
         let key = "_tako_test_109_";
         let mut config = orchestrator::ProjectsConfig::load().unwrap();

@@ -615,3 +615,11 @@
   dry-run bump 判定を実機検証、bash 3.2 の変数名境界バグも修正
 - 関連: `98b17ea`（リリース）/ PR #170 squash merge（`1c2c48a`）、Issue #166 クローズ
 - 次: 明朝 5:00 の初回 launchd 実行で v0.4.1 自動リリースの通し検証
+
+## 2026-07-13（#169: projects.yaml 並行 add 全消失の根治 — config_io 新設）
+- 根本原因を実証テストで確定: ①旧 save = fs::write の truncate→write 窓 ②serde_yaml が
+  空 / 部分 YAML を「0 件」で成功パース ③RMW のプロセス間直列化なし、の三段連鎖。
+  新設 `config_io`（アトミック書き込み + `<path>.lock` flock + .bak.1〜3 世代バックアップ）へ
+  projects.yaml / profiles/*.yaml / config.yaml の書き込みを集約、mutate 系 API で fail-loud 化
+- 検証: 507 tests / fmt / clippy 全緑 + 実機 before/after（修正前 = 並行 add 60 件で 48 件消失、
+  修正後 = 118/118 全件残存・破損 YAML 拒否・bak 復元成功。隔離 HOME）
