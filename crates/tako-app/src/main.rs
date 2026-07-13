@@ -754,6 +754,8 @@ struct TakoApp {
     pending_close_confirm: Option<CloseConfirmTarget>,
     /// スリープ防止のアサーションが現在保持中か（ステータスバー表示用。ポーリングで更新）
     sleep_guard_active: bool,
+    /// 起動時に orphan 自動復帰した tmux セッション数（Issue #191。診断用）
+    recovered_count: usize,
 }
 
 /// × ボタン close の確認ダイアログ対象（Issue #172）
@@ -1494,6 +1496,7 @@ impl TakoApp {
             confirm_close: tako_control::setup::confirm_close_enabled(),
             pending_close_confirm: None,
             sleep_guard_active: false,
+            recovered_count: 0,
         };
         // App Nap 無効化 + 初回スリープ防止更新（Issue #173）
         tako_control::sleep_guard::disable_app_nap();
@@ -1663,6 +1666,23 @@ impl TakoApp {
         // Web ビュー dock の退避分（ペイン無し）も初回 render で開き直す（#155）
         for url in webview_dock_restore {
             app.pending_webview_restore.push((None, url));
+        }
+
+        // Issue #191: layout.json に載っていない生存中の tmux セッション（orphan）を
+        // 自動復帰する。kill -9 直前の spawn や crash で layout 保存が間に合わなかった
+        // セッションを拾い、「復帰」タブにまとめて配置する。
+        // セカンダリモード・persist OFF・tmux 不在では何もしない（= クリーン起動に影響なし）
+        if tmux_persist && tmux_available && !secondary {
+            let recovered = app.recover_orphan_sessions(cx);
+            if !recovered.is_empty() {
+                app.recovered_count = recovered.len();
+                let report = format!(
+                    "orphan 自動復帰: {} セッションを「復帰」タブへ追加",
+                    recovered.len()
+                );
+                persist_diag(&report);
+                eprintln!("info: {report}");
+            }
         }
 
         // 起動時の orphan 一括クリーンアップ（FR-2.16.11）。復元で backend_sessions が
@@ -3666,6 +3686,65 @@ impl TakoApp {
     /// orphan tmux セッションの一括クリーンアップ本体（FR-2.16.11）。
     /// `min_idle_secs` は起動時の自動実行だけが渡す猶予（Issue #113: 直前まで動いていた
     /// セッションを protected 漏れ時にも巻き込まない）。判定は `cleanup_orphans` を参照
+    /// layout.json に載っていない生存中 tmux セッション（orphan）を発見し、
+    /// 「復帰」タブにまとめて自動追加する（Issue #191）。
+    /// spawn_session を通すため backend_sessions に登録され、
+    /// 後続の cleanup_orphan_tmux からは protected として保護される
+    fn recover_orphan_sessions(&mut self, cx: &mut Context<Self>) -> Vec<String> {
+        let protected: std::collections::HashSet<String> =
+            self.backend_sessions.values().cloned().collect();
+        let socket = tako_core::tmux_backend::socket_name();
+        let orphans = tako_core::tmux_backend::find_orphans(&socket, &protected);
+        if orphans.is_empty() {
+            return Vec::new();
+        }
+        // orphan ごとに cwd を取得（復元タブ内のペインを cwd で区別するため）
+        let tab_title = "復帰".to_string();
+        let first_pane = Pane::new(PaneOrigin::User);
+        let first_id = first_pane.id();
+        self.workspace.create_tab(tab_title, first_pane);
+        // 最初の orphan を最初のペインに割り当て、残りは分割で追加
+        let mut recovered = Vec::new();
+        for (i, name) in orphans.iter().enumerate() {
+            let pane_id = if i == 0 {
+                first_id
+            } else {
+                let new_pane = Pane::new(PaneOrigin::User);
+                let new_id = new_pane.id();
+                // 最初のペインから垂直分割で追加
+                let _ = self.workspace.active_tab_mut().tree_mut().split(
+                    first_id,
+                    tako_core::SplitDirection::Down,
+                    new_pane,
+                );
+                new_id
+            };
+            // backend_sessions に登録して spawn_session が既存セッションへ attach する
+            self.backend_sessions.insert(pane_id, name.clone());
+            let cwd = tako_core::tmux_backend::session_cwd(&socket, name);
+            let options = SpawnOptions {
+                cwd: cwd.map(std::path::PathBuf::from).filter(|p| p.is_dir()),
+                ..SpawnOptions::default()
+            };
+            if let Err(e) = self.spawn_session(pane_id, options, cx) {
+                eprintln!("warning: orphan セッション {name} を復帰できない: {e}");
+                self.backend_sessions.remove(&pane_id);
+                continue;
+            }
+            recovered.push(name.clone());
+        }
+        // 復帰したペインが 0 件ならタブを閉じる
+        if recovered.is_empty() {
+            if let Some(tab_id) = self.workspace.find_tab_of_pane(first_id) {
+                self.remove_tab_with(tab_id, CloseReason::Explicit, cx);
+            }
+        } else {
+            // 均等化して見やすくする
+            self.workspace.active_tab_mut().tree_mut().equalize();
+        }
+        recovered
+    }
+
     fn cleanup_orphan_tmux_with(&self, min_idle_secs: Option<u64>) -> Vec<String> {
         // セカンダリモードは backend_sessions（= protected）が空でプライマリの
         // セッションを全部 orphan と誤認するため、判定自体を行わない（Issue #113）
@@ -7591,6 +7670,10 @@ impl ControlHost for TakoApp {
 
     fn is_secondary(&self) -> bool {
         self.secondary
+    }
+
+    fn recovered_sessions_count(&self) -> usize {
+        self.recovered_count
     }
 
     fn backend_session(&self, pane: PaneId) -> Option<String> {

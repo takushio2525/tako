@@ -208,6 +208,30 @@ pub fn pane_tty(socket: &str, session: &str) -> Option<String> {
     (!tty.is_empty()).then_some(tty)
 }
 
+/// セッションの現在の作業ディレクトリを取得する（orphan 復帰時のタブ名推定用）
+pub fn session_cwd(socket: &str, session: &str) -> Option<String> {
+    let output = crate::tmux::tmux_command(Some(socket))
+        .args([
+            "list-panes",
+            "-t",
+            &format!("={session}"),
+            "-F",
+            "#{pane_current_path}",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    (!path.is_empty()).then_some(path)
+}
+
 /// セッションを破棄する（ペインの明示 close 時。tako 終了時は呼ばない = 永続化）。
 /// セッションが既に無い（シェル exit で消えた後）のエラーは無害なので潰す
 pub fn kill_session(socket: &str, session: &str) {
@@ -218,6 +242,42 @@ pub fn kill_session(socket: &str, session: &str) {
 /// `tako-` プレフィックス・**detached**・**非 grouped**・`protected` 外のセッションを
 /// kill し、kill した名前を返す。
 ///
+/// layout.json に載っていない生存中の `tako-*` セッション（orphan）を返す。
+/// cleanup_orphans と同じ list-sessions を読むが、kill せずに名前一覧だけ返す。
+/// 起動時の自動復帰（#191）で、layout 復元では拾えなかったセッションを発見するのに使う
+pub fn find_orphans(socket: &str, protected: &std::collections::HashSet<String>) -> Vec<String> {
+    let listing = crate::tmux::run_tmux(
+        Some(socket),
+        &[
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{session_attached}\t#{session_grouped}",
+        ],
+    )
+    .unwrap_or_default();
+    let mut orphans = Vec::new();
+    for line in listing.lines() {
+        let mut f = line.split('\t');
+        let (Some(name), Some(_attached), Some(grouped)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        if !name.starts_with("tako-") {
+            continue;
+        }
+        if name.starts_with("tako-view-") {
+            continue;
+        }
+        if grouped != "0" {
+            continue;
+        }
+        if protected.contains(name) {
+            continue;
+        }
+        orphans.push(name.to_string());
+    }
+    orphans
+}
+
 /// 安全設計（誤爆防止の四重ガード）:
 /// - **attached**（= いずれかのペイン/クライアントが使用中）は決して触らない
 /// - **grouped**（= 表示中ビューの元セッション or その `tako-view-*` ラッパー）も触らない。
@@ -504,6 +564,74 @@ mod tests {
             !crate::tmux::session_alive(Some(&socket), session),
             "kill 後はセッションが消える"
         );
+    }
+
+    /// find_orphans は protected 外の tako-* セッションを返し、
+    /// tako-view-* やユーザーセッションは除外する（Issue #191）
+    #[test]
+    #[cfg(unix)]
+    fn find_orphansはprotected外のtakoセッションだけ返す() {
+        if !available() {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-{}-orphan", std::process::id());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
+        // orphan 候補（tako-*）、ビュー（tako-view-*）、ユーザーセッション（user-*）を作成
+        for name in &["tako-orphan1", "tako-orphan2", "tako-view-x", "user-sess"] {
+            let r = crate::tmux::tmux_command(Some(&socket))
+                .args([
+                    "-f",
+                    "/dev/null",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    name,
+                    "sleep",
+                    "300",
+                ])
+                .output()
+                .expect("tmux new-session");
+            assert!(r.status.success(), "セッション {name} の作成に失敗");
+        }
+        // orphan1 を protected に入れる
+        let mut protected = std::collections::HashSet::new();
+        protected.insert("tako-orphan1".to_string());
+        let orphans = find_orphans(&socket, &protected);
+        // orphan2 だけが返る（orphan1 は protected、tako-view-x は除外、user-sess は非 tako-*）
+        assert_eq!(orphans, vec!["tako-orphan2".to_string()]);
+    }
+
+    /// session_cwd はセッションの現在の作業ディレクトリを返す（Issue #191）
+    #[test]
+    #[cfg(unix)]
+    fn session_cwdはセッションのcwdを返す() {
+        if !available() {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-{}-cwd", std::process::id());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
+        let session = "tako-cwd-test";
+        let r = crate::tmux::tmux_command(Some(&socket))
+            .args([
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-c",
+                "/tmp",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(r.status.success());
+        let cwd = session_cwd(&socket, session);
+        assert!(cwd.is_some(), "cwd が取得できる");
+        let cwd = cwd.unwrap();
+        // /tmp は /private/tmp のシンボリックリンクの場合がある
+        assert!(cwd == "/tmp" || cwd == "/private/tmp", "cwd = {cwd}");
     }
 
     /// 永続化の根幹 e2e: クライアント（tako 側）を破棄してもセッションが生き、
