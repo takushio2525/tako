@@ -693,3 +693,13 @@
   #181（worker_status snapshot/compute の先行修正）とは rebase 時に OffloadJob へ一本化
   （#181 のテストは検証内容を維持して新 API へ移植）
 - 次: PR #187 squash merge → install → tako 再起動 → ユーザー体感の再確認依頼
+
+## 2026-07-13（#157: orchestrator watch に異常検知イベント WORKER_ERROR を追加）
+- watch がペイン画面から実採取パターン（API Error / usage limit / codex モデル切替ダイアログ）を
+  検知し `WORKER_ERROR: tako:<pane> (<種別>)` + detail/action 行を出力。worker_status は
+  status=error + error{kind, detail, recommended_action}（resume / wait_reset / respond_dialog）を
+  MCP / CLI 1:1 公開、run は worker_error + auto_close スキップ。busy 中不判定・自動切替除外・
+  末尾 15 行限定の誤検知ガード + master prompt にリカバリ手順（respawn 禁止）
+- 検証: 581 tests / fmt / clippy 全緑 + 隔離 e2e（WORKER_ERROR 実測 35 秒・正常 idle 誤発火なし・
+  close 時 WORKER_GONE 優先・MCP 直叩き一致・codex limit 画面で usage_limit 優先）
+- 関連: PR #190 squash merge（`9847ee5`）→ install 済み。Issue #157 クローズ + 実測証拠コメント
