@@ -653,3 +653,12 @@
   + `tako recover`（一覧 / --apply / --force）+ persist.log 行に pid + README 復旧手順
 - 検証: 全緑 + 隔離セルフテスト完走 + 実機 e2e（強奪防止・事故再現・bak 退避・recover 復旧の通し）
 - 次: PR squash merge → install → Issue クローズ
+
+## 2026-07-13（#172: タブ/ペインの×ボタン close に確認ダイアログ + cmd+クリック即消し）
+- × クリックで確認ダイアログ表示（失われるペイン数・実行中プロセス・稼働中 worker・tmux
+  セッションを要約）。cmd+クリックでスキップ即消し。Enter=確定 / Esc=キャンセル。
+  config.yaml `confirm_close`（既定 true）で ON/OFF 永続化。dispatch `ConfirmClose` +
+  CLI `tako confirm-close` + MCP `tako_confirm_close`（計 60 ツール）。セルフテスト 5 項目追加
+- 関連: PR #182 squash merge（`1f694d3`）。547 tests / fmt / clippy(-D warnings) 全緑 +
+  隔離セルフテスト完走（73a〜73e 全パス）
+- 次: `build-app.sh --install` → tako 再起動で GUI 確認
