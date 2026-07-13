@@ -598,3 +598,10 @@
   install 済み。実機 e2e（セカンダリ + CLI: open → read title=Example Domain → close）+
   screencapture ピクセル確認済み
 - 次: tako 再起動 → manual-checks「Web ビューペイン」節の GUI 確認
+
+## 2026-07-13（#103: Cmd-Q 不発の根治 — Quit のグローバルアクション化）
+- 根因を GPUI ソースで確定: Quit がルート div の on_action のみでフォーカスパス依存。blur（focus=None）時は
+  dispatch path が root node へフォールバックしキーバインド・メニュー両経路とも不発（Dock 終了のみ AppKit 経路で生存）。
+  修正 = `cx.on_action` グローバル化 + 終了処理を `cx.on_app_quit` へ（Dock/OS 終了でも layout 保存。quitting ガードで #30/#113 維持）
+- 検証: 同一セルフテスト（blur + cmd-q）が旧構造 FAILED → 新構造 OK / 実 Cmd-Q キーイベントで隔離インスタンス終了 /
+  exit 全ペイン終了経路の回帰なし / 486 tests + fmt + clippy 全緑

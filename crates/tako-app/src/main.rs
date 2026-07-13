@@ -535,7 +535,9 @@ struct TakoApp {
     /// 削除・tmux バックエンド・persist トグルを封じ、プライマリの作業を一切壊さない
     secondary: bool,
     /// 最後のタブの終了処理（remove_tab_with の LastTab 分岐）を通過済み（Issue #113:
-    /// PTY の Exit / ChildExit 二重イベントによる「全ペイン終了」ログ + quit の重複発火防止）
+    /// PTY の Exit / ChildExit 二重イベントによる「全ペイン終了」ログ + quit の重複発火防止。
+    /// #103: on_app_quit の layout 保存もこのフラグでスキップし、LastTab 分岐が確定した
+    /// layout.json の削除 / 保持を上書きしない）
     quitting: bool,
     /// ペインを保持する tmux バックエンドセッション名（persist 有効時のみ登録される）
     backend_sessions: HashMap<PaneId, String>,
@@ -1362,6 +1364,32 @@ impl TakoApp {
             pane_links: HashMap::new(),
             hovered_link: None,
         };
+        // 終了処理（layout 保存 + 接続情報の後片付け）はアプリ終了フックで一元化する
+        // （#103）。Cmd-Q（グローバル Quit アクション）・メニュー・Dock 右クリック終了・
+        // OS シャットダウンのどの経路でも走る（従来はルート div の Quit ハンドラ限定で、
+        // Dock 終了では操作ごと保存に救われているだけだった）。
+        // 「全ペイン終了」経路（quitting=true）は layout.json の削除 / 保持を
+        // close_pane 側で確定済みのため、ここでは触らない（#30 / #113 の挙動を維持）
+        cx.on_app_quit(|this: &mut TakoApp, _cx| {
+            if !this.quitting {
+                // 終了直前の構成を保存してから抜ける（Phase 5.5。セッションは残る = 永続化）
+                this.save_layout();
+                // persist ON（セッション生存）なら接続情報を残す: ソケットパス・トークンが
+                // 再起動後も同一のため、既存クライアントがそのまま再接続できる。
+                // persist OFF なら旧来通り片付け（死んだ接続先を CLI の候補に残さない）
+                if !this.tmux_persist {
+                    tako_control::discovery::cleanup(std::process::id());
+                }
+            }
+            // セルフテスト最終項目（フォーカス喪失状態の cmd-q。#103）の成功マーカー。
+            // ここに到達した = Quit がフォーカス非依存で発火し quit 経路に入った証拠。
+            // 全 check 通過後にだけ cmd-q が送られるため、これが総合 OK マーカーを兼ねる
+            if std::env::var_os("TAKO_SELF_TEST").is_some() {
+                println!("TAKO_APP_SELF_TEST_OK");
+            }
+            async {}
+        })
+        .detach();
         if restored.is_empty() {
             let root_id = app.workspace.active_tab().tree().focused();
             if let Err(e) = app.spawn_session(root_id, SpawnOptions::default(), cx) {
@@ -7727,17 +7755,8 @@ impl Render for TakoApp {
                 this.toggle_filetree();
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &Quit, _, cx| {
-                // 終了直前の構成を保存してから抜ける（Phase 5.5。セッションは残る = 永続化）
-                this.save_layout();
-                // persist ON（セッション生存）なら接続情報を残す: ソケットパス・トークンが
-                // 再起動後も同一のため、既存クライアントがそのまま再接続できる。
-                // persist OFF なら旧来通り片付け（死んだ接続先を CLI の候補に残さない）
-                if !this.tmux_persist {
-                    tako_control::discovery::cleanup(std::process::id());
-                }
-                cx.quit()
-            }))
+            // Quit はここ（フォーカスパス依存）ではなく main() のグローバル
+            // on_action + on_app_quit で処理する（#103）
             .on_action(cx.listener(|this, _: &ActivateTab1, _, cx| this.activate_tab_index(0, cx)))
             .on_action(cx.listener(|this, _: &ActivateTab2, _, cx| this.activate_tab_index(1, cx)))
             .on_action(cx.listener(|this, _: &ActivateTab3, _, cx| this.activate_tab_index(2, cx)))
@@ -8062,6 +8081,14 @@ fn main() {
             cx.on_action(|_: &NewWindow, cx| {
                 open_new_window(cx);
             });
+            // Quit はグローバルアクションとして登録する（#103: ルート div の on_action
+            // だけだとウィンドウのフォーカスパス上でしか発火せず、フォーカス喪失
+            // （blur）状態では cmd-q もメニューの Quit も無反応になる。GPUI の
+            // アクションディスパッチは path 上で未処理ならグローバルハンドラの
+            // Bubble フェーズへ必ず到達するため、ここならフォーカス状態・
+            // ウィンドウ有無に依存しない）。layout 保存などの終了処理は
+            // on_app_quit（TakoApp::new で登録。Dock 終了でも走る）が担う
+            cx.on_action(|_: &Quit, cx| cx.quit());
             // 保存済みウィンドウフレームの復元（FR-5。終了前にフルスクリーンなら
             // フルスクリーンで開く）。セルフテストは既定サイズで決定的に動かす
             let saved_frame = if std::env::var_os("TAKO_SELF_TEST").is_none() {
@@ -12829,8 +12856,17 @@ mod self_test {
                 let _ = std::fs::remove_dir_all(dir);
             }
 
-            println!("TAKO_APP_SELF_TEST_OK");
-            std::process::exit(0);
+            // 最終項目: Quit はフォーカス喪失（blur）状態でも発火する（#103）。
+            // 外部 a11y ツール等で window.blur() が起きると GPUI の dispatch path が
+            // root dispatch node のみになり、ルート div の on_action ではキーバインド・
+            // メニューどちらの経路でも Quit が不発だった。グローバル on_action 化後は
+            // quit → on_app_quit フック（OK マーカー印字）→ 自然終了（exit 0）する。
+            // 「終了すること」自体が成功条件のため必ず最後に置く。不発時のみ 5 秒後の
+            // fail（exit 1・OK マーカーなし）へ到達する
+            let _ = any.update(cx, |_, window, _| window.blur());
+            press(any, cx, "cmd-q");
+            wait(cx, 5000).await;
+            fail("フォーカス喪失状態の cmd-q で終了しない (#103)");
         })
         .detach();
     }
