@@ -3187,6 +3187,10 @@ fn dispatch_tree_folder(
             Ok(json!({ "status": "removed", "path": canonical.display().to_string() }))
         }
         "list" => {
+            // 実体が消えたエントリを自動除去してから返す（#171）
+            if let Some(tab_mut) = host.workspace_mut().get_tab_mut(tab_id) {
+                tab_mut.prune_dead_folders();
+            }
             let tab_ref = host
                 .workspace()
                 .get_tab(tab_id)
@@ -4873,5 +4877,162 @@ mod tests {
             PaneOrigin::Cli,
         );
         assert!(result.is_err());
+    }
+
+    // --- #171: 重複排除・プルーニング ---
+
+    #[test]
+    fn tree_folder_symlink経由の重複追加は1エントリに畳まれる() {
+        // macOS: /tmp は /private/tmp へのシンボリックリンク
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+
+        // /tmp で追加（canonicalize → /private/tmp）
+        let r1 = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "add".into(),
+                path: Some("/tmp".into()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(r1["status"], "added");
+
+        // /private/tmp で追加（同じ正規パス → already_exists）
+        let r2 = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "add".into(),
+                path: Some("/private/tmp".into()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(r2["status"], "already_exists");
+
+        // list は 1 件
+        let list = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "list".into(),
+                path: None,
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(list["folders"].as_array().unwrap().len(), 1);
+
+        // 表示名は basename（/private/tmp の file_name = "tmp"）
+        let folder_path = list["folders"][0].as_str().unwrap();
+        let basename = std::path::Path::new(folder_path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        assert_eq!(basename, "tmp");
+    }
+
+    #[test]
+    fn tree_folder_symlink経由でも削除できる() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+
+        // /tmp で追加
+        dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "add".into(),
+                path: Some("/tmp".into()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        // /private/tmp で削除（同じ正規パスなので成功する）
+        let removed = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "remove".into(),
+                path: Some("/private/tmp".into()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(removed["status"], "removed");
+
+        let list = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "list".into(),
+                path: None,
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(list["folders"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn tree_folder_実体消失エントリはlistで自動プルーニングされる() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+
+        // 一時ディレクトリを作って追加
+        let tmp = std::env::temp_dir().join("tako_test_prune_171");
+        std::fs::create_dir_all(&tmp).unwrap();
+        dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "add".into(),
+                path: Some(tmp.display().to_string()),
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        // 追加されたことを確認
+        let list = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "list".into(),
+                path: None,
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(list["folders"].as_array().unwrap().len(), 1);
+
+        // ディレクトリを削除
+        std::fs::remove_dir_all(&tmp).unwrap();
+
+        // list で自動プルーニング → 0 件に
+        let list2 = dispatch(
+            &mut host,
+            Request::TreeFolder {
+                action: "list".into(),
+                path: None,
+                tab: None,
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(list2["folders"].as_array().unwrap().len(), 0);
     }
 }
