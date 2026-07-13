@@ -686,6 +686,122 @@ mod tests {
         );
     }
 
+    /// マウスレポート洪水（トラックパッド慣性スクロール級）でも ESC 欠落断片が
+    /// 内側アプリへテキストとして漏れない e2e（#167）。
+    /// 転送レートが下流（tmux クライアント PTY / 内側 PTY）の処理能力を超えると
+    /// macOS の tty 入力キューがバイトを黙って捨て、ESC を失った断片
+    /// （例: `4;45;18M`）が平文として内側の入力欄に入る（実 claude で再現済み）。
+    /// terminal.rs のホイール転送レート制限がこれを防ぐことを検証する。
+    /// 内側は claude と同じ raw mode + 受信バイトの即時可視化（perl）
+    #[test]
+    #[cfg(unix)]
+    fn マウスレポート洪水でも断片がテキスト化しない() {
+        if !available() {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-flood-{}", std::process::id());
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                kill_server(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(socket.clone());
+        // 内側アプリ: SGR マウス要求 + raw mode + ESC を「^[」に可視化して即時 echo
+        // （claude 等の raw mode TUI が受け取るバイト列の観測装置）
+        let inner = r#"stty raw -echo; printf '\033[?1000h\033[?1006h'; exec perl -e '$|=1; while (sysread(STDIN,$b,4096)) { $b =~ s/\x1b/^[/g; syswrite(STDOUT,$b) }'"#;
+        let options = SpawnOptions {
+            command: Some(SpawnCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), inner.into()],
+            }),
+            cwd: Some(std::env::temp_dir()),
+            env: vec![],
+        };
+        let session_name = "tako-e2e-flood";
+        let (mut session, mut rx) =
+            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, session_name))
+                .expect("tmux クライアントを spawn できる");
+
+        // 内側のマウス要求が外側端末モードへ伝わるのを待つ。
+        // rx（PtyWrite = tmux の端末クエリへの応答）を実運用の UI 層と同様に処理する
+        // （捨てると tmux クライアントが応答待ちのままになり、経路の再現にならない）
+        let mut mouse_on = false;
+        for _ in 0..100 {
+            while let Ok(event) = rx.try_recv() {
+                session.process_event(event);
+            }
+            if session.mouse_reporting() {
+                mouse_on = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(mouse_on, "内側アプリのマウス要求が外側端末モードへ伝わる");
+
+        // 洪水: 慣性スクロール相当（2,100 イベント要求）を全速で連打
+        for _ in 0..700 {
+            session.scroll_wheel(3, 5, 5);
+            while let Ok(event) = rx.try_recv() {
+                session.process_event(event);
+            }
+        }
+
+        // 配送が安定するまで待つ（capture の intact 数が変化しなくなるまで）
+        let capture = || -> String {
+            crate::tmux::tmux_command(Some(&socket))
+                .args(["capture-pane", "-t", session_name, "-p", "-S", "-", "-J"])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default()
+        };
+        const INTACT: &str = "^[[<64;6;6M";
+        let mut all = String::new();
+        let mut last_count = usize::MAX;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            while let Ok(event) = rx.try_recv() {
+                session.process_event(event);
+            }
+            all = capture();
+            let count = all.matches(INTACT).count();
+            if count > 0 && count == last_count {
+                break;
+            }
+            last_count = count;
+        }
+
+        let intact_count = all.matches(INTACT).count();
+        // intact な SGR レポートを全部取り除いた残りに座標断片が残っていたら、
+        // ESC 欠落断片がテキストとして内側へ届いている（= #167 の症状）
+        let stripped = all.replace(INTACT, "");
+        assert!(
+            !stripped.contains("6;6M"),
+            "ESC 欠落断片が内側へテキストとして漏れている（#167 再発）。\
+             intact={intact_count} 残骸例: {:?}",
+            stripped
+                .lines()
+                .filter(|l| l.contains("6;6M"))
+                .take(3)
+                .collect::<Vec<_>>()
+        );
+        // レート制限が全イベントを殺していないこと（正常なレポートは届く）
+        assert!(
+            intact_count > 0,
+            "SGR レポートが 1 件も届いていない（転送が死んでいる）。画面: {:?}",
+            session.visible_lines().join("\n")
+        );
+        // レート制限が生きていること（2,100 イベントの洪水がそのまま流れていない。
+        // 制限が消えると飛行中バイト量が増え、書き込み停滞時の断片化リスクが戻る）
+        assert!(
+            intact_count < 200,
+            "洪水がレート制限されずそのまま転送されている（#167 の防御が消失）: {intact_count}"
+        );
+        eprintln!("洪水 2100 イベント要求 → intact 配送 {intact_count} 件・断片ゼロ");
+    }
+
     /// Esc 単押しが「kitty を要求していない」内側アプリ（素の zsh 相当）にも
     /// 素の \e のまま届き、「27u」が文字として漏れない e2e
     /// （2026-06-12 実機バグの再発防止）。

@@ -129,6 +129,12 @@ struct ScrollCtl {
     last_refresh: std::time::Instant,
     /// 直近のホイール座標（マウス要求アプリと判明したとき生 SGR へ流す用）
     last_cell: (usize, usize),
+    /// 内側アプリのレポート形式が SGR か（`#{mouse_sgr_flag}`。false = X10 形式）
+    wants_sgr: bool,
+    /// tmux 直接注入（send-keys -H。#167）待ちのホイールイベント数（正 = 上方向）
+    pending_wheel: i32,
+    /// send-keys 実行中フラグ（実行中は `pending_wheel` に溜めて直列化する）
+    wheel_sending: bool,
 }
 
 impl Default for ScrollCtl {
@@ -143,6 +149,9 @@ impl Default for ScrollCtl {
             last_activity: std::time::Instant::now(),
             last_refresh: std::time::Instant::now(),
             last_cell: (0, 0),
+            wants_sgr: true,
+            pending_wheel: 0,
+            wheel_sending: false,
         }
     }
 }
@@ -5171,30 +5180,39 @@ impl TakoApp {
         let ctl = self.scroll_ctls.entry(pane_id).or_default();
         ctl.last_activity = std::time::Instant::now();
         ctl.last_cell = cell;
+        let wants_mouse = ctl.wants_mouse;
         let mut need_pump = false;
-        if ctl.wants_mouse == Some(true) {
-            // 生 SGR 転送: 整数行に畳んで送る（行未満は持ち越し）
+        if wants_mouse == Some(true) {
+            // マウス要求アプリへのレポート: 整数行に畳み（行未満は持ち越し）、
+            // レート制限を通して tmux サーバーへ直接注入する（send-keys -H。#167）
             let carry = self.scroll_accum.entry(pane_id).or_insert(0.0);
             let (lines, rest) = accumulate_scroll(*carry, delta_rows);
             *carry = rest;
-            if lines != 0 {
-                if let Some(session) = self.terminals.get(&pane_id) {
-                    session.scroll_wheel(lines, cell.0, cell.1);
+            let allowed = match self.terminals.get(&pane_id) {
+                Some(session) if lines != 0 => session.take_wheel_budget(lines),
+                _ => 0,
+            };
+            if allowed != 0 {
+                if let Some(ctl) = self.scroll_ctls.get_mut(&pane_id) {
+                    ctl.pending_wheel += allowed;
                 }
+                self.pump_wheel(pane_id, cx);
             }
-        } else if let Some(m) = ctl.mirror.as_mut() {
-            m.scroll_by(delta_rows);
-            if m.position <= 0.0 {
-                // 最下部到達でライブ表示へ復帰
-                ctl.mirror = None;
-            } else if m.wants_more_history(rows) && !ctl.loading {
-                need_pump = true;
-            }
-        } else if delta_rows > 0.0 {
-            // 過去方向の初動: ロード完了まで蓄積
-            ctl.pending_rows += delta_rows;
-            if !ctl.loading {
-                need_pump = true;
+        } else if let Some(ctl) = self.scroll_ctls.get_mut(&pane_id) {
+            if let Some(m) = ctl.mirror.as_mut() {
+                m.scroll_by(delta_rows);
+                if m.position <= 0.0 {
+                    // 最下部到達でライブ表示へ復帰
+                    ctl.mirror = None;
+                } else if m.wants_more_history(rows) && !ctl.loading {
+                    need_pump = true;
+                }
+            } else if delta_rows > 0.0 {
+                // 過去方向の初動: ロード完了まで蓄積
+                ctl.pending_rows += delta_rows;
+                if !ctl.loading {
+                    need_pump = true;
+                }
             }
         }
         if need_pump {
@@ -5202,6 +5220,41 @@ impl TakoApp {
         }
         self.ensure_scroll_ticker(cx);
         cx.notify();
+    }
+
+    /// tmux 直接注入（send-keys -H）待ちのホイールイベントを非同期送信する（#167）。
+    /// in-flight 中は `pending_wheel` に溜め、完了時に残りを再送する（ペイン単位に直列 =
+    /// イベント順序の保証 + サブプロセス起動レートの自動調整）
+    fn pump_wheel(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        let Some(ctl) = self.scroll_ctls.get_mut(&pane_id) else {
+            return;
+        };
+        if ctl.wheel_sending || ctl.pending_wheel == 0 {
+            return;
+        }
+        let Some(target) = ctl.target.clone() else {
+            // wants_mouse 解決前（target 未解決）は送らない（finish_mirror_load 経由で来る）
+            ctl.pending_wheel = 0;
+            return;
+        };
+        let lines = std::mem::take(&mut ctl.pending_wheel);
+        let sgr = ctl.wants_sgr;
+        let cell = ctl.last_cell;
+        ctl.wheel_sending = true;
+        cx.spawn(async move |this, cx| {
+            let task = cx.background_executor().spawn(async move {
+                tako_core::scroll_mirror::send_wheel(&target, lines, cell.0, cell.1, sgr);
+            });
+            task.await;
+            this.update(cx, |app, cx| {
+                if let Some(ctl) = app.scroll_ctls.get_mut(&pane_id) {
+                    ctl.wheel_sending = false;
+                }
+                app.pump_wheel(pane_id, cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// ミラーの解決・チャンク取得を非同期実行する（ペイン単位に直列）。
@@ -5236,7 +5289,7 @@ impl TakoApp {
                 }
                 let state = scroll_mirror::history_state(&target);
                 let chunk = match state {
-                    Some((history, false)) if history > 0 => scroll_mirror::capture_history(
+                    Some(s) if !s.mouse && s.history > 0 => scroll_mirror::capture_history(
                         &target,
                         skip,
                         scroll_mirror::MIRROR_CHUNK,
@@ -5261,7 +5314,7 @@ impl TakoApp {
         &mut self,
         pane_id: PaneId,
         target: tako_core::scroll::ScrollTarget,
-        state: Option<(usize, bool)>,
+        state: Option<tako_core::scroll_mirror::HistoryState>,
         chunk: Option<(Vec<tako_core::screen::ScreenLine>, usize)>,
         skip: usize,
         cx: &mut Context<Self>,
@@ -5276,11 +5329,16 @@ impl TakoApp {
             ctl.loading = false;
             ctl.target = Some(target);
             match state {
-                Some((history, mouse)) => {
+                Some(tako_core::scroll_mirror::HistoryState {
+                    history,
+                    mouse,
+                    sgr,
+                }) => {
                     ctl.wants_mouse = Some(mouse);
+                    ctl.wants_sgr = sgr;
                     ctl.known_history = history;
                     if mouse {
-                        // 解決して初めてマウス要求アプリと判明: 溜まった分を SGR へ
+                        // 解決して初めてマウス要求アプリと判明: 溜まった分をレポートへ
                         flush_rows = Some(std::mem::take(&mut ctl.pending_rows));
                         ctl.mirror = None;
                     } else if let Some((lines, total)) = chunk {
@@ -5327,18 +5385,18 @@ impl TakoApp {
             }
         }
         if let Some(rows_f) = flush_rows {
-            let cell = self
-                .scroll_ctls
-                .get(&pane_id)
-                .map(|c| c.last_cell)
-                .unwrap_or((0, 0));
             let carry = self.scroll_accum.entry(pane_id).or_insert(0.0);
             let (lines, rest) = accumulate_scroll(*carry, rows_f);
             *carry = rest;
-            if lines != 0 {
-                if let Some(session) = self.terminals.get(&pane_id) {
-                    session.scroll_wheel(lines, cell.0, cell.1);
+            let allowed = match self.terminals.get(&pane_id) {
+                Some(session) if lines != 0 => session.take_wheel_budget(lines),
+                _ => 0,
+            };
+            if allowed != 0 {
+                if let Some(ctl) = self.scroll_ctls.get_mut(&pane_id) {
+                    ctl.pending_wheel += allowed;
                 }
+                self.pump_wheel(pane_id, cx);
             }
         }
         let more = self.scroll_ctls.get(&pane_id).is_some_and(|c| {
@@ -5376,8 +5434,8 @@ impl TakoApp {
                 use tako_core::scroll_mirror;
                 let state = scroll_mirror::history_state(&target);
                 let chunk = match state {
-                    Some((history, _)) if history > known => {
-                        scroll_mirror::capture_history(&target, 0, history - known, &theme)
+                    Some(s) if s.history > known => {
+                        scroll_mirror::capture_history(&target, 0, s.history - known, &theme)
                     }
                     _ => None,
                 };
@@ -5387,9 +5445,10 @@ impl TakoApp {
             this.update(cx, |app, cx| {
                 if let Some(ctl) = app.scroll_ctls.get_mut(&pane_id) {
                     ctl.loading = false;
-                    if let Some((history, mouse)) = state {
-                        ctl.known_history = history;
-                        ctl.wants_mouse = Some(mouse);
+                    if let Some(s) = state {
+                        ctl.known_history = s.history;
+                        ctl.wants_mouse = Some(s.mouse);
+                        ctl.wants_sgr = s.sgr;
                     }
                     if let (Some(m), Some((lines, total))) = (ctl.mirror.as_mut(), chunk) {
                         let added = lines.len() as f32;
@@ -7412,11 +7471,12 @@ impl ControlHost for TakoApp {
             ));
         }
         let target = ctl.target.as_ref().expect("直前に解決済み");
-        if let Some((history, mouse)) = tako_core::scroll_mirror::history_state(target) {
-            ctl.known_history = history;
-            ctl.wants_mouse = Some(mouse);
+        if let Some(s) = tako_core::scroll_mirror::history_state(target) {
+            ctl.known_history = s.history;
+            ctl.wants_mouse = Some(s.mouse);
+            ctl.wants_sgr = s.sgr;
             if let Some(m) = ctl.mirror.as_mut() {
-                m.total_history = m.total_history.max(history);
+                m.total_history = m.total_history.max(s.history);
             }
         }
         let history = ctl.known_history;

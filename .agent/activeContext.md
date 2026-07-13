@@ -4,52 +4,43 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-13・#177 全ペイン消失の根治。#159 / #165 も同日完了）
+## 現在の対象（2026-07-13・#167 マウスエスケープ断片の入力欄混入を根治）
 
-**#177（UI から全ターミナルペイン消失）を根本修正**。根本原因は多重起動ガード（#113）の
-構造的な穴: ガードの判定材料が discovery（control.json）だけなのに、守るべき資源
-（layout.json = HOME 固定 / tmux セッション = TAKO_TMUX_SOCKET）は別の環境変数で
-差し替わる。`TAKO_DISCOVERY_DIR` だけ隔離した dev 検証起動（#165 検証中の実験、16:53:47）が
-プライマリ判定 → 本番 layout.json を復元 → `new-session -A -D` が本番 GUI の
-クライアント 13 本を強奪 → PTY 一斉死亡 → 定期保存が縮退 layout を上書き、の連鎖。
-**#178（同事故の起票）はこの修正が本質対応**（討議の案 1 プロセスベース判定は
-セカンダリ残存で本物の再起動を阻害するため、資源ベースのクライアントガードを採用）。
+**#167（SGR マウスレポート断片 `4;45;18M` / `<64;12;17M` が claude 入力欄に平文混入）を根本修正**。
+隔離 tmux + 実 claude で機序を実測確定: 外側クライアント PTY へ書いた SGR シーケンスが
+途中で 10ms 以上途切れる（慣性スクロール洪水の部分 write + UI/イベントループ停滞）と、
+tmux（escape-time 10ms）が ESC を単独キー確定し残りを平文として内側へ転送する。
+仮説①（モードレース）②（単純分割 write）は tmux が正しく再構成することを確認し棄却。
 
-対策（三層防御 + 復旧）:
-- **復元強奪ガード**（FR-5.10）: 復元前に `tmux list-clients` を走査し、生きた別
-  tako-app 配下のクライアントが attach 中ならセカンダリ降格
-- **縮退保存ガード**（FR-5.11）: ペイン数半減の保存前に `.bak.1`〜`.bak.3` 世代退避
-  （bak.1 が 10 分以内は回転しない = 連鎖縮退での押し出し防止）
-- **`TAKO_ISOLATED=1`**: discovery / persist / tmux socket の一括隔離（片脚隔離の根絶。
-  実験起動はこれを必須とする。AGENTS.md コマンド表に明記）
-- **`tako recover`**: バックアップ一覧 / `--apply <世代>` 復元（稼働中は拒否、--force あり）
-- persist.log 全行に `[pid N]` 付与
+対策（二層）:
+- **バックエンドペインのホイールレポートは外側 PTY を通さない**: `scroll_mirror::send_wheel`
+  （`tmux send-keys -H` 直接注入）+ UI 層 `pump_wheel`（in-flight 1 本直列化）。
+  SGR / X10 は `#{mouse_sgr_flag}`（`HistoryState`）で出し分け
+- **全ホイール転送にレート制限**（`terminal.rs`）: トークンバケット 150 イベント/秒・
+  バースト 8（macOS PTY バッファ 1024B に対する安全マージン）
 
-詳細は `.agent/architecture.md`「多重インスタンスの資源保護」節。
+詳細は `.agent/architecture.md`「マウスレポート転送（#167）」節。
 
-main 側の同日完了分: #159 スクロール大幅改善（ピクセル単位化 + ローカル履歴ミラー）、
-#165 spawn レイアウトエンジン（master-reserved + grid/spiral。59 ツール）。
+## 検証済み（#167）
 
-## 検証済み（#177）
-
-- workspace build / test（521 passed）/ fmt / clippy(-D warnings) 全緑 + 隔離セルフテスト完走
-- 実機 e2e（隔離 HOME + 専用 socket、本番不接触）: 修正後 = 事故条件（discovery のみ隔離）の
-  後発インスタンスがセカンダリ降格し先発の 4 クライアント無傷 / FORCE_PRIMARY バイパスで
-  事故経路を再現（クライアント全交代 = 強奪）→ 縮退保存直前に bak.1（5 ペイン版）自動退避 →
-  `tako recover --apply 1` → 再起動で「2 タブ / 5 ペイン（tmux 再 attach 4）」完全復旧
+- workspace build / test（551 passed）/ fmt / clippy(-D warnings) 全緑 + 隔離セルフテスト完走
+- e2e 新設 2 本: 洪水 2100 イベントで断片ゼロ + レート制限の存在 / send-keys 注入が生で届く
+- 実 claude before/after（隔離 tmux、本番不接触）: before = PTY 書き込み洪水で入力欄に断片
+  大量混入を再現 / after = 新経路で idle 1500 + busy 588 イベント断片ゼロ
+- 教訓: capture-pane の断片判定は `-J`（折り返し結合）必須（80 桁折り返しの誤検出を踏んだ）
 
 ## 次の一手
 
-- fix/177 の PR #180 を squash merge（#177 / #178 クローズ）→ `build-app.sh --install`
-- tako 再起動後の GUI 確認（manual-checks.md）: 「ターミナルスクロールの大幅改善」節
-  （#159）+「Web ビューペイン」節（#155）+ #153/#152 節 + Cmd-Q 経過観察（#103）
-- 明朝 5:00 の夜間ジョブ初回実行を監視（v0.4.1 自動リリース見込み。#166）
+- fix/167 の PR を squash merge → `build-app.sh --install` → tako 再起動で実機反映
+- **並行 worker #181**（#159 スクロールが再アタッチペインで体感できない）が同じスクロール
+  制御群を変更中（tako-wt-181）。`history_state` のシグネチャ変更・`ScrollCtl` 新フィールド・
+  wants_mouse=true 経路の send-keys 化を Issue #181 コメントで共有済み。rebase 側が対応する
+- fix/177 の残タスク: 明朝 5:00 の夜間ジョブ初回実行を監視（v0.4.1 自動リリース見込み。#166）
 - Phase 5 の次候補は FR-2.19 localhost ポートパネル・FR-3.10 画像プレビュー等
 
 ## 現フェーズで Read すべき設計書
 
+- マウスレポート転送の設計（#167）: `.agent/architecture.md` 該当節
 - 多重インスタンスの資源保護（#177）: `.agent/architecture.md` 該当節
+- スクロールの要件（#159 で全面改稿 + #167 で転送経路更新）: `.agent/requirements.md` FR-2.5.13
 - spawn レイアウトの設計（#165）: `.agent/architecture.md`「spawn レイアウトエンジン」節
-- スクロールの要件（#159 で全面改稿）: `.agent/requirements.md` FR-2.5.13 +
-  手動確認 `.agent/manual-checks.md`「ターミナルスクロールの大幅改善」
-- 設定ファイル I/O の安全化（#169）: `.agent/architecture.md` 該当節
