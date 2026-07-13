@@ -104,21 +104,28 @@ fn scrollbar_alpha(elapsed_ms: u128) -> f32 {
 }
 
 /// バックエンド / ネスト tmux スクロールの UI 側状態（ペイン単位）。
-/// ホイールは pending に溜めて 1 つの tmux 操作へコアレッシングする
-/// （SGR イベント洪水による「ばっと飛ぶ」スクロールの対策。2026-06-12）
+///
+/// #159 でローカルミラー方式へ刷新: スクロール開始時に tmux 履歴を capture して
+/// [`ScrollMirror`] としてローカルに持ち、以降の描画は完全ローカル（直接ペインと
+/// 同じピクセル単位のサブライン描画）。copy-mode には入らない（旧方式の
+/// ① 行単位 ② tmux 往復レイテンシ ③ キー飲まれ、の 3 制約を構造的に解消）。
+/// マウス要求アプリ（vim / claude 等）への生 SGR 転送は従来どおり
 struct ScrollCtl {
-    /// 解決済みのスクロール実体（None = 未解決。初回ポンプで解決する）
+    /// 解決済みのスクロール実体（None = 未解決。初回ロードで解決する）
     target: Option<tako_core::scroll::ScrollTarget>,
-    state: tako_core::scroll::ScrollState,
-    /// 未送信の相対行数（正 = 遡る）
-    pending: i32,
-    /// スクロールバードラッグの絶対位置目標（pending より優先）
-    drag_goal: Option<usize>,
-    /// tmux 操作の実行中（完了時に残りをポンプ）
-    in_flight: bool,
-    /// copy-mode 中の外部変化（ユーザー操作・新規出力）への追従要求
-    want_refresh: bool,
+    /// 対象ペインのアプリがマウスを要求しているか（true なら生 SGR 転送に任せる）。
+    /// None = 未解決（初回ロードで判定）
+    wants_mouse: Option<bool>,
+    /// スクロールバック表示のローカルミラー（None = 最下部・ライブ表示）
+    mirror: Option<tako_core::scroll_mirror::ScrollMirror>,
+    /// 最後に知った tmux 履歴行数（スクロールバー表示用。ロード時に更新）
+    known_history: usize,
+    /// capture / 解決の実行中（完了時に pending を反映して必要なら再ポンプ）
+    loading: bool,
+    /// 解決・ロード完了待ちのホイール蓄積（行小数。正 = 遡る）
+    pending_rows: f32,
     last_activity: std::time::Instant,
+    /// 増分追記（新規出力の押し出し行回収）の間隔制御
     last_refresh: std::time::Instant,
     /// 直近のホイール座標（マウス要求アプリと判明したとき生 SGR へ流す用）
     last_cell: (usize, usize),
@@ -128,15 +135,24 @@ impl Default for ScrollCtl {
     fn default() -> Self {
         Self {
             target: None,
-            state: tako_core::scroll::ScrollState::default(),
-            pending: 0,
-            drag_goal: None,
-            in_flight: false,
-            want_refresh: false,
+            wants_mouse: None,
+            mirror: None,
+            known_history: 0,
+            loading: false,
+            pending_rows: 0.0,
             last_activity: std::time::Instant::now(),
             last_refresh: std::time::Instant::now(),
             last_cell: (0, 0),
         }
+    }
+}
+
+impl ScrollCtl {
+    /// ミラースクロール表示中か（0 より上を見ている）
+    fn mirror_scrolling(&self) -> bool {
+        self.mirror
+            .as_ref()
+            .is_some_and(|m| m.effective_position() > 0.0)
     }
 }
 
@@ -491,11 +507,13 @@ struct TakoApp {
     dragging_border: Option<DragBorder>,
     /// スクロールバーをドラッグ中のペイン
     dragging_scrollbar: Option<PaneId>,
+    /// スクロールバーにホバー中のペイン（表示維持 + サム強調。macOS 慣行）
+    hovered_scrollbar: Option<PaneId>,
     /// ホイール行換算の端数持ち越し（accumulate_scroll）。ペイン close で破棄
     scroll_accum: HashMap<PaneId, f32>,
-    /// バックエンド / ネスト tmux スクロールの UI 状態（コアレッシング + フェード表示）
+    /// バックエンド / ネスト tmux スクロールの UI 状態（ミラー + フェード表示）
     scroll_ctls: HashMap<PaneId, ScrollCtl>,
-    /// フェード再描画・copy-mode 追従ティッカーの稼働中フラグ
+    /// フェード再描画・ミラー増分追従ティッカーの稼働中フラグ
     scroll_ticker: bool,
     /// 右サイドバー情報パネル（tmux 一覧 FR-2.13 / 集約センター FR-2.10）の表示状態。
     /// 表示・幅・ビューは dispatch（CLI / MCP の `tako panel`）からも操作できる
@@ -1278,6 +1296,7 @@ impl TakoApp {
             ime: None,
             dragging_border: None,
             dragging_scrollbar: None,
+            hovered_scrollbar: None,
             scroll_accum: HashMap::new(),
             scroll_ctls: HashMap::new(),
             scroll_ticker: false,
@@ -4344,8 +4363,13 @@ impl TakoApp {
     ) {
         let _ = self.workspace.active_tab_mut().tree_mut().focus(pane_id);
         if let Some((col, row, _right)) = self.cell_at(pane_id, event.position, window) {
-            // cmd+クリック: リンクを開く
-            if event.modifiers.platform && event.click_count == 1 {
+            let mirror_scrolling = self
+                .scroll_ctls
+                .get(&pane_id)
+                .is_some_and(|c| c.mirror_scrolling());
+            // cmd+クリック: リンクを開く（ミラースクロール表示中は視覚位置と
+            // リンク検出座標が一致しないため判定しない。#159）
+            if event.modifiers.platform && event.click_count == 1 && !mirror_scrolling {
                 if let Some(link) = self.hovered_link.take() {
                     if link.contains(pane_id, row, col) {
                         self.open_link(&link.target, link.kind, pane_id, cx);
@@ -4366,15 +4390,21 @@ impl TakoApp {
                     }
                 }
             }
-            if let Some(session) = self.terminals.get(&pane_id) {
-                let kind = match event.click_count {
-                    1 => SelectionKind::Simple,
-                    2 => SelectionKind::Word,
-                    _ => SelectionKind::Line,
-                };
-                session.clear_selection();
-                session.start_selection(kind, col, row, _right);
-                self.selecting = Some(pane_id);
+            // バックエンドのミラースクロール表示中は選択を開始しない: 選択は
+            // alacritty の viewport（ライブ画面）に対して働くため、ミラー行が
+            // 見えている間は視覚位置と選択位置が一致しない（#159 の既知制約。
+            // コピーは最下部へ戻ってから）
+            if !mirror_scrolling {
+                if let Some(session) = self.terminals.get(&pane_id) {
+                    let kind = match event.click_count {
+                        1 => SelectionKind::Simple,
+                        2 => SelectionKind::Word,
+                        _ => SelectionKind::Line,
+                    };
+                    session.clear_selection();
+                    session.start_selection(kind, col, row, _right);
+                    self.selecting = Some(pane_id);
+                }
             }
         }
         cx.notify();
@@ -4477,7 +4507,10 @@ impl TakoApp {
         let history = if backend {
             self.scroll_ctls
                 .get(&pane_id)
-                .map(|c| c.state.history)
+                .map(|c| {
+                    c.known_history
+                        .max(c.mirror.as_ref().map(|m| m.total_history).unwrap_or(0))
+                })
                 .unwrap_or(0)
         } else {
             session.history_size()
@@ -4487,18 +4520,35 @@ impl TakoApp {
             .clamp(0.0, 1.0);
         // 表示窓（rows 行）の中心をマウス位置の行へ合わせ、上端行 → offset に直す
         let top_row = (ratio * total - rows as f32 / 2.0).clamp(0.0, history as f32);
+        let goal = history as f32 - top_row;
         if backend {
-            // tmux copy-mode は行単位のため丸める
-            let offset = history - top_row.round() as usize;
+            // ミラー上の位置を直接動かす（未ロードなら目標だけ立ててロード開始。#159）
             let ctl = self.scroll_ctls.entry(pane_id).or_default();
             ctl.last_activity = std::time::Instant::now();
-            ctl.drag_goal = Some(offset);
-            ctl.pending = 0;
-            self.pump_scroll(pane_id, cx);
+            let mut need_pump = false;
+            match ctl.mirror.as_mut() {
+                Some(m) => {
+                    m.position = goal.clamp(0.0, m.total_history as f32);
+                    if m.position <= 0.0 {
+                        ctl.mirror = None;
+                    } else if m.wants_more_history(rows) && !ctl.loading {
+                        need_pump = true;
+                    }
+                }
+                None => {
+                    ctl.pending_rows = goal.max(0.0);
+                    if ctl.pending_rows > 0.0 && !ctl.loading {
+                        need_pump = true;
+                    }
+                }
+            }
+            if need_pump {
+                self.pump_mirror(pane_id, cx);
+            }
             self.ensure_scroll_ticker(cx);
         } else {
             // 直接ペインは行小数のままドラッグ追従（サブライン描画。#159）
-            session.scroll_to_position(history as f32 - top_row);
+            session.scroll_to_position(goal);
             self.mark_scroll_activity(pane_id, cx);
         }
         cx.notify();
@@ -4620,6 +4670,15 @@ impl TakoApp {
         let mut found = None;
         for &(pane_id, _) in &self.pane_text_areas {
             if let Some((col, row, _)) = self.cell_at(pane_id, position, window) {
+                // ミラースクロール表示中はリンク判定しない: 検出はライブ viewport
+                // ベースのため、ミラー行が見えている間は視覚位置と一致しない（#159）
+                if self
+                    .scroll_ctls
+                    .get(&pane_id)
+                    .is_some_and(|c| c.mirror_scrolling())
+                {
+                    break;
+                }
                 // リンクキャッシュを更新（ペインの画面が変わるたびにリフレッシュ）
                 self.refresh_pane_links(pane_id);
                 if let Some(links) = self.pane_links.get(&pane_id) {
@@ -4725,14 +4784,9 @@ impl TakoApp {
             .map(|(c, r, _)| (c, r))
             .unwrap_or((0, 0));
         if self.backend_sessions.contains_key(&pane_id) {
-            // バックエンドペイン: tako が tmux スクロールを正確な行数で駆動する。
-            // tmux copy-mode は行単位のため、端数を持ち越して整数行だけ送る
-            let carry = self.scroll_accum.entry(pane_id).or_insert(0.0);
-            let (lines, rest) = accumulate_scroll(*carry, delta_rows);
-            *carry = rest;
-            if lines != 0 {
-                self.backend_scroll(pane_id, lines, (col, row), cx);
-            }
+            // バックエンドペイン: tmux 履歴のローカルミラー上でピクセル単位に
+            // スクロールする（マウス要求アプリへの SGR 転送も内部で出し分け。#159）
+            self.backend_scroll_px(pane_id, delta_rows, (col, row), cx);
         } else if let Some(session) = self.terminals.get(&pane_id) {
             // 直接ペイン: 行小数のままセッションへ（ピクセル単位スムーススクロール #159）。
             // mouse reporting / alternate scroll の転送とスクロールバック表示の
@@ -4743,98 +4797,255 @@ impl TakoApp {
         }
     }
 
-    // --- バックエンド / ネスト tmux スクロール（tako-core::scroll の UI 側） ---
+    // --- バックエンド / ネスト tmux スクロール（ローカルミラー方式。#159） ---
 
-    /// ホイール行数をバックエンドスクロールへ積む。マウス要求アプリ（vim 等）へは
-    /// 従来どおり生 SGR を転送し、それ以外は tako 自身が tmux copy-mode を正確な
-    /// 行数で駆動する。SGR 経由で tmux 既定バインドの copy-mode に入れる方式は
-    /// 「5 行単位でばっと飛ぶ」「キー入力が copy-mode に飲まれる」「copy-mode
-    /// カーソルが画面に居座る」の 3 症状を生むためやめた（2026-06-12 実機）
-    fn backend_scroll(
+    /// ホイールの行小数をバックエンドスクロールへ積む。マウス要求アプリ（vim 等）へは
+    /// 従来どおり生 SGR を転送し、それ以外は tmux 履歴のローカルミラー
+    /// （`tako-core::scroll_mirror`）上でピクセル単位にスクロールする。
+    /// 旧方式（tmux copy-mode 駆動）は ① 行単位でしか動けない ② 1 操作 = tmux 往復
+    /// 数十 ms で慣性に追従できない ③ copy-mode 滞在のキー飲まれ、が原理的に残るため
+    /// 置き換えた（外側 alacritty に履歴は積もらないことを 2026-07-13 実測で確認済み）
+    fn backend_scroll_px(
         &mut self,
         pane_id: PaneId,
-        lines: i32,
+        delta_rows: f32,
         cell: (usize, usize),
         cx: &mut Context<Self>,
     ) {
+        let rows = self
+            .terminals
+            .get(&pane_id)
+            .map(|s| s.size().1)
+            .unwrap_or(24);
         let ctl = self.scroll_ctls.entry(pane_id).or_default();
         ctl.last_activity = std::time::Instant::now();
         ctl.last_cell = cell;
-        if ctl.target.is_some() && ctl.state.wants_mouse {
-            if let Some(session) = self.terminals.get(&pane_id) {
-                session.scroll_wheel(lines, cell.0, cell.1);
+        let mut need_pump = false;
+        if ctl.wants_mouse == Some(true) {
+            // 生 SGR 転送: 整数行に畳んで送る（行未満は持ち越し）
+            let carry = self.scroll_accum.entry(pane_id).or_insert(0.0);
+            let (lines, rest) = accumulate_scroll(*carry, delta_rows);
+            *carry = rest;
+            if lines != 0 {
+                if let Some(session) = self.terminals.get(&pane_id) {
+                    session.scroll_wheel(lines, cell.0, cell.1);
+                }
             }
-        } else {
-            ctl.pending += lines;
-            self.pump_scroll(pane_id, cx);
+        } else if let Some(m) = ctl.mirror.as_mut() {
+            m.scroll_by(delta_rows);
+            if m.position <= 0.0 {
+                // 最下部到達でライブ表示へ復帰
+                ctl.mirror = None;
+            } else if m.wants_more_history(rows) && !ctl.loading {
+                need_pump = true;
+            }
+        } else if delta_rows > 0.0 {
+            // 過去方向の初動: ロード完了まで蓄積
+            ctl.pending_rows += delta_rows;
+            if !ctl.loading {
+                need_pump = true;
+            }
+        }
+        if need_pump {
+            self.pump_mirror(pane_id, cx);
         }
         self.ensure_scroll_ticker(cx);
         cx.notify();
     }
 
-    /// 溜まったスクロール要求を 1 つの tmux 操作として実行する（ペイン単位に直列 =
-    /// コアレッシング）。完了時に残りがあれば再帰的にポンプする
-    fn pump_scroll(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+    /// ミラーの解決・チャンク取得を非同期実行する（ペイン単位に直列）。
+    /// 初回はスクロール実体の解決 + マウス要求判定 + 最新チャンク取得、
+    /// 以降はさらに過去のチャンクを先頭へ足す。完了時に必要なら再ポンプする
+    fn pump_mirror(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
         let Some(backend) = self.backend_sessions.get(&pane_id).cloned() else {
             return;
         };
         let Some(ctl) = self.scroll_ctls.get_mut(&pane_id) else {
             return;
         };
-        if ctl.in_flight {
+        if ctl.loading || ctl.wants_mouse == Some(true) {
             return;
         }
-        let need_resolve = ctl.target.is_none();
-        let goal = ctl.drag_goal.take();
-        let delta = std::mem::take(&mut ctl.pending);
-        let refresh = std::mem::take(&mut ctl.want_refresh);
-        if !need_resolve && goal.is_none() && delta == 0 && !refresh {
-            return;
-        }
-        ctl.in_flight = true;
+        ctl.loading = true;
         ctl.last_refresh = std::time::Instant::now();
         let target = ctl.target.clone();
+        let first_load = ctl.target.is_none();
+        let skip = ctl.mirror.as_ref().map(|m| m.lines.len()).unwrap_or(0);
+        let theme = self.theme.clone();
         let socket = tako_core::tmux_backend::socket_name();
         cx.spawn(async move |this, cx| {
             let task = cx.background_executor().spawn(async move {
-                use tako_core::scroll;
+                use tako_core::{scroll, scroll_mirror};
                 let target =
                     target.unwrap_or_else(|| scroll::resolve_target(&socket, &backend, &[None]));
-                let state = if let Some(goal) = goal {
-                    scroll::scroll_to(&target, goal)
-                } else if delta != 0 {
-                    scroll::scroll_by(&target, delta)
-                } else {
-                    scroll::scroll_state(&target)
+                // 旧 tako（copy-mode 方式）や CLI が copy-mode を残していたら初回に掃除する
+                // （新方式は copy-mode に入らないため、居残りはキー飲まれ事故になる）
+                if first_load {
+                    scroll::cancel(&target);
+                }
+                let state = scroll_mirror::history_state(&target);
+                let chunk = match state {
+                    Some((history, false)) if history > 0 => scroll_mirror::capture_history(
+                        &target,
+                        skip,
+                        scroll_mirror::MIRROR_CHUNK,
+                        &theme,
+                    ),
+                    _ => None,
                 };
-                (target, state)
+                (target, state, chunk)
             });
-            let (target, state) = task.await;
+            let (target, state, chunk) = task.await;
             this.update(cx, |app, cx| {
-                let mut flush: Option<i32> = None;
-                if let Some(ctl) = app.scroll_ctls.get_mut(&pane_id) {
-                    ctl.in_flight = false;
-                    ctl.target = Some(target);
-                    if let Some(state) = state {
-                        ctl.state = state;
-                        // 解決して初めてマウス要求アプリと判明したら、待つ間に
-                        // 溜まった分を生 SGR へ振り替える
-                        if state.wants_mouse && ctl.pending != 0 {
-                            flush = Some(std::mem::take(&mut ctl.pending));
+                app.finish_mirror_load(pane_id, target, state, chunk, skip, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// `pump_mirror` の完了処理: ミラーへの統合・マウス要求判明時の SGR 振り替え・
+    /// 必要に応じた再ポンプ
+    fn finish_mirror_load(
+        &mut self,
+        pane_id: PaneId,
+        target: tako_core::scroll::ScrollTarget,
+        state: Option<(usize, bool)>,
+        chunk: Option<(Vec<tako_core::screen::ScreenLine>, usize)>,
+        skip: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let rows = self
+            .terminals
+            .get(&pane_id)
+            .map(|s| s.size().1)
+            .unwrap_or(24);
+        let mut flush_rows: Option<f32> = None;
+        if let Some(ctl) = self.scroll_ctls.get_mut(&pane_id) {
+            ctl.loading = false;
+            ctl.target = Some(target);
+            match state {
+                Some((history, mouse)) => {
+                    ctl.wants_mouse = Some(mouse);
+                    ctl.known_history = history;
+                    if mouse {
+                        // 解決して初めてマウス要求アプリと判明: 溜まった分を SGR へ
+                        flush_rows = Some(std::mem::take(&mut ctl.pending_rows));
+                        ctl.mirror = None;
+                    } else if let Some((lines, total)) = chunk {
+                        let pending = std::mem::take(&mut ctl.pending_rows);
+                        ctl.known_history = total;
+                        match ctl.mirror.as_mut() {
+                            Some(m) if skip > 0 => {
+                                // 過去側チャンクを先頭へ（position は下端基準なので不変）
+                                let mut joined = lines;
+                                joined.append(&mut m.lines);
+                                m.lines = joined;
+                                m.total_history = total;
+                                m.scroll_by(pending);
+                            }
+                            Some(m) => {
+                                m.total_history = total;
+                                m.scroll_by(pending);
+                            }
+                            None => {
+                                let mut m = tako_core::scroll_mirror::ScrollMirror {
+                                    lines,
+                                    total_history: total,
+                                    position: 0.0,
+                                };
+                                m.scroll_by(pending);
+                                if m.position > 0.0 {
+                                    ctl.mirror = Some(m);
+                                }
+                            }
                         }
+                        if ctl.mirror.as_ref().is_some_and(|m| m.position <= 0.0) {
+                            ctl.mirror = None;
+                        }
+                    } else {
+                        // 履歴ゼロ（alt screen の TUI 等）: 蓄積は捨てる
+                        ctl.pending_rows = 0.0;
                     }
                 }
-                if let Some(lines) = flush {
-                    let cell = app
-                        .scroll_ctls
-                        .get(&pane_id)
-                        .map(|c| c.last_cell)
-                        .unwrap_or((0, 0));
-                    if let Some(session) = app.terminals.get(&pane_id) {
-                        session.scroll_wheel(lines, cell.0, cell.1);
+                None => {
+                    // セッション消滅・tmux 不在
+                    ctl.pending_rows = 0.0;
+                    ctl.mirror = None;
+                }
+            }
+        }
+        if let Some(rows_f) = flush_rows {
+            let cell = self
+                .scroll_ctls
+                .get(&pane_id)
+                .map(|c| c.last_cell)
+                .unwrap_or((0, 0));
+            let carry = self.scroll_accum.entry(pane_id).or_insert(0.0);
+            let (lines, rest) = accumulate_scroll(*carry, rows_f);
+            *carry = rest;
+            if lines != 0 {
+                if let Some(session) = self.terminals.get(&pane_id) {
+                    session.scroll_wheel(lines, cell.0, cell.1);
+                }
+            }
+        }
+        let more = self.scroll_ctls.get(&pane_id).is_some_and(|c| {
+            !c.loading
+                && (c
+                    .mirror
+                    .as_ref()
+                    .is_some_and(|m| m.wants_more_history(rows))
+                    || (c.mirror.is_none() && c.pending_rows > 0.0 && c.wants_mouse != Some(true)))
+        });
+        if more {
+            self.pump_mirror(pane_id, cx);
+        }
+        cx.notify();
+    }
+
+    /// ミラースクロール表示中に新規出力で tmux 履歴が伸びたら、押し出された行を
+    /// 回収して表示内容を固定する（position を同じだけ進める = 内容アンカー）
+    fn refresh_mirror(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        let Some(ctl) = self.scroll_ctls.get_mut(&pane_id) else {
+            return;
+        };
+        if ctl.loading || !ctl.mirror_scrolling() {
+            return;
+        }
+        let Some(target) = ctl.target.clone() else {
+            return;
+        };
+        let known = ctl.mirror.as_ref().map(|m| m.total_history).unwrap_or(0);
+        ctl.loading = true;
+        ctl.last_refresh = std::time::Instant::now();
+        let theme = self.theme.clone();
+        cx.spawn(async move |this, cx| {
+            let task = cx.background_executor().spawn(async move {
+                use tako_core::scroll_mirror;
+                let state = scroll_mirror::history_state(&target);
+                let chunk = match state {
+                    Some((history, _)) if history > known => {
+                        scroll_mirror::capture_history(&target, 0, history - known, &theme)
                     }
-                } else {
-                    app.pump_scroll(pane_id, cx);
+                    _ => None,
+                };
+                (state, chunk)
+            });
+            let (state, chunk) = task.await;
+            this.update(cx, |app, cx| {
+                if let Some(ctl) = app.scroll_ctls.get_mut(&pane_id) {
+                    ctl.loading = false;
+                    if let Some((history, mouse)) = state {
+                        ctl.known_history = history;
+                        ctl.wants_mouse = Some(mouse);
+                    }
+                    if let (Some(m), Some((lines, total))) = (ctl.mirror.as_mut(), chunk) {
+                        let added = lines.len() as f32;
+                        m.lines.extend(lines);
+                        m.total_history = total;
+                        m.position = (m.position + added).min(total as f32);
+                    }
                 }
                 cx.notify();
             })
@@ -4843,13 +5054,10 @@ impl TakoApp {
         .detach();
     }
 
-    /// dispatch（CLI / MCP）の Scroll 応答を UI のスクロール状態へ反映する
+    /// dispatch（CLI / MCP）の Scroll 実行後に必要なら非同期ロードを起動する
+    /// （`ControlHost::backend_scroll_view` は同期処理のため spawn できない）
     fn sync_scroll_from_dispatch(&mut self, value: &serde_json::Value, cx: &mut Context<Self>) {
-        let (Some(pane), Some(offset), Some(history)) = (
-            value["pane"].as_u64(),
-            value["offset"].as_u64(),
-            value["history"].as_u64(),
-        ) else {
+        let Some(pane) = value["pane"].as_u64() else {
             return;
         };
         let Some(pane_id) = self
@@ -4863,16 +5071,12 @@ impl TakoApp {
             return;
         };
         if self.backend_sessions.contains_key(&pane_id) {
-            let ctl = self.scroll_ctls.entry(pane_id).or_default();
-            ctl.last_activity = std::time::Instant::now();
-            ctl.state.position = offset as usize;
-            ctl.state.history = history as usize;
-            ctl.state.in_mode = offset > 0;
-            // dispatch 側で解決済みだが UI 側の target は未解決のままにし、
-            // 次のホイール / キー時に必要なら解決する（cancel は target が要るため）
-            if offset > 0 && ctl.target.is_none() {
-                ctl.want_refresh = true;
-                self.pump_scroll(pane_id, cx);
+            let need_load = self
+                .scroll_ctls
+                .get(&pane_id)
+                .is_some_and(|c| c.mirror.is_none() && c.pending_rows > 0.0 && !c.loading);
+            if need_load {
+                self.pump_mirror(pane_id, cx);
             }
             self.ensure_scroll_ticker(cx);
         } else {
@@ -4887,19 +5091,12 @@ impl TakoApp {
         self.ensure_scroll_ticker(cx);
     }
 
-    /// copy-mode 中のキー入力前に最下部へ戻す（iTerm2 流）。同期実行（~数 ms）なのは
-    /// 非同期にするとキーが先に copy-mode へ届いて飲まれるため
+    /// キー入力前にスクロールバック表示を最下部へ戻す（iTerm2 流）。
+    /// ミラー方式では copy-mode に入らないためローカル状態を畳むだけで済む
     fn cancel_scroll_before_input(&mut self, pane_id: PaneId) {
         if let Some(ctl) = self.scroll_ctls.get_mut(&pane_id) {
-            if ctl.state.in_mode {
-                if let Some(target) = &ctl.target {
-                    tako_core::scroll::cancel(target);
-                }
-                ctl.state.in_mode = false;
-                ctl.state.position = 0;
-                ctl.pending = 0;
-                ctl.drag_goal = None;
-            }
+            ctl.mirror = None;
+            ctl.pending_rows = 0.0;
         }
     }
 
@@ -5062,7 +5259,7 @@ impl TakoApp {
         }
     }
 
-    /// スクロールバーのフェード再描画と copy-mode 状態の追従。
+    /// スクロールバーのフェード再描画とミラーの増分追従。
     /// 対象エントリが尽きたら自動停止する
     fn ensure_scroll_ticker(&mut self, cx: &mut Context<Self>) {
         if self.scroll_ticker {
@@ -5077,30 +5274,29 @@ impl TakoApp {
                 let live = this
                     .update(cx, |app, cx| {
                         let dragging = app.dragging_scrollbar;
+                        let hovered = app.hovered_scrollbar;
                         app.scroll_ctls.retain(|id, ctl| {
-                            ctl.in_flight
-                                || ctl.pending != 0
-                                || ctl.drag_goal.is_some()
-                                || ctl.state.in_mode
+                            ctl.loading
+                                || ctl.pending_rows != 0.0
+                                || ctl.mirror.is_some()
                                 || Some(*id) == dragging
+                                || Some(*id) == hovered
                                 || scrollbar_alpha(ctl.last_activity.elapsed().as_millis()) > 0.0
                         });
-                        // copy-mode 中は外部変化（ユーザーの q・新規出力での履歴増）に追従
+                        // ミラー表示中は新規出力での履歴増（押し出し行）に追従して
+                        // 表示内容を固定する
                         let refresh: Vec<PaneId> = app
                             .scroll_ctls
-                            .iter_mut()
+                            .iter()
                             .filter(|(_, ctl)| {
-                                ctl.state.in_mode
-                                    && !ctl.in_flight
+                                ctl.mirror_scrolling()
+                                    && !ctl.loading
                                     && ctl.last_refresh.elapsed() >= Duration::from_millis(1000)
                             })
-                            .map(|(id, ctl)| {
-                                ctl.want_refresh = true;
-                                *id
-                            })
+                            .map(|(id, _)| *id)
                             .collect();
                         for id in refresh {
-                            app.pump_scroll(id, cx);
+                            app.refresh_mirror(id, cx);
                         }
                         cx.notify();
                         !app.scroll_ctls.is_empty()
@@ -5115,16 +5311,18 @@ impl TakoApp {
         .detach();
     }
 
-    /// スクロールバーの描画情報 (top, thumb_h, track_h, alpha, dragging)。
-    /// スクロール活動が無い・フェードアウト済み・履歴ゼロでは None（iTerm2 流）
+    /// スクロールバーの描画情報 (top, thumb_h, track_h, alpha, 強調)。
+    /// スクロール活動が無い・フェードアウト済み・履歴ゼロでは None（iTerm2 流）。
+    /// ドラッグ / ホバー中は表示を維持しサムを強調する（macOS 慣行）
     fn scrollbar_overlay(
         &self,
         pane_id: PaneId,
         area: Bounds<Pixels>,
     ) -> Option<(f32, f32, f32, f32, bool)> {
-        let dragging = self.dragging_scrollbar == Some(pane_id);
+        let emphasized =
+            self.dragging_scrollbar == Some(pane_id) || self.hovered_scrollbar == Some(pane_id);
         let ctl = self.scroll_ctls.get(&pane_id)?;
-        let alpha = if dragging {
+        let alpha = if emphasized {
             1.0
         } else {
             scrollbar_alpha(ctl.last_activity.elapsed().as_millis())
@@ -5134,8 +5332,15 @@ impl TakoApp {
         }
         let session = self.terminals.get(&pane_id)?;
         let (offset, history) = if self.backend_sessions.contains_key(&pane_id) {
-            // バックエンドのスクロールバックは tmux 側（ネスト先含む）にある
-            (ctl.state.position as f32, ctl.state.history)
+            // バックエンドのスクロールバックは tmux 側（ネスト先含む）のミラー
+            (
+                ctl.mirror
+                    .as_ref()
+                    .map(|m| m.effective_position())
+                    .unwrap_or(0.0),
+                ctl.known_history
+                    .max(ctl.mirror.as_ref().map(|m| m.total_history).unwrap_or(0)),
+            )
         } else {
             if session.is_alt_screen() {
                 return None;
@@ -5152,7 +5357,7 @@ impl TakoApp {
         let thumb_h = (rows as f32 / total * track_h).clamp(20.0, track_h);
         let top = ((history as f32 - offset.min(history as f32)) / total * track_h)
             .min(track_h - thumb_h);
-        Some((top, thumb_h, track_h, alpha, dragging))
+        Some((top, thumb_h, track_h, alpha, emphasized))
     }
 
     // --- 描画 ---
@@ -5313,6 +5518,43 @@ impl TakoApp {
         infos
     }
 
+    /// バックエンドペインのミラースクロール表示行列（#159）。
+    /// tmux 履歴ミラー（古い→新しい）とライブ画面を連結した仮想空間から、
+    /// 表示位置 pos（下端からの遡り行数）の窓 rows + 1 行（部分行込み）を切り出す。
+    /// ミラー未使用・最下部表示では None（通常の viewport 描画へ）
+    fn compose_mirror_lines(
+        &self,
+        pane_id: PaneId,
+        screen: &tako_core::Screen,
+    ) -> Option<Vec<tako_core::ScreenLine>> {
+        if !self.backend_sessions.contains_key(&pane_id) {
+            return None;
+        }
+        let ctl = self.scroll_ctls.get(&pane_id)?;
+        let m = ctl.mirror.as_ref()?;
+        let pos = m.effective_position();
+        if pos <= 0.0 {
+            return None;
+        }
+        let rows = screen.rows;
+        let m_len = m.lines.len();
+        // 表示窓の上端 = 仮想 index (m_len - ceil(pos))。ceil(pos) <= m_len は
+        // effective_position のクランプで保証される
+        let base = (pos.ceil() as usize).min(m_len);
+        let start = m_len - base;
+        Some(
+            (start..start + rows + 1)
+                .filter_map(|i| {
+                    if i < m_len {
+                        Some(m.lines[i].clone())
+                    } else {
+                        screen.lines.get(i - m_len).cloned()
+                    }
+                })
+                .collect(),
+        )
+    }
+
     /// ターミナルの現在画面を行 div のリストへ変換する（通常ペイン描画とバックグラウンドプレビューで共用）。
     /// run ごとの色・太字・下線などの装飾を StyledText のハイライトへ写す。
     /// 全角文字を含む行はランごとにセル幅固定 div で配置し、フォント advance と
@@ -5356,13 +5598,19 @@ impl TakoApp {
             .unwrap_or_default();
 
         let _total_cols = screen.cols;
-        // サブラインスクロール中は viewport 最下行の 1 行下も描画する（部分行表示。#159）。
-        // 描画側が行スタック全体を fract 行ぶん上へずらすため、下端の隙間をこの行が埋める
-        let extra_bottom = screen.extra_bottom;
-        screen
-            .lines
+        // 表示行列の決定（#159）:
+        // - バックエンドのミラースクロール中: tmux 履歴ミラー + ライブ画面の合成
+        // - それ以外: viewport（+ サブライン中は最下行の 1 行下 = extra_bottom）。
+        //   描画側が行スタック全体を fract 行ぶん上へずらすため、下端の隙間を追加行が埋める
+        let display_lines = self
+            .compose_mirror_lines(pane_id, &screen)
+            .unwrap_or_else(|| {
+                let mut lines = screen.lines;
+                lines.extend(screen.extra_bottom);
+                lines
+            });
+        display_lines
             .into_iter()
-            .chain(extra_bottom)
             .enumerate()
             .map(|(row_idx, line)| {
                 if cell_width.is_none() {
@@ -5739,19 +5987,26 @@ impl TakoApp {
             .find(|s| s.pane == pane_id)
             .map(|s| (s.port, s.process.clone()));
 
-        // tmux copy-mode でスクロール中は copy-mode カーソルが画面に固定表示されて
-        // 不自然なため隠す（2026-06-12 実機フィードバック (b)）
-        let scrolled_in_tmux = self
+        // ミラー方式（#159）では copy-mode に入らないためカーソルを隠す必要はない
+        // （ライブ画面部分のカーソルはスクロール中も見えるのが iTerm2 と同じ挙動）
+        let lines = self.terminal_screen_lines(pane_id, true);
+        // サブラインスクロールの描画シフト（fract 行ぶん行スタック全体を上へずらす。#159）。
+        // バックエンドペインはミラー位置の端数、直接ペインはセッションの端数
+        let subline_fract = self
             .scroll_ctls
             .get(&pane_id)
-            .is_some_and(|c| c.state.in_mode);
-        let lines = self.terminal_screen_lines(pane_id, !scrolled_in_tmux);
-        // サブラインスクロールの描画シフト（fract 行ぶん行スタック全体を上へずらす。#159）
-        let subline_shift = self
-            .terminals
-            .get(&pane_id)
-            .map(|s| s.scroll_subline_fract() * f32::from(cell.height))
+            .and_then(|c| c.mirror.as_ref())
+            .map(|m| {
+                let pos = m.effective_position();
+                pos.ceil() - pos
+            })
+            .or_else(|| {
+                self.terminals
+                    .get(&pane_id)
+                    .map(|s| s.scroll_subline_fract())
+            })
             .unwrap_or(0.0);
+        let subline_shift = subline_fract * f32::from(cell.height);
         let has_link_hover = self
             .hovered_link
             .as_ref()
@@ -6011,7 +6266,10 @@ impl TakoApp {
                             .children(lines),
                     ),
             )
-            .children(scrollbar.map(|(top, thumb_h, track_h, alpha, dragging)| {
+            .children(scrollbar.map(|(top, thumb_h, track_h, alpha, emphasized)| {
+                // オーバーレイスクロールバー（macOS 慣行 #159）: スクロール中に表示 →
+                // 停止 1 秒でフェードアウト。ホバー / ドラッグ中は表示を維持し、
+                // トラックをうっすら敷いてサムを太く・濃くする
                 div()
                     .id(("scrollbar", pane_id.as_u64()))
                     .absolute()
@@ -6020,6 +6278,19 @@ impl TakoApp {
                     .w(px(SCROLLBAR_WIDTH))
                     .h(px(track_h))
                     .occlude() // 下のペインへの選択開始を防ぐ
+                    .when(emphasized, |d| {
+                        d.bg(rgba_alpha(theme.surface_highlight, alpha * 0.5))
+                    })
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered {
+                            this.hovered_scrollbar = Some(pane_id);
+                        } else if this.hovered_scrollbar == Some(pane_id) {
+                            this.hovered_scrollbar = None;
+                            // 離脱時からフェード猶予を数え直す
+                            this.mark_scroll_activity(pane_id, cx);
+                        }
+                        cx.notify();
+                    }))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -6032,12 +6303,16 @@ impl TakoApp {
                             .absolute()
                             .top(px(top))
                             .right(px(2.0))
-                            .w(px(SCROLLBAR_WIDTH - 4.0))
+                            .w(px(if emphasized {
+                                SCROLLBAR_WIDTH - 2.0
+                            } else {
+                                SCROLLBAR_WIDTH - 4.0
+                            }))
                             .h(px(thumb_h))
                             .rounded_sm()
                             .bg(rgba_alpha(
                                 theme.tab_inactive_foreground,
-                                alpha * if dragging { 0.7 } else { 0.35 },
+                                alpha * if emphasized { 0.7 } else { 0.45 },
                             )),
                     )
             }))
@@ -6434,6 +6709,62 @@ impl ControlHost for TakoApp {
 
     fn backend_windows(&self, pane: PaneId) -> Option<Vec<tako_core::TmuxWindow>> {
         self.backend_windows.get(&pane).cloned()
+    }
+
+    /// CLI / MCP のバックエンドスクロール（#159）: ミラー位置を同期更新し、
+    /// 履歴チャンクの取得は dispatch 後の `sync_scroll_from_dispatch` が非同期で起動する
+    /// （ControlHost は同期文脈のため spawn できない）。
+    /// スクロール実体の解決と履歴サイズ取得（tmux 各 1 呼び出し・数 ms）のみ同期実行
+    fn backend_scroll_view(
+        &mut self,
+        pane: PaneId,
+        to: Option<usize>,
+        delta: Option<i32>,
+    ) -> Option<(usize, usize)> {
+        let backend = self.backend_sessions.get(&pane)?.clone();
+        let ctl = self.scroll_ctls.entry(pane).or_default();
+        ctl.last_activity = std::time::Instant::now();
+        if ctl.target.is_none() {
+            let socket = tako_core::tmux_backend::socket_name();
+            ctl.target = Some(tako_core::scroll::resolve_target(
+                &socket,
+                &backend,
+                &[None],
+            ));
+        }
+        let target = ctl.target.as_ref().expect("直前に解決済み");
+        if let Some((history, mouse)) = tako_core::scroll_mirror::history_state(target) {
+            ctl.known_history = history;
+            ctl.wants_mouse = Some(mouse);
+            if let Some(m) = ctl.mirror.as_mut() {
+                m.total_history = m.total_history.max(history);
+            }
+        }
+        let history = ctl.known_history;
+        let current = ctl
+            .mirror
+            .as_ref()
+            .map(|m| m.position)
+            .unwrap_or(ctl.pending_rows);
+        let goal = match (to, delta) {
+            (Some(t), None) => t as f32,
+            (None, Some(d)) => current + d as f32,
+            _ => current,
+        }
+        .clamp(0.0, history as f32);
+        match ctl.mirror.as_mut() {
+            Some(m) => {
+                m.position = goal;
+                if m.position <= 0.0 {
+                    ctl.mirror = None;
+                }
+                ctl.pending_rows = 0.0;
+            }
+            None => {
+                ctl.pending_rows = goal;
+            }
+        }
+        Some((goal.round() as usize, history))
     }
 
     fn panel_state(&self) -> (bool, f32, tako_control::protocol::PanelViewWire) {
@@ -10494,8 +10825,9 @@ mod self_test {
                     .unwrap_or(false);
                 check(listed_backend, "tmux list がバックエンドを区別表示する");
 
-                // 61b. バックエンドのホイール = tako 駆動の tmux スクロール
-                //（SGR 任せの copy-mode 突入をやめた方式。コアレッシング + 正確な行数）
+                // 61b. バックエンドのホイール = tmux 履歴のローカルミラー表示（#159）。
+                //      copy-mode には入らず、capture した履歴 + ライブ画面の合成行列で
+                //      過去が見える（ピクセル単位スクロールの土台）
                 press(any, cx, "ctrl-u");
                 type_text(any, cx, "seq 200", true);
                 wait(cx, 1000).await;
@@ -10524,17 +10856,41 @@ mod self_test {
                     wait(cx, 300).await;
                     wheel_scrolled = window
                         .update(cx, |app, _, _| {
-                            app.scroll_ctls
+                            let mirrored = app
+                                .scroll_ctls
                                 .get(&backend_pane)
-                                .map(|c| c.state.in_mode && c.state.position > 0)
-                                .unwrap_or(false)
+                                .is_some_and(|c| c.mirror_scrolling());
+                            // 合成行列がライブ viewport と異なる = 過去が見えている
+                            let composed_differs = app
+                                .terminals
+                                .get(&backend_pane)
+                                .map(|s| s.screen(&app.theme))
+                                .and_then(|screen| {
+                                    let composed =
+                                        app.compose_mirror_lines(backend_pane, &screen)?;
+                                    Some(composed.first()?.text != screen.lines.first()?.text)
+                                })
+                                .unwrap_or(false);
+                            // copy-mode には入っていない（キー飲まれの構造的解消）
+                            let no_copy_mode = tako_core::scroll::scroll_state(
+                                &tako_core::scroll::ScrollTarget::Backend {
+                                    socket: backend_sock.clone(),
+                                    session: backend_name.clone(),
+                                },
+                            )
+                            .map(|s| !s.in_mode)
+                            .unwrap_or(false);
+                            mirrored && composed_differs && no_copy_mode
                         })
                         .unwrap_or(false);
                     if wheel_scrolled {
                         break;
                     }
                 }
-                check(wheel_scrolled, "バックエンドのホイールが tmux スクロールに乗る");
+                check(
+                    wheel_scrolled,
+                    "バックエンドのホイールがミラー表示に乗る（copy-mode 不使用）",
+                );
 
                 // 61c. スクロールバーはスクロール中だけ表示され、時間経過でフェードする
                 let bar_visible = window
@@ -10568,8 +10924,9 @@ mod self_test {
                     "スクロールバーはスクロール中だけ表示（フェード）",
                 );
 
-                // 61d. スクロール中のキー入力は最下部へ戻してから流れる（iTerm2 流。
-                //      copy-mode にキーが飲まれて入力が反映されない症状の回帰検知）
+                // 61d. スクロール中のキー入力は最下部（ライブ表示）へ戻してから流れる
+                //      （iTerm2 流。ミラー方式では copy-mode に入らないため
+                //      「キーが飲まれる」事故は構造的に起きない）
                 press(any, cx, "enter");
                 let mut key_cancelled = false;
                 for _ in 0..20 {
@@ -10578,7 +10935,7 @@ mod self_test {
                         .update(cx, |app, _, _| {
                             app.scroll_ctls
                                 .get(&backend_pane)
-                                .map(|c| !c.state.in_mode)
+                                .map(|c| !c.mirror_scrolling())
                                 .unwrap_or(true)
                         })
                         .unwrap_or(false)
@@ -10596,25 +10953,33 @@ mod self_test {
                 }
                 check(key_cancelled, "スクロール中のキー入力で最下部へ戻る（iTerm2 流）");
 
-                // 61e. CLI（dispatch 共有）でもバックエンドの tmux スクロールに効く
+                // 61e. CLI（dispatch 共有）でもバックエンドのミラー表示位置に効く
+                //      （開発不変条件: UI と同じ層を CLI / MCP からも操作できる）
                 press(any, cx, "ctrl-u");
                 type_text(any, cx, &format!("{cli} scroll --to 5 >/dev/null"), true);
                 let mut cli_scrolled = false;
                 for _ in 0..20 {
                     wait(cx, 300).await;
-                    cli_scrolled = tako_core::scroll::scroll_state(
-                        &tako_core::scroll::ScrollTarget::Backend {
-                            socket: backend_sock.clone(),
-                            session: backend_name.clone(),
-                        },
-                    )
-                    .map(|s| s.position >= 5)
-                    .unwrap_or(false);
+                    cli_scrolled = window
+                        .update(cx, |app, _, _| {
+                            app.scroll_ctls
+                                .get(&backend_pane)
+                                .map(|c| {
+                                    let pos = c
+                                        .mirror
+                                        .as_ref()
+                                        .map(|m| m.position)
+                                        .unwrap_or(c.pending_rows);
+                                    pos >= 4.5
+                                })
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
                     if cli_scrolled {
                         break;
                     }
                 }
-                check(cli_scrolled, "tako scroll がバックエンドの tmux スクロールに効く");
+                check(cli_scrolled, "tako scroll がバックエンドのミラー表示位置に効く");
 
                 // 61f. タブ内ペインで attach 中の外部 tmux セッションはタブ枠へ紐付き、
                 //      「管理外 / kill 漏れ?」に出ない（FR-2.16.9。別サーバーのセッションを

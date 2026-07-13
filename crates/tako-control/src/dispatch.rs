@@ -69,6 +69,18 @@ pub trait ControlHost {
     fn backend_session(&self, _pane: PaneId) -> Option<String> {
         None
     }
+    /// バックエンドペインの表示スクロール（ローカルミラー方式 #159）。
+    /// `to` = 絶対位置（0 = 最下部）/ `delta` = 相対行数（正 = 遡る）のどちらか一方。
+    /// 戻り値は (クランプ後の表示位置, 履歴行数)。UI を持たない実装では None
+    /// （= バックエンドのスクロール表示は不可）
+    fn backend_scroll_view(
+        &mut self,
+        _pane: PaneId,
+        _to: Option<usize>,
+        _delta: Option<i32>,
+    ) -> Option<(usize, usize)> {
+        None
+    }
     /// バックエンドセッション内の window 一覧（2+ window の場合のみ）
     fn backend_windows(&self, _pane: PaneId) -> Option<Vec<tako_core::TmuxWindow>> {
         None
@@ -584,26 +596,22 @@ fn dispatch_inner(
                     "to（絶対位置。0 = 最下部）か delta（相対行数）のどちらか一方を指定する".into(),
                 ));
             }
-            // バックエンドペイン（Phase 5.5）のスクロールバックは tmux 側にある。
-            // ネスト tmux（ペイン内 attach）まで含めて tako-core::scroll が解決・駆動する
-            // （UI のホイール / スクロールバーと同じ層。開発不変条件）
-            if let Some(backend) = host.backend_session(target) {
-                let socket = tako_core::tmux_backend::socket_name();
-                let scroll_target = tako_core::scroll::resolve_target(&socket, &backend, &[None]);
-                let state = match (to, delta) {
-                    (Some(offset), None) => {
-                        tako_core::scroll::scroll_to(&scroll_target, offset as usize)
-                    }
-                    (None, Some(lines)) => tako_core::scroll::scroll_by(&scroll_target, lines),
-                    _ => unreachable!("引数は上で検証済み"),
-                }
-                .ok_or_else(|| {
-                    DispatchError::Operation("バックエンドセッションのスクロールに失敗".into())
-                })?;
+            // バックエンドペイン（Phase 5.5）のスクロールバックは tmux 側にあり、
+            // 表示はホスト UI のローカルミラー（#159。UI のホイール / スクロールバーと
+            // 同じ層。開発不変条件）。旧 copy-mode 駆動は廃止した（行単位 + tmux 往復 +
+            // キー飲まれの 3 制約のため）
+            if host.backend_session(target).is_some() {
+                let (offset, history) = host
+                    .backend_scroll_view(target, to.map(|t| t as usize), delta)
+                    .ok_or_else(|| {
+                        DispatchError::Operation(
+                            "このホストはバックエンドペインのスクロール表示に対応していない".into(),
+                        )
+                    })?;
                 return Ok(json!({
                     "pane": target.as_u64(),
-                    "offset": state.position,
-                    "history": state.history,
+                    "offset": offset,
+                    "history": history,
                 }));
             }
             match (to, delta) {
