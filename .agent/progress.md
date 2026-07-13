@@ -703,3 +703,15 @@
 - 検証: 581 tests / fmt / clippy 全緑 + 隔離 e2e（WORKER_ERROR 実測 35 秒・正常 idle 誤発火なし・
   close 時 WORKER_GONE 優先・MCP 直叩き一致・codex limit 画面で usage_limit 優先）
 - 関連: PR #190 squash merge（`9847ee5`）→ install 済み。Issue #157 クローズ + 実測証拠コメント
+## 2026-07-14（#112: セッション会話ログの管理と復元 — カタログ + ペイン平文ログ）
+- A: セッションカタログ（FR-5.12。`tako-control::sessions` 新設）: 会話は claude transcript
+  参照 + メタデータのみを sessions.yaml へ索引化。spawn 時 pending 記録（Issue 番号抽出）→
+  claude セッション検出で昇格。`tako sessions list/show/resume` + MCP（resume は claude のみ）。
+  B: ペイン平文ログ（FR-5.13。`tako-core::pane_log` 新設）: 確定行の増分保存
+  （直接 = alacritty history / バックエンド = tmux capture）。TUI はマーカーのみ・
+  5MB ローテ + 200MB 全体上限。`tako logs` + MCP（計 63 ツール）
+- 副産物: spawn 応答 tmux_session の常時 null を修正（reserve_backend_session）、
+  TAKO_DATA_DIR 隔離を新設（#177 の TAKO_PERSIST=1 併用穴を閉塞）
+- 検証: 全緑（591+ tests）+ セルフテスト完走 + 隔離 e2e（spawn → 全滅 + 再起動 →
+  resume → 文脈維持を実測）。ペイン kill 後の logs 読み出し・TUI 93B・洪水 26KB 実測
+- 次: origin/main rebase → PR（Closes #112）→ squash merge → install

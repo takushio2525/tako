@@ -4,37 +4,48 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-13・#157 watch 異常検知イベント完了）
+## 現在の対象（2026-07-14・#112 セッション会話ログの管理と復元）
 
-**#157（orchestrator watch の WORKER_ERROR イベント）を実装・マージ済み**（PR #190 = `9847ee5`）。
-worker のエラー停止を watch が検知し `WORKER_ERROR: tako:<pane> (<種別>)` を出力、
-worker_status / run にも `status: "error"` + `error: {kind, detail, recommended_action}` を 1:1 公開:
+**#112 を二本立てで実装完了**（worktree feat/112-session-log。PR 準備中）:
 
-- 種別（実採取画面由来）: `api_error`→resume / `usage_limit`→wait_reset / `limit_dialog`→respond_dialog
-- 検知は `orchestrator::wait::detect_worker_error`（busy/idle ヒューリスティックと同居）。
-  dispatch `finish_worker_status` が idle 確定後に細分類、watch は dispatch 判定を優先しつつ
-  旧 tako-app 相手でも画面から自力検知（フォールバック）
-- 誤検知ガード: busy 中は判定しない（`Retrying…` は busy 継続）/「limit reached, now using」
-  自動切替は除外 / api_error は末尾 15 行限定（復帰後のスクロールバック残留対策）
-- run はエラー停止時 `worker_error` + auto_close スキップ（復帰余地を残す）
-- master default prompt に WORKER_ERROR リカバリ手順（respawn 禁止・resume 優先）を追記
+1. **A: セッションカタログ**（FR-5.12・`tako-control::sessions` 新設）
+   - 会話本文は保存せず claude transcript への参照 + メタデータを
+     `<data_dir>/sessions.yaml`（config_io 保護・`TAKO_SESSIONS_FILE` で隔離）へ索引化
+   - spawn 時に tmux セッション名キーの pending 記録（プロンプト由来 Issue 番号含む）→
+     GUI の 5 秒スキャン（`claude agents --json` × pid 祖先照合）で session_id 検出時に昇格
+   - `tako sessions list/show/resume` + MCP `tako_sessions`。resume = 記録 cwd で分割 +
+     `claude --resume` 注入（#30 の復元と同方式）。codex / agy は resume 非対応を明示エラー
+2. **B: ペイン平文ログ**（FR-5.13・`tako-core::pane_log` 新設）
+   - 確定行のみ保存: 直接ペイン = alacritty history 増分、バックエンド = tmux
+     `#{history_size}` 増分 + `capture-pane -p`（ANSI 除去・再 attach 重複なし）
+   - alt screen 中は history が増えない = TUI 描画スパム構造排除（マーカーのみ。実測 93B）
+   - close/exit/quit で可視画面フラッシュ。5MB/ペイン `.1` ローテ + 200MB 全体上限 +
+     tick 400 行上限。`tako logs list/show/status/set` + MCP `tako_logs`（計 63 ツール）
 
-## 検証済み（#157）
+副産物の修正: spawn 応答 `tmux_session` が常に null だった問題
+（`ControlHost::reserve_backend_session` で dispatch 時に採番確定）/
+`TAKO_DATA_DIR` 上書き新設（TAKO_ISOLATED が一括設定。#177 の
+「TAKO_ISOLATED + TAKO_PERSIST=1 で本番 layout 復元」の穴を閉塞）
 
-- build / test（581 passed。unit 10 本追加）/ fmt / clippy(-D warnings) 全緑
-- 隔離 e2e（TAKO_ISOLATED=1 + 隔離 discovery + env -u TAKO_*）: WORKER_ERROR 実測
-  （api_error、35 秒で確定）/ 正常 idle は WORKER_IDLE のまま / エラー画面中の close は
-  WORKER_GONE 優先 / MCP 直叩きと CLI の応答一致 / codex limit 画面で usage_limit 優先
-- origin/main（#116 / #173）rebase 取り込み後に全検証を再実行
+## 検証済み（#112）
+
+- workspace build / test（591+）/ fmt / clippy(-D warnings) 全緑 + セルフテスト完走（63 ツール）
+- 隔離 e2e（TAKO_DATA_DIR + 隔離ソケット + 実 claude）: spawn → pending 記録 → 昇格 →
+  ペイン/タブ/tmux 全滅 + アプリ再起動 → `tako sessions resume` → 会話文脈維持
+  （合言葉を記憶から再出力）まで通し実証
+- ペインログ: kill 後の読み出し（可視画面 + クローズマーカー）/ 洪水 30000 行 → 26KB +
+  省略マーカー / claude TUI 数分稼働 → 93 バイト
+- 検証時の注意: 隔離 tako から spawn する claude は `CLAUDECODE` 等の環境変数を
+  継承すると `claude agents --json` に載らない（ネスト claude 扱い）。e2e ハーネスでは
+  `env -u CLAUDECODE -u CLAUDE_CODE_*` が必須
 
 ## 次の一手
 
-- tako 再起動で新バイナリ反映（`build-app.sh --install` 済み）→ 実運用で WORKER_ERROR の
-  発火を観察（次の API エラー多発時に master が自動判別できるか）
-- 明朝 5:00 の夜間ジョブで自動パッチリリース見込み（#166。CHANGELOG Unreleased に #157 記載済み）
-- 将来の拡張候補（スコープ外）: エラーパターンの外部設定化・claude の新 limit UI 文言の追随
+- origin/main（v0.5.0 + #157 + #191）を rebase 取り込み → コンフリクト解消 →
+  全ゲート再実行 → push → PR（Closes #112）→ squash merge → `build-app.sh --install`
+- マージ後: Issue #112 に実測証拠つき完了コメント
 
 ## 現フェーズで Read すべき設計書
 
-- watch / worker_status の判定構造: `crates/tako-control/src/orchestrator/wait.rs` 冒頭コメント
-- オーケストレーターの使い方・イベント一覧: `.agent/orchestrator.md`「tako orchestrator watch」節
+- セッションカタログ / ペインログの仕様: `.agent/requirements.md` FR-5.12 / FR-5.13
+- 多重インスタンス・隔離検証の注意（#177 + TAKO_DATA_DIR）: `.agent/architecture.md` 該当節
