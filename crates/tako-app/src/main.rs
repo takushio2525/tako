@@ -3213,8 +3213,26 @@ impl TakoApp {
             .workspace
             .get_tab_mut(tab_id)
             .expect("直前に存在を確認したタブ");
+        // Issue #165: worker close 後のリフロー用に spawn 元を close 前に記録する
+        // （明示 close も worker プロセスの exit 由来も対象）
+        let reflow_anchor = tab
+            .tree()
+            .get(pane_id)
+            .filter(|p| {
+                p.role()
+                    .is_some_and(|r| r.starts_with("orchestrator-worker"))
+            })
+            .and_then(|p| p.spawned_by());
         match tab.tree_mut().close(pane_id) {
             Ok(_) => {
+                // Issue #165: worker が抜けた領域を残りの worker で再配分する
+                // （master・ユーザー由来ペインの矩形は変わらない）
+                if let Some(anchor) = reflow_anchor {
+                    let layout = tako_control::setup::spawn_layout_config();
+                    if layout.policy != tako_core::SpawnLayoutPolicy::Legacy {
+                        let _ = tab.tree_mut().reflow_workers(anchor, layout.algorithm);
+                    }
+                }
                 self.terminals.remove(&pane_id);
                 self.previews.remove(&pane_id);
                 self.preview_edits.remove(&pane_id);
@@ -9471,7 +9489,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 58, "MCP tools/list は 58 ツール");
+            check(status == 200 && tool_count == 59, "MCP tools/list は 59 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -12849,6 +12867,196 @@ mod self_test {
                     .flatten()
                     .unwrap_or(false);
                 check(closed, "Web ビュー close（完全破棄 + ペイン後始末）");
+            }
+
+            // 72. worker spawn レイアウトエンジン（#165）: OrchestratorSpawn の配置が
+            //     master-reserved / grid（既定）で行われ、worker close 後に worker 領域内
+            //     だけがリフローされ、ユーザー由来ペインの矩形が不変であることを
+            //     rect（単位矩形の比率）で機械検証する。dispatch 直呼び = CLI / MCP と
+            //     同一経路（開発不変条件）。spawn の cwd 解決用に projects.yaml へ
+            //     一時プロジェクトを登録し、終了時に削除する。worker エージェント CLI の
+            //     起動完了は待たない（レイアウト検証には無関係。prompt は空文字のため
+            //     エージェントが起動しても API 呼び出しは発生しない。事前信頼の書き込みが
+            //     ~/.claude.json に一時 dir の trust を 1 エントリ残しうるが、実在しない
+            //     パスとして無視される）
+            {
+                fn rect_close(r: tako_core::Rect, x: f32, y: f32, w: f32, h: f32) -> bool {
+                    (r.x - x).abs() < 1e-3
+                        && (r.y - y).abs() < 1e-3
+                        && (r.width - w).abs() < 1e-3
+                        && (r.height - h).abs() < 1e-3
+                }
+                fn spawn_req(pane: u64, label: &str) -> tako_control::protocol::Request {
+                    tako_control::protocol::Request::OrchestratorSpawn {
+                        project: "tako-selftest-165".into(),
+                        prompt: String::new(),
+                        label: Some(label.into()),
+                        model: None,
+                        effort: None,
+                        pane: Some(pane),
+                        tab: None,
+                        caller_role: None,
+                        agent: None,
+                    }
+                }
+
+                let scratch = std::env::temp_dir()
+                    .join(format!("tako-selftest-165-{}", std::process::id()));
+                let _ = std::fs::create_dir_all(&scratch);
+                let registered = (|| -> Result<(), String> {
+                    let mut config = tako_control::orchestrator::ProjectsConfig::load()?;
+                    config.add(
+                        "tako-selftest-165".to_string(),
+                        scratch.display().to_string(),
+                        Some("selftest #165（自動削除される）".into()),
+                    );
+                    config.save()
+                })();
+                check(registered.is_ok(), "spawn レイアウト: 一時プロジェクト登録");
+
+                // 専用タブ（root = master 役）+ master の下にユーザー由来ペイン
+                let ids = window
+                    .update(cx, |app, _, _cx| {
+                        let r = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TabNew {
+                                title: Some("spawn-layout".into()),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()?;
+                        let tab = r["tab"].as_u64()?;
+                        let master = app
+                            .workspace
+                            .get_tab(TabId::from_raw(tab))?
+                            .tree()
+                            .focused()
+                            .as_u64();
+                        let user = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Split {
+                                pane: Some(master),
+                                tab: None,
+                                direction: Some(tako_control::protocol::Direction::Down),
+                                ratio: None,
+                                command: None,
+                                cwd: None,
+                                focus: None,
+                            },
+                            PaneOrigin::User,
+                        )
+                        .ok()?["pane"]
+                            .as_u64()?;
+                        Some((tab, master, user))
+                    })
+                    .ok()
+                    .flatten();
+                let Some((lt_tab, lt_master, lt_user)) = ids else {
+                    fail("spawn レイアウト: 専用タブ + ユーザーペイン準備");
+                };
+                let rect_of = |cx: &mut AsyncApp, pane: u64| -> Option<tako_core::Rect> {
+                    window
+                        .update(cx, |app, _, _cx| {
+                            app.workspace
+                                .get_tab(TabId::from_raw(lt_tab))?
+                                .tree()
+                                .layout(tako_core::Rect::UNIT)
+                                .into_iter()
+                                .find(|(id, _)| id.as_u64() == pane)
+                                .map(|(_, r)| r)
+                        })
+                        .ok()
+                        .flatten()
+                };
+                let user_rect0 = rect_of(cx, lt_user);
+                check(
+                    user_rect0.is_some_and(|r| rect_close(r, 0.0, 0.5, 1.0, 0.5)),
+                    "spawn レイアウト: ユーザーペイン初期配置（下半分）",
+                );
+
+                // spawn 1〜4 体。各回 dispatch の戻りから pane_id を得て rect を検証する
+                let mut workers = Vec::new();
+                for label in ["w1", "w2", "w3", "w4"] {
+                    let spawned = window
+                        .update(cx, |app, _, _cx| {
+                            tako_control::dispatch(
+                                app,
+                                spawn_req(lt_master, label),
+                                PaneOrigin::Mcp,
+                            )
+                            .ok()
+                            .and_then(|v| v["pane_id"].as_u64())
+                        })
+                        .ok()
+                        .flatten();
+                    let Some(id) = spawned else {
+                        fail(&format!("spawn レイアウト: {label} の spawn"));
+                    };
+                    workers.push(id);
+                }
+                let (w1, w2, w3, w4) = (workers[0], workers[1], workers[2], workers[3]);
+                // master は上半分の中で左 50% を維持、右上 1/4 が worker 領域の十字四分割
+                check(
+                    rect_of(cx, lt_master).is_some_and(|r| rect_close(r, 0.0, 0.0, 0.5, 0.5)),
+                    "spawn レイアウト: 4 spawn 後も master は左 50% を維持",
+                );
+                for (id, x, y, name) in [
+                    (w1, 0.5, 0.0, "w1 左上"),
+                    (w2, 0.5, 0.25, "w2 左下"),
+                    (w3, 0.75, 0.0, "w3 右上"),
+                    (w4, 0.75, 0.25, "w4 右下"),
+                ] {
+                    check(
+                        rect_of(cx, id).is_some_and(|r| rect_close(r, x, y, 0.25, 0.25)),
+                        &format!("spawn レイアウト: grid 十字四分割の {name}"),
+                    );
+                }
+                check(
+                    rect_of(cx, lt_user) == user_rect0,
+                    "spawn レイアウト: 4 spawn 後もユーザーペインの矩形は不変",
+                );
+
+                // w2 を close → worker 領域内だけがリフローされる（dispatch Close 経路）
+                let closed = window
+                    .update(cx, |app, _, _cx| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Close {
+                                pane: Some(w2),
+                                force: true,
+                            },
+                            PaneOrigin::Mcp,
+                        )
+                        .is_ok()
+                    })
+                    .unwrap_or(false);
+                check(closed, "spawn レイアウト: w2 の close");
+                for (id, x, y, w, h, name) in [
+                    (w1, 0.5, 0.0, 0.25, 0.25, "w1 左上"),
+                    (w3, 0.5, 0.25, 0.25, 0.25, "w3 左下"),
+                    (w4, 0.75, 0.0, 0.25, 0.5, "w4 右列全高"),
+                ] {
+                    check(
+                        rect_of(cx, id).is_some_and(|r| rect_close(r, x, y, w, h)),
+                        &format!("spawn レイアウト: close 後リフローの {name}"),
+                    );
+                }
+                check(
+                    rect_of(cx, lt_master).is_some_and(|r| rect_close(r, 0.0, 0.0, 0.5, 0.5))
+                        && rect_of(cx, lt_user) == user_rect0,
+                    "spawn レイアウト: close 後も master とユーザーペインは不変",
+                );
+
+                // 後始末: タブごと閉じて worker PTY を破棄 + 一時プロジェクト削除
+                let _ = window.update(cx, |app, _, cx| {
+                    app.remove_tab(TabId::from_raw(lt_tab), cx);
+                });
+                let _ = (|| -> Result<(), String> {
+                    let mut config = tako_control::orchestrator::ProjectsConfig::load()?;
+                    config.remove("tako-selftest-165");
+                    config.save()
+                })();
+                let _ = std::fs::remove_dir_all(&scratch);
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

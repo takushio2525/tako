@@ -78,6 +78,12 @@ To understand a project's conventions, read its AGENTS.md / CLAUDE.md first
      dependency repos under discussion.
    - **Cleanup**: when the session's focus shifts and a folder is no longer
      relevant, remove it with action "remove" to keep the tree uncluttered.
+7. **Layout: keep the user's panes readable**: when you rearrange panes
+   (split / resize / equalize / close), prioritize the readability of your own
+   conversation pane and panes the user opened manually (previews, editors,
+   terminals). Check `origin` in `tako_list_panes` to tell user panes from
+   AI-opened ones, and never shrink the user's panes to make room for your
+   work panes.
 
 <!-- block: tools -->
 ## Available Tools
