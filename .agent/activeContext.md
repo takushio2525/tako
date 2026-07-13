@@ -4,39 +4,35 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-13・#155 Web ビュー + #103 Cmd-Q 完了）
+## 現在の対象（2026-07-13・#165 spawn レイアウトエンジン完了）
 
-本日 main へマージ済み: #155（Web ビュー wry 化。PR #160 + #163）/ #103（Cmd-Q
-グローバルアクション化。#162。Issue クローズ済み）/ #152 / #153 / #156 / #158。
-`build-app.sh --install` は #162 込みの最新 main で実施済み（0.4.0。反映は tako 再起動後）。
+#165 実装完了（fix/165-spawn-layout-engine → PR 予定）: worker spawn を
+master-reserved（master の取り分維持 + 右側 worker 領域内 grid/spiral 配置）へ刷新。
 
-- Web ビュー = wry `build_as_child`（WKWebView）。直接操作は OS 配送。
-  ページ = `WebViewEntry`（ペイン独立）。ー = dock 退避（生存）、× = 破棄。
-  ステータスバー 🌐 → dock パネル。layout.json 永続化（後方互換）。
-  dispatch `Web` + CLI `tako web` + MCP `tako_web`（9 action、58 ツール不変）。
-  タイトル/URL 追跡 = eval 2 秒ポーリング（ipc は data: URL 不達を実機確認）
-- #103 = Quit を `cx.on_action` グローバル登録へ + 終了処理を `cx.on_app_quit` へ
-  （Dock/OS 終了でも layout 保存。quitting ガードで #30/#113 維持）。
-  根因はフォーカスパス依存: blur（focus=None）で dispatch path が root node のみになり
-  キーバインド・メニュー両経路とも不発（Dock 終了だけ AppKit 経路で生存）
+- レイアウト計算 = `tako-core::spawn_layout`（型 + 領域構築純関数）+
+  `PaneTree::spawn_worker` / `reflow_workers`。worker 領域 = spawned_by チェーンが
+  anchor に到達するリーフのみのサブツリー（ユーザーペイン混在は領域外 = 不変）
+- 設定 = config.yaml `spawn_layout`（policy / master_ratio / algorithm）。
+  CLI `tako orchestrator layout` と MCP `tako_orchestrator_layout`（59 ツール）は
+  `dispatch_orchestrator_layout` を共用（host 非依存・二重実装なし）
+- close リフロー = dispatch `Close` + tako-app `remove_pane_with` の両経路
+- 検証済み: tako-core 単体 10 本 + セルフテスト項目 72 完走 + セカンダリ実機
+  spawn ×4 → 十字四分割 → close リフローを screencapture ピクセル確認
 
-## 検証済み
+## 検証時インシデント（解決済み・#178 起票）
 
-- workspace build / test / fmt / clippy（-D warnings）全緑（#103 rebase 後 494 tests）
-- セルフテスト完走（#155 項目 71 = webview e2e 8 操作を実 WKWebView で通過。
-  #103 最終項目 = blur + cmd-q e2e: 旧構造 FAILED を実測 → 新構造 OK）
-- #155 実機 e2e: セカンダリインスタンス + CLI で open → read（title=Example Domain）→
-  list → close 成功、screencapture でネイティブ描画・🌐 バッジをピクセル確認
-- #103 実機: osascript の実 Cmd-Q キーイベントで隔離インスタンス終了、
-  インストール済み .app（md5 一致 + codesign 検証済み）でセルフテスト完走
+TAKO_DISCOVERY_DIR 指定の dev 起動で多重起動ガードが無効化され、production の
+tmux バックエンド 13 セッションを強奪（タブ 8 → 3。実プロセス損失ゼロ、
+ユーザーが復旧済み）。根因 = プライマリ判定が discovery のみ依存 → #178。
+**dev 併走検証は素の `cargo run -p tako-app`（セカンダリモード）で行うこと**
 
 ## 次の一手
 
-- tako 再起動後の GUI 確認（manual-checks.md）: 「Web ビューペイン」節（#155）、
-  「#153 節」（cmd ホバー装飾）、「#152 節」（PDF 選択・色分け）+ Cmd-Q 経過観察（#103）
+- PR 作成 → squash merge → `build-app.sh --install` → tako 再起動で実機反映
+- #178（多重起動ガードのプロセスベース判定併用)の着手判断
 - Phase 5 の次候補は FR-2.19 localhost ポートパネル・FR-3.10 画像プレビュー等
 
 ## 現フェーズで Read すべき設計書
 
-- Web ビュー実装詳細と z オーダー制約: `.agent/architecture.md`「Web ビューペイン」節
-- 手動確認: `.agent/manual-checks.md`「Web ビューペイン」節
+- spawn レイアウトの設計: `.agent/architecture.md`「spawn レイアウトエンジン」節
+- 要件: `.agent/requirements.md` FR-2.20
