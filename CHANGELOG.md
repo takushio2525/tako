@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.4.0] - 2026-07-13
 
 ### Added
 
@@ -16,6 +16,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - New `tako solo [-profile]` command for a 1:1 conversation mode without orchestration (#111): launches claude in a new tab with a solo-specific system prompt that **forbids orchestration** (`tako_orchestrator_spawn` / sub-agents / the Workflow tool) — the solo session does the work directly (read, edit, test, commit) instead of delegating to workers. Designed for economical use on plans like Claude Pro: default `effort=high` (below master's `max`), and recent activity is not preloaded at startup (checked via `git log` on demand). Shares the master `projects.yaml` and `build_master_claude_cmd`, so you can talk in terms of project names ("fix the README in demo") without `cd`. Uses the same profile-argument pattern as master (`-<name>` = profile, bare word = backward-compatible suffix); role and `TAKO_ORCHESTRATOR_ROLE` are `solo` / `solo:<suffix>`, distinct from master's `orchestrator-master`. Solo profiles live in `solo-profiles/`
   オーケストレーション無しの 1 対 1 対話モード `tako solo [-profile]` を新設（#111）: solo 専用の system prompt を付けて新タブで claude を起動する。プロンプトで**オーケストレーションを禁止**し（`tako_orchestrator_spawn` / sub-agent / Workflow ツール）、worker へ委任せず solo セッション自身がファイル編集・テスト・コミットを直接行う。Claude Pro 等のプランでの省トークン運用を想定し、既定 `effort=high`（master の `max` より低い）、「最近やってること」は起動時にロードせず必要時に `git log` で参照する。master と `projects.yaml` / `build_master_claude_cmd` を共有するため、`cd` せずプロジェクト名で（「demo の README 直して」）話せる。プロファイル引数は master と同一パターン（`-<名前>` = プロファイル、裸の語 = 後方互換サフィックス）。role と `TAKO_ORCHESTRATOR_ROLE` は `solo` / `solo:<suffix>`（master の `orchestrator-master` と区別）。solo プロファイルは `solo-profiles/` に置く
 
+- Orchestrator workers can now run on codex and agy in addition to claude (#120): profiles gain `worker_agent` plus per-agent `worker_agents` settings (model, effort mapping, skip_permissions, extra args), and spawn / run / profiles expose the agent choice 1:1 via MCP (`agent` parameter) and CLI (`--agent`, `--worker-agent`, `--agent-*`). TUI handling (input-line, trust-dialog and busy detection) was extended to the union of all three agents based on captured real screens, busy/idle is screen-estimated for agents without OSC signals, and agy's always-on "(Thinking)" footer no longer reads as forever-busy
+  オーケストレーションの worker が claude に加えて codex / agy で起動できるようになった（#120）: プロファイルに `worker_agent` とエージェント別 `worker_agents` 設定（model・effort 写像・skip_permissions・追加引数）を追加し、spawn / run / profiles の agent 指定を MCP（`agent` パラメータ）と CLI（`--agent` / `--worker-agent` / `--agent-*`）へ 1:1 公開。TUI 対応（入力欄・信頼ダイアログ・busy 検出）を実採取画面に基づく 3 種の和集合へ拡張し、OSC シグナルの無いエージェントは画面推定で busy/idle を判定する。agy の常時フッター「(Thinking)」が永遠 busy と誤判定される問題も修正済み
+
+- The orchestrator master itself can now be codex (#127): profiles gain `master_agent` (claude / codex), honored by both `tako master` and `tako solo`. For codex, the system prompt is injected via developer instructions and the tako MCP server is wired in with temporary `-c mcp_servers.tako.*` config (TAKO_* env passthrough). A guard keeps a non-claude master's model / effort from propagating to claude workers, and agy as master is rejected with an explicit error. CLI `--master-agent` / MCP `master_agent` expose the setting 1:1
+  オーケストレーションの master 自体を codex にできるようになった（#127）: プロファイルに `master_agent`（claude / codex）を追加し、`tako master` / `tako solo` の両方が対応。codex は developer instructions で system prompt を注入し、tako MCP サーバーは `-c mcp_servers.tako.*` の一時設定（TAKO_* 環境変数の引き継ぎ）で配線する。master≠claude のとき model / effort を claude worker へ継承しない波及ガード付き。agy の master 指定は明示エラー。CLI `--master-agent` / MCP `master_agent` で 1:1 公開
+
+- PDF previews now support text selection and clipboard copy (#124): a PDFKit-extracted text layer feeds the same drag-selection / ⌘C / highlight path used by code and Markdown previews. PDFs without a text layer degrade gracefully to view-only
+  PDF プレビューでテキスト選択とクリップボードコピーが可能になった（#124）: PDFKit で抽出したテキストレイヤを Code / Markdown プレビューと同じドラッグ選択・⌘C・ハイライト描画パスへ統合。テキストレイヤの無い PDF は従来どおり表示のみ
+
+- Terminal text now supports cmd+click links (#146, #147, #153): URLs (including ones wrapped across lines) open in the default browser, file paths open a preview pane split to the right, and directories split-and-cd. Path resolution tries cwd-relative / ~-expanded / absolute candidates with an existence check and strips `:line:col` suffixes; while cmd is held, link text is underlined and highlighted. #153 fixed five root causes that made path links unreliable (link hover hitting the wrong pane, an empty pane on directory click, unknown cwd in TUI panes without OSC 7, detection skipped entirely when cwd was unknown, and an infinite loop in link scanning)
+  ターミナル文字列の cmd+クリックリンクに対応（#146, #147, #153）: URL（行折り返しをまたぐものも連結検出）はデフォルトブラウザで開き、ファイルパスは右分割のプレビューで開き、ディレクトリは右分割 + cd する。パス解決は cwd 相対 / ~ 展開 / 絶対パスの 3 戦略 + 実在チェックで、`:行:列` サフィックスも除去。cmd 押下中はリンク文字列だけに下線 + ハイライトを表示する。#153 でパスリンクを不安定にしていた根本原因 5 件（ホバーの別ペイン誤ヒット・ディレクトリクリック時の空ペイン・OSC 7 なし TUI での cwd 不明・cwd 不明時の検出スキップ・リンク走査の無限ループ）を修正
+
+- AI can pin project folders into the file tree (#134): `tako tree add/remove/list` + MCP `tako_tree_folder` (57 tools) manage per-tab pinned folders that persist in layout.json and merge with the cwd-derived workspace roots
+  ファイルツリーへの AI からのフォルダ追加・削除（#134）: `tako tree add/remove/list` + MCP `tako_tree_folder`（計 57 ツール）で、タブ単位のピン留めフォルダを管理する。layout.json に永続化され、cwd 由来のワークスペースルートと合流表示される
+
+- Common agent rules can be synced from one source of truth (#136): `tako agents sync-rules` / `tako agents status` + MCP `tako_agents_sync_rules` (58 tools) embed a source file into each agent's global instruction file (claude / codex / agy) between marker blocks — everything outside the block stays untouched, with automatic backups. Also available as a new `tako setup` item, with sync status shown in `tako setup --check`
+  エージェント共通ルールの同期機能（#136）: `tako agents sync-rules` / `tako agents status` + MCP `tako_agents_sync_rules`（計 58 ツール）が、正本ファイルの内容を各エージェント（claude / codex / agy）のグローバル指示ファイルへマーカーブロックで埋め込む。ブロック外は不変・バックアップ付き。`tako setup` の新項目としても提供され、同期状態は `tako setup --check` に表示される
+
+- Full Disk Access guidance (#118): new `tako fda status/open` + MCP `tako_fda` (53 tools) detect whether tako has Full Disk Access and open the exact System Settings pane to grant it; `tako setup --check` includes the same check. This targets macOS TCC folder-access dialogs reappearing on every access
+  フルディスクアクセス（FDA）ガイド機能（#118）: `tako fda status/open` + MCP `tako_fda`（計 53 ツール）が FDA の付与状態を検出し、付与用のシステム設定画面を直接開く。`tako setup --check` にも同じチェックを追加。macOS TCC のフォルダアクセス許可ダイアログが毎回出る問題への対策
+
+### Changed
+
+- codex / agy workers now skip approval prompts by default (#132): spawned codex / agy workers run with permissions bypassed unless opted out, and a codex master launches with `--dangerously-bypass-approvals-and-sandbox` — verified against a real codex to be the only mode that also bypasses MCP tool approvals (`-a never` does not). `tako orchestrator profiles set` gains `--worker-model-policy`, and `scripts/clean-target.sh` was added to prune build artifacts
+  codex / agy worker の承認を既定でスキップ（#132）: spawn される codex / agy worker は opt-out しない限り承認バイパスで起動し、codex master は `--dangerously-bypass-approvals-and-sandbox` を使う（実 codex での検証により、MCP ツール承認までバイパスするのはこのモードのみ。`-a never` では不十分）。`tako orchestrator profiles set` に `--worker-model-policy` を追加し、target 掃除の `scripts/clean-target.sh` を新設
+
+- Master / solo system prompts now pin project folders proactively (#141): folders for projects mentioned in conversation are added to the file tree before the user has to ask
+  master / solo のデフォルト system prompt がプロジェクトフォルダを積極的にピン留めするようになった（#141）: 会話に上がったプロジェクト・関連フォルダを、ユーザーに聞かれる前にファイルツリーへ追加する行動規範を強化
+
+- `tako setup` now walks through Full Disk Access (#143): the setup flow names missing FDA as the cause of repeated TCC folder dialogs, offers to open System Settings on the spot, notes that an app restart is required after granting, and shows a checkmark when already granted. Delivered to existing users as setup changelog rev 6
+  `tako setup` の FDA 案内を強化（#143）: TCC ダイアログ頻発の原因が FDA 未付与であることを明示し、その場でシステム設定を開く対話・付与後のアプリ再起動案内・付与済みなら「✓ 済み」表示を追加。setup changelog rev 6 として既存ユーザーにも配信
+
 ### Fixed
 
 - Claude Code conversations now resume after a full PC restart (#139): tako periodically associates running Claude session IDs with their tmux-backed panes and stores them in `layout.json`. On restore, an existing backend session is still reattached unchanged; only when that backend disappeared (as happens on reboot) does tako validate the local transcript and run `claude --resume <session-id>` in the recreated pane. Explicitly exited or unidentifiable sessions are not guessed, and the behavior remains controlled by the existing `tako persist` / `tako_persist` setting
@@ -26,6 +58,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Preview selection now follows the actual GPUI-shaped text coordinates instead of terminal-cell estimates (#145), including Markdown font sizes, mixed Japanese/ASCII text, tabs, and vertical scrolling. PDF selection uses PDFKit line/character rectangles transformed onto the rendered page, and editable previews keep syntax colors while composing selection/caret highlights. Preview swaps invalidate stale coordinate caches, and self-tests synchronize on real CLI/paint completion instead of fixed delays
   プレビュー選択の座標ずれを修正（#145）: ターミナル固定セル換算をやめ、GPUI が実際に shaping した座標から Markdown の文字サイズ・日本語／半角混在・タブ・縦スクロール後の byte 位置を逆算する。PDF は PDFKit の行／文字矩形を表示ページへ変換して選択し、編集モードでも構文色と選択／キャレットを合成する。ファイル差し替え時は旧座標キャッシュを破棄し、セルフテストは固定待ちではなく実 CLI／paint 完了へ同期する
+
+- Starting a second tako instance no longer destroys panes (#113): the root cause was a three-step chain — the late instance's restore (`new-session -A -D`) hijacked the primary's tmux clients, the resulting cascade of Exited states overwrote layout.json mid-shutdown, and the next startup's orphan cleanup killed live worker sessions that had leaked out of the protected set. A multi-instance guard now starts late instances in a secondary mode (no restore, no layout.json writes, no tmux backend, no socket takeover; `TAKO_FORCE_PRIMARY=1` overrides), startup orphan cleanup skips sessions active within the last hour, and pane-exit / quit handling is idempotent against double-fired exit events. A UI-stall watchdog and dispatch timing now log to perf.log (256KB rotation, event names only), and tmux window capture for hover previews moved off the UI thread
+  2 個目の tako 起動でペインが消える問題を根治（#113）: 根因は三段連鎖 — 後発インスタンスの復元（`new-session -A -D`）がプライマリの tmux クライアントを強奪 → Exited 連鎖の途中状態が layout.json を上書き → 次回起動の orphan cleanup が保護から漏れた実行中セッションを kill。多重インスタンスガード（後発はセカンダリモードで起動: 復元しない・layout.json に書かない・tmux バックエンドに乗らない・ソケットを乗っ取らない。`TAKO_FORCE_PRIMARY=1` で上書き可）+ 起動時 cleanup の 1 時間アクティビティ猶予 + 終了イベント二重発火の冪等化で対策。UI ストールウォッチドッグと dispatch 処理時間の perf.log 記録（256KB ローテート・種別名のみ）、ホバープレビュー用 tmux window キャプチャの background 化も同梱
+
+- `tako remote start` no longer fails when a stale daemon holds the port (#129): the port is probed before spawning, a stale tako remote daemon is reclaimed automatically (SIGTERM → poll → SIGKILL), and an unrelated process occupying the port produces a clear error including its PID. `daemon_stop` now polls for actual process exit (up to 5s, then SIGKILL) instead of a fixed 500ms wait, and recovers stale daemons even when the PID file is gone
+  stale デーモンのポート占有で `tako remote start` が失敗する問題を修正（#129）: 起動前にポート占有を検知し、stale な tako remote デーモンなら SIGTERM → ポーリング → SIGKILL で自動回収して再起動する。無関係プロセスが占有中なら PID 入りのエラーで案内。`daemon_stop` も固定 500ms 待ちをやめ実際のプロセス終了をポーリングし（最大 5 秒、超過時 SIGKILL）、PID ファイル消失時もポート占有者から stale デーモンを回収する
+
+- Cmd-Q now always quits (#103): Quit was registered only on the root div's `on_action`, making it focus-path dependent — with no focused element (blur, e.g. caused by accessibility tools), both the keybinding and the menu item silently did nothing, and only quitting from the Dock worked. Quit is now a global `cx.on_action` registration, and shutdown work (layout save, discovery cleanup) moved to `cx.on_app_quit` so it also runs on Dock- or OS-initiated quits. The all-panes-exited path keeps its layout delete / keep semantics
+  Cmd-Q で終了しないことがある問題を根治（#103）: Quit がルート div の `on_action` のみに登録されフォーカスパス依存だったため、フォーカス無し（blur。a11y ツール等で発生）ではキーバインド・メニューの両経路が無音で不発になり、Dock からの終了だけが効いていた。Quit を `cx.on_action` のグローバル登録へ一本化し、終了処理（layout 保存・discovery cleanup）を `cx.on_app_quit` へ移設（Dock・OS 起因の終了でも保存が走る）。全ペイン終了経路の layout 削除 / 保持の分岐は不変
 
 ## [0.3.2] - 2026-07-07
 
