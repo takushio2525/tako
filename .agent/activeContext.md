@@ -4,7 +4,7 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-13・#181 スクロール体感問題の根治）
+## 現在の対象（2026-07-13・#181 スクロール体感問題の根治。#167 は main へマージ済み）
 
 **#181（#159 スクロール改善が実機で体感できない）を根本修正**。根因は 3 つ + カクつき 1 つ:
 
@@ -22,7 +22,12 @@
 スムーススクロール対象外。カスタム `-L` 外部サーバーのビューは復元後にネスト検出不能
 （開き直せば回復）。いずれも manual-checks.md / requirements.md FR-2.5.13 に記載。
 
-## 検証済み（#181）
+**main 取り込み済み（#167 = PR #184）**: マウスレポートは `send-keys -H` 直接注入 +
+レート制限へ（wants_mouse=true 側の転送経路。#181 対象の mirror 経路とは独立）。
+`history_state` の `HistoryState` 構造体化・`ScrollCtl` 新フィールドとの整合を
+マージ後ビルド + セルフテストで確認する。
+
+## 検証済み（#181。マージ前の fix/181 単体）
 
 - 全 551 テスト / fmt / clippy(-D warnings) / 隔離セルフテスト完走（項目 73 = TmuxOpen ミラー
   e2e、74 = worker_status IPC 応答を新設）/ visual-test subline direct=22197 shifted=0（#176 一致）
@@ -35,13 +40,14 @@
 
 ## 次の一手
 
-- fix/181 をコミット → push → PR（Closes #181）→ 全緑確認 → squash merge --delete-branch
-- fetch + detach → `scripts/build-app.sh --install` → ユーザー再確認（本番の tako-view ペイン
-  405/400/420 でスクロール + カクつき解消の体感確認）
+- origin/main（#167）とのマージ整合を検証（ビルド + テスト + 隔離セルフテスト再実行）→
+  PR #186 を squash merge --delete-branch → fetch + detach → `scripts/build-app.sh --install`
+- ユーザー再確認: 本番の tako-view ペイン（405/400/420）でスクロール + カクつき解消の体感確認
 - 明朝 5:00 の夜間ジョブ監視（v0.4.1 自動リリース見込み。#166）は継続
 
 ## 現フェーズで Read すべき設計書
 
 - スクロールのミラー経路・実体解決（#181 で改稿）: `.agent/architecture.md`「スクロール制御」節
+- マウスレポート転送（#167）: `.agent/architecture.md` 該当節
 - スクロール要件・既知制約: `.agent/requirements.md` FR-2.5.13
 - UI スレッドで外部プロセス禁止の教訓: `.agent/architecture.md`「UI スレッド同期処理」節

@@ -54,6 +54,12 @@ pub trait ControlHost {
     }
     /// tmux バックエンド永続化の ON/OFF 切替（永続化は実装側の責務。以後のペインに効く）
     fn set_tmux_persist(&mut self, _enabled: bool) {}
+    /// × ボタン close の確認ダイアログの現在状態（Issue #172）
+    fn confirm_close_enabled(&self) -> bool {
+        true
+    }
+    /// 確認ダイアログの ON/OFF 切替（永続化は実装側の責務）
+    fn set_confirm_close(&mut self, _enabled: bool) {}
     /// セカンダリモード（Issue #113: 多重起動の後発。復元・layout 書き込み・persist 切替が
     /// 無効化されている）か。診断用に `tako persist` / MCP の応答へ含める
     fn is_secondary(&self) -> bool {
@@ -1067,6 +1073,14 @@ fn dispatch_inner(
                 host.set_port_detect(enabled);
             }
             Ok(json!({ "enabled": host.port_detect_enabled() }))
+        }
+
+        Request::ConfirmClose { enabled } => {
+            if let Some(val) = enabled {
+                host.set_confirm_close(val);
+                let _ = crate::setup::mutate_config(|c| c.confirm_close = val);
+            }
+            Ok(json!({ "enabled": host.confirm_close_enabled() }))
         }
 
         Request::Persist { enabled } => {

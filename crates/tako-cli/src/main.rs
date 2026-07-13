@@ -79,6 +79,9 @@ enum Command {
     /// セッション永続化（tmux バックエンド）の ON/OFF・状態確認。
     /// 有効時、tako を再起動してもタブ構成と実行中プロセスが復元される
     Persist(ToggleArgs),
+    /// × ボタン close の確認ダイアログ ON/OFF・状態確認
+    #[command(name = "confirm-close")]
+    ConfirmClose(ToggleArgs),
     /// 右サイドバー情報パネル（tmux 一覧 / agents 集約センター）の表示・幅・ビュー切替。
     /// 引数なしで現在状態を表示する
     Panel(PanelArgs),
@@ -2295,6 +2298,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Portdetect(args) => Request::PortDetect {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
+        Command::ConfirmClose(args) => Request::ConfirmClose {
+            enabled: args.state.as_deref().map(|s| s == "on"),
+        },
         Command::Git(GitCommand::Log { max_count, pane }) => Request::GitLog {
             pane: target_pane(*pane)?,
             max_count: Some(*max_count),
@@ -2765,6 +2771,7 @@ fn print_result(command: &Command, result: &Value) {
         Command::Autorename(_)
         | Command::Portdetect(_)
         | Command::Persist(_)
+        | Command::ConfirmClose(_)
         | Command::Panel(_)
         | Command::Collapse(_)
         | Command::Pin(_) => {

@@ -32,6 +32,9 @@ pub struct SetupConfig {
     /// worker spawn のレイアウト設定（Issue #165）
     #[serde(default, skip_serializing_if = "SpawnLayoutSection::is_default")]
     pub spawn_layout: SpawnLayoutSection,
+    /// タブ/ペインの × ボタン close 時の確認ダイアログ（Issue #172。既定 true）
+    #[serde(default = "default_true")]
+    pub confirm_close: bool,
 }
 
 /// config.yaml の spawn_layout セクション（Issue #165）。
@@ -76,6 +79,11 @@ impl SpawnLayoutSection {
                 .unwrap_or(defaults.algorithm),
         }
     }
+}
+
+/// × ボタン close の確認ダイアログ有効状態を config.yaml から取得する（Issue #172）
+pub fn confirm_close_enabled() -> bool {
+    load_config().map(|c| c.confirm_close).unwrap_or(true)
 }
 
 /// spawn レイアウト設定を config.yaml から解決する（Issue #165）。
