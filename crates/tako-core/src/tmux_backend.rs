@@ -287,6 +287,19 @@ pub fn kill_server(socket: &str) {
     let _ = crate::tmux::tmux_command(Some(socket))
         .arg("kill-server")
         .output();
+    remove_socket_file(socket);
+}
+
+/// tmux ソケットファイルを削除する。tmux は kill-server 後もファイルを残すことがある。
+/// tmux は TMUX_TMPDIR → /tmp の順でソケットディレクトリを決定する（TMPDIR は使わない）。
+/// macOS では /tmp → /private/tmp のシンボリックリンク解決でソケット名末尾に `=` が付くため
+/// 両方試す
+fn remove_socket_file(socket: &str) {
+    let uid = unsafe { libc::getuid() };
+    let tmpdir = std::env::var("TMUX_TMPDIR").unwrap_or_else(|_| "/tmp".into());
+    let base = std::path::Path::new(&tmpdir).join(format!("tmux-{uid}"));
+    let _ = std::fs::remove_file(base.join(socket));
+    let _ = std::fs::remove_file(base.join(format!("{socket}=")));
 }
 
 /// 語のリストを sh -c 安全な 1 つのコマンド文字列へ組み立てる
@@ -312,6 +325,58 @@ fn quote_word(word: &str) -> String {
         word.to_string()
     } else {
         format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+/// テスト用: tmux 隔離ソケットの後始末ガード。
+/// 生成時に前回テストの残骸ソケット（tako-coretest-*）を掃除し、Drop でサーバー kill +
+/// ソケットファイル削除を行う
+#[cfg(test)]
+pub(crate) struct TmuxTestGuard(Vec<String>);
+
+#[cfg(test)]
+impl TmuxTestGuard {
+    pub fn new(sockets: Vec<String>) -> Self {
+        Self::cleanup_stale_sockets();
+        Self(sockets)
+    }
+
+    /// 前回テストの残骸（tako-coretest-* ソケット + ゾンビサーバー）を一括掃除する。
+    /// テスト途中の kill -9 で Drop が走らずサーバーが残る場合の回収
+    fn cleanup_stale_sockets() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let uid = unsafe { libc::getuid() };
+            let tmpdir = std::env::var("TMUX_TMPDIR").unwrap_or_else(|_| "/tmp".into());
+            let dir = std::path::Path::new(&tmpdir).join(format!("tmux-{uid}"));
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                return;
+            };
+            let pid = std::process::id().to_string();
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                let base = name.trim_end_matches('=');
+                if !base.starts_with("tako-coretest-") {
+                    continue;
+                }
+                // 自プロセスのソケットはスキップ（テスト前半で作って後半で使う場合）
+                if base.contains(&pid) {
+                    continue;
+                }
+                kill_server(base);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+impl Drop for TmuxTestGuard {
+    fn drop(&mut self) {
+        for socket in &self.0 {
+            kill_server(socket);
+        }
     }
 }
 
@@ -395,13 +460,7 @@ mod tests {
             return;
         }
         let socket = format!("tako-coretest-{}-grace", std::process::id());
-        struct Cleanup(String);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                kill_server(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(socket.clone());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
         // detached セッションを直接作る（クライアント無し = attached 0。
         // 作成直後なので session_activity は「今」= 実行中 worker の状態を再現）
         let session = "tako-grace-victim";
@@ -457,13 +516,7 @@ mod tests {
             return;
         }
         let socket = format!("tako-coretest-{}", std::process::id());
-        struct Cleanup(String);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                kill_server(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(socket.clone());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
         let session = "tako-e2e-persist";
         // rc ファイルを読まない /bin/sh で決定的に
         let base = SpawnOptions {
@@ -527,13 +580,7 @@ mod tests {
             return;
         }
         let socket = format!("tako-coretest-osc-{}", std::process::id());
-        struct Cleanup(String);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                kill_server(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(socket.clone());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
         // シェル統合（ZDOTDIR 等）+ TAKO_PANE_ID（統合スクリプトの発動条件）。
         // コマンドは指定しない = tmux の default-shell（SHELL 環境変数）経由で
         // ログインシェルが直接 spawn され、シェル統合が本番と同じ経路で効く
@@ -576,13 +623,7 @@ mod tests {
             return;
         }
         let socket = format!("tako-coretest-mouse-{}", std::process::id());
-        struct Cleanup(String);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                kill_server(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(socket.clone());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
         // 内側アプリ: SGR マウス + kitty keyboard を要求してから受信バイトを表示
         let options = SpawnOptions {
             command: Some(SpawnCommand {
@@ -701,13 +742,7 @@ mod tests {
             return;
         }
         let socket = format!("tako-coretest-flood-{}", std::process::id());
-        struct Cleanup(String);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                kill_server(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(socket.clone());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
         // 内側アプリ: SGR マウス要求 + raw mode + ESC を「^[」に可視化して即時 echo
         // （claude 等の raw mode TUI が受け取るバイト列の観測装置）
         let inner = r#"stty raw -echo; printf '\033[?1000h\033[?1006h'; exec perl -e '$|=1; while (sysread(STDIN,$b,4096)) { $b =~ s/\x1b/^[/g; syswrite(STDOUT,$b) }'"#;
@@ -817,13 +852,7 @@ mod tests {
             return;
         }
         let socket = format!("tako-coretest-esc-{}", std::process::id());
-        struct Cleanup(String);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                kill_server(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(socket.clone());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
         // 内側アプリ: kitty を**要求しない** cat -v（素の zsh で Esc を押した状況の再現）
         let options = SpawnOptions {
             command: Some(SpawnCommand {
@@ -931,14 +960,7 @@ mod tests {
         }
         let backend = format!("tako-coretest-nestw-{}", std::process::id());
         let nested = format!("tako-coretest-nestw-in-{}", std::process::id());
-        struct Cleanup(String, String);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                kill_server(&self.0);
-                kill_server(&self.1);
-            }
-        }
-        let _cleanup = Cleanup(backend.clone(), nested.clone());
+        let _cleanup = TmuxTestGuard::new(vec![backend.clone(), nested.clone()]);
         let session = spawn_nested(
             &backend,
             &nested,
@@ -1003,14 +1025,7 @@ mod tests {
         }
         let backend = format!("tako-coretest-nestk-{}", std::process::id());
         let nested = format!("tako-coretest-nestk-in-{}", std::process::id());
-        struct Cleanup(String, String);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                kill_server(&self.0);
-                kill_server(&self.1);
-            }
-        }
-        let _cleanup = Cleanup(backend.clone(), nested.clone());
+        let _cleanup = TmuxTestGuard::new(vec![backend.clone(), nested.clone()]);
         let session = spawn_nested(
             &backend,
             &nested,
@@ -1055,13 +1070,7 @@ mod tests {
             return;
         }
         let socket = format!("tako-coretest-cjk-{}", std::process::id());
-        struct Cleanup(String);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                kill_server(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(socket.clone());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
         let options = SpawnOptions {
             // 出力経路を直接検証する（タイプ入力を経由しない）: 日本語を printf して待機
             command: Some(SpawnCommand {
@@ -1110,13 +1119,7 @@ mod tests {
             return;
         }
         let socket = format!("tako-coretest-ind-{}", std::process::id());
-        struct Cleanup(String);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                kill_server(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(socket.clone());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
         // 100 行出力して待機する sh（通常画面・非マウス。Claude Code と同型）
         let options = SpawnOptions {
             command: Some(SpawnCommand {
@@ -1204,13 +1207,7 @@ mod tests {
             return;
         }
         let socket = format!("tako-coretest-sync-{}", std::process::id());
-        struct Cleanup(String);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                kill_server(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(socket.clone());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
         let tmux = crate::tmux::tmux_bin();
         // 旧バージョン相当: conf 無し（/dev/null）でサーバーを起動しておく
         let status = Command::new(tmux)
@@ -1295,13 +1292,7 @@ mod tests {
             return;
         }
         let socket = format!("tako-coretest-alt-{}", std::process::id());
-        struct Cleanup(String);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                kill_server(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(socket.clone());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
         // 内側: alt screen に入るだけでマウスは要求しない（claude を内包する
         // ネスト tmux クライアントや less / vim 既定がこの形）
         let options = SpawnOptions {

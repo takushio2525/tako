@@ -202,16 +202,7 @@ fn send_copy_command(target: &ScrollTarget, command: &str, count: usize) {
 mod tests {
     use super::*;
     use crate::terminal::{SpawnCommand, SpawnOptions};
-    use crate::tmux_backend::{available, kill_server, wrap_options};
-
-    struct Cleanup(Vec<String>);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            for socket in &self.0 {
-                kill_server(socket);
-            }
-        }
-    }
+    use crate::tmux_backend::{available, wrap_options, TmuxTestGuard};
 
     fn lines_command() -> String {
         "i=0; while [ $i -lt 100 ]; do echo LINE-$i; i=$((i+1)); done; exec sleep 60".into()
@@ -237,7 +228,7 @@ mod tests {
             return;
         }
         let socket = format!("tako-coretest-scr-{}", std::process::id());
-        let _cleanup = Cleanup(vec![socket.clone()]);
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
         let options = SpawnOptions {
             command: Some(SpawnCommand {
                 program: "/bin/sh".into(),
@@ -304,7 +295,7 @@ mod tests {
             return;
         }
         let socket = format!("tako-coretest-scr0-{}", std::process::id());
-        let _cleanup = Cleanup(vec![socket.clone()]);
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
         let options = SpawnOptions {
             command: Some(SpawnCommand {
                 program: "/bin/sh".into(),
@@ -356,7 +347,7 @@ mod tests {
         }
         let backend = format!("tako-coretest-scrn-{}", std::process::id());
         let nested = format!("tako-coretest-scrn-in-{}", std::process::id());
-        let _cleanup = Cleanup(vec![backend.clone(), nested.clone()]);
+        let _cleanup = TmuxTestGuard::new(vec![backend.clone(), nested.clone()]);
         let conf_path = std::env::temp_dir().join(format!("tako-scrn-conf-{nested}"));
         std::fs::write(&conf_path, crate::tmux_backend::NESTED_TMUX_SNIPPET)
             .expect("ネスト conf を書ける");
