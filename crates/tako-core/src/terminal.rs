@@ -222,6 +222,13 @@ pub struct TerminalSession {
     tty_name: Option<String>,
     /// 検知された listen ポート（FR-2.4.2。UI 層のポーリングが更新する）
     listen_ports: Vec<crate::ports::ListenPort>,
+    /// サブライン表示の下方向端数（0.0..1.0 行）。表示位置 = display_offset - fract。
+    /// ピクセル単位スムーススクロール（#159）の描画専用状態で、グリッドには影響しない。
+    /// ロック順序は fract → term に固定（逆順取得をしない）
+    scroll_fract: std::sync::Mutex<f32>,
+    /// 転送系ホイール（mouse reporting / alternate scroll）の行未満端数の持ち越し。
+    /// トラックパッドの微小デルタを都度切り捨てると無反応になるため積分する
+    wheel_carry: std::sync::Mutex<f32>,
 }
 
 impl TerminalSession {
@@ -319,6 +326,8 @@ impl TerminalSession {
                 command_state: CommandState::default(),
                 tty_name,
                 listen_ports: Vec::new(),
+                scroll_fract: std::sync::Mutex::new(0.0),
+                wheel_carry: std::sync::Mutex::new(0.0),
             },
             rx,
         ))
@@ -352,6 +361,8 @@ impl TerminalSession {
         if (cols, rows) == (self.cols, self.rows) {
             return;
         }
+        // リサイズは reflow で行構成が変わるため端数はリセット（整数位置へスナップ）
+        *self.scroll_fract.lock().unwrap() = 0.0;
         self.term.lock().resize(TermSize::new(cols, rows));
         self.notifier.on_resize(WindowSize {
             num_lines: rows as u16,
@@ -376,9 +387,41 @@ impl TerminalSession {
         self.write(paste_payload(text, bracketed));
     }
 
-    /// スクロールバック表示を行数ぶん動かす（正で過去方向）
+    /// スクロールバック表示を行数ぶん動かす（正で過去方向）。
+    /// 行単位 API（CLI / MCP・キーボード）なので端数はリセットして整数位置へスナップする
     pub fn scroll_display(&self, delta_lines: i32) {
+        let mut fract = self.scroll_fract.lock().unwrap();
+        *fract = 0.0;
         self.term.lock().scroll_display(Scroll::Delta(delta_lines));
+    }
+
+    /// スクロールバック表示を行の小数単位で動かす（正で過去方向）。
+    /// ピクセル単位スムーススクロール（#159）の中核: 整数部は alacritty の
+    /// display_offset、端数は `scroll_fract`（描画時のサブラインオフセット）に
+    /// 分解して保持する。表示位置 pos = display_offset - fract（fract ∈ [0,1)）
+    pub fn scroll_pixels(&self, delta_rows: f32) {
+        let mut fract = self.scroll_fract.lock().unwrap();
+        let mut term = self.term.lock();
+        let offset = term.grid().display_offset();
+        let history = term.grid().history_size();
+        let (delta_int, new_fract) = subline_scroll(offset, *fract, delta_rows, history);
+        if delta_int != 0 {
+            term.scroll_display(Scroll::Delta(delta_int));
+        }
+        *fract = new_fract;
+    }
+
+    /// 表示位置（行。0.0 = 最下部、増えると過去方向）。スクロールバーの位置計算用
+    pub fn scroll_position(&self) -> f32 {
+        let fract = *self.scroll_fract.lock().unwrap();
+        let offset = self.term.lock().grid().display_offset() as f32;
+        (offset - fract).max(0.0)
+    }
+
+    /// 表示位置を行の小数で直接指定する（スクロールバードラッグ用）
+    pub fn scroll_to_position(&self, pos: f32) {
+        let current = self.scroll_position();
+        self.scroll_pixels(pos - current);
     }
 
     /// マウスホイール入力。端末モードに応じて PTY 転送（mouse reporting /
@@ -394,6 +437,31 @@ impl TerminalSession {
         }
     }
 
+    /// マウスホイール入力の行小数版（GPUI のホイール / トラックパッドイベント用）。
+    /// 表示スクロールは `scroll_pixels`（サブライン描画）、PTY 転送（mouse reporting /
+    /// alternate scroll）は行未満を `wheel_carry` で積分して整数行だけ送る
+    pub fn scroll_wheel_px(&self, delta_rows: f32, col: usize, row: usize) {
+        let mode = *self.term.lock().mode();
+        let forwards = mode.intersects(TermMode::MOUSE_MODE) || mode.contains(TermMode::ALT_SCREEN);
+        if forwards {
+            let mut carry = self.wheel_carry.lock().unwrap();
+            *carry += delta_rows;
+            let lines = carry.trunc() as i32;
+            *carry -= lines as f32;
+            drop(carry);
+            if lines != 0 {
+                match wheel_action(mode, lines, col, row) {
+                    WheelAction::Write(bytes) => self.notifier.notify(bytes),
+                    // ALT_SCREEN + alternate scroll OFF は何もしない（履歴が無い）
+                    WheelAction::ScrollDisplay(_) | WheelAction::None => {}
+                }
+            }
+        } else {
+            *self.wheel_carry.lock().unwrap() = 0.0;
+            self.scroll_pixels(delta_rows);
+        }
+    }
+
     /// スクロールバック表示のオフセット（行。0 = 最下部）
     pub fn display_offset(&self) -> usize {
         self.term.lock().grid().display_offset()
@@ -404,8 +472,11 @@ impl TerminalSession {
         self.term.lock().grid().history_size()
     }
 
-    /// スクロールバック表示を絶対位置へ動かす（0 = 最下部。history を超えると先頭へクランプ）
+    /// スクロールバック表示を絶対位置へ動かす（0 = 最下部。history を超えると先頭へクランプ）。
+    /// 行単位 API なので端数はリセットして整数位置へスナップする
     pub fn scroll_to(&self, offset: usize) {
+        let mut fract = self.scroll_fract.lock().unwrap();
+        *fract = 0.0;
         let mut term = self.term.lock();
         let current = term.grid().display_offset() as i32;
         let target = offset.min(term.grid().history_size()) as i32;
@@ -435,6 +506,8 @@ impl TerminalSession {
     }
 
     pub fn scroll_to_bottom(&self) {
+        let mut fract = self.scroll_fract.lock().unwrap();
+        *fract = 0.0;
         let mut term = self.term.lock();
         if term.grid().display_offset() != 0 {
             term.scroll_display(Scroll::Bottom);
@@ -536,14 +609,16 @@ impl TerminalSession {
         true
     }
 
-    /// 表示中グリッドの色解決済みスナップショット（描画・読み取りの基盤）
+    /// 表示中グリッドの色解決済みスナップショット（描画・読み取りの基盤）。
+    /// サブライン端数（`scroll_fract`）と部分表示用の追加行も含む
     pub fn screen(&self, theme: &Theme) -> Screen {
-        screen::snapshot(&self.term.lock(), theme)
+        self.screen_opts(theme, true)
     }
 
     /// カーソル強調を抑止できる版（tmux copy-mode スクロール中の描画用）
     pub fn screen_opts(&self, theme: &Theme, show_cursor: bool) -> Screen {
-        screen::snapshot_opts(&self.term.lock(), theme, show_cursor)
+        let fract = *self.scroll_fract.lock().unwrap();
+        screen::snapshot_opts(&self.term.lock(), theme, show_cursor, fract)
     }
 
     /// 表示行を文字列で返す（装飾なし。セルフテスト・将来の `tako read` 用）
@@ -784,6 +859,17 @@ impl CommandState {
     }
 }
 
+/// サブラインスクロールの位置計算（純関数）。
+/// 表示位置 pos = offset - fract（0.0 = 最下部、増えると過去方向）に delta_rows を
+/// 加算し、[0, history] へクランプして (display_offset の増減, 新しい fract) を返す。
+/// display_offset = ceil(pos) / fract = ceil(pos) - pos ∈ [0, 1) の分解を保つ
+fn subline_scroll(offset: usize, fract: f32, delta_rows: f32, history: usize) -> (i32, f32) {
+    let pos = (offset as f32 - fract).max(0.0);
+    let new_pos = (pos + delta_rows).clamp(0.0, history as f32);
+    let new_offset = new_pos.ceil();
+    (new_offset as i32 - offset as i32, new_offset - new_pos)
+}
+
 /// ホイール入力の出し分け先
 #[derive(Debug, PartialEq, Eq)]
 enum WheelAction {
@@ -983,6 +1069,37 @@ mod tests {
         );
         // 0 行は無視
         assert_eq!(wheel_action(base, 0, 0, 0), WheelAction::None);
+    }
+
+    #[test]
+    fn サブラインスクロールの位置計算() {
+        // 最下部から半行遡る → offset 1 / fract 0.5（表示位置 = 1 - 0.5 = 0.5）
+        assert_eq!(subline_scroll(0, 0.0, 0.5, 100), (1, 0.5));
+        // さらに半行 → ちょうど 1 行（fract 0 に収束）
+        assert_eq!(subline_scroll(1, 0.5, 0.5, 100), (0, 0.0));
+        // 半行から戻す → 最下部へ（offset も fract も 0）
+        assert_eq!(subline_scroll(1, 0.5, -0.5, 100), (-1, 0.0));
+        // 最下部でさらに下 → 動かない（クランプ）
+        assert_eq!(subline_scroll(0, 0.0, -5.0, 100), (0, 0.0));
+        // 最古行でさらに上 → 動かない（クランプ）
+        assert_eq!(subline_scroll(100, 0.0, 3.0, 100), (0, 0.0));
+        // 履歴ゼロ（alt screen 等）では常に最下部のまま
+        assert_eq!(subline_scroll(0, 0.0, 0.25, 0), (0, 0.0));
+        // 整数行ぴったりのスクロールでは fract が発生しない
+        assert_eq!(subline_scroll(0, 0.0, 3.0, 100), (3, 0.0));
+        // 2.25 行遡り → offset 3 / fract 0.75（表示位置 2.25）
+        let (d, f) = subline_scroll(0, 0.0, 2.25, 100);
+        assert_eq!(d, 3);
+        assert!((f - 0.75).abs() < 1e-5);
+        // 微小デルタの積分: 0.1 行 × 10 回 ≒ 1 行（f32 誤差は 1e-4 以内）
+        let (mut off, mut fr) = (0usize, 0.0f32);
+        for _ in 0..10 {
+            let (d, nf) = subline_scroll(off, fr, 0.1, 100);
+            off = (off as i32 + d) as usize;
+            fr = nf;
+        }
+        let pos = off as f32 - fr;
+        assert!((pos - 1.0).abs() < 1e-4, "pos={pos}");
     }
 
     #[test]
