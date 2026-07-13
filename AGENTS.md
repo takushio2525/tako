@@ -60,6 +60,7 @@ tako/
 | 操作 | コマンド |
 |---|---|
 | dev（最小ターミナル起動） | `cargo run -p tako-app` |
+| **実験・検証用の隔離起動（本番 GUI 稼働中は必須。#177）** | `TAKO_ISOLATED=1 cargo run -p tako-app`（discovery / persist / tmux socket を一括隔離。個別の `TAKO_DISCOVERY_DIR` だけの隔離は本番セッション強奪を起こすため**禁止**） |
 | セルフテスト起動（入力経路 + CLI / MCP e2e の機械検証） | `TAKO_SELF_TEST=1 cargo run -p tako-app` |
 | 実 claude の Shift+Enter 改行 e2e（#28。要 claude CLI + 認証） | `TAKO_SELF_TEST=1 TAKO_SELF_TEST_CLAUDE=1 cargo run -p tako-app`（セルフテスト 45c として実行） |
 | Claude Code 実機検証（MCP 設定ゼロ接続） | `scripts/verify-claude-mcp.sh`（要 claude CLI + 認証） |
@@ -79,6 +80,7 @@ tako/
 | ファイルツリーフォルダ操作 | `tako tree add <path>` / `tako tree remove <path>` / `tako tree list`（AI がプロジェクトフォルダを明示追加。#134） |
 | Web ビューペイン操作 | `tako web open <url>` / `list` / `show <id>` / `hide` / `close` / `nav <to>` / `eval <js>` / `eval-result <token>` / `read`（ネイティブ WKWebView ペイン。#155） |
 | エージェント共通ルール同期 | `tako agents sync-rules` / `tako agents status`（正本から各エージェントのグローバル指示ファイルへマーカーブロック同期。#136） |
+| レイアウト復旧（タブ・ペイン大量消失時。#177） | `tako recover`（バックアップ世代一覧）→ tako 終了 → `tako recover --apply <世代>` → tako 再起動。実体 tmux セッションの個別取り込みは `tako tmux open --socket tako --pane <N> <session>` |
 | target 掃除 | `scripts/clean-target.sh`（dry-run。`--run` で実行。cargo clean + worktree prune） |
 
 CI（`.github/workflows/ci.yml`）は macOS / Windows の両ランナーで build + test を回す。

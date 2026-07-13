@@ -4,44 +4,42 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-13・v0.4.0 リリース済み + #169 projects.yaml 全消失の根治）
+## 現在の対象（2026-07-13・#177 全ペイン消失の根治）
 
-**v0.4.0 リリース済み**（tag `v0.4.0` = `98b17ea`、バイナリ付き GitHub Release、
-Pages デプロイ、homebrew-tako cask 0.4.0 更新済み）。夜間リリースは launchd
-ローカルジョブへ移行（#166 / PR #170。`com.takushio.tako-nightly-release` 毎日 5:00）。
+**#177（UI から全ターミナルペイン消失）を根本修正**。根本原因は多重起動ガード（#113）の
+構造的な穴: ガードの判定材料が discovery（control.json）だけなのに、守るべき資源
+（layout.json = HOME 固定 / tmux セッション = TAKO_TMUX_SOCKET）は別の環境変数で
+差し替わる。`TAKO_DISCOVERY_DIR` だけ隔離した dev 検証起動（worker の実験、16:53:47）が
+プライマリ判定 → 本番 layout.json を復元 → `new-session -A -D` が本番 GUI の
+クライアント 13 本を強奪 → PTY 一斉死亡 → 定期保存が縮退 layout を上書き、の連鎖。
 
-#169（orchestrator projects.yaml が並行 add で 58 件 → 1 件に全消失）を根本修正。
-根本原因は三段連鎖: ①旧 save = `std::fs::write`（truncate → write の窓で並行プロセスに
-空 / 部分ファイルが見える）②serde_yaml が空 / 部分内容を「0 件」として**成功**パース
-（`#[serde(default)]` + 空 = null。エラーにならない）③read-modify-write のプロセス間
-直列化なし（GUI の MCP dispatch と CLI が別プロセス）。
+対策（三層防御 + 復旧）:
+- **復元強奪ガード**（FR-5.10）: 復元前に `tmux list-clients` を走査し、生きた別
+  tako-app 配下のクライアントが attach 中ならセカンダリ降格
+- **縮退保存ガード**（FR-5.11）: ペイン数半減の保存前に `.bak.1`〜`.bak.3` 世代退避
+  （bak.1 が 10 分以内は回転しない = 連鎖縮退での押し出し防止）
+- **`TAKO_ISOLATED=1`**: discovery / persist / tmux socket の一括隔離（片脚隔離の根絶）
+- **`tako recover`**: バックアップ一覧 / `--apply <世代>` 復元（稼働中は拒否、--force あり）
+- persist.log 全行に `[pid N]` 付与
 
-- 新設 `tako-control::config_io`: アトミック書き込み（tmp + fsync + rename）/
-  `<path>.lock` 排他 flock（std `File::lock`）/ `.bak.1`〜`.bak.3` 世代バックアップ
-- `ProjectsConfig::mutate`・`Profile::mutate_named`・`setup::mutate_config` で
-  ロック付き RMW に統一。パース失敗時は**一切書き込まず Err**（fail-loud）
-- 横展開: profiles set の `unwrap_or_default()` 握りつぶし修正、config.yaml の RMW
-  ロック化、`ensure_defaults` の TOCTOU 解消
-- 詳細は `.agent/architecture.md`「設定ファイル I/O の安全化」節
+詳細は `.agent/architecture.md`「多重インスタンスの資源保護」節。
 
-## 検証済み（#169）
+## 検証済み（#177）
 
-- workspace build / test（507 tests）/ fmt / clippy（-D warnings）全緑
-- 根本原因の実証テスト 2 本（空 YAML の 0 件成功パース / truncate 窓での 58→1 再現）
-- 実機 before/after: 修正前バイナリ = 並行 add 60 件で 48 件消失を再現 →
-  修正後 = 118/118 全件残存 + bak 3 世代生成 + 破損 YAML add 拒否（exit=1・ファイル不変）+
-  bak.1 からの復元 → add 再開成功（すべて隔離 HOME、本物の projects.yaml 不使用）
+- workspace build / test / fmt / clippy(-D warnings) 全緑 + 隔離セルフテスト完走（OK・FAILED 0）
+- 実機 e2e（隔離 HOME + 専用 socket、本番不接触）: 修正後 = 事故条件（discovery のみ隔離）の
+  後発インスタンスがセカンダリ降格し先発の 4 クライアント無傷 / FORCE_PRIMARY バイパスで
+  事故経路を再現（クライアント全交代 = 強奪）→ 縮退保存直前に bak.1（5 ペイン版）自動退避 →
+  `tako recover --apply 1` → 再起動で「2 タブ / 5 ペイン（tmux 再 attach 4）」完全復旧
 
 ## 次の一手
 
-- #169: squash merge → `build-app.sh --install` → Issue クローズ
-- 明朝 5:00 の夜間ジョブ初回実行を監視: main が v0.4.0 タグより先行しているため
-  v0.4.1 が自動リリースされる見込み = 全経路の初通し検証
+- fix/177 を PR → squash merge → `build-app.sh --install` → Issue クローズ
 - tako 再起動後の GUI 確認（manual-checks.md）: 「Web ビューペイン」節（#155）、
   「#153 節」（cmd ホバー装飾）、「#152 節」（PDF 選択・色分け）+ Cmd-Q 経過観察（#103）
 - Phase 5 の次候補は FR-2.19 localhost ポートパネル・FR-3.10 画像プレビュー等
 
 ## 現フェーズで Read すべき設計書
 
+- 多重インスタンスの資源保護（#177）: `.agent/architecture.md` 該当節
 - 設定ファイル I/O の安全化（#169）: `.agent/architecture.md` 該当節
-- Web ビュー実装詳細と z オーダー制約: `.agent/architecture.md`「Web ビューペイン」節

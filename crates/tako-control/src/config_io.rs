@@ -107,8 +107,10 @@ pub fn backup_path(path: &Path, generation: u32) -> PathBuf {
 
 /// 既存ファイルを `.bak.1` へ複製し、既存バックアップを 1 世代ずつ繰り下げる。
 /// 本体 → `.bak.1` は rename ではなく copy を使う（rename だと本体が一瞬消え、
-/// 並行プロセスの load が「ファイル不在 = 0 件」と誤読する窓を作るため）
-fn rotate_backups(path: &Path) -> Result<(), String> {
+/// 並行プロセスの load が「ファイル不在 = 0 件」と誤読する窓を作るため）。
+/// `atomic_write_with_backup` は毎書き込みで回すが、呼び出し側が独自条件で
+/// 世代を残したい場合（layout.json の縮退保存ガード。#177）は単体でも使える
+pub fn rotate_backups(path: &Path) -> Result<(), String> {
     if !path.is_file() {
         return Ok(());
     }

@@ -377,13 +377,77 @@ enum CloseReason {
 /// persist 診断ログ（Issue #30）: `<data_dir>/persist.log` へ追記 + stderr へも出す
 /// （ターミナル起動時に見える）。Dock 起動の .app では stderr が届かないため、
 /// 「再起動でタブが消えた」原因をファイルで追えるようにする。
-/// セルフテスト中はユーザーの persist.log を汚さない
+/// セルフテスト中はユーザーの persist.log を汚さない。
+/// pid を付与するのは、複数インスタンス（本番 + 実験起動）のログが同じファイルに
+/// 混ざったとき、どの行がどの起動のものかを事後調査で切り分けるため（#177）
 fn persist_diag(msg: &str) {
     if std::env::var_os("TAKO_SELF_TEST").is_some() {
         return;
     }
+    let msg = format!("{msg} [pid {}]", std::process::id());
     eprintln!("persist: {msg}");
-    tako_control::diag::persist_log(msg);
+    tako_control::diag::persist_log(&msg);
+}
+
+/// 復元強奪ガード（#177）: これから復元 attach しようとする tmux セッションに
+/// **生きた別 tako-app 配下のクライアント**が attach 中なら、そのセッション群は
+/// 別インスタンスが表示中なのでセカンダリ降格の理由を返す。
+///
+/// 多重起動ガード（#113）は control.json（discovery）だけを見るため、
+/// `TAKO_DISCOVERY_DIR` を隔離した起動や control.json の消失で盲目になる
+/// （実機 2026-07-13: discovery だけ隔離した dev 起動がプライマリ判定 →
+/// 本番 layout.json を復元 → `new-session -A -D` が稼働中インスタンスの
+/// クライアント 13 本を強奪 → PTY 一斉死亡 + 縮退 layout 上書き）。
+/// 判定材料を「守るべき資源そのもの」に置くことで隔離変数の組合せに依存しない。
+///
+/// 手動の `tmux attach`（ターミナル.app 等の配下）は tako-app 祖先を持たないため
+/// 対象外（従来どおり -D で引き継ぐ）。正当な再起動では旧インスタンスの死亡と同時に
+/// クライアントも死ぬ（PTY 閉鎖 → SIGHUP）ため、このガードは発動しない
+fn foreign_client_guard() -> Option<String> {
+    if !initial_tmux_persist() || !tako_core::tmux_backend::available() {
+        return None;
+    }
+    let file = tako_control::layout::try_load().ok()?;
+    let sessions: std::collections::HashSet<&str> = file.sessions().into_iter().collect();
+    if sessions.is_empty() {
+        return None;
+    }
+    let socket = tako_core::tmux_backend::socket_name();
+    let clients: Vec<(u32, String)> = tako_core::tmux::list_client_pids(Some(&socket))
+        .into_iter()
+        .filter(|(_, session)| sessions.contains(session.as_str()))
+        .collect();
+    if clients.is_empty() {
+        return None;
+    }
+    let parents = tako_control::agents::process_parent_map();
+    for (pid, session) in &clients {
+        if let Some(owner) = live_foreign_tako_ancestor(*pid, &parents) {
+            return Some(format!(
+                "復元対象の tmux セッション {session} に別の tako（pid {owner}）のクライアントが attach 中（表示中の資源は強奪しない）"
+            ));
+        }
+    }
+    None
+}
+
+/// `pid` の祖先（自身を含む）から「自プロセス以外の生きた tako-app」を探す。
+/// tmux クライアントは tako-app が spawn した PTY の子プロセスなので、
+/// 祖先を辿れば所有インスタンスに行き着く
+fn live_foreign_tako_ancestor(pid: u32, parents: &HashMap<u32, u32>) -> Option<u32> {
+    let me = std::process::id();
+    let mut current = pid;
+    // 祖先チェーンの上限（循環 ppid への防御。実際は数ホップで launchd に到達する）
+    for _ in 0..32 {
+        if current != me && tako_core::ports::is_live_tako_app(current) {
+            return Some(current);
+        }
+        match parents.get(&current) {
+            Some(&parent) if parent != 0 && parent != current => current = parent,
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// 起動時 orphan cleanup の猶予（秒）。最終アクティビティがこれより新しい detached
@@ -1130,8 +1194,12 @@ impl TakoApp {
         } else if in_process_secondary {
             Some("同一プロセスの先行ウィンドウがプライマリ".into())
         } else {
+            // discovery ベースの判定は TAKO_DISCOVERY_DIR の隔離や control.json の
+            // 消失で盲目になるため、守るべき資源そのもの（復元対象 tmux セッションの
+            // クライアント）を見る第二ガードを重ねる（#177）
             tako_control::discovery::live_primary_pid()
                 .map(|pid| format!("別の tako プロセス（pid {pid}）が稼働中"))
+                .or_else(foreign_client_guard)
         };
         let secondary = secondary_reason.is_some();
 
@@ -8046,6 +8114,31 @@ fn open_new_window(cx: &mut App) {
 }
 
 fn main() {
+    // 一括隔離モード（#177）: TAKO_ISOLATED=1 だけで本番リソース（layout.json /
+    // tmux バックエンド / discovery）に一切触れない起動になる。実験・検証で個別の
+    // 隔離変数を指定し漏らす事故（TAKO_DISCOVERY_DIR だけ隔離した dev 起動が
+    // プライマリ判定 → 本番 layout を復元 → 稼働中インスタンスの tmux クライアントを
+    // 強奪）への構造対策。個別変数が明示されていればそちらを尊重する
+    if matches!(
+        std::env::var("TAKO_ISOLATED").ok().as_deref(),
+        Some("1" | "true" | "on")
+    ) {
+        if std::env::var_os("TAKO_PERSIST").is_none() {
+            std::env::set_var("TAKO_PERSIST", "0");
+        }
+        if std::env::var_os("TAKO_TMUX_SOCKET").is_none() {
+            std::env::set_var(
+                "TAKO_TMUX_SOCKET",
+                format!("tako-iso-{}", std::process::id()),
+            );
+        }
+        if std::env::var_os("TAKO_DISCOVERY_DIR").is_none() {
+            std::env::set_var(
+                "TAKO_DISCOVERY_DIR",
+                std::env::temp_dir().join(format!("tako-iso-discovery-{}", std::process::id())),
+            );
+        }
+    }
     // セルフテストの tmux バックエンド項目は、ユーザーの実バックエンド（tako サーバー）を
     // 汚さない隔離ソケットで行う（終了時に self_test 側が kill-server で片付ける）
     if std::env::var_os("TAKO_SELF_TEST").is_some()
@@ -12913,6 +13006,34 @@ fn accumulate_scroll(carry: f32, delta_lines: f32) -> (i32, f32) {
     let total = carry + delta_lines;
     let lines = total.trunc() as i32;
     (lines, total - lines as f32)
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::live_foreign_tako_ancestor;
+    use std::collections::HashMap;
+
+    // 検出の正常系（祖先に生きた tako-app が居る）は実プロセスが必要なため
+    // 実機 e2e（隔離 HOME での before/after 実証）で担保する。ここでは
+    // 否定系と防御（循環 ppid・自プロセス除外）を固定する
+
+    #[test]
+    fn 祖先に生きたtakoが無ければ検出しない() {
+        // 100 → 50 → 1（launchd 相当）。どれも tako-app ではない
+        let parents: HashMap<u32, u32> = [(100, 50), (50, 1)].into();
+        assert_eq!(live_foreign_tako_ancestor(100, &parents), None);
+    }
+
+    #[test]
+    fn ppidの循環でも無限ループしない() {
+        let parents: HashMap<u32, u32> = [(100, 50), (50, 100)].into();
+        assert_eq!(live_foreign_tako_ancestor(100, &parents), None);
+    }
+
+    #[test]
+    fn 親情報が無いpidは検出しない() {
+        assert_eq!(live_foreign_tako_ancestor(12345, &HashMap::new()), None);
+    }
 }
 
 #[cfg(test)]

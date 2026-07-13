@@ -623,3 +623,14 @@
   projects.yaml / profiles/*.yaml / config.yaml の書き込みを集約、mutate 系 API で fail-loud 化
 - 検証: 507 tests / fmt / clippy 全緑 + 実機 before/after（修正前 = 並行 add 60 件で 48 件消失、
   修正後 = 118/118 全件残存・破損 YAML 拒否・bak 復元成功。隔離 HOME）
+
+## 2026-07-13（#177: 全ターミナルペイン消失の根治 — 復元強奪ガード + 縮退保存ガード + tako recover）
+- 根本原因を worker トランスクリプト + persist.log[pid] + perf.log で特定: TAKO_DISCOVERY_DIR だけ
+  隔離した dev 検証起動が多重ガード（control.json のみ参照）を素通り → 本番 layout 復元 →
+  `-A -D` が本番 GUI のクライアント 13 本を強奪 → PTY 一斉死亡 → 縮退 layout 上書き（16:53 の
+  「再起動」は実在せず。クラッシュレポート無し・本番プロセスは 16:57 の kill -9 まで生存）
+- 三層防御: 復元強奪ガード（FR-5.10。list-clients + 祖先辿りでセカンダリ降格）/ 縮退保存ガード
+  （FR-5.11。半減保存前に .bak.1〜3 退避 + 10 分回転ガード）/ TAKO_ISOLATED=1 一括隔離。
+  + `tako recover`（一覧 / --apply / --force）+ persist.log 行に pid + README 復旧手順
+- 検証: 全緑 + 隔離セルフテスト完走 + 実機 e2e（強奪防止・事故再現・bak 退避・recover 復旧の通し）
+- 次: PR squash merge → install → Issue クローズ

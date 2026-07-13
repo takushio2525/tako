@@ -12,6 +12,7 @@
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tako_core::{
@@ -64,6 +65,48 @@ pub struct LayoutFile {
     /// PaneLayout.webview に載る）。旧ファイル後方互換のため default + 空省略
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub webview_dock: Vec<String>,
+}
+
+impl LayoutFile {
+    /// レイアウト内の全ペイン数（全タブの葉 + バックグラウンド）。
+    /// 縮退保存ガード（#177）が「直前よりペインが大幅に減る保存」を検出するのに使う
+    pub fn pane_count(&self) -> usize {
+        fn count(node: &NodeLayout) -> usize {
+            match node {
+                NodeLayout::Pane(_) => 1,
+                NodeLayout::Split { first, second, .. } => count(first) + count(second),
+            }
+        }
+        self.tabs.iter().map(|t| count(&t.tree)).sum::<usize>() + self.backgrounded.len()
+    }
+
+    /// レイアウト内の全 tmux バックエンドセッション名（全タブの葉 + バックグラウンド）。
+    /// 復元強奪ガード（#177）が「これから attach しようとするセッション」を知るのに使う
+    pub fn sessions(&self) -> Vec<&str> {
+        fn collect<'a>(node: &'a NodeLayout, out: &mut Vec<&'a str>) {
+            match node {
+                NodeLayout::Pane(p) => {
+                    if let Some(s) = &p.session {
+                        out.push(s);
+                    }
+                }
+                NodeLayout::Split { first, second, .. } => {
+                    collect(first, out);
+                    collect(second, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for t in &self.tabs {
+            collect(&t.tree, &mut out);
+        }
+        for p in &self.backgrounded {
+            if let Some(s) = &p.session {
+                out.push(s);
+            }
+        }
+        out
+    }
 }
 
 /// OS ウィンドウのジオメトリ（復元時は起動時のウィンドウ生成オプションに使う）
@@ -486,10 +529,12 @@ pub fn try_load() -> Result<LayoutFile, LayoutError> {
     let path = layout_path().ok_or_else(|| {
         LayoutError::Io("データディレクトリを解決できない（HOME 未設定等）".into())
     })?;
-    load_from(&path)
+    load_file(&path)
 }
 
-fn load_from(path: &Path) -> Result<LayoutFile, LayoutError> {
+/// 任意パスのレイアウトファイルを読む（`tako recover` のバックアップ世代表示・
+/// 復元前検証に使う。#177）。通常の起動復元は [`try_load`] を使うこと
+pub fn load_file(path: &Path) -> Result<LayoutFile, LayoutError> {
     let json = std::fs::read_to_string(path).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
             LayoutError::NotFound
@@ -500,7 +545,10 @@ fn load_from(path: &Path) -> Result<LayoutFile, LayoutError> {
     serde_json::from_str(&json).map_err(|e| LayoutError::Parse(e.to_string()))
 }
 
-/// 書き出し（tmp + rename。settings と同方式）
+/// 書き出し（tmp + rename。settings と同方式）。
+/// ペイン数が大幅に減る保存は、上書き前に直前の layout.json を世代バックアップ
+/// （`.bak.1`〜`.bak.3`）へ退避する（#177: tmux クライアント強奪で PTY が一斉死亡した
+/// 直後の自動保存が「正常だった構成」を上書き破壊し、復元不能になった）
 pub fn save(layout: &LayoutFile) -> io::Result<PathBuf> {
     let path = layout_path().ok_or_else(|| {
         io::Error::new(
@@ -508,8 +556,43 @@ pub fn save(layout: &LayoutFile) -> io::Result<PathBuf> {
             "データディレクトリを解決できない",
         )
     })?;
+    backup_if_degraded(&path, layout, BACKUP_MIN_INTERVAL);
     save_to(&path, layout)?;
     Ok(path)
+}
+
+/// 縮退保存とみなすしきい値: 直前 4 ペイン以上から半分未満へ減る保存。
+/// 1〜3 ペインの増減は日常操作（ペインを閉じる）なので対象外
+fn is_degraded_shrink(prev: usize, next: usize) -> bool {
+    prev >= 4 && next < prev.div_ceil(2)
+}
+
+/// 縮退の連鎖（Exited が 1 ペインずつ届き 16→15→…→3 と段階保存される）で
+/// 健全世代が bak から押し出されないよう、bak.1 がこの秒数より新しい間は回転させない
+const BACKUP_MIN_INTERVAL: Duration = Duration::from_secs(600);
+
+/// ペイン数が大幅減する保存の前に、直前の layout.json を `.bak.1`〜`.bak.3` へ退避する。
+/// バックアップ失敗で保存自体は止めない（保存できない方が復元不能に直結する）
+fn backup_if_degraded(path: &Path, next: &LayoutFile, min_interval: Duration) {
+    let Ok(prev) = load_file(path) else {
+        // 不在 = 初回保存、破損 = 退避しても復旧に使えない。どちらも対象外
+        return;
+    };
+    if !is_degraded_shrink(prev.pane_count(), next.pane_count()) {
+        return;
+    }
+    let bak1 = crate::config_io::backup_path(path, 1);
+    let bak1_fresh = std::fs::metadata(&bak1)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < min_interval);
+    if bak1_fresh {
+        return;
+    }
+    if let Err(e) = crate::config_io::rotate_backups(path) {
+        eprintln!("warning: layout.json の縮退前バックアップに失敗: {e}");
+    }
 }
 
 fn save_to(path: &Path, layout: &LayoutFile) -> io::Result<()> {
@@ -737,7 +820,7 @@ mod tests {
         let ws = sample_workspace();
         let layout = capture(&ws, &|_| PaneMeta::default(), None);
         save_to(&path, &layout).unwrap();
-        assert_eq!(load_from(&path), Ok(layout));
+        assert_eq!(load_file(&path), Ok(layout));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -749,11 +832,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("layout.json");
         // 不在 = NotFound（初回起動。異常ではない）
-        assert_eq!(load_from(&path).err(), Some(LayoutError::NotFound));
+        assert_eq!(load_file(&path).err(), Some(LayoutError::NotFound));
         // 破損 = Parse（理由文字列付き）
         std::fs::write(&path, "{ こわれた json").unwrap();
         assert!(matches!(
-            load_from(&path).err(),
+            load_file(&path).err(),
             Some(LayoutError::Parse(_))
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -776,5 +859,154 @@ mod tests {
         );
         let legacy: LayoutFile = serde_json::from_str(&legacy).unwrap();
         assert!(legacy.collapsed.is_empty());
+    }
+
+    /// n 個のターミナルペイン（全て session 持ち）を 1 タブに持つ layout を組む（#177 テスト用）
+    fn layout_with_panes(n: usize) -> LayoutFile {
+        fn pane(id: u64) -> NodeLayout {
+            NodeLayout::Pane(Box::new(PaneLayout {
+                id,
+                session: Some(format!("tako-s{id}")),
+                title: None,
+                title_source: "auto".into(),
+                role: None,
+                origin: "user".into(),
+                cwd: None,
+                claude_session_id: None,
+                preview: None,
+                webview: None,
+                origin_tab: None,
+                origin_tab_title: None,
+            }))
+        }
+        let mut tree = pane(1);
+        for id in 2..=n as u64 {
+            tree = NodeLayout::Split {
+                axis: "x".into(),
+                ratio: 0.5,
+                first: Box::new(tree),
+                second: Box::new(pane(id)),
+            };
+        }
+        LayoutFile {
+            version: LAYOUT_VERSION,
+            active_tab: 1,
+            tabs: vec![TabLayout {
+                id: 1,
+                title: "t".into(),
+                title_source: "auto".into(),
+                focused: 1,
+                tree,
+                pinned_folders: Vec::new(),
+            }],
+            window: None,
+            backgrounded: Vec::new(),
+            collapsed: Vec::new(),
+            webview_dock: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ペイン数とセッション名を数える() {
+        let mut layout = layout_with_panes(3);
+        assert_eq!(layout.pane_count(), 3);
+        assert_eq!(layout.sessions(), vec!["tako-s1", "tako-s2", "tako-s3"]);
+
+        // session の無いペイン（直接 spawn・プレビュー）は sessions に載らないが数には入る
+        if let NodeLayout::Split { second, .. } = &mut layout.tabs[0].tree {
+            if let NodeLayout::Pane(p) = second.as_mut() {
+                p.session = None;
+            }
+        }
+        // バックグラウンドのペインは数・セッションの両方に入る
+        layout.backgrounded.push(PaneLayout {
+            id: 99,
+            session: Some("tako-bg".into()),
+            title: None,
+            title_source: "auto".into(),
+            role: None,
+            origin: "user".into(),
+            cwd: None,
+            claude_session_id: None,
+            preview: None,
+            webview: None,
+            origin_tab: Some(1),
+            origin_tab_title: None,
+        });
+        assert_eq!(layout.pane_count(), 4);
+        assert_eq!(layout.sessions(), vec!["tako-s1", "tako-s2", "tako-bg"]);
+    }
+
+    #[test]
+    fn 縮退保存の判定しきい値() {
+        // 4 ペイン以上から半分未満へ減る保存だけを縮退とみなす
+        assert!(is_degraded_shrink(16, 3));
+        assert!(is_degraded_shrink(4, 1));
+        assert!(is_degraded_shrink(5, 2)); // 2 < ceil(5/2)=3
+        assert!(!is_degraded_shrink(8, 4)); // ちょうど半分は対象外
+        assert!(!is_degraded_shrink(4, 2));
+        assert!(!is_degraded_shrink(3, 1)); // 少ペインからの減少は日常操作
+        assert!(!is_degraded_shrink(16, 20)); // 増加
+        assert!(!is_degraded_shrink(16, 16)); // 不変
+    }
+
+    #[test]
+    fn 縮退保存で直前レイアウトが世代バックアップへ退避される() {
+        let dir = std::env::temp_dir().join(format!("tako-layout-degrade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("layout.json");
+        let bak1 = crate::config_io::backup_path(&path, 1);
+
+        // 不在（初回保存）では何もしない
+        backup_if_degraded(&path, &layout_with_panes(3), Duration::ZERO);
+        assert!(!bak1.exists());
+
+        // 16 ペイン → 3 ペインの縮退保存: 直前の 16 ペイン版が .bak.1 へ退避される
+        save_to(&path, &layout_with_panes(16)).unwrap();
+        backup_if_degraded(&path, &layout_with_panes(3), Duration::ZERO);
+        save_to(&path, &layout_with_panes(3)).unwrap();
+        assert_eq!(load_file(&bak1).unwrap().pane_count(), 16);
+        assert_eq!(load_file(&path).unwrap().pane_count(), 3);
+
+        // 増加・微減では回転しない（bak.1 は 16 ペイン版のまま）
+        save_to(&path, &layout_with_panes(8)).unwrap();
+        backup_if_degraded(&path, &layout_with_panes(7), Duration::ZERO);
+        save_to(&path, &layout_with_panes(7)).unwrap();
+        assert_eq!(load_file(&bak1).unwrap().pane_count(), 16);
+
+        // 破損した直前ファイルは退避対象にしない（パニックもしない）
+        let broken = dir.join("broken.json");
+        std::fs::write(&broken, "{not json").unwrap();
+        backup_if_degraded(&broken, &layout_with_panes(1), Duration::ZERO);
+        assert!(!crate::config_io::backup_path(&broken, 1).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 連鎖縮退では健全世代が押し出されない() {
+        let dir = std::env::temp_dir().join(format!("tako-layout-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("layout.json");
+        let bak1 = crate::config_io::backup_path(&path, 1);
+        let interval = Duration::from_secs(600);
+
+        // PTY 大量死は 16→7→3 のような段階保存になる。最初の縮退で bak.1 = 16 が
+        // でき、直後（interval 内）の縮退では回転せず健全世代が保持される
+        save_to(&path, &layout_with_panes(16)).unwrap();
+        backup_if_degraded(&path, &layout_with_panes(7), interval);
+        save_to(&path, &layout_with_panes(7)).unwrap();
+        assert_eq!(load_file(&bak1).unwrap().pane_count(), 16);
+        backup_if_degraded(&path, &layout_with_panes(3), interval);
+        save_to(&path, &layout_with_panes(3)).unwrap();
+        assert_eq!(
+            load_file(&bak1).unwrap().pane_count(),
+            16,
+            "連鎖縮退の 2 回目で健全世代（16 ペイン）が 7 ペイン版に置き換わってはいけない"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -93,6 +93,27 @@ pub fn has_session(socket: Option<&str>, name: &str) -> bool {
     run_tmux(socket, &["has-session", "-t", &format!("={name}")]).is_ok()
 }
 
+/// 全クライアントの (client_pid, セッション名) 一覧（`list-clients`、1 コマンド）。
+/// 復元強奪ガード（#177）が「生きた別 tako のクライアントが attach 中のセッション」を
+/// 検出するのに使う。サーバー不在・クライアント無しは空
+pub fn list_client_pids(socket: Option<&str>) -> Vec<(u32, String)> {
+    let out = run_tmux(
+        socket,
+        &["list-clients", "-F", "#{client_pid}\t#{session_name}"],
+    )
+    .unwrap_or_default();
+    parse_client_pids(&out)
+}
+
+fn parse_client_pids(out: &str) -> Vec<(u32, String)> {
+    out.lines()
+        .filter_map(|line| {
+            let (pid, session) = line.split_once('\t')?;
+            Some((pid.trim().parse().ok()?, session.trim().to_string()))
+        })
+        .collect()
+}
+
 /// grouped session の所属グループ名を返す。tmux はグループ名を「最初に作られた
 /// 元セッション名」にするため、これが事実上の「元セッション」になる
 /// （例: `tako-view-master-tako-2` → `master-tako`）。単独セッション（グループ無し）や
@@ -404,6 +425,21 @@ mod tests {
         let parsed = parse_sessions("only-name\nok\t1\t0\n", "broken\n", "broken\n");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].name, "ok");
+    }
+
+    #[test]
+    fn クライアントpid一覧をパースする() {
+        let parsed = parse_client_pids("1234\ttako-abc\n5678\tmaster-tako\n");
+        assert_eq!(
+            parsed,
+            vec![
+                (1234, "tako-abc".to_string()),
+                (5678, "master-tako".to_string())
+            ]
+        );
+        // 壊れた行（pid 非数値・タブ無し）と空入力は読み飛ばす
+        assert_eq!(parse_client_pids("x\ttako-abc\nno-tab\n"), vec![]);
+        assert!(parse_client_pids("").is_empty());
     }
 
     /// tmux クライアント子プロセスに UTF-8 ロケールが必ず注入される
