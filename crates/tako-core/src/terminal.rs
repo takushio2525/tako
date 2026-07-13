@@ -214,7 +214,7 @@ pub struct TerminalSession {
     cols: usize,
     rows: usize,
     title: Option<String>,
-    /// OSC 7 で通知された cwd（シェル統合が無ければ None のまま）
+    /// 起動時 working directory または OSC 7 で通知された cwd
     cwd: Option<PathBuf>,
     /// OSC 133 から導出したコマンド実行状態
     command_state: CommandState,
@@ -276,6 +276,10 @@ impl TerminalSession {
         env.extend(crate::shell_integration::env().iter().cloned());
         env.extend(options.env);
 
+        // 明示コマンド（Claude 等）はシェル統合の OSC 7 を発行しないことがある。
+        // PTY へ渡す起動 cwd をセッションにも保持し、相対パス解決やファイルツリーが
+        // TUI 起動直後から同じ基準ディレクトリを使えるようにする。
+        let working_directory = options.cwd.or_else(default_home_dir);
         let tty_options = tty::Options {
             // command 未指定なら既定シェルを明示解決する（login ラッパ回避。`default_shell`）
             shell: options
@@ -284,7 +288,7 @@ impl TerminalSession {
                 .map(|c| tty::Shell::new(c.program, c.args)),
             // cwd 未指定なら親プロセスの cwd（.app 起動時は `/`）ではなくホームを既定にする。
             // 元ペインの cwd 継承は OSC 7 シェル統合（Phase 4）で対応する。
-            working_directory: options.cwd.or_else(default_home_dir),
+            working_directory: working_directory.clone(),
             env,
             ..tty::Options::default()
         };
@@ -311,7 +315,7 @@ impl TerminalSession {
                 cols,
                 rows,
                 title: None,
-                cwd: None,
+                cwd: working_directory,
                 command_state: CommandState::default(),
                 tty_name,
                 listen_ports: Vec::new(),
@@ -508,7 +512,7 @@ impl TerminalSession {
         }
     }
 
-    /// OSC 7 で通知された cwd（シェル統合が無ければ None）
+    /// 起動時 working directory または OSC 7 で通知された cwd
     pub fn cwd(&self) -> Option<&std::path::Path> {
         self.cwd.as_deref()
     }

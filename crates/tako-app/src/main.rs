@@ -621,6 +621,16 @@ struct HoveredLink {
     spans: Vec<(usize, usize, usize)>,
 }
 
+impl HoveredLink {
+    fn contains(&self, pane: PaneId, row: usize, col: usize) -> bool {
+        self.pane == pane
+            && self
+                .spans
+                .iter()
+                .any(|&(r, start, end)| r == row && start <= col && col < end)
+    }
+}
+
 /// git パネルのデータスナップショット（FR-3.6 / FR-3.9）
 #[derive(Debug, Clone)]
 struct GitPanelData {
@@ -718,6 +728,42 @@ fn chunk_line_chars(infos: &[CharInfo]) -> Vec<RenderChunk> {
         });
     }
     chunks
+}
+
+/// 描画チャンク内でリンクのセル範囲に重なる UTF-8 バイト範囲を返す。
+/// StyledText のハイライトをリンク部分だけへ限定し、同じ ANSI style run の行全体へ
+/// 下線・背景色が広がるのを防ぐ。
+fn link_byte_range_in_chunk(
+    infos: &[CharInfo],
+    cell_cols: &[usize],
+    chunk: &RenderChunk,
+    link_start: usize,
+    link_end: usize,
+) -> Option<Range<usize>> {
+    let mut byte_offset = 0;
+    let mut start = None;
+    let mut end = 0;
+
+    for index in chunk.start..chunk.end {
+        let info = &infos[index];
+        let cell_start = cell_cols.get(index).copied().unwrap_or(index);
+        let cell_end = cell_start + info.char_cols;
+        let next_byte = byte_offset + info.ch.len_utf8();
+        let overlaps = if info.char_cols == 0 {
+            cell_start >= link_start && cell_start < link_end
+        } else {
+            cell_end > link_start && cell_start < link_end
+        };
+        if overlaps {
+            start.get_or_insert(byte_offset);
+            end = next_byte;
+        } else if start.is_some() {
+            break;
+        }
+        byte_offset = next_byte;
+    }
+
+    start.map(|start| start..end)
 }
 
 /// プレビューペインのテキスト選択状態
@@ -3732,6 +3778,9 @@ impl TakoApp {
         _window: &mut Window,
     ) -> Option<(usize, usize, bool)> {
         let (_, area) = self.pane_text_areas.iter().find(|(id, _)| *id == pane_id)?;
+        if !area.contains(&position) {
+            return None;
+        }
         let cell = self.cell_size_for_pane(pane_id)?;
         let session = self.terminals.get(&pane_id)?;
         let (cols, rows) = session.size();
@@ -4143,13 +4192,14 @@ impl TakoApp {
             // cmd+クリック: リンクを開く
             if event.modifiers.platform && event.click_count == 1 {
                 if let Some(link) = self.hovered_link.take() {
-                    if link.pane == pane_id {
+                    if link.contains(pane_id, row, col) {
                         self.open_link(&link.target, link.kind, pane_id, cx);
                         cx.notify();
                         return;
                     }
                 }
-                // hovered_link が無くてもその場で検出を試みる
+                // cmd を押してからマウスを動かさずクリックした場合も、その場で最新画面を検出する
+                self.refresh_pane_links(pane_id);
                 let links = self.pane_links.get(&pane_id);
                 if let Some(links) = links {
                     if let Some(link) = tako_core::link_at(links, row, col) {
@@ -4205,8 +4255,24 @@ impl TakoApp {
                         },
                         PaneOrigin::User,
                     );
-                    if let Err(e) = result {
-                        eprintln!("warning: ディレクトリを開けない: {e}");
+                    match result {
+                        Ok(_) => {
+                            // UI から dispatch を直接呼ぶため、IPC / MCP ループと同じ
+                            // pending_attach 後処理をここで実行する。これを欠くとツリー上に
+                            // 空ペインだけができ、PTY も cwd も存在しない（#153）。
+                            for (pane, options) in std::mem::take(&mut self.pending_attach) {
+                                if let Err(e) = self.spawn_session(pane, options, cx) {
+                                    eprintln!("warning: ディレクトリペインを開けない: {e}");
+                                    self.remove_pane(pane, cx);
+                                }
+                            }
+                            for (pane, data) in std::mem::take(&mut self.pending_writes) {
+                                if let Some(session) = self.terminals.get(&pane) {
+                                    session.write(data);
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("warning: ディレクトリを開けない: {e}"),
                     }
                 } else {
                     // ファイル: 右に分割してプレビュー
@@ -4288,7 +4354,7 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) {
         // cmd+ホバーでリンク検出（ボタン押下状態に関係なく判定）
-        self.update_hovered_link(event, window, cx);
+        self.update_hovered_link_at(event.position, event.modifiers.platform, window, cx);
 
         if event.pressed_button != Some(MouseButton::Left) {
             // ウィンドウ外でボタンが離されると MouseUp が届かないことがある。
@@ -4376,13 +4442,13 @@ impl TakoApp {
     }
 
     /// cmd+ホバー時のリンク検出更新
-    fn update_hovered_link(
+    fn update_hovered_link_at(
         &mut self,
-        event: &MouseMoveEvent,
+        position: Point<Pixels>,
+        cmd: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let cmd = event.modifiers.platform;
         let old = self.hovered_link.is_some();
 
         if !cmd {
@@ -4395,7 +4461,7 @@ impl TakoApp {
         // マウス位置がどのペインのどのセルか判定
         let mut found = None;
         for &(pane_id, _) in &self.pane_text_areas {
-            if let Some((col, row, _)) = self.cell_at(pane_id, event.position, window) {
+            if let Some((col, row, _)) = self.cell_at(pane_id, position, window) {
                 // リンクキャッシュを更新（ペインの画面が変わるたびにリフレッシュ）
                 self.refresh_pane_links(pane_id);
                 if let Some(links) = self.pane_links.get(&pane_id) {
@@ -4421,6 +4487,21 @@ impl TakoApp {
         if changed || old {
             cx.notify();
         }
+    }
+
+    /// cmd 単独の押下・解放でも、現在のマウス位置にあるリンク装飾を即時更新する。
+    fn on_modifiers_changed(
+        &mut self,
+        event: &gpui::ModifiersChangedEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_hovered_link_at(
+            window.mouse_position(),
+            event.modifiers.platform,
+            window,
+            cx,
+        );
     }
 
     /// ペインのリンク検出キャッシュを更新する
@@ -5164,40 +5245,39 @@ impl TakoApp {
                 let mut children: Vec<gpui::AnyElement> = Vec::with_capacity(chunks.len());
                 let link_span = link_spans.get(&row_idx);
                 for chunk in chunks {
-                    let mut hl = if chunk.run_idx < run_highlights.len() {
+                    let hl = if chunk.run_idx < run_highlights.len() {
                         run_highlights[chunk.run_idx]
                     } else {
                         self.run_highlight(&fallback_run)
                     };
-                    // cmd+ホバー中のリンク範囲にチャンクが重なるなら下線を追加
-                    if let Some(&(link_sc, link_ec)) = link_span {
-                        let chunk_sc = line
-                            .cell_cols
-                            .get(chunk.start)
-                            .copied()
-                            .unwrap_or(chunk.start);
-                        let chunk_ec = if chunk.end > 0 {
-                            line.cell_cols
-                                .get(chunk.end - 1)
-                                .copied()
-                                .unwrap_or(chunk.end - 1)
-                                + infos.get(chunk.end - 1).map_or(1, |i| i.char_cols)
-                        } else {
-                            chunk_sc
-                        };
-                        if chunk_ec > link_sc && chunk_sc < link_ec {
-                            hl.underline = Some(UnderlineStyle {
-                                thickness: px(1.0),
-                                color: Some(hsla(theme.accent)),
-                                wavy: false,
-                            });
-                            hl.color = Some(hsla(theme.accent));
-                        }
-                    }
                     let text: String = infos[chunk.start..chunk.end].iter().map(|x| x.ch).collect();
                     let text_len = text.len();
+                    let link_range = link_span.and_then(|&(link_sc, link_ec)| {
+                        link_byte_range_in_chunk(&infos, &line.cell_cols, &chunk, link_sc, link_ec)
+                    });
+                    let highlights = if let Some(link_range) = link_range {
+                        let mut link_hl = hl;
+                        link_hl.underline = Some(UnderlineStyle {
+                            thickness: px(1.0),
+                            color: Some(hsla(theme.accent)),
+                            wavy: false,
+                        });
+                        link_hl.color = Some(hsla(theme.accent));
+                        link_hl.background_color = Some(hsla_alpha(theme.accent, 0.22));
+                        let mut ranges = Vec::with_capacity(3);
+                        if link_range.start > 0 {
+                            ranges.push((0..link_range.start, hl));
+                        }
+                        ranges.push((link_range.clone(), link_hl));
+                        if link_range.end < text_len {
+                            ranges.push((link_range.end..text_len, hl));
+                        }
+                        ranges
+                    } else {
+                        vec![(0..text_len, hl)]
+                    };
                     let styled = StyledText::new(SharedString::from(text))
-                        .with_default_highlights(&default_style, vec![(0..text_len, hl)]);
+                        .with_default_highlights(&default_style, highlights);
                     let mut d = div()
                         .w(cw * chunk.cols.max(1) as f32)
                         .flex_none()
@@ -6980,6 +7060,11 @@ impl Render for TakoApp {
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 this.handle_key(&event.keystroke, cx);
             }))
+            .on_modifiers_changed(cx.listener(
+                |this, event: &gpui::ModifiersChangedEvent, window, cx| {
+                    this.on_modifiers_changed(event, window, cx);
+                },
+            ))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 this.on_mouse_move(event, window, cx);
             }))
@@ -11028,6 +11113,223 @@ mod self_test {
             check(issue64.1, "行 div の whitespace_nowrap（折り返しの構造的禁止）");
             check(issue64.2, "セル幅不一致グリフの隔離 + ASCII グループ化維持");
 
+            // 69c. ターミナルリンク（#153）: 実 PTY に絶対 / ~/ / cwd 相対パスを表示し、
+            //      画面スナップショットからの検出と cmd+クリック相当の MouseDown を通す。
+            //      ファイルは OpenFile プレビュー、ディレクトリは Split + PTY 起動まで実測する。
+            let link_dir = std::path::PathBuf::from("/private/tmp")
+                .join(format!("tako-selftest-link-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&link_dir);
+            std::fs::create_dir_all(link_dir.join("sub"))
+                .expect("リンク用一時ディレクトリを作れる");
+            let link_file = link_dir.join("sub/relative.txt");
+            let absolute_file = link_dir.join("absolute.txt");
+            std::fs::write(&link_file, "link selftest\n").unwrap();
+            std::fs::write(&absolute_file, "absolute link selftest\n").unwrap();
+            let link_command = format!(
+                "cd {} && printf '%s\\n' LINK_SELFTEST {} '~/' sub/relative.txt {}",
+                shell_escape(&link_dir),
+                shell_escape(&absolute_file),
+                shell_escape(&link_dir),
+            );
+            press(any, cx, "ctrl-u");
+            type_text(any, cx, &link_command, true);
+            let mut link_screen_ready = false;
+            for _ in 0..12 {
+                wait(cx, 300).await;
+                link_screen_ready = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&app.focused_pane())
+                            .is_some_and(|session| {
+                                session.cwd() == Some(link_dir.as_path())
+                                    && session
+                                        .visible_lines()
+                                        .iter()
+                                        .any(|line| line.trim() == "LINK_SELFTEST")
+                            })
+                    })
+                    .unwrap_or(false);
+                if link_screen_ready {
+                    break;
+                }
+            }
+            check(link_screen_ready, "リンク検証テキストを実 PTY 画面へ表示");
+
+            let (absolute_ok, home_ok, relative_ok, cwd_ok) = window
+                .update(cx, |app, _, _| {
+                    let base = app.focused_pane();
+                    app.refresh_pane_links(base);
+                    let links = app.pane_links.get(&base).cloned().unwrap_or_default();
+                    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                    let has_absolute = links.iter().any(|link| {
+                        link.kind == tako_core::LinkKind::Path
+                            && std::path::Path::new(&link.target) == absolute_file
+                    });
+                    let has_relative = links.iter().any(|link| {
+                        link.kind == tako_core::LinkKind::Path
+                            && std::path::Path::new(&link.target) == link_file
+                    });
+                    let has_home = home.is_some_and(|home| {
+                        links.iter().any(|link| {
+                            link.kind == tako_core::LinkKind::Path
+                                && std::path::Path::new(&link.target) == home
+                        })
+                    });
+                    let cwd_matches = app
+                        .terminals
+                        .get(&base)
+                        .and_then(|session| session.cwd())
+                        == Some(link_dir.as_path());
+                    (has_absolute, has_home, has_relative, cwd_matches)
+                })
+                .unwrap_or((false, false, false, false));
+            check(absolute_ok, "絶対パスを実画面から検出・解決");
+            check(home_ok, "~/ 起点パスを実画面から検出・解決");
+            check(relative_ok, "cwd 相対パスを実画面から検出・解決");
+            check(cwd_ok, "リンク解決 cwd が実 PTY の OSC 7 と一致");
+
+            // 任意のピクセル検証停止点。通常の self-test では待機しない。
+            // 実画面の検出結果とセル座標から cmd ホバーと同じ更新関数を通し、外部の
+            // screencapture が装飾前後を同一ウィンドウで取得できるようにする。
+            if std::env::var_os("TAKO_SELF_TEST_LINK_VISUAL").is_some() {
+                println!("TAKO_LINK_VISUAL_BASELINE_READY");
+                wait(cx, 15_000).await;
+                let visual_hovered = window
+                    .update(cx, |app, win, cx| {
+                        let base = app.focused_pane();
+                        app.refresh_pane_links(base);
+                        let link = app
+                            .pane_links
+                            .get(&base)?
+                            .iter()
+                            .find(|link| std::path::Path::new(&link.target) == link_file)?
+                            .clone();
+                        let &(row, start, _) = link.spans.first()?;
+                        let area = app
+                            .pane_text_areas
+                            .iter()
+                            .find(|(pane, _)| *pane == base)
+                            .map(|(_, area)| *area)?;
+                        let cell = app.cell_size_for_pane(base)?;
+                        let position = point(
+                            area.origin.x + cell.width * (start as f32 + 0.5),
+                            area.origin.y + cell.height * (row as f32 + 0.5),
+                        );
+                        app.update_hovered_link_at(position, true, win, cx);
+                        app.hovered_link
+                            .as_ref()
+                            .is_some_and(|hovered| hovered.contains(base, row, start))
+                            .then_some(())
+                    })
+                    .ok()
+                    .flatten()
+                    .is_some();
+                check(visual_hovered, "ピクセル検証用 cmd ホバー状態を構築");
+                println!("TAKO_LINK_VISUAL_HOVER_READY");
+                wait(cx, 60_000).await;
+                let _ = window.update(cx, |app, _, cx| {
+                    app.hovered_link = None;
+                    cx.notify();
+                });
+            }
+
+            let (file_click_ok, directory_click_ok) = window
+                .update(cx, |app, win, cx| {
+                    let base = app.focused_pane();
+                    app.refresh_pane_links(base);
+                    let links = app.pane_links.get(&base)?.clone();
+
+                    let click = |app: &mut TakoApp,
+                                 link: &tako_core::DetectedLink,
+                                 win: &mut Window,
+                                 cx: &mut Context<TakoApp>| {
+                        let &(row, start, _) = link.spans.first()?;
+                        let area = app
+                            .pane_text_areas
+                            .iter()
+                            .find(|(pane, _)| *pane == base)
+                            .map(|(_, area)| *area)?;
+                        let cell = app.cell_size_for_pane(base)?;
+                        let position = point(
+                            area.origin.x + cell.width * (start as f32 + 0.5),
+                            area.origin.y + cell.height * (row as f32 + 0.5),
+                        );
+                        app.hovered_link = None;
+                        app.on_pane_mouse_down(
+                            base,
+                            &MouseDownEvent {
+                                button: MouseButton::Left,
+                                position,
+                                modifiers: Modifiers {
+                                    platform: true,
+                                    ..Modifiers::default()
+                                },
+                                click_count: 1,
+                                first_mouse: false,
+                            },
+                            win,
+                            cx,
+                        );
+                        Some(())
+                    };
+
+                    let file_link = links
+                        .iter()
+                        .find(|link| std::path::Path::new(&link.target) == link_file)?;
+                    click(app, file_link, win, cx)?;
+                    let preview = app.previews.iter().find_map(|(pane, state)| {
+                        (state.path == link_file).then_some(*pane)
+                    });
+                    let file_click_ok = preview.is_some();
+                    if let Some(preview) = preview {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Close {
+                                pane: Some(preview.as_u64()),
+                                force: true,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                    }
+
+                    app.refresh_pane_links(base);
+                    let dir_link = app
+                        .pane_links
+                        .get(&base)?
+                        .iter()
+                        .find(|link| std::path::Path::new(&link.target) == link_dir)?
+                        .clone();
+                    let terminals_before: std::collections::HashSet<_> =
+                        app.terminals.keys().copied().collect();
+                    click(app, &dir_link, win, cx)?;
+                    let directory_pane = app.terminals.iter().find_map(|(pane, session)| {
+                        (!terminals_before.contains(pane)
+                            && session.cwd() == Some(link_dir.as_path()))
+                        .then_some(*pane)
+                    });
+                    let directory_click_ok = directory_pane.is_some();
+                    if let Some(pane) = directory_pane {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Close {
+                                pane: Some(pane.as_u64()),
+                                force: true,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                    }
+                    Some((file_click_ok, directory_click_ok))
+                })
+                .ok()
+                .flatten()
+                .unwrap_or((false, false));
+            check(file_click_ok, "cmd+クリックでファイルを分割プレビュー表示");
+            check(
+                directory_click_ok,
+                "cmd+クリックでディレクトリを分割し PTY を cwd 付きで起動",
+            );
+            let _ = std::fs::remove_dir_all(&link_dir);
+
             // 70. PDF プレビュー（FR-3.4 macOS）: dispatch OpenFile で PDF を開き、
             //     Pdf モードで Core Graphics レンダリングされたページが表示される
             #[cfg(target_os = "macos")]
@@ -11139,7 +11441,7 @@ fn accumulate_scroll(carry: f32, delta_lines: f32) -> (i32, f32) {
 
 #[cfg(test)]
 mod chunk_tests {
-    use super::{chunk_line_chars, CharInfo};
+    use super::{chunk_line_chars, link_byte_range_in_chunk, CharInfo};
 
     fn ci(ch: char, char_cols: usize, run_idx: usize, snaps: bool) -> CharInfo {
         CharInfo {
@@ -11217,6 +11519,20 @@ mod chunk_tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].cols, 2);
         assert_eq!(chunks[0].end, 3);
+    }
+
+    #[test]
+    fn リンク装飾は同一styleチャンク内のリンク範囲だけに限定する() {
+        let text = "prefix https://example.com suffix";
+        let infos: Vec<CharInfo> = text.chars().map(|c| ci(c, 1, 0, true)).collect();
+        let cell_cols: Vec<usize> = (0..infos.len()).collect();
+        let chunks = chunk_line_chars(&infos);
+        assert_eq!(chunks.len(), 1, "同じ ANSI style なので描画チャンクは1つ");
+        let start = text.find("https://").unwrap();
+        let end = start + "https://example.com".len();
+        let range = link_byte_range_in_chunk(&infos, &cell_cols, &chunks[0], start, end)
+            .expect("リンク部分がチャンク内にある");
+        assert_eq!(&text[range], "https://example.com");
     }
 }
 
