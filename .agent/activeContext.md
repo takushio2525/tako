@@ -4,32 +4,30 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-13・#152 完了）
+## 現在の対象（2026-07-13・#153 ターミナルリンク実機修正）
 
-#152 / PR #154 は squash merge 済み。`scripts/build-app.sh --install` で
-`/Applications/tako.app` へ配置済み。
+#153 完了（codex → Fable 引き継ぎ）。パスリンク cmd+クリック不動作の根本原因 5 件
+（ペイン判定誤ヒット / ディレクトリ空ペイン / TUI cwd 不明 / cwd=None 検出スキップ /
+走査無限ループ）+ cmd 押下中の下線・背景ハイライト・即時装飾更新を実装。
+直前の #152（PDF 選択描画・標準言語色分け）も merge・install 済み。
 
-- PDF canvas を画像左上へ固定し、選択矩形を専用最前面 layer で合成
-- syntect の行末改行を維持し、読み取り / 編集の構文解決を標準言語セット全体へ共通化
-- TypeScript は JavaScript 文法へフォールバック
-- Metal scene の RGBA 読み戻しで実ピクセル差分を検証
+- 起動時 working directory をセッション初期 cwd に保持（OSC 7 で上書き）
+- リンク装飾は `link_byte_range_in_chunk` でリンク文字列だけに限定
+- 選択ドラッグは `cell_at_clamped` 分離でペイン外でも伸びる旧挙動を維持（引き継ぎ検証で追加）
 
 ## 検証済み
 
-- PDF 選択: 2,475px 変化
-- C++: 読み取り 7,173px / 編集 7,277px 変化
-- Python: 読み取り 7,089px / 編集 7,193px 変化
-- workspace build / test（483 passed）/ fmt / clippy 全緑
-- 通常隔離 selftest が `TAKO_APP_SELF_TEST_OK` まで完走
-- インストール済み app / CLI は生成物と一致、codesign 検証成功
+- 隔離セルフテスト（TAKO_DISCOVERY_DIR + TAKO_PERSIST=0 + TAKO_TMUX_SOCKET）完走
+  = 69c 全 7 判定（3 形式検出 / OSC 7 cwd 一致 / ファイル→プレビュー / ディレクトリ→PTY 分割)パス
+- workspace build / test / fmt / clippy（-D warnings）全緑
 
 ## 次の一手
 
-- ユーザー最終確認: tako 再起動後、実マウスで PDF ドラッグ選択
-- `.cpp` / `.py` と任意のコードファイルを読み取り / 編集で開き、見た目を確認
+- tako 再起動後、`.agent/manual-checks.md` #153 節（cmd ホバー装飾・実マウスクリック）と
+  #152 節（PDF ドラッグ選択・コード色分け）を GUI で確認
 - Phase 5 の次候補は FR-3.8 Web ビューまたは FR-2.19 localhost ポートパネル
 
 ## 現フェーズで Read すべき設計書
 
 - 要件: `.agent/requirements.md` FR-3.2〜FR-3.5
-- 手動確認: `.agent/manual-checks.md`「PDF 選択描画・標準言語セット色分け」
+- 手動確認: `.agent/manual-checks.md`「ターミナルリンクの cmd+クリック・cmd ホバー装飾」
