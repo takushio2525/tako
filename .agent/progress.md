@@ -623,3 +623,12 @@
   projects.yaml / profiles/*.yaml / config.yaml の書き込みを集約、mutate 系 API で fail-loud 化
 - 検証: 507 tests / fmt / clippy 全緑 + 実機 before/after（修正前 = 並行 add 60 件で 48 件消失、
   修正後 = 118/118 全件残存・破損 YAML 拒否・bak 復元成功。隔離 HOME）
+
+## 2026-07-13（#159: ターミナルスクロールの大幅改善 — ピクセル単位化・ミラー方式・スクロールバー）
+- Zed エディタの行小数 scroll_position 方式をターミナルへ翻案: 直接ペインは
+  display_offset - fract 分解 + サブライン描画（visual-test 実ピクセル実証 direct=22197/shifted=0）。
+  バックエンド(tmux)ペインは copy-mode 駆動を廃止し capture ベースのローカル履歴ミラーへ
+  （tako-core::scroll_mirror 新設。行単位・往復レイテンシ・キー飲まれを構造解消）。
+  スクロールバーはホバー維持 + サム強調。CLI/MCP Scroll は ControlHost::backend_scroll_view で同一経路
+- 検証: 全テスト・隔離セルフテスト（44b/61b-61e 新設・更新）・visual-test 全緑
+- 次: merge + install 後に manual-checks.md「ターミナルスクロールの大幅改善」節の人手確認

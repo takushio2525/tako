@@ -4,44 +4,40 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-13・v0.4.0 リリース済み + #169 projects.yaml 全消失の根治）
+## 現在の対象（2026-07-13・#159 スクロール大幅改善 + v0.4.0 / #169 は main 側で完了済み）
 
-**v0.4.0 リリース済み**（tag `v0.4.0` = `98b17ea`、バイナリ付き GitHub Release、
-Pages デプロイ、homebrew-tako cask 0.4.0 更新済み）。夜間リリースは launchd
-ローカルジョブへ移行（#166 / PR #170。`com.takushio.tako-nightly-release` 毎日 5:00）。
+#159 実装完了（fix/159-smooth-scroll worktree → PR #176）。①ピクセル単位スムース
+スクロール（表示位置 = display_offset - fract の行小数分解 + サブライン描画）
+②操作感改善（1 行未満切り捨て廃止 → Pixels デルタを行小数のまま反映、慣性は OS
+momentum）③スクロールバー強化（ホバー維持 + サム強調 + トラック）④バックエンド
+(tmux)ペインを copy-mode 駆動 → **ローカル履歴ミラー方式**へ刷新
+（tako-core::scroll_mirror 新設）。
 
-#169（orchestrator projects.yaml が並行 add で 58 件 → 1 件に全消失）を根本修正。
-根本原因は三段連鎖: ①旧 save = `std::fs::write`（truncate → write の窓で並行プロセスに
-空 / 部分ファイルが見える）②serde_yaml が空 / 部分内容を「0 件」として**成功**パース
-（`#[serde(default)]` + 空 = null。エラーにならない）③read-modify-write のプロセス間
-直列化なし（GUI の MCP dispatch と CLI が別プロセス）。
+- Zed 比較所見: Zed ターミナルは行単位のまま。ピクセルオフセットは Zed エディタの
+  scroll_position (f64 行小数) 方式で、それをターミナルの下端アンカーに翻案した
+- 外側 alacritty に tmux 履歴は積もらない（実測 outer_history=0）→ ミラー方式が必然
+- 既知制約: ミラー表示中（バックエンド過去閲覧中）の選択・cmd+クリックは無効
 
-- 新設 `tako-control::config_io`: アトミック書き込み（tmp + fsync + rename）/
-  `<path>.lock` 排他 flock（std `File::lock`）/ `.bak.1`〜`.bak.3` 世代バックアップ
-- `ProjectsConfig::mutate`・`Profile::mutate_named`・`setup::mutate_config` で
-  ロック付き RMW に統一。パース失敗時は**一切書き込まず Err**（fail-loud）
-- 横展開: profiles set の `unwrap_or_default()` 握りつぶし修正、config.yaml の RMW
-  ロック化、`ensure_defaults` の TOCTOU 解消
-- 詳細は `.agent/architecture.md`「設定ファイル I/O の安全化」節
+main 側の並行完了分: **v0.4.0 リリース済み**（tag `v0.4.0`、cask 0.4.0）、夜間パッチ
+リリースは launchd ジョブへ移行（#166）、#169 projects.yaml 全消失の根治
+（config_io 新設）、#155 Web ビューペイン（wry / WKWebView）。
 
-## 検証済み（#169）
+## 検証済み（#159）
 
-- workspace build / test（507 tests）/ fmt / clippy（-D warnings）全緑
-- 根本原因の実証テスト 2 本（空 YAML の 0 件成功パース / truncate 窓での 58→1 再現）
-- 実機 before/after: 修正前バイナリ = 並行 add 60 件で 48 件消失を再現 →
-  修正後 = 118/118 全件残存 + bak 3 世代生成 + 破損 YAML add 拒否（exit=1・ファイル不変）+
-  bak.1 からの復元 → add 再開成功（すべて隔離 HOME、本物の projects.yaml 不使用）
+- 実ピクセル実証: visual-test「半行戻しでほぼ一致」direct=22197 / shifted=0
+- 隔離セルフテスト全項目パス（44b サブライン / 61b-61e ミラー・CLI 経路）
+- workspace build / test / fmt / clippy（-D warnings）全緑（origin/main 統合後に再検証）
 
 ## 次の一手
 
-- #169: squash merge → `build-app.sh --install` → Issue クローズ
-- 明朝 5:00 の夜間ジョブ初回実行を監視: main が v0.4.0 タグより先行しているため
-  v0.4.1 が自動リリースされる見込み = 全経路の初通し検証
-- tako 再起動後の GUI 確認（manual-checks.md）: 「Web ビューペイン」節（#155）、
-  「#153 節」（cmd ホバー装飾）、「#152 節」（PDF 選択・色分け）+ Cmd-Q 経過観察（#103）
-- Phase 5 の次候補は FR-2.19 localhost ポートパネル・FR-3.10 画像プレビュー等
+- PR #176（Closes #159）squash merge → fetch + detach → build-app.sh --install
+- tako 再起動後、`.agent/manual-checks.md`「ターミナルスクロールの大幅改善」節の
+  操作感チェックリスト（トラックパッド慣性・バー操作・TUI 整合）を人手確認。
+  併せて main 側の残確認: 「Web ビューペイン」節（#155）・#153/#152 節・Cmd-Q 経過観察（#103）
+- 明朝 5:00 の夜間ジョブ初回実行を監視（v0.4.1 自動リリース見込み。#166）
 
 ## 現フェーズで Read すべき設計書
 
+- 要件: `.agent/requirements.md` FR-2.5.13（#159 で全面改稿）
+- 手動確認: `.agent/manual-checks.md`「ターミナルスクロールの大幅改善」
 - 設定ファイル I/O の安全化（#169）: `.agent/architecture.md` 該当節
-- Web ビュー実装詳細と z オーダー制約: `.agent/architecture.md`「Web ビューペイン」節

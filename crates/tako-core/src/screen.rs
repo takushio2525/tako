@@ -62,6 +62,12 @@ pub struct Screen {
     pub ime_cursor: Option<(usize, usize)>,
     /// スクロールバック表示中のオフセット（0 = 最下部）
     pub display_offset: usize,
+    /// サブライン表示の下方向端数（0.0..1.0 行）。表示位置 = display_offset - fract。
+    /// 描画側は行スタック全体を fract 行ぶん上へずらす（ピクセル単位スクロール #159）
+    pub fract: f32,
+    /// fract > 0 のとき viewport 最下行の 1 行下（上下端の部分行描画用）。
+    /// display_offset == 0 か fract == 0 では None
+    pub extra_bottom: Option<ScreenLine>,
 }
 
 /// セル単位の解決済みスタイル（ラン合成前の中間表現）
@@ -78,17 +84,19 @@ struct CellStyle {
 
 /// Term の表示内容を色解決済みスナップショットへ変換する
 pub fn snapshot<T: EventListener>(term: &Term<T>, theme: &Theme) -> Screen {
-    snapshot_opts(term, theme, true)
+    snapshot_opts(term, theme, true, 0.0)
 }
 
 /// `show_cursor = false` でカーソルセルの強調を抑止する版。
 /// tmux copy-mode でスクロール中のバックエンドペインは、tmux が報告する
 /// copy-mode カーソルが画面に固定表示されて不自然なため UI 層が隠す
-/// （2026-06-12 実機フィードバック (b)）
+/// （2026-06-12 実機フィードバック (b)）。
+/// `fract` はサブライン表示の下方向端数（`TerminalSession::scroll_pixels` が管理）
 pub(crate) fn snapshot_opts<T: EventListener>(
     term: &Term<T>,
     theme: &Theme,
     show_cursor: bool,
+    fract: f32,
 ) -> Screen {
     let cols = term.columns();
     let rows = term.screen_lines();
@@ -118,6 +126,13 @@ pub(crate) fn snapshot_opts<T: EventListener>(
         .map(|p| (p.column.0, p.line))
         .filter(|&(col, row)| col < cols && row < rows);
 
+    let selection = content.selection;
+    let colors = content.colors;
+    // display_iter が content を部分 move するため、追加行の構築で使う
+    // カーソルのグリッド座標はここで取り出しておく
+    let cursor_visible_at = (show_cursor && content.cursor.shape != CursorShape::Hidden)
+        .then_some(content.cursor.point);
+
     for indexed in content.display_iter {
         let Some(vp) = point_to_viewport(display_offset, indexed.point) else {
             continue;
@@ -126,101 +141,33 @@ pub(crate) fn snapshot_opts<T: EventListener>(
         if row >= rows || col >= cols {
             continue;
         }
-        let cell = indexed.cell;
-        let flags = cell.flags;
-
-        let c = if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
-            '\0'
-        } else {
-            cell.c
-        };
-
-        let mut fg = resolve_color(&cell.fg, content.colors, theme);
-        let mut bg = resolve_color(&cell.bg, content.colors, theme);
-        if flags.contains(Flags::DIM) {
-            fg = fg.dim(DIM_FACTOR);
-        }
-        if flags.contains(Flags::INVERSE) {
-            std::mem::swap(&mut fg, &mut bg);
-        }
-        if flags.contains(Flags::HIDDEN) {
-            fg = bg;
-        }
-        let mut bg = (bg != theme.background).then_some(bg);
-
-        let selected = content
-            .selection
-            .is_some_and(|range| range.contains(indexed.point));
-        if selected {
-            bg = Some(theme.selection_background);
-        }
-        if cursor == Some((col, row)) {
-            fg = theme.cursor_text;
-            bg = Some(theme.cursor);
-        }
-
-        grid[row * cols + col] = (
-            c,
-            CellStyle {
-                fg,
-                bg,
-                bold: flags.intersects(Flags::BOLD),
-                italic: flags.intersects(Flags::ITALIC),
-                underline: flags.intersects(Flags::ALL_UNDERLINES),
-                strikeout: flags.intersects(Flags::STRIKEOUT),
-                dim: flags.contains(Flags::DIM),
-            },
-        );
+        let selected = selection.is_some_and(|range| range.contains(indexed.point));
+        let is_cursor = cursor == Some((col, row));
+        grid[row * cols + col] = resolve_cell(indexed.cell, selected, is_cursor, colors, theme);
     }
 
     let lines = (0..rows)
-        .map(|row| {
-            let row_start = row * cols;
-            let mut text = String::with_capacity(cols);
-            let mut runs: Vec<StyleRun> = Vec::new();
-            let mut cell_cols = Vec::with_capacity(cols);
-            for col in 0..cols {
-                let (c, ref style) = grid[row_start + col];
-                if c == '\0' {
-                    continue;
-                }
-                cell_cols.push(col);
-                let start = text.len();
-                text.push(c);
-                let end = text.len();
-                match runs.last_mut() {
-                    Some(last)
-                        if last.fg == style.fg
-                            && last.bg == style.bg
-                            && last.bold == style.bold
-                            && last.italic == style.italic
-                            && last.underline == style.underline
-                            && last.strikeout == style.strikeout
-                            && last.dim == style.dim =>
-                    {
-                        last.range.end = end;
-                    }
-                    _ => runs.push(StyleRun {
-                        range: start..end,
-                        fg: style.fg,
-                        bg: style.bg,
-                        bold: style.bold,
-                        italic: style.italic,
-                        underline: style.underline,
-                        strikeout: style.strikeout,
-                        dim: style.dim,
-                    }),
-                }
-            }
-            let has_wide = cell_cols.windows(2).any(|w| w[1] - w[0] > 1);
-            ScreenLine {
-                text,
-                runs,
-                cell_cols,
-                has_wide,
-            }
-        })
+        .map(|row| compose_line(&grid[row * cols..(row + 1) * cols]))
         .collect();
+
+    // fract > 0 のとき viewport 最下行の 1 行下を追加で切り出す（部分行の描画用）。
+    // display_offset d の viewport は grid の Line(-d..rows-d) なので、その下は Line(rows-d)。
+    // d == 0（最下部）では存在しない
+    let extra_bottom = (fract > 0.0 && display_offset >= 1).then(|| {
+        use alacritty_terminal::index::{Column, Line, Point};
+        let line = Line(rows as i32 - display_offset as i32);
+        let grid_ref = term.grid();
+        let mut cells: Vec<(char, CellStyle)> = Vec::with_capacity(cols);
+        for col in 0..cols {
+            let point = Point::new(line, Column(col));
+            let cell = &grid_ref[line][Column(col)];
+            let selected = selection.is_some_and(|range| range.contains(point));
+            // カーソルが追加行（viewport の 1 行下）にある場合も焼き込む
+            let is_cursor = cursor_visible_at == Some(point);
+            cells.push(resolve_cell(cell, selected, is_cursor, colors, theme));
+        }
+        compose_line(&cells)
+    });
 
     Screen {
         cols,
@@ -229,6 +176,106 @@ pub(crate) fn snapshot_opts<T: EventListener>(
         cursor,
         ime_cursor,
         display_offset,
+        fract,
+        extra_bottom,
+    }
+}
+
+/// セル 1 つを色解決済みの (文字, スタイル) へ変換する。
+/// display_iter のセルと grid 直接アクセスのセル（追加行）で共用する
+fn resolve_cell(
+    cell: &alacritty_terminal::term::cell::Cell,
+    selected: bool,
+    is_cursor: bool,
+    colors: &Colors,
+    theme: &Theme,
+) -> (char, CellStyle) {
+    let flags = cell.flags;
+    let c = if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+        '\0'
+    } else {
+        cell.c
+    };
+
+    let mut fg = resolve_color(&cell.fg, colors, theme);
+    let mut bg = resolve_color(&cell.bg, colors, theme);
+    if flags.contains(Flags::DIM) {
+        fg = fg.dim(DIM_FACTOR);
+    }
+    if flags.contains(Flags::INVERSE) {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    if flags.contains(Flags::HIDDEN) {
+        fg = bg;
+    }
+    let mut bg = (bg != theme.background).then_some(bg);
+
+    if selected {
+        bg = Some(theme.selection_background);
+    }
+    if is_cursor {
+        fg = theme.cursor_text;
+        bg = Some(theme.cursor);
+    }
+
+    (
+        c,
+        CellStyle {
+            fg,
+            bg,
+            bold: flags.intersects(Flags::BOLD),
+            italic: flags.intersects(Flags::ITALIC),
+            underline: flags.intersects(Flags::ALL_UNDERLINES),
+            strikeout: flags.intersects(Flags::STRIKEOUT),
+            dim: flags.contains(Flags::DIM),
+        },
+    )
+}
+
+/// 1 行分のセル列を ScreenLine（text + StyleRun + cell_cols）へ合成する
+fn compose_line(cells: &[(char, CellStyle)]) -> ScreenLine {
+    let cols = cells.len();
+    let mut text = String::with_capacity(cols);
+    let mut runs: Vec<StyleRun> = Vec::new();
+    let mut cell_cols = Vec::with_capacity(cols);
+    for (col, (c, style)) in cells.iter().enumerate() {
+        if *c == '\0' {
+            continue;
+        }
+        cell_cols.push(col);
+        let start = text.len();
+        text.push(*c);
+        let end = text.len();
+        match runs.last_mut() {
+            Some(last)
+                if last.fg == style.fg
+                    && last.bg == style.bg
+                    && last.bold == style.bold
+                    && last.italic == style.italic
+                    && last.underline == style.underline
+                    && last.strikeout == style.strikeout
+                    && last.dim == style.dim =>
+            {
+                last.range.end = end;
+            }
+            _ => runs.push(StyleRun {
+                range: start..end,
+                fg: style.fg,
+                bg: style.bg,
+                bold: style.bold,
+                italic: style.italic,
+                underline: style.underline,
+                strikeout: style.strikeout,
+                dim: style.dim,
+            }),
+        }
+    }
+    let has_wide = cell_cols.windows(2).any(|w| w[1] - w[0] > 1);
+    ScreenLine {
+        text,
+        runs,
+        cell_cols,
+        has_wide,
     }
 }
 
@@ -506,7 +553,7 @@ mod tests {
         // tmux copy-mode スクロール中のカーソル居残り対策（2026-06-12 実機 (b)）。
         // DECTCEM（\e[?25l）による非表示は alacritty 側が処理する
         let term = term_with(b"ab");
-        let s = snapshot_opts(&term, &theme(), false);
+        let s = snapshot_opts(&term, &theme(), false, 0.0);
         assert_eq!(s.cursor, None);
         // IME 用カーソルは show_cursor=false でも返る
         assert_eq!(s.ime_cursor, Some((2, 0)));
@@ -583,5 +630,65 @@ mod tests {
         for line in &s.lines {
             assert_eq!(line.text.chars().count(), COLS);
         }
+    }
+
+    /// 20 行出力して 10 行遡った term（extra_bottom テスト共用）
+    fn scrolled_term() -> Term<VoidListener> {
+        let mut text = Vec::new();
+        for i in 0..20 {
+            text.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        }
+        let mut term = term_with(&text);
+        term.scroll_display(alacritty_terminal::grid::Scroll::Delta(10));
+        term
+    }
+
+    #[test]
+    fn fract付きではviewport最下行の1行下が追加される() {
+        let term = scrolled_term();
+        let s = snapshot_opts(&term, &theme(), true, 0.5);
+        assert_eq!(s.display_offset, 10);
+        assert_eq!(s.fract, 0.5);
+        // viewport は line6..line10（ROWS=5）なので追加行は line11
+        assert!(s.lines[0].text.starts_with("line6"));
+        assert!(s.lines[ROWS - 1].text.starts_with("line10"));
+        let extra = s.extra_bottom.expect("追加行が付く");
+        assert!(extra.text.starts_with("line11"), "text={:?}", extra.text);
+        assert_eq!(extra.text.chars().count(), COLS);
+    }
+
+    #[test]
+    fn fractゼロでは追加行なし() {
+        let term = scrolled_term();
+        let s = snapshot_opts(&term, &theme(), true, 0.0);
+        assert!(s.extra_bottom.is_none());
+        assert_eq!(s.fract, 0.0);
+    }
+
+    #[test]
+    fn 最下部では追加行なし() {
+        // display_offset 0 では fract があっても追加行は構築しない（防御）
+        let term = term_with(b"hello");
+        let s = snapshot_opts(&term, &theme(), true, 0.5);
+        assert!(s.extra_bottom.is_none());
+    }
+
+    #[test]
+    fn 追加行にも選択ハイライトが写る() {
+        let mut term = scrolled_term();
+        // 追加行 = grid 座標 Line(rows - display_offset) = Line(-5)（line11 の行）
+        let row = Line(ROWS as i32 - 10);
+        let mut sel = Selection::new(
+            SelectionType::Simple,
+            Point::new(row, Column(0)),
+            Side::Left,
+        );
+        sel.update(Point::new(row, Column(3)), Side::Right);
+        term.selection = Some(sel);
+        let t = theme();
+        let s = snapshot_opts(&term, &t, true, 0.5);
+        let extra = s.extra_bottom.expect("追加行が付く");
+        let run = run_for(&extra, "line");
+        assert_eq!(run.bg, Some(t.selection_background));
     }
 }
