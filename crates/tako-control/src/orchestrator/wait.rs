@@ -11,7 +11,16 @@
 //! 判定ヒューリスティック（`screen_looks_busy` / `screen_looks_idle`）は
 //! worker「完了」監視用で、`claude_tui` の送達確認用パターンとは目的が異なるため
 //! ここに置く（dispatch の idle 補正も本モジュールを参照する）。
+//!
+//! ## 非同期 run レジストリ（#121）
+//!
+//! `RunRegistry` は進行中・完了済みの run をプロセス内でグローバルに追跡する。
+//! `run_start` で spawn + バックグラウンドポーリングを開始し、`run_status` で
+//! 進捗を照会、`run_result` で完了した結果を回収（+ auto_close）する。
+//! MCP コール中断で run が孤児化しない（ポーリングスレッドが独立して完走する）。
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -111,9 +120,16 @@ impl WorkerErrorKind {
 ///
 /// 停止確定時に画面へ既知のエラーパターン（API エラー・usage limit 等）があれば
 /// `Idle` ではなく `Error` を返す（#157）。error 状態（status = "error"）も
-/// 「worker が止まっている」ことに変わりはないため idle と同じ streak で確定する
-pub fn wait_for_worker(exec: Exec, opts: &WatchOptions) -> WatchOutcome {
-    let deadline = opts.timeout.map(|t| Instant::now() + t);
+/// 「worker が止まっている」ことに変わりはないため idle と同じ streak で確定する。
+///
+/// `progress` が Some のとき、ポーリングごとに中間状態を更新する（#121 の非同期 run 用）
+pub fn wait_for_worker(
+    exec: Exec,
+    opts: &WatchOptions,
+    progress: Option<&Arc<Mutex<RunSnapshot>>>,
+) -> WatchOutcome {
+    let start = Instant::now();
+    let deadline = opts.timeout.map(|t| start + t);
     std::thread::sleep(opts.initial_delay);
 
     let mut idle_streak: u32 = 0;
@@ -139,6 +155,14 @@ pub fn wait_for_worker(exec: Exec, opts: &WatchOptions) -> WatchOutcome {
                 let source = val["status_source"].as_str().unwrap_or("screen");
                 // agents 一次シグナル（明示 or 自動解決）は streak 3、画面推定は streak 8
                 let need_streak: u32 = if source == "screen" { 8 } else { 3 };
+
+                // 非同期 run 用: 中間スナップショットを更新（#121）
+                if let Some(snap) = progress {
+                    if let Ok(mut s) = snap.lock() {
+                        s.worker_status = status.to_string();
+                        s.elapsed_secs = start.elapsed().as_secs();
+                    }
+                }
 
                 match status {
                     "gone" => {
@@ -288,6 +312,7 @@ pub fn run_worker(
             initial_delay: opts.initial_delay,
             interval: opts.interval,
         },
+        None,
     );
     let final_status = match outcome {
         WatchOutcome::Idle { .. } => "completed",
@@ -336,6 +361,324 @@ pub fn run_worker(
         });
     }
     Ok(result)
+}
+
+// ==========================================================================
+// 非同期 run レジストリ（#121）
+// ==========================================================================
+
+/// 進行中の run エントリの中間状態（ポーリングスレッドが更新する）
+#[derive(Debug, Clone)]
+pub struct RunSnapshot {
+    /// 直近の worker_status ポーリング結果（busy / idle / error / gone / unknown）
+    worker_status: String,
+    /// 経過秒数
+    elapsed_secs: u64,
+}
+
+/// 完了した run の結果
+#[derive(Debug, Clone)]
+struct RunCompleted {
+    outcome: WatchOutcome,
+    elapsed_secs: u64,
+}
+
+/// 1 件の run エントリ
+struct RunEntry {
+    pane_id: u64,
+    spawned_by: u64,
+    tmux_session: Option<String>,
+    auto_close: bool,
+    output_lines: usize,
+    started_at: Instant,
+    /// ポーリングスレッドが定期更新する中間状態
+    snapshot: Arc<Mutex<RunSnapshot>>,
+    /// 完了時にセットされる
+    completed: Arc<Mutex<Option<RunCompleted>>>,
+}
+
+/// グローバルな非同期 run レジストリ
+struct RunRegistry {
+    entries: HashMap<String, RunEntry>,
+    next_id: u64,
+}
+
+impl RunRegistry {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            next_id: 1,
+        }
+    }
+
+    fn alloc_id(&mut self) -> String {
+        let id = self.next_id;
+        self.next_id += 1;
+        format!("run-{id}")
+    }
+}
+
+fn registry() -> &'static Mutex<RunRegistry> {
+    use std::sync::OnceLock;
+    static REG: OnceLock<Mutex<RunRegistry>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(RunRegistry::new()))
+}
+
+/// 非同期 run を開始する: spawn してバックグラウンドでポーリングを開始し、
+/// `{run_id, pane_id, spawned_by, tmux_session}` を即座に返す。
+/// exec はこのスレッドで spawn のみ実行する（ポーリングは別スレッド）。
+/// `exec_factory` はポーリングスレッド用の新しい exec を生成する
+pub fn run_start(
+    exec: Exec,
+    opts: &RunOptions,
+    exec_factory: impl FnOnce() -> Box<dyn FnMut(Request) -> Result<Value, String> + Send>
+        + Send
+        + 'static,
+) -> Result<Value, String> {
+    // spawn（メインスレッドで実行）
+    let spawn_result = exec(Request::OrchestratorSpawn {
+        project: opts.project.clone(),
+        prompt: opts.prompt.clone(),
+        label: opts.label.clone(),
+        model: opts.model.clone(),
+        effort: opts.effort.clone(),
+        pane: opts.pane,
+        tab: opts.tab,
+        caller_role: opts.caller_role.clone(),
+        agent: opts.agent.clone(),
+    })?;
+    let pane_id = spawn_result["pane_id"].as_u64().unwrap_or(0);
+    let spawned_by = spawn_result["spawned_by"].as_u64().unwrap_or(0);
+    let tmux_session = spawn_result["tmux_session"].as_str().map(String::from);
+
+    let snapshot = Arc::new(Mutex::new(RunSnapshot {
+        worker_status: "starting".into(),
+        elapsed_secs: 0,
+    }));
+    let completed = Arc::new(Mutex::new(None));
+
+    let run_id = {
+        let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+        let id = reg.alloc_id();
+        reg.entries.insert(
+            id.clone(),
+            RunEntry {
+                pane_id,
+                spawned_by,
+                tmux_session: tmux_session.clone(),
+                auto_close: opts.auto_close,
+                output_lines: opts.output_lines,
+                started_at: Instant::now(),
+                snapshot: Arc::clone(&snapshot),
+                completed: Arc::clone(&completed),
+            },
+        );
+        id
+    };
+
+    // ポーリングスレッドを起動
+    let timeout = opts.timeout;
+    let initial_delay = opts.initial_delay;
+    let interval = opts.interval;
+    let session_id: Option<String> = None;
+    let tmux_for_thread = tmux_session.clone();
+
+    std::thread::Builder::new()
+        .name(format!("run-{pane_id}"))
+        .spawn(move || {
+            let mut exec_fn = exec_factory();
+            let start = Instant::now();
+            let outcome = wait_for_worker(
+                &mut *exec_fn,
+                &WatchOptions {
+                    pane_id,
+                    session_id,
+                    tmux_session: tmux_for_thread,
+                    timeout: Some(timeout),
+                    initial_delay,
+                    interval,
+                },
+                Some(&snapshot),
+            );
+            let elapsed_secs = start.elapsed().as_secs();
+            *completed.lock().unwrap_or_else(|e| e.into_inner()) = Some(RunCompleted {
+                outcome,
+                elapsed_secs,
+            });
+        })
+        .map_err(|e| format!("ポーリングスレッドの起動に失敗: {e}"))?;
+
+    Ok(json!({
+        "run_id": run_id,
+        "pane_id": pane_id,
+        "spawned_by": spawned_by,
+        "tmux_session": tmux_session,
+    }))
+}
+
+/// 非同期 run の進捗を返す。run_id が不明なら Err
+pub fn run_status(run_id: &str) -> Result<Value, String> {
+    let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    let entry = reg
+        .entries
+        .get(run_id)
+        .ok_or_else(|| format!("run_id '{run_id}' が見つからない"))?;
+
+    let completed = entry.completed.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = completed.as_ref() {
+        let status = match &c.outcome {
+            WatchOutcome::Idle { .. } => "completed",
+            WatchOutcome::Error { .. } => "worker_error",
+            WatchOutcome::Gone => "error",
+            WatchOutcome::Timeout => "timeout",
+        };
+        let mut result = json!({
+            "run_id": run_id,
+            "pane_id": entry.pane_id,
+            "status": status,
+            "phase": "finished",
+            "elapsed_seconds": c.elapsed_secs,
+        });
+        if let WatchOutcome::Error { kind, detail } = &c.outcome {
+            result["error"] = json!({
+                "kind": kind.as_str(),
+                "detail": detail,
+                "recommended_action": kind.recommended_action(),
+            });
+        }
+        return Ok(result);
+    }
+    drop(completed);
+
+    let snap = entry.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(json!({
+        "run_id": run_id,
+        "pane_id": entry.pane_id,
+        "status": snap.worker_status,
+        "phase": "running",
+        "elapsed_seconds": entry.started_at.elapsed().as_secs(),
+    }))
+}
+
+/// 完了した run の結果を回収する。未完了なら `phase: "running"` を返す。
+/// 完了済みなら出力取得 + auto_close を行い、レジストリから除去する
+pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
+    let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    let entry = reg
+        .entries
+        .get(run_id)
+        .ok_or_else(|| format!("run_id '{run_id}' が見つからない"))?;
+
+    let completed = entry.completed.lock().unwrap_or_else(|e| e.into_inner());
+    if completed.is_none() {
+        let snap = entry.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        return Ok(json!({
+            "run_id": run_id,
+            "pane_id": entry.pane_id,
+            "status": snap.worker_status,
+            "phase": "running",
+            "elapsed_seconds": entry.started_at.elapsed().as_secs(),
+        }));
+    }
+    let c = completed.as_ref().unwrap().clone();
+    drop(completed);
+
+    let pane_id = entry.pane_id;
+    let spawned_by = entry.spawned_by;
+    let tmux_session = entry.tmux_session.clone();
+    let auto_close = entry.auto_close;
+    let output_lines = entry.output_lines;
+    drop(reg);
+
+    let final_status = match &c.outcome {
+        WatchOutcome::Idle { .. } => "completed",
+        WatchOutcome::Error { .. } => "worker_error",
+        WatchOutcome::Gone => "error",
+        WatchOutcome::Timeout => "timeout",
+    };
+
+    // 出力取得
+    let output = exec(Request::Read {
+        pane: Some(pane_id),
+        lines: Some(output_lines),
+        tmux_session: tmux_session.clone(),
+    })
+    .ok()
+    .and_then(|v| v["text"].as_str().map(String::from))
+    .unwrap_or_default();
+
+    // auto_close（エラー停止時は close しない。#157）
+    let closed = if auto_close && !matches!(c.outcome, WatchOutcome::Error { .. }) {
+        exec(Request::Close {
+            pane: Some(pane_id),
+            force: true,
+        })
+        .is_ok()
+    } else {
+        false
+    };
+
+    // レジストリから除去
+    registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entries
+        .remove(run_id);
+
+    let mut result = json!({
+        "run_id": run_id,
+        "pane_id": pane_id,
+        "spawned_by": spawned_by,
+        "status": final_status,
+        "output": output,
+        "duration_seconds": c.elapsed_secs,
+        "closed": closed,
+    });
+    if let WatchOutcome::Error { kind, detail } = &c.outcome {
+        result["error"] = json!({
+            "kind": kind.as_str(),
+            "detail": detail,
+            "recommended_action": kind.recommended_action(),
+        });
+    }
+    Ok(result)
+}
+
+/// 全 run の一覧を返す（run_status 相当の情報をまとめて）
+pub fn run_list() -> Value {
+    let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    let runs: Vec<Value> = reg
+        .entries
+        .iter()
+        .map(|(run_id, entry)| {
+            let completed = entry.completed.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(c) = completed.as_ref() {
+                let status = match &c.outcome {
+                    WatchOutcome::Idle { .. } => "completed",
+                    WatchOutcome::Error { .. } => "worker_error",
+                    WatchOutcome::Gone => "error",
+                    WatchOutcome::Timeout => "timeout",
+                };
+                json!({
+                    "run_id": run_id,
+                    "pane_id": entry.pane_id,
+                    "status": status,
+                    "phase": "finished",
+                    "elapsed_seconds": c.elapsed_secs,
+                })
+            } else {
+                let snap = entry.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                json!({
+                    "run_id": run_id,
+                    "pane_id": entry.pane_id,
+                    "status": snap.worker_status,
+                    "phase": "running",
+                    "elapsed_seconds": entry.started_at.elapsed().as_secs(),
+                })
+            }
+        })
+        .collect();
+    json!({ "runs": runs })
 }
 
 /// tmux session が生きているか（tako バックエンドサーバー上）。None は常に false
@@ -507,7 +850,7 @@ mod tests {
                 .pop_front()
                 .expect("スクリプトの応答が尽きた")
         };
-        wait_for_worker(&mut exec, opts)
+        wait_for_worker(&mut exec, opts, None)
     }
 
     #[test]
@@ -919,5 +1262,99 @@ mod tests {
                 .any(|r| matches!(r, Request::Close { .. })),
             "エラー停止時は auto_close しない"
         );
+    }
+
+    // --- #121: 非同期 run レジストリのテスト ---
+
+    #[test]
+    fn run_startは即座にrun_idを返す() {
+        let spawn_resp = Ok(json!({ "pane_id": 42, "spawned_by": 1, "tmux_session": "tako-w42" }));
+        let script = std::sync::Arc::new(std::sync::Mutex::new(ExecScript::new(vec![spawn_resp])));
+        let script_for_factory = script.clone();
+
+        let opts = RunOptions {
+            project: "demo".into(),
+            prompt: "やって".into(),
+            label: None,
+            model: None,
+            effort: None,
+            agent: None,
+            pane: Some(1),
+            tab: None,
+            caller_role: None,
+            timeout: Duration::from_millis(100),
+            auto_close: true,
+            output_lines: 50,
+            initial_delay: Duration::ZERO,
+            interval: Duration::ZERO,
+        };
+
+        let result = {
+            let mut s = script.lock().unwrap();
+            let mut exec = |req: Request| {
+                s.seen.push(req);
+                s.responses.pop_front().expect("応答が尽きた")
+            };
+            run_start(&mut exec, &opts, move || {
+                // ポーリング用: すぐに idle を返す
+                let idle_responses: Vec<Result<Value, String>> = (0..3)
+                    .map(|_| status("idle", IDLE_SCREEN, "agents"))
+                    .collect();
+                let inner_script = std::sync::Arc::clone(&script_for_factory);
+                let mut responses: VecDeque<Result<Value, String>> = idle_responses.into();
+                Box::new(move |req: Request| -> Result<Value, String> {
+                    let _ = inner_script; // keep alive
+                    responses.pop_front().unwrap_or(Ok(json!({})))
+                })
+            })
+            .expect("run_start は成功する")
+        };
+
+        assert_eq!(result["pane_id"], 42);
+        assert!(result["run_id"].as_str().unwrap().starts_with("run-"));
+        assert_eq!(result["tmux_session"], "tako-w42");
+    }
+
+    #[test]
+    fn run_statusはrunning中にphase_runningを返す() {
+        let spawn_resp = Ok(json!({ "pane_id": 99, "spawned_by": 1, "tmux_session": null }));
+        let opts = RunOptions {
+            project: "demo".into(),
+            prompt: "test".into(),
+            label: None,
+            model: None,
+            effort: None,
+            agent: None,
+            pane: Some(1),
+            tab: None,
+            caller_role: None,
+            timeout: Duration::from_secs(60),
+            auto_close: true,
+            output_lines: 50,
+            initial_delay: Duration::from_secs(9999),
+            interval: Duration::from_secs(9999),
+        };
+
+        let result = {
+            let mut responses: VecDeque<Result<Value, String>> = vec![spawn_resp].into();
+            let mut exec = |_: Request| responses.pop_front().unwrap_or(Ok(json!({})));
+            run_start(&mut exec, &opts, || {
+                Box::new(|_: Request| -> Result<Value, String> { Ok(json!({})) })
+            })
+            .unwrap()
+        };
+        let run_id = result["run_id"].as_str().unwrap();
+
+        // initial_delay が 9999 秒なのでまだ running
+        std::thread::sleep(Duration::from_millis(10));
+        let status = run_status(run_id).unwrap();
+        assert_eq!(status["phase"], "running");
+        assert_eq!(status["pane_id"], 99);
+    }
+
+    #[test]
+    fn run_listは全run一覧を返す() {
+        let list = run_list();
+        assert!(list["runs"].is_array());
     }
 }

@@ -1957,6 +1957,20 @@ fn dispatch_inner(
             finish_worker_status(ctx, session_id.as_deref(), tmux_session.as_deref())
         }
 
+        // 非同期 run の進捗照会・結果回収（#121）。レジストリはプロセス内グローバルで
+        // ControlHost 不要のため dispatch で直接呼ぶ
+        Request::OrchestratorRunStatus { run_id } => match run_id {
+            Some(id) => {
+                crate::orchestrator::wait::run_status(&id).map_err(DispatchError::Operation)
+            }
+            None => Ok(crate::orchestrator::wait::run_list()),
+        },
+        Request::OrchestratorRunResult { run_id } => {
+            let exec: &mut dyn FnMut(Request) -> Result<Value, String> =
+                &mut |req| dispatch(host, req, origin).map_err(|e| e.to_string());
+            crate::orchestrator::wait::run_result(&run_id, exec).map_err(DispatchError::Operation)
+        }
+
         Request::RemoteStart { port, insecure } => host
             .remote_start(port, insecure)
             .map_err(DispatchError::Operation),
