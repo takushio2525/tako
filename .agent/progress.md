@@ -594,8 +594,10 @@
   ポート検知チップ統合。dispatch `Web` / CLI `tako web` / MCP `tako_web`（9 action、58 ツール不変）
 - タイトル追跡は ipc 不達（data: URL、実機診断で確定）のため eval 2 秒ポーリングへ。
   検証: 487 tests / fmt / clippy 緑 + セルフテスト完走（項目 71 = webview e2e 8 操作）
-- 関連コミット: `03c3c45` `7b52c2f` + ポーリング修正（PR #160 squash merge 予定）
-- 次: merge → install → 実機確認（manual-checks「Web ビューペイン」節）
+- 関連: PR #160 squash merge（`6705c39`）+ #163（CLI 基準ペイン任意化、実機検証で発見）+
+  install 済み。実機 e2e（セカンダリ + CLI: open → read title=Example Domain → close）+
+  screencapture ピクセル確認済み
+- 次: tako 再起動 → manual-checks「Web ビューペイン」節の GUI 確認
 
 ## 2026-07-13（#103: Cmd-Q 不発の根治 — Quit のグローバルアクション化）
 - 根因を GPUI ソースで確定: Quit がルート div の on_action のみでフォーカスパス依存。blur（focus=None）時は
