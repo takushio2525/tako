@@ -561,6 +561,18 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         targets: Option<Vec<String>>,
     },
+    /// スリープ防止機能の状態確認・設定変更（Issue #173）。
+    /// `action` = "status"（既定）/ "set"（モード・電源条件の変更）
+    SleepGuard {
+        #[serde(default)]
+        action: Option<String>,
+        /// スリープ防止モード: "off" / "on" / "while-agents-running"
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        /// 電源条件: "ac-only" / "always"
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        power_condition: Option<String>,
+    },
     /// ファイルツリーへのフォルダ追加・削除・一覧（#134）。
     /// AI が作業対象プロジェクトのフォルダをファイルツリーに明示追加する。タブ単位スコープ
     TreeFolder {

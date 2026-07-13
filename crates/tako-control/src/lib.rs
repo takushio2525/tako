@@ -31,6 +31,7 @@ pub mod protocol;
 pub mod remote;
 pub mod settings;
 pub mod setup;
+pub mod sleep_guard;
 pub mod transcript;
 
 pub use dispatch::{

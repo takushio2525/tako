@@ -1281,6 +1281,40 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_sleep_guard",
+            "description": "スリープ防止機能の状態確認・設定変更（Issue #173）。\
+                macOS のアイドルスリープを IOKit 電源アサーションで防止する。\
+                ディスプレイスリープは妨げない（画面は消えてよい）。\
+                action=status（既定）: 現在のモード・電源条件・アサーション状態を返す。\
+                action=set: mode（off / on / while-agents-running）と \
+                power_condition（ac-only / always）を設定する。\
+                while-agents-running モードでは busy なエージェントが 1 体でもいる間だけ \
+                アサーションを保持し、全 idle で自動解放する（既定）。\
+                ユーザーが「PC がスリープして作業が止まった」と言った場合は、\
+                まず status で確認し、set で適切な設定に変更すること。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "set"],
+                        "description": "操作種別（省略時は status）",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["off", "on", "while-agents-running"],
+                        "description": "スリープ防止モード（set 時のみ有効）",
+                    },
+                    "power_condition": {
+                        "type": "string",
+                        "enum": ["ac-only", "always"],
+                        "description": "電源条件（set 時のみ有効）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_setup_changes",
             "description": "tako setup のアップデート追従状況を照会する（Issue #94）。\
                 前回 `tako setup` 完了時に適用したリビジョン（applied_revision）と\
@@ -1829,6 +1863,11 @@ fn build_request(
         "tako_fda" => Request::Fda {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
         },
+        "tako_sleep_guard" => Request::SleepGuard {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
+            mode: str_arg(args, "mode")?.map(|s| s.to_string()),
+            power_condition: str_arg(args, "power_condition")?.map(|s| s.to_string()),
+        },
         "tako_setup_changes" => Request::SetupChanges,
         "tako_agents_sync_rules" => Request::AgentsSyncRules {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
@@ -2357,7 +2396,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 60);
+        assert_eq!(tools.len(), 61);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

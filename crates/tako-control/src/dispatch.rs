@@ -2020,6 +2020,57 @@ fn dispatch_inner(
             }
         }
 
+        Request::SleepGuard {
+            action,
+            mode,
+            power_condition,
+        } => {
+            let action = action.as_deref().unwrap_or("status");
+            match action {
+                "status" => {
+                    let settings = crate::settings::load();
+                    Ok(crate::sleep_guard::status(
+                        settings.sleep_guard_mode,
+                        settings.sleep_guard_power,
+                    )
+                    .to_json())
+                }
+                "set" => {
+                    let mut settings = crate::settings::load();
+                    if let Some(m) = mode.as_deref() {
+                        settings.sleep_guard_mode =
+                            crate::sleep_guard::SleepGuardMode::from_str_opt(m).ok_or_else(
+                                || {
+                                    DispatchError::InvalidParams(format!(
+                                    "不明な mode: {m:?}（off / on / while-agents-running のいずれか）"
+                                ))
+                                },
+                            )?;
+                    }
+                    if let Some(pc) = power_condition.as_deref() {
+                        settings.sleep_guard_power =
+                            crate::sleep_guard::PowerCondition::from_str_opt(pc).ok_or_else(
+                                || {
+                                    DispatchError::InvalidParams(format!(
+                                        "不明な power_condition: {pc:?}（ac-only / always のいずれか）"
+                                    ))
+                                },
+                            )?;
+                    }
+                    crate::settings::save(&settings)
+                        .map_err(|e| DispatchError::Operation(format!("設定の保存に失敗: {e}")))?;
+                    Ok(crate::sleep_guard::status(
+                        settings.sleep_guard_mode,
+                        settings.sleep_guard_power,
+                    )
+                    .to_json())
+                }
+                other => Err(DispatchError::InvalidParams(format!(
+                    "不明な action: {other:?}（status / set のいずれか）"
+                ))),
+            }
+        }
+
         Request::TreeFolder {
             action,
             path,

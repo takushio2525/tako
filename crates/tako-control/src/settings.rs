@@ -21,6 +21,12 @@ pub struct Settings {
     /// tmux 不在環境では設定に関わらず直接 spawn へ無害劣化する）
     #[serde(default = "default_true")]
     pub tmux_persist: bool,
+    /// スリープ防止モード（Issue #173。既定 while-agents-running）
+    #[serde(default)]
+    pub sleep_guard_mode: crate::sleep_guard::SleepGuardMode,
+    /// スリープ防止の電源条件（Issue #173。既定 ac-only）
+    #[serde(default)]
+    pub sleep_guard_power: crate::sleep_guard::PowerCondition,
 }
 
 fn default_true() -> bool {
@@ -33,6 +39,8 @@ impl Default for Settings {
             auto_rename: true,
             port_detect: true,
             tmux_persist: true,
+            sleep_guard_mode: crate::sleep_guard::SleepGuardMode::default(),
+            sleep_guard_power: crate::sleep_guard::PowerCondition::default(),
         }
     }
 }
@@ -97,6 +105,8 @@ mod tests {
             auto_rename: false,
             port_detect: false,
             tmux_persist: false,
+            sleep_guard_mode: crate::sleep_guard::SleepGuardMode::On,
+            sleep_guard_power: crate::sleep_guard::PowerCondition::Always,
         };
         save_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), Some(settings));
@@ -112,5 +122,13 @@ mod tests {
         assert!(parsed.auto_rename);
         assert!(parsed.port_detect);
         assert!(parsed.tmux_persist);
+        assert_eq!(
+            parsed.sleep_guard_mode,
+            crate::sleep_guard::SleepGuardMode::WhileAgentsRunning
+        );
+        assert_eq!(
+            parsed.sleep_guard_power,
+            crate::sleep_guard::PowerCondition::AcOnly
+        );
     }
 }
