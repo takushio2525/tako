@@ -160,9 +160,9 @@ impl TakoApp {
                                 d.bg(rgba(theme.surface_highlight))
                                     .text_color(hsla(theme.red))
                             })
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                                 cx.stop_propagation();
-                                this.remove_tab(id, cx);
+                                this.close_tab_with_confirm(id, event.modifiers().platform, cx);
                             }))
                             .child("×"),
                     )

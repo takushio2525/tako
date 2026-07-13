@@ -753,6 +753,20 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_confirm_close",
+            "description": "タブ / ペインの × ボタンで閉じる際の確認ダイアログの ON/OFF を\
+                切り替える（enabled 省略時は現在状態の取得のみ）。有効時、× クリックで\
+                「失われるもの」を要約した確認ダイアログを表示し、⌘クリックでスキップできる。\
+                設定は config.yaml に永続化される。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "enabled": { "type": "boolean", "description": "true = 有効化、false = 無効化（省略時は状態取得）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_git_log",
             "description": "git リポジトリのコミット履歴・ブランチ一覧・変更状態を取得する。\
                 対象ペインの cwd から git リポジトリを解決する。\
@@ -1594,6 +1608,9 @@ fn build_request(
         "tako_persist" => Request::Persist {
             enabled: bool_arg(args, "enabled")?,
         },
+        "tako_confirm_close" => Request::ConfirmClose {
+            enabled: bool_arg(args, "enabled")?,
+        },
         "tako_open_file" => Request::OpenFile {
             pane: Some(target_pane(args, caller)?),
             path: str_arg(args, "path")?.ok_or("path を指定する")?,
@@ -2340,7 +2357,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 59);
+        assert_eq!(tools.len(), 60);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
