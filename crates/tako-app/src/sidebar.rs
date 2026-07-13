@@ -11,7 +11,18 @@ impl TakoApp {
         if !self.filetree.visible {
             return;
         }
+
+        // 実体が消えた pinned フォルダを自動除去（#171）
+        let tab_id = self.workspace.active_tab().id();
+        if let Some(tab) = self.workspace.get_tab_mut(tab_id) {
+            tab.prune_dead_folders();
+        }
+
+        // 正規パス（symlink 解決済み）でデデュープ（#171: cwd と pinned の重複排除）
+        let mut canonical_set: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
         let mut roots: Vec<std::path::PathBuf> = Vec::new();
+
         let active_tab_id = self.workspace.active_tab().id();
 
         // フォアグラウンドペイン
@@ -20,7 +31,8 @@ impl TakoApp {
                 continue;
             };
             let cwd = cwd.to_path_buf();
-            if !roots.contains(&cwd) {
+            let canon = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+            if canonical_set.insert(canon) {
                 roots.push(cwd);
             }
         }
@@ -34,14 +46,16 @@ impl TakoApp {
                 continue;
             };
             let cwd = cwd.to_path_buf();
-            if !roots.contains(&cwd) {
+            let canon = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+            if canonical_set.insert(canon) {
                 roots.push(cwd);
             }
         }
 
-        // #134: AI が明示追加したフォルダを合流
+        // #134: AI が明示追加したフォルダを合流（正規パスでデデュープ）
         for folder in self.workspace.active_tab().pinned_folders() {
-            if !roots.contains(folder) {
+            let canon = folder.canonicalize().unwrap_or_else(|_| folder.clone());
+            if canonical_set.insert(canon) {
                 roots.push(folder.clone());
             }
         }

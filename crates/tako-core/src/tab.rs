@@ -141,23 +141,40 @@ impl Tab {
         &self.pinned_folders
     }
 
-    /// フォルダを追加する。既に含まれていれば false
+    /// フォルダを追加する。正規パス（symlink 解決済み）でデデュープし、既存なら false
     pub fn add_pinned_folder(&mut self, path: PathBuf) -> bool {
-        if self.pinned_folders.contains(&path) {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if self
+            .pinned_folders
+            .iter()
+            .any(|p| p.canonicalize().unwrap_or_else(|_| p.clone()) == canonical)
+        {
             return false;
         }
-        self.pinned_folders.push(path);
+        self.pinned_folders.push(canonical);
         true
     }
 
-    /// フォルダを削除する。含まれていなければ false
-    pub fn remove_pinned_folder(&mut self, path: &PathBuf) -> bool {
-        if let Some(pos) = self.pinned_folders.iter().position(|p| p == path) {
+    /// フォルダを削除する。正規パスで比較し、含まれていなければ false
+    pub fn remove_pinned_folder(&mut self, path: &std::path::Path) -> bool {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if let Some(pos) = self
+            .pinned_folders
+            .iter()
+            .position(|p| p.canonicalize().unwrap_or_else(|_| p.clone()) == canonical)
+        {
             self.pinned_folders.remove(pos);
             true
         } else {
             false
         }
+    }
+
+    /// 実体が消えたフォルダエントリを除去する。変化があれば true
+    pub fn prune_dead_folders(&mut self) -> bool {
+        let before = self.pinned_folders.len();
+        self.pinned_folders.retain(|p| p.is_dir());
+        self.pinned_folders.len() != before
     }
 }
 
@@ -179,5 +196,42 @@ mod tests {
         tab.clear_manual_title();
         assert!(tab.set_title_auto("再開"));
         assert_eq!(tab.title(), "再開");
+    }
+
+    // --- #171: pinned_folders の正規パスデデュープ ---
+
+    #[test]
+    fn pinned_folder_symlink経由の重複は畳まれる() {
+        let mut tab = Tab::new("t", Pane::new(PaneOrigin::User));
+        // macOS: /tmp → /private/tmp
+        assert!(tab.add_pinned_folder(PathBuf::from("/tmp")));
+        assert!(
+            !tab.add_pinned_folder(PathBuf::from("/private/tmp")),
+            "同じ正規パスの二重追加は false を返す"
+        );
+        assert_eq!(tab.pinned_folders().len(), 1);
+    }
+
+    #[test]
+    fn pinned_folder_symlink経由でも削除できる() {
+        let mut tab = Tab::new("t", Pane::new(PaneOrigin::User));
+        tab.add_pinned_folder(PathBuf::from("/tmp"));
+        assert!(
+            tab.remove_pinned_folder(&PathBuf::from("/private/tmp")),
+            "正規パスが同じなら別表記でも削除できる"
+        );
+        assert!(tab.pinned_folders().is_empty());
+    }
+
+    #[test]
+    fn prune_dead_folders_は実体消失エントリを除去する() {
+        let mut tab = Tab::new("t", Pane::new(PaneOrigin::User));
+        let tmp = std::env::temp_dir().join("tako_test_prune_tab_171");
+        std::fs::create_dir_all(&tmp).unwrap();
+        tab.add_pinned_folder(tmp.clone());
+        assert_eq!(tab.pinned_folders().len(), 1);
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert!(tab.prune_dead_folders());
+        assert!(tab.pinned_folders().is_empty());
     }
 }
