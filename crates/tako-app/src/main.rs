@@ -57,6 +57,24 @@ use tako_core::{
 const INITIAL_COLS: usize = 80;
 const INITIAL_ROWS: usize = 24;
 
+/// 実行中 Claude Code とペインの対応を layout.json へ反映する間隔。
+/// 外部 CLI を呼ぶため描画ループとは分離し、成功時だけ保存キャッシュを更新する。
+const CLAUDE_SESSION_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// 復元時に新しいシェルへ投入する Claude resume コマンドを安全条件つきで組み立てる。
+/// backend 生存時はプロセスごと再 attach するため、二重起動を避けて None。
+fn claude_resume_command(
+    backend_alive: bool,
+    session_id: Option<&str>,
+    transcript_exists: bool,
+) -> Option<Vec<u8>> {
+    let session_id = (!backend_alive && transcript_exists)
+        .then_some(session_id)
+        .flatten()
+        .filter(|id| tako_control::transcript::is_valid_session_id(id))?;
+    Some(format!("claude --resume {session_id}\r").into_bytes())
+}
+
 /// タブバーの高さ（px）
 const TAB_BAR_HEIGHT: f32 = 40.0;
 /// ペイン枠線の太さ（px）
@@ -521,6 +539,9 @@ struct TakoApp {
     quitting: bool,
     /// ペインを保持する tmux バックエンドセッション名（persist 有効時のみ登録される）
     backend_sessions: HashMap<PaneId, String>,
+    /// PC 再起動で tmux セッション自体が消えたときに resume する Claude session ID。
+    /// `claude agents --json` と PID 祖先照合が成功した結果だけを保持する
+    claude_resume_sessions: HashMap<PaneId, String>,
     /// バックエンドセッション内の window 一覧（tmux ポーリングで更新。2+ window のみ保持）
     backend_windows: HashMap<PaneId, Vec<tako_core::TmuxWindow>>,
     /// tmux window のキャプチャテキスト（ホバープレビュー用。ポーリングで非アクティブ window を取得）
@@ -1237,6 +1258,7 @@ impl TakoApp {
             secondary,
             quitting: false,
             backend_sessions: HashMap::new(),
+            claude_resume_sessions: HashMap::new(),
             backend_windows: HashMap::new(),
             window_captures: HashMap::new(),
             last_saved_layout: None,
@@ -1291,6 +1313,10 @@ impl TakoApp {
                 .iter()
                 .flat_map(|t| t.tree().panes().into_iter().map(|p| p.id()))
                 .collect();
+            let mut reattached = 0usize;
+            let mut resumed_claude = 0usize;
+            let mut fresh_shells = 0usize;
+            let mut restored_previews = 0usize;
             for r in &restored {
                 let Some(&pane) = pane_ids.iter().find(|p| p.as_u64() == r.pane) else {
                     continue;
@@ -1311,10 +1337,32 @@ impl TakoApp {
                             .push((pane, path.to_path_buf(), text));
                     }
                     app.previews.insert(pane, state);
+                    restored_previews += 1;
                     continue;
                 }
+                let backend_alive = r.session.as_ref().is_some_and(|name| {
+                    tmux_available
+                        && tako_core::tmux::has_session(
+                            Some(&tako_core::tmux_backend::socket_name()),
+                            name,
+                        )
+                });
                 if let Some(name) = &r.session {
                     app.backend_sessions.insert(pane, name.clone());
+                }
+                let transcript_exists = r
+                    .claude_session_id
+                    .as_deref()
+                    .is_some_and(|id| tako_control::transcript::find_transcript(id).is_some());
+                let resume_command = claude_resume_command(
+                    backend_alive,
+                    r.claude_session_id.as_deref(),
+                    transcript_exists,
+                );
+                if let Some(session_id) = &r.claude_session_id {
+                    if tako_control::transcript::is_valid_session_id(session_id) {
+                        app.claude_resume_sessions.insert(pane, session_id.clone());
+                    }
                 }
                 let options = SpawnOptions {
                     cwd: r
@@ -1326,12 +1374,37 @@ impl TakoApp {
                 };
                 if let Err(e) = app.spawn_session(pane, options, cx) {
                     eprintln!("warning: ペイン {pane} を復元できない: {e}");
+                    continue;
+                }
+                if backend_alive {
+                    reattached += 1;
+                } else if let Some(command) = resume_command {
+                    // tmux サーバーごと消える PC 再起動では新しいログインシェルを起動し、
+                    // 保存済みの会話だけを明示 resume する。入力を PTY にキューすることで、
+                    // Claude 終了後は元のシェルへ戻れる（明示コマンド spawn だとペインも終了する）。
+                    if let Some(session) = app.terminals.get(&pane) {
+                        session.write(command);
+                        resumed_claude += 1;
+                    }
+                } else {
+                    fresh_shells += 1;
                 }
             }
             if app.terminals.is_empty() && app.previews.is_empty() {
                 eprintln!("fatal: 復元したペインを 1 つも起動できない");
                 std::process::exit(1);
             }
+            let report = format!(
+                "復元成功: {} タブ / {} ペイン（tmux 再 attach {} / Claude resume {} / 新規シェル {} / プレビュー {}）",
+                app.workspace.tabs().len(),
+                restored.len(),
+                reattached,
+                resumed_claude,
+                fresh_shells,
+                restored_previews
+            );
+            app.restore_report = Some(report.clone());
+            persist_diag(&report);
             // 復元時のプレビューも background でハイライトする
             for (pane, path, text) in std::mem::take(&mut app.pending_highlights) {
                 app.spawn_highlight(pane, path, text, cx);
@@ -1403,6 +1476,44 @@ impl TakoApp {
                     }
                     Err(_) => break, // View が破棄された
                 }
+            }
+        })
+        .detach();
+
+        // PC 再起動では tmux プロセスも消えるため、実行中 Claude Code の session ID を
+        // ペインごとに保存して `claude --resume` へ使う。外部コマンドは background で実行し、
+        // 検出失敗時は直前の成功値を壊さない。既存 persist トグルが CLI / MCP 共通の制御点。
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(CLAUDE_SESSION_SCAN_INTERVAL)
+                .await;
+            let should_scan = this
+                .update(cx, |app: &mut TakoApp, _| {
+                    app.tmux_persist
+                        && !app.secondary
+                        && !app.backend_sessions.is_empty()
+                        // self-test は外部 Claude CLI を呼ばず決定的に完走させる
+                        && std::env::var_os("TAKO_SELF_TEST").is_none()
+                })
+                .unwrap_or(false);
+            if !should_scan {
+                continue;
+            }
+            let detected = cx
+                .background_executor()
+                .spawn(async { tako_control::agents::claude_session_ids_by_backend() })
+                .await;
+            let Ok(detected) = detected else {
+                continue;
+            };
+            if this
+                .update(cx, |app: &mut TakoApp, _| {
+                    app.apply_claude_resume_sessions(&detected);
+                    app.save_layout();
+                })
+                .is_err()
+            {
+                break;
             }
         })
         .detach();
@@ -2940,6 +3051,7 @@ impl TakoApp {
     /// セッションは生きているか他インスタンスが引き継いでいる。残骸は起動時の
     /// orphan クリーンアップ（FR-2.16.11）と tmux ビューの「kill漏れ?」表示が拾う）
     fn drop_backend_session_with(&mut self, pane_id: PaneId, reason: CloseReason) {
+        self.claude_resume_sessions.remove(&pane_id);
         match reason {
             CloseReason::Explicit => self.drop_backend_session(pane_id),
             CloseReason::Exited => {
@@ -3115,6 +3227,7 @@ impl TakoApp {
             return;
         }
         let backend_sessions = &self.backend_sessions;
+        let claude_resume_sessions = &self.claude_resume_sessions;
         let terminals = &self.terminals;
         let previews = &self.previews;
         let mut layout = tako_control::layout::capture(
@@ -3125,6 +3238,7 @@ impl TakoApp {
                     .get(&pane)
                     .and_then(|s| s.cwd())
                     .map(|p| p.display().to_string()),
+                claude_session_id: claude_resume_sessions.get(&pane).cloned(),
                 preview: previews
                     .get(&pane)
                     .map(|p| tako_control::layout::PreviewLayout {
@@ -3152,6 +3266,22 @@ impl TakoApp {
             // 保存失敗は復元不能に直結するので診断ログにも残す（Issue #30）
             Err(e) => persist_diag(&format!("保存失敗: {e}")),
         }
+    }
+
+    /// 1 回の `claude agents --json` 成功結果を現在の backend ペインへ反映する。
+    /// 成功結果に存在しないペインは Claude が終了済みなので関連を外し、次回 PC 起動で
+    /// 古い会話を勝手に resume しない。スキャン自体が失敗した場合は呼ばれない。
+    fn apply_claude_resume_sessions(&mut self, by_backend: &HashMap<String, String>) {
+        self.claude_resume_sessions = self
+            .backend_sessions
+            .iter()
+            .filter_map(|(pane, backend)| {
+                by_backend
+                    .get(backend)
+                    .filter(|id| tako_control::transcript::is_valid_session_id(id))
+                    .map(|id| (*pane, id.clone()))
+            })
+            .collect();
     }
 
     fn focus_direction(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
@@ -11738,5 +11868,25 @@ mod scroll_tests {
         let (lines, carry) = accumulate_scroll(0.9, -0.4);
         assert_eq!(lines, 0);
         assert!((carry + 0.4).abs() < 1e-5);
+    }
+}
+
+#[cfg(test)]
+mod persist_resume_tests {
+    use super::claude_resume_command;
+
+    #[test]
+    fn backend消失時だけ検証済みclaudeをresumeする() {
+        let id = "a45899a8-96a6-4fa6-9bf6-71df53307878";
+        assert_eq!(
+            claude_resume_command(false, Some(id), true),
+            Some(format!("claude --resume {id}\r").into_bytes())
+        );
+        // 通常の tako 再起動は既存プロセスへ再 attach し、Claude を二重起動しない
+        assert_eq!(claude_resume_command(true, Some(id), true), None);
+        // transcript 不在・不正 ID・ID 不明を推測で起動しない
+        assert_eq!(claude_resume_command(false, Some(id), false), None);
+        assert_eq!(claude_resume_command(false, Some("../../bad"), true), None);
+        assert_eq!(claude_resume_command(false, None, true), None);
     }
 }

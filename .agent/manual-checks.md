@@ -147,6 +147,11 @@ role / title の設定・取得自体はセルフテスト（`tako title / role 
       作り、tako を cmd+Q → 再起動。タブ構成・分割・実行中プロセス・画面内容が戻る
 - [ ] **AI 操作の継続**: 再起動前から動いている claude（tmux セッション内で生存）が、
       再起動後も MCP ツール（`tako_list_panes` 等）を叩ける（control.json フォールバック）
+- [ ] **PC 再起動相当の Claude 会話復旧（#139）**: Claude を起動して layout.json に
+      `claude_session_id` が保存されたことを確認 → tako 終了 + 専用 tmux server kill →
+      tako 再起動。同じペインで `claude --resume` が起動し、直前の会話が表示される。
+      tmux server を残す通常再起動では既存 Claude への再 attach だけで二重起動しない。
+      `tako persist` / MCP `tako_persist` の `last_restore` に resume 件数が出る
 - [ ] 体感レイテンシ・描画が直接 spawn と変わらない（キー入力・大量出力・vim / claude の TUI）
 - [ ] ホイールスクロールで過去出力が見える（tmux copy-mode。`q` か最下部までスクロールで戻る。
       従来の自前スクロールバック・スクロールバーは backend ペインでは出ない = 既知の仕様変更）
