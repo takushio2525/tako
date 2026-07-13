@@ -4,43 +4,50 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-13・#167 マウスエスケープ断片の入力欄混入を根治）
+## 現在の対象（2026-07-13・#181 スクロール体感問題の根治。#167 は main へマージ済み）
 
-**#167（SGR マウスレポート断片 `4;45;18M` / `<64;12;17M` が claude 入力欄に平文混入）を根本修正**。
-隔離 tmux + 実 claude で機序を実測確定: 外側クライアント PTY へ書いた SGR シーケンスが
-途中で 10ms 以上途切れる（慣性スクロール洪水の部分 write + UI/イベントループ停滞）と、
-tmux（escape-time 10ms）が ESC を単独キー確定し残りを平文として内側へ転送する。
-仮説①（モードレース）②（単純分割 write）は tmux が正しく再構成することを確認し棄却。
+**#181（#159 スクロール改善が実機で体感できない）を根本修正**。根因は 3 つ + カクつき 1 つ:
 
-対策（二層）:
-- **バックエンドペインのホイールレポートは外側 PTY を通さない**: `scroll_mirror::send_wheel`
-  （`tmux send-keys -H` 直接注入）+ UI 層 `pump_wheel`（in-flight 1 本直列化）。
-  SGR / X10 は `#{mouse_sgr_flag}`（`HistoryState`）で出し分け
-- **全ホイール転送にレート制限**（`terminal.rs`）: トークンバケット 150 イベント/秒・
-  バースト 8（macOS PTY バッファ 1024B に対する安全マージン）
+1. ミラー経路の分岐が `backend_sessions` のみ → `tako tmux open` の TmuxOpen ビューペインが
+   直接ペイン扱いに落ち、外側 alacritty は alt screen（履歴 0）でホイール・スクロールバー不発
+2. persist ON ではビューペインの外側 PTY 自体も backend ラップされる（実測: ラッパー client_tty
+   = backend pane_tty）→ backend 優先の実体解決だと外側（history 0）へ誤解決
+3. persist 復元で戻ったビューペインは `tmux_view_panes` 未登録 + ネスト候補が既定サーバーのみで
+   `--socket tako` のビュー先を辿れない → ネスト候補に backend socket を追加して tty 突き合わせ
+4. カクつき = `OrchestratorWorkerStatus` dispatch が `claude agents --json`（550〜1100ms）を
+   UI スレッド同期実行（perf.log 2h で 2000 件超、時刻がユーザー報告と一致）→
+   IPC ループで snapshot（UI）/ compute（background executor）に分離
 
-詳細は `.agent/architecture.md`「マウスレポート転送（#167）」節。
+既知制約（仕様化）: alt screen TUI（claude Code / vim）内のスクロール粒度はアプリ依存で
+スムーススクロール対象外。カスタム `-L` 外部サーバーのビューは復元後にネスト検出不能
+（開き直せば回復）。いずれも manual-checks.md / requirements.md FR-2.5.13 に記載。
 
-## 検証済み（#167）
+**main 取り込み済み（#167 = PR #184）**: マウスレポートは `send-keys -H` 直接注入 +
+レート制限へ（wants_mouse=true 側の転送経路。#181 対象の mirror 経路とは独立）。
+`history_state` の `HistoryState` 構造体化・`ScrollCtl` 新フィールドとの整合を
+マージ後ビルド + セルフテストで確認する。
 
-- workspace build / test（551 passed）/ fmt / clippy(-D warnings) 全緑 + 隔離セルフテスト完走
-- e2e 新設 2 本: 洪水 2100 イベントで断片ゼロ + レート制限の存在 / send-keys 注入が生で届く
-- 実 claude before/after（隔離 tmux、本番不接触）: before = PTY 書き込み洪水で入力欄に断片
-  大量混入を再現 / after = 新経路で idle 1500 + busy 588 イベント断片ゼロ
-- 教訓: capture-pane の断片判定は `-J`（折り返し結合）必須（80 桁折り返しの誤検出を踏んだ）
+## 検証済み（#181。マージ前の fix/181 単体）
+
+- 全 551 テスト / fmt / clippy(-D warnings) / 隔離セルフテスト完走（項目 73 = TmuxOpen ミラー
+  e2e、74 = worker_status IPC 応答を新設）/ visual-test subline direct=22197 shifted=0（#176 一致）
+- 隔離実機 e2e（TAKO_ISOLATED + 隔離 HOME、本番不接触）: バックエンド（history 275）/
+  ビュー（276）/ 復元通常（275）/ 復元ビュー = backend socket 上（273）の各ミラー + スクロール
+  バー描画をキャプチャ実証。worker_status 15 連打（各 174〜239ms 実負荷）中の scroll 応答
+  24〜34ms 安定・隔離 perf.log 0 件
+- 調査中の事故: CLI が TAKO_SOCKET 注入で本番へ誤接続（ビューペイン 1 個生成 → close 復旧済み）。
+  以降の検証は `env -u TAKO_*` を徹底。Issue #181 コメントに記録済み
 
 ## 次の一手
 
-- fix/167 の PR を squash merge → `build-app.sh --install` → tako 再起動で実機反映
-- **並行 worker #181**（#159 スクロールが再アタッチペインで体感できない）が同じスクロール
-  制御群を変更中（tako-wt-181）。`history_state` のシグネチャ変更・`ScrollCtl` 新フィールド・
-  wants_mouse=true 経路の send-keys 化を Issue #181 コメントで共有済み。rebase 側が対応する
-- fix/177 の残タスク: 明朝 5:00 の夜間ジョブ初回実行を監視（v0.4.1 自動リリース見込み。#166）
-- Phase 5 の次候補は FR-2.19 localhost ポートパネル・FR-3.10 画像プレビュー等
+- origin/main（#167）とのマージ整合を検証（ビルド + テスト + 隔離セルフテスト再実行）→
+  PR #186 を squash merge --delete-branch → fetch + detach → `scripts/build-app.sh --install`
+- ユーザー再確認: 本番の tako-view ペイン（405/400/420）でスクロール + カクつき解消の体感確認
+- 明朝 5:00 の夜間ジョブ監視（v0.4.1 自動リリース見込み。#166）は継続
 
 ## 現フェーズで Read すべき設計書
 
-- マウスレポート転送の設計（#167）: `.agent/architecture.md` 該当節
-- 多重インスタンスの資源保護（#177）: `.agent/architecture.md` 該当節
-- スクロールの要件（#159 で全面改稿 + #167 で転送経路更新）: `.agent/requirements.md` FR-2.5.13
-- spawn レイアウトの設計（#165）: `.agent/architecture.md`「spawn レイアウトエンジン」節
+- スクロールのミラー経路・実体解決（#181 で改稿）: `.agent/architecture.md`「スクロール制御」節
+- マウスレポート転送（#167）: `.agent/architecture.md` 該当節
+- スクロール要件・既知制約: `.agent/requirements.md` FR-2.5.13
+- UI スレッドで外部プロセス禁止の教訓: `.agent/architecture.md`「UI スレッド同期処理」節

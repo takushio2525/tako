@@ -422,6 +422,24 @@ e2e: `tmux_backend::マウスレポート洪水でも断片がテキスト化し
   （開発不変条件）。応答を UI が `sync_scroll_from_dispatch` で取り込み、
   AI のスクロールでもバーが出る
 
+**2026-07-13（#159）に copy-mode 駆動 → ローカルミラー方式へ再転換**: スクロール開始時に
+`capture-pane -e` で履歴をチャンク取得（`tako-core::scroll_mirror`）し、以降の描画は完全
+ローカル（copy-mode 不使用）。詳細は `requirements.md` FR-2.5.13。`resolve_target` /
+`mouse_any_flag` の出し分け・`=セッション名:` の罠は現方式でも同じ。
+
+**ミラー経路の対象判定は `mirror_scroll_pane`（backend_sessions ∪ tmux_view_panes）**
+（2026-07-13、#181）: `tako tmux open` の TmuxOpen ビューペイン（再アタッチ・`tako-view-*`
+ラッパー）は外側 alacritty が alt screen（履歴なし）のため、`backend_sessions` だけで分岐すると
+直接ペイン扱いに落ちてスクロール不能になる（#177 復旧直後の実機で全ペイン非機能に見えた根因）。
+TmuxOpen ペインの実体は wrapper（無ければ元セッション）@ socket を `ScrollTarget::Nested` として
+resolve なしで確定する（`MirrorSource::Fixed`）。実体解決は**ビュー先優先**: persist ON では
+ビューペインの外側 PTY 自体が backend ラップされ `backend_sessions` にも載る（実測: ラッパーの
+client_tty = backend セッションの pane_tty）ため、backend を先に見ると外側（history 0）へ
+誤解決する。また persist 復元で戻ったビューペインは `tmux_view_panes` に載らないため、
+`resolve_target` のネスト候補を `[None]` → `[None, backend socket]` に広げ、`--socket tako`
+（README の #177 復旧手順）のビュー先を tty 突き合わせで検出する。カスタム `-L` 外部サーバーの
+ビューだけは復元後に検出不能（既知制約。開き直せば回復）
+
 ### ⚠️ スパイクで踏んだ罠（再発防止）
 
 - **tmux に明示コマンドを渡すと `default-shell -c <cmd>` で実行される**: この非対話 zsh
@@ -506,6 +524,14 @@ e2e: `tmux_backend::マウスレポート洪水でも断片がテキスト化し
   `scan_dirs` → main thread `apply_refresh` の 3 段階に分離
 - **原則**: UI スレッド上で 1ms 以上かかるファイル I/O や CPU 計算を同期実行しない。
   やむを得ない場合は計測値をコメントに残し、非同期化の TODO を添える
+- **dispatch でサブプロセスを同期起動してはいけない**（2026-07-13、#181）:
+  `OrchestratorWorkerStatus` が `claude agents --json`（Node.js 起動 = 実測 500〜1100ms）を
+  UI スレッドの dispatch 内で呼び、master のポーリング（1〜3 秒間隔）ごとに UI 全体が固まって
+  「スクロールがカクつく」実機症状になった（perf.log に 2 時間で 2000 件超の dispatch 遅延）。
+  対処 = IPC ループでリクエストを特別扱いし、UI 依存部分のスナップショット
+  （`worker_status_snapshot`。workspace / 画面の写し取りのみ）を UI スレッドで、
+  外部プロセスを叩く合成（`worker_status_compute`。ControlHost 不要）を background executor で
+  実行して応答する。同型の外部プロセス依存 dispatch を追加するときはこの二段分離を踏襲する
 
 ## コンセプト②の実現
 

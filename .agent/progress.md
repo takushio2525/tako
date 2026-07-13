@@ -664,3 +664,17 @@
 - 検証: 551 tests / fmt / clippy 全緑 + 隔離セルフテスト完走 + 実 claude before/after
   （before = 入力欄へ断片大量混入、after = idle 1500 + busy 588 イベントで断片ゼロ）
 - 次: PR squash merge → install。並行 #181 へ変更点を Issue コメントで共有済み
+
+## 2026-07-13（#181: スクロール改善が実機で体感できない問題の根治 — 3 根因 + カクつき）
+- 根因 ①ミラー経路判定が backend_sessions のみで TmuxOpen ビューペインが直接ペイン扱い
+  （alt screen = 履歴 0 で不発）②persist ON では外側 PTY も backend ラップされ backend 優先
+  解決だと外側（history 0）へ誤解決 ③persist 復元後は tmux_view_panes 未登録 + ネスト候補が
+  既定サーバーのみで `--socket tako` のビュー先を辿れない。カクつき = worker_status dispatch が
+  claude CLI（実測 550〜1100ms）を UI スレッド同期実行（perf.log 2h で 2000 件超・報告時刻一致）
+- 修正: mirror_scroll_pane / mirror_source（ビュー先優先）+ ネスト候補に backend socket 追加 +
+  worker_status を snapshot（UI）/compute（background）分離 + scrollbar_overlay 極小領域 panic 防御
+- 検証: 全 551 テスト + 隔離セルフテスト完走（項目 73/74 新設）+ visual-test（direct=22197/
+  shifted=0 = #176 記録値一致）+ 隔離 e2e キャプチャ 3 種（backend / ビュー / 復元ビュー）+
+  worker_status 15 連打中 scroll 24〜34ms 安定・perf.log 0 件
+- 副産物: 調査 CLI の TAKO_SOCKET 注入による本番誤接続（ビューペイン 1 個生成 → close 復旧済み、
+  Issue に記録）。alt screen TUI 内スクロール粒度はアプリ依存 = 仕様と明確化（manual-checks 記載）

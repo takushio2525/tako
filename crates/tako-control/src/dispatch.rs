@@ -75,6 +75,13 @@ pub trait ControlHost {
     fn backend_session(&self, _pane: PaneId) -> Option<String> {
         None
     }
+    /// ペインのスクロール実体が tmux 側にあるか（バックエンドセッション、または
+    /// `tako tmux open` の TmuxOpen ビュー。#181）。dispatch の `Scroll` をミラー経路
+    /// （`backend_scroll_view`）へ回すかの判定。UI を持たない実装の既定は
+    /// バックエンドセッションの有無
+    fn is_mirror_scroll_pane(&self, pane: PaneId) -> bool {
+        self.backend_session(pane).is_some()
+    }
     /// バックエンドペインの表示スクロール（ローカルミラー方式 #159）。
     /// `to` = 絶対位置（0 = 最下部）/ `delta` = 相対行数（正 = 遡る）のどちらか一方。
     /// 戻り値は (クランプ後の表示位置, 履歴行数)。UI を持たない実装では None
@@ -656,11 +663,11 @@ fn dispatch_inner(
                     "to（絶対位置。0 = 最下部）か delta（相対行数）のどちらか一方を指定する".into(),
                 ));
             }
-            // バックエンドペイン（Phase 5.5）のスクロールバックは tmux 側にあり、
-            // 表示はホスト UI のローカルミラー（#159。UI のホイール / スクロールバーと
-            // 同じ層。開発不変条件）。旧 copy-mode 駆動は廃止した（行単位 + tmux 往復 +
-            // キー飲まれの 3 制約のため）
-            if host.backend_session(target).is_some() {
+            // バックエンドペイン（Phase 5.5）・TmuxOpen ビューペイン（#181）の
+            // スクロールバックは tmux 側にあり、表示はホスト UI のローカルミラー
+            // （#159。UI のホイール / スクロールバーと同じ層。開発不変条件）。
+            // 旧 copy-mode 駆動は廃止した（行単位 + tmux 往復 + キー飲まれの 3 制約のため）
+            if host.is_mirror_scroll_pane(target) {
                 let (offset, history) = host
                     .backend_scroll_view(target, to.map(|t| t as usize), delta)
                     .ok_or_else(|| {
@@ -1722,16 +1729,18 @@ fn dispatch_inner(
             },
         ),
 
+        // 通常は UI 層（tako-app の IPC ループ）が snapshot / compute を二段で実行して
+        // ここへ来ない（#181: compute の claude CLI 起動が UI を専有するため background 化）。
+        // CLI 直呼びやテストなど ControlHost が UI スレッドに縛られない経路のフォールバック
         Request::OrchestratorWorkerStatus {
             pane_id,
             session_id,
             tmux_session,
-        } => dispatch_orchestrator_worker_status(
-            host,
-            pane_id,
+        } => Ok(worker_status_compute(
+            worker_status_snapshot(host, pane_id),
             session_id.as_deref(),
             tmux_session.as_deref(),
-        ),
+        )),
 
         Request::RemoteStart { port, insecure } => host
             .remote_start(port, insecure)
@@ -2530,15 +2539,19 @@ fn dispatch_orchestrator_spawn(
     }))
 }
 
-fn dispatch_orchestrator_worker_status(
-    host: &dyn ControlHost,
-    pane_id: u64,
-    session_id: Option<&str>,
-    tmux_session: Option<&str>,
-) -> Result<Value, DispatchError> {
-    use crate::orchestrator;
+/// WorkerStatus の UI 依存部分のスナップショット（#181）。
+/// UI スレッドで `worker_status_snapshot` により取得し、外部プロセスを叩く重い合成
+/// （`worker_status_compute`）へ渡す。二分することで claude CLI / tmux の起動待ちが
+/// UI スレッドを専有しない
+pub struct WorkerPaneSnapshot {
+    pub pane_exists: bool,
+    pub backend_session: Option<String>,
+    pub visible_lines: Option<Vec<String>>,
+}
 
-    // ペインの存在確認（ツリー上 + shelved の両方を走査）
+/// WorkerStatus のうち UI 状態（workspace / セッション画面）だけを軽く写し取る。
+/// 外部プロセスは呼ばない（UI スレッドで安全に実行できる）
+pub fn worker_status_snapshot(host: &dyn ControlHost, pane_id: u64) -> WorkerPaneSnapshot {
     let target = PaneId::from_raw(pane_id);
     let in_tree = host.workspace().tabs().iter().any(|tab| {
         tab.tree()
@@ -2546,7 +2559,25 @@ fn dispatch_orchestrator_worker_status(
             .iter()
             .any(|p| p.id().as_u64() == pane_id)
     });
-    let pane_exists = in_tree || host.workspace().is_shelved(target);
+    WorkerPaneSnapshot {
+        pane_exists: in_tree || host.workspace().is_shelved(target),
+        backend_session: host.backend_session(target),
+        visible_lines: host.session(target).map(|s| s.visible_lines()),
+    }
+}
+
+/// スナップショットから worker 状態を合成する。`claude agents --json` のサブプロセス
+/// 起動（実測 500〜1100ms）と tmux 往復を含むため、UI スレッドでは実行しないこと
+/// （#181: master のポーリングごとに UI が固まりスクロールがカクつく）。
+/// ControlHost 不要 = background executor で実行できる
+pub fn worker_status_compute(
+    snap: WorkerPaneSnapshot,
+    session_id: Option<&str>,
+    tmux_session: Option<&str>,
+) -> Value {
+    use crate::orchestrator;
+
+    let pane_exists = snap.pane_exists;
 
     // session_id の解決: 明示指定 > pane→session 自動解決 > フォールバック
     let (resolved_sid, status_source);
@@ -2555,8 +2586,8 @@ fn dispatch_orchestrator_worker_status(
         status_source = "agents";
     } else if pane_exists {
         // pane→session 自動解決: backend_session から pid 祖先辿り
-        if let Some(backend) = host.backend_session(target) {
-            if let Some(sid) = crate::agents::resolve_session_id_for_backend(&backend) {
+        if let Some(backend) = &snap.backend_session {
+            if let Some(sid) = crate::agents::resolve_session_id_for_backend(backend) {
                 resolved_sid = Some(sid);
                 status_source = "agents-auto";
             } else {
@@ -2582,10 +2613,9 @@ fn dispatch_orchestrator_worker_status(
     };
 
     // ペインの最近の出力を取得（pane → tmux session フォールバック）
-    let recent_output = host
-        .session(target)
-        .map(|session| {
-            let mut lines = session.visible_lines();
+    let recent_output = snap
+        .visible_lines
+        .map(|mut lines| {
             while lines.last().is_some_and(|l| l.is_empty()) {
                 lines.pop();
             }
@@ -2649,13 +2679,13 @@ fn dispatch_orchestrator_worker_status(
         }
     }
 
-    Ok(json!({
+    json!({
         "status": status,
         "ctx_percent": ctx_percent,
         "recent_output": recent_output,
         "status_source": status_source,
         "resolved_session_id": resolved_sid,
-    }))
+    })
 }
 
 /// worker が busy かどうかを画面出力で判定する。
@@ -5155,5 +5185,94 @@ mod tests {
         )
         .unwrap();
         assert_eq!(list2["folders"].as_array().unwrap().len(), 0);
+    }
+
+    // --- worker_status の snapshot / compute 分離（#181）---
+    // 以下は backend_session = None / session_id = None / tmux_session = None に固定し、
+    // claude CLI / tmux のサブプロセスを一切呼ばない決定的な範囲だけを検証する
+
+    #[test]
+    fn worker_status_snapshotがui状態を写し取る() {
+        let host = MockHost::new();
+        let pane = host.root_pane();
+        let snap = worker_status_snapshot(&host, pane);
+        assert!(snap.pane_exists);
+        // MockHost は backend / セッション画面を持たない
+        assert_eq!(snap.backend_session, None);
+        assert!(snap.visible_lines.is_none());
+        // 存在しないペイン
+        let gone = worker_status_snapshot(&host, 999_999);
+        assert!(!gone.pane_exists);
+    }
+
+    #[test]
+    fn worker_status_computeがペイン不在でgoneを返す() {
+        let snap = WorkerPaneSnapshot {
+            pane_exists: false,
+            backend_session: None,
+            visible_lines: None,
+        };
+        let v = worker_status_compute(snap, None, None);
+        assert_eq!(v["status"], "gone");
+        assert_eq!(v["status_source"], "none");
+        assert!(v["recent_output"].is_null());
+    }
+
+    #[test]
+    fn worker_status_computeが画面からidle_busyを推定する() {
+        // ❯ プロンプト行 = idle（backend 無しなので status_source は screen）
+        let idle = worker_status_compute(
+            WorkerPaneSnapshot {
+                pane_exists: true,
+                backend_session: None,
+                visible_lines: Some(vec!["done".into(), "❯ ".into()]),
+            },
+            None,
+            None,
+        );
+        assert_eq!(idle["status"], "idle");
+        assert_eq!(idle["status_source"], "screen");
+        // busy マーカー行 = busy
+        let busy = worker_status_compute(
+            WorkerPaneSnapshot {
+                pane_exists: true,
+                backend_session: None,
+                visible_lines: Some(vec!["Thinking…".into(), "esc to interrupt".into()]),
+            },
+            None,
+            None,
+        );
+        assert_eq!(busy["status"], "busy");
+        // 画面なし = unknown のまま
+        let unknown = worker_status_compute(
+            WorkerPaneSnapshot {
+                pane_exists: true,
+                backend_session: None,
+                visible_lines: None,
+            },
+            None,
+            None,
+        );
+        assert_eq!(unknown["status"], "unknown");
+    }
+
+    #[test]
+    fn worker_status_computeが末尾空行を刈り30行に制限する() {
+        let mut lines: Vec<String> = (1..=40).map(|i| format!("L{i}")).collect();
+        lines.push(String::new());
+        lines.push(String::new());
+        let v = worker_status_compute(
+            WorkerPaneSnapshot {
+                pane_exists: true,
+                backend_session: None,
+                visible_lines: Some(lines),
+            },
+            None,
+            None,
+        );
+        let out = v["recent_output"].as_str().unwrap();
+        assert!(out.starts_with("L11"), "先頭 10 行が刈られる: {out}");
+        assert!(out.ends_with("L40"), "末尾の空行が刈られる: {out}");
+        assert_eq!(out.lines().count(), 30);
     }
 }
