@@ -253,8 +253,10 @@ Monitor({
 pane to its claude session via pid ancestry. Only pass `--session-id` if you already
 have it (e.g. from a previous status check).
 
-The watch command will output one line when the worker finishes:
+The watch command will output when the worker stops:
 - `WORKER_IDLE: tako:<pane> (ctx NN%)` — worker completed or awaiting input
+- `WORKER_ERROR: tako:<pane> (<kind>)` — worker stalled on a known error
+  (API error, usage limit, etc.). Extra `detail:` / `action:` lines follow.
 - `WORKER_GONE: tako:<pane>` — pane was closed
 
 ### When you receive WORKER_IDLE
@@ -268,10 +270,30 @@ The watch command will output one line when the worker finishes:
 3. Worker reports completion → run Acceptance Inspection, then follow the
    lifecycle rules.
 
-Restart a worker (close → respawn) ONLY on: explicit error output in the pane,
-~10+ minutes with no output and no thinking indicator, or the worker itself
-declaring it cannot proceed. Respawning a worker that was merely thinking throws
-away its entire context and doubles token cost.
+### When you receive WORKER_ERROR
+
+The worker stalled — it did NOT complete. Do not run Acceptance Inspection.
+Recover by `kind` (also in `tako_orchestrator_worker_status` as
+`error.kind` / `error.recommended_action`):
+
+- `api_error` (action: resume) — transient API failure (connection closed,
+  timeout). Send a continue nudge via `tako_send_input` (e.g. "続きを実行して")
+  and re-arm the watch. The worker keeps its context.
+- `usage_limit` (action: wait_reset) — usage limit reached. Read the pane for
+  the reset time, wait until then (or tell the user), then send a continue
+  nudge. Immediate resends will bounce.
+- `limit_dialog` (action: respond_dialog) — a rate-limit dialog (e.g. codex
+  model-switch prompt) is blocking. Read the pane, pick the option that keeps
+  the task on track, and answer it via `tako_send_input` (keys: e.g. Enter).
+
+Do NOT close → respawn on WORKER_ERROR: the worker's context is intact and a
+resume is almost always cheaper than a respawn.
+
+Restart a worker (close → respawn) ONLY on: explicit error output in the pane
+that a resume nudge did not clear, ~10+ minutes with no output and no thinking
+indicator, or the worker itself declaring it cannot proceed. Respawning a
+worker that was merely thinking throws away its entire context and doubles
+token cost.
 
 <!-- block: acceptance -->
 ## Acceptance Inspection (Before Reporting to the User)

@@ -2803,12 +2803,31 @@ fn finish_worker_status(
         }
     }
 
+    // 停止（idle）した worker の画面に既知のエラーパターン（API エラー・usage limit・
+    // rate limit ダイアログ）があれば error へ細分類する（#157）。busy 中は判定しない
+    // （自動リトライ・ツール実行ログへの誤検知防止。busy が明ければ idle 経由で判定される）
+    let mut error_info: Option<Value> = None;
+    if status == "idle" {
+        if let Some((kind, detail)) = recent_output
+            .as_ref()
+            .and_then(|out| crate::orchestrator::wait::detect_worker_error(out))
+        {
+            status = "error".to_string();
+            error_info = Some(json!({
+                "kind": kind.as_str(),
+                "detail": detail,
+                "recommended_action": kind.recommended_action(),
+            }));
+        }
+    }
+
     Ok(json!({
         "status": status,
         "ctx_percent": ctx_percent,
         "recent_output": recent_output,
         "status_source": status_source,
         "resolved_session_id": resolved_sid,
+        "error": error_info,
     }))
 }
 
@@ -5381,6 +5400,77 @@ mod tests {
         )
         .unwrap();
         assert_eq!(unknown["status"], "unknown");
+    }
+
+    #[test]
+    fn finish_worker_statusがエラー停止をerrorへ細分類する() {
+        // #157: idle（❯ プロンプト表示）+ 画面に API Error → status=error + error オブジェクト
+        let v = finish_worker_status(
+            WorkerStatusCtx {
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some(
+                    "  ⎿  API Error: Connection closed mid-response. The response above may be incomplete.\n\n❯ ".into(),
+                ),
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["error"]["kind"], "api_error");
+        assert_eq!(v["error"]["recommended_action"], "resume");
+        assert!(v["error"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Connection closed mid-response"));
+
+        // usage limit 停止（codex の実採取文言）
+        let limited = finish_worker_status(
+            WorkerStatusCtx {
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some(
+                    "■ You've hit your usage limit. Upgrade to Pro or try again at 4:24 AM.\n\n› 1. Switch to gpt-5.4-mini".into(),
+                ),
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(limited["status"], "error");
+        assert_eq!(limited["error"]["kind"], "usage_limit");
+        assert_eq!(limited["error"]["recommended_action"], "wait_reset");
+
+        // 正常 idle では error が付かない（誤発火しない）
+        let clean = finish_worker_status(
+            WorkerStatusCtx {
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some("done\n❯ ".into()),
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(clean["status"], "idle");
+        assert!(clean["error"].is_null());
+
+        // busy 中はエラー行が見えていても busy のまま（自動リトライへの誤検知防止）
+        let retrying = finish_worker_status(
+            WorkerStatusCtx {
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some(
+                    "  ⎿  API Error (Connection error.) · Retrying in 4 seconds… (attempt 3/10)\nesc to interrupt".into(),
+                ),
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(retrying["status"], "busy");
+        assert!(retrying["error"].is_null());
     }
 
     #[test]

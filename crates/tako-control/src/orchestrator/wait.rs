@@ -44,10 +44,61 @@ pub struct WatchOptions {
 pub enum WatchOutcome {
     /// worker が入力待ち（= 完了）になった。`ctx_percent` は取得できた場合のみ
     Idle { ctx_percent: Option<u64> },
+    /// worker が異常（API エラー・usage limit 等）で停止した（#157）。
+    /// `detail` は検知パターンにマッチした画面上の行
+    Error {
+        kind: WorkerErrorKind,
+        detail: String,
+    },
     /// ペインも tmux session も消滅した
     Gone,
     /// タイムアウトに達した（worker は動き続けている可能性がある）
     Timeout,
+}
+
+/// worker 画面から検知した異常停止の種別（#157）。
+/// 種別ごとの復帰手段が異なるため、master の自動リカバリの分岐点になる
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerErrorKind {
+    /// API エラー（接続断・タイムアウト等）で停止。続行指示の再送で復帰できることが多い
+    ApiError,
+    /// usage limit 到達で停止（claude の 5h/週次、codex のクレジット）。解除時刻まで待つ必要がある
+    UsageLimit,
+    /// rate limit 起因の選択ダイアログ（codex のモデル切替提案等）で停止。選択肢への応答で復帰できる
+    LimitDialog,
+}
+
+impl WorkerErrorKind {
+    /// JSON / イベント行に載せる機械可読 slug
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiError => "api_error",
+            Self::UsageLimit => "usage_limit",
+            Self::LimitDialog => "limit_dialog",
+        }
+    }
+
+    /// slug からの復元（watch が dispatch 応答の error.kind を読む用）
+    pub fn from_slug(s: &str) -> Option<Self> {
+        match s {
+            "api_error" => Some(Self::ApiError),
+            "usage_limit" => Some(Self::UsageLimit),
+            "limit_dialog" => Some(Self::LimitDialog),
+            _ => None,
+        }
+    }
+
+    /// master 向けの推奨リカバリアクション（worker_status の JSON にそのまま載せる）
+    pub fn recommended_action(self) -> &'static str {
+        match self {
+            // 続行指示（「続けて」等）を send_input すれば復帰できることが多い
+            Self::ApiError => "resume",
+            // 解除時刻まで待ってから続行指示する（即時再送しても弾かれる）
+            Self::UsageLimit => "wait_reset",
+            // ダイアログの選択肢に応答する（send_input でキー送信）
+            Self::LimitDialog => "respond_dialog",
+        }
+    }
 }
 
 /// worker が完了（idle）または消滅（gone）するまでブロックする。
@@ -56,7 +107,11 @@ pub enum WatchOutcome {
 /// （明示 session_id or 自動解決）なら 3 回、画面推定フォールバックなら 8 回の
 /// idle 連続で完了とみなす（サブエージェント完了瞬間の一時 idle 誤検知対策）。
 /// gone は 2 回連続で確定するが、`tmux_session` が生存していれば取り消す
-/// （tako 再起動中はペイン一覧が空になるため）
+/// （tako 再起動中はペイン一覧が空になるため）。
+///
+/// 停止確定時に画面へ既知のエラーパターン（API エラー・usage limit 等）があれば
+/// `Idle` ではなく `Error` を返す（#157）。error 状態（status = "error"）も
+/// 「worker が止まっている」ことに変わりはないため idle と同じ streak で確定する
 pub fn wait_for_worker(exec: Exec, opts: &WatchOptions) -> WatchOutcome {
     let deadline = opts.timeout.map(|t| Instant::now() + t);
     std::thread::sleep(opts.initial_delay);
@@ -98,7 +153,10 @@ pub fn wait_for_worker(exec: Exec, opts: &WatchOptions) -> WatchOutcome {
                             }
                         }
                     }
-                    "idle" => {
+                    // "error" は「idle + 画面にエラーパターン」の細分類（#157）。
+                    // 停止していることは同じなので idle と同じ streak で確定させ、
+                    // 確定時にどちらの outcome かを画面から再判定する
+                    "idle" | "error" => {
                         gone_streak = 0;
                         // 画面内容で busy パターンがあれば idle を取り消す
                         if screen_looks_busy(recent) {
@@ -125,6 +183,24 @@ pub fn wait_for_worker(exec: Exec, opts: &WatchOptions) -> WatchOutcome {
                 }
 
                 if idle_streak >= need_streak {
+                    // 停止確定。dispatch が判定済みの error（新 tako-app）を優先し、
+                    // 無ければ画面から自力検知する（tako-app 更新前でも watch 単体で
+                    // WORKER_ERROR を出せるようにするフォールバック。判定関数は同一）
+                    let error = val["error"]
+                        .as_object()
+                        .and_then(|e| {
+                            let kind = WorkerErrorKind::from_slug(e.get("kind")?.as_str()?)?;
+                            let detail = e
+                                .get("detail")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            Some((kind, detail))
+                        })
+                        .or_else(|| detect_worker_error(recent));
+                    if let Some((kind, detail)) = error {
+                        return WatchOutcome::Error { kind, detail };
+                    }
                     return WatchOutcome::Idle {
                         ctx_percent: val["ctx_percent"].as_u64(),
                     };
@@ -215,6 +291,8 @@ pub fn run_worker(
     );
     let final_status = match outcome {
         WatchOutcome::Idle { .. } => "completed",
+        // worker がエラー停止（#157）。ペイン消滅の "error" と区別する
+        WatchOutcome::Error { .. } => "worker_error",
         WatchOutcome::Gone => "error",
         WatchOutcome::Timeout => "timeout",
     };
@@ -230,8 +308,9 @@ pub fn run_worker(
     .and_then(|v| v["text"].as_str().map(String::from))
     .unwrap_or_default();
 
-    // --- 4. 自動 close（run の完了後なので force: true） ---
-    let closed = if opts.auto_close {
+    // --- 4. 自動 close（run の完了後なので force: true）。
+    // エラー停止時は close しない: 続行指示・解除待ちで復帰できる余地を残す（#157） ---
+    let closed = if opts.auto_close && !matches!(outcome, WatchOutcome::Error { .. }) {
         exec(Request::Close {
             pane: Some(pane_id),
             force: true,
@@ -241,14 +320,22 @@ pub fn run_worker(
         false
     };
 
-    Ok(json!({
+    let mut result = json!({
         "pane_id": pane_id,
         "spawned_by": spawned_by,
         "status": final_status,
         "output": output,
         "duration_seconds": start.elapsed().as_secs(),
         "closed": closed,
-    }))
+    });
+    if let WatchOutcome::Error { kind, detail } = &outcome {
+        result["error"] = json!({
+            "kind": kind.as_str(),
+            "detail": detail,
+            "recommended_action": kind.recommended_action(),
+        });
+    }
+    Ok(result)
 }
 
 /// tmux session が生きているか（tako バックエンドサーバー上）。None は常に false
@@ -305,6 +392,64 @@ pub fn screen_looks_idle(output: &str) -> bool {
         let t = l.trim_start();
         t.starts_with('❯') || t.starts_with('›') || t == ">" || t.starts_with("> ")
     })
+}
+
+/// worker 画面から異常停止パターンを検知する（#157）。
+/// 返り値は（種別, マッチした行の trim 済みテキスト）。
+/// **idle（停止）確定後の画面に対して使う**こと — busy 中の呼び出しは
+/// 自動リトライやツール実行ログへの誤検知を招く。パターンはすべて
+/// 実採取画面由来（claude / codex。2026-07-12〜13 の夜間バッチ等）。
+///
+/// 検知の優先順位は復帰コストの高い順: usage_limit > limit_dialog > api_error
+/// （codex は limit 到達時に limit メッセージとモデル切替ダイアログが同時に出るため、
+/// 本質である limit 到達を優先する）
+pub fn detect_worker_error(output: &str) -> Option<(WorkerErrorKind, String)> {
+    // tail_lines は新しい行が先頭 = 最初のマッチが画面最下部に最も近い
+    let lines = tail_lines(output, 30);
+
+    // 1. usage limit 到達（claude / codex）
+    //    - codex: 「■ You've hit your usage limit. ... try again at 4:24 AM.」
+    //    - claude: 「Claude usage limit reached. Your limit will reset at …」
+    //    - 「5-hour limit reached ∙ resets 3am」系は limit reached + reset の共起で拾う
+    //    - 「Claude Opus 4.6 limit reached, now using …」は自動モデル切替の告知で
+    //      worker は停止しないため除外する
+    for l in &lines {
+        if l.contains("limit reached, now using") {
+            continue;
+        }
+        if l.contains("hit your usage limit")
+            || l.contains("usage limit reached")
+            || (l.contains("limit reached") && l.contains("reset"))
+        {
+            return Some((WorkerErrorKind::UsageLimit, l.trim().to_string()));
+        }
+    }
+
+    // 2. rate limit 起因の選択ダイアログ（codex のモデル切替提案。実採取画面:
+    //    「Approaching rate limits / Switch to gpt-… / Press enter to confirm」）。
+    //    「Press enter to confirm」単独は通常の確認ダイアログにもあるため使わない
+    for l in &lines {
+        if l.contains("Approaching rate limits") {
+            return Some((WorkerErrorKind::LimitDialog, l.trim().to_string()));
+        }
+    }
+
+    // 3. API エラー（claude。「API Error: Connection closed mid-response. …」等）。
+    //    エラー行はプロンプト直上に出るため末尾 15 行に限定する
+    //    （復帰後の作業完了時にスクロールバック上へ残った古いエラー行への誤検知を抑える）。
+    //    「Retrying in 4 seconds… (attempt 3/10)」が見えている間は自動リトライ中 =
+    //    まだ停止と確定しない
+    let tail15 = tail_lines(output, 15);
+    if tail15.iter().any(|l| l.contains("Retrying")) {
+        return None;
+    }
+    for l in &tail15 {
+        if l.contains("API Error") {
+            return Some((WorkerErrorKind::ApiError, l.trim().to_string()));
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -582,5 +727,197 @@ mod tests {
         assert!(!screen_looks_idle("$ echo foo >file\ndone"));
         assert!(!screen_looks_idle(">>append"));
         assert!(screen_looks_idle("some output\n> "));
+    }
+
+    // --- #157: 異常検知（detect_worker_error / WatchOutcome::Error） ---
+
+    /// claude の API エラー停止画面（2026-07-12〜13 夜間バッチの実採取メッセージ）
+    const API_ERROR_SCREEN: &str = "⏺ 実装を続けます\n\n  ⎿  API Error: Connection closed mid-response. The response above may be incomplete.\n\n──────\n❯ \n──────\n  ctx 42%";
+    /// claude の API エラー自動リトライ中（まだ停止と確定しない）
+    const API_RETRYING_SCREEN: &str =
+        "  ⎿  API Error (Connection error.) · Retrying in 4 seconds… (attempt 3/10)\n\n❯ \n──────";
+    /// codex の usage limit 停止画面（実採取。limit メッセージ + モデル切替ダイアログ同時表示）
+    const CODEX_LIMIT_SCREEN: &str = "■ You've hit your usage limit. Upgrade to Pro\n(https://chatgpt.com/explore/pro), visit\nhttps://chatgpt.com/codex/settings/usage to purchase more credits or\ntry again at 4:24 AM.\n\n\n  Approaching rate limits\n  Switch to gpt-5.4-mini for lower credit usage?\n\n› 1. Switch to gpt-5.4-mini\n  2. Keep current model\n  3. Keep current model (never show again)\n\n  Press enter to confirm or esc to go back";
+    /// claude の usage limit 停止画面（旧形式の文言）
+    const CLAUDE_LIMIT_SCREEN: &str =
+        "Claude usage limit reached. Your limit will reset at 4pm (Asia/Tokyo).\n\n❯ \n──────";
+
+    #[test]
+    fn detect_worker_errorはapiエラー停止を検知する() {
+        let (kind, detail) = detect_worker_error(API_ERROR_SCREEN).expect("検知される");
+        assert_eq!(kind, WorkerErrorKind::ApiError);
+        assert!(detail.contains("API Error: Connection closed mid-response"));
+        assert_eq!(kind.as_str(), "api_error");
+        assert_eq!(kind.recommended_action(), "resume");
+    }
+
+    #[test]
+    fn detect_worker_errorは自動リトライ中を停止と確定しない() {
+        assert_eq!(detect_worker_error(API_RETRYING_SCREEN), None);
+    }
+
+    #[test]
+    fn detect_worker_errorはusage_limitをダイアログより優先する() {
+        // codex は limit 到達時に limit メッセージと切替ダイアログが同時に出る。
+        // 本質は limit 到達なので usage_limit として報告する
+        let (kind, detail) = detect_worker_error(CODEX_LIMIT_SCREEN).expect("検知される");
+        assert_eq!(kind, WorkerErrorKind::UsageLimit);
+        assert!(detail.contains("hit your usage limit"));
+        assert_eq!(kind.recommended_action(), "wait_reset");
+
+        let (kind, _) = detect_worker_error(CLAUDE_LIMIT_SCREEN).expect("検知される");
+        assert_eq!(kind, WorkerErrorKind::UsageLimit);
+    }
+
+    #[test]
+    fn detect_worker_errorはダイアログ単独をlimit_dialogとして検知する() {
+        let dialog_only = "  Approaching rate limits\n  Switch to gpt-5.4-mini for lower credit usage?\n\n› 1. Switch to gpt-5.4-mini\n  2. Keep current model\n\n  Press enter to confirm or esc to go back";
+        let (kind, _) = detect_worker_error(dialog_only).expect("検知される");
+        assert_eq!(kind, WorkerErrorKind::LimitDialog);
+        assert_eq!(kind.recommended_action(), "respond_dialog");
+    }
+
+    #[test]
+    fn detect_worker_errorは正常画面と自動モデル切替に誤検知しない() {
+        // 正常な完了画面
+        assert_eq!(detect_worker_error(IDLE_SCREEN), None);
+        assert_eq!(detect_worker_error(CODEX_IDLE_SCREEN), None);
+        assert_eq!(detect_worker_error(AGY_IDLE_SCREEN), None);
+        // 自動モデル切替の告知（worker は止まらない）
+        assert_eq!(
+            detect_worker_error(
+                "⎿ Claude Opus 4.6 limit reached, now using Claude Sonnet 4.5\n\n❯ \n──────"
+            ),
+            None
+        );
+        // 「Press enter to confirm」単独（通常の確認ダイアログ）
+        assert_eq!(
+            detect_worker_error("Do you trust this folder?\n❯ 1. Yes\n  Press enter to confirm"),
+            None
+        );
+    }
+
+    #[test]
+    fn detect_worker_errorは復帰後にスクロールバックへ流れた古いapiエラーを無視する() {
+        // エラー行の後に 15 行以上の新しい出力 → 末尾 15 行から外れて検知しない
+        let recovered = format!(
+            "  ⎿  API Error: Connection closed mid-response. The response above may be incomplete.\n{}❯ \n──────",
+            "後続の作業出力行\n".repeat(15)
+        );
+        assert_eq!(detect_worker_error(&recovered), None);
+    }
+
+    #[test]
+    fn watchはエラー停止でworker_errorを返す() {
+        // dispatch が status="error" + error オブジェクトを返す（新 tako-app 経路）。
+        // agents ソース相当なので 3 回で確定
+        let error_resp = || -> Result<Value, String> {
+            Ok(json!({
+                "status": "error",
+                "recent_output": API_ERROR_SCREEN,
+                "status_source": "agents-auto",
+                "ctx_percent": 42,
+                "error": {
+                    "kind": "api_error",
+                    "detail": "API Error: Connection closed mid-response. The response above may be incomplete.",
+                    "recommended_action": "resume",
+                },
+            }))
+        };
+        let mut script = ExecScript::new(vec![error_resp(), error_resp(), error_resp()]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        match outcome {
+            WatchOutcome::Error { kind, detail } => {
+                assert_eq!(kind, WorkerErrorKind::ApiError);
+                assert!(detail.contains("Connection closed mid-response"));
+            }
+            other => panic!("Error になるはず: {other:?}"),
+        }
+        assert_eq!(script.seen.len(), 3);
+    }
+
+    #[test]
+    fn watchは旧appのidle応答でも画面からエラーを自力検知する() {
+        // 旧 tako-app は error 判定を知らず status="idle" を返す。
+        // watch 側の detect_worker_error フォールバックで WORKER_ERROR になる
+        let mut script = ExecScript::new(vec![
+            status("idle", API_ERROR_SCREEN, "agents"),
+            status("idle", API_ERROR_SCREEN, "agents"),
+            status("idle", API_ERROR_SCREEN, "agents"),
+        ]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        assert!(matches!(
+            outcome,
+            WatchOutcome::Error {
+                kind: WorkerErrorKind::ApiError,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn watchは正常idleでエラーを誤発火しない() {
+        // 受け入れ条件 3: 既存 WORKER_IDLE の挙動が壊れていない
+        let mut script = ExecScript::new(vec![
+            status("idle", IDLE_SCREEN, "agents"),
+            status("idle", IDLE_SCREEN, "agents"),
+            status("idle", IDLE_SCREEN, "agents"),
+        ]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        assert_eq!(
+            outcome,
+            WatchOutcome::Idle {
+                ctx_percent: Some(42)
+            }
+        );
+    }
+
+    #[test]
+    fn run_workerはエラー停止でworker_errorを返しauto_closeしない() {
+        let mut script = ExecScript::new(vec![
+            Ok(json!({ "pane_id": 9, "spawned_by": 1, "tmux_session": null })),
+            status("error", API_ERROR_SCREEN, "agents"),
+            status("error", API_ERROR_SCREEN, "agents"),
+            status("error", API_ERROR_SCREEN, "agents"),
+            Ok(json!({ "pane": 9, "text": "エラー直前までの出力" })),
+            // auto_close: true でも Close は呼ばれない（応答を積まないことで検証）
+        ]);
+        let opts = RunOptions {
+            project: "demo".into(),
+            prompt: "やって".into(),
+            label: None,
+            model: None,
+            effort: None,
+            agent: None,
+            pane: Some(1),
+            tab: None,
+            caller_role: None,
+            timeout: Duration::from_secs(60),
+            auto_close: true,
+            output_lines: 200,
+            initial_delay: Duration::ZERO,
+            interval: Duration::ZERO,
+        };
+        let result = {
+            let mut exec = |req: Request| {
+                script.seen.push(req);
+                script
+                    .responses
+                    .pop_front()
+                    .expect("スクリプトの応答が尽きた")
+            };
+            run_worker(&mut exec, &opts, &mut |_, _| {}).expect("成功する")
+        };
+        assert_eq!(result["status"], "worker_error");
+        assert_eq!(result["error"]["kind"], "api_error");
+        assert_eq!(result["error"]["recommended_action"], "resume");
+        assert_eq!(result["closed"], false);
+        assert!(
+            !script
+                .seen
+                .iter()
+                .any(|r| matches!(r, Request::Close { .. })),
+            "エラー停止時は auto_close しない"
+        );
     }
 }

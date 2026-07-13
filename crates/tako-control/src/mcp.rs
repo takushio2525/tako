@@ -1036,7 +1036,11 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_orchestrator_worker_status",
             "description": "子 worker の状態を確認する。status は busy（作業中）/ idle（入力待ち・完了）/ \
+                error（API エラー・usage limit 等の異常で停止。#157）/ \
                 gone（ペイン消滅かつ tmux session も消滅）/ unknown（agents 不可）。\
+                error 時は応答の error オブジェクトに kind（api_error = 続行指示で復帰可 / \
+                usage_limit = 解除時刻まで待つ / limit_dialog = モデル切替等のダイアログに応答）と \
+                detail（検知した画面上の行）、recommended_action（resume / wait_reset / respond_dialog）が入る。\
                 session_id を省略しても pane→session の自動解決（pid 祖先辿り）で claude agents --json の \
                 正確な status を取得する（status_source が agents-auto になる）。自動解決失敗時のみ \
                 画面パターン推定にフォールバック（status_source が screen）。\
@@ -1068,7 +1072,10 @@ pub fn tools() -> Vec<Value> {
                 完了判定は OrchestratorWorkerStatus と同じロジック（pane→session 自動解決 + \
                 claude agents --json の status 一次シグナル、フォールバックで端末出力パターン。\
                 codex / agy は画面推定のみ）を内部で繰り返し呼ぶ。\
-                タイムアウト（既定 1800 秒）に達した場合は status=timeout で途中結果を返す。",
+                タイムアウト（既定 1800 秒）に達した場合は status=timeout で途中結果を返す。\
+                worker が API エラー・usage limit 等の異常で停止した場合は status=worker_error + \
+                error オブジェクト（kind / detail / recommended_action）を返し、復帰の余地を残すため \
+                auto_close でもペインを閉じない（#157）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

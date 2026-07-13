@@ -622,8 +622,8 @@ enum VideoCommand {
 
 #[derive(Subcommand)]
 enum OrchestratorCommand {
-    /// worker が完了（idle）または消滅（gone）するまでブロックし、結果を 1 行出力する。
-    /// Monitor ツールから呼ばれる想定。出力形式: WORKER_IDLE / WORKER_GONE
+    /// worker が完了（idle）・異常停止（error）・消滅（gone）するまでブロックし、結果を出力する。
+    /// Monitor ツールから呼ばれる想定。出力形式: WORKER_IDLE / WORKER_ERROR / WORKER_GONE
     Watch {
         /// 監視対象ペイン ID（位置引数または --pane で指定）
         #[arg(long)]
@@ -686,7 +686,8 @@ enum OrchestratorCommand {
         #[arg(long)]
         tab: Option<u64>,
     },
-    /// worker の状態確認
+    /// worker の状態確認（busy / idle / error / gone / unknown。error 時は
+    /// error.kind（api_error / usage_limit / limit_dialog）と recommended_action を含む。#157）
     Status {
         /// ペイン ID
         #[arg(long)]
@@ -1590,7 +1591,8 @@ fn orchestrator_solo(arg: Option<&str>) -> Result<(), String> {
 }
 
 /// `tako orchestrator watch --pane N [--session-id S] [--timeout T]` — worker の完了まで待機し 1 行出力する。
-/// 判定は tako-control の完了待ちエンジン（`orchestrator::wait`。MCP の run と共通。#83）
+/// 判定は tako-control の完了待ちエンジン（`orchestrator::wait`。MCP の run と共通。#83）。
+/// 異常停止（API エラー・usage limit 等）は WORKER_ERROR として区別する（#157）
 fn orchestrator_watch(
     pane: u64,
     session_id: Option<&str>,
@@ -1611,6 +1613,15 @@ fn orchestrator_watch(
             ctx_percent: Some(pct),
         } => println!("WORKER_IDLE: tako:{pane} (ctx {pct}%)"),
         wait::WatchOutcome::Idle { .. } => println!("WORKER_IDLE: tako:{pane}"),
+        wait::WatchOutcome::Error { kind, detail } => {
+            // 1 行目は Issue #157 指定の形式。detail / action は master が
+            // read_pane 無しでも一次判断できるための補助行
+            println!("WORKER_ERROR: tako:{pane} ({})", kind.as_str());
+            if !detail.is_empty() {
+                println!("  detail: {detail}");
+            }
+            println!("  action: {}", kind.recommended_action());
+        }
         wait::WatchOutcome::Gone => println!("WORKER_GONE: tako:{pane}"),
         wait::WatchOutcome::Timeout => println!("WORKER_TIMEOUT: tako:{pane}"),
     }
