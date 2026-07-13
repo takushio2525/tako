@@ -21,9 +21,22 @@ pub const SOLO_SYSTEM_PROMPT: &str = include_str!("solo_system_prompt.md");
 /// solo のデフォルト effort。master の "max" より低くしてエコ運用を既定にする
 pub const SOLO_DEFAULT_EFFORT: &str = "high";
 
+/// テスト専用: config_dir() の返り先を隔離ディレクトリへ差し替える。
+/// テストが実運用の projects.yaml / profiles / config.yaml に書き込み、
+/// 世代バックアップをテスト由来の内容で汚染するのを防ぐ（#169）
+#[cfg(test)]
+pub(crate) fn test_config_dir_override() -> &'static std::sync::OnceLock<PathBuf> {
+    static OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    &OVERRIDE
+}
+
 /// オーケストレーター設定ディレクトリのパス。
 /// `~/Library/Application Support/tako/orchestrator/`
 pub fn config_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = test_config_dir_override().get() {
+        return Some(dir.clone());
+    }
     home_dir().map(|h| h.join("Library/Application Support/tako/orchestrator"))
 }
 

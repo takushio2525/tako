@@ -4445,13 +4445,21 @@ mod tests {
     /// 追加・削除すると解決失敗のレースが起きるため（#120 でテストが増えて顕在化）
     static TEST_PROJECT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// テスト用に一時プロジェクトを projects.yaml に追加し、テスト後に削除する
+    /// テスト用に一時プロジェクトを projects.yaml に追加し、テスト後に削除する。
+    /// config_dir を隔離ディレクトリへ差し替え、実運用の projects.yaml と
+    /// その世代バックアップには絶対に触らない（#169）
     fn with_test_project<F: FnOnce()>(f: F) {
         use crate::orchestrator;
         // panic したテストの poison は無視して続行する（後続テストを巻き込まない）
         let _guard = TEST_PROJECT_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        orchestrator::test_config_dir_override().get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("tako-dispatch-test-config-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        });
         let _ = orchestrator::ensure_defaults();
         let key = "_tako_test_109_";
         let mut config = orchestrator::ProjectsConfig::load().unwrap();
