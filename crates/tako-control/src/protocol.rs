@@ -484,6 +484,28 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
     },
+    /// オーケストレーター: master が自身の pane/tab/ctx% を取得する（#123 / #193）。
+    /// caller_pane（MCP: X-Tako-Pane / stdio: TAKO_PANE_ID）と caller_role から
+    /// master のペインを特定し、claude agents --json で ctx% を取得する。
+    /// pane/tab 指定は省略可（省略時は caller 情報から自動解決）
+    OrchestratorSelf {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_role: Option<String>,
+    },
+    /// オーケストレーター: master の引き継ぎ（#193）。
+    /// handoff ファイル（`<config_dir>/handoff/<profile>.md`）を確認し、
+    /// 同プロファイルの新 master を spawn して引き継ぎプロンプトを注入する
+    OrchestratorHandoff {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_role: Option<String>,
+        /// 引き継ぎ先のタブ ID（省略時は呼び出し元と同タブ）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab: Option<u64>,
+    },
     /// オーケストレーター: worker の状態確認。`tmux_session` 指定時は pane が gone でも
     /// tmux session 経由で recent_output を取得する
     OrchestratorWorkerStatus {

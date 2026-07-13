@@ -813,6 +813,22 @@ enum OrchestratorCommand {
         #[arg(long)]
         tmux_session: Option<String>,
     },
+    /// master/solo が自身の pane・tab・ctx%・session_id を取得する（#123 / #193）
+    #[command(name = "self")]
+    SelfInfo {
+        /// 自 pane ID（省略時は TAKO_PANE_ID / TAKO_ORCHESTRATOR_ROLE から自動解決）
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// master の引き継ぎを実行する（#193）。handoff ファイルを読み新 master を spawn
+    Handoff {
+        /// 呼び出し元ペイン ID（省略時は自動解決）
+        #[arg(long)]
+        pane: Option<u64>,
+        /// 新 master を出すタブ ID（省略時は呼び出し元と同タブ）
+        #[arg(long)]
+        tab: Option<u64>,
+    },
     /// spawn + 完了待ち + 出力取得 + close を 1 回で行う
     Run {
         /// プロジェクトキー（projects.yaml に登録済み）
@@ -1300,6 +1316,22 @@ fn main() -> ExitCode {
         }
         Command::Orchestrator(OrchestratorCommand::Profiles(ref sub)) => {
             orchestrator_profiles_cli(sub)
+        }
+        Command::Orchestrator(OrchestratorCommand::SelfInfo { pane }) => {
+            let pane = pane.or_else(caller_pane);
+            let caller_role = std::env::var("TAKO_ORCHESTRATOR_ROLE").ok();
+            send_request(Request::OrchestratorSelf { pane, caller_role })
+                .map(|result| println!("{}", pretty_json(&result)))
+        }
+        Command::Orchestrator(OrchestratorCommand::Handoff { pane, tab }) => {
+            let pane = pane.or_else(caller_pane);
+            let caller_role = std::env::var("TAKO_ORCHESTRATOR_ROLE").ok();
+            send_request(Request::OrchestratorHandoff {
+                pane,
+                caller_role,
+                tab,
+            })
+            .map(|result| println!("{}", pretty_json(&result)))
         }
         Command::Orchestrator(OrchestratorCommand::Layout {
             ref policy,
@@ -2749,6 +2781,12 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 caller_role: std::env::var("TAKO_ORCHESTRATOR_ROLE").ok(),
                 agent: agent.clone(),
             }
+        }
+        Command::Orchestrator(OrchestratorCommand::SelfInfo { .. }) => {
+            unreachable!("orchestrator self は run() を通らない（main() でローカル処理済み）")
+        }
+        Command::Orchestrator(OrchestratorCommand::Handoff { .. }) => {
+            unreachable!("orchestrator handoff は run() を通らない（main() でローカル処理済み）")
         }
         Command::Orchestrator(OrchestratorCommand::Status {
             pane,

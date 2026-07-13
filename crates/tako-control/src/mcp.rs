@@ -1128,6 +1128,40 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_orchestrator_self",
+            "description": "master / solo が自分自身の pane・tab・ctx%・session_id を取得する。\
+                master は MCP 経由では自分のペイン ID を知る手段がなかったが（#123）、\
+                このツールで自己特定できる。ctx_percent はコンテキスト使用率（0〜100）、\
+                ctx_threshold は引き継ぎ閾値（config.yaml の ctx_threshold、既定 60）、\
+                ctx_over_threshold は閾値超えフラグ。\
+                handoff_exists は引き継ぎファイル（handoff/<profile>.md）の有無。\
+                pane を省略すると caller の環境変数（TAKO_PANE_ID / TAKO_ORCHESTRATOR_ROLE）\
+                から自動解決する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("自 pane ID（省略時は caller から自動解決）"),
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_orchestrator_handoff",
+            "description": "master の引き継ぎを実行する。handoff ファイル（handoff/<profile>.md）を読み、\
+                同プロファイルの新 master を spawn して引き継ぎプロンプトを注入する。\
+                旧 master のペインは閉じない（ユーザー判断）。\
+                handoff ファイルが無ければエラーを返す（master は事前にファイルを更新する必要がある）。\
+                tab を省略すると呼び出し元と同タブに新 master を spawn する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("呼び出し元ペイン ID（省略時は caller から自動解決）"),
+                    "tab": { "type": "integer", "minimum": 0, "description": "新 master を出すタブ ID（省略時は呼び出し元と同タブ）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_orchestrator_run",
             "description": "子 worker を spawn し、完了まで待って結果を返す。spawn + 完了待ち + \
                 出力取得 + close を 1 回で行うアトミック操作。Monitor や手動ポーリングは不要。\
@@ -1584,6 +1618,13 @@ fn call_tool(params: &Value, session: &mut McpSession) -> Result<Value, (i64, St
         session.caller_role.as_deref(),
     )
     .map_err(|e| (-32602, e))?;
+
+    // list_panes の応答に caller_pane_id / caller_tab_id を付加する（#123）。
+    // master が「自分がどこにいるか」を list で確認できる導線
+    if name == "tako_list_panes" {
+        return list_panes_with_caller(request, session);
+    }
+
     exec_and_wrap(request, session)
 }
 
@@ -1602,6 +1643,40 @@ fn exec_and_wrap(request: Request, session: &mut McpSession) -> Result<Value, (i
             json!({ "content": [{ "type": "text", "text": message }], "isError": true })
         }
     })
+}
+
+/// list_panes の応答に caller_pane_id / caller_tab_id を後付けする（#123）
+fn list_panes_with_caller(
+    request: Request,
+    session: &mut McpSession,
+) -> Result<Value, (i64, String)> {
+    match (session.exec)(request) {
+        Ok(mut value) => {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("caller_pane_id".to_string(), json!(session.caller_pane));
+                // caller_tab_id: caller_pane が属するタブを探す
+                let caller_tab = session.caller_pane.and_then(|cpane| {
+                    obj.get("tabs")?.as_array()?.iter().find_map(|tab| {
+                        let panes = tab.get("panes")?.as_array()?;
+                        if panes.iter().any(|p| p["id"].as_u64() == Some(cpane)) {
+                            tab.get("id")?.as_u64()
+                        } else {
+                            None
+                        }
+                    })
+                });
+                obj.insert("caller_tab_id".to_string(), json!(caller_tab));
+                if let Some(role) = &session.caller_role {
+                    obj.insert("caller_role".to_string(), json!(role));
+                }
+            }
+            let text = value.to_string();
+            Ok(json!({ "content": [{ "type": "text", "text": text }], "isError": false }))
+        }
+        Err(message) => {
+            Ok(json!({ "content": [{ "type": "text", "text": message }], "isError": true }))
+        }
+    }
 }
 
 /// `tako_orchestrator_run` — spawn + 完了待ち + 出力取得 + close の合成操作。
@@ -1982,6 +2057,15 @@ fn build_request(
             policy: str_arg(args, "policy")?,
             master_ratio: f64_arg(args, "master_ratio")?.map(|v| v as f32),
             algorithm: str_arg(args, "algorithm")?,
+        },
+        "tako_orchestrator_self" => Request::OrchestratorSelf {
+            pane: u64_arg(args, "pane")?.or(caller),
+            caller_role: caller_role.map(str::to_string),
+        },
+        "tako_orchestrator_handoff" => Request::OrchestratorHandoff {
+            pane: u64_arg(args, "pane")?.or(caller),
+            caller_role: caller_role.map(str::to_string),
+            tab: u64_arg(args, "tab")?,
         },
         "tako_orchestrator_spawn" => {
             let pane = u64_arg(args, "pane")?;
@@ -2625,7 +2709,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 68);
+        assert_eq!(tools.len(), 70);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

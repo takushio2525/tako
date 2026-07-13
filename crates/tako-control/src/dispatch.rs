@@ -1907,6 +1907,16 @@ fn dispatch_inner(
             algorithm,
         } => dispatch_orchestrator_layout(policy.as_deref(), master_ratio, algorithm.as_deref()),
 
+        Request::OrchestratorSelf { pane, caller_role } => {
+            dispatch_orchestrator_self(host, pane, caller_role.as_deref())
+        }
+
+        Request::OrchestratorHandoff {
+            pane,
+            caller_role,
+            tab,
+        } => dispatch_orchestrator_handoff(host, origin, pane, caller_role.as_deref(), tab),
+
         Request::OrchestratorSpawn {
             project,
             prompt,
@@ -2863,6 +2873,255 @@ pub fn dispatch_orchestrator_layout(
         "algorithm": resolved.algorithm.as_str(),
         "updated": changed,
         "config_path": crate::setup::config_yaml_path().ok(),
+    }))
+}
+
+/// OrchestratorSelf — master が自身の pane/tab/ctx% を取得する（#123 / #193）
+fn dispatch_orchestrator_self(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    caller_role: Option<&str>,
+) -> Result<Value, DispatchError> {
+    use crate::orchestrator;
+
+    let role_suffix = caller_role
+        .and_then(|r| r.strip_prefix("master:"))
+        .or_else(|| caller_role.and_then(|r| r.strip_prefix("solo:")))
+        .map(str::to_string);
+
+    // pane → role suffix → 全 master からの検索
+    let (tab_id, pane_id) = if let Some(resolved) =
+        pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok())
+    {
+        resolved
+    } else {
+        let suffix = role_suffix.as_deref().unwrap_or("");
+        find_master_pane(host.workspace(), suffix, caller_role)
+            .ok_or_else(|| DispatchError::Operation(
+                "master/solo ペインが見つからない（pane を明示指定するか、TAKO_ORCHESTRATOR_ROLE を確認してください）".into()
+            ))?
+    };
+
+    let profile_name = role_suffix
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default");
+
+    // session_id の自動解決（バックエンドセッション → pid 祖先辿り）
+    let session_id = resolve_session_id_for_pane_via_host(host, pane_id);
+
+    let (status, ctx_percent) = if let Some(sid) = &session_id {
+        let agent_status = orchestrator::query_agent_status(sid);
+        (agent_status.status, agent_status.ctx_percent)
+    } else {
+        ("unknown".to_string(), None)
+    };
+
+    let ctx_threshold = crate::setup::load_config()
+        .map(|c| c.ctx_threshold)
+        .unwrap_or(60);
+
+    let handoff_path = orchestrator::handoff_path(profile_name);
+    let handoff_exists = handoff_path.as_ref().is_some_and(|p| p.is_file());
+
+    Ok(json!({
+        "pane_id": pane_id.as_u64(),
+        "tab_id": tab_id.as_u64(),
+        "profile": profile_name,
+        "role": caller_role,
+        "session_id": session_id,
+        "status": status,
+        "ctx_percent": ctx_percent,
+        "ctx_threshold": ctx_threshold,
+        "ctx_over_threshold": ctx_percent.map(|c| c >= ctx_threshold),
+        "handoff_path": handoff_path,
+        "handoff_exists": handoff_exists,
+    }))
+}
+
+/// master/solo ペインを検索する。suffix があれば suffix 一致を優先
+fn find_master_pane(
+    ws: &tako_core::Workspace,
+    suffix: &str,
+    caller_role: Option<&str>,
+) -> Option<(TabId, PaneId)> {
+    let is_solo = caller_role.is_some_and(|r| r.starts_with("solo"));
+    let prefix = if is_solo {
+        "orchestrator-solo"
+    } else {
+        "orchestrator-master"
+    };
+
+    let target_role = if suffix.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}:{suffix}")
+    };
+
+    // suffix 一致の厳密検索
+    let exact = ws.tabs().iter().find_map(|t| {
+        t.tree().panes().iter().find_map(|p| {
+            if p.role().is_some_and(|r| r == target_role) {
+                Some((t.id(), p.id()))
+            } else {
+                None
+            }
+        })
+    });
+
+    exact.or_else(|| {
+        // フォールバック: 任意の master/solo
+        ws.tabs().iter().find_map(|t| {
+            t.tree().panes().iter().find_map(|p| {
+                if p.role().is_some_and(|r| r.starts_with(prefix)) {
+                    Some((t.id(), p.id()))
+                } else {
+                    None
+                }
+            })
+        })
+    })
+}
+
+/// ペインの session_id をバックエンドセッション → pid 祖先辿りで解決する。
+/// 既存の agents::resolve_session_id_for_backend を流用
+fn resolve_session_id_for_pane_via_host(host: &dyn ControlHost, pane_id: PaneId) -> Option<String> {
+    let backend = host.backend_session(pane_id)?;
+    crate::agents::resolve_session_id_for_backend(&backend)
+}
+
+/// OrchestratorHandoff — master の引き継ぎ（#193）。
+/// handoff ファイルを読み、同プロファイルの新 master を同タブに spawn し、
+/// handoff 内容を含むプロンプトを注入する。旧 master は閉じない（ユーザー判断）。
+/// spawn には既存の OrchestratorSpawn（project 経由）を使わず、直接 Split + attach
+/// を行う（handoff は「プロジェクト」ではないため projects.yaml に依存しない）
+fn dispatch_orchestrator_handoff(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    pane: Option<u64>,
+    caller_role: Option<&str>,
+    tab: Option<u64>,
+) -> Result<Value, DispatchError> {
+    use crate::orchestrator;
+
+    let role_suffix = caller_role
+        .and_then(|r| r.strip_prefix("master:"))
+        .map(str::to_string);
+
+    let profile_name = role_suffix
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default");
+
+    // handoff ファイルの存在確認
+    let handoff_content = orchestrator::read_handoff(profile_name)
+        .ok_or_else(|| {
+            let path = orchestrator::handoff_path(profile_name)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            DispatchError::Operation(format!(
+                "handoff ファイルが見つからない: {path}\nmaster は引き継ぎ前にこのファイルに状態を書き込む必要がある"
+            ))
+        })?;
+
+    // 分割元ペインの解決
+    let (tab_id, split_target) = if let Some(raw_tab) = tab {
+        let tid = find_tab(host.workspace(), raw_tab)?;
+        let focused = host.workspace().get_tab(tid).unwrap().tree().focused();
+        (tid, focused)
+    } else if let Some(resolved) = pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok()) {
+        resolved
+    } else {
+        let suffix = role_suffix.as_deref().unwrap_or("");
+        find_master_pane(host.workspace(), suffix, caller_role).ok_or_else(|| {
+            DispatchError::Operation("分割元の master/solo ペインが見つからない".into())
+        })?
+    };
+
+    // プロファイルの読み込みとエージェント解決
+    let profile = orchestrator::Profile::load(profile_name).unwrap_or_default();
+    let master_agent = profile
+        .resolve_master_agent()
+        .map_err(DispatchError::InvalidParams)?;
+    let launch = profile.resolve_agent_launch(master_agent, None, None);
+
+    // 新 master の role
+    let new_role = if profile_name == "default" {
+        "orchestrator-master".to_string()
+    } else {
+        format!("orchestrator-master:{profile_name}")
+    };
+
+    // cwd はホームディレクトリ
+    let cwd = orchestrator::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+
+    // 新ペインを分割（右方向、spawn_worker レイアウト使用）
+    let new_pane = tako_core::Pane::new(origin);
+    let new_id = new_pane.id();
+    let layout = crate::setup::spawn_layout_config();
+    tree_mut(host.workspace_mut(), tab_id)
+        .spawn_worker(split_target, new_pane, &layout)
+        .map_err(op_err)?;
+    let _ = tree_mut(host.workspace_mut(), tab_id).focus(split_target);
+
+    // セッション起動（cwd をホームに、command は None = シェルのみ起動）
+    let options = SpawnOptions {
+        command: None,
+        cwd: Some(cwd.clone()),
+        env: Vec::new(),
+    };
+    host.attach_session(new_id, options);
+
+    // master エージェント CLI コマンドを構築して送信
+    let master_cmd = orchestrator::agent::build_worker_cmd(&orchestrator::agent::WorkerLaunch {
+        agent: master_agent,
+        role: &new_role,
+        model: launch.model.as_deref(),
+        effort: launch.effort.as_deref(),
+        skip_permissions: master_agent.default_skip_permissions(),
+        extra_args: &launch.extra_args,
+    });
+
+    // 事前信頼
+    let _ = orchestrator::agent::ensure_trusted(master_agent, &cwd.to_string_lossy())
+        .unwrap_or_else(|e| {
+            eprintln!("warning: handoff 事前信頼失敗（ダイアログ検出で継続）: {e}");
+            false
+        });
+
+    // コマンド送信（queue_write で遅延書き込み）
+    let mut cmd_bytes = master_cmd.into_bytes();
+    cmd_bytes.push(b'\r');
+    host.queue_write(new_id, cmd_bytes);
+
+    // handoff プロンプトの構成と送信
+    let handoff_prompt = format!(
+        "あなたは前任 master から引き継ぎを受けた新しい master です。\n\
+         以下の引き継ぎファイルの内容を読み、前任の状態を把握してから業務を開始してください。\n\n\
+         --- handoff/{profile_name}.md ---\n\
+         {handoff_content}\n\
+         --- end ---\n\n\
+         引き継ぎ内容を把握したら「引き継ぎ完了」と報告し、待機してください。"
+    );
+    host.queue_prompt_flow(new_id, handoff_prompt.clone());
+
+    // タイトルと role 設定
+    let window_title = format!("master-{profile_name}");
+    let pane_obj = tree_mut(host.workspace_mut(), tab_id)
+        .get_mut(new_id)
+        .expect("直前に split で追加済み");
+    pane_obj.set_title(Some(window_title));
+    pane_obj.set_spawned_by(Some(split_target));
+    pane_obj.set_role(Some(new_role.clone()));
+
+    let handoff_path = orchestrator::handoff_path(profile_name);
+    Ok(json!({
+        "new_master_pane_id": new_id.as_u64(),
+        "new_master_tab_id": tab_id.as_u64(),
+        "profile": profile_name,
+        "role": new_role,
+        "handoff_file": handoff_path,
+        "handoff_prompt_length": handoff_prompt.len(),
     }))
 }
 
@@ -5929,5 +6188,138 @@ mod tests {
         assert!(out.starts_with("L11"), "先頭 10 行が刈られる: {out}");
         assert!(out.ends_with("L40"), "末尾の空行が刈られる: {out}");
         assert_eq!(out.lines().count(), 30);
+    }
+
+    // --- #123 / #193: OrchestratorSelf + OrchestratorHandoff ---
+
+    #[test]
+    fn orchestrator_selfがmaster_paneを返す() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(pane),
+                title: None,
+                role: Some("orchestrator-master:test".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        let result = dispatch(
+            &mut host,
+            Request::OrchestratorSelf {
+                pane: Some(pane),
+                caller_role: Some("master:test".into()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(result["pane_id"].as_u64(), Some(pane));
+        assert_eq!(result["profile"].as_str(), Some("test"));
+        assert!(result["ctx_threshold"].as_u64().is_some());
+    }
+
+    #[test]
+    fn orchestrator_selfがcaller_roleから自動解決する() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(pane),
+                title: None,
+                role: Some("orchestrator-master".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        // pane を渡さず caller_role だけで解決
+        let result = dispatch(
+            &mut host,
+            Request::OrchestratorSelf {
+                pane: None,
+                caller_role: Some("master:".into()),
+            },
+            PaneOrigin::Mcp,
+        );
+        // 「master:」は空 suffix → default → pane_id が一致
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val["pane_id"].as_u64(), Some(pane));
+        assert_eq!(val["profile"].as_str(), Some("default"));
+    }
+
+    #[test]
+    fn orchestrator_handoffがファイル不在でエラー() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(pane),
+                title: None,
+                role: Some("orchestrator-master".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        let result = dispatch(
+            &mut host,
+            Request::OrchestratorHandoff {
+                pane: Some(pane),
+                caller_role: Some("master:".into()),
+                tab: None,
+            },
+            PaneOrigin::Mcp,
+        );
+        assert!(result.is_err(), "handoff ファイル不在はエラー");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("handoff ファイルが見つからない"), "{err}");
+    }
+
+    #[test]
+    fn find_master_paneがsuffix一致を優先する() {
+        let mut host = MockHost::new();
+        let tab1_pane = host.root_pane();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(tab1_pane),
+                title: None,
+                role: Some("orchestrator-master:alpha".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let tab2 = dispatch(&mut host, Request::TabNew { title: None }, PaneOrigin::Cli).unwrap();
+        let tab2_pane = tab2["pane"].as_u64().unwrap();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(tab2_pane),
+                title: None,
+                role: Some("orchestrator-master:beta".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        let found = find_master_pane(host.workspace(), "beta", Some("master:beta"));
+        assert_eq!(
+            found.map(|(_, p)| p.as_u64()),
+            Some(tab2_pane),
+            "suffix beta のペインが返る"
+        );
+
+        let found_alpha = find_master_pane(host.workspace(), "alpha", Some("master:alpha"));
+        assert_eq!(
+            found_alpha.map(|(_, p)| p.as_u64()),
+            Some(tab1_pane),
+            "suffix alpha のペインが返る"
+        );
     }
 }

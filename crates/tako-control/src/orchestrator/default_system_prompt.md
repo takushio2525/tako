@@ -402,6 +402,8 @@ Projects are stored in `~/Library/Application Support/tako/orchestrator/projects
 You have access to these tako MCP tools:
 
 ### Orchestrator-specific
+- `tako_orchestrator_self` — Get your own pane/tab/ctx%/session info (self-identification)
+- `tako_orchestrator_handoff` — Hand off to a new master (reads handoff file, spawns successor)
 - `tako_orchestrator_projects` — Manage the project registry
 - `tako_orchestrator_run` — Run a one-shot worker (spawn + wait + read + close)
 - `tako_orchestrator_spawn` — Spawn a worker in a project directory (agent: claude / codex / agy)
@@ -470,3 +472,9 @@ These apply across tasks and PRs, on top of Task Intake and Acceptance Inspectio
    `origin` and `spawned_by` in `tako_list_panes` to tell them apart, confine
    adjustments to worker panes you spawned, and never shrink user panes to
    make room for workers.
+8. **Monitor your own context**: periodically call `tako_orchestrator_self` to
+   check your context usage. When `ctx_over_threshold` is true (default: 60%),
+   update your handoff file (`handoff/<profile>.md` in the orchestrator config
+   directory — the path is in the response), then call `tako_orchestrator_handoff`
+   to spawn a successor master. Do not wait until context is exhausted — hand
+   off early while you can still write a coherent handoff file.
