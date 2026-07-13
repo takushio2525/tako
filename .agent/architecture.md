@@ -524,14 +524,14 @@ client_tty = backend セッションの pane_tty）ため、backend を先に見
   `scan_dirs` → main thread `apply_refresh` の 3 段階に分離
 - **原則**: UI スレッド上で 1ms 以上かかるファイル I/O や CPU 計算を同期実行しない。
   やむを得ない場合は計測値をコメントに残し、非同期化の TODO を添える
-- **dispatch でサブプロセスを同期起動してはいけない**（2026-07-13、#181）:
+- **dispatch でサブプロセスを同期起動してはいけない**（2026-07-13、#181 / #168）:
   `OrchestratorWorkerStatus` が `claude agents --json`（Node.js 起動 = 実測 500〜1100ms）を
   UI スレッドの dispatch 内で呼び、master のポーリング（1〜3 秒間隔）ごとに UI 全体が固まって
   「スクロールがカクつく」実機症状になった（perf.log に 2 時間で 2000 件超の dispatch 遅延）。
-  対処 = IPC ループでリクエストを特別扱いし、UI 依存部分のスナップショット
-  （`worker_status_snapshot`。workspace / 画面の写し取りのみ）を UI スレッドで、
-  外部プロセスを叩く合成（`worker_status_compute`。ControlHost 不要）を background executor で
-  実行して応答する。同型の外部プロセス依存 dispatch を追加するときはこの二段分離を踏襲する
+  対処 = IPC ループで UI 依存部分の収集だけを UI スレッドで行い、外部プロセスを叩く
+  実行部を background executor へ（`dispatch::prepare_offload` / `OffloadJob`。GitLog /
+  GitDiff も同機構）。同型の外部プロセス依存 dispatch を追加するときは OffloadJob へ
+  ケースを足す（詳細は「メインスレッド非ブロック化とストール診断」節）
 
 ## コンセプト②の実現
 
