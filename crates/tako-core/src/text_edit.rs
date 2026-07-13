@@ -710,4 +710,89 @@ mod tests {
         assert!(buffer.undo());
         assert_eq!(buffer.text(), "old");
     }
+
+    // --- エッジケーステスト（#195 受け入れ条件の検証） ---
+
+    #[test]
+    fn 空バッファでのundo_redoは安全にfalseを返す() {
+        let mut buffer = TextBuffer::from_text(path("edge-empty-undo"), String::new());
+        assert!(!buffer.undo());
+        assert!(!buffer.redo());
+        assert!(!buffer.can_undo());
+        assert!(!buffer.can_redo());
+    }
+
+    #[test]
+    fn 空バッファへの検索は空を返す() {
+        let buffer = TextBuffer::from_text(path("edge-empty-search"), String::new());
+        assert!(buffer.find_all("abc").is_empty());
+        assert!(buffer.find_next("abc", 0).is_none());
+        assert!(buffer.find_prev("abc", 0).is_none());
+    }
+
+    #[test]
+    fn 空バッファへの全置換は0件を返す() {
+        let mut buffer = TextBuffer::from_text(path("edge-empty-replace"), String::new());
+        assert_eq!(buffer.replace_all("a", "b"), 0);
+    }
+
+    #[test]
+    fn 五千行バッファでundo_redoが動く() {
+        let text = (0..5_000)
+            .map(|i| format!("{i}: テスト行"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut buffer = TextBuffer::from_text(path("edge-large-undo"), text.clone());
+        buffer.move_cursor(CursorMovement::DocumentEnd, false);
+        buffer.insert("追加");
+        assert!(buffer.text().ends_with("追加"));
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), text);
+    }
+
+    #[test]
+    fn 五千行バッファで検索が動く() {
+        let text = (0..5_000)
+            .map(|i| format!("{i}: テスト行"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let buffer = TextBuffer::from_text(path("edge-large-search"), text);
+        let hits = buffer.find_all("テスト行");
+        assert_eq!(hits.len(), 5_000);
+        let hit = buffer.find_next("4999", 0).unwrap();
+        assert!(hit.start > 0);
+    }
+
+    #[test]
+    fn 読み取り専用ファイルの自動保存は失敗してバッファを保つ() {
+        let path = path("edge-readonly-autosave");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "readonly content").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let mut buffer = TextBuffer::open(&path).unwrap();
+        buffer.insert("edit");
+        assert!(buffer.dirty());
+        assert!(buffer.save().is_err());
+        assert!(buffer.dirty());
+        assert!(buffer.text().contains("edit"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn 日本語を含む検索と置換が正しいバイト位置で動く() {
+        let mut buffer = TextBuffer::from_text(path("edge-jp-search"), "あいうえお".into());
+        let hits = buffer.find_all("うえ");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].start, "あい".len());
+        assert_eq!(hits[0].end, "あいうえ".len());
+        buffer.replace_range(hits[0].start..hits[0].end, "カキ");
+        assert_eq!(buffer.text(), "あいカキお");
+    }
 }
