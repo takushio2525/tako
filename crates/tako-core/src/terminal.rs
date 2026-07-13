@@ -418,6 +418,12 @@ impl TerminalSession {
         (offset - fract).max(0.0)
     }
 
+    /// サブライン表示の下方向端数（0.0..1.0 行）。描画側のピクセルシフト量と
+    /// マウス座標→セル座標変換の補正に使う
+    pub fn scroll_subline_fract(&self) -> f32 {
+        *self.scroll_fract.lock().unwrap()
+    }
+
     /// 表示位置を行の小数で直接指定する（スクロールバードラッグ用）
     pub fn scroll_to_position(&self, pos: f32) {
         let current = self.scroll_position();

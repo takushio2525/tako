@@ -3848,12 +3848,15 @@ impl TakoApp {
         }
         let (_, area) = self.pane_text_areas.iter().find(|(id, _)| *id == pane)?;
         let cell = self.cell_size_for_pane(pane)?;
-        let screen = self.terminals.get(&pane)?.screen(&self.theme);
+        let session = self.terminals.get(&pane)?;
+        let screen = session.screen(&self.theme);
         let (col, row) = screen.cursor?;
         let x = f32::from(cell.width) * col as f32;
+        // サブラインスクロール中は描画シフトぶんカーソル位置も上へずれる（#159）
+        let subline = session.scroll_subline_fract() * f32::from(cell.height);
         Some(point(
             area.origin.x + px(x),
-            area.origin.y + cell.height * row as f32,
+            area.origin.y + cell.height * row as f32 - px(subline),
         ))
     }
 
@@ -3870,12 +3873,14 @@ impl TakoApp {
         }
         let (_, area) = self.pane_text_areas.iter().find(|(id, _)| *id == pane)?;
         let cell = self.cell_size_for_pane(pane)?;
-        let screen = self.terminals.get(&pane)?.screen(&self.theme);
+        let session = self.terminals.get(&pane)?;
+        let screen = session.screen(&self.theme);
         let (col, row) = screen.ime_cursor?;
         let x = f32::from(cell.width) * col as f32;
+        let subline = session.scroll_subline_fract() * f32::from(cell.height);
         Some(point(
             area.origin.x + px(x),
-            area.origin.y + cell.height * row as f32,
+            area.origin.y + cell.height * row as f32 - px(subline),
         ))
     }
 
@@ -3932,7 +3937,10 @@ impl TakoApp {
         let session = self.terminals.get(&pane_id)?;
         let (cols, rows) = session.size();
         let local = position - area.origin;
-        let y = (f32::from(local.y) / f32::from(cell.height)).max(0.0);
+        // サブラインスクロール中は描画が fract 行ぶん上へずれているため、
+        // マウス座標も同じだけ補正して視覚位置とグリッド行を一致させる（#159）
+        let subline = session.scroll_subline_fract() * f32::from(cell.height);
+        let y = ((f32::from(local.y) + subline) / f32::from(cell.height)).max(0.0);
         let row = (y as usize).min(rows.saturating_sub(1));
         let local_x = f32::from(local.x).max(0.0);
         let cw = f32::from(cell.width);
@@ -4479,8 +4487,9 @@ impl TakoApp {
             .clamp(0.0, 1.0);
         // 表示窓（rows 行）の中心をマウス位置の行へ合わせ、上端行 → offset に直す
         let top_row = (ratio * total - rows as f32 / 2.0).clamp(0.0, history as f32);
-        let offset = history - top_row.round() as usize;
         if backend {
+            // tmux copy-mode は行単位のため丸める
+            let offset = history - top_row.round() as usize;
             let ctl = self.scroll_ctls.entry(pane_id).or_default();
             ctl.last_activity = std::time::Instant::now();
             ctl.drag_goal = Some(offset);
@@ -4488,7 +4497,8 @@ impl TakoApp {
             self.pump_scroll(pane_id, cx);
             self.ensure_scroll_ticker(cx);
         } else {
-            session.scroll_to(offset);
+            // 直接ペインは行小数のままドラッグ追従（サブライン描画。#159）
+            session.scroll_to_position(history as f32 - top_row);
             self.mark_scroll_activity(pane_id, cx);
         }
         cx.notify();
@@ -4703,31 +4713,33 @@ impl TakoApp {
         let Some(cell) = self.cell_size_for_pane(pane_id) else {
             return;
         };
-        let delta_lines = match event.delta {
+        // トラックパッドは Pixels（そのまま行小数へ）、マウスホイールは Lines
+        // （1 ノッチ = 3 行。iTerm2 / Terminal.app と同等）。慣性は macOS が
+        // momentum イベントとして Pixels デルタを流し続けるため、加算だけで効く
+        let delta_rows = match event.delta {
             ScrollDelta::Lines(l) => l.y * 3.0,
             ScrollDelta::Pixels(p) => f32::from(p.y) / f32::from(cell.height),
         };
-        // トラックパッドはイベント単位のピクセルデルタが 1 セル未満になりがちで、
-        // 都度切り捨てるとゆっくりスクロールが完全に無反応になる（2026-06-12
-        // 実機バグ (1) の app 側要因）。端数をペインごとに持ち越して積分する
-        let carry = self.scroll_accum.entry(pane_id).or_insert(0.0);
-        let (lines, rest) = accumulate_scroll(*carry, delta_lines);
-        *carry = rest;
-        if lines != 0 {
-            let (col, row) = self
-                .cell_at(pane_id, event.position, window)
-                .map(|(c, r, _)| (c, r))
-                .unwrap_or((0, 0));
-            if self.backend_sessions.contains_key(&pane_id) {
-                // バックエンドペイン: tako が tmux スクロールを正確な行数で駆動する
+        let (col, row) = self
+            .cell_at(pane_id, event.position, window)
+            .map(|(c, r, _)| (c, r))
+            .unwrap_or((0, 0));
+        if self.backend_sessions.contains_key(&pane_id) {
+            // バックエンドペイン: tako が tmux スクロールを正確な行数で駆動する。
+            // tmux copy-mode は行単位のため、端数を持ち越して整数行だけ送る
+            let carry = self.scroll_accum.entry(pane_id).or_insert(0.0);
+            let (lines, rest) = accumulate_scroll(*carry, delta_rows);
+            *carry = rest;
+            if lines != 0 {
                 self.backend_scroll(pane_id, lines, (col, row), cx);
-            } else if let Some(session) = self.terminals.get(&pane_id) {
-                // 直接ペイン: mouse reporting / alternate scroll / 自前スクロールの
-                // 出し分けはセッション側
-                session.scroll_wheel(lines, col, row);
-                self.mark_scroll_activity(pane_id, cx);
-                cx.notify();
             }
+        } else if let Some(session) = self.terminals.get(&pane_id) {
+            // 直接ペイン: 行小数のままセッションへ（ピクセル単位スムーススクロール #159）。
+            // mouse reporting / alternate scroll の転送とスクロールバック表示の
+            // 出し分け・転送時の整数化はセッション側（scroll_wheel_px）
+            session.scroll_wheel_px(delta_rows, col, row);
+            self.mark_scroll_activity(pane_id, cx);
+            cx.notify();
         }
     }
 
@@ -5123,12 +5135,13 @@ impl TakoApp {
         let session = self.terminals.get(&pane_id)?;
         let (offset, history) = if self.backend_sessions.contains_key(&pane_id) {
             // バックエンドのスクロールバックは tmux 側（ネスト先含む）にある
-            (ctl.state.position, ctl.state.history)
+            (ctl.state.position as f32, ctl.state.history)
         } else {
             if session.is_alt_screen() {
                 return None;
             }
-            (session.display_offset(), session.history_size())
+            // サブライン位置（行小数）でサムを連続移動させる（#159）
+            (session.scroll_position(), session.history_size())
         };
         if history == 0 {
             return None;
@@ -5137,7 +5150,8 @@ impl TakoApp {
         let total = (history + rows) as f32;
         let track_h = f32::from(area.size.height);
         let thumb_h = (rows as f32 / total * track_h).clamp(20.0, track_h);
-        let top = ((history - offset.min(history)) as f32 / total * track_h).min(track_h - thumb_h);
+        let top = ((history as f32 - offset.min(history as f32)) / total * track_h)
+            .min(track_h - thumb_h);
         Some((top, thumb_h, track_h, alpha, dragging))
     }
 
@@ -5342,9 +5356,13 @@ impl TakoApp {
             .unwrap_or_default();
 
         let _total_cols = screen.cols;
+        // サブラインスクロール中は viewport 最下行の 1 行下も描画する（部分行表示。#159）。
+        // 描画側が行スタック全体を fract 行ぶん上へずらすため、下端の隙間をこの行が埋める
+        let extra_bottom = screen.extra_bottom;
         screen
             .lines
             .into_iter()
+            .chain(extra_bottom)
             .enumerate()
             .map(|(row_idx, line)| {
                 if cell_width.is_none() {
@@ -5728,6 +5746,12 @@ impl TakoApp {
             .get(&pane_id)
             .is_some_and(|c| c.state.in_mode);
         let lines = self.terminal_screen_lines(pane_id, !scrolled_in_tmux);
+        // サブラインスクロールの描画シフト（fract 行ぶん行スタック全体を上へずらす。#159）
+        let subline_shift = self
+            .terminals
+            .get(&pane_id)
+            .map(|s| s.scroll_subline_fract() * f32::from(cell.height))
+            .unwrap_or(0.0);
         let has_link_hover = self
             .hovered_link
             .as_ref()
@@ -5968,12 +5992,24 @@ impl TakoApp {
                     ),
             )
             .child(
+                // テキスト領域: サブラインスクロール（#159）のため行スタックを
+                // absolute 配置し、fract 行ぶん上へずらして描画する（overflow_hidden で
+                // 上下端は部分行として見切れる = ピクセル単位のスムーススクロール）
                 div()
                     .flex_1()
-                    .p(px(PANE_PADDING))
                     .overflow_hidden()
+                    .relative()
                     .when(has_link_hover, |d| d.cursor(CursorStyle::PointingHand))
-                    .children(lines),
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(PANE_PADDING))
+                            .right(px(PANE_PADDING))
+                            .top(px(PANE_PADDING - subline_shift))
+                            .flex()
+                            .flex_col()
+                            .children(lines),
+                    ),
             )
             .children(scrollbar.map(|(top, thumb_h, track_h, alpha, dragging)| {
                 div()
