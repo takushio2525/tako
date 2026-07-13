@@ -632,3 +632,13 @@
   スクロールバーはホバー維持 + サム強調。CLI/MCP Scroll は ControlHost::backend_scroll_view で同一経路
 - 検証: 全テスト・隔離セルフテスト（44b/61b-61e 新設・更新）・visual-test 全緑
 - 次: merge + install 後に manual-checks.md「ターミナルスクロールの大幅改善」節の人手確認
+
+## 2026-07-13（#165: worker spawn のレイアウトエンジン）
+- spawn を master-reserved（master の取り分維持 + 右側 worker 領域の grid/spiral 配置）へ刷新。
+  worker 領域は spawned_by チェーン判定（ユーザーペイン不変）、close 時は領域内のみリフロー。
+  config.yaml spawn_layout + `tako orchestrator layout` + MCP `tako_orchestrator_layout`（59 ツール）。
+  master/solo プロンプトにレイアウト行動規範を追記
+- 検証: tako-core 単体 10 本 + セルフテスト項目 72 + セカンダリ実機 spawn ×4 → 十字四分割 →
+  close リフローの screencapture ピクセル確認。全テスト / fmt / clippy(-D warnings) 緑
+- 副産物 #178: TAKO_DISCOVERY_DIR 指定で多重起動ガードが無効化され production の tmux
+  バックエンドを強奪する穴を発見・起票（実プロセス損失ゼロ、ユーザー復旧済み）

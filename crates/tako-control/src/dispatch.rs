@@ -405,27 +405,42 @@ fn dispatch_inner(
             let (tab, target) = resolve_pane(host.workspace(), pane)?;
 
             // worker 保護: orchestrator-worker role のペインが busy なら拒否
-            if !force {
-                let is_worker = host
-                    .workspace()
-                    .get_tab(tab)
-                    .and_then(|t| t.tree().get(target))
-                    .and_then(|p| p.role())
-                    .is_some_and(|r| r.starts_with("orchestrator-worker"));
-                if is_worker {
-                    let busy = is_worker_busy(host, target);
-                    if busy {
-                        return Err(DispatchError::Operation(format!(
-                            "Worker is still active. Use force: true to close anyway. pane_id={}",
-                            target.as_u64()
-                        )));
-                    }
+            let target_pane = host
+                .workspace()
+                .get_tab(tab)
+                .and_then(|t| t.tree().get(target));
+            let is_worker = target_pane
+                .and_then(|p| p.role())
+                .is_some_and(|r| r.starts_with("orchestrator-worker"));
+            if !force && is_worker {
+                let busy = is_worker_busy(host, target);
+                if busy {
+                    return Err(DispatchError::Operation(format!(
+                        "Worker is still active. Use force: true to close anyway. pane_id={}",
+                        target.as_u64()
+                    )));
                 }
             }
+            // Issue #165: worker close 後のリフロー用に spawn 元を close 前に記録する
+            let reflow_anchor = if is_worker {
+                target_pane.and_then(|p| p.spawned_by())
+            } else {
+                None
+            };
 
             let closed = tree_mut(host.workspace_mut(), tab).close(target);
             match closed {
-                Ok(_) => {}
+                Ok(_) => {
+                    // Issue #165: worker が抜けた領域を残りの worker で再配分する
+                    // （master・ユーザー由来ペインの矩形は変わらない）
+                    if let Some(anchor) = reflow_anchor {
+                        let layout = crate::setup::spawn_layout_config();
+                        if layout.policy != tako_core::SpawnLayoutPolicy::Legacy {
+                            let _ = tree_mut(host.workspace_mut(), tab)
+                                .reflow_workers(anchor, layout.algorithm);
+                        }
+                    }
+                }
                 Err(PaneTreeError::LastPane) => {
                     // タブ最後の 1 ペイン → タブごと閉じる。最後のタブなら拒否する
                     // （アプリ終了に等しい操作は AI / CLI からは行わせない。UI の cmd+W のみ）
@@ -1661,6 +1676,12 @@ fn dispatch_inner(
             agent_args,
         }),
 
+        Request::OrchestratorLayout {
+            policy,
+            master_ratio,
+            algorithm,
+        } => dispatch_orchestrator_layout(policy.as_deref(), master_ratio, algorithm.as_deref()),
+
         Request::OrchestratorSpawn {
             project,
             prompt,
@@ -2218,7 +2239,66 @@ fn spawn_tmux_delivery(session: String, text: String, wait_ready: bool) {
     });
 }
 
-#[allow(clippy::too_many_arguments)]
+/// spawn レイアウト設定の取得・変更（Issue #165）。host 非依存（config.yaml の読み書きのみ）
+/// のため pub にし、CLI `tako orchestrator layout` からもローカル呼び出しで共用する
+/// （二重実装を作らない。#83 の教訓）。
+/// 全パラメータ None = 取得、いずれか Some = 検証して更新。更新はロック付き
+/// read-modify-write（#169。並行する他プロセスの設定更新を巻き戻さない）。
+/// 応答は解決済みの現在値
+pub fn dispatch_orchestrator_layout(
+    policy: Option<&str>,
+    master_ratio: Option<f32>,
+    algorithm: Option<&str>,
+) -> Result<Value, DispatchError> {
+    // 検証は書き込み前に完了させる（不正値ではロックを取らない）
+    let policy = policy
+        .map(tako_core::SpawnLayoutPolicy::parse)
+        .transpose()
+        .map_err(DispatchError::InvalidParams)?;
+    if let Some(r) = master_ratio {
+        if !r.is_finite() || !(0.1..=0.9).contains(&r) {
+            return Err(DispatchError::InvalidParams(format!(
+                "master_ratio は 0.1〜0.9 で指定してください（指定値: {r}）"
+            )));
+        }
+    }
+    let algorithm = algorithm
+        .map(tako_core::WorkerLayoutAlgorithm::parse)
+        .transpose()
+        .map_err(DispatchError::InvalidParams)?;
+
+    let changed = policy.is_some() || master_ratio.is_some() || algorithm.is_some();
+    let resolved = if changed {
+        crate::setup::mutate_config(|config| {
+            if let Some(p) = policy {
+                config.spawn_layout.policy = Some(p.as_str().to_string());
+            }
+            if let Some(r) = master_ratio {
+                config.spawn_layout.master_ratio = Some(r);
+            }
+            if let Some(a) = algorithm {
+                config.spawn_layout.algorithm = Some(a.as_str().to_string());
+            }
+            config.spawn_layout.resolve()
+        })
+        .map_err(DispatchError::Operation)?
+    } else {
+        crate::setup::load_config()
+            .map_err(DispatchError::Operation)?
+            .spawn_layout
+            .resolve()
+    };
+    // f32 → f64 の昇格ノイズ（0.6 → 0.6000000238…）を応答から除く
+    let ratio = (f64::from(resolved.master_ratio) * 1000.0).round() / 1000.0;
+    Ok(json!({
+        "policy": resolved.policy.as_str(),
+        "master_ratio": ratio,
+        "algorithm": resolved.algorithm.as_str(),
+        "updated": changed,
+        "config_path": crate::setup::config_yaml_path().ok(),
+    }))
+}
+
 /// OrchestratorSpawn のパラメータ（Request と 1:1）
 struct SpawnParams<'a> {
     project: &'a str,
@@ -2354,8 +2434,12 @@ fn dispatch_orchestrator_spawn(
     };
     let new_pane = Pane::new(origin);
     let new_id = new_pane.id();
+    // spawn レイアウトエンジン（Issue #165）: 配置は config.yaml の spawn_layout に従う。
+    // 既定 = master-reserved（spawn 元の取り分を維持し、worker は右側の worker 領域内へ
+    // grid 配置）。領域判定は既存 worker の spawned_by チェーンによる
+    let layout = crate::setup::spawn_layout_config();
     tree_mut(host.workspace_mut(), tab_id)
-        .split_with_ratio(target, SplitDirection::Right, 0.45, new_pane)
+        .spawn_worker(target, new_pane, &layout)
         .map_err(op_err)?;
     // MCP/CLI 経由ではフォーカスを分割元に維持（ユーザーの入力を奪わない）
     let _ = tree_mut(host.workspace_mut(), tab_id).focus(target);

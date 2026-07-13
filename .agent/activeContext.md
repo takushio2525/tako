@@ -4,40 +4,46 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-13・#159 スクロール大幅改善 + v0.4.0 / #169 は main 側で完了済み）
+## 現在の対象（2026-07-13・#159 スクロール改善 + #165 spawn レイアウトが完了）
 
-#159 実装完了（fix/159-smooth-scroll worktree → PR #176）。①ピクセル単位スムース
-スクロール（表示位置 = display_offset - fract の行小数分解 + サブライン描画）
-②操作感改善（1 行未満切り捨て廃止 → Pixels デルタを行小数のまま反映、慣性は OS
-momentum）③スクロールバー強化（ホバー維持 + サム強調 + トラック）④バックエンド
-(tmux)ペインを copy-mode 駆動 → **ローカル履歴ミラー方式**へ刷新
-（tako-core::scroll_mirror 新設）。
+main 側の完了分: **v0.4.0 リリース済み**（tag `v0.4.0`、cask 0.4.0）、夜間パッチ
+リリースは launchd ジョブへ移行（#166。毎日 5:00）、#169 projects.yaml 全消失の根治
+（`config_io` 新設。**設定更新は load→save ではなく `mutate_config` 系を使うこと**）、
+#159 スクロール大幅改善（ピクセル単位化 + tmux ペインのローカル履歴ミラー +
+スクロールバー強化。PR #176 マージ済み）。
 
-- Zed 比較所見: Zed ターミナルは行単位のまま。ピクセルオフセットは Zed エディタの
-  scroll_position (f64 行小数) 方式で、それをターミナルの下端アンカーに翻案した
-- 外側 alacritty に tmux 履歴は積もらない（実測 outer_history=0）→ ミラー方式が必然
-- 既知制約: ミラー表示中（バックエンド過去閲覧中）の選択・cmd+クリックは無効
+#165 実装完了（fix/165-spawn-layout-engine → PR #179）: worker spawn を
+master-reserved（master の取り分維持 + 右側 worker 領域内 grid/spiral 配置）へ刷新。
 
-main 側の並行完了分: **v0.4.0 リリース済み**（tag `v0.4.0`、cask 0.4.0）、夜間パッチ
-リリースは launchd ジョブへ移行（#166）、#169 projects.yaml 全消失の根治
-（config_io 新設）、#155 Web ビューペイン（wry / WKWebView）。
+- レイアウト計算 = `tako-core::spawn_layout`（型 + 領域構築純関数）+
+  `PaneTree::spawn_worker` / `reflow_workers`。worker 領域 = spawned_by チェーンが
+  anchor に到達するリーフのみのサブツリー（ユーザーペイン混在は領域外 = 不変）
+- 設定 = config.yaml `spawn_layout`（policy / master_ratio / algorithm）。
+  CLI `tako orchestrator layout` と MCP `tako_orchestrator_layout`（59 ツール）は
+  `dispatch_orchestrator_layout` を共用（更新は #169 の mutate_config 経由）
+- close リフロー = dispatch `Close` + tako-app `remove_pane_with` の両経路
+- 検証済み: tako-core 単体 10 本 + セルフテスト項目 72 完走 + セカンダリ実機
+  spawn ×4 → 十字四分割 → close リフローを screencapture ピクセル確認
 
-## 検証済み（#159）
+## 検証時インシデント（解決済み・#178 起票）
 
-- 実ピクセル実証: visual-test「半行戻しでほぼ一致」direct=22197 / shifted=0
-- 隔離セルフテスト全項目パス（44b サブライン / 61b-61e ミラー・CLI 経路）
-- workspace build / test / fmt / clippy（-D warnings）全緑（origin/main 統合後に再検証）
+TAKO_DISCOVERY_DIR 指定の dev 起動で多重起動ガードが無効化され、production の
+tmux バックエンド 13 セッションを強奪（タブ 8 → 3。実プロセス損失ゼロ、
+ユーザーが復旧済み）。根因 = プライマリ判定が discovery のみ依存 → #178。
+**dev 併走検証は素の `cargo run -p tako-app`（セカンダリモード）で行うこと**
 
 ## 次の一手
 
-- PR #176（Closes #159）squash merge → fetch + detach → build-app.sh --install
-- tako 再起動後、`.agent/manual-checks.md`「ターミナルスクロールの大幅改善」節の
-  操作感チェックリスト（トラックパッド慣性・バー操作・TUI 整合）を人手確認。
-  併せて main 側の残確認: 「Web ビューペイン」節（#155）・#153/#152 節・Cmd-Q 経過観察（#103）
+- PR #179 の squash merge → `build-app.sh --install` → tako 再起動で実機反映
+- tako 再起動後の GUI 確認（manual-checks.md）: 「ターミナルスクロールの大幅改善」節
+  （#159）+「Web ビューペイン」節（#155）+ #153/#152 節 + Cmd-Q 経過観察（#103）
 - 明朝 5:00 の夜間ジョブ初回実行を監視（v0.4.1 自動リリース見込み。#166）
+- #178（多重起動ガードのプロセスベース判定併用）の着手判断
+- Phase 5 の次候補は FR-2.19 localhost ポートパネル・FR-3.10 画像プレビュー等
 
 ## 現フェーズで Read すべき設計書
 
-- 要件: `.agent/requirements.md` FR-2.5.13（#159 で全面改稿）
-- 手動確認: `.agent/manual-checks.md`「ターミナルスクロールの大幅改善」
+- spawn レイアウトの設計: `.agent/architecture.md`「spawn レイアウトエンジン」節
+- スクロールの要件（#159 で全面改稿）: `.agent/requirements.md` FR-2.5.13 +
+  手動確認 `.agent/manual-checks.md`「ターミナルスクロールの大幅改善」
 - 設定ファイル I/O の安全化（#169）: `.agent/architecture.md` 該当節

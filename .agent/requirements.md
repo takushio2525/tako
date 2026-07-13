@@ -525,7 +525,30 @@ tty 突き合わせ）。現状はペイン配下のみ検知のため、**tako 
 （システム全体の LISTEN 走査）が追加実装点。kill は確認 UI + dispatch 経由
 （FR-2.13.3 の tmux kill と同型）。
 
-FR-2.8〜2.19 はいずれも設計原則 5（AI フルコントロール）の不変条件に従い、
+### FR-2.20 worker spawn のレイアウトエンジン（✅ 2026-07-13、#165）
+
+> spawn の「呼び出し元の右に等分割」を繰り返すと worker が増えるほど全ペインが
+> 横に圧縮され、master も worker も読めなくなる。**master を見やすく保ちつつ、
+> worker を右側の「worker 領域」に賢く配置する**レイアウトエンジンに差し替える。
+
+| ID | 要件 | 優先度 |
+|---|---|---|
+| FR-2.20.1 | spawn 配置ポリシーを設定で切替できる: `master-reserved`（**既定**。spawn 元 = master の取り分を維持し、worker は master 右の worker 領域内に配置）/ `legacy`（従来の右等分割） | M |
+| FR-2.20.2 | worker 領域内の配置アルゴリズム: `grid`（**既定**。1 体=全面 → 2 体=上下 → 3〜4 体=十字四分割 → 以降は列を増やす格子）/ `spiral`（縦横交互に半分ずつの再帰分割、黄金比風） | M |
+| FR-2.20.3 | 設定は config.yaml の `spawn_layout` セクション（policy / master_ratio 0.1〜0.9 / algorithm）。取得・変更を CLI `tako orchestrator layout` + MCP `tako_orchestrator_layout` で 1:1 公開する（開発不変条件。計 59 ツール） | M |
+| FR-2.20.4 | **worker 領域の判定は origin / spawned_by による**: 領域 = spawn 由来ペイン（`spawned_by` チェーンが spawn 元に到達）だけのサブツリー。ユーザーが手動で開いたペインが混在するサブツリーは領域と見なさず再構築しない（**master とユーザー由来ペインの矩形を勝手に潰さない**） | M |
+| FR-2.20.5 | worker close 時（dispatch `Close` / UI ×・exit）に空いた場所を残り worker で再配分する。リフローは worker 領域内に限定し、master・ユーザー由来ペインの矩形は不変 | M |
+| FR-2.20.6 | master / solo のデフォルト system prompt に「レイアウト操作時は master とユーザー由来ペインの可読性を最優先する」行動規範を持つ | S |
+
+実装メモ（2026-07-13）: レイアウト計算は `tako-core::spawn_layout`（ポリシー型 +
+領域構築の純関数）と `PaneTree::spawn_worker` / `reflow_workers`（領域判定 + 再構築）。
+spawn 経路は `dispatch_orchestrator_spawn`、close リフローは dispatch `Close` と
+tako-app `remove_pane_with` の両方から `reflow_workers` を呼ぶ。設定読み込みは
+`tako-control::setup::spawn_layout_config()`（不正値は既定へフォールバックし spawn を
+止めない）。機械検証は tako-core 単体テスト（rect 検証 10 本）+ セルフテスト項目 72
+（dispatch 経由 spawn 1→4 → close リフロー → ユーザーペイン不変）。
+
+FR-2.8〜2.20 はいずれも設計原則 5（AI フルコントロール）の不変条件に従い、
 対応する MCP / CLI 操作（表示・読み取り・応答送信）を同時に提供する。
 提示系の体験は FR-2.7（AI 成果物プレゼンテーション）と一体で設計する。
 

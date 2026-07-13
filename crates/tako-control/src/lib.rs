@@ -34,7 +34,8 @@ pub mod setup;
 pub mod transcript;
 
 pub use dispatch::{
-    dispatch, fetch_tmux_sessions, ControlHost, DispatchError, PinnedView, TmuxContext,
+    dispatch, dispatch_orchestrator_layout, fetch_tmux_sessions, ControlHost, DispatchError,
+    PinnedView, TmuxContext,
 };
 pub use ipc::{IncomingRequest, IpcServer};
 pub use mcp::McpServer;

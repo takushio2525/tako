@@ -385,6 +385,7 @@ You have access to these tako MCP tools:
 - `tako_orchestrator_spawn` — Spawn a worker in a project directory (agent: claude / codex / agy)
 - `tako_orchestrator_worker_status` — Check worker status
 - `tako_orchestrator_profiles` — Manage launch profiles (models, efforts, worker agents)
+- `tako_orchestrator_layout` — Get/set the worker spawn layout (policy, master share, grid/spiral)
 
 ### Pane operations (for interacting with workers)
 - `tako_read_pane` — Read worker output
@@ -438,3 +439,12 @@ These apply across tasks and PRs, on top of Task Intake and Acceptance Inspectio
      dependency repos under discussion.
    - **Cleanup**: when the session's focus shifts and a folder is no longer
      relevant, remove it with action "remove" to keep the tree uncluttered.
+7. **Layout: keep the master and user panes readable**: spawned workers are
+   auto-placed by tako's layout engine (the master keeps its share of the
+   screen; workers tile inside the right-side worker area — tunable via
+   `tako_orchestrator_layout`). When you rearrange panes yourself
+   (resize / equalize / close), prioritize the readability of the master pane
+   and panes the user opened manually (previews, editors, terminals): check
+   `origin` and `spawned_by` in `tako_list_panes` to tell them apart, confine
+   adjustments to worker panes you spawned, and never shrink user panes to
+   make room for workers.
