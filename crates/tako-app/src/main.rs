@@ -709,6 +709,8 @@ struct TakoApp {
     video_seek_bar_bounds: HashMap<PaneId, Bounds<Pixels>>,
     /// シークバーのドラッグ中フラグ（ペイン ID。ドラッグ中はマウス移動でシーク位置を追従）
     video_seek_dragging: Option<PaneId>,
+    /// シークバーのホバー時刻（ペイン ID、秒数、x 座標）
+    video_seek_hover: Option<(PaneId, f64, f32)>,
     /// プレビューペインのテキスト選択
     preview_selections: HashMap<PaneId, PreviewSelection>,
     /// プレビューで選択操作中のペイン
@@ -1557,6 +1559,7 @@ impl TakoApp {
             preview_image_cache: HashMap::new(),
             video_seek_bar_bounds: HashMap::new(),
             video_seek_dragging: None,
+            video_seek_hover: None,
             preview_selections: HashMap::new(),
             preview_selecting: None,
             preview_line_bounds: HashMap::new(),
@@ -6693,6 +6696,20 @@ impl TakoApp {
                 }
                 true
             }
+            "m" => {
+                if let Some(p) = self.video_players.get_mut(&pane_id) {
+                    p.toggle_mute();
+                    cx.notify();
+                }
+                true
+            }
+            "l" => {
+                if let Some(p) = self.video_players.get_mut(&pane_id) {
+                    p.toggle_loop();
+                    cx.notify();
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -8611,6 +8628,37 @@ impl PreviewHost for TakoApp {
             "play" => player.play(),
             "pause" => player.pause(),
             "toggle" => player.toggle(),
+            "mute" => {
+                player.muted = true;
+                player.set_volume(player.volume);
+                return Ok("muted".to_string());
+            }
+            "unmute" => {
+                player.muted = false;
+                player.set_volume(player.volume);
+                return Ok("unmuted".to_string());
+            }
+            "toggle_mute" => {
+                player.toggle_mute();
+                return Ok(if player.muted { "muted" } else { "unmuted" }.to_string());
+            }
+            "loop_on" => {
+                player.looping = true;
+                return Ok("loop_on".to_string());
+            }
+            "loop_off" => {
+                player.looping = false;
+                return Ok("loop_off".to_string());
+            }
+            "toggle_loop" => {
+                player.toggle_loop();
+                return Ok(if player.looping {
+                    "loop_on"
+                } else {
+                    "loop_off"
+                }
+                .to_string());
+            }
             _ => return Err(format!("不明なアクション: {action}")),
         }
         let state_str = match player.state {
@@ -8627,6 +8675,15 @@ impl PreviewHost for TakoApp {
             .ok_or_else(|| "動画プレイヤーが起動していない".to_string())?;
         player.seek(seconds);
         Ok(player.current_time)
+    }
+
+    fn video_volume(&mut self, pane: PaneId, volume: f64) -> Result<f64, String> {
+        let player = self
+            .video_players
+            .get_mut(&pane)
+            .ok_or_else(|| "動画プレイヤーが起動していない".to_string())?;
+        player.set_volume(volume as f32);
+        Ok(player.volume as f64)
     }
 
     fn set_preview(
@@ -11643,7 +11700,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 72, "MCP tools/list は 72 ツール");
+            check(status == 200 && tool_count == 73, "MCP tools/list は 73 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)

@@ -387,11 +387,14 @@ pub enum Request {
         scope: Option<String>,
         pane: Option<u64>,
     },
-    /// 動画の再生/一時停止（プレビューペインが Video モードの場合のみ有効）。
-    /// `action` = "play" / "pause" / "toggle"。`pane` 省略時は呼び出し元ペイン
+    /// 動画の再生/一時停止/ミュート/ループ（プレビューペインが Video モードの場合のみ有効）。
+    /// `action` = "play" / "pause" / "toggle" / "mute" / "unmute" / "toggle_mute" /
+    /// "loop_on" / "loop_off" / "toggle_loop"。`pane` 省略時は呼び出し元ペイン
     VideoPlayback { pane: Option<u64>, action: String },
     /// 動画のシーク。`seconds` は絶対位置（秒）。`pane` 省略時は呼び出し元ペイン
     VideoSeek { pane: Option<u64>, seconds: f64 },
+    /// 動画の音量設定。`volume` は 0.0〜1.0。`pane` 省略時は呼び出し元ペイン
+    VideoVolume { pane: Option<u64>, volume: f64 },
     /// オーケストレーター: プロジェクト管理（list / add / remove）
     OrchestratorProjects {
         action: String,

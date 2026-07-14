@@ -111,6 +111,12 @@ pub struct VideoPlayer {
     pub frame_gen: u64,
     /// 再生速度（0.5 / 1.0 / 1.5 / 2.0）
     pub rate: f32,
+    /// 音量（0.0〜1.0）
+    pub volume: f32,
+    /// ミュート中か
+    pub muted: bool,
+    /// ループ再生が有効か
+    pub looping: bool,
 }
 
 // Safety: AVFoundation の API（AVPlayer / AVPlayerItemVideoOutput 等）は多くが
@@ -231,6 +237,9 @@ impl VideoPlayer {
                 current_time: 0.0,
                 frame_gen: 0,
                 rate: 1.0,
+                volume: 1.0,
+                muted: false,
+                looping: false,
             };
 
             // 最初のフレームを取得
@@ -298,6 +307,29 @@ impl VideoPlayer {
         self.seek(self.current_time + delta);
     }
 
+    /// 音量を設定（0.0〜1.0）。AVPlayer.volume を直接操作
+    pub fn set_volume(&mut self, vol: f32) {
+        self.volume = vol.clamp(0.0, 1.0);
+        unsafe {
+            let effective = if self.muted { 0.0 } else { self.volume };
+            let _: () = msg_send_void_f32(self.player, sel("setVolume:"), effective);
+        }
+    }
+
+    /// ミュートのトグル
+    pub fn toggle_mute(&mut self) {
+        self.muted = !self.muted;
+        unsafe {
+            let effective = if self.muted { 0.0 } else { self.volume };
+            let _: () = msg_send_void_f32(self.player, sel("setVolume:"), effective);
+        }
+    }
+
+    /// ループ再生のトグル
+    pub fn toggle_loop(&mut self) {
+        self.looping = !self.looping;
+    }
+
     /// 現在のフレームをキャプチャして current_bgra に格納する。
     /// 再生中は定期的に呼ぶ（タイマー駆動）
     pub fn grab_frame(&mut self) -> bool {
@@ -353,6 +385,16 @@ impl VideoPlayer {
 
             CVPixelBufferUnlockBaseAddress(pixel_buffer, K_CV_PIXEL_BUFFER_LOCK_READ_ONLY);
             CFRelease(pixel_buffer);
+
+            // ループ再生: 末尾到達で先頭に戻る
+            if self.looping
+                && self.state == PlaybackState::Playing
+                && self.duration > 0.0
+                && self.current_time >= self.duration - 0.1
+            {
+                self.seek(0.0);
+                self.play();
+            }
 
             true
         }
@@ -569,6 +611,9 @@ pub struct VideoPlayer {
     pub current_time: f64,
     pub frame_gen: u64,
     pub rate: f32,
+    pub volume: f32,
+    pub muted: bool,
+    pub looping: bool,
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -582,6 +627,9 @@ impl VideoPlayer {
     pub fn set_rate(&mut self, _rate: f32) {}
     pub fn seek(&mut self, _seconds: f64) {}
     pub fn seek_relative(&mut self, _delta: f64) {}
+    pub fn set_volume(&mut self, _vol: f32) {}
+    pub fn toggle_mute(&mut self) {}
+    pub fn toggle_loop(&mut self) {}
     pub fn grab_frame(&mut self) -> bool {
         false
     }

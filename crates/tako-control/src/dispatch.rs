@@ -1525,6 +1525,19 @@ fn dispatch_inner(
             Ok(json!({ "pane": target.as_u64(), "seconds": actual }))
         }
 
+        Request::VideoVolume { pane, volume } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            if host.preview_state(target).map(|(_, m)| m) != Some(PreviewModeWire::Video) {
+                return Err(DispatchError::Operation(
+                    "対象ペインは動画プレビューではない".into(),
+                ));
+            }
+            let actual = host
+                .video_volume(target, volume)
+                .map_err(DispatchError::Operation)?;
+            Ok(json!({ "pane": target.as_u64(), "volume": actual }))
+        }
+
         Request::OrchestratorProjects {
             action,
             key,
