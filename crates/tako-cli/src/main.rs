@@ -732,6 +732,28 @@ enum VideoCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
+    /// ミュートのトグル
+    Mute {
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// ミュート解除
+    Unmute {
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// ループ再生のトグル
+    Loop {
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// 音量の設定（0.0〜1.0）
+    Volume {
+        /// 音量（0.0〜1.0）
+        volume: f64,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2781,6 +2803,22 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Video(VideoCommand::Seek { seconds, pane }) => Request::VideoSeek {
             pane: target_pane(*pane)?,
             seconds: *seconds,
+        },
+        Command::Video(VideoCommand::Mute { pane }) => Request::VideoPlayback {
+            pane: target_pane(*pane)?,
+            action: "toggle_mute".into(),
+        },
+        Command::Video(VideoCommand::Unmute { pane }) => Request::VideoPlayback {
+            pane: target_pane(*pane)?,
+            action: "unmute".into(),
+        },
+        Command::Video(VideoCommand::Loop { pane }) => Request::VideoPlayback {
+            pane: target_pane(*pane)?,
+            action: "toggle_loop".into(),
+        },
+        Command::Video(VideoCommand::Volume { volume, pane }) => Request::VideoVolume {
+            pane: target_pane(*pane)?,
+            volume: *volume,
         },
         Command::Orchestrator(OrchestratorCommand::Spawn {
             project,

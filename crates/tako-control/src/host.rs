@@ -254,13 +254,18 @@ pub trait PreviewHost {
     fn preview_pane_of_tab(&self, _tab: TabId) -> Option<PaneId> {
         None
     }
-    /// 動画プレイヤーの操作（"play" / "pause" / "toggle"）。プレビューペインが Video
-    /// モードの場合のみ有効。戻り値は現在の state（"playing" / "paused"）
+    /// 動画プレイヤーの操作（"play" / "pause" / "toggle" / "mute" / "unmute" /
+    /// "toggle_mute" / "loop_on" / "loop_off" / "toggle_loop"）。
+    /// 戻り値は現在の state（"playing" / "paused"）
     fn video_playback(&mut self, _pane: PaneId, _action: &str) -> Result<String, String> {
         Err("動画再生は未対応".into())
     }
     /// 動画のシーク（秒）。戻り値は実際のシーク先の秒数
     fn video_seek(&mut self, _pane: PaneId, _seconds: f64) -> Result<f64, String> {
+        Err("動画再生は未対応".into())
+    }
+    /// 動画の音量設定（0.0〜1.0）。戻り値は設定後の音量
+    fn video_volume(&mut self, _pane: PaneId, _volume: f64) -> Result<f64, String> {
         Err("動画再生は未対応".into())
     }
 }

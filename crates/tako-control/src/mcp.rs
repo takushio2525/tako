@@ -387,16 +387,17 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_video_playback",
-            "description": "動画プレビューペインの再生/一時停止/再生速度を操作する。\
+            "description": "動画プレビューペインの再生/一時停止/音量/ループを操作する。\
                 対象ペインが動画プレビュー（tako open で .mp4/.mov 等を開いた状態）の場合のみ有効。\
-                action に play / pause / toggle / rate:N（N は 0.1〜4.0 の速度倍率、例: rate:2.0）を指定する。",
+                action: play / pause / toggle / rate:N（N は 0.1〜4.0 の速度倍率、例: rate:2.0）/ \
+                mute / unmute / toggle_mute / loop_on / loop_off / toggle_loop。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane": pane_schema("対象ペイン ID（省略時は呼び出し元）"),
                     "action": {
                         "type": "string",
-                        "description": "再生操作（play=再生、pause=一時停止、toggle=切替、rate:N=速度変更）",
+                        "description": "再生操作（play / pause / toggle / rate:N / mute / unmute / toggle_mute / loop_on / loop_off / toggle_loop）",
                     },
                 },
                 "required": ["action"],
@@ -414,6 +415,20 @@ pub fn tools() -> Vec<Value> {
                     "seconds": { "type": "number", "minimum": 0, "description": "シーク先の秒数（絶対位置）" },
                 },
                 "required": ["seconds"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_video_volume",
+            "description": "動画プレビューペインの音量を設定する（0.0〜1.0）。\
+                対象ペインが動画プレビューの場合のみ有効。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン ID（省略時は呼び出し元）"),
+                    "volume": { "type": "number", "minimum": 0, "maximum": 1, "description": "音量（0.0〜1.0）" },
+                },
+                "required": ["volume"],
                 "additionalProperties": false,
             },
         }),
@@ -2113,6 +2128,10 @@ fn build_request(
             pane: Some(target_pane(args, caller)?),
             seconds: f64_arg(args, "seconds")?.ok_or("seconds を指定する")?,
         },
+        "tako_video_volume" => Request::VideoVolume {
+            pane: Some(target_pane(args, caller)?),
+            volume: f64_arg(args, "volume")?.ok_or("volume を指定する")?,
+        },
         "tako_orchestrator_projects" => Request::OrchestratorProjects {
             action: str_arg(args, "action")?.unwrap_or_else(|| "list".into()),
             key: str_arg(args, "key")?,
@@ -2813,7 +2832,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 72);
+        assert_eq!(tools.len(), 73);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
@@ -3078,6 +3097,53 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("seconds"));
+    }
+
+    #[test]
+    fn video_volumeはvolume必須でペインへフォールバックする() {
+        let (_, requests) = run(
+            call("tako_video_volume", json!({ "volume": 0.5 })),
+            Some(3),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::VideoVolume {
+                pane: Some(3),
+                volume: 0.5,
+            }]
+        );
+        let (response, requests) = run(call("tako_video_volume", json!({})), Some(3), true);
+        assert!(requests.is_empty());
+        assert!(response.unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("volume"));
+    }
+
+    #[test]
+    fn video_playbackのmute_loop操作がパースできる() {
+        for action in &[
+            "mute",
+            "unmute",
+            "toggle_mute",
+            "loop_on",
+            "loop_off",
+            "toggle_loop",
+        ] {
+            let (_, requests) = run(
+                call("tako_video_playback", json!({ "action": action })),
+                Some(3),
+                true,
+            );
+            assert_eq!(
+                requests,
+                vec![Request::VideoPlayback {
+                    pane: Some(3),
+                    action: action.to_string(),
+                }]
+            );
+        }
     }
 
     #[test]

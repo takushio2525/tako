@@ -900,8 +900,34 @@ impl TakoApp {
                     };
                     let seek_dur = duration;
 
-                    // シークバー（クリック + ドラッグ対応 + つまみノブ）
-                    let seek_bar = div()
+                    let is_muted = player.muted;
+                    let is_looping = player.looping;
+
+                    // ホバー時刻ツールチップ
+                    let hover_tooltip = self
+                        .video_seek_hover
+                        .filter(|&(pid, _, _)| pid == pane_id)
+                        .map(|(_, hover_sec, hover_x)| {
+                            let hm = hover_sec as u64 / 60;
+                            let hs = hover_sec as u64 % 60;
+                            let label: SharedString = format!("{hm}:{hs:02}").into();
+                            div()
+                                .absolute()
+                                .bottom(px(16.0))
+                                .left(px(hover_x - 20.0))
+                                .px(px(4.0))
+                                .py(px(1.0))
+                                .rounded(px(3.0))
+                                .bg(hsla_alpha(theme.background, 0.95))
+                                .border_1()
+                                .border_color(hsla_alpha(theme.foreground, 0.3))
+                                .text_size(px(11.0))
+                                .text_color(hsla(theme.foreground))
+                                .child(label)
+                        });
+
+                    // シークバー（クリック + ドラッグ対応 + つまみノブ + ホバー時刻）
+                    let mut seek_bar = div()
                         .id(("video-seek", pane_id.as_u64()))
                         .relative()
                         .flex_1()
@@ -970,7 +996,32 @@ impl TakoApp {
                             if this.video_seek_dragging == Some(pane_id) {
                                 this.video_seek_by_drag(pane_id, ev.position, cx);
                             }
-                        }));
+                            // ホバー時刻を計算
+                            if let Some(bounds) = this.video_seek_bar_bounds.get(&pane_id).copied()
+                            {
+                                let bar_x = f32::from(bounds.origin.x);
+                                let bar_w = f32::from(bounds.size.width);
+                                let mouse_x = f32::from(ev.position.x);
+                                if bar_w > 0.0 {
+                                    let frac = ((mouse_x - bar_x) / bar_w).clamp(0.0, 1.0);
+                                    let hover_sec = frac as f64 * seek_dur;
+                                    let rel_x = mouse_x - bar_x;
+                                    this.video_seek_hover = Some((pane_id, hover_sec, rel_x));
+                                    cx.notify();
+                                }
+                            }
+                        }))
+                        .on_mouse_up_out(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, _, _, _| {
+                                if this.video_seek_dragging == Some(pane_id) {
+                                    this.video_seek_dragging = None;
+                                }
+                            }),
+                        );
+                    if let Some(tooltip) = hover_tooltip {
+                        seek_bar = seek_bar.child(tooltip);
+                    }
 
                     // 再生速度ボタン
                     let rates: &[(f32, &str)] =
@@ -1011,7 +1062,51 @@ impl TakoApp {
                                     .into_any_element()
                             }));
 
-                    // コントロールバー: 再生/一時停止 + シークバー + 時間 + 速度
+                    // ミュートボタン
+                    let mute_label: SharedString = if is_muted {
+                        "\u{1f507}".into() // 🔇
+                    } else {
+                        "\u{1f50a}".into() // 🔊
+                    };
+                    let mute_btn = div()
+                        .id(("video-mute", pane_id.as_u64()))
+                        .cursor_pointer()
+                        .text_size(px(14.0))
+                        .px(px(2.0))
+                        .rounded(px(3.0))
+                        .hover(|s| s.bg(hsla_alpha(theme.foreground, 0.1)))
+                        .child(mute_label)
+                        .on_click(cx.listener(move |this, _ev: &gpui::ClickEvent, _, cx| {
+                            if let Some(p) = this.video_players.get_mut(&pane_id) {
+                                p.toggle_mute();
+                                cx.notify();
+                            }
+                        }));
+
+                    // ループトグルボタン
+                    let loop_btn = div()
+                        .id(("video-loop", pane_id.as_u64()))
+                        .cursor_pointer()
+                        .text_size(px(11.0))
+                        .px(px(4.0))
+                        .py(px(1.0))
+                        .rounded(px(3.0))
+                        .when(is_looping, |d| {
+                            d.bg(hsla(theme.ansi[4])).text_color(hsla(theme.background))
+                        })
+                        .when(!is_looping, |d| {
+                            d.text_color(hsla_alpha(theme.foreground, 0.6))
+                                .hover(|s| s.bg(hsla_alpha(theme.foreground, 0.1)))
+                        })
+                        .child(SharedString::from("\u{1f501}")) // 🔁
+                        .on_click(cx.listener(move |this, _ev: &gpui::ClickEvent, _, cx| {
+                            if let Some(p) = this.video_players.get_mut(&pane_id) {
+                                p.toggle_loop();
+                                cx.notify();
+                            }
+                        }));
+
+                    // コントロールバー: 再生/一時停止 + シークバー + 時間 + 速度 + ミュート + ループ
                     elements.push(
                         div()
                             .flex()
@@ -1044,6 +1139,8 @@ impl TakoApp {
                                     .child(time_label),
                             )
                             .child(speed_buttons)
+                            .child(mute_btn)
+                            .child(loop_btn)
                             .into_any_element(),
                     );
                 } else {
