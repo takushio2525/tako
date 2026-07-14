@@ -55,6 +55,105 @@ fn pdf_selection_highlight_bounds(
     result
 }
 
+/// PDF の描画済み文字矩形を UTF-8 byte 座標へ逆写像する。
+///
+/// 行間・ページ余白では `None` を返す。従来はどの行にも当たらない座標を文書末尾へ
+/// フォールバックしていたため、行間からのドラッグが「先頭から末尾まで」の全選択に
+/// 化けていた。ドラッグ中の行間では直前の head を維持し、選択開始時の行間では選択を
+/// 開始しない。
+pub(super) fn pdf_text_hit_test(
+    line_bounds: &[Bounds<Pixels>],
+    char_bounds: &[Vec<Bounds<Pixels>>],
+    texts: &[String],
+    position: Point<Pixels>,
+) -> Option<(usize, usize)> {
+    for (line_idx, bounds) in line_bounds.iter().enumerate() {
+        if position.y < bounds.top() || position.y >= bounds.bottom() {
+            continue;
+        }
+        let line_text = texts.get(line_idx).map(String::as_str).unwrap_or("");
+        let chars = char_bounds.get(line_idx).map(Vec::as_slice).unwrap_or(&[]);
+        if chars.is_empty() {
+            return (!line_text.is_empty()).then_some((line_idx, 0));
+        }
+        let byte_offsets: Vec<usize> = line_text
+            .char_indices()
+            .map(|(byte, _)| byte)
+            .chain(std::iter::once(line_text.len()))
+            .collect();
+        for (char_idx, char_bounds) in chars.iter().enumerate() {
+            let midpoint = char_bounds.left() + (char_bounds.right() - char_bounds.left()) * 0.5;
+            if position.x < midpoint {
+                return Some((line_idx, byte_offsets.get(char_idx).copied().unwrap_or(0)));
+            }
+        }
+        return Some((line_idx, line_text.len()));
+    }
+    None
+}
+
+#[cfg(test)]
+mod pdf_hit_test_tests {
+    use super::*;
+
+    fn bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
+        Bounds {
+            origin: point(px(x), px(y)),
+            size: gpui::size(px(width), px(height)),
+        }
+    }
+
+    #[test]
+    fn pdf行間と余白は文字へ解決しない() {
+        let lines = vec![
+            bounds(10.0, 10.0, 80.0, 10.0),
+            bounds(10.0, 30.0, 80.0, 10.0),
+        ];
+        let chars = vec![
+            vec![bounds(10.0, 10.0, 10.0, 10.0)],
+            vec![bounds(10.0, 30.0, 10.0, 10.0)],
+        ];
+        let texts = vec!["A".to_string(), "B".to_string()];
+
+        assert_eq!(
+            pdf_text_hit_test(&lines, &chars, &texts, point(px(15.0), px(25.0))),
+            None
+        );
+        assert_eq!(
+            pdf_text_hit_test(&lines, &chars, &texts, point(px(15.0), px(5.0))),
+            None
+        );
+        assert_eq!(
+            pdf_text_hit_test(&lines, &chars, &texts, point(px(15.0), px(45.0))),
+            None
+        );
+    }
+
+    #[test]
+    fn pdf文字矩形はutf8バイト位置へ解決する() {
+        let lines = vec![bounds(10.0, 10.0, 60.0, 12.0)];
+        let chars = vec![vec![
+            bounds(10.0, 10.0, 20.0, 12.0),
+            bounds(30.0, 10.0, 20.0, 12.0),
+            bounds(50.0, 10.0, 20.0, 12.0),
+        ]];
+        let texts = vec!["A日B".to_string()];
+
+        assert_eq!(
+            pdf_text_hit_test(&lines, &chars, &texts, point(px(12.0), px(15.0))),
+            Some((0, 0))
+        );
+        assert_eq!(
+            pdf_text_hit_test(&lines, &chars, &texts, point(px(32.0), px(15.0))),
+            Some((0, 1))
+        );
+        assert_eq!(
+            pdf_text_hit_test(&lines, &chars, &texts, point(px(68.0), px(15.0))),
+            Some((0, 5))
+        );
+    }
+}
+
 impl TakoApp {
     fn preview_label(&self, target: PreviewTarget) -> String {
         match target {

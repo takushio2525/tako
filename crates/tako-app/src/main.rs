@@ -4835,29 +4835,7 @@ impl TakoApp {
             self.preview_line_bounds.get(&pane_id),
             self.preview_pdf_char_bounds.get(&pane_id),
         ) {
-            for (i, b) in line_bounds.iter().enumerate() {
-                if position.y < b.top() || position.y >= b.bottom() {
-                    continue;
-                }
-                let line_text = texts.get(i).map(|t| t.as_str()).unwrap_or("");
-                let char_bounds = char_bounds.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
-                if char_bounds.is_empty() {
-                    return Some((i, 0));
-                }
-                let byte_offsets: Vec<usize> = line_text
-                    .char_indices()
-                    .map(|(byte, _)| byte)
-                    .chain(std::iter::once(line_text.len()))
-                    .collect();
-                for (j, ch_bounds) in char_bounds.iter().enumerate() {
-                    let mid = ch_bounds.left() + (ch_bounds.right() - ch_bounds.left()) * 0.5;
-                    if position.x < mid {
-                        return Some((i, byte_offsets.get(j).copied().unwrap_or(0)));
-                    }
-                }
-                return Some((i, line_text.len()));
-            }
-            return texts.last().map(|last| (texts.len() - 1, last.len()));
+            return preview_render::pdf_text_hit_test(line_bounds, char_bounds, texts, position);
         }
         texts.last().map(|last| (texts.len() - 1, last.len()))
     }

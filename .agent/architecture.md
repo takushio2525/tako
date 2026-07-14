@@ -599,6 +599,9 @@ client_tty = backend セッションの pane_tty）ため、backend を先に見
   通って実マウス座標と描画は外れる。文字矩形収集と選択描画を分離し、選択はペイン最終子の専用
   `paint_layer` で PDF の polychrome sprite より前面へ合成する。`visual-test` feature の Metal
   RGBA 読み戻しで PDF 選択と C++ / Python の読み取り・編集を対象矩形の実ピクセル差分まで検証する
+- **PDF 選択の行間（#231）**: PDF の文字ヒットテストは行矩形内だけを有効とし、行間・
+  ページ余白を文書末尾へクランプしない。選択開始時は操作を開始せず、ドラッグ中は直前の
+  head を維持することで、行間から全テキスト選択へ化けることを防ぐ
 - **syntect の行入力（#152）**: `SyntaxSet::load_defaults_newlines()` へ `str::lines()` の
   改行除去済み文字列を渡さない。`LinesWithEndings` で状態遷移に必要な改行を維持し、UI の行要素へ
   変換するときだけ末尾改行を除く。パス解決は読み取り / 編集で単一の `syntax_for_path` を使う
