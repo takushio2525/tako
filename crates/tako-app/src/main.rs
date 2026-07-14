@@ -16552,7 +16552,7 @@ mod self_test {
             .await
             .unwrap_or_else(|| fail("連続 write の最終内容が 3 秒以内に反映"));
             let final_delay = final_write_at.elapsed();
-            // 遲延イベントが二重適用を起こさないことも観測する。
+            // 遅延イベントが二重適用を起こさないことも観測する。
             wait(cx, 450).await;
             let (mode_after, scroll_after, apply_after) = window
                 .update(cx, |app, _, _| {
