@@ -4,25 +4,26 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-14・#217 UI 大刷新: Claude Design カンプの忠実再現）
+## 現在の対象（2026-07-14・#226 setup のマルチエージェント対応）
 
-**#217 実装完了**（worktree tako-wt-217 / feat/217-ui-redesign。PR 準備中）:
+**実装・検証完了、PR マージ待ち**（worktree tako-wt-226 / feat/226-setup-multiagent）:
 
-- カンプ: `design/claude-design/tako-ui/project/tako Desktop 改善版.dc.html`（コミット済み）が正
-- M1〜M7 全マイルストーン完了: テーマ基盤（ライト/ダーク + `tako theme` + MCP `tako_theme`、
-  Catppuccin Mocha=カンプ実値 / Latte=ライト）→ ピル型タブバー（⌘K エントリ・ベル・テーマボタン、
-  タイトルバー統合）→ ペインヘッダ（番号バッジ・workers ▾・↳ 親リンク・cwd チップ・再実行）→
-  サイドバー（ブランチチップ・パスコピー・git サマリ）→ ステータスバー（breadcrumb・
-  5h/週リミットメーター・ctx 改良）→ orch ビュー + トースト + ⌘K パレット → 絵文字全廃（grep 0 件）
-- UI アイコンは `assets/icons/ui/*.svg`（カンプの SVG パスを忠実に写経、gpui::svg() マスク描画）
-- origin/main rebase 済み（#220 sleep-guard 蓋閉じと status_bar でコンフリクト → 解決済み）
+- claude / codex / agy のインストール・認証・取得可能なプランを検出し、単一 CLI は自動選択、
+  複数 CLI は対話選択する setup フローを実装
+- 自動取得できない Claude / GPT / Google プランは対話フォールバックし、規模に応じて
+  master_agent / worker_agents / effort / worker_model_policy を推奨生成
+- setup-context、`--check` / `--changes`、system prompt、changes revision 8、ドキュメントを同期
+- Issue #226 に実地調査結果をコメント済み。認証情報は読み取りのみで、保存・ログ出力なし
+- 隔離 HOME / PATH で「claude のみ」「3 CLI から codex 選択」を実測。build / fmt / clippy /
+  workspace test / docs build / setup 検証スクリプトは全緑
 
 ## 次の一手
 
-- PR（Closes #217）→ squash merge → 本体リポで `build-app.sh --install` →
-  Issue に実測証拠 + ユーザー目視チェックリスト
+- コミット → origin/main rebase → push → PR（Closes #226）→ CI 確認 → squash merge
+- Issue #226 に実測証拠付き完了コメント。アプリ install は master 側で実施
 
 ## 現フェーズで Read すべき設計書
 
-- カンプの実値確認: `design/claude-design/tako-ui/project/tako Desktop 改善版.dc.html`
-- テーマトークン対応: `crates/tako-core/src/theme.rs`（カンプ色 → トークンのコメント付き）
+- setup 要件: `.agent/requirements.md`（FR-2.14）
+- setup 実装: `crates/tako-cli/src/setup.rs`、`crates/tako-control/src/setup.rs`
+- setup 追従資材: `resources/setup/changes.yaml`、`resources/setup/system-prompt.md`

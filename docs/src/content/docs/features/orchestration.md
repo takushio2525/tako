@@ -90,7 +90,7 @@ tako solo            # そのまま起動
 tako solo -fast      # プロファイルを指定して起動
 ```
 
-master と同じく `projects.yaml` を把握しているので、`cd` で移動しなくても「demo の README を直して」のようにプロジェクト名で話しかけられます。トークン消費を抑えたエコ設計（既定の思考量は master より控えめ）なので、Claude Pro プランでも気軽に使えます。**「まず 1 つのことを AI に任せたい」なら solo、「複数を並行で回したい」なら master**、と覚えておけば十分です。
+master と同じく `projects.yaml` を把握しているので、`cd` で移動しなくても「demo の README を直して」のようにプロジェクト名で話しかけられます。トークン消費を抑えたエコ設計（既定の思考量は master より控えめ）です。**「まず 1 つのことを AI に任せたい」なら solo、「複数を並行で回したい」なら master**、と覚えておけば十分です。
 
 ## 3 分で始める
 
@@ -102,7 +102,7 @@ tako setup
 tako master
 ```
 
-新しいタブに master の claude が立ち上がります。あとは話しかけるだけです。
+新しいタブに profile で選ばれた master（claude または codex）が立ち上がります。あとは話しかけるだけです。
 
 > 「`~/Documents/webapp` のリポジトリを管理対象に追加して、README を最新のコマンド体系に合わせて書き直して」
 

@@ -739,3 +739,7 @@
 - 検証: build / fmt / clippy(-D warnings) / test 全緑（988 tests）+ 隔離セルフテスト完走
   （33b テーマ MCP e2e・75 パレット新設）+ 隔離実機スクショでカンプ突き合わせ
 - 次: PR（Closes #217）→ squash merge → install → Issue に証拠 + 目視チェックリスト
+
+## 2026-07-14（#226: setup の claude / codex / agy 対応 + プラン別推奨）
+- 3 CLI の検出・認証・プラン取得と対話フォールバック、単一自動選択 / 複数選択、プラン規模別 profile 推奨を実装。changes revision 8 と docs を同期
+- 隔離 HOME / PATH で claude 単独・3 CLI から codex 選択を実測し、build / fmt / clippy / workspace test / docs build を全緑確認
