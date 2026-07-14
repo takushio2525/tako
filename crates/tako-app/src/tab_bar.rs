@@ -11,8 +11,8 @@
 use std::time::Duration;
 
 use gpui::{
-    div, point, prelude::*, px, svg, Animation, AnimationExt, BoxShadow, Context, FontWeight,
-    SharedString, WindowControlArea,
+    div, point, prelude::*, px, svg, Animation, AnimationExt, BoxShadow, Context, DragMoveEvent,
+    FontWeight, SharedString, WindowControlArea,
 };
 use tako_core::{CommandState, TitleSource};
 
@@ -113,6 +113,8 @@ impl TakoApp {
         };
 
         let label_max = self.tab_label_max_chars(tabs.len(), window);
+        let tab_drop = self.tab_drop_target;
+        let is_pane_dragging = self.drag_kind == Some(DragKind::Pane);
 
         div()
             .flex()
@@ -144,6 +146,14 @@ impl TakoApp {
                     .min_w(px(0.0))
                     .overflow_x_scroll()
                     .track_scroll(&self.tab_scroll_handle)
+                    .on_drag_move::<PaneDrag>(cx.listener(
+                        |this, _: &DragMoveEvent<PaneDrag>, _, cx| {
+                            this.set_tab_drop_target(None, cx);
+                        },
+                    ))
+                    .on_drop::<PaneDrag>(cx.listener(|this, drag: &PaneDrag, _, cx| {
+                        this.drop_pane_on_tab(drag.pane, None, cx);
+                    }))
                     .children(
                         tabs.into_iter()
                             .map(|(id, label, agg, pane_states, fails)| {
@@ -211,6 +221,11 @@ impl TakoApp {
                                     .when(!is_active, |d| {
                                         d.hover(|d| d.bg(rgba(theme.surface_hover)))
                                     })
+                                    .when(is_pane_dragging && tab_drop == Some(Some(id)), |d| {
+                                        d.bg(rgba_alpha(theme.accent, 0.15))
+                                            .border_2()
+                                            .border_color(hsla(theme.accent))
+                                    })
                                     .text_color(if is_active {
                                         hsla(theme.tab_active_foreground)
                                     } else if fails > 0 {
@@ -232,6 +247,16 @@ impl TakoApp {
                                             cx,
                                         ),
                                     )
+                                    .on_drag_move::<PaneDrag>(cx.listener(
+                                        move |this, _: &DragMoveEvent<PaneDrag>, _, cx| {
+                                            this.set_tab_drop_target(Some(id), cx);
+                                        },
+                                    ))
+                                    .on_drop::<PaneDrag>(cx.listener(
+                                        move |this, drag: &PaneDrag, _, cx| {
+                                            this.drop_pane_on_tab(drag.pane, Some(id), cx);
+                                        },
+                                    ))
                                     .child(dot)
                                     .child(
                                         div()
@@ -347,6 +372,19 @@ impl TakoApp {
                             .cursor_pointer()
                             .hover(|d| d.bg(rgba(theme.surface_hover)))
                             .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
+                            .on_drag_move::<PaneDrag>(cx.listener(
+                                |this, _: &DragMoveEvent<PaneDrag>, _, cx| {
+                                    this.set_tab_drop_target(None, cx);
+                                },
+                            ))
+                            .on_drop::<PaneDrag>(cx.listener(|this, drag: &PaneDrag, _, cx| {
+                                this.drop_pane_on_tab(drag.pane, None, cx);
+                            }))
+                            .when(self.tab_drop_target == Some(None), |d| {
+                                d.bg(rgba_alpha(theme.accent, 0.2))
+                                    .border_2()
+                                    .border_color(hsla(theme.accent))
+                            })
                             .child(
                                 svg()
                                     .path(ui_icon::PLUS)

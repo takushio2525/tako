@@ -677,6 +677,8 @@ struct TakoApp {
     drag_kind: Option<DragKind>,
     /// ドラッグ中のドロップ先（ペイン, 挿入位置）。挿入プレビュー表示の状態
     drop_target: Option<(PaneId, DropZone)>,
+    /// タブバーへのペイン D&D: ドロップ先タブ（Some(id) = 既存タブへ合流、None = 新タブ化）
+    tab_drop_target: Option<Option<TabId>>,
     /// git パネルのデータ（FR-3.6。cwd 連動で 2 秒ポーリング更新）
     git_data: Option<GitPanelData>,
     /// サイドバー用の軽量 git サマリ（#217。ブランチチップ + 変更フッター）
@@ -1588,6 +1590,7 @@ impl TakoApp {
             window_frame: None,
             drag_kind: None,
             drop_target: None,
+            tab_drop_target: None,
             git_data: None,
             sidebar_git: None,
             git_selected_commit: None,
@@ -5799,6 +5802,7 @@ impl TakoApp {
     /// ドロップ確定の共通処理: ドラッグ状態を畳み、対象ペインで確定した挿入位置を返す
     fn take_drop_zone(&mut self, pane_id: PaneId) -> Option<DropZone> {
         self.drag_kind = None;
+        self.tab_drop_target = None;
         self.drop_target
             .take()
             .filter(|(p, _)| *p == pane_id)
@@ -5866,6 +5870,61 @@ impl TakoApp {
         if let Err(e) = result {
             eprintln!("warning: ペインを移動できない: {e}");
         }
+        cx.notify();
+    }
+
+    /// タブバーへのペイン D&D のドロップ先フィードバック更新（Issue #209）。
+    /// `dest`: Some(tab_id) = 既存タブへ合流、None = 新タブ化（+ ボタン / 余白）
+    pub(crate) fn set_tab_drop_target(&mut self, dest: Option<TabId>, cx: &mut Context<Self>) {
+        let new = Some(dest);
+        if self.tab_drop_target != new {
+            self.tab_drop_target = new;
+            cx.notify();
+        }
+    }
+
+    /// タブバーへペインをドロップ（Issue #209）。
+    /// `dest`: Some(tab_id) = 既存タブへ合流、None = 新タブ化
+    pub(crate) fn drop_pane_on_tab(
+        &mut self,
+        pane: PaneId,
+        dest: Option<TabId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.drag_kind = None;
+        self.tab_drop_target = None;
+        let result = match dest {
+            Some(tab_id) => {
+                if self.workspace.find_tab_of_pane(pane) == Some(tab_id) {
+                    cx.notify();
+                    return;
+                }
+                tako_control::dispatch(
+                    self,
+                    tako_control::protocol::Request::MovePane {
+                        pane: Some(pane.as_u64()),
+                        tab: Some(tab_id.as_u64()),
+                        target: None,
+                        direction: None,
+                    },
+                    PaneOrigin::User,
+                )
+            }
+            None => tako_control::dispatch(
+                self,
+                tako_control::protocol::Request::MovePane {
+                    pane: Some(pane.as_u64()),
+                    tab: None,
+                    target: None,
+                    direction: None,
+                },
+                PaneOrigin::User,
+            ),
+        };
+        if let Err(e) = result {
+            eprintln!("warning: ペインをタブへ移動できない: {e}");
+        }
+        self.scroll_active_tab_into_view();
         cx.notify();
     }
 
@@ -6469,7 +6528,10 @@ impl TakoApp {
     fn on_mouse_up(&mut self, _: &MouseUpEvent, cx: &mut Context<Self>) {
         // D&D の後始末（ドロップ成立時は on_drop が stop_propagation 込みで先に畳む。
         // ここはドロップ先以外で離した場合のクリア）
-        if self.drag_kind.take().is_some() | self.drop_target.take().is_some() {
+        if self.drag_kind.take().is_some()
+            | self.drop_target.take().is_some()
+            | self.tab_drop_target.take().is_some()
+        {
             cx.notify();
             return;
         }

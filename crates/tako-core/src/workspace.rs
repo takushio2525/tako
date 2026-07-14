@@ -229,6 +229,33 @@ impl Workspace {
         Ok(())
     }
 
+    /// ペインを新しいタブとして分離する（Issue #209。タブバーへのペイン D&D）。
+    /// 移動元タブが空になる場合はタブごと閉じる。最後のタブの最後のペインの場合は
+    /// 分離先がないため LastTab を返す
+    pub fn move_pane_to_new_tab(&mut self, pane: PaneId) -> Result<TabId, WorkspaceError> {
+        let src = self
+            .find_tab_of_pane(pane)
+            .ok_or(WorkspaceError::PaneNotFound(pane))?;
+        let src_tree = self
+            .get_tab_mut(src)
+            .expect("find_tab_of_pane で存在確認済み")
+            .tree_mut();
+        let moved = match src_tree.close(pane) {
+            Ok(pane) => pane,
+            Err(PaneTreeError::LastPane) => {
+                if self.tabs.len() == 1 {
+                    return Err(WorkspaceError::LastTab);
+                }
+                let tab = self.close_tab(src).expect("タブは 2 つ以上存在する");
+                let mut panes = tab.into_tree().into_panes();
+                panes.pop().expect("タブは常に 1 ペイン以上を持つ")
+            }
+            Err(e) => unreachable!("move_pane_to_new_tab の close で想定外のエラー: {e}"),
+        };
+        let new_tab = self.create_tab("", moved);
+        Ok(new_tab)
+    }
+
     /// ペインを別ペインの隣へ移動する（FR-1.10。タイトルバー D&D 移動の同等操作）。
     /// `target` を `direction` 側へ分割した位置に `pane` を挿し直す。
     /// 同タブ内の並べ替えとタブをまたぐ移動の両方に使え、移動元タブが空になる場合は
@@ -575,6 +602,49 @@ mod tests {
         assert_eq!(
             ws.move_pane(p1, t1).unwrap_err(),
             WorkspaceError::AlreadyInTab(p1, t1)
+        );
+    }
+
+    #[test]
+    fn ペインを新タブとして分離できる() {
+        let mut ws = Workspace::new("t1", pane());
+        let t1 = ws.active_tab_id();
+        let p1 = ws.active_tab().tree().focused();
+        let p2 = pane();
+        let p2_id = p2.id();
+        ws.active_tab_mut()
+            .tree_mut()
+            .split(p1, SplitDirection::Right, p2)
+            .unwrap();
+        assert_eq!(ws.get_tab(t1).unwrap().tree().len(), 2);
+        let new_tab = ws.move_pane_to_new_tab(p2_id).unwrap();
+        assert_ne!(new_tab, t1);
+        assert_eq!(ws.find_tab_of_pane(p2_id), Some(new_tab));
+        assert_eq!(ws.get_tab(t1).unwrap().tree().len(), 1);
+        assert_eq!(ws.get_tab(new_tab).unwrap().tree().len(), 1);
+        assert_eq!(ws.active_tab_id(), new_tab);
+        assert_eq!(ws.tabs().len(), 2);
+    }
+
+    #[test]
+    fn 最後のペインの新タブ化はタブごと移動() {
+        let mut ws = Workspace::new("t1", pane());
+        let t1 = ws.active_tab_id();
+        let p1 = ws.active_tab().tree().focused();
+        let _t2 = ws.create_tab("t2", pane());
+        let new_tab = ws.move_pane_to_new_tab(p1).unwrap();
+        assert!(ws.get_tab(t1).is_none());
+        assert_eq!(ws.find_tab_of_pane(p1), Some(new_tab));
+        assert_eq!(ws.tabs().len(), 2);
+    }
+
+    #[test]
+    fn 唯一タブの唯一ペインの新タブ化はエラー() {
+        let mut ws = Workspace::new("t1", pane());
+        let p1 = ws.active_tab().tree().focused();
+        assert_eq!(
+            ws.move_pane_to_new_tab(p1).unwrap_err(),
+            WorkspaceError::LastTab
         );
     }
 

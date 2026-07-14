@@ -913,9 +913,20 @@ fn dispatch_inner(
                         )
                         .map_err(op_err)?;
                 }
-                _ => {
+                // Issue #209: 両方 None → 新タブ化
+                (None, None) => {
+                    if direction.is_some() {
+                        return Err(DispatchError::InvalidParams(
+                            "direction は target 指定時のみ使える".into(),
+                        ));
+                    }
+                    host.workspace_mut()
+                        .move_pane_to_new_tab(source)
+                        .map_err(op_err)?;
+                }
+                (Some(_), Some(_)) => {
                     return Err(DispatchError::InvalidParams(
-                        "tab か target のどちらか一方を指定する".into(),
+                        "tab と target は同時に指定できない".into(),
                     ))
                 }
             }
@@ -4922,7 +4933,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, DispatchError::InvalidParams(_)));
-        let err = dispatch(
+        // tab=None, target=None は新タブ化（Issue #209）
+        let tab_count_before = host.ws.tabs().len();
+        dispatch(
             &mut host,
             Request::MovePane {
                 pane: Some(root),
@@ -4932,8 +4945,13 @@ mod tests {
             },
             PaneOrigin::Cli,
         )
-        .unwrap_err();
-        assert!(matches!(err, DispatchError::InvalidParams(_)));
+        .unwrap();
+        assert_eq!(host.ws.tabs().len(), tab_count_before + 1);
+        assert_eq!(
+            host.ws.find_tab_of_pane(PaneId::from_raw(root)).unwrap(),
+            host.ws.active_tab_id()
+        );
+
         let err = dispatch(
             &mut host,
             Request::MovePane {
