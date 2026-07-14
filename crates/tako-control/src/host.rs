@@ -360,6 +360,11 @@ pub trait SystemHost {
     fn recovered_sessions_count(&self) -> usize {
         0
     }
+    /// orphan 復元で旧 pane ID から新 pane ID を解決する（#210）。
+    /// 既存 claude CLI が旧 TAKO_PANE_ID で MCP を呼んだとき、caller_pane を新 ID に変換する
+    fn resolve_stale_pane(&self, _stale: PaneId) -> Option<PaneId> {
+        None
+    }
     /// バックエンド tmux セッション名の事前予約（Issue #112）。
     /// attach は非同期（pending_attach）のため、dispatch 時点では `backend_session` が
     /// まだ無い。spawn 応答の `tmux_session` とカタログの pending 記録のために、

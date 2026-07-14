@@ -232,6 +232,29 @@ pub fn session_cwd(socket: &str, session: &str) -> Option<String> {
     (!path.is_empty()).then_some(path)
 }
 
+/// セッション環境変数を読む（`tmux show-environment -t <session> <name>`）。
+/// orphan 復元時に `TAKO_ORCHESTRATOR_ROLE` / `TAKO_PANE_ID` を取り出す用途（#210）
+pub fn session_env(socket: &str, session: &str, name: &str) -> Option<String> {
+    let output = crate::tmux::tmux_command(Some(socket))
+        .args(["show-environment", "-t", &format!("={session}"), name])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // "NAME=value" 形式。`-NAME` は unset を意味する
+    line.strip_prefix(&format!("{name}=")).map(str::to_string)
+}
+
+/// セッション環境変数を設定する（`tmux set-environment -t <session> <name> <value>`）。
+/// orphan 復元後に TAKO_PANE_ID を新 pane ID に更新する用途（#210）
+pub fn set_session_env(socket: &str, session: &str, name: &str, value: &str) {
+    let _ = crate::tmux::tmux_command(Some(socket))
+        .args(["set-environment", "-t", &format!("={session}"), name, value])
+        .status();
+}
+
 /// セッションを破棄する（ペインの明示 close 時。tako 終了時は呼ばない = 永続化）。
 /// セッションが既に無い（シェル exit で消えた後）のエラーは無害なので潰す
 pub fn kill_session(socket: &str, session: &str) {
