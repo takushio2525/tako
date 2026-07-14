@@ -4,26 +4,34 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-14・#226 setup のマルチエージェント対応）
+## 現在の対象（2026-07-14・#231 / #234 PDF 品質改善 + PDF・画像ズーム）
 
-**実装・検証完了、PR マージ待ち**（worktree tako-wt-226 / feat/226-setup-multiagent）:
+**3 マイルストーン実装・main 統合後の全体検証済み、push / PR 前**（worktree `tako-wt-231` / `fix/231-234-pdf-quality-zoom`）:
 
-- claude / codex / agy のインストール・認証・取得可能なプランを検出し、単一 CLI は自動選択、
-  複数 CLI は対話選択する setup フローを実装
-- 自動取得できない Claude / GPT / Google プランは対話フォールバックし、規模に応じて
-  master_agent / worker_agents / effort / worker_model_policy を推奨生成
-- setup-context、`--check` / `--changes`、system prompt、changes revision 8、ドキュメントを同期
-- Issue #226 に実地調査結果をコメント済み。認証情報は読み取りのみで、保存・ログ出力なし
-- 隔離 HOME / PATH で「claude のみ」「3 CLI から codex 選択」を実測。build / fmt / clippy /
-  workspace test / docs build / setup 検証スクリプトは全緑
+- #231: PDF 行間・余白のヒットテストを `None` にし、ドラッグ全文選択を防止。UTF-8 座標テスト追加
+- #231: device scale × zoom × 表示幅の `PdfRasterKey`、background 再ラスタライズ、
+  path + raster key の `PreviewImageCache` を実装。Retina 2x 全幅で 1224×1584 → 1920×2485 を実測
+- #234: PDF・画像を 25〜400% ズーム、2 軸パン、現在ページ維持リセット、倍率 SVG 操作、
+  ピンチ / ⌘+/⌘- / ⌘0 / 修飾スクロールへ対応。PDF ページ高さを明示してページ移動を修正
+- core `PreviewViewState` → dispatch `PreviewView` → CLI `tako preview` → MCP
+  `tako_preview_view`（75 ツール）を 1:1 実装。3 ページ目 + 150% の変換テストあり
+- 隔離実機: PDF 100/150%、2 ページ目、パン、リセット、画像 100/200%、行間ドラッグ、
+  150% 選択ハイライトを確認。render p50 1ms / p99 2ms / max 4ms
+- GPUI `PlatformInput::Pinch` の Started → Moved → Ended を実 scroll bounds へ送り、
+  1.500 → 1.650 → 1.485 の増減を隔離 E2E で確認。keyboard modality 直後も
+  capture + ペイン bounds 判定で取りこぼさず、他ペインへ誤配信しない
+- `origin/main`（#21 / #229、`6af2d47`）を競合なしで rebase。統合後も workspace
+  build / fmt --check / clippy -D warnings / test 全緑
+  （app 83・CLI 22・control 362・core 249 passed）。隔離セルフテストは
+  `TAKO_APP_SELF_TEST_OK`、PDF 150% は raster key 150 + hit `(0, 0)`、pinch 増減を実描画で確認
 
 ## 次の一手
 
-- コミット → origin/main rebase → push → PR（Closes #226）→ CI 確認 → squash merge
-- Issue #226 に実測証拠付き完了コメント。アプリ install は master 側で実施
+- push、PR（Closes #231 / #234）、CI 後 squash merge
+- 両 Issue に実測値・安全に切り出したスクショ・目視チェックリストをコメント
 
 ## 現フェーズで Read すべき設計書
 
-- setup 要件: `.agent/requirements.md`（FR-2.14）
-- setup 実装: `crates/tako-cli/src/setup.rs`、`crates/tako-control/src/setup.rs`
-- setup 追従資材: `resources/setup/changes.yaml`、`resources/setup/system-prompt.md`
+- 要件: `.agent/requirements.md`（FR-3.4 / FR-3.10 / FR-3.14、NFR-8）
+- 設計: `.agent/architecture.md`（PDF 選択・ラスタライズ・ズーム、ストール診断）
+- 実機確認: `.agent/manual-checks.md`（PDF 選択描画・ズーム）

@@ -5,7 +5,9 @@
 //! シグネチャ（`&mut dyn ControlHost`）は不変。
 
 use serde_json::Value;
-use tako_core::{PaneId, SpawnOptions, TabId, TerminalSession, Workspace};
+use tako_core::{
+    PaneId, PreviewViewState, PreviewViewUpdate, SpawnOptions, TabId, TerminalSession, Workspace,
+};
 
 /// ピン留め中のプレビュー 1 件分（FR-2.16.15。list / MCP 公開用）。
 /// `group=false` なら `id` はペイン ID、`group=true` なら閉じたタブグループの由来タブ ID
@@ -204,6 +206,18 @@ pub trait PreviewHost {
         _mode: crate::protocol::PreviewModeWire,
     ) -> Result<(), String> {
         Ok(())
+    }
+    /// PDF・画像プレビューの現在のズーム / パン / ページ状態。
+    fn preview_view_state(&self, _pane: PaneId) -> Option<PreviewViewState> {
+        None
+    }
+    /// core の表示更新を適用する。PDF の最大ページ検査と実スクロール反映は実装側の責務。
+    fn update_preview_view(
+        &mut self,
+        _pane: PaneId,
+        _update: PreviewViewUpdate,
+    ) -> Result<PreviewViewState, String> {
+        Err("PDF・画像プレビューのズームは未対応".into())
     }
     /// プレビュー編集状態（editing, dirty）。編集セッション未開始なら (false, false)。
     fn preview_edit_state(&self, _pane: PaneId) -> Option<(bool, bool)> {

@@ -10,8 +10,9 @@
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tako_core::{
-    CommandState, Pane, PaneId, PaneNode, PaneOrigin, PaneTreeError, Rect, SpawnCommand,
-    SpawnOptions, SplitAxis, SplitDirection, TabId, Workspace,
+    CommandState, Pane, PaneId, PaneNode, PaneOrigin, PaneTreeError, PreviewViewUpdate,
+    PreviewZoomCommand, Rect, SpawnCommand, SpawnOptions, SplitAxis, SplitDirection, TabId,
+    Workspace,
 };
 
 use crate::protocol::{error_code, Direction, FileOpKind, PreviewModeWire, Request};
@@ -1123,6 +1124,66 @@ fn dispatch_inner(
                 "path": path_str,
                 "mode": mode.as_str(),
                 "created": created,
+            }))
+        }
+        Request::PreviewView {
+            pane,
+            zoom,
+            zoom_in,
+            zoom_out,
+            reset,
+            page,
+            pan_x,
+            pan_y,
+        } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let controls = usize::from(zoom.is_some())
+                + usize::from(zoom_in)
+                + usize::from(zoom_out)
+                + usize::from(reset);
+            if controls > 1 {
+                return Err(DispatchError::InvalidParams(
+                    "zoom / zoom_in / zoom_out / reset は同時に指定できない".into(),
+                ));
+            }
+            let zoom_command = if let Some(percent) = zoom {
+                Some(PreviewZoomCommand::Set(percent / 100.0))
+            } else if zoom_in {
+                Some(PreviewZoomCommand::In)
+            } else if zoom_out {
+                Some(PreviewZoomCommand::Out)
+            } else if reset {
+                Some(PreviewZoomCommand::Reset)
+            } else {
+                None
+            };
+            let has_update =
+                zoom_command.is_some() || page.is_some() || pan_x.is_some() || pan_y.is_some();
+            let state = if has_update {
+                host.update_preview_view(
+                    target,
+                    PreviewViewUpdate {
+                        zoom: zoom_command,
+                        page,
+                        pan_delta: (pan_x.is_some() || pan_y.is_some())
+                            .then_some((pan_x.unwrap_or(0.0), pan_y.unwrap_or(0.0))),
+                    },
+                )
+                .map_err(DispatchError::Operation)?
+            } else {
+                host.preview_view_state(target).ok_or_else(|| {
+                    DispatchError::Operation(format!(
+                        "PDF・画像プレビューペインではない: {}",
+                        target.as_u64()
+                    ))
+                })?
+            };
+            Ok(json!({
+                "pane": target.as_u64(),
+                "zoom": (state.zoom * 100.0).round(),
+                "page": state.page,
+                "pan_x": state.pan_x,
+                "pan_y": state.pan_y,
             }))
         }
         Request::PreviewEdit { pane, enabled } => {
@@ -4128,6 +4189,7 @@ mod tests {
         attached: Vec<u64>,
         detached: Vec<u64>,
         previews: std::collections::HashMap<u64, (String, PreviewModeWire)>,
+        preview_views: std::collections::HashMap<u64, tako_core::PreviewViewState>,
         preview_edits: std::collections::HashMap<u64, (bool, bool, String)>,
         collapsed: std::collections::HashSet<u64>,
         /// ピン留め: (group, id)
@@ -4145,6 +4207,7 @@ mod tests {
                 attached: Vec::new(),
                 detached: Vec::new(),
                 previews: std::collections::HashMap::new(),
+                preview_views: std::collections::HashMap::new(),
                 preview_edits: std::collections::HashMap::new(),
                 collapsed: std::collections::HashSet::new(),
                 pins: Vec::new(),
@@ -4189,6 +4252,7 @@ mod tests {
         fn detach_session(&mut self, pane: PaneId) {
             self.detached.push(pane.as_u64());
             self.previews.remove(&pane.as_u64());
+            self.preview_views.remove(&pane.as_u64());
             self.preview_edits.remove(&pane.as_u64());
         }
     }
@@ -4251,8 +4315,29 @@ mod tests {
                 return Err("未保存の変更があるため別ファイルを開けない".into());
             }
             self.previews.insert(pane.as_u64(), (path.into(), mode));
+            if matches!(mode, PreviewModeWire::Pdf | PreviewModeWire::Image) {
+                self.preview_views
+                    .insert(pane.as_u64(), tako_core::PreviewViewState::default());
+            } else {
+                self.preview_views.remove(&pane.as_u64());
+            }
             self.preview_edits.remove(&pane.as_u64());
             Ok(())
+        }
+        fn preview_view_state(&self, pane: PaneId) -> Option<tako_core::PreviewViewState> {
+            self.preview_views.get(&pane.as_u64()).copied()
+        }
+        fn update_preview_view(
+            &mut self,
+            pane: PaneId,
+            update: PreviewViewUpdate,
+        ) -> Result<tako_core::PreviewViewState, String> {
+            let state = self
+                .preview_views
+                .get_mut(&pane.as_u64())
+                .ok_or_else(|| "ズーム対象のプレビューペインではない".to_string())?;
+            state.apply(update)?;
+            Ok(*state)
         }
         fn preview_edit_state(&self, pane: PaneId) -> Option<(bool, bool)> {
             self.previews.get(&pane.as_u64())?;
@@ -5294,6 +5379,60 @@ mod tests {
         assert!(open(&mut host, dir.join("no-such").display().to_string(), None).is_err());
         assert!(open(&mut host, dir.display().to_string(), None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preview_viewはpdfをページ指定してズームとパンできる() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        host.previews
+            .insert(pane, ("/tmp/a.pdf".into(), PreviewModeWire::Pdf));
+        host.preview_views
+            .insert(pane, tako_core::PreviewViewState::default());
+
+        let result = dispatch(
+            &mut host,
+            Request::PreviewView {
+                pane: Some(pane),
+                zoom: Some(150.0),
+                zoom_in: false,
+                zoom_out: false,
+                reset: false,
+                page: Some(3),
+                pan_x: Some(24.0),
+                pan_y: Some(48.0),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+
+        assert_eq!(result["pane"], pane);
+        assert_eq!(result["zoom"], 150.0);
+        assert_eq!(result["page"], 3);
+        assert_eq!(result["pan_x"], 24.0);
+        assert_eq!(result["pan_y"], 48.0);
+    }
+
+    #[test]
+    fn preview_viewは複数のズーム指定を拒否する() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let error = dispatch(
+            &mut host,
+            Request::PreviewView {
+                pane: Some(pane),
+                zoom: Some(150.0),
+                zoom_in: true,
+                zoom_out: false,
+                reset: false,
+                page: None,
+                pan_x: None,
+                pan_y: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(matches!(error, DispatchError::InvalidParams(_)));
     }
 
     #[test]

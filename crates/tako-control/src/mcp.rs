@@ -696,6 +696,27 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_preview_view",
+            "description": "PDF・画像プレビューのズーム・ページ・パンを操作する。全操作を省略すると現在状態を返す。\
+                zoom は百分率（150 = 150%）、page は 1 始まり。zoom と page を同時指定できるため、\
+                『3 ページ目を 150% で見せて』を 1 回で実行できる。zoom_in / zoom_out は 1 段階、\
+                reset は幅フィット（100%）+ パン位置リセット。pan_x / pan_y は現在位置へ加える logical px。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象 PDF・画像プレビューペイン ID（省略時は呼び出し元）"),
+                    "zoom": { "type": "number", "minimum": 25, "maximum": 400, "description": "表示倍率（百分率）" },
+                    "zoom_in": { "type": "boolean", "description": "true = 1 段階ズームイン" },
+                    "zoom_out": { "type": "boolean", "description": "true = 1 段階ズームアウト" },
+                    "reset": { "type": "boolean", "description": "true = 100% + パン位置リセット" },
+                    "page": { "type": "integer", "minimum": 1, "description": "PDF の表示ページ（1 始まり）" },
+                    "pan_x": { "type": "number", "description": "横パン差分（logical px。正 = 右）" },
+                    "pan_y": { "type": "number", "description": "縦パン差分（logical px。正 = 下）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_preview_edit",
             "description": "コードプレビューの編集モードを開始・終了する。enabled 省略時は状態取得。\
                 PDF・画像・動画・末尾省略された巨大ファイルは編集できない。状態は editing / dirty で返す。",
@@ -2045,6 +2066,16 @@ fn build_request(
             direction: direction_arg(args)?,
             focus: bool_arg(args, "focus")?,
         },
+        "tako_preview_view" => Request::PreviewView {
+            pane: Some(target_pane(args, caller)?),
+            zoom: f32_arg(args, "zoom")?,
+            zoom_in: bool_arg(args, "zoom_in")?.unwrap_or(false),
+            zoom_out: bool_arg(args, "zoom_out")?.unwrap_or(false),
+            reset: bool_arg(args, "reset")?.unwrap_or(false),
+            page: u64_arg(args, "page")?.map(|page| page as usize),
+            pan_x: f32_arg(args, "pan_x")?,
+            pan_y: f32_arg(args, "pan_y")?,
+        },
         "tako_preview_edit" => Request::PreviewEdit {
             pane: Some(target_pane(args, caller)?),
             enabled: bool_arg(args, "enabled")?,
@@ -2816,6 +2847,37 @@ mod tests {
     }
 
     #[test]
+    fn preview_viewは倍率ページパンをrequestへ写す() {
+        let (_, requests) = run(
+            call(
+                "tako_preview_view",
+                json!({
+                    "pane": 7,
+                    "zoom": 150.0,
+                    "page": 3,
+                    "pan_x": 24.0,
+                    "pan_y": 48.0
+                }),
+            ),
+            None,
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::PreviewView {
+                pane: Some(7),
+                zoom: Some(150.0),
+                zoom_in: false,
+                zoom_out: false,
+                reset: false,
+                page: Some(3),
+                pan_x: Some(24.0),
+                pan_y: Some(48.0),
+            }]
+        );
+    }
+
+    #[test]
     fn tmux_openはセッション必須でドロップ位置相当を写す() {
         let (_, requests) = run(
             call(
@@ -2887,7 +2949,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 74);
+        assert_eq!(tools.len(), 75);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

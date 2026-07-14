@@ -66,6 +66,8 @@ enum Command {
     /// ファイルをプレビューペインで開く（コード = ハイライト表示、
     /// .md は既定でレンダリング表示。--mode code でソース表示へ切替）
     Open(OpenArgs),
+    /// PDF・画像プレビューのズーム・ページ・パン操作。引数なしで現在状態を表示する
+    Preview(PreviewArgs),
     /// コードプレビューの軽量編集（開始 / 全文適用 / 保存）
     #[command(subcommand)]
     Edit(EditCommand),
@@ -1181,6 +1183,34 @@ struct OpenArgs {
     /// プレビューペインにフォーカスを移す（省略時は元ペインを維持）
     #[arg(long)]
     focus: bool,
+}
+
+#[derive(Args)]
+struct PreviewArgs {
+    /// 対象 PDF・画像プレビューペイン ID（省略時は呼び出し元）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// 表示倍率（百分率。25〜400。例: 150 = 150%）
+    #[arg(long, conflicts_with_all = ["zoom_in", "zoom_out", "reset"])]
+    zoom: Option<f32>,
+    /// 1 段階ズームイン
+    #[arg(long, conflicts_with_all = ["zoom", "zoom_out", "reset"])]
+    zoom_in: bool,
+    /// 1 段階ズームアウト
+    #[arg(long, conflicts_with_all = ["zoom", "zoom_in", "reset"])]
+    zoom_out: bool,
+    /// 幅フィット（100%）へ戻しパン位置をリセット
+    #[arg(long, conflicts_with_all = ["zoom", "zoom_in", "zoom_out"])]
+    reset: bool,
+    /// PDF の表示ページ（1 始まり）
+    #[arg(long)]
+    page: Option<usize>,
+    /// 現在位置から横へパンする量（logical px。正 = 右）
+    #[arg(long, allow_hyphen_values = true)]
+    pan_x: Option<f32>,
+    /// 現在位置から縦へパンする量（logical px。正 = 下）
+    #[arg(long, allow_hyphen_values = true)]
+    pan_y: Option<f32>,
 }
 
 #[derive(Args)]
@@ -2619,6 +2649,16 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 focus: if args.focus { Some(true) } else { None },
             }
         }
+        Command::Preview(args) => Request::PreviewView {
+            pane: target_pane(args.pane)?,
+            zoom: args.zoom,
+            zoom_in: args.zoom_in,
+            zoom_out: args.zoom_out,
+            reset: args.reset,
+            page: args.page,
+            pan_x: args.pan_x,
+            pan_y: args.pan_y,
+        },
         Command::Edit(command) => match command {
             EditCommand::Start { pane } => Request::PreviewEdit {
                 pane: target_pane(*pane)?,
@@ -3463,7 +3503,7 @@ fn print_result(command: &Command, result: &Value) {
             println!("{}", pretty_json(result));
         }
         Command::Tab(TabCommand::New { .. }) => println!("{result}"),
-        Command::Open(_) | Command::Edit(_) => println!("{result}"),
+        Command::Open(_) | Command::Preview(_) | Command::Edit(_) => println!("{result}"),
         Command::Autorename(_)
         | Command::Portdetect(_)
         | Command::Persist(_)
@@ -3915,6 +3955,28 @@ mod tests {
                 enabled: Some(true),
             }
         );
+    }
+
+    #[test]
+    fn previewは倍率ページパンを操作へ写す() {
+        let command = parse(&[
+            "tako", "preview", "--pane", "5", "--zoom", "150", "--page", "3", "--pan-x", "24",
+            "--pan-y", "48",
+        ]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewView {
+                pane: Some(5),
+                zoom: Some(150.0),
+                zoom_in: false,
+                zoom_out: false,
+                reset: false,
+                page: Some(3),
+                pan_x: Some(24.0),
+                pan_y: Some(48.0),
+            }
+        );
+        assert!(Cli::try_parse_from(["tako", "preview", "--zoom", "150", "--zoom-in"]).is_err());
     }
 
     #[test]

@@ -326,6 +326,22 @@ pub enum Request {
         #[serde(default)]
         focus: Option<bool>,
     },
+    /// PDF・画像プレビューの表示倍率・ページ・パン操作（#234）。
+    /// 全操作省略時は状態取得。zoom は百分率（150 = 150%）、page は 1 始まり、
+    /// pan_x / pan_y は現在位置へ加える logical px。
+    PreviewView {
+        pane: Option<u64>,
+        zoom: Option<f32>,
+        #[serde(default)]
+        zoom_in: bool,
+        #[serde(default)]
+        zoom_out: bool,
+        #[serde(default)]
+        reset: bool,
+        page: Option<usize>,
+        pan_x: Option<f32>,
+        pan_y: Option<f32>,
+    },
     /// コードプレビューの編集モードを切り替える（FR-3.5）。`enabled` 省略時は状態取得。
     PreviewEdit {
         pane: Option<u64>,

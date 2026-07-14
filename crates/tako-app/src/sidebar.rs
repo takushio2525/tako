@@ -1025,12 +1025,24 @@ impl TakoApp {
         mode: preview::PreviewMode,
         cx: &mut Context<Self>,
     ) {
+        let logical_width = self
+            .pane_text_areas
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, bounds)| f32::from(bounds.size.width) - (PANE_PADDING + 4.0) * 2.0)
+            .unwrap_or(612.0);
+        let pdf_raster_key =
+            preview::PdfRasterKey::for_view(self.preview_device_scale, 1.0, logical_width);
         cx.spawn(async move |this, cx| {
             let p = path.clone();
             // PDF / Video は load_fast がそのまま完成版を返す（raw は常に None）
-            let task = cx
-                .background_executor()
-                .spawn(async move { preview::load_fast(&p, mode).0 });
+            let task = cx.background_executor().spawn(async move {
+                if mode == preview::PreviewMode::Pdf {
+                    preview::load_pdf_with_key(&p, pdf_raster_key)
+                } else {
+                    preview::load_fast(&p, mode).0
+                }
+            });
             let state = task.await;
             let _ = this.update(cx, |app, cx| {
                 // 読み込み中に別ファイルへ差し替わっていたら破棄（後勝ち）

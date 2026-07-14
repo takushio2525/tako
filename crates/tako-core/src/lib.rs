@@ -12,6 +12,7 @@ pub mod pane_log;
 pub mod pane_tree;
 pub mod paths;
 pub mod ports;
+pub mod preview_view;
 pub mod screen;
 pub mod scroll;
 pub mod scroll_mirror;
@@ -39,6 +40,10 @@ pub use pane_tree::{
     SplitDirection,
 };
 pub use ports::ListenPort;
+pub use preview_view::{
+    PreviewViewState, PreviewViewUpdate, PreviewZoomCommand, PREVIEW_ZOOM_MAX, PREVIEW_ZOOM_MIN,
+    PREVIEW_ZOOM_STEP,
+};
 pub use screen::{InputStatus, InputStyle, Screen, ScreenLine, StyleRun};
 pub use shell::{quote_for_shell, quote_paths_for_shell};
 pub use spawn_layout::{SpawnLayoutConfig, SpawnLayoutPolicy, WorkerLayoutAlgorithm};

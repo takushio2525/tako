@@ -145,6 +145,57 @@ pub struct PdfData {
     pub text_layers: Vec<Vec<PdfTextLine>>,
     /// ページごとの PDF 座標系でのサイズ [width, height]
     pub page_sizes: Vec<[f64; 2]>,
+    /// 現在の PNG を生成した表示条件。ウィンドウ scale・ズーム・幅を量子化して
+    /// background 再ラスタライズと PreviewImageCache の世代判定に使う。
+    pub raster_key: PdfRasterKey,
+    /// ページごとの実ラスタライズ解像度 [pixel width, pixel height]。
+    /// 品質検証とキャッシュ整合性の確認に使う。
+    pub pixel_sizes: Vec<[u32; 2]>,
+}
+
+/// PDF 再ラスタライズのキャッシュキー（#231 / #234）。
+///
+/// 連続リサイズやピンチでキーが無制限に増えないよう、表示幅は 64 logical px、
+/// device scale と zoom は 1% 単位へ量子化する。対象ピクセル幅は安全上 4096 px を上限とする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PdfRasterKey {
+    pub device_scale_percent: u16,
+    pub zoom_percent: u16,
+    pub logical_width_bucket: u32,
+}
+
+impl PdfRasterKey {
+    const WIDTH_BUCKET: u32 = 64;
+    const MIN_PIXEL_WIDTH: u32 = 256;
+    const MAX_PIXEL_WIDTH: u32 = 4096;
+
+    pub fn for_view(device_scale: f32, zoom: f32, logical_width: f32) -> Self {
+        let device_scale_percent = (device_scale.clamp(1.0, 4.0) * 100.0).round() as u16;
+        let zoom_percent = (zoom.clamp(0.25, 4.0) * 100.0).round() as u16;
+        let width = logical_width.max(1.0).ceil() as u32;
+        let logical_width_bucket = width.div_ceil(Self::WIDTH_BUCKET) * Self::WIDTH_BUCKET;
+        Self {
+            device_scale_percent,
+            zoom_percent,
+            logical_width_bucket,
+        }
+    }
+
+    pub fn target_pixel_width(self) -> u32 {
+        let width = self.logical_width_bucket as f64
+            * f64::from(self.device_scale_percent)
+            * f64::from(self.zoom_percent)
+            / 10_000.0;
+        (width.ceil() as u32).clamp(Self::MIN_PIXEL_WIDTH, Self::MAX_PIXEL_WIDTH)
+    }
+}
+
+/// background ラスタライズの戻り値。テキストレイヤは scale 非依存なので含めず再利用する。
+pub struct PdfRasterizedPages {
+    pub pages: Vec<Vec<u8>>,
+    pub total_pages: usize,
+    pub page_sizes: Vec<[f64; 2]>,
+    pub pixel_sizes: Vec<[u32; 2]>,
 }
 
 /// 動画のメタ情報 + サムネイル（ffmpeg で抽出）
@@ -358,20 +409,27 @@ pub fn load_image(path: &Path) -> PreviewState {
 /// PDF の全ページをレンダリングして PreviewState を返す。
 /// Core Graphics FFI で描画する（macOS のみ）
 pub fn load_pdf(path: &Path, _page: usize) -> PreviewState {
+    load_pdf_with_key(path, PdfRasterKey::for_view(2.0, 1.0, 612.0))
+}
+
+/// 指定した表示条件で PDF を読み込む。全処理は呼び出し側が background へ載せる。
+pub fn load_pdf_with_key(path: &Path, raster_key: PdfRasterKey) -> PreviewState {
     #[cfg(target_os = "macos")]
     {
-        match pdf_render::render_all_pages(path) {
-            Ok((all_pages, total_pages, page_sizes)) => {
-                let text_layers =
-                    pdf_render::extract_text_layers(path, total_pages).unwrap_or_default();
+        match rasterize_pdf(path, raster_key) {
+            Ok(rasterized) => {
+                let text_layers = pdf_render::extract_text_layers(path, rasterized.total_pages)
+                    .unwrap_or_default();
                 PreviewState {
                     path: path.to_path_buf(),
                     mode: PreviewMode::Pdf,
                     content: PreviewContent::Pdf(PdfData {
-                        pages: all_pages,
-                        total_pages,
+                        pages: rasterized.pages,
+                        total_pages: rasterized.total_pages,
                         text_layers,
-                        page_sizes,
+                        page_sizes: rasterized.page_sizes,
+                        raster_key,
+                        pixel_sizes: rasterized.pixel_sizes,
                     }),
                     truncated: false,
                 }
@@ -381,8 +439,22 @@ pub fn load_pdf(path: &Path, _page: usize) -> PreviewState {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = _page;
+        let _ = raster_key;
         PreviewState::error(path, PreviewMode::Pdf, "PDF プレビューは macOS のみ対応")
+    }
+}
+
+/// PDF ページ画像だけを再生成する。テキスト抽出は初回ロード時だけ行う。
+pub fn rasterize_pdf(path: &Path, raster_key: PdfRasterKey) -> Result<PdfRasterizedPages, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let _span = tako_control::diag::perf_span("pdf_rasterize");
+        pdf_render::render_all_pages(path, raster_key)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (path, raster_key);
+        Err("PDF プレビューは macOS のみ対応".into())
     }
 }
 
@@ -690,8 +762,6 @@ mod pdf_render {
     // kCGImageAlphaPremultipliedLast = 1 (RGBA with premultiplied alpha)
     const CG_IMAGE_ALPHA_PREMULTIPLIED_LAST: u32 = 1;
 
-    const RENDER_SCALE: f64 = 2.0; // Retina 品質
-
     fn make_cfstring(s: &str) -> *const core::ffi::c_void {
         unsafe {
             CFStringCreateWithBytes(
@@ -704,8 +774,10 @@ mod pdf_render {
         }
     }
 
-    #[allow(clippy::type_complexity)]
-    pub fn render_all_pages(path: &Path) -> Result<(Vec<Vec<u8>>, usize, Vec<[f64; 2]>), String> {
+    pub fn render_all_pages(
+        path: &Path,
+        raster_key: super::PdfRasterKey,
+    ) -> Result<super::PdfRasterizedPages, String> {
         let path_str = path
             .to_str()
             .ok_or_else(|| "パスが UTF-8 でない".to_string())?;
@@ -739,19 +811,23 @@ mod pdf_render {
 
             let mut all_pages = Vec::with_capacity(total);
             let mut page_sizes = Vec::with_capacity(total);
+            let mut pixel_sizes = Vec::with_capacity(total);
             for page_idx in 0..total {
                 let page_num = page_idx + 1;
                 let pdf_page = CGPDFDocumentGetPage(doc, page_num);
                 if pdf_page.is_null() {
                     all_pages.push(Vec::new());
                     page_sizes.push([0.0, 0.0]);
+                    pixel_sizes.push([0, 0]);
                     continue;
                 }
 
                 let media_box = CGPDFPageGetBoxRect(pdf_page, CG_PDF_MEDIA_BOX);
                 page_sizes.push([media_box.size.width, media_box.size.height]);
-                let pixel_w = (media_box.size.width * RENDER_SCALE) as usize;
-                let pixel_h = (media_box.size.height * RENDER_SCALE) as usize;
+                let pixel_w = raster_key.target_pixel_width() as usize;
+                let render_scale = pixel_w as f64 / media_box.size.width.max(1.0);
+                let pixel_h = (media_box.size.height * render_scale).ceil() as usize;
+                pixel_sizes.push([pixel_w as u32, pixel_h as u32]);
                 if pixel_w == 0 || pixel_h == 0 {
                     all_pages.push(Vec::new());
                     continue;
@@ -787,7 +863,7 @@ mod pdf_render {
                     },
                 );
 
-                CGContextScaleCTM(ctx, RENDER_SCALE, RENDER_SCALE);
+                CGContextScaleCTM(ctx, render_scale, render_scale);
                 CGContextDrawPDFPage(ctx, pdf_page);
 
                 let cg_image = CGBitmapContextCreateImage(ctx);
@@ -805,7 +881,25 @@ mod pdf_render {
             }
 
             CGPDFDocumentRelease(doc);
-            Ok((all_pages, total, page_sizes))
+            if std::env::var_os("TAKO_PERF_VERBOSE").is_some() {
+                if let (Some(logical), Some(pixels)) = (page_sizes.first(), pixel_sizes.first()) {
+                    eprintln!(
+                        "TAKO_PDF_RASTER: pages={total} logical={:.0}x{:.0} pixels={}x{} device_scale={:.2} zoom={:.2}",
+                        logical[0],
+                        logical[1],
+                        pixels[0],
+                        pixels[1],
+                        f32::from(raster_key.device_scale_percent) / 100.0,
+                        f32::from(raster_key.zoom_percent) / 100.0,
+                    );
+                }
+            }
+            Ok(super::PdfRasterizedPages {
+                pages: all_pages,
+                total_pages: total,
+                page_sizes,
+                pixel_sizes,
+            })
         }
     }
 
@@ -1726,6 +1820,26 @@ mod tests {
         assert!(is_pdf_path(Path::new("/a/doc.pdf")));
         assert!(is_pdf_path(Path::new("/a/DOC.PDF")));
         assert!(!is_pdf_path(Path::new("/a/main.rs")));
+    }
+
+    #[test]
+    fn pdfラスタキーはretina表示幅を実ピクセルへ変換する() {
+        let key = PdfRasterKey::for_view(2.0, 1.0, 930.0);
+        assert_eq!(key.logical_width_bucket, 960);
+        assert_eq!(key.target_pixel_width(), 1920);
+
+        let zoomed = PdfRasterKey::for_view(2.0, 1.5, 930.0);
+        assert_eq!(zoomed.target_pixel_width(), 2880);
+        assert_ne!(key, zoomed);
+    }
+
+    #[test]
+    fn pdfラスタキーは連続リサイズを64px単位へ量子化する() {
+        let a = PdfRasterKey::for_view(2.0, 1.0, 901.0);
+        let b = PdfRasterKey::for_view(2.0, 1.0, 950.0);
+        let c = PdfRasterKey::for_view(2.0, 1.0, 970.0);
+        assert_eq!(a, b);
+        assert_ne!(b, c);
     }
 
     #[test]
