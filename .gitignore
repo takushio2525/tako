@@ -39,3 +39,4 @@ web/tako-remote/dist/
 docs/node_modules/
 docs/dist/
 docs/.astro/
+.vite/

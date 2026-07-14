@@ -716,6 +716,12 @@
   resume → 文脈維持を実測）。ペイン kill 後の logs 読み出し・TUI 93B・洪水 26KB 実測
 - 次: origin/main rebase → PR（Closes #112）→ squash merge → install
 
+## 2026-07-14（#210: master identity — 復元後 role 消失 + 同一プロファイル複数 master 誤認の根治）
+- orphan 復元で role 引き継ぎ（`TAKO_ORCHESTRATOR_ROLE` 逆引き）+ stale pane map（旧→新 pane ID）
+  + self/spawn の caller 解決に stale map 挿入。テスト 9 本追加（645 全緑）
+- 関連コミット: `0dbd534`（PR #215 squash merge）。`build-app.sh --install` 済み
+- 次: tako 再起動で反映。手動 role 後付けは `tako title --pane <id> --role <role>`
+
 ## 2026-07-14（#212: 画面が重い・点滅・スクロールもっさりの根治 — pmset UI スレッド実行の排除）
 - 犯人を perf.log + 隔離実測で確定: sleep guard（#173）の AC 判定 `pmset -g batt` が UI スレッドで
   2 秒毎に同期実行（アイドル 20〜30ms、CPU 飽和時に秒級）。IOKit FFI へ置換で
