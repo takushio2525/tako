@@ -466,6 +466,7 @@ impl TakoApp {
         &mut self,
         pane_id: PaneId,
         rect: Rect,
+        area: gpui::Bounds<gpui::Pixels>,
         focused: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -1304,8 +1305,12 @@ impl TakoApp {
                     cx.notify();
                 }),
             )
-            .child(
-                // タイトルバー: × / 種別アイコン + ファイル名 / （md のみ）モードトグル
+            .child({
+                // #185: プレビューヘッダ — × を右側に統一 + パス中間省略 + 省略制御
+                let preview_w = f32::from(area.size.width);
+                let phv = tako_core::PreviewHeaderVisibility::from_width(preview_w);
+                let path_max = ((preview_w / 8.0) as usize).clamp(12, 60);
+                let path_short = tako_core::truncate_path_middle(&path_label, path_max);
                 div()
                     .id(("preview-titlebar", pane_id.as_u64()))
                     .h(px(PANE_TITLE_BAR))
@@ -1314,8 +1319,8 @@ impl TakoApp {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_1()
-                    .px_1()
+                    .gap(px(6.0))
+                    .px(px(8.0))
                     .bg(rgba(if focused {
                         theme.surface_2
                     } else {
@@ -1334,191 +1339,280 @@ impl TakoApp {
                         PaneDrag { pane: pane_id },
                         self.drag_ghost_builder(DragKind::Pane, truncate(&file_name, 24), cx),
                     )
-                    .child(
-                        div()
-                            .id(("pane-close", pane_id.as_u64()))
-                            .w(px(16.0))
-                            .h(px(16.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
-                            .hover(|d| {
-                                d.bg(rgba_alpha(theme.red, 0.25))
-                                    .text_color(hsla(theme.foreground))
-                            })
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.close_pane_button(pane_id, cx);
-                            }))
-                            .child("×"),
+                    // #185: プレビューヘッダ右クリックメニュー
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.pane_context_menu = Some(PaneContextMenu {
+                                pane: pane_id,
+                                kind: PaneContextKind::Preview,
+                                position: event.position,
+                            });
+                            cx.notify();
+                        }),
                     )
+                    // 左コンテナ: ファイル情報
                     .child(
                         div()
-                            .text_color(if focused {
-                                hsla(theme.foreground)
-                            } else {
-                                hsla(theme.tab_inactive_foreground)
-                            })
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap(px(5.0))
-                            // 種別アイコン（絵文字全廃 #217: 既存ファイルアイコン SVG）
-                            .child(
-                                svg()
-                                    .path(match mode {
-                                        preview::PreviewMode::Image => "icons/file_icons/image.svg",
-                                        preview::PreviewMode::Pdf => "icons/file_icons/book.svg",
-                                        _ => crate::file_icons::ui_icon::FILE_GENERIC,
-                                    })
-                                    .w(px(13.0))
-                                    .h(px(13.0))
-                                    .flex_none()
-                                    .text_color(hsla(theme.text_tertiary)),
-                            )
-                            .child(SharedString::from({
-                                let suffix = if autosave {
-                                    match &save_status {
-                                        Some(preview::SaveStatus::Saved) => " \u{00B7} 保存済",
-                                        Some(preview::SaveStatus::Conflict) => " \u{00B7} 競合",
-                                        Some(preview::SaveStatus::Error(_)) => " \u{00B7} エラー",
-                                        None if dirty => " \u{25CF}",
-                                        None => "",
-                                    }
-                                } else if dirty {
-                                    " \u{25CF}"
-                                } else {
-                                    ""
-                                };
-                                format!("{}{suffix}", truncate(&file_name, 36))
-                            })),
-                    )
-                    .child(div().flex_grow(1.0))
-                    .children((md_capable && edit_snap.is_none()).then(|| {
-                        // 目アイコンのトグル（FR-3.3）: コード表示 ⇔ md レンダリング
-                        let (icon, label) = match mode {
-                            preview::PreviewMode::Markdown => (None, "コードとして表示"),
-                            preview::PreviewMode::Code => {
-                                (Some(crate::file_icons::ui_icon::EYE), "md レンダリング表示")
-                            }
-                            _ => (None, ""),
-                        };
-                        div()
-                            .id(("preview-mode-toggle", pane_id.as_u64()))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_1()
-                            .px_1()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_color(hsla(theme.accent))
-                            .hover(|d| d.bg(rgba_alpha(theme.tab_active_background, 0.8)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.toggle_preview_mode(pane_id, cx);
-                            }))
-                            .when(mode == preview::PreviewMode::Markdown, |d| {
-                                d.child(SharedString::from("</>"))
+                            .when(phv.file_icon, |d| {
+                                d.child(
+                                    svg()
+                                        .path(match mode {
+                                            preview::PreviewMode::Image => {
+                                                "icons/file_icons/image.svg"
+                                            }
+                                            preview::PreviewMode::Pdf => {
+                                                "icons/file_icons/book.svg"
+                                            }
+                                            _ => crate::file_icons::ui_icon::FILE_GENERIC,
+                                        })
+                                        .w(px(13.0))
+                                        .h(px(13.0))
+                                        .flex_none()
+                                        .text_color(hsla(theme.text_tertiary)),
+                                )
                             })
-                            .children(icon.map(|p| {
-                                svg()
-                                    .path(p)
-                                    .w(px(13.0))
-                                    .h(px(13.0))
-                                    .text_color(hsla(theme.accent))
-                            }))
-                            .child(SharedString::from(label))
-                    }))
-                    .children(editable.then(|| {
-                        div()
-                            .id(("preview-edit-toggle", pane_id.as_u64()))
-                            .px_1()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_color(hsla(if editing { theme.green } else { theme.accent }))
-                            .hover(|d| d.bg(rgba_alpha(theme.tab_active_background, 0.8)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                if let Err(message) =
-                                    this.set_preview_editing_local(pane_id, !editing)
-                                {
-                                    if let Some(edit) = this.preview_edits.get_mut(&pane_id) {
-                                        edit.message = Some(message);
-                                    }
-                                }
-                                cx.notify();
-                            }))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                svg()
-                                    .path(crate::file_icons::ui_icon::PENCIL)
-                                    .w(px(12.0))
-                                    .h(px(12.0))
-                                    .text_color(hsla(if editing {
-                                        theme.green
+                            .when(phv.file_name, |d| {
+                                d.child(
+                                    div()
+                                        .min_w(px(0.0))
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .text_color(if focused {
+                                            hsla(theme.foreground)
+                                        } else {
+                                            hsla(theme.tab_inactive_foreground)
+                                        })
+                                        .child(SharedString::from({
+                                            let suffix = if autosave {
+                                                match &save_status {
+                                                    Some(preview::SaveStatus::Saved) => {
+                                                        " \u{00B7} 保存済"
+                                                    }
+                                                    Some(preview::SaveStatus::Conflict) => {
+                                                        " \u{00B7} 競合"
+                                                    }
+                                                    Some(preview::SaveStatus::Error(_)) => {
+                                                        " \u{00B7} エラー"
+                                                    }
+                                                    None if dirty => " \u{25CF}",
+                                                    None => "",
+                                                }
+                                            } else if dirty {
+                                                " \u{25CF}"
+                                            } else {
+                                                ""
+                                            };
+                                            format!("{}{suffix}", truncate(&file_name, 36))
+                                        })),
+                                )
+                            })
+                            .when(phv.path_label, |d| {
+                                d.child(
+                                    div()
+                                        .min_w(px(0.0))
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.6))
+                                        .text_size(px(10.0))
+                                        .child(SharedString::from(path_short)),
+                                )
+                            })
+                            .children(edit_message.map(|message| {
+                                div()
+                                    .flex_none()
+                                    .text_size(px(10.0))
+                                    .text_color(hsla(if dirty {
+                                        theme.yellow
                                     } else {
-                                        theme.accent
-                                    })),
-                            )
-                            .child(if editing { "編集中" } else { "編集" })
-                    }))
-                    .children((dirty && !autosave).then(|| {
-                        div()
-                            .id(("preview-save", pane_id.as_u64()))
-                            .px_1()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_color(hsla(theme.accent))
-                            .hover(|d| d.bg(rgba_alpha(theme.tab_active_background, 0.8)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                let _ = this.save_preview_local(pane_id);
-                                cx.notify();
+                                        theme.green
+                                    }))
+                                    .child(SharedString::from(truncate(&message, 36)))
                             }))
-                            .child("保存 ⌘S")
-                    }))
-                    .children(pdf_info.map(|total| {
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.6))
-                            .child(SharedString::from(format!("{} ページ", total)))
-                    }))
-                    .children(edit_message.map(|message| {
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(hsla(if dirty { theme.yellow } else { theme.green }))
-                            .child(SharedString::from(truncate(&message, 36)))
-                    }))
+                            .when(phv.page_info, |d| {
+                                d.children(pdf_info.map(|total| {
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(11.0))
+                                        .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.6))
+                                        .child(SharedString::from(format!("{} p", total)))
+                                }))
+                            }),
+                    )
+                    // 右コンテナ: 操作ボタン（常に表示）
                     .child(
                         div()
-                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.6))
-                            .text_size(px(10.0))
-                            .child(SharedString::from(truncate(&path_label, 40))),
-                    ),
-            )
+                            .flex_none()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .when(phv.mode_toggle && md_capable && edit_snap.is_none(), |d| {
+                                let (icon, label) = match mode {
+                                    preview::PreviewMode::Markdown => (None, "コードとして表示"),
+                                    preview::PreviewMode::Code => (
+                                        Some(crate::file_icons::ui_icon::EYE),
+                                        "md レンダリング表示",
+                                    ),
+                                    _ => (None, ""),
+                                };
+                                d.child(
+                                    div()
+                                        .id(("preview-mode-toggle", pane_id.as_u64()))
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_1()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .text_color(hsla(theme.accent))
+                                        .hover(|d| {
+                                            d.bg(rgba_alpha(theme.tab_active_background, 0.8))
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation()
+                                            }),
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.toggle_preview_mode(pane_id, cx);
+                                        }))
+                                        .when(mode == preview::PreviewMode::Markdown, |d| {
+                                            d.child(SharedString::from("</>"))
+                                        })
+                                        .children(icon.map(|p| {
+                                            svg()
+                                                .path(p)
+                                                .w(px(13.0))
+                                                .h(px(13.0))
+                                                .text_color(hsla(theme.accent))
+                                        }))
+                                        .child(SharedString::from(label)),
+                                )
+                            })
+                            .when(phv.edit_button && editable, |d| {
+                                d.child(
+                                    div()
+                                        .id(("preview-edit-toggle", pane_id.as_u64()))
+                                        .px_1()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .text_color(hsla(if editing {
+                                            theme.green
+                                        } else {
+                                            theme.accent
+                                        }))
+                                        .hover(|d| {
+                                            d.bg(rgba_alpha(theme.tab_active_background, 0.8))
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation()
+                                            }),
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            if let Err(message) =
+                                                this.set_preview_editing_local(pane_id, !editing)
+                                            {
+                                                if let Some(edit) =
+                                                    this.preview_edits.get_mut(&pane_id)
+                                                {
+                                                    edit.message = Some(message);
+                                                }
+                                            }
+                                            cx.notify();
+                                        }))
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            svg()
+                                                .path(crate::file_icons::ui_icon::PENCIL)
+                                                .w(px(12.0))
+                                                .h(px(12.0))
+                                                .text_color(hsla(if editing {
+                                                    theme.green
+                                                } else {
+                                                    theme.accent
+                                                })),
+                                        )
+                                        .child(if editing { "編集中" } else { "編集" }),
+                                )
+                            })
+                            .when(phv.save_button && dirty && !autosave, |d| {
+                                d.child(
+                                    div()
+                                        .id(("preview-save", pane_id.as_u64()))
+                                        .px_1()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .text_color(hsla(theme.accent))
+                                        .hover(|d| {
+                                            d.bg(rgba_alpha(theme.tab_active_background, 0.8))
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation()
+                                            }),
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            let _ = this.save_preview_local(pane_id);
+                                            cx.notify();
+                                        }))
+                                        .child("保存 ⌘S"),
+                                )
+                            })
+                            // 閉じるボタン（常に表示。右側に統一 #185）
+                            .child(
+                                div()
+                                    .id(("pane-close", pane_id.as_u64()))
+                                    .w(px(18.0))
+                                    .h(px(18.0))
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(5.0))
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(rgba_alpha(theme.red, 0.25)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation()
+                                        }),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.close_pane_button(pane_id, cx);
+                                    }))
+                                    .child(
+                                        svg()
+                                            .path(crate::file_icons::ui_icon::CLOSE)
+                                            .w(px(13.0))
+                                            .h(px(13.0))
+                                            .text_color(hsla(theme.text_muted)),
+                                    ),
+                            ),
+                    )
+            })
             .when(search_visible, |el| {
                 let query_focused = search_focus == preview::SearchFieldFocus::Query;
                 let replace_focused = search_focus == preview::SearchFieldFocus::Replace;
