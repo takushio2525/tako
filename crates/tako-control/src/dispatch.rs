@@ -2216,6 +2216,140 @@ fn dispatch_inner(
                 "不明な action: {other:?}（list / read / status / set のいずれか）"
             ))),
         },
+
+        Request::OpenDir { path, focus } => {
+            let dir = PathBuf::from(&path);
+            if !dir.is_dir() {
+                return Err(DispatchError::InvalidParams(format!(
+                    "ディレクトリが存在しない: {path}"
+                )));
+            }
+            let dir = dir.canonicalize().unwrap_or(dir);
+            let label = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone());
+
+            let prev_active = host.workspace().active_tab_id();
+            let pane = Pane::new(origin);
+            let pane_id = pane.id();
+            let tab_id = host.workspace_mut().create_tab(label, pane);
+
+            if !focus.unwrap_or(true) {
+                let _ = host.workspace_mut().activate_tab(prev_active);
+            }
+
+            host.attach_session(
+                pane_id,
+                SpawnOptions {
+                    cwd: Some(dir.clone()),
+                    ..Default::default()
+                },
+            );
+            // ファイルツリーにフォルダを追加
+            if let Some(tab) = host.workspace_mut().get_tab_mut(tab_id) {
+                tab.add_pinned_folder(dir.clone());
+            }
+            host.sync_filetree();
+
+            // Recent に記録
+            let mut recent = tako_core::recent::RecentList::load();
+            recent.push(tako_core::recent::RecentEntry::Directory {
+                path: dir.to_string_lossy().to_string(),
+            });
+            recent.save();
+
+            Ok(json!({ "tab": tab_id.as_u64(), "pane": pane_id.as_u64() }))
+        }
+
+        Request::OpenRemote {
+            host: ssh_host,
+            focus,
+        } => {
+            let hosts = match tako_core::ssh_config::default_ssh_config_path() {
+                Some(p) => tako_core::ssh_config::parse_ssh_config(&p),
+                None => Vec::new(),
+            };
+            let entry = hosts.iter().find(|h| h.name == ssh_host);
+            let cmd = match entry {
+                Some(h) => h.ssh_command(),
+                None => vec!["ssh".to_string(), ssh_host.clone()],
+            };
+
+            let prev_active = host.workspace().active_tab_id();
+            let pane = Pane::new(origin);
+            let pane_id = pane.id();
+            let tab_title = format!("ssh:{ssh_host}");
+            let tab_id = host.workspace_mut().create_tab(tab_title, pane);
+            if let Some(tab) = host.workspace_mut().get_tab_mut(tab_id) {
+                let t = tab.title().to_string();
+                tab.set_title_manual(t);
+            }
+
+            if !focus.unwrap_or(true) {
+                let _ = host.workspace_mut().activate_tab(prev_active);
+            }
+
+            host.attach_session(
+                pane_id,
+                SpawnOptions {
+                    command: Some(SpawnCommand {
+                        program: cmd[0].clone(),
+                        args: cmd[1..].to_vec(),
+                    }),
+                    ..Default::default()
+                },
+            );
+
+            // Recent に記録
+            let mut recent = tako_core::recent::RecentList::load();
+            recent.push(tako_core::recent::RecentEntry::Ssh {
+                host: ssh_host.clone(),
+            });
+            recent.save();
+
+            Ok(json!({ "tab": tab_id.as_u64(), "pane": pane_id.as_u64() }))
+        }
+
+        Request::SshHosts => {
+            let hosts = match tako_core::ssh_config::default_ssh_config_path() {
+                Some(p) => tako_core::ssh_config::parse_ssh_config(&p),
+                None => Vec::new(),
+            };
+            let list: Vec<Value> = hosts
+                .iter()
+                .map(|h| {
+                    json!({
+                        "name": h.name,
+                        "hostname": h.hostname,
+                        "user": h.user,
+                        "port": h.port,
+                    })
+                })
+                .collect();
+            Ok(json!({ "hosts": list }))
+        }
+
+        Request::RecentItems { action } => match action.as_str() {
+            "list" => {
+                let recent = tako_core::recent::RecentList::load();
+                let entries: Vec<Value> = recent
+                    .entries
+                    .iter()
+                    .map(|e| serde_json::to_value(e).unwrap_or(Value::Null))
+                    .collect();
+                Ok(json!({ "entries": entries }))
+            }
+            "clear" => {
+                let mut recent = tako_core::recent::RecentList::load();
+                recent.clear();
+                recent.save();
+                Ok(json!({ "cleared": true }))
+            }
+            other => Err(DispatchError::InvalidParams(format!(
+                "不明な action: {other:?}（list / clear のいずれか）"
+            ))),
+        },
     }
 }
 
@@ -6804,5 +6938,98 @@ mod tests {
             PaneOrigin::Cli,
         )
         .is_err());
+    }
+
+    // --- OpenDir / OpenRemote / SshHosts / RecentItems テスト (#20) ---
+
+    #[test]
+    fn open_dir_存在しないパスはエラー() {
+        let mut host = MockHost::new();
+        let result = dispatch(
+            &mut host,
+            Request::OpenDir {
+                path: "/nonexistent/path/12345".into(),
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_dir_存在するパスは新タブを作成() {
+        let mut host = MockHost::new();
+        let dir = std::env::temp_dir();
+        let result = dispatch(
+            &mut host,
+            Request::OpenDir {
+                path: dir.display().to_string(),
+                focus: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!(result["tab"].as_u64().is_some());
+        assert!(result["pane"].as_u64().is_some());
+    }
+
+    #[test]
+    fn open_remote_は新タブを作成() {
+        let mut host = MockHost::new();
+        let result = dispatch(
+            &mut host,
+            Request::OpenRemote {
+                host: "nonexistent-host".into(),
+                focus: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!(result["tab"].as_u64().is_some());
+        assert!(result["pane"].as_u64().is_some());
+    }
+
+    #[test]
+    fn ssh_hosts_は配列を返す() {
+        let mut host = MockHost::new();
+        let result = dispatch(&mut host, Request::SshHosts, PaneOrigin::Cli).unwrap();
+        assert!(result["hosts"].is_array());
+    }
+
+    #[test]
+    fn recent_items_list_とclear() {
+        let mut host = MockHost::new();
+        let result = dispatch(
+            &mut host,
+            Request::RecentItems {
+                action: "list".into(),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!(result["entries"].is_array());
+
+        let result = dispatch(
+            &mut host,
+            Request::RecentItems {
+                action: "clear".into(),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["cleared"], true);
+    }
+
+    #[test]
+    fn recent_items_不明なactionはエラー() {
+        let mut host = MockHost::new();
+        let result = dispatch(
+            &mut host,
+            Request::RecentItems {
+                action: "invalid".into(),
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(result.is_err());
     }
 }

@@ -37,6 +37,8 @@ actions!(
         SelectAll,
         OpenDirectory,
         OpenRepository,
+        OpenRemote,
+        OpenRecent,
         NewWindow,
         UndoPreview,
         RedoPreview,

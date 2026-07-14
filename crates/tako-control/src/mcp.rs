@@ -1705,6 +1705,73 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "tako_open_dir",
+            "description": "ディレクトリを新タブで開く（#20）。cwd を設定してシェルを起動し、\
+                ファイルツリーにフォルダを自動追加する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "開くディレクトリの絶対パス",
+                    },
+                    "focus": {
+                        "type": "boolean",
+                        "description": "新タブにフォーカスを移すか（省略時 true）",
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_open_remote",
+            "description": "SSH ホストに接続する新タブを開く（#20）。~/.ssh/config の Host 名を\
+                指定すると、HostName / User / Port 等の設定を尊重して ssh コマンドを実行する。\
+                未定義ホストでも ssh <host> として実行できる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "host": {
+                        "type": "string",
+                        "description": "SSH ホスト名（~/.ssh/config の Host、または直接 hostname）",
+                    },
+                    "focus": {
+                        "type": "boolean",
+                        "description": "新タブにフォーカスを移すか（省略時 true）",
+                    },
+                },
+                "required": ["host"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_ssh_hosts",
+            "description": "~/.ssh/config の Host 一覧を返す（#20）。ワイルドカード（*）を含む\
+                エントリは除外される。各ホストの name / hostname / user / port を返す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_recent",
+            "description": "最近開いたディレクトリ/リポジトリ/SSH ホストの一覧・クリア（#20）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "clear"],
+                        "description": "操作種別",
+                    },
+                },
+                "required": ["action"],
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -2399,6 +2466,20 @@ fn build_request(
             max_mb: u64_arg(args, "max_mb")?,
             total_max_mb: u64_arg(args, "total_max_mb")?,
         },
+        "tako_open_dir" => Request::OpenDir {
+            path: str_arg(args, "path")?.ok_or("path を指定する")?.to_string(),
+            focus: bool_arg(args, "focus")?,
+        },
+        "tako_open_remote" => Request::OpenRemote {
+            host: str_arg(args, "host")?.ok_or("host を指定する")?.to_string(),
+            focus: bool_arg(args, "focus")?,
+        },
+        "tako_ssh_hosts" => Request::SshHosts,
+        "tako_recent" => Request::RecentItems {
+            action: str_arg(args, "action")?
+                .ok_or("action を指定する")?
+                .to_string(),
+        },
         _ => return Err(format!("不明なツール: {name}")),
     })
 }
@@ -2949,7 +3030,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 75);
+        assert_eq!(tools.len(), 79);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
