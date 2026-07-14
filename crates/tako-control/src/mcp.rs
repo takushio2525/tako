@@ -1933,6 +1933,9 @@ fn call_tool(params: &Value, session: &mut McpSession) -> Result<Value, (i64, St
         .ok_or((-32602, "ツール名（name）が無い".to_string()))?;
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
+    // 未知パラメータの検出（#227: タイポが黙って無視される事故を防ぐ）
+    validate_known_params(name, &args)?;
+
     // gate check はコマンド実行を伴うため MCP ハンドラスレッドで直接実行する
     // （dispatch は UI スレッドで実行されるため長時間ブロック不可。#244）
     if name == "tako_task_gate_check" {
@@ -2755,6 +2758,66 @@ fn target_pane(args: &Value, caller: Option<u64>) -> Result<u64, String> {
          呼び出し元ペインの自動特定には TAKO_PANE_ID / X-Tako-Pane が必要）"
             .into()
     })
+}
+
+/// ツール名 → 許可パラメータ名セットのキャッシュ（#227）。
+/// `tools()` のスキーマから `inputSchema.properties` のキーを抽出して構築する。
+/// 全ツールの `additionalProperties: false` を実行時に強制する
+fn allowed_params_map(
+) -> &'static std::collections::HashMap<String, std::collections::HashSet<String>> {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::OnceLock;
+    static MAP: OnceLock<HashMap<String, HashSet<String>>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut map = HashMap::new();
+        for tool in tools() {
+            if let (Some(name), Some(schema)) = (
+                tool.get("name").and_then(Value::as_str),
+                tool.get("inputSchema"),
+            ) {
+                let keys: HashSet<String> = schema
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .map(|props| props.keys().cloned().collect())
+                    .unwrap_or_default();
+                map.insert(name.to_string(), keys);
+            }
+        }
+        map
+    })
+}
+
+/// 引数の全キーがツールスキーマの `properties` に含まれるか検証する。
+/// 未知キーがあれば JSON-RPC InvalidParams エラーを返す
+fn validate_known_params(tool_name: &str, args: &Value) -> Result<(), (i64, String)> {
+    let map = allowed_params_map();
+    let Some(allowed) = map.get(tool_name) else {
+        return Ok(());
+    };
+    if let Some(obj) = args.as_object() {
+        let unknown: Vec<&String> = obj.keys().filter(|k| !allowed.contains(*k)).collect();
+        if !unknown.is_empty() {
+            return Err((
+                -32602,
+                format!(
+                    "未知のパラメータ: {}（{tool_name} が受け付けるのは {} のみ）",
+                    unknown
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if allowed.is_empty() {
+                        "引数なし".to_string()
+                    } else {
+                        let mut sorted: Vec<&str> = allowed.iter().map(String::as_str).collect();
+                        sorted.sort_unstable();
+                        sorted.join(", ")
+                    },
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn required_u64(args: &Value, key: &str) -> Result<u64, String> {
@@ -4005,5 +4068,46 @@ mod tests {
             );
             assert!(slow_elapsed >= std::time::Duration::from_millis(400));
         }
+    }
+
+    #[test]
+    fn 未知パラメータはエラーになる_spawn() {
+        let msg = call(
+            "tako_orchestrator_spawn",
+            json!({ "project": "p", "prompt": "hi", "agentt": "codex" }),
+        );
+        let (resp, _) = run(msg, Some(0), true);
+        let err = &resp.unwrap()["error"];
+        assert_eq!(err["code"], -32602);
+        let msg = err["message"].as_str().unwrap();
+        assert!(msg.contains("agentt"), "エラーに未知キー名を含む: {msg}");
+        assert!(
+            msg.contains("tako_orchestrator_spawn"),
+            "エラーにツール名を含む: {msg}"
+        );
+    }
+
+    #[test]
+    fn 未知パラメータはエラーになる_list_panes() {
+        let msg = call("tako_list_panes", json!({ "foo": "bar" }));
+        let (resp, _) = run(msg, Some(0), true);
+        let err = &resp.unwrap()["error"];
+        assert_eq!(err["code"], -32602);
+        let msg = err["message"].as_str().unwrap();
+        assert!(msg.contains("foo"), "エラーに未知キー名を含む: {msg}");
+    }
+
+    #[test]
+    fn 正規パラメータはエラーにならない_spawn() {
+        let msg = call(
+            "tako_orchestrator_spawn",
+            json!({ "project": "p", "prompt": "hi", "agent": "codex", "pane": 0 }),
+        );
+        let (resp, _) = run(msg, Some(0), true);
+        assert!(
+            resp.as_ref().unwrap().get("error").is_none(),
+            "正規パラメータでエラー: {:?}",
+            resp
+        );
     }
 }
