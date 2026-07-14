@@ -2448,6 +2448,49 @@ fn dispatch_inner(
                 "不明な action: {other:?}（checkpoint / list / update / resume のいずれか）"
             ))),
         },
+
+        Request::TaskGate {
+            action,
+            task_id,
+            criteria_json,
+            results_json,
+            cwd,
+            sync_checkpoint,
+        } => match action.as_str() {
+            "set" => {
+                let tid = task_id.ok_or_else(|| {
+                    DispatchError::InvalidParams("set には task_id が必要".into())
+                })?;
+                let cj = criteria_json.ok_or_else(|| {
+                    DispatchError::InvalidParams("set には criteria_json が必要".into())
+                })?;
+                crate::acceptance_gates::set_gate_payload(&tid, &cj, cwd.as_deref())
+                    .map_err(DispatchError::Operation)
+            }
+            "show" => {
+                let tid = task_id.ok_or_else(|| {
+                    DispatchError::InvalidParams("show には task_id が必要".into())
+                })?;
+                crate::acceptance_gates::show_gate_payload(&tid).map_err(DispatchError::Operation)
+            }
+            "record_results" => {
+                let tid = task_id.ok_or_else(|| {
+                    DispatchError::InvalidParams("record_results には task_id が必要".into())
+                })?;
+                let rj = results_json.ok_or_else(|| {
+                    DispatchError::InvalidParams("record_results には results_json が必要".into())
+                })?;
+                crate::acceptance_gates::record_results_payload(
+                    &tid,
+                    &rj,
+                    sync_checkpoint.unwrap_or(false),
+                )
+                .map_err(DispatchError::Operation)
+            }
+            other => Err(DispatchError::InvalidParams(format!(
+                "不明な action: {other:?}（set / show / record_results のいずれか）"
+            ))),
+        },
     }
 }
 

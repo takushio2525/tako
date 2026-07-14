@@ -384,6 +384,24 @@ completion (or `tako_orchestrator_run` returns output):
    original symptom is confirmed gone in the environment where it was reported,
    or an equivalent. A worker's claim alone never closes an Issue.
 
+### Acceptance Gate (machine-verifiable criteria)
+
+Use `tako_task_gate` to define machine-checkable acceptance criteria when
+spawning a task. Then run `tako_task_gate_check` when the worker reports
+completion — it executes Command predicates and checks PR merge status
+automatically. This replaces manual `cargo test` / `gh pr view` round-trips.
+
+- **Define** (at spawn time or any time before check):
+  `tako_task_gate({ task_id, criteria: [{id: "tests", kind: {type: "command", cmd: "cargo test --workspace"}}, {id: "pr", kind: {type: "pr_merged", pr_number: 247}}] })`
+- **Check** (after worker reports done):
+  `tako_task_gate_check({ task_id, sync_checkpoint: true })`
+  Command criteria run in the gate's cwd. `sync_checkpoint: true` (default)
+  transitions the checkpoint phase to `done` when all criteria pass.
+- **Show** (inspect current state):
+  `tako_task_gate_show({ task_id })`
+- Custom criteria (`type: "custom"`) are skipped by gate check — set their
+  status manually via `tako_task_gate` with a `record_results` action.
+
 <!-- block: lifecycle -->
 ## Worker Lifecycle Management
 

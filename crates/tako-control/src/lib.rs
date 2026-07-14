@@ -15,6 +15,7 @@
 //! - config_io: 設定ファイルの安全な読み書き共通部品（アトミック書き込み・
 //!   プロセス間ロック・世代バックアップ。Issue #169）
 
+pub mod acceptance_gates;
 pub mod agents;
 pub mod agents_sync;
 pub mod claude_tui;
