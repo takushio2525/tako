@@ -4,6 +4,9 @@
 //! tab-bar セクション。高さ 44px / ピル型タブ（h30・radius 8）/ ペイン状態
 //! ミニインジケータ / fail 数表示 / ⌘K 検索エントリ / 通知ベル + バッジ /
 //! テーマ切替ボタン。traffic lights はタイトルバー統合（native）で同居する。
+//!
+//! オーバーフロー対応（Issue #208）: タブ数に応じてラベルを縮小 + GPUI
+//! ScrollHandle で横スクロール + アクティブタブの自動スクロールイン。
 
 use std::time::Duration;
 
@@ -19,11 +22,55 @@ use crate::file_icons::ui_icon;
 /// traffic lights（12px × 3 + gap 8px × 2 = 52px）+ 右余白 16px
 const TRAFFIC_LIGHTS_SPACER: f32 = 68.0;
 
+/// 1 タブのラベル込みの参考幅（px）。ラベル truncate 上限を決めるために使う概算値。
+/// 実測: dot(7) + gap(8) + pl(10) + label + pr(11) + gap(3)。
+/// ラベル 1 文字あたり約 7px（12.5px フォントの平均グリフ幅）
+const TAB_CHROME_PX: f32 = 42.0;
+const CHAR_WIDTH_PX: f32 = 7.0;
+/// タブラベルの最大文字数（通常時）
+const LABEL_MAX_CHARS: usize = 24;
+/// タブラベルの最小文字数（縮小限界）
+const LABEL_MIN_CHARS: usize = 6;
+/// 右端コントロール群の概算幅（⌘K(210+px) + bell(30) + theme(30) + gap + margin）
+const RIGHT_CONTROLS_PX: f32 = 300.0;
+
 impl TakoApp {
-    pub(crate) fn render_tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// タブ数と利用可能幅からラベルの truncate 上限文字数を決定する
+    fn tab_label_max_chars(&self, tab_count: usize, window: &Window) -> usize {
+        if tab_count == 0 {
+            return LABEL_MAX_CHARS;
+        }
+        let vw = f32::from(window.viewport_size().width);
+        let available = vw - TRAFFIC_LIGHTS_SPACER - RIGHT_CONTROLS_PX - 40.0;
+        let per_tab = available / tab_count as f32;
+        let label_px = (per_tab - TAB_CHROME_PX).max(0.0);
+        let chars = (label_px / CHAR_WIDTH_PX) as usize;
+        chars.clamp(LABEL_MIN_CHARS, LABEL_MAX_CHARS)
+    }
+
+    /// アクティブタブが表示領域に入るよう ScrollHandle を更新する。
+    /// タブ切替を行うすべての経路（クリック・⌘数字・CLI/MCP）から呼ぶ
+    pub(crate) fn scroll_active_tab_into_view(&self) {
+        let active = self.workspace.active_tab_id();
+        if let Some(idx) = self.workspace.tabs().iter().position(|t| t.id() == active) {
+            self.tab_scroll_handle.scroll_to_item(idx);
+        }
+    }
+
+    pub(crate) fn render_tab_bar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = self.theme.clone();
         let active = self.workspace.active_tab_id();
-        // (id, ラベル, タブ集約状態, ペインごとの状態, fail 数)
+
+        // アクティブタブが変わった（dispatch / new_tab 等）ら自動スクロールイン
+        if self.last_active_tab != Some(active) {
+            self.last_active_tab = Some(active);
+            self.scroll_active_tab_into_view();
+        }
+
         let tabs: Vec<_> = self
             .workspace
             .tabs()
@@ -65,6 +112,8 @@ impl TakoApp {
             CommandState::Unknown => theme.text_overlay,
         };
 
+        let label_max = self.tab_label_max_chars(tabs.len(), window);
+
         div()
             .flex()
             .flex_row()
@@ -78,16 +127,23 @@ impl TakoApp {
             .bg(rgba(theme.mantle))
             .border_b_1()
             .border_color(hsla(theme.border_subtle))
-            // 空き領域はウィンドウドラッグ（タイトルバー統合の代替）
             .window_control_area(WindowControlArea::Drag)
             // native traffic lights の載る領域
             .child(div().w(px(TRAFFIC_LIGHTS_SPACER)).h_full().flex_none())
+            // タブ領域（横スクロール対応。Issue #208）
+            // scroll_to_item が直接子要素のインデックスで動作するため、
+            // タブを scrollable コンテナの直接子要素にする
             .child(
                 div()
+                    .id("tab-scroll-area")
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(3.0))
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_x_scroll()
+                    .track_scroll(&self.tab_scroll_handle)
                     .children(
                         tabs.into_iter()
                             .map(|(id, label, agg, pane_states, fails)| {
@@ -95,7 +151,6 @@ impl TakoApp {
                                 let dot_color = state_color(&agg);
                                 let pulsing = matches!(agg, CommandState::Running);
 
-                                // 状態ドット（7px。active は glow、running は pulse）
                                 let dot = div()
                                     .w(px(7.0))
                                     .h(px(7.0))
@@ -126,6 +181,8 @@ impl TakoApp {
                                     dot.into_any_element()
                                 };
 
+                                let truncated = truncate(&label, label_max);
+
                                 div()
                                     .id(("tab", id.as_u64()))
                                     .group("tab-pill")
@@ -136,6 +193,7 @@ impl TakoApp {
                                     .h(px(30.0))
                                     .pl(px(10.0))
                                     .pr(px(11.0))
+                                    .flex_shrink_0()
                                     .rounded(px(8.0))
                                     .cursor_pointer()
                                     .when(is_active, |d| {
@@ -163,13 +221,14 @@ impl TakoApp {
                                     .text_size(px(12.5))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         let _ = this.workspace.activate_tab(id);
+                                        this.scroll_active_tab_into_view();
                                         cx.notify();
                                     }))
                                     .on_drag(
                                         TabDrag { tab: id },
                                         self.drag_ghost_builder(
                                             DragKind::Tab,
-                                            truncate(&label, 24),
+                                            truncated.clone(),
                                             cx,
                                         ),
                                     )
@@ -181,9 +240,8 @@ impl TakoApp {
                                             } else {
                                                 FontWeight::MEDIUM
                                             })
-                                            .child(SharedString::from(truncate(&label, 24))),
+                                            .child(SharedString::from(truncated)),
                                     )
-                                    // ペイン状態ミニインジケータ（active タブのみ。5px 角丸四角）
                                     .when(is_active && pane_states.len() > 1, |d| {
                                         d.child(
                                             div()
@@ -201,7 +259,6 @@ impl TakoApp {
                                                 })),
                                         )
                                     })
-                                    // fail 数（カンプ: JetBrains Mono 10.5px 600 red）
                                     .when(!is_active && fails > 0, |d| {
                                         d.child(
                                             div()
@@ -212,7 +269,6 @@ impl TakoApp {
                                                 .child(SharedString::from(format!("{fails} fail"))),
                                         )
                                     })
-                                    // ー: バックグラウンドへ退避（現行機能の維持。active のみ表示）
                                     .when(is_active, |d| {
                                         d.child(
                                             div()
@@ -243,7 +299,6 @@ impl TakoApp {
                                                 ),
                                         )
                                     })
-                                    // ×: タブを閉じる（カンプ 17×17 / radius 5。active のみ表示)
                                     .when(is_active, |d| {
                                         d.child(
                                             div()
@@ -301,7 +356,6 @@ impl TakoApp {
                             ),
                     ),
             )
-            .child(div().flex_grow(1.0))
             // ⌘K コマンドパレット入口（カンプ: h30 / min-w 210 / radius 8）
             .child(
                 div()

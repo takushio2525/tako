@@ -797,6 +797,10 @@ struct TakoApp {
     pane_logs: std::sync::Arc<std::sync::Mutex<tako_core::pane_log::PaneLogManager>>,
     /// 自動保存が必要なプレビューペイン（デバウンスタイマーで消費。#195）
     autosave_pending: std::collections::HashSet<PaneId>,
+    /// タブバーの横スクロール（Issue #208。GPUI ScrollHandle で位置を制御）
+    tab_scroll_handle: gpui::ScrollHandle,
+    /// 前回 render 時のアクティブタブ ID（タブ切替時のみ自動スクロール発火用。Issue #208）
+    last_active_tab: Option<TabId>,
 }
 
 /// × ボタン close の確認ダイアログ対象（Issue #172）
@@ -1645,6 +1649,8 @@ impl TakoApp {
                 ),
             )),
             autosave_pending: std::collections::HashSet::new(),
+            tab_scroll_handle: gpui::ScrollHandle::new(),
+            last_active_tab: None,
         };
         // App Nap 無効化 + 初回スリープ防止更新（Issue #173）
         // 蓋閉じ防止の残留チェック（#218: 前回クラッシュ時の disablesleep=1 を自動復帰）
@@ -4701,6 +4707,7 @@ impl TakoApp {
         if let Some(id) = self.workspace.tabs().get(index).map(|t| t.id()) {
             let _ = self.workspace.activate_tab(id);
         }
+        self.scroll_active_tab_into_view();
         self.sync_filetree_roots();
         cx.notify();
     }
@@ -7858,6 +7865,7 @@ impl TakoApp {
                     let _ = t.tree_mut().focus(p);
                 }
                 let _ = self.workspace.activate_tab(tab);
+                self.scroll_active_tab_into_view();
             }
         } else {
             let target = self.workspace.active_tab().tree().focused();
@@ -10865,7 +10873,7 @@ impl Render for TakoApp {
                     this.on_mouse_up(event, cx);
                 }),
             )
-            .child(self.render_tab_bar(cx))
+            .child(self.render_tab_bar(window, cx))
             .child(
                 div()
                     .flex_1()
@@ -14942,6 +14950,7 @@ mod self_test {
                         .map(|tab| tab.id())
                     {
                         let _ = app.workspace.activate_tab(tab);
+                        app.scroll_active_tab_into_view();
                         let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
                     }
                     preview_window.refresh();
