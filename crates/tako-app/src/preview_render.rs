@@ -117,7 +117,7 @@ impl TakoApp {
             }
         }
         if let Some(preview) = self.previews.get(&pane_id) {
-            return format!("📄 {}", preview.file_name());
+            return preview.file_name().to_string();
         }
         self.terminals
             .get(&pane_id)
@@ -1062,20 +1062,25 @@ impl TakoApp {
                                     .into_any_element()
                             }));
 
-                    // ミュートボタン
-                    let mute_label: SharedString = if is_muted {
-                        "\u{1f507}".into() // 🔇
-                    } else {
-                        "\u{1f50a}".into() // 🔊
-                    };
+                    // ミュートボタン（絵文字全廃 #217: SVG）
                     let mute_btn = div()
                         .id(("video-mute", pane_id.as_u64()))
                         .cursor_pointer()
-                        .text_size(px(14.0))
                         .px(px(2.0))
+                        .py(px(2.0))
                         .rounded(px(3.0))
                         .hover(|s| s.bg(hsla_alpha(theme.foreground, 0.1)))
-                        .child(mute_label)
+                        .child(
+                            svg()
+                                .path(if is_muted {
+                                    crate::file_icons::ui_icon::VOLUME_OFF
+                                } else {
+                                    crate::file_icons::ui_icon::VOLUME_ON
+                                })
+                                .w(px(14.0))
+                                .h(px(14.0))
+                                .text_color(hsla_alpha(theme.foreground, 0.8)),
+                        )
                         .on_click(cx.listener(move |this, _ev: &gpui::ClickEvent, _, cx| {
                             if let Some(p) = this.video_players.get_mut(&pane_id) {
                                 p.toggle_mute();
@@ -1098,7 +1103,17 @@ impl TakoApp {
                             d.text_color(hsla_alpha(theme.foreground, 0.6))
                                 .hover(|s| s.bg(hsla_alpha(theme.foreground, 0.1)))
                         })
-                        .child(SharedString::from("\u{1f501}")) // 🔁
+                        .child(
+                            svg()
+                                .path(crate::file_icons::ui_icon::LOOP_REPEAT)
+                                .w(px(13.0))
+                                .h(px(13.0))
+                                .text_color(if is_looping {
+                                    hsla(theme.background)
+                                } else {
+                                    hsla_alpha(theme.foreground, 0.7)
+                                }),
+                        )
                         .on_click(cx.listener(move |this, _ev: &gpui::ClickEvent, _, cx| {
                             if let Some(p) = this.video_players.get_mut(&pane_id) {
                                 p.toggle_loop();
@@ -1290,7 +1305,7 @@ impl TakoApp {
                 }),
             )
             .child(
-                // タイトルバー: × / 📄 ファイル名 / （md のみ）モードトグル
+                // タイトルバー: × / 種別アイコン + ファイル名 / （md のみ）モードトグル
                 div()
                     .id(("preview-titlebar", pane_id.as_u64()))
                     .h(px(PANE_TITLE_BAR))
@@ -1317,11 +1332,7 @@ impl TakoApp {
                     .cursor(CursorStyle::OpenHand)
                     .on_drag(
                         PaneDrag { pane: pane_id },
-                        self.drag_ghost_builder(
-                            DragKind::Pane,
-                            format!("📄 {}", truncate(&file_name, 24)),
-                            cx,
-                        ),
+                        self.drag_ghost_builder(DragKind::Pane, truncate(&file_name, 24), cx),
                     )
                     .child(
                         div()
@@ -1355,37 +1366,49 @@ impl TakoApp {
                             } else {
                                 hsla(theme.tab_inactive_foreground)
                             })
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(5.0))
+                            // 種別アイコン（絵文字全廃 #217: 既存ファイルアイコン SVG）
+                            .child(
+                                svg()
+                                    .path(match mode {
+                                        preview::PreviewMode::Image => "icons/file_icons/image.svg",
+                                        preview::PreviewMode::Pdf => "icons/file_icons/book.svg",
+                                        _ => crate::file_icons::ui_icon::FILE_GENERIC,
+                                    })
+                                    .w(px(13.0))
+                                    .h(px(13.0))
+                                    .flex_none()
+                                    .text_color(hsla(theme.text_tertiary)),
+                            )
                             .child(SharedString::from({
-                                let icon = match mode {
-                                    preview::PreviewMode::Image => "🖼",
-                                    preview::PreviewMode::Pdf => "📕",
-                                    _ => "📄",
+                                let suffix = if autosave {
+                                    match &save_status {
+                                        Some(preview::SaveStatus::Saved) => " \u{00B7} 保存済",
+                                        Some(preview::SaveStatus::Conflict) => " \u{00B7} 競合",
+                                        Some(preview::SaveStatus::Error(_)) => " \u{00B7} エラー",
+                                        None if dirty => " \u{25CF}",
+                                        None => "",
+                                    }
+                                } else if dirty {
+                                    " \u{25CF}"
+                                } else {
+                                    ""
                                 };
-                                {
-                                    let suffix = if autosave {
-                                        match &save_status {
-                                            Some(preview::SaveStatus::Saved) => " ✓",
-                                            Some(preview::SaveStatus::Conflict) => " ⚠ 競合",
-                                            Some(preview::SaveStatus::Error(_)) => " ⚠ エラー",
-                                            None if dirty => " ●",
-                                            None => "",
-                                        }
-                                    } else if dirty {
-                                        " ●"
-                                    } else {
-                                        ""
-                                    };
-                                    format!("{icon} {}{suffix}", truncate(&file_name, 36))
-                                }
+                                format!("{}{suffix}", truncate(&file_name, 36))
                             })),
                     )
                     .child(div().flex_grow(1.0))
                     .children((md_capable && edit_snap.is_none()).then(|| {
                         // 目アイコンのトグル（FR-3.3）: コード表示 ⇔ md レンダリング
                         let (icon, label) = match mode {
-                            preview::PreviewMode::Markdown => ("</>", "コードとして表示"),
-                            preview::PreviewMode::Code => ("👁", "md レンダリング表示"),
-                            _ => ("", ""),
+                            preview::PreviewMode::Markdown => (None, "コードとして表示"),
+                            preview::PreviewMode::Code => {
+                                (Some(crate::file_icons::ui_icon::EYE), "md レンダリング表示")
+                            }
+                            _ => (None, ""),
                         };
                         div()
                             .id(("preview-mode-toggle", pane_id.as_u64()))
@@ -1406,7 +1429,17 @@ impl TakoApp {
                                 cx.stop_propagation();
                                 this.toggle_preview_mode(pane_id, cx);
                             }))
-                            .child(SharedString::from(format!("{icon} {label}")))
+                            .when(mode == preview::PreviewMode::Markdown, |d| {
+                                d.child(SharedString::from("</>"))
+                            })
+                            .children(icon.map(|p| {
+                                svg()
+                                    .path(p)
+                                    .w(px(13.0))
+                                    .h(px(13.0))
+                                    .text_color(hsla(theme.accent))
+                            }))
+                            .child(SharedString::from(label))
                     }))
                     .children(editable.then(|| {
                         div()
@@ -1431,11 +1464,22 @@ impl TakoApp {
                                 }
                                 cx.notify();
                             }))
-                            .child(if editing {
-                                "✓ 編集中"
-                            } else {
-                                "✎ 編集"
-                            })
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                svg()
+                                    .path(crate::file_icons::ui_icon::PENCIL)
+                                    .w(px(12.0))
+                                    .h(px(12.0))
+                                    .text_color(hsla(if editing {
+                                        theme.green
+                                    } else {
+                                        theme.accent
+                                    })),
+                            )
+                            .child(if editing { "編集中" } else { "編集" })
                     }))
                     .children((dirty && !autosave).then(|| {
                         div()
@@ -1507,7 +1551,13 @@ impl TakoApp {
                                 .flex_row()
                                 .items_center()
                                 .gap_1()
-                                .child("🔍")
+                                .child(
+                                    svg()
+                                        .path(crate::file_icons::ui_icon::SEARCH)
+                                        .w(px(12.0))
+                                        .h(px(12.0))
+                                        .text_color(hsla(theme.text_tertiary)),
+                                )
                                 .child(
                                     div()
                                         .id(("search-query-field", pane_id.as_u64()))

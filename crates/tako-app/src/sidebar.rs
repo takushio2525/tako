@@ -315,16 +315,19 @@ impl TakoApp {
                             if let (true, Some(edit)) = (is_inline, inline_edit_snapshot.as_ref()) {
                                 let depth = row.depth;
                                 let indent = 8.0 + 12.0 * depth as f32;
-                                let icon = match edit.kind {
+                                // 種別アイコン（絵文字全廃 #217: SVG マスク描画）
+                                let icon_path = match edit.kind {
                                     InlineEditKind::Rename => {
                                         if is_dir {
-                                            "🗂 "
+                                            Some(file_icons::ui_icon::FOLDER)
                                         } else {
-                                            ""
+                                            None
                                         }
                                     }
-                                    InlineEditKind::NewFile => "📄 ",
-                                    InlineEditKind::NewDir => "🗂 ",
+                                    InlineEditKind::NewFile => {
+                                        Some(file_icons::ui_icon::FILE_GENERIC)
+                                    }
+                                    InlineEditKind::NewDir => Some(file_icons::ui_icon::FOLDER),
                                 };
                                 let before_cursor = &edit.text[..edit.cursor];
                                 let after_cursor = &edit.text[edit.cursor..];
@@ -333,11 +336,18 @@ impl TakoApp {
                                     .flex()
                                     .flex_row()
                                     .items_center()
+                                    .gap(px(4.0))
                                     .w_full()
                                     .px_1()
                                     .pl(px(indent))
                                     .bg(rgba_alpha(theme.tab_active_background, 0.8))
-                                    .child(SharedString::from(icon.to_string()))
+                                    .children(icon_path.map(|p| {
+                                        svg()
+                                            .path(p)
+                                            .size(px(14.0))
+                                            .flex_none()
+                                            .text_color(hsla(theme.text_muted))
+                                    }))
                                     .child(
                                         div()
                                             .flex_1()
@@ -400,11 +410,7 @@ impl TakoApp {
                                     FileDrag { path: drag_path },
                                     self.drag_ghost_builder(
                                         DragKind::File,
-                                        format!(
-                                            "{} {}",
-                                            if is_dir { "🗂" } else { "📄" },
-                                            truncate(&row.entry.name, 24)
-                                        ),
+                                        truncate(&row.entry.name, 24),
                                         cx,
                                     ),
                                 );

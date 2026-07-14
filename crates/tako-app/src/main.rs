@@ -224,8 +224,8 @@ enum PanelView {
 enum PromptFlowState {
     /// alt_screen 遷移待ち（claude TUI の起動待ち。spawn / await_prompt 経路のみ）
     WaitAltScreen,
-    /// 送信可能待ち: 信頼ダイアログが出ていれば承諾し、入力欄（❯）表示で貼り付ける。
-    /// 信頼ダイアログも選択カーソルに ❯ を含むため、ダイアログ判定を先に行う
+    /// 送信可能待ち: 信頼ダイアログが出ていれば承諾し、入力欄（プロンプト記号）表示で貼り付ける。
+    /// 信頼ダイアログも選択カーソルに同じプロンプト記号を含むため、ダイアログ判定を先に行う
     WaitPromptReady,
     /// 貼り付け済み、入力欄への反映待ち。反映確認後に送信の Enter を
     /// 貼り付けと分離した単独キーとして送る（次 tick = 500ms 以上の遅延）
@@ -250,7 +250,7 @@ struct PromptFlow {
     trust_accepts: u8,
     /// 入力欄残留に対する Enter 単独再送の残り回数
     enter_retries_left: u8,
-    /// true = claude TUI の起動（alt_screen + ❯）を待つ（spawn / await_prompt）。
+    /// true = claude TUI の起動（alt_screen + プロンプト記号）を待つ（spawn / await_prompt）。
     /// false = 現画面へ即貼り付けの汎用送信（TUI でなければ 2 秒待って貼る）
     wait_tui: bool,
     /// Enter 単独送達モード（Issue #95）: 貼り付けせず Enter を送り、入力欄が
@@ -754,7 +754,7 @@ struct TakoApp {
     webview_next_id: u64,
     /// 今フレームで描画された Web ビュー（render 末尾の可視性同期で使う）
     webview_marks: std::collections::HashSet<webview::WebViewId>,
-    /// Web ビュー dock パネルの開閉（ステータスバーの 🌐 ボタン）
+    /// Web ビュー dock パネルの開閉（ステータスバーの Web ボタン）
     webview_dock_open: bool,
     /// Web ビュー dock の URL 入力欄（#207）
     webview_dock_url_input: String,
@@ -2684,7 +2684,7 @@ impl TakoApp {
                             (None, Some(r)) => r.to_string(),
                             // プレビューペイン（FR-3.2）はファイル名で表す
                             (None, None) => match self.previews.get(&p.id()) {
-                                Some(preview) => format!("📄 {}", preview.file_name()),
+                                Some(preview) => preview.file_name().to_string(),
                                 None => session
                                     .and_then(|s| s.title())
                                     .unwrap_or("シェル")
@@ -2941,7 +2941,7 @@ impl TakoApp {
     }
 
     /// プレビューのピン留めを設定する（FR-2.16.15）。pinned 省略時はトグル。
-    /// UI の 📌 ボタンと dispatch（CLI / MCP）の両方から呼ぶ（操作経路を一本化）。
+    /// UI のピンボタンと dispatch（CLI / MCP）の両方から呼ぶ（操作経路を一本化）。
     /// 新規ピンは重ならないようカスケード配置する（以後 D&D で動かせる）
     fn set_pin(&mut self, target: PreviewTarget, pinned: Option<bool>) {
         let existing = self.pinned_previews.iter().position(|p| p.target == target);
@@ -3141,7 +3141,7 @@ impl TakoApp {
                         }
                     } else if flow.enter_only {
                         // Enter 単独送達（Issue #95）: 貼り付けせず、入力欄の現内容を
-                        // 残留判定の基準に控えて Enter を送る。❯ が見えない画面
+                        // 残留判定の基準に控えて Enter を送る。プロンプト記号が見えない画面
                         // （他 TUI 等）へも 2 秒待って Enter だけ送る（検証は不能 = 1 発）
                         if claude_tui::input_line(&lines).is_some()
                             || flow.state_entered_at.elapsed() > std::time::Duration::from_secs(2)
@@ -3157,7 +3157,7 @@ impl TakoApp {
                         || (!flow.wait_tui
                             && flow.state_entered_at.elapsed() > std::time::Duration::from_secs(2))
                     {
-                        // 入力欄（❯）を確認して貼り付け。汎用送信（wait_tui=false）は
+                        // 入力欄（プロンプト記号）を確認して貼り付け。汎用送信（wait_tui=false）は
                         // 対象が claude TUI でなくても 2 秒待って貼る（他 TUI への送信）。
                         // bracketed paste はアプリが要求していれば paste() が括りを付ける
                         session.paste(&flow.prompt);
@@ -7702,11 +7702,7 @@ impl TakoApp {
                     .cursor(CursorStyle::OpenHand)
                     .on_drag(
                         PaneDrag { pane: pane_id },
-                        self.drag_ghost_builder(
-                            DragKind::Pane,
-                            format!("🌐 {}", truncate(&display_title, 24)),
-                            cx,
-                        ),
+                        self.drag_ghost_builder(DragKind::Pane, truncate(&display_title, 24), cx),
                     )
                     .child(
                         div()
@@ -7769,10 +7765,18 @@ impl TakoApp {
                             } else {
                                 hsla(theme.tab_inactive_foreground)
                             })
-                            .child(SharedString::from(format!(
-                                "🌐 {}",
-                                truncate(&display_title, 32)
-                            ))),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(5.0))
+                            .child(
+                                svg()
+                                    .path(crate::file_icons::ui_icon::GLOBE)
+                                    .w(px(12.0))
+                                    .h(px(12.0))
+                                    .text_color(hsla(theme.accent)),
+                            )
+                            .child(SharedString::from(truncate(&display_title, 32))),
                     )
                     .child(
                         // URL 表示（タイトルの右に控えめに。編集は CLI / MCP / cmd+K 経由）
@@ -8020,10 +8024,18 @@ impl TakoApp {
                         div()
                             .text_size(px(11.0))
                             .text_color(hsla(theme.foreground))
-                            .child(SharedString::from(format!(
-                                "🌐 {}",
-                                truncate(&display_title, 36)
-                            ))),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(5.0))
+                            .child(
+                                svg()
+                                    .path(crate::file_icons::ui_icon::GLOBE)
+                                    .w(px(12.0))
+                                    .h(px(12.0))
+                                    .text_color(hsla(theme.accent)),
+                            )
+                            .child(SharedString::from(truncate(&display_title, 36))),
                     )
                     .child(
                         div()
@@ -8116,10 +8128,12 @@ impl TakoApp {
             .h(px(28.0))
             .px(px(8.0))
             .child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(hsla(theme.accent))
-                    .child("🌐"),
+                svg()
+                    .path(crate::file_icons::ui_icon::GLOBE)
+                    .w(px(13.0))
+                    .h(px(13.0))
+                    .flex_none()
+                    .text_color(hsla(theme.accent)),
             )
             .child(
                 div()

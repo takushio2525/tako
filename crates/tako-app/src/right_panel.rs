@@ -233,7 +233,13 @@ impl TakoApp {
                                     Some((kill_name.clone(), Some(w_index), kill_socket.clone()));
                                 cx.notify();
                             }))
-                            .child("🗑"),
+                            .child(
+                                svg()
+                                    .path(ui_icon::TRASH)
+                                    .w(px(12.0))
+                                    .h(px(12.0))
+                                    .text_color(hsla_alpha(theme.red, 0.9)),
+                            ),
                     ),
             );
         }
@@ -1419,7 +1425,7 @@ impl TakoApp {
                                     .child("WORK"),
                             )
                         })
-                        // バックグラウンド行に 📌 ピン留めボタン（FR-2.16.15。ピン中は常時表示、
+                        // バックグラウンド行にピン留めボタン（FR-2.16.15。ピン中は常時表示、
                         // 未ピンは行ホバー時のみ）。前面行はプレビュー対象外なので出さない
                         .when(!is_active, |d| {
                             d.child(
@@ -1440,7 +1446,13 @@ impl TakoApp {
                                         this.set_pin(PreviewTarget::Pane(pane), None);
                                         cx.notify();
                                     }))
-                                    .child("📌"),
+                                    .child(
+                                        svg()
+                                            .path(ui_icon::PIN)
+                                            .w(px(12.0))
+                                            .h(px(12.0))
+                                            .text_color(hsla(theme.text_tertiary)),
+                                    ),
                             )
                         })
                         .child(
@@ -1570,7 +1582,13 @@ impl TakoApp {
                                             );
                                             cx.notify();
                                         }))
-                                        .child("📌"),
+                                        .child(
+                                        svg()
+                                            .path(ui_icon::PIN)
+                                            .w(px(12.0))
+                                            .h(px(12.0))
+                                            .text_color(hsla(theme.text_tertiary)),
+                                    ),
                                 ),
                         );
                     }
@@ -1899,7 +1917,7 @@ impl TakoApp {
                                     shelf_group.entries.len()
                                 ))),
                         )
-                        // グループ全体を 📌 ピン留め（FR-2.16.15 / FR-2.16.16）
+                        // グループ全体をピン留め（FR-2.16.15 / FR-2.16.16）
                         .child(
                             div()
                                 .id(("group-pin", group_tab.as_u64()))
@@ -1919,7 +1937,13 @@ impl TakoApp {
                                     this.set_pin(PreviewTarget::ClosedGroup(group_tab), None);
                                     cx.notify();
                                 }))
-                                .child("📌"),
+                                .child(
+                                    svg()
+                                        .path(ui_icon::PIN)
+                                        .w(px(12.0))
+                                        .h(px(12.0))
+                                        .text_color(hsla(theme.text_tertiary)),
+                                ),
                         ),
                 );
             for entry in &shelf_group.entries {

@@ -1492,7 +1492,8 @@ pub fn markdown_blocks(text: &str) -> Vec<MdBlock> {
             }
             Event::TaskListMarker(done) => push_span(
                 &mut spans,
-                if done { "☑ " } else { "☐ " },
+                // MD ソース表記のまま描画（絵文字全廃 #217。[x] / [ ] は mono で揃う）
+                if done { "[x] " } else { "[ ] " },
                 false,
                 bold,
                 italic,

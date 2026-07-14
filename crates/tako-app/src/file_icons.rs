@@ -110,7 +110,14 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     ui_asset!("bell"),
     ui_asset!("bg_drawer"),
     ui_asset!("coffee"),
+    ui_asset!("eye"),
     ui_asset!("globe"),
+    ui_asset!("loop_repeat"),
+    ui_asset!("pencil"),
+    ui_asset!("pin"),
+    ui_asset!("trash"),
+    ui_asset!("volume_off"),
+    ui_asset!("volume_on"),
     ui_asset!("chevron_down_ui"),
     ui_asset!("chevron_right_ui"),
     ui_asset!("close"),
@@ -144,7 +151,14 @@ pub mod ui_icon {
     pub const BELL: &str = "icons/ui/bell.svg";
     pub const BG_DRAWER: &str = "icons/ui/bg_drawer.svg";
     pub const COFFEE: &str = "icons/ui/coffee.svg";
+    pub const EYE: &str = "icons/ui/eye.svg";
     pub const GLOBE: &str = "icons/ui/globe.svg";
+    pub const LOOP_REPEAT: &str = "icons/ui/loop_repeat.svg";
+    pub const PENCIL: &str = "icons/ui/pencil.svg";
+    pub const PIN: &str = "icons/ui/pin.svg";
+    pub const TRASH: &str = "icons/ui/trash.svg";
+    pub const VOLUME_OFF: &str = "icons/ui/volume_off.svg";
+    pub const VOLUME_ON: &str = "icons/ui/volume_on.svg";
     pub const CHEVRON_DOWN: &str = "icons/ui/chevron_down_ui.svg";
     pub const CHEVRON_RIGHT: &str = "icons/ui/chevron_right_ui.svg";
     pub const CLOSE: &str = "icons/ui/close.svg";
