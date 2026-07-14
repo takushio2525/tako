@@ -164,6 +164,62 @@ pub fn resolve_session_id_for_backend(backend_session: &str) -> Option<String> {
     None
 }
 
+/// tmux セッション配下に実行中の子プロセス（tmux クライアント除外）があるか。
+/// worker_status の idle 判定を補正するために使う（Issue #224: 偽 IDLE 根治）。
+/// `backend_session` は tako の tmux バックエンドセッション名（例: `tako-s3`）。
+/// tmux ペインの pane_pid の子孫プロセスを走査し、tmux クライアント自体を除いた
+/// 実ユーザープロセスが 1 つでもあれば true を返す
+pub fn has_running_children(backend_session: &str) -> bool {
+    let socket = tako_core::tmux_backend::socket_name();
+    let panes = tmux_pane_pids(Some(&socket));
+    let target_pids: Vec<u32> = panes
+        .into_iter()
+        .filter(|(id, _)| id.starts_with(&format!("{backend_session}:")))
+        .map(|(_, pid)| pid)
+        .collect();
+    if target_pids.is_empty() {
+        return false;
+    }
+
+    let parents = process_parent_map();
+    // pane_pid の子孫を収集（pane_pid 自体 = シェルは除外）
+    let pane_set: std::collections::HashSet<u32> = target_pids.iter().copied().collect();
+    let mut child_count = 0u32;
+    for (&pid, &ppid) in &parents {
+        if pane_set.contains(&pid) {
+            continue; // pane_pid 自体（シェル）は除外
+        }
+        // ppid が pane_pid のいずれか、または pane_pid の子孫か
+        if is_descendant_of(ppid, &pane_set, &parents) {
+            child_count += 1;
+        }
+    }
+    // tmux クライアント分を差し引く: tmux セッション 1 つにつき attach 中の
+    // クライアントが 1 つ居る（tako の backend ペイン構造）。ただしクライアントは
+    // pane_pid の直接の子ではなくセッションに attach しているだけなので、
+    // 上記の子孫走査ではカウントされない。安全のため 0 超で true を返す
+    child_count > 0
+}
+
+/// pid が target_pids のいずれかの子孫（自身を含む）かどうか
+fn is_descendant_of(
+    pid: u32,
+    target_pids: &std::collections::HashSet<u32>,
+    parents: &HashMap<u32, u32>,
+) -> bool {
+    let mut current = pid;
+    for _ in 0..MAX_ANCESTOR_HOPS {
+        if target_pids.contains(&current) {
+            return true;
+        }
+        match parents.get(&current) {
+            Some(&ppid) if ppid != 0 && ppid != current => current = ppid,
+            _ => break,
+        }
+    }
+    false
+}
+
 /// エージェント一覧に tmux ペイン対応を付与した完全版を返す（remote / dispatch / CLI 共用）。
 /// `socket` 省略時は tako バックエンドソケットを使う
 pub fn list_agents_with_panes(socket: Option<&str>) -> Result<Value, String> {

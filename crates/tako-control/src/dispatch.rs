@@ -3202,6 +3202,8 @@ pub struct WorkerStatusCtx {
     backend_session: Option<String>,
     /// ライブ画面の末尾（空行除去 + 最大 30 行に整形済み）。ペインが GUI に無ければ None
     live_tail: Option<String>,
+    /// ライブ画面全体のテキスト（折りたたみ検出用。ペインが GUI に無ければ None）
+    full_screen: Option<String>,
 }
 
 /// 末尾の空行を除去し、最大 30 行に切り詰めて 1 本のテキストへ
@@ -3224,12 +3226,13 @@ fn collect_worker_status_ctx(host: &dyn ControlHost, pane_id: u64) -> WorkerStat
             .iter()
             .any(|p| p.id().as_u64() == pane_id)
     });
+    let lines = host.session(target).map(|session| session.visible_lines());
+    let full_screen = lines.as_ref().map(|l| l.join("\n"));
     WorkerStatusCtx {
         pane_exists: in_tree || host.workspace().is_shelved(target),
         backend_session: host.backend_session(target),
-        live_tail: host
-            .session(target)
-            .map(|session| tail_join(session.visible_lines())),
+        live_tail: lines.map(tail_join),
+        full_screen,
     }
 }
 
@@ -3244,6 +3247,7 @@ fn finish_worker_status(
         pane_exists,
         backend_session,
         live_tail,
+        full_screen,
     } = ctx;
 
     // session_id の解決: 明示指定 > pane→session 自動解決 > フォールバック
@@ -3253,8 +3257,8 @@ fn finish_worker_status(
         status_source = "agents";
     } else if pane_exists {
         // pane→session 自動解決: backend_session から pid 祖先辿り
-        if let Some(backend) = backend_session {
-            if let Some(sid) = crate::agents::resolve_session_id_for_backend(&backend) {
+        if let Some(ref backend) = backend_session {
+            if let Some(sid) = crate::agents::resolve_session_id_for_backend(backend) {
                 resolved_sid = Some(sid);
                 status_source = "agents-auto";
             } else {
@@ -3302,6 +3306,12 @@ fn finish_worker_status(
         }
     }
 
+    // #224 偽 IDLE 根治: idle / error 判定の前に、tmux セッション配下で
+    // 実行中の子プロセスがあれば busy に補正する。画面だけでなくプロセス実在を確認
+    let has_children = backend_session
+        .as_ref()
+        .is_some_and(|bs| crate::agents::has_running_children(bs));
+
     // idle 誤検知防止: サブエージェント完了の瞬間に claude agents --json が
     // 一時的に idle を返すことがある。末尾付近に ❯ プロンプトが
     // なければメインはまだ作業中なので busy に補正する
@@ -3310,7 +3320,7 @@ fn finish_worker_status(
         let has_prompt = recent_output
             .as_ref()
             .is_some_and(|out| crate::orchestrator::wait::screen_looks_idle(out));
-        if !has_prompt {
+        if !has_prompt || has_children {
             status = "busy".to_string();
         }
     }
@@ -3321,7 +3331,7 @@ fn finish_worker_status(
     // watch / run 側は従来どおり idle 連続 8 回を要求し、単発の誤判定では完了しない）
     if status == "unknown" {
         if let Some(ref out) = recent_output {
-            if crate::orchestrator::wait::screen_looks_busy(out) {
+            if crate::orchestrator::wait::screen_looks_busy(out) || has_children {
                 status = "busy".to_string();
             } else if crate::orchestrator::wait::screen_looks_idle(out) {
                 status = "idle".to_string();
@@ -3347,6 +3357,26 @@ fn finish_worker_status(
         }
     }
 
+    // #224 停滞検知: busy だが実行中子プロセスなし → stalled（停滞）
+    let mut stalled_info: Option<Value> = None;
+    if status == "busy" && !has_children {
+        let screen_busy = recent_output
+            .as_ref()
+            .is_some_and(|out| crate::orchestrator::wait::screen_looks_busy(out));
+        if !screen_busy {
+            status = "stalled".to_string();
+            stalled_info = Some(json!({
+                "detail": "busy と判定されたが実行中の子プロセスが無く、画面の busy パターンも無い",
+                "recommended_action": "check_and_resume",
+            }));
+        }
+    }
+
+    // #224 折りたたみ検出: TUI が「N new messages (click) ↓」で折りたたまれている
+    let collapsed = full_screen
+        .as_ref()
+        .is_some_and(|s| crate::orchestrator::wait::screen_is_collapsed(s));
+
     Ok(json!({
         "status": status,
         "ctx_percent": ctx_percent,
@@ -3354,6 +3384,9 @@ fn finish_worker_status(
         "status_source": status_source,
         "resolved_session_id": resolved_sid,
         "error": error_info,
+        "stalled": stalled_info,
+        "has_running_children": has_children,
+        "collapsed": collapsed,
     }))
 }
 
@@ -5978,6 +6011,7 @@ mod tests {
             pane_exists: false,
             backend_session: None,
             live_tail: None,
+            full_screen: None,
         };
         let v = finish_worker_status(ctx, None, None).unwrap();
         assert_eq!(v["status"], "gone");
@@ -5993,6 +6027,7 @@ mod tests {
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some("done\n❯ ".into()),
+                full_screen: None,
             },
             None,
             None,
@@ -6006,6 +6041,7 @@ mod tests {
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some("Thinking…\nesc to interrupt".into()),
+                full_screen: None,
             },
             None,
             None,
@@ -6018,6 +6054,7 @@ mod tests {
                 pane_exists: true,
                 backend_session: None,
                 live_tail: None,
+                full_screen: None,
             },
             None,
             None,
@@ -6036,6 +6073,7 @@ mod tests {
                 live_tail: Some(
                     "  ⎿  API Error: Connection closed mid-response. The response above may be incomplete.\n\n❯ ".into(),
                 ),
+                full_screen: None,
             },
             None,
             None,
@@ -6057,6 +6095,7 @@ mod tests {
                 live_tail: Some(
                     "■ You've hit your usage limit. Upgrade to Pro or try again at 4:24 AM.\n\n› 1. Switch to gpt-5.4-mini".into(),
                 ),
+                full_screen: None,
             },
             None,
             None,
@@ -6072,6 +6111,7 @@ mod tests {
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some("done\n❯ ".into()),
+                full_screen: None,
             },
             None,
             None,
@@ -6088,6 +6128,7 @@ mod tests {
                 live_tail: Some(
                     "  ⎿  API Error (Connection error.) · Retrying in 4 seconds… (attempt 3/10)\nesc to interrupt".into(),
                 ),
+                full_screen: None,
             },
             None,
             None,

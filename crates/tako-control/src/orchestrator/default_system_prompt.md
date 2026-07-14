@@ -257,6 +257,8 @@ The watch command will output when the worker stops:
 - `WORKER_IDLE: tako:<pane> (ctx NN%)` — worker completed or awaiting input
 - `WORKER_ERROR: tako:<pane> (<kind>)` — worker stalled on a known error
   (API error, usage limit, etc.). Extra `detail:` / `action:` lines follow.
+- `WORKER_STALLED: tako:<pane>` — worker appears stuck: no running child
+  processes and no busy screen pattern. Extra `detail:` / `action:` lines follow.
 - `WORKER_GONE: tako:<pane>` — pane was closed
 
 ### When you receive WORKER_IDLE
@@ -269,6 +271,12 @@ The watch command will output when the worker stops:
    it to the user if it is genuinely the user's call.
 3. Worker reports completion → run Acceptance Inspection, then follow the
    lifecycle rules.
+
+`tako_orchestrator_worker_status` also returns `has_running_children` (true if
+the worker's tmux session has active child processes) and `collapsed` (true if
+the TUI is in a folded "N new messages" state). When `collapsed` is true, the
+pane text may be incomplete — use `has_running_children` and the `status` field
+as the primary signals, not the screen text.
 
 ### When you receive WORKER_ERROR
 
@@ -286,8 +294,17 @@ Recover by `kind` (also in `tako_orchestrator_worker_status` as
   model-switch prompt) is blocking. Read the pane, pick the option that keeps
   the task on track, and answer it via `tako_send_input` (keys: e.g. Enter).
 
-Do NOT close → respawn on WORKER_ERROR: the worker's context is intact and a
-resume is almost always cheaper than a respawn.
+### When you receive WORKER_STALLED
+
+The worker appears stuck — no running child processes and the screen shows
+neither a busy indicator nor an idle prompt. Read the pane to diagnose:
+- If it shows a prompt, send a continue nudge via `tako_send_input`.
+- If it shows an error, treat as WORKER_ERROR.
+- If the output is unclear (TUI may be folded), try `tako_send_input` with
+  a brief nudge and re-arm the watch.
+
+Do NOT close → respawn on WORKER_ERROR or WORKER_STALLED: the worker's context
+is intact and a resume is almost always cheaper than a respawn.
 
 Restart a worker (close → respawn) ONLY on: explicit error output in the pane
 that a resume nudge did not clear, ~10+ minutes with no output and no thinking
