@@ -811,6 +811,28 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_role: Option<String>,
     },
+    /// 受け入れゲートの操作（Issue #244）。
+    /// `action`:
+    /// - "set": ゲートの定義（criteria の一括設定）
+    /// - "show": ゲートの参照（criteria + status + evidence）
+    /// - "record_results": criterion の判定結果を記録する（check の結果永続化用）
+    TaskGate {
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+        /// criteria の JSON 配列（set 用）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        criteria_json: Option<String>,
+        /// 判定結果の JSON 配列（record_results 用）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        results_json: Option<String>,
+        /// Command 述語の実行 cwd（set 用）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        /// true のとき、全 Passed で checkpoint.phase を Done に遷移させる
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sync_checkpoint: Option<bool>,
+    },
 }
 
 impl Request {

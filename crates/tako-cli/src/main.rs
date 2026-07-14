@@ -577,6 +577,52 @@ enum TaskCommand {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// 受け入れゲートの操作（述語の定義・検証・参照。#244）
+    #[command(subcommand)]
+    Gate(GateCommand),
+}
+
+#[derive(Subcommand)]
+enum GateCommand {
+    /// 受け入れ条件（述語）を定義する
+    Set {
+        /// 対象のタスク ID
+        task_id: String,
+        /// Command 述語を追加（シェルコマンド。exit 0 で Passed）
+        #[arg(long = "command", value_name = "CMD")]
+        commands: Vec<String>,
+        /// PrMerged 述語を追加（PR 番号。マージ済みで Passed）
+        #[arg(long = "pr-merged", value_name = "PR_NUMBER")]
+        pr_merged: Vec<u32>,
+        /// Custom 述語を追加（説明文。手動で判定する）
+        #[arg(long = "custom", value_name = "DESCRIPTION")]
+        customs: Vec<String>,
+        /// Command 述語の実行ディレクトリ
+        #[arg(long)]
+        cwd: Option<String>,
+        /// JSON で出力する
+        #[arg(long)]
+        json: bool,
+    },
+    /// 述語を実行し結果を記録する（Command / PrMerged を自動判定）
+    Check {
+        /// 対象のタスク ID
+        task_id: String,
+        /// 全 Passed で checkpoint.phase を done に遷移させない（既定は遷移する）
+        #[arg(long)]
+        no_sync: bool,
+        /// JSON で出力する
+        #[arg(long)]
+        json: bool,
+    },
+    /// 受け入れゲートの状態を表示する
+    Show {
+        /// 対象のタスク ID
+        task_id: String,
+        /// JSON で出力する
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1624,6 +1670,8 @@ fn main() -> ExitCode {
             };
             send_request(request).map(|v| println!("{}", pretty_json(&v)))
         }
+        // gate 操作は YAML I/O + コマンド実行のみのためローカル処理（#244）
+        Command::Task(TaskCommand::Gate(ref gate_sub)) => gate_cli(gate_sub),
         // remote コマンドはローカル処理（IPC 不要）
         Command::Remote(RemoteCommand::Start { port, insecure }) => remote_start(port, insecure),
         Command::Remote(RemoteCommand::Stop) => remote_stop(),
@@ -3658,8 +3706,90 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 resume_model: None,
                 caller_role: None,
             },
+            // gate は main() でローカル処理。ここには来ない
+            TaskCommand::Gate(_) => unreachable!("gate は main() でローカル処理する"),
         },
     })
+}
+
+/// gate 操作のローカル処理（YAML I/O + コマンド実行。IPC 不要。#244）
+fn gate_cli(sub: &GateCommand) -> Result<(), String> {
+    match sub {
+        GateCommand::Set {
+            task_id,
+            commands,
+            pr_merged,
+            customs,
+            cwd,
+            json,
+        } => {
+            let criteria_json = build_criteria_json(commands, pr_merged, customs)?;
+            let result = tako_control::acceptance_gates::set_gate_payload(
+                task_id,
+                &criteria_json,
+                cwd.as_deref(),
+            )?;
+            if *json {
+                println!("{}", pretty_json(&result));
+            } else {
+                print_gate_result(&result);
+            }
+            Ok(())
+        }
+        GateCommand::Check {
+            task_id,
+            no_sync,
+            json,
+        } => {
+            let result = tako_control::acceptance_gates::execute_gate_check(task_id, !no_sync)?;
+            if *json {
+                println!("{}", pretty_json(&result));
+            } else {
+                print_gate_result(&result);
+            }
+            Ok(())
+        }
+        GateCommand::Show { task_id, json } => {
+            let result = tako_control::acceptance_gates::show_gate_payload(task_id)?;
+            if *json {
+                println!("{}", pretty_json(&result));
+            } else {
+                print_gate_result(&result);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// CLI の --command / --pr-merged / --custom フラグから criteria JSON を組み立てる
+fn build_criteria_json(
+    commands: &[String],
+    pr_merged: &[u32],
+    customs: &[String],
+) -> Result<String, String> {
+    if commands.is_empty() && pr_merged.is_empty() && customs.is_empty() {
+        return Err("少なくとも 1 つの述語を指定する（--command / --pr-merged / --custom）".into());
+    }
+    let mut criteria = Vec::new();
+    for (i, cmd) in commands.iter().enumerate() {
+        criteria.push(serde_json::json!({
+            "id": format!("cmd_{}", i + 1),
+            "kind": { "type": "command", "cmd": cmd },
+        }));
+    }
+    for pr in pr_merged {
+        criteria.push(serde_json::json!({
+            "id": format!("pr_{pr}"),
+            "kind": { "type": "pr_merged", "pr_number": pr },
+        }));
+    }
+    for (i, desc) in customs.iter().enumerate() {
+        criteria.push(serde_json::json!({
+            "id": format!("custom_{}", i + 1),
+            "kind": { "type": "custom", "description": desc },
+        }));
+    }
+    serde_json::to_string(&criteria).map_err(|e| format!("JSON 変換に失敗: {e}"))
 }
 
 fn parse_direction(s: &str) -> Result<Direction, String> {
@@ -3852,6 +3982,44 @@ fn print_task_list(result: &Value) {
     );
 }
 
+fn print_gate_result(result: &Value) {
+    let task_id = result["task_id"].as_str().unwrap_or("-");
+    let overall = result["overall"].as_str().unwrap_or("?");
+    let overall_marker = match overall {
+        "passed" => "[PASSED]",
+        "failed" => "[FAILED]",
+        _ => "[PENDING]",
+    };
+    println!("Gate: {task_id}  {overall_marker}");
+    if let Some(criteria) = result["criteria"].as_array() {
+        for c in criteria {
+            let id = c["id"].as_str().unwrap_or("-");
+            let status = c["status"].as_str().unwrap_or("?");
+            let marker = match status {
+                "passed" => "[PASSED]",
+                "failed" => "[FAILED]",
+                _ => "[      ]",
+            };
+            let kind_type = c["kind"]["type"].as_str().unwrap_or("?");
+            let kind_detail = match kind_type {
+                "command" => c["kind"]["cmd"].as_str().unwrap_or("").to_string(),
+                "pr_merged" => format!("PR #{}", c["kind"]["pr_number"].as_u64().unwrap_or(0)),
+                "custom" => c["kind"]["description"].as_str().unwrap_or("").to_string(),
+                _ => String::new(),
+            };
+            println!("  {marker} {id}: {kind_detail}");
+            if let Some(ev) = c["evidence"].as_str() {
+                let ev_short = if ev.len() > 120 {
+                    format!("{}...", &ev[..120])
+                } else {
+                    ev.to_string()
+                };
+                println!("         {ev_short}");
+            }
+        }
+    }
+}
+
 fn print_result(command: &Command, result: &Value) {
     match command {
         // 新ペイン ID をそのままスクリプトで使えるよう数値のみ出力する
@@ -3963,6 +4131,7 @@ fn print_result(command: &Command, result: &Value) {
                 print_task_list(result);
             }
         }
+        // gate は main() でローカル処理。ここには来ない
         Command::Task(_) => println!("{}", pretty_json(result)),
         // remote は run() → print_result を通らない
         _ => {}

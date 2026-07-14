@@ -1860,6 +1860,69 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "tako_task_gate",
+            "description": "受け入れゲートの定義（Issue #244）。\
+                タスクに機械検証可能な受け入れ条件（述語）を設定する。\
+                Command 述語はシェルコマンドの exit code、PrMerged は PR のマージ状態、\
+                Custom は人間判断で判定する。\
+                設定後は tako_task_gate_check で述語を実行し、結果を記録する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "対象のタスク ID（checkpoint の task_id と同じ）" },
+                    "criteria": {
+                        "type": "array",
+                        "description": "受け入れ条件の配列",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "条件 ID（例: tests_green, pr_merged）" },
+                                "kind": {
+                                    "type": "object",
+                                    "description": "条件の種別。type=command: {cmd, expect_exit_0?}、type=pr_merged: {pr_number, repo?}、type=custom: {description}",
+                                },
+                            },
+                            "required": ["id", "kind"],
+                        },
+                    },
+                    "cwd": { "type": "string", "description": "Command 述語の実行ディレクトリ（省略時は worker の cwd）" },
+                },
+                "required": ["task_id", "criteria"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_task_gate_check",
+            "description": "受け入れゲートの述語を実行し、結果を記録する（Issue #244）。\
+                Command 述語はシェルコマンドを実行し exit code で判定、\
+                PrMerged 述語は gh pr view で PR のマージ状態を判定する。\
+                Custom 述語はスキップされる（手動で tako_task_gate の record_results で設定）。\
+                sync_checkpoint=true のとき、全 Passed で checkpoint.phase が done に遷移する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "対象のタスク ID" },
+                    "sync_checkpoint": { "type": "boolean", "description": "true のとき、全 Passed で checkpoint.phase を done に遷移させる（既定 true）" },
+                },
+                "required": ["task_id"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_task_gate_show",
+            "description": "受け入れゲートの状態を表示する（Issue #244）。\
+                各 criterion の id / kind / status / evidence / checked_at と、\
+                overall（pending / passed / failed）を返す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "対象のタスク ID" },
+                },
+                "required": ["task_id"],
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -1869,6 +1932,29 @@ fn call_tool(params: &Value, session: &mut McpSession) -> Result<Value, (i64, St
         .and_then(Value::as_str)
         .ok_or((-32602, "ツール名（name）が無い".to_string()))?;
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
+
+    // gate check はコマンド実行を伴うため MCP ハンドラスレッドで直接実行する
+    // （dispatch は UI スレッドで実行されるため長時間ブロック不可。#244）
+    if name == "tako_task_gate_check" {
+        let task_id = args
+            .get("task_id")
+            .and_then(Value::as_str)
+            .ok_or((-32602, "task_id を指定する".to_string()))?;
+        let sync = args
+            .get("sync_checkpoint")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        return match crate::acceptance_gates::execute_gate_check(task_id, sync) {
+            Ok(value) => {
+                let text = serde_json::to_string_pretty(&value).unwrap_or_default();
+                Ok(json!({ "content": [{ "type": "text", "text": text }] }))
+            }
+            Err(e) => Ok(json!({
+                "content": [{ "type": "text", "text": e }],
+                "isError": true,
+            })),
+        };
+    }
 
     // orchestrator_run はポーリングループを伴うため MCP ハンドラスレッドで合成する
     // （dispatch は同期・UI スレッド実行のため長時間ブロック不可）
@@ -2636,6 +2722,28 @@ fn build_request(
             resume_model: str_arg(args, "model")?,
             caller_role: caller_role.map(String::from),
         },
+        "tako_task_gate" => {
+            let criteria_val = args.get("criteria").ok_or("criteria を指定する")?;
+            let criteria_json = serde_json::to_string(criteria_val)
+                .map_err(|e| format!("criteria の JSON 変換に失敗: {e}"))?;
+            Request::TaskGate {
+                action: "set".into(),
+                task_id: str_arg(args, "task_id")?,
+                criteria_json: Some(criteria_json),
+                results_json: None,
+                cwd: str_arg(args, "cwd")?,
+                sync_checkpoint: None,
+            }
+        }
+        // tako_task_gate_check は call_tool で特殊処理（dispatch を経由しない）
+        "tako_task_gate_show" => Request::TaskGate {
+            action: "show".into(),
+            task_id: str_arg(args, "task_id")?,
+            criteria_json: None,
+            results_json: None,
+            cwd: None,
+            sync_checkpoint: None,
+        },
         _ => return Err(format!("不明なツール: {name}")),
     })
 }
@@ -3232,7 +3340,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 84);
+        assert_eq!(tools.len(), 87);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
