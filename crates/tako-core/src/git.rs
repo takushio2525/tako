@@ -262,6 +262,34 @@ fn parse_status(raw: &str) -> GitStatus {
     result
 }
 
+/// working tree 全体の変更行数（追加, 削除）。`git diff --shortstat HEAD` の
+/// 「2 files changed, 126 insertions(+), 41 deletions(-)」をパースする（#217 サイドバー用。
+/// HEAD が無い空リポジトリ等では (0, 0)）
+pub fn diff_shortstat(repo: &Path) -> (usize, usize) {
+    let out = run_git(repo, &["diff", "--shortstat", "HEAD"]).unwrap_or_default();
+    parse_shortstat(&out)
+}
+
+fn parse_shortstat(raw: &str) -> (usize, usize) {
+    let mut added = 0;
+    let mut removed = 0;
+    for part in raw.split(',') {
+        let part = part.trim();
+        if let Some(n) = part
+            .strip_suffix(" insertions(+)")
+            .or_else(|| part.strip_suffix(" insertion(+)"))
+        {
+            added = n.trim().parse().unwrap_or(0);
+        } else if let Some(n) = part
+            .strip_suffix(" deletions(-)")
+            .or_else(|| part.strip_suffix(" deletion(-)"))
+        {
+            removed = n.trim().parse().unwrap_or(0);
+        }
+    }
+    (added, removed)
+}
+
 // ──────────────────────── git diff ────────────────────────
 
 /// `git diff` の種別
@@ -721,5 +749,17 @@ mod tests {
         assert_eq!(layout.rows[0].lane, 0);
         // ルートコミット（上に線なし・親なし）→ 描画指示なし
         assert!(layout.rows[0].lines.is_empty());
+    }
+
+    #[test]
+    fn shortstatのパース() {
+        assert_eq!(
+            parse_shortstat(" 2 files changed, 126 insertions(+), 41 deletions(-)\n"),
+            (126, 41)
+        );
+        // 単数形・片側のみ・空出力
+        assert_eq!(parse_shortstat(" 1 file changed, 1 insertion(+)\n"), (1, 0));
+        assert_eq!(parse_shortstat(" 1 file changed, 3 deletions(-)\n"), (0, 3));
+        assert_eq!(parse_shortstat(""), (0, 0));
     }
 }

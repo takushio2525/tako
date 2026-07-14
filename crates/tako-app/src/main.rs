@@ -675,6 +675,8 @@ struct TakoApp {
     drop_target: Option<(PaneId, DropZone)>,
     /// git パネルのデータ（FR-3.6。cwd 連動で 2 秒ポーリング更新）
     git_data: Option<GitPanelData>,
+    /// サイドバー用の軽量 git サマリ（#217。ブランチチップ + 変更フッター）
+    sidebar_git: Option<SidebarGitSummary>,
     /// git パネルで選択中のコミット（diff 表示用）
     git_selected_commit: Option<String>,
     /// git パネルのアコーディオン折りたたみ
@@ -897,6 +899,15 @@ struct GitPanelData {
     status: Vec<tako_core::GitStatusEntry>,
     diff_files: Vec<tako_core::DiffFile>,
     graph: tako_core::GraphLayout,
+}
+
+/// サイドバー用の軽量 git サマリ（#217。ブランチチップ + 変更フッター）
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarGitSummary {
+    branch: String,
+    modified: usize,
+    added_lines: usize,
+    removed_lines: usize,
 }
 
 /// git パネルのアコーディオン折りたたみ状態
@@ -1562,6 +1573,7 @@ impl TakoApp {
             drag_kind: None,
             drop_target: None,
             git_data: None,
+            sidebar_git: None,
             git_selected_commit: None,
             git_collapsed: GitCollapsed::default(),
             drawer_visible: false,
@@ -2098,12 +2110,19 @@ impl TakoApp {
                         None
                     };
                     let git_selected = app.git_selected_commit.clone();
+                    // サイドバー表示中はブランチ + 変更サマリの軽量 git 取得（#217）
+                    let sidebar_git_cwd = if app.filetree.visible {
+                        app.active_tab_cwd()
+                    } else {
+                        None
+                    };
                     (
                         tmux_ctx,
                         filetree_targets,
                         view_targets,
                         git_cwd,
                         git_selected,
+                        sidebar_git_cwd,
                         log_jobs,
                         app.pane_logs.clone(),
                     )
@@ -2121,6 +2140,7 @@ impl TakoApp {
                     view_targets,
                     git_cwd,
                     git_selected,
+                    sidebar_git_cwd,
                     log_jobs,
                     pane_logs,
                 )) = prep
@@ -2267,6 +2287,22 @@ impl TakoApp {
                     let ok = this.update(cx, |app: &mut TakoApp, cx| {
                         app.git_data = data;
                         cx.notify();
+                    });
+                    if ok.is_err() {
+                        break;
+                    }
+                }
+                // ④ background: サイドバー用の軽量 git サマリ（#217）
+                if let Some(cwd) = sidebar_git_cwd {
+                    let task = cx
+                        .background_executor()
+                        .spawn(async move { fetch_sidebar_git(&cwd) });
+                    let data = task.await;
+                    let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                        if app.sidebar_git != data {
+                            app.sidebar_git = data;
+                            cx.notify();
+                        }
                     });
                     if ok.is_err() {
                         break;
@@ -10760,6 +10796,19 @@ fn paint_graph_row(
 }
 
 /// background thread で git データを取得する（2 秒ポーリング用）
+/// サイドバー用の軽量 git サマリ取得（#217。status + shortstat の 2 コマンドのみ）
+fn fetch_sidebar_git(cwd: &std::path::Path) -> Option<SidebarGitSummary> {
+    let repo = tako_core::git::repo_root(cwd)?;
+    let status = tako_core::git::status(&repo);
+    let (added_lines, removed_lines) = tako_core::git::diff_shortstat(&repo);
+    Some(SidebarGitSummary {
+        branch: status.branch,
+        modified: status.entries.len(),
+        added_lines,
+        removed_lines,
+    })
+}
+
 fn fetch_git_data(cwd: &std::path::Path, selected_commit: Option<&str>) -> Option<GitPanelData> {
     let repo = tako_core::git::repo_root(cwd)?;
     let commits = tako_core::git::log_commits(&repo, 200);

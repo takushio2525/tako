@@ -72,15 +72,35 @@ impl TakoApp {
             return None;
         }
         let theme = self.theme.clone();
-        let tab_title = self.workspace.active_tab().title().to_string();
-        let sidebar_path = self.active_tab_cwd().map(|p| {
-            if let Ok(home) = std::env::var("HOME") {
+        // プロジェクト名 = アクティブタブ cwd のフォルダ名（カンプ: 「tako」）
+        let cwd = self.active_tab_cwd();
+        let project_name = cwd
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.workspace.active_tab().title().to_string());
+        // フルパス表示（カンプ: ~/projects/ + 末尾強調。クリックでコピー）
+        let sidebar_path = cwd.as_ref().map(|p| {
+            let full = p.display().to_string();
+            let short = if let Ok(home) = std::env::var("HOME") {
                 if let Ok(rel) = p.strip_prefix(&home) {
-                    return format!("~/{}", rel.display());
+                    format!("~/{}", rel.display())
+                } else {
+                    full.clone()
                 }
-            }
-            p.display().to_string()
+            } else {
+                full.clone()
+            };
+            // 末尾要素を分離（親部分は muted、末尾は明るく）
+            let (parent, leaf) = match short.rfind('/') {
+                Some(i) if i + 1 < short.len() => {
+                    (short[..=i].to_string(), short[i + 1..].to_string())
+                }
+                _ => (String::new(), short.clone()),
+            };
+            (parent, leaf, full)
         });
+        let git_summary = self.sidebar_git.clone();
         // プレビュー表示中のファイル（開いている行を控えめにハイライトする）
         let open_paths: std::collections::HashSet<std::path::PathBuf> =
             self.previews.values().map(|p| p.path.clone()).collect();
@@ -145,65 +165,134 @@ impl TakoApp {
                 .text_size(px(12.0))
                 .text_color(hsla(theme.foreground))
                 .overflow_hidden()
+                // プロジェクトヘッダ（カンプ: 名前 + ブランチチップ + フルパスボックス）
                 .child(
                     div()
                         .flex()
-                        .flex_row()
-                        .items_center()
+                        .flex_col()
                         .gap(px(6.0))
-                        .h(px(38.0))
+                        .pt(px(10.0))
                         .px(px(12.0))
+                        .pb(px(8.0))
                         .flex_none()
-                        .child(
-                            div()
-                                .w(px(14.0))
-                                .h(px(11.0))
-                                .flex_none()
-                                .relative()
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .top(px(0.0))
-                                        .left(px(0.0))
-                                        .w(px(6.0))
-                                        .h(px(4.0))
-                                        .rounded_t(px(1.5))
-                                        .bg(hsla(theme.accent)),
-                                )
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .top(px(3.0))
-                                        .left(px(0.0))
-                                        .w(px(14.0))
-                                        .h(px(8.0))
-                                        .rounded(px(1.5))
-                                        .bg(hsla(theme.accent)),
-                                ),
-                        )
+                        .border_b_1()
+                        .border_color(hsla(theme.border_inner))
                         .child(
                             div()
                                 .flex()
-                                .flex_col()
-                                .overflow_hidden()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    svg()
+                                        .path(file_icons::ui_icon::FOLDER)
+                                        .size(px(14.0))
+                                        .flex_none()
+                                        .text_color(hsla(theme.accent)),
+                                )
                                 .child(
                                     div()
-                                        .text_size(px(12.0))
+                                        .text_size(px(12.5))
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(hsla(theme.text_secondary))
-                                        .child(SharedString::from(truncate(&tab_title, 20))),
-                                )
-                                .children(sidebar_path.map(|path| {
-                                    div()
-                                        .text_size(px(10.5))
-                                        .font_family("Monaco")
-                                        .text_color(hsla(theme.tab_inactive_foreground))
+                                        .text_color(hsla(theme.foreground))
                                         .overflow_hidden()
                                         .whitespace_nowrap()
                                         .text_ellipsis()
-                                        .child(SharedString::from(truncate(&path, 28)))
-                                })),
-                        ),
+                                        .child(SharedString::from(truncate(&project_name, 18))),
+                                )
+                                // git ブランチチップ（カンプ: green / bg 10% / mono 10px）
+                                .children(git_summary.as_ref().map(|g| {
+                                    div()
+                                        .flex()
+                                        .flex_none()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(4.0))
+                                        .px(px(7.0))
+                                        .py(px(2.0))
+                                        .rounded(px(5.0))
+                                        .bg(rgba_alpha(theme.green, 0.10))
+                                        .font_family(theme.font_family.clone())
+                                        .text_size(px(10.0))
+                                        .text_color(hsla(theme.green))
+                                        .child(
+                                            svg()
+                                                .path(file_icons::ui_icon::GIT_BRANCH)
+                                                .size(px(10.0))
+                                                .flex_none()
+                                                .text_color(hsla(theme.green)),
+                                        )
+                                        .child(SharedString::from(truncate(&g.branch, 14)))
+                                }))
+                                .child(div().flex_grow(1.0))
+                                // + = フォルダ追加（現行機能の維持: open_directory）
+                                .child(
+                                    div()
+                                        .id("sidebar-add-folder")
+                                        .flex_none()
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.open_directory(cx);
+                                        }))
+                                        .child(
+                                            svg()
+                                                .path(file_icons::ui_icon::PLUS)
+                                                .size(px(14.0))
+                                                .text_color(hsla(theme.text_muted)),
+                                        ),
+                                ),
+                        )
+                        // フルパスボックス（カンプ: クリックでコピー + コピーアイコン）
+                        .children(sidebar_path.map(|(parent, leaf, full)| {
+                            div()
+                                .id("sidebar-path")
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(5.0))
+                                .px(px(7.0))
+                                .py(px(4.0))
+                                .rounded(px(6.0))
+                                .bg(rgba(theme.surface_1))
+                                .border_1()
+                                .border_color(hsla(theme.border_subtle))
+                                .font_family(theme.font_family.clone())
+                                .text_size(px(10.5))
+                                .text_color(hsla(theme.text_muted))
+                                .cursor_pointer()
+                                .hover(|d| {
+                                    d.border_color(hsla(theme.border_heavy))
+                                        .text_color(hsla(theme.text_tertiary))
+                                })
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        full.clone(),
+                                    ));
+                                }))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .flex()
+                                        .flex_row()
+                                        .child(SharedString::from(parent))
+                                        .child(
+                                            div()
+                                                .text_color(hsla(theme.text_secondary))
+                                                .child(SharedString::from(leaf)),
+                                        ),
+                                )
+                                .child(
+                                    svg()
+                                        .path(file_icons::ui_icon::COPY)
+                                        .size(px(11.0))
+                                        .flex_none()
+                                        .text_color(hsla(theme.text_muted)),
+                                )
+                        })),
                 )
                 .child(
                     div()
@@ -277,7 +366,6 @@ impl TakoApp {
                                 .flex()
                                 .flex_row()
                                 .items_center()
-                                .w_full()
                                 .py(px(1.0))
                                 .cursor_pointer()
                                 .hover(|d| d.bg(rgba(theme.surface_hover)))
@@ -365,9 +453,15 @@ impl TakoApp {
                                         ("?", theme.tab_inactive_foreground)
                                     }
                                 });
-                                let indent = 12.0 + 12.0 * row.depth as f32;
+                                // インデントガイド線（カンプ: margin-left 17px + border-left）
                                 let mut row_el = base
-                                    .pl(px(indent))
+                                    .when(row.depth >= 1, |d| {
+                                        d.ml(px(17.0 * row.depth as f32))
+                                            .border_l_1()
+                                            .border_color(hsla(theme.border_subtle))
+                                            .pl(px(13.0))
+                                    })
+                                    .when(row.depth == 0, |d| d.pl(px(12.0)))
                                     .py(px(2.0))
                                     .gap(px(4.0))
                                     .when(!is_dir, |d| d.text_color(hsla(theme.text_tertiary)))
@@ -449,7 +543,53 @@ impl TakoApp {
                                 row_el
                             }
                         })),
-                ),
+                )
+                // フッター: git 変更サマリ（カンプ: N modified +A −R / diff →）
+                .children(git_summary.filter(|g| g.modified > 0).map(|g| {
+                    div()
+                        .flex()
+                        .flex_none()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .px(px(12.0))
+                        .py(px(8.0))
+                        .border_t_1()
+                        .border_color(hsla(theme.border_inner))
+                        .text_size(px(11.0))
+                        .text_color(hsla(theme.text_muted))
+                        .font_family(theme.font_family.clone())
+                        .child(
+                            div()
+                                .text_color(hsla(theme.yellow))
+                                .child(SharedString::from(format!("{} modified", g.modified))),
+                        )
+                        .child(
+                            div()
+                                .text_color(hsla(theme.green))
+                                .child(SharedString::from(format!("+{}", g.added_lines))),
+                        )
+                        .child(
+                            div()
+                                .text_color(hsla(theme.red))
+                                .child(SharedString::from(format!("\u{2212}{}", g.removed_lines))),
+                        )
+                        .child(div().flex_grow(1.0))
+                        .child(
+                            div()
+                                .id("sidebar-diff-link")
+                                .cursor_pointer()
+                                .hover(|d| d.text_color(hsla(theme.foreground)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    // 右パネルの git ビューを開く（diff への導線）
+                                    this.panel_visible = true;
+                                    this.panel_view = PanelView::Git;
+                                    this.refresh_tmux_data();
+                                    cx.notify();
+                                }))
+                                .child("diff \u{2192}"),
+                        )
+                })),
         )
     }
 
