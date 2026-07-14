@@ -342,6 +342,12 @@ pub enum Request {
         pan_x: Option<f32>,
         pan_y: Option<f32>,
     },
+    /// Markdown / PDF プレビューのアウトライン取得・ジャンプ（Issue #232）。
+    /// `item` は表示順の 1 始まり。省略時は完成済み目次を返すだけで移動しない。
+    PreviewOutline {
+        pane: Option<u64>,
+        item: Option<usize>,
+    },
     /// 表示中プレビューファイルのライブリロード設定（Issue #233）。
     /// `enabled` 省略時は現在状態の取得のみ。設定は永続化される。
     PreviewReload { enabled: Option<bool> },

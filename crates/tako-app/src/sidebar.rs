@@ -974,10 +974,16 @@ impl TakoApp {
             | preview::PreviewMode::Video => return,
         };
         let path = state.path.clone();
-        let (new_state, raw) = preview::load_fast(&path, mode);
-        self.previews.insert(pane_id, new_state);
-        if let Some(text) = raw {
-            self.spawn_highlight(pane_id, path, text, cx);
+        if mode == preview::PreviewMode::Markdown {
+            self.previews
+                .insert(pane_id, preview::PreviewState::loading(&path, mode));
+            self.spawn_preview_load(pane_id, path, mode, cx);
+        } else {
+            let (new_state, raw) = preview::load_fast(&path, mode);
+            self.previews.insert(pane_id, new_state);
+            if let Some(text) = raw {
+                self.spawn_highlight(pane_id, path, text, cx);
+            }
         }
         cx.notify();
     }
@@ -1016,8 +1022,8 @@ impl TakoApp {
         self.drain_pending_preview_loads(cx);
     }
 
-    /// 重量プレビュー（PDF ラスタライズ / 動画 ffmpeg）を background executor で
-    /// 読み込み、完了後に Loading プレースホルダを本内容へ差し替える（Issue #168）
+    /// Markdown 目次構築・PDF ラスタライズ・動画 ffmpeg を background executor で
+    /// 読み込み、完了後に Loading プレースホルダを本内容へ差し替える（#168 / #232）
     pub(crate) fn spawn_preview_load(
         &self,
         pane: PaneId,
@@ -1035,12 +1041,13 @@ impl TakoApp {
             preview::PdfRasterKey::for_view(self.preview_device_scale, 1.0, logical_width);
         cx.spawn(async move |this, cx| {
             let p = path.clone();
-            // PDF / Video は load_fast がそのまま完成版を返す（raw は常に None）
             let task = cx.background_executor().spawn(async move {
-                if mode == preview::PreviewMode::Pdf {
-                    preview::load_pdf_with_key(&p, pdf_raster_key)
-                } else {
-                    preview::load_fast(&p, mode).0
+                match mode {
+                    preview::PreviewMode::Pdf => preview::load_pdf_with_key(&p, pdf_raster_key),
+                    preview::PreviewMode::Markdown => {
+                        preview::load_for_reload(&p, mode, None).state
+                    }
+                    _ => preview::load_fast(&p, mode).0,
                 }
             });
             let state = task.await;

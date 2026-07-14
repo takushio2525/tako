@@ -12,6 +12,7 @@ pub mod pane_log;
 pub mod pane_tree;
 pub mod paths;
 pub mod ports;
+pub mod preview_outline;
 pub mod preview_reload;
 pub mod preview_view;
 pub mod recent;
@@ -44,6 +45,7 @@ pub use pane_tree::{
     SplitDirection,
 };
 pub use ports::ListenPort;
+pub use preview_outline::{PreviewOutline, PreviewOutlineItem, PreviewOutlineTarget};
 pub use preview_reload::PreviewReloadState;
 pub use preview_view::{
     PreviewViewState, PreviewViewUpdate, PreviewZoomCommand, PREVIEW_ZOOM_MAX, PREVIEW_ZOOM_MIN,

@@ -68,6 +68,9 @@ enum Command {
     Open(OpenArgs),
     /// PDF・画像プレビューのズーム・ページ・パン操作。引数なしで現在状態を表示する
     Preview(PreviewArgs),
+    /// Markdown・PDF プレビューのアウトラインを表示し、項目へジャンプする
+    #[command(name = "preview-outline")]
+    PreviewOutline(PreviewOutlineArgs),
     /// 表示中プレビューファイルのライブリロード ON/OFF・状態確認
     #[command(name = "preview-reload")]
     PreviewReload(ToggleArgs),
@@ -1337,6 +1340,16 @@ struct PreviewArgs {
     /// 現在位置から縦へパンする量（logical px。正 = 下）
     #[arg(long, allow_hyphen_values = true)]
     pan_y: Option<f32>,
+}
+
+#[derive(Args)]
+struct PreviewOutlineArgs {
+    /// 対象 Markdown・PDF プレビューペイン ID（省略時は呼び出し元）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// ジャンプするアウトライン項目（表示順の 1 始まり。省略時は一覧取得のみ）
+    #[arg(long)]
+    item: Option<usize>,
 }
 
 #[derive(Args)]
@@ -2821,6 +2834,10 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pan_x: args.pan_x,
             pan_y: args.pan_y,
         },
+        Command::PreviewOutline(args) => Request::PreviewOutline {
+            pane: target_pane(args.pane)?,
+            item: args.item,
+        },
         Command::PreviewReload(args) => Request::PreviewReload {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
@@ -3860,7 +3877,9 @@ fn print_result(command: &Command, result: &Value) {
             println!("{}", pretty_json(result));
         }
         Command::Tab(TabCommand::New { .. }) => println!("{result}"),
-        Command::Open(_) | Command::Preview(_) | Command::Edit(_) => println!("{result}"),
+        Command::Open(_) | Command::Preview(_) | Command::PreviewOutline(_) | Command::Edit(_) => {
+            println!("{result}")
+        }
         Command::PreviewReload(_) => println!("{result}"),
         Command::Autorename(_)
         | Command::Portdetect(_)
@@ -4346,6 +4365,26 @@ mod tests {
             }
         );
         assert!(Cli::try_parse_from(["tako", "preview", "--zoom", "150", "--zoom-in"]).is_err());
+    }
+
+    #[test]
+    fn preview_outlineは一覧取得と項目ジャンプを操作へ写す() {
+        let list = parse(&["tako", "preview-outline", "--pane", "5"]);
+        assert_eq!(
+            build_request(&list).unwrap(),
+            Request::PreviewOutline {
+                pane: Some(5),
+                item: None,
+            }
+        );
+        let jump = parse(&["tako", "preview-outline", "--pane", "5", "--item", "3"]);
+        assert_eq!(
+            build_request(&jump).unwrap(),
+            Request::PreviewOutline {
+                pane: Some(5),
+                item: Some(3),
+            }
+        );
     }
 
     #[test]

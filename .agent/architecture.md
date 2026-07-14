@@ -621,6 +621,14 @@ client_tty = backend セッションの pane_tty）ため、backend を先に見
   世代照合に成功した結果だけを差し替え、`PreviewImageCache` をその時点で無効化する。
   `preview_views` / `preview_scroll_handles` / mode は触らず #234 の状態を保持する。監視同期は
   open / close / 設定切替のみから呼び、render 毎フレームの処理は増やさない。
+- **プレビュー目次（#232）**: GPUI / PDFKit 非依存の `tako-core::PreviewOutline` に表示ラベル・
+  階層・Markdown ブロック番号または PDF ページ番号を保持する。Markdown は block パース直後、
+  PDF は PDFKit `PDFDocument.outlineRoot` の background 走査で初回ロード結果へ同梱し、#233 の
+  ライブリロードも同じ完成状態を世代単位で差し替える。render は `Arc<PreviewOutline>` の参照と
+  パネル開閉中の行生成だけで、再パースや PDFKit 呼び出しをしない。ヘッダの目次と `n / total`
+  ページ一覧は既存 `ScrollHandle::scroll_to_top_of_item` を使い、dispatch `PreviewOutline` + CLI
+  `tako preview-outline` + MCP `tako_preview_outline`（一覧 / 項目ジャンプ）、既存 `PreviewView` +
+  `tako preview --page` + `tako_preview_view`（ページ指定）を 1:1 で共有する。
 - **syntect の行入力（#152）**: `SyntaxSet::load_defaults_newlines()` へ `str::lines()` の
   改行除去済み文字列を渡さない。`LinesWithEndings` で状態遷移に必要な改行を維持し、UI の行要素へ
   変換するときだけ末尾改行を除く。パス解決は読み取り / 編集で単一の `syntax_for_path` を使う

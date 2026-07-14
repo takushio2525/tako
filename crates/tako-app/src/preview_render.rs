@@ -716,6 +716,8 @@ impl TakoApp {
         let md_capable = state.markdown_capable();
         let mode = state.mode;
         let truncated = state.truncated;
+        let preview_outline = state.outline.clone();
+        let outline_available = !preview_outline.is_empty();
         struct EditSnapshot {
             editing: bool,
             dirty: bool,
@@ -804,11 +806,23 @@ impl TakoApp {
         let viewport_width = (f32::from(area.size.width) - (PANE_PADDING + 4.0) * 2.0).max(1.0);
         let viewport_height = (f32::from(area.size.height) - (PANE_PADDING + 4.0) * 2.0).max(1.0);
 
-        let pdf_info: Option<usize> = if let preview::PreviewContent::Pdf(data) = &state.content {
-            Some(data.total_pages)
-        } else {
-            None
-        };
+        let pdf_info: Option<(usize, usize)> =
+            if let preview::PreviewContent::Pdf(data) = &state.content {
+                let current = self
+                    .preview_scroll_handles
+                    .get(&pane_id)
+                    .filter(|handle| handle.bounds_for_item(0).is_some())
+                    .map(|handle| handle.top_item() + 1)
+                    .unwrap_or(preview_view.page)
+                    .clamp(1, data.total_pages.max(1));
+                Some((current, data.total_pages))
+            } else {
+                None
+            };
+        let navigation_panel = self
+            .preview_navigation_panel
+            .filter(|(open_pane, _)| *open_pane == pane_id)
+            .map(|(_, panel)| panel);
 
         // 選択状態
         let selection = self.preview_selections.get(&pane_id).cloned();
@@ -1698,12 +1712,41 @@ impl TakoApp {
                                     .child(SharedString::from(truncate(&message, 36)))
                             }))
                             .when(phv.page_info, |d| {
-                                d.children(pdf_info.map(|total| {
+                                d.children(pdf_info.map(|(current, total)| {
                                     div()
+                                        .id(("preview-page-picker", pane_id.as_u64()))
                                         .flex_none()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .cursor_pointer()
                                         .text_size(px(11.0))
                                         .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.6))
-                                        .child(SharedString::from(format!("{} p", total)))
+                                        .hover(|d| d.bg(rgba(theme.surface_hover)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation()
+                                            }),
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.preview_navigation_panel =
+                                                if this.preview_navigation_panel
+                                                    == Some((
+                                                        pane_id,
+                                                        PreviewNavigationPanel::Pages,
+                                                    ))
+                                                {
+                                                    None
+                                                } else {
+                                                    Some((
+                                                        pane_id,
+                                                        PreviewNavigationPanel::Pages,
+                                                    ))
+                                                };
+                                            cx.notify();
+                                        }))
+                                        .child(SharedString::from(format!("{current} / {total}")))
                                 }))
                             }),
                     )
@@ -1715,6 +1758,62 @@ impl TakoApp {
                             .flex_row()
                             .items_center()
                             .gap(px(4.0))
+                            .when(outline_available, |d| {
+                                d.child(
+                                    div()
+                                        .id(("preview-outline-toggle", pane_id.as_u64()))
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(3.0))
+                                        .px_1()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .text_color(hsla(theme.accent))
+                                        .hover(|d| {
+                                            d.bg(rgba_alpha(theme.tab_active_background, 0.8))
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation()
+                                            }),
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.preview_navigation_panel =
+                                                if this.preview_navigation_panel
+                                                    == Some((
+                                                        pane_id,
+                                                        PreviewNavigationPanel::Outline,
+                                                    ))
+                                                {
+                                                    None
+                                                } else {
+                                                    Some((
+                                                        pane_id,
+                                                        PreviewNavigationPanel::Outline,
+                                                    ))
+                                                };
+                                            cx.notify();
+                                        }))
+                                        .child(
+                                            svg()
+                                                .path("icons/file_icons/book.svg")
+                                                .w(px(12.0))
+                                                .h(px(12.0))
+                                                .text_color(hsla(theme.accent)),
+                                        )
+                                        .child("目次")
+                                        .child(
+                                            svg()
+                                                .path(crate::file_icons::ui_icon::CHEVRON_DOWN)
+                                                .w(px(9.0))
+                                                .h(px(9.0))
+                                                .text_color(hsla(theme.text_tertiary)),
+                                        ),
+                                )
+                            })
                             .when(zoomable, |d| {
                                 let zoom_out_pane = pane_id;
                                 let zoom_in_pane = pane_id;
@@ -1968,6 +2067,169 @@ impl TakoApp {
                             ),
                     )
             })
+            .children(navigation_panel.map(|panel| {
+                let (label, rows): (&str, Vec<gpui::AnyElement>) = match panel {
+                    PreviewNavigationPanel::Outline => {
+                        let rows = preview_outline
+                            .items
+                            .iter()
+                            .enumerate()
+                            .map(|(index, item)| {
+                                let item_number = index + 1;
+                                let indent = f32::from(item.level.saturating_sub(1)) * 12.0;
+                                div()
+                                    .id((
+                                        "preview-outline-item",
+                                        pane_id
+                                            .as_u64()
+                                            .wrapping_mul(10_000)
+                                            .wrapping_add(item_number as u64),
+                                    ))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .pl(px(8.0 + indent))
+                                    .pr_2()
+                                    .py(px(4.0))
+                                    .cursor_pointer()
+                                    .text_size(px(11.0))
+                                    .text_color(hsla(theme.text_secondary))
+                                    .hover(|d| {
+                                        d.bg(rgba(theme.surface_hover))
+                                            .text_color(hsla(theme.foreground))
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation()
+                                        }),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        if tako_control::dispatch(
+                                            this,
+                                            tako_control::protocol::Request::PreviewOutline {
+                                                pane: Some(pane_id.as_u64()),
+                                                item: Some(item_number),
+                                            },
+                                            PaneOrigin::User,
+                                        )
+                                        .is_ok()
+                                        {
+                                            this.preview_navigation_panel = None;
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        svg()
+                                            .path(crate::file_icons::ui_icon::JUMP_ARROW)
+                                            .w(px(9.0))
+                                            .h(px(9.0))
+                                            .flex_none()
+                                            .text_color(hsla(theme.text_tertiary)),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w(px(0.0))
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .child(SharedString::from(item.title.clone())),
+                                    )
+                                    .into_any_element()
+                            })
+                            .collect();
+                        ("アウトライン", rows)
+                    }
+                    PreviewNavigationPanel::Pages => {
+                        let (current, total) = pdf_info.unwrap_or((1, 0));
+                        let rows = (1..=total)
+                            .map(|page| {
+                                div()
+                                    .id((
+                                        "preview-page-item",
+                                        pane_id
+                                            .as_u64()
+                                            .wrapping_mul(10_000)
+                                            .wrapping_add(page as u64),
+                                    ))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_2()
+                                    .py(px(4.0))
+                                    .cursor_pointer()
+                                    .text_size(px(11.0))
+                                    .when(page == current, |d| {
+                                        d.bg(rgba_alpha(theme.accent, 0.14))
+                                            .text_color(hsla(theme.accent))
+                                    })
+                                    .when(page != current, |d| {
+                                        d.text_color(hsla(theme.text_secondary))
+                                            .hover(|d| d.bg(rgba(theme.surface_hover)))
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation()
+                                        }),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        if tako_control::dispatch(
+                                            this,
+                                            tako_control::protocol::Request::PreviewView {
+                                                pane: Some(pane_id.as_u64()),
+                                                zoom: None,
+                                                zoom_in: false,
+                                                zoom_out: false,
+                                                reset: false,
+                                                page: Some(page),
+                                                pan_x: None,
+                                                pan_y: None,
+                                            },
+                                            PaneOrigin::User,
+                                        )
+                                        .is_ok()
+                                        {
+                                            this.preview_navigation_panel = None;
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child(SharedString::from(format!("ページ {page}")))
+                                    .into_any_element()
+                            })
+                            .collect();
+                        ("ページへ移動", rows)
+                    }
+                };
+                div()
+                    .id(("preview-navigation-panel", pane_id.as_u64()))
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .max_h(px(220.0))
+                    .overflow_y_scroll()
+                    .bg(rgba(theme.surface_1))
+                    .border_b_1()
+                    .border_color(hsla(theme.border_subtle))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .px_2()
+                            .py(px(4.0))
+                            .text_size(px(10.0))
+                            .text_color(hsla(theme.text_tertiary))
+                            .child(label)
+                            .child(SharedString::from(format!("{} 件", rows.len()))),
+                    )
+                    .children(rows)
+            }))
             .when(search_visible, |el| {
                 let query_focused = search_focus == preview::SearchFieldFocus::Query;
                 let replace_focused = search_focus == preview::SearchFieldFocus::Replace;

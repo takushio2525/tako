@@ -220,6 +220,13 @@ enum PanelView {
     Git,
 }
 
+/// プレビューヘッダから開くナビゲーションドロップダウン（Issue #232）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewNavigationPanel {
+    Outline,
+    Pages,
+}
+
 /// claude TUI へのプロンプト送信フローの状態（Issue #32 送達確認ループ）
 #[derive(Debug)]
 enum PromptFlowState {
@@ -640,6 +647,8 @@ struct TakoApp {
     /// プレビューペイン（FR-3.2 / FR-3.3）。キーに居るペインはターミナルではなく
     /// ファイル内容（コードハイライト / Markdown レンダリング）を描画する
     previews: HashMap<PaneId, preview::PreviewState>,
+    /// Markdown / PDF の目次または PDF ページ一覧を開いているペイン。
+    preview_navigation_panel: Option<(PaneId, PreviewNavigationPanel)>,
     /// 表示中ファイルのライブリロード設定（core 状態を CLI / MCP と共有）。
     preview_reload: tako_core::PreviewReloadState,
     /// OS ネイティブのイベント駆動監視。生成不能時は None でライブリロードだけ無効化する。
@@ -1648,6 +1657,7 @@ impl TakoApp {
             inline_edit: None,
             filetree: filetree::FileTree::default(),
             previews: HashMap::new(),
+            preview_navigation_panel: None,
             preview_reload: tako_core::PreviewReloadState::new(
                 preview_reload_enabled && preview_file_watcher.is_some(),
             ),
@@ -1824,10 +1834,12 @@ impl TakoApp {
                         _ => preview::PreviewMode::Code,
                     };
                     let path = std::path::Path::new(&p.path);
-                    // Issue #168: PDF / 動画は復元時も background 読み込み（起動を塞がない）
+                    // #168 / #232: Markdown 目次・PDF・動画は復元時も background 読み込み
                     let state = if matches!(
                         mode,
-                        preview::PreviewMode::Pdf | preview::PreviewMode::Video
+                        preview::PreviewMode::Markdown
+                            | preview::PreviewMode::Pdf
+                            | preview::PreviewMode::Video
                     ) {
                         app.pending_preview_loads
                             .push((pane, path.to_path_buf(), mode));
@@ -10342,6 +10354,53 @@ impl PreviewHost for TakoApp {
         Ok(state)
     }
 
+    fn preview_outline(&self, pane: PaneId) -> Option<tako_core::PreviewOutline> {
+        let preview = self.previews.get(&pane)?;
+        matches!(
+            preview.mode,
+            preview::PreviewMode::Markdown | preview::PreviewMode::Pdf
+        )
+        .then(|| (*preview.outline).clone())
+    }
+
+    fn navigate_preview_outline(
+        &mut self,
+        pane: PaneId,
+        item: usize,
+    ) -> Result<tako_core::PreviewOutlineTarget, String> {
+        let preview = self
+            .previews
+            .get(&pane)
+            .ok_or_else(|| "プレビューペインではない".to_string())?;
+        let target = preview.outline.target(item)?;
+        let handle = self.preview_scroll_handles.entry(pane).or_default().clone();
+        match target {
+            tako_core::PreviewOutlineTarget::MarkdownBlock { block } => {
+                if preview.mode != preview::PreviewMode::Markdown {
+                    return Err("Markdown アウトラインの対象ではない".into());
+                }
+                handle.scroll_to_top_of_item(block);
+            }
+            tako_core::PreviewOutlineTarget::PdfPage { page } => {
+                let preview::PreviewContent::Pdf(data) = &preview.content else {
+                    return Err("PDF アウトラインの対象ではない".into());
+                };
+                if page == 0 || page > data.total_pages {
+                    return Err(format!(
+                        "ページ範囲外: {page}（全 {} ページ）",
+                        data.total_pages
+                    ));
+                }
+                handle.scroll_to_top_of_item(page - 1);
+                let mut view = self.preview_views.get(&pane).copied().unwrap_or_default();
+                view.page = page;
+                view.pan_y = 0.0;
+                self.preview_views.insert(pane, view);
+            }
+        }
+        Ok(target)
+    }
+
     fn video_playback(&mut self, pane: PaneId, action: &str) -> Result<String, String> {
         let player = self
             .video_players
@@ -10440,7 +10499,9 @@ impl PreviewHost for TakoApp {
         let mode = preview::PreviewMode::from_wire(mode);
         let state = if matches!(
             mode,
-            preview::PreviewMode::Pdf | preview::PreviewMode::Video
+            preview::PreviewMode::Markdown
+                | preview::PreviewMode::Pdf
+                | preview::PreviewMode::Video
         ) {
             self.pending_preview_loads
                 .push((pane, path.to_path_buf(), mode));
@@ -10465,6 +10526,12 @@ impl PreviewHost for TakoApp {
         self.pending_pdf_rasters.remove(&pane);
         self.preview_views.remove(&pane);
         self.preview_scroll_handles.remove(&pane);
+        if self
+            .preview_navigation_panel
+            .is_some_and(|(open_pane, _)| open_pane == pane)
+        {
+            self.preview_navigation_panel = None;
+        }
         self.previews.insert(pane, state);
         self.sync_preview_watches();
         Ok(())
@@ -12338,6 +12405,87 @@ mod self_test {
         std::fs::write(path, pdf).expect("テスト PDF を書ける");
     }
 
+    /// PDFKit が `PDFDocument.outlineRoot` として読める 2 ページ・2 項目の PDF を生成する。
+    fn write_test_pdf_with_outline(path: &std::path::Path) {
+        let streams = [
+            "BT /F1 14 Tf 14 TL 72 700 Td (Outline page one) Tj T* (World 123) Tj ET",
+            "BT /F1 14 Tf 14 TL 72 700 Td (Outline page two) Tj T* (World 123) Tj ET",
+        ];
+        let objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R /Outlines 8 0 R /PageMode /UseOutlines >>"
+                .to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>".to_vec(),
+            format!(
+                "<< /Length {} >>\nstream\n{}\nendstream",
+                streams[0].len(),
+                streams[0]
+            )
+            .into_bytes(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 7 0 R /Resources << /Font << /F1 5 0 R >> >> >>".to_vec(),
+            format!(
+                "<< /Length {} >>\nstream\n{}\nendstream",
+                streams[1].len(),
+                streams[1]
+            )
+            .into_bytes(),
+            b"<< /Type /Outlines /First 9 0 R /Last 10 0 R /Count 2 >>".to_vec(),
+            b"<< /Title (Chapter One) /Parent 8 0 R /Next 10 0 R /Dest [3 0 R /Fit] >>"
+                .to_vec(),
+            b"<< /Title (Chapter Two) /Parent 8 0 R /Prev 9 0 R /Dest [6 0 R /Fit] >>"
+                .to_vec(),
+        ];
+
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            pdf.extend_from_slice(object);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        std::fs::write(path, pdf).expect("アウトライン付きテスト PDF を書ける");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pdfkitアウトライン付きfixtureを読み込める() {
+        let path = std::env::temp_dir().join(format!(
+            "tako-preview-outline-test-{}.pdf",
+            std::process::id()
+        ));
+        write_test_pdf_with_outline(&path);
+        let state = preview::load_pdf(&path, 0);
+        assert_eq!(state.outline.items.len(), 2);
+        assert_eq!(state.outline.items[0].title, "Chapter One");
+        assert_eq!(
+            state.outline.items[1].target,
+            tako_core::PreviewOutlineTarget::PdfPage { page: 2 }
+        );
+        let preview::PreviewContent::Pdf(data) = &state.content else {
+            panic!("PDF fixture を読み込める");
+        };
+        assert!(data
+            .text_layers
+            .first()
+            .is_some_and(|lines| lines.len() >= 2));
+        let _ = std::fs::remove_file(path);
+    }
+
     /// 文字列をキーストローク列としてウィンドウへ流し込む
     fn type_text(any: AnyWindowHandle, cx: &mut AsyncApp, text: &str, enter: bool) {
         let text = text.to_string();
@@ -13790,7 +13938,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 83, "MCP tools/list は 83 ツール");
+            check(status == 200 && tool_count == 84, "MCP tools/list は 84 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -15683,6 +15831,22 @@ mod self_test {
                 "# Title\n\n日本語 abc\tend\n\n- item\n",
             )
             .unwrap();
+            let mut outline_markdown = String::from("# Overview\n\n");
+            for index in 0..24 {
+                outline_markdown.push_str(&format!("paragraph before {index}\n\n"));
+            }
+            outline_markdown.push_str("## Duplicate\n\n");
+            for index in 0..24 {
+                outline_markdown.push_str(&format!("paragraph middle {index}\n\n"));
+            }
+            outline_markdown.push_str("## Duplicate\n\n");
+            for index in 0..40 {
+                outline_markdown.push_str(&format!("paragraph after {index}\n\n"));
+            }
+            let outline_md_path = preview_dir.join("outline.md");
+            std::fs::write(&outline_md_path, outline_markdown).unwrap();
+            let no_heading_md_path = preview_dir.join("no-heading.md");
+            std::fs::write(&no_heading_md_path, "本文だけです。\n\n- 項目\n").unwrap();
             std::fs::write(
                 preview_dir.join("sample.cpp"),
                 "#include <iostream>\nint main() { std::cout << \"hello\"; return 0; }\n",
@@ -15695,6 +15859,10 @@ mod self_test {
             .unwrap();
             let pdf_path = preview_dir.join("sample.pdf");
             write_test_pdf(&pdf_path);
+            let outlined_pdf_path = preview_dir.join("outlined.pdf");
+            write_test_pdf_with_outline(&outlined_pdf_path);
+            let plain_pdf_path = preview_dir.join("plain.pdf");
+            write_test_pdf(&plain_pdf_path);
             let image_path = preview_dir.join("sample.png");
             image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]))
                 .save(&image_path)
@@ -15713,8 +15881,8 @@ mod self_test {
                         PaneOrigin::Cli,
                     )
                 };
-            let (base, pane, code_ok, md_ok) = window
-                .update(cx, |app, _, _| {
+            let (base, pane, code_ok, md_open_ok) = window
+                .update(cx, |app, _, cx| {
                     let base = app.focused_pane().as_u64();
                     // コードを開く: ペインが生え、PTY は起動しない。フォーカスは移る
                     let opened = selftest_open(
@@ -15742,18 +15910,168 @@ mod self_test {
                         None,
                     )
                     .expect("md の open_file は成功する");
-                    let md_ok = opened["pane"].as_u64() == Some(pane)
+                    app.drain_pending_preview_loads(cx);
+                    let md_open_ok = opened["pane"].as_u64() == Some(pane)
                         && opened["created"].as_bool() == Some(false)
                         && opened["mode"].as_str() == Some("markdown")
                         && matches!(
                             app.previews.values().next().map(|p| &p.content),
-                            Some(preview::PreviewContent::Markdown(blocks))
-                                if matches!(blocks.first(),
-                                    Some(preview::MdBlock::Heading { level: 1, .. }))
+                            Some(preview::PreviewContent::Loading)
                         );
-                    (base, pane, code_ok, md_ok)
+                    (base, pane, code_ok, md_open_ok)
                 })
                 .unwrap_or((0, 0, false, false));
+            let mut md_ok = false;
+            for _ in 0..30 {
+                wait(cx, 100).await;
+                md_ok = md_open_ok
+                    && window
+                        .update(cx, |app, _, _| {
+                            app.previews.values().next().is_some_and(|state| {
+                                matches!(
+                                    &state.content,
+                                    preview::PreviewContent::Markdown(blocks)
+                                        if matches!(blocks.first(),
+                                            Some(preview::MdBlock::Heading { level: 1, .. }))
+                                ) && state.outline.items.len() == 1
+                                    && state.outline.items[0].title == "Title"
+                            })
+                        })
+                        .unwrap_or(false);
+                if md_ok {
+                    break;
+                }
+            }
+            let outline_md_opened = window
+                .update(cx, |app, _, cx| {
+                    let opened = selftest_open(
+                        app,
+                        base,
+                        outline_md_path.display().to_string(),
+                        Some(tako_control::protocol::PreviewModeWire::Markdown),
+                    )
+                    .is_ok();
+                    app.drain_pending_preview_loads(cx);
+                    opened
+                })
+                .unwrap_or(false);
+            let outline_md_loaded = wait_for_preview_state(
+                window,
+                cx,
+                Duration::from_secs(3),
+                |app| {
+                    app.previews
+                        .values()
+                        .next()
+                        .is_some_and(|state| state.outline.items.len() == 3)
+                },
+            )
+            .await
+            .is_some();
+            // 新しい本文の子矩形を確定させ、ジャンプ前は 3 項目目が画面外であることを測る。
+            let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
+            wait(cx, 50).await;
+            let markdown_target_position = |app: &TakoApp| -> Option<(f32, f32, f32)> {
+                let target = app
+                    .previews
+                    .values()
+                    .next()
+                    .and_then(|state| state.outline.target(3).ok())?;
+                let tako_core::PreviewOutlineTarget::MarkdownBlock { block } = target else {
+                    return None;
+                };
+                let handle = app.preview_scroll_handles.get(&PaneId::from_raw(pane))?;
+                let target_bounds = handle.bounds_for_item(block)?;
+                Some((
+                    f32::from(target_bounds.top() + handle.offset().y),
+                    f32::from(handle.bounds().top()),
+                    f32::from(handle.bounds().bottom()),
+                ))
+            };
+            let markdown_before = window
+                .update(cx, |app, _, _| markdown_target_position(app))
+                .ok()
+                .flatten();
+            let markdown_outline_ok = window
+                .update(cx, |app, _, _| {
+                    let listed = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::PreviewOutline {
+                            pane: Some(pane),
+                            item: None,
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .expect("Markdown アウトラインを一覧できる");
+                    outline_md_opened
+                        && outline_md_loaded
+                        && listed["outline"].as_array().is_some_and(|items| {
+                            items.len() == 3
+                                && items[1]["title"] == "Duplicate"
+                                && items[2]["title"] == "Duplicate"
+                                && items[1]["target"] != items[2]["target"]
+                        })
+                })
+                .unwrap_or(false);
+            let markdown_jump_requested = window
+                .update(cx, |app, _, cx| {
+                    let jumped = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::PreviewOutline {
+                            pane: Some(pane),
+                            item: Some(3),
+                        },
+                        PaneOrigin::Mcp,
+                    )
+                    .expect("Markdown アウトラインの 3 項目目へジャンプできる");
+                    cx.notify();
+                    jumped["selected"]["kind"] == "markdown_block"
+                })
+                .unwrap_or(false);
+            let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
+            wait(cx, 50).await;
+            let markdown_after = window
+                .update(cx, |app, _, _| markdown_target_position(app))
+                .ok()
+                .flatten();
+            let (markdown_jump_ok, markdown_jump_delta) =
+                match (markdown_before, markdown_after) {
+                    (Some((before_top, _, before_bottom)), Some((after_top, top, bottom))) => (
+                        markdown_jump_requested
+                            && before_top > before_bottom
+                            && after_top >= top - 1.0
+                            && after_top < bottom,
+                        (after_top - top).abs(),
+                    ),
+                    _ => (false, f32::INFINITY),
+                };
+            let no_heading_opened = window
+                .update(cx, |app, _, cx| {
+                    let opened = selftest_open(
+                        app,
+                        base,
+                        no_heading_md_path.display().to_string(),
+                        Some(tako_control::protocol::PreviewModeWire::Markdown),
+                    )
+                    .is_ok();
+                    app.drain_pending_preview_loads(cx);
+                    opened
+                })
+                .unwrap_or(false);
+            let no_heading_ok = wait_for_preview_state(
+                window,
+                cx,
+                Duration::from_secs(3),
+                |app| {
+                    app.previews.values().next().is_some_and(|state| {
+                        matches!(state.content, preview::PreviewContent::Markdown(_))
+                            && state.outline.is_empty()
+                    })
+                },
+            )
+            .await
+            .is_some()
+                && no_heading_opened;
             // PDF を開く: 応答は即返り（Loading プレースホルダ）、全ページラスタライズは
             // background（Issue #168）。実運用では IPC ループ / UI が drain するが、
             // ここは直接 dispatch のため手動で流し、完了をポーリングで待つ
@@ -15793,6 +16111,130 @@ mod self_test {
                     break;
                 }
             }
+            let outlined_pdf_opened = window
+                .update(cx, |app, _, cx| {
+                    let opened = selftest_open(
+                        app,
+                        base,
+                        outlined_pdf_path.display().to_string(),
+                        Some(tako_control::protocol::PreviewModeWire::Pdf),
+                    )
+                    .is_ok();
+                    app.drain_pending_preview_loads(cx);
+                    opened
+                })
+                .unwrap_or(false);
+            let outlined_pdf_loaded = wait_for_preview_state(
+                window,
+                cx,
+                Duration::from_secs(5),
+                |app| {
+                    app.previews.values().next().is_some_and(|state| {
+                        matches!(state.content, preview::PreviewContent::Pdf(_))
+                            && state.outline.items.len() == 2
+                    })
+                },
+            )
+            .await
+            .is_some();
+            // background 完了後の PDF ページ矩形を確定してからジャンプ要求を出す。
+            let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
+            wait(cx, 50).await;
+            let pdf_page_position = |app: &TakoApp| -> Option<(f32, f32, f32, f32, f32)> {
+                let handle = app.preview_scroll_handles.get(&PaneId::from_raw(pane))?;
+                let page_bounds = handle.bounds_for_item(1)?;
+                Some((
+                    f32::from(handle.offset().y),
+                    f32::from(page_bounds.top() + handle.offset().y),
+                    f32::from(page_bounds.bottom() + handle.offset().y),
+                    f32::from(handle.bounds().top()),
+                    f32::from(handle.bounds().bottom()),
+                ))
+            };
+            let pdf_before = window
+                .update(cx, |app, _, _| pdf_page_position(app))
+                .ok()
+                .flatten();
+            let pdf_outline_ok = window
+                .update(cx, |app, _, _| {
+                    let listed = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::PreviewOutline {
+                            pane: Some(pane),
+                            item: None,
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .expect("PDF アウトラインを一覧できる");
+                    let jumped = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::PreviewOutline {
+                            pane: Some(pane),
+                            item: Some(2),
+                        },
+                        PaneOrigin::Mcp,
+                    )
+                    .expect("PDF アウトラインの 2 項目目へジャンプできる");
+                    listed["outline"].as_array().is_some_and(|items| {
+                        outlined_pdf_opened
+                            && outlined_pdf_loaded
+                            && items.len() == 2
+                            && items[0]["title"] == "Chapter One"
+                            && items[1]["title"] == "Chapter Two"
+                    }) && jumped["selected"]["kind"] == "pdf_page"
+                        && jumped["selected"]["page"] == 2
+                        && app
+                            .preview_views
+                            .get(&PaneId::from_raw(pane))
+                            .is_some_and(|view| view.page == 2)
+                })
+                .unwrap_or(false);
+            let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
+            wait(cx, 50).await;
+            let pdf_after = window
+                .update(cx, |app, _, _| pdf_page_position(app))
+                .ok()
+                .flatten();
+            let (pdf_jump_ok, pdf_jump_delta) = match (pdf_before, pdf_after) {
+                (
+                    Some((before_offset, before_page_top, _, _, _)),
+                    Some((after_offset, after_page_top, after_page_bottom, top, bottom)),
+                ) => (
+                    after_offset < before_offset - 1.0
+                        && after_page_top < before_page_top - 1.0
+                        && after_page_top < bottom
+                        && after_page_bottom > top,
+                    (after_page_top - top).abs(),
+                ),
+                _ => (false, f32::INFINITY),
+            };
+            let plain_pdf_opened = window
+                .update(cx, |app, _, cx| {
+                    let opened = selftest_open(
+                        app,
+                        base,
+                        plain_pdf_path.display().to_string(),
+                        Some(tako_control::protocol::PreviewModeWire::Pdf),
+                    )
+                    .is_ok();
+                    app.drain_pending_preview_loads(cx);
+                    opened
+                })
+                .unwrap_or(false);
+            let plain_pdf_outline_ok = wait_for_preview_state(
+                window,
+                cx,
+                Duration::from_secs(5),
+                |app| {
+                    app.previews.values().next().is_some_and(|state| {
+                        matches!(state.content, preview::PreviewContent::Pdf(_))
+                            && state.outline.is_empty()
+                    })
+                },
+            )
+            .await
+            .is_some()
+                && plain_pdf_opened;
             let (mode_ok, toggle_ok, list_ok, closed) = window
                 .update(cx, |app, _, cx| {
                     // dispatch の mode 指定（CLI --mode / MCP mode と同じ）でコード表示へ
@@ -15846,13 +16288,27 @@ mod self_test {
                     (mode_ok, toggle_ok, list_ok, closed)
                 })
                 .unwrap_or((false, false, false, false));
+            println!(
+                "TAKO_PREVIEW_OUTLINE_DEBUG: md_list_ok={markdown_outline_ok} md_jump_ok={markdown_jump_ok} md_jump_delta_px={markdown_jump_delta:.1} pdf_list_ok={pdf_outline_ok} pdf_jump_ok={pdf_jump_ok} pdf_jump_delta_px={pdf_jump_delta:.1}"
+            );
             check(code_ok, "コードプレビューの open");
             check(md_ok, "Markdown プレビューの再利用");
+            check(markdown_outline_ok, "Markdown 重複見出しの一覧と個別ターゲット");
+            check(markdown_jump_ok, "Markdown 目次ジャンプ後の見出し先頭位置");
+            check(no_heading_ok, "見出しなし Markdown は空アウトラインへ劣化");
             check(pdf_ok, "PDF プレビューの文字矩形抽出（background 読み込み完了後）");
+            check(
+                pdf_outline_ok && pdf_jump_ok,
+                "PDFKit アウトライン一覧と 2 ページ目ジャンプ",
+            );
+            check(plain_pdf_outline_ok, "目次なし PDF は空アウトラインへ劣化");
             check(mode_ok, "プレビューモード指定");
             check(toggle_ok, "プレビューモードの UI トグル");
             check(list_ok, "プレビュー状態の list 公開");
             check(closed, "プレビューペインの close");
+            println!(
+                "TAKO_PREVIEW_OUTLINE: markdown_items=3 duplicate_targets=distinct markdown_jump_delta_px={markdown_jump_delta:.1} no_heading=empty pdf_items=2 pdf_page=2 pdf_jump_delta_px={pdf_jump_delta:.1} no_pdf_outline=empty"
+            );
 
             // 66b. `tako open` CLI e2e（開発不変条件）: ペイン内シェルから実 CLI で開く。
             //      開いた後のフォーカスはプレビューペインに在るため、検証は app 状態で行う
@@ -16487,6 +16943,9 @@ mod self_test {
                             preview::MdBlock::Heading { spans, .. }
                                 if spans.iter().any(|span| span.text == "Live baseline")
                         ))
+                            && app.previews.get(&reload_pane).is_some_and(|state|
+                                state.outline.items.first().is_some_and(|item|
+                                    item.title == "Live baseline"))
                 )
             })
             .await
@@ -16546,6 +17005,9 @@ mod self_test {
                                 preview::MdBlock::Heading { spans, .. }
                                     if spans.iter().any(|span| span.text == "Live reload 5")
                             ))
+                                && app.previews.get(&reload_pane).is_some_and(|state|
+                                    state.outline.items.first().is_some_and(|item|
+                                        item.title == "Live reload 5"))
                     )
                 },
             )
@@ -16579,7 +17041,7 @@ mod self_test {
                 "最終 write から 1.5 秒以内に反映",
             );
             println!(
-                "TAKO_PREVIEW_RELOAD: writes=6 applies=1 delay_ms={} mode=markdown scroll_y={scroll_before:.1}",
+                "TAKO_PREVIEW_RELOAD: writes=6 applies=1 delay_ms={} mode=markdown scroll_y={scroll_before:.1} outline=updated",
                 final_delay.as_millis()
             );
 
@@ -16745,6 +17207,7 @@ mod self_test {
             check(image_view_preserved, "PNG 更新後も zoom / pan を保持");
 
             // PDF も #231/#234 の表示条件をキーに background 再ラスタライズする。
+            write_test_pdf_with_outline(&pdf_path);
             window
                 .update(cx, |app, _, cx| {
                     selftest_open(
@@ -16759,8 +17222,10 @@ mod self_test {
                 .ok();
             wait_for_preview_state(window, cx, Duration::from_secs(8), |app| {
                 matches!(
-                    app.previews.get(&reload_pane).map(|state| &state.content),
-                    Some(preview::PreviewContent::Pdf(data)) if !data.pages.is_empty()
+                    app.previews.get(&reload_pane),
+                    Some(state) if matches!(&state.content,
+                        preview::PreviewContent::Pdf(data) if !data.pages.is_empty())
+                        && state.outline.items.len() == 2
                 )
             })
             .await
@@ -16771,6 +17236,8 @@ mod self_test {
                     app.previews.get(&reload_pane).map(|state| &state.content),
                     Some(preview::PreviewContent::Pdf(data))
                         if data.text_layers.iter().flatten().any(|line| line.text.contains("Reloaded PDF"))
+                            && app.previews.get(&reload_pane).is_some_and(|state|
+                                state.outline.is_empty())
                 )
             })
             .await
