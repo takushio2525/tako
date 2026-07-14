@@ -177,7 +177,7 @@ const PANEL_DEFAULT_WIDTH: f32 = 320.0;
 const PANEL_MIN_WIDTH: f32 = 220.0;
 
 /// ペイン上部タイトルバーの高さ（px。デザインスペック: 30px）
-const PANE_TITLE_BAR: f32 = 30.0;
+const PANE_TITLE_BAR: f32 = 32.0;
 
 /// 下部ステータスバーの高さ（px。FR-2.16.4。Zed / VSCode 風）
 const STATUS_BAR_HEIGHT: f32 = 30.0;
@@ -688,6 +688,8 @@ struct TakoApp {
     /// サイドバー tmux ビューでホバー中のプレビュー（FR-2.16.13。バックグラウンド行 /
     /// 閉じたタブグループの中身をマウス位置のポップアップで覗く）
     hover_preview: Option<HoverPreview>,
+    /// 子ワーカードロップダウンを開いている master ペイン（#217。「N workers ▾」）
+    workers_menu_open: Option<PaneId>,
     /// ピン留めされた常駐プレビュー（FR-2.16.15。アプリ内フローティングウィンドウ）
     pinned_previews: Vec<PinnedPreview>,
     /// ドラッグ移動中のピン（対象 + 掴んだ位置からピン左上までのオフセット px）
@@ -1566,6 +1568,7 @@ impl TakoApp {
             drawer_height: DRAWER_DEFAULT_HEIGHT,
             bg_pending_kill: None,
             hover_preview: None,
+            workers_menu_open: None,
             pinned_previews: Vec::new(),
             dragging_pin: None,
             agent_metrics: AgentMetrics::default(),
@@ -7955,6 +7958,176 @@ impl TakoApp {
         }
     }
 
+    /// 失敗ペインの「再実行」（#217 カンプ）。シェルの履歴呼び出し（上矢印）+
+    /// Enter を送り、直前コマンドを再実行する
+    fn retry_last_command(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        if let Some(session) = self.terminals.get(&pane_id) {
+            session.write(b"\x1b[A\r".to_vec());
+        }
+        cx.notify();
+    }
+
+    /// 子ワーカードロップダウン（#217 カンプ: w282 / radius 9 / ヘッダ + 行 + フッター）。
+    /// master ペインの「N workers ▾」から開く。行クリックでジャンプ、
+    /// フッターは master ペインへのフォーカス（起動指示の導線）
+    fn render_workers_menu(
+        &self,
+        master_pane: PaneId,
+        workers: &[WorkerRow],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = self.theme.clone();
+        div()
+            .absolute()
+            .top(px(38.0))
+            .left(px(140.0))
+            .w(px(282.0))
+            .rounded(px(9.0))
+            .bg(rgba(theme.surface_1))
+            .border_1()
+            .border_color(hsla(theme.border_heavy))
+            .shadow(vec![BoxShadow {
+                color: gpui::hsla(0., 0., 0., 0.5),
+                offset: point(px(0.), px(12.)),
+                blur_radius: px(28.),
+                spread_radius: px(0.),
+                inset: false,
+            }])
+            .overflow_hidden()
+            .occlude()
+            .child(
+                div()
+                    .px(px(11.0))
+                    .pt(px(8.0))
+                    .pb(px(7.0))
+                    .border_b_1()
+                    .border_color(hsla(theme.border_subtle))
+                    .text_size(px(9.5))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(hsla(theme.text_muted))
+                    .child(SharedString::from(format!(
+                        "MASTER の子ワーカー \u{00B7} {}",
+                        workers.len()
+                    ))),
+            )
+            .child(
+                div()
+                    .p(px(4.0))
+                    .flex()
+                    .flex_col()
+                    .children(workers.iter().map(|w| {
+                        let failed = matches!(w.state, tako_core::CommandState::Failed(_));
+                        let dot_color = match w.state {
+                            tako_core::CommandState::Failed(_) => theme.red,
+                            tako_core::CommandState::Running => theme.accent,
+                            tako_core::CommandState::Idle => theme.green,
+                            tako_core::CommandState::Unknown => theme.text_overlay,
+                        };
+                        let target = w.pane;
+                        div()
+                            .id(("workers-menu-row", w.pane.as_u64()))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .px(px(8.0))
+                            .py(px(6.0))
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .hover(|d| {
+                                if failed {
+                                    d.bg(rgba_alpha(theme.red, 0.08))
+                                } else {
+                                    d.bg(rgba(theme.surface_hover_strong))
+                                }
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.workers_menu_open = None;
+                                this.jump_to_pane(target, cx);
+                            }))
+                            .child(if failed {
+                                svg()
+                                    .path(crate::file_icons::ui_icon::FAIL_X)
+                                    .w(px(9.0))
+                                    .h(px(9.0))
+                                    .text_color(hsla(theme.red))
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .w(px(6.0))
+                                    .h(px(6.0))
+                                    .flex_none()
+                                    .rounded_full()
+                                    .bg(hsla(dot_color))
+                                    .into_any_element()
+                            })
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .font_family(theme.font_family.clone())
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(hsla(theme.foreground))
+                                    .child(SharedString::from(truncate(&w.name, 20))),
+                            )
+                            .child(
+                                div()
+                                    .flex_grow(1.0)
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(10.5))
+                                    .text_color(if failed {
+                                        hsla(theme.red)
+                                    } else {
+                                        hsla(theme.text_muted)
+                                    })
+                                    .child(SharedString::from(if failed {
+                                        "failed".to_string()
+                                    } else {
+                                        w.subtitle.clone()
+                                    })),
+                            )
+                    })),
+            )
+            .child(
+                div()
+                    .id(("workers-menu-spawn", master_pane.as_u64()))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .border_t_1()
+                    .border_color(hsla(theme.border_subtle))
+                    .text_size(px(11.0))
+                    .text_color(hsla(theme.text_muted))
+                    .cursor_pointer()
+                    .hover(|d| {
+                        d.text_color(hsla(theme.foreground))
+                            .bg(rgba(theme.surface_hover))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.workers_menu_open = None;
+                        // 起動指示は master との対話で行う（master ペインへ導線）
+                        this.jump_to_pane(master_pane, cx);
+                    }))
+                    .child(
+                        svg()
+                            .path(crate::file_icons::ui_icon::PLUS)
+                            .w(px(11.0))
+                            .h(px(11.0))
+                            .text_color(hsla(theme.text_muted)),
+                    )
+                    .child("ワーカーを起動"),
+            )
+            .into_any_element()
+    }
+
     fn render_pane(
         &mut self,
         pane_id: PaneId,
@@ -8008,13 +8181,23 @@ impl TakoApp {
                     .map(str::to_string)
             })
             .unwrap_or_else(|| "ターミナル".to_string());
-        let role_badge = pane_role.as_deref().map(|r| {
-            if r.contains("orchestrator-master") || r == "master" {
-                ("ORCH", theme.accent, 0.14)
-            } else if r.contains("orchestrator-worker") || r.starts_with("worker") {
-                ("WORKER", theme.teal, 0.12)
+        // role ラベル（カンプ: バッジではなく素のテキスト 9.5px 600 tracking 0.06em）
+        let is_master = pane_role.as_deref().is_some_and(|r| {
+            r.contains("orchestrator-master") || r == "master" || r.starts_with("master:")
+        });
+        let is_worker = pane_role
+            .as_deref()
+            .is_some_and(|r| r.contains("orchestrator-worker") || r.starts_with("worker"));
+        let role_label = pane_role.as_deref().map(|r| {
+            if is_master {
+                ("ORCH".to_string(), theme.accent)
+            } else if is_worker {
+                ("WORKER".to_string(), theme.teal)
             } else {
-                (r.split(':').next().unwrap_or(r), theme.text_tertiary, 0.14)
+                (
+                    r.split(':').next().unwrap_or(r).to_uppercase(),
+                    theme.text_tertiary,
+                )
             }
         });
         let (state_dot, state_label) = self
@@ -8027,6 +8210,86 @@ impl TakoApp {
                 tako_core::CommandState::Unknown => (None, None),
             })
             .unwrap_or((None, None));
+        let is_failed = matches!(state_label, Some("failed"));
+        // 稼働時間（カンプ: running · 4m12s。OSC 133 の状態遷移からの経過）
+        let state_elapsed = self
+            .terminals
+            .get(&pane_id)
+            .and_then(|s| s.command_state_since())
+            .map(|t| format_state_elapsed(t.elapsed()));
+        // ペイン番号（カンプ: 17×17 バッジ。タブ内の表示順で 1 始まり）
+        let pane_index = self
+            .workspace
+            .active_tab()
+            .tree()
+            .panes()
+            .iter()
+            .position(|p| p.id() == pane_id)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        // cwd チップ（カンプ: ~/projects/tako。クリックでコピー)
+        let cwd_display = self.terminals.get(&pane_id).and_then(|s| s.cwd()).map(|p| {
+            let full = p.to_string_lossy().to_string();
+            let home = std::env::var("HOME").unwrap_or_default();
+            let short = if !home.is_empty() && full.starts_with(&home) {
+                format!("~{}", &full[home.len()..])
+            } else {
+                full.clone()
+            };
+            (short, full)
+        });
+        // master: 子ワーカー一覧（spawned_by チェーン。全タブ走査）
+        let workers: Vec<WorkerRow> = if is_master {
+            self.workspace
+                .tabs()
+                .iter()
+                .flat_map(|t| t.tree().panes())
+                .filter(|p| p.spawned_by() == Some(pane_id))
+                .map(|p| {
+                    let name = p
+                        .role()
+                        .or_else(|| p.title())
+                        .unwrap_or("worker")
+                        .to_string();
+                    let subtitle = p
+                        .title()
+                        .map(str::to_string)
+                        .filter(|t| *t != name)
+                        .unwrap_or_default();
+                    let st = self
+                        .terminals
+                        .get(&p.id())
+                        .map(|s| s.command_state())
+                        .unwrap_or(tako_core::CommandState::Unknown);
+                    WorkerRow {
+                        pane: p.id(),
+                        name,
+                        subtitle,
+                        state: st,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // worker: 親 master へのリンク（↳ master）
+        let parent_master = pane_info.and_then(|p| p.spawned_by()).and_then(|parent| {
+            self.workspace
+                .tabs()
+                .iter()
+                .flat_map(|t| t.tree().panes())
+                .find(|p| p.id() == parent)
+                .map(|p| {
+                    (
+                        parent,
+                        p.role()
+                            .or_else(|| p.title())
+                            .unwrap_or("master")
+                            .to_string(),
+                    )
+                })
+        });
+        let workers_menu_open = self.workers_menu_open == Some(pane_id);
 
         // スクロールバー（FR-2.5.13）: iTerm2 流にスクロール中だけ表示 → フェードアウト。
         // バックエンドペインは tmux 側（ネスト先含む）の位置・履歴を表示する
@@ -8073,16 +8336,28 @@ impl TakoApp {
             .h(relative(rect.height))
             .bg(rgba(theme.background))
             .border(px(PANE_BORDER))
-            .rounded(px(7.0))
-            .border_color(if focused {
+            .rounded(px(9.0))
+            .border_color(if is_failed {
+                // カンプ: 失敗ペインは赤枠で明確に（rgba(243,139,168,0.55)）
+                hsla_alpha(theme.red, 0.55)
+            } else if focused {
                 hsla(theme.accent)
             } else {
                 hsla(theme.border_default)
             })
-            .when(focused, |d| {
+            .when(is_failed, |d| {
+                d.shadow(vec![BoxShadow {
+                    color: hsla_alpha(theme.red, 0.12),
+                    offset: point(px(0.), px(0.)),
+                    blur_radius: px(0.),
+                    spread_radius: px(1.),
+                    inset: false,
+                }])
+            })
+            .when(focused && !is_failed, |d| {
                 d.shadow(vec![
                     BoxShadow {
-                        color: hsla_alpha(theme.accent, 0.25),
+                        color: hsla_alpha(theme.accent, 0.22),
                         offset: point(px(0.), px(0.)),
                         blur_radius: px(0.),
                         spread_radius: px(1.),
@@ -8120,19 +8395,24 @@ impl TakoApp {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(6.0))
-                    .px(px(8.0))
-                    .bg(rgba(if focused {
+                    .gap(px(8.0))
+                    .px(px(10.0))
+                    .bg(rgba(if is_failed {
+                        // カンプ: 失敗ペインのヘッダは赤みの面（#241b26）
+                        theme.danger_header
+                    } else if focused {
                         theme.surface_2
                     } else {
                         theme.surface_0
                     }))
                     .border_b_1()
-                    .border_color(hsla(if focused {
-                        theme.border_default
+                    .border_color(if is_failed {
+                        hsla_alpha(theme.red, 0.25)
+                    } else if focused {
+                        hsla(theme.border_default)
                     } else {
-                        theme.border_subtle
-                    }))
+                        hsla(theme.border_subtle)
+                    })
                     .text_size(px(11.0))
                     .text_color(hsla(theme.tab_inactive_foreground))
                     .cursor(CursorStyle::OpenHand)
@@ -8152,55 +8432,221 @@ impl TakoApp {
                             cx.notify();
                         }),
                     )
-                    // 状態ドット（スペック準拠: 6px + glow）
-                    .children(state_dot.map(|color| {
-                        div()
-                            .w(px(6.0))
-                            .h(px(6.0))
-                            .rounded_full()
-                            .bg(hsla(color))
-                            .shadow(vec![BoxShadow {
-                                color: hsla_alpha(color, 0.5),
-                                offset: point(px(0.), px(0.)),
-                                blur_radius: px(4.0),
-                                spread_radius: px(0.),
-                                inset: false,
-                            }])
-                    }))
-                    // ペイン名
+                    // ペイン番号バッジ（カンプ: 17×17 / radius 5 / mono 10px 700）
+                    .when(pane_index > 0, |d| {
+                        let (badge_bg, badge_fg) = if is_failed {
+                            (rgba_alpha(theme.red, 0.16), theme.red)
+                        } else if focused {
+                            (rgba_alpha(theme.accent, 0.16), theme.accent)
+                        } else {
+                            (rgba_alpha(theme.accent, 0.10), theme.accent_muted)
+                        };
+                        d.child(
+                            div()
+                                .w(px(17.0))
+                                .h(px(17.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(5.0))
+                                .bg(badge_bg)
+                                .font_family(theme.font_family.clone())
+                                .text_size(px(10.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(hsla(badge_fg))
+                                .child(SharedString::from(pane_index.to_string())),
+                        )
+                    })
+                    // ペイン名（カンプ: mono 12px 600）
                     .child(
                         div()
                             .text_size(px(12.0))
-                            .font_family("Monaco")
+                            .font_family(theme.font_family.clone())
                             .font_weight(FontWeight::SEMIBOLD)
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
                             .text_color(if focused {
                                 hsla(theme.foreground)
                             } else {
-                                hsla(theme.tab_inactive_foreground)
+                                hsla(theme.text_secondary)
                             })
                             .child(SharedString::from(truncate(&title_label, 40))),
                     )
-                    // ロールバッジ
-                    .children(role_badge.map(|(label, color, alpha)| {
+                    // role ラベル（カンプ: 素のテキスト 9.5px 600 tracking 0.06em）
+                    .children(role_label.map(|(label, color)| {
                         div()
-                            .text_size(px(10.0))
+                            .flex_none()
+                            .text_size(px(9.5))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .px(px(7.0))
+                            .text_color(hsla(color))
+                            .child(SharedString::from(label))
+                    }))
+                    // master: 「N workers ▾」ドロップダウンボタン（カンプの新規コントロール）
+                    .when(is_master && !workers.is_empty(), |d| {
+                        let n = workers.len();
+                        d.child(
+                            div()
+                                .id(("pane-workers", pane_id.as_u64()))
+                                .flex()
+                                .flex_none()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.0))
+                                .px(px(8.0))
+                                .py(px(3.0))
+                                .rounded(px(6.0))
+                                .bg(rgba(theme.chip_surface))
+                                .border_1()
+                                .border_color(hsla(theme.border_heavy))
+                                .text_size(px(10.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(hsla(theme.text_tertiary))
+                                .cursor_pointer()
+                                .hover(|d| {
+                                    d.text_color(hsla(theme.foreground))
+                                        .border_color(hsla(theme.text_overlay))
+                                })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation()
+                                    }),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.workers_menu_open =
+                                        if this.workers_menu_open == Some(pane_id) {
+                                            None
+                                        } else {
+                                            Some(pane_id)
+                                        };
+                                    cx.notify();
+                                }))
+                                .child(SharedString::from(format!("{n} workers")))
+                                .child(
+                                    svg()
+                                        .path(crate::file_icons::ui_icon::CHEVRON_DOWN)
+                                        .w(px(9.0))
+                                        .h(px(9.0))
+                                        .text_color(hsla(theme.text_tertiary)),
+                                ),
+                        )
+                    })
+                    // worker: 「↳ master」親リンク（カンプ: クリックで親へジャンプ）
+                    .children(parent_master.clone().map(|(parent_id, parent_name)| {
+                        div()
+                            .id(("pane-parent", pane_id.as_u64()))
+                            .flex_none()
+                            .font_family(theme.font_family.clone())
+                            .text_size(px(10.5))
+                            .text_color(hsla(theme.text_muted))
+                            .cursor_pointer()
+                            .hover(|d| d.text_color(hsla(theme.accent)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.jump_to_pane(parent_id, cx);
+                            }))
+                            .child(SharedString::from(format!(
+                                "\u{21B3} {}",
+                                truncate(&parent_name, 16)
+                            )))
+                    }))
+                    // 状態表示（カンプ: ドット + running · 4m12s / fail_x + failed）
+                    .when(is_failed, |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .flex_none()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(5.0))
+                                .text_size(px(10.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(hsla(theme.red))
+                                .child(
+                                    svg()
+                                        .path(crate::file_icons::ui_icon::FAIL_X)
+                                        .w(px(11.0))
+                                        .h(px(11.0))
+                                        .text_color(hsla(theme.red)),
+                                )
+                                .child("failed"),
+                        )
+                    })
+                    .when(!is_failed, |d| {
+                        d.children(state_dot.map(|color| {
+                            let label = match (state_label, &state_elapsed) {
+                                (Some("running"), Some(el)) => format!("running \u{00B7} {el}"),
+                                (Some(l), _) => l.to_string(),
+                                (None, _) => String::new(),
+                            };
+                            div()
+                                .flex()
+                                .flex_none()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(5.0))
+                                .text_size(px(10.5))
+                                .text_color(if state_label == Some("running") {
+                                    hsla(theme.accent)
+                                } else {
+                                    hsla(theme.text_muted)
+                                })
+                                .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color)))
+                                .child(SharedString::from(label))
+                        }))
+                    })
+                    .child(div().flex_grow(1.0))
+                    // cwd チップ（カンプ: mono 10.5 / chip 面 / クリックでコピー）
+                    .children(cwd_display.map(|(short, full)| {
+                        div()
+                            .id(("pane-cwd", pane_id.as_u64()))
+                            .flex()
+                            .flex_none()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .px(px(8.0))
                             .py(px(2.0))
                             .rounded(px(5.0))
-                            .text_color(hsla(color))
-                            .bg(rgba_alpha(color, alpha))
-                            .child(SharedString::from(label.to_string()))
-                    }))
-                    // 状態ラベル
-                    .children(state_label.map(|label| {
-                        div()
+                            .bg(rgba(theme.chip_surface))
+                            .border_1()
+                            .border_color(hsla(theme.border_subtle))
+                            .font_family(theme.font_family.clone())
                             .text_size(px(10.5))
-                            .text_color(hsla(theme.tab_inactive_foreground))
-                            .child(SharedString::from(label.to_string()))
+                            .text_color(hsla(theme.text_muted))
+                            .cursor_pointer()
+                            .hover(|d| {
+                                d.text_color(hsla(theme.text_tertiary))
+                                    .border_color(hsla(theme.border_heavy))
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                            )
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    full.clone(),
+                                ));
+                            }))
+                            .child(
+                                svg()
+                                    .path(crate::file_icons::ui_icon::FOLDER)
+                                    .w(px(10.0))
+                                    .h(px(10.0))
+                                    .text_color(hsla(theme.text_muted)),
+                            )
+                            .child(SharedString::from(truncate(&short, 28)))
                     }))
-                    .child(div().flex_grow(1.0))
-                    // ターミナル情報（シェル名 · cols×rows）
+                    // ターミナル情報（現行機能の維持: シェル名 · cols×rows）
                     .child({
                         let shell_name = self
                             .terminals
@@ -8209,30 +8655,67 @@ impl TakoApp {
                             .unwrap_or("zsh");
                         let shell_short = shell_name.rsplit('/').next().unwrap_or(shell_name);
                         div()
+                            .flex_none()
                             .text_size(px(10.5))
-                            .font_family("Monaco")
+                            .font_family(theme.font_family.clone())
                             .text_color(hsla(theme.tab_inactive_foreground))
                             .child(SharedString::from(format!(
                                 "{shell_short} \u{00B7} {cols}\u{00D7}{rows}"
                             )))
                     })
-                    // split ボタン
+                    // failed: 再実行ボタン（カンプ: 直前コマンドの再実行）
+                    .when(is_failed, |d| {
+                        d.child(
+                            div()
+                                .id(("pane-retry", pane_id.as_u64()))
+                                .flex()
+                                .flex_none()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.0))
+                                .px(px(9.0))
+                                .py(px(3.0))
+                                .rounded(px(6.0))
+                                .border_1()
+                                .border_color(hsla_alpha(theme.red, 0.35))
+                                .text_size(px(10.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(hsla(theme.red))
+                                .cursor_pointer()
+                                .hover(|d| d.bg(rgba_alpha(theme.red, 0.10)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation()
+                                    }),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.retry_last_command(pane_id, cx);
+                                }))
+                                .child(
+                                    svg()
+                                        .path(crate::file_icons::ui_icon::RETRY)
+                                        .w(px(11.0))
+                                        .h(px(11.0))
+                                        .text_color(hsla(theme.red)),
+                                )
+                                .child("再実行"),
+                        )
+                    })
+                    // split ボタン（カンプ: 13px SVG）
                     .child(
                         div()
                             .id(("pane-split", pane_id.as_u64()))
                             .w(px(18.0))
                             .h(px(18.0))
                             .flex()
+                            .flex_none()
                             .items_center()
                             .justify_center()
                             .rounded(px(5.0))
                             .cursor_pointer()
-                            .text_size(px(13.0))
-                            .text_color(hsla(theme.tab_inactive_foreground))
-                            .hover(|d| {
-                                d.bg(rgba(theme.surface_highlight))
-                                    .text_color(hsla(theme.foreground))
-                            })
+                            .hover(|d| d.bg(rgba(theme.surface_highlight)))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
@@ -8241,25 +8724,27 @@ impl TakoApp {
                                 cx.stop_propagation();
                                 this.split_pane_button(pane_id, SplitDirection::Right, cx);
                             }))
-                            .child("◫"),
+                            .child(
+                                svg()
+                                    .path(crate::file_icons::ui_icon::SPLIT)
+                                    .w(px(13.0))
+                                    .h(px(13.0))
+                                    .text_color(hsla(theme.text_muted)),
+                            ),
                     )
-                    // バックグラウンドボタン
+                    // バックグラウンドボタン（現行機能の維持）
                     .child(
                         div()
                             .id(("pane-bg", pane_id.as_u64()))
                             .w(px(18.0))
                             .h(px(18.0))
                             .flex()
+                            .flex_none()
                             .items_center()
                             .justify_center()
                             .rounded(px(5.0))
                             .cursor_pointer()
-                            .text_size(px(13.0))
-                            .text_color(hsla(theme.tab_inactive_foreground))
-                            .hover(|d| {
-                                d.bg(rgba(theme.surface_highlight))
-                                    .text_color(hsla(theme.foreground))
-                            })
+                            .hover(|d| d.bg(rgba(theme.surface_highlight)))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
@@ -8268,25 +8753,27 @@ impl TakoApp {
                                 cx.stop_propagation();
                                 this.background_pane_button(pane_id, cx);
                             }))
-                            .child("ー"),
+                            .child(
+                                svg()
+                                    .path(crate::file_icons::ui_icon::MINUS)
+                                    .w(px(13.0))
+                                    .h(px(13.0))
+                                    .text_color(hsla(theme.text_muted)),
+                            ),
                     )
-                    // 閉じるボタン
+                    // 閉じるボタン（カンプ: hover で赤）
                     .child(
                         div()
                             .id(("pane-close", pane_id.as_u64()))
                             .w(px(18.0))
                             .h(px(18.0))
                             .flex()
+                            .flex_none()
                             .items_center()
                             .justify_center()
                             .rounded(px(5.0))
                             .cursor_pointer()
-                            .text_size(px(13.0))
-                            .text_color(hsla(theme.tab_inactive_foreground))
-                            .hover(|d| {
-                                d.bg(rgba_alpha(theme.red, 0.25))
-                                    .text_color(hsla(theme.red))
-                            })
+                            .hover(|d| d.bg(rgba_alpha(theme.red, 0.25)))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
@@ -8299,9 +8786,19 @@ impl TakoApp {
                                     cx,
                                 );
                             }))
-                            .child("×"),
+                            .child(
+                                svg()
+                                    .path(crate::file_icons::ui_icon::CLOSE)
+                                    .w(px(13.0))
+                                    .h(px(13.0))
+                                    .text_color(hsla(theme.text_muted)),
+                            ),
                     ),
             )
+            // 子ワーカードロップダウン（カンプ: w282 / radius 9。ヘッダ下に絶対配置）
+            .when(workers_menu_open, |d| {
+                d.child(self.render_workers_menu(pane_id, &workers, cx))
+            })
             .child(
                 // テキスト領域: サブラインスクロール（#159）のため行スタックを
                 // absolute 配置し、fract 行ぶん上へずらして描画する（overflow_hidden で
@@ -9607,6 +10104,27 @@ fn truncate(s: &str, max_chars: usize) -> String {
         let cut: String = s.chars().take(max_chars.saturating_sub(1)).collect();
         format!("{cut}…")
     }
+}
+
+/// 状態遷移からの経過時間の表示（カンプ: 4m12s 形式。#217）
+fn format_state_elapsed(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    }
+}
+
+/// 子ワーカードロップダウンの 1 行分（#217。render_pane で収集）
+#[derive(Clone)]
+struct WorkerRow {
+    pane: PaneId,
+    name: String,
+    subtitle: String,
+    state: tako_core::CommandState,
 }
 
 /// GPUI の Keystroke を端末入力バイト列へ変換する

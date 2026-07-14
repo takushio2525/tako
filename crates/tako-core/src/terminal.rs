@@ -218,6 +218,8 @@ pub struct TerminalSession {
     cwd: Option<PathBuf>,
     /// OSC 133 から導出したコマンド実行状態
     command_state: CommandState,
+    /// command_state が最後に遷移した時刻（稼働時間表示用。#217）
+    command_state_since: Option<std::time::Instant>,
     /// PTY スレーブの tty 名（tmux クライアントとの対応付け。FR-2.13.2）
     tty_name: Option<String>,
     /// 検知された listen ポート（FR-2.4.2。UI 層のポーリングが更新する）
@@ -332,6 +334,7 @@ impl TerminalSession {
                 title: None,
                 cwd: working_directory,
                 command_state: CommandState::default(),
+                command_state_since: None,
                 tty_name,
                 listen_ports: Vec::new(),
                 scroll_fract: std::sync::Mutex::new(0.0),
@@ -695,7 +698,11 @@ impl TerminalSession {
         match event {
             OscEvent::CwdChanged(path) => self.cwd = Some(path),
             OscEvent::Mark(mark) => {
-                self.command_state = next_command_state(self.command_state, mark);
+                let next = next_command_state(self.command_state, mark);
+                if next != self.command_state {
+                    self.command_state = next;
+                    self.command_state_since = Some(std::time::Instant::now());
+                }
             }
         }
     }
@@ -708,6 +715,12 @@ impl TerminalSession {
     /// OSC 133 から導出したコマンド実行状態
     pub fn command_state(&self) -> CommandState {
         self.command_state
+    }
+
+    /// command_state が最後に遷移した時刻（稼働時間表示用。#217）。
+    /// 一度も遷移していなければ None
+    pub fn command_state_since(&self) -> Option<std::time::Instant> {
+        self.command_state_since
     }
 
     /// 検知された listen ポート（FR-2.4.2。list / MCP に公開される）
