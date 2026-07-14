@@ -3,6 +3,22 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.1] - 2026-07-14
+
+Nightly patch release (automated). Changes since v0.5.0:
+夜間パッチリリース（自動）。v0.5.0 以降の変更:
+
+- [改善] プレビュー検索の polish: ヒットハイライト描画・フィールドクリックフォーカス・IME 未確定表示 (#200) (#206)
+- [リファクタ] ControlHost trait を 8 つの責務別サブトレイトへ分割 (#86) (#204)
+- [改善] MCP HTTP サーバーをリクエスト毎スレッド化し並行処理を可能にする (#84) (#203)
+- [機能追加] タブ単位の退避を CLI / MCP から操作可能にする (#85) (#202)
+- [機能追加] orchestrator_run の非同期化 (#121) (#201)
+- [修正] 検索バーの GUI 直接テキスト入力を実装 (#195)
+- [機能追加] master 自己特定 + ctx 監視 + handoff コマンド (#123, #193) (#198)
+- [機能追加] プレビュー編集の強化: 自動保存・undo/redo・検索/置換 (#195) (#197)
+- [機能追加] セッション会話ログの管理と復元: カタログ + ペイン平文ログ (#112) (#196)
+- [ドキュメント] CHANGELOG: #165 レイアウトエンジンを [0.4.0] から [0.5.0] へ移動 (#165)
+
 ## [Unreleased]
 
 ## [0.5.0] - 2026-07-14
