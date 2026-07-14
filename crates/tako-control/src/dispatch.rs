@@ -859,7 +859,8 @@ fn dispatch_inner(
             Ok(json!({ "tab": tab_id.as_u64(), "title": tab.title() }))
         }
 
-        Request::TabNew { title } => {
+        Request::TabNew { title, focus } => {
+            let prev_active = host.workspace().active_tab_id();
             let pane = Pane::new(origin);
             let pane_id = pane.id();
             let explicit = title.is_some();
@@ -871,6 +872,10 @@ fn dispatch_inner(
                     let title = tab.title().to_string();
                     tab.set_title_manual(title);
                 }
+            }
+            // CLI/MCP 経由ではアクティブタブを維持（ユーザーの入力を奪わない）
+            if !focus.unwrap_or(false) {
+                let _ = host.workspace_mut().activate_tab(prev_active);
             }
             host.attach_session(pane_id, SpawnOptions::default());
             Ok(json!({ "tab": tab_id.as_u64(), "pane": pane_id.as_u64() }))
@@ -887,7 +892,10 @@ fn dispatch_inner(
             tab,
             target,
             direction,
+            focus,
         } => {
+            let prev_active = host.workspace().active_tab_id();
+            let prev_focused = host.workspace().active_tab().tree().focused();
             let (_, source) = resolve_pane(host.workspace(), pane)?;
             match (tab, target) {
                 // 従来動作: 別タブの末尾（フォーカス右）へ移送
@@ -928,6 +936,23 @@ fn dispatch_inner(
                     return Err(DispatchError::InvalidParams(
                         "tab と target は同時に指定できない".into(),
                     ))
+                }
+            }
+            // CLI/MCP 経由ではアクティブタブ・フォーカスペインを維持（ユーザーの入力を奪わない）
+            if !focus.unwrap_or(false) {
+                // 移動元タブが閉じていなければ元のアクティブ状態を復元
+                if host.workspace().get_tab(prev_active).is_some() {
+                    let _ = host.workspace_mut().activate_tab(prev_active);
+                    // フォーカスペインがまだ同タブにいれば復元（移動対象だった場合はスキップ）
+                    if host
+                        .workspace()
+                        .get_tab(prev_active)
+                        .unwrap()
+                        .tree()
+                        .contains(prev_focused)
+                    {
+                        let _ = tree_mut(host.workspace_mut(), prev_active).focus(prev_focused);
+                    }
                 }
             }
             Ok(Value::Null)
@@ -1012,6 +1037,7 @@ fn dispatch_inner(
             path,
             mode,
             direction,
+            focus,
         } => {
             let (tab, target) = match pane {
                 Some(_) => resolve_pane(host.workspace(), pane)?,
@@ -1086,10 +1112,12 @@ fn dispatch_inner(
             let path_str = resolved.display().to_string();
             host.set_preview(view_pane, &path_str, mode)
                 .map_err(DispatchError::Operation)?;
-            // 開いたものへフォーカスを移す（タブ切替はしない。見せる導線は Focus / FR-2.7）
-            tree_mut(host.workspace_mut(), tab)
-                .focus(view_pane)
-                .map_err(op_err)?;
+            // CLI/MCP 経由のデフォルトはフォーカスを移さない（ユーザーの入力を奪わない）
+            if focus.unwrap_or(false) {
+                tree_mut(host.workspace_mut(), tab)
+                    .focus(view_pane)
+                    .map_err(op_err)?;
+            }
             Ok(json!({
                 "pane": view_pane.as_u64(),
                 "path": path_str,
@@ -1707,9 +1735,11 @@ fn dispatch_inner(
             to,
             js,
             token,
+            focus,
         } => {
             // ペイン分割を伴う action（open / show）の共通処理。
-            // 分割 → host フック → 失敗なら巻き戻し、成功ならフォーカス
+            // 分割 → host フック → 失敗なら巻き戻し、成功なら focus 指定時のみフォーカス移動
+            let should_focus = focus.unwrap_or(false);
             let split_and =
                 |host: &mut dyn ControlHost,
                  pane: Option<u64>,
@@ -1732,9 +1762,14 @@ fn dispatch_inner(
                         .map_err(op_err)?;
                     match attach(host, new_id) {
                         Ok(v) => {
-                            tree_mut(host.workspace_mut(), tab)
-                                .focus(new_id)
-                                .map_err(op_err)?;
+                            // CLI/MCP 経由のデフォルトはフォーカスを移さない（ユーザーの入力を奪わない）
+                            if should_focus {
+                                tree_mut(host.workspace_mut(), tab)
+                                    .focus(new_id)
+                                    .map_err(op_err)?;
+                            } else {
+                                let _ = tree_mut(host.workspace_mut(), tab).focus(target);
+                            }
                             Ok(v)
                         }
                         Err(e) => {
@@ -1766,13 +1801,15 @@ fn dispatch_inner(
                 "show" => {
                     let id =
                         id.ok_or(DispatchError::InvalidParams("id は必須（web list で確認）".into()))?;
-                    // 既に表示中なら分割せずそのペインへフォーカスする
+                    // 既に表示中なら分割しない。focus 指定時のみフォーカス移動
                     let (_, showing) = host.web_target(Some(id), None).map_err(op_err)?;
                     if let Some(p) = showing {
                         let (tab, target) = resolve_pane(host.workspace(), Some(p.as_u64()))?;
-                        let ws = host.workspace_mut();
-                        tree_mut(ws, tab).focus(target).map_err(op_err)?;
-                        ws.activate_tab(tab).map_err(op_err)?;
+                        if should_focus {
+                            let ws = host.workspace_mut();
+                            tree_mut(ws, tab).focus(target).map_err(op_err)?;
+                            ws.activate_tab(tab).map_err(op_err)?;
+                        }
                         return Ok(json!({ "id": id, "pane": target.as_u64(), "already_shown": true }));
                     }
                     split_and(host, pane, &|h, new_id| h.web_show(new_id, id))
@@ -4313,7 +4350,15 @@ mod tests {
         let mut host = MockHost::new();
         let _root = host.root_pane();
         // タブ 2 を作り、タブ 1 に戻る
-        let result = dispatch(&mut host, Request::TabNew { title: None }, PaneOrigin::Cli).unwrap();
+        let result = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
         let tab2 = result["tab"].as_u64().unwrap();
         let tab2_pane = result["pane"].as_u64().unwrap();
         let tab1 = host.ws.tabs()[0].id().as_u64();
@@ -4371,7 +4416,15 @@ mod tests {
     fn タブ最後のペインのcloseはタブごと閉じる() {
         let mut host = MockHost::new();
         let root = host.root_pane();
-        dispatch(&mut host, Request::TabNew { title: None }, PaneOrigin::Cli).unwrap();
+        dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
         assert_eq!(host.ws.tabs().len(), 2);
         dispatch(
             &mut host,
@@ -4408,7 +4461,15 @@ mod tests {
     fn focusはタブ切替も伴う() {
         let mut host = MockHost::new();
         let root = host.root_pane();
-        let result = dispatch(&mut host, Request::TabNew { title: None }, PaneOrigin::Cli).unwrap();
+        let result = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
         let tab2 = result["tab"].as_u64().unwrap();
         assert_eq!(host.ws.active_tab_id().as_u64(), tab2);
         // タブ 1 のペインへフォーカス → アクティブタブも戻る
@@ -4423,6 +4484,74 @@ mod tests {
         .unwrap();
         assert_ne!(host.ws.active_tab_id().as_u64(), tab2);
         assert_eq!(host.ws.active_tab().tree().focused().as_u64(), root);
+    }
+
+    #[test]
+    fn tab_newはfocus無しでアクティブタブを変えない() {
+        let mut host = MockHost::new();
+        let tab1 = host.ws.active_tab_id();
+        let result = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let _tab2 = result["tab"].as_u64().unwrap();
+        assert_eq!(host.ws.active_tab_id(), tab1);
+    }
+
+    #[test]
+    fn tab_newはfocus指定でアクティブタブを切り替える() {
+        let mut host = MockHost::new();
+        let result = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let tab2 = result["tab"].as_u64().unwrap();
+        assert_eq!(host.ws.active_tab_id().as_u64(), tab2);
+    }
+
+    #[test]
+    fn move_paneはfocus無しでアクティブタブを変えない() {
+        let mut host = MockHost::new();
+        let tab1 = host.ws.active_tab_id();
+        let root = host.root_pane();
+        let p2 = split(&mut host, root);
+        let result = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let tab2 = result["tab"].as_u64().unwrap();
+        // tab1 に戻る
+        host.ws.activate_tab(tab1).unwrap();
+        // p2 を tab2 へ移動（focus 無し）
+        dispatch(
+            &mut host,
+            Request::MovePane {
+                pane: Some(p2),
+                tab: Some(tab2),
+                target: None,
+                direction: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        // アクティブタブは tab1 のまま
+        assert_eq!(host.ws.active_tab_id(), tab1);
     }
 
     #[test]
@@ -4878,6 +5007,7 @@ mod tests {
             &mut host,
             Request::TabNew {
                 title: Some("agents".into()),
+                focus: None,
             },
             PaneOrigin::Cli,
         )
@@ -4893,6 +5023,7 @@ mod tests {
                 tab: Some(tab2),
                 target: None,
                 direction: None,
+                focus: None,
             },
             PaneOrigin::Cli,
         )
@@ -4938,6 +5069,7 @@ mod tests {
                 tab: None,
                 target: Some(new_id),
                 direction: Some(Direction::Down),
+                focus: None,
             },
             PaneOrigin::Cli,
         )
@@ -4961,6 +5093,7 @@ mod tests {
                 tab: Some(tab1),
                 target: Some(new_id),
                 direction: None,
+                focus: None,
             },
             PaneOrigin::Cli,
         )
@@ -4968,6 +5101,7 @@ mod tests {
         assert!(matches!(err, DispatchError::InvalidParams(_)));
         // tab=None, target=None は新タブ化（Issue #209）
         let tab_count_before = host.ws.tabs().len();
+        let active_before = host.ws.active_tab_id();
         dispatch(
             &mut host,
             Request::MovePane {
@@ -4975,15 +5109,21 @@ mod tests {
                 tab: None,
                 target: None,
                 direction: None,
+                focus: None,
             },
             PaneOrigin::Cli,
         )
         .unwrap();
         assert_eq!(host.ws.tabs().len(), tab_count_before + 1);
-        assert_eq!(
-            host.ws.find_tab_of_pane(PaneId::from_raw(root)).unwrap(),
-            host.ws.active_tab_id()
-        );
+        // focus: None なのでアクティブタブは変わらない（#211: フォーカス非奪取）。
+        // ただし元タブが閉じた（最後のペインを移動）場合は close_tab の移行先になる
+        let root_tab = host.ws.find_tab_of_pane(PaneId::from_raw(root)).unwrap();
+        if host.ws.get_tab(active_before).is_some() {
+            assert_eq!(host.ws.active_tab_id(), active_before);
+        } else {
+            // 元タブが閉じた場合は close_tab の自動移行で root_tab がアクティブになる
+            assert_eq!(host.ws.active_tab_id(), root_tab);
+        }
 
         let err = dispatch(
             &mut host,
@@ -4992,6 +5132,7 @@ mod tests {
                 tab: Some(tab1),
                 target: None,
                 direction: Some(Direction::Down),
+                focus: None,
             },
             PaneOrigin::Cli,
         )
@@ -5005,6 +5146,7 @@ mod tests {
                 tab: None,
                 target: Some(root),
                 direction: None,
+                focus: None,
             },
             PaneOrigin::Cli,
         )
@@ -5058,22 +5200,33 @@ mod tests {
     #[test]
     fn 明示タイトル付きのタブ作成は手動扱い() {
         let mut host = MockHost::new();
-        dispatch(
+        let result = dispatch(
             &mut host,
             Request::TabNew {
                 title: Some("agents".into()),
+                focus: None,
             },
             PaneOrigin::Cli,
         )
         .unwrap();
+        let new_tab_id = TabId::from_raw(result["tab"].as_u64().unwrap());
         assert_eq!(
-            host.ws.active_tab().title_source(),
+            host.ws.get_tab(new_tab_id).unwrap().title_source(),
             tako_core::TitleSource::Manual
         );
         // 連番の既定タイトルは Default のまま（自動リネーム対象）
-        dispatch(&mut host, Request::TabNew { title: None }, PaneOrigin::Cli).unwrap();
+        let result2 = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let new_tab_id2 = TabId::from_raw(result2["tab"].as_u64().unwrap());
         assert_eq!(
-            host.ws.active_tab().title_source(),
+            host.ws.get_tab(new_tab_id2).unwrap().title_source(),
             tako_core::TitleSource::Default
         );
     }
@@ -5096,6 +5249,7 @@ mod tests {
                     path,
                     mode,
                     direction: None,
+                    focus: None,
                 },
                 PaneOrigin::Mcp,
             )
@@ -5160,6 +5314,7 @@ mod tests {
                     path: dir.join("a.rs").display().to_string(),
                     mode: None,
                     direction,
+                    focus: Some(true),
                 },
                 PaneOrigin::User,
             )
@@ -5197,6 +5352,7 @@ mod tests {
                 path: first.display().to_string(),
                 mode: Some(PreviewModeWire::Code),
                 direction: None,
+                focus: None,
             },
             PaneOrigin::Cli,
         )
@@ -5231,6 +5387,7 @@ mod tests {
                 path: second.display().to_string(),
                 mode: None,
                 direction: None,
+                focus: None,
             },
             PaneOrigin::User,
         );
@@ -5446,8 +5603,15 @@ mod tests {
                 PaneOrigin::Cli,
             )
             .unwrap();
-            let tab2_result =
-                dispatch(&mut host, Request::TabNew { title: None }, PaneOrigin::Cli).unwrap();
+            let tab2_result = dispatch(
+                &mut host,
+                Request::TabNew {
+                    title: None,
+                    focus: None,
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
             let tab2_pane = tab2_result["pane"].as_u64().unwrap();
             dispatch(
                 &mut host,
@@ -5518,8 +5682,15 @@ mod tests {
                 PaneOrigin::Cli,
             )
             .unwrap();
-            let tab2_result =
-                dispatch(&mut host, Request::TabNew { title: None }, PaneOrigin::Cli).unwrap();
+            let tab2_result = dispatch(
+                &mut host,
+                Request::TabNew {
+                    title: None,
+                    focus: None,
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
             let tab2_pane = tab2_result["pane"].as_u64().unwrap();
             dispatch(
                 &mut host,
@@ -6254,7 +6425,15 @@ mod tests {
             PaneOrigin::Cli,
         )
         .unwrap();
-        let tab2 = dispatch(&mut host, Request::TabNew { title: None }, PaneOrigin::Cli).unwrap();
+        let tab2 = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
         let tab2_pane = tab2["pane"].as_u64().unwrap();
         dispatch(
             &mut host,
@@ -6299,7 +6478,15 @@ mod tests {
         )
         .unwrap();
 
-        let tab2 = dispatch(&mut host, Request::TabNew { title: None }, PaneOrigin::Cli).unwrap();
+        let tab2 = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
         let master_b = tab2["pane"].as_u64().unwrap();
         dispatch(
             &mut host,

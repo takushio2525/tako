@@ -540,11 +540,13 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_create_tab",
             "description": "新しいタブ（= エージェントグループ）を作り、タブ ID と初期ペイン ID を返す。\
-                いまのタブと無関係な作業系列を始めるときに使う（1 グループ = 1 タブ）。",
+                いまのタブと無関係な作業系列を始めるときに使う（1 グループ = 1 タブ）。\
+                既定ではアクティブタブは変わらない（ユーザーの入力を奪わない）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "title": { "type": "string", "description": "タブのタイトル（省略時は連番）" },
+                    "focus": { "type": "boolean", "description": "true にすると新タブをアクティブにする（省略時は false = 現在のタブを維持）" },
                 },
                 "additionalProperties": false,
             },
@@ -566,7 +568,7 @@ pub fn tools() -> Vec<Value> {
             "description": "ペインを移動する。tab 指定 = 別タブの末尾へ移送（グループ分け）、\
                 target 指定 = そのペインの隣（direction 側）へ挿し直す（同タブ内の並べ替え = \
                 ペインタイトルバーの D&D と同じ操作。タブまたぎも可）、new_tab = true で新タブとして分離。\
-                tab / target / new_tab は排他。レイアウトを整えてユーザーに見せる導線に使う。",
+                tab / target / new_tab は排他。既定ではアクティブタブは変わらない（ユーザーの入力を奪わない）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -579,6 +581,7 @@ pub fn tools() -> Vec<Value> {
                         "description": "target のどちら側に入るか（省略時は right。target 指定時のみ有効）",
                     },
                     "pane": pane_schema("対象ペイン ID（省略時は呼び出し元）"),
+                    "focus": { "type": "boolean", "description": "true にすると移動先タブをアクティブにする（省略時は false = 現在のタブを維持）" },
                 },
                 "additionalProperties": false,
             },
@@ -686,6 +689,7 @@ pub fn tools() -> Vec<Value> {
                         "enum": ["right", "down", "left", "up"],
                         "description": "指定時は既存プレビューを再利用せず pane をこの方向へ分割して開く",
                     },
+                    "focus": { "type": "boolean", "description": "true にするとプレビューペインにフォーカスを移す（省略時は false = 元ペインを維持）" },
                 },
                 "required": ["path"],
                 "additionalProperties": false,
@@ -1389,6 +1393,7 @@ pub fn tools() -> Vec<Value> {
                     "to": { "type": "string", "description": "navigate: back / forward / reload / URL（必須）" },
                     "js": { "type": "string", "description": "eval: 実行する JavaScript（必須）" },
                     "token": { "type": "integer", "description": "eval_result: eval が返した token（必須）" },
+                    "focus": { "type": "boolean", "description": "open / show: true にすると新ペインにフォーカスを移す（省略時は false = 元ペインを維持）" },
                 },
                 "required": ["action"],
                 "additionalProperties": false,
@@ -1997,6 +2002,7 @@ fn build_request(
         }
         "tako_create_tab" => Request::TabNew {
             title: str_arg(args, "title")?,
+            focus: bool_arg(args, "focus")?,
         },
         "tako_select_tab" => Request::TabSelect {
             tab: required_u64(args, "tab")?,
@@ -2012,6 +2018,7 @@ fn build_request(
                     u64_arg(args, "target")?
                 },
                 direction: if new_tab { None } else { direction_arg(args)? },
+                focus: bool_arg(args, "focus")?,
             }
         }
         "tako_auto_rename" => Request::AutoRename {
@@ -2036,6 +2043,7 @@ fn build_request(
                 Some(other) => return Err(format!("mode が不正: {other}（code | markdown）")),
             },
             direction: direction_arg(args)?,
+            focus: bool_arg(args, "focus")?,
         },
         "tako_preview_edit" => Request::PreviewEdit {
             pane: Some(target_pane(args, caller)?),
@@ -2285,6 +2293,7 @@ fn build_request(
                 to: str_arg(args, "to")?.map(|s| s.to_string()),
                 js: str_arg(args, "js")?.map(|s| s.to_string()),
                 token: u64_arg(args, "token")?,
+                focus: bool_arg(args, "focus")?,
             }
         }
         "tako_update" => Request::Update {
@@ -2717,6 +2726,7 @@ mod tests {
                 path: "/tmp/x.md".into(),
                 mode: Some(crate::protocol::PreviewModeWire::Code),
                 direction: None,
+                focus: None,
             }]
         );
         // mode 省略は拡張子の自動判定に委ねる（None で渡る）。direction も省略可
@@ -2732,6 +2742,7 @@ mod tests {
                 path: "a.rs".into(),
                 mode: None,
                 direction: None,
+                focus: None,
             }]
         );
         // direction 指定（FR-3.11 = D&D のドロップ位置の同等操作）
@@ -2750,6 +2761,7 @@ mod tests {
                 path: "a.rs".into(),
                 mode: None,
                 direction: Some(Direction::Down),
+                focus: None,
             }]
         );
         // 不正な mode と path 欠落は引数エラー
@@ -3211,6 +3223,7 @@ mod tests {
                 to: None,
                 js: None,
                 token: None,
+                focus: None,
             }]
         );
         // navigate: pane 省略でも caller を埋めない（対象は表示中 Web ビューの自動解決）
@@ -3230,6 +3243,7 @@ mod tests {
                 to: Some("reload".into()),
                 js: None,
                 token: None,
+                focus: None,
             }]
         );
         // action 欠落はエラー
