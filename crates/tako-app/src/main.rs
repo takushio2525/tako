@@ -1312,6 +1312,9 @@ struct TabDrag {
 enum DragKind {
     TmuxSession,
     File,
+    /// Finder など外部アプリからのファイルドロップ（ExternalPaths 経由）。
+    /// ターミナルペインではパス入力、それ以外ではファイルを開く
+    ExternalFile,
     Pane,
     BackgroundPane,
     Tab,
@@ -5796,7 +5799,14 @@ impl TakoApp {
                 f32::from(position.x - bounds.origin.x) / f32::from(bounds.size.width).max(1.0);
             let fy =
                 f32::from(position.y - bounds.origin.y) / f32::from(bounds.size.height).max(1.0);
-            (pane_id, drop_zone(fx, fy, kind == DragKind::File))
+            (
+                pane_id,
+                drop_zone(
+                    fx,
+                    fy,
+                    matches!(kind, DragKind::File | DragKind::ExternalFile),
+                ),
+            )
         });
         match new {
             Some(target) => {
@@ -5945,11 +5955,13 @@ impl TakoApp {
     }
 
     /// ファイルのドロップ（FR-3.11 / FR-3.13 / Issue #21）:
-    /// ターミナルペイン中央 → パス文字列を send（複数はスペース区切り）、それ以外 → ファイルを開く
+    /// ターミナルペイン中央 → パス文字列を send（複数はスペース区切り）、それ以外 → ファイルを開く。
+    /// `cmd_held` が true の場合、ターミナルへのドロップで cd も実行する
     fn drop_files(
         &mut self,
         pane_id: PaneId,
         paths: &[std::path::PathBuf],
+        cmd_held: bool,
         cx: &mut Context<Self>,
     ) {
         if paths.is_empty() {
@@ -5959,25 +5971,28 @@ impl TakoApp {
         let is_terminal =
             self.terminals.contains_key(&pane_id) && !self.previews.contains_key(&pane_id);
         if is_terminal && zone == DropZone::Center {
-            let escaped: Vec<String> = paths
-                .iter()
-                .map(|p| {
-                    let s = p.display().to_string();
-                    if s.chars()
-                        .any(|c| c == ' ' || c == '\'' || c == '"' || c == '(' || c == ')')
-                    {
-                        format!("'{}'", s.replace('\'', "'\\\\''"))
-                    } else {
-                        s
-                    }
-                })
-                .collect();
+            let text = if cmd_held {
+                let dir = if paths[0].is_dir() {
+                    paths[0].clone()
+                } else {
+                    paths[0]
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| paths[0].clone())
+                };
+                format!(
+                    "cd {}",
+                    tako_core::quote_for_shell(&dir.display().to_string())
+                )
+            } else {
+                tako_core::quote_paths_for_shell(paths)
+            };
             let _ = tako_control::dispatch(
                 self,
                 tako_control::protocol::Request::Send {
                     pane: Some(pane_id.as_u64()),
-                    text: escaped.join(" "),
-                    newline: false,
+                    text,
+                    newline: cmd_held,
                     tmux_session: None,
                     await_prompt: false,
                 },
@@ -6002,6 +6017,29 @@ impl TakoApp {
                     path: path.display().to_string(),
                     mode: None,
                     direction,
+                },
+                PaneOrigin::User,
+            );
+            if let Err(e) = result {
+                eprintln!("warning: ファイルを開けない: {e}");
+            }
+        }
+        self.drain_pending_highlights(cx);
+        cx.notify();
+    }
+
+    /// サイドバーやプレビュー領域への外部ファイルドロップ（Issue #21）:
+    /// フォーカスペインの位置でファイルを開く（direction なし = 既存プレビュー再利用）
+    fn open_dropped_files(&mut self, paths: &[std::path::PathBuf], cx: &mut Context<Self>) {
+        let focus_pane = self.workspace.active_tab().tree().focused();
+        for path in paths {
+            let result = tako_control::dispatch(
+                self,
+                tako_control::protocol::Request::OpenFile {
+                    pane: Some(focus_pane.as_u64()),
+                    path: path.display().to_string(),
+                    mode: None,
+                    direction: None,
                 },
                 PaneOrigin::User,
             );
@@ -6091,7 +6129,7 @@ impl TakoApp {
                 this.drop_tmux_session(pane_id, drag.clone(), cx);
             }))
             .on_drop::<FileDrag>(cx.listener(move |this, drag: &FileDrag, _, cx| {
-                this.drop_files(pane_id, std::slice::from_ref(&drag.path), cx);
+                this.drop_files(pane_id, std::slice::from_ref(&drag.path), false, cx);
             }))
             .on_drag_move::<ExternalPaths>(cx.listener(
                 move |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
@@ -6099,14 +6137,17 @@ impl TakoApp {
                         pane_id,
                         e.bounds,
                         e.event.position,
-                        DragKind::File,
+                        DragKind::ExternalFile,
                         cx,
                     );
                 },
             ))
-            .on_drop::<ExternalPaths>(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
-                this.drop_files(pane_id, paths.paths(), cx);
-            }))
+            .on_drop::<ExternalPaths>(cx.listener(
+                move |this, paths: &ExternalPaths, window, cx| {
+                    let cmd_held = window.modifiers().platform;
+                    this.drop_files(pane_id, paths.paths(), cmd_held, cx);
+                },
+            ))
             .on_drop::<PaneDrag>(cx.listener(move |this, drag: &PaneDrag, _, cx| {
                 this.drop_pane(pane_id, *drag, cx);
             }))
@@ -6123,10 +6164,14 @@ impl TakoApp {
                 DropZone::Down => (0.0, 0.5, 1.0, 0.5),
                 DropZone::Center => (0.0, 0.0, 1.0, 1.0),
             };
+            let is_terminal_pane =
+                self.terminals.contains_key(&pane_id) && !self.previews.contains_key(&pane_id);
             let label = match (kind, zone) {
                 (DragKind::TmuxSession, _) => "ここに分割して表示",
-                (DragKind::File, DropZone::Center) => "ここで開く",
-                (DragKind::File, _) => "ここに分割して開く",
+                (DragKind::ExternalFile, DropZone::Center) if is_terminal_pane => "パスを入力",
+                (DragKind::File, DropZone::Center) if is_terminal_pane => "パスを入力",
+                (DragKind::ExternalFile | DragKind::File, DropZone::Center) => "ここで開く",
+                (DragKind::ExternalFile | DragKind::File, _) => "ここに分割して開く",
                 (DragKind::Pane, _) => "この位置に移動",
                 (DragKind::BackgroundPane, _) => "ここに復帰",
                 (DragKind::Tab, _) => "この位置に移動",
