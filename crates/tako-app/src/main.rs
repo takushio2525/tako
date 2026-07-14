@@ -736,6 +736,12 @@ struct TakoApp {
     webview_marks: std::collections::HashSet<webview::WebViewId>,
     /// Web ビュー dock パネルの開閉（ステータスバーの 🌐 ボタン）
     webview_dock_open: bool,
+    /// Web ビュー dock の URL 入力欄（#207）
+    webview_dock_url_input: String,
+    /// URL 入力欄のカーソル位置（バイト）
+    webview_dock_url_cursor: usize,
+    /// URL 入力欄がフォーカスされているか（dock は開いていてもターミナルへ入力できる）
+    webview_dock_url_focused: bool,
     /// wry の親にする GPUI ウィンドウの生ハンドル（初回 render で採取）
     window_raw_handle: Option<webview::WindowHandleBox>,
     /// 起動復元で開き直す Web ビュー（ペイン対応, URL）。ウィンドウハンドルが
@@ -1571,6 +1577,9 @@ impl TakoApp {
             webview_next_id: 1,
             webview_marks: std::collections::HashSet::new(),
             webview_dock_open: false,
+            webview_dock_url_input: String::new(),
+            webview_dock_url_cursor: 0,
+            webview_dock_url_focused: false,
             window_raw_handle: None,
             pending_webview_restore: Vec::new(),
             update_state: update_checker::UpdateState::Idle,
@@ -5099,6 +5108,11 @@ impl TakoApp {
             return;
         }
 
+        if self.webview_dock_url_focused && self.handle_webview_dock_url_key(keystroke, cx) {
+            cx.stop_propagation();
+            return;
+        }
+
         if self.handle_preview_edit_key(keystroke, cx) {
             cx.stop_propagation();
             return;
@@ -7500,6 +7514,101 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// Web dock URL 入力欄のキー処理（#207）。dock が開いているときだけ呼ばれる。
+    /// 入力を消費したら true を返す
+    fn handle_webview_dock_url_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) -> bool {
+        match ks.key.as_str() {
+            "enter" => {
+                let url = self.webview_dock_url_input.trim().to_string();
+                if url.is_empty() {
+                    return true;
+                }
+                self.open_webview_from_dock(&url, cx);
+                true
+            }
+            "escape" => {
+                self.webview_dock_url_input.clear();
+                self.webview_dock_url_cursor = 0;
+                self.webview_dock_url_focused = false;
+                self.webview_dock_open = false;
+                cx.notify();
+                true
+            }
+            "backspace" => {
+                if self.webview_dock_url_cursor > 0 {
+                    let prev = self.webview_dock_url_input[..self.webview_dock_url_cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    self.webview_dock_url_input
+                        .drain(prev..self.webview_dock_url_cursor);
+                    self.webview_dock_url_cursor = prev;
+                }
+                cx.notify();
+                true
+            }
+            "delete" => {
+                if self.webview_dock_url_cursor < self.webview_dock_url_input.len() {
+                    let next = self.webview_dock_url_cursor
+                        + self.webview_dock_url_input[self.webview_dock_url_cursor..]
+                            .chars()
+                            .next()
+                            .map(|c| c.len_utf8())
+                            .unwrap_or(0);
+                    self.webview_dock_url_input
+                        .drain(self.webview_dock_url_cursor..next);
+                }
+                cx.notify();
+                true
+            }
+            "left" => {
+                if self.webview_dock_url_cursor > 0 {
+                    self.webview_dock_url_cursor = self.webview_dock_url_input
+                        [..self.webview_dock_url_cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                }
+                cx.notify();
+                true
+            }
+            "right" => {
+                if self.webview_dock_url_cursor < self.webview_dock_url_input.len() {
+                    self.webview_dock_url_cursor += self.webview_dock_url_input
+                        [self.webview_dock_url_cursor..]
+                        .chars()
+                        .next()
+                        .map(|c| c.len_utf8())
+                        .unwrap_or(0);
+                }
+                cx.notify();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// URL を指定して Web ビューペインを開く（#207。dock UI からの共通入口）。
+    /// create_webview + フォーカスペイン右分割で表示し、dock を閉じる
+    fn open_webview_from_dock(&mut self, url: &str, cx: &mut Context<Self>) {
+        let normalized = webview::normalize_url(url);
+        match self.create_webview(&normalized) {
+            Ok(id) => {
+                self.webview_show_from_dock(id, cx);
+                self.webview_dock_url_input.clear();
+                self.webview_dock_url_cursor = 0;
+                self.webview_dock_url_focused = false;
+                self.webview_dock_open = false;
+            }
+            Err(e) => {
+                eprintln!("warning: Web ビューを開けない: {e}");
+            }
+        }
+        cx.notify();
+    }
+
     /// Web ビュー dock（#155）。ステータスバーの Web ボタンで開閉する下部パネル。
     /// 全ページ（表示中 + 退避中）を一覧し、ワンクリックで呼び出し / 破棄できる。
     /// flex 列（ドロワーと同じ層）に挟まるためペインエリアが縮み、webview とは重ならない
@@ -7513,7 +7622,6 @@ impl TakoApp {
             .iter()
             .map(|e| (e.id, e.current_title(), e.current_url(), e.pane))
             .collect();
-        let empty = entries.is_empty();
         let rows: Vec<_> = entries
             .into_iter()
             .map(|(id, title, url, pane)| {
@@ -7620,19 +7728,84 @@ impl TakoApp {
                 .border_t_1()
                 .border_color(hsla(theme.border_subtle))
                 .overflow_hidden()
-                .when(empty, |d| {
-                    d.child(
-                        div()
-                            .p(px(8.0))
-                            .text_size(px(11.0))
-                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.7))
-                            .child(
-                                "Web ビューは無い（tako web open <URL> または AI に依頼で開く）",
-                            ),
-                    )
-                })
-                .children(rows),
+                .children(rows)
+                .child(self.render_webview_dock_url_input(&theme, cx)),
         )
+    }
+
+    /// Web dock URL 入力行の描画（#207）
+    fn render_webview_dock_url_input(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let cursor = self
+            .webview_dock_url_cursor
+            .min(self.webview_dock_url_input.len());
+        let before = &self.webview_dock_url_input[..cursor];
+        let after = &self.webview_dock_url_input[cursor..];
+        let display = if self.webview_dock_url_input.is_empty() {
+            SharedString::from("URL を入力して Enter（例: example.com）")
+        } else {
+            SharedString::from(format!("{before}|{after}"))
+        };
+        let placeholder = self.webview_dock_url_input.is_empty();
+        let focused = self.webview_dock_url_focused;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .h(px(28.0))
+            .px(px(8.0))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(hsla(theme.accent))
+                    .child("🌐"),
+            )
+            .child(
+                div()
+                    .id("webdock-url-input")
+                    .flex_1()
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded_sm()
+                    .cursor(CursorStyle::IBeam)
+                    .bg(rgba_alpha(theme.accent, if focused { 0.12 } else { 0.08 }))
+                    .border_1()
+                    .border_color(hsla_alpha(theme.accent, if focused { 0.6 } else { 0.3 }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            this.webview_dock_url_focused = true;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .text_size(px(11.0))
+                    .text_color(if placeholder {
+                        hsla_alpha(theme.tab_inactive_foreground, 0.5)
+                    } else {
+                        hsla(theme.foreground)
+                    })
+                    .child(display),
+            )
+            .child(
+                div()
+                    .id("webdock-url-open")
+                    .px(px(8.0))
+                    .py(px(2.0))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .bg(rgba_alpha(theme.accent, 0.15))
+                    .hover(|d| d.bg(rgba_alpha(theme.accent, 0.3)))
+                    .text_size(px(11.0))
+                    .text_color(hsla(theme.accent))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let url = this.webview_dock_url_input.trim().to_string();
+                        if !url.is_empty() {
+                            this.open_webview_from_dock(&url, cx);
+                        }
+                    }))
+                    .child("開く"),
+            )
     }
 
     /// render 末尾の可視性同期。今フレームで描画されなかった Web ビュー
@@ -9170,6 +9343,15 @@ impl EntityInputHandler for TakoApp {
                 edit.text.insert_str(edit.cursor, text);
                 edit.cursor += text.len();
             }
+            self.ime = None;
+            cx.notify();
+            return;
+        }
+        // Web dock URL 入力中
+        if self.webview_dock_url_focused && !text.is_empty() {
+            self.webview_dock_url_input
+                .insert_str(self.webview_dock_url_cursor, text);
+            self.webview_dock_url_cursor += text.len();
             self.ime = None;
             cx.notify();
             return;
