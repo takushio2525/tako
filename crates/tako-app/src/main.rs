@@ -1504,7 +1504,8 @@ impl TakoApp {
             // ルートペイン（復元時は全ペイン）は下の spawn_session でセッションを張る
             workspace,
             terminals: HashMap::new(),
-            theme: Theme::default(),
+            // テーマは settings.json の設定値から復元（Issue #217。既定ダーク）
+            theme: Theme::for_mode(tako_control::settings::load().theme_mode()),
             focus_handle: cx.focus_handle(),
             cell_size: None,
             pane_font_sizes: HashMap::new(),
@@ -8768,6 +8769,17 @@ impl UiStateHost for TakoApp {
         self.confirm_close = enabled;
     }
 
+    fn theme_mode(&self) -> tako_core::theme::ThemeMode {
+        self.theme.mode
+    }
+
+    fn set_theme_mode(&mut self, mode: tako_core::theme::ThemeMode) {
+        if self.theme.mode == mode {
+            return;
+        }
+        self.theme = Theme::for_mode(mode);
+    }
+
     fn panel_state(&self) -> (bool, f32, tako_control::protocol::PanelViewWire) {
         let view = match self.panel_view {
             PanelView::Tmux => tako_control::protocol::PanelViewWire::Tmux,
@@ -11963,7 +11975,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 73, "MCP tools/list は 73 ツール");
+            check(status == 200 && tool_count == 74, "MCP tools/list は 74 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -11974,6 +11986,44 @@ mod self_test {
                     && response.contains("tabs")
                     && response.contains(r#""isError":false"#),
                 "MCP list_panes",
+            );
+
+            // 33b. tools/call tako_theme（Issue #217。set light → GUI 反映 → toggle で復帰）
+            let (status, response) = mcp_post_bg(
+                cx,
+                &mcp_url,
+                Some(&token),
+                &[],
+                r#"{"jsonrpc":"2.0","id":103,"method":"tools/call","params":{"name":"tako_theme","arguments":{"action":"set","mode":"light"}}}"#,
+            )
+            .await
+            .unwrap_or_else(|| fail("MCP theme set 接続"));
+            let light_applied = window
+                .update(cx, |app, _, _| {
+                    app.theme.mode == tako_core::theme::ThemeMode::Light
+                })
+                .unwrap_or(false);
+            check(
+                status == 200 && response.contains(r#"\"theme\":\"light\""#) && light_applied,
+                "MCP theme set light（GUI 反映）",
+            );
+            let (status, response) = mcp_post_bg(
+                cx,
+                &mcp_url,
+                Some(&token),
+                &[],
+                r#"{"jsonrpc":"2.0","id":104,"method":"tools/call","params":{"name":"tako_theme","arguments":{"action":"toggle"}}}"#,
+            )
+            .await
+            .unwrap_or_else(|| fail("MCP theme toggle 接続"));
+            let dark_restored = window
+                .update(cx, |app, _, _| {
+                    app.theme.mode == tako_core::theme::ThemeMode::Dark
+                })
+                .unwrap_or(false);
+            check(
+                status == 200 && response.contains(r#"\"theme\":\"dark\""#) && dark_restored,
+                "MCP theme toggle（dark へ復帰）",
             );
 
             // 34. tools/call tako_split_pane（X-Tako-Pane で呼び出し元特定 + origin=mcp）と

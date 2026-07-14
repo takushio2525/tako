@@ -1478,6 +1478,30 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_theme",
+            "description": "UI テーマ（ライト/ダーク）の状態確認・切替（Issue #217）。\
+                action=status（既定）: 現在のテーマ（dark / light）を返す。\
+                action=set: mode で指定したテーマへ切り替える。\
+                action=toggle: 現在のテーマを反転する。\
+                変更は settings.json に永続化され、GUI に即時反映される。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "set", "toggle"],
+                        "description": "操作種別（省略時は status）",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["dark", "light"],
+                        "description": "テーマモード（set 時に必須）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_setup_changes",
             "description": "tako setup のアップデート追従状況を照会する（Issue #94）。\
                 前回 `tako setup` 完了時に適用したリビジョン（applied_revision）と\
@@ -2266,6 +2290,10 @@ fn build_request(
             power_condition: str_arg(args, "power_condition")?.map(|s| s.to_string()),
             lid_sleep_mode: str_arg(args, "lid_sleep_mode")?.map(|s| s.to_string()),
         },
+        "tako_theme" => Request::Theme {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
+            mode: str_arg(args, "mode")?.map(|s| s.to_string()),
+        },
         "tako_setup_changes" => Request::SetupChanges,
         "tako_agents_sync_rules" => Request::AgentsSyncRules {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
@@ -2838,7 +2866,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 73);
+        assert_eq!(tools.len(), 74);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

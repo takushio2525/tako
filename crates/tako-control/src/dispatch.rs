@@ -1959,6 +1959,53 @@ fn dispatch_inner(
             }
         }
 
+        Request::Theme { action, mode } => {
+            use tako_core::theme::ThemeMode;
+            let action = action.as_deref().unwrap_or("status");
+            let status_json = |mode: ThemeMode| {
+                serde_json::json!({
+                    "theme": mode.as_str(),
+                    "available": ["dark", "light"],
+                })
+            };
+            match action {
+                "status" => Ok(status_json(host.theme_mode())),
+                "set" | "toggle" => {
+                    let next = match action {
+                        "set" => {
+                            let m = mode.as_deref().ok_or_else(|| {
+                                DispatchError::InvalidParams(
+                                    "set には mode が必要（dark / light）".into(),
+                                )
+                            })?;
+                            ThemeMode::parse(m).ok_or_else(|| {
+                                DispatchError::InvalidParams(format!(
+                                    "不明な mode: {m:?}（dark / light のいずれか）"
+                                ))
+                            })?
+                        }
+                        _ => match host.theme_mode() {
+                            ThemeMode::Dark => ThemeMode::Light,
+                            ThemeMode::Light => ThemeMode::Dark,
+                        },
+                    };
+                    // 永続化（テスト・セルフテスト中はユーザー設定を汚さない。ipc.rs と同方針）
+                    if !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none() {
+                        let mut settings = crate::settings::load();
+                        settings.theme = next.as_str().into();
+                        crate::settings::save(&settings).map_err(|e| {
+                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
+                        })?;
+                    }
+                    host.set_theme_mode(next);
+                    Ok(status_json(next))
+                }
+                other => Err(DispatchError::InvalidParams(format!(
+                    "不明な action: {other:?}（status / set / toggle のいずれか）"
+                ))),
+            }
+        }
+
         Request::TreeFolder {
             action,
             path,
@@ -4006,6 +4053,8 @@ mod tests {
         pins: Vec<(bool, u64)>,
         /// #210: 旧 pane ID → 新 pane ID マッピング
         stale_pane_map: std::collections::HashMap<PaneId, PaneId>,
+        /// #217: UI テーマモード
+        theme_mode: tako_core::theme::ThemeMode,
     }
 
     impl MockHost {
@@ -4019,6 +4068,7 @@ mod tests {
                 collapsed: std::collections::HashSet::new(),
                 pins: Vec::new(),
                 stale_pane_map: std::collections::HashMap::new(),
+                theme_mode: tako_core::theme::ThemeMode::Dark,
             }
         }
 
@@ -4093,6 +4143,12 @@ mod tests {
         }
         fn set_pin_group(&mut self, tab: TabId, pinned: Option<bool>) {
             self.toggle_pin(true, tab.as_u64(), pinned);
+        }
+        fn theme_mode(&self) -> tako_core::theme::ThemeMode {
+            self.theme_mode
+        }
+        fn set_theme_mode(&mut self, mode: tako_core::theme::ThemeMode) {
+            self.theme_mode = mode;
         }
     }
 
@@ -6303,5 +6359,65 @@ mod tests {
                 "spawned_by が実ペインを指す"
             );
         });
+    }
+
+    #[test]
+    fn テーマのstatus_set_toggleが機能する() {
+        use tako_core::theme::ThemeMode;
+        let mut host = MockHost::new();
+        // status: 既定はダーク
+        let v = dispatch(
+            &mut host,
+            Request::Theme {
+                action: None,
+                mode: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["theme"], "dark");
+        // set light → host へ反映
+        let v = dispatch(
+            &mut host,
+            Request::Theme {
+                action: Some("set".into()),
+                mode: Some("light".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["theme"], "light");
+        assert_eq!(host.theme_mode, ThemeMode::Light);
+        // toggle → dark へ反転
+        let v = dispatch(
+            &mut host,
+            Request::Theme {
+                action: Some("toggle".into()),
+                mode: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(host.theme_mode, ThemeMode::Dark);
+        // set の不明 mode / mode 無しはエラー
+        assert!(dispatch(
+            &mut host,
+            Request::Theme {
+                action: Some("set".into()),
+                mode: Some("sepia".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .is_err());
+        assert!(dispatch(
+            &mut host,
+            Request::Theme {
+                action: Some("set".into()),
+                mode: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .is_err());
     }
 }

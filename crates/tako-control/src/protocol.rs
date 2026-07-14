@@ -636,6 +636,16 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         lid_sleep_mode: Option<String>,
     },
+    /// UI テーマの状態確認・切替（Issue #217。ライト/ダーク）。
+    /// `action` = "status"（既定）/ "set"（`mode` へ変更）/ "toggle"（反転）。
+    /// 変更は settings.json に永続化され、GUI に即時反映される
+    Theme {
+        #[serde(default)]
+        action: Option<String>,
+        /// テーマモード: "dark" / "light"（set 時に必須）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+    },
     /// ファイルツリーへのフォルダ追加・削除・一覧（#134）。
     /// AI が作業対象プロジェクトのフォルダをファイルツリーに明示追加する。タブ単位スコープ
     TreeFolder {

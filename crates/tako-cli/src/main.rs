@@ -82,6 +82,9 @@ enum Command {
     /// × ボタン close の確認ダイアログ ON/OFF・状態確認
     #[command(name = "confirm-close")]
     ConfirmClose(ToggleArgs),
+    /// UI テーマ（ライト/ダーク）の確認・切替（Issue #217）。
+    /// 引数なしで現在テーマを表示、dark / light で指定、toggle で反転
+    Theme(ThemeArgs),
     /// 右サイドバー情報パネル（tmux 一覧 / agents 集約センター）の表示・幅・ビュー切替。
     /// 引数なしで現在状態を表示する
     Panel(PanelArgs),
@@ -1196,6 +1199,14 @@ struct ToggleArgs {
     /// on = 有効化、off = 無効化（省略時は現在状態を表示）
     #[arg(value_parser = ["on", "off"])]
     state: Option<String>,
+}
+
+/// UI テーマコマンドの引数（Issue #217）
+#[derive(Args)]
+struct ThemeArgs {
+    /// dark / light = 指定テーマへ、toggle = 反転（省略時は現在テーマを表示）
+    #[arg(value_parser = ["dark", "light", "toggle"])]
+    mode: Option<String>,
 }
 
 #[derive(Args)]
@@ -2693,6 +2704,16 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::ConfirmClose(args) => Request::ConfirmClose {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
+        Command::Theme(args) => Request::Theme {
+            action: args.mode.as_deref().map(|m| {
+                if m == "toggle" {
+                    "toggle".to_string()
+                } else {
+                    "set".to_string()
+                }
+            }),
+            mode: args.mode.clone().filter(|m| m != "toggle"),
+        },
         Command::Git(GitCommand::Log { max_count, pane }) => Request::GitLog {
             pane: target_pane(*pane)?,
             max_count: Some(*max_count),
@@ -3383,6 +3404,7 @@ fn print_result(command: &Command, result: &Value) {
         | Command::Portdetect(_)
         | Command::Persist(_)
         | Command::ConfirmClose(_)
+        | Command::Theme(_)
         | Command::Panel(_)
         | Command::Collapse(_)
         | Command::Pin(_) => {
