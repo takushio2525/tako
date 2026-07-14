@@ -261,22 +261,42 @@ The watch command will output when the worker stops:
   processes and no busy screen pattern. Extra `detail:` / `action:` lines follow.
 - `WORKER_GONE: tako:<pane>` — pane was closed
 
+After WORKER_IDLE or WORKER_ERROR, `event:` lines may follow with additional
+context (Issue #243). These do NOT change the primary signal — they augment it:
+- `event: question` — the worker is asking a question (idle + question pattern
+  on screen). Answer via `tako_send_input` or relay to the user.
+- `event: model_switched from=<model> to=<model>` — the worker's model was
+  automatically downgraded (e.g. sol limit → sonnet). The worker continues but
+  at lower capability. Consider `tako_task_checkpoint` + handoff to a better model.
+- `event: context_high percent=<N>` — context usage exceeds 60%. The worker
+  risks hitting the context limit. Consider asking the worker to commit progress
+  and checkpoint, or prepare a handoff.
+
 ### When you receive WORKER_IDLE
 
-1. **Confirm before acting** — idle notifications can misfire. Read the pane
+1. **Check the `events` first** — if `question` is present, the worker is NOT
+   done: it is waiting for your answer. Answer via `tako_send_input`, or relay
+   the question to the user if it is genuinely the user's call. Re-arm the watch.
+2. **Confirm before acting** — idle notifications can misfire. Read the pane
    with `tako_read_pane`. If it shows an active thinking/working indicator, the
    worker is NOT done: wait and re-arm the watch. Long thinking is normal at
    high effort — allow at least 10 minutes before suspecting a stall.
-2. Worker is waiting on a question → answer it via `tako_send_input`, or relay
-   it to the user if it is genuinely the user's call.
-3. Worker reports completion → run Acceptance Inspection, then follow the
+3. If `model_switched` is present, the worker completed on a downgraded model.
+   Note the model change in your inspection — the worker may have made
+   lower-quality decisions. Consider re-running critical sections on the
+   original model after limits reset.
+4. If `context_high` is present (percent > 60%), the worker is nearing its
+   context limit. After inspection, consider whether the next task for this
+   worker should be a fresh spawn instead of a continuation.
+5. Worker reports completion → run Acceptance Inspection, then follow the
    lifecycle rules.
 
 `tako_orchestrator_worker_status` also returns `has_running_children` (true if
-the worker's tmux session has active child processes) and `collapsed` (true if
-the TUI is in a folded "N new messages" state). When `collapsed` is true, the
-pane text may be incomplete — use `has_running_children` and the `status` field
-as the primary signals, not the screen text.
+the worker's tmux session has active child processes), `collapsed` (true if
+the TUI is in a folded "N new messages" state), and `events` (array of detected
+events — see above). When `collapsed` is true, the pane text may be incomplete
+— use `has_running_children` and the `status` field as the primary signals, not
+the screen text.
 
 ### When you receive WORKER_ERROR
 

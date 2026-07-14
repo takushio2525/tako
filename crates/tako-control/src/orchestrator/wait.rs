@@ -873,6 +873,169 @@ pub fn detect_worker_error(output: &str) -> Option<(WorkerErrorKind, String)> {
     None
 }
 
+// --- #243: 質問検知・モデル切替検知・context_high ---
+
+/// worker イベントの種別（worker_status の events 配列に載せる。#243）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerEventKind {
+    /// worker が質問している（idle + 画面末尾に質問パターン）
+    Question,
+    /// claude の自動モデル切替が発生した
+    ModelSwitched { from: String, to: String },
+    /// ctx 使用率が閾値（60%）を超えた
+    ContextHigh { percent: u64 },
+}
+
+/// worker_status の events 配列に載せる 1 イベント
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerEvent {
+    pub kind: WorkerEventKind,
+}
+
+impl WorkerEvent {
+    pub fn to_json(&self) -> Value {
+        match &self.kind {
+            WorkerEventKind::Question => json!({ "kind": "question" }),
+            WorkerEventKind::ModelSwitched { from, to } => {
+                json!({ "kind": "model_switched", "from": from, "to": to })
+            }
+            WorkerEventKind::ContextHigh { percent } => {
+                json!({ "kind": "context_high", "percent": percent })
+            }
+        }
+    }
+}
+
+/// worker の画面が「質問している」パターンを含むか検出する（#243）。
+/// **idle 確定後の画面に対して使う**こと。busy 中の質問は質問ではなく作業中。
+///
+/// パターンは実採取画面由来:
+/// - claude: 「? 」で始まる行（確認質問）、末尾が「?」の行（自由質問）
+/// - claude: 選択肢パターン（「1.」「2.」が連続する行）
+/// - claude / codex: 「Should I」「Would you like」「Do you want」等の決まり文句
+/// - 誤発火防止: 「? for shortcuts」（agy フッター）は除外
+pub fn detect_worker_question(output: &str) -> bool {
+    let lines = tail_lines(output, 15);
+
+    for l in &lines {
+        let t = l.trim();
+        // agy フッターの「? for shortcuts」を除外
+        if t.contains("? for shortcuts") {
+            continue;
+        }
+        // 「? 」で始まる行（claude の yes/no 確認）
+        if t.starts_with("? ") {
+            return true;
+        }
+    }
+
+    // 質問の決まり文句（末尾 15 行に 1 つでもあれば）
+    for l in &lines {
+        let t = l.trim();
+        if t.contains("Should I ")
+            || t.contains("Would you like")
+            || t.contains("Do you want")
+            || t.contains("Which ")
+            || t.contains("Shall I ")
+        {
+            return true;
+        }
+        // 末尾が ? または ？ の行（「?」単独はフッター由来の可能性があるので除外）
+        if t.len() > 1
+            && (t.ends_with('?') || t.ends_with('\u{ff1f}'))
+            && !t.contains("? for shortcuts")
+        {
+            return true;
+        }
+    }
+
+    // 選択肢パターン: 「1. ...」「2. ...」が末尾 10 行に複数行ある
+    let choice_count = tail_lines(output, 10)
+        .iter()
+        .filter(|l| {
+            let t = l.trim().trim_start_matches(['›', ' ']);
+            // 「N. テキスト」パターン（N は 1〜9）
+            t.len() > 2
+                && t.as_bytes()[0].is_ascii_digit()
+                && t.as_bytes()[1] == b'.'
+                && t.as_bytes()[2] == b' '
+        })
+        .count();
+    if choice_count >= 2 {
+        return true;
+    }
+
+    false
+}
+
+/// 自動モデル切替の告知行を検出し、from/to を返す（#243）。
+/// パターン: 「{model} limit reached, now using {model}」
+/// 既存の detect_worker_error では除外（worker は止まらない）されていた情報を、
+/// events として master に通知する
+pub fn detect_model_switched(output: &str) -> Option<(String, String)> {
+    let lines = tail_lines(output, 30);
+    for l in &lines {
+        // 「Claude Opus 4.6 limit reached, now using Claude Sonnet 4.5」
+        // 「5-hour limit reached, now using Claude Sonnet 4.5」
+        if let Some(pos) = l.find("limit reached, now using") {
+            let from = l[..pos].trim().trim_start_matches("⎿ ").trim().to_string();
+            let to = l[pos + "limit reached, now using".len()..]
+                .trim()
+                .to_string();
+            if !to.is_empty() {
+                return Some((from, to));
+            }
+        }
+    }
+    None
+}
+
+/// context_high の閾値（%）
+pub const CONTEXT_HIGH_THRESHOLD: u32 = 60;
+
+/// worker_status の応答から events 配列を構築する（#243）。
+/// dispatch の finish_worker_status から呼ばれる
+pub fn collect_worker_events(
+    status: &str,
+    recent_output: Option<&str>,
+    ctx_percent: Option<u32>,
+) -> Vec<WorkerEvent> {
+    let mut events = Vec::new();
+
+    // question: idle 時のみ（busy 中の質問文言はまだ作業途中）
+    if status == "idle" || status == "error" {
+        if let Some(out) = recent_output {
+            if detect_worker_question(out) {
+                events.push(WorkerEvent {
+                    kind: WorkerEventKind::Question,
+                });
+            }
+        }
+    }
+
+    // model_switched: status に関係なく画面に告知があれば記録
+    if let Some(out) = recent_output {
+        if let Some((from, to)) = detect_model_switched(out) {
+            events.push(WorkerEvent {
+                kind: WorkerEventKind::ModelSwitched { from, to },
+            });
+        }
+    }
+
+    // context_high: 閾値超えなら
+    if let Some(pct) = ctx_percent {
+        if pct >= CONTEXT_HIGH_THRESHOLD {
+            events.push(WorkerEvent {
+                kind: WorkerEventKind::ContextHigh {
+                    percent: pct as u64,
+                },
+            });
+        }
+    }
+
+    events
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -1553,5 +1716,193 @@ mod tests {
                 .any(|r| matches!(r, Request::Close { .. })),
             "stalled 時は auto_close しない"
         );
+    }
+
+    // --- #243: 質問検知・モデル切替検知・context_high ---
+
+    /// claude が質問している画面（実採取。AskUserQuestion 相当の選択肢表示）
+    const QUESTION_CHOICE_SCREEN: &str = "\
+このリポジトリにはテストが見つかりませんでした。\n\
+テストを追加しますか？\n\n\
+❯ 1. はい、ユニットテストを追加する\n\
+  2. いいえ、スキップする\n\
+  3. 後で自分で追加する\n\n\
+❯ \n──────\n  ctx 42%";
+
+    /// claude が自由形式の質問をしている画面（実採取。全角？で終わる行）
+    const QUESTION_FREE_SCREEN: &str = "\
+実装を進めるにあたり確認があります。\n\n\
+データベースのマイグレーションは先に実行しておくべきですか\u{ff1f}\n\n\
+❯ \n──────\n  ctx 28%";
+
+    /// claude の ? で始まる確認質問（実採取。信頼確認ダイアログ相当）
+    const QUESTION_CONFIRM_SCREEN: &str = "\
+? Do you trust the files in this folder?\n\
+❯ 1. Yes\n\
+  2. No\n\n\
+  Press enter to confirm";
+
+    /// claude の Should I 質問パターン
+    const QUESTION_SHOULD_SCREEN: &str = "\
+変更をコミットしました。\n\n\
+Should I also update the documentation?\n\n\
+❯ \n──────";
+
+    /// 自動モデル切替の告知画面（実採取。worker は停止しない）
+    const MODEL_SWITCHED_SCREEN: &str = "\
+⎿ Claude Opus 4.6 limit reached, now using Claude Sonnet 4.5\n\n\
+⏺ 続けて実装します\n\n\
+❯ \n──────\n  ctx 65%";
+
+    /// 正常完了画面（質問なし。既存 IDLE_SCREEN と同等）
+    const NORMAL_DONE_SCREEN: &str = "\
+実装が完了しました。変更をコミットし、テストも全緑です。\n\n\
+❯ \n──────\nmodel: opus · ctx 42%";
+
+    #[test]
+    fn detect_worker_questionは選択肢パターンを検知する() {
+        assert!(detect_worker_question(QUESTION_CHOICE_SCREEN));
+    }
+
+    #[test]
+    fn detect_worker_questionは自由形式の質問を検知する() {
+        assert!(detect_worker_question(QUESTION_FREE_SCREEN));
+    }
+
+    #[test]
+    fn detect_worker_questionは確認質問を検知する() {
+        assert!(detect_worker_question(QUESTION_CONFIRM_SCREEN));
+    }
+
+    #[test]
+    fn detect_worker_questionはshould_iパターンを検知する() {
+        assert!(detect_worker_question(QUESTION_SHOULD_SCREEN));
+    }
+
+    #[test]
+    fn detect_worker_questionは正常完了画面で誤発火しない() {
+        assert!(!detect_worker_question(NORMAL_DONE_SCREEN));
+        assert!(!detect_worker_question(IDLE_SCREEN));
+        assert!(!detect_worker_question(CODEX_IDLE_SCREEN));
+    }
+
+    #[test]
+    fn detect_worker_questionはagyフッターの問号に誤発火しない() {
+        assert!(!detect_worker_question(AGY_IDLE_SCREEN));
+        assert!(!detect_worker_question(AGY_BUSY_SCREEN));
+    }
+
+    #[test]
+    fn detect_worker_questionはbusy画面で誤発火しない() {
+        assert!(!detect_worker_question(BUSY_SCREEN));
+    }
+
+    #[test]
+    fn detect_model_switchedはモデル切替を検出する() {
+        let (from, to) = detect_model_switched(MODEL_SWITCHED_SCREEN).expect("検知される");
+        assert_eq!(from, "Claude Opus 4.6");
+        assert_eq!(to, "Claude Sonnet 4.5");
+    }
+
+    #[test]
+    fn detect_model_switchedは5h_limit形式も検出する() {
+        let screen = "5-hour limit reached, now using Claude Sonnet 4.5\n\n❯ \n──────";
+        let (from, to) = detect_model_switched(screen).expect("検知される");
+        assert_eq!(from, "5-hour");
+        assert_eq!(to, "Claude Sonnet 4.5");
+    }
+
+    #[test]
+    fn detect_model_switchedは正常画面で誤発火しない() {
+        assert_eq!(detect_model_switched(IDLE_SCREEN), None);
+        assert_eq!(detect_model_switched(CODEX_IDLE_SCREEN), None);
+        assert_eq!(detect_model_switched(AGY_IDLE_SCREEN), None);
+        assert_eq!(detect_model_switched(NORMAL_DONE_SCREEN), None);
+    }
+
+    #[test]
+    fn collect_worker_eventsは質問イベントを返す() {
+        let events = collect_worker_events("idle", Some(QUESTION_CHOICE_SCREEN), Some(42u32));
+        assert!(events.iter().any(|e| e.kind == WorkerEventKind::Question));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e.kind, WorkerEventKind::ContextHigh { .. })));
+    }
+
+    #[test]
+    fn collect_worker_eventsはbusy時に質問を検出しない() {
+        let events = collect_worker_events("busy", Some(QUESTION_CHOICE_SCREEN), Some(42u32));
+        assert!(!events.iter().any(|e| e.kind == WorkerEventKind::Question));
+    }
+
+    #[test]
+    fn collect_worker_eventsはモデル切替を返す() {
+        let events = collect_worker_events("idle", Some(MODEL_SWITCHED_SCREEN), Some(65u32));
+        assert!(events
+            .iter()
+            .any(|e| matches!(&e.kind, WorkerEventKind::ModelSwitched { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.kind, WorkerEventKind::ContextHigh { percent: 65 })));
+    }
+
+    #[test]
+    fn collect_worker_eventsはcontext_highを返す() {
+        let events = collect_worker_events("idle", Some(IDLE_SCREEN), Some(75u32));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].kind,
+            WorkerEventKind::ContextHigh { percent: 75 }
+        ));
+    }
+
+    #[test]
+    fn collect_worker_eventsは閾値未満でcontext_highを返さない() {
+        let events = collect_worker_events("idle", Some(IDLE_SCREEN), Some(59u32));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn collect_worker_eventsは正常完了でイベントなし() {
+        let events = collect_worker_events("idle", Some(NORMAL_DONE_SCREEN), Some(42u32));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn collect_worker_eventsは複数イベントを同時に返す() {
+        let events = collect_worker_events("idle", Some(MODEL_SWITCHED_SCREEN), Some(65u32));
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn collect_worker_eventsはoutput_noneで空() {
+        let events: Vec<WorkerEvent> = collect_worker_events("idle", None, None);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn worker_eventのto_jsonは期待する形式を出力する() {
+        let q = WorkerEvent {
+            kind: WorkerEventKind::Question,
+        };
+        assert_eq!(q.to_json()["kind"], "question");
+
+        let ms = WorkerEvent {
+            kind: WorkerEventKind::ModelSwitched {
+                from: "Opus".into(),
+                to: "Sonnet".into(),
+            },
+        };
+        let j = ms.to_json();
+        assert_eq!(j["kind"], "model_switched");
+        assert_eq!(j["from"], "Opus");
+        assert_eq!(j["to"], "Sonnet");
+
+        let ch = WorkerEvent {
+            kind: WorkerEventKind::ContextHigh { percent: 70 },
+        };
+        let j = ch.to_json();
+        assert_eq!(j["kind"], "context_high");
+        assert_eq!(j["percent"], 70);
     }
 }

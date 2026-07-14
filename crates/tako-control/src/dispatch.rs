@@ -3684,6 +3684,16 @@ fn finish_worker_status(
         .as_ref()
         .is_some_and(|s| crate::orchestrator::wait::screen_is_collapsed(s));
 
+    // #243: events 配列（question / model_switched / context_high）
+    let events: Vec<Value> = crate::orchestrator::wait::collect_worker_events(
+        &status,
+        recent_output.as_deref(),
+        ctx_percent,
+    )
+    .iter()
+    .map(|e| e.to_json())
+    .collect();
+
     Ok(json!({
         "status": status,
         "ctx_percent": ctx_percent,
@@ -3694,6 +3704,7 @@ fn finish_worker_status(
         "stalled": stalled_info,
         "has_running_children": has_children,
         "collapsed": collapsed,
+        "events": events,
     }))
 }
 
@@ -6790,6 +6801,69 @@ mod tests {
         .unwrap();
         assert_eq!(retrying["status"], "busy");
         assert!(retrying["error"].is_null());
+    }
+
+    #[test]
+    fn finish_worker_statusがevents配列を返す() {
+        // #243: 質問画面で question イベント
+        let v = finish_worker_status(
+            WorkerStatusCtx {
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some(
+                    "テストを追加しますか？\n❯ 1. はい\n  2. いいえ\n❯ \n──────".into(),
+                ),
+                full_screen: None,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["status"], "idle");
+        let events = v["events"].as_array().expect("events は配列");
+        assert!(
+            events.iter().any(|e| e["kind"] == "question"),
+            "question イベントが含まれる: {events:?}"
+        );
+
+        // モデル切替画面で model_switched + context_high（ctx 65%）
+        let v2 = finish_worker_status(
+            WorkerStatusCtx {
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some(
+                    "⎿ Claude Opus 4.6 limit reached, now using Claude Sonnet 4.5\n\n❯ \n──────"
+                        .into(),
+                ),
+                full_screen: None,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        // この画面は error 判定されない（limit reached, now using は除外）
+        assert_eq!(v2["status"], "idle");
+        let events2 = v2["events"].as_array().expect("events は配列");
+        assert!(
+            events2.iter().any(|e| e["kind"] == "model_switched"),
+            "model_switched: {events2:?}"
+        );
+
+        // 正常完了画面では events が空
+        let v3 = finish_worker_status(
+            WorkerStatusCtx {
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some("done\n❯ ".into()),
+                full_screen: None,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v3["status"], "idle");
+        let events3 = v3["events"].as_array().expect("events は配列");
+        assert!(events3.is_empty(), "正常完了で events が空: {events3:?}");
     }
 
     #[test]
