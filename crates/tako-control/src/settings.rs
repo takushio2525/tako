@@ -27,6 +27,9 @@ pub struct Settings {
     /// スリープ防止の電源条件（Issue #173。既定 ac-only）
     #[serde(default)]
     pub sleep_guard_power: crate::sleep_guard::PowerCondition,
+    /// 蓋閉じ防止モード（Issue #218。既定 off）
+    #[serde(default)]
+    pub lid_sleep_mode: crate::sleep_guard::LidSleepMode,
     /// ペインの平文ログ保存（Issue #112 B。既定 ON）
     #[serde(default = "default_true")]
     pub pane_logs: bool,
@@ -58,6 +61,7 @@ impl Default for Settings {
             tmux_persist: true,
             sleep_guard_mode: crate::sleep_guard::SleepGuardMode::default(),
             sleep_guard_power: crate::sleep_guard::PowerCondition::default(),
+            lid_sleep_mode: crate::sleep_guard::LidSleepMode::default(),
             pane_logs: true,
             pane_log_max_mb: default_pane_log_max_mb(),
             pane_log_total_max_mb: default_pane_log_total_max_mb(),
@@ -138,6 +142,7 @@ mod tests {
             tmux_persist: false,
             sleep_guard_mode: crate::sleep_guard::SleepGuardMode::On,
             sleep_guard_power: crate::sleep_guard::PowerCondition::Always,
+            lid_sleep_mode: crate::sleep_guard::LidSleepMode::WhileAgentsRunning,
             pane_logs: false,
             pane_log_max_mb: 10,
             pane_log_total_max_mb: 300,

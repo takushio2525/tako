@@ -328,13 +328,20 @@ enum SleepGuardCommand {
     Status,
     /// スリープ防止の設定を変更する
     Set {
-        /// モード: off / on / while-agents-running
+        /// アイドルスリープ防止モード: off / on / while-agents-running
         #[arg(long)]
         mode: Option<String>,
         /// 電源条件: ac-only / always
         #[arg(long, name = "power")]
         power_condition: Option<String>,
+        /// 蓋閉じ防止モード: off / while-agents-running（要 sudoers 登録）
+        #[arg(long)]
+        lid_sleep_mode: Option<String>,
     },
+    /// 蓋閉じ防止の sudoers 登録（管理者パスワード必要、初回のみ）
+    InstallLidSleep,
+    /// 蓋閉じ防止の sudoers 登録を削除
+    RemoveLidSleep,
 }
 
 #[derive(Subcommand)]
@@ -2212,11 +2219,12 @@ fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
             let state = tako_control::sleep_guard::status(
                 settings.sleep_guard_mode,
                 settings.sleep_guard_power,
+                settings.lid_sleep_mode,
             );
             if state.assertion_held {
-                eprintln!("✓ スリープ防止: アサーション保持中");
+                eprintln!("  idle-sleep: アサーション保持中");
             } else {
-                eprintln!("  スリープ防止: アサーション未保持");
+                eprintln!("  idle-sleep: アサーション未保持");
             }
             eprintln!("  モード: {}", state.mode.as_str());
             eprintln!("  電源条件: {}", state.power_condition.as_str());
@@ -2228,10 +2236,25 @@ fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
                     "未接続"
                 }
             );
+            eprintln!("  蓋: {}", if state.lid_closed { "閉" } else { "開" });
             eprintln!(
-                "  説明: {}",
-                state.to_json()["description"].as_str().unwrap_or("")
+                "  蓋閉じ防止: {} (sudoers: {})",
+                state.lid_sleep_mode.as_str(),
+                if state.sudoers_installed {
+                    "登録済み"
+                } else {
+                    "未登録"
+                }
             );
+            eprintln!(
+                "  disablesleep: {}",
+                if state.lid_sleep_disabled {
+                    "有効"
+                } else {
+                    "無効"
+                }
+            );
+            eprintln!("  thermal: {}", state.thermal_state.as_str());
             println!(
                 "{}",
                 serde_json::to_string_pretty(&state.to_json()).unwrap()
@@ -2241,6 +2264,7 @@ fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
         SleepGuardCommand::Set {
             mode,
             power_condition,
+            lid_sleep_mode,
         } => {
             let mut settings = tako_control::settings::load();
             if let Some(m) = mode {
@@ -2259,22 +2283,57 @@ fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
                         || format!("不明な power: {pc:?}（ac-only / always のいずれか）"),
                     )?;
             }
+            if let Some(lsm) = lid_sleep_mode {
+                settings.lid_sleep_mode = tako_control::sleep_guard::LidSleepMode::from_str_opt(
+                    lsm,
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "不明な lid-sleep-mode: {lsm:?}（off / while-agents-running のいずれか）"
+                    )
+                })?;
+            }
             tako_control::settings::save(&settings)
                 .map_err(|e| format!("設定の保存に失敗: {e}"))?;
             eprintln!(
-                "✓ スリープ防止の設定を変更しました: mode={}, power={}",
+                "  設定を変更しました: mode={}, power={}, lid-sleep={}",
                 settings.sleep_guard_mode.as_str(),
-                settings.sleep_guard_power.as_str()
+                settings.sleep_guard_power.as_str(),
+                settings.lid_sleep_mode.as_str(),
             );
-            eprintln!("  ⚠ tako アプリの再起動後に反映されます");
             let state = tako_control::sleep_guard::status(
                 settings.sleep_guard_mode,
                 settings.sleep_guard_power,
+                settings.lid_sleep_mode,
             );
             println!(
                 "{}",
                 serde_json::to_string_pretty(&state.to_json()).unwrap()
             );
+            Ok(())
+        }
+        SleepGuardCommand::InstallLidSleep => {
+            eprintln!("蓋閉じ防止の sudoers 登録を行います...");
+            eprintln!("  登録内容: pmset -a disablesleep 0/1 のみ NOPASSWD");
+            eprintln!("  管理者パスワードの入力ダイアログが表示されます。");
+            let result = tako_control::sleep_guard::install_sudoers()?;
+            eprintln!("  {result}");
+            let mut settings = tako_control::settings::load();
+            settings.lid_sleep_mode = tako_control::sleep_guard::LidSleepMode::WhileAgentsRunning;
+            tako_control::settings::save(&settings)
+                .map_err(|e| format!("設定の保存に失敗: {e}"))?;
+            eprintln!("  lid-sleep-mode を while-agents-running に設定しました。");
+            eprintln!("  解除: tako sleep-guard remove-lid-sleep");
+            Ok(())
+        }
+        SleepGuardCommand::RemoveLidSleep => {
+            let result = tako_control::sleep_guard::remove_sudoers()?;
+            eprintln!("  {result}");
+            let mut settings = tako_control::settings::load();
+            settings.lid_sleep_mode = tako_control::sleep_guard::LidSleepMode::Off;
+            tako_control::settings::save(&settings)
+                .map_err(|e| format!("設定の保存に失敗: {e}"))?;
+            eprintln!("  lid-sleep-mode を off に設定しました。");
             Ok(())
         }
     }
@@ -3015,14 +3074,29 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 action: Some("status".to_string()),
                 mode: None,
                 power_condition: None,
+                lid_sleep_mode: None,
             },
             SleepGuardCommand::Set {
                 mode,
                 power_condition,
+                lid_sleep_mode,
             } => Request::SleepGuard {
                 action: Some("set".to_string()),
                 mode: mode.clone(),
                 power_condition: power_condition.clone(),
+                lid_sleep_mode: lid_sleep_mode.clone(),
+            },
+            SleepGuardCommand::InstallLidSleep => Request::SleepGuard {
+                action: Some("install-lid-sleep".to_string()),
+                mode: None,
+                power_condition: None,
+                lid_sleep_mode: None,
+            },
+            SleepGuardCommand::RemoveLidSleep => Request::SleepGuard {
+                action: Some("remove-lid-sleep".to_string()),
+                mode: None,
+                power_condition: None,
+                lid_sleep_mode: None,
             },
         },
         Command::Tree(sub) => match sub {

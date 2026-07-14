@@ -274,16 +274,12 @@ fn run_sleep_guard_check(interactive: bool) {
             new_settings.sleep_guard_power = tako_control::sleep_guard::PowerCondition::AcOnly;
             eprintln!("      ✓ L3: L1 の設定を適用しました（AC 接続時のみ防止）");
             eprintln!();
-            eprintln!("      蓋閉じでの継続稼働には追加の手動設定が必要です:");
+            eprintln!("      蓋閉じでの継続稼働:");
             eprintln!("      ─────────────────────────────────────────────");
-            eprintln!("      方法 1（推奨）: クラムシェルモード");
-            eprintln!("        AC 接続 + 外部ディスプレイ接続時に蓋を閉じても稼働します。");
-            eprintln!("        macOS 標準機能のため追加設定不要。外部ディスプレイが必要です。");
-            eprintln!();
-            eprintln!("      方法 2: sudo pmset disablesleep 1");
-            eprintln!("        管理者権限が必要。蓋を閉じてもスリープしなくなります。");
-            eprintln!("        ⚠ 発熱・電池劣化のリスクがあります。AC 接続時のみ推奨。");
-            eprintln!("        解除: sudo pmset disablesleep 0");
+            eprintln!("      tako sleep-guard install-lid-sleep");
+            eprintln!("        初回のみ管理者パスワードが必要。以後 tako が");
+            eprintln!("        エージェント稼働中だけ自動で蓋閉じ継続を有効にします。");
+            eprintln!("        解除: tako sleep-guard remove-lid-sleep");
             eprintln!("      ─────────────────────────────────────────────");
         }
         other => {
@@ -580,6 +576,20 @@ pub fn run_check() -> Result<(), String> {
                     mode.as_str(),
                     power.as_str()
                 );
+            }
+        }
+        let lid_mode = settings.lid_sleep_mode;
+        let sudoers = tako_control::sleep_guard::is_sudoers_installed();
+        match lid_mode {
+            tako_control::sleep_guard::LidSleepMode::Off => {
+                eprintln!("  △ 蓋閉じ防止: 未設定（tako sleep-guard install-lid-sleep で有効化）");
+            }
+            tako_control::sleep_guard::LidSleepMode::WhileAgentsRunning => {
+                if sudoers {
+                    eprintln!("  ✓ 蓋閉じ防止: while-agents-running（sudoers 登録済み）");
+                } else {
+                    eprintln!("  ✗ 蓋閉じ防止: while-agents-running だが sudoers 未登録（tako sleep-guard install-lid-sleep で登録）");
+                }
             }
         }
     }
