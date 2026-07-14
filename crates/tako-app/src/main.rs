@@ -736,6 +736,10 @@ struct TakoApp {
     /// 生成すると PDF 全ページの PNG コピー + ハッシュだけで 1 フレーム 100ms 級になる
     /// （71 ページ PDF の実測 p50 96ms/frame）。path 不変の間は Arc を再利用する
     preview_image_cache: HashMap<PaneId, PreviewImageCache>,
+    /// PDF・画像プレビューのズーム / パン / ページ状態（#234。core モデル）。
+    preview_views: HashMap<PaneId, tako_core::PreviewViewState>,
+    /// PDF・画像プレビューの 2 軸スクロールとページ移動を共有する GPUI handle。
+    preview_scroll_handles: HashMap<PaneId, gpui::ScrollHandle>,
     /// シークバー要素の実測 bounds（paint 時に canvas で記録）
     video_seek_bar_bounds: HashMap<PaneId, Bounds<Pixels>>,
     /// シークバーのドラッグ中フラグ（ペイン ID。ドラッグ中はマウス移動でシーク位置を追従）
@@ -1649,6 +1653,8 @@ impl TakoApp {
             video_ticker: false,
             video_frame_cache: HashMap::new(),
             preview_image_cache: HashMap::new(),
+            preview_views: HashMap::new(),
+            preview_scroll_handles: HashMap::new(),
             video_seek_bar_bounds: HashMap::new(),
             video_seek_dragging: None,
             video_seek_hover: None,
@@ -3568,8 +3574,66 @@ impl TakoApp {
     }
 
     /// フォーカス中ペインのフォントサイズを delta 分だけ変更する
+    fn set_preview_zoom_about(
+        &mut self,
+        pane_id: PaneId,
+        zoom: f32,
+        center: Option<Point<Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(current) = <Self as PreviewHost>::preview_view_state(self, pane_id) else {
+            return;
+        };
+        let zoom = zoom.clamp(tako_core::PREVIEW_ZOOM_MIN, tako_core::PREVIEW_ZOOM_MAX);
+        let pan_delta = self
+            .preview_scroll_handles
+            .get(&pane_id)
+            .and_then(|handle| {
+                let bounds = handle.bounds();
+                if f32::from(bounds.size.width) <= 0.0 || f32::from(bounds.size.height) <= 0.0 {
+                    return None;
+                }
+                let center = center.unwrap_or_else(|| {
+                    point(
+                        bounds.origin.x + bounds.size.width / 2.0,
+                        bounds.origin.y + bounds.size.height / 2.0,
+                    )
+                });
+                let relative_x = f32::from(center.x - bounds.origin.x);
+                let relative_y = f32::from(center.y - bounds.origin.y);
+                let ratio = zoom / current.zoom.max(f32::EPSILON);
+                // update_preview_view が現在パンを倍率比で拡大するため、ここでは
+                // ズーム中心を画面上の同じ位置へ保つ追加差分だけを渡す。
+                Some((relative_x * (ratio - 1.0), relative_y * (ratio - 1.0)))
+            });
+        if <Self as PreviewHost>::update_preview_view(
+            self,
+            pane_id,
+            tako_core::PreviewViewUpdate {
+                zoom: Some(tako_core::PreviewZoomCommand::Set(zoom)),
+                pan_delta,
+                ..tako_core::PreviewViewUpdate::default()
+            },
+        )
+        .is_ok()
+        {
+            cx.notify();
+        }
+    }
+
+    /// フォーカス中ペインのフォントサイズを delta 分だけ変更する。
+    /// PDF・画像プレビューでは同じキーをコンテンツズームへ割り当てる。
     fn zoom_focused_pane(&mut self, delta: f32, cx: &mut Context<Self>) {
         let pane_id = self.focused_pane();
+        if let Some(view) = <Self as PreviewHost>::preview_view_state(self, pane_id) {
+            let factor = if delta >= 0.0 {
+                tako_core::PREVIEW_ZOOM_STEP
+            } else {
+                1.0 / tako_core::PREVIEW_ZOOM_STEP
+            };
+            self.set_preview_zoom_about(pane_id, view.zoom * factor, None, cx);
+            return;
+        }
         let current = self.pane_font_size(pane_id);
         let new_size = (current + delta).clamp(Self::FONT_SIZE_MIN, Self::FONT_SIZE_MAX);
         if (new_size - current).abs() < 0.01 {
@@ -3583,6 +3647,21 @@ impl TakoApp {
     /// フォーカス中ペインのフォントサイズをテーマ既定に戻す
     fn reset_zoom_focused_pane(&mut self, cx: &mut Context<Self>) {
         let pane_id = self.focused_pane();
+        if <Self as PreviewHost>::preview_view_state(self, pane_id).is_some() {
+            if <Self as PreviewHost>::update_preview_view(
+                self,
+                pane_id,
+                tako_core::PreviewViewUpdate {
+                    zoom: Some(tako_core::PreviewZoomCommand::Reset),
+                    ..tako_core::PreviewViewUpdate::default()
+                },
+            )
+            .is_ok()
+            {
+                cx.notify();
+            }
+            return;
+        }
         self.pane_font_sizes.remove(&pane_id);
         self.pane_cell_sizes.remove(&pane_id);
         cx.notify();
@@ -3914,6 +3993,10 @@ impl TakoApp {
                 self.video_players.remove(&pane_id);
                 self.video_frame_cache.remove(&pane_id);
                 self.preview_image_cache.remove(&pane_id);
+                self.preview_views.remove(&pane_id);
+                self.preview_scroll_handles.remove(&pane_id);
+                self.pending_pdf_rasters.remove(&pane_id);
+                self.active_pdf_rasters.remove(&pane_id);
                 self.video_seek_bar_bounds.remove(&pane_id);
                 self.preview_selections.remove(&pane_id);
                 self.preview_line_bounds.remove(&pane_id);
@@ -3964,6 +4047,10 @@ impl TakoApp {
                     self.video_players.remove(&id);
                     self.video_frame_cache.remove(&id);
                     self.preview_image_cache.remove(&id);
+                    self.preview_views.remove(&id);
+                    self.preview_scroll_handles.remove(&id);
+                    self.pending_pdf_rasters.remove(&id);
+                    self.active_pdf_rasters.remove(&id);
                     self.video_seek_bar_bounds.remove(&id);
                     self.preview_selections.remove(&id);
                     self.preview_line_bounds.remove(&id);
@@ -9908,6 +9995,71 @@ impl PreviewHost for TakoApp {
             .map(|p| (p.path.display().to_string(), p.mode.to_wire()))
     }
 
+    fn preview_view_state(&self, pane: PaneId) -> Option<tako_core::PreviewViewState> {
+        let preview = self.previews.get(&pane)?;
+        if !matches!(
+            preview.mode,
+            preview::PreviewMode::Pdf | preview::PreviewMode::Image
+        ) {
+            return None;
+        }
+        let mut state = self.preview_views.get(&pane).copied().unwrap_or_default();
+        if let Some(handle) = self.preview_scroll_handles.get(&pane) {
+            let offset = handle.offset();
+            state.pan_x = -f32::from(offset.x);
+            state.pan_y = -f32::from(offset.y);
+            if preview.mode == preview::PreviewMode::Pdf && handle.bounds_for_item(0).is_some() {
+                state.page = handle.top_item() + 1;
+            }
+        }
+        Some(state)
+    }
+
+    fn update_preview_view(
+        &mut self,
+        pane: PaneId,
+        update: tako_core::PreviewViewUpdate,
+    ) -> Result<tako_core::PreviewViewState, String> {
+        let preview = self
+            .previews
+            .get(&pane)
+            .ok_or_else(|| "プレビューペインではない".to_string())?;
+        let (is_pdf, total_pages) = match &preview.content {
+            preview::PreviewContent::Pdf(data) => (true, data.total_pages),
+            preview::PreviewContent::Loading if preview.mode == preview::PreviewMode::Pdf => {
+                (true, usize::MAX)
+            }
+            preview::PreviewContent::Image(_) => (false, 1),
+            _ if preview.mode == preview::PreviewMode::Image => (false, 1),
+            _ => return Err("ズーム操作は PDF・画像プレビューだけに対応する".into()),
+        };
+        let mut state = self.preview_view_state(pane).unwrap_or_default();
+        state.apply(update)?;
+        if state.page > total_pages {
+            return Err(format!(
+                "ページ範囲外: {}（全 {total_pages} ページ）",
+                state.page
+            ));
+        }
+        if !is_pdf && state.page != 1 {
+            return Err("画像プレビューの page は 1 だけ指定できる".into());
+        }
+
+        let handle = self.preview_scroll_handles.entry(pane).or_default().clone();
+        let restore_page = update.page.or_else(|| {
+            matches!(update.zoom, Some(tako_core::PreviewZoomCommand::Reset)).then_some(state.page)
+        });
+        if let Some(page) = restore_page {
+            handle.scroll_to_top_of_item(page - 1);
+            state.pan_y = 0.0;
+            handle.set_offset(point(px(-state.pan_x), handle.offset().y));
+        } else {
+            handle.set_offset(point(px(-state.pan_x), px(-state.pan_y)));
+        }
+        self.preview_views.insert(pane, state);
+        Ok(state)
+    }
+
     fn video_playback(&mut self, pane: PaneId, action: &str) -> Result<String, String> {
         let player = self
             .video_players
@@ -10029,6 +10181,8 @@ impl PreviewHost for TakoApp {
         self.preview_line_texts.remove(&pane);
         self.preview_image_cache.remove(&pane);
         self.pending_pdf_rasters.remove(&pane);
+        self.preview_views.remove(&pane);
+        self.preview_scroll_handles.remove(&pane);
         self.previews.insert(pane, state);
         Ok(())
     }
@@ -13274,7 +13428,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 74, "MCP tools/list は 74 ツール");
+            check(status == 200 && tool_count == 75, "MCP tools/list は 75 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -15630,6 +15784,74 @@ mod self_test {
             check(
                 pdf_coordinates_ok,
                 "PDF の文字矩形ヒットテストと選択コピーが往復する",
+            );
+            let preview_zoom_command_ok = window
+                .update(cx, |app, preview_window, cx| {
+                    let pane = PaneId::from_raw(code_pane);
+                    let result = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::PreviewView {
+                            pane: Some(pane.as_u64()),
+                            zoom: Some(150.0),
+                            zoom_in: false,
+                            zoom_out: false,
+                            reset: false,
+                            page: Some(1),
+                            pan_x: None,
+                            pan_y: None,
+                        },
+                        PaneOrigin::Mcp,
+                    )
+                    .expect("PDF を 150% へズームできる");
+                    preview_window.refresh();
+                    cx.notify();
+                    result["zoom"].as_f64() == Some(150.0)
+                        && result["page"].as_u64() == Some(1)
+                })
+                .unwrap_or(false);
+            check(
+                preview_zoom_command_ok,
+                "PDF の page + zoom を dispatch で同時指定できる",
+            );
+            let mut zoom_coordinates_ok = false;
+            for _ in 0..30 {
+                wait(cx, 100).await;
+                zoom_coordinates_ok = window
+                    .update(cx, |app, preview_window, cx| {
+                        preview_window.refresh();
+                        cx.notify();
+                        let pane = PaneId::from_raw(code_pane);
+                        let zoom = app.preview_views.get(&pane).map(|view| view.zoom);
+                        let raster_zoom = app.previews.get(&pane).and_then(|state| {
+                            if let preview::PreviewContent::Pdf(data) = &state.content {
+                                Some(data.raster_key.zoom_percent)
+                            } else {
+                                None
+                            }
+                        });
+                        let hit = app
+                            .preview_pdf_char_bounds
+                            .get(&pane)
+                            .and_then(|lines| lines.first())
+                            .and_then(|line| line.first())
+                            .map(|bounds| {
+                                app.preview_hit_test(
+                                    pane,
+                                    point(bounds.left() + px(1.0), bounds.center().y),
+                                )
+                            });
+                        zoom == Some(1.5)
+                            && raster_zoom == Some(150)
+                            && hit == Some(Some((0, 0)))
+                    })
+                    .unwrap_or(false);
+                if zoom_coordinates_ok {
+                    break;
+                }
+            }
+            check(
+                zoom_coordinates_ok,
+                "PDF 150% の再ラスタライズ後も文字座標が画像へ追従する",
             );
             check(
                 wait_for_pdf_highlight_paint(

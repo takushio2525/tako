@@ -98,6 +98,26 @@ pub(super) fn pdf_text_hit_test(
     None
 }
 
+/// PDFKit の左下原点座標を、ズーム・パン適用後のページ画像矩形へ写像する。
+///
+/// `image_bounds` は GPUI のスクロールで既にパン済みの画面座標なので、倍率と移動量を
+/// ここへ二重適用しない。テキスト選択・ハイライトは常に実際の画像矩形へ追従する。
+fn pdf_box_to_screen(
+    bbox: [f64; 4],
+    page_size: [f64; 2],
+    image_bounds: Bounds<Pixels>,
+) -> Bounds<Pixels> {
+    let scale_x = f32::from(image_bounds.size.width) / page_size[0] as f32;
+    let scale_y = f32::from(image_bounds.size.height) / page_size[1] as f32;
+    Bounds {
+        origin: point(
+            image_bounds.origin.x + px(bbox[0] as f32 * scale_x),
+            image_bounds.origin.y + px((page_size[1] - bbox[1] - bbox[3]) as f32 * scale_y),
+        ),
+        size: gpui::size(px(bbox[2] as f32 * scale_x), px(bbox[3] as f32 * scale_y)),
+    }
+}
+
 #[cfg(test)]
 mod pdf_hit_test_tests {
     use super::*;
@@ -158,6 +178,16 @@ mod pdf_hit_test_tests {
             Some((0, 5))
         );
     }
+
+    #[test]
+    fn pdf文字座標はズームとパン後の画像矩形へ追従する() {
+        // 612×792 のページを 150% 相当の 918×1188 へ拡大し、スクロールで
+        // 左 120px・上 240px 移動した画面座標を与える。
+        let image = bounds(-120.0, -240.0, 918.0, 1188.0);
+        let actual = pdf_box_to_screen([72.0, 648.0, 144.0, 72.0], [612.0, 792.0], image);
+
+        assert_eq!(actual, bounds(-12.0, -132.0, 216.0, 108.0));
+    }
 }
 
 impl TakoApp {
@@ -171,8 +201,15 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) {
         let logical_width = (f32::from(area.size.width) - (PANE_PADDING + 4.0) * 2.0).max(1.0);
-        let desired =
-            preview::PdfRasterKey::for_view(self.preview_device_scale, 1.0, logical_width);
+        let desired = preview::PdfRasterKey::for_view(
+            self.preview_device_scale,
+            self.preview_views
+                .get(&pane_id)
+                .copied()
+                .unwrap_or_default()
+                .zoom,
+            logical_width,
+        );
         let Some(state) = self.previews.get(&pane_id) else {
             return;
         };
@@ -754,6 +791,18 @@ impl TakoApp {
             &state.content,
             preview::PreviewContent::Code(_) | preview::PreviewContent::Markdown(_)
         ) && !truncated;
+        let zoomable = matches!(
+            mode,
+            preview::PreviewMode::Image | preview::PreviewMode::Pdf
+        );
+        let preview_view = self
+            .preview_views
+            .get(&pane_id)
+            .copied()
+            .unwrap_or_default();
+        let preview_zoom = preview_view.zoom;
+        let viewport_width = (f32::from(area.size.width) - (PANE_PADDING + 4.0) * 2.0).max(1.0);
+        let viewport_height = (f32::from(area.size.height) - (PANE_PADDING + 4.0) * 2.0).max(1.0);
 
         let pdf_info: Option<usize> = if let preview::PreviewContent::Pdf(data) = &state.content {
             Some(data.total_pages)
@@ -858,18 +907,26 @@ impl TakoApp {
                     .and_then(|c| c.images.first())
                     .and_then(|i| i.clone());
                 match image {
-                    Some(image) => vec![div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            gpui::img(image)
-                                .object_fit(gpui::ObjectFit::Contain)
-                                .max_w_full()
-                                .max_h_full(),
-                        )
-                        .into_any_element()],
+                    Some(image) => {
+                        let scaled_width = viewport_width * preview_zoom;
+                        let scaled_height = viewport_height * preview_zoom;
+                        let canvas_width = viewport_width.max(scaled_width);
+                        let canvas_height = viewport_height.max(scaled_height);
+                        vec![div()
+                            .flex_none()
+                            .w(px(canvas_width))
+                            .h(px(canvas_height))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                gpui::img(image)
+                                    .object_fit(gpui::ObjectFit::Contain)
+                                    .w(px(scaled_width))
+                                    .h(px(scaled_height)),
+                            )
+                            .into_any_element()]
+                    }
                     None => Vec::new(),
                 }
             }
@@ -918,6 +975,13 @@ impl TakoApp {
                             cache.text_layers.get(i).cloned().unwrap_or_default();
                         let pdf_w = page_size[0];
                         let pdf_h = page_size[1];
+                        let scaled_page_width = viewport_width * preview_zoom;
+                        let scaled_page_height = if pdf_w > 0.0 {
+                            scaled_page_width * (pdf_h / pdf_w) as f32
+                        } else {
+                            scaled_page_width
+                        };
+                        let page_canvas_width = viewport_width.max(scaled_page_width);
 
                         let overlay = canvas(
                             |_, _, _| (),
@@ -930,8 +994,6 @@ impl TakoApp {
                                 if img_w <= 0.0 || img_h <= 0.0 {
                                     return;
                                 }
-                                let scale_x = img_w / pdf_w;
-                                let scale_y = img_h / pdf_h;
                                 let mut page_char_bounds: Vec<Vec<Bounds<Pixels>>> =
                                     Vec::with_capacity(text_lines_for_canvas.len());
 
@@ -945,18 +1007,8 @@ impl TakoApp {
                                             if list.len() <= idx {
                                                 list.resize(idx + 1, Bounds::default());
                                             }
-                                            // PDF 座標（左下原点）→ スクリーン座標（左上原点）
-                                            let sx = bounds.origin.x
-                                                + px(tl.bbox[0] as f32 * scale_x as f32);
-                                            let sy = bounds.origin.y
-                                                + px((pdf_h - tl.bbox[1] - tl.bbox[3]) as f32
-                                                    * scale_y as f32);
-                                            let sw = px(tl.bbox[2] as f32 * scale_x as f32);
-                                            let sh = px(tl.bbox[3] as f32 * scale_y as f32);
-                                            list[idx] = Bounds {
-                                                origin: point(sx, sy),
-                                                size: gpui::size(sw, sh),
-                                            };
+                                            list[idx] =
+                                                pdf_box_to_screen(tl.bbox, [pdf_w, pdf_h], bounds);
                                         }
                                     });
                                 }
@@ -965,17 +1017,11 @@ impl TakoApp {
                                     let mut line_char_bounds =
                                         Vec::with_capacity(tl.char_boxes.len());
                                     for ch in &tl.char_boxes {
-                                        let sx = bounds.origin.x
-                                            + px(ch.bbox[0] as f32 * scale_x as f32);
-                                        let sy = bounds.origin.y
-                                            + px((pdf_h - ch.bbox[1] - ch.bbox[3]) as f32
-                                                * scale_y as f32);
-                                        let sw = px(ch.bbox[2] as f32 * scale_x as f32);
-                                        let sh = px(ch.bbox[3] as f32 * scale_y as f32);
-                                        line_char_bounds.push(Bounds {
-                                            origin: point(sx, sy),
-                                            size: gpui::size(sw, sh),
-                                        });
+                                        line_char_bounds.push(pdf_box_to_screen(
+                                            ch.bbox,
+                                            [pdf_w, pdf_h],
+                                            bounds,
+                                        ));
                                     }
                                     page_char_bounds.push(line_char_bounds);
                                 }
@@ -1014,7 +1060,8 @@ impl TakoApp {
                             .flex()
                             .flex_col()
                             .items_center()
-                            .w_full()
+                            .flex_none()
+                            .w(px(page_canvas_width))
                             .pb_2()
                             .child(
                                 div()
@@ -1030,11 +1077,12 @@ impl TakoApp {
                             .child(
                                 div()
                                     .relative()
-                                    .w_full()
+                                    .w(px(scaled_page_width))
+                                    .h(px(scaled_page_height))
                                     .child(
                                         gpui::img(image)
                                             .object_fit(gpui::ObjectFit::Contain)
-                                            .max_w_full(),
+                                            .size_full(),
                                     )
                                     .child(overlay),
                             )
@@ -1658,6 +1706,103 @@ impl TakoApp {
                             .flex_row()
                             .items_center()
                             .gap(px(4.0))
+                            .when(zoomable, |d| {
+                                let zoom_out_pane = pane_id;
+                                let zoom_in_pane = pane_id;
+                                let reset_pane = pane_id;
+                                d.child(
+                                    div()
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(2.0))
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(hsla(theme.border_subtle))
+                                        .child(
+                                            div()
+                                                .id(("preview-zoom-out", pane_id.as_u64()))
+                                                .p(px(3.0))
+                                                .cursor_pointer()
+                                                .hover(|d| d.bg(rgba(theme.surface_hover)))
+                                                .child(
+                                                    svg()
+                                                        .path(crate::file_icons::ui_icon::MINUS)
+                                                        .w(px(10.0))
+                                                        .h(px(10.0))
+                                                        .text_color(hsla(theme.text_secondary)),
+                                                )
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    let current = this
+                                                        .preview_views
+                                                        .get(&zoom_out_pane)
+                                                        .copied()
+                                                        .unwrap_or_default()
+                                                        .zoom;
+                                                    this.set_preview_zoom_about(
+                                                        zoom_out_pane,
+                                                        current / tako_core::PREVIEW_ZOOM_STEP,
+                                                        None,
+                                                        cx,
+                                                    );
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(("preview-zoom-reset", pane_id.as_u64()))
+                                                .px(px(3.0))
+                                                .cursor_pointer()
+                                                .text_size(px(10.0))
+                                                .text_color(hsla(theme.text_secondary))
+                                                .child(SharedString::from(format!(
+                                                    "{}%",
+                                                    (preview_zoom * 100.0).round() as u32
+                                                )))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    if <TakoApp as PreviewHost>::update_preview_view(
+                                                        this,
+                                                        reset_pane,
+                                                        tako_core::PreviewViewUpdate {
+                                                            zoom: Some(tako_core::PreviewZoomCommand::Reset),
+                                                            ..tako_core::PreviewViewUpdate::default()
+                                                        },
+                                                    )
+                                                    .is_ok()
+                                                    {
+                                                        cx.notify();
+                                                    }
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(("preview-zoom-in", pane_id.as_u64()))
+                                                .p(px(3.0))
+                                                .cursor_pointer()
+                                                .hover(|d| d.bg(rgba(theme.surface_hover)))
+                                                .child(
+                                                    svg()
+                                                        .path(crate::file_icons::ui_icon::PLUS)
+                                                        .w(px(10.0))
+                                                        .h(px(10.0))
+                                                        .text_color(hsla(theme.text_secondary)),
+                                                )
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    let current = this
+                                                        .preview_views
+                                                        .get(&zoom_in_pane)
+                                                        .copied()
+                                                        .unwrap_or_default()
+                                                        .zoom;
+                                                    this.set_preview_zoom_about(
+                                                        zoom_in_pane,
+                                                        current * tako_core::PREVIEW_ZOOM_STEP,
+                                                        None,
+                                                        cx,
+                                                    );
+                                                })),
+                                        ),
+                                )
+                            })
                             .when(phv.mode_toggle && md_capable && edit_snap.is_none(), |d| {
                                 let (icon, label) = match mode {
                                     preview::PreviewMode::Markdown => (None, "コードとして表示"),
@@ -1979,6 +2124,11 @@ impl TakoApp {
                 // bounds 追跡用にリセット（各行の canvas で上書きされる）
                 self.preview_line_bounds.insert(pane_id, Vec::new());
                 self.preview_text_layouts.insert(pane_id, line_layouts);
+                let scroll_handle = self
+                    .preview_scroll_handles
+                    .entry(pane_id)
+                    .or_default()
+                    .clone();
 
                 div()
                     .id(("preview-scroll", pane_id.as_u64()))
@@ -1986,8 +2136,60 @@ impl TakoApp {
                     .p(px(PANE_PADDING + 4.0))
                     .flex()
                     .flex_col()
-                    .overflow_y_scroll()
-                    .cursor(CursorStyle::IBeam)
+                    .track_scroll(&scroll_handle)
+                    .when(zoomable, |d| d.overflow_scroll())
+                    .when(!zoomable, |d| d.overflow_y_scroll())
+                    .cursor(if mode == preview::PreviewMode::Image {
+                        CursorStyle::Arrow
+                    } else {
+                        CursorStyle::IBeam
+                    })
+                    .on_pinch(cx.listener(move |this, event: &gpui::PinchEvent, _, cx| {
+                        if zoomable {
+                            let current = this
+                                .preview_views
+                                .get(&pane_id)
+                                .copied()
+                                .unwrap_or_default()
+                                .zoom;
+                            let factor = (1.0 + event.delta).max(0.1);
+                            this.set_preview_zoom_about(
+                                pane_id,
+                                current * factor,
+                                Some(event.position),
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .on_scroll_wheel(cx.listener(
+                        move |this, event: &ScrollWheelEvent, _, cx| {
+                            if zoomable && (event.modifiers.platform || event.modifiers.control) {
+                                let delta = match event.delta {
+                                    ScrollDelta::Pixels(delta) => f32::from(delta.y),
+                                    ScrollDelta::Lines(delta) => delta.y * 20.0,
+                                };
+                                let factor = if delta >= 0.0 {
+                                    1.0 + delta.abs() * 0.01
+                                } else {
+                                    1.0 / (1.0 + delta.abs() * 0.01)
+                                };
+                                let current = this
+                                    .preview_views
+                                    .get(&pane_id)
+                                    .copied()
+                                    .unwrap_or_default()
+                                    .zoom;
+                                this.set_preview_zoom_about(
+                                    pane_id,
+                                    current * factor,
+                                    Some(event.position),
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            }
+                        },
+                    ))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, ev: &MouseDownEvent, _, cx| {

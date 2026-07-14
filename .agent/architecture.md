@@ -607,6 +607,13 @@ client_tty = backend セッションの pane_tty）ため、backend を先に見
   120ms debounce 後に background で全ページを再ラスタライズし、完了までは旧画像を表示する。
   `PreviewImageCache` も path だけでなく同じキーを比較し、古い PNG の `Arc<Image>` を誤再利用
   しない。実ピクセル幅はメモリ上限として 4096px にクランプする
+- **PDF・画像ズーム（#234）**: 倍率・パン・PDF ページは GPUI 非依存の
+  `tako-core::PreviewViewState` が検証・更新し、UI / dispatch / CLI / MCP は同じ操作へ載せる。
+  UI はペインの `ScrollHandle` を再利用して 2 軸スクロールし、ピンチ中心または表示中心が
+  拡大前後で動かないようパン量を補正する。PDF テキストレイヤは独自の倍率計算を持たず、
+  スクロール適用後のページ画像 `Bounds` へ PDFKit の文字矩形を写像するため、ズーム・パン後も
+  ヒットテストとハイライトが画像へ一致する。描画フレームでは既存 `Arc<Image>` の拡縮と
+  座標変換だけを行い、再ラスタライズは上記 background 経路に限定する
 - **syntect の行入力（#152）**: `SyntaxSet::load_defaults_newlines()` へ `str::lines()` の
   改行除去済み文字列を渡さない。`LinesWithEndings` で状態遷移に必要な改行を維持し、UI の行要素へ
   変換するときだけ末尾改行を除く。パス解決は読み取り / 編集で単一の `syntax_for_path` を使う

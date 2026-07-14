@@ -743,3 +743,7 @@
 ## 2026-07-14（#226: setup の claude / codex / agy 対応 + プラン別推奨）
 - 3 CLI の検出・認証・プラン取得と対話フォールバック、単一自動選択 / 複数選択、プラン規模別 profile 推奨を実装。changes revision 8 と docs を同期
 - 隔離 HOME / PATH で claude 単独・3 CLI から codex 選択を実測し、build / fmt / clippy / workspace test / docs build を全緑確認
+
+## 2026-07-14（#231 / #234: PDF 品質改善 + PDF・画像ズーム）
+- 行間ドラッグ全文選択を修正し、device scale × zoom × 表示幅の background 再ラスタライズを追加。Retina 全幅で 1224×1584 → 1920×2485、render p50 1ms を隔離実測
+- PDF・画像の 25〜400% ズーム / パン / ページ維持リセット / 倍率表示を実装し、dispatch・CLI `tako preview`・MCP `tako_preview_view`（75 ツール）へ 1:1 公開
