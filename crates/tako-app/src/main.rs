@@ -2674,6 +2674,7 @@ impl TakoApp {
                 to: None,
                 js: None,
                 token: None,
+                focus: Some(true),
             },
             PaneOrigin::User,
         );
@@ -5890,6 +5891,7 @@ impl TakoApp {
                 tab: None,
                 target: Some(pane_id.as_u64()),
                 direction: Some(zone_to_direction(zone)),
+                focus: Some(true),
             },
             PaneOrigin::User,
         );
@@ -5932,6 +5934,7 @@ impl TakoApp {
                         tab: Some(tab_id.as_u64()),
                         target: None,
                         direction: None,
+                        focus: Some(true),
                     },
                     PaneOrigin::User,
                 )
@@ -5943,6 +5946,7 @@ impl TakoApp {
                     tab: None,
                     target: None,
                     direction: None,
+                    focus: Some(true),
                 },
                 PaneOrigin::User,
             ),
@@ -6017,6 +6021,7 @@ impl TakoApp {
                     path: path.display().to_string(),
                     mode: None,
                     direction,
+                    focus: Some(true),
                 },
                 PaneOrigin::User,
             );
@@ -6040,6 +6045,7 @@ impl TakoApp {
                     path: path.display().to_string(),
                     mode: None,
                     direction: None,
+                    focus: Some(true),
                 },
                 PaneOrigin::User,
             );
@@ -6319,6 +6325,7 @@ impl TakoApp {
                             path: target.to_string(),
                             mode: None,
                             direction: Some(tako_control::protocol::Direction::Right),
+                            focus: Some(true),
                         },
                         PaneOrigin::User,
                     );
@@ -12340,6 +12347,7 @@ mod self_test {
                             path: pdf_path.display().to_string(),
                             mode: Some(tako_control::protocol::PreviewModeWire::Pdf),
                             direction: None,
+                            focus: None,
                         },
                         PaneOrigin::Cli,
                     )
@@ -12414,6 +12422,7 @@ mod self_test {
                                 path: dir.join(file_name).display().to_string(),
                                 mode: Some(tako_control::protocol::PreviewModeWire::Code),
                                 direction: None,
+                                focus: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -15146,6 +15155,7 @@ mod self_test {
                             path,
                             mode,
                             direction: None,
+                            focus: None,
                         },
                         PaneOrigin::Cli,
                     )
@@ -15424,6 +15434,7 @@ mod self_test {
                             path: preview_dir.join("hello.rs").display().to_string(),
                             mode: Some(tako_control::protocol::PreviewModeWire::Code),
                             direction: None,
+                            focus: None,
                         },
                         PaneOrigin::Cli,
                     )
@@ -15555,6 +15566,7 @@ mod self_test {
                             path: pdf_path.display().to_string(),
                             mode: Some(tako_control::protocol::PreviewModeWire::Pdf),
                             direction: None,
+                            focus: None,
                         },
                         PaneOrigin::Cli,
                     )
@@ -15657,6 +15669,7 @@ mod self_test {
                                 path: preview_dir.join(file_name).display().to_string(),
                                 mode: Some(tako_control::protocol::PreviewModeWire::Code),
                                 direction: None,
+                                focus: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -15715,6 +15728,7 @@ mod self_test {
                             path: preview_dir.join("note.md").display().to_string(),
                             mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
                             direction: None,
+                            focus: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -16253,6 +16267,7 @@ mod self_test {
                                 path: path.clone(),
                                 mode: None,
                                 direction,
+                                focus: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -16317,6 +16332,7 @@ mod self_test {
                             tab: None,
                             target: Some(p2),
                             direction: Some(tako_control::protocol::Direction::Down),
+                            focus: None,
                         },
                         PaneOrigin::Cli,
                     )
@@ -16382,6 +16398,7 @@ mod self_test {
                                 path,
                                 mode: None,
                                 direction: None,
+                                focus: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -16778,6 +16795,7 @@ mod self_test {
                                 path: pdf_path.display().to_string(),
                                 mode: None,
                                 direction: None,
+                                focus: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -16848,6 +16866,7 @@ mod self_test {
                         to: to.map(String::from),
                         js: js.map(String::from),
                         token,
+                        focus: None,
                     }
                 }
                 let base_panes = window
@@ -17168,6 +17187,7 @@ mod self_test {
                             app,
                             tako_control::protocol::Request::TabNew {
                                 title: Some("spawn-layout".into()),
+                                focus: None,
                             },
                             PaneOrigin::Cli,
                         )

@@ -246,7 +246,12 @@ pub enum Request {
         title: String,
     },
     /// タブ作成（FR-2.5.10）
-    TabNew { title: Option<String> },
+    TabNew {
+        title: Option<String>,
+        /// 新タブをアクティブにするか（省略時は false = 現在のタブを維持）
+        #[serde(default)]
+        focus: Option<bool>,
+    },
     /// タブ切替（FR-2.5.10）
     TabSelect { tab: u64 },
     /// ペインの移動（FR-2.5.10 / FR-1.10）。`tab` 指定 = 別タブの末尾へ移送（従来動作）、
@@ -258,6 +263,9 @@ pub enum Request {
         tab: Option<u64>,
         target: Option<u64>,
         direction: Option<Direction>,
+        /// 移動先タブをアクティブにするか（省略時は false = 現在のタブを維持）
+        #[serde(default)]
+        focus: Option<bool>,
     },
     /// タブ・ペイン名の AI 自動リネーム（FR-2.12.4）の ON/OFF。
     /// `enabled` 省略時は現在状態の取得のみ。設定は永続化される
@@ -314,6 +322,9 @@ pub enum Request {
         path: String,
         mode: Option<PreviewModeWire>,
         direction: Option<Direction>,
+        /// プレビューペインにフォーカスを移すか（省略時は false = 元ペインを維持）
+        #[serde(default)]
+        focus: Option<bool>,
     },
     /// コードプレビューの編集モードを切り替える（FR-3.5）。`enabled` 省略時は状態取得。
     PreviewEdit {
@@ -589,6 +600,9 @@ pub enum Request {
         js: Option<String>,
         #[serde(default)]
         token: Option<u64>,
+        /// open/show で新ペインにフォーカスを移すか（省略時は false = 元ペインを維持）
+        #[serde(default)]
+        focus: Option<bool>,
     },
     /// アプリ内更新の診断・実行（Issue #36 + #50）。
     /// `action` 省略 or `"status"` → 配布系統・現在バージョン・重複 CLI の診断情報。

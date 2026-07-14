@@ -935,6 +935,7 @@ impl TakoApp {
                 path: path.display().to_string(),
                 mode: None,
                 direction: None,
+                focus: Some(true),
             },
             PaneOrigin::User,
         );

@@ -218,6 +218,9 @@ enum WebCommand {
         /// 上に分割
         #[arg(long)]
         up: bool,
+        /// 新ペインにフォーカスを移す（省略時は元ペインを維持）
+        #[arg(long)]
+        focus: bool,
     },
     /// Web ビューの一覧（表示中 + dock 退避中。id・URL・タイトル・ペイン）
     List,
@@ -240,6 +243,9 @@ enum WebCommand {
         /// 上に分割
         #[arg(long)]
         up: bool,
+        /// 呼び出したペインにフォーカスを移す（省略時は元ペインを維持）
+        #[arg(long)]
+        focus: bool,
     },
     /// Web ビューをペインから外して dock へ退避する（ページは生きたまま）
     Hide {
@@ -1172,6 +1178,9 @@ struct OpenArgs {
     /// 同・左に分割して開く
     #[arg(long, conflicts_with_all = ["right", "down", "up"])]
     left: bool,
+    /// プレビューペインにフォーカスを移す（省略時は元ペインを維持）
+    #[arg(long)]
+    focus: bool,
 }
 
 #[derive(Args)]
@@ -1294,6 +1303,9 @@ enum TabCommand {
         /// タブのタイトル（省略時は連番）
         #[arg(long)]
         title: Option<String>,
+        /// 新タブをアクティブにする（省略時は現在のタブを維持）
+        #[arg(long)]
+        focus: bool,
     },
     /// タブの表示タイトルを変える（明示リネーム = 自動リネームより優先。空文字で解除）
     Rename {
@@ -1332,6 +1344,9 @@ enum TabCommand {
         /// --target の左に入る
         #[arg(long, conflicts_with_all = ["right", "down", "up"])]
         left: bool,
+        /// 移動先のタブをアクティブにする（省略時は現在のタブを維持）
+        #[arg(long)]
+        focus: bool,
     },
 }
 
@@ -1632,9 +1647,10 @@ fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
         None => "master".into(),
     };
 
-    // 新タブを作成
+    // 新タブを作成（master/solo の起動はユーザーの明示操作なのでフォーカスする）
     let tab_result = send_request(Request::TabNew {
         title: Some(tab_title.clone()),
+        focus: Some(true),
     })?;
     let pane_id = tab_result["pane"]
         .as_u64()
@@ -1763,9 +1779,10 @@ fn orchestrator_solo(arg: Option<&str>) -> Result<(), String> {
         None => "solo".into(),
     };
 
-    // 新タブを作成
+    // 新タブを作成（solo の起動はユーザーの明示操作なのでフォーカスする）
     let tab_result = send_request(Request::TabNew {
         title: Some(tab_title.clone()),
+        focus: Some(true),
     })?;
     let pane_id = tab_result["pane"]
         .as_u64()
@@ -2032,6 +2049,7 @@ fn remote_start(port: u16, insecure: bool) -> Result<(), String> {
                     path: path.display().to_string(),
                     mode: Some(tako_control::protocol::PreviewModeWire::Image),
                     direction: None,
+                    focus: Some(true),
                 });
                 eprintln!("スマホでスキャンしてください。");
             }
@@ -2598,6 +2616,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     (_, _, _, true) => Some(Direction::Left),
                     _ => None,
                 },
+                focus: if args.focus { Some(true) } else { None },
             }
         }
         Command::Edit(command) => match command {
@@ -2651,8 +2670,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 enabled: *enabled,
             },
         },
-        Command::Tab(TabCommand::New { title }) => Request::TabNew {
+        Command::Tab(TabCommand::New { title, focus }) => Request::TabNew {
             title: title.clone(),
+            focus: if *focus { Some(true) } else { None },
         },
         Command::Tab(TabCommand::Rename { tab, title }) => Request::TabRename {
             // --tab 指定があればそれを、無ければ呼び出し元ペインからタブを解決する
@@ -2674,6 +2694,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             down,
             up,
             left,
+            focus,
         }) => {
             // 方向フラグは --target 指定時のみ有効（黙って無視せず明示エラーにする）
             if (*right || *down || *up || *left) && target.is_none() {
@@ -2692,6 +2713,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     (_, _, true) => Direction::Left,
                     _ => Direction::Right,
                 }),
+                focus: if *focus { Some(true) } else { None },
             }
         }
         Command::Autorename(args) => Request::AutoRename {
@@ -3017,6 +3039,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 to: Option<String>,
                 js: Option<String>,
                 token: Option<u64>,
+                focus: Option<bool>,
             ) -> Request {
                 Request::Web {
                     action: action.to_string(),
@@ -3027,6 +3050,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     to,
                     js,
                     token,
+                    focus,
                 }
             }
             match sub {
@@ -3037,14 +3061,26 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     down,
                     left,
                     up,
+                    focus,
                 } => {
                     // 基準ペインは任意: tako 外（別インスタンス操作・スクリプト）からは
                     // 省略のまま送り、アプリ側がフォーカスペインへ解決する（OpenFile と同じ）
                     let pane = pane.or_else(caller_pane);
                     let d = dir(*right, *down, *left, *up);
-                    web("open", Some(url.clone()), None, pane, d, None, None, None)
+                    let f = if *focus { Some(true) } else { None };
+                    web(
+                        "open",
+                        Some(url.clone()),
+                        None,
+                        pane,
+                        d,
+                        None,
+                        None,
+                        None,
+                        f,
+                    )
                 }
-                WebCommand::List => web("list", None, None, None, None, None, None, None),
+                WebCommand::List => web("list", None, None, None, None, None, None, None, None),
                 WebCommand::Show {
                     id,
                     pane,
@@ -3052,16 +3088,18 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     down,
                     left,
                     up,
+                    focus,
                 } => {
                     let pane = pane.or_else(caller_pane);
                     let d = dir(*right, *down, *left, *up);
-                    web("show", None, Some(*id), pane, d, None, None, None)
+                    let f = if *focus { Some(true) } else { None };
+                    web("show", None, Some(*id), pane, d, None, None, None, f)
                 }
                 WebCommand::Hide { id, pane } => {
-                    web("hide", None, *id, *pane, None, None, None, None)
+                    web("hide", None, *id, *pane, None, None, None, None, None)
                 }
                 WebCommand::Close { id, pane } => {
-                    web("close", None, *id, *pane, None, None, None, None)
+                    web("close", None, *id, *pane, None, None, None, None, None)
                 }
                 WebCommand::Nav { to, id, pane } => web(
                     "navigate",
@@ -3072,10 +3110,19 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     Some(to.clone()),
                     None,
                     None,
+                    None,
                 ),
-                WebCommand::Eval { js, id, pane } => {
-                    web("eval", None, *id, *pane, None, None, Some(js.clone()), None)
-                }
+                WebCommand::Eval { js, id, pane } => web(
+                    "eval",
+                    None,
+                    *id,
+                    *pane,
+                    None,
+                    None,
+                    Some(js.clone()),
+                    None,
+                    None,
+                ),
                 WebCommand::EvalResult { token, id, pane } => web(
                     "eval_result",
                     None,
@@ -3085,9 +3132,10 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     None,
                     None,
                     Some(*token),
+                    None,
                 ),
                 WebCommand::Read { id, pane } => {
-                    web("read", None, *id, *pane, None, None, None, None)
+                    web("read", None, *id, *pane, None, None, None, None, None)
                 }
             }
         }
@@ -3688,6 +3736,7 @@ mod tests {
                 tab: Some(4),
                 target: None,
                 direction: None,
+                focus: None,
             }
         );
         let command = parse(&["tako", "tab", "select", "2"]);
@@ -3717,6 +3766,7 @@ mod tests {
                 tab: None,
                 target: Some(7),
                 direction: Some(Direction::Down),
+                focus: None,
             }
         );
         // 方向省略は右
@@ -3728,6 +3778,7 @@ mod tests {
                 tab: None,
                 target: Some(7),
                 direction: Some(Direction::Right),
+                focus: None,
             }
         );
         // tab と --target の併用は clap が拒否、--target なしの方向指定は build_request が拒否
@@ -3743,6 +3794,7 @@ mod tests {
                 tab: None,
                 target: None,
                 direction: None,
+                focus: None,
             }
         );
         // --new は tab / --target と排他
@@ -3775,6 +3827,7 @@ mod tests {
                 path: "/tmp/a.md".into(),
                 mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
                 direction: None,
+                focus: None,
             }
         );
         // 相対パスは CLI の cwd で絶対化される
