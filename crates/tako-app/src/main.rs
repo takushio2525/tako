@@ -2856,6 +2856,13 @@ impl TakoApp {
             .map(|s| s.to_string())
             .or_else(|| p.role().map(|s| s.to_string()))
             .or_else(|| {
+                // プレビューペインならファイル名をラベルにする（#230）
+                self.previews
+                    .get(&p.id())
+                    .and_then(|s| s.path.file_name())
+                    .map(|n| n.to_string_lossy().to_string())
+            })
+            .or_else(|| {
                 // cwd のベース名（例: ~/projects/tako → 「tako」）で意味づけする
                 self.terminals
                     .get(&p.id())
@@ -2868,6 +2875,9 @@ impl TakoApp {
 
     /// バックグラウンドペインのコマンド状態（ターミナル不在なら Unknown）
     fn background_state(&self, pane_id: PaneId) -> CommandState {
+        if self.previews.contains_key(&pane_id) {
+            return CommandState::Idle;
+        }
         self.terminals
             .get(&pane_id)
             .map(|s| s.command_state())
@@ -3950,6 +3960,7 @@ impl TakoApp {
             }
             Err(e) => eprintln!("warning: バックグラウンドへバックグラウンドできない: {e}"),
         }
+        self.sync_preview_watches();
         cx.notify();
     }
 
@@ -3971,7 +3982,22 @@ impl TakoApp {
             }
             Err(e) => eprintln!("warning: タブをバックグラウンドへバックグラウンドできない: {e}"),
         }
+        self.sync_preview_watches();
         cx.notify();
+    }
+
+    /// BG 復帰時のプレビュー監視再開 + リロードトリガー（#230）。
+    /// dispatch 経由（Foreground）は ControlHost::reattach_backgrounded で、
+    /// ドロワー / D&D はこちらを直接呼ぶ
+    pub(crate) fn reattach_backgrounded_preview(&mut self, pane: PaneId) {
+        if let Some(state) = self.previews.get(&pane) {
+            let path = state.path.clone();
+            let mode = state.mode;
+            self.sync_preview_watches();
+            if preview::live_reload_supported(mode) {
+                self.pending_preview_loads.push((pane, path, mode));
+            }
+        }
     }
 
     /// ペインを閉じたときのバックエンドセッション破棄（Phase 5.5）。
@@ -9973,6 +9999,11 @@ impl SessionHost for TakoApp {
         self.terminals.remove(&pane);
         self.previews.remove(&pane);
         self.preview_edits.remove(&pane);
+        self.preview_image_cache.remove(&pane);
+        self.preview_views.remove(&pane);
+        self.preview_scroll_handles.remove(&pane);
+        self.video_players.remove(&pane);
+        self.video_frame_cache.remove(&pane);
         self.sync_preview_watches();
         self.dock_webview_of(pane);
         self.scroll_accum.remove(&pane);
@@ -9981,8 +10012,17 @@ impl SessionHost for TakoApp {
         self.drop_backend_session(pane);
     }
 
-    fn reattach_backgrounded(&mut self, _pane: PaneId) {
-        // セッションは terminals HashMap に残っている。再描画のみ必要
+    fn reattach_backgrounded(&mut self, pane: PaneId) {
+        // ターミナル: セッションは terminals HashMap に残っている。再描画のみ必要。
+        // プレビュー: 退避中に停止していたファイル監視を再開し、退避中の変更を反映する（#230）
+        if let Some(state) = self.previews.get(&pane) {
+            let path = state.path.clone();
+            let mode = state.mode;
+            self.sync_preview_watches();
+            if preview::live_reload_supported(mode) {
+                self.pending_preview_loads.push((pane, path, mode));
+            }
+        }
     }
 }
 
@@ -13938,7 +13978,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 84, "MCP tools/list は 84 ツール");
+            check(status == 200 && tool_count == 87, "MCP tools/list は 87 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
