@@ -1785,6 +1785,63 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "tako_task_checkpoint",
+            "description": "タスクチェックポイントの記録・更新（Issue #242）。\
+                worker タスクの進行状態（Issue 番号・ブランチ・フェーズ・直近コミット等）を \
+                永続化し、クラッシュ・利用上限・API 切断からの resume を可能にする。\
+                task_id を省略すると自動採番される。既存の task_id を指定すると上書き更新する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "タスク ID（省略時は自動採番 task-N）" },
+                    "pane": { "type": "integer", "description": "ペイン ID" },
+                    "issue": { "type": "integer", "description": "GitHub Issue 番号" },
+                    "branch": { "type": "string", "description": "作業ブランチ名" },
+                    "phase": { "type": "string", "enum": ["queued", "running", "verifying", "done", "failed", "suspended"], "description": "フェーズ（省略時 running）" },
+                    "last_commit": { "type": "string", "description": "直近の git commit SHA" },
+                    "agent": { "type": "string", "description": "エージェント種別（claude / codex / agy）" },
+                    "model": { "type": "string", "description": "モデル名" },
+                    "prompt_head": { "type": "string", "description": "コンテキスト復元用のプロンプト冒頭" },
+                    "suspended_reason": { "type": "string", "description": "一時停止の理由（usage_limit / api_error / crash 等）" },
+                    "project": { "type": "string", "description": "プロジェクト名（projects.yaml のキー）" },
+                    "cwd": { "type": "string", "description": "作業ディレクトリ" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_task_list",
+            "description": "タスクチェックポイントの一覧（Issue #242）。\
+                永続化された全チェックポイントを updated_at の新しい順に返す。\
+                phase で絞り込み可能（例: suspended で中断中のタスクだけ表示）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "phase": { "type": "string", "enum": ["queued", "running", "verifying", "done", "failed", "suspended"], "description": "フェーズで絞り込む（省略時は全件）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_task_resume",
+            "description": "チェックポイントから worker を再開する（Issue #242）。\
+                指定した task_id のチェックポイントを読み、元の branch / cwd / issue コンテキストを \
+                resume プロンプトに含めて新しいペインに worker を spawn する。\
+                モデルを変更して再開することも可能（usage_limit 後に別モデルへ切り替え等）。\
+                再開後、チェックポイントの phase は running に遷移し、pane_id が新ペインに更新される。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "再開するチェックポイントの task_id" },
+                    "model": { "type": "string", "description": "モデルを変更して再開する（省略時はチェックポイントのモデル）" },
+                    "pane": { "type": "integer", "description": "分割元ペイン ID（省略時は呼び出し元）" },
+                    "tab": { "type": "integer", "description": "分割先タブ ID" },
+                },
+                "required": ["task_id"],
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -2496,6 +2553,67 @@ fn build_request(
                 .ok_or("action を指定する")?
                 .to_string(),
         },
+        "tako_task_checkpoint" => Request::TaskCheckpoint {
+            action: "checkpoint".into(),
+            task_id: str_arg(args, "task_id")?,
+            pane: u64_arg(args, "pane")?.or(caller),
+            issue: u64_arg(args, "issue")?.map(|v| v as u32),
+            branch: str_arg(args, "branch")?,
+            phase: str_arg(args, "phase")?,
+            last_commit: str_arg(args, "last_commit")?,
+            agent: str_arg(args, "agent")?,
+            model: str_arg(args, "model")?,
+            prompt_head: str_arg(args, "prompt_head")?,
+            suspended_reason: str_arg(args, "suspended_reason")?,
+            project: str_arg(args, "project")?,
+            cwd: str_arg(args, "cwd")?,
+            resume_pane: None,
+            tab: None,
+            resume_model: None,
+            caller_role: caller_role.map(String::from),
+        },
+        "tako_task_list" => Request::TaskCheckpoint {
+            action: "list".into(),
+            task_id: None,
+            pane: None,
+            issue: None,
+            branch: None,
+            phase: str_arg(args, "phase")?,
+            last_commit: None,
+            agent: None,
+            model: None,
+            prompt_head: None,
+            suspended_reason: None,
+            project: None,
+            cwd: None,
+            resume_pane: None,
+            tab: None,
+            resume_model: None,
+            caller_role: None,
+        },
+        "tako_task_resume" => Request::TaskCheckpoint {
+            action: "resume".into(),
+            task_id: str_arg(args, "task_id")?,
+            pane: None,
+            issue: None,
+            branch: None,
+            phase: None,
+            last_commit: None,
+            agent: None,
+            model: None,
+            prompt_head: None,
+            suspended_reason: None,
+            project: None,
+            cwd: None,
+            resume_pane: if u64_arg(args, "tab")?.is_some() {
+                None
+            } else {
+                u64_arg(args, "pane")?.or(caller)
+            },
+            tab: u64_arg(args, "tab")?,
+            resume_model: str_arg(args, "model")?,
+            caller_role: caller_role.map(String::from),
+        },
         _ => return Err(format!("不明なツール: {name}")),
     })
 }
@@ -3064,7 +3182,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 80);
+        assert_eq!(tools.len(), 83);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

@@ -34,6 +34,7 @@ pub mod sessions;
 pub mod settings;
 pub mod setup;
 pub mod sleep_guard;
+pub mod task_checkpoints;
 pub mod transcript;
 
 pub use dispatch::{

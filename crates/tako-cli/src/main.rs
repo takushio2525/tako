@@ -197,6 +197,10 @@ enum Command {
     Recent(RecentCommand),
     /// SSH config の Host 一覧を表示する（#20）
     SshHosts,
+    /// タスクチェックポイントの操作（Issue #242）。
+    /// worker タスクの進行状態を永続化し、クラッシュや利用上限からの resume を可能にする
+    #[command(subcommand)]
+    Task(TaskCommand),
 }
 
 #[derive(Args)]
@@ -495,6 +499,80 @@ enum LogsCommand {
         /// ログ全体の上限（MB）
         #[arg(long = "total-max-mb")]
         total_max_mb: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaskCommand {
+    /// チェックポイントを記録・更新する
+    Checkpoint {
+        /// task_id（省略時は自動採番）
+        #[arg(long)]
+        task_id: Option<String>,
+        /// 対象ペイン ID
+        #[arg(long)]
+        pane: Option<u64>,
+        /// GitHub Issue 番号
+        #[arg(long)]
+        issue: Option<u32>,
+        /// 作業ブランチ名
+        #[arg(long)]
+        branch: Option<String>,
+        /// フェーズ: queued / running / verifying / done / failed / suspended
+        #[arg(long)]
+        phase: Option<String>,
+        /// 直近の git commit SHA
+        #[arg(long)]
+        last_commit: Option<String>,
+        /// エージェント種別: claude / codex / agy
+        #[arg(long)]
+        agent: Option<String>,
+        /// モデル名
+        #[arg(long)]
+        model: Option<String>,
+        /// コンテキスト復元用のプロンプト冒頭
+        #[arg(long)]
+        prompt_head: Option<String>,
+        /// プロジェクト名（projects.yaml のキー）
+        #[arg(long)]
+        project: Option<String>,
+        /// 作業ディレクトリ
+        #[arg(long)]
+        cwd: Option<String>,
+    },
+    /// チェックポイント一覧
+    List {
+        /// フェーズで絞り込む
+        #[arg(long)]
+        phase: Option<String>,
+        /// JSON で出力する
+        #[arg(long)]
+        json: bool,
+    },
+    /// チェックポイントから worker を再開する
+    Resume {
+        /// 再開するチェックポイントの task_id
+        task_id: String,
+        /// モデルを変更して再開する
+        #[arg(long)]
+        model: Option<String>,
+        /// 分割元ペイン ID
+        #[arg(long)]
+        pane: Option<u64>,
+        /// 分割先タブ ID
+        #[arg(long)]
+        tab: Option<u64>,
+    },
+    /// チェックポイントのフェーズを手動で変更する
+    Update {
+        /// 対象の task_id
+        task_id: String,
+        /// 新しいフェーズ
+        #[arg(long)]
+        phase: String,
+        /// 理由（suspended_reason に記録）
+        #[arg(long)]
+        reason: Option<String>,
     },
 }
 
@@ -3425,6 +3503,109 @@ fn build_request(command: &Command) -> Result<Request, String> {
             },
         },
         Command::SshHosts => Request::SshHosts,
+        Command::Task(sub) => match sub {
+            TaskCommand::Checkpoint {
+                task_id,
+                pane,
+                issue,
+                branch,
+                phase,
+                last_commit,
+                agent,
+                model,
+                prompt_head,
+                project,
+                cwd,
+            } => Request::TaskCheckpoint {
+                action: "checkpoint".into(),
+                task_id: task_id.clone(),
+                pane: pane.or_else(caller_pane),
+                issue: *issue,
+                branch: branch.clone(),
+                phase: phase.clone(),
+                last_commit: last_commit.clone(),
+                agent: agent.clone(),
+                model: model.clone(),
+                prompt_head: prompt_head.clone(),
+                suspended_reason: None,
+                project: project.clone(),
+                cwd: cwd.clone(),
+                resume_pane: None,
+                tab: None,
+                resume_model: None,
+                caller_role: std::env::var("TAKO_ORCHESTRATOR_ROLE").ok(),
+            },
+            TaskCommand::List { phase, .. } => Request::TaskCheckpoint {
+                action: "list".into(),
+                task_id: None,
+                pane: None,
+                issue: None,
+                branch: None,
+                phase: phase.clone(),
+                last_commit: None,
+                agent: None,
+                model: None,
+                prompt_head: None,
+                suspended_reason: None,
+                project: None,
+                cwd: None,
+                resume_pane: None,
+                tab: None,
+                resume_model: None,
+                caller_role: None,
+            },
+            TaskCommand::Resume {
+                task_id,
+                model,
+                pane,
+                tab,
+            } => Request::TaskCheckpoint {
+                action: "resume".into(),
+                task_id: Some(task_id.clone()),
+                pane: None,
+                issue: None,
+                branch: None,
+                phase: None,
+                last_commit: None,
+                agent: None,
+                model: None,
+                prompt_head: None,
+                suspended_reason: None,
+                project: None,
+                cwd: None,
+                resume_pane: if tab.is_some() {
+                    None
+                } else {
+                    pane.or_else(caller_pane)
+                },
+                tab: *tab,
+                resume_model: model.clone(),
+                caller_role: std::env::var("TAKO_ORCHESTRATOR_ROLE").ok(),
+            },
+            TaskCommand::Update {
+                task_id,
+                phase,
+                reason,
+            } => Request::TaskCheckpoint {
+                action: "update".into(),
+                task_id: Some(task_id.clone()),
+                pane: None,
+                issue: None,
+                branch: None,
+                phase: Some(phase.clone()),
+                last_commit: None,
+                agent: None,
+                model: None,
+                prompt_head: None,
+                suspended_reason: reason.clone(),
+                project: None,
+                cwd: None,
+                resume_pane: None,
+                tab: None,
+                resume_model: None,
+                caller_role: None,
+            },
+        },
     })
 }
 
@@ -3578,6 +3759,46 @@ fn print_sessions_list(result: &Value) {
     eprintln!("(resume: tako sessions resume <id> / 詳細: tako sessions show <id>)");
 }
 
+fn print_task_list(result: &Value) {
+    let checkpoints = result["checkpoints"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if checkpoints.is_empty() {
+        println!("チェックポイントが無い");
+        return;
+    }
+    for cp in &checkpoints {
+        let issue = cp["issue"]
+            .as_u64()
+            .map(|n| format!(" #{n}"))
+            .unwrap_or_default();
+        let branch = cp["branch"]
+            .as_str()
+            .map(|b| format!("  branch:{b}"))
+            .unwrap_or_default();
+        let reason = cp["suspended_reason"]
+            .as_str()
+            .map(|r| format!("  ({r})"))
+            .unwrap_or_default();
+        println!(
+            "{:<12}  {:10}  pane:{}{}{}{}",
+            cp["task_id"].as_str().unwrap_or("-"),
+            cp["phase"].as_str().unwrap_or("-"),
+            cp["pane_id"]
+                .as_u64()
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".into()),
+            issue,
+            branch,
+            reason,
+        );
+    }
+    eprintln!(
+        "(resume: tako task resume <task_id> / update: tako task update <task_id> --phase ...)"
+    );
+}
+
 fn print_result(command: &Command, result: &Value) {
     match command {
         // 新ペイン ID をそのままスクリプトで使えるよう数値のみ出力する
@@ -3680,6 +3901,14 @@ fn print_result(command: &Command, result: &Value) {
         Command::OpenIn(_) => println!("{}", pretty_json(result)),
         Command::Recent(_) => println!("{}", pretty_json(result)),
         Command::SshHosts => println!("{}", pretty_json(result)),
+        Command::Task(TaskCommand::List { json, .. }) => {
+            if *json {
+                println!("{}", pretty_json(result));
+            } else {
+                print_task_list(result);
+            }
+        }
+        Command::Task(_) => println!("{}", pretty_json(result)),
         // remote は run() → print_result を通らない
         _ => {}
     }
