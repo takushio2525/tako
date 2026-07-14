@@ -738,6 +738,26 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         total_max_mb: Option<u64>,
     },
+    /// ディレクトリを指定して新タブ・ペインを開く（#20）。
+    /// ファイルツリーにも自動追加する
+    OpenDir {
+        path: String,
+        /// 新タブにフォーカスを移すか（省略時は true = ユーザー操作の既定）
+        #[serde(default)]
+        focus: Option<bool>,
+    },
+    /// SSH ホストに接続するペインを開く（#20）。
+    /// `host` は ~/.ssh/config の Host 名。新タブで `ssh <host>` を実行する
+    OpenRemote {
+        host: String,
+        #[serde(default)]
+        focus: Option<bool>,
+    },
+    /// SSH config の Host 一覧を返す（#20）
+    SshHosts,
+    /// 最近開いた項目の一覧・クリア（#20）。
+    /// `action`: "list" / "clear"
+    RecentItems { action: String },
 }
 
 impl Request {

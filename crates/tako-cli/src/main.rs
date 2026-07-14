@@ -185,6 +185,15 @@ enum Command {
     /// タブ・ペインが大量消失したときは tako を終了してから
     /// `tako recover --apply <世代>` で直前の構成へ戻し、tako を再起動する
     Recover(RecoverArgs),
+    /// ディレクトリ/リポジトリ/SSH ホストを開く（#20）。
+    /// 新タブを作成してファイルツリーに追加し、フォーカスを移す
+    #[command(subcommand, name = "open-in")]
+    OpenIn(OpenInCommand),
+    /// 最近開いた項目の一覧・クリア（#20）
+    #[command(subcommand)]
+    Recent(RecentCommand),
+    /// SSH config の Host 一覧を表示する（#20）
+    SshHosts,
 }
 
 #[derive(Args)]
@@ -197,6 +206,42 @@ struct RecoverArgs {
     /// ディレクトリで動く無関係な tako も検出するため、その場合の明示上書き用）
     #[arg(long)]
     force: bool,
+}
+
+#[derive(Subcommand)]
+enum OpenInCommand {
+    /// ディレクトリを新タブで開く（cwd として起動 + ファイルツリーに追加）
+    Dir {
+        /// 開くディレクトリの絶対パス
+        path: String,
+        /// フォーカスを新タブに移さない
+        #[arg(long)]
+        no_focus: bool,
+    },
+    /// git リポジトリを新タブで開く（git root を自動検出）
+    Repo {
+        /// リポジトリ内の任意のパス（git root を自動検出する）
+        path: String,
+        /// フォーカスを新タブに移さない
+        #[arg(long)]
+        no_focus: bool,
+    },
+    /// SSH ホストに接続する新タブを開く
+    Remote {
+        /// ~/.ssh/config の Host 名（未定義でも ssh コマンドとして実行）
+        host: String,
+        /// フォーカスを新タブに移さない
+        #[arg(long)]
+        no_focus: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecentCommand {
+    /// 最近開いたディレクトリ/リポジトリ/SSH ホストの一覧
+    List,
+    /// 履歴をクリアする
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -3346,6 +3391,34 @@ fn build_request(command: &Command) -> Result<Request, String> {
         },
         Command::Agents(_) => unreachable!("agents は run() を通らない"),
         Command::Recover(_) => unreachable!("recover は run() を通らない（ローカル処理）"),
+        Command::OpenIn(sub) => match sub {
+            OpenInCommand::Dir { path, no_focus } => Request::OpenDir {
+                path: resolve_cli_path(path),
+                focus: Some(!no_focus),
+            },
+            OpenInCommand::Repo { path, no_focus } => {
+                let resolved = resolve_cli_path(path);
+                let dir = std::path::PathBuf::from(&resolved);
+                let git_root = find_git_root_cli(&dir).unwrap_or(resolved);
+                Request::OpenDir {
+                    path: git_root,
+                    focus: Some(!no_focus),
+                }
+            }
+            OpenInCommand::Remote { host, no_focus } => Request::OpenRemote {
+                host: host.clone(),
+                focus: Some(!no_focus),
+            },
+        },
+        Command::Recent(sub) => match sub {
+            RecentCommand::List => Request::RecentItems {
+                action: "list".into(),
+            },
+            RecentCommand::Clear => Request::RecentItems {
+                action: "clear".into(),
+            },
+        },
+        Command::SshHosts => Request::SshHosts,
     })
 }
 
@@ -3367,6 +3440,27 @@ fn resolve_cli_path(path: &str) -> String {
             .unwrap_or_else(|_| path.to_string())
     } else {
         path.to_string()
+    }
+}
+
+fn find_git_root_cli(dir: &std::path::Path) -> Option<String> {
+    let d = if dir.is_dir() { dir } else { dir.parent()? };
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(d)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(output.stdout).ok()?;
+    let trimmed = root.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -3576,6 +3670,9 @@ fn print_result(command: &Command, result: &Value) {
             }
         }
         Command::Logs(_) => println!("{}", pretty_json(result)),
+        Command::OpenIn(_) => println!("{}", pretty_json(result)),
+        Command::Recent(_) => println!("{}", pretty_json(result)),
+        Command::SshHosts => println!("{}", pretty_json(result)),
         // remote は run() → print_result を通らない
         _ => {}
     }

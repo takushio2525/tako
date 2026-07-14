@@ -4596,13 +4596,76 @@ impl TakoApp {
 
     /// ⌘K コマンドパレットを開く（#217 カンプ。ペイン・コマンド検索）
     pub(crate) fn open_command_palette(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.command_palette = Some(CommandPalette::default());
+        self.command_palette = Some(CommandPalette {
+            query: String::new(),
+            selected: 0,
+            mode: PaletteMode::Normal,
+        });
+        cx.notify();
+    }
+
+    fn open_ssh_palette(&mut self, cx: &mut Context<Self>) {
+        let hosts = match tako_core::ssh_config::default_ssh_config_path() {
+            Some(p) => tako_core::ssh_config::parse_ssh_config(&p),
+            None => Vec::new(),
+        };
+        self.command_palette = Some(CommandPalette {
+            query: String::new(),
+            selected: 0,
+            mode: PaletteMode::SshHost(hosts),
+        });
+        cx.notify();
+    }
+
+    fn open_recent_palette(&mut self, cx: &mut Context<Self>) {
+        let recent = tako_core::recent::RecentList::load();
+        self.command_palette = Some(CommandPalette {
+            query: String::new(),
+            selected: 0,
+            mode: PaletteMode::RecentItems(recent.entries),
+        });
         cx.notify();
     }
 
     /// コマンドパレットの候補（#217。query の部分一致で絞り込み済み）
     fn palette_items(&self, query: &str) -> Vec<PaletteItem> {
         let q = query.to_lowercase();
+
+        // SSH ホスト選択モード
+        if let Some(ref palette) = self.command_palette {
+            match &palette.mode {
+                PaletteMode::SshHost(hosts) => {
+                    let items: Vec<PaletteItem> = hosts
+                        .iter()
+                        .map(|h| PaletteItem::SshHost(h.clone()))
+                        .collect();
+                    return if q.is_empty() {
+                        items
+                    } else {
+                        items
+                            .into_iter()
+                            .filter(|item| item.label().to_lowercase().contains(&q))
+                            .collect()
+                    };
+                }
+                PaletteMode::RecentItems(entries) => {
+                    let items: Vec<PaletteItem> = entries
+                        .iter()
+                        .map(|e| PaletteItem::Recent(e.clone()))
+                        .collect();
+                    return if q.is_empty() {
+                        items
+                    } else {
+                        items
+                            .into_iter()
+                            .filter(|item| item.label().to_lowercase().contains(&q))
+                            .collect()
+                    };
+                }
+                PaletteMode::Normal => {}
+            }
+        }
+
         let mut items: Vec<PaletteItem> = Vec::new();
         // ペイン（全タブ）
         for tab in self.workspace.tabs() {
@@ -4729,6 +4792,84 @@ impl TakoApp {
                 "split-down" => self.split(SplitDirection::Down, cx),
                 _ => {}
             },
+            PaletteItem::SshHost(host) => {
+                self.open_ssh_host(host, cx);
+            }
+            PaletteItem::Recent(entry) => {
+                self.open_recent_entry(entry, cx);
+            }
+        }
+    }
+
+    fn open_ssh_host(&mut self, host: tako_core::ssh_config::SshHost, cx: &mut Context<Self>) {
+        let cmd = host.ssh_command();
+        let tab_title = format!("ssh:{}", host.name);
+        let pane = tako_core::Pane::new(tako_core::PaneOrigin::User);
+        let pane_id = pane.id();
+        let tab_id = self.workspace.create_tab(tab_title.clone(), pane);
+        if let Some(tab) = self.workspace.get_tab_mut(tab_id) {
+            tab.set_title_manual(tab_title);
+        }
+        self.attach_session(
+            pane_id,
+            tako_core::SpawnOptions {
+                command: Some(tako_core::SpawnCommand {
+                    program: cmd[0].clone(),
+                    args: cmd[1..].to_vec(),
+                }),
+                ..Default::default()
+            },
+        );
+        self.scroll_active_tab_into_view();
+
+        let mut recent = tako_core::recent::RecentList::load();
+        recent.push(tako_core::recent::RecentEntry::Ssh { host: host.name });
+        recent.save();
+
+        cx.notify();
+    }
+
+    fn open_recent_entry(&mut self, entry: tako_core::recent::RecentEntry, cx: &mut Context<Self>) {
+        match entry {
+            tako_core::recent::RecentEntry::Directory { ref path } => {
+                let dir = std::path::PathBuf::from(path);
+                if dir.is_dir() {
+                    self.open_dir_in_new_tab(
+                        dir,
+                        tako_core::recent::RecentEntry::Directory {
+                            path: String::new(),
+                        },
+                        cx,
+                    );
+                }
+            }
+            tako_core::recent::RecentEntry::Repository { ref path } => {
+                let dir = std::path::PathBuf::from(path);
+                if dir.is_dir() {
+                    self.open_dir_in_new_tab(
+                        dir,
+                        tako_core::recent::RecentEntry::Repository {
+                            path: String::new(),
+                        },
+                        cx,
+                    );
+                }
+            }
+            tako_core::recent::RecentEntry::Ssh { ref host } => {
+                let hosts = match tako_core::ssh_config::default_ssh_config_path() {
+                    Some(p) => tako_core::ssh_config::parse_ssh_config(&p),
+                    None => Vec::new(),
+                };
+                let ssh_host = hosts.into_iter().find(|h| h.name == *host).unwrap_or(
+                    tako_core::ssh_config::SshHost {
+                        name: host.clone(),
+                        hostname: None,
+                        user: None,
+                        port: None,
+                    },
+                );
+                self.open_ssh_host(ssh_host, cx);
+            }
         }
     }
 
@@ -4792,7 +4933,13 @@ impl TakoApp {
             if let Ok(Ok(Some(paths))) = rx.await {
                 if let Some(dir) = paths.into_iter().next() {
                     let _ = this.update(cx, |app: &mut TakoApp, cx| {
-                        app.change_directory(dir, cx);
+                        app.open_dir_in_new_tab(
+                            dir,
+                            tako_core::recent::RecentEntry::Directory {
+                                path: String::new(),
+                            },
+                            cx,
+                        );
                     });
                 }
             }
@@ -4812,7 +4959,13 @@ impl TakoApp {
                 if let Some(dir) = paths.into_iter().next() {
                     let git_root = find_git_root(&dir).unwrap_or(dir);
                     let _ = this.update(cx, |app: &mut TakoApp, cx| {
-                        app.change_directory(git_root, cx);
+                        app.open_dir_in_new_tab(
+                            git_root,
+                            tako_core::recent::RecentEntry::Repository {
+                                path: String::new(),
+                            },
+                            cx,
+                        );
                     });
                 }
             }
@@ -4820,13 +4973,48 @@ impl TakoApp {
         .detach();
     }
 
-    fn change_directory(&mut self, dir: std::path::PathBuf, cx: &mut Context<Self>) {
-        let pane_id = self.focused_pane();
-        if let Some(session) = self.terminals.get(&pane_id) {
-            let cd_cmd = format!("cd {}\n", shell_escape(&dir));
-            session.write(cd_cmd.into_bytes());
+    fn open_dir_in_new_tab(
+        &mut self,
+        dir: std::path::PathBuf,
+        entry_kind: tako_core::recent::RecentEntry,
+        cx: &mut Context<Self>,
+    ) {
+        use tako_core::recent::{RecentEntry, RecentList};
+
+        let dir = dir.canonicalize().unwrap_or(dir);
+        let label = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| dir.display().to_string());
+
+        let pane = tako_core::Pane::new(tako_core::PaneOrigin::User);
+        let pane_id = pane.id();
+        let tab_id = self.workspace.create_tab(label, pane);
+        self.attach_session(
+            pane_id,
+            tako_core::SpawnOptions {
+                cwd: Some(dir.clone()),
+                ..Default::default()
+            },
+        );
+
+        // ファイルツリーにフォルダを追加
+        if let Some(tab) = self.workspace.get_tab_mut(tab_id) {
+            tab.add_pinned_folder(dir.clone());
         }
         self.sync_filetree_roots();
+        self.scroll_active_tab_into_view();
+
+        // Recent に記録
+        let path_str = dir.to_string_lossy().to_string();
+        let recent_entry = match entry_kind {
+            RecentEntry::Repository { .. } => RecentEntry::Repository { path: path_str },
+            _ => RecentEntry::Directory { path: path_str },
+        };
+        let mut recent = RecentList::load();
+        recent.push(recent_entry);
+        recent.save();
+
         cx.notify();
     }
 
@@ -10990,6 +11178,15 @@ struct AttentionToast {
 struct CommandPalette {
     query: String,
     selected: usize,
+    mode: PaletteMode,
+}
+
+#[derive(Default, Clone)]
+enum PaletteMode {
+    #[default]
+    Normal,
+    SshHost(Vec<tako_core::ssh_config::SshHost>),
+    RecentItems(Vec<tako_core::recent::RecentEntry>),
 }
 
 /// コマンドパレットの候補 1 件（#217）
@@ -10998,6 +11195,10 @@ enum PaletteItem {
     Pane(PaneId, String, String),
     /// 固定コマンド（表示名, 実行内容の識別子）
     Command(&'static str, &'static str),
+    /// SSH ホスト
+    SshHost(tako_core::ssh_config::SshHost),
+    /// Recent エントリ
+    Recent(tako_core::recent::RecentEntry),
 }
 
 impl PaletteItem {
@@ -11005,6 +11206,24 @@ impl PaletteItem {
         match self {
             PaletteItem::Pane(_, tab, name) => format!("{tab} \u{203A} {name}"),
             PaletteItem::Command(label, _) => (*label).to_string(),
+            PaletteItem::SshHost(h) => {
+                let mut s = h.name.clone();
+                if let Some(ref hostname) = h.hostname {
+                    s.push_str(&format!(" ({hostname})"));
+                }
+                if let Some(ref user) = h.user {
+                    s.push_str(&format!(" @{user}"));
+                }
+                s
+            }
+            PaletteItem::Recent(e) => {
+                let prefix = match e {
+                    tako_core::recent::RecentEntry::Directory { .. } => "dir",
+                    tako_core::recent::RecentEntry::Repository { .. } => "repo",
+                    tako_core::recent::RecentEntry::Ssh { .. } => "ssh",
+                };
+                format!("[{prefix}] {}", e.label())
+            }
         }
     }
 }
@@ -11396,6 +11615,12 @@ impl Render for TakoApp {
             .on_action(cx.listener(|this, _: &OpenRepository, _, cx| {
                 this.open_repository(cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenRemote, _, cx| {
+                this.open_ssh_palette(cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenRecent, _, cx| {
+                this.open_recent_palette(cx);
+            }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 this.handle_key(&event.keystroke, cx);
             }))
@@ -11745,6 +11970,9 @@ fn app_menus() -> Vec<gpui::Menu> {
             MenuItem::separator(),
             MenuItem::action("Open Directory…", OpenDirectory),
             MenuItem::action("Open Repository…", OpenRepository),
+            MenuItem::action("Open Remote…", OpenRemote),
+            MenuItem::separator(),
+            MenuItem::action("Open Recent…", OpenRecent),
             MenuItem::separator(),
             MenuItem::action("Save Preview", SavePreview),
         ]),
@@ -13437,7 +13665,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 75, "MCP tools/list は 75 ツール");
+            check(status == 200 && tool_count == 79, "MCP tools/list は 79 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
