@@ -40,7 +40,8 @@ actions!(
         NewWindow,
         UndoPreview,
         RedoPreview,
-        FindPreview
+        FindPreview,
+        OpenCommandPalette
     ]
 );
 
@@ -65,6 +66,7 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-v", PasteClipboard, None),
         KeyBinding::new("cmd-s", SavePreview, None),
         KeyBinding::new("cmd-b", ToggleSidebar, None),
+        KeyBinding::new("cmd-k", OpenCommandPalette, None),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-1", ActivateTab1, None),
         KeyBinding::new("cmd-2", ActivateTab2, None),

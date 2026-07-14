@@ -18,6 +18,7 @@ mod drawer;
 mod file_icons;
 mod filetree;
 mod keybindings;
+mod overlays;
 mod preview;
 mod preview_render;
 mod right_panel;
@@ -212,6 +213,9 @@ const PIN_H: f32 = 180.0;
 enum PanelView {
     #[default]
     Tmux,
+    /// オーケストレーター中心ビュー（#217 カンプの「orch」タブ。master とその
+    /// ワーカーツリー・メトリクスを俯瞰する）
+    Orch,
     Git,
 }
 
@@ -692,6 +696,12 @@ struct TakoApp {
     hover_preview: Option<HoverPreview>,
     /// 子ワーカードロップダウンを開いている master ペイン（#217。「N workers ▾」）
     workers_menu_open: Option<PaneId>,
+    /// Attention トースト（#217。失敗の即時通知。右下に積む）
+    toasts: Vec<AttentionToast>,
+    /// トースト検知用: 前回スナップショットで Failed だったペイン（#217）
+    known_failed: std::collections::HashSet<PaneId>,
+    /// ⌘K コマンドパレット（#217。None = 閉じている）
+    command_palette: Option<CommandPalette>,
     /// ピン留めされた常駐プレビュー（FR-2.16.15。アプリ内フローティングウィンドウ）
     pinned_previews: Vec<PinnedPreview>,
     /// ドラッグ移動中のピン（対象 + 掴んだ位置からピン左上までのオフセット px）
@@ -1583,6 +1593,9 @@ impl TakoApp {
             bg_pending_kill: None,
             hover_preview: None,
             workers_menu_open: None,
+            toasts: Vec::new(),
+            known_failed: std::collections::HashSet::new(),
+            command_palette: None,
             pinned_previews: Vec::new(),
             dragging_pin: None,
             agent_metrics: AgentMetrics::default(),
@@ -2090,6 +2103,8 @@ impl TakoApp {
                         let _s = tako_control::diag::perf_span("periodic_prep:sleep_guard");
                         app.update_sleep_guard();
                     }
+                    // 失敗遷移の検知 → Attention トースト（#217）
+                    app.update_attention_toasts();
                     // ペインログ: 直接ペインはここで取り込み、バックエンドはジョブ化（Issue #112 B）
                     let log_jobs = {
                         let _s = tako_control::diag::perf_span("periodic_prep:pane_log");
@@ -4446,10 +4461,191 @@ impl TakoApp {
         cx.notify();
     }
 
-    /// ⌘K コマンドパレットを開く（#217 カンプの検索エントリ。本体は M6 で実装）
+    /// ⌘K コマンドパレットを開く（#217 カンプ。ペイン・コマンド検索）
     pub(crate) fn open_command_palette(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        // TODO(#217 M6): コマンドパレット本体（ペイン・コマンド検索）を実装する
+        self.command_palette = Some(CommandPalette::default());
         cx.notify();
+    }
+
+    /// コマンドパレットの候補（#217。query の部分一致で絞り込み済み）
+    fn palette_items(&self, query: &str) -> Vec<PaletteItem> {
+        let q = query.to_lowercase();
+        let mut items: Vec<PaletteItem> = Vec::new();
+        // ペイン（全タブ）
+        for tab in self.workspace.tabs() {
+            for pane in tab.tree().panes() {
+                let name = pane
+                    .title()
+                    .or_else(|| pane.role())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        self.terminals
+                            .get(&pane.id())
+                            .and_then(|s| s.title())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| "ターミナル".into());
+                let state = self
+                    .terminals
+                    .get(&pane.id())
+                    .map(|s| match s.command_state() {
+                        tako_core::CommandState::Failed(_) => "failed",
+                        tako_core::CommandState::Running => "running",
+                        tako_core::CommandState::Idle => "idle",
+                        tako_core::CommandState::Unknown => "",
+                    })
+                    .unwrap_or("");
+                items.push(PaletteItem::Pane(
+                    pane.id(),
+                    tab.title().to_string(),
+                    format!(
+                        "{name}{}",
+                        if state.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" \u{00B7} {state}")
+                        }
+                    ),
+                ));
+            }
+        }
+        // 固定コマンド
+        const COMMANDS: &[(&str, &str)] = &[
+            ("新しいタブ", "new-tab"),
+            ("テーマをライト/ダーク切替", "toggle-theme"),
+            ("ファイルツリーを開閉", "toggle-files"),
+            ("バックグラウンドドロワーを開閉", "toggle-drawer"),
+            ("fleet パネルを開く", "panel-fleet"),
+            ("orch パネルを開く", "panel-orch"),
+            ("git パネルを開く", "panel-git"),
+            ("ペインを右に分割", "split-right"),
+            ("ペインを下に分割", "split-down"),
+        ];
+        for (label, id) in COMMANDS {
+            items.push(PaletteItem::Command(label, id));
+        }
+        if q.is_empty() {
+            return items;
+        }
+        items
+            .into_iter()
+            .filter(|item| item.label().to_lowercase().contains(&q))
+            .collect()
+    }
+
+    /// コマンドパレットのキー入力処理（#217）。true = 消費した
+    fn handle_palette_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+        let Some(palette) = self.command_palette.as_mut() else {
+            return false;
+        };
+        match keystroke.key.as_str() {
+            "escape" => {
+                self.command_palette = None;
+            }
+            "enter" => {
+                let query = palette.query.clone();
+                let selected = palette.selected;
+                let items = self.palette_items(&query);
+                self.command_palette = None;
+                if let Some(item) = items.into_iter().nth(selected) {
+                    self.palette_execute(item, cx);
+                }
+            }
+            "up" => {
+                palette.selected = palette.selected.saturating_sub(1);
+            }
+            "down" => {
+                palette.selected = palette.selected.saturating_add(1);
+            }
+            "backspace" => {
+                palette.query.pop();
+                palette.selected = 0;
+            }
+            _ => {
+                if let Some(ch) = keystroke.key_char.as_deref() {
+                    if !ch.chars().any(|c| c.is_control()) {
+                        palette.query.push_str(ch);
+                        palette.selected = 0;
+                    }
+                }
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    /// コマンドパレットの実行（#217）
+    fn palette_execute(&mut self, item: PaletteItem, cx: &mut Context<Self>) {
+        match item {
+            PaletteItem::Pane(pane, _, _) => self.jump_to_pane(pane, cx),
+            PaletteItem::Command(_, id) => match id {
+                "new-tab" => self.new_tab(cx),
+                "toggle-theme" => self.toggle_theme(cx),
+                "toggle-files" => {
+                    self.toggle_filetree();
+                    cx.notify();
+                }
+                "toggle-drawer" => {
+                    self.drawer_visible = !self.drawer_visible;
+                    cx.notify();
+                }
+                "panel-fleet" => self.toggle_panel_view(PanelView::Tmux, cx),
+                "panel-orch" => self.toggle_panel_view(PanelView::Orch, cx),
+                "panel-git" => self.toggle_panel_view(PanelView::Git, cx),
+                "split-right" => self.split(SplitDirection::Right, cx),
+                "split-down" => self.split(SplitDirection::Down, cx),
+                _ => {}
+            },
+        }
+    }
+
+    /// 失敗遷移を検知して Attention トーストを積む（#217 カンプ。periodic から呼ぶ）
+    fn update_attention_toasts(&mut self) {
+        let current: std::collections::HashSet<PaneId> = self
+            .terminals
+            .iter()
+            .filter(|(_, s)| matches!(s.command_state(), tako_core::CommandState::Failed(_)))
+            .map(|(id, _)| *id)
+            .collect();
+        for pane_id in current.difference(&self.known_failed) {
+            let exit_code = self
+                .terminals
+                .get(pane_id)
+                .and_then(|s| match s.command_state() {
+                    tako_core::CommandState::Failed(code) => Some(code),
+                    _ => None,
+                })
+                .unwrap_or(1);
+            // ペイン名とタブ情報
+            let mut name = "ターミナル".to_string();
+            let mut tab_title = String::new();
+            let mut pane_index = 0;
+            for tab in self.workspace.tabs() {
+                let panes = tab.tree().panes();
+                if let Some(pos) = panes.iter().position(|p| p.id() == *pane_id) {
+                    let p = &panes[pos];
+                    name = p
+                        .title()
+                        .or_else(|| p.role())
+                        .map(str::to_string)
+                        .unwrap_or(name);
+                    tab_title = tab.title().to_string();
+                    pane_index = pos + 1;
+                    break;
+                }
+            }
+            self.toasts.push(AttentionToast {
+                pane: *pane_id,
+                title: format!("{} が失敗", truncate(&name, 24)),
+                detail: format!("{tab_title} \u{203A} pane {pane_index} \u{00B7} exit {exit_code}"),
+                at: std::time::Instant::now(),
+            });
+            // 溜まりすぎ防止（最新 3 件のみ表示対象）
+            if self.toasts.len() > 3 {
+                self.toasts.remove(0);
+            }
+        }
+        self.known_failed = current;
     }
 
     fn open_directory(&mut self, cx: &mut Context<Self>) {
@@ -5241,6 +5437,11 @@ impl TakoApp {
                 "escape" => self.close_confirm_cancelled(cx),
                 _ => {}
             }
+            cx.stop_propagation();
+            return;
+        }
+        // ⌘K コマンドパレット（#217）: 開いている間は全キーを消費する
+        if self.command_palette.is_some() && self.handle_palette_key(keystroke, cx) {
             cx.stop_propagation();
             return;
         }
@@ -8343,6 +8544,11 @@ impl TakoApp {
                 })
         });
         let workers_menu_open = self.workers_menu_open == Some(pane_id);
+        // 見切れ防止の省略順序（#185 と同思想）: 狭いペインでは cwd チップ →
+        // シェル情報の順に隠し、ペイン名と操作ボタン（×等）は最後まで残す
+        let header_w = f32::from(area.size.width);
+        let show_cwd_chip = header_w >= 450.0;
+        let show_shell_info = header_w >= 350.0;
 
         // スクロールバー（FR-2.5.13）: iTerm2 流にスクロール中だけ表示 → フェードアウト。
         // バックエンドペインは tmux 側（ネスト先含む）の位置・履歴を表示する
@@ -8658,7 +8864,7 @@ impl TakoApp {
                     })
                     .child(div().flex_grow(1.0))
                     // cwd チップ（カンプ: mono 10.5 / chip 面 / クリックでコピー）
-                    .children(cwd_display.map(|(short, full)| {
+                    .children(cwd_display.filter(|_| show_cwd_chip).map(|(short, full)| {
                         div()
                             .id(("pane-cwd", pane_id.as_u64()))
                             .flex()
@@ -8700,21 +8906,23 @@ impl TakoApp {
                             .child(SharedString::from(truncate(&short, 28)))
                     }))
                     // ターミナル情報（現行機能の維持: シェル名 · cols×rows）
-                    .child({
+                    .when(show_shell_info, |d| {
                         let shell_name = self
                             .terminals
                             .get(&pane_id)
                             .and_then(|s| s.title())
                             .unwrap_or("zsh");
                         let shell_short = shell_name.rsplit('/').next().unwrap_or(shell_name);
-                        div()
-                            .flex_none()
-                            .text_size(px(10.5))
-                            .font_family(theme.font_family.clone())
-                            .text_color(hsla(theme.tab_inactive_foreground))
-                            .child(SharedString::from(format!(
-                                "{shell_short} \u{00B7} {cols}\u{00D7}{rows}"
-                            )))
+                        d.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(10.5))
+                                .font_family(theme.font_family.clone())
+                                .text_color(hsla(theme.tab_inactive_foreground))
+                                .child(SharedString::from(format!(
+                                    "{shell_short} \u{00B7} {cols}\u{00D7}{rows}"
+                                ))),
+                        )
                     })
                     // failed: 再実行ボタン（カンプ: 直前コマンドの再実行）
                     .when(is_failed, |d| {
@@ -9359,6 +9567,7 @@ impl UiStateHost for TakoApp {
     fn panel_state(&self) -> (bool, f32, tako_control::protocol::PanelViewWire) {
         let view = match self.panel_view {
             PanelView::Tmux => tako_control::protocol::PanelViewWire::Tmux,
+            PanelView::Orch => tako_control::protocol::PanelViewWire::Orch,
             PanelView::Git => tako_control::protocol::PanelViewWire::Git,
         };
         (self.panel_visible, self.panel_width, view)
@@ -9379,6 +9588,7 @@ impl UiStateHost for TakoApp {
         if let Some(view) = view {
             self.panel_view = match view {
                 tako_control::protocol::PanelViewWire::Tmux => PanelView::Tmux,
+                tako_control::protocol::PanelViewWire::Orch => PanelView::Orch,
                 tako_control::protocol::PanelViewWire::Git => PanelView::Git,
             };
         }
@@ -10207,6 +10417,38 @@ struct WorkerRow {
     state: tako_core::CommandState,
 }
 
+/// Attention トースト 1 件（#217 カンプ。失敗即知の右下通知）
+struct AttentionToast {
+    pane: PaneId,
+    title: String,
+    detail: String,
+    at: std::time::Instant,
+}
+
+/// ⌘K コマンドパレットの状態（#217 カンプ。ペイン・コマンド検索）
+#[derive(Default)]
+struct CommandPalette {
+    query: String,
+    selected: usize,
+}
+
+/// コマンドパレットの候補 1 件（#217）
+enum PaletteItem {
+    /// ペインへジャンプ（タブ名, 表示名, 状態）
+    Pane(PaneId, String, String),
+    /// 固定コマンド（表示名, 実行内容の識別子）
+    Command(&'static str, &'static str),
+}
+
+impl PaletteItem {
+    fn label(&self) -> String {
+        match self {
+            PaletteItem::Pane(_, tab, name) => format!("{tab} \u{203A} {name}"),
+            PaletteItem::Command(label, _) => (*label).to_string(),
+        }
+    }
+}
+
 /// GPUI の Keystroke を端末入力バイト列へ変換する
 /// `firstRectForCharacterRange` の range 先頭を擬似ドキュメント（marked text のみ・
 /// 0 起点）内へ解釈する。macOS のライブ変換は確定済みテキストを含む**文書全体基準**の
@@ -10564,6 +10806,9 @@ impl Render for TakoApp {
                 this.toggle_filetree();
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
+                this.open_command_palette(window, cx);
+            }))
             // Quit はここ（フォーカスパス依存）ではなく main() のグローバル
             // on_action + on_app_quit で処理する（#103）
             .on_action(cx.listener(|this, _: &ActivateTab1, _, cx| this.activate_tab_index(0, cx)))
@@ -10639,6 +10884,8 @@ impl Render for TakoApp {
             .children(hover_preview_overlay)
             .children(pinned_overlays)
             .children(self.render_close_confirm_dialog(cx))
+            .children(self.render_attention_toasts(cx))
+            .children(self.render_command_palette(cx))
     }
 }
 
@@ -16719,6 +16966,38 @@ mod self_test {
                     })
                     .unwrap_or(false);
                 check(cmd_ok, "確認ダイアログ: cmd+クリックでスキップ");
+
+                // 75. ⌘K コマンドパレット（#217）: 開く → 絞り込み → Enter で実行 →
+                //     テーマが反転し settings は汚さない（TAKO_SELF_TEST ガード）
+                let palette_ok = window
+                    .update(cx, |app, window, cx| {
+                        app.open_command_palette(window, cx);
+                        let opened = app.command_palette.is_some();
+                        // 「テーマ」で絞ると toggle-theme コマンドが先頭に来る
+                        if let Some(p) = app.command_palette.as_mut() {
+                            p.query = "テーマ".into();
+                            p.selected = 0;
+                        }
+                        let items = app.palette_items("テーマ");
+                        let has_theme = matches!(
+                            items.first(),
+                            Some(PaletteItem::Command(_, "toggle-theme"))
+                        );
+                        let before_mode = app.theme.mode;
+                        app.handle_palette_key(&Keystroke::parse("enter").unwrap(), cx);
+                        let toggled =
+                            app.theme.mode != before_mode && app.command_palette.is_none();
+                        // 後始末: テーマを元に戻す
+                        app.toggle_theme(cx);
+                        let restored = app.theme.mode == before_mode;
+                        // Esc で閉じる
+                        app.open_command_palette(window, cx);
+                        app.handle_palette_key(&Keystroke::parse("escape").unwrap(), cx);
+                        let esc_closed = app.command_palette.is_none();
+                        opened && has_theme && toggled && restored && esc_closed
+                    })
+                    .unwrap_or(false);
+                check(palette_ok, "コマンドパレット: 絞り込み + Enter 実行 + Esc");
 
                 // 73d. confirm_close=false で即クローズ
                 type_text(

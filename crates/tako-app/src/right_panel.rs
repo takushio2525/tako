@@ -1,10 +1,30 @@
 use gpui::{
-    canvas, div, point, prelude::*, px, BoxShadow, Context, CursorStyle, FontWeight, MouseButton,
-    MouseDownEvent, SharedString,
+    canvas, div, point, prelude::*, px, svg, BoxShadow, Context, CursorStyle, FontWeight,
+    MouseButton, MouseDownEvent, SharedString,
 };
 use tako_core::{CommandState, PaneId, SplitDirection};
 
 use super::*;
+use crate::file_icons::ui_icon;
+
+/// orch ビューのワーカー行（#217。render_orch_view で収集）
+struct OrchWorker {
+    pane: PaneId,
+    name: String,
+    subtitle: String,
+    state: CommandState,
+}
+
+/// orch ビューのオーケストレーターカード（#217）
+struct OrchCard {
+    pane: PaneId,
+    name: String,
+    tab_title: String,
+    state: CommandState,
+    elapsed: Option<String>,
+    ctx_percent: Option<u32>,
+    workers: Vec<OrchWorker>,
+}
 
 impl TakoApp {
     /// 縦積みにし、文言が長くてもボタンがパネル右端へ見切れないようにする
@@ -336,6 +356,485 @@ impl TakoApp {
     /// 外部 tmux セッションは window 一覧ごとタブ枠へ紐付け表示する（FR-2.16.9）。続けて、
     /// どのタブにも表示されていない tmux セッションを「管理外 / kill 漏れ?」に区別して
     /// 列挙する（確認つき TmuxKill）
+    /// orch ビュー（#217 カンプ。master とその依存ツリー・メトリクスを俯瞰する）
+    fn render_orch_view(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let theme = self.theme.clone();
+        let state_color = |s: &CommandState| match s {
+            CommandState::Failed(_) => theme.red,
+            CommandState::Running => theme.accent,
+            CommandState::Idle => theme.green,
+            CommandState::Unknown => theme.text_overlay,
+        };
+        // 全タブから master を収集し、spawned_by チェーンでワーカーを紐付ける
+        let mut cards: Vec<OrchCard> = Vec::new();
+        let mut standalone: Vec<(PaneId, String, CommandState)> = Vec::new();
+        for tab in self.workspace.tabs() {
+            for pane in tab.tree().panes() {
+                let role = pane.role().unwrap_or("");
+                let is_master = role.contains("orchestrator-master")
+                    || role == "master"
+                    || role.starts_with("master:");
+                let is_solo = role.contains("orchestrator-solo") || role.starts_with("solo");
+                if is_master {
+                    let session = self.terminals.get(&pane.id());
+                    // spawned_by で紐づくワーカーを収集。復元後などで spawned_by が
+                    // 失われた worker role ペインは、master が唯一のときだけ
+                    // フォールバック紐づけする（複数 master の誤認防止 = #210 と同思想）
+                    let master_count = self
+                        .workspace
+                        .tabs()
+                        .iter()
+                        .flat_map(|t| t.tree().panes())
+                        .filter(|p| {
+                            p.role().is_some_and(|r| {
+                                r.contains("orchestrator-master")
+                                    || r == "master"
+                                    || r.starts_with("master:")
+                            })
+                        })
+                        .count();
+                    let workers = self
+                        .workspace
+                        .tabs()
+                        .iter()
+                        .flat_map(|t| t.tree().panes())
+                        .filter(|p| {
+                            p.spawned_by() == Some(pane.id())
+                                || (master_count == 1
+                                    && p.spawned_by().is_none()
+                                    && p.role().is_some_and(|r| {
+                                        r.contains("orchestrator-worker") || r.starts_with("worker")
+                                    }))
+                        })
+                        .map(|p| {
+                            let name = p
+                                .role()
+                                .or_else(|| p.title())
+                                .unwrap_or("worker")
+                                .to_string();
+                            let subtitle = p
+                                .title()
+                                .map(str::to_string)
+                                .filter(|t| *t != name)
+                                .unwrap_or_default();
+                            OrchWorker {
+                                pane: p.id(),
+                                name,
+                                subtitle,
+                                state: self
+                                    .terminals
+                                    .get(&p.id())
+                                    .map(|s| s.command_state())
+                                    .unwrap_or(CommandState::Unknown),
+                            }
+                        })
+                        .collect();
+                    cards.push(OrchCard {
+                        pane: pane.id(),
+                        name: pane
+                            .title()
+                            .or_else(|| pane.role())
+                            .unwrap_or("master")
+                            .to_string(),
+                        tab_title: tab.title().to_string(),
+                        state: session
+                            .map(|s| s.command_state())
+                            .unwrap_or(CommandState::Unknown),
+                        elapsed: session
+                            .and_then(|s| s.command_state_since())
+                            .map(|t| crate::format_state_elapsed(t.elapsed())),
+                        ctx_percent: session
+                            .and_then(|s| s.agent_metrics())
+                            .and_then(|m| m.ctx_percent),
+                        workers,
+                    });
+                } else if is_solo {
+                    standalone.push((
+                        pane.id(),
+                        pane.title()
+                            .or_else(|| pane.role())
+                            .unwrap_or("solo")
+                            .to_string(),
+                        self.terminals
+                            .get(&pane.id())
+                            .map(|s| s.command_state())
+                            .unwrap_or(CommandState::Unknown),
+                    ));
+                }
+            }
+        }
+        let total_workers: usize = cards.iter().map(|c| c.workers.len()).sum();
+        let n_orch = cards.len();
+
+        div()
+            .id("panel-orch-view")
+            .flex_1()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .text_color(hsla(theme.foreground))
+            // ヘッダ行（カンプ: ORCHESTRATORS + N orch · N workers）
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .pt(px(12.0))
+                    .px(px(14.0))
+                    .pb(px(6.0))
+                    .flex_none()
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(hsla(theme.text_muted))
+                            .child("ORCHESTRATORS"),
+                    )
+                    .child(div().flex_grow(1.0))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(hsla(theme.text_faint))
+                            .child(SharedString::from(format!(
+                                "{n_orch} orch \u{00B7} {total_workers} workers"
+                            ))),
+                    ),
+            )
+            .child(
+                div()
+                    .id("orch-scroll")
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .overflow_y_scroll()
+                    .px(px(8.0))
+                    .pb(px(8.0))
+                    .when(cards.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .px(px(6.0))
+                                .py(px(8.0))
+                                .text_size(px(11.5))
+                                .text_color(hsla(theme.text_muted))
+                                .child("オーケストレーターはいません（tako master で起動）"),
+                        )
+                    })
+                    .children(cards.into_iter().map(|card| {
+                        let master_pane = card.pane;
+                        let dot = state_color(&card.state);
+                        div()
+                            .flex_none()
+                            .rounded(px(10.0))
+                            .border_1()
+                            .border_color(hsla(theme.border_strong))
+                            .bg(rgba(theme.surface_1))
+                            .mb(px(8.0))
+                            .overflow_hidden()
+                            // カードヘッダ（master 名 + ORCH + タブ名 + 状態）
+                            .child(
+                                div()
+                                    .id(("orch-card-head", master_pane.as_u64()))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .px(px(11.0))
+                                    .py(px(10.0))
+                                    .border_b_1()
+                                    .border_color(hsla(theme.border_subtle))
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(rgba(theme.surface_hover_strong)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.jump_to_pane(master_pane, cx);
+                                    }))
+                                    .child(
+                                        svg()
+                                            .path(ui_icon::MASTER)
+                                            .w(px(14.0))
+                                            .h(px(14.0))
+                                            .text_color(hsla(theme.accent)),
+                                    )
+                                    .child(
+                                        div()
+                                            .font_family(theme.font_family.clone())
+                                            .text_size(px(12.5))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(hsla(theme.foreground))
+                                            .child(SharedString::from(truncate(&card.name, 18))),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(9.5))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(hsla(theme.accent))
+                                            .child("ORCH"),
+                                    )
+                                    .child(div().flex_grow(1.0))
+                                    .child(
+                                        div()
+                                            .font_family(theme.font_family.clone())
+                                            .text_size(px(10.0))
+                                            .text_color(hsla(theme.text_muted))
+                                            .child(SharedString::from(truncate(
+                                                &card.tab_title,
+                                                12,
+                                            ))),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(6.0))
+                                            .h(px(6.0))
+                                            .flex_none()
+                                            .rounded_full()
+                                            .bg(hsla(dot)),
+                                    ),
+                            )
+                            // メトリクス行（カンプ: 稼働 / tok / cost / tasks。取れるものだけ）
+                            .when(card.elapsed.is_some() || card.ctx_percent.is_some(), |d| {
+                                d.child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .gap(px(14.0))
+                                        .px(px(12.0))
+                                        .py(px(8.0))
+                                        .border_b_1()
+                                        .border_color(hsla(theme.border_inner))
+                                        .font_family(theme.font_family.clone())
+                                        .text_size(px(10.5))
+                                        .text_color(hsla(theme.text_muted))
+                                        .children(card.elapsed.clone().map(|el| {
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .gap(px(4.0))
+                                                .child("稼働")
+                                                .child(
+                                                    div()
+                                                        .text_color(hsla(theme.foreground))
+                                                        .child(SharedString::from(el)),
+                                                )
+                                        }))
+                                        .children(card.ctx_percent.map(|pct| {
+                                            div().flex().flex_row().gap(px(4.0)).child("ctx").child(
+                                                div()
+                                                    .text_color(hsla(theme.foreground))
+                                                    .child(SharedString::from(format!("{pct}%"))),
+                                            )
+                                        })),
+                                )
+                            })
+                            // ワーカーツリー（カンプ: ツリー罫線 + 状態 + 名前 + 概要）
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .pt(px(6.0))
+                                    .pb(px(10.0))
+                                    .pl(px(16.0))
+                                    .pr(px(10.0))
+                                    .when(card.workers.is_empty(), |d| {
+                                        d.child(
+                                            div()
+                                                .text_size(px(10.5))
+                                                .text_color(hsla(theme.text_faint))
+                                                .child("ワーカーなし"),
+                                        )
+                                    })
+                                    .children({
+                                        let n = card.workers.len();
+                                        let rows: Vec<(bool, OrchWorker)> = card
+                                            .workers
+                                            .into_iter()
+                                            .enumerate()
+                                            .map(|(i, w)| (i + 1 == n, w))
+                                            .collect();
+                                        rows.into_iter().map(|(last, w)| {
+                                            let failed = matches!(w.state, CommandState::Failed(_));
+                                            let wdot = state_color(&w.state);
+                                            let target = w.pane;
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_stretch()
+                                                // ツリー罫線（縦線 + 横枝）
+                                                .child(
+                                                    div()
+                                                        .w(px(16.0))
+                                                        .flex_none()
+                                                        .relative()
+                                                        .child(
+                                                            div()
+                                                                .absolute()
+                                                                .top(px(0.0))
+                                                                .left(px(0.0))
+                                                                .w(px(1.0))
+                                                                .h(relative(if last {
+                                                                    0.5
+                                                                } else {
+                                                                    1.0
+                                                                }))
+                                                                .bg(hsla(theme.border_heavy)),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .absolute()
+                                                                .top(relative(0.5))
+                                                                .left(px(0.0))
+                                                                .w(px(12.0))
+                                                                .h(px(1.0))
+                                                                .bg(hsla(theme.border_heavy)),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id(("orch-worker", w.pane.as_u64()))
+                                                        .flex_1()
+                                                        .min_w(px(0.0))
+                                                        .flex()
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .gap(px(7.0))
+                                                        .p(px(6.0))
+                                                        .rounded(px(6.0))
+                                                        .cursor_pointer()
+                                                        .when(failed, |d| {
+                                                            d.bg(rgba_alpha(theme.red, 0.06))
+                                                        })
+                                                        .hover(move |d| {
+                                                            if failed {
+                                                                d.bg(rgba_alpha(theme.red, 0.1))
+                                                            } else {
+                                                                d.bg(rgba(
+                                                                    theme.surface_hover_strong,
+                                                                ))
+                                                            }
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.jump_to_pane(target, cx);
+                                                            },
+                                                        ))
+                                                        .child(if failed {
+                                                            svg()
+                                                                .path(ui_icon::FAIL_X)
+                                                                .w(px(9.0))
+                                                                .h(px(9.0))
+                                                                .text_color(hsla(theme.red))
+                                                                .into_any_element()
+                                                        } else {
+                                                            div()
+                                                                .w(px(6.0))
+                                                                .h(px(6.0))
+                                                                .flex_none()
+                                                                .rounded_full()
+                                                                .bg(hsla(wdot))
+                                                                .into_any_element()
+                                                        })
+                                                        .child(
+                                                            div()
+                                                                .flex_none()
+                                                                .font_family(
+                                                                    theme.font_family.clone(),
+                                                                )
+                                                                .text_size(px(11.5))
+                                                                .font_weight(FontWeight::SEMIBOLD)
+                                                                .text_color(hsla(
+                                                                    theme.text_secondary,
+                                                                ))
+                                                                .child(SharedString::from(
+                                                                    truncate(&w.name, 22),
+                                                                )),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .flex_grow(1.0)
+                                                                .min_w(px(0.0))
+                                                                .overflow_hidden()
+                                                                .text_ellipsis()
+                                                                .whitespace_nowrap()
+                                                                .text_size(px(10.5))
+                                                                .text_color(if failed {
+                                                                    hsla(theme.red)
+                                                                } else {
+                                                                    hsla(theme.text_muted)
+                                                                })
+                                                                .child(SharedString::from(
+                                                                    if failed {
+                                                                        "failed".to_string()
+                                                                    } else {
+                                                                        w.subtitle.clone()
+                                                                    },
+                                                                )),
+                                                        ),
+                                                )
+                                        })
+                                    }),
+                            )
+                    }))
+                    // STANDALONE セクション（カンプ: オーケストレーター配下でないエージェント）
+                    .when(!standalone.is_empty(), |d| {
+                        let n = standalone.len();
+                        d.child(
+                            div()
+                                .flex_none()
+                                .px(px(6.0))
+                                .py(px(6.0))
+                                .text_size(px(9.5))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(hsla(theme.text_muted))
+                                .child(SharedString::from(format!("STANDALONE \u{00B7} {n}"))),
+                        )
+                        .children(standalone.into_iter().map(|(pane, name, state)| {
+                            let dot = state_color(&state);
+                            div()
+                                .id(("orch-standalone", pane.as_u64()))
+                                .flex_none()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .px(px(11.0))
+                                .py(px(9.0))
+                                .rounded(px(10.0))
+                                .border_1()
+                                .border_color(hsla(theme.border_strong))
+                                .bg(rgba(theme.chip_surface))
+                                .mb(px(8.0))
+                                .cursor_pointer()
+                                .hover(|d| d.bg(rgba(theme.surface_hover)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.jump_to_pane(pane, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .w(px(6.0))
+                                        .h(px(6.0))
+                                        .flex_none()
+                                        .rounded_full()
+                                        .bg(hsla(dot)),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(theme.font_family.clone())
+                                        .text_size(px(11.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(hsla(theme.text_secondary))
+                                        .child(SharedString::from(truncate(&name, 24))),
+                                )
+                                .child(div().flex_grow(1.0))
+                                .child(
+                                    div()
+                                        .font_family(theme.font_family.clone())
+                                        .text_size(px(10.0))
+                                        .text_color(hsla(theme.text_faint))
+                                        .child("SOLO"),
+                                )
+                        }))
+                    }),
+            )
+    }
+
     fn render_tmux_view(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme.clone();
         let groups = self.tmux_view_groups();
@@ -348,6 +847,19 @@ impl TakoApp {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
+        // fleet サマリ（#217 カンプ: N running / N failed / N idle）
+        let (n_running, n_failed, n_idle) =
+            self.terminals
+                .values()
+                .fold((0usize, 0usize, 0usize), |(r, f, i), s| {
+                    match s.command_state() {
+                        CommandState::Running => (r + 1, f, i),
+                        CommandState::Failed(_) => (r, f + 1, i),
+                        CommandState::Idle => (r, f, i + 1),
+                        CommandState::Unknown => (r, f, i),
+                    }
+                });
+
         let mut root = div()
             .id("tmux-view")
             .flex_1()
@@ -359,6 +871,49 @@ impl TakoApp {
             .text_color(hsla(theme.foreground))
             .text_size(px(12.0))
             .overflow_y_scroll()
+            .child({
+                // サマリ行（カンプ: ドット + 数 + 状態名）
+                let stat = |count: usize, label: &'static str, color: tako_core::theme::Rgb| {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(5.0))
+                        .text_size(px(11.0))
+                        .text_color(hsla(if label == "failed" && count > 0 {
+                            theme.red
+                        } else {
+                            theme.text_tertiary
+                        }))
+                        .when(label == "failed" && count > 0, |d| {
+                            d.font_weight(FontWeight::SEMIBOLD)
+                        })
+                        .child(
+                            div()
+                                .w(px(6.0))
+                                .h(px(6.0))
+                                .flex_none()
+                                .rounded_full()
+                                .bg(hsla(color)),
+                        )
+                        .child(
+                            div()
+                                .font_family(theme.font_family.clone())
+                                .child(SharedString::from(count.to_string())),
+                        )
+                        .child(label)
+                };
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(12.0))
+                    .px(px(4.0))
+                    .pt(px(2.0))
+                    .child(stat(n_running, "running", theme.accent))
+                    .child(stat(n_failed, "failed", theme.red))
+                    .child(stat(n_idle, "idle", theme.green))
+            })
             .child(
                 div()
                     .flex()
@@ -1830,26 +2385,50 @@ impl TakoApp {
         }
         let theme = self.theme.clone();
         let view = self.panel_view;
-        let tab_button = |label: &'static str, target: PanelView, active: bool| {
-            div()
-                .id(("panel-tab", target as u64))
-                .px_2()
-                .py_1()
-                .cursor_pointer()
-                .text_size(px(11.0))
-                .when(active, |d| {
-                    d.bg(rgba(theme.tab_active_background))
-                        .border_b_2()
-                        .border_color(hsla(theme.accent))
-                })
-                .when(!active, |d| d.hover(|d| d.bg(rgba(theme.surface_hover))))
-                .text_color(if active {
-                    hsla(theme.tab_active_foreground)
-                } else {
-                    hsla(theme.tab_inactive_foreground)
-                })
-                .child(label)
-        };
+        // カンプ準拠のタブ（アイコン + ラベル、active は下線 inset）
+        let tab_button =
+            |label: &'static str, icon: &'static str, target: PanelView, active: bool| {
+                div()
+                    .id(("panel-tab", target as u64))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(7.0))
+                    .px(px(12.0))
+                    .h_full()
+                    .cursor_pointer()
+                    .text_size(px(12.0))
+                    .when(active, |d| {
+                        d.font_weight(gpui::FontWeight::SEMIBOLD)
+                            .shadow(vec![gpui::BoxShadow {
+                                color: hsla(theme.accent),
+                                offset: gpui::point(px(0.), px(-2.)),
+                                blur_radius: px(0.),
+                                spread_radius: px(0.),
+                                inset: true,
+                            }])
+                    })
+                    .when(!active, |d| {
+                        d.hover(|d| d.text_color(hsla(theme.foreground)))
+                    })
+                    .text_color(if active {
+                        hsla(theme.foreground)
+                    } else {
+                        hsla(theme.text_muted)
+                    })
+                    .child(
+                        svg()
+                            .path(icon)
+                            .w(px(14.0))
+                            .h(px(14.0))
+                            .text_color(if active {
+                                hsla(theme.accent)
+                            } else {
+                                hsla(theme.text_muted)
+                            }),
+                    )
+                    .child(label)
+            };
         Some(
             div()
                 .w(px(self.panel_width))
@@ -1864,44 +2443,77 @@ impl TakoApp {
                     div()
                         .flex()
                         .flex_row()
-                        .items_center()
-                        .gap(px(2.0))
+                        .items_stretch()
                         .px_2()
                         .h(px(38.0))
                         .flex_none()
+                        .border_b_1()
+                        .border_color(hsla(theme.border_inner))
                         .bg(rgba(theme.mantle))
                         .child(
-                            tab_button("tmux", PanelView::Tmux, view == PanelView::Tmux).on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.panel_view = PanelView::Tmux;
-                                    this.refresh_tmux(cx);
-                                }),
-                            ),
+                            tab_button(
+                                "fleet",
+                                crate::file_icons::ui_icon::FLEET,
+                                PanelView::Tmux,
+                                view == PanelView::Tmux,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.panel_view = PanelView::Tmux;
+                                this.refresh_tmux(cx);
+                            })),
                         )
                         .child(
-                            tab_button("git", PanelView::Git, view == PanelView::Git).on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.panel_view = PanelView::Git;
-                                    cx.notify();
-                                }),
-                            ),
+                            tab_button(
+                                "orch",
+                                if view == PanelView::Orch {
+                                    crate::file_icons::ui_icon::ORCH_ACTIVE
+                                } else {
+                                    crate::file_icons::ui_icon::ORCH
+                                },
+                                PanelView::Orch,
+                                view == PanelView::Orch,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.panel_view = PanelView::Orch;
+                                cx.notify();
+                            })),
+                        )
+                        .child(
+                            tab_button(
+                                "git",
+                                crate::file_icons::ui_icon::GIT_BRANCH,
+                                PanelView::Git,
+                                view == PanelView::Git,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.panel_view = PanelView::Git;
+                                cx.notify();
+                            })),
                         )
                         .child(div().flex_grow(1.0))
                         .child(
                             div()
                                 .id("panel-close")
+                                .flex()
+                                .items_center()
                                 .px_1()
                                 .cursor_pointer()
-                                .text_color(hsla(theme.tab_inactive_foreground))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.panel_visible = false;
                                     cx.notify();
                                 }))
-                                .child("×"),
+                                .child(
+                                    svg()
+                                        .path(crate::file_icons::ui_icon::CLOSE)
+                                        .w(px(12.0))
+                                        .h(px(12.0))
+                                        .text_color(hsla(theme.text_muted)),
+                                ),
                         ),
                 )
                 .child(match view {
                     PanelView::Tmux => self.render_tmux_view(cx).into_any_element(),
+                    PanelView::Orch => self.render_orch_view(cx).into_any_element(),
                     PanelView::Git => self.render_git_view(cx).into_any_element(),
                 })
                 .child(

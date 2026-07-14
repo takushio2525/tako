@@ -620,7 +620,7 @@ pub fn tools() -> Vec<Value> {
                 "properties": {
                     "visible": { "type": "boolean", "description": "true = 表示、false = 非表示" },
                     "width": { "type": "number", "exclusiveMinimum": 0, "description": "パネル幅（px）" },
-                    "view": { "type": "string", "enum": ["tmux", "git"], "description": "表示するビュー" },
+                    "view": { "type": "string", "enum": ["tmux", "orch", "git"], "description": "表示するビュー（orch = オーケストレーター俯瞰。#217）" },
                     "filetree": { "type": "boolean", "description": "左サイドバーのファイルツリーの表示・非表示" },
                 },
                 "additionalProperties": false,
@@ -2121,8 +2121,9 @@ fn build_request(
             view: match str_arg(args, "view")?.as_deref() {
                 None => None,
                 Some("tmux") => Some(crate::protocol::PanelViewWire::Tmux),
+                Some("orch") => Some(crate::protocol::PanelViewWire::Orch),
                 Some("git") => Some(crate::protocol::PanelViewWire::Git),
-                Some(other) => return Err(format!("view が不正: {other}（tmux | git）")),
+                Some(other) => return Err(format!("view が不正: {other}（tmux | orch | git）")),
             },
             filetree: bool_arg(args, "filetree")?,
         },

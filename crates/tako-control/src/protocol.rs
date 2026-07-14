@@ -78,6 +78,8 @@ fn default_true() -> bool {
 #[serde(rename_all = "snake_case")]
 pub enum PanelViewWire {
     Tmux,
+    /// オーケストレーター中心ビュー（#217。master + ワーカーツリーの俯瞰）
+    Orch,
     Git,
 }
 
@@ -85,6 +87,7 @@ impl PanelViewWire {
     pub fn as_str(self) -> &'static str {
         match self {
             PanelViewWire::Tmux => "tmux",
+            PanelViewWire::Orch => "orch",
             PanelViewWire::Git => "git",
         }
     }

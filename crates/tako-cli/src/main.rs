@@ -1185,8 +1185,8 @@ struct PanelArgs {
     /// パネル幅（px）
     #[arg(long)]
     width: Option<f32>,
-    /// 表示するビュー
-    #[arg(long, value_parser = ["tmux", "git"])]
+    /// 表示するビュー（orch = オーケストレーター俯瞰。#217）
+    #[arg(long, value_parser = ["tmux", "orch", "git"])]
     view: Option<String>,
     /// 左サイドバーのファイルツリー表示（FR-2.16.5。on = 表示、off = 非表示）
     #[arg(long, value_parser = ["on", "off"])]
@@ -2694,6 +2694,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             width: args.width,
             view: args.view.as_deref().map(|v| match v {
                 "git" => tako_control::protocol::PanelViewWire::Git,
+                "orch" => tako_control::protocol::PanelViewWire::Orch,
                 _ => tako_control::protocol::PanelViewWire::Tmux,
             }),
             filetree: args.filetree.as_deref().map(|s| s == "on"),
