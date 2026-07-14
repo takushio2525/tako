@@ -6,7 +6,7 @@
 
 ## 現在の対象（2026-07-15・#233 プレビューライブリロード）
 
-**実装・全検証・最新 main 取り込み・全差分レビューまで完了。PR 作成待ち**:
+**実装・全検証・squash merge・Issue 報告まで完了**（PR #247 / merge `133fbe7`）:
 
 - `notify` の OS ネイティブイベントで表示中ファイルの親ディレクトリだけを非再帰監視し、
   パス別 300ms デバウンスと世代照合を実装。callback は channel 送信だけで、アイドル時の
@@ -26,14 +26,14 @@
 - `preview_watch_sync` のアイドル窓は p50 / p95 / p99 / max すべて 0ms、event / apply は 0 回。
   6 イベント時の `preview_watch_event` と 1 回の `preview_reload_apply` も全 percentile 0ms、
   16ms 以上の UI 専有ログは 0 件
-- `origin/main`（#161 / #20、`30a56b5`）へ rebase 済み。workspace build / fmt --check /
+- `origin/main`（#161 / #20、`30a56b5`）へ rebase して実装し、workspace build / fmt --check /
   clippy -D warnings / test 全緑、隔離セルフテストは `TAKO_APP_SELF_TEST_OK`。変更 22 ファイルの
   diff を全行レビュー済み
+- PR #247 は Cloudflare Pages 成功後に squash merge、リモート・ローカル作業ブランチを削除。
+  Issue #233 へ受け入れ条件別の実測値とエッジケースを完了コメント済み
 
 ## 次の一手
 
-- ブランチを push し、`Closes #233` と perf_span 実測値を含む PR を作成する
-- CI 成功後に squash merge + ブランチ削除し、Issue #233 へ実測証拠付き完了コメントを投稿する
 - install は依頼どおり master 側で行うため、この worktree では実行しない
 
 ## 現フェーズで Read すべき設計書
