@@ -1186,6 +1186,29 @@ fn dispatch_inner(
                 "pan_y": state.pan_y,
             }))
         }
+        Request::PreviewOutline { pane, item } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let outline = host.preview_outline(target).ok_or_else(|| {
+                DispatchError::Operation(format!(
+                    "Markdown・PDF プレビューペインではない: {}",
+                    target.as_u64()
+                ))
+            })?;
+            let selected = if let Some(item) = item {
+                Some(
+                    host.navigate_preview_outline(target, item)
+                        .map_err(DispatchError::Operation)?,
+                )
+            } else {
+                None
+            };
+            Ok(json!({
+                "pane": target.as_u64(),
+                "item": item,
+                "selected": selected,
+                "outline": outline.items,
+            }))
+        }
         Request::PreviewReload { enabled } => {
             if let Some(enabled) = enabled {
                 host.set_preview_reload(enabled);
@@ -4514,6 +4537,8 @@ mod tests {
         detached: Vec<u64>,
         previews: std::collections::HashMap<u64, (String, PreviewModeWire)>,
         preview_views: std::collections::HashMap<u64, tako_core::PreviewViewState>,
+        preview_outlines: std::collections::HashMap<u64, tako_core::PreviewOutline>,
+        last_outline_target: Option<tako_core::PreviewOutlineTarget>,
         preview_edits: std::collections::HashMap<u64, (bool, bool, String)>,
         collapsed: std::collections::HashSet<u64>,
         /// ピン留め: (group, id)
@@ -4533,6 +4558,8 @@ mod tests {
                 detached: Vec::new(),
                 previews: std::collections::HashMap::new(),
                 preview_views: std::collections::HashMap::new(),
+                preview_outlines: std::collections::HashMap::new(),
+                last_outline_target: None,
                 preview_edits: std::collections::HashMap::new(),
                 collapsed: std::collections::HashSet::new(),
                 pins: Vec::new(),
@@ -4579,6 +4606,7 @@ mod tests {
             self.detached.push(pane.as_u64());
             self.previews.remove(&pane.as_u64());
             self.preview_views.remove(&pane.as_u64());
+            self.preview_outlines.remove(&pane.as_u64());
             self.preview_edits.remove(&pane.as_u64());
         }
     }
@@ -4647,6 +4675,7 @@ mod tests {
                 return Err("未保存の変更があるため別ファイルを開けない".into());
             }
             self.previews.insert(pane.as_u64(), (path.into(), mode));
+            self.preview_outlines.remove(&pane.as_u64());
             if matches!(mode, PreviewModeWire::Pdf | PreviewModeWire::Image) {
                 self.preview_views
                     .insert(pane.as_u64(), tako_core::PreviewViewState::default());
@@ -4670,6 +4699,22 @@ mod tests {
                 .ok_or_else(|| "ズーム対象のプレビューペインではない".to_string())?;
             state.apply(update)?;
             Ok(*state)
+        }
+        fn preview_outline(&self, pane: PaneId) -> Option<tako_core::PreviewOutline> {
+            self.preview_outlines.get(&pane.as_u64()).cloned()
+        }
+        fn navigate_preview_outline(
+            &mut self,
+            pane: PaneId,
+            item: usize,
+        ) -> Result<tako_core::PreviewOutlineTarget, String> {
+            let target = self
+                .preview_outlines
+                .get(&pane.as_u64())
+                .ok_or_else(|| "アウトラインがない".to_string())?
+                .target(item)?;
+            self.last_outline_target = Some(target);
+            Ok(target)
         }
         fn preview_edit_state(&self, pane: PaneId) -> Option<(bool, bool)> {
             self.previews.get(&pane.as_u64())?;
@@ -5743,6 +5788,66 @@ mod tests {
         assert_eq!(result["page"], 3);
         assert_eq!(result["pan_x"], 24.0);
         assert_eq!(result["pan_y"], 48.0);
+    }
+
+    #[test]
+    fn preview_outlineは一覧取得と一始まり項目ジャンプを共有する() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        host.previews
+            .insert(pane, ("/tmp/a.md".into(), PreviewModeWire::Markdown));
+        host.preview_outlines.insert(
+            pane,
+            tako_core::PreviewOutline::new(vec![
+                tako_core::PreviewOutlineItem {
+                    title: "概要".into(),
+                    level: 1,
+                    target: tako_core::PreviewOutlineTarget::MarkdownBlock { block: 0 },
+                },
+                tako_core::PreviewOutlineItem {
+                    title: "詳細".into(),
+                    level: 2,
+                    target: tako_core::PreviewOutlineTarget::MarkdownBlock { block: 4 },
+                },
+            ]),
+        );
+
+        let listed = dispatch(
+            &mut host,
+            Request::PreviewOutline {
+                pane: Some(pane),
+                item: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(listed["outline"].as_array().map(Vec::len), Some(2));
+        assert_eq!(listed["outline"][1]["title"], "詳細");
+
+        let jumped = dispatch(
+            &mut host,
+            Request::PreviewOutline {
+                pane: Some(pane),
+                item: Some(2),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(jumped["item"], 2);
+        assert_eq!(jumped["selected"]["kind"], "markdown_block");
+        assert_eq!(
+            host.last_outline_target,
+            Some(tako_core::PreviewOutlineTarget::MarkdownBlock { block: 4 })
+        );
+        assert!(dispatch(
+            &mut host,
+            Request::PreviewOutline {
+                pane: Some(pane),
+                item: Some(3),
+            },
+            PaneOrigin::Cli,
+        )
+        .is_err());
     }
 
     #[test]

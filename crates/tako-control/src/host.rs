@@ -6,7 +6,8 @@
 
 use serde_json::Value;
 use tako_core::{
-    PaneId, PreviewViewState, PreviewViewUpdate, SpawnOptions, TabId, TerminalSession, Workspace,
+    PaneId, PreviewOutline, PreviewOutlineTarget, PreviewViewState, PreviewViewUpdate,
+    SpawnOptions, TabId, TerminalSession, Workspace,
 };
 
 /// ピン留め中のプレビュー 1 件分（FR-2.16.15。list / MCP 公開用）。
@@ -218,6 +219,18 @@ pub trait PreviewHost {
         _update: PreviewViewUpdate,
     ) -> Result<PreviewViewState, String> {
         Err("PDF・画像プレビューのズームは未対応".into())
+    }
+    /// ロード時に構築済みの Markdown / PDF アウトライン。
+    fn preview_outline(&self, _pane: PaneId) -> Option<PreviewOutline> {
+        None
+    }
+    /// 1 始まりのアウトライン項目へジャンプする。
+    fn navigate_preview_outline(
+        &mut self,
+        _pane: PaneId,
+        _item: usize,
+    ) -> Result<PreviewOutlineTarget, String> {
+        Err("アウトラインナビゲーションは未対応".into())
     }
     /// 表示中ファイルのライブリロード設定（Issue #233）。
     fn preview_reload_enabled(&self) -> bool {

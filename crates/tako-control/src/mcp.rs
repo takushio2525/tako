@@ -717,6 +717,20 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_preview_outline",
+            "description": "Markdown 見出しまたは PDF 目次のアウトラインを取得し、項目へジャンプする。\
+                item は返却順の 1 始まり。item を省略すると一覧取得だけを行う。Markdown の重複見出しも\
+                別項目として保持され、PDF 項目は PDFKit のリンク先ページへ移動する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象 Markdown・PDF プレビューペイン ID（省略時は呼び出し元）"),
+                    "item": { "type": "integer", "minimum": 1, "description": "ジャンプするアウトライン項目（表示順の 1 始まり）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_preview_reload",
             "description": "表示中プレビューファイルのライブリロードを設定する。enabled 省略時は現在状態を返す。\
                 有効時は外部変更をイベント駆動で検知し、デバウンス後に background で再構築する。\
@@ -2217,6 +2231,10 @@ fn build_request(
             pan_x: f32_arg(args, "pan_x")?,
             pan_y: f32_arg(args, "pan_y")?,
         },
+        "tako_preview_outline" => Request::PreviewOutline {
+            pane: Some(target_pane(args, caller)?),
+            item: u64_arg(args, "item")?.map(|item| item as usize),
+        },
         "tako_preview_reload" => Request::PreviewReload {
             enabled: bool_arg(args, "enabled")?,
         },
@@ -3097,6 +3115,34 @@ mod tests {
     }
 
     #[test]
+    fn preview_outlineは一覧取得と項目ジャンプをrequestへ写す() {
+        let (_, requests) = run(
+            call("tako_preview_outline", json!({ "pane": 7 })),
+            None,
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::PreviewOutline {
+                pane: Some(7),
+                item: None,
+            }]
+        );
+        let (_, requests) = run(
+            call("tako_preview_outline", json!({ "item": 2 })),
+            Some(5),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::PreviewOutline {
+                pane: Some(5),
+                item: Some(2),
+            }]
+        );
+    }
+
+    #[test]
     fn tmux_openはセッション必須でドロップ位置相当を写す() {
         let (_, requests) = run(
             call(
@@ -3186,7 +3232,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 83);
+        assert_eq!(tools.len(), 84);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

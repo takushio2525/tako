@@ -9,10 +9,10 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use tako_control::protocol::PreviewModeWire;
-use tako_core::{SearchHit, TextBuffer};
+use tako_core::{PreviewOutline, PreviewOutlineItem, PreviewOutlineTarget, SearchHit, TextBuffer};
 
 /// 読み込みの上限（巨大ファイルで UI を固めない。超過分は切り詰めて明示する）
 pub(crate) const MAX_BYTES: usize = 1_000_000;
@@ -242,6 +242,9 @@ pub struct PreviewState {
     pub path: PathBuf,
     pub mode: PreviewMode,
     pub content: PreviewContent,
+    /// プレビューロード時に background で一度だけ構築した目次。
+    /// render はこの完成済みデータを参照するだけで再計算しない。
+    pub outline: Arc<PreviewOutline>,
     /// 上限超過で切り詰めたか（フッタで明示する）
     pub truncated: bool,
 }
@@ -331,6 +334,7 @@ pub fn apply_editor_text(preview: &mut PreviewState, edit: &EditState) {
     preview.mode = PreviewMode::Code;
     preview.content =
         PreviewContent::Code(highlighter().highlight(&preview.path, edit.buffer.text()));
+    preview.outline = Arc::new(PreviewOutline::default());
     preview.truncated = false;
 }
 
@@ -352,6 +356,7 @@ impl PreviewState {
             path: path.to_path_buf(),
             mode,
             content: PreviewContent::Error(message.into()),
+            outline: Arc::new(PreviewOutline::default()),
             truncated: false,
         }
     }
@@ -362,6 +367,7 @@ impl PreviewState {
             path: path.to_path_buf(),
             mode,
             content: PreviewContent::Loading,
+            outline: Arc::new(PreviewOutline::default()),
             truncated: false,
         }
     }
@@ -408,6 +414,7 @@ pub fn load_image(path: &Path) -> PreviewState {
             path: path.to_path_buf(),
             mode: PreviewMode::Image,
             content: PreviewContent::Image(ImageData { bytes, format }),
+            outline: Arc::new(PreviewOutline::default()),
             truncated: false,
         },
         Err(e) => PreviewState::error(path, PreviewMode::Image, format!("読み込めない: {e}")),
@@ -428,6 +435,8 @@ pub fn load_pdf_with_key(path: &Path, raster_key: PdfRasterKey) -> PreviewState 
             Ok(rasterized) => {
                 let text_layers = pdf_render::extract_text_layers(path, rasterized.total_pages)
                     .unwrap_or_default();
+                let outline =
+                    pdf_render::extract_outline(path, rasterized.total_pages).unwrap_or_default();
                 PreviewState {
                     path: path.to_path_buf(),
                     mode: PreviewMode::Pdf,
@@ -439,6 +448,7 @@ pub fn load_pdf_with_key(path: &Path, raster_key: PdfRasterKey) -> PreviewState 
                         raster_key,
                         pixel_sizes: rasterized.pixel_sizes,
                     }),
+                    outline: Arc::new(outline),
                     truncated: false,
                 }
             }
@@ -491,6 +501,7 @@ pub fn load_video(path: &Path) -> PreviewState {
             codec,
             file_size,
         }),
+        outline: Arc::new(PreviewOutline::default()),
         truncated: false,
     }
 }
@@ -651,6 +662,7 @@ fn video_thumbnail(path: &Path, duration: Option<f64>) -> Vec<u8> {
 #[cfg(target_os = "macos")]
 mod pdf_render {
     use std::path::Path;
+    use tako_core::{PreviewOutline, PreviewOutlineItem, PreviewOutlineTarget};
 
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
@@ -1090,36 +1102,111 @@ mod pdf_render {
         )
     }
 
+    unsafe fn open_pdfkit_document(path: &Path) -> Result<*const core::ffi::c_void, String> {
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| "パスが UTF-8 でない".to_string())?;
+        let ns_path = make_cfstring(path_str);
+        if ns_path.is_null() {
+            return Err("CFString 生成失敗".into());
+        }
+        let nsurl = msg_id(cls("NSURL"), sel_name("fileURLWithPath:"), ns_path);
+        CFRelease(ns_path);
+        if nsurl.is_null() {
+            return Err("NSURL 生成失敗".into());
+        }
+        let pdf_doc_alloc = msg_no_arg(cls("PDFDocument"), sel_name("alloc"));
+        if pdf_doc_alloc.is_null() {
+            return Err("PDFDocument alloc 失敗".into());
+        }
+        let pdf_doc = msg_id(pdf_doc_alloc, sel_name("initWithURL:"), nsurl);
+        if pdf_doc.is_null() {
+            return Err("PDFDocument initWithURL: 失敗".into());
+        }
+        Ok(pdf_doc)
+    }
+
+    unsafe fn msg_index_for_page(
+        document: *const core::ffi::c_void,
+        page: *const core::ffi::c_void,
+    ) -> usize {
+        let f: unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+        ) -> usize = std::mem::transmute(objc_msgSend as *const core::ffi::c_void);
+        f(document, sel_name("indexForPage:"), page)
+    }
+
+    /// PDFKit の PDFOutline ツリーを平坦なクリック可能目次へ変換する。
+    /// ページを持たないグループ見出しは子だけを辿り、ジャンプ不能な行は UI に出さない。
+    pub fn extract_outline(path: &Path, total_pages: usize) -> Result<PreviewOutline, String> {
+        const MAX_OUTLINE_ITEMS: usize = 5_000;
+        const MAX_OUTLINE_DEPTH: u8 = 32;
+
+        unsafe fn collect(
+            document: *const core::ffi::c_void,
+            parent: *const core::ffi::c_void,
+            level: u8,
+            total_pages: usize,
+            items: &mut Vec<PreviewOutlineItem>,
+        ) {
+            if parent.is_null() || level > MAX_OUTLINE_DEPTH || items.len() >= MAX_OUTLINE_ITEMS {
+                return;
+            }
+            let child_count = msg_no_arg(parent, sel_name("numberOfChildren")) as usize;
+            for index in 0..child_count {
+                if items.len() >= MAX_OUTLINE_ITEMS {
+                    break;
+                }
+                let child = msg_usize(parent, sel_name("childAtIndex:"), index);
+                if child.is_null() {
+                    continue;
+                }
+                let label = nsstring_to_rust(msg_no_arg(child, sel_name("label")))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let destination = msg_no_arg(child, sel_name("destination"));
+                if !label.is_empty() && !destination.is_null() {
+                    let page = msg_no_arg(destination, sel_name("page"));
+                    if !page.is_null() {
+                        let page_index = msg_index_for_page(document, page);
+                        if page_index < total_pages {
+                            items.push(PreviewOutlineItem {
+                                title: label,
+                                level,
+                                target: PreviewOutlineTarget::PdfPage {
+                                    page: page_index + 1,
+                                },
+                            });
+                        }
+                    }
+                }
+                collect(document, child, level.saturating_add(1), total_pages, items);
+            }
+        }
+
+        unsafe {
+            let document = open_pdfkit_document(path)?;
+            let root = msg_no_arg(document, sel_name("outlineRoot"));
+            let mut items = Vec::new();
+            if !root.is_null() {
+                collect(document, root, 1, total_pages, &mut items);
+            }
+            msg_no_arg(document, sel_name("release"));
+            Ok(PreviewOutline::new(items))
+        }
+    }
+
     /// PDFKit を使ってテキストレイヤを抽出する。
     /// 各ページのテキストを行に分割し、行ごとの PDF 座標バウンディングボックスを取得する。
     pub fn extract_text_layers(
         path: &Path,
         total_pages: usize,
     ) -> Result<Vec<Vec<super::PdfTextLine>>, String> {
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| "パスが UTF-8 でない".to_string())?;
         unsafe {
-            // NSURL.fileURLWithPath:
-            let ns_path = make_cfstring(path_str);
-            if ns_path.is_null() {
-                return Err("CFString 生成失敗".into());
-            }
-            let nsurl = msg_id(cls("NSURL"), sel_name("fileURLWithPath:"), ns_path);
-            CFRelease(ns_path);
-            if nsurl.is_null() {
-                return Err("NSURL 生成失敗".into());
-            }
-
-            // PDFDocument.alloc.initWithURL:
-            let pdf_doc_alloc = msg_no_arg(cls("PDFDocument"), sel_name("alloc"));
-            if pdf_doc_alloc.is_null() {
-                return Err("PDFDocument alloc 失敗".into());
-            }
-            let pdf_doc = msg_id(pdf_doc_alloc, sel_name("initWithURL:"), nsurl);
-            if pdf_doc.is_null() {
-                return Err("PDFDocument initWithURL: 失敗".into());
-            }
+            let pdf_doc = open_pdfkit_document(path)?;
 
             let mut result = Vec::with_capacity(total_pages);
             for page_idx in 0..total_pages {
@@ -1232,22 +1319,30 @@ pub fn load(path: &Path, mode: PreviewMode) -> PreviewState {
         Ok(pair) => pair,
         Err(message) => return PreviewState::error(path, mode, message),
     };
-    let content = match mode {
-        PreviewMode::Markdown => PreviewContent::Markdown(markdown_blocks(&text)),
-        PreviewMode::Code => PreviewContent::Code(highlighter().highlight(path, &text)),
+    let (content, outline) = match mode {
+        PreviewMode::Markdown => {
+            let (blocks, outline) = markdown_document(&text);
+            (PreviewContent::Markdown(blocks), outline)
+        }
+        PreviewMode::Code => (
+            PreviewContent::Code(highlighter().highlight(path, &text)),
+            PreviewOutline::default(),
+        ),
         PreviewMode::Image | PreviewMode::Pdf | PreviewMode::Video => unreachable!(),
     };
     PreviewState {
         path: path.to_path_buf(),
         mode,
         content,
+        outline: Arc::new(outline),
         truncated,
     }
 }
 
 /// 高速ロード（UI スレッド用）: ファイルを読むが syntect ハイライトはスキップする。
 /// Code モードは平文（色なし）を返し、呼び出し側が background で [`highlight_text`] を
-/// 走らせて差し替える。Markdown は pulldown-cmark が十分速いのでそのまま完成版を返す。
+/// 走らせて差し替える。Markdown の初回ロードは Issue #232 以降、本文と目次を同時に
+/// background で完成させるため、本番の set_preview からはこの関数を呼ばない。
 /// Image / Pdf モードは専用ローダーに委譲する。
 /// 戻り値の `Option<String>` は Code モードの生テキスト（background ハイライト用）
 pub fn load_fast(path: &Path, mode: PreviewMode) -> (PreviewState, Option<String>) {
@@ -1263,11 +1358,18 @@ pub fn load_fast(path: &Path, mode: PreviewMode) -> (PreviewState, Option<String
             return (PreviewState::error(path, mode, message), None);
         }
     };
-    let (content, raw) = match mode {
-        PreviewMode::Markdown => (PreviewContent::Markdown(markdown_blocks(&text)), None),
+    let (content, outline, raw) = match mode {
+        PreviewMode::Markdown => {
+            let (blocks, outline) = markdown_document(&text);
+            (PreviewContent::Markdown(blocks), outline, None)
+        }
         PreviewMode::Code => {
             let lines = text.lines().map(|l| vec![plain_span(l)]).collect();
-            (PreviewContent::Code(lines), Some(text))
+            (
+                PreviewContent::Code(lines),
+                PreviewOutline::default(),
+                Some(text),
+            )
         }
         PreviewMode::Image | PreviewMode::Pdf | PreviewMode::Video => unreachable!(),
     };
@@ -1276,6 +1378,7 @@ pub fn load_fast(path: &Path, mode: PreviewMode) -> (PreviewState, Option<String
             path: path.to_path_buf(),
             mode,
             content,
+            outline: Arc::new(outline),
             truncated,
         },
         raw,
@@ -1310,9 +1413,15 @@ pub fn load_for_reload(
                     };
                 }
             };
-            let content = match mode {
-                PreviewMode::Code => PreviewContent::Code(highlighter().highlight(path, &text)),
-                PreviewMode::Markdown => PreviewContent::Markdown(markdown_blocks(&text)),
+            let (content, outline) = match mode {
+                PreviewMode::Code => (
+                    PreviewContent::Code(highlighter().highlight(path, &text)),
+                    PreviewOutline::default(),
+                ),
+                PreviewMode::Markdown => {
+                    let (blocks, outline) = markdown_document(&text);
+                    (PreviewContent::Markdown(blocks), outline)
+                }
                 _ => unreachable!(),
             };
             (
@@ -1320,6 +1429,7 @@ pub fn load_for_reload(
                     path: path.to_path_buf(),
                     mode,
                     content,
+                    outline: Arc::new(outline),
                     truncated,
                 },
                 (!truncated).then_some(source),
@@ -1508,8 +1618,8 @@ impl Highlighter for SyntectHighlighter {
 }
 
 /// Markdown をブロック列へパースする（FR-3.3）。表など未対応の構造は
-/// テキストとして段落へ劣化させ、内容を落とさない
-pub fn markdown_blocks(text: &str) -> Vec<MdBlock> {
+/// テキストとして段落へ劣化させ、内容を落とさない。
+fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
     use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
     let mut options = Options::empty();
@@ -1679,6 +1789,39 @@ pub fn markdown_blocks(text: &str) -> Vec<MdBlock> {
     blocks
 }
 
+/// Markdown 本文とアウトラインを 1 回のロードで完成させる（Issue #232）。
+/// アウトラインの対象は描画ブロック番号なので、クリック時に再パースせず直接スクロールできる。
+fn markdown_document(text: &str) -> (Vec<MdBlock>, PreviewOutline) {
+    let blocks = parse_markdown_blocks(text);
+    let items = blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(block, entry)| {
+            let MdBlock::Heading { level, spans } = entry else {
+                return None;
+            };
+            let title = spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+                .trim()
+                .to_string();
+            (!title.is_empty()).then_some(PreviewOutlineItem {
+                title,
+                level: *level,
+                target: PreviewOutlineTarget::MarkdownBlock { block },
+            })
+        })
+        .collect();
+    (blocks, PreviewOutline::new(items))
+}
+
+/// Markdown ブロックだけを必要とする既存のテスト・補助経路。
+#[cfg(test)]
+pub fn markdown_blocks(text: &str) -> Vec<MdBlock> {
+    parse_markdown_blocks(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1757,6 +1900,29 @@ mod tests {
             .iter()
             .any(|b| matches!(b, MdBlock::CodeBlock { lines } if !lines.is_empty())));
         assert!(blocks.iter().any(|b| matches!(b, MdBlock::Rule)));
+    }
+
+    #[test]
+    fn markdownアウトラインは重複見出しを別位置へ保持する() {
+        let (blocks, outline) =
+            markdown_document("# 概要\n\n本文\n\n## 詳細\n\n説明\n\n## 詳細\n\n再掲\n");
+        assert_eq!(blocks.len(), 6);
+        assert_eq!(outline.items.len(), 3);
+        assert_eq!(outline.items[0].title, "概要");
+        assert_eq!(outline.items[0].level, 1);
+        assert_eq!(
+            outline.items[0].target,
+            PreviewOutlineTarget::MarkdownBlock { block: 0 }
+        );
+        assert_eq!(outline.items[1].title, "詳細");
+        assert_eq!(outline.items[2].title, "詳細");
+        assert_ne!(outline.items[1].target, outline.items[2].target);
+    }
+
+    #[test]
+    fn markdown見出しなしは空アウトラインになる() {
+        let (_, outline) = markdown_document("本文だけ\n\n- 項目\n");
+        assert!(outline.is_empty());
     }
 
     #[test]
