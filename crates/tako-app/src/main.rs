@@ -9124,7 +9124,7 @@ impl TakoApp {
                             .items_center()
                             .gap(px(4.0))
                             // failed: 再実行ボタン
-                            .when(is_failed, |d| {
+                            .when(is_failed && !hv.more_menu, |d| {
                                 d.child(
                                     div()
                                         .id(("pane-retry", pane_id.as_u64()))
@@ -9233,43 +9233,83 @@ impl TakoApp {
                                         ),
                                 )
                             })
-                            // 閉じるボタン（常に表示。hover で赤）
-                            .child(
-                                div()
-                                    .id(("pane-close", pane_id.as_u64()))
-                                    .w(px(18.0))
-                                    .h(px(18.0))
-                                    .flex()
-                                    .flex_none()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(5.0))
-                                    .cursor_pointer()
-                                    .hover(|d| d.bg(rgba_alpha(theme.red, 0.25)))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                                            cx.stop_propagation()
-                                        }),
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, event: &gpui::ClickEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            this.close_pane_with_confirm(
-                                                pane_id,
-                                                event.modifiers().platform,
-                                                cx,
-                                            );
-                                        },
-                                    ))
-                                    .child(
-                                        svg()
-                                            .path(crate::file_icons::ui_icon::CLOSE)
-                                            .w(px(13.0))
-                                            .h(px(13.0))
-                                            .text_color(hsla(theme.text_muted)),
-                                    ),
-                            ),
+                            // #229: 狭幅時は「...」メニューに bg/close を集約
+                            .when(hv.more_menu, |d| {
+                                d.child(
+                                    div()
+                                        .id(("pane-more", pane_id.as_u64()))
+                                        .w(px(18.0))
+                                        .h(px(18.0))
+                                        .flex()
+                                        .flex_none()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(5.0))
+                                        .cursor_pointer()
+                                        .hover(|d| d.bg(rgba(theme.surface_highlight)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                move |this, event: &MouseDownEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.pane_context_menu =
+                                                        Some(PaneContextMenu {
+                                                            pane: pane_id,
+                                                            kind: PaneContextKind::Terminal,
+                                                            position: event.position,
+                                                        });
+                                                    cx.notify();
+                                                },
+                                            ),
+                                        )
+                                        .child(
+                                            svg()
+                                                .path(crate::file_icons::ui_icon::MORE)
+                                                .w(px(13.0))
+                                                .h(px(13.0))
+                                                .text_color(hsla(theme.text_muted)),
+                                        ),
+                                )
+                            })
+                            // 閉じるボタン（more_menu でないとき表示。hover で赤）
+                            .when(hv.close_button, |d| {
+                                d.child(
+                                    div()
+                                        .id(("pane-close", pane_id.as_u64()))
+                                        .w(px(18.0))
+                                        .h(px(18.0))
+                                        .flex()
+                                        .flex_none()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(5.0))
+                                        .cursor_pointer()
+                                        .hover(|d| d.bg(rgba_alpha(theme.red, 0.25)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation()
+                                            }),
+                                        )
+                                        .on_click(cx.listener(
+                                            move |this, event: &gpui::ClickEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                this.close_pane_with_confirm(
+                                                    pane_id,
+                                                    event.modifiers().platform,
+                                                    cx,
+                                                );
+                                            },
+                                        ))
+                                        .child(
+                                            svg()
+                                                .path(crate::file_icons::ui_icon::CLOSE)
+                                                .w(px(13.0))
+                                                .h(px(13.0))
+                                                .text_color(hsla(theme.text_muted)),
+                                        ),
+                                )
+                            }),
                     ),
             )
             // 子ワーカードロップダウン（カンプ: w282 / radius 9。ヘッダ下に絶対配置）
