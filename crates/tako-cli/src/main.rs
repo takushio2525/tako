@@ -1999,19 +1999,55 @@ fn orchestrator_watch(
         initial_delay: std::time::Duration::ZERO,
         interval: std::time::Duration::from_secs(5),
     };
-    match wait::wait_for_worker(&mut exec, &opts, None) {
+    let outcome = wait::wait_for_worker(&mut exec, &opts, None);
+
+    // #243: Idle / Error 確定後に events を取得して補助行に出力する。
+    // wait_for_worker の最終ポーリング結果から events を構築するため、
+    // 完了後に worker_status を 1 回追加で取得する
+    let print_events = |exec: &mut dyn FnMut(Request) -> Result<serde_json::Value, String>| {
+        if let Ok(val) = exec(Request::OrchestratorWorkerStatus {
+            pane_id: pane,
+            session_id: session_id.map(|s| s.to_string()),
+            tmux_session: tmux_session.map(|s| s.to_string()),
+        }) {
+            if let Some(events) = val["events"].as_array() {
+                for ev in events {
+                    if let Some(kind) = ev["kind"].as_str() {
+                        let mut parts = vec![format!("  event: {kind}")];
+                        if let Some(from) = ev["from"].as_str() {
+                            parts.push(format!("from={from}"));
+                        }
+                        if let Some(to) = ev["to"].as_str() {
+                            parts.push(format!("to={to}"));
+                        }
+                        if let Some(pct) = ev["percent"].as_u64() {
+                            parts.push(format!("percent={pct}"));
+                        }
+                        println!("{}", parts.join(" "));
+                    }
+                }
+            }
+        }
+    };
+
+    match outcome {
         wait::WatchOutcome::Idle {
             ctx_percent: Some(pct),
-        } => println!("WORKER_IDLE: tako:{pane} (ctx {pct}%)"),
-        wait::WatchOutcome::Idle { .. } => println!("WORKER_IDLE: tako:{pane}"),
+        } => {
+            println!("WORKER_IDLE: tako:{pane} (ctx {pct}%)");
+            print_events(&mut exec);
+        }
+        wait::WatchOutcome::Idle { .. } => {
+            println!("WORKER_IDLE: tako:{pane}");
+            print_events(&mut exec);
+        }
         wait::WatchOutcome::Error { kind, detail } => {
-            // 1 行目は Issue #157 指定の形式。detail / action は master が
-            // read_pane 無しでも一次判断できるための補助行
             println!("WORKER_ERROR: tako:{pane} ({})", kind.as_str());
             if !detail.is_empty() {
                 println!("  detail: {detail}");
             }
             println!("  action: {}", kind.recommended_action());
+            print_events(&mut exec);
         }
         wait::WatchOutcome::Stalled { detail } => {
             println!("WORKER_STALLED: tako:{pane}");

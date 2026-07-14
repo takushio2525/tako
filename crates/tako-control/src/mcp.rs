@@ -1164,6 +1164,10 @@ pub fn tools() -> Vec<Value> {
                 error 時は応答の error オブジェクトに kind（api_error = 続行指示で復帰可 / \
                 usage_limit = 解除時刻まで待つ / limit_dialog = モデル切替等のダイアログに応答）と \
                 detail（検知した画面上の行）、recommended_action（resume / wait_reset / respond_dialog）が入る。\
+                events 配列に直近の検知イベントが入る（#243）: \
+                question = worker が質問中（idle 時のみ。画面末尾に ? 終端行・選択肢・Should I 等のパターン）/ \
+                model_switched = 自動モデル切替が発生（from/to つき。limit reached, now using ... の検知）/ \
+                context_high = ctx 使用率が 60% 超（percent つき。handoff やセーフティコミットの判断材料）。\
                 session_id を省略しても pane→session の自動解決（pid 祖先辿り）で claude agents --json の \
                 正確な status を取得する（status_source が agents-auto になる）。自動解決失敗時のみ \
                 画面パターン推定にフォールバック（status_source が screen）。\
