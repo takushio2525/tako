@@ -80,7 +80,7 @@ fn claude_resume_command(
 }
 
 /// タブバーの高さ（px）
-const TAB_BAR_HEIGHT: f32 = 40.0;
+const TAB_BAR_HEIGHT: f32 = 44.0;
 /// ペイン枠線の太さ（px）
 const PANE_BORDER: f32 = 1.0;
 /// ペイン内側の余白（px。デザインスペック: 12–14px content padding）
@@ -4381,6 +4381,32 @@ impl TakoApp {
             self.remove_pane(pane_id, cx); // 最後の 1 ペイン → タブごと畳まれる
         }
         self.sync_filetree_roots();
+        cx.notify();
+    }
+
+    /// UI テーマのライト/ダーク反転（Issue #217。タブバーのテーマボタン用。
+    /// dispatch::Theme と同じ状態遷移 + settings 永続化で UI / AI 操作の等価性を保つ）
+    pub(crate) fn toggle_theme(&mut self, cx: &mut Context<Self>) {
+        use tako_core::theme::ThemeMode;
+        let next = match self.theme.mode {
+            ThemeMode::Dark => ThemeMode::Light,
+            ThemeMode::Light => ThemeMode::Dark,
+        };
+        self.theme = Theme::for_mode(next);
+        // セルフテスト中はユーザー設定を汚さない（dispatch 側と同方針）
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.theme = next.as_str().into();
+            if let Err(e) = tako_control::settings::save(&settings) {
+                eprintln!("warning: 設定を保存できない: {e}");
+            }
+        }
+        cx.notify();
+    }
+
+    /// ⌘K コマンドパレットを開く（#217 カンプの検索エントリ。本体は M6 で実装）
+    pub(crate) fn open_command_palette(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        // TODO(#217 M6): コマンドパレット本体（ペイン・コマンド検索）を実装する
         cx.notify();
     }
 
@@ -10322,6 +10348,17 @@ fn app_menus() -> Vec<gpui::Menu> {
     ]
 }
 
+/// カンプ準拠のタイトルバー統合設定（#217。タブバー行に traffic lights を同居させる）
+fn tako_titlebar_options() -> gpui::TitlebarOptions {
+    gpui::TitlebarOptions {
+        title: Some("tako".into()),
+        // システムタイトルバーを透過し、タブバー（44px）を最上段に置く
+        appears_transparent: true,
+        // 12px のライトをタブバー縦中央へ（(44-12)/2 = 16。カンプ padding-left 16）
+        traffic_light_position: Some(point(px(16.), px(16.))),
+    }
+}
+
 fn open_new_window(cx: &mut App) {
     let _ = cx
         .open_window(
@@ -10331,6 +10368,7 @@ fn open_new_window(cx: &mut App) {
                     size(px(960.), px(600.)),
                     cx,
                 ))),
+                titlebar: Some(tako_titlebar_options()),
                 ..Default::default()
             },
             |window, cx| {
@@ -10475,6 +10513,7 @@ fn main() {
                 .open_window(
                     WindowOptions {
                         window_bounds: Some(window_bounds),
+                        titlebar: Some(tako_titlebar_options()),
                         ..Default::default()
                     },
                     |window, cx| {

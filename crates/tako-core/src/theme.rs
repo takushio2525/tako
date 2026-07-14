@@ -224,7 +224,7 @@ impl Theme {
             // UI クローム
             pane_border: Rgb::from_hex(0x2a2b3c), // border_default に合わせた
             tab_bar_background: Rgb::from_hex(0x181825), // Mantle（旧 Crust→スペック準拠）
-            tab_active_background: Rgb::from_hex(0x1e1e2e),
+            tab_active_background: Rgb::from_hex(0x26273a), // カンプのピル型 active タブ面（#217）
             tab_active_foreground: Rgb::from_hex(0xcdd6f4),
             tab_inactive_foreground: Rgb::from_hex(0x6c7086),
 
@@ -307,7 +307,7 @@ impl Theme {
             // UI クローム
             pane_border: Rgb::from_hex(0xcfd4de),
             tab_bar_background: Rgb::from_hex(0xe6e9ef), // Mantle
-            tab_active_background: Rgb::from_hex(0xeff1f5),
+            tab_active_background: Rgb::from_hex(0xd5d9e2), // ピル型 active タブ面（ダークと同相対）
             tab_active_foreground: Rgb::from_hex(0x4c4f69),
             tab_inactive_foreground: Rgb::from_hex(0x8c8fa1),
 
