@@ -6,7 +6,7 @@
 
 ## 現在の対象（2026-07-14・#231 / #234 PDF 品質改善 + PDF・画像ズーム）
 
-**3 マイルストーン実装済み、全体検証・PR 前**（worktree `tako-wt-231` / `fix/231-234-pdf-quality-zoom`）:
+**3 マイルストーン実装・main 統合後の全体検証済み、push / PR 前**（worktree `tako-wt-231` / `fix/231-234-pdf-quality-zoom`）:
 
 - #231: PDF 行間・余白のヒットテストを `None` にし、ドラッグ全文選択を防止。UTF-8 座標テスト追加
 - #231: device scale × zoom × 表示幅の `PdfRasterKey`、background 再ラスタライズ、
@@ -17,12 +17,14 @@
   `tako_preview_view`（75 ツール）を 1:1 実装。3 ページ目 + 150% の変換テストあり
 - 隔離実機: PDF 100/150%、2 ページ目、パン、リセット、画像 100/200%、行間ドラッグ、
   150% 選択ハイライトを確認。render p50 1ms / p99 2ms / max 4ms
+- `origin/main`（#21 / #229、`6af2d47`）を競合なしで rebase。統合後も workspace
+  build / fmt --check / clippy -D warnings / test 全緑
+  （app 83・CLI 22・control 362・core 249 passed）。隔離セルフテストは
+  `TAKO_APP_SELF_TEST_OK`、PDF 150% は raster key 150 + hit `(0, 0)` を実描画で確認
 
 ## 次の一手
 
-- #234 マイルストーンコミット
-- workspace build / fmt / clippy / test + `TAKO_ISOLATED=1` セルフテスト
-- origin/main 取り込み、push、PR（Closes #231 / #234）、CI 後 squash merge
+- push、PR（Closes #231 / #234）、CI 後 squash merge
 - 両 Issue に実測値・安全に切り出したスクショ・目視チェックリストをコメント
 
 ## 現フェーズで Read すべき設計書

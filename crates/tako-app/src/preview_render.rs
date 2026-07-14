@@ -994,25 +994,14 @@ impl TakoApp {
                                 if img_w <= 0.0 || img_h <= 0.0 {
                                     return;
                                 }
+                                let page_line_bounds: Vec<Bounds<Pixels>> = text_lines_for_canvas
+                                    .iter()
+                                    .map(|line| {
+                                        pdf_box_to_screen(line.bbox, [pdf_w, pdf_h], bounds)
+                                    })
+                                    .collect();
                                 let mut page_char_bounds: Vec<Vec<Bounds<Pixels>>> =
                                     Vec::with_capacity(text_lines_for_canvas.len());
-
-                                // bounds 追跡: 各行の画面座標を preview_line_bounds に登録
-                                if let Some(e) = entity.upgrade() {
-                                    e.update(cx, |app, _| {
-                                        let list =
-                                            app.preview_line_bounds.entry(pane_id).or_default();
-                                        for (j, tl) in text_lines_for_canvas.iter().enumerate() {
-                                            let idx = page_line_offset + j;
-                                            if list.len() <= idx {
-                                                list.resize(idx + 1, Bounds::default());
-                                            }
-                                            list[idx] =
-                                                pdf_box_to_screen(tl.bbox, [pdf_w, pdf_h], bounds);
-                                        }
-                                    });
-                                }
-
                                 for tl in text_lines_for_canvas.iter() {
                                     let mut line_char_bounds =
                                         Vec::with_capacity(tl.char_boxes.len());
@@ -1027,26 +1016,46 @@ impl TakoApp {
                                 }
 
                                 if let Some(e) = entity.upgrade() {
-                                    e.update(cx, |app, cx| {
-                                        let list =
-                                            app.preview_pdf_char_bounds.entry(pane_id).or_default();
-                                        let mut changed = false;
-                                        for (j, line_bounds) in page_char_bounds.iter().enumerate()
-                                        {
-                                            let idx = page_line_offset + j;
-                                            if list.len() <= idx {
-                                                list.resize(idx + 1, Vec::new());
+                                    // canvas paint は root entity の更新サイクル内から呼ばれる場合が
+                                    // ある。即時 e.update は GPUI の再入更新になるため、行・文字の
+                                    // 座標反映を effect cycle 末尾へ 1 回だけ defer する。
+                                    cx.defer(move |cx| {
+                                        e.update(cx, |app, cx| {
+                                            let lines =
+                                                app.preview_line_bounds.entry(pane_id).or_default();
+                                            for (j, line_bounds) in
+                                                page_line_bounds.iter().enumerate()
+                                            {
+                                                let idx = page_line_offset + j;
+                                                if lines.len() <= idx {
+                                                    lines.resize(idx + 1, Bounds::default());
+                                                }
+                                                lines[idx] = *line_bounds;
                                             }
-                                            if list[idx] != *line_bounds {
-                                                list[idx] = line_bounds.clone();
-                                                changed = true;
+
+                                            let chars = app
+                                                .preview_pdf_char_bounds
+                                                .entry(pane_id)
+                                                .or_default();
+                                            let mut changed = false;
+                                            for (j, line_bounds) in
+                                                page_char_bounds.iter().enumerate()
+                                            {
+                                                let idx = page_line_offset + j;
+                                                if chars.len() <= idx {
+                                                    chars.resize(idx + 1, Vec::new());
+                                                }
+                                                if chars[idx] != *line_bounds {
+                                                    chars[idx] = line_bounds.clone();
+                                                    changed = true;
+                                                }
                                             }
-                                        }
-                                        if changed {
-                                            // リサイズ / スクロール後は次フレームで最前面の
-                                            // ハイライト矩形を新しい座標へ追従させる。
-                                            cx.notify();
-                                        }
+                                            if changed {
+                                                // リサイズ / スクロール後は次フレームで最前面の
+                                                // ハイライト矩形を新しい座標へ追従させる。
+                                                cx.notify();
+                                            }
+                                        });
                                     });
                                 }
                             },
@@ -2144,8 +2153,12 @@ impl TakoApp {
                     } else {
                         CursorStyle::IBeam
                     })
-                    .on_pinch(cx.listener(move |this, event: &gpui::PinchEvent, _, cx| {
-                        if zoomable {
+                    // 非ズーム対象へリスナー自体を登録すると、セルフテストの
+                    // dispatch_event が root update 中に listener update を再入させる。
+                    // Image / PDF にだけイベント経路を載せる。
+                    .when(zoomable, |d| {
+                        d.on_pinch(cx.listener(
+                            move |this, event: &gpui::PinchEvent, _, cx| {
                             let current = this
                                 .preview_views
                                 .get(&pane_id)
@@ -2160,11 +2173,11 @@ impl TakoApp {
                                 cx,
                             );
                             cx.stop_propagation();
-                        }
-                    }))
-                    .on_scroll_wheel(cx.listener(
-                        move |this, event: &ScrollWheelEvent, _, cx| {
-                            if zoomable && (event.modifiers.platform || event.modifiers.control) {
+                        },
+                        ))
+                        .on_scroll_wheel(cx.listener(
+                            move |this, event: &ScrollWheelEvent, _, cx| {
+                                if event.modifiers.platform || event.modifiers.control {
                                 let delta = match event.delta {
                                     ScrollDelta::Pixels(delta) => f32::from(delta.y),
                                     ScrollDelta::Lines(delta) => delta.y * 20.0,
@@ -2188,8 +2201,9 @@ impl TakoApp {
                                 );
                                 cx.stop_propagation();
                             }
-                        },
-                    ))
+                            },
+                        ))
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, ev: &MouseDownEvent, _, cx| {

@@ -15814,9 +15814,15 @@ mod self_test {
                 "PDF の page + zoom を dispatch で同時指定できる",
             );
             let mut zoom_coordinates_ok = false;
-            for _ in 0..30 {
+            let mut zoom_coordinate_record = String::new();
+            for _ in 0..60 {
+                // refresh/notify は次フレームを要求するだけなので、ラスタ完了後の canvas
+                // 座標まで同期するには root entity を借用しない draw を明示する。
+                let _ = any.update(cx, |_, preview_window, cx| {
+                    preview_window.draw(cx).clear()
+                });
                 wait(cx, 100).await;
-                zoom_coordinates_ok = window
+                let observation = window
                     .update(cx, |app, preview_window, cx| {
                         preview_window.refresh();
                         cx.notify();
@@ -15840,15 +15846,21 @@ mod self_test {
                                     point(bounds.left() + px(1.0), bounds.center().y),
                                 )
                             });
-                        zoom == Some(1.5)
-                            && raster_zoom == Some(150)
-                            && hit == Some(Some((0, 0)))
+                        (zoom, raster_zoom, hit)
                     })
-                    .unwrap_or(false);
+                    .unwrap_or((None, None, None));
+                zoom_coordinates_ok = observation.0 == Some(1.5)
+                    && observation.1 == Some(150)
+                    && observation.2 == Some(Some((0, 0)));
+                zoom_coordinate_record = format!(
+                    "zoom={:?} raster_zoom={:?} hit={:?}",
+                    observation.0, observation.1, observation.2
+                );
                 if zoom_coordinates_ok {
                     break;
                 }
             }
+            println!("TAKO_PREVIEW_COORD: pdf zoom {zoom_coordinate_record}");
             check(
                 zoom_coordinates_ok,
                 "PDF 150% の再ラスタライズ後も文字座標が画像へ追従する",
