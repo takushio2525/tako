@@ -6,7 +6,7 @@
 
 ## 現在の対象（2026-07-14・#231 / #234 PDF 品質改善 + PDF・画像ズーム）
 
-**3 マイルストーン実装・main 統合後の全体検証済み、push / PR 前**（worktree `tako-wt-231` / `fix/231-234-pdf-quality-zoom`）:
+**実装・検証・squash merge・Issue 報告まで完了**（PR #240 / merge `22f1d23`）:
 
 - #231: PDF 行間・余白のヒットテストを `None` にし、ドラッグ全文選択を防止。UTF-8 座標テスト追加
 - #231: device scale × zoom × 表示幅の `PdfRasterKey`、background 再ラスタライズ、
@@ -24,11 +24,14 @@
   build / fmt --check / clippy -D warnings / test 全緑
   （app 83・CLI 22・control 362・core 249 passed）。隔離セルフテストは
   `TAKO_APP_SELF_TEST_OK`、PDF 150% は raster key 150 + hit `(0, 0)`、pinch 増減を実描画で確認
+- PR #240 は Cloudflare Pages 成功後に squash merge、作業ブランチ削除済み。#231 / #234 は closed、
+  実測値と目視チェックリストを各 Issue へコメント済み
 
 ## 次の一手
 
-- push、PR（Closes #231 / #234）、CI 後 squash merge
-- 両 Issue に実測値・安全に切り出したスクショ・目視チェックリストをコメント
+- install は依頼どおり master 側で行うため、この worktree では実行しない
+- 安全に切り出した before / after PNG は目視確認済みだが、GitHub Web が未ログインかつ
+  CLI の Issue API はバイナリ添付非対応のため未添付。検証画像を git へ入れない規約を優先
 
 ## 現フェーズで Read すべき設計書
 
