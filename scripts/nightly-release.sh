@@ -52,7 +52,34 @@ notify() {
 
 # ---- launchd 登録 / 解除 ------------------------------------------------
 
+# worktree 検出: 一時 worktree なら本体リポのパスを返す（#205 再発防止）
+resolve_main_repo() {
+  local git_dir git_common_dir
+  git_dir=$(git rev-parse --git-dir 2>/dev/null) || { echo "$REPO_ROOT"; return; }
+  git_common_dir=$(git rev-parse --git-common-dir 2>/dev/null) || { echo "$REPO_ROOT"; return; }
+  [[ "$git_dir" = /* ]] || git_dir="$REPO_ROOT/$git_dir"
+  [[ "$git_common_dir" = /* ]] || git_common_dir="$REPO_ROOT/$git_common_dir"
+  git_dir=$(cd "$git_dir" && pwd -P)
+  git_common_dir=$(cd "$git_common_dir" && pwd -P)
+  if [[ "$git_dir" != "$git_common_dir" ]]; then
+    dirname "$git_common_dir"
+  else
+    echo "$REPO_ROOT"
+  fi
+}
+
 install_launchd() {
+  local install_root
+  install_root=$(resolve_main_repo)
+
+  if [[ "$install_root" != "$REPO_ROOT" ]]; then
+    if [[ ! -x "$install_root/scripts/nightly-release.sh" ]]; then
+      echo "ERROR: 一時 worktree から実行されましたが、本体リポ ($install_root) に scripts/nightly-release.sh が見つかりません" >&2
+      exit 1
+    fi
+    echo "NOTE: 一時 worktree を検出。本体リポのパスで登録します: $install_root"
+  fi
+
   mkdir -p "$(dirname "$PLIST")"
   cat > "$PLIST" <<PLIST_END
 <?xml version="1.0" encoding="UTF-8"?>
@@ -64,7 +91,7 @@ install_launchd() {
 	<key>ProgramArguments</key>
 	<array>
 		<string>/bin/bash</string>
-		<string>$REPO_ROOT/scripts/nightly-release.sh</string>
+		<string>$install_root/scripts/nightly-release.sh</string>
 	</array>
 	<key>StartCalendarInterval</key>
 	<dict>
@@ -74,7 +101,7 @@ install_launchd() {
 		<integer>0</integer>
 	</dict>
 	<key>WorkingDirectory</key>
-	<string>$REPO_ROOT</string>
+	<string>$install_root</string>
 	<key>StandardOutPath</key>
 	<string>$LOG_DIR/launchd-tako-nightly-release.log</string>
 	<key>StandardErrorPath</key>
@@ -89,7 +116,7 @@ install_launchd() {
 PLIST_END
   launchctl unload "$PLIST" 2>/dev/null || true
   launchctl load "$PLIST"
-  echo "登録完了: ${LABEL}（毎日 5:00、対象リポ: ${REPO_ROOT}）"
+  echo "登録完了: ${LABEL}（毎日 5:00、対象リポ: ${install_root}）"
   echo "確認: launchctl list | grep tako-nightly"
 }
 
@@ -107,6 +134,18 @@ for arg in "$@"; do
     *) echo "不明な引数: ${arg}（--dry-run / --install-launchd / --uninstall-launchd）" >&2; exit 2 ;;
   esac
 done
+
+# ---- パス妥当性チェック（#205: worktree 撤去で launchd 参照先が消失した場合の早期検出）
+if [[ ! -f "$REPO_ROOT/scripts/nightly-release.sh" ]]; then
+  log "ERROR: スクリプトパスが無効 ($REPO_ROOT/scripts/nightly-release.sh)。launchd の参照先が消えた可能性。本体リポから --install-launchd を再実行してください"
+  notify "失敗: スクリプトパスが無効"
+  exit 1
+fi
+if ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  log "ERROR: 有効な git リポジトリではない ($REPO_ROOT)。本体リポから --install-launchd を再実行してください"
+  notify "失敗: git リポジトリが無効"
+  exit 1
+fi
 
 # ---- 前提チェック --------------------------------------------------------
 
