@@ -2032,19 +2032,40 @@ impl TakoApp {
                 let prep = this.update(cx, |app: &mut TakoApp, _| {
                     // Issue #168: 定期更新の UI スレッド部（収集 + save_layout）を計測
                     let _span = tako_control::diag::perf_span("periodic_prep");
-                    let tmux_ctx = if app.panel_visible && app.panel_view == PanelView::Tmux {
-                        Some(app.collect_tmux_context())
-                    } else {
-                        None
+                    // ステップ別サブスパン（#212: periodic_prep の秒級スパイクをステップ単位で
+                    // 攻撃者特定できるようにする。しきい値超えのみ記録 = 正常時コストほぼゼロ）
+                    let tmux_ctx = {
+                        let _s = tako_control::diag::perf_span("periodic_prep:tmux_ctx");
+                        if app.panel_visible && app.panel_view == PanelView::Tmux {
+                            Some(app.collect_tmux_context())
+                        } else {
+                            None
+                        }
                     };
-                    app.sync_filetree_roots();
-                    app.refresh_agent_metrics();
-                    app.poll_webview_state();
-                    app.update_sleep_guard();
+                    {
+                        let _s = tako_control::diag::perf_span("periodic_prep:filetree_roots");
+                        app.sync_filetree_roots();
+                    }
+                    {
+                        let _s = tako_control::diag::perf_span("periodic_prep:agent_metrics");
+                        app.refresh_agent_metrics();
+                    }
+                    {
+                        let _s = tako_control::diag::perf_span("periodic_prep:webview");
+                        app.poll_webview_state();
+                    }
+                    {
+                        let _s = tako_control::diag::perf_span("periodic_prep:sleep_guard");
+                        app.update_sleep_guard();
+                    }
                     // ペインログ: 直接ペインはここで取り込み、バックエンドはジョブ化（Issue #112 B）
-                    let log_jobs = app.collect_pane_log_work();
+                    let log_jobs = {
+                        let _s = tako_control::diag::perf_span("periodic_prep:pane_log");
+                        app.collect_pane_log_work()
+                    };
                     app.save_layout();
                     let filetree_targets = if app.filetree.visible {
+                        let _s = tako_control::diag::perf_span("periodic_prep:filetree_targets");
                         Some(app.filetree.refresh_targets())
                     } else {
                         None

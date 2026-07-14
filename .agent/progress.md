@@ -715,3 +715,10 @@
 - 検証: 全緑（591+ tests）+ セルフテスト完走 + 隔離 e2e（spawn → 全滅 + 再起動 →
   resume → 文脈維持を実測）。ペイン kill 後の logs 読み出し・TUI 93B・洪水 26KB 実測
 - 次: origin/main rebase → PR（Closes #112）→ squash merge → install
+
+## 2026-07-14（#212: 画面が重い・点滅・スクロールもっさりの根治 — pmset UI スレッド実行の排除）
+- 犯人を perf.log + 隔離実測で確定: sleep guard（#173）の AC 判定 `pmset -g batt` が UI スレッドで
+  2 秒毎に同期実行（アイドル 20〜30ms、CPU 飽和時に秒級）。IOKit FFI へ置換で
+  periodic_prep p50 17〜59ms → 0ms / max 116ms → 8ms。サブスパン診断 + perf.log 行混線修正も同梱
+- 外因も特定: worker 4 体の cargo build 並走で load avg 最大 161・swap 10.5/11GB・ディスク 99%
+- 検証: build / fmt / clippy(-D warnings) / test 全緑（638 passed）+ FFI の AC 判定を pmset と実機突き合わせ

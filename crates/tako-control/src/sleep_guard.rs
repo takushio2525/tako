@@ -150,6 +150,9 @@ mod iokit {
         fn CFRelease(cf: *const c_void);
     }
 
+    /// AC 接続時の IOPSGetTimeRemainingEstimate 戻り値（kIOPSTimeRemainingUnlimited）
+    const K_IOPS_TIME_REMAINING_UNLIMITED: f64 = -2.0;
+
     #[link(name = "IOKit", kind = "framework")]
     extern "C" {
         fn IOPMAssertionCreateWithName(
@@ -159,6 +162,7 @@ mod iokit {
             assertion_id: *mut IOPMAssertionID,
         ) -> i32;
         fn IOPMAssertionRelease(assertion_id: IOPMAssertionID) -> i32;
+        fn IOPSGetTimeRemainingEstimate() -> f64;
     }
 
     static ASSERTION_ID: AtomicU32 = AtomicU32::new(0);
@@ -221,19 +225,13 @@ mod iokit {
         ASSERTION_HELD.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// AC 電源に接続されているか（IOKit IOPSCopyPowerSourcesInfo 経由）
+    /// AC 電源に接続されているか（IOKit IOPSGetTimeRemainingEstimate 経由）。
+    /// UI スレッドから 2 秒毎に呼ばれるため、サブプロセス（pmset）は使えない
+    /// （fork+exec は 1 回 20〜30ms、CPU 飽和時は秒級までブロックする。#212）
     pub fn on_ac_power() -> bool {
-        // ps_info を読んで AC 判定。簡易実装として pmset -g batt のパースで代用
-        let output = std::process::Command::new("pmset")
-            .args(["-g", "batt"])
-            .output();
-        match output {
-            Ok(o) => {
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                stdout.contains("AC Power")
-            }
-            Err(_) => true, // 判定不能時は AC と仮定（安全側）
-        }
+        // AC 接続中は kIOPSTimeRemainingUnlimited (-2.0) が返る。
+        // バッテリー駆動中は残り秒数または kIOPSTimeRemainingUnknown (-1.0)
+        unsafe { IOPSGetTimeRemainingEstimate() == K_IOPS_TIME_REMAINING_UNLIMITED }
     }
 
     /// App Nap を無効化する（NSProcessInfo.beginActivityWithOptions 経由）。
@@ -507,6 +505,23 @@ mod tests {
     #[test]
     fn on_ac_power_does_not_panic() {
         let _ = iokit::on_ac_power();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_ac_powerはサブプロセスを使わず高速である() {
+        // #212: UI スレッドから 2 秒毎に呼ばれるため、サブプロセス実装（pmset =
+        // 1 回 20〜30ms、fork+exec が高負荷時に秒級）への回帰を検出する。
+        // FFI 実装なら 100 回で 1ms 未満、subprocess 実装なら 2 秒以上かかる
+        let t0 = std::time::Instant::now();
+        for _ in 0..100 {
+            let _ = iokit::on_ac_power();
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "on_ac_power ×100 が {:?} かかった（サブプロセス実装への回帰の疑い）",
+            t0.elapsed()
+        );
     }
 
     #[test]

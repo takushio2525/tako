@@ -78,7 +78,11 @@ fn append_log(path: Option<PathBuf>, msg: &str) {
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "[{}] {msg}", format_utc(now));
+        // 1 行 = 1 write(2) にする。writeln! はフォーマット断片ごとに write が分かれ、
+        // 複数スレッド（MCP リクエスト毎スレッド化 #84 以降）の並行書き込みで
+        // 行が混線する実例が出た（#212 の perf.log で観測）
+        let line = format!("[{}] {msg}\n", format_utc(now));
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -361,6 +365,42 @@ mod tests {
             );
         }
         assert!(watch_lock().current.is_none());
+    }
+
+    #[test]
+    fn 並行書き込みでも行が混線しない() {
+        // #212: writeln! のフォーマット断片ごとの write(2) 分割で、複数スレッドの
+        // 並行 append_log がタイムスタンプ途中に割り込む実例が出た。1 行 = 1 write の回帰テスト
+        let dir = std::env::temp_dir().join(format!("tako-diag-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("perf.log");
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..50 {
+                        append_log(Some(p.clone()), &format!("thread{t} メッセージ {i}"));
+                    }
+                })
+            })
+            .collect();
+        for th in threads {
+            th.join().unwrap();
+        }
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 8 * 50);
+        for line in lines {
+            // 各行が「[YYYY-MM-DDTHH:MM:SSZ] threadN メッセージ M」の完全形であること
+            assert!(
+                line.starts_with('[')
+                    && line.len() > 22
+                    && &line[21..23] == "] "
+                    && line[23..].starts_with("thread"),
+                "混線した行: {line:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

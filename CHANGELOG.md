@@ -21,6 +21,11 @@ Nightly patch release (automated). Changes since v0.5.0:
 
 ## [Unreleased]
 
+### Fixed
+
+- UI thread no longer blocks on a `pmset` subprocess every 2 seconds (#212): the sleep-guard AC-power check (introduced in v0.5.0 via #173) ran `pmset -g batt` synchronously on the UI thread from the 2-second periodic tick — 20–30ms per call even when idle, stretching to multi-second stalls under CPU saturation (e.g. 4 parallel `cargo build` workers), which surfaced as a sluggish screen, flickering terminal text, and janky scrolling. Replaced with an IOKit FFI call (`IOPSGetTimeRemainingEstimate`, microseconds). Measured: isolated idle instance `periodic_prep` p50 17–59ms / max 116ms → p50 0ms / max 8ms. Also: per-step sub-spans (`periodic_prep:*`) added to perf diagnostics for future attribution, and perf.log lines no longer interleave when written from multiple threads
+  UI スレッドが 2 秒毎に `pmset` サブプロセスでブロックされる問題を修正（#212）: sleep guard の AC 電源判定（v0.5.0 の #173 で導入）が 2 秒毎の定期 tick から `pmset -g batt` を UI スレッドで同期実行しており、アイドルでも 1 回 20〜30ms、CPU 飽和時（cargo build 4 並走等）は秒級まで伸びて「画面が重い・ターミナル表記の点滅・スクロールもっさり」として顕在化していた。IOKit FFI（`IOPSGetTimeRemainingEstimate`、マイクロ秒）へ置換。実測: 隔離アイドル環境の `periodic_prep` p50 17〜59ms / max 116ms → p50 0ms / max 8ms。あわせて perf 診断にステップ別サブスパン（`periodic_prep:*`）を追加し、perf.log の複数スレッド並行書き込みによる行混線も修正
+
 ## [0.5.0] - 2026-07-14
 
 ### Added
