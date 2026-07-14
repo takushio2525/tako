@@ -139,6 +139,7 @@ impl TakoApp {
             .h(px(STATUS_BAR_HEIGHT))
             .flex_none()
             .w_full()
+            .overflow_hidden()
             .bg(rgba(theme.tab_bar_background))
             .border_t_1()
             .border_color(hsla(theme.border_subtle))
@@ -232,6 +233,8 @@ impl TakoApp {
                     .gap(px(5.0))
                     .h_full()
                     .px(px(12.0))
+                    .min_w(px(0.0))
+                    .overflow_hidden()
                     .border_r_1()
                     .border_color(hsla(theme.border_subtle))
                     .font_family(theme.font_family.clone())
@@ -246,15 +249,24 @@ impl TakoApp {
                             .path(ui_icon::FOLDER)
                             .w(px(12.0))
                             .h(px(12.0))
+                            .flex_none()
                             .text_color(hsla(theme.text_muted)),
                     )
                     .child(
                         div()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
                             .text_color(hsla(theme.text_faint))
                             .child(SharedString::from(truncate(&parent, 28))),
                     )
                     .child(
                         div()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(hsla(theme.foreground))
                             .child(SharedString::from(truncate(&leaf, 20))),
@@ -264,6 +276,7 @@ impl TakoApp {
                             .path(ui_icon::COPY)
                             .w(px(10.0))
                             .h(px(10.0))
+                            .flex_none()
                             .text_color(hsla(theme.text_faint)),
                     )
             }))

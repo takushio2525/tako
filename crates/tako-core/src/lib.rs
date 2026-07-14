@@ -4,6 +4,7 @@
 //! GPUI への依存はここに置かない（GPUI 破壊的変更リスクの防波堤。`.agent/architecture.md`）。
 
 pub mod git;
+pub mod header_layout;
 pub mod links;
 pub mod osc_tap;
 pub mod pane;
@@ -28,6 +29,7 @@ pub use git::{
     DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffTarget, GitBranch, GitCommit, GitStatus,
     GitStatusEntry, GraphLayout, GraphLine, GraphRow, GRAPH_PALETTE,
 };
+pub use header_layout::{truncate_path_middle, HeaderVisibility, PreviewHeaderVisibility};
 pub use links::{detect_links, detect_links_with_cwd, link_at, DetectedLink, LinkKind};
 pub use osc_tap::{OscEvent, PromptMark};
 pub use pane::{Pane, PaneId, PaneOrigin, TitleSource};
