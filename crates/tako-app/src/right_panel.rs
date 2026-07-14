@@ -848,10 +848,6 @@ impl TakoApp {
         let pending_pane = self.pending_pane_kill;
         let pending_tmux = self.tmux_pending_kill.clone();
         let active_tab = self.workspace.active_tab_id();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
 
         // fleet サマリ（#217 カンプ: N running / N failed / N idle）
         let (n_running, n_failed, n_idle) =
@@ -1650,32 +1646,85 @@ impl TakoApp {
             root = root.child(card);
         }
 
-        // どのタブにも表示されていない tmux セッション（FR-2.16.8。
+        // どのタブにも表示されていない tmux セッション（FR-2.16.8 / #183。
         // 管理外 = ユーザー直起動等 / kill 漏れ? = orphan バックエンドの残骸）
         if !unlisted.is_empty() {
             root = root.child(
                 div()
-                    .mt_2()
-                    .text_color(hsla(theme.tab_inactive_foreground))
-                    .text_size(px(11.0))
-                    .child("どのタブにも表示されていない tmux セッション（2 秒毎に更新）"),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .mt(px(12.0))
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(hsla(theme.text_muted))
+                            .child("DETACHED SESSIONS"),
+                    )
+                    .child(div().flex_grow(1.0))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(hsla(theme.text_faint))
+                            .child(SharedString::from(format!("{}", unlisted.len()))),
+                    ),
             );
         }
         for (index, session) in unlisted.iter().enumerate() {
             let (badge_label, badge_color) = if session.orphan_backend {
-                ("kill漏れ?", theme.red) // 赤: tako が起動して kill し損ねた残骸
+                ("orphan", theme.red)
             } else {
-                ("管理外", theme.yellow) // 黄: tako の外で立てられたセッション
+                ("外部", theme.yellow)
             };
             let kill_name = session.name.clone();
             let kill_socket = session.socket.clone();
+            let open_name = session.name.clone();
+            let open_socket = session.socket.clone();
+            // 表示名: ロールがあればロール、なければセッション名
+            let display_name = if !session.role.is_empty() {
+                truncate(&session.role, 24)
+            } else {
+                truncate(&session.name, 24)
+            };
+            // メタデータ行（#183: プロセス / cwd / 最終アクティビティ）
+            let mut meta_parts: Vec<String> = Vec::new();
+            if !session.process.is_empty() {
+                meta_parts.push(session.process.clone());
+            }
+            if !session.cwd.is_empty() {
+                let short_cwd = session
+                    .cwd
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&session.cwd)
+                    .to_string();
+                meta_parts.push(short_cwd);
+            }
+            if !session.last_activity_age.is_empty() {
+                meta_parts.push(session.last_activity_age.clone());
+            }
+            let meta_line = meta_parts.join(" \u{00B7} ");
+
             let mut card = div()
                 .flex()
                 .flex_col()
-                .gap_1()
-                .p_1()
-                .rounded_md()
-                .bg(rgba_alpha(theme.tab_bar_background, 0.6))
+                .gap(px(2.0))
+                .p(px(8.0))
+                .rounded(px(9.0))
+                .border_1()
+                .border_color(hsla(if session.orphan_backend {
+                    tako_core::Rgb::from_hex(0x3a2b35)
+                } else {
+                    theme.border_strong
+                }))
+                .bg(rgba(if session.orphan_backend {
+                    tako_core::Rgb::from_hex(0x1f1a22)
+                } else {
+                    theme.surface_0
+                }))
+                .mb(px(6.0))
                 .child(
                     div()
                         .id(("tmux-unlisted-row", index as u64))
@@ -1683,10 +1732,9 @@ impl TakoApp {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap_1()
+                        .gap(px(6.0))
                         .overflow_hidden()
                         .cursor(CursorStyle::OpenHand)
-                        // D&D で現在のタブへ取り込んで表示（FR-2.16.10。kill せず中身を確認できる）
                         .on_drag(
                             TmuxSessionDrag {
                                 name: session.name.clone(),
@@ -1699,54 +1747,86 @@ impl TakoApp {
                                 cx,
                             ),
                         )
+                        // バッジ
                         .child(
                             div()
-                                .px_1()
+                                .px(px(5.0))
+                                .py(px(1.0))
                                 .flex_none()
-                                .rounded_sm()
-                                .text_size(px(10.0))
+                                .rounded(px(4.0))
+                                .text_size(px(9.5))
+                                .font_weight(FontWeight::BOLD)
                                 .text_color(hsla(badge_color))
                                 .bg(rgba_alpha(badge_color, 0.15))
                                 .child(badge_label),
                         )
+                        // 表示名
                         .child(
                             div()
-                                .font_weight(FontWeight::BOLD)
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_size(px(12.0))
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_ellipsis()
-                                .child(SharedString::from(truncate(&session.name, 24))),
+                                .child(SharedString::from(display_name)),
                         )
+                        // attached / detached
                         .child(
                             div()
-                                .text_size(px(11.0))
+                                .text_size(px(9.5))
                                 .flex_none()
                                 .whitespace_nowrap()
+                                .px(px(5.0))
+                                .py(px(1.0))
+                                .rounded(px(4.0))
                                 .text_color(if session.attached {
                                     hsla(theme.accent)
                                 } else {
-                                    hsla(theme.yellow)
+                                    hsla(theme.text_faint)
                                 })
+                                .when(session.attached, |d| d.bg(rgba_alpha(theme.accent, 0.12)))
                                 .child(if session.attached {
                                     "attached"
                                 } else {
                                     "detached"
                                 }),
                         )
+                        // 復帰ボタン（#183: tako tmux open 相当をワンクリック）
                         .child(
                             div()
-                                .text_size(px(11.0))
-                                .text_color(hsla(theme.tab_inactive_foreground))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .child(SharedString::from(format!(
-                                    "作成 {} ・ {}",
-                                    format_age(now - session.created),
-                                    session.location,
-                                ))),
+                                .id(("tmux-restore", index as u64))
+                                .px(px(5.0))
+                                .py(px(1.0))
+                                .flex_none()
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .text_size(px(9.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(hsla(theme.accent))
+                                .bg(rgba_alpha(theme.accent, 0.12))
+                                .opacity(0.0)
+                                .group_hover("tmux-unlisted", |d| d.opacity(1.0))
+                                .hover(|d| d.bg(rgba_alpha(theme.accent, 0.25)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    let _ = tako_control::dispatch(
+                                        this,
+                                        tako_control::protocol::Request::TmuxOpen {
+                                            socket: open_socket.clone(),
+                                            session: open_name.clone(),
+                                            window: None,
+                                            pane: None,
+                                            direction: None,
+                                        },
+                                        PaneOrigin::User,
+                                    );
+                                    cx.notify();
+                                }))
+                                .child("復帰"),
                         )
-                        .child(div().flex_grow(1.0))
+                        // kill ボタン（確認つき）
                         .child(
                             div()
                                 .id(("tmux-kill", index as u64))
@@ -1760,76 +1840,88 @@ impl TakoApp {
                                 .group_hover("tmux-unlisted", |d| d.opacity(1.0))
                                 .hover(|d| d.bg(rgba_alpha(theme.red, 0.2)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
                                     this.tmux_pending_kill =
                                         Some((kill_name.clone(), None, kill_socket.clone()));
                                     cx.notify();
                                 }))
                                 .child("×"),
                         ),
-                )
-                .children(session.windows.iter().map(|(w_index, label)| {
-                    let w_index = *w_index;
-                    let kill_name = session.name.clone();
-                    let kill_socket = session.socket.clone();
-                    let drag_name = session.name.clone();
-                    let drag_socket = session.socket.clone();
+                );
+            // メタデータ行（#183: プロセス / cwd / 最終アクティビティ）
+            if !meta_line.is_empty() {
+                card = card.child(
                     div()
-                        .id((
-                            "tmux-unlisted-wrow",
-                            ((index as u64) << 16) | w_index as u64 | 0x8000_0000,
-                        ))
-                        .group("tmux-unlisted-wrow")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .pl_4()
-                        .text_size(px(11.0))
-                        .cursor(CursorStyle::OpenHand)
-                        .on_drag(
-                            TmuxSessionDrag {
-                                name: drag_name,
-                                socket: drag_socket,
-                                window: Some(w_index),
-                            },
-                            self.drag_ghost_builder(
-                                DragKind::TmuxSession,
-                                format!("tmux: {}", truncate(label, 24)),
-                                cx,
-                            ),
-                        )
+                        .pl(px(6.0))
+                        .text_size(px(10.0))
+                        .text_color(hsla(theme.text_faint))
                         .overflow_hidden()
-                        .child(
-                            div()
-                                .flex_1()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .child(SharedString::from(truncate(label, 40))),
-                        )
-                        .child(
-                            div()
-                                .id(("tmux-kill-window", ((index as u64) << 16) | w_index as u64))
-                                .px_1()
-                                .flex_none()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .text_size(px(10.0))
-                                .text_color(hsla_alpha(theme.red, 0.8))
-                                .opacity(0.0)
-                                .group_hover("tmux-unlisted-wrow", |d| d.opacity(1.0))
-                                .hover(|d| d.bg(rgba_alpha(theme.red, 0.2)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.tmux_pending_kill = Some((
-                                        kill_name.clone(),
-                                        Some(w_index),
-                                        kill_socket.clone(),
-                                    ));
-                                    cx.notify();
-                                }))
-                                .child("×"),
-                        )
-                }));
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(SharedString::from(meta_line)),
+                );
+            }
+            // window 一覧
+            card = card.children(session.windows.iter().map(|(w_index, label)| {
+                let w_index = *w_index;
+                let kill_name = session.name.clone();
+                let kill_socket = session.socket.clone();
+                let drag_name = session.name.clone();
+                let drag_socket = session.socket.clone();
+                div()
+                    .id((
+                        "tmux-unlisted-wrow",
+                        ((index as u64) << 16) | w_index as u64 | 0x8000_0000,
+                    ))
+                    .group("tmux-unlisted-wrow")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .pl_4()
+                    .text_size(px(11.0))
+                    .cursor(CursorStyle::OpenHand)
+                    .on_drag(
+                        TmuxSessionDrag {
+                            name: drag_name,
+                            socket: drag_socket,
+                            window: Some(w_index),
+                        },
+                        self.drag_ghost_builder(
+                            DragKind::TmuxSession,
+                            format!("tmux: {}", truncate(label, 24)),
+                            cx,
+                        ),
+                    )
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(SharedString::from(truncate(label, 40))),
+                    )
+                    .child(
+                        div()
+                            .id(("tmux-kill-window", ((index as u64) << 16) | w_index as u64))
+                            .px_1()
+                            .flex_none()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_size(px(10.0))
+                            .text_color(hsla_alpha(theme.red, 0.8))
+                            .opacity(0.0)
+                            .group_hover("tmux-unlisted-wrow", |d| d.opacity(1.0))
+                            .hover(|d| d.bg(rgba_alpha(theme.red, 0.2)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.tmux_pending_kill =
+                                    Some((kill_name.clone(), Some(w_index), kill_socket.clone()));
+                                cx.notify();
+                            }))
+                            .child("×"),
+                    )
+            }));
             // 誤爆防止のインライン確認（FR-2.13.3 / FR-2.16.8）
             if let Some((pending_session, pending_window, _)) = &pending_tmux {
                 if *pending_session == session.name {
@@ -1845,7 +1937,6 @@ impl TakoApp {
                             "管理外セッション {name} を kill していいですか?（中のプロセスごと終了）"
                         ),
                     };
-                    // 確認 UI の id は attach 済み側（1<<32 系）と衝突しない下位値
                     card = card.child(self.render_kill_confirm(index as u64, label, None, cx));
                 }
             }

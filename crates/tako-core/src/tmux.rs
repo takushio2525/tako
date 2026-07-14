@@ -55,6 +55,14 @@ pub struct TmuxSession {
     pub windows: Vec<TmuxWindow>,
     /// attach 中クライアントの tty（`/dev/ttysNNN`）。tako ペインとの対応付けに使う
     pub client_ttys: Vec<String>,
+    /// アクティブペインのプロセス PID（`#{pane_pid}`）
+    pub pane_pid: Option<u32>,
+    /// アクティブペインで走っているコマンド名（`#{pane_current_command}`）
+    pub pane_command: Option<String>,
+    /// アクティブペインの cwd（`#{pane_current_path}`）
+    pub pane_current_path: Option<String>,
+    /// 最終アクティビティ時刻（`#{session_activity}` unix epoch 秒）
+    pub last_activity: i64,
 }
 
 /// 対象 tmux サーバー。`None` は既定サーバー、`Some(name)` は `tmux -L <name>`
@@ -65,7 +73,7 @@ pub fn list_sessions(socket: Option<&str>) -> Vec<TmuxSession> {
         &[
             "list-sessions",
             "-F",
-            "#{session_name}\t#{session_created}\t#{session_attached}",
+            "#{session_name}\t#{session_created}\t#{session_attached}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}\t#{session_activity}",
         ],
     )
     .unwrap_or_default();
@@ -420,12 +428,23 @@ fn parse_sessions(sessions: &str, windows: &str, clients: &str) -> Vec<TmuxSessi
         .lines()
         .filter_map(|line| {
             let mut f = line.split('\t');
+            let name = f.next()?.to_string();
+            let created = f.next()?.parse().ok()?;
+            let attached = f.next()? != "0";
+            let pane_pid = f.next().and_then(|s| s.parse().ok());
+            let pane_command = f.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
+            let pane_current_path = f.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
+            let last_activity = f.next().and_then(|s| s.parse().ok()).unwrap_or(0);
             Some(TmuxSession {
-                name: f.next()?.to_string(),
-                created: f.next()?.parse().ok()?,
-                attached: f.next()? != "0",
+                name,
+                created,
+                attached,
                 windows: Vec::new(),
                 client_ttys: Vec::new(),
+                pane_pid,
+                pane_command,
+                pane_current_path,
+                last_activity,
             })
         })
         .collect();
@@ -466,7 +485,7 @@ mod tests {
 
     #[test]
     fn フォーマット出力を統合してパースする() {
-        let sessions = "work\t1760000000\t1\nbg-agent\t1760000100\t0\n";
+        let sessions = "work\t1760000000\t1\t1234\tzsh\t/Users/tako\t1760000500\nbg-agent\t1760000100\t0\t5678\tclaude\t/tmp\t1760000200\n";
         let windows = "work\t0\tvim\t1\t2\nwork\t1\tserver\t0\t1\nbg-agent\t0\tzsh\t1\t1\n";
         let clients = "work\t/dev/ttys012\n";
         let parsed = parse_sessions(sessions, windows, clients);
@@ -475,6 +494,10 @@ mod tests {
         assert_eq!(work.name, "work");
         assert_eq!(work.created, 1760000000);
         assert!(work.attached);
+        assert_eq!(work.pane_pid, Some(1234));
+        assert_eq!(work.pane_command.as_deref(), Some("zsh"));
+        assert_eq!(work.pane_current_path.as_deref(), Some("/Users/tako"));
+        assert_eq!(work.last_activity, 1760000500);
         assert_eq!(work.windows.len(), 2);
         assert_eq!(work.windows[0].name, "vim");
         assert!(work.windows[0].active);
@@ -482,6 +505,8 @@ mod tests {
         assert_eq!(work.client_ttys, vec!["/dev/ttys012"]);
         let bg = &parsed[1];
         assert!(!bg.attached);
+        assert_eq!(bg.pane_pid, Some(5678));
+        assert_eq!(bg.pane_command.as_deref(), Some("claude"));
         assert!(bg.client_ttys.is_empty());
     }
 
@@ -491,6 +516,16 @@ mod tests {
         let parsed = parse_sessions("only-name\nok\t1\t0\n", "broken\n", "broken\n");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].name, "ok");
+    }
+
+    #[test]
+    fn 旧フォーマット3列でもパースできる() {
+        let parsed = parse_sessions("old\t1760000000\t0\n", "", "");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "old");
+        assert_eq!(parsed[0].pane_pid, None);
+        assert_eq!(parsed[0].pane_command, None);
+        assert_eq!(parsed[0].last_activity, 0);
     }
 
     #[test]
