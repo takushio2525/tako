@@ -785,6 +785,10 @@ pub struct AgentMetrics {
     pub ctx_detail: Option<String>,
     /// usage 表示テキスト（例: "5h 23%", "$1.23" 等）
     pub usage_text: Option<String>,
+    /// 5 時間リミット使用率（0–100。「5h NN%」表示から抽出。#217 ステータスバー）
+    pub limit_5h: Option<u32>,
+    /// 週リミット使用率（0–100。「7d NN%」「週 NN%」表示から抽出。#217）
+    pub limit_week: Option<u32>,
 }
 
 /// 画面行リストから Claude TUI フッターのメトリクスをパースする
@@ -794,8 +798,18 @@ fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
     let mut ctx_percent = None;
     let mut ctx_detail = None;
     let mut usage_text = None;
+    let mut limit_5h = None;
+    let mut limit_week = None;
 
     for line in &scan_lines {
+        // リミット表示（「5h NN%」「7d NN%」「週 NN%」。#217 ステータスバー）
+        if limit_5h.is_none() {
+            limit_5h = extract_labeled_percent(line, "5h");
+        }
+        if limit_week.is_none() {
+            limit_week =
+                extract_labeled_percent(line, "7d").or_else(|| extract_labeled_percent(line, "週"));
+        }
         // `ctx NN%` / `context NN%` パターン（プログレスバー文字を含む行）
         if ctx_percent.is_none() {
             let after = line
@@ -821,14 +835,37 @@ fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
         }
     }
 
-    if ctx_percent.is_none() && usage_text.is_none() {
+    if ctx_percent.is_none() && usage_text.is_none() && limit_5h.is_none() && limit_week.is_none() {
         return None;
     }
     Some(AgentMetrics {
         ctx_percent,
         ctx_detail,
         usage_text,
+        limit_5h,
+        limit_week,
     })
+}
+
+/// 「<label> NN%」形式のパーセント値を抽出する（#217。ラベルの直前が英数字なら
+/// 別トークンの一部とみなして飛ばす。例: "15h" の "5h" 誤マッチ防止）
+fn extract_labeled_percent(line: &str, label: &str) -> Option<u32> {
+    let mut search = 0;
+    while let Some(rel) = line[search..].find(label) {
+        let pos = search + rel;
+        let before_ok = pos == 0
+            || line[..pos]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_ascii_alphanumeric());
+        if before_ok {
+            if let Some(pct) = extract_percent(&line[pos + label.len()..]) {
+                return Some(pct.min(100));
+            }
+        }
+        search = pos + label.len();
+    }
+    None
 }
 
 /// `NNN.NK/NNNK` パターンの ctx 詳細テキストを抽出する（例: "128K/200K", "45.2K/200K"）
@@ -1413,6 +1450,29 @@ mod tests {
     fn agent_metricsの該当なし() {
         let lines = vec!["normal shell output".into(), "$ ls".into()];
         assert!(parse_agent_metrics(&lines).is_none());
+    }
+
+    #[test]
+    fn agent_metricsのリミット抽出() {
+        // claudemeter 風ステータスライン（5h / 7d の 2 段 + 残り時間の括弧書き）
+        let lines = vec![
+            "5h  37% ████░░░░░░ (→2h34m)".into(),
+            "7d  46% ████▓░░░░░ (→4d09h)".into(),
+            "ctx 54% ████████░░".into(),
+        ];
+        let m = parse_agent_metrics(&lines).unwrap();
+        assert_eq!(m.limit_5h, Some(37));
+        assert_eq!(m.limit_week, Some(46));
+        assert_eq!(m.ctx_percent, Some(54));
+        // 「週 NN%」表記でも取れる
+        let lines = vec!["5h 62%  週 31%".into()];
+        let m = parse_agent_metrics(&lines).unwrap();
+        assert_eq!(m.limit_5h, Some(62));
+        assert_eq!(m.limit_week, Some(31));
+        // 「15h」の 5h 誤マッチはしない
+        let lines = vec!["uptime 15h 99%  ctx 10%".into()];
+        let m = parse_agent_metrics(&lines).unwrap();
+        assert_eq!(m.limit_5h, None);
     }
 
     #[test]

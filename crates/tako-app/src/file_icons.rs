@@ -109,6 +109,8 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     // UI クロームアイコン（#217。カンプの SVG パスを忠実に写したもの）
     ui_asset!("bell"),
     ui_asset!("bg_drawer"),
+    ui_asset!("coffee"),
+    ui_asset!("globe"),
     ui_asset!("chevron_down_ui"),
     ui_asset!("chevron_right_ui"),
     ui_asset!("close"),
@@ -141,6 +143,8 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
 pub mod ui_icon {
     pub const BELL: &str = "icons/ui/bell.svg";
     pub const BG_DRAWER: &str = "icons/ui/bg_drawer.svg";
+    pub const COFFEE: &str = "icons/ui/coffee.svg";
+    pub const GLOBE: &str = "icons/ui/globe.svg";
     pub const CHEVRON_DOWN: &str = "icons/ui/chevron_down_ui.svg";
     pub const CHEVRON_RIGHT: &str = "icons/ui/chevron_right_ui.svg";
     pub const CLOSE: &str = "icons/ui/close.svg";

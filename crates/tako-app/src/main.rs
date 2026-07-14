@@ -180,7 +180,7 @@ const PANEL_MIN_WIDTH: f32 = 220.0;
 const PANE_TITLE_BAR: f32 = 32.0;
 
 /// 下部ステータスバーの高さ（px。FR-2.16.4。Zed / VSCode 風）
-const STATUS_BAR_HEIGHT: f32 = 30.0;
+const STATUS_BAR_HEIGHT: f32 = 32.0;
 
 /// バックグラウンドドロワーの既定高さ（px。FR-2.15）。横並びプレビュー（実画面サムネイル）が
 /// 読めるだけの高さを確保する
@@ -702,6 +702,8 @@ struct TakoApp {
     video_ticker: bool,
     /// 全ペインから集約した Claude エージェントメトリクス（ctx/usage。ポーリングで更新）
     agent_metrics: AgentMetrics,
+    /// usage トークン推移の履歴（#217 スパークライン。最大 5 点、変化時のみ追記）
+    usage_history: std::collections::VecDeque<f32>,
     /// 端末イベントの再描画デバウンス: 最後に notify した時刻
     last_term_notify: std::time::Instant,
     /// 端末イベントの再描画デバウンス: 遅延 notify のタイマーが稼働中か
@@ -1584,6 +1586,7 @@ impl TakoApp {
             pinned_previews: Vec::new(),
             dragging_pin: None,
             agent_metrics: AgentMetrics::default(),
+            usage_history: std::collections::VecDeque::new(),
             last_term_notify: std::time::Instant::now(),
             term_notify_pending: false,
             video_players: HashMap::new(),
@@ -5477,7 +5480,7 @@ impl TakoApp {
         for pid in pane_ids {
             if let Some(session) = self.terminals.get(&pid) {
                 if let Some(m) = session.agent_metrics() {
-                    if m.ctx_percent.is_some() || m.usage_text.is_some() {
+                    if m.ctx_percent.is_some() || m.usage_text.is_some() || m.limit_5h.is_some() {
                         best = Some(m);
                         break;
                     }
@@ -5488,6 +5491,20 @@ impl TakoApp {
             self.agent_metrics = m;
         } else {
             self.agent_metrics = AgentMetrics::default();
+        }
+        // usage トークン推移の履歴（#217 スパークライン。取れたときだけ・変化時だけ積む）
+        if let Some(tok) = self
+            .agent_metrics
+            .usage_text
+            .as_deref()
+            .and_then(parse_tokens_value)
+        {
+            if self.usage_history.back().copied() != Some(tok) {
+                self.usage_history.push_back(tok);
+                if self.usage_history.len() > 5 {
+                    self.usage_history.pop_front();
+                }
+            }
         }
     }
 
@@ -10140,6 +10157,33 @@ fn truncate(s: &str, max_chars: usize) -> String {
         let cut: String = s.chars().take(max_chars.saturating_sub(1)).collect();
         format!("{cut}…")
     }
+}
+
+/// usage テキストから概算トークン数を抽出する（#217 スパークライン用。
+/// "48.2k tok" → 48200.0。k/M 単位の数値が無ければ None）
+fn parse_tokens_value(s: &str) -> Option<f32> {
+    let chars: Vec<char> = s.chars().collect();
+    for i in 0..chars.len() {
+        if chars[i].is_ascii_digit() {
+            let start = i;
+            let mut j = i + 1;
+            while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == '.') {
+                j += 1;
+            }
+            if j < chars.len() {
+                let mult = match chars[j] {
+                    'k' | 'K' => 1_000.0,
+                    'M' => 1_000_000.0,
+                    _ => continue,
+                };
+                let num: String = chars[start..j].iter().collect();
+                if let Ok(v) = num.parse::<f32>() {
+                    return Some(v * mult);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// 状態遷移からの経過時間の表示（カンプ: 4m12s 形式。#217）
