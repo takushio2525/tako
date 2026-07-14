@@ -2356,6 +2356,75 @@ fn dispatch_inner(
                 "不明な action: {other:?}（list / clear のいずれか）"
             ))),
         },
+
+        Request::TaskCheckpoint {
+            action,
+            task_id,
+            pane,
+            issue,
+            branch,
+            phase,
+            last_commit,
+            agent,
+            model,
+            prompt_head,
+            suspended_reason,
+            project,
+            cwd,
+            resume_pane,
+            tab,
+            resume_model,
+            caller_role,
+        } => match action.as_str() {
+            "checkpoint" => crate::task_checkpoints::checkpoint_payload(
+                task_id.as_deref(),
+                pane,
+                issue,
+                branch.as_deref(),
+                phase.as_deref(),
+                last_commit.as_deref(),
+                agent.as_deref(),
+                model.as_deref(),
+                prompt_head.as_deref(),
+                suspended_reason.as_deref(),
+                project.as_deref(),
+                cwd.as_deref(),
+            )
+            .map_err(DispatchError::Operation),
+            "list" => crate::task_checkpoints::list_payload(phase.as_deref())
+                .map_err(DispatchError::Operation),
+            "update" => {
+                let tid = task_id.ok_or_else(|| {
+                    DispatchError::InvalidParams("update には task_id が必要".into())
+                })?;
+                let ph = phase.ok_or_else(|| {
+                    DispatchError::InvalidParams("update には phase が必要".into())
+                })?;
+                crate::task_checkpoints::update_phase_payload(
+                    &tid,
+                    &ph,
+                    suspended_reason.as_deref(),
+                )
+                .map_err(DispatchError::Operation)
+            }
+            "resume" => {
+                let tid = task_id.ok_or_else(|| {
+                    DispatchError::InvalidParams("resume には task_id が必要".into())
+                })?;
+                dispatch_task_resume(
+                    host,
+                    origin,
+                    &tid,
+                    resume_pane,
+                    tab,
+                    resume_model.as_deref(),
+                    caller_role.as_deref(),
+                )
+            }
+            other => Err(DispatchError::InvalidParams(format!(
+                "不明な action: {other:?}（checkpoint / list / update / resume のいずれか）"
+            ))),
+        },
     }
 }
 
@@ -4315,6 +4384,110 @@ fn resolve_tab(
         }
     }
     Ok(ws.active_tab().id())
+}
+
+/// task checkpoint resume: チェックポイントから worker を再起動する（Issue #242）。
+/// checkpoint の branch / cwd / issue を復元し、OrchestratorSpawn と同じ経路で
+/// 新ペインを生やしてプロンプトを注入する
+fn dispatch_task_resume(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    task_id: &str,
+    resume_pane: Option<u64>,
+    tab: Option<u64>,
+    resume_model: Option<&str>,
+    caller_role: Option<&str>,
+) -> Result<Value, DispatchError> {
+    let store =
+        crate::task_checkpoints::TaskCheckpointStore::load().map_err(DispatchError::Operation)?;
+    let cp = store
+        .find(task_id)
+        .ok_or_else(|| {
+            DispatchError::InvalidParams(format!("チェックポイントが見つからない: {task_id}"))
+        })?
+        .clone();
+
+    let project = cp.project.as_deref().unwrap_or("default");
+    let model = resume_model.map(String::from).or_else(|| cp.model.clone());
+    let agent_str = cp.agent.as_deref().unwrap_or("claude");
+
+    // resume プロンプトを組み立てる
+    let mut prompt_lines = vec![format!(
+        "Resume task {task_id}. Continue the work from where it was interrupted."
+    )];
+    if let Some(issue) = cp.issue {
+        prompt_lines.push(format!("GitHub Issue: #{issue}"));
+    }
+    if let Some(ref branch) = cp.branch {
+        prompt_lines.push(format!("Branch: {branch} (checkout this branch first)"));
+    }
+    if let Some(ref sha) = cp.last_commit {
+        prompt_lines.push(format!("Last commit: {sha}"));
+    }
+    if let Some(ref head) = cp.prompt_head {
+        prompt_lines.push(format!("Context: {head}"));
+    }
+    if let Some(ref reason) = cp.suspended_reason {
+        prompt_lines.push(format!(
+            "Previous suspension reason: {reason}. \
+             The issue may have been resolved — check before acting on it."
+        ));
+    }
+    prompt_lines.push(
+        "Read the codebase state, verify the current branch and last commit, \
+         then continue implementation."
+            .into(),
+    );
+    let prompt = prompt_lines.join("\n");
+    let label = format!(
+        "resume-{}",
+        cp.issue
+            .map(|i| format!("#{i}"))
+            .unwrap_or_else(|| task_id.to_string())
+    );
+
+    // OrchestratorSpawn と同じ経路で spawn する
+    let spawn_result = dispatch_orchestrator_spawn(
+        host,
+        origin,
+        SpawnParams {
+            project,
+            prompt: &prompt,
+            label: Some(&label),
+            model: model.as_deref(),
+            effort: None,
+            pane: resume_pane.or(cp.pane_id),
+            tab,
+            caller_role,
+            agent: Some(agent_str),
+        },
+    )?;
+
+    // チェックポイントの phase を Running に更新し、新しい pane_id を記録する
+    let new_pane_id = spawn_result["pane_id"].as_u64();
+    crate::task_checkpoints::TaskCheckpointStore::mutate(|store| {
+        if let Some(existing) = store.find_mut(task_id) {
+            existing.phase = tako_core::task_checkpoint::TaskPhase::Running;
+            existing.pane_id = new_pane_id;
+            existing.suspended_reason = None;
+            if let Some(ref m) = model {
+                existing.model = Some(m.clone());
+            }
+            existing.touch();
+        }
+    })
+    .map_err(DispatchError::Operation)?;
+
+    let mut result = spawn_result;
+    result
+        .as_object_mut()
+        .unwrap()
+        .insert("task_id".into(), json!(task_id));
+    result
+        .as_object_mut()
+        .unwrap()
+        .insert("resumed".into(), json!(true));
+    Ok(result)
 }
 
 #[cfg(test)]

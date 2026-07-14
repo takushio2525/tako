@@ -23,6 +23,7 @@ pub mod shell_integration;
 pub mod spawn_layout;
 pub mod ssh_config;
 pub mod tab;
+pub mod task_checkpoint;
 pub mod terminal;
 pub mod text_edit;
 pub mod theme;
@@ -52,6 +53,7 @@ pub use screen::{InputStatus, InputStyle, Screen, ScreenLine, StyleRun};
 pub use shell::{quote_for_shell, quote_paths_for_shell};
 pub use spawn_layout::{SpawnLayoutConfig, SpawnLayoutPolicy, WorkerLayoutAlgorithm};
 pub use tab::{Tab, TabId};
+pub use task_checkpoint::{TaskCheckpoint, TaskPhase};
 pub use terminal::{
     login_shell_command, AgentMetrics, CommandState, SelectionKind, SessionError, SessionEvent,
     SessionNotice, SpawnCommand, SpawnOptions, TermEvent, TerminalSession,

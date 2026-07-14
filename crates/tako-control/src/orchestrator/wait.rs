@@ -394,6 +394,22 @@ pub fn run_worker(
             "recommended_action": "check_and_resume",
         });
     }
+
+    // Issue #242: usage_limit / crash / gone でチェックポイントを Suspended に遷移させる
+    let suspend_reason = match &outcome {
+        WatchOutcome::Error { kind, .. } => Some(kind.as_str().to_string()),
+        WatchOutcome::Gone => Some("gone".to_string()),
+        _ => None,
+    };
+    if let Some(reason) = suspend_reason {
+        if let Ok(Some(task_id)) = crate::task_checkpoints::suspend_by_pane(pane_id, &reason) {
+            result["task_suspended"] = json!({
+                "task_id": task_id,
+                "reason": reason,
+            });
+        }
+    }
+
     Ok(result)
 }
 

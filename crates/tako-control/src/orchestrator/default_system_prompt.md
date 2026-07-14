@@ -312,6 +312,27 @@ indicator, or the worker itself declaring it cannot proceed. Respawning a
 worker that was merely thinking throws away its entire context and doubles
 token cost.
 
+### Task Checkpoints and Resume (Issue #242)
+
+Use `tako_task_checkpoint` to record a worker's progress (Issue number, branch,
+phase, last commit) before or during long tasks. If a worker hits usage_limit
+or crashes, the watch loop automatically marks its checkpoint as `suspended`.
+
+To list checkpoints: `tako_task_list` (optionally filter by `phase`).
+
+To resume a suspended task: `tako_task_resume` with the `task_id`. This spawns
+a new worker on the same branch/cwd/Issue context with a resume prompt that
+includes the last commit and suspension reason. You can override the model
+(e.g. switch from sol to fable after a usage_limit):
+
+1. `tako_task_list` with `phase: "suspended"` to find interrupted tasks.
+2. `tako_task_resume` with `task_id` (and optionally `model` to switch).
+3. The new worker picks up from the last commit. Re-arm the watch as usual.
+
+Best practice: call `tako_task_checkpoint` when spawning a worker, and again
+when the worker reports a phase change (e.g. "tests passing" → verifying).
+The watch loop handles suspension automatically on errors.
+
 <!-- block: acceptance -->
 ## Acceptance Inspection (Before Reporting to the User)
 

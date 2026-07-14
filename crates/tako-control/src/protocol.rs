@@ -761,6 +761,50 @@ pub enum Request {
     /// 最近開いた項目の一覧・クリア（#20）。
     /// `action`: "list" / "clear"
     RecentItems { action: String },
+    /// タスクチェックポイントの操作（Issue #242）。
+    /// `action`:
+    /// - "checkpoint": チェックポイントを記録・更新する。task_id 省略時は自動採番
+    /// - "list": 一覧（phase で絞り込み可）
+    /// - "resume": task_id のチェックポイントから新ペインで再開する
+    /// - "update": 既存チェックポイントの phase を変更する（watch ループの自動遷移用）
+    TaskCheckpoint {
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issue: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_commit: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_head: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suspended_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        /// resume の分割元ペイン（省略時は呼び出し元）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_pane: Option<u64>,
+        /// resume の分割先タブ
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab: Option<u64>,
+        /// resume 時にモデルを変更する
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_role: Option<String>,
+    },
 }
 
 impl Request {
