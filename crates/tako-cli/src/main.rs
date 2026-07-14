@@ -68,6 +68,9 @@ enum Command {
     Open(OpenArgs),
     /// PDF・画像プレビューのズーム・ページ・パン操作。引数なしで現在状態を表示する
     Preview(PreviewArgs),
+    /// 表示中プレビューファイルのライブリロード ON/OFF・状態確認
+    #[command(name = "preview-reload")]
+    PreviewReload(ToggleArgs),
     /// コードプレビューの軽量編集（開始 / 全文適用 / 保存）
     #[command(subcommand)]
     Edit(EditCommand),
@@ -2704,6 +2707,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pan_x: args.pan_x,
             pan_y: args.pan_y,
         },
+        Command::PreviewReload(args) => Request::PreviewReload {
+            enabled: args.state.as_deref().map(|s| s == "on"),
+        },
         Command::Edit(command) => match command {
             EditCommand::Start { pane } => Request::PreviewEdit {
                 pane: target_pane(*pane)?,
@@ -3598,6 +3604,7 @@ fn print_result(command: &Command, result: &Value) {
         }
         Command::Tab(TabCommand::New { .. }) => println!("{result}"),
         Command::Open(_) | Command::Preview(_) | Command::Edit(_) => println!("{result}"),
+        Command::PreviewReload(_) => println!("{result}"),
         Command::Autorename(_)
         | Command::Portdetect(_)
         | Command::Persist(_)
@@ -4074,6 +4081,22 @@ mod tests {
             }
         );
         assert!(Cli::try_parse_from(["tako", "preview", "--zoom", "150", "--zoom-in"]).is_err());
+    }
+
+    #[test]
+    fn preview_reloadは状態取得と切替を操作へ写す() {
+        let status = parse(&["tako", "preview-reload"]);
+        assert_eq!(
+            build_request(&status).unwrap(),
+            Request::PreviewReload { enabled: None }
+        );
+        let disable = parse(&["tako", "preview-reload", "off"]);
+        assert_eq!(
+            build_request(&disable).unwrap(),
+            Request::PreviewReload {
+                enabled: Some(false)
+            }
+        );
     }
 
     #[test]

@@ -1186,6 +1186,12 @@ fn dispatch_inner(
                 "pan_y": state.pan_y,
             }))
         }
+        Request::PreviewReload { enabled } => {
+            if let Some(enabled) = enabled {
+                host.set_preview_reload(enabled);
+            }
+            Ok(json!({ "enabled": host.preview_reload_enabled() }))
+        }
         Request::PreviewEdit { pane, enabled } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
             if host.preview_state(target).is_none() {
@@ -4332,6 +4338,7 @@ mod tests {
         stale_pane_map: std::collections::HashMap<PaneId, PaneId>,
         /// #217: UI テーマモード
         theme_mode: tako_core::theme::ThemeMode,
+        preview_reload: tako_core::PreviewReloadState,
     }
 
     impl MockHost {
@@ -4347,6 +4354,7 @@ mod tests {
                 pins: Vec::new(),
                 stale_pane_map: std::collections::HashMap::new(),
                 theme_mode: tako_core::theme::ThemeMode::Dark,
+                preview_reload: tako_core::PreviewReloadState::default(),
             }
         }
 
@@ -4432,6 +4440,12 @@ mod tests {
     }
 
     impl PreviewHost for MockHost {
+        fn preview_reload_enabled(&self) -> bool {
+            self.preview_reload.enabled()
+        }
+        fn set_preview_reload(&mut self, enabled: bool) {
+            self.preview_reload.set_enabled(enabled);
+        }
         fn preview_state(&self, pane: PaneId) -> Option<(String, PreviewModeWire)> {
             self.previews.get(&pane.as_u64()).cloned()
         }
@@ -5567,6 +5581,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, DispatchError::InvalidParams(_)));
+    }
+
+    #[test]
+    fn preview_reloadはcore状態を取得変更できる() {
+        let mut host = MockHost::new();
+        let initial = dispatch(
+            &mut host,
+            Request::PreviewReload { enabled: None },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(initial["enabled"], true);
+
+        let changed = dispatch(
+            &mut host,
+            Request::PreviewReload {
+                enabled: Some(false),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(changed["enabled"], false);
+        assert!(!host.preview_reload.enabled());
     }
 
     #[test]

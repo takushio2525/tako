@@ -1064,4 +1064,181 @@ impl TakoApp {
             self.spawn_preview_load(pane, path, mode, cx);
         }
     }
+
+    /// 表示中かつ対応形式のパスだけを親ディレクトリの非再帰監視へ同期する。
+    /// render からは呼ばず、open / close / 設定切替時だけ実行する。
+    pub(crate) fn sync_preview_watches(&mut self) {
+        let _span = tako_control::diag::perf_span("preview_watch_sync");
+        let paths: Vec<std::path::PathBuf> = if self.preview_reload.enabled() {
+            self.previews
+                .values()
+                .filter(|state| preview::live_reload_supported(state.mode))
+                .map(|state| state.path.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let keep: std::collections::HashSet<_> = paths.iter().cloned().collect();
+        self.pending_preview_reloads
+            .retain(|path, _| keep.contains(path));
+        self.active_preview_reloads
+            .retain(|path| keep.contains(path));
+        self.preview_reload_generations
+            .retain(|path, _| keep.contains(path));
+        if let Some(watcher) = self.preview_file_watcher.as_mut() {
+            if watcher.sync_paths(paths).is_err() {
+                eprintln!("warning: プレビューの監視対象を更新できない");
+            }
+        }
+    }
+
+    pub(crate) fn handle_preview_watch_signal(
+        &mut self,
+        signal: preview_watch::PreviewWatchSignal,
+        cx: &mut Context<Self>,
+    ) {
+        let _span = tako_control::diag::perf_span("preview_watch_event");
+        if !self.preview_reload.enabled() {
+            return;
+        }
+        let paths = match signal {
+            preview_watch::PreviewWatchSignal::Paths(paths) => paths,
+            preview_watch::PreviewWatchSignal::Rescan => self
+                .previews
+                .values()
+                .filter(|state| preview::live_reload_supported(state.mode))
+                .map(|state| state.path.clone())
+                .collect(),
+        };
+        for path in paths {
+            self.schedule_preview_reload(path, cx);
+        }
+    }
+
+    fn schedule_preview_reload(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        let now = std::time::Instant::now();
+        self.next_preview_reload_generation = self.next_preview_reload_generation.wrapping_add(1);
+        self.preview_reload_generations
+            .insert(path.clone(), self.next_preview_reload_generation);
+        self.pending_preview_reloads.insert(path.clone(), now);
+        if !self.active_preview_reloads.insert(path.clone()) {
+            return;
+        }
+
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(preview_watch::RELOAD_DEBOUNCE)
+                .await;
+            let ready = this.update(cx, |app, cx| {
+                let Some(last_event) = app.pending_preview_reloads.get(&path).copied() else {
+                    app.active_preview_reloads.remove(&path);
+                    return true;
+                };
+                if last_event.elapsed() < preview_watch::RELOAD_DEBOUNCE {
+                    return false;
+                }
+                app.pending_preview_reloads.remove(&path);
+                app.active_preview_reloads.remove(&path);
+                let Some(generation) = app.preview_reload_generations.get(&path).copied() else {
+                    return true;
+                };
+                let targets: Vec<_> = app
+                    .previews
+                    .iter()
+                    .filter(|(_, state)| {
+                        state.path == path && preview::live_reload_supported(state.mode)
+                    })
+                    .map(|(pane, state)| {
+                        let pdf_key = match &state.content {
+                            preview::PreviewContent::Pdf(data) => Some(data.raster_key),
+                            _ => None,
+                        };
+                        (*pane, state.mode, pdf_key)
+                    })
+                    .collect();
+                for (pane, mode, pdf_key) in targets {
+                    app.spawn_preview_reload(pane, path.clone(), mode, pdf_key, generation, cx);
+                }
+                true
+            });
+            match ready {
+                Ok(true) | Err(_) => break,
+                Ok(false) => {}
+            }
+        })
+        .detach();
+    }
+
+    fn spawn_preview_reload(
+        &self,
+        pane: PaneId,
+        path: std::path::PathBuf,
+        mode: preview::PreviewMode,
+        pdf_key: Option<preview::PdfRasterKey>,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let reload_path = path.clone();
+            let loaded = cx
+                .background_executor()
+                .spawn(async move { preview::load_for_reload(&reload_path, mode, pdf_key) })
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                app.apply_preview_reload(pane, &path, mode, generation, loaded, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn apply_preview_reload(
+        &mut self,
+        pane: PaneId,
+        path: &std::path::Path,
+        mode: preview::PreviewMode,
+        generation: u64,
+        loaded: preview::ReloadedPreview,
+        cx: &mut Context<Self>,
+    ) {
+        let _span = tako_control::diag::perf_span("preview_reload_apply");
+        if !self.preview_reload.enabled()
+            || self.preview_reload_generations.get(path) != Some(&generation)
+            || !self
+                .previews
+                .get(&pane)
+                .is_some_and(|state| state.path == path && state.mode == mode)
+        {
+            return;
+        }
+
+        if let Some(edit) = self
+            .preview_edits
+            .get_mut(&pane)
+            .filter(|edit| edit.editing || edit.dirty())
+        {
+            // 自分自身の保存でも OS イベントは発生する。同じ内容なら競合にせず、
+            // 真の外部変更または削除だけを既存 FR-3.5 の競合表示へ接続する。
+            if loaded.source_bytes.as_deref() == Some(edit.buffer.text().as_bytes()) {
+                return;
+            }
+            edit.save_status = Some(preview::SaveStatus::Conflict);
+            edit.message =
+                Some("外部変更を検知しました。編集中の内容を保持し、自動更新は行いません".into());
+            cx.notify();
+            return;
+        }
+
+        self.preview_edits.remove(&pane);
+        self.preview_selections.remove(&pane);
+        self.preview_line_bounds.remove(&pane);
+        self.preview_pdf_char_bounds.remove(&pane);
+        self.preview_pdf_highlight_paint_count.remove(&pane);
+        self.preview_text_layouts.remove(&pane);
+        self.preview_line_texts.remove(&pane);
+        self.preview_image_cache.remove(&pane);
+        self.pending_pdf_rasters.remove(&pane);
+        self.previews.insert(pane, loaded.state);
+        self.preview_reload_apply_count = self.preview_reload_apply_count.saturating_add(1);
+        cx.notify();
+    }
 }

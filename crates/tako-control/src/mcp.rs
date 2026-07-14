@@ -717,6 +717,19 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_preview_reload",
+            "description": "表示中プレビューファイルのライブリロードを設定する。enabled 省略時は現在状態を返す。\
+                有効時は外部変更をイベント駆動で検知し、デバウンス後に background で再構築する。\
+                編集中の外部変更は表示内容を上書きせず競合として通知する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "enabled": { "type": "boolean", "description": "true = ライブリロード ON（既定）、false = OFF" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_preview_edit",
             "description": "コードプレビューの編集モードを開始・終了する。enabled 省略時は状態取得。\
                 PDF・画像・動画・末尾省略された巨大ファイルは編集できない。状態は editing / dirty で返す。",
@@ -2143,6 +2156,9 @@ fn build_request(
             pan_x: f32_arg(args, "pan_x")?,
             pan_y: f32_arg(args, "pan_y")?,
         },
+        "tako_preview_reload" => Request::PreviewReload {
+            enabled: bool_arg(args, "enabled")?,
+        },
         "tako_preview_edit" => Request::PreviewEdit {
             pane: Some(target_pane(args, caller)?),
             enabled: bool_arg(args, "enabled")?,
@@ -3028,9 +3044,27 @@ mod tests {
     }
 
     #[test]
+    fn preview_reloadは状態取得と切替をrequestへ写す() {
+        let (_, requests) = run(call("tako_preview_reload", json!({})), None, true);
+        assert_eq!(requests, vec![Request::PreviewReload { enabled: None }]);
+
+        let (_, requests) = run(
+            call("tako_preview_reload", json!({ "enabled": false })),
+            None,
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::PreviewReload {
+                enabled: Some(false)
+            }]
+        );
+    }
+
+    #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 79);
+        assert_eq!(tools.len(), 80);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

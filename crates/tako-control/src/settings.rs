@@ -1,7 +1,6 @@
 //! settings — ユーザー設定の永続化（`<data_dir>/settings.json`）
 //!
-//! 現状の項目は自動リネームの ON/OFF（FR-2.12.4）のみ。項目追加時は
-//! `#[serde(default)]` で後方互換を保つ（未知キーは serde が無視する）。
+//! 項目追加時は `#[serde(default)]` で後方互換を保つ（未知キーは serde が無視する）。
 //! 接続情報（トークン入り）は `discovery` 側で、こちらは秘密を含めない。
 
 use std::io;
@@ -17,6 +16,9 @@ pub struct Settings {
     /// listen ポート検知 + 提案チップ（FR-2.4.4。既定 ON）
     #[serde(default = "default_true")]
     pub port_detect: bool,
+    /// 表示中プレビューファイルのライブリロード（Issue #233。既定 ON）
+    #[serde(default = "default_true")]
+    pub preview_live_reload: bool,
     /// tmux バックエンドによるセッション永続化（Phase 5.5 / FR-5。既定 ON。
     /// tmux 不在環境では設定に関わらず直接 spawn へ無害劣化する）
     #[serde(default = "default_true")]
@@ -65,6 +67,7 @@ impl Default for Settings {
         Self {
             auto_rename: true,
             port_detect: true,
+            preview_live_reload: true,
             tmux_persist: true,
             sleep_guard_mode: crate::sleep_guard::SleepGuardMode::default(),
             sleep_guard_power: crate::sleep_guard::PowerCondition::default(),
@@ -152,6 +155,7 @@ mod tests {
         let settings = Settings {
             auto_rename: false,
             port_detect: false,
+            preview_live_reload: false,
             tmux_persist: false,
             sleep_guard_mode: crate::sleep_guard::SleepGuardMode::On,
             sleep_guard_power: crate::sleep_guard::PowerCondition::Always,
@@ -174,6 +178,7 @@ mod tests {
         let parsed: Settings = serde_json::from_str("{}").unwrap();
         assert!(parsed.auto_rename);
         assert!(parsed.port_detect);
+        assert!(parsed.preview_live_reload);
         assert!(parsed.tmux_persist);
         assert_eq!(
             parsed.sleep_guard_mode,

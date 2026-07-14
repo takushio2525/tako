@@ -92,6 +92,7 @@ impl TakoApp {
                             if this.workspace.remove_shelved(pane_id).is_some() {
                                 this.terminals.remove(&pane_id);
                                 this.previews.remove(&pane_id);
+                                this.sync_preview_watches();
                                 this.scroll_accum.remove(&pane_id);
                                 this.scroll_ctls.remove(&pane_id);
                                 this.drop_tmux_view_session(pane_id);
