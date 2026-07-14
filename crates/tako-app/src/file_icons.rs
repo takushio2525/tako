@@ -119,6 +119,7 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     ui_asset!("volume_off"),
     ui_asset!("volume_on"),
     ui_asset!("chevron_down_ui"),
+    ui_asset!("chevron_left_ui"),
     ui_asset!("chevron_right_ui"),
     ui_asset!("close"),
     ui_asset!("copy"),
@@ -160,6 +161,7 @@ pub mod ui_icon {
     pub const VOLUME_OFF: &str = "icons/ui/volume_off.svg";
     pub const VOLUME_ON: &str = "icons/ui/volume_on.svg";
     pub const CHEVRON_DOWN: &str = "icons/ui/chevron_down_ui.svg";
+    pub const CHEVRON_LEFT: &str = "icons/ui/chevron_left_ui.svg";
     pub const CHEVRON_RIGHT: &str = "icons/ui/chevron_right_ui.svg";
     pub const CLOSE: &str = "icons/ui/close.svg";
     pub const COPY: &str = "icons/ui/copy.svg";
