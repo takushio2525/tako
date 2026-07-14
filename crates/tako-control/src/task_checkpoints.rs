@@ -218,7 +218,16 @@ pub fn update_phase_payload(
 /// pane_id に紐づく active なチェックポイントの phase を Suspended に遷移させる
 pub fn suspend_by_pane(pane_id: u64, reason: &str) -> Result<Option<String>, String> {
     let path = store_path().ok_or("データディレクトリを解決できない")?;
-    TaskCheckpointStore::mutate_at(&path, |store| {
+    suspend_by_pane_at(&path, pane_id, reason)
+}
+
+/// パス指定版の suspend_by_pane（テスト・隔離用）
+pub fn suspend_by_pane_at(
+    path: &std::path::Path,
+    pane_id: u64,
+    reason: &str,
+) -> Result<Option<String>, String> {
+    TaskCheckpointStore::mutate_at(path, |store| {
         if let Some(cp) = store.find_active_by_pane_mut(pane_id) {
             cp.phase = TaskPhase::Suspended;
             cp.suspended_reason = Some(reason.to_string());
@@ -319,7 +328,6 @@ mod tests {
     fn suspend_by_pane_transitions_phase() {
         let dir = temp_dir("suspend");
         let path = dir.join("task_checkpoints.yaml");
-        std::env::set_var("TAKO_TASK_CHECKPOINTS_FILE", &path);
 
         TaskCheckpointStore::mutate_at(&path, |store| {
             store.upsert(TaskCheckpoint {
@@ -340,7 +348,8 @@ mod tests {
         })
         .unwrap();
 
-        let result = suspend_by_pane(10, "usage_limit").unwrap();
+        // suspend_by_pane_at で直接パスを指定（環境変数の並列テスト干渉を回避）
+        let result = suspend_by_pane_at(&path, 10, "usage_limit").unwrap();
         assert_eq!(result, Some("task-1".into()));
 
         let store = TaskCheckpointStore::load_from(&path).unwrap();
@@ -348,10 +357,9 @@ mod tests {
         assert_eq!(cp.phase, TaskPhase::Suspended);
         assert_eq!(cp.suspended_reason.as_deref(), Some("usage_limit"));
 
-        let result3 = suspend_by_pane(99, "crash").unwrap();
+        let result3 = suspend_by_pane_at(&path, 99, "crash").unwrap();
         assert_eq!(result3, None);
 
-        std::env::remove_var("TAKO_TASK_CHECKPOINTS_FILE");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -455,6 +463,105 @@ mod tests {
         let path = dir.join("nonexistent.yaml");
         let store = TaskCheckpointStore::load_from(&path).unwrap();
         assert!(store.checkpoints.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e2e_checkpoint_list_update_restart() {
+        let dir = temp_dir("e2e");
+        let path = dir.join("task_checkpoints.yaml");
+        std::env::set_var("TAKO_TASK_CHECKPOINTS_FILE", &path);
+
+        // 1. ファイル不在から checkpoint 記録
+        let result = checkpoint_payload(
+            Some("test-42"),
+            Some(100),
+            Some(242),
+            Some("feat/242"),
+            Some("running"),
+            None,
+            Some("claude"),
+            None,
+            Some("Issue #242 の実装"),
+            None,
+            Some("tako"),
+            Some("/tmp/tako"),
+        )
+        .unwrap();
+        assert_eq!(result["task_id"], "test-42");
+        assert_eq!(result["phase"], "running");
+
+        // 2. list で確認
+        let list = list_payload(None).unwrap();
+        assert_eq!(list["count"], 1);
+        assert_eq!(list["checkpoints"][0]["task_id"], "test-42");
+        assert_eq!(list["checkpoints"][0]["issue"], 242);
+
+        // 3. 同一 task_id で上書き（phase を verifying に）
+        let updated = checkpoint_payload(
+            Some("test-42"),
+            Some(100),
+            Some(242),
+            Some("feat/242"),
+            Some("verifying"),
+            Some("abc1234"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(updated["phase"], "verifying");
+        let list2 = list_payload(None).unwrap();
+        assert_eq!(list2["count"], 1);
+
+        // 4. 同一 pane で 2 つ目の checkpoint（異なる task_id）
+        let auto_id = checkpoint_payload(
+            None,
+            Some(100),
+            Some(243),
+            Some("feat/243"),
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(auto_id["task_id"], "task-1");
+        let list3 = list_payload(None).unwrap();
+        assert_eq!(list3["count"], 2);
+
+        // 5. update で suspended に遷移
+        let upd = update_phase_payload("test-42", "suspended", Some("usage_limit")).unwrap();
+        assert_eq!(upd["phase"], "suspended");
+
+        // 6. phase フィルタで suspended だけ表示
+        let suspended = list_payload(Some("suspended")).unwrap();
+        assert_eq!(suspended["count"], 1);
+        assert_eq!(suspended["checkpoints"][0]["task_id"], "test-42");
+        assert_eq!(
+            suspended["checkpoints"][0]["suspended_reason"],
+            "usage_limit"
+        );
+
+        // 7. プロセス再起動シミュレーション（新しい load で同じファイルを読む）
+        let store = TaskCheckpointStore::load().unwrap();
+        assert_eq!(store.checkpoints.len(), 2);
+        assert_eq!(store.find("test-42").unwrap().phase, TaskPhase::Suspended);
+        assert_eq!(store.version, 1);
+
+        // 8. 存在しない task_id の update はエラー
+        let err = update_phase_payload("nonexistent", "done", None);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("見つからない"));
+
+        std::env::remove_var("TAKO_TASK_CHECKPOINTS_FILE");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
