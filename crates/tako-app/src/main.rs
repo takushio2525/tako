@@ -639,6 +639,10 @@ struct TakoApp {
     quitting: bool,
     /// ペインを保持する tmux バックエンドセッション名（persist 有効時のみ登録される）
     backend_sessions: HashMap<PaneId, String>,
+    /// orphan 復元（#191）で旧 pane ID から新 pane ID へのマッピング。
+    /// 既存の claude CLI プロセスが旧 TAKO_PANE_ID で MCP を呼んだとき、
+    /// dispatch で resolve 失敗 → このマップで新 pane ID に解決する（#210）
+    stale_pane_map: HashMap<PaneId, PaneId>,
     /// PC 再起動で tmux セッション自体が消えたときに resume する Claude session ID。
     /// `claude agents --json` と PID 祖先照合が成功した結果だけを保持する
     claude_resume_sessions: HashMap<PaneId, String>,
@@ -1539,6 +1543,7 @@ impl TakoApp {
             secondary,
             quitting: false,
             backend_sessions: HashMap::new(),
+            stale_pane_map: HashMap::new(),
             claude_resume_sessions: HashMap::new(),
             backend_windows: HashMap::new(),
             window_captures: HashMap::new(),
@@ -3904,11 +3909,12 @@ impl TakoApp {
         if orphans.is_empty() {
             return Vec::new();
         }
-        // orphan ごとに cwd を取得（復元タブ内のペインを cwd で区別するため）
+        // orphan ごとに cwd と role を取得
         let tab_title = "復帰".to_string();
         let first_pane = Pane::new(PaneOrigin::User);
         let first_id = first_pane.id();
         self.workspace.create_tab(tab_title, first_pane);
+        let tab_id = self.workspace.find_tab_of_pane(first_id).unwrap();
         // 最初の orphan を最初のペインに割り当て、残りは分割で追加
         let mut recovered = Vec::new();
         for (i, name) in orphans.iter().enumerate() {
@@ -3917,7 +3923,6 @@ impl TakoApp {
             } else {
                 let new_pane = Pane::new(PaneOrigin::User);
                 let new_id = new_pane.id();
-                // 最初のペインから垂直分割で追加
                 let _ = self.workspace.active_tab_mut().tree_mut().split(
                     first_id,
                     tako_core::SplitDirection::Down,
@@ -3925,7 +3930,6 @@ impl TakoApp {
                 );
                 new_id
             };
-            // backend_sessions に登録して spawn_session が既存セッションへ attach する
             self.backend_sessions.insert(pane_id, name.clone());
             let cwd = tako_core::tmux_backend::session_cwd(&socket, name);
             let options = SpawnOptions {
@@ -3937,15 +3941,50 @@ impl TakoApp {
                 self.backend_sessions.remove(&pane_id);
                 continue;
             }
+            // #210: orphan セッションの TAKO_ORCHESTRATOR_ROLE から role を引き継ぐ
+            let role =
+                tako_core::tmux_backend::session_env(&socket, name, "TAKO_ORCHESTRATOR_ROLE")
+                    .and_then(|env_role| role_from_orchestrator_env(&env_role));
+            if let Some(role) = &role {
+                if let Some(pane_obj) = self
+                    .workspace
+                    .get_tab_mut(tab_id)
+                    .and_then(|t| t.tree_mut().get_mut(pane_id))
+                {
+                    pane_obj.set_role(Some(role.clone()));
+                }
+            }
+            // #210: 旧 TAKO_PANE_ID → 新 pane ID のマッピングを記録
+            // （既存 claude CLI が旧 ID で MCP を呼んだとき dispatch で解決する）
+            if let Some(old_id) =
+                tako_core::tmux_backend::session_env(&socket, name, "TAKO_PANE_ID")
+                    .and_then(|v| v.parse::<u64>().ok())
+            {
+                let old_pane = PaneId::from_raw(old_id);
+                if old_pane != pane_id {
+                    self.stale_pane_map.insert(old_pane, pane_id);
+                }
+            }
+            // TAKO_PANE_ID / TAKO_TAB_ID を新 pane ID に更新
+            tako_core::tmux_backend::set_session_env(
+                &socket,
+                name,
+                "TAKO_PANE_ID",
+                &pane_id.as_u64().to_string(),
+            );
+            tako_core::tmux_backend::set_session_env(
+                &socket,
+                name,
+                "TAKO_TAB_ID",
+                &tab_id.as_u64().to_string(),
+            );
             recovered.push(name.clone());
         }
-        // 復帰したペインが 0 件ならタブを閉じる
         if recovered.is_empty() {
             if let Some(tab_id) = self.workspace.find_tab_of_pane(first_id) {
                 self.remove_tab_with(tab_id, CloseReason::Explicit, cx);
             }
         } else {
-            // 均等化して見やすくする
             self.workspace.active_tab_mut().tree_mut().equalize();
         }
         recovered
@@ -9152,6 +9191,10 @@ impl SystemHost for TakoApp {
 
     fn recovered_sessions_count(&self) -> usize {
         self.recovered_count
+    }
+
+    fn resolve_stale_pane(&self, stale: PaneId) -> Option<PaneId> {
+        self.stale_pane_map.get(&stale).copied()
     }
 
     fn reserve_backend_session(&mut self, pane: PaneId) -> Option<String> {
@@ -16030,6 +16073,32 @@ fn shell_escape(path: &std::path::Path) -> String {
     }
 }
 
+/// TAKO_ORCHESTRATOR_ROLE 環境変数の値（`master:<profile>` / `master` / `solo:<profile>` /
+/// `worker:<project>` 等）からペインの role 文字列に変換する（#210）
+fn role_from_orchestrator_env(env_role: &str) -> Option<String> {
+    if let Some(suffix) = env_role.strip_prefix("master:") {
+        if suffix.is_empty() {
+            Some("orchestrator-master".into())
+        } else {
+            Some(format!("orchestrator-master:{suffix}"))
+        }
+    } else if env_role == "master" {
+        Some("orchestrator-master".into())
+    } else if let Some(suffix) = env_role.strip_prefix("solo:") {
+        if suffix.is_empty() {
+            Some("orchestrator-solo".into())
+        } else {
+            Some(format!("orchestrator-solo:{suffix}"))
+        }
+    } else if env_role == "solo" {
+        Some("orchestrator-solo".into())
+    } else if env_role.starts_with("worker:") {
+        Some(format!("orchestrator-{env_role}"))
+    } else {
+        None
+    }
+}
+
 fn accumulate_scroll(carry: f32, delta_lines: f32) -> (i32, f32) {
     let carry = if carry * delta_lines < 0.0 {
         0.0
@@ -16253,5 +16322,52 @@ mod persist_resume_tests {
         assert_eq!(claude_resume_command(false, Some(id), false), None);
         assert_eq!(claude_resume_command(false, Some("../../bad"), true), None);
         assert_eq!(claude_resume_command(false, None, true), None);
+    }
+}
+
+#[cfg(test)]
+mod role_env_tests {
+    use super::role_from_orchestrator_env;
+
+    #[test]
+    fn master各形式からroleに変換する() {
+        assert_eq!(
+            role_from_orchestrator_env("master"),
+            Some("orchestrator-master".into())
+        );
+        assert_eq!(
+            role_from_orchestrator_env("master:exam"),
+            Some("orchestrator-master:exam".into())
+        );
+        assert_eq!(
+            role_from_orchestrator_env("master:"),
+            Some("orchestrator-master".into())
+        );
+    }
+
+    #[test]
+    fn solo各形式からroleに変換する() {
+        assert_eq!(
+            role_from_orchestrator_env("solo"),
+            Some("orchestrator-solo".into())
+        );
+        assert_eq!(
+            role_from_orchestrator_env("solo:docs"),
+            Some("orchestrator-solo:docs".into())
+        );
+    }
+
+    #[test]
+    fn worker形式からroleに変換する() {
+        assert_eq!(
+            role_from_orchestrator_env("worker:demo"),
+            Some("orchestrator-worker:demo".into())
+        );
+    }
+
+    #[test]
+    fn 不明な形式は_none() {
+        assert_eq!(role_from_orchestrator_env("unknown"), None);
+        assert_eq!(role_from_orchestrator_env(""), None);
     }
 }

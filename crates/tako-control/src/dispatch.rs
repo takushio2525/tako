@@ -2578,7 +2578,7 @@ pub fn dispatch_orchestrator_layout(
     }))
 }
 
-/// OrchestratorSelf — master が自身の pane/tab/ctx% を取得する（#123 / #193）
+/// OrchestratorSelf — master が自身の pane/tab/ctx% を取得する（#123 / #193 / #210）
 fn dispatch_orchestrator_self(
     host: &dyn ControlHost,
     pane: Option<u64>,
@@ -2591,9 +2591,15 @@ fn dispatch_orchestrator_self(
         .or_else(|| caller_role.and_then(|r| r.strip_prefix("solo:")))
         .map(str::to_string);
 
-    // pane → role suffix → 全 master からの検索
+    // #210: pane → stale_pane_map（orphan 復元）→ role suffix → 全 master からの検索
     let (tab_id, pane_id) = if let Some(resolved) =
         pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok())
+    {
+        resolved
+    } else if let Some(resolved) = pane
+        .map(PaneId::from_raw)
+        .and_then(|stale| host.resolve_stale_pane(stale))
+        .and_then(|new_id| resolve_pane(host.workspace(), Some(new_id.as_u64())).ok())
     {
         resolved
     } else {
@@ -2890,9 +2896,16 @@ fn dispatch_orchestrator_spawn(
         None => format!("{project}-worker"),
     };
 
-    // 分割元ペインの解決。優先順位: pane > tab > caller_role の suffix > 任意 master
+    // #210: 分割元ペインの解決。pane > stale_pane_map > tab > caller_role の suffix > 任意 master
     let resolved_pane = pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok());
+    let stale_resolved = || -> Option<(TabId, PaneId)> {
+        let stale = PaneId::from_raw(pane?);
+        let new_id = host.resolve_stale_pane(stale)?;
+        resolve_pane(host.workspace(), Some(new_id.as_u64())).ok()
+    };
     let (tab_id, target) = if let Some(resolved) = resolved_pane {
+        resolved
+    } else if let Some(resolved) = stale_resolved() {
         resolved
     } else if let Some(raw_tab) = tab {
         let tid = find_tab(host.workspace(), raw_tab)?;
@@ -3944,6 +3957,8 @@ mod tests {
         collapsed: std::collections::HashSet<u64>,
         /// ピン留め: (group, id)
         pins: Vec<(bool, u64)>,
+        /// #210: 旧 pane ID → 新 pane ID マッピング
+        stale_pane_map: std::collections::HashMap<PaneId, PaneId>,
     }
 
     impl MockHost {
@@ -3956,6 +3971,7 @@ mod tests {
                 preview_edits: std::collections::HashMap::new(),
                 collapsed: std::collections::HashSet::new(),
                 pins: Vec::new(),
+                stale_pane_map: std::collections::HashMap::new(),
             }
         }
 
@@ -4102,7 +4118,11 @@ mod tests {
 
     impl WebViewHost for MockHost {}
     impl RemoteHost for MockHost {}
-    impl SystemHost for MockHost {}
+    impl SystemHost for MockHost {
+        fn resolve_stale_pane(&self, stale: PaneId) -> Option<PaneId> {
+            self.stale_pane_map.get(&stale).copied()
+        }
+    }
 
     fn split(host: &mut MockHost, pane: u64) -> u64 {
         dispatch(
@@ -6098,5 +6118,143 @@ mod tests {
             Some(tab1_pane),
             "suffix alpha のペインが返る"
         );
+    }
+
+    // --- #210: 同一プロファイル複数 master で self が自分を返す ---
+
+    #[test]
+    fn orchestrator_self_同一profile_2体が自分を返す() {
+        let mut host = MockHost::new();
+        let master_a = host.root_pane();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(master_a),
+                title: None,
+                role: Some("orchestrator-master:exam".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        let tab2 = dispatch(&mut host, Request::TabNew { title: None }, PaneOrigin::Cli).unwrap();
+        let master_b = tab2["pane"].as_u64().unwrap();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(master_b),
+                title: None,
+                role: Some("orchestrator-master:exam".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        // master A が caller_pane=master_a で self を呼ぶ → 自分を返す
+        let result_a = dispatch(
+            &mut host,
+            Request::OrchestratorSelf {
+                pane: Some(master_a),
+                caller_role: Some("master:exam".into()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(result_a["pane_id"].as_u64(), Some(master_a));
+
+        // master B が caller_pane=master_b で self を呼ぶ → 自分を返す
+        let result_b = dispatch(
+            &mut host,
+            Request::OrchestratorSelf {
+                pane: Some(master_b),
+                caller_role: Some("master:exam".into()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(result_b["pane_id"].as_u64(), Some(master_b));
+    }
+
+    #[test]
+    fn orchestrator_self_stale_pane_mapで旧pane_idを解決する() {
+        let mut host = MockHost::new();
+        let actual_pane = host.root_pane();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(actual_pane),
+                title: None,
+                role: Some("orchestrator-master:exam".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        // orphan 復元で旧 pane 99999 → 実 pane へのマッピングを登録
+        let stale_id = 99999_u64;
+        host.stale_pane_map
+            .insert(PaneId::from_raw(stale_id), PaneId::from_raw(actual_pane));
+
+        // 旧 pane ID で self を呼ぶ → stale_pane_map 経由で実ペインに解決
+        let result = dispatch(
+            &mut host,
+            Request::OrchestratorSelf {
+                pane: Some(stale_id),
+                caller_role: Some("master:exam".into()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(
+            result["pane_id"].as_u64(),
+            Some(actual_pane),
+            "stale pane ID が新 pane ID に解決される"
+        );
+    }
+
+    #[test]
+    fn orchestrator_spawn_stale_paneから分割元を解決する() {
+        with_test_project(|| {
+            let mut host = MockHost::new();
+            let master_pane = host.root_pane();
+            dispatch(
+                &mut host,
+                Request::Title {
+                    pane: Some(master_pane),
+                    title: None,
+                    role: Some("orchestrator-master".into()),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+
+            let stale_id = 88888_u64;
+            host.stale_pane_map
+                .insert(PaneId::from_raw(stale_id), PaneId::from_raw(master_pane));
+
+            let params = SpawnParams {
+                project: TEST_PROJECT,
+                prompt: "hello",
+                label: None,
+                model: None,
+                effort: Some("max"),
+                pane: Some(stale_id),
+                tab: None,
+                caller_role: Some("master:"),
+                agent: None,
+            };
+            let result = dispatch_orchestrator_spawn(&mut host, PaneOrigin::Mcp, params);
+            assert!(
+                result.is_ok(),
+                "stale pane からの spawn が成功する: {:?}",
+                result.err()
+            );
+            let val = result.unwrap();
+            assert_eq!(
+                val["spawned_by"].as_u64(),
+                Some(master_pane),
+                "spawned_by が実ペインを指す"
+            );
+        });
     }
 }
