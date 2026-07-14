@@ -722,3 +722,14 @@
   periodic_prep p50 17〜59ms → 0ms / max 116ms → 8ms。サブスパン診断 + perf.log 行混線修正も同梱
 - 外因も特定: worker 4 体の cargo build 並走で load avg 最大 161・swap 10.5/11GB・ディスク 99%
 - 検証: build / fmt / clippy(-D warnings) / test 全緑（638 passed）+ FFI の AC 判定を pmset と実機突き合わせ
+
+## 2026-07-14（#217: UI 大刷新 — Claude Design カンプの忠実再現 + 絵文字全廃）
+- カンプ（design/claude-design/tako-ui、コミット済み）を正に M1〜M7 で全面刷新: テーマ基盤
+  （ライト/ダーク = `tako theme` + MCP `tako_theme`、74 ツール）/ ピル型タブバー + ⌘K + ベル +
+  テーマボタン（タイトルバー統合）/ ペインヘッダ（番号バッジ・workers ▾・↳ 親・cwd チップ・
+  failed 赤 + 再実行）/ サイドバー（ブランチチップ・パスコピー・git サマリ）/ ステータスバー
+  （breadcrumb・5h/週リミット・ctx 改良）/ 右パネル 3 タブ + orch ビュー + トースト + ⌘K パレット /
+  絵文字全廃（tako-app grep 0 件、SVG アイコン 36 種を assets/icons/ui に新設）
+- 検証: build / fmt / clippy(-D warnings) / test 全緑（988 tests）+ 隔離セルフテスト完走
+  （33b テーマ MCP e2e・75 パレット新設）+ 隔離実機スクショでカンプ突き合わせ
+- 次: PR（Closes #217）→ squash merge → install → Issue に証拠 + 目視チェックリスト

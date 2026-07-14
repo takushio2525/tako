@@ -4,25 +4,25 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-14・#212 画面が重い・点滅・スクロールもっさり）
+## 現在の対象（2026-07-14・#217 UI 大刷新: Claude Design カンプの忠実再現）
 
-**#212 修正完了**（worktree tako-wt-212 / fix/212-perf-flicker。PR 準備中）:
+**#217 実装完了**（worktree tako-wt-217 / feat/217-ui-redesign。PR 準備中）:
 
-- 犯人: sleep guard（#173、v0.5.0）の AC 判定 `pmset -g batt` が UI スレッドで
-  2 秒毎に同期実行（アイドル 20〜30ms、CPU 飽和時に秒級 = perf.log の periodic_prep
-  スパイク 0.8〜2.9s と一致）。外因（worker 4 体の cargo build 並走 = load avg 最大 161・
-  swap 10.5/11GB・ディスク 99%）との複合で症状顕在化
-- 修正: ① `on_ac_power` を IOKit FFI（`IOPSGetTimeRemainingEstimate`）へ置換
-  ② periodic_prep にステップ別サブスパン追加 ③ perf.log 並行書き込みの行混線を単一 write 化
-- 実測: 隔離アイドルで periodic_prep p50 17〜59ms / max 116ms → **p50 0ms / max 8ms**。
-  FFI の AC 判定は pmset と一致（実機 AC 接続で -2.0 / true）
+- カンプ: `design/claude-design/tako-ui/project/tako Desktop 改善版.dc.html`（コミット済み）が正
+- M1〜M7 全マイルストーン完了: テーマ基盤（ライト/ダーク + `tako theme` + MCP `tako_theme`、
+  Catppuccin Mocha=カンプ実値 / Latte=ライト）→ ピル型タブバー（⌘K エントリ・ベル・テーマボタン、
+  タイトルバー統合）→ ペインヘッダ（番号バッジ・workers ▾・↳ 親リンク・cwd チップ・再実行）→
+  サイドバー（ブランチチップ・パスコピー・git サマリ）→ ステータスバー（breadcrumb・
+  5h/週リミットメーター・ctx 改良）→ orch ビュー + トースト + ⌘K パレット → 絵文字全廃（grep 0 件）
+- UI アイコンは `assets/icons/ui/*.svg`（カンプの SVG パスを忠実に写経、gpui::svg() マスク描画）
+- origin/main rebase 済み（#220 sleep-guard 蓋閉じと status_bar でコンフリクト → 解決済み）
 
 ## 次の一手
 
-- origin/main（#213〜#215 が進行）を rebase 取り込み → 全ゲート再実行 → push →
-  PR（Closes #212）→ squash merge → 本体リポで `build-app.sh --install` →
-  Issue に実測証拠つき完了コメント（症状解消の最終確認はユーザー体感・再発時 reopen）
+- PR（Closes #217）→ squash merge → 本体リポで `build-app.sh --install` →
+  Issue に実測証拠 + ユーザー目視チェックリスト
 
 ## 現フェーズで Read すべき設計書
 
-- ストール診断（perf_span / サブスパン / UI スレッド禁止事項）: `.agent/architecture.md` 診断節
+- カンプの実値確認: `design/claude-design/tako-ui/project/tako Desktop 改善版.dc.html`
+- テーマトークン対応: `crates/tako-core/src/theme.rs`（カンプ色 → トークンのコメント付き）
