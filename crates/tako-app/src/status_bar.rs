@@ -112,6 +112,8 @@ impl TakoApp {
                 toggle("statusbar-web", self.webview_dock_open)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.webview_dock_open = !this.webview_dock_open;
+                        // dock を開いたら URL 入力欄にフォーカス（#207）
+                        this.webview_dock_url_focused = this.webview_dock_open;
                         cx.notify();
                     }))
                     .child(if web_count > 0 {
