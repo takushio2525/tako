@@ -1255,7 +1255,7 @@ struct AttachedTmuxSession {
     windows: Vec<(u32, String)>,
 }
 
-/// どのタブにも表示されていない tmux セッション 1 件分（FR-2.16.8）。
+/// どのタブにも表示されていない tmux セッション 1 件分（FR-2.16.8 / #183）。
 /// `orphan_backend` = tako から起動されたが対応ペインを失った残骸（kill 漏れ?）、
 /// false = tako 管理外（ユーザーが直接立てた等）
 #[derive(Debug, Clone)]
@@ -1264,10 +1264,16 @@ struct UnlistedTmuxSession {
     socket: Option<String>,
     orphan_backend: bool,
     attached: bool,
-    created: i64,
-    location: String,
     /// (window index, 表示ラベル)
     windows: Vec<(u32, String)>,
+    /// ロール（TAKO_ORCHESTRATOR_ROLE。セッション名から推定）
+    role: String,
+    /// 中で走っているプロセス名
+    process: String,
+    /// セッションの cwd
+    cwd: String,
+    /// 最終アクティビティからの経過（人間可読）
+    last_activity_age: String,
 }
 
 /// ペイン行の並び順（注目度。エラー > 入力待ち > 実行中 > 不明）
@@ -2986,65 +2992,86 @@ impl TakoApp {
             .collect()
     }
 
-    /// どのタブにも表示されていない tmux セッションの抽出（FR-2.16.8）。
+    /// どのタブにも表示されていない tmux セッションの抽出（FR-2.16.8 / #183）。
     /// 対応ペインを持つバックエンドセッションはタブ枠内のペイン行が、tako ペイン内で
     /// attach 中のセッションはタブ枠内の紐付け表示（FR-2.16.9）が代表するため除外し、
-    /// 残りを「kill 漏れ?（orphan バックエンド）」と「管理外（ユーザー直起動等）」に分類する
+    /// 残りを「kill 漏れ?（orphan バックエンド）」と「管理外（ユーザー直起動等）」に分類する。
+    /// #183: ロール/cwd/プロセス/最終アクティビティを表示、orphan 判定を改良
     fn tmux_unlisted_sessions(&self) -> Vec<UnlistedTmuxSession> {
-        // バックグラウンド中ペインの backend セッションは「バックグラウンド中」セクションで表示するため、
-        // ここ（kill漏れ?/管理外）からは除外する（二重表示の防止。2026-06-15）
         let bg_sessions: std::collections::HashSet<String> = self
             .workspace
             .shelved_panes()
             .iter()
             .filter_map(|p| self.backend_sessions.get(&p.id()).cloned())
             .collect();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         self.tmux_sessions
             .iter()
             .filter_map(|session| {
                 let backend = session["backend"].as_bool().unwrap_or(false);
                 if backend && session["backend_pane"].as_u64().is_some() {
-                    return None; // タブ枠内のペイン行で表示済み
+                    return None;
                 }
                 if let Some(name) = session["name"].as_str() {
                     if name.starts_with("tako-view-") {
-                        return None; // tako 内部の viewer セッション（管理外に出さない）
+                        return None;
                     }
                     if bg_sessions.contains(name) {
-                        return None; // バックグラウンド中セクションで表示するため除外
+                        return None;
                     }
                 }
                 if Self::tmux_session_attached_at(session).is_some() {
-                    return None; // tako ペイン内で attach 中 = タブ枠へ紐付け表示済み
+                    return None;
                 }
-                let clients: Vec<String> = session["clients"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|c| match (c["tab"].as_u64(), c["pane"].as_u64()) {
-                        (Some(tab), Some(pane)) => format!("tako タブ {tab} / ペイン {pane}"),
-                        _ => format!("tako 外（{}）", c["tty"].as_str().unwrap_or("?")),
-                    })
-                    .collect();
-                let location = if backend {
-                    "orphan（対応ペインなし）".to_string()
-                } else if clients.is_empty() {
-                    "detached（どこにも表示されていない）".to_string()
-                } else {
-                    clients.join("、")
-                };
                 let windows = Self::tmux_session_windows(session);
+                let name_str = session["name"].as_str().unwrap_or("?").to_string();
+                let role = Self::infer_role_from_session_name(&name_str);
+                let process = session["pane_command"].as_str().unwrap_or("").to_string();
+                let cwd = session["pane_current_path"]
+                    .as_str()
+                    .map(|p| {
+                        if let Ok(home) = std::env::var("HOME") {
+                            if let Some(rest) = p.strip_prefix(&home) {
+                                return format!("~{rest}");
+                            }
+                        }
+                        p.to_string()
+                    })
+                    .unwrap_or_default();
+                let last_activity = session["last_activity"].as_i64().unwrap_or(0);
+                let last_activity_age = if last_activity > 0 {
+                    format_age(now - last_activity)
+                } else {
+                    String::new()
+                };
                 Some(UnlistedTmuxSession {
-                    name: session["name"].as_str().unwrap_or("?").to_string(),
+                    name: name_str,
                     socket: session["socket"].as_str().map(str::to_string),
                     orphan_backend: backend,
                     attached: session["attached"].as_bool().unwrap_or(false),
-                    created: session["created"].as_i64().unwrap_or(0),
-                    location,
                     windows,
+                    role,
+                    process,
+                    cwd,
+                    last_activity_age,
                 })
             })
             .collect()
+    }
+
+    /// セッション名から TAKO_ORCHESTRATOR_ROLE を推定する（#183）。
+    /// バックエンドセッション名は「orchestrator-worker:tako:167-mouse-leak」等の形式
+    fn infer_role_from_session_name(name: &str) -> String {
+        if let Some(rest) = name.strip_prefix("orchestrator-") {
+            return rest.to_string();
+        }
+        if name.starts_with("master") || name.starts_with("worker") || name.starts_with("solo") {
+            return name.to_string();
+        }
+        String::new()
     }
 
     /// 集約センターからのジャンプ（FR-2.10.2）。CLI / MCP と同じコマンド層

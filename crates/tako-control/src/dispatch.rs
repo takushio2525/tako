@@ -627,6 +627,10 @@ fn dispatch_inner(
                     // backend セッションを保持している tako ペイン（orphan なら null）
                     "backend_pane": owner.map(|(_, pane, _)| *pane),
                     "backend_tab": owner.map(|(_, _, tab)| *tab),
+                    "pane_pid": s.pane_pid,
+                    "pane_command": s.pane_command,
+                    "pane_current_path": s.pane_current_path,
+                    "last_activity": s.last_activity,
                     "windows": s.windows.iter().map(|w| json!({
                         "index": w.index,
                         "name": w.name,
@@ -4258,6 +4262,10 @@ pub fn fetch_tmux_sessions(ctx: &TmuxContext) -> Vec<Value> {
             "socket": socket,
             "backend_pane": owner.map(|(_, pane, _)| *pane),
             "backend_tab": owner.map(|(_, _, tab)| *tab),
+            "pane_pid": s.pane_pid,
+            "pane_command": s.pane_command,
+            "pane_current_path": s.pane_current_path,
+            "last_activity": s.last_activity,
             "windows": s.windows.iter().map(|w| json!({
                 "index": w.index,
                 "name": w.name,
