@@ -59,6 +59,8 @@ pub enum WatchOutcome {
         kind: WorkerErrorKind,
         detail: String,
     },
+    /// worker が停滞: 実行中子プロセスなし + 画面不変（#224）
+    Stalled { detail: String },
     /// ペインも tmux session も消滅した
     Gone,
     /// タイムアウトに達した（worker は動き続けている可能性がある）
@@ -134,6 +136,7 @@ pub fn wait_for_worker(
 
     let mut idle_streak: u32 = 0;
     let mut gone_streak: u32 = 0;
+    let mut stalled_streak: u32 = 0;
 
     loop {
         if let Some(dl) = deadline {
@@ -176,12 +179,14 @@ pub fn wait_for_worker(
                                 return WatchOutcome::Gone;
                             }
                         }
+                        stalled_streak = 0;
                     }
                     // "error" は「idle + 画面にエラーパターン」の細分類（#157）。
                     // 停止していることは同じなので idle と同じ streak で確定させ、
                     // 確定時にどちらの outcome かを画面から再判定する
                     "idle" | "error" => {
                         gone_streak = 0;
+                        stalled_streak = 0;
                         // 画面内容で busy パターンがあれば idle を取り消す
                         if screen_looks_busy(recent) {
                             idle_streak = 0;
@@ -189,13 +194,32 @@ pub fn wait_for_worker(
                             idle_streak += 1;
                         }
                     }
+                    // #224: dispatch が stalled と判定した場合。3 回連続で確定
+                    "stalled" => {
+                        gone_streak = 0;
+                        idle_streak = 0;
+                        stalled_streak += 1;
+                        if stalled_streak >= 3 {
+                            let detail = val["stalled"]
+                                .as_object()
+                                .and_then(|s| s.get("detail"))
+                                .and_then(|d| d.as_str())
+                                .unwrap_or(
+                                    "busy だが実行中の子プロセスが無く、画面の busy パターンも無い",
+                                )
+                                .to_string();
+                            return WatchOutcome::Stalled { detail };
+                        }
+                    }
                     "busy" => {
                         gone_streak = 0;
                         idle_streak = 0;
+                        stalled_streak = 0;
                     }
                     _ => {
                         // unknown: 画面内容から推定（判定不能は busy 扱い = 誤 idle 防止）
                         gone_streak = 0;
+                        stalled_streak = 0;
                         if screen_looks_busy(recent) {
                             idle_streak = 0;
                         } else if screen_looks_idle(recent) {
@@ -316,8 +340,8 @@ pub fn run_worker(
     );
     let final_status = match outcome {
         WatchOutcome::Idle { .. } => "completed",
-        // worker がエラー停止（#157）。ペイン消滅の "error" と区別する
         WatchOutcome::Error { .. } => "worker_error",
+        WatchOutcome::Stalled { .. } => "worker_stalled",
         WatchOutcome::Gone => "error",
         WatchOutcome::Timeout => "timeout",
     };
@@ -334,8 +358,12 @@ pub fn run_worker(
     .unwrap_or_default();
 
     // --- 4. 自動 close（run の完了後なので force: true）。
-    // エラー停止時は close しない: 続行指示・解除待ちで復帰できる余地を残す（#157） ---
-    let closed = if opts.auto_close && !matches!(outcome, WatchOutcome::Error { .. }) {
+    // エラー / stalled 時は close しない: 復帰できる余地を残す（#157 / #224） ---
+    let closed = if opts.auto_close
+        && !matches!(
+            outcome,
+            WatchOutcome::Error { .. } | WatchOutcome::Stalled { .. }
+        ) {
         exec(Request::Close {
             pane: Some(pane_id),
             force: true,
@@ -358,6 +386,12 @@ pub fn run_worker(
             "kind": kind.as_str(),
             "detail": detail,
             "recommended_action": kind.recommended_action(),
+        });
+    }
+    if let WatchOutcome::Stalled { detail } = &outcome {
+        result["stalled"] = json!({
+            "detail": detail,
+            "recommended_action": "check_and_resume",
         });
     }
     Ok(result)
@@ -529,6 +563,7 @@ pub fn run_status(run_id: &str) -> Result<Value, String> {
         let status = match &c.outcome {
             WatchOutcome::Idle { .. } => "completed",
             WatchOutcome::Error { .. } => "worker_error",
+            WatchOutcome::Stalled { .. } => "worker_stalled",
             WatchOutcome::Gone => "error",
             WatchOutcome::Timeout => "timeout",
         };
@@ -544,6 +579,12 @@ pub fn run_status(run_id: &str) -> Result<Value, String> {
                 "kind": kind.as_str(),
                 "detail": detail,
                 "recommended_action": kind.recommended_action(),
+            });
+        }
+        if let WatchOutcome::Stalled { detail } = &c.outcome {
+            result["stalled"] = json!({
+                "detail": detail,
+                "recommended_action": "check_and_resume",
             });
         }
         return Ok(result);
@@ -593,6 +634,7 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
     let final_status = match &c.outcome {
         WatchOutcome::Idle { .. } => "completed",
         WatchOutcome::Error { .. } => "worker_error",
+        WatchOutcome::Stalled { .. } => "worker_stalled",
         WatchOutcome::Gone => "error",
         WatchOutcome::Timeout => "timeout",
     };
@@ -607,8 +649,12 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
     .and_then(|v| v["text"].as_str().map(String::from))
     .unwrap_or_default();
 
-    // auto_close（エラー停止時は close しない。#157）
-    let closed = if auto_close && !matches!(c.outcome, WatchOutcome::Error { .. }) {
+    // auto_close（エラー / stalled 時は close しない。#157 / #224）
+    let closed = if auto_close
+        && !matches!(
+            c.outcome,
+            WatchOutcome::Error { .. } | WatchOutcome::Stalled { .. }
+        ) {
         exec(Request::Close {
             pane: Some(pane_id),
             force: true,
@@ -641,6 +687,12 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
             "recommended_action": kind.recommended_action(),
         });
     }
+    if let WatchOutcome::Stalled { detail } = &c.outcome {
+        result["stalled"] = json!({
+            "detail": detail,
+            "recommended_action": "check_and_resume",
+        });
+    }
     Ok(result)
 }
 
@@ -656,6 +708,7 @@ pub fn run_list() -> Value {
                 let status = match &c.outcome {
                     WatchOutcome::Idle { .. } => "completed",
                     WatchOutcome::Error { .. } => "worker_error",
+                    WatchOutcome::Stalled { .. } => "worker_stalled",
                     WatchOutcome::Gone => "error",
                     WatchOutcome::Timeout => "timeout",
                 };
@@ -735,6 +788,15 @@ pub fn screen_looks_idle(output: &str) -> bool {
         let t = l.trim_start();
         t.starts_with('❯') || t.starts_with('›') || t == ">" || t.starts_with("> ")
     })
+}
+
+/// TUI が折りたたみ状態（「N new messages (click) ↓」等で途中省略されている）かを検出する。
+/// claude TUI は長いツール実行後に出力を折りたたみ、最終的に「95 new messages (click) ↓」
+/// のような表示になる。この状態では read_pane / capture-pane のどちらでも最新の会話が取れない
+pub fn screen_is_collapsed(output: &str) -> bool {
+    output
+        .lines()
+        .any(|l| l.contains("new messages") && l.contains("click"))
 }
 
 /// worker 画面から異常停止パターンを検知する（#157）。
@@ -1356,5 +1418,124 @@ mod tests {
     fn run_listは全run一覧を返す() {
         let list = run_list();
         assert!(list["runs"].is_array());
+    }
+
+    // --- #224: stalled 検出 ---
+
+    fn stalled_resp() -> Result<Value, String> {
+        Ok(json!({
+            "status": "stalled",
+            "recent_output": "❯ \n──────\nmodel: opus",
+            "status_source": "agents-auto",
+            "ctx_percent": 42,
+            "stalled": {
+                "detail": "busy だが実行中の子プロセスが無く、画面の busy パターンも無い",
+                "recommended_action": "check_and_resume",
+            },
+        }))
+    }
+
+    #[test]
+    fn stalledは3回連続で確定する() {
+        let mut script = ExecScript::new(vec![stalled_resp(), stalled_resp(), stalled_resp()]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        match outcome {
+            WatchOutcome::Stalled { detail } => {
+                assert!(detail.contains("子プロセス"), "detail に根拠が含まれる");
+            }
+            other => panic!("Stalled になるはず: {other:?}"),
+        }
+        assert_eq!(script.seen.len(), 3);
+    }
+
+    #[test]
+    fn stalledはbusyで中断してリセットされる() {
+        let mut script = ExecScript::new(vec![
+            stalled_resp(),
+            stalled_resp(),
+            status("busy", BUSY_SCREEN, "agents"),
+            stalled_resp(),
+            stalled_resp(),
+            stalled_resp(),
+        ]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        assert!(matches!(outcome, WatchOutcome::Stalled { .. }));
+        assert_eq!(script.seen.len(), 6, "busy で中断後に 3 回で確定");
+    }
+
+    #[test]
+    fn stalledはidleで中断してリセットされる() {
+        let mut script = ExecScript::new(vec![
+            stalled_resp(),
+            stalled_resp(),
+            status("idle", IDLE_SCREEN, "agents"),
+            status("idle", IDLE_SCREEN, "agents"),
+            status("idle", IDLE_SCREEN, "agents"),
+        ]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        assert!(
+            matches!(outcome, WatchOutcome::Idle { .. }),
+            "idle の streak が優先して確定する"
+        );
+    }
+
+    // --- #224: 折りたたみ検出 ---
+
+    #[test]
+    fn 折りたたみ画面を検出する() {
+        assert!(screen_is_collapsed(
+            "⏺ some output\n\n95 new messages (click) ↓\n\n❯ \n──────"
+        ));
+        assert!(!screen_is_collapsed(IDLE_SCREEN));
+        assert!(!screen_is_collapsed(BUSY_SCREEN));
+    }
+
+    // --- #224: run_worker で stalled を扱う ---
+
+    #[test]
+    fn run_workerはstalledでworker_stalledを返しauto_closeしない() {
+        let mut script = ExecScript::new(vec![
+            Ok(json!({ "pane_id": 9, "spawned_by": 1, "tmux_session": null })),
+            stalled_resp(),
+            stalled_resp(),
+            stalled_resp(),
+            Ok(json!({ "pane": 9, "text": "停滞中の出力" })),
+        ]);
+        let opts = RunOptions {
+            project: "demo".into(),
+            prompt: "やって".into(),
+            label: None,
+            model: None,
+            effort: None,
+            agent: None,
+            pane: Some(1),
+            tab: None,
+            caller_role: None,
+            timeout: Duration::from_secs(60),
+            auto_close: true,
+            output_lines: 200,
+            initial_delay: Duration::ZERO,
+            interval: Duration::ZERO,
+        };
+        let result = {
+            let mut exec = |req: Request| {
+                script.seen.push(req);
+                script
+                    .responses
+                    .pop_front()
+                    .expect("スクリプトの応答が尽きた")
+            };
+            run_worker(&mut exec, &opts, &mut |_, _| {}).expect("成功する")
+        };
+        assert_eq!(result["status"], "worker_stalled");
+        assert_eq!(result["stalled"]["recommended_action"], "check_and_resume");
+        assert_eq!(result["closed"], false);
+        assert!(
+            !script
+                .seen
+                .iter()
+                .any(|r| matches!(r, Request::Close { .. })),
+            "stalled 時は auto_close しない"
+        );
     }
 }

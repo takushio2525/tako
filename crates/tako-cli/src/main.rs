@@ -1840,6 +1840,13 @@ fn orchestrator_watch(
             }
             println!("  action: {}", kind.recommended_action());
         }
+        wait::WatchOutcome::Stalled { detail } => {
+            println!("WORKER_STALLED: tako:{pane}");
+            if !detail.is_empty() {
+                println!("  detail: {detail}");
+            }
+            println!("  action: check_and_resume");
+        }
         wait::WatchOutcome::Gone => println!("WORKER_GONE: tako:{pane}"),
         wait::WatchOutcome::Timeout => println!("WORKER_TIMEOUT: tako:{pane}"),
     }
