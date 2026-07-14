@@ -602,6 +602,11 @@ client_tty = backend セッションの pane_tty）ため、backend を先に見
 - **PDF 選択の行間（#231）**: PDF の文字ヒットテストは行矩形内だけを有効とし、行間・
   ページ余白を文書末尾へクランプしない。選択開始時は操作を開始せず、ドラッグ中は直前の
   head を維持することで、行間から全テキスト選択へ化けることを防ぐ
+- **PDF ラスタライズ品質（#231 / #234）**: 固定 2x ではなく、表示幅（64 logical px 単位）×
+  `Window::scale_factor()`（1% 単位）× zoom（1% 単位）を `PdfRasterKey` とする。キー変更時は
+  120ms debounce 後に background で全ページを再ラスタライズし、完了までは旧画像を表示する。
+  `PreviewImageCache` も path だけでなく同じキーを比較し、古い PNG の `Arc<Image>` を誤再利用
+  しない。実ピクセル幅はメモリ上限として 4096px にクランプする
 - **syntect の行入力（#152）**: `SyntaxSet::load_defaults_newlines()` へ `str::lines()` の
   改行除去済み文字列を渡さない。`LinesWithEndings` で状態遷移に必要な改行を維持し、UI の行要素へ
   変換するときだけ末尾改行を除く。パス解決は読み取り / 編集で単一の `syntax_for_path` を使う

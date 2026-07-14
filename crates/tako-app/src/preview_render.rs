@@ -14,12 +14,18 @@ use super::*;
 /// 71 ページ PDF の実測で 1 フレーム p50 96ms（通常 2ms）まで劣化する。
 /// path が変わらない限り load 時に 1 回だけ構築した Arc を使い回す
 pub(crate) struct PreviewImageCache {
-    path: PathBuf,
+    key: PreviewImageCacheKey,
     /// PDF: ページごと（描画失敗の空ページは None）。画像 / サムネ: 先頭 1 要素
     images: Vec<Option<std::sync::Arc<gpui::Image>>>,
     /// PDF テキストレイヤのページごと Arc（paint の canvas クロージャへ毎フレーム
     /// move する分を to_vec から Arc clone に置き換える）
     text_layers: Vec<std::sync::Arc<Vec<preview::PdfTextLine>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreviewImageCacheKey {
+    Original(PathBuf),
+    Pdf(PathBuf, preview::PdfRasterKey),
 }
 
 /// PDFKit の文字矩形キャッシュから、現在の UTF-8 選択範囲に含まれる描画矩形を返す。
@@ -155,6 +161,97 @@ mod pdf_hit_test_tests {
 }
 
 impl TakoApp {
+    /// 表示幅・device scale に合う PDF 画像を background で用意する。
+    /// 64px / 1% 量子化キーが変わった時だけ要求し、連続リサイズは 120ms debounce 後の
+    /// 最新要求だけを実行する。結果待ち中は旧画像を拡縮表示して UI を止めない。
+    fn ensure_pdf_raster_quality(
+        &mut self,
+        pane_id: PaneId,
+        area: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let logical_width = (f32::from(area.size.width) - (PANE_PADDING + 4.0) * 2.0).max(1.0);
+        let desired =
+            preview::PdfRasterKey::for_view(self.preview_device_scale, 1.0, logical_width);
+        let Some(state) = self.previews.get(&pane_id) else {
+            return;
+        };
+        let preview::PreviewContent::Pdf(data) = &state.content else {
+            return;
+        };
+        if data.raster_key == desired {
+            return;
+        }
+        self.pending_pdf_rasters.insert(
+            pane_id,
+            PendingPdfRaster {
+                path: state.path.clone(),
+                key: desired,
+            },
+        );
+        if !self.active_pdf_rasters.insert(pane_id) {
+            return;
+        }
+
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(120))
+                .await;
+            let request =
+                match this.update(cx, |app, _| app.pending_pdf_rasters.get(&pane_id).cloned()) {
+                    Ok(Some(request)) => request,
+                    _ => {
+                        let _ = this.update(cx, |app, _| {
+                            app.active_pdf_rasters.remove(&pane_id);
+                        });
+                        break;
+                    }
+                };
+
+            let path = request.path.clone();
+            let key = request.key;
+            let result = cx
+                .background_executor()
+                .spawn(async move { preview::rasterize_pdf(&path, key) })
+                .await;
+
+            let retry = this
+                .update(cx, |app, cx| {
+                    if app.pending_pdf_rasters.get(&pane_id) != Some(&request) {
+                        return true;
+                    }
+                    app.pending_pdf_rasters.remove(&pane_id);
+                    app.active_pdf_rasters.remove(&pane_id);
+                    match result {
+                        Ok(rasterized) => {
+                            if let Some(state) = app.previews.get_mut(&pane_id) {
+                                if state.path == request.path {
+                                    if let preview::PreviewContent::Pdf(data) = &mut state.content {
+                                        data.pages = rasterized.pages;
+                                        data.total_pages = rasterized.total_pages;
+                                        data.page_sizes = rasterized.page_sizes;
+                                        data.pixel_sizes = rasterized.pixel_sizes;
+                                        data.raster_key = request.key;
+                                        app.preview_image_cache.remove(&pane_id);
+                                        cx.notify();
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("warning: PDF 再ラスタライズ失敗: {error}");
+                        }
+                    }
+                    false
+                })
+                .unwrap_or(false);
+            if !retry {
+                break;
+            }
+        })
+        .detach();
+    }
+
     fn preview_label(&self, target: PreviewTarget) -> String {
         match target {
             PreviewTarget::Pane(pane_id) => self.pane_preview_label(pane_id),
@@ -494,16 +591,20 @@ impl TakoApp {
             self.preview_image_cache.remove(&pane_id);
             return;
         };
-        if self
-            .preview_image_cache
-            .get(&pane_id)
-            .is_some_and(|c| c.path == state.path)
-        {
+        if self.preview_image_cache.get(&pane_id).is_some_and(|cache| {
+            match (&cache.key, &state.content) {
+                (PreviewImageCacheKey::Pdf(path, key), preview::PreviewContent::Pdf(data)) => {
+                    path == &state.path && *key == data.raster_key
+                }
+                (PreviewImageCacheKey::Original(path), _) => path == &state.path,
+                _ => false,
+            }
+        }) {
             return;
         }
         let built = match &state.content {
             preview::PreviewContent::Pdf(data) => Some(PreviewImageCache {
-                path: state.path.clone(),
+                key: PreviewImageCacheKey::Pdf(state.path.clone(), data.raster_key),
                 images: data
                     .pages
                     .iter()
@@ -531,7 +632,7 @@ impl TakoApp {
                     preview::ImageFileFormat::Svg => gpui::ImageFormat::Svg,
                 };
                 Some(PreviewImageCache {
-                    path: state.path.clone(),
+                    key: PreviewImageCacheKey::Original(state.path.clone()),
                     images: vec![Some(std::sync::Arc::new(gpui::Image::from_bytes(
                         gpui_format,
                         data.bytes.clone(),
@@ -541,7 +642,7 @@ impl TakoApp {
             }
             preview::PreviewContent::Video(data) if !data.thumbnail.is_empty() => {
                 Some(PreviewImageCache {
-                    path: state.path.clone(),
+                    key: PreviewImageCacheKey::Original(state.path.clone()),
                     images: vec![Some(std::sync::Arc::new(gpui::Image::from_bytes(
                         gpui::ImageFormat::Png,
                         data.thumbnail.clone(),
@@ -570,6 +671,7 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme.clone();
+        self.ensure_pdf_raster_quality(pane_id, area, cx);
         self.ensure_preview_image_cache(pane_id);
         let state = self.previews.get(&pane_id).expect("呼び出し前に確認済み");
         let file_name = state.file_name();
@@ -787,7 +889,7 @@ impl TakoApp {
                 // 構築済み。ここでは Arc clone だけ行う（旧実装は毎フレーム全ページの
                 // PNG clone + Image::from_bytes のフルハッシュで p50 96ms/frame だった）
                 let empty_cache = PreviewImageCache {
-                    path: PathBuf::new(),
+                    key: PreviewImageCacheKey::Original(PathBuf::new()),
                     images: Vec::new(),
                     text_layers: Vec::new(),
                 };

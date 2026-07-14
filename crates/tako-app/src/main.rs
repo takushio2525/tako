@@ -585,6 +585,13 @@ struct TakoApp {
     /// dispatch 中に依頼された重量プレビュー（PDF / 動画）の background 読み込み
     /// （Issue #168。Loading 表示 → 完了時差し替え。GPUI の Context が要るため遅延実行）
     pending_preview_loads: Vec<(PaneId, std::path::PathBuf, preview::PreviewMode)>,
+    /// 現在の GPUI ウィンドウが属する display の device scale。
+    /// PDF の実ピクセル解像度を表示幅へ合わせるため render 冒頭で更新する。
+    preview_device_scale: f32,
+    /// ペインごとの最新 PDF 再ラスタライズ要求。リサイズ中は最新キーだけを残す。
+    pending_pdf_rasters: HashMap<PaneId, PendingPdfRaster>,
+    /// debounce / background ラスタライズループが稼働中のペイン。
+    active_pdf_rasters: std::collections::HashSet<PaneId>,
     /// IME 変換中の未確定文字列（FR-1.9。None = 変換中でない）
     ime: Option<ImeComposition>,
     /// ドラッグ中のペイン境界（None = ドラッグしていない）
@@ -1064,6 +1071,13 @@ fn link_byte_range_in_chunk(
 struct PreviewSelection {
     anchor: (usize, usize),
     head: (usize, usize),
+}
+
+/// 最新の PDF 再ラスタライズ要求。path と量子化済みキーが一致した結果だけを採用する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingPdfRaster {
+    path: std::path::PathBuf,
+    key: preview::PdfRasterKey,
 }
 
 impl PreviewSelection {
@@ -1570,6 +1584,9 @@ impl TakoApp {
             prompt_flows: Vec::new(),
             pending_highlights: Vec::new(),
             pending_preview_loads: Vec::new(),
+            preview_device_scale: 1.0,
+            pending_pdf_rasters: HashMap::new(),
+            active_pdf_rasters: std::collections::HashSet::new(),
             ime: None,
             dragging_border: None,
             dragging_scrollbar: None,
@@ -10011,6 +10028,7 @@ impl PreviewHost for TakoApp {
         self.preview_text_layouts.remove(&pane);
         self.preview_line_texts.remove(&pane);
         self.preview_image_cache.remove(&pane);
+        self.pending_pdf_rasters.remove(&pane);
         self.previews.insert(pane, state);
         Ok(())
     }
@@ -10852,6 +10870,7 @@ impl Render for TakoApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Issue #168: フレーム構築（element tree 生成）のメインスレッド専有を計測
         let _span = tako_control::diag::perf_span("render");
+        self.preview_device_scale = window.scale_factor();
         // Web ビュー（FR-3.8）: wry の親にするウィンドウハンドルは render でしか
         // 採取できないため、初回 render で保存し、復元待ちの Web ビューを開き直す
         if self.window_raw_handle.is_none() {
