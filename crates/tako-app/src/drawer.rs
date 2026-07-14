@@ -24,6 +24,7 @@ impl TakoApp {
         {
             eprintln!("warning: バックグラウンドから復帰できない: {e}");
         }
+        self.reattach_backgrounded_preview(drag.pane);
         self.drag_kind = None;
         if self.workspace.shelved_panes().is_empty() {
             self.drawer_visible = false;
@@ -92,6 +93,12 @@ impl TakoApp {
                             if this.workspace.remove_shelved(pane_id).is_some() {
                                 this.terminals.remove(&pane_id);
                                 this.previews.remove(&pane_id);
+                                this.preview_edits.remove(&pane_id);
+                                this.preview_image_cache.remove(&pane_id);
+                                this.preview_views.remove(&pane_id);
+                                this.preview_scroll_handles.remove(&pane_id);
+                                this.video_players.remove(&pane_id);
+                                this.video_frame_cache.remove(&pane_id);
                                 this.sync_preview_watches();
                                 this.scroll_accum.remove(&pane_id);
                                 this.scroll_ctls.remove(&pane_id);
@@ -153,6 +160,7 @@ impl TakoApp {
                             {
                                 eprintln!("warning: バックグラウンドから復帰できない: {e}");
                             }
+                            this.reattach_backgrounded_preview(pane_id);
                             if this.workspace.shelved_panes().is_empty() {
                                 this.drawer_visible = false;
                             }

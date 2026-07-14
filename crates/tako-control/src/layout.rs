@@ -1024,4 +1024,57 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn bgプレビューペインの保存と復元() {
+        // #230: プレビューペインを BG 退避した状態が layout.json 経由で round-trip する
+        let root_pane = Pane::new(PaneOrigin::User);
+        let root_id = root_pane.id();
+        let preview_pane = Pane::new(PaneOrigin::User);
+        let preview_id = preview_pane.id();
+        let ws = {
+            let mut w = Workspace::new("t1", root_pane);
+            w.active_tab_mut()
+                .tree_mut()
+                .split(root_id, SplitDirection::Right, preview_pane)
+                .unwrap();
+            w.shelve_pane(preview_id).unwrap();
+            assert!(w.is_shelved(preview_id));
+            w
+        };
+        let layout = capture(
+            &ws,
+            &|pane| {
+                if pane == preview_id {
+                    PaneMeta {
+                        preview: Some(PreviewLayout {
+                            path: "/tmp/test.md".into(),
+                            mode: "markdown".into(),
+                        }),
+                        ..Default::default()
+                    }
+                } else {
+                    PaneMeta::default()
+                }
+            },
+            None,
+        );
+        assert_eq!(layout.backgrounded.len(), 1);
+        assert_eq!(
+            layout.backgrounded[0].preview.as_ref().unwrap().path,
+            "/tmp/test.md"
+        );
+        assert_eq!(
+            layout.backgrounded[0].preview.as_ref().unwrap().mode,
+            "markdown"
+        );
+        // round-trip: JSON → 復元
+        let json = serde_json::to_string(&layout).unwrap();
+        let file: LayoutFile = serde_json::from_str(&json).unwrap();
+        let (restored_ws, restored_panes) = restore(&file).unwrap();
+        assert_eq!(restored_ws.shelved_panes().len(), 1);
+        let bg_restored = restored_panes.iter().find(|p| p.preview.is_some()).unwrap();
+        assert_eq!(bg_restored.preview.as_ref().unwrap().path, "/tmp/test.md");
+        assert_eq!(bg_restored.preview.as_ref().unwrap().mode, "markdown");
+    }
 }

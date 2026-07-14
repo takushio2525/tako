@@ -1526,15 +1526,19 @@ fn dispatch_inner(
                 .shelved_panes()
                 .iter()
                 .map(|p| {
-                    let state = host
-                        .session(p.id())
-                        .map(|s| s.command_state())
-                        .unwrap_or(CommandState::Unknown);
+                    let preview = host.preview_state(p.id());
+                    let state = if preview.is_some() {
+                        CommandState::Idle
+                    } else {
+                        host.session(p.id())
+                            .map(|s| s.command_state())
+                            .unwrap_or(CommandState::Unknown)
+                    };
                     let cwd = host
                         .session(p.id())
                         .and_then(|s| s.cwd())
                         .map(|p| p.display().to_string());
-                    json!({
+                    let mut entry = json!({
                         "pane": p.id().as_u64(),
                         "title": p.title(),
                         "role": p.role(),
@@ -1543,7 +1547,14 @@ fn dispatch_inner(
                         "origin_tab": p.origin_tab().as_u64(),
                         "origin_tab_title": p.origin_tab_title(),
                         "surface": "background",
-                    })
+                    });
+                    if let Some((path, mode)) = preview {
+                        entry["preview"] = json!({
+                            "path": path,
+                            "mode": mode.as_str(),
+                        });
+                    }
+                    entry
                 })
                 .collect();
             Ok(json!({ "backgrounded": items }))
@@ -5307,6 +5318,67 @@ mod tests {
             PaneOrigin::Cli,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn backgroundリストにプレビュー情報が含まれる() {
+        // #230: プレビューペインを BG 退避したとき BackgroundList にプレビュー情報が載る
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        host.previews
+            .insert(root, ("/tmp/test.md".into(), PreviewModeWire::Markdown));
+        host.ws.create_tab("t2", Pane::new(PaneOrigin::User));
+        dispatch(
+            &mut host,
+            Request::Background {
+                pane: Some(root),
+                tab: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let result = dispatch(&mut host, Request::BackgroundList, PaneOrigin::Cli).unwrap();
+        let items = result["backgrounded"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["state"].as_str(), Some("idle"));
+        let preview = &items[0]["preview"];
+        assert_eq!(preview["path"].as_str(), Some("/tmp/test.md"));
+        assert_eq!(preview["mode"].as_str(), Some("markdown"));
+    }
+
+    #[test]
+    fn プレビューペインのforeground復帰() {
+        // #230: プレビューペインの退避 → 復帰でツリーに戻り、プレビュー情報を保持
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let p2 = split(&mut host, root);
+        host.previews
+            .insert(p2, ("/tmp/test.rs".into(), PreviewModeWire::Code));
+        host.ws.create_tab("t2", Pane::new(PaneOrigin::User));
+        dispatch(
+            &mut host,
+            Request::Background {
+                pane: Some(p2),
+                tab: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!(host.ws.is_shelved(PaneId::from_raw(p2)));
+        assert!(host.previews.contains_key(&p2));
+        let result = dispatch(
+            &mut host,
+            Request::Foreground {
+                pane: p2,
+                target: None,
+                direction: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["foregrounded"].as_u64(), Some(p2));
+        assert!(!host.ws.is_shelved(PaneId::from_raw(p2)));
+        assert!(host.previews.contains_key(&p2));
     }
 
     #[test]

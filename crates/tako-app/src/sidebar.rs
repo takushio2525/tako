@@ -1074,13 +1074,17 @@ impl TakoApp {
 
     /// 表示中かつ対応形式のパスだけを親ディレクトリの非再帰監視へ同期する。
     /// render からは呼ばず、open / close / 設定切替時だけ実行する。
+    /// BG 退避中のプレビューは監視対象から除外する（#230）。
     pub(crate) fn sync_preview_watches(&mut self) {
         let _span = tako_control::diag::perf_span("preview_watch_sync");
         let paths: Vec<std::path::PathBuf> = if self.preview_reload.enabled() {
             self.previews
-                .values()
-                .filter(|state| preview::live_reload_supported(state.mode))
-                .map(|state| state.path.clone())
+                .iter()
+                .filter(|(pane_id, state)| {
+                    preview::live_reload_supported(state.mode)
+                        && !self.workspace.is_shelved(**pane_id)
+                })
+                .map(|(_, state)| state.path.clone())
                 .collect()
         } else {
             Vec::new()
