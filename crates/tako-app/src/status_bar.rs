@@ -155,7 +155,21 @@ impl TakoApp {
                             ))),
                     )
             }))
-            .when(self.sleep_guard_active, |d| {
+            .when(self.sleep_guard_active || self.lid_sleep_disabled, |d| {
+                let label = if self.lid_sleep_disabled {
+                    if self.thermal_warning {
+                        "awake+lid (!)".to_string()
+                    } else {
+                        "awake+lid".to_string()
+                    }
+                } else {
+                    "awake".to_string()
+                };
+                let color = if self.thermal_warning {
+                    theme.red
+                } else {
+                    theme.teal
+                };
                 d.child(
                     div()
                         .flex()
@@ -166,17 +180,13 @@ impl TakoApp {
                         .px_2()
                         .border_r_1()
                         .border_color(hsla(theme.border_subtle))
-                        .child(
-                            div()
-                                .text_size(px(10.5))
-                                .text_color(hsla(theme.teal))
-                                .child("☕"),
-                        )
+                        // 丸ドット（描画プリミティブ。絵文字禁止 #217）
+                        .child(div().size(px(6.0)).rounded(px(3.0)).bg(hsla(color)))
                         .child(
                             div()
                                 .text_size(px(10.5))
                                 .text_color(hsla(theme.tab_inactive_foreground))
-                                .child("awake"),
+                                .child(SharedString::from(label)),
                         ),
                 )
             })

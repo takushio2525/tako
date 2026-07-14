@@ -769,6 +769,12 @@ struct TakoApp {
     pending_close_confirm: Option<CloseConfirmTarget>,
     /// スリープ防止のアサーションが現在保持中か（ステータスバー表示用。ポーリングで更新）
     sleep_guard_active: bool,
+    /// 蓋が閉じているか（#218 ステータスバー表示用）
+    lid_closed: bool,
+    /// pmset disablesleep が有効か（#218 ステータスバー表示用）
+    lid_sleep_disabled: bool,
+    /// thermal 警告中か（#218 ステータスバー表示用）
+    thermal_warning: bool,
     /// 起動時に orphan 自動復帰した tmux セッション数（Issue #191。診断用）
     recovered_count: usize,
     /// ペインの平文ログ管理（Issue #112 B）
@@ -1595,6 +1601,9 @@ impl TakoApp {
             confirm_close: tako_control::setup::confirm_close_enabled(),
             pending_close_confirm: None,
             sleep_guard_active: false,
+            lid_closed: false,
+            lid_sleep_disabled: false,
+            thermal_warning: false,
             recovered_count: 0,
             pane_logs: std::sync::Arc::new(std::sync::Mutex::new(
                 tako_core::pane_log::PaneLogManager::new(
@@ -1606,7 +1615,9 @@ impl TakoApp {
             autosave_pending: std::collections::HashSet::new(),
         };
         // App Nap 無効化 + 初回スリープ防止更新（Issue #173）
+        // 蓋閉じ防止の残留チェック（#218: 前回クラッシュ時の disablesleep=1 を自動復帰）
         tako_control::sleep_guard::disable_app_nap();
+        tako_control::sleep_guard::check_disablesleep_residual();
         app.update_sleep_guard();
 
         // 終了処理（layout 保存 + 接続情報の後片付け）はアプリ終了フックで一元化する
@@ -1631,6 +1642,8 @@ impl TakoApp {
                         this.apply_pane_log_close(pane, data, CloseReason::Exited);
                     }
                 }
+                // 蓋閉じ防止の解除（#218: 正常終了時に disablesleep を 0 に戻す）
+                tako_control::sleep_guard::cleanup_on_exit();
                 // 終了直前の構成を保存してから抜ける（Phase 5.5。セッションは残る = 永続化）
                 this.save_layout();
                 // persist ON（セッション生存）なら接続情報を残す: ソケットパス・トークンが
@@ -5423,9 +5436,13 @@ impl TakoApp {
         let state = tako_control::sleep_guard::update(
             settings.sleep_guard_mode,
             settings.sleep_guard_power,
+            settings.lid_sleep_mode,
             busy_agents,
         );
         self.sleep_guard_active = state.assertion_held;
+        self.lid_closed = state.lid_closed;
+        self.lid_sleep_disabled = state.lid_sleep_disabled;
+        self.thermal_warning = state.thermal_state.is_warning();
     }
 
     // --- D&D（FR-2.16.10 tmux セッション取り込み / FR-3.11 ファイルプレビュー） ---

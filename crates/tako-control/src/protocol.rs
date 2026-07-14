@@ -619,8 +619,10 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         targets: Option<Vec<String>>,
     },
-    /// スリープ防止機能の状態確認・設定変更（Issue #173）。
+    /// スリープ防止機能の状態確認・設定変更（Issue #173 + #218 蓋閉じ対応）。
     /// `action` = "status"（既定）/ "set"（モード・電源条件の変更）
+    ///          / "install-lid-sleep"（sudoers 登録）/ "remove-lid-sleep"（sudoers 削除）
+    ///          / "open-battery-settings"（System Settings フォールバック）
     SleepGuard {
         #[serde(default)]
         action: Option<String>,
@@ -630,6 +632,9 @@ pub enum Request {
         /// 電源条件: "ac-only" / "always"
         #[serde(default, skip_serializing_if = "Option::is_none")]
         power_condition: Option<String>,
+        /// 蓋閉じ防止モード: "off" / "while-agents-running"（#218）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lid_sleep_mode: Option<String>,
     },
     /// ファイルツリーへのフォルダ追加・削除・一覧（#134）。
     /// AI が作業対象プロジェクトのフォルダをファイルツリーに明示追加する。タブ単位スコープ

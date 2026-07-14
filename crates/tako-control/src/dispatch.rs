@@ -1865,6 +1865,7 @@ fn dispatch_inner(
             action,
             mode,
             power_condition,
+            lid_sleep_mode,
         } => {
             let action = action.as_deref().unwrap_or("status");
             match action {
@@ -1873,6 +1874,7 @@ fn dispatch_inner(
                     Ok(crate::sleep_guard::status(
                         settings.sleep_guard_mode,
                         settings.sleep_guard_power,
+                        settings.lid_sleep_mode,
                     )
                     .to_json())
                 }
@@ -1898,16 +1900,61 @@ fn dispatch_inner(
                                 },
                             )?;
                     }
+                    if let Some(lsm) = lid_sleep_mode.as_deref() {
+                        settings.lid_sleep_mode =
+                            crate::sleep_guard::LidSleepMode::from_str_opt(lsm).ok_or_else(
+                                || {
+                                    DispatchError::InvalidParams(format!(
+                                        "不明な lid_sleep_mode: {lsm:?}（off / while-agents-running のいずれか）"
+                                    ))
+                                },
+                            )?;
+                    }
                     crate::settings::save(&settings)
                         .map_err(|e| DispatchError::Operation(format!("設定の保存に失敗: {e}")))?;
                     Ok(crate::sleep_guard::status(
                         settings.sleep_guard_mode,
                         settings.sleep_guard_power,
+                        settings.lid_sleep_mode,
                     )
                     .to_json())
                 }
+                "install-lid-sleep" => {
+                    let result = crate::sleep_guard::install_sudoers()
+                        .map_err(DispatchError::Operation)?;
+                    let mut settings = crate::settings::load();
+                    settings.lid_sleep_mode =
+                        crate::sleep_guard::LidSleepMode::WhileAgentsRunning;
+                    crate::settings::save(&settings)
+                        .map_err(|e| DispatchError::Operation(format!("設定の保存に失敗: {e}")))?;
+                    Ok(serde_json::json!({
+                        "result": result,
+                        "lid_sleep_mode": "while-agents-running",
+                        "sudoers_installed": true,
+                    }))
+                }
+                "remove-lid-sleep" => {
+                    let result = crate::sleep_guard::remove_sudoers()
+                        .map_err(DispatchError::Operation)?;
+                    let mut settings = crate::settings::load();
+                    settings.lid_sleep_mode = crate::sleep_guard::LidSleepMode::Off;
+                    crate::settings::save(&settings)
+                        .map_err(|e| DispatchError::Operation(format!("設定の保存に失敗: {e}")))?;
+                    Ok(serde_json::json!({
+                        "result": result,
+                        "lid_sleep_mode": "off",
+                        "sudoers_installed": false,
+                    }))
+                }
+                "open-battery-settings" => {
+                    crate::sleep_guard::open_battery_settings()
+                        .map_err(DispatchError::Operation)?;
+                    Ok(serde_json::json!({
+                        "result": "System Settings の Battery を開きました",
+                    }))
+                }
                 other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / set のいずれか）"
+                    "不明な action: {other:?}（status / set / install-lid-sleep / remove-lid-sleep / open-battery-settings のいずれか）"
                 ))),
             }
         }

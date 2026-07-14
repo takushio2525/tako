@@ -1440,33 +1440,38 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_sleep_guard",
-            "description": "スリープ防止機能の状態確認・設定変更（Issue #173）。\
+            "description": "スリープ防止機能の状態確認・設定変更（Issue #173 + #218 蓋閉じ対応）。\
                 macOS のアイドルスリープを IOKit 電源アサーションで防止する。\
-                ディスプレイスリープは妨げない（画面は消えてよい）。\
-                action=status（既定）: 現在のモード・電源条件・アサーション状態を返す。\
-                action=set: mode（off / on / while-agents-running）と \
-                power_condition（ac-only / always）を設定する。\
-                while-agents-running モードでは busy なエージェントが 1 体でもいる間だけ \
-                アサーションを保持し、全 idle で自動解放する（既定）。\
-                ユーザーが「PC がスリープして作業が止まった」と言った場合は、\
-                まず status で確認し、set で適切な設定に変更すること。",
+                蓋閉じ防止は pmset disablesleep で制御（sudoers 登録が必要）。\
+                action=status（既定）: モード・電源条件・アサーション状態・蓋の開閉・thermal 状態を返す。\
+                action=set: mode / power_condition / lid_sleep_mode を設定する。\
+                action=install-lid-sleep: sudoers.d に pmset NOPASSWD を登録（管理者パスワード必要、初回のみ）。\
+                action=remove-lid-sleep: sudoers.d から削除 + disablesleep 解除。\
+                action=open-battery-settings: System Settings の Battery を開く（フォールバック）。\
+                ユーザーが「PC がスリープして作業が止まった」「蓋を閉じても続けたい」と言った場合は、\
+                まず status で確認し、蓋閉じ防止なら install-lid-sleep で登録を案内すること。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "set"],
+                        "enum": ["status", "set", "install-lid-sleep", "remove-lid-sleep", "open-battery-settings"],
                         "description": "操作種別（省略時は status）",
                     },
                     "mode": {
                         "type": "string",
                         "enum": ["off", "on", "while-agents-running"],
-                        "description": "スリープ防止モード（set 時のみ有効）",
+                        "description": "アイドルスリープ防止モード（set 時のみ有効）",
                     },
                     "power_condition": {
                         "type": "string",
                         "enum": ["ac-only", "always"],
                         "description": "電源条件（set 時のみ有効）",
+                    },
+                    "lid_sleep_mode": {
+                        "type": "string",
+                        "enum": ["off", "while-agents-running"],
+                        "description": "蓋閉じ防止モード（set 時のみ有効。要 sudoers 登録）",
                     },
                 },
                 "additionalProperties": false,
@@ -2259,6 +2264,7 @@ fn build_request(
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             mode: str_arg(args, "mode")?.map(|s| s.to_string()),
             power_condition: str_arg(args, "power_condition")?.map(|s| s.to_string()),
+            lid_sleep_mode: str_arg(args, "lid_sleep_mode")?.map(|s| s.to_string()),
         },
         "tako_setup_changes" => Request::SetupChanges,
         "tako_agents_sync_rules" => Request::AgentsSyncRules {
