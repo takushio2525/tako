@@ -1,7 +1,10 @@
-use gpui::{div, point, prelude::*, px, relative, BoxShadow, Context, FontWeight, SharedString};
+use gpui::{
+    div, point, prelude::*, px, relative, svg, BoxShadow, Context, FontWeight, SharedString,
+};
 use tako_core::CommandState;
 
 use super::*;
+use crate::file_icons::ui_icon;
 
 impl TakoApp {
     pub(crate) fn render_status_bar(&mut self, cx: &mut Context<Self>) -> gpui::Div {
@@ -18,11 +21,11 @@ impl TakoApp {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap_1()
+                .gap(px(6.0))
                 .h_full()
-                .px_2()
+                .px(px(11.0))
                 .cursor_pointer()
-                .text_size(px(10.5))
+                .text_size(px(11.5))
                 .when(active, |d| {
                     d.text_color(hsla(theme.accent))
                         .bg(rgba_alpha(theme.accent, 0.1))
@@ -32,6 +35,7 @@ impl TakoApp {
                 .border_r_1()
                 .border_color(hsla(theme.border_subtle))
         };
+        // master エントリ（カンプ: master アイコン + N workers + 失敗ドット）
         let fleet_label = {
             let has_master = self
                 .workspace
@@ -44,7 +48,7 @@ impl TakoApp {
                     })
                 });
             if has_master {
-                let worker_count: usize = self
+                let workers: Vec<CommandState> = self
                     .workspace
                     .tabs()
                     .iter()
@@ -53,8 +57,18 @@ impl TakoApp {
                         p.role()
                             .is_some_and(|r| r.starts_with("orchestrator-worker:"))
                     })
+                    .map(|p| {
+                        self.terminals
+                            .get(&p.id())
+                            .map(|s| s.command_state())
+                            .unwrap_or(CommandState::Unknown)
+                    })
+                    .collect();
+                let failed = workers
+                    .iter()
+                    .filter(|s| matches!(s, CommandState::Failed(_)))
                     .count();
-                Some(worker_count)
+                Some((workers.len(), failed))
             } else {
                 None
             }
@@ -70,6 +84,53 @@ impl TakoApp {
         let ctx_fill_frac = ctx_pct as f32 / 100.0;
         let ctx_detail = self.agent_metrics.ctx_detail.clone();
         let usage_text = self.agent_metrics.usage_text.clone();
+        let limit_5h = self.agent_metrics.limit_5h;
+        let limit_week = self.agent_metrics.limit_week;
+        // リミット表示があるとき、usage_text が同じ「Nh NN%」なら重複表示を避ける
+        let usage_text = usage_text.filter(|t| {
+            limit_5h.is_none() || t.contains('$') || t.contains('k') || t.contains('K')
+        });
+        // リミットの色（カンプ: >=90 red / >=70 yellow / 通常 text_tertiary）
+        let limit_color = |v: u32| {
+            if v >= 90 {
+                theme.red
+            } else if v >= 70 {
+                theme.yellow
+            } else {
+                theme.text_tertiary
+            }
+        };
+        // フォーカスペインの cwd（カンプ: breadcrumb。クリックでコピー）
+        let cwd_breadcrumb = self.active_tab_cwd().map(|p| {
+            let full = p.display().to_string();
+            let short = if let Ok(home) = std::env::var("HOME") {
+                if let Ok(rel) = p.strip_prefix(&home) {
+                    format!("~/{}", rel.display())
+                } else {
+                    full.clone()
+                }
+            } else {
+                full.clone()
+            };
+            let (parent, leaf) = match short.rfind('/') {
+                Some(i) if i + 1 < short.len() => {
+                    (short[..=i].to_string(), short[i + 1..].to_string())
+                }
+                _ => (String::new(), short.clone()),
+            };
+            (parent, leaf, full)
+        });
+        // アクティブタブ名（カンプ: ctx メーターに表示）
+        let active_tab_name = self.workspace.active_tab().title().to_string();
+        let sparkline: Vec<f32> = {
+            let max = self
+                .usage_history
+                .iter()
+                .cloned()
+                .fold(f32::MIN, f32::max)
+                .max(1.0);
+            self.usage_history.iter().map(|v| v / max).collect()
+        };
 
         div()
             .flex()
@@ -81,12 +142,24 @@ impl TakoApp {
             .bg(rgba(theme.tab_bar_background))
             .border_t_1()
             .border_color(hsla(theme.border_subtle))
+            .text_size(px(11.5))
             .child(
                 toggle("statusbar-filetree", self.filetree.visible)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_filetree();
                         cx.notify();
                     }))
+                    .child(
+                        svg()
+                            .path(ui_icon::FOLDER)
+                            .w(px(13.0))
+                            .h(px(13.0))
+                            .text_color(if self.filetree.visible {
+                                hsla(theme.accent)
+                            } else {
+                                hsla(theme.text_tertiary)
+                            }),
+                    )
                     .child("Files"),
             )
             .child({
@@ -100,10 +173,24 @@ impl TakoApp {
                     .on_drop::<TabDrag>(cx.listener(|this, drag: &TabDrag, _, cx| {
                         this.background_tab(drag.tab, cx);
                     }))
-                    .child(if bg_count > 0 {
-                        format!("BG {bg_count}")
-                    } else {
-                        "BG".into()
+                    .child(
+                        svg()
+                            .path(ui_icon::BG_DRAWER)
+                            .w(px(13.0))
+                            .h(px(13.0))
+                            .text_color(if drawer_open {
+                                hsla(theme.accent)
+                            } else {
+                                hsla(theme.text_tertiary)
+                            }),
+                    )
+                    .child("BG")
+                    .when(bg_count > 0, |d| {
+                        d.child(
+                            div()
+                                .text_color(hsla(theme.text_muted))
+                                .child(SharedString::from(bg_count.to_string())),
+                        )
                     })
             })
             .child({
@@ -116,44 +203,113 @@ impl TakoApp {
                         this.webview_dock_url_focused = this.webview_dock_open;
                         cx.notify();
                     }))
-                    .child(if web_count > 0 {
-                        format!("🌐 {web_count}")
-                    } else {
-                        "🌐".into()
+                    .child(
+                        svg()
+                            .path(ui_icon::GLOBE)
+                            .w(px(13.0))
+                            .h(px(13.0))
+                            .text_color(if self.webview_dock_open {
+                                hsla(theme.accent)
+                            } else {
+                                hsla(theme.text_tertiary)
+                            }),
+                    )
+                    .when(web_count > 0, |d| {
+                        d.child(
+                            div()
+                                .text_color(hsla(theme.text_muted))
+                                .child(SharedString::from(web_count.to_string())),
+                        )
                     })
             })
-            .children(fleet_label.map(|worker_count| {
+            // フォーカスペインの cwd breadcrumb（カンプ新設。クリックでコピー）
+            .children(cwd_breadcrumb.map(|(parent, leaf, full)| {
+                div()
+                    .id("statusbar-cwd")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.0))
+                    .h_full()
+                    .px(px(12.0))
+                    .border_r_1()
+                    .border_color(hsla(theme.border_subtle))
+                    .font_family(theme.font_family.clone())
+                    .text_size(px(11.0))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgba(theme.surface_hover)))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(full.clone()));
+                    }))
+                    .child(
+                        svg()
+                            .path(ui_icon::FOLDER)
+                            .w(px(12.0))
+                            .h(px(12.0))
+                            .text_color(hsla(theme.text_muted)),
+                    )
+                    .child(
+                        div()
+                            .text_color(hsla(theme.text_faint))
+                            .child(SharedString::from(truncate(&parent, 28))),
+                    )
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(hsla(theme.foreground))
+                            .child(SharedString::from(truncate(&leaf, 20))),
+                    )
+                    .child(
+                        svg()
+                            .path(ui_icon::COPY)
+                            .w(px(10.0))
+                            .h(px(10.0))
+                            .text_color(hsla(theme.text_faint)),
+                    )
+            }))
+            // master エントリ（カンプ: master アイコン + N workers + 失敗ドット）
+            .children(fleet_label.map(|(worker_count, failed)| {
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(4.0))
+                    .gap(px(7.0))
                     .h_full()
-                    .px_2()
+                    .px(px(12.0))
                     .border_r_1()
                     .border_color(hsla(theme.border_subtle))
                     .hover(|d| d.bg(rgba(theme.surface_hover)))
                     .child(
-                        div()
-                            .text_size(px(10.5))
-                            .text_color(hsla(theme.accent))
-                            .child("⚙"),
+                        svg()
+                            .path(ui_icon::MASTER)
+                            .w(px(13.0))
+                            .h(px(13.0))
+                            .text_color(hsla(theme.accent)),
                     )
                     .child(
                         div()
-                            .text_size(px(10.5))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(hsla(theme.tab_active_foreground))
+                            .text_color(hsla(theme.foreground))
                             .child("master"),
                     )
                     .child(
                         div()
-                            .text_size(px(10.5))
-                            .text_color(hsla(theme.tab_inactive_foreground))
+                            .text_color(hsla(theme.text_muted))
                             .child(SharedString::from(format!(
                                 "\u{00B7} {worker_count} workers"
                             ))),
                     )
+                    .when(failed > 0, |d| {
+                        d.child(
+                            div()
+                                .w(px(6.0))
+                                .h(px(6.0))
+                                .ml(px(2.0))
+                                .flex_none()
+                                .rounded_full()
+                                .bg(hsla(theme.red)),
+                        )
+                    })
             }))
             .when(self.sleep_guard_active || self.lid_sleep_disabled, |d| {
                 let label = if self.lid_sleep_disabled {
@@ -175,23 +331,76 @@ impl TakoApp {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(4.0))
+                        .gap(px(5.0))
                         .h_full()
-                        .px_2()
+                        .px(px(11.0))
                         .border_r_1()
                         .border_color(hsla(theme.border_subtle))
-                        // 丸ドット（描画プリミティブ。絵文字禁止 #217）
-                        .child(div().size(px(6.0)).rounded(px(3.0)).bg(hsla(color)))
+                        // coffee アイコン（#217 SVG。#220 の蓋閉じ・高温警告の色分けを維持）
+                        .child(
+                            svg()
+                                .path(ui_icon::COFFEE)
+                                .w(px(13.0))
+                                .h(px(13.0))
+                                .text_color(hsla(color)),
+                        )
                         .child(
                             div()
-                                .text_size(px(10.5))
-                                .text_color(hsla(theme.tab_inactive_foreground))
+                                .text_color(hsla(theme.text_muted))
                                 .child(SharedString::from(label)),
                         ),
                 )
             })
             .child(div().flex_grow(1.0))
             .children(self.render_update_banner(&theme, cx))
+            // 利用リミットメーター（カンプ新設: 5h / 週。データが取れたときだけ表示）
+            .when(limit_5h.is_some() || limit_week.is_some(), |d| {
+                let meter = |label: &'static str, v: u32| {
+                    let color = limit_color(v);
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(5.0))
+                        .child(div().text_color(hsla(theme.text_muted)).child(label))
+                        .child(
+                            div()
+                                .w(px(42.0))
+                                .h(px(5.0))
+                                .rounded(px(3.0))
+                                .bg(rgba(theme.surface_highlight))
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(relative((v as f32 / 100.0).min(1.0)))
+                                        .bg(hsla(color)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .font_family(theme.font_family.clone())
+                                .text_size(px(10.5))
+                                .text_color(hsla(color))
+                                .child(SharedString::from(format!("{v}%"))),
+                        )
+                };
+                d.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.0))
+                        .h_full()
+                        .px(px(12.0))
+                        .border_l_1()
+                        .border_color(hsla(theme.border_subtle))
+                        .hover(|d| d.bg(rgba(theme.surface_hover)))
+                        .children(limit_5h.map(|v| meter("5h", v)))
+                        .children(limit_week.map(|v| meter("週", v))),
+                )
+            })
+            // usage（カンプ: トレンドアイコン + スパークライン + tok + cost）
             .children(usage_text.map(|text| {
                 let (tokens, cost) = if let Some(pos) = text.find('$') {
                     let tok_part = text[..pos].trim().trim_end_matches('·').trim();
@@ -204,58 +413,79 @@ impl TakoApp {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(4.0))
+                    .gap(px(7.0))
                     .h_full()
-                    .px_2()
-                    .border_r_1()
+                    .px(px(12.0))
+                    .border_l_1()
                     .border_color(hsla(theme.border_subtle))
                     .hover(|d| d.bg(rgba(theme.surface_hover)))
                     .child(
+                        svg()
+                            .path(ui_icon::TREND)
+                            .w(px(13.0))
+                            .h(px(13.0))
+                            .text_color(hsla(theme.teal)),
+                    );
+                // スパークライン（カンプ: 3px バー×5。履歴が 2 点以上あるときだけ）
+                if sparkline.len() >= 2 {
+                    row = row.child(
                         div()
-                            .text_size(px(10.5))
-                            .text_color(hsla(theme.teal))
-                            .child("📊"),
-                    )
-                    .child(
+                            .flex()
+                            .flex_row()
+                            .items_end()
+                            .gap(px(1.5))
+                            .h(px(10.0))
+                            .children(sparkline.iter().enumerate().map(|(i, v)| {
+                                let recent = i + 2 >= sparkline.len();
+                                div()
+                                    .w(px(3.0))
+                                    .h(px((10.0 * v).max(2.0)))
+                                    .rounded(px(1.0))
+                                    .bg(hsla(if recent {
+                                        theme.teal
+                                    } else {
+                                        theme.text_overlay
+                                    }))
+                            })),
+                    );
+                }
+                if !tokens.is_empty() {
+                    row = row.child(
                         div()
-                            .text_size(px(10.5))
-                            .text_color(hsla(theme.tab_inactive_foreground))
-                            .child("usage"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.5))
-                            .font_family("Monaco")
-                            .text_color(hsla(theme.tab_active_foreground))
+                            .font_family(theme.font_family.clone())
+                            .text_color(hsla(theme.foreground))
                             .child(SharedString::from(tokens)),
                     );
+                }
                 if let Some(c) = cost {
                     row = row.child(
                         div()
-                            .text_size(px(10.5))
-                            .font_family("Monaco")
+                            .font_family(theme.font_family.clone())
                             .text_color(hsla(theme.teal))
                             .child(SharedString::from(c)),
                     );
                 }
                 row
             }))
+            // ctx メーター（カンプ: タブ名 + 70/90% 目盛り線つきバー）
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(4.0))
+                    .gap(px(8.0))
                     .h_full()
-                    .px_2()
-                    .border_r_1()
+                    .px(px(12.0))
+                    .border_l_1()
                     .border_color(hsla(theme.border_subtle))
                     .hover(|d| d.bg(rgba(theme.surface_hover)))
+                    .child(div().text_color(hsla(theme.text_muted)).child("ctx"))
                     .child(
                         div()
+                            .font_family(theme.font_family.clone())
                             .text_size(px(10.5))
-                            .text_color(hsla(theme.tab_inactive_foreground))
-                            .child("ctx"),
+                            .text_color(hsla(theme.accent))
+                            .child(SharedString::from(truncate(&active_tab_name, 12))),
                     )
                     .child(
                         div()
@@ -264,26 +494,46 @@ impl TakoApp {
                             .rounded(px(3.0))
                             .bg(rgba(theme.surface_highlight))
                             .overflow_hidden()
+                            .relative()
                             .child(
                                 div()
                                     .h_full()
                                     .rounded(px(3.0))
                                     .w(relative(ctx_fill_frac))
                                     .bg(hsla(ctx_bar_color)),
+                            )
+                            // 70% / 90% の目盛り線（カンプ）
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(0.0))
+                                    .bottom(px(0.0))
+                                    .left(px(70.0 * 0.7))
+                                    .w(px(1.0))
+                                    .bg(hsla_alpha(theme.foreground, 0.25)),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(0.0))
+                                    .bottom(px(0.0))
+                                    .left(px(70.0 * 0.9))
+                                    .w(px(1.0))
+                                    .bg(hsla_alpha(theme.foreground, 0.25)),
                             ),
                     )
                     .child(
                         div()
-                            .text_size(px(10.5))
-                            .font_family("Monaco")
-                            .text_color(hsla(theme.tab_active_foreground))
+                            .font_family(theme.font_family.clone())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(hsla(ctx_bar_color))
                             .child(SharedString::from(format!("{ctx_pct}%"))),
                     )
                     .children(ctx_detail.map(|detail| {
                         div()
+                            .font_family(theme.font_family.clone())
                             .text_size(px(10.5))
-                            .font_family("Monaco")
-                            .text_color(hsla(theme.tab_inactive_foreground))
+                            .text_color(hsla(theme.text_muted))
                             .child(SharedString::from(detail))
                     })),
             )
@@ -292,6 +542,8 @@ impl TakoApp {
                     "statusbar-tmux",
                     self.panel_visible && self.panel_view == PanelView::Tmux,
                 )
+                .border_r_0()
+                .border_l_1()
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.toggle_panel_view(PanelView::Tmux, cx);
                 }))
@@ -309,6 +561,19 @@ impl TakoApp {
                             inset: false,
                         }])
                 }))
+                .child(
+                    svg()
+                        .path(ui_icon::FLEET)
+                        .w(px(13.0))
+                        .h(px(13.0))
+                        .text_color(
+                            if self.panel_visible && self.panel_view == PanelView::Tmux {
+                                hsla(theme.accent)
+                            } else {
+                                hsla(theme.text_tertiary)
+                            },
+                        ),
+                )
                 .child("tmux"),
             )
             .child(
@@ -316,17 +581,35 @@ impl TakoApp {
                     "statusbar-git",
                     self.panel_visible && self.panel_view == PanelView::Git,
                 )
+                .border_r_0()
+                .border_l_1()
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.toggle_panel_view(PanelView::Git, cx);
                 }))
+                .child(
+                    svg()
+                        .path(ui_icon::GIT_BRANCH)
+                        .w(px(13.0))
+                        .h(px(13.0))
+                        .text_color(if self.panel_visible && self.panel_view == PanelView::Git {
+                            hsla(theme.accent)
+                        } else {
+                            hsla(theme.text_tertiary)
+                        }),
+                )
                 .child({
                     let branch = self
-                        .git_data
+                        .sidebar_git
                         .as_ref()
-                        .and_then(|d| d.branches.iter().find(|b| b.is_current))
-                        .map(|b| truncate(&b.name, 16))
+                        .map(|g| truncate(&g.branch, 16))
+                        .or_else(|| {
+                            self.git_data
+                                .as_ref()
+                                .and_then(|d| d.branches.iter().find(|b| b.is_current))
+                                .map(|b| truncate(&b.name, 16))
+                        })
                         .unwrap_or_else(|| "git".into());
-                    SharedString::from(format!("⎇ {branch}"))
+                    SharedString::from(branch)
                 }),
             )
     }

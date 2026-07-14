@@ -28,6 +28,22 @@ macro_rules! icon_asset {
     };
 }
 
+/// UI クロームアイコン（Claude Design カンプ由来。Issue #217）
+macro_rules! ui_asset {
+    ($name:literal) => {
+        (
+            concat!("icons/ui/", $name, ".svg"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../assets/icons/ui/",
+                $name,
+                ".svg"
+            ))
+            .as_slice(),
+        )
+    };
+}
+
 static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     icon_asset!("archive"),
     icon_asset!("audio"),
@@ -90,7 +106,85 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     icon_asset!("vue"),
     icon_asset!("yaml"),
     icon_asset!("zig"),
+    // UI クロームアイコン（#217。カンプの SVG パスを忠実に写したもの）
+    ui_asset!("bell"),
+    ui_asset!("bg_drawer"),
+    ui_asset!("coffee"),
+    ui_asset!("eye"),
+    ui_asset!("globe"),
+    ui_asset!("loop_repeat"),
+    ui_asset!("pencil"),
+    ui_asset!("pin"),
+    ui_asset!("trash"),
+    ui_asset!("volume_off"),
+    ui_asset!("volume_on"),
+    ui_asset!("chevron_down_ui"),
+    ui_asset!("chevron_right_ui"),
+    ui_asset!("close"),
+    ui_asset!("copy"),
+    ui_asset!("fail_x"),
+    ui_asset!("file_generic"),
+    ui_asset!("fleet"),
+    ui_asset!("folder_ui"),
+    ui_asset!("git_branch"),
+    ui_asset!("grip"),
+    ui_asset!("jump_arrow"),
+    ui_asset!("master"),
+    ui_asset!("minus"),
+    ui_asset!("moon"),
+    ui_asset!("orch"),
+    ui_asset!("orch_active"),
+    ui_asset!("plus"),
+    ui_asset!("refresh"),
+    ui_asset!("retry"),
+    ui_asset!("search"),
+    ui_asset!("split"),
+    ui_asset!("sun"),
+    ui_asset!("trend"),
+    ui_asset!("unshelve"),
+    ui_asset!("warning"),
 ];
+
+/// UI アイコンのアセットパス定数（#217。`gpui::svg().path(...)` に渡す）
+#[allow(dead_code)] // 各マイルストーン（M2〜M7）で順次使用する
+pub mod ui_icon {
+    pub const BELL: &str = "icons/ui/bell.svg";
+    pub const BG_DRAWER: &str = "icons/ui/bg_drawer.svg";
+    pub const COFFEE: &str = "icons/ui/coffee.svg";
+    pub const EYE: &str = "icons/ui/eye.svg";
+    pub const GLOBE: &str = "icons/ui/globe.svg";
+    pub const LOOP_REPEAT: &str = "icons/ui/loop_repeat.svg";
+    pub const PENCIL: &str = "icons/ui/pencil.svg";
+    pub const PIN: &str = "icons/ui/pin.svg";
+    pub const TRASH: &str = "icons/ui/trash.svg";
+    pub const VOLUME_OFF: &str = "icons/ui/volume_off.svg";
+    pub const VOLUME_ON: &str = "icons/ui/volume_on.svg";
+    pub const CHEVRON_DOWN: &str = "icons/ui/chevron_down_ui.svg";
+    pub const CHEVRON_RIGHT: &str = "icons/ui/chevron_right_ui.svg";
+    pub const CLOSE: &str = "icons/ui/close.svg";
+    pub const COPY: &str = "icons/ui/copy.svg";
+    pub const FAIL_X: &str = "icons/ui/fail_x.svg";
+    pub const FILE_GENERIC: &str = "icons/ui/file_generic.svg";
+    pub const FLEET: &str = "icons/ui/fleet.svg";
+    pub const FOLDER: &str = "icons/ui/folder_ui.svg";
+    pub const GIT_BRANCH: &str = "icons/ui/git_branch.svg";
+    pub const GRIP: &str = "icons/ui/grip.svg";
+    pub const JUMP_ARROW: &str = "icons/ui/jump_arrow.svg";
+    pub const MASTER: &str = "icons/ui/master.svg";
+    pub const MINUS: &str = "icons/ui/minus.svg";
+    pub const MOON: &str = "icons/ui/moon.svg";
+    pub const ORCH: &str = "icons/ui/orch.svg";
+    pub const ORCH_ACTIVE: &str = "icons/ui/orch_active.svg";
+    pub const PLUS: &str = "icons/ui/plus.svg";
+    pub const REFRESH: &str = "icons/ui/refresh.svg";
+    pub const RETRY: &str = "icons/ui/retry.svg";
+    pub const SEARCH: &str = "icons/ui/search.svg";
+    pub const SPLIT: &str = "icons/ui/split.svg";
+    pub const SUN: &str = "icons/ui/sun.svg";
+    pub const TREND: &str = "icons/ui/trend.svg";
+    pub const UNSHELVE: &str = "icons/ui/unshelve.svg";
+    pub const WARNING: &str = "icons/ui/warning.svg";
+}
 
 impl AssetSource for TakoAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {

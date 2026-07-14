@@ -179,6 +179,12 @@ pub trait UiStateHost {
     fn set_pin_pane(&mut self, _pane: PaneId, _pinned: Option<bool>) {}
     /// 閉じたタブグループのプレビューをピン留め / 解除する（FR-2.16.15 / FR-2.16.16）
     fn set_pin_group(&mut self, _tab: TabId, _pinned: Option<bool>) {}
+    /// UI テーマモードの現在値（Issue #217。ライト/ダーク切替）
+    fn theme_mode(&self) -> tako_core::theme::ThemeMode {
+        tako_core::theme::ThemeMode::Dark
+    }
+    /// UI テーマモードの切替（再描画は実装側の責務。永続化は dispatch 側で行う）
+    fn set_theme_mode(&mut self, _mode: tako_core::theme::ThemeMode) {}
 }
 
 // ---------------------------------------------------------------------------

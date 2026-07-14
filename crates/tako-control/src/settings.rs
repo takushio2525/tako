@@ -39,6 +39,13 @@ pub struct Settings {
     /// ログディレクトリ全体の上限（MB。超過で古いファイルから削除）
     #[serde(default = "default_pane_log_total_max_mb")]
     pub pane_log_total_max_mb: u64,
+    /// UI テーマ（Issue #217。"dark" / "light"。既定 dark）
+    #[serde(default = "default_theme")]
+    pub theme: String,
+}
+
+fn default_theme() -> String {
+    "dark".into()
 }
 
 fn default_true() -> bool {
@@ -65,6 +72,7 @@ impl Default for Settings {
             pane_logs: true,
             pane_log_max_mb: default_pane_log_max_mb(),
             pane_log_total_max_mb: default_pane_log_total_max_mb(),
+            theme: default_theme(),
         }
     }
 }
@@ -77,6 +85,11 @@ impl Settings {
             max_bytes_per_pane: self.pane_log_max_mb.max(1) * 1024 * 1024,
             max_total_bytes: self.pane_log_total_max_mb.max(1) * 1024 * 1024,
         }
+    }
+
+    /// テーマモードを tako-core の型へ解決する（不明値は既定ダーク。Issue #217）
+    pub fn theme_mode(&self) -> tako_core::theme::ThemeMode {
+        tako_core::theme::ThemeMode::parse(&self.theme).unwrap_or_default()
     }
 }
 
@@ -146,6 +159,7 @@ mod tests {
             pane_logs: false,
             pane_log_max_mb: 10,
             pane_log_total_max_mb: 300,
+            theme: "light".into(),
         };
         save_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), Some(settings));
@@ -177,5 +191,22 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.max_bytes_per_pane, 5 * 1024 * 1024);
         assert_eq!(config.max_total_bytes, 200 * 1024 * 1024);
+        // テーマの既定はダーク（Issue #217。旧ファイル後方互換）
+        assert_eq!(parsed.theme, "dark");
+        assert_eq!(parsed.theme_mode(), tako_core::theme::ThemeMode::Dark);
+    }
+
+    #[test]
+    fn theme_modeが不明値でダークへフォールバックする() {
+        let light = Settings {
+            theme: "light".into(),
+            ..Settings::default()
+        };
+        assert_eq!(light.theme_mode(), tako_core::theme::ThemeMode::Light);
+        let unknown = Settings {
+            theme: "solarized".into(),
+            ..Settings::default()
+        };
+        assert_eq!(unknown.theme_mode(), tako_core::theme::ThemeMode::Dark);
     }
 }
