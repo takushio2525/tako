@@ -1,6 +1,8 @@
-// ペインヘッダの省略制御（#185 見切れ解消）
+// ペインヘッダの省略制御（#185 見切れ解消 + #229 狭幅メニュー集約）
 //
-// 幅に応じて要素を段階的に非表示にし、× ボタンは最後まで残す。
+// 幅に応じて要素を段階的に非表示にする。
+// 狭幅（bg_button が消える閾値未満）では × の代わりに「...」メニューに集約し、
+// メニューからバックグラウンド退避/クローズを選択できるようにする。
 
 /// ヘッダの各要素の表示可否を幅に応じて決定する。
 /// 優先度が低い要素から順に非表示にしていく。
@@ -18,19 +20,25 @@ pub struct HeaderVisibility {
     pub split_button: bool,
     pub bg_button: bool,
     pub close_button: bool,
+    /// 狭幅時に bg/close を「...」メニューに集約する (#229)
+    pub more_menu: bool,
 }
 
 impl HeaderVisibility {
     /// 利用可能な幅 (px) からヘッダ要素の表示可否を計算する。
-    /// × (close) ボタンは常に表示。省略順序（優先度低→高）:
+    /// 省略順序（優先度低→高）:
     ///   shell_info → cwd_chip → workers/parent → state_elapsed →
-    ///   state → role → split → bg → title → badge → close
+    ///   state → role → split → bg/close (→ more_menu に集約)
+    /// 幅 < 140 では bg_button/close_button の代わりに more_menu = true となり、
+    /// UI 側で「...」ボタン 1 個にまとめる。
     pub fn from_width(width: f32) -> Self {
+        let more_menu = width < 140.0;
         Self {
-            close_button: true,
+            more_menu,
+            close_button: !more_menu,
+            bg_button: width >= 140.0,
             badge: width >= 80.0,
             title: width >= 100.0,
-            bg_button: width >= 140.0,
             split_button: width >= 180.0,
             role: width >= 220.0,
             state: width >= 260.0,
@@ -141,17 +149,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn header_visibility_always_shows_close() {
-        for w in [30.0, 50.0, 79.0, 100.0, 500.0] {
+    fn header_visibility_very_narrow_uses_more_menu() {
+        // #229: 狭幅では close/bg の代わりに more_menu に集約
+        for w in [30.0, 50.0, 79.0, 100.0, 139.0] {
             let v = HeaderVisibility::from_width(w);
-            assert!(v.close_button, "width={w}: close must always be visible");
+            assert!(v.more_menu, "width={w}: must use more_menu");
+            assert!(!v.close_button, "width={w}: close hidden in more_menu");
+            assert!(!v.bg_button, "width={w}: bg hidden in more_menu");
+        }
+    }
+
+    #[test]
+    fn header_visibility_normal_width_no_more_menu() {
+        for w in [140.0, 300.0, 500.0] {
+            let v = HeaderVisibility::from_width(w);
+            assert!(!v.more_menu, "width={w}: no more_menu at normal width");
+            assert!(v.close_button, "width={w}: close shown normally");
+            assert!(v.bg_button, "width={w}: bg shown normally");
         }
     }
 
     #[test]
     fn header_visibility_very_narrow() {
         let v = HeaderVisibility::from_width(60.0);
-        assert!(v.close_button);
+        assert!(v.more_menu);
+        assert!(!v.close_button);
         assert!(!v.badge);
         assert!(!v.title);
         assert!(!v.role);
@@ -163,6 +185,7 @@ mod tests {
     #[test]
     fn header_visibility_narrow() {
         let v = HeaderVisibility::from_width(150.0);
+        assert!(!v.more_menu);
         assert!(v.close_button);
         assert!(v.badge);
         assert!(v.title);
@@ -175,6 +198,7 @@ mod tests {
     #[test]
     fn header_visibility_medium() {
         let v = HeaderVisibility::from_width(300.0);
+        assert!(!v.more_menu);
         assert!(v.close_button);
         assert!(v.badge);
         assert!(v.title);
@@ -189,6 +213,7 @@ mod tests {
     #[test]
     fn header_visibility_full() {
         let v = HeaderVisibility::from_width(600.0);
+        assert!(!v.more_menu);
         assert!(v.close_button);
         assert!(v.badge);
         assert!(v.title);
@@ -205,22 +230,35 @@ mod tests {
 
     #[test]
     fn header_visibility_progressive_hiding() {
-        // 幅が広がるにつれて要素が増えることを確認
         let narrow = HeaderVisibility::from_width(100.0);
         let medium = HeaderVisibility::from_width(300.0);
         let wide = HeaderVisibility::from_width(600.0);
 
-        // narrow → medium で role, state が追加される
+        // narrow は more_menu モード（bg/close は集約）
+        assert!(narrow.more_menu);
         assert!(!narrow.role);
         assert!(medium.role);
         assert!(!narrow.state);
         assert!(medium.state);
 
-        // medium → wide で cwd, shell_info が追加される
         assert!(!medium.cwd_chip);
         assert!(wide.cwd_chip);
         assert!(!medium.shell_info);
         assert!(wide.shell_info);
+    }
+
+    #[test]
+    fn header_visibility_more_menu_boundary() {
+        // 閾値 140 の境界テスト
+        let below = HeaderVisibility::from_width(139.9);
+        assert!(below.more_menu);
+        assert!(!below.close_button);
+        assert!(!below.bg_button);
+
+        let at = HeaderVisibility::from_width(140.0);
+        assert!(!at.more_menu);
+        assert!(at.close_button);
+        assert!(at.bg_button);
     }
 
     #[test]
