@@ -142,3 +142,20 @@ changes:
       CLI: `tako sleep-guard status/set`、MCP: `tako_sleep_guard`。
       `tako setup --check` にも状態が表示される。
       setup 再実行でチェックが自動で走るため、個別の適用作業は不要。
+
+  - revision: 8
+    version: "0.5.2"
+    date: "2026-07-14"
+    kind: auto
+    title: setup を claude / codex / agy の検出・プラン別推奨に対応
+    description: |
+      tako setup が claude 固定ではなく、インストール済みの claude / codex / agy を
+      すべて検出するようになった（Issue #226）。1 CLI のみなら自動選択し、複数なら
+      認証状態つきの選択肢を表示する。Claude は `auth status --json`、Codex は
+      `login status` とローカル OAuth claim、agy は `models` の終了状態を使い、token や
+      個人識別子は保存・表示しない。機械取得できないプランは対話で確認する。
+      検出・申告した Claude / GPT / Google のプラン規模から、各 CLI の既定モデル、
+      effort、worker の inherit / delegate 方針と worker_agents を profiles/default.yaml
+      へ推奨生成する。既存 profile は確認なしに変更せず、更新に同意した場合も
+      system_prompt / prompt_blocks / projects のカスタマイズを保持する。
+      setup 再実行で新しい検出・推奨フローが自動で走るため、個別の適用作業は不要。

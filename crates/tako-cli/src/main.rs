@@ -115,7 +115,7 @@ enum Command {
     /// MCP 連携（serve = stdio ブリッジ。エージェントの MCP クライアントが起動する）
     #[command(subcommand)]
     Mcp(McpCommand),
-    /// 対話式セットアップ。claude と対話しながら環境を最適化する。
+    /// 対話式セットアップ。claude / codex / agy を検出・選択して環境を最適化する。
     /// アプリ未起動でも実行できる
     Setup(SetupArgs),
     /// Claude Code の settings.json に tako MCP サーバーの接続設定を追加する。
@@ -127,7 +127,7 @@ enum Command {
     /// リモートアクセス API サーバーの操作（start / stop / status）
     #[command(subcommand)]
     Remote(RemoteCommand),
-    /// マスターオーケストレーターを起動する。新タブで claude を master system prompt 付きで起動する。
+    /// マスターオーケストレーターを起動する。profile の claude / codex を system prompt 付きで起動する。
     /// プロファイル名を指定して設定を切り替えられる（例: tako master -2 → "2" プロファイル）。
     /// 引数なしは default プロファイル。旧形式（tako master dev）も後方互換で動作する
     Master {
@@ -135,7 +135,7 @@ enum Command {
         #[arg(allow_hyphen_values = true)]
         profile: Option<String>,
     },
-    /// ソロエージェントを起動する。新タブで claude を solo system prompt 付きで起動する。
+    /// ソロエージェントを起動する。新タブで profile の claude / codex を solo system prompt 付きで起動する。
     /// オーケストレーション無しの 1 対 1 対話モード（worker spawn を禁止、作業は自分で行う）。
     /// エコ運用（既定 effort=high）で Pro プランでも使える。master と同じプロファイル引数パターン。
     /// プロファイル名を指定して設定を切り替えられる（例: tako solo -fast → "fast" プロファイル）。

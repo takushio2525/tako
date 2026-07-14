@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// バイナリ埋め込みの setup changelog
@@ -121,6 +122,13 @@ pub struct SetupState {
     /// 最後に setup を完了したときの tako バージョン（診断表示用）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_version: Option<String>,
+    /// 最後の setup で選択したエージェント CLI（Issue #226）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_agent: Option<String>,
+    /// setup が自動検出または対話で確認したプロバイダ別プラン。
+    /// キーは claude / gpt / google。token やアカウント識別子は保存しない。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider_plans: BTreeMap<String, String>,
 }
 
 fn default_true() -> bool {
@@ -260,6 +268,8 @@ pub fn changes_status() -> Result<Value, String> {
         "applied_revision": applied,
         "applied_version": config.setup.applied_version,
         "setup_completed": config.setup.completed,
+        "selected_agent": config.setup.selected_agent,
+        "provider_plans": config.setup.provider_plans,
         "up_to_date": pending.is_empty(),
         "pending": pending,
     }))
@@ -416,10 +426,17 @@ mod tests {
         config.setup.completed = true;
         config.setup.applied_revision = 4;
         config.setup.applied_version = Some("0.2.9".into());
+        config.setup.selected_agent = Some("codex".into());
+        config
+            .setup
+            .provider_plans
+            .insert("gpt".into(), "plus".into());
         let yaml = serde_yaml::to_string(&config).unwrap();
         let back: SetupConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(back.setup.applied_revision, 4);
         assert_eq!(back.setup.applied_version.as_deref(), Some("0.2.9"));
+        assert_eq!(back.setup.selected_agent.as_deref(), Some("codex"));
+        assert_eq!(back.setup.provider_plans["gpt"], "plus");
     }
 
     #[test]

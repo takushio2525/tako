@@ -1,13 +1,15 @@
 //! `tako setup` — 対話式セットアップコマンド。
 //!
-//! 依存ツールチェック（claude 必須 / tmux・cloudflared・git 任意。未導入は brew で
+//! エージェント CLI（claude / codex / agy）の検出・選択とプラン確認 →
+//! 依存ツールチェック（tmux・cloudflared・git 任意。未導入は brew で
 //! その場インストール可）→ MCP 登録確認 → リソースファイル書き出し →
 //! config.yaml の初回/2回目判定 + アップデート追従（Issue #94）→
-//! claude を setup cwd で起動する。IPC 不要（tako アプリ未起動でも動作）。
+//! 選択したエージェントを setup cwd で起動する。IPC 不要（tako アプリ未起動でも動作）。
 //!
 //! config.yaml のスキーマと setup changelog は `tako_control::setup` にある
 //! （MCP `tako_setup_changes` と共有。二重実装を作らない）。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tako_control::setup::{load_config, pending_changes, ChangeKind, SetupChange, CHANGES_YAML};
 
@@ -45,6 +47,28 @@ fn setup_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "ホームディレクトリが取得できない（$HOME 未設定）".into())
 }
 
+fn codex_home_dir() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".codex")))
+}
+
+fn instruction_path(agent: SetupAgent) -> Option<PathBuf> {
+    let home = home_dir()?;
+    Some(match agent {
+        SetupAgent::Claude => home.join(".claude/CLAUDE.md"),
+        SetupAgent::Codex => codex_home_dir()?.join("AGENTS.md"),
+        SetupAgent::Agy => home.join(".gemini/GEMINI.md"),
+    })
+}
+
+fn display_home_relative(path: &Path) -> String {
+    home_dir()
+        .and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf))
+        .map(|relative| format!("~/{}", relative.display()))
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 // --- 環境チェック ---
 
 fn login_shell() -> String {
@@ -69,6 +93,235 @@ fn find_command(name: &str) -> Option<String> {
     None
 }
 
+/// setup を進行できるエージェント CLI。agy はオーケストレーターでは worker 専用だが、
+/// setup の対話エージェントとしては利用できる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupAgent {
+    Claude,
+    Codex,
+    Agy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Provider {
+    Claude,
+    Gpt,
+    Google,
+}
+
+impl Provider {
+    const ALL: [Self; 3] = [Self::Claude, Self::Gpt, Self::Google];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Gpt => "gpt",
+            Self::Google => "google",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Gpt => "GPT / ChatGPT",
+            Self::Google => "Google",
+        }
+    }
+}
+
+impl SetupAgent {
+    const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Agy];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Agy => "agy",
+        }
+    }
+
+    fn provider(self) -> Provider {
+        match self {
+            Self::Claude => Provider::Claude,
+            Self::Codex => Provider::Gpt,
+            Self::Agy => Provider::Google,
+        }
+    }
+
+    fn supports_master(self) -> bool {
+        !matches!(self, Self::Agy)
+    }
+
+    fn install_hint(self) -> &'static str {
+        match self {
+            Self::Claude => "https://docs.anthropic.com/en/docs/claude-code",
+            Self::Codex => "https://developers.openai.com/codex/cli",
+            Self::Agy => "agy install",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DetectedAgent {
+    kind: SetupAgent,
+    path: String,
+    authenticated: bool,
+    /// 正規化済みプラン名。個人識別子や token は保持しない。
+    plan: Option<String>,
+}
+
+fn command_output(path: &str, args: &[&str]) -> Option<std::process::Output> {
+    std::process::Command::new(path).args(args).output().ok()
+}
+
+fn detect_agents() -> Vec<DetectedAgent> {
+    SetupAgent::ALL
+        .into_iter()
+        .filter_map(|kind| {
+            let path = find_command(kind.as_str())?;
+            let (authenticated, plan) = match kind {
+                SetupAgent::Claude => detect_claude_auth(&path),
+                SetupAgent::Codex => detect_codex_auth(&path),
+                SetupAgent::Agy => detect_agy_auth(&path),
+            };
+            Some(DetectedAgent {
+                kind,
+                path,
+                authenticated,
+                plan,
+            })
+        })
+        .collect()
+}
+
+fn detect_claude_auth(path: &str) -> (bool, Option<String>) {
+    let Some(output) = command_output(path, &["auth", "status", "--json"]) else {
+        return (false, None);
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return (false, None);
+    };
+    parse_claude_auth_json(&value, output.status.success())
+}
+
+fn parse_claude_auth_json(
+    value: &serde_json::Value,
+    command_succeeded: bool,
+) -> (bool, Option<String>) {
+    let authenticated = command_succeeded
+        && value
+            .get("loggedIn")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+    if !authenticated {
+        return (false, None);
+    }
+    let plan = value
+        .get("subscriptionType")
+        .and_then(|v| v.as_str())
+        .map(normalize_plan)
+        .or_else(|| {
+            value
+                .get("authMethod")
+                .and_then(|v| v.as_str())
+                .filter(|method| method.to_ascii_lowercase().contains("api"))
+                .map(|_| "api".to_string())
+        });
+    (true, plan)
+}
+
+fn detect_codex_auth(path: &str) -> (bool, Option<String>) {
+    let authenticated =
+        command_output(path, &["login", "status"]).is_some_and(|output| output.status.success());
+    let plan = authenticated
+        .then(codex_plan_from_auth_file)
+        .flatten()
+        .map(|p| normalize_plan(&p));
+    (authenticated, plan)
+}
+
+fn detect_agy_auth(path: &str) -> (bool, Option<String>) {
+    let authenticated =
+        command_output(path, &["models"]).is_some_and(|output| output.status.success());
+    // agy 1.1.1 は models で認証判定できるが、プラン / quota は返さない。
+    (authenticated, None)
+}
+
+fn normalize_plan(plan: &str) -> String {
+    plan.trim().to_ascii_lowercase().replace([' ', '_'], "-")
+}
+
+/// Codex の OAuth JWT payload に含まれる ChatGPT plan claim をローカルで読む。
+/// token 自体・account ID・メールアドレスは戻り値にもログにも出さない。
+fn codex_plan_from_auth_file() -> Option<String> {
+    let path = codex_home_dir()?.join("auth.json");
+    codex_plan_from_auth_file_at(&path)
+}
+
+fn codex_plan_from_auth_file_at(path: &Path) -> Option<String> {
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    if value
+        .get("OPENAI_API_KEY")
+        .and_then(|v| v.as_str())
+        .is_some_and(|key| !key.is_empty())
+    {
+        return Some("api".to_string());
+    }
+    for token_name in ["id_token", "access_token"] {
+        let token = value
+            .get("tokens")
+            .and_then(|v| v.as_object())?
+            .get(token_name)
+            .and_then(|v| v.as_str());
+        let Some(payload) = token.and_then(decode_jwt_payload) else {
+            continue;
+        };
+        if let Some(plan) = payload
+            .get("https://api.openai.com/auth")
+            .and_then(|v| v.get("chatgpt_plan_type"))
+            .and_then(|v| v.as_str())
+        {
+            return Some(plan.to_string());
+        }
+    }
+    None
+}
+
+fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = decode_base64url(payload)?;
+    serde_json::from_slice(&decoded).ok()
+}
+
+/// 依存追加を避けるための最小 base64url decoder（JWT payload 読み取り専用）。
+fn decode_base64url(input: &str) -> Option<Vec<u8>> {
+    let mut output = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buffer = 0u32;
+    let mut bits = 0u8;
+    for byte in input.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((buffer >> bits) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    Some(output)
+}
+
 // --- 依存ツールチェック ---
 
 /// tako が実行時に使う外部コマンドの定義
@@ -86,13 +339,6 @@ struct ExternalDep {
 }
 
 const EXTERNAL_DEPS: &[ExternalDep] = &[
-    ExternalDep {
-        bin: "claude",
-        required: true,
-        purpose: "setup の対話・tako master・オーケストレーター・タブの自動リネーム",
-        brew_pkg: None,
-        install_hint: "https://docs.anthropic.com/en/docs/claude-code",
-    },
     ExternalDep {
         bin: "tmux",
         required: false,
@@ -116,21 +362,44 @@ const EXTERNAL_DEPS: &[ExternalDep] = &[
     },
 ];
 
-/// 依存ツールのチェック段階。検出結果を ✓ / △ / ✗ で表示し、
+/// 依存ツールのチェック段階。検出結果を `[OK]` / `[任意]` / `[不足]` で表示し、
 /// interactive = true なら未導入の依存をその場で brew インストールできる。
-/// 戻り値はチェック後も欠けている必須依存のコマンド名一覧。
-fn run_dependency_check(interactive: bool) -> Vec<&'static str> {
+/// 戻り値は検出したエージェントと、チェック後も欠けている必須依存の一覧。
+fn run_dependency_check(interactive: bool) -> (Vec<DetectedAgent>, Vec<String>) {
+    let agents = detect_agents();
+    eprintln!("  エージェント CLI:");
+    for agent in &agents {
+        let auth = if agent.authenticated {
+            "認証済み"
+        } else {
+            "未認証"
+        };
+        let plan = agent.plan.as_deref().unwrap_or("プラン不明");
+        eprintln!(
+            "    [検出] {}: {}（{auth} / {plan}）",
+            agent.kind.as_str(),
+            agent.path
+        );
+    }
     let brew = find_command("brew");
-    let mut missing_required = Vec::new();
+    let mut missing_required = if agents.is_empty() {
+        eprintln!("    [不足] claude / codex / agy のいずれも見つかりません");
+        for kind in SetupAgent::ALL {
+            eprintln!("      {}: {}", kind.as_str(), kind.install_hint());
+        }
+        vec!["エージェント CLI（claude / codex / agy のいずれか）".to_string()]
+    } else {
+        Vec::new()
+    };
     for dep in EXTERNAL_DEPS {
         if let Some(path) = find_command(dep.bin) {
-            eprintln!("  ✓ {}: {path}", dep.bin);
+            eprintln!("  [OK] {}: {path}", dep.bin);
             continue;
         }
         let (mark, kind) = if dep.required {
-            ("✗", "必須")
+            ("[不足]", "必須")
         } else {
-            ("△", "任意")
+            ("[任意]", "任意")
         };
         eprintln!("  {mark} {}: 見つかりません（{kind}）", dep.bin);
         eprintln!("      用途: {}", dep.purpose);
@@ -157,19 +426,19 @@ fn run_dependency_check(interactive: bool) -> Vec<&'static str> {
         }
         if installed {
             match find_command(dep.bin) {
-                Some(path) => eprintln!("  ✓ {}: {path}（インストール完了）", dep.bin),
+                Some(path) => eprintln!("  [OK] {}: {path}（インストール完了）", dep.bin),
                 None => {
                     eprintln!(
-                        "  ⚠ {}: インストール後も検出できません。シェルを開き直してから再実行してください",
+                        "  [警告] {}: インストール後も検出できません。シェルを開き直してから再実行してください",
                         dep.bin
                     );
                     if dep.required {
-                        missing_required.push(dep.bin);
+                        missing_required.push(dep.bin.to_string());
                     }
                 }
             }
         } else if dep.required {
-            missing_required.push(dep.bin);
+            missing_required.push(dep.bin.to_string());
         }
     }
     // FDA チェック（macOS のみ。任意だが強く推奨）
@@ -179,7 +448,7 @@ fn run_dependency_check(interactive: bool) -> Vec<&'static str> {
     }
     // スリープ防止の設定案内
     run_sleep_guard_check(interactive);
-    missing_required
+    (agents, missing_required)
 }
 
 /// 未導入の依存をその場で brew インストールするか確認して実行する。
@@ -204,7 +473,7 @@ fn offer_brew_install(pkg: &str, brew_bin: &str) -> bool {
     match status {
         Ok(s) if s.success() => true,
         _ => {
-            eprintln!("      ⚠ brew install {pkg} が失敗しました。手動で導入してください");
+            eprintln!("      [警告] brew install {pkg} が失敗しました。手動で導入してください");
             false
         }
     }
@@ -253,26 +522,26 @@ fn run_sleep_guard_check(interactive: bool) {
     match choice {
         "0" => {
             new_settings.sleep_guard_mode = tako_control::sleep_guard::SleepGuardMode::Off;
-            eprintln!("      ✓ L0: スリープ防止を無効にしました（OS 任せ）");
+            eprintln!("      [OK] L0: スリープ防止を無効にしました（OS 任せ）");
         }
         "1" => {
             new_settings.sleep_guard_mode =
                 tako_control::sleep_guard::SleepGuardMode::WhileAgentsRunning;
             new_settings.sleep_guard_power = tako_control::sleep_guard::PowerCondition::AcOnly;
-            eprintln!("      ✓ L1: AC 接続時のみ、エージェント稼働中にスリープを防止します");
+            eprintln!("      [OK] L1: AC 接続時のみ、エージェント稼働中にスリープを防止します");
         }
         "2" => {
             new_settings.sleep_guard_mode =
                 tako_control::sleep_guard::SleepGuardMode::WhileAgentsRunning;
             new_settings.sleep_guard_power = tako_control::sleep_guard::PowerCondition::Always;
-            eprintln!("      ✓ L2: バッテリー時もエージェント稼働中にスリープを防止します");
-            eprintln!("      ⚠ 電池消耗が速くなります。AC 接続での利用を推奨します");
+            eprintln!("      [OK] L2: バッテリー時もエージェント稼働中にスリープを防止します");
+            eprintln!("      [警告] 電池消耗が速くなります。AC 接続での利用を推奨します");
         }
         "3" => {
             new_settings.sleep_guard_mode =
                 tako_control::sleep_guard::SleepGuardMode::WhileAgentsRunning;
             new_settings.sleep_guard_power = tako_control::sleep_guard::PowerCondition::AcOnly;
-            eprintln!("      ✓ L3: L1 の設定を適用しました（AC 接続時のみ防止）");
+            eprintln!("      [OK] L3: L1 の設定を適用しました（AC 接続時のみ防止）");
             eprintln!();
             eprintln!("      蓋閉じでの継続稼働:");
             eprintln!("      ─────────────────────────────────────────────");
@@ -288,7 +557,7 @@ fn run_sleep_guard_check(interactive: bool) {
         }
     }
     if let Err(e) = tako_control::settings::save(&new_settings) {
-        eprintln!("      ⚠ 設定の保存に失敗: {e}");
+        eprintln!("      [警告] 設定の保存に失敗: {e}");
     }
 }
 
@@ -298,10 +567,10 @@ fn run_sleep_guard_check(interactive: bool) {
 #[cfg(target_os = "macos")]
 fn run_fda_check(interactive: bool) {
     if tako_control::fda::is_granted() {
-        eprintln!("  ✓ フルディスクアクセス: 付与済み（許可ダイアログは表示されません）");
+        eprintln!("  [OK] フルディスクアクセス: 付与済み（許可ダイアログは表示されません）");
         return;
     }
-    eprintln!("  △ フルディスクアクセス: 未付与（推奨）");
+    eprintln!("  [任意] フルディスクアクセス: 未付与（推奨）");
     eprintln!("      macOS が「tako.app から、ほかのアプリからのデータへのアクセス権を");
     eprintln!("      求められています」と頻繁に表示する原因です。フルディスクアクセスを");
     eprintln!("      付与すると、このダイアログが出なくなります。");
@@ -323,13 +592,13 @@ fn run_fda_check(interactive: bool) {
         return;
     }
     if let Err(e) = tako_control::fda::open_settings() {
-        eprintln!("      ⚠ {e}");
+        eprintln!("      [警告] {e}");
         return;
     }
     eprintln!(
         "      システム設定を開きました。tako を「フルディスクアクセス」に追加してください。"
     );
-    eprintln!("      ⚠ 付与後、tako アプリの再起動が必要です（⌘Q で終了 → 再度起動）。");
+    eprintln!("      [警告] 付与後、tako アプリの再起動が必要です（⌘Q で終了 → 再度起動）。");
     eprintln!("        再起動するまで許可ダイアログが表示され続けることがあります。");
 
     // 再チェック（FDA は再起動後に有効になるため通常ここでは検出できないが、
@@ -339,16 +608,16 @@ fn run_fda_check(interactive: bool) {
     // 設定画面での操作を待つ猶予
     std::thread::sleep(std::time::Duration::from_secs(2));
     if tako_control::fda::is_granted() {
-        eprintln!("✓ 付与を確認しました！ tako を再起動すると反映されます。");
+        eprintln!("[OK] 付与を確認しました。tako を再起動すると反映されます。");
     } else {
         eprintln!("まだ検出できません。");
         eprintln!("        付与後に tako を再起動すれば反映されます。今は先に進みます。");
     }
 }
 
-fn check_mcp_registered() -> bool {
-    let output = std::process::Command::new(login_shell())
-        .args(["-l", "-c", "claude mcp list 2>/dev/null"])
+fn check_claude_mcp_registered(path: &str) -> bool {
+    let output = std::process::Command::new(path)
+        .args(["mcp", "list"])
         .output();
     match output {
         Ok(o) if o.status.success() => {
@@ -377,6 +646,28 @@ fn run_setup_mcp() -> Result<(), String> {
             Ok(())
         }
         Err(e) => Err(format!("MCP 設定の追加に失敗: {e}")),
+    }
+}
+
+fn configure_agent_mcp(agent: &DetectedAgent) -> Result<(), String> {
+    match agent.kind {
+        SetupAgent::Claude => {
+            if check_claude_mcp_registered(&agent.path) {
+                eprintln!("  [OK] Claude MCP: tako が登録済み");
+                Ok(())
+            } else {
+                eprintln!("  [設定] Claude MCP を自動登録します");
+                run_setup_mcp()
+            }
+        }
+        SetupAgent::Codex => {
+            eprintln!("  [OK] Codex MCP: tako master 起動時に一時設定を注入します");
+            Ok(())
+        }
+        SetupAgent::Agy => {
+            eprintln!("  [情報] agy は worker 専用のため MCP 登録は不要です");
+            Ok(())
+        }
     }
 }
 
@@ -444,7 +735,7 @@ fn pending_changes_path(setup_dir: &Path) -> PathBuf {
 /// 未適用の変更一覧を CLI に表示する
 fn print_pending_changes(pending: &[SetupChange], applied_revision: u32) {
     eprintln!(
-        "  ℹ 前回のセットアップ（rev {applied_revision}）以降、アップデートで setup に {} 件の変更が入っています:",
+        "  [情報] 前回のセットアップ（rev {applied_revision}）以降、アップデートで setup に {} 件の変更が入っています:",
         pending.len()
     );
     for change in pending {
@@ -477,6 +768,417 @@ fn sync_pending_changes_file(
     std::fs::write(&path, md).map_err(|e| format!("pending-changes.md の書き出しに失敗: {e}"))
 }
 
+fn select_setup_agent(agents: &[DetectedAgent]) -> Result<SetupAgent, String> {
+    match agents {
+        [] => Err("エージェント CLI が見つかりません".into()),
+        [only] => {
+            eprintln!(
+                "  [自動選択] 検出された CLI は {} のみです。既定エージェントに設定します",
+                only.kind.as_str()
+            );
+            Ok(only.kind)
+        }
+        _ => {
+            eprintln!();
+            eprintln!("セットアップを進めるエージェントを選択してください:");
+            for (index, agent) in agents.iter().enumerate() {
+                let auth = if agent.authenticated {
+                    "認証済み"
+                } else {
+                    "未認証"
+                };
+                eprintln!("  {}) {}（{auth}）", index + 1, agent.kind.as_str());
+            }
+            let default_index = default_agent_index(agents);
+            eprint!("選択 [{default_index}]: ");
+            let mut input = String::new();
+            let _ = std::io::stdin().read_line(&mut input);
+            choose_setup_agent(agents, input.trim())
+        }
+    }
+}
+
+fn default_agent_index(agents: &[DetectedAgent]) -> usize {
+    agents
+        .iter()
+        .position(|agent| agent.authenticated)
+        .unwrap_or(0)
+        + 1
+}
+
+fn choose_setup_agent(agents: &[DetectedAgent], input: &str) -> Result<SetupAgent, String> {
+    let selected = if input.is_empty() {
+        default_agent_index(agents)
+    } else {
+        input
+            .parse::<usize>()
+            .map_err(|_| "選択は番号で入力してください".to_string())?
+    };
+    agents
+        .get(selected.saturating_sub(1))
+        .map(|agent| agent.kind)
+        .ok_or_else(|| format!("選択範囲は 1〜{} です", agents.len()))
+}
+
+fn collect_provider_plans(agents: &[DetectedAgent]) -> BTreeMap<String, String> {
+    let mut plans = BTreeMap::new();
+    for provider in Provider::ALL {
+        let detected = agents
+            .iter()
+            .find(|agent| agent.kind.provider() == provider);
+        let plan = match detected.and_then(|agent| agent.plan.as_deref()) {
+            // Claude の status は max の倍率を返さないため、その部分だけ対話で補う。
+            Some("max") if provider == Provider::Claude => prompt_plan(provider, Some("max")),
+            Some(plan) => {
+                eprintln!("  [自動検出] {} プラン: {plan}", provider.label());
+                plan.to_string()
+            }
+            None => prompt_plan(provider, None),
+        };
+        plans.insert(provider.as_str().to_string(), plan);
+    }
+    plans
+}
+
+fn prompt_plan(provider: Provider, detected: Option<&str>) -> String {
+    eprintln!();
+    match provider {
+        Provider::Claude if detected == Some("max") => {
+            eprintln!("Claude Max を検出しました。契約倍率を選んでください:");
+            eprintln!("  1) Max 5x");
+            eprintln!("  2) Max 20x");
+            eprintln!("  3) 不明");
+            eprint!("選択 [3]: ");
+            match read_choice("3") {
+                "1" => "max-5x".into(),
+                "2" => "max-20x".into(),
+                _ => "max".into(),
+            }
+        }
+        Provider::Claude => {
+            eprintln!("Claude のプランを選んでください:");
+            eprintln!("  1) Free / 未契約  2) Pro  3) Max 5x  4) Max 20x");
+            eprintln!("  5) Team / Enterprise  6) API  7) 不明");
+            eprint!("選択 [7]: ");
+            match read_choice("7") {
+                "1" => "free",
+                "2" => "pro",
+                "3" => "max-5x",
+                "4" => "max-20x",
+                "5" => "team-enterprise",
+                "6" => "api",
+                _ => "unknown",
+            }
+            .into()
+        }
+        Provider::Gpt => {
+            eprintln!("GPT / ChatGPT のプランを選んでください:");
+            eprintln!("  1) Free / 未契約  2) Plus  3) Pro");
+            eprintln!("  4) Business / Enterprise  5) API  6) 不明");
+            eprint!("選択 [6]: ");
+            match read_choice("6") {
+                "1" => "free",
+                "2" => "plus",
+                "3" => "pro",
+                "4" => "business-enterprise",
+                "5" => "api",
+                _ => "unknown",
+            }
+            .into()
+        }
+        Provider::Google => {
+            eprintln!("Google のプランを選んでください（agy からは自動取得できません）:");
+            eprintln!("  1) Free / 未契約  2) Google AI Pro  3) Google AI Ultra");
+            eprintln!("  4) Workspace / Enterprise  5) 不明");
+            eprint!("選択 [5]: ");
+            match read_choice("5") {
+                "1" => "free",
+                "2" => "google-ai-pro",
+                "3" => "google-ai-ultra",
+                "4" => "workspace-enterprise",
+                _ => "unknown",
+            }
+            .into()
+        }
+    }
+}
+
+fn read_choice(default: &str) -> &str {
+    let mut input = String::new();
+    let _ = std::io::stdin().read_line(&mut input);
+    match input.trim() {
+        "1" => "1",
+        "2" => "2",
+        "3" => "3",
+        "4" => "4",
+        "5" => "5",
+        "6" => "6",
+        "7" => "7",
+        _ => default,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PlanScale {
+    Limited,
+    Standard,
+    High,
+}
+
+fn plan_scale(provider: Provider, plan: Option<&str>) -> PlanScale {
+    let plan = plan.unwrap_or("unknown");
+    match provider {
+        Provider::Claude => match plan {
+            "max-20x" | "team-enterprise" | "enterprise" | "api" => PlanScale::High,
+            "pro" | "max" | "max-5x" | "team" => PlanScale::Standard,
+            _ => PlanScale::Limited,
+        },
+        Provider::Gpt => match plan {
+            "pro" | "business-enterprise" | "business" | "enterprise" | "api" => PlanScale::High,
+            "plus" | "team" => PlanScale::Standard,
+            _ => PlanScale::Limited,
+        },
+        Provider::Google => match plan {
+            "google-ai-ultra" | "workspace-enterprise" | "enterprise" => PlanScale::High,
+            "google-ai-pro" | "workspace" => PlanScale::Standard,
+            _ => PlanScale::Limited,
+        },
+    }
+}
+
+fn effort_for(agent: SetupAgent, scale: PlanScale) -> Option<&'static str> {
+    match agent {
+        SetupAgent::Claude => Some(match scale {
+            PlanScale::Limited => "medium",
+            PlanScale::Standard => "high",
+            PlanScale::High => "max",
+        }),
+        SetupAgent::Codex => Some(match scale {
+            PlanScale::Limited => "medium",
+            PlanScale::Standard => "high",
+            PlanScale::High => "xhigh",
+        }),
+        SetupAgent::Agy => None,
+    }
+}
+
+fn recommended_profile(
+    selected: SetupAgent,
+    agents: &[DetectedAgent],
+    plans: &BTreeMap<String, String>,
+) -> (tako_control::orchestrator::Profile, String) {
+    use tako_control::orchestrator::{AgentWorkerConfig, Profile, WorkerModelPolicy};
+
+    let master = if selected.supports_master() {
+        selected
+    } else {
+        agents
+            .iter()
+            .find(|a| a.kind == SetupAgent::Claude && a.authenticated)
+            .or_else(|| {
+                agents
+                    .iter()
+                    .find(|a| a.kind == SetupAgent::Codex && a.authenticated)
+            })
+            .or_else(|| agents.iter().find(|a| a.kind.supports_master()))
+            .map(|a| a.kind)
+            // agy 単独時は master 非対応であることを注記し、後方互換の claude 既定を残す。
+            .unwrap_or(SetupAgent::Claude)
+    };
+    let master_provider = master.provider();
+    let master_scale = plan_scale(
+        master_provider,
+        plans.get(master_provider.as_str()).map(String::as_str),
+    );
+    let mut profile = Profile {
+        master_agent: Some(master.as_str().to_string()),
+        model: None,
+        effort: effort_for(master, master_scale)
+            .unwrap_or("high")
+            .to_string(),
+        worker_agent: Some(selected.as_str().to_string()),
+        ..Profile::default()
+    };
+
+    let usable_count = agents.iter().filter(|a| a.authenticated).count();
+    if usable_count > 1 && master_scale >= PlanScale::Standard {
+        profile.worker_model_policy = WorkerModelPolicy::Delegate;
+        let names = agents
+            .iter()
+            .filter(|a| a.authenticated)
+            .map(|a| a.kind.as_str())
+            .collect::<Vec<_>>()
+            .join(" / ");
+        profile.delegate_guidance = Some(format!(
+            "利用可能な {names} から、重い実装は高プラン側、軽い調査は低負荷側へ振り分ける。モデル未指定時は各 CLI の既定モデルを使う。"
+        ));
+    }
+
+    for agent in agents.iter().filter(|a| a.authenticated) {
+        let scale = plan_scale(
+            agent.kind.provider(),
+            plans
+                .get(agent.kind.provider().as_str())
+                .map(String::as_str),
+        );
+        profile.worker_agents.insert(
+            agent.kind.as_str().to_string(),
+            AgentWorkerConfig {
+                model: None,
+                effort: effort_for(agent.kind, scale).map(str::to_string),
+                skip_permissions: matches!(agent.kind, SetupAgent::Codex | SetupAgent::Agy),
+                args: Vec::new(),
+            },
+        );
+    }
+
+    let master_ready = agents
+        .iter()
+        .any(|agent| agent.authenticated && agent.kind.supports_master());
+    let note = if selected == SetupAgent::Agy && !master_ready {
+        "agy は worker 専用です。tako master を使う前に claude または codex を導入してログインしてください。"
+            .to_string()
+    } else if selected == SetupAgent::Agy {
+        format!(
+            "agy は worker 専用のため、master={} / worker=agy としました。",
+            master.as_str()
+        )
+    } else {
+        format!(
+            "master / worker を {}、モデルは各 CLI の既定値としました。",
+            selected.as_str()
+        )
+    };
+    (profile, note)
+}
+
+fn prepare_profile(
+    selected: SetupAgent,
+    agents: &[DetectedAgent],
+    plans: &BTreeMap<String, String>,
+) -> Result<&'static str, String> {
+    use tako_control::orchestrator;
+
+    let profile_path = orchestrator::profiles_dir()
+        .ok_or("ホームディレクトリが取得できない")?
+        .join("default.yaml");
+    let existed = profile_path.is_file();
+    orchestrator::ensure_defaults()?;
+    if let Some(notice) = orchestrator::migrate_legacy_default_profile() {
+        eprintln!("  [移行] {notice}");
+    }
+    let (recommended, note) = recommended_profile(selected, agents, plans);
+    let should_save = if existed {
+        eprintln!();
+        eprintln!("既存の default プロファイルがあります。プランにもとづく推奨で更新しますか？");
+        eprintln!(
+            "  推奨: master={} / worker={} / effort={} / policy={:?}",
+            recommended.master_agent.as_deref().unwrap_or("claude"),
+            recommended.worker_agent.as_deref().unwrap_or("claude"),
+            recommended.effort,
+            recommended.worker_model_policy
+        );
+        eprint!("更新する [y/N]: ");
+        let mut input = String::new();
+        let _ = std::io::stdin().read_line(&mut input);
+        matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    } else {
+        true
+    };
+    if should_save {
+        if existed {
+            orchestrator::Profile::mutate_named("default", |profile| {
+                apply_profile_recommendation(profile, &recommended);
+            })?;
+        } else {
+            recommended.save("default")?;
+        }
+        eprintln!("  [OK] 推奨プロファイルを保存: {}", profile_path.display());
+        eprintln!("       {note}");
+        Ok("モデルは各 CLI の既定値。effort と worker ポリシーはプラン規模から推奨済み。")
+    } else {
+        eprintln!("  [維持] 既存プロファイルを変更しませんでした");
+        Ok("既存の default profile をユーザー選択で維持。自動推奨は未反映。")
+    }
+}
+
+fn apply_profile_recommendation(
+    profile: &mut tako_control::orchestrator::Profile,
+    recommended: &tako_control::orchestrator::Profile,
+) {
+    // setup が提案する起動設定だけを更新し、ユーザー所有の system prompt・
+    // prompt_blocks・projects は保持する。
+    profile.master_agent = recommended.master_agent.clone();
+    profile.model = recommended.model.clone();
+    profile.effort = recommended.effort.clone();
+    profile.worker_model_policy = recommended.worker_model_policy;
+    profile.worker_model = recommended.worker_model.clone();
+    profile.worker_effort = recommended.worker_effort.clone();
+    profile.delegate_guidance = recommended.delegate_guidance.clone();
+    profile.worker_agent = recommended.worker_agent.clone();
+    profile.worker_agents = recommended.worker_agents.clone();
+}
+
+#[derive(serde::Serialize)]
+struct SetupContext<'a> {
+    selected_agent: &'a str,
+    instruction_file: String,
+    installed_agents: Vec<&'a str>,
+    authenticated_agents: Vec<&'a str>,
+    provider_plans: &'a BTreeMap<String, String>,
+    profile_note: &'a str,
+}
+
+fn write_setup_context(
+    dir: &Path,
+    selected: SetupAgent,
+    agents: &[DetectedAgent],
+    plans: &BTreeMap<String, String>,
+    profile_note: &str,
+) -> Result<(), String> {
+    let instruction_file = instruction_path(selected)
+        .map(|path| display_home_relative(&path))
+        .unwrap_or_else(|| "(取得不能)".to_string());
+    let context = SetupContext {
+        selected_agent: selected.as_str(),
+        instruction_file,
+        installed_agents: agents.iter().map(|agent| agent.kind.as_str()).collect(),
+        authenticated_agents: agents
+            .iter()
+            .filter(|agent| agent.authenticated)
+            .map(|agent| agent.kind.as_str())
+            .collect(),
+        provider_plans: plans,
+        profile_note,
+    };
+    let yaml = serde_yaml::to_string(&context)
+        .map_err(|e| format!("setup-context.yaml の生成に失敗: {e}"))?;
+    write_resource(dir, "setup-context.yaml", &yaml)
+}
+
+fn launch_setup_agent(
+    agent: &DetectedAgent,
+    dir: &Path,
+    greeting: &str,
+) -> Result<std::process::ExitStatus, String> {
+    let mut command = std::process::Command::new(&agent.path);
+    command.current_dir(dir);
+    match agent.kind {
+        SetupAgent::Claude | SetupAgent::Codex => {
+            command.arg(greeting);
+        }
+        SetupAgent::Agy => {
+            command.args(["--prompt-interactive", greeting]);
+        }
+    }
+    command
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .map_err(|e| format!("{} の起動に失敗: {e}", agent.kind.as_str()))
+}
+
 // --- メインエントリ ---
 
 /// `tako setup --check` — 環境チェックだけ実行して終了
@@ -484,14 +1186,22 @@ pub fn run_check() -> Result<(), String> {
     eprintln!("tako セットアップ 環境チェック");
     eprintln!("─────────────────────────────");
 
-    // 依存ツール（claude / tmux / git。--check では表示のみ）
-    let _ = run_dependency_check(false);
+    // エージェント CLI + 任意依存。--check では表示のみ。
+    let (agents, _) = run_dependency_check(false);
 
-    // MCP 登録
-    if check_mcp_registered() {
-        eprintln!("  ✓ MCP: tako が登録済み");
-    } else {
-        eprintln!("  ✗ MCP: tako が未登録（tako setup-mcp で登録できます）");
+    // MCP 登録（claude のみ永続登録。codex は master 起動時注入、agy は worker 専用）
+    if let Some(claude) = agents.iter().find(|a| a.kind == SetupAgent::Claude) {
+        if check_claude_mcp_registered(&claude.path) {
+            eprintln!("  [OK] Claude MCP: tako が登録済み");
+        } else {
+            eprintln!("  [不足] Claude MCP: tako が未登録（tako setup-mcp で登録できます）");
+        }
+    }
+    if agents.iter().any(|a| a.kind == SetupAgent::Codex) {
+        eprintln!("  [OK] Codex MCP: tako master 起動時に一時注入");
+    }
+    if agents.iter().any(|a| a.kind == SetupAgent::Agy) {
+        eprintln!("  [情報] agy: worker 専用（master / MCP 接続は非対応）");
     }
 
     // config.yaml
@@ -500,36 +1210,50 @@ pub fn run_check() -> Result<(), String> {
         let config = load_config()?;
         if config.setup.completed {
             eprintln!(
-                "  ✓ セットアップ: 完了済み ({})",
+                "  [OK] セットアップ: 完了済み ({})",
                 config.setup.completed_at.as_deref().unwrap_or("日時不明")
             );
             // アップデート追従状況（Issue #94）
             let pending = pending_changes(config.setup.applied_revision)?;
             if pending.is_empty() {
                 eprintln!(
-                    "  ✓ アップデート追従: 最新（rev {}）",
+                    "  [OK] アップデート追従: 最新（rev {}）",
                     config.setup.applied_revision
                 );
             } else {
                 eprintln!(
-                    "  △ アップデート追従: 未適用の setup 変更が {} 件（tako setup --changes で詳細）",
+                    "  [情報] アップデート追従: 未適用の setup 変更が {} 件（tako setup --changes で詳細）",
                     pending.len()
                 );
             }
+            if let Some(agent) = config.setup.selected_agent.as_deref() {
+                eprintln!("  [OK] 既定エージェント: {agent}");
+            }
+            if !config.setup.provider_plans.is_empty() {
+                let plans = config
+                    .setup
+                    .provider_plans
+                    .iter()
+                    .map(|(provider, plan)| format!("{provider}={plan}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                eprintln!("  [OK] 申告・検出プラン: {plans}");
+            }
         } else {
-            eprintln!("  △ セットアップ: 未完了");
+            eprintln!("  [情報] セットアップ: 未完了");
         }
     } else {
-        eprintln!("  △ config.yaml: 未作成");
+        eprintln!("  [情報] config.yaml: 未作成");
     }
 
-    // ~/.claude/CLAUDE.md
-    if let Some(home) = home_dir() {
-        let claude_md = home.join(".claude/CLAUDE.md");
-        if claude_md.is_file() {
-            eprintln!("  ✓ ~/.claude/CLAUDE.md: 存在します");
-        } else {
-            eprintln!("  △ ~/.claude/CLAUDE.md: 未作成");
+    // 検出したエージェントのグローバル指示ファイル
+    for agent in &agents {
+        if let Some(path) = instruction_path(agent.kind) {
+            if path.is_file() {
+                eprintln!("  [OK] {}: 存在します", display_home_relative(&path));
+            } else {
+                eprintln!("  [情報] {}: 未作成", display_home_relative(&path));
+            }
         }
     }
 
@@ -539,26 +1263,26 @@ pub fn run_check() -> Result<(), String> {
             let st = status["status"].as_str().unwrap_or("unknown");
             match st {
                 "not_configured" => {
-                    eprintln!("  △ エージェント共通ルール同期: 未設定");
+                    eprintln!("  [情報] エージェント共通ルール同期: 未設定");
                 }
                 "up_to_date" => {
-                    eprintln!("  ✓ エージェント共通ルール同期: 最新");
+                    eprintln!("  [OK] エージェント共通ルール同期: 最新");
                 }
                 "outdated" => {
                     eprintln!(
-                        "  △ エージェント共通ルール同期: ずれあり（tako agents sync-rules で同期）"
+                        "  [情報] エージェント共通ルール同期: ずれあり（tako agents sync-rules で同期）"
                     );
                 }
                 "source_missing" => {
                     let path = status["source_path"].as_str().unwrap_or("?");
-                    eprintln!("  ✗ エージェント共通ルール同期: 正本が見つからない ({path})");
+                    eprintln!("  [不足] エージェント共通ルール同期: 正本が見つからない ({path})");
                 }
                 _ => {
                     eprintln!("  ? エージェント共通ルール同期: {st}");
                 }
             }
         }
-        Err(e) => eprintln!("  △ エージェント共通ルール同期: 確認失敗 ({e})"),
+        Err(e) => eprintln!("  [情報] エージェント共通ルール同期: 確認失敗 ({e})"),
     }
 
     // スリープ防止（Issue #173）
@@ -568,11 +1292,11 @@ pub fn run_check() -> Result<(), String> {
         let power = settings.sleep_guard_power;
         match mode {
             tako_control::sleep_guard::SleepGuardMode::Off => {
-                eprintln!("  △ スリープ防止: 無効（tako sleep-guard set --mode while-agents-running で有効化）");
+                eprintln!("  [情報] スリープ防止: 無効（tako sleep-guard set --mode while-agents-running で有効化）");
             }
             _ => {
                 eprintln!(
-                    "  ✓ スリープ防止: mode={}, power={}",
+                    "  [OK] スリープ防止: mode={}, power={}",
                     mode.as_str(),
                     power.as_str()
                 );
@@ -582,13 +1306,15 @@ pub fn run_check() -> Result<(), String> {
         let sudoers = tako_control::sleep_guard::is_sudoers_installed();
         match lid_mode {
             tako_control::sleep_guard::LidSleepMode::Off => {
-                eprintln!("  △ 蓋閉じ防止: 未設定（tako sleep-guard install-lid-sleep で有効化）");
+                eprintln!(
+                    "  [情報] 蓋閉じ防止: 未設定（tako sleep-guard install-lid-sleep で有効化）"
+                );
             }
             tako_control::sleep_guard::LidSleepMode::WhileAgentsRunning => {
                 if sudoers {
-                    eprintln!("  ✓ 蓋閉じ防止: while-agents-running（sudoers 登録済み）");
+                    eprintln!("  [OK] 蓋閉じ防止: while-agents-running（sudoers 登録済み）");
                 } else {
-                    eprintln!("  ✗ 蓋閉じ防止: while-agents-running だが sudoers 未登録（tako sleep-guard install-lid-sleep で登録）");
+                    eprintln!("  [不足] 蓋閉じ防止: while-agents-running だが sudoers 未登録（tako sleep-guard install-lid-sleep で登録）");
                 }
             }
         }
@@ -598,13 +1324,13 @@ pub fn run_check() -> Result<(), String> {
     match tako_control::orchestrator::list_profiles() {
         Ok(profiles) if !profiles.is_empty() => {
             eprintln!(
-                "  ✓ プロファイル: {} 個（{}）",
+                "  [OK] プロファイル: {} 個（{}）",
                 profiles.len(),
                 profiles.join(", ")
             );
         }
-        Ok(_) => eprintln!("  △ プロファイル: 未作成（tako master で自動生成されます）"),
-        Err(e) => eprintln!("  △ プロファイル: 確認失敗 ({e})"),
+        Ok(_) => eprintln!("  [情報] プロファイル: 未作成（tako master で自動生成されます）"),
+        Err(e) => eprintln!("  [情報] プロファイル: 確認失敗 ({e})"),
     }
 
     Ok(())
@@ -651,7 +1377,7 @@ pub fn run_changes(json: bool) -> Result<(), String> {
     }
     let pending = pending_changes(applied)?;
     if pending.is_empty() {
-        eprintln!("  ✓ 最新です。追従が必要な変更はありません");
+        eprintln!("  [OK] 最新です。追従が必要な変更はありません");
         return Ok(());
     }
     eprintln!("  未適用の変更: {} 件", pending.len());
@@ -681,8 +1407,8 @@ pub fn run_setup() -> Result<(), String> {
     eprintln!("═════════════════");
     eprintln!();
 
-    // 1. 依存ツールのチェック（必須 = claude、任意 = tmux / git。未導入はその場インストール可）
-    let missing = run_dependency_check(true);
+    // 1. エージェント CLI と依存ツールのチェック
+    let (agents, missing) = run_dependency_check(true);
     if !missing.is_empty() {
         return Err(format!(
             "必須の依存ツールが不足しています: {}。\n\
@@ -690,25 +1416,42 @@ pub fn run_setup() -> Result<(), String> {
             missing.join(", ")
         ));
     }
-
-    // 2. MCP 登録確認
-    if !check_mcp_registered() {
-        eprintln!("  △ MCP 未登録 → 自動登録します...");
-        run_setup_mcp()?;
-    } else {
-        eprintln!("  ✓ MCP: tako が登録済み");
+    let selected = select_setup_agent(&agents)?;
+    let selected_agent = agents
+        .iter()
+        .find(|agent| agent.kind == selected)
+        .ok_or("選択したエージェントの検出情報がありません")?;
+    if !selected_agent.authenticated {
+        return Err(format!(
+            "{} は未認証です。先に {} を単独起動してログインしてから再実行してください",
+            selected.as_str(),
+            selected.as_str()
+        ));
     }
+
+    // 1.5 取得できるプランは自動反映し、不足分だけ対話で補う。
+    let plans = collect_provider_plans(&agents);
+
+    // 2. 選択エージェントに応じた MCP 設定
+    configure_agent_mcp(selected_agent)?;
 
     // 3. setup ディレクトリ + リソース書き出し
     let dir = setup_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
     write_all_resources(&dir)?;
-    eprintln!("  ✓ テンプレートを展開: {}", dir.display());
+    eprintln!("  [OK] テンプレートを展開: {}", dir.display());
 
-    // CLAUDE.md（setup 用 system prompt）を書き出す
-    let claude_md_path = dir.join("CLAUDE.md");
-    std::fs::write(&claude_md_path, SYSTEM_PROMPT)
-        .map_err(|e| format!("CLAUDE.md の書き出しに失敗: {e}"))?;
+    // 各 CLI の自動読込名 + 明示参照名へ同じ setup 指示を書き出す。
+    for filename in [
+        "setup-instructions.md",
+        "CLAUDE.md",
+        "AGENTS.md",
+        "GEMINI.md",
+    ] {
+        let path = dir.join(filename);
+        std::fs::write(&path, SYSTEM_PROMPT)
+            .map_err(|e| format!("{filename} の書き出しに失敗: {e}"))?;
+    }
 
     // 4. config.yaml の初回 / 2 回目判定
     let config = load_config()?;
@@ -725,22 +1468,29 @@ pub fn run_setup() -> Result<(), String> {
         eprintln!();
         print_pending_changes(&pending, config.setup.applied_revision);
         eprintln!(
-            "      詳細を pending-changes.md に書き出しました。claude が対話の中で追従を案内します"
+            "      詳細を pending-changes.md に書き出しました。選択したエージェントが対話で追従を案内します"
         );
     }
     sync_pending_changes_file(&dir, &pending, config.setup.applied_revision)?;
 
-    // 5. claude を setup cwd で起動
-    // ~/.claude/CLAUDE.md が存在すればバックアップ
-    if let Some(home) = home_dir() {
-        let claude_md = home.join(".claude/CLAUDE.md");
-        if claude_md.is_file() {
-            let backup = find_backup_path(&home.join(".claude"), "CLAUDE.md");
-            if let Err(e) = std::fs::copy(&claude_md, &backup) {
-                eprintln!("  ⚠ CLAUDE.md のバックアップに失敗: {e}");
+    // 5. 検出プランにもとづくプロファイル推奨を生成する。
+    let profile_note = prepare_profile(selected, &agents, &plans)?;
+    write_setup_context(&dir, selected, &agents, &plans, profile_note)?;
+
+    // 選択エージェントのグローバル指示ファイルが存在すればバックアップする。
+    if let Some(instruction) = instruction_path(selected) {
+        if instruction.is_file() {
+            let parent = instruction.parent().unwrap_or(Path::new("."));
+            let filename = instruction
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
+            let backup = find_backup_path(parent, &filename);
+            if let Err(e) = std::fs::copy(&instruction, &backup) {
+                eprintln!("  [警告] {filename} のバックアップに失敗: {e}");
             } else {
                 eprintln!(
-                    "  ✓ CLAUDE.md をバックアップ: {}",
+                    "  [OK] {filename} をバックアップ: {}",
                     backup.file_name().unwrap_or_default().to_string_lossy()
                 );
             }
@@ -749,36 +1499,24 @@ pub fn run_setup() -> Result<(), String> {
 
     eprintln!();
     if is_first_run {
-        eprintln!("初回セットアップを開始します。claude が対話で設定をガイドします。");
+        eprintln!(
+            "初回セットアップを開始します。{} が対話で設定をガイドします。",
+            selected.as_str()
+        );
     } else {
         eprintln!("セットアップメニューを開きます。");
     }
     eprintln!("─────────────────────────────────────────────────────");
     eprintln!();
 
-    let shell = login_shell();
-
     let greeting = if is_first_run {
-        "tako のセットアップを始めます。いくつか質問に答えてください。"
+        "最初に setup-instructions.md を読んでください。tako のセットアップを始めます。CLI 側でエージェント選択・プラン確認・推奨プロファイル生成は完了済みです。残りの質問を1つずつ進めてください。"
     } else if !pending.is_empty() {
-        "tako の設定を更新します。まず pending-changes.md を読んで、前回セットアップ以降のアップデート変更への追従から始めてください。"
+        "最初に setup-instructions.md と pending-changes.md を読んでください。前回セットアップ以降のアップデート変更への追従から始めてください。"
     } else {
-        "tako の設定を変更します。何をしますか？"
+        "最初に setup-instructions.md を読んでください。tako の設定を変更します。何をしますか？"
     };
-
-    let claude_cmd = format!(
-        "cd '{}' && claude --model 'claude-opus-4-6' '{}'",
-        dir.display(),
-        greeting.replace('\'', "'\\''"),
-    );
-
-    let status = std::process::Command::new(&shell)
-        .args(["-l", "-c", &claude_cmd])
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
-        .map_err(|e| format!("claude の起動に失敗: {e}"))?;
+    let status = launch_setup_agent(selected_agent, &dir, greeting)?;
 
     if status.success() {
         // セットアップ完了を記録（適用済み setup リビジョンを含む。Issue #94）。
@@ -790,6 +1528,8 @@ pub fn run_setup() -> Result<(), String> {
             config.setup.completed_at = Some(now_iso8601());
             config.setup.applied_revision = revision;
             config.setup.applied_version = Some(env!("CARGO_PKG_VERSION").to_string());
+            config.setup.selected_agent = Some(selected.as_str().to_string());
+            config.setup.provider_plans = plans.clone();
         })?;
         // 追従が完了したので pending-changes.md を消す（stale 防止）
         sync_pending_changes_file(&dir, &[], revision)?;
@@ -798,198 +1538,12 @@ pub fn run_setup() -> Result<(), String> {
     } else {
         eprintln!();
         eprintln!(
-            "claude が終了しました（exit code: {}）",
+            "{} が終了しました（exit code: {}）",
+            selected.as_str(),
             status.code().unwrap_or(-1)
         );
     }
 
-    // 6. デフォルトプロファイルの確認・作成
-    use tako_control::orchestrator;
-    if let Err(e) = orchestrator::ensure_defaults() {
-        eprintln!("  ⚠ プロファイルの初期化に失敗: {e}");
-    } else {
-        eprintln!("  ✓ デフォルトのオーケストレータープロファイルを確認しました");
-        // 旧バージョンが書き込んだ [1m] 既定値のマイグレーション（Issue #27）
-        if let Some(notice) = orchestrator::migrate_legacy_default_profile() {
-            eprintln!("  ℹ {notice}");
-        }
-        match orchestrator::list_profiles() {
-            Ok(profiles) if profiles.len() > 1 => {
-                eprintln!("    既存プロファイル: {}", profiles.join(", "));
-            }
-            _ => {}
-        }
-    }
-
-    // 7. オーケストレータープロファイルの設定（対話・スキップ可能）
-    eprintln!();
-    eprintln!("━━━ オーケストレータープロファイル設定 ━━━");
-    eprintln!();
-    eprintln!("tako master で子 worker を管理するときのモデル・effort 設定を行います。");
-    eprintln!("Pro プランではモデル指定が制限される場合があるため、既定のままでも構いません。");
-    eprintln!();
-    run_profile_setup()?;
-
-    Ok(())
-}
-
-/// オーケストレータープロファイルの対話式設定
-fn run_profile_setup() -> Result<(), String> {
-    use tako_control::orchestrator;
-
-    let stdin = std::io::stdin();
-    let mut input = String::new();
-
-    // 既定のままにする選択肢を最初に提示
-    eprintln!("プロファイルを設定しますか？");
-    eprintln!("  1) 既定のままにする（推奨: claude 既定モデル / max / inherit。全プランで動作）");
-    eprintln!("  2) 設定する");
-    eprint!("選択 [1]: ");
-    input.clear();
-    let _ = stdin.read_line(&mut input);
-    let choice = input.trim();
-    if choice.is_empty() || choice == "1" {
-        eprintln!();
-        eprintln!("  既定のプロファイルを維持します。");
-        show_profile_paths()?;
-        return Ok(());
-    }
-
-    // プロファイル名
-    eprintln!();
-    eprint!("プロファイル名 [default]: ");
-    input.clear();
-    let _ = stdin.read_line(&mut input);
-    let profile_name = input.trim();
-    let profile_name = if profile_name.is_empty() {
-        "default"
-    } else {
-        profile_name
-    }
-    .to_string();
-
-    // 既存プロファイルがあれば読み込む
-    let mut profile = orchestrator::Profile::load(&profile_name).unwrap_or_default();
-
-    // master のモデル
-    eprintln!();
-    eprintln!("master のモデル（未指定 = claude CLI の既定モデル。プラン非依存で推奨）:");
-    eprintln!("  現在: {}", profile.model_label());
-    eprintln!("  空欄 = 現状維持、`-` = 指定を解除して claude 既定に戻す");
-    eprintln!("  注意: [1m] 付き（1M コンテキスト版）は Max / API プラン限定");
-    eprint!("モデル [{}]: ", profile.model_label());
-    input.clear();
-    let _ = stdin.read_line(&mut input);
-    let model_input = input.trim();
-    if model_input == "-" {
-        profile.model = None;
-    } else if !model_input.is_empty() {
-        profile.model = Some(model_input.to_string());
-    }
-
-    // master の effort
-    eprintln!();
-    eprintln!("master の effort:");
-    eprintln!("  現在: {}", profile.effort);
-    eprint!("effort [{}]: ", profile.effort);
-    input.clear();
-    let _ = stdin.read_line(&mut input);
-    let effort_input = input.trim();
-    if !effort_input.is_empty() {
-        profile.effort = effort_input.to_string();
-    }
-
-    // 子 worker のモデル決定ポリシー
-    eprintln!();
-    eprintln!("子 worker のモデル決定ポリシー:");
-    eprintln!("  1) inherit — master と同じモデル・effort を使う（推奨）");
-    eprintln!("  2) fixed — 子 worker は別の固定モデルを使う");
-    eprintln!("  3) delegate — master がタスク内容を見て判断する");
-    eprint!("選択 [1]: ");
-    input.clear();
-    let _ = stdin.read_line(&mut input);
-    let policy_choice = input.trim();
-    match policy_choice {
-        "2" => {
-            profile.worker_model_policy = orchestrator::WorkerModelPolicy::Fixed;
-            eprintln!();
-            eprint!("子 worker のモデル [{}]: ", profile.model_label());
-            input.clear();
-            let _ = stdin.read_line(&mut input);
-            let wm = input.trim();
-            if !wm.is_empty() {
-                profile.worker_model = Some(wm.to_string());
-            }
-            eprint!("子 worker の effort [{}]: ", profile.effort);
-            input.clear();
-            let _ = stdin.read_line(&mut input);
-            let we = input.trim();
-            if !we.is_empty() {
-                profile.worker_effort = Some(we.to_string());
-            }
-        }
-        "3" => {
-            profile.worker_model_policy = orchestrator::WorkerModelPolicy::Delegate;
-            eprintln!();
-            eprintln!("振り分け方針のテキスト（master の system prompt に注入されます）。");
-            eprintln!("空欄で既定の雛形を使います。ファイルパス（~/...）も指定可能。");
-            eprint!("guidance: ");
-            input.clear();
-            let _ = stdin.read_line(&mut input);
-            let guidance = input.trim();
-            if !guidance.is_empty() {
-                profile.delegate_guidance = Some(guidance.to_string());
-            }
-        }
-        _ => {
-            profile.worker_model_policy = orchestrator::WorkerModelPolicy::Inherit;
-        }
-    }
-
-    // 保存
-    let saved_path = profile
-        .save(&profile_name)
-        .map_err(|e| format!("プロファイルの保存に失敗: {e}"))?;
-    eprintln!();
-    eprintln!("  ✓ プロファイルを保存しました: {}", saved_path.display());
-    let policy_desc = match profile.worker_model_policy {
-        orchestrator::WorkerModelPolicy::Inherit => {
-            format!("inherit（{} / {}）", profile.model_label(), profile.effort)
-        }
-        orchestrator::WorkerModelPolicy::Fixed => format!(
-            "fixed（{} / {}）",
-            profile.worker_model_label(),
-            profile.resolve_worker_effort()
-        ),
-        orchestrator::WorkerModelPolicy::Delegate => "delegate（master が判断）".into(),
-    };
-    eprintln!(
-        "    master: {} / {}、worker: {policy_desc}",
-        profile.model_label(),
-        profile.effort
-    );
-    if let Some(warning) = profile
-        .model
-        .as_deref()
-        .and_then(|m| orchestrator::one_m_model_warning(m, "master"))
-    {
-        eprintln!("{warning}");
-    }
-    show_profile_paths()?;
-    Ok(())
-}
-
-fn show_profile_paths() -> Result<(), String> {
-    use tako_control::orchestrator;
-    eprintln!();
-    eprintln!("プロファイル設定の変更:");
-    eprintln!(
-        "  {}orchestrator/profiles/<名前>.yaml を編集",
-        orchestrator::config_dir()
-            .map(|d| format!("{}/", d.display()))
-            .unwrap_or_default()
-    );
-    eprintln!("  tako master -<名前> で起動");
     Ok(())
 }
 
@@ -1078,9 +1632,10 @@ mod tests {
 
     #[test]
     fn external_deps_table_is_consistent() {
-        // claude は必須依存として先頭に置く（setup の対話自体が claude を使うため）
-        assert_eq!(EXTERNAL_DEPS[0].bin, "claude");
-        assert!(EXTERNAL_DEPS[0].required);
+        // エージェント CLI は 3 者から別途検出するため、汎用依存表には含めない。
+        assert!(EXTERNAL_DEPS.iter().all(|dep| !SetupAgent::ALL
+            .iter()
+            .any(|agent| agent.as_str() == dep.bin)));
         // tmux は任意依存（remote / 永続化 / オーケストレーターが対象機能）
         let tmux = EXTERNAL_DEPS.iter().find(|d| d.bin == "tmux").unwrap();
         assert!(!tmux.required);
@@ -1102,6 +1657,144 @@ mod tests {
                 dep.bin
             );
         }
+    }
+
+    fn detected(kind: SetupAgent, authenticated: bool, plan: Option<&str>) -> DetectedAgent {
+        DetectedAgent {
+            kind,
+            path: format!("/fake/{}", kind.as_str()),
+            authenticated,
+            plan: plan.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn claude_auth_jsonから認証とプランを取得する() {
+        let value = serde_json::json!({
+            "loggedIn": true,
+            "authMethod": "claude.ai",
+            "subscriptionType": "Max"
+        });
+        assert_eq!(
+            parse_claude_auth_json(&value, true),
+            (true, Some("max".into()))
+        );
+        assert_eq!(parse_claude_auth_json(&value, false), (false, None));
+
+        let api = serde_json::json!({"loggedIn": true, "authMethod": "api_key"});
+        assert_eq!(
+            parse_claude_auth_json(&api, true),
+            (true, Some("api".into()))
+        );
+    }
+
+    #[test]
+    fn codexのjwtからプランだけを取得する() {
+        let dir =
+            std::env::temp_dir().join(format!("tako-issue226-codex-auth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        let payload =
+            "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbHVzIn19";
+        std::fs::write(
+            &path,
+            format!(r#"{{"tokens":{{"id_token":"header.{payload}.signature"}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(codex_plan_from_auth_file_at(&path).as_deref(), Some("plus"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 複数cliでは認証済みを既定にして番号選択を反映する() {
+        let agents = vec![
+            detected(SetupAgent::Claude, false, None),
+            detected(SetupAgent::Codex, true, Some("plus")),
+            detected(SetupAgent::Agy, true, None),
+        ];
+        assert_eq!(default_agent_index(&agents), 2);
+        assert_eq!(choose_setup_agent(&agents, ""), Ok(SetupAgent::Codex));
+        assert_eq!(choose_setup_agent(&agents, "3"), Ok(SetupAgent::Agy));
+        assert!(choose_setup_agent(&agents, "4").is_err());
+    }
+
+    #[test]
+    fn プラン規模でeffortとworker方針を推奨する() {
+        let single = vec![detected(SetupAgent::Claude, true, Some("pro"))];
+        let single_plans = BTreeMap::from([
+            ("claude".into(), "pro".into()),
+            ("gpt".into(), "unknown".into()),
+            ("google".into(), "unknown".into()),
+        ]);
+        let (profile, _) = recommended_profile(SetupAgent::Claude, &single, &single_plans);
+        assert_eq!(profile.master_agent.as_deref(), Some("claude"));
+        assert_eq!(profile.worker_agent.as_deref(), Some("claude"));
+        assert_eq!(profile.effort, "high");
+        assert_eq!(
+            profile.worker_model_policy,
+            tako_control::orchestrator::WorkerModelPolicy::Inherit
+        );
+        assert!(profile.model.is_none(), "モデルは陳腐化しない CLI 既定");
+
+        let multiple = vec![
+            detected(SetupAgent::Claude, true, Some("pro")),
+            detected(SetupAgent::Codex, true, Some("pro")),
+            detected(SetupAgent::Agy, true, None),
+        ];
+        let multiple_plans = BTreeMap::from([
+            ("claude".into(), "pro".into()),
+            ("gpt".into(), "pro".into()),
+            ("google".into(), "free".into()),
+        ]);
+        let (profile, _) = recommended_profile(SetupAgent::Codex, &multiple, &multiple_plans);
+        assert_eq!(profile.master_agent.as_deref(), Some("codex"));
+        assert_eq!(profile.worker_agent.as_deref(), Some("codex"));
+        assert_eq!(profile.effort, "xhigh");
+        assert_eq!(
+            profile.worker_model_policy,
+            tako_control::orchestrator::WorkerModelPolicy::Delegate
+        );
+        assert_eq!(
+            profile
+                .worker_agents
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["agy", "claude", "codex"]
+        );
+        assert!(profile.worker_agents["codex"].skip_permissions);
+        assert!(profile.worker_agents["agy"].effort.is_none());
+    }
+
+    #[test]
+    fn 推奨profile更新はsystem_promptとprojectsを保持する() {
+        let mut existing = tako_control::orchestrator::Profile {
+            system_prompt: Some("custom.md".into()),
+            prompt_blocks: Some(tako_control::orchestrator::PromptBlocks {
+                prepend: Some("custom".into()),
+                ..Default::default()
+            }),
+            projects: Some(vec!["demo".into()]),
+            ..Default::default()
+        };
+        let recommended = tako_control::orchestrator::Profile {
+            master_agent: Some("codex".into()),
+            effort: "high".into(),
+            worker_agent: Some("codex".into()),
+            ..Default::default()
+        };
+        apply_profile_recommendation(&mut existing, &recommended);
+        assert_eq!(existing.master_agent.as_deref(), Some("codex"));
+        assert_eq!(existing.system_prompt.as_deref(), Some("custom.md"));
+        assert_eq!(
+            existing
+                .prompt_blocks
+                .as_ref()
+                .and_then(|blocks| blocks.prepend.as_deref()),
+            Some("custom")
+        );
+        assert_eq!(existing.projects, Some(vec!["demo".into()]));
     }
 
     #[test]

@@ -21,6 +21,11 @@ Nightly patch release (automated). Changes since v0.5.0:
 
 ## [Unreleased]
 
+### Added
+
+- `tako setup` now supports claude / codex / agy end to end (#226): it detects every installed CLI, auto-selects a single candidate or presents an authenticated multi-choice list, reads available auth/plan signals without logging credentials, asks only for unavailable Claude / GPT / Google plan details, and generates a plan-sized `profiles/default.yaml` recommendation (CLI-default models, scaled effort, multi-agent delegate policy). Existing system-prompt and project customizations are preserved. A scratch-HOME/PATH verifier covers the single-Claude and multi-CLI flows
+  `tako setup` を claude / codex / agy に全面対応（#226）: インストール済み CLI の全検出、単一時の自動選択、複数時の認証状態つき選択、認証情報を出力しないプラン自動検出、取得不能な Claude / GPT / Google プランだけの質問、プラン規模別 `profiles/default.yaml` 推奨（CLI 既定モデル・effort・複数エージェント delegate）を追加。既存 profile の system prompt / projects カスタマイズは保持する。スクラッチ HOME / PATH の検証スクリプトで Claude 単独・複数 CLI の両フローを実測
+
 ### Fixed
 
 - UI thread no longer blocks on a `pmset` subprocess every 2 seconds (#212): the sleep-guard AC-power check (introduced in v0.5.0 via #173) ran `pmset -g batt` synchronously on the UI thread from the 2-second periodic tick — 20–30ms per call even when idle, stretching to multi-second stalls under CPU saturation (e.g. 4 parallel `cargo build` workers), which surfaced as a sluggish screen, flickering terminal text, and janky scrolling. Replaced with an IOKit FFI call (`IOPSGetTimeRemainingEstimate`, microseconds). Measured: isolated idle instance `periodic_prep` p50 17–59ms / max 116ms → p50 0ms / max 8ms. Also: per-step sub-spans (`periodic_prep:*`) added to perf diagnostics for future attribution, and perf.log lines no longer interleave when written from multiple threads
