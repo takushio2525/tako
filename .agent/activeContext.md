@@ -17,10 +17,13 @@
   `tako_preview_view`（75 ツール）を 1:1 実装。3 ページ目 + 150% の変換テストあり
 - 隔離実機: PDF 100/150%、2 ページ目、パン、リセット、画像 100/200%、行間ドラッグ、
   150% 選択ハイライトを確認。render p50 1ms / p99 2ms / max 4ms
+- GPUI `PlatformInput::Pinch` の Started → Moved → Ended を実 scroll bounds へ送り、
+  1.500 → 1.650 → 1.485 の増減を隔離 E2E で確認。keyboard modality 直後も
+  capture + ペイン bounds 判定で取りこぼさず、他ペインへ誤配信しない
 - `origin/main`（#21 / #229、`6af2d47`）を競合なしで rebase。統合後も workspace
   build / fmt --check / clippy -D warnings / test 全緑
   （app 83・CLI 22・control 362・core 249 passed）。隔離セルフテストは
-  `TAKO_APP_SELF_TEST_OK`、PDF 150% は raster key 150 + hit `(0, 0)` を実描画で確認
+  `TAKO_APP_SELF_TEST_OK`、PDF 150% は raster key 150 + hit `(0, 0)`、pinch 増減を実描画で確認
 
 ## 次の一手
 

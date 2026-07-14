@@ -2157,11 +2157,24 @@ impl TakoApp {
                     // dispatch_event が root update 中に listener update を再入させる。
                     // Image / PDF にだけイベント経路を載せる。
                     .when(zoomable, |d| {
-                        d.on_pinch(cx.listener(
+                        d.capture_pinch(cx.listener(
                             move |this, event: &gpui::PinchEvent, _, cx| {
-                            let current = this
-                                .preview_views
-                                .get(&pane_id)
+                                // GPUI は Pinch 単体では keyboard modality を解除しないため、
+                                // bubble の is_hovered 判定ではキーボード操作直後のピンチを
+                                // 取りこぼす。capture で受け、対象ペインの実 bounds を自前判定する。
+                                let in_pane = this
+                                    .preview_scroll_handles
+                                    .get(&pane_id)
+                                    .is_some_and(|handle| {
+                                        handle.bounds().contains(&event.position)
+                                    });
+                                if !in_pane {
+                                    cx.propagate();
+                                    return;
+                                }
+                                let current = this
+                                    .preview_views
+                                    .get(&pane_id)
                                 .copied()
                                 .unwrap_or_default()
                                 .zoom;

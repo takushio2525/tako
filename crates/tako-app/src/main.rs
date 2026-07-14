@@ -15865,6 +15865,67 @@ mod self_test {
                 zoom_coordinates_ok,
                 "PDF 150% の再ラスタライズ後も文字座標が画像へ追従する",
             );
+            let pinch_position = window
+                .update(cx, |app, _, _| {
+                    app.preview_scroll_handles
+                        .get(&PaneId::from_raw(code_pane))
+                        .map(|handle| handle.bounds().center())
+                })
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| fail("PDF pinch の中心座標がある"));
+            let dispatch_pinch = |delta: f32, cx: &mut AsyncApp| {
+                [
+                    (gpui::TouchPhase::Started, 0.0),
+                    (gpui::TouchPhase::Moved, delta),
+                    (gpui::TouchPhase::Ended, 0.0),
+                ]
+                .into_iter()
+                .all(|(phase, phase_delta)| {
+                    any.update(cx, |_, preview_window, cx| {
+                        preview_window.dispatch_event(
+                            gpui::PlatformInput::Pinch(gpui::PinchEvent {
+                                position: pinch_position,
+                                delta: phase_delta,
+                                phase,
+                                ..gpui::PinchEvent::default()
+                            }),
+                            cx,
+                        );
+                    })
+                    .is_ok()
+                })
+            };
+            check(dispatch_pinch(0.1, cx), "PDF へ pinch-in イベントを送れる");
+            wait(cx, 50).await;
+            let pinch_in_zoom = window
+                .update(cx, |app, _, _| {
+                    app.preview_views
+                        .get(&PaneId::from_raw(code_pane))
+                        .map(|view| view.zoom)
+                })
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            check(pinch_in_zoom > 1.5, "pinch-in で PDF 倍率が増える");
+            check(dispatch_pinch(-0.1, cx), "PDF へ pinch-out イベントを送れる");
+            wait(cx, 50).await;
+            let pinch_out_zoom = window
+                .update(cx, |app, _, _| {
+                    app.preview_views
+                        .get(&PaneId::from_raw(code_pane))
+                        .map(|view| view.zoom)
+                })
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            check(
+                pinch_out_zoom < pinch_in_zoom,
+                "pinch-out で PDF 倍率が減る",
+            );
+            println!(
+                "TAKO_PREVIEW_COORD: pdf pinch in={pinch_in_zoom:.3} out={pinch_out_zoom:.3}"
+            );
             check(
                 wait_for_pdf_highlight_paint(
                     any,
