@@ -1308,11 +1308,15 @@ enum TabCommand {
     /// ペインを移動する: タブ ID 指定 = 別タブの末尾へ、--target 指定 = そのペインの
     /// 隣（--right 等の方向）へ挿し直す（FR-1.10 = タイトルバー D&D の同等操作）
     MovePane {
-        /// 移送先タブ ID（--target と排他）
+        /// 移送先タブ ID（--target / --new と排他）
+        #[arg(conflicts_with_all = ["target", "new"])]
         tab: Option<u64>,
         /// 挿入先ペイン ID（このペインの隣に入る。同タブ内の並べ替えに使う）
-        #[arg(long, conflicts_with = "tab")]
+        #[arg(long, conflicts_with_all = ["tab", "new"])]
         target: Option<u64>,
+        /// 新しいタブとして分離する（Issue #209）
+        #[arg(long, conflicts_with_all = ["tab", "target"])]
+        new: bool,
         /// 対象ペイン ID（省略時は呼び出し元）
         #[arg(long)]
         pane: Option<u64>,
@@ -2657,6 +2661,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Tab(TabCommand::MovePane {
             tab,
             target,
+            new,
             pane,
             right,
             down,
@@ -2667,9 +2672,12 @@ fn build_request(command: &Command) -> Result<Request, String> {
             if (*right || *down || *up || *left) && target.is_none() {
                 return Err("--right/--down/--up/--left は --target と併用する".into());
             }
+            if !new && tab.is_none() && target.is_none() {
+                return Err("tab か --target か --new のいずれかを指定する".into());
+            }
             Request::MovePane {
                 pane: target_pane(*pane)?,
-                tab: *tab,
+                tab: if *new { None } else { *tab },
                 target: *target,
                 direction: target.map(|_| match (down, up, left) {
                     (true, _, _) => Direction::Down,
@@ -3718,6 +3726,35 @@ mod tests {
         // tab と --target の併用は clap が拒否、--target なしの方向指定は build_request が拒否
         assert!(Cli::try_parse_from(["tako", "tab", "move-pane", "4", "--target", "7"]).is_err());
         let command = parse(&["tako", "tab", "move-pane", "4", "--pane", "9", "--down"]);
+        assert!(build_request(&command).is_err());
+        // --new は新タブ化（Issue #209）
+        let command = parse(&["tako", "tab", "move-pane", "--new", "--pane", "9"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::MovePane {
+                pane: Some(9),
+                tab: None,
+                target: None,
+                direction: None,
+            }
+        );
+        // --new は tab / --target と排他
+        assert!(
+            Cli::try_parse_from(["tako", "tab", "move-pane", "4", "--new", "--pane", "9"]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "tako",
+            "tab",
+            "move-pane",
+            "--target",
+            "7",
+            "--new",
+            "--pane",
+            "9"
+        ])
+        .is_err());
+        // tab / target / new すべて省略はエラー
+        let command = parse(&["tako", "tab", "move-pane", "--pane", "9"]);
         assert!(build_request(&command).is_err());
     }
 

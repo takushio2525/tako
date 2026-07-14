@@ -565,13 +565,14 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_move_pane_to_tab",
             "description": "ペインを移動する。tab 指定 = 別タブの末尾へ移送（グループ分け）、\
                 target 指定 = そのペインの隣（direction 側）へ挿し直す（同タブ内の並べ替え = \
-                ペインタイトルバーの D&D と同じ操作。タブまたぎも可）。どちらか一方を指定する。\
-                レイアウトを整えてユーザーに見せる導線に使う。",
+                ペインタイトルバーの D&D と同じ操作。タブまたぎも可）、new_tab = true で新タブとして分離。\
+                tab / target / new_tab は排他。レイアウトを整えてユーザーに見せる導線に使う。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "tab": { "type": "integer", "minimum": 0, "description": "移送先タブ ID（target と排他）" },
+                    "tab": { "type": "integer", "minimum": 0, "description": "移送先タブ ID（target / new_tab と排他）" },
                     "target": { "type": "integer", "minimum": 0, "description": "挿入先ペイン ID（このペインの隣に入る）" },
+                    "new_tab": { "type": "boolean", "description": "true = 新しいタブとして分離する（tab / target と排他）" },
                     "direction": {
                         "type": "string",
                         "enum": ["right", "down", "left", "up"],
@@ -2000,12 +2001,19 @@ fn build_request(
         "tako_select_tab" => Request::TabSelect {
             tab: required_u64(args, "tab")?,
         },
-        "tako_move_pane_to_tab" => Request::MovePane {
-            pane: Some(target_pane(args, caller)?),
-            tab: u64_arg(args, "tab")?,
-            target: u64_arg(args, "target")?,
-            direction: direction_arg(args)?,
-        },
+        "tako_move_pane_to_tab" => {
+            let new_tab = bool_arg(args, "new_tab")?.unwrap_or(false);
+            Request::MovePane {
+                pane: Some(target_pane(args, caller)?),
+                tab: if new_tab { None } else { u64_arg(args, "tab")? },
+                target: if new_tab {
+                    None
+                } else {
+                    u64_arg(args, "target")?
+                },
+                direction: if new_tab { None } else { direction_arg(args)? },
+            }
+        }
         "tako_auto_rename" => Request::AutoRename {
             enabled: bool_arg(args, "enabled")?,
         },
