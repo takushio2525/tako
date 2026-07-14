@@ -342,6 +342,9 @@ pub enum Request {
         pan_x: Option<f32>,
         pan_y: Option<f32>,
     },
+    /// 表示中プレビューファイルのライブリロード設定（Issue #233）。
+    /// `enabled` 省略時は現在状態の取得のみ。設定は永続化される。
+    PreviewReload { enabled: Option<bool> },
     /// コードプレビューの編集モードを切り替える（FR-3.5）。`enabled` 省略時は状態取得。
     PreviewEdit {
         pane: Option<u64>,

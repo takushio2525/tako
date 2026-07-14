@@ -4,37 +4,40 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-14・#231 / #234 PDF 品質改善 + PDF・画像ズーム）
+## 現在の対象（2026-07-15・#233 プレビューライブリロード）
 
-**実装・検証・squash merge・Issue 報告まで完了**（PR #240 / merge `22f1d23`）:
+**実装・全検証・最新 main 取り込み・全差分レビューまで完了。PR 作成待ち**:
 
-- #231: PDF 行間・余白のヒットテストを `None` にし、ドラッグ全文選択を防止。UTF-8 座標テスト追加
-- #231: device scale × zoom × 表示幅の `PdfRasterKey`、background 再ラスタライズ、
-  path + raster key の `PreviewImageCache` を実装。Retina 2x 全幅で 1224×1584 → 1920×2485 を実測
-- #234: PDF・画像を 25〜400% ズーム、2 軸パン、現在ページ維持リセット、倍率 SVG 操作、
-  ピンチ / ⌘+/⌘- / ⌘0 / 修飾スクロールへ対応。PDF ページ高さを明示してページ移動を修正
-- core `PreviewViewState` → dispatch `PreviewView` → CLI `tako preview` → MCP
-  `tako_preview_view`（75 ツール）を 1:1 実装。3 ページ目 + 150% の変換テストあり
-- 隔離実機: PDF 100/150%、2 ページ目、パン、リセット、画像 100/200%、行間ドラッグ、
-  150% 選択ハイライトを確認。render p50 1ms / p99 2ms / max 4ms
-- GPUI `PlatformInput::Pinch` の Started → Moved → Ended を実 scroll bounds へ送り、
-  1.500 → 1.650 → 1.485 の増減を隔離 E2E で確認。keyboard modality 直後も
-  capture + ペイン bounds 判定で取りこぼさず、他ペインへ誤配信しない
-- `origin/main`（#21 / #229、`6af2d47`）を競合なしで rebase。統合後も workspace
-  build / fmt --check / clippy -D warnings / test 全緑
-  （app 83・CLI 22・control 362・core 249 passed）。隔離セルフテストは
-  `TAKO_APP_SELF_TEST_OK`、PDF 150% は raster key 150 + hit `(0, 0)`、pinch 増減を実描画で確認
-- PR #240 は Cloudflare Pages 成功後に squash merge、作業ブランチ削除済み。#231 / #234 は closed、
-  実測値と目視チェックリストを各 Issue へコメント済み
+- `notify` の OS ネイティブイベントで表示中ファイルの親ディレクトリだけを非再帰監視し、
+  パス別 300ms デバウンスと世代照合を実装。callback は channel 送信だけで、アイドル時の
+  UI ポーリングは追加していない
+- コード / Markdown / 画像 / PDF の読み込み、syntect / pulldown-cmark、画像バイト取得、
+  PDF ラスタライズを background で完了してから UI を差し替える。#231/#234 の
+  `PreviewImageCache` と raster key を維持し、スクロール、mode、zoom / pan を保持する
+- 編集モード中の外部変更は `SaveStatus::Conflict` で通知し、編集バッファを上書きしない。
+  自保存由来のイベントは完成バイトとの比較で除外する。動画は再生位置保持のため対象外
+- core `PreviewReloadState` → dispatch `PreviewReload` → CLI
+  `tako preview-reload [on|off]` → MCP `tako_preview_reload`（全 80 ツール）を 1:1 実装。
+  設定は既定 ON で `settings.json` に永続化する
+- 連続 6 write（40ms 間隔）は 1 回へ集約され、最終 write から 427ms で反映。
+  Markdown mode と scroll_y=-48.0 を維持。編集競合は 344ms、バッファ保持を確認
+- 削除 / rename / 同一パス復帰、1MB 超の省略表示、PNG 更新と zoom / pan 保持、
+  PDF 更新後の background 再ラスタライズを隔離セルフテストで確認
+- `preview_watch_sync` のアイドル窓は p50 / p95 / p99 / max すべて 0ms、event / apply は 0 回。
+  6 イベント時の `preview_watch_event` と 1 回の `preview_reload_apply` も全 percentile 0ms、
+  16ms 以上の UI 専有ログは 0 件
+- `origin/main`（#161 / #20、`30a56b5`）へ rebase 済み。workspace build / fmt --check /
+  clippy -D warnings / test 全緑、隔離セルフテストは `TAKO_APP_SELF_TEST_OK`。変更 22 ファイルの
+  diff を全行レビュー済み
 
 ## 次の一手
 
+- ブランチを push し、`Closes #233` と perf_span 実測値を含む PR を作成する
+- CI 成功後に squash merge + ブランチ削除し、Issue #233 へ実測証拠付き完了コメントを投稿する
 - install は依頼どおり master 側で行うため、この worktree では実行しない
-- 安全に切り出した before / after PNG は目視確認済みだが、GitHub Web が未ログインかつ
-  CLI の Issue API はバイナリ添付非対応のため未添付。検証画像を git へ入れない規約を優先
 
 ## 現フェーズで Read すべき設計書
 
-- 要件: `.agent/requirements.md`（FR-3.4 / FR-3.10 / FR-3.14、NFR-8）
-- 設計: `.agent/architecture.md`（PDF 選択・ラスタライズ・ズーム、ストール診断）
-- 実機確認: `.agent/manual-checks.md`（PDF 選択描画・ズーム）
+- 要件: `.agent/requirements.md`（FR-3.5 / FR-3.15、NFR-8）
+- 設計: `.agent/architecture.md`（background プレビュー、ライブリロード経路、ストール診断）
+- 実機確認: `.agent/manual-checks.md`（プレビューライブリロード）

@@ -190,7 +190,7 @@ pub trait UiStateHost {
 }
 
 // ---------------------------------------------------------------------------
-// PreviewHost — プレビュー + 編集 + 動画（15 メソッド）
+// PreviewHost — プレビュー + 編集 + 動画（17 メソッド）
 // ---------------------------------------------------------------------------
 
 pub trait PreviewHost {
@@ -219,6 +219,12 @@ pub trait PreviewHost {
     ) -> Result<PreviewViewState, String> {
         Err("PDF・画像プレビューのズームは未対応".into())
     }
+    /// 表示中ファイルのライブリロード設定（Issue #233）。
+    fn preview_reload_enabled(&self) -> bool {
+        true
+    }
+    /// ライブリロードの ON/OFF 切替。監視登録と永続化は実装側の責務。
+    fn set_preview_reload(&mut self, _enabled: bool) {}
     /// プレビュー編集状態（editing, dirty）。編集セッション未開始なら (false, false)。
     fn preview_edit_state(&self, _pane: PaneId) -> Option<(bool, bool)> {
         None

@@ -55,6 +55,9 @@ syntect = { version = "5", default-features = false, features = [
 ] }
 # Markdown プレビューのパーサ（FR-3.3。イベントストリーム型で GPUI 独自描画に写す）
 pulldown-cmark = { version = "0.13", default-features = false }
+# 表示中プレビューファイルのイベント駆動監視（Issue #233）。macOS は FSEvents、
+# Windows は ReadDirectoryChangesW を使い、描画ループでポーリングしない。
+notify = "8.2"
 image = "0.25"
 rust-embed = "8"
 pathdiff = "0.2"

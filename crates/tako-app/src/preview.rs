@@ -7,6 +7,7 @@
 //! 画像は生バイトを保持し GPUI 側でデコードする（FR-3.10）。
 //! PDF は macOS Core Graphics でページを RGBA にレンダリングする（FR-3.4）。
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -14,7 +15,7 @@ use tako_control::protocol::PreviewModeWire;
 use tako_core::{SearchHit, TextBuffer};
 
 /// 読み込みの上限（巨大ファイルで UI を固めない。超過分は切り詰めて明示する）
-const MAX_BYTES: usize = 1_000_000;
+pub(crate) const MAX_BYTES: usize = 1_000_000;
 const MAX_LINES: usize = 5_000;
 
 /// プレビューの表示モード（ワイヤ表現 `PreviewModeWire` と 1:1）
@@ -226,6 +227,13 @@ pub enum PreviewContent {
     Loading,
     /// 読めない・バイナリ等（正常系の劣化。ペインは開いたまま理由を表示する）
     Error(String),
+}
+
+/// background ライブリロードの完成結果。テキストの元バイト列は、編集中の
+/// 自己保存イベントと真の外部変更を区別するためだけに完了時まで保持する。
+pub struct ReloadedPreview {
+    pub state: PreviewState,
+    pub source_bytes: Option<Vec<u8>>,
 }
 
 /// プレビューペイン 1 枚分の状態（`TakoApp::previews` の値）
@@ -1274,6 +1282,63 @@ pub fn load_fast(path: &Path, mode: PreviewMode) -> (PreviewState, Option<String
     )
 }
 
+/// ライブリロード用の完成版を作る。ファイル I/O・Markdown パース・syntect・
+/// 画像読み込み・PDF ラスタライズのすべてを呼び出し側の background executor で行う。
+pub fn load_for_reload(
+    path: &Path,
+    mode: PreviewMode,
+    pdf_raster_key: Option<PdfRasterKey>,
+) -> ReloadedPreview {
+    let (state, source_bytes) = match mode {
+        PreviewMode::Image => (load_image(path), None),
+        PreviewMode::Pdf => (
+            load_pdf_with_key(
+                path,
+                pdf_raster_key.unwrap_or_else(|| PdfRasterKey::for_view(2.0, 1.0, 612.0)),
+            ),
+            None,
+        ),
+        // 動画はライブリロード対象外だが、呼び出し誤りでも安全に完成状態を返す。
+        PreviewMode::Video => (load_video(path), None),
+        PreviewMode::Code | PreviewMode::Markdown => {
+            let (text, truncated, source) = match read_text_source(path) {
+                Ok(loaded) => loaded,
+                Err(message) => {
+                    return ReloadedPreview {
+                        state: PreviewState::error(path, mode, message),
+                        source_bytes: None,
+                    };
+                }
+            };
+            let content = match mode {
+                PreviewMode::Code => PreviewContent::Code(highlighter().highlight(path, &text)),
+                PreviewMode::Markdown => PreviewContent::Markdown(markdown_blocks(&text)),
+                _ => unreachable!(),
+            };
+            (
+                PreviewState {
+                    path: path.to_path_buf(),
+                    mode,
+                    content,
+                    truncated,
+                },
+                (!truncated).then_some(source),
+            )
+        }
+    };
+    ReloadedPreview {
+        state,
+        source_bytes,
+    }
+}
+
+pub fn live_reload_supported(mode: PreviewMode) -> bool {
+    matches!(
+        mode,
+        PreviewMode::Code | PreviewMode::Markdown | PreviewMode::Image | PreviewMode::Pdf
+    )
+}
+
 /// background executor 上で呼ぶ: syntect ハイライトだけを実行して行列を返す
 pub fn highlight_text(path: &Path, text: &str) -> Vec<Line> {
     highlighter().highlight(path, text)
@@ -1281,19 +1346,28 @@ pub fn highlight_text(path: &Path, text: &str) -> Vec<Line> {
 
 /// テキストとして読む。バイナリ（NUL 含有）は明示エラー、上限超過は切り詰める
 fn read_text(path: &Path) -> Result<(String, bool), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("読み込めない: {e}"))?;
+    read_text_source(path).map(|(text, truncated, _)| (text, truncated))
+}
+
+/// 上限 + 1 byte だけ読み、巨大ファイルを丸ごとメモリへ載せずに省略判定する。
+fn read_text_source(path: &Path) -> Result<(String, bool, Vec<u8>), String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("読み込めない: {e}"))?;
+    let mut bytes = Vec::with_capacity(MAX_BYTES.min(64 * 1024) + 1);
+    file.take((MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("読み込めない: {e}"))?;
     let truncated_bytes = bytes.len() > MAX_BYTES;
-    let bytes = &bytes[..bytes.len().min(MAX_BYTES)];
+    bytes.truncate(MAX_BYTES);
     if bytes.contains(&0) {
         return Err("バイナリファイル（テキストとして表示できない）".into());
     }
-    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
     let mut truncated = truncated_bytes;
     if text.lines().count() > MAX_LINES {
         text = text.lines().take(MAX_LINES).collect::<Vec<_>>().join("\n");
         truncated = true;
     }
-    Ok((text, truncated))
+    Ok((text, truncated, bytes))
 }
 
 /// シンタックスハイライタの抽象（差し替え点。現実装は syntect、将来 tree-sitter）
@@ -1721,6 +1795,47 @@ mod tests {
         let state = load(&dir.join("no-such.txt"), PreviewMode::Code);
         assert!(matches!(&state.content, PreviewContent::Error(_)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ライブリロードは完成状態を作り巨大ファイルを上限で止める() {
+        let dir = std::env::temp_dir().join(format!("tako-preview-reload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.md");
+        std::fs::write(&path, "# 変更後\n").unwrap();
+
+        let loaded = load_for_reload(&path, PreviewMode::Markdown, None);
+        assert!(matches!(
+            &loaded.state.content,
+            PreviewContent::Markdown(blocks)
+                if matches!(&blocks[0], MdBlock::Heading { spans, .. }
+                    if spans[0].text == "変更後")
+        ));
+        assert_eq!(
+            loaded.source_bytes.as_deref(),
+            Some("# 変更後\n".as_bytes())
+        );
+
+        std::fs::write(&path, vec![b'x'; MAX_BYTES + 128]).unwrap();
+        let huge = load_for_reload(&path, PreviewMode::Code, None);
+        assert!(huge.state.truncated);
+        assert!(huge.source_bytes.is_none());
+        assert!(matches!(huge.state.content, PreviewContent::Code(_)));
+
+        std::fs::remove_file(&path).unwrap();
+        let deleted = load_for_reload(&path, PreviewMode::Markdown, None);
+        assert!(matches!(deleted.state.content, PreviewContent::Error(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ライブリロード対象はテキスト・画像・pdfに限る() {
+        assert!(live_reload_supported(PreviewMode::Code));
+        assert!(live_reload_supported(PreviewMode::Markdown));
+        assert!(live_reload_supported(PreviewMode::Image));
+        assert!(live_reload_supported(PreviewMode::Pdf));
+        assert!(!live_reload_supported(PreviewMode::Video));
     }
 
     /// 性能計測（通常テストでは走らせない）: `cargo test -p tako-app --release -- --ignored --nocapture perf_`

@@ -27,6 +27,7 @@ serde_json.workspace = true
 # プレビューペイン: コードハイライト（FR-3.2）と Markdown パース（FR-3.3）
 syntect.workspace = true
 pulldown-cmark.workspace = true
+notify.workspace = true
 image.workspace = true
 # アプリ内更新の GitHub Releases チェック（update_checker）
 ureq.workspace = true

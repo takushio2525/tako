@@ -749,3 +749,7 @@
 - PDF・画像の 25〜400% ズーム / パン / ページ維持リセット / 倍率表示を実装し、dispatch・CLI `tako preview`・MCP `tako_preview_view`（75 ツール）へ 1:1 公開
 - workspace 全検証と隔離セルフテスト（PDF 150% raster key・文字 hit を含む）を完走。canvas 座標反映は effect cycle 末尾へ送り GPUI 再入更新を防止
 - keyboard modality 直後も捕捉できる pinch 経路を追加し、隔離 E2E で 1.500 → 1.650 → 1.485 と全セルフテスト完走を確認
+
+## 2026-07-15（#233: プレビューライブリロード）
+- OS ネイティブ監視 + 300ms デバウンス + background 再生成を実装し、編集競合保護と CLI / MCP（全 80 ツール）を 1:1 公開
+- 連続 6 write を 1 回・427ms で反映、状態保持、削除 / rename / 巨大ファイル / PNG / PDF、UI 専有 0ms 水準を隔離実測。全検証と全 diff レビューを完了

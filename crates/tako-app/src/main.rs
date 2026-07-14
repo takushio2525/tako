@@ -21,6 +21,7 @@ mod keybindings;
 mod overlays;
 mod preview;
 mod preview_render;
+mod preview_watch;
 mod right_panel;
 mod sidebar;
 mod status_bar;
@@ -376,6 +377,18 @@ fn initial_port_detect() -> bool {
     tako_control::settings::load().port_detect
 }
 
+/// プレビューライブリロード（Issue #233）の起動時の有効判定。
+/// `TAKO_PREVIEW_RELOAD=0|false|off` は設定ファイルより優先して無効化する。
+fn initial_preview_reload() -> bool {
+    if matches!(
+        std::env::var("TAKO_PREVIEW_RELOAD").ok().as_deref(),
+        Some("0" | "false" | "off")
+    ) {
+        return false;
+    }
+    tako_control::settings::load().preview_live_reload
+}
+
 /// tmux バックエンド永続化（Phase 5.5 / FR-5）の起動時の有効判定。
 /// セルフテストでは既定 OFF（専用項目が dispatch 経由で ON にして検証する。
 /// 既存項目を tmux 経由にしてスクロールバック等の挙動を変えない）。
@@ -627,6 +640,19 @@ struct TakoApp {
     /// プレビューペイン（FR-3.2 / FR-3.3）。キーに居るペインはターミナルではなく
     /// ファイル内容（コードハイライト / Markdown レンダリング）を描画する
     previews: HashMap<PaneId, preview::PreviewState>,
+    /// 表示中ファイルのライブリロード設定（core 状態を CLI / MCP と共有）。
+    preview_reload: tako_core::PreviewReloadState,
+    /// OS ネイティブのイベント駆動監視。生成不能時は None でライブリロードだけ無効化する。
+    preview_file_watcher: Option<preview_watch::PreviewFileWatcher>,
+    /// パス別の最終イベント時刻（300ms デバウンス）。イベントが無ければ空のまま。
+    pending_preview_reloads: HashMap<std::path::PathBuf, std::time::Instant>,
+    /// デバウンスタスクが稼働中のパス。連続 write でもタスクを増殖させない。
+    active_preview_reloads: std::collections::HashSet<std::path::PathBuf>,
+    /// background 完了の世代照合。後続 write より古い結果を表示へ適用しない。
+    preview_reload_generations: HashMap<std::path::PathBuf, u64>,
+    next_preview_reload_generation: u64,
+    /// 隔離 E2E でデバウンス適用回数を実測する診断カウンタ。
+    preview_reload_apply_count: u64,
     /// コードプレビューの編集セッション。未保存バッファは表示モードを OFF にしても保持する。
     preview_edits: HashMap<PaneId, preview::EditState>,
     /// タブ・ペイン名の AI 自動リネームの検知状態（FR-2.12。ループは new で張る）
@@ -1567,6 +1593,16 @@ impl TakoApp {
         };
         let restore_report = Some(restore_report);
 
+        let preview_reload_enabled = initial_preview_reload();
+        let (preview_file_watcher, preview_watch_rx) =
+            match preview_watch::PreviewFileWatcher::new() {
+                Ok((watcher, rx)) => (Some(watcher), Some(rx)),
+                Err(_) => {
+                    eprintln!("warning: プレビューのファイル監視を開始できない");
+                    (None, None)
+                }
+            };
+
         let mut app = Self {
             // ルートペイン（復元時は全ペイン）は下の spawn_session でセッションを張る
             workspace,
@@ -1612,6 +1648,15 @@ impl TakoApp {
             inline_edit: None,
             filetree: filetree::FileTree::default(),
             previews: HashMap::new(),
+            preview_reload: tako_core::PreviewReloadState::new(
+                preview_reload_enabled && preview_file_watcher.is_some(),
+            ),
+            preview_file_watcher,
+            pending_preview_reloads: HashMap::new(),
+            active_preview_reloads: std::collections::HashSet::new(),
+            preview_reload_generations: HashMap::new(),
+            next_preview_reload_generation: 0,
+            preview_reload_apply_count: 0,
             preview_edits: HashMap::new(),
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
             port_detect: initial_port_detect(),
@@ -2544,6 +2589,25 @@ impl TakoApp {
                     }
                 };
                 cx.background_executor().timer(wait).await;
+            })
+            .detach();
+        }
+
+        // ファイル監視の callback は OS バックエンドのスレッドから channel へ送るだけ。
+        // イベントが無いアイドル時は UI スレッドへ一切起床・ポーリングを追加しない。
+        app.sync_preview_watches();
+        if let Some(mut rx) = preview_watch_rx {
+            cx.spawn(async move |this, cx| {
+                while let Some(signal) = rx.next().await {
+                    if this
+                        .update(cx, |app: &mut TakoApp, cx| {
+                            app.handle_preview_watch_signal(signal, cx);
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             })
             .detach();
         }
@@ -4018,6 +4082,7 @@ impl TakoApp {
                 self.remove_tab_with(tab_id, reason, cx);
             }
         }
+        self.sync_preview_watches();
         cx.notify();
     }
 
@@ -4116,6 +4181,7 @@ impl TakoApp {
                 cx.quit();
             }
         }
+        self.sync_preview_watches();
         cx.notify();
     }
 
@@ -9895,6 +9961,7 @@ impl SessionHost for TakoApp {
         self.terminals.remove(&pane);
         self.previews.remove(&pane);
         self.preview_edits.remove(&pane);
+        self.sync_preview_watches();
         self.dock_webview_of(pane);
         self.scroll_accum.remove(&pane);
         self.scroll_ctls.remove(&pane);
@@ -10181,6 +10248,26 @@ impl UiStateHost for TakoApp {
 }
 
 impl PreviewHost for TakoApp {
+    fn preview_reload_enabled(&self) -> bool {
+        self.preview_reload.enabled()
+    }
+
+    fn set_preview_reload(&mut self, enabled: bool) {
+        // セルフテスト中はユーザー設定を汚さない。
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.preview_live_reload = enabled;
+            if let Err(e) = tako_control::settings::save(&settings) {
+                eprintln!("warning: 設定を保存できない: {e}");
+            }
+        }
+        // OS 監視の初期化に失敗したプロセスで ON を報告しない。
+        let effective = enabled && self.preview_file_watcher.is_some();
+        if self.preview_reload.set_enabled(effective) {
+            self.sync_preview_watches();
+        }
+    }
+
     fn preview_state(
         &self,
         pane: PaneId,
@@ -10379,6 +10466,7 @@ impl PreviewHost for TakoApp {
         self.preview_views.remove(&pane);
         self.preview_scroll_handles.remove(&pane);
         self.previews.insert(pane, state);
+        self.sync_preview_watches();
         Ok(())
     }
 
@@ -12215,7 +12303,12 @@ mod self_test {
 
     /// CoreGraphics / PDFKit の両方が受理する xref 付き最小 PDF を生成する。
     fn write_test_pdf(path: &std::path::Path) {
-        let content = b"BT /F1 14 Tf 14 TL 72 700 Td (Hello PDF) Tj T* (World 123) Tj ET";
+        write_test_pdf_with_text(path, "Hello PDF");
+    }
+
+    fn write_test_pdf_with_text(path: &std::path::Path, first_line: &str) {
+        let content =
+            format!("BT /F1 14 Tf 14 TL 72 700 Td ({first_line}) Tj T* (World 123) Tj ET");
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
         let off1 = pdf.len();
@@ -12228,7 +12321,7 @@ mod self_test {
         pdf.extend_from_slice(
             format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
         );
-        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(content.as_bytes());
         pdf.extend_from_slice(b"\nendstream\nendobj\n");
         let off5 = pdf.len();
         pdf.extend_from_slice(
@@ -12386,6 +12479,32 @@ mod self_test {
                     .ok()
             })
             .await
+    }
+
+    /// OS イベント→デバウンス→background 読み込み→UI 差し替えの
+    /// E2E 待ち合わせ。経過時間を受け入れ条件成立時の実測値として返す。
+    async fn wait_for_preview_state<F>(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        timeout: Duration,
+        predicate: F,
+    ) -> Option<Duration>
+    where
+        F: Fn(&TakoApp) -> bool,
+    {
+        let started = std::time::Instant::now();
+        while started.elapsed() < timeout {
+            cx.background_executor()
+                .timer(Duration::from_millis(25))
+                .await;
+            if window
+                .update(cx, |app, _, _| predicate(app))
+                .unwrap_or(false)
+            {
+                return Some(started.elapsed());
+            }
+        }
+        None
     }
 
     /// preview の次の paint で座標キャッシュが揃うまで待つ。
@@ -13522,8 +13641,14 @@ mod self_test {
                 .unwrap_or_else(|_| fail("tako focus 後の状態取得"));
             check(refocused == pane2, "tako focus");
 
-            // 25. tako tab new（FR-2.5.10。pane2 から実行 → 新タブがアクティブに）
-            type_text(any, cx, &format!("{cli} tab new --title agents"), true);
+            // 25. tako tab new（FR-2.5.10。AI 操作の既定はフォーカス維持のため、
+            //     後続操作で新タブを使うこのテストは --focus を明示する）
+            type_text(
+                any,
+                cx,
+                &format!("{cli} tab new --title agents --focus"),
+                true,
+            );
             wait(cx, 1500).await;
             let (tab_count, pane5, on_new_tab) = window
                 .update(cx, |app, _, _| {
@@ -13665,7 +13790,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 79, "MCP tools/list は 79 ツール");
+            check(status == 200 && tool_count == 80, "MCP tools/list は 80 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -13714,6 +13839,45 @@ mod self_test {
             check(
                 status == 200 && response.contains(r#"\"theme\":\"dark\""#) && dark_restored,
                 "MCP theme toggle（dark へ復帰）",
+            );
+
+            // 33c. ライブリロードの MCP 切替は core 状態と 1:1（#233）。
+            //      一度 OFF にした後 ON へ戻し、後続 E2E で実監視を使う。
+            let (status, response) = mcp_post_bg(
+                cx,
+                &mcp_url,
+                Some(&token),
+                &[],
+                r#"{"jsonrpc":"2.0","id":105,"method":"tools/call","params":{"name":"tako_preview_reload","arguments":{"enabled":false}}}"#,
+            )
+            .await
+            .unwrap_or_else(|| fail("MCP preview reload off 接続"));
+            let preview_reload_off = window
+                .update(cx, |app, _, _| !app.preview_reload.enabled())
+                .unwrap_or(false);
+            check(
+                status == 200
+                    && response.contains(r#"\"enabled\":false"#)
+                    && preview_reload_off,
+                "MCP preview reload off（core 状態へ反映）",
+            );
+            let (status, response) = mcp_post_bg(
+                cx,
+                &mcp_url,
+                Some(&token),
+                &[],
+                r#"{"jsonrpc":"2.0","id":106,"method":"tools/call","params":{"name":"tako_preview_reload","arguments":{"enabled":true}}}"#,
+            )
+            .await
+            .unwrap_or_else(|| fail("MCP preview reload on 接続"));
+            let preview_reload_on = window
+                .update(cx, |app, _, _| app.preview_reload.enabled())
+                .unwrap_or(false);
+            check(
+                status == 200
+                    && response.contains(r#"\"enabled\":true"#)
+                    && preview_reload_on,
+                "MCP preview reload on（core 状態へ反映）",
             );
 
             // 34. tools/call tako_split_pane（X-Tako-Pane で呼び出し元特定 + origin=mcp）と
@@ -13900,7 +14064,13 @@ mod self_test {
                 &token,
                 caller_pane,
                 caller_tab,
-                vec!["tab".into(), "new".into(), "--title".into(), "close-reg".into()],
+                vec![
+                    "tab".into(),
+                    "new".into(),
+                    "--title".into(),
+                    "close-reg".into(),
+                    "--focus".into(),
+                ],
             )
             .await
             .unwrap_or_else(|| fail("回帰 40: tab new CLI 起動"));
@@ -15525,6 +15695,10 @@ mod self_test {
             .unwrap();
             let pdf_path = preview_dir.join("sample.pdf");
             write_test_pdf(&pdf_path);
+            let image_path = preview_dir.join("sample.png");
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]))
+                .save(&image_path)
+                .expect("テスト PNG を書ける");
             let selftest_open =
                 |app: &mut TakoApp, base: u64, path: String, mode| {
                     tako_control::dispatch(
@@ -16256,7 +16430,367 @@ mod self_test {
                 })
                 .ok();
             wait(cx, 300).await;
-            // 66c. 軽量編集（FR-3.5）: 実 CLI で開始 → 全文適用 → 保存し、子プロセスの
+
+            // 66c. プレビューのライブリロード（#233）。実 CLI の ON/OFF、OS イベント、
+            //      300ms デバウンス、background 差し替えを一気通貫で検証する。
+            let (reload_pane, reload_terminal, reload_tab) = window
+                .update(cx, |app, _, _| {
+                    (
+                        app.previews.keys().next().copied().expect("preview がある"),
+                        app.terminals.keys().next().copied().expect("terminal がある"),
+                        app.workspace.active_tab_id(),
+                    )
+                })
+                .unwrap_or_else(|_| fail("ライブリロード対象の取得"));
+            for (action, expected) in [("off", false), ("on", true)] {
+                let output = cli_output_bg(
+                    cx,
+                    &cli_path,
+                    &ipc_endpoint,
+                    &token,
+                    reload_terminal,
+                    reload_tab,
+                    vec!["preview-reload".into(), action.into()],
+                )
+                .await
+                .unwrap_or_else(|| fail(&format!("tako preview-reload {action} CLI 起動")));
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let state_ok = window
+                    .update(cx, |app, _, _| app.preview_reload.enabled() == expected)
+                    .unwrap_or(false);
+                check(
+                    output.status.success()
+                        && stdout.contains(&format!(r#""enabled":{expected}"#))
+                        && state_ok,
+                    &format!("tako preview-reload {action} が core 状態へ反映"),
+                );
+            }
+
+            let long_markdown = |heading: &str| {
+                let mut text = format!("# {heading}\n\n");
+                for line in 0..100 {
+                    text.push_str(&format!("- line {line}\n"));
+                }
+                text
+            };
+            std::fs::write(
+                preview_dir.join("note.md"),
+                long_markdown("Live baseline"),
+            )
+            .expect("スクロール可能な基準 Markdown を書ける");
+            wait_for_preview_state(window, cx, Duration::from_secs(3), |app| {
+                matches!(
+                    app.previews.get(&reload_pane).map(|state| &state.content),
+                    Some(preview::PreviewContent::Markdown(blocks))
+                        if blocks.iter().any(|block| matches!(
+                            block,
+                            preview::MdBlock::Heading { spans, .. }
+                                if spans.iter().any(|span| span.text == "Live baseline")
+                        ))
+                )
+            })
+            .await
+            .unwrap_or_else(|| fail("スクロール保持用の基準 Markdown を反映"));
+            window
+                .update(cx, |app, preview_window, cx| {
+                    app.preview_scroll_handles
+                        .entry(reload_pane)
+                        .or_default()
+                        .set_offset(point(px(0.0), px(-48.0)));
+                    preview_window.refresh();
+                    cx.notify();
+                })
+                .ok();
+            let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
+            wait(cx, 50).await;
+            let (mode_before, scroll_before, apply_before) = window
+                .update(cx, |app, _, _| {
+                    (
+                        app.previews.get(&reload_pane).map(|state| state.mode),
+                        app.preview_scroll_handles
+                            .get(&reload_pane)
+                            .map(|handle| f32::from(handle.offset().y))
+                            .unwrap_or_default(),
+                        app.preview_reload_apply_count,
+                    )
+                })
+                .unwrap_or((None, 0.0, 0));
+            check(
+                mode_before == Some(preview::PreviewMode::Markdown),
+                "連続 write 前は Markdown モード",
+            );
+            let mut final_write_at = std::time::Instant::now();
+            for index in 0..6 {
+                if index == 5 {
+                    final_write_at = std::time::Instant::now();
+                }
+                std::fs::write(
+                    preview_dir.join("note.md"),
+                    long_markdown(&format!("Live reload {index}")),
+                )
+                .expect("連続 write を実行できる");
+                if index < 5 {
+                    wait(cx, 40).await;
+                }
+            }
+            let live_delay = wait_for_preview_state(
+                window,
+                cx,
+                Duration::from_secs(3),
+                |app| {
+                    matches!(
+                        app.previews.get(&reload_pane).map(|state| &state.content),
+                        Some(preview::PreviewContent::Markdown(blocks))
+                            if blocks.iter().any(|block| matches!(
+                                block,
+                                preview::MdBlock::Heading { spans, .. }
+                                    if spans.iter().any(|span| span.text == "Live reload 5")
+                            ))
+                    )
+                },
+            )
+            .await
+            .unwrap_or_else(|| fail("連続 write の最終内容が 3 秒以内に反映"));
+            let final_delay = final_write_at.elapsed();
+            // 遅延イベントが二重適用を起こさないことも観測する。
+            wait(cx, 450).await;
+            let (mode_after, scroll_after, apply_after) = window
+                .update(cx, |app, _, _| {
+                    (
+                        app.previews.get(&reload_pane).map(|state| state.mode),
+                        app.preview_scroll_handles
+                            .get(&reload_pane)
+                            .map(|handle| f32::from(handle.offset().y)),
+                        app.preview_reload_apply_count,
+                    )
+                })
+                .unwrap_or((None, None, 0));
+            check(
+                apply_after.saturating_sub(apply_before) == 1,
+                "6 回の連続 write を 1 回だけ差し替える",
+            );
+            check(
+                mode_after == mode_before
+                    && scroll_after.is_some_and(|value| (value - scroll_before).abs() < 0.1),
+                "ライブリロード後もモードとスクロール位置を保持",
+            );
+            check(
+                live_delay <= Duration::from_millis(1500),
+                "最終 write から 1.5 秒以内に反映",
+            );
+            println!(
+                "TAKO_PREVIEW_RELOAD: writes=6 applies=1 delay_ms={} mode=markdown scroll_y={scroll_before:.1}",
+                final_delay.as_millis()
+            );
+
+            // 削除 / rename は旧パスに Error を出し、同パスへ戻せば自動復帰する。
+            let note_path = preview_dir.join("note.md");
+            let moved_path = preview_dir.join("note-renamed.md");
+            std::fs::rename(&note_path, &moved_path).expect("表示中ファイルを rename できる");
+            wait_for_preview_state(window, cx, Duration::from_secs(3), |app| {
+                matches!(
+                    app.previews.get(&reload_pane).map(|state| &state.content),
+                    Some(preview::PreviewContent::Error(_))
+                )
+            })
+            .await
+            .unwrap_or_else(|| fail("削除 / rename 後に Error 表示へなる"));
+            std::fs::rename(&moved_path, &note_path).expect("表示中パスへ戻せる");
+            wait_for_preview_state(window, cx, Duration::from_secs(3), |app| {
+                matches!(
+                    app.previews.get(&reload_pane).map(|state| &state.content),
+                    Some(preview::PreviewContent::Markdown(blocks))
+                        if blocks.iter().any(|block| matches!(
+                            block,
+                            preview::MdBlock::Heading { spans, .. }
+                                if spans.iter().any(|span| span.text == "Live reload 5")
+                        ))
+                )
+            })
+            .await
+            .unwrap_or_else(|| fail("rename 元のパス復帰後に再読み込み"));
+
+            // 1 MB 超は全体を読まず上限 + 1 byte で止め、既存の省略表示へ劣化。
+            std::fs::write(&note_path, vec![b'x'; preview::MAX_BYTES + 128])
+                .expect("巨大ファイルを書ける");
+            wait_for_preview_state(window, cx, Duration::from_secs(3), |app| {
+                app.previews
+                    .get(&reload_pane)
+                    .is_some_and(|state| state.truncated)
+            })
+            .await
+            .unwrap_or_else(|| fail("巨大ファイルを省略表示"));
+            std::fs::write(&note_path, "# Restored\n").expect("通常サイズへ戻せる");
+            wait_for_preview_state(window, cx, Duration::from_secs(3), |app| {
+                matches!(
+                    app.previews.get(&reload_pane).map(|state| &state.content),
+                    Some(preview::PreviewContent::Markdown(blocks))
+                        if blocks.iter().any(|block| matches!(
+                            block,
+                            preview::MdBlock::Heading { spans, .. }
+                                if spans.iter().any(|span| span.text == "Restored")
+                        ))
+                )
+            })
+            .await
+            .unwrap_or_else(|| fail("巨大ファイル後に通常表示へ復帰"));
+
+            // 編集モード中は外部変更を適用せず、FR-3.5 の Conflict へ接続する。
+            let (edit_buffer_before, conflict_apply_before) = window
+                .update(cx, |app, _, _| {
+                    app.set_preview_editing_local(reload_pane, true)
+                        .expect("編集モードを開始できる");
+                    (
+                        app.preview_edits
+                            .get(&reload_pane)
+                            .map(|edit| edit.buffer.text().to_string()),
+                        app.preview_reload_apply_count,
+                    )
+                })
+                .unwrap_or((None, 0));
+            std::fs::write(&note_path, "# External conflict\n")
+                .expect("編集中に外部変更できる");
+            let conflict_delay = wait_for_preview_state(
+                window,
+                cx,
+                Duration::from_secs(3),
+                |app| {
+                    app.preview_edits.get(&reload_pane).is_some_and(|edit| {
+                        edit.save_status == Some(preview::SaveStatus::Conflict)
+                    })
+                },
+            )
+            .await
+            .unwrap_or_else(|| fail("編集中の外部変更を Conflict 通知"));
+            let conflict_preserved = window
+                .update(cx, |app, _, _| {
+                    let edit = app.preview_edits.get(&reload_pane);
+                    let preserved = edit.map(|edit| edit.buffer.text().to_string())
+                        == edit_buffer_before
+                        && app.preview_reload_apply_count == conflict_apply_before;
+                    app.set_preview_editing_local(reload_pane, false)
+                        .expect("編集モードを終了できる");
+                    preserved
+                })
+                .unwrap_or(false);
+            check(conflict_preserved, "競合時は編集バッファを上書きしない");
+            println!(
+                "TAKO_PREVIEW_RELOAD: conflict_delay_ms={} buffer_preserved=true",
+                conflict_delay.as_millis()
+            );
+
+            // 画像は生バイトを background で差し替え、#234 の zoom / pan を保持。
+            let image_opened = window
+                .update(cx, |app, _, cx| {
+                    let opened = selftest_open(
+                        app,
+                        reload_pane.as_u64(),
+                        image_path.display().to_string(),
+                        Some(tako_control::protocol::PreviewModeWire::Image),
+                    )
+                    .is_ok();
+                    let view = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::PreviewView {
+                            pane: Some(reload_pane.as_u64()),
+                            zoom: Some(175.0),
+                            zoom_in: false,
+                            zoom_out: false,
+                            reset: false,
+                            page: None,
+                            pan_x: Some(12.0),
+                            pan_y: Some(8.0),
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .is_ok();
+                    app.drain_pending_preview_loads(cx);
+                    opened && view
+                })
+                .unwrap_or(false);
+            check(
+                image_opened,
+                "画像プレビューをライブリロード対象で開く",
+            );
+            let image_before = window
+                .update(cx, |app, _, _| {
+                    app.previews.get(&reload_pane).and_then(|state| match &state.content {
+                        preview::PreviewContent::Image(data) => Some(data.bytes.clone()),
+                        _ => None,
+                    })
+                })
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| fail("画像更新前バイトの取得"));
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([200, 40, 50, 255]))
+                .save(&image_path)
+                .expect("表示中 PNG を更新できる");
+            wait_for_preview_state(window, cx, Duration::from_secs(3), |app| {
+                app.previews.get(&reload_pane).is_some_and(|state| {
+                    matches!(&state.content, preview::PreviewContent::Image(data)
+                        if data.bytes != image_before)
+                })
+            })
+            .await
+            .unwrap_or_else(|| fail("PNG のライブリロード"));
+            let image_view_preserved = window
+                .update(cx, |app, _, _| {
+                    app.preview_views.get(&reload_pane).is_some_and(|view| {
+                        (view.zoom - 1.75).abs() < f32::EPSILON
+                            && (view.pan_x - 12.0).abs() < f32::EPSILON
+                            && (view.pan_y - 8.0).abs() < f32::EPSILON
+                    })
+                })
+                .unwrap_or(false);
+            check(image_view_preserved, "PNG 更新後も zoom / pan を保持");
+
+            // PDF も #231/#234 の表示条件をキーに background 再ラスタライズする。
+            window
+                .update(cx, |app, _, cx| {
+                    selftest_open(
+                        app,
+                        reload_pane.as_u64(),
+                        pdf_path.display().to_string(),
+                        Some(tako_control::protocol::PreviewModeWire::Pdf),
+                    )
+                    .expect("PDF をライブリロード対象で開ける");
+                    app.drain_pending_preview_loads(cx);
+                })
+                .ok();
+            wait_for_preview_state(window, cx, Duration::from_secs(8), |app| {
+                matches!(
+                    app.previews.get(&reload_pane).map(|state| &state.content),
+                    Some(preview::PreviewContent::Pdf(data)) if !data.pages.is_empty()
+                )
+            })
+            .await
+            .unwrap_or_else(|| fail("PDF 初回ラスタライズ"));
+            write_test_pdf_with_text(&pdf_path, "Reloaded PDF");
+            wait_for_preview_state(window, cx, Duration::from_secs(8), |app| {
+                matches!(
+                    app.previews.get(&reload_pane).map(|state| &state.content),
+                    Some(preview::PreviewContent::Pdf(data))
+                        if data.text_layers.iter().flatten().any(|line| line.text.contains("Reloaded PDF"))
+                )
+            })
+            .await
+            .unwrap_or_else(|| fail("PDF のライブ再ラスタライズ"));
+
+            // 後続の編集 E2E は note.md を対象にするため Markdown へ戻す。
+            window
+                .update(cx, |app, _, cx| {
+                    selftest_open(
+                        app,
+                        reload_pane.as_u64(),
+                        note_path.display().to_string(),
+                        Some(tako_control::protocol::PreviewModeWire::Markdown),
+                    )
+                    .expect("note.md へ戻せる");
+                    cx.notify();
+                })
+                .ok();
+
+            // 66d. 軽量編集（FR-3.5）: 実 CLI で開始 → 全文適用 → 保存し、子プロセスの
             //      成功終了を同期点として書き戻しを確認する。続けて MCP と同じ dispatch
             //      起点でも保存する。
             let (edit_preview_pane, edit_terminal_pane, edit_tab) = window
