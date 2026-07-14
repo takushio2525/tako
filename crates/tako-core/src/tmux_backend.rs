@@ -390,25 +390,9 @@ fn remove_socket_file(socket: &str) {
 pub(crate) fn shell_quoted(command: &SpawnCommand) -> String {
     std::iter::once(&command.program)
         .chain(command.args.iter())
-        .map(|w| quote_word(w))
+        .map(|w| crate::shell::quote_for_shell(w))
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-/// 単語のシェルクォート。英数と無害な記号のみならそのまま、他は単引用符で包む。
-/// 先頭 `=` は zsh の equals 展開（`=cmd` → コマンドのフルパス）に化けるため必ず包む
-/// （例: `tmux attach -t =name` の完全一致指定。2026-06-13 D&D 実装で実測）
-fn quote_word(word: &str) -> String {
-    let safe = !word.is_empty()
-        && !word.starts_with('=')
-        && word
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_./=:,@%+".contains(c));
-    if safe {
-        word.to_string()
-    } else {
-        format!("'{}'", word.replace('\'', "'\\''"))
-    }
 }
 
 /// テスト用: tmux 隔離ソケットの後始末ガード。
@@ -470,14 +454,15 @@ mod tests {
 
     #[test]
     fn 単語のクォートはシェル安全() {
-        assert_eq!(quote_word("/bin/zsh"), "/bin/zsh");
-        assert_eq!(quote_word("-l"), "-l");
-        assert_eq!(quote_word("a b"), "'a b'");
-        assert_eq!(quote_word("it's"), r#"'it'\''s'"#);
-        assert_eq!(quote_word(""), "''");
+        use crate::shell::quote_for_shell;
+        assert_eq!(quote_for_shell("/bin/zsh"), "/bin/zsh");
+        assert_eq!(quote_for_shell("-l"), "-l");
+        assert_eq!(quote_for_shell("a b"), "'a b'");
+        assert_eq!(quote_for_shell("it's"), r#"'it'\''s'"#);
+        assert_eq!(quote_for_shell(""), "''");
         // 先頭 = は zsh の equals 展開を踏むため必ず包む（途中の = は安全）
-        assert_eq!(quote_word("=dnd-src"), "'=dnd-src'");
-        assert_eq!(quote_word("TMUX="), "TMUX=");
+        assert_eq!(quote_for_shell("=dnd-src"), "'=dnd-src'");
+        assert_eq!(quote_for_shell("TMUX="), "TMUX=");
         assert_eq!(
             shell_quoted(&SpawnCommand {
                 program: "npm".into(),

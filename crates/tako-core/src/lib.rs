@@ -15,6 +15,7 @@ pub mod ports;
 pub mod screen;
 pub mod scroll;
 pub mod scroll_mirror;
+pub mod shell;
 pub mod shell_integration;
 pub mod spawn_layout;
 pub mod tab;
@@ -39,6 +40,7 @@ pub use pane_tree::{
 };
 pub use ports::ListenPort;
 pub use screen::{InputStatus, InputStyle, Screen, ScreenLine, StyleRun};
+pub use shell::{quote_for_shell, quote_paths_for_shell};
 pub use spawn_layout::{SpawnLayoutConfig, SpawnLayoutPolicy, WorkerLayoutAlgorithm};
 pub use tab::{Tab, TabId};
 pub use terminal::{

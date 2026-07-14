@@ -165,6 +165,10 @@ impl TakoApp {
                 .text_size(px(12.0))
                 .text_color(hsla(theme.foreground))
                 .overflow_hidden()
+                // Issue #21: 外部ファイルをサイドバーにドロップ → プレビューで開く
+                .on_drop::<ExternalPaths>(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                    this.open_dropped_files(paths.paths(), cx);
+                }))
                 // プロジェクトヘッダ（カンプ: 名前 + ブランチチップ + フルパスボックス）
                 .child(
                     div()
