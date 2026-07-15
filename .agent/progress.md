@@ -753,3 +753,8 @@
 ## 2026-07-15（#233: プレビューライブリロード）
 - OS ネイティブ監視 + 300ms デバウンス + background 再生成を実装し、編集競合保護と CLI / MCP（全 80 ツール）を 1:1 公開
 - 連続 6 write を 1 回・427ms で反映、状態保持、削除 / rename / 巨大ファイル / PNG / PDF、UI 専有 0ms 水準を隔離実測。全検証と全 diff レビューを完了
+
+## 2026-07-15（#258: アプリ全体メモリ監査・調査マイルストーン）
+- 6ページPDFの倍率世代で0.48GB→2.63GB、`MALLOC_LARGE` 1.30GB + graphics 1.08GBを実測。旧GPUI asset未除去が主因で、71ページ・同6世代は約27.35GiB相当
+- ライブリロード8回でラスタライズ7本並行・RSS最大808,656KiB。BG退避/closeは解放なし、端末・sessions・logs・worker eventsはGB級原因でないと切り分け
+- 次: 512MiB既定のバイト予算付きLRU + GPUI eviction、可視近傍デコード、reload single-flightを実装
