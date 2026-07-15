@@ -6,7 +6,7 @@
 
 ## 現在の対象（2026-07-15・#258 アプリ全体メモリ監査）
 
-**調査・修正・検証完了、PR前**:
+**調査・修正・検証・merge完了**:
 
 - v0.5.2 / `8d80be3` の隔離実測で、GPUI asset cache / sprite atlas に残るPDFの
   デコード済みCPU + GPU画像を主因と定量特定。71ページ・同6倍率は約27.35GiB相当
@@ -23,14 +23,14 @@
   -4,266.1KiB / cycle。`render` p95 / p99最大6ms、最大15ms
 - build / fmt / clippy / workspace test全緑。隔離セルフテストは終了コード0、
   `TAKO_APP_SELF_TEST_OK`
+- PR #260をsquash merge（`530d568`）、作業ブランチ削除、Issue #258を実測証拠付きで完了
 - 詳細: `.agent/investigations/issue-258-memory-audit.md`、
   `.agent/investigations/issue-258-memory-validation.md`
 
 ## 次の一手
 
-- 検証マイルストーンをコミット・push
-- PR（Closes #258）を作成し、CI緑後にsquash merge・ブランチ削除
-- Issue #258へ実測証拠付き完了コメントを投稿
+- master側でinstall・再起動して実利用へ反映
+- 71ページ級PDFの通常運用でメモリ圧力を継続観察
 
 ## 現フェーズで Read すべき設計書
 
