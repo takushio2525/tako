@@ -351,6 +351,9 @@ pub enum Request {
     /// 表示中プレビューファイルのライブリロード設定（Issue #233）。
     /// `enabled` 省略時は現在状態の取得のみ。設定は永続化される。
     PreviewReload { enabled: Option<bool> },
+    /// デコード済みプレビュー画像キャッシュの上限と利用状況（Issue #258）。
+    /// `max_mb` 省略時は現在状態の取得のみ。設定は永続化される。
+    PreviewCache { max_mb: Option<u64> },
     /// コードプレビューの編集モードを切り替える（FR-3.5）。`enabled` 省略時は状態取得。
     PreviewEdit {
         pane: Option<u64>,

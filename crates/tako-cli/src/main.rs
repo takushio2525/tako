@@ -74,6 +74,9 @@ enum Command {
     /// 表示中プレビューファイルのライブリロード ON/OFF・状態確認
     #[command(name = "preview-reload")]
     PreviewReload(ToggleArgs),
+    /// デコード済みプレビュー画像キャッシュの上限（MiB）と利用状況
+    #[command(name = "preview-cache")]
+    PreviewCache(PreviewCacheArgs),
     /// コードプレビューの軽量編集（開始 / 全文適用 / 保存）
     #[command(subcommand)]
     Edit(EditCommand),
@@ -1423,6 +1426,12 @@ struct ToggleArgs {
     /// on = 有効化、off = 無効化（省略時は現在状態を表示）
     #[arg(value_parser = ["on", "off"])]
     state: Option<String>,
+}
+
+#[derive(Args)]
+struct PreviewCacheArgs {
+    /// キャッシュ上限（MiB、256〜8192。省略時は利用状況を表示）
+    max_mb: Option<u64>,
 }
 
 /// UI テーマコマンドの引数（Issue #217）
@@ -2889,6 +2898,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::PreviewReload(args) => Request::PreviewReload {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
+        Command::PreviewCache(args) => Request::PreviewCache {
+            max_mb: args.max_mb,
+        },
         Command::Edit(command) => match command {
             EditCommand::Start { pane } => Request::PreviewEdit {
                 pane: target_pane(*pane)?,
@@ -4048,7 +4060,7 @@ fn print_result(command: &Command, result: &Value) {
         Command::Open(_) | Command::Preview(_) | Command::PreviewOutline(_) | Command::Edit(_) => {
             println!("{result}")
         }
-        Command::PreviewReload(_) => println!("{result}"),
+        Command::PreviewReload(_) | Command::PreviewCache(_) => println!("{result}"),
         Command::Autorename(_)
         | Command::Portdetect(_)
         | Command::Persist(_)
@@ -4569,6 +4581,20 @@ mod tests {
             Request::PreviewReload {
                 enabled: Some(false)
             }
+        );
+    }
+
+    #[test]
+    fn preview_cacheは状態取得と上限変更を操作へ写す() {
+        let status = parse(&["tako", "preview-cache"]);
+        assert_eq!(
+            build_request(&status).unwrap(),
+            Request::PreviewCache { max_mb: None }
+        );
+        let changed = parse(&["tako", "preview-cache", "768"]);
+        assert_eq!(
+            build_request(&changed).unwrap(),
+            Request::PreviewCache { max_mb: Some(768) }
         );
     }
 

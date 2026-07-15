@@ -105,6 +105,8 @@ pub enum MdBlock {
 pub struct ImageData {
     pub bytes: Vec<u8>,
     pub format: ImageFileFormat,
+    /// ヘッダだけから取得したデコード後の pixel size。SVG など取得不能時は None。
+    pub pixel_size: Option<(u32, u32)>,
 }
 
 /// 対応画像フォーマット（GPUI の ImageFormat と 1:1 だが GPUI 非依存にする）
@@ -431,14 +433,24 @@ pub fn load_image(path: &Path) -> PreviewState {
                 bytes.len() as f64 / 1_000_000.0
             ),
         ),
-        Ok(bytes) => PreviewState {
-            path: path.to_path_buf(),
-            mode: PreviewMode::Image,
-            content: PreviewContent::Image(ImageData { bytes, format }),
-            outline: Arc::new(PreviewOutline::default()),
-            truncated: false,
-            file_stamp: FileStamp::from_path(path),
-        },
+        Ok(bytes) => {
+            let pixel_size = image::ImageReader::new(std::io::Cursor::new(&bytes))
+                .with_guessed_format()
+                .ok()
+                .and_then(|reader| reader.into_dimensions().ok());
+            PreviewState {
+                path: path.to_path_buf(),
+                mode: PreviewMode::Image,
+                content: PreviewContent::Image(ImageData {
+                    bytes,
+                    format,
+                    pixel_size,
+                }),
+                outline: Arc::new(PreviewOutline::default()),
+                truncated: false,
+                file_stamp: FileStamp::from_path(path),
+            }
+        }
         Err(e) => PreviewState::error(path, PreviewMode::Image, format!("読み込めない: {e}")),
     }
 }

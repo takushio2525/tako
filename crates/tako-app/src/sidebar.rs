@@ -1190,7 +1190,7 @@ impl TakoApp {
 
     #[allow(clippy::too_many_arguments)]
     fn spawn_preview_reload(
-        &self,
+        &mut self,
         pane: PaneId,
         path: std::path::PathBuf,
         mode: preview::PreviewMode,
@@ -1199,6 +1199,10 @@ impl TakoApp {
         generation: u64,
         cx: &mut Context<Self>,
     ) {
+        let job_key = (pane, path.clone());
+        if !self.active_preview_reload_jobs.insert(job_key.clone()) {
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let reload_path = path.clone();
             let loaded = cx
@@ -1215,11 +1219,43 @@ impl TakoApp {
                     Some(preview::load_for_reload(&reload_path, mode, pdf_key))
                 })
                 .await;
-            if let Some(loaded) = loaded {
-                let _ = this.update(cx, |app, cx| {
+            let _ = this.update(cx, |app, cx| {
+                app.active_preview_reload_jobs.remove(&job_key);
+                if let Some(loaded) = loaded {
                     app.apply_preview_reload(pane, &path, mode, generation, loaded, cx);
-                });
-            }
+                }
+                let Some(latest_generation) = app.preview_reload_generations.get(&path).copied()
+                else {
+                    return;
+                };
+                if latest_generation == generation
+                    || !app.preview_reload.enabled()
+                    || !app
+                        .previews
+                        .get(&pane)
+                        .is_some_and(|state| state.path == path && state.mode == mode)
+                {
+                    return;
+                }
+                let Some((pdf_key, old_stamp)) = app.previews.get(&pane).map(|state| {
+                    let pdf_key = match &state.content {
+                        preview::PreviewContent::Pdf(data) => Some(data.raster_key),
+                        _ => None,
+                    };
+                    (pdf_key, state.file_stamp)
+                }) else {
+                    return;
+                };
+                app.spawn_preview_reload(
+                    pane,
+                    path.clone(),
+                    mode,
+                    pdf_key,
+                    old_stamp,
+                    latest_generation,
+                    cx,
+                );
+            });
         })
         .detach();
     }
@@ -1270,7 +1306,8 @@ impl TakoApp {
         self.preview_line_texts.remove(&pane);
         // preview_image_cache は除去しない。次フレームの ensure_preview_image_cache が
         // 新旧の path / raster_key を比較して自動更新する。旧キャッシュは新キャッシュ
-        // 構築完了まで表示に使われるため、暗転（空 div フォールバック）を防ぐ。(#257)
+        // 構築開始まで表示に使い、差し替え時に #258 の LRU / GPUI eviction へ送る。
+        // これにより暗転（空 div フォールバック）と旧資源残留を同時に防ぐ。(#257 / #258)
         self.pending_pdf_rasters.remove(&pane);
         self.previews.insert(pane, loaded.state);
         self.preview_reload_apply_count = self.preview_reload_apply_count.saturating_add(1);

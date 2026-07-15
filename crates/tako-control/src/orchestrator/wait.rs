@@ -453,6 +453,8 @@ struct RunRegistry {
     next_id: u64,
 }
 
+const MAX_COMPLETED_RUNS: usize = 256;
+
 impl RunRegistry {
     fn new() -> Self {
         Self {
@@ -465,6 +467,31 @@ impl RunRegistry {
         let id = self.next_id;
         self.next_id += 1;
         format!("run-{id}")
+    }
+
+    /// 結果未回収クライアントがいても完了履歴を無制限保持しない（Issue #258）。
+    /// 実行中エントリは対象外とし、完了時刻の代わりに開始時刻が古い順で落とす。
+    fn prune_completed(&mut self) {
+        let mut completed: Vec<_> = self
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| {
+                entry
+                    .completed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some()
+                    .then_some((id.clone(), entry.started_at))
+            })
+            .collect();
+        if completed.len() <= MAX_COMPLETED_RUNS {
+            return;
+        }
+        completed.sort_by_key(|(_, started_at)| *started_at);
+        let remove_count = completed.len() - MAX_COMPLETED_RUNS;
+        for (id, _) in completed.into_iter().take(remove_count) {
+            self.entries.remove(&id);
+        }
     }
 }
 
@@ -551,10 +578,16 @@ pub fn run_start(
                 Some(&snapshot),
             );
             let elapsed_secs = start.elapsed().as_secs();
-            *completed.lock().unwrap_or_else(|e| e.into_inner()) = Some(RunCompleted {
-                outcome,
-                elapsed_secs,
-            });
+            {
+                *completed.lock().unwrap_or_else(|e| e.into_inner()) = Some(RunCompleted {
+                    outcome,
+                    elapsed_secs,
+                });
+            }
+            let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+            // 自分自身を含め最新 256 件だけ残す。run_result と競合しても registry lock
+            // によりエントリ参照中の除去は起きない。
+            reg.prune_completed();
         })
         .map_err(|e| format!("ポーリングスレッドの起動に失敗: {e}"))?;
 
@@ -1041,6 +1074,53 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
+
+    #[test]
+    fn run_registryは実行中を残して完了履歴を上限まで削減する() {
+        let mut registry = RunRegistry::new();
+        for index in 0..(MAX_COMPLETED_RUNS + 4) {
+            registry.entries.insert(
+                format!("done-{index}"),
+                RunEntry {
+                    pane_id: index as u64,
+                    spawned_by: 0,
+                    tmux_session: None,
+                    auto_close: false,
+                    output_lines: 1,
+                    started_at: Instant::now(),
+                    snapshot: Arc::new(Mutex::new(RunSnapshot {
+                        worker_status: "idle".into(),
+                        elapsed_secs: 0,
+                    })),
+                    completed: Arc::new(Mutex::new(Some(RunCompleted {
+                        outcome: WatchOutcome::Idle { ctx_percent: None },
+                        elapsed_secs: 0,
+                    }))),
+                },
+            );
+        }
+        registry.entries.insert(
+            "running".into(),
+            RunEntry {
+                pane_id: 999,
+                spawned_by: 0,
+                tmux_session: None,
+                auto_close: false,
+                output_lines: 1,
+                started_at: Instant::now(),
+                snapshot: Arc::new(Mutex::new(RunSnapshot {
+                    worker_status: "busy".into(),
+                    elapsed_secs: 0,
+                })),
+                completed: Arc::new(Mutex::new(None)),
+            },
+        );
+
+        registry.prune_completed();
+
+        assert_eq!(registry.entries.len(), MAX_COMPLETED_RUNS + 1);
+        assert!(registry.entries.contains_key("running"));
+    }
 
     /// ❯ プロンプトつきの idle 画面
     const IDLE_SCREEN: &str = "作業が完了しました\n❯ \n──────\nmodel: opus";

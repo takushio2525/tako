@@ -4,6 +4,7 @@
 //! GPUI への依存はここに置かない（GPUI 破壊的変更リスクの防波堤。`.agent/architecture.md`）。
 
 pub mod acceptance_gate;
+pub mod byte_lru;
 pub mod git;
 pub mod header_layout;
 pub mod links;
@@ -13,6 +14,7 @@ pub mod pane_log;
 pub mod pane_tree;
 pub mod paths;
 pub mod ports;
+pub mod preview_cache;
 pub mod preview_outline;
 pub mod preview_reload;
 pub mod preview_view;
@@ -33,6 +35,7 @@ pub mod tmux;
 pub mod tmux_backend;
 pub mod workspace;
 
+pub use byte_lru::ByteLru;
 pub use git::{
     DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffTarget, GitBranch, GitCommit, GitStatus,
     GitStatusEntry, GraphLayout, GraphLine, GraphRow, GRAPH_PALETTE,
@@ -46,6 +49,10 @@ pub use pane_tree::{
     SplitDirection,
 };
 pub use ports::ListenPort;
+pub use preview_cache::{
+    preview_cache_bytes, PreviewCacheStats, PREVIEW_CACHE_DEFAULT_MB, PREVIEW_CACHE_MAX_MB,
+    PREVIEW_CACHE_MIN_MB,
+};
 pub use preview_outline::{PreviewOutline, PreviewOutlineItem, PreviewOutlineTarget};
 pub use preview_reload::PreviewReloadState;
 pub use preview_view::{

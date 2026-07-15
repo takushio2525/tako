@@ -94,11 +94,11 @@ impl TakoApp {
                                 this.terminals.remove(&pane_id);
                                 this.previews.remove(&pane_id);
                                 this.preview_edits.remove(&pane_id);
-                                this.preview_image_cache.remove(&pane_id);
+                                this.remove_preview_image_cache(pane_id);
                                 this.preview_views.remove(&pane_id);
                                 this.preview_scroll_handles.remove(&pane_id);
                                 this.video_players.remove(&pane_id);
-                                this.video_frame_cache.remove(&pane_id);
+                                this.remove_video_frame_cache(pane_id);
                                 this.sync_preview_watches();
                                 this.scroll_accum.remove(&pane_id);
                                 this.scroll_ctls.remove(&pane_id);

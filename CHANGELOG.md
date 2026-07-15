@@ -69,6 +69,9 @@ Nightly patch release (automated). Changes since v0.5.0:
 
 ### Fixed
 
+- Preview image memory is now bounded by a configurable byte-budgeted LRU (#258). PDF pages are decoded only around the visible page, and eviction explicitly removes both GPUI CPU assets and GPU atlas textures; replaced video frames are also dropped from the atlas. Live reload rasterization is single-flight with one latest retry, completed async run history is capped at 256, and `tako preview-cache [max_mb]` / MCP `tako_preview_cache` expose the 512MiB default budget and live usage
+  プレビュー画像メモリを設定可能なバイト予算つき LRU で上限化（#258）。PDF は表示ページ近傍だけをデコードし、退避時は GPUI の CPU asset と GPU atlas texture の両方を明示解放し、置換済み動画フレームも atlas から除去する。ライブリロードのラスタライズは single-flight + 最新 1 件再実行、非同期 run 完了履歴は 256 件上限とし、`tako preview-cache [max_mb]` / MCP `tako_preview_cache` で既定 512MiB の予算と利用状況を公開
+
 - PDF text selection no longer turns into a whole-document selection when dragging from line gaps or page margins (#231). PDF pages are also re-rasterized in the background at the quantized device scale × zoom × viewport width, making Retina and zoomed text sharp while preserving the path-and-raster-keyed `PreviewImageCache`
   PDF の行間・ページ余白からドラッグしたとき全文選択になる不具合を修正（#231）。PDF ページは device scale × zoom × 表示幅を量子化した解像度で background 再ラスタライズし、path + raster key の `PreviewImageCache` を維持したまま Retina・ズーム表示の文字を鮮明化
 

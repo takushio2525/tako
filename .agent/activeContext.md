@@ -6,7 +6,7 @@
 
 ## 現在の対象（2026-07-15・#258 アプリ全体メモリ監査）
 
-**調査フェーズ完了、修正着手前**:
+**調査・修正フェーズ完了、長時間検証前**:
 
 - v0.5.2 / `8d80be3` の隔離自前ビルドで Issue 記載の容疑1〜7を調査
 - 6ページ PDF の倍率世代で physical footprint が 0.48GB → 2.63GBへ増加。
@@ -20,13 +20,22 @@
 - BG退避とcloseで footprint不変。ターミナル10,000行上限、sessions 500件、ログ5/200MB、
   worker events一時生成はGB級原因でないことを確認
 - 詳細: `.agent/investigations/issue-258-memory-audit.md`
+- `tako-core::ByteLru` で既定512MiB（設定256〜8192MiB）のデコード済み画像予算を実装。
+  PDF は表示ページ前後だけを遅延 `gpui::Image` 化する
+- LRU / 世代変更 / close 時は `Image::remove_asset` + `App::drop_image` を次render冒頭で実行し、
+  CPU assetとGPU atlasを同時解放。動画の置換済みフレームもatlasから解放する
+- ライブリロードは `(pane, path)` single-flight + 最新1件再実行。未回収run完了履歴は
+  実行中を除外して最大256件、close時のpane link補助キャッシュも除去
+- dispatch `PreviewCache` / CLI `tako preview-cache` / MCP `tako_preview_cache` を1:1追加。
+  上限・使用bytes・entry数を返し、settings.jsonへ永続化する
+- app 91件、CLI 25件、control 425件、core 276件の対象4クレートテストは全緑
 
 ## 次の一手
 
-- 原因の定量結果を Issue #258へ報告して調査マイルストーンをコミット
-- 512MiB既定の設定可能な画像バイト予算 + LRU、可視近傍ページだけのデコード、
-  GPUI asset / atlasの明示eviction、ライブリロードsingle-flightを実装
-- 長時間相当RSS系列、perf_span、全品質ゲート、隔離セルフテストを通す
+- 修正マイルストーンをコミット・push
+- 隔離環境で PDFズーム + ページ移動 + ライブリロードの30分相当を実行し、
+  RSS / physical footprint / cache stats / single-flight本数 / perf_spanを系列採取
+- origin/main（#257）を取り込み、全品質ゲートと隔離セルフテスト後にPR・mergeする
 
 ## 現フェーズで Read すべき設計書
 
