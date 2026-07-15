@@ -3687,9 +3687,19 @@ fn finish_worker_status(
         status_source = "none";
     };
 
+    // #267: agents の生ステータスを dispatch の語彙に正規化する。
+    // 正規化しないと watch ループの unknown フォールバック（スクリーン末尾 5 行判定）に
+    // 落ち、長時間ツール出力で busy パターンが流れた瞬間に偽 IDLE が出る
     let (mut status, ctx_percent) = if let Some(ref sid) = resolved_sid {
         let agent = orchestrator::query_agent_status(sid);
-        (agent.status, agent.ctx_percent)
+        let normalized = match agent.status.as_str() {
+            "idle" => "idle",
+            "active" => "busy",
+            "waiting" | "waiting_for_input" => "waiting",
+            "gone" => "gone",
+            _ => "unknown",
+        };
+        (normalized.to_string(), agent.ctx_percent)
     } else if pane_exists {
         ("unknown".to_string(), None)
     } else {
@@ -3709,6 +3719,11 @@ fn finish_worker_status(
         Some(tail_join(lines))
     });
 
+    // #267: agents が "gone" を返しても pane が workspace にある場合は
+    // セッション未発見なだけで worker は健在 → unknown に降格
+    if status == "gone" && pane_exists {
+        status = "unknown".to_string();
+    }
     // tmux session が生きていれば gone を取り消す（pane は無いが worker は健在）
     if status == "gone" {
         if let Some(ts) = tmux_session {
@@ -3725,15 +3740,15 @@ fn finish_worker_status(
         .as_ref()
         .is_some_and(|bs| crate::agents::has_running_children(bs));
 
-    // idle 誤検知防止: サブエージェント完了の瞬間に claude agents --json が
-    // 一時的に idle を返すことがある。末尾付近に ❯ プロンプトが
-    // なければメインはまだ作業中なので busy に補正する
-    // （判定は orchestrator::wait の完了監視ヒューリスティックと共通。#83）
+    // #267: idle 補正は has_children と screen_looks_busy のみで判断する。
+    // 旧実装の !has_prompt（画面にプロンプトが無ければ busy）は折りたたみ画面や
+    // 特殊レイアウトで真の完了を拾えなくなる問題があった（症状 4）。
+    // 一時的な idle（サブエージェント完了瞬間）は watch ループの idle_streak（3 回連続）で防ぐ
     if status == "idle" {
-        let has_prompt = recent_output
+        let screen_busy = recent_output
             .as_ref()
-            .is_some_and(|out| crate::orchestrator::wait::screen_looks_idle(out));
-        if !has_prompt || has_children {
+            .is_some_and(|out| crate::orchestrator::wait::screen_looks_busy(out));
+        if has_children || screen_busy {
             status = "busy".to_string();
         }
     }

@@ -53,6 +53,9 @@ pub struct WatchOptions {
 pub enum WatchOutcome {
     /// worker が入力待ち（= 完了）になった。`ctx_percent` は取得できた場合のみ
     Idle { ctx_percent: Option<u64> },
+    /// worker が質問/確認ダイアログ待ちで停止した（#267）。
+    /// Idle と同じく入力待ちだが、master 側の対応が異なる
+    Question { ctx_percent: Option<u64> },
     /// worker が異常（API エラー・usage limit 等）で停止した（#157）。
     /// `detail` は検知パターンにマッチした画面上の行
     Error {
@@ -175,7 +178,7 @@ pub fn wait_for_worker(
                             idle_streak = 0;
                         } else {
                             gone_streak += 1;
-                            if gone_streak >= 2 {
+                            if gone_streak >= 3 {
                                 return WatchOutcome::Gone;
                             }
                         }
@@ -211,7 +214,9 @@ pub fn wait_for_worker(
                             return WatchOutcome::Stalled { detail };
                         }
                     }
-                    "busy" => {
+                    // #267: "waiting" は permission ダイアログ等の待機状態。
+                    // idle_streak を加算しない（IDLE として発火させない）
+                    "busy" | "waiting" => {
                         gone_streak = 0;
                         idle_streak = 0;
                         stalled_streak = 0;
@@ -249,6 +254,16 @@ pub fn wait_for_worker(
                     if let Some((kind, detail)) = error {
                         return WatchOutcome::Error { kind, detail };
                     }
+                    // #267: idle 確定後に events から question を判定。
+                    // question がある場合は Question で通知（master の対応が異なるため）
+                    let has_question = val["events"].as_array().is_some_and(|evts| {
+                        evts.iter().any(|e| e["kind"].as_str() == Some("question"))
+                    });
+                    if has_question {
+                        return WatchOutcome::Question {
+                            ctx_percent: val["ctx_percent"].as_u64(),
+                        };
+                    }
                     return WatchOutcome::Idle {
                         ctx_percent: val["ctx_percent"].as_u64(),
                     };
@@ -260,7 +275,8 @@ pub fn wait_for_worker(
                     gone_streak = 0;
                 } else {
                     gone_streak += 1;
-                    if gone_streak >= 2 {
+                    // #267: 閾値を 2→3 に引き上げ（一時的な IPC 断での偽 GONE 防止）
+                    if gone_streak >= 3 {
                         return WatchOutcome::Gone;
                     }
                 }
@@ -339,7 +355,7 @@ pub fn run_worker(
         None,
     );
     let final_status = match outcome {
-        WatchOutcome::Idle { .. } => "completed",
+        WatchOutcome::Idle { .. } | WatchOutcome::Question { .. } => "completed",
         WatchOutcome::Error { .. } => "worker_error",
         WatchOutcome::Stalled { .. } => "worker_stalled",
         WatchOutcome::Gone => "error",
@@ -358,11 +374,13 @@ pub fn run_worker(
     .unwrap_or_default();
 
     // --- 4. 自動 close（run の完了後なので force: true）。
-    // エラー / stalled 時は close しない: 復帰できる余地を残す（#157 / #224） ---
+    // エラー / stalled / question 時は close しない: 復帰・応答の余地を残す ---
     let closed = if opts.auto_close
         && !matches!(
             outcome,
-            WatchOutcome::Error { .. } | WatchOutcome::Stalled { .. }
+            WatchOutcome::Error { .. }
+                | WatchOutcome::Stalled { .. }
+                | WatchOutcome::Question { .. }
         ) {
         exec(Request::Close {
             pane: Some(pane_id),
@@ -393,6 +411,9 @@ pub fn run_worker(
             "detail": detail,
             "recommended_action": "check_and_resume",
         });
+    }
+    if matches!(outcome, WatchOutcome::Question { .. }) {
+        result["question"] = json!(true);
     }
 
     // Issue #242: usage_limit / crash / gone でチェックポイントを Suspended に遷移させる
@@ -610,7 +631,7 @@ pub fn run_status(run_id: &str) -> Result<Value, String> {
     let completed = entry.completed.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(c) = completed.as_ref() {
         let status = match &c.outcome {
-            WatchOutcome::Idle { .. } => "completed",
+            WatchOutcome::Idle { .. } | WatchOutcome::Question { .. } => "completed",
             WatchOutcome::Error { .. } => "worker_error",
             WatchOutcome::Stalled { .. } => "worker_stalled",
             WatchOutcome::Gone => "error",
@@ -681,7 +702,7 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
     drop(reg);
 
     let final_status = match &c.outcome {
-        WatchOutcome::Idle { .. } => "completed",
+        WatchOutcome::Idle { .. } | WatchOutcome::Question { .. } => "completed",
         WatchOutcome::Error { .. } => "worker_error",
         WatchOutcome::Stalled { .. } => "worker_stalled",
         WatchOutcome::Gone => "error",
@@ -698,11 +719,13 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
     .and_then(|v| v["text"].as_str().map(String::from))
     .unwrap_or_default();
 
-    // auto_close（エラー / stalled 時は close しない。#157 / #224）
+    // auto_close（エラー / stalled / question 時は close しない）
     let closed = if auto_close
         && !matches!(
             c.outcome,
-            WatchOutcome::Error { .. } | WatchOutcome::Stalled { .. }
+            WatchOutcome::Error { .. }
+                | WatchOutcome::Stalled { .. }
+                | WatchOutcome::Question { .. }
         ) {
         exec(Request::Close {
             pane: Some(pane_id),
@@ -742,6 +765,9 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
             "recommended_action": "check_and_resume",
         });
     }
+    if matches!(c.outcome, WatchOutcome::Question { .. }) {
+        result["question"] = json!(true);
+    }
     Ok(result)
 }
 
@@ -755,7 +781,7 @@ pub fn run_list() -> Value {
             let completed = entry.completed.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(c) = completed.as_ref() {
                 let status = match &c.outcome {
-                    WatchOutcome::Idle { .. } => "completed",
+                    WatchOutcome::Idle { .. } | WatchOutcome::Question { .. } => "completed",
                     WatchOutcome::Error { .. } => "worker_error",
                     WatchOutcome::Stalled { .. } => "worker_stalled",
                     WatchOutcome::Gone => "error",
@@ -1035,8 +1061,8 @@ pub fn collect_worker_events(
 ) -> Vec<WorkerEvent> {
     let mut events = Vec::new();
 
-    // question: idle 時のみ（busy 中の質問文言はまだ作業途中）
-    if status == "idle" || status == "error" {
+    // question: idle / error / waiting 時のみ（busy 中の質問文言はまだ作業途中）
+    if status == "idle" || status == "error" || status == "waiting" {
         if let Some(out) = recent_output {
             if detect_worker_question(out) {
                 events.push(WorkerEvent {
@@ -1220,16 +1246,24 @@ mod tests {
     }
 
     #[test]
-    fn goneは2回連続で消滅と判定する() {
-        let mut script =
-            ExecScript::new(vec![status("gone", "", "none"), status("gone", "", "none")]);
+    fn goneは3回連続で消滅と判定する() {
+        // #267: 閾値を 2→3 に引き上げ（一時的な IPC 断での偽 GONE 防止）
+        let mut script = ExecScript::new(vec![
+            status("gone", "", "none"),
+            status("gone", "", "none"),
+            status("gone", "", "none"),
+        ]);
         let outcome = run_wait(&mut script, &watch_opts(7, None));
         assert_eq!(outcome, WatchOutcome::Gone);
     }
 
     #[test]
-    fn 実行エラーも2回連続でgoneと判定する() {
-        let mut script = ExecScript::new(vec![Err("IPC 断".into()), Err("IPC 断".into())]);
+    fn 実行エラーも3回連続でgoneと判定する() {
+        let mut script = ExecScript::new(vec![
+            Err("IPC 断".into()),
+            Err("IPC 断".into()),
+            Err("IPC 断".into()),
+        ]);
         let outcome = run_wait(&mut script, &watch_opts(7, None));
         assert_eq!(outcome, WatchOutcome::Gone);
     }
@@ -1984,5 +2018,148 @@ Should I also update the documentation?\n\n\
         let j = ch.to_json();
         assert_eq!(j["kind"], "context_high");
         assert_eq!(j["percent"], 70);
+    }
+
+    // --- #267: watch 誤検知修正のテスト ---
+
+    /// ツール実行中の画面（Docker latexmk）。"Running" が末尾 5 行より上に流れた状態。
+    /// 実採取: 長い出力で busy パターンが tail 5 から外れるケース
+    const TOOL_RUNNING_SCROLLED_SCREEN: &str = "\
+Running 1 shell command...\n\
+\n\
+  $ docker run --rm -v \"$(pwd):/work\" texlive:latest latexmk -pdf main.tex\n\
+\n\
+  This is XeTeX, Version 3.141592653\n\
+  Output written on main.pdf (10 pages)\n\
+  Latexmk: All targets (main.pdf) are up to date\n\
+  Transcript written on main.log\n\
+  Build complete.\n\
+  Done.";
+
+    /// permission ダイアログ待ちの画面（実採取相当）
+    const PERMISSION_DIALOG_SCREEN: &str = "\
+? Claude requested permissions to write to .../main.aux\n\
+  (suspicious Windows path pattern)\n\
+❯ 1. Allow once\n\
+  2. Always allow\n\
+  3. Deny\n\n\
+  Press enter to confirm";
+
+    #[test]
+    fn 症状2_ツール実行中に偽idleを出さない() {
+        // dispatch が "busy"（has_children=true）を返す場面を再現。
+        // screen_looks_busy が tail 5 で Running を拾えなくても dispatch が busy なら OK
+        let mut script = ExecScript::new(vec![
+            status("busy", TOOL_RUNNING_SCROLLED_SCREEN, "agents-auto"),
+            status("busy", TOOL_RUNNING_SCROLLED_SCREEN, "agents-auto"),
+            status("busy", TOOL_RUNNING_SCROLLED_SCREEN, "agents-auto"),
+            status("idle", IDLE_SCREEN, "agents-auto"),
+            status("idle", IDLE_SCREEN, "agents-auto"),
+            status("idle", IDLE_SCREEN, "agents-auto"),
+        ]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        assert!(
+            matches!(outcome, WatchOutcome::Idle { .. }),
+            "busy 中は idle_streak が上がらず、idle 3 連続で初めて完了する"
+        );
+        assert_eq!(script.seen.len(), 6);
+    }
+
+    #[test]
+    fn 症状2_screen_looks_busyはtail5より上のrunningを拾えない() {
+        // busy パターンが tail 5 から外れた画面で screen_looks_busy が false になることを確認
+        // （このため dispatch 側の正規化が必要）
+        assert!(
+            !screen_looks_busy(TOOL_RUNNING_SCROLLED_SCREEN),
+            "tail 5 に Running が入っていないため false"
+        );
+    }
+
+    #[test]
+    fn 症状3_waitingステータスはidle_streakを加算しない() {
+        // dispatch が "waiting" を返す場面。idle_streak が上がらないことを確認
+        let mut script = ExecScript::new(vec![
+            status("waiting", PERMISSION_DIALOG_SCREEN, "agents-auto"),
+            status("waiting", PERMISSION_DIALOG_SCREEN, "agents-auto"),
+            status("waiting", PERMISSION_DIALOG_SCREEN, "agents-auto"),
+            status("waiting", PERMISSION_DIALOG_SCREEN, "agents-auto"),
+            status("idle", IDLE_SCREEN, "agents-auto"),
+            status("idle", IDLE_SCREEN, "agents-auto"),
+            status("idle", IDLE_SCREEN, "agents-auto"),
+        ]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        assert!(
+            matches!(outcome, WatchOutcome::Idle { .. }),
+            "waiting 中は idle_streak が加算されず、waiting 解消後の idle 3 連続で完了"
+        );
+        assert_eq!(script.seen.len(), 7);
+    }
+
+    #[test]
+    fn 症状3_questionイベント付きidleはquestionを返す() {
+        // dispatch が idle + events に question を含む応答を返す場面
+        let question_resp = || -> Result<Value, String> {
+            Ok(json!({
+                "status": "idle",
+                "recent_output": QUESTION_CONFIRM_SCREEN,
+                "status_source": "agents-auto",
+                "ctx_percent": 42,
+                "events": [{"kind": "question"}],
+            }))
+        };
+        let mut script = ExecScript::new(vec![question_resp(), question_resp(), question_resp()]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        assert!(
+            matches!(
+                outcome,
+                WatchOutcome::Question {
+                    ctx_percent: Some(42)
+                }
+            ),
+            "events に question があれば Question を返す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn 症状4_has_promptなしでもagents_idleで完了を検出する() {
+        // agents が "idle" を返すが画面にプロンプトが見えない場面。
+        // 旧実装では !has_prompt で busy に上書きされ完了を拾えなかった
+        // → dispatch 側の修正で idle のまま通る（テストは dispatch 経由でなく
+        //   watch ループの idle 解釈を検証。dispatch 側は dispatch テストで担保）
+        let no_prompt_screen = "実装が完了しました\n\n95 new messages (click)";
+        let mut script = ExecScript::new(vec![
+            status("idle", no_prompt_screen, "agents-auto"),
+            status("idle", no_prompt_screen, "agents-auto"),
+            status("idle", no_prompt_screen, "agents-auto"),
+        ]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        assert!(
+            matches!(outcome, WatchOutcome::Idle { .. }),
+            "dispatch が idle を返せば watch は素直に idle_streak を加算する"
+        );
+    }
+
+    #[test]
+    fn 症状1_gone2連続ではまだ発火しない() {
+        // #267: 閾値 3。2 連続の後に busy に戻れば gone しない
+        let mut script = ExecScript::new(vec![
+            status("gone", "", "none"),
+            status("gone", "", "none"),
+            status("busy", BUSY_SCREEN, "agents"),
+            status("idle", IDLE_SCREEN, "agents"),
+            status("idle", IDLE_SCREEN, "agents"),
+            status("idle", IDLE_SCREEN, "agents"),
+        ]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        assert!(
+            matches!(outcome, WatchOutcome::Idle { .. }),
+            "2 連続の gone で発火せず、復帰後に idle で完了する"
+        );
+    }
+
+    #[test]
+    fn collect_worker_eventsはwaiting時も質問を検出する() {
+        let events = collect_worker_events("waiting", Some(QUESTION_CONFIRM_SCREEN), Some(42u32));
+        assert!(events.iter().any(|e| e.kind == WorkerEventKind::Question));
     }
 }

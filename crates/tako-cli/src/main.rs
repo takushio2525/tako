@@ -2142,6 +2142,16 @@ fn orchestrator_watch(
             println!("WORKER_IDLE: tako:{pane}");
             print_events(&mut exec);
         }
+        wait::WatchOutcome::Question {
+            ctx_percent: Some(pct),
+        } => {
+            println!("WORKER_QUESTION: tako:{pane} (ctx {pct}%)");
+            print_events(&mut exec);
+        }
+        wait::WatchOutcome::Question { .. } => {
+            println!("WORKER_QUESTION: tako:{pane}");
+            print_events(&mut exec);
+        }
         wait::WatchOutcome::Error { kind, detail } => {
             println!("WORKER_ERROR: tako:{pane} ({})", kind.as_str());
             if !detail.is_empty() {
