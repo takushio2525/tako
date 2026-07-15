@@ -229,14 +229,14 @@ impl TakoApp {
                                         .child(SharedString::from(truncate(&g.branch, 14)))
                                 }))
                                 .child(div().flex_grow(1.0))
-                                // + = フォルダ追加（現行機能の維持: open_directory）
+                                // + = ファイルツリーにルート追加（#268）
                                 .child(
                                     div()
                                         .id("sidebar-add-folder")
                                         .flex_none()
                                         .cursor_pointer()
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.open_directory(cx);
+                                            this.add_tree_root(cx);
                                         }))
                                         .child(
                                             svg()
@@ -398,11 +398,27 @@ impl TakoApp {
                                     MouseButton::Right,
                                     cx.listener({
                                         let ctx_path = path.clone();
+                                        let is_root = row.root;
                                         move |this, e: &MouseDownEvent, _, cx| {
                                             cx.stop_propagation();
+                                            let is_pinned_root = is_root && {
+                                                let canon = ctx_path
+                                                    .canonicalize()
+                                                    .unwrap_or_else(|_| ctx_path.clone());
+                                                this.workspace
+                                                    .active_tab()
+                                                    .pinned_folders()
+                                                    .iter()
+                                                    .any(|f| {
+                                                        f.canonicalize()
+                                                            .unwrap_or_else(|_| f.clone())
+                                                            == canon
+                                                    })
+                                            };
                                             this.context_menu = Some(ContextMenu {
                                                 path: ctx_path.clone(),
                                                 is_dir,
+                                                is_pinned_root,
                                                 position: e.position,
                                             });
                                             cx.notify();
@@ -609,8 +625,9 @@ impl TakoApp {
         let theme = &self.theme;
         let path = ctx.path.clone();
         let is_dir = ctx.is_dir;
+        let is_pinned_root = ctx.is_pinned_root;
         let pos = ctx.position;
-        let items: Vec<(&str, &str)> = vec![
+        let mut items: Vec<(&str, &str)> = vec![
             ("copy-rel", "相対パスをコピー"),
             ("copy-abs", "絶対パスをコピー"),
             ("reveal", "Finder で表示"),
@@ -622,6 +639,10 @@ impl TakoApp {
             ("sep2", ""),
             ("trash", "削除"),
         ];
+        if is_pinned_root {
+            items.push(("sep3", ""));
+            items.push(("remove-root", "ツリーから除去"));
+        }
         let menu = div()
             .absolute()
             .left(pos.x)
@@ -911,6 +932,19 @@ impl TakoApp {
                         op: FileOpKind::Trash,
                         path: path_str,
                         name: None,
+                        pane: None,
+                    },
+                    PaneOrigin::User,
+                );
+                self.sync_filetree_roots();
+            }
+            "remove-root" => {
+                let _ = tako_control::dispatch(
+                    self,
+                    Request::TreeFolder {
+                        action: "remove".into(),
+                        path: Some(path_str),
+                        tab: None,
                         pane: None,
                     },
                     PaneOrigin::User,
