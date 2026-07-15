@@ -6,7 +6,7 @@
 
 ## 現在の対象（2026-07-15・#262 setup UX 全面見直し）
 
-**根本原因の隔離実測まで完了、実装着手前**:
+**根本原因調査と方針 A/B の実装・隔離 E2E まで完了**:
 
 - v0.5.3（`6a4e06e`）で実ユーザー設定を隔離コピーし、認証照会だけ実 CLI へ委譲
 - claude=max / codex=free / agy=取得不能を検出。現行 setup は 1 回目・2 回目とも
@@ -15,12 +15,14 @@
 - 根因は config 読み込み順、全 provider 無条件巡回、設定済み項目の再質問、
   profile の無差分確認、CLI 後の agent 二重対話
 - Issue #262 に着手コメントと実測・根本原因コメントを投稿済み
+- 方針 A: 認証済み・導入済み provider だけを解決し、検出値を `[detected]` で採用
+- 方針 B: config を質問前に読み、2 回目 Enter で agent / plan / profile を引き継ぐ。
+  設定済み依存は表示のみ、setup agent は再起動しない
+- 隔離 E2E: claude 単独と 3 CLI の両方で 2 回目の追加質問 0・agent 起動なし
 - 詳細: `.agent/investigations/issue-262-setup-ux.md`
 
 ## 次の一手
 
-- 方針 A: 検出値の実効化と source 表示
-- 方針 B: 前回設定引き継ぎと idempotent 化
 - 方針 C: 最終確認 1 回と `tako setup --yes`
 - 4 シナリオ、設定破損、検出値不一致、全品質ゲートを実測
 

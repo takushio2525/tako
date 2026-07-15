@@ -16,6 +16,61 @@ use std::path::{Path, PathBuf};
 /// バイナリ埋め込みの setup changelog
 pub const CHANGES_YAML: &str = include_str!("../../../resources/setup/changes.yaml");
 
+/// setup が採用した値の出所。CLI 表示のラベルを共通化する（Issue #262）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupValueSource {
+    Detected,
+    Previous,
+    Default,
+}
+
+impl SetupValueSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Detected => "detected",
+            Self::Previous => "previous",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// 検出値、前回値、既定値の優先順で setup 値を解決する。
+/// 検出値と前回値が違う場合は previous を残し、呼び出し側が差異を通知できるようにする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSetupValue {
+    pub value: String,
+    pub source: SetupValueSource,
+    pub previous: Option<String>,
+}
+
+pub fn resolve_setup_value(
+    detected: Option<&str>,
+    previous: Option<&str>,
+    default: Option<&str>,
+) -> Option<ResolvedSetupValue> {
+    if let Some(value) = detected {
+        return Some(ResolvedSetupValue {
+            value: value.to_string(),
+            source: SetupValueSource::Detected,
+            previous: previous
+                .filter(|previous| *previous != value)
+                .map(str::to_string),
+        });
+    }
+    if let Some(value) = previous {
+        return Some(ResolvedSetupValue {
+            value: value.to_string(),
+            source: SetupValueSource::Previous,
+            previous: None,
+        });
+    }
+    default.map(|value| ResolvedSetupValue {
+        value: value.to_string(),
+        source: SetupValueSource::Default,
+        previous: None,
+    })
+}
+
 // --- config.yaml のスキーマ ---
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -307,6 +362,24 @@ pub fn render_pending_markdown(pending: &[SetupChange], applied_revision: u32) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup値はdetected_previous_defaultの順で解決する() {
+        let detected = resolve_setup_value(Some("pro"), Some("free"), Some("unknown")).unwrap();
+        assert_eq!(detected.value, "pro");
+        assert_eq!(detected.source, SetupValueSource::Detected);
+        assert_eq!(detected.previous.as_deref(), Some("free"));
+        assert_eq!(detected.source.label(), "detected");
+
+        let previous = resolve_setup_value(None, Some("max-20x"), Some("unknown")).unwrap();
+        assert_eq!(previous.source, SetupValueSource::Previous);
+        assert_eq!(previous.source.label(), "previous");
+
+        let default = resolve_setup_value(None, None, Some("unknown")).unwrap();
+        assert_eq!(default.source, SetupValueSource::Default);
+        assert_eq!(default.source.label(), "default");
+        assert!(resolve_setup_value(None, None, None).is_none());
+    }
 
     #[test]
     fn config_roundtrip() {

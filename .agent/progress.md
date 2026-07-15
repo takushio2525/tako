@@ -776,3 +776,9 @@
   5 問を再現。GPT 検出だけ採用、前回 agent / plan は未使用と確認
 - config 読み込み順、全 provider 巡回、設定済み項目・profile の再確認、agent 二重対話を
   根因として Issue #262 と `.agent/investigations/issue-262-setup-ux.md` に記録
+
+## 2026-07-15（#262: setup UX 方針 A/B 実装）
+- 認証済み・導入済み provider だけをプラン解決対象にし、detected / previous / default の
+  優先解決を tako-control に集約。検出値の食い違いは detected 優先で通知
+- config を質問前に読み、2 回目 Enter で agent / plan / profile を引き継ぐ冪等経路を追加。
+  claude 単独・3 CLI の隔離 E2E で追加質問 0・setup agent 再起動なしを確認

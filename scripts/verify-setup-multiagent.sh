@@ -19,6 +19,15 @@ assert_contains() {
     grep -Eq "$pattern" "$file" || fail "$message"
 }
 
+assert_not_contains() {
+    file=$1
+    pattern=$2
+    message=$3
+    if grep -Eq "$pattern" "$file"; then
+        fail "$message"
+    fi
+}
+
 make_login_shell() {
     path=$1
     mkdir -p "$(dirname -- "$path")"
@@ -96,17 +105,30 @@ SINGLE_BIN="$TMP/single-bin"
 mkdir -p "$SINGLE_HOME" "$SINGLE_BIN"
 make_login_shell "$SINGLE_HOME/login-shell"
 make_claude "$SINGLE_BIN/claude"
-run_setup "$SINGLE_HOME" "$SINGLE_BIN" '\n1\n1\n' "$TMP/single.out"
+run_setup "$SINGLE_HOME" "$SINGLE_BIN" '\n' "$TMP/single.out"
 
 SINGLE_CONFIG="$SINGLE_HOME/Library/Application Support/tako/orchestrator/config.yaml"
 SINGLE_PROFILE="$SINGLE_HOME/Library/Application Support/tako/orchestrator/profiles/default.yaml"
-assert_contains "$TMP/single.out" '\[自動選択\].*claude のみ' "claude 単独の自動選択が表示されない"
+assert_contains "$TMP/single.out" '\[detected\] setup agent: claude' "claude 単独の検出採用が表示されない"
+assert_contains "$TMP/single.out" '\[detected\] Claude プラン: pro' "Claude Pro の検出採用が表示されない"
 assert_contains "$SINGLE_CONFIG" '^  selected_agent: claude$' "config の selected_agent が claude でない"
 assert_contains "$SINGLE_PROFILE" '^master_agent: claude$' "profile の master_agent が claude でない"
 assert_contains "$SINGLE_PROFILE" '^worker_agent: claude$' "profile の worker_agent が claude でない"
 assert_contains "$SINGLE_PROFILE" '^effort: high$' "Claude Pro の effort 推奨が high でない"
 assert_contains "$SINGLE_HOME/launched-agent" '^claude$' "setup 対話に claude が起動されていない"
 printf '[OK] claude のみ: 自動選択 -> master/worker=claude, effort=high\n'
+
+# 同じ HOME の 2 回目は Enter 1 回で前回設定を引き継ぎ、追加質問も agent 起動も行わない。
+rm -f "$SINGLE_HOME/launched-agent"
+run_setup "$SINGLE_HOME" "$SINGLE_BIN" '\n' "$TMP/single-second.out"
+assert_contains "$TMP/single-second.out" '前回の設定をそのまま使う \[Enter\]' "2 回目の引き継ぎ選択が表示されない"
+assert_contains "$TMP/single-second.out" '\[detected\] setup agent: claude' "一意に検出した agent が採用されない"
+assert_contains "$TMP/single-second.out" '\[detected\] Claude プラン: pro' "再検出値が採用されない"
+assert_contains "$TMP/single-second.out" '\[previous\] 既存の default プロファイルを維持' "前回 profile が引き継がれない"
+assert_not_contains "$TMP/single-second.out" 'プランを選んでください|契約倍率を選んでください' "2 回目にプラン質問が出ている"
+assert_not_contains "$TMP/single-second.out" '更新する \[y/N\]' "2 回目に profile 更新確認が出ている"
+[ ! -e "$SINGLE_HOME/launched-agent" ] || fail "2 回目の Enter 経路で setup agent が起動された"
+printf '[OK] 2 回目: Enter 1 回で前回値を引き継ぎ、追加質問・agent 起動なし\n'
 
 env HOME="$SINGLE_HOME" USERPROFILE="$SINGLE_HOME" SHELL="$SINGLE_HOME/login-shell" \
     PATH="$SINGLE_BIN" "$TAKO_BIN" setup --check >"$TMP/check.out" 2>&1
@@ -145,3 +167,11 @@ assert_contains "$MULTI_PROFILE" '^  claude:$' "profile に claude worker 設定
 assert_contains "$MULTI_PROFILE" '^  codex:$' "profile に codex worker 設定がない"
 assert_contains "$MULTI_HOME/launched-agent" '^codex$' "選択した codex が setup 対話に起動されていない"
 printf '[OK] 複数 CLI: 選択 codex -> master/worker=codex, Plus=high, policy=delegate\n'
+
+rm -f "$MULTI_HOME/launched-agent"
+run_setup "$MULTI_HOME" "$MULTI_BIN" '\n' "$TMP/multi-second.out"
+assert_contains "$TMP/multi-second.out" '\[previous\] setup agent: codex' "複数 CLI の前回 agent が引き継がれない"
+assert_contains "$TMP/multi-second.out" '\[previous\] Google プラン: google-ai-pro' "取得不能な前回プランが引き継がれない"
+assert_not_contains "$TMP/multi-second.out" 'プランを選んでください|契約倍率を選んでください' "複数 CLI の 2 回目にプラン質問が出ている"
+[ ! -e "$MULTI_HOME/launched-agent" ] || fail "複数 CLI の 2 回目に setup agent が起動された"
+printf '[OK] 複数 CLI の 2 回目: previous agent / plan を引き継ぎ\n'

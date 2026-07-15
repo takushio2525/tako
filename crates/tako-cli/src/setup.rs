@@ -11,7 +11,9 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use tako_control::setup::{load_config, pending_changes, ChangeKind, SetupChange, CHANGES_YAML};
+use tako_control::setup::{
+    load_config, pending_changes, resolve_setup_value, ChangeKind, SetupChange, CHANGES_YAML,
+};
 
 // --- バイナリ埋め込みリソース ---
 
@@ -135,6 +137,15 @@ impl SetupAgent {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Agy => "agy",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "agy" => Some(Self::Agy),
+            _ => None,
         }
     }
 
@@ -766,17 +777,43 @@ fn sync_pending_changes_file(
     std::fs::write(&path, md).map_err(|e| format!("pending-changes.md の書き出しに失敗: {e}"))
 }
 
-fn select_setup_agent(agents: &[DetectedAgent]) -> Result<SetupAgent, String> {
+fn select_setup_agent(
+    agents: &[DetectedAgent],
+    previous: Option<&str>,
+    reuse_previous: bool,
+) -> Result<SetupAgent, String> {
     match agents {
         [] => Err("エージェント CLI が見つかりません".into()),
         [only] => {
+            if let Some(previous) = previous.filter(|value| *value != only.kind.as_str()) {
+                eprintln!(
+                    "  [detected] setup agent: {}（previous: {previous} は利用不可。検出値を優先）",
+                    only.kind.as_str()
+                );
+                return Ok(only.kind);
+            }
             eprintln!(
-                "  [自動選択] 検出された CLI は {} のみです。既定エージェントに設定します",
+                "  [detected] setup agent: {}（検出された認証済み CLI は 1 つ）",
                 only.kind.as_str()
             );
             Ok(only.kind)
         }
         _ => {
+            if reuse_previous {
+                if let Some(previous_kind) = previous.and_then(SetupAgent::parse) {
+                    if agents
+                        .iter()
+                        .any(|agent| agent.kind == previous_kind && agent.authenticated)
+                    {
+                        eprintln!("  [previous] setup agent: {}", previous_kind.as_str());
+                        return Ok(previous_kind);
+                    }
+                    eprintln!(
+                        "  [情報] previous setup agent `{}` は現在利用できないため、再選択します",
+                        previous_kind.as_str()
+                    );
+                }
+            }
             eprintln!();
             eprintln!("セットアップを進めるエージェントを選択してください:");
             for (index, agent) in agents.iter().enumerate() {
@@ -828,15 +865,72 @@ fn detected_provider_plans(agents: &[DetectedAgent]) -> Vec<(Provider, Option<St
         .collect()
 }
 
-fn collect_provider_plans(agents: &[DetectedAgent]) -> BTreeMap<String, String> {
-    let mut plans = BTreeMap::new();
+fn collect_provider_plans(
+    agents: &[DetectedAgent],
+    previous: &BTreeMap<String, String>,
+    reuse_previous: bool,
+) -> BTreeMap<String, String> {
+    let mut plans = if reuse_previous {
+        previous.clone()
+    } else {
+        BTreeMap::new()
+    };
     for (provider, detected) in detected_provider_plans(agents) {
+        let previous_plan = previous.get(provider.as_str()).map(String::as_str);
         let plan = match detected.as_deref() {
             // Claude の status は max の倍率を返さないため、その部分だけ対話で補う。
-            Some("max") if provider == Provider::Claude => prompt_plan(provider, Some("max")),
+            Some("max") if provider == Provider::Claude => {
+                if reuse_previous
+                    && previous_plan
+                        .is_some_and(|plan| matches!(plan, "max" | "max-5x" | "max-20x"))
+                {
+                    let plan = previous_plan.unwrap_or("max");
+                    eprintln!(
+                        "  [previous] {} プラン: {plan}（detected: max）",
+                        provider.label()
+                    );
+                    plan.to_string()
+                } else {
+                    if let Some(previous_plan) = previous_plan.filter(|_| reuse_previous) {
+                        eprintln!(
+                            "  [detected] {} プラン: max（previous: {previous_plan}。検出値を優先）",
+                            provider.label()
+                        );
+                    }
+                    prompt_plan(provider, Some("max"))
+                }
+            }
             Some(plan) => {
-                eprintln!("  [detected] {} プラン: {plan}", provider.label());
-                plan.to_string()
+                let resolved =
+                    resolve_setup_value(Some(plan), previous_plan.filter(|_| reuse_previous), None)
+                        .expect("detected があれば必ず解決できる");
+                if let Some(previous) = resolved.previous.as_deref() {
+                    eprintln!(
+                        "  [{}] {} プラン: {}（previous: {previous}。検出値を優先）",
+                        resolved.source.label(),
+                        provider.label(),
+                        resolved.value
+                    );
+                } else {
+                    eprintln!(
+                        "  [{}] {} プラン: {}",
+                        resolved.source.label(),
+                        provider.label(),
+                        resolved.value
+                    );
+                }
+                resolved.value
+            }
+            None if reuse_previous && previous_plan.is_some() => {
+                let resolved = resolve_setup_value(None, previous_plan, None)
+                    .expect("previous があれば必ず解決できる");
+                eprintln!(
+                    "  [{}] {} プラン: {}",
+                    resolved.source.label(),
+                    provider.label(),
+                    resolved.value
+                );
+                resolved.value
             }
             None => prompt_plan(provider, None),
         };
@@ -1061,6 +1155,7 @@ fn prepare_profile(
     selected: SetupAgent,
     agents: &[DetectedAgent],
     plans: &BTreeMap<String, String>,
+    reuse_previous: bool,
 ) -> Result<&'static str, String> {
     use tako_control::orchestrator;
 
@@ -1073,7 +1168,10 @@ fn prepare_profile(
         eprintln!("  [移行] {notice}");
     }
     let (recommended, note) = recommended_profile(selected, agents, plans);
-    let should_save = if existed {
+    let should_save = if existed && reuse_previous {
+        eprintln!("  [previous] 既存の default プロファイルを維持します");
+        false
+    } else if existed {
         eprintln!();
         eprintln!("既存の default プロファイルがあります。プランにもとづく推奨で更新しますか？");
         eprintln!(
@@ -1103,7 +1201,11 @@ fn prepare_profile(
         Ok("モデルは各 CLI の既定値。effort と worker ポリシーはプラン規模から推奨済み。")
     } else {
         eprintln!("  [維持] 既存プロファイルを変更しませんでした");
-        Ok("既存の default profile をユーザー選択で維持。自動推奨は未反映。")
+        if reuse_previous {
+            Ok("既存の default profile を前回どおり維持。")
+        } else {
+            Ok("既存の default profile をユーザー選択で維持。自動推奨は未反映。")
+        }
     }
 }
 
@@ -1182,6 +1284,33 @@ fn launch_setup_agent(
         .stderr(std::process::Stdio::inherit())
         .status()
         .map_err(|e| format!("{} の起動に失敗: {e}", agent.kind.as_str()))
+}
+
+fn should_reuse_previous(config: &tako_control::setup::SetupConfig) -> bool {
+    if !config.setup.completed {
+        return false;
+    }
+    eprintln!("前回の設定があります。");
+    eprint!("前回の設定をそのまま使う [Enter] / 個別に見直す [r]: ");
+    let mut input = String::new();
+    let _ = std::io::stdin().read_line(&mut input);
+    !input.trim().eq_ignore_ascii_case("r")
+}
+
+fn mark_setup_complete(
+    selected: SetupAgent,
+    plans: &BTreeMap<String, String>,
+) -> Result<u32, String> {
+    let revision = tako_control::setup::current_revision()?;
+    tako_control::setup::mutate_config(|config| {
+        config.setup.completed = true;
+        config.setup.completed_at = Some(now_iso8601());
+        config.setup.applied_revision = revision;
+        config.setup.applied_version = Some(env!("CARGO_PKG_VERSION").to_string());
+        config.setup.selected_agent = Some(selected.as_str().to_string());
+        config.setup.provider_plans = plans.clone();
+    })?;
+    Ok(revision)
 }
 
 // --- メインエントリ ---
@@ -1412,8 +1541,18 @@ pub fn run_setup() -> Result<(), String> {
     eprintln!("═════════════════");
     eprintln!();
 
+    // 前回値をすべての質問より先に読む。破損時は既定値で上書きせず中断する。
+    let config = load_config()?;
+    let is_first_run = !config.setup.completed;
+    let reuse_previous = should_reuse_previous(&config);
+    if reuse_previous {
+        eprintln!("  [previous] 前回の設定を引き継ぎます");
+        eprintln!();
+    }
+
     // 1. エージェント CLI と依存ツールのチェック
-    let (agents, missing) = run_dependency_check(true);
+    // 前回値の引き継ぎ時は設定済み項目を表示だけにして質問しない。
+    let (agents, missing) = run_dependency_check(!reuse_previous);
     if !missing.is_empty() {
         return Err(format!(
             "必須の依存ツールが不足しています: {}。\n\
@@ -1421,7 +1560,11 @@ pub fn run_setup() -> Result<(), String> {
             missing.join(", ")
         ));
     }
-    let selected = select_setup_agent(&agents)?;
+    let selected = select_setup_agent(
+        &agents,
+        config.setup.selected_agent.as_deref(),
+        reuse_previous,
+    )?;
     let selected_agent = agents
         .iter()
         .find(|agent| agent.kind == selected)
@@ -1435,7 +1578,7 @@ pub fn run_setup() -> Result<(), String> {
     }
 
     // 1.5 取得できるプランは自動反映し、不足分だけ対話で補う。
-    let plans = collect_provider_plans(&agents);
+    let plans = collect_provider_plans(&agents, &config.setup.provider_plans, reuse_previous);
 
     // 2. 選択エージェントに応じた MCP 設定
     configure_agent_mcp(selected_agent)?;
@@ -1458,10 +1601,6 @@ pub fn run_setup() -> Result<(), String> {
             .map_err(|e| format!("{filename} の書き出しに失敗: {e}"))?;
     }
 
-    // 4. config.yaml の初回 / 2 回目判定
-    let config = load_config()?;
-    let is_first_run = !config.setup.completed;
-
     // 4.5 アップデート追従（Issue #94）: 前回セットアップ以降に setup へ入った変更を検出。
     // 初回はすべて最新の内容で導入されるため対象外（完了時に最新リビジョンを記録するのみ）
     let pending = if is_first_run {
@@ -1475,31 +1614,50 @@ pub fn run_setup() -> Result<(), String> {
         eprintln!(
             "      詳細を pending-changes.md に書き出しました。選択したエージェントが対話で追従を案内します"
         );
+        if reuse_previous
+            && pending
+                .iter()
+                .any(|change| change.kind == ChangeKind::Guided)
+        {
+            eprintln!(
+                "      [previous] 対話確認が必要な変更は、既存カスタマイズを維持して追従済みとします"
+            );
+        }
     }
     sync_pending_changes_file(&dir, &pending, config.setup.applied_revision)?;
 
     // 5. 検出プランにもとづくプロファイル推奨を生成する。
-    let profile_note = prepare_profile(selected, &agents, &plans)?;
+    let profile_note = prepare_profile(selected, &agents, &plans, reuse_previous)?;
     write_setup_context(&dir, selected, &agents, &plans, profile_note)?;
 
     // 選択エージェントのグローバル指示ファイルが存在すればバックアップする。
-    if let Some(instruction) = instruction_path(selected) {
-        if instruction.is_file() {
-            let parent = instruction.parent().unwrap_or(Path::new("."));
-            let filename = instruction
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy();
-            let backup = find_backup_path(parent, &filename);
-            if let Err(e) = std::fs::copy(&instruction, &backup) {
-                eprintln!("  [警告] {filename} のバックアップに失敗: {e}");
-            } else {
-                eprintln!(
-                    "  [OK] {filename} をバックアップ: {}",
-                    backup.file_name().unwrap_or_default().to_string_lossy()
-                );
+    if !reuse_previous {
+        if let Some(instruction) = instruction_path(selected) {
+            if instruction.is_file() {
+                let parent = instruction.parent().unwrap_or(Path::new("."));
+                let filename = instruction
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                let backup = find_backup_path(parent, &filename);
+                if let Err(e) = std::fs::copy(&instruction, &backup) {
+                    eprintln!("  [警告] {filename} のバックアップに失敗: {e}");
+                } else {
+                    eprintln!(
+                        "  [OK] {filename} をバックアップ: {}",
+                        backup.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                }
             }
         }
+    }
+
+    if reuse_previous {
+        let revision = mark_setup_complete(selected, &plans)?;
+        sync_pending_changes_file(&dir, &[], revision)?;
+        eprintln!();
+        eprintln!("前回の設定を引き継ぎ、セットアップが完了しました。");
+        return Ok(());
     }
 
     eprintln!();
@@ -1527,15 +1685,7 @@ pub fn run_setup() -> Result<(), String> {
         // セットアップ完了を記録（適用済み setup リビジョンを含む。Issue #94）。
         // claude 対話中に他プロセスが config.yaml を更新していても巻き戻さないよう、
         // 完了フィールドだけをロック付き read-modify-write で更新する（#169）
-        let revision = tako_control::setup::current_revision()?;
-        tako_control::setup::mutate_config(|config| {
-            config.setup.completed = true;
-            config.setup.completed_at = Some(now_iso8601());
-            config.setup.applied_revision = revision;
-            config.setup.applied_version = Some(env!("CARGO_PKG_VERSION").to_string());
-            config.setup.selected_agent = Some(selected.as_str().to_string());
-            config.setup.provider_plans = plans.clone();
-        })?;
+        let revision = mark_setup_complete(selected, &plans)?;
         // 追従が完了したので pending-changes.md を消す（stale 防止）
         sync_pending_changes_file(&dir, &[], revision)?;
         eprintln!();
@@ -1722,6 +1872,10 @@ mod tests {
         assert_eq!(choose_setup_agent(&agents, ""), Ok(SetupAgent::Codex));
         assert_eq!(choose_setup_agent(&agents, "3"), Ok(SetupAgent::Agy));
         assert!(choose_setup_agent(&agents, "4").is_err());
+        assert_eq!(
+            select_setup_agent(&agents, Some("agy"), true),
+            Ok(SetupAgent::Agy)
+        );
     }
 
     #[test]
