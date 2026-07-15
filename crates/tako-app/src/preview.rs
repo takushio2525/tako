@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use tako_control::protocol::PreviewModeWire;
-use tako_core::{PreviewOutline, PreviewOutlineItem, PreviewOutlineTarget, SearchHit, TextBuffer};
+use tako_core::{
+    PdfLinks, PreviewOutline, PreviewOutlineItem, PreviewOutlineTarget, SearchHit, TextBuffer,
+};
 
 /// 読み込みの上限（巨大ファイルで UI を固めない。超過分は切り詰めて明示する）
 pub(crate) const MAX_BYTES: usize = 1_000_000;
@@ -154,6 +156,8 @@ pub struct PdfData {
     /// ページごとの実ラスタライズ解像度 [pixel width, pixel height]。
     /// 品質検証とキャッシュ整合性の確認に使う。
     pub pixel_sizes: Vec<[u32; 2]>,
+    /// PDF アノテーションから抽出したリンク一覧（#271。ロード時に 1 回構築）。
+    pub links: Arc<PdfLinks>,
 }
 
 /// PDF 再ラスタライズのキャッシュキー（#231 / #234）。
@@ -471,6 +475,8 @@ pub fn load_pdf_with_key(path: &Path, raster_key: PdfRasterKey) -> PreviewState 
                     .unwrap_or_default();
                 let outline =
                     pdf_render::extract_outline(path, rasterized.total_pages).unwrap_or_default();
+                let links =
+                    pdf_render::extract_links(path, rasterized.total_pages).unwrap_or_default();
                 PreviewState {
                     path: path.to_path_buf(),
                     mode: PreviewMode::Pdf,
@@ -481,6 +487,7 @@ pub fn load_pdf_with_key(path: &Path, raster_key: PdfRasterKey) -> PreviewState 
                         page_sizes: rasterized.page_sizes,
                         raster_key,
                         pixel_sizes: rasterized.pixel_sizes,
+                        links: Arc::new(links),
                     }),
                     outline: Arc::new(outline),
                     truncated: false,
@@ -698,7 +705,9 @@ fn video_thumbnail(path: &Path, duration: Option<f64>) -> Vec<u8> {
 #[cfg(target_os = "macos")]
 mod pdf_render {
     use std::path::Path;
-    use tako_core::{PreviewOutline, PreviewOutlineItem, PreviewOutlineTarget};
+    use tako_core::{
+        PdfLink, PdfLinkTarget, PdfLinks, PreviewOutline, PreviewOutlineItem, PreviewOutlineTarget,
+    };
 
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
@@ -1339,6 +1348,99 @@ mod pdf_render {
             msg_no_arg(pdf_doc, sel_name("release"));
             Ok(result)
         }
+    }
+
+    /// PDFKit のアノテーションからリンク（外部 URL / 内部ページ）を抽出する（#271）。
+    /// ロード時に 1 回だけ呼び、結果を PdfData.links に保持する。
+    pub fn extract_links(path: &Path, total_pages: usize) -> Result<PdfLinks, String> {
+        unsafe {
+            let pdf_doc = open_pdfkit_document(path)?;
+            let mut links = Vec::new();
+
+            for page_idx in 0..total_pages {
+                let page = msg_usize(pdf_doc, sel_name("pageAtIndex:"), page_idx);
+                if page.is_null() {
+                    continue;
+                }
+                let annotations = msg_no_arg(page, sel_name("annotations"));
+                if annotations.is_null() {
+                    continue;
+                }
+                let count = msg_no_arg(annotations, sel_name("count")) as usize;
+                for ann_idx in 0..count {
+                    let annotation = msg_usize(annotations, sel_name("objectAtIndex:"), ann_idx);
+                    if annotation.is_null() {
+                        continue;
+                    }
+                    // アノテーションの bounds を取得（PDF 座標系、左下原点）
+                    let ann_bounds = msg_annotation_bounds(annotation);
+
+                    // linkURL（外部 URL）を試す
+                    let url_obj = msg_no_arg(annotation, sel_name("URL"));
+                    if !url_obj.is_null() {
+                        let abs_string = msg_no_arg(url_obj, sel_name("absoluteString"));
+                        if let Some(url) = nsstring_to_rust(abs_string) {
+                            if !url.is_empty() {
+                                links.push(PdfLink {
+                                    page_index: page_idx,
+                                    bbox: [ann_bounds.x, ann_bounds.y, ann_bounds.w, ann_bounds.h],
+                                    target: PdfLinkTarget::Url { url },
+                                });
+                                continue;
+                            }
+                        }
+                    }
+
+                    // destination（内部リンク）を試す
+                    let destination = msg_no_arg(annotation, sel_name("destination"));
+                    if !destination.is_null() {
+                        let dest_page = msg_no_arg(destination, sel_name("page"));
+                        if !dest_page.is_null() {
+                            let dest_page_index = msg_index_for_page(pdf_doc, dest_page);
+                            if dest_page_index < total_pages {
+                                links.push(PdfLink {
+                                    page_index: page_idx,
+                                    bbox: [ann_bounds.x, ann_bounds.y, ann_bounds.w, ann_bounds.h],
+                                    target: PdfLinkTarget::Page {
+                                        page: dest_page_index + 1,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            msg_no_arg(pdf_doc, sel_name("release"));
+            Ok(PdfLinks::new(links))
+        }
+    }
+
+    /// PDFAnnotation の bounds（NSRect）を取得する。
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn msg_annotation_bounds(annotation: *const core::ffi::c_void) -> NSRect {
+        let f: unsafe extern "C" fn(*const core::ffi::c_void, *const core::ffi::c_void) -> NSRect =
+            std::mem::transmute(objc_msgSend as *const core::ffi::c_void);
+        f(annotation, sel_name("bounds"))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn msg_annotation_bounds(annotation: *const core::ffi::c_void) -> NSRect {
+        extern "C" {
+            fn objc_msgSend_stret(
+                ret: *mut NSRect,
+                receiver: *const core::ffi::c_void,
+                sel: *const core::ffi::c_void,
+            );
+        }
+        let mut result = NSRect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+        };
+        objc_msgSend_stret(&mut result, annotation, sel_name("bounds"));
+        result
     }
 }
 

@@ -71,6 +71,12 @@ enum Command {
     /// Markdown・PDF プレビューのアウトラインを表示し、項目へジャンプする
     #[command(name = "preview-outline")]
     PreviewOutline(PreviewOutlineArgs),
+    /// PDF プレビュー内のリンク一覧を表示する
+    #[command(name = "preview-link-list")]
+    PreviewLinkList(PaneArg),
+    /// PDF プレビュー内のリンクをフォローする（外部 URL はブラウザ、内部はページジャンプ）
+    #[command(name = "preview-follow-link")]
+    PreviewFollowLink(PreviewFollowLinkArgs),
     /// 表示中プレビューファイルのライブリロード ON/OFF・状態確認
     #[command(name = "preview-reload")]
     PreviewReload(ToggleArgs),
@@ -1407,6 +1413,22 @@ struct PreviewOutlineArgs {
     /// ジャンプするアウトライン項目（表示順の 1 始まり。省略時は一覧取得のみ）
     #[arg(long)]
     item: Option<usize>,
+}
+
+#[derive(Args)]
+struct PaneArg {
+    /// 対象ペイン ID（省略時は呼び出し元）
+    #[arg(long)]
+    pane: Option<u64>,
+}
+
+#[derive(Args)]
+struct PreviewFollowLinkArgs {
+    /// 対象ペイン ID（省略時は呼び出し元）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// フォローするリンクのインデックス（0 始まり。preview-link-list の結果で確認）
+    index: usize,
 }
 
 #[derive(Args)]
@@ -2936,6 +2958,13 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane: target_pane(args.pane)?,
             item: args.item,
         },
+        Command::PreviewLinkList(args) => Request::PreviewLinkList {
+            pane: target_pane(args.pane)?,
+        },
+        Command::PreviewFollowLink(args) => Request::PreviewFollowLink {
+            pane: target_pane(args.pane)?,
+            index: args.index,
+        },
         Command::PreviewReload(args) => Request::PreviewReload {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
@@ -4101,6 +4130,8 @@ fn print_result(command: &Command, result: &Value) {
         Command::Open(_) | Command::Preview(_) | Command::PreviewOutline(_) | Command::Edit(_) => {
             println!("{result}")
         }
+        Command::PreviewLinkList(_) => println!("{}", pretty_json(result)),
+        Command::PreviewFollowLink(_) => println!("{result}"),
         Command::PreviewReload(_) | Command::PreviewCache(_) => println!("{result}"),
         Command::Autorename(_)
         | Command::Portdetect(_)

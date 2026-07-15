@@ -807,6 +807,8 @@ struct TakoApp {
     /// PDF 選択の最前面 canvas が直近フレームで発行した矩形数。
     /// selftest が座標計算だけでなく paint 経路まで到達したことを検証する。
     preview_pdf_highlight_paint_count: HashMap<PaneId, usize>,
+    /// PDF リンクのホバー状態（#271）。⌘ 押下中のみ有効。
+    preview_pdf_hovered_link: Option<(PaneId, usize)>,
     /// コード / Markdown の行ごとの GPUI 実描画レイアウト。
     /// 描画と同じ shaping 結果で座標を UTF-8 byte index へ逆写像する。
     preview_text_layouts: HashMap<PaneId, Vec<Option<TextLayout>>>,
@@ -1744,6 +1746,7 @@ impl TakoApp {
             preview_line_bounds: HashMap::new(),
             preview_pdf_char_bounds: HashMap::new(),
             preview_pdf_highlight_paint_count: HashMap::new(),
+            preview_pdf_hovered_link: None,
             preview_text_layouts: HashMap::new(),
             preview_line_texts: HashMap::new(),
             webviews: Vec::new(),
@@ -5314,6 +5317,183 @@ impl TakoApp {
         texts.last().map(|last| (texts.len() - 1, last.len()))
     }
 
+    /// PDF リンクのヒットテスト（#271）。マウス位置にある PDF リンクのインデックスを返す。
+    fn pdf_link_at_position(&self, pane_id: PaneId, position: Point<Pixels>) -> Option<usize> {
+        let state = self.previews.get(&pane_id)?;
+        let data = match &state.content {
+            preview::PreviewContent::Pdf(data) => data,
+            _ => return None,
+        };
+        if data.links.is_empty() {
+            return None;
+        }
+        let view = self
+            .preview_views
+            .get(&pane_id)
+            .copied()
+            .unwrap_or_default();
+        let page_idx = view.page.saturating_sub(1);
+        let page_size = data.page_sizes.get(page_idx)?;
+        let image_bounds = self.estimate_pdf_page_bounds(pane_id, page_idx, data)?;
+
+        for (link_idx, link) in data.links.links.iter().enumerate() {
+            if link.page_index != page_idx {
+                continue;
+            }
+            let screen_bounds =
+                preview_render::pdf_box_to_screen(link.bbox, *page_size, image_bounds);
+            if screen_bounds.contains(&position) {
+                return Some(link_idx);
+            }
+        }
+        None
+    }
+
+    /// PDF ページ画像のビューポート座標 bounds を推算する（#271）。
+    /// テキストレイヤの行 bounds から逆算するか、行がなければ None。
+    fn estimate_pdf_page_bounds(
+        &self,
+        pane_id: PaneId,
+        page_idx: usize,
+        data: &preview::PdfData,
+    ) -> Option<Bounds<Pixels>> {
+        let line_bounds = self.preview_line_bounds.get(&pane_id)?;
+        let page_size = data.page_sizes.get(page_idx)?;
+        // ページのテキストレイヤ先頭行のオフセットを求める
+        let mut line_offset = 0usize;
+        for (pi, page_lines) in data.text_layers.iter().enumerate() {
+            if pi == page_idx {
+                break;
+            }
+            line_offset += page_lines.len();
+        }
+        let page_text = data.text_layers.get(page_idx)?;
+        // テキストレイヤの bbox から画像 bounds を逆算する:
+        // PDF 座標(左下原点) → スクリーン座標(左上原点) の変換は pdf_box_to_screen で行う。
+        // image_bounds = ページ画像全体の矩形。
+        // 任意のテキスト行: screen.origin.x = image.origin.x + bbox.x * scale_x
+        // → image.origin.x = screen.origin.x - bbox.x * scale_x
+        // scale_x = image.width / page_size.width
+        // → image.origin.x = screen.origin.x - bbox.x * image.width / page_size.width
+        // この循環を、全ページの bbox [0,0,w,h] として解くと:
+        // ページ全体 = bbox [0, 0, page_w, page_h] のスクリーン化
+        // ただし直接 image_bounds がわからない。
+        //
+        // 代替アプローチ: テキストの行 bounds の上下端からページ画像の上端と高さを推定し、
+        // ページの幅はアスペクト比から求める。ただしテキストが無い場合は判定不能。
+        if page_text.is_empty() {
+            return None;
+        }
+        // 全行の bounds の包含矩形を求める
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        let mut pdf_min_x = f64::MAX;
+        let mut pdf_min_y = f64::MAX;
+        let mut pdf_max_x = f64::MIN;
+        let mut pdf_max_y = f64::MIN;
+        for (i, tl) in page_text.iter().enumerate() {
+            if let Some(lb) = line_bounds.get(line_offset + i) {
+                let lx = f32::from(lb.origin.x);
+                let ly = f32::from(lb.origin.y);
+                let lw = f32::from(lb.size.width);
+                let lh = f32::from(lb.size.height);
+                if lw > 0.0 && lh > 0.0 {
+                    min_x = min_x.min(lx);
+                    min_y = min_y.min(ly);
+                    max_x = max_x.max(lx + lw);
+                    max_y = max_y.max(ly + lh);
+                    // 対応する PDF 座標の bbox
+                    pdf_min_x = pdf_min_x.min(tl.bbox[0]);
+                    // PDF 左下原点 → 上端: page_h - (y + h)
+                    let pdf_top = page_size[1] - tl.bbox[1] - tl.bbox[3];
+                    pdf_min_y = pdf_min_y.min(pdf_top);
+                    pdf_max_x = pdf_max_x.max(tl.bbox[0] + tl.bbox[2]);
+                    pdf_max_y = pdf_max_y.max(pdf_top + tl.bbox[3]);
+                }
+            }
+        }
+        if min_x >= max_x || min_y >= max_y || pdf_min_x >= pdf_max_x || pdf_min_y >= pdf_max_y {
+            return None;
+        }
+        // テキスト群のスクリーン範囲と PDF 座標範囲からスケールを算出
+        let screen_w = max_x - min_x;
+        let pdf_w = (pdf_max_x - pdf_min_x) as f32;
+        if pdf_w <= 0.0 {
+            return None;
+        }
+        let scale = screen_w / pdf_w;
+        // ページ画像の origin を逆算
+        let img_x = min_x - pdf_min_x as f32 * scale;
+        let img_y = min_y - pdf_min_y as f32 * scale;
+        let img_w = page_size[0] as f32 * scale;
+        let img_h = page_size[1] as f32 * scale;
+        Some(Bounds {
+            origin: point(px(img_x), px(img_y)),
+            size: gpui::size(px(img_w), px(img_h)),
+        })
+    }
+
+    /// PDF プレビューのリンクホバー状態を更新する（#271）。
+    fn update_pdf_link_hover(
+        &mut self,
+        position: Point<Pixels>,
+        cmd_held: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let old = self.preview_pdf_hovered_link;
+        if !cmd_held {
+            if old.is_some() {
+                self.preview_pdf_hovered_link = None;
+                cx.notify();
+            }
+            return;
+        }
+        let pane_id = self.focused_pane();
+        let found = self
+            .pdf_link_at_position(pane_id, position)
+            .map(|idx| (pane_id, idx));
+        if found != old {
+            self.preview_pdf_hovered_link = found;
+            cx.notify();
+        }
+    }
+
+    /// PDF リンクをフォローする（#271）。外部 URL はブラウザ、内部リンクはページジャンプ。
+    fn follow_pdf_link(&mut self, pane_id: PaneId, link_idx: usize, cx: &mut Context<Self>) {
+        let state = match self.previews.get(&pane_id) {
+            Some(s) => s,
+            None => return,
+        };
+        let data = match &state.content {
+            preview::PreviewContent::Pdf(data) => data,
+            _ => return,
+        };
+        let link = match data.links.links.get(link_idx) {
+            Some(l) => l,
+            None => return,
+        };
+        match &link.target {
+            tako_core::PdfLinkTarget::Url { url } => {
+                let _ = std::process::Command::new("open").arg(url).spawn();
+            }
+            tako_core::PdfLinkTarget::Page { page } => {
+                if let Err(e) = <TakoApp as PreviewHost>::update_preview_view(
+                    self,
+                    pane_id,
+                    tako_core::PreviewViewUpdate {
+                        page: Some(*page),
+                        ..tako_core::PreviewViewUpdate::default()
+                    },
+                ) {
+                    eprintln!("warning: PDF ページジャンプ失敗: {e}");
+                }
+            }
+        }
+        cx.notify();
+    }
+
     fn refresh_preview_from_editor(&mut self, pane_id: PaneId) {
         let (previews, edits) = (&mut self.previews, &self.preview_edits);
         if let (Some(state), Some(edit)) = (previews.get_mut(&pane_id), edits.get(&pane_id)) {
@@ -6871,6 +7051,8 @@ impl TakoApp {
     ) {
         // cmd+ホバーでリンク検出（ボタン押下状態に関係なく判定）
         self.update_hovered_link_at(event.position, event.modifiers.platform, window, cx);
+        // PDF プレビューのリンクホバー（#271）
+        self.update_pdf_link_hover(event.position, event.modifiers.platform, cx);
 
         if event.pressed_button != Some(MouseButton::Left) {
             // ウィンドウ外でボタンが離されると MouseUp が届かないことがある。
@@ -7028,6 +7210,8 @@ impl TakoApp {
             window,
             cx,
         );
+        // PDF プレビューのリンクホバーも更新（#271）
+        self.update_pdf_link_hover(window.mouse_position(), event.modifiers.platform, cx);
     }
 
     /// ペインのリンク検出キャッシュを更新する
@@ -10550,6 +10734,59 @@ impl PreviewHost for TakoApp {
             }
         }
         Ok(target)
+    }
+
+    fn preview_pdf_links(&self, pane: PaneId) -> Option<tako_core::PdfLinks> {
+        let preview = self.previews.get(&pane)?;
+        let data = match &preview.content {
+            preview::PreviewContent::Pdf(data) => data,
+            _ => return None,
+        };
+        Some((*data.links).clone())
+    }
+
+    fn follow_preview_pdf_link(
+        &mut self,
+        pane: PaneId,
+        index: usize,
+    ) -> Result<serde_json::Value, String> {
+        let preview = self
+            .previews
+            .get(&pane)
+            .ok_or_else(|| "プレビューペインではない".to_string())?;
+        let data = match &preview.content {
+            preview::PreviewContent::Pdf(data) => data,
+            _ => return Err("PDF プレビューではない".into()),
+        };
+        let link = data
+            .links
+            .links
+            .get(index)
+            .ok_or_else(|| format!("リンクインデックス範囲外: {index}"))?;
+        match &link.target {
+            tako_core::PdfLinkTarget::Url { url } => {
+                let _ = std::process::Command::new("open").arg(url).spawn();
+                Ok(serde_json::json!({
+                    "pane": pane.as_u64(),
+                    "action": "opened_url",
+                    "url": url,
+                }))
+            }
+            tako_core::PdfLinkTarget::Page { page } => {
+                let page = *page;
+                let handle = self.preview_scroll_handles.entry(pane).or_default().clone();
+                handle.scroll_to_top_of_item(page - 1);
+                let mut view = self.preview_views.get(&pane).copied().unwrap_or_default();
+                view.page = page;
+                view.pan_y = 0.0;
+                self.preview_views.insert(pane, view);
+                Ok(serde_json::json!({
+                    "pane": pane.as_u64(),
+                    "action": "jumped_to_page",
+                    "page": page,
+                }))
+            }
+        }
     }
 
     fn video_playback(&mut self, pane: PaneId, action: &str) -> Result<String, String> {
@@ -14090,7 +14327,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 89, "MCP tools/list は 89 ツール");
+            check(status == 200 && tool_count == 91, "MCP tools/list は 91 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
