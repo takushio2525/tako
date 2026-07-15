@@ -744,6 +744,23 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_preview_cache",
+            "description": "PDF・画像・動画サムネのデコード済み画像キャッシュをバイト予算つき LRU で管理する。\
+                max_mb 省略時は現在の上限・使用 bytes・entry 数を返す。変更値は settings.json に永続化する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "max_mb": {
+                        "type": "integer",
+                        "minimum": 256,
+                        "maximum": 8192,
+                        "description": "キャッシュ上限（MiB、既定 512）"
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_preview_edit",
             "description": "コードプレビューの編集モードを開始・終了する。enabled 省略時は状態取得。\
                 PDF・画像・動画・末尾省略された巨大ファイルは編集できない。状態は editing / dirty で返す。",
@@ -2327,6 +2344,9 @@ fn build_request(
         "tako_preview_reload" => Request::PreviewReload {
             enabled: bool_arg(args, "enabled")?,
         },
+        "tako_preview_cache" => Request::PreviewCache {
+            max_mb: u64_arg(args, "max_mb")?,
+        },
         "tako_preview_edit" => Request::PreviewEdit {
             pane: Some(target_pane(args, caller)?),
             enabled: bool_arg(args, "enabled")?,
@@ -3401,9 +3421,22 @@ mod tests {
     }
 
     #[test]
+    fn preview_cacheは状態取得と上限変更をrequestへ写す() {
+        let (_, requests) = run(call("tako_preview_cache", json!({})), None, true);
+        assert_eq!(requests, vec![Request::PreviewCache { max_mb: None }]);
+
+        let (_, requests) = run(
+            call("tako_preview_cache", json!({ "max_mb": 768 })),
+            None,
+            true,
+        );
+        assert_eq!(requests, vec![Request::PreviewCache { max_mb: Some(768) }]);
+    }
+
+    #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 87);
+        assert_eq!(tools.len(), 88);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

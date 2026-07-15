@@ -19,6 +19,9 @@ pub struct Settings {
     /// 表示中プレビューファイルのライブリロード（Issue #233。既定 ON）
     #[serde(default = "default_true")]
     pub preview_live_reload: bool,
+    /// PDF・画像・動画サムネのデコード済み画像キャッシュ上限（Issue #258。MiB）
+    #[serde(default = "default_preview_cache_max_mb")]
+    pub preview_cache_max_mb: u64,
     /// tmux バックエンドによるセッション永続化（Phase 5.5 / FR-5。既定 ON。
     /// tmux 不在環境では設定に関わらず直接 spawn へ無害劣化する）
     #[serde(default = "default_true")]
@@ -62,12 +65,17 @@ fn default_pane_log_total_max_mb() -> u64 {
     200
 }
 
+fn default_preview_cache_max_mb() -> u64 {
+    tako_core::PREVIEW_CACHE_DEFAULT_MB
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             auto_rename: true,
             port_detect: true,
             preview_live_reload: true,
+            preview_cache_max_mb: default_preview_cache_max_mb(),
             tmux_persist: true,
             sleep_guard_mode: crate::sleep_guard::SleepGuardMode::default(),
             sleep_guard_power: crate::sleep_guard::PowerCondition::default(),
@@ -156,6 +164,7 @@ mod tests {
             auto_rename: false,
             port_detect: false,
             preview_live_reload: false,
+            preview_cache_max_mb: 768,
             tmux_persist: false,
             sleep_guard_mode: crate::sleep_guard::SleepGuardMode::On,
             sleep_guard_power: crate::sleep_guard::PowerCondition::Always,
@@ -179,6 +188,7 @@ mod tests {
         assert!(parsed.auto_rename);
         assert!(parsed.port_detect);
         assert!(parsed.preview_live_reload);
+        assert_eq!(parsed.preview_cache_max_mb, 512);
         assert!(parsed.tmux_persist);
         assert_eq!(
             parsed.sleep_guard_mode,

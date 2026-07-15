@@ -753,3 +753,17 @@
 ## 2026-07-15（#233: プレビューライブリロード）
 - OS ネイティブ監視 + 300ms デバウンス + background 再生成を実装し、編集競合保護と CLI / MCP（全 80 ツール）を 1:1 公開
 - 連続 6 write を 1 回・427ms で反映、状態保持、削除 / rename / 巨大ファイル / PNG / PDF、UI 専有 0ms 水準を隔離実測。全検証と全 diff レビューを完了
+
+## 2026-07-15（#258: アプリ全体メモリ監査・調査マイルストーン）
+- 6ページPDFの倍率世代で0.48GB→2.63GB、`MALLOC_LARGE` 1.30GB + graphics 1.08GBを実測。旧GPUI asset未除去が主因で、71ページ・同6世代は約27.35GiB相当
+- ライブリロード8回でラスタライズ7本並行・RSS最大808,656KiB。BG退避/closeは解放なし、端末・sessions・logs・worker eventsはGB級原因でないと切り分け
+- 次: 512MiB既定のバイト予算付きLRU + GPUI eviction、可視近傍デコード、reload single-flightを実装
+
+## 2026-07-15（#258: メモリ上限・解放修正マイルストーン）
+- 512MiB既定のバイト予算付きLRU、PDF可視近傍3ページ遅延デコード、GPUI CPU asset + GPU atlas明示解放、旧動画frame解放を実装
+- ライブリロードをpane/path単位single-flight + 最新1件へ直列化し、未回収run履歴256件上限・pane補助cache close cleanupを追加
+- dispatch / CLI `preview-cache` / MCPを1:1公開。app 91・CLI 25・control 425・core 276件の対象テスト全緑
+
+## 2026-07-15（#258: メモリ安定性検証マイルストーン）
+- PDFズーム・ページ移動・ライブリロード30サイクルでfootprint peak 795MB横ばい、終了後RSS 84,816KiB、close後68,672KiB / LRU 0 bytesを実測
+- #257統合後の追加21サイクルもpeak 812MB横ばい・RSS傾き負、render p95 / p99最大6ms。全品質ゲート + 隔離セルフテスト完走

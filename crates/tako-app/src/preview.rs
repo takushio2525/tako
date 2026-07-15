@@ -105,6 +105,8 @@ pub enum MdBlock {
 pub struct ImageData {
     pub bytes: Vec<u8>,
     pub format: ImageFileFormat,
+    /// ヘッダだけから取得したデコード後の pixel size。SVG など取得不能時は None。
+    pub pixel_size: Option<(u32, u32)>,
 }
 
 /// 対応画像フォーマット（GPUI の ImageFormat と 1:1 だが GPUI 非依存にする）
@@ -136,7 +138,7 @@ pub struct PdfTextLine {
     pub char_boxes: Vec<PdfCharBox>,
 }
 
-/// PDF データ（全ページの PNG を保持し、スクロールで閲覧）
+/// PDF データ（全ページの圧縮 PNG を保持し、表示近傍だけデコードして閲覧）
 #[derive(Debug, Clone, PartialEq)]
 pub struct PdfData {
     /// 各ページの PNG バイト列（Core Graphics でレンダリング済み）
@@ -431,19 +433,29 @@ pub fn load_image(path: &Path) -> PreviewState {
                 bytes.len() as f64 / 1_000_000.0
             ),
         ),
-        Ok(bytes) => PreviewState {
-            path: path.to_path_buf(),
-            mode: PreviewMode::Image,
-            content: PreviewContent::Image(ImageData { bytes, format }),
-            outline: Arc::new(PreviewOutline::default()),
-            truncated: false,
-            file_stamp: FileStamp::from_path(path),
-        },
+        Ok(bytes) => {
+            let pixel_size = image::ImageReader::new(std::io::Cursor::new(&bytes))
+                .with_guessed_format()
+                .ok()
+                .and_then(|reader| reader.into_dimensions().ok());
+            PreviewState {
+                path: path.to_path_buf(),
+                mode: PreviewMode::Image,
+                content: PreviewContent::Image(ImageData {
+                    bytes,
+                    format,
+                    pixel_size,
+                }),
+                outline: Arc::new(PreviewOutline::default()),
+                truncated: false,
+                file_stamp: FileStamp::from_path(path),
+            }
+        }
         Err(e) => PreviewState::error(path, PreviewMode::Image, format!("読み込めない: {e}")),
     }
 }
 
-/// PDF の全ページをレンダリングして PreviewState を返す。
+/// PDF の全ページを圧縮 PNG へレンダリングして PreviewState を返す。
 /// Core Graphics FFI で描画する（macOS のみ）
 pub fn load_pdf(path: &Path, _page: usize) -> PreviewState {
     load_pdf_with_key(path, PdfRasterKey::for_view(2.0, 1.0, 612.0))

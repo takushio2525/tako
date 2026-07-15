@@ -16,16 +16,45 @@ use super::*;
 pub(crate) struct PreviewImageCache {
     key: PreviewImageCacheKey,
     /// PDF: ページごと（描画失敗の空ページは None）。画像 / サムネ: 先頭 1 要素
-    images: Vec<Option<std::sync::Arc<gpui::Image>>>,
+    images: Vec<Option<CachedPreviewImage>>,
     /// PDF テキストレイヤのページごと Arc（paint の canvas クロージャへ毎フレーム
     /// move する分を to_vec から Arc clone に置き換える）
     text_layers: Vec<std::sync::Arc<Vec<preview::PdfTextLine>>>,
+}
+
+pub(crate) struct CachedPreviewImage {
+    image: std::sync::Arc<gpui::Image>,
+    decoded_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PreviewImageCacheEntryKey {
+    pane: PaneId,
+    index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PreviewImageCacheKey {
     Original(PathBuf),
     Pdf(PathBuf, preview::PdfRasterKey),
+}
+
+/// 表示ページの前後を先に、表示ページ自身を最後に返す。
+/// LRU 予算が近傍 3 ページ分に満たない場合も表示ページを残すための順序。
+fn wanted_pdf_image_indices(current: usize, total: usize) -> Vec<usize> {
+    if total == 0 {
+        return Vec::new();
+    }
+    let current = current.min(total - 1);
+    let mut wanted = Vec::with_capacity(3);
+    if current > 0 {
+        wanted.push(current - 1);
+    }
+    if current + 1 < total {
+        wanted.push(current + 1);
+    }
+    wanted.push(current);
+    wanted
 }
 
 /// PDFKit の文字矩形キャッシュから、現在の UTF-8 選択範囲に含まれる描画矩形を返す。
@@ -188,6 +217,14 @@ mod pdf_hit_test_tests {
 
         assert_eq!(actual, bounds(-12.0, -132.0, 216.0, 108.0));
     }
+
+    #[test]
+    fn pdf画像は表示近傍だけを表示ページ優先順で要求する() {
+        assert_eq!(wanted_pdf_image_indices(3, 10), vec![2, 4, 3]);
+        assert_eq!(wanted_pdf_image_indices(0, 10), vec![1, 0]);
+        assert_eq!(wanted_pdf_image_indices(9, 10), vec![8, 9]);
+        assert!(wanted_pdf_image_indices(0, 0).is_empty());
+    }
 }
 
 impl TakoApp {
@@ -271,7 +308,8 @@ impl TakoApp {
                                         data.raster_key = request.key;
                                         // キャッシュは除去しない。ensure_preview_image_cache が
                                         // 次フレームで raster_key の不一致を検出して再構築する。
-                                        // 旧キャッシュは再構築完了まで表示に使われる。(#257)
+                                        // 旧キャッシュは再構築開始まで表示に使い、差し替え時に
+                                        // #258 の LRU / GPUI eviction へ送る。(#257 / #258)
                                         cx.notify();
                                     }
                                 }
@@ -622,15 +660,69 @@ impl TakoApp {
             })
             .collect()
     }
-    /// プレビュー描画用の画像キャッシュを整える（Issue #168）。
-    /// path が変わったとき（別ファイルを開いた・開き直した）だけ再構築し、
-    /// それ以外のフレームは既存の Arc をそのまま使う
-    fn ensure_preview_image_cache(&mut self, pane_id: PaneId) {
-        let Some(state) = self.previews.get(&pane_id) else {
-            self.preview_image_cache.remove(&pane_id);
+    /// ペインの画像キャッシュを論理 LRU と GPUI 解放待ちへ移す（Issue #258）。
+    pub(crate) fn remove_preview_image_cache(&mut self, pane_id: PaneId) {
+        let Some(cache) = self.preview_image_cache.remove(&pane_id) else {
             return;
         };
-        if self.preview_image_cache.get(&pane_id).is_some_and(|cache| {
+        for (index, cached) in cache.images.into_iter().enumerate() {
+            self.preview_image_lru.remove(&PreviewImageCacheEntryKey {
+                pane: pane_id,
+                index,
+            });
+            if let Some(cached) = cached {
+                self.pending_preview_image_evictions.push(cached.image);
+            }
+        }
+    }
+
+    pub(crate) fn evict_preview_image_keys(&mut self, keys: Vec<PreviewImageCacheEntryKey>) {
+        for key in keys {
+            let Some(cached) = self
+                .preview_image_cache
+                .get_mut(&key.pane)
+                .and_then(|cache| cache.images.get_mut(key.index))
+                .and_then(Option::take)
+            else {
+                continue;
+            };
+            self.pending_preview_image_evictions.push(cached.image);
+        }
+    }
+
+    /// GPUI の CPU asset と GPU sprite atlas を同じフレームで除去する。
+    pub(crate) fn drain_preview_image_evictions(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for image in std::mem::take(&mut self.pending_preview_image_evictions) {
+            let render_image = image.clone().get_render_image(window, cx);
+            image.remove_asset(cx);
+            if let Some(render_image) = render_image {
+                cx.drop_image(render_image, Some(window));
+            }
+        }
+        for frame in std::mem::take(&mut self.pending_video_frame_evictions) {
+            cx.drop_image(frame, Some(window));
+        }
+    }
+
+    pub(crate) fn remove_video_frame_cache(&mut self, pane_id: PaneId) {
+        if let Some((_, frame)) = self.video_frame_cache.remove(&pane_id) {
+            self.pending_video_frame_evictions.push(frame);
+        }
+    }
+
+    /// 必要なページだけプレビュー画像キャッシュへ遅延追加する（Issue #168 / #258）。
+    /// PDF は現在ページの近傍以外を `gpui::Image` 化せず、デコード済み BGRA 推定値を
+    /// バイト予算つき LRU へ計上する。
+    fn ensure_preview_image_cache(&mut self, pane_id: PaneId, wanted: &[usize]) {
+        let Some(state) = self.previews.get(&pane_id) else {
+            self.remove_preview_image_cache(pane_id);
+            return;
+        };
+        let cache_matches = self.preview_image_cache.get(&pane_id).is_some_and(|cache| {
             match (&cache.key, &state.content) {
                 (PreviewImageCacheKey::Pdf(path, key), preview::PreviewContent::Pdf(data)) => {
                     path == &state.path && *key == data.raster_key
@@ -638,66 +730,117 @@ impl TakoApp {
                 (PreviewImageCacheKey::Original(path), _) => path == &state.path,
                 _ => false,
             }
-        }) {
-            return;
+        });
+        if !cache_matches {
+            let key_and_lengths = match &state.content {
+                preview::PreviewContent::Pdf(data) => Some((
+                    PreviewImageCacheKey::Pdf(state.path.clone(), data.raster_key),
+                    data.pages.len(),
+                    data.text_layers
+                        .iter()
+                        .map(|lines| std::sync::Arc::new(lines.clone()))
+                        .collect(),
+                )),
+                preview::PreviewContent::Image(_) => Some((
+                    PreviewImageCacheKey::Original(state.path.clone()),
+                    1,
+                    Vec::new(),
+                )),
+                preview::PreviewContent::Video(data) if !data.thumbnail.is_empty() => Some((
+                    PreviewImageCacheKey::Original(state.path.clone()),
+                    1,
+                    Vec::new(),
+                )),
+                _ => None,
+            };
+            self.remove_preview_image_cache(pane_id);
+            if let Some((key, image_count, text_layers)) = key_and_lengths {
+                self.preview_image_cache.insert(
+                    pane_id,
+                    PreviewImageCache {
+                        key,
+                        images: std::iter::repeat_with(|| None).take(image_count).collect(),
+                        text_layers,
+                    },
+                );
+            }
         }
-        let built = match &state.content {
-            preview::PreviewContent::Pdf(data) => Some(PreviewImageCache {
-                key: PreviewImageCacheKey::Pdf(state.path.clone(), data.raster_key),
-                images: data
-                    .pages
-                    .iter()
-                    .map(|png| {
-                        (!png.is_empty()).then(|| {
-                            std::sync::Arc::new(gpui::Image::from_bytes(
-                                gpui::ImageFormat::Png,
-                                png.clone(),
-                            ))
-                        })
+
+        for &index in wanted {
+            let entry_key = PreviewImageCacheEntryKey {
+                pane: pane_id,
+                index,
+            };
+            if self
+                .preview_image_cache
+                .get(&pane_id)
+                .and_then(|cache| cache.images.get(index))
+                .is_some_and(Option::is_some)
+            {
+                self.preview_image_lru.touch(&entry_key);
+                continue;
+            }
+
+            let built = match self.previews.get(&pane_id).map(|state| &state.content) {
+                Some(preview::PreviewContent::Pdf(data)) => data.pages.get(index).and_then(|png| {
+                    (!png.is_empty()).then(|| CachedPreviewImage {
+                        image: std::sync::Arc::new(gpui::Image::from_bytes(
+                            gpui::ImageFormat::Png,
+                            png.clone(),
+                        )),
+                        decoded_bytes: data
+                            .pixel_sizes
+                            .get(index)
+                            .map(|[w, h]| u64::from(*w) * u64::from(*h) * 4)
+                            .unwrap_or(png.len() as u64),
                     })
-                    .collect(),
-                text_layers: data
-                    .text_layers
-                    .iter()
-                    .map(|lines| std::sync::Arc::new(lines.clone()))
-                    .collect(),
-            }),
-            preview::PreviewContent::Image(data) => {
-                let gpui_format = match data.format {
-                    preview::ImageFileFormat::Png => gpui::ImageFormat::Png,
-                    preview::ImageFileFormat::Jpeg => gpui::ImageFormat::Jpeg,
-                    preview::ImageFileFormat::Gif => gpui::ImageFormat::Gif,
-                    preview::ImageFileFormat::WebP => gpui::ImageFormat::Webp,
-                    preview::ImageFileFormat::Svg => gpui::ImageFormat::Svg,
-                };
-                Some(PreviewImageCache {
-                    key: PreviewImageCacheKey::Original(state.path.clone()),
-                    images: vec![Some(std::sync::Arc::new(gpui::Image::from_bytes(
-                        gpui_format,
-                        data.bytes.clone(),
-                    )))],
-                    text_layers: Vec::new(),
-                })
+                }),
+                Some(preview::PreviewContent::Image(data)) => {
+                    let gpui_format = match data.format {
+                        preview::ImageFileFormat::Png => gpui::ImageFormat::Png,
+                        preview::ImageFileFormat::Jpeg => gpui::ImageFormat::Jpeg,
+                        preview::ImageFileFormat::Gif => gpui::ImageFormat::Gif,
+                        preview::ImageFileFormat::WebP => gpui::ImageFormat::Webp,
+                        preview::ImageFileFormat::Svg => gpui::ImageFormat::Svg,
+                    };
+                    Some(CachedPreviewImage {
+                        image: std::sync::Arc::new(gpui::Image::from_bytes(
+                            gpui_format,
+                            data.bytes.clone(),
+                        )),
+                        decoded_bytes: data
+                            .pixel_size
+                            .map(|(w, h)| u64::from(w) * u64::from(h) * 4)
+                            .unwrap_or(data.bytes.len() as u64),
+                    })
+                }
+                Some(preview::PreviewContent::Video(data)) if !data.thumbnail.is_empty() => {
+                    Some(CachedPreviewImage {
+                        image: std::sync::Arc::new(gpui::Image::from_bytes(
+                            gpui::ImageFormat::Png,
+                            data.thumbnail.clone(),
+                        )),
+                        decoded_bytes: data
+                            .resolution
+                            .map(|(w, h)| u64::from(w) * u64::from(h) * 4)
+                            .unwrap_or(data.thumbnail.len() as u64),
+                    })
+                }
+                _ => None,
+            };
+            let Some(cached) = built else {
+                continue;
+            };
+            let decoded_bytes = cached.decoded_bytes;
+            if let Some(slot) = self
+                .preview_image_cache
+                .get_mut(&pane_id)
+                .and_then(|cache| cache.images.get_mut(index))
+            {
+                *slot = Some(cached);
             }
-            preview::PreviewContent::Video(data) if !data.thumbnail.is_empty() => {
-                Some(PreviewImageCache {
-                    key: PreviewImageCacheKey::Original(state.path.clone()),
-                    images: vec![Some(std::sync::Arc::new(gpui::Image::from_bytes(
-                        gpui::ImageFormat::Png,
-                        data.thumbnail.clone(),
-                    )))],
-                    text_layers: Vec::new(),
-                })
-            }
-            _ => None,
-        };
-        match built {
-            Some(cache) => {
-                self.preview_image_cache.insert(pane_id, cache);
-            }
-            None => {
-                self.preview_image_cache.remove(&pane_id);
-            }
+            let evicted = self.preview_image_lru.insert(entry_key, decoded_bytes);
+            self.evict_preview_image_keys(evicted);
         }
     }
 
@@ -711,7 +854,28 @@ impl TakoApp {
     ) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme.clone();
         self.ensure_pdf_raster_quality(pane_id, area, cx);
-        self.ensure_preview_image_cache(pane_id);
+        let wanted_images: Vec<usize> = match self.previews.get(&pane_id).map(|p| &p.content) {
+            Some(preview::PreviewContent::Pdf(data)) => {
+                let current = self
+                    .preview_scroll_handles
+                    .get(&pane_id)
+                    .filter(|handle| handle.bounds_for_item(0).is_some())
+                    .map(gpui::ScrollHandle::top_item)
+                    .unwrap_or_else(|| {
+                        self.preview_views
+                            .get(&pane_id)
+                            .map(|view| view.page.saturating_sub(1))
+                            .unwrap_or(0)
+                    })
+                    .min(data.total_pages.saturating_sub(1));
+                wanted_pdf_image_indices(current, data.total_pages)
+            }
+            Some(preview::PreviewContent::Image(_)) | Some(preview::PreviewContent::Video(_)) => {
+                vec![0]
+            }
+            _ => Vec::new(),
+        };
+        self.ensure_preview_image_cache(pane_id, &wanted_images);
         let state = self.previews.get(&pane_id).expect("呼び出し前に確認済み");
         let file_name = state.file_name();
         let path_label = state.path.display().to_string();
@@ -921,7 +1085,7 @@ impl TakoApp {
                     .preview_image_cache
                     .get(&pane_id)
                     .and_then(|c| c.images.first())
-                    .and_then(|i| i.clone());
+                    .and_then(|i| i.as_ref().map(|cached| cached.image.clone()));
                 match image {
                     Some(image) => {
                         let scaled_width = viewport_width * preview_zoom;
@@ -977,9 +1141,10 @@ impl TakoApp {
                     .map(|(i, _)| {
                         // ensure_preview_image_cache 直後なので None は起きない想定
                         // （防御: 欠損時は空要素を返し、次フレームの再構築に任せる）
-                        let Some(image) = cache.images.get(i).and_then(|img| img.clone()) else {
-                            return div().into_any_element();
-                        };
+                        let image = cache
+                            .images
+                            .get(i)
+                            .and_then(|img| img.as_ref().map(|cached| cached.image.clone()));
                         let page_text_lines = data.text_layers.get(i);
                         let page_size = data.page_sizes.get(i).copied().unwrap_or([612.0, 792.0]);
                         let page_line_offset = line_offset;
@@ -1081,6 +1246,21 @@ impl TakoApp {
                         .left_0()
                         .size_full();
 
+                        let mut surface = div()
+                            .relative()
+                            .w(px(scaled_page_width))
+                            .h(px(scaled_page_height))
+                            .bg(hsla(theme.background));
+                        if let Some(image) = image {
+                            surface = surface
+                                .child(
+                                    gpui::img(image)
+                                        .object_fit(gpui::ObjectFit::Contain)
+                                        .size_full(),
+                                )
+                                .child(overlay);
+                        }
+
                         div()
                             .flex()
                             .flex_col()
@@ -1099,18 +1279,7 @@ impl TakoApp {
                                         data.total_pages
                                     ))),
                             )
-                            .child(
-                                div()
-                                    .relative()
-                                    .w(px(scaled_page_width))
-                                    .h(px(scaled_page_height))
-                                    .child(
-                                        gpui::img(image)
-                                            .object_fit(gpui::ObjectFit::Contain)
-                                            .size_full(),
-                                    )
-                                    .child(overlay),
-                            )
+                            .child(surface)
                             .into_any_element()
                     })
                     .collect()
@@ -1133,7 +1302,11 @@ impl TakoApp {
                         {
                             let frame = image::Frame::new(rgba_img);
                             let render = std::sync::Arc::new(gpui::RenderImage::new(vec![frame]));
-                            self.video_frame_cache.insert(pane_id, (gen, render));
+                            if let Some((_, old)) =
+                                self.video_frame_cache.insert(pane_id, (gen, render))
+                            {
+                                self.pending_video_frame_evictions.push(old);
+                            }
                         }
                     }
                     if let Some((_, ref frame_image)) = self.video_frame_cache.get(&pane_id) {
@@ -1439,7 +1612,7 @@ impl TakoApp {
                         .preview_image_cache
                         .get(&pane_id)
                         .and_then(|c| c.images.first())
-                        .and_then(|i| i.clone())
+                        .and_then(|i| i.as_ref().map(|cached| cached.image.clone()))
                     {
                         // Issue #168: サムネもキャッシュ済み Arc を使う（毎フレームの
                         // from_bytes ハッシュ計算を避ける）

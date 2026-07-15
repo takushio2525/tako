@@ -1219,6 +1219,19 @@ fn dispatch_inner(
             }
             Ok(json!({ "enabled": host.preview_reload_enabled() }))
         }
+        Request::PreviewCache { max_mb } => {
+            if let Some(max_mb) = max_mb {
+                let max_bytes =
+                    tako_core::preview_cache_bytes(max_mb).map_err(DispatchError::InvalidParams)?;
+                host.set_preview_cache_budget(max_bytes);
+            }
+            let stats = host.preview_cache_stats();
+            Ok(json!({
+                "max_mb": stats.max_bytes / 1024 / 1024,
+                "used_bytes": stats.used_bytes,
+                "entries": stats.entries,
+            }))
+        }
         Request::PreviewEdit { pane, enabled } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
             if host.preview_state(target).is_none() {
@@ -4610,6 +4623,7 @@ mod tests {
         /// #217: UI テーマモード
         theme_mode: tako_core::theme::ThemeMode,
         preview_reload: tako_core::PreviewReloadState,
+        preview_cache: tako_core::PreviewCacheStats,
     }
 
     impl MockHost {
@@ -4628,6 +4642,11 @@ mod tests {
                 stale_pane_map: std::collections::HashMap::new(),
                 theme_mode: tako_core::theme::ThemeMode::Dark,
                 preview_reload: tako_core::PreviewReloadState::default(),
+                preview_cache: tako_core::PreviewCacheStats {
+                    max_bytes: 512 * 1024 * 1024,
+                    used_bytes: 32 * 1024 * 1024,
+                    entries: 2,
+                },
             }
         }
 
@@ -4719,6 +4738,13 @@ mod tests {
         }
         fn set_preview_reload(&mut self, enabled: bool) {
             self.preview_reload.set_enabled(enabled);
+        }
+        fn preview_cache_stats(&self) -> tako_core::PreviewCacheStats {
+            self.preview_cache
+        }
+        fn set_preview_cache_budget(&mut self, max_bytes: u64) {
+            self.preview_cache.max_bytes = max_bytes;
+            self.preview_cache.used_bytes = self.preview_cache.used_bytes.min(max_bytes);
         }
         fn preview_state(&self, pane: PaneId) -> Option<(String, PreviewModeWire)> {
             self.previews.get(&pane.as_u64()).cloned()
@@ -6016,6 +6042,37 @@ mod tests {
         .unwrap();
         assert_eq!(changed["enabled"], false);
         assert!(!host.preview_reload.enabled());
+    }
+
+    #[test]
+    fn preview_cacheは予算と利用状況を取得変更できる() {
+        let mut host = MockHost::new();
+        let initial = dispatch(
+            &mut host,
+            Request::PreviewCache { max_mb: None },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(initial["max_mb"], 512);
+        assert_eq!(initial["used_bytes"], 32 * 1024 * 1024);
+        assert_eq!(initial["entries"], 2);
+
+        let changed = dispatch(
+            &mut host,
+            Request::PreviewCache { max_mb: Some(256) },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(changed["max_mb"], 256);
+        assert_eq!(host.preview_cache.max_bytes, 256 * 1024 * 1024);
+
+        let error = dispatch(
+            &mut host,
+            Request::PreviewCache { max_mb: Some(8) },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(matches!(error, DispatchError::InvalidParams(_)));
     }
 
     #[test]

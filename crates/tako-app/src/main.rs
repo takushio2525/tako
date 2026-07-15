@@ -31,7 +31,7 @@ mod video_player;
 mod webview;
 
 use keybindings::*;
-use preview_render::PreviewImageCache;
+use preview_render::{PreviewImageCache, PreviewImageCacheEntryKey};
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -396,6 +396,13 @@ fn initial_preview_reload() -> bool {
     tako_control::settings::load().preview_live_reload
 }
 
+/// デコード済みプレビュー画像キャッシュの起動時予算（Issue #258）。
+fn initial_preview_cache_budget() -> u64 {
+    let max_mb = tako_control::settings::load().preview_cache_max_mb;
+    tako_core::preview_cache_bytes(max_mb)
+        .unwrap_or(tako_core::PREVIEW_CACHE_DEFAULT_MB * 1024 * 1024)
+}
+
 /// tmux バックエンド永続化（Phase 5.5 / FR-5）の起動時の有効判定。
 /// セルフテストでは既定 OFF（専用項目が dispatch 経由で ON にして検証する。
 /// 既存項目を tmux 経由にしてスクロールバック等の挙動を変えない）。
@@ -657,6 +664,8 @@ struct TakoApp {
     pending_preview_reloads: HashMap<std::path::PathBuf, std::time::Instant>,
     /// デバウンスタスクが稼働中のパス。連続 write でもタスクを増殖させない。
     active_preview_reloads: std::collections::HashSet<std::path::PathBuf>,
+    /// 実読み込み中の (pane, path)。イベント頻度に比例した PDF 全ページ並行生成を防ぐ。
+    active_preview_reload_jobs: std::collections::HashSet<(PaneId, std::path::PathBuf)>,
     /// background 完了の世代照合。後続 write より古い結果を表示へ適用しない。
     preview_reload_generations: HashMap<std::path::PathBuf, u64>,
     next_preview_reload_generation: u64,
@@ -766,11 +775,17 @@ struct TakoApp {
     term_notify_pending: bool,
     /// 動画フレームの描画キャッシュ（frame_gen で世代管理: 新フレーム準備完了まで前フレームを表示）
     video_frame_cache: HashMap<PaneId, (u64, std::sync::Arc<gpui::RenderImage>)>,
+    /// 動画の旧フレーム。次の render 冒頭で GPU sprite atlas から解放する（Issue #258）。
+    pending_video_frame_evictions: Vec<std::sync::Arc<gpui::RenderImage>>,
     /// PDF / 画像 / 動画サムネの描画用 gpui::Image キャッシュ（Issue #168）。
     /// `Image::from_bytes` は id 生成で全バイトのハッシュ計算を行うため、毎フレーム
     /// 生成すると PDF 全ページの PNG コピー + ハッシュだけで 1 フレーム 100ms 級になる
     /// （71 ページ PDF の実測 p50 96ms/frame）。path 不変の間は Arc を再利用する
     preview_image_cache: HashMap<PaneId, PreviewImageCache>,
+    /// デコード済み画像の CPU バイト予算を管理するプロセス全体 LRU（Issue #258）。
+    preview_image_lru: tako_core::ByteLru<PreviewImageCacheEntryKey>,
+    /// LRU / close で外した GPUI asset。次の render 冒頭で atlas と一緒に解放する。
+    pending_preview_image_evictions: Vec<std::sync::Arc<gpui::Image>>,
     /// PDF・画像プレビューのズーム / パン / ページ状態（#234。core モデル）。
     preview_views: HashMap<PaneId, tako_core::PreviewViewState>,
     /// PDF・画像プレビューの 2 軸スクロールとページ移動を共有する GPUI handle。
@@ -1670,6 +1685,7 @@ impl TakoApp {
             preview_file_watcher,
             pending_preview_reloads: HashMap::new(),
             active_preview_reloads: std::collections::HashSet::new(),
+            active_preview_reload_jobs: std::collections::HashSet::new(),
             preview_reload_generations: HashMap::new(),
             next_preview_reload_generation: 0,
             preview_reload_apply_count: 0,
@@ -1713,7 +1729,10 @@ impl TakoApp {
             video_players: HashMap::new(),
             video_ticker: false,
             video_frame_cache: HashMap::new(),
+            pending_video_frame_evictions: Vec::new(),
             preview_image_cache: HashMap::new(),
+            preview_image_lru: tako_core::ByteLru::new(initial_preview_cache_budget()),
+            pending_preview_image_evictions: Vec::new(),
             preview_views: HashMap::new(),
             preview_scroll_handles: HashMap::new(),
             video_seek_bar_bounds: HashMap::new(),
@@ -4121,8 +4140,8 @@ impl TakoApp {
                 self.previews.remove(&pane_id);
                 self.preview_edits.remove(&pane_id);
                 self.video_players.remove(&pane_id);
-                self.video_frame_cache.remove(&pane_id);
-                self.preview_image_cache.remove(&pane_id);
+                self.remove_video_frame_cache(pane_id);
+                self.remove_preview_image_cache(pane_id);
                 self.preview_views.remove(&pane_id);
                 self.preview_scroll_handles.remove(&pane_id);
                 self.pending_pdf_rasters.remove(&pane_id);
@@ -4134,6 +4153,8 @@ impl TakoApp {
                 self.preview_pdf_highlight_paint_count.remove(&pane_id);
                 self.preview_text_layouts.remove(&pane_id);
                 self.preview_line_texts.remove(&pane_id);
+                self.pane_links.remove(&pane_id);
+                self.known_failed.remove(&pane_id);
                 self.scroll_accum.remove(&pane_id);
                 self.scroll_ctls.remove(&pane_id);
                 self.pane_font_sizes.remove(&pane_id);
@@ -4176,8 +4197,8 @@ impl TakoApp {
                     self.previews.remove(&id);
                     self.preview_edits.remove(&id);
                     self.video_players.remove(&id);
-                    self.video_frame_cache.remove(&id);
-                    self.preview_image_cache.remove(&id);
+                    self.remove_video_frame_cache(id);
+                    self.remove_preview_image_cache(id);
                     self.preview_views.remove(&id);
                     self.preview_scroll_handles.remove(&id);
                     self.pending_pdf_rasters.remove(&id);
@@ -4189,6 +4210,8 @@ impl TakoApp {
                     self.preview_pdf_highlight_paint_count.remove(&id);
                     self.preview_text_layouts.remove(&id);
                     self.preview_line_texts.remove(&id);
+                    self.pane_links.remove(&id);
+                    self.known_failed.remove(&id);
                     self.scroll_accum.remove(&id);
                     self.scroll_ctls.remove(&id);
                     self.dock_webview_of(id);
@@ -10026,11 +10049,13 @@ impl SessionHost for TakoApp {
         self.terminals.remove(&pane);
         self.previews.remove(&pane);
         self.preview_edits.remove(&pane);
-        self.preview_image_cache.remove(&pane);
+        self.remove_preview_image_cache(pane);
         self.preview_views.remove(&pane);
         self.preview_scroll_handles.remove(&pane);
         self.video_players.remove(&pane);
-        self.video_frame_cache.remove(&pane);
+        self.remove_video_frame_cache(pane);
+        self.pane_links.remove(&pane);
+        self.known_failed.remove(&pane);
         self.sync_preview_watches();
         self.dock_webview_of(pane);
         self.scroll_accum.remove(&pane);
@@ -10347,6 +10372,27 @@ impl PreviewHost for TakoApp {
         }
     }
 
+    fn preview_cache_stats(&self) -> tako_core::PreviewCacheStats {
+        tako_core::PreviewCacheStats {
+            max_bytes: self.preview_image_lru.budget_bytes(),
+            used_bytes: self.preview_image_lru.used_bytes(),
+            entries: self.preview_image_lru.len(),
+        }
+    }
+
+    fn set_preview_cache_budget(&mut self, max_bytes: u64) {
+        let evicted = self.preview_image_lru.set_budget_bytes(max_bytes);
+        self.evict_preview_image_keys(evicted);
+        // セルフテスト中はユーザー設定を汚さない。
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.preview_cache_max_mb = max_bytes / 1024 / 1024;
+            if let Err(e) = tako_control::settings::save(&settings) {
+                eprintln!("warning: 設定を保存できない: {e}");
+            }
+        }
+    }
+
     fn preview_state(
         &self,
         pane: PaneId,
@@ -10589,7 +10635,7 @@ impl PreviewHost for TakoApp {
         self.preview_pdf_highlight_paint_count.remove(&pane);
         self.preview_text_layouts.remove(&pane);
         self.preview_line_texts.remove(&pane);
-        self.preview_image_cache.remove(&pane);
+        self.remove_preview_image_cache(pane);
         self.pending_pdf_rasters.remove(&pane);
         self.preview_views.remove(&pane);
         self.preview_scroll_handles.remove(&pane);
@@ -11472,6 +11518,7 @@ impl Render for TakoApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Issue #168: フレーム構築（element tree 生成）のメインスレッド専有を計測
         let _span = tako_control::diag::perf_span("render");
+        self.drain_preview_image_evictions(window, cx);
         self.preview_device_scale = window.scale_factor();
         // Web ビュー（FR-3.8）: wry の親にするウィンドウハンドルは render でしか
         // 採取できないため、初回 render で保存し、復元待ちの Web ビューを開き直す
@@ -14005,7 +14052,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 87, "MCP tools/list は 87 ツール");
+            check(status == 200 && tool_count == 88, "MCP tools/list は 88 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -14093,6 +14140,26 @@ mod self_test {
                     && response.contains(r#"\"enabled\":true"#)
                     && preview_reload_on,
                 "MCP preview reload on（core 状態へ反映）",
+            );
+
+            // 33d. プレビュー画像キャッシュ上限も MCP から同じ LRU へ反映する（#258）。
+            let (status, response) = mcp_post_bg(
+                cx,
+                &mcp_url,
+                Some(&token),
+                &[],
+                r#"{"jsonrpc":"2.0","id":107,"method":"tools/call","params":{"name":"tako_preview_cache","arguments":{"max_mb":256}}}"#,
+            )
+            .await
+            .unwrap_or_else(|| fail("MCP preview cache 接続"));
+            let preview_cache_256 = window
+                .update(cx, |app, _, _| app.preview_image_lru.budget_bytes() == 256 * 1024 * 1024)
+                .unwrap_or(false);
+            check(
+                status == 200
+                    && response.contains(r#"\"max_mb\":256"#)
+                    && preview_cache_256,
+                "MCP preview cache（LRU 予算へ反映）",
             );
 
             // 34. tools/call tako_split_pane（X-Tako-Pane で呼び出し元特定 + origin=mcp）と
@@ -16988,6 +17055,25 @@ mod self_test {
                     &format!("tako preview-reload {action} が core 状態へ反映"),
                 );
             }
+            let output = cli_output_bg(
+                cx,
+                &cli_path,
+                &ipc_endpoint,
+                &token,
+                reload_terminal,
+                reload_tab,
+                vec!["preview-cache".into(), "512".into()],
+            )
+            .await
+            .unwrap_or_else(|| fail("tako preview-cache 512 CLI 起動"));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let cache_512 = window
+                .update(cx, |app, _, _| app.preview_image_lru.budget_bytes() == 512 * 1024 * 1024)
+                .unwrap_or(false);
+            check(
+                output.status.success() && stdout.contains(r#""max_mb":512"#) && cache_512,
+                "tako preview-cache 512 が LRU 予算へ反映",
+            );
 
             let long_markdown = |heading: &str| {
                 let mut text = format!("# {heading}\n\n");
