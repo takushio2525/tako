@@ -782,3 +782,9 @@
   優先解決を tako-control に集約。検出値の食い違いは detected 優先で通知
 - config を質問前に読み、2 回目 Enter で agent / plan / profile を引き継ぐ冪等経路を追加。
   claude 単独・3 CLI の隔離 E2E で追加質問 0・setup agent 再起動なしを確認
+
+## 2026-07-15（#262: setup UX 方針 C/D/E 実装・検証）
+- 標準 setup を最終サマリだけの質問ゼロへ変更し、`--yes` / 全項目 `--answers` /
+  dispatch `SetupRun` / MCP `tako_setup` と明示 `--review` を実装
+- 初回・2回目・`--yes`・未認証を before 5+/5+/未実装/1 → after 全 0 入力で実測。
+  実 Claude Max 認証、検出競合、破損 config、複数 CLI、全品質ゲートも全緑

@@ -995,13 +995,20 @@ fn collect_provider_plans(
 
 fn prompt_plan(provider: Provider, detected: Option<&str>, assume_yes: bool) -> ResolvedSetupValue {
     if assume_yes {
-        let value = if provider == Provider::Claude && detected == Some("max") {
-            "max"
+        let resolved = if provider == Provider::Claude && detected == Some("max") {
+            eprintln!(
+                "  [detected] {} プラン: max（倍率は未検出のため [default] 未指定）",
+                provider.label()
+            );
+            return ResolvedSetupValue {
+                value: "max".to_string(),
+                source: SetupValueSource::Detected,
+                previous: None,
+            };
         } else {
-            "unknown"
+            resolve_setup_value(None, None, Some("unknown"))
+                .expect("default があれば必ず解決できる")
         };
-        let resolved =
-            resolve_setup_value(None, None, Some(value)).expect("default があれば必ず解決できる");
         eprintln!(
             "  [{}] {} プラン: {}",
             resolved.source.label(),
@@ -2178,6 +2185,15 @@ mod tests {
         assert!(detected_provider_plans(&single)
             .iter()
             .all(|(provider, _)| *provider != Provider::Gpt && *provider != Provider::Google));
+
+        let max = collect_provider_plans(
+            &[detected(SetupAgent::Claude, true, Some("max"))],
+            &BTreeMap::new(),
+            false,
+            true,
+        );
+        assert_eq!(max["claude"].value, "max");
+        assert_eq!(max["claude"].source, SetupValueSource::Detected);
     }
 
     #[test]
