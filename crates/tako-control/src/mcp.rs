@@ -1577,6 +1577,64 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_setup",
+            "description": "tako setup を非対話で実行する（Issue #262）。ユーザーが日本語で伝えた好みを answers に変換して代行する。省略項目は detected → previous → default の順で自動解決され、標準ケースは質問ゼロで完走する。instructions / profile / projects / orchestrator / sleep_guard は明示指定時だけ既存値を更新する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "selected_agent": {
+                        "type": "string",
+                        "enum": ["claude", "codex", "agy"],
+                        "description": "setup の既定 agent。省略時は検出・前回値から自動決定",
+                    },
+                    "provider_plans": {
+                        "type": "object",
+                        "description": "プロバイダ別プラン。キーは claude / gpt / google",
+                        "additionalProperties": {"type": "string"},
+                    },
+                    "instruction_content": {
+                        "type": "string",
+                        "description": "選択 agent のグローバル指示ファイルへ書く完全な Markdown。省略時は既存維持",
+                    },
+                    "profile": {
+                        "type": "object",
+                        "description": "profiles/default.yaml の完全な設定。省略時は既存維持または推奨生成",
+                        "additionalProperties": true,
+                    },
+                    "projects": {
+                        "type": "object",
+                        "description": "projects.yaml の全登録。明示時だけ既存一覧を置換",
+                        "additionalProperties": {
+                            "type": "object",
+                            "properties": {
+                                "cwd": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                            "required": ["cwd"],
+                            "additionalProperties": false,
+                        },
+                    },
+                    "orchestrator": {
+                        "type": "object",
+                        "properties": {
+                            "auto_close": {"type": "boolean"},
+                            "auto_push": {"type": "boolean"},
+                        },
+                        "additionalProperties": false,
+                    },
+                    "sleep_guard": {
+                        "type": "object",
+                        "properties": {
+                            "mode": {"type": "string", "enum": ["off", "on", "while-agents-running"]},
+                            "power": {"type": "string", "enum": ["ac-only", "always"]},
+                        },
+                        "additionalProperties": false,
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_setup_changes",
             "description": "tako setup のアップデート追従状況を照会する（Issue #94）。\
                 前回 `tako setup` 完了時に適用したリビジョン（applied_revision）と\
@@ -1585,7 +1643,7 @@ pub fn tools() -> Vec<Value> {
                 master 用システムプロンプト等の変更）の一覧を返す。読み取り専用。\
                 pending の各エントリの kind が auto なら `tako setup` の再実行だけで追従が\
                 完了する。guided ならユーザー所有ファイル（CLAUDE.md・profiles 等）に関わる\
-                ため、setup の対話で確認しながら適用する。適用は `tako setup` を案内すること。",
+                ため、`tako setup --review` で個別確認する。自動追従は `tako setup` を案内すること。",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -2615,6 +2673,9 @@ fn build_request(
             mode: str_arg(args, "mode")?.map(|s| s.to_string()),
         },
         "tako_setup_changes" => Request::SetupChanges,
+        "tako_setup" => Request::SetupRun {
+            answers: Some(args.clone()),
+        },
         "tako_agents_sync_rules" => Request::AgentsSyncRules {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             source: str_arg(args, "source")?.map(|s| s.to_string()),
@@ -3370,6 +3431,26 @@ mod tests {
     }
 
     #[test]
+    fn tako_setupは全回答をsetup_runリクエストに変換する() {
+        let answers = json!({
+            "selected_agent": "codex",
+            "provider_plans": {"gpt": "plus"},
+            "instruction_content": "# Rules",
+            "profile": {"master_agent": "codex", "effort": "high"},
+            "projects": {"app": {"cwd": "~/src/app"}},
+            "orchestrator": {"auto_close": false, "auto_push": false},
+            "sleep_guard": {"mode": "while-agents-running", "power": "ac-only"}
+        });
+        let (_, requests) = run(call("tako_setup", answers.clone()), None, true);
+        assert_eq!(
+            requests,
+            vec![Request::SetupRun {
+                answers: Some(answers)
+            }]
+        );
+    }
+
+    #[test]
     fn tako_orchestrator_layoutはリクエストに変換される() {
         // 全省略 = 取得
         let (response, requests) = run(call("tako_orchestrator_layout", json!({})), None, true);
@@ -3436,7 +3517,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 88);
+        assert_eq!(tools.len(), 89);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

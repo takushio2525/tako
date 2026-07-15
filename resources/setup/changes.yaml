@@ -159,3 +159,17 @@ changes:
       へ推奨生成する。既存 profile は確認なしに変更せず、更新に同意した場合も
       system_prompt / prompt_blocks / projects のカスタマイズを保持する。
       setup 再実行で新しい検出・推奨フローが自動で走るため、個別の適用作業は不要。
+
+  - revision: 9
+    version: "0.5.4"
+    date: "2026-07-15"
+    kind: auto
+    title: setup を質問ゼロ・前回値引き継ぎ・AI 代行へ刷新
+    description: |
+      tako setup は検出値、前回値、安全な既定値を detected → previous → default の順で
+      自動採用し、CLI 1 つ・認証済みの標準ケースを質問ゼロで完了するようになった
+      （Issue #262）。2 回目は前回設定をそのまま引き継ぎ、変更がなければ設定ファイルを
+      書き直さない。値の由来と最終変更サマリは表示する。
+      `--yes` と `--answers <json|@file|->` で全設定を非対話指定でき、同じ回答 JSON を
+      dispatch `SetupRun` / MCP `tako_setup` へ 1:1 公開した。個別に会話で設定を
+      見直したい場合だけ `tako setup --review` を使う。
