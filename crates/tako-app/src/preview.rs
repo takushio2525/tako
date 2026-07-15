@@ -138,7 +138,7 @@ pub struct PdfTextLine {
     pub char_boxes: Vec<PdfCharBox>,
 }
 
-/// PDF データ（全ページの PNG を保持し、スクロールで閲覧）
+/// PDF データ（全ページの圧縮 PNG を保持し、表示近傍だけデコードして閲覧）
 #[derive(Debug, Clone, PartialEq)]
 pub struct PdfData {
     /// 各ページの PNG バイト列（Core Graphics でレンダリング済み）
@@ -455,7 +455,7 @@ pub fn load_image(path: &Path) -> PreviewState {
     }
 }
 
-/// PDF の全ページをレンダリングして PreviewState を返す。
+/// PDF の全ページを圧縮 PNG へレンダリングして PreviewState を返す。
 /// Core Graphics FFI で描画する（macOS のみ）
 pub fn load_pdf(path: &Path, _page: usize) -> PreviewState {
     load_pdf_with_key(path, PdfRasterKey::for_view(2.0, 1.0, 612.0))

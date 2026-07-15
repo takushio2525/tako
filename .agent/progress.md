@@ -763,3 +763,7 @@
 - 512MiB既定のバイト予算付きLRU、PDF可視近傍3ページ遅延デコード、GPUI CPU asset + GPU atlas明示解放、旧動画frame解放を実装
 - ライブリロードをpane/path単位single-flight + 最新1件へ直列化し、未回収run履歴256件上限・pane補助cache close cleanupを追加
 - dispatch / CLI `preview-cache` / MCPを1:1公開。app 91・CLI 25・control 425・core 276件の対象テスト全緑
+
+## 2026-07-15（#258: メモリ安定性検証マイルストーン）
+- PDFズーム・ページ移動・ライブリロード30サイクルでfootprint peak 795MB横ばい、終了後RSS 84,816KiB、close後68,672KiB / LRU 0 bytesを実測
+- #257統合後の追加21サイクルもpeak 812MB横ばい・RSS傾き負、render p95 / p99最大6ms。全品質ゲート + 隔離セルフテスト完走
