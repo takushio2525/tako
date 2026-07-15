@@ -1337,6 +1337,7 @@ struct PaneDrag {
 struct ContextMenu {
     path: std::path::PathBuf,
     is_dir: bool,
+    is_pinned_root: bool,
     position: Point<Pixels>,
 }
 
@@ -5094,6 +5095,32 @@ impl TakoApp {
                             },
                             cx,
                         );
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// サイドバー「+」ボタン: フォルダピッカー → 現タブにルート追加（#268）
+    fn add_tree_root(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(dir) = paths.into_iter().next() {
+                    let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                        let dir = dir.canonicalize().unwrap_or(dir);
+                        let tab_id = app.workspace.active_tab().id();
+                        if let Some(tab) = app.workspace.get_tab_mut(tab_id) {
+                            tab.add_pinned_folder(dir);
+                        }
+                        app.sync_filetree_roots();
+                        cx.notify();
                     });
                 }
             }
@@ -14063,7 +14090,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 88, "MCP tools/list は 88 ツール");
+            check(status == 200 && tool_count == 89, "MCP tools/list は 89 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
