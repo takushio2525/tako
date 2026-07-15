@@ -139,14 +139,19 @@ enum Command {
     #[command(subcommand)]
     Remote(RemoteCommand),
     /// マスターオーケストレーターを起動する。profile の claude / codex を system prompt 付きで起動する。
+    /// 既定は現在のペインでインライン起動（新タブを作らない）。--tab で従来の新タブ起動。
     /// プロファイル名を指定して設定を切り替えられる（例: tako master -2 → "2" プロファイル）。
     /// 引数なしは default プロファイル。旧形式（tako master dev）も後方互換で動作する
     Master {
         /// プロファイル名（-2, -difficult 等）またはサフィックス（旧形式: dev 等）
         #[arg(allow_hyphen_values = true)]
         profile: Option<String>,
+        /// 新しいタブで起動する（既定はインライン = 現在のペインで起動）
+        #[arg(long)]
+        tab: bool,
     },
-    /// ソロエージェントを起動する。新タブで profile の claude / codex を solo system prompt 付きで起動する。
+    /// ソロエージェントを起動する。既定は現在のペインでインライン起動（新タブを作らない）。
+    /// --tab で従来の新タブ起動。
     /// オーケストレーション無しの 1 対 1 対話モード（worker spawn を禁止、作業は自分で行う）。
     /// エコ運用（既定 effort=high）で Pro プランでも使える。master と同じプロファイル引数パターン。
     /// プロファイル名を指定して設定を切り替えられる（例: tako solo -fast → "fast" プロファイル）。
@@ -155,6 +160,9 @@ enum Command {
         /// プロファイル名（-fast 等）またはサフィックス（旧形式: docs 等）。role は solo:<suffix>
         #[arg(allow_hyphen_values = true)]
         profile: Option<String>,
+        /// 新しいタブで起動する（既定はインライン = 現在のペインで起動）
+        #[arg(long)]
+        tab: bool,
     },
     /// オーケストレーター操作（projects / spawn / status / watch）
     #[command(subcommand)]
@@ -1590,8 +1598,8 @@ fn main() -> ExitCode {
             }
         }
         Command::SetupMcp(ref args) => setup_mcp_local(args),
-        Command::Master { ref profile } => orchestrator_master(profile.as_deref()),
-        Command::Solo { ref profile } => orchestrator_solo(profile.as_deref()),
+        Command::Master { ref profile, tab } => orchestrator_master(profile.as_deref(), tab),
+        Command::Solo { ref profile, tab } => orchestrator_solo(profile.as_deref(), tab),
         Command::Orchestrator(OrchestratorCommand::Watch {
             pane,
             pane_pos,
@@ -1804,18 +1812,16 @@ fn setup_mcp_local(args: &SetupMcpArgs) -> Result<(), String> {
 
 /// `tako master [-profile]` — 新タブで claude をマスター system prompt 付きで起動する。
 /// `-<名前>` でプロファイルを指定、引数なしは default、旧形式（suffix のみ）も後方互換で動作
-fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
+fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     use tako_control::orchestrator;
 
     orchestrator::ensure_defaults().map_err(|e| format!("セットアップに失敗: {e}"))?;
 
-    // 旧バージョンが default.yaml に書き込んだ [1m] 既定値のマイグレーション（Issue #27）
     if let Some(notice) = orchestrator::migrate_legacy_default_profile() {
         eprintln!("ℹ {notice}");
         eprintln!();
     }
 
-    // 引数をパース: "-<name>" → プロファイル名、それ以外 → 旧 suffix として扱う
     let (profile_name, suffix) = match arg {
         None => ("default", None),
         Some(s) if s.starts_with('-') => {
@@ -1825,24 +1831,17 @@ fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
             }
             (name, Some(name))
         }
-        Some(s) => {
-            // 旧形式の後方互換: `tako master dev` → suffix "dev"、プロファイル "default"
-            ("default", Some(s))
-        }
+        Some(s) => ("default", Some(s)),
     };
 
-    // プロファイルを読み込む（存在しなければデフォルト値で作成）
     let profile = match orchestrator::Profile::load(profile_name) {
         Ok(p) => p,
         Err(_) if profile_name == "default" => orchestrator::Profile::default(),
         Err(e) => return Err(e),
     };
 
-    // master のエージェント種別を検証する（不正・未対応はコマンド送信前にエラー。#127）
     let master_agent = profile.resolve_master_agent()?;
 
-    // プロファイルに明示された [1m] モデルは opt-in として尊重するが、
-    // Pro プランでは起動不能になるため警告を出す（Issue #27。claude master のみ）
     if profile.master_agent_is_claude() {
         if let Some(warning) = profile
             .model
@@ -1860,50 +1859,60 @@ fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
         eprintln!("{warning}");
     }
 
-    // system prompt をプロファイル設定に基づいて合成し、一時ファイルに書き出す
     let prompt_content = profile.build_system_prompt(profile_name);
     let dir = orchestrator::config_dir().ok_or("ホームディレクトリが取得できない")?;
     let prompt_path = dir.join(format!("_system_prompt_{profile_name}.md"));
     std::fs::write(&prompt_path, &prompt_content)
         .map_err(|e| format!("system prompt の書き出しに失敗: {e}"))?;
 
-    // タブ名
     let tab_title = match suffix {
         Some(s) => format!("master-{s}"),
         None => "master".into(),
     };
 
-    // 新タブを作成（master/solo の起動はユーザーの明示操作なのでフォーカスする）
-    let tab_result = send_request(Request::TabNew {
-        title: Some(tab_title.clone()),
-        focus: Some(true),
-    })?;
-    let pane_id = tab_result["pane"]
-        .as_u64()
-        .ok_or("タブ作成の応答に pane が含まれない")?;
-
-    // master ペインに role を設定
     let role = match suffix {
         Some(s) => format!("orchestrator-master:{s}"),
         None => "orchestrator-master".into(),
     };
+    let role_env = match suffix {
+        Some(s) => format!("master:{s}"),
+        None => "master".into(),
+    };
+
+    let tako_bin = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| tako_control::dispatch::resolve_tako_binary());
+    let master_cmd = orchestrator::build_master_cmd(&role_env, &profile, &prompt_path, &tako_bin)?;
+
+    // インライン起動（既定）: 現在のペインでコマンドを実行（新タブを作らない。#264）
+    // --tab 指定時: 従来の新タブ起動
+    let pane_id = if use_tab {
+        let tab_result = send_request(Request::TabNew {
+            title: Some(tab_title.clone()),
+            focus: Some(true),
+        })?;
+        tab_result["pane"]
+            .as_u64()
+            .ok_or("タブ作成の応答に pane が含まれない")?
+    } else {
+        let cp = caller_pane().ok_or(
+            "呼び出し元ペインが不明（tako 内から実行するか、--tab で新タブ起動してください）",
+        )?;
+        send_request(Request::TabRename {
+            tab: None,
+            pane: Some(cp),
+            title: tab_title.clone(),
+        })
+        .ok();
+        cp
+    };
+
     send_request(Request::Title {
         pane: Some(pane_id),
         title: None,
         role: Some(role.clone()),
     })?;
 
-    // TAKO_ORCHESTRATOR_ROLE 環境変数を設定
-    let role_env = match suffix {
-        Some(s) => format!("master:{s}"),
-        None => "master".into(),
-    };
-    // model 未指定のプロファイルは --model を付けずその CLI の既定に委ねる（Issue #27）。
-    // codex master の MCP stdio ブリッジ（`<tako> mcp serve`）は自分自身のパスで起動する
-    let tako_bin = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| tako_control::dispatch::resolve_tako_binary());
-    let master_cmd = orchestrator::build_master_cmd(&role_env, &profile, &prompt_path, &tako_bin)?;
     send_request(Request::Send {
         pane: Some(pane_id),
         text: master_cmd,
@@ -1912,7 +1921,12 @@ fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
         await_prompt: false,
     })?;
 
-    eprintln!("master を起動しました: タブ '{tab_title}'（ペイン {pane_id}）");
+    let location = if use_tab {
+        format!("タブ '{tab_title}'（ペイン {pane_id}）")
+    } else {
+        format!("ペイン {pane_id}（インライン）")
+    };
+    eprintln!("master を起動しました: {location}");
     eprintln!(
         "プロファイル: {profile_name}（エージェント: {}、モデル: {}、effort: {}）",
         master_agent.as_str(),
@@ -1925,7 +1939,6 @@ fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
             profile.model_label(),
             profile.effort
         ),
-        // master が claude 以外のときは model / effort が claude worker へ継承されない（#127）
         orchestrator::WorkerModelPolicy::Inherit => format!(
             "inherit（master は {} のため claude worker へは非継承: {} / {}）",
             master_agent.as_str(),
@@ -1944,17 +1957,13 @@ fn orchestrator_master(arg: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-/// `tako solo [-profile]` — 新タブで claude を solo system prompt 付きで起動する。
-/// オーケストレーション無しの 1 対 1 対話モード。worker spawn を禁止し、作業は自分で行う。
-/// `-<名前>` でプロファイルを指定、引数なしは default、旧形式（suffix のみ）も後方互換。
-/// role / TAKO_ORCHESTRATOR_ROLE は `solo` / `solo:<suffix>`（master と区別）。
-/// claude コマンドの組み立ては master と `build_master_claude_cmd` を共用する。
-fn orchestrator_solo(arg: Option<&str>) -> Result<(), String> {
+/// `tako solo [-profile]` — solo system prompt 付きで claude / codex を起動する。
+/// 既定はインライン（現在のペインで起動）、--tab で新タブ起動（#264）。
+fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     use tako_control::orchestrator;
 
     orchestrator::ensure_solo_defaults().map_err(|e| format!("セットアップに失敗: {e}"))?;
 
-    // 引数をパース: "-<name>" → プロファイル名、それ以外 → 旧 suffix として扱う（master と同じパターン）
     let (profile_name, suffix) = match arg {
         None => ("default", None),
         Some(s) if s.starts_with('-') => {
@@ -1964,24 +1973,17 @@ fn orchestrator_solo(arg: Option<&str>) -> Result<(), String> {
             }
             (name, Some(name))
         }
-        Some(s) => {
-            // 旧形式の後方互換: `tako solo docs` → suffix "docs"、プロファイル "default"
-            ("default", Some(s))
-        }
+        Some(s) => ("default", Some(s)),
     };
 
-    // solo プロファイルを読み込む（存在しなければ default 値で起動する）
     let profile = match orchestrator::load_solo_profile(profile_name) {
         Ok(p) => p,
         Err(_) if profile_name == "default" => orchestrator::solo_default_profile(),
         Err(e) => return Err(e),
     };
 
-    // solo のエージェント種別を検証する（master とコマンド組み立てを共用。#127）
     let solo_agent = profile.resolve_master_agent()?;
 
-    // プロファイルに明示された [1m] モデルは opt-in として尊重するが、
-    // Pro プランでは起動不能になるため警告を出す（Issue #27。claude のみ）
     if profile.master_agent_is_claude() {
         if let Some(warning) = profile
             .model
@@ -1992,45 +1994,54 @@ fn orchestrator_solo(arg: Option<&str>) -> Result<(), String> {
         }
     }
 
-    // solo 用 system prompt を合成し、一時ファイルに書き出す
     let prompt_content = profile.build_solo_system_prompt(profile_name);
     let dir = orchestrator::config_dir().ok_or("ホームディレクトリが取得できない")?;
     let prompt_path = dir.join(format!("_solo_system_prompt_{profile_name}.md"));
     std::fs::write(&prompt_path, &prompt_content)
         .map_err(|e| format!("system prompt の書き出しに失敗: {e}"))?;
 
-    // タブ名
     let tab_title = match suffix {
         Some(s) => format!("solo-{s}"),
         None => "solo".into(),
     };
 
-    // 新タブを作成（solo の起動はユーザーの明示操作なのでフォーカスする）
-    let tab_result = send_request(Request::TabNew {
-        title: Some(tab_title.clone()),
-        focus: Some(true),
-    })?;
-    let pane_id = tab_result["pane"]
-        .as_u64()
-        .ok_or("タブ作成の応答に pane が含まれない")?;
-
-    // solo ペインに role を設定（master の orchestrator-master と区別する）
     let role = match suffix {
         Some(s) => format!("solo:{s}"),
         None => "solo".into(),
     };
+
+    let tako_bin = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| tako_control::dispatch::resolve_tako_binary());
+    let solo_cmd = orchestrator::build_master_cmd(&role, &profile, &prompt_path, &tako_bin)?;
+
+    let pane_id = if use_tab {
+        let tab_result = send_request(Request::TabNew {
+            title: Some(tab_title.clone()),
+            focus: Some(true),
+        })?;
+        tab_result["pane"]
+            .as_u64()
+            .ok_or("タブ作成の応答に pane が含まれない")?
+    } else {
+        let cp = caller_pane().ok_or(
+            "呼び出し元ペインが不明（tako 内から実行するか、--tab で新タブ起動してください）",
+        )?;
+        send_request(Request::TabRename {
+            tab: None,
+            pane: Some(cp),
+            title: tab_title.clone(),
+        })
+        .ok();
+        cp
+    };
+
     send_request(Request::Title {
         pane: Some(pane_id),
         title: None,
         role: Some(role.clone()),
     })?;
 
-    // TAKO_ORCHESTRATOR_ROLE 環境変数を設定（solo / solo:<suffix>）。
-    // model 未指定のプロファイルは --model を付けずその CLI の既定に委ねる（Issue #27）
-    let tako_bin = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| tako_control::dispatch::resolve_tako_binary());
-    let solo_cmd = orchestrator::build_master_cmd(&role, &profile, &prompt_path, &tako_bin)?;
     send_request(Request::Send {
         pane: Some(pane_id),
         text: solo_cmd,
@@ -2039,7 +2050,12 @@ fn orchestrator_solo(arg: Option<&str>) -> Result<(), String> {
         await_prompt: false,
     })?;
 
-    eprintln!("solo を起動しました: タブ '{tab_title}'（ペイン {pane_id}）");
+    let location = if use_tab {
+        format!("タブ '{tab_title}'（ペイン {pane_id}）")
+    } else {
+        format!("ペイン {pane_id}（インライン）")
+    };
+    eprintln!("solo を起動しました: {location}");
     eprintln!(
         "プロファイル: {profile_name}（エージェント: {}、モデル: {}、effort: {}）",
         solo_agent.as_str(),
