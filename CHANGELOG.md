@@ -3,6 +3,15 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.3] - 2026-07-15
+
+Nightly patch release (automated). Changes since v0.5.2:
+夜間パッチリリース（自動）。v0.5.2 以降の変更:
+
+- [ドキュメント] Issue 258の完了状態を記録 (#258) (#261)
+- [修正] アプリ全体のメモリ肥大を抑制 (#258) (#260)
+- [修正] PDF プレビューの周期的暗転を根治: イベントフィルタ強化 + ファイルスタンプ比較 + ダブルバッファ化 (#257) (#259)
+
 ## [0.5.2] - 2026-07-15
 
 Nightly patch release (automated). Changes since v0.5.1:
