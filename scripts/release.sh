@@ -153,13 +153,63 @@ claude mcp add --scope user tako -- /Applications/tako.app/Contents/MacOS/tako m
 "
 
   echo "==> GitHub Release 作成: $TAG"
-  # --generate-notes: CHANGELOG 由来の --notes に加えて PR 一覧の自動生成ノートを追記する
-  gh release create "$TAG" \
-    --title "tako $TAG" \
-    --notes "$RELEASE_NOTES" \
-    --generate-notes \
-    $DRAFT_FLAG \
-    "$ZIP_PATH"
+
+  # 冪等性: Release が既に存在する場合はアセット追加のみ（#256）
+  if gh release view "$TAG" >/dev/null 2>&1; then
+    echo "    Release $TAG は既に存在。アセットのアップロードのみ実行"
+    gh release upload "$TAG" "$ZIP_PATH" --clobber
+  else
+    # タグ push 直後は GitHub 側の伝播ラグで gh release create が失敗する
+    # ことがあるため、指数バックオフ付きリトライで吸収する（#256）
+    MAX_RETRIES=3
+    RETRY_WAIT=${TAKO_RELEASE_RETRY_WAIT:-10}
+    ATTEMPT=0
+    RELEASE_CREATED=0
+
+    while [[ $ATTEMPT -lt $MAX_RETRIES ]]; do
+      ATTEMPT=$((ATTEMPT + 1))
+      echo "    gh release create: 試行 ${ATTEMPT}/${MAX_RETRIES}"
+
+      GH_STDERR_FILE=$(mktemp)
+      GH_EXIT=0
+      gh release create "$TAG" \
+          --title "tako $TAG" \
+          --notes "$RELEASE_NOTES" \
+          --generate-notes \
+          $DRAFT_FLAG \
+          "$ZIP_PATH" 2>"$GH_STDERR_FILE" || GH_EXIT=$?
+
+      if [[ $GH_EXIT -eq 0 ]]; then
+        rm -f "$GH_STDERR_FILE"
+        RELEASE_CREATED=1
+        break
+      fi
+
+      echo "    gh release create 失敗（exit ${GH_EXIT}）。gh stderr:" >&2
+      cat "$GH_STDERR_FILE" >&2
+      rm -f "$GH_STDERR_FILE"
+
+      if [[ $ATTEMPT -lt $MAX_RETRIES ]]; then
+        # 部分成功（Release は作られたがアセット添付で失敗等）への対処
+        if gh release view "$TAG" >/dev/null 2>&1; then
+          echo "    Release $TAG が前回の試行で作成された。アセットをアップロード"
+          gh release upload "$TAG" "$ZIP_PATH" --clobber
+          RELEASE_CREATED=1
+          break
+        fi
+        echo "    ${RETRY_WAIT} 秒後にリトライ..."
+        sleep "$RETRY_WAIT"
+        RETRY_WAIT=$((RETRY_WAIT * 2))
+      fi
+    done
+
+    if [[ $RELEASE_CREATED -eq 0 ]]; then
+      echo "" >&2
+      echo "ERROR: GitHub Release の作成に ${MAX_RETRIES} 回失敗（tag $TAG は push 済み）" >&2
+      echo "手動リカバリ: scripts/release.sh --skip-build --publish" >&2
+      exit 1
+    fi
+  fi
 
   echo "==> リリース完了"
 else
