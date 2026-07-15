@@ -770,3 +770,9 @@
 
 ## 2026-07-15（#258: 完了）
 - PR #260を`530d568`へsquash mergeし、ブランチ削除・Issue完了コメントまで実施。installはmaster側へ引き渡し
+
+## 2026-07-15（#262: setup UX 全面見直し — 根本原因調査）
+- 実ユーザー設定の隔離コピーで v0.5.3 setup を 2 回実走し、両方とも CLI 側だけで
+  5 問を再現。GPT 検出だけ採用、前回 agent / plan は未使用と確認
+- config 読み込み順、全 provider 巡回、設定済み項目・profile の再確認、agent 二重対話を
+  根因として Issue #262 と `.agent/investigations/issue-262-setup-ux.md` に記録

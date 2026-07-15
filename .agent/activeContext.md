@@ -4,37 +4,29 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-15・#258 アプリ全体メモリ監査）
+## 現在の対象（2026-07-15・#262 setup UX 全面見直し）
 
-**調査・修正・検証・merge完了**:
+**根本原因の隔離実測まで完了、実装着手前**:
 
-- v0.5.2 / `8d80be3` の隔離実測で、GPUI asset cache / sprite atlas に残るPDFの
-  デコード済みCPU + GPU画像を主因と定量特定。71ページ・同6倍率は約27.35GiB相当
-- 既定512MiB（設定256〜8192MiB）のバイト予算付きLRU、表示近傍3ページの遅延デコード、
-  `Image::remove_asset` + `App::drop_image`、動画旧frame解放を実装
-- ライブリロードを `(pane, path)` single-flight + 最新1件へ直列化。未回収run完了履歴は
-  最大256件、close時にペイン補助キャッシュを除去
-- dispatch `PreviewCache` / CLI `tako preview-cache` / MCP `tako_preview_cache` を1:1追加し、
-  上限・使用bytes・entry数を返してsettings.jsonへ永続化
-- #257 のファイルスタンプ比較・ダブルバッファ化をorigin/mainから取り込み済み
-- 30分相当のPDFズーム・移動・120回変更でfootprint peakはcycle 10〜30の795MBで不変。
-  終了時RSS 84,816KiB、close後68,672KiB / LRU 0 bytesへ回収
-- #257統合後も追加21サイクルでfootprint peak 812MB横ばい、RSS傾き
-  -4,266.1KiB / cycle。`render` p95 / p99最大6ms、最大15ms
-- build / fmt / clippy / workspace test全緑。隔離セルフテストは終了コード0、
-  `TAKO_APP_SELF_TEST_OK`
-- PR #260をsquash merge（`530d568`）、作業ブランチ削除、Issue #258を実測証拠付きで完了
-- 詳細: `.agent/investigations/issue-258-memory-audit.md`、
-  `.agent/investigations/issue-258-memory-validation.md`
+- v0.5.3（`6a4e06e`）で実ユーザー設定を隔離コピーし、認証照会だけ実 CLI へ委譲
+- claude=max / codex=free / agy=取得不能を検出。現行 setup は 1 回目・2 回目とも
+  CLI 側だけで 5 問（スリープ、agent、Max 倍率、Google、profile 更新）
+- GPT の検出値だけは採用。保存済み `selected_agent` / `provider_plans` は 2 回目も未使用
+- 根因は config 読み込み順、全 provider 無条件巡回、設定済み項目の再質問、
+  profile の無差分確認、CLI 後の agent 二重対話
+- Issue #262 に着手コメントと実測・根本原因コメントを投稿済み
+- 詳細: `.agent/investigations/issue-262-setup-ux.md`
 
 ## 次の一手
 
-- master側でinstall・再起動して実利用へ反映
-- 71ページ級PDFの通常運用でメモリ圧力を継続観察
+- 方針 A: 検出値の実効化と source 表示
+- 方針 B: 前回設定引き継ぎと idempotent 化
+- 方針 C: 最終確認 1 回と `tako setup --yes`
+- 4 シナリオ、設定破損、検出値不一致、全品質ゲートを実測
 
 ## 現フェーズで Read すべき設計書
 
-- Issue: #258（スコープ・容疑1〜7・受け入れ条件）
-- 調査: `.agent/investigations/issue-258-memory-audit.md`
-- 要件: `.agent/requirements.md`（FR-3.4 / FR-3.14 / FR-3.15 / FR-3.17、NFR-3 / NFR-8）
-- 設計: `.agent/architecture.md`（プレビュー描画キャッシュ、backgroundロード、ストール診断）
+- Issue: #262（方針 A/B/C・受け入れ条件 6 項目）
+- 調査: `.agent/investigations/issue-262-setup-ux.md`
+- 要件: `.agent/requirements.md`（FR-2.14.7）
+- 実装: `crates/tako-cli/src/setup.rs` / `crates/tako-control/src/setup.rs`
