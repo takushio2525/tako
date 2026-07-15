@@ -97,10 +97,13 @@ fn signal_for_event(event: &Event, targets: &HashSet<PathBuf>) -> Option<Preview
     if event.need_rescan() {
         return Some(PreviewWatchSignal::Rescan);
     }
-    // 読み取り・open/close だけでは再ロードしない。作成・変更・削除・rename と、
-    // バックエンドが詳細分類できない Any/Other を変更候補として扱う。
-    if matches!(event.kind, EventKind::Access(_)) {
-        return None;
+    // 内容変更を伴わないイベントでは再ロードしない。
+    // Access（読み取り / open / close）と Modify(Metadata(_))（権限・xattr・mtime
+    // のみの変更。macOS FSEvents は Spotlight インデックス更新でこれを送る）を除外する。
+    match event.kind {
+        EventKind::Access(_) => return None,
+        EventKind::Modify(notify::event::ModifyKind::Metadata(_)) => return None,
+        _ => {}
     }
     let mut paths: Vec<PathBuf> = event
         .paths
@@ -135,6 +138,12 @@ mod tests {
         let access = Event::new(EventKind::Access(AccessKind::Read))
             .add_path(PathBuf::from("/tmp/preview.md"));
         assert_eq!(signal_for_event(&access, &targets), None);
+
+        let metadata = Event::new(EventKind::Modify(ModifyKind::Metadata(
+            notify::event::MetadataKind::Any,
+        )))
+        .add_path(PathBuf::from("/tmp/preview.md"));
+        assert_eq!(signal_for_event(&metadata, &targets), None);
     }
 
     #[test]

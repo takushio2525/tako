@@ -269,7 +269,9 @@ impl TakoApp {
                                         data.page_sizes = rasterized.page_sizes;
                                         data.pixel_sizes = rasterized.pixel_sizes;
                                         data.raster_key = request.key;
-                                        app.preview_image_cache.remove(&pane_id);
+                                        // キャッシュは除去しない。ensure_preview_image_cache が
+                                        // 次フレームで raster_key の不一致を検出して再構築する。
+                                        // 旧キャッシュは再構築完了まで表示に使われる。(#257)
                                         cx.notify();
                                     }
                                 }
