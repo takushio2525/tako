@@ -8513,7 +8513,18 @@ impl TakoApp {
                 cx.notify();
                 true
             }
-            _ => false,
+            _ => {
+                if let Some(ch) = ks.key_char.as_deref() {
+                    if !ch.chars().any(|c| c.is_control()) {
+                        self.webview_dock_url_input
+                            .insert_str(self.webview_dock_url_cursor, ch);
+                        self.webview_dock_url_cursor += ch.len();
+                        cx.notify();
+                        return true;
+                    }
+                }
+                true
+            }
         }
     }
 
