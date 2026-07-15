@@ -236,6 +236,23 @@ pub struct ReloadedPreview {
     pub source_bytes: Option<Vec<u8>>,
 }
 
+/// ファイルの mtime + size ペア。ライブリロード時に内容変更の有無を判定する（#257）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStamp {
+    pub size: u64,
+    pub modified: Option<std::time::SystemTime>,
+}
+
+impl FileStamp {
+    pub fn from_path(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            size: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+}
+
 /// プレビューペイン 1 枚分の状態（`TakoApp::previews` の値）
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreviewState {
@@ -247,6 +264,8 @@ pub struct PreviewState {
     pub outline: Arc<PreviewOutline>,
     /// 上限超過で切り詰めたか（フッタで明示する）
     pub truncated: bool,
+    /// ロード時のファイルスタンプ（ライブリロードの変更判定用。#257）
+    pub file_stamp: Option<FileStamp>,
 }
 
 /// コードプレビューの軽量編集セッション（FR-3.5）。表示状態とは分離し、編集モードを
@@ -358,6 +377,7 @@ impl PreviewState {
             content: PreviewContent::Error(message.into()),
             outline: Arc::new(PreviewOutline::default()),
             truncated: false,
+            file_stamp: None,
         }
     }
 
@@ -369,6 +389,7 @@ impl PreviewState {
             content: PreviewContent::Loading,
             outline: Arc::new(PreviewOutline::default()),
             truncated: false,
+            file_stamp: None,
         }
     }
 }
@@ -416,6 +437,7 @@ pub fn load_image(path: &Path) -> PreviewState {
             content: PreviewContent::Image(ImageData { bytes, format }),
             outline: Arc::new(PreviewOutline::default()),
             truncated: false,
+            file_stamp: FileStamp::from_path(path),
         },
         Err(e) => PreviewState::error(path, PreviewMode::Image, format!("読み込めない: {e}")),
     }
@@ -450,6 +472,7 @@ pub fn load_pdf_with_key(path: &Path, raster_key: PdfRasterKey) -> PreviewState 
                     }),
                     outline: Arc::new(outline),
                     truncated: false,
+                    file_stamp: FileStamp::from_path(path),
                 }
             }
             Err(e) => PreviewState::error(path, PreviewMode::Pdf, e),
@@ -503,6 +526,7 @@ pub fn load_video(path: &Path) -> PreviewState {
         }),
         outline: Arc::new(PreviewOutline::default()),
         truncated: false,
+        file_stamp: FileStamp::from_path(path),
     }
 }
 
@@ -1336,6 +1360,7 @@ pub fn load(path: &Path, mode: PreviewMode) -> PreviewState {
         content,
         outline: Arc::new(outline),
         truncated,
+        file_stamp: FileStamp::from_path(path),
     }
 }
 
@@ -1380,6 +1405,7 @@ pub fn load_fast(path: &Path, mode: PreviewMode) -> (PreviewState, Option<String
             content,
             outline: Arc::new(outline),
             truncated,
+            file_stamp: FileStamp::from_path(path),
         },
         raw,
     )
@@ -1431,6 +1457,7 @@ pub fn load_for_reload(
                     content,
                     outline: Arc::new(outline),
                     truncated,
+                    file_stamp: FileStamp::from_path(path),
                 },
                 (!truncated).then_some(source),
             )

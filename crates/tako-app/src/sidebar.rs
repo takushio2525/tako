@@ -1164,11 +1164,19 @@ impl TakoApp {
                             preview::PreviewContent::Pdf(data) => Some(data.raster_key),
                             _ => None,
                         };
-                        (*pane, state.mode, pdf_key)
+                        (*pane, state.mode, pdf_key, state.file_stamp)
                     })
                     .collect();
-                for (pane, mode, pdf_key) in targets {
-                    app.spawn_preview_reload(pane, path.clone(), mode, pdf_key, generation, cx);
+                for (pane, mode, pdf_key, old_stamp) in targets {
+                    app.spawn_preview_reload(
+                        pane,
+                        path.clone(),
+                        mode,
+                        pdf_key,
+                        old_stamp,
+                        generation,
+                        cx,
+                    );
                 }
                 true
             });
@@ -1180,12 +1188,14 @@ impl TakoApp {
         .detach();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_preview_reload(
         &self,
         pane: PaneId,
         path: std::path::PathBuf,
         mode: preview::PreviewMode,
         pdf_key: Option<preview::PdfRasterKey>,
+        old_stamp: Option<preview::FileStamp>,
         generation: u64,
         cx: &mut Context<Self>,
     ) {
@@ -1193,11 +1203,23 @@ impl TakoApp {
             let reload_path = path.clone();
             let loaded = cx
                 .background_executor()
-                .spawn(async move { preview::load_for_reload(&reload_path, mode, pdf_key) })
+                .spawn(async move {
+                    // mtime + size が変わっていなければ再ロードをスキップする。
+                    // テキストは source_bytes 比較があるが PDF / 画像には無いため、
+                    // ファイルスタンプで不要な再ラスタライズを防ぐ。(#257)
+                    if let Some(old) = old_stamp {
+                        if preview::FileStamp::from_path(&reload_path) == Some(old) {
+                            return None;
+                        }
+                    }
+                    Some(preview::load_for_reload(&reload_path, mode, pdf_key))
+                })
                 .await;
-            let _ = this.update(cx, |app, cx| {
-                app.apply_preview_reload(pane, &path, mode, generation, loaded, cx);
-            });
+            if let Some(loaded) = loaded {
+                let _ = this.update(cx, |app, cx| {
+                    app.apply_preview_reload(pane, &path, mode, generation, loaded, cx);
+                });
+            }
         })
         .detach();
     }
@@ -1246,7 +1268,9 @@ impl TakoApp {
         self.preview_pdf_highlight_paint_count.remove(&pane);
         self.preview_text_layouts.remove(&pane);
         self.preview_line_texts.remove(&pane);
-        self.preview_image_cache.remove(&pane);
+        // preview_image_cache は除去しない。次フレームの ensure_preview_image_cache が
+        // 新旧の path / raster_key を比較して自動更新する。旧キャッシュは新キャッシュ
+        // 構築完了まで表示に使われるため、暗転（空 div フォールバック）を防ぐ。(#257)
         self.pending_pdf_rasters.remove(&pane);
         self.previews.insert(pane, loaded.state);
         self.preview_reload_apply_count = self.preview_reload_apply_count.saturating_add(1);
