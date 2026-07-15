@@ -110,8 +110,6 @@ enum Provider {
 }
 
 impl Provider {
-    const ALL: [Self; 3] = [Self::Claude, Self::Gpt, Self::Google];
-
     fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
@@ -820,17 +818,24 @@ fn choose_setup_agent(agents: &[DetectedAgent], input: &str) -> Result<SetupAgen
         .ok_or_else(|| format!("選択範囲は 1〜{} です", agents.len()))
 }
 
+/// 認証済み CLI に対応するプロバイダと検出プランだけを返す。
+/// 未導入・未認証のプロバイダを質問対象へ混ぜない（Issue #262 方針 A）。
+fn detected_provider_plans(agents: &[DetectedAgent]) -> Vec<(Provider, Option<String>)> {
+    agents
+        .iter()
+        .filter(|agent| agent.authenticated)
+        .map(|agent| (agent.kind.provider(), agent.plan.clone()))
+        .collect()
+}
+
 fn collect_provider_plans(agents: &[DetectedAgent]) -> BTreeMap<String, String> {
     let mut plans = BTreeMap::new();
-    for provider in Provider::ALL {
-        let detected = agents
-            .iter()
-            .find(|agent| agent.kind.provider() == provider);
-        let plan = match detected.and_then(|agent| agent.plan.as_deref()) {
+    for (provider, detected) in detected_provider_plans(agents) {
+        let plan = match detected.as_deref() {
             // Claude の status は max の倍率を返さないため、その部分だけ対話で補う。
             Some("max") if provider == Provider::Claude => prompt_plan(provider, Some("max")),
             Some(plan) => {
-                eprintln!("  [自動検出] {} プラン: {plan}", provider.label());
+                eprintln!("  [detected] {} プラン: {plan}", provider.label());
                 plan.to_string()
             }
             None => prompt_plan(provider, None),
@@ -1717,6 +1722,24 @@ mod tests {
         assert_eq!(choose_setup_agent(&agents, ""), Ok(SetupAgent::Codex));
         assert_eq!(choose_setup_agent(&agents, "3"), Ok(SetupAgent::Agy));
         assert!(choose_setup_agent(&agents, "4").is_err());
+    }
+
+    #[test]
+    fn 認証済みかつ導入済みのproviderだけをプラン解決対象にする() {
+        let agents = vec![
+            detected(SetupAgent::Claude, true, Some("pro")),
+            detected(SetupAgent::Codex, false, None),
+        ];
+        assert_eq!(
+            detected_provider_plans(&agents),
+            vec![(Provider::Claude, Some("pro".into()))]
+        );
+
+        let single = vec![detected(SetupAgent::Claude, true, Some("pro"))];
+        assert_eq!(detected_provider_plans(&single).len(), 1);
+        assert!(detected_provider_plans(&single)
+            .iter()
+            .all(|(provider, _)| *provider != Provider::Gpt && *provider != Provider::Google));
     }
 
     #[test]

@@ -341,7 +341,7 @@ Phase 3 設計時の指針:
 | FR-2.14.4 | 登録・診断は CLI / MCP からも可能にする（開発不変条件） | M |
 | FR-2.14.5 | `tako` CLI バイナリの PATH 設置（`/usr/local/bin` 等へのシムリンク作成・更新）もオンボーディングに含める。tako 内のシェルから `tako` コマンドが素で使えることが Layer 1（CLI）の前提（2026-06-12 追記） | S |
 | FR-2.14.6 | **セットアップ画面**: 必要なもの（claude CLI の存在 / MCP 登録 / tako CLI の PATH 設置）を**自動診断してチェックリスト表示**し、不足項目は「**セットアップ実行**」ボタン一発でまとめて自動導入する（FR-2.14.1 / 2.14.2 / 2.14.5 の UI 統合。手動手順をユーザーに踏ませない）。診断・セットアップ実行は CLI / MCP からも可能（FR-2.14.4 の対象に含める。2026-06-12 追記） | S |
-| FR-2.14.7 | `tako setup` は claude / codex / agy を全検出し、1 CLI なら自動選択、複数なら認証状態つきで選択させる。取得可能な認証・プランは自動反映し、取得不能な Claude / GPT / Google プランだけ対話で補完する。プラン規模から profiles/default.yaml の master / worker エージェント、CLI 既定モデル、effort、worker ポリシーを推奨生成する（Issue #226） | S |
+| FR-2.14.7 | `tako setup` は claude / codex / agy を全検出し、1 CLI なら自動選択、複数なら認証状態つきで選択させる。取得可能な認証・プランは source を `detected` と表示して確認なしで自動反映し、導入・認証済み CLI で取得不能なプランだけ対話で補完する。未導入・未認証プロバイダは質問しない。プラン規模から profiles/default.yaml の master / worker エージェント、CLI 既定モデル、effort、worker ポリシーを推奨生成する（Issue #226 / #262） | S |
 
 実装メモ（着手時に設計する）:
 
