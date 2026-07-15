@@ -131,7 +131,7 @@ pub(super) fn pdf_text_hit_test(
 ///
 /// `image_bounds` は GPUI のスクロールで既にパン済みの画面座標なので、倍率と移動量を
 /// ここへ二重適用しない。テキスト選択・ハイライトは常に実際の画像矩形へ追従する。
-fn pdf_box_to_screen(
+pub(crate) fn pdf_box_to_screen(
     bbox: [f64; 4],
     page_size: [f64; 2],
     image_bounds: Bounds<Pixels>,
@@ -2657,6 +2657,23 @@ impl TakoApp {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                            // ⌘クリック: PDF リンクを開く（#271）
+                            if ev.modifiers.platform && ev.click_count == 1 {
+                                if let Some(link_idx) = this.preview_pdf_hovered_link
+                                    .filter(|(pid, _)| *pid == pane_id)
+                                    .map(|(_, idx)| idx)
+                                {
+                                    this.follow_pdf_link(pane_id, link_idx, cx);
+                                    this.preview_pdf_hovered_link = None;
+                                    cx.notify();
+                                    return;
+                                }
+                                if let Some(idx) = this.pdf_link_at_position(pane_id, ev.position) {
+                                    this.follow_pdf_link(pane_id, idx, cx);
+                                    cx.notify();
+                                    return;
+                                }
+                            }
                             if let Some(pos) = this.preview_hit_test(pane_id, ev.position) {
                                 this.preview_selections.insert(
                                     pane_id,

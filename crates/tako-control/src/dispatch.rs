@@ -1213,6 +1213,26 @@ fn dispatch_inner(
                 "outline": outline.items,
             }))
         }
+        Request::PreviewLinkList { pane } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let links = host.preview_pdf_links(target).ok_or_else(|| {
+                DispatchError::Operation(format!(
+                    "PDF プレビューペインではない: {}",
+                    target.as_u64()
+                ))
+            })?;
+            Ok(json!({
+                "pane": target.as_u64(),
+                "links": links.links,
+            }))
+        }
+        Request::PreviewFollowLink { pane, index } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let result = host
+                .follow_preview_pdf_link(target, index)
+                .map_err(DispatchError::Operation)?;
+            Ok(result)
+        }
         Request::PreviewReload { enabled } => {
             if let Some(enabled) = enabled {
                 host.set_preview_reload(enabled);

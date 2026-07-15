@@ -348,6 +348,11 @@ pub enum Request {
         pane: Option<u64>,
         item: Option<usize>,
     },
+    /// PDF プレビュー内のリンク一覧取得（Issue #271）。
+    PreviewLinkList { pane: Option<u64> },
+    /// PDF プレビュー内のリンクをフォローする（Issue #271）。
+    /// `index` は link-list で返る 0 始まりインデックス。
+    PreviewFollowLink { pane: Option<u64>, index: usize },
     /// 表示中プレビューファイルのライブリロード設定（Issue #233）。
     /// `enabled` 省略時は現在状態の取得のみ。設定は永続化される。
     PreviewReload { enabled: Option<bool> },

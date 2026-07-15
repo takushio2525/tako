@@ -731,6 +731,32 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_preview_link_list",
+            "description": "PDF プレビュー内のリンク（外部 URL・内部ページ参照）を一覧する。\
+                ページインデックスは 0 始まり、リンクの index は follow-link で使う。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象 PDF プレビューペイン ID（省略時は呼び出し元）"),
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_preview_follow_link",
+            "description": "PDF プレビュー内のリンクをフォローする。外部 URL はブラウザで開き、\
+                内部リンクは該当ページへジャンプする。index は link-list の結果で得られる 0 始まりインデックス。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象 PDF プレビューペイン ID（省略時は呼び出し元）"),
+                    "index": { "type": "integer", "minimum": 0, "description": "フォローするリンクのインデックス（0 始まり）" },
+                },
+                "required": ["index"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_preview_reload",
             "description": "表示中プレビューファイルのライブリロードを設定する。enabled 省略時は現在状態を返す。\
                 有効時は外部変更をイベント駆動で検知し、デバウンス後に background で再構築する。\
@@ -2399,6 +2425,13 @@ fn build_request(
             pane: Some(target_pane(args, caller)?),
             item: u64_arg(args, "item")?.map(|item| item as usize),
         },
+        "tako_preview_link_list" => Request::PreviewLinkList {
+            pane: Some(target_pane(args, caller)?),
+        },
+        "tako_preview_follow_link" => Request::PreviewFollowLink {
+            pane: Some(target_pane(args, caller)?),
+            index: u64_arg(args, "index")?.ok_or("index を指定する")? as usize,
+        },
         "tako_preview_reload" => Request::PreviewReload {
             enabled: bool_arg(args, "enabled")?,
         },
@@ -3517,7 +3550,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 89);
+        assert_eq!(tools.len(), 91);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

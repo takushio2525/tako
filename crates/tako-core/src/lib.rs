@@ -13,6 +13,7 @@ pub mod pane;
 pub mod pane_log;
 pub mod pane_tree;
 pub mod paths;
+pub mod pdf_links;
 pub mod ports;
 pub mod preview_cache;
 pub mod preview_outline;
@@ -48,6 +49,7 @@ pub use pane_tree::{
     ratio_for_position, PaneBorder, PaneNode, PaneTree, PaneTreeError, Rect, SplitAxis,
     SplitDirection,
 };
+pub use pdf_links::{PdfLink, PdfLinkTarget, PdfLinks};
 pub use ports::ListenPort;
 pub use preview_cache::{
     preview_cache_bytes, PreviewCacheStats, PREVIEW_CACHE_DEFAULT_MB, PREVIEW_CACHE_MAX_MB,

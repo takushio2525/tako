@@ -232,6 +232,18 @@ pub trait PreviewHost {
     ) -> Result<PreviewOutlineTarget, String> {
         Err("アウトラインナビゲーションは未対応".into())
     }
+    /// PDF プレビュー内のリンク一覧（Issue #271）。
+    fn preview_pdf_links(&self, _pane: PaneId) -> Option<tako_core::PdfLinks> {
+        None
+    }
+    /// PDF プレビュー内のリンクをフォローする（Issue #271）。
+    fn follow_preview_pdf_link(
+        &mut self,
+        _pane: PaneId,
+        _index: usize,
+    ) -> Result<serde_json::Value, String> {
+        Err("PDF リンクフォローは未対応".into())
+    }
     /// 表示中ファイルのライブリロード設定（Issue #233）。
     fn preview_reload_enabled(&self) -> bool {
         true
