@@ -126,7 +126,7 @@ enum Command {
     /// MCP 連携（serve = stdio ブリッジ。エージェントの MCP クライアントが起動する）
     #[command(subcommand)]
     Mcp(McpCommand),
-    /// 対話式セットアップ。claude / codex / agy を検出・選択して環境を最適化する。
+    /// 質問ゼロの自動セットアップ。claude / codex / agy を検出して環境を最適化する。
     /// アプリ未起動でも実行できる
     Setup(SetupArgs),
     /// Claude Code の settings.json に tako MCP サーバーの接続設定を追加する。
@@ -1509,6 +1509,15 @@ struct SetupArgs {
     /// --changes の出力を JSON にする（MCP tako_setup_changes と同一ペイロード）
     #[arg(long, requires = "changes")]
     json: bool,
+    /// 検出値・前回値・既定値を使い、標準入力を読まずにセットアップする
+    #[arg(long, conflicts_with_all = ["check", "changes", "review"])]
+    yes: bool,
+    /// 全回答を JSON、@ファイル、または -（標準入力）で与える（指定時は非対話）
+    #[arg(long, value_name = "JSON|@FILE|-", conflicts_with_all = ["check", "changes", "review"])]
+    answers: Option<String>,
+    /// 前回設定を setup agent と個別に見直す
+    #[arg(long, conflicts_with_all = ["check", "changes", "yes", "answers"])]
+    review: bool,
 }
 
 #[derive(Args)]
@@ -1592,9 +1601,15 @@ fn main() -> ExitCode {
             } else if args.changes {
                 setup::run_changes(args.json)
             } else if args.reset {
-                setup::run_reset().and_then(|()| setup::run_setup())
+                setup::load_answers(args.answers.as_deref()).and_then(|answers| {
+                    setup::run_reset().and_then(|()| {
+                        setup::run_setup(args.yes || args.answers.is_some(), args.review, &answers)
+                    })
+                })
             } else {
-                setup::run_setup()
+                setup::load_answers(args.answers.as_deref()).and_then(|answers| {
+                    setup::run_setup(args.yes || args.answers.is_some(), args.review, &answers)
+                })
             }
         }
         Command::SetupMcp(ref args) => setup_mcp_local(args),

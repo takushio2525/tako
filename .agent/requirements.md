@@ -341,7 +341,9 @@ Phase 3 設計時の指針:
 | FR-2.14.4 | 登録・診断は CLI / MCP からも可能にする（開発不変条件） | M |
 | FR-2.14.5 | `tako` CLI バイナリの PATH 設置（`/usr/local/bin` 等へのシムリンク作成・更新）もオンボーディングに含める。tako 内のシェルから `tako` コマンドが素で使えることが Layer 1（CLI）の前提（2026-06-12 追記） | S |
 | FR-2.14.6 | **セットアップ画面**: 必要なもの（claude CLI の存在 / MCP 登録 / tako CLI の PATH 設置）を**自動診断してチェックリスト表示**し、不足項目は「**セットアップ実行**」ボタン一発でまとめて自動導入する（FR-2.14.1 / 2.14.2 / 2.14.5 の UI 統合。手動手順をユーザーに踏ませない）。診断・セットアップ実行は CLI / MCP からも可能（FR-2.14.4 の対象に含める。2026-06-12 追記） | S |
-| FR-2.14.7 | `tako setup` は claude / codex / agy を全検出し、1 CLI なら自動選択、複数なら認証状態つきで選択させる。取得可能な認証・プランは自動反映し、取得不能な Claude / GPT / Google プランだけ対話で補完する。プラン規模から profiles/default.yaml の master / worker エージェント、CLI 既定モデル、effort、worker ポリシーを推奨生成する（Issue #226） | S |
+| FR-2.14.7 | `tako setup` は claude / codex / agy を全検出する。取得可能な認証・プランは source を `detected` と表示して即時採用し、未導入・未認証プロバイダは設定対象にしない。検出不能でも安全な既定値を置ける項目は source `default` で自動解決する。CLI 1 つ・認証済みの標準ケースは質問ゼロで完走し、プラン規模から profiles/default.yaml の master / worker、CLI 既定モデル、effort、worker ポリシーを推奨生成する。質問は「検出不能かつ誤ると実害がある」項目だけに限定し、Enter で進める既定値を必ず示す（Issue #226 / #262） | S |
+| FR-2.14.8 | setup 完了済みなら config の agent / provider plan、既存 profile・指示・プロジェクト、設定済み依存・FDA・スリープ設定を確認なしで引き継ぎ、冪等な再実行は質問ゼロ・実変更ゼロで完了する。source は `previous` と表示し、新しい検出値と食い違う場合は `detected` を優先して旧値も通知する。破損 config は既定値で上書きせず中断する。個別対話による見直しは明示的な `--review` だけで起動する（Issue #262） | S |
+| FR-2.14.9 | setup の全入力（agent、provider plan、グローバル指示、default profile、projects、orchestrator 挙動、sleep guard）は `tako setup --answers <json|@file|->` で非対話指定できる。`--yes` は省略値を detected → previous → default で解決して標準入力を読まない。同じ JSON を dispatch `SetupRun` / MCP `tako_setup` へ 1:1 公開し、AI がユーザーの自然言語の希望を回答 JSON に変換して setup を代行できる。標準実行は最終サマリを表示し、項目別確認も最終確認も要求しない（Issue #262） | S |
 
 実装メモ（着手時に設計する）:
 

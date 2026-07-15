@@ -650,8 +650,13 @@ pub enum Request {
     },
     /// setup のアップデート追従状況の照会（Issue #94）。
     /// 適用済みリビジョン・現在リビジョン・未適用の setup 関連変更の一覧を返す。
-    /// 適用自体は `tako setup`（対話）が行い、これは読み取り専用
+    /// 適用自体は `tako setup`（自動適用、個別見直しは --review）が行い、これは読み取り専用
     SetupChanges,
+    /// setup を非対話実行する（Issue #262）。answers は CLI `tako setup --answers` と同じ JSON。
+    SetupRun {
+        #[serde(default)]
+        answers: Option<serde_json::Value>,
+    },
     /// エージェント共通ルールの同期（Issue #136）。
     /// `action` = "sync"（同期実行）/ "status"（状態確認）
     AgentsSyncRules {
@@ -1005,6 +1010,7 @@ mod tests {
         // フィールド無し variant / struct variant の両形
         assert_eq!(Request::List.kind_name(), "List");
         assert_eq!(Request::SetupChanges.kind_name(), "SetupChanges");
+        assert_eq!(Request::SetupRun { answers: None }.kind_name(), "SetupRun");
         assert_eq!(Request::TmuxList { socket: None }.kind_name(), "TmuxList");
     }
 }

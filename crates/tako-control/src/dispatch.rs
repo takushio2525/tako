@@ -2007,8 +2007,20 @@ fn dispatch_inner(
 
         Request::SetupChanges => {
             // 読み取り専用・プロセス内完結（アプリ状態に依存しない）。
-            // 追従の適用は `tako setup` の対話フロー側の責務（Issue #94）
+            // 追従の適用は `tako setup` の自動適用フロー側の責務（Issue #94）
             crate::setup::changes_status().map_err(DispatchError::Operation)
+        }
+
+        Request::SetupRun { answers } => {
+            let answers_value = answers.clone().unwrap_or_else(|| serde_json::json!({}));
+            let parsed: crate::setup::SetupAnswers = serde_json::from_value(answers_value)
+                .map_err(|e| DispatchError::InvalidParams(format!("setup answers が不正: {e}")))?;
+            parsed.validate().map_err(DispatchError::InvalidParams)?;
+            let answers_json = serde_json::to_string(&parsed).map_err(|e| {
+                DispatchError::Operation(format!("setup answers の JSON 化に失敗: {e}"))
+            })?;
+            let tako_bin = resolve_tako_binary();
+            run_setup_cli(&tako_bin, &answers_json)
         }
 
         Request::AgentsSyncRules {
@@ -3897,6 +3909,42 @@ pub fn resolve_tako_binary() -> String {
         }
     }
     "tako".to_string()
+}
+
+/// dispatch / MCP の回答 JSON を CLI の非対話 stdin 経路へ渡す。
+/// 回答本文を argv に含めず、プロセス一覧や診断情報へ露出させない。
+fn run_setup_cli(tako_bin: &str, answers_json: &str) -> Result<Value, DispatchError> {
+    use std::io::Write as _;
+
+    let mut child = std::process::Command::new(tako_bin)
+        .args(["setup", "--yes", "--answers", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| DispatchError::Operation(format!("tako setup の起動に失敗: {e}")))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| DispatchError::Operation("tako setup の標準入力を開けない".into()))?
+        .write_all(answers_json.as_bytes())
+        .map_err(|e| DispatchError::Operation(format!("setup answers の送信に失敗: {e}")))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| DispatchError::Operation(format!("tako setup の完了待ちに失敗: {e}")))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        return Err(DispatchError::Operation(format!(
+            "tako setup が失敗しました (exit={}): {}",
+            output.status.code().unwrap_or(-1),
+            if stderr.is_empty() { &stdout } else { &stderr }
+        )));
+    }
+    Ok(serde_json::json!({
+        "completed": true,
+        "output": if stderr.is_empty() { stdout } else { stderr },
+    }))
 }
 
 fn check_health(host: &dyn ControlHost) -> Value {
@@ -7600,5 +7648,38 @@ mod tests {
             PaneOrigin::Cli,
         );
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_runはanswersをargvでなくstdinからcliへ渡す() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let script = std::env::temp_dir().join(format!(
+            "tako-dispatch-setup-{}-{}.sh",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             payload=$(/bin/cat)\n\
+             if [ \"$1\" != setup ] || [ \"$2\" != --yes ] || \
+                [ \"$3\" != --answers ] || [ \"$4\" != - ] || \
+                [ \"$payload\" != '{\"selected_agent\":\"claude\"}' ]; then\n\
+               exit 2\n\
+             fi\n\
+             printf 'dispatch-setup-ok'\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let result =
+            run_setup_cli(script.to_str().unwrap(), r#"{"selected_agent":"claude"}"#).unwrap();
+        let _ = std::fs::remove_file(&script);
+        assert_eq!(result["completed"], true);
+        assert_eq!(result["output"], "dispatch-setup-ok");
     }
 }

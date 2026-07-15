@@ -1,7 +1,7 @@
 //! setup — `tako setup` の状態管理とアップデート追従（Issue #94）
 //!
 //! - config.yaml（`~/Library/Application Support/tako/orchestrator/config.yaml`）の
-//!   setup セクションのスキーマと読み書き（CLI の対話フローは tako-cli 側）
+//!   setup セクションのスキーマと読み書き（CLI の自動適用フローは tako-cli 側）
 //! - バイナリ埋め込みの setup changelog（`resources/setup/changes.yaml`）のパースと、
 //!   適用済みリビジョンとの突き合わせによる未適用変更の検出
 //!
@@ -15,6 +15,221 @@ use std::path::{Path, PathBuf};
 
 /// バイナリ埋め込みの setup changelog
 pub const CHANGES_YAML: &str = include_str!("../../../resources/setup/changes.yaml");
+
+/// setup が採用した値の出所。CLI 表示のラベルを共通化する（Issue #262）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupValueSource {
+    Detected,
+    Previous,
+    Default,
+    Input,
+}
+
+impl SetupValueSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Detected => "detected",
+            Self::Previous => "previous",
+            Self::Default => "default",
+            Self::Input => "input",
+        }
+    }
+}
+
+/// 最終サマリに表示する setup の 1 変更。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupPlanChange {
+    pub key: String,
+    pub before: Option<String>,
+    pub after: String,
+    pub source: SetupValueSource,
+}
+
+/// setup の値解決と書き込みを分離する変更計画（Issue #262 方針 C/D）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SetupPlan {
+    changes: Vec<SetupPlanChange>,
+}
+
+impl SetupPlan {
+    pub fn push_if_changed(
+        &mut self,
+        key: impl Into<String>,
+        before: Option<&str>,
+        after: impl Into<String>,
+        source: SetupValueSource,
+    ) {
+        let after = after.into();
+        if before == Some(after.as_str()) {
+            return;
+        }
+        self.changes.push(SetupPlanChange {
+            key: key.into(),
+            before: before.map(str::to_string),
+            after,
+            source,
+        });
+    }
+
+    pub fn changes(&self) -> &[SetupPlanChange] {
+        &self.changes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+
+    pub fn render_diff(&self) -> String {
+        self.changes
+            .iter()
+            .map(|change| {
+                format!(
+                    "  - {}: {} -> {} [{}]",
+                    change.key,
+                    change.before.as_deref().unwrap_or("(未設定)"),
+                    change.after,
+                    change.source.label()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// 検出値、前回値、既定値の優先順で setup 値を解決する。
+/// 検出値と前回値が違う場合は previous を残し、呼び出し側が差異を通知できるようにする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSetupValue {
+    pub value: String,
+    pub source: SetupValueSource,
+    pub previous: Option<String>,
+}
+
+pub fn resolve_setup_value(
+    detected: Option<&str>,
+    previous: Option<&str>,
+    default: Option<&str>,
+) -> Option<ResolvedSetupValue> {
+    if let Some(value) = detected {
+        return Some(ResolvedSetupValue {
+            value: value.to_string(),
+            source: SetupValueSource::Detected,
+            previous: previous
+                .filter(|previous| *previous != value)
+                .map(str::to_string),
+        });
+    }
+    if let Some(value) = previous {
+        return Some(ResolvedSetupValue {
+            value: value.to_string(),
+            source: SetupValueSource::Previous,
+            previous: None,
+        });
+    }
+    default.map(|value| ResolvedSetupValue {
+        value: value.to_string(),
+        source: SetupValueSource::Default,
+        previous: None,
+    })
+}
+
+/// CLI / dispatch / MCP から非対話 setup へ渡す全回答（Issue #262 要件 E）。
+/// 省略項目は detected → previous → default の順で解決する。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SetupAnswers {
+    pub selected_agent: Option<String>,
+    pub provider_plans: BTreeMap<String, String>,
+    /// 選択 agent のグローバル指示ファイルへ書く完全な Markdown。
+    /// 省略時は既存を維持し、未作成なら同梱既定値を使う。
+    pub instruction_content: Option<String>,
+    /// profiles/default.yaml の完全な内容。省略時は既存を維持し、未作成なら推奨生成する。
+    pub profile: Option<crate::orchestrator::Profile>,
+    /// projects.yaml の全プロジェクト。明示時だけ既存一覧を置き換える。
+    pub projects: Option<BTreeMap<String, crate::orchestrator::ProjectEntry>>,
+    pub orchestrator: Option<SetupOrchestratorAnswers>,
+    pub sleep_guard: Option<SetupSleepGuardAnswers>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SetupOrchestratorAnswers {
+    pub auto_close: Option<bool>,
+    pub auto_push: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SetupSleepGuardAnswers {
+    /// off / on / while-agents-running
+    pub mode: Option<String>,
+    /// ac-only / always
+    pub power: Option<String>,
+}
+
+impl SetupAnswers {
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let answers: Self =
+            serde_json::from_str(input).map_err(|e| format!("setup answers JSON が不正: {e}"))?;
+        answers.validate()?;
+        Ok(answers)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(agent) = self.selected_agent.as_deref() {
+            if !matches!(agent, "claude" | "codex" | "agy") {
+                return Err(format!(
+                    "selected_agent は claude / codex / agy のいずれかです: {agent}"
+                ));
+            }
+        }
+        for provider in self.provider_plans.keys() {
+            if !matches!(provider.as_str(), "claude" | "gpt" | "google") {
+                return Err(format!(
+                    "provider_plans のキーは claude / gpt / google のいずれかです: {provider}"
+                ));
+            }
+        }
+        if self
+            .instruction_content
+            .as_deref()
+            .is_some_and(|content| content.trim().is_empty())
+        {
+            return Err("instruction_content は空にできません".to_string());
+        }
+        if let Some(profile) = &self.profile {
+            profile.resolve_master_agent()?;
+            profile.resolve_worker_agent(None)?;
+        }
+        if let Some(projects) = &self.projects {
+            for (key, project) in projects {
+                if key.trim().is_empty() {
+                    return Err("projects のキーは空にできません".to_string());
+                }
+                if project.cwd.trim().is_empty() {
+                    return Err(format!("projects.{key}.cwd は空にできません"));
+                }
+            }
+        }
+        if let Some(sleep) = &self.sleep_guard {
+            if let Some(mode) = sleep.mode.as_deref() {
+                if !matches!(mode, "off" | "on" | "while-agents-running") {
+                    return Err(format!(
+                        "sleep_guard.mode は off / on / while-agents-running のいずれかです: {mode}"
+                    ));
+                }
+            }
+            if let Some(power) = sleep.power.as_deref() {
+                if !matches!(power, "ac-only" | "always") {
+                    return Err(format!(
+                        "sleep_guard.power は ac-only / always のいずれかです: {power}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 // --- config.yaml のスキーマ ---
 
@@ -125,7 +340,7 @@ pub struct SetupState {
     /// 最後の setup で選択したエージェント CLI（Issue #226）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_agent: Option<String>,
-    /// setup が自動検出または対話で確認したプロバイダ別プラン。
+    /// setup が自動検出、前回値、既定値、または answers で解決したプロバイダ別プラン。
     /// キーは claude / gpt / google。token やアカウント識別子は保存しない。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub provider_plans: BTreeMap<String, String>,
@@ -307,6 +522,80 @@ pub fn render_pending_markdown(pending: &[SetupChange], applied_revision: u32) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup値はdetected_previous_defaultの順で解決する() {
+        let detected = resolve_setup_value(Some("pro"), Some("free"), Some("unknown")).unwrap();
+        assert_eq!(detected.value, "pro");
+        assert_eq!(detected.source, SetupValueSource::Detected);
+        assert_eq!(detected.previous.as_deref(), Some("free"));
+        assert_eq!(detected.source.label(), "detected");
+
+        let previous = resolve_setup_value(None, Some("max-20x"), Some("unknown")).unwrap();
+        assert_eq!(previous.source, SetupValueSource::Previous);
+        assert_eq!(previous.source.label(), "previous");
+
+        let default = resolve_setup_value(None, None, Some("unknown")).unwrap();
+        assert_eq!(default.source, SetupValueSource::Default);
+        assert_eq!(default.source.label(), "default");
+        assert!(resolve_setup_value(None, None, None).is_none());
+    }
+
+    #[test]
+    fn setup_planは実差分だけをsource付きで描画する() {
+        let mut plan = SetupPlan::default();
+        plan.push_if_changed(
+            "setup.selected_agent",
+            Some("claude"),
+            "claude",
+            SetupValueSource::Previous,
+        );
+        assert!(plan.is_empty());
+
+        plan.push_if_changed(
+            "setup.provider_plans.claude",
+            Some("free"),
+            "pro",
+            SetupValueSource::Detected,
+        );
+        plan.push_if_changed(
+            "profiles/default.yaml",
+            None,
+            "推奨 profile を作成",
+            SetupValueSource::Default,
+        );
+        assert_eq!(plan.changes().len(), 2);
+        let diff = plan.render_diff();
+        assert!(diff.contains("free -> pro [detected]"));
+        assert!(diff.contains("(未設定) -> 推奨 profile を作成 [default]"));
+    }
+
+    #[test]
+    fn setup_answersは全項目をparseして不正値を拒否する() {
+        let answers = SetupAnswers::from_json(
+            r##"{
+                "selected_agent":"codex",
+                "provider_plans":{"gpt":"plus"},
+                "instruction_content":"# Rules",
+                "profile":{"master_agent":"codex","effort":"high","worker_model_policy":"inherit"},
+                "projects":{"app":{"cwd":"~/src/app","description":"main app"}},
+                "orchestrator":{"auto_close":false,"auto_push":true},
+                "sleep_guard":{"mode":"while-agents-running","power":"ac-only"}
+            }"##,
+        )
+        .unwrap();
+        assert_eq!(answers.selected_agent.as_deref(), Some("codex"));
+        assert_eq!(answers.provider_plans["gpt"], "plus");
+        assert_eq!(answers.projects.as_ref().unwrap()["app"].cwd, "~/src/app");
+        assert_eq!(
+            answers.orchestrator.as_ref().unwrap().auto_close,
+            Some(false)
+        );
+        assert!(SetupAnswers::from_json(r#"{"selected_agent":"unknown"}"#).is_err());
+        assert!(SetupAnswers::from_json(r#"{"extra":true}"#).is_err());
+        assert!(SetupAnswers::from_json(r#"{"instruction_content":"  "}"#).is_err());
+        assert!(SetupAnswers::from_json(r#"{"projects":{"":{"cwd":"x"}}}"#).is_err());
+    }
 
     #[test]
     fn config_roundtrip() {

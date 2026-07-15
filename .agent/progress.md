@@ -770,3 +770,21 @@
 
 ## 2026-07-15（#258: 完了）
 - PR #260を`530d568`へsquash mergeし、ブランチ削除・Issue完了コメントまで実施。installはmaster側へ引き渡し
+
+## 2026-07-15（#262: setup UX 全面見直し — 根本原因調査）
+- 実ユーザー設定の隔離コピーで v0.5.3 setup を 2 回実走し、両方とも CLI 側だけで
+  5 問を再現。GPT 検出だけ採用、前回 agent / plan は未使用と確認
+- config 読み込み順、全 provider 巡回、設定済み項目・profile の再確認、agent 二重対話を
+  根因として Issue #262 と `.agent/investigations/issue-262-setup-ux.md` に記録
+
+## 2026-07-15（#262: setup UX 方針 A/B 実装）
+- 認証済み・導入済み provider だけをプラン解決対象にし、detected / previous / default の
+  優先解決を tako-control に集約。検出値の食い違いは detected 優先で通知
+- config を質問前に読み、2 回目 Enter で agent / plan / profile を引き継ぐ冪等経路を追加。
+  claude 単独・3 CLI の隔離 E2E で追加質問 0・setup agent 再起動なしを確認
+
+## 2026-07-15（#262: setup UX 方針 C/D/E 実装・検証）
+- 標準 setup を最終サマリだけの質問ゼロへ変更し、`--yes` / 全項目 `--answers` /
+  dispatch `SetupRun` / MCP `tako_setup` と明示 `--review` を実装
+- 初回・2回目・`--yes`・未認証を before 5+/5+/未実装/1 → after 全 0 入力で実測。
+  実 Claude Max 認証、検出競合、破損 config、複数 CLI、全品質ゲートも全緑

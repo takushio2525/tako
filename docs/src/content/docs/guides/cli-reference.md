@@ -21,11 +21,22 @@ tako split --help
 
 ### tako setup
 
-AI 連携に必要な設定を対話形式でまとめて行います。claude / codex / agy の検出・選択、認証とプラン確認、プラン規模に応じた profile 推奨生成、選択した AI による対話ガイド、という流れです。CLI が1つだけなら自動選択されます。tako アプリが起動していなくても実行できます。詳しくは[セットアップガイド](/getting-started/#3-tako-setup--対話式セットアップai-連携する場合)を参照してください。
+AI 連携に必要な設定を質問ゼロでまとめて行います。claude / codex / agy の認証・プランを検出し、前回値、安全な既定値の順で不足を補い、値の source と最終サマリを表示します。CLI が1つ・認証済みの標準ケースは人間の入力なしで完走します。tako アプリが起動していなくても実行できます。詳しくは[セットアップガイド](/getting-started/#3-tako-setup--質問ゼロの自動セットアップ)を参照してください。
 
 ```bash
-# 対話式セットアップを開始
+# 自動セットアップ（標準ケースは質問ゼロ）
 tako setup
+
+# 標準入力を一切読まずに自動セットアップ
+tako setup --yes
+
+# 全回答を JSON、ファイル、標準入力のいずれかで指定
+tako setup --answers '{"selected_agent":"codex","provider_plans":{"gpt":"plus"}}'
+tako setup --answers @setup-answers.json
+generate-answers | tako setup --answers -
+
+# 前回設定を AI と個別に見直す
+tako setup --review
 
 # 環境チェックだけ実行（3 CLI の有無・認証・プラン・MCP・セットアップ状態を表示）
 tako setup --check
@@ -40,7 +51,9 @@ tako setup --changes --json
 tako setup --reset
 ```
 
-tako のアップデートでセットアップ項目・設定フォーマット・master 用システムプロンプトが変わることがあります。`--changes` で未適用の変更を確認でき、`tako setup` を再実行すると対話の中で最新状態へ追従できます（詳細は[セットアップガイド](/getting-started/#アップデート後の追従-tako-setup-の再実行)）。
+tako のアップデートでセットアップ項目・設定フォーマット・master 用システムプロンプトが変わることがあります。`--changes` で未適用の変更を確認でき、`tako setup` を再実行すると既存カスタマイズを維持しながら最新状態へ追従できます（詳細は[セットアップガイド](/getting-started/#アップデート後の追従-tako-setup-の再実行)）。
+
+`--answers` は `selected_agent`、`provider_plans`、`instruction_content`、`profile`、`projects`、`orchestrator`、`sleep_guard` を受け取ります。同じ JSON は dispatch `SetupRun` と MCP `tako_setup` でも利用できるため、AI に日本語で希望を伝えてセットアップを代行させられます。`projects` は指定時に全登録を置き換えます。
 
 ### tako setup-mcp
 
@@ -525,7 +538,7 @@ tako orchestrator projects remove --key webapp
 
 ### tako orchestrator profiles
 
-マスター・worker が使うモデルや思考量（effort）の設定です。**通常は `tako setup` の対話や master への依頼で変更すれば済みます**。コマンドで直接変更したいとき用です。
+マスター・worker が使うモデルや思考量（effort）の設定です。**通常は master への依頼か `tako_setup` / `tako setup --answers` で変更すれば済みます**。コマンドで直接変更したいとき用です。
 
 ```bash
 # プロファイル一覧（model: null は「claude の既定モデルで起動」の意味）
