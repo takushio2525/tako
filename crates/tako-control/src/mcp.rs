@@ -1345,14 +1345,15 @@ pub fn tools() -> Vec<Value> {
                 action=list で一覧（project / task_type でフィルタ、limit で件数制限）、\
                 stats で task_type x model の集計（成功率・差し戻し率・平均所要時間・未評価数）、\
                 record で検収結果の記録（id + outcome + rounds + note）、\
-                amend で事後修正（検収 pass だが実使用で問題発覚。id + note）。\
+                amend で事後修正（検収 pass だが実使用で問題発覚。id + note）、\
+                prune で project 前方一致によるエントリ除去（project 必須。selftest 混入等の掃除用）。\
                 spawn / run 時に task_type を指定すると自動記録され、stats で判断材料になる。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list", "stats", "record", "amend"],
+                        "enum": ["list", "stats", "record", "amend", "prune"],
                         "description": "操作種別",
                     },
                     "id": { "type": "string", "description": "対象エントリ ID（record / amend 時に必須。spawn 応答の ledger_id）" },

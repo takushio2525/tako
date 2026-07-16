@@ -217,6 +217,13 @@ impl Ledger {
     pub fn unevaluated_count(&self) -> usize {
         self.entries.iter().filter(|e| e.outcome.is_none()).count()
     }
+
+    /// project が prefix に前方一致するエントリを除去し、除去件数を返す
+    pub fn prune_by_project_prefix(&mut self, prefix: &str) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|e| !e.project.starts_with(prefix));
+        before - self.entries.len()
+    }
 }
 
 /// 集計行
@@ -742,5 +749,76 @@ mod tests {
         assert!(section.contains("Delegation Judgment Criteria"));
         assert!(section.contains("Built-in Defaults"));
         assert!(section.contains("Survey Frequency Control"));
+    }
+
+    fn make_entry(id: &str, project: &str) -> LedgerEntry {
+        LedgerEntry {
+            id: id.into(),
+            ts: "t".into(),
+            project: project.into(),
+            label: None,
+            issue: None,
+            task_type: "docs".into(),
+            model: "m".into(),
+            effort: None,
+            agent: None,
+            duration_seconds: None,
+            ctx_percent: None,
+            had_error: false,
+            outcome: None,
+            rounds: None,
+            note: None,
+            post_issue: false,
+            amend_note: None,
+        }
+    }
+
+    #[test]
+    fn prune_removes_matching_entries() {
+        let mut ledger = Ledger {
+            entries: vec![
+                make_entry("s1", "tako-selftest-165"),
+                make_entry("s2", "tako"),
+                make_entry("s3", "tako-selftest-200"),
+                make_entry("s4", "other-project"),
+            ],
+        };
+        let removed = ledger.prune_by_project_prefix("tako-selftest-");
+        assert_eq!(removed, 2);
+        assert_eq!(ledger.entries.len(), 2);
+        assert_eq!(ledger.entries[0].id, "s2");
+        assert_eq!(ledger.entries[1].id, "s4");
+    }
+
+    #[test]
+    fn prune_zero_matches() {
+        let mut ledger = Ledger {
+            entries: vec![make_entry("s1", "tako"), make_entry("s2", "other")],
+        };
+        let removed = ledger.prune_by_project_prefix("tako-selftest-");
+        assert_eq!(removed, 0);
+        assert_eq!(ledger.entries.len(), 2);
+    }
+
+    #[test]
+    fn prune_with_file_roundtrip() {
+        let dir = isolated_dir("prune");
+        let path = dir.join("ledger.yaml");
+
+        let mut ledger = Ledger::default();
+        ledger.append(make_entry("s1", "tako-selftest-1"));
+        ledger.append(make_entry("s2", "real-project"));
+        ledger.append(make_entry("s3", "tako-selftest-2"));
+        ledger.save_to(&path).unwrap();
+
+        let removed =
+            Ledger::mutate_at(&path, |l| l.prune_by_project_prefix("tako-selftest-")).unwrap();
+        assert_eq!(removed, 2);
+
+        let loaded = Ledger::load_from(&path).unwrap();
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].project, "real-project");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

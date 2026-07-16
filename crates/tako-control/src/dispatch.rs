@@ -4923,8 +4923,16 @@ fn dispatch_orchestrator_ledger(p: LedgerParams) -> Result<Value, DispatchError>
             ledger::amend_entry(&id, &note).map_err(DispatchError::Operation)?;
             Ok(json!({"ok": true, "id": id, "post_issue": true}))
         }
+        "prune" => {
+            let prefix = project.ok_or_else(|| {
+                DispatchError::InvalidParams("project（前方一致プレフィックス）は必須".into())
+            })?;
+            let removed = ledger::Ledger::mutate(|l| l.prune_by_project_prefix(&prefix))
+                .map_err(DispatchError::Operation)?;
+            Ok(json!({"ok": true, "prefix": prefix, "removed": removed}))
+        }
         _ => Err(DispatchError::InvalidParams(format!(
-            "不正な action '{action}'。使用可能: list, stats, record, amend"
+            "不正な action '{action}'。使用可能: list, stats, record, amend, prune"
         ))),
     }
 }
