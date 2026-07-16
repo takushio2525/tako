@@ -3,6 +3,18 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.5] - 2026-07-17
+
+Nightly patch release (automated). Changes since v0.5.4:
+夜間パッチリリース（自動）。v0.5.4 以降の変更:
+
+- [機能追加] setup 完了後にエージェント起動ランチャーを追加 (#295) (#296)
+- [改善] remote の dispatch 統合 + WS broadcaster 化 + API v2 (#281) (#294)
+- [修正] remote daemon の封じ込め修正 (#280) (#290)
+- [修正] self/spawn の caller 解決に pid 祖先辿りを一次化 (#288) (#291)
+- [ドキュメント] Tailscale Serve PoC 実測レポート (#279)
+- [ドキュメント] tako remote 全面刷新計画（Tailscale一本化 + UI刷新）に改訂
+
 ## [0.5.3] - 2026-07-15
 
 Nightly patch release (automated). Changes since v0.5.2:
