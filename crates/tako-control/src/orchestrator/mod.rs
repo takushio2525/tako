@@ -5,6 +5,7 @@
 //! tako をインストールするだけで使える。
 
 pub mod agent;
+pub mod ledger;
 pub mod wait;
 
 use serde::{Deserialize, Serialize};
@@ -676,10 +677,13 @@ impl Profile {
         lines.join("\n")
     }
 
-    /// worker_model_policy に基づいて model-policy セクションのテキストを生成する
+    /// worker_model_policy に基づいて model-policy セクションのテキストを生成する。
+    /// judgment 二層（雛形 + ローカル）を末尾に注入する（Issue #292）
     fn generate_model_policy_section(&self) -> String {
         let base = self.generate_model_policy_base();
-        format!("{base}{}", self.generate_worker_agents_section())
+        let agents = self.generate_worker_agents_section();
+        let judgment = ledger::build_judgment_section();
+        format!("{base}{agents}{judgment}")
     }
 
     fn generate_model_policy_base(&self) -> String {
@@ -1739,6 +1743,15 @@ prompt_blocks:
         // 既定はモデル無指定 = claude CLI の既定（[1m] を含まない）
         assert!(prompt.contains(CLAUDE_DEFAULT_LABEL));
         assert!(!prompt.contains("[1m]"));
+        // #292: judgment 二層が model-policy の後に注入されていること
+        let policy_pos = prompt.find("Worker Model Policy").unwrap();
+        let judgment_pos = prompt
+            .find("Delegation Judgment Criteria")
+            .expect("judgment セクションが存在する");
+        assert!(judgment_pos > policy_pos, "judgment は model-policy の後");
+        assert!(prompt.contains("Built-in Defaults"));
+        assert!(prompt.contains("Survey Frequency Control"));
+        assert!(prompt.contains("bugfix-rooted"));
     }
 
     #[test]

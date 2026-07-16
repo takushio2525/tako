@@ -1035,6 +1035,9 @@ enum OrchestratorCommand {
         /// 子を出すタブ ID（そのタブのフォーカスペインを分割元にする）
         #[arg(long)]
         tab: Option<u64>,
+        /// 委任台帳の task_type（省略時は investigation）
+        #[arg(long)]
+        task_type: Option<String>,
     },
     /// worker の状態確認（busy / idle / error / gone / unknown。error 時は
     /// error.kind（api_error / usage_limit / limit_dialog）と recommended_action を含む。#157）
@@ -1094,6 +1097,9 @@ enum OrchestratorCommand {
         /// 返す出力の末尾行数（省略時 200）
         #[arg(long, default_value = "200")]
         output_lines: usize,
+        /// 委任台帳の task_type（省略時は investigation）
+        #[arg(long)]
+        task_type: Option<String>,
     },
     /// 非同期 run の進捗照会（#121）。run_id 省略時は全 run の一覧
     #[command(name = "run-status")]
@@ -1106,6 +1112,49 @@ enum OrchestratorCommand {
     RunResult {
         /// 回収する run_id
         run_id: String,
+    },
+    /// 委任台帳の操作（Issue #292）
+    #[command(subcommand)]
+    Ledger(LedgerCommand),
+}
+
+#[derive(Subcommand)]
+enum LedgerCommand {
+    /// 台帳エントリの一覧
+    List {
+        /// フィルタ: プロジェクト
+        #[arg(long)]
+        project: Option<String>,
+        /// フィルタ: task_type
+        #[arg(long)]
+        task_type: Option<String>,
+        /// 返す件数の上限（既定 50）
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    /// task_type x model の集計
+    Stats,
+    /// 検収結果の記録
+    Record {
+        /// エントリ ID（spawn 応答の ledger_id）
+        id: String,
+        /// 検収結果
+        #[arg(long)]
+        outcome: String,
+        /// 差し戻し回数
+        #[arg(long)]
+        rounds: Option<u32>,
+        /// メモ
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// 事後修正（検収 pass だが実使用で問題発覚）
+    Amend {
+        /// エントリ ID
+        id: String,
+        /// 修正メモ
+        #[arg(long)]
+        note: String,
     },
 }
 
@@ -1710,6 +1759,7 @@ fn main() -> ExitCode {
             timeout,
             auto_close,
             output_lines,
+            ref task_type,
         }) => orchestrator_run(
             project,
             prompt,
@@ -1720,6 +1770,7 @@ fn main() -> ExitCode {
             timeout,
             auto_close,
             output_lines,
+            task_type.as_deref(),
         ),
         Command::Orchestrator(OrchestratorCommand::RunStatus { ref run_id }) => {
             let request = Request::OrchestratorRunStatus {
@@ -1733,6 +1784,7 @@ fn main() -> ExitCode {
             };
             send_request(request).map(|v| println!("{}", pretty_json(&v)))
         }
+        Command::Orchestrator(OrchestratorCommand::Ledger(ref sub)) => ledger_cli(sub),
         // gate 操作は YAML I/O + コマンド実行のみのためローカル処理（#244）
         Command::Task(TaskCommand::Gate(ref gate_sub)) => gate_cli(gate_sub),
         // remote コマンドはローカル処理（IPC 不要）
@@ -2217,6 +2269,7 @@ fn orchestrator_run(
     timeout_secs: u64,
     auto_close: bool,
     output_lines: usize,
+    task_type: Option<&str>,
 ) -> Result<(), String> {
     let pane_resolved = if pane.is_some() {
         pane
@@ -2245,6 +2298,7 @@ fn orchestrator_run(
         // claude 起動 + プロンプト送信を待つ
         initial_delay: std::time::Duration::from_secs(20),
         interval: std::time::Duration::from_secs(5),
+        task_type: task_type.map(str::to_string),
     };
     let mut exec = |req: Request| send_request(req);
     let result = wait::run_worker(&mut exec, &opts, &mut |pane_id, tmux| {
@@ -3312,6 +3366,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             effort,
             pane,
             tab,
+            task_type,
         }) => {
             let pane_resolved = if pane.is_some() {
                 *pane
@@ -3335,6 +3390,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 caller_role: std::env::var("TAKO_ORCHESTRATOR_ROLE").ok(),
                 agent: agent.clone(),
                 caller_pid: Some(std::process::id()),
+                task_type: task_type.clone(),
             }
         }
         Command::Orchestrator(OrchestratorCommand::SelfInfo { .. }) => {
@@ -3384,6 +3440,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }
         Command::Orchestrator(OrchestratorCommand::Layout { .. }) => {
             unreachable!("orchestrator layout は run() を通らない（ローカルで config.yaml を操作）")
+        }
+        Command::Orchestrator(OrchestratorCommand::Ledger(_)) => {
+            unreachable!("orchestrator ledger は run() を通らない（ローカル処理）")
         }
         Command::Web(sub) => {
             let dir = |right: bool, down: bool, left: bool, up: bool| match (down, left, up) {
@@ -3806,6 +3865,63 @@ fn build_request(command: &Command) -> Result<Request, String> {
             TaskCommand::Gate(_) => unreachable!("gate は main() でローカル処理する"),
         },
     })
+}
+
+/// 委任台帳のローカル処理（YAML I/O のみ。IPC 不要。#292）
+fn ledger_cli(sub: &LedgerCommand) -> Result<(), String> {
+    use tako_control::orchestrator::ledger;
+    match sub {
+        LedgerCommand::List {
+            project,
+            task_type,
+            limit,
+        } => {
+            let l = ledger::Ledger::load()?;
+            let mut entries: Vec<&ledger::LedgerEntry> = l.entries.iter().collect();
+            if let Some(p) = project {
+                entries.retain(|e| e.project == *p);
+            }
+            if let Some(t) = task_type {
+                entries.retain(|e| e.task_type == *t);
+            }
+            if entries.len() > *limit {
+                entries = entries[entries.len() - *limit..].to_vec();
+            }
+            let result = serde_json::json!({
+                "entries": entries,
+                "total": l.entries.len(),
+                "unevaluated": l.unevaluated_count(),
+            });
+            println!("{}", pretty_json(&result));
+            Ok(())
+        }
+        LedgerCommand::Stats => {
+            let l = ledger::Ledger::load()?;
+            let stats = l.stats();
+            let result = serde_json::json!({
+                "stats": stats,
+                "total_entries": l.entries.len(),
+                "unevaluated": l.unevaluated_count(),
+            });
+            println!("{}", pretty_json(&result));
+            Ok(())
+        }
+        LedgerCommand::Record {
+            id,
+            outcome,
+            rounds,
+            note,
+        } => {
+            ledger::record_outcome(id, outcome, *rounds, note.as_deref())?;
+            println!("recorded: {id} -> {outcome}");
+            Ok(())
+        }
+        LedgerCommand::Amend { id, note } => {
+            ledger::amend_entry(id, note)?;
+            println!("amended: {id} (post_issue=true)");
+            Ok(())
+        }
+    }
 }
 
 /// gate 操作のローカル処理（YAML I/O + コマンド実行。IPC 不要。#244）

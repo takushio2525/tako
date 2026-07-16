@@ -312,6 +312,8 @@ pub struct RunOptions {
     pub initial_delay: Duration,
     /// ポーリング間隔（本番 5 秒。テストは ZERO）
     pub interval: Duration,
+    /// 委任台帳の task_type（Issue #292。統制語彙。省略時は investigation）
+    pub task_type: Option<String>,
 }
 
 /// spawn + 完了待ち + 出力取得 + close を 1 回で行う（`orchestrator run` の本体）。
@@ -335,6 +337,7 @@ pub fn run_worker(
         caller_role: opts.caller_role.clone(),
         agent: opts.agent.clone(),
         caller_pid: None,
+        task_type: opts.task_type.clone(),
     })?;
     let pane_id = spawn_result["pane_id"].as_u64().unwrap_or(0);
     let spawned_by = spawn_result["spawned_by"].as_u64().unwrap_or(0);
@@ -546,6 +549,7 @@ pub fn run_start(
         caller_role: opts.caller_role.clone(),
         agent: opts.agent.clone(),
         caller_pid: None,
+        task_type: opts.task_type.clone(),
     })?;
     let pane_id = spawn_result["pane_id"].as_u64().unwrap_or(0);
     let spawned_by = spawn_result["spawned_by"].as_u64().unwrap_or(0);
@@ -1305,6 +1309,7 @@ mod tests {
             output_lines: 200,
             initial_delay: Duration::ZERO,
             interval: Duration::ZERO,
+            task_type: None,
         };
         let mut spawned = None;
         let result = {
@@ -1362,6 +1367,7 @@ mod tests {
             output_lines: 50,
             initial_delay: Duration::ZERO,
             interval: Duration::ZERO,
+            task_type: None,
         };
         let result = {
             let mut exec = |req: Request| {
@@ -1597,6 +1603,7 @@ mod tests {
             output_lines: 200,
             initial_delay: Duration::ZERO,
             interval: Duration::ZERO,
+            task_type: None,
         };
         let result = {
             let mut exec = |req: Request| {
@@ -1644,6 +1651,7 @@ mod tests {
             output_lines: 50,
             initial_delay: Duration::ZERO,
             interval: Duration::ZERO,
+            task_type: None,
         };
 
         let result = {
@@ -1690,6 +1698,7 @@ mod tests {
             output_lines: 50,
             initial_delay: Duration::from_secs(9999),
             interval: Duration::from_secs(9999),
+            task_type: None,
         };
 
         let result = {
@@ -1811,6 +1820,7 @@ mod tests {
             output_lines: 200,
             initial_delay: Duration::ZERO,
             interval: Duration::ZERO,
+            task_type: None,
         };
         let result = {
             let mut exec = |req: Request| {

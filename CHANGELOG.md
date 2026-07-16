@@ -5,6 +5,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added / 機能追加
+
+- 委任台帳: spawn/run 時に task_type × model × 結果を自動蓄積 + 検収記録 CLI + ユーザーフィードバック反映 + 判断基準の二層化 (#292)
+  Delegation ledger: auto-records task_type × model × outcome on spawn/run, CLI/MCP for acceptance recording (record/amend), judgment criteria two-layer injection (built-in defaults + local overrides), survey frequency control (#292)
+
 ### Fixed / 修正
 
 - master がタスク受付時に登録プロジェクトの照合を最優先で行うよう順序制約を追加（プロジェクト名の誤認防止）(#263)

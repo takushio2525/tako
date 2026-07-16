@@ -1208,6 +1208,12 @@ pub fn tools() -> Vec<Value> {
                     "tab": { "type": "integer", "minimum": 0, "description": "子を出すタブ ID。\
                         指定するとそのタブのフォーカスペインを分割元にする。\
                         複数マスター運用時は tab で出力先タブを明示指定することを推奨" },
+                    "task_type": {
+                        "type": "string",
+                        "enum": ["bugfix-rooted", "bugfix-unrooted", "investigation", "feature-verifiable", "feature-ui", "docs", "review"],
+                        "description": "委任台帳の task_type（省略時は investigation）。\
+                            spawn 時に自動記録され、ledger stats で task_type x model の成功率・差し戻し率を集計できる",
+                    },
                 },
                 "required": ["project", "prompt"],
                 "additionalProperties": false,
@@ -1323,8 +1329,49 @@ pub fn tools() -> Vec<Value> {
                         "type": "boolean", "default": false,
                         "description": "true にすると完了までブロッキングする旧挙動（後方互換。既定 false = 非同期）",
                     },
+                    "task_type": {
+                        "type": "string",
+                        "enum": ["bugfix-rooted", "bugfix-unrooted", "investigation", "feature-verifiable", "feature-ui", "docs", "review"],
+                        "description": "委任台帳の task_type（省略時は investigation）",
+                    },
                 },
                 "required": ["project", "prompt"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_orchestrator_ledger",
+            "description": "委任台帳を操作する（Issue #292）。\
+                action=list で一覧（project / task_type でフィルタ、limit で件数制限）、\
+                stats で task_type x model の集計（成功率・差し戻し率・平均所要時間・未評価数）、\
+                record で検収結果の記録（id + outcome + rounds + note）、\
+                amend で事後修正（検収 pass だが実使用で問題発覚。id + note）。\
+                spawn / run 時に task_type を指定すると自動記録され、stats で判断材料になる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "stats", "record", "amend"],
+                        "description": "操作種別",
+                    },
+                    "id": { "type": "string", "description": "対象エントリ ID（record / amend 時に必須。spawn 応答の ledger_id）" },
+                    "outcome": {
+                        "type": "string",
+                        "enum": ["pass", "rework", "fail"],
+                        "description": "検収結果（record 時に必須）",
+                    },
+                    "rounds": { "type": "integer", "minimum": 1, "description": "差し戻し回数（record 時に任意）" },
+                    "note": { "type": "string", "description": "メモ（record / amend 時に任意）" },
+                    "project": { "type": "string", "description": "フィルタ用プロジェクト（list 時に任意）" },
+                    "task_type": {
+                        "type": "string",
+                        "enum": ["bugfix-rooted", "bugfix-unrooted", "investigation", "feature-verifiable", "feature-ui", "docs", "review"],
+                        "description": "フィルタ用 task_type（list 時に任意）",
+                    },
+                    "limit": { "type": "integer", "minimum": 1, "description": "返す件数の上限（list 時に任意。既定 50）" },
+                },
+                "required": ["action"],
                 "additionalProperties": false,
             },
         }),
@@ -2204,6 +2251,7 @@ fn orchestrator_run(
     let agent = str_arg(args, "agent").map_err(map_err)?;
     let sync_mode = bool_arg(args, "sync").map_err(map_err)?.unwrap_or(false);
 
+    let task_type = str_arg(args, "task_type").map_err(map_err)?;
     let opts = wait::RunOptions {
         project,
         prompt,
@@ -2219,6 +2267,7 @@ fn orchestrator_run(
         output_lines,
         initial_delay: std::time::Duration::from_secs(20),
         interval: std::time::Duration::from_secs(5),
+        task_type,
     };
 
     if sync_mode {
@@ -2662,6 +2711,7 @@ fn build_request(
                 caller_role: caller_role.map(str::to_string),
                 agent: str_arg(args, "agent")?,
                 caller_pid: u64_arg(args, "caller_pid")?.map(|v| v as u32),
+                task_type: str_arg(args, "task_type")?,
             }
         }
         "tako_orchestrator_worker_status" => Request::OrchestratorWorkerStatus {
@@ -2674,6 +2724,16 @@ fn build_request(
         },
         "tako_orchestrator_run_result" => Request::OrchestratorRunResult {
             run_id: str_arg(args, "run_id")?.ok_or("run_id を指定する")?,
+        },
+        "tako_orchestrator_ledger" => Request::OrchestratorLedger {
+            action: str_arg(args, "action")?.ok_or("action を指定する")?,
+            id: str_arg(args, "id")?,
+            outcome: str_arg(args, "outcome")?,
+            rounds: u64_arg(args, "rounds")?.map(|v| v as u32),
+            note: str_arg(args, "note")?,
+            project: str_arg(args, "project")?,
+            task_type: str_arg(args, "task_type")?,
+            limit: u64_arg(args, "limit")?.map(|v| v as usize),
         },
         "tako_remote_start" => Request::RemoteStart {
             port: u64_arg(args, "port")?.map(|v| v as u16),
@@ -3575,7 +3635,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 91);
+        assert_eq!(tools.len(), 92);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

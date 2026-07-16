@@ -537,6 +537,9 @@ pub enum Request {
         /// 呼び出しプロセスの pid（#288: pid 祖先辿りで caller を確実に特定）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_pid: Option<u32>,
+        /// 委任台帳の task_type（Issue #292。統制語彙。省略時は investigation）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_type: Option<String>,
     },
     /// オーケストレーター: master が自身の pane/tab/ctx% を取得する（#123 / #193 / #288）。
     /// 解決順序: caller_pid pid 祖先辿り → pane env → stale map → role 検索（複数時エラー）
@@ -577,6 +580,32 @@ pub enum Request {
     /// 未完了なら `phase: "running"` を返す。完了済みなら出力取得 + auto_close +
     /// レジストリから除去
     OrchestratorRunResult { run_id: String },
+    /// オーケストレーター: 委任台帳の操作（Issue #292）。
+    /// action: list / stats / record / amend
+    OrchestratorLedger {
+        action: String,
+        /// record / amend 対象のエントリ ID
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// record: 検収結果（pass / rework / fail）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<String>,
+        /// record: 差し戻し回数
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rounds: Option<u32>,
+        /// record / amend: メモ
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        /// list: フィルタ用 project
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        /// list: フィルタ用 task_type
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_type: Option<String>,
+        /// list: 返す件数の上限
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
     /// リモートアクセス API サーバーの起動。`port` 省略時は 7749。
     /// 既定では暗号化トンネル（cloudflared）経由でのみホストし、トンネルを張れなければ
     /// 起動を拒否する。`insecure` = true のときだけ平文 HTTP の LAN 直モードを許可する
