@@ -4,38 +4,37 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-15・#262 setup UX 全面見直し）
+## 現在の対象（2026-07-17・#282 remote 刷新 弾3 = 統合ブランチ開始）
 
-**要件 A〜E の実装と検証を完了**:
+**ブランチ `renewal/remote-transport`（このブランチ）で Tailscale transport 一本化を実装済み**:
 
-- 検出値 → 前回値 → 安全な既定値を source ラベルつきで自動解決
-- 認証済み CLI 1 つの標準ケース、2 回目、`--yes` を質問・入力 0 回へ変更
-- 2 回目の `config.yaml` は実変更なしなら byte-for-byte 不変
-- 検出値と前回値の競合は両方を通知して検出値を優先
-- 破損 config は書き込まず停止、未認証はログイン手順つきで停止
-- `--answers <json|@file|->` で全項目を非対話指定
-- dispatch `SetupRun` / MCP `tako_setup` / CLI を 1:1 接続
-- AI に日本語で希望を伝えて setup を代行する導線を docs に記載
-- 個別対話は明示的な `tako setup --review` に分離
-- setup revision 9、workspace v0.5.4、CHANGELOG を同期
+- `tako-control::tailscale` 新設: CLI 検出（brew / App Store）・setup 状態判定
+  `setup_status()`（弾 6 ウィザードと共有）・serve start/stop/state・ts.net URL 解決
+- remote daemon: cloudflared / Quick Tunnel / KV リレー / `--insecure` を全削除。
+  start 時に setup 判定 → 不足列挙 + `tako remote setup` 誘導で停止 → serve 設定 →
+  固定 ts.net URL を提示。stop / 異常終了時は**自分が設定した serve のみ**解除
+- protocol / dispatch / host / tako-app / CLI / MCP から insecure を同期削除。
+  PWA から relay 解決を削除。`web/tako-remote-worker/` 削除。
+  setup 依存チェック（#88）から cloudflared 削除。docs / README 更新済み
+- 検証で直した main 由来バグ: daemon_status が 3 行 PID 形式（#280）に未追従で常に
+  running=false / spawn_daemon が PATH の旧 tako へ化ける / 子 stderr の握りつぶし
 
-## 検証
+## 検証状態
 
-- 実 Claude Max 認証を読み取り専用で参照し、スクラッチ HOME へのみ書き込んで
-  `[detected]`・入力 0・質問 0・完走を確認
-- 初回 / 2 回目 / `--yes` / 未認証、プラン不明、検出競合、破損 config、
-  全 answers、複数 CLI を隔離 E2E で確認
-- workspace build / fmt / clippy / test、docs build は全緑
-- 詳細: `.agent/investigations/issue-262-setup-ux.md`
+- 品質ゲート（fmt / clippy -D warnings / build / test 843 本）+ 隔離セルフテスト完走
+- 未 setup 4 状態（未導入 / デーモン未起動 / 未ログイン / HTTPS 未有効）の start 拒否を実測
+- fake tailscale で start → serve 設定 → API 到達 → stop → serve off、SIGKILL 残骸再利用、
+  別ポート残骸拒否、管理外 serve 保護、stop 二重実行を実測
+- **実 tailnet の通し実測は未了**: この Mac の tailscaled が停止中 + ログイン state 消失
+  （起動に root、ログインにブラウザ認証が必要 = ユーザー協力待ち）。詳細は Issue #282 コメント
 
 ## 次の一手
 
-- #262 のコード・検証側に残作業なし。delivery 状態は Issue / PR を正とする
-- install はユーザー指示どおり master 側で行う
+- 実 tailnet 通し実測（ユーザー協力: tailscaled 起動 + tailscale up）→ Issue #282 に証拠追記
+- 弾 4（#283 機器ペアリング認証 + PWA daemon 配信化）をこのブランチに積む
 
 ## 現フェーズで Read すべき設計書
 
-- Issue: #262（方針 A〜E・受け入れ条件 6 項目）
-- 調査と実測: `.agent/investigations/issue-262-setup-ux.md`
-- 要件: `.agent/requirements.md`（FR-2.14.7〜FR-2.14.9）
-- 実装: `crates/tako-cli/src/setup.rs` / `crates/tako-control/src/setup.rs`
+- 計画の正: `.agent/plans/tako-remote-plan.md` §6（弾 3〜7 は統合ブランチ）
+- 弾 0 実測: `.agent/investigations/tailscale-serve-poc.md`（serve / identity / URL 固定性）
+- 実装: `crates/tako-control/src/tailscale.rs` / `crates/tako-control/src/remote.rs`

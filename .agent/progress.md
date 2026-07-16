@@ -788,3 +788,14 @@
   dispatch `SetupRun` / MCP `tako_setup` と明示 `--review` を実装
 - 初回・2回目・`--yes`・未認証を before 5+/5+/未実装/1 → after 全 0 入力で実測。
   実 Claude Max 認証、検出競合、破損 config、複数 CLI、全品質ゲートも全緑
+
+## 2026-07-17（#282: remote 刷新 弾3 — Tailscale transport 一本化・統合ブランチ開始）
+- `renewal/remote-transport` を開始。`tako-control::tailscale` 新設（検出 / setup 判定 /
+  serve 管理。判定関数は弾 6 と共有）、daemon を tailscale serve 化（固定 ts.net URL・
+  未 setup は不足列挙 + `tako remote setup` 誘導で停止）、cloudflared / relay / --insecure /
+  `web/tako-remote-worker/` / setup 依存チェックの cloudflared を全削除
+- 副産物修正: daemon_status の 3 行 PID 未追従（常に running=false）/ spawn_daemon の
+  PATH 旧バイナリ化け / 子 stderr 握りつぶし / agents.rs の clippy 違反（いずれも main 由来）
+- 検証: 全品質ゲート + 隔離セルフテスト完走 + 未 setup 4 状態・serve 残骸エッジの実測。
+  実 tailnet 通し実測のみユーザー協力待ち（tailscaled 停止中・要 root + ブラウザ認証）
+- 次: 実 tailnet 実測 → 弾 4（#283）を同ブランチに積む
