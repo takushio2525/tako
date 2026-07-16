@@ -25,12 +25,12 @@
 - 未 setup 4 状態（未導入 / デーモン未起動 / 未ログイン / HTTPS 未有効）の start 拒否を実測
 - fake tailscale で start → serve 設定 → API 到達 → stop → serve off、SIGKILL 残骸再利用、
   別ポート残骸拒否、管理外 serve 保護、stop 二重実行を実測
-- **実 tailnet の通し実測は未了**: この Mac の tailscaled が停止中 + ログイン state 消失
-  （起動に root、ログインにブラウザ認証が必要 = ユーザー協力待ち）。詳細は Issue #282 コメント
+- 実 tailnet 通し実測も達成（2026-07-17）: start → 固定 ts.net URL へ TLS 検証込み到達
+  （health / PWA / 認証 API / WS 101）→ stop → 到達不能 + serve 設定ゼロ。
+  受け入れ条件 1〜4 完了、証拠は Issue #282 コメント。iPhone 実機到達のみ要実機確認
 
 ## 次の一手
 
-- 実 tailnet 通し実測（ユーザー協力: tailscaled 起動 + tailscale up）→ Issue #282 に証拠追記
 - 弾 4（#283 機器ペアリング認証 + PWA daemon 配信化）をこのブランチに積む
 
 ## 現フェーズで Read すべき設計書

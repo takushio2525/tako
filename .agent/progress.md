@@ -796,6 +796,7 @@
   `web/tako-remote-worker/` / setup 依存チェックの cloudflared を全削除
 - 副産物修正: daemon_status の 3 行 PID 未追従（常に running=false）/ spawn_daemon の
   PATH 旧バイナリ化け / 子 stderr 握りつぶし / agents.rs の clippy 違反（いずれも main 由来）
-- 検証: 全品質ゲート + 隔離セルフテスト完走 + 未 setup 4 状態・serve 残骸エッジの実測。
-  実 tailnet 通し実測のみユーザー協力待ち（tailscaled 停止中・要 root + ブラウザ認証）
-- 次: 実 tailnet 実測 → 弾 4（#283）を同ブランチに積む
+- 検証: 全品質ゲート + 隔離セルフテスト完走 + 未 setup 4 状態・serve 残骸エッジの実測 +
+  実 tailnet 通し実測（start → TLS 検証込み到達（health/PWA/認証/WS 101）→ stop → 到達不能。
+  受け入れ 1〜4 完了、証拠 = Issue #282 コメント。iPhone 実機到達のみ要実機確認）
+- 次: 弾 4（#283 ペアリング認証 + PWA daemon 配信）を同ブランチに積む
