@@ -381,18 +381,26 @@ impl PaneMapping {
 /// ペインごとの共有 broadcaster。1 つの capture ループを共有し、複数 WS クライアントへ配信する
 struct PaneBroadcaster {
     subscribers: Vec<std::sync::mpsc::Sender<String>>,
+    /// 最新の init メッセージ。新規 subscriber に即送するためキャッシュする
+    last_init: Option<String>,
 }
 
 impl PaneBroadcaster {
     fn new() -> Self {
         Self {
             subscribers: Vec::new(),
+            last_init: None,
         }
     }
 
-    /// 新しい subscriber を登録し、受信チャンネルを返す
+    /// 新しい subscriber を登録し、受信チャンネルを返す。
+    /// キャッシュ済みの init があれば即座に送信する（画面変化がない間に
+    /// サブスクライブした subscriber が init を受け取れないのを防ぐ）
     fn subscribe(&mut self) -> std::sync::mpsc::Receiver<String> {
         let (tx, rx) = std::sync::mpsc::channel();
+        if let Some(ref init) = self.last_init {
+            let _ = tx.send(init.clone());
+        }
         self.subscribers.push(tx);
         rx
     }
@@ -401,6 +409,12 @@ impl PaneBroadcaster {
     fn broadcast(&mut self, msg: &str) {
         self.subscribers
             .retain(|tx| tx.send(msg.to_string()).is_ok());
+    }
+
+    /// init メッセージをキャッシュして全 subscriber に配信する
+    fn broadcast_init(&mut self, msg: &str) {
+        self.last_init = Some(msg.to_string());
+        self.broadcast(msg);
     }
 
     fn subscriber_count(&self) -> usize {
@@ -581,7 +595,11 @@ fn broadcaster_loop(
         };
 
         if let Some(payload) = msg {
-            broadcaster.lock().unwrap().broadcast(&payload);
+            if need_init {
+                broadcaster.lock().unwrap().broadcast_init(&payload);
+            } else {
+                broadcaster.lock().unwrap().broadcast(&payload);
+            }
             last_sent = std::time::Instant::now();
         } else if last_sent.elapsed() >= WS_KEEPALIVE {
             let keepalive = json!({ "type": "keepalive" }).to_string();
