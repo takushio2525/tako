@@ -334,6 +334,7 @@ pub fn run_worker(
         tab: opts.tab,
         caller_role: opts.caller_role.clone(),
         agent: opts.agent.clone(),
+        caller_pid: None,
     })?;
     let pane_id = spawn_result["pane_id"].as_u64().unwrap_or(0);
     let spawned_by = spawn_result["spawned_by"].as_u64().unwrap_or(0);
@@ -544,6 +545,7 @@ pub fn run_start(
         tab: opts.tab,
         caller_role: opts.caller_role.clone(),
         agent: opts.agent.clone(),
+        caller_pid: None,
     })?;
     let pane_id = spawn_result["pane_id"].as_u64().unwrap_or(0);
     let spawned_by = spawn_result["spawned_by"].as_u64().unwrap_or(0);

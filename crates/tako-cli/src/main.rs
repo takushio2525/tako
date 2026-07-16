@@ -1663,8 +1663,12 @@ fn main() -> ExitCode {
         Command::Orchestrator(OrchestratorCommand::SelfInfo { pane }) => {
             let pane = pane.or_else(caller_pane);
             let caller_role = std::env::var("TAKO_ORCHESTRATOR_ROLE").ok();
-            send_request(Request::OrchestratorSelf { pane, caller_role })
-                .map(|result| println!("{}", pretty_json(&result)))
+            send_request(Request::OrchestratorSelf {
+                pane,
+                caller_role,
+                caller_pid: Some(std::process::id()),
+            })
+            .map(|result| println!("{}", pretty_json(&result)))
         }
         Command::Orchestrator(OrchestratorCommand::Handoff { pane, tab }) => {
             let pane = pane.or_else(caller_pane);
@@ -1673,6 +1677,7 @@ fn main() -> ExitCode {
                 pane,
                 caller_role,
                 tab,
+                caller_pid: Some(std::process::id()),
             })
             .map(|result| println!("{}", pretty_json(&result)))
         }
@@ -3321,6 +3326,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 tab: tab_resolved,
                 caller_role: std::env::var("TAKO_ORCHESTRATOR_ROLE").ok(),
                 agent: agent.clone(),
+                caller_pid: Some(std::process::id()),
             }
         }
         Command::Orchestrator(OrchestratorCommand::SelfInfo { .. }) => {

@@ -19112,6 +19112,7 @@ mod self_test {
                         tab: None,
                         caller_role: None,
                         agent: None,
+                        caller_pid: None,
                     }
                 }
 
