@@ -3182,50 +3182,6 @@ fn dispatch_orchestrator_self(
     }))
 }
 
-/// master/solo ペインを検索する。suffix があれば suffix 一致を優先
-fn find_master_pane(
-    ws: &tako_core::Workspace,
-    suffix: &str,
-    caller_role: Option<&str>,
-) -> Option<(TabId, PaneId)> {
-    let is_solo = caller_role.is_some_and(|r| r.starts_with("solo"));
-    let prefix = if is_solo {
-        "orchestrator-solo"
-    } else {
-        "orchestrator-master"
-    };
-
-    let target_role = if suffix.is_empty() {
-        prefix.to_string()
-    } else {
-        format!("{prefix}:{suffix}")
-    };
-
-    // suffix 一致の厳密検索
-    let exact = ws.tabs().iter().find_map(|t| {
-        t.tree().panes().iter().find_map(|p| {
-            if p.role().is_some_and(|r| r == target_role) {
-                Some((t.id(), p.id()))
-            } else {
-                None
-            }
-        })
-    });
-
-    exact.or_else(|| {
-        // フォールバック: 任意の master/solo
-        ws.tabs().iter().find_map(|t| {
-            t.tree().panes().iter().find_map(|p| {
-                if p.role().is_some_and(|r| r.starts_with(prefix)) {
-                    Some((t.id(), p.id()))
-                } else {
-                    None
-                }
-            })
-        })
-    })
-}
-
 /// #288: caller のペインを解決する共通関数
 fn resolve_caller_pane(
     host: &dyn ControlHost,
@@ -7438,16 +7394,16 @@ mod tests {
         )
         .unwrap();
 
-        let found = find_master_pane(host.workspace(), "beta", Some("master:beta"));
+        let found = find_master_pane_strict(host.workspace(), "beta", Some("master:beta"));
         assert_eq!(
-            found.map(|(_, p)| p.as_u64()),
+            found.ok().map(|(_, p)| p.as_u64()),
             Some(tab2_pane),
             "suffix beta のペインが返る"
         );
 
-        let found_alpha = find_master_pane(host.workspace(), "alpha", Some("master:alpha"));
+        let found_alpha = find_master_pane_strict(host.workspace(), "alpha", Some("master:alpha"));
         assert_eq!(
-            found_alpha.map(|(_, p)| p.as_u64()),
+            found_alpha.ok().map(|(_, p)| p.as_u64()),
             Some(tab1_pane),
             "suffix alpha のペインが返る"
         );
@@ -7787,5 +7743,208 @@ mod tests {
         let _ = std::fs::remove_file(&script);
         assert_eq!(result["completed"], true);
         assert_eq!(result["output"], "dispatch-setup-ok");
+    }
+
+    /// 受け入れ条件 1: stale env + 同一 role 3 ペイン + 実ペイン role=null で
+    /// pane env が現存する場合に正しい pane を返す（pid 祖先辿りは tmux 不在で
+    /// フォールバック。env の現存 pane が第 2 解決手段として正しく機能することを検証）。
+    /// Issue #288 の実事故再現: pane 400 が role=null なのに role 検索で 443 を誤返答した構図
+    #[test]
+    fn orchestrator_self_stale_env_同一role3体_roleなし実ペインで正しいpaneを返す() {
+        let mut host = MockHost::new();
+
+        // master A: tab 1（実ペイン = role なし。実事故の pane 400 相当）
+        let actual_pane = host.root_pane();
+
+        // master B: tab 2（role あり。実事故の pane 443 相当）
+        let tab2 = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let master_b = tab2["pane"].as_u64().unwrap();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(master_b),
+                title: None,
+                role: Some("orchestrator-master:fable".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        // master C: tab 3（role あり。同一 role の 2 体目）
+        let tab3 = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let master_c = tab3["pane"].as_u64().unwrap();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(master_c),
+                title: None,
+                role: Some("orchestrator-master:fable".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        // master D: tab 4（role あり。同一 role の 3 体目）
+        let tab4 = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let master_d = tab4["pane"].as_u64().unwrap();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(master_d),
+                title: None,
+                role: Some("orchestrator-master:fable".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        // 状態確認: actual_pane は role=null、master_b/c/d は同一 role
+        assert!(
+            host.ws
+                .tabs()
+                .iter()
+                .flat_map(|t| t.tree().panes())
+                .find(|p| p.id().as_u64() == actual_pane)
+                .unwrap()
+                .role()
+                .is_none(),
+            "actual_pane は role=null であること"
+        );
+
+        // ケース 1: pane env が現存 ID（actual_pane）を持つ場合 → pid 解決失敗でも
+        // pane env のフォールバックで actual_pane を返す（role 検索に落ちない）
+        let result = dispatch(
+            &mut host,
+            Request::OrchestratorSelf {
+                pane: Some(actual_pane),
+                caller_role: Some("master:fable".into()),
+                caller_pid: Some(99999), // tmux 不在で pid 解決は失敗する
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(
+            result["pane_id"].as_u64(),
+            Some(actual_pane),
+            "pane env が現存する場合は role 検索に落ちず正しい pane を返す"
+        );
+
+        // ケース 2: pane env が stale（現存しない ID 305）→ stale map もなし →
+        // role 検索に落ちるが、同一 role が 3 体あるため曖昧エラーになる
+        // （旧実装では先頭の master_b を黙って返していた = 実事故の再現）
+        let result_stale = dispatch(
+            &mut host,
+            Request::OrchestratorSelf {
+                pane: Some(305), // 現存しない stale ID
+                caller_role: Some("master:fable".into()),
+                caller_pid: Some(99999), // pid 解決も失敗
+            },
+            PaneOrigin::Mcp,
+        );
+        assert!(
+            result_stale.is_err(),
+            "stale env + pid 解決失敗 + 同一 role 3 体 → 曖昧エラーになること（旧実装では master_b を誤返答）"
+        );
+        let err_msg = result_stale.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("複数ペインに存在"),
+            "エラーメッセージに「複数ペインに存在」を含むこと: {err_msg}"
+        );
+    }
+
+    /// 受け入れ条件 2: 曖昧 role のみで確定不能な場合にエラーとなる
+    /// find_master_pane_strict が複数マッチ時に先頭を返さず曖昧エラーを返すことの検証
+    #[test]
+    fn find_master_pane_strict_複数マッチで曖昧エラー() {
+        let mut host = MockHost::new();
+
+        // 同一 role の master を 2 体作成
+        let pane_a = host.root_pane();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(pane_a),
+                title: None,
+                role: Some("orchestrator-master:dup".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        let tab2 = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let pane_b = tab2["pane"].as_u64().unwrap();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(pane_b),
+                title: None,
+                role: Some("orchestrator-master:dup".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        // suffix 一致（"dup"）で 2 体マッチ → 曖昧エラー
+        let result = find_master_pane_strict(host.workspace(), "dup", Some("master:dup"));
+        assert!(result.is_err(), "複数マッチで Err を返すこと");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains(&pane_a.to_string()) && err_msg.contains(&pane_b.to_string()),
+            "エラーメッセージに両方のペイン ID を含むこと: {err_msg}"
+        );
+
+        // suffix なし（prefix フォールバック）でも 2 体マッチ → 曖昧エラー
+        let result_fb = find_master_pane_strict(host.workspace(), "", None);
+        assert!(
+            result_fb.is_err(),
+            "prefix フォールバックでも複数マッチは Err"
+        );
+
+        // 1 体だけなら成功
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(pane_b),
+                title: None,
+                role: Some("worker:test".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let result_single = find_master_pane_strict(host.workspace(), "dup", Some("master:dup"));
+        assert!(result_single.is_ok(), "1 体なら成功");
+        assert_eq!(result_single.unwrap().1.as_u64(), pane_a);
     }
 }
