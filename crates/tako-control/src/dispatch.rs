@@ -3661,6 +3661,8 @@ pub struct WorkerStatusCtx {
     live_tail: Option<String>,
     /// ライブ画面全体のテキスト（折りたたみ検出用。ペインが GUI に無ければ None）
     full_screen: Option<String>,
+    /// tmux セッション配下に実行中の子プロセスがあるか（#224）
+    has_running_children: bool,
 }
 
 /// 末尾の空行を除去し、最大 30 行に切り詰めて 1 本のテキストへ
@@ -3685,9 +3687,14 @@ fn collect_worker_status_ctx(host: &dyn ControlHost, pane_id: u64) -> WorkerStat
     });
     let lines = host.session(target).map(|session| session.visible_lines());
     let full_screen = lines.as_ref().map(|l| l.join("\n"));
+    let backend_session = host.backend_session(target);
+    let has_running_children = backend_session
+        .as_ref()
+        .is_some_and(|bs| crate::agents::has_running_children(bs));
     WorkerStatusCtx {
         pane_exists: in_tree || host.workspace().is_shelved(target),
-        backend_session: host.backend_session(target),
+        backend_session,
+        has_running_children,
         live_tail: lines.map(tail_join),
         full_screen,
     }
@@ -3705,6 +3712,7 @@ fn finish_worker_status(
         backend_session,
         live_tail,
         full_screen,
+        has_running_children: has_children,
     } = ctx;
 
     // session_id の解決: 明示指定 > pane→session 自動解決 > フォールバック
@@ -3734,7 +3742,7 @@ fn finish_worker_status(
     // #267: agents の生ステータスを dispatch の語彙に正規化する。
     // 正規化しないと watch ループの unknown フォールバック（スクリーン末尾 5 行判定）に
     // 落ち、長時間ツール出力で busy パターンが流れた瞬間に偽 IDLE が出る
-    let (mut status, ctx_percent) = if let Some(ref sid) = resolved_sid {
+    let (status, ctx_percent) = if let Some(ref sid) = resolved_sid {
         let agent = orchestrator::query_agent_status(sid);
         let normalized = match agent.status.as_str() {
             "idle" => "idle",
@@ -3752,17 +3760,55 @@ fn finish_worker_status(
 
     // ペインの最近の出力（pane のライブ画面 → tmux session フォールバック）
     let recent_output = live_tail.or_else(|| {
-        // tmux session フォールバック: pane が gone でも tmux session が生きていれば読む
         let ts = tmux_session?;
         let socket = tako_core::tmux_backend::socket_name();
         if !tako_core::tmux::session_alive(Some(&socket), ts) {
             return None;
         }
-        // tmux session が生きている = pane は gone だが worker は生存中
         let lines = tako_core::tmux::capture_session(Some(&socket), ts).ok()?;
         Some(tail_join(lines))
     });
 
+    apply_worker_status_corrections(ResolvedWorkerStatus {
+        status,
+        status_source: status_source.to_string(),
+        ctx_percent,
+        resolved_sid,
+        pane_exists,
+        has_children,
+        recent_output,
+        full_screen,
+        tmux_session: tmux_session.map(String::from),
+    })
+}
+
+/// `apply_worker_status_corrections` への入力（agents / screen 解決後の初期状態）
+struct ResolvedWorkerStatus {
+    status: String,
+    status_source: String,
+    ctx_percent: Option<u32>,
+    resolved_sid: Option<String>,
+    pane_exists: bool,
+    has_children: bool,
+    recent_output: Option<String>,
+    full_screen: Option<String>,
+    tmux_session: Option<String>,
+}
+
+/// worker_status の初期状態に補正ロジックを適用し、最終的な JSON 応答を構築する。
+/// `finish_worker_status` から分離した内部関数（テスト時に初期状態を直接制御するため）
+fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Value, DispatchError> {
+    let ResolvedWorkerStatus {
+        mut status,
+        status_source,
+        ctx_percent,
+        resolved_sid,
+        pane_exists,
+        has_children,
+        recent_output,
+        full_screen,
+        tmux_session,
+    } = resolved;
     // #267: agents が "gone" を返しても pane が workspace にある場合は
     // セッション未発見なだけで worker は健在 → unknown に降格
     if status == "gone" && pane_exists {
@@ -3770,7 +3816,7 @@ fn finish_worker_status(
     }
     // tmux session が生きていれば gone を取り消す（pane は無いが worker は健在）
     if status == "gone" {
-        if let Some(ts) = tmux_session {
+        if let Some(ref ts) = tmux_session {
             let socket = tako_core::tmux_backend::socket_name();
             if tako_core::tmux::session_alive(Some(&socket), ts) {
                 status = "unknown".to_string();
@@ -3778,21 +3824,18 @@ fn finish_worker_status(
         }
     }
 
-    // #224 偽 IDLE 根治: idle / error 判定の前に、tmux セッション配下で
-    // 実行中の子プロセスがあれば busy に補正する。画面だけでなくプロセス実在を確認
-    let has_children = backend_session
-        .as_ref()
-        .is_some_and(|bs| crate::agents::has_running_children(bs));
-
-    // #267: idle 補正は has_children と screen_looks_busy のみで判断する。
-    // 旧実装の !has_prompt（画面にプロンプトが無ければ busy）は折りたたみ画面や
-    // 特殊レイアウトで真の完了を拾えなくなる問題があった（症状 4）。
-    // 一時的な idle（サブエージェント完了瞬間）は watch ループの idle_streak（3 回連続）で防ぐ
+    // agents API（status_source = agents / agents-auto）はセッション状態の
+    // 一次情報なので、idle を返したらプロセスツリー heuristic で覆さない。
+    // バックグラウンドシェル（tailscaled 等）の常駐子プロセスが IDLE 検知を
+    // 永久にブロックする問題を根治する（#289）。
+    // has_children による busy 補正は screen フォールバック時のみ使う。
+    // 一時的な idle（サブエージェント完了瞬間）は watch の idle_streak（3 回連続）で防ぐ
+    let agents_authoritative = status_source == "agents" || status_source == "agents-auto";
     if status == "idle" {
         let screen_busy = recent_output
             .as_ref()
             .is_some_and(|out| crate::orchestrator::wait::screen_looks_busy(out));
-        if has_children || screen_busy {
+        if screen_busy || (has_children && !agents_authoritative) {
             status = "busy".to_string();
         }
     }
@@ -7071,6 +7114,7 @@ mod tests {
             backend_session: None,
             live_tail: None,
             full_screen: None,
+            has_running_children: false,
         };
         let v = finish_worker_status(ctx, None, None).unwrap();
         assert_eq!(v["status"], "gone");
@@ -7087,6 +7131,7 @@ mod tests {
                 backend_session: None,
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
+                has_running_children: false,
             },
             None,
             None,
@@ -7101,6 +7146,7 @@ mod tests {
                 backend_session: None,
                 live_tail: Some("Thinking…\nesc to interrupt".into()),
                 full_screen: None,
+                has_running_children: false,
             },
             None,
             None,
@@ -7114,6 +7160,7 @@ mod tests {
                 backend_session: None,
                 live_tail: None,
                 full_screen: None,
+                has_running_children: false,
             },
             None,
             None,
@@ -7133,6 +7180,7 @@ mod tests {
                     "  ⎿  API Error: Connection closed mid-response. The response above may be incomplete.\n\n❯ ".into(),
                 ),
                 full_screen: None,
+                has_running_children: false,
             },
             None,
             None,
@@ -7155,6 +7203,7 @@ mod tests {
                     "■ You've hit your usage limit. Upgrade to Pro or try again at 4:24 AM.\n\n› 1. Switch to gpt-5.4-mini".into(),
                 ),
                 full_screen: None,
+                has_running_children: false,
             },
             None,
             None,
@@ -7171,6 +7220,7 @@ mod tests {
                 backend_session: None,
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
+                has_running_children: false,
             },
             None,
             None,
@@ -7188,6 +7238,7 @@ mod tests {
                     "  ⎿  API Error (Connection error.) · Retrying in 4 seconds… (attempt 3/10)\nesc to interrupt".into(),
                 ),
                 full_screen: None,
+                has_running_children: false,
             },
             None,
             None,
@@ -7208,6 +7259,7 @@ mod tests {
                     "テストを追加しますか？\n❯ 1. はい\n  2. いいえ\n❯ \n──────".into(),
                 ),
                 full_screen: None,
+                has_running_children: false,
             },
             None,
             None,
@@ -7230,6 +7282,7 @@ mod tests {
                         .into(),
                 ),
                 full_screen: None,
+                has_running_children: false,
             },
             None,
             None,
@@ -7250,6 +7303,7 @@ mod tests {
                 backend_session: None,
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
+                has_running_children: false,
             },
             None,
             None,
@@ -7258,6 +7312,71 @@ mod tests {
         assert_eq!(v3["status"], "idle");
         let events3 = v3["events"].as_array().expect("events は配列");
         assert!(events3.is_empty(), "正常完了で events が空: {events3:?}");
+    }
+
+    // --- #289: バックグラウンドシェルが IDLE 検知をブロックする問題の根治 ---
+    // apply_worker_status_corrections を直接呼び、agents の初期状態を制御する
+
+    fn resolved(status: &str, source: &str, has_children: bool) -> ResolvedWorkerStatus {
+        ResolvedWorkerStatus {
+            status: status.into(),
+            status_source: source.into(),
+            ctx_percent: None,
+            resolved_sid: if source.starts_with("agents") {
+                Some("test-session".into())
+            } else {
+                None
+            },
+            pane_exists: true,
+            has_children,
+            recent_output: Some("done\n❯ \n──────".into()),
+            full_screen: None,
+            tmux_session: None,
+        }
+    }
+
+    #[test]
+    fn issue289_agents_idleはhas_childrenで覆されない() {
+        let v = apply_worker_status_corrections(resolved("idle", "agents", true)).unwrap();
+        assert_eq!(v["status"], "idle");
+        assert_eq!(v["has_running_children"], true);
+        assert_eq!(v["status_source"], "agents");
+    }
+
+    #[test]
+    fn issue289_agents_auto経路でもidleが尊重される() {
+        let v = apply_worker_status_corrections(resolved("idle", "agents-auto", true)).unwrap();
+        assert_eq!(v["status"], "idle");
+        assert_eq!(v["status_source"], "agents-auto");
+    }
+
+    #[test]
+    fn issue289_screenフォールバックではhas_childrenが効く() {
+        let v = apply_worker_status_corrections(resolved("idle", "screen", true)).unwrap();
+        assert_eq!(v["status"], "busy");
+        assert_eq!(v["status_source"], "screen");
+    }
+
+    #[test]
+    fn issue289_agents_busyはhas_childrenに関係なくbusy維持() {
+        let mut r = resolved("busy", "agents", true);
+        r.recent_output = Some("Thinking…\nesc to interrupt".into());
+        let v = apply_worker_status_corrections(r).unwrap();
+        assert_eq!(v["status"], "busy");
+    }
+
+    #[test]
+    fn issue289_screen_looks_busyはagents_idleでも効く() {
+        let mut r = resolved("idle", "agents", false);
+        r.recent_output = Some("Thinking…\nesc to interrupt".into());
+        let v = apply_worker_status_corrections(r).unwrap();
+        assert_eq!(v["status"], "busy");
+    }
+
+    #[test]
+    fn issue289_unknownではhas_childrenが引き続き有効() {
+        let v = apply_worker_status_corrections(resolved("unknown", "screen", true)).unwrap();
+        assert_eq!(v["status"], "busy");
     }
 
     #[test]
