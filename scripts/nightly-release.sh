@@ -29,6 +29,11 @@ set -euo pipefail
 
 # launchd 環境は最小 PATH のため明示設定（cargo / gh / npm / node を通す）
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# Node.js バージョンマネージャの標準所在を補う（Pages デプロイに npm/node が必要。#297）
+for _p in "$HOME/.nodebrew/current/bin" "$HOME/.volta/bin" "$HOME/.fnm" "$HOME/n/bin"; do
+  [[ -d "$_p" ]] && PATH="$_p:$PATH"
+done
+export PATH
 
 cd "$(dirname "$0")/.."
 REPO_ROOT=$PWD
