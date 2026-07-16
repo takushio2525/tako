@@ -1742,6 +1742,40 @@ prompt_blocks:
     }
 
     #[test]
+    fn project_resolution_gate_in_default_prompt() {
+        let p = Profile::default();
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
+        // Step 0 が存在し、Step 1 より前にあること
+        let step0_pos = prompt.find("Step 0").expect("Step 0 が存在する");
+        let step1_pos = prompt.find("Step 1").expect("Step 1 が存在する");
+        assert!(step0_pos < step1_pos, "Step 0 は Step 1 より前");
+        // 順序制約の主要キーワードが含まれること
+        assert!(prompt.contains("Resolve target projects"));
+        assert!(prompt.contains("tako_orchestrator_projects"));
+        assert!(prompt.contains("high-confidence match"));
+        assert!(prompt.contains("Zero matches"));
+        // ステップ数が five に更新されていること
+        assert!(prompt.contains("five steps"));
+        // Step 4 にプロジェクト key 明記の指示があること
+        assert!(prompt.contains("Step 0 resolved"));
+    }
+
+    #[test]
+    fn project_resolution_gate_survives_append() {
+        let p = Profile {
+            prompt_blocks: Some(PromptBlocks {
+                append: Some("CUSTOM_FOOTER".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
+        assert!(prompt.contains("Step 0"));
+        assert!(prompt.contains("Resolve target projects"));
+        assert!(prompt.ends_with("CUSTOM_FOOTER"));
+    }
+
+    #[test]
     fn build_system_prompt_inherit_model() {
         let p = Profile {
             model: Some("claude-fable-5".into()),
