@@ -1803,6 +1803,7 @@ fn dispatch_inner(
             caller_role,
             agent,
             caller_pid,
+            task_type,
         } => dispatch_orchestrator_spawn(
             host,
             origin,
@@ -1817,6 +1818,7 @@ fn dispatch_inner(
                 caller_role: caller_role.as_deref(),
                 agent: agent.as_deref(),
                 caller_pid,
+                task_type: task_type.as_deref(),
             },
         ),
 
@@ -1847,6 +1849,26 @@ fn dispatch_inner(
                 &mut |req| dispatch(host, req, origin).map_err(|e| e.to_string());
             crate::orchestrator::wait::run_result(&run_id, exec).map_err(DispatchError::Operation)
         }
+
+        Request::OrchestratorLedger {
+            action,
+            id,
+            outcome,
+            rounds,
+            note,
+            project,
+            task_type,
+            limit,
+        } => dispatch_orchestrator_ledger(LedgerParams {
+            action,
+            id,
+            outcome,
+            rounds,
+            note,
+            project,
+            task_type,
+            limit,
+        }),
 
         Request::RemoteStart { port, insecure } => host
             .remote_start(port, insecure)
@@ -3468,6 +3490,8 @@ struct SpawnParams<'a> {
     /// worker のエージェント種別（claude / codex / agy。省略時はプロファイル既定。#120）
     agent: Option<&'a str>,
     caller_pid: Option<u32>,
+    /// 委任台帳の task_type（Issue #292。統制語彙。省略時は investigation）
+    task_type: Option<&'a str>,
 }
 
 fn dispatch_orchestrator_spawn(
@@ -3486,6 +3510,7 @@ fn dispatch_orchestrator_spawn(
         caller_role,
         agent,
         caller_pid,
+        task_type: _task_type,
     } = params;
     if pane.is_none() && tab.is_none() {
         return Err(DispatchError::Operation(
@@ -3632,6 +3657,26 @@ fn dispatch_orchestrator_spawn(
         }
     }
 
+    // 委任台帳への自動記録（Issue #292 層1）。失敗しても spawn は止めない
+    let issue_num =
+        crate::sessions::extract_issues(&format!("{} {prompt}", label.unwrap_or_default()))
+            .into_iter()
+            .next();
+    let issue_str = issue_num.map(|n| format!("#{n}"));
+    let ledger_id = crate::orchestrator::ledger::record_spawn(
+        project,
+        label,
+        issue_str.as_deref(),
+        _task_type,
+        launch.model.as_deref().unwrap_or("(default)"),
+        launch.effort.as_deref(),
+        Some(worker_agent.as_str()),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("warning: 委任台帳への記録に失敗: {e}");
+        String::new()
+    });
+
     Ok(json!({
         "pane_id": new_id.as_u64(),
         "spawned_by": target.as_u64(),
@@ -3646,6 +3691,7 @@ fn dispatch_orchestrator_spawn(
         "prompt": prompt,
         "pre_trusted": pre_trusted,
         "tmux_session": tmux_session,
+        "ledger_id": ledger_id,
     }))
 }
 
@@ -4720,6 +4766,7 @@ fn dispatch_task_resume(
             caller_role,
             agent: Some(agent_str),
             caller_pid: None,
+            task_type: None,
         },
     )?;
 
@@ -4748,6 +4795,79 @@ fn dispatch_task_resume(
         .unwrap()
         .insert("resumed".into(), json!(true));
     Ok(result)
+}
+
+struct LedgerParams {
+    action: String,
+    id: Option<String>,
+    outcome: Option<String>,
+    rounds: Option<u32>,
+    note: Option<String>,
+    project: Option<String>,
+    task_type: Option<String>,
+    limit: Option<usize>,
+}
+
+/// OrchestratorLedger の dispatch（Issue #292）。ControlHost 不要のためスタンドアロン
+fn dispatch_orchestrator_ledger(p: LedgerParams) -> Result<Value, DispatchError> {
+    let LedgerParams {
+        action,
+        id,
+        outcome,
+        rounds,
+        note,
+        project,
+        task_type,
+        limit,
+    } = p;
+    use crate::orchestrator::ledger;
+    match action.as_str() {
+        "list" => {
+            let ledger = ledger::Ledger::load().map_err(DispatchError::Operation)?;
+            let mut entries: Vec<&ledger::LedgerEntry> = ledger.entries.iter().collect();
+            if let Some(ref p) = project {
+                entries.retain(|e| e.project == *p);
+            }
+            if let Some(ref t) = task_type {
+                entries.retain(|e| e.task_type == *t);
+            }
+            let limit = limit.unwrap_or(50);
+            if entries.len() > limit {
+                entries = entries[entries.len() - limit..].to_vec();
+            }
+            Ok(json!({
+                "entries": entries,
+                "total": ledger.entries.len(),
+                "unevaluated": ledger.unevaluated_count(),
+            }))
+        }
+        "stats" => {
+            let ledger = ledger::Ledger::load().map_err(DispatchError::Operation)?;
+            let stats = ledger.stats();
+            Ok(json!({
+                "stats": stats,
+                "total_entries": ledger.entries.len(),
+                "unevaluated": ledger.unevaluated_count(),
+            }))
+        }
+        "record" => {
+            let id = id.ok_or_else(|| DispatchError::InvalidParams("id は必須".into()))?;
+            let outcome =
+                outcome.ok_or_else(|| DispatchError::InvalidParams("outcome は必須".into()))?;
+            ledger::record_outcome(&id, &outcome, rounds, note.as_deref())
+                .map_err(DispatchError::Operation)?;
+            Ok(json!({"ok": true, "id": id, "outcome": outcome}))
+        }
+        "amend" => {
+            let id = id.ok_or_else(|| DispatchError::InvalidParams("id は必須".into()))?;
+            let note = note.ok_or_else(|| DispatchError::InvalidParams("note は必須".into()))?;
+            ledger::amend_entry(&id, &note).map_err(DispatchError::Operation)?;
+            Ok(json!({"ok": true, "id": id, "post_issue": true}))
+        }
+        _ => Err(DispatchError::InvalidParams(format!(
+            "不正な action '{action}'。使用可能: list, stats, record, amend"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -6514,6 +6634,7 @@ mod tests {
             caller_role,
             agent: None,
             caller_pid: None,
+            task_type: None,
         }
     }
 
@@ -7668,6 +7789,7 @@ mod tests {
                 caller_role: Some("master:"),
                 agent: None,
                 caller_pid: None,
+                task_type: None,
             };
             let result = dispatch_orchestrator_spawn(&mut host, PaneOrigin::Mcp, params);
             assert!(
