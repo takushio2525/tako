@@ -102,15 +102,7 @@ ditto -c -k --keepParent "$APP" "$ZIP_PATH"
 ZIP_SIZE=$(du -h "$ZIP_PATH" | cut -f1 | xargs)
 echo "    生成完了: $ZIP_PATH ($ZIP_SIZE)"
 
-# --- リモート PWA を Cloudflare Pages へデプロイ（接続入口の固定 URL。Issue #91）---
-# 接続リンクは常に https://tako-remote.pages.dev を指すため、リリース公開時に
-# Pages 側の PWA も同時に最新化する（--draft では実行しない）
-if [[ $PUBLISH -eq 1 ]]; then
-  echo "==> リモート PWA を Cloudflare Pages へデプロイ"
-  "$REPO_ROOT/scripts/deploy-pages.sh"
-fi
-
-# --- リリース作成 ---
+# --- リリース作成（Pages デプロイより先に実行。リリースの主目的を先に完遂する。#297）---
 if [[ $PUBLISH -eq 1 ]] || [[ $DRAFT -eq 1 ]]; then
   if ! command -v gh >/dev/null; then
     echo "エラー: gh CLI が必要（brew install gh）" >&2
@@ -208,6 +200,18 @@ claude mcp add --scope user tako -- /Applications/tako.app/Contents/MacOS/tako m
       echo "ERROR: GitHub Release の作成に ${MAX_RETRIES} 回失敗（tag $TAG は push 済み）" >&2
       echo "手動リカバリ: scripts/release.sh --skip-build --publish" >&2
       exit 1
+    fi
+  fi
+
+  # --- リモート PWA を Cloudflare Pages へデプロイ（失敗は非致命。#297）---
+  # 接続リンクは常に https://tako-remote.pages.dev を指すため、リリース公開時に
+  # Pages 側の PWA も同時に最新化する（--draft では実行しない）
+  if [[ $PUBLISH -eq 1 ]]; then
+    echo "==> リモート PWA を Cloudflare Pages へデプロイ"
+    if "$REPO_ROOT/scripts/deploy-pages.sh"; then
+      echo "    Pages デプロイ完了"
+    else
+      echo "WARN: Pages デプロイに失敗（GitHub Release は作成済み）。手動リカバリ: scripts/deploy-pages.sh" >&2
     fi
   fi
 

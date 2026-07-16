@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed / 修正
+
+- nightly-release が launchd 環境（npm 不在の PATH）で GitHub Release 未作成のまま停止する問題を修正 (#297)
+  Fixed nightly-release stopping without creating GitHub Release when npm is not in PATH (launchd environment) (#297)
+
 ## [0.5.5] - 2026-07-17
 
 Nightly patch release (automated). Changes since v0.5.4:
