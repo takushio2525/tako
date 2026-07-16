@@ -599,19 +599,25 @@ fn verify_pid_identity(info: &PidInfo) -> bool {
                 return false;
             }
         }
-        // lstart ベースの起動時刻チェック（記録がある場合のみ。秒精度で ±2 秒の余裕）
+        // etime ベースの起動時刻チェック（記録がある場合のみ。±5 秒の余裕）。
+        // ps etime（経過時間）+ 現在 epoch → 起動 epoch を逆算し、記録値と照合する
         if let Some(recorded) = info.start_time {
             if let Ok(output) = Command::new("ps")
-                .args(["-p", &info.pid.to_string(), "-o", "lstart="])
+                .args(["-p", &info.pid.to_string(), "-o", "etime="])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .output()
             {
-                let lstart = String::from_utf8_lossy(&output.stdout);
-                let lstart = lstart.trim();
-                if !lstart.is_empty() {
-                    if let Some(actual) = parse_lstart(lstart) {
-                        if actual.abs_diff(recorded) > 2 {
+                let etime_str = String::from_utf8_lossy(&output.stdout);
+                let etime_str = etime_str.trim();
+                if !etime_str.is_empty() {
+                    if let Some(elapsed_secs) = parse_etime(etime_str) {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let actual_start = now.saturating_sub(elapsed_secs);
+                        if actual_start.abs_diff(recorded) > 5 {
                             return false;
                         }
                     }
@@ -626,45 +632,30 @@ fn verify_pid_identity(info: &PidInfo) -> bool {
     true
 }
 
-/// ps の lstart 出力（"Mon Jul 14 12:34:56 2026"）を unix epoch 秒に変換する。
-/// 厳密なパーサは不要 — 照合のために近似で十分
+/// ps の etime 出力（"[[DD-]HH:]MM:SS"）を秒数に変換する。
+/// 形式: "03:42" / "01:03:42" / "2-01:03:42"
 #[cfg(unix)]
-fn parse_lstart(s: &str) -> Option<u64> {
-    let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.len() < 5 {
-        return None;
-    }
-    let mon = match parts[1] {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
+fn parse_etime(s: &str) -> Option<u64> {
+    let (days, rest) = if let Some((d, r)) = s.split_once('-') {
+        (d.parse::<u64>().ok()?, r)
+    } else {
+        (0, s)
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    let (hours, mins, secs) = match parts.len() {
+        2 => (
+            0u64,
+            parts[0].parse::<u64>().ok()?,
+            parts[1].parse::<u64>().ok()?,
+        ),
+        3 => (
+            parts[0].parse::<u64>().ok()?,
+            parts[1].parse::<u64>().ok()?,
+            parts[2].parse::<u64>().ok()?,
+        ),
         _ => return None,
     };
-    let day: u32 = parts[2].parse().ok()?;
-    let time_parts: Vec<&str> = parts[3].split(':').collect();
-    if time_parts.len() != 3 {
-        return None;
-    }
-    let hour: u32 = time_parts[0].parse().ok()?;
-    let min: u32 = time_parts[1].parse().ok()?;
-    let sec: u32 = time_parts[2].parse().ok()?;
-    let year: i64 = parts[4].parse().ok()?;
-    // 近似 unix epoch 計算（うるう年は厳密でなくてよい。照合精度は ±2 秒）
-    let days_in_year = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-    let yday = days_in_year.get(mon as usize - 1).copied().unwrap_or(0) + day - 1;
-    let days_since_epoch = (year - 1970) * 365 + (year - 1969) / 4 - (year - 1901) / 100
-        + (year - 1601) / 400
-        + yday as i64;
-    Some((days_since_epoch * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64) as u64)
+    Some(days * 86400 + hours * 3600 + mins * 60 + secs)
 }
 
 /// デーモンを停止する（PID ファイルから kill → 終了確認 → state クリーンアップ）。
@@ -3036,16 +3027,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // --- parse_lstart テスト ---
     #[cfg(unix)]
     #[test]
-    fn parse_lstartは日時をepochに変換する() {
-        // 2026-07-14 12:00:00 UTC の近似値（うるう年補正なし、数秒の誤差は許容）
-        let result = parse_lstart("Mon Jul 14 12:00:00 2026");
-        assert!(result.is_some());
-        let epoch = result.unwrap();
-        // 2026-01-01 から約半年後なので、1780000000 前後
-        assert!(epoch > 1_700_000_000, "epoch は 2024 以降: {epoch}");
-        assert!(epoch < 1_800_000_000, "epoch は 2027 以前: {epoch}");
+    fn parse_etimeは経過時間を秒に変換する() {
+        assert_eq!(parse_etime("03:42"), Some(222));
+        assert_eq!(parse_etime("01:03:42"), Some(3822));
+        assert_eq!(parse_etime("2-01:03:42"), Some(2 * 86400 + 3822));
+        assert_eq!(parse_etime("00:05"), Some(5));
+        assert_eq!(parse_etime("bad"), None);
     }
 }
