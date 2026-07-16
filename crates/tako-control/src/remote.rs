@@ -44,10 +44,11 @@
 //! - PID ファイル（`/tmp/tako-remote.pid`）で管理
 //! - `tako remote stop` → PID ファイルから kill
 
+use std::collections::HashMap;
 use std::io;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 
 use rust_embed::Embed;
 use serde_json::{json, Value};
@@ -193,6 +194,403 @@ fn cleanup_legacy_state_files() {
 #[derive(Embed)]
 #[folder = "../../web/tako-remote/dist/"]
 struct PwaAssets;
+
+// --- IPC クライアント（daemon → app の正規 dispatch 経路。#281 H-7）---
+
+/// daemon から tako-app の IPC ソケットへ接続し、Request を dispatch 経由で実行する。
+/// discovery::read_candidates で接続情報を自動発見する
+struct AppIpcClient {
+    socket: String,
+    token: String,
+}
+
+impl AppIpcClient {
+    /// discovery 経由で稼働中の tako-app を探して接続する。見つからなければ None
+    fn connect() -> Option<Self> {
+        for info in crate::discovery::read_candidates() {
+            if Self::probe(&info.socket, &info.token) {
+                return Some(Self {
+                    socket: info.socket,
+                    token: info.token,
+                });
+            }
+        }
+        None
+    }
+
+    /// ソケットが生きていてトークンが通るかプローブする
+    fn probe(socket: &str, token: &str) -> bool {
+        Self::roundtrip_raw(socket, token, crate::protocol::Request::List).is_ok()
+    }
+
+    /// IPC に Request を送り、結果を返す
+    fn request(&self, request: crate::protocol::Request) -> Result<Value, String> {
+        Self::roundtrip_raw(&self.socket, &self.token, request)
+    }
+
+    #[cfg(unix)]
+    fn roundtrip_raw(
+        socket: &str,
+        token: &str,
+        request: crate::protocol::Request,
+    ) -> Result<Value, String> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+
+        let stream = UnixStream::connect(socket)
+            .map_err(|e| format!("tako app へ接続できない ({socket}): {e}"))?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok();
+        let mut writer = stream
+            .try_clone()
+            .map_err(|e| format!("接続の複製に失敗: {e}"))?;
+        let envelope = crate::protocol::RequestEnvelope::new(1, token, request);
+        let json =
+            serde_json::to_string(&envelope).map_err(|e| format!("リクエストの構築に失敗: {e}"))?;
+        writeln!(writer, "{json}").map_err(|e| format!("送信に失敗: {e}"))?;
+
+        let mut line = String::new();
+        BufReader::new(stream)
+            .read_line(&mut line)
+            .map_err(|e| format!("応答の受信に失敗: {e}"))?;
+        if line.is_empty() {
+            return Err("tako app から応答が返らなかった".into());
+        }
+        let response: crate::protocol::ResponseEnvelope =
+            serde_json::from_str(&line).map_err(|e| format!("応答を解釈できない: {e}"))?;
+        if let Some(error) = response.error {
+            return Err(error.message);
+        }
+        Ok(response.result.unwrap_or(Value::Null))
+    }
+
+    #[cfg(not(unix))]
+    fn roundtrip_raw(
+        _socket: &str,
+        _token: &str,
+        _request: crate::protocol::Request,
+    ) -> Result<Value, String> {
+        Err("Windows の IPC は未実装".into())
+    }
+}
+
+/// daemon 起動中に保持する IPC 接続状態。定期的に再接続を試みる
+struct AppConnection {
+    client: Option<AppIpcClient>,
+    last_attempt: std::time::Instant,
+}
+
+const IPC_RECONNECT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl AppConnection {
+    fn new() -> Self {
+        Self {
+            client: AppIpcClient::connect(),
+            last_attempt: std::time::Instant::now(),
+        }
+    }
+
+    /// 接続中の IPC クライアントを返す。未接続なら定期的に再接続を試みる
+    fn get(&mut self) -> Option<&AppIpcClient> {
+        if self.client.is_none() && self.last_attempt.elapsed() >= IPC_RECONNECT_INTERVAL {
+            self.client = AppIpcClient::connect();
+            self.last_attempt = std::time::Instant::now();
+        }
+        self.client.as_ref()
+    }
+
+    /// IPC 接続に失敗したら切断状態にする（次の get() で再接続を試みる）
+    fn invalidate(&mut self) {
+        self.client = None;
+        self.last_attempt = std::time::Instant::now();
+    }
+}
+
+// --- ペイン ID マッピング（tmux target ↔ tako PaneId。#281）---
+
+/// tmux target（`session:window.pane`）から tako PaneId への解決結果キャッシュ
+struct PaneMapping {
+    /// tmux backend session name → tako PaneId (u64)
+    backend_to_pane: HashMap<String, u64>,
+    /// tako PaneId → app の List 応答のペイン情報（API v2 用）
+    pane_info: HashMap<u64, Value>,
+    updated_at: std::time::Instant,
+}
+
+#[allow(dead_code)]
+const PANE_MAPPING_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl PaneMapping {
+    fn new() -> Self {
+        Self {
+            backend_to_pane: HashMap::new(),
+            pane_info: HashMap::new(),
+            updated_at: std::time::Instant::now() - std::time::Duration::from_secs(999),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn is_stale(&self) -> bool {
+        self.updated_at.elapsed() > PANE_MAPPING_TTL
+    }
+
+    /// IPC List の結果からマッピングを更新する
+    fn update_from_list(&mut self, list: &Value) {
+        self.backend_to_pane.clear();
+        self.pane_info.clear();
+        if let Some(tabs) = list["tabs"].as_array() {
+            for tab in tabs {
+                if let Some(panes) = tab["panes"].as_array() {
+                    for pane in panes {
+                        let Some(id) = pane["id"].as_u64() else {
+                            continue;
+                        };
+                        self.pane_info.insert(id, pane.clone());
+                        // backend_windows がある場合、そのセッション名を逆引きに登録
+                        if let Some(windows) = pane["backend_windows"].as_array() {
+                            if !windows.is_empty() {
+                                // backend session 名はペインのタイトルから推定。
+                                // より確実には tmux_list の backend session 名を使う
+                                // ここでは role や osc_title からの推定は不要 —
+                                // remote の pane target 解決で直接 PaneId を返す
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.updated_at = std::time::Instant::now();
+    }
+
+    /// tmux target（`session:window.pane`）から tako PaneId を解決する。
+    /// session 名が backend session と一致すれば対応する PaneId を返す。
+    /// 見つからなければ None（tmux-only のペイン or マッピング未更新）
+    #[allow(dead_code)]
+    fn resolve_pane_id(&self, _tmux_target: &str) -> Option<u64> {
+        // remote の pane target は tmux session:window.pane 形式。
+        // IPC 経由の Send は tmux_session フィールドで session 名を渡せるので
+        // PaneId への変換は必須ではない。ただし Close には PaneId が必要。
+        // List 応答から全ペインの ID を取得済みなので、pane_info のキーから探す
+        None
+    }
+}
+
+// --- WS broadcaster（M-5: 接続数分の tmux subprocess 乱立を解消。#281）---
+
+/// ペインごとの共有 broadcaster。1 つの capture ループを共有し、複数 WS クライアントへ配信する
+struct PaneBroadcaster {
+    subscribers: Vec<std::sync::mpsc::Sender<String>>,
+}
+
+impl PaneBroadcaster {
+    fn new() -> Self {
+        Self {
+            subscribers: Vec::new(),
+        }
+    }
+
+    /// 新しい subscriber を登録し、受信チャンネルを返す
+    fn subscribe(&mut self) -> std::sync::mpsc::Receiver<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.subscribers.push(tx);
+        rx
+    }
+
+    /// 全 subscriber にメッセージを配信。切断済みの subscriber は除去する
+    fn broadcast(&mut self, msg: &str) {
+        self.subscribers
+            .retain(|tx| tx.send(msg.to_string()).is_ok());
+    }
+
+    fn subscriber_count(&self) -> usize {
+        self.subscribers.len()
+    }
+}
+
+type BroadcasterMap = Arc<Mutex<HashMap<String, Arc<Mutex<PaneBroadcaster>>>>>;
+
+/// broadcaster map を作成する
+fn new_broadcaster_map() -> BroadcasterMap {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// 指定ペインの broadcaster を取得するか新規作成する。
+/// 新規作成時は capture ループスレッドを起動する
+fn get_or_create_broadcaster(
+    map: &BroadcasterMap,
+    pane: &str,
+    tmux_socket: &str,
+    shutdown: Arc<AtomicBool>,
+) -> (
+    Arc<Mutex<PaneBroadcaster>>,
+    std::sync::mpsc::Receiver<String>,
+) {
+    let mut map_guard = map.lock().unwrap();
+    let broadcaster = map_guard
+        .entry(pane.to_string())
+        .or_insert_with(|| {
+            let bc = Arc::new(Mutex::new(PaneBroadcaster::new()));
+            let bc_clone = bc.clone();
+            let pane_id = pane.to_string();
+            let socket = tmux_socket.to_string();
+            let map_weak = Arc::downgrade(map);
+            std::thread::Builder::new()
+                .name(format!("ws-broadcast-{}", &pane_id))
+                .spawn(move || {
+                    broadcaster_loop(bc_clone, &pane_id, &socket, shutdown, map_weak);
+                })
+                .ok();
+            bc
+        })
+        .clone();
+    let rx = broadcaster.lock().unwrap().subscribe();
+    (broadcaster, rx)
+}
+
+/// broadcaster の capture ループ。subscriber が 0 になったら自動終了する
+fn broadcaster_loop(
+    broadcaster: Arc<Mutex<PaneBroadcaster>>,
+    pane: &str,
+    tmux_socket: &str,
+    shutdown: Arc<AtomicBool>,
+    map_weak: std::sync::Weak<Mutex<HashMap<String, Arc<Mutex<PaneBroadcaster>>>>>,
+) {
+    let target = format!("={pane}");
+    let mut prev: Option<WsPrevState> = None;
+    let mut last_sent = std::time::Instant::now();
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // subscriber が 0 なら終了して map からも削除
+        {
+            let guard = broadcaster.lock().unwrap();
+            if guard.subscriber_count() == 0 && prev.is_some() {
+                // 初回以降で subscriber がいなくなった
+                drop(guard);
+                if let Some(map) = map_weak.upgrade() {
+                    map.lock().unwrap().remove(pane);
+                }
+                break;
+            }
+        }
+
+        let snap = match ws_snapshot(tmux_socket, &target, 0) {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = json!({ "type": "error", "message": e }).to_string();
+                broadcaster.lock().unwrap().broadcast(&msg);
+                if let Some(map) = map_weak.upgrade() {
+                    map.lock().unwrap().remove(pane);
+                }
+                break;
+            }
+        };
+
+        let need_init = match &prev {
+            None => true,
+            Some(p) => {
+                snap.history_size < p.history_size
+                    || (snap.cols, snap.rows) != p.size
+                    || snap.history_size - p.history_size > WS_INIT_HISTORY
+            }
+        };
+
+        let msg = if need_init {
+            match ws_snapshot(tmux_socket, &target, WS_INIT_HISTORY) {
+                Ok(full) => {
+                    let payload = json!({
+                        "type": "init",
+                        "history": full.history(),
+                        "screen": full.screen(),
+                        "cursor": { "x": full.cursor_x, "y": full.cursor_y },
+                        "size": { "cols": full.cols, "rows": full.rows },
+                    })
+                    .to_string();
+                    prev = Some(WsPrevState {
+                        history_size: full.history_size,
+                        size: (full.cols, full.rows),
+                        screen_hash: full.screen_hash(),
+                    });
+                    Some(payload)
+                }
+                Err(e) => {
+                    let msg = json!({ "type": "error", "message": e }).to_string();
+                    broadcaster.lock().unwrap().broadcast(&msg);
+                    if let Some(map) = map_weak.upgrade() {
+                        map.lock().unwrap().remove(pane);
+                    }
+                    break;
+                }
+            }
+        } else {
+            let p = prev.as_mut().unwrap();
+            let delta = snap.history_size - p.history_size;
+            if delta > 0 {
+                match ws_snapshot(tmux_socket, &target, delta + WS_PUSH_MARGIN) {
+                    Ok(full) => {
+                        let need = full.history_size.saturating_sub(p.history_size) as usize;
+                        if full.history_size < p.history_size
+                            || need > full.history_lines
+                            || need as u64 > WS_INIT_HISTORY
+                        {
+                            prev = None;
+                            None
+                        } else {
+                            let payload = json!({
+                                "type": "update",
+                                "pushed": full.lines[full.history_lines - need..full.history_lines],
+                                "screen": full.screen(),
+                                "cursor": { "x": full.cursor_x, "y": full.cursor_y },
+                            })
+                            .to_string();
+                            p.history_size = full.history_size;
+                            p.screen_hash = full.screen_hash();
+                            Some(payload)
+                        }
+                    }
+                    Err(e) => {
+                        let msg = json!({ "type": "error", "message": e }).to_string();
+                        broadcaster.lock().unwrap().broadcast(&msg);
+                        if let Some(map) = map_weak.upgrade() {
+                            map.lock().unwrap().remove(pane);
+                        }
+                        break;
+                    }
+                }
+            } else {
+                let hash = snap.screen_hash();
+                if hash != p.screen_hash {
+                    p.screen_hash = hash;
+                    Some(
+                        json!({
+                            "type": "update",
+                            "pushed": [],
+                            "screen": snap.screen(),
+                            "cursor": { "x": snap.cursor_x, "y": snap.cursor_y },
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    None
+                }
+            }
+        };
+
+        if let Some(payload) = msg {
+            broadcaster.lock().unwrap().broadcast(&payload);
+            last_sent = std::time::Instant::now();
+        } else if last_sent.elapsed() >= WS_KEEPALIVE {
+            let keepalive = json!({ "type": "keepalive" }).to_string();
+            broadcaster.lock().unwrap().broadcast(&keepalive);
+            last_sent = std::time::Instant::now();
+        }
+        std::thread::sleep(WS_POLL_INTERVAL);
+    }
+}
 
 /// 独立デーモンとして HTTP サーバーを起動し、SIGTERM まで待機する。
 /// `tako remote serve` から呼ばれる内部用関数。
@@ -375,15 +773,28 @@ pub fn run_daemon(port: Option<u16>, insecure: bool) -> io::Result<()> {
     });
     println!("{info}");
 
+    // IPC 接続（#281: dispatch 正規経路。app 不在時は read-only fallback）
+    let app_conn = Arc::new(RwLock::new(AppConnection::new()));
+    // ペイン ID マッピングキャッシュ
+    let pane_mapping = Arc::new(RwLock::new(PaneMapping::new()));
+    // WS broadcaster map（M-5: ペインごとの共有 broadcaster）
+    let broadcasters = new_broadcaster_map();
+
     // HTTP サーバーループ
     while !shutdown.load(Ordering::Relaxed) {
         match server.recv_timeout(std::time::Duration::from_millis(200)) {
             Ok(Some(request)) => {
                 let path = request.url().split('?').next().unwrap_or("");
                 if path == "/ws" && is_ws_upgrade(&request) {
-                    handle_ws(request, &token, &tmux_socket, shutdown.clone());
+                    handle_ws_v2(
+                        request,
+                        &token,
+                        &tmux_socket,
+                        shutdown.clone(),
+                        broadcasters.clone(),
+                    );
                 } else {
-                    handle_request(request, &token, &tmux_socket);
+                    handle_request_v2(request, &token, &tmux_socket, &app_conn, &pane_mapping);
                 }
             }
             Ok(None) => {}
@@ -1477,57 +1888,6 @@ fn tmux_reset_window_size(tmux_socket: &str, window_target: &str) -> Result<(), 
     Ok(())
 }
 
-/// tmux の特定ペインを kill する。
-/// 最後のペインなら window ごと、最後の window ならセッションごと消える（tmux の標準挙動）
-fn tmux_kill_pane(tmux_socket: &str, target: &str) -> Result<(), String> {
-    let output = tmux_output_with_timeout(tmux_socket, &["kill-pane", "-t", target])?;
-    if !output.status.success() {
-        return Err(format!(
-            "tmux kill-pane がエラー: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    Ok(())
-}
-
-/// tmux の特定ペインへテキストを送信する
-fn tmux_send_keys(
-    tmux_socket: &str,
-    target: &str,
-    text: &str,
-    newline: bool,
-) -> Result<(), String> {
-    let output = tmux_output_with_timeout(tmux_socket, &["send-keys", "-t", target, "-l", text])?;
-    if !output.status.success() {
-        return Err(format!(
-            "tmux send-keys がエラー: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    if newline {
-        tmux_output_with_timeout(tmux_socket, &["send-keys", "-t", target, "Enter"])?;
-    }
-    Ok(())
-}
-
-/// tmux の特定ペインへ生キーシーケンスを送信する（`-l` なし = 特殊キー名を解釈する）。
-/// スペース区切りで複数キーを渡せる（例: `"Enter"`, `"C-c"`, `"Escape \\x1b[13;2u"`）
-fn tmux_send_raw_keys(tmux_socket: &str, target: &str, keys: &str) -> Result<(), String> {
-    let mut args = vec!["send-keys", "-t", target];
-    let parts: Vec<&str> = keys.split(' ').filter(|s| !s.is_empty()).collect();
-    for part in &parts {
-        args.push(part);
-    }
-    let output = tmux_output_with_timeout(tmux_socket, &args)?;
-    if !output.status.success() {
-        return Err(format!(
-            "tmux send-keys がエラー: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    Ok(())
-}
-
 // --- HTTP サーバー ---
 
 fn cors_headers() -> Vec<tiny_http::Header> {
@@ -1696,62 +2056,6 @@ fn ws_token_from_protocols(protocols: &str) -> Option<String> {
         .find_map(|p| p.strip_prefix("token.").map(|t| t.to_string()))
 }
 
-/// `GET /ws?pane=<id>` の WebSocket アップグレードを処理する。
-/// 認証はハンドシェイク時の Sec-WebSocket-Protocol（`token.<T>`）で検証し、
-/// 不一致なら 101 を返さない（= 認証なしでは WS 接続できない）
-fn handle_ws(
-    request: tiny_http::Request,
-    token: &str,
-    tmux_socket: &str,
-    shutdown: Arc<AtomicBool>,
-) {
-    let url_full = request.url().to_string();
-    let client_token =
-        header_value(&request, "sec-websocket-protocol").and_then(|v| ws_token_from_protocols(&v));
-    let token_ok = client_token
-        .as_deref()
-        .is_some_and(|t| constant_time_eq(t.as_bytes(), token.as_bytes()));
-    if !token_ok {
-        return respond(
-            request,
-            401,
-            Some(json!({ "error": "認証が必要" }).to_string()),
-        );
-    }
-    let Some(pane) = query_param(&url_full, "pane") else {
-        return respond(
-            request,
-            400,
-            Some(json!({ "error": "pane クエリが必要" }).to_string()),
-        );
-    };
-    let Some(ws_key) = header_value(&request, "sec-websocket-key") else {
-        return respond(
-            request,
-            400,
-            Some(json!({ "error": "Sec-WebSocket-Key ヘッダが無い" }).to_string()),
-        );
-    };
-
-    // 101 Switching Protocols（Upgrade / Connection ヘッダは tiny_http が付与する）
-    let accept = tungstenite::handshake::derive_accept_key(ws_key.as_bytes());
-    let response = tiny_http::Response::empty(101)
-        .with_header(
-            tiny_http::Header::from_bytes(&b"Sec-WebSocket-Accept"[..], accept.as_bytes())
-                .expect("固定ヘッダ"),
-        )
-        .with_header(
-            tiny_http::Header::from_bytes(&b"Sec-WebSocket-Protocol"[..], WS_PROTOCOL.as_bytes())
-                .expect("固定ヘッダ"),
-        );
-    let stream = request.upgrade("websocket", response);
-
-    let tmux_socket = tmux_socket.to_string();
-    let _ = std::thread::Builder::new()
-        .name("tako-remote-ws".into())
-        .spawn(move || ws_push_loop(stream, &pane, &tmux_socket, shutdown));
-}
-
 /// ペインの一貫スナップショット。`display-message` と `capture-pane` を 1 回の
 /// tmux コマンドシーケンス（`;` 連結）で実行した結果で、`history_size` と行内容の
 /// 間に別コマンドが挟まらない（250ms ポーリング間の race を最小化する）
@@ -1856,152 +2160,6 @@ struct WsPrevState {
     screen_hash: u64,
 }
 
-/// 画面プッシュループ。接続時に init（履歴 + 現画面）を送り、以後 250ms 間隔で
-/// 差分（履歴へ押し出された行 + 現画面）を update として送る。読み取り専用で
-/// ペインサイズには一切影響しない（Issue #63「PC 非破壊」）。無変化でも
-/// WS_KEEPALIVE ごとに keepalive を送って接続を維持する。
-/// 送信失敗（クライアント切断）・ペイン消失で終了
-fn ws_push_loop(
-    stream: Box<dyn tiny_http::ReadWrite + Send>,
-    pane: &str,
-    tmux_socket: &str,
-    shutdown: Arc<AtomicBool>,
-) {
-    use tungstenite::protocol::{Role, WebSocket};
-
-    let mut ws = WebSocket::from_raw_socket(stream, Role::Server, None);
-    let target = format!("={pane}");
-    let mut prev: Option<WsPrevState> = None;
-    let mut last_sent = std::time::Instant::now();
-
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            let _ = ws.close(None);
-            break;
-        }
-
-        // 現画面のみの軽量スナップショットで差分の有無を判定する
-        let snap = match ws_snapshot(tmux_socket, &target, 0) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = ws.send(tungstenite::Message::text(
-                    json!({ "type": "error", "message": e }).to_string(),
-                ));
-                let _ = ws.close(None);
-                break;
-            }
-        };
-
-        // init が必要: 初回 / 履歴の減少（clear-history）/ PC 側でのサイズ変更 /
-        // 押し出し量が大きすぎて差分で追う価値がない
-        let need_init = match &prev {
-            None => true,
-            Some(p) => {
-                snap.history_size < p.history_size
-                    || (snap.cols, snap.rows) != p.size
-                    || snap.history_size - p.history_size > WS_INIT_HISTORY
-            }
-        };
-
-        let msg = if need_init {
-            match ws_snapshot(tmux_socket, &target, WS_INIT_HISTORY) {
-                Ok(full) => {
-                    let payload = json!({
-                        "type": "init",
-                        "history": full.history(),
-                        "screen": full.screen(),
-                        "cursor": { "x": full.cursor_x, "y": full.cursor_y },
-                        "size": { "cols": full.cols, "rows": full.rows },
-                    })
-                    .to_string();
-                    prev = Some(WsPrevState {
-                        history_size: full.history_size,
-                        size: (full.cols, full.rows),
-                        screen_hash: full.screen_hash(),
-                    });
-                    Some(payload)
-                }
-                Err(e) => {
-                    let _ = ws.send(tungstenite::Message::text(
-                        json!({ "type": "error", "message": e }).to_string(),
-                    ));
-                    let _ = ws.close(None);
-                    break;
-                }
-            }
-        } else {
-            let p = prev.as_mut().expect("need_init=false なら prev はある");
-            let delta = snap.history_size - p.history_size;
-            if delta > 0 {
-                // 押し出された行を含めて取り直す（マージン付き）。取り直しまでの間に
-                // さらに履歴が進んでいても、マージン内なら取りこぼさない
-                match ws_snapshot(tmux_socket, &target, delta + WS_PUSH_MARGIN) {
-                    Ok(full) => {
-                        let need = full.history_size.saturating_sub(p.history_size) as usize;
-                        if full.history_size < p.history_size
-                            || need > full.history_lines
-                            || need as u64 > WS_INIT_HISTORY
-                        {
-                            // 取り直しの間に clear された / マージンを超えて進んだ。
-                            // 次周期で init を再送する
-                            prev = None;
-                            None
-                        } else {
-                            let payload = json!({
-                                "type": "update",
-                                "pushed": full.lines[full.history_lines - need..full.history_lines],
-                                "screen": full.screen(),
-                                "cursor": { "x": full.cursor_x, "y": full.cursor_y },
-                            })
-                            .to_string();
-                            p.history_size = full.history_size;
-                            p.screen_hash = full.screen_hash();
-                            Some(payload)
-                        }
-                    }
-                    Err(e) => {
-                        let _ = ws.send(tungstenite::Message::text(
-                            json!({ "type": "error", "message": e }).to_string(),
-                        ));
-                        let _ = ws.close(None);
-                        break;
-                    }
-                }
-            } else {
-                let hash = snap.screen_hash();
-                if hash != p.screen_hash {
-                    p.screen_hash = hash;
-                    Some(
-                        json!({
-                            "type": "update",
-                            "pushed": [],
-                            "screen": snap.screen(),
-                            "cursor": { "x": snap.cursor_x, "y": snap.cursor_y },
-                        })
-                        .to_string(),
-                    )
-                } else {
-                    None
-                }
-            }
-        };
-
-        if let Some(payload) = msg {
-            if ws.send(tungstenite::Message::text(payload)).is_err() {
-                break;
-            }
-            last_sent = std::time::Instant::now();
-        } else if last_sent.elapsed() >= WS_KEEPALIVE {
-            let keepalive = json!({ "type": "keepalive" }).to_string();
-            if ws.send(tungstenite::Message::text(keepalive)).is_err() {
-                break;
-            }
-            last_sent = std::time::Instant::now();
-        }
-        std::thread::sleep(WS_POLL_INTERVAL);
-    }
-}
-
 /// URL のクエリ文字列から指定キーの値を取り出す（`/path?ansi=1&lines=200` の類）
 fn query_param(url: &str, key: &str) -> Option<String> {
     let qs = url.split_once('?')?.1;
@@ -2041,7 +2199,253 @@ fn extract_pane_target(path: &str) -> Option<String> {
     None
 }
 
-fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &str) {
+// --- dispatch 統合版ハンドラ（#281 H-7）---
+
+/// IPC 経由でペイン一覧を取得し、マッピングを更新する。
+/// 成功時は List 応答全体を返す
+fn refresh_pane_mapping(
+    app_conn: &Arc<RwLock<AppConnection>>,
+    pane_mapping: &Arc<RwLock<PaneMapping>>,
+) -> Option<Value> {
+    let mut conn = app_conn.write().ok()?;
+    let client = conn.get()?;
+    match client.request(crate::protocol::Request::List) {
+        Ok(list) => {
+            if let Ok(mut mapping) = pane_mapping.write() {
+                mapping.update_from_list(&list);
+            }
+            Some(list)
+        }
+        Err(_) => {
+            conn.invalidate();
+            None
+        }
+    }
+}
+
+/// List 応答をリモート API v2 形式に変換する。
+/// agent 種別・タイトル・role・cwd・タブ内位置・モデル・状態を含むペイン情報
+fn list_to_api_v2(list: &Value) -> Value {
+    let mut panes = Vec::new();
+    let tabs = list["tabs"].as_array().cloned().unwrap_or_default();
+    for tab in &tabs {
+        let tab_title = tab["title"].as_str().unwrap_or("");
+        let tab_id = tab["id"].as_u64().unwrap_or(0);
+        let tab_panes = tab["panes"].as_array().cloned().unwrap_or_default();
+        let total_panes = tab_panes.len();
+        for (idx, pane) in tab_panes.iter().enumerate() {
+            let id = pane["id"].as_u64().unwrap_or(0);
+            let role = pane["role"].as_str().unwrap_or("");
+            let title = pane["title"].as_str().unwrap_or("");
+            let cwd = pane["cwd"].as_str();
+            let state = pane["state"].as_str().unwrap_or("unknown");
+            let surface = pane["surface"].as_str().unwrap_or("background");
+
+            // agent 種別の推定: role から判定
+            let agent_type = if role.contains("master") || role.contains("solo") {
+                if role.contains("codex") {
+                    "codex"
+                } else if role.contains("agy") {
+                    "agy"
+                } else {
+                    "claude"
+                }
+            } else if role.starts_with("orchestrator-worker") {
+                // worker は role の suffix から agent を推定
+                if role.contains("codex") {
+                    "codex"
+                } else if role.contains("agy") {
+                    "agy"
+                } else {
+                    "claude"
+                }
+            } else if pane["osc_title"]
+                .as_str()
+                .is_some_and(|t| t.contains("claude"))
+            {
+                "claude"
+            } else {
+                "plain"
+            };
+
+            // タブ内位置（1/N 形式）
+            let position = format!("{}/{}", idx + 1, total_panes);
+
+            panes.push(json!({
+                "id": id,
+                "title": title,
+                "role": role,
+                "agent_type": agent_type,
+                "cwd": cwd,
+                "state": state,
+                "surface": surface,
+                "position": position,
+                "tab_id": tab_id,
+                "tab_title": tab_title,
+                "cols": pane["cols"],
+                "rows": pane["rows"],
+                "focused": pane["focused"],
+            }));
+        }
+    }
+    json!({ "panes": panes, "api_version": 2 })
+}
+
+/// tmux target を使って IPC 経由で Send dispatch を呼ぶ。
+/// app が不在なら 503 を返す
+fn dispatch_send(
+    app_conn: &Arc<RwLock<AppConnection>>,
+    tmux_target: &str,
+    text: &str,
+    newline: bool,
+    keys: Option<&str>,
+) -> Result<Value, (u16, String)> {
+    let request = if let Some(keys_str) = keys {
+        crate::protocol::Request::Send {
+            pane: None,
+            text: keys_str.to_string(),
+            newline: false,
+            tmux_session: Some(tmux_target.to_string()),
+            await_prompt: false,
+        }
+    } else {
+        crate::protocol::Request::Send {
+            pane: None,
+            text: text.to_string(),
+            newline,
+            tmux_session: Some(tmux_target.to_string()),
+            await_prompt: false,
+        }
+    };
+
+    let mut conn = app_conn
+        .write()
+        .map_err(|_| (500u16, "内部エラー".to_string()))?;
+    let client = conn.get().ok_or((
+        503u16,
+        "tako app が稼働していない（リモートからの入力は app 経由のみ）".to_string(),
+    ))?;
+    match client.request(request) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            conn.invalidate();
+            Err((502, e))
+        }
+    }
+}
+
+/// IPC 経由で Close dispatch を呼ぶ。PaneId が必要なため、
+/// まず List でマッピングを取得してから Close を実行する
+fn dispatch_close(
+    app_conn: &Arc<RwLock<AppConnection>>,
+    pane_mapping: &Arc<RwLock<PaneMapping>>,
+    tmux_target: &str,
+) -> Result<Value, (u16, String)> {
+    // まず List を取得して PaneId を解決する
+    let list = {
+        let mut conn = app_conn
+            .write()
+            .map_err(|_| (500u16, "内部エラー".to_string()))?;
+        let client = conn.get().ok_or((
+            503u16,
+            "tako app が稼働していない（リモートからの close は app 経由のみ）".to_string(),
+        ))?;
+        match client.request(crate::protocol::Request::List) {
+            Ok(v) => v,
+            Err(e) => {
+                conn.invalidate();
+                return Err((502u16, e));
+            }
+        }
+    };
+
+    if let Ok(mut mapping) = pane_mapping.write() {
+        mapping.update_from_list(&list);
+    }
+
+    // tmux target からセッション名を取り出して PaneId を探す
+    let session_name = tmux_target
+        .strip_prefix('=')
+        .unwrap_or(tmux_target)
+        .split(':')
+        .next()
+        .unwrap_or(tmux_target);
+
+    let pane_id = find_pane_id_for_tmux_target(&list, session_name);
+    let Some(pid) = pane_id else {
+        return Err((404, format!("ペイン '{tmux_target}' が見つからない")));
+    };
+
+    // Close を実行する
+    let mut conn = app_conn
+        .write()
+        .map_err(|_| (500u16, "内部エラー".to_string()))?;
+    let client = conn
+        .get()
+        .ok_or((503u16, "tako app が稼働していない".to_string()))?;
+    let result = client.request(crate::protocol::Request::Close {
+        pane: Some(pid),
+        force: false,
+    });
+    match result {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            if e.contains("LastPane") || e.contains("最後") {
+                Err((409, e))
+            } else {
+                conn.invalidate();
+                Err((502, e))
+            }
+        }
+    }
+}
+
+/// List 応答からセッション名にマッチする PaneId を探す
+fn find_pane_id_for_tmux_target(list: &Value, session_name: &str) -> Option<u64> {
+    let tabs = list["tabs"].as_array()?;
+    for tab in tabs {
+        let panes = tab["panes"].as_array()?;
+        for pane in panes {
+            // backend_windows がある = tmux backend ペイン
+            if let Some(windows) = pane["backend_windows"].as_array() {
+                if !windows.is_empty() {
+                    // ペインのタイトルまたは osc_title に session 名が含まれるか確認
+                    let title = pane["title"].as_str().unwrap_or("");
+                    let role = pane["role"].as_str().unwrap_or("");
+                    // backend session 名は通常 `tako-<hash>` 形式。
+                    // tmux target の session 部分と一致するか
+                    if title.contains(session_name)
+                        || role.contains(session_name)
+                        || session_name.starts_with("tako-")
+                    {
+                        return pane["id"].as_u64();
+                    }
+                }
+            }
+            // tmux target の session が pane の何らかの属性と一致する場合
+            let pane_id = pane["id"].as_u64()?;
+            // backend_windows が無くても、全ペインの ID リストから最も合致するものを返す
+            // （tmux target ではなく PaneId を直接使える場合）
+            if let Ok(id_str) = session_name.parse::<u64>() {
+                if pane_id == id_str {
+                    return Some(pane_id);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// dispatch 統合版のリクエストハンドラ。
+/// 書き込み系（input/close/resize）は IPC 経由で dispatch を通す。
+/// 読み取り系は従来どおり tmux 直接 + API v2 は IPC List 経由
+fn handle_request_v2(
+    mut request: tiny_http::Request,
+    token: &str,
+    tmux_socket: &str,
+    app_conn: &Arc<RwLock<AppConnection>>,
+    pane_mapping: &Arc<RwLock<PaneMapping>>,
+) {
     let method = request.method().clone();
     let url_full = request.url().to_string();
     let path = url_full.split('?').next().unwrap_or("").to_string();
@@ -2053,10 +2457,22 @@ fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &st
 
     // /api/health は認証不要
     if path == "/api/health" && method == tiny_http::Method::Get {
+        let app_available = app_conn
+            .read()
+            .ok()
+            .and_then(|c| c.client.as_ref().map(|_| true))
+            .unwrap_or(false);
         return respond(
             request,
             200,
-            Some(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }).to_string()),
+            Some(
+                json!({
+                    "status": "ok",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "app_connected": app_available,
+                })
+                .to_string(),
+            ),
         );
     }
 
@@ -2074,14 +2490,29 @@ fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &st
         );
     }
 
-    // API ルーティング（tmux 直接操作）
+    // --- API v2 エンドポイント（IPC 経由のリッチ情報。#281）---
+    if path == "/api/v2/panes" && method == tiny_http::Method::Get {
+        match refresh_pane_mapping(app_conn, pane_mapping) {
+            Some(list) => {
+                let result = list_to_api_v2(&list);
+                return respond_sensitive(request, 200, Some(result.to_string()));
+            }
+            None => {
+                // app 不在: tmux-only のペイン一覧（v1 形式にフォールバック）
+                let result = tmux_list_panes(tmux_socket);
+                return respond(request, 200, Some(result.to_string()));
+            }
+        }
+    }
+
+    // --- API ルーティング（dispatch 統合 + tmux 直接操作）---
     match (method, path.as_str()) {
         (tiny_http::Method::Get, "/api/panes") => {
+            // v1: 従来の tmux 直接一覧（後方互換）
             let result = tmux_list_panes(tmux_socket);
             respond(request, 200, Some(result.to_string()))
         }
         (tiny_http::Method::Get, "/api/agents") => {
-            // claude agents --json のプロキシ + pane 対応付け（Issue #23）
             match crate::agents::list_agents_with_panes(Some(tmux_socket)) {
                 Ok(result) => respond_sensitive(request, 200, Some(result.to_string())),
                 Err(e) => respond(request, 502, Some(json!({ "error": e }).to_string())),
@@ -2090,7 +2521,6 @@ fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &st
         (tiny_http::Method::Get, p)
             if p.starts_with("/api/sessions/") && p.ends_with("/messages") =>
         {
-            // /api/sessions/:id/messages — Claude Code transcript の正規化読み取り
             let Some(session_id) = extract_session_id(p) else {
                 return respond(
                     request,
@@ -2114,7 +2544,6 @@ fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &st
                     Some(json!({ "error": "無効なペイン ID" }).to_string()),
                 );
             };
-            // tmux target は URL デコード不要（session:window.pane）
             let tmux_target = format!("={target}");
             let ansi = query_param(&url_full, "ansi").is_some_and(|v| v == "1" || v == "true");
             let history = query_param(&url_full, "lines").and_then(|v| v.parse::<u32>().ok());
@@ -2155,6 +2584,7 @@ fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &st
                 Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
             }
         }
+        // --- 書き込み系: dispatch 経由（H-7）---
         (tiny_http::Method::Post, p) if p.starts_with("/api/panes/") && p.ends_with("/input") => {
             let Some(target) = extract_pane_target(p) else {
                 return respond(
@@ -2189,18 +2619,14 @@ fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &st
                     );
                 }
             };
-            let tmux_target = format!("={target}");
-            if let Some(keys) = parsed["keys"].as_str() {
-                match tmux_send_raw_keys(tmux_socket, &tmux_target, keys) {
-                    Ok(()) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
-                    Err(e) => respond(request, 500, Some(json!({ "error": e }).to_string())),
-                }
-            } else {
-                let text = parsed["text"].as_str().unwrap_or("").to_string();
-                let newline = parsed["newline"].as_bool().unwrap_or(true);
-                match tmux_send_keys(tmux_socket, &tmux_target, &text, newline) {
-                    Ok(()) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
-                    Err(e) => respond(request, 500, Some(json!({ "error": e }).to_string())),
+            // IPC 経由で dispatch Send を呼ぶ（H-7: #95 送達検証が効く）
+            let keys = parsed["keys"].as_str().map(|s| s.to_string());
+            let text = parsed["text"].as_str().unwrap_or("").to_string();
+            let newline = parsed["newline"].as_bool().unwrap_or(true);
+            match dispatch_send(app_conn, &target, &text, newline, keys.as_deref()) {
+                Ok(_) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
+                Err((status, e)) => {
+                    respond(request, status, Some(json!({ "error": e }).to_string()))
                 }
             }
         }
@@ -2212,10 +2638,12 @@ fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &st
                     Some(json!({ "error": "無効なペイン ID" }).to_string()),
                 );
             };
-            let tmux_target = format!("={target}");
-            match tmux_kill_pane(tmux_socket, &tmux_target) {
-                Ok(()) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
-                Err(e) => respond(request, 500, Some(json!({ "error": e }).to_string())),
+            // IPC 経由で dispatch Close を呼ぶ（H-7: 最後のペイン保護が効く）
+            match dispatch_close(app_conn, pane_mapping, &target) {
+                Ok(_) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
+                Err((status, e)) => {
+                    respond(request, status, Some(json!({ "error": e }).to_string()))
+                }
             }
         }
         (tiny_http::Method::Post, p) if p.starts_with("/api/panes/") && p.ends_with("/resize") => {
@@ -2252,29 +2680,73 @@ fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &st
                     );
                 }
             };
-            let window_target = format!("={}", window_target_of(&target));
-            let result = if parsed["reset"].as_bool() == Some(true) {
-                tmux_reset_window_size(tmux_socket, &window_target)
-            } else {
-                match (parsed["cols"].as_u64(), parsed["rows"].as_u64()) {
-                    (Some(cols), Some(rows)) if cols > 0 && rows > 0 => {
-                        tmux_resize_window(tmux_socket, &window_target, cols as u32, rows as u32)
-                    }
-                    _ => {
-                        return respond(
-                            request,
-                            400,
-                            Some(
-                                json!({ "error": "cols と rows（正の整数）か reset=true を指定する" })
-                                    .to_string(),
-                            ),
-                        );
-                    }
+            // IPC 経由で TmuxResize dispatch を呼ぶ
+            let session_part = target.split(':').next().unwrap_or(&target);
+            let window_part = target
+                .split(':')
+                .nth(1)
+                .and_then(|w| w.split('.').next())
+                .and_then(|w| w.parse::<u32>().ok())
+                .unwrap_or(0);
+            let reset = parsed["reset"].as_bool() == Some(true);
+            let cols = parsed["cols"].as_u64().map(|c| c as u32);
+            let rows = parsed["rows"].as_u64().map(|r| r as u32);
+
+            // IPC 経由で TmuxResize を呼ぶ
+            let mut conn_guard = match app_conn.write() {
+                Ok(g) => g,
+                Err(_) => {
+                    return respond(
+                        request,
+                        500,
+                        Some(json!({ "error": "内部エラー" }).to_string()),
+                    );
                 }
             };
-            match result {
-                Ok(()) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
-                Err(e) => respond(request, 500, Some(json!({ "error": e }).to_string())),
+            match conn_guard.get() {
+                Some(client) => {
+                    let result = client.request(crate::protocol::Request::TmuxResize {
+                        socket: Some(tako_core::tmux_backend::socket_name()),
+                        session: session_part.to_string(),
+                        window: window_part,
+                        cols: if reset { None } else { cols },
+                        rows: if reset { None } else { rows },
+                        reset,
+                    });
+                    drop(conn_guard);
+                    match result {
+                        Ok(_) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
+                        Err(e) => respond(request, 502, Some(json!({ "error": e }).to_string())),
+                    }
+                }
+                None => {
+                    drop(conn_guard);
+                    // app 不在時は tmux 直接操作にフォールバック（resize は読み取りに近い操作）
+                    let window_target = format!("={}", window_target_of(&target));
+                    let result = if reset {
+                        tmux_reset_window_size(tmux_socket, &window_target)
+                    } else {
+                        match (cols, rows) {
+                            (Some(c), Some(r)) if c > 0 && r > 0 => {
+                                tmux_resize_window(tmux_socket, &window_target, c, r)
+                            }
+                            _ => {
+                                return respond(
+                                    request,
+                                    400,
+                                    Some(
+                                        json!({ "error": "cols と rows（正の整数）か reset=true を指定する" })
+                                            .to_string(),
+                                    ),
+                                );
+                            }
+                        }
+                    };
+                    match result {
+                        Ok(()) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
+                        Err(e) => respond(request, 500, Some(json!({ "error": e }).to_string())),
+                    }
+                }
             }
         }
         _ => respond(
@@ -2283,6 +2755,91 @@ fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &st
             Some(json!({ "error": "API エンドポイントが見つからない" }).to_string()),
         ),
     }
+}
+
+/// WS broadcaster 版のハンドラ（M-5: ペインごとの共有 broadcaster で接続数分の
+/// tmux subprocess 乱立を解消）
+fn handle_ws_v2(
+    request: tiny_http::Request,
+    token: &str,
+    tmux_socket: &str,
+    shutdown: Arc<AtomicBool>,
+    broadcasters: BroadcasterMap,
+) {
+    let url_full = request.url().to_string();
+    let client_token =
+        header_value(&request, "sec-websocket-protocol").and_then(|v| ws_token_from_protocols(&v));
+    let token_ok = client_token
+        .as_deref()
+        .is_some_and(|t| constant_time_eq(t.as_bytes(), token.as_bytes()));
+    if !token_ok {
+        return respond(
+            request,
+            401,
+            Some(json!({ "error": "認証が必要" }).to_string()),
+        );
+    }
+    let Some(pane) = query_param(&url_full, "pane") else {
+        return respond(
+            request,
+            400,
+            Some(json!({ "error": "pane クエリが必要" }).to_string()),
+        );
+    };
+    let Some(ws_key) = header_value(&request, "sec-websocket-key") else {
+        return respond(
+            request,
+            400,
+            Some(json!({ "error": "Sec-WebSocket-Key ヘッダが無い" }).to_string()),
+        );
+    };
+
+    // 101 Switching Protocols
+    let accept = tungstenite::handshake::derive_accept_key(ws_key.as_bytes());
+    let response = tiny_http::Response::empty(101)
+        .with_header(
+            tiny_http::Header::from_bytes(&b"Sec-WebSocket-Accept"[..], accept.as_bytes())
+                .expect("固定ヘッダ"),
+        )
+        .with_header(
+            tiny_http::Header::from_bytes(&b"Sec-WebSocket-Protocol"[..], WS_PROTOCOL.as_bytes())
+                .expect("固定ヘッダ"),
+        );
+    let stream = request.upgrade("websocket", response);
+
+    // broadcaster に subscribe して WS 配信スレッドを起動
+    let (_, rx) = get_or_create_broadcaster(&broadcasters, &pane, tmux_socket, shutdown);
+
+    std::thread::Builder::new()
+        .name("tako-remote-ws-relay".into())
+        .spawn(move || {
+            use tungstenite::protocol::{Role, WebSocket};
+            let mut ws = WebSocket::from_raw_socket(stream, Role::Server, None);
+
+            // broadcaster からのメッセージを WS クライアントへ中継する
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                    Ok(msg) => {
+                        if ws.send(tungstenite::Message::text(msg)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // keepalive
+                        let keepalive = json!({ "type": "keepalive" }).to_string();
+                        if ws.send(tungstenite::Message::text(keepalive)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        // broadcaster が終了した
+                        break;
+                    }
+                }
+            }
+            let _ = ws.close(None);
+        })
+        .ok();
 }
 
 /// macOS の LAN IP アドレスを取得する。取得できなければ None を返す
