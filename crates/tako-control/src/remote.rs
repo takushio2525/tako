@@ -28,25 +28,23 @@
 //! WS は Sec-WebSocket-Protocol の `token.<T>` で検証（ブラウザ WS API はヘッダ不可のため）。
 //! CORS: PWA からのアクセス用にワイルドカード許可。
 //!
-//! 接続リンクの構成（Issue #91）:
-//! - トンネル成功 + リレー登録成功 → `https://tako-remote.pages.dev/#/connect?machine=...`
-//!   （固定 URL。PWA は Cloudflare Pages が配信し、KV リレーで machineId → 現在の
-//!   トンネル URL を解決してデータだけトンネル経由で流す。トンネルが再起動しても
-//!   リンク / ブックマークは不変）。トンネル直 URL は `fallback_url` として併記
-//!   （リレー障害時の予備。デーモン内蔵 PWA がトンネル経由で配信される）
-//! - トンネル成功 + リレー登録失敗 → トンネル直 URL（従来形式）
-//! - トンネル失敗（cloudflared 不在等）→ **起動を拒否する**（#104。暗号化経路を確立できない
-//!   状態では安全に提供できないため）。信頼できる LAN 内で平文のまま使いたい場合のみ
-//!   `--insecure`（明示 opt-in・非推奨）で LAN URL 直（内蔵 PWA）を許可する
+//! transport（Issue #282: Tailscale Serve 一本化）:
+//! - daemon は `127.0.0.1` のみ bind し、`tailscale serve` が HTTPS:443 →
+//!   `http://127.0.0.1:<port>` のプロキシとして tailnet 内へ公開する
+//!   （WireGuard E2E 暗号化・public internet に入口を持たない）
+//! - 接続リンクは恒久固定の `https://<ホスト名>.<tailnet>.ts.net`（MagicDNS 名。
+//!   serve の off → 再設定でも不変。弾 0 実測 `.agent/investigations/tailscale-serve-poc.md`）
+//! - Tailscale 未セットアップ（未導入・デーモン未起動・未ログイン・HTTPS 未有効）での
+//!   起動は不足項目を列挙して**拒否**し、`tako remote setup` へ誘導する（黙って失敗させない）
 //!
 //! デーモン管理:
 //! - `tako remote start` → `tako remote serve` をバックグラウンド fork
-//! - PID ファイル（`/tmp/tako-remote.pid`）で管理
-//! - `tako remote stop` → PID ファイルから kill
+//! - PID ファイル（`<data_dir>/remote/tako-remote.pid`）で管理
+//! - `tako remote stop` → PID ファイルから kill + serve 設定の解除
 
 use std::collections::HashMap;
 use std::io;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -55,18 +53,6 @@ use serde_json::{json, Value};
 
 const DEFAULT_PORT: u16 = 7749;
 const MAX_BODY_BYTES: u64 = 1024 * 1024;
-/// KV リレーの Workers URL（Cloudflare Pages / Workers のデプロイ先）。
-/// PWA 側（web/tako-remote/src/api.js）の DEFAULT_RELAY_URL と一致させること
-const DEFAULT_RELAY_URL: &str = "https://tako-remote-relay.takushio2525.workers.dev";
-/// 接続入口の Cloudflare Pages URL（PWA の固定ホスティング先。scripts/deploy-pages.sh で更新）。
-/// トンネル有効時の接続リンクはこの固定 URL をベースにし、PWA が KV リレー経由で実際の
-/// トンネル URL を解決する（Issue #91: trycloudflare のランダム URL をユーザーに見せず、
-/// ブックマークを恒久化する）。`TAKO_PAGES_URL` で差し替え可能（セルフホスト・検証用）
-const DEFAULT_PAGES_URL: &str = "https://tako-remote.pages.dev";
-
-fn pages_url() -> String {
-    std::env::var("TAKO_PAGES_URL").unwrap_or_else(|_| DEFAULT_PAGES_URL.to_string())
-}
 // --- PID / トークン / ポートファイルのパス ---
 // P0-3: 共有 /tmp から <data_dir>/remote/（0700）へ移動。作成時から 0600。
 
@@ -103,10 +89,10 @@ pub fn token_path() -> std::path::PathBuf {
 pub fn port_path() -> std::path::PathBuf {
     state_dir().join("tako-remote.port")
 }
-/// トンネル状態（tunnel URL / machineId / リレー登録成否）の JSON。
-/// デーモンがトンネル確立時に書き、`daemon_status` が接続リンクの再構成に使う
-pub fn tunnel_path() -> std::path::PathBuf {
-    state_dir().join("tako-remote.tunnel")
+/// 公開中の固定 ts.net URL を記録するファイル。
+/// デーモンが serve 確立時に書き、`daemon_status` が接続リンクの再構成に使う
+pub fn url_path() -> std::path::PathBuf {
+    state_dir().join("tako-remote.url")
 }
 
 /// 秘密を含むファイルを作成時から 0600 で書き込む。
@@ -161,7 +147,7 @@ fn cleanup_state_files() {
     let _ = std::fs::remove_file(pid_path());
     let _ = std::fs::remove_file(token_path());
     let _ = std::fs::remove_file(port_path());
-    let _ = std::fs::remove_file(tunnel_path());
+    let _ = std::fs::remove_file(url_path());
     // QR ファイル（ランダム名）を掃除する
     let dir = state_dir();
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -610,19 +596,77 @@ fn broadcaster_loop(
     }
 }
 
+/// Tailscale setup の不足項目を列挙した起動拒否エラーを組み立てる。
+/// `tako remote start` の誘導文言（Issue #282: 黙って失敗させない）
+fn setup_incomplete_error(status: &crate::tailscale::SetupStatus) -> io::Error {
+    let items = status
+        .missing
+        .iter()
+        .map(|m| format!("  - {}", m.describe()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    io::Error::other(format!(
+        "Tailscale のセットアップが完了していないため、remote サーバーを起動できません。\n\
+         不足項目:\n{items}\n\
+         `tako remote setup` を実行してください。"
+    ))
+}
+
+/// Tailscale の setup 状態を検証し、serve を設定して固定 ts.net URL を返す。
+/// 返り値: (tailscale CLI パス, 固定 URL)。
+/// 既存の serve 設定が tako 管理形式（HTTPS:443 の "/" 単純プロキシ）で自ポートを
+/// 向いている場合は再利用し、それ以外の設定は上書きせず拒否する
+fn establish_tailscale_serve(port: u16) -> io::Result<(String, String)> {
+    let status = crate::tailscale::setup_status();
+    if !status.ready() {
+        return Err(setup_incomplete_error(&status));
+    }
+    // ready() = missing が空なら cli_path / dns_name は必ず埋まっている
+    let cli = status
+        .cli_path
+        .clone()
+        .ok_or_else(|| io::Error::other("tailscale CLI パスを解決できない"))?;
+    let base_url = status
+        .ts_net_url()
+        .ok_or_else(|| io::Error::other("ts.net URL を解決できない"))?;
+
+    match crate::tailscale::serve_state(&cli).map_err(io::Error::other)? {
+        crate::tailscale::ServeState::NotConfigured => {
+            crate::tailscale::serve_start(&cli, port).map_err(io::Error::other)?;
+        }
+        crate::tailscale::ServeState::Proxy(target)
+            if target == crate::tailscale::proxy_target_for_port(port) =>
+        {
+            // 前回の設定が残っている（強制終了等）。同一ポートなのでそのまま再利用する
+        }
+        crate::tailscale::ServeState::Proxy(target) => {
+            return Err(io::Error::other(format!(
+                "tailscale serve に既存の設定があります（HTTPS:443 → {target}）。\
+                 ユーザー設定を壊さないため上書きしません。tako の以前の設定の残骸であれば\
+                 `tailscale serve --https=443 off` で解除するか、同じポートを使うなら\
+                 `tako remote start --port <ポート番号>` を指定してください"
+            )));
+        }
+        crate::tailscale::ServeState::Other => {
+            return Err(io::Error::other(
+                "tailscale serve に tako 管理外の設定があります（パス分けハンドラ等）。\
+                 上書きを避けるため起動を中止しました。`tailscale serve status` で確認してください",
+            ));
+        }
+    }
+    Ok((cli, base_url))
+}
+
 /// 独立デーモンとして HTTP サーバーを起動し、SIGTERM まで待機する。
 /// `tako remote serve` から呼ばれる内部用関数。
 ///
-/// セキュリティ方針（#104）: 既定では**暗号化されたトンネル経由でのみ**ホストする。
-/// cloudflared トンネルが張れなければ起動を**拒否**する（平文 LAN へフォールバックしない）。
-/// `insecure = true` のときだけ、平文 HTTP の LAN 直モードを許可する（明示 opt-in。
-/// 同一 LAN 上の第三者にトークンを盗聴されうるため、信頼できるネットワーク限定）
-pub fn run_daemon(port: Option<u16>, insecure: bool) -> io::Result<()> {
+/// transport 方針（#282）: `127.0.0.1` のみ bind し、`tailscale serve` 経由でのみ
+/// tailnet 内へ公開する（WireGuard E2E 暗号化。平文 LAN モードは存在しない）。
+/// Tailscale が未セットアップなら不足項目を列挙して起動を拒否する
+pub fn run_daemon(port: Option<u16>) -> io::Result<()> {
     let port = port.unwrap_or(DEFAULT_PORT);
-    // P0-1: secure モードは 127.0.0.1（ループバック）のみ bind。cloudflared だけがアクセスする。
-    // insecure（LAN 直）のみ 0.0.0.0 に bind する
-    let bind_host = if insecure { "0.0.0.0" } else { "127.0.0.1" };
-    let addr = format!("{bind_host}:{port}");
+    // P0-1: 127.0.0.1（ループバック）のみ bind。tailscale serve だけがアクセスする
+    let addr = format!("127.0.0.1:{port}");
     let server = tiny_http::Server::http(&addr)
         .map_err(|e| io::Error::other(format!("remote API サーバーを起動できない: {e}")))?;
     let actual_port = server
@@ -640,6 +684,9 @@ pub fn run_daemon(port: Option<u16>, insecure: bool) -> io::Result<()> {
             "tmux が見つからない。remote サーバーは tmux 経由でペインを操作するため、tmux が必須です",
         ));
     }
+
+    // Tailscale setup 検証 + serve 設定（不足があればここで起動拒否）
+    let (ts_cli, base_url) = establish_tailscale_serve(actual_port)?;
 
     // トークン生成
     let token = crate::generate_token()?;
@@ -701,93 +748,28 @@ pub fn run_daemon(port: Option<u16>, insecure: bool) -> io::Result<()> {
             })?;
     }
 
-    // cloudflared tunnel
-    let mut tunnel_url: Option<String> = None;
-    let mut tunnel_process: Option<Child> = None;
-    let mut mid: Option<String> = None;
-    // 起動失敗はもう Err で中止するため、この情報 JSON では常に null（後方互換のため残す）
-    let tunnel_error: Option<String> = None;
-    let mut relay_ok = false;
-
-    if insecure {
-        // 平文 LAN 直モード（明示 opt-in）。トンネルを張らない。強い警告を出す
-        eprintln!("⚠ insecure モード: 暗号化されていない平文 HTTP で LAN に公開します。");
-        eprintln!(
-            "  同一 Wi-Fi / LAN 上の第三者にトークンを含む通信を盗聴されうる。信頼できるネットワークでのみ使うこと。"
-        );
-    } else {
-        // secure モード（既定）: 暗号化トンネル必須。張れなければ起動を拒否する
-        match start_cloudflared(actual_port) {
-            Ok((child, url)) => {
-                let machine = machine_id();
-                match register_relay(&machine, &url) {
-                    Ok(()) => relay_ok = true,
-                    Err(e) => eprintln!("KV リレー登録失敗（トンネル直 URL で継続）: {e}"),
-                }
-                mid = Some(machine);
-                tunnel_url = Some(url);
-                tunnel_process = Some(child);
-            }
-            Err(e) => {
-                // 暗号化経路を確立できない = 安全に提供できない。起動を中止する（#104）。
-                // 書き込んだ state ファイルを片付けてから Err を返す
-                cleanup_state_files();
-                return Err(io::Error::other(format!(
-                    "暗号化トンネルを確立できないため remote サーバーの起動を中止しました: {e}\n\
-                     cloudflared を導入してください（brew install cloudflared）。\
-                     信頼できる LAN 内で平文のまま使うには `tako remote start --insecure` を指定します（非推奨）。"
-                )));
-            }
-        }
-    }
-
-    // トンネル状態を state ファイルに残す（`tako remote status` が接続リンクを再構成するため）
-    if let Some(ref t) = tunnel_url {
-        let state = json!({ "tunnel_url": t, "machine_id": mid, "relay_ok": relay_ok });
-        let _ = write_secret_file(&tunnel_path(), &state.to_string());
+    // 公開 URL を state ファイルに残す（`tako remote status` が接続リンクを再構成するため）
+    if let Err(e) = write_secret_file(&url_path(), &base_url) {
+        // 起動情報の整合が取れないため中止する。設定した serve と state を片付ける
+        let _ = crate::tailscale::serve_stop_if_ours(&ts_cli, actual_port);
+        cleanup_state_files();
+        return Err(io::Error::other(format!(
+            "URL ファイルの書き出しに失敗: {e}"
+        )));
     }
 
     // 起動情報を JSON で stdout に出力（start コマンドが読み取る）。
-    // 接続リンク: リレー登録済みなら Pages 固定 URL + トンネル直 URL を予備として併記
-    // （リレーが単一障害点にならないように。Issue #91 留意点）
-    // P0-1: secure モードでは LAN URL を生成しない（ループバック bind のため到達不能）
-    let local_url = if insecure {
-        let lan_host = lan_ip().unwrap_or_else(|| "localhost".to_string());
-        format!("http://{lan_host}:{actual_port}")
-    } else {
-        format!("http://127.0.0.1:{actual_port}")
-    };
+    // 接続リンクは恒久固定の ts.net URL（tailnet 内限定・WireGuard E2E 暗号化）
     let host_name = hostname();
-    let mid_for_link = if relay_ok { mid.as_deref() } else { None };
-    let connect = connect_url(
-        tunnel_url.as_deref(),
-        &local_url,
-        &token,
-        Some(&host_name),
-        mid_for_link,
-    );
-    let fallback = if relay_ok && tunnel_url.is_some() {
-        Some(connect_url(
-            tunnel_url.as_deref(),
-            &local_url,
-            &token,
-            Some(&host_name),
-            None,
-        ))
-    } else {
-        None
-    };
+    let connect = connect_url(&base_url, &token, Some(&host_name));
     let info = json!({
         "running": true,
         "port": actual_port,
         "bind_addr": addr,
         "token": token,
-        "url": local_url,
-        "tunnel_url": tunnel_url,
-        "tunnel_error": tunnel_error,
-        "machine_id": mid,
+        "url": base_url,
         "connect_url": connect,
-        "fallback_url": fallback,
+        "transport": "tailscale-serve",
     });
     println!("{info}");
 
@@ -820,10 +802,9 @@ pub fn run_daemon(port: Option<u16>, insecure: bool) -> io::Result<()> {
         }
     }
 
-    // クリーンアップ
-    if let Some(mut child) = tunnel_process.take() {
-        let _ = child.kill();
-        let _ = child.wait();
+    // クリーンアップ: 自分が公開に使った serve 設定のみ解除する
+    if let Err(e) = crate::tailscale::serve_stop_if_ours(&ts_cli, actual_port) {
+        eprintln!("tailscale serve の解除に失敗（tailscale serve --https=443 off で手動解除できます）: {e}");
     }
     cleanup_state_files();
 
@@ -881,40 +862,23 @@ pub fn daemon_status() -> Value {
         .unwrap_or_default()
         .trim()
         .to_string();
-    let lan_host = lan_ip().unwrap_or_else(|| "localhost".to_string());
-    let local_url = format!("http://{lan_host}:{port}");
     let host_name = hostname();
-    // トンネル状態ファイルがあれば、起動時と同じ規則で接続リンクを再構成する
-    let tunnel_state: Option<Value> = std::fs::read_to_string(tunnel_path())
+    // URL ファイル（起動時に確定した固定 ts.net URL）から接続リンクを再構成する
+    let base_url = std::fs::read_to_string(url_path())
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok());
-    let tunnel_url = tunnel_state
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let connect = base_url
         .as_ref()
-        .and_then(|v| v["tunnel_url"].as_str().map(String::from));
-    let mid = tunnel_state
-        .as_ref()
-        .and_then(|v| v["machine_id"].as_str().map(String::from));
-    let relay_ok = tunnel_state
-        .as_ref()
-        .and_then(|v| v["relay_ok"].as_bool())
-        .unwrap_or(false);
-    let mid_for_link = if relay_ok { mid.as_deref() } else { None };
-    let connect = connect_url(
-        tunnel_url.as_deref(),
-        &local_url,
-        &token,
-        Some(&host_name),
-        mid_for_link,
-    );
+        .map(|b| connect_url(b, &token, Some(&host_name)));
     json!({
         "running": true,
         "pid": pid_num,
         "port": port,
         "token": token,
-        "url": local_url,
-        "tunnel_url": tunnel_url,
-        "machine_id": mid,
+        "url": base_url,
         "connect_url": connect,
+        "transport": "tailscale-serve",
     })
 }
 
@@ -944,14 +908,14 @@ fn mask_token_in_url(url: &str) -> String {
 /// `daemon_status()` が返す状態 JSON のトークンをマスクする（`***` へ置換）。
 /// スクリーンショット・画面共有経由でのトークン漏えいを防ぐため、CLI / MCP の
 /// `remote status` は既定でこれを通す（`--show-token` 指定時のみ生値を出す）。
-/// 単体の `token` フィールドに加え、接続 URL（`connect_url` / `fallback_url` / `url`）の
+/// 単体の `token` フィールドに加え、接続 URL（`connect_url` / `url`）の
 /// クエリに載る `token=<生値>` もマスクする（#104。URL だけ生値が残るとマスクの意味がないため）
 pub fn mask_status_token(status: &mut Value) {
     if let Some(obj) = status.as_object_mut() {
         if obj.get("token").and_then(|t| t.as_str()).is_some() {
             obj.insert("token".to_string(), json!("***"));
         }
-        for key in ["connect_url", "fallback_url", "url"] {
+        for key in ["connect_url", "url"] {
             if let Some(masked) = obj.get(key).and_then(|v| v.as_str()).map(mask_token_in_url) {
                 obj.insert(key.to_string(), json!(masked));
             }
@@ -1099,6 +1063,24 @@ pub fn daemon_force_stop() -> Result<Value, String> {
     daemon_stop_impl(true)
 }
 
+/// デーモン停止後に残った serve 設定をベストエフォートで解除する。
+/// SIGKILL などで daemon 自身のクリーンアップが走らなかったケースの回収。
+/// 対象ポートへの tako 管理プロキシである場合のみ解除する（ユーザー設定は不可侵）
+fn cleanup_serve_leftover(port: Option<u16>) {
+    let Some(port) = port else { return };
+    let Some(cli) = crate::tailscale::find_tailscale() else {
+        return;
+    };
+    let _ = crate::tailscale::serve_stop_if_ours(&cli, port);
+}
+
+/// port ファイルに記録されたデーモンのポート番号を読む（無ければ None）
+fn recorded_port() -> Option<u16> {
+    std::fs::read_to_string(port_path())
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+}
+
 fn daemon_stop_impl(force: bool) -> Result<Value, String> {
     let pid_info = match parse_pid_file() {
         Ok(info) => info,
@@ -1110,6 +1092,7 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
                         "PID ファイルが消失していますが、stale デーモン（PID {occupant}）を検出。停止します…"
                     );
                     kill_stale_daemon(occupant);
+                    cleanup_serve_leftover(Some(DEFAULT_PORT));
                     return Ok(json!({ "stopped": true, "stale_pid": occupant }));
                 }
             }
@@ -1117,6 +1100,8 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
         }
     };
     let pid_num = pid_info.pid;
+    // kill 後は state が消えるため、serve 残骸回収用のポートを先に読んでおく
+    let daemon_port = recorded_port();
     if !is_process_alive(pid_num) {
         cleanup_state_files();
         return Err("リモートサーバーが起動していない（プロセスは既に終了）".to_string());
@@ -1166,15 +1151,19 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    // SIGTERM ならデーモン自身が serve を解除して終了する。SIGKILL（--force）や
+    // 異常終了で残った serve 設定はここでベストエフォート回収する（冪等）
+    cleanup_serve_leftover(daemon_port);
     cleanup_state_files();
     Ok(json!({ "stopped": true }))
 }
 
 /// デーモンをバックグラウンドで fork 起動する。
-/// `tako remote serve --port N [--insecure]` を子プロセスとして起動し、
+/// `tako remote serve --port N` を子プロセスとして起動し、
 /// stdout から起動情報 JSON を読み取って返す。
-/// `insecure = true` のときだけ平文 LAN 直モードを許可する（既定は暗号化トンネル必須。#104）
-pub fn spawn_daemon(port: Option<u16>, insecure: bool) -> Result<Value, String> {
+/// Tailscale 未セットアップ時は子プロセスが不足項目を stderr に出して終了するため、
+/// その内容がこの関数の Err に載る（#282: `tako remote setup` への誘導）
+pub fn spawn_daemon(port: Option<u16>) -> Result<Value, String> {
     let actual_port = port.unwrap_or(DEFAULT_PORT);
 
     // 既に起動中か確認
@@ -1211,9 +1200,6 @@ pub fn spawn_daemon(port: Option<u16>, insecure: bool) -> Result<Value, String> 
     if let Some(p) = port {
         args.push("--port".to_string());
         args.push(p.to_string());
-    }
-    if insecure {
-        args.push("--insecure".to_string());
     }
 
     let mut cmd = Command::new(&tako_bin);
@@ -1377,254 +1363,17 @@ fn kill_stale_daemon(pid: u32) {
     cleanup_state_files();
 }
 
-// --- cloudflared Quick Tunnel ---
-
-/// cloudflared を起動して Quick Tunnel URL を取得する
-fn start_cloudflared(port: u16) -> io::Result<(Child, String)> {
-    let cloudflared = find_cloudflared()?;
-    let mut child = Command::new(&cloudflared)
-        .args(["tunnel", "--url", &format!("http://127.0.0.1:{port}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| io::Error::other(format!("cloudflared の起動に失敗: {e}")))?;
-
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other("cloudflared の stderr を取得できない"))?;
-
-    let url = parse_tunnel_url(stderr)?;
-    Ok((child, url))
-}
-
-/// PATH から cloudflared を探す
-fn find_cloudflared() -> io::Result<String> {
-    let candidates = [
-        "cloudflared",
-        "/opt/homebrew/bin/cloudflared",
-        "/usr/local/bin/cloudflared",
-    ];
-    for c in &candidates {
-        if Command::new(c)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return Ok(c.to_string());
-        }
-    }
-    Err(io::Error::other(
-        "cloudflared が見つかりません。インストールしてください: brew install cloudflared",
-    ))
-}
-
-/// cloudflared の stderr 出力から tunnel URL を読み取る。
-/// H-6: reader thread + recv_timeout で blocking read がタイムアウトを妨げない
-fn parse_tunnel_url(stderr: std::process::ChildStderr) -> io::Result<String> {
-    use std::sync::mpsc;
-    let (tx, rx) = mpsc::channel::<io::Result<String>>();
-
-    std::thread::Builder::new()
-        .name("cloudflared-stderr-reader".into())
-        .spawn(move || {
-            use std::io::BufRead;
-            let reader = std::io::BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Some(result) = lines.next() {
-                match result {
-                    Ok(line) => {
-                        if let Some(url) = extract_trycloudflare_url(&line) {
-                            let _ = tx.send(Ok(url));
-                            // 残りの stderr を drain して pipe 詰まりを防ぐ
-                            for _ in lines {}
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        return;
-                    }
-                }
-            }
-            let _ = tx.send(Err(io::Error::other(
-                "cloudflared が tunnel URL を出力せず終了した",
-            )));
-        })
-        .map_err(|e| io::Error::other(format!("reader スレッドの起動に失敗: {e}")))?;
-
-    match rx.recv_timeout(std::time::Duration::from_secs(30)) {
-        Ok(Ok(url)) => Ok(url),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(io::Error::other(
-            "cloudflared から tunnel URL を取得できなかった（30 秒タイムアウト）",
-        )),
-    }
-}
-
-/// 1 行のテキストから trycloudflare.com の URL を抽出する
-fn extract_trycloudflare_url(line: &str) -> Option<String> {
-    let marker = ".trycloudflare.com";
-    let end_pos = line.find(marker)?;
-    let url_end = end_pos + marker.len();
-    let before = &line[..end_pos];
-    let https_pos = before.rfind("https://")?;
-    let url = &line[https_pos..url_end];
-    Some(url.to_string())
-}
-
-// --- マシン ID ---
-
-/// マシン固有の安定 ID を取得する。初回は UUID v4 を生成してファイルに保存する
-pub fn machine_id() -> String {
-    let path = machine_id_path();
-    if let Some(ref p) = path {
-        if let Ok(id) = std::fs::read_to_string(p) {
-            let id = id.trim().to_string();
-            if !id.is_empty() {
-                return id;
-            }
-        }
-    }
-    let id = uuid::Uuid::new_v4().to_string();
-    if let Some(ref p) = path {
-        if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(p, &id);
-    }
-    id
-}
-
-fn machine_id_path() -> Option<std::path::PathBuf> {
-    tako_core::paths::data_dir().map(|d| d.join("machine_id"))
-}
-
-// --- リレー登録シークレット ---
-
-/// リレー登録シークレットを読み込むか、初回は CSPRNG で生成して保存する（hex 64 文字）。
-/// リレー worker 側で machineId エントリを first-write-wins で保護するためのもの
-/// （worker には SHA-256 ハッシュのみ保存される）。token と同様、ログに出さないこと
-fn relay_secret() -> Option<String> {
-    let path = tako_core::paths::data_dir().map(|d| d.join("relay_secret"))?;
-    relay_secret_at(&path)
-}
-
-fn relay_secret_at(path: &std::path::Path) -> Option<String> {
-    if let Ok(content) = std::fs::read_to_string(path) {
-        let secret = content.trim().to_string();
-        if secret.len() >= 32 {
-            return Some(secret);
-        }
-    }
-    let secret = crate::generate_token().ok()?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).ok()?;
-    }
-    std::fs::write(path, &secret).ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    Some(secret)
-}
-
-// --- KV リレー登録 ---
-
-fn register_relay(machine_id: &str, tunnel_url: &str) -> Result<(), String> {
-    let relay_url =
-        std::env::var("TAKO_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY_URL.to_string());
-    let url = format!("{relay_url}/api/register");
-    let mut body = json!({
-        "machineId": machine_id,
-        "tunnelUrl": tunnel_url,
-    });
-    // secret が用意できない環境（data_dir なし）では従来どおり無 secret で登録する
-    // （worker 側もレガシー登録として受理する。保護は効かないが機能は壊れない）
-    if let Some(secret) = relay_secret() {
-        body["secret"] = json!(secret);
-    }
-
-    // H-6: --connect-timeout / --max-time で curl のブロッキングを制限する
-    let status = Command::new("curl")
-        .args([
-            "-s",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            "--connect-timeout",
-            "10",
-            "--max-time",
-            "15",
-            "-X",
-            "POST",
-            "-H",
-            "Content-Type: application/json",
-            "-d",
-            &body.to_string(),
-            &url,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| format!("curl の実行に失敗: {e}"))?;
-
-    let code = String::from_utf8_lossy(&status.stdout);
-    if code.starts_with('2') {
-        Ok(())
-    } else {
-        Err(format!("KV リレー登録が HTTP {code} で失敗"))
-    }
-}
-
-/// QR コードに含める接続 URL を生成する。
+/// QR コード・接続案内に使う接続 URL を生成する。
+/// ベースは恒久固定の ts.net URL（PWA は daemon 内蔵のものを tailscale serve が配信
+/// するため、リンク先 = デーモン自身。リレー等の中間解決は存在しない。#282）。
 /// トークンは URL fragment（`/#/connect?token=...`）に載せる: fragment はブラウザが
-/// サーバーへ送信しないため、アクセスログ・cloudflared のログ・Referer に平文トークンが
-/// 残らない（Issue #23 認証改善）。PWA はハッシュルーターなのでこの形式を直接解釈できる。
-///
-/// トンネル有効時（`tunnel_url` と `machine_id` の両方あり）は Cloudflare Pages の
-/// 固定 URL をベースにし、`machine` パラメータで PWA に KV リレー解決させる（Issue #91）。
-/// トンネル URL はリンクに現れず KV 内部の値に留まるため、トンネル再起動でもリンク不変。
-/// `machine_id` の呼び出し側契約: リレー登録が成功しているときだけ渡す（未登録の
-/// machineId で Pages リンクを出すと PWA が接続先を解決できない）。
-/// LAN-only 時は従来どおり内蔵 PWA の LAN URL 直リンク（https の Pages から
-/// プライベート IP の http へは mixed content で接続できないため、Pages 化しない）
-pub fn connect_url(
-    tunnel_url: Option<&str>,
-    local_url: &str,
-    token: &str,
-    name: Option<&str>,
-    machine_id: Option<&str>,
-) -> String {
-    connect_url_with_pages(&pages_url(), tunnel_url, local_url, token, name, machine_id)
-}
-
-/// connect_url の本体（Pages ベース URL を引数化。env 非依存でテスト可能にするため分離）
-fn connect_url_with_pages(
-    pages_base: &str,
-    tunnel_url: Option<&str>,
-    local_url: &str,
-    token: &str,
-    name: Option<&str>,
-    machine_id: Option<&str>,
-) -> String {
-    let mut url = match (tunnel_url, machine_id) {
-        // トンネル + machineId → Pages 固定 URL（リレー解決経路）
-        (Some(_), Some(mid)) => format!(
-            "{}/#/connect?machine={}&token={}",
-            pages_base.trim_end_matches('/'),
-            urlencoding::encode(mid),
-            urlencoding::encode(token),
-        ),
-        // トンネルはあるが machineId が無い（リレー登録失敗）→ トンネル直（トンネルが PWA を配信）
-        (Some(t), None) => format!("{t}/#/connect?token={}", urlencoding::encode(token)),
-        // LAN-only → LAN URL 直（内蔵 PWA）
-        (None, _) => format!("{local_url}/#/connect?token={}", urlencoding::encode(token)),
-    };
+/// サーバーへ送信しないため、アクセスログ・Referer に平文トークンが残らない
+pub fn connect_url(base_url: &str, token: &str, name: Option<&str>) -> String {
+    let mut url = format!(
+        "{}/#/connect?token={}",
+        base_url.trim_end_matches('/'),
+        urlencoding::encode(token)
+    );
     if let Some(n) = name {
         url.push_str(&format!("&name={}", urlencoding::encode(n)));
     }
@@ -2829,7 +2578,7 @@ fn handle_ws_v2(
     let (_, rx) = get_or_create_broadcaster(&broadcasters, &pane, tmux_socket, shutdown);
 
     std::thread::Builder::new()
-        .name("tako-remote-ws-relay".into())
+        .name("tako-remote-ws-forward".into())
         .spawn(move || {
             use tungstenite::protocol::{Role, WebSocket};
             let mut ws = WebSocket::from_raw_socket(stream, Role::Server, None);
@@ -2858,28 +2607,6 @@ fn handle_ws_v2(
             let _ = ws.close(None);
         })
         .ok();
-}
-
-/// macOS の LAN IP アドレスを取得する。取得できなければ None を返す
-pub fn lan_ip() -> Option<String> {
-    let output = Command::new("ifconfig")
-        .arg("en0")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("inet ") {
-            if let Some(ip) = rest.split_whitespace().next() {
-                if ip != "127.0.0.1" {
-                    return Some(ip.to_string());
-                }
-            }
-        }
-    }
-    None
 }
 
 /// QR コードを PNG 画像として生成する。生成先のパスを返す
@@ -2975,6 +2702,10 @@ mod urlencoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `TAKO_REMOTE_STATE_DIR` はプロセスグローバルのため、これを触るテストを直列化する
+    /// （並列実行で他テストの state_dir を差し替えてしまう race の防止）
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn extract_pane_targetからidを取り出せる() {
@@ -3145,16 +2876,8 @@ mod tests {
     }
 
     #[test]
-    fn lan_ipはipv4形式を返す() {
-        if let Some(ip) = lan_ip() {
-            let parts: Vec<&str> = ip.split('.').collect();
-            assert_eq!(parts.len(), 4, "IPv4 アドレスではない: {ip}");
-            assert_ne!(ip, "127.0.0.1", "ループバックは除外される");
-        }
-    }
-
-    #[test]
     fn qr_pngを生成できる() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = super::generate_qr_png("http://192.168.1.100:7749#token=abc123def456")
             .expect("PNG 生成に失敗");
         assert!(path.exists());
@@ -3163,134 +2886,29 @@ mod tests {
     }
 
     #[test]
-    fn trycloudflare_urlをパースできる() {
-        assert_eq!(
-            extract_trycloudflare_url(
-                "INF |  https://foo-bar-baz.trycloudflare.com                    |"
-            ),
-            Some("https://foo-bar-baz.trycloudflare.com".to_string()),
-        );
-        assert_eq!(
-            extract_trycloudflare_url("Visit it at: https://abc-123.trycloudflare.com"),
-            Some("https://abc-123.trycloudflare.com".to_string()),
-        );
-        assert_eq!(extract_trycloudflare_url("no url here"), None);
-    }
-
-    #[test]
-    fn machine_idは安定して返る() {
-        let id1 = machine_id();
-        let id2 = machine_id();
-        assert_eq!(id1, id2);
-        assert!(!id1.is_empty());
-    }
-
-    #[test]
     fn connect_urlの生成() {
-        // machineId なし（リレー登録失敗）→ トンネル直 URL
-        let url = connect_url(
-            Some("https://foo.trycloudflare.com"),
-            "http://localhost:7749",
-            "abc123",
-            Some("my-mac"),
-            None,
+        let url = connect_url("https://mac.tail1234.ts.net", "abc123", Some("my-mac"));
+        assert_eq!(
+            url,
+            "https://mac.tail1234.ts.net/#/connect?token=abc123&name=my-mac"
         );
-        assert!(url.starts_with("https://foo.trycloudflare.com/#/connect?"));
-        assert!(!url.contains("host="));
-        assert!(url.contains("token=abc123"));
-        assert!(url.contains("name=my-mac"));
 
-        let url = connect_url(
-            None,
-            "http://192.168.1.10:7749",
-            "tok456",
-            Some("host1"),
-            None,
-        );
-        assert!(url.starts_with("http://192.168.1.10:7749/#/connect?"));
-        assert!(!url.contains("host="));
-        assert!(url.contains("token=tok456"));
-        assert!(url.contains("name=host1"));
+        // name 省略
+        let url = connect_url("https://mac.tail1234.ts.net", "abc123", None);
+        assert_eq!(url, "https://mac.tail1234.ts.net/#/connect?token=abc123");
 
-        let url = connect_url(None, "http://localhost:7749", "abc123", None, None);
-        assert!(url.starts_with("http://localhost:7749/#/connect?"));
-        assert!(url.contains("token=abc123"));
-        assert!(!url.contains("name="));
-    }
-
-    #[test]
-    fn connect_urlはトンネルとmachine_idが揃うとpages固定urlになる() {
-        // Issue #91: トンネル有効 + リレー登録済みの正常系はランダムな trycloudflare URL を
-        // 見せず、Pages 固定 URL + machine パラメータで PWA にリレー解決させる
-        let url = connect_url_with_pages(
-            "https://tako-remote.pages.dev",
-            Some("https://foo.trycloudflare.com"),
-            "http://localhost:7749",
-            "tok123",
-            Some("my-mac"),
-            Some("aaaabbbb-cccc-4ddd-8eee-ffff00001111"),
-        );
-        assert!(url.starts_with("https://tako-remote.pages.dev/#/connect?"));
-        assert!(url.contains("machine=aaaabbbb-cccc-4ddd-8eee-ffff00001111"));
-        assert!(url.contains("token=tok123"));
-        assert!(url.contains("name=my-mac"));
-        assert!(
-            !url.contains("trycloudflare"),
-            "トンネル URL を露出させない: {url}"
-        );
-    }
-
-    #[test]
-    fn connect_urlはlan_onlyならmachine_idがあってもlan直リンク() {
-        // https の Pages からプライベート IP の http へは mixed content で接続できないため、
-        // LAN-only では Pages 化しない
-        let url = connect_url_with_pages(
-            "https://tako-remote.pages.dev",
-            None,
-            "http://192.168.1.10:7749",
-            "tok123",
-            None,
-            Some("aaaabbbb-cccc-4ddd-8eee-ffff00001111"),
-        );
-        assert!(url.starts_with("http://192.168.1.10:7749/#/connect?"));
-        assert!(!url.contains("pages.dev"));
-    }
-
-    #[test]
-    fn connect_urlのpagesベース末尾スラッシュは正規化される() {
-        let url = connect_url_with_pages(
-            "https://tako-remote.pages.dev/",
-            Some("https://foo.trycloudflare.com"),
-            "http://localhost:7749",
-            "t",
-            None,
-            Some("m-1"),
-        );
-        assert!(url.starts_with("https://tako-remote.pages.dev/#/connect?"));
+        // ベース URL の末尾スラッシュは正規化される
+        let url = connect_url("https://mac.tail1234.ts.net/", "t", None);
+        assert!(url.starts_with("https://mac.tail1234.ts.net/#/connect?"));
     }
 
     #[test]
     fn connect_urlのトークンはfragmentに載る() {
-        // fragment（# 以降）はブラウザがサーバーへ送らない = ログ・Referer に残らない。
-        // token が # より後ろにあることを検証する（LAN 直 / Pages の両形式）
-        let url = connect_url(None, "http://192.168.1.10:7749", "secret", None, None);
+        // fragment（# 以降）はブラウザがサーバーへ送らない = ログ・Referer に残らない
+        let url = connect_url("https://mac.tail1234.ts.net", "secret", None);
         let hash_pos = url.find('#').expect("fragment がある");
         let token_pos = url.find("token=").expect("token がある");
         assert!(token_pos > hash_pos, "token は fragment 内: {url}");
-
-        let url = connect_url_with_pages(
-            "https://tako-remote.pages.dev",
-            Some("https://foo.trycloudflare.com"),
-            "http://localhost:7749",
-            "secret",
-            None,
-            Some("m-1"),
-        );
-        let hash_pos = url.find('#').expect("fragment がある");
-        let token_pos = url.find("token=").expect("token がある");
-        let machine_pos = url.find("machine=").expect("machine がある");
-        assert!(token_pos > hash_pos, "token は fragment 内: {url}");
-        assert!(machine_pos > hash_pos, "machine も fragment 内: {url}");
     }
 
     #[test]
@@ -3303,101 +2921,8 @@ mod tests {
     }
 
     #[test]
-    fn cloudflaredが無い環境ではエラーを返す() {
-        let original = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", "");
-        let result = find_cloudflared();
-        std::env::set_var("PATH", &original);
-        if let Err(e) = result {
-            assert!(e.to_string().contains("cloudflared"));
-        }
-    }
-
-    #[test]
-    fn trycloudflare_url抽出のエッジケース() {
-        assert_eq!(
-            extract_trycloudflare_url("2024-06-22 INF https://a-b-c.trycloudflare.com registered"),
-            Some("https://a-b-c.trycloudflare.com".to_string()),
-        );
-        assert_eq!(
-            extract_trycloudflare_url("see https://example.com and https://x.trycloudflare.com"),
-            Some("https://x.trycloudflare.com".to_string()),
-        );
-        assert_eq!(extract_trycloudflare_url("https://example.com"), None);
-        assert_eq!(extract_trycloudflare_url(""), None);
-    }
-
-    #[test]
-    fn machine_idはuuid形式() {
-        let id = machine_id();
-        assert_eq!(id.len(), 36);
-        assert_eq!(id.chars().filter(|c| *c == '-').count(), 4);
-    }
-
-    #[test]
-    fn machine_idをファイルに保存して再読み込みできる() {
-        let tmp = std::env::temp_dir().join(format!("tako-test-mid-{}", std::process::id()));
-        let _ = std::fs::remove_file(&tmp);
-
-        let id1 = {
-            let _ = std::fs::write(&tmp, "");
-            let fresh = uuid::Uuid::new_v4().to_string();
-            std::fs::write(&tmp, &fresh).unwrap();
-            fresh
-        };
-        let id2 = std::fs::read_to_string(&tmp).unwrap().trim().to_string();
-        assert_eq!(id1, id2);
-        let _ = std::fs::remove_file(&tmp);
-    }
-
-    #[test]
-    fn register_relayは不正urlでエラーを返す() {
-        std::env::set_var("TAKO_RELAY_URL", "http://127.0.0.1:1");
-        let result = register_relay("test-machine", "https://example.trycloudflare.com");
-        std::env::remove_var("TAKO_RELAY_URL");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn relay_secretは初回生成後に安定して返る() {
-        let tmp = std::env::temp_dir().join(format!("tako-test-rsec-{}", std::process::id()));
-        let _ = std::fs::remove_file(&tmp);
-
-        let s1 = relay_secret_at(&tmp).expect("初回生成");
-        assert_eq!(s1.len(), 64, "hex 64 文字");
-        assert!(s1.chars().all(|c| c.is_ascii_hexdigit()));
-
-        let s2 = relay_secret_at(&tmp).expect("再読み込み");
-        assert_eq!(s1, s2, "永続化された同じ値が返る");
-        let _ = std::fs::remove_file(&tmp);
-    }
-
-    #[test]
-    fn relay_secretは短すぎる既存値を再生成する() {
-        let tmp = std::env::temp_dir().join(format!("tako-test-rsec2-{}", std::process::id()));
-        std::fs::write(&tmp, "short").unwrap();
-        let s = relay_secret_at(&tmp).expect("再生成");
-        assert_eq!(s.len(), 64);
-        let _ = std::fs::remove_file(&tmp);
-    }
-
-    #[test]
-    fn connect_urlはtunnelありnameなしでもtunnel直接() {
-        let url = connect_url(
-            Some("https://foo.trycloudflare.com"),
-            "http://localhost:7749",
-            "tok123",
-            None,
-            None,
-        );
-        assert!(url.starts_with("https://foo.trycloudflare.com/#/connect?"));
-        assert!(!url.contains("host="));
-        assert!(url.contains("token=tok123"));
-        assert!(!url.contains("name="));
-    }
-
-    #[test]
     fn daemon_statusはpidファイルがないときfalse() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // テスト中に PID ファイルが存在しないことを前提にしない（他のテストが使うかも）
         // ので、存在しないパスを使う代わりに関数の戻り値形式を検証する
         let status = daemon_status();
@@ -3444,8 +2969,8 @@ mod tests {
     fn mask_token_in_urlはクエリのtokenを伏せる() {
         // fragment 内 + 後続パラメータあり
         assert_eq!(
-            mask_token_in_url("https://x.pages.dev/#/connect?machine=m1&token=deadbeef&name=mac"),
-            "https://x.pages.dev/#/connect?machine=m1&token=***&name=mac"
+            mask_token_in_url("https://mac.tail1234.ts.net/#/connect?token=deadbeef&name=mac"),
+            "https://mac.tail1234.ts.net/#/connect?token=***&name=mac"
         );
         // token が末尾
         assert_eq!(
@@ -3467,12 +2992,14 @@ mod tests {
 
     #[test]
     fn kill_stale_daemonは存在しないpidで安全に完了する() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // is_process_alive が false なので即 cleanup_state_files して return
         kill_stale_daemon(999_999_999);
     }
 
     #[test]
     fn daemon_statusはpidファイルが無ければnot_running() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // state_dir をテンポラリに差し替えて検証
         let dir = std::env::temp_dir().join(format!("tako-test-remote-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -3489,31 +3016,25 @@ mod tests {
         let mut v = json!({
             "running": true,
             "token": "aabbccdd",
-            "url": "http://10.0.0.5:7749",
-            "connect_url": "https://tako-remote.pages.dev/#/connect?machine=m1&token=aabbccdd&name=mac",
-            "fallback_url": "https://foo.trycloudflare.com/#/connect?token=aabbccdd&name=mac",
+            "url": "https://mac.tail1234.ts.net",
+            "connect_url": "https://mac.tail1234.ts.net/#/connect?token=aabbccdd&name=mac",
         });
         mask_status_token(&mut v);
         assert_eq!(v["token"], json!("***"));
         let connect = v["connect_url"].as_str().unwrap();
-        let fallback = v["fallback_url"].as_str().unwrap();
         assert!(
             !connect.contains("aabbccdd"),
             "connect_url に生トークンが残る: {connect}"
         );
-        assert!(
-            !fallback.contains("aabbccdd"),
-            "fallback_url に生トークンが残る: {fallback}"
-        );
         assert!(connect.contains("token=***"));
-        assert!(connect.contains("machine=m1"), "他のクエリは保持する");
-        assert!(connect.contains("name=mac"));
+        assert!(connect.contains("name=mac"), "他のクエリは保持する");
     }
 
     // --- P0-3 テスト ---
 
     #[test]
     fn state_dirはdata_dir配下のremoteを返す() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = state_dir();
         let s = dir.to_string_lossy();
         assert!(
@@ -3524,6 +3045,7 @@ mod tests {
 
     #[test]
     fn write_secret_fileは0600で書ける() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("tako-test-wsf-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("secret.txt");
@@ -3541,6 +3063,7 @@ mod tests {
 
     #[test]
     fn ensure_state_dirは0700でディレクトリを作る() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("tako-test-esd-{}", std::process::id()));
         std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
         let result = ensure_state_dir();
@@ -3559,6 +3082,7 @@ mod tests {
 
     #[test]
     fn parse_pid_fileは3行形式を解析する() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("tako-test-ppf-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
@@ -3584,6 +3108,7 @@ mod tests {
 
     #[test]
     fn daemon_stop_implはpid再利用時にkillしない() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 自分の PID を書いたが、args が "tako remote serve" でないのでエラーになる
         let dir = std::env::temp_dir().join(format!("tako-test-dsi-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);

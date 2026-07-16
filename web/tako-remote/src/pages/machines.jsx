@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'preact/hooks';
-import { getMachines, removeMachine, setActiveMachine, updateMachineHost } from '../store';
-import { createClient, resolveHost } from '../api';
+import { getMachines, removeMachine, setActiveMachine } from '../store';
+import { createClient } from '../api';
 
 export function MachinesPage() {
   const [machines, setMachines] = useState(getMachines);
@@ -15,17 +15,7 @@ export function MachinesPage() {
         setStatuses(prev => ({ ...prev, [m.id]: 'online' }));
         return;
       } catch {}
-
-      const resolved = await resolveHost(m.id);
-      if (resolved && resolved !== m.host) {
-        try {
-          await createClient(resolved, m.token).health();
-          updateMachineHost(m.id, resolved);
-          setMachines(getMachines());
-          setStatuses(prev => ({ ...prev, [m.id]: 'online' }));
-          return;
-        } catch {}
-      }
+      // 接続先 URL は Tailscale の固定 ts.net URL のため、再解決は無い
       setStatuses(prev => ({ ...prev, [m.id]: 'offline' }));
     });
   }, [machines.length]);

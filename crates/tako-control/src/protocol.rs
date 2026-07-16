@@ -578,14 +578,10 @@ pub enum Request {
     /// レジストリから除去
     OrchestratorRunResult { run_id: String },
     /// リモートアクセス API サーバーの起動。`port` 省略時は 7749。
-    /// 既定では暗号化トンネル（cloudflared）経由でのみホストし、トンネルを張れなければ
-    /// 起動を拒否する。`insecure` = true のときだけ平文 HTTP の LAN 直モードを許可する
-    /// （明示 opt-in・非推奨。同一 LAN 上の盗聴リスクあり。#104）
-    RemoteStart {
-        port: Option<u16>,
-        #[serde(default)]
-        insecure: bool,
-    },
+    /// transport は Tailscale Serve のみ（tailnet 内限定・WireGuard E2E 暗号化。#282）。
+    /// Tailscale が未セットアップ（未導入・未ログイン・HTTPS 未有効等）なら
+    /// 不足項目を列挙して起動を拒否し、`tako remote setup` へ誘導する
+    RemoteStart { port: Option<u16> },
     /// リモートアクセス API サーバーの停止。`force` = true で SIGKILL
     RemoteStop {
         #[serde(default)]

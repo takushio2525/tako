@@ -1,9 +1,9 @@
 import { useState, useEffect } from 'preact/hooks';
 import { addMachine, setActiveMachine } from '../store';
-import { createClient, resolveHost } from '../api';
+import { createClient } from '../api';
 
 // この PWA が動作を保証するデーモン（Mac 側 tako）の最小バージョン。
-// Pages 配信の PWA とデーモンはバージョンが独立に進むため（Issue #91 留意点）、
+// service worker にキャッシュされた古い PWA が更新後のデーモンへ接続するずれ対策として、
 // /api/health が返す version がこれより古い・無い場合は警告を出す（接続は続行する）
 const MIN_DAEMON_VERSION = '0.2.0';
 
@@ -17,16 +17,10 @@ function versionOlderThan(version, min) {
   return false;
 }
 
-// Pages（静的ホスティング）から配信されているか。この場合 origin はデーモンではないので、
-// 自分の origin への health 試行（失敗まで 5 秒待ち）をスキップして即リレー解決に進む
-function isStaticHosting() {
-  return /\.pages\.dev$/i.test(window.location.hostname);
-}
-
-// URL パラメータから接続情報を読む。host はデーモン候補が既知の場合のみ
-// （明示 host パラメータ、または内蔵 PWA 配信 = origin がデーモン自身）
+// URL パラメータから接続情報を読む。PWA はデーモン自身（Tailscale Serve 経由の
+// 固定 ts.net URL）から配信されるため、host は明示パラメータが無ければ origin
 function readParams(params) {
-  const host = params.get('host') || (isStaticHosting() ? null : window.location.origin);
+  const host = params.get('host') || window.location.origin;
   const token = params.get('token');
   const id = params.get('machine') || `m-${Date.now()}`;
   const name = params.get('name') || id;
@@ -60,20 +54,7 @@ export function ConnectPage({ params }) {
         await connectTo(host, token, id, name);
         return;
       } catch {
-        // 直接接続失敗 → KV リレー経由で最新 URL を取得
-      }
-    }
-
-    if (id) {
-      setDetail('最新の接続先を検索中...');
-      const resolved = await resolveHost(id);
-      if (resolved && resolved !== host) {
-        try {
-          await connectTo(resolved, token, id, name);
-          return;
-        } catch {
-          // resolve した URL でも接続失敗
-        }
+        // 接続失敗 → 下のエラー表示へ（URL は固定なので再解決は無い）
       }
     }
 

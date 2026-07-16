@@ -667,14 +667,11 @@ enum AgentsCommand {
 #[derive(Subcommand)]
 enum RemoteCommand {
     /// リモートアクセス API サーバーを起動し、QR コードを表示する
+    /// （transport は Tailscale Serve のみ。未セットアップなら不足項目を案内して停止）
     Start {
         /// サーバーのポート番号（省略時は 7749）
         #[arg(long, default_value_t = 7749)]
         port: u16,
-        /// 暗号化トンネルを使わず平文 HTTP の LAN 直モードで起動する（明示 opt-in・非推奨。
-        /// 既定は暗号化トンネル必須で、張れなければ起動を拒否する。#104）
-        #[arg(long)]
-        insecure: bool,
     },
     /// リモートアクセス API サーバーを停止する
     Stop {
@@ -711,9 +708,6 @@ enum RemoteCommand {
         /// サーバーのポート番号（省略時は 7749）
         #[arg(long, default_value_t = 7749)]
         port: u16,
-        /// 暗号化トンネルを使わず平文 HTTP の LAN 直モードで起動する（明示 opt-in・非推奨。#104）
-        #[arg(long)]
-        insecure: bool,
     },
 }
 
@@ -1736,10 +1730,10 @@ fn main() -> ExitCode {
         // gate 操作は YAML I/O + コマンド実行のみのためローカル処理（#244）
         Command::Task(TaskCommand::Gate(ref gate_sub)) => gate_cli(gate_sub),
         // remote コマンドはローカル処理（IPC 不要）
-        Command::Remote(RemoteCommand::Start { port, insecure }) => remote_start(port, insecure),
+        Command::Remote(RemoteCommand::Start { port }) => remote_start(port),
         Command::Remote(RemoteCommand::Stop { force }) => remote_stop(force),
         Command::Remote(RemoteCommand::Status { show_token }) => remote_status(show_token),
-        Command::Remote(RemoteCommand::Serve { port, insecure }) => remote_serve(port, insecure),
+        Command::Remote(RemoteCommand::Serve { port }) => remote_serve(port),
         Command::Remote(RemoteCommand::Agents) => remote_agents(),
         Command::Remote(RemoteCommand::Messages { session_id, tail }) => {
             remote_messages(&session_id, tail)
@@ -2368,10 +2362,10 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
 }
 
 /// `tako remote start` — デーモンをバックグラウンドで fork 起動し QR を表示する。
-/// 既定は暗号化トンネル必須（張れなければ spawn_daemon が起動を拒否しエラーを返す）。
-/// `insecure` = true のときだけ平文 LAN 直モードで起動する（#104）
-fn remote_start(port: u16, insecure: bool) -> Result<(), String> {
-    let result = tako_control::remote::spawn_daemon(Some(port), insecure)?;
+/// transport は Tailscale Serve のみ（tailnet 内限定・WireGuard E2E 暗号化）。
+/// Tailscale 未セットアップ時は spawn_daemon が不足項目を列挙して起動を拒否する（#282）
+fn remote_start(port: u16) -> Result<(), String> {
+    let result = tako_control::remote::spawn_daemon(Some(port))?;
     println!("{}", pretty_json(&result));
     if let Some(connect) = result["connect_url"].as_str() {
         match tako_control::remote::generate_qr_png(connect) {
@@ -2390,23 +2384,8 @@ fn remote_start(port: u16, insecure: bool) -> Result<(), String> {
             Err(e) => eprintln!("\nQR コード画像の生成に失敗: {e}"),
         }
         eprintln!("URL: {connect}");
-        if let Some(fallback) = result["fallback_url"].as_str() {
-            // 接続リンクは Pages 固定 URL（#91）。リレー障害時の予備にトンネル直 URL も出す
-            eprintln!("予備 URL（上のリンクで繋がらないとき）: {fallback}");
-        }
-        if let Some(tunnel) = result["tunnel_url"].as_str() {
-            eprintln!("Tunnel: {tunnel}");
-        }
-        if insecure {
-            // 平文 LAN 直モード（明示 opt-in）。暗号化されていないことを明示する（#104）
-            eprintln!("⚠ insecure モード: LAN 直リンクは暗号化されません（平文 HTTP）。");
-            eprintln!("  同一 Wi-Fi / LAN 上の第三者に通信（トークン含む）を盗聴されうる。");
-            eprintln!("  信頼できる LAN でのみ使い、接続 URL / QR は共有しないでください。");
-            eprintln!("  同一 Wi-Fi 以外や AP isolation 環境のスマホからは開けません。");
-        }
-        if let Some(mid) = result["machine_id"].as_str() {
-            eprintln!("Machine ID: {mid}");
-        }
+        eprintln!("この URL は恒久固定です（Tailscale MagicDNS 名。tailnet 内限定）。");
+        eprintln!("スマホ側にも Tailscale アプリを入れ、同じアカウントでログインしてください。");
     }
     Ok(())
 }
@@ -2435,8 +2414,8 @@ fn remote_status(show_token: bool) -> Result<(), String> {
 }
 
 /// `tako remote serve` — HTTP サーバーをフォアグラウンドで起動する（内部用）
-fn remote_serve(port: u16, insecure: bool) -> Result<(), String> {
-    tako_control::remote::run_daemon(Some(port), insecure).map_err(|e| e.to_string())
+fn remote_serve(port: u16) -> Result<(), String> {
+    tako_control::remote::run_daemon(Some(port)).map_err(|e| e.to_string())
 }
 
 /// `tako remote agents` — claude agents --json + tmux ペイン対応付けを表示する

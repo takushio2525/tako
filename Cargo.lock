@@ -6644,7 +6644,6 @@ dependencies = [
  "tiny_http",
  "tracing",
  "tungstenite",
- "uuid",
 ]
 
 [[package]]

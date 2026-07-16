@@ -1364,11 +1364,12 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_remote_start",
             "description": "リモートアクセス API サーバーを起動する。スマホからブラウザ経由で\
                 ペインを操作するための HTTP API サーバーが指定ポート（既定 7749）で開始される。\
-                既定では cloudflared による暗号化トンネル経由でのみ公開し、トンネルを張れない\
-                場合（cloudflared 不在等）は安全に提供できないため起動を拒否する。\
-                起動後は接続用の QR コードが表示される。\
-                注意: 接続したリモートはターミナルへ任意コマンドを送信できる（実質シェルアクセス）。\
-                平文モード（--insecure）は CLI からのみ利用可能。",
+                transport は Tailscale Serve のみ: daemon は 127.0.0.1 に bind し、\
+                tailnet 内限定の恒久固定 URL（https://<ホスト名>.<tailnet>.ts.net）で公開される\
+                （WireGuard E2E 暗号化・public internet に入口を持たない）。\
+                Tailscale が未セットアップ（未導入・未ログイン・HTTPS 未有効等）の場合は\
+                不足項目を列挙して起動を拒否するので、ユーザーに `tako remote setup` を案内する。\
+                注意: 接続したリモートはターミナルへ任意コマンドを送信できる（実質シェルアクセス）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2093,7 +2094,7 @@ fn exec_and_strip_token(
     Ok(match (session.exec)(request) {
         Ok(mut value) => {
             crate::remote::mask_status_token(&mut value);
-            // さらに fallback_url も除去
+            // マスク済みの token フィールド自体も応答から除去する
             if let Some(obj) = value.as_object_mut() {
                 obj.remove("token");
             }
@@ -2677,7 +2678,6 @@ fn build_request(
         },
         "tako_remote_start" => Request::RemoteStart {
             port: u64_arg(args, "port")?.map(|v| v as u16),
-            insecure: false,
         },
         "tako_remote_stop" => Request::RemoteStop {
             force: bool_arg(args, "force")?.unwrap_or(false),

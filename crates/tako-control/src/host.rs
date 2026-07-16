@@ -388,8 +388,8 @@ pub trait WebViewHost {
 
 pub trait RemoteHost {
     /// リモートアクセス API サーバーを起動する。成功時は状態 JSON を返す。
-    /// 既定は暗号化トンネル必須。`insecure` = true のときだけ平文 LAN 直モードを許可する（#104）
-    fn remote_start(&mut self, _port: Option<u16>, _insecure: bool) -> Result<Value, String> {
+    /// transport は Tailscale Serve のみ。未セットアップなら不足項目を列挙して拒否する（#282）
+    fn remote_start(&mut self, _port: Option<u16>) -> Result<Value, String> {
         Err("リモートアクセス API はこの環境では使えない".into())
     }
     /// リモートアクセス API サーバーを停止する

@@ -39,16 +39,6 @@ export function removeMachine(id) {
   save(data);
 }
 
-export function updateMachineHost(id, host) {
-  const data = load();
-  const m = data.machines.find(x => x.id === id);
-  if (m) {
-    m.host = host;
-    m.lastSeen = Date.now();
-    save(data);
-  }
-}
-
 export function getActiveMachine() {
   const data = load();
   return data.machines.find(m => m.id === data.activeId) || null;

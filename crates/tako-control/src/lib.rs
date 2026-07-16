@@ -11,6 +11,7 @@
 //! - detect: パッシブ検知（Layer 3。listen ポート検知は Phase 4 後半で実装）
 //! - remote / agents / transcript: スマホリモートアクセス（Issue #23。HTTP+WS API と
 //!   claude agents プロキシ・会話ログ正規化）
+//! - tailscale: Tailscale Serve transport（Issue #282。CLI 検出・setup 判定・serve 管理）
 //! - claude_tui: Claude Code TUI の画面状態検出とプロンプト送達確認（Issue #32）
 //! - config_io: 設定ファイルの安全な読み書き共通部品（アトミック書き込み・
 //!   プロセス間ロック・世代バックアップ。Issue #169）
@@ -35,6 +36,7 @@ pub mod sessions;
 pub mod settings;
 pub mod setup;
 pub mod sleep_guard;
+pub mod tailscale;
 pub mod task_checkpoints;
 pub mod transcript;
 

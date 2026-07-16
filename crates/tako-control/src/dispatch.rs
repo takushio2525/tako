@@ -1848,9 +1848,9 @@ fn dispatch_inner(
             crate::orchestrator::wait::run_result(&run_id, exec).map_err(DispatchError::Operation)
         }
 
-        Request::RemoteStart { port, insecure } => host
-            .remote_start(port, insecure)
-            .map_err(DispatchError::Operation),
+        Request::RemoteStart { port } => {
+            host.remote_start(port).map_err(DispatchError::Operation)
+        }
         Request::RemoteStop { force } => {
             if force {
                 crate::remote::daemon_force_stop().map_err(DispatchError::Operation)
