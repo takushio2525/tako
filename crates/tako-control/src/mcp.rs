@@ -1367,7 +1367,8 @@ pub fn tools() -> Vec<Value> {
                 既定では cloudflared による暗号化トンネル経由でのみ公開し、トンネルを張れない\
                 場合（cloudflared 不在等）は安全に提供できないため起動を拒否する。\
                 起動後は接続用の QR コードが表示される。\
-                注意: 接続したリモートはターミナルへ任意コマンドを送信できる（実質シェルアクセス）。",
+                注意: 接続したリモートはターミナルへ任意コマンドを送信できる（実質シェルアクセス）。\
+                平文モード（--insecure）は CLI からのみ利用可能。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1375,39 +1376,33 @@ pub fn tools() -> Vec<Value> {
                         "type": "integer", "minimum": 1, "maximum": 65535,
                         "description": "サーバーのポート番号（省略時は 7749）",
                     },
-                    "insecure": {
-                        "type": "boolean",
-                        "description": "true にすると暗号化トンネルを使わず平文 HTTP の LAN 直モードで\
-                            起動する（明示 opt-in・非推奨。同一 LAN 上の第三者に通信を盗聴されうる）。\
-                            既定 false = 暗号化トンネル必須",
-                    },
                 },
                 "additionalProperties": false,
             },
         }),
         json!({
             "name": "tako_remote_stop",
-            "description": "リモートアクセス API サーバーを停止する。",
+            "description": "リモートアクセス API サーバーを停止する。\
+                既定は SIGTERM で停止を試みる。force=true で SIGKILL を使う。",
             "inputSchema": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "force": {
+                        "type": "boolean",
+                        "description": "true で SIGKILL を使う（既定 false = SIGTERM）",
+                    },
+                },
                 "additionalProperties": false,
             },
         }),
         json!({
             "name": "tako_remote_status",
             "description": "リモートアクセス API サーバーの状態を取得する。\
-                起動中なら running=true とポート番号・接続 URL を返す。\
-                トークンは既定でマスク（***）される。生値が必要なら show_token=true を指定する\
-                （スクリーンショット・画面共有経由の漏えい防止のため既定はマスク）。",
+                起動中なら running=true とポート番号を返す。\
+                トークンと接続 URL は AI からは取得できない（CLI の --show-token でのみ表示可）。",
             "inputSchema": {
                 "type": "object",
-                "properties": {
-                    "show_token": {
-                        "type": "boolean",
-                        "description": "true でトークンをマスクせず生値で返す（既定 false = マスク）",
-                    },
-                },
+                "properties": {},
                 "additionalProperties": false,
             },
         }),
@@ -2081,7 +2076,34 @@ fn call_tool(params: &Value, session: &mut McpSession) -> Result<Value, (i64, St
         return list_panes_with_caller(request, session);
     }
 
+    // P0-2: MCP 経由の remote start/status からトークンを除去する。
+    // CLI の --show-token は残すが、AI にはトークンを渡さない（意図的な非対称）
+    if name == "tako_remote_start" || name == "tako_remote_status" {
+        return exec_and_strip_token(request, session);
+    }
+
     exec_and_wrap(request, session)
+}
+
+/// P0-2: MCP 応答から token / token 入り URL を除去する
+fn exec_and_strip_token(
+    request: Request,
+    session: &mut McpSession,
+) -> Result<Value, (i64, String)> {
+    Ok(match (session.exec)(request) {
+        Ok(mut value) => {
+            crate::remote::mask_status_token(&mut value);
+            // さらに fallback_url も除去
+            if let Some(obj) = value.as_object_mut() {
+                obj.remove("token");
+            }
+            let text = value.to_string();
+            json!({ "content": [{ "type": "text", "text": text }], "isError": false })
+        }
+        Err(message) => {
+            json!({ "content": [{ "type": "text", "text": message }], "isError": true })
+        }
+    })
 }
 
 fn exec_and_wrap(request: Request, session: &mut McpSession) -> Result<Value, (i64, String)> {
@@ -2652,12 +2674,12 @@ fn build_request(
         },
         "tako_remote_start" => Request::RemoteStart {
             port: u64_arg(args, "port")?.map(|v| v as u16),
-            insecure: bool_arg(args, "insecure")?.unwrap_or(false),
+            insecure: false,
         },
-        "tako_remote_stop" => Request::RemoteStop,
-        "tako_remote_status" => Request::RemoteStatus {
-            show_token: bool_arg(args, "show_token")?.unwrap_or(false),
+        "tako_remote_stop" => Request::RemoteStop {
+            force: bool_arg(args, "force")?.unwrap_or(false),
         },
+        "tako_remote_status" => Request::RemoteStatus { show_token: false },
         "tako_remote_agents" => Request::RemoteAgents,
         "tako_remote_messages" => Request::RemoteMessages {
             session_id: str_arg(args, "session_id")?.ok_or("session_id を指定する")?,

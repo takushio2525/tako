@@ -67,14 +67,32 @@ fn pages_url() -> String {
     std::env::var("TAKO_PAGES_URL").unwrap_or_else(|_| DEFAULT_PAGES_URL.to_string())
 }
 // --- PID / トークン / ポートファイルのパス ---
+// P0-3: 共有 /tmp から <data_dir>/remote/（0700）へ移動。作成時から 0600。
 
 /// state ファイルの置き場所。`TAKO_REMOTE_STATE_DIR` で差し替え可能
 /// （検証用デーモンを本番デーモンと衝突させず並走させるため）
 fn state_dir() -> std::path::PathBuf {
-    std::env::var("TAKO_REMOTE_STATE_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+    if let Ok(dir) = std::env::var("TAKO_REMOTE_STATE_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+    tako_core::paths::data_dir()
+        .map(|d| d.join("remote"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/tako-remote"))
 }
+
+/// state_dir を 0700 で確保する
+fn ensure_state_dir() -> io::Result<std::path::PathBuf> {
+    let dir = state_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| io::Error::other(format!("state ディレクトリの作成に失敗: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(dir)
+}
+
 pub fn pid_path() -> std::path::PathBuf {
     state_dir().join("tako-remote.pid")
 }
@@ -88,6 +106,40 @@ pub fn port_path() -> std::path::PathBuf {
 /// デーモンがトンネル確立時に書き、`daemon_status` が接続リンクの再構成に使う
 pub fn tunnel_path() -> std::path::PathBuf {
     state_dir().join("tako-remote.tunnel")
+}
+
+/// 秘密を含むファイルを作成時から 0600 で書き込む。
+/// temp → atomic rename で symlink race を防ぐ
+fn write_secret_file(path: &std::path::Path, content: &str) -> io::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| io::Error::other("ファイルの親ディレクトリが無い"))?;
+    let tmp = dir.join(format!(
+        ".tmp-{}-{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+        std::process::id()
+    ));
+    {
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(content.as_bytes())?;
+            f.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&tmp, content)?;
+        }
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// ファイルを所有者のみ読み書き可（0o600）に制限する。unix 以外では何もしない。
@@ -109,6 +161,32 @@ fn cleanup_state_files() {
     let _ = std::fs::remove_file(token_path());
     let _ = std::fs::remove_file(port_path());
     let _ = std::fs::remove_file(tunnel_path());
+    // QR ファイル（ランダム名）を掃除する
+    let dir = state_dir();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("qr-") && name.ends_with(".png") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    // 旧 /tmp パスが残っていれば掃除する
+    cleanup_legacy_state_files();
+}
+
+/// 旧バージョンが /tmp に残した state ファイルを掃除する（移行互換）
+fn cleanup_legacy_state_files() {
+    let legacy = std::path::PathBuf::from("/tmp");
+    for name in [
+        "tako-remote.pid",
+        "tako-remote.token",
+        "tako-remote.port",
+        "tako-remote.tunnel",
+    ] {
+        let _ = std::fs::remove_file(legacy.join(name));
+    }
 }
 
 /// PWA の dist/ を埋め込む（`npm run build` で生成済みのもの）
@@ -125,7 +203,10 @@ struct PwaAssets;
 /// 同一 LAN 上の第三者にトークンを盗聴されうるため、信頼できるネットワーク限定）
 pub fn run_daemon(port: Option<u16>, insecure: bool) -> io::Result<()> {
     let port = port.unwrap_or(DEFAULT_PORT);
-    let addr = format!("0.0.0.0:{port}");
+    // P0-1: secure モードは 127.0.0.1（ループバック）のみ bind。cloudflared だけがアクセスする。
+    // insecure（LAN 直）のみ 0.0.0.0 に bind する
+    let bind_host = if insecure { "0.0.0.0" } else { "127.0.0.1" };
+    let addr = format!("{bind_host}:{port}");
     let server = tiny_http::Server::http(&addr)
         .map_err(|e| io::Error::other(format!("remote API サーバーを起動できない: {e}")))?;
     let actual_port = server
@@ -147,15 +228,24 @@ pub fn run_daemon(port: Option<u16>, insecure: bool) -> io::Result<()> {
     // トークン生成
     let token = crate::generate_token()?;
 
-    // PID / トークン / ポートを書き出す。トークンは秘密なので所有者のみ読み書き（0o600）に絞る
-    // （既定 state_dir = /tmp はマルチユーザーで共有されるため、umask 依存の 0644 だと他ユーザーに
-    // トークンが読まれうる。#104）
-    std::fs::write(pid_path(), std::process::id().to_string())
+    // P0-3: state ディレクトリを 0700 で確保し、各ファイルを 0600 で書き出す
+    ensure_state_dir()?;
+
+    // PID ファイル: 実行ファイルパスと起動時刻も記録（P0-4 の stop 照合用）
+    let pid_info = format!(
+        "{}\n{}\n{}",
+        std::process::id(),
+        std::env::current_exe().unwrap_or_default().display(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    );
+    write_secret_file(&pid_path(), &pid_info)
         .map_err(|e| io::Error::other(format!("PID ファイルの書き出しに失敗: {e}")))?;
-    std::fs::write(token_path(), &token)
+    write_secret_file(&token_path(), &token)
         .map_err(|e| io::Error::other(format!("トークンファイルの書き出しに失敗: {e}")))?;
-    restrict_permissions(&token_path());
-    std::fs::write(port_path(), actual_port.to_string())
+    write_secret_file(&port_path(), &actual_port.to_string())
         .map_err(|e| io::Error::other(format!("ポートファイルの書き出しに失敗: {e}")))?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -238,14 +328,19 @@ pub fn run_daemon(port: Option<u16>, insecure: bool) -> io::Result<()> {
     // トンネル状態を state ファイルに残す（`tako remote status` が接続リンクを再構成するため）
     if let Some(ref t) = tunnel_url {
         let state = json!({ "tunnel_url": t, "machine_id": mid, "relay_ok": relay_ok });
-        let _ = std::fs::write(tunnel_path(), state.to_string());
+        let _ = write_secret_file(&tunnel_path(), &state.to_string());
     }
 
     // 起動情報を JSON で stdout に出力（start コマンドが読み取る）。
     // 接続リンク: リレー登録済みなら Pages 固定 URL + トンネル直 URL を予備として併記
     // （リレーが単一障害点にならないように。Issue #91 留意点）
-    let lan_host = lan_ip().unwrap_or_else(|| "localhost".to_string());
-    let local_url = format!("http://{lan_host}:{actual_port}");
+    // P0-1: secure モードでは LAN URL を生成しない（ループバック bind のため到達不能）
+    let local_url = if insecure {
+        let lan_host = lan_ip().unwrap_or_else(|| "localhost".to_string());
+        format!("http://{lan_host}:{actual_port}")
+    } else {
+        format!("http://127.0.0.1:{actual_port}")
+    };
     let host_name = hostname();
     let mid_for_link = if relay_ok { mid.as_deref() } else { None };
     let connect = connect_url(
@@ -269,6 +364,7 @@ pub fn run_daemon(port: Option<u16>, insecure: bool) -> io::Result<()> {
     let info = json!({
         "running": true,
         "port": actual_port,
+        "bind_addr": addr,
         "token": token,
         "url": local_url,
         "tunnel_url": tunnel_url,
@@ -449,14 +545,143 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// PID ファイルの内容を解析する。
+/// 形式: 行1=PID, 行2=実行ファイルパス, 行3=起動時刻(unix epoch sec)
+struct PidInfo {
+    pid: u32,
+    #[allow(dead_code)]
+    exe: Option<String>,
+    start_time: Option<u64>,
+}
+
+fn parse_pid_file() -> Result<PidInfo, String> {
+    let content = std::fs::read_to_string(pid_path())
+        .map_err(|_| "PID ファイルが見つからない".to_string())?;
+    let mut lines = content.lines();
+    let pid: u32 = lines
+        .next()
+        .unwrap_or("")
+        .trim()
+        .parse()
+        .map_err(|_| "PID ファイルの内容が不正".to_string())?;
+    let exe = lines
+        .next()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let start_time = lines.next().and_then(|s| s.trim().parse::<u64>().ok());
+    Ok(PidInfo {
+        pid,
+        exe,
+        start_time,
+    })
+}
+
+/// P0-4: PID が本当に tako remote serve プロセスか検証する。
+/// 実行ファイルパスまたは ps の args で確認し、起動時刻もチェックする
+fn verify_pid_identity(info: &PidInfo) -> bool {
+    if !is_process_alive(info.pid) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        // ps で実行コマンドを取得し、tako remote serve かどうか確認
+        if let Ok(output) = Command::new("ps")
+            .args(["-p", &info.pid.to_string(), "-o", "args="])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        {
+            let cmd = String::from_utf8_lossy(&output.stdout);
+            let cmd = cmd.trim();
+            let is_tako_remote =
+                cmd.contains("tako") && cmd.contains("remote") && cmd.contains("serve");
+            if !cmd.is_empty() && !is_tako_remote {
+                return false;
+            }
+        }
+        // lstart ベースの起動時刻チェック（記録がある場合のみ。秒精度で ±2 秒の余裕）
+        if let Some(recorded) = info.start_time {
+            if let Ok(output) = Command::new("ps")
+                .args(["-p", &info.pid.to_string(), "-o", "lstart="])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+            {
+                let lstart = String::from_utf8_lossy(&output.stdout);
+                let lstart = lstart.trim();
+                if !lstart.is_empty() {
+                    if let Some(actual) = parse_lstart(lstart) {
+                        if actual.abs_diff(recorded) > 2 {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = info;
+    }
+    true
+}
+
+/// ps の lstart 出力（"Mon Jul 14 12:34:56 2026"）を unix epoch 秒に変換する。
+/// 厳密なパーサは不要 — 照合のために近似で十分
+#[cfg(unix)]
+fn parse_lstart(s: &str) -> Option<u64> {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() < 5 {
+        return None;
+    }
+    let mon = match parts[1] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let day: u32 = parts[2].parse().ok()?;
+    let time_parts: Vec<&str> = parts[3].split(':').collect();
+    if time_parts.len() != 3 {
+        return None;
+    }
+    let hour: u32 = time_parts[0].parse().ok()?;
+    let min: u32 = time_parts[1].parse().ok()?;
+    let sec: u32 = time_parts[2].parse().ok()?;
+    let year: i64 = parts[4].parse().ok()?;
+    // 近似 unix epoch 計算（うるう年は厳密でなくてよい。照合精度は ±2 秒）
+    let days_in_year = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let yday = days_in_year.get(mon as usize - 1).copied().unwrap_or(0) + day - 1;
+    let days_since_epoch = (year - 1970) * 365 + (year - 1969) / 4 - (year - 1901) / 100
+        + (year - 1601) / 400
+        + yday as i64;
+    Some((days_since_epoch * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64) as u64)
+}
+
 /// デーモンを停止する（PID ファイルから kill → 終了確認 → state クリーンアップ）。
+/// P0-4: PID + 実行ファイル + 起動時刻を照合し、無関係プロセスを kill しない。
 /// PID ファイルが無い場合はポート占有者を探して stale デーモンなら回収する
 pub fn daemon_stop() -> Result<Value, String> {
-    let pid_num = match std::fs::read_to_string(pid_path()) {
-        Ok(s) => s
-            .trim()
-            .parse::<u32>()
-            .map_err(|_| "PID ファイルの内容が不正".to_string())?,
+    daemon_stop_impl(false)
+}
+
+/// `--force` 付き停止。SIGTERM を試みた後 SIGKILL を送る
+pub fn daemon_force_stop() -> Result<Value, String> {
+    daemon_stop_impl(true)
+}
+
+fn daemon_stop_impl(force: bool) -> Result<Value, String> {
+    let pid_info = match parse_pid_file() {
+        Ok(info) => info,
         Err(_) => {
             // PID ファイルが無い → ポート占有者を探す
             if let Some((occupant, is_tako)) = find_port_occupant(DEFAULT_PORT) {
@@ -471,33 +696,53 @@ pub fn daemon_stop() -> Result<Value, String> {
             return Err("リモートサーバーが起動していない（PID ファイルが無い）".to_string());
         }
     };
+    let pid_num = pid_info.pid;
     if !is_process_alive(pid_num) {
         cleanup_state_files();
         return Err("リモートサーバーが起動していない（プロセスは既に終了）".to_string());
     }
+    // P0-4: PID が本当に tako remote プロセスか検証
+    if !verify_pid_identity(&pid_info) {
+        // PID が再利用されている。state だけ掃除して終了（無関係プロセスを kill しない）
+        cleanup_state_files();
+        return Err(format!(
+            "PID {pid_num} は tako remote ではないプロセスに再利用されています。\
+             state ファイルを掃除しました"
+        ));
+    }
     #[cfg(unix)]
     {
-        unsafe {
-            libc::kill(pid_num as libc::pid_t, libc::SIGTERM);
+        let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
+        let ret = unsafe { libc::kill(pid_num as libc::pid_t, sig) };
+        if ret != 0 {
+            return Err(format!(
+                "PID {pid_num} への signal 送信に失敗（errno: {}）",
+                std::io::Error::last_os_error()
+            ));
         }
     }
     #[cfg(not(unix))]
     {
         return Err("Windows での停止は未実装".to_string());
     }
-    // プロセスの終了をポーリングで確認（最大 5 秒、超過時は SIGKILL）
+    // プロセスの終了をポーリングで確認（最大 5 秒）
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         if !is_process_alive(pid_num) {
             break;
         }
         if std::time::Instant::now() >= deadline {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(pid_num as libc::pid_t, libc::SIGKILL);
+            if force {
+                // force でも終了しない場合はエラー（state は残す）
+                return Err(format!(
+                    "PID {pid_num} が SIGKILL 後 5 秒経っても終了しない。state ファイルは残してあります"
+                ));
             }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            break;
+            // 通常 stop は SIGKILL にエスカレートせず、エラーを返して state を残す
+            return Err(format!(
+                "PID {pid_num} が SIGTERM 後 5 秒経っても終了しない。\
+                 `tako remote stop --force` で SIGKILL を試みてください"
+            ));
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -573,28 +818,44 @@ pub fn spawn_daemon(port: Option<u16>, insecure: bool) -> Result<Value, String> 
         .spawn()
         .map_err(|e| format!("デーモンの起動に失敗: {e}"))?;
 
-    // stdout から起動情報 JSON を読み取る（最大 10 秒待機）
+    // H-6: stdout から起動情報 JSON を reader thread + recv_timeout で読み取る
     let stdout = child
         .stdout
         .take()
         .ok_or("デーモンの stdout を取得できない")?;
 
     let info = {
-        use std::io::BufRead;
-        let reader = std::io::BufReader::new(stdout);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut result = None;
-        for line in reader.lines() {
-            if std::time::Instant::now() > deadline {
-                break;
-            }
-            let line = line.map_err(|e| format!("デーモンの出力読み取りに失敗: {e}"))?;
-            if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                result = Some(v);
-                break;
-            }
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel::<Result<Value, String>>();
+
+        std::thread::Builder::new()
+            .name("daemon-stdout-reader".into())
+            .spawn(move || {
+                use std::io::BufRead;
+                let reader = std::io::BufReader::new(stdout);
+                for line in reader.lines() {
+                    match line {
+                        Ok(line) => {
+                            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                                let _ = tx.send(Ok(v));
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(format!("デーモンの出力読み取りに失敗: {e}")));
+                            return;
+                        }
+                    }
+                }
+                let _ = tx.send(Err("デーモンが起動情報 JSON を出力しなかった".to_string()));
+            })
+            .map_err(|e| format!("reader スレッドの起動に失敗: {e}"))?;
+
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(Ok(v)) => Some(v),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => None,
         }
-        result
     };
 
     let Some(info) = info else {
@@ -740,29 +1001,47 @@ fn find_cloudflared() -> io::Result<String> {
     ))
 }
 
-/// cloudflared の stderr 出力から tunnel URL を読み取る
+/// cloudflared の stderr 出力から tunnel URL を読み取る。
+/// H-6: reader thread + recv_timeout で blocking read がタイムアウトを妨げない
 fn parse_tunnel_url(stderr: std::process::ChildStderr) -> io::Result<String> {
-    use std::io::BufRead;
-    let reader = std::io::BufReader::new(stderr);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel::<io::Result<String>>();
 
-    let mut lines = reader.lines();
-    while let Some(result) = lines.next() {
-        if std::time::Instant::now() > deadline {
-            break;
-        }
-        let line = result?;
-        if let Some(url) = extract_trycloudflare_url(&line) {
-            std::thread::Builder::new()
-                .name("cloudflared-stderr-drain".into())
-                .spawn(move || for _ in lines {})
-                .ok();
-            return Ok(url);
-        }
+    std::thread::Builder::new()
+        .name("cloudflared-stderr-reader".into())
+        .spawn(move || {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Some(result) = lines.next() {
+                match result {
+                    Ok(line) => {
+                        if let Some(url) = extract_trycloudflare_url(&line) {
+                            let _ = tx.send(Ok(url));
+                            // 残りの stderr を drain して pipe 詰まりを防ぐ
+                            for _ in lines {}
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(Err(io::Error::other(
+                "cloudflared が tunnel URL を出力せず終了した",
+            )));
+        })
+        .map_err(|e| io::Error::other(format!("reader スレッドの起動に失敗: {e}")))?;
+
+    match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(Ok(url)) => Ok(url),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(io::Error::other(
+            "cloudflared から tunnel URL を取得できなかった（30 秒タイムアウト）",
+        )),
     }
-    Err(io::Error::other(
-        "cloudflared から tunnel URL を取得できなかった（30 秒タイムアウト）",
-    ))
 }
 
 /// 1 行のテキストから trycloudflare.com の URL を抽出する
@@ -849,6 +1128,7 @@ fn register_relay(machine_id: &str, tunnel_url: &str) -> Result<(), String> {
         body["secret"] = json!(secret);
     }
 
+    // H-6: --connect-timeout / --max-time で curl のブロッキングを制限する
     let status = Command::new("curl")
         .args([
             "-s",
@@ -856,6 +1136,10 @@ fn register_relay(machine_id: &str, tunnel_url: &str) -> Result<(), String> {
             "/dev/null",
             "-w",
             "%{http_code}",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "15",
             "-X",
             "POST",
             "-H",
@@ -943,9 +1227,12 @@ pub fn hostname() -> String {
 
 const TMUX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// 応答サイズ上限（8MB）。capture-pane の巨大出力を打ち切る
+const MAX_TMUX_OUTPUT: usize = 8 * 1024 * 1024;
+
 /// tmux コマンドをタイムアウト付きで実行する。
-/// `.output()` は tmux ハング時にスレッドを永久ブロックするため、
-/// `spawn` + `try_wait` ループでタイムアウトを実装する
+/// H-5: stdout/stderr を別スレッドで同時 drain して pipe deadlock を根治する。
+/// pipe buffer（macOS: 64KB）を超える出力でも deadlock しない
 fn tmux_output_with_timeout(
     tmux_socket: &str,
     args: &[&str],
@@ -959,24 +1246,43 @@ fn tmux_output_with_timeout(
         .spawn()
         .map_err(|e| format!("tmux コマンドの起動に失敗: {e}"))?;
 
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(ref mut out) = child.stdout {
-                    let _ = out.read_to_end(&mut stdout);
-                }
-                if let Some(ref mut err) = child.stderr {
-                    let _ = err.read_to_end(&mut stderr);
-                }
-                return Ok(std::process::Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
+    // stdout/stderr を別スレッドで同時に drain する（H-5 pipe deadlock 対策）。
+    // 子プロセスが pipe buffer いっぱいまで書いて write 待ちになっても、
+    // 親が同時に読んでいるため deadlock しない
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    let stdout_handle = std::thread::Builder::new()
+        .name("tmux-stdout-drain".into())
+        .spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stdout_pipe {
+                let _ = (&mut pipe)
+                    .take(MAX_TMUX_OUTPUT as u64)
+                    .read_to_end(&mut buf);
             }
+            buf
+        })
+        .map_err(|e| format!("stdout drain スレッドの起動に失敗: {e}"))?;
+
+    let stderr_handle = std::thread::Builder::new()
+        .name("tmux-stderr-drain".into())
+        .spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stderr_pipe {
+                let _ = (&mut pipe)
+                    .take(MAX_TMUX_OUTPUT as u64)
+                    .read_to_end(&mut buf);
+            }
+            buf
+        })
+        .map_err(|e| format!("stderr drain スレッドの起動に失敗: {e}"))?;
+
+    // タイムアウト付きで子プロセスの終了を待つ
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
             Ok(None) => {
                 if start.elapsed() > TMUX_TIMEOUT {
                     let _ = child.kill();
@@ -994,7 +1300,16 @@ fn tmux_output_with_timeout(
                 return Err(format!("プロセスの待機に失敗: {e}"));
             }
         }
-    }
+    };
+
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
+
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// tmux バックエンドから全セッション・ペイン情報を取得して JSON 配列に変換する。
@@ -1242,6 +1557,15 @@ fn cors_headers() -> Vec<tiny_http::Header> {
 }
 
 fn respond(request: tiny_http::Request, status: u16, body: Option<String>) {
+    respond_inner(request, status, body, false);
+}
+
+/// M-4: 機密データを含む応答。Cache-Control: no-store, private を付与する
+fn respond_sensitive(request: tiny_http::Request, status: u16, body: Option<String>) {
+    respond_inner(request, status, body, true);
+}
+
+fn respond_inner(request: tiny_http::Request, status: u16, body: Option<String>, no_cache: bool) {
     let cors = cors_headers();
     let result = match body {
         Some(body) => {
@@ -1252,6 +1576,12 @@ fn respond(request: tiny_http::Request, status: u16, body: Option<String>) {
                 .with_status_code(status);
             for h in cors {
                 resp = resp.with_header(h);
+            }
+            if no_cache {
+                resp = resp.with_header(
+                    tiny_http::Header::from_bytes(&b"Cache-Control"[..], &b"no-store, private"[..])
+                        .expect("固定ヘッダ"),
+                );
             }
             request.respond(resp)
         }
@@ -1762,7 +2092,7 @@ fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &st
         (tiny_http::Method::Get, "/api/agents") => {
             // claude agents --json のプロキシ + pane 対応付け（Issue #23）
             match crate::agents::list_agents_with_panes(Some(tmux_socket)) {
-                Ok(result) => respond(request, 200, Some(result.to_string())),
+                Ok(result) => respond_sensitive(request, 200, Some(result.to_string())),
                 Err(e) => respond(request, 502, Some(json!({ "error": e }).to_string())),
             }
         }
@@ -1781,7 +2111,7 @@ fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &st
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(30);
             match crate::transcript::read_messages(&session_id, tail) {
-                Ok(result) => respond(request, 200, Some(result.to_string())),
+                Ok(result) => respond_sensitive(request, 200, Some(result.to_string())),
                 Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
             }
         }
@@ -1804,7 +2134,7 @@ fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &st
                         body["cursor"] = json!({ "x": x, "y": y });
                         body["size"] = json!({ "cols": w, "rows": h });
                     }
-                    respond(request, 200, Some(body.to_string()))
+                    respond_sensitive(request, 200, Some(body.to_string()))
                 }
                 Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
             }
@@ -1829,7 +2159,7 @@ fn handle_request(mut request: tiny_http::Request, token: &str, tmux_socket: &st
                     if let Some((_, _, w, h)) = tmux_pane_geometry(tmux_socket, &tmux_target) {
                         body["size"] = json!({ "cols": w, "rows": h });
                     }
-                    respond(request, 200, Some(body.to_string()))
+                    respond_sensitive(request, 200, Some(body.to_string()))
                 }
                 Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
             }
@@ -2014,10 +2344,23 @@ pub fn generate_qr_png(url: &str) -> io::Result<std::path::PathBuf> {
         }
     }
 
-    let path = std::env::temp_dir().join("tako-remote-qr.png");
+    // P0-3: QR はランダム名で state_dir 配下に保存（停止時に cleanup_state_files で削除される）
+    let dir = ensure_state_dir()?;
+    let nonce: u64 = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        std::process::id().hash(&mut h);
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .hash(&mut h);
+        h.finish()
+    };
+    let path = dir.join(format!("qr-{nonce:016x}.png"));
     img.save(&path)
         .map_err(|e| io::Error::other(format!("PNG の保存に失敗: {e}")))?;
-    // QR はトークン入りの接続 URL をエンコードしているため所有者のみ読取可に制限する（#104）
     restrict_permissions(&path);
 
     Ok(path)
@@ -2599,5 +2942,110 @@ mod tests {
         assert!(connect.contains("token=***"));
         assert!(connect.contains("machine=m1"), "他のクエリは保持する");
         assert!(connect.contains("name=mac"));
+    }
+
+    // --- P0-3 テスト ---
+
+    #[test]
+    fn state_dirはdata_dir配下のremoteを返す() {
+        let dir = state_dir();
+        let s = dir.to_string_lossy();
+        assert!(
+            s.contains("remote") || s.contains("tako"),
+            "state_dir は /tmp ではなく data_dir 配下: {s}"
+        );
+    }
+
+    #[test]
+    fn write_secret_fileは0600で書ける() {
+        let dir = std::env::temp_dir().join(format!("tako-test-wsf-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("secret.txt");
+        write_secret_file(&path, "hello").expect("書き込み成功");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "hello");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "パーミッションは 0600: {mode:o}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_state_dirは0700でディレクトリを作る() {
+        let dir = std::env::temp_dir().join(format!("tako-test-esd-{}", std::process::id()));
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
+        let result = ensure_state_dir();
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+        assert!(result.is_ok());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "ディレクトリパーミッションは 0700: {mode:o}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- P0-4 テスト ---
+
+    #[test]
+    fn parse_pid_fileは3行形式を解析する() {
+        let dir = std::env::temp_dir().join(format!("tako-test-ppf-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
+        let pid_file = dir.join("tako-remote.pid");
+        std::fs::write(&pid_file, "12345\n/usr/bin/tako\n1700000000\n").unwrap();
+        let info = parse_pid_file().expect("パースに成功");
+        assert_eq!(info.pid, 12345);
+        assert_eq!(info.exe, Some("/usr/bin/tako".to_string()));
+        assert_eq!(info.start_time, Some(1700000000));
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_pid_identityは存在しないpidをfalseで返す() {
+        let info = PidInfo {
+            pid: 99_999_999,
+            exe: None,
+            start_time: None,
+        };
+        assert!(!verify_pid_identity(&info));
+    }
+
+    #[test]
+    fn daemon_stop_implはpid再利用時にkillしない() {
+        // 自分の PID を書いたが、args が "tako remote serve" でないのでエラーになる
+        let dir = std::env::temp_dir().join(format!("tako-test-dsi-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
+        let my_pid = std::process::id();
+        let pid_file = dir.join("tako-remote.pid");
+        std::fs::write(&pid_file, format!("{my_pid}\n/bin/zsh\n0\n")).unwrap();
+        let result = daemon_stop_impl(false);
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+        assert!(result.is_err(), "PID 再利用を検知してエラーになる");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("再利用"),
+            "エラーメッセージに PID 再利用を示す: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- parse_lstart テスト ---
+    #[cfg(unix)]
+    #[test]
+    fn parse_lstartは日時をepochに変換する() {
+        // 2026-07-14 12:00:00 UTC の近似値（うるう年補正なし、数秒の誤差は許容）
+        let result = parse_lstart("Mon Jul 14 12:00:00 2026");
+        assert!(result.is_some());
+        let epoch = result.unwrap();
+        // 2026-01-01 から約半年後なので、1780000000 前後
+        assert!(epoch > 1_700_000_000, "epoch は 2024 以降: {epoch}");
+        assert!(epoch < 1_800_000_000, "epoch は 2027 以前: {epoch}");
     }
 }

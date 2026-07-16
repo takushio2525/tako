@@ -677,7 +677,11 @@ enum RemoteCommand {
         insecure: bool,
     },
     /// リモートアクセス API サーバーを停止する
-    Stop,
+    Stop {
+        /// SIGTERM の代わりに SIGKILL で停止する（P0-4）
+        #[arg(long)]
+        force: bool,
+    },
     /// リモートアクセス API サーバーの状態を表示する
     Status {
         /// トークンをマスクせず生値で表示する（既定はマスク。#104）
@@ -1728,7 +1732,7 @@ fn main() -> ExitCode {
         Command::Task(TaskCommand::Gate(ref gate_sub)) => gate_cli(gate_sub),
         // remote コマンドはローカル処理（IPC 不要）
         Command::Remote(RemoteCommand::Start { port, insecure }) => remote_start(port, insecure),
-        Command::Remote(RemoteCommand::Stop) => remote_stop(),
+        Command::Remote(RemoteCommand::Stop { force }) => remote_stop(force),
         Command::Remote(RemoteCommand::Status { show_token }) => remote_status(show_token),
         Command::Remote(RemoteCommand::Serve { port, insecure }) => remote_serve(port, insecure),
         Command::Remote(RemoteCommand::Agents) => remote_agents(),
@@ -2403,8 +2407,12 @@ fn remote_start(port: u16, insecure: bool) -> Result<(), String> {
 }
 
 /// `tako remote stop` — デーモンを PID ファイルから kill する
-fn remote_stop() -> Result<(), String> {
-    let result = tako_control::remote::daemon_stop()?;
+fn remote_stop(force: bool) -> Result<(), String> {
+    let result = if force {
+        tako_control::remote::daemon_force_stop()?
+    } else {
+        tako_control::remote::daemon_stop()?
+    };
     println!("{}", pretty_json(&result));
     eprintln!("リモートサーバーを停止しました");
     Ok(())
