@@ -32,13 +32,13 @@ pub(crate) fn test_config_dir_override() -> &'static std::sync::OnceLock<PathBuf
 }
 
 /// オーケストレーター設定ディレクトリのパス。
-/// `~/Library/Application Support/tako/orchestrator/`
+/// `<data_dir>/orchestrator/`（TAKO_DATA_DIR / TAKO_ISOLATED を経由）
 pub fn config_dir() -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(dir) = test_config_dir_override().get() {
         return Some(dir.clone());
     }
-    home_dir().map(|h| h.join("Library/Application Support/tako/orchestrator"))
+    tako_core::paths::data_dir().map(|d| d.join("orchestrator"))
 }
 
 /// projects.yaml のパス

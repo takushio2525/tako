@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed / 修正
 
+- TAKO_ISOLATED の隔離セルフテストが本番 ledger.yaml に書き込む問題を修正: orchestrator の config_dir を data_dir() ベースに切り替え + ledger prune コマンドの追加（CLI / MCP 1:1）(#303)
+  Fixed isolated selftest writing to production ledger.yaml: switched orchestrator config_dir to data_dir()-based resolution (respects TAKO_DATA_DIR / TAKO_ISOLATED) + added ledger prune action for cleanup (CLI / MCP 1:1) (#303)
 - MCP 登録パスが消失しても検知・自己修復されない問題を修正: 安定パス優先解決 + ヘルスチェック + master 起動時警告 (#299)
   Fixed MCP registration pointing to a dead binary path going undetected: stable path resolution (/Applications priority), health check on existing registrations, and master startup warning (#299)
 - master がタスク受付時に登録プロジェクトの照合を最優先で行うよう順序制約を追加（プロジェクト名の誤認防止）(#263)

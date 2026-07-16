@@ -1156,6 +1156,12 @@ enum LedgerCommand {
         #[arg(long)]
         note: String,
     },
+    /// project 前方一致でエントリを除去（selftest 混入等の掃除用）
+    Prune {
+        /// 除去対象の project プレフィックス（例: tako-selftest-）
+        #[arg(long)]
+        project_prefix: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3959,6 +3965,11 @@ fn ledger_cli(sub: &LedgerCommand) -> Result<(), String> {
         LedgerCommand::Amend { id, note } => {
             ledger::amend_entry(id, note)?;
             println!("amended: {id} (post_issue=true)");
+            Ok(())
+        }
+        LedgerCommand::Prune { project_prefix } => {
+            let removed = ledger::Ledger::mutate(|l| l.prune_by_project_prefix(project_prefix))?;
+            println!("pruned: {removed} entries with project prefix '{project_prefix}'");
             Ok(())
         }
     }
