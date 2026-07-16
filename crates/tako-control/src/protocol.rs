@@ -586,8 +586,11 @@ pub enum Request {
         #[serde(default)]
         insecure: bool,
     },
-    /// リモートアクセス API サーバーの停止
-    RemoteStop,
+    /// リモートアクセス API サーバーの停止。`force` = true で SIGKILL
+    RemoteStop {
+        #[serde(default)]
+        force: bool,
+    },
     /// リモートアクセス API サーバーの状態取得。
     /// `show_token` = true のときだけ応答にトークンを平文で含める（既定はマスク。
     /// スクリーンショット・画面共有経由でのトークン漏えいを防ぐため）

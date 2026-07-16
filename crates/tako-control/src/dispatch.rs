@@ -1851,7 +1851,13 @@ fn dispatch_inner(
         Request::RemoteStart { port, insecure } => host
             .remote_start(port, insecure)
             .map_err(DispatchError::Operation),
-        Request::RemoteStop => host.remote_stop().map_err(DispatchError::Operation),
+        Request::RemoteStop { force } => {
+            if force {
+                crate::remote::daemon_force_stop().map_err(DispatchError::Operation)
+            } else {
+                host.remote_stop().map_err(DispatchError::Operation)
+            }
+        }
         Request::RemoteStatus { show_token } => {
             let mut status = host.remote_status();
             if !show_token {
