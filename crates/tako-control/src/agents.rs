@@ -339,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn find_ancestor_backendは無関係なpidでNone() {
+    fn find_ancestor_backendは無関係なpidでnoneを返す() {
         let parents: HashMap<u32, u32> = [(999, 500), (500, 1)].into();
         let backend_pids = vec![("tako-s1".to_string(), 100u32)];
         assert_eq!(find_ancestor_backend(999, &parents, &backend_pids), None);

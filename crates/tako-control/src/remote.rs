@@ -642,9 +642,9 @@ fn establish_tailscale_serve(port: u16) -> io::Result<(String, String)> {
         crate::tailscale::ServeState::Proxy(target) => {
             return Err(io::Error::other(format!(
                 "tailscale serve に既存の設定があります（HTTPS:443 → {target}）。\
-                 ユーザー設定を壊さないため上書きしません。tako の以前の設定の残骸であれば\
-                 `tailscale serve --https=443 off` で解除するか、同じポートを使うなら\
-                 `tako remote start --port <ポート番号>` を指定してください"
+                 ユーザー設定を壊さないため上書きしません。tako の以前の設定の残骸で\
+                 あれば `tailscale serve --https=443 off` で解除するか、同じポートを\
+                 使うなら `tako remote start --port <ポート番号>` を指定してください"
             )));
         }
         crate::tailscale::ServeState::Other => {
@@ -840,14 +840,12 @@ pub fn scrollback(pane_id: &str, lines: u32) -> Result<Vec<String>, String> {
 }
 
 /// デーモンの状態を PID ファイルから確認する。
-/// 返り値: running=true ならポート/トークンも含む
+/// 返り値: running=true ならポート/トークンも含む。
+/// PID ファイルは 3 行形式（PID / 実行ファイル / 起動時刻。P0-4）のため
+/// parse_pid_file で先頭行の PID を取り出す
 pub fn daemon_status() -> Value {
-    let pid = match std::fs::read_to_string(pid_path()) {
-        Ok(s) => s.trim().to_string(),
-        Err(_) => return json!({ "running": false }),
-    };
-    let pid_num: u32 = match pid.parse() {
-        Ok(n) => n,
+    let pid_num = match parse_pid_file() {
+        Ok(info) => info.pid,
         Err(_) => return json!({ "running": false }),
     };
     if !is_process_alive(pid_num) {
@@ -1158,6 +1156,20 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
     Ok(json!({ "stopped": true }))
 }
 
+/// serve 子プロセスに使う tako バイナリを解決する。
+/// tako CLI 自身から呼ばれた場合は自分（current_exe）を使う: PATH 優先の解決だと、
+/// dev ビルドや .app 同梱 CLI からの起動が PATH 上の**別バージョンの tako**へ化けて
+/// 旧実装の serve が立つ事故が起きる。tako-app（ファイル名が tako でない）から
+/// 呼ばれた場合のみ resolve_tako_binary（PATH → 同梱 CLI）に委ねる
+fn serve_binary() -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        if exe.file_name().and_then(|n| n.to_str()) == Some("tako") {
+            return exe.display().to_string();
+        }
+    }
+    crate::dispatch::resolve_tako_binary()
+}
+
 /// デーモンをバックグラウンドで fork 起動する。
 /// `tako remote serve --port N` を子プロセスとして起動し、
 /// stdout から起動情報 JSON を読み取って返す。
@@ -1195,7 +1207,7 @@ pub fn spawn_daemon(port: Option<u16>) -> Result<Value, String> {
         }
     }
 
-    let tako_bin = crate::dispatch::resolve_tako_binary();
+    let tako_bin = serve_binary();
     let mut args = vec!["remote".to_string(), "serve".to_string()];
     if let Some(p) = port {
         args.push("--port".to_string());
@@ -1257,26 +1269,43 @@ pub fn spawn_daemon(port: Option<u16>) -> Result<Value, String> {
             })
             .map_err(|e| format!("reader スレッドの起動に失敗: {e}"))?;
 
+        // JSON を得られず stdout が閉じた（子が起動前チェックで終了した等）場合も
+        // タイムアウトと同じ経路に落とし、下で stderr から実際の原因を拾って返す
         match rx.recv_timeout(std::time::Duration::from_secs(30)) {
             Ok(Ok(v)) => Some(v),
-            Ok(Err(e)) => return Err(e),
-            Err(_) => None,
+            Ok(Err(_)) | Err(_) => None,
         }
     };
 
     let Some(info) = info else {
-        // 起動情報が来なかった。子が即死していれば stderr から原因を拾う
-        // （例: ポート使用中で bind 失敗。orphan デーモンの残骸が典型）
-        if let Ok(Some(status)) = child.try_wait() {
+        // 起動情報が来なかった。子の終了を少し待ち、stderr から原因を拾う
+        // （例: Tailscale 未セットアップの不足項目列挙、ポート使用中で bind 失敗）
+        let status = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(s)) => break Some(s),
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    _ => break None,
+                }
+            }
+        };
+        if let Some(status) = status {
             let mut detail = String::new();
             if let Some(mut err) = child.stderr.take() {
                 use std::io::Read as _;
                 let _ = (&mut err).take(4096).read_to_string(&mut detail);
             }
             let detail = detail.trim();
-            return Err(format!(
-                "デーモンが起動情報を返さず終了した（{status}）: {detail}"
-            ));
+            if !detail.is_empty() {
+                // 子の stderr（不足項目の列挙 + setup 誘導など）をそのまま伝える。
+                // 呼び出し側 CLI も「error: 」を付けるため、子側の接頭辞は剥がして二重化を防ぐ
+                let detail = detail.strip_prefix("error: ").unwrap_or(detail);
+                return Err(detail.to_string());
+            }
+            return Err(format!("デーモンが起動情報を返さず終了した（{status}）"));
         }
         let _ = child.kill();
         return Err("デーモンからの起動情報を受信できなかった（30 秒タイムアウト）".into());
