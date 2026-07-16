@@ -1880,9 +1880,7 @@ fn mcp_serve() -> Result<(), String> {
 
 /// MCP セットアップ（アプリ未起動でも動作）。settings.json に tako MCP 設定を追加する
 fn setup_mcp_local(args: &SetupMcpArgs) -> Result<(), String> {
-    let tako_bin = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| tako_control::dispatch::resolve_tako_binary());
+    let tako_bin = tako_control::dispatch::resolve_tako_binary();
     let settings_dir = if args.project {
         std::env::current_dir()
             .map_err(|e| format!("カレントディレクトリの取得に失敗: {e}"))?
@@ -1897,7 +1895,15 @@ fn setup_mcp_local(args: &SetupMcpArgs) -> Result<(), String> {
     let settings_path = settings_dir.join("settings.json");
     match tako_control::dispatch::setup_mcp_settings(&tako_bin, &settings_path) {
         Ok(result) => {
-            if result.already_existed {
+            if result.repaired {
+                let old = result.old_command.as_deref().unwrap_or("(不明)");
+                eprintln!(
+                    "登録パスが消失していたため付け替えました: {}",
+                    settings_path.display()
+                );
+                eprintln!("  旧: {old}");
+                eprintln!("  新: {tako_bin}");
+            } else if result.already_existed {
                 eprintln!("既に設定されています: {}", settings_path.display());
             } else {
                 eprintln!("設定を追加しました: {}", settings_path.display());
@@ -1908,12 +1914,48 @@ fn setup_mcp_local(args: &SetupMcpArgs) -> Result<(), String> {
     }
 }
 
+/// MCP 登録パスの存在を確認し、不在なら警告を出す（master/solo 起動前のガード）
+fn check_mcp_health_warning() {
+    let home = match std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+    {
+        Some(h) => h,
+        None => return,
+    };
+    let settings_path = home.join(".claude").join("settings.json");
+    let content = match std::fs::read_to_string(&settings_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let settings: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let cmd = match settings
+        .get("mcpServers")
+        .and_then(|s| s.get("tako"))
+        .and_then(|t| t.get("command"))
+        .and_then(|c| c.as_str())
+    {
+        Some(c) => c,
+        None => return, // 未登録は setup の管轄
+    };
+    if !std::path::Path::new(cmd).is_file() {
+        eprintln!("[警告] MCP 登録パスが消失しています: {cmd}");
+        eprintln!("        tako MCP なしで起動します。tako setup-mcp で修復してください。");
+        eprintln!();
+    }
+}
+
 /// `tako master [-profile]` — 新タブで claude をマスター system prompt 付きで起動する。
 /// `-<名前>` でプロファイルを指定、引数なしは default、旧形式（suffix のみ）も後方互換で動作
 fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     use tako_control::orchestrator;
 
     orchestrator::ensure_defaults().map_err(|e| format!("セットアップに失敗: {e}"))?;
+
+    check_mcp_health_warning();
 
     if let Some(notice) = orchestrator::migrate_legacy_default_profile() {
         eprintln!("ℹ {notice}");
@@ -1977,9 +2019,7 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         None => "master".into(),
     };
 
-    let tako_bin = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| tako_control::dispatch::resolve_tako_binary());
+    let tako_bin = tako_control::dispatch::resolve_tako_binary();
     let master_cmd = orchestrator::build_master_cmd(&role_env, &profile, &prompt_path, &tako_bin)?;
 
     // インライン起動（既定）: 現在のペインでコマンドを実行（新タブを作らない。#264）
@@ -2062,6 +2102,8 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
 
     orchestrator::ensure_solo_defaults().map_err(|e| format!("セットアップに失敗: {e}"))?;
 
+    check_mcp_health_warning();
+
     let (profile_name, suffix) = match arg {
         None => ("default", None),
         Some(s) if s.starts_with('-') => {
@@ -2108,9 +2150,7 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         None => "solo".into(),
     };
 
-    let tako_bin = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| tako_control::dispatch::resolve_tako_binary());
+    let tako_bin = tako_control::dispatch::resolve_tako_binary();
     let solo_cmd = orchestrator::build_master_cmd(&role, &profile, &prompt_path, &tako_bin)?;
 
     let pane_id = if use_tab {

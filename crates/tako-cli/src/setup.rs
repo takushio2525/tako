@@ -644,30 +644,61 @@ fn run_fda_check(interactive: bool) {
     }
 }
 
-fn check_claude_mcp_registered(path: &str) -> bool {
-    let output = std::process::Command::new(path)
+/// MCP 登録の健全性を確認。
+/// 返り値: (登録あり, 登録パスが生きている)
+fn check_claude_mcp_health(claude_path: &str) -> (bool, bool) {
+    let output = std::process::Command::new(claude_path)
         .args(["mcp", "list"])
         .output();
     match output {
         Ok(o) if o.status.success() => {
             let stdout = String::from_utf8_lossy(&o.stdout);
-            stdout.contains("tako")
+            let has_tako = stdout.lines().any(|line| {
+                let lower = line.to_lowercase();
+                lower.contains("tako") && !lower.contains("no mcp")
+            });
+            if !has_tako {
+                return (false, false);
+            }
+            // settings.json から登録パスを直接読む（claude mcp list の出力は
+            // ✔/✘ の有無やフォーマットがバージョンで変わり得るため）
+            let path_alive = read_mcp_command_path()
+                .map(|p| std::path::Path::new(&p).is_file())
+                .unwrap_or(true); // 読めなければ楽観判定
+            (true, path_alive)
         }
-        _ => false,
+        _ => (false, false),
     }
 }
 
+/// settings.json から tako MCP 登録の command パスを読み取る
+fn read_mcp_command_path() -> Option<String> {
+    let home = home_dir()?;
+    let path = home.join(".claude").join("settings.json");
+    let content = std::fs::read_to_string(path).ok()?;
+    let settings: serde_json::Value = serde_json::from_str(&content).ok()?;
+    settings
+        .get("mcpServers")?
+        .get("tako")?
+        .get("command")?
+        .as_str()
+        .map(String::from)
+}
+
 fn run_setup_mcp() -> Result<(), String> {
-    let tako_bin = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| tako_control::dispatch::resolve_tako_binary());
+    let tako_bin = tako_control::dispatch::resolve_tako_binary();
     let settings_dir = home_dir()
         .ok_or("ホームディレクトリが取得できない")?
         .join(".claude");
     let settings_path = settings_dir.join("settings.json");
     match tako_control::dispatch::setup_mcp_settings(&tako_bin, &settings_path) {
         Ok(result) => {
-            if result.already_existed {
+            if result.repaired {
+                let old = result.old_command.as_deref().unwrap_or("(不明)");
+                eprintln!("  [修復] MCP: 登録パスが消失していたため付け替えました");
+                eprintln!("         旧: {old}");
+                eprintln!("         新: {tako_bin}");
+            } else if result.already_existed {
                 eprintln!("  MCP: 既に設定されています");
             } else {
                 eprintln!("  MCP: 設定を追加しました");
@@ -681,9 +712,13 @@ fn run_setup_mcp() -> Result<(), String> {
 fn configure_agent_mcp(agent: &DetectedAgent) -> Result<(), String> {
     match agent.kind {
         SetupAgent::Claude => {
-            if check_claude_mcp_registered(&agent.path) {
+            let (registered, healthy) = check_claude_mcp_health(&agent.path);
+            if registered && healthy {
                 eprintln!("  [OK] Claude MCP: tako が登録済み");
                 Ok(())
+            } else if registered && !healthy {
+                eprintln!("  [警告] Claude MCP: 登録パスが消失しています。修復します");
+                run_setup_mcp()
             } else {
                 eprintln!("  [設定] Claude MCP を自動登録します");
                 run_setup_mcp()
@@ -1534,8 +1569,15 @@ pub fn run_check() -> Result<(), String> {
 
     // MCP 登録（claude のみ永続登録。codex は master 起動時注入、agy は worker 専用）
     if let Some(claude) = agents.iter().find(|a| a.kind == SetupAgent::Claude) {
-        if check_claude_mcp_registered(&claude.path) {
+        let (registered, healthy) = check_claude_mcp_health(&claude.path);
+        if registered && healthy {
             eprintln!("  [OK] Claude MCP: tako が登録済み");
+        } else if registered && !healthy {
+            eprintln!("  [警告] Claude MCP: 登録済みだがパスが消失しています");
+            if let Some(cmd) = read_mcp_command_path() {
+                eprintln!("         登録パス: {cmd}");
+            }
+            eprintln!("         tako setup または tako setup-mcp で修復できます");
         } else {
             eprintln!("  [不足] Claude MCP: tako が未登録（tako setup-mcp で登録できます）");
         }
@@ -1850,8 +1892,12 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     let instruction_existed = instruction.is_file();
     let profile_path = default_profile_path()?;
     let profile_existed = profile_path.is_file();
-    let claude_mcp_missing =
-        selected == SetupAgent::Claude && !check_claude_mcp_registered(&selected_agent.path);
+    let claude_mcp_missing = if selected == SetupAgent::Claude {
+        let (registered, healthy) = check_claude_mcp_health(&selected_agent.path);
+        !registered || !healthy
+    } else {
+        false
+    };
 
     let mut plan = SetupPlan::default();
     plan.push_if_changed(

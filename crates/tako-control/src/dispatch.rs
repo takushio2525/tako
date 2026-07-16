@@ -1668,12 +1668,19 @@ fn dispatch_inner(
             };
             let tako_bin = resolve_tako_binary();
             let result = setup_mcp_settings(&tako_bin, &settings_dir.join("settings.json"))?;
-            Ok(json!({
+            let mut resp = json!({
                 "configured": result.configured,
                 "already_existed": result.already_existed,
                 "settings_path": settings_dir.join("settings.json").display().to_string(),
                 "command": tako_bin,
-            }))
+            });
+            if result.repaired {
+                resp["repaired"] = json!(true);
+                if let Some(old) = &result.old_command {
+                    resp["old_command"] = json!(old);
+                }
+            }
+            Ok(resp)
         }
 
         Request::VideoPlayback { pane, action } => {
@@ -3986,11 +3993,16 @@ fn shell_escape(s: &str) -> String {
 pub struct SetupMcpResult {
     pub configured: bool,
     pub already_existed: bool,
+    /// 既存の登録パスが死んでいたため新パスに付け替えた
+    pub repaired: bool,
+    /// 修復前の旧パス（repaired=true のときのみ）
+    pub old_command: Option<String>,
 }
 
 /// Claude Code の settings.json に tako MCP サーバーの接続設定を追加する。
 /// `tako_binary` は tako CLI のフルパス、`settings_path` は書き込む settings.json のパス。
-/// 既に設定済みなら `already_existed=true`、新規追加なら `configured=true`
+/// 既に設定済みなら `already_existed=true`、新規追加なら `configured=true`。
+/// 既存登録の command パスが存在しない場合は `tako_binary` に付け替え `repaired=true`
 pub fn setup_mcp_settings(
     tako_binary: &str,
     settings_path: &std::path::Path,
@@ -4005,10 +4017,39 @@ pub fn setup_mcp_settings(
     };
     let servers = settings.entry("mcpServers").or_insert_with(|| json!({}));
     if let Some(obj) = servers.as_object() {
-        if obj.contains_key("tako") {
+        if let Some(existing) = obj.get("tako") {
+            let existing_cmd = existing
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let path_healthy =
+                !existing_cmd.is_empty() && std::path::Path::new(existing_cmd).is_file();
+            if path_healthy {
+                return Ok(SetupMcpResult {
+                    configured: false,
+                    already_existed: true,
+                    repaired: false,
+                    old_command: None,
+                });
+            }
+            // 登録パスが死んでいる → 付け替え
+            let old_cmd = existing_cmd.to_string();
+            let servers_obj = servers.as_object_mut().ok_or_else(|| {
+                DispatchError::Operation("settings.json の mcpServers がオブジェクトでない".into())
+            })?;
+            servers_obj.insert(
+                "tako".to_string(),
+                json!({
+                    "command": tako_binary,
+                    "args": ["mcp", "serve"],
+                }),
+            );
+            write_settings_json(settings_path, &settings)?;
             return Ok(SetupMcpResult {
-                configured: false,
+                configured: true,
                 already_existed: true,
+                repaired: true,
+                old_command: Some(old_cmd),
             });
         }
     }
@@ -4022,12 +4063,25 @@ pub fn setup_mcp_settings(
             "args": ["mcp", "serve"],
         }),
     );
+    write_settings_json(settings_path, &settings)?;
+    Ok(SetupMcpResult {
+        configured: true,
+        already_existed: false,
+        repaired: false,
+        old_command: None,
+    })
+}
+
+fn write_settings_json(
+    settings_path: &std::path::Path,
+    settings: &serde_json::Map<String, Value>,
+) -> Result<(), DispatchError> {
     if let Some(parent) = settings_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             DispatchError::Operation(format!("{} の作成に失敗: {e}", parent.display()))
         })?;
     }
-    let json = serde_json::to_string_pretty(&settings)
+    let json = serde_json::to_string_pretty(settings)
         .map_err(|e| DispatchError::Operation(format!("JSON のシリアライズに失敗: {e}")))?;
     std::fs::write(settings_path, json).map_err(|e| {
         DispatchError::Operation(format!(
@@ -4035,20 +4089,25 @@ pub fn setup_mcp_settings(
             settings_path.display()
         ))
     })?;
-    Ok(SetupMcpResult {
-        configured: true,
-        already_existed: false,
-    })
+    Ok(())
 }
 
+/// MCP 登録に使う安定パス。/Applications/tako.app がある場合に最優先
+pub const STABLE_APP_BINARY: &str = "/Applications/tako.app/Contents/MacOS/tako";
+
 /// tako CLI バイナリのパスを解決する。
-/// ① `which tako`、② 実行中バイナリの隣（.app バンドル想定）、③ フォールバック "tako"
+/// ① /Applications/tako.app（安定パス）
+/// ② `which tako`
+/// ③ 実行中バイナリの隣（.app バンドル想定）
+/// ④ フォールバック "tako"
 pub fn resolve_tako_binary() -> String {
+    if std::path::Path::new(STABLE_APP_BINARY).is_file() {
+        return STABLE_APP_BINARY.to_string();
+    }
     if let Some(path) = which("tako") {
         return path;
     }
     if let Ok(exe) = std::env::current_exe() {
-        // .app バンドル: tako-app の隣に tako がある
         if let Some(dir) = exe.parent() {
             let sibling = dir.join("tako");
             if sibling.is_file() {
@@ -8193,5 +8252,86 @@ mod tests {
         let result_single = find_master_pane_strict(host.workspace(), "dup", Some("master:dup"));
         assert!(result_single.is_ok(), "1 体なら成功");
         assert_eq!(result_single.unwrap().1.as_u64(), pane_a);
+    }
+
+    fn mcp_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tako-mcp-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn setup_mcp_settings_新規登録() {
+        let dir = mcp_test_dir("new");
+        let settings = dir.join("settings.json");
+        let result = setup_mcp_settings("/usr/local/bin/tako", &settings).unwrap();
+        assert!(result.configured);
+        assert!(!result.already_existed);
+        assert!(!result.repaired);
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            content["mcpServers"]["tako"]["command"],
+            "/usr/local/bin/tako"
+        );
+    }
+
+    #[test]
+    fn setup_mcp_settings_健全な既存登録は触らない() {
+        let dir = mcp_test_dir("healthy");
+        let settings = dir.join("settings.json");
+        let exe = std::env::current_exe().unwrap();
+        let existing = serde_json::json!({
+            "mcpServers": {
+                "tako": {
+                    "command": exe.display().to_string(),
+                    "args": ["mcp", "serve"]
+                }
+            }
+        });
+        std::fs::write(&settings, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+        let result = setup_mcp_settings("/other/path/tako", &settings).unwrap();
+        assert!(!result.configured);
+        assert!(result.already_existed);
+        assert!(!result.repaired);
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            content["mcpServers"]["tako"]["command"],
+            exe.display().to_string(),
+        );
+    }
+
+    #[test]
+    fn setup_mcp_settings_死んだパスを修復() {
+        let dir = mcp_test_dir("repair");
+        let settings = dir.join("settings.json");
+        let dead_path = "/nonexistent/old/path/tako";
+        let existing = serde_json::json!({
+            "mcpServers": {
+                "tako": {
+                    "command": dead_path,
+                    "args": ["mcp", "serve"]
+                }
+            }
+        });
+        std::fs::write(&settings, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+        let result = setup_mcp_settings("/new/stable/tako", &settings).unwrap();
+        assert!(result.configured);
+        assert!(result.already_existed);
+        assert!(result.repaired);
+        assert_eq!(result.old_command.as_deref(), Some(dead_path));
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(content["mcpServers"]["tako"]["command"], "/new/stable/tako");
+    }
+
+    #[test]
+    fn resolve_tako_binary_はapplicationsを優先() {
+        // /Applications/tako.app が存在する場合のみこのテストが意味を持つ
+        if std::path::Path::new(STABLE_APP_BINARY).is_file() {
+            assert_eq!(resolve_tako_binary(), STABLE_APP_BINARY);
+        }
     }
 }
