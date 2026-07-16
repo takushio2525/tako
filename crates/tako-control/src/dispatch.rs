@@ -1772,15 +1772,25 @@ fn dispatch_inner(
             algorithm,
         } => dispatch_orchestrator_layout(policy.as_deref(), master_ratio, algorithm.as_deref()),
 
-        Request::OrchestratorSelf { pane, caller_role } => {
-            dispatch_orchestrator_self(host, pane, caller_role.as_deref())
-        }
+        Request::OrchestratorSelf {
+            pane,
+            caller_role,
+            caller_pid,
+        } => dispatch_orchestrator_self(host, pane, caller_role.as_deref(), caller_pid),
 
         Request::OrchestratorHandoff {
             pane,
             caller_role,
             tab,
-        } => dispatch_orchestrator_handoff(host, origin, pane, caller_role.as_deref(), tab),
+            caller_pid,
+        } => dispatch_orchestrator_handoff(
+            host,
+            origin,
+            pane,
+            caller_role.as_deref(),
+            tab,
+            caller_pid,
+        ),
 
         Request::OrchestratorSpawn {
             project,
@@ -1792,6 +1802,7 @@ fn dispatch_inner(
             tab,
             caller_role,
             agent,
+            caller_pid,
         } => dispatch_orchestrator_spawn(
             host,
             origin,
@@ -1805,6 +1816,7 @@ fn dispatch_inner(
                 tab,
                 caller_role: caller_role.as_deref(),
                 agent: agent.as_deref(),
+                caller_pid,
             },
         ),
 
@@ -3121,6 +3133,7 @@ fn dispatch_orchestrator_self(
     host: &dyn ControlHost,
     pane: Option<u64>,
     caller_role: Option<&str>,
+    caller_pid: Option<u32>,
 ) -> Result<Value, DispatchError> {
     use crate::orchestrator;
 
@@ -3129,24 +3142,8 @@ fn dispatch_orchestrator_self(
         .or_else(|| caller_role.and_then(|r| r.strip_prefix("solo:")))
         .map(str::to_string);
 
-    // #210: pane → stale_pane_map（orphan 復元）→ role suffix → 全 master からの検索
-    let (tab_id, pane_id) = if let Some(resolved) =
-        pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok())
-    {
-        resolved
-    } else if let Some(resolved) = pane
-        .map(PaneId::from_raw)
-        .and_then(|stale| host.resolve_stale_pane(stale))
-        .and_then(|new_id| resolve_pane(host.workspace(), Some(new_id.as_u64())).ok())
-    {
-        resolved
-    } else {
-        let suffix = role_suffix.as_deref().unwrap_or("");
-        find_master_pane(host.workspace(), suffix, caller_role)
-            .ok_or_else(|| DispatchError::Operation(
-                "master/solo ペインが見つからない（pane を明示指定するか、TAKO_ORCHESTRATOR_ROLE を確認してください）".into()
-            ))?
-    };
+    // #288: pid 祖先辿り → pane env → stale map → role（複数時エラー）
+    let (tab_id, pane_id) = resolve_caller_pane(host, pane, caller_role, caller_pid)?;
 
     let profile_name = role_suffix
         .as_deref()
@@ -3185,48 +3182,133 @@ fn dispatch_orchestrator_self(
     }))
 }
 
-/// master/solo ペインを検索する。suffix があれば suffix 一致を優先
-fn find_master_pane(
+/// #288: caller のペインを解決する共通関数
+fn resolve_caller_pane(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    caller_role: Option<&str>,
+    caller_pid: Option<u32>,
+) -> Result<(TabId, PaneId), DispatchError> {
+    if let Some(pid) = caller_pid {
+        let pane_backends = collect_pane_backends(host);
+        if let Some(resolved_pane) = crate::agents::resolve_pane_by_pid(pid, &pane_backends) {
+            if let Ok(resolved) = resolve_pane(host.workspace(), Some(resolved_pane)) {
+                return Ok(resolved);
+            }
+        }
+    }
+    if let Some(resolved) = pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok()) {
+        return Ok(resolved);
+    }
+    if let Some(resolved) = pane
+        .map(PaneId::from_raw)
+        .and_then(|stale| host.resolve_stale_pane(stale))
+        .and_then(|new_id| resolve_pane(host.workspace(), Some(new_id.as_u64())).ok())
+    {
+        return Ok(resolved);
+    }
+    let role_suffix = caller_role
+        .and_then(|r| r.strip_prefix("master:"))
+        .or_else(|| caller_role.and_then(|r| r.strip_prefix("solo:")))
+        .unwrap_or("");
+    find_master_pane_strict(host.workspace(), role_suffix, caller_role)
+}
+
+/// #288 B: role 検索で master/solo ペインを探す。複数マッチ時は曖昧エラー
+fn find_master_pane_strict(
     ws: &tako_core::Workspace,
     suffix: &str,
     caller_role: Option<&str>,
-) -> Option<(TabId, PaneId)> {
+) -> Result<(TabId, PaneId), DispatchError> {
     let is_solo = caller_role.is_some_and(|r| r.starts_with("solo"));
     let prefix = if is_solo {
         "orchestrator-solo"
     } else {
         "orchestrator-master"
     };
-
     let target_role = if suffix.is_empty() {
         prefix.to_string()
     } else {
         format!("{prefix}:{suffix}")
     };
-
-    // suffix 一致の厳密検索
-    let exact = ws.tabs().iter().find_map(|t| {
-        t.tree().panes().iter().find_map(|p| {
+    let mut exact: Vec<(TabId, PaneId)> = Vec::new();
+    for t in ws.tabs() {
+        for p in t.tree().panes() {
             if p.role().is_some_and(|r| r == target_role) {
-                Some((t.id(), p.id()))
-            } else {
-                None
+                exact.push((t.id(), p.id()));
             }
-        })
-    });
+        }
+    }
+    if exact.len() == 1 {
+        return Ok(exact[0]);
+    }
+    if exact.len() > 1 {
+        let ids: Vec<String> = exact.iter().map(|(_, p)| p.as_u64().to_string()).collect();
+        return Err(DispatchError::Operation(format!(
+            "role '{target_role}' が複数ペインに存在（pane: {}）。--pane で明示指定してください",
+            ids.join(", ")
+        )));
+    }
+    let mut fb: Vec<(TabId, PaneId)> = Vec::new();
+    for t in ws.tabs() {
+        for p in t.tree().panes() {
+            if p.role().is_some_and(|r| r.starts_with(prefix)) {
+                fb.push((t.id(), p.id()));
+            }
+        }
+    }
+    match fb.len() {
+        0 => Err(DispatchError::Operation(
+            "master/solo ペインが見つからない（pane を明示指定するか、TAKO_ORCHESTRATOR_ROLE を確認してください）".into()
+        )),
+        1 => Ok(fb[0]),
+        _ => {
+            let ids: Vec<String> = fb.iter().map(|(_, p)| p.as_u64().to_string()).collect();
+            Err(DispatchError::Operation(format!(
+                "master/solo ペインが複数（pane: {}）。pid / env / stale map では解決できず、role も曖昧。--pane で明示指定してください",
+                ids.join(", ")
+            )))
+        }
+    }
+}
 
-    exact.or_else(|| {
-        // フォールバック: 任意の master/solo
-        ws.tabs().iter().find_map(|t| {
-            t.tree().panes().iter().find_map(|p| {
-                if p.role().is_some_and(|r| r.starts_with(prefix)) {
-                    Some((t.id(), p.id()))
-                } else {
-                    None
-                }
-            })
-        })
-    })
+fn collect_pane_backends(host: &dyn ControlHost) -> Vec<(u64, String)> {
+    let mut result = Vec::new();
+    for tab in host.workspace().tabs() {
+        for pane in tab.tree().panes() {
+            if let Some(session) = host.backend_session(pane.id()) {
+                result.push((pane.id().as_u64(), session));
+            }
+        }
+    }
+    result
+}
+
+/// #288: spawn の分割元ペイン解決（pid 以外のフォールバック）
+fn resolve_spawn_pane_fallback(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    tab: Option<u64>,
+    caller_role: Option<&str>,
+    role_suffix: &Option<String>,
+) -> Result<(TabId, PaneId), DispatchError> {
+    if let Some(resolved) = pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok()) {
+        return Ok(resolved);
+    }
+    if let Some(resolved) = pane
+        .map(PaneId::from_raw)
+        .and_then(|stale| host.resolve_stale_pane(stale))
+        .and_then(|new_id| resolve_pane(host.workspace(), Some(new_id.as_u64())).ok())
+    {
+        return Ok(resolved);
+    }
+    if let Some(raw_tab) = tab {
+        let tid = find_tab(host.workspace(), raw_tab)?;
+        let focused = host.workspace().get_tab(tid).unwrap().tree().focused();
+        return Ok((tid, focused));
+    }
+    let suffix = role_suffix.as_deref().unwrap_or("");
+    find_master_pane_strict(host.workspace(), suffix, caller_role)
 }
 
 /// ペインの session_id をバックエンドセッション → pid 祖先辿りで解決する。
@@ -3247,6 +3329,7 @@ fn dispatch_orchestrator_handoff(
     pane: Option<u64>,
     caller_role: Option<&str>,
     tab: Option<u64>,
+    caller_pid: Option<u32>,
 ) -> Result<Value, DispatchError> {
     use crate::orchestrator;
 
@@ -3270,18 +3353,13 @@ fn dispatch_orchestrator_handoff(
             ))
         })?;
 
-    // 分割元ペインの解決
+    // #288: 分割元ペインの解決
     let (tab_id, split_target) = if let Some(raw_tab) = tab {
         let tid = find_tab(host.workspace(), raw_tab)?;
         let focused = host.workspace().get_tab(tid).unwrap().tree().focused();
         (tid, focused)
-    } else if let Some(resolved) = pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok()) {
-        resolved
     } else {
-        let suffix = role_suffix.as_deref().unwrap_or("");
-        find_master_pane(host.workspace(), suffix, caller_role).ok_or_else(|| {
-            DispatchError::Operation("分割元の master/solo ペインが見つからない".into())
-        })?
+        resolve_caller_pane(host, pane, caller_role, caller_pid)?
     };
 
     // プロファイルの読み込みとエージェント解決
@@ -3383,6 +3461,7 @@ struct SpawnParams<'a> {
     caller_role: Option<&'a str>,
     /// worker のエージェント種別（claude / codex / agy。省略時はプロファイル既定。#120）
     agent: Option<&'a str>,
+    caller_pid: Option<u32>,
 }
 
 fn dispatch_orchestrator_spawn(
@@ -3400,6 +3479,7 @@ fn dispatch_orchestrator_spawn(
         tab,
         caller_role,
         agent,
+        caller_pid,
     } = params;
     if pane.is_none() && tab.is_none() {
         return Err(DispatchError::Operation(
@@ -3434,82 +3514,20 @@ fn dispatch_orchestrator_spawn(
         None => format!("{project}-worker"),
     };
 
-    // #210: 分割元ペインの解決。pane > stale_pane_map > tab > caller_role の suffix > 任意 master
-    let resolved_pane = pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok());
-    let stale_resolved = || -> Option<(TabId, PaneId)> {
-        let stale = PaneId::from_raw(pane?);
-        let new_id = host.resolve_stale_pane(stale)?;
-        resolve_pane(host.workspace(), Some(new_id.as_u64())).ok()
-    };
-    let (tab_id, target) = if let Some(resolved) = resolved_pane {
-        resolved
-    } else if let Some(resolved) = stale_resolved() {
-        resolved
-    } else if let Some(raw_tab) = tab {
-        let tid = find_tab(host.workspace(), raw_tab)?;
-        let focused = host.workspace().get_tab(tid).unwrap().tree().focused();
-        (tid, focused)
-    } else {
-        // master role のペインを検索。pane が指定されていても resolve に失敗した場合
-        // （再起動で PaneId が変わった stale な値）はここに落ちる。
-        // 複数 master 対応（#109）: caller_role（TAKO_ORCHESTRATOR_ROLE）の suffix を
-        // 第一候補にし、pane の role は第二候補。role_suffix があれば pane が stale でも
-        // 正しい master を特定できる
-        let caller_suffix = role_suffix
-            .as_deref()
-            .map(|s| format!(":{s}"))
-            .or_else(|| {
-                resolved_pane.and_then(|(_, pid)| {
-                    host.workspace().tabs().iter().find_map(|t| {
-                        t.tree()
-                            .panes()
-                            .iter()
-                            .find(|pp| pp.id() == pid)
-                            .and_then(|pp| pp.role())
-                            .and_then(|r| r.strip_prefix("orchestrator-master"))
-                            .map(|s| s.to_string())
-                    })
-                })
-            })
-            .unwrap_or_default();
-
-        let find_master = |suffix: &str| -> Option<(TabId, PaneId)> {
-            let target_role = format!("orchestrator-master{suffix}");
-            host.workspace().tabs().iter().find_map(|t| {
-                t.tree().panes().iter().find_map(|p| {
-                    let role = p.role()?;
-                    if role == target_role {
-                        Some((t.id(), p.id()))
-                    } else {
-                        None
-                    }
-                })
-            })
-        };
-
-        let master_pane = if !caller_suffix.is_empty() {
-            find_master(&caller_suffix)
+    // #288: 分割元ペインの解決。pid 祖先辿り → pane → stale → tab → role（複数時エラー）
+    let (tab_id, target) = if let Some(pid) = caller_pid {
+        let pane_backends = collect_pane_backends(host);
+        if let Some(rp) = crate::agents::resolve_pane_by_pid(pid, &pane_backends) {
+            if let Ok(resolved) = resolve_pane(host.workspace(), Some(rp)) {
+                resolved
+            } else {
+                resolve_spawn_pane_fallback(host, pane, tab, caller_role, &role_suffix)?
+            }
         } else {
-            None
+            resolve_spawn_pane_fallback(host, pane, tab, caller_role, &role_suffix)?
         }
-        .or_else(|| {
-            host.workspace().tabs().iter().find_map(|t| {
-                t.tree().panes().iter().find_map(|p| {
-                    let role = p.role()?;
-                    if role.starts_with("orchestrator-master") {
-                        Some((t.id(), p.id()))
-                    } else {
-                        None
-                    }
-                })
-            })
-        });
-
-        master_pane.ok_or_else(|| {
-            DispatchError::InvalidParams(
-                "分割元ペインを特定できない（--pane または --tab を指定するか、tako 内のターミナルから実行する）".into(),
-            )
-        })?
+    } else {
+        resolve_spawn_pane_fallback(host, pane, tab, caller_role, &role_suffix)?
     };
     let new_pane = Pane::new(origin);
     let new_id = new_pane.id();
@@ -4652,6 +4670,7 @@ fn dispatch_task_resume(
             tab,
             caller_role,
             agent: Some(agent_str),
+            caller_pid: None,
         },
     )?;
 
@@ -6445,6 +6464,7 @@ mod tests {
             tab: None,
             caller_role,
             agent: None,
+            caller_pid: None,
         }
     }
 
@@ -7267,6 +7287,7 @@ mod tests {
             Request::OrchestratorSelf {
                 pane: Some(pane),
                 caller_role: Some("master:test".into()),
+                caller_pid: None,
             },
             PaneOrigin::Mcp,
         )
@@ -7297,6 +7318,7 @@ mod tests {
             Request::OrchestratorSelf {
                 pane: None,
                 caller_role: Some("master:".into()),
+                caller_pid: None,
             },
             PaneOrigin::Mcp,
         );
@@ -7328,6 +7350,7 @@ mod tests {
                 pane: Some(pane),
                 caller_role: Some("master:".into()),
                 tab: None,
+                caller_pid: None,
             },
             PaneOrigin::Mcp,
         );
@@ -7371,16 +7394,16 @@ mod tests {
         )
         .unwrap();
 
-        let found = find_master_pane(host.workspace(), "beta", Some("master:beta"));
+        let found = find_master_pane_strict(host.workspace(), "beta", Some("master:beta"));
         assert_eq!(
-            found.map(|(_, p)| p.as_u64()),
+            found.ok().map(|(_, p)| p.as_u64()),
             Some(tab2_pane),
             "suffix beta のペインが返る"
         );
 
-        let found_alpha = find_master_pane(host.workspace(), "alpha", Some("master:alpha"));
+        let found_alpha = find_master_pane_strict(host.workspace(), "alpha", Some("master:alpha"));
         assert_eq!(
-            found_alpha.map(|(_, p)| p.as_u64()),
+            found_alpha.ok().map(|(_, p)| p.as_u64()),
             Some(tab1_pane),
             "suffix alpha のペインが返る"
         );
@@ -7430,6 +7453,7 @@ mod tests {
             Request::OrchestratorSelf {
                 pane: Some(master_a),
                 caller_role: Some("master:exam".into()),
+                caller_pid: None,
             },
             PaneOrigin::Mcp,
         )
@@ -7442,6 +7466,7 @@ mod tests {
             Request::OrchestratorSelf {
                 pane: Some(master_b),
                 caller_role: Some("master:exam".into()),
+                caller_pid: None,
             },
             PaneOrigin::Mcp,
         )
@@ -7475,6 +7500,7 @@ mod tests {
             Request::OrchestratorSelf {
                 pane: Some(stale_id),
                 caller_role: Some("master:exam".into()),
+                caller_pid: None,
             },
             PaneOrigin::Mcp,
         )
@@ -7516,6 +7542,7 @@ mod tests {
                 tab: None,
                 caller_role: Some("master:"),
                 agent: None,
+                caller_pid: None,
             };
             let result = dispatch_orchestrator_spawn(&mut host, PaneOrigin::Mcp, params);
             assert!(
@@ -7716,5 +7743,208 @@ mod tests {
         let _ = std::fs::remove_file(&script);
         assert_eq!(result["completed"], true);
         assert_eq!(result["output"], "dispatch-setup-ok");
+    }
+
+    /// 受け入れ条件 1: stale env + 同一 role 3 ペイン + 実ペイン role=null で
+    /// pane env が現存する場合に正しい pane を返す（pid 祖先辿りは tmux 不在で
+    /// フォールバック。env の現存 pane が第 2 解決手段として正しく機能することを検証）。
+    /// Issue #288 の実事故再現: pane 400 が role=null なのに role 検索で 443 を誤返答した構図
+    #[test]
+    fn orchestrator_self_stale_env_同一role3体_roleなし実ペインで正しいpaneを返す() {
+        let mut host = MockHost::new();
+
+        // master A: tab 1（実ペイン = role なし。実事故の pane 400 相当）
+        let actual_pane = host.root_pane();
+
+        // master B: tab 2（role あり。実事故の pane 443 相当）
+        let tab2 = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let master_b = tab2["pane"].as_u64().unwrap();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(master_b),
+                title: None,
+                role: Some("orchestrator-master:fable".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        // master C: tab 3（role あり。同一 role の 2 体目）
+        let tab3 = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let master_c = tab3["pane"].as_u64().unwrap();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(master_c),
+                title: None,
+                role: Some("orchestrator-master:fable".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        // master D: tab 4（role あり。同一 role の 3 体目）
+        let tab4 = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let master_d = tab4["pane"].as_u64().unwrap();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(master_d),
+                title: None,
+                role: Some("orchestrator-master:fable".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        // 状態確認: actual_pane は role=null、master_b/c/d は同一 role
+        assert!(
+            host.ws
+                .tabs()
+                .iter()
+                .flat_map(|t| t.tree().panes())
+                .find(|p| p.id().as_u64() == actual_pane)
+                .unwrap()
+                .role()
+                .is_none(),
+            "actual_pane は role=null であること"
+        );
+
+        // ケース 1: pane env が現存 ID（actual_pane）を持つ場合 → pid 解決失敗でも
+        // pane env のフォールバックで actual_pane を返す（role 検索に落ちない）
+        let result = dispatch(
+            &mut host,
+            Request::OrchestratorSelf {
+                pane: Some(actual_pane),
+                caller_role: Some("master:fable".into()),
+                caller_pid: Some(99999), // tmux 不在で pid 解決は失敗する
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(
+            result["pane_id"].as_u64(),
+            Some(actual_pane),
+            "pane env が現存する場合は role 検索に落ちず正しい pane を返す"
+        );
+
+        // ケース 2: pane env が stale（現存しない ID 305）→ stale map もなし →
+        // role 検索に落ちるが、同一 role が 3 体あるため曖昧エラーになる
+        // （旧実装では先頭の master_b を黙って返していた = 実事故の再現）
+        let result_stale = dispatch(
+            &mut host,
+            Request::OrchestratorSelf {
+                pane: Some(305), // 現存しない stale ID
+                caller_role: Some("master:fable".into()),
+                caller_pid: Some(99999), // pid 解決も失敗
+            },
+            PaneOrigin::Mcp,
+        );
+        assert!(
+            result_stale.is_err(),
+            "stale env + pid 解決失敗 + 同一 role 3 体 → 曖昧エラーになること（旧実装では master_b を誤返答）"
+        );
+        let err_msg = result_stale.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("複数ペインに存在"),
+            "エラーメッセージに「複数ペインに存在」を含むこと: {err_msg}"
+        );
+    }
+
+    /// 受け入れ条件 2: 曖昧 role のみで確定不能な場合にエラーとなる
+    /// find_master_pane_strict が複数マッチ時に先頭を返さず曖昧エラーを返すことの検証
+    #[test]
+    fn find_master_pane_strict_複数マッチで曖昧エラー() {
+        let mut host = MockHost::new();
+
+        // 同一 role の master を 2 体作成
+        let pane_a = host.root_pane();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(pane_a),
+                title: None,
+                role: Some("orchestrator-master:dup".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        let tab2 = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let pane_b = tab2["pane"].as_u64().unwrap();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(pane_b),
+                title: None,
+                role: Some("orchestrator-master:dup".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        // suffix 一致（"dup"）で 2 体マッチ → 曖昧エラー
+        let result = find_master_pane_strict(host.workspace(), "dup", Some("master:dup"));
+        assert!(result.is_err(), "複数マッチで Err を返すこと");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains(&pane_a.to_string()) && err_msg.contains(&pane_b.to_string()),
+            "エラーメッセージに両方のペイン ID を含むこと: {err_msg}"
+        );
+
+        // suffix なし（prefix フォールバック）でも 2 体マッチ → 曖昧エラー
+        let result_fb = find_master_pane_strict(host.workspace(), "", None);
+        assert!(
+            result_fb.is_err(),
+            "prefix フォールバックでも複数マッチは Err"
+        );
+
+        // 1 体だけなら成功
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(pane_b),
+                title: None,
+                role: Some("worker:test".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let result_single = find_master_pane_strict(host.workspace(), "dup", Some("master:dup"));
+        assert!(result_single.is_ok(), "1 体なら成功");
+        assert_eq!(result_single.unwrap().1.as_u64(), pane_a);
     }
 }

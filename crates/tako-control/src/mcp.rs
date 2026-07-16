@@ -2607,11 +2607,13 @@ fn build_request(
         "tako_orchestrator_self" => Request::OrchestratorSelf {
             pane: u64_arg(args, "pane")?.or(caller),
             caller_role: caller_role.map(str::to_string),
+            caller_pid: u64_arg(args, "caller_pid")?.map(|v| v as u32),
         },
         "tako_orchestrator_handoff" => Request::OrchestratorHandoff {
             pane: u64_arg(args, "pane")?.or(caller),
             caller_role: caller_role.map(str::to_string),
             tab: u64_arg(args, "tab")?,
+            caller_pid: u64_arg(args, "caller_pid")?.map(|v| v as u32),
         },
         "tako_orchestrator_spawn" => {
             let pane = u64_arg(args, "pane")?;
@@ -2637,6 +2639,7 @@ fn build_request(
                 tab: resolved_tab,
                 caller_role: caller_role.map(str::to_string),
                 agent: str_arg(args, "agent")?,
+                caller_pid: u64_arg(args, "caller_pid")?.map(|v| v as u32),
             }
         }
         "tako_orchestrator_worker_status" => Request::OrchestratorWorkerStatus {

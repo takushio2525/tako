@@ -102,6 +102,53 @@ fn parse_parent_map(text: &str) -> HashMap<u32, u32> {
     map
 }
 
+/// caller_pid の祖先チェーンを辿り、バックエンドセッションの pane_pid に到達時にセッション名を返す（#288）
+fn find_ancestor_backend(
+    caller_pid: u32,
+    parents: &HashMap<u32, u32>,
+    backend_pids: &[(String, u32)],
+) -> Option<String> {
+    let pid_to_session: HashMap<u32, &str> = backend_pids
+        .iter()
+        .map(|(name, pid)| (*pid, name.as_str()))
+        .collect();
+    let mut current = caller_pid;
+    for _ in 0..MAX_ANCESTOR_HOPS {
+        if let Some(session) = pid_to_session.get(&current) {
+            return Some(session.to_string());
+        }
+        match parents.get(&current) {
+            Some(&ppid) if ppid != 0 && ppid != current => current = ppid,
+            _ => break,
+        }
+    }
+    None
+}
+
+/// caller_pid のプロセス祖先を辿り、tako バックエンドの pane_pid に一致するペインを返す（#288）
+pub fn resolve_pane_by_pid(caller_pid: u32, pane_backends: &[(u64, String)]) -> Option<u64> {
+    let socket = tako_core::tmux_backend::socket_name();
+    let all_tmux_panes = tmux_pane_pids(Some(&socket));
+    if all_tmux_panes.is_empty() {
+        return None;
+    }
+    let parents = process_parent_map();
+    for (tako_pane_id, backend_session) in pane_backends {
+        let backend_pids: Vec<(String, u32)> = all_tmux_panes
+            .iter()
+            .filter(|(id, _)| id.starts_with(&format!("{backend_session}:")))
+            .cloned()
+            .collect();
+        if backend_pids.is_empty() {
+            continue;
+        }
+        if find_ancestor_backend(caller_pid, &parents, &backend_pids).is_some() {
+            return Some(*tako_pane_id);
+        }
+    }
+    None
+}
+
 /// tmux バックエンドの全ペイン（ID と pane_pid）を列挙する。
 /// ID は remote API のペイン ID 形式（`session:window.pane`）と一致させる
 pub fn tmux_pane_pids(socket: Option<&str>) -> Vec<(String, u32)> {
@@ -279,6 +326,23 @@ mod tests {
         assert_eq!(agents[0]["pane"], "sess:0.0");
         assert!(agents[1]["pane"].is_null());
         assert!(agents[2]["pane"].is_null());
+    }
+
+    #[test]
+    fn find_ancestor_backendはpane_pidの祖先を辿る() {
+        let parents: HashMap<u32, u32> = [(300, 200), (200, 100), (100, 1)].into();
+        let backend_pids = vec![("tako-s1".to_string(), 100u32)];
+        assert_eq!(
+            find_ancestor_backend(300, &parents, &backend_pids),
+            Some("tako-s1".to_string())
+        );
+    }
+
+    #[test]
+    fn find_ancestor_backendは無関係なpidでNone() {
+        let parents: HashMap<u32, u32> = [(999, 500), (500, 1)].into();
+        let backend_pids = vec![("tako-s1".to_string(), 100u32)];
+        assert_eq!(find_ancestor_backend(999, &parents, &backend_pids), None);
     }
 
     #[test]
