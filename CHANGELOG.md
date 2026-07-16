@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed / 修正
 
+- master がタスク受付時に登録プロジェクトの照合を最優先で行うよう順序制約を追加（プロジェクト名の誤認防止）(#263)
+  Added project resolution gate (Step 0) to master task intake: registered projects are matched before general exploration or browser access (#263)
 - nightly-release が launchd 環境（npm 不在の PATH）で GitHub Release 未作成のまま停止する問題を修正 (#297)
   Fixed nightly-release stopping without creating GitHub Release when npm is not in PATH (launchd environment) (#297)
 

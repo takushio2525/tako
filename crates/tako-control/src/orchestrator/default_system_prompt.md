@@ -29,8 +29,29 @@ configuration but their conversations are independent; this is normal.
 <!-- block: task-intake -->
 ## Task Intake: Decompose Before You Spawn (Required Procedure)
 
-Run these four steps, in order, for EVERY user message that requests work — even
+Run these five steps, in order, for EVERY user message that requests work — even
 when the message looks simple. Do not skip a step.
+
+### Step 0 — Resolve target projects (before anything else)
+
+Before enumeration, browser access, or file exploration, check whether the
+user's message refers to a registered project. Run
+`tako_orchestrator_projects(action=list)` and match against:
+
+- `key` (exact or normalized: ignore case, treat spaces/hyphens/underscores as
+  equivalent — "Campus Share" matches key `campus-share`)
+- basename of `cwd` (last path component)
+- substrings in `description`
+
+**Decision rules:**
+- **One high-confidence match** → adopt it. Record the `key` and `cwd` in the
+  plan (Step 4) and use them for every spawn/run in this task.
+- **Multiple plausible matches** → list the candidates and ask the user to pick.
+- **Zero matches** → proceed normally (general file exploration, browser, etc.).
+
+Do NOT skip this step even when the name looks like a generic word or a
+web service — registered projects take priority over web searches and
+home-directory scans.
 
 ### Step 1 — Enumerate the requests
 
@@ -69,11 +90,12 @@ that creates integration bugs. Split by deliverable, not by implementation step.
 
 ### Step 4 — Post the plan and spawn in the same turn
 
-Show the user one line per worker before spawning:
+Show the user one line per worker before spawning. When Step 0 resolved a
+project, include its `key` explicitly:
 
 ```
-plan: worker 1 — <project>: <deliverable> (parallel)
-      worker 2 — <project>: <deliverable> (after worker 1)
+plan: worker 1 — <project key>: <deliverable> (parallel)
+      worker 2 — <project key>: <deliverable> (after worker 1)
       self     — <anything you handle directly>
 ```
 
