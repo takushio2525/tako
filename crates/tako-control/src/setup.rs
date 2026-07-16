@@ -149,6 +149,10 @@ pub struct SetupAnswers {
     pub projects: Option<BTreeMap<String, crate::orchestrator::ProjectEntry>>,
     pub orchestrator: Option<SetupOrchestratorAnswers>,
     pub sleep_guard: Option<SetupSleepGuardAnswers>,
+    /// setup 完了後に起動するエージェント CLI（Issue #295）。
+    /// "claude" / "codex" / "agy" = その場で対話起動、"none" = 起動しない。
+    /// 省略時は TTY があれば対話で選択、なければ "none"
+    pub launch_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -209,6 +213,13 @@ impl SetupAnswers {
                 if project.cwd.trim().is_empty() {
                     return Err(format!("projects.{key}.cwd は空にできません"));
                 }
+            }
+        }
+        if let Some(agent) = self.launch_agent.as_deref() {
+            if !matches!(agent, "claude" | "codex" | "agy" | "none") {
+                return Err(format!(
+                    "launch_agent は claude / codex / agy / none のいずれかです: {agent}"
+                ));
             }
         }
         if let Some(sleep) = &self.sleep_guard {
@@ -595,6 +606,10 @@ mod tests {
         assert!(SetupAnswers::from_json(r#"{"extra":true}"#).is_err());
         assert!(SetupAnswers::from_json(r#"{"instruction_content":"  "}"#).is_err());
         assert!(SetupAnswers::from_json(r#"{"projects":{"":{"cwd":"x"}}}"#).is_err());
+        // launch_agent（Issue #295）
+        assert!(SetupAnswers::from_json(r#"{"launch_agent":"claude"}"#).is_ok());
+        assert!(SetupAnswers::from_json(r#"{"launch_agent":"none"}"#).is_ok());
+        assert!(SetupAnswers::from_json(r#"{"launch_agent":"unknown"}"#).is_err());
     }
 
     #[test]

@@ -1368,6 +1368,61 @@ fn print_setup_summary(plan: &SetupPlan) {
     }
 }
 
+/// 認証済みエージェントを対話で選んで返す。
+/// エージェント 1 つなら Y/n、複数なら番号選択。選ばなければ None。
+fn prompt_launch_agent(agents: &[DetectedAgent]) -> Option<DetectedAgent> {
+    let launchable: Vec<_> = agents.iter().filter(|a| a.authenticated).collect();
+    if launchable.is_empty() {
+        return None;
+    }
+    eprintln!();
+    if launchable.len() == 1 {
+        let agent = launchable[0];
+        eprint!(
+            "続けて {} で対話を開始しますか？ [Y/n]: ",
+            agent.kind.as_str()
+        );
+        let mut input = String::new();
+        let _ = std::io::stdin().read_line(&mut input);
+        let trimmed = input.trim().to_ascii_lowercase();
+        if trimmed.is_empty() || trimmed == "y" || trimmed == "yes" {
+            return Some(agent.clone());
+        }
+        return None;
+    }
+    eprintln!("続けてエージェントで対話を開始しますか？");
+    for (i, agent) in launchable.iter().enumerate() {
+        eprintln!("  {}) {}", i + 1, agent.kind.as_str());
+    }
+    eprintln!("  Enter) 起動しない");
+    eprint!("選択 [Enter]: ");
+    let mut input = String::new();
+    let _ = std::io::stdin().read_line(&mut input);
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| launchable.get(n.wrapping_sub(1)))
+        .map(|a| (*a).clone())
+}
+
+/// エージェント CLI をユーザーのホームディレクトリで対話起動する。
+fn launch_agent_interactive(agent: &DetectedAgent) -> Result<std::process::ExitStatus, String> {
+    let cwd = home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let mut command = std::process::Command::new(&agent.path);
+    command.current_dir(&cwd);
+    command
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    command
+        .status()
+        .map_err(|e| format!("{} の起動に失敗: {e}", agent.kind.as_str()))
+}
+
 fn apply_instruction(agent: SetupAgent, provided: Option<&str>) -> Result<(), String> {
     let path = instruction_path(agent).ok_or("グローバル指示ファイルのパスを取得できません")?;
     if let Some(content) = provided {
@@ -1990,6 +2045,40 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     sync_pending_changes_file(&dir, &[], revision)?;
     print_setup_summary(&plan);
     eprintln!("セットアップが完了しました。");
+
+    // --- 起動ランチャー（Issue #295）---
+    // --answers で launch_agent を明示指定した場合はそれに従う。
+    // --yes のみ / --answers で launch_agent 省略 / 非 TTY → スキップ
+    let launch_result = if let Some(specified) = answers.launch_agent.as_deref() {
+        if specified == "none" {
+            None
+        } else {
+            SetupAgent::parse(specified).and_then(|kind| {
+                agents
+                    .iter()
+                    .find(|a| a.kind == kind && a.authenticated)
+                    .cloned()
+            })
+        }
+    } else if assume_yes || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        None
+    } else {
+        prompt_launch_agent(&agents)
+    };
+    if let Some(agent) = launch_result {
+        eprintln!();
+        eprintln!("{} を起動します…", agent.kind.as_str());
+        eprintln!("─────────────────────────────────────────────────────");
+        let status = launch_agent_interactive(&agent)?;
+        if !status.success() {
+            eprintln!(
+                "{} が終了しました（exit code: {}）",
+                agent.kind.as_str(),
+                status.code().unwrap_or(-1)
+            );
+        }
+    }
+
     Ok(())
 }
 
