@@ -45,8 +45,8 @@ use gpui::{
     EntityInputHandler, ExternalPaths, FocusHandle, Font, FontStyle, FontWeight, HighlightStyle,
     Hsla, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     Point, Rgba, ScrollDelta, ScrollWheelEvent, SharedString, Size, StrikethroughStyle, StyledText,
-    TextLayout, TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window, WindowBounds,
-    WindowOptions,
+    Subscription, TextLayout, TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window,
+    WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use tako_control::{
@@ -663,6 +663,8 @@ struct TakoApp {
     ime: Option<ImeComposition>,
     /// 直近 render のフォーカスペイン（IM 座標キャッシュ更新の変化検知用。#332）
     last_ime_focus: Option<PaneId>,
+    /// focus 喪失（blur）からの自動復元の購読（drop で解除されるため保持。#332）
+    _focus_lost_sub: Option<Subscription>,
     /// ドラッグ中のペイン境界（None = ドラッグしていない）
     dragging_border: Option<DragBorder>,
     /// スクロールバーをドラッグ中のペイン
@@ -1723,6 +1725,7 @@ impl TakoApp {
             active_pdf_rasters: std::collections::HashSet::new(),
             ime: None,
             last_ime_focus: None,
+            _focus_lost_sub: None,
             dragging_border: None,
             dragging_scrollbar: None,
             hovered_scrollbar: None,
@@ -12240,13 +12243,11 @@ impl Render for TakoApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Issue #168: フレーム構築（element tree 生成）のメインスレッド専有を計測
         let _span = tako_control::diag::perf_span("render");
-        // IME 経路の自己修復（#332）: 外部要因（a11y の Blur アクション等）で GPUI の
-        // focus が失われると Window::handle_input が input handler を登録しなくなり、
-        // 日本語 IM の printable キーが IME を素通りして ASCII のまま terminal へ入り
-        // 続ける（変換候補ウィンドウが二度と出ない。英数入力は on_key_down の root
-        // フォールバックで動き続けるため IME だけ壊れたように見える）。tako は単一
-        // focus_handle 設計で「フォーカスが無い」正当な状態は存在しないため、
-        // None を検知したら即復元する
+        // IME 経路の自己修復の保険（#332）: 本線は wire_focus_self_heal の
+        // on_focus_lost（draw 末尾で発火し view render の reuse に依存しない）。
+        // ここは購読が何らかの理由で効かなかった場合に、次の notify 契機で
+        // 復元する多層防御。tako は単一 focus_handle 設計で「フォーカスが無い」
+        // 正当な状態は存在しない
         if window.focused(cx).is_none() {
             window.focus(&self.focus_handle.clone(), cx);
             window.invalidate_character_coordinates();
@@ -12633,7 +12634,16 @@ impl Render for TakoApp {
             .on_action(cx.listener(|this, _: &OpenRecent, _, cx| {
                 this.open_recent_palette(cx);
             }))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                // blur（外部 a11y 等）からの自動復元（#332）: focus が無いと
+                // input handler が未登録になり日本語 IM の printable キーが IME を
+                // 素通りする。キーイベント自体は blur 中も root dispatch フォール
+                // バックで届く（#103 で実証）ため、打鍵を検知したら focus を戻す。
+                // draw 停止中（不可視ウィンドウ）でも効く復元経路
+                if !this.focus_handle.is_focused(window) {
+                    window.focus(&this.focus_handle.clone(), cx);
+                    window.invalidate_character_coordinates();
+                }
                 this.handle_key(&event.keystroke, cx);
             }))
             .on_modifiers_changed(cx.listener(
@@ -13044,6 +13054,23 @@ fn open_restored_window(cx: &mut App) {
     open_window_with_bounds(bounds, cx);
 }
 
+/// ウィンドウ生成直後の focus 配線（#332）: 初期 focus + blur（外部 a11y の Blur
+/// アクション等）からの自動復元。focus が無いと Window::handle_input が input handler
+/// を登録せず、日本語 IM の printable キーが IME を素通りして ASCII 直書きになる
+/// （変換候補ウィンドウが再起動まで出ない）。GPUI の on_focus_lost は「ウィンドウ内の
+/// どこにも focus が無くなった」draw 末尾に発火するため、view render が reuse で
+/// スキップされるフレームでも確実に呼ばれる
+fn wire_focus_self_heal(view: &gpui::Entity<TakoApp>, window: &mut Window, cx: &mut App) {
+    window.focus(&view.read(cx).focus_handle.clone(), cx);
+    view.update(cx, |app, cx| {
+        app._focus_lost_sub = Some(cx.on_focus_lost(window, |app, window, cx| {
+            window.focus(&app.focus_handle.clone(), cx);
+            window.invalidate_character_coordinates();
+            cx.notify();
+        }));
+    });
+}
+
 fn open_window_with_bounds(window_bounds: WindowBounds, cx: &mut App) {
     let _ = cx
         .open_window(
@@ -13054,7 +13081,7 @@ fn open_window_with_bounds(window_bounds: WindowBounds, cx: &mut App) {
             },
             |window, cx| {
                 let view = cx.new(TakoApp::new);
-                window.focus(&view.read(cx).focus_handle.clone(), cx);
+                wire_focus_self_heal(&view, window, cx);
                 // 赤ボタン close 時にレイアウトを保存する（#312。quit ではなく
                 // ウインドウ単体の close なので on_app_quit は走らない）
                 let entity = view.clone();
@@ -13220,7 +13247,7 @@ fn main() {
                 },
                 |window, cx| {
                     let view = cx.new(TakoApp::new);
-                    window.focus(&view.read(cx).focus_handle.clone(), cx);
+                    wire_focus_self_heal(&view, window, cx);
                     // 赤ボタン close 時にレイアウトを保存（#312）
                     let entity = view.clone();
                     window.on_window_should_close(cx, move |_window, cx| {
@@ -19934,17 +19961,28 @@ mod self_test {
             }
 
             // 76. IME 経路の自己修復（#332）: 外部要因（a11y の Blur アクション等）で
-            // window.blur() が起きても、次の render で focus が TakoApp へ復元される。
-            // 復元されないと Window::handle_input が input handler を登録しなくなり、
-            // 日本語 IM の printable キーが IME を素通りして ASCII のまま terminal へ
-            // 入り続ける（変換候補ウィンドウが二度と出ない。修正前はこの check が
-            // FAILED = blur が恒久化していた）
+            // window.blur() が起きても、次のキー打鍵で focus が TakoApp へ復元される
+            // （on_key_down 冒頭の復元。キーは blur 中も root dispatch フォール
+            // バックで届く = #103 実証）。復元されないと Window::handle_input が
+            // input handler を登録しなくなり、日本語 IM の printable キーが IME を
+            // 素通りして ASCII のまま terminal へ入り続ける（候補ウィンドウが再起動
+            // まで出ない）。可視ウィンドウでは on_focus_lost（draw 末尾）が打鍵前に
+            // 復元するが、このセルフテスト環境は draw が止まり得るため打鍵経路で検証
+            // する。修正前はこの check が FAILED = blur が恒久化していた
             let _ = any.update(cx, |_, window, _| window.blur());
-            wait(cx, 500).await;
+            wait(cx, 300).await;
+            let blurred = window
+                .update(cx, |app, window, _| !app.focus_handle.is_focused(window))
+                .unwrap_or(false);
+            press(any, cx, "escape");
+            wait(cx, 300).await;
             let refocused = window
                 .update(cx, |app, window, _| app.focus_handle.is_focused(window))
                 .unwrap_or(false);
-            check(refocused, "IME 経路: blur 後の focus 自己修復 (#332)");
+            check(
+                blurred && refocused,
+                "IME 経路: blur 後の focus 自己修復 (#332)",
+            );
 
             // 76b. 変換中ペインの close で IME 状態が畳まれる（#332）。
             // 畳まれないと ime_target / 確定書き込みが死んだペインへ向き続け、
