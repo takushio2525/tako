@@ -818,3 +818,13 @@
 - 根因 = git タブが `active_tab_cwd()`（フォーカスペインの cwd のみ）を参照。ファイルツリーは全ペイン cwd + pinned フォルダを集約するが git タブはこのソースを見ていなかった。`git_cwd_for_tab()` を新設しフォールバック検索に変更
 - 関連コミット: PR #331 squash merge（`2606d03`）。worktree 掃除・Issue 証拠コメント済み
 - 次: `build-app.sh --install` → ユーザー実機確認 → #313 クローズ
+
+## 2026-07-17（#319: worker の permission ダイアログ検知 + 構造化応答 API）
+- `detect_permission_dialog()` で画面から permission ダイアログを構造化検知（コマンド・選択肢・ハイライト）。`worker_status` に `permission_dialog` フィールド、watch に `WORKER_PERMISSION` イベント、`OrchestratorRespond` + CLI `respond` + MCP `tako_orchestrator_respond`（95 ツール）を追加。master prompt に安全/危険コマンドの承認規範を追記
+- 関連コミット: `f8f4dc0`（PR #344）。build / fmt / clippy / test 全緑（484 + 278 passed）
+- 次: 隔離セルフテスト + 実 claude ダイアログ実測 → squash merge → #319 クローズ
+
+## 2026-07-17（#333: エラーレポートの自動送信基盤 — テレメトリ）
+- Cloudflare Worker + Rust telemetry + panic ハンドラ + CLI/MCP 1:1（95 ツール）。既定 OFF（opt-in）。Worker デプロイ + 通し実測（人工レポート到達確認）完了
+- 関連コミット: PR #345 squash merge（`a19dd54`）。Worker テスト 11/11 + Rust テスト 12/12 + 品質ゲート全緑
+- 次: `build-app.sh --install` で反映 → #333 クローズは master 判断
