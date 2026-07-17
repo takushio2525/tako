@@ -8780,6 +8780,9 @@ impl TakoApp {
     fn webview_close_button(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
         if let Some(idx) = self.webviews.iter().position(|e| e.pane == Some(pane_id)) {
             self.webviews.remove(idx);
+            if self.webviews.is_empty() {
+                webview::set_has_webview(false);
+            }
         }
         self.remove_pane(pane_id, cx);
     }
@@ -8811,6 +8814,7 @@ impl TakoApp {
         let entry = webview::WebViewEntry::build(handle, id, url)?;
         self.webview_next_id += 1;
         self.webviews.push(entry);
+        webview::set_has_webview(true);
         Ok(id)
     }
 
@@ -11431,6 +11435,9 @@ impl WebViewHost for TakoApp {
     fn web_destroy(&mut self, id: u64) -> Option<PaneId> {
         let idx = self.webviews.iter().position(|e| e.id.as_u64() == id)?;
         let entry = self.webviews.remove(idx);
+        if self.webviews.is_empty() {
+            webview::set_has_webview(false);
+        }
         entry.pane
     }
 
@@ -12281,10 +12288,12 @@ impl Render for TakoApp {
             .collect();
         let _ = cell;
 
-        // Web ビューの可視性同期: 今フレームで描画されなかったもの（非アクティブタブ・
-        // dock 退避中）と、D&D 中の全 Web ビューを隠す（ネイティブビューは GPUI の
-        // ドロップターゲット描画より上に来るため、ドラッグ中は GPUI 描画を優先する）
-        let hide_webviews = self.drag_kind.is_some() && cx.has_active_drag();
+        // Web ビューの可視性同期: ネイティブビューは GPUI の GPU 合成レイヤの上に
+        // 来るため、GPUI のオーバーレイ UI（コマンドパレット・close 確認等）と重なる
+        // 場面では全 Web ビューを隠す。D&D 中のドロップターゲット描画も同様（#155）
+        let hide_webviews = (self.drag_kind.is_some() && cx.has_active_drag())
+            || self.command_palette.is_some()
+            || self.pending_close_confirm.is_some();
         self.sync_webview_visibility(hide_webviews);
 
         // D&D 中のみ、各ペインにドロップ先オーバーレイを重ねる（FR-2.16.10 / FR-3.11）。
@@ -13105,6 +13114,7 @@ fn main() {
     app.run(|cx: &mut App| {
         cx.bind_keys(key_bindings());
         cx.set_menus(app_menus());
+        webview::install_key_monitor();
         cx.on_action(|_: &NewWindow, cx| {
             open_new_window(cx);
         });
