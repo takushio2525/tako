@@ -56,6 +56,9 @@ pub enum WatchOutcome {
     /// worker が質問/確認ダイアログ待ちで停止した（#267）。
     /// Idle と同じく入力待ちだが、master 側の対応が異なる
     Question { ctx_percent: Option<u64> },
+    /// worker が permission ダイアログ（ツール実行の承認要求）で停止した（#319）。
+    /// master は `tako orchestrator respond` で応答する
+    PermissionWaiting { permission_dialog: Value },
     /// worker が異常（API エラー・usage limit 等）で停止した（#157）。
     /// `detail` は検知パターンにマッチした画面上の行
     Error {
@@ -215,8 +218,20 @@ pub fn wait_for_worker(
                         }
                     }
                     // #267: "waiting" は permission ダイアログ等の待機状態。
-                    // idle_streak を加算しない（IDLE として発火させない）
-                    "busy" | "waiting" => {
+                    // idle_streak を加算しない（IDLE として発火させない）。
+                    // #319: permission_dialog が応答に含まれていれば即発火する
+                    // （ダイアログは安定状態で一時的に現れて消えることはない）
+                    "waiting" => {
+                        gone_streak = 0;
+                        idle_streak = 0;
+                        stalled_streak = 0;
+                        if val.get("permission_dialog").is_some_and(|v| !v.is_null()) {
+                            return WatchOutcome::PermissionWaiting {
+                                permission_dialog: val["permission_dialog"].clone(),
+                            };
+                        }
+                    }
+                    "busy" => {
                         gone_streak = 0;
                         idle_streak = 0;
                         stalled_streak = 0;
@@ -362,6 +377,7 @@ pub fn run_worker(
         WatchOutcome::Idle { .. } | WatchOutcome::Question { .. } => "completed",
         WatchOutcome::Error { .. } => "worker_error",
         WatchOutcome::Stalled { .. } => "worker_stalled",
+        WatchOutcome::PermissionWaiting { .. } => "permission_waiting",
         WatchOutcome::Gone => "error",
         WatchOutcome::Timeout => "timeout",
     };
@@ -378,13 +394,14 @@ pub fn run_worker(
     .unwrap_or_default();
 
     // --- 4. 自動 close（run の完了後なので force: true）。
-    // エラー / stalled / question 時は close しない: 復帰・応答の余地を残す ---
+    // エラー / stalled / question / permission 時は close しない ---
     let closed = if opts.auto_close
         && !matches!(
             outcome,
             WatchOutcome::Error { .. }
                 | WatchOutcome::Stalled { .. }
                 | WatchOutcome::Question { .. }
+                | WatchOutcome::PermissionWaiting { .. }
         ) {
         exec(Request::Close {
             pane: Some(pane_id),
@@ -418,6 +435,12 @@ pub fn run_worker(
     }
     if matches!(outcome, WatchOutcome::Question { .. }) {
         result["question"] = json!(true);
+    }
+    if let WatchOutcome::PermissionWaiting {
+        ref permission_dialog,
+    } = outcome
+    {
+        result["permission_dialog"] = permission_dialog.clone();
     }
 
     // Issue #242: usage_limit / crash / gone でチェックポイントを Suspended に遷移させる
@@ -640,6 +663,7 @@ pub fn run_status(run_id: &str) -> Result<Value, String> {
             WatchOutcome::Idle { .. } | WatchOutcome::Question { .. } => "completed",
             WatchOutcome::Error { .. } => "worker_error",
             WatchOutcome::Stalled { .. } => "worker_stalled",
+            WatchOutcome::PermissionWaiting { .. } => "permission_waiting",
             WatchOutcome::Gone => "error",
             WatchOutcome::Timeout => "timeout",
         };
@@ -711,6 +735,7 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
         WatchOutcome::Idle { .. } | WatchOutcome::Question { .. } => "completed",
         WatchOutcome::Error { .. } => "worker_error",
         WatchOutcome::Stalled { .. } => "worker_stalled",
+        WatchOutcome::PermissionWaiting { .. } => "permission_waiting",
         WatchOutcome::Gone => "error",
         WatchOutcome::Timeout => "timeout",
     };
@@ -725,13 +750,14 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
     .and_then(|v| v["text"].as_str().map(String::from))
     .unwrap_or_default();
 
-    // auto_close（エラー / stalled / question 時は close しない）
+    // auto_close（エラー / stalled / question / permission 時は close しない）
     let closed = if auto_close
         && !matches!(
             c.outcome,
             WatchOutcome::Error { .. }
                 | WatchOutcome::Stalled { .. }
                 | WatchOutcome::Question { .. }
+                | WatchOutcome::PermissionWaiting { .. }
         ) {
         exec(Request::Close {
             pane: Some(pane_id),
@@ -774,6 +800,12 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
     if matches!(c.outcome, WatchOutcome::Question { .. }) {
         result["question"] = json!(true);
     }
+    if let WatchOutcome::PermissionWaiting {
+        ref permission_dialog,
+    } = c.outcome
+    {
+        result["permission_dialog"] = permission_dialog.clone();
+    }
     Ok(result)
 }
 
@@ -790,6 +822,7 @@ pub fn run_list() -> Value {
                     WatchOutcome::Idle { .. } | WatchOutcome::Question { .. } => "completed",
                     WatchOutcome::Error { .. } => "worker_error",
                     WatchOutcome::Stalled { .. } => "worker_stalled",
+                    WatchOutcome::PermissionWaiting { .. } => "permission_waiting",
                     WatchOutcome::Gone => "error",
                     WatchOutcome::Timeout => "timeout",
                 };
@@ -945,6 +978,8 @@ pub fn detect_worker_error(output: &str) -> Option<(WorkerErrorKind, String)> {
 pub enum WorkerEventKind {
     /// worker が質問している（idle + 画面末尾に質問パターン）
     Question,
+    /// worker が permission ダイアログで停止している（#319）
+    PermissionDialog,
     /// claude の自動モデル切替が発生した
     ModelSwitched { from: String, to: String },
     /// ctx 使用率が閾値（60%）を超えた
@@ -961,6 +996,7 @@ impl WorkerEvent {
     pub fn to_json(&self) -> Value {
         match &self.kind {
             WorkerEventKind::Question => json!({ "kind": "question" }),
+            WorkerEventKind::PermissionDialog => json!({ "kind": "permission_dialog" }),
             WorkerEventKind::ModelSwitched { from, to } => {
                 json!({ "kind": "model_switched", "from": from, "to": to })
             }
@@ -1073,6 +1109,18 @@ pub fn collect_worker_events(
             if detect_worker_question(out) {
                 events.push(WorkerEvent {
                     kind: WorkerEventKind::Question,
+                });
+            }
+        }
+    }
+
+    // permission_dialog: waiting 時に画面に permission ダイアログがあれば記録（#319）
+    if status == "waiting" {
+        if let Some(out) = recent_output {
+            let lines: Vec<String> = out.lines().map(|l| l.to_string()).collect();
+            if crate::claude_tui::detect_permission_dialog(&lines).is_some() {
+                events.push(WorkerEvent {
+                    kind: WorkerEventKind::PermissionDialog,
                 });
             }
         }

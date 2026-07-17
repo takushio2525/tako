@@ -582,6 +582,17 @@ pub enum Request {
     /// 未完了なら `phase: "running"` を返す。完了済みなら出力取得 + auto_close +
     /// レジストリから除去
     OrchestratorRunResult { run_id: String },
+    /// オーケストレーター: worker の permission ダイアログへの応答（#319）。
+    /// ダイアログが画面上に存在することを検証してから選択キーを送る。
+    /// 不在時はエラー（誤爆防止）
+    OrchestratorRespond {
+        pane_id: u64,
+        /// 選択肢の番号（1-based）または "yes"/"no" エイリアス
+        choice: String,
+        /// 呼び出し元の TAKO_ORCHESTRATOR_ROLE（監査ログ用）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_role: Option<String>,
+    },
     /// オーケストレーター: 委任台帳の操作（Issue #292）。
     /// action: list / stats / record / amend
     OrchestratorLedger {

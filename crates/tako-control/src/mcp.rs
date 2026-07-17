@@ -1408,6 +1408,26 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "tako_orchestrator_respond",
+            "description": "worker の permission ダイアログ（ツール実行の承認要求）に応答する（#319）。\
+                watch の WORKER_PERMISSION イベントで検知されたダイアログに対し、選択肢を指定して解除する。\
+                ダイアログが画面に存在しない場合はエラーを返す（誤爆防止）。\
+                応答内容は persist.log に監査記録される。\
+                危険なコマンド（rm -rf / 本番 DB 操作等）への承認はユーザーに確認すること。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane_id": { "type": "integer", "description": "対象の worker ペイン ID" },
+                    "choice": {
+                        "type": "string",
+                        "description": "選択肢: 番号（1, 2, 3...）または 'yes'/'allow'（最初の選択肢）/ 'no'/'deny'（Deny 選択肢）",
+                    },
+                },
+                "required": ["pane_id", "choice"],
+                "additionalProperties": false,
+            },
+        }),
         // --- リモートアクセス MCP ツール ---
         json!({
             "name": "tako_remote_start",
@@ -2793,6 +2813,11 @@ fn build_request(
         "tako_orchestrator_run_result" => Request::OrchestratorRunResult {
             run_id: str_arg(args, "run_id")?.ok_or("run_id を指定する")?,
         },
+        "tako_orchestrator_respond" => Request::OrchestratorRespond {
+            pane_id: required_u64(args, "pane_id")?,
+            choice: str_arg(args, "choice")?.ok_or("choice を指定する")?,
+            caller_role: caller_role.map(str::to_string),
+        },
         "tako_orchestrator_ledger" => Request::OrchestratorLedger {
             action: str_arg(args, "action")?.ok_or("action を指定する")?,
             id: str_arg(args, "id")?,
@@ -3723,7 +3748,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 94);
+        assert_eq!(tools.len(), 95);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

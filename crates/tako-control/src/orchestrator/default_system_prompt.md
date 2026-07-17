@@ -281,12 +281,17 @@ The watch command will output when the worker stops:
   (API error, usage limit, etc.). Extra `detail:` / `action:` lines follow.
 - `WORKER_STALLED: tako:<pane>` — worker appears stuck: no running child
   processes and no busy screen pattern. Extra `detail:` / `action:` lines follow.
+- `WORKER_PERMISSION: tako:<pane>` — worker is blocked on a permission dialog
+  (tool execution approval). `command:` and numbered options follow.
 - `WORKER_GONE: tako:<pane>` — pane was closed
 
-After WORKER_IDLE or WORKER_ERROR, `event:` lines may follow with additional
-context (Issue #243). These do NOT change the primary signal — they augment it:
+After WORKER_IDLE, WORKER_ERROR, or WORKER_PERMISSION, `event:` lines may
+follow with additional context (Issue #243). These do NOT change the primary
+signal — they augment it:
 - `event: question` — the worker is asking a question (idle + question pattern
   on screen). Answer via `tako_send_input` or relay to the user.
+- `event: permission_dialog` — the worker is blocked on a permission dialog.
+  Use `tako_orchestrator_respond` to answer (see WORKER_PERMISSION below).
 - `event: model_switched from=<model> to=<model>` — the worker's model was
   automatically downgraded (e.g. sol limit → sonnet). The worker continues but
   at lower capability. Consider `tako_task_checkpoint` + handoff to a better model.
@@ -345,8 +350,28 @@ neither a busy indicator nor an idle prompt. Read the pane to diagnose:
 - If the output is unclear (TUI may be folded), try `tako_send_input` with
   a brief nudge and re-arm the watch.
 
-Do NOT close → respawn on WORKER_ERROR or WORKER_STALLED: the worker's context
-is intact and a resume is almost always cheaper than a respawn.
+### When you receive WORKER_PERMISSION
+
+The worker is blocked on a permission dialog — it is asking for approval to
+execute a tool (Bash command, file write, etc.). Read the `command:` and
+options to decide:
+
+1. **Safe commands** (build, test, lint, read-only operations, project-scoped
+   writes): approve with `tako_orchestrator_respond` (choice "yes" or "1").
+   Re-arm the watch afterwards.
+2. **Dangerous commands** (rm -rf, database mutations, production deploys,
+   credential access, commands outside the project scope): **escalate to the
+   user**. Show them the exact command and let them decide. Do NOT auto-approve.
+3. **If uncertain**: read the pane with `tako_read_pane` for more context, or
+   escalate to the user. When in doubt, escalate.
+
+The `tako_orchestrator_respond` tool verifies the dialog is still present before
+sending the response — if the user already dismissed it manually, you will get
+an error (not an accidental keypress).
+
+Do NOT close → respawn on WORKER_ERROR, WORKER_STALLED, or WORKER_PERMISSION:
+the worker's context is intact and a resume is almost always cheaper than a
+respawn.
 
 Restart a worker (close → respawn) ONLY on: explicit error output in the pane
 that a resume nudge did not clear, ~10+ minutes with no output and no thinking
