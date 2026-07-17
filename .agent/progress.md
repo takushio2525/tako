@@ -788,3 +788,8 @@
   dispatch `SetupRun` / MCP `tako_setup` と明示 `--review` を実装
 - 初回・2回目・`--yes`・未認証を before 5+/5+/未実装/1 → after 全 0 入力で実測。
   実 Claude Max 認証、検出競合、破損 config、複数 CLI、全品質ゲートも全緑
+
+## 2026-07-17（#307: 左サイドバーのドラッグリサイズ）
+- 右端リサイズハンドル + ドラッグ追従 + 120px〜50% クランプ + settings.json 永続化 + CLI/MCP 1:1。右パネルと同方式
+- 関連コミット: PR #316 squash merge（`e961acc`）。worktree 掃除・Issue 証拠コメント済み
+- 次: ユーザー目視確認（カーソル変化・ドラッグ・永続化）→ #307 クローズ
