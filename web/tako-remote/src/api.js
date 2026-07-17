@@ -79,6 +79,24 @@ export function createClient() {
       const hostPart = base.replace(/^https?:\/\//, '');
       return `${proto}://${hostPart}/ws?pane=${encodeURIComponent(paneId)}`;
     },
+    // ファイルアップロード（#285: POST /api/upload。Interact role 必須）
+    async upload(paneId, file) {
+      const form = new FormData();
+      form.append('file', file);
+      form.append('pane', paneId);
+      const resp = await fetch(`${base}/api/upload`, {
+        method: 'POST',
+        body: form,
+        signal: AbortSignal.timeout(60000),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        const e = new Error(err.error || `HTTP ${resp.status}`);
+        e.status = resp.status;
+        throw e;
+      }
+      return resp.json();
+    },
     // WS の認証もサーバー側の identity + ペアリング照合（サブプロトコルに secret を載せない）
     wsProtocols() {
       return ['tako-remote'];

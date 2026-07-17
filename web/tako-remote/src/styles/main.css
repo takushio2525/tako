@@ -658,6 +658,260 @@ body {
 .empty-state p { color: var(--fg2); font-size: 14px; max-width: 280px; line-height: 1.6; }
 
 /* ============================================================
+   Approval card (1b)
+   ============================================================ */
+
+.approval-card {
+  background: var(--panel2);
+  border: 1px solid rgba(232, 178, 62, .4);
+  border-radius: 12px;
+  padding: 11px 13px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.approval-card-header {
+  display: flex; align-items: center; gap: 8px;
+}
+.approval-card-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--amber);
+  animation: takopulse 1.6s ease-in-out infinite;
+  flex-shrink: 0;
+}
+.approval-card-title {
+  font-family: var(--mono); font-size: 11px; font-weight: 600;
+  color: var(--amber);
+}
+.approval-card-body {
+  font-family: var(--mono); font-size: 12px; color: var(--fg2); line-height: 1.5;
+}
+.approval-card-body strong {
+  color: var(--fg); font-weight: 600;
+}
+.approval-card-actions {
+  display: flex; gap: 8px;
+}
+.approval-btn-allow {
+  flex: 1; text-align: center;
+  font-family: var(--mono); font-size: 12px; font-weight: 600;
+  background: var(--codex); color: #0B0D10;
+  border: none; border-radius: 9px; padding: 9px 0;
+  cursor: pointer; min-height: 38px;
+  transition: opacity .12s;
+}
+.approval-btn-allow:active { opacity: .8; }
+.approval-btn-deny {
+  flex: 1; text-align: center;
+  font-family: var(--mono); font-size: 12px;
+  color: var(--fg2); background: none;
+  border: 1px solid var(--line2); border-radius: 9px; padding: 9px 0;
+  cursor: pointer; min-height: 38px;
+  transition: background .12s;
+}
+.approval-btn-deny:active { background: var(--panel3); }
+
+/* ============================================================
+   Choice buttons (1c)
+   ============================================================ */
+
+.choice-buttons {
+  display: flex; gap: 8px; flex-wrap: wrap;
+}
+.choice-btn {
+  font-family: var(--mono); font-size: 12px;
+  color: var(--fg2); background: none;
+  border: 1px solid var(--line2); border-radius: 9px;
+  padding: 9px 16px; cursor: pointer;
+  transition: background .12s;
+}
+.choice-btn:active { background: var(--panel3); }
+.choice-btn-primary {
+  font-weight: 600;
+  background: var(--agy); color: #0A1A33; border-color: var(--agy);
+}
+.choice-btn-primary:active { opacity: .85; }
+
+/* ============================================================
+   Slash command candidates (1e)
+   ============================================================ */
+
+.slash-candidates {
+  flex: none;
+  margin: 0 14px 8px;
+  background: var(--panel); border: 1px solid var(--line2);
+  border-radius: 16px; overflow: hidden;
+  box-shadow: 0 -12px 32px rgba(0, 0, 0, .45);
+  z-index: 10;
+}
+.slash-candidates-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 14px 8px;
+}
+.slash-candidates-label {
+  font-family: var(--mono); font-size: 10px; color: var(--fg3);
+  letter-spacing: .05em;
+}
+.slash-candidate {
+  display: flex; align-items: center; gap: 10px;
+  padding: 11px 14px;
+  border-top: 1px solid var(--line);
+  cursor: pointer;
+  transition: background .12s;
+}
+.slash-candidate:first-of-type { border-top: none; }
+.slash-candidate:active { background: var(--panel3); }
+.slash-candidate-active {
+  background: var(--panel3);
+}
+.slash-candidate-cmd {
+  font-family: var(--mono); font-size: 13px; font-weight: 600;
+  color: var(--fg);
+}
+.slash-candidate-desc {
+  font-size: 12px; color: var(--fg2);
+}
+
+.chat-scroll-dimmed { opacity: .35; }
+.composer-box-active { }
+
+/* ============================================================
+   Model / effort sheet (1f)
+   ============================================================ */
+
+.sheet-overlay {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(5, 6, 8, .55);
+  display: flex; align-items: flex-end;
+  animation: fadeIn .15s ease-out;
+}
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+
+.sheet-panel {
+  width: 100%;
+  background: var(--panel);
+  border-top: 1px solid var(--line2);
+  border-radius: 26px 26px 0 0;
+  padding: 12px 18px;
+  padding-bottom: calc(18px + env(safe-area-inset-bottom, 0px));
+  box-shadow: 0 -20px 50px -10px rgba(0, 0, 0, .6);
+  animation: slideUp .2s ease-out;
+}
+.sheet-handle {
+  width: 38px; height: 4px;
+  border-radius: 2px; background: var(--line2);
+  margin: 2px auto 18px;
+}
+.sheet-section-label {
+  font-family: var(--mono); font-size: 10px; color: var(--fg3);
+  letter-spacing: .05em; margin-bottom: 9px;
+}
+.sheet-model-list {
+  display: flex; flex-direction: column; gap: 7px;
+  margin-bottom: 20px;
+}
+.sheet-model-item {
+  display: flex; align-items: center; gap: 11px;
+  border: 1px solid var(--line); border-radius: 13px;
+  padding: 13px 14px; cursor: pointer;
+  transition: background .12s;
+}
+.sheet-model-item:active { background: var(--panel3); }
+.sheet-model-active {
+  background: var(--panel3);
+}
+.sheet-model-info {
+  display: flex; flex-direction: column; gap: 1px; min-width: 0;
+}
+.sheet-model-name {
+  font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--fg);
+}
+.sheet-model-desc {
+  font-size: 11px; color: var(--fg2);
+}
+.sheet-model-check {
+  margin-left: auto; font-size: 15px;
+}
+.sheet-effort-bar {
+  display: flex;
+  background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 12px; padding: 3px; gap: 3px;
+}
+.sheet-effort-btn {
+  flex: 1; text-align: center;
+  font-family: var(--mono); font-size: 12px;
+  color: var(--fg3); background: none;
+  border: none; border-radius: 9px;
+  padding: 10px 0; cursor: pointer;
+  transition: background .12s, color .12s;
+}
+.sheet-effort-btn:active { background: var(--panel3); }
+.sheet-effort-active {
+  font-weight: 600;
+}
+.sheet-footer-note {
+  font-size: 11px; color: var(--fg3); margin-top: 10px; text-align: center;
+}
+
+/* ============================================================
+   Attach sheet + pending attachment (1g)
+   ============================================================ */
+
+.attach-sources {
+  display: flex; gap: 9px;
+}
+.attach-source {
+  flex: 1; display: flex; flex-direction: column;
+  align-items: center; gap: 8px;
+  border: 1px solid var(--line); border-radius: 14px;
+  padding: 16px 0 13px; cursor: pointer;
+  transition: background .12s;
+}
+.attach-source:active { background: var(--panel3); }
+.attach-source-icon {
+  color: var(--fg2);
+}
+.attach-source-label {
+  font-family: var(--mono); font-size: 11px; color: var(--fg2);
+}
+.attach-note {
+  font-size: 11px; color: var(--fg3); text-align: center;
+  margin-top: 14px;
+}
+
+.pending-attach {
+  display: flex; align-items: center; gap: 9px;
+  background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 11px; padding: 8px 11px;
+  align-self: flex-start; max-width: 100%;
+}
+.pending-attach-icon {
+  width: 30px; height: 30px; border-radius: 8px;
+  background: linear-gradient(135deg, #2A3542, #1A222C);
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0; color: var(--fg2);
+}
+.pending-attach-info {
+  display: flex; flex-direction: column; min-width: 0;
+}
+.pending-attach-name {
+  font-family: var(--mono); font-size: 11px; color: var(--fg);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.pending-attach-status {
+  font-family: var(--mono); font-size: 10px;
+}
+.pending-attach-status.done { color: var(--green); }
+.pending-attach-status.uploading { color: var(--amber); }
+.pending-attach-status.error { color: var(--red); }
+.pending-attach-status.pending { color: var(--fg3); }
+.pending-attach-remove {
+  color: var(--fg3); font-size: 13px; margin-left: 4px;
+  background: none; border: none; cursor: pointer;
+  padding: 4px;
+}
+.pending-attach-remove:active { color: var(--fg); }
+
+/* ============================================================
    Version banner
    ============================================================ */
 .version-banner {

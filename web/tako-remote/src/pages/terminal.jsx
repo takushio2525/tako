@@ -405,6 +405,7 @@ export function TerminalPage({ paneId, me }) {
           info={info}
           agentType={agentType}
           onStop={sendStop}
+          me={me}
         />
       )}
 

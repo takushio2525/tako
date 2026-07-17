@@ -56,7 +56,50 @@ function ToolCard({ tool, agentType }) {
   );
 }
 
-function ChatMessage({ msg, agentType }) {
+// --- 承認待ちカード（カンプ 1b）---
+function ApprovalCard({ approval, onAllow, onDeny, canInteract }) {
+  return (
+    <div class="approval-card">
+      <div class="approval-card-header">
+        <span class="approval-card-dot" />
+        <span class="approval-card-title">承認が必要</span>
+      </div>
+      <div class="approval-card-body">
+        {approval.tool && <><strong>{approval.tool}</strong>: </>}
+        {approval.command || approval.description || ''}
+      </div>
+      <div class="approval-card-actions">
+        <button
+          class="approval-btn-allow"
+          onClick={onAllow}
+          disabled={!canInteract}
+          style={!canInteract ? 'opacity:.4;cursor:not-allowed' : ''}
+        >許可 (y)</button>
+        <button
+          class="approval-btn-deny"
+          onClick={onDeny}
+          disabled={!canInteract}
+          style={!canInteract ? 'opacity:.4;cursor:not-allowed' : ''}
+        >拒否 (n)</button>
+      </div>
+    </div>
+  );
+}
+
+// --- 選択肢ボタン（カンプ 1c）---
+function ChoiceButtons({ choices, onSelect }) {
+  return (
+    <div class="choice-buttons">
+      {choices.map((choice, i) => (
+        <button key={i} class={`choice-btn${i === 0 ? ' choice-btn-primary' : ''}`} onClick={() => onSelect(choice, i)}>
+          {choice}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ChatMessage({ msg, agentType, paneId, onSend, canInteract }) {
   if (msg.role === 'user') {
     return <div class="chat-user">{msg.text}</div>;
   }
@@ -75,6 +118,20 @@ function ChatMessage({ msg, agentType }) {
       {msg.tools && msg.tools.map((tool, i) => (
         <ToolCard key={i} tool={tool} agentType={agentType} />
       ))}
+      {msg.approval && (
+        <ApprovalCard
+          approval={msg.approval}
+          canInteract={canInteract}
+          onAllow={() => onSend('y')}
+          onDeny={() => onSend('n')}
+        />
+      )}
+      {msg.choices && msg.choices.length > 0 && (
+        <ChoiceButtons
+          choices={msg.choices}
+          onSelect={(choice, idx) => onSend(String(idx + 1))}
+        />
+      )}
     </div>
   );
 }
@@ -119,16 +176,219 @@ function formatDateLabel(ts) {
   }
 }
 
-export function ChatView({ paneId, info, agentType, onStop }) {
+// --- スラッシュコマンド静的候補（カンプ 1e）---
+const SLASH_COMMANDS = [
+  { cmd: '/compact', desc: 'コンテキストを圧縮' },
+  { cmd: '/cost', desc: '今セッションの使用量' },
+  { cmd: '/clear', desc: '会話履歴をクリア' },
+  { cmd: '/help', desc: 'ヘルプを表示' },
+  { cmd: '/model', desc: 'モデルを切り替え' },
+  { cmd: '/status', desc: '現在の状態を確認' },
+];
+
+function SlashCandidates({ filter, onSelect, agentColor: color }) {
+  const filtered = filter
+    ? SLASH_COMMANDS.filter(c => c.cmd.startsWith(filter))
+    : SLASH_COMMANDS;
+  if (filtered.length === 0) return null;
+  return (
+    <div class="slash-candidates">
+      <div class="slash-candidates-header">
+        <span class="slash-candidates-label">COMMANDS</span>
+      </div>
+      {filtered.map((c, i) => (
+        <div
+          key={c.cmd}
+          class={`slash-candidate${i === 0 ? ' slash-candidate-active' : ''}`}
+          onClick={() => onSelect(c.cmd)}
+        >
+          <span class="slash-candidate-cmd" style={i === 0 ? `color:${color}` : ''}>{c.cmd}</span>
+          <span class="slash-candidate-desc">{c.desc}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// --- モデル / エフォートシート（カンプ 1f）---
+const CLAUDE_MODELS = [
+  { id: 'opus', name: 'Opus 4.5', desc: '複雑なタスク向け・最高性能' },
+  { id: 'sonnet', name: 'Sonnet 4.6', desc: '日常タスク・高速' },
+  { id: 'haiku', name: 'Haiku 4.5', desc: '軽量・最速' },
+];
+const EFFORT_LEVELS = [
+  { id: 'off', label: 'off' },
+  { id: 'low', label: '低' },
+  { id: 'medium', label: '中' },
+  { id: 'high', label: '高' },
+];
+
+function ModelEffortSheet({ currentModel, onSelectModel, onSelectEffort, onClose, agentType }) {
+  const color = agentColor(agentType);
+  const [selectedEffort, setSelectedEffort] = useState(null);
+
+  return (
+    <div class="sheet-overlay" onClick={onClose}>
+      <div class="sheet-panel" onClick={e => e.stopPropagation()}>
+        <div class="sheet-handle" />
+        <div class="sheet-section-label">MODEL</div>
+        <div class="sheet-model-list">
+          {CLAUDE_MODELS.map(m => {
+            const isActive = currentModel && currentModel.toLowerCase().includes(m.id);
+            return (
+              <div
+                key={m.id}
+                class={`sheet-model-item${isActive ? ' sheet-model-active' : ''}`}
+                style={isActive ? `border-color:${color}` : ''}
+                onClick={() => onSelectModel(m.name)}
+              >
+                <AgentIcon type={agentType} small />
+                <div class="sheet-model-info">
+                  <span class="sheet-model-name">{m.name}</span>
+                  <span class="sheet-model-desc">{m.desc}</span>
+                </div>
+                {isActive && <span class="sheet-model-check" style={`color:${color}`}>✓</span>}
+              </div>
+            );
+          })}
+        </div>
+        <div class="sheet-section-label">THINKING EFFORT</div>
+        <div class="sheet-effort-bar">
+          {EFFORT_LEVELS.map(e => (
+            <button
+              key={e.id}
+              class={`sheet-effort-btn${selectedEffort === e.id ? ' sheet-effort-active' : ''}`}
+              style={selectedEffort === e.id ? `background:${color};color:${agentDarkColor(agentType)}` : ''}
+              onClick={() => {
+                setSelectedEffort(e.id);
+                onSelectEffort(e.id);
+              }}
+            >{e.label}</button>
+          ))}
+        </div>
+        <div class="sheet-footer-note">
+          選択は /model・/effort としてエージェントに送信されます
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// --- ファイル添付シート（カンプ 1g）---
+function AttachSheet({ onClose, onFileSelected, pendingFile, agentType }) {
+  const fileInputRef = useRef(null);
+
+  function handleSource(source) {
+    if (source === 'file' && fileInputRef.current) {
+      fileInputRef.current.click();
+    } else if (source === 'camera') {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'image/*';
+      input.capture = 'environment';
+      input.onchange = (e) => {
+        const file = e.target.files?.[0];
+        if (file) onFileSelected(file);
+      };
+      input.click();
+    } else if (source === 'photo') {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'image/*,video/*';
+      input.onchange = (e) => {
+        const file = e.target.files?.[0];
+        if (file) onFileSelected(file);
+      };
+      input.click();
+    }
+  }
+
+  return (
+    <div class="sheet-overlay" onClick={onClose}>
+      <div class="sheet-panel" onClick={e => e.stopPropagation()}>
+        <div class="sheet-handle" />
+        <div class="attach-sources">
+          <div class="attach-source" onClick={() => handleSource('camera')}>
+            <span class="attach-source-icon">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="6" width="20" height="14" rx="3"/><circle cx="12" cy="13" r="4"/><path d="M7 6V5a2 2 0 012-2h6a2 2 0 012 2v1"/></svg>
+            </span>
+            <span class="attach-source-label">カメラ</span>
+          </div>
+          <div class="attach-source" onClick={() => handleSource('photo')}>
+            <span class="attach-source-icon">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="2"/><path d="M22 15l-5-5L5 21"/></svg>
+            </span>
+            <span class="attach-source-label">写真</span>
+          </div>
+          <div class="attach-source" onClick={() => handleSource('file')}>
+            <span class="attach-source-icon">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+            </span>
+            <span class="attach-source-label">ファイル</span>
+          </div>
+        </div>
+        <div class="attach-note">
+          リモートの作業ディレクトリにアップロードし、パスをエージェントに渡します
+        </div>
+        <input
+          ref={fileInputRef}
+          type="file"
+          style="display:none"
+          onChange={e => {
+            const file = e.target.files?.[0];
+            if (file) onFileSelected(file);
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function PendingAttachment({ file, uploadState, onRemove }) {
+  const icon = file.type?.startsWith('image/') ? 'img' : 'file';
+  const sizeStr = file.size < 1024 * 1024
+    ? `${(file.size / 1024).toFixed(0)}KB`
+    : `${(file.size / (1024 * 1024)).toFixed(1)}MB`;
+  return (
+    <div class="pending-attach">
+      <span class="pending-attach-icon">
+        {icon === 'img' ? (
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="2"/><path d="M22 15l-5-5L5 21"/></svg>
+        ) : (
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        )}
+      </span>
+      <div class="pending-attach-info">
+        <span class="pending-attach-name">{file.name}</span>
+        <span class={`pending-attach-status ${uploadState?.status || 'pending'}`}>
+          {uploadState?.status === 'uploading' && `↑ ${sizeStr} ・ アップロード中...`}
+          {uploadState?.status === 'done' && `↑ ${sizeStr} ・ 完了`}
+          {uploadState?.status === 'error' && `エラー: ${uploadState.error}`}
+          {(!uploadState || uploadState.status === 'pending') && `${sizeStr}`}
+        </span>
+      </div>
+      <button class="pending-attach-remove" onClick={onRemove}>✕</button>
+    </div>
+  );
+}
+
+
+export function ChatView({ paneId, info, agentType, onStop, me }) {
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(true);
   const [input, setInput] = useState('');
+  const [showSlash, setShowSlash] = useState(false);
+  const [showModelSheet, setShowModelSheet] = useState(false);
+  const [showAttachSheet, setShowAttachSheet] = useState(false);
+  const [pendingFile, setPendingFile] = useState(null);
+  const [uploadState, setUploadState] = useState(null);
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
   const timerRef = useRef(null);
   const atBottomRef = useRef(true);
 
   const isRunning = info && (info.state === 'busy' || info.state === 'running');
+  const canInteract = me && (me.role === 'interact' || me.role === 'manage' || me.role === 'admin');
 
   const fetchMessages = useCallback(async () => {
     if (!info || !info.session_id) return;
@@ -166,22 +426,83 @@ export function ChatView({ paneId, info, agentType, onStop }) {
     atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
   }
 
-  async function send() {
+  async function send(text) {
+    const t = (text || '').trim();
+    if (!t) return;
+    if (navigator.vibrate) navigator.vibrate(10);
+    try {
+      await createClient().input(paneId, t, true);
+    } catch {}
+  }
+
+  async function sendFromComposer() {
     const text = input.trim();
     if (!text) return;
     setInput('');
-    if (navigator.vibrate) navigator.vibrate(10);
-    try {
-      await createClient().input(paneId, text, true);
-    } catch {}
+    setShowSlash(false);
+
+    // 添付ファイルがある場合はパスをプレフィックスに
+    if (pendingFile && uploadState?.status === 'done' && uploadState.path) {
+      await send(`${uploadState.path} ${text}`);
+    } else {
+      await send(text);
+    }
+    setPendingFile(null);
+    setUploadState(null);
     inputRef.current?.focus();
+  }
+
+  function onInputChange(e) {
+    const val = e.target.value;
+    setInput(val);
+    // `/` で始まるとスラコマ候補を表示
+    if (val.startsWith('/') && !val.includes(' ')) {
+      setShowSlash(true);
+    } else {
+      setShowSlash(false);
+    }
   }
 
   function onKeyDown(e) {
     if (e.isComposing) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      send();
+      sendFromComposer();
+    }
+  }
+
+  function onSlashSelect(cmd) {
+    if (cmd === '/model') {
+      setShowModelSheet(true);
+      setInput('');
+      setShowSlash(false);
+      return;
+    }
+    setInput('');
+    setShowSlash(false);
+    send(cmd);
+  }
+
+  function onModelSelect(modelName) {
+    setShowModelSheet(false);
+    send(`/model ${modelName}`);
+  }
+
+  function onEffortSelect(level) {
+    setShowModelSheet(false);
+    send(`/effort ${level}`);
+  }
+
+  async function onFileSelected(file) {
+    setShowAttachSheet(false);
+    setPendingFile(file);
+    setUploadState({ status: 'uploading' });
+    try {
+      const client = createClient();
+      const result = await client.upload(paneId, file);
+      setUploadState({ status: 'done', path: result.path });
+    } catch (e) {
+      setUploadState({ status: 'error', error: e.message });
     }
   }
 
@@ -193,7 +514,7 @@ export function ChatView({ paneId, info, agentType, onStop }) {
 
   return (
     <>
-      <div class="chat-scroll" ref={scrollRef} onScroll={onScroll}>
+      <div class={`chat-scroll${showSlash ? ' chat-scroll-dimmed' : ''}`} ref={scrollRef} onScroll={onScroll}>
         {loading && (
           <div style="display:flex;justify-content:center;padding:40px">
             <div class="spinner" />
@@ -219,7 +540,13 @@ export function ChatView({ paneId, info, agentType, onStop }) {
           return (
             <div key={i}>
               {showDate && <div class="chat-date">{dateLabel}</div>}
-              <ChatMessage msg={msg} agentType={agentType} />
+              <ChatMessage
+                msg={msg}
+                agentType={agentType}
+                paneId={paneId}
+                onSend={send}
+                canInteract={canInteract}
+              />
             </div>
           );
         })}
@@ -239,13 +566,30 @@ export function ChatView({ paneId, info, agentType, onStop }) {
         )}
       </div>
 
+      {/* スラコマ候補（カンプ 1e）*/}
+      {showSlash && (
+        <SlashCandidates
+          filter={input}
+          onSelect={onSlashSelect}
+          agentColor={color}
+        />
+      )}
+
       <div class="composer">
-        <div class="composer-box">
+        <div class={`composer-box${showSlash ? ' composer-box-active' : ''}`} style={showSlash ? `border-color:${color}` : ''}>
+          {/* 添付プレビュー（カンプ 1g） */}
+          {pendingFile && (
+            <PendingAttachment
+              file={pendingFile}
+              uploadState={uploadState}
+              onRemove={() => { setPendingFile(null); setUploadState(null); }}
+            />
+          )}
           <textarea
             ref={inputRef}
             class="composer-input"
             value={input}
-            onInput={e => setInput(e.target.value)}
+            onInput={onInputChange}
             onKeyDown={onKeyDown}
             placeholder={placeholder}
             autocomplete="off"
@@ -255,21 +599,53 @@ export function ChatView({ paneId, info, agentType, onStop }) {
             rows={1}
           />
           <div class="composer-toolbar">
-            <button class="composer-btn-attach" disabled>+</button>
+            <button
+              class={`composer-btn-attach${pendingFile ? ' composer-btn-attach-active' : ''}`}
+              style={pendingFile ? `border-color:${color};color:${color}` : ''}
+              onClick={() => setShowAttachSheet(true)}
+            >+</button>
             {info?.model && (
-              <span class="composer-chip">{info.model}</span>
+              <button class="composer-chip" onClick={() => setShowModelSheet(true)}>
+                {info.model} ▾
+              </button>
+            )}
+            {info?.effort && (
+              <button class="composer-chip" onClick={() => setShowModelSheet(true)}>
+                {info.effort} ▾
+              </button>
             )}
             <button
               class="composer-send"
               style={`background:${color};color:${darkColor}`}
-              onClick={send}
-              disabled={!input.trim()}
+              onClick={sendFromComposer}
+              disabled={!input.trim() && !(pendingFile && uploadState?.status === 'done')}
             >
               {'↑'}
             </button>
           </div>
         </div>
       </div>
+
+      {/* モデル / エフォートシート（カンプ 1f）*/}
+      {showModelSheet && (
+        <ModelEffortSheet
+          currentModel={info?.model}
+          onSelectModel={onModelSelect}
+          onSelectEffort={onEffortSelect}
+          onClose={() => setShowModelSheet(false)}
+          agentType={agentType}
+        />
+      )}
+
+      {/* ファイル添付シート（カンプ 1g）*/}
+      {showAttachSheet && (
+        <AttachSheet
+          onClose={() => setShowAttachSheet(false)}
+          onFileSelected={onFileSelected}
+          pendingFile={pendingFile}
+          agentType={agentType}
+        />
+      )}
     </>
   );
 }

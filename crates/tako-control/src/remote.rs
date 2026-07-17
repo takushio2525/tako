@@ -2744,7 +2744,7 @@ fn required_role(method: &tiny_http::Method, path: &str) -> DeviceRole {
         return DeviceRole::Admin;
     }
     if *method == tiny_http::Method::Post {
-        if path.ends_with("/input") {
+        if path.ends_with("/input") || path == "/api/upload" {
             return DeviceRole::Interact;
         }
         if path.ends_with("/close") || path.ends_with("/resize") {
@@ -3148,12 +3148,293 @@ fn handle_api_v2_routes(
                 }
             }
         }
+        // --- ファイルアップロード（#285）: Interact role 必須 ---
+        (tiny_http::Method::Post, "/api/upload") => {
+            handle_upload(request, ctx, device, pane_mapping)
+        }
         _ => respond(
             request,
             404,
             Some(json!({ "error": "API エンドポイントが見つからない" }).to_string()),
         ),
     }
+}
+
+/// POST /api/upload: リモート端末からのファイルアップロード（#285）
+///
+/// Interact role 必須 / 20MB 上限 / 保存先は対象ペインの cwd 配下
+/// `.tako-remote-uploads/` 固定 / パス traversal 検証 / 実行権限なし
+fn handle_upload(
+    mut request: tiny_http::Request,
+    ctx: &Arc<DaemonCtx>,
+    device: &crate::remote_auth::Device,
+    pane_mapping: &Arc<RwLock<PaneMapping>>,
+) {
+    const MAX_UPLOAD_SIZE: u64 = 20 * 1024 * 1024; // 20MB
+    const UPLOAD_DIR: &str = ".tako-remote-uploads";
+
+    // Content-Length の事前チェック
+    let content_length = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Content-Length"))
+        .and_then(|h| h.value.as_str().parse::<u64>().ok())
+        .unwrap_or(0);
+    if content_length > MAX_UPLOAD_SIZE {
+        return respond(
+            request,
+            413,
+            Some(json!({ "error": format!("ファイルサイズが上限 ({}MB) を超えています", MAX_UPLOAD_SIZE / (1024 * 1024)) }).to_string()),
+        );
+    }
+
+    // Content-Type が multipart/form-data であることを確認
+    let content_type = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Content-Type"))
+        .map(|h| h.value.as_str().to_string())
+        .unwrap_or_default();
+    let boundary = extract_multipart_boundary(&content_type);
+    let Some(boundary) = boundary else {
+        return respond(
+            request,
+            400,
+            Some(json!({ "error": "multipart/form-data が必要です" }).to_string()),
+        );
+    };
+
+    // ボディを全て読む（サイズ上限を超えたら中断）
+    use std::io::Read as _;
+    let mut body = Vec::new();
+    let mut reader = request.as_reader().take(MAX_UPLOAD_SIZE);
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                body.extend_from_slice(&buf[..n]);
+                if body.len() as u64 > MAX_UPLOAD_SIZE {
+                    return respond(
+                        request,
+                        413,
+                        Some(json!({ "error": format!("ファイルサイズが上限 ({}MB) を超えています", MAX_UPLOAD_SIZE / (1024 * 1024)) }).to_string()),
+                    );
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    // multipart パーシング（最小実装: file と pane フィールドを抽出）
+    let (file_name, file_data, pane_id) = match parse_multipart(&body, &boundary) {
+        Ok(parts) => parts,
+        Err(e) => {
+            return respond(request, 400, Some(json!({ "error": e }).to_string()));
+        }
+    };
+
+    // ファイル名の traversal 検証
+    if file_name.contains('/')
+        || file_name.contains('\\')
+        || file_name.contains("..")
+        || file_name.is_empty()
+    {
+        return respond(
+            request,
+            400,
+            Some(json!({ "error": "不正なファイル名です" }).to_string()),
+        );
+    }
+
+    // cwd を取得（pane_mapping の pane_info から）
+    let cwd = {
+        let mapping = pane_mapping.read().unwrap();
+        pane_id
+            .parse::<u64>()
+            .ok()
+            .and_then(|id| mapping.pane_info.get(&id))
+            .and_then(|info| info["cwd"].as_str())
+            .map(String::from)
+    };
+
+    let Some(cwd) = cwd else {
+        return respond(
+            request,
+            404,
+            Some(json!({ "error": "対象ペインの作業ディレクトリが取得できません" }).to_string()),
+        );
+    };
+
+    // 保存先ディレクトリの作成
+    let upload_dir = std::path::Path::new(&cwd).join(UPLOAD_DIR);
+    if let Err(e) = std::fs::create_dir_all(&upload_dir) {
+        return respond(
+            request,
+            500,
+            Some(
+                json!({ "error": format!("アップロードディレクトリの作成に失敗: {e}") })
+                    .to_string(),
+            ),
+        );
+    }
+
+    // パスの最終検証（canonicalize で traversal を防止）
+    let target_path = upload_dir.join(&file_name);
+    let canonical_dir = match upload_dir.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            return respond(
+                request,
+                500,
+                Some(json!({ "error": format!("パス解決に失敗: {e}") }).to_string()),
+            );
+        }
+    };
+
+    // ファイル書き込み（実行権限なし: 0o644）
+    use std::io::Write;
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&target_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return respond(
+                request,
+                500,
+                Some(json!({ "error": format!("ファイル書き込みに失敗: {e}") }).to_string()),
+            );
+        }
+    };
+    if let Err(e) = file.write_all(&file_data) {
+        return respond(
+            request,
+            500,
+            Some(json!({ "error": format!("ファイル書き込みに失敗: {e}") }).to_string()),
+        );
+    }
+    drop(file);
+
+    // 実行権限を除去（Unix のみ）
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(0o644));
+    }
+
+    // canonicalize で traversal していないことを最終確認
+    if let Ok(canonical_target) = target_path.canonicalize() {
+        if !canonical_target.starts_with(&canonical_dir) {
+            let _ = std::fs::remove_file(&target_path);
+            return respond(
+                request,
+                400,
+                Some(json!({ "error": "パス traversal が検出されました" }).to_string()),
+            );
+        }
+    }
+
+    // 監査ログ
+    ctx.registry.lock().unwrap().audit(
+        "upload",
+        &device.id,
+        &device.name,
+        json!({
+            "file": file_name,
+            "size": file_data.len(),
+            "pane": pane_id,
+        }),
+    );
+
+    let relative_path = format!("{UPLOAD_DIR}/{file_name}");
+    respond(
+        request,
+        200,
+        Some(
+            json!({
+                "ok": true,
+                "path": relative_path,
+                "size": file_data.len(),
+            })
+            .to_string(),
+        ),
+    )
+}
+
+/// multipart/form-data の boundary を抽出する
+fn extract_multipart_boundary(content_type: &str) -> Option<String> {
+    if !content_type.starts_with("multipart/form-data") {
+        return None;
+    }
+    content_type.split(';').find_map(|part| {
+        let part = part.trim();
+        part.strip_prefix("boundary=")
+            .map(|b| b.trim_matches('"').to_string())
+    })
+}
+
+/// multipart ボディから file パートと pane フィールドを抽出する最小実装
+fn parse_multipart(body: &[u8], boundary: &str) -> Result<(String, Vec<u8>, String), String> {
+    let delimiter = format!("--{boundary}");
+    let body_str_lossy = String::from_utf8_lossy(body);
+    let parts: Vec<&str> = body_str_lossy.split(&delimiter).collect();
+
+    let mut file_name = String::new();
+    let mut file_data: Option<Vec<u8>> = None;
+    let mut pane_id = String::new();
+
+    for part in &parts {
+        if part.starts_with("--") || part.is_empty() {
+            continue;
+        }
+        let Some(header_end) = part.find("\r\n\r\n") else {
+            continue;
+        };
+        let headers = &part[..header_end];
+        let body_start = header_end + 4;
+        let body_part = &part[body_start..];
+        // 末尾の \r\n を除去
+        let body_part = body_part.strip_suffix("\r\n").unwrap_or(body_part);
+
+        if headers.contains("name=\"pane\"") {
+            pane_id = body_part.trim().to_string();
+        } else if headers.contains("name=\"file\"") {
+            // filename の抽出
+            if let Some(fname_start) = headers.find("filename=\"") {
+                let rest = &headers[fname_start + 10..];
+                if let Some(fname_end) = rest.find('"') {
+                    file_name = rest[..fname_end].to_string();
+                }
+            }
+            // バイナリデータの正確な抽出（lossy 変換ではなく元のバイト列から）
+            let header_bytes = format!("{delimiter}{}", &part[..body_start]);
+            let offset_in_body = body
+                .windows(header_bytes.len())
+                .position(|w| w == header_bytes.as_bytes());
+            if let Some(offset) = offset_in_body {
+                let data_start = offset + header_bytes.len();
+                let next_delim = format!("\r\n{delimiter}");
+                let data_end = body[data_start..]
+                    .windows(next_delim.len())
+                    .position(|w| w == next_delim.as_bytes())
+                    .map(|p| data_start + p)
+                    .unwrap_or(body.len());
+                file_data = Some(body[data_start..data_end].to_vec());
+            }
+        }
+    }
+
+    if file_name.is_empty() {
+        return Err("ファイルが含まれていません".to_string());
+    }
+    if pane_id.is_empty() {
+        return Err("pane パラメータが必要です".to_string());
+    }
+    let data = file_data.ok_or_else(|| "ファイルデータの読み取りに失敗".to_string())?;
+    Ok((file_name, data, pane_id))
 }
 
 /// WS broadcaster 版のハンドラ（M-5: ペインごとの共有 broadcaster で接続数分の
@@ -3429,6 +3710,11 @@ mod tests {
         assert_eq!(
             required_role(&Method::Post, "/api/devices/revoke"),
             DeviceRole::Admin
+        );
+        // upload は Interact
+        assert_eq!(
+            required_role(&Method::Post, "/api/upload"),
+            DeviceRole::Interact
         );
         // 未知の POST は安全側（Manage）
         assert_eq!(
@@ -3746,5 +4032,48 @@ mod tests {
         assert_eq!(parse_etime("2-01:03:42"), Some(2 * 86400 + 3822));
         assert_eq!(parse_etime("00:05"), Some(5));
         assert_eq!(parse_etime("bad"), None);
+    }
+
+    // --- upload API テスト (#285) ---
+
+    #[test]
+    fn extract_multipart_boundaryはboundaryを抽出する() {
+        assert_eq!(
+            extract_multipart_boundary("multipart/form-data; boundary=----WebKitFormBoundary"),
+            Some("----WebKitFormBoundary".to_string())
+        );
+        assert_eq!(
+            extract_multipart_boundary("multipart/form-data; boundary=\"abc123\""),
+            Some("abc123".to_string())
+        );
+        assert_eq!(extract_multipart_boundary("application/json"), None);
+    }
+
+    #[test]
+    fn parse_multipartはfileとpaneを抽出する() {
+        let boundary = "----boundary";
+        let body = "------boundary\r\nContent-Disposition: form-data; name=\"pane\"\r\n\r\n42\r\n\
+             ------boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\n\
+             Content-Type: text/plain\r\n\r\nhello world\r\n------boundary--\r\n";
+        let (name, data, pane) = parse_multipart(body.as_bytes(), boundary).unwrap();
+        assert_eq!(name, "test.txt");
+        assert_eq!(data, b"hello world");
+        assert_eq!(pane, "42");
+    }
+
+    #[test]
+    fn parse_multipartはファイルなしでエラーを返す() {
+        let boundary = "----boundary";
+        let body = "------boundary\r\nContent-Disposition: form-data; name=\"pane\"\r\n\r\n42\r\n------boundary--\r\n";
+        assert!(parse_multipart(body.as_bytes(), boundary).is_err());
+    }
+
+    #[test]
+    fn upload_roleはinteractが必要() {
+        use tiny_http::Method;
+        assert_eq!(
+            required_role(&Method::Post, "/api/upload"),
+            DeviceRole::Interact
+        );
     }
 }
