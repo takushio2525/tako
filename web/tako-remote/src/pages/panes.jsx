@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { createClient } from '../api';
+import { AgentIcon, agentColor } from '../components/agent-icon';
 
 function SkeletonCard() {
   return (
@@ -18,10 +19,6 @@ function SkeletonCard() {
           <div class="skeleton skeleton-line" style="width: 50%" />
         </div>
       </div>
-      <div class="pane-card-footer">
-        <span class="skeleton skeleton-text" style="width: 60px" />
-        <span class="skeleton skeleton-text" style="width: 40px" />
-      </div>
     </div>
   );
 }
@@ -35,8 +32,8 @@ function stateOf(p) {
 
 function stateLabel(st) {
   switch (st) {
-    case 'error': return 'exit 1';
-    case 'busy': return 'NEEDS INPUT';
+    case 'error': return 'error';
+    case 'busy': return 'needs input';
     case 'running': return 'running';
     default: return 'idle';
   }
@@ -71,11 +68,7 @@ export function PanesPage({ me }) {
           .catch(() => {});
       }
     } catch (e) {
-      // 403 = 登録が失効した（revoke）。リロードでペアリング画面へ戻す
-      if (e.status === 403) {
-        window.location.reload();
-        return;
-      }
+      if (e.status === 403) { window.location.reload(); return; }
       setError(e.message);
       setLoading(false);
     }
@@ -92,7 +85,6 @@ export function PanesPage({ me }) {
     const el = listRef.current;
     touchStartRef.current = { y: e.touches[0].clientY, scrollTop: el?.scrollTop || 0 };
   }
-
   function onTouchMove(e) {
     const el = listRef.current;
     if (!el || touchStartRef.current.scrollTop > 0) return;
@@ -102,7 +94,6 @@ export function PanesPage({ me }) {
       if (dy > 10) e.preventDefault();
     }
   }
-
   function onTouchEnd() {
     if (pullY >= PULL_THRESHOLD) {
       setPulling(true);
@@ -119,7 +110,7 @@ export function PanesPage({ me }) {
 
   return (
     <div class="page">
-      <div class="panes-header" style={`padding-top: calc(8px + env(safe-area-inset-top, 0px))`}>
+      <div class="panes-header">
         <div class="panes-header-row">
           <div class="machine-chip">
             <span class="dot online" style="width: 7px; height: 7px;" />
@@ -132,19 +123,19 @@ export function PanesPage({ me }) {
           </button>
           {counts.busy > 0 && (
             <button class={`filter-chip${filter === 'busy' ? ' active' : ''}`} onClick={() => setFilter('busy')}>
-              <span class="chip-dot" style="background: var(--warning);" />
+              <span class="chip-dot" style="background: var(--amber);" />
               needs you {counts.busy}
             </button>
           )}
           {counts.running > 0 && (
             <button class={`filter-chip${filter === 'running' ? ' active' : ''}`} onClick={() => setFilter('running')}>
-              <span class="chip-dot" style="background: var(--success);" />
+              <span class="chip-dot" style="background: var(--green);" />
               running {counts.running}
             </button>
           )}
           {counts.error > 0 && (
             <button class={`filter-chip${filter === 'error' ? ' active' : ''}`} onClick={() => setFilter('error')}>
-              <span class="chip-dot" style="background: var(--danger);" />
+              <span class="chip-dot" style="background: var(--red);" />
               failed {counts.error}
             </button>
           )}
@@ -178,15 +169,26 @@ export function PanesPage({ me }) {
         >
           {filtered.map(p => {
             const st = stateOf(p);
+            const agentType = p.agent_type || 'plain';
+            const displayTitle = p.title || `Pane ${p.id}`;
+            const cardTitle = agentType !== 'plain'
+              ? `${agentType} · ${displayTitle}`
+              : displayTitle;
+
             return (
               <div key={p.id} class={`pane-card state-${st}`} onClick={() => { window.location.hash = `#/panes/${p.id}`; }}>
                 <div class="edge-bar" />
                 <div class="pane-card-header">
                   <div class="pane-card-left">
-                    <span class={`dot ${st === 'busy' ? 'busy' : st === 'running' ? 'running' : st === 'error' ? 'error' : 'idle'}`} />
-                    <span class="pane-card-title">{p.title || `Pane ${p.id}`}</span>
+                    <AgentIcon type={agentType} />
+                    <span class="pane-card-title">{cardTitle}</span>
                   </div>
                   <span class="state-badge">{stateLabel(st)}</span>
+                </div>
+                <div class="pane-card-meta">
+                  {(me && me.host) || 'tako'}
+                  {p.position ? ` · ${p.position}` : ''}
+                  {p.role ? ` · ${p.role}` : ''}
                 </div>
                 <div class="pane-card-preview">
                   <div class="pane-card-preview-box">

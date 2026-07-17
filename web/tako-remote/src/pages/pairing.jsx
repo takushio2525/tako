@@ -2,19 +2,15 @@ import { useState, useEffect, useRef } from 'preact/hooks';
 import { createClient } from '../api';
 import { getDeviceName, setDeviceName } from '../store';
 
-// 承認待ちの me() ポーリング間隔
 const POLL_MS = 2000;
 
 const ROLES = [
-  { value: 'observe', label: 'Observe', desc: '画面を見るだけ（推奨・既定）' },
+  { value: 'observe', label: 'Observe', desc: '画面を見るだけ（推奨）' },
   { value: 'interact', label: 'Interact', desc: '+ テキスト入力・承認応答' },
-  { value: 'manage', label: 'Manage', desc: '+ ペインを閉じる・リサイズ' },
-  { value: 'admin', label: 'Admin', desc: '+ 端末管理（一覧・失効）' },
+  { value: 'manage', label: 'Manage', desc: '+ ペインの管理' },
+  { value: 'admin', label: 'Admin', desc: '+ 端末管理' },
 ];
 
-// 機器ペアリング画面（#283）。未登録端末はここしか操作できない:
-// 名前と希望 role を添えてペアリングを要求 → Mac 画面の承認ダイアログで
-// ユーザーが許可すると登録され、onRegistered() 経由で本画面へ進む
 export function PairingPage({ me, onRegistered }) {
   const [name, setName] = useState(getDeviceName());
   const [role, setRole] = useState('observe');
@@ -22,7 +18,6 @@ export function PairingPage({ me, onRegistered }) {
   const [error, setError] = useState(null);
   const pollRef = useRef(null);
 
-  // 承認待ちの間は me() をポーリングし、登録されたら親へ通知する
   useEffect(() => {
     if (phase !== 'pending') return undefined;
     pollRef.current = setInterval(async () => {
@@ -35,9 +30,7 @@ export function PairingPage({ me, onRegistered }) {
           clearInterval(pollRef.current);
           setPhase('denied');
         }
-      } catch {
-        // 一時的な失敗はポーリング継続
-      }
+      } catch {}
     }, POLL_MS);
     return () => clearInterval(pollRef.current);
   }, [phase]);
@@ -58,13 +51,14 @@ export function PairingPage({ me, onRegistered }) {
     }
   }
 
+  // 承認待ち — カンプのデザイントークンでダーク統一
   if (phase === 'pending') {
     return (
       <div class="connect-page">
         <div class="connect-card">
           <div class="connect-icon"><div class="spinner" /></div>
           <h1>Mac で承認してください</h1>
-          <p style="color: var(--text-muted); font-size: 14px; margin-top: 8px;">
+          <p style="color: var(--fg2); font-size: 14px; margin-top: 8px; max-width: 300px; line-height: 1.6;">
             {me.host ? `${me.host} の` : 'Mac の'}画面にペアリングの承認ダイアログが表示されています。
             「許可」を押すとこの端末が登録されます。
           </p>
@@ -80,9 +74,11 @@ export function PairingPage({ me, onRegistered }) {
     return (
       <div class="connect-page">
         <div class="connect-card">
-          <div class="connect-icon"><div class="status-badge danger">!</div></div>
+          <div class="connect-icon">
+            <span class="status-badge-circle danger">!</span>
+          </div>
           <h1>拒否されました</h1>
-          <p style="color: var(--text-muted); font-size: 14px; margin-top: 8px;">
+          <p style="color: var(--fg2); font-size: 14px; margin-top: 8px; max-width: 300px; line-height: 1.6;">
             Mac 側でペアリングが拒否されました。心当たりがなければそのまま閉じてください。
           </p>
           <div class="connect-actions">
@@ -97,11 +93,11 @@ export function PairingPage({ me, onRegistered }) {
     <div class="connect-page">
       <div class="connect-card" style="max-width: 360px;">
         <h1>この端末をペアリング</h1>
-        <p style="color: var(--text-muted); font-size: 13px; margin: 8px 0 16px;">
+        <p style="color: var(--fg2); font-size: 13px; margin: 8px 0 16px; line-height: 1.6;">
           {me.host ? `${me.host} に` : 'Mac に'}この端末の登録を要求します。
           Mac の画面で承認されるまで画面データは表示されません。
         </p>
-        <label style="display: block; text-align: left; font-size: 12px; color: var(--text-muted); margin-bottom: 4px;">
+        <label style="display: block; text-align: left; font-family: var(--mono); font-size: 10px; color: var(--fg3); letter-spacing: .05em; text-transform: uppercase; margin-bottom: 6px;">
           端末の名前
         </label>
         <input
@@ -110,26 +106,39 @@ export function PairingPage({ me, onRegistered }) {
           placeholder="例: iPhone"
           maxLength={64}
           onInput={e => setName(e.target.value)}
-          style="width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border, #2a2e35); background: var(--panel, #121519); color: inherit; font-size: 15px; margin-bottom: 14px;"
+          style="width: 100%; padding: 10px 14px; border-radius: 13px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); font-family: var(--mono); font-size: 13px; margin-bottom: 16px; outline: none;"
         />
-        <label style="display: block; text-align: left; font-size: 12px; color: var(--text-muted); margin-bottom: 4px;">
+        <label style="display: block; text-align: left; font-family: var(--mono); font-size: 10px; color: var(--fg3); letter-spacing: .05em; text-transform: uppercase; margin-bottom: 6px;">
           希望する権限
         </label>
-        <div style="display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px;">
+        <div style="display: flex; flex-direction: column; gap: 7px; margin-bottom: 16px;">
           {ROLES.map(r => (
             <button
               key={r.value}
-              class="btn"
-              style={`display: flex; justify-content: space-between; align-items: baseline; gap: 8px; text-align: left; ${role === r.value ? 'border-color: var(--accent, #D6795C); color: var(--accent, #D6795C);' : ''}`}
+              style={`
+                display: flex; align-items: center; gap: 11px;
+                border: 1px solid ${role === r.value ? 'var(--claude)' : 'var(--line)'};
+                border-radius: 13px; padding: 13px 14px; background: ${role === r.value ? 'var(--panel3)' : 'none'};
+                cursor: pointer; text-align: left; color: var(--fg);
+              `}
               onClick={() => setRole(r.value)}
             >
-              <span style="font-weight: 600;">{r.label}</span>
-              <span style="font-size: 11px; color: var(--text-muted); flex: 1; text-align: right;">{r.desc}</span>
+              <div style="display: flex; flex-direction: column; gap: 1px; min-width: 0;">
+                <span style="font-family: var(--mono); font-size: 13px; font-weight: 600;">{r.label}</span>
+                <span style="font-size: 11px; color: var(--fg2);">{r.desc}</span>
+              </div>
+              {role === r.value && (
+                <span style="margin-left: auto; color: var(--claude); font-size: 15px;">{'✓'}</span>
+              )}
             </button>
           ))}
         </div>
         {error && <p class="error-text">{error}</p>}
-        <button class="btn btn-primary" style="width: 100%;" onClick={requestPairing}>
+        <button
+          class="btn"
+          style="width: 100%; background: var(--claude); color: #1B0E09; border-color: var(--claude); font-weight: 600;"
+          onClick={requestPairing}
+        >
           ペアリングを要求
         </button>
       </div>

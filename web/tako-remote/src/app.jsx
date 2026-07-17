@@ -74,7 +74,7 @@ export function App() {
     return (
       <div class="connect-page">
         <div class="connect-card">
-          <div class="connect-icon"><div class="status-badge danger">!</div></div>
+          <div class="connect-icon"><span class="status-badge-circle danger">!</span></div>
           <h1>接続エラー</h1>
           <p class="error-text">{meError}</p>
           <p style="color: var(--text-muted); font-size: 13px; margin-top: 8px;">

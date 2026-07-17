@@ -2300,7 +2300,8 @@ fn refresh_pane_mapping(
 }
 
 /// List 応答をリモート API v2 形式に変換する。
-/// agent 種別・タイトル・role・cwd・タブ内位置・モデル・状態を含むペイン情報
+/// agent 種別・タイトル・role・cwd・タブ内位置・モデル・状態・session_id を含むペイン情報。
+/// agents が Some なら session_id をペインに紐付ける（チャットビュー用。#284）
 fn list_to_api_v2(list: &Value) -> Value {
     let mut panes = Vec::new();
     let tabs = list["tabs"].as_array().cloned().unwrap_or_default();
@@ -2317,17 +2318,11 @@ fn list_to_api_v2(list: &Value) -> Value {
             let state = pane["state"].as_str().unwrap_or("unknown");
             let surface = pane["surface"].as_str().unwrap_or("background");
 
-            // agent 種別の推定: role から判定
-            let agent_type = if role.contains("master") || role.contains("solo") {
-                if role.contains("codex") {
-                    "codex"
-                } else if role.contains("agy") {
-                    "agy"
-                } else {
-                    "claude"
-                }
-            } else if role.starts_with("orchestrator-worker") {
-                // worker は role の suffix から agent を推定
+            // agent 種別の推定: role から判定（master/solo/worker は同一ロジック）
+            let has_agent_role = role.contains("master")
+                || role.contains("solo")
+                || role.starts_with("orchestrator-worker");
+            let agent_type = if has_agent_role {
                 if role.contains("codex") {
                     "codex"
                 } else if role.contains("agy") {
@@ -2347,7 +2342,18 @@ fn list_to_api_v2(list: &Value) -> Value {
             // タブ内位置（1/N 形式）
             let position = format!("{}/{}", idx + 1, total_panes);
 
-            panes.push(json!({
+            // session_id: tmux バックエンドセッション名からエージェントの session_id を解決
+            let session_id = pane["tmux_session"]
+                .as_str()
+                .and_then(crate::agents::resolve_session_id_for_backend)
+                .or_else(|| {
+                    // フォールバック: pane ID から直接 agents リストを突き合わせ
+                    // sessions カタログがあれば使う
+                    let pane_id_str = id.to_string();
+                    crate::sessions::resolve_session_for_pane(&pane_id_str)
+                });
+
+            let mut entry = json!({
                 "id": id,
                 "title": title,
                 "role": role,
@@ -2361,7 +2367,11 @@ fn list_to_api_v2(list: &Value) -> Value {
                 "cols": pane["cols"],
                 "rows": pane["rows"],
                 "focused": pane["focused"],
-            }));
+            });
+            if let Some(sid) = session_id {
+                entry["session_id"] = json!(sid);
+            }
+            panes.push(entry);
         }
     }
     json!({ "panes": panes, "api_version": 2 })

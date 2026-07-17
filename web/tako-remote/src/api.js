@@ -46,7 +46,7 @@ export function createClient() {
       return request('POST', '/api/pair', { name, role });
     },
     panes() {
-      return request('GET', '/api/panes');
+      return request('GET', '/api/v2/panes');
     },
     screen(id, lines, ansi = false) {
       const params = [];

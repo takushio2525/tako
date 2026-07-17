@@ -642,6 +642,19 @@ fn parse_iso(iso: &str) -> Option<i64> {
     Some(days * 86_400 + hh * 3_600 + mm * 60 + ss)
 }
 
+/// ペイン ID から session_id を逆引きする（カタログの pane フィールドを使用。#284）。
+/// カタログが無い・読めない場合は None
+pub fn resolve_session_for_pane(pane_id: &str) -> Option<String> {
+    let pane_num: u64 = pane_id.parse().ok()?;
+    let catalog = SessionCatalog::load().ok()?;
+    for (session_id, entry) in &catalog.entries {
+        if entry.pane == Some(pane_num) {
+            return Some(session_id.clone());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
