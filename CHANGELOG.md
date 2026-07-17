@@ -26,6 +26,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed / 修正
 
+- Web ビューにフォーカスがあるとき tako のグローバルショートカット（⌘K / ⌘T / ⌘W 等）が効かない問題を修正: macOS の NSEvent local monitor で ⌘ キーイベントを先取りし、first responder が WKWebView なら GPUI の content view へ戻す。⌘C/⌘V 等の編集系は webview へそのまま渡す。コマンドパレット等のオーバーレイ表示中は webview を非表示にして重なりも解消 (#326)
+  Fixed global shortcuts (Cmd+K / Cmd+T / Cmd+W, etc.) not working when a Web view pane has focus: installed a macOS NSEvent local monitor that intercepts Cmd-modified key events and switches the first responder from WKWebView back to the GPUI content view for tako shortcuts while passing editing keys (Cmd+C/V, etc.) through to the webview. Also hides webviews when overlays (command palette, close confirm) are active to prevent z-order conflicts (#326)
 - master ペインの workers ドロップダウンの一覧項目に背景色がなく背後のターミナル文字が透けて見える問題を修正: GPUI の描画順でメニューがターミナルテキストエリアの前に描画されていたのをペイン div の最後尾に移動 (#341)
   Fixed workers dropdown list items having no background with terminal text bleeding through: moved the absolute-positioned menu to be painted last within the pane div, after the terminal text area (#341)
 - PDF プレビューのリンク ⌘クリックが無反応だった問題を根治: ページ画像 bounds をテキストレイヤからの逆算ではなく描画時に直接記録する方式に変更。テキストのないページでもリンクが動作し、全描画ページのリンクをチェック、ホバー時のカーソル変化 + 下線ハイライトを追加 (#315)
