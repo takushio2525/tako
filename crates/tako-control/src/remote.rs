@@ -2976,6 +2976,12 @@ mod urlencoding {
 mod tests {
     use super::*;
 
+    /// env var（TAKO_REMOTE_STATE_DIR / PATH）はプロセス全域のため、これを set/remove する
+    /// テスト同士が並列実行でレースする。特に PATH を空にする窓では verify_pid_identity の
+    /// ps 起動が失敗して検証素通り → daemon_stop_impl が自プロセスへ SIGTERM を送り
+    /// テスト全体が死ぬ（実測）。env var を触るテストはこのロックで直列化する
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn extract_pane_targetからidを取り出せる() {
         assert_eq!(
@@ -3155,6 +3161,8 @@ mod tests {
 
     #[test]
     fn qr_pngを生成できる() {
+        // generate_qr_png は state_dir（TAKO_REMOTE_STATE_DIR の影響下）に保存するため直列化する
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = super::generate_qr_png("http://192.168.1.100:7749#token=abc123def456")
             .expect("PNG 生成に失敗");
         assert!(path.exists());
@@ -3304,6 +3312,7 @@ mod tests {
 
     #[test]
     fn cloudflaredが無い環境ではエラーを返す() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let original = std::env::var("PATH").unwrap_or_default();
         std::env::set_var("PATH", "");
         let result = find_cloudflared();
@@ -3398,6 +3407,8 @@ mod tests {
 
     #[test]
     fn daemon_statusはpidファイルがないときfalse() {
+        // env var 窓中に他テストの pid ファイルを読んで cleanup しないよう直列化
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // テスト中に PID ファイルが存在しないことを前提にしない（他のテストが使うかも）
         // ので、存在しないパスを使う代わりに関数の戻り値形式を検証する
         let status = daemon_status();
@@ -3467,12 +3478,15 @@ mod tests {
 
     #[test]
     fn kill_stale_daemonは存在しないpidで安全に完了する() {
+        // cleanup_state_files が state_dir を掃除するため、env var 窓中の他テストを壊さないよう直列化
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // is_process_alive が false なので即 cleanup_state_files して return
         kill_stale_daemon(999_999_999);
     }
 
     #[test]
     fn daemon_statusはpidファイルが無ければnot_running() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // state_dir をテンポラリに差し替えて検証
         let dir = std::env::temp_dir().join(format!("tako-test-remote-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -3541,6 +3555,7 @@ mod tests {
 
     #[test]
     fn ensure_state_dirは0700でディレクトリを作る() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("tako-test-esd-{}", std::process::id()));
         std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
         let result = ensure_state_dir();
@@ -3559,6 +3574,7 @@ mod tests {
 
     #[test]
     fn parse_pid_fileは3行形式を解析する() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("tako-test-ppf-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
@@ -3584,6 +3600,7 @@ mod tests {
 
     #[test]
     fn daemon_stop_implはpid再利用時にkillしない() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 自分の PID を書いたが、args が "tako remote serve" でないのでエラーになる
         let dir = std::env::temp_dir().join(format!("tako-test-dsi-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
