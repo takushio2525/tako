@@ -2277,14 +2277,14 @@ impl TakoApp {
                         .map(|(id, t)| (*id, t.session.clone(), t.socket.clone()))
                         .collect();
                     let git_cwd = if app.panel_visible && app.panel_view == PanelView::Git {
-                        app.active_tab_cwd()
+                        app.git_cwd_for_tab()
                     } else {
                         None
                     };
                     let git_selected = app.git_selected_commit.clone();
                     // サイドバー表示中はブランチ + 変更サマリの軽量 git 取得（#217）
                     let sidebar_git_cwd = if app.filetree.visible {
-                        app.active_tab_cwd()
+                        app.git_cwd_for_tab()
                     } else {
                         None
                     };
@@ -3263,6 +3263,55 @@ impl TakoApp {
                         .map(|p| p.to_path_buf())
                 })
             })
+    }
+
+    /// git タブ用の cwd を決定する。フォーカスペインの cwd を優先し、
+    /// git リポジトリが見つからなければファイルツリーの全ソース（他ペインの cwd +
+    /// pinned フォルダ）からフォールバック検索する（#313）
+    fn git_cwd_for_tab(&self) -> Option<std::path::PathBuf> {
+        let tab = self.workspace.active_tab();
+        let active_pane = tab.tree().focused();
+
+        // フォーカスペインの cwd が git リポジトリ内ならそれを使う
+        if let Some(cwd) = self.terminals.get(&active_pane).and_then(|s| s.cwd()) {
+            if has_git_ancestor(cwd) {
+                return Some(cwd.to_path_buf());
+            }
+        }
+
+        // 他のフォアグラウンドペインの cwd を走査
+        for pane in tab.tree().panes() {
+            if pane.id() == active_pane {
+                continue;
+            }
+            if let Some(cwd) = self.terminals.get(&pane.id()).and_then(|s| s.cwd()) {
+                if has_git_ancestor(cwd) {
+                    return Some(cwd.to_path_buf());
+                }
+            }
+        }
+
+        // pinned フォルダを走査
+        for folder in tab.pinned_folders() {
+            if has_git_ancestor(folder) {
+                return Some(folder.clone());
+            }
+        }
+
+        // バックグラウンドペイン（同タブ由来）を走査
+        let tab_id = tab.id();
+        for bp in self.workspace.shelved_panes() {
+            if bp.origin_tab() != tab_id {
+                continue;
+            }
+            if let Some(cwd) = self.terminals.get(&bp.id()).and_then(|s| s.cwd()) {
+                if has_git_ancestor(cwd) {
+                    return Some(cwd.to_path_buf());
+                }
+            }
+        }
+
+        None
     }
 
     /// background thread で tmux セッション一覧を取得するためのコンテキストを収集する。
@@ -19464,6 +19513,21 @@ mod self_test {
 /// 実 IME / GUI を起動できない CI でもキーエンコードの退行を捕まえる
 /// ホイールデルタの行換算。整数化できた行数と持ち越す端数を返す。
 /// 方向が反転したら端数を捨てる（逆向きの貯金で初動が重くなるのを防ぐ）
+
+/// .git ディレクトリが祖先に存在するかの軽量チェック（プロセス spawn なし。#313）
+fn has_git_ancestor(dir: &std::path::Path) -> bool {
+    let mut cur = dir;
+    loop {
+        if cur.join(".git").exists() {
+            return true;
+        }
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => return false,
+        }
+    }
+}
+
 fn find_git_root(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -19788,5 +19852,37 @@ mod role_env_tests {
     fn 不明な形式は_none() {
         assert_eq!(role_from_orchestrator_env("unknown"), None);
         assert_eq!(role_from_orchestrator_env(""), None);
+    }
+}
+
+#[cfg(test)]
+mod git_ancestor_tests {
+    use super::has_git_ancestor;
+
+    #[test]
+    fn gitリポジトリ内のディレクトリで_true() {
+        let dir = std::env::current_dir().unwrap();
+        assert!(has_git_ancestor(&dir));
+    }
+
+    #[test]
+    fn gitリポジトリ内のサブディレクトリで_true() {
+        let dir = std::env::current_dir().unwrap().join("crates");
+        if dir.is_dir() {
+            assert!(has_git_ancestor(&dir));
+        }
+    }
+
+    #[test]
+    fn ルートディレクトリで_false() {
+        assert!(!has_git_ancestor(std::path::Path::new("/")));
+    }
+
+    #[test]
+    fn 一時ディレクトリで_false() {
+        let dir = std::env::temp_dir().join("tako-test-no-git");
+        let _ = std::fs::create_dir_all(&dir);
+        assert!(!has_git_ancestor(&dir));
+        let _ = std::fs::remove_dir(&dir);
     }
 }
