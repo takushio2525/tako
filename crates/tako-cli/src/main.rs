@@ -1110,6 +1110,16 @@ enum OrchestratorCommand {
         #[arg(long)]
         tab: Option<u64>,
     },
+    /// worker の permission ダイアログに応答する（#319）。
+    /// ダイアログ不在時はエラー（誤爆防止）
+    Respond {
+        /// 対象ペイン ID
+        #[arg(long)]
+        pane: u64,
+        /// 選択肢の番号（1-based）または "yes"/"no" エイリアス
+        #[arg(long)]
+        choice: String,
+    },
     /// spawn + 完了待ち + 出力取得 + close を 1 回で行う
     Run {
         /// プロジェクトキー（projects.yaml に登録済み）
@@ -1800,6 +1810,15 @@ fn main() -> ExitCode {
             .map_err(|e| e.to_string())
             .map(|result| println!("{}", pretty_json(&result)))
         }
+        Command::Orchestrator(OrchestratorCommand::Respond { pane, ref choice }) => {
+            let caller_role = std::env::var("TAKO_ORCHESTRATOR_ROLE").ok();
+            send_request(Request::OrchestratorRespond {
+                pane_id: pane,
+                choice: choice.clone(),
+                caller_role,
+            })
+            .map(|result| println!("{}", pretty_json(&result)))
+        }
         Command::Orchestrator(OrchestratorCommand::Run {
             ref project,
             ref prompt,
@@ -2342,6 +2361,21 @@ fn orchestrator_watch(
                 println!("  detail: {detail}");
             }
             println!("  action: check_and_resume");
+        }
+        wait::WatchOutcome::PermissionWaiting { permission_dialog } => {
+            println!("WORKER_PERMISSION: tako:{pane}");
+            if let Some(cmd) = permission_dialog.get("command").and_then(|v| v.as_str()) {
+                println!("  command: {cmd}");
+            }
+            if let Some(opts) = permission_dialog.get("options").and_then(|v| v.as_array()) {
+                for (i, opt) in opts.iter().enumerate() {
+                    if let Some(text) = opt.as_str() {
+                        println!("  {}. {text}", i + 1);
+                    }
+                }
+            }
+            println!("  action: respond");
+            print_events(&mut exec);
         }
         wait::WatchOutcome::Gone => println!("WORKER_GONE: tako:{pane}"),
         wait::WatchOutcome::Timeout => println!("WORKER_TIMEOUT: tako:{pane}"),
@@ -3537,6 +3571,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }
         Command::Orchestrator(OrchestratorCommand::Layout { .. }) => {
             unreachable!("orchestrator layout は run() を通らない（ローカルで config.yaml を操作）")
+        }
+        Command::Orchestrator(OrchestratorCommand::Respond { .. }) => {
+            unreachable!("orchestrator respond は run() を通らない")
         }
         Command::Orchestrator(OrchestratorCommand::Ledger(_)) => {
             unreachable!("orchestrator ledger は run() を通らない（ローカル処理）")

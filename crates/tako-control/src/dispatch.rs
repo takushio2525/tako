@@ -1872,6 +1872,13 @@ fn dispatch_inner(
             crate::orchestrator::wait::run_result(&run_id, exec).map_err(DispatchError::Operation)
         }
 
+        // #319: permission ダイアログへの構造化応答
+        Request::OrchestratorRespond {
+            pane_id,
+            choice,
+            caller_role,
+        } => dispatch_orchestrator_respond(host, pane_id, &choice, caller_role.as_deref()),
+
         Request::OrchestratorLedger {
             action,
             id,
@@ -4100,7 +4107,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         .as_ref()
         .is_some_and(|s| crate::orchestrator::wait::screen_is_collapsed(s));
 
-    // #243: events 配列（question / model_switched / context_high）
+    // #243: events 配列（question / model_switched / context_high / permission_dialog）
     let events: Vec<Value> = crate::orchestrator::wait::collect_worker_events(
         &status,
         recent_output.as_deref(),
@@ -4109,6 +4116,21 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     .iter()
     .map(|e| e.to_json())
     .collect();
+
+    // #319: waiting + 画面に permission ダイアログがあれば構造化情報を付与
+    let permission_dialog: Option<Value> = if status == "waiting" {
+        recent_output.as_ref().and_then(|out| {
+            let lines: Vec<String> = out.lines().map(|l| l.to_string()).collect();
+            let dialog = crate::claude_tui::detect_permission_dialog(&lines)?;
+            Some(json!({
+                "command": dialog.command,
+                "options": dialog.options,
+                "highlighted": dialog.highlighted,
+            }))
+        })
+    } else {
+        None
+    };
 
     Ok(json!({
         "status": status,
@@ -4121,6 +4143,89 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         "has_running_children": has_children,
         "collapsed": collapsed,
         "events": events,
+        "permission_dialog": permission_dialog,
+    }))
+}
+
+/// #319: permission ダイアログへの構造化応答
+fn dispatch_orchestrator_respond(
+    host: &dyn ControlHost,
+    pane_id: u64,
+    choice: &str,
+    caller_role: Option<&str>,
+) -> Result<Value, DispatchError> {
+    let target = PaneId::from_raw(pane_id);
+
+    // バックエンドセッションの取得
+    let backend_session = host.backend_session(target).ok_or_else(|| {
+        DispatchError::Operation(format!(
+            "ペイン {pane_id} のバックエンドセッションが見つからない"
+        ))
+    })?;
+
+    // 画面から permission ダイアログの存在を検証
+    let socket = tako_core::tmux_backend::socket_name();
+    let lines = tako_core::tmux::capture_session(Some(&socket), &backend_session)
+        .map_err(|e| DispatchError::Operation(format!("画面の取得に失敗: {e}")))?;
+    let dialog = crate::claude_tui::detect_permission_dialog(&lines).ok_or_else(|| {
+        DispatchError::Operation(
+            "ペイン画面に permission ダイアログが見つからない（既に解消済みか、別の画面状態です）"
+                .to_string(),
+        )
+    })?;
+
+    // choice を番号に解決
+    let choice_num: usize = match choice.to_lowercase().as_str() {
+        "yes" | "allow" => 1,
+        "no" | "deny" => {
+            // Deny は最後の選択肢（通常は 3 番目）
+            dialog
+                .options
+                .iter()
+                .position(|o| o.to_lowercase().contains("deny") || o.to_lowercase() == "no")
+                .map(|i| i + 1)
+                .unwrap_or(dialog.options.len())
+        }
+        n => n.parse().map_err(|_| {
+            DispatchError::Operation(format!(
+                "choice は番号（1-{}）または yes/no/allow/deny を指定してください: {choice}",
+                dialog.options.len()
+            ))
+        })?,
+    };
+    if choice_num == 0 || choice_num > dialog.options.len() {
+        return Err(DispatchError::Operation(format!(
+            "choice {choice_num} は範囲外です（1-{}）",
+            dialog.options.len()
+        )));
+    }
+
+    // 選択キーを送信: 番号キー → 短い待ち → Enter
+    tako_core::tmux::send_key(Some(&socket), &backend_session, &choice_num.to_string())
+        .map_err(|e| DispatchError::Operation(format!("番号キーの送信に失敗: {e}")))?;
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    tako_core::tmux::send_key(Some(&socket), &backend_session, "Enter")
+        .map_err(|e| DispatchError::Operation(format!("Enter の送信に失敗: {e}")))?;
+
+    let chosen_text = dialog
+        .options
+        .get(choice_num - 1)
+        .cloned()
+        .unwrap_or_default();
+
+    // 監査記録（persist.log。ペイン出力自体はキー入力の結果として画面に残る）
+    let caller = caller_role.unwrap_or("unknown");
+    crate::diag::persist_log(&format!(
+        "[permission-respond] caller={caller} pane={pane_id} choice={choice_num} ({chosen_text}) command={}",
+        dialog.command
+    ));
+
+    Ok(json!({
+        "pane_id": pane_id,
+        "responded": true,
+        "choice": choice_num,
+        "choice_text": chosen_text,
+        "command": dialog.command,
     }))
 }
 

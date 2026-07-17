@@ -255,16 +255,10 @@ mod pdf_hit_test_tests {
         let link_bbox = [72.0, 648.0, 144.0, 72.0];
         let screen = pdf_box_to_screen(link_bbox, page_size, image);
 
-        let inside = point(
-            screen.origin.x + px(10.0),
-            screen.origin.y + px(10.0),
-        );
+        let inside = point(screen.origin.x + px(10.0), screen.origin.y + px(10.0));
         assert!(screen.contains(&inside));
 
-        let just_outside = point(
-            screen.origin.x - px(1.0),
-            screen.origin.y + px(10.0),
-        );
+        let just_outside = point(screen.origin.x - px(1.0), screen.origin.y + px(10.0));
         assert!(!screen.contains(&just_outside));
     }
 }

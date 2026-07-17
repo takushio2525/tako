@@ -28,6 +28,109 @@ use serde_json::json;
 
 // --- 画面状態の検出（純関数） ---
 
+// --- permission ダイアログ検知（#319） ---
+
+/// Claude Code / codex / agy の permission ダイアログ（ツール実行の承認要求）の構造化情報
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionDialog {
+    /// 承認を求めている操作の説明（画面から抽出した要約行）
+    pub command: String,
+    /// 選択肢のリスト（表示順。番号は含まず、テキスト部分のみ）
+    pub options: Vec<String>,
+    /// 現在ハイライトされている選択肢のインデックス（0-based。`❯` / `>` マーカー位置）
+    pub highlighted: Option<usize>,
+}
+
+/// 画面から permission ダイアログを検知し、構造化情報を返す。
+///
+/// 検知パターン（実採取画面由来。claude v2.x / codex 0.x / agy 1.x）:
+/// - 「Allow once」または「Allow for this session」を含む選択肢行
+/// - agy の「Do you want to proceed?」+ 選択肢
+/// - 信頼ダイアログ（`is_trust_dialog`）は除外（別経路で自動承諾済み）
+/// - rate limit ダイアログ（`Approaching rate limits`）は除外（#157 で WORKER_ERROR）
+pub fn detect_permission_dialog(lines: &[String]) -> Option<PermissionDialog> {
+    if is_trust_dialog(lines) {
+        return None;
+    }
+    if lines.iter().any(|l| l.contains("Approaching rate limits")) {
+        return None;
+    }
+
+    // permission ダイアログの選択肢パターンを探す
+    let has_permission_marker = lines.iter().any(|l| {
+        l.contains("Allow once")
+            || l.contains("Allow for this session")
+            || l.contains("Always allow")
+            || (l.contains("Do you want to proceed?"))
+    });
+    if !has_permission_marker {
+        return None;
+    }
+
+    // コマンド/操作の説明を抽出: 選択肢行より上の内容行
+    let mut command_parts = Vec::new();
+    let mut options = Vec::new();
+    let mut highlighted: Option<usize> = None;
+    let mut in_choices = false;
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("Press enter")
+            || trimmed.starts_with("Esc ")
+        {
+            continue;
+        }
+        // 選択カーソル ❯ / > を除去した内容テキスト。
+        // ❯ は UTF-8 で 3 バイト（U+276F）、> は ASCII 1 バイト
+        let (is_highlighted, inner) = if let Some(rest) = trimmed.strip_prefix("❯ ") {
+            (true, rest.trim_start())
+        } else if let Some(rest) = trimmed.strip_prefix("> ") {
+            (true, rest.trim_start())
+        } else {
+            (false, trimmed)
+        };
+
+        // 番号付き選択肢行: 「N. テキスト」（N=1〜9）
+        let is_numbered_choice = inner.len() > 2
+            && inner.as_bytes()[0].is_ascii_digit()
+            && inner.as_bytes()[1] == b'.'
+            && inner.as_bytes()[2] == b' ';
+
+        if is_numbered_choice {
+            in_choices = true;
+            if is_highlighted {
+                highlighted = Some(options.len());
+            }
+            options.push(inner[3..].trim().to_string());
+        } else if !in_choices {
+            // 選択肢の前 = コマンド説明部分
+            let desc = trimmed
+                .trim_start_matches("? ")
+                .trim_start_matches("❯ ")
+                .trim_start_matches("> ");
+            if !desc.is_empty()
+                && !desc.starts_with("──")
+                && !desc.contains("Navigate")
+                && !desc.contains("ctrl+g")
+            {
+                command_parts.push(desc.to_string());
+            }
+        }
+    }
+
+    if options.is_empty() {
+        return None;
+    }
+
+    let command = command_parts.join(" ").trim().to_string();
+    Some(PermissionDialog {
+        command,
+        options,
+        highlighted,
+    })
+}
+
 /// claude TUI の画面状態
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaudeScreen {
@@ -690,5 +793,80 @@ esc to cancel                                       Claude Opus 4.6 (Thinking)"#
         assert_eq!(prompt_content(">"), Some(""));
         // 全角・枠線行は不一致
         assert_eq!(prompt_content("│ >_ OpenAI Codex │"), None);
+    }
+
+    // --- #319: permission ダイアログ検知 ---
+
+    /// claude の Bash 承認ダイアログ（実採取相当。#312 の worker 停止時の画面）
+    const CLAUDE_BASH_PERMISSION: &str = r#"  Claude wants to run:
+
+  TAKO_ISOLATED=1 cargo run -p tako-app
+
+  Allow this command?
+
+❯ 1. Allow once
+  2. Always allow for this session
+  3. Deny
+
+  Press enter to confirm · Esc to cancel"#;
+
+    /// claude の Read/Write 承認ダイアログ（wait.rs の PERMISSION_DIALOG_SCREEN と同等）
+    const CLAUDE_FILE_PERMISSION: &str = r#"? Claude requested permissions to write to .../main.aux
+  (suspicious Windows path pattern)
+❯ 1. Allow once
+  2. Always allow
+  3. Deny
+
+  Press enter to confirm"#;
+
+    #[test]
+    fn claudeのbash承認ダイアログを検知する() {
+        let lines = screen(CLAUDE_BASH_PERMISSION);
+        let dialog = detect_permission_dialog(&lines).expect("検知される");
+        assert!(
+            dialog.command.contains("TAKO_ISOLATED"),
+            "コマンド部分を抽出: {}",
+            dialog.command
+        );
+        assert_eq!(dialog.options.len(), 3);
+        assert_eq!(dialog.options[0], "Allow once");
+        assert_eq!(dialog.options[1], "Always allow for this session");
+        assert_eq!(dialog.options[2], "Deny");
+        assert_eq!(dialog.highlighted, Some(0), "❯ が 1. を指している");
+    }
+
+    #[test]
+    fn claudeのファイル承認ダイアログを検知する() {
+        let lines = screen(CLAUDE_FILE_PERMISSION);
+        let dialog = detect_permission_dialog(&lines).expect("検知される");
+        assert!(dialog.command.contains("write to"));
+        assert_eq!(dialog.options.len(), 3);
+        assert_eq!(dialog.highlighted, Some(0));
+    }
+
+    #[test]
+    fn agyの許可ダイアログを検知する() {
+        let lines = screen(AGY_PERMISSION_DIALOG);
+        let dialog = detect_permission_dialog(&lines).expect("検知される");
+        assert!(dialog.command.contains("Do you want to proceed?"));
+        assert_eq!(dialog.options.len(), 4);
+        assert_eq!(dialog.options[0], "Yes");
+        assert_eq!(dialog.options[3], "No");
+        assert_eq!(dialog.highlighted, Some(0), "> 1. を指している");
+    }
+
+    #[test]
+    fn 信頼ダイアログをpermission_dialogとして誤検知しない() {
+        assert!(detect_permission_dialog(&screen(TRUST_DIALOG)).is_none());
+        assert!(detect_permission_dialog(&screen(CODEX_TRUST_DIALOG)).is_none());
+        assert!(detect_permission_dialog(&screen(AGY_TRUST_DIALOG)).is_none());
+    }
+
+    #[test]
+    fn 通常画面をpermission_dialogとして誤検知しない() {
+        assert!(detect_permission_dialog(&screen(READY_BARE)).is_none());
+        assert!(detect_permission_dialog(&screen(CODEX_READY)).is_none());
+        assert!(detect_permission_dialog(&screen(AGY_READY)).is_none());
+        assert!(detect_permission_dialog(&screen(AGY_BUSY)).is_none());
     }
 }
