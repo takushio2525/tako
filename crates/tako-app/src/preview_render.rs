@@ -225,6 +225,48 @@ mod pdf_hit_test_tests {
         assert_eq!(wanted_pdf_image_indices(9, 10), vec![8, 9]);
         assert!(wanted_pdf_image_indices(0, 0).is_empty());
     }
+
+    #[test]
+    fn pdfリンクのヒットテストはページ画像boundsから正しく判定する() {
+        // 612×792 のページが画面座標 (50, 100) に 400×518 で描画されている想定
+        let image = bounds(50.0, 100.0, 400.0, 518.0);
+        let page_size = [612.0, 792.0];
+        // PDF 左下原点で (100, 700, 200, 30) のリンク bbox
+        let link_bbox = [100.0, 700.0, 200.0, 30.0];
+        let screen = pdf_box_to_screen(link_bbox, page_size, image);
+
+        // リンク矩形の中心をクリック → 含まれる
+        let center = point(
+            screen.origin.x + screen.size.width / 2.0,
+            screen.origin.y + screen.size.height / 2.0,
+        );
+        assert!(screen.contains(&center));
+
+        // リンク矩形の外 → 含まれない
+        let outside = point(px(10.0), px(10.0));
+        assert!(!screen.contains(&outside));
+    }
+
+    #[test]
+    fn pdfリンクはズーム後も正しくヒットする() {
+        // 150% ズーム + スクロールオフセット
+        let image = bounds(-120.0, -240.0, 918.0, 1188.0);
+        let page_size = [612.0, 792.0];
+        let link_bbox = [72.0, 648.0, 144.0, 72.0];
+        let screen = pdf_box_to_screen(link_bbox, page_size, image);
+
+        let inside = point(
+            screen.origin.x + px(10.0),
+            screen.origin.y + px(10.0),
+        );
+        assert!(screen.contains(&inside));
+
+        let just_outside = point(
+            screen.origin.x - px(1.0),
+            screen.origin.y + px(10.0),
+        );
+        assert!(!screen.contains(&just_outside));
+    }
 }
 
 impl TakoApp {
@@ -1164,80 +1206,116 @@ impl TakoApp {
                         };
                         let page_canvas_width = viewport_width.max(scaled_page_width);
 
+                        let page_index = i;
+                        let hovered_link_bbox: Option<[f64; 4]> = self
+                            .preview_pdf_hovered_link
+                            .filter(|(pid, _)| *pid == pane_id)
+                            .and_then(|(_, link_idx)| data.links.links.get(link_idx))
+                            .filter(|link| link.page_index == i)
+                            .map(|link| link.bbox);
+                        let link_accent = theme.accent;
                         let overlay = canvas(
                             |_, _, _| (),
-                            move |bounds, _, _window, cx| {
-                                if text_lines_for_canvas.is_empty() {
-                                    return;
-                                }
+                            move |bounds, _, window, cx| {
                                 let img_w = f32::from(bounds.size.width) as f64;
                                 let img_h = f32::from(bounds.size.height) as f64;
                                 if img_w <= 0.0 || img_h <= 0.0 {
                                     return;
                                 }
-                                let page_line_bounds: Vec<Bounds<Pixels>> = text_lines_for_canvas
-                                    .iter()
-                                    .map(|line| {
-                                        pdf_box_to_screen(line.bbox, [pdf_w, pdf_h], bounds)
-                                    })
-                                    .collect();
-                                let mut page_char_bounds: Vec<Vec<Bounds<Pixels>>> =
-                                    Vec::with_capacity(text_lines_for_canvas.len());
-                                for tl in text_lines_for_canvas.iter() {
-                                    let mut line_char_bounds =
-                                        Vec::with_capacity(tl.char_boxes.len());
-                                    for ch in &tl.char_boxes {
-                                        line_char_bounds.push(pdf_box_to_screen(
-                                            ch.bbox,
-                                            [pdf_w, pdf_h],
-                                            bounds,
-                                        ));
-                                    }
-                                    page_char_bounds.push(line_char_bounds);
-                                }
+                                let has_text = !text_lines_for_canvas.is_empty();
+                                let page_line_bounds: Vec<Bounds<Pixels>> = if has_text {
+                                    text_lines_for_canvas
+                                        .iter()
+                                        .map(|line| {
+                                            pdf_box_to_screen(line.bbox, [pdf_w, pdf_h], bounds)
+                                        })
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
+                                let page_char_bounds: Vec<Vec<Bounds<Pixels>>> = if has_text {
+                                    text_lines_for_canvas
+                                        .iter()
+                                        .map(|tl| {
+                                            tl.char_boxes
+                                                .iter()
+                                                .map(|ch| {
+                                                    pdf_box_to_screen(
+                                                        ch.bbox,
+                                                        [pdf_w, pdf_h],
+                                                        bounds,
+                                                    )
+                                                })
+                                                .collect()
+                                        })
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
 
                                 if let Some(e) = entity.upgrade() {
-                                    // canvas paint は root entity の更新サイクル内から呼ばれる場合が
-                                    // ある。即時 e.update は GPUI の再入更新になるため、行・文字の
-                                    // 座標反映を effect cycle 末尾へ 1 回だけ defer する。
                                     cx.defer(move |cx| {
                                         e.update(cx, |app, cx| {
-                                            let lines =
-                                                app.preview_line_bounds.entry(pane_id).or_default();
-                                            for (j, line_bounds) in
-                                                page_line_bounds.iter().enumerate()
-                                            {
-                                                let idx = page_line_offset + j;
-                                                if lines.len() <= idx {
-                                                    lines.resize(idx + 1, Bounds::default());
-                                                }
-                                                lines[idx] = *line_bounds;
-                                            }
-
-                                            let chars = app
-                                                .preview_pdf_char_bounds
+                                            // ページ画像 bounds を直接記録（#315）
+                                            app.preview_pdf_page_image_bounds
                                                 .entry(pane_id)
-                                                .or_default();
-                                            let mut changed = false;
-                                            for (j, line_bounds) in
-                                                page_char_bounds.iter().enumerate()
-                                            {
-                                                let idx = page_line_offset + j;
-                                                if chars.len() <= idx {
-                                                    chars.resize(idx + 1, Vec::new());
+                                                .or_default()
+                                                .insert(page_index, bounds);
+
+                                            if has_text {
+                                                let lines = app
+                                                    .preview_line_bounds
+                                                    .entry(pane_id)
+                                                    .or_default();
+                                                for (j, line_bounds) in
+                                                    page_line_bounds.iter().enumerate()
+                                                {
+                                                    let idx = page_line_offset + j;
+                                                    if lines.len() <= idx {
+                                                        lines.resize(idx + 1, Bounds::default());
+                                                    }
+                                                    lines[idx] = *line_bounds;
                                                 }
-                                                if chars[idx] != *line_bounds {
-                                                    chars[idx] = line_bounds.clone();
-                                                    changed = true;
+
+                                                let chars = app
+                                                    .preview_pdf_char_bounds
+                                                    .entry(pane_id)
+                                                    .or_default();
+                                                let mut changed = false;
+                                                for (j, line_bounds) in
+                                                    page_char_bounds.iter().enumerate()
+                                                {
+                                                    let idx = page_line_offset + j;
+                                                    if chars.len() <= idx {
+                                                        chars.resize(idx + 1, Vec::new());
+                                                    }
+                                                    if chars[idx] != *line_bounds {
+                                                        chars[idx] = line_bounds.clone();
+                                                        changed = true;
+                                                    }
                                                 }
-                                            }
-                                            if changed {
-                                                // リサイズ / スクロール後は次フレームで最前面の
-                                                // ハイライト矩形を新しい座標へ追従させる。
-                                                cx.notify();
+                                                if changed {
+                                                    cx.notify();
+                                                }
                                             }
                                         });
                                     });
+                                }
+
+                                // ホバー中リンクの下線ハイライト描画（#315）
+                                if let Some(bbox) = hovered_link_bbox {
+                                    let link_bounds =
+                                        pdf_box_to_screen(bbox, [pdf_w, pdf_h], bounds);
+                                    let underline_h = px(2.0);
+                                    let underline = Bounds {
+                                        origin: point(
+                                            link_bounds.origin.x,
+                                            link_bounds.origin.y + link_bounds.size.height
+                                                - underline_h,
+                                        ),
+                                        size: gpui::size(link_bounds.size.width, underline_h),
+                                    };
+                                    window.paint_quad(fill(underline, hsla(link_accent)));
                                 }
                             },
                         )
@@ -2569,6 +2647,8 @@ impl TakoApp {
                 self.preview_line_texts.insert(pane_id, line_texts);
                 // bounds 追跡用にリセット（各行の canvas で上書きされる）
                 self.preview_line_bounds.insert(pane_id, Vec::new());
+                self.preview_pdf_page_image_bounds
+                    .insert(pane_id, HashMap::new());
                 self.preview_text_layouts.insert(pane_id, line_layouts);
                 let scroll_handle = self
                     .preview_scroll_handles
@@ -2585,11 +2665,18 @@ impl TakoApp {
                     .track_scroll(&scroll_handle)
                     .when(zoomable, |d| d.overflow_scroll())
                     .when(!zoomable, |d| d.overflow_y_scroll())
-                    .cursor(if mode == preview::PreviewMode::Image {
-                        CursorStyle::Arrow
-                    } else {
-                        CursorStyle::IBeam
-                    })
+                    .cursor(
+                        if self
+                            .preview_pdf_hovered_link
+                            .is_some_and(|(pid, _)| pid == pane_id)
+                        {
+                            CursorStyle::PointingHand
+                        } else if mode == preview::PreviewMode::Image {
+                            CursorStyle::Arrow
+                        } else {
+                            CursorStyle::IBeam
+                        },
+                    )
                     // 非ズーム対象へリスナー自体を登録すると、セルフテストの
                     // dispatch_event が root update 中に listener update を再入させる。
                     // Image / PDF にだけイベント経路を載せる。
