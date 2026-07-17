@@ -1016,6 +1016,7 @@ fn dispatch_inner(
             width,
             view,
             filetree,
+            sidebar_width,
         } => {
             if let Some(w) = width {
                 if !w.is_finite() || w <= 0.0 {
@@ -1024,9 +1025,22 @@ fn dispatch_inner(
                     ));
                 }
             }
+            if let Some(sw) = sidebar_width {
+                if !sw.is_finite() || sw <= 0.0 {
+                    return Err(DispatchError::InvalidParams(
+                        "sidebar_width は正の数（px）を指定する".into(),
+                    ));
+                }
+            }
             host.set_panel(visible, width, view);
             if let Some(filetree) = filetree {
                 host.set_filetree(filetree);
+            }
+            if let Some(sw) = sidebar_width {
+                host.set_sidebar_width(sw);
+                let mut settings = crate::settings::load();
+                settings.sidebar_width = sw as u32;
+                let _ = crate::settings::save(&settings);
             }
             let (visible, width, view) = host.panel_state();
             Ok(json!({
@@ -1034,6 +1048,7 @@ fn dispatch_inner(
                 "width": width,
                 "view": view.as_str(),
                 "filetree": host.filetree_visible(),
+                "sidebar_width": host.sidebar_width(),
             }))
         }
 

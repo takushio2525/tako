@@ -153,10 +153,12 @@ impl TakoApp {
             );
         }
         let inline_edit_snapshot = self.inline_edit.clone();
+        let sidebar_w = self.sidebar_width;
         Some(
             div()
-                .w(px(SIDEBAR_WIDTH))
+                .w(px(sidebar_w))
                 .h_full()
+                .relative()
                 .flex()
                 .flex_col()
                 .bg(rgba(theme.mantle))
@@ -615,7 +617,26 @@ impl TakoApp {
                                 }))
                                 .child("diff \u{2192}"),
                         )
-                })),
+                }))
+                // 右端のリサイズハンドル（Issue #307。右パネルと同方式）
+                .child(
+                    div()
+                        .id("sidebar-resize")
+                        .absolute()
+                        .right(px(0.0))
+                        .top(px(0.0))
+                        .w(px(BORDER_HANDLE))
+                        .h_full()
+                        .cursor(gpui::CursorStyle::ResizeLeftRight)
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
+                                this.dragging_sidebar = true;
+                                cx.stop_propagation();
+                            }),
+                        ),
+                ),
         )
     }
 

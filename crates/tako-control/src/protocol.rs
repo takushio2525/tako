@@ -291,6 +291,8 @@ pub enum Request {
         view: Option<PanelViewWire>,
         /// 左サイドバーのファイルツリー（FR-3.1）の表示・非表示
         filetree: Option<bool>,
+        /// 左サイドバーの幅（px。Issue #307）
+        sidebar_width: Option<f32>,
     },
     /// サイドバー tmux ビューのタブ枠の折りたたみ（FR-2.16.14）。折りたたむと、その
     /// タブ配下の**バックグラウンド項目（裏で実行中のペイン行 + バックグラウンド）を隠し、前面表示中の
