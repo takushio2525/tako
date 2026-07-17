@@ -8,8 +8,8 @@ compatibility_date = "2024-12-01"
 # 生成された ID を以下に記入する
 [[kv_namespaces]]
 binding = "REPORTS_KV"
-id = "PLACEHOLDER_PRODUCTION_ID"
-preview_id = "PLACEHOLDER_PREVIEW_ID"
+id = "24e82234923142e0ba9185db2e15bd24"
+preview_id = "59eb34c07f38402a9348d87f6b907aa3"
 
 # 読み取りエンドポイントの認証トークンは Worker の secret に設定する:
 #   wrangler secret put ADMIN_TOKEN

@@ -26,6 +26,8 @@
 # Cloudflare Workers
 web/tako-remote-worker/.dev.vars
 web/tako-remote-worker/node_modules/
+web/tako-error-collector/.dev.vars
+web/tako-error-collector/node_modules/
 .wrangler/
 
 # 検証アーティファクト（ユーザー名等の環境情報を含みうるため commit しない。#76 / #77）
