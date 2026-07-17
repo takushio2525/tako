@@ -828,3 +828,13 @@
 - Cloudflare Worker + Rust telemetry + panic ハンドラ + CLI/MCP 1:1（95 ツール）。既定 OFF（opt-in）。Worker デプロイ + 通し実測（人工レポート到達確認）完了
 - 関連コミット: PR #345 squash merge（`a19dd54`）。Worker テスト 11/11 + Rust テスト 12/12 + 品質ゲート全緑
 - 次: `build-app.sh --install` で反映 → #333 クローズは master 判断
+
+## 2026-07-17（#338: プレビューペインにチェンジログビュー切替を実装）
+- 「履歴」トグルでコード ⇔ git 履歴ビュー切替。コミット一覧 + ファイル単位 diff 展開。git 管理外ファイルは安全表示。CLI `tako preview-changelog` + MCP `tako_preview_changelog`（95 ツール）
+- 関連コミット: `f2c1c80`、PR #348。テスト 4 本追加（606 全緑）+ 品質ゲート全緑
+- 次: squash merge → `build-app.sh --install` → 実機確認 → #338 クローズは master 判断
+
+## 2026-07-17（#314: ファイルツリー右クリメニュー改善 — デフォルトアプリ/見切れ修正）
+- ファイル右クリに「デフォルトアプリで開く」「このアプリで開く...」追加 + コンテキストメニューの見切れ修正（フリップ/クランプ）。FileOpKind に OpenDefault / OpenWith 追加（dispatch / MCP / CLI 1:1）
+- 関連コミット: `495ca44`（PR #349 squash merge）。テスト 5 本追加（486 全緑）+ 品質ゲート全緑 + 隔離セルフテスト完走
+- 次: `build-app.sh --install` → 実機確認 → #314 クローズ
