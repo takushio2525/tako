@@ -254,6 +254,8 @@ pub enum Request {
     },
     /// タブ切替（FR-2.5.10）
     TabSelect { tab: u64 },
+    /// タブの並べ替え（#308）。`tab` を `index`（0 始まり）の位置へ移動する
+    TabReorder { tab: u64, index: usize },
     /// ペインの移動（FR-2.5.10 / FR-1.10）。`tab` 指定 = 別タブの末尾へ移送（従来動作）、
     /// `target` 指定 = そのペインを `direction`（省略時は右）へ分割した位置に挿し直す
     /// （同タブ内の並べ替え = タイトルバー D&D と同等。タブまたぎも可）。
@@ -291,6 +293,8 @@ pub enum Request {
         view: Option<PanelViewWire>,
         /// 左サイドバーのファイルツリー（FR-3.1）の表示・非表示
         filetree: Option<bool>,
+        /// 左サイドバーの幅（px。Issue #307）
+        sidebar_width: Option<f32>,
     },
     /// サイドバー tmux ビューのタブ枠の折りたたみ（FR-2.16.14）。折りたたむと、その
     /// タブ配下の**バックグラウンド項目（裏で実行中のペイン行 + バックグラウンド）を隠し、前面表示中の
@@ -390,6 +394,15 @@ pub enum Request {
     PreviewAutosave {
         pane: Option<u64>,
         enabled: Option<bool>,
+    },
+    /// プレビューのチェンジログビュー切替（Issue #338）。
+    /// `enabled` 省略時は現在の状態取得のみ。`max_count` はコミット取得上限（省略時 50）。
+    /// `expand` はコミットハッシュ指定でそのコミットの diff を展開/折りたたみ。
+    PreviewChangelog {
+        pane: Option<u64>,
+        enabled: Option<bool>,
+        max_count: Option<usize>,
+        expand: Option<String>,
     },
     /// ファイルシステム操作（FR-3.12）
     FileOp {
@@ -537,6 +550,9 @@ pub enum Request {
         /// 呼び出しプロセスの pid（#288: pid 祖先辿りで caller を確実に特定）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_pid: Option<u32>,
+        /// 委任台帳の task_type（Issue #292。統制語彙。省略時は investigation）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_type: Option<String>,
     },
     /// オーケストレーター: master が自身の pane/tab/ctx% を取得する（#123 / #193 / #288）。
     /// 解決順序: caller_pid pid 祖先辿り → pane env → stale map → role 検索（複数時エラー）
@@ -577,6 +593,43 @@ pub enum Request {
     /// 未完了なら `phase: "running"` を返す。完了済みなら出力取得 + auto_close +
     /// レジストリから除去
     OrchestratorRunResult { run_id: String },
+    /// オーケストレーター: worker の permission ダイアログへの応答（#319）。
+    /// ダイアログが画面上に存在することを検証してから選択キーを送る。
+    /// 不在時はエラー（誤爆防止）
+    OrchestratorRespond {
+        pane_id: u64,
+        /// 選択肢の番号（1-based）または "yes"/"no" エイリアス
+        choice: String,
+        /// 呼び出し元の TAKO_ORCHESTRATOR_ROLE（監査ログ用）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_role: Option<String>,
+    },
+    /// オーケストレーター: 委任台帳の操作（Issue #292）。
+    /// action: list / stats / record / amend
+    OrchestratorLedger {
+        action: String,
+        /// record / amend 対象のエントリ ID
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// record: 検収結果（pass / rework / fail）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<String>,
+        /// record: 差し戻し回数
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rounds: Option<u32>,
+        /// record / amend: メモ
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        /// list: フィルタ用 project
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        /// list: フィルタ用 task_type
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_type: Option<String>,
+        /// list: 返す件数の上限
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
     /// リモートアクセス API サーバーの起動。`port` 省略時は 7749。
     /// transport は Tailscale Serve のみ（tailnet 内限定・WireGuard E2E 暗号化。#282）。
     /// Tailscale が未セットアップ（未導入・未ログイン・HTTPS 未有効等）なら
@@ -708,6 +761,22 @@ pub enum Request {
         /// テーマモード: "dark" / "light"（set 時に必須）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
+    },
+    /// エラーレポートの自動送信（テレメトリ）の状態確認・切替（Issue #333）。
+    /// `action` = "status"（既定）/ "on" / "off"。設定は settings.json に永続化される
+    Telemetry {
+        #[serde(default)]
+        action: Option<String>,
+    },
+    /// ステータスバーの利用制限表示サービスの状態確認・切替（Issue #321）。
+    /// `action` = "status"（既定）/ "set"（`service` へ変更）。
+    /// 変更は settings.json に永続化され、GUI に即時反映される
+    LimitService {
+        #[serde(default)]
+        action: Option<String>,
+        /// サービス名: "claude" / "codex" / "agy"（set 時に必須）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service: Option<String>,
     },
     /// ファイルツリーへのフォルダ追加・削除・一覧（#134）。
     /// AI が作業対象プロジェクトのフォルダをファイルツリーに明示追加する。タブ単位スコープ
@@ -854,6 +923,33 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sync_checkpoint: Option<bool>,
     },
+    /// 対話コマンドのペイン委譲（Issue #305）。split → タイトル設定 → コマンド投入を
+    /// アトミックに実行し、pane_id を返す。コマンドは exit code 回収マーカーでラップされる
+    RunInteractive {
+        pane: Option<u64>,
+        tab: Option<u64>,
+        /// 実行するコマンド文字列（シェル経由で実行される）
+        command: String,
+        /// ユーザーへの入力案内（タイトルに「要入力: <hint>」として表示）
+        input_hint: Option<String>,
+        direction: Option<Direction>,
+        /// 新ペイン側の取り分（0.0–1.0、省略時 0.3）
+        ratio: Option<f32>,
+        /// 完了後の自動 close 方針。
+        /// "success"（既定）= exit 0 で自動 close / "always" = 常に close / "never" = 残す
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_close: Option<String>,
+    },
+    /// run-interactive で起動したペインの完了状態を問い合わせる（Issue #305）。
+    /// マーカー `__TAKO_EXIT=<code>` をペイン出力から探し、見つかれば exit code を返す。
+    /// auto_close 方針に従い、完了済みペインを自動 close する
+    RunInteractiveStatus {
+        pane: u64,
+        /// true のとき完了を待たず現在の状態だけ返す（既定 false = マーカー検出まで待つ。
+        /// ただし即座に帰る実装で、AI がポーリングする想定）
+        #[serde(default)]
+        no_wait: bool,
+    },
 }
 
 impl Request {
@@ -945,6 +1041,10 @@ pub enum FileOpKind {
     CreateFile,
     CreateDir,
     Trash,
+    /// デフォルトアプリで開く（macOS: `open <path>`）
+    OpenDefault,
+    /// 指定アプリで開く（macOS: `open -a <name> <path>`。name フィールド必須）
+    OpenWith,
 }
 
 #[cfg(test)]

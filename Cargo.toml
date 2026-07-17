@@ -49,9 +49,10 @@ qrcode = "0.14"
 syntect = { version = "5", default-features = false, features = [
     "parsing",
     "regex-fancy",
-    "default-syntaxes",
     "default-themes",
 ] }
+# bat 由来の拡張構文セット（TOML・TypeScript・Dockerfile 等 270+ 構文。#320）
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 # Markdown プレビューのパーサ（FR-3.3。イベントストリーム型で GPUI 独自描画に写す）
 pulldown-cmark = { version = "0.13", default-features = false }
 # 表示中プレビューファイルのイベント駆動監視（Issue #233）。macOS は FSEvents、

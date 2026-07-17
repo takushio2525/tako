@@ -39,6 +39,7 @@ pub mod setup;
 pub mod sleep_guard;
 pub mod tailscale;
 pub mod task_checkpoints;
+pub mod telemetry;
 pub mod transcript;
 
 pub use dispatch::{

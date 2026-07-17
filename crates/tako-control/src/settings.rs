@@ -47,10 +47,23 @@ pub struct Settings {
     /// UI テーマ（Issue #217。"dark" / "light"。既定 dark）
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// 左サイドバー（ファイルツリー）の幅（px 整数。Issue #307。既定 244）
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: u32,
+    /// エラーレポートの自動送信（Issue #333。既定 OFF = opt-in）
+    #[serde(default)]
+    pub telemetry: bool,
+    /// ステータスバーの利用制限表示で選択中のサービス（Issue #321。既定 "claude"）
+    #[serde(default = "default_limit_service")]
+    pub limit_service: String,
 }
 
 fn default_theme() -> String {
     "dark".into()
+}
+
+fn default_sidebar_width() -> u32 {
+    244
 }
 
 fn default_true() -> bool {
@@ -69,6 +82,10 @@ fn default_preview_cache_max_mb() -> u64 {
     tako_core::PREVIEW_CACHE_DEFAULT_MB
 }
 
+fn default_limit_service() -> String {
+    "claude".into()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -84,6 +101,9 @@ impl Default for Settings {
             pane_log_max_mb: default_pane_log_max_mb(),
             pane_log_total_max_mb: default_pane_log_total_max_mb(),
             theme: default_theme(),
+            sidebar_width: default_sidebar_width(),
+            telemetry: false,
+            limit_service: default_limit_service(),
         }
     }
 }
@@ -101,6 +121,11 @@ impl Settings {
     /// テーマモードを tako-core の型へ解決する（不明値は既定ダーク。Issue #217）
     pub fn theme_mode(&self) -> tako_core::theme::ThemeMode {
         tako_core::theme::ThemeMode::parse(&self.theme).unwrap_or_default()
+    }
+
+    /// 利用制限表示の選択サービスを解決する（不明値は既定 Claude。Issue #321）
+    pub fn limit_service(&self) -> tako_core::LimitService {
+        tako_core::LimitService::parse(&self.limit_service).unwrap_or_default()
     }
 }
 
@@ -173,6 +198,9 @@ mod tests {
             pane_log_max_mb: 10,
             pane_log_total_max_mb: 300,
             theme: "light".into(),
+            sidebar_width: 300,
+            telemetry: true,
+            limit_service: "codex".into(),
         };
         save_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), Some(settings));
@@ -209,6 +237,13 @@ mod tests {
         // テーマの既定はダーク（Issue #217。旧ファイル後方互換）
         assert_eq!(parsed.theme, "dark");
         assert_eq!(parsed.theme_mode(), tako_core::theme::ThemeMode::Dark);
+        // サイドバー幅の既定（Issue #307。旧ファイル後方互換）
+        assert_eq!(parsed.sidebar_width, 244);
+        // テレメトリの既定は OFF（Issue #333。opt-in）
+        assert!(!parsed.telemetry);
+        // 利用制限サービスの既定は claude（Issue #321。旧ファイル後方互換）
+        assert_eq!(parsed.limit_service, "claude");
+        assert_eq!(parsed.limit_service(), tako_core::LimitService::Claude);
     }
 
     #[test]

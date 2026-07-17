@@ -79,6 +79,8 @@ pub struct Pane {
     role: Option<String>,
     /// spawn 元ペイン（オーケストレーター worker 用。セッション内で使い捨て、永続化不要）
     spawned_by: Option<PaneId>,
+    /// run-interactive のメタデータ (auto_close_policy, command)。セッション内で使い捨て
+    interactive_meta: Option<(String, String)>,
 }
 
 impl Pane {
@@ -90,6 +92,7 @@ impl Pane {
             title_source: TitleSource::Default,
             role: None,
             spawned_by: None,
+            interactive_meta: None,
         }
     }
 
@@ -110,6 +113,7 @@ impl Pane {
             title_source,
             role,
             spawned_by: None,
+            interactive_meta: None,
         }
     }
 
@@ -164,6 +168,15 @@ impl Pane {
 
     pub fn set_spawned_by(&mut self, parent: Option<PaneId>) {
         self.spawned_by = parent;
+    }
+
+    /// run-interactive のメタデータ (auto_close_policy, command)
+    pub fn interactive_meta(&self) -> Option<&(String, String)> {
+        self.interactive_meta.as_ref()
+    }
+
+    pub fn set_interactive_meta(&mut self, auto_close: String, command: String) {
+        self.interactive_meta = Some((auto_close, command));
     }
 }
 

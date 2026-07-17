@@ -172,6 +172,12 @@ pub trait UiStateHost {
     }
     /// ファイルツリーの表示・非表示（root の cwd 同期は実装側の責務）
     fn set_filetree(&mut self, _visible: bool) {}
+    /// 左サイドバーの幅（px。Issue #307）
+    fn sidebar_width(&self) -> f32 {
+        244.0
+    }
+    /// 左サイドバーの幅を設定する（Issue #307。永続化は呼び出し側の責務）
+    fn set_sidebar_width(&mut self, _width: f32) {}
     /// ファイルツリーの root 同期をトリガーする（#134: pinned_folders 変更後に呼ぶ）
     fn sync_filetree(&mut self) {}
     /// ピン留め中のプレビュー一覧（FR-2.16.15）
@@ -188,6 +194,12 @@ pub trait UiStateHost {
     }
     /// UI テーマモードの切替（再描画は実装側の責務。永続化は dispatch 側で行う）
     fn set_theme_mode(&mut self, _mode: tako_core::theme::ThemeMode) {}
+    /// ステータスバーの利用制限表示で選択中のサービス（Issue #321）
+    fn limit_service(&self) -> tako_core::LimitService {
+        tako_core::LimitService::Claude
+    }
+    /// 利用制限表示のサービス切替（再描画は実装側の責務。永続化は dispatch 側で行う）
+    fn set_limit_service(&mut self, _service: tako_core::LimitService) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +322,28 @@ pub trait PreviewHost {
         _all: bool,
     ) -> Result<serde_json::Value, String> {
         Err("プレビュー編集は未対応".into())
+    }
+    /// プレビューペインのチェンジログビュー状態（Issue #338）。
+    /// `(enabled, commits_json)` を返す。enabled=true ならチェンジログ表示中。
+    fn preview_changelog_state(&self, _pane: PaneId) -> Option<bool> {
+        None
+    }
+    /// チェンジログビューの ON/OFF 切替。コミット一覧の取得・描画は実装側の責務。
+    fn set_preview_changelog(
+        &mut self,
+        _pane: PaneId,
+        _enabled: bool,
+        _max_count: usize,
+    ) -> Result<serde_json::Value, String> {
+        Err("チェンジログビューは未対応".into())
+    }
+    /// チェンジログビューで特定コミットの diff を展開/折りたたみする。
+    fn toggle_changelog_diff(
+        &mut self,
+        _pane: PaneId,
+        _hash: &str,
+    ) -> Result<serde_json::Value, String> {
+        Err("チェンジログビューは未対応".into())
     }
     /// タブ内の既存プレビューペイン（OpenFile の再利用先。VSCode のプレビュータブ相当）
     fn preview_pane_of_tab(&self, _tab: TabId) -> Option<PaneId> {

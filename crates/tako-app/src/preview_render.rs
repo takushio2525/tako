@@ -225,6 +225,42 @@ mod pdf_hit_test_tests {
         assert_eq!(wanted_pdf_image_indices(9, 10), vec![8, 9]);
         assert!(wanted_pdf_image_indices(0, 0).is_empty());
     }
+
+    #[test]
+    fn pdfリンクのヒットテストはページ画像boundsから正しく判定する() {
+        // 612×792 のページが画面座標 (50, 100) に 400×518 で描画されている想定
+        let image = bounds(50.0, 100.0, 400.0, 518.0);
+        let page_size = [612.0, 792.0];
+        // PDF 左下原点で (100, 700, 200, 30) のリンク bbox
+        let link_bbox = [100.0, 700.0, 200.0, 30.0];
+        let screen = pdf_box_to_screen(link_bbox, page_size, image);
+
+        // リンク矩形の中心をクリック → 含まれる
+        let center = point(
+            screen.origin.x + screen.size.width / 2.0,
+            screen.origin.y + screen.size.height / 2.0,
+        );
+        assert!(screen.contains(&center));
+
+        // リンク矩形の外 → 含まれない
+        let outside = point(px(10.0), px(10.0));
+        assert!(!screen.contains(&outside));
+    }
+
+    #[test]
+    fn pdfリンクはズーム後も正しくヒットする() {
+        // 150% ズーム + スクロールオフセット
+        let image = bounds(-120.0, -240.0, 918.0, 1188.0);
+        let page_size = [612.0, 792.0];
+        let link_bbox = [72.0, 648.0, 144.0, 72.0];
+        let screen = pdf_box_to_screen(link_bbox, page_size, image);
+
+        let inside = point(screen.origin.x + px(10.0), screen.origin.y + px(10.0));
+        assert!(screen.contains(&inside));
+
+        let just_outside = point(screen.origin.x - px(1.0), screen.origin.y + px(10.0));
+        assert!(!screen.contains(&just_outside));
+    }
 }
 
 impl TakoApp {
@@ -1016,697 +1052,750 @@ impl TakoApp {
             .filter(|s| s.search_visible && !s.search_hits.is_empty())
             .map(|s| (s.search_hits.as_slice(), s.search_index));
 
+        // チェンジログビューの判定（Issue #338）
+        let changelog_active = self.preview_changelogs.contains_key(&pane_id);
+        let changelog_data = self.preview_changelogs.get(&pane_id).cloned();
+
         // 本文要素を先に組む（state の借用をここで終える）
-        let body: Vec<gpui::AnyElement> = match &state.content {
-            preview::PreviewContent::Code(lines) => {
-                let number_width = lines.len().to_string().len();
-                let mut doc_offset: usize = 0;
-                lines
-                    .iter()
-                    .enumerate()
-                    .map(|(i, line)| {
-                        let text: String = line.iter().map(|s| s.text.as_str()).collect();
-                        let line_start = doc_offset;
-                        let line_end = doc_offset + text.len();
-                        doc_offset = line_end + 1; // +1 for '\n'
-                        let sel_range = selection
-                            .as_ref()
-                            .and_then(|s| s.range_for_line(i, text.len()));
-                        let hit_ranges = search_hits
-                            .map(|(hits, idx)| {
-                                search_hits_for_line(hits, idx, line_start, line_end)
-                            })
-                            .unwrap_or_default();
-                        line_texts.push(text);
-                        let cursor_col = edit_cursor
-                            .filter(|(line, _)| *line == i)
-                            .map(|(_, col)| col);
-                        let (element, layout) = self.preview_code_line_sel(
-                            line,
-                            Some((i + 1, number_width)),
-                            (sel_range, cursor_col),
-                            &hit_ranges,
-                            cx,
-                        );
-                        line_layouts.push(Some(layout));
-                        element.into_any_element()
-                    })
-                    .collect()
-            }
-            preview::PreviewContent::Markdown(blocks) => {
-                let mut doc_offset: usize = 0;
-                blocks
-                    .iter()
-                    .enumerate()
-                    .map(|(i, block)| {
-                        let text = md_block_plain_text(block);
-                        let line_start = doc_offset;
-                        let line_end = doc_offset + text.len();
-                        doc_offset = line_end + 1;
-                        let sel_range = selection
-                            .as_ref()
-                            .and_then(|s| s.range_for_line(i, text.len()));
-                        let hit_ranges = search_hits
-                            .map(|(hits, idx)| {
-                                search_hits_for_line(hits, idx, line_start, line_end)
-                            })
-                            .unwrap_or_default();
-                        line_texts.push(text);
-                        let (element, layout) =
-                            self.preview_md_block_sel(block, sel_range, &hit_ranges);
-                        line_layouts.push(layout);
-                        element
-                    })
-                    .collect()
-            }
-            preview::PreviewContent::Image(_) => {
-                // Issue #168: Image はキャッシュ済み（ensure_preview_image_cache）
-                let image = self
-                    .preview_image_cache
-                    .get(&pane_id)
-                    .and_then(|c| c.images.first())
-                    .and_then(|i| i.as_ref().map(|cached| cached.image.clone()));
-                match image {
-                    Some(image) => {
-                        let scaled_width = viewport_width * preview_zoom;
-                        let scaled_height = viewport_height * preview_zoom;
-                        let canvas_width = viewport_width.max(scaled_width);
-                        let canvas_height = viewport_height.max(scaled_height);
-                        vec![div()
-                            .flex_none()
-                            .w(px(canvas_width))
-                            .h(px(canvas_height))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                gpui::img(image)
-                                    .object_fit(gpui::ObjectFit::Contain)
-                                    .w(px(scaled_width))
-                                    .h(px(scaled_height)),
-                            )
-                            .into_any_element()]
-                    }
-                    None => Vec::new(),
+        let body: Vec<gpui::AnyElement> = if let Some(cl) = &changelog_data {
+            self.render_changelog_body(pane_id, cl, &theme, cx)
+        } else {
+            match &state.content {
+                preview::PreviewContent::Code(lines) => {
+                    let number_width = lines.len().to_string().len();
+                    let mut doc_offset: usize = 0;
+                    lines
+                        .iter()
+                        .enumerate()
+                        .map(|(i, line)| {
+                            let text: String = line.iter().map(|s| s.text.as_str()).collect();
+                            let line_start = doc_offset;
+                            let line_end = doc_offset + text.len();
+                            doc_offset = line_end + 1; // +1 for '\n'
+                            let sel_range = selection
+                                .as_ref()
+                                .and_then(|s| s.range_for_line(i, text.len()));
+                            let hit_ranges = search_hits
+                                .map(|(hits, idx)| {
+                                    search_hits_for_line(hits, idx, line_start, line_end)
+                                })
+                                .unwrap_or_default();
+                            line_texts.push(text);
+                            let cursor_col = edit_cursor
+                                .filter(|(line, _)| *line == i)
+                                .map(|(_, col)| col);
+                            let (element, layout) = self.preview_code_line_sel(
+                                line,
+                                Some((i + 1, number_width)),
+                                (sel_range, cursor_col),
+                                &hit_ranges,
+                                cx,
+                            );
+                            line_layouts.push(Some(layout));
+                            element.into_any_element()
+                        })
+                        .collect()
                 }
-            }
-            preview::PreviewContent::Pdf(data) => {
-                // テキスト行を line_texts に登録（選択テキスト抽出用）
-                let mut global_line_idx: usize = 0;
-                for page_lines in &data.text_layers {
-                    for tl in page_lines {
-                        line_texts.push(tl.text.clone());
-                        global_line_idx += 1;
-                    }
+                preview::PreviewContent::Markdown(blocks) => {
+                    let mut doc_offset: usize = 0;
+                    blocks
+                        .iter()
+                        .enumerate()
+                        .map(|(i, block)| {
+                            let text = md_block_plain_text(block);
+                            let line_start = doc_offset;
+                            let line_end = doc_offset + text.len();
+                            doc_offset = line_end + 1;
+                            let sel_range = selection
+                                .as_ref()
+                                .and_then(|s| s.range_for_line(i, text.len()));
+                            let hit_ranges = search_hits
+                                .map(|(hits, idx)| {
+                                    search_hits_for_line(hits, idx, line_start, line_end)
+                                })
+                                .unwrap_or_default();
+                            line_texts.push(text);
+                            let (element, layout) =
+                                self.preview_md_block_sel(block, sel_range, &hit_ranges);
+                            line_layouts.push(layout);
+                            element
+                        })
+                        .collect()
                 }
-                let _ = global_line_idx;
-
-                let mut line_offset: usize = 0;
-                // Issue #168: ページ画像とテキストレイヤは ensure_preview_image_cache が
-                // 構築済み。ここでは Arc clone だけ行う（旧実装は毎フレーム全ページの
-                // PNG clone + Image::from_bytes のフルハッシュで p50 96ms/frame だった）
-                let empty_cache = PreviewImageCache {
-                    key: PreviewImageCacheKey::Original(PathBuf::new()),
-                    images: Vec::new(),
-                    text_layers: Vec::new(),
-                };
-                let cache = self
-                    .preview_image_cache
-                    .get(&pane_id)
-                    .unwrap_or(&empty_cache);
-                data.pages
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, png)| !png.is_empty())
-                    .map(|(i, _)| {
-                        // ensure_preview_image_cache 直後なので None は起きない想定
-                        // （防御: 欠損時は空要素を返し、次フレームの再構築に任せる）
-                        let image = cache
-                            .images
-                            .get(i)
-                            .and_then(|img| img.as_ref().map(|cached| cached.image.clone()));
-                        let page_text_lines = data.text_layers.get(i);
-                        let page_size = data.page_sizes.get(i).copied().unwrap_or([612.0, 792.0]);
-                        let page_line_offset = line_offset;
-                        let n_lines = page_text_lines.map(|l| l.len()).unwrap_or(0);
-                        line_offset += n_lines;
-
-                        let entity = cx.entity().downgrade();
-                        let text_lines_for_canvas: std::sync::Arc<Vec<preview::PdfTextLine>> =
-                            cache.text_layers.get(i).cloned().unwrap_or_default();
-                        let pdf_w = page_size[0];
-                        let pdf_h = page_size[1];
-                        let scaled_page_width = viewport_width * preview_zoom;
-                        let scaled_page_height = if pdf_w > 0.0 {
-                            scaled_page_width * (pdf_h / pdf_w) as f32
-                        } else {
-                            scaled_page_width
-                        };
-                        let page_canvas_width = viewport_width.max(scaled_page_width);
-
-                        let overlay = canvas(
-                            |_, _, _| (),
-                            move |bounds, _, _window, cx| {
-                                if text_lines_for_canvas.is_empty() {
-                                    return;
-                                }
-                                let img_w = f32::from(bounds.size.width) as f64;
-                                let img_h = f32::from(bounds.size.height) as f64;
-                                if img_w <= 0.0 || img_h <= 0.0 {
-                                    return;
-                                }
-                                let page_line_bounds: Vec<Bounds<Pixels>> = text_lines_for_canvas
-                                    .iter()
-                                    .map(|line| {
-                                        pdf_box_to_screen(line.bbox, [pdf_w, pdf_h], bounds)
-                                    })
-                                    .collect();
-                                let mut page_char_bounds: Vec<Vec<Bounds<Pixels>>> =
-                                    Vec::with_capacity(text_lines_for_canvas.len());
-                                for tl in text_lines_for_canvas.iter() {
-                                    let mut line_char_bounds =
-                                        Vec::with_capacity(tl.char_boxes.len());
-                                    for ch in &tl.char_boxes {
-                                        line_char_bounds.push(pdf_box_to_screen(
-                                            ch.bbox,
-                                            [pdf_w, pdf_h],
-                                            bounds,
-                                        ));
-                                    }
-                                    page_char_bounds.push(line_char_bounds);
-                                }
-
-                                if let Some(e) = entity.upgrade() {
-                                    // canvas paint は root entity の更新サイクル内から呼ばれる場合が
-                                    // ある。即時 e.update は GPUI の再入更新になるため、行・文字の
-                                    // 座標反映を effect cycle 末尾へ 1 回だけ defer する。
-                                    cx.defer(move |cx| {
-                                        e.update(cx, |app, cx| {
-                                            let lines =
-                                                app.preview_line_bounds.entry(pane_id).or_default();
-                                            for (j, line_bounds) in
-                                                page_line_bounds.iter().enumerate()
-                                            {
-                                                let idx = page_line_offset + j;
-                                                if lines.len() <= idx {
-                                                    lines.resize(idx + 1, Bounds::default());
-                                                }
-                                                lines[idx] = *line_bounds;
-                                            }
-
-                                            let chars = app
-                                                .preview_pdf_char_bounds
-                                                .entry(pane_id)
-                                                .or_default();
-                                            let mut changed = false;
-                                            for (j, line_bounds) in
-                                                page_char_bounds.iter().enumerate()
-                                            {
-                                                let idx = page_line_offset + j;
-                                                if chars.len() <= idx {
-                                                    chars.resize(idx + 1, Vec::new());
-                                                }
-                                                if chars[idx] != *line_bounds {
-                                                    chars[idx] = line_bounds.clone();
-                                                    changed = true;
-                                                }
-                                            }
-                                            if changed {
-                                                // リサイズ / スクロール後は次フレームで最前面の
-                                                // ハイライト矩形を新しい座標へ追従させる。
-                                                cx.notify();
-                                            }
-                                        });
-                                    });
-                                }
-                            },
-                        )
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .size_full();
-
-                        let mut surface = div()
-                            .relative()
-                            .w(px(scaled_page_width))
-                            .h(px(scaled_page_height))
-                            .bg(hsla(theme.background));
-                        if let Some(image) = image {
-                            surface = surface
-                                .child(
-                                    gpui::img(image)
-                                        .object_fit(gpui::ObjectFit::Contain)
-                                        .size_full(),
-                                )
-                                .child(overlay);
-                        }
-
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .flex_none()
-                            .w(px(page_canvas_width))
-                            .pb_2()
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.6))
-                                    .pb_1()
-                                    .child(SharedString::from(format!(
-                                        "— {} / {} —",
-                                        i + 1,
-                                        data.total_pages
-                                    ))),
-                            )
-                            .child(surface)
-                            .into_any_element()
-                    })
-                    .collect()
-            }
-            preview::PreviewContent::Video(data) => {
-                let mut elements: Vec<gpui::AnyElement> = Vec::new();
-
-                if let Some(player) = self.video_players.get(&pane_id) {
-                    // AVFoundation プレイヤー起動中: キャッシュ済みフレームを表示
-                    let gen = player.frame_gen;
-                    let need_update = match self.video_frame_cache.get(&pane_id) {
-                        Some((cached_gen, _)) => *cached_gen != gen,
-                        None => true,
-                    };
-                    if need_update && !player.current_bgra.is_empty() {
-                        let w = player.width;
-                        let h = player.height;
-                        if let Some(rgba_img) =
-                            image::RgbaImage::from_raw(w, h, player.current_bgra.clone())
-                        {
-                            let frame = image::Frame::new(rgba_img);
-                            let render = std::sync::Arc::new(gpui::RenderImage::new(vec![frame]));
-                            if let Some((_, old)) =
-                                self.video_frame_cache.insert(pane_id, (gen, render))
-                            {
-                                self.pending_video_frame_evictions.push(old);
-                            }
-                        }
-                    }
-                    if let Some((_, ref frame_image)) = self.video_frame_cache.get(&pane_id) {
-                        let frame_image = frame_image.clone();
-                        elements.push(
-                            div()
+                preview::PreviewContent::Image(_) => {
+                    // Issue #168: Image はキャッシュ済み（ensure_preview_image_cache）
+                    let image = self
+                        .preview_image_cache
+                        .get(&pane_id)
+                        .and_then(|c| c.images.first())
+                        .and_then(|i| i.as_ref().map(|cached| cached.image.clone()));
+                    match image {
+                        Some(image) => {
+                            let scaled_width = viewport_width * preview_zoom;
+                            let scaled_height = viewport_height * preview_zoom;
+                            let canvas_width = viewport_width.max(scaled_width);
+                            let canvas_height = viewport_height.max(scaled_height);
+                            vec![div()
+                                .flex_none()
+                                .w(px(canvas_width))
+                                .h(px(canvas_height))
                                 .flex()
                                 .items_center()
                                 .justify_center()
                                 .child(
-                                    gpui::img(frame_image)
+                                    gpui::img(image)
                                         .object_fit(gpui::ObjectFit::Contain)
-                                        .max_w_full()
-                                        .flex_1(),
+                                        .w(px(scaled_width))
+                                        .h(px(scaled_height)),
                                 )
-                                .into_any_element(),
-                        );
+                                .into_any_element()]
+                        }
+                        None => Vec::new(),
                     }
-                    let is_playing = player.state == video_player::PlaybackState::Playing;
-                    let current_time = player.current_time;
-                    let duration = player.duration;
-                    let current_rate = player.rate;
+                }
+                preview::PreviewContent::Pdf(data) => {
+                    // テキスト行を line_texts に登録（選択テキスト抽出用）
+                    let mut global_line_idx: usize = 0;
+                    for page_lines in &data.text_layers {
+                        for tl in page_lines {
+                            line_texts.push(tl.text.clone());
+                            global_line_idx += 1;
+                        }
+                    }
+                    let _ = global_line_idx;
 
-                    let play_btn_label: SharedString = if is_playing {
-                        "\u{23f8}".into() // ⏸
-                    } else {
-                        "\u{25b6}\u{fe0e}".into() // ▶︎
+                    let mut line_offset: usize = 0;
+                    // Issue #168: ページ画像とテキストレイヤは ensure_preview_image_cache が
+                    // 構築済み。ここでは Arc clone だけ行う（旧実装は毎フレーム全ページの
+                    // PNG clone + Image::from_bytes のフルハッシュで p50 96ms/frame だった）
+                    let empty_cache = PreviewImageCache {
+                        key: PreviewImageCacheKey::Original(PathBuf::new()),
+                        images: Vec::new(),
+                        text_layers: Vec::new(),
                     };
-                    let cur_m = current_time as u64 / 60;
-                    let cur_s = current_time as u64 % 60;
-                    let dur_m = duration as u64 / 60;
-                    let dur_s = duration as u64 % 60;
-                    let time_label: SharedString =
-                        format!("{cur_m}:{cur_s:02} / {dur_m}:{dur_s:02}").into();
-                    let progress_frac = if duration > 0.0 {
-                        (current_time / duration).clamp(0.0, 1.0) as f32
-                    } else {
-                        0.0
-                    };
-                    let seek_dur = duration;
+                    let cache = self
+                        .preview_image_cache
+                        .get(&pane_id)
+                        .unwrap_or(&empty_cache);
+                    data.pages
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, png)| !png.is_empty())
+                        .map(|(i, _)| {
+                            // ensure_preview_image_cache 直後なので None は起きない想定
+                            // （防御: 欠損時は空要素を返し、次フレームの再構築に任せる）
+                            let image = cache
+                                .images
+                                .get(i)
+                                .and_then(|img| img.as_ref().map(|cached| cached.image.clone()));
+                            let page_text_lines = data.text_layers.get(i);
+                            let page_size =
+                                data.page_sizes.get(i).copied().unwrap_or([612.0, 792.0]);
+                            let page_line_offset = line_offset;
+                            let n_lines = page_text_lines.map(|l| l.len()).unwrap_or(0);
+                            line_offset += n_lines;
 
-                    let is_muted = player.muted;
-                    let is_looping = player.looping;
-
-                    // ホバー時刻ツールチップ
-                    let hover_tooltip = self
-                        .video_seek_hover
-                        .filter(|&(pid, _, _)| pid == pane_id)
-                        .map(|(_, hover_sec, hover_x)| {
-                            let hm = hover_sec as u64 / 60;
-                            let hs = hover_sec as u64 % 60;
-                            let label: SharedString = format!("{hm}:{hs:02}").into();
-                            div()
-                                .absolute()
-                                .bottom(px(16.0))
-                                .left(px(hover_x - 20.0))
-                                .px(px(4.0))
-                                .py(px(1.0))
-                                .rounded(px(3.0))
-                                .bg(hsla_alpha(theme.background, 0.95))
-                                .border_1()
-                                .border_color(hsla_alpha(theme.foreground, 0.3))
-                                .text_size(px(11.0))
-                                .text_color(hsla(theme.foreground))
-                                .child(label)
-                        });
-
-                    // シークバー（クリック + ドラッグ対応 + つまみノブ + ホバー時刻）
-                    let mut seek_bar = div()
-                        .id(("video-seek", pane_id.as_u64()))
-                        .relative()
-                        .flex_1()
-                        .h(px(14.0))
-                        .cursor_pointer()
-                        .child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .right_0()
-                                .top(px(4.0))
-                                .h(px(6.0))
-                                .rounded(px(3.0))
-                                .bg(hsla_alpha(theme.foreground, 0.2))
-                                .child(
-                                    div()
-                                        .h_full()
-                                        .rounded(px(3.0))
-                                        .bg(hsla(theme.ansi[4]))
-                                        .w(relative(progress_frac)),
-                                ),
-                        )
-                        // つまみノブ
-                        .child(
-                            div()
-                                .absolute()
-                                .top(px(1.0))
-                                .left(relative(progress_frac))
-                                .ml(px(-6.0))
-                                .w(px(12.0))
-                                .h(px(12.0))
-                                .rounded_full()
-                                .bg(hsla(theme.ansi[4])),
-                        )
-                        .child({
                             let entity = cx.entity().downgrade();
-                            canvas(
+                            let text_lines_for_canvas: std::sync::Arc<Vec<preview::PdfTextLine>> =
+                                cache.text_layers.get(i).cloned().unwrap_or_default();
+                            let pdf_w = page_size[0];
+                            let pdf_h = page_size[1];
+                            let scaled_page_width = viewport_width * preview_zoom;
+                            let scaled_page_height = if pdf_w > 0.0 {
+                                scaled_page_width * (pdf_h / pdf_w) as f32
+                            } else {
+                                scaled_page_width
+                            };
+                            let page_canvas_width = viewport_width.max(scaled_page_width);
+
+                            let page_index = i;
+                            let hovered_link_bbox: Option<[f64; 4]> = self
+                                .preview_pdf_hovered_link
+                                .filter(|(pid, _)| *pid == pane_id)
+                                .and_then(|(_, link_idx)| data.links.links.get(link_idx))
+                                .filter(|link| link.page_index == i)
+                                .map(|link| link.bbox);
+                            let link_accent = theme.accent;
+                            let overlay = canvas(
                                 |_, _, _| (),
-                                move |bounds, _, _, cx| {
+                                move |bounds, _, window, cx| {
+                                    let img_w = f32::from(bounds.size.width) as f64;
+                                    let img_h = f32::from(bounds.size.height) as f64;
+                                    if img_w <= 0.0 || img_h <= 0.0 {
+                                        return;
+                                    }
+                                    let has_text = !text_lines_for_canvas.is_empty();
+                                    let page_line_bounds: Vec<Bounds<Pixels>> = if has_text {
+                                        text_lines_for_canvas
+                                            .iter()
+                                            .map(|line| {
+                                                pdf_box_to_screen(line.bbox, [pdf_w, pdf_h], bounds)
+                                            })
+                                            .collect()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    let page_char_bounds: Vec<Vec<Bounds<Pixels>>> = if has_text {
+                                        text_lines_for_canvas
+                                            .iter()
+                                            .map(|tl| {
+                                                tl.char_boxes
+                                                    .iter()
+                                                    .map(|ch| {
+                                                        pdf_box_to_screen(
+                                                            ch.bbox,
+                                                            [pdf_w, pdf_h],
+                                                            bounds,
+                                                        )
+                                                    })
+                                                    .collect()
+                                            })
+                                            .collect()
+                                    } else {
+                                        Vec::new()
+                                    };
+
                                     if let Some(e) = entity.upgrade() {
-                                        e.update(cx, |app, _| {
-                                            app.video_seek_bar_bounds.insert(pane_id, bounds);
+                                        cx.defer(move |cx| {
+                                            e.update(cx, |app, cx| {
+                                                // ページ画像 bounds を直接記録（#315）
+                                                app.preview_pdf_page_image_bounds
+                                                    .entry(pane_id)
+                                                    .or_default()
+                                                    .insert(page_index, bounds);
+
+                                                if has_text {
+                                                    let lines = app
+                                                        .preview_line_bounds
+                                                        .entry(pane_id)
+                                                        .or_default();
+                                                    for (j, line_bounds) in
+                                                        page_line_bounds.iter().enumerate()
+                                                    {
+                                                        let idx = page_line_offset + j;
+                                                        if lines.len() <= idx {
+                                                            lines
+                                                                .resize(idx + 1, Bounds::default());
+                                                        }
+                                                        lines[idx] = *line_bounds;
+                                                    }
+
+                                                    let chars = app
+                                                        .preview_pdf_char_bounds
+                                                        .entry(pane_id)
+                                                        .or_default();
+                                                    let mut changed = false;
+                                                    for (j, line_bounds) in
+                                                        page_char_bounds.iter().enumerate()
+                                                    {
+                                                        let idx = page_line_offset + j;
+                                                        if chars.len() <= idx {
+                                                            chars.resize(idx + 1, Vec::new());
+                                                        }
+                                                        if chars[idx] != *line_bounds {
+                                                            chars[idx] = line_bounds.clone();
+                                                            changed = true;
+                                                        }
+                                                    }
+                                                    if changed {
+                                                        cx.notify();
+                                                    }
+                                                }
+                                            });
                                         });
+                                    }
+
+                                    // ホバー中リンクの下線ハイライト描画（#315）
+                                    if let Some(bbox) = hovered_link_bbox {
+                                        let link_bounds =
+                                            pdf_box_to_screen(bbox, [pdf_w, pdf_h], bounds);
+                                        let underline_h = px(2.0);
+                                        let underline = Bounds {
+                                            origin: point(
+                                                link_bounds.origin.x,
+                                                link_bounds.origin.y + link_bounds.size.height
+                                                    - underline_h,
+                                            ),
+                                            size: gpui::size(link_bounds.size.width, underline_h),
+                                        };
+                                        window.paint_quad(fill(underline, hsla(link_accent)));
                                     }
                                 },
                             )
                             .absolute()
-                            .size_full()
-                        })
-                        .on_mouse_down(
-                            gpui::MouseButton::Left,
-                            cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
-                                this.video_seek_dragging = Some(pane_id);
-                                this.video_seek_by_click(pane_id, ev.position, seek_dur, cx);
-                            }),
-                        )
-                        .on_mouse_up(
-                            gpui::MouseButton::Left,
-                            cx.listener(move |this, _ev: &gpui::MouseUpEvent, _, _cx| {
-                                if this.video_seek_dragging == Some(pane_id) {
-                                    this.video_seek_dragging = None;
-                                }
-                            }),
-                        )
-                        .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
-                            if this.video_seek_dragging == Some(pane_id) {
-                                this.video_seek_by_drag(pane_id, ev.position, cx);
-                            }
-                            // ホバー時刻を計算
-                            if let Some(bounds) = this.video_seek_bar_bounds.get(&pane_id).copied()
-                            {
-                                let bar_x = f32::from(bounds.origin.x);
-                                let bar_w = f32::from(bounds.size.width);
-                                let mouse_x = f32::from(ev.position.x);
-                                if bar_w > 0.0 {
-                                    let frac = ((mouse_x - bar_x) / bar_w).clamp(0.0, 1.0);
-                                    let hover_sec = frac as f64 * seek_dur;
-                                    let rel_x = mouse_x - bar_x;
-                                    this.video_seek_hover = Some((pane_id, hover_sec, rel_x));
-                                    cx.notify();
-                                }
-                            }
-                        }))
-                        .on_mouse_up_out(
-                            gpui::MouseButton::Left,
-                            cx.listener(move |this, _, _, _| {
-                                if this.video_seek_dragging == Some(pane_id) {
-                                    this.video_seek_dragging = None;
-                                }
-                            }),
-                        );
-                    if let Some(tooltip) = hover_tooltip {
-                        seek_bar = seek_bar.child(tooltip);
-                    }
+                            .top_0()
+                            .left_0()
+                            .size_full();
 
-                    // 再生速度ボタン
-                    let rates: &[(f32, &str)] =
-                        &[(0.5, "0.5x"), (1.0, "1x"), (1.5, "1.5x"), (2.0, "2x")];
-                    let speed_buttons =
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(2.0))
-                            .children(rates.iter().map(|&(rate, label)| {
-                                let is_active = (current_rate - rate).abs() < 0.01;
+                            let mut surface = div()
+                                .relative()
+                                .w(px(scaled_page_width))
+                                .h(px(scaled_page_height))
+                                .bg(hsla(theme.background));
+                            if let Some(image) = image {
+                                surface = surface
+                                    .child(
+                                        gpui::img(image)
+                                            .object_fit(gpui::ObjectFit::Contain)
+                                            .size_full(),
+                                    )
+                                    .child(overlay);
+                            }
+
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .flex_none()
+                                .w(px(page_canvas_width))
+                                .pb_2()
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.6))
+                                        .pb_1()
+                                        .child(SharedString::from(format!(
+                                            "— {} / {} —",
+                                            i + 1,
+                                            data.total_pages
+                                        ))),
+                                )
+                                .child(surface)
+                                .into_any_element()
+                        })
+                        .collect()
+                }
+                preview::PreviewContent::Video(data) => {
+                    let mut elements: Vec<gpui::AnyElement> = Vec::new();
+
+                    if let Some(player) = self.video_players.get(&pane_id) {
+                        // AVFoundation プレイヤー起動中: キャッシュ済みフレームを表示
+                        let gen = player.frame_gen;
+                        let need_update = match self.video_frame_cache.get(&pane_id) {
+                            Some((cached_gen, _)) => *cached_gen != gen,
+                            None => true,
+                        };
+                        if need_update && !player.current_bgra.is_empty() {
+                            let w = player.width;
+                            let h = player.height;
+                            if let Some(rgba_img) =
+                                image::RgbaImage::from_raw(w, h, player.current_bgra.clone())
+                            {
+                                let frame = image::Frame::new(rgba_img);
+                                let render =
+                                    std::sync::Arc::new(gpui::RenderImage::new(vec![frame]));
+                                if let Some((_, old)) =
+                                    self.video_frame_cache.insert(pane_id, (gen, render))
+                                {
+                                    self.pending_video_frame_evictions.push(old);
+                                }
+                            }
+                        }
+                        if let Some((_, ref frame_image)) = self.video_frame_cache.get(&pane_id) {
+                            let frame_image = frame_image.clone();
+                            elements.push(
                                 div()
-                                    .id((
-                                        "video-rate",
-                                        pane_id.as_u64() * 100 + (rate * 10.0) as u64,
-                                    ))
-                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        gpui::img(frame_image)
+                                            .object_fit(gpui::ObjectFit::Contain)
+                                            .max_w_full()
+                                            .flex_1(),
+                                    )
+                                    .into_any_element(),
+                            );
+                        }
+                        let is_playing = player.state == video_player::PlaybackState::Playing;
+                        let current_time = player.current_time;
+                        let duration = player.duration;
+                        let current_rate = player.rate;
+
+                        let play_btn_label: SharedString = if is_playing {
+                            "\u{23f8}".into() // ⏸
+                        } else {
+                            "\u{25b6}\u{fe0e}".into() // ▶︎
+                        };
+                        let cur_m = current_time as u64 / 60;
+                        let cur_s = current_time as u64 % 60;
+                        let dur_m = duration as u64 / 60;
+                        let dur_s = duration as u64 % 60;
+                        let time_label: SharedString =
+                            format!("{cur_m}:{cur_s:02} / {dur_m}:{dur_s:02}").into();
+                        let progress_frac = if duration > 0.0 {
+                            (current_time / duration).clamp(0.0, 1.0) as f32
+                        } else {
+                            0.0
+                        };
+                        let seek_dur = duration;
+
+                        let is_muted = player.muted;
+                        let is_looping = player.looping;
+
+                        // ホバー時刻ツールチップ
+                        let hover_tooltip = self
+                            .video_seek_hover
+                            .filter(|&(pid, _, _)| pid == pane_id)
+                            .map(|(_, hover_sec, hover_x)| {
+                                let hm = hover_sec as u64 / 60;
+                                let hs = hover_sec as u64 % 60;
+                                let label: SharedString = format!("{hm}:{hs:02}").into();
+                                div()
+                                    .absolute()
+                                    .bottom(px(16.0))
+                                    .left(px(hover_x - 20.0))
                                     .px(px(4.0))
                                     .py(px(1.0))
                                     .rounded(px(3.0))
+                                    .bg(hsla_alpha(theme.background, 0.95))
+                                    .border_1()
+                                    .border_color(hsla_alpha(theme.foreground, 0.3))
                                     .text_size(px(11.0))
-                                    .when(is_active, |d| {
-                                        d.bg(hsla(theme.ansi[4])).text_color(hsla(theme.background))
+                                    .text_color(hsla(theme.foreground))
+                                    .child(label)
+                            });
+
+                        // シークバー（クリック + ドラッグ対応 + つまみノブ + ホバー時刻）
+                        let mut seek_bar = div()
+                            .id(("video-seek", pane_id.as_u64()))
+                            .relative()
+                            .flex_1()
+                            .h(px(14.0))
+                            .cursor_pointer()
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .right_0()
+                                    .top(px(4.0))
+                                    .h(px(6.0))
+                                    .rounded(px(3.0))
+                                    .bg(hsla_alpha(theme.foreground, 0.2))
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .rounded(px(3.0))
+                                            .bg(hsla(theme.ansi[4]))
+                                            .w(relative(progress_frac)),
+                                    ),
+                            )
+                            // つまみノブ
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(1.0))
+                                    .left(relative(progress_frac))
+                                    .ml(px(-6.0))
+                                    .w(px(12.0))
+                                    .h(px(12.0))
+                                    .rounded_full()
+                                    .bg(hsla(theme.ansi[4])),
+                            )
+                            .child({
+                                let entity = cx.entity().downgrade();
+                                canvas(
+                                    |_, _, _| (),
+                                    move |bounds, _, _, cx| {
+                                        if let Some(e) = entity.upgrade() {
+                                            e.update(cx, |app, _| {
+                                                app.video_seek_bar_bounds.insert(pane_id, bounds);
+                                            });
+                                        }
+                                    },
+                                )
+                                .absolute()
+                                .size_full()
+                            })
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                    this.video_seek_dragging = Some(pane_id);
+                                    this.video_seek_by_click(pane_id, ev.position, seek_dur, cx);
+                                }),
+                            )
+                            .on_mouse_up(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |this, _ev: &gpui::MouseUpEvent, _, _cx| {
+                                    if this.video_seek_dragging == Some(pane_id) {
+                                        this.video_seek_dragging = None;
+                                    }
+                                }),
+                            )
+                            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
+                                if this.video_seek_dragging == Some(pane_id) {
+                                    this.video_seek_by_drag(pane_id, ev.position, cx);
+                                }
+                                // ホバー時刻を計算
+                                if let Some(bounds) =
+                                    this.video_seek_bar_bounds.get(&pane_id).copied()
+                                {
+                                    let bar_x = f32::from(bounds.origin.x);
+                                    let bar_w = f32::from(bounds.size.width);
+                                    let mouse_x = f32::from(ev.position.x);
+                                    if bar_w > 0.0 {
+                                        let frac = ((mouse_x - bar_x) / bar_w).clamp(0.0, 1.0);
+                                        let hover_sec = frac as f64 * seek_dur;
+                                        let rel_x = mouse_x - bar_x;
+                                        this.video_seek_hover = Some((pane_id, hover_sec, rel_x));
+                                        cx.notify();
+                                    }
+                                }
+                            }))
+                            .on_mouse_up_out(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |this, _, _, _| {
+                                    if this.video_seek_dragging == Some(pane_id) {
+                                        this.video_seek_dragging = None;
+                                    }
+                                }),
+                            );
+                        if let Some(tooltip) = hover_tooltip {
+                            seek_bar = seek_bar.child(tooltip);
+                        }
+
+                        // 再生速度ボタン
+                        let rates: &[(f32, &str)] =
+                            &[(0.5, "0.5x"), (1.0, "1x"), (1.5, "1.5x"), (2.0, "2x")];
+                        let speed_buttons =
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(2.0))
+                                .children(rates.iter().map(|&(rate, label)| {
+                                    let is_active = (current_rate - rate).abs() < 0.01;
+                                    div()
+                                        .id((
+                                            "video-rate",
+                                            pane_id.as_u64() * 100 + (rate * 10.0) as u64,
+                                        ))
+                                        .cursor_pointer()
+                                        .px(px(4.0))
+                                        .py(px(1.0))
+                                        .rounded(px(3.0))
+                                        .text_size(px(11.0))
+                                        .when(is_active, |d| {
+                                            d.bg(hsla(theme.ansi[4]))
+                                                .text_color(hsla(theme.background))
+                                        })
+                                        .when(!is_active, |d| {
+                                            d.text_color(hsla_alpha(theme.foreground, 0.6))
+                                                .hover(|s| s.bg(hsla_alpha(theme.foreground, 0.1)))
+                                        })
+                                        .child(SharedString::from(label))
+                                        .on_click(cx.listener(
+                                            move |this, _ev: &gpui::ClickEvent, _, cx| {
+                                                if let Some(p) =
+                                                    this.video_players.get_mut(&pane_id)
+                                                {
+                                                    p.set_rate(rate);
+                                                    cx.notify();
+                                                }
+                                            },
+                                        ))
+                                        .into_any_element()
+                                }));
+
+                        // ミュートボタン（絵文字全廃 #217: SVG）
+                        let mute_btn = div()
+                            .id(("video-mute", pane_id.as_u64()))
+                            .cursor_pointer()
+                            .px(px(2.0))
+                            .py(px(2.0))
+                            .rounded(px(3.0))
+                            .hover(|s| s.bg(hsla_alpha(theme.foreground, 0.1)))
+                            .child(
+                                svg()
+                                    .path(if is_muted {
+                                        crate::file_icons::ui_icon::VOLUME_OFF
+                                    } else {
+                                        crate::file_icons::ui_icon::VOLUME_ON
                                     })
-                                    .when(!is_active, |d| {
-                                        d.text_color(hsla_alpha(theme.foreground, 0.6))
-                                            .hover(|s| s.bg(hsla_alpha(theme.foreground, 0.1)))
-                                    })
-                                    .child(SharedString::from(label))
-                                    .on_click(cx.listener(
-                                        move |this, _ev: &gpui::ClickEvent, _, cx| {
-                                            if let Some(p) = this.video_players.get_mut(&pane_id) {
-                                                p.set_rate(rate);
-                                                cx.notify();
-                                            }
-                                        },
-                                    ))
-                                    .into_any_element()
+                                    .w(px(14.0))
+                                    .h(px(14.0))
+                                    .text_color(hsla_alpha(theme.foreground, 0.8)),
+                            )
+                            .on_click(cx.listener(move |this, _ev: &gpui::ClickEvent, _, cx| {
+                                if let Some(p) = this.video_players.get_mut(&pane_id) {
+                                    p.toggle_mute();
+                                    cx.notify();
+                                }
                             }));
 
-                    // ミュートボタン（絵文字全廃 #217: SVG）
-                    let mute_btn = div()
-                        .id(("video-mute", pane_id.as_u64()))
-                        .cursor_pointer()
-                        .px(px(2.0))
-                        .py(px(2.0))
-                        .rounded(px(3.0))
-                        .hover(|s| s.bg(hsla_alpha(theme.foreground, 0.1)))
-                        .child(
-                            svg()
-                                .path(if is_muted {
-                                    crate::file_icons::ui_icon::VOLUME_OFF
-                                } else {
-                                    crate::file_icons::ui_icon::VOLUME_ON
-                                })
-                                .w(px(14.0))
-                                .h(px(14.0))
-                                .text_color(hsla_alpha(theme.foreground, 0.8)),
-                        )
-                        .on_click(cx.listener(move |this, _ev: &gpui::ClickEvent, _, cx| {
-                            if let Some(p) = this.video_players.get_mut(&pane_id) {
-                                p.toggle_mute();
-                                cx.notify();
-                            }
-                        }));
-
-                    // ループトグルボタン
-                    let loop_btn = div()
-                        .id(("video-loop", pane_id.as_u64()))
-                        .cursor_pointer()
-                        .text_size(px(11.0))
-                        .px(px(4.0))
-                        .py(px(1.0))
-                        .rounded(px(3.0))
-                        .when(is_looping, |d| {
-                            d.bg(hsla(theme.ansi[4])).text_color(hsla(theme.background))
-                        })
-                        .when(!is_looping, |d| {
-                            d.text_color(hsla_alpha(theme.foreground, 0.6))
-                                .hover(|s| s.bg(hsla_alpha(theme.foreground, 0.1)))
-                        })
-                        .child(
-                            svg()
-                                .path(crate::file_icons::ui_icon::LOOP_REPEAT)
-                                .w(px(13.0))
-                                .h(px(13.0))
-                                .text_color(if is_looping {
-                                    hsla(theme.background)
-                                } else {
-                                    hsla_alpha(theme.foreground, 0.7)
-                                }),
-                        )
-                        .on_click(cx.listener(move |this, _ev: &gpui::ClickEvent, _, cx| {
-                            if let Some(p) = this.video_players.get_mut(&pane_id) {
-                                p.toggle_loop();
-                                cx.notify();
-                            }
-                        }));
-
-                    // コントロールバー: 再生/一時停止 + シークバー + 時間 + 速度 + ミュート + ループ
-                    elements.push(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_2()
-                            .py_1()
-                            .bg(hsla_alpha(theme.background, 0.9))
+                        // ループトグルボタン
+                        let loop_btn = div()
+                            .id(("video-loop", pane_id.as_u64()))
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .px(px(4.0))
+                            .py(px(1.0))
+                            .rounded(px(3.0))
+                            .when(is_looping, |d| {
+                                d.bg(hsla(theme.ansi[4])).text_color(hsla(theme.background))
+                            })
+                            .when(!is_looping, |d| {
+                                d.text_color(hsla_alpha(theme.foreground, 0.6))
+                                    .hover(|s| s.bg(hsla_alpha(theme.foreground, 0.1)))
+                            })
                             .child(
-                                div()
-                                    .id(("video-toggle", pane_id.as_u64()))
-                                    .cursor_pointer()
-                                    .text_size(px(18.0))
-                                    .child(play_btn_label)
-                                    .on_click(cx.listener(
-                                        move |this, _ev: &gpui::ClickEvent, _, cx| {
-                                            if let Some(p) = this.video_players.get_mut(&pane_id) {
-                                                p.toggle();
-                                                this.ensure_video_ticker(cx);
-                                                cx.notify();
-                                            }
-                                        },
-                                    )),
+                                svg()
+                                    .path(crate::file_icons::ui_icon::LOOP_REPEAT)
+                                    .w(px(13.0))
+                                    .h(px(13.0))
+                                    .text_color(if is_looping {
+                                        hsla(theme.background)
+                                    } else {
+                                        hsla_alpha(theme.foreground, 0.7)
+                                    }),
                             )
-                            .child(seek_bar)
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(hsla_alpha(theme.foreground, 0.7))
-                                    .child(time_label),
-                            )
-                            .child(speed_buttons)
-                            .child(mute_btn)
-                            .child(loop_btn)
-                            .into_any_element(),
-                    );
-                } else {
-                    // プレイヤー未起動: ffmpeg サムネイル + 再生ボタン + メタ情報
-                    if let Some(image) = self
-                        .preview_image_cache
-                        .get(&pane_id)
-                        .and_then(|c| c.images.first())
-                        .and_then(|i| i.as_ref().map(|cached| cached.image.clone()))
-                    {
-                        // Issue #168: サムネもキャッシュ済み Arc を使う（毎フレームの
-                        // from_bytes ハッシュ計算を避ける）
+                            .on_click(cx.listener(move |this, _ev: &gpui::ClickEvent, _, cx| {
+                                if let Some(p) = this.video_players.get_mut(&pane_id) {
+                                    p.toggle_loop();
+                                    cx.notify();
+                                }
+                            }));
+
+                        // コントロールバー: 再生/一時停止 + シークバー + 時間 + 速度 + ミュート + ループ
                         elements.push(
                             div()
                                 .flex()
                                 .items_center()
+                                .gap_2()
+                                .px_2()
+                                .py_1()
+                                .bg(hsla_alpha(theme.background, 0.9))
+                                .child(
+                                    div()
+                                        .id(("video-toggle", pane_id.as_u64()))
+                                        .cursor_pointer()
+                                        .text_size(px(18.0))
+                                        .child(play_btn_label)
+                                        .on_click(cx.listener(
+                                            move |this, _ev: &gpui::ClickEvent, _, cx| {
+                                                if let Some(p) =
+                                                    this.video_players.get_mut(&pane_id)
+                                                {
+                                                    p.toggle();
+                                                    this.ensure_video_ticker(cx);
+                                                    cx.notify();
+                                                }
+                                            },
+                                        )),
+                                )
+                                .child(seek_bar)
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(hsla_alpha(theme.foreground, 0.7))
+                                        .child(time_label),
+                                )
+                                .child(speed_buttons)
+                                .child(mute_btn)
+                                .child(loop_btn)
+                                .into_any_element(),
+                        );
+                    } else {
+                        // プレイヤー未起動: ffmpeg サムネイル + 再生ボタン + メタ情報
+                        if let Some(image) = self
+                            .preview_image_cache
+                            .get(&pane_id)
+                            .and_then(|c| c.images.first())
+                            .and_then(|i| i.as_ref().map(|cached| cached.image.clone()))
+                        {
+                            // Issue #168: サムネもキャッシュ済み Arc を使う（毎フレームの
+                            // from_bytes ハッシュ計算を避ける）
+                            elements.push(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .relative()
+                                    .p_2()
+                                    .child(
+                                        gpui::img(image)
+                                            .object_fit(gpui::ObjectFit::Contain)
+                                            .max_w_full()
+                                            .max_h(px(400.0)),
+                                    )
+                                    .into_any_element(),
+                            );
+                        }
+                        // 再生ボタン
+                        elements.push(
+                            div()
+                                .flex()
                                 .justify_center()
-                                .relative()
                                 .p_2()
                                 .child(
-                                    gpui::img(image)
-                                        .object_fit(gpui::ObjectFit::Contain)
-                                        .max_w_full()
-                                        .max_h(px(400.0)),
+                                    div()
+                                        .id(("video-play", pane_id.as_u64()))
+                                        .cursor_pointer()
+                                        .px_4()
+                                        .py_1()
+                                        .rounded(px(6.0))
+                                        .bg(hsla(theme.ansi[4]))
+                                        .text_color(hsla(theme.background))
+                                        .text_size(px(14.0))
+                                        .child(SharedString::from("\u{25b6}\u{fe0e} 再生"))
+                                        .on_click(cx.listener(
+                                            move |this, _ev: &gpui::ClickEvent, _, cx| {
+                                                this.start_video_player(pane_id, cx);
+                                            },
+                                        )),
                                 )
                                 .into_any_element(),
                         );
+                        // メタ情報
+                        let mut info_lines = Vec::new();
+                        if let Some((w, h)) = data.resolution {
+                            info_lines.push(format!("解像度: {w} x {h}"));
+                        }
+                        if let Some(dur) = data.duration {
+                            let mins = dur as u64 / 60;
+                            let secs = dur as u64 % 60;
+                            info_lines.push(format!("長さ: {mins}:{secs:02}"));
+                        }
+                        if let Some(codec) = &data.codec {
+                            info_lines.push(format!("コーデック: {codec}"));
+                        }
+                        let size_mb = data.file_size as f64 / 1_000_000.0;
+                        if size_mb >= 1.0 {
+                            info_lines.push(format!("サイズ: {size_mb:.1} MB"));
+                        } else {
+                            info_lines
+                                .push(format!("サイズ: {:.0} KB", data.file_size as f64 / 1_000.0));
+                        }
+                        elements.push(
+                            div()
+                                .p_2()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .text_size(px(13.0))
+                                .text_color(hsla_alpha(theme.foreground, 0.8))
+                                .children(info_lines.into_iter().map(|line| {
+                                    div().child(SharedString::from(line)).into_any_element()
+                                }))
+                                .into_any_element(),
+                        );
                     }
-                    // 再生ボタン
-                    elements.push(
-                        div()
-                            .flex()
-                            .justify_center()
-                            .p_2()
-                            .child(
-                                div()
-                                    .id(("video-play", pane_id.as_u64()))
-                                    .cursor_pointer()
-                                    .px_4()
-                                    .py_1()
-                                    .rounded(px(6.0))
-                                    .bg(hsla(theme.ansi[4]))
-                                    .text_color(hsla(theme.background))
-                                    .text_size(px(14.0))
-                                    .child(SharedString::from("\u{25b6}\u{fe0e} 再生"))
-                                    .on_click(cx.listener(
-                                        move |this, _ev: &gpui::ClickEvent, _, cx| {
-                                            this.start_video_player(pane_id, cx);
-                                        },
-                                    )),
-                            )
-                            .into_any_element(),
-                    );
-                    // メタ情報
-                    let mut info_lines = Vec::new();
-                    if let Some((w, h)) = data.resolution {
-                        info_lines.push(format!("解像度: {w} x {h}"));
-                    }
-                    if let Some(dur) = data.duration {
-                        let mins = dur as u64 / 60;
-                        let secs = dur as u64 % 60;
-                        info_lines.push(format!("長さ: {mins}:{secs:02}"));
-                    }
-                    if let Some(codec) = &data.codec {
-                        info_lines.push(format!("コーデック: {codec}"));
-                    }
-                    let size_mb = data.file_size as f64 / 1_000_000.0;
-                    if size_mb >= 1.0 {
-                        info_lines.push(format!("サイズ: {size_mb:.1} MB"));
-                    } else {
-                        info_lines
-                            .push(format!("サイズ: {:.0} KB", data.file_size as f64 / 1_000.0));
-                    }
-                    elements.push(
-                        div()
-                            .p_2()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .text_size(px(13.0))
-                            .text_color(hsla_alpha(theme.foreground, 0.8))
-                            .children(info_lines.into_iter().map(|line| {
-                                div().child(SharedString::from(line)).into_any_element()
-                            }))
-                            .into_any_element(),
-                    );
+                    elements
                 }
-                elements
+                preview::PreviewContent::Loading => vec![div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p_2()
+                    .text_color(hsla_alpha(theme.foreground, 0.6))
+                    .child(SharedString::from("読み込み中…"))
+                    .into_any_element()],
+                preview::PreviewContent::Error(message) => vec![div()
+                    .p_2()
+                    .text_color(hsla(theme.red))
+                    .child(SharedString::from(message.clone()))
+                    .into_any_element()],
             }
-            preview::PreviewContent::Loading => vec![div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .p_2()
-                .text_color(hsla_alpha(theme.foreground, 0.6))
-                .child(SharedString::from("読み込み中…"))
-                .into_any_element()],
-            preview::PreviewContent::Error(message) => vec![div()
-                .p_2()
-                .text_color(hsla(theme.red))
-                .child(SharedString::from(message.clone()))
-                .into_any_element()],
         };
 
         div()
@@ -2130,6 +2219,49 @@ impl TakoApp {
                                                 .text_color(hsla(theme.accent))
                                         }))
                                         .child(SharedString::from(label)),
+                                )
+                            })
+                            .when(phv.edit_button && !editing, |d| {
+                                d.child(
+                                    div()
+                                        .id(("preview-changelog-toggle", pane_id.as_u64()))
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_1()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .text_color(hsla(if changelog_active {
+                                            theme.green
+                                        } else {
+                                            theme.accent
+                                        }))
+                                        .hover(|d| {
+                                            d.bg(rgba_alpha(theme.tab_active_background, 0.8))
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation()
+                                            }),
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.toggle_preview_changelog(pane_id, cx);
+                                        }))
+                                        .child(
+                                            svg()
+                                                .path(crate::file_icons::ui_icon::GIT_BRANCH)
+                                                .w(px(12.0))
+                                                .h(px(12.0))
+                                                .text_color(hsla(if changelog_active {
+                                                    theme.green
+                                                } else {
+                                                    theme.accent
+                                                })),
+                                        )
+                                        .child("履歴"),
                                 )
                             })
                             .when(phv.edit_button && editable, |d| {
@@ -2569,6 +2701,8 @@ impl TakoApp {
                 self.preview_line_texts.insert(pane_id, line_texts);
                 // bounds 追跡用にリセット（各行の canvas で上書きされる）
                 self.preview_line_bounds.insert(pane_id, Vec::new());
+                self.preview_pdf_page_image_bounds
+                    .insert(pane_id, HashMap::new());
                 self.preview_text_layouts.insert(pane_id, line_layouts);
                 let scroll_handle = self
                     .preview_scroll_handles
@@ -2585,11 +2719,18 @@ impl TakoApp {
                     .track_scroll(&scroll_handle)
                     .when(zoomable, |d| d.overflow_scroll())
                     .when(!zoomable, |d| d.overflow_y_scroll())
-                    .cursor(if mode == preview::PreviewMode::Image {
-                        CursorStyle::Arrow
-                    } else {
-                        CursorStyle::IBeam
-                    })
+                    .cursor(
+                        if self
+                            .preview_pdf_hovered_link
+                            .is_some_and(|(pid, _)| pid == pane_id)
+                        {
+                            CursorStyle::PointingHand
+                        } else if mode == preview::PreviewMode::Image {
+                            CursorStyle::Arrow
+                        } else {
+                            CursorStyle::IBeam
+                        },
+                    )
                     // 非ズーム対象へリスナー自体を登録すると、セルフテストの
                     // dispatch_event が root update 中に listener update を再入させる。
                     // Image / PDF にだけイベント経路を載せる。
@@ -3087,6 +3228,225 @@ impl TakoApp {
                     .into_any_element(),
                 None,
             ),
+        }
+    }
+
+    /// チェンジログビューのトグル（Issue #338）
+    pub(crate) fn toggle_preview_changelog(
+        &mut self,
+        pane_id: PaneId,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let currently_on = self.preview_changelogs.contains_key(&pane_id);
+        if currently_on {
+            self.preview_changelogs.remove(&pane_id);
+        } else {
+            let state = match self.previews.get(&pane_id) {
+                Some(s) => s,
+                None => return,
+            };
+            let path = state.path.clone();
+            let repo = tako_core::git::repo_root(&path);
+            match repo {
+                Some(repo) => {
+                    let rel = path
+                        .strip_prefix(&repo)
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| path.to_string_lossy().to_string());
+                    let commits = tako_core::git::log_file_commits(&repo, &rel, 50);
+                    let entries = commits
+                        .into_iter()
+                        .map(|c| preview::ChangelogEntry {
+                            commit: c,
+                            expanded_diff: None,
+                        })
+                        .collect();
+                    self.preview_changelogs.insert(
+                        pane_id,
+                        preview::ChangelogData {
+                            entries,
+                            repo_root: Some(repo),
+                            rel_path: Some(rel),
+                        },
+                    );
+                }
+                None => {
+                    self.preview_changelogs
+                        .insert(pane_id, preview::ChangelogData::default());
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// チェンジログビューの本文描画（Issue #338）
+    fn render_changelog_body(
+        &self,
+        pane_id: PaneId,
+        data: &preview::ChangelogData,
+        theme: &Theme,
+        cx: &mut gpui::Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        if data.entries.is_empty() {
+            return vec![div()
+                .p_4()
+                .text_color(hsla_alpha(theme.foreground, 0.5))
+                .child(SharedString::from(if data.repo_root.is_none() {
+                    "git 管理外のファイルです"
+                } else {
+                    "このファイルの変更履歴はありません"
+                }))
+                .into_any_element()];
+        }
+        let mut elements: Vec<gpui::AnyElement> = Vec::new();
+        for (idx, entry) in data.entries.iter().enumerate() {
+            let c = &entry.commit;
+            let is_expanded = entry.expanded_diff.is_some();
+            let hash = c.short_hash.clone();
+            let commit_hash_full = c.hash.clone();
+            elements.push(
+                div()
+                    .id(("changelog-entry", (pane_id.as_u64() * 10000 + idx as u64)))
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .border_b_1()
+                    .border_color(hsla_alpha(theme.border_default, 0.3))
+                    .child(
+                        div()
+                            .id(("cl-row", (pane_id.as_u64() * 10000 + idx as u64)))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(rgba_alpha(theme.surface_hover, 0.5)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_changelog_diff(pane_id, &commit_hash_full);
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(SharedString::from(if is_expanded { "v" } else { ">" }))
+                                    .child(
+                                        div()
+                                            .text_color(hsla(theme.accent))
+                                            .child(SharedString::from(hash)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .overflow_x_hidden()
+                                    .child(SharedString::from(c.subject.clone())),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(hsla_alpha(theme.foreground, 0.5))
+                                    .text_xs()
+                                    .child(SharedString::from(format!(
+                                        "{} / {}",
+                                        c.author, c.date_relative
+                                    ))),
+                            ),
+                    )
+                    .when(is_expanded, |d| {
+                        let hunks = entry.expanded_diff.as_deref().unwrap_or(&[]);
+                        d.child(self.render_changelog_diff(hunks, theme))
+                    })
+                    .into_any_element(),
+            );
+        }
+        elements
+    }
+
+    /// チェンジログの diff 展開描画
+    fn render_changelog_diff(
+        &self,
+        hunks: &[tako_core::DiffHunk],
+        theme: &Theme,
+    ) -> gpui::AnyElement {
+        if hunks.is_empty() {
+            return div()
+                .px_4()
+                .py_1()
+                .text_color(hsla_alpha(theme.foreground, 0.5))
+                .text_xs()
+                .child(SharedString::from("(変更なし)"))
+                .into_any_element();
+        }
+        let mut elements: Vec<gpui::AnyElement> = Vec::new();
+        for hunk in hunks {
+            elements.push(
+                div()
+                    .px_4()
+                    .py(px(1.0))
+                    .text_color(hsla_alpha(theme.accent, 0.7))
+                    .text_xs()
+                    .child(SharedString::from(hunk.header.clone()))
+                    .into_any_element(),
+            );
+            for line in &hunk.lines {
+                let (bg, color, prefix) = match line.kind {
+                    tako_core::DiffLineKind::Add => {
+                        (rgba_alpha(theme.green, 0.15), hsla(theme.green), "+")
+                    }
+                    tako_core::DiffLineKind::Remove => {
+                        (rgba_alpha(theme.red, 0.15), hsla(theme.red), "-")
+                    }
+                    tako_core::DiffLineKind::Context => (
+                        rgba_alpha(theme.background, 0.0),
+                        hsla_alpha(theme.foreground, 0.6),
+                        " ",
+                    ),
+                };
+                elements.push(
+                    div()
+                        .px_4()
+                        .bg(bg)
+                        .text_color(color)
+                        .text_xs()
+                        .child(SharedString::from(format!("{}{}", prefix, line.content)))
+                        .into_any_element(),
+                );
+            }
+        }
+        div()
+            .w_full()
+            .bg(rgba_alpha(theme.surface_1, 0.5))
+            .pb_1()
+            .children(elements)
+            .into_any_element()
+    }
+
+    /// toggle_changelog_diff のローカル版（UI から直接呼ぶ）
+    fn toggle_changelog_diff(&mut self, pane_id: PaneId, hash: &str) {
+        let data = match self.preview_changelogs.get_mut(&pane_id) {
+            Some(d) => d,
+            None => return,
+        };
+        let entry = match data
+            .entries
+            .iter_mut()
+            .find(|e| e.commit.hash == hash || e.commit.short_hash == hash)
+        {
+            Some(e) => e,
+            None => return,
+        };
+        if entry.expanded_diff.is_some() {
+            entry.expanded_diff = None;
+        } else {
+            if let (Some(repo), Some(rel)) = (data.repo_root.as_deref(), data.rel_path.as_deref()) {
+                let hunks = tako_core::git::diff_file_commit(repo, &entry.commit.hash, rel);
+                entry.expanded_diff = Some(hunks);
+            }
         }
     }
 }

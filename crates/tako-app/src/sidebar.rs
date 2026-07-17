@@ -153,10 +153,12 @@ impl TakoApp {
             );
         }
         let inline_edit_snapshot = self.inline_edit.clone();
+        let sidebar_w = self.sidebar_width;
         Some(
             div()
-                .w(px(SIDEBAR_WIDTH))
+                .w(px(sidebar_w))
                 .h_full()
+                .relative()
                 .flex()
                 .flex_col()
                 .bg(rgba(theme.mantle))
@@ -615,12 +617,35 @@ impl TakoApp {
                                 }))
                                 .child("diff \u{2192}"),
                         )
-                })),
+                }))
+                // 右端のリサイズハンドル（Issue #307。右パネルと同方式）
+                .child(
+                    div()
+                        .id("sidebar-resize")
+                        .absolute()
+                        .right(px(0.0))
+                        .top(px(0.0))
+                        .w(px(BORDER_HANDLE))
+                        .h_full()
+                        .cursor(gpui::CursorStyle::ResizeLeftRight)
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
+                                this.dragging_sidebar = true;
+                                cx.stop_propagation();
+                            }),
+                        ),
+                ),
         )
     }
 
     /// コンテキストメニューの描画（FR-3.12）
-    pub(crate) fn render_context_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    pub(crate) fn render_context_menu(
+        &self,
+        window: &gpui::Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         let ctx = self.context_menu.as_ref()?;
         let theme = &self.theme;
         let path = ctx.path.clone();
@@ -632,22 +657,44 @@ impl TakoApp {
             ("copy-abs", "絶対パスをコピー"),
             ("reveal", "Finder で表示"),
             ("open-term", "ターミナルで開く"),
-            ("sep1", ""),
-            ("rename", "名前変更"),
-            ("new-file", "新しいファイル"),
-            ("new-dir", "新しいフォルダ"),
-            ("sep2", ""),
-            ("trash", "削除"),
         ];
+        if !is_dir {
+            items.push(("open-default", "デフォルトアプリで開く"));
+            items.push(("open-with", "このアプリで開く..."));
+        }
+        items.push(("sep1", ""));
+        items.push(("rename", "名前変更"));
+        items.push(("new-file", "新しいファイル"));
+        items.push(("new-dir", "新しいフォルダ"));
+        items.push(("sep2", ""));
+        items.push(("trash", "削除"));
         if is_pinned_root {
             items.push(("sep3", ""));
             items.push(("remove-root", "ツリーから除去"));
         }
+
+        let menu_width: f32 = 200.0;
+        let item_height: f32 = 20.0;
+        let sep_height: f32 = 5.0;
+        let padding_y: f32 = 8.0;
+        let menu_height: f32 = items
+            .iter()
+            .map(|(id, _)| {
+                if id.starts_with("sep") {
+                    sep_height
+                } else {
+                    item_height
+                }
+            })
+            .sum::<f32>()
+            + padding_y;
+        let adjusted = clamp_menu_position(pos, menu_width, menu_height, window);
+
         let menu = div()
             .absolute()
-            .left(pos.x)
-            .top(pos.y)
-            .w(px(180.0))
+            .left(adjusted.x)
+            .top(adjusted.y)
+            .w(px(menu_width))
             .py(px(4.0))
             .bg(rgba(theme.tab_bar_background))
             .border_1()
@@ -937,6 +984,25 @@ impl TakoApp {
                     PaneOrigin::User,
                 );
                 self.sync_filetree_roots();
+            }
+            "open-default" => {
+                let _ = tako_control::dispatch(
+                    self,
+                    Request::FileOp {
+                        op: FileOpKind::OpenDefault,
+                        path: path_str,
+                        name: None,
+                        pane: None,
+                    },
+                    PaneOrigin::User,
+                );
+            }
+            "open-with" => {
+                let path_owned = path.to_path_buf();
+                cx.spawn(async move |_, _| {
+                    let _ = pick_app_and_open(&path_owned);
+                })
+                .detach();
             }
             "remove-root" => {
                 let _ = tako_control::dispatch(
@@ -1347,4 +1413,34 @@ impl TakoApp {
         self.preview_reload_apply_count = self.preview_reload_apply_count.saturating_add(1);
         cx.notify();
     }
+}
+
+/// macOS のアプリ選択ダイアログ（AppleScript 経由）でアプリを選択し、
+/// 指定ファイルをそのアプリで開く
+#[cfg(target_os = "macos")]
+fn pick_app_and_open(path: &std::path::Path) -> Result<(), String> {
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg("POSIX path of (choose application as alias)")
+        .output()
+        .map_err(|e| format!("osascript 起動に失敗: {e}"))?;
+    if !output.status.success() {
+        return Err("アプリ選択がキャンセルされた".into());
+    }
+    let app_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if app_path.is_empty() {
+        return Err("アプリパスが空".into());
+    }
+    std::process::Command::new("open")
+        .arg("-a")
+        .arg(&app_path)
+        .arg(path)
+        .spawn()
+        .map_err(|e| format!("アプリで開けない: {e}"))?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pick_app_and_open(_path: &std::path::Path) -> Result<(), String> {
+    Err("アプリ選択は macOS のみ対応".into())
 }

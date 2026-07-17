@@ -220,6 +220,24 @@ pub struct VideoData {
     pub file_size: u64,
 }
 
+/// チェンジログビューの 1 コミットエントリ（Issue #338）
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangelogEntry {
+    pub commit: tako_core::GitCommit,
+    /// diff 展開中なら Some（hunks）。折りたたみ中なら None
+    pub expanded_diff: Option<Vec<tako_core::DiffHunk>>,
+}
+
+/// チェンジログビュー全体のデータ（Issue #338）
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ChangelogData {
+    pub entries: Vec<ChangelogEntry>,
+    /// git リポジトリのルートパス（diff 取得時に使う）
+    pub repo_root: Option<std::path::PathBuf>,
+    /// リポジトリ内の相対パス（diff 取得時に使う）
+    pub rel_path: Option<String>,
+}
+
 /// 読み込み済みのプレビュー内容
 #[derive(Debug, Clone, PartialEq)]
 pub enum PreviewContent {
@@ -1643,8 +1661,8 @@ pub struct SyntectHighlighter {
 
 impl SyntectHighlighter {
     fn new() -> Self {
-        let syntaxes = syntect::parsing::SyntaxSet::load_defaults_newlines();
-        // ダーク背景（tako 既定テーマ）に合う同梱テーマ。見つからなければ任意の 1 つ
+        // bat 由来の拡張構文セット（TOML・TypeScript・Dockerfile 等 270+ 構文。#320）
+        let syntaxes = two_face::syntax::extra_newlines();
         let mut themes = syntect::highlighting::ThemeSet::load_defaults().themes;
         let theme = themes
             .remove("base16-eighties.dark")
@@ -1653,37 +1671,73 @@ impl SyntectHighlighter {
         Self { syntaxes, theme }
     }
 
-    /// 読み取り / 編集で共用する構文解決。syntect 標準セットに含まれる全構文を
-    /// 拡張子・特殊ファイル名・shebang の順で解決し、標準セットに TypeScript 文法が
-    /// 無い版では JavaScript 文法へ安全に劣化させる。
+    /// 読み取り / 編集で共用する構文解決。ファイル名 → 拡張子 → shebang の優先順で
+    /// 構文を特定する。two-face（bat 由来）の 270+ 構文セットが基盤。
+    /// ファイル名を先に試すのは CMakeLists.txt 等の拡張子が汎用（.txt）でも
+    /// ファイル名で特定できるケースを拾うため。
     fn syntax_for_path<'a>(
         &'a self,
         path: &Path,
         text: &str,
     ) -> &'a syntect::parsing::SyntaxReference {
+        let file_name = path.file_name().and_then(|v| v.to_str());
+        // ファイル名での解決を先に試す（CMakeLists.txt・Dockerfile・Makefile 等）
+        if let Some(syn) = file_name.and_then(|name| {
+            self.syntaxes
+                .find_syntax_by_extension(name)
+                .or_else(|| self.filename_to_syntax(name))
+        }) {
+            return syn;
+        }
         let extension = path
             .extension()
             .and_then(|value| value.to_str())
             .map(str::to_ascii_lowercase);
         extension
             .as_deref()
-            .and_then(|ext| self.syntaxes.find_syntax_by_extension(ext))
-            .or_else(|| {
-                path.file_name()
-                    .and_then(|value| value.to_str())
-                    .and_then(|name| self.syntaxes.find_syntax_by_extension(name))
+            .and_then(|ext| {
+                self.syntaxes
+                    .find_syntax_by_extension(ext)
+                    .or_else(|| self.extension_fallback(ext))
             })
             .or_else(|| {
                 text.lines()
                     .next()
                     .and_then(|line| self.syntaxes.find_syntax_by_first_line(line))
             })
-            .or_else(|| {
-                matches!(extension.as_deref(), Some("ts" | "tsx"))
-                    .then(|| self.syntaxes.find_syntax_by_name("JavaScript"))
-                    .flatten()
-            })
             .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text())
+    }
+
+    /// ファイル名からの追加マッピング（拡張子が無い / 特殊なファイル名用）
+    fn filename_to_syntax<'a>(
+        &'a self,
+        name: &str,
+    ) -> Option<&'a syntect::parsing::SyntaxReference> {
+        let mapped = match name {
+            "Cargo.lock" | "Pipfile" | "Pipfile.lock" | "poetry.lock" => "toml",
+            ".dockerignore" => "gitignore",
+            ".editorconfig" | ".npmrc" | ".yarnrc" => "ini",
+            ".eslintrc" | ".prettierrc" | ".babelrc" => "json",
+            "Justfile" | "justfile" => "makefile",
+            _ => return None,
+        };
+        self.syntaxes
+            .find_syntax_by_extension(mapped)
+            .or_else(|| self.syntaxes.find_syntax_by_name(mapped))
+    }
+
+    /// 拡張子からの追加フォールバック（構文セットに定義が無い拡張子用）
+    fn extension_fallback<'a>(
+        &'a self,
+        ext: &str,
+    ) -> Option<&'a syntect::parsing::SyntaxReference> {
+        let mapped = match ext {
+            "jsx" => "js",
+            "mjs" | "cjs" => "js",
+            "mts" | "cts" => "ts",
+            _ => return None,
+        };
+        self.syntaxes.find_syntax_by_extension(mapped)
     }
 
     fn run(&self, syntax: &syntect::parsing::SyntaxReference, text: &str) -> Vec<Line> {
@@ -2552,5 +2606,97 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&scratchpad).ok();
+    }
+}
+
+#[cfg(test)]
+mod syntax_resolution_tests {
+    use super::*;
+
+    fn assert_syntax(filename: &str, expected: &str) {
+        let hl = SyntectHighlighter::new();
+        let path = std::path::Path::new(filename);
+        let syn = hl.syntax_for_path(path, "");
+        assert_eq!(
+            syn.name, expected,
+            "{filename} は {expected} に解決されるべき（実際: {}）",
+            syn.name
+        );
+    }
+
+    #[test]
+    fn data_formats() {
+        assert_syntax("Cargo.toml", "TOML");
+        assert_syntax("Cargo.lock", "TOML");
+        assert_syntax("pyproject.toml", "TOML");
+        assert_syntax("test.yaml", "YAML");
+        assert_syntax("test.yml", "YAML");
+        assert_syntax("test.json", "JSON");
+        assert_syntax("test.ini", "INI");
+        assert_syntax(".env", "DotENV");
+        assert_syntax("test.csv", "Separated Values");
+        assert_syntax("test.xml", "XML");
+    }
+
+    #[test]
+    fn systems_languages() {
+        assert_syntax("test.rs", "Rust");
+        assert_syntax("test.c", "C");
+        assert_syntax("test.cpp", "C++");
+        assert_syntax("test.go", "Go");
+        assert_syntax("test.swift", "Swift");
+        assert_syntax("test.kt", "Kotlin");
+        assert_syntax("test.java", "Java");
+    }
+
+    #[test]
+    fn web_languages() {
+        assert_syntax("test.js", "JavaScript");
+        assert_syntax("test.jsx", "JavaScript");
+        assert_syntax("test.mjs", "JavaScript");
+        assert_syntax("test.ts", "TypeScript");
+        assert_syntax("test.tsx", "TypeScriptReact");
+        assert_syntax("test.html", "HTML");
+        assert_syntax("test.css", "CSS");
+        assert_syntax("test.php", "PHP");
+    }
+
+    #[test]
+    fn scripting_languages() {
+        assert_syntax("test.py", "Python");
+        assert_syntax("test.rb", "Ruby");
+        assert_syntax("test.lua", "Lua");
+        assert_syntax("test.sh", "Bourne Again Shell (bash)");
+    }
+
+    #[test]
+    fn build_and_config_files() {
+        assert_syntax("Dockerfile", "Dockerfile");
+        assert_syntax("Makefile", "Makefile");
+        assert_syntax("CMakeLists.txt", "CMake");
+        assert_syntax("test.cmake", "CMake");
+        assert_syntax(".gitignore", "Git Ignore");
+        assert_syntax(".editorconfig", "INI");
+        assert_syntax("test.sql", "SQL");
+        assert_syntax("test.diff", "Diff");
+        assert_syntax("test.md", "Markdown");
+    }
+
+    #[test]
+    fn filename_based_fallbacks() {
+        assert_syntax("Cargo.lock", "TOML");
+        assert_syntax("Pipfile", "TOML");
+        assert_syntax(".gitattributes", "Git Attributes");
+        assert_syntax(".dockerignore", "Git Ignore");
+        assert_syntax(".eslintrc", "JSON");
+        assert_syntax("Justfile", "Makefile");
+    }
+
+    #[test]
+    fn shebang_detection() {
+        let hl = SyntectHighlighter::new();
+        let path = std::path::Path::new("script");
+        let syn = hl.syntax_for_path(path, "#!/bin/bash\necho hello");
+        assert_ne!(syn.name, "Plain Text", "shebang で構文が特定される");
     }
 }

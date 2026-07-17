@@ -564,6 +564,20 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_reorder_tab",
+            "description": "タブの並び順を変更する（D&D 並べ替えと同等）。\
+                tab を index（0 始まり）の位置へ移動する。範囲外は末尾にクランプされる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tab": { "type": "integer", "minimum": 0, "description": "移動するタブ ID" },
+                    "index": { "type": "integer", "minimum": 0, "description": "移動先インデックス（0 始まり）" },
+                },
+                "required": ["tab", "index"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_move_pane_to_tab",
             "description": "ペインを移動する。tab 指定 = 別タブの末尾へ移送（グループ分け）、\
                 target 指定 = そのペインの隣（direction 側）へ挿し直す（同タブ内の並べ替え = \
@@ -626,6 +640,7 @@ pub fn tools() -> Vec<Value> {
                     "width": { "type": "number", "exclusiveMinimum": 0, "description": "パネル幅（px）" },
                     "view": { "type": "string", "enum": ["tmux", "orch", "git"], "description": "表示するビュー（orch = オーケストレーター俯瞰。#217）" },
                     "filetree": { "type": "boolean", "description": "左サイドバーのファイルツリーの表示・非表示" },
+                    "sidebar_width": { "type": "number", "exclusiveMinimum": 0, "description": "左サイドバーの幅（px。Issue #307）" },
                 },
                 "additionalProperties": false,
             },
@@ -888,25 +903,44 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_preview_changelog",
+            "description": "プレビューペインのチェンジログビュー切替（Issue #338）。\
+                enabled=true で git 履歴ベースのファイル変更履歴表示に切り替える。\
+                enabled 省略時は状態取得のみ。expand にコミットハッシュを指定すると diff を展開/折りたたみ。\
+                git 管理外ファイルでは「履歴なし」を返す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象プレビューペイン ID（省略時は呼び出し元）"),
+                    "enabled": { "type": "boolean", "description": "true = チェンジログ表示、false = コードプレビューに戻す" },
+                    "max_count": { "type": "integer", "description": "取得するコミット数の上限（省略時は 50）", "minimum": 1 },
+                    "expand": { "type": "string", "description": "diff を展開/折りたたみするコミットハッシュ" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_file_op",
             "description": "ファイル操作を実行する。op で種別を指定:\n\
                 copy_absolute_path = 絶対パスを取得 / copy_relative_path = ペイン cwd 基準の相対パスを取得 /\n\
                 reveal = Finder でファイルの場所を表示（macOS）/\n\
                 open_terminal = 指定パスのディレクトリへペイン内で cd /\n\
                 rename = name でファイル名を変更 / create_file = path 配下に name でファイル作成 /\n\
-                create_dir = path 配下に name でフォルダ作成 / trash = ゴミ箱へ移動。\n\
-                rename / create_file / create_dir は name パラメータが必須。\
+                create_dir = path 配下に name でフォルダ作成 / trash = ゴミ箱へ移動 /\n\
+                open_default = デフォルトアプリで開く（macOS）/\n\
+                open_with = name で指定したアプリで開く（macOS。name 必須）。\n\
+                rename / create_file / create_dir / open_with は name パラメータが必須。\
                 open_terminal / copy_relative_path は pane パラメータでペインを指定する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "op": {
                         "type": "string",
-                        "enum": ["copy_absolute_path","copy_relative_path","reveal","open_terminal","rename","create_file","create_dir","trash"],
+                        "enum": ["copy_absolute_path","copy_relative_path","reveal","open_terminal","rename","create_file","create_dir","trash","open_default","open_with"],
                         "description": "操作種別",
                     },
                     "path": { "type": "string", "description": "対象のファイル・フォルダパス（必須）" },
-                    "name": { "type": "string", "description": "新しい名前（rename / create_file / create_dir で必須）" },
+                    "name": { "type": "string", "description": "新しい名前 / アプリ名（rename / create_file / create_dir / open_with で必須）" },
                     "pane": pane_schema("対象ペイン ID（open_terminal の cd 先 / copy_relative_path の基準。省略時は呼び出し元）"),
                 },
                 "required": ["op", "path"],
@@ -1208,6 +1242,12 @@ pub fn tools() -> Vec<Value> {
                     "tab": { "type": "integer", "minimum": 0, "description": "子を出すタブ ID。\
                         指定するとそのタブのフォーカスペインを分割元にする。\
                         複数マスター運用時は tab で出力先タブを明示指定することを推奨" },
+                    "task_type": {
+                        "type": "string",
+                        "enum": ["bugfix-rooted", "bugfix-unrooted", "investigation", "feature-verifiable", "feature-ui", "docs", "review"],
+                        "description": "委任台帳の task_type（省略時は investigation）。\
+                            spawn 時に自動記録され、ledger stats で task_type x model の成功率・差し戻し率を集計できる",
+                    },
                 },
                 "required": ["project", "prompt"],
                 "additionalProperties": false,
@@ -1323,8 +1363,50 @@ pub fn tools() -> Vec<Value> {
                         "type": "boolean", "default": false,
                         "description": "true にすると完了までブロッキングする旧挙動（後方互換。既定 false = 非同期）",
                     },
+                    "task_type": {
+                        "type": "string",
+                        "enum": ["bugfix-rooted", "bugfix-unrooted", "investigation", "feature-verifiable", "feature-ui", "docs", "review"],
+                        "description": "委任台帳の task_type（省略時は investigation）",
+                    },
                 },
                 "required": ["project", "prompt"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_orchestrator_ledger",
+            "description": "委任台帳を操作する（Issue #292）。\
+                action=list で一覧（project / task_type でフィルタ、limit で件数制限）、\
+                stats で task_type x model の集計（成功率・差し戻し率・平均所要時間・未評価数）、\
+                record で検収結果の記録（id + outcome + rounds + note）、\
+                amend で事後修正（検収 pass だが実使用で問題発覚。id + note）、\
+                prune で project 前方一致によるエントリ除去（project 必須。selftest 混入等の掃除用）。\
+                spawn / run 時に task_type を指定すると自動記録され、stats で判断材料になる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "stats", "record", "amend", "prune"],
+                        "description": "操作種別",
+                    },
+                    "id": { "type": "string", "description": "対象エントリ ID（record / amend 時に必須。spawn 応答の ledger_id）" },
+                    "outcome": {
+                        "type": "string",
+                        "enum": ["pass", "rework", "fail"],
+                        "description": "検収結果（record 時に必須）",
+                    },
+                    "rounds": { "type": "integer", "minimum": 1, "description": "差し戻し回数（record 時に任意）" },
+                    "note": { "type": "string", "description": "メモ（record / amend 時に任意）" },
+                    "project": { "type": "string", "description": "フィルタ用プロジェクト（list 時に任意）" },
+                    "task_type": {
+                        "type": "string",
+                        "enum": ["bugfix-rooted", "bugfix-unrooted", "investigation", "feature-verifiable", "feature-ui", "docs", "review"],
+                        "description": "フィルタ用 task_type（list 時に任意）",
+                    },
+                    "limit": { "type": "integer", "minimum": 1, "description": "返す件数の上限（list 時に任意。既定 50）" },
+                },
+                "required": ["action"],
                 "additionalProperties": false,
             },
         }),
@@ -1356,6 +1438,26 @@ pub fn tools() -> Vec<Value> {
                     "run_id": { "type": "string", "description": "回収する run_id" },
                 },
                 "required": ["run_id"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_orchestrator_respond",
+            "description": "worker の permission ダイアログ（ツール実行の承認要求）に応答する（#319）。\
+                watch の WORKER_PERMISSION イベントで検知されたダイアログに対し、選択肢を指定して解除する。\
+                ダイアログが画面に存在しない場合はエラーを返す（誤爆防止）。\
+                応答内容は persist.log に監査記録される。\
+                危険なコマンド（rm -rf / 本番 DB 操作等）への承認はユーザーに確認すること。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane_id": { "type": "integer", "description": "対象の worker ペイン ID" },
+                    "choice": {
+                        "type": "string",
+                        "description": "選択肢: 番号（1, 2, 3...）または 'yes'/'allow'（最初の選択肢）/ 'no'/'deny'（Deny 選択肢）",
+                    },
+                },
+                "required": ["pane_id", "choice"],
                 "additionalProperties": false,
             },
         }),
@@ -1621,6 +1723,50 @@ pub fn tools() -> Vec<Value> {
                         "type": "string",
                         "enum": ["dark", "light"],
                         "description": "テーマモード（set 時に必須）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_limit_service",
+            "description": "ステータスバーの利用制限表示サービスの状態確認・切替（Issue #321）。\
+                ステータスバーの 5h / 7d リミットメーターにどのサービス（claude / codex / agy）の値を表示するかを制御する。\
+                action=status（既定）: 現在の選択サービスと利用可能サービス一覧を返す。\
+                action=set: service で指定したサービスへ切り替える。\
+                変更は settings.json に永続化され、GUI に即時反映される。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "set"],
+                        "description": "操作種別（省略時は status）",
+                    },
+                    "service": {
+                        "type": "string",
+                        "enum": ["claude", "codex", "agy"],
+                        "description": "サービス名（set 時に必須）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_telemetry",
+            "description": "エラーレポートの自動送信（テレメトリ）の状態確認・切替（Issue #333）。\
+                tako 内で発生した panic / 重大エラーを PII なしで収集エンドポイントへ送信する。\
+                action=status（既定）: 現在の ON/OFF・直近の送信件数・ログパスを返す。\
+                action=on: テレメトリを有効化する。\
+                action=off: テレメトリを無効化する。\
+                変更は settings.json に永続化される。送信内容はすべてローカルの telemetry.log に記録される。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "on", "off"],
+                        "description": "操作種別（省略時は status）",
                     },
                 },
                 "additionalProperties": false,
@@ -2048,6 +2194,71 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "tako_run_interactive",
+            "description": "ユーザー入力が必要なコマンドを可視ペインに委譲する（Issue #305）。\
+                sudo パスワード・ブラウザ認証・対話プロンプト等、AI が直接入力できない操作を \
+                split -> タイトル設定 -> コマンド投入までアトミックに実行し、pane_id を返す。\
+                コマンドは exit code 回収マーカーでラップされるため、完了後に \
+                tako_run_interactive_status で exit code を回収できる。\
+                使い方: (1) run_interactive でペインを開く (2) ユーザーに入力を案内する \
+                (3) status で完了を確認する (4) auto_close に従いペインが自動 close される",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "実行するコマンド文字列（シェル経由で実行される）",
+                    },
+                    "input_hint": {
+                        "type": "string",
+                        "description": "ユーザーへの入力案内（タイトルに表示。省略時はコマンド文字列が使われる）",
+                    },
+                    "pane": pane_schema("分割の基準ペイン ID（省略時は呼び出し元。tab と排他）"),
+                    "tab": {
+                        "type": "integer", "minimum": 0,
+                        "description": "分割先タブ ID（pane と排他）",
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["right", "down", "left", "up"],
+                        "description": "新ペインが生える方向（省略時は right）",
+                    },
+                    "ratio": {
+                        "type": "number",
+                        "exclusiveMinimum": 0.0,
+                        "exclusiveMaximum": 1.0,
+                        "description": "新ペイン側の取り分（省略時は 0.3）",
+                    },
+                    "auto_close": {
+                        "type": "string",
+                        "enum": ["success", "always", "never"],
+                        "description": "完了後の自動 close 方針。success（既定）= exit 0 で close / always = 常に close / never = 残す",
+                    },
+                },
+                "required": ["command"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_run_interactive_status",
+            "description": "run-interactive で起動したペインの完了状態を確認する（Issue #305）。\
+                ペイン出力から exit code マーカーを探し、見つかれば exit code と auto_close の \
+                結果を返す。見つからなければ status: running を返す。\
+                完了検知後、auto_close 方針に従いペインを自動 close する（success: exit 0 のみ / \
+                always: 常に / never: 残す）。AI は完了まで定期的にポーリングすること。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": {
+                        "type": "integer", "minimum": 0,
+                        "description": "run-interactive が返した pane ID",
+                    },
+                },
+                "required": ["pane"],
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -2209,6 +2420,7 @@ fn orchestrator_run(
     let agent = str_arg(args, "agent").map_err(map_err)?;
     let sync_mode = bool_arg(args, "sync").map_err(map_err)?.unwrap_or(false);
 
+    let task_type = str_arg(args, "task_type").map_err(map_err)?;
     let opts = wait::RunOptions {
         project,
         prompt,
@@ -2224,6 +2436,7 @@ fn orchestrator_run(
         output_lines,
         initial_delay: std::time::Duration::from_secs(20),
         interval: std::time::Duration::from_secs(5),
+        task_type,
     };
 
     if sync_mode {
@@ -2400,6 +2613,10 @@ fn build_request(
         "tako_select_tab" => Request::TabSelect {
             tab: required_u64(args, "tab")?,
         },
+        "tako_reorder_tab" => Request::TabReorder {
+            tab: required_u64(args, "tab")?,
+            index: required_u64(args, "index")? as usize,
+        },
         "tako_move_pane_to_tab" => {
             let new_tab = bool_arg(args, "new_tab")?.unwrap_or(false);
             Request::MovePane {
@@ -2497,6 +2714,12 @@ fn build_request(
             pane: Some(target_pane(args, caller)?),
             enabled: bool_arg(args, "enabled")?,
         },
+        "tako_preview_changelog" => Request::PreviewChangelog {
+            pane: Some(target_pane(args, caller)?),
+            enabled: bool_arg(args, "enabled")?,
+            max_count: u64_arg(args, "max_count")?.map(|v| v as usize),
+            expand: str_arg(args, "expand")?,
+        },
         "tako_file_op" => {
             let op_str = str_arg(args, "op")?.ok_or("op を指定する")?;
             let op = match op_str.as_str() {
@@ -2508,6 +2731,8 @@ fn build_request(
                 "create_file" => crate::protocol::FileOpKind::CreateFile,
                 "create_dir" => crate::protocol::FileOpKind::CreateDir,
                 "trash" => crate::protocol::FileOpKind::Trash,
+                "open_default" => crate::protocol::FileOpKind::OpenDefault,
+                "open_with" => crate::protocol::FileOpKind::OpenWith,
                 other => return Err(format!("op が不正: {other}")),
             };
             Request::FileOp {
@@ -2562,6 +2787,7 @@ fn build_request(
                 Some(other) => return Err(format!("view が不正: {other}（tmux | orch | git）")),
             },
             filetree: bool_arg(args, "filetree")?,
+            sidebar_width: f32_arg(args, "sidebar_width")?,
         },
         "tako_collapse_tab" => Request::CollapseTab {
             pane: u64_arg(args, "pane")?.or(caller),
@@ -2667,6 +2893,7 @@ fn build_request(
                 caller_role: caller_role.map(str::to_string),
                 agent: str_arg(args, "agent")?,
                 caller_pid: u64_arg(args, "caller_pid")?.map(|v| v as u32),
+                task_type: str_arg(args, "task_type")?,
             }
         }
         "tako_orchestrator_worker_status" => Request::OrchestratorWorkerStatus {
@@ -2679,6 +2906,21 @@ fn build_request(
         },
         "tako_orchestrator_run_result" => Request::OrchestratorRunResult {
             run_id: str_arg(args, "run_id")?.ok_or("run_id を指定する")?,
+        },
+        "tako_orchestrator_respond" => Request::OrchestratorRespond {
+            pane_id: required_u64(args, "pane_id")?,
+            choice: str_arg(args, "choice")?.ok_or("choice を指定する")?,
+            caller_role: caller_role.map(str::to_string),
+        },
+        "tako_orchestrator_ledger" => Request::OrchestratorLedger {
+            action: str_arg(args, "action")?.ok_or("action を指定する")?,
+            id: str_arg(args, "id")?,
+            outcome: str_arg(args, "outcome")?,
+            rounds: u64_arg(args, "rounds")?.map(|v| v as u32),
+            note: str_arg(args, "note")?,
+            project: str_arg(args, "project")?,
+            task_type: str_arg(args, "task_type")?,
+            limit: u64_arg(args, "limit")?.map(|v| v as usize),
         },
         "tako_remote_start" => Request::RemoteStart {
             port: u64_arg(args, "port")?.map(|v| v as u16),
@@ -2737,6 +2979,13 @@ fn build_request(
         "tako_theme" => Request::Theme {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             mode: str_arg(args, "mode")?.map(|s| s.to_string()),
+        },
+        "tako_limit_service" => Request::LimitService {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
+            service: str_arg(args, "service")?.map(|s| s.to_string()),
+        },
+        "tako_telemetry" => Request::Telemetry {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
         },
         "tako_setup_changes" => Request::SetupChanges,
         "tako_setup" => Request::SetupRun {
@@ -2893,6 +3142,26 @@ fn build_request(
             results_json: None,
             cwd: None,
             sync_checkpoint: None,
+        },
+        "tako_run_interactive" => {
+            let tab = u64_arg(args, "tab")?;
+            Request::RunInteractive {
+                pane: if tab.is_some() {
+                    None
+                } else {
+                    Some(target_pane(args, caller)?)
+                },
+                tab,
+                command: str_arg(args, "command")?.ok_or("command を指定する")?,
+                input_hint: str_arg(args, "input_hint")?,
+                direction: direction_arg(args)?,
+                ratio: f32_arg(args, "ratio")?,
+                auto_close: str_arg(args, "auto_close")?,
+            }
+        }
+        "tako_run_interactive_status" => Request::RunInteractiveStatus {
+            pane: required_u64(args, "pane")?,
+            no_wait: false,
         },
         _ => return Err(format!("不明なツール: {name}")),
     })
@@ -3583,7 +3852,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 92);
+        assert_eq!(tools.len(), 100);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

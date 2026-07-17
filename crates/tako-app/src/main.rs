@@ -93,6 +93,22 @@ const RESIZE_STEP: f32 = 0.05;
 /// ペイン境界のドラッグ判定/カーソル変更の当たり幅（px。仕切り線を中心に左右各 BORDER_HANDLE/2）
 const BORDER_HANDLE: f32 = 8.0;
 
+/// ドラッグ選択自動スクロール: ペイン上下端からこの範囲内でスクロールを開始する（px）
+const DRAG_SCROLL_MARGIN: f32 = 40.0;
+/// ドラッグ選択自動スクロールのタイマー間隔（ms）
+const DRAG_SCROLL_INTERVAL_MS: u64 = 30;
+/// ドラッグ選択自動スクロールの最小速度（行/秒）
+const DRAG_SCROLL_MIN_SPEED: f32 = 2.0;
+/// ドラッグ選択自動スクロールの最大速度（行/秒）
+const DRAG_SCROLL_MAX_SPEED: f32 = 30.0;
+
+/// 速度係数（0.0..1.0）を 1 ティック分のスクロール行数（正）に変換する
+fn drag_scroll_delta(factor_abs: f32) -> f32 {
+    let speed =
+        DRAG_SCROLL_MIN_SPEED + (DRAG_SCROLL_MAX_SPEED - DRAG_SCROLL_MIN_SPEED) * factor_abs;
+    speed * (DRAG_SCROLL_INTERVAL_MS as f32 / 1000.0)
+}
+
 /// スクロールバーの当たり領域の幅（px。サムはこの内側に描く）
 const SCROLLBAR_WIDTH: f32 = 10.0;
 /// スクロールバーの表示維持時間とフェード時間（iTerm2 流の出し方。FR-2.5.13）
@@ -172,8 +188,9 @@ impl ScrollCtl {
     }
 }
 
-/// 左サイドバー（ファイルツリー）の幅（px。FR-3.1）
-const SIDEBAR_WIDTH: f32 = 244.0;
+/// 左サイドバー（ファイルツリー）の最小幅（px。FR-3.1。ドラッグで可変。
+/// 既定幅は settings::default_sidebar_width() = 244）
+const SIDEBAR_MIN_WIDTH: f32 = 120.0;
 
 /// 右サイドバー（情報パネル）の既定幅・最小幅（px。ドラッグで可変）
 const PANEL_DEFAULT_WIDTH: f32 = 320.0;
@@ -579,6 +596,13 @@ fn byte_to_utf16_offset(text: &str, byte_offset: usize) -> usize {
     text[..offset].chars().map(char::len_utf16).sum()
 }
 
+/// ドラッグ選択中の自動スクロール状態（#310）
+struct DragScrollState {
+    pane: PaneId,
+    /// 正 = 過去方向（上）、負 = 未来方向（下）。絶対値が速度係数（0.0..1.0）
+    speed_factor: f32,
+}
+
 struct TakoApp {
     workspace: Workspace,
     terminals: HashMap<PaneId, TerminalSession>,
@@ -592,6 +616,8 @@ struct TakoApp {
     pane_cell_sizes: HashMap<PaneId, Size<Pixels>>,
     /// マウス選択中のペイン
     selecting: Option<PaneId>,
+    /// ドラッグ選択自動スクロールの状態（上下端到達時のスクロール方向。タイマー稼働中）
+    drag_scroll: Option<DragScrollState>,
     /// 直近 render でのアクティブタブ各ペインのテキスト領域（マウス座標→セル変換用）
     pane_text_areas: Vec<(PaneId, Bounds<Pixels>)>,
     /// Layer 1 IPC サーバー（FR-2.2 の受け口。起動失敗時は None で IPC なし動作）
@@ -650,6 +676,10 @@ struct TakoApp {
     tmux_pending_kill: Option<(String, Option<u32>, Option<String>)>,
     /// 統合 tmux ビューのペイン行ゴミ箱 → kill 確認待ちのペイン（FR-2.16.7。誤爆防止）
     pending_pane_kill: Option<PaneId>,
+    /// 左サイドバー幅（px。右端ハンドルのドラッグで可変。#307）
+    sidebar_width: f32,
+    /// 左サイドバー右端の境界をドラッグ中か（#307）
+    dragging_sidebar: bool,
     /// 左サイドバーのファイルツリー（FR-3.1 / FR-3.7。cmd+B でトグル）
     filetree: filetree::FileTree,
     /// プレビューペイン（FR-3.2 / FR-3.3）。キーに居るペインはターミナルではなく
@@ -733,6 +763,9 @@ struct TakoApp {
     drop_target: Option<(PaneId, DropZone)>,
     /// タブバーへのペイン D&D: ドロップ先タブ（Some(id) = 既存タブへ合流、None = 新タブ化）
     tab_drop_target: Option<Option<TabId>>,
+    /// タブ D&D 並べ替え中の挿入位置インジケータ（#308）。
+    /// Some(tab_id) = そのタブの**左**にインジケータを表示、None = 末尾
+    tab_reorder_indicator: Option<Option<TabId>>,
     /// git パネルのデータ（FR-3.6。cwd 連動で 2 秒ポーリング更新）
     git_data: Option<GitPanelData>,
     /// サイドバー用の軽量 git サマリ（#217。ブランチチップ + 変更フッター）
@@ -768,6 +801,10 @@ struct TakoApp {
     video_ticker: bool,
     /// 全ペインから集約した Claude エージェントメトリクス（ctx/usage。ポーリングで更新）
     agent_metrics: AgentMetrics,
+    /// ステータスバーの利用制限表示で選択中のサービス（Issue #321。settings.json 永続化）
+    limit_service: tako_core::LimitService,
+    /// ステータスバーの利用制限サービス切替ドロップダウンが開いているか（Issue #321）
+    limit_service_menu_open: bool,
     /// usage トークン推移の履歴（#217 スパークライン。最大 5 点、変化時のみ追記）
     usage_history: std::collections::VecDeque<f32>,
     /// 端末イベントの再描画デバウンス: 最後に notify した時刻
@@ -787,6 +824,8 @@ struct TakoApp {
     preview_image_lru: tako_core::ByteLru<PreviewImageCacheEntryKey>,
     /// LRU / close で外した GPUI asset。次の render 冒頭で atlas と一緒に解放する。
     pending_preview_image_evictions: Vec<std::sync::Arc<gpui::Image>>,
+    /// チェンジログビューのデータ（Issue #338。pane ごと）
+    preview_changelogs: HashMap<PaneId, preview::ChangelogData>,
     /// PDF・画像プレビューのズーム / パン / ページ状態（#234。core モデル）。
     preview_views: HashMap<PaneId, tako_core::PreviewViewState>,
     /// PDF・画像プレビューの 2 軸スクロールとページ移動を共有する GPUI handle。
@@ -810,6 +849,9 @@ struct TakoApp {
     preview_pdf_highlight_paint_count: HashMap<PaneId, usize>,
     /// PDF リンクのホバー状態（#271）。⌘ 押下中のみ有効。
     preview_pdf_hovered_link: Option<(PaneId, usize)>,
+    /// PDF ページ画像のスクリーン座標 bounds（canvas paint 時に直接記録。#315）。
+    /// estimate 不要で zoom / scroll 後もヒットテストが正しい。
+    preview_pdf_page_image_bounds: HashMap<PaneId, HashMap<usize, Bounds<Pixels>>>,
     /// コード / Markdown の行ごとの GPUI 実描画レイアウト。
     /// 描画と同じ shaping 結果で座標を UTF-8 byte index へ逆写像する。
     preview_text_layouts: HashMap<PaneId, Vec<Option<TextLayout>>>,
@@ -871,6 +913,8 @@ struct TakoApp {
     last_active_tab: Option<TabId>,
     /// リモート接続の GUI 状態（#283。承認ダイアログ・接続端末インジケータ・kill switch）
     remote: remote_panel::RemoteUiState,
+    /// タイトルバー（タブバー領域）のドラッグでウインドウ移動中か（#312）
+    titlebar_dragging: bool,
 }
 
 /// × ボタン close の確認ダイアログ対象（Issue #172）
@@ -1650,6 +1694,7 @@ impl TakoApp {
             pane_font_sizes: HashMap::new(),
             pane_cell_sizes: HashMap::new(),
             selecting: None,
+            drag_scroll: None,
             pane_text_areas: Vec::new(),
             ipc,
             mcp,
@@ -1682,6 +1727,11 @@ impl TakoApp {
             context_menu: None,
             pane_context_menu: None,
             inline_edit: None,
+            sidebar_width: {
+                let w = tako_control::settings::load().sidebar_width as f32;
+                w.clamp(SIDEBAR_MIN_WIDTH, 600.0)
+            },
+            dragging_sidebar: false,
             filetree: filetree::FileTree::default(),
             previews: HashMap::new(),
             preview_navigation_panel: None,
@@ -1714,6 +1764,7 @@ impl TakoApp {
             drag_kind: None,
             drop_target: None,
             tab_drop_target: None,
+            tab_reorder_indicator: None,
             git_data: None,
             sidebar_git: None,
             git_selected_commit: None,
@@ -1729,6 +1780,8 @@ impl TakoApp {
             pinned_previews: Vec::new(),
             dragging_pin: None,
             agent_metrics: AgentMetrics::default(),
+            limit_service: tako_control::settings::load().limit_service(),
+            limit_service_menu_open: false,
             usage_history: std::collections::VecDeque::new(),
             last_term_notify: std::time::Instant::now(),
             term_notify_pending: false,
@@ -1739,6 +1792,7 @@ impl TakoApp {
             preview_image_cache: HashMap::new(),
             preview_image_lru: tako_core::ByteLru::new(initial_preview_cache_budget()),
             pending_preview_image_evictions: Vec::new(),
+            preview_changelogs: HashMap::new(),
             preview_views: HashMap::new(),
             preview_scroll_handles: HashMap::new(),
             video_seek_bar_bounds: HashMap::new(),
@@ -1750,6 +1804,7 @@ impl TakoApp {
             preview_pdf_char_bounds: HashMap::new(),
             preview_pdf_highlight_paint_count: HashMap::new(),
             preview_pdf_hovered_link: None,
+            preview_pdf_page_image_bounds: HashMap::new(),
             preview_text_layouts: HashMap::new(),
             preview_line_texts: HashMap::new(),
             webviews: Vec::new(),
@@ -1784,6 +1839,7 @@ impl TakoApp {
             tab_scroll_handle: gpui::ScrollHandle::new(),
             last_active_tab: None,
             remote: remote_panel::RemoteUiState::default(),
+            titlebar_dragging: false,
         };
         // App Nap 無効化 + 初回スリープ防止更新（Issue #173）
         // 蓋閉じ防止の残留チェック（#218: 前回クラッシュ時の disablesleep=1 を自動復帰）
@@ -2273,14 +2329,14 @@ impl TakoApp {
                         .map(|(id, t)| (*id, t.session.clone(), t.socket.clone()))
                         .collect();
                     let git_cwd = if app.panel_visible && app.panel_view == PanelView::Git {
-                        app.active_tab_cwd()
+                        app.git_cwd_for_tab()
                     } else {
                         None
                     };
                     let git_selected = app.git_selected_commit.clone();
                     // サイドバー表示中はブランチ + 変更サマリの軽量 git 取得（#217）
                     let sidebar_git_cwd = if app.filetree.visible {
-                        app.active_tab_cwd()
+                        app.git_cwd_for_tab()
                     } else {
                         None
                     };
@@ -3261,6 +3317,55 @@ impl TakoApp {
             })
     }
 
+    /// git タブ用の cwd を決定する。フォーカスペインの cwd を優先し、
+    /// git リポジトリが見つからなければファイルツリーの全ソース（他ペインの cwd +
+    /// pinned フォルダ）からフォールバック検索する（#313）
+    fn git_cwd_for_tab(&self) -> Option<std::path::PathBuf> {
+        let tab = self.workspace.active_tab();
+        let active_pane = tab.tree().focused();
+
+        // フォーカスペインの cwd が git リポジトリ内ならそれを使う
+        if let Some(cwd) = self.terminals.get(&active_pane).and_then(|s| s.cwd()) {
+            if has_git_ancestor(cwd) {
+                return Some(cwd.to_path_buf());
+            }
+        }
+
+        // 他のフォアグラウンドペインの cwd を走査
+        for pane in tab.tree().panes() {
+            if pane.id() == active_pane {
+                continue;
+            }
+            if let Some(cwd) = self.terminals.get(&pane.id()).and_then(|s| s.cwd()) {
+                if has_git_ancestor(cwd) {
+                    return Some(cwd.to_path_buf());
+                }
+            }
+        }
+
+        // pinned フォルダを走査
+        for folder in tab.pinned_folders() {
+            if has_git_ancestor(folder) {
+                return Some(folder.clone());
+            }
+        }
+
+        // バックグラウンドペイン（同タブ由来）を走査
+        let tab_id = tab.id();
+        for bp in self.workspace.shelved_panes() {
+            if bp.origin_tab() != tab_id {
+                continue;
+            }
+            if let Some(cwd) = self.terminals.get(&bp.id()).and_then(|s| s.cwd()) {
+                if has_git_ancestor(cwd) {
+                    return Some(cwd.to_path_buf());
+                }
+            }
+        }
+
+        None
+    }
+
     /// background thread で tmux セッション一覧を取得するためのコンテキストを収集する。
     /// UI スレッドでの実行コスト: pane/tab の走査のみ（< 0.1ms）
     /// alt_screen 遷移待ちの遅延書き込みを flush する（汎用）。
@@ -4159,6 +4264,7 @@ impl TakoApp {
                 self.video_players.remove(&pane_id);
                 self.remove_video_frame_cache(pane_id);
                 self.remove_preview_image_cache(pane_id);
+                self.preview_changelogs.remove(&pane_id);
                 self.preview_views.remove(&pane_id);
                 self.preview_scroll_handles.remove(&pane_id);
                 self.pending_pdf_rasters.remove(&pane_id);
@@ -4168,6 +4274,7 @@ impl TakoApp {
                 self.preview_line_bounds.remove(&pane_id);
                 self.preview_pdf_char_bounds.remove(&pane_id);
                 self.preview_pdf_highlight_paint_count.remove(&pane_id);
+                self.preview_pdf_page_image_bounds.remove(&pane_id);
                 self.preview_text_layouts.remove(&pane_id);
                 self.preview_line_texts.remove(&pane_id);
                 self.pane_links.remove(&pane_id);
@@ -4225,6 +4332,7 @@ impl TakoApp {
                     self.preview_line_bounds.remove(&id);
                     self.preview_pdf_char_bounds.remove(&id);
                     self.preview_pdf_highlight_paint_count.remove(&id);
+                    self.preview_pdf_page_image_bounds.remove(&id);
                     self.preview_text_layouts.remove(&id);
                     self.preview_line_texts.remove(&id);
                     self.pane_links.remove(&id);
@@ -4763,6 +4871,17 @@ impl TakoApp {
             }
         }
         cx.notify();
+    }
+
+    fn save_sidebar_width(&self) {
+        if std::env::var_os("TAKO_SELF_TEST").is_some() {
+            return;
+        }
+        let mut settings = tako_control::settings::load();
+        settings.sidebar_width = self.sidebar_width as u32;
+        if let Err(e) = tako_control::settings::save(&settings) {
+            eprintln!("warning: 設定を保存できない: {e}");
+        }
     }
 
     /// ⌘K コマンドパレットを開く（#217 カンプ。ペイン・コマンド検索）
@@ -5330,7 +5449,8 @@ impl TakoApp {
         texts.last().map(|last| (texts.len() - 1, last.len()))
     }
 
-    /// PDF リンクのヒットテスト（#271）。マウス位置にある PDF リンクのインデックスを返す。
+    /// PDF リンクのヒットテスト（#271 / #315）。マウス位置にある PDF リンクのインデックスを返す。
+    /// ページ画像の bounds は canvas paint 時に直接記録したものを使う（テキストレイヤ不要）。
     fn pdf_link_at_position(&self, pane_id: PaneId, position: Point<Pixels>) -> Option<usize> {
         let state = self.previews.get(&pane_id)?;
         let data = match &state.content {
@@ -5340,21 +5460,17 @@ impl TakoApp {
         if data.links.is_empty() {
             return None;
         }
-        let view = self
-            .preview_views
-            .get(&pane_id)
-            .copied()
-            .unwrap_or_default();
-        let page_idx = view.page.saturating_sub(1);
-        let page_size = data.page_sizes.get(page_idx)?;
-        let image_bounds = self.estimate_pdf_page_bounds(pane_id, page_idx, data)?;
+        let page_bounds_map = self.preview_pdf_page_image_bounds.get(&pane_id)?;
 
         for (link_idx, link) in data.links.links.iter().enumerate() {
-            if link.page_index != page_idx {
+            let Some(page_size) = data.page_sizes.get(link.page_index) else {
                 continue;
-            }
+            };
+            let Some(image_bounds) = page_bounds_map.get(&link.page_index) else {
+                continue;
+            };
             let screen_bounds =
-                preview_render::pdf_box_to_screen(link.bbox, *page_size, image_bounds);
+                preview_render::pdf_box_to_screen(link.bbox, *page_size, *image_bounds);
             if screen_bounds.contains(&position) {
                 return Some(link_idx);
             }
@@ -5362,93 +5478,8 @@ impl TakoApp {
         None
     }
 
-    /// PDF ページ画像のビューポート座標 bounds を推算する（#271）。
-    /// テキストレイヤの行 bounds から逆算するか、行がなければ None。
-    fn estimate_pdf_page_bounds(
-        &self,
-        pane_id: PaneId,
-        page_idx: usize,
-        data: &preview::PdfData,
-    ) -> Option<Bounds<Pixels>> {
-        let line_bounds = self.preview_line_bounds.get(&pane_id)?;
-        let page_size = data.page_sizes.get(page_idx)?;
-        // ページのテキストレイヤ先頭行のオフセットを求める
-        let mut line_offset = 0usize;
-        for (pi, page_lines) in data.text_layers.iter().enumerate() {
-            if pi == page_idx {
-                break;
-            }
-            line_offset += page_lines.len();
-        }
-        let page_text = data.text_layers.get(page_idx)?;
-        // テキストレイヤの bbox から画像 bounds を逆算する:
-        // PDF 座標(左下原点) → スクリーン座標(左上原点) の変換は pdf_box_to_screen で行う。
-        // image_bounds = ページ画像全体の矩形。
-        // 任意のテキスト行: screen.origin.x = image.origin.x + bbox.x * scale_x
-        // → image.origin.x = screen.origin.x - bbox.x * scale_x
-        // scale_x = image.width / page_size.width
-        // → image.origin.x = screen.origin.x - bbox.x * image.width / page_size.width
-        // この循環を、全ページの bbox [0,0,w,h] として解くと:
-        // ページ全体 = bbox [0, 0, page_w, page_h] のスクリーン化
-        // ただし直接 image_bounds がわからない。
-        //
-        // 代替アプローチ: テキストの行 bounds の上下端からページ画像の上端と高さを推定し、
-        // ページの幅はアスペクト比から求める。ただしテキストが無い場合は判定不能。
-        if page_text.is_empty() {
-            return None;
-        }
-        // 全行の bounds の包含矩形を求める
-        let mut min_x = f32::MAX;
-        let mut min_y = f32::MAX;
-        let mut max_x = f32::MIN;
-        let mut max_y = f32::MIN;
-        let mut pdf_min_x = f64::MAX;
-        let mut pdf_min_y = f64::MAX;
-        let mut pdf_max_x = f64::MIN;
-        let mut pdf_max_y = f64::MIN;
-        for (i, tl) in page_text.iter().enumerate() {
-            if let Some(lb) = line_bounds.get(line_offset + i) {
-                let lx = f32::from(lb.origin.x);
-                let ly = f32::from(lb.origin.y);
-                let lw = f32::from(lb.size.width);
-                let lh = f32::from(lb.size.height);
-                if lw > 0.0 && lh > 0.0 {
-                    min_x = min_x.min(lx);
-                    min_y = min_y.min(ly);
-                    max_x = max_x.max(lx + lw);
-                    max_y = max_y.max(ly + lh);
-                    // 対応する PDF 座標の bbox
-                    pdf_min_x = pdf_min_x.min(tl.bbox[0]);
-                    // PDF 左下原点 → 上端: page_h - (y + h)
-                    let pdf_top = page_size[1] - tl.bbox[1] - tl.bbox[3];
-                    pdf_min_y = pdf_min_y.min(pdf_top);
-                    pdf_max_x = pdf_max_x.max(tl.bbox[0] + tl.bbox[2]);
-                    pdf_max_y = pdf_max_y.max(pdf_top + tl.bbox[3]);
-                }
-            }
-        }
-        if min_x >= max_x || min_y >= max_y || pdf_min_x >= pdf_max_x || pdf_min_y >= pdf_max_y {
-            return None;
-        }
-        // テキスト群のスクリーン範囲と PDF 座標範囲からスケールを算出
-        let screen_w = max_x - min_x;
-        let pdf_w = (pdf_max_x - pdf_min_x) as f32;
-        if pdf_w <= 0.0 {
-            return None;
-        }
-        let scale = screen_w / pdf_w;
-        // ページ画像の origin を逆算
-        let img_x = min_x - pdf_min_x as f32 * scale;
-        let img_y = min_y - pdf_min_y as f32 * scale;
-        let img_w = page_size[0] as f32 * scale;
-        let img_h = page_size[1] as f32 * scale;
-        Some(Bounds {
-            origin: point(px(img_x), px(img_y)),
-            size: gpui::size(px(img_w), px(img_h)),
-        })
-    }
-
-    /// PDF プレビューのリンクホバー状態を更新する（#271）。
+    /// PDF プレビューのリンクホバー状態を更新する（#271 / #315）。
+    /// すべてのレンダリング済み PDF ペインをチェックする（focused_pane に依存しない）。
     fn update_pdf_link_hover(
         &mut self,
         position: Point<Pixels>,
@@ -5463,10 +5494,14 @@ impl TakoApp {
             }
             return;
         }
-        let pane_id = self.focused_pane();
-        let found = self
-            .pdf_link_at_position(pane_id, position)
-            .map(|idx| (pane_id, idx));
+        let pane_ids: Vec<PaneId> = self.preview_pdf_page_image_bounds.keys().copied().collect();
+        let mut found = None;
+        for pane_id in pane_ids {
+            if let Some(idx) = self.pdf_link_at_position(pane_id, position) {
+                found = Some((pane_id, idx));
+                break;
+            }
+        }
         if found != old {
             self.preview_pdf_hovered_link = found;
             cx.notify();
@@ -6386,11 +6421,23 @@ impl TakoApp {
     fn update_sleep_guard(&mut self) {
         use tako_core::CommandState;
         let settings = tako_control::settings::load();
-        let busy_agents = self
+        // OSC 133 で Running が検知できているペイン数
+        let running_count = self
             .terminals
             .values()
             .filter(|s| matches!(s.command_state(), CommandState::Running))
             .count();
+        // persist 復元後に OSC 133 未検知（Unknown）だがバックエンドに
+        // 実行中の子プロセスがいるペイン数（#324: 復元 worker の busy 漏れ根治）
+        let unknown_backends: Vec<&str> = self
+            .terminals
+            .iter()
+            .filter(|(_, s)| matches!(s.command_state(), CommandState::Unknown))
+            .filter_map(|(pid, _)| self.backend_sessions.get(pid).map(|s| s.as_str()))
+            .collect();
+        let restored_busy =
+            tako_control::agents::count_sessions_with_running_children(&unknown_backends);
+        let busy_agents = running_count + restored_busy;
         let state = tako_control::sleep_guard::update(
             settings.sleep_guard_mode,
             settings.sleep_guard_power,
@@ -6420,6 +6467,9 @@ impl TakoApp {
             let _ = entity.update(cx, |this, cx| {
                 this.drag_kind = Some(kind);
                 this.drop_target = None;
+                // #308: タブ D&D 開始時に titlebar_dragging を解除して
+                // #312 のウインドウ移動と競合しないようにする
+                this.titlebar_dragging = false;
                 cx.notify();
             });
             cx.new(|_| DragGhost {
@@ -6474,6 +6524,7 @@ impl TakoApp {
     fn take_drop_zone(&mut self, pane_id: PaneId) -> Option<DropZone> {
         self.drag_kind = None;
         self.tab_drop_target = None;
+        self.tab_reorder_indicator = None;
         self.drop_target
             .take()
             .filter(|(p, _)| *p == pane_id)
@@ -6553,6 +6604,46 @@ impl TakoApp {
             self.tab_drop_target = new;
             cx.notify();
         }
+    }
+
+    /// タブ D&D 並べ替えの挿入インジケータ更新（#308）。
+    /// `before`: Some(tab_id) = そのタブの左にインジケータ表示、None = 末尾
+    pub(crate) fn set_tab_reorder_indicator(
+        &mut self,
+        before: Option<TabId>,
+        cx: &mut Context<Self>,
+    ) {
+        let new = Some(before);
+        if self.tab_reorder_indicator != new {
+            self.tab_reorder_indicator = new;
+            cx.notify();
+        }
+    }
+
+    /// タブ D&D 並べ替えのドロップ確定（#308）。
+    /// `before`: Some(tab_id) = そのタブの位置へ移動、None = 末尾
+    pub(crate) fn drop_tab_reorder(
+        &mut self,
+        dragged: TabId,
+        before: Option<TabId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.drag_kind = None;
+        self.tab_reorder_indicator = None;
+        let target_index = match before {
+            Some(before_id) => self
+                .workspace
+                .tabs()
+                .iter()
+                .position(|t| t.id() == before_id)
+                .unwrap_or(usize::MAX),
+            None => usize::MAX,
+        };
+        if let Err(e) = self.workspace.move_tab(dragged, target_index) {
+            eprintln!("warning: タブを並べ替えできない: {e}");
+        }
+        self.save_layout();
+        cx.notify();
     }
 
     /// タブバーへペインをドロップ（Issue #209）。
@@ -7074,9 +7165,11 @@ impl TakoApp {
             if self.dragging_border.take().is_some()
                 | self.dragging_scrollbar.take().is_some()
                 | self.selecting.take().is_some()
+                | self.drag_scroll.take().is_some()
                 | self.preview_selecting.take().is_some()
                 | self.dragging_pin.take().is_some()
                 | std::mem::take(&mut self.dragging_panel)
+                | std::mem::take(&mut self.dragging_sidebar)
                 | self.video_seek_dragging.take().is_some()
             {
                 cx.notify();
@@ -7100,6 +7193,14 @@ impl TakoApp {
             if let Some(p) = self.pinned_previews.iter_mut().find(|p| p.target == target) {
                 p.pos = point(px(x), px(y));
             }
+            cx.notify();
+            return;
+        }
+        // 左サイドバーの幅ドラッグ（Issue #307。右パネルと同方式）
+        if self.dragging_sidebar {
+            let total = f32::from(window.viewport_size().width);
+            let max = (total * 0.5).max(SIDEBAR_MIN_WIDTH);
+            self.sidebar_width = f32::from(event.position.x).clamp(SIDEBAR_MIN_WIDTH, max);
             cx.notify();
             return;
         }
@@ -7151,6 +7252,110 @@ impl TakoApp {
                 cx.notify();
             }
         }
+        // ドラッグ選択中のオートスクロール判定（#310）
+        self.update_drag_scroll(pane_id, event.position, cx);
+    }
+
+    /// ドラッグ選択中のオートスクロール状態を更新する（#310）。
+    /// マウスがペイン上下端の DRAG_SCROLL_MARGIN 範囲内ならスクロール開始、
+    /// 範囲外に戻ったら停止する
+    fn update_drag_scroll(
+        &mut self,
+        pane_id: PaneId,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        // alt_screen（全画面 TUI）ではスクロールバックがないため自動スクロールしない
+        if let Some(session) = self.terminals.get(&pane_id) {
+            if session.is_alt_screen() {
+                self.drag_scroll = None;
+                return;
+            }
+        }
+        let Some((_, area)) = self.pane_text_areas.iter().find(|(id, _)| *id == pane_id) else {
+            return;
+        };
+        let area = *area;
+        let y = f32::from(position.y);
+        let top = f32::from(area.origin.y);
+        let bottom = top + f32::from(area.size.height);
+
+        let speed_factor = if y < top + DRAG_SCROLL_MARGIN {
+            // 上端に近い → 過去方向（正）へスクロール
+            let dist = (top + DRAG_SCROLL_MARGIN - y).min(DRAG_SCROLL_MARGIN);
+            dist / DRAG_SCROLL_MARGIN
+        } else if y > bottom - DRAG_SCROLL_MARGIN {
+            // 下端に近い → 未来方向（負）へスクロール
+            let dist = (y - (bottom - DRAG_SCROLL_MARGIN)).min(DRAG_SCROLL_MARGIN);
+            -(dist / DRAG_SCROLL_MARGIN)
+        } else {
+            0.0
+        };
+
+        if speed_factor == 0.0 {
+            self.drag_scroll = None;
+            return;
+        }
+
+        let was_none = self.drag_scroll.is_none();
+        self.drag_scroll = Some(DragScrollState {
+            pane: pane_id,
+            speed_factor,
+        });
+        if was_none {
+            self.start_drag_scroll_timer(cx);
+        }
+    }
+
+    /// ドラッグ選択オートスクロールのタイマーを起動する
+    fn start_drag_scroll_timer(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(DRAG_SCROLL_INTERVAL_MS))
+                .await;
+            let should_continue = this
+                .update(cx, |this, cx| this.tick_drag_scroll(cx))
+                .unwrap_or(false);
+            if !should_continue {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// ドラッグ選択オートスクロールの 1 ティック分を処理する
+    fn tick_drag_scroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(state) = &self.drag_scroll else {
+            return false;
+        };
+        if self.selecting != Some(state.pane) {
+            self.drag_scroll = None;
+            return false;
+        }
+        let pane_id = state.pane;
+        let factor = state.speed_factor;
+        let delta_rows = drag_scroll_delta(factor.abs());
+
+        let session = match self.terminals.get(&pane_id) {
+            Some(s) => s,
+            None => {
+                self.drag_scroll = None;
+                return false;
+            }
+        };
+        let (cols, rows) = session.size();
+
+        if factor > 0.0 {
+            // 過去方向（上）
+            session.scroll_display(delta_rows.ceil() as i32);
+            session.extend_selection(0, 0, false);
+        } else {
+            // 未来方向（下）
+            session.scroll_display(-(delta_rows.ceil() as i32));
+            session.extend_selection(cols.saturating_sub(1), rows.saturating_sub(1), true);
+        }
+        cx.notify();
+        true
     }
 
     /// cmd+ホバー時のリンク検出更新
@@ -7247,20 +7452,27 @@ impl TakoApp {
         if self.drag_kind.take().is_some()
             | self.drop_target.take().is_some()
             | self.tab_drop_target.take().is_some()
+            | self.tab_reorder_indicator.take().is_some()
         {
             cx.notify();
             return;
         }
+        let sidebar_was_dragging = std::mem::take(&mut self.dragging_sidebar);
         if self.dragging_border.take().is_some()
             | self.dragging_scrollbar.take().is_some()
             | self.dragging_pin.take().is_some()
             | std::mem::take(&mut self.dragging_panel)
+            | sidebar_was_dragging
             | self.video_seek_dragging.take().is_some()
         {
+            if sidebar_was_dragging {
+                self.save_sidebar_width();
+            }
             cx.notify();
             return;
         }
         self.preview_selecting = None;
+        self.drag_scroll = None;
         if let Some(pane_id) = self.selecting.take() {
             // iTerm2 流の copy-on-select
             if let Some(text) = self
@@ -8581,6 +8793,9 @@ impl TakoApp {
     fn webview_close_button(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
         if let Some(idx) = self.webviews.iter().position(|e| e.pane == Some(pane_id)) {
             self.webviews.remove(idx);
+            if self.webviews.is_empty() {
+                webview::set_has_webview(false);
+            }
         }
         self.remove_pane(pane_id, cx);
     }
@@ -8612,6 +8827,7 @@ impl TakoApp {
         let entry = webview::WebViewEntry::build(handle, id, url)?;
         self.webview_next_id += 1;
         self.webviews.push(entry);
+        webview::set_has_webview(true);
         Ok(id)
     }
 
@@ -9978,10 +10194,6 @@ impl TakoApp {
                             }),
                     ),
             )
-            // 子ワーカードロップダウン（カンプ: w282 / radius 9。ヘッダ下に絶対配置）
-            .when(workers_menu_open, |d| {
-                d.child(self.render_workers_menu(pane_id, &workers, cx))
-            })
             .child(
                 // テキスト領域: サブラインスクロール（#159）のため行スタックを
                 // absolute 配置し、fract 行ぶん上へずらして描画する（overflow_hidden で
@@ -10106,6 +10318,11 @@ impl TakoApp {
                             .child("×"),
                     )
             }))
+            // 子ワーカードロップダウン（カンプ: w282 / radius 9。ヘッダ下に絶対配置）
+            // ターミナルテキストエリアより後に描画し、背後が透けないようにする（#341）
+            .when(workers_menu_open, |d| {
+                d.child(self.render_workers_menu(pane_id, &workers, cx))
+            })
             .into_any_element()
     }
 }
@@ -10503,6 +10720,14 @@ impl UiStateHost for TakoApp {
         self.theme = Theme::for_mode(mode);
     }
 
+    fn limit_service(&self) -> tako_core::LimitService {
+        self.limit_service
+    }
+
+    fn set_limit_service(&mut self, service: tako_core::LimitService) {
+        self.limit_service = service;
+    }
+
     fn panel_state(&self) -> (bool, f32, tako_control::protocol::PanelViewWire) {
         let view = match self.panel_view {
             PanelView::Tmux => tako_control::protocol::PanelViewWire::Tmux,
@@ -10539,6 +10764,14 @@ impl UiStateHost for TakoApp {
 
     fn filetree_visible(&self) -> bool {
         self.filetree.visible
+    }
+
+    fn sidebar_width(&self) -> f32 {
+        self.sidebar_width
+    }
+
+    fn set_sidebar_width(&mut self, width: f32) {
+        self.sidebar_width = width.clamp(SIDEBAR_MIN_WIDTH, 600.0);
     }
 
     fn set_filetree(&mut self, visible: bool) {
@@ -10921,6 +11154,7 @@ impl PreviewHost for TakoApp {
         self.preview_line_bounds.remove(&pane);
         self.preview_pdf_char_bounds.remove(&pane);
         self.preview_pdf_highlight_paint_count.remove(&pane);
+        self.preview_pdf_page_image_bounds.remove(&pane);
         self.preview_text_layouts.remove(&pane);
         self.preview_line_texts.remove(&pane);
         self.remove_preview_image_cache(pane);
@@ -11008,6 +11242,106 @@ impl PreviewHost for TakoApp {
             .into_iter()
             .map(|p| p.id())
             .find(|id| self.previews.contains_key(id))
+    }
+
+    fn preview_changelog_state(&self, pane: PaneId) -> Option<bool> {
+        if self.previews.contains_key(&pane) {
+            Some(self.preview_changelogs.contains_key(&pane))
+        } else {
+            None
+        }
+    }
+
+    fn set_preview_changelog(
+        &mut self,
+        pane: PaneId,
+        enabled: bool,
+        max_count: usize,
+    ) -> Result<serde_json::Value, String> {
+        let state = self
+            .previews
+            .get(&pane)
+            .ok_or_else(|| format!("プレビューペインではない: {}", pane.as_u64()))?;
+        if !enabled {
+            self.preview_changelogs.remove(&pane);
+            return Ok(serde_json::json!({
+                "pane": pane.as_u64(),
+                "changelog": false,
+            }));
+        }
+        let path = state.path.clone();
+        let repo = tako_core::git::repo_root(&path);
+        let repo = match repo {
+            Some(r) => r,
+            None => {
+                let data = preview::ChangelogData::default();
+                self.preview_changelogs.insert(pane, data);
+                return Ok(serde_json::json!({
+                    "pane": pane.as_u64(),
+                    "changelog": true,
+                    "commits": 0,
+                    "message": "git 管理外のファイル",
+                }));
+            }
+        };
+        let rel = path
+            .strip_prefix(&repo)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| path.to_string_lossy().to_string());
+        let commits = tako_core::git::log_file_commits(&repo, &rel, max_count);
+        let commit_count = commits.len();
+        let entries: Vec<preview::ChangelogEntry> = commits
+            .into_iter()
+            .map(|c| preview::ChangelogEntry {
+                commit: c,
+                expanded_diff: None,
+            })
+            .collect();
+        let data = preview::ChangelogData {
+            entries,
+            repo_root: Some(repo),
+            rel_path: Some(rel),
+        };
+        self.preview_changelogs.insert(pane, data);
+        Ok(serde_json::json!({
+            "pane": pane.as_u64(),
+            "changelog": true,
+            "commits": commit_count,
+        }))
+    }
+
+    fn toggle_changelog_diff(
+        &mut self,
+        pane: PaneId,
+        hash: &str,
+    ) -> Result<serde_json::Value, String> {
+        let data = self
+            .preview_changelogs
+            .get_mut(&pane)
+            .ok_or("チェンジログビューが有効ではない")?;
+        let entry = data
+            .entries
+            .iter_mut()
+            .find(|e| e.commit.hash == hash || e.commit.short_hash == hash)
+            .ok_or_else(|| format!("コミット {} が見つからない", hash))?;
+        if entry.expanded_diff.is_some() {
+            entry.expanded_diff = None;
+            Ok(serde_json::json!({
+                "pane": pane.as_u64(),
+                "hash": hash,
+                "expanded": false,
+            }))
+        } else {
+            let repo = data.repo_root.as_deref().ok_or("リポジトリ情報がない")?;
+            let rel = data.rel_path.as_deref().ok_or("ファイルパス情報がない")?;
+            let hunks = tako_core::git::diff_file_commit(repo, &entry.commit.hash, rel);
+            entry.expanded_diff = Some(hunks);
+            Ok(serde_json::json!({
+                "pane": pane.as_u64(),
+                "hash": hash,
+                "expanded": true,
+            }))
+        }
     }
 }
 
@@ -11110,6 +11444,9 @@ impl WebViewHost for TakoApp {
     fn web_destroy(&mut self, id: u64) -> Option<PaneId> {
         let idx = self.webviews.iter().position(|e| e.id.as_u64() == id)?;
         let entry = self.webviews.remove(idx);
+        if self.webviews.is_empty() {
+            webview::set_has_webview(false);
+        }
         entry.pane
     }
 
@@ -11514,7 +11851,11 @@ impl EntityInputHandler for TakoApp {
 
 impl TakoApp {
     /// ペインヘッダ / タブの右クリックメニュー描画（#185）
-    fn render_pane_context_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    fn render_pane_context_menu(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         let ctx = self.pane_context_menu.as_ref()?;
         let theme = &self.theme;
         let pane_id = ctx.pane;
@@ -11548,11 +11889,28 @@ impl TakoApp {
         items.push(("bg", "バックグラウンドへ"));
         items.push(("close", "閉じる"));
 
+        let pctx_menu_width: f32 = 200.0;
+        let pctx_item_height: f32 = 20.0;
+        let pctx_sep_height: f32 = 5.0;
+        let pctx_padding_y: f32 = 8.0;
+        let pctx_menu_height: f32 = items
+            .iter()
+            .map(|(id, _)| {
+                if id.starts_with("sep") {
+                    pctx_sep_height
+                } else {
+                    pctx_item_height
+                }
+            })
+            .sum::<f32>()
+            + pctx_padding_y;
+        let adjusted = clamp_menu_position(pos, pctx_menu_width, pctx_menu_height, window);
+
         let menu = div()
             .absolute()
-            .left(pos.x)
-            .top(pos.y)
-            .w(px(200.0))
+            .left(adjusted.x)
+            .top(adjusted.y)
+            .w(px(pctx_menu_width))
             .py(px(4.0))
             .bg(rgba(theme.tab_bar_background))
             .border_1()
@@ -11667,6 +12025,48 @@ fn truncate(s: &str, max_chars: usize) -> String {
         let cut: String = s.chars().take(max_chars.saturating_sub(1)).collect();
         format!("{cut}…")
     }
+}
+
+/// メニュー位置���計算（純粋関数・テスト��能）。
+/// 見切れる場合はフリップ（メニュー幅/高さ分の引き戻し）、0 未満にはさせない。
+fn compute_menu_position(
+    x: f32,
+    y: f32,
+    menu_width: f32,
+    menu_height: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> (f32, f32) {
+    let rx = if x + menu_width > viewport_width {
+        (x - menu_width).max(0.0)
+    } else {
+        x
+    };
+    let ry = if y + menu_height > viewport_height {
+        (y - menu_height).max(0.0)
+    } else {
+        y
+    };
+    (rx, ry)
+}
+
+/// コンテキストメニューの位置をウインドウ内にクランプする。
+fn clamp_menu_position(
+    pos: Point<Pixels>,
+    menu_width: f32,
+    menu_height: f32,
+    window: &Window,
+) -> Point<Pixels> {
+    let vp = window.viewport_size();
+    let (rx, ry) = compute_menu_position(
+        f32::from(pos.x),
+        f32::from(pos.y),
+        menu_width,
+        menu_height,
+        f32::from(vp.width),
+        f32::from(vp.height),
+    );
+    point(px(rx), px(ry))
 }
 
 /// usage テキストから概算トークン数を抽出する（#217 スパークライン用。
@@ -11846,7 +12246,7 @@ impl Render for TakoApp {
         // ハンドル・IME 位置はすべて content_origin / content_size 起点で連動する）
         let viewport = window.viewport_size();
         let sidebar_width = if self.filetree.visible {
-            px(SIDEBAR_WIDTH)
+            px(self.sidebar_width)
         } else {
             px(0.0)
         };
@@ -11897,10 +12297,12 @@ impl Render for TakoApp {
             .collect();
         let _ = cell;
 
-        // Web ビューの可視性同期: 今フレームで描画されなかったもの（非アクティブタブ・
-        // dock 退避中）と、D&D 中の全 Web ビューを隠す（ネイティブビューは GPUI の
-        // ドロップターゲット描画より上に来るため、ドラッグ中は GPUI 描画を優先する）
-        let hide_webviews = self.drag_kind.is_some() && cx.has_active_drag();
+        // Web ビューの可視性同期: ネイティブビューは GPUI の GPU 合成レイヤの上に
+        // 来るため、GPUI のオーバーレイ UI（コマンドパレット・close 確認等）と重なる
+        // 場面では全 Web ビューを隠す。D&D 中のドロップターゲット描画も同様（#155）
+        let hide_webviews = (self.drag_kind.is_some() && cx.has_active_drag())
+            || self.command_palette.is_some()
+            || self.pending_close_confirm.is_some();
         self.sync_webview_visibility(hide_webviews);
 
         // D&D 中のみ、各ペインにドロップ先オーバーレイを重ねる（FR-2.16.10 / FR-3.11）。
@@ -11966,8 +12368,8 @@ impl Render for TakoApp {
             })
             .collect();
 
-        let context_menu_overlay = self.render_context_menu(cx);
-        let pane_context_overlay = self.render_pane_context_menu(cx);
+        let context_menu_overlay = self.render_context_menu(window, cx);
+        let pane_context_overlay = self.render_pane_context_menu(window, cx);
         // サイドバー tmux ビューのホバープレビュー（FR-2.16.13。マウス位置に実画面サムネイル）
         let hover_preview_overlay = self.render_hover_preview(window);
         // ピン留めされた常駐プレビュー（FR-2.16.15。アプリ内フローティングウィンドウ）
@@ -12563,20 +12965,47 @@ fn tako_titlebar_options() -> gpui::TitlebarOptions {
 }
 
 fn open_new_window(cx: &mut App) {
+    open_window_with_bounds(
+        WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx)),
+        cx,
+    );
+}
+
+/// 保存済みレイアウトから復元してウインドウを開く（#312: Dock クリックでの復帰用）
+fn open_restored_window(cx: &mut App) {
+    let saved_frame = tako_control::layout::load().and_then(|l| l.window);
+    let bounds = match saved_frame {
+        Some(f) if f.width >= 200.0 && f.height >= 150.0 => {
+            let bounds = Bounds::new(point(px(f.x), px(f.y)), size(px(f.width), px(f.height)));
+            match f.state.as_str() {
+                "fullscreen" => WindowBounds::Fullscreen(bounds),
+                "maximized" => WindowBounds::Maximized(bounds),
+                _ => WindowBounds::Windowed(bounds),
+            }
+        }
+        _ => WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx)),
+    };
+    open_window_with_bounds(bounds, cx);
+}
+
+fn open_window_with_bounds(window_bounds: WindowBounds, cx: &mut App) {
     let _ = cx
         .open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                    None,
-                    size(px(960.), px(600.)),
-                    cx,
-                ))),
+                window_bounds: Some(window_bounds),
                 titlebar: Some(tako_titlebar_options()),
                 ..Default::default()
             },
             |window, cx| {
                 let view = cx.new(TakoApp::new);
                 window.focus(&view.read(cx).focus_handle.clone(), cx);
+                // 赤ボタン close 時にレイアウトを保存する（#312。quit ではなく
+                // ウインドウ単体の close なので on_app_quit は走らない）
+                let entity = view.clone();
+                window.on_window_should_close(cx, move |_window, cx| {
+                    entity.update(cx, |app, _cx| app.save_layout());
+                    true
+                });
                 view
             },
         )
@@ -12670,80 +13099,100 @@ fn main() {
             );
         }
     }
+    // テレメトリ初期化: settings.json から ON/OFF を読み、panic ハンドラを設置する
+    {
+        let settings = tako_control::settings::load();
+        tako_control::telemetry::init(settings.telemetry);
+        tako_control::telemetry::install_panic_handler();
+    }
     let initial_dir = parse_initial_dir();
     if let Some(ref dir) = initial_dir {
         if let Err(e) = std::env::set_current_dir(dir) {
             eprintln!("warning: --dir で指定されたディレクトリに移動できない: {e}");
         }
     }
-    application()
-        .with_assets(file_icons::TakoAssets)
-        .run(|cx: &mut App| {
-            cx.bind_keys(key_bindings());
-            cx.set_menus(app_menus());
-            cx.on_action(|_: &NewWindow, cx| {
-                open_new_window(cx);
-            });
-            // Quit はグローバルアクションとして登録する（#103: ルート div の on_action
-            // だけだとウィンドウのフォーカスパス上でしか発火せず、フォーカス喪失
-            // （blur）状態では cmd-q もメニューの Quit も無反応になる。GPUI の
-            // アクションディスパッチは path 上で未処理ならグローバルハンドラの
-            // Bubble フェーズへ必ず到達するため、ここならフォーカス状態・
-            // ウィンドウ有無に依存しない）。layout 保存などの終了処理は
-            // on_app_quit（TakoApp::new で登録。Dock 終了でも走る）が担う
-            cx.on_action(|_: &Quit, cx| cx.quit());
-            // 保存済みウィンドウフレームの復元（FR-5。終了前にフルスクリーンなら
-            // フルスクリーンで開く）。セルフテストは既定サイズで決定的に動かす
-            let saved_frame = if std::env::var_os("TAKO_SELF_TEST").is_none() {
-                tako_control::layout::load().and_then(|l| l.window)
-            } else {
-                None
-            };
-            let window_bounds = match saved_frame {
-                // 壊れた保存値（極端に小さい等）は既定へフォールバック
-                Some(f) if f.width >= 200.0 && f.height >= 150.0 => {
-                    let bounds =
-                        Bounds::new(point(px(f.x), px(f.y)), size(px(f.width), px(f.height)));
-                    match f.state.as_str() {
-                        "fullscreen" => WindowBounds::Fullscreen(bounds),
-                        "maximized" => WindowBounds::Maximized(bounds),
-                        _ => WindowBounds::Windowed(bounds),
-                    }
-                }
-                _ => WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx)),
-            };
-            let window = cx
-                .open_window(
-                    WindowOptions {
-                        window_bounds: Some(window_bounds),
-                        titlebar: Some(tako_titlebar_options()),
-                        ..Default::default()
-                    },
-                    |window, cx| {
-                        let view = cx.new(TakoApp::new);
-                        window.focus(&view.read(cx).focus_handle.clone(), cx);
-                        view
-                    },
-                )
-                .expect("ウィンドウを開けなかった");
+    let app = application().with_assets(file_icons::TakoAssets);
+    // Dock クリックでウインドウ再表示（#312。赤ボタン close 後にプロセスが
+    // 生存している状態で Dock アイコンをクリックすると呼ばれる。ウインドウが
+    // 無ければ保存済みレイアウトから復元して新規ウインドウを開く）
+    app.on_reopen(|cx| {
+        if cx.windows().is_empty() {
+            open_restored_window(cx);
             cx.activate(true);
-
-            if std::env::var_os("TAKO_VISUAL_TEST").is_some() {
-                #[cfg(feature = "visual-test")]
-                {
-                    self_test::run_visual(window, cx);
-                    return;
-                }
-                #[cfg(not(feature = "visual-test"))]
-                {
-                    eprintln!("TAKO_VISUAL_TEST には --features visual-test が必要");
-                    std::process::exit(1);
-                }
-            }
-            if std::env::var_os("TAKO_SELF_TEST").is_some() {
-                self_test::run(window, cx);
-            }
+        }
+    });
+    app.run(|cx: &mut App| {
+        cx.bind_keys(key_bindings());
+        cx.set_menus(app_menus());
+        webview::install_key_monitor();
+        cx.on_action(|_: &NewWindow, cx| {
+            open_new_window(cx);
         });
+        // Quit はグローバルアクションとして登録する（#103: ルート div の on_action
+        // だけだとウィンドウのフォーカスパス上でしか発火せず、フォーカス喪失
+        // （blur）状態では cmd-q もメニューの Quit も無反応になる。GPUI の
+        // アクションディスパッチは path 上で未処理ならグローバルハンドラの
+        // Bubble フェーズへ必ず到達するため、ここならフォーカス状態・
+        // ウィンドウ有無に依存しない）。layout 保存などの終了処理は
+        // on_app_quit（TakoApp::new で登録。Dock 終了でも走る）が担う
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        // 保存済みウィンドウフレームの復元（FR-5。終了前にフルスクリーンなら
+        // フルスクリーンで開く）。セルフテストは既定サイズで決定的に動かす
+        let saved_frame = if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            tako_control::layout::load().and_then(|l| l.window)
+        } else {
+            None
+        };
+        let window_bounds = match saved_frame {
+            // 壊れた保存値（極端に小さい等）は既定へフォールバック
+            Some(f) if f.width >= 200.0 && f.height >= 150.0 => {
+                let bounds = Bounds::new(point(px(f.x), px(f.y)), size(px(f.width), px(f.height)));
+                match f.state.as_str() {
+                    "fullscreen" => WindowBounds::Fullscreen(bounds),
+                    "maximized" => WindowBounds::Maximized(bounds),
+                    _ => WindowBounds::Windowed(bounds),
+                }
+            }
+            _ => WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx)),
+        };
+        let window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(window_bounds),
+                    titlebar: Some(tako_titlebar_options()),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let view = cx.new(TakoApp::new);
+                    window.focus(&view.read(cx).focus_handle.clone(), cx);
+                    // 赤ボタン close 時にレイアウトを保存（#312）
+                    let entity = view.clone();
+                    window.on_window_should_close(cx, move |_window, cx| {
+                        entity.update(cx, |app, _cx| app.save_layout());
+                        true
+                    });
+                    view
+                },
+            )
+            .expect("ウィンドウを開けなかった");
+        cx.activate(true);
+
+        if std::env::var_os("TAKO_VISUAL_TEST").is_some() {
+            #[cfg(feature = "visual-test")]
+            {
+                self_test::run_visual(window, cx);
+                return;
+            }
+            #[cfg(not(feature = "visual-test"))]
+            {
+                eprintln!("TAKO_VISUAL_TEST には --features visual-test が必要");
+                std::process::exit(1);
+            }
+        }
+        if std::env::var_os("TAKO_SELF_TEST").is_some() {
+            self_test::run(window, cx);
+        }
+    });
 }
 
 /// セルフテスト: キーディスパッチ経由で入力・分割・フォーカス・リサイズ・タブ・色・
@@ -14337,7 +14786,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 92, "MCP tools/list は 92 ツール");
+            check(status == 200 && tool_count == 99, "MCP tools/list は 99 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -15412,6 +15861,7 @@ mod self_test {
                             width: Some(320.0),
                             view: Some(tako_control::protocol::PanelViewWire::Tmux),
                             filetree: None,
+                            sidebar_width: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -15429,6 +15879,7 @@ mod self_test {
                             width: None,
                             view: None,
                             filetree: None,
+                            sidebar_width: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -15634,6 +16085,7 @@ mod self_test {
                             width: None,
                             view: Some(tako_control::protocol::PanelViewWire::Tmux),
                             filetree: None,
+                            sidebar_width: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -16945,6 +17397,7 @@ mod self_test {
                     // 次の paint 完了を存在で同期できるよう、旧位置のキャッシュを破棄する。
                     app.preview_line_bounds.remove(&pane);
                     app.preview_pdf_char_bounds.remove(&pane);
+                    app.preview_pdf_page_image_bounds.remove(&pane);
                     app.preview_text_layouts.remove(&pane);
                     app.preview_line_texts.remove(&pane);
                 })
@@ -19123,6 +19576,7 @@ mod self_test {
                         caller_role: None,
                         agent: None,
                         caller_pid: None,
+                        task_type: None,
                     }
                 }
 
@@ -19444,10 +19898,20 @@ mod self_test {
     }
 }
 
-/// 特殊キー → PTY 送出バイト列の総点検（バイトレベル検証）。
-/// 実 IME / GUI を起動できない CI でもキーエンコードの退行を捕まえる
-/// ホイールデルタの行換算。整数化できた行数と持ち越す端数を返す。
-/// 方向が反転したら端数を捨てる（逆向きの貯金で初動が重くなるのを防ぐ）
+/// .git ディレクトリが祖先に存在するかの軽量チェック（プロセス spawn なし。#313）
+fn has_git_ancestor(dir: &std::path::Path) -> bool {
+    let mut cur = dir;
+    loop {
+        if cur.join(".git").exists() {
+            return true;
+        }
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => return false,
+        }
+    }
+}
+
 fn find_git_root(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -19772,5 +20236,116 @@ mod role_env_tests {
     fn 不明な形式は_none() {
         assert_eq!(role_from_orchestrator_env("unknown"), None);
         assert_eq!(role_from_orchestrator_env(""), None);
+    }
+}
+
+#[cfg(test)]
+mod git_ancestor_tests {
+    use super::has_git_ancestor;
+
+    #[test]
+    fn gitリポジトリ内のディレクトリで_true() {
+        let dir = std::env::current_dir().unwrap();
+        assert!(has_git_ancestor(&dir));
+    }
+
+    #[test]
+    fn gitリポジトリ内のサブディレクトリで_true() {
+        let dir = std::env::current_dir().unwrap().join("crates");
+        if dir.is_dir() {
+            assert!(has_git_ancestor(&dir));
+        }
+    }
+
+    #[test]
+    fn ルートディレクトリで_false() {
+        assert!(!has_git_ancestor(std::path::Path::new("/")));
+    }
+
+    #[test]
+    fn 一時ディレクトリで_false() {
+        let dir = std::env::temp_dir().join("tako-test-no-git");
+        let _ = std::fs::create_dir_all(&dir);
+        assert!(!has_git_ancestor(&dir));
+        let _ = std::fs::remove_dir(&dir);
+    }
+}
+
+#[cfg(test)]
+mod menu_position_tests {
+    use super::compute_menu_position;
+
+    #[test]
+    fn メニューが収まる場合はそのまま() {
+        let (x, y) = compute_menu_position(100.0, 200.0, 180.0, 250.0, 1200.0, 800.0);
+        assert_eq!(x, 100.0);
+        assert_eq!(y, 200.0);
+    }
+
+    #[test]
+    fn 右端を超えたら左へフリップ() {
+        let (x, y) = compute_menu_position(1100.0, 200.0, 180.0, 250.0, 1200.0, 800.0);
+        assert_eq!(x, 1100.0 - 180.0);
+        assert_eq!(y, 200.0);
+    }
+
+    #[test]
+    fn 下端を超えたら上へフリップ() {
+        let (x, y) = compute_menu_position(100.0, 700.0, 180.0, 250.0, 1200.0, 800.0);
+        assert_eq!(x, 100.0);
+        assert_eq!(y, 700.0 - 250.0);
+    }
+
+    #[test]
+    fn 両方超えたら両方フリップ() {
+        let (x, y) = compute_menu_position(1100.0, 700.0, 180.0, 250.0, 1200.0, 800.0);
+        assert_eq!(x, 1100.0 - 180.0);
+        assert_eq!(y, 700.0 - 250.0);
+    }
+
+    #[test]
+    fn フリップ後も負にならない() {
+        let (x, y) = compute_menu_position(50.0, 30.0, 180.0, 250.0, 100.0, 100.0);
+        assert_eq!(x, 0.0);
+        assert_eq!(y, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod drag_scroll_tests {
+    use super::*;
+
+    #[test]
+    fn 最小速度係数では最小速度になる() {
+        let delta = drag_scroll_delta(0.0);
+        let expected = DRAG_SCROLL_MIN_SPEED * (DRAG_SCROLL_INTERVAL_MS as f32 / 1000.0);
+        assert!((delta - expected).abs() < 0.001);
+    }
+
+    #[test]
+    fn 最大速度係数では最大速度になる() {
+        let delta = drag_scroll_delta(1.0);
+        let expected = DRAG_SCROLL_MAX_SPEED * (DRAG_SCROLL_INTERVAL_MS as f32 / 1000.0);
+        assert!((delta - expected).abs() < 0.001);
+    }
+
+    #[test]
+    fn 中間係数は最小と最大の間に収まる() {
+        let min = drag_scroll_delta(0.0);
+        let max = drag_scroll_delta(1.0);
+        let mid = drag_scroll_delta(0.5);
+        assert!(mid > min);
+        assert!(mid < max);
+    }
+
+    #[test]
+    fn 速度は単調増加する() {
+        let mut prev = drag_scroll_delta(0.0);
+        for i in 1..=10 {
+            let factor = i as f32 / 10.0;
+            let delta = drag_scroll_delta(factor);
+            assert!(delta > prev, "factor={factor}: {delta} <= {prev}");
+            prev = delta;
+        }
     }
 }

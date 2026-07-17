@@ -776,6 +776,36 @@ impl TerminalSession {
     }
 }
 
+/// ステータスバーの利用制限表示で選択中のサービス（Issue #321）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LimitService {
+    #[default]
+    Claude,
+    Codex,
+    Agy,
+}
+
+impl LimitService {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Agy => "agy",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "agy" => Some(Self::Agy),
+            _ => None,
+        }
+    }
+
+    pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Agy];
+}
+
 /// Claude TUI フッターから抽出したエージェントメトリクス
 #[derive(Debug, Clone, Default)]
 pub struct AgentMetrics {

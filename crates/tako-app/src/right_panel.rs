@@ -2066,7 +2066,7 @@ impl TakoApp {
         let Some(data) = data else {
             // git パネルを開いた瞬間のデータ取得（初回は即 fetch）
             if self.git_data.is_none() {
-                if let Some(cwd) = self.active_tab_cwd() {
+                if let Some(cwd) = self.git_cwd_for_tab() {
                     cx.spawn(async move |this, cx| {
                         let data = cx
                             .background_executor()
@@ -2280,7 +2280,7 @@ impl TakoApp {
                             this.git_selected_commit = Some(full_hash.clone());
                         }
                         // 即座に diff を取得する
-                        if let Some(cwd) = this.active_tab_cwd() {
+                        if let Some(cwd) = this.git_cwd_for_tab() {
                             let selected = this.git_selected_commit.clone();
                             cx.spawn(async move |this, cx| {
                                 let data = cx
@@ -2476,7 +2476,7 @@ impl TakoApp {
 
     /// git パネルのデータを即座に background 取得する
     pub(crate) fn refresh_git(&mut self, cx: &mut Context<Self>) {
-        if let Some(cwd) = self.active_tab_cwd() {
+        if let Some(cwd) = self.git_cwd_for_tab() {
             let selected = self.git_selected_commit.clone();
             cx.spawn(async move |this, cx| {
                 let data = cx

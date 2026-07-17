@@ -83,6 +83,9 @@ enum Command {
     /// デコード済みプレビュー画像キャッシュの上限（MiB）と利用状況
     #[command(name = "preview-cache")]
     PreviewCache(PreviewCacheArgs),
+    /// プレビューのチェンジログビュー切替・diff 展開（Issue #338）
+    #[command(name = "preview-changelog")]
+    PreviewChangelog(PreviewChangelogArgs),
     /// コードプレビューの軽量編集（開始 / 全文適用 / 保存）
     #[command(subcommand)]
     Edit(EditCommand),
@@ -102,6 +105,10 @@ enum Command {
     /// UI テーマ（ライト/ダーク）の確認・切替（Issue #217）。
     /// 引数なしで現在テーマを表示、dark / light で指定、toggle で反転
     Theme(ThemeArgs),
+    /// ステータスバーの利用制限表示サービスの確認・切替（Issue #321）。
+    /// 引数なしで現在サービスを表示、claude / codex / agy で指定
+    #[command(name = "limit-service")]
+    LimitService(LimitServiceArgs),
     /// 右サイドバー情報パネル（tmux 一覧 / agents 集約センター）の表示・幅・ビュー切替。
     /// 引数なしで現在状態を表示する
     Panel(PanelArgs),
@@ -189,6 +196,9 @@ enum Command {
     /// macOS のアイドルスリープを IOKit 電源アサーションで防止する
     #[command(subcommand, name = "sleep-guard")]
     SleepGuard(SleepGuardCommand),
+    /// エラーレポートの自動送信（テレメトリ）の状態確認・切替（Issue #333）
+    #[command(subcommand)]
+    Telemetry(TelemetryCommand),
     /// ファイルツリーへのフォルダの追加・削除・一覧（#134）。
     /// AI が作業対象プロジェクトのフォルダを明示追加する
     #[command(subcommand)]
@@ -221,6 +231,48 @@ enum Command {
     /// worker タスクの進行状態を永続化し、クラッシュや利用上限からの resume を可能にする
     #[command(subcommand)]
     Task(TaskCommand),
+    /// ユーザー入力が必要なコマンドを可視ペインに委譲する（Issue #305）。
+    /// split → タイトル設定 → コマンド投入をアトミックに実行し、pane_id を返す。
+    /// --wait で完了まで待って exit code を返す
+    #[command(name = "run-interactive")]
+    RunInteractive(RunInteractiveArgs),
+    /// run-interactive で起動したペインの完了状態を確認する。
+    /// exit code マーカーを探し、見つかれば auto_close 方針に従い処理する
+    #[command(name = "run-interactive-status")]
+    RunInteractiveStatus(RunInteractiveStatusArgs),
+}
+
+#[derive(Args)]
+struct RunInteractiveArgs {
+    /// 実行するコマンド文字列
+    command: String,
+    /// ユーザーへの入力案内（タイトルに表示。省略時はコマンド文字列）
+    #[arg(long)]
+    hint: Option<String>,
+    /// 分割の基準ペイン ID（省略時は呼び出し元。--tab と排他）
+    #[arg(long, conflicts_with = "tab")]
+    pane: Option<u64>,
+    /// 分割先タブ ID（--pane と排他）
+    #[arg(long)]
+    tab: Option<u64>,
+    /// 下に分割
+    #[arg(long)]
+    down: bool,
+    /// 新ペイン側の取り分（0.0–1.0、省略時は 0.3）
+    #[arg(long)]
+    ratio: Option<f32>,
+    /// 完了後の自動 close 方針（success / always / never。省略時は success）
+    #[arg(long, default_value = "success")]
+    auto_close: String,
+    /// 完了まで待って exit code を返す（ポーリング）
+    #[arg(long)]
+    wait: bool,
+}
+
+#[derive(Args)]
+struct RunInteractiveStatusArgs {
+    /// 対象ペイン ID
+    pane: u64,
 }
 
 #[derive(Args)]
@@ -403,6 +455,16 @@ enum FdaCommand {
     Status,
     /// システム設定のフルディスクアクセスパネルを開く
     Open,
+}
+
+#[derive(Subcommand)]
+enum TelemetryCommand {
+    /// テレメトリの状態を確認する
+    Status,
+    /// テレメトリを有効にする
+    On,
+    /// テレメトリを無効にする
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -857,6 +919,10 @@ enum FileCommand {
     Mkdir { path: String, name: String },
     /// ファイル・フォルダをゴミ箱へ移動する
     Trash { path: String },
+    /// デフォルトアプ��で開く（macOS）
+    Open { path: String },
+    /// 指定アプリで開く（macOS）
+    OpenWith { path: String, name: String },
 }
 
 #[derive(Subcommand)]
@@ -1041,6 +1107,9 @@ enum OrchestratorCommand {
         /// 子を出すタブ ID（そのタブのフォーカスペインを分割元にする）
         #[arg(long)]
         tab: Option<u64>,
+        /// 委任台帳の task_type（省略時は investigation）
+        #[arg(long)]
+        task_type: Option<String>,
     },
     /// worker の状態確認（busy / idle / error / gone / unknown。error 時は
     /// error.kind（api_error / usage_limit / limit_dialog）と recommended_action を含む。#157）
@@ -1071,6 +1140,16 @@ enum OrchestratorCommand {
         #[arg(long)]
         tab: Option<u64>,
     },
+    /// worker の permission ダイアログに応答する（#319）。
+    /// ダイアログ不在時はエラー（誤爆防止）
+    Respond {
+        /// 対象ペイン ID
+        #[arg(long)]
+        pane: u64,
+        /// 選択肢の番号（1-based）または "yes"/"no" エイリアス
+        #[arg(long)]
+        choice: String,
+    },
     /// spawn + 完了待ち + 出力取得 + close を 1 回で行う
     Run {
         /// プロジェクトキー（projects.yaml に登録済み）
@@ -1100,6 +1179,9 @@ enum OrchestratorCommand {
         /// 返す出力の末尾行数（省略時 200）
         #[arg(long, default_value = "200")]
         output_lines: usize,
+        /// 委任台帳の task_type（省略時は investigation）
+        #[arg(long)]
+        task_type: Option<String>,
     },
     /// 非同期 run の進捗照会（#121）。run_id 省略時は全 run の一覧
     #[command(name = "run-status")]
@@ -1112,6 +1194,55 @@ enum OrchestratorCommand {
     RunResult {
         /// 回収する run_id
         run_id: String,
+    },
+    /// 委任台帳の操作（Issue #292）
+    #[command(subcommand)]
+    Ledger(LedgerCommand),
+}
+
+#[derive(Subcommand)]
+enum LedgerCommand {
+    /// 台帳エントリの一覧
+    List {
+        /// フィルタ: プロジェクト
+        #[arg(long)]
+        project: Option<String>,
+        /// フィルタ: task_type
+        #[arg(long)]
+        task_type: Option<String>,
+        /// 返す件数の上限（既定 50）
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    /// task_type x model の集計
+    Stats,
+    /// 検収結果の記録
+    Record {
+        /// エントリ ID（spawn 応答の ledger_id）
+        id: String,
+        /// 検収結果
+        #[arg(long)]
+        outcome: String,
+        /// 差し戻し回数
+        #[arg(long)]
+        rounds: Option<u32>,
+        /// メモ
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// 事後修正（検収 pass だが実使用で問題発覚）
+    Amend {
+        /// エントリ ID
+        id: String,
+        /// 修正メモ
+        #[arg(long)]
+        note: String,
+    },
+    /// project 前方一致でエントリを除去（selftest 混入等の掃除用）
+    Prune {
+        /// 除去対象の project プレフィックス（例: tako-selftest-）
+        #[arg(long)]
+        project_prefix: String,
     },
 }
 
@@ -1458,6 +1589,9 @@ struct PanelArgs {
     /// 左サイドバーのファイルツリー表示（FR-2.16.5。on = 表示、off = 非表示）
     #[arg(long, value_parser = ["on", "off"])]
     filetree: Option<String>,
+    /// 左サイドバーの幅（px。Issue #307）
+    #[arg(long)]
+    sidebar_width: Option<f32>,
 }
 
 /// ON/OFF トグル系コマンド共通の引数（autorename / portdetect）
@@ -1474,12 +1608,37 @@ struct PreviewCacheArgs {
     max_mb: Option<u64>,
 }
 
+/// チェンジログビューの引数（Issue #338）
+#[derive(Args)]
+struct PreviewChangelogArgs {
+    /// 対象プレビューペイン ID（省略時は呼び出し元）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// on = チェンジログ表示、off = コードプレビューに戻す（省略時は状態取得）
+    #[arg(value_parser = ["on", "off"])]
+    mode: Option<String>,
+    /// 取得するコミット数の上限（省略時は 50）
+    #[arg(long)]
+    max_count: Option<usize>,
+    /// 指定コミットハッシュの diff を展開/折りたたみ
+    #[arg(long)]
+    expand: Option<String>,
+}
+
 /// UI テーマコマンドの引数（Issue #217）
 #[derive(Args)]
 struct ThemeArgs {
     /// dark / light = 指定テーマへ、toggle = 反転（省略時は現在テーマを表示）
     #[arg(value_parser = ["dark", "light", "toggle"])]
     mode: Option<String>,
+}
+
+/// 利用制限表示サービスの引数（Issue #321）
+#[derive(Args)]
+struct LimitServiceArgs {
+    /// claude / codex / agy（省略時は現在サービスを表示）
+    #[arg(value_parser = ["claude", "codex", "agy"])]
+    service: Option<String>,
 }
 
 #[derive(Args)]
@@ -1590,6 +1749,14 @@ enum TabCommand {
     },
     /// タブを切り替える
     Select { tab: u64 },
+    /// タブの並び順を変更する（D&D 並べ替えと同等。#308）
+    Reorder {
+        /// 移動するタブ ID
+        tab: u64,
+        /// 移動先インデックス（0 始まり。範囲外は末尾にクランプ）
+        #[arg(long)]
+        index: usize,
+    },
     /// ペインを移動する: タブ ID 指定 = 別タブの末尾へ、--target 指定 = そのペインの
     /// 隣（--right 等の方向）へ挿し直す（FR-1.10 = タイトルバー D&D の同等操作）
     MovePane {
@@ -1706,6 +1873,15 @@ fn main() -> ExitCode {
             .map_err(|e| e.to_string())
             .map(|result| println!("{}", pretty_json(&result)))
         }
+        Command::Orchestrator(OrchestratorCommand::Respond { pane, ref choice }) => {
+            let caller_role = std::env::var("TAKO_ORCHESTRATOR_ROLE").ok();
+            send_request(Request::OrchestratorRespond {
+                pane_id: pane,
+                choice: choice.clone(),
+                caller_role,
+            })
+            .map(|result| println!("{}", pretty_json(&result)))
+        }
         Command::Orchestrator(OrchestratorCommand::Run {
             ref project,
             ref prompt,
@@ -1716,6 +1892,7 @@ fn main() -> ExitCode {
             timeout,
             auto_close,
             output_lines,
+            ref task_type,
         }) => orchestrator_run(
             project,
             prompt,
@@ -1726,6 +1903,7 @@ fn main() -> ExitCode {
             timeout,
             auto_close,
             output_lines,
+            task_type.as_deref(),
         ),
         Command::Orchestrator(OrchestratorCommand::RunStatus { ref run_id }) => {
             let request = Request::OrchestratorRunStatus {
@@ -1739,6 +1917,7 @@ fn main() -> ExitCode {
             };
             send_request(request).map(|v| println!("{}", pretty_json(&v)))
         }
+        Command::Orchestrator(OrchestratorCommand::Ledger(ref sub)) => ledger_cli(sub),
         // gate 操作は YAML I/O + コマンド実行のみのためローカル処理（#244）
         Command::Task(TaskCommand::Gate(ref gate_sub)) => gate_cli(gate_sub),
         // remote コマンドはローカル処理（IPC 不要）
@@ -1754,6 +1933,8 @@ fn main() -> ExitCode {
             remote_scrollback(&pane_id, lines)
         }
         Command::Remote(RemoteCommand::Devices { command }) => remote_devices(command),
+        // テレメトリもローカル処理（IPC 不要。設定ファイルの読み書きのみ）
+        Command::Telemetry(ref sub) => telemetry_local(sub),
         // FDA チェックはローカル処理（IPC 不要。ファイルシステムのみ）
         Command::Fda(ref sub) => fda_local(sub),
         // スリープ防止もローカル処理（IPC 不要。設定ファイルの読み書きのみ）
@@ -1762,6 +1943,8 @@ fn main() -> ExitCode {
         Command::Agents(ref sub) => agents_local(sub),
         // レイアウト復旧もローカル処理（GUI 死亡・縮退保存後の復旧手段のため IPC 不要が本質）
         Command::Recover(ref args) => recover_local(args),
+        // run-interactive --wait は起動 + ポーリングの合成
+        Command::RunInteractive(ref args) if args.wait => run_interactive_wait(&cli.command),
         command => run(command),
     };
     match result {
@@ -1835,9 +2018,7 @@ fn mcp_serve() -> Result<(), String> {
 
 /// MCP セットアップ（アプリ未起動でも動作）。settings.json に tako MCP 設定を追加する
 fn setup_mcp_local(args: &SetupMcpArgs) -> Result<(), String> {
-    let tako_bin = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| tako_control::dispatch::resolve_tako_binary());
+    let tako_bin = tako_control::dispatch::resolve_tako_binary();
     let settings_dir = if args.project {
         std::env::current_dir()
             .map_err(|e| format!("カレントディレクトリの取得に失敗: {e}"))?
@@ -1852,7 +2033,15 @@ fn setup_mcp_local(args: &SetupMcpArgs) -> Result<(), String> {
     let settings_path = settings_dir.join("settings.json");
     match tako_control::dispatch::setup_mcp_settings(&tako_bin, &settings_path) {
         Ok(result) => {
-            if result.already_existed {
+            if result.repaired {
+                let old = result.old_command.as_deref().unwrap_or("(不明)");
+                eprintln!(
+                    "登録パスが消失していたため付け替えました: {}",
+                    settings_path.display()
+                );
+                eprintln!("  旧: {old}");
+                eprintln!("  新: {tako_bin}");
+            } else if result.already_existed {
                 eprintln!("既に設定されています: {}", settings_path.display());
             } else {
                 eprintln!("設定を追加しました: {}", settings_path.display());
@@ -1863,12 +2052,48 @@ fn setup_mcp_local(args: &SetupMcpArgs) -> Result<(), String> {
     }
 }
 
+/// MCP 登録パスの存在を確認し、不在なら警告を出す（master/solo 起動前のガード）
+fn check_mcp_health_warning() {
+    let home = match std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+    {
+        Some(h) => h,
+        None => return,
+    };
+    let settings_path = home.join(".claude").join("settings.json");
+    let content = match std::fs::read_to_string(&settings_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let settings: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let cmd = match settings
+        .get("mcpServers")
+        .and_then(|s| s.get("tako"))
+        .and_then(|t| t.get("command"))
+        .and_then(|c| c.as_str())
+    {
+        Some(c) => c,
+        None => return, // 未登録は setup の管轄
+    };
+    if !std::path::Path::new(cmd).is_file() {
+        eprintln!("[警告] MCP 登録パスが消失しています: {cmd}");
+        eprintln!("        tako MCP なしで起動します。tako setup-mcp で修復してください。");
+        eprintln!();
+    }
+}
+
 /// `tako master [-profile]` — 新タブで claude をマスター system prompt 付きで起動する。
 /// `-<名前>` でプロファイルを指定、引数なしは default、旧形式（suffix のみ）も後方互換で動作
 fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     use tako_control::orchestrator;
 
     orchestrator::ensure_defaults().map_err(|e| format!("セットアップに失敗: {e}"))?;
+
+    check_mcp_health_warning();
 
     if let Some(notice) = orchestrator::migrate_legacy_default_profile() {
         eprintln!("ℹ {notice}");
@@ -1932,9 +2157,7 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         None => "master".into(),
     };
 
-    let tako_bin = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| tako_control::dispatch::resolve_tako_binary());
+    let tako_bin = tako_control::dispatch::resolve_tako_binary();
     let master_cmd = orchestrator::build_master_cmd(&role_env, &profile, &prompt_path, &tako_bin)?;
 
     // インライン起動（既定）: 現在のペインでコマンドを実行（新タブを作らない。#264）
@@ -2017,6 +2240,8 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
 
     orchestrator::ensure_solo_defaults().map_err(|e| format!("セットアップに失敗: {e}"))?;
 
+    check_mcp_health_warning();
+
     let (profile_name, suffix) = match arg {
         None => ("default", None),
         Some(s) if s.starts_with('-') => {
@@ -2063,9 +2288,7 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         None => "solo".into(),
     };
 
-    let tako_bin = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| tako_control::dispatch::resolve_tako_binary());
+    let tako_bin = tako_control::dispatch::resolve_tako_binary();
     let solo_cmd = orchestrator::build_master_cmd(&role, &profile, &prompt_path, &tako_bin)?;
 
     let pane_id = if use_tab {
@@ -2205,6 +2428,21 @@ fn orchestrator_watch(
             }
             println!("  action: check_and_resume");
         }
+        wait::WatchOutcome::PermissionWaiting { permission_dialog } => {
+            println!("WORKER_PERMISSION: tako:{pane}");
+            if let Some(cmd) = permission_dialog.get("command").and_then(|v| v.as_str()) {
+                println!("  command: {cmd}");
+            }
+            if let Some(opts) = permission_dialog.get("options").and_then(|v| v.as_array()) {
+                for (i, opt) in opts.iter().enumerate() {
+                    if let Some(text) = opt.as_str() {
+                        println!("  {}. {text}", i + 1);
+                    }
+                }
+            }
+            println!("  action: respond");
+            print_events(&mut exec);
+        }
         wait::WatchOutcome::Gone => println!("WORKER_GONE: tako:{pane}"),
         wait::WatchOutcome::Timeout => println!("WORKER_TIMEOUT: tako:{pane}"),
     }
@@ -2224,6 +2462,7 @@ fn orchestrator_run(
     timeout_secs: u64,
     auto_close: bool,
     output_lines: usize,
+    task_type: Option<&str>,
 ) -> Result<(), String> {
     let pane_resolved = if pane.is_some() {
         pane
@@ -2252,6 +2491,7 @@ fn orchestrator_run(
         // claude 起動 + プロンプト送信を待つ
         initial_delay: std::time::Duration::from_secs(20),
         interval: std::time::Duration::from_secs(5),
+        task_type: task_type.map(str::to_string),
     };
     let mut exec = |req: Request| send_request(req);
     let result = wait::run_worker(&mut exec, &opts, &mut |pane_id, tmux| {
@@ -2470,6 +2710,48 @@ fn remote_scrollback(pane_id: &str, lines: u32) -> Result<(), String> {
     Ok(())
 }
 
+fn telemetry_local(sub: &TelemetryCommand) -> Result<(), String> {
+    let mut settings = tako_control::settings::load();
+    match sub {
+        TelemetryCommand::Status => {
+            let recent = tako_control::telemetry::recent_count();
+            let log_path = tako_control::telemetry::log_file_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            if settings.telemetry {
+                eprintln!("telemetry: ON");
+            } else {
+                eprintln!("telemetry: OFF");
+            }
+            eprintln!("  直近のレポート件数: {recent}");
+            eprintln!("  ログ: {log_path}");
+            let json = serde_json::json!({
+                "telemetry": settings.telemetry,
+                "recent_reports": recent,
+                "log_path": log_path,
+            });
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            Ok(())
+        }
+        TelemetryCommand::On => {
+            settings.telemetry = true;
+            tako_control::settings::save(&settings)
+                .map_err(|e| format!("設定の保存に失敗: {e}"))?;
+            tako_control::telemetry::set_enabled(true);
+            eprintln!("telemetry: ON");
+            Ok(())
+        }
+        TelemetryCommand::Off => {
+            settings.telemetry = false;
+            tako_control::settings::save(&settings)
+                .map_err(|e| format!("設定の保存に失敗: {e}"))?;
+            tako_control::telemetry::set_enabled(false);
+            eprintln!("telemetry: OFF");
+            Ok(())
+        }
+    }
+}
+
 fn fda_local(sub: &FdaCommand) -> Result<(), String> {
     match sub {
         FdaCommand::Status => {
@@ -2641,6 +2923,9 @@ fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
                 }
             );
             eprintln!("  thermal: {}", state.thermal_state.as_str());
+            if state.display_sleep_forced {
+                eprintln!("  ディスプレイ: 消灯済み（蓋閉じ中）");
+            }
             println!(
                 "{}",
                 serde_json::to_string_pretty(&state.to_json()).unwrap()
@@ -2992,6 +3277,12 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::PreviewCache(args) => Request::PreviewCache {
             max_mb: args.max_mb,
         },
+        Command::PreviewChangelog(args) => Request::PreviewChangelog {
+            pane: target_pane(args.pane)?,
+            enabled: args.mode.as_deref().map(|s| s == "on"),
+            max_count: args.max_count,
+            expand: args.expand.clone(),
+        },
         Command::Edit(command) => match command {
             EditCommand::Start { pane } => Request::PreviewEdit {
                 pane: target_pane(*pane)?,
@@ -3058,6 +3349,10 @@ fn build_request(command: &Command) -> Result<Request, String> {
             title: title.join(" "),
         },
         Command::Tab(TabCommand::Select { tab }) => Request::TabSelect { tab: *tab },
+        Command::Tab(TabCommand::Reorder { tab, index }) => Request::TabReorder {
+            tab: *tab,
+            index: *index,
+        },
         Command::Tab(TabCommand::MovePane {
             tab,
             target,
@@ -3108,6 +3403,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 _ => tako_control::protocol::PanelViewWire::Tmux,
             }),
             filetree: args.filetree.as_deref().map(|s| s == "on"),
+            sidebar_width: args.sidebar_width,
         },
         Command::Portdetect(args) => Request::PortDetect {
             enabled: args.state.as_deref().map(|s| s == "on"),
@@ -3124,6 +3420,10 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 }
             }),
             mode: args.mode.clone().filter(|m| m != "toggle"),
+        },
+        Command::LimitService(args) => Request::LimitService {
+            action: args.service.as_ref().map(|_| "set".to_string()),
+            service: args.service.clone(),
         },
         Command::Git(GitCommand::Log { max_count, pane }) => Request::GitLog {
             pane: target_pane(*pane)?,
@@ -3279,6 +3579,18 @@ fn build_request(command: &Command) -> Result<Request, String> {
             name: None,
             pane: None,
         },
+        Command::File(FileCommand::Open { path }) => Request::FileOp {
+            op: tako_control::protocol::FileOpKind::OpenDefault,
+            path: resolve_cli_path(path),
+            name: None,
+            pane: None,
+        },
+        Command::File(FileCommand::OpenWith { path, name }) => Request::FileOp {
+            op: tako_control::protocol::FileOpKind::OpenWith,
+            path: resolve_cli_path(path),
+            name: Some(name.clone()),
+            pane: None,
+        },
         Command::Video(VideoCommand::Play { pane }) => Request::VideoPlayback {
             pane: target_pane(*pane)?,
             action: "play".into(),
@@ -3320,6 +3632,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             effort,
             pane,
             tab,
+            task_type,
         }) => {
             let pane_resolved = if pane.is_some() {
                 *pane
@@ -3343,6 +3656,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 caller_role: std::env::var("TAKO_ORCHESTRATOR_ROLE").ok(),
                 agent: agent.clone(),
                 caller_pid: Some(std::process::id()),
+                task_type: task_type.clone(),
             }
         }
         Command::Orchestrator(OrchestratorCommand::SelfInfo { .. }) => {
@@ -3392,6 +3706,12 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }
         Command::Orchestrator(OrchestratorCommand::Layout { .. }) => {
             unreachable!("orchestrator layout は run() を通らない（ローカルで config.yaml を操作）")
+        }
+        Command::Orchestrator(OrchestratorCommand::Respond { .. }) => {
+            unreachable!("orchestrator respond は run() を通らない")
+        }
+        Command::Orchestrator(OrchestratorCommand::Ledger(_)) => {
+            unreachable!("orchestrator ledger は run() を通らない（ローカル処理）")
         }
         Command::Web(sub) => {
             let dir = |right: bool, down: bool, left: bool, up: bool| match (down, left, up) {
@@ -3520,6 +3840,13 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 UpdateCommand::Apply => "apply".to_string(),
                 UpdateCommand::ApplyZip => "apply-zip".to_string(),
                 UpdateCommand::Repair => "repair".to_string(),
+            }),
+        },
+        Command::Telemetry(sub) => Request::Telemetry {
+            action: Some(match sub {
+                TelemetryCommand::Status => "status".to_string(),
+                TelemetryCommand::On => "on".to_string(),
+                TelemetryCommand::Off => "off".to_string(),
             }),
         },
         Command::Fda(sub) => Request::Fda {
@@ -3813,7 +4140,122 @@ fn build_request(command: &Command) -> Result<Request, String> {
             // gate は main() でローカル処理。ここには来ない
             TaskCommand::Gate(_) => unreachable!("gate は main() でローカル処理する"),
         },
+        Command::RunInteractive(ref args) => {
+            let direction = if args.down {
+                Some(Direction::Down)
+            } else {
+                Some(Direction::Right)
+            };
+            Request::RunInteractive {
+                pane: if args.tab.is_some() {
+                    None
+                } else {
+                    target_pane(args.pane)?
+                },
+                tab: args.tab,
+                command: args.command.clone(),
+                input_hint: args.hint.clone(),
+                direction,
+                ratio: args.ratio,
+                auto_close: Some(args.auto_close.clone()),
+            }
+        }
+        Command::RunInteractiveStatus(ref args) => Request::RunInteractiveStatus {
+            pane: args.pane,
+            no_wait: false,
+        },
     })
+}
+
+/// 委任台帳のローカル処理（YAML I/O のみ。IPC 不要。#292）
+fn ledger_cli(sub: &LedgerCommand) -> Result<(), String> {
+    use tako_control::orchestrator::ledger;
+    match sub {
+        LedgerCommand::List {
+            project,
+            task_type,
+            limit,
+        } => {
+            let l = ledger::Ledger::load()?;
+            let mut entries: Vec<&ledger::LedgerEntry> = l.entries.iter().collect();
+            if let Some(p) = project {
+                entries.retain(|e| e.project == *p);
+            }
+            if let Some(t) = task_type {
+                entries.retain(|e| e.task_type == *t);
+            }
+            if entries.len() > *limit {
+                entries = entries[entries.len() - *limit..].to_vec();
+            }
+            let result = serde_json::json!({
+                "entries": entries,
+                "total": l.entries.len(),
+                "unevaluated": l.unevaluated_count(),
+            });
+            println!("{}", pretty_json(&result));
+            Ok(())
+        }
+        LedgerCommand::Stats => {
+            let l = ledger::Ledger::load()?;
+            let stats = l.stats();
+            let result = serde_json::json!({
+                "stats": stats,
+                "total_entries": l.entries.len(),
+                "unevaluated": l.unevaluated_count(),
+            });
+            println!("{}", pretty_json(&result));
+            Ok(())
+        }
+        LedgerCommand::Record {
+            id,
+            outcome,
+            rounds,
+            note,
+        } => {
+            ledger::record_outcome(id, outcome, *rounds, note.as_deref())?;
+            println!("recorded: {id} -> {outcome}");
+            Ok(())
+        }
+        LedgerCommand::Amend { id, note } => {
+            ledger::amend_entry(id, note)?;
+            println!("amended: {id} (post_issue=true)");
+            Ok(())
+        }
+        LedgerCommand::Prune { project_prefix } => {
+            let removed = ledger::Ledger::mutate(|l| l.prune_by_project_prefix(project_prefix))?;
+            println!("pruned: {removed} entries with project prefix '{project_prefix}'");
+            Ok(())
+        }
+    }
+}
+
+/// run-interactive --wait: 起動 → ポーリングで完了待ち → exit code を返す
+fn run_interactive_wait(command: &Command) -> Result<(), String> {
+    let request = build_request(command)?;
+    let result = send_request(request)?;
+    let pane = result["pane"]
+        .as_u64()
+        .ok_or("run-interactive が pane ID を返さなかった")?;
+    println!(
+        "pane {pane} で対話コマンドを起動しました（status: {}）",
+        result["status"].as_str().unwrap_or("?")
+    );
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let status = send_request(Request::RunInteractiveStatus {
+            pane,
+            no_wait: false,
+        })?;
+        if status["status"].as_str() == Some("exited") {
+            println!("{}", pretty_json(&status));
+            let code = status["exit_code"].as_i64().unwrap_or(1);
+            if code != 0 {
+                return Err(format!("コマンドが exit code {code} で終了"));
+            }
+            return Ok(());
+        }
+    }
 }
 
 /// gate 操作のローカル処理（YAML I/O + コマンド実行。IPC 不要。#244）
@@ -4154,12 +4596,16 @@ fn print_result(command: &Command, result: &Value) {
         }
         Command::PreviewLinkList(_) => println!("{}", pretty_json(result)),
         Command::PreviewFollowLink(_) => println!("{result}"),
-        Command::PreviewReload(_) | Command::PreviewCache(_) => println!("{result}"),
+        Command::PreviewReload(_) | Command::PreviewCache(_) | Command::PreviewChangelog(_) => {
+            println!("{result}")
+        }
         Command::Autorename(_)
         | Command::Portdetect(_)
         | Command::Persist(_)
         | Command::ConfirmClose(_)
         | Command::Theme(_)
+        | Command::LimitService(_)
+        | Command::Telemetry(_)
         | Command::Panel(_)
         | Command::Collapse(_)
         | Command::Pin(_) => {
@@ -4239,6 +4685,12 @@ fn print_result(command: &Command, result: &Value) {
         }
         // gate は main() でローカル処理。ここには来ない
         Command::Task(_) => println!("{}", pretty_json(result)),
+        Command::RunInteractive(_) => {
+            println!("{}", pretty_json(result));
+        }
+        Command::RunInteractiveStatus(_) => {
+            println!("{}", pretty_json(result));
+        }
         // remote は run() → print_result を通らない
         _ => {}
     }
@@ -4738,6 +5190,50 @@ mod tests {
                 pane: None,
                 tab: Some(3),
                 title: "実験 用".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn run_interactiveのパースと変換() {
+        let command = parse(&[
+            "tako",
+            "run-interactive",
+            "sudo systemctl start foo",
+            "--hint",
+            "sudo password",
+            "--pane",
+            "5",
+            "--down",
+            "--ratio",
+            "0.4",
+            "--auto-close",
+            "always",
+        ]);
+        let request = build_request(&command).unwrap();
+        assert_eq!(
+            request,
+            Request::RunInteractive {
+                pane: Some(5),
+                tab: None,
+                command: "sudo systemctl start foo".into(),
+                input_hint: Some("sudo password".into()),
+                direction: Some(Direction::Down),
+                ratio: Some(0.4),
+                auto_close: Some("always".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn run_interactive_statusのパースと変換() {
+        let command = parse(&["tako", "run-interactive-status", "42"]);
+        let request = build_request(&command).unwrap();
+        assert_eq!(
+            request,
+            Request::RunInteractiveStatus {
+                pane: 42,
+                no_wait: false,
             }
         );
     }

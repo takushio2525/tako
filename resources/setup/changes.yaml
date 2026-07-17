@@ -173,3 +173,16 @@ changes:
       `--yes` と `--answers <json|@file|->` で全設定を非対話指定でき、同じ回答 JSON を
       dispatch `SetupRun` / MCP `tako_setup` へ 1:1 公開した。個別に会話で設定を
       見直したい場合だけ `tako setup --review` を使う。
+
+  - revision: 10
+    version: "0.5.6"
+    date: "2026-07-17"
+    kind: auto
+    title: エラーレポートの自動送信基盤（テレメトリ）を追加
+    description: |
+      tako 内で発生した panic / 重大エラーを PII なしで収集エンドポイントへ自動送信する
+      テレメトリ機能を追加した（Issue #333）。既定 OFF（opt-in）。
+      送信内容はすべてローカルの telemetry.log に記録される（透明性）。
+      CLI: `tako telemetry status/on/off`、MCP: `tako_telemetry`。
+      setup 再実行でテレメトリの案内が表示されるが、自動で ON にはしない。
+      有効化する場合は `tako telemetry on` を実行する。

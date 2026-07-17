@@ -892,6 +892,15 @@ fn dispatch_inner(
             Ok(Value::Null)
         }
 
+        Request::TabReorder { tab, index } => {
+            let tab_id = find_tab(host.workspace(), tab)?;
+            let actual = host
+                .workspace_mut()
+                .move_tab(tab_id, index)
+                .map_err(op_err)?;
+            Ok(json!({ "tab": tab_id.as_u64(), "index": actual }))
+        }
+
         Request::MovePane {
             pane,
             tab,
@@ -1016,6 +1025,7 @@ fn dispatch_inner(
             width,
             view,
             filetree,
+            sidebar_width,
         } => {
             if let Some(w) = width {
                 if !w.is_finite() || w <= 0.0 {
@@ -1024,9 +1034,22 @@ fn dispatch_inner(
                     ));
                 }
             }
+            if let Some(sw) = sidebar_width {
+                if !sw.is_finite() || sw <= 0.0 {
+                    return Err(DispatchError::InvalidParams(
+                        "sidebar_width は正の数（px）を指定する".into(),
+                    ));
+                }
+            }
             host.set_panel(visible, width, view);
             if let Some(filetree) = filetree {
                 host.set_filetree(filetree);
+            }
+            if let Some(sw) = sidebar_width {
+                host.set_sidebar_width(sw);
+                let mut settings = crate::settings::load();
+                settings.sidebar_width = sw as u32;
+                let _ = crate::settings::save(&settings);
             }
             let (visible, width, view) = host.panel_state();
             Ok(json!({
@@ -1034,6 +1057,7 @@ fn dispatch_inner(
                 "width": width,
                 "view": view.as_str(),
                 "filetree": host.filetree_visible(),
+                "sidebar_width": host.sidebar_width(),
             }))
         }
 
@@ -1364,6 +1388,36 @@ fn dispatch_inner(
                 "replace": result,
             }))
         }
+        Request::PreviewChangelog {
+            pane,
+            enabled,
+            max_count,
+            expand,
+        } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            if host.preview_state(target).is_none() {
+                return Err(DispatchError::Operation(format!(
+                    "プレビューペインではない: {}",
+                    target.as_u64()
+                )));
+            }
+            if let Some(hash) = expand {
+                return host
+                    .toggle_changelog_diff(target, &hash)
+                    .map_err(DispatchError::Operation);
+            }
+            if let Some(enabled) = enabled {
+                let count = max_count.unwrap_or(50);
+                return host
+                    .set_preview_changelog(target, enabled, count)
+                    .map_err(DispatchError::Operation);
+            }
+            let changelog_on = host.preview_changelog_state(target).unwrap_or(false);
+            Ok(json!({
+                "pane": target.as_u64(),
+                "changelog": changelog_on,
+            }))
+        }
         Request::FileOp {
             op,
             path,
@@ -1501,6 +1555,63 @@ fn dispatch_inner(
                             .map_err(|e| DispatchError::Operation(format!("削除に失敗: {e}")))?;
                     }
                     Ok(json!({ "trashed": path.display().to_string() }))
+                }
+                FileOpKind::OpenDefault => {
+                    if !path.exists() {
+                        return Err(DispatchError::Operation(format!(
+                            "パスが存在しない: {}",
+                            path.display()
+                        )));
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        std::process::Command::new("open")
+                            .arg(&path)
+                            .spawn()
+                            .map_err(|e| {
+                                DispatchError::Operation(format!("デフォルトアプリで開けない: {e}"))
+                            })?;
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        return Err(DispatchError::Operation(
+                            "open_default は macOS のみ対応".into(),
+                        ));
+                    }
+                    Ok(json!({ "opened": path.display().to_string() }))
+                }
+                FileOpKind::OpenWith => {
+                    if !path.exists() {
+                        return Err(DispatchError::Operation(format!(
+                            "パスが存在しない: {}",
+                            path.display()
+                        )));
+                    }
+                    let app_name = name.ok_or(DispatchError::InvalidParams(
+                        "name（アプリ名）を指定する".into(),
+                    ))?;
+                    #[cfg(target_os = "macos")]
+                    {
+                        std::process::Command::new("open")
+                            .arg("-a")
+                            .arg(&app_name)
+                            .arg(&path)
+                            .spawn()
+                            .map_err(|e| {
+                                DispatchError::Operation(format!(
+                                    "アプリ '{}' で開けない: {e}",
+                                    app_name
+                                ))
+                            })?;
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let _ = app_name;
+                        return Err(DispatchError::Operation(
+                            "open_with は macOS のみ対応".into(),
+                        ));
+                    }
+                    Ok(json!({ "opened": path.display().to_string(), "app": app_name }))
                 }
             }
         }
@@ -1668,12 +1779,19 @@ fn dispatch_inner(
             };
             let tako_bin = resolve_tako_binary();
             let result = setup_mcp_settings(&tako_bin, &settings_dir.join("settings.json"))?;
-            Ok(json!({
+            let mut resp = json!({
                 "configured": result.configured,
                 "already_existed": result.already_existed,
                 "settings_path": settings_dir.join("settings.json").display().to_string(),
                 "command": tako_bin,
-            }))
+            });
+            if result.repaired {
+                resp["repaired"] = json!(true);
+                if let Some(old) = &result.old_command {
+                    resp["old_command"] = json!(old);
+                }
+            }
+            Ok(resp)
         }
 
         Request::VideoPlayback { pane, action } => {
@@ -1803,6 +1921,7 @@ fn dispatch_inner(
             caller_role,
             agent,
             caller_pid,
+            task_type,
         } => dispatch_orchestrator_spawn(
             host,
             origin,
@@ -1817,6 +1936,7 @@ fn dispatch_inner(
                 caller_role: caller_role.as_deref(),
                 agent: agent.as_deref(),
                 caller_pid,
+                task_type: task_type.as_deref(),
             },
         ),
 
@@ -1847,6 +1967,33 @@ fn dispatch_inner(
                 &mut |req| dispatch(host, req, origin).map_err(|e| e.to_string());
             crate::orchestrator::wait::run_result(&run_id, exec).map_err(DispatchError::Operation)
         }
+
+        // #319: permission ダイアログへの構造化応答
+        Request::OrchestratorRespond {
+            pane_id,
+            choice,
+            caller_role,
+        } => dispatch_orchestrator_respond(host, pane_id, &choice, caller_role.as_deref()),
+
+        Request::OrchestratorLedger {
+            action,
+            id,
+            outcome,
+            rounds,
+            note,
+            project,
+            task_type,
+            limit,
+        } => dispatch_orchestrator_ledger(LedgerParams {
+            action,
+            id,
+            outcome,
+            rounds,
+            note,
+            project,
+            task_type,
+            limit,
+        }),
 
         Request::RemoteStart { port } => host.remote_start(port).map_err(DispatchError::Operation),
         Request::RemoteStop { force } => {
@@ -2229,6 +2376,78 @@ fn dispatch_inner(
             }
         }
 
+        Request::Telemetry { action } => {
+            let action = action.as_deref().unwrap_or("status");
+            match action {
+                "status" => {
+                    let enabled = crate::telemetry::is_enabled();
+                    let recent = crate::telemetry::recent_count();
+                    let log_path =
+                        crate::telemetry::log_file_path().map(|p| p.display().to_string());
+                    Ok(serde_json::json!({
+                        "telemetry": enabled,
+                        "recent_reports": recent,
+                        "log_path": log_path,
+                    }))
+                }
+                "on" | "off" => {
+                    let enabled = action == "on";
+                    crate::telemetry::set_enabled(enabled);
+                    if !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none() {
+                        let mut settings = crate::settings::load();
+                        settings.telemetry = enabled;
+                        crate::settings::save(&settings).map_err(|e| {
+                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
+                        })?;
+                    }
+                    Ok(serde_json::json!({
+                        "telemetry": enabled,
+                    }))
+                }
+                other => Err(DispatchError::InvalidParams(format!(
+                    "不明な action: {other:?}（status / on / off のいずれか）"
+                ))),
+            }
+        }
+
+        Request::LimitService { action, service } => {
+            use tako_core::LimitService as LS;
+            let action = action.as_deref().unwrap_or("status");
+            let status_json = |svc: LS| {
+                serde_json::json!({
+                    "limit_service": svc.as_str(),
+                    "available": LS::ALL.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                })
+            };
+            match action {
+                "status" => Ok(status_json(host.limit_service())),
+                "set" => {
+                    let s = service.as_deref().ok_or_else(|| {
+                        DispatchError::InvalidParams(
+                            "set には service が必要（claude / codex / agy）".into(),
+                        )
+                    })?;
+                    let next = LS::parse(s).ok_or_else(|| {
+                        DispatchError::InvalidParams(format!(
+                            "不明な service: {s:?}（claude / codex / agy のいずれか）"
+                        ))
+                    })?;
+                    if !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none() {
+                        let mut settings = crate::settings::load();
+                        settings.limit_service = next.as_str().into();
+                        crate::settings::save(&settings).map_err(|e| {
+                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
+                        })?;
+                    }
+                    host.set_limit_service(next);
+                    Ok(status_json(next))
+                }
+                other => Err(DispatchError::InvalidParams(format!(
+                    "不明な action: {other:?}（status / set のいずれか）"
+                ))),
+            }
+        }
+
         Request::TreeFolder {
             action,
             path,
@@ -2576,6 +2795,144 @@ fn dispatch_inner(
                 "不明な action: {other:?}（set / show / record_results のいずれか）"
             ))),
         },
+
+        Request::RunInteractive {
+            pane,
+            tab,
+            command,
+            input_hint,
+            direction,
+            ratio,
+            auto_close,
+        } => {
+            let ac = auto_close.as_deref().unwrap_or("success");
+            if !matches!(ac, "success" | "always" | "never") {
+                return Err(DispatchError::InvalidParams(format!(
+                    "auto_close は success / always / never のいずれか（指定: {ac:?}）"
+                )));
+            }
+
+            let (tab_id, target) = if let Some(tab_raw) = tab {
+                let tid = find_tab(host.workspace(), tab_raw)?;
+                let focused = host
+                    .workspace()
+                    .get_tab(tid)
+                    .expect("find_tab で存在確認済み")
+                    .tree()
+                    .focused();
+                (tid, focused)
+            } else {
+                resolve_pane(host.workspace(), pane)?
+            };
+
+            let new_pane = Pane::new(origin);
+            let new_id = new_pane.id();
+            let new_id_u64 = new_id.as_u64();
+
+            tree_mut(host.workspace_mut(), tab_id)
+                .split_with_ratio(
+                    target,
+                    direction.unwrap_or(Direction::Right).to_core(),
+                    ratio.unwrap_or(0.3),
+                    new_pane,
+                )
+                .map_err(op_err)?;
+
+            let cwd = host
+                .session(target)
+                .and_then(|s| s.cwd())
+                .filter(|p| p.is_dir())
+                .map(|p| p.to_path_buf());
+
+            // コマンドをシェルの -c 引数として渡す（#325: queue_write での PTY 直書きは
+            // シェル初期化とのレース条件で余分な入力が read 等の対話コマンドに混入する）。
+            // 末尾の read は PTY を生存させる（exit マーカー検知前にペインが消えるのを防止）
+            let wrapped = format!(
+                "{command}; echo \"__TAKO_EXIT=$?\"; read -r __TAKO_DUMMY__ 2>/dev/null || true"
+            );
+            host.attach_session(
+                new_id,
+                SpawnOptions {
+                    command: Some(SpawnCommand {
+                        program: wrapped,
+                        args: Vec::new(),
+                    }),
+                    cwd,
+                    env: Vec::new(),
+                },
+            );
+
+            // フォーカスを新ペインに移す（ユーザーが入力するため）
+            let _ = tree_mut(host.workspace_mut(), tab_id).focus(new_id);
+
+            // タイトルとメタデータを設定
+            let hint = input_hint.as_deref().unwrap_or(&command);
+            if let Some(p) = host
+                .workspace_mut()
+                .get_tab_mut(tab_id)
+                .and_then(|t| t.tree_mut().get_mut(new_id))
+            {
+                p.set_title(Some(format!("(!) {hint}")));
+                p.set_interactive_meta(ac.to_string(), command.clone());
+            }
+
+            Ok(json!({
+                "pane": new_id_u64,
+                "status": "running",
+                "auto_close": ac,
+            }))
+        }
+
+        Request::RunInteractiveStatus { pane, no_wait: _ } => {
+            let (tab_id, target) = resolve_pane(host.workspace(), Some(pane))?;
+
+            // ペインの画面からマーカーを探す
+            let lines = host
+                .session(target)
+                .map(|s| s.visible_lines())
+                .unwrap_or_default();
+
+            let exit_code = find_exit_marker(&lines);
+
+            let meta = host
+                .workspace()
+                .get_tab(tab_id)
+                .and_then(|t| t.tree().get(target))
+                .and_then(|p| p.interactive_meta())
+                .cloned();
+
+            match exit_code {
+                Some(code) => {
+                    let should_close = match meta.as_ref().map(|(ac, _)| ac.as_str()) {
+                        Some("always") => true,
+                        Some("success") => code == 0,
+                        _ => false,
+                    };
+                    let cmd = meta.map(|(_, c)| c).unwrap_or_default();
+
+                    if should_close {
+                        let _ = tree_mut(host.workspace_mut(), tab_id).close(target);
+                        host.detach_session(target);
+                    }
+
+                    Ok(json!({
+                        "pane": pane,
+                        "status": "exited",
+                        "exit_code": code,
+                        "command": cmd,
+                        "closed": should_close,
+                    }))
+                }
+                None => {
+                    let cmd = meta.map(|(_, c)| c).unwrap_or_default();
+                    Ok(json!({
+                        "pane": pane,
+                        "status": "running",
+                        "command": cmd,
+                    }))
+                }
+            }
+        }
     }
 }
 
@@ -3056,6 +3413,17 @@ fn send_is_enter_only(text: &str, newline: bool) -> bool {
     text.chars().all(|c| c == '\n' || c == '\r') && (newline || !text.is_empty())
 }
 
+/// `__TAKO_EXIT=<code>` マーカーを画面行から検索する。
+/// 行頭以外の位置（read プロンプトと同一行等）にも対応する（#325）
+fn find_exit_marker(lines: &[String]) -> Option<i32> {
+    lines.iter().rev().find_map(|line| {
+        line.find("__TAKO_EXIT=").and_then(|pos| {
+            let after = &line[pos + "__TAKO_EXIT=".len()..];
+            after.trim().parse::<i32>().ok()
+        })
+    })
+}
+
 /// キーボード入力の意味論での改行正規化（Issue #95）: 端末の Enter キーは CR であり、
 /// LF は claude TUI で「改行挿入」と解釈され送信にならない。PTY へ直接書く経路では
 /// LF / CRLF を CR へ揃える（bracketed paste 経由の貼り付けは対象外）
@@ -3475,6 +3843,8 @@ struct SpawnParams<'a> {
     /// worker のエージェント種別（claude / codex / agy。省略時はプロファイル既定。#120）
     agent: Option<&'a str>,
     caller_pid: Option<u32>,
+    /// 委任台帳の task_type（Issue #292。統制語彙。省略時は investigation）
+    task_type: Option<&'a str>,
 }
 
 fn dispatch_orchestrator_spawn(
@@ -3493,6 +3863,7 @@ fn dispatch_orchestrator_spawn(
         caller_role,
         agent,
         caller_pid,
+        task_type: _task_type,
     } = params;
     if pane.is_none() && tab.is_none() {
         return Err(DispatchError::Operation(
@@ -3639,6 +4010,26 @@ fn dispatch_orchestrator_spawn(
         }
     }
 
+    // 委任台帳への自動記録（Issue #292 層1）。失敗しても spawn は止めない
+    let issue_num =
+        crate::sessions::extract_issues(&format!("{} {prompt}", label.unwrap_or_default()))
+            .into_iter()
+            .next();
+    let issue_str = issue_num.map(|n| format!("#{n}"));
+    let ledger_id = crate::orchestrator::ledger::record_spawn(
+        project,
+        label,
+        issue_str.as_deref(),
+        _task_type,
+        launch.model.as_deref().unwrap_or("(default)"),
+        launch.effort.as_deref(),
+        Some(worker_agent.as_str()),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("warning: 委任台帳への記録に失敗: {e}");
+        String::new()
+    });
+
     Ok(json!({
         "pane_id": new_id.as_u64(),
         "spawned_by": target.as_u64(),
@@ -3653,6 +4044,7 @@ fn dispatch_orchestrator_spawn(
         "prompt": prompt,
         "pre_trusted": pre_trusted,
         "tmux_session": tmux_session,
+        "ledger_id": ledger_id,
     }))
 }
 
@@ -3899,7 +4291,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         .as_ref()
         .is_some_and(|s| crate::orchestrator::wait::screen_is_collapsed(s));
 
-    // #243: events 配列（question / model_switched / context_high）
+    // #243: events 配列（question / model_switched / context_high / permission_dialog）
     let events: Vec<Value> = crate::orchestrator::wait::collect_worker_events(
         &status,
         recent_output.as_deref(),
@@ -3908,6 +4300,21 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     .iter()
     .map(|e| e.to_json())
     .collect();
+
+    // #319: waiting + 画面に permission ダイアログがあれば構造化情報を付与
+    let permission_dialog: Option<Value> = if status == "waiting" {
+        recent_output.as_ref().and_then(|out| {
+            let lines: Vec<String> = out.lines().map(|l| l.to_string()).collect();
+            let dialog = crate::claude_tui::detect_permission_dialog(&lines)?;
+            Some(json!({
+                "command": dialog.command,
+                "options": dialog.options,
+                "highlighted": dialog.highlighted,
+            }))
+        })
+    } else {
+        None
+    };
 
     Ok(json!({
         "status": status,
@@ -3920,6 +4327,89 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         "has_running_children": has_children,
         "collapsed": collapsed,
         "events": events,
+        "permission_dialog": permission_dialog,
+    }))
+}
+
+/// #319: permission ダイアログへの構造化応答
+fn dispatch_orchestrator_respond(
+    host: &dyn ControlHost,
+    pane_id: u64,
+    choice: &str,
+    caller_role: Option<&str>,
+) -> Result<Value, DispatchError> {
+    let target = PaneId::from_raw(pane_id);
+
+    // バックエンドセッションの取得
+    let backend_session = host.backend_session(target).ok_or_else(|| {
+        DispatchError::Operation(format!(
+            "ペイン {pane_id} のバックエンドセッションが見つからない"
+        ))
+    })?;
+
+    // 画面から permission ダイアログの存在を検証
+    let socket = tako_core::tmux_backend::socket_name();
+    let lines = tako_core::tmux::capture_session(Some(&socket), &backend_session)
+        .map_err(|e| DispatchError::Operation(format!("画面の取得に失敗: {e}")))?;
+    let dialog = crate::claude_tui::detect_permission_dialog(&lines).ok_or_else(|| {
+        DispatchError::Operation(
+            "ペイン画面に permission ダイアログが見つからない（既に解消済みか、別の画面状態です）"
+                .to_string(),
+        )
+    })?;
+
+    // choice を番号に解決
+    let choice_num: usize = match choice.to_lowercase().as_str() {
+        "yes" | "allow" => 1,
+        "no" | "deny" => {
+            // Deny は最後の選択肢（通常は 3 番目）
+            dialog
+                .options
+                .iter()
+                .position(|o| o.to_lowercase().contains("deny") || o.to_lowercase() == "no")
+                .map(|i| i + 1)
+                .unwrap_or(dialog.options.len())
+        }
+        n => n.parse().map_err(|_| {
+            DispatchError::Operation(format!(
+                "choice は番号（1-{}）または yes/no/allow/deny を指定してください: {choice}",
+                dialog.options.len()
+            ))
+        })?,
+    };
+    if choice_num == 0 || choice_num > dialog.options.len() {
+        return Err(DispatchError::Operation(format!(
+            "choice {choice_num} は範囲外です（1-{}）",
+            dialog.options.len()
+        )));
+    }
+
+    // 選択キーを送信: 番号キー → 短い待ち → Enter
+    tako_core::tmux::send_key(Some(&socket), &backend_session, &choice_num.to_string())
+        .map_err(|e| DispatchError::Operation(format!("番号キーの送信に失敗: {e}")))?;
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    tako_core::tmux::send_key(Some(&socket), &backend_session, "Enter")
+        .map_err(|e| DispatchError::Operation(format!("Enter の送信に失敗: {e}")))?;
+
+    let chosen_text = dialog
+        .options
+        .get(choice_num - 1)
+        .cloned()
+        .unwrap_or_default();
+
+    // 監査記録（persist.log。ペイン出力自体はキー入力の結果として画面に残る）
+    let caller = caller_role.unwrap_or("unknown");
+    crate::diag::persist_log(&format!(
+        "[permission-respond] caller={caller} pane={pane_id} choice={choice_num} ({chosen_text}) command={}",
+        dialog.command
+    ));
+
+    Ok(json!({
+        "pane_id": pane_id,
+        "responded": true,
+        "choice": choice_num,
+        "choice_text": chosen_text,
+        "command": dialog.command,
     }))
 }
 
@@ -3947,11 +4437,16 @@ fn shell_escape(s: &str) -> String {
 pub struct SetupMcpResult {
     pub configured: bool,
     pub already_existed: bool,
+    /// 既存の登録パスが死んでいたため新パスに付け替えた
+    pub repaired: bool,
+    /// 修復前の旧パス（repaired=true のときのみ）
+    pub old_command: Option<String>,
 }
 
 /// Claude Code の settings.json に tako MCP サーバーの接続設定を追加する。
 /// `tako_binary` は tako CLI のフルパス、`settings_path` は書き込む settings.json のパス。
-/// 既に設定済みなら `already_existed=true`、新規追加なら `configured=true`
+/// 既に設定済みなら `already_existed=true`、新規追加なら `configured=true`。
+/// 既存登録の command パスが存在しない場合は `tako_binary` に付け替え `repaired=true`
 pub fn setup_mcp_settings(
     tako_binary: &str,
     settings_path: &std::path::Path,
@@ -3966,10 +4461,39 @@ pub fn setup_mcp_settings(
     };
     let servers = settings.entry("mcpServers").or_insert_with(|| json!({}));
     if let Some(obj) = servers.as_object() {
-        if obj.contains_key("tako") {
+        if let Some(existing) = obj.get("tako") {
+            let existing_cmd = existing
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let path_healthy =
+                !existing_cmd.is_empty() && std::path::Path::new(existing_cmd).is_file();
+            if path_healthy {
+                return Ok(SetupMcpResult {
+                    configured: false,
+                    already_existed: true,
+                    repaired: false,
+                    old_command: None,
+                });
+            }
+            // 登録パスが死んでいる → 付け替え
+            let old_cmd = existing_cmd.to_string();
+            let servers_obj = servers.as_object_mut().ok_or_else(|| {
+                DispatchError::Operation("settings.json の mcpServers がオブジェクトでない".into())
+            })?;
+            servers_obj.insert(
+                "tako".to_string(),
+                json!({
+                    "command": tako_binary,
+                    "args": ["mcp", "serve"],
+                }),
+            );
+            write_settings_json(settings_path, &settings)?;
             return Ok(SetupMcpResult {
-                configured: false,
+                configured: true,
                 already_existed: true,
+                repaired: true,
+                old_command: Some(old_cmd),
             });
         }
     }
@@ -3983,12 +4507,25 @@ pub fn setup_mcp_settings(
             "args": ["mcp", "serve"],
         }),
     );
+    write_settings_json(settings_path, &settings)?;
+    Ok(SetupMcpResult {
+        configured: true,
+        already_existed: false,
+        repaired: false,
+        old_command: None,
+    })
+}
+
+fn write_settings_json(
+    settings_path: &std::path::Path,
+    settings: &serde_json::Map<String, Value>,
+) -> Result<(), DispatchError> {
     if let Some(parent) = settings_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             DispatchError::Operation(format!("{} の作成に失敗: {e}", parent.display()))
         })?;
     }
-    let json = serde_json::to_string_pretty(&settings)
+    let json = serde_json::to_string_pretty(settings)
         .map_err(|e| DispatchError::Operation(format!("JSON のシリアライズに失敗: {e}")))?;
     std::fs::write(settings_path, json).map_err(|e| {
         DispatchError::Operation(format!(
@@ -3996,20 +4533,25 @@ pub fn setup_mcp_settings(
             settings_path.display()
         ))
     })?;
-    Ok(SetupMcpResult {
-        configured: true,
-        already_existed: false,
-    })
+    Ok(())
 }
 
+/// MCP 登録に使う安定パス。/Applications/tako.app がある場合に最優先
+pub const STABLE_APP_BINARY: &str = "/Applications/tako.app/Contents/MacOS/tako";
+
 /// tako CLI バイナリのパスを解決する。
-/// ① `which tako`、② 実行中バイナリの隣（.app バンドル想定）、③ フォールバック "tako"
+/// ① /Applications/tako.app（安定パス）
+/// ② `which tako`
+/// ③ 実行中バイナリの隣（.app バンドル想定）
+/// ④ フォールバック "tako"
 pub fn resolve_tako_binary() -> String {
+    if std::path::Path::new(STABLE_APP_BINARY).is_file() {
+        return STABLE_APP_BINARY.to_string();
+    }
     if let Some(path) = which("tako") {
         return path;
     }
     if let Ok(exe) = std::env::current_exe() {
-        // .app バンドル: tako-app の隣に tako がある
         if let Some(dir) = exe.parent() {
             let sibling = dir.join("tako");
             if sibling.is_file() {
@@ -4727,6 +5269,7 @@ fn dispatch_task_resume(
             caller_role,
             agent: Some(agent_str),
             caller_pid: None,
+            task_type: None,
         },
     )?;
 
@@ -4757,6 +5300,87 @@ fn dispatch_task_resume(
     Ok(result)
 }
 
+struct LedgerParams {
+    action: String,
+    id: Option<String>,
+    outcome: Option<String>,
+    rounds: Option<u32>,
+    note: Option<String>,
+    project: Option<String>,
+    task_type: Option<String>,
+    limit: Option<usize>,
+}
+
+/// OrchestratorLedger の dispatch（Issue #292）。ControlHost 不要のためスタンドアロン
+fn dispatch_orchestrator_ledger(p: LedgerParams) -> Result<Value, DispatchError> {
+    let LedgerParams {
+        action,
+        id,
+        outcome,
+        rounds,
+        note,
+        project,
+        task_type,
+        limit,
+    } = p;
+    use crate::orchestrator::ledger;
+    match action.as_str() {
+        "list" => {
+            let ledger = ledger::Ledger::load().map_err(DispatchError::Operation)?;
+            let mut entries: Vec<&ledger::LedgerEntry> = ledger.entries.iter().collect();
+            if let Some(ref p) = project {
+                entries.retain(|e| e.project == *p);
+            }
+            if let Some(ref t) = task_type {
+                entries.retain(|e| e.task_type == *t);
+            }
+            let limit = limit.unwrap_or(50);
+            if entries.len() > limit {
+                entries = entries[entries.len() - limit..].to_vec();
+            }
+            Ok(json!({
+                "entries": entries,
+                "total": ledger.entries.len(),
+                "unevaluated": ledger.unevaluated_count(),
+            }))
+        }
+        "stats" => {
+            let ledger = ledger::Ledger::load().map_err(DispatchError::Operation)?;
+            let stats = ledger.stats();
+            Ok(json!({
+                "stats": stats,
+                "total_entries": ledger.entries.len(),
+                "unevaluated": ledger.unevaluated_count(),
+            }))
+        }
+        "record" => {
+            let id = id.ok_or_else(|| DispatchError::InvalidParams("id は必須".into()))?;
+            let outcome =
+                outcome.ok_or_else(|| DispatchError::InvalidParams("outcome は必須".into()))?;
+            ledger::record_outcome(&id, &outcome, rounds, note.as_deref())
+                .map_err(DispatchError::Operation)?;
+            Ok(json!({"ok": true, "id": id, "outcome": outcome}))
+        }
+        "amend" => {
+            let id = id.ok_or_else(|| DispatchError::InvalidParams("id は必須".into()))?;
+            let note = note.ok_or_else(|| DispatchError::InvalidParams("note は必須".into()))?;
+            ledger::amend_entry(&id, &note).map_err(DispatchError::Operation)?;
+            Ok(json!({"ok": true, "id": id, "post_issue": true}))
+        }
+        "prune" => {
+            let prefix = project.ok_or_else(|| {
+                DispatchError::InvalidParams("project（前方一致プレフィックス）は必須".into())
+            })?;
+            let removed = ledger::Ledger::mutate(|l| l.prune_by_project_prefix(&prefix))
+                .map_err(DispatchError::Operation)?;
+            Ok(json!({"ok": true, "prefix": prefix, "removed": removed}))
+        }
+        _ => Err(DispatchError::InvalidParams(format!(
+            "不正な action '{action}'。使用可能: list, stats, record, amend, prune"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4767,6 +5391,7 @@ mod tests {
     struct MockHost {
         ws: Workspace,
         attached: Vec<u64>,
+        attached_options: std::collections::HashMap<u64, SpawnOptions>,
         detached: Vec<u64>,
         previews: std::collections::HashMap<u64, (String, PreviewModeWire)>,
         preview_views: std::collections::HashMap<u64, tako_core::PreviewViewState>,
@@ -4780,6 +5405,8 @@ mod tests {
         stale_pane_map: std::collections::HashMap<PaneId, PaneId>,
         /// #217: UI テーマモード
         theme_mode: tako_core::theme::ThemeMode,
+        /// #321: 利用制限表示サービス
+        limit_service: tako_core::LimitService,
         preview_reload: tako_core::PreviewReloadState,
         preview_cache: tako_core::PreviewCacheStats,
     }
@@ -4789,6 +5416,7 @@ mod tests {
             Self {
                 ws: Workspace::new("t1", Pane::new(PaneOrigin::User)),
                 attached: Vec::new(),
+                attached_options: std::collections::HashMap::new(),
                 detached: Vec::new(),
                 previews: std::collections::HashMap::new(),
                 preview_views: std::collections::HashMap::new(),
@@ -4799,6 +5427,7 @@ mod tests {
                 pins: Vec::new(),
                 stale_pane_map: std::collections::HashMap::new(),
                 theme_mode: tako_core::theme::ThemeMode::Dark,
+                limit_service: tako_core::LimitService::Claude,
                 preview_reload: tako_core::PreviewReloadState::default(),
                 preview_cache: tako_core::PreviewCacheStats {
                     max_bytes: 512 * 1024 * 1024,
@@ -4838,8 +5467,9 @@ mod tests {
         fn session(&self, _pane: PaneId) -> Option<&TerminalSession> {
             None
         }
-        fn attach_session(&mut self, pane: PaneId, _options: SpawnOptions) {
+        fn attach_session(&mut self, pane: PaneId, options: SpawnOptions) {
             self.attached.push(pane.as_u64());
+            self.attached_options.insert(pane.as_u64(), options);
         }
         fn detach_session(&mut self, pane: PaneId) {
             self.detached.push(pane.as_u64());
@@ -4887,6 +5517,12 @@ mod tests {
         }
         fn set_theme_mode(&mut self, mode: tako_core::theme::ThemeMode) {
             self.theme_mode = mode;
+        }
+        fn limit_service(&self) -> tako_core::LimitService {
+            self.limit_service
+        }
+        fn set_limit_service(&mut self, service: tako_core::LimitService) {
+            self.limit_service = service;
         }
     }
 
@@ -5967,6 +6603,33 @@ mod tests {
     }
 
     #[test]
+    fn タブの並べ替え() {
+        let mut host = MockHost::new();
+        let t1 = host.ws.active_tab_id();
+        let t2 = host.ws.create_tab(
+            "t2",
+            tako_core::Pane::new(tako_core::pane::PaneOrigin::User),
+        );
+        let t3 = host.ws.create_tab(
+            "t3",
+            tako_core::Pane::new(tako_core::pane::PaneOrigin::User),
+        );
+        let result = dispatch(
+            &mut host,
+            Request::TabReorder {
+                tab: t3.as_u64(),
+                index: 0,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["tab"], t3.as_u64());
+        assert_eq!(result["index"], 0);
+        let ids: Vec<_> = host.ws.tabs().iter().map(|t| t.id()).collect();
+        assert_eq!(ids, vec![t3, t1, t2]);
+    }
+
+    #[test]
     fn 明示タイトル付きのタブ作成は手動扱い() {
         let mut host = MockHost::new();
         let result = dispatch(
@@ -6354,6 +7017,43 @@ mod tests {
     }
 
     #[test]
+    fn preview_changelogはプレビューペイン以外を拒否する() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let err = dispatch(
+            &mut host,
+            Request::PreviewChangelog {
+                pane: Some(root),
+                enabled: Some(true),
+                max_count: None,
+                expand: None,
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn preview_changelogはプレビューペインで状態取得できる() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        host.previews
+            .insert(root, ("/tmp/test.rs".into(), PreviewModeWire::Code));
+        let result = dispatch(
+            &mut host,
+            Request::PreviewChangelog {
+                pane: Some(root),
+                enabled: None,
+                max_count: None,
+                expand: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["changelog"].as_bool(), Some(false));
+    }
+
+    #[test]
     fn tmux_openは存在しないセッションを分割前に弾く() {
         let mut host = MockHost::new();
         let root = host.root_pane();
@@ -6521,6 +7221,7 @@ mod tests {
             caller_role,
             agent: None,
             caller_pid: None,
+            task_type: None,
         }
     }
 
@@ -7675,6 +8376,7 @@ mod tests {
                 caller_role: Some("master:"),
                 agent: None,
                 caller_pid: None,
+                task_type: None,
             };
             let result = dispatch_orchestrator_spawn(&mut host, PaneOrigin::Mcp, params);
             assert!(
@@ -7745,6 +8447,68 @@ mod tests {
             Request::Theme {
                 action: Some("set".into()),
                 mode: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn 利用制限サービスのstatus_setが機能する() {
+        use tako_core::LimitService;
+        let mut host = MockHost::new();
+        // status: 既定は claude
+        let v = dispatch(
+            &mut host,
+            Request::LimitService {
+                action: None,
+                service: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["limit_service"], "claude");
+        assert_eq!(v["available"].as_array().unwrap().len(), 3);
+        // set codex → host へ反映
+        let v = dispatch(
+            &mut host,
+            Request::LimitService {
+                action: Some("set".into()),
+                service: Some("codex".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["limit_service"], "codex");
+        assert_eq!(host.limit_service, LimitService::Codex);
+        // set agy
+        let v = dispatch(
+            &mut host,
+            Request::LimitService {
+                action: Some("set".into()),
+                service: Some("agy".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["limit_service"], "agy");
+        assert_eq!(host.limit_service, LimitService::Agy);
+        // 不明 service はエラー
+        assert!(dispatch(
+            &mut host,
+            Request::LimitService {
+                action: Some("set".into()),
+                service: Some("unknown".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .is_err());
+        // service 無しの set はエラー
+        assert!(dispatch(
+            &mut host,
+            Request::LimitService {
+                action: Some("set".into()),
+                service: None,
             },
             PaneOrigin::Cli,
         )
@@ -8078,5 +8842,236 @@ mod tests {
         let result_single = find_master_pane_strict(host.workspace(), "dup", Some("master:dup"));
         assert!(result_single.is_ok(), "1 体なら成功");
         assert_eq!(result_single.unwrap().1.as_u64(), pane_a);
+    }
+
+    fn mcp_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tako-mcp-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn setup_mcp_settings_新規登録() {
+        let dir = mcp_test_dir("new");
+        let settings = dir.join("settings.json");
+        let result = setup_mcp_settings("/usr/local/bin/tako", &settings).unwrap();
+        assert!(result.configured);
+        assert!(!result.already_existed);
+        assert!(!result.repaired);
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            content["mcpServers"]["tako"]["command"],
+            "/usr/local/bin/tako"
+        );
+    }
+
+    #[test]
+    fn setup_mcp_settings_健全な既存登録は触らない() {
+        let dir = mcp_test_dir("healthy");
+        let settings = dir.join("settings.json");
+        let exe = std::env::current_exe().unwrap();
+        let existing = serde_json::json!({
+            "mcpServers": {
+                "tako": {
+                    "command": exe.display().to_string(),
+                    "args": ["mcp", "serve"]
+                }
+            }
+        });
+        std::fs::write(&settings, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+        let result = setup_mcp_settings("/other/path/tako", &settings).unwrap();
+        assert!(!result.configured);
+        assert!(result.already_existed);
+        assert!(!result.repaired);
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            content["mcpServers"]["tako"]["command"],
+            exe.display().to_string(),
+        );
+    }
+
+    #[test]
+    fn setup_mcp_settings_死んだパスを修復() {
+        let dir = mcp_test_dir("repair");
+        let settings = dir.join("settings.json");
+        let dead_path = "/nonexistent/old/path/tako";
+        let existing = serde_json::json!({
+            "mcpServers": {
+                "tako": {
+                    "command": dead_path,
+                    "args": ["mcp", "serve"]
+                }
+            }
+        });
+        std::fs::write(&settings, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+        let result = setup_mcp_settings("/new/stable/tako", &settings).unwrap();
+        assert!(result.configured);
+        assert!(result.already_existed);
+        assert!(result.repaired);
+        assert_eq!(result.old_command.as_deref(), Some(dead_path));
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(content["mcpServers"]["tako"]["command"], "/new/stable/tako");
+    }
+
+    #[test]
+    fn resolve_tako_binary_はapplicationsを優先() {
+        // /Applications/tako.app が存在する場合のみこのテストが意味を持つ
+        if std::path::Path::new(STABLE_APP_BINARY).is_file() {
+            assert_eq!(resolve_tako_binary(), STABLE_APP_BINARY);
+        }
+    }
+
+    #[test]
+    fn run_interactiveはsplitとtitleとmetaを設定する() {
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::RunInteractive {
+                pane: Some(root.as_u64()),
+                tab: None,
+                command: "sudo systemctl start foo".into(),
+                input_hint: Some("sudo パスワード".into()),
+                direction: None,
+                ratio: None,
+                auto_close: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+
+        let pane_id = result["pane"].as_u64().unwrap();
+        assert_eq!(result["status"], "running");
+        assert_eq!(result["auto_close"], "success");
+
+        // 新ペインが生成された
+        assert!(host.attached.contains(&pane_id));
+
+        // タイトルにヒントが設定された
+        let new_pane_id = PaneId::from_raw(pane_id);
+        let pane = host
+            .ws
+            .active_tab()
+            .tree()
+            .get(new_pane_id)
+            .expect("新ペインが存在する");
+        assert_eq!(pane.title(), Some("(!) sudo パスワード"));
+
+        // interactive_meta が設定された
+        let (ac, cmd) = pane.interactive_meta().expect("interactive_meta がある");
+        assert_eq!(ac, "success");
+        assert_eq!(cmd, "sudo systemctl start foo");
+    }
+
+    #[test]
+    fn run_interactive_statusはrunningを返す_session未接続時() {
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::RunInteractive {
+                pane: Some(root.as_u64()),
+                tab: None,
+                command: "read -p 'input: ' val".into(),
+                input_hint: None,
+                direction: Some(Direction::Down),
+                ratio: Some(0.4),
+                auto_close: Some("never".into()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let pane_id = result["pane"].as_u64().unwrap();
+
+        // session() が None のため、status は running（マーカー未検出）
+        let status = dispatch(
+            &mut host,
+            Request::RunInteractiveStatus {
+                pane: pane_id,
+                no_wait: false,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(status["status"], "running");
+        assert_eq!(status["pane"], pane_id);
+    }
+
+    #[test]
+    fn run_interactiveのauto_close不正値はエラー() {
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::RunInteractive {
+                pane: Some(root.as_u64()),
+                tab: None,
+                command: "echo hi".into(),
+                input_hint: None,
+                direction: None,
+                ratio: None,
+                auto_close: Some("invalid".into()),
+            },
+            PaneOrigin::Mcp,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn exit_markerは行頭でも途中でも検知できる() {
+        assert_eq!(find_exit_marker(&["__TAKO_EXIT=0".into()]), Some(0));
+        assert_eq!(
+            find_exit_marker(&["続行しますか? (y/n): __TAKO_EXIT=1".into()]),
+            Some(1)
+        );
+        assert_eq!(find_exit_marker(&["  __TAKO_EXIT=42  ".into()]), Some(42));
+        assert_eq!(find_exit_marker(&["just some output".into()]), None);
+        assert_eq!(
+            find_exit_marker(&[
+                "__TAKO_EXIT=0".into(),
+                "some output".into(),
+                "prompt: __TAKO_EXIT=2".into(),
+            ]),
+            Some(2),
+        );
+    }
+
+    #[test]
+    fn run_interactiveはコマンドをspawn_commandで渡す() {
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::RunInteractive {
+                pane: Some(root.as_u64()),
+                tab: None,
+                command: r#"read "ans?input: ""#.into(),
+                input_hint: None,
+                direction: None,
+                ratio: None,
+                auto_close: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let pane_id = result["pane"].as_u64().unwrap();
+        let opts = host.attached_options.get(&pane_id).expect("options 記録");
+        let cmd = opts.command.as_ref().expect("command が設定されている");
+        assert!(cmd.program.contains("__TAKO_EXIT="), "{}", cmd.program);
+        assert!(
+            cmd.program.contains(r#"read "ans?input: ""#),
+            "{}",
+            cmd.program
+        );
+        assert!(
+            cmd.program
+                .ends_with("read -r __TAKO_DUMMY__ 2>/dev/null || true"),
+            "{}",
+            cmd.program
+        );
     }
 }

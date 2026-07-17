@@ -5,6 +5,7 @@
 //! tako をインストールするだけで使える。
 
 pub mod agent;
+pub mod ledger;
 pub mod wait;
 
 use serde::{Deserialize, Serialize};
@@ -31,13 +32,13 @@ pub(crate) fn test_config_dir_override() -> &'static std::sync::OnceLock<PathBuf
 }
 
 /// オーケストレーター設定ディレクトリのパス。
-/// `~/Library/Application Support/tako/orchestrator/`
+/// `<data_dir>/orchestrator/`（TAKO_DATA_DIR / TAKO_ISOLATED を経由）
 pub fn config_dir() -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(dir) = test_config_dir_override().get() {
         return Some(dir.clone());
     }
-    home_dir().map(|h| h.join("Library/Application Support/tako/orchestrator"))
+    tako_core::paths::data_dir().map(|d| d.join("orchestrator"))
 }
 
 /// projects.yaml のパス
@@ -676,10 +677,13 @@ impl Profile {
         lines.join("\n")
     }
 
-    /// worker_model_policy に基づいて model-policy セクションのテキストを生成する
+    /// worker_model_policy に基づいて model-policy セクションのテキストを生成する。
+    /// judgment 二層（雛形 + ローカル）を末尾に注入する（Issue #292）
     fn generate_model_policy_section(&self) -> String {
         let base = self.generate_model_policy_base();
-        format!("{base}{}", self.generate_worker_agents_section())
+        let agents = self.generate_worker_agents_section();
+        let judgment = ledger::build_judgment_section();
+        format!("{base}{agents}{judgment}")
     }
 
     fn generate_model_policy_base(&self) -> String {
@@ -1739,6 +1743,49 @@ prompt_blocks:
         // 既定はモデル無指定 = claude CLI の既定（[1m] を含まない）
         assert!(prompt.contains(CLAUDE_DEFAULT_LABEL));
         assert!(!prompt.contains("[1m]"));
+        // #292: judgment 二層が model-policy の後に注入されていること
+        let policy_pos = prompt.find("Worker Model Policy").unwrap();
+        let judgment_pos = prompt
+            .find("Delegation Judgment Criteria")
+            .expect("judgment セクションが存在する");
+        assert!(judgment_pos > policy_pos, "judgment は model-policy の後");
+        assert!(prompt.contains("Built-in Defaults"));
+        assert!(prompt.contains("Survey Frequency Control"));
+        assert!(prompt.contains("bugfix-rooted"));
+    }
+
+    #[test]
+    fn project_resolution_gate_in_default_prompt() {
+        let p = Profile::default();
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
+        // Step 0 が存在し、Step 1 より前にあること
+        let step0_pos = prompt.find("Step 0").expect("Step 0 が存在する");
+        let step1_pos = prompt.find("Step 1").expect("Step 1 が存在する");
+        assert!(step0_pos < step1_pos, "Step 0 は Step 1 より前");
+        // 順序制約の主要キーワードが含まれること
+        assert!(prompt.contains("Resolve target projects"));
+        assert!(prompt.contains("tako_orchestrator_projects"));
+        assert!(prompt.contains("high-confidence match"));
+        assert!(prompt.contains("Zero matches"));
+        // ステップ数が five に更新されていること
+        assert!(prompt.contains("five steps"));
+        // Step 4 にプロジェクト key 明記の指示があること
+        assert!(prompt.contains("Step 0 resolved"));
+    }
+
+    #[test]
+    fn project_resolution_gate_survives_append() {
+        let p = Profile {
+            prompt_blocks: Some(PromptBlocks {
+                append: Some("CUSTOM_FOOTER".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "test");
+        assert!(prompt.contains("Step 0"));
+        assert!(prompt.contains("Resolve target projects"));
+        assert!(prompt.ends_with("CUSTOM_FOOTER"));
     }
 
     #[test]

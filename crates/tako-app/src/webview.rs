@@ -128,6 +128,7 @@ impl WebViewEntry {
         id: WebViewId,
         url: &str,
     ) -> Result<Self, String> {
+        validate_url(url)?;
         let shared = Arc::new(Mutex::new(WebShared {
             url: url.to_string(),
             ..Default::default()
@@ -256,6 +257,7 @@ impl WebViewEntry {
             "reload" => self.view.reload().map_err(|e| format!("reload 失敗: {e}")),
             url => {
                 let url = normalize_url(url);
+                validate_url(&url)?;
                 if let Ok(mut s) = self.shared.lock() {
                     s.url = url.clone();
                     s.loading = true;
@@ -315,6 +317,214 @@ impl WebViewEntry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// macOS: NSEvent local monitor（#326）
+//
+// WKWebView が first responder のとき、tako のグローバルショートカット（⌘K 等）が
+// webview に飲まれて GPUI に届かない問題を解決する。
+// addLocalMonitorForEventsMatchingMask: でキーダウンを先取りし、tako が処理すべき
+// ⌘ ショートカットなら first responder を content view（GPUI）へ戻してから
+// イベントを通す。webview 用の編集系（⌘C/⌘V 等）はそのまま webview へ渡す。
+// ---------------------------------------------------------------------------
+#[cfg(target_os = "macos")]
+mod key_monitor {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    extern "C" {
+        fn objc_getClass(name: *const u8) -> *const c_void;
+        fn sel_registerName(name: *const u8) -> *const c_void;
+        fn objc_msgSend(receiver: *const c_void, selector: *const c_void, ...) -> *const c_void;
+        static _NSConcreteGlobalBlock: c_void;
+    }
+
+    fn cls(name: &str) -> *const c_void {
+        let cstr = std::ffi::CString::new(name).unwrap();
+        unsafe { objc_getClass(cstr.as_ptr() as *const u8) }
+    }
+    fn sel(name: &str) -> *const c_void {
+        let cstr = std::ffi::CString::new(name).unwrap();
+        unsafe { sel_registerName(cstr.as_ptr() as *const u8) }
+    }
+
+    // Objective-C global block（キャプチャなし）の ABI レイアウト
+    #[repr(C)]
+    struct GlobalBlock {
+        isa: *const c_void,
+        flags: i32,
+        reserved: i32,
+        invoke: unsafe extern "C" fn(*const GlobalBlock, *const c_void) -> *const c_void,
+        descriptor: *const BlockDescriptor,
+    }
+    unsafe impl Sync for GlobalBlock {}
+    unsafe impl Send for GlobalBlock {}
+
+    #[repr(C)]
+    struct BlockDescriptor {
+        reserved: u64,
+        size: u64,
+    }
+
+    static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+        reserved: 0,
+        size: std::mem::size_of::<GlobalBlock>() as u64,
+    };
+
+    // webview が存在しない ⌘ キーイベントまで first responder を切り替えると
+    // 通常操作に副作用が出るため、webview が 1 個以上ある場合のみ動作させる
+    static HAS_WEBVIEW: AtomicBool = AtomicBool::new(false);
+
+    /// webview が存在するか。main.rs 側の webview 作成/破棄で呼ぶ
+    pub(super) fn set_has_webview(v: bool) {
+        HAS_WEBVIEW.store(v, Ordering::Relaxed);
+    }
+
+    const NS_COMMAND_KEY_MASK: u64 = 1 << 20;
+
+    /// webview で処理させるキー（⌘C/⌘V 等）の virtual key code 集合。
+    /// これに含まれるキーは first responder を切り替えず webview にそのまま渡す
+    const WEBVIEW_PASSTHROUGH_KEYS: &[u16] = &[
+        0x00, // A  (⌘A select all)
+        0x08, // C  (⌘C copy)
+        0x03, // F  (⌘F find)
+        0x25, // L  (⌘L address bar)
+        0x23, // P  (⌘P print)
+        0x0F, // R  (⌘R reload)
+        0x01, // S  (⌘S save)
+        0x09, // V  (⌘V paste)
+        0x07, // X  (⌘X cut)
+        0x06, // Z  (⌘Z undo / ⌘Shift+Z redo)
+    ];
+
+    /// NSEvent の virtual key code が webview 用かどうか
+    fn is_webview_key(key_code: u16, _flags: u64) -> bool {
+        WEBVIEW_PASSTHROUGH_KEYS.contains(&key_code)
+    }
+
+    /// NSEvent local monitor のコールバック。
+    /// first responder が WKWebView で、tako が処理すべき ⌘ キーなら
+    /// first responder を content view へ戻す。イベント自体は常にそのまま返す
+    unsafe extern "C" fn monitor_invoke(
+        _block: *const GlobalBlock,
+        event: *const c_void,
+    ) -> *const c_void {
+        if !HAS_WEBVIEW.load(Ordering::Relaxed) {
+            return event;
+        }
+        // modifier flags を取得
+        let flags_sel = sel("modifierFlags");
+        let f: unsafe extern "C" fn(*const c_void, *const c_void) -> u64 =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        let flags = f(event, flags_sel);
+        if flags & NS_COMMAND_KEY_MASK == 0 {
+            return event;
+        }
+        // key code を取得
+        let kc_sel = sel("keyCode");
+        let f_kc: unsafe extern "C" fn(*const c_void, *const c_void) -> u16 =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        let key_code = f_kc(event, kc_sel);
+
+        if is_webview_key(key_code, flags) {
+            return event;
+        }
+        // NSApp.keyWindow
+        let nsapp_cls = cls("NSApplication");
+        let f_id: unsafe extern "C" fn(*const c_void, *const c_void) -> *const c_void =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        let nsapp = f_id(nsapp_cls, sel("sharedApplication"));
+        if nsapp.is_null() {
+            return event;
+        }
+        let window = f_id(nsapp, sel("keyWindow"));
+        if window.is_null() {
+            return event;
+        }
+        let first_resp = f_id(window, sel("firstResponder"));
+        if first_resp.is_null() {
+            return event;
+        }
+        // first responder が WKWebView（またはそのサブクラス）かチェック
+        let wk_cls = cls("WKWebView");
+        if wk_cls.is_null() {
+            return event;
+        }
+        let ik_sel = sel("isKindOfClass:");
+        let f_bool: unsafe extern "C" fn(*const c_void, *const c_void, *const c_void) -> bool =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        let is_wk = f_bool(first_resp, ik_sel, wk_cls);
+        if !is_wk {
+            // WKWebView のサブビュー（WKContentView 等）が first responder の場合もある
+            let sv_sel = sel("superview");
+            let parent = f_id(first_resp, sv_sel);
+            if parent.is_null() || !f_bool(parent, ik_sel, wk_cls) {
+                return event;
+            }
+        }
+        // first responder を content view（GPUI のカスタム NSView）へ戻す
+        let content_view = f_id(window, sel("contentView"));
+        if !content_view.is_null() {
+            let mk_sel = sel("makeFirstResponder:");
+            let f_mk: unsafe extern "C" fn(*const c_void, *const c_void, *const c_void) -> bool =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            f_mk(window, mk_sel, content_view);
+        }
+        event
+    }
+
+    static MONITOR_BLOCK: GlobalBlock = GlobalBlock {
+        isa: unsafe { &_NSConcreteGlobalBlock as *const c_void },
+        flags: 1 << 28, // BLOCK_IS_GLOBAL
+        reserved: 0,
+        invoke: monitor_invoke,
+        descriptor: &DESCRIPTOR,
+    };
+
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+    /// NSEvent local monitor を設置する。二重登録防止済み。アプリ起動時に 1 回呼ぶ
+    pub(super) fn install() {
+        if INSTALLED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        unsafe {
+            let ns_event = cls("NSEvent");
+            let mask: u64 = 1 << 10; // NSEventMaskKeyDown
+            let add_sel = sel("addLocalMonitorForEventsMatchingMask:handler:");
+            let f: unsafe extern "C" fn(
+                *const c_void,
+                *const c_void,
+                u64,
+                *const c_void,
+            ) -> *const c_void = std::mem::transmute(objc_msgSend as *const c_void);
+            let _monitor = f(
+                ns_event,
+                add_sel,
+                mask,
+                &MONITOR_BLOCK as *const _ as *const c_void,
+            );
+            // monitor オブジェクトはアプリ終了まで保持（リーク許容。removeMonitor: は不要）
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod key_monitor {
+    pub(super) fn install() {}
+    pub(super) fn set_has_webview(_: bool) {}
+}
+
+/// NSEvent local monitor を設置する（macOS のみ。#326）。
+/// アプリ起動時に 1 回呼ぶ。webview が 1 個以上存在する間だけ有効
+pub fn install_key_monitor() {
+    key_monitor::install();
+}
+
+/// webview の存在状態を更新する。webview 作成/全破棄のたびに呼ぶ
+pub fn set_has_webview(v: bool) {
+    key_monitor::set_has_webview(v);
+}
+
 /// スキーム無しの入力を URL に正規化する（アドレスバー入力・CLI の省略記法）。
 /// ドットも空白も無い単語はそのまま https 扱いにせず検索はしない（ローカル開発が主用途）
 pub fn normalize_url(input: &str) -> String {
@@ -332,6 +542,26 @@ pub fn normalize_url(input: &str) -> String {
         return format!("http://{s}");
     }
     format!("https://{s}")
+}
+
+/// 正規化済み URL を wry へ渡す前に検証する。
+/// NSURL(string:) が nil を返す文字列（空白・制御文字を含む等）を弾き、
+/// wry 内部の unwrap による panic（#334）を防ぐ
+pub fn validate_url(url: &str) -> Result<(), String> {
+    if url.is_empty() {
+        return Err("URL が空です".into());
+    }
+    if url.chars().any(|c| c.is_ascii_whitespace()) {
+        return Err(format!(
+            "URL に空白文字が含まれています（NSURL が解釈できない）: {url}"
+        ));
+    }
+    if url.bytes().any(|b| b < 0x20) {
+        return Err(format!(
+            "URL に制御文字が含まれています（NSURL が解釈できない）: {url}"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -359,5 +589,50 @@ mod tests {
     fn normalize_url_は裸ドメインを_https_に倒す() {
         assert_eq!(normalize_url("example.com"), "https://example.com");
         assert_eq!(normalize_url("  docs.rs/wry "), "https://docs.rs/wry");
+    }
+
+    #[test]
+    fn validate_url_は正常な_url_を通す() {
+        assert!(validate_url("https://example.com").is_ok());
+        assert!(validate_url("http://localhost:3000").is_ok());
+        assert!(validate_url("data:text/html,hello").is_ok());
+        assert!(validate_url("about:blank").is_ok());
+        assert!(validate_url("https://example.com/path?q=1&r=2#frag").is_ok());
+    }
+
+    #[test]
+    fn validate_url_は空白入り_url_を拒否する() {
+        assert!(validate_url("https://github .com").is_err());
+        assert!(validate_url("a b").is_err());
+        assert!(validate_url("hello world").is_err());
+        assert!(validate_url("https://example.com/path with spaces").is_err());
+    }
+
+    #[test]
+    fn validate_url_は空文字を拒否する() {
+        assert!(validate_url("").is_err());
+    }
+
+    #[test]
+    fn validate_url_はスキーム無しのドメインを通す() {
+        assert!(validate_url("https://example.com").is_ok());
+        assert!(validate_url("http://127.0.0.1:8080").is_ok());
+    }
+
+    #[test]
+    fn validate_url_は制御文字を拒否する() {
+        assert!(validate_url("https://example.com/\x01bad").is_err());
+        assert!(validate_url("https://\x00evil.com").is_err());
+    }
+
+    #[test]
+    fn validate_url_は非_ascii_を許容する() {
+        assert!(validate_url("https://xn--example.com/%E6%97%A5%E6%9C%AC%E8%AA%9E").is_ok());
+    }
+
+    #[test]
+    fn validate_url_はタブや改行を拒否する() {
+        assert!(validate_url("https://example.com/\there").is_err());
+        assert!(validate_url("https://example.com/\nhere").is_err());
     }
 }

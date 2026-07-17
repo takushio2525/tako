@@ -203,6 +203,18 @@ claude mcp add --scope user tako -- /Applications/tako.app/Contents/MacOS/tako m
     fi
   fi
 
+  # --- リモート PWA を Cloudflare Pages へデプロイ（失敗は非致命。#297）---
+  # 接続リンクは常に https://tako-remote.pages.dev を指すため、リリース公開時に
+  # Pages 側の PWA も同時に最新化する（--draft では実行しない）
+  if [[ $PUBLISH -eq 1 ]]; then
+    echo "==> リモート PWA を Cloudflare Pages へデプロイ"
+    if "$REPO_ROOT/scripts/deploy-pages.sh"; then
+      echo "    Pages デプロイ完了"
+    else
+      echo "WARN: Pages デプロイに失敗（GitHub Release は作成済み）。手動リカバリ: scripts/deploy-pages.sh" >&2
+    fi
+  fi
+
   echo "==> リリース完了"
 else
   echo ""
