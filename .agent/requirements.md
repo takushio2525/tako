@@ -26,6 +26,19 @@
 > しない（master も同様に CLI のみ）。起動後に solo / master が行う操作（split / send /
 > read 等）はすべて既存 MCP ツールで等価に実行可能なので、フルコントロール不変条件は保たれる。
 
+> 例外（設計原則 5・2026-07-17・#283 remote 機器ペアリング認証）:
+> **リモート端末のペアリング承認・role 昇格は Mac 側 GUI のダイアログ限定**とし、
+> MCP / CLI に承認 API を提供しない。理由 = これは「tako を操作する権限を新しい端末へ
+> 付与する」セキュリティ境界の操作であり、AI（= すでに tako を操作している主体）が
+> 自分で承認できてしまうと二層認証の第二層（人間による物理的な承認）が無意味になる。
+> 承認だけは必ず Mac の前にいる人間の手を経由させる。
+> 一方、リモートの **start / stop / status / devices list / devices revoke** は
+> MCP（`tako_remote_start` / `tako_remote_stop` / `tako_remote_status` /
+> `tako_remote_devices`）と CLI（`tako remote …`）に 1:1 で公開し、この 5 操作については
+> フルコントロール不変条件を維持する（tailnet 内限定露出 + 失効は AI からも行える方が安全側）。
+> 承認 API（`/api/admin/pair/approve` / `deny`）はローカル管理トークン（`<state_dir>/
+> tako-remote.token`、0600）で保護され、同一 Mac 上の tako-app GUI からしか到達できない。
+
 ## FR-1 ターミナル基盤
 
 | ID | 要件 | 優先度 |
@@ -778,6 +791,24 @@ FR-2.7.6 は画像ペインを並べて実現する）。
   出る）構造が、ー 退避の前提となる
 
 実装詳細は `architecture.md`「Phase 5.5: tmux バックエンド永続化」節。
+
+## FR-6 リモートアクセス（スマホから）
+
+> スマホのブラウザから tako のペインを閲覧・操作する。transport は Tailscale Serve
+> 一本（tailnet 内限定・WireGuard E2E 暗号化・恒久固定 URL）。認証は機器ペアリングの
+> 二層認証。全面刷新の計画は `.agent/plans/tako-remote-plan.md`（Issue #278 エピック）が正。
+
+| ID | 要件 | 優先度 | 状況 |
+|---|---|---|---|
+| FR-6.1 | daemon は `127.0.0.1` のみ bind し、`tailscale serve` が HTTPS:443 → localhost へプロキシして tailnet 内へ公開する。未セットアップ（未導入・未ログイン・HTTPS 未有効）の `remote start` は不足項目を列挙して拒否し `tako remote setup` へ誘導する | M | ✅ #282 |
+| FR-6.2 | PWA は daemon 自身が静的配信する（同一 origin・バージョン一致）。公開 Pages 配信は廃止。SW キャッシュの古いシェルは `/api/health` の version と PWA 埋め込み版の不一致で検出しキャッシュ破棄 + 再読み込みを促す | M | ✅ #283 |
+| FR-6.3 | **層① Tailscale identity 検証**: `tailscale serve` が付与する `X-Forwarded-For` の接続元 IP を `tailscale whois` で照合し、tailnet 上の実在ノードのみ通す。ヘッダ無し（serve を経由しないローカル直結）・`peer not found`（偽装 IP）は拒否する（弾 0 実測: serve はクライアントの偽ヘッダを完全上書きする） | M | ✅ #283 |
+| FR-6.4 | **層② 機器ペアリング**: ノードの恒久 ID（`Node.StableID`）をデバイス識別子として `<state_dir>/devices.json`（0600・atomic 書き込み・破損時は起動拒否）と照合する。未登録端末はペアリング要求（`POST /api/pair`）だけができ、画面データを 1 バイトも受け取れない。role = **Observe**（画面閲覧のみ・既定）⊂ **Interact**（+ 入力）⊂ **Manage**（+ close / resize）⊂ **Admin**（+ 端末管理）。role 不足の操作は 403 | M | ✅ #283 |
+| FR-6.5 | **ペアリング承認・role 昇格は Mac 側 GUI ダイアログ限定**（設計原則 5 の例外。冒頭に理由明記）。承認 API はローカル管理トークン（`<state_dir>/tako-remote.token`、0600）+ ローカル直結限定で保護し、serve 経由（`X-Forwarded-For` あり）の管理 API アクセスは管理トークンが正しくても拒否 + 監査記録する | M | ✅ #283 |
+| FR-6.6 | **端末失効の即時反映**: `tako remote devices revoke <id>` / MCP `tako_remote_devices` / GUI から失効でき、接続中端末の WS を即時切断する（broadcaster の subscriber をデバイス単位で drop）。長寿命 bearer token / QR への token 埋め込み / `--show-token` は全廃（QR は恒久固定 URL のみ） | M | ✅ #283 |
+| FR-6.7 | **interact session の idle timeout**（既定 15 分）+ **接続開始終了・操作開始の macOS 通知**（osascript・`TAKO_REMOTE_NO_NOTIFY=1` で抑止）+ **status bar インジケータ**（接続端末数・承認待ちバッジ）とクリックで端末一覧・kill switch（全遮断 = `tako remote stop` 相当） | M | ✅ #283 |
+| FR-6.8 | **監査 metadata**: 接続開始終了・ペアリング・入力 byte 数・revoke を `<state_dir>/audit.log`（JSONL・256KB ローテート）へ記録する。**ペイン内容・入力テキストは記録しない**（診断ログ規約の維持。ペインログ FR-5.13 と異なりこちらは内容を持たない） | M | ✅ #283 |
+| FR-6.9 | start / stop / status / devices list / devices revoke は MCP・CLI に 1:1 公開（フルコントロール維持）。承認・role 昇格のみ GUI 限定（FR-6.5） | M | ✅ #283 |
 
 ## NFR 非機能要件
 

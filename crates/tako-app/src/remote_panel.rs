@@ -68,6 +68,30 @@ pub fn apply_admin_state(state: &mut RemoteUiState, value: &Value) {
         .retain(|id, _| pending_ids.contains(id.as_str()));
 }
 
+/// リモート GUI が最前面に出すオーバーレイの種別。承認ダイアログを最優先にする
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteOverlay {
+    /// ペアリング / 昇格の承認ダイアログ（承認待ちがある）
+    Pairing,
+    /// 端末一覧ポップオーバー（panel_open）
+    Panel,
+    /// 何も出さない
+    None,
+}
+
+/// UI 状態からどのオーバーレイを出すか決める（描画と分離した純粋判定）。
+/// 承認待ちがあれば必ず承認ダイアログを最優先で出す = 未登録端末が接続しても
+/// Mac 側の承認操作が確実に前面に現れる（#283）
+pub fn overlay_kind(state: &RemoteUiState) -> RemoteOverlay {
+    if !state.pending.is_empty() {
+        RemoteOverlay::Pairing
+    } else if state.panel_open {
+        RemoteOverlay::Panel
+    } else {
+        RemoteOverlay::None
+    }
+}
+
 /// role の 4 段階（弱い順）。承認ダイアログの選択肢に使う
 const ROLES: &[(&str, &str)] = &[
     ("observe", "Observe（画面閲覧のみ）"),
@@ -269,15 +293,15 @@ impl TakoApp {
     /// 承認ダイアログ + 端末一覧ポップオーバーのオーバーレイ（ウィンドウ全面）。
     /// 承認待ちがあれば承認ダイアログを最優先で出す
     pub(crate) fn render_remote_overlay(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
-        // 承認ダイアログ（承認待ちを 1 件ずつ処理する。最優先）
-        if let Some(req) = self.remote.pending.first() {
-            return Some(self.render_pairing_dialog(req, cx));
+        match overlay_kind(&self.remote) {
+            RemoteOverlay::Pairing => {
+                // 承認待ちを 1 件ずつ処理する（overlay_kind が Some を保証）
+                let req = self.remote.pending.first().expect("overlay_kind の保証");
+                Some(self.render_pairing_dialog(req, cx))
+            }
+            RemoteOverlay::Panel => Some(self.render_remote_panel(cx)),
+            RemoteOverlay::None => None,
         }
-        // 端末一覧ポップオーバー
-        if self.remote.panel_open {
-            return Some(self.render_remote_panel(cx));
-        }
-        None
     }
 
     /// ペアリング / 昇格承認ダイアログ（GUI 限定経路。#283）
@@ -660,5 +684,25 @@ mod tests {
     fn 停止中はconnected_countが0() {
         let state = RemoteUiState::default();
         assert_eq!(state.connected_count(), 0);
+    }
+
+    #[test]
+    fn overlay_kindは承認待ちを最優先で出す() {
+        let mut state = RemoteUiState::default();
+        // 何も無ければ None
+        assert_eq!(overlay_kind(&state), RemoteOverlay::None);
+        // panel_open だけなら Panel
+        state.panel_open = true;
+        assert_eq!(overlay_kind(&state), RemoteOverlay::Panel);
+        // 承認待ちがあれば panel より承認ダイアログが優先
+        state.pending = vec![json!({ "device_id": "nX", "name": "iPhone" })];
+        assert_eq!(
+            overlay_kind(&state),
+            RemoteOverlay::Pairing,
+            "承認待ちは panel_open より優先して前面に出る"
+        );
+        // 承認待ちが消えれば panel に戻る
+        state.pending.clear();
+        assert_eq!(overlay_kind(&state), RemoteOverlay::Panel);
     }
 }

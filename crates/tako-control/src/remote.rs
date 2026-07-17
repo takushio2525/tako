@@ -879,8 +879,18 @@ pub fn run_daemon(port: Option<u16>) -> io::Result<()> {
         ));
     }
 
-    // Tailscale setup 検証 + serve 設定（不足があればここで起動拒否）
-    let (ts_cli, base_url) = establish_tailscale_serve(actual_port)?;
+    // Tailscale setup 検証 + serve 設定（不足があればここで起動拒否）。
+    // e2e 検証モード（TAKO_REMOTE_TEST_MODE=1）では実 tailscale serve を張らず、
+    // ts CLI パスと fake base URL だけを用意する（本番 tailnet の serve 設定を壊さず、
+    // localhost 直叩き + fake identity 注入で認証層を実測するため。#283 の実測方針）。
+    // このモードは 127.0.0.1 bind のまま = 外部到達経路は増えない
+    let test_mode = std::env::var("TAKO_REMOTE_TEST_MODE").is_ok_and(|v| v == "1");
+    let (ts_cli, base_url) = if test_mode {
+        let cli = crate::tailscale::find_tailscale().unwrap_or_else(|| "tailscale".to_string());
+        (cli, format!("http://127.0.0.1:{actual_port}"))
+    } else {
+        establish_tailscale_serve(actual_port)?
+    };
 
     // ローカル管理トークン生成（/api/admin/* 専用。リモート端末には渡らない。#283）
     let token = crate::generate_token()?;
@@ -948,7 +958,10 @@ pub fn run_daemon(port: Option<u16>) -> io::Result<()> {
     // 公開 URL を state ファイルに残す（`tako remote status` が接続リンクを再構成するため）
     if let Err(e) = write_secret_file(&url_path(), &base_url) {
         // 起動情報の整合が取れないため中止する。設定した serve と state を片付ける
-        let _ = crate::tailscale::serve_stop_if_ours(&ts_cli, actual_port);
+        // （test_mode では serve を張っていないので触らない = 本番設定を壊さない）
+        if !test_mode {
+            let _ = crate::tailscale::serve_stop_if_ours(&ts_cli, actual_port);
+        }
         cleanup_state_files();
         return Err(io::Error::other(format!(
             "URL ファイルの書き出しに失敗: {e}"
@@ -1019,8 +1032,11 @@ pub fn run_daemon(port: Option<u16>) -> io::Result<()> {
     }
 
     // クリーンアップ: 自分が公開に使った serve 設定のみ解除する
-    if let Err(e) = crate::tailscale::serve_stop_if_ours(&ts_cli, actual_port) {
-        eprintln!("tailscale serve の解除に失敗（tailscale serve --https=443 off で手動解除できます）: {e}");
+    // （test_mode では serve を張っていないので触らない = 本番設定を壊さない）
+    if !test_mode {
+        if let Err(e) = crate::tailscale::serve_stop_if_ours(&ts_cli, actual_port) {
+            eprintln!("tailscale serve の解除に失敗（tailscale serve --https=443 off で手動解除できます）: {e}");
+        }
     }
     cleanup_state_files();
 

@@ -3,6 +3,32 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — remote 全面刷新（統合ブランチ `renewal/remote-transport`。v0.6.0 で一括リリース予定）
+
+このセクションは破壊的変更を含むため、統合ブランチで積み上げ、レビュー後に main へ
+マージして v0.6.0 として出荷する（夜間自動リリースには乗せない）。
+
+### Breaking / Security
+
+- **remote transport を Tailscale Serve へ一本化** (#282): Quick Tunnel / Cloudflare relay
+  Worker / 公開 Pages PWA / URL 埋め込みトークン / `--insecure` 平文 LAN モードを廃止。
+  接続は tailnet 内限定・WireGuard E2E 暗号化・恒久固定 URL のみ。
+  *Migrate the remote transport to Tailscale Serve; remove Quick Tunnel, the Cloudflare relay
+  Worker, public Pages hosting, URL-embedded tokens, and the plaintext LAN mode.*
+- **機器ペアリング二層認証を実装 + PWA を daemon 配信化** (#283):
+  - 層① Tailscale identity 検証（`tailscale whois` で接続元ノードを照合）+
+    層② 機器ペアリング（Mac 承認ダイアログ・role = observe/interact/manage/admin・
+    devices.json 永続化）。未登録端末は画面データを 1 バイトも受け取れない。
+  - 長寿命 bearer token / QR の token 埋め込み / `tako remote status --show-token` を全廃。
+  - 端末失効の即時反映（接続中の WS を即切断）・interact idle timeout（15 分）・
+    接続開始終了の macOS 通知・status bar インジケータ + kill switch・監査ログ
+    （内容は記録しない）。
+  - PWA を daemon の静的配信へ（同一 origin・バージョン一致）。ペアリング画面を新設。
+  - CLI `tako remote devices list/revoke` + MCP `tako_remote_devices`（計 92 ツール）。
+    **承認・権限昇格は Mac GUI 限定**（AI フルコントロール不変条件の明示的な例外）。
+  *Implement two-layer device-pairing authentication and serve the PWA from the daemon
+  (same-origin, version-matched); approval and role elevation are Mac-GUI-only.*
+
 ## [0.5.5] - 2026-07-17
 
 Nightly patch release (automated). Changes since v0.5.4:
