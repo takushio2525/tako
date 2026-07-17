@@ -9986,10 +9986,6 @@ impl TakoApp {
                             }),
                     ),
             )
-            // 子ワーカードロップダウン（カンプ: w282 / radius 9。ヘッダ下に絶対配置）
-            .when(workers_menu_open, |d| {
-                d.child(self.render_workers_menu(pane_id, &workers, cx))
-            })
             .child(
                 // テキスト領域: サブラインスクロール（#159）のため行スタックを
                 // absolute 配置し、fract 行ぶん上へずらして描画する（overflow_hidden で
@@ -10114,6 +10110,11 @@ impl TakoApp {
                             .child("×"),
                     )
             }))
+            // 子ワーカードロップダウン（カンプ: w282 / radius 9。ヘッダ下に絶対配置）
+            // ターミナルテキストエリアより後に描画し、背後が透けないようにする（#341）
+            .when(workers_menu_open, |d| {
+                d.child(self.render_workers_menu(pane_id, &workers, cx))
+            })
             .into_any_element()
     }
 }
@@ -19578,10 +19579,6 @@ mod self_test {
     }
 }
 
-/// 特殊キー → PTY 送出バイト列の総点検（バイトレベル検証）。
-/// 実 IME / GUI を起動できない CI でもキーエンコードの退行を捕まえる
-/// ホイールデルタの行換算。整数化できた行数と持ち越す端数を返す。
-/// 方向が反転したら端数を捨てる（逆向きの貯金で初動が重くなるのを防ぐ）
 /// .git ディレクトリが祖先に存在するかの軽量チェック（プロセス spawn なし。#313）
 fn has_git_ancestor(dir: &std::path::Path) -> bool {
     let mut cur = dir;

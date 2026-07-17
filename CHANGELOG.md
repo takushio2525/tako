@@ -20,6 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed / 修正
 
+- master ペインの workers ドロップダウンの一覧項目に背景色がなく背後のターミナル文字が透けて見える問題を修正: GPUI の描画順でメニューがターミナルテキストエリアの前に描画されていたのをペイン div の最後尾に移動 (#341)
+  Fixed workers dropdown list items having no background with terminal text bleeding through: moved the absolute-positioned menu to be painted last within the pane div, after the terminal text area (#341)
 - PDF プレビューのリンク ⌘クリックが無反応だった問題を根治: ページ画像 bounds をテキストレイヤからの逆算ではなく描画時に直接記録する方式に変更。テキストのないページでもリンクが動作し、全描画ページのリンクをチェック、ホバー時のカーソル変化 + 下線ハイライトを追加 (#315)
   Fixed PDF preview link Cmd+click being unresponsive: page image bounds are now recorded directly during rendering instead of reverse-estimated from text layers. Links work on text-free pages, hit-testing checks all rendered pages, and hover visual feedback (cursor + underline) was added (#315)
 - sleep-guard: 蓋閉じ運用時にディスプレイが点灯したままになる問題を修正。disablesleep=1 中に蓋閉じを検知したら pmset displaysleepnow で画面だけ消灯 (#311)

@@ -75,10 +75,7 @@ pub fn detect_permission_dialog(lines: &[String]) -> Option<PermissionDialog> {
 
     for line in lines {
         let trimmed = line.trim();
-        if trimmed.is_empty()
-            || trimmed.starts_with("Press enter")
-            || trimmed.starts_with("Esc ")
-        {
+        if trimmed.is_empty() || trimmed.starts_with("Press enter") || trimmed.starts_with("Esc ") {
             continue;
         }
         // 選択カーソル ❯ / > を除去した内容テキスト。
