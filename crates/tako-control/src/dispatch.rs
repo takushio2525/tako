@@ -1868,6 +1868,21 @@ fn dispatch_inner(
                 .map_err(DispatchError::Operation)
         }
 
+        // ペアリング済み端末の管理（#283）。承認・role 変更はここに存在しない
+        // （Mac 画面の GUI ダイアログ限定 = AI フルコントロール不変条件の例外）
+        Request::RemoteDevices { action, device_id } => match action.as_str() {
+            "list" => crate::remote::devices_list().map_err(DispatchError::Operation),
+            "revoke" => {
+                let id = device_id.ok_or_else(|| {
+                    DispatchError::Operation("revoke には device_id が必要".to_string())
+                })?;
+                crate::remote::devices_revoke(&id).map_err(DispatchError::Operation)
+            }
+            other => Err(DispatchError::Operation(format!(
+                "不明な action: {other}（list / revoke）"
+            ))),
+        },
+
         Request::RemoteScrollback { pane_id, lines } => {
             let result = crate::remote::scrollback(&pane_id, lines.unwrap_or(1000))
                 .map_err(DispatchError::Operation)?;

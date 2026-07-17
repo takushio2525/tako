@@ -600,6 +600,16 @@ pub enum Request {
     },
     /// ペインのスクロールバック履歴をプレーンテキストで取得（Issue #42 履歴レイヤー用）
     RemoteScrollback { pane_id: String, lines: Option<u32> },
+    /// ペアリング済み端末の管理（#283）。`action`:
+    /// - "list": 登録済み端末と保留中のペアリング要求を一覧
+    /// - "revoke": `device_id` の登録を失効（接続中なら即時切断）
+    ///
+    /// ペアリングの承認・role 変更はここに**存在しない**: Mac 画面の GUI ダイアログ
+    /// でのみ行う（AI フルコントロール不変条件の例外。`.agent/requirements.md`）
+    RemoteDevices {
+        action: String,
+        device_id: Option<String>,
+    },
     /// Web ビューペインの操作（FR-3.8、Issue #155）。ネイティブ webview
     /// （macOS = WKWebView）をペインとして表示・管理する。`action`:
     /// - "open": `url` を新しい Web ビューペインで開く（`pane` を `direction` 方向に分割）

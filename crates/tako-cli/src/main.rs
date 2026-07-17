@@ -699,11 +699,27 @@ enum RemoteCommand {
         #[arg(long, default_value_t = 1000)]
         lines: u32,
     },
+    /// ペアリング済み端末の管理（一覧・失効。承認は Mac 画面のダイアログでのみ行う）
+    Devices {
+        #[command(subcommand)]
+        command: RemoteDevicesCommand,
+    },
     /// [内部用] HTTP サーバーをフォアグラウンドで起動する（start から自動呼び出し）
     Serve {
         /// サーバーのポート番号（省略時は 7749）
         #[arg(long, default_value_t = 7749)]
         port: u16,
+    },
+}
+
+#[derive(Subcommand)]
+enum RemoteDevicesCommand {
+    /// 登録済み端末と保留中のペアリング要求を一覧する
+    List,
+    /// 端末の登録を失効させる（接続中なら即時切断される）
+    Revoke {
+        /// 対象デバイス ID（`tako remote devices list` で確認できる）
+        device_id: String,
     },
 }
 
@@ -1737,6 +1753,7 @@ fn main() -> ExitCode {
         Command::Remote(RemoteCommand::Scrollback { pane_id, lines }) => {
             remote_scrollback(&pane_id, lines)
         }
+        Command::Remote(RemoteCommand::Devices { command }) => remote_devices(command),
         // FDA チェックはローカル処理（IPC 不要。ファイルシステムのみ）
         Command::Fda(ref sub) => fda_local(sub),
         // スリープ防止もローカル処理（IPC 不要。設定ファイルの読み書きのみ）
@@ -2408,6 +2425,20 @@ fn remote_stop(force: bool) -> Result<(), String> {
 fn remote_status() -> Result<(), String> {
     let status = tako_control::remote::daemon_status();
     println!("{}", pretty_json(&status));
+    Ok(())
+}
+
+/// `tako remote devices` — ペアリング済み端末の一覧・失効。
+/// ペアリングの承認・role 変更は Mac 画面の GUI ダイアログでのみ行う
+/// （AI フルコントロール不変条件の例外。`.agent/requirements.md`）
+fn remote_devices(command: RemoteDevicesCommand) -> Result<(), String> {
+    let result = match command {
+        RemoteDevicesCommand::List => tako_control::remote::devices_list()?,
+        RemoteDevicesCommand::Revoke { device_id } => {
+            tako_control::remote::devices_revoke(&device_id)?
+        }
+    };
+    println!("{}", pretty_json(&result));
     Ok(())
 }
 

@@ -1455,6 +1455,31 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_remote_devices",
+            "description": "リモート接続のペアリング済み端末を管理する（#283 機器ペアリング認証）。\
+                action=list で登録済み端末（id・名前・role・最終アクセス）と保留中の\
+                ペアリング要求を一覧、action=revoke で device_id の登録を失効させる\
+                （接続中の端末は即時切断される）。\
+                ペアリングの承認・role 変更はこのツールでは行えない: Mac 画面に表示される\
+                承認ダイアログでユーザー本人だけが操作できる（セキュリティ境界のため AI には\
+                承認 API を提供しない）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string", "enum": ["list", "revoke"],
+                        "description": "list = 端末一覧 / revoke = 登録失効",
+                    },
+                    "device_id": {
+                        "type": "string",
+                        "description": "revoke の対象デバイス ID（list で確認できる）",
+                    },
+                },
+                "required": ["action"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_web",
             "description": "ネイティブ Web ビューペインの操作（FR-3.8）。macOS の WKWebView を \
                 ペインとして表示し、ユーザーはクリック・スクロール・文字入力を直接行える。\
@@ -2667,6 +2692,10 @@ fn build_request(
             session_id: str_arg(args, "session_id")?.ok_or("session_id を指定する")?,
             tail: u64_arg(args, "tail")?.map(|n| n as usize),
         },
+        "tako_remote_devices" => Request::RemoteDevices {
+            action: str_arg(args, "action")?.ok_or("action を指定する（list / revoke）")?,
+            device_id: str_arg(args, "device_id")?,
+        },
         "tako_remote_scrollback" => Request::RemoteScrollback {
             pane_id: str_arg(args, "pane_id")?
                 .ok_or("pane_id を指定する")?
@@ -3554,7 +3583,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 91);
+        assert_eq!(tools.len(), 92);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
