@@ -221,6 +221,48 @@ enum Command {
     /// worker タスクの進行状態を永続化し、クラッシュや利用上限からの resume を可能にする
     #[command(subcommand)]
     Task(TaskCommand),
+    /// ユーザー入力が必要なコマンドを可視ペインに委譲する（Issue #305）。
+    /// split → タイトル設定 → コマンド投入をアトミックに実行し、pane_id を返す。
+    /// --wait で完了まで待って exit code を返す
+    #[command(name = "run-interactive")]
+    RunInteractive(RunInteractiveArgs),
+    /// run-interactive で起動したペインの完了状態を確認する。
+    /// exit code マーカーを探し、見つかれば auto_close 方針に従い処理する
+    #[command(name = "run-interactive-status")]
+    RunInteractiveStatus(RunInteractiveStatusArgs),
+}
+
+#[derive(Args)]
+struct RunInteractiveArgs {
+    /// 実行するコマンド文字列
+    command: String,
+    /// ユーザーへの入力案内（タイトルに表示。省略時はコマンド文字列）
+    #[arg(long)]
+    hint: Option<String>,
+    /// 分割の基準ペイン ID（省略時は呼び出し元。--tab と排他）
+    #[arg(long, conflicts_with = "tab")]
+    pane: Option<u64>,
+    /// 分割先タブ ID（--pane と排他）
+    #[arg(long)]
+    tab: Option<u64>,
+    /// 下に分割
+    #[arg(long)]
+    down: bool,
+    /// 新ペイン側の取り分（0.0–1.0、省略時は 0.3）
+    #[arg(long)]
+    ratio: Option<f32>,
+    /// 完了後の自動 close 方針（success / always / never。省略時は success）
+    #[arg(long, default_value = "success")]
+    auto_close: String,
+    /// 完了まで待って exit code を返す（ポーリング）
+    #[arg(long)]
+    wait: bool,
+}
+
+#[derive(Args)]
+struct RunInteractiveStatusArgs {
+    /// 対象ペイン ID
+    pane: u64,
 }
 
 #[derive(Args)]
@@ -1813,6 +1855,8 @@ fn main() -> ExitCode {
         Command::Agents(ref sub) => agents_local(sub),
         // レイアウト復旧もローカル処理（GUI 死亡・縮退保存後の復旧手段のため IPC 不要が本質）
         Command::Recover(ref args) => recover_local(args),
+        // run-interactive --wait は起動 + ポーリングの合成
+        Command::RunInteractive(ref args) if args.wait => run_interactive_wait(&cli.command),
         command => run(command),
     };
     match result {
@@ -3910,6 +3954,30 @@ fn build_request(command: &Command) -> Result<Request, String> {
             // gate は main() でローカル処理。ここには来ない
             TaskCommand::Gate(_) => unreachable!("gate は main() でローカル処理する"),
         },
+        Command::RunInteractive(ref args) => {
+            let direction = if args.down {
+                Some(Direction::Down)
+            } else {
+                Some(Direction::Right)
+            };
+            Request::RunInteractive {
+                pane: if args.tab.is_some() {
+                    None
+                } else {
+                    target_pane(args.pane)?
+                },
+                tab: args.tab,
+                command: args.command.clone(),
+                input_hint: args.hint.clone(),
+                direction,
+                ratio: args.ratio,
+                auto_close: Some(args.auto_close.clone()),
+            }
+        }
+        Command::RunInteractiveStatus(ref args) => Request::RunInteractiveStatus {
+            pane: args.pane,
+            no_wait: false,
+        },
     })
 }
 
@@ -3971,6 +4039,35 @@ fn ledger_cli(sub: &LedgerCommand) -> Result<(), String> {
             let removed = ledger::Ledger::mutate(|l| l.prune_by_project_prefix(project_prefix))?;
             println!("pruned: {removed} entries with project prefix '{project_prefix}'");
             Ok(())
+        }
+    }
+}
+
+/// run-interactive --wait: 起動 → ポーリングで完了待ち → exit code を返す
+fn run_interactive_wait(command: &Command) -> Result<(), String> {
+    let request = build_request(command)?;
+    let result = send_request(request)?;
+    let pane = result["pane"]
+        .as_u64()
+        .ok_or("run-interactive が pane ID を返さなかった")?;
+    println!(
+        "pane {pane} で対話コマンドを起動しました（status: {}）",
+        result["status"].as_str().unwrap_or("?")
+    );
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let status = send_request(Request::RunInteractiveStatus {
+            pane,
+            no_wait: false,
+        })?;
+        if status["status"].as_str() == Some("exited") {
+            println!("{}", pretty_json(&status));
+            let code = status["exit_code"].as_i64().unwrap_or(1);
+            if code != 0 {
+                return Err(format!("コマンドが exit code {code} で終了"));
+            }
+            return Ok(());
         }
     }
 }
@@ -4398,6 +4495,12 @@ fn print_result(command: &Command, result: &Value) {
         }
         // gate は main() でローカル処理。ここには来ない
         Command::Task(_) => println!("{}", pretty_json(result)),
+        Command::RunInteractive(_) => {
+            println!("{}", pretty_json(result));
+        }
+        Command::RunInteractiveStatus(_) => {
+            println!("{}", pretty_json(result));
+        }
         // remote は run() → print_result を通らない
         _ => {}
     }
@@ -4897,6 +5000,50 @@ mod tests {
                 pane: None,
                 tab: Some(3),
                 title: "実験 用".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn run_interactiveのパースと変換() {
+        let command = parse(&[
+            "tako",
+            "run-interactive",
+            "sudo systemctl start foo",
+            "--hint",
+            "sudo password",
+            "--pane",
+            "5",
+            "--down",
+            "--ratio",
+            "0.4",
+            "--auto-close",
+            "always",
+        ]);
+        let request = build_request(&command).unwrap();
+        assert_eq!(
+            request,
+            Request::RunInteractive {
+                pane: Some(5),
+                tab: None,
+                command: "sudo systemctl start foo".into(),
+                input_hint: Some("sudo password".into()),
+                direction: Some(Direction::Down),
+                ratio: Some(0.4),
+                auto_close: Some("always".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn run_interactive_statusのパースと変換() {
+        let command = parse(&["tako", "run-interactive-status", "42"]);
+        let request = build_request(&command).unwrap();
+        assert_eq!(
+            request,
+            Request::RunInteractiveStatus {
+                pane: 42,
+                no_wait: false,
             }
         );
     }

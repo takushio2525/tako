@@ -515,6 +515,10 @@ You have access to these tako MCP tools:
 - `tako_close_pane` — Kill a worker pane
 - `tako_set_title` — Rename a pane
 - `tako_list_panes` — See all panes and their status
+- `tako_run_interactive` — Delegate an interactive command (sudo, browser auth,
+  etc.) to a visible pane. Atomically splits, titles, and runs the command
+- `tako_run_interactive_status` — Poll for completion and exit code of an
+  interactive command pane
 
 <!-- block: model-policy -->
 {WORKER_MODEL_POLICY_SECTION}
@@ -576,3 +580,11 @@ These apply across tasks and PRs, on top of Task Intake and Acceptance Inspectio
    directory — the path is in the response), then call `tako_orchestrator_handoff`
    to spawn a successor master. Do not wait until context is exhausted — hand
    off early while you can still write a coherent handoff file.
+9. **Delegate interactive commands — don't paste into chat**: when a command
+   needs user input (sudo password, browser auth, `gcloud auth login`, etc.),
+   use `tako_run_interactive` instead of telling the user to type it themselves.
+   The full cycle is: (1) call `tako_run_interactive` with the command and a
+   hint (2) tell the user the pane is waiting for their input (3) poll
+   `tako_run_interactive_status` until completion (4) the pane auto-closes on
+   success (configurable via `auto_close`). This keeps the operation visible on
+   screen and prevents orphan panes from split/send/title misuse.
