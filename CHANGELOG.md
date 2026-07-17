@@ -14,6 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed / 修正
 
+- sleep-guard: 蓋閉じ運用時にディスプレイが点灯したままになる問題を修正。disablesleep=1 中に蓋閉じを検知したら pmset displaysleepnow で画面だけ消灯 (#311)
+  sleep-guard: fixed display staying on when lid is closed with disablesleep=1. Now forces display sleep via pmset displaysleepnow when lid closure is detected while system sleep is disabled (#311)
 - TAKO_ISOLATED の隔離セルフテストが本番 ledger.yaml に書き込む問題を修正: orchestrator の config_dir を data_dir() ベースに切り替え + ledger prune コマンドの追加（CLI / MCP 1:1）(#303)
   Fixed isolated selftest writing to production ledger.yaml: switched orchestrator config_dir to data_dir()-based resolution (respects TAKO_DATA_DIR / TAKO_ISOLATED) + added ledger prune action for cleanup (CLI / MCP 1:1) (#303)
 - MCP 登録パスが消失しても検知・自己修復されない問題を修正: 安定パス優先解決 + ヘルスチェック + master 起動時警告 (#299)

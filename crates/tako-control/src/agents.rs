@@ -329,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn find_ancestor_backendはpane_pidの祖先を辿る() {
+    fn find_ancestor_backend_pane_pid_ancestor() {
         let parents: HashMap<u32, u32> = [(300, 200), (200, 100), (100, 1)].into();
         let backend_pids = vec![("tako-s1".to_string(), 100u32)];
         assert_eq!(
@@ -339,14 +339,14 @@ mod tests {
     }
 
     #[test]
-    fn find_ancestor_backendは無関係なpidでNone() {
+    fn find_ancestor_backend_unrelated_pid_none() {
         let parents: HashMap<u32, u32> = [(999, 500), (500, 1)].into();
         let backend_pids = vec![("tako-s1".to_string(), 100u32)];
         assert_eq!(find_ancestor_backend(999, &parents, &backend_pids), None);
     }
 
     #[test]
-    fn 祖先辿りは循環でも停止する() {
+    fn ancestor_traversal_stops_on_cycle() {
         let parents: HashMap<u32, u32> = [(10, 20), (20, 10)].into();
         let pane_by_pid = HashMap::new();
         assert_eq!(find_ancestor_pane(10, &parents, &pane_by_pid), None);
