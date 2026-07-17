@@ -602,6 +602,20 @@ struct DragScrollState {
     speed_factor: f32,
 }
 
+/// IME 変換状態の対象ペインを解決する（#332）。変換開始時のペインが既に閉じられて
+/// いる場合、候補ウィンドウの位置出しと確定文字列が死んだペインへ向かわないよう
+/// 現在のフォーカスペインへ倒す
+fn resolve_ime_pane(
+    recorded: Option<PaneId>,
+    alive: impl Fn(PaneId) -> bool,
+    focused: PaneId,
+) -> PaneId {
+    match recorded {
+        Some(pane) if alive(pane) => pane,
+        _ => focused,
+    }
+}
+
 struct TakoApp {
     workspace: Workspace,
     terminals: HashMap<PaneId, TerminalSession>,
@@ -647,6 +661,8 @@ struct TakoApp {
     active_pdf_rasters: std::collections::HashSet<PaneId>,
     /// IME 変換中の未確定文字列（FR-1.9。None = 変換中でない）
     ime: Option<ImeComposition>,
+    /// 直近 render のフォーカスペイン（IM 座標キャッシュ更新の変化検知用。#332）
+    last_ime_focus: Option<PaneId>,
     /// ドラッグ中のペイン境界（None = ドラッグしていない）
     dragging_border: Option<DragBorder>,
     /// スクロールバーをドラッグ中のペイン
@@ -1706,6 +1722,7 @@ impl TakoApp {
             pending_pdf_rasters: HashMap::new(),
             active_pdf_rasters: std::collections::HashSet::new(),
             ime: None,
+            last_ime_focus: None,
             dragging_border: None,
             dragging_scrollbar: None,
             hovered_scrollbar: None,
@@ -4248,6 +4265,7 @@ impl TakoApp {
                 self.terminals.remove(&pane_id);
                 self.previews.remove(&pane_id);
                 self.preview_edits.remove(&pane_id);
+                self.discard_ime_for_pane(pane_id);
                 self.video_players.remove(&pane_id);
                 self.remove_video_frame_cache(pane_id);
                 self.remove_preview_image_cache(pane_id);
@@ -4307,6 +4325,7 @@ impl TakoApp {
                     self.terminals.remove(&id);
                     self.previews.remove(&id);
                     self.preview_edits.remove(&id);
+                    self.discard_ime_for_pane(id);
                     self.video_players.remove(&id);
                     self.remove_video_frame_cache(id);
                     self.remove_preview_image_cache(id);
@@ -6231,10 +6250,25 @@ impl TakoApp {
 
     /// IME 操作の対象ペイン。変換中はその開始ペイン、それ以外はフォーカスペイン
     fn ime_target(&self) -> PaneId {
-        self.ime
-            .as_ref()
-            .map(|ime| ime.pane)
-            .unwrap_or_else(|| self.focused_pane())
+        resolve_ime_pane(
+            self.ime.as_ref().map(|ime| ime.pane),
+            |pane| self.ime_pane_alive(pane),
+            self.focused_pane(),
+        )
+    }
+
+    /// ime.pane がまだ入力先として実在するか（terminal / プレビュー編集のどちらか）（#332）
+    fn ime_pane_alive(&self, pane: PaneId) -> bool {
+        self.terminals.contains_key(&pane) || self.preview_edits.contains_key(&pane)
+    }
+
+    /// ペインが閉じられたとき、そのペインを対象にした IME 変換状態を畳む（#332）。
+    /// 残すと ime_target / 確定書き込みが死んだペインへ向き続け、候補ウィンドウの
+    /// 位置出しと確定文字列の宛先が壊れる
+    fn discard_ime_for_pane(&mut self, pane_id: PaneId) {
+        if self.ime.as_ref().is_some_and(|ime| ime.pane == pane_id) {
+            self.ime = None;
+        }
     }
 
     /// 指定ペインのカーソルセル左上（ウィンドウ座標）。
@@ -10488,6 +10522,7 @@ impl SessionHost for TakoApp {
         self.terminals.remove(&pane);
         self.previews.remove(&pane);
         self.preview_edits.remove(&pane);
+        self.discard_ime_for_pane(pane);
         self.remove_preview_image_cache(pane);
         self.preview_views.remove(&pane);
         self.preview_scroll_handles.remove(&pane);
@@ -11660,32 +11695,39 @@ impl EntityInputHandler for TakoApp {
         self.ime.as_ref().map(|ime| 0..utf16_len(&ime.text))
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // NSTextInputClient の規約: unmark は「未確定文字列をそのまま挿入扱いにする」
         if let Some(ime) = self.ime.take() {
+            // 変換開始ペインが既に閉じられていたらフォーカスペインへ倒す（#332）
+            let pane = if self.ime_pane_alive(ime.pane) {
+                ime.pane
+            } else {
+                self.focused_pane()
+            };
             // 検索バー表示中は検索/置換フィールドへ
             if self
                 .preview_edits
-                .get(&ime.pane)
+                .get(&pane)
                 .is_some_and(|edit| edit.search_visible)
             {
                 if !ime.text.is_empty() {
-                    self.insert_search_char(ime.pane, &ime.text);
+                    self.insert_search_char(pane, &ime.text);
                 }
             } else if let Some(edit) = self
                 .preview_edits
-                .get_mut(&ime.pane)
+                .get_mut(&pane)
                 .filter(|edit| edit.editing)
             {
-                let p = ime.pane;
                 edit.buffer.insert(&ime.text);
                 edit.message = None;
-                self.refresh_preview_from_editor(p);
-                self.schedule_autosave(p);
-                self.start_autosave_timer(p, cx);
-            } else if let Some(session) = self.terminals.get(&ime.pane) {
+                self.refresh_preview_from_editor(pane);
+                self.schedule_autosave(pane);
+                self.start_autosave_timer(pane, cx);
+            } else if let Some(session) = self.terminals.get(&pane) {
                 session.write(ime.text.into_bytes());
             }
+            // 挿入確定でテキストが動いたので IM に文字座標の再計算を促す（zed 準拠。#332）
+            window.invalidate_character_coordinates();
         }
         cx.notify();
     }
@@ -11694,7 +11736,7 @@ impl EntityInputHandler for TakoApp {
         &mut self,
         _range_utf16: Option<Range<usize>>,
         text: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // インライン編集中は IME 確定文字列をインライン入力に振り分ける
@@ -11716,11 +11758,7 @@ impl EntityInputHandler for TakoApp {
             cx.notify();
             return;
         }
-        let pane = self
-            .ime
-            .as_ref()
-            .map(|ime| ime.pane)
-            .unwrap_or_else(|| self.focused_pane());
+        let pane = self.ime_target();
         // 検索バー表示中は入力文字を検索/置換フィールドへ
         if self
             .preview_edits
@@ -11751,20 +11789,25 @@ impl EntityInputHandler for TakoApp {
             self.refresh_preview_from_editor(pane);
             self.schedule_autosave(pane);
             self.start_autosave_timer(pane, cx);
+            window.invalidate_character_coordinates();
             cx.notify();
             return;
         }
-        // 確定（insertText 相当）。変換を開始したペインへ書き、変換状態を畳む
+        // 確定（insertText 相当）。変換を開始したペインへ書き、変換状態を畳む。
+        // 開始ペインが既に閉じられていたらフォーカスペインへ倒す（#332）
         let pane = self
             .ime
             .take()
             .map(|ime| ime.pane)
+            .filter(|pane| self.ime_pane_alive(*pane))
             .unwrap_or_else(|| self.focused_pane());
         self.cancel_scroll_before_input(pane);
         if let Some(session) = self.terminals.get(&pane) {
             session.clear_selection();
             session.write(text.as_bytes().to_vec());
         }
+        // 確定でテキストが動いたので IM に文字座標の再計算を促す（zed 準拠。#332）
+        window.invalidate_character_coordinates();
         cx.notify();
     }
 
@@ -11781,10 +11824,14 @@ impl EntityInputHandler for TakoApp {
         if new_text.is_empty() {
             self.ime = None;
         } else {
+            // 変換継続中は開始ペインを維持する。ただし開始ペインが既に閉じられて
+            // いたらフォーカスペインへ付け替える（stale なまま引き継ぐと以後の
+            // 変換・確定がすべて死んだペインへ向かう。#332）
             let pane = self
                 .ime
                 .take()
                 .map(|ime| ime.pane)
+                .filter(|pane| self.ime_pane_alive(*pane))
                 .unwrap_or_else(|| self.focused_pane());
             self.ime = Some(ImeComposition {
                 pane,
@@ -12193,6 +12240,25 @@ impl Render for TakoApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Issue #168: フレーム構築（element tree 生成）のメインスレッド専有を計測
         let _span = tako_control::diag::perf_span("render");
+        // IME 経路の自己修復（#332）: 外部要因（a11y の Blur アクション等）で GPUI の
+        // focus が失われると Window::handle_input が input handler を登録しなくなり、
+        // 日本語 IM の printable キーが IME を素通りして ASCII のまま terminal へ入り
+        // 続ける（変換候補ウィンドウが二度と出ない。英数入力は on_key_down の root
+        // フォールバックで動き続けるため IME だけ壊れたように見える）。tako は単一
+        // focus_handle 設計で「フォーカスが無い」正当な状態は存在しないため、
+        // None を検知したら即復元する
+        if window.focused(cx).is_none() {
+            window.focus(&self.focus_handle.clone(), cx);
+            window.invalidate_character_coordinates();
+        }
+        // フォーカスペインが変わったら IM に文字座標の再計算を促す（zed の
+        // SelectionsChanged / focus_in 相当。放置すると候補ウィンドウが旧ペインの
+        // 座標キャッシュ位置へ出る。#332）
+        let ime_focus_now = self.focused_pane();
+        if self.last_ime_focus != Some(ime_focus_now) {
+            self.last_ime_focus = Some(ime_focus_now);
+            window.invalidate_character_coordinates();
+        }
         self.drain_preview_image_evictions(window, cx);
         self.preview_device_scale = window.scale_factor();
         // Web ビュー（FR-3.8）: wry の親にするウィンドウハンドルは render でしか
@@ -19867,6 +19933,38 @@ mod self_test {
                 check(tab_ok, "確認ダイアログ: タブの × でダイアログ表示 + キャンセル");
             }
 
+            // 76. IME 経路の自己修復（#332）: 外部要因（a11y の Blur アクション等）で
+            // window.blur() が起きても、次の render で focus が TakoApp へ復元される。
+            // 復元されないと Window::handle_input が input handler を登録しなくなり、
+            // 日本語 IM の printable キーが IME を素通りして ASCII のまま terminal へ
+            // 入り続ける（変換候補ウィンドウが二度と出ない。修正前はこの check が
+            // FAILED = blur が恒久化していた）
+            let _ = any.update(cx, |_, window, _| window.blur());
+            wait(cx, 500).await;
+            let refocused = window
+                .update(cx, |app, window, _| app.focus_handle.is_focused(window))
+                .unwrap_or(false);
+            check(refocused, "IME 経路: blur 後の focus 自己修復 (#332)");
+
+            // 76b. 変換中ペインの close で IME 状態が畳まれる（#332）。
+            // 畳まれないと ime_target / 確定書き込みが死んだペインへ向き続け、
+            // 候補ウィンドウの位置出しと確定文字列の宛先が壊れる
+            let _ = window.update(cx, |app, _, cx| app.split(SplitDirection::Right, cx));
+            wait(cx, 1200).await;
+            let ime_close_ok = window
+                .update(cx, |app, window, cx| {
+                    let target = app.focused_pane();
+                    app.replace_and_mark_text_in_range(None, "へんかん", None, window, cx);
+                    let composing = app.ime.is_some();
+                    app.remove_pane(target, cx);
+                    let cleared = app.ime.is_none();
+                    // 畳んだ後の ime_target がフォーカスペインへ解決されることも固定
+                    let target_ok = app.ime_target() == app.focused_pane();
+                    composing && cleared && target_ok
+                })
+                .unwrap_or(false);
+            check(ime_close_ok, "IME 状態: 変換中ペインの close で畳まれる (#332)");
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -19965,6 +20063,45 @@ fn accumulate_scroll(carry: f32, delta_lines: f32) -> (i32, f32) {
     let total = carry + delta_lines;
     let lines = total.trunc() as i32;
     (lines, total - lines as f32)
+}
+
+#[cfg(test)]
+mod ime_tests {
+    use super::resolve_ime_pane;
+    use tako_core::PaneId;
+
+    // #332: IME 変換状態の対象ペイン解決。変換開始ペインが閉じられた後も
+    // 死んだペインへ向け続けると、候補ウィンドウの位置出し（bounds_for_range が
+    // カーソル解決に失敗してコンテンツ左上へフォールバック）と確定文字列の宛先
+    // （terminals.get = None で入力が虚空へ消える）が壊れる
+
+    #[test]
+    fn 変換中は開始ペインを対象にする() {
+        let started = PaneId::from_raw(1);
+        let focused = PaneId::from_raw(2);
+        assert_eq!(
+            resolve_ime_pane(Some(started), |_| true, focused),
+            started,
+            "生きている開始ペインが対象（変換途中のフォーカス移動で確定先がぶれない）"
+        );
+    }
+
+    #[test]
+    fn 開始ペインが閉じられていたらフォーカスペインへ倒す() {
+        let dead = PaneId::from_raw(1);
+        let focused = PaneId::from_raw(2);
+        assert_eq!(
+            resolve_ime_pane(Some(dead), |_| false, focused),
+            focused,
+            "死んだペインを対象にし続けない（#332 の stale 防御）"
+        );
+    }
+
+    #[test]
+    fn 非変換中はフォーカスペインを対象にする() {
+        let focused = PaneId::from_raw(2);
+        assert_eq!(resolve_ime_pane(None, |_| true, focused), focused);
+    }
 }
 
 #[cfg(test)]
