@@ -1379,6 +1379,36 @@ fn dispatch_inner(
                 "replace": result,
             }))
         }
+        Request::PreviewChangelog {
+            pane,
+            enabled,
+            max_count,
+            expand,
+        } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            if host.preview_state(target).is_none() {
+                return Err(DispatchError::Operation(format!(
+                    "プレビューペインではない: {}",
+                    target.as_u64()
+                )));
+            }
+            if let Some(hash) = expand {
+                return host
+                    .toggle_changelog_diff(target, &hash)
+                    .map_err(DispatchError::Operation);
+            }
+            if let Some(enabled) = enabled {
+                let count = max_count.unwrap_or(50);
+                return host
+                    .set_preview_changelog(target, enabled, count)
+                    .map_err(DispatchError::Operation);
+            }
+            let changelog_on = host.preview_changelog_state(target).unwrap_or(false);
+            Ok(json!({
+                "pane": target.as_u64(),
+                "changelog": changelog_on,
+            }))
+        }
         Request::FileOp {
             op,
             path,
@@ -6894,6 +6924,43 @@ mod tests {
         assert_eq!(preview["preview"]["editing"].as_bool(), Some(true));
         assert_eq!(preview["preview"]["dirty"].as_bool(), Some(false));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn preview_changelogはプレビューペイン以外を拒否する() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let err = dispatch(
+            &mut host,
+            Request::PreviewChangelog {
+                pane: Some(root),
+                enabled: Some(true),
+                max_count: None,
+                expand: None,
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn preview_changelogはプレビューペインで状態取得できる() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        host.previews
+            .insert(root, ("/tmp/test.rs".into(), PreviewModeWire::Code));
+        let result = dispatch(
+            &mut host,
+            Request::PreviewChangelog {
+                pane: Some(root),
+                enabled: None,
+                max_count: None,
+                expand: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["changelog"].as_bool(), Some(false));
     }
 
     #[test]

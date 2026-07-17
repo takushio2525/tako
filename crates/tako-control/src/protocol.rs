@@ -393,6 +393,15 @@ pub enum Request {
         pane: Option<u64>,
         enabled: Option<bool>,
     },
+    /// プレビューのチェンジログビュー切替（Issue #338）。
+    /// `enabled` 省略時は現在の状態取得のみ。`max_count` はコミット取得上限（省略時 50）。
+    /// `expand` はコミットハッシュ指定でそのコミットの diff を展開/折りたたみ。
+    PreviewChangelog {
+        pane: Option<u64>,
+        enabled: Option<bool>,
+        max_count: Option<usize>,
+        expand: Option<String>,
+    },
     /// ファイルシステム操作（FR-3.12）
     FileOp {
         op: FileOpKind,
