@@ -853,3 +853,8 @@
 - codex TUI の `primary NN%` / `secondary NN%` スクレイピング + サービス別メトリクス保持 + ドロップダウン実データ表示。agy は取得不能で「--」維持（調査結果を Issue にコメント）
 - 関連コミット: `690d220`（PR #359 squash merge）。テスト 4 本追加 + 品質ゲート全緑
 - 次: `build-app.sh --install` → 有料プラン codex 環境での実測確認（free tier では rate limit 表示なし）
+
+## 2026-07-17（#287: セキュリティレビュー P1×2 + P2×4 修正）
+- P1-1 XFF identity 偽装対策（XFH 検証追加）、P1-2 PII プレースホルダ化、P2-1〜P2-4（upload 0o600 / 監査ログファイル名除去 / Windows パス redact / symlink 拒否）。threat model 正確化。テスト 9 本追加、全 843 テスト緑
+- 関連コミット: `d008e6c`（`renewal/remote-transport`）。Issue に修正証拠コメント済み
+- 次: master レビュー → main マージ判断 → 実 serve 経由 e2e → v0.6.0
