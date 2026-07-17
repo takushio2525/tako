@@ -22,6 +22,7 @@ mod overlays;
 mod preview;
 mod preview_render;
 mod preview_watch;
+mod remote_panel;
 mod right_panel;
 mod sidebar;
 mod status_bar;
@@ -325,7 +326,7 @@ fn hsla(c: tako_core::Rgb) -> Hsla {
 }
 
 /// 半透明色（スクロールバー等のオーバーレイ用）
-fn rgba_alpha(c: tako_core::Rgb, a: f32) -> Rgba {
+pub(crate) fn rgba_alpha(c: tako_core::Rgb, a: f32) -> Rgba {
     Rgba { a, ..rgba(c) }
 }
 
@@ -868,6 +869,8 @@ struct TakoApp {
     tab_scroll_handle: gpui::ScrollHandle,
     /// 前回 render 時のアクティブタブ ID（タブ切替時のみ自動スクロール発火用。Issue #208）
     last_active_tab: Option<TabId>,
+    /// リモート接続の GUI 状態（#283。承認ダイアログ・接続端末インジケータ・kill switch）
+    remote: remote_panel::RemoteUiState,
 }
 
 /// × ボタン close の確認ダイアログ対象（Issue #172）
@@ -1780,6 +1783,7 @@ impl TakoApp {
             autosave_pending: std::collections::HashSet::new(),
             tab_scroll_handle: gpui::ScrollHandle::new(),
             last_active_tab: None,
+            remote: remote_panel::RemoteUiState::default(),
         };
         // App Nap 無効化 + 初回スリープ防止更新（Issue #173）
         // 蓋閉じ防止の残留チェック（#218: 前回クラッシュ時の disablesleep=1 を自動復帰）
@@ -2209,6 +2213,15 @@ impl TakoApp {
             let mut pane_log_tick: u32 = 0;
             loop {
                 cx.background_executor().timer(Duration::from_secs(2)).await;
+                // リモート接続の承認待ち・接続端末を更新（#283。状態確認 + admin API は
+                // すべて background で行い、UI スレッドをブロックしない。daemon 停止中は
+                // running=false になるだけ）
+                if this
+                    .update(cx, |app: &mut TakoApp, cx| app.refresh_remote_state(cx))
+                    .is_err()
+                {
+                    break;
+                }
                 // ① main thread: tmux コンテキスト + filetree 対象 + view 監視対象 + git を収集（高速）
                 let t0 = std::time::Instant::now();
                 let prep = this.update(cx, |app: &mut TakoApp, _| {
@@ -12212,6 +12225,7 @@ impl Render for TakoApp {
             .children(hover_preview_overlay)
             .children(pinned_overlays)
             .children(self.render_close_confirm_dialog(cx))
+            .children(self.render_remote_overlay(cx))
             .children(self.render_attention_toasts(cx))
             .children(self.render_command_palette(cx))
     }

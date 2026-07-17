@@ -181,6 +181,7 @@ pub mod ui_icon {
     pub const ORCH_ACTIVE: &str = "icons/ui/orch_active.svg";
     pub const PLUS: &str = "icons/ui/plus.svg";
     pub const REFRESH: &str = "icons/ui/refresh.svg";
+    pub const REMOTE: &str = "icons/ui/remote.svg";
     pub const RETRY: &str = "icons/ui/retry.svg";
     pub const SEARCH: &str = "icons/ui/search.svg";
     pub const SPLIT: &str = "icons/ui/split.svg";
