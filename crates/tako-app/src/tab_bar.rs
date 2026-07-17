@@ -117,6 +117,7 @@ impl TakoApp {
         let is_pane_dragging = self.drag_kind == Some(DragKind::Pane);
 
         div()
+            .id("tab-bar")
             .flex()
             .flex_row()
             .items_center()
@@ -130,6 +131,37 @@ impl TakoApp {
             .border_b_1()
             .border_color(hsla(theme.border_subtle))
             .window_control_area(WindowControlArea::Drag)
+            // macOS: タブバー空き領域のドラッグでウインドウ移動（#312）。
+            // GPUI の WindowControlArea::Drag は hitbox 登録のみ。macOS では
+            // on_hit_test_window_control が空実装のため、Zed と同じく
+            // mouse_down → mouse_move で start_window_move() を明示呼び出しする
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, _| {
+                    this.titlebar_dragging = true;
+                }),
+            )
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, _| {
+                    this.titlebar_dragging = false;
+                }),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, _, _| {
+                this.titlebar_dragging = false;
+            }))
+            .on_mouse_move(cx.listener(|this, _, window, _| {
+                if this.titlebar_dragging {
+                    this.titlebar_dragging = false;
+                    window.start_window_move();
+                }
+            }))
+            // ダブルクリックでズーム（macOS 標準操作。#312）
+            .on_click(|event, window, _| {
+                if event.click_count() == 2 {
+                    window.titlebar_double_click();
+                }
+            })
             // native traffic lights の載る領域
             .child(div().w(px(TRAFFIC_LIGHTS_SPACER)).h_full().flex_none())
             // タブ領域（横スクロール対応。Issue #208）

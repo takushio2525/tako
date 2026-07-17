@@ -873,6 +873,8 @@ struct TakoApp {
     tab_scroll_handle: gpui::ScrollHandle,
     /// 前回 render 時のアクティブタブ ID（タブ切替時のみ自動スクロール発火用。Issue #208）
     last_active_tab: Option<TabId>,
+    /// タイトルバー（タブバー領域）のドラッグでウインドウ移動中か（#312）
+    titlebar_dragging: bool,
 }
 
 /// × ボタン close の確認ダイアログ対象（Issue #172）
@@ -1790,6 +1792,7 @@ impl TakoApp {
             autosave_pending: std::collections::HashSet::new(),
             tab_scroll_handle: gpui::ScrollHandle::new(),
             last_active_tab: None,
+            titlebar_dragging: false,
         };
         // App Nap 無効化 + 初回スリープ防止更新（Issue #173）
         // 蓋閉じ防止の残留チェック（#218: 前回クラッシュ時の disablesleep=1 を自動復帰）
@@ -12596,20 +12599,47 @@ fn tako_titlebar_options() -> gpui::TitlebarOptions {
 }
 
 fn open_new_window(cx: &mut App) {
+    open_window_with_bounds(
+        WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx)),
+        cx,
+    );
+}
+
+/// 保存済みレイアウトから復元してウインドウを開く（#312: Dock クリックでの復帰用）
+fn open_restored_window(cx: &mut App) {
+    let saved_frame = tako_control::layout::load().and_then(|l| l.window);
+    let bounds = match saved_frame {
+        Some(f) if f.width >= 200.0 && f.height >= 150.0 => {
+            let bounds = Bounds::new(point(px(f.x), px(f.y)), size(px(f.width), px(f.height)));
+            match f.state.as_str() {
+                "fullscreen" => WindowBounds::Fullscreen(bounds),
+                "maximized" => WindowBounds::Maximized(bounds),
+                _ => WindowBounds::Windowed(bounds),
+            }
+        }
+        _ => WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx)),
+    };
+    open_window_with_bounds(bounds, cx);
+}
+
+fn open_window_with_bounds(window_bounds: WindowBounds, cx: &mut App) {
     let _ = cx
         .open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                    None,
-                    size(px(960.), px(600.)),
-                    cx,
-                ))),
+                window_bounds: Some(window_bounds),
                 titlebar: Some(tako_titlebar_options()),
                 ..Default::default()
             },
             |window, cx| {
                 let view = cx.new(TakoApp::new);
                 window.focus(&view.read(cx).focus_handle.clone(), cx);
+                // 赤ボタン close 時にレイアウトを保存する（#312。quit ではなく
+                // ウインドウ単体の close なので on_app_quit は走らない）
+                let entity = view.clone();
+                window.on_window_should_close(cx, move |_window, cx| {
+                    entity.update(cx, |app, _cx| app.save_layout());
+                    true
+                });
                 view
             },
         )
@@ -12709,74 +12739,87 @@ fn main() {
             eprintln!("warning: --dir で指定されたディレクトリに移動できない: {e}");
         }
     }
-    application()
-        .with_assets(file_icons::TakoAssets)
-        .run(|cx: &mut App| {
-            cx.bind_keys(key_bindings());
-            cx.set_menus(app_menus());
-            cx.on_action(|_: &NewWindow, cx| {
-                open_new_window(cx);
-            });
-            // Quit はグローバルアクションとして登録する（#103: ルート div の on_action
-            // だけだとウィンドウのフォーカスパス上でしか発火せず、フォーカス喪失
-            // （blur）状態では cmd-q もメニューの Quit も無反応になる。GPUI の
-            // アクションディスパッチは path 上で未処理ならグローバルハンドラの
-            // Bubble フェーズへ必ず到達するため、ここならフォーカス状態・
-            // ウィンドウ有無に依存しない）。layout 保存などの終了処理は
-            // on_app_quit（TakoApp::new で登録。Dock 終了でも走る）が担う
-            cx.on_action(|_: &Quit, cx| cx.quit());
-            // 保存済みウィンドウフレームの復元（FR-5。終了前にフルスクリーンなら
-            // フルスクリーンで開く）。セルフテストは既定サイズで決定的に動かす
-            let saved_frame = if std::env::var_os("TAKO_SELF_TEST").is_none() {
-                tako_control::layout::load().and_then(|l| l.window)
-            } else {
-                None
-            };
-            let window_bounds = match saved_frame {
-                // 壊れた保存値（極端に小さい等）は既定へフォールバック
-                Some(f) if f.width >= 200.0 && f.height >= 150.0 => {
-                    let bounds =
-                        Bounds::new(point(px(f.x), px(f.y)), size(px(f.width), px(f.height)));
-                    match f.state.as_str() {
-                        "fullscreen" => WindowBounds::Fullscreen(bounds),
-                        "maximized" => WindowBounds::Maximized(bounds),
-                        _ => WindowBounds::Windowed(bounds),
-                    }
-                }
-                _ => WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx)),
-            };
-            let window = cx
-                .open_window(
-                    WindowOptions {
-                        window_bounds: Some(window_bounds),
-                        titlebar: Some(tako_titlebar_options()),
-                        ..Default::default()
-                    },
-                    |window, cx| {
-                        let view = cx.new(TakoApp::new);
-                        window.focus(&view.read(cx).focus_handle.clone(), cx);
-                        view
-                    },
-                )
-                .expect("ウィンドウを開けなかった");
+    let app = application().with_assets(file_icons::TakoAssets);
+    // Dock クリックでウインドウ再表示（#312。赤ボタン close 後にプロセスが
+    // 生存している状態で Dock アイコンをクリックすると呼ばれる。ウインドウが
+    // 無ければ保存済みレイアウトから復元して新規ウインドウを開く）
+    app.on_reopen(|cx| {
+        if cx.windows().is_empty() {
+            open_restored_window(cx);
             cx.activate(true);
-
-            if std::env::var_os("TAKO_VISUAL_TEST").is_some() {
-                #[cfg(feature = "visual-test")]
-                {
-                    self_test::run_visual(window, cx);
-                    return;
-                }
-                #[cfg(not(feature = "visual-test"))]
-                {
-                    eprintln!("TAKO_VISUAL_TEST には --features visual-test が必要");
-                    std::process::exit(1);
-                }
-            }
-            if std::env::var_os("TAKO_SELF_TEST").is_some() {
-                self_test::run(window, cx);
-            }
+        }
+    });
+    app.run(|cx: &mut App| {
+        cx.bind_keys(key_bindings());
+        cx.set_menus(app_menus());
+        cx.on_action(|_: &NewWindow, cx| {
+            open_new_window(cx);
         });
+        // Quit はグローバルアクションとして登録する（#103: ルート div の on_action
+        // だけだとウィンドウのフォーカスパス上でしか発火せず、フォーカス喪失
+        // （blur）状態では cmd-q もメニューの Quit も無反応になる。GPUI の
+        // アクションディスパッチは path 上で未処理ならグローバルハンドラの
+        // Bubble フェーズへ必ず到達するため、ここならフォーカス状態・
+        // ウィンドウ有無に依存しない）。layout 保存などの終了処理は
+        // on_app_quit（TakoApp::new で登録。Dock 終了でも走る）が担う
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        // 保存済みウィンドウフレームの復元（FR-5。終了前にフルスクリーンなら
+        // フルスクリーンで開く）。セルフテストは既定サイズで決定的に動かす
+        let saved_frame = if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            tako_control::layout::load().and_then(|l| l.window)
+        } else {
+            None
+        };
+        let window_bounds = match saved_frame {
+            // 壊れた保存値（極端に小さい等）は既定へフォールバック
+            Some(f) if f.width >= 200.0 && f.height >= 150.0 => {
+                let bounds = Bounds::new(point(px(f.x), px(f.y)), size(px(f.width), px(f.height)));
+                match f.state.as_str() {
+                    "fullscreen" => WindowBounds::Fullscreen(bounds),
+                    "maximized" => WindowBounds::Maximized(bounds),
+                    _ => WindowBounds::Windowed(bounds),
+                }
+            }
+            _ => WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx)),
+        };
+        let window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(window_bounds),
+                    titlebar: Some(tako_titlebar_options()),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let view = cx.new(TakoApp::new);
+                    window.focus(&view.read(cx).focus_handle.clone(), cx);
+                    // 赤ボタン close 時にレイアウトを保存（#312）
+                    let entity = view.clone();
+                    window.on_window_should_close(cx, move |_window, cx| {
+                        entity.update(cx, |app, _cx| app.save_layout());
+                        true
+                    });
+                    view
+                },
+            )
+            .expect("ウィンドウを開けなかった");
+        cx.activate(true);
+
+        if std::env::var_os("TAKO_VISUAL_TEST").is_some() {
+            #[cfg(feature = "visual-test")]
+            {
+                self_test::run_visual(window, cx);
+                return;
+            }
+            #[cfg(not(feature = "visual-test"))]
+            {
+                eprintln!("TAKO_VISUAL_TEST には --features visual-test が必要");
+                std::process::exit(1);
+            }
+        }
+        if std::env::var_os("TAKO_SELF_TEST").is_some() {
+            self_test::run(window, cx);
+        }
+    });
 }
 
 /// セルフテスト: キーディスパッチ経由で入力・分割・フォーカス・リサイズ・タブ・色・
