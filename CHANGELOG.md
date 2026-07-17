@@ -16,6 +16,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed / 修正
 
+- PDF プレビューのリンク ⌘クリックが無反応だった問題を根治: ページ画像 bounds をテキストレイヤからの逆算ではなく描画時に直接記録する方式に変更。テキストのないページでもリンクが動作し、全描画ページのリンクをチェック、ホバー時のカーソル変化 + 下線ハイライトを追加 (#315)
+  Fixed PDF preview link Cmd+click being unresponsive: page image bounds are now recorded directly during rendering instead of reverse-estimated from text layers. Links work on text-free pages, hit-testing checks all rendered pages, and hover visual feedback (cursor + underline) was added (#315)
 - sleep-guard: 蓋閉じ運用時にディスプレイが点灯したままになる問題を修正。disablesleep=1 中に蓋閉じを検知したら pmset displaysleepnow で画面だけ消灯 (#311)
   sleep-guard: fixed display staying on when lid is closed with disablesleep=1. Now forces display sleep via pmset displaysleepnow when lid closure is detected while system sleep is disabled (#311)
 - TAKO_ISOLATED の隔離セルフテストが本番 ledger.yaml に書き込む問題を修正: orchestrator の config_dir を data_dir() ベースに切り替え + ledger prune コマンドの追加（CLI / MCP 1:1）(#303)

@@ -814,6 +814,9 @@ struct TakoApp {
     preview_pdf_highlight_paint_count: HashMap<PaneId, usize>,
     /// PDF リンクのホバー状態（#271）。⌘ 押下中のみ有効。
     preview_pdf_hovered_link: Option<(PaneId, usize)>,
+    /// PDF ページ画像のスクリーン座標 bounds（canvas paint 時に直接記録。#315）。
+    /// estimate 不要で zoom / scroll 後もヒットテストが正しい。
+    preview_pdf_page_image_bounds: HashMap<PaneId, HashMap<usize, Bounds<Pixels>>>,
     /// コード / Markdown の行ごとの GPUI 実描画レイアウト。
     /// 描画と同じ shaping 結果で座標を UTF-8 byte index へ逆写像する。
     preview_text_layouts: HashMap<PaneId, Vec<Option<TextLayout>>>,
@@ -1759,6 +1762,7 @@ impl TakoApp {
             preview_pdf_char_bounds: HashMap::new(),
             preview_pdf_highlight_paint_count: HashMap::new(),
             preview_pdf_hovered_link: None,
+            preview_pdf_page_image_bounds: HashMap::new(),
             preview_text_layouts: HashMap::new(),
             preview_line_texts: HashMap::new(),
             webviews: Vec::new(),
@@ -4168,6 +4172,7 @@ impl TakoApp {
                 self.preview_line_bounds.remove(&pane_id);
                 self.preview_pdf_char_bounds.remove(&pane_id);
                 self.preview_pdf_highlight_paint_count.remove(&pane_id);
+                self.preview_pdf_page_image_bounds.remove(&pane_id);
                 self.preview_text_layouts.remove(&pane_id);
                 self.preview_line_texts.remove(&pane_id);
                 self.pane_links.remove(&pane_id);
@@ -4225,6 +4230,7 @@ impl TakoApp {
                     self.preview_line_bounds.remove(&id);
                     self.preview_pdf_char_bounds.remove(&id);
                     self.preview_pdf_highlight_paint_count.remove(&id);
+                    self.preview_pdf_page_image_bounds.remove(&id);
                     self.preview_text_layouts.remove(&id);
                     self.preview_line_texts.remove(&id);
                     self.pane_links.remove(&id);
@@ -5341,7 +5347,8 @@ impl TakoApp {
         texts.last().map(|last| (texts.len() - 1, last.len()))
     }
 
-    /// PDF リンクのヒットテスト（#271）。マウス位置にある PDF リンクのインデックスを返す。
+    /// PDF リンクのヒットテスト（#271 / #315）。マウス位置にある PDF リンクのインデックスを返す。
+    /// ページ画像の bounds は canvas paint 時に直接記録したものを使う（テキストレイヤ不要）。
     fn pdf_link_at_position(&self, pane_id: PaneId, position: Point<Pixels>) -> Option<usize> {
         let state = self.previews.get(&pane_id)?;
         let data = match &state.content {
@@ -5351,21 +5358,17 @@ impl TakoApp {
         if data.links.is_empty() {
             return None;
         }
-        let view = self
-            .preview_views
-            .get(&pane_id)
-            .copied()
-            .unwrap_or_default();
-        let page_idx = view.page.saturating_sub(1);
-        let page_size = data.page_sizes.get(page_idx)?;
-        let image_bounds = self.estimate_pdf_page_bounds(pane_id, page_idx, data)?;
+        let page_bounds_map = self.preview_pdf_page_image_bounds.get(&pane_id)?;
 
         for (link_idx, link) in data.links.links.iter().enumerate() {
-            if link.page_index != page_idx {
+            let Some(page_size) = data.page_sizes.get(link.page_index) else {
                 continue;
-            }
+            };
+            let Some(image_bounds) = page_bounds_map.get(&link.page_index) else {
+                continue;
+            };
             let screen_bounds =
-                preview_render::pdf_box_to_screen(link.bbox, *page_size, image_bounds);
+                preview_render::pdf_box_to_screen(link.bbox, *page_size, *image_bounds);
             if screen_bounds.contains(&position) {
                 return Some(link_idx);
             }
@@ -5373,93 +5376,8 @@ impl TakoApp {
         None
     }
 
-    /// PDF ページ画像のビューポート座標 bounds を推算する（#271）。
-    /// テキストレイヤの行 bounds から逆算するか、行がなければ None。
-    fn estimate_pdf_page_bounds(
-        &self,
-        pane_id: PaneId,
-        page_idx: usize,
-        data: &preview::PdfData,
-    ) -> Option<Bounds<Pixels>> {
-        let line_bounds = self.preview_line_bounds.get(&pane_id)?;
-        let page_size = data.page_sizes.get(page_idx)?;
-        // ページのテキストレイヤ先頭行のオフセットを求める
-        let mut line_offset = 0usize;
-        for (pi, page_lines) in data.text_layers.iter().enumerate() {
-            if pi == page_idx {
-                break;
-            }
-            line_offset += page_lines.len();
-        }
-        let page_text = data.text_layers.get(page_idx)?;
-        // テキストレイヤの bbox から画像 bounds を逆算する:
-        // PDF 座標(左下原点) → スクリーン座標(左上原点) の変換は pdf_box_to_screen で行う。
-        // image_bounds = ページ画像全体の矩形。
-        // 任意のテキスト行: screen.origin.x = image.origin.x + bbox.x * scale_x
-        // → image.origin.x = screen.origin.x - bbox.x * scale_x
-        // scale_x = image.width / page_size.width
-        // → image.origin.x = screen.origin.x - bbox.x * image.width / page_size.width
-        // この循環を、全ページの bbox [0,0,w,h] として解くと:
-        // ページ全体 = bbox [0, 0, page_w, page_h] のスクリーン化
-        // ただし直接 image_bounds がわからない。
-        //
-        // 代替アプローチ: テキストの行 bounds の上下端からページ画像の上端と高さを推定し、
-        // ページの幅はアスペクト比から求める。ただしテキストが無い場合は判定不能。
-        if page_text.is_empty() {
-            return None;
-        }
-        // 全行の bounds の包含矩形を求める
-        let mut min_x = f32::MAX;
-        let mut min_y = f32::MAX;
-        let mut max_x = f32::MIN;
-        let mut max_y = f32::MIN;
-        let mut pdf_min_x = f64::MAX;
-        let mut pdf_min_y = f64::MAX;
-        let mut pdf_max_x = f64::MIN;
-        let mut pdf_max_y = f64::MIN;
-        for (i, tl) in page_text.iter().enumerate() {
-            if let Some(lb) = line_bounds.get(line_offset + i) {
-                let lx = f32::from(lb.origin.x);
-                let ly = f32::from(lb.origin.y);
-                let lw = f32::from(lb.size.width);
-                let lh = f32::from(lb.size.height);
-                if lw > 0.0 && lh > 0.0 {
-                    min_x = min_x.min(lx);
-                    min_y = min_y.min(ly);
-                    max_x = max_x.max(lx + lw);
-                    max_y = max_y.max(ly + lh);
-                    // 対応する PDF 座標の bbox
-                    pdf_min_x = pdf_min_x.min(tl.bbox[0]);
-                    // PDF 左下原点 → 上端: page_h - (y + h)
-                    let pdf_top = page_size[1] - tl.bbox[1] - tl.bbox[3];
-                    pdf_min_y = pdf_min_y.min(pdf_top);
-                    pdf_max_x = pdf_max_x.max(tl.bbox[0] + tl.bbox[2]);
-                    pdf_max_y = pdf_max_y.max(pdf_top + tl.bbox[3]);
-                }
-            }
-        }
-        if min_x >= max_x || min_y >= max_y || pdf_min_x >= pdf_max_x || pdf_min_y >= pdf_max_y {
-            return None;
-        }
-        // テキスト群のスクリーン範囲と PDF 座標範囲からスケールを算出
-        let screen_w = max_x - min_x;
-        let pdf_w = (pdf_max_x - pdf_min_x) as f32;
-        if pdf_w <= 0.0 {
-            return None;
-        }
-        let scale = screen_w / pdf_w;
-        // ページ画像の origin を逆算
-        let img_x = min_x - pdf_min_x as f32 * scale;
-        let img_y = min_y - pdf_min_y as f32 * scale;
-        let img_w = page_size[0] as f32 * scale;
-        let img_h = page_size[1] as f32 * scale;
-        Some(Bounds {
-            origin: point(px(img_x), px(img_y)),
-            size: gpui::size(px(img_w), px(img_h)),
-        })
-    }
-
-    /// PDF プレビューのリンクホバー状態を更新する（#271）。
+    /// PDF プレビューのリンクホバー状態を更新する（#271 / #315）。
+    /// すべてのレンダリング済み PDF ペインをチェックする（focused_pane に依存しない）。
     fn update_pdf_link_hover(
         &mut self,
         position: Point<Pixels>,
@@ -5474,10 +5392,14 @@ impl TakoApp {
             }
             return;
         }
-        let pane_id = self.focused_pane();
-        let found = self
-            .pdf_link_at_position(pane_id, position)
-            .map(|idx| (pane_id, idx));
+        let pane_ids: Vec<PaneId> = self.preview_pdf_page_image_bounds.keys().copied().collect();
+        let mut found = None;
+        for pane_id in pane_ids {
+            if let Some(idx) = self.pdf_link_at_position(pane_id, position) {
+                found = Some((pane_id, idx));
+                break;
+            }
+        }
         if found != old {
             self.preview_pdf_hovered_link = found;
             cx.notify();
@@ -10954,6 +10876,7 @@ impl PreviewHost for TakoApp {
         self.preview_line_bounds.remove(&pane);
         self.preview_pdf_char_bounds.remove(&pane);
         self.preview_pdf_highlight_paint_count.remove(&pane);
+        self.preview_pdf_page_image_bounds.remove(&pane);
         self.preview_text_layouts.remove(&pane);
         self.preview_line_texts.remove(&pane);
         self.remove_preview_image_cache(pane);
@@ -17024,6 +16947,7 @@ mod self_test {
                     // 次の paint 完了を存在で同期できるよう、旧位置のキャッシュを破棄する。
                     app.preview_line_bounds.remove(&pane);
                     app.preview_pdf_char_bounds.remove(&pane);
+                    app.preview_pdf_page_image_bounds.remove(&pane);
                     app.preview_text_layouts.remove(&pane);
                     app.preview_line_texts.remove(&pane);
                 })
