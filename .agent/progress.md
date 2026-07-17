@@ -838,3 +838,8 @@
 - ファイル右クリに「デフォルトアプリで開く」「このアプリで開く...」追加 + コンテキストメニューの見切れ修正（フリップ/クランプ）。FileOpKind に OpenDefault / OpenWith 追加（dispatch / MCP / CLI 1:1）
 - 関連コミット: `495ca44`（PR #349 squash merge）。テスト 5 本追加（486 全緑）+ 品質ゲート全緑 + 隔離セルフテスト完走
 - 次: `build-app.sh --install` → 実機確認 → #314 クローズ
+
+## 2026-07-17（#320: シンタックスハイライト対応形式の大幅拡充）
+- two-face crate（bat 由来）を導入し 75→210+ 構文。TOML・Dockerfile・TypeScript・Swift・Kotlin・CMake 等が新規対応。ファイル名判定 + 拡張子フォールバック追加。バイナリ +550KB（2.5%）
+- 関連コミット: `5dd4bd5`（PR #351 squash merge）。テスト 7 本追加 + fmt / clippy / test 全緑
+- 次: `build-app.sh --install` → 実ファイルでの色分け目視確認
