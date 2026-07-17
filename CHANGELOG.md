@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added / 機能追加
 
+- ターミナルペインで選択ドラッグ中にビューポート上下端へ到達すると自動スクロールして選択を継続できるようになった。端への近さでスクロール速度が変化する（最小 2 行/秒、最大 30 行/秒）。上方向はスクロールバックへの遡り、下方向は最新出力方向。alt_screen（全画面 TUI）では従来挙動を維持 (#310)
+  Terminal pane now auto-scrolls during selection drag when the cursor reaches the top or bottom edge of the viewport, extending the selection into scrollback history. Scroll speed increases with proximity to the edge (2–30 lines/sec). Alt-screen (fullscreen TUI) behavior is unchanged (#310)
 - タブバーのタブ D&D 並べ替え: タブを掴んで左右にドラッグすると順序が変わる。挿入位置にアクセントカラーのインジケータを表示。並び順は persist（layout.json）に自動反映。CLI `tako tab reorder` + MCP `tako_reorder_tab`（97 ツール）で操作可能 (#308)
   Tab bar drag-and-drop reorder: drag tabs left/right to change order. An accent-colored insertion indicator shows the drop position. Order persists in layout.json automatically. CLI `tako tab reorder` + MCP `tako_reorder_tab` (97 tools) (#308)
 - エラーレポートの自動送信基盤（テレメトリ）: panic / 重大エラーを PII なしで Cloudflare Workers エンドポイントへ自動送信。既定 OFF（opt-in）。送信内容はすべてローカルの telemetry.log に記録される透明性設計。CLI `tako telemetry status/on/off` + MCP `tako_telemetry` で操作可能。スキーマ・保持期間 90 日・削除依頼先を docs に明記 (#333)
