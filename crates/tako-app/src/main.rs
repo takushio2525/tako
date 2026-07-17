@@ -818,6 +818,8 @@ struct TakoApp {
     video_ticker: bool,
     /// 全ペインから集約した Claude エージェントメトリクス（ctx/usage。ポーリングで更新）
     agent_metrics: AgentMetrics,
+    /// codex ペインから集約したメトリクス（#357: サービス別制限データ）
+    codex_metrics: AgentMetrics,
     /// ステータスバーの利用制限表示で選択中のサービス（Issue #321。settings.json 永続化）
     limit_service: tako_core::LimitService,
     /// ステータスバーの利用制限サービス切替ドロップダウンが開いているか（Issue #321）
@@ -1797,6 +1799,7 @@ impl TakoApp {
             pinned_previews: Vec::new(),
             dragging_pin: None,
             agent_metrics: AgentMetrics::default(),
+            codex_metrics: AgentMetrics::default(),
             limit_service: tako_control::settings::load().limit_service(),
             limit_service_menu_open: false,
             usage_history: std::collections::VecDeque::new(),
@@ -6397,10 +6400,12 @@ impl TakoApp {
     }
 
     /// kill 確認のインラインブロック（FR-2.16.7）。メッセージ行（折り返し）+ ボタン行の
-    /// 全ペインから Claude TUI のメトリクス（ctx%/usage）を収集・更新する
+    /// 全ペインから Claude / Codex TUI のメトリクス（ctx%/usage）を収集・更新する（#357 拡張）
     fn refresh_agent_metrics(&mut self) {
-        let mut best: Option<AgentMetrics> = None;
-        // フォーカスペインを優先し、なければ他の alt_screen ペインから取得
+        use tako_core::MetricsSource;
+        let mut best_claude: Option<AgentMetrics> = None;
+        let mut best_codex: Option<AgentMetrics> = None;
+        // フォーカスペインを優先し、なければ他のペインから取得
         let focused = self.workspace.active_tab().tree().focused();
         let pane_ids: Vec<PaneId> = std::iter::once(focused)
             .chain(
@@ -6414,18 +6419,31 @@ impl TakoApp {
         for pid in pane_ids {
             if let Some(session) = self.terminals.get(&pid) {
                 if let Some(m) = session.agent_metrics() {
-                    if m.ctx_percent.is_some() || m.usage_text.is_some() || m.limit_5h.is_some() {
-                        best = Some(m);
+                    let has_data =
+                        m.ctx_percent.is_some() || m.usage_text.is_some() || m.limit_5h.is_some();
+                    if !has_data {
+                        continue;
+                    }
+                    match m.source {
+                        MetricsSource::Codex => {
+                            if best_codex.is_none() {
+                                best_codex = Some(m);
+                            }
+                        }
+                        _ => {
+                            if best_claude.is_none() {
+                                best_claude = Some(m);
+                            }
+                        }
+                    }
+                    if best_claude.is_some() && best_codex.is_some() {
                         break;
                     }
                 }
             }
         }
-        if let Some(m) = best {
-            self.agent_metrics = m;
-        } else {
-            self.agent_metrics = AgentMetrics::default();
-        }
+        self.agent_metrics = best_claude.unwrap_or_default();
+        self.codex_metrics = best_codex.unwrap_or_default();
         // usage トークン推移の履歴（#217 スパークライン。取れたときだけ・変化時だけ積む）
         if let Some(tok) = self
             .agent_metrics

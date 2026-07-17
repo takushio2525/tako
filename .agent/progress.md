@@ -843,3 +843,8 @@
 - two-face crate（bat 由来）を導入し 75→210+ 構文。TOML・Dockerfile・TypeScript・Swift・Kotlin・CMake 等が新規対応。ファイル名判定 + 拡張子フォールバック追加。バイナリ +550KB（2.5%）
 - 関連コミット: `5dd4bd5`（PR #351 squash merge）。テスト 7 本追加 + fmt / clippy / test 全緑
 - 次: `build-app.sh --install` → 実ファイルでの色分け目視確認
+
+## 2026-07-17（#321: ステータスバー利用制限表示の改修）
+- 「週」→「7d」表記統一 + サービス切替ドロップダウン（claude/codex/agy）+ 色ドット/ラベルで区別 + 選択永続化 + CLI/MCP 1:1（計 99 ツール）
+- 関連コミット: `1f95bf9`（PR #355 squash merge）。dispatch テスト 1 本追加 + 502 tests / fmt / clippy 全緑 + 隔離セルフテスト完走
+- 次: `build-app.sh --install` → 目視チェック → #321 クローズ

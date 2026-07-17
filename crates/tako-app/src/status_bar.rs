@@ -85,13 +85,21 @@ impl TakoApp {
         let ctx_fill_frac = ctx_pct as f32 / 100.0;
         let ctx_detail = self.agent_metrics.ctx_detail.clone();
         let usage_text = self.agent_metrics.usage_text.clone();
-        let limit_5h = self.agent_metrics.limit_5h;
-        let limit_week = self.agent_metrics.limit_week;
+        let claude_5h = self.agent_metrics.limit_5h;
+        let claude_week = self.agent_metrics.limit_week;
+        let codex_primary = self.codex_metrics.limit_5h;
+        let codex_secondary = self.codex_metrics.limit_week;
         let selected_limit_service = self.limit_service;
         let limit_menu_open = self.limit_service_menu_open;
+        // 選択中のサービスに応じてメーター表示データを選択（#357）
+        let (limit_5h, limit_week) = match selected_limit_service {
+            LimitService::Claude => (claude_5h, claude_week),
+            LimitService::Codex => (codex_primary, codex_secondary),
+            LimitService::Agy => (None, None),
+        };
         // リミット表示があるとき、usage_text が同じ「Nh NN%」なら重複表示を避ける
         let usage_text = usage_text.filter(|t| {
-            limit_5h.is_none() || t.contains('$') || t.contains('k') || t.contains('K')
+            claude_5h.is_none() || t.contains('$') || t.contains('k') || t.contains('K')
         });
         // リミットの色（カンプ: >=90 red / >=70 yellow / 通常 text_tertiary）
         let limit_color = |v: u32| {
@@ -371,8 +379,7 @@ impl TakoApp {
             .children(self.render_update_banner(&theme, cx))
             // 利用リミットメーター（Issue #321: サービス切替ドロップダウン + 「7d」表記）
             .child({
-                let has_data = selected_limit_service == LimitService::Claude
-                    && (limit_5h.is_some() || limit_week.is_some());
+                let has_data = limit_5h.is_some() || limit_week.is_some();
                 let meter = |label: &'static str, v: u32| {
                     let color = limit_color(v);
                     div()
@@ -463,12 +470,16 @@ impl TakoApp {
                                     .text_color(hsla(theme.text_tertiary)),
                             ),
                     )
-                    // メーター（データがあるときだけ）
+                    // メーター（データがあるときだけ。ラベルはサービスで切替。#357）
                     .when(has_data, |d| {
-                        d.children(limit_5h.map(|v| meter("5h", v)))
-                            .children(limit_week.map(|v| meter("7d", v)))
+                        let (l1, l2) = match selected_limit_service {
+                            LimitService::Codex => ("P", "S"),
+                            _ => ("5h", "7d"),
+                        };
+                        d.children(limit_5h.map(|v| meter(l1, v)))
+                            .children(limit_week.map(|v| meter(l2, v)))
                     })
-                    // データがないとき（codex/agy、または claude でデータ未取得）
+                    // データがないとき（agy、またはデータ未取得）
                     .when(!has_data, |d| {
                         d.child(
                             div()
@@ -477,9 +488,15 @@ impl TakoApp {
                                 .child(SharedString::from("--")),
                         )
                     })
-                    // ドロップダウンポップアップ
+                    // ドロップダウンポップアップ（#357: 全サービスの実データ）
                     .when(limit_menu_open, |d| {
-                        d.child(self.render_limit_service_menu(limit_5h, limit_week, cx))
+                        d.child(self.render_limit_service_menu(
+                            claude_5h,
+                            claude_week,
+                            codex_primary,
+                            codex_secondary,
+                            cx,
+                        ))
                     })
             })
             // usage（カンプ: トレンドアイコン + スパークライン + tok + cost）
@@ -1056,12 +1073,18 @@ impl TakoApp {
         &self,
         claude_5h: Option<u32>,
         claude_week: Option<u32>,
+        codex_primary: Option<u32>,
+        codex_secondary: Option<u32>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = self.theme.clone();
         let selected = self.limit_service;
 
-        let row = |svc: LimitService, h5: Option<u32>, w7: Option<u32>| {
+        let row = |svc: LimitService,
+                   h5: Option<u32>,
+                   w7: Option<u32>,
+                   l1: &'static str,
+                   l2: &'static str| {
             let is_selected = svc == selected;
             let svc_color = match svc {
                 LimitService::Claude => theme.accent,
@@ -1163,10 +1186,10 @@ impl TakoApp {
                         })
                         .child(svc.as_str()),
                 )
-                // 5h メーター
-                .child(meter_inline("5h", h5))
-                // 7d メーター
-                .child(meter_inline("7d", w7))
+                // 短期枠メーター（Claude: 5h / Codex: P）
+                .child(meter_inline(l1, h5))
+                // 長期枠メーター（Claude: 7d / Codex: S）
+                .child(meter_inline(l2, w7))
         };
 
         div()
@@ -1204,9 +1227,21 @@ impl TakoApp {
                     .p(px(4.0))
                     .flex()
                     .flex_col()
-                    .child(row(LimitService::Claude, claude_5h, claude_week))
-                    .child(row(LimitService::Codex, None, None))
-                    .child(row(LimitService::Agy, None, None)),
+                    .child(row(
+                        LimitService::Claude,
+                        claude_5h,
+                        claude_week,
+                        "5h",
+                        "7d",
+                    ))
+                    .child(row(
+                        LimitService::Codex,
+                        codex_primary,
+                        codex_secondary,
+                        "P",
+                        "S",
+                    ))
+                    .child(row(LimitService::Agy, None, None, "5h", "7d")),
             )
             .into_any_element()
     }
