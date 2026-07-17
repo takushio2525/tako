@@ -16441,9 +16441,14 @@ mod self_test {
                     "バックエンドのホイールがミラー表示に乗る（copy-mode 不使用）",
                 );
 
-                // 61c. スクロールバーはスクロール中だけ表示され、時間経過でフェードする
+                // 61c. スクロールバーはスクロール中だけ表示され、時間経過でフェードする。
+                //      直前 61b の確認リトライが長引くとフェード時間を過ぎてしまうため、
+                //      「スクロール活動直後」の状態を明示的に再現してから判定する（決定化）
                 let bar_visible = window
                     .update(cx, |app, _, _| {
+                        if let Some(ctl) = app.scroll_ctls.get_mut(&backend_pane) {
+                            ctl.last_activity = std::time::Instant::now();
+                        }
                         let area = app
                             .pane_text_areas
                             .iter()
