@@ -737,6 +737,9 @@ struct TakoApp {
     drop_target: Option<(PaneId, DropZone)>,
     /// タブバーへのペイン D&D: ドロップ先タブ（Some(id) = 既存タブへ合流、None = 新タブ化）
     tab_drop_target: Option<Option<TabId>>,
+    /// タブ D&D 並べ替え中の挿入位置インジケータ（#308）。
+    /// Some(tab_id) = そのタブの**左**にインジケータを表示、None = 末尾
+    tab_reorder_indicator: Option<Option<TabId>>,
     /// git パネルのデータ（FR-3.6。cwd 連動で 2 秒ポーリング更新）
     git_data: Option<GitPanelData>,
     /// サイドバー用の軽量 git サマリ（#217。ブランチチップ + 変更フッター）
@@ -1728,6 +1731,7 @@ impl TakoApp {
             drag_kind: None,
             drop_target: None,
             tab_drop_target: None,
+            tab_reorder_indicator: None,
             git_data: None,
             sidebar_git: None,
             git_selected_commit: None,
@@ -6418,6 +6422,9 @@ impl TakoApp {
             let _ = entity.update(cx, |this, cx| {
                 this.drag_kind = Some(kind);
                 this.drop_target = None;
+                // #308: タブ D&D 開始時に titlebar_dragging を解除して
+                // #312 のウインドウ移動と競合しないようにする
+                this.titlebar_dragging = false;
                 cx.notify();
             });
             cx.new(|_| DragGhost {
@@ -6472,6 +6479,7 @@ impl TakoApp {
     fn take_drop_zone(&mut self, pane_id: PaneId) -> Option<DropZone> {
         self.drag_kind = None;
         self.tab_drop_target = None;
+        self.tab_reorder_indicator = None;
         self.drop_target
             .take()
             .filter(|(p, _)| *p == pane_id)
@@ -6551,6 +6559,46 @@ impl TakoApp {
             self.tab_drop_target = new;
             cx.notify();
         }
+    }
+
+    /// タブ D&D 並べ替えの挿入インジケータ更新（#308）。
+    /// `before`: Some(tab_id) = そのタブの左にインジケータ表示、None = 末尾
+    pub(crate) fn set_tab_reorder_indicator(
+        &mut self,
+        before: Option<TabId>,
+        cx: &mut Context<Self>,
+    ) {
+        let new = Some(before);
+        if self.tab_reorder_indicator != new {
+            self.tab_reorder_indicator = new;
+            cx.notify();
+        }
+    }
+
+    /// タブ D&D 並べ替えのドロップ確定（#308）。
+    /// `before`: Some(tab_id) = そのタブの位置へ移動、None = 末尾
+    pub(crate) fn drop_tab_reorder(
+        &mut self,
+        dragged: TabId,
+        before: Option<TabId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.drag_kind = None;
+        self.tab_reorder_indicator = None;
+        let target_index = match before {
+            Some(before_id) => self
+                .workspace
+                .tabs()
+                .iter()
+                .position(|t| t.id() == before_id)
+                .unwrap_or(usize::MAX),
+            None => usize::MAX,
+        };
+        if let Err(e) = self.workspace.move_tab(dragged, target_index) {
+            eprintln!("warning: タブを並べ替えできない: {e}");
+        }
+        self.save_layout();
+        cx.notify();
     }
 
     /// タブバーへペインをドロップ（Issue #209）。
@@ -7254,6 +7302,7 @@ impl TakoApp {
         if self.drag_kind.take().is_some()
             | self.drop_target.take().is_some()
             | self.tab_drop_target.take().is_some()
+            | self.tab_reorder_indicator.take().is_some()
         {
             cx.notify();
             return;

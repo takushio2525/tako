@@ -564,6 +564,20 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_reorder_tab",
+            "description": "タブの並び順を変更する（D&D 並べ替えと同等）。\
+                tab を index（0 始まり）の位置へ移動する。範囲外は末尾にクランプされる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tab": { "type": "integer", "minimum": 0, "description": "移動するタブ ID" },
+                    "index": { "type": "integer", "minimum": 0, "description": "移動先インデックス（0 始まり）" },
+                },
+                "required": ["tab", "index"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_move_pane_to_tab",
             "description": "ペインを移動する。tab 指定 = 別タブの末尾へ移送（グループ分け）、\
                 target 指定 = そのペインの隣（direction 側）へ挿し直す（同タブ内の並べ替え = \
@@ -2569,6 +2583,10 @@ fn build_request(
         },
         "tako_select_tab" => Request::TabSelect {
             tab: required_u64(args, "tab")?,
+        },
+        "tako_reorder_tab" => Request::TabReorder {
+            tab: required_u64(args, "tab")?,
+            index: required_u64(args, "index")? as usize,
         },
         "tako_move_pane_to_tab" => {
             let new_tab = bool_arg(args, "new_tab")?.unwrap_or(false);

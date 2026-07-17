@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added / 機能追加
 
+- タブバーのタブ D&D 並べ替え: タブを掴んで左右にドラッグすると順序が変わる。挿入位置にアクセントカラーのインジケータを表示。並び順は persist（layout.json）に自動反映。CLI `tako tab reorder` + MCP `tako_reorder_tab`（97 ツール）で操作可能 (#308)
+  Tab bar drag-and-drop reorder: drag tabs left/right to change order. An accent-colored insertion indicator shows the drop position. Order persists in layout.json automatically. CLI `tako tab reorder` + MCP `tako_reorder_tab` (97 tools) (#308)
 - エラーレポートの自動送信基盤（テレメトリ）: panic / 重大エラーを PII なしで Cloudflare Workers エンドポイントへ自動送信。既定 OFF（opt-in）。送信内容はすべてローカルの telemetry.log に記録される透明性設計。CLI `tako telemetry status/on/off` + MCP `tako_telemetry` で操作可能。スキーマ・保持期間 90 日・削除依頼先を docs に明記 (#333)
   Automatic error reporting (telemetry): sends panic / critical errors to a Cloudflare Workers endpoint with no PII. Disabled by default (opt-in). All sent reports are logged locally to telemetry.log for transparency. CLI `tako telemetry status/on/off` + MCP `tako_telemetry`. Schema, 90-day retention, and deletion contact documented (#333)
 - シンタックスハイライト対応形式の大幅拡充: syntect デフォルト 75 構文 → bat 由来の拡張セット 210+ 構文（two-face crate）。TOML・Dockerfile・TypeScript（ネイティブ）・Swift・Kotlin・INI・DotENV・CMake 等が新たに対応。ファイル名ベースの判定も追加（Cargo.lock → TOML、CMakeLists.txt → CMake、.gitignore → Git Ignore 等）。バイナリサイズ増加は約 550KB (#320)

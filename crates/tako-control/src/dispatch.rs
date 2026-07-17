@@ -892,6 +892,15 @@ fn dispatch_inner(
             Ok(Value::Null)
         }
 
+        Request::TabReorder { tab, index } => {
+            let tab_id = find_tab(host.workspace(), tab)?;
+            let actual = host
+                .workspace_mut()
+                .move_tab(tab_id, index)
+                .map_err(op_err)?;
+            Ok(json!({ "tab": tab_id.as_u64(), "index": actual }))
+        }
+
         Request::MovePane {
             pane,
             tab,
@@ -6537,6 +6546,31 @@ mod tests {
         let tab = &host.ws.tabs()[0];
         assert_eq!(tab.title(), "実験");
         assert_eq!(tab.title_source(), tako_core::TitleSource::Default);
+    }
+
+    #[test]
+    fn タブの並べ替え() {
+        let mut host = MockHost::new();
+        let t1 = host.ws.active_tab_id();
+        let t2 = host
+            .ws
+            .create_tab("t2", tako_core::Pane::new(tako_core::pane::PaneOrigin::User));
+        let t3 = host
+            .ws
+            .create_tab("t3", tako_core::Pane::new(tako_core::pane::PaneOrigin::User));
+        let result = dispatch(
+            &mut host,
+            Request::TabReorder {
+                tab: t3.as_u64(),
+                index: 0,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["tab"], t3.as_u64());
+        assert_eq!(result["index"], 0);
+        let ids: Vec<_> = host.ws.tabs().iter().map(|t| t.id()).collect();
+        assert_eq!(ids, vec![t3, t1, t2]);
     }
 
     #[test]
