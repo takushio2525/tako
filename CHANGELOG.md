@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added / 機能追加
 
+- codex の利用制限データ（primary / secondary）を実データで表示: codex TUI フッターの `primary NN%` / `secondary NN%` パターンをスクレイピングし、ステータスバーのサービス切替ドロップダウンに実データを反映。agy は CLI にレート制限表示機能が無いため「未対応」として明示 (#357)
+  Codex usage limit data (primary / secondary) now displays real data: scrapes `primary NN%` / `secondary NN%` patterns from the Codex TUI footer and reflects actual data in the status bar service switcher dropdown. agy is marked as "unsupported" since the CLI lacks rate limit display (#357)
 - ステータスバーの利用制限表示を改修: 「週」→「7d」表記に統一、サービス切替ドロップダウン（claude / codex / agy）を追加。サービス別の色ドット + ラベルで視覚的区別。選択は settings.json に永続化。データ経路の無いサービスは「--」で明示。CLI `tako limit-service` + MCP `tako_limit_service`（99 ツール）(#321)
   Status bar usage limit display revamp: changed "週" → "7d" notation, added service switcher dropdown (claude / codex / agy) with per-service color dot + label. Selection persists in settings.json. Services without data show "--". CLI `tako limit-service` + MCP `tako_limit_service` (99 tools) (#321)
 - ターミナルペインで選択ドラッグ中にビューポート上下端へ到達すると自動スクロールして選択を継続できるようになった。端への近さでスクロール速度が変化する（最小 2 行/秒、最大 30 行/秒）。上方向はスクロールバックへの遡り、下方向は最新出力方向。alt_screen（全画面 TUI）では従来挙動を維持 (#310)
