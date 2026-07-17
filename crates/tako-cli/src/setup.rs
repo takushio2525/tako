@@ -382,6 +382,13 @@ const EXTERNAL_DEPS: &[ExternalDep] = &[
         brew_pkg: Some("git"),
         install_hint: "xcode-select --install でも導入できます",
     },
+    ExternalDep {
+        bin: "tailscale",
+        required: false,
+        purpose: "スマホからのリモート接続（tako remote。WireGuard E2E 暗号化）",
+        brew_pkg: Some("tailscale"),
+        install_hint: "App Store で「Tailscale」を検索、または brew install tailscale",
+    },
 ];
 
 /// 依存ツールのチェック段階。検出結果を `[OK]` / `[任意]` / `[不足]` で表示し、
@@ -2084,6 +2091,8 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     sync_pending_changes_file(&dir, &[], revision)?;
     print_setup_summary(&plan);
     eprintln!("セットアップが完了しました。");
+    eprintln!();
+    eprintln!("スマホからリモート接続するには: tako remote setup");
 
     // --- 起動ランチャー（Issue #295）---
     // --answers で launch_agent を明示指定した場合はそれに従う。
@@ -2215,9 +2224,9 @@ mod tests {
         assert!(!tmux.required);
         assert!(tmux.purpose.contains("tako remote"));
         assert_eq!(tmux.brew_pkg, Some("tmux"));
-        // 依存は tmux / git の 2 つのみ（#282: 旧トンネル用依存は削除済み。
-        // tailscale の依存チェック追加は弾 6 の remote setup ウィザードと同時に行う）
-        assert_eq!(EXTERNAL_DEPS.len(), 2);
+        // 依存は tmux / git / tailscale の 3 つ（#282: 旧トンネル用依存は削除済み。
+        // #286: tailscale を弾 6 で追加）
+        assert_eq!(EXTERNAL_DEPS.len(), 3);
         // 全依存に用途説明と導入案内がある
         for dep in EXTERNAL_DEPS {
             assert!(!dep.purpose.is_empty(), "{} の purpose が空", dep.bin);
