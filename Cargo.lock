@@ -6644,6 +6644,7 @@ dependencies = [
  "tiny_http",
  "tracing",
  "tungstenite",
+ "ureq",
  "uuid",
 ]
 

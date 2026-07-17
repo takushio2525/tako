@@ -2273,6 +2273,40 @@ fn dispatch_inner(
             }
         }
 
+        Request::Telemetry { action } => {
+            let action = action.as_deref().unwrap_or("status");
+            match action {
+                "status" => {
+                    let enabled = crate::telemetry::is_enabled();
+                    let recent = crate::telemetry::recent_count();
+                    let log_path =
+                        crate::telemetry::log_file_path().map(|p| p.display().to_string());
+                    Ok(serde_json::json!({
+                        "telemetry": enabled,
+                        "recent_reports": recent,
+                        "log_path": log_path,
+                    }))
+                }
+                "on" | "off" => {
+                    let enabled = action == "on";
+                    crate::telemetry::set_enabled(enabled);
+                    if !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none() {
+                        let mut settings = crate::settings::load();
+                        settings.telemetry = enabled;
+                        crate::settings::save(&settings).map_err(|e| {
+                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
+                        })?;
+                    }
+                    Ok(serde_json::json!({
+                        "telemetry": enabled,
+                    }))
+                }
+                other => Err(DispatchError::InvalidParams(format!(
+                    "不明な action: {other:?}（status / on / off のいずれか）"
+                ))),
+            }
+        }
+
         Request::TreeFolder {
             action,
             path,

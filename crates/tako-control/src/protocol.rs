@@ -748,6 +748,12 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
     },
+    /// エラーレポートの自動送信（テレメトリ）の状態確認・切替（Issue #333）。
+    /// `action` = "status"（既定）/ "on" / "off"。設定は settings.json に永続化される
+    Telemetry {
+        #[serde(default)]
+        action: Option<String>,
+    },
     /// ファイルツリーへのフォルダ追加・削除・一覧（#134）。
     /// AI が作業対象プロジェクトのフォルダをファイルツリーに明示追加する。タブ単位スコープ
     TreeFolder {

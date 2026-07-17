@@ -12717,6 +12717,12 @@ fn main() {
             );
         }
     }
+    // テレメトリ初期化: settings.json から ON/OFF を読み、panic ハンドラを設置する
+    {
+        let settings = tako_control::settings::load();
+        tako_control::telemetry::init(settings.telemetry);
+        tako_control::telemetry::install_panic_handler();
+    }
     let initial_dir = parse_initial_dir();
     if let Some(ref dir) = initial_dir {
         if let Err(e) = std::env::set_current_dir(dir) {

@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added / 機能追加
 
+- エラーレポートの自動送信基盤（テレメトリ）: panic / 重大エラーを PII なしで Cloudflare Workers エンドポイントへ自動送信。既定 OFF（opt-in）。送信内容はすべてローカルの telemetry.log に記録される透明性設計。CLI `tako telemetry status/on/off` + MCP `tako_telemetry` で操作可能。スキーマ・保持期間 90 日・削除依頼先を docs に明記 (#333)
+  Automatic error reporting (telemetry): sends panic / critical errors to a Cloudflare Workers endpoint with no PII. Disabled by default (opt-in). All sent reports are logged locally to telemetry.log for transparency. CLI `tako telemetry status/on/off` + MCP `tako_telemetry`. Schema, 90-day retention, and deletion contact documented (#333)
 - 左サイドバー（Files ツリー）の境界ドラッグリサイズ: 右端をドラッグして幅変更、最小 120px / 最大ウィンドウ幅 50% でクランプ、幅は settings.json に永続化、CLI `tako panel --sidebar-width` / MCP `sidebar_width` で操作可能 (#307)
   Sidebar drag resize: drag the right edge to adjust Files sidebar width, clamped to 120px min / 50% of window max, persisted in settings.json, controllable via CLI `tako panel --sidebar-width` / MCP `sidebar_width` (#307)
 - 対話コマンドのペイン委譲 `tako run-interactive`: sudo パスワード・ブラウザ認証等のユーザー入力が必要なコマンドを可視ペインに委譲。split → タイトル設定 → コマンド投入をアトミックに実行し、exit code 回収と auto_close で後片付けまで自動化。MCP `tako_run_interactive` / `tako_run_interactive_status` + CLI 1:1（計 94 ツール）(#305)

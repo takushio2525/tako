@@ -1667,6 +1667,26 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_telemetry",
+            "description": "エラーレポートの自動送信（テレメトリ）の状態確認・切替（Issue #333）。\
+                tako 内で発生した panic / 重大エラーを PII なしで収集エンドポイントへ送信する。\
+                action=status（既定）: 現在の ON/OFF・直近の送信件数・ログパスを返す。\
+                action=on: テレメトリを有効化する。\
+                action=off: テレメトリを無効化する。\
+                変更は settings.json に永続化される。送信内容はすべてローカルの telemetry.log に記録される。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "on", "off"],
+                        "description": "操作種別（省略時は status）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_setup",
             "description": "tako setup を非対話で実行する（Issue #262）。ユーザーが日本語で伝えた好みを answers に変換して代行する。省略項目は detected → previous → default の順で自動解決され、標準ケースは質問ゼロで完走する。instructions / profile / projects / orchestrator / sleep_guard は明示指定時だけ既存値を更新する。",
             "inputSchema": {
@@ -2882,6 +2902,9 @@ fn build_request(
         "tako_theme" => Request::Theme {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             mode: str_arg(args, "mode")?.map(|s| s.to_string()),
+        },
+        "tako_telemetry" => Request::Telemetry {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
         },
         "tako_setup_changes" => Request::SetupChanges,
         "tako_setup" => Request::SetupRun {
