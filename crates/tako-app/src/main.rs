@@ -6319,11 +6319,23 @@ impl TakoApp {
     fn update_sleep_guard(&mut self) {
         use tako_core::CommandState;
         let settings = tako_control::settings::load();
-        let busy_agents = self
+        // OSC 133 で Running が検知できているペイン数
+        let running_count = self
             .terminals
             .values()
             .filter(|s| matches!(s.command_state(), CommandState::Running))
             .count();
+        // persist 復元後に OSC 133 未検知（Unknown）だがバックエンドに
+        // 実行中の子プロセスがいるペイン数（#324: 復元 worker の busy 漏れ根治）
+        let unknown_backends: Vec<&str> = self
+            .terminals
+            .iter()
+            .filter(|(_, s)| matches!(s.command_state(), CommandState::Unknown))
+            .filter_map(|(pid, _)| self.backend_sessions.get(pid).map(|s| s.as_str()))
+            .collect();
+        let restored_busy =
+            tako_control::agents::count_sessions_with_running_children(&unknown_backends);
+        let busy_agents = running_count + restored_busy;
         let state = tako_control::sleep_guard::update(
             settings.sleep_guard_mode,
             settings.sleep_guard_power,
