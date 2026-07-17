@@ -349,7 +349,8 @@ export function TerminalPage({ paneId, me }) {
     : `Pane ${paneId}`;
   const position = info?.position || '';
   const host = (me && me.host) || 'tako';
-  const subtitle = [host, position].filter(Boolean).join(' · ');
+  const modelName = info?.model || '';
+  const subtitle = [host, position, modelName].filter(Boolean).join(' · ');
   const termSubtitle = [host, position, `A− A＋`].filter(Boolean).join(' · ');
 
   return (

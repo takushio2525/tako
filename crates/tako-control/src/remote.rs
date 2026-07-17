@@ -2342,16 +2342,8 @@ fn list_to_api_v2(list: &Value) -> Value {
             // タブ内位置（1/N 形式）
             let position = format!("{}/{}", idx + 1, total_panes);
 
-            // session_id: tmux バックエンドセッション名からエージェントの session_id を解決
-            let session_id = pane["tmux_session"]
-                .as_str()
-                .and_then(crate::agents::resolve_session_id_for_backend)
-                .or_else(|| {
-                    // フォールバック: pane ID から直接 agents リストを突き合わせ
-                    // sessions カタログがあれば使う
-                    let pane_id_str = id.to_string();
-                    crate::sessions::resolve_session_for_pane(&pane_id_str)
-                });
+            // session_id + model: sessions カタログからペインに紐づく情報を解決
+            let (session_id, model) = resolve_pane_session_info(pane, id);
 
             let mut entry = json!({
                 "id": id,
@@ -2371,10 +2363,30 @@ fn list_to_api_v2(list: &Value) -> Value {
             if let Some(sid) = session_id {
                 entry["session_id"] = json!(sid);
             }
+            if let Some(m) = model {
+                entry["model"] = json!(m);
+            }
             panes.push(entry);
         }
     }
     json!({ "panes": panes, "api_version": 2 })
+}
+
+/// ペインの session_id と model を解決する（#284）。
+/// tmux バックエンドセッション → agents 逆引き → sessions カタログの順で探す
+fn resolve_pane_session_info(pane: &Value, pane_id: u64) -> (Option<String>, Option<String>) {
+    let session_id = pane["tmux_session"]
+        .as_str()
+        .and_then(crate::agents::resolve_session_id_for_backend)
+        .or_else(|| {
+            let id_str = pane_id.to_string();
+            crate::sessions::resolve_session_for_pane(&id_str)
+        });
+    let model = session_id.as_ref().and_then(|sid| {
+        let catalog = crate::sessions::SessionCatalog::load().ok()?;
+        catalog.entries.get(sid)?.model.clone()
+    });
+    (session_id, model)
 }
 
 /// tmux target を使って IPC 経由で Send dispatch を呼ぶ。

@@ -230,10 +230,10 @@ export function ChatView({ paneId, info, agentType, onStop }) {
               style={`background:${color};width:7px;height:7px;border-radius:50%`}
             />
             <span class="chat-running-text">
-              実行中...
+              {'実行中…'}
             </span>
             <button class="chat-stop-btn" onClick={() => onStop?.()}>
-              {'■ 停止'}
+              <svg width="8" height="8" viewBox="0 0 8 8" style="margin-right:4px;vertical-align:middle"><rect width="8" height="8" rx="1" fill="currentColor"/></svg>停止
             </button>
           </div>
         )}
@@ -256,6 +256,9 @@ export function ChatView({ paneId, info, agentType, onStop }) {
           />
           <div class="composer-toolbar">
             <button class="composer-btn-attach" disabled>+</button>
+            {info?.model && (
+              <span class="composer-chip">{info.model}</span>
+            )}
             <button
               class="composer-send"
               style={`background:${color};color:${darkColor}`}
