@@ -30,21 +30,21 @@ const FAKE_PANES = {
       agent_type: 'claude', cwd: '/dev/project', state: 'busy',
       surface: 'foreground', position: '2/4', tab_id: 1, tab_title: 'work',
       cols: 120, rows: 40, focused: false, session_id: 'abc-def-123',
-      model: 'opus 4.5',
+      model: 'opus 4.5', effort: 'high',
     },
     {
       id: 2, title: 'refactor-api', role: 'orchestrator-worker-codex',
       agent_type: 'codex', cwd: '/dev/project', state: 'running',
       surface: 'foreground', position: '3/4', tab_id: 1, tab_title: 'work',
       cols: 120, rows: 40, focused: false, session_id: 'codex-session',
-      model: 'gpt-5.6',
+      model: 'gpt-5.6', effort: 'medium',
     },
     {
       id: 3, title: 'docs-site', role: 'orchestrator-worker-agy',
       agent_type: 'agy', cwd: '/dev/docs', state: 'running',
       surface: 'foreground', position: '4/4', tab_id: 1, tab_title: 'work',
       cols: 120, rows: 40, focused: false, session_id: 'agy-session',
-      model: 'gemini 3.5',
+      model: 'gemini 3.5', effort: 'fast',
     },
   ],
   api_version: 2,
@@ -237,5 +237,85 @@ test.describe('弾5b: UI 高度機能スクショ — iPhone viewport', () => {
     await page.goto(`${BASE}/#/panes/2`);
     await page.waitForTimeout(2000);
     expect(external).toEqual([]);
+  });
+
+  // --- 受け入れ条件①: 承認カード通し実測 ---
+  // 承認カード表示 → 許可(y)タップ → dispatch Send (POST /api/panes/:id/input) へ
+  // text="y" newline=true が送信されることを Playwright でキャプチャして検証する
+  test('承認カード通し: 許可(y)タップ → input API に y が送信される', async ({ page }) => {
+    const inputRequests = [];
+    await setupMocks(page);
+    await page.route('**/api/sessions/codex-session/messages*', route =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(FAKE_MESSAGES_1B) })
+    );
+    // input API をキャプチャ（dispatch Send への入口）
+    await page.route('**/api/panes/*/input', async route => {
+      const body = route.request().postDataJSON();
+      inputRequests.push(body);
+      await route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' });
+    });
+    await page.goto(`${BASE}/#/panes/2`);
+    await page.waitForSelector('.approval-card', { timeout: 10000 });
+    await page.screenshot({ path: `${EVIDENCE_DIR}/e2e-approval-before.png`, fullPage: false });
+
+    // 許可(y)ボタンをタップ
+    await page.click('.approval-btn-allow');
+    await page.waitForTimeout(500);
+    await page.screenshot({ path: `${EVIDENCE_DIR}/e2e-approval-after.png`, fullPage: false });
+
+    // input API に "y" が送信されたことを検証
+    expect(inputRequests.length).toBeGreaterThan(0);
+    const lastInput = inputRequests[inputRequests.length - 1];
+    expect(lastInput.text).toBe('y');
+    expect(lastInput.newline).toBe(true);
+  });
+
+  test('承認カード通し: 拒否(n)タップ → input API に n が送信される', async ({ page }) => {
+    const inputRequests = [];
+    await setupMocks(page);
+    await page.route('**/api/sessions/codex-session/messages*', route =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(FAKE_MESSAGES_1B) })
+    );
+    await page.route('**/api/panes/*/input', async route => {
+      const body = route.request().postDataJSON();
+      inputRequests.push(body);
+      await route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' });
+    });
+    await page.goto(`${BASE}/#/panes/2`);
+    await page.waitForSelector('.approval-card', { timeout: 10000 });
+
+    // 拒否(n)ボタンをタップ
+    await page.click('.approval-btn-deny');
+    await page.waitForTimeout(500);
+
+    expect(inputRequests.length).toBeGreaterThan(0);
+    const lastInput = inputRequests[inputRequests.length - 1];
+    expect(lastInput.text).toBe('n');
+    expect(lastInput.newline).toBe(true);
+  });
+
+  // 承認カードで Observe role の場合ボタンが disabled で送信されないことの検証
+  test('承認カード: Observe role ではボタンが disabled', async ({ page }) => {
+    const inputRequests = [];
+    await setupMocks(page, FAKE_ME_OBSERVE);
+    await page.route('**/api/sessions/codex-session/messages*', route =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(FAKE_MESSAGES_1B) })
+    );
+    await page.route('**/api/panes/*/input', async route => {
+      const body = route.request().postDataJSON();
+      inputRequests.push(body);
+      await route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' });
+    });
+    await page.goto(`${BASE}/#/panes/2`);
+    await page.waitForSelector('.approval-card', { timeout: 10000 });
+
+    // ボタンが disabled であること
+    const allowBtn = page.locator('.approval-btn-allow');
+    await expect(allowBtn).toBeDisabled();
+
+    // クリックしても input は呼ばれない
+    await allowBtn.click({ force: true });
+    await page.waitForTimeout(500);
+    expect(inputRequests.length).toBe(0);
   });
 });

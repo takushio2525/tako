@@ -195,6 +195,7 @@ function SlashCandidates({ filter, onSelect, agentColor: color }) {
     <div class="slash-candidates">
       <div class="slash-candidates-header">
         <span class="slash-candidates-label">COMMANDS</span>
+        <span class="slash-candidates-hint">長押しで一覧 ⌃</span>
       </div>
       {filtered.map((c, i) => (
         <div
@@ -223,9 +224,16 @@ const EFFORT_LEVELS = [
   { id: 'high', label: '高' },
 ];
 
-function ModelEffortSheet({ currentModel, onSelectModel, onSelectEffort, onClose, agentType }) {
+function ModelEffortSheet({ currentModel, currentEffort, onSelectModel, onSelectEffort, onClose, agentType }) {
   const color = agentColor(agentType);
-  const [selectedEffort, setSelectedEffort] = useState(null);
+  const [selectedEffort, setSelectedEffort] = useState(() => {
+    if (!currentEffort) return null;
+    const lower = currentEffort.toLowerCase();
+    if (lower.includes('high') || lower === '高') return 'high';
+    if (lower.includes('medium') || lower === '中') return 'medium';
+    if (lower.includes('low') || lower === '低') return 'low';
+    return null;
+  });
 
   return (
     <div class="sheet-overlay" onClick={onClose}>
@@ -630,6 +638,7 @@ export function ChatView({ paneId, info, agentType, onStop, me }) {
       {showModelSheet && (
         <ModelEffortSheet
           currentModel={info?.model}
+          currentEffort={info?.effort}
           onSelectModel={onModelSelect}
           onSelectEffort={onEffortSelect}
           onClose={() => setShowModelSheet(false)}
