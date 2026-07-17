@@ -4,25 +4,25 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-17・#307 完了）
+## 現在の対象（2026-07-17・#312 修正完了）
 
-**Issue #307: 左サイドバーのドラッグリサイズ — PR #316 squash merge 済み**
+**Issue #312: macOS ウインドウ操作の不備 2 件を修正 — PR #318 squash merge 済み**
 
-- 右端のリサイズハンドル（右パネルと同方式。ホバーで ↔ カーソル + ドラッグ追従）
-- 最小 120px / 最大ウィンドウ幅 50% のクランプ
-- settings.json に sidebar_width を永続化（既定 244px、後方互換）
-- CLI `tako panel --sidebar-width` / MCP `sidebar_width` で操作可能
-- ツール数 94 不変（既存ツールにパラメータ追加のみ）
+- タブバー空き領域ドラッグでウインドウ移動（`start_window_move`）
+- ダブルクリックでズーム（`titlebar_double_click`）
+- 赤ボタン close 前に layout 保存（`on_window_should_close`）
+- Dock クリックで保存済みレイアウトからウインドウ復帰（`on_reopen`）
 
 ## 検証
 
-- cargo fmt / clippy(-D warnings lib) / test 全緑（settings 6/6 含む）
-- ドラッグの実挙動はユーザー目視確認待ち（Issue #307 に目視チェックリスト記載）
+- cargo fmt / clippy(-D warnings) / test 全緑（476 passed）
+- 隔離セルフテスト完走（`TAKO_APP_SELF_TEST_OK`）
+- ユーザー目視確認待ち（Issue #312 に目視チェックリスト記載）
 
 ## 次の一手
 
-- #307 のクローズは master 判断（目視確認後）
-- install はユーザー指示どおり master 側で行う
+- #312 のクローズはユーザー目視確認後
+- install はユーザー指示で `build-app.sh --install`
 
 ## 現フェーズで Read すべき設計書
 

@@ -793,3 +793,8 @@
 - 右端リサイズハンドル + ドラッグ追従 + 120px〜50% クランプ + settings.json 永続化 + CLI/MCP 1:1。右パネルと同方式
 - 関連コミット: PR #316 squash merge（`e961acc`）。worktree 掃除・Issue 証拠コメント済み
 - 次: ユーザー目視確認（カーソル変化・ドラッグ・永続化）→ #307 クローズ
+
+## 2026-07-17（#312: macOS ウインドウ操作の不備修正）
+- タブバードラッグ移動（`start_window_move`）+ ダブルクリックズーム + 赤ボタン close 後の Dock 復帰（`on_reopen` + `on_window_should_close`）
+- 関連コミット: PR #318 squash merge（`9cd2535`）。worktree 掃除・Issue 証拠コメント済み
+- 次: ユーザー目視確認（ドラッグ移動・Dock 復帰・既存操作との競合なし）→ #312 クローズ
