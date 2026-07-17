@@ -11535,7 +11535,11 @@ impl EntityInputHandler for TakoApp {
 
 impl TakoApp {
     /// ペインヘッダ / タブの右クリックメニュー描画（#185）
-    fn render_pane_context_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    fn render_pane_context_menu(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         let ctx = self.pane_context_menu.as_ref()?;
         let theme = &self.theme;
         let pane_id = ctx.pane;
@@ -11569,11 +11573,28 @@ impl TakoApp {
         items.push(("bg", "バックグラウンドへ"));
         items.push(("close", "閉じる"));
 
+        let pctx_menu_width: f32 = 200.0;
+        let pctx_item_height: f32 = 20.0;
+        let pctx_sep_height: f32 = 5.0;
+        let pctx_padding_y: f32 = 8.0;
+        let pctx_menu_height: f32 = items
+            .iter()
+            .map(|(id, _)| {
+                if id.starts_with("sep") {
+                    pctx_sep_height
+                } else {
+                    pctx_item_height
+                }
+            })
+            .sum::<f32>()
+            + pctx_padding_y;
+        let adjusted = clamp_menu_position(pos, pctx_menu_width, pctx_menu_height, window);
+
         let menu = div()
             .absolute()
-            .left(pos.x)
-            .top(pos.y)
-            .w(px(200.0))
+            .left(adjusted.x)
+            .top(adjusted.y)
+            .w(px(pctx_menu_width))
             .py(px(4.0))
             .bg(rgba(theme.tab_bar_background))
             .border_1()
@@ -11688,6 +11709,48 @@ fn truncate(s: &str, max_chars: usize) -> String {
         let cut: String = s.chars().take(max_chars.saturating_sub(1)).collect();
         format!("{cut}…")
     }
+}
+
+/// メニュー位置���計算（純粋関数・テスト��能）。
+/// 見切れる場合はフリップ（メニュー幅/高さ分の引き戻し）、0 未満にはさせない。
+fn compute_menu_position(
+    x: f32,
+    y: f32,
+    menu_width: f32,
+    menu_height: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> (f32, f32) {
+    let rx = if x + menu_width > viewport_width {
+        (x - menu_width).max(0.0)
+    } else {
+        x
+    };
+    let ry = if y + menu_height > viewport_height {
+        (y - menu_height).max(0.0)
+    } else {
+        y
+    };
+    (rx, ry)
+}
+
+/// コンテキストメニューの位置をウインドウ内にクランプする。
+fn clamp_menu_position(
+    pos: Point<Pixels>,
+    menu_width: f32,
+    menu_height: f32,
+    window: &Window,
+) -> Point<Pixels> {
+    let vp = window.viewport_size();
+    let (rx, ry) = compute_menu_position(
+        f32::from(pos.x),
+        f32::from(pos.y),
+        menu_width,
+        menu_height,
+        f32::from(vp.width),
+        f32::from(vp.height),
+    );
+    point(px(rx), px(ry))
 }
 
 /// usage テキストから概算トークン数を抽出する（#217 スパークライン用。
@@ -11987,8 +12050,8 @@ impl Render for TakoApp {
             })
             .collect();
 
-        let context_menu_overlay = self.render_context_menu(cx);
-        let pane_context_overlay = self.render_pane_context_menu(cx);
+        let context_menu_overlay = self.render_context_menu(window, cx);
+        let pane_context_overlay = self.render_pane_context_menu(window, cx);
         // サイドバー tmux ビューのホバープレビュー（FR-2.16.13。マウス位置に実画面サムネイル）
         let hover_preview_overlay = self.render_hover_preview(window);
         // ピン留めされた常駐プレビュー（FR-2.16.15。アプリ内フローティングウィンドウ）
@@ -19889,5 +19952,45 @@ mod git_ancestor_tests {
         let _ = std::fs::create_dir_all(&dir);
         assert!(!has_git_ancestor(&dir));
         let _ = std::fs::remove_dir(&dir);
+    }
+}
+
+#[cfg(test)]
+mod menu_position_tests {
+    use super::compute_menu_position;
+
+    #[test]
+    fn メニューが収まる場合はそのまま() {
+        let (x, y) = compute_menu_position(100.0, 200.0, 180.0, 250.0, 1200.0, 800.0);
+        assert_eq!(x, 100.0);
+        assert_eq!(y, 200.0);
+    }
+
+    #[test]
+    fn 右端を超えたら左へフリップ() {
+        let (x, y) = compute_menu_position(1100.0, 200.0, 180.0, 250.0, 1200.0, 800.0);
+        assert_eq!(x, 1100.0 - 180.0);
+        assert_eq!(y, 200.0);
+    }
+
+    #[test]
+    fn 下端を超えたら上へフリップ() {
+        let (x, y) = compute_menu_position(100.0, 700.0, 180.0, 250.0, 1200.0, 800.0);
+        assert_eq!(x, 100.0);
+        assert_eq!(y, 700.0 - 250.0);
+    }
+
+    #[test]
+    fn 両方超えたら両方フリップ() {
+        let (x, y) = compute_menu_position(1100.0, 700.0, 180.0, 250.0, 1200.0, 800.0);
+        assert_eq!(x, 1100.0 - 180.0);
+        assert_eq!(y, 700.0 - 250.0);
+    }
+
+    #[test]
+    fn フリップ後も負にならない() {
+        let (x, y) = compute_menu_position(50.0, 30.0, 180.0, 250.0, 100.0, 100.0);
+        assert_eq!(x, 0.0);
+        assert_eq!(y, 0.0);
     }
 }
