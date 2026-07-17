@@ -844,7 +844,12 @@
 - 関連コミット: `5dd4bd5`（PR #351 squash merge）。テスト 7 本追加 + fmt / clippy / test 全緑
 - 次: `build-app.sh --install` → 実ファイルでの色分け目視確認
 
-## 2026-07-17（#321: ステータスバー利用制限表示の改修）
-- 「週」→「7d」表記統一 + サービス切替ドロップダウン（claude/codex/agy）+ 色ドット/ラベルで区別 + 選択永続化 + CLI/MCP 1:1（計 99 ツール）
-- 関連コミット: `1f95bf9`（PR #355 squash merge）。dispatch テスト 1 本追加 + 502 tests / fmt / clippy 全緑 + 隔離セルフテスト完走
-- 次: `build-app.sh --install` → 目視チェック → #321 クローズ
+## 2026-07-17（#338: プレビューペインにチェンジログビュー切替を実装）
+- 「履歴」トグルでコード ⇔ git 履歴ビュー切替。コミット一覧 + ファイル単位 diff 展開。CLI `tako preview-changelog` + MCP `tako_preview_changelog`（97 ツール）。隔離セルフテスト完走（FAILED 0 件）
+- 関連コミット: `d29005d`（PR #348 squash merge）。テスト 4 本追加 + 品質ゲート全緑
+- 次: `build-app.sh --install` → 実機確認（目視チェックリスト）→ #338 クローズは master 判断
+
+## 2026-07-17（#357: codex / agy の利用制限データ取得）
+- codex TUI の `primary NN%` / `secondary NN%` スクレイピング + サービス別メトリクス保持 + ドロップダウン実データ表示。agy は取得不能で「--」維持（調査結果を Issue にコメント）
+- 関連コミット: `690d220`（PR #359 squash merge）。テスト 4 本追加 + 品質ゲート全緑
+- 次: `build-app.sh --install` → 有料プラン codex 環境での実測確認（free tier では rate limit 表示なし）
