@@ -889,6 +889,23 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_preview_changelog",
+            "description": "プレビューペインのチェンジログビュー切替（Issue #338）。\
+                enabled=true で git 履歴ベースのファイル変更履歴表示に切り替える。\
+                enabled 省略時は状態取得のみ。expand にコミットハッシュを指定すると diff を展開/折りたたみ。\
+                git 管理外ファイルでは「履歴なし」を返す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象プレビューペイン ID（省略時は呼び出し元）"),
+                    "enabled": { "type": "boolean", "description": "true = チェンジログ表示、false = コードプレビューに戻す" },
+                    "max_count": { "type": "integer", "description": "取得するコミット数の上限（省略時は 50）", "minimum": 1 },
+                    "expand": { "type": "string", "description": "diff を展開/折りたたみするコミットハッシュ" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_file_op",
             "description": "ファイル操作を実行する。op で種別を指定:\n\
                 copy_absolute_path = 絶対パスを取得 / copy_relative_path = ペイン cwd 基準の相対パスを取得 /\n\
@@ -2649,6 +2666,12 @@ fn build_request(
         "tako_preview_autosave" => Request::PreviewAutosave {
             pane: Some(target_pane(args, caller)?),
             enabled: bool_arg(args, "enabled")?,
+        },
+        "tako_preview_changelog" => Request::PreviewChangelog {
+            pane: Some(target_pane(args, caller)?),
+            enabled: bool_arg(args, "enabled")?,
+            max_count: u64_arg(args, "max_count")?.map(|v| v as usize),
+            expand: str_arg(args, "expand")?,
         },
         "tako_file_op" => {
             let op_str = str_arg(args, "op")?.ok_or("op を指定する")?;

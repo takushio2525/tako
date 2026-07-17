@@ -220,6 +220,24 @@ pub struct VideoData {
     pub file_size: u64,
 }
 
+/// チェンジログビューの 1 コミットエントリ（Issue #338）
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangelogEntry {
+    pub commit: tako_core::GitCommit,
+    /// diff 展開中なら Some（hunks）。折りたたみ中なら None
+    pub expanded_diff: Option<Vec<tako_core::DiffHunk>>,
+}
+
+/// チェンジログビュー全体のデータ（Issue #338）
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ChangelogData {
+    pub entries: Vec<ChangelogEntry>,
+    /// git リポジトリのルートパス（diff 取得時に使う）
+    pub repo_root: Option<std::path::PathBuf>,
+    /// リポジトリ内の相対パス（diff 取得時に使う）
+    pub rel_path: Option<String>,
+}
+
 /// 読み込み済みのプレビュー内容
 #[derive(Debug, Clone, PartialEq)]
 pub enum PreviewContent {

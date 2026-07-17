@@ -83,6 +83,9 @@ enum Command {
     /// デコード済みプレビュー画像キャッシュの上限（MiB）と利用状況
     #[command(name = "preview-cache")]
     PreviewCache(PreviewCacheArgs),
+    /// プレビューのチェンジログビュー切替・diff 展開（Issue #338）
+    #[command(name = "preview-changelog")]
+    PreviewChangelog(PreviewChangelogArgs),
     /// コードプレビューの軽量編集（開始 / 全文適用 / 保存）
     #[command(subcommand)]
     Edit(EditCommand),
@@ -1593,6 +1596,23 @@ struct ToggleArgs {
 struct PreviewCacheArgs {
     /// キャッシュ上限（MiB、256〜8192。省略時は利用状況を表示）
     max_mb: Option<u64>,
+}
+
+/// チェンジログビューの引数（Issue #338）
+#[derive(Args)]
+struct PreviewChangelogArgs {
+    /// 対象プレビューペイン ID（省略時は呼び出し元）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// on = チェンジログ表示、off = コードプレビューに戻す（省略時は状態取得）
+    #[arg(value_parser = ["on", "off"])]
+    mode: Option<String>,
+    /// 取得するコミット数の上限（省略時は 50）
+    #[arg(long)]
+    max_count: Option<usize>,
+    /// 指定コミットハッシュの diff を展開/折りたたみ
+    #[arg(long)]
+    expand: Option<String>,
 }
 
 /// UI テーマコマンドの引数（Issue #217）
@@ -3229,6 +3249,12 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::PreviewCache(args) => Request::PreviewCache {
             max_mb: args.max_mb,
         },
+        Command::PreviewChangelog(args) => Request::PreviewChangelog {
+            pane: target_pane(args.pane)?,
+            enabled: args.mode.as_deref().map(|s| s == "on"),
+            max_count: args.max_count,
+            expand: args.expand.clone(),
+        },
         Command::Edit(command) => match command {
             EditCommand::Start { pane } => Request::PreviewEdit {
                 pane: target_pane(*pane)?,
@@ -4534,7 +4560,9 @@ fn print_result(command: &Command, result: &Value) {
         }
         Command::PreviewLinkList(_) => println!("{}", pretty_json(result)),
         Command::PreviewFollowLink(_) => println!("{result}"),
-        Command::PreviewReload(_) | Command::PreviewCache(_) => println!("{result}"),
+        Command::PreviewReload(_) | Command::PreviewCache(_) | Command::PreviewChangelog(_) => {
+            println!("{result}")
+        }
         Command::Autorename(_)
         | Command::Portdetect(_)
         | Command::Persist(_)

@@ -317,6 +317,28 @@ pub trait PreviewHost {
     ) -> Result<serde_json::Value, String> {
         Err("プレビュー編集は未対応".into())
     }
+    /// プレビューペインのチェンジログビュー状態（Issue #338）。
+    /// `(enabled, commits_json)` を返す。enabled=true ならチェンジログ表示中。
+    fn preview_changelog_state(&self, _pane: PaneId) -> Option<bool> {
+        None
+    }
+    /// チェンジログビューの ON/OFF 切替。コミット一覧の取得・描画は実装側の責務。
+    fn set_preview_changelog(
+        &mut self,
+        _pane: PaneId,
+        _enabled: bool,
+        _max_count: usize,
+    ) -> Result<serde_json::Value, String> {
+        Err("チェンジログビューは未対応".into())
+    }
+    /// チェンジログビューで特定コミットの diff を展開/折りたたみする。
+    fn toggle_changelog_diff(
+        &mut self,
+        _pane: PaneId,
+        _hash: &str,
+    ) -> Result<serde_json::Value, String> {
+        Err("チェンジログビューは未対応".into())
+    }
     /// タブ内の既存プレビューペイン（OpenFile の再利用先。VSCode のプレビュータブ相当）
     fn preview_pane_of_tab(&self, _tab: TabId) -> Option<PaneId> {
         None

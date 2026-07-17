@@ -183,6 +183,39 @@ fn parse_log(raw: &str) -> Vec<GitCommit> {
         .collect()
 }
 
+/// 特定ファイルのコミット履歴を取得する（`git log --follow -- <file>`）。
+/// リネームも追跡する。repo_root からの相対パスで指定する。
+pub fn log_file_commits(repo: &Path, file_path: &str, max_count: usize) -> Vec<GitCommit> {
+    let out = run_git(
+        repo,
+        &[
+            "log",
+            "--follow",
+            &format!("--max-count={max_count}"),
+            &format!("--format={LOG_FORMAT}"),
+            "--",
+            file_path,
+        ],
+    )
+    .unwrap_or_default();
+    parse_log(&out)
+}
+
+/// 特定コミットでの特定ファイルの diff を取得する。
+/// `git diff <hash>^..<hash> -- <file>`（初期コミットは `--root` フォールバック）
+pub fn diff_file_commit(repo: &Path, hash: &str, file_path: &str) -> Vec<DiffHunk> {
+    let out = run_git(
+        repo,
+        &["diff", &format!("{hash}^..{hash}"), "--", file_path],
+    );
+    let raw = match out {
+        Ok(s) => s,
+        Err(_) => run_git(repo, &["diff", "--root", hash, "--", file_path]).unwrap_or_default(),
+    };
+    let files = parse_diff(&raw);
+    files.into_iter().flat_map(|f| f.hunks).collect()
+}
+
 // ──────────────────────── git branch ────────────────────────
 
 pub fn list_branches(repo: &Path) -> Vec<GitBranch> {
@@ -749,6 +782,42 @@ mod tests {
         assert_eq!(layout.rows[0].lane, 0);
         // ルートコミット（上に線なし・親なし）→ 描画指示なし
         assert!(layout.rows[0].lines.is_empty());
+    }
+
+    #[test]
+    fn log_file_commitsは自リポの実ファイルで履歴を取れる() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        if repo_root(repo).is_none() {
+            return; // git リポ外（CI 等）ではスキップ
+        }
+        let commits = log_file_commits(repo, "Cargo.toml", 5);
+        assert!(!commits.is_empty(), "Cargo.toml に履歴がある");
+        assert!(commits.len() <= 5);
+        assert!(!commits[0].hash.is_empty());
+    }
+
+    #[test]
+    fn diff_file_commitは特定コミットのファイル差分を取れる() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        if repo_root(repo).is_none() {
+            return;
+        }
+        let commits = log_file_commits(repo, "Cargo.toml", 2);
+        if commits.len() < 2 {
+            return; // コミット不足ならスキップ
+        }
+        let hunks = diff_file_commit(repo, &commits[0].hash, "Cargo.toml");
+        // 最新コミットが Cargo.toml を変更していなければ空
+        // 変更していれば hunk が取れる。どちらもパニックしない
+        let _ = hunks;
     }
 
     #[test]

@@ -791,6 +791,8 @@ struct TakoApp {
     preview_image_lru: tako_core::ByteLru<PreviewImageCacheEntryKey>,
     /// LRU / close で外した GPUI asset。次の render 冒頭で atlas と一緒に解放する。
     pending_preview_image_evictions: Vec<std::sync::Arc<gpui::Image>>,
+    /// チェンジログビューのデータ（Issue #338。pane ごと）
+    preview_changelogs: HashMap<PaneId, preview::ChangelogData>,
     /// PDF・画像プレビューのズーム / パン / ページ状態（#234。core モデル）。
     preview_views: HashMap<PaneId, tako_core::PreviewViewState>,
     /// PDF・画像プレビューの 2 軸スクロールとページ移動を共有する GPUI handle。
@@ -1751,6 +1753,7 @@ impl TakoApp {
             preview_image_cache: HashMap::new(),
             preview_image_lru: tako_core::ByteLru::new(initial_preview_cache_budget()),
             pending_preview_image_evictions: Vec::new(),
+            preview_changelogs: HashMap::new(),
             preview_views: HashMap::new(),
             preview_scroll_handles: HashMap::new(),
             video_seek_bar_bounds: HashMap::new(),
@@ -4212,6 +4215,7 @@ impl TakoApp {
                 self.video_players.remove(&pane_id);
                 self.remove_video_frame_cache(pane_id);
                 self.remove_preview_image_cache(pane_id);
+                self.preview_changelogs.remove(&pane_id);
                 self.preview_views.remove(&pane_id);
                 self.preview_scroll_handles.remove(&pane_id);
                 self.pending_pdf_rasters.remove(&pane_id);
@@ -11025,6 +11029,106 @@ impl PreviewHost for TakoApp {
             .into_iter()
             .map(|p| p.id())
             .find(|id| self.previews.contains_key(id))
+    }
+
+    fn preview_changelog_state(&self, pane: PaneId) -> Option<bool> {
+        if self.previews.contains_key(&pane) {
+            Some(self.preview_changelogs.contains_key(&pane))
+        } else {
+            None
+        }
+    }
+
+    fn set_preview_changelog(
+        &mut self,
+        pane: PaneId,
+        enabled: bool,
+        max_count: usize,
+    ) -> Result<serde_json::Value, String> {
+        let state = self
+            .previews
+            .get(&pane)
+            .ok_or_else(|| format!("プレビューペインではない: {}", pane.as_u64()))?;
+        if !enabled {
+            self.preview_changelogs.remove(&pane);
+            return Ok(serde_json::json!({
+                "pane": pane.as_u64(),
+                "changelog": false,
+            }));
+        }
+        let path = state.path.clone();
+        let repo = tako_core::git::repo_root(&path);
+        let repo = match repo {
+            Some(r) => r,
+            None => {
+                let data = preview::ChangelogData::default();
+                self.preview_changelogs.insert(pane, data);
+                return Ok(serde_json::json!({
+                    "pane": pane.as_u64(),
+                    "changelog": true,
+                    "commits": 0,
+                    "message": "git 管理外のファイル",
+                }));
+            }
+        };
+        let rel = path
+            .strip_prefix(&repo)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| path.to_string_lossy().to_string());
+        let commits = tako_core::git::log_file_commits(&repo, &rel, max_count);
+        let commit_count = commits.len();
+        let entries: Vec<preview::ChangelogEntry> = commits
+            .into_iter()
+            .map(|c| preview::ChangelogEntry {
+                commit: c,
+                expanded_diff: None,
+            })
+            .collect();
+        let data = preview::ChangelogData {
+            entries,
+            repo_root: Some(repo),
+            rel_path: Some(rel),
+        };
+        self.preview_changelogs.insert(pane, data);
+        Ok(serde_json::json!({
+            "pane": pane.as_u64(),
+            "changelog": true,
+            "commits": commit_count,
+        }))
+    }
+
+    fn toggle_changelog_diff(
+        &mut self,
+        pane: PaneId,
+        hash: &str,
+    ) -> Result<serde_json::Value, String> {
+        let data = self
+            .preview_changelogs
+            .get_mut(&pane)
+            .ok_or("チェンジログビューが有効ではない")?;
+        let entry = data
+            .entries
+            .iter_mut()
+            .find(|e| e.commit.hash == hash || e.commit.short_hash == hash)
+            .ok_or_else(|| format!("コミット {} が見つからない", hash))?;
+        if entry.expanded_diff.is_some() {
+            entry.expanded_diff = None;
+            Ok(serde_json::json!({
+                "pane": pane.as_u64(),
+                "hash": hash,
+                "expanded": false,
+            }))
+        } else {
+            let repo = data.repo_root.as_deref().ok_or("リポジトリ情報がない")?;
+            let rel = data.rel_path.as_deref().ok_or("ファイルパス情報がない")?;
+            let hunks = tako_core::git::diff_file_commit(repo, &entry.commit.hash, rel);
+            entry.expanded_diff = Some(hunks);
+            Ok(serde_json::json!({
+                "pane": pane.as_u64(),
+                "hash": hash,
+                "expanded": true,
+            }))
+        }
     }
 }
 
