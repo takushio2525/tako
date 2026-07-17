@@ -813,3 +813,8 @@
 - 根因 = `update_sleep_guard()` が OSC 133 の `CommandState::Running` のみカウント。persist 復元後は `Unknown` のまま遷移しないため常に 0。`Unknown` バックエンドセッションの子プロセスをバッチ判定し busy にカウントする修正
 - 関連コミット: PR #328 squash merge（`f685e27`）。worktree 掃除・Issue 証拠コメント済み
 - 次: `build-app.sh --install` → 暫定運用復帰 → ユーザー実機確認 → #324 クローズ
+
+## 2026-07-17（#313: git タブがファイルツリーの表示リポジトリに追随しない問題を根治）
+- 根因 = git タブが `active_tab_cwd()`（フォーカスペインの cwd のみ）を参照。ファイルツリーは全ペイン cwd + pinned フォルダを集約するが git タブはこのソースを見ていなかった。`git_cwd_for_tab()` を新設しフォールバック検索に変更
+- 関連コミット: PR #331 squash merge（`2606d03`）。worktree 掃除・Issue 証拠コメント済み
+- 次: `build-app.sh --install` → ユーザー実機確認 → #313 クローズ
