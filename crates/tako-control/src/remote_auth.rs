@@ -473,15 +473,24 @@ pub enum Identity {
     Local,
 }
 
-/// 層①の識別: `X-Forwarded-For` ヘッダと whois 照合から接続元を特定する。
+/// 層①の識別: `X-Forwarded-For` + `X-Forwarded-Host` ヘッダと whois 照合から
+/// 接続元を特定する。
 /// - ヘッダ無し → Local（serve を経由していない）
-/// - ヘッダあり + whois 成功 → Tailnet
-/// - ヘッダあり + peer not found → Err（偽装 or 不正経路。拒否）
+/// - XFF あり + XFH が期待ホスト名と一致 + whois 成功 → Tailnet
+/// - XFF あり + XFH 不一致/欠落 → Err（XFF 偽装の可能性。拒否）
+/// - XFF あり + peer not found → Err（偽装 or 不正経路。拒否）
 /// - whois 実行失敗 → Err（安全側に拒否）
+///
+/// `expected_host`: daemon 起動時に `tailscale status --json` から取得した自ノードの
+/// ts.net ホスト名（例: `mac.tail1234.ts.net`）。`tailscale serve` は
+/// `X-Forwarded-Host` をこの値に設定する。ローカルプロセスが XFF を偽装する場合、
+/// XFH も正しく設定する必要があり、攻撃の敷居を上げる（#287 P1-1）
 pub fn identify(
     registry: &Mutex<DeviceRegistry>,
     ts_cli: &str,
     forwarded_for: Option<&str>,
+    forwarded_host: Option<&str>,
+    expected_host: &str,
 ) -> Result<Identity, String> {
     let Some(xff) = forwarded_for else {
         return Ok(Identity::Local);
@@ -490,6 +499,19 @@ pub fn identify(
     let ip = xff.split(',').next().unwrap_or("").trim().to_string();
     if ip.is_empty() {
         return Err("X-Forwarded-For が空".into());
+    }
+    // XFF がある場合、X-Forwarded-Host も serve が付与するはず。
+    // 欠落または期待値と不一致なら偽装の可能性が高い
+    match forwarded_host {
+        None => {
+            return Err(
+                "X-Forwarded-For はあるが X-Forwarded-Host が欠落（serve 経由でない可能性）".into(),
+            );
+        }
+        Some(xfh) if !host_matches(xfh, expected_host) => {
+            return Err(format!("X-Forwarded-Host が期待値と不一致（受信: {xfh}）"));
+        }
+        _ => {}
     }
     if let Ok(mut reg) = registry.lock() {
         if let Some(info) = reg.cached_whois(&ip) {
@@ -508,6 +530,12 @@ pub fn identify(
         )),
         Err(WhoisError::Failed(e)) => Err(format!("接続元の identity 検証に失敗: {e}")),
     }
+}
+
+/// X-Forwarded-Host が期待するホスト名と一致するか判定する。
+/// serve は `<hostname>.<tailnet>.ts.net` を設定する。大文字小文字は無視する
+fn host_matches(xfh: &str, expected: &str) -> bool {
+    xfh.eq_ignore_ascii_case(expected)
 }
 
 #[cfg(test)]
@@ -713,5 +741,65 @@ mod tests {
         assert!(rotated.exists(), "ローテート先が存在する");
         let fresh = std::fs::read_to_string(dir.path().join("audit.log")).expect("read");
         assert_eq!(fresh.lines().count(), 1, "新ログは 1 行から始まる");
+    }
+
+    // --- P1-1: XFF 偽装対策のテスト (#287) ---
+
+    #[test]
+    fn xffなしはlocal() {
+        let (_dir, reg) = temp_registry("id-local");
+        let reg = Mutex::new(reg);
+        let result = identify(&reg, "tailscale", None, None, "mac.tail1234.ts.net");
+        assert_eq!(result.unwrap(), Identity::Local);
+    }
+
+    #[test]
+    fn xffありxfh欠落は拒否() {
+        let (_dir, reg) = temp_registry("id-no-xfh");
+        let reg = Mutex::new(reg);
+        let result = identify(
+            &reg,
+            "tailscale",
+            Some("100.1.2.3"),
+            None,
+            "mac.tail1234.ts.net",
+        );
+        assert!(result.is_err(), "XFH 欠落は偽装として拒否されるべき");
+        assert!(result.unwrap_err().contains("X-Forwarded-Host が欠落"));
+    }
+
+    #[test]
+    fn xffありxfh不一致は拒否() {
+        let (_dir, reg) = temp_registry("id-xfh-mismatch");
+        let reg = Mutex::new(reg);
+        let result = identify(
+            &reg,
+            "tailscale",
+            Some("100.1.2.3"),
+            Some("attacker.evil.ts.net"),
+            "mac.tail1234.ts.net",
+        );
+        assert!(result.is_err(), "XFH 不一致は偽装として拒否されるべき");
+        assert!(result.unwrap_err().contains("不一致"));
+    }
+
+    #[test]
+    fn xffが空文字は拒否() {
+        let (_dir, reg) = temp_registry("id-xff-empty");
+        let reg = Mutex::new(reg);
+        let result = identify(
+            &reg,
+            "tailscale",
+            Some(""),
+            Some("mac.tail1234.ts.net"),
+            "mac.tail1234.ts.net",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn host_matchesは大文字小文字を無視する() {
+        assert!(host_matches("Mac.Tail1234.ts.net", "mac.tail1234.ts.net"));
+        assert!(!host_matches("other.ts.net", "mac.tail1234.ts.net"));
     }
 }

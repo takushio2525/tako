@@ -215,6 +215,8 @@ struct DaemonCtx {
     /// 稼働ポート・公開 URL（admin state 表示用）
     port: u16,
     base_url: String,
+    /// 自ノードの ts.net ホスト名（XFF 検証用。#287 P1-1）
+    expected_host: String,
 }
 
 impl DaemonCtx {
@@ -288,7 +290,14 @@ fn authorize_device(
     required: DeviceRole,
 ) -> AuthDecision {
     let forwarded = header_value(request, "x-forwarded-for");
-    match crate::remote_auth::identify(&ctx.registry, &ctx.ts_cli, forwarded.as_deref()) {
+    let forwarded_host = header_value(request, "x-forwarded-host");
+    match crate::remote_auth::identify(
+        &ctx.registry,
+        &ctx.ts_cli,
+        forwarded.as_deref(),
+        forwarded_host.as_deref(),
+        &ctx.expected_host,
+    ) {
         Ok(Identity::Tailnet(who)) => {
             let mut reg = ctx.registry.lock().unwrap();
             match reg.device(&who.stable_id).cloned() {
@@ -327,7 +336,14 @@ fn identify_tailnet(
     request: &tiny_http::Request,
 ) -> Result<crate::tailscale::WhoisInfo, (u16, String)> {
     let forwarded = header_value(request, "x-forwarded-for");
-    match crate::remote_auth::identify(&ctx.registry, &ctx.ts_cli, forwarded.as_deref()) {
+    let forwarded_host = header_value(request, "x-forwarded-host");
+    match crate::remote_auth::identify(
+        &ctx.registry,
+        &ctx.ts_cli,
+        forwarded.as_deref(),
+        forwarded_host.as_deref(),
+        &ctx.expected_host,
+    ) {
         Ok(Identity::Tailnet(who)) => Ok(who),
         Ok(Identity::Local) => Err((
             401,
@@ -981,6 +997,11 @@ pub fn run_daemon(port: Option<u16>) -> io::Result<()> {
     println!("{info}");
 
     // daemon 共有コンテキスト（二層認証・接続追跡。#283）
+    // base_url は "https://<host>.ts.net" 形式。expected_host はスキーム除去
+    let expected_host = base_url
+        .strip_prefix("https://")
+        .unwrap_or(&base_url)
+        .to_string();
     let ctx = Arc::new(DaemonCtx {
         registry: Mutex::new(registry),
         ts_cli: ts_cli.clone(),
@@ -989,6 +1010,7 @@ pub fn run_daemon(port: Option<u16>) -> io::Result<()> {
         ws_connections: Mutex::new(HashMap::new()),
         port: actual_port,
         base_url: base_url.clone(),
+        expected_host,
     });
 
     // IPC 接続（#281: dispatch 正規経路。app 不在時は read-only fallback）
@@ -3279,8 +3301,39 @@ fn handle_upload(
         );
     }
 
+    // symlink follow 拒否: upload_dir 自体がシンボリックリンクなら拒否する。
+    // リンク先への意図しない書き込み（任意パスへのファイル配置）を防ぐ（#287 P2-4）
+    if upload_dir
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return respond(
+            request,
+            400,
+            Some(
+                json!({ "error": "アップロード先がシンボリックリンクのため拒否しました" })
+                    .to_string(),
+            ),
+        );
+    }
+
     // パスの最終検証（canonicalize で traversal を防止）
     let target_path = upload_dir.join(&file_name);
+
+    // target_path が既存の symlink なら拒否（上書きによるリンク先改変を防ぐ。#287 P2-4）
+    if target_path
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return respond(
+            request,
+            400,
+            Some(
+                json!({ "error": "既存のシンボリックリンクへの上書きは拒否しました" }).to_string(),
+            ),
+        );
+    }
+
     let canonical_dir = match upload_dir.canonicalize() {
         Ok(p) => p,
         Err(e) => {
@@ -3292,7 +3345,7 @@ fn handle_upload(
         }
     };
 
-    // ファイル書き込み（実行権限なし: 0o644）
+    // ファイル書き込み（所有者のみ読み書き可。#287 P2-1）
     use std::io::Write;
     let mut file = match std::fs::OpenOptions::new()
         .write(true)
@@ -3318,11 +3371,12 @@ fn handle_upload(
     }
     drop(file);
 
-    // 実行権限を除去（Unix のみ）
+    // 所有者のみ読み書き可（0o600）。リモート端末から受信したファイルは
+    // 本人以外がアクセスする必要がない（#287 P2-1）
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(0o600));
     }
 
     // canonicalize で traversal していないことを最終確認
@@ -3337,14 +3391,13 @@ fn handle_upload(
         }
     }
 
-    // 監査ログ
+    // 監査ログ（ファイル名はペイン内容に準じ記録しない。バイト数のみ。#287 P2-2）
     ctx.registry.lock().unwrap().audit(
         "upload",
         &device.id,
         &device.name,
         json!({
-            "file": file_name,
-            "size": file_data.len(),
+            "bytes": file_data.len(),
             "pane": pane_id,
         }),
     );

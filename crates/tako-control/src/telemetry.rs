@@ -79,7 +79,71 @@ pub fn mask_paths(input: &str) -> String {
     let re_var = regex_lite_replace(&result, r"/var/folders/[^/]+/[^/]+", "/var/folders/<tmp>");
     result = re_var;
 
+    // Windows の C:\Users\<name> パターン（#287 P2-3）
+    result = replace_windows_user_paths(&result);
+
     result
+}
+
+/// Windows の `C:\Users\<name>` パターンをマスクする。
+/// ドライブレターは任意（C / D / ...）。バックスラッシュとスラッシュの両方に対応する
+fn replace_windows_user_paths(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut remaining = input;
+    while !remaining.is_empty() {
+        if let Some(m) = find_windows_user_path(remaining) {
+            result.push_str(&remaining[..m.start]);
+            result.push_str(&remaining[m.start..m.start + m.prefix_len]);
+            result.push_str("<user>");
+            remaining = &remaining[m.end..];
+        } else {
+            result.push_str(remaining);
+            break;
+        }
+    }
+    result
+}
+
+struct WinUserMatch {
+    start: usize,
+    prefix_len: usize,
+    end: usize,
+}
+
+fn find_windows_user_path(input: &str) -> Option<WinUserMatch> {
+    let bytes = input.as_bytes();
+    for i in 0..bytes.len() {
+        // ドライブレター + :\ or :/
+        if i + 9 > bytes.len() {
+            break;
+        }
+        if !bytes[i].is_ascii_alphabetic() || bytes[i + 1] != b':' {
+            continue;
+        }
+        let sep = bytes[i + 2];
+        if sep != b'\\' && sep != b'/' {
+            continue;
+        }
+        let after_drive = &input[i + 3..];
+        let users_prefix = if sep == b'\\' { "Users\\" } else { "Users/" };
+        if !after_drive.starts_with(users_prefix) {
+            continue;
+        }
+        let prefix_len = 3 + users_prefix.len(); // "C:\Users\"
+        let name_start = i + prefix_len;
+        let name_end = input[name_start..]
+            .find(|c: char| c == '\\' || c == '/' || c.is_whitespace())
+            .map(|j| name_start + j)
+            .unwrap_or(input.len());
+        if name_end > name_start {
+            return Some(WinUserMatch {
+                start: i,
+                prefix_len,
+                end: name_end,
+            });
+        }
+    }
+    None
 }
 
 fn dirs_home() -> Option<String> {
@@ -447,5 +511,37 @@ mod tests {
         let input = "at /Users/alice/a.rs:1 and /Users/bob/b.rs:2";
         let masked = mask_paths(input);
         assert_eq!(masked, "at /Users/<user>/a.rs:1 and /Users/<user>/b.rs:2");
+    }
+
+    // --- P2-3: Windows パスのマスク (#287) ---
+
+    #[test]
+    fn windowsパスのバックスラッシュをマスクする() {
+        let input = r"panicked at C:\Users\alice\dev\project\src\main.rs:42";
+        let masked = mask_paths(input);
+        assert_eq!(
+            masked,
+            r"panicked at C:\Users\<user>\dev\project\src\main.rs:42"
+        );
+    }
+
+    #[test]
+    fn windowsパスのスラッシュもマスクする() {
+        let input = "at D:/Users/bob/code/file.rs:10";
+        let masked = mask_paths(input);
+        assert_eq!(masked, "at D:/Users/<user>/code/file.rs:10");
+    }
+
+    #[test]
+    fn windows複数パスのマスク() {
+        let input = r"C:\Users\a\x.rs and D:\Users\b\y.rs";
+        let masked = mask_paths(input);
+        assert_eq!(masked, r"C:\Users\<user>\x.rs and D:\Users\<user>\y.rs");
+    }
+
+    #[test]
+    fn windowsパスを含まない文字列はそのまま() {
+        let input = "C:\\Program Files\\app";
+        assert_eq!(mask_paths(input), input);
     }
 }
