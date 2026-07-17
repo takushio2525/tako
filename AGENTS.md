@@ -55,6 +55,10 @@ tako/
 - 新機能の操作ロジックは tako-core の操作 API として実装し、`tako-control::dispatch`
   （protocol + ControlHost）へ 1:1 で載せる（UI 層に閉じたロジックを作らない）。
   Phase 2 以降、CLI はこの経路で操作できる。MCP 公開（Phase 3）も同じ dispatch を呼ぶ
+- **「最も簡単なコマンドを提案する」原則（#322）**: ユーザーへ提示するコマンドは常に最簡形
+  （既定値で済む引数を付けない。`tako master -default` ではなく `tako master`）。機能追加は
+  新しい `--オプション` ではなく既定動作を賢くする方向で設計する。CLI 出力・system prompt・
+  docs のすべてに適用。詳細は `.agent/conventions.md`「コマンド案内の規約」
 
 ## コマンド
 

@@ -1,5 +1,8 @@
 # Git 運用
 
+<!-- coverage: コミット規約 = コミット | commit -->
+<!-- coverage: push・ブランチ運用 = push | ブランチ | branch | マージ | merge | pull request -->
+
 ## 必須概念
 
 - コミットメッセージのフォーマットを定義する
