@@ -35,9 +35,23 @@ tako はターミナルでありながら、エディタのようなファイル
 
 ファイルをクリックまたは `tako open <ファイルパス>` で、ペイン内にファイル内容を表示します。
 
-- **シンタックスハイライト**: syntect エンジンによる高精度なハイライト。多数の言語に対応
+- **シンタックスハイライト**: 210+ の言語・形式に対応（bat 由来の拡張構文セット）
 - **行番号表示**: 行番号付きのコードビュー
 - **折り返し**: 長い行は自動折り返し（横スクロール不要）
+
+### 対応形式（主要なもの）
+
+| カテゴリ | 対応形式 |
+|---|---|
+| システム言語 | Rust, C, C++, Go, Swift, Kotlin, Java, C#, Objective-C, Scala, Haskell, D |
+| Web / スクリプト | JavaScript (.js/.jsx/.mjs), TypeScript (.ts/.tsx), Python, Ruby, PHP, Lua, Perl, HTML, CSS |
+| シェル | Bash (.sh/.bash/.zsh), Fish |
+| データ形式 | JSON, TOML, YAML, XML, INI, CSV, DotENV (.env) |
+| ドキュメント | Markdown, LaTeX, reStructuredText |
+| ビルド / 設定 | Dockerfile, Makefile, CMake, SQL, Diff/Patch |
+| その他 | Git Ignore, Git Attributes, AppleScript, R, Clojure, Erlang, Groovy, nginx.conf 等 |
+
+拡張子に加え、ファイル名でも判定します（例: `Cargo.lock` → TOML, `Dockerfile` → Dockerfile, `CMakeLists.txt` → CMake, `.gitignore` → Git Ignore）。shebang（`#!/bin/bash` 等）による自動検出にも対応しています。
 
 ## Markdown プレビュー
 
