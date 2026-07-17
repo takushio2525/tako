@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
-import { getActiveMachine } from '../store';
 import { createClient } from '../api';
 
 function SkeletonCard() {
@@ -45,7 +44,7 @@ function stateLabel(st) {
 
 const PULL_THRESHOLD = 80;
 
-export function PanesPage() {
+export function PanesPage({ me }) {
   const [panes, setPanes] = useState([]);
   const [previews, setPreviews] = useState({});
   const [loading, setLoading] = useState(true);
@@ -53,14 +52,12 @@ export function PanesPage() {
   const [pulling, setPulling] = useState(false);
   const [pullY, setPullY] = useState(0);
   const [filter, setFilter] = useState('all');
-  const machine = getActiveMachine();
   const timerRef = useRef(null);
   const touchStartRef = useRef({ y: 0, scrollTop: 0 });
   const listRef = useRef(null);
 
   const refresh = useCallback(async (client) => {
-    const c = client || (machine && createClient(machine.host, machine.token));
-    if (!c) return;
+    const c = client || createClient();
     try {
       const result = await c.panes();
       const list = result.panes || [];
@@ -74,14 +71,18 @@ export function PanesPage() {
           .catch(() => {});
       }
     } catch (e) {
+      // 403 = 登録が失効した（revoke）。リロードでペアリング画面へ戻す
+      if (e.status === 403) {
+        window.location.reload();
+        return;
+      }
       setError(e.message);
       setLoading(false);
     }
-  }, [machine]);
+  }, []);
 
   useEffect(() => {
-    if (!machine) { window.location.hash = '#/'; return; }
-    const client = createClient(machine.host, machine.token);
+    const client = createClient();
     refresh(client);
     timerRef.current = setInterval(() => refresh(client), 3000);
     return () => clearInterval(timerRef.current);
@@ -112,8 +113,6 @@ export function PanesPage() {
     }
   }
 
-  if (!machine) return null;
-
   const counts = { all: panes.length, busy: 0, running: 0, idle: 0, error: 0 };
   panes.forEach(p => { counts[stateOf(p)]++; });
   const filtered = filter === 'all' ? panes : panes.filter(p => stateOf(p) === filter);
@@ -122,10 +121,9 @@ export function PanesPage() {
     <div class="page">
       <div class="panes-header" style={`padding-top: calc(8px + env(safe-area-inset-top, 0px))`}>
         <div class="panes-header-row">
-          <div class="machine-chip" onClick={() => { window.location.hash = '#/'; }}>
+          <div class="machine-chip">
             <span class="dot online" style="width: 7px; height: 7px;" />
-            <span class="chip-name">{machine.name}</span>
-            <span class="chip-arrow">▾</span>
+            <span class="chip-name">{(me && me.host) || 'tako'}</span>
           </div>
         </div>
         <div style="display: flex; gap: 7px; overflow-x: auto;">

@@ -102,14 +102,6 @@ ditto -c -k --keepParent "$APP" "$ZIP_PATH"
 ZIP_SIZE=$(du -h "$ZIP_PATH" | cut -f1 | xargs)
 echo "    生成完了: $ZIP_PATH ($ZIP_SIZE)"
 
-# --- リモート PWA を Cloudflare Pages へデプロイ（接続入口の固定 URL。Issue #91）---
-# 接続リンクは常に https://tako-remote.pages.dev を指すため、リリース公開時に
-# Pages 側の PWA も同時に最新化する（--draft では実行しない）
-if [[ $PUBLISH -eq 1 ]]; then
-  echo "==> リモート PWA を Cloudflare Pages へデプロイ"
-  "$REPO_ROOT/scripts/deploy-pages.sh"
-fi
-
 # --- リリース作成 ---
 if [[ $PUBLISH -eq 1 ]] || [[ $DRAFT -eq 1 ]]; then
   if ! command -v gh >/dev/null; then

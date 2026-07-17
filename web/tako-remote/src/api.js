@@ -1,11 +1,15 @@
 const TIMEOUT_MS = 10000;
 
-export function createClient(host, token) {
-  const raw = host.replace(/\/+$/, '');
-  const base = /^https?:\/\//.test(raw) ? raw : `http://${raw}`;
+// PWA は daemon 自身（Tailscale Serve 経由の固定 ts.net URL）から配信されるため、
+// API は常に同一 origin。認証は機器ペアリング二層認証がサーバー側で行う（#283）:
+// - 層①: tailscale serve が付与する identity ヘッダ（クライアント側の作業なし）
+// - 層②: Mac 画面で承認された端末か（未登録なら /api/me が registered=false を返す）
+// 旧方式の bearer token・localStorage 保存は全廃した。
+export function createClient() {
+  const base = window.location.origin;
 
   async function request(method, path, body) {
-    const headers = { 'Authorization': `Bearer ${token}` };
+    const headers = {};
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json';
     }
@@ -17,7 +21,9 @@ export function createClient(host, token) {
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
-      throw new Error(err.error || `HTTP ${resp.status}`);
+      const e = new Error(err.error || `HTTP ${resp.status}`);
+      e.status = resp.status;
+      throw e;
     }
     return resp.json();
   }
@@ -30,6 +36,14 @@ export function createClient(host, token) {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
       });
+    },
+    // この端末の登録状態（registered / pending / denied / role）
+    me() {
+      return request('GET', '/api/me');
+    },
+    // ペアリング / role 変更を要求する（Mac 画面に承認ダイアログが出る）
+    pair(name, role = 'observe') {
+      return request('POST', '/api/pair', { name, role });
     },
     panes() {
       return request('GET', '/api/panes');
@@ -65,8 +79,9 @@ export function createClient(host, token) {
       const hostPart = base.replace(/^https?:\/\//, '');
       return `${proto}://${hostPart}/ws?pane=${encodeURIComponent(paneId)}`;
     },
+    // WS の認証もサーバー側の identity + ペアリング照合（サブプロトコルに secret を載せない）
     wsProtocols() {
-      return ['tako-remote', `token.${token}`];
+      return ['tako-remote'];
     },
     base() {
       return base;

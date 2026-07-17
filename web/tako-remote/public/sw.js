@@ -1,4 +1,4 @@
-const CACHE = 'tako-remote-v2';
+const CACHE = 'tako-remote-v3';
 const SHELL = ['/', '/index.html', '/manifest.json', '/icons/icon.svg'];
 
 self.addEventListener('install', e => {

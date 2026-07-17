@@ -13,7 +13,6 @@
 // 履歴 DOM は Preact を通さず直接 append する（数千行の vdom diff を避ける）。
 // ライブ画面 DOM は update ごとに丸ごと置き換える（高々数十行なので軽い）。
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
-import { getActiveMachine } from '../store';
 import { createClient } from '../api';
 import { parseAnsiLine, defaultSgrState, colorToCss } from '../ansi';
 
@@ -157,8 +156,6 @@ export function TerminalPage({ paneId }) {
     const saved = parseInt(localStorage.getItem(FONT_KEY) || '', 10);
     return Number.isFinite(saved) && saved >= FONT_MIN && saved <= FONT_MAX ? saved : 13;
   });
-  const machine = getActiveMachine();
-
   const readerRef = useRef(null);
   const historyRef = useRef(null);
   const screenRef = useRef(null);
@@ -171,8 +168,8 @@ export function TerminalPage({ paneId }) {
   const atBottomRef = useRef(true);
   const sgrStateRef = useRef(defaultSgrState());
 
-  if (machine && !clientRef.current) {
-    clientRef.current = createClient(machine.host, machine.token);
+  if (!clientRef.current) {
+    clientRef.current = createClient();
   }
 
   /** 履歴 DOM へ行を追記する（SGR 状態は行を跨いで継続） */
@@ -282,8 +279,7 @@ export function TerminalPage({ paneId }) {
   }, [paneId]);
 
   useEffect(() => {
-    if (!machine) { window.location.hash = '#/'; return; }
-    clientRef.current = createClient(machine.host, machine.token);
+    clientRef.current = createClient();
     setLoading(true);
     setConnected(false);
     setHasNew(false);
@@ -398,7 +394,6 @@ export function TerminalPage({ paneId }) {
     send();
   }
 
-  if (!machine) return null;
   const pos = idx >= 0 ? `${idx + 1}/${allPanes.length}` : '';
 
   return (
@@ -411,7 +406,7 @@ export function TerminalPage({ paneId }) {
               <span class={`conn-dot ${connected ? 'on' : 'off'}`} />
               <span class="terminal-name">{info?.title || `Pane ${paneId}`}</span>
             </div>
-            <span class="terminal-meta">{machine.name}{pos ? ` · ${pos}` : ''}</span>
+            <span class="terminal-meta">{(me && me.host) || 'tako'}{pos ? ` · ${pos}` : ''}</span>
           </div>
         </div>
         <div class="terminal-header-right">
