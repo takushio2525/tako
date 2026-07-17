@@ -588,12 +588,9 @@ pub enum Request {
         force: bool,
     },
     /// リモートアクセス API サーバーの状態取得。
-    /// `show_token` = true のときだけ応答にトークンを平文で含める（既定はマスク。
-    /// スクリーンショット・画面共有経由でのトークン漏えいを防ぐため）
-    RemoteStatus {
-        #[serde(default)]
-        show_token: bool,
-    },
+    /// 応答にトークンは含まれない（#283 で長寿命 bearer token を全廃。
+    /// 接続時の認証は機器ペアリング二層認証が行う）
+    RemoteStatus,
     /// エージェント一覧（`claude agents --json` プロキシ + tmux ペイン対応付け。Issue #23）
     RemoteAgents,
     /// Claude Code の会話ログ（transcript）の末尾 `tail` 件を正規化して取得（Issue #23）

@@ -24,9 +24,17 @@
 //!   update（履歴へ押し出された行 + 現画面）をプッシュ。描画・スクロール・折り返しは
 //!   クライアント側の責務（Issue #63）。操作系は REST を使う）
 //!
-//! 認証: `Authorization: Bearer <token>` ヘッダ必須（/api/health 以外）。
-//! WS は Sec-WebSocket-Protocol の `token.<T>` で検証（ブラウザ WS API はヘッダ不可のため）。
-//! CORS: PWA からのアクセス用にワイルドカード許可。
+//! 認証（Issue #283: 機器ペアリング二層認証。長寿命 bearer token は全廃）:
+//! - 層①: `tailscale serve` が付与する `X-Forwarded-For` を `tailscale whois` で照合し、
+//!   tailnet 上の実在ノードのみ通す（ローカル直結・偽装 IP は拒否）
+//! - 層②: ノードの恒久 ID をデバイスレジストリと照合し、role（Observe / Interact /
+//!   Manage / Admin）で操作を認可する。未登録端末はペアリング要求（`POST /api/pair`）
+//!   だけができ、Mac 画面の承認ダイアログで許可されるまで画面データを受け取れない
+//! - 管理 API（`/api/admin/*`）: ローカル直結 + `X-Tako-Admin: <管理トークン>` のみ。
+//!   ペアリング承認・role 変更は tako-app の GUI ダイアログ専用（`.agent/requirements.md`）
+//! - 詳細は `remote_auth` モジュールと計画 `.agent/plans/tako-remote-plan.md` §4
+//!
+//! PWA は daemon 自身が配信する（同一 origin・バージョン一致。公開 Pages 配信は廃止）。
 //!
 //! transport（Issue #282: Tailscale Serve 一本化）:
 //! - daemon は `127.0.0.1` のみ bind し、`tailscale serve` が HTTPS:443 →
@@ -51,8 +59,12 @@ use std::sync::{Arc, Mutex, RwLock};
 use rust_embed::Embed;
 use serde_json::{json, Value};
 
+use crate::remote_auth::{DeviceRegistry, DeviceRole, Identity};
+
 const DEFAULT_PORT: u16 = 7749;
 const MAX_BODY_BYTES: u64 = 1024 * 1024;
+/// interact idle session の定期スイープ間隔
+const SESSION_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 // --- PID / トークン / ポートファイルのパス ---
 // P0-3: 共有 /tmp から <data_dir>/remote/（0700）へ移動。作成時から 0600。
 
@@ -96,7 +108,12 @@ pub fn url_path() -> std::path::PathBuf {
 }
 
 /// 秘密を含むファイルを作成時から 0600 で書き込む。
-/// temp → atomic rename で symlink race を防ぐ
+/// temp → atomic rename で symlink race を防ぐ。
+/// devices.json（remote_auth）も identity 情報を含むため同じ経路で書く
+pub(crate) fn write_state_file(path: &std::path::Path, content: &str) -> io::Result<()> {
+    write_secret_file(path, content)
+}
+
 fn write_secret_file(path: &std::path::Path, content: &str) -> io::Result<()> {
     let dir = path
         .parent()
@@ -180,6 +197,165 @@ fn cleanup_legacy_state_files() {
 #[derive(Embed)]
 #[folder = "../../web/tako-remote/dist/"]
 struct PwaAssets;
+
+// --- daemon 共有コンテキスト（二層認証・接続追跡。#283）---
+
+/// daemon がリクエストハンドラ間で共有する状態。
+/// registry（デバイスレジストリ + 保留 + interact session + whois キャッシュ）と
+/// WS 接続数（通知・status 表示用）を持つ
+struct DaemonCtx {
+    registry: Mutex<DeviceRegistry>,
+    /// tailscale CLI のパス（whois 照合に使う）
+    ts_cli: String,
+    /// ローカル管理トークン（`/api/admin/*` 専用。リモート端末には決して渡らない）
+    admin_token: String,
+    tmux_socket: String,
+    /// デバイスごとの WS 接続数（0→1 で接続開始、1→0 で終了とみなす）
+    ws_connections: Mutex<HashMap<String, usize>>,
+    /// 稼働ポート・公開 URL（admin state 表示用）
+    port: u16,
+    base_url: String,
+}
+
+impl DaemonCtx {
+    /// デバイスの WS 接続数を +1 する。0→1（接続開始）なら true
+    fn ws_connect(&self, device_id: &str) -> bool {
+        let mut map = self.ws_connections.lock().unwrap();
+        let count = map.entry(device_id.to_string()).or_insert(0);
+        *count += 1;
+        *count == 1
+    }
+
+    /// デバイスの WS 接続数を -1 する。1→0（全切断）なら true
+    fn ws_disconnect(&self, device_id: &str) -> bool {
+        let mut map = self.ws_connections.lock().unwrap();
+        match map.get_mut(device_id) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                false
+            }
+            Some(_) => {
+                map.remove(device_id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 接続中デバイス → WS 接続数のスナップショット
+    fn connections_snapshot(&self) -> HashMap<String, usize> {
+        self.ws_connections.lock().unwrap().clone()
+    }
+}
+
+/// macOS 通知を表示する（接続開始終了・操作セッション開始。#283）。
+/// osascript 経由（依存追加なし）。`TAKO_REMOTE_NO_NOTIFY=1` で抑止（テスト・検証用）。
+/// 通知文にはデバイス名・イベントのみを載せ、ペイン内容は含めない
+fn notify_macos(message: &str) {
+    if std::env::var("TAKO_REMOTE_NO_NOTIFY").is_ok_and(|v| v == "1") {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // osascript の文字列リテラルは引数渡し（argv）にして injection を避ける
+        let script = "on run argv\ndisplay notification (item 1 of argv) with title \"tako remote\"\nend run";
+        let _ = Command::new("osascript")
+            .args(["-e", script, message])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = message;
+    }
+}
+
+/// 認可判定の結果
+enum AuthDecision {
+    /// 承認済みデバイスとして許可
+    Allowed(crate::remote_auth::Device),
+    /// 拒否（HTTP status, エラーメッセージ）
+    Rejected(u16, String),
+}
+
+/// 層①（identity）+ 層②（デバイス role）を評価する。
+/// `required` 以上の role を持つ登録済みデバイスのみ Allowed
+fn authorize_device(
+    ctx: &DaemonCtx,
+    request: &tiny_http::Request,
+    required: DeviceRole,
+) -> AuthDecision {
+    let forwarded = header_value(request, "x-forwarded-for");
+    match crate::remote_auth::identify(&ctx.registry, &ctx.ts_cli, forwarded.as_deref()) {
+        Ok(Identity::Tailnet(who)) => {
+            let mut reg = ctx.registry.lock().unwrap();
+            match reg.device(&who.stable_id).cloned() {
+                Some(device) if device.role >= required => {
+                    reg.touch(&device.id);
+                    AuthDecision::Allowed(device)
+                }
+                Some(device) => AuthDecision::Rejected(
+                    403,
+                    format!(
+                        "この操作には {} 以上の role が必要（現在: {}）。\
+                         role の変更はペアリング画面から要求できます",
+                        required.as_str(),
+                        device.role.as_str()
+                    ),
+                ),
+                None => AuthDecision::Rejected(
+                    403,
+                    "この端末はペアリングされていない。PWA のペアリング画面から要求してください"
+                        .to_string(),
+                ),
+            }
+        }
+        Ok(Identity::Local) => AuthDecision::Rejected(
+            401,
+            "tailscale serve 経由のアクセスのみ受け付ける".to_string(),
+        ),
+        Err(e) => AuthDecision::Rejected(401, e),
+    }
+}
+
+/// 層①のみ評価する（静的アセット・/api/health・/api/me・/api/pair 用）。
+/// tailnet ノードなら Ok(WhoisInfo)
+fn identify_tailnet(
+    ctx: &DaemonCtx,
+    request: &tiny_http::Request,
+) -> Result<crate::tailscale::WhoisInfo, (u16, String)> {
+    let forwarded = header_value(request, "x-forwarded-for");
+    match crate::remote_auth::identify(&ctx.registry, &ctx.ts_cli, forwarded.as_deref()) {
+        Ok(Identity::Tailnet(who)) => Ok(who),
+        Ok(Identity::Local) => Err((
+            401,
+            "tailscale serve 経由のアクセスのみ受け付ける".to_string(),
+        )),
+        Err(e) => Err((401, e)),
+    }
+}
+
+/// 管理 API の認証: ローカル直結（serve 経由でない）+ `X-Tako-Admin` ヘッダが
+/// 管理トークンと一致する場合のみ許可する。
+/// serve 経由（X-Forwarded-For あり）は管理トークンが正しくても拒否する
+/// （管理トークンは tailnet 上に流れない前提を守る。漏えいの兆候として監査に残す）
+fn check_admin(ctx: &DaemonCtx, request: &tiny_http::Request) -> bool {
+    if header_value(request, "x-forwarded-for").is_some() {
+        if let Ok(reg) = ctx.registry.lock() {
+            reg.audit(
+                "admin_over_tailnet_rejected",
+                "",
+                "",
+                json!({ "route": request.url().split('?').next().unwrap_or("") }),
+            );
+        }
+        return false;
+    }
+    header_value(request, "x-tako-admin")
+        .is_some_and(|v| constant_time_eq(v.as_bytes(), ctx.admin_token.as_bytes()))
+}
 
 // --- IPC クライアント（daemon → app の正規 dispatch 経路。#281 H-7）---
 
@@ -364,9 +540,11 @@ impl PaneMapping {
 
 // --- WS broadcaster（M-5: 接続数分の tmux subprocess 乱立を解消。#281）---
 
-/// ペインごとの共有 broadcaster。1 つの capture ループを共有し、複数 WS クライアントへ配信する
+/// ペインごとの共有 broadcaster。1 つの capture ループを共有し、複数 WS クライアントへ配信する。
+/// subscriber はデバイス ID つきで登録し、revoke 時に該当デバイスの接続だけを
+/// 即時切断できる（#283 受け入れ条件: revoke 即時反映）
 struct PaneBroadcaster {
-    subscribers: Vec<std::sync::mpsc::Sender<String>>,
+    subscribers: Vec<(String, std::sync::mpsc::Sender<String>)>,
     /// 最新の init メッセージ。新規 subscriber に即送するためキャッシュする
     last_init: Option<String>,
 }
@@ -382,19 +560,25 @@ impl PaneBroadcaster {
     /// 新しい subscriber を登録し、受信チャンネルを返す。
     /// キャッシュ済みの init があれば即座に送信する（画面変化がない間に
     /// サブスクライブした subscriber が init を受け取れないのを防ぐ）
-    fn subscribe(&mut self) -> std::sync::mpsc::Receiver<String> {
+    fn subscribe(&mut self, device_id: &str) -> std::sync::mpsc::Receiver<String> {
         let (tx, rx) = std::sync::mpsc::channel();
         if let Some(ref init) = self.last_init {
             let _ = tx.send(init.clone());
         }
-        self.subscribers.push(tx);
+        self.subscribers.push((device_id.to_string(), tx));
         rx
+    }
+
+    /// 指定デバイスの subscriber を除去する（Sender の drop で受信側が
+    /// Disconnected を検知し、WS 転送スレッドが即座に接続を閉じる）
+    fn drop_device(&mut self, device_id: &str) {
+        self.subscribers.retain(|(id, _)| id != device_id);
     }
 
     /// 全 subscriber にメッセージを配信。切断済みの subscriber は除去する
     fn broadcast(&mut self, msg: &str) {
         self.subscribers
-            .retain(|tx| tx.send(msg.to_string()).is_ok());
+            .retain(|(_, tx)| tx.send(msg.to_string()).is_ok());
     }
 
     /// init メッセージをキャッシュして全 subscriber に配信する
@@ -415,11 +599,21 @@ fn new_broadcaster_map() -> BroadcasterMap {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// 指定デバイスの WS 接続をすべて即時切断する（revoke の即時反映。#283）
+fn disconnect_device_ws(map: &BroadcasterMap, device_id: &str) {
+    let broadcasters: Vec<Arc<Mutex<PaneBroadcaster>>> =
+        map.lock().unwrap().values().cloned().collect();
+    for bc in broadcasters {
+        bc.lock().unwrap().drop_device(device_id);
+    }
+}
+
 /// 指定ペインの broadcaster を取得するか新規作成する。
 /// 新規作成時は capture ループスレッドを起動する
 fn get_or_create_broadcaster(
     map: &BroadcasterMap,
     pane: &str,
+    device_id: &str,
     tmux_socket: &str,
     shutdown: Arc<AtomicBool>,
 ) -> (
@@ -444,7 +638,7 @@ fn get_or_create_broadcaster(
             bc
         })
         .clone();
-    let rx = broadcaster.lock().unwrap().subscribe();
+    let rx = broadcaster.lock().unwrap().subscribe(device_id);
     (broadcaster, rx)
 }
 
@@ -688,11 +882,14 @@ pub fn run_daemon(port: Option<u16>) -> io::Result<()> {
     // Tailscale setup 検証 + serve 設定（不足があればここで起動拒否）
     let (ts_cli, base_url) = establish_tailscale_serve(actual_port)?;
 
-    // トークン生成
+    // ローカル管理トークン生成（/api/admin/* 専用。リモート端末には渡らない。#283）
     let token = crate::generate_token()?;
 
     // P0-3: state ディレクトリを 0700 で確保し、各ファイルを 0600 で書き出す
     ensure_state_dir()?;
+
+    // デバイスレジストリを開く（devices.json 破損時は黙って全失効させず起動を拒否する）
+    let registry = DeviceRegistry::open(&state_dir()).map_err(io::Error::other)?;
 
     // PID ファイル: 実行ファイルパスと起動時刻も記録（P0-4 の stop 照合用）
     let pid_info = format!(
@@ -759,19 +956,27 @@ pub fn run_daemon(port: Option<u16>) -> io::Result<()> {
     }
 
     // 起動情報を JSON で stdout に出力（start コマンドが読み取る）。
-    // 接続リンクは恒久固定の ts.net URL（tailnet 内限定・WireGuard E2E 暗号化）
-    let host_name = hostname();
-    let connect = connect_url(&base_url, &token, Some(&host_name));
+    // 接続リンクは恒久固定の ts.net URL（tailnet 内限定・WireGuard E2E 暗号化）。
+    // #283: URL に token は載せない（接続時の認証は機器ペアリングが行う）
     let info = json!({
         "running": true,
         "port": actual_port,
         "bind_addr": addr,
-        "token": token,
         "url": base_url,
-        "connect_url": connect,
         "transport": "tailscale-serve",
     });
     println!("{info}");
+
+    // daemon 共有コンテキスト（二層認証・接続追跡。#283）
+    let ctx = Arc::new(DaemonCtx {
+        registry: Mutex::new(registry),
+        ts_cli: ts_cli.clone(),
+        admin_token: token.clone(),
+        tmux_socket: tmux_socket.clone(),
+        ws_connections: Mutex::new(HashMap::new()),
+        port: actual_port,
+        base_url: base_url.clone(),
+    });
 
     // IPC 接続（#281: dispatch 正規経路。app 不在時は read-only fallback）
     let app_conn = Arc::new(RwLock::new(AppConnection::new()));
@@ -780,21 +985,32 @@ pub fn run_daemon(port: Option<u16>) -> io::Result<()> {
     // WS broadcaster map（M-5: ペインごとの共有 broadcaster）
     let broadcasters = new_broadcaster_map();
 
+    // interact idle session の定期スイープ（session_end の監査記録。#283）
+    {
+        let ctx_sweep = ctx.clone();
+        let shutdown_sweep = shutdown.clone();
+        std::thread::Builder::new()
+            .name("remote-session-sweep".into())
+            .spawn(move || {
+                while !shutdown_sweep.load(Ordering::Relaxed) {
+                    std::thread::sleep(SESSION_SWEEP_INTERVAL);
+                    if let Ok(mut reg) = ctx_sweep.registry.lock() {
+                        let _ = reg.sweep_idle_sessions();
+                    }
+                }
+            })
+            .ok();
+    }
+
     // HTTP サーバーループ
     while !shutdown.load(Ordering::Relaxed) {
         match server.recv_timeout(std::time::Duration::from_millis(200)) {
             Ok(Some(request)) => {
                 let path = request.url().split('?').next().unwrap_or("");
                 if path == "/ws" && is_ws_upgrade(&request) {
-                    handle_ws_v2(
-                        request,
-                        &token,
-                        &tmux_socket,
-                        shutdown.clone(),
-                        broadcasters.clone(),
-                    );
+                    handle_ws_v2(request, &ctx, shutdown.clone(), broadcasters.clone());
                 } else {
-                    handle_request_v2(request, &token, &tmux_socket, &app_conn, &pane_mapping);
+                    handle_request_v2(request, &ctx, &app_conn, &pane_mapping, &broadcasters);
                 }
             }
             Ok(None) => {}
@@ -856,69 +1072,27 @@ pub fn daemon_status() -> Value {
         .ok()
         .and_then(|s| s.trim().parse::<u16>().ok())
         .unwrap_or(DEFAULT_PORT);
-    let token = std::fs::read_to_string(token_path())
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let host_name = hostname();
-    // URL ファイル（起動時に確定した固定 ts.net URL）から接続リンクを再構成する
+    // URL ファイル（起動時に確定した固定 ts.net URL）から接続リンクを再構成する。
+    // #283: URL に token は含まれない（QR も固定 URL のみ）
     let base_url = std::fs::read_to_string(url_path())
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let connect = base_url
-        .as_ref()
-        .map(|b| connect_url(b, &token, Some(&host_name)));
-    json!({
+    // 登録済みデバイス数（devices.json を読むだけ。破損時は数えず None）
+    let devices = DeviceRegistry::open(&state_dir())
+        .ok()
+        .map(|reg| reg.devices().len());
+    let mut status = json!({
         "running": true,
         "pid": pid_num,
         "port": port,
-        "token": token,
         "url": base_url,
-        "connect_url": connect,
         "transport": "tailscale-serve",
-    })
-}
-
-/// URL のクエリ / fragment 内の `token=<値>` を `token=***` に置換する。
-/// 次の `&` または文字列末尾までを値とみなす。`token=` が無ければそのまま返す
-fn mask_token_in_url(url: &str) -> String {
-    let mut out = String::with_capacity(url.len());
-    let mut rest = url;
-    while let Some(pos) = rest.find("token=") {
-        let val_start = pos + "token=".len();
-        out.push_str(&rest[..val_start]);
-        out.push_str("***");
-        // 値の終端（次の `&` まで。無ければ末尾）以降を残す
-        let after = &rest[val_start..];
-        match after.find('&') {
-            Some(amp) => rest = &after[amp..],
-            None => {
-                rest = "";
-                break;
-            }
-        }
+    });
+    if let Some(n) = devices {
+        status["devices"] = json!(n);
     }
-    out.push_str(rest);
-    out
-}
-
-/// `daemon_status()` が返す状態 JSON のトークンをマスクする（`***` へ置換）。
-/// スクリーンショット・画面共有経由でのトークン漏えいを防ぐため、CLI / MCP の
-/// `remote status` は既定でこれを通す（`--show-token` 指定時のみ生値を出す）。
-/// 単体の `token` フィールドに加え、接続 URL（`connect_url` / `url`）の
-/// クエリに載る `token=<生値>` もマスクする（#104。URL だけ生値が残るとマスクの意味がないため）
-pub fn mask_status_token(status: &mut Value) {
-    if let Some(obj) = status.as_object_mut() {
-        if obj.get("token").and_then(|t| t.as_str()).is_some() {
-            obj.insert("token".to_string(), json!("***"));
-        }
-        for key in ["connect_url", "url"] {
-            if let Some(masked) = obj.get(key).and_then(|v| v.as_str()).map(mask_token_in_url) {
-                obj.insert(key.to_string(), json!(masked));
-            }
-        }
-    }
+    status
 }
 
 /// 2 つのバイト列を定数時間で比較する（長さと内容の両方を一定時間で判定）。
@@ -1392,21 +1566,110 @@ fn kill_stale_daemon(pid: u32) {
     cleanup_state_files();
 }
 
-/// QR コード・接続案内に使う接続 URL を生成する。
-/// ベースは恒久固定の ts.net URL（PWA は daemon 内蔵のものを tailscale serve が配信
-/// するため、リンク先 = デーモン自身。リレー等の中間解決は存在しない。#282）。
-/// トークンは URL fragment（`/#/connect?token=...`）に載せる: fragment はブラウザが
-/// サーバーへ送信しないため、アクセスログ・Referer に平文トークンが残らない
-pub fn connect_url(base_url: &str, token: &str, name: Option<&str>) -> String {
-    let mut url = format!(
-        "{}/#/connect?token={}",
-        base_url.trim_end_matches('/'),
-        urlencoding::encode(token)
-    );
-    if let Some(n) = name {
-        url.push_str(&format!("&name={}", urlencoding::encode(n)));
+// --- ローカル管理クライアント（GUI / CLI / MCP → daemon の admin API。#283）---
+//
+// 承認・拒否は tako-app の GUI ダイアログ専用（AI フルコントロール不変条件の例外。
+// `.agent/requirements.md`）。devices list / revoke は CLI / MCP にも公開する。
+// 認証はローカル管理トークン（state_dir の token ファイル、0600 = 同一ユーザーのみ）。
+
+/// 稼働中 daemon の admin API を叩く最小 HTTP クライアント（localhost 専用）。
+/// 外部依存を増やさないため std TcpStream + HTTP/1.1 の自前実装
+pub fn admin_request(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    use std::io::{Read as _, Write as _};
+
+    let status = daemon_status();
+    if status["running"].as_bool() != Some(true) {
+        return Err("リモートサーバーが起動していない".to_string());
     }
-    url
+    let port = status["port"].as_u64().unwrap_or(DEFAULT_PORT as u64) as u16;
+    let token = std::fs::read_to_string(token_path())
+        .map_err(|e| format!("管理トークンの読み取りに失敗: {e}"))?
+        .trim()
+        .to_string();
+
+    let body_str = body.map(|b| b.to_string()).unwrap_or_default();
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Tako-Admin: {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
+        body_str.len()
+    );
+
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
+        .map_err(|e| format!("daemon へ接続できない (127.0.0.1:{port}): {e}"))?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .ok();
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("daemon への送信に失敗: {e}"))?;
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|e| format!("daemon からの受信に失敗: {e}"))?;
+    let response = String::from_utf8_lossy(&response);
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or("daemon の応答が不正（ヘッダ境界なし）")?;
+    let status_code: u16 = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .ok_or("daemon の応答が不正（ステータス行なし）")?;
+    let value: Value = if body.trim().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(body.trim())
+            .map_err(|e| format!("daemon の応答を解釈できない: {e}"))?
+    };
+    if !(200..300).contains(&status_code) {
+        let msg = value["error"]
+            .as_str()
+            .unwrap_or("不明なエラー")
+            .to_string();
+        return Err(format!("daemon がエラーを返した ({status_code}): {msg}"));
+    }
+    Ok(value)
+}
+
+/// 登録済みデバイスの一覧（CLI `tako remote devices list` / MCP / GUI から使う）。
+/// daemon 稼働中は admin API（接続状態込み）、停止中は devices.json を直接読む
+pub fn devices_list() -> Result<Value, String> {
+    if daemon_status()["running"].as_bool() == Some(true) {
+        return admin_request("GET", "/api/admin/state", None);
+    }
+    let reg = DeviceRegistry::open(&state_dir())?;
+    let devices: Vec<Value> = reg.devices().iter().map(device_json).collect();
+    Ok(json!({ "running": false, "devices": devices, "pending": [], "connections": {} }))
+}
+
+/// デバイスの登録を失効させる（CLI `tako remote devices revoke` / MCP / GUI から使う）。
+/// daemon 稼働中は admin API 経由（接続中 WS の即時切断込み）、停止中はレジストリ直接編集
+pub fn devices_revoke(device_id: &str) -> Result<Value, String> {
+    if daemon_status()["running"].as_bool() == Some(true) {
+        return admin_request(
+            "POST",
+            "/api/admin/devices/revoke",
+            Some(&json!({ "device_id": device_id })),
+        );
+    }
+    let mut reg = DeviceRegistry::open(&state_dir())?;
+    let device = reg.revoke(device_id)?;
+    Ok(json!({ "revoked": true, "device": device_json(&device) }))
+}
+
+/// Device を API 応答用の JSON に変換する
+fn device_json(d: &crate::remote_auth::Device) -> Value {
+    json!({
+        "id": d.id,
+        "name": d.name,
+        "login": d.login,
+        "node_name": d.node_name,
+        "role": d.role.as_str(),
+        "created_at": d.created_at,
+        "last_seen": d.last_seen,
+    })
 }
 
 /// ホスト名を取得する（表示用）
@@ -1796,10 +2059,19 @@ fn header_value(request: &tiny_http::Request, name: &'static str) -> Option<Stri
         .map(|h| h.value.as_str().to_string())
 }
 
-fn check_auth(request: &tiny_http::Request, token: &str) -> bool {
-    let expected = format!("Bearer {token}");
-    header_value(request, "authorization")
-        .is_some_and(|v| constant_time_eq(v.as_bytes(), expected.as_bytes()))
+/// リクエストボディを JSON として読む（サイズ上限つき）
+fn read_json_body(request: &mut tiny_http::Request) -> Result<Value, String> {
+    use std::io::Read as _;
+    let mut body = String::new();
+    request
+        .as_reader()
+        .take(MAX_BODY_BYTES)
+        .read_to_string(&mut body)
+        .map_err(|_| "リクエストボディの読み取りに失敗".to_string())?;
+    if body.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(&body).map_err(|e| format!("JSON パースエラー: {e}"))
 }
 
 // --- WebSocket（画面プッシュ専用チャンネル） ---
@@ -1842,14 +2114,6 @@ const WS_PUSH_MARGIN: u64 = 50;
 /// リクエストが WebSocket アップグレードかどうか
 fn is_ws_upgrade(request: &tiny_http::Request) -> bool {
     header_value(request, "upgrade").is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
-}
-
-/// Sec-WebSocket-Protocol の値からトークンを取り出す（`token.<T>` エントリ）
-fn ws_token_from_protocols(protocols: &str) -> Option<String> {
-    protocols
-        .split(',')
-        .map(|p| p.trim())
-        .find_map(|p| p.strip_prefix("token.").map(|t| t.to_string()))
 }
 
 /// ペインの一貫スナップショット。`display-message` と `capture-pane` を 1 回の
@@ -2234,30 +2498,58 @@ fn find_pane_id_for_tmux_target(list: &Value, session_name: &str) -> Option<u64>
 
 /// dispatch 統合版のリクエストハンドラ。
 /// 書き込み系（input/close/resize）は IPC 経由で dispatch を通す。
-/// 読み取り系は従来どおり tmux 直接 + API v2 は IPC List 経由
+/// 読み取り系は従来どおり tmux 直接 + API v2 は IPC List 経由。
+///
+/// 認可（#283 二層認証）:
+/// - 静的アセット・/api/health・/api/me・/api/pair: 層①のみ（tailnet ノードなら可）
+/// - /api/admin/*: ローカル直結 + 管理トークンのみ（GUI / CLI / MCP 用）
+/// - その他の /api/*: 層① + 層②（Observe / Interact / Manage / Admin の role 認可）
 fn handle_request_v2(
     mut request: tiny_http::Request,
-    token: &str,
-    tmux_socket: &str,
+    ctx: &Arc<DaemonCtx>,
     app_conn: &Arc<RwLock<AppConnection>>,
     pane_mapping: &Arc<RwLock<PaneMapping>>,
+    broadcasters: &BroadcasterMap,
 ) {
     let method = request.method().clone();
     let url_full = request.url().to_string();
     let path = url_full.split('?').next().unwrap_or("").to_string();
+    let tmux_socket = &ctx.tmux_socket;
 
     // CORS preflight
     if method == tiny_http::Method::Options {
         return respond(request, 204, None);
     }
 
-    // /api/health は認証不要
+    // --- 管理 API（ローカル直結 + 管理トークン。GUI 承認ダイアログ / CLI / MCP 用）---
+    if path.starts_with("/api/admin/") {
+        if !check_admin(ctx, &request) {
+            return respond(
+                request,
+                401,
+                Some(json!({ "error": "管理 API はローカルの管理トークンが必要" }).to_string()),
+            );
+        }
+        return handle_admin_api(request, &method, &path, ctx, broadcasters);
+    }
+
+    // --- 層①: tailnet identity 検証（serve 経由の実在ノードのみ通す）---
+    // 静的アセット（PWA）とペアリング前 API も tailnet ノード限定
+    let who = match identify_tailnet(ctx, &request) {
+        Ok(who) => who,
+        Err((status, e)) => {
+            return respond(request, status, Some(json!({ "error": e }).to_string()));
+        }
+    };
+
+    // API 以外のパスは PWA 静的ファイルとして配信（層①通過のみで可 —
+    // 未登録端末がペアリング画面を表示するために必要。画面データは含まない）
+    if !path.starts_with("/api/") {
+        return serve_embedded(request, &path);
+    }
+
+    // /api/health: 層①のみ。version は PWA の互換チェックに使う
     if path == "/api/health" && method == tiny_http::Method::Get {
-        let app_available = app_conn
-            .read()
-            .ok()
-            .and_then(|c| c.client.as_ref().map(|_| true))
-            .unwrap_or(false);
         return respond(
             request,
             200,
@@ -2265,25 +2557,119 @@ fn handle_request_v2(
                 json!({
                     "status": "ok",
                     "version": env!("CARGO_PKG_VERSION"),
-                    "app_connected": app_available,
                 })
                 .to_string(),
             ),
         );
     }
 
-    // API 以外のパスは PWA 静的ファイルとして配信（認証不要）
-    if !path.starts_with("/api/") {
-        return serve_embedded(request, &path);
+    // /api/me: 層①のみ。この端末の登録状態を返す（ペアリング画面のポーリング先）
+    if path == "/api/me" && method == tiny_http::Method::Get {
+        let mut reg = ctx.registry.lock().unwrap();
+        let body = match reg.device(&who.stable_id).cloned() {
+            Some(device) => json!({
+                "registered": true,
+                "device_id": device.id,
+                "name": device.name,
+                "role": device.role.as_str(),
+                "login": device.login,
+                "host": hostname(),
+                "version": env!("CARGO_PKG_VERSION"),
+                "app_connected": app_conn
+                    .read()
+                    .ok()
+                    .and_then(|c| c.client.as_ref().map(|_| true))
+                    .unwrap_or(false),
+            }),
+            None => {
+                let pending = reg.pending().iter().any(|p| p.device_id == who.stable_id);
+                json!({
+                    "registered": false,
+                    "pending": pending,
+                    "denied": !pending && reg.recently_denied(&who.stable_id),
+                    "host": hostname(),
+                    "version": env!("CARGO_PKG_VERSION"),
+                })
+            }
+        };
+        return respond_sensitive(request, 200, Some(body.to_string()));
     }
 
-    // API エンドポイントの認証チェック
-    if !check_auth(&request, token) {
-        return respond(
+    // /api/pair: 層①のみ。ペアリング / role 変更を要求する（Mac 承認待ちになる）
+    if path == "/api/pair" && method == tiny_http::Method::Post {
+        let parsed = match read_json_body(&mut request) {
+            Ok(v) => v,
+            Err(e) => {
+                return respond(request, 400, Some(json!({ "error": e }).to_string()));
+            }
+        };
+        let name = parsed["name"].as_str().unwrap_or("").to_string();
+        let role_str = parsed["role"].as_str().unwrap_or("observe");
+        let Some(role) = DeviceRole::parse(role_str) else {
+            return respond(
+                request,
+                400,
+                Some(
+                    json!({ "error": format!("不正な role: {role_str}（observe / interact / manage / admin）") })
+                        .to_string(),
+                ),
+            );
+        };
+        let result = ctx
+            .registry
+            .lock()
+            .unwrap()
+            .request_pairing(&who, &name, role);
+        return respond_sensitive(request, 200, Some(result.to_string()));
+    }
+
+    // --- 層②: 機器ペアリング認可（未登録・role 不足は 403）---
+    // 読み取り系は Observe、input は Interact、close / resize は Manage、
+    // 端末管理は Admin（役割は remote_auth::DeviceRole。強い role は弱い role を包含）
+    let required = required_role(&method, &path);
+    let device = match authorize_device_checked(ctx, &request, required) {
+        Ok(device) => device,
+        Err((status, e)) => {
+            return respond(request, status, Some(json!({ "error": e }).to_string()));
+        }
+    };
+
+    // --- リモート端末管理（Admin role。承認・role 変更は含まない = GUI 限定）---
+    if path == "/api/devices" && method == tiny_http::Method::Get {
+        let reg = ctx.registry.lock().unwrap();
+        let devices: Vec<Value> = reg.devices().iter().map(device_json).collect();
+        return respond_sensitive(
             request,
-            401,
-            Some(json!({ "error": "認証が必要" }).to_string()),
+            200,
+            Some(json!({ "devices": devices }).to_string()),
         );
+    }
+    if path == "/api/devices/revoke" && method == tiny_http::Method::Post {
+        let parsed = match read_json_body(&mut request) {
+            Ok(v) => v,
+            Err(e) => {
+                return respond(request, 400, Some(json!({ "error": e }).to_string()));
+            }
+        };
+        let Some(target_id) = parsed["device_id"].as_str() else {
+            return respond(
+                request,
+                400,
+                Some(json!({ "error": "device_id が必要" }).to_string()),
+            );
+        };
+        let result = ctx.registry.lock().unwrap().revoke(target_id);
+        return match result {
+            Ok(revoked) => {
+                disconnect_device_ws(broadcasters, target_id);
+                respond(
+                    request,
+                    200,
+                    Some(json!({ "revoked": true, "device": device_json(&revoked) }).to_string()),
+                )
+            }
+            Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
+        };
     }
 
     // --- API v2 エンドポイント（IPC 経由のリッチ情報。#281）---
@@ -2302,7 +2688,197 @@ fn handle_request_v2(
     }
 
     // --- API ルーティング（dispatch 統合 + tmux 直接操作）---
-    match (method, path.as_str()) {
+    handle_api_v2_routes(
+        request,
+        method,
+        &path,
+        &url_full,
+        ctx,
+        &device,
+        app_conn,
+        pane_mapping,
+    )
+}
+
+/// パス・メソッドから必要 role を決める（強い role は弱い role の操作を包含する）
+fn required_role(method: &tiny_http::Method, path: &str) -> DeviceRole {
+    if path.starts_with("/api/devices") {
+        return DeviceRole::Admin;
+    }
+    if *method == tiny_http::Method::Post {
+        if path.ends_with("/input") {
+            return DeviceRole::Interact;
+        }
+        if path.ends_with("/close") || path.ends_with("/resize") {
+            return DeviceRole::Manage;
+        }
+        // 未知の POST は安全側（Manage）
+        return DeviceRole::Manage;
+    }
+    DeviceRole::Observe
+}
+
+/// authorize_device の Result 版（呼び出し側の early-return 用）
+fn authorize_device_checked(
+    ctx: &DaemonCtx,
+    request: &tiny_http::Request,
+    required: DeviceRole,
+) -> Result<crate::remote_auth::Device, (u16, String)> {
+    match authorize_device(ctx, request, required) {
+        AuthDecision::Allowed(device) => Ok(device),
+        AuthDecision::Rejected(status, e) => Err((status, e)),
+    }
+}
+
+/// 管理 API のルーティング（check_admin 通過後に呼ばれる）。
+/// ペアリング承認・拒否はここだけ = Mac 側 GUI（+ 同一ユーザーのローカルプロセス）限定
+fn handle_admin_api(
+    mut request: tiny_http::Request,
+    method: &tiny_http::Method,
+    path: &str,
+    ctx: &Arc<DaemonCtx>,
+    broadcasters: &BroadcasterMap,
+) {
+    match (method.clone(), path) {
+        // 状態スナップショット（GUI の 2 秒ポーリング先）
+        (tiny_http::Method::Get, "/api/admin/state") => {
+            let reg = ctx.registry.lock().unwrap();
+            let devices: Vec<Value> = reg.devices().iter().map(device_json).collect();
+            let pending: Vec<Value> = reg
+                .pending()
+                .iter()
+                .map(|p| {
+                    json!({
+                        "device_id": p.device_id,
+                        "name": p.name,
+                        "login": p.login,
+                        "node_name": p.node_name,
+                        "requested_role": p.requested_role.as_str(),
+                        "kind": p.kind,
+                        "requested_at": p.requested_at,
+                    })
+                })
+                .collect();
+            drop(reg);
+            let connections = ctx.connections_snapshot();
+            let body = json!({
+                "running": true,
+                "port": ctx.port,
+                "url": ctx.base_url,
+                "devices": devices,
+                "pending": pending,
+                "connections": connections,
+            });
+            respond_sensitive(request, 200, Some(body.to_string()))
+        }
+        // ペアリング / 昇格の承認（GUI 限定経路）
+        (tiny_http::Method::Post, "/api/admin/pair/approve") => {
+            let parsed = match read_json_body(&mut request) {
+                Ok(v) => v,
+                Err(e) => {
+                    return respond(request, 400, Some(json!({ "error": e }).to_string()));
+                }
+            };
+            let Some(device_id) = parsed["device_id"].as_str() else {
+                return respond(
+                    request,
+                    400,
+                    Some(json!({ "error": "device_id が必要" }).to_string()),
+                );
+            };
+            let role = parsed["role"].as_str().and_then(DeviceRole::parse);
+            let result = ctx.registry.lock().unwrap().approve(device_id, role);
+            match result {
+                Ok(device) => {
+                    notify_macos(&format!(
+                        "{} を {} として登録しました",
+                        device.name,
+                        device.role.as_str()
+                    ));
+                    respond(
+                        request,
+                        200,
+                        Some(
+                            json!({ "approved": true, "device": device_json(&device) }).to_string(),
+                        ),
+                    )
+                }
+                Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
+            }
+        }
+        // ペアリング / 昇格の拒否（GUI 限定経路）
+        (tiny_http::Method::Post, "/api/admin/pair/deny") => {
+            let parsed = match read_json_body(&mut request) {
+                Ok(v) => v,
+                Err(e) => {
+                    return respond(request, 400, Some(json!({ "error": e }).to_string()));
+                }
+            };
+            let Some(device_id) = parsed["device_id"].as_str() else {
+                return respond(
+                    request,
+                    400,
+                    Some(json!({ "error": "device_id が必要" }).to_string()),
+                );
+            };
+            let result = ctx.registry.lock().unwrap().deny(device_id);
+            match result {
+                Ok(()) => respond(request, 200, Some(json!({ "denied": true }).to_string())),
+                Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
+            }
+        }
+        // デバイス失効（CLI / MCP / GUI の revoke。接続中 WS は即時切断）
+        (tiny_http::Method::Post, "/api/admin/devices/revoke") => {
+            let parsed = match read_json_body(&mut request) {
+                Ok(v) => v,
+                Err(e) => {
+                    return respond(request, 400, Some(json!({ "error": e }).to_string()));
+                }
+            };
+            let Some(device_id) = parsed["device_id"].as_str() else {
+                return respond(
+                    request,
+                    400,
+                    Some(json!({ "error": "device_id が必要" }).to_string()),
+                );
+            };
+            let result = ctx.registry.lock().unwrap().revoke(device_id);
+            match result {
+                Ok(device) => {
+                    disconnect_device_ws(broadcasters, device_id);
+                    respond(
+                        request,
+                        200,
+                        Some(
+                            json!({ "revoked": true, "device": device_json(&device) }).to_string(),
+                        ),
+                    )
+                }
+                Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
+            }
+        }
+        _ => respond(
+            request,
+            404,
+            Some(json!({ "error": "管理 API エンドポイントが見つからない" }).to_string()),
+        ),
+    }
+}
+
+/// 認可済みリクエストの API ルーティング（従来の handle_request_v2 後段）
+#[allow(clippy::too_many_arguments)]
+fn handle_api_v2_routes(
+    mut request: tiny_http::Request,
+    method: tiny_http::Method,
+    path: &str,
+    url_full: &str,
+    ctx: &Arc<DaemonCtx>,
+    device: &crate::remote_auth::Device,
+    app_conn: &Arc<RwLock<AppConnection>>,
+    pane_mapping: &Arc<RwLock<PaneMapping>>,
+) {
+    let tmux_socket = &ctx.tmux_socket;
+    match (method, path) {
         (tiny_http::Method::Get, "/api/panes") => {
             // v1: 従来の tmux 直接一覧（後方互換）
             let result = tmux_list_panes(tmux_socket);
@@ -2324,7 +2900,7 @@ fn handle_request_v2(
                     Some(json!({ "error": "無効なセッション ID" }).to_string()),
                 );
             };
-            let tail = query_param(&url_full, "tail")
+            let tail = query_param(url_full, "tail")
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(30);
             match crate::transcript::read_messages(&session_id, tail) {
@@ -2341,8 +2917,8 @@ fn handle_request_v2(
                 );
             };
             let tmux_target = format!("={target}");
-            let ansi = query_param(&url_full, "ansi").is_some_and(|v| v == "1" || v == "true");
-            let history = query_param(&url_full, "lines").and_then(|v| v.parse::<u32>().ok());
+            let ansi = query_param(url_full, "ansi").is_some_and(|v| v == "1" || v == "true");
+            let history = query_param(url_full, "lines").and_then(|v| v.parse::<u32>().ok());
             match tmux_capture_pane(tmux_socket, &tmux_target, ansi, history) {
                 Ok(lines) => {
                     let mut body = json!({ "lines": lines });
@@ -2366,7 +2942,7 @@ fn handle_request_v2(
                 );
             };
             let tmux_target = format!("={target}");
-            let history = query_param(&url_full, "lines")
+            let history = query_param(url_full, "lines")
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(1000);
             match tmux_capture_pane(tmux_socket, &tmux_target, false, Some(history)) {
@@ -2389,36 +2965,33 @@ fn handle_request_v2(
                     Some(json!({ "error": "無効なペイン ID" }).to_string()),
                 );
             };
-            let mut body = String::new();
-            {
-                use std::io::Read as _;
-                if request
-                    .as_reader()
-                    .take(MAX_BODY_BYTES)
-                    .read_to_string(&mut body)
-                    .is_err()
-                {
-                    return respond(
-                        request,
-                        400,
-                        Some(json!({ "error": "リクエストボディの読み取りに失敗" }).to_string()),
-                    );
-                }
-            }
-            let parsed: Value = match serde_json::from_str(&body) {
+            let parsed = match read_json_body(&mut request) {
                 Ok(v) => v,
                 Err(e) => {
-                    return respond(
-                        request,
-                        400,
-                        Some(json!({ "error": format!("JSON パースエラー: {e}") }).to_string()),
-                    );
+                    return respond(request, 400, Some(json!({ "error": e }).to_string()));
                 }
             };
             // IPC 経由で dispatch Send を呼ぶ（H-7: #95 送達検証が効く）
             let keys = parsed["keys"].as_str().map(|s| s.to_string());
             let text = parsed["text"].as_str().unwrap_or("").to_string();
             let newline = parsed["newline"].as_bool().unwrap_or(true);
+            // 監査 metadata（バイト数のみ。テキスト内容は記録しない）+ interact session。
+            // idle timeout 明けの最初の入力は操作セッション開始として macOS 通知を出す
+            let input_bytes = text.len() + keys.as_deref().map(|k| k.len()).unwrap_or(0);
+            {
+                let mut reg = ctx.registry.lock().unwrap();
+                let session_started = reg.record_input(&device.id);
+                reg.audit(
+                    "input",
+                    &device.id,
+                    &device.name,
+                    json!({ "route": p, "bytes": input_bytes }),
+                );
+                drop(reg);
+                if session_started {
+                    notify_macos(&format!("{} が操作を開始しました", device.name));
+                }
+            }
             match dispatch_send(app_conn, &target, &text, newline, keys.as_deref()) {
                 Ok(_) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
                 Err((status, e)) => {
@@ -2434,6 +3007,12 @@ fn handle_request_v2(
                     Some(json!({ "error": "無効なペイン ID" }).to_string()),
                 );
             };
+            ctx.registry.lock().unwrap().audit(
+                "close",
+                &device.id,
+                &device.name,
+                json!({ "route": p }),
+            );
             // IPC 経由で dispatch Close を呼ぶ（H-7: 最後のペイン保護が効く）
             match dispatch_close(app_conn, pane_mapping, &target) {
                 Ok(_) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
@@ -2450,32 +3029,18 @@ fn handle_request_v2(
                     Some(json!({ "error": "無効なペイン ID" }).to_string()),
                 );
             };
-            let mut body = String::new();
-            {
-                use std::io::Read as _;
-                if request
-                    .as_reader()
-                    .take(MAX_BODY_BYTES)
-                    .read_to_string(&mut body)
-                    .is_err()
-                {
-                    return respond(
-                        request,
-                        400,
-                        Some(json!({ "error": "リクエストボディの読み取りに失敗" }).to_string()),
-                    );
-                }
-            }
-            let parsed: Value = match serde_json::from_str(&body) {
+            let parsed = match read_json_body(&mut request) {
                 Ok(v) => v,
                 Err(e) => {
-                    return respond(
-                        request,
-                        400,
-                        Some(json!({ "error": format!("JSON パースエラー: {e}") }).to_string()),
-                    );
+                    return respond(request, 400, Some(json!({ "error": e }).to_string()));
                 }
             };
+            ctx.registry.lock().unwrap().audit(
+                "resize",
+                &device.id,
+                &device.name,
+                json!({ "route": p }),
+            );
             // IPC 経由で TmuxResize dispatch を呼ぶ
             let session_part = target.split(':').next().unwrap_or(&target);
             let window_part = target
@@ -2554,27 +3119,27 @@ fn handle_request_v2(
 }
 
 /// WS broadcaster 版のハンドラ（M-5: ペインごとの共有 broadcaster で接続数分の
-/// tmux subprocess 乱立を解消）
+/// tmux subprocess 乱立を解消）。
+///
+/// 認証（#283）: 機器ペアリングの二層認証（Observe 以上）。
+/// 旧方式の `token.<T>` サブプロトコルは全廃 — serve が付与する identity ヘッダは
+/// WS の upgrade リクエストにも載る（弾 0 実測）ため、REST と同じ認可を通せる。
+/// デバイスの WS 接続数 0→1 / 1→0 で接続開始・終了の通知と監査を行い、
+/// revoke 時は該当デバイスの subscriber を落として即時切断する
 fn handle_ws_v2(
     request: tiny_http::Request,
-    token: &str,
-    tmux_socket: &str,
+    ctx: &Arc<DaemonCtx>,
     shutdown: Arc<AtomicBool>,
     broadcasters: BroadcasterMap,
 ) {
     let url_full = request.url().to_string();
-    let client_token =
-        header_value(&request, "sec-websocket-protocol").and_then(|v| ws_token_from_protocols(&v));
-    let token_ok = client_token
-        .as_deref()
-        .is_some_and(|t| constant_time_eq(t.as_bytes(), token.as_bytes()));
-    if !token_ok {
-        return respond(
-            request,
-            401,
-            Some(json!({ "error": "認証が必要" }).to_string()),
-        );
-    }
+    // 二層認証（画面データは Observe role から）
+    let device = match authorize_device_checked(ctx, &request, DeviceRole::Observe) {
+        Ok(device) => device,
+        Err((status, e)) => {
+            return respond(request, status, Some(json!({ "error": e }).to_string()));
+        }
+    };
     let Some(pane) = query_param(&url_full, "pane") else {
         return respond(
             request,
@@ -2603,9 +3168,24 @@ fn handle_ws_v2(
         );
     let stream = request.upgrade("websocket", response);
 
-    // broadcaster に subscribe して WS 配信スレッドを起動
-    let (_, rx) = get_or_create_broadcaster(&broadcasters, &pane, tmux_socket, shutdown);
+    // broadcaster に subscribe して WS 配信スレッドを起動（subscriber はデバイス ID つき =
+    // revoke 時に disconnect_device_ws で該当デバイスだけ即時切断できる）
+    let (_, rx) =
+        get_or_create_broadcaster(&broadcasters, &pane, &device.id, &ctx.tmux_socket, shutdown);
 
+    // 接続開始（このデバイスの 1 本目の WS）なら通知 + 監査
+    if ctx.ws_connect(&device.id) {
+        ctx.registry.lock().unwrap().audit(
+            "conn_open",
+            &device.id,
+            &device.name,
+            json!({ "route": "/ws" }),
+        );
+        notify_macos(&format!("{} が接続しました", device.name));
+    }
+
+    let ctx_fwd = ctx.clone();
+    let device_fwd = device.clone();
     std::thread::Builder::new()
         .name("tako-remote-ws-forward".into())
         .spawn(move || {
@@ -2628,12 +3208,24 @@ fn handle_ws_v2(
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        // broadcaster が終了した
+                        // broadcaster の終了 or revoke による切断
                         break;
                     }
                 }
             }
             let _ = ws.close(None);
+            // 全 WS 切断（このデバイスの最後の 1 本）なら通知 + 監査
+            if ctx_fwd.ws_disconnect(&device_fwd.id) {
+                if let Ok(reg) = ctx_fwd.registry.lock() {
+                    reg.audit(
+                        "conn_close",
+                        &device_fwd.id,
+                        &device_fwd.name,
+                        json!({ "route": "/ws" }),
+                    );
+                }
+                notify_macos(&format!("{} が切断しました", device_fwd.name));
+            }
         })
         .ok();
 }
@@ -2691,22 +3283,6 @@ pub fn generate_qr_png(url: &str) -> io::Result<std::path::PathBuf> {
 // --- URL エンコーディング（最小実装。外部依存なし）---
 
 mod urlencoding {
-    pub fn encode(s: &str) -> String {
-        let mut result = String::with_capacity(s.len());
-        for b in s.bytes() {
-            match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    result.push(b as char);
-                }
-                _ => {
-                    result.push('%');
-                    result.push_str(&format!("{b:02X}"));
-                }
-            }
-        }
-        result
-    }
-
     pub fn decode(s: &str) -> String {
         let mut result = Vec::with_capacity(s.len());
         let bytes = s.as_bytes();
@@ -2770,19 +3346,76 @@ mod tests {
     }
 
     #[test]
-    fn ws_token_from_protocolsの抽出() {
+    fn required_roleは操作種別ごとに正しいroleを要求する() {
+        use tiny_http::Method;
+        // 読み取り系は Observe
         assert_eq!(
-            ws_token_from_protocols("tako-remote, token.abc123"),
-            Some("abc123".to_string())
+            required_role(&Method::Get, "/api/panes"),
+            DeviceRole::Observe
         );
         assert_eq!(
-            ws_token_from_protocols("token.xyz"),
-            Some("xyz".to_string())
+            required_role(&Method::Get, "/api/v2/panes"),
+            DeviceRole::Observe
         );
-        assert_eq!(ws_token_from_protocols("tako-remote"), None);
-        assert_eq!(ws_token_from_protocols(""), None);
-        // token. 接頭辞のみ（空トークン）は Some("") となり、実トークンと一致しないため安全
-        assert_eq!(ws_token_from_protocols("token."), Some(String::new()));
+        assert_eq!(
+            required_role(&Method::Get, "/api/panes/s:0.0/screen"),
+            DeviceRole::Observe
+        );
+        assert_eq!(
+            required_role(&Method::Get, "/api/panes/s:0.0/scrollback"),
+            DeviceRole::Observe
+        );
+        assert_eq!(
+            required_role(&Method::Get, "/api/sessions/abc/messages"),
+            DeviceRole::Observe
+        );
+        // input は Interact
+        assert_eq!(
+            required_role(&Method::Post, "/api/panes/s:0.0/input"),
+            DeviceRole::Interact
+        );
+        // close / resize は Manage
+        assert_eq!(
+            required_role(&Method::Post, "/api/panes/s:0.0/close"),
+            DeviceRole::Manage
+        );
+        assert_eq!(
+            required_role(&Method::Post, "/api/panes/s:0.0/resize"),
+            DeviceRole::Manage
+        );
+        // 端末管理は Admin
+        assert_eq!(
+            required_role(&Method::Get, "/api/devices"),
+            DeviceRole::Admin
+        );
+        assert_eq!(
+            required_role(&Method::Post, "/api/devices/revoke"),
+            DeviceRole::Admin
+        );
+        // 未知の POST は安全側（Manage）
+        assert_eq!(
+            required_role(&Method::Post, "/api/unknown"),
+            DeviceRole::Manage
+        );
+    }
+
+    #[test]
+    fn device_jsonは全フィールドを含む() {
+        let d = crate::remote_auth::Device {
+            id: "nDEV1".into(),
+            name: "iPhone".into(),
+            login: "u@e.com".into(),
+            node_name: "iphone.tail1234.ts.net".into(),
+            role: DeviceRole::Interact,
+            created_at: 100,
+            last_seen: 200,
+        };
+        let v = device_json(&d);
+        assert_eq!(v["id"], "nDEV1");
+        assert_eq!(v["name"], "iPhone");
+        assert_eq!(v["role"], "interact");
+        assert_eq!(v["created_at"], 100);
+        assert_eq!(v["last_seen"], 200);
     }
 
     #[test]
@@ -2915,41 +3548,6 @@ mod tests {
     }
 
     #[test]
-    fn connect_urlの生成() {
-        let url = connect_url("https://mac.tail1234.ts.net", "abc123", Some("my-mac"));
-        assert_eq!(
-            url,
-            "https://mac.tail1234.ts.net/#/connect?token=abc123&name=my-mac"
-        );
-
-        // name 省略
-        let url = connect_url("https://mac.tail1234.ts.net", "abc123", None);
-        assert_eq!(url, "https://mac.tail1234.ts.net/#/connect?token=abc123");
-
-        // ベース URL の末尾スラッシュは正規化される
-        let url = connect_url("https://mac.tail1234.ts.net/", "t", None);
-        assert!(url.starts_with("https://mac.tail1234.ts.net/#/connect?"));
-    }
-
-    #[test]
-    fn connect_urlのトークンはfragmentに載る() {
-        // fragment（# 以降）はブラウザがサーバーへ送らない = ログ・Referer に残らない
-        let url = connect_url("https://mac.tail1234.ts.net", "secret", None);
-        let hash_pos = url.find('#').expect("fragment がある");
-        let token_pos = url.find("token=").expect("token がある");
-        assert!(token_pos > hash_pos, "token は fragment 内: {url}");
-    }
-
-    #[test]
-    fn urlエンコーディング() {
-        assert_eq!(urlencoding::encode("hello"), "hello");
-        assert_eq!(
-            urlencoding::encode("https://foo.com"),
-            "https%3A%2F%2Ffoo.com"
-        );
-    }
-
-    #[test]
     fn daemon_statusはpidファイルがないときfalse() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // テスト中に PID ファイルが存在しないことを前提にしない（他のテストが使うかも）
@@ -2980,40 +3578,6 @@ mod tests {
     }
 
     #[test]
-    fn mask_status_tokenはトークンをマスクしそれ以外を残す() {
-        let mut v =
-            json!({ "running": true, "port": 7749, "token": "deadbeef", "url": "http://x" });
-        mask_status_token(&mut v);
-        assert_eq!(v["token"], json!("***"));
-        assert_eq!(v["port"], json!(7749));
-        assert_eq!(v["running"], json!(true));
-
-        // token フィールドが無ければ何も壊さない
-        let mut v2 = json!({ "running": false });
-        mask_status_token(&mut v2);
-        assert_eq!(v2, json!({ "running": false }));
-    }
-
-    #[test]
-    fn mask_token_in_urlはクエリのtokenを伏せる() {
-        // fragment 内 + 後続パラメータあり
-        assert_eq!(
-            mask_token_in_url("https://mac.tail1234.ts.net/#/connect?token=deadbeef&name=mac"),
-            "https://mac.tail1234.ts.net/#/connect?token=***&name=mac"
-        );
-        // token が末尾
-        assert_eq!(
-            mask_token_in_url("http://10.0.0.1:7749/#/connect?token=secretvalue"),
-            "http://10.0.0.1:7749/#/connect?token=***"
-        );
-        // token 無しはそのまま
-        assert_eq!(
-            mask_token_in_url("http://10.0.0.1:7749/"),
-            "http://10.0.0.1:7749/"
-        );
-    }
-
-    #[test]
     fn find_port_occupantは未使用ポートでnoneを返す() {
         // 存在しないであろう高番号ポート
         assert!(find_port_occupant(59999).is_none());
@@ -3037,26 +3601,6 @@ mod tests {
         assert_eq!(status["running"], json!(false));
         std::env::remove_var("TAKO_REMOTE_STATE_DIR");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn mask_status_tokenはconnect_url内のtokenもマスクする() {
-        // #104: token フィールドだけでなく URL クエリの生トークンも伏せる
-        let mut v = json!({
-            "running": true,
-            "token": "aabbccdd",
-            "url": "https://mac.tail1234.ts.net",
-            "connect_url": "https://mac.tail1234.ts.net/#/connect?token=aabbccdd&name=mac",
-        });
-        mask_status_token(&mut v);
-        assert_eq!(v["token"], json!("***"));
-        let connect = v["connect_url"].as_str().unwrap();
-        assert!(
-            !connect.contains("aabbccdd"),
-            "connect_url に生トークンが残る: {connect}"
-        );
-        assert!(connect.contains("token=***"));
-        assert!(connect.contains("name=mac"), "他のクエリは保持する");
     }
 
     // --- P0-3 テスト ---

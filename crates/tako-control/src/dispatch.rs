@@ -1856,13 +1856,7 @@ fn dispatch_inner(
                 host.remote_stop().map_err(DispatchError::Operation)
             }
         }
-        Request::RemoteStatus { show_token } => {
-            let mut status = host.remote_status();
-            if !show_token {
-                crate::remote::mask_status_token(&mut status);
-            }
-            Ok(status)
-        }
+        Request::RemoteStatus => Ok(host.remote_status()),
 
         // エージェント一覧と会話ログはどのプロセスでも取得できる（ControlHost 不要）
         Request::RemoteAgents => {

@@ -680,11 +680,7 @@ enum RemoteCommand {
         force: bool,
     },
     /// リモートアクセス API サーバーの状態を表示する
-    Status {
-        /// トークンをマスクせず生値で表示する（既定はマスク。#104）
-        #[arg(long)]
-        show_token: bool,
-    },
+    Status,
     /// エージェント一覧を表示する（claude agents --json + tmux ペイン対応付け）
     Agents,
     /// Claude Code の会話ログ（transcript）の末尾を正規化 JSON で表示する
@@ -1732,7 +1728,7 @@ fn main() -> ExitCode {
         // remote コマンドはローカル処理（IPC 不要）
         Command::Remote(RemoteCommand::Start { port }) => remote_start(port),
         Command::Remote(RemoteCommand::Stop { force }) => remote_stop(force),
-        Command::Remote(RemoteCommand::Status { show_token }) => remote_status(show_token),
+        Command::Remote(RemoteCommand::Status) => remote_status(),
         Command::Remote(RemoteCommand::Serve { port }) => remote_serve(port),
         Command::Remote(RemoteCommand::Agents) => remote_agents(),
         Command::Remote(RemoteCommand::Messages { session_id, tail }) => {
@@ -2363,12 +2359,14 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
 
 /// `tako remote start` — デーモンをバックグラウンドで fork 起動し QR を表示する。
 /// transport は Tailscale Serve のみ（tailnet 内限定・WireGuard E2E 暗号化）。
-/// Tailscale 未セットアップ時は spawn_daemon が不足項目を列挙して起動を拒否する（#282）
+/// Tailscale 未セットアップ時は spawn_daemon が不足項目を列挙して起動を拒否する（#282）。
+/// QR は恒久固定 URL のみ（#283: secret を含まない。初回接続時に Mac 側で
+/// ペアリング承認ダイアログが表示される）
 fn remote_start(port: u16) -> Result<(), String> {
     let result = tako_control::remote::spawn_daemon(Some(port))?;
     println!("{}", pretty_json(&result));
-    if let Some(connect) = result["connect_url"].as_str() {
-        match tako_control::remote::generate_qr_png(connect) {
+    if let Some(url) = result["url"].as_str() {
+        match tako_control::remote::generate_qr_png(url) {
             Ok(path) => {
                 eprintln!("\nQR コードを生成しました: {}", path.display());
                 // tako-app が起動していれば IPC 経由で OpenFile を送る（エラーは握りつぶす）
@@ -2383,9 +2381,12 @@ fn remote_start(port: u16) -> Result<(), String> {
             }
             Err(e) => eprintln!("\nQR コード画像の生成に失敗: {e}"),
         }
-        eprintln!("URL: {connect}");
-        eprintln!("この URL は恒久固定です（Tailscale MagicDNS 名。tailnet 内限定）。");
+        eprintln!("URL: {url}");
+        eprintln!(
+            "この URL は恒久固定で secret を含みません（Tailscale MagicDNS 名。tailnet 内限定）。"
+        );
         eprintln!("スマホ側にも Tailscale アプリを入れ、同じアカウントでログインしてください。");
+        eprintln!("初回アクセス時は Mac の画面にペアリング承認ダイアログが表示されます。");
     }
     Ok(())
 }
@@ -2403,12 +2404,9 @@ fn remote_stop(force: bool) -> Result<(), String> {
 }
 
 /// `tako remote status` — デーモンの状態を表示する。
-/// 既定ではトークンをマスクし、`--show-token` 指定時のみ生値を出す（#104）
-fn remote_status(show_token: bool) -> Result<(), String> {
-    let mut status = tako_control::remote::daemon_status();
-    if !show_token {
-        tako_control::remote::mask_status_token(&mut status);
-    }
+/// 応答にトークンは含まれない（#283 で長寿命 bearer token を全廃）
+fn remote_status() -> Result<(), String> {
+    let status = tako_control::remote::daemon_status();
     println!("{}", pretty_json(&status));
     Ok(())
 }

@@ -1369,7 +1369,10 @@ pub fn tools() -> Vec<Value> {
                 （WireGuard E2E 暗号化・public internet に入口を持たない）。\
                 Tailscale が未セットアップ（未導入・未ログイン・HTTPS 未有効等）の場合は\
                 不足項目を列挙して起動を拒否するので、ユーザーに `tako remote setup` を案内する。\
-                注意: 接続したリモートはターミナルへ任意コマンドを送信できる（実質シェルアクセス）。",
+                接続には機器ペアリングが必要: 初回アクセス時に Mac 画面へ承認ダイアログが表示され、\
+                ユーザーが許可した端末だけが role（observe / interact / manage / admin）に応じて\
+                操作できる。承認・role 変更は Mac の GUI 限定で AI からは行えない。\
+                注意: interact 以上を許可した端末はターミナルへ任意コマンドを送信できる（実質シェルアクセス）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1399,8 +1402,8 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_remote_status",
             "description": "リモートアクセス API サーバーの状態を取得する。\
-                起動中なら running=true とポート番号を返す。\
-                トークンと接続 URL は AI からは取得できない（CLI の --show-token でのみ表示可）。",
+                起動中なら running=true・ポート番号・恒久固定 URL・登録済み端末数を返す。\
+                URL に secret は含まれない（接続時の認証は機器ペアリングが行う）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -2077,34 +2080,10 @@ fn call_tool(params: &Value, session: &mut McpSession) -> Result<Value, (i64, St
         return list_panes_with_caller(request, session);
     }
 
-    // P0-2: MCP 経由の remote start/status からトークンを除去する。
-    // CLI の --show-token は残すが、AI にはトークンを渡さない（意図的な非対称）
-    if name == "tako_remote_start" || name == "tako_remote_status" {
-        return exec_and_strip_token(request, session);
-    }
+    // #283: remote の応答にトークンは存在しない（長寿命 bearer token を全廃。
+    // 接続時の認証は機器ペアリング二層認証が行う）ため、除去処理は不要になった
 
     exec_and_wrap(request, session)
-}
-
-/// P0-2: MCP 応答から token / token 入り URL を除去する
-fn exec_and_strip_token(
-    request: Request,
-    session: &mut McpSession,
-) -> Result<Value, (i64, String)> {
-    Ok(match (session.exec)(request) {
-        Ok(mut value) => {
-            crate::remote::mask_status_token(&mut value);
-            // マスク済みの token フィールド自体も応答から除去する
-            if let Some(obj) = value.as_object_mut() {
-                obj.remove("token");
-            }
-            let text = value.to_string();
-            json!({ "content": [{ "type": "text", "text": text }], "isError": false })
-        }
-        Err(message) => {
-            json!({ "content": [{ "type": "text", "text": message }], "isError": true })
-        }
-    })
 }
 
 fn exec_and_wrap(request: Request, session: &mut McpSession) -> Result<Value, (i64, String)> {
@@ -2682,7 +2661,7 @@ fn build_request(
         "tako_remote_stop" => Request::RemoteStop {
             force: bool_arg(args, "force")?.unwrap_or(false),
         },
-        "tako_remote_status" => Request::RemoteStatus { show_token: false },
+        "tako_remote_status" => Request::RemoteStatus,
         "tako_remote_agents" => Request::RemoteAgents,
         "tako_remote_messages" => Request::RemoteMessages {
             session_id: str_arg(args, "session_id")?.ok_or("session_id を指定する")?,

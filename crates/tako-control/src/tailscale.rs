@@ -260,6 +260,86 @@ pub fn proxy_target_for_port(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// `tailscale whois` で得た接続元ノードの情報（層①の identity 検証。#283）。
+/// フィールドは 2026-07-17 実測の JSON 形式が正（`Node.StableID` / `UserProfile.LoginName`）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhoisInfo {
+    /// ノードの恒久 ID（`Node.StableID`）。機器ペアリングのデバイス識別子に使う
+    pub stable_id: String,
+    /// ノードの MagicDNS 名（`Node.Name`、末尾ドット除去済み）
+    pub node_name: String,
+    /// ノードのマシン名（`Node.Hostinfo.Hostname`。無ければ node_name の先頭ラベル）
+    pub hostname: String,
+    /// ノード所有ユーザーのログイン名（`UserProfile.LoginName`）
+    pub login: String,
+}
+
+/// whois の失敗理由。PeerNotFound（= serve 経由でない直結 or 偽装 IP）と
+/// 実行エラーを区別する（前者は認証拒否、後者は 503 相当）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WhoisError {
+    /// 指定 IP は tailnet 上のピアではない（`peer not found`）
+    PeerNotFound,
+    /// tailscale コマンドの実行失敗・出力の解釈失敗
+    Failed(String),
+}
+
+/// `tailscale whois --json <ip>` で接続元 IP のノード情報を取得する。
+/// serve が付与する `X-Forwarded-For` の IP を照合し、tailnet 上の実在ノードで
+/// あることを検証する（弾 0 実測: ローカル直結の 127.0.0.1 等は `peer not found`）
+pub fn whois(cli: &str, ip: &str) -> Result<WhoisInfo, WhoisError> {
+    let output = run_tailscale(cli, &["whois", "--json", ip]).map_err(WhoisError::Failed)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stderr.contains("peer not found") || stdout.contains("peer not found") {
+            return Err(WhoisError::PeerNotFound);
+        }
+        return Err(WhoisError::Failed(format!(
+            "tailscale whois が失敗: {}",
+            stderr.trim()
+        )));
+    }
+    let json: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| WhoisError::Failed(format!("tailscale whois の JSON を解釈できない: {e}")))?;
+    parse_whois(&json)
+}
+
+/// whois JSON から WhoisInfo を組み立てる（テスト可能な純関数部）
+fn parse_whois(json: &Value) -> Result<WhoisInfo, WhoisError> {
+    let stable_id = json["Node"]["StableID"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| WhoisError::Failed("whois 応答に Node.StableID が無い".into()))?
+        .to_string();
+    let node_name = json["Node"]["Name"]
+        .as_str()
+        .unwrap_or("")
+        .trim_end_matches('.')
+        .to_string();
+    let hostname = json["Node"]["Hostinfo"]["Hostname"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            node_name
+                .split('.')
+                .next()
+                .unwrap_or(&node_name)
+                .to_string()
+        });
+    let login = json["UserProfile"]["LoginName"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    Ok(WhoisInfo {
+        stable_id,
+        node_name,
+        hostname,
+        login,
+    })
+}
+
 /// `tailscale serve --bg --https=443 <target>` で serve を設定する。
 /// 設定は tailscaled 側に永続化され、off するまで残る（弾 0 項目 3:
 /// off → 再設定でも URL は不変）
@@ -531,6 +611,44 @@ mod tests {
     #[test]
     fn proxy_target_for_portの形式() {
         assert_eq!(proxy_target_for_port(7749), "http://127.0.0.1:7749");
+    }
+
+    #[test]
+    fn whoisのjsonからノード情報を組み立てる() {
+        // 2026-07-17 実測の whois --json 形式（キーは抜粋）
+        let json = json!({
+            "Node": {
+                "StableID": "nABCDEF123CNTRL",
+                "Name": "iphone.tail1234.ts.net.",
+                "Hostinfo": { "Hostname": "iPhone" },
+            },
+            "UserProfile": { "LoginName": "user@example.com" },
+        });
+        let info = parse_whois(&json).expect("パース成功");
+        assert_eq!(info.stable_id, "nABCDEF123CNTRL");
+        assert_eq!(info.node_name, "iphone.tail1234.ts.net");
+        assert_eq!(info.hostname, "iPhone");
+        assert_eq!(info.login, "user@example.com");
+    }
+
+    #[test]
+    fn whoisのhostname欠落はnode_nameの先頭ラベルへフォールバックする() {
+        let json = json!({
+            "Node": {
+                "StableID": "nXYZ",
+                "Name": "ipad.tail1234.ts.net.",
+                "Hostinfo": {},
+            },
+            "UserProfile": { "LoginName": "u@e.com" },
+        });
+        let info = parse_whois(&json).expect("パース成功");
+        assert_eq!(info.hostname, "ipad");
+    }
+
+    #[test]
+    fn whoisのstableid欠落はエラー() {
+        let json = json!({ "Node": {}, "UserProfile": {} });
+        assert!(matches!(parse_whois(&json), Err(WhoisError::Failed(_))));
     }
 
     #[test]
