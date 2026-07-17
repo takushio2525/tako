@@ -2662,10 +2662,19 @@ fn dispatch_inner(
                 .filter(|p| p.is_dir())
                 .map(|p| p.to_path_buf());
 
+            // コマンドをシェルの -c 引数として渡す（#325: queue_write での PTY 直書きは
+            // シェル初期化とのレース条件で余分な入力が read 等の対話コマンドに混入する）。
+            // 末尾の read は PTY を生存させる（exit マーカー検知前にペインが消えるのを防止）
+            let wrapped = format!(
+                "{command}; echo \"__TAKO_EXIT=$?\"; read -r __TAKO_DUMMY__ 2>/dev/null || true"
+            );
             host.attach_session(
                 new_id,
                 SpawnOptions {
-                    command: None,
+                    command: Some(SpawnCommand {
+                        program: wrapped,
+                        args: Vec::new(),
+                    }),
                     cwd,
                     env: Vec::new(),
                 },
@@ -2685,12 +2694,6 @@ fn dispatch_inner(
                 p.set_interactive_meta(ac.to_string(), command.clone());
             }
 
-            // exit code 回収マーカーつきでコマンドを投入（queue_write で遅延書き込み）
-            let wrapped = format!("{command}; echo \"__TAKO_EXIT=$?\"");
-            let mut cmd_bytes = wrapped.into_bytes();
-            cmd_bytes.push(b'\r');
-            host.queue_write(new_id, cmd_bytes);
-
             Ok(json!({
                 "pane": new_id_u64,
                 "status": "running",
@@ -2707,12 +2710,7 @@ fn dispatch_inner(
                 .map(|s| s.visible_lines())
                 .unwrap_or_default();
 
-            let exit_code = lines.iter().rev().find_map(|line| {
-                let trimmed = line.trim();
-                trimmed
-                    .strip_prefix("__TAKO_EXIT=")
-                    .and_then(|s| s.parse::<i32>().ok())
-            });
+            let exit_code = find_exit_marker(&lines);
 
             let meta = host
                 .workspace()
@@ -3231,6 +3229,17 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
 /// `text:"" + newline:false` は「何も送らない」なので対象外
 fn send_is_enter_only(text: &str, newline: bool) -> bool {
     text.chars().all(|c| c == '\n' || c == '\r') && (newline || !text.is_empty())
+}
+
+/// `__TAKO_EXIT=<code>` マーカーを画面行から検索する。
+/// 行頭以外の位置（read プロンプトと同一行等）にも対応する（#325）
+fn find_exit_marker(lines: &[String]) -> Option<i32> {
+    lines.iter().rev().find_map(|line| {
+        line.find("__TAKO_EXIT=").and_then(|pos| {
+            let after = &line[pos + "__TAKO_EXIT=".len()..];
+            after.trim().parse::<i32>().ok()
+        })
+    })
 }
 
 /// キーボード入力の意味論での改行正規化（Issue #95）: 端末の Enter キーは CR であり、
@@ -5102,6 +5111,7 @@ mod tests {
     struct MockHost {
         ws: Workspace,
         attached: Vec<u64>,
+        attached_options: std::collections::HashMap<u64, SpawnOptions>,
         detached: Vec<u64>,
         previews: std::collections::HashMap<u64, (String, PreviewModeWire)>,
         preview_views: std::collections::HashMap<u64, tako_core::PreviewViewState>,
@@ -5124,6 +5134,7 @@ mod tests {
             Self {
                 ws: Workspace::new("t1", Pane::new(PaneOrigin::User)),
                 attached: Vec::new(),
+                attached_options: std::collections::HashMap::new(),
                 detached: Vec::new(),
                 previews: std::collections::HashMap::new(),
                 preview_views: std::collections::HashMap::new(),
@@ -5173,8 +5184,9 @@ mod tests {
         fn session(&self, _pane: PaneId) -> Option<&TerminalSession> {
             None
         }
-        fn attach_session(&mut self, pane: PaneId, _options: SpawnOptions) {
+        fn attach_session(&mut self, pane: PaneId, options: SpawnOptions) {
             self.attached.push(pane.as_u64());
+            self.attached_options.insert(pane.as_u64(), options);
         }
         fn detach_session(&mut self, pane: PaneId) {
             self.detached.push(pane.as_u64());
@@ -8592,5 +8604,59 @@ mod tests {
             PaneOrigin::Mcp,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn exit_markerは行頭でも途中でも検知できる() {
+        assert_eq!(find_exit_marker(&["__TAKO_EXIT=0".into()]), Some(0));
+        assert_eq!(
+            find_exit_marker(&["続行しますか? (y/n): __TAKO_EXIT=1".into()]),
+            Some(1)
+        );
+        assert_eq!(find_exit_marker(&["  __TAKO_EXIT=42  ".into()]), Some(42));
+        assert_eq!(find_exit_marker(&["just some output".into()]), None);
+        assert_eq!(
+            find_exit_marker(&[
+                "__TAKO_EXIT=0".into(),
+                "some output".into(),
+                "prompt: __TAKO_EXIT=2".into(),
+            ]),
+            Some(2),
+        );
+    }
+
+    #[test]
+    fn run_interactiveはコマンドをspawn_commandで渡す() {
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::RunInteractive {
+                pane: Some(root.as_u64()),
+                tab: None,
+                command: r#"read "ans?input: ""#.into(),
+                input_hint: None,
+                direction: None,
+                ratio: None,
+                auto_close: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let pane_id = result["pane"].as_u64().unwrap();
+        let opts = host.attached_options.get(&pane_id).expect("options 記録");
+        let cmd = opts.command.as_ref().expect("command が設定されている");
+        assert!(cmd.program.contains("__TAKO_EXIT="), "{}", cmd.program);
+        assert!(
+            cmd.program.contains(r#"read "ans?input: ""#),
+            "{}",
+            cmd.program
+        );
+        assert!(
+            cmd.program
+                .ends_with("read -r __TAKO_DUMMY__ 2>/dev/null || true"),
+            "{}",
+            cmd.program
+        );
     }
 }
