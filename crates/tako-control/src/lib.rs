@@ -33,6 +33,7 @@ pub mod orchestrator;
 pub mod protocol;
 pub mod remote;
 pub mod remote_auth;
+pub mod remote_setup;
 pub mod sessions;
 pub mod settings;
 pub mod setup;

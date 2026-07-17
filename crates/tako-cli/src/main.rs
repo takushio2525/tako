@@ -766,6 +766,18 @@ enum RemoteCommand {
         #[command(subcommand)]
         command: RemoteDevicesCommand,
     },
+    /// Tailscale を使ったリモート接続のセットアップ（対話ウィザード）
+    Setup {
+        /// 全質問に自動で yes と回答する（brew install 等）
+        #[arg(long)]
+        yes: bool,
+        /// 非対話パラメータを JSON で渡す（MCP / dispatch と同じ形式）
+        #[arg(long)]
+        answers: Option<String>,
+        /// サーバーのポート番号（省略時は 7749）
+        #[arg(long, default_value_t = 7749)]
+        port: u16,
+    },
     /// [内部用] HTTP サーバーをフォアグラウンドで起動する（start から自動呼び出し）
     Serve {
         /// サーバーのポート番号（省略時は 7749）
@@ -1933,6 +1945,9 @@ fn main() -> ExitCode {
             remote_scrollback(&pane_id, lines)
         }
         Command::Remote(RemoteCommand::Devices { command }) => remote_devices(command),
+        Command::Remote(RemoteCommand::Setup { yes, answers, port }) => {
+            remote_setup_cli(yes, answers.as_deref(), port)
+        }
         // テレメトリもローカル処理（IPC 不要。設定ファイルの読み書きのみ）
         Command::Telemetry(ref sub) => telemetry_local(sub),
         // FDA チェックはローカル処理（IPC 不要。ファイルシステムのみ）
@@ -2679,6 +2694,26 @@ fn remote_devices(command: RemoteDevicesCommand) -> Result<(), String> {
         }
     };
     println!("{}", pretty_json(&result));
+    Ok(())
+}
+
+/// `tako remote setup` — Tailscale リモートセットアップウィザード
+fn remote_setup_cli(yes: bool, answers_json: Option<&str>, port: u16) -> Result<(), String> {
+    if let Some(json_str) = answers_json {
+        let mut answers: tako_control::remote_setup::RemoteSetupAnswers =
+            serde_json::from_str(json_str).map_err(|e| format!("answers JSON が不正: {e}"))?;
+        if answers.port.is_none() {
+            answers.port = Some(port);
+        }
+        if yes {
+            answers.yes = Some(true);
+        }
+        let result = tako_control::remote_setup::run_noninteractive(&answers)?;
+        println!("{}", pretty_json(&result));
+    } else {
+        let mut stdout = std::io::stdout();
+        tako_control::remote_setup::run_interactive(port, yes, &mut stdout)?;
+    }
     Ok(())
 }
 

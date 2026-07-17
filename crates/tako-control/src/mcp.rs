@@ -1582,6 +1582,34 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_remote_setup",
+            "description": "リモートアクセスの Tailscale セットアップ状態を確認・実行する（#286）。\
+                action=check で Tailscale の導入・ログイン・HTTPS・serve の各項目を確認、\
+                action=run で serve 設定 + QR PNG 生成まで実行する。\
+                Tailscale が未導入・未ログインの場合は手順を案内して停止する。\
+                対話的なウィザード（brew install の実行等）は CLI `tako remote setup` で行い、\
+                このツールでは非対話実行のみ。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string", "enum": ["check", "run"],
+                        "description": "check = 状態確認のみ / run = セットアップ実行",
+                    },
+                    "answers": {
+                        "type": "object",
+                        "description": "run 時のオプション。yes=true で全質問を自動承認、port でポート指定",
+                        "properties": {
+                            "yes": { "type": "boolean" },
+                            "port": { "type": "integer" },
+                        },
+                    },
+                },
+                "required": ["action"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_web",
             "description": "ネイティブ Web ビューペインの操作（FR-3.8）。macOS の WKWebView を \
                 ペインとして表示し、ユーザーはクリック・スクロール・文字入力を直接行える。\
@@ -2938,6 +2966,10 @@ fn build_request(
             action: str_arg(args, "action")?.ok_or("action を指定する（list / revoke）")?,
             device_id: str_arg(args, "device_id")?,
         },
+        "tako_remote_setup" => Request::RemoteSetup {
+            action: str_arg(args, "action")?.ok_or("action を指定する（check / run）")?,
+            answers: args.get("answers").cloned(),
+        },
         "tako_remote_scrollback" => Request::RemoteScrollback {
             pane_id: str_arg(args, "pane_id")?
                 .ok_or("pane_id を指定する")?
@@ -3852,7 +3884,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 100);
+        assert_eq!(tools.len(), 101);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

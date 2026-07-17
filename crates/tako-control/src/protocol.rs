@@ -663,6 +663,16 @@ pub enum Request {
         action: String,
         device_id: Option<String>,
     },
+    /// リモートアクセスの対話セットアップ（Issue #286 弾6）。
+    /// Tailscale の導入状態を検証し、serve 設定と QR PNG 生成まで行う。
+    /// `action`:
+    /// - "run": ウィザードを実行（非対話。`answers` で制御。既定ポートは 7749）
+    /// - "check": setup 状態のチェックのみ（変更なし）
+    RemoteSetup {
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answers: Option<serde_json::Value>,
+    },
     /// Web ビューペインの操作（FR-3.8、Issue #155）。ネイティブ webview
     /// （macOS = WKWebView）をペインとして表示・管理する。`action`:
     /// - "open": `url` を新しい Web ビューペインで開く（`pane` を `direction` 方向に分割）

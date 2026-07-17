@@ -2036,6 +2036,23 @@ fn dispatch_inner(
             Ok(json!({ "lines": result }))
         }
 
+        Request::RemoteSetup { action, answers } => match action.as_str() {
+            "run" => {
+                let parsed: crate::remote_setup::RemoteSetupAnswers = answers
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|e| {
+                        DispatchError::InvalidParams(format!("remote setup answers が不正: {e}"))
+                    })?
+                    .unwrap_or_default();
+                crate::remote_setup::run_noninteractive(&parsed).map_err(DispatchError::Operation)
+            }
+            "check" => Ok(crate::remote_setup::check_status()),
+            other => Err(DispatchError::InvalidParams(format!(
+                "不明な action: {other}（run / check）"
+            ))),
+        },
+
         Request::Web {
             action,
             url,
