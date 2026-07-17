@@ -1700,6 +1700,30 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_limit_service",
+            "description": "ステータスバーの利用制限表示サービスの状態確認・切替（Issue #321）。\
+                ステータスバーの 5h / 7d リミットメーターにどのサービス（claude / codex / agy）の値を表示するかを制御する。\
+                action=status（既定）: 現在の選択サービスと利用可能サービス一覧を返す。\
+                action=set: service で指定したサービスへ切り替える。\
+                変更は settings.json に永続化され、GUI に即時反映される。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "set"],
+                        "description": "操作種別（省略時は status）",
+                    },
+                    "service": {
+                        "type": "string",
+                        "enum": ["claude", "codex", "agy"],
+                        "description": "サービス名（set 時に必須）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_telemetry",
             "description": "エラーレポートの自動送信（テレメトリ）の状態確認・切替（Issue #333）。\
                 tako 内で発生した panic / 重大エラーを PII なしで収集エンドポイントへ送信する。\
@@ -2948,6 +2972,10 @@ fn build_request(
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             mode: str_arg(args, "mode")?.map(|s| s.to_string()),
         },
+        "tako_limit_service" => Request::LimitService {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
+            service: str_arg(args, "service")?.map(|s| s.to_string()),
+        },
         "tako_telemetry" => Request::Telemetry {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
         },
@@ -3816,7 +3844,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 98);
+        assert_eq!(tools.len(), 99);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

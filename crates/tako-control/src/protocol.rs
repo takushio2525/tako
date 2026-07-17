@@ -765,6 +765,16 @@ pub enum Request {
         #[serde(default)]
         action: Option<String>,
     },
+    /// ステータスバーの利用制限表示サービスの状態確認・切替（Issue #321）。
+    /// `action` = "status"（既定）/ "set"（`service` へ変更）。
+    /// 変更は settings.json に永続化され、GUI に即時反映される
+    LimitService {
+        #[serde(default)]
+        action: Option<String>,
+        /// サービス名: "claude" / "codex" / "agy"（set 時に必須）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service: Option<String>,
+    },
     /// ファイルツリーへのフォルダ追加・削除・一覧（#134）。
     /// AI が作業対象プロジェクトのフォルダをファイルツリーに明示追加する。タブ単位スコープ
     TreeFolder {
