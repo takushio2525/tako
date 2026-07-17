@@ -428,6 +428,185 @@ pub fn mutate_config_at<R>(
     Ok(result)
 }
 
+// --- グローバル指示ファイルと同梱推奨ルールの項目レベル比較（Issue #322） ---
+
+/// 同梱推奨ルールのセクション（バイナリ埋め込み）。
+/// (setup ディレクトリへの展開相対パス, 内容)。tako-cli のテンプレート展開と
+/// 項目レベル比較の両方がこれを正として使う（二重定義を作らない）
+pub const RECOMMENDED_SECTIONS: &[(&str, &str)] = &[
+    (
+        "templates/sections/00-language.md",
+        include_str!("../../../resources/setup/templates/sections/00-language.md"),
+    ),
+    (
+        "templates/sections/01-interaction-style.md",
+        include_str!("../../../resources/setup/templates/sections/01-interaction-style.md"),
+    ),
+    (
+        "templates/sections/02-git-workflow.md",
+        include_str!("../../../resources/setup/templates/sections/02-git-workflow.md"),
+    ),
+    (
+        "templates/sections/03-code-quality.md",
+        include_str!("../../../resources/setup/templates/sections/03-code-quality.md"),
+    ),
+    (
+        "templates/sections/04-safety-rules.md",
+        include_str!("../../../resources/setup/templates/sections/04-safety-rules.md"),
+    ),
+    (
+        "templates/sections/05-proposal-quality.md",
+        include_str!("../../../resources/setup/templates/sections/05-proposal-quality.md"),
+    ),
+    (
+        "templates/sections/06-completion-verification.md",
+        include_str!("../../../resources/setup/templates/sections/06-completion-verification.md"),
+    ),
+];
+
+/// 同梱の既定グローバル指示ファイル（未作成時に setup が書く内容）
+pub const INSTRUCTIONS_DEFAULT: &str =
+    include_str!("../../../resources/setup/templates/instructions-default.md");
+
+/// 推奨ルール 1 項目内の必須概念。キーワード（小文字化済み）のいずれかが
+/// 指示ファイル本文に含まれれば、その概念は記述済みとみなす
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageConcept {
+    pub name: String,
+    pub keywords: Vec<String>,
+}
+
+/// 推奨ルールの 1 項目（sections/*.md の 1 ファイル）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageSection {
+    pub title: String,
+    pub concepts: Vec<CoverageConcept>,
+}
+
+/// セクション md の coverage メタ行（`<!-- coverage: 概念名 = kw | kw -->`）をパースする。
+/// メタ行はセクション md 自身が持つ（比較の正をコードに複製しない）
+fn parse_coverage_section(md: &str) -> Option<CoverageSection> {
+    let mut title: Option<String> = None;
+    let mut concepts = Vec::new();
+    for line in md.lines() {
+        let line = line.trim();
+        if title.is_none() {
+            if let Some(t) = line.strip_prefix("# ") {
+                title = Some(t.trim().to_string());
+            }
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("<!-- coverage:") else {
+            continue;
+        };
+        let Some(body) = rest.strip_suffix("-->") else {
+            continue;
+        };
+        let Some((name, keywords)) = body.split_once('=') else {
+            continue;
+        };
+        let keywords: Vec<String> = keywords
+            .split('|')
+            .map(|k| k.trim().to_lowercase())
+            .filter(|k| !k.is_empty())
+            .collect();
+        let name = name.trim();
+        if keywords.is_empty() || name.is_empty() {
+            continue;
+        }
+        concepts.push(CoverageConcept {
+            name: name.to_string(),
+            keywords,
+        });
+    }
+    let title = title?;
+    if concepts.is_empty() {
+        return None;
+    }
+    Some(CoverageSection { title, concepts })
+}
+
+/// 同梱推奨ルール全項目の比較定義
+pub fn recommended_coverage_sections() -> Vec<CoverageSection> {
+    RECOMMENDED_SECTIONS
+        .iter()
+        .filter_map(|(_, md)| parse_coverage_section(md))
+        .collect()
+}
+
+/// 項目レベル比較の結果。CLI 表示と setup-context.yaml（setup エージェントの裏取り用）で共有する
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstructionCoverage {
+    /// (項目タイトル, 記述が見当たらない概念名。空 = 全概念カバー)
+    pub sections: Vec<(String, Vec<String>)>,
+}
+
+impl InstructionCoverage {
+    /// 全項目・全概念がカバーされている（= 同梱推奨ルールとの差分なし）
+    pub fn is_full(&self) -> bool {
+        self.sections.iter().all(|(_, missing)| missing.is_empty())
+    }
+
+    /// 「項目タイトル: 概念1・概念2」形式の不足一覧（setup-context.yaml 用）
+    pub fn missing_summaries(&self) -> Vec<String> {
+        self.sections
+            .iter()
+            .filter(|(_, missing)| !missing.is_empty())
+            .map(|(title, missing)| format!("{title}: {}", missing.join("・")))
+            .collect()
+    }
+
+    /// CLI / MCP 出力共通の表示行。
+    /// 全項目カバー時は「差分なし」を明示する（Issue #322 受け入れ条件 1）
+    pub fn render_lines(&self) -> Vec<String> {
+        if self.is_full() {
+            return vec![format!(
+                "同梱推奨ルールとの比較: 全 {} 項目をカバーしています（差分なし）",
+                self.sections.len()
+            )];
+        }
+        let covered: Vec<&str> = self
+            .sections
+            .iter()
+            .filter(|(_, missing)| missing.is_empty())
+            .map(|(title, _)| title.as_str())
+            .collect();
+        let mut lines = vec![format!(
+            "同梱推奨ルールとの比較（全 {} 項目）:",
+            self.sections.len()
+        )];
+        if !covered.is_empty() {
+            lines.push(format!("  [OK] {}", covered.join(" / ")));
+        }
+        for (title, missing) in &self.sections {
+            if missing.is_empty() {
+                continue;
+            }
+            lines.push(format!("  [不足の可能性] {title}: {}", missing.join("・")));
+        }
+        lines
+    }
+}
+
+/// 既存のグローバル指示ファイル本文を同梱推奨ルールと項目レベルで比較する。
+/// 判定はキーワードの部分一致（大文字小文字無視）で、確定ではなく「不足の可能性」を示す
+pub fn compare_instruction_coverage(existing: &str) -> InstructionCoverage {
+    let haystack = existing.to_lowercase();
+    let sections = recommended_coverage_sections()
+        .into_iter()
+        .map(|section| {
+            let missing = section
+                .concepts
+                .iter()
+                .filter(|c| !c.keywords.iter().any(|k| haystack.contains(k.as_str())))
+                .map(|c| c.name.clone())
+                .collect();
+            (section.title, missing)
+        })
+        .collect();
+    InstructionCoverage { sections }
+}
+
 // --- setup changelog（アップデート追従） ---
 
 /// 変更の適用方法の区分
@@ -798,5 +977,108 @@ mod tests {
         }
         assert!(md.contains("guided"));
         assert!(md.contains("auto"));
+    }
+
+    // --- 項目レベル比較（Issue #322） ---
+
+    /// 同梱 sections は全 7 項目が coverage メタ行を持ち、パースできること
+    #[test]
+    fn issue_322_recommended_sections_parse() {
+        assert_eq!(RECOMMENDED_SECTIONS.len(), 7, "同梱推奨ルールは 7 項目");
+        let sections = recommended_coverage_sections();
+        assert_eq!(
+            sections.len(),
+            7,
+            "全項目が coverage メタ行を持つ（不足はメタ行の記入漏れ）"
+        );
+        for section in &sections {
+            assert!(!section.title.is_empty());
+            assert!(
+                !section.concepts.is_empty(),
+                "{}: 概念が 1 つ以上ある",
+                section.title
+            );
+            for concept in &section.concepts {
+                assert!(!concept.keywords.is_empty());
+                assert!(
+                    concept.keywords.iter().all(|k| *k == k.to_lowercase()),
+                    "キーワードは小文字化済み"
+                );
+            }
+        }
+    }
+
+    /// 同梱の既定指示ファイルは自分自身の推奨ルールを全項目カバーする（整合性の機械検証）
+    #[test]
+    fn issue_322_default_instructions_cover_all_sections() {
+        let coverage = compare_instruction_coverage(INSTRUCTIONS_DEFAULT);
+        assert!(
+            coverage.is_full(),
+            "既定テンプレートに不足がある: {:?}",
+            coverage.missing_summaries()
+        );
+        let lines = coverage.render_lines();
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("差分なし"),
+            "差分ゼロは明示する: {lines:?}"
+        );
+    }
+
+    /// 部分的な指示ファイルは不足項目が具体的に提示される
+    #[test]
+    fn issue_322_partial_instructions_report_missing() {
+        let partial = "# My Rules\n\n## 言語\n\n- 回答は日本語で\n\n## Git\n\n- コミットは機能単位、push は PR ブランチ経由\n";
+        let coverage = compare_instruction_coverage(partial);
+        assert!(!coverage.is_full());
+
+        let missing = coverage.missing_summaries();
+        let joined = missing.join("\n");
+        assert!(
+            joined.contains("安全ルール"),
+            "安全ルール不足を検出: {joined}"
+        );
+        assert!(joined.contains("完了検証"), "完了検証不足を検出: {joined}");
+        // カバー済み項目は不足に出ない
+        assert!(!joined.contains("言語設定"), "言語はカバー済み: {joined}");
+
+        let lines = coverage.render_lines();
+        assert!(lines[0].contains("全 7 項目"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("[OK]") && l.contains("言語設定")),
+            "カバー済み項目の [OK] 行がある: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("[不足の可能性]") && l.contains("安全ルール")),
+            "不足項目は [不足の可能性] で提示: {lines:?}"
+        );
+    }
+
+    /// 空の指示ファイルは全項目が不足になる
+    #[test]
+    fn issue_322_empty_instructions_report_all_missing() {
+        let coverage = compare_instruction_coverage("");
+        assert!(!coverage.is_full());
+        assert_eq!(coverage.missing_summaries().len(), 7, "全 7 項目が不足");
+        assert!(!coverage.render_lines().iter().any(|l| l.contains("[OK]")));
+    }
+
+    /// coverage メタ行パーサの仕様（不正行の無視・小文字化・空キーワード除外）
+    #[test]
+    fn issue_322_parse_coverage_section_spec() {
+        let md = "# テスト項目\n\n<!-- coverage: 概念A = Foo | バー | -->\n<!-- coverage: 等号を持たない壊れた行 -->\n<!-- coverage: = キーワードのみ -->\n本文\n";
+        let section = parse_coverage_section(md).unwrap();
+        assert_eq!(section.title, "テスト項目");
+        assert_eq!(section.concepts.len(), 1, "不正なメタ行は無視");
+        assert_eq!(section.concepts[0].name, "概念A");
+        assert_eq!(section.concepts[0].keywords, vec!["foo", "バー"]);
+
+        // タイトルなし・メタ行なしは None
+        assert!(parse_coverage_section("本文だけ").is_none());
+        assert!(parse_coverage_section("# タイトルのみ\n本文").is_none());
     }
 }

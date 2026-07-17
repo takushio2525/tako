@@ -14107,13 +14107,19 @@ mod self_test {
             wait(cx, 1000).await;
             check(focused_contains(window, cx, "TAKO-INPUT-OK"), "入力エコー");
 
-            // 1b. TERM / COLORTERM 注入（tmux 等の「missing or unsuitable terminal」回避）
+            // 1b. TERM / COLORTERM 注入（tmux 等の「missing or unsuitable terminal」回避）。
+            //     高負荷環境（worker のビルド並走等）ではエコー反映が 800ms を超えることが
+            //     あるため、リトライループで待つ（フレーキー対策。項目 17 と同型）
             type_text(any, cx, "echo TERMCHK=$TERM,$COLORTERM", true);
-            wait(cx, 800).await;
-            check(
-                focused_contains(window, cx, "TERMCHK=xterm-256color,truecolor"),
-                "TERM / COLORTERM 注入",
-            );
+            let mut term_ok = false;
+            for _ in 0..8 {
+                wait(cx, 800).await;
+                term_ok = focused_contains(window, cx, "TERMCHK=xterm-256color,truecolor");
+                if term_ok {
+                    break;
+                }
+            }
+            check(term_ok, "TERM / COLORTERM 注入");
 
             // 1c. 初期 cwd はホーム（.app 起動時に `/` へ落ちない）
             type_text(any, cx, "[ \"$PWD\" = \"$HOME\" ] && echo CWDCHK-$((40+2))", true);
@@ -14341,26 +14347,35 @@ mod self_test {
                 "cmd-t で新タブ",
             );
 
-            // 8. 色つき出力（ANSI 赤）が Theme の赤へ解決される
+            // 8. 色つき出力（ANSI 赤）が Theme の赤へ解決される。
+            //    新タブ直後の初回コマンドは高負荷環境でシェル初期化が 1 秒を超えることが
+            //    あるため、リトライループで待つ（フレーキー対策。項目 17 と同型）
             type_text(any, cx, r"printf '\e[31mTAKO-RED\e[0m\n'", true);
-            wait(cx, 1000).await;
-            let red_ok = window
-                .update(cx, |app, _, _| {
-                    let theme = app.theme.clone();
-                    app.focused_session()
-                        .map(|s| {
-                            let screen = s.screen(&theme);
-                            screen.lines.iter().any(|line| {
-                                line.text.contains("TAKO-RED")
-                                    && line.runs.iter().any(|run| {
-                                        run.fg == theme.red
-                                            && line.text[run.range.clone()].contains("TAKO-RED")
-                                    })
+            let mut red_ok = false;
+            for _ in 0..8 {
+                wait(cx, 1000).await;
+                red_ok = window
+                    .update(cx, |app, _, _| {
+                        let theme = app.theme.clone();
+                        app.focused_session()
+                            .map(|s| {
+                                let screen = s.screen(&theme);
+                                screen.lines.iter().any(|line| {
+                                    line.text.contains("TAKO-RED")
+                                        && line.runs.iter().any(|run| {
+                                            run.fg == theme.red
+                                                && line.text[run.range.clone()]
+                                                    .contains("TAKO-RED")
+                                        })
+                                })
                             })
-                        })
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if red_ok {
+                    break;
+                }
+            }
             check(red_ok, "ANSI 赤の解決");
 
             // 9. スクロールバック表示
@@ -14513,43 +14528,61 @@ mod self_test {
 
             // 18. tako split --down --focus（呼び出し元の自動特定 + origin=cli + フォーカス移動）。
             // 既定はフォーカスを分割元に維持する仕様（3c9d363）のため、--focus を明示して
-            // 新ペインへ移す（後続テストは新ペインからの入力を前提とする）
+            // 新ペインへ移す（後続テストは新ペインからの入力を前提とする）。
+            // ペイン数が増えるまでリトライで待つ（項目 17 と同型のフレーキー対策）
             type_text(any, cx, &format!("{cli} split --down --focus"), true);
-            wait(cx, 1500).await;
-            let (pane_count, pane4, origin_cli) = window
-                .update(cx, |app, _, _| {
-                    let tree = app.workspace.active_tab().tree();
-                    let focused = tree.focused();
-                    (
-                        tree.len(),
-                        focused,
-                        tree.get(focused).map(|p| p.origin()) == Some(PaneOrigin::Cli),
-                    )
-                })
-                .unwrap_or_else(|_| fail("tako split 後の状態取得"));
+            let mut split_state = None;
+            for _ in 0..8 {
+                wait(cx, 1500).await;
+                let state = window
+                    .update(cx, |app, _, _| {
+                        let tree = app.workspace.active_tab().tree();
+                        let focused = tree.focused();
+                        (
+                            tree.len(),
+                            focused,
+                            tree.get(focused).map(|p| p.origin()) == Some(PaneOrigin::Cli),
+                        )
+                    })
+                    .unwrap_or_else(|_| fail("tako split 後の状態取得"));
+                let done = state.0 == 2;
+                split_state = Some(state);
+                if done {
+                    break;
+                }
+            }
+            let (pane_count, pane4, origin_cli) =
+                split_state.unwrap_or_else(|| fail("tako split 後の状態取得"));
             check(pane_count == 2, "tako split で 2 ペイン");
             check(pane4 != pane2, "split --focus 後フォーカスは新ペイン");
             check(origin_cli, "新ペインの origin は cli");
 
-            // 19. tako send で別ペインへコマンドを流し込む（FR-2.2.2。pane4 から pane2 へ）
+            // 19. tako send で別ペインへコマンドを流し込む（FR-2.2.2。pane4 から pane2 へ）。
+            //     debug CLI 起動 + IPC 往復は高負荷時に 1 秒を超えるためリトライで待つ（項目 17 と同型）
             type_text(
                 any,
                 cx,
                 &format!("{cli} send --pane {pane2} 'echo TAKO-SEND-$((40+2))'"),
                 true,
             );
-            wait(cx, 1200).await;
-            let sent = window
-                .update(cx, |app, _, _| {
-                    app.terminals
-                        .get(&pane2)
-                        .map(|s| s.visible_lines().iter().any(|l| l.contains("TAKO-SEND-42")))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
+            let mut sent = false;
+            for _ in 0..8 {
+                wait(cx, 1200).await;
+                sent = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&pane2)
+                            .map(|s| s.visible_lines().iter().any(|l| l.contains("TAKO-SEND-42")))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if sent {
+                    break;
+                }
+            }
             check(sent, "tako send で別ペインへ送信");
 
-            // 20. tako read で別ペインの画面内容を取得する（FR-2.2.5）
+            // 20. tako read で別ペインの画面内容を取得する（FR-2.2.5。リトライは項目 17 と同型）
             type_text(
                 any,
                 cx,
@@ -14558,8 +14591,15 @@ mod self_test {
                 ),
                 true,
             );
-            wait(cx, 1000).await;
-            check(focused_contains(window, cx, "TAKO-READ-42"), "tako read");
+            let mut read_ok = false;
+            for _ in 0..8 {
+                wait(cx, 1000).await;
+                read_ok = focused_contains(window, cx, "TAKO-READ-42");
+                if read_ok {
+                    break;
+                }
+            }
+            check(read_ok, "tako read");
 
             // 21. tako title --role（FR-2.2.6 / FR-2.1.3）
             type_text(
@@ -15199,28 +15239,56 @@ mod self_test {
                 })
                 .unwrap_or(false);
             check(osc_cwd_ok, "シェル統合の OSC 7 で cwd 検知");
-            type_text(any, cx, "sleep 2", true);
-            wait(cx, 700).await;
-            let osc_running = window
-                .update(cx, |app, _, _| {
-                    app.terminals
-                        .get(&app.focused_pane())
-                        .map(|s| s.command_state() == CommandState::Running)
-                        == Some(true)
-                })
-                .unwrap_or(false);
+            // 実行中状態の検知: sleep 5 の実行ウィンドウ内で Running への遷移をポーリングで
+            // 捕まえる（高負荷時はコマンド開始自体が 1 秒超遅れるため。項目 17 と同型の対策）
+            type_text(any, cx, "sleep 5", true);
+            let mut osc_running = false;
+            for _ in 0..12 {
+                wait(cx, 300).await;
+                osc_running = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&app.focused_pane())
+                            .map(|s| s.command_state() == CommandState::Running)
+                            == Some(true)
+                    })
+                    .unwrap_or(false);
+                if osc_running {
+                    break;
+                }
+            }
             check(osc_running, "実行中コマンドが running");
-            wait(cx, 1800).await; // sleep 2 の完了を待つ
+            // sleep 5 の完了（Running でなくなる）を待ってから失敗コマンドへ
+            for _ in 0..10 {
+                wait(cx, 800).await;
+                let done = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&app.focused_pane())
+                            .map(|s| s.command_state() != CommandState::Running)
+                            == Some(true)
+                    })
+                    .unwrap_or(false);
+                if done {
+                    break;
+                }
+            }
             type_text(any, cx, "false", true);
-            wait(cx, 800).await;
-            let osc_failed = window
-                .update(cx, |app, _, _| {
-                    app.terminals
-                        .get(&app.focused_pane())
-                        .map(|s| s.command_state() == CommandState::Failed(1))
-                        == Some(true)
-                })
-                .unwrap_or(false);
+            let mut osc_failed = false;
+            for _ in 0..8 {
+                wait(cx, 800).await;
+                osc_failed = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&app.focused_pane())
+                            .map(|s| s.command_state() == CommandState::Failed(1))
+                            == Some(true)
+                    })
+                    .unwrap_or(false);
+                if osc_failed {
+                    break;
+                }
+            }
             check(osc_failed, "失敗コマンドで failed（プロンプト後も保持）");
             // 開発不変条件: 検知した状態は list（CLI / MCP 共有の dispatch）からも見える
             let list_exposes = window
@@ -16194,11 +16262,17 @@ mod self_test {
                 ),
                 true,
             );
-            wait(cx, 1200).await;
-            check(
-                focused_contains(window, cx, "TAKO-PS-58"),
-                "tako persist on / 状態取得",
-            );
+            // debug CLI 3 連発 + IPC 往復のため固定待ちでは不足することがある
+            // （リトライは項目 17 と同型のフレーキー対策）
+            let mut persist_status_ok = false;
+            for _ in 0..8 {
+                wait(cx, 1200).await;
+                persist_status_ok = focused_contains(window, cx, "TAKO-PS-58");
+                if persist_status_ok {
+                    break;
+                }
+            }
+            check(persist_status_ok, "tako persist on / 状態取得");
             let persist_on = window
                 .update(cx, |app, _, _| app.tmux_persist)
                 .unwrap_or(false);
@@ -16377,9 +16451,14 @@ mod self_test {
                     "バックエンドのホイールがミラー表示に乗る（copy-mode 不使用）",
                 );
 
-                // 61c. スクロールバーはスクロール中だけ表示され、時間経過でフェードする
+                // 61c. スクロールバーはスクロール中だけ表示され、時間経過でフェードする。
+                //      直前 61b の確認リトライが長引くとフェード時間を過ぎてしまうため、
+                //      「スクロール活動直後」の状態を明示的に再現してから判定する（決定化）
                 let bar_visible = window
                     .update(cx, |app, _, _| {
+                        if let Some(ctl) = app.scroll_ctls.get_mut(&backend_pane) {
+                            ctl.last_activity = std::time::Instant::now();
+                        }
                         let area = app
                             .pane_text_areas
                             .iter()

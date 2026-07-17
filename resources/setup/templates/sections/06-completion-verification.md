@@ -1,5 +1,8 @@
 # 完了検証（品質ゲート）
 
+<!-- coverage: 完了前の自己検証 = 完了検証 | 品質ゲート | 完了報告 | 検証 | verif | quality gate | テスト | test -->
+<!-- coverage: 証拠つき報告と未検証の明示 = 証拠 | 未検証 | evidence | not verified | unverified -->
+
 ## 必須概念
 
 - 「完了」と報告する前に必ず通す自己検証手順を定義する
