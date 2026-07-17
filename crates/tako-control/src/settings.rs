@@ -50,6 +50,9 @@ pub struct Settings {
     /// 左サイドバー（ファイルツリー）の幅（px 整数。Issue #307。既定 244）
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: u32,
+    /// エラーレポートの自動送信（Issue #333。既定 OFF = opt-in）
+    #[serde(default)]
+    pub telemetry: bool,
 }
 
 fn default_theme() -> String {
@@ -92,6 +95,7 @@ impl Default for Settings {
             pane_log_total_max_mb: default_pane_log_total_max_mb(),
             theme: default_theme(),
             sidebar_width: default_sidebar_width(),
+            telemetry: false,
         }
     }
 }
@@ -182,6 +186,7 @@ mod tests {
             pane_log_total_max_mb: 300,
             theme: "light".into(),
             sidebar_width: 300,
+            telemetry: true,
         };
         save_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), Some(settings));
@@ -220,6 +225,8 @@ mod tests {
         assert_eq!(parsed.theme_mode(), tako_core::theme::ThemeMode::Dark);
         // サイドバー幅の既定（Issue #307。旧ファイル後方互換）
         assert_eq!(parsed.sidebar_width, 244);
+        // テレメトリの既定は OFF（Issue #333。opt-in）
+        assert!(!parsed.telemetry);
     }
 
     #[test]

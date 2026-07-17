@@ -1,0 +1,16 @@
+name = "tako-error-collector"
+main = "src/index.js"
+compatibility_date = "2024-12-01"
+
+# KV namespace は wrangler で作成後にバインディング ID を設定する:
+#   wrangler kv namespace create REPORTS_KV
+#   wrangler kv namespace create REPORTS_KV --preview
+# 生成された ID を以下に記入する
+[[kv_namespaces]]
+binding = "REPORTS_KV"
+id = "PLACEHOLDER_PRODUCTION_ID"
+preview_id = "PLACEHOLDER_PREVIEW_ID"
+
+# 読み取りエンドポイントの認証トークンは Worker の secret に設定する:
+#   wrangler secret put ADMIN_TOKEN
+# リポジトリにはコミットしない

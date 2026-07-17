@@ -189,6 +189,9 @@ enum Command {
     /// macOS のアイドルスリープを IOKit 電源アサーションで防止する
     #[command(subcommand, name = "sleep-guard")]
     SleepGuard(SleepGuardCommand),
+    /// エラーレポートの自動送信（テレメトリ）の状態確認・切替（Issue #333）
+    #[command(subcommand)]
+    Telemetry(TelemetryCommand),
     /// ファイルツリーへのフォルダの追加・削除・一覧（#134）。
     /// AI が作業対象プロジェクトのフォルダを明示追加する
     #[command(subcommand)]
@@ -445,6 +448,16 @@ enum FdaCommand {
     Status,
     /// システム設定のフルディスクアクセスパネルを開く
     Open,
+}
+
+#[derive(Subcommand)]
+enum TelemetryCommand {
+    /// テレメトリの状態を確認する
+    Status,
+    /// テレメトリを有効にする
+    On,
+    /// テレメトリを無効にする
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -1850,6 +1863,8 @@ fn main() -> ExitCode {
         Command::Remote(RemoteCommand::Scrollback { pane_id, lines }) => {
             remote_scrollback(&pane_id, lines)
         }
+        // テレメトリもローカル処理（IPC 不要。設定ファイルの読み書きのみ）
+        Command::Telemetry(ref sub) => telemetry_local(sub),
         // FDA チェックはローカル処理（IPC 不要。ファイルシステムのみ）
         Command::Fda(ref sub) => fda_local(sub),
         // スリープ防止もローカル処理（IPC 不要。設定ファイルの読み書きのみ）
@@ -2607,6 +2622,48 @@ fn remote_scrollback(pane_id: &str, lines: u32) -> Result<(), String> {
         println!("{line}");
     }
     Ok(())
+}
+
+fn telemetry_local(sub: &TelemetryCommand) -> Result<(), String> {
+    let mut settings = tako_control::settings::load();
+    match sub {
+        TelemetryCommand::Status => {
+            let recent = tako_control::telemetry::recent_count();
+            let log_path = tako_control::telemetry::log_file_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            if settings.telemetry {
+                eprintln!("telemetry: ON");
+            } else {
+                eprintln!("telemetry: OFF");
+            }
+            eprintln!("  直近のレポート件数: {recent}");
+            eprintln!("  ログ: {log_path}");
+            let json = serde_json::json!({
+                "telemetry": settings.telemetry,
+                "recent_reports": recent,
+                "log_path": log_path,
+            });
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            Ok(())
+        }
+        TelemetryCommand::On => {
+            settings.telemetry = true;
+            tako_control::settings::save(&settings)
+                .map_err(|e| format!("設定の保存に失敗: {e}"))?;
+            tako_control::telemetry::set_enabled(true);
+            eprintln!("telemetry: ON");
+            Ok(())
+        }
+        TelemetryCommand::Off => {
+            settings.telemetry = false;
+            tako_control::settings::save(&settings)
+                .map_err(|e| format!("設定の保存に失敗: {e}"))?;
+            tako_control::telemetry::set_enabled(false);
+            eprintln!("telemetry: OFF");
+            Ok(())
+        }
+    }
 }
 
 fn fda_local(sub: &FdaCommand) -> Result<(), String> {
@@ -3670,6 +3727,13 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 UpdateCommand::Repair => "repair".to_string(),
             }),
         },
+        Command::Telemetry(sub) => Request::Telemetry {
+            action: Some(match sub {
+                TelemetryCommand::Status => "status".to_string(),
+                TelemetryCommand::On => "on".to_string(),
+                TelemetryCommand::Off => "off".to_string(),
+            }),
+        },
         Command::Fda(sub) => Request::Fda {
             action: Some(match sub {
                 FdaCommand::Status => "status".to_string(),
@@ -4423,6 +4487,7 @@ fn print_result(command: &Command, result: &Value) {
         | Command::Persist(_)
         | Command::ConfirmClose(_)
         | Command::Theme(_)
+        | Command::Telemetry(_)
         | Command::Panel(_)
         | Command::Collapse(_)
         | Command::Pin(_) => {

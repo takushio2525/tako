@@ -12717,6 +12717,12 @@ fn main() {
             );
         }
     }
+    // テレメトリ初期化: settings.json から ON/OFF を読み、panic ハンドラを設置する
+    {
+        let settings = tako_control::settings::load();
+        tako_control::telemetry::init(settings.telemetry);
+        tako_control::telemetry::install_panic_handler();
+    }
     let initial_dir = parse_initial_dir();
     if let Some(ref dir) = initial_dir {
         if let Err(e) = std::env::set_current_dir(dir) {
@@ -14397,7 +14403,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 94, "MCP tools/list は 94 ツール");
+            check(status == 200 && tool_count == 95, "MCP tools/list は 95 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -19513,7 +19519,6 @@ mod self_test {
 /// 実 IME / GUI を起動できない CI でもキーエンコードの退行を捕まえる
 /// ホイールデルタの行換算。整数化できた行数と持ち越す端数を返す。
 /// 方向が反転したら端数を捨てる（逆向きの貯金で初動が重くなるのを防ぐ）
-
 /// .git ディレクトリが祖先に存在するかの軽量チェック（プロセス spawn なし。#313）
 fn has_git_ancestor(dir: &std::path::Path) -> bool {
     let mut cur = dir;
