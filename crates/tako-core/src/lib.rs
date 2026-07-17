@@ -67,8 +67,8 @@ pub use spawn_layout::{SpawnLayoutConfig, SpawnLayoutPolicy, WorkerLayoutAlgorit
 pub use tab::{Tab, TabId};
 pub use task_checkpoint::{TaskCheckpoint, TaskPhase};
 pub use terminal::{
-    login_shell_command, AgentMetrics, CommandState, SelectionKind, SessionError, SessionEvent,
-    SessionNotice, SpawnCommand, SpawnOptions, TermEvent, TerminalSession,
+    login_shell_command, AgentMetrics, CommandState, LimitService, SelectionKind, SessionError,
+    SessionEvent, SessionNotice, SpawnCommand, SpawnOptions, TermEvent, TerminalSession,
 };
 pub use text_edit::{CursorMovement, SearchHit, TextBuffer, TextEditError};
 pub use theme::{Rgb, Theme};

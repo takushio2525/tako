@@ -800,6 +800,10 @@ struct TakoApp {
     video_ticker: bool,
     /// 全ペインから集約した Claude エージェントメトリクス（ctx/usage。ポーリングで更新）
     agent_metrics: AgentMetrics,
+    /// ステータスバーの利用制限表示で選択中のサービス（Issue #321。settings.json 永続化）
+    limit_service: tako_core::LimitService,
+    /// ステータスバーの利用制限サービス切替ドロップダウンが開いているか（Issue #321）
+    limit_service_menu_open: bool,
     /// usage トークン推移の履歴（#217 スパークライン。最大 5 点、変化時のみ追記）
     usage_history: std::collections::VecDeque<f32>,
     /// 端末イベントの再描画デバウンス: 最後に notify した時刻
@@ -1773,6 +1777,8 @@ impl TakoApp {
             pinned_previews: Vec::new(),
             dragging_pin: None,
             agent_metrics: AgentMetrics::default(),
+            limit_service: tako_control::settings::load().limit_service(),
+            limit_service_menu_open: false,
             usage_history: std::collections::VecDeque::new(),
             last_term_notify: std::time::Instant::now(),
             term_notify_pending: false,
@@ -10697,6 +10703,14 @@ impl UiStateHost for TakoApp {
         self.theme = Theme::for_mode(mode);
     }
 
+    fn limit_service(&self) -> tako_core::LimitService {
+        self.limit_service
+    }
+
+    fn set_limit_service(&mut self, service: tako_core::LimitService) {
+        self.limit_service = service;
+    }
+
     fn panel_state(&self) -> (bool, f32, tako_control::protocol::PanelViewWire) {
         let view = match self.panel_view {
             PanelView::Tmux => tako_control::protocol::PanelViewWire::Tmux,
@@ -14752,7 +14766,7 @@ mod self_test {
                 .ok()
                 .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
                 .unwrap_or(0);
-            check(status == 200 && tool_count == 98, "MCP tools/list は 98 ツール");
+            check(status == 200 && tool_count == 99, "MCP tools/list は 99 ツール");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)

@@ -194,6 +194,12 @@ pub trait UiStateHost {
     }
     /// UI テーマモードの切替（再描画は実装側の責務。永続化は dispatch 側で行う）
     fn set_theme_mode(&mut self, _mode: tako_core::theme::ThemeMode) {}
+    /// ステータスバーの利用制限表示で選択中のサービス（Issue #321）
+    fn limit_service(&self) -> tako_core::LimitService {
+        tako_core::LimitService::Claude
+    }
+    /// 利用制限表示のサービス切替（再描画は実装側の責務。永続化は dispatch 側で行う）
+    fn set_limit_service(&mut self, _service: tako_core::LimitService) {}
 }
 
 // ---------------------------------------------------------------------------

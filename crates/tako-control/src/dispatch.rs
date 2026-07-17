@@ -2403,6 +2403,44 @@ fn dispatch_inner(
             }
         }
 
+        Request::LimitService { action, service } => {
+            use tako_core::LimitService as LS;
+            let action = action.as_deref().unwrap_or("status");
+            let status_json = |svc: LS| {
+                serde_json::json!({
+                    "limit_service": svc.as_str(),
+                    "available": LS::ALL.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                })
+            };
+            match action {
+                "status" => Ok(status_json(host.limit_service())),
+                "set" => {
+                    let s = service.as_deref().ok_or_else(|| {
+                        DispatchError::InvalidParams(
+                            "set には service が必要（claude / codex / agy）".into(),
+                        )
+                    })?;
+                    let next = LS::parse(s).ok_or_else(|| {
+                        DispatchError::InvalidParams(format!(
+                            "不明な service: {s:?}（claude / codex / agy のいずれか）"
+                        ))
+                    })?;
+                    if !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none() {
+                        let mut settings = crate::settings::load();
+                        settings.limit_service = next.as_str().into();
+                        crate::settings::save(&settings).map_err(|e| {
+                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
+                        })?;
+                    }
+                    host.set_limit_service(next);
+                    Ok(status_json(next))
+                }
+                other => Err(DispatchError::InvalidParams(format!(
+                    "不明な action: {other:?}（status / set のいずれか）"
+                ))),
+            }
+        }
+
         Request::TreeFolder {
             action,
             path,
@@ -5360,6 +5398,8 @@ mod tests {
         stale_pane_map: std::collections::HashMap<PaneId, PaneId>,
         /// #217: UI テーマモード
         theme_mode: tako_core::theme::ThemeMode,
+        /// #321: 利用制限表示サービス
+        limit_service: tako_core::LimitService,
         preview_reload: tako_core::PreviewReloadState,
         preview_cache: tako_core::PreviewCacheStats,
     }
@@ -5380,6 +5420,7 @@ mod tests {
                 pins: Vec::new(),
                 stale_pane_map: std::collections::HashMap::new(),
                 theme_mode: tako_core::theme::ThemeMode::Dark,
+                limit_service: tako_core::LimitService::Claude,
                 preview_reload: tako_core::PreviewReloadState::default(),
                 preview_cache: tako_core::PreviewCacheStats {
                     max_bytes: 512 * 1024 * 1024,
@@ -5469,6 +5510,12 @@ mod tests {
         }
         fn set_theme_mode(&mut self, mode: tako_core::theme::ThemeMode) {
             self.theme_mode = mode;
+        }
+        fn limit_service(&self) -> tako_core::LimitService {
+            self.limit_service
+        }
+        fn set_limit_service(&mut self, service: tako_core::LimitService) {
+            self.limit_service = service;
         }
     }
 
@@ -6552,12 +6599,14 @@ mod tests {
     fn タブの並べ替え() {
         let mut host = MockHost::new();
         let t1 = host.ws.active_tab_id();
-        let t2 = host
-            .ws
-            .create_tab("t2", tako_core::Pane::new(tako_core::pane::PaneOrigin::User));
-        let t3 = host
-            .ws
-            .create_tab("t3", tako_core::Pane::new(tako_core::pane::PaneOrigin::User));
+        let t2 = host.ws.create_tab(
+            "t2",
+            tako_core::Pane::new(tako_core::pane::PaneOrigin::User),
+        );
+        let t3 = host.ws.create_tab(
+            "t3",
+            tako_core::Pane::new(tako_core::pane::PaneOrigin::User),
+        );
         let result = dispatch(
             &mut host,
             Request::TabReorder {
@@ -8391,6 +8440,68 @@ mod tests {
             Request::Theme {
                 action: Some("set".into()),
                 mode: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn 利用制限サービスのstatus_setが機能する() {
+        use tako_core::LimitService;
+        let mut host = MockHost::new();
+        // status: 既定は claude
+        let v = dispatch(
+            &mut host,
+            Request::LimitService {
+                action: None,
+                service: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["limit_service"], "claude");
+        assert_eq!(v["available"].as_array().unwrap().len(), 3);
+        // set codex → host へ反映
+        let v = dispatch(
+            &mut host,
+            Request::LimitService {
+                action: Some("set".into()),
+                service: Some("codex".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["limit_service"], "codex");
+        assert_eq!(host.limit_service, LimitService::Codex);
+        // set agy
+        let v = dispatch(
+            &mut host,
+            Request::LimitService {
+                action: Some("set".into()),
+                service: Some("agy".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["limit_service"], "agy");
+        assert_eq!(host.limit_service, LimitService::Agy);
+        // 不明 service はエラー
+        assert!(dispatch(
+            &mut host,
+            Request::LimitService {
+                action: Some("set".into()),
+                service: Some("unknown".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .is_err());
+        // service 無しの set はエラー
+        assert!(dispatch(
+            &mut host,
+            Request::LimitService {
+                action: Some("set".into()),
+                service: None,
             },
             PaneOrigin::Cli,
         )

@@ -53,6 +53,9 @@ pub struct Settings {
     /// エラーレポートの自動送信（Issue #333。既定 OFF = opt-in）
     #[serde(default)]
     pub telemetry: bool,
+    /// ステータスバーの利用制限表示で選択中のサービス（Issue #321。既定 "claude"）
+    #[serde(default = "default_limit_service")]
+    pub limit_service: String,
 }
 
 fn default_theme() -> String {
@@ -79,6 +82,10 @@ fn default_preview_cache_max_mb() -> u64 {
     tako_core::PREVIEW_CACHE_DEFAULT_MB
 }
 
+fn default_limit_service() -> String {
+    "claude".into()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -96,6 +103,7 @@ impl Default for Settings {
             theme: default_theme(),
             sidebar_width: default_sidebar_width(),
             telemetry: false,
+            limit_service: default_limit_service(),
         }
     }
 }
@@ -113,6 +121,11 @@ impl Settings {
     /// テーマモードを tako-core の型へ解決する（不明値は既定ダーク。Issue #217）
     pub fn theme_mode(&self) -> tako_core::theme::ThemeMode {
         tako_core::theme::ThemeMode::parse(&self.theme).unwrap_or_default()
+    }
+
+    /// 利用制限表示の選択サービスを解決する（不明値は既定 Claude。Issue #321）
+    pub fn limit_service(&self) -> tako_core::LimitService {
+        tako_core::LimitService::parse(&self.limit_service).unwrap_or_default()
     }
 }
 
@@ -187,6 +200,7 @@ mod tests {
             theme: "light".into(),
             sidebar_width: 300,
             telemetry: true,
+            limit_service: "codex".into(),
         };
         save_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), Some(settings));
@@ -227,6 +241,9 @@ mod tests {
         assert_eq!(parsed.sidebar_width, 244);
         // テレメトリの既定は OFF（Issue #333。opt-in）
         assert!(!parsed.telemetry);
+        // 利用制限サービスの既定は claude（Issue #321。旧ファイル後方互換）
+        assert_eq!(parsed.limit_service, "claude");
+        assert_eq!(parsed.limit_service(), tako_core::LimitService::Claude);
     }
 
     #[test]

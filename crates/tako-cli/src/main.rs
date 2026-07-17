@@ -105,6 +105,10 @@ enum Command {
     /// UI テーマ（ライト/ダーク）の確認・切替（Issue #217）。
     /// 引数なしで現在テーマを表示、dark / light で指定、toggle で反転
     Theme(ThemeArgs),
+    /// ステータスバーの利用制限表示サービスの確認・切替（Issue #321）。
+    /// 引数なしで現在サービスを表示、claude / codex / agy で指定
+    #[command(name = "limit-service")]
+    LimitService(LimitServiceArgs),
     /// 右サイドバー情報パネル（tmux 一覧 / agents 集約センター）の表示・幅・ビュー切替。
     /// 引数なしで現在状態を表示する
     Panel(PanelArgs),
@@ -1621,6 +1625,14 @@ struct ThemeArgs {
     /// dark / light = 指定テーマへ、toggle = 反転（省略時は現在テーマを表示）
     #[arg(value_parser = ["dark", "light", "toggle"])]
     mode: Option<String>,
+}
+
+/// 利用制限表示サービスの引数（Issue #321）
+#[derive(Args)]
+struct LimitServiceArgs {
+    /// claude / codex / agy（省略時は現在サービスを表示）
+    #[arg(value_parser = ["claude", "codex", "agy"])]
+    service: Option<String>,
 }
 
 #[derive(Args)]
@@ -3401,6 +3413,10 @@ fn build_request(command: &Command) -> Result<Request, String> {
             }),
             mode: args.mode.clone().filter(|m| m != "toggle"),
         },
+        Command::LimitService(args) => Request::LimitService {
+            action: args.service.as_ref().map(|_| "set".to_string()),
+            service: args.service.clone(),
+        },
         Command::Git(GitCommand::Log { max_count, pane }) => Request::GitLog {
             pane: target_pane(*pane)?,
             max_count: Some(*max_count),
@@ -4580,6 +4596,7 @@ fn print_result(command: &Command, result: &Value) {
         | Command::Persist(_)
         | Command::ConfirmClose(_)
         | Command::Theme(_)
+        | Command::LimitService(_)
         | Command::Telemetry(_)
         | Command::Panel(_)
         | Command::Collapse(_)
