@@ -1549,6 +1549,9 @@ struct PanelArgs {
     /// 左サイドバーのファイルツリー表示（FR-2.16.5。on = 表示、off = 非表示）
     #[arg(long, value_parser = ["on", "off"])]
     filetree: Option<String>,
+    /// 左サイドバーの幅（px。Issue #307）
+    #[arg(long)]
+    sidebar_width: Option<f32>,
 }
 
 /// ON/OFF トグル系コマンド共通の引数（autorename / portdetect）
@@ -3244,6 +3247,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 _ => tako_control::protocol::PanelViewWire::Tmux,
             }),
             filetree: args.filetree.as_deref().map(|s| s == "on"),
+            sidebar_width: args.sidebar_width,
         },
         Command::Portdetect(args) => Request::PortDetect {
             enabled: args.state.as_deref().map(|s| s == "on"),

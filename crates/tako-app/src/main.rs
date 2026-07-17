@@ -171,8 +171,9 @@ impl ScrollCtl {
     }
 }
 
-/// 左サイドバー（ファイルツリー）の幅（px。FR-3.1）
-const SIDEBAR_WIDTH: f32 = 244.0;
+/// 左サイドバー（ファイルツリー）の最小幅（px。FR-3.1。ドラッグで可変。
+/// 既定幅は settings::default_sidebar_width() = 244）
+const SIDEBAR_MIN_WIDTH: f32 = 120.0;
 
 /// 右サイドバー（情報パネル）の既定幅・最小幅（px。ドラッグで可変）
 const PANEL_DEFAULT_WIDTH: f32 = 320.0;
@@ -649,6 +650,10 @@ struct TakoApp {
     tmux_pending_kill: Option<(String, Option<u32>, Option<String>)>,
     /// 統合 tmux ビューのペイン行ゴミ箱 → kill 確認待ちのペイン（FR-2.16.7。誤爆防止）
     pending_pane_kill: Option<PaneId>,
+    /// 左サイドバー幅（px。右端ハンドルのドラッグで可変。#307）
+    sidebar_width: f32,
+    /// 左サイドバー右端の境界をドラッグ中か（#307）
+    dragging_sidebar: bool,
     /// 左サイドバーのファイルツリー（FR-3.1 / FR-3.7。cmd+B でトグル）
     filetree: filetree::FileTree,
     /// プレビューペイン（FR-3.2 / FR-3.3）。キーに居るペインはターミナルではなく
@@ -1679,6 +1684,11 @@ impl TakoApp {
             context_menu: None,
             pane_context_menu: None,
             inline_edit: None,
+            sidebar_width: {
+                let w = tako_control::settings::load().sidebar_width as f32;
+                w.clamp(SIDEBAR_MIN_WIDTH, 600.0)
+            },
+            dragging_sidebar: false,
             filetree: filetree::FileTree::default(),
             previews: HashMap::new(),
             preview_navigation_panel: None,
@@ -4752,6 +4762,17 @@ impl TakoApp {
         cx.notify();
     }
 
+    fn save_sidebar_width(&self) {
+        if std::env::var_os("TAKO_SELF_TEST").is_some() {
+            return;
+        }
+        let mut settings = tako_control::settings::load();
+        settings.sidebar_width = self.sidebar_width as u32;
+        if let Err(e) = tako_control::settings::save(&settings) {
+            eprintln!("warning: 設定を保存できない: {e}");
+        }
+    }
+
     /// ⌘K コマンドパレットを開く（#217 カンプ。ペイン・コマンド検索）
     pub(crate) fn open_command_palette(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.command_palette = Some(CommandPalette {
@@ -7064,6 +7085,7 @@ impl TakoApp {
                 | self.preview_selecting.take().is_some()
                 | self.dragging_pin.take().is_some()
                 | std::mem::take(&mut self.dragging_panel)
+                | std::mem::take(&mut self.dragging_sidebar)
                 | self.video_seek_dragging.take().is_some()
             {
                 cx.notify();
@@ -7087,6 +7109,14 @@ impl TakoApp {
             if let Some(p) = self.pinned_previews.iter_mut().find(|p| p.target == target) {
                 p.pos = point(px(x), px(y));
             }
+            cx.notify();
+            return;
+        }
+        // 左サイドバーの幅ドラッグ（Issue #307。右パネルと同方式）
+        if self.dragging_sidebar {
+            let total = f32::from(window.viewport_size().width);
+            let max = (total * 0.5).max(SIDEBAR_MIN_WIDTH);
+            self.sidebar_width = f32::from(event.position.x).clamp(SIDEBAR_MIN_WIDTH, max);
             cx.notify();
             return;
         }
@@ -7238,12 +7268,17 @@ impl TakoApp {
             cx.notify();
             return;
         }
+        let sidebar_was_dragging = std::mem::take(&mut self.dragging_sidebar);
         if self.dragging_border.take().is_some()
             | self.dragging_scrollbar.take().is_some()
             | self.dragging_pin.take().is_some()
             | std::mem::take(&mut self.dragging_panel)
+            | sidebar_was_dragging
             | self.video_seek_dragging.take().is_some()
         {
+            if sidebar_was_dragging {
+                self.save_sidebar_width();
+            }
             cx.notify();
             return;
         }
@@ -10528,6 +10563,14 @@ impl UiStateHost for TakoApp {
         self.filetree.visible
     }
 
+    fn sidebar_width(&self) -> f32 {
+        self.sidebar_width
+    }
+
+    fn set_sidebar_width(&mut self, width: f32) {
+        self.sidebar_width = width.clamp(SIDEBAR_MIN_WIDTH, 600.0);
+    }
+
     fn set_filetree(&mut self, visible: bool) {
         if self.filetree.visible != visible {
             self.toggle_filetree();
@@ -11837,7 +11880,7 @@ impl Render for TakoApp {
         // ハンドル・IME 位置はすべて content_origin / content_size 起点で連動する）
         let viewport = window.viewport_size();
         let sidebar_width = if self.filetree.visible {
-            px(SIDEBAR_WIDTH)
+            px(self.sidebar_width)
         } else {
             px(0.0)
         };
@@ -15402,6 +15445,7 @@ mod self_test {
                             width: Some(320.0),
                             view: Some(tako_control::protocol::PanelViewWire::Tmux),
                             filetree: None,
+                            sidebar_width: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -15419,6 +15463,7 @@ mod self_test {
                             width: None,
                             view: None,
                             filetree: None,
+                            sidebar_width: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -15624,6 +15669,7 @@ mod self_test {
                             width: None,
                             view: Some(tako_control::protocol::PanelViewWire::Tmux),
                             filetree: None,
+                            sidebar_width: None,
                         },
                         PaneOrigin::Cli,
                     );

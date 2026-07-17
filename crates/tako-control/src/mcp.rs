@@ -626,6 +626,7 @@ pub fn tools() -> Vec<Value> {
                     "width": { "type": "number", "exclusiveMinimum": 0, "description": "パネル幅（px）" },
                     "view": { "type": "string", "enum": ["tmux", "orch", "git"], "description": "表示するビュー（orch = オーケストレーター俯瞰。#217）" },
                     "filetree": { "type": "boolean", "description": "左サイドバーのファイルツリーの表示・非表示" },
+                    "sidebar_width": { "type": "number", "exclusiveMinimum": 0, "description": "左サイドバーの幅（px。Issue #307）" },
                 },
                 "additionalProperties": false,
             },
@@ -2672,6 +2673,7 @@ fn build_request(
                 Some(other) => return Err(format!("view が不正: {other}（tmux | orch | git）")),
             },
             filetree: bool_arg(args, "filetree")?,
+            sidebar_width: f32_arg(args, "sidebar_width")?,
         },
         "tako_collapse_tab" => Request::CollapseTab {
             pane: u64_arg(args, "pane")?.or(caller),

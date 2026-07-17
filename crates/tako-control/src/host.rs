@@ -172,6 +172,12 @@ pub trait UiStateHost {
     }
     /// ファイルツリーの表示・非表示（root の cwd 同期は実装側の責務）
     fn set_filetree(&mut self, _visible: bool) {}
+    /// 左サイドバーの幅（px。Issue #307）
+    fn sidebar_width(&self) -> f32 {
+        244.0
+    }
+    /// 左サイドバーの幅を設定する（Issue #307。永続化は呼び出し側の責務）
+    fn set_sidebar_width(&mut self, _width: f32) {}
     /// ファイルツリーの root 同期をトリガーする（#134: pinned_folders 変更後に呼ぶ）
     fn sync_filetree(&mut self) {}
     /// ピン留め中のプレビュー一覧（FR-2.16.15）

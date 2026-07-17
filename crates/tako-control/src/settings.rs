@@ -47,10 +47,17 @@ pub struct Settings {
     /// UI テーマ（Issue #217。"dark" / "light"。既定 dark）
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// 左サイドバー（ファイルツリー）の幅（px 整数。Issue #307。既定 244）
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: u32,
 }
 
 fn default_theme() -> String {
     "dark".into()
+}
+
+fn default_sidebar_width() -> u32 {
+    244
 }
 
 fn default_true() -> bool {
@@ -84,6 +91,7 @@ impl Default for Settings {
             pane_log_max_mb: default_pane_log_max_mb(),
             pane_log_total_max_mb: default_pane_log_total_max_mb(),
             theme: default_theme(),
+            sidebar_width: default_sidebar_width(),
         }
     }
 }
@@ -173,6 +181,7 @@ mod tests {
             pane_log_max_mb: 10,
             pane_log_total_max_mb: 300,
             theme: "light".into(),
+            sidebar_width: 300,
         };
         save_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), Some(settings));
@@ -209,6 +218,8 @@ mod tests {
         // テーマの既定はダーク（Issue #217。旧ファイル後方互換）
         assert_eq!(parsed.theme, "dark");
         assert_eq!(parsed.theme_mode(), tako_core::theme::ThemeMode::Dark);
+        // サイドバー幅の既定（Issue #307。旧ファイル後方互換）
+        assert_eq!(parsed.sidebar_width, 244);
     }
 
     #[test]

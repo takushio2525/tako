@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added / 機能追加
 
+- 左サイドバー（Files ツリー）の境界ドラッグリサイズ: 右端をドラッグして幅変更、最小 120px / 最大ウィンドウ幅 50% でクランプ、幅は settings.json に永続化、CLI `tako panel --sidebar-width` / MCP `sidebar_width` で操作可能 (#307)
+  Sidebar drag resize: drag the right edge to adjust Files sidebar width, clamped to 120px min / 50% of window max, persisted in settings.json, controllable via CLI `tako panel --sidebar-width` / MCP `sidebar_width` (#307)
 - 対話コマンドのペイン委譲 `tako run-interactive`: sudo パスワード・ブラウザ認証等のユーザー入力が必要なコマンドを可視ペインに委譲。split → タイトル設定 → コマンド投入をアトミックに実行し、exit code 回収と auto_close で後片付けまで自動化。MCP `tako_run_interactive` / `tako_run_interactive_status` + CLI 1:1（計 94 ツール）(#305)
   Interactive command delegation `tako run-interactive`: delegates commands requiring user input (sudo, browser auth) to a visible pane. Atomically splits, titles, and runs the command with exit code recovery marker. Auto-close on success (configurable). MCP `tako_run_interactive` / `tako_run_interactive_status` + CLI 1:1 (94 tools total) (#305)
 - 委任台帳: spawn/run 時に task_type × model × 結果を自動蓄積 + 検収記録 CLI + ユーザーフィードバック反映 + 判断基準の二層化 (#292)
