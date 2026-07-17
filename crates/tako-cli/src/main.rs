@@ -1711,6 +1711,14 @@ enum TabCommand {
     },
     /// タブを切り替える
     Select { tab: u64 },
+    /// タブの並び順を変更する（D&D 並べ替えと同等。#308）
+    Reorder {
+        /// 移動するタブ ID
+        tab: u64,
+        /// 移動先インデックス（0 始まり。範囲外は末尾にクランプ）
+        #[arg(long)]
+        index: usize,
+    },
     /// ペインを移動する: タブ ID 指定 = 別タブの末尾へ、--target 指定 = そのペインの
     /// 隣（--right 等の方向）へ挿し直す（FR-1.10 = タイトルバー D&D の同等操作）
     MovePane {
@@ -3295,6 +3303,10 @@ fn build_request(command: &Command) -> Result<Request, String> {
             title: title.join(" "),
         },
         Command::Tab(TabCommand::Select { tab }) => Request::TabSelect { tab: *tab },
+        Command::Tab(TabCommand::Reorder { tab, index }) => Request::TabReorder {
+            tab: *tab,
+            index: *index,
+        },
         Command::Tab(TabCommand::MovePane {
             tab,
             target,

@@ -184,6 +184,22 @@ impl Workspace {
         self.activate_by_offset(self.tabs.len() - 1)
     }
 
+    /// タブを指定インデックスへ移動する（D&D 並べ替え / CLI / MCP。#308）。
+    /// `target_index` はクランプされる（範囲外なら末尾）
+    pub fn move_tab(&mut self, id: TabId, target_index: usize) -> Result<usize, WorkspaceError> {
+        let from = self
+            .tabs
+            .iter()
+            .position(|t| t.id() == id)
+            .ok_or(WorkspaceError::TabNotFound(id))?;
+        let to = target_index.min(self.tabs.len().saturating_sub(1));
+        if from != to {
+            let tab = self.tabs.remove(from);
+            self.tabs.insert(to, tab);
+        }
+        Ok(to)
+    }
+
     /// ペインが属するタブを探す（FR-2.2.7 の呼び出し元特定や IPC のペイン解決に使う）
     pub fn find_tab_of_pane(&self, pane: PaneId) -> Option<TabId> {
         self.tabs
@@ -762,6 +778,51 @@ mod tests {
         );
         assert_eq!(
             ws.activate_tab(ghost),
+            Err(WorkspaceError::TabNotFound(ghost))
+        );
+    }
+
+    #[test]
+    fn タブの並べ替え_前方移動() {
+        let mut ws = Workspace::new("t1", pane());
+        let t1 = ws.active_tab_id();
+        let t2 = ws.create_tab("t2", pane());
+        let t3 = ws.create_tab("t3", pane());
+        // t3(末尾) を先頭へ
+        assert_eq!(ws.move_tab(t3, 0).unwrap(), 0);
+        let ids: Vec<_> = ws.tabs().iter().map(|t| t.id()).collect();
+        assert_eq!(ids, vec![t3, t1, t2]);
+    }
+
+    #[test]
+    fn タブの並べ替え_後方移動() {
+        let mut ws = Workspace::new("t1", pane());
+        let t1 = ws.active_tab_id();
+        let t2 = ws.create_tab("t2", pane());
+        let t3 = ws.create_tab("t3", pane());
+        // t1(先頭) を末尾へ
+        assert_eq!(ws.move_tab(t1, 2).unwrap(), 2);
+        let ids: Vec<_> = ws.tabs().iter().map(|t| t.id()).collect();
+        assert_eq!(ids, vec![t2, t3, t1]);
+    }
+
+    #[test]
+    fn タブの並べ替え_範囲外クランプ() {
+        let mut ws = Workspace::new("t1", pane());
+        let t1 = ws.active_tab_id();
+        let t2 = ws.create_tab("t2", pane());
+        // 範囲外 → 末尾へクランプ
+        assert_eq!(ws.move_tab(t1, 100).unwrap(), 1);
+        let ids: Vec<_> = ws.tabs().iter().map(|t| t.id()).collect();
+        assert_eq!(ids, vec![t2, t1]);
+    }
+
+    #[test]
+    fn タブの並べ替え_存在しないタブ() {
+        let mut ws = Workspace::new("t1", pane());
+        let ghost = TabId::from_raw(9999);
+        assert_eq!(
+            ws.move_tab(ghost, 0),
             Err(WorkspaceError::TabNotFound(ghost))
         );
     }
