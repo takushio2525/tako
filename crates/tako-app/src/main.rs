@@ -45,8 +45,8 @@ use gpui::{
     EntityInputHandler, ExternalPaths, FocusHandle, Font, FontStyle, FontWeight, HighlightStyle,
     Hsla, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     Point, Rgba, ScrollDelta, ScrollWheelEvent, SharedString, Size, StrikethroughStyle, StyledText,
-    TextLayout, TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window, WindowBounds,
-    WindowOptions,
+    Subscription, TextLayout, TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window,
+    WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use tako_control::{
@@ -602,6 +602,20 @@ struct DragScrollState {
     speed_factor: f32,
 }
 
+/// IME 変換状態の対象ペインを解決する（#332）。変換開始時のペインが既に閉じられて
+/// いる場合、候補ウィンドウの位置出しと確定文字列が死んだペインへ向かわないよう
+/// 現在のフォーカスペインへ倒す
+fn resolve_ime_pane(
+    recorded: Option<PaneId>,
+    alive: impl Fn(PaneId) -> bool,
+    focused: PaneId,
+) -> PaneId {
+    match recorded {
+        Some(pane) if alive(pane) => pane,
+        _ => focused,
+    }
+}
+
 struct TakoApp {
     workspace: Workspace,
     terminals: HashMap<PaneId, TerminalSession>,
@@ -647,6 +661,10 @@ struct TakoApp {
     active_pdf_rasters: std::collections::HashSet<PaneId>,
     /// IME 変換中の未確定文字列（FR-1.9。None = 変換中でない）
     ime: Option<ImeComposition>,
+    /// 直近 render のフォーカスペイン（IM 座標キャッシュ更新の変化検知用。#332）
+    last_ime_focus: Option<PaneId>,
+    /// focus 喪失（blur）からの自動復元の購読（drop で解除されるため保持。#332）
+    _focus_lost_sub: Option<Subscription>,
     /// ドラッグ中のペイン境界（None = ドラッグしていない）
     dragging_border: Option<DragBorder>,
     /// スクロールバーをドラッグ中のペイン
@@ -800,6 +818,8 @@ struct TakoApp {
     video_ticker: bool,
     /// 全ペインから集約した Claude エージェントメトリクス（ctx/usage。ポーリングで更新）
     agent_metrics: AgentMetrics,
+    /// codex ペインから集約したメトリクス（#357: サービス別制限データ）
+    codex_metrics: AgentMetrics,
     /// ステータスバーの利用制限表示で選択中のサービス（Issue #321。settings.json 永続化）
     limit_service: tako_core::LimitService,
     /// ステータスバーの利用制限サービス切替ドロップダウンが開いているか（Issue #321）
@@ -1706,6 +1726,8 @@ impl TakoApp {
             pending_pdf_rasters: HashMap::new(),
             active_pdf_rasters: std::collections::HashSet::new(),
             ime: None,
+            last_ime_focus: None,
+            _focus_lost_sub: None,
             dragging_border: None,
             dragging_scrollbar: None,
             hovered_scrollbar: None,
@@ -1777,6 +1799,7 @@ impl TakoApp {
             pinned_previews: Vec::new(),
             dragging_pin: None,
             agent_metrics: AgentMetrics::default(),
+            codex_metrics: AgentMetrics::default(),
             limit_service: tako_control::settings::load().limit_service(),
             limit_service_menu_open: false,
             usage_history: std::collections::VecDeque::new(),
@@ -4248,6 +4271,7 @@ impl TakoApp {
                 self.terminals.remove(&pane_id);
                 self.previews.remove(&pane_id);
                 self.preview_edits.remove(&pane_id);
+                self.discard_ime_for_pane(pane_id);
                 self.video_players.remove(&pane_id);
                 self.remove_video_frame_cache(pane_id);
                 self.remove_preview_image_cache(pane_id);
@@ -4307,6 +4331,7 @@ impl TakoApp {
                     self.terminals.remove(&id);
                     self.previews.remove(&id);
                     self.preview_edits.remove(&id);
+                    self.discard_ime_for_pane(id);
                     self.video_players.remove(&id);
                     self.remove_video_frame_cache(id);
                     self.remove_preview_image_cache(id);
@@ -6231,10 +6256,25 @@ impl TakoApp {
 
     /// IME 操作の対象ペイン。変換中はその開始ペイン、それ以外はフォーカスペイン
     fn ime_target(&self) -> PaneId {
-        self.ime
-            .as_ref()
-            .map(|ime| ime.pane)
-            .unwrap_or_else(|| self.focused_pane())
+        resolve_ime_pane(
+            self.ime.as_ref().map(|ime| ime.pane),
+            |pane| self.ime_pane_alive(pane),
+            self.focused_pane(),
+        )
+    }
+
+    /// ime.pane がまだ入力先として実在するか（terminal / プレビュー編集のどちらか）（#332）
+    fn ime_pane_alive(&self, pane: PaneId) -> bool {
+        self.terminals.contains_key(&pane) || self.preview_edits.contains_key(&pane)
+    }
+
+    /// ペインが閉じられたとき、そのペインを対象にした IME 変換状態を畳む（#332）。
+    /// 残すと ime_target / 確定書き込みが死んだペインへ向き続け、候補ウィンドウの
+    /// 位置出しと確定文字列の宛先が壊れる
+    fn discard_ime_for_pane(&mut self, pane_id: PaneId) {
+        if self.ime.as_ref().is_some_and(|ime| ime.pane == pane_id) {
+            self.ime = None;
+        }
     }
 
     /// 指定ペインのカーソルセル左上（ウィンドウ座標）。
@@ -6360,10 +6400,12 @@ impl TakoApp {
     }
 
     /// kill 確認のインラインブロック（FR-2.16.7）。メッセージ行（折り返し）+ ボタン行の
-    /// 全ペインから Claude TUI のメトリクス（ctx%/usage）を収集・更新する
+    /// 全ペインから Claude / Codex TUI のメトリクス（ctx%/usage）を収集・更新する（#357 拡張）
     fn refresh_agent_metrics(&mut self) {
-        let mut best: Option<AgentMetrics> = None;
-        // フォーカスペインを優先し、なければ他の alt_screen ペインから取得
+        use tako_core::MetricsSource;
+        let mut best_claude: Option<AgentMetrics> = None;
+        let mut best_codex: Option<AgentMetrics> = None;
+        // フォーカスペインを優先し、なければ他のペインから取得
         let focused = self.workspace.active_tab().tree().focused();
         let pane_ids: Vec<PaneId> = std::iter::once(focused)
             .chain(
@@ -6377,18 +6419,31 @@ impl TakoApp {
         for pid in pane_ids {
             if let Some(session) = self.terminals.get(&pid) {
                 if let Some(m) = session.agent_metrics() {
-                    if m.ctx_percent.is_some() || m.usage_text.is_some() || m.limit_5h.is_some() {
-                        best = Some(m);
+                    let has_data =
+                        m.ctx_percent.is_some() || m.usage_text.is_some() || m.limit_5h.is_some();
+                    if !has_data {
+                        continue;
+                    }
+                    match m.source {
+                        MetricsSource::Codex => {
+                            if best_codex.is_none() {
+                                best_codex = Some(m);
+                            }
+                        }
+                        _ => {
+                            if best_claude.is_none() {
+                                best_claude = Some(m);
+                            }
+                        }
+                    }
+                    if best_claude.is_some() && best_codex.is_some() {
                         break;
                     }
                 }
             }
         }
-        if let Some(m) = best {
-            self.agent_metrics = m;
-        } else {
-            self.agent_metrics = AgentMetrics::default();
-        }
+        self.agent_metrics = best_claude.unwrap_or_default();
+        self.codex_metrics = best_codex.unwrap_or_default();
         // usage トークン推移の履歴（#217 スパークライン。取れたときだけ・変化時だけ積む）
         if let Some(tok) = self
             .agent_metrics
@@ -10585,6 +10640,7 @@ impl SessionHost for TakoApp {
         self.terminals.remove(&pane);
         self.previews.remove(&pane);
         self.preview_edits.remove(&pane);
+        self.discard_ime_for_pane(pane);
         self.remove_preview_image_cache(pane);
         self.preview_views.remove(&pane);
         self.preview_scroll_handles.remove(&pane);
@@ -11763,32 +11819,39 @@ impl EntityInputHandler for TakoApp {
         self.ime.as_ref().map(|ime| 0..utf16_len(&ime.text))
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // NSTextInputClient の規約: unmark は「未確定文字列をそのまま挿入扱いにする」
         if let Some(ime) = self.ime.take() {
+            // 変換開始ペインが既に閉じられていたらフォーカスペインへ倒す（#332）
+            let pane = if self.ime_pane_alive(ime.pane) {
+                ime.pane
+            } else {
+                self.focused_pane()
+            };
             // 検索バー表示中は検索/置換フィールドへ
             if self
                 .preview_edits
-                .get(&ime.pane)
+                .get(&pane)
                 .is_some_and(|edit| edit.search_visible)
             {
                 if !ime.text.is_empty() {
-                    self.insert_search_char(ime.pane, &ime.text);
+                    self.insert_search_char(pane, &ime.text);
                 }
             } else if let Some(edit) = self
                 .preview_edits
-                .get_mut(&ime.pane)
+                .get_mut(&pane)
                 .filter(|edit| edit.editing)
             {
-                let p = ime.pane;
                 edit.buffer.insert(&ime.text);
                 edit.message = None;
-                self.refresh_preview_from_editor(p);
-                self.schedule_autosave(p);
-                self.start_autosave_timer(p, cx);
-            } else if let Some(session) = self.terminals.get(&ime.pane) {
+                self.refresh_preview_from_editor(pane);
+                self.schedule_autosave(pane);
+                self.start_autosave_timer(pane, cx);
+            } else if let Some(session) = self.terminals.get(&pane) {
                 session.write(ime.text.into_bytes());
             }
+            // 挿入確定でテキストが動いたので IM に文字座標の再計算を促す（zed 準拠。#332）
+            window.invalidate_character_coordinates();
         }
         cx.notify();
     }
@@ -11797,7 +11860,7 @@ impl EntityInputHandler for TakoApp {
         &mut self,
         _range_utf16: Option<Range<usize>>,
         text: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // インライン編集中は IME 確定文字列をインライン入力に振り分ける
@@ -11819,11 +11882,7 @@ impl EntityInputHandler for TakoApp {
             cx.notify();
             return;
         }
-        let pane = self
-            .ime
-            .as_ref()
-            .map(|ime| ime.pane)
-            .unwrap_or_else(|| self.focused_pane());
+        let pane = self.ime_target();
         // 検索バー表示中は入力文字を検索/置換フィールドへ
         if self
             .preview_edits
@@ -11854,20 +11913,25 @@ impl EntityInputHandler for TakoApp {
             self.refresh_preview_from_editor(pane);
             self.schedule_autosave(pane);
             self.start_autosave_timer(pane, cx);
+            window.invalidate_character_coordinates();
             cx.notify();
             return;
         }
-        // 確定（insertText 相当）。変換を開始したペインへ書き、変換状態を畳む
+        // 確定（insertText 相当）。変換を開始したペインへ書き、変換状態を畳む。
+        // 開始ペインが既に閉じられていたらフォーカスペインへ倒す（#332）
         let pane = self
             .ime
             .take()
             .map(|ime| ime.pane)
+            .filter(|pane| self.ime_pane_alive(*pane))
             .unwrap_or_else(|| self.focused_pane());
         self.cancel_scroll_before_input(pane);
         if let Some(session) = self.terminals.get(&pane) {
             session.clear_selection();
             session.write(text.as_bytes().to_vec());
         }
+        // 確定でテキストが動いたので IM に文字座標の再計算を促す（zed 準拠。#332）
+        window.invalidate_character_coordinates();
         cx.notify();
     }
 
@@ -11884,10 +11948,14 @@ impl EntityInputHandler for TakoApp {
         if new_text.is_empty() {
             self.ime = None;
         } else {
+            // 変換継続中は開始ペインを維持する。ただし開始ペインが既に閉じられて
+            // いたらフォーカスペインへ付け替える（stale なまま引き継ぐと以後の
+            // 変換・確定がすべて死んだペインへ向かう。#332）
             let pane = self
                 .ime
                 .take()
                 .map(|ime| ime.pane)
+                .filter(|pane| self.ime_pane_alive(*pane))
                 .unwrap_or_else(|| self.focused_pane());
             self.ime = Some(ImeComposition {
                 pane,
@@ -12296,6 +12364,23 @@ impl Render for TakoApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Issue #168: フレーム構築（element tree 生成）のメインスレッド専有を計測
         let _span = tako_control::diag::perf_span("render");
+        // IME 経路の自己修復の保険（#332）: 本線は wire_focus_self_heal の
+        // on_focus_lost（draw 末尾で発火し view render の reuse に依存しない）。
+        // ここは購読が何らかの理由で効かなかった場合に、次の notify 契機で
+        // 復元する多層防御。tako は単一 focus_handle 設計で「フォーカスが無い」
+        // 正当な状態は存在しない
+        if window.focused(cx).is_none() {
+            window.focus(&self.focus_handle.clone(), cx);
+            window.invalidate_character_coordinates();
+        }
+        // フォーカスペインが変わったら IM に文字座標の再計算を促す（zed の
+        // SelectionsChanged / focus_in 相当。放置すると候補ウィンドウが旧ペインの
+        // 座標キャッシュ位置へ出る。#332）
+        let ime_focus_now = self.focused_pane();
+        if self.last_ime_focus != Some(ime_focus_now) {
+            self.last_ime_focus = Some(ime_focus_now);
+            window.invalidate_character_coordinates();
+        }
         self.drain_preview_image_evictions(window, cx);
         self.preview_device_scale = window.scale_factor();
         // Web ビュー（FR-3.8）: wry の親にするウィンドウハンドルは render でしか
@@ -12670,7 +12755,16 @@ impl Render for TakoApp {
             .on_action(cx.listener(|this, _: &OpenRecent, _, cx| {
                 this.open_recent_palette(cx);
             }))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                // blur（外部 a11y 等）からの自動復元（#332）: focus が無いと
+                // input handler が未登録になり日本語 IM の printable キーが IME を
+                // 素通りする。キーイベント自体は blur 中も root dispatch フォール
+                // バックで届く（#103 で実証）ため、打鍵を検知したら focus を戻す。
+                // draw 停止中（不可視ウィンドウ）でも効く復元経路
+                if !this.focus_handle.is_focused(window) {
+                    window.focus(&this.focus_handle.clone(), cx);
+                    window.invalidate_character_coordinates();
+                }
                 this.handle_key(&event.keystroke, cx);
             }))
             .on_modifiers_changed(cx.listener(
@@ -13081,6 +13175,23 @@ fn open_restored_window(cx: &mut App) {
     open_window_with_bounds(bounds, cx);
 }
 
+/// ウィンドウ生成直後の focus 配線（#332）: 初期 focus + blur（外部 a11y の Blur
+/// アクション等）からの自動復元。focus が無いと Window::handle_input が input handler
+/// を登録せず、日本語 IM の printable キーが IME を素通りして ASCII 直書きになる
+/// （変換候補ウィンドウが再起動まで出ない）。GPUI の on_focus_lost は「ウィンドウ内の
+/// どこにも focus が無くなった」draw 末尾に発火するため、view render が reuse で
+/// スキップされるフレームでも確実に呼ばれる
+fn wire_focus_self_heal(view: &gpui::Entity<TakoApp>, window: &mut Window, cx: &mut App) {
+    window.focus(&view.read(cx).focus_handle.clone(), cx);
+    view.update(cx, |app, cx| {
+        app._focus_lost_sub = Some(cx.on_focus_lost(window, |app, window, cx| {
+            window.focus(&app.focus_handle.clone(), cx);
+            window.invalidate_character_coordinates();
+            cx.notify();
+        }));
+    });
+}
+
 fn open_window_with_bounds(window_bounds: WindowBounds, cx: &mut App) {
     let _ = cx
         .open_window(
@@ -13091,7 +13202,7 @@ fn open_window_with_bounds(window_bounds: WindowBounds, cx: &mut App) {
             },
             |window, cx| {
                 let view = cx.new(TakoApp::new);
-                window.focus(&view.read(cx).focus_handle.clone(), cx);
+                wire_focus_self_heal(&view, window, cx);
                 // 赤ボタン close 時にレイアウトを保存する（#312。quit ではなく
                 // ウインドウ単体の close なので on_app_quit は走らない）
                 let entity = view.clone();
@@ -13257,7 +13368,7 @@ fn main() {
                 },
                 |window, cx| {
                     let view = cx.new(TakoApp::new);
-                    window.focus(&view.read(cx).focus_handle.clone(), cx);
+                    wire_focus_self_heal(&view, window, cx);
                     // 赤ボタン close 時にレイアウトを保存（#312）
                     let entity = view.clone();
                     window.on_window_should_close(cx, move |_window, cx| {
@@ -14210,13 +14321,19 @@ mod self_test {
             wait(cx, 1000).await;
             check(focused_contains(window, cx, "TAKO-INPUT-OK"), "入力エコー");
 
-            // 1b. TERM / COLORTERM 注入（tmux 等の「missing or unsuitable terminal」回避）
+            // 1b. TERM / COLORTERM 注入（tmux 等の「missing or unsuitable terminal」回避）。
+            //     高負荷環境（worker のビルド並走等）ではエコー反映が 800ms を超えることが
+            //     あるため、リトライループで待つ（フレーキー対策。項目 17 と同型）
             type_text(any, cx, "echo TERMCHK=$TERM,$COLORTERM", true);
-            wait(cx, 800).await;
-            check(
-                focused_contains(window, cx, "TERMCHK=xterm-256color,truecolor"),
-                "TERM / COLORTERM 注入",
-            );
+            let mut term_ok = false;
+            for _ in 0..8 {
+                wait(cx, 800).await;
+                term_ok = focused_contains(window, cx, "TERMCHK=xterm-256color,truecolor");
+                if term_ok {
+                    break;
+                }
+            }
+            check(term_ok, "TERM / COLORTERM 注入");
 
             // 1c. 初期 cwd はホーム（.app 起動時に `/` へ落ちない）
             type_text(any, cx, "[ \"$PWD\" = \"$HOME\" ] && echo CWDCHK-$((40+2))", true);
@@ -14444,26 +14561,35 @@ mod self_test {
                 "cmd-t で新タブ",
             );
 
-            // 8. 色つき出力（ANSI 赤）が Theme の赤へ解決される
+            // 8. 色つき出力（ANSI 赤）が Theme の赤へ解決される。
+            //    新タブ直後の初回コマンドは高負荷環境でシェル初期化が 1 秒を超えることが
+            //    あるため、リトライループで待つ（フレーキー対策。項目 17 と同型）
             type_text(any, cx, r"printf '\e[31mTAKO-RED\e[0m\n'", true);
-            wait(cx, 1000).await;
-            let red_ok = window
-                .update(cx, |app, _, _| {
-                    let theme = app.theme.clone();
-                    app.focused_session()
-                        .map(|s| {
-                            let screen = s.screen(&theme);
-                            screen.lines.iter().any(|line| {
-                                line.text.contains("TAKO-RED")
-                                    && line.runs.iter().any(|run| {
-                                        run.fg == theme.red
-                                            && line.text[run.range.clone()].contains("TAKO-RED")
-                                    })
+            let mut red_ok = false;
+            for _ in 0..8 {
+                wait(cx, 1000).await;
+                red_ok = window
+                    .update(cx, |app, _, _| {
+                        let theme = app.theme.clone();
+                        app.focused_session()
+                            .map(|s| {
+                                let screen = s.screen(&theme);
+                                screen.lines.iter().any(|line| {
+                                    line.text.contains("TAKO-RED")
+                                        && line.runs.iter().any(|run| {
+                                            run.fg == theme.red
+                                                && line.text[run.range.clone()]
+                                                    .contains("TAKO-RED")
+                                        })
+                                })
                             })
-                        })
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if red_ok {
+                    break;
+                }
+            }
             check(red_ok, "ANSI 赤の解決");
 
             // 9. スクロールバック表示
@@ -14616,43 +14742,61 @@ mod self_test {
 
             // 18. tako split --down --focus（呼び出し元の自動特定 + origin=cli + フォーカス移動）。
             // 既定はフォーカスを分割元に維持する仕様（3c9d363）のため、--focus を明示して
-            // 新ペインへ移す（後続テストは新ペインからの入力を前提とする）
+            // 新ペインへ移す（後続テストは新ペインからの入力を前提とする）。
+            // ペイン数が増えるまでリトライで待つ（項目 17 と同型のフレーキー対策）
             type_text(any, cx, &format!("{cli} split --down --focus"), true);
-            wait(cx, 1500).await;
-            let (pane_count, pane4, origin_cli) = window
-                .update(cx, |app, _, _| {
-                    let tree = app.workspace.active_tab().tree();
-                    let focused = tree.focused();
-                    (
-                        tree.len(),
-                        focused,
-                        tree.get(focused).map(|p| p.origin()) == Some(PaneOrigin::Cli),
-                    )
-                })
-                .unwrap_or_else(|_| fail("tako split 後の状態取得"));
+            let mut split_state = None;
+            for _ in 0..8 {
+                wait(cx, 1500).await;
+                let state = window
+                    .update(cx, |app, _, _| {
+                        let tree = app.workspace.active_tab().tree();
+                        let focused = tree.focused();
+                        (
+                            tree.len(),
+                            focused,
+                            tree.get(focused).map(|p| p.origin()) == Some(PaneOrigin::Cli),
+                        )
+                    })
+                    .unwrap_or_else(|_| fail("tako split 後の状態取得"));
+                let done = state.0 == 2;
+                split_state = Some(state);
+                if done {
+                    break;
+                }
+            }
+            let (pane_count, pane4, origin_cli) =
+                split_state.unwrap_or_else(|| fail("tako split 後の状態取得"));
             check(pane_count == 2, "tako split で 2 ペイン");
             check(pane4 != pane2, "split --focus 後フォーカスは新ペイン");
             check(origin_cli, "新ペインの origin は cli");
 
-            // 19. tako send で別ペインへコマンドを流し込む（FR-2.2.2。pane4 から pane2 へ）
+            // 19. tako send で別ペインへコマンドを流し込む（FR-2.2.2。pane4 から pane2 へ）。
+            //     debug CLI 起動 + IPC 往復は高負荷時に 1 秒を超えるためリトライで待つ（項目 17 と同型）
             type_text(
                 any,
                 cx,
                 &format!("{cli} send --pane {pane2} 'echo TAKO-SEND-$((40+2))'"),
                 true,
             );
-            wait(cx, 1200).await;
-            let sent = window
-                .update(cx, |app, _, _| {
-                    app.terminals
-                        .get(&pane2)
-                        .map(|s| s.visible_lines().iter().any(|l| l.contains("TAKO-SEND-42")))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
+            let mut sent = false;
+            for _ in 0..8 {
+                wait(cx, 1200).await;
+                sent = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&pane2)
+                            .map(|s| s.visible_lines().iter().any(|l| l.contains("TAKO-SEND-42")))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if sent {
+                    break;
+                }
+            }
             check(sent, "tako send で別ペインへ送信");
 
-            // 20. tako read で別ペインの画面内容を取得する（FR-2.2.5）
+            // 20. tako read で別ペインの画面内容を取得する（FR-2.2.5。リトライは項目 17 と同型）
             type_text(
                 any,
                 cx,
@@ -14661,8 +14805,15 @@ mod self_test {
                 ),
                 true,
             );
-            wait(cx, 1000).await;
-            check(focused_contains(window, cx, "TAKO-READ-42"), "tako read");
+            let mut read_ok = false;
+            for _ in 0..8 {
+                wait(cx, 1000).await;
+                read_ok = focused_contains(window, cx, "TAKO-READ-42");
+                if read_ok {
+                    break;
+                }
+            }
+            check(read_ok, "tako read");
 
             // 21. tako title --role（FR-2.2.6 / FR-2.1.3）
             type_text(
@@ -15302,28 +15453,56 @@ mod self_test {
                 })
                 .unwrap_or(false);
             check(osc_cwd_ok, "シェル統合の OSC 7 で cwd 検知");
-            type_text(any, cx, "sleep 2", true);
-            wait(cx, 700).await;
-            let osc_running = window
-                .update(cx, |app, _, _| {
-                    app.terminals
-                        .get(&app.focused_pane())
-                        .map(|s| s.command_state() == CommandState::Running)
-                        == Some(true)
-                })
-                .unwrap_or(false);
+            // 実行中状態の検知: sleep 5 の実行ウィンドウ内で Running への遷移をポーリングで
+            // 捕まえる（高負荷時はコマンド開始自体が 1 秒超遅れるため。項目 17 と同型の対策）
+            type_text(any, cx, "sleep 5", true);
+            let mut osc_running = false;
+            for _ in 0..12 {
+                wait(cx, 300).await;
+                osc_running = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&app.focused_pane())
+                            .map(|s| s.command_state() == CommandState::Running)
+                            == Some(true)
+                    })
+                    .unwrap_or(false);
+                if osc_running {
+                    break;
+                }
+            }
             check(osc_running, "実行中コマンドが running");
-            wait(cx, 1800).await; // sleep 2 の完了を待つ
+            // sleep 5 の完了（Running でなくなる）を待ってから失敗コマンドへ
+            for _ in 0..10 {
+                wait(cx, 800).await;
+                let done = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&app.focused_pane())
+                            .map(|s| s.command_state() != CommandState::Running)
+                            == Some(true)
+                    })
+                    .unwrap_or(false);
+                if done {
+                    break;
+                }
+            }
             type_text(any, cx, "false", true);
-            wait(cx, 800).await;
-            let osc_failed = window
-                .update(cx, |app, _, _| {
-                    app.terminals
-                        .get(&app.focused_pane())
-                        .map(|s| s.command_state() == CommandState::Failed(1))
-                        == Some(true)
-                })
-                .unwrap_or(false);
+            let mut osc_failed = false;
+            for _ in 0..8 {
+                wait(cx, 800).await;
+                osc_failed = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&app.focused_pane())
+                            .map(|s| s.command_state() == CommandState::Failed(1))
+                            == Some(true)
+                    })
+                    .unwrap_or(false);
+                if osc_failed {
+                    break;
+                }
+            }
             check(osc_failed, "失敗コマンドで failed（プロンプト後も保持）");
             // 開発不変条件: 検知した状態は list（CLI / MCP 共有の dispatch）からも見える
             let list_exposes = window
@@ -16297,11 +16476,17 @@ mod self_test {
                 ),
                 true,
             );
-            wait(cx, 1200).await;
-            check(
-                focused_contains(window, cx, "TAKO-PS-58"),
-                "tako persist on / 状態取得",
-            );
+            // debug CLI 3 連発 + IPC 往復のため固定待ちでは不足することがある
+            // （リトライは項目 17 と同型のフレーキー対策）
+            let mut persist_status_ok = false;
+            for _ in 0..8 {
+                wait(cx, 1200).await;
+                persist_status_ok = focused_contains(window, cx, "TAKO-PS-58");
+                if persist_status_ok {
+                    break;
+                }
+            }
+            check(persist_status_ok, "tako persist on / 状態取得");
             let persist_on = window
                 .update(cx, |app, _, _| app.tmux_persist)
                 .unwrap_or(false);
@@ -16480,9 +16665,14 @@ mod self_test {
                     "バックエンドのホイールがミラー表示に乗る（copy-mode 不使用）",
                 );
 
-                // 61c. スクロールバーはスクロール中だけ表示され、時間経過でフェードする
+                // 61c. スクロールバーはスクロール中だけ表示され、時間経過でフェードする。
+                //      直前 61b の確認リトライが長引くとフェード時間を過ぎてしまうため、
+                //      「スクロール活動直後」の状態を明示的に再現してから判定する（決定化）
                 let bar_visible = window
                     .update(cx, |app, _, _| {
+                        if let Some(ctl) = app.scroll_ctls.get_mut(&backend_pane) {
+                            ctl.last_activity = std::time::Instant::now();
+                        }
                         let area = app
                             .pane_text_areas
                             .iter()
@@ -19970,6 +20160,49 @@ mod self_test {
                 check(tab_ok, "確認ダイアログ: タブの × でダイアログ表示 + キャンセル");
             }
 
+            // 76. IME 経路の自己修復（#332）: 外部要因（a11y の Blur アクション等）で
+            // window.blur() が起きても、次のキー打鍵で focus が TakoApp へ復元される
+            // （on_key_down 冒頭の復元。キーは blur 中も root dispatch フォール
+            // バックで届く = #103 実証）。復元されないと Window::handle_input が
+            // input handler を登録しなくなり、日本語 IM の printable キーが IME を
+            // 素通りして ASCII のまま terminal へ入り続ける（候補ウィンドウが再起動
+            // まで出ない）。可視ウィンドウでは on_focus_lost（draw 末尾）が打鍵前に
+            // 復元するが、このセルフテスト環境は draw が止まり得るため打鍵経路で検証
+            // する。修正前はこの check が FAILED = blur が恒久化していた
+            let _ = any.update(cx, |_, window, _| window.blur());
+            wait(cx, 300).await;
+            let blurred = window
+                .update(cx, |app, window, _| !app.focus_handle.is_focused(window))
+                .unwrap_or(false);
+            press(any, cx, "escape");
+            wait(cx, 300).await;
+            let refocused = window
+                .update(cx, |app, window, _| app.focus_handle.is_focused(window))
+                .unwrap_or(false);
+            check(
+                blurred && refocused,
+                "IME 経路: blur 後の focus 自己修復 (#332)",
+            );
+
+            // 76b. 変換中ペインの close で IME 状態が畳まれる（#332）。
+            // 畳まれないと ime_target / 確定書き込みが死んだペインへ向き続け、
+            // 候補ウィンドウの位置出しと確定文字列の宛先が壊れる
+            let _ = window.update(cx, |app, _, cx| app.split(SplitDirection::Right, cx));
+            wait(cx, 1200).await;
+            let ime_close_ok = window
+                .update(cx, |app, window, cx| {
+                    let target = app.focused_pane();
+                    app.replace_and_mark_text_in_range(None, "へんかん", None, window, cx);
+                    let composing = app.ime.is_some();
+                    app.remove_pane(target, cx);
+                    let cleared = app.ime.is_none();
+                    // 畳んだ後の ime_target がフォーカスペインへ解決されることも固定
+                    let target_ok = app.ime_target() == app.focused_pane();
+                    composing && cleared && target_ok
+                })
+                .unwrap_or(false);
+            check(ime_close_ok, "IME 状態: 変換中ペインの close で畳まれる (#332)");
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -20068,6 +20301,45 @@ fn accumulate_scroll(carry: f32, delta_lines: f32) -> (i32, f32) {
     let total = carry + delta_lines;
     let lines = total.trunc() as i32;
     (lines, total - lines as f32)
+}
+
+#[cfg(test)]
+mod ime_tests {
+    use super::resolve_ime_pane;
+    use tako_core::PaneId;
+
+    // #332: IME 変換状態の対象ペイン解決。変換開始ペインが閉じられた後も
+    // 死んだペインへ向け続けると、候補ウィンドウの位置出し（bounds_for_range が
+    // カーソル解決に失敗してコンテンツ左上へフォールバック）と確定文字列の宛先
+    // （terminals.get = None で入力が虚空へ消える）が壊れる
+
+    #[test]
+    fn 変換中は開始ペインを対象にする() {
+        let started = PaneId::from_raw(1);
+        let focused = PaneId::from_raw(2);
+        assert_eq!(
+            resolve_ime_pane(Some(started), |_| true, focused),
+            started,
+            "生きている開始ペインが対象（変換途中のフォーカス移動で確定先がぶれない）"
+        );
+    }
+
+    #[test]
+    fn 開始ペインが閉じられていたらフォーカスペインへ倒す() {
+        let dead = PaneId::from_raw(1);
+        let focused = PaneId::from_raw(2);
+        assert_eq!(
+            resolve_ime_pane(Some(dead), |_| false, focused),
+            focused,
+            "死んだペインを対象にし続けない（#332 の stale 防御）"
+        );
+    }
+
+    #[test]
+    fn 非変換中はフォーカスペインを対象にする() {
+        let focused = PaneId::from_raw(2);
+        assert_eq!(resolve_ime_pane(None, |_| true, focused), focused);
+    }
 }
 
 #[cfg(test)]

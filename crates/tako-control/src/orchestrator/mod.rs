@@ -262,6 +262,16 @@ pub struct AgentWorkerConfig {
     pub args: Vec<String>,
 }
 
+/// プロファイル起動コマンドの案内表記。default は引数なしの最簡形で示す
+/// （「最も簡単なコマンドを提案する」原則。Issue #322、`.agent/conventions.md`）
+pub fn launch_command(base: &str, profile_name: &str) -> String {
+    if profile_name == "default" {
+        base.to_string()
+    } else {
+        format!("{base} -{profile_name}")
+    }
+}
+
 /// `Profile::resolve_agent_launch` の解決結果（spawn で使う worker 起動パラメータ）
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedWorkerLaunch {
@@ -816,10 +826,11 @@ impl Profile {
             None => String::new(),
         };
 
+        let launch_cmd = launch_command("tako master", profile_name);
         format!(
             "## Session Identity\n\n\
              - **Profile**: `{profile_name}`\n\
-             - **Launch command**: `tako master -{profile_name}`{master_agent_line}\n\
+             - **Launch command**: `{launch_cmd}`{master_agent_line}\n\
              - **Master model**: {}\n\
              - **Master effort**: {}\n\
              - **Worker model policy**: {policy_str}{agent_line}\n\
@@ -887,11 +898,12 @@ impl Profile {
             None => String::new(),
         };
 
+        let launch_cmd = launch_command("tako solo", profile_name);
         format!(
             "## Session Identity\n\n\
              - **Mode**: solo (direct execution, no orchestration)\n\
              - **Profile**: `{profile_name}`\n\
-             - **Launch command**: `tako solo -{profile_name}`{agent_line}\n\
+             - **Launch command**: `{launch_cmd}`{agent_line}\n\
              - **Model**: {}\n\
              - **Effort**: {}\n\
              - **Profile config**: `{profile_path}`",
@@ -1891,6 +1903,24 @@ prompt_blocks:
         assert!(prompt.contains("claude-fable-5"));
         assert!(prompt.contains("fixed"));
         assert!(prompt.contains("claude-sonnet-5"));
+    }
+
+    /// default プロファイルの起動コマンド案内は引数なしの最簡形（Issue #322）
+    #[test]
+    fn issue_322_launch_command_simplest_form() {
+        assert_eq!(launch_command("tako master", "default"), "tako master");
+        assert_eq!(launch_command("tako solo", "default"), "tako solo");
+        assert_eq!(launch_command("tako master", "fable"), "tako master -fable");
+        assert_eq!(launch_command("tako solo", "fast"), "tako solo -fast");
+
+        // Session Identity 経由でも -default を見せない
+        let p = Profile::default();
+        let master_prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "default");
+        assert!(master_prompt.contains("Launch command**: `tako master`"));
+        assert!(!master_prompt.contains("tako master -default"));
+        let solo_prompt = p.build_solo_system_prompt("default");
+        assert!(solo_prompt.contains("Launch command**: `tako solo`"));
+        assert!(!solo_prompt.contains("tako solo -default"));
     }
 
     #[test]

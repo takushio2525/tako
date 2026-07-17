@@ -1,5 +1,8 @@
 # 安全ルール
 
+<!-- coverage: 本番・破壊的操作の保護 = 本番 | 破壊的 | production | destructive -->
+<!-- coverage: 認証情報・秘密情報の扱い = 認証情報 | シークレット | 秘密 | 個人情報 | secret | credential | api key | api キー | パスワード | password | token | トークン -->
+
 ## 必須概念
 
 - 本番環境の直接操作を禁止するルール
