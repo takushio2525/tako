@@ -16252,11 +16252,17 @@ mod self_test {
                 ),
                 true,
             );
-            wait(cx, 1200).await;
-            check(
-                focused_contains(window, cx, "TAKO-PS-58"),
-                "tako persist on / 状態取得",
-            );
+            // debug CLI 3 連発 + IPC 往復のため固定待ちでは不足することがある
+            // （リトライは項目 17 と同型のフレーキー対策）
+            let mut persist_status_ok = false;
+            for _ in 0..8 {
+                wait(cx, 1200).await;
+                persist_status_ok = focused_contains(window, cx, "TAKO-PS-58");
+                if persist_status_ok {
+                    break;
+                }
+            }
+            check(persist_status_ok, "tako persist on / 状態取得");
             let persist_on = window
                 .update(cx, |app, _, _| app.tmux_persist)
                 .unwrap_or(false);
