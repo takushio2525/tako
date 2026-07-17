@@ -128,6 +128,7 @@ impl WebViewEntry {
         id: WebViewId,
         url: &str,
     ) -> Result<Self, String> {
+        validate_url(url)?;
         let shared = Arc::new(Mutex::new(WebShared {
             url: url.to_string(),
             ..Default::default()
@@ -256,6 +257,7 @@ impl WebViewEntry {
             "reload" => self.view.reload().map_err(|e| format!("reload 失敗: {e}")),
             url => {
                 let url = normalize_url(url);
+                validate_url(&url)?;
                 if let Ok(mut s) = self.shared.lock() {
                     s.url = url.clone();
                     s.loading = true;
@@ -334,6 +336,26 @@ pub fn normalize_url(input: &str) -> String {
     format!("https://{s}")
 }
 
+/// 正規化済み URL を wry へ渡す前に検証する。
+/// NSURL(string:) が nil を返す文字列（空白・制御文字を含む等）を弾き、
+/// wry 内部の unwrap による panic（#334）を防ぐ
+pub fn validate_url(url: &str) -> Result<(), String> {
+    if url.is_empty() {
+        return Err("URL が空です".into());
+    }
+    if url.chars().any(|c| c.is_ascii_whitespace()) {
+        return Err(format!(
+            "URL に空白文字が含まれています（NSURL が解釈できない）: {url}"
+        ));
+    }
+    if url.bytes().any(|b| b < 0x20) {
+        return Err(format!(
+            "URL に制御文字が含まれています（NSURL が解釈できない）: {url}"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +381,50 @@ mod tests {
     fn normalize_url_は裸ドメインを_https_に倒す() {
         assert_eq!(normalize_url("example.com"), "https://example.com");
         assert_eq!(normalize_url("  docs.rs/wry "), "https://docs.rs/wry");
+    }
+
+    #[test]
+    fn validate_url_は正常な_url_を通す() {
+        assert!(validate_url("https://example.com").is_ok());
+        assert!(validate_url("http://localhost:3000").is_ok());
+        assert!(validate_url("data:text/html,hello").is_ok());
+        assert!(validate_url("about:blank").is_ok());
+        assert!(validate_url("https://example.com/path?q=1&r=2#frag").is_ok());
+    }
+
+    #[test]
+    fn validate_url_は空白入り_url_を拒否する() {
+        assert!(validate_url("https://github .com").is_err());
+        assert!(validate_url("a b").is_err());
+        assert!(validate_url("hello world").is_err());
+        assert!(validate_url("https://example.com/path with spaces").is_err());
+    }
+
+    #[test]
+    fn validate_url_は空文字を拒否する() {
+        assert!(validate_url("").is_err());
+    }
+
+    #[test]
+    fn validate_url_はスキーム無しのドメインを通す() {
+        assert!(validate_url("https://example.com").is_ok());
+        assert!(validate_url("http://127.0.0.1:8080").is_ok());
+    }
+
+    #[test]
+    fn validate_url_は制御文字を拒否する() {
+        assert!(validate_url("https://example.com/\x01bad").is_err());
+        assert!(validate_url("https://\x00evil.com").is_err());
+    }
+
+    #[test]
+    fn validate_url_は非_ascii_を許容する() {
+        assert!(validate_url("https://xn--example.com/%E6%97%A5%E6%9C%AC%E8%AA%9E").is_ok());
+    }
+
+    #[test]
+    fn validate_url_はタブや改行を拒否する() {
+        assert!(validate_url("https://example.com/\there").is_err());
+        assert!(validate_url("https://example.com/\nhere").is_err());
     }
 }
