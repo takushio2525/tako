@@ -893,6 +893,10 @@ enum FileCommand {
     Mkdir { path: String, name: String },
     /// ファイル・フォルダをゴミ箱へ移動する
     Trash { path: String },
+    /// デフォルトアプ��で開く（macOS）
+    Open { path: String },
+    /// 指定アプリで開く（macOS）
+    OpenWith { path: String, name: String },
 }
 
 #[derive(Subcommand)]
@@ -3420,6 +3424,18 @@ fn build_request(command: &Command) -> Result<Request, String> {
             op: tako_control::protocol::FileOpKind::Trash,
             path: resolve_cli_path(path),
             name: None,
+            pane: None,
+        },
+        Command::File(FileCommand::Open { path }) => Request::FileOp {
+            op: tako_control::protocol::FileOpKind::OpenDefault,
+            path: resolve_cli_path(path),
+            name: None,
+            pane: None,
+        },
+        Command::File(FileCommand::OpenWith { path, name }) => Request::FileOp {
+            op: tako_control::protocol::FileOpKind::OpenWith,
+            path: resolve_cli_path(path),
+            name: Some(name.clone()),
             pane: None,
         },
         Command::Video(VideoCommand::Play { pane }) => Request::VideoPlayback {

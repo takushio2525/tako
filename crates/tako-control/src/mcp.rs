@@ -895,19 +895,21 @@ pub fn tools() -> Vec<Value> {
                 reveal = Finder でファイルの場所を表示（macOS）/\n\
                 open_terminal = 指定パスのディレクトリへペイン内で cd /\n\
                 rename = name でファイル名を変更 / create_file = path 配下に name でファイル作成 /\n\
-                create_dir = path 配下に name でフォルダ作成 / trash = ゴミ箱へ移動。\n\
-                rename / create_file / create_dir は name パラメータが必須。\
+                create_dir = path 配下に name でフォルダ作成 / trash = ゴミ箱へ移動 /\n\
+                open_default = デフォルトアプリで開く（macOS）/\n\
+                open_with = name で指定したアプリで開く（macOS。name 必須）。\n\
+                rename / create_file / create_dir / open_with は name パラメータが必須。\
                 open_terminal / copy_relative_path は pane パラメータでペインを指定する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "op": {
                         "type": "string",
-                        "enum": ["copy_absolute_path","copy_relative_path","reveal","open_terminal","rename","create_file","create_dir","trash"],
+                        "enum": ["copy_absolute_path","copy_relative_path","reveal","open_terminal","rename","create_file","create_dir","trash","open_default","open_with"],
                         "description": "操作種別",
                     },
                     "path": { "type": "string", "description": "対象のファイル・フォルダパス（必須）" },
-                    "name": { "type": "string", "description": "新しい名前（rename / create_file / create_dir で必須）" },
+                    "name": { "type": "string", "description": "新しい名前 / アプリ名（rename / create_file / create_dir / open_with で必須）" },
                     "pane": pane_schema("対象ペイン ID（open_terminal の cd 先 / copy_relative_path の基準。省略時は呼び出し元）"),
                 },
                 "required": ["op", "path"],
@@ -2619,6 +2621,8 @@ fn build_request(
                 "create_file" => crate::protocol::FileOpKind::CreateFile,
                 "create_dir" => crate::protocol::FileOpKind::CreateDir,
                 "trash" => crate::protocol::FileOpKind::Trash,
+                "open_default" => crate::protocol::FileOpKind::OpenDefault,
+                "open_with" => crate::protocol::FileOpKind::OpenWith,
                 other => return Err(format!("op が不正: {other}")),
             };
             Request::FileOp {

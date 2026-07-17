@@ -1517,6 +1517,63 @@ fn dispatch_inner(
                     }
                     Ok(json!({ "trashed": path.display().to_string() }))
                 }
+                FileOpKind::OpenDefault => {
+                    if !path.exists() {
+                        return Err(DispatchError::Operation(format!(
+                            "パスが存在しない: {}",
+                            path.display()
+                        )));
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        std::process::Command::new("open")
+                            .arg(&path)
+                            .spawn()
+                            .map_err(|e| {
+                                DispatchError::Operation(format!("デフォルトアプリで開けない: {e}"))
+                            })?;
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        return Err(DispatchError::Operation(
+                            "open_default は macOS のみ対応".into(),
+                        ));
+                    }
+                    Ok(json!({ "opened": path.display().to_string() }))
+                }
+                FileOpKind::OpenWith => {
+                    if !path.exists() {
+                        return Err(DispatchError::Operation(format!(
+                            "パスが存在しない: {}",
+                            path.display()
+                        )));
+                    }
+                    let app_name = name.ok_or(DispatchError::InvalidParams(
+                        "name（アプリ名）を指定する".into(),
+                    ))?;
+                    #[cfg(target_os = "macos")]
+                    {
+                        std::process::Command::new("open")
+                            .arg("-a")
+                            .arg(&app_name)
+                            .arg(&path)
+                            .spawn()
+                            .map_err(|e| {
+                                DispatchError::Operation(format!(
+                                    "アプリ '{}' で開けない: {e}",
+                                    app_name
+                                ))
+                            })?;
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let _ = app_name;
+                        return Err(DispatchError::Operation(
+                            "open_with は macOS のみ対応".into(),
+                        ));
+                    }
+                    Ok(json!({ "opened": path.display().to_string(), "app": app_name }))
+                }
             }
         }
         Request::GitLog { pane, max_count } => {

@@ -1000,6 +1000,10 @@ pub enum FileOpKind {
     CreateFile,
     CreateDir,
     Trash,
+    /// デフォルトアプリで開く（macOS: `open <path>`）
+    OpenDefault,
+    /// 指定アプリで開く（macOS: `open -a <name> <path>`。name フィールド必須）
+    OpenWith,
 }
 
 #[cfg(test)]
