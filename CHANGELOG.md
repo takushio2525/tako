@@ -29,6 +29,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   *Implement two-layer device-pairing authentication and serve the PWA from the daemon
   (same-origin, version-matched); approval and role elevation are Mac-GUI-only.*
 
+### Added / 機能追加
+
+- **`tako remote setup` 対話ウィザード新設** (#286): Tailscale の導入検出 → brew/App Store
+  案内 → ログイン確認 → MagicDNS/HTTPS 有効化ガイド → serve 設定 → 自己接続確認 →
+  固定 URL の QR（PNG）表示 → スマホ側手順案内。`--yes` / `--answers` で非対話実行可。
+  dispatch `RemoteSetup` + MCP `tako_remote_setup` と 1:1（101 ツール）。
+  *New `tako remote setup` interactive wizard for Tailscale Serve configuration: detects
+  installation, guides login/HTTPS setup, configures serve, generates QR PNG, and shows
+  phone-side instructions. Non-interactive via `--yes` / `--answers`. MCP 1:1 (101 tools).*
+- `tako setup` の依存チェックに tailscale を追加（任意扱い）。完了サマリ末尾に
+  `tako remote setup` への案内を表示。setup changes.yaml rev 11 で既存ユーザーにも配信。
+  *Added tailscale to `tako setup` dependency check (optional). Shows `tako remote setup`
+  guidance at the end of setup summary. Distributed via changes.yaml rev 11.*
+
+### Documentation / ドキュメント
+
+- threat model を `.agent/threat-model-remote.md` に新設（信頼境界・Tailscale 侵害時の
+  挙動・CT log 露出・ペアリング承認の人間限定・残存リスク）。
+  `.agent/architecture.md` の「リモート機能は持たない」矛盾を解消。
+  *New threat model at `.agent/threat-model-remote.md`. Resolved "no remote" contradiction
+  in architecture.md.*
+
 ## [0.5.5] - 2026-07-17
 
 Nightly patch release (automated). Changes since v0.5.4:
