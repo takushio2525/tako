@@ -880,6 +880,33 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sync_checkpoint: Option<bool>,
     },
+    /// 対話コマンドのペイン委譲（Issue #305）。split → タイトル設定 → コマンド投入を
+    /// アトミックに実行し、pane_id を返す。コマンドは exit code 回収マーカーでラップされる
+    RunInteractive {
+        pane: Option<u64>,
+        tab: Option<u64>,
+        /// 実行するコマンド文字列（シェル経由で実行される）
+        command: String,
+        /// ユーザーへの入力案内（タイトルに「要入力: <hint>」として表示）
+        input_hint: Option<String>,
+        direction: Option<Direction>,
+        /// 新ペイン側の取り分（0.0–1.0、省略時 0.3）
+        ratio: Option<f32>,
+        /// 完了後の自動 close 方針。
+        /// "success"（既定）= exit 0 で自動 close / "always" = 常に close / "never" = 残す
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_close: Option<String>,
+    },
+    /// run-interactive で起動したペインの完了状態を問い合わせる（Issue #305）。
+    /// マーカー `__TAKO_EXIT=<code>` をペイン出力から探し、見つかれば exit code を返す。
+    /// auto_close 方針に従い、完了済みペインを自動 close する
+    RunInteractiveStatus {
+        pane: u64,
+        /// true のとき完了を待たず現在の状態だけ返す（既定 false = マーカー検出まで待つ。
+        /// ただし即座に帰る実装で、AI がポーリングする想定）
+        #[serde(default)]
+        no_wait: bool,
+    },
 }
 
 impl Request {

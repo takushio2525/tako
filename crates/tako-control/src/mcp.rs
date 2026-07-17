@@ -2067,6 +2067,71 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "tako_run_interactive",
+            "description": "ユーザー入力が必要なコマンドを可視ペインに委譲する（Issue #305）。\
+                sudo パスワード・ブラウザ認証・対話プロンプト等、AI が直接入力できない操作を \
+                split -> タイトル設定 -> コマンド投入までアトミックに実行し、pane_id を返す。\
+                コマンドは exit code 回収マーカーでラップされるため、完了後に \
+                tako_run_interactive_status で exit code を回収できる。\
+                使い方: (1) run_interactive でペインを開く (2) ユーザーに入力を案内する \
+                (3) status で完了を確認する (4) auto_close に従いペインが自動 close される",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "実行するコマンド文字列（シェル経由で実行される）",
+                    },
+                    "input_hint": {
+                        "type": "string",
+                        "description": "ユーザーへの入力案内（タイトルに表示。省略時はコマンド文字列が使われる）",
+                    },
+                    "pane": pane_schema("分割の基準ペイン ID（省略時は呼び出し元。tab と排他）"),
+                    "tab": {
+                        "type": "integer", "minimum": 0,
+                        "description": "分割先タブ ID（pane と排他）",
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["right", "down", "left", "up"],
+                        "description": "新ペインが生える方向（省略時は right）",
+                    },
+                    "ratio": {
+                        "type": "number",
+                        "exclusiveMinimum": 0.0,
+                        "exclusiveMaximum": 1.0,
+                        "description": "新ペイン側の取り分（省略時は 0.3）",
+                    },
+                    "auto_close": {
+                        "type": "string",
+                        "enum": ["success", "always", "never"],
+                        "description": "完了後の自動 close 方針。success（既定）= exit 0 で close / always = 常に close / never = 残す",
+                    },
+                },
+                "required": ["command"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_run_interactive_status",
+            "description": "run-interactive で起動したペインの完了状態を確認する（Issue #305）。\
+                ペイン出力から exit code マーカーを探し、見つかれば exit code と auto_close の \
+                結果を返す。見つからなければ status: running を返す。\
+                完了検知後、auto_close 方針に従いペインを自動 close する（success: exit 0 のみ / \
+                always: 常に / never: 残す）。AI は完了まで定期的にポーリングすること。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": {
+                        "type": "integer", "minimum": 0,
+                        "description": "run-interactive が返した pane ID",
+                    },
+                },
+                "required": ["pane"],
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -2947,6 +3012,26 @@ fn build_request(
             cwd: None,
             sync_checkpoint: None,
         },
+        "tako_run_interactive" => {
+            let tab = u64_arg(args, "tab")?;
+            Request::RunInteractive {
+                pane: if tab.is_some() {
+                    None
+                } else {
+                    Some(target_pane(args, caller)?)
+                },
+                tab,
+                command: str_arg(args, "command")?.ok_or("command を指定する")?,
+                input_hint: str_arg(args, "input_hint")?,
+                direction: direction_arg(args)?,
+                ratio: f32_arg(args, "ratio")?,
+                auto_close: str_arg(args, "auto_close")?,
+            }
+        }
+        "tako_run_interactive_status" => Request::RunInteractiveStatus {
+            pane: required_u64(args, "pane")?,
+            no_wait: false,
+        },
         _ => return Err(format!("不明なツール: {name}")),
     })
 }
@@ -3636,7 +3721,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 92);
+        assert_eq!(tools.len(), 94);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

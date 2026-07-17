@@ -2598,6 +2598,146 @@ fn dispatch_inner(
                 "不明な action: {other:?}（set / show / record_results のいずれか）"
             ))),
         },
+
+        Request::RunInteractive {
+            pane,
+            tab,
+            command,
+            input_hint,
+            direction,
+            ratio,
+            auto_close,
+        } => {
+            let ac = auto_close.as_deref().unwrap_or("success");
+            if !matches!(ac, "success" | "always" | "never") {
+                return Err(DispatchError::InvalidParams(format!(
+                    "auto_close は success / always / never のいずれか（指定: {ac:?}）"
+                )));
+            }
+
+            let (tab_id, target) = if let Some(tab_raw) = tab {
+                let tid = find_tab(host.workspace(), tab_raw)?;
+                let focused = host
+                    .workspace()
+                    .get_tab(tid)
+                    .expect("find_tab で存在確認済み")
+                    .tree()
+                    .focused();
+                (tid, focused)
+            } else {
+                resolve_pane(host.workspace(), pane)?
+            };
+
+            let new_pane = Pane::new(origin);
+            let new_id = new_pane.id();
+            let new_id_u64 = new_id.as_u64();
+
+            tree_mut(host.workspace_mut(), tab_id)
+                .split_with_ratio(
+                    target,
+                    direction.unwrap_or(Direction::Right).to_core(),
+                    ratio.unwrap_or(0.3),
+                    new_pane,
+                )
+                .map_err(op_err)?;
+
+            let cwd = host
+                .session(target)
+                .and_then(|s| s.cwd())
+                .filter(|p| p.is_dir())
+                .map(|p| p.to_path_buf());
+
+            host.attach_session(
+                new_id,
+                SpawnOptions {
+                    command: None,
+                    cwd,
+                    env: Vec::new(),
+                },
+            );
+
+            // フォーカスを新ペインに移す（ユーザーが入力するため）
+            let _ = tree_mut(host.workspace_mut(), tab_id).focus(new_id);
+
+            // タイトルとメタデータを設定
+            let hint = input_hint.as_deref().unwrap_or(&command);
+            if let Some(p) = host
+                .workspace_mut()
+                .get_tab_mut(tab_id)
+                .and_then(|t| t.tree_mut().get_mut(new_id))
+            {
+                p.set_title(Some(format!("(!) {hint}")));
+                p.set_interactive_meta(ac.to_string(), command.clone());
+            }
+
+            // exit code 回収マーカーつきでコマンドを投入（queue_write で遅延書き込み）
+            let wrapped = format!("{command}; echo \"__TAKO_EXIT=$?\"");
+            let mut cmd_bytes = wrapped.into_bytes();
+            cmd_bytes.push(b'\r');
+            host.queue_write(new_id, cmd_bytes);
+
+            Ok(json!({
+                "pane": new_id_u64,
+                "status": "running",
+                "auto_close": ac,
+            }))
+        }
+
+        Request::RunInteractiveStatus { pane, no_wait: _ } => {
+            let (tab_id, target) = resolve_pane(host.workspace(), Some(pane))?;
+
+            // ペインの画面からマーカーを探す
+            let lines = host
+                .session(target)
+                .map(|s| s.visible_lines())
+                .unwrap_or_default();
+
+            let exit_code = lines.iter().rev().find_map(|line| {
+                let trimmed = line.trim();
+                trimmed
+                    .strip_prefix("__TAKO_EXIT=")
+                    .and_then(|s| s.parse::<i32>().ok())
+            });
+
+            let meta = host
+                .workspace()
+                .get_tab(tab_id)
+                .and_then(|t| t.tree().get(target))
+                .and_then(|p| p.interactive_meta())
+                .cloned();
+
+            match exit_code {
+                Some(code) => {
+                    let should_close = match meta.as_ref().map(|(ac, _)| ac.as_str()) {
+                        Some("always") => true,
+                        Some("success") => code == 0,
+                        _ => false,
+                    };
+                    let cmd = meta.map(|(_, c)| c).unwrap_or_default();
+
+                    if should_close {
+                        let _ = tree_mut(host.workspace_mut(), tab_id).close(target);
+                        host.detach_session(target);
+                    }
+
+                    Ok(json!({
+                        "pane": pane,
+                        "status": "exited",
+                        "exit_code": code,
+                        "command": cmd,
+                        "closed": should_close,
+                    }))
+                }
+                None => {
+                    let cmd = meta.map(|(_, c)| c).unwrap_or_default();
+                    Ok(json!({
+                        "pane": pane,
+                        "status": "running",
+                        "command": cmd,
+                    }))
+                }
+            }
+        }
     }
 }
 
@@ -8341,5 +8481,101 @@ mod tests {
         if std::path::Path::new(STABLE_APP_BINARY).is_file() {
             assert_eq!(resolve_tako_binary(), STABLE_APP_BINARY);
         }
+    }
+
+    #[test]
+    fn run_interactiveはsplitとtitleとmetaを設定する() {
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::RunInteractive {
+                pane: Some(root.as_u64()),
+                tab: None,
+                command: "sudo systemctl start foo".into(),
+                input_hint: Some("sudo パスワード".into()),
+                direction: None,
+                ratio: None,
+                auto_close: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+
+        let pane_id = result["pane"].as_u64().unwrap();
+        assert_eq!(result["status"], "running");
+        assert_eq!(result["auto_close"], "success");
+
+        // 新ペインが生成された
+        assert!(host.attached.contains(&pane_id));
+
+        // タイトルにヒントが設定された
+        let new_pane_id = PaneId::from_raw(pane_id);
+        let pane = host
+            .ws
+            .active_tab()
+            .tree()
+            .get(new_pane_id)
+            .expect("新ペインが存在する");
+        assert_eq!(pane.title(), Some("(!) sudo パスワード"));
+
+        // interactive_meta が設定された
+        let (ac, cmd) = pane.interactive_meta().expect("interactive_meta がある");
+        assert_eq!(ac, "success");
+        assert_eq!(cmd, "sudo systemctl start foo");
+    }
+
+    #[test]
+    fn run_interactive_statusはrunningを返す_session未接続時() {
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::RunInteractive {
+                pane: Some(root.as_u64()),
+                tab: None,
+                command: "read -p 'input: ' val".into(),
+                input_hint: None,
+                direction: Some(Direction::Down),
+                ratio: Some(0.4),
+                auto_close: Some("never".into()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let pane_id = result["pane"].as_u64().unwrap();
+
+        // session() が None のため、status は running（マーカー未検出）
+        let status = dispatch(
+            &mut host,
+            Request::RunInteractiveStatus {
+                pane: pane_id,
+                no_wait: false,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(status["status"], "running");
+        assert_eq!(status["pane"], pane_id);
+    }
+
+    #[test]
+    fn run_interactiveのauto_close不正値はエラー() {
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::RunInteractive {
+                pane: Some(root.as_u64()),
+                tab: None,
+                command: "echo hi".into(),
+                input_hint: None,
+                direction: None,
+                ratio: None,
+                auto_close: Some("invalid".into()),
+            },
+            PaneOrigin::Mcp,
+        );
+        assert!(result.is_err());
     }
 }
