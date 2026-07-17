@@ -1,4 +1,4 @@
-//! スリープ防止機能（Issue #173 + #218 蓋閉じ対応）
+//! スリープ防止機能（Issue #173 + #218 蓋閉じ対応 + #311 ディスプレイ消灯）
 //!
 //! IOKit の電源アサーション（PreventUserIdleSystemSleep）で macOS のアイドルスリープを防止する。
 //! ディスプレイスリープは妨げない。App Nap 無効化も行い、バックグラウンドで間引かれない。
@@ -7,6 +7,11 @@
 //! - 蓋の開閉を IORegistry AppleClamshellState で検知（root 不要）
 //! - NSProcessInfo.thermalState で thermal 状態を監視（serious/critical で警告）
 //! - sudoers.d 限定登録で pmset disablesleep を NOPASSWD 制御（opt-in）
+//!
+//! ディスプレイ消灯（#311）:
+//! - disablesleep=1 は蓋閉じスリープだけでなくディスプレイ消灯も阻害する
+//! - 蓋閉じ + disablesleep 有効を検知したら pmset displaysleepnow でディスプレイだけ消灯
+//! - 蓋が閉じている間はユーザー入力がないため消灯を維持
 //!
 //! モード:
 //! - off: 機能無効
@@ -156,6 +161,8 @@ pub struct SleepGuardState {
     pub sudoers_installed: bool,
     /// thermal 状態（#218）
     pub thermal_state: ThermalState,
+    /// ディスプレイ消灯を強制送信済みか（#311）
+    pub display_sleep_forced: bool,
 }
 
 impl SleepGuardState {
@@ -172,6 +179,7 @@ impl SleepGuardState {
             "lid_sleep_mode": self.lid_sleep_mode.as_str(),
             "sudoers_installed": self.sudoers_installed,
             "thermal_state": self.thermal_state.as_str(),
+            "display_sleep_forced": self.display_sleep_forced,
             "description": self.description(),
         })
     }
@@ -204,6 +212,8 @@ impl SleepGuardState {
         let lid_desc = if self.lid_sleep_disabled {
             if self.thermal_state.is_warning() {
                 "蓋閉じ継続: 有効（高温警告中）"
+            } else if self.display_sleep_forced {
+                "蓋閉じ継続: 有効（ディスプレイ消灯済み）"
             } else {
                 "蓋閉じ継続: 有効"
             }
@@ -284,6 +294,9 @@ mod iokit {
 
     static ASSERTION_ID: AtomicU32 = AtomicU32::new(0);
     static ASSERTION_HELD: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    // #311: 蓋閉じ中にディスプレイ消灯コマンドを送信済みか
+    static DISPLAY_SLEEP_SENT: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
     fn cf_string(s: &str) -> CFStringRef {
@@ -448,6 +461,28 @@ mod iokit {
                 ])
                 .output();
         });
+    }
+
+    /// ディスプレイだけをスリープさせる（#311）。
+    /// disablesleep=1 の蓋閉じ時に呼ぶ。root 不要。蓋閉じ中はユーザー入力が
+    /// ないため、一度送ればディスプレイは消灯を維持する。
+    /// 蓋閉じ→蓋開け 1 サイクルにつき 1 回だけ呼ぶ（DISPLAY_SLEEP_SENT で制御）
+    pub fn force_display_sleep() {
+        if DISPLAY_SLEEP_SENT.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let _ = std::process::Command::new("pmset")
+            .arg("displaysleepnow")
+            .output();
+        DISPLAY_SLEEP_SENT.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn display_sleep_sent() -> bool {
+        DISPLAY_SLEEP_SENT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn reset_display_sleep_sent() {
+        DISPLAY_SLEEP_SENT.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -626,6 +661,7 @@ pub fn update(
             lid_sleep_mode: LidSleepMode::Off,
             sudoers_installed: false,
             thermal_state: ThermalState::Nominal,
+            display_sleep_forced: false,
         };
     }
     #[cfg(target_os = "macos")]
@@ -673,6 +709,16 @@ pub fn update(
 
         let lid_sleep_disabled = iokit::sleep_disabled();
 
+        // --- ディスプレイ消灯（#311） ---
+        // disablesleep=1 は蓋閉じ時のディスプレイ消灯も阻害するため、
+        // 蓋閉じ + disablesleep 有効の組み合わせで明示的にディスプレイだけ消す
+        if lid_closed && lid_sleep_disabled {
+            iokit::force_display_sleep();
+        }
+        if !lid_closed || !lid_sleep_disabled {
+            iokit::reset_display_sleep_sent();
+        }
+
         SleepGuardState {
             assertion_held: iokit::is_held(),
             mode,
@@ -685,6 +731,7 @@ pub fn update(
             lid_sleep_mode,
             sudoers_installed: sudoers,
             thermal_state: thermal,
+            display_sleep_forced: iokit::display_sleep_sent(),
         }
     }
 }
@@ -710,6 +757,7 @@ pub fn status(
             lid_sleep_mode: LidSleepMode::Off,
             sudoers_installed: false,
             thermal_state: ThermalState::Nominal,
+            display_sleep_forced: false,
         };
     }
     #[cfg(target_os = "macos")]
@@ -726,6 +774,7 @@ pub fn status(
             lid_sleep_mode,
             sudoers_installed: is_sudoers_installed(),
             thermal_state: iokit::thermal_state(),
+            display_sleep_forced: iokit::display_sleep_sent(),
         }
     }
 }
@@ -851,6 +900,7 @@ mod tests {
             lid_sleep_mode: LidSleepMode::Off,
             sudoers_installed: false,
             thermal_state: ThermalState::Nominal,
+            display_sleep_forced: false,
         };
         let json = state.to_json();
         assert!(json.get("assertion_held").is_some());
@@ -864,6 +914,7 @@ mod tests {
         assert!(json.get("lid_sleep_mode").is_some());
         assert!(json.get("sudoers_installed").is_some());
         assert!(json.get("thermal_state").is_some());
+        assert!(json.get("display_sleep_forced").is_some());
         assert!(json.get("description").is_some());
     }
 
@@ -913,6 +964,7 @@ mod tests {
             lid_sleep_mode: LidSleepMode::Off,
             sudoers_installed: false,
             thermal_state: ThermalState::Nominal,
+            display_sleep_forced: false,
         };
         assert!(state.description().contains("無効"));
     }
@@ -931,6 +983,7 @@ mod tests {
             lid_sleep_mode: LidSleepMode::WhileAgentsRunning,
             sudoers_installed: true,
             thermal_state: ThermalState::Nominal,
+            display_sleep_forced: false,
         };
         assert!(state.description().contains("蓋閉じ継続: 有効"));
     }
@@ -949,6 +1002,7 @@ mod tests {
             lid_sleep_mode: LidSleepMode::WhileAgentsRunning,
             sudoers_installed: true,
             thermal_state: ThermalState::Serious,
+            display_sleep_forced: false,
         };
         assert!(state.description().contains("高温警告中"));
     }
@@ -967,6 +1021,7 @@ mod tests {
             lid_sleep_mode: LidSleepMode::WhileAgentsRunning,
             sudoers_installed: false,
             thermal_state: ThermalState::Nominal,
+            display_sleep_forced: false,
         };
         assert!(state.description().contains("sudoers 未登録"));
     }
@@ -985,6 +1040,7 @@ mod tests {
             lid_sleep_mode: LidSleepMode::Off,
             sudoers_installed: false,
             thermal_state: ThermalState::Nominal,
+            display_sleep_forced: false,
         };
         assert!(state.description().contains("AC 未接続"));
     }
@@ -1003,8 +1059,29 @@ mod tests {
             lid_sleep_mode: LidSleepMode::Off,
             sudoers_installed: false,
             thermal_state: ThermalState::Nominal,
+            display_sleep_forced: false,
         };
         assert!(state.description().contains("macOS 以外"));
+    }
+
+    #[test]
+    fn description_display_sleep_forced() {
+        let state = SleepGuardState {
+            assertion_held: true,
+            mode: SleepGuardMode::WhileAgentsRunning,
+            power_condition: PowerCondition::AcOnly,
+            on_ac_power: true,
+            busy_agents: 1,
+            platform_supported: true,
+            lid_closed: true,
+            lid_sleep_disabled: true,
+            lid_sleep_mode: LidSleepMode::WhileAgentsRunning,
+            sudoers_installed: true,
+            thermal_state: ThermalState::Nominal,
+            display_sleep_forced: true,
+        };
+        assert!(state.description().contains("蓋閉じ継続: 有効"));
+        assert!(state.description().contains("ディスプレイ消灯済み"));
     }
 
     #[cfg(target_os = "macos")]

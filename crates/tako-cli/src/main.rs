@@ -2780,6 +2780,9 @@ fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
                 }
             );
             eprintln!("  thermal: {}", state.thermal_state.as_str());
+            if state.display_sleep_forced {
+                eprintln!("  ディスプレイ: 消灯済み（蓋閉じ中）");
+            }
             println!(
                 "{}",
                 serde_json::to_string_pretty(&state.to_json()).unwrap()
