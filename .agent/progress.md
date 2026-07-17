@@ -798,3 +798,8 @@
 - タブバードラッグ移動（`start_window_move`）+ ダブルクリックズーム + 赤ボタン close 後の Dock 復帰（`on_reopen` + `on_window_should_close`）
 - 関連コミット: PR #318 squash merge（`9cd2535`）。worktree 掃除・Issue 証拠コメント済み
 - 次: ユーザー目視確認（ドラッグ移動・Dock 復帰・既存操作との競合なし）→ #312 クローズ
+
+## 2026-07-17（#315: PDF プレビューのリンク ⌘クリック無反応を根治）
+- 根因 = estimate_pdf_page_bounds がテキストなしページで None → ヒットテスト常時失敗。canvas paint でページ画像 bounds を直接記録する方式に変更 + 全描画ページチェック + ホバー全ペイン化 + カーソル変化 + 下線ハイライト
+- 関連コミット: PR #323 squash merge（`9373003`）。worktree 掃除・Issue 証拠コメント済み
+- 次: `build-app.sh --install` → ユーザー目視確認 → #315 クローズ
