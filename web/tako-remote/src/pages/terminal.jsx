@@ -142,7 +142,7 @@ export function TerminalPage({ paneId, me }) {
 
   const agentType = info?.agent_type || 'plain';
   const color = agentColor(agentType);
-  const hasChatSupport = agentType === 'claude' && info?.session_id;
+  const hasChatSupport = !!info?.session_id && (agentType === 'claude' || agentType === 'codex' || agentType === 'agy');
 
   // chat が使えなければ自動で term に
   useEffect(() => {
