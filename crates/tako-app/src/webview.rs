@@ -69,6 +69,17 @@ pub struct WebShared {
     pub loading: bool,
     /// evaluate_script_with_callback の結果置き場（token → 結果 JSON 文字列）
     pub eval_results: HashMap<u64, String>,
+    /// ナビゲーション失敗時のエラーメッセージ（None = 正常）
+    pub error: Option<String>,
+    /// 読み込みに失敗した URL（リトライ用に保持）
+    pub failed_url: Option<String>,
+    /// ナビゲーション開始時刻（タイムアウト検知用）
+    pub nav_started_at: Option<std::time::Instant>,
+    /// wry の didCommitNavigation（PageLoadEvent::Started）が発火したか。
+    /// DNS 失敗等では発火しないため、タイムアウトと組み合わせて失敗を検知する
+    pub nav_committed: bool,
+    /// ナビゲーション先の URL（poll_state の JS 評価で url が上書きされるため別途保持）
+    pub nav_target_url: Option<String>,
 }
 
 /// タイトル・URL の変化を Rust 側へ通知する初期化スクリプト。
@@ -129,8 +140,19 @@ impl WebViewEntry {
         url: &str,
     ) -> Result<Self, String> {
         validate_url(url)?;
+        let track_nav = should_track_nav(url);
         let shared = Arc::new(Mutex::new(WebShared {
             url: url.to_string(),
+            nav_started_at: if track_nav {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            },
+            nav_target_url: if track_nav {
+                Some(url.to_string())
+            } else {
+                None
+            },
             ..Default::default()
         }));
         let ipc_shared = Arc::clone(&shared);
@@ -162,10 +184,18 @@ impl WebViewEntry {
                         wry::PageLoadEvent::Started => {
                             s.loading = true;
                             s.url = url;
+                            s.nav_committed = true;
+                            s.nav_target_url = None;
+                            s.error = None;
+                            s.failed_url = None;
                         }
                         wry::PageLoadEvent::Finished => {
                             s.loading = false;
                             s.url = url;
+                            s.nav_started_at = None;
+                            s.nav_target_url = None;
+                            s.error = None;
+                            s.failed_url = None;
                         }
                     }
                 }
@@ -254,13 +284,30 @@ impl WebViewEntry {
                 .view
                 .evaluate_script("history.forward();")
                 .map_err(|e| format!("forward 失敗: {e}")),
-            "reload" => self.view.reload().map_err(|e| format!("reload 失敗: {e}")),
+            "reload" => {
+                // エラー状態なら失敗した URL をリトライ
+                if let Ok(s) = self.shared.lock() {
+                    if let Some(url) = s.failed_url.clone() {
+                        drop(s);
+                        return self.navigate(&url);
+                    }
+                }
+                self.view.reload().map_err(|e| format!("reload 失敗: {e}"))
+            }
             url => {
                 let url = normalize_url(url);
                 validate_url(&url)?;
+                let track = should_track_nav(&url);
                 if let Ok(mut s) = self.shared.lock() {
                     s.url = url.clone();
                     s.loading = true;
+                    s.error = None;
+                    s.failed_url = None;
+                    s.nav_committed = false;
+                    if track {
+                        s.nav_started_at = Some(std::time::Instant::now());
+                        s.nav_target_url = Some(url.clone());
+                    }
                 }
                 self.view
                     .load_url(&url)
@@ -314,6 +361,48 @@ impl WebViewEntry {
     /// ページ読み込み中か
     pub fn is_loading(&self) -> bool {
         self.shared.lock().map(|s| s.loading).unwrap_or(false)
+    }
+
+    /// エラー状態を返す（None = 正常）
+    pub fn error_state(&self) -> Option<(String, String)> {
+        let s = self.shared.lock().ok()?;
+        let error = s.error.as_ref()?.clone();
+        let url = s.failed_url.as_ref().cloned().unwrap_or_default();
+        Some((error, url))
+    }
+
+    /// ナビゲーションのタイムアウトを検査する。
+    /// wry は WKWebView の didFailProvisionalNavigation: を公開しないため、
+    /// 「Started（didCommitNavigation）が一定時間来ない」ことで失敗を推定する。
+    /// 状態が変わった（エラー検知した）場合に true を返す
+    pub fn check_nav_timeout(&self) -> bool {
+        if let Ok(mut s) = self.shared.lock() {
+            if s.error.is_some() {
+                return false;
+            }
+            if let Some(started) = s.nav_started_at {
+                let elapsed = started.elapsed();
+                if !s.nav_committed && elapsed > std::time::Duration::from_secs(NAV_TIMEOUT_SECS) {
+                    let target = s.nav_target_url.clone().unwrap_or_else(|| s.url.clone());
+                    s.error = Some("ページの読み込みに失敗しました".to_string());
+                    s.failed_url = Some(target);
+                    s.loading = false;
+                    s.nav_started_at = None;
+                    s.nav_target_url = None;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// エラー状態をクリアして失敗した URL を再読み込みする
+    pub fn retry(&self) -> Result<(), String> {
+        let url = {
+            let s = self.shared.lock().map_err(|_| "lock error".to_string())?;
+            s.failed_url.clone().unwrap_or_else(|| s.url.clone())
+        };
+        self.navigate(&url)
     }
 }
 
@@ -525,6 +614,15 @@ pub fn set_has_webview(v: bool) {
     key_monitor::set_has_webview(v);
 }
 
+/// ナビゲーションのタイムアウト秒数。
+/// DNS 失敗（macOS 既定: 約 5〜10 秒）+ マージンを見込んだ値
+const NAV_TIMEOUT_SECS: u64 = 10;
+
+/// タイムアウト追跡が必要な URL か。data: / about: は即座に読み込まれるため不要
+fn should_track_nav(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://")
+}
+
 /// スキーム無しの入力を URL に正規化する（アドレスバー入力・CLI の省略記法）。
 /// ドットも空白も無い単語はそのまま https 扱いにせず検索はしない（ローカル開発が主用途）
 pub fn normalize_url(input: &str) -> String {
@@ -634,5 +732,23 @@ mod tests {
     fn validate_url_はタブや改行を拒否する() {
         assert!(validate_url("https://example.com/\there").is_err());
         assert!(validate_url("https://example.com/\nhere").is_err());
+    }
+
+    #[test]
+    fn should_track_nav_はリモート_url_のみ追跡する() {
+        assert!(should_track_nav("https://example.com"));
+        assert!(should_track_nav("http://localhost:3000"));
+        assert!(should_track_nav("file:///tmp/test.html"));
+        assert!(!should_track_nav("data:text/html,hello"));
+        assert!(!should_track_nav("about:blank"));
+    }
+
+    #[test]
+    fn web_shared_のデフォルトはエラーなし() {
+        let s = WebShared::default();
+        assert!(s.error.is_none());
+        assert!(s.failed_url.is_none());
+        assert!(!s.nav_committed);
+        assert!(s.nav_started_at.is_none());
     }
 }

@@ -8615,18 +8615,23 @@ impl TakoApp {
         let url = self.webviews[idx].current_url();
         let title = self.webviews[idx].current_title();
         let loading = self.webviews[idx].is_loading();
+        let error_state = self.webviews[idx].error_state();
 
         // 本文領域 = pane_text_areas と同じ絶対座標（タイトルバー・枠・パディングの内側）。
         // GPUI の Pixels は論理座標なので wry の Logical bounds へそのまま渡せる。
         // 実描画はネイティブ webview 自身が行い、GPUI 側は枠とタイトルバーだけを描く
         self.webview_marks.insert(id);
-        let bounds = (
-            f64::from(f32::from(area.origin.x)),
-            f64::from(f32::from(area.origin.y)),
-            f64::from(f32::from(area.size.width)),
-            f64::from(f32::from(area.size.height)),
-        );
-        self.webviews[idx].sync_frame(Some(bounds));
+        if error_state.is_none() {
+            let bounds = (
+                f64::from(f32::from(area.origin.x)),
+                f64::from(f32::from(area.origin.y)),
+                f64::from(f32::from(area.size.width)),
+                f64::from(f32::from(area.size.height)),
+            );
+            self.webviews[idx].sync_frame(Some(bounds));
+        } else {
+            self.webviews[idx].sync_frame(None);
+        }
 
         let display_title = if title.trim().is_empty() {
             url.clone()
@@ -8669,7 +8674,11 @@ impl TakoApp {
                 }))
                 .child(icon)
         };
-        let body = div().flex_1().bg(rgba(theme.background));
+        let body = if let Some((error_msg, failed_url)) = &error_state {
+            self.render_webview_error_overlay(pane_id, error_msg, failed_url, &theme, cx)
+        } else {
+            div().flex_1().bg(rgba(theme.background))
+        };
 
         div()
             .id(("pane", pane_id.as_u64()))
@@ -8796,7 +8805,17 @@ impl TakoApp {
                     )
                     .child(nav_button("←", "back", cx))
                     .child(nav_button("→", "forward", cx))
-                    .child(nav_button(if loading { "…" } else { "⟳" }, "reload", cx))
+                    .child(nav_button(
+                        if error_state.is_some() {
+                            "!"
+                        } else if loading {
+                            "…"
+                        } else {
+                            "⟳"
+                        },
+                        "reload",
+                        cx,
+                    ))
                     .child(
                         div()
                             .text_color(if focused {
@@ -8828,6 +8847,83 @@ impl TakoApp {
                     ),
             )
             .child(body)
+    }
+
+    /// Web ビューのエラーオーバーレイ（#327）。ネイティブ webview を隠し、GPUI で
+    /// エラーメッセージ + 再読み込みボタンを描画する
+    fn render_webview_error_overlay(
+        &self,
+        pane_id: PaneId,
+        error_msg: &str,
+        failed_url: &str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let error_msg = SharedString::from(error_msg.to_string());
+        let url_display = SharedString::from(truncate(failed_url, 60));
+        div()
+            .flex_1()
+            .bg(rgba(theme.background))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .max_w(px(380.0))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(
+                        svg()
+                            .path(crate::file_icons::ui_icon::GLOBE)
+                            .w(px(32.0))
+                            .h(px(32.0))
+                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.4)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(hsla(theme.foreground))
+                            .child(error_msg),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.7))
+                            .overflow_hidden()
+                            .child(url_display),
+                    )
+                    .child(
+                        div()
+                            .id(("web-retry", pane_id.as_u64()))
+                            .mt(px(4.0))
+                            .px(px(16.0))
+                            .py(px(6.0))
+                            .rounded(px(6.0))
+                            .bg(rgba_alpha(theme.accent, 0.15))
+                            .text_size(px(12.0))
+                            .text_color(hsla(theme.accent))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(rgba_alpha(theme.accent, 0.25)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if let Some(e) =
+                                    this.webviews.iter().find(|e| e.pane == Some(pane_id))
+                                {
+                                    let _ = e.retry();
+                                }
+                                cx.notify();
+                            }))
+                            .child("再読み込み"),
+                    ),
+            )
     }
 
     /// Web ビューペインの × = ページごと完全破棄（ブラウザのタブ × と同じ）。
@@ -8879,6 +8975,7 @@ impl TakoApp {
         for e in &self.webviews {
             if e.pane.is_some() {
                 e.poll_state();
+                e.check_nav_timeout();
             }
         }
     }
@@ -11444,12 +11541,15 @@ impl WebViewHost for TakoApp {
             self.webviews
                 .iter()
                 .map(|e| {
+                    let err = e.error_state();
                     serde_json::json!({
                         "id": e.id.as_u64(),
                         "url": e.current_url(),
                         "title": e.current_title(),
                         "pane": e.pane.map(|p| p.as_u64()),
                         "loading": e.is_loading(),
+                        "error": err.as_ref().map(|(msg, _)| msg.as_str()),
+                        "failed_url": err.as_ref().map(|(_, url)| url.as_str()),
                     })
                 })
                 .collect(),
@@ -11543,12 +11643,15 @@ impl WebViewHost for TakoApp {
             .iter()
             .find(|e| e.id.as_u64() == id)
             .ok_or(format!("Web ビュー {id} が見つからない"))?;
+        let err = e.error_state();
         Ok(serde_json::json!({
             "id": id,
             "url": e.current_url(),
             "title": e.current_title(),
             "loading": e.is_loading(),
             "pane": e.pane.map(|p| p.as_u64()),
+            "error": err.as_ref().map(|(msg, _)| msg.as_str()),
+            "failed_url": err.as_ref().map(|(_, url)| url.as_str()),
         }))
     }
 }
