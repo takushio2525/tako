@@ -92,6 +92,22 @@ const RESIZE_STEP: f32 = 0.05;
 /// ペイン境界のドラッグ判定/カーソル変更の当たり幅（px。仕切り線を中心に左右各 BORDER_HANDLE/2）
 const BORDER_HANDLE: f32 = 8.0;
 
+/// ドラッグ選択自動スクロール: ペイン上下端からこの範囲内でスクロールを開始する（px）
+const DRAG_SCROLL_MARGIN: f32 = 40.0;
+/// ドラッグ選択自動スクロールのタイマー間隔（ms）
+const DRAG_SCROLL_INTERVAL_MS: u64 = 30;
+/// ドラッグ選択自動スクロールの最小速度（行/秒）
+const DRAG_SCROLL_MIN_SPEED: f32 = 2.0;
+/// ドラッグ選択自動スクロールの最大速度（行/秒）
+const DRAG_SCROLL_MAX_SPEED: f32 = 30.0;
+
+/// 速度係数（0.0..1.0）を 1 ティック分のスクロール行数（正）に変換する
+fn drag_scroll_delta(factor_abs: f32) -> f32 {
+    let speed =
+        DRAG_SCROLL_MIN_SPEED + (DRAG_SCROLL_MAX_SPEED - DRAG_SCROLL_MIN_SPEED) * factor_abs;
+    speed * (DRAG_SCROLL_INTERVAL_MS as f32 / 1000.0)
+}
+
 /// スクロールバーの当たり領域の幅（px。サムはこの内側に描く）
 const SCROLLBAR_WIDTH: f32 = 10.0;
 /// スクロールバーの表示維持時間とフェード時間（iTerm2 流の出し方。FR-2.5.13）
@@ -579,6 +595,13 @@ fn byte_to_utf16_offset(text: &str, byte_offset: usize) -> usize {
     text[..offset].chars().map(char::len_utf16).sum()
 }
 
+/// ドラッグ選択中の自動スクロール状態（#310）
+struct DragScrollState {
+    pane: PaneId,
+    /// 正 = 過去方向（上）、負 = 未来方向（下）。絶対値が速度係数（0.0..1.0）
+    speed_factor: f32,
+}
+
 struct TakoApp {
     workspace: Workspace,
     terminals: HashMap<PaneId, TerminalSession>,
@@ -592,6 +615,8 @@ struct TakoApp {
     pane_cell_sizes: HashMap<PaneId, Size<Pixels>>,
     /// マウス選択中のペイン
     selecting: Option<PaneId>,
+    /// ドラッグ選択自動スクロールの状態（上下端到達時のスクロール方向。タイマー稼働中）
+    drag_scroll: Option<DragScrollState>,
     /// 直近 render でのアクティブタブ各ペインのテキスト領域（マウス座標→セル変換用）
     pane_text_areas: Vec<(PaneId, Bounds<Pixels>)>,
     /// Layer 1 IPC サーバー（FR-2.2 の受け口。起動失敗時は None で IPC なし動作）
@@ -1662,6 +1687,7 @@ impl TakoApp {
             pane_font_sizes: HashMap::new(),
             pane_cell_sizes: HashMap::new(),
             selecting: None,
+            drag_scroll: None,
             pane_text_areas: Vec::new(),
             ipc,
             mcp,
@@ -7120,6 +7146,7 @@ impl TakoApp {
             if self.dragging_border.take().is_some()
                 | self.dragging_scrollbar.take().is_some()
                 | self.selecting.take().is_some()
+                | self.drag_scroll.take().is_some()
                 | self.preview_selecting.take().is_some()
                 | self.dragging_pin.take().is_some()
                 | std::mem::take(&mut self.dragging_panel)
@@ -7206,6 +7233,110 @@ impl TakoApp {
                 cx.notify();
             }
         }
+        // ドラッグ選択中のオートスクロール判定（#310）
+        self.update_drag_scroll(pane_id, event.position, cx);
+    }
+
+    /// ドラッグ選択中のオートスクロール状態を更新する（#310）。
+    /// マウスがペイン上下端の DRAG_SCROLL_MARGIN 範囲内ならスクロール開始、
+    /// 範囲外に戻ったら停止する
+    fn update_drag_scroll(
+        &mut self,
+        pane_id: PaneId,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        // alt_screen（全画面 TUI）ではスクロールバックがないため自動スクロールしない
+        if let Some(session) = self.terminals.get(&pane_id) {
+            if session.is_alt_screen() {
+                self.drag_scroll = None;
+                return;
+            }
+        }
+        let Some((_, area)) = self.pane_text_areas.iter().find(|(id, _)| *id == pane_id) else {
+            return;
+        };
+        let area = *area;
+        let y = f32::from(position.y);
+        let top = f32::from(area.origin.y);
+        let bottom = top + f32::from(area.size.height);
+
+        let speed_factor = if y < top + DRAG_SCROLL_MARGIN {
+            // 上端に近い → 過去方向（正）へスクロール
+            let dist = (top + DRAG_SCROLL_MARGIN - y).min(DRAG_SCROLL_MARGIN);
+            dist / DRAG_SCROLL_MARGIN
+        } else if y > bottom - DRAG_SCROLL_MARGIN {
+            // 下端に近い → 未来方向（負）へスクロール
+            let dist = (y - (bottom - DRAG_SCROLL_MARGIN)).min(DRAG_SCROLL_MARGIN);
+            -(dist / DRAG_SCROLL_MARGIN)
+        } else {
+            0.0
+        };
+
+        if speed_factor == 0.0 {
+            self.drag_scroll = None;
+            return;
+        }
+
+        let was_none = self.drag_scroll.is_none();
+        self.drag_scroll = Some(DragScrollState {
+            pane: pane_id,
+            speed_factor,
+        });
+        if was_none {
+            self.start_drag_scroll_timer(cx);
+        }
+    }
+
+    /// ドラッグ選択オートスクロールのタイマーを起動する
+    fn start_drag_scroll_timer(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(DRAG_SCROLL_INTERVAL_MS))
+                .await;
+            let should_continue = this
+                .update(cx, |this, cx| this.tick_drag_scroll(cx))
+                .unwrap_or(false);
+            if !should_continue {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// ドラッグ選択オートスクロールの 1 ティック分を処理する
+    fn tick_drag_scroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(state) = &self.drag_scroll else {
+            return false;
+        };
+        if self.selecting != Some(state.pane) {
+            self.drag_scroll = None;
+            return false;
+        }
+        let pane_id = state.pane;
+        let factor = state.speed_factor;
+        let delta_rows = drag_scroll_delta(factor.abs());
+
+        let session = match self.terminals.get(&pane_id) {
+            Some(s) => s,
+            None => {
+                self.drag_scroll = None;
+                return false;
+            }
+        };
+        let (cols, rows) = session.size();
+
+        if factor > 0.0 {
+            // 過去方向（上）
+            session.scroll_display(delta_rows.ceil() as i32);
+            session.extend_selection(0, 0, false);
+        } else {
+            // 未来方向（下）
+            session.scroll_display(-(delta_rows.ceil() as i32));
+            session.extend_selection(cols.saturating_sub(1), rows.saturating_sub(1), true);
+        }
+        cx.notify();
+        true
     }
 
     /// cmd+ホバー時のリンク検出更新
@@ -7322,6 +7453,7 @@ impl TakoApp {
             return;
         }
         self.preview_selecting = None;
+        self.drag_scroll = None;
         if let Some(pane_id) = self.selecting.take() {
             // iTerm2 流の copy-on-select
             if let Some(text) = self
@@ -20142,5 +20274,44 @@ mod menu_position_tests {
         let (x, y) = compute_menu_position(50.0, 30.0, 180.0, 250.0, 100.0, 100.0);
         assert_eq!(x, 0.0);
         assert_eq!(y, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod drag_scroll_tests {
+    use super::*;
+
+    #[test]
+    fn 最小速度係数では最小速度になる() {
+        let delta = drag_scroll_delta(0.0);
+        let expected = DRAG_SCROLL_MIN_SPEED * (DRAG_SCROLL_INTERVAL_MS as f32 / 1000.0);
+        assert!((delta - expected).abs() < 0.001);
+    }
+
+    #[test]
+    fn 最大速度係数では最大速度になる() {
+        let delta = drag_scroll_delta(1.0);
+        let expected = DRAG_SCROLL_MAX_SPEED * (DRAG_SCROLL_INTERVAL_MS as f32 / 1000.0);
+        assert!((delta - expected).abs() < 0.001);
+    }
+
+    #[test]
+    fn 中間係数は最小と最大の間に収まる() {
+        let min = drag_scroll_delta(0.0);
+        let max = drag_scroll_delta(1.0);
+        let mid = drag_scroll_delta(0.5);
+        assert!(mid > min);
+        assert!(mid < max);
+    }
+
+    #[test]
+    fn 速度は単調増加する() {
+        let mut prev = drag_scroll_delta(0.0);
+        for i in 1..=10 {
+            let factor = i as f32 / 10.0;
+            let delta = drag_scroll_delta(factor);
+            assert!(delta > prev, "factor={factor}: {delta} <= {prev}");
+            prev = delta;
+        }
     }
 }
