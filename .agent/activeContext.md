@@ -4,26 +4,24 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-17・#315 修正完了）
+## 現在の対象（2026-07-17・#324 修正完了）
 
-**Issue #315: PDF プレビューのリンク ⌘クリック無反応を根治 — PR #323 squash merge 済み**
+**Issue #324: sleep-guard の busy_agents が復元 worker を数えない問題の根治 — PR #328 squash merge 済み**
 
-- canvas paint callback でページ画像 bounds を直接記録（テキストレイヤ不要）
-- estimate_pdf_page_bounds（85 行の逆算ロジック）を廃止
-- 全描画ページのリンクチェック + 全 PDF ペインのホバー検出
-- ⌘ホバーでカーソル変化（PointingHand）+ リンク下線ハイライト
+- 根因: `update_sleep_guard()` が `CommandState::Running`（OSC 133 由来）でのみカウント。persist 復元後は `Unknown` のまま遷移しないため常に 0
+- 修正: `Unknown` バックエンドセッションの子プロセスをバッチ判定し busy にカウント
+- `agents::count_sessions_with_running_children` 新設 + テスト 4 本
 
 ## 検証
 
-- cargo fmt / clippy(-D warnings) / test 全緑（849 passed）
-- PDF ヒットテスト単体テスト 2 本追加・通過
-- 隔離セルフテスト完走（PDF 関連項目全通過）
-- ユーザー目視確認待ち（Issue #315 に確認手順記載）
+- cargo build / fmt / clippy(-D warnings) / test 全緑（785 tests）
+- 新規テスト 4 本全通過
+- 実機確認待ち（build-app.sh --install → tako 再起動 → 暫定運用復帰手順は Issue #324 コメント参照）
 
 ## 次の一手
 
-- `build-app.sh --install` → tako 再起動 → ユーザー目視確認
-- #315 クローズは master 判断
+- `build-app.sh --install` → tako 再起動 → ユーザー実機確認
+- #324 クローズは master 判断
 
 ## 現フェーズで Read すべき設計書
 

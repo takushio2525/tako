@@ -803,3 +803,13 @@
 - 根因 = estimate_pdf_page_bounds がテキストなしページで None → ヒットテスト常時失敗。canvas paint でページ画像 bounds を直接記録する方式に変更 + 全描画ページチェック + ホバー全ペイン化 + カーソル変化 + 下線ハイライト
 - 関連コミット: PR #323 squash merge（`9373003`）。worktree 掃除・Issue 証拠コメント済み
 - 次: `build-app.sh --install` → ユーザー目視確認 → #315 クローズ
+
+## 2026-07-17（アプリ内 Web ビュー品質監査 — 調査・起票のみ、コード変更なし）
+- 隔離インスタンス（TAKO_ISOLATED=1 + release）で CLI/MCP 経由に全経路検証。最重大: 空白入り等 NSURL 不能な URL を web open/nav に渡すと wry の `NSURL::URLWithString().unwrap()`（mod.rs:826）で panic → tako 全体 abort（全ペイン消失）。#325/#326/#327 起票
+- 正常確認: URL 正規化・back/forward/reload・hide/show の SPA 維持・file:// のクロスオリジン fetch ブロック・persist 復元・close 後始末・data:/IDN
+- 未検証（別スペースで GUI 操作不可）: cmd+K 等キーボード衝突・実クリック/IME/テーマ目視 → 報告書メモに記載
+
+## 2026-07-17（#324: sleep-guard の busy_agents が復元 worker を数えない問題を根治）
+- 根因 = `update_sleep_guard()` が OSC 133 の `CommandState::Running` のみカウント。persist 復元後は `Unknown` のまま遷移しないため常に 0。`Unknown` バックエンドセッションの子プロセスをバッチ判定し busy にカウントする修正
+- 関連コミット: PR #328 squash merge（`f685e27`）。worktree 掃除・Issue 証拠コメント済み
+- 次: `build-app.sh --install` → 暫定運用復帰 → ユーザー実機確認 → #324 クローズ
