@@ -3,6 +3,26 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.7] - 2026-07-19
+
+Nightly patch release (automated). Changes since v0.5.6:
+夜間パッチリリース（自動）。v0.5.6 以降の変更:
+
+- [ドキュメント] activeContext / progress を #340 監査完了で更新
+- [改善] sleep guard の busy 判定を UI スレッドから background へ移動 (#340) (#370)
+- [ドキュメント] activeContext / progress を #339 実装完了で更新
+- [機能追加] 複数ウィンドウ対応: ビューポート方式で別ウィンドウに別タブを表示 (#339) (#367)
+- [ドキュメント] activeContext / progress を #364 実装完了で更新
+- [機能追加] orchestrator report: scrollback + transcript 2 層で worker 報告を取得 (#364) (#366)
+- [ドキュメント] activeContext / progress を #338 再修正完了で更新
+- [修正] チェンジログビューの git 検出が .app 環境で全滅する問題を根治 (#338) (#365)
+- [ドキュメント] activeContext / progress を #308 再修正完了で更新
+- [ドキュメント] activeContext / progress を #312 再修正完了で更新
+- [修正] タブ D&D がウインドウ移動に食われる競合を根治 (#308) (#363)
+- [修正] 赤ボタン close → Dock 復帰でタブが空になるバグを根治 (#312) (#362)
+- [ドキュメント] activeContext / progress を #321 再修正完了で更新
+- [修正] ステータスバーのサービス切替ドロップダウンが開かない問題を根治 (#321) (#361)
+
 ## [Unreleased]
 
 - [改善] sleep guard の busy 判定を UI スレッドから background へ移動 (#340)
