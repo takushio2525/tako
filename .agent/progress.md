@@ -885,3 +885,12 @@
   history フィールド追加。隔離実測で可視画面 10 行 → scrollback 330 行を確認
 - 関連コミット: `46b925b`（PR #366 squash merge）。288 tests / セルフテスト FAILED 1（既知 #332）
 - 次: `build-app.sh --install` → 実 claude ペインでの report e2e + codex fallback 実測
+
+## 2026-07-18（#339: 複数ウィンドウ対応 — ビューポート方式）
+- 単一 TakoApp entity を全 GPUI ウィンドウの root view として共有（GPUI の entity→複数 window
+  invalidation を確認して採用）。tako-core に WorkspaceWindow/WindowId + タブ排他割当、
+  CLI `tako window` + MCP `tako_window`（101 ツール）+ persist windows[]（後方互換）
+- 検証: 品質ゲート全緑（978 tests）+ 隔離セルフテスト完走（項目 77 新設）+ 隔離実測
+  （2 窓別タブ send/read・move-tab・再起動復元・orchestrator spawn→WORKER_IDLE）
+- 関連コミット: `52bb49d`（PR #367 squash merge）。Issue に実測証拠コメント済み
+- 次: `build-app.sh --install` → 実機目視（New Window の状態同期・赤ボタン Dock 復帰）
