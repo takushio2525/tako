@@ -1461,6 +1461,28 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "tako_orchestrator_report",
+            "description": "worker の報告内容を取得する（#364）。\
+                第 1 層: tmux scrollback（capture-pane -J で折返し結合。全 agent 共通）。\
+                第 2 層: 構造化ソース（claude の transcript JSONL。ペイン幅非依存の全文品質）。\
+                transcript が利用可能なら source=transcript で全文テキストを返し、scrollback_text に \
+                スクロールバック版も併記する。利用不可（codex / agy 等）なら source=scrollback。\
+                tako_read_pane（可視画面のみ）と異なり、スクロールバック履歴を遡るため長い出力も取得できる。\
+                報告の読み取りには report を使い、read_pane は配置・生存確認用に限定すること。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane_id": { "type": "integer", "minimum": 0, "description": "worker のペイン ID（必須）" },
+                    "lines": {
+                        "type": "integer", "minimum": 1, "maximum": 100000,
+                        "description": "スクロールバック取得行数（既定 2000）",
+                    },
+                },
+                "required": ["pane_id"],
+                "additionalProperties": false,
+            },
+        }),
         // --- リモートアクセス MCP ツール ---
         json!({
             "name": "tako_remote_start",
@@ -2891,6 +2913,10 @@ fn build_request(
                 task_type: str_arg(args, "task_type")?,
             }
         }
+        "tako_orchestrator_report" => Request::OrchestratorReport {
+            pane_id: required_u64(args, "pane_id")?,
+            lines: u64_arg(args, "lines")?.map(|v| v as usize),
+        },
         "tako_orchestrator_worker_status" => Request::OrchestratorWorkerStatus {
             pane_id: required_u64(args, "pane_id")?,
             session_id: str_arg(args, "session_id")?,
@@ -3844,7 +3870,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 99);
+        assert_eq!(tools.len(), 100);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

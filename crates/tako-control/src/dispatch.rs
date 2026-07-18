@@ -1975,6 +1975,11 @@ fn dispatch_inner(
             caller_role,
         } => dispatch_orchestrator_respond(host, pane_id, &choice, caller_role.as_deref()),
 
+        // #364: worker の報告内容を scrollback + transcript から取得
+        Request::OrchestratorReport { pane_id, lines } => {
+            dispatch_orchestrator_report(host, pane_id, lines.unwrap_or(2000))
+        }
+
         Request::OrchestratorLedger {
             action,
             id,
@@ -3692,6 +3697,89 @@ fn resolve_session_id_for_pane_via_host(host: &dyn ControlHost, pane_id: PaneId)
     crate::agents::resolve_session_id_for_backend(&backend)
 }
 
+/// #364: worker の報告内容を取得する。
+/// 第 1 層: tmux scrollback（capture-pane -p -J -S。全 agent 共通）。
+/// 第 2 層: 構造化ソース（claude transcript。アダプタ拡張可能）。
+/// source フィールドで判別。transcript 利用時は scrollback も併記し対比可能にする
+fn dispatch_orchestrator_report(
+    host: &dyn ControlHost,
+    pane_id: u64,
+    lines: usize,
+) -> Result<Value, DispatchError> {
+    let target = PaneId::from_raw(pane_id);
+    let mut result = json!({ "pane_id": pane_id });
+
+    // 第 1 層: scrollback（全 agent 共通の主ソース）
+    let scrollback = if let Some(backend) = host.backend_session(target) {
+        let socket = tako_core::tmux_backend::socket_name();
+        capture_scrollback_joined(Some(&socket), &backend, lines)
+    } else {
+        None
+    };
+
+    // 第 2 層: transcript アダプタ（claude のみ。将来 codex 等を追加する拡張点）
+    let transcript = resolve_session_id_for_pane_via_host(host, target).and_then(|sid| {
+        let texts = crate::transcript::last_assistant_texts(&sid, 1).ok()?;
+        if texts.is_empty() {
+            return None;
+        }
+        result["session_id"] = json!(sid);
+        Some(texts.join("\n"))
+    });
+
+    match (&transcript, &scrollback) {
+        (Some(t), _) => {
+            result["source"] = json!("transcript");
+            result["text"] = json!(t);
+            if let Some(ref sb) = scrollback {
+                result["scrollback_text"] = json!(sb);
+            }
+        }
+        (None, Some(sb)) => {
+            result["source"] = json!("scrollback");
+            result["text"] = json!(sb);
+        }
+        (None, None) => {
+            return Err(DispatchError::Operation(format!(
+                "pane {pane_id} の報告を取得できない（backend session 不在または scrollback 空）"
+            )));
+        }
+    }
+
+    Ok(result)
+}
+
+/// tmux capture-pane -p -J -S で折返し結合済みのスクロールバックを取得する
+fn capture_scrollback_joined(socket: Option<&str>, session: &str, lines: usize) -> Option<String> {
+    let start = format!("-{lines}");
+    let output = tako_core::tmux::tmux_command(socket)
+        .args([
+            "capture-pane",
+            "-p",
+            "-J",
+            "-t",
+            &format!("={session}:"),
+            "-S",
+            &start,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end()
+        .to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 /// OrchestratorHandoff — master の引き継ぎ（#193）。
 /// handoff ファイルを読み、同プロファイルの新 master を同タブに spawn し、
 /// handoff 内容を含むプロンプトを注入する。旧 master は閉じない（ユーザー判断）。
@@ -4309,6 +4397,15 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         None
     };
 
+    // #364: 履歴サイズ計測（agent 非依存の busy シグナル布石）
+    let history_info = tmux_session
+        .as_ref()
+        .and_then(|ts| {
+            let socket = tako_core::tmux_backend::socket_name();
+            tako_core::tmux::pane_log_probe(Some(&socket), ts)
+        })
+        .map(|p| json!({ "lines": p.history, "bytes": p.bytes }));
+
     Ok(json!({
         "status": status,
         "ctx_percent": ctx_percent,
@@ -4321,6 +4418,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         "collapsed": collapsed,
         "events": events,
         "permission_dialog": permission_dialog,
+        "history": history_info,
     }))
 }
 
