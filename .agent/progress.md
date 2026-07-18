@@ -858,3 +858,8 @@
 - P1-1 XFF identity 偽装対策（XFH 検証追加）、P1-2 PII プレースホルダ化、P2-1〜P2-4（upload 0o600 / 監査ログファイル名除去 / Windows パス redact / symlink 拒否）。threat model 正確化。テスト 9 本追加、全 843 テスト緑
 - 関連コミット: `d008e6c`（`renewal/remote-transport`）。Issue に修正証拠コメント済み
 - 次: master レビュー → main マージ判断 → 実 serve 経由 e2e → v0.6.0
+
+## 2026-07-18（#321: ステータスバーのサービス切替ドロップダウン無反応を根治）
+- 根因 = ステータスバーの container div の overflow_hidden がポップアップをクリップ。メニューをルート div のオーバーレイへ移動（#346 コンテキストメニューと同方式）。背面 dismiss 追加
+- 関連コミット: `09fde57`（PR #361 squash merge）。fmt / clippy / test 288 / セルフテスト全緑
+- 次: `build-app.sh --install` → 実機目視確認
