@@ -40,13 +40,13 @@ use std::time::Duration;
 use futures::channel::mpsc::unbounded;
 use futures::StreamExt;
 use gpui::{
-    canvas, div, fill, point, prelude::*, px, quad, relative, size, svg, App, BorderStyle, Bounds,
-    BoxShadow, ClipboardItem, Context, CursorStyle, DragMoveEvent, ElementInputHandler,
-    EntityInputHandler, ExternalPaths, FocusHandle, Font, FontStyle, FontWeight, HighlightStyle,
-    Hsla, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, Rgba, ScrollDelta, ScrollWheelEvent, SharedString, Size, StrikethroughStyle, StyledText,
-    Subscription, TextLayout, TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window,
-    WindowBounds, WindowOptions,
+    canvas, div, fill, point, prelude::*, px, quad, relative, size, svg, AnyWindowHandle, App,
+    BorderStyle, Bounds, BoxShadow, ClipboardItem, Context, CursorStyle, DragMoveEvent,
+    ElementInputHandler, EntityInputHandler, ExternalPaths, FocusHandle, Font, FontStyle,
+    FontWeight, HighlightStyle, Hsla, Keystroke, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollDelta, ScrollWheelEvent, SharedString,
+    Size, StrikethroughStyle, StyledText, Subscription, TextLayout, TextRun, TextStyle,
+    UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use tako_control::{
@@ -663,8 +663,6 @@ struct TakoApp {
     ime: Option<ImeComposition>,
     /// 直近 render のフォーカスペイン（IM 座標キャッシュ更新の変化検知用。#332）
     last_ime_focus: Option<PaneId>,
-    /// focus 喪失（blur）からの自動復元の購読（drop で解除されるため保持。#332）
-    _focus_lost_sub: Option<Subscription>,
     /// ドラッグ中のペイン境界（None = ドラッグしていない）
     dragging_border: Option<DragBorder>,
     /// スクロールバーをドラッグ中のペイン
@@ -936,6 +934,18 @@ struct TakoApp {
     titlebar_dragging: bool,
     /// タブ要素上で mouse down されたか（#308: タブ D&D とウインドウドラッグの競合防止）
     tab_mouse_down: bool,
+    /// GPUI ウィンドウ ⇔ 論理ウィンドウの対応（Issue #339 ビューポート方式）。
+    /// 同一 TakoApp entity を全ウィンドウの root view として共有し、render 冒頭で
+    /// 呼び出し元 window からこの対応表で表示タブを解決する
+    viewports: Vec<(tako_core::WindowId, gpui::AnyWindowHandle)>,
+    /// ウィンドウごとの購読（focus 自己修復 #332 + activation 追随 #339）。
+    /// ウィンドウ close で drop して購読解除する
+    viewport_subs: HashMap<gpui::WindowId, Vec<Subscription>>,
+    /// ウィンドウごとの OS フレーム（render で採取し layout 保存に含める。Issue #339）
+    window_frames: HashMap<tako_core::WindowId, tako_control::layout::WindowFrame>,
+    /// 論理ウィンドウ作成済みで GPUI ウィンドウが未生成のもの（dispatch 経由の
+    /// window new 等。GPUI の Context が要るため render / defer で消費する）
+    pending_viewport_opens: Vec<tako_core::WindowId>,
 }
 
 /// × ボタン close の確認ダイアログ対象（Issue #172）
@@ -1738,7 +1748,6 @@ impl TakoApp {
             active_pdf_rasters: std::collections::HashSet::new(),
             ime: None,
             last_ime_focus: None,
-            _focus_lost_sub: None,
             dragging_border: None,
             dragging_scrollbar: None,
             hovered_scrollbar: None,
@@ -1872,6 +1881,10 @@ impl TakoApp {
             last_active_tab: None,
             titlebar_dragging: false,
             tab_mouse_down: false,
+            viewports: Vec::new(),
+            viewport_subs: HashMap::new(),
+            window_frames: HashMap::new(),
+            pending_viewport_opens: Vec::new(),
         };
         // App Nap 無効化 + 初回スリープ防止更新（Issue #173）
         // 蓋閉じ防止の残留チェック（#218: 前回クラッシュ時の disablesleep=1 を自動復帰）
@@ -2150,7 +2163,13 @@ impl TakoApp {
                         incoming.request,
                         tako_control::protocol::Request::Scroll { .. }
                     );
+                    let prev_window = app.workspace.active_window_id();
                     let mut result = tako_control::dispatch(app, incoming.request, incoming.origin);
+                    // CLI / MCP のタブ選択・ウィンドウ操作がアクティブウィンドウを
+                    // またいだら OS ウィンドウも前面化する（Issue #339）
+                    if app.workspace.active_window_id() != prev_window {
+                        app.focus_active_viewport(cx);
+                    }
                     // CLI / MCP のスクロールでも UI のスクロールバー・カーソル抑止が
                     // 同じ状態を共有する（開発不変条件: UI と AI 操作の等価性）
                     if was_scroll {
@@ -5360,12 +5379,183 @@ impl TakoApp {
     }
 
     fn activate_tab_index(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Some(id) = self.workspace.tabs().get(index).map(|t| t.id()) {
+        // cmd+数字はアクティブウィンドウ内の並びで解釈する（Issue #339）
+        let win_tabs = self
+            .workspace
+            .window_tab_ids(self.workspace.active_window_id());
+        if let Some(id) = win_tabs.get(index).copied() {
             let _ = self.workspace.activate_tab(id);
         }
         self.scroll_active_tab_into_view();
         self.sync_filetree_roots();
         cx.notify();
+    }
+
+    // === 複数ウィンドウ（Issue #339・ビューポート方式） ===
+
+    /// GPUI ウィンドウを論理ウィンドウに対応付け、ウィンドウ単位の購読
+    /// （focus 自己修復 #332 / OS フォーカス追随）を張る。open_window 直後に呼ぶ
+    fn register_viewport(
+        &mut self,
+        logical: tako_core::WindowId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let handle = window.window_handle();
+        self.viewports
+            .retain(|(l, h)| *l != logical && *h != handle);
+        self.viewports.push((logical, handle));
+        // 初期 focus + blur からの自動復元（#332）: focus が無いと Window::handle_input
+        // が input handler を登録せず、日本語 IM の printable キーが IME を素通りして
+        // ASCII 直書きになる。on_focus_lost は「ウィンドウ内のどこにも focus が無く
+        // なった」draw 末尾に発火するため、view render が reuse でスキップされる
+        // フレームでも確実に呼ばれる
+        window.focus(&self.focus_handle.clone(), cx);
+        let focus_sub = cx.on_focus_lost(window, |app, window, cx| {
+            window.focus(&app.focus_handle.clone(), cx);
+            window.invalidate_character_coordinates();
+            cx.notify();
+        });
+        // OS のウィンドウフォーカス変化に workspace のアクティブウィンドウを追随させる
+        let activation_sub = cx.observe_window_activation(window, |app, window, cx| {
+            if window.is_window_active() {
+                app.on_viewport_activated(window, cx);
+            }
+        });
+        self.viewport_subs
+            .insert(handle.window_id(), vec![focus_sub, activation_sub]);
+    }
+
+    /// 呼び出し元 GPUI ウィンドウの論理ウィンドウを解決する
+    fn viewport_of(&self, window: &Window) -> Option<tako_core::WindowId> {
+        let handle = window.window_handle();
+        self.viewports
+            .iter()
+            .find(|(_, h)| *h == handle)
+            .map(|(l, _)| *l)
+    }
+
+    /// このウィンドウが表示すべきタブ（Issue #339）。未登録ウィンドウ（保険経路）は
+    /// グローバルのアクティブタブへフォールバックする
+    fn display_tab_for(&self, window: &Window) -> TabId {
+        self.viewport_of(window)
+            .and_then(|l| self.workspace.get_window(l))
+            .map(|w| w.active_tab())
+            .unwrap_or_else(|| self.workspace.active_tab_id())
+    }
+
+    /// OS ウィンドウがフォーカスされた → workspace のアクティブウィンドウを追随させる
+    fn on_viewport_activated(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(lid) = self.viewport_of(window) else {
+            return;
+        };
+        if self.workspace.active_window_id() != lid && self.workspace.get_window(lid).is_some() {
+            let _ = self.workspace.activate_window(lid);
+            self.sync_filetree_roots();
+            self.scroll_active_tab_into_view();
+            cx.notify();
+        }
+    }
+
+    /// 赤ボタン close（on_window_should_close）。複数ウィンドウならビューポートだけ
+    /// 閉じてタブを残存ウィンドウへ合流させる（タブ・プロセスは殺さない）。
+    /// 最後の 1 枚は #312 の従来挙動（layout 保存 + primary 解放 → プロセス生存 →
+    /// Dock 復帰で復元）
+    fn handle_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let handle = window.window_handle();
+        let logical = self.viewport_of(window);
+        if self.workspace.windows().len() > 1 {
+            if let Some(lid) = logical {
+                match self.workspace.close_window(lid) {
+                    Ok(moved) => persist_diag(&format!(
+                        "ウィンドウ close: タブ {} 枚を残存ウィンドウへ合流",
+                        moved.len()
+                    )),
+                    Err(e) => eprintln!("warning: ウィンドウを閉じられない: {e}"),
+                }
+                self.drop_viewport(lid, handle);
+                self.save_layout();
+                cx.notify();
+            }
+            return true;
+        }
+        persist_diag("赤ボタン close: layout 保存 + primary 解放");
+        self.save_layout();
+        release_primary();
+        if let Some(lid) = logical {
+            self.drop_viewport(lid, handle);
+        }
+        true
+    }
+
+    /// ビューポート対応表と購読・フレームを掃除する（close 経路共通）
+    fn drop_viewport(&mut self, logical: tako_core::WindowId, handle: AnyWindowHandle) {
+        self.viewports
+            .retain(|(l, h)| *l != logical && *h != handle);
+        self.viewport_subs.remove(&handle.window_id());
+        self.window_frames.remove(&logical);
+    }
+
+    /// New Window（Issue #339）: 新規タブ 1 つ付きの論理ウィンドウを作り、
+    /// 同一 TakoApp entity を root にした GPUI ウィンドウを開く
+    fn new_viewport_window(&mut self, cx: &mut Context<Self>) {
+        let title = (self.workspace.tabs().len() + 1).to_string();
+        let pane = Pane::new(PaneOrigin::User);
+        let pane_id = pane.id();
+        let (wid, _tab) = self.workspace.create_window(title, pane);
+        if let Err(e) = self.spawn_session(pane_id, SpawnOptions::default(), cx) {
+            eprintln!("warning: 新しいウィンドウを開けない: {e}");
+            self.remove_pane(pane_id, cx); // タブごと畳まれ空ウィンドウも除去される
+            return;
+        }
+        self.open_viewport(wid, cx);
+        self.sync_filetree_roots();
+        cx.notify();
+    }
+
+    /// 論理ウィンドウに対応する GPUI ウィンドウを開く（entity 借用の外で defer 実行）
+    fn open_viewport(&mut self, logical: tako_core::WindowId, cx: &mut Context<Self>) {
+        let entity = cx.entity();
+        cx.defer(move |cx| open_viewport_window(entity, logical, None, cx));
+    }
+
+    /// 論理ウィンドウと GPUI ウィンドウの突き合わせ（Issue #339）。render 冒頭から
+    /// 毎フレーム呼ばれる冪等な同期で、どの経路（close_tab / タブ移動 / dispatch）で
+    /// 論理ウィンドウが消えても GPUI ウィンドウを閉じ漏らさない。
+    /// dispatch 経由で作られた GPUI 未生成の論理ウィンドウはここで開く
+    fn sync_viewports(&mut self, cx: &mut Context<Self>) {
+        let live: std::collections::HashSet<tako_core::WindowId> =
+            self.workspace.windows().iter().map(|w| w.id()).collect();
+        let dead: Vec<(tako_core::WindowId, AnyWindowHandle)> = self
+            .viewports
+            .iter()
+            .filter(|(l, _)| !live.contains(l))
+            .copied()
+            .collect();
+        for (lid, handle) in dead {
+            self.drop_viewport(lid, handle);
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, _| window.remove_window());
+            });
+        }
+        for lid in std::mem::take(&mut self.pending_viewport_opens) {
+            if live.contains(&lid) && !self.viewports.iter().any(|(l, _)| *l == lid) {
+                self.open_viewport(lid, cx);
+            }
+        }
+    }
+
+    /// アクティブ論理ウィンドウの GPUI ウィンドウを前面化する（タブ切替がウィンドウを
+    /// またいだとき用。CLI / MCP / パレット経由のタブ選択から呼ぶ）
+    fn focus_active_viewport(&mut self, cx: &mut Context<Self>) {
+        let lid = self.workspace.active_window_id();
+        let Some(entry) = self.viewports.iter().find(|(l, _)| *l == lid).copied() else {
+            return;
+        };
+        let (_, handle) = entry;
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, _| window.activate_window());
+        });
     }
 
     fn select_all_preview(&mut self, cx: &mut Context<Self>) {
@@ -12417,9 +12607,15 @@ impl Render for TakoApp {
         // ファイルツリーの root 同期は 2 秒ポーリングとイベント駆動に移した
         // （render 毎フレームの呼び出しを廃止してパフォーマンス改善）
 
+        // 論理ウィンドウ ⇔ GPUI ウィンドウの同期（Issue #339。空ウィンドウの close 等）
+        self.sync_viewports(cx);
+        // このウィンドウの表示タブ（Issue #339 ビューポート方式)。同一 entity を
+        // 全ウィンドウの root view として共有するため、呼び出し元 window ごとに解決する
+        let display_tab = self.display_tab_for(window);
+
         // OS ウィンドウのフレームを採取する（layout 保存 = 再起動時のウィンドウ復元用。
         // window_bounds() は fullscreen / maximized 中でも復元サイズを返す）
-        self.window_frame = Some({
+        let frame = {
             let (state, bounds) = match window.window_bounds() {
                 WindowBounds::Windowed(b) => ("windowed", b),
                 WindowBounds::Maximized(b) => ("maximized", b),
@@ -12432,9 +12628,17 @@ impl Render for TakoApp {
                 height: f32::from(bounds.size.height),
                 state: state.to_string(),
             }
-        });
+        };
+        let this_viewport = self.viewport_of(window);
+        if let Some(lid) = this_viewport {
+            self.window_frames.insert(lid, frame.clone());
+        }
+        // 旧スキーマ互換の単一フレーム（layout.window）はプライマリ（先頭ビューポート）のもの
+        if self.viewports.first().map(|(l, _)| *l) == this_viewport || this_viewport.is_none() {
+            self.window_frame = Some(frame);
+        }
 
-        // アクティブタブのレイアウト（単位矩形）と、マウス変換用のピクセル矩形を更新する。
+        // 表示タブのレイアウト（単位矩形）と、マウス変換用のピクセル矩形を更新する。
         // サイドバー表示中はその幅だけコンテンツ領域を右へずらす（ペイン矩形・境界
         // ハンドル・IME 位置はすべて content_origin / content_size 起点で連動する）
         let viewport = window.viewport_size();
@@ -12455,10 +12659,14 @@ impl Render for TakoApp {
             viewport.width - sidebar_width - panel_width,
             viewport.height - px(TAB_BAR_HEIGHT) - px(STATUS_BAR_HEIGHT),
         );
-        let tree = self.workspace.active_tab().tree();
+        let tree = self
+            .workspace
+            .get_tab(display_tab)
+            .unwrap_or_else(|| self.workspace.active_tab())
+            .tree();
         let focused = tree.focused();
         let layout = tree.layout(Rect::UNIT);
-        self.pane_text_areas = layout
+        let new_areas: Vec<(PaneId, Bounds<Pixels>)> = layout
             .iter()
             .map(|(id, r)| {
                 let inset = PANE_BORDER + PANE_PADDING;
@@ -12474,6 +12682,21 @@ impl Render for TakoApp {
                 (*id, Bounds::new(origin, area_size))
             })
             .collect();
+        // pane_text_areas は全ウィンドウ共有（Issue #339）: 自ウィンドウの表示タブ分を
+        // 差し替え、他ウィンドウが表示中のタブの分は残す（同一タブは 1 ウィンドウのみ
+        // 表示なのでキー空間は排他）。非表示タブ・消えたペインの残骸はここで掃除する
+        let visible_tabs: std::collections::HashSet<TabId> = self
+            .workspace
+            .windows()
+            .iter()
+            .map(|w| w.active_tab())
+            .collect();
+        self.pane_text_areas.retain(|(pid, _)| {
+            self.workspace
+                .find_tab_of_pane(*pid)
+                .is_some_and(|t| t != display_tab && visible_tabs.contains(&t))
+        });
+        self.pane_text_areas.extend(new_areas);
 
         let drop_layout = layout.clone();
         let panes: Vec<_> = layout
@@ -12524,7 +12747,8 @@ impl Render for TakoApp {
         let origin_y = f32::from(content_origin.y);
         let border_handles: Vec<_> = self
             .workspace
-            .active_tab()
+            .get_tab(display_tab)
+            .unwrap_or_else(|| self.workspace.active_tab())
             .tree()
             .borders(border_rect)
             .into_iter()
@@ -12667,6 +12891,7 @@ impl Render for TakoApp {
             )
             .on_action(cx.listener(|this, _: &ClosePane, _, cx| this.close_focused_pane(cx)))
             .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_tab(cx)))
+            .on_action(cx.listener(|this, _: &NewWindow, _, cx| this.new_viewport_window(cx)))
             .on_action(cx.listener(|this, _: &NextTab, _, cx| {
                 this.workspace.activate_next_tab();
                 this.sync_filetree_roots();
@@ -13166,13 +13391,6 @@ fn tako_titlebar_options() -> gpui::TitlebarOptions {
     }
 }
 
-fn open_new_window(cx: &mut App) {
-    open_window_with_bounds(
-        WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx)),
-        cx,
-    );
-}
-
 /// 保存済みレイアウトから復元してウインドウを開く（#312: Dock クリックでの復帰用）
 fn open_restored_window(cx: &mut App) {
     let saved_frame = tako_control::layout::load().and_then(|l| l.window);
@@ -13187,52 +13405,68 @@ fn open_restored_window(cx: &mut App) {
         }
         _ => WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx)),
     };
-    open_window_with_bounds(bounds, cx);
+    open_primary_window(bounds, cx);
 }
 
-/// ウィンドウ生成直後の focus 配線（#332）: 初期 focus + blur（外部 a11y の Blur
-/// アクション等）からの自動復元。focus が無いと Window::handle_input が input handler
-/// を登録せず、日本語 IM の printable キーが IME を素通りして ASCII 直書きになる
-/// （変換候補ウィンドウが再起動まで出ない）。GPUI の on_focus_lost は「ウィンドウ内の
-/// どこにも focus が無くなった」draw 末尾に発火するため、view render が reuse で
-/// スキップされるフレームでも確実に呼ばれる
-fn wire_focus_self_heal(view: &gpui::Entity<TakoApp>, window: &mut Window, cx: &mut App) {
-    window.focus(&view.read(cx).focus_handle.clone(), cx);
-    view.update(cx, |app, cx| {
-        app._focus_lost_sub = Some(cx.on_focus_lost(window, |app, window, cx| {
-            window.focus(&app.focus_handle.clone(), cx);
-            window.invalidate_character_coordinates();
-            cx.notify();
-        }));
+/// プライマリウィンドウを開く（TakoApp entity を新規作成する経路: 初回起動・Dock 復帰）。
+/// 追加ウィンドウは `open_viewport_window`（同一 entity 共有。Issue #339）を使う。
+/// 赤ボタン close の挙動は `TakoApp::handle_window_close`（複数ウィンドウなら
+/// タブ合流のみ、最後の 1 枚なら #312 の layout 保存 + primary 解放）
+fn open_primary_window(window_bounds: WindowBounds, cx: &mut App) -> gpui::WindowHandle<TakoApp> {
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(window_bounds),
+            titlebar: Some(tako_titlebar_options()),
+            ..Default::default()
+        },
+        |window, cx| {
+            let view = cx.new(TakoApp::new);
+            let logical = view.read(cx).workspace.active_window_id();
+            view.update(cx, |app, cx| app.register_viewport(logical, window, cx));
+            let entity = view.clone();
+            window.on_window_should_close(cx, move |window, cx| {
+                entity.update(cx, |app, cx| app.handle_window_close(window, cx))
+            });
+            view
+        },
+    )
+    .expect("ウィンドウを開けなかった")
+}
+
+/// 同一 TakoApp entity を root view にした追加ウィンドウを開く（Issue #339 ビューポート
+/// 方式）。GPUI は entity を描画中の全ウィンドウを notify で invalidate するため、
+/// アプリ状態の変更は全ウィンドウへ自動反映される
+fn open_viewport_window(
+    entity: gpui::Entity<TakoApp>,
+    logical: tako_core::WindowId,
+    bounds: Option<WindowBounds>,
+    cx: &mut App,
+) {
+    let bounds = bounds.unwrap_or_else(|| {
+        WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx))
     });
-}
-
-fn open_window_with_bounds(window_bounds: WindowBounds, cx: &mut App) {
-    let _ = cx
-        .open_window(
-            WindowOptions {
-                window_bounds: Some(window_bounds),
-                titlebar: Some(tako_titlebar_options()),
-                ..Default::default()
-            },
-            |window, cx| {
-                let view = cx.new(TakoApp::new);
-                wire_focus_self_heal(&view, window, cx);
-                // 赤ボタン close 時にレイアウトを保存する（#312。quit ではなく
-                // ウインドウ単体の close なので on_app_quit は走らない）
-                let entity = view.clone();
-                window.on_window_should_close(cx, move |_window, cx| {
-                    entity.update(cx, |app, _cx| {
-                        persist_diag("赤ボタン close: layout 保存 + primary 解放");
-                        app.save_layout();
-                    });
-                    release_primary();
-                    true
-                });
-                view
-            },
-        )
-        .expect("新規ウィンドウを開けなかった");
+    let opened = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(bounds),
+            titlebar: Some(tako_titlebar_options()),
+            ..Default::default()
+        },
+        |window, cx| {
+            entity.update(cx, |app, cx| app.register_viewport(logical, window, cx));
+            let close_entity = entity.clone();
+            window.on_window_should_close(cx, move |window, cx| {
+                close_entity.update(cx, |app, cx| app.handle_window_close(window, cx))
+            });
+            entity.clone()
+        },
+    );
+    if opened.is_err() {
+        eprintln!("warning: 新しいウィンドウを開けなかった");
+        // GPUI ウィンドウの無い論理ウィンドウは操作不能になるため合流で畳む
+        entity.update(cx, |app, _| {
+            let _ = app.workspace.close_window(logical);
+        });
+    }
 }
 
 fn main() {
@@ -13349,8 +13583,15 @@ fn main() {
         cx.bind_keys(key_bindings());
         cx.set_menus(app_menus());
         webview::install_key_monitor();
+        // New Window はルート div（TakoApp::new_viewport_window = 同一 entity の
+        // ビューポート追加。Issue #339）が処理する。ここはウィンドウが 1 枚も無い
+        // （全部閉じた後にメニューから New Window）ときだけ届くグローバルフォール
+        // バックで、Dock 復帰（on_reopen）と同じ復元ウィンドウを開く
         cx.on_action(|_: &NewWindow, cx| {
-            open_new_window(cx);
+            if cx.windows().is_empty() {
+                open_restored_window(cx);
+                cx.activate(true);
+            }
         });
         // Quit はグローバルアクションとして登録する（#103: ルート div の on_action
         // だけだとウィンドウのフォーカスパス上でしか発火せず、フォーカス喪失
@@ -13379,30 +13620,7 @@ fn main() {
             }
             _ => WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx)),
         };
-        let window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(window_bounds),
-                    titlebar: Some(tako_titlebar_options()),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    let view = cx.new(TakoApp::new);
-                    wire_focus_self_heal(&view, window, cx);
-                    // 赤ボタン close 時にレイアウトを保存（#312）
-                    let entity = view.clone();
-                    window.on_window_should_close(cx, move |_window, cx| {
-                        entity.update(cx, |app, _cx| {
-                            persist_diag("赤ボタン close: layout 保存 + primary 解放");
-                            app.save_layout();
-                        });
-                        release_primary();
-                        true
-                    });
-                    view
-                },
-            )
-            .expect("ウィンドウを開けなかった");
+        let window = open_primary_window(window_bounds, cx);
         cx.activate(true);
 
         if std::env::var_os("TAKO_VISUAL_TEST").is_some() {

@@ -49,12 +49,29 @@ impl TakoApp {
     }
 
     /// アクティブタブが表示領域に入るよう ScrollHandle を更新する。
-    /// タブ切替を行うすべての経路（クリック・⌘数字・CLI/MCP）から呼ぶ
+    /// タブ切替を行うすべての経路（クリック・⌘数字・CLI/MCP）から呼ぶ。
+    /// scroll_to_item は子要素インデックスで動くため、タブバーの表示と同じ
+    /// アクティブウィンドウ内の並びで位置を計算する（Issue #339）
     pub(crate) fn scroll_active_tab_into_view(&self) {
         let active = self.workspace.active_tab_id();
-        if let Some(idx) = self.workspace.tabs().iter().position(|t| t.id() == active) {
+        let win_tabs = self
+            .workspace
+            .window_tab_ids(self.workspace.active_window_id());
+        if let Some(idx) = win_tabs.iter().position(|t| *t == active) {
             self.tab_scroll_handle.scroll_to_item(idx);
         }
+    }
+
+    /// タブバーの + ボタン: クリックされたウィンドウに新規タブを作る（Issue #339。
+    /// 非アクティブウィンドウの + でも activation イベントの順序に依存せず正しく動かす）
+    pub(crate) fn new_tab_in_viewport(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if let Some(lid) = self.viewport_of(window) {
+            if self.workspace.get_window(lid).is_some() && self.workspace.active_window_id() != lid
+            {
+                let _ = self.workspace.activate_window(lid);
+            }
+        }
+        self.new_tab(cx);
     }
 
     pub(crate) fn render_tab_bar(
@@ -63,18 +80,29 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme.clone();
-        let active = self.workspace.active_tab_id();
+        // このウィンドウの表示タブと所属タブだけを描く（Issue #339 ビューポート方式）
+        let viewport = self
+            .viewport_of(window)
+            .unwrap_or_else(|| self.workspace.active_window_id());
+        let active = self
+            .workspace
+            .get_window(viewport)
+            .map(|w| w.active_tab())
+            .unwrap_or_else(|| self.workspace.active_tab_id());
 
-        // アクティブタブが変わった（dispatch / new_tab 等）ら自動スクロールイン
-        if self.last_active_tab != Some(active) {
+        // アクティブタブが変わった（dispatch / new_tab 等）ら自動スクロールイン。
+        // スクロール位置（tab_scroll_handle）は共有のためアクティブウィンドウでのみ追従
+        if viewport == self.workspace.active_window_id() && self.last_active_tab != Some(active) {
             self.last_active_tab = Some(active);
             self.scroll_active_tab_into_view();
         }
 
+        let window_tabs = self.workspace.window_tab_ids(viewport);
         let tabs: Vec<_> = self
             .workspace
             .tabs()
             .iter()
+            .filter(|tab| window_tabs.contains(&tab.id()))
             .map(|tab| {
                 let id = tab.id();
                 let label = if tab.title_source() == TitleSource::Default {
@@ -473,7 +501,9 @@ impl TakoApp {
                             .rounded(px(8.0))
                             .cursor_pointer()
                             .hover(|d| d.bg(rgba(theme.surface_hover)))
-                            .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.new_tab_in_viewport(window, cx)
+                            }))
                             .on_drag_move::<TabDrag>(cx.listener(
                                 |this, _: &DragMoveEvent<TabDrag>, _, cx| {
                                     this.set_tab_reorder_indicator(None, cx);
