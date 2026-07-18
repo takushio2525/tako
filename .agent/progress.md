@@ -894,3 +894,11 @@
   （2 窓別タブ send/read・move-tab・再起動復元・orchestrator spawn→WORKER_IDLE）
 - 関連コミット: `52bb49d`（PR #367 squash merge）。Issue に実測証拠コメント済み
 - 次: `build-app.sh --install` → 実機目視（New Window の状態同期・赤ボタン Dock 復帰）
+## 2026-07-18（#340: エネルギー・CPU 監査 — 3 状態実測 + 棚卸し + sleep_guard BG 化）
+
+- 実測: アイドル 0.24% / 通常 1.05% / 高負荷(8 ペイン 160 行/秒) 1.64% = 本体は軽量。
+  見えない消費 2 件を特定: claude agents 5s スキャン(0.2s CPU/回 = 1 コア 4% 相当 → #368)、
+  sleep_guard の UI 専有 p50 42ms×毎 2s(#324 由来 → 本タスクで BG 化)。pane_log probe は #369
+- 常駐ポーリング棚卸し表 15 項目 + 残骸プロセス(5.8 日常駐 headless Chrome 等)を Issue #340 に報告
+- 関連コミット: PR #370 squash merge（`3cd5693`）。before p50 50ms → after 0ms(隔離再現ベンチ)
+- 次: #368 / #369 の着手判断、残骸プロセスの掃除はユーザー判断
