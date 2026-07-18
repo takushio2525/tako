@@ -1522,6 +1522,15 @@ impl Render for DragGhost {
     }
 }
 
+/// プロセス内でプライマリウインドウが 1 つだけ存在することを保証するフラグ（Issue #113）。
+/// 赤ボタン close でウインドウが閉じてもプロセスが生存するため、Dock 復帰時に
+/// 再びプライマリとして復元できるよう `release_primary` で解放する（#312）
+static PRIMARY_CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn release_primary() {
+    PRIMARY_CLAIMED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
 impl TakoApp {
     fn new(cx: &mut Context<Self>) -> Self {
         // 多重インスタンスガード（Issue #113）: 別の生きたインスタンスがプライマリである間は
@@ -1533,8 +1542,6 @@ impl TakoApp {
         // - プロセス内: NewWindow で 2 つ目以降の TakoApp（最初の 1 つだけがプライマリ）
         // - プロセス間: control.json の主がまだ生きた tako-app（SIGKILL 残骸は pid 死亡で除外）
         // TAKO_FORCE_PRIMARY=1 は検証・緊急脱出用の明示オーバーライド（多重復元の保護も切れる）
-        static PRIMARY_CLAIMED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
         let in_process_secondary = PRIMARY_CLAIMED.swap(true, std::sync::atomic::Ordering::SeqCst);
         let secondary_reason: Option<String> = if std::env::var_os("TAKO_SELF_TEST").is_some()
             || std::env::var_os("TAKO_FORCE_PRIMARY").is_some()
@@ -13207,7 +13214,11 @@ fn open_window_with_bounds(window_bounds: WindowBounds, cx: &mut App) {
                 // ウインドウ単体の close なので on_app_quit は走らない）
                 let entity = view.clone();
                 window.on_window_should_close(cx, move |_window, cx| {
-                    entity.update(cx, |app, _cx| app.save_layout());
+                    entity.update(cx, |app, _cx| {
+                        persist_diag("赤ボタン close: layout 保存 + primary 解放");
+                        app.save_layout();
+                    });
+                    release_primary();
                     true
                 });
                 view
@@ -13321,6 +13332,7 @@ fn main() {
     // 無ければ保存済みレイアウトから復元して新規ウインドウを開く）
     app.on_reopen(|cx| {
         if cx.windows().is_empty() {
+            persist_diag("on_reopen: ウインドウなし → 復元ウインドウを開く");
             open_restored_window(cx);
             cx.activate(true);
         }
@@ -13372,7 +13384,11 @@ fn main() {
                     // 赤ボタン close 時にレイアウトを保存（#312）
                     let entity = view.clone();
                     window.on_window_should_close(cx, move |_window, cx| {
-                        entity.update(cx, |app, _cx| app.save_layout());
+                        entity.update(cx, |app, _cx| {
+                            persist_diag("赤ボタン close: layout 保存 + primary 解放");
+                            app.save_layout();
+                        });
+                        release_primary();
                         true
                     });
                     view
