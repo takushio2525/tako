@@ -863,3 +863,8 @@
 - 根因 = ステータスバーの container div の overflow_hidden がポップアップをクリップ。メニューをルート div のオーバーレイへ移動（#346 コンテキストメニューと同方式）。背面 dismiss 追加
 - 関連コミット: `09fde57`（PR #361 squash merge）。fmt / clippy / test 288 / セルフテスト全緑
 - 次: `build-app.sh --install` → 実機目視確認
+
+## 2026-07-18（#312 再修正: 赤ボタン close → Dock 復帰でタブが空になるバグを根治）
+- 根因 = PRIMARY_CLAIMED（#113 多重起動ガード）が swap(true) のみで false に戻す処理がなかった。赤ボタン close → プロセス生存 → on_reopen → TakoApp::new 2 回目 → セカンダリ判定 → 復元スキップ。release_primary() を新設し on_window_should_close で解放
+- 関連コミット: `5c1795e`（PR #362 squash merge）。fmt / clippy / test 288 / セルフテスト全緑
+- 次: `build-app.sh --install` → 実機確認（赤ボタン close → Dock 復帰 → タブ完全復元）

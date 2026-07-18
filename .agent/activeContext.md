@@ -4,17 +4,16 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-18・#321 再修正完了）
+## 現在の対象（2026-07-18・#312 再修正完了）
 
-**Issue #321: ステータスバーのサービス切替ドロップダウンが開かない実機バグを根治**
+**Issue #312: 赤ボタン close → Dock 復帰でタブが空になるバグを根治**
 
-- コミット `09fde57` on main、PR #361 squash merge 済み
-- Issue に修正証拠 + 目視チェックリストをコメント済み
-- worktree `~/dev/tako-wt-321b` は除去済み
+- コミット `5c1795e` on main、PR #362 squash merge 済み
+- worktree `~/dev/tako-wt-312b` は除去済み
 
 ## 次の一手
 
-- `build-app.sh --install` で .app 更新 → 実機目視確認（ドロップダウン表示・選択切替・dismiss）
+- `build-app.sh --install` で .app 更新 → 実機目視確認（赤ボタン close → Dock 復帰 → タブ完全復元）
 - #287 の master レビュー・main マージ判断（renewal/remote-transport）
 - v0.6.0 リリース判断
 
