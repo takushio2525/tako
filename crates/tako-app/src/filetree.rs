@@ -245,20 +245,14 @@ pub fn scan_git_status(roots: &[PathBuf]) -> HashMap<PathBuf, GitChange> {
     let mut visited_repos: HashSet<PathBuf> = HashSet::new();
     for root in roots {
         // git rev-parse --show-toplevel でリポジトリルートを取得
-        let repo_root = match std::process::Command::new("git")
-            .args(["rev-parse", "--show-toplevel"])
-            .current_dir(root)
-            .output()
-        {
-            Ok(out) if out.status.success() => {
-                PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
-            }
-            _ => continue,
+        let repo_root = match tako_core::git::repo_root(root) {
+            Some(r) => r,
+            None => continue,
         };
         if !visited_repos.insert(repo_root.clone()) {
             continue;
         }
-        let Ok(output) = std::process::Command::new("git")
+        let Ok(output) = std::process::Command::new(tako_core::git::git_bin())
             .args(["status", "--porcelain", "-uall"])
             .current_dir(&repo_root)
             .output()

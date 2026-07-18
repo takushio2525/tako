@@ -20263,22 +20263,7 @@ fn has_git_ancestor(dir: &std::path::Path) -> bool {
 }
 
 fn find_git_root(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let root = String::from_utf8(output.stdout).ok()?;
-    let root = root.trim();
-    if root.is_empty() {
-        return None;
-    }
-    Some(std::path::PathBuf::from(root))
+    tako_core::git::repo_root(dir)
 }
 
 fn shell_escape(path: &std::path::Path) -> String {
