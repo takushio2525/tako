@@ -90,7 +90,6 @@ impl TakoApp {
         let codex_primary = self.codex_metrics.limit_5h;
         let codex_secondary = self.codex_metrics.limit_week;
         let selected_limit_service = self.limit_service;
-        let limit_menu_open = self.limit_service_menu_open;
         // 選択中のサービスに応じてメーター表示データを選択（#357）
         let (limit_5h, limit_week) = match selected_limit_service {
             LimitService::Claude => (claude_5h, claude_week),
@@ -431,15 +430,17 @@ impl TakoApp {
                     .hover(|d| d.bg(rgba(theme.surface_hover)))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|_, _: &gpui::MouseDownEvent, _, cx| {
+                        cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
                             cx.stop_propagation();
+                            this.limit_service_menu_open = !this.limit_service_menu_open;
+                            if this.limit_service_menu_open {
+                                this.limit_service_menu_anchor = Some(event.position);
+                            } else {
+                                this.limit_service_menu_anchor = None;
+                            }
+                            cx.notify();
                         }),
                     )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.limit_service_menu_open = !this.limit_service_menu_open;
-                        cx.notify();
-                    }))
                     // サービスラベル + ドット（視覚的区別）
                     .child(
                         div()
@@ -488,16 +489,8 @@ impl TakoApp {
                                 .child(SharedString::from("--")),
                         )
                     })
-                    // ドロップダウンポップアップ（#357: 全サービスの実データ）
-                    .when(limit_menu_open, |d| {
-                        d.child(self.render_limit_service_menu(
-                            claude_5h,
-                            claude_week,
-                            codex_primary,
-                            codex_secondary,
-                            cx,
-                        ))
-                    })
+                // ドロップダウンメニューはルート div のオーバーレイとして描画
+                // （ステータスバーの overflow_hidden の外へ出すため）
             })
             // usage（カンプ: トレンドアイコン + スパークライン + tok + cost）
             .children(usage_text.map(|text| {
@@ -1069,14 +1062,18 @@ impl TakoApp {
         self.sync_filetree_roots();
     }
 
-    fn render_limit_service_menu(
+    pub(crate) fn render_limit_service_overlay(
         &self,
-        claude_5h: Option<u32>,
-        claude_week: Option<u32>,
-        codex_primary: Option<u32>,
-        codex_secondary: Option<u32>,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> Option<gpui::AnyElement> {
+        if !self.limit_service_menu_open {
+            return None;
+        }
+        let anchor = self.limit_service_menu_anchor?;
+        let claude_5h = self.agent_metrics.limit_5h;
+        let claude_week = self.agent_metrics.limit_week;
+        let codex_primary = self.codex_metrics.limit_5h;
+        let codex_secondary = self.codex_metrics.limit_week;
         let theme = self.theme.clone();
         let selected = self.limit_service;
 
@@ -1157,6 +1154,7 @@ impl TakoApp {
                     cx.stop_propagation();
                     this.limit_service = svc;
                     this.limit_service_menu_open = false;
+                    this.limit_service_menu_anchor = None;
                     if !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none() {
                         let mut settings = tako_control::settings::load();
                         settings.limit_service = svc.as_str().into();
@@ -1192,58 +1190,82 @@ impl TakoApp {
                 .child(meter_inline(l2, w7))
         };
 
-        div()
-            .absolute()
-            .bottom(px(STATUS_BAR_HEIGHT + 4.0))
-            .right(px(0.0))
-            .w(px(340.0))
-            .rounded(px(9.0))
-            .bg(rgba(theme.surface_1))
-            .border_1()
-            .border_color(hsla(theme.border_heavy))
-            .shadow(vec![BoxShadow {
-                color: gpui::hsla(0., 0., 0., 0.5),
-                offset: point(px(0.), px(12.)),
-                blur_radius: px(28.),
-                spread_radius: px(0.),
-                inset: false,
-            }])
-            .overflow_hidden()
-            .occlude()
-            .child(
-                div()
-                    .px(px(11.0))
-                    .pt(px(8.0))
-                    .pb(px(7.0))
-                    .border_b_1()
-                    .border_color(hsla(theme.border_subtle))
-                    .text_size(px(9.5))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(hsla(theme.text_muted))
-                    .child("USAGE LIMITS"),
-            )
-            .child(
-                div()
-                    .p(px(4.0))
-                    .flex()
-                    .flex_col()
-                    .child(row(
-                        LimitService::Claude,
-                        claude_5h,
-                        claude_week,
-                        "5h",
-                        "7d",
-                    ))
-                    .child(row(
-                        LimitService::Codex,
-                        codex_primary,
-                        codex_secondary,
-                        "P",
-                        "S",
-                    ))
-                    .child(row(LimitService::Agy, None, None, "5h", "7d")),
-            )
-            .into_any_element()
+        let menu_w: f32 = 340.0;
+        let menu_left = anchor.x - px(menu_w);
+
+        // 背面クリックで dismiss + メニュー本体
+        Some(
+            div()
+                .id("limit-service-dismiss")
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.limit_service_menu_open = false;
+                        this.limit_service_menu_anchor = None;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(menu_left.max(px(4.0)))
+                        .bottom(px(STATUS_BAR_HEIGHT + 4.0))
+                        .w(px(menu_w))
+                        .rounded(px(9.0))
+                        .bg(rgba(theme.surface_1))
+                        .border_1()
+                        .border_color(hsla(theme.border_heavy))
+                        .shadow(vec![BoxShadow {
+                            color: gpui::hsla(0., 0., 0., 0.5),
+                            offset: point(px(0.), px(12.)),
+                            blur_radius: px(28.),
+                            spread_radius: px(0.),
+                            inset: false,
+                        }])
+                        .overflow_hidden()
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .px(px(11.0))
+                                .pt(px(8.0))
+                                .pb(px(7.0))
+                                .border_b_1()
+                                .border_color(hsla(theme.border_subtle))
+                                .text_size(px(9.5))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(hsla(theme.text_muted))
+                                .child("USAGE LIMITS"),
+                        )
+                        .child(
+                            div()
+                                .p(px(4.0))
+                                .flex()
+                                .flex_col()
+                                .child(row(
+                                    LimitService::Claude,
+                                    claude_5h,
+                                    claude_week,
+                                    "5h",
+                                    "7d",
+                                ))
+                                .child(row(
+                                    LimitService::Codex,
+                                    codex_primary,
+                                    codex_secondary,
+                                    "P",
+                                    "S",
+                                ))
+                                .child(row(LimitService::Agy, None, None, "5h", "7d")),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     pub(crate) fn toggle_panel_view(&mut self, view: PanelView, cx: &mut Context<Self>) {

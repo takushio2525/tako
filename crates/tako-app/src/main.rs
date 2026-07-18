@@ -824,6 +824,8 @@ struct TakoApp {
     limit_service: tako_core::LimitService,
     /// ステータスバーの利用制限サービス切替ドロップダウンが開いているか（Issue #321）
     limit_service_menu_open: bool,
+    /// ドロップダウンメニューのアンカー位置（ステータスバーの overflow_hidden 外へ描画するため）
+    limit_service_menu_anchor: Option<gpui::Point<gpui::Pixels>>,
     /// usage トークン推移の履歴（#217 スパークライン。最大 5 点、変化時のみ追記）
     usage_history: std::collections::VecDeque<f32>,
     /// 端末イベントの再描画デバウンス: 最後に notify した時刻
@@ -1802,6 +1804,7 @@ impl TakoApp {
             codex_metrics: AgentMetrics::default(),
             limit_service: tako_control::settings::load().limit_service(),
             limit_service_menu_open: false,
+            limit_service_menu_anchor: None,
             usage_history: std::collections::VecDeque::new(),
             last_term_notify: std::time::Instant::now(),
             term_notify_pending: false,
@@ -10866,6 +10869,8 @@ impl UiStateHost for TakoApp {
 
     fn set_limit_service(&mut self, service: tako_core::LimitService) {
         self.limit_service = service;
+        self.limit_service_menu_open = false;
+        self.limit_service_menu_anchor = None;
     }
 
     fn panel_state(&self) -> (bool, f32, tako_control::protocol::PanelViewWire) {
@@ -12814,6 +12819,7 @@ impl Render for TakoApp {
             .children(pane_context_overlay)
             .children(hover_preview_overlay)
             .children(pinned_overlays)
+            .children(self.render_limit_service_overlay(cx))
             .children(self.render_close_confirm_dialog(cx))
             .children(self.render_attention_toasts(cx))
             .children(self.render_command_palette(cx))
