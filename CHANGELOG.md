@@ -5,6 +5,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- [改善] sleep guard の busy 判定を UI スレッドから background へ移動 (#340)
+  persist 復元後の Unknown ペイン常在時、2 秒毎の子プロセス判定（tmux + ps 実行）が
+  UI スレッドを p50 42ms 専有し続けていた（#324 で導入、#212 の pmset と同型）。
+  判定を background executor へ移し、UI 側は Unknown ペインの収集のみに変更
+
+  Move sleep guard busy detection off the UI thread to the background (#340).
+  With Unknown panes persisting after restore, the 2-second child-process check
+  (spawning tmux + ps) was occupying the UI thread for p50 42ms per tick
+  (introduced in #324; same pattern as the #212 pmset issue). The check now runs
+  on the background executor; the UI thread only collects Unknown pane names.
+
 - [機能追加] 複数ウィンドウ対応: ビューポート方式で別ウィンドウに別タブを表示 (#339)
   単一アプリ状態（タブ・ペイン・tmux・discovery）を複数ウィンドウで共有し、各ウィンドウは
   表示タブだけを持つ。New Window（⌘⇧N）が状態共有の追加ウィンドウになり、タブの
