@@ -35,4 +35,3 @@ ureq.workspace = true
 # Web ビューペイン（FR-3.8）: OS ネイティブ webview の GPUI 子ビュー統合
 wry.workspace = true
 raw-window-handle.workspace = true
-
