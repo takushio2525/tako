@@ -92,6 +92,9 @@ enum Command {
     /// タブ操作（new / rename / select / move-pane）
     #[command(subcommand)]
     Tab(TabCommand),
+    /// 複数ウィンドウの操作（Issue #339。list / new / close / move-tab / focus）
+    #[command(subcommand)]
+    Window(WindowCommand),
     /// タブ・ペイン名の AI 自動リネームの ON/OFF・状態確認
     Autorename(ToggleArgs),
     /// listen ポート検知 + 提案チップの ON/OFF・状態確認
@@ -1793,6 +1796,37 @@ enum TabCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum WindowCommand {
+    /// ウィンドウ一覧を表示する
+    List,
+    /// 新しいウィンドウを開く。--tab で既存タブを分離、省略で新規タブ付き
+    New {
+        /// このタブを新しいウィンドウへ分離する（省略時は新規タブを作って開く）
+        #[arg(long)]
+        tab: Option<u64>,
+    },
+    /// ウィンドウを閉じる（タブは残存ウィンドウへ合流。プロセスは殺さない）
+    Close {
+        /// 対象ウィンドウ ID
+        window: u64,
+    },
+    /// タブを別ウィンドウへ移動する（移動先の表示タブになる）
+    MoveTab {
+        /// 移動するタブ ID
+        #[arg(long)]
+        tab: u64,
+        /// 移動先ウィンドウ ID
+        #[arg(long)]
+        window: u64,
+    },
+    /// ウィンドウをアクティブにして前面化する
+    Focus {
+        /// 対象ウィンドウ ID
+        window: u64,
+    },
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -3357,6 +3391,18 @@ fn build_request(command: &Command) -> Result<Request, String> {
             title: title.join(" "),
         },
         Command::Tab(TabCommand::Select { tab }) => Request::TabSelect { tab: *tab },
+        Command::Window(WindowCommand::List) => Request::WindowList,
+        Command::Window(WindowCommand::New { tab }) => Request::WindowNew { tab: *tab },
+        Command::Window(WindowCommand::Close { window }) => {
+            Request::WindowClose { window: *window }
+        }
+        Command::Window(WindowCommand::MoveTab { tab, window }) => Request::WindowMoveTab {
+            tab: *tab,
+            window: *window,
+        },
+        Command::Window(WindowCommand::Focus { window }) => {
+            Request::WindowFocus { window: *window }
+        }
         Command::Tab(TabCommand::Reorder { tab, index }) => Request::TabReorder {
             tab: *tab,
             index: *index,
