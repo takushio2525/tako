@@ -65,6 +65,24 @@ pub struct LayoutFile {
     /// PaneLayout.webview に載る）。旧ファイル後方互換のため default + 空省略
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub webview_dock: Vec<String>,
+    /// 複数ウィンドウの配置（Issue #339 ビューポート方式）。旧ファイルには無いので
+    /// serde default（空 = 全タブを 1 ウィンドウで復元）、空なら出力省略で後方互換
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<WindowLayout>,
+}
+
+/// 論理ウィンドウ 1 枚の保存形（Issue #339）。タブの実体は `tabs` にあり、
+/// ここは所属と表示タブ・OS フレームだけを持つ
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowLayout {
+    pub id: u64,
+    /// 所属タブ ID（表示順）
+    pub tabs: Vec<u64>,
+    /// このウィンドウが表示中のタブ
+    pub active_tab: u64,
+    /// OS ウィンドウのフレーム（未採取なら None = 既定サイズで開く）
+    #[serde(default)]
+    pub frame: Option<WindowFrame>,
 }
 
 impl LayoutFile {
@@ -281,6 +299,26 @@ pub fn capture(
         // 無い UI 状態なので capture では空にし、save 時に UI 層が埋める
         collapsed: Vec::new(),
         webview_dock: Vec::new(),
+        // 複数ウィンドウの配置（Issue #339）。単一ウィンドウ時は空にして出力を
+        // 省略し、旧バージョンでも読める JSON を保つ。OS フレームは save 時に
+        // UI 層（window_frames）が埋める
+        windows: if ws.windows().len() > 1 {
+            ws.windows()
+                .iter()
+                .map(|w| WindowLayout {
+                    id: w.id().as_u64(),
+                    tabs: ws
+                        .window_tab_ids(w.id())
+                        .iter()
+                        .map(|t| t.as_u64())
+                        .collect(),
+                    active_tab: w.active_tab().as_u64(),
+                    frame: None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -427,8 +465,28 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
     }
 
     let active = active.unwrap_or(tabs[0].id());
-    let ws =
-        Workspace::restore_with_shelved(tabs, active, bg_panes).ok_or(LayoutError::Workspace)?;
+    // 複数ウィンドウの復元（Issue #339）。保存が無ければ全タブ 1 ウィンドウ。
+    // 壊れた割当（存在しないタブ・二重割当）は tako-core 側が安全に読み飛ばす
+    let ws = if file.windows.is_empty() {
+        Workspace::restore_with_shelved(tabs, active, bg_panes)
+    } else {
+        Workspace::restore_with_windows(
+            tabs,
+            active,
+            bg_panes,
+            file.windows
+                .iter()
+                .map(|w| {
+                    (
+                        w.id,
+                        w.tabs.iter().map(|t| TabId::from_raw(*t)).collect(),
+                        TabId::from_raw(w.active_tab),
+                    )
+                })
+                .collect(),
+        )
+    }
+    .ok_or(LayoutError::Workspace)?;
     Ok((ws, restored))
 }
 
@@ -780,6 +838,68 @@ mod tests {
     }
 
     #[test]
+    fn 複数ウィンドウ配置が永続化で往復する() {
+        let mut ws = sample_workspace();
+        let t2 = ws.tabs()[1].id();
+        let (w2, _) = ws.move_tab_to_new_window(t2).unwrap();
+        let w1 = ws.window_of_tab(ws.tabs()[0].id()).unwrap();
+        let mut layout = capture(&ws, &|_| PaneMeta::default(), None);
+        assert_eq!(layout.windows.len(), 2);
+        // save 時に UI 層が埋めるフレームも往復する
+        layout.windows[1].frame = Some(WindowFrame {
+            x: 30.0,
+            y: 40.0,
+            width: 800.0,
+            height: 500.0,
+            state: "windowed".into(),
+        });
+        let json = serde_json::to_string(&layout).unwrap();
+        let back: LayoutFile = serde_json::from_str(&json).unwrap();
+        let (restored_ws, _) = restore(&back).unwrap();
+        assert_eq!(restored_ws.windows().len(), 2);
+        let rt1 = restored_ws.tabs()[0].id();
+        let rt2 = restored_ws.tabs()[1].id();
+        assert_eq!(
+            restored_ws.window_of_tab(rt1).map(|w| w.as_u64()),
+            Some(w1.as_u64())
+        );
+        assert_eq!(
+            restored_ws.window_of_tab(rt2).map(|w| w.as_u64()),
+            Some(w2.as_u64())
+        );
+        // アクティブウィンドウ（タブ 2 を分離した w2 がアクティブ）も復元される
+        assert_eq!(restored_ws.active_window_id().as_u64(), w2.as_u64());
+        assert_eq!(back.windows[1].frame.as_ref().map(|f| f.width), Some(800.0));
+        // 単一ウィンドウの保存は windows を省略し旧バージョンでも読める JSON になる
+        let single = capture(&sample_workspace(), &|_| PaneMeta::default(), None);
+        assert!(single.windows.is_empty());
+        assert!(!serde_json::to_string(&single)
+            .unwrap()
+            .contains("\"windows\""));
+    }
+
+    #[test]
+    fn 複数ウィンドウの壊れた保存値は単一ウィンドウへ縮退する() {
+        let ws = sample_workspace();
+        let mut layout = capture(&ws, &|_| PaneMeta::default(), None);
+        // 実在しないタブだけを指すウィンドウ割当（継ぎ接ぎ・部分破損を想定)
+        layout.windows = vec![WindowLayout {
+            id: 900,
+            tabs: vec![88888],
+            active_tab: 88888,
+            frame: None,
+        }];
+        let (restored_ws, _) = restore(&layout).unwrap();
+        // 全タブがフォールバックの単一ウィンドウに属し不変条件が保たれる
+        assert_eq!(restored_ws.windows().len(), 1);
+        let w = restored_ws.active_window_id();
+        assert!(restored_ws
+            .tabs()
+            .iter()
+            .all(|t| restored_ws.window_of_tab(t.id()) == Some(w)));
+    }
+
+    #[test]
     fn webビューdockが永続化で往復する() {
         let ws = sample_workspace();
         let mut layout = capture(&ws, &|_| PaneMeta::default(), None);
@@ -805,6 +925,7 @@ mod tests {
                 backgrounded: vec![],
                 collapsed: vec![],
                 webview_dock: vec![],
+                windows: vec![],
             })
             .err(),
             Some(LayoutError::Empty)
@@ -917,6 +1038,7 @@ mod tests {
             backgrounded: Vec::new(),
             collapsed: Vec::new(),
             webview_dock: Vec::new(),
+            windows: Vec::new(),
         }
     }
 

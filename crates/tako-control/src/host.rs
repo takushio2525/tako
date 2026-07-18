@@ -136,6 +136,9 @@ pub trait TmuxHost {
 // ---------------------------------------------------------------------------
 
 pub trait UiStateHost {
+    /// 論理ウィンドウの GPUI ウィンドウ生成を依頼する（Issue #339）。
+    /// dispatch は GPUI の Context を持たないため、UI 層が render で消費する
+    fn request_viewport_open(&mut self, _window: tako_core::WindowId) {}
     /// AI 自動リネーム（FR-2.12.4）の現在状態。UI 層が検知ループの状態を返す
     fn auto_rename_enabled(&self) -> bool {
         true

@@ -578,6 +578,23 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_window",
+            "description": "複数ウィンドウの操作（ビューポート方式: タブ・ペインの実体は全ウィンドウで\
+                共有され、各ウィンドウは表示タブだけを持つ）。action: list = ウィンドウ一覧、\
+                new = 新しいウィンドウを開く（tab 指定でそのタブを分離、省略で新規タブ付き）、\
+                close = ウィンドウを閉じる（タブは残存ウィンドウへ合流しプロセスは殺さない）、\
+                move-tab = タブを別ウィンドウへ移動、focus = ウィンドウをアクティブにして前面化。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "new", "close", "move-tab", "focus"], "description": "省略時は list" },
+                    "tab": { "type": "integer", "minimum": 0, "description": "new: 分離するタブ ID（省略で新規タブ）/ move-tab: 移動するタブ ID" },
+                    "window": { "type": "integer", "minimum": 0, "description": "close / move-tab / focus の対象ウィンドウ ID" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_move_pane_to_tab",
             "description": "ペインを移動する。tab 指定 = 別タブの末尾へ移送（グループ分け）、\
                 target 指定 = そのペインの隣（direction 側）へ挿し直す（同タブ内の並べ替え = \
@@ -2634,6 +2651,30 @@ fn build_request(
             tab: required_u64(args, "tab")?,
             index: required_u64(args, "index")? as usize,
         },
+        "tako_window" => {
+            let action = str_arg(args, "action")?.unwrap_or_else(|| "list".into());
+            match action.as_str() {
+                "list" => Request::WindowList,
+                "new" => Request::WindowNew {
+                    tab: u64_arg(args, "tab")?,
+                },
+                "close" => Request::WindowClose {
+                    window: required_u64(args, "window")?,
+                },
+                "move-tab" => Request::WindowMoveTab {
+                    tab: required_u64(args, "tab")?,
+                    window: required_u64(args, "window")?,
+                },
+                "focus" => Request::WindowFocus {
+                    window: required_u64(args, "window")?,
+                },
+                other => {
+                    return Err(format!(
+                        "action が不正: {other}（list | new | close | move-tab | focus）"
+                    ))
+                }
+            }
+        }
         "tako_move_pane_to_tab" => {
             let new_tab = bool_arg(args, "new_tab")?.unwrap_or(false);
             Request::MovePane {
@@ -3870,7 +3911,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 100);
+        assert_eq!(tools.len(), 101);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

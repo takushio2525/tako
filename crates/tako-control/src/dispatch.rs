@@ -892,6 +892,69 @@ fn dispatch_inner(
             Ok(Value::Null)
         }
 
+        Request::WindowList => Ok(windows_json(host.workspace())),
+
+        Request::WindowNew { tab } => match tab {
+            // 既存タブを新しいウィンドウへ分離
+            Some(t) => {
+                let tab_id = find_tab(host.workspace(), t)?;
+                let (wid, closed) = host
+                    .workspace_mut()
+                    .move_tab_to_new_window(tab_id)
+                    .map_err(op_err)?;
+                host.request_viewport_open(wid);
+                Ok(json!({
+                    "window": wid.as_u64(),
+                    "tab": tab_id.as_u64(),
+                    "closed_window": closed.map(|w| w.as_u64()),
+                }))
+            }
+            // 新規タブ 1 つ付きの新しいウィンドウ
+            None => {
+                let pane = Pane::new(origin);
+                let pane_id = pane.id();
+                let title = (host.workspace().tabs().len() + 1).to_string();
+                let (wid, tab_id) = host.workspace_mut().create_window(title, pane);
+                host.attach_session(pane_id, SpawnOptions::default());
+                host.request_viewport_open(wid);
+                Ok(json!({
+                    "window": wid.as_u64(),
+                    "tab": tab_id.as_u64(),
+                    "pane": pane_id.as_u64(),
+                }))
+            }
+        },
+
+        Request::WindowClose { window } => {
+            let wid = find_window(host.workspace(), window)?;
+            let moved = host.workspace_mut().close_window(wid).map_err(op_err)?;
+            // GPUI ウィンドウの実 close は UI 層の同期（sync_viewports）が拾う
+            Ok(json!({
+                "window": wid.as_u64(),
+                "moved_tabs": moved.iter().map(|t| t.as_u64()).collect::<Vec<_>>(),
+            }))
+        }
+
+        Request::WindowMoveTab { tab, window } => {
+            let tab_id = find_tab(host.workspace(), tab)?;
+            let wid = find_window(host.workspace(), window)?;
+            let closed = host
+                .workspace_mut()
+                .move_tab_to_window(tab_id, wid)
+                .map_err(op_err)?;
+            Ok(json!({
+                "tab": tab_id.as_u64(),
+                "window": wid.as_u64(),
+                "closed_window": closed.map(|w| w.as_u64()),
+            }))
+        }
+
+        Request::WindowFocus { window } => {
+            let wid = find_window(host.workspace(), window)?;
+            host.workspace_mut().activate_window(wid).map_err(op_err)?;
+            Ok(Value::Null)
+        }
+
         Request::TabReorder { tab, index } => {
             let tab_id = find_tab(host.workspace(), tab)?;
             let actual = host
@@ -4820,6 +4883,27 @@ fn find_tab(ws: &Workspace, raw: u64) -> Result<TabId, DispatchError> {
         .ok_or(DispatchError::TabNotFound(raw))
 }
 
+fn find_window(ws: &Workspace, raw: u64) -> Result<tako_core::WindowId, DispatchError> {
+    ws.windows()
+        .iter()
+        .map(|w| w.id())
+        .find(|w| w.as_u64() == raw)
+        .ok_or_else(|| DispatchError::Operation(format!("ウィンドウ {raw} が見つからない")))
+}
+
+/// ウィンドウ一覧（Issue #339）。`WindowList` 応答と `list` の windows フィールドで共用
+fn windows_json(ws: &Workspace) -> Value {
+    json!({
+        "active_window": ws.active_window_id().as_u64(),
+        "windows": ws.windows().iter().map(|w| json!({
+            "id": w.id().as_u64(),
+            "active": w.id() == ws.active_window_id(),
+            "active_tab": w.active_tab().as_u64(),
+            "tabs": ws.window_tab_ids(w.id()).iter().map(|t| t.as_u64()).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
 fn tree_mut(ws: &mut Workspace, tab: TabId) -> &mut tako_core::PaneTree {
     ws.get_tab_mut(tab)
         .expect("呼び出し前に存在確認済みのタブ")
@@ -4851,15 +4935,18 @@ fn dir_of(path: &std::path::Path) -> std::path::PathBuf {
 /// ツリー構造 + 単位矩形ジオメトリ + 各ペインの状態を返す
 fn list_json(host: &dyn ControlHost) -> Value {
     let ws = host.workspace();
+    // いずれかのウィンドウで表示中のタブ集合（Issue #339。surface 判定に使う）
+    let displayed: std::collections::HashSet<TabId> =
+        ws.windows().iter().map(|w| w.active_tab()).collect();
     let tabs: Vec<Value> = ws
         .tabs()
         .iter()
         .map(|tab| {
             let tree = tab.tree();
             let rects = tree.layout(Rect::UNIT);
-            // 前面表示中（アクティブタブ）か裏で動いているか（FR-2.16.12）。
-            // tako はアクティブタブの全ペインをタイル表示するので、表示中 = アクティブタブ所属
-            let tab_active = tab.id() == ws.active_tab_id();
+            // 前面表示中か裏で動いているか（FR-2.16.12）。tako は表示タブの全ペインを
+            // タイル表示するので、表示中 = いずれかのウィンドウの表示タブ所属（Issue #339）
+            let tab_active = displayed.contains(&tab.id());
             let panes: Vec<Value> = tree
                 .panes()
                 .iter()
@@ -4934,7 +5021,9 @@ fn list_json(host: &dyn ControlHost) -> Value {
                 "id": tab.id().as_u64(),
                 "title": tab.title(),
                 "title_source": title_source_str(tab.title_source()),
-                "active": tab_active,
+                "active": tab.id() == ws.active_tab_id(),
+                // 所属ウィンドウ（Issue #339。後方互換: 単一ウィンドウでは常に同じ値）
+                "window": ws.window_of_tab(tab.id()).map(|w| w.as_u64()),
                 // サイドバー tmux ビューでこのタブ枠が折りたたまれているか（FR-2.16.14）
                 "collapsed": host.tmux_tab_collapsed(tab.id()),
                 "focused_pane": tree.focused().as_u64(),
@@ -4960,6 +5049,9 @@ fn list_json(host: &dyn ControlHost) -> Value {
         .collect();
     json!({
         "active_tab": ws.active_tab_id().as_u64(),
+        // 複数ウィンドウ（Issue #339）。後方互換: 既存フィールドは維持し追加のみ
+        "active_window": ws.active_window_id().as_u64(),
+        "windows": windows_json(ws)["windows"].clone(),
         "tabs": tabs,
         "shelved_panes": shelved,
         // ピン留め中のプレビューウィンドウ（FR-2.16.15。AI が現在のピンを把握できる）
@@ -9164,5 +9256,116 @@ mod tests {
             "{}",
             cmd.program
         );
+    }
+
+    // === 複数ウィンドウ（Issue #339） ===
+
+    #[test]
+    fn window系の一連操作とlist反映() {
+        let mut host = MockHost::new();
+        let w1 = host.workspace().active_window_id().as_u64();
+        // 新規タブ付きの新ウィンドウ
+        let r = dispatch(&mut host, Request::WindowNew { tab: None }, PaneOrigin::Cli).unwrap();
+        let w2 = r["window"].as_u64().unwrap();
+        let t2 = r["tab"].as_u64().unwrap();
+        assert!(r["pane"].as_u64().is_some());
+        assert_ne!(w2, w1);
+        // 一覧: 2 ウィンドウ + 新ウィンドウがアクティブ
+        let r = dispatch(&mut host, Request::WindowList, PaneOrigin::Cli).unwrap();
+        assert_eq!(r["active_window"].as_u64(), Some(w2));
+        assert_eq!(r["windows"].as_array().unwrap().len(), 2);
+        // タブを w1 へ移動 → w2 が空になり除去される
+        let r = dispatch(
+            &mut host,
+            Request::WindowMoveTab {
+                tab: t2,
+                window: w1,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(r["closed_window"].as_u64(), Some(w2));
+        // list に windows / active_window / tabs[].window が載る（後方互換の追加フィールド）
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        assert_eq!(list["active_window"].as_u64(), Some(w1));
+        assert_eq!(list["windows"].as_array().unwrap().len(), 1);
+        let tabs = list["tabs"].as_array().unwrap();
+        assert_eq!(tabs.len(), 2);
+        assert!(tabs.iter().all(|t| t["window"].as_u64() == Some(w1)));
+        // タブ分離（tab 指定の WindowNew）
+        let r = dispatch(
+            &mut host,
+            Request::WindowNew { tab: Some(t2) },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let w3 = r["window"].as_u64().unwrap();
+        assert_eq!(r["tab"].as_u64(), Some(t2));
+        assert_eq!(r["closed_window"], Value::Null);
+        // focus で w1 へ戻す
+        dispatch(
+            &mut host,
+            Request::WindowFocus { window: w1 },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let r = dispatch(&mut host, Request::WindowList, PaneOrigin::Cli).unwrap();
+        assert_eq!(r["active_window"].as_u64(), Some(w1));
+        // close で合流（タブは残る）
+        let tab_count = host.workspace().tabs().len();
+        let r = dispatch(
+            &mut host,
+            Request::WindowClose { window: w3 },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(r["moved_tabs"].as_array().unwrap().len(), 1);
+        assert_eq!(host.workspace().tabs().len(), tab_count);
+        // 存在しないウィンドウはエラー / 最後の 1 ウィンドウは閉じられない
+        assert!(dispatch(
+            &mut host,
+            Request::WindowFocus { window: 99999 },
+            PaneOrigin::Cli
+        )
+        .is_err());
+        assert!(dispatch(
+            &mut host,
+            Request::WindowClose { window: w1 },
+            PaneOrigin::Cli
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn listのsurfaceは全ウィンドウの表示タブを前面扱いする() {
+        let mut host = MockHost::new();
+        // タブ 2 枚目を作って新ウィンドウへ分離 → 両タブとも表示中になる
+        let r = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let t2 = r["tab"].as_u64().unwrap();
+        dispatch(
+            &mut host,
+            Request::WindowNew { tab: Some(t2) },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        for tab in list["tabs"].as_array().unwrap() {
+            for pane in tab["panes"].as_array().unwrap() {
+                assert_eq!(
+                    pane["surface"].as_str(),
+                    Some("foreground"),
+                    "タブ {} のペインは表示中のはず",
+                    tab["id"]
+                );
+            }
+        }
     }
 }

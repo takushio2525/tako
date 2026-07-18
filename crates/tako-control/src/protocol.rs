@@ -256,6 +256,21 @@ pub enum Request {
     TabSelect { tab: u64 },
     /// タブの並べ替え（#308）。`tab` を `index`（0 始まり）の位置へ移動する
     TabReorder { tab: u64, index: usize },
+    /// ウィンドウ一覧（Issue #339。ビューポート方式の論理ウィンドウ）
+    WindowList,
+    /// 新しいウィンドウを開く（Issue #339）。`tab` 指定 = そのタブを新ウィンドウへ
+    /// 分離、省略 = 新規タブ 1 つ付きで開く
+    WindowNew {
+        #[serde(default)]
+        tab: Option<u64>,
+    },
+    /// ウィンドウを閉じる（Issue #339）。所属タブは残存ウィンドウへ合流し、
+    /// タブ・プロセスは殺さない。最後の 1 ウィンドウは閉じられない
+    WindowClose { window: u64 },
+    /// タブを別ウィンドウへ移動する（Issue #339）。移動先の表示タブになる
+    WindowMoveTab { tab: u64, window: u64 },
+    /// ウィンドウをアクティブにして前面化する（Issue #339）
+    WindowFocus { window: u64 },
     /// ペインの移動（FR-2.5.10 / FR-1.10）。`tab` 指定 = 別タブの末尾へ移送（従来動作）、
     /// `target` 指定 = そのペインを `direction`（省略時は右）へ分割した位置に挿し直す
     /// （同タブ内の並べ替え = タイトルバー D&D と同等。タブまたぎも可）。
