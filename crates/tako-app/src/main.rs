@@ -934,6 +934,8 @@ struct TakoApp {
     last_active_tab: Option<TabId>,
     /// タイトルバー（タブバー領域）のドラッグでウインドウ移動中か（#312）
     titlebar_dragging: bool,
+    /// タブ要素上で mouse down されたか（#308: タブ D&D とウインドウドラッグの競合防止）
+    tab_mouse_down: bool,
 }
 
 /// × ボタン close の確認ダイアログ対象（Issue #172）
@@ -1869,6 +1871,7 @@ impl TakoApp {
             tab_scroll_handle: gpui::ScrollHandle::new(),
             last_active_tab: None,
             titlebar_dragging: false,
+            tab_mouse_down: false,
         };
         // App Nap 無効化 + 初回スリープ防止更新（Issue #173）
         // 蓋閉じ防止の残留チェック（#218: 前回クラッシュ時の disablesleep=1 を自動復帰）
@@ -6519,9 +6522,8 @@ impl TakoApp {
             let _ = entity.update(cx, |this, cx| {
                 this.drag_kind = Some(kind);
                 this.drop_target = None;
-                // #308: タブ D&D 開始時に titlebar_dragging を解除して
-                // #312 のウインドウ移動と競合しないようにする
                 this.titlebar_dragging = false;
+                this.tab_mouse_down = false;
                 cx.notify();
             });
             cx.new(|_| DragGhost {

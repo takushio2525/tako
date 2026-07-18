@@ -147,13 +147,15 @@ impl TakoApp {
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, _, _| {
                     this.titlebar_dragging = false;
+                    this.tab_mouse_down = false;
                 }),
             )
             .on_mouse_down_out(cx.listener(|this, _, _, _| {
                 this.titlebar_dragging = false;
+                this.tab_mouse_down = false;
             }))
             .on_mouse_move(cx.listener(|this, _, window, _| {
-                if this.titlebar_dragging {
+                if this.titlebar_dragging && !this.tab_mouse_down {
                     this.titlebar_dragging = false;
                     window.start_window_move();
                 }
@@ -299,6 +301,12 @@ impl TakoApp {
                                                 hsla(theme.tab_inactive_foreground)
                                             })
                                             .text_size(px(12.5))
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                cx.listener(move |this, _, _, _| {
+                                                    this.tab_mouse_down = true;
+                                                }),
+                                            )
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 let _ = this.workspace.activate_tab(id);
                                                 this.scroll_active_tab_into_view();
