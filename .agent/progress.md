@@ -868,3 +868,8 @@
 - 根因 = PRIMARY_CLAIMED（#113 多重起動ガード）が swap(true) のみで false に戻す処理がなかった。赤ボタン close → プロセス生存 → on_reopen → TakoApp::new 2 回目 → セカンダリ判定 → 復元スキップ。release_primary() を新設し on_window_should_close で解放
 - 関連コミット: `5c1795e`（PR #362 squash merge）。fmt / clippy / test 288 / セルフテスト全緑
 - 次: `build-app.sh --install` → 実機確認（赤ボタン close → Dock 復帰 → タブ完全復元）
+
+## 2026-07-18（#308 再修正: タブ D&D がウインドウ移動に食われる競合を根治）
+- 根因 = GPUI の on_drag は DRAG_THRESHOLD(2px) 超過まで待機するが、親 tab-bar の on_mouse_move → start_window_move() が 1px 移動で先に発火。tab_mouse_down フラグで抑制
+- 関連コミット: `73da200`（PR #363 squash merge）。fmt / clippy / test 288 / セルフテスト全緑
+- 次: `build-app.sh --install` → 実機確認（タブドラッグ並べ替え・空き領域ウインドウ移動の両立）
