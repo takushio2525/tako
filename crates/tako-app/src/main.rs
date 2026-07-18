@@ -20502,6 +20502,101 @@ mod self_test {
                 .unwrap_or(false);
             check(ime_close_ok, "IME 状態: 変換中ペインの close で畳まれる (#332)");
 
+            // 77. 複数ウィンドウ（#339 ビューポート方式）: CLI で window new →
+            //     論理 + GPUI ウィンドウが増え同一 TakoApp entity を共有 → タブは
+            //     ウィンドウ間で排他 → move-tab で合流すると空ウィンドウが自動 close
+            let win_before = window
+                .update(cx, |app, _, cx| {
+                    (app.workspace.windows().len(), cx.windows().len())
+                })
+                .unwrap_or((0, 0));
+            let new_ok = window
+                .update(cx, |app, _, cx| {
+                    let r = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::WindowNew { tab: None },
+                        tako_core::PaneOrigin::Cli,
+                    );
+                    // IPC ループの後処理相当（pending 消費 + GPUI ウィンドウ同期）
+                    for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                        let _ = app.spawn_session(pane, options, cx);
+                    }
+                    app.sync_viewports(cx);
+                    r.is_ok()
+                })
+                .unwrap_or(false);
+            check(new_ok, "window new の dispatch が成功する (#339)");
+            wait(cx, 1500).await;
+            let (logical_after, gpui_after, new_tab, tabs_exclusive) = window
+                .update(cx, |app, _, cx| {
+                    let logical = app.workspace.windows().len();
+                    let gpui = cx.windows().len();
+                    let active_win = app.workspace.active_window_id();
+                    let new_tab = app
+                        .workspace
+                        .get_window(active_win)
+                        .map(|w| w.active_tab());
+                    // 全タブがちょうど 1 つのウィンドウに属する（排他）
+                    let sum: usize = app
+                        .workspace
+                        .windows()
+                        .iter()
+                        .map(|w| app.workspace.window_tab_ids(w.id()).len())
+                        .sum();
+                    (logical, gpui, new_tab, app.workspace.tabs().len() == sum)
+                })
+                .unwrap_or((0, 0, None, false));
+            check(
+                logical_after == win_before.0 + 1 && gpui_after == win_before.1 + 1,
+                "window new: 論理 + GPUI ウィンドウが 1 枚増える (#339)",
+            );
+            check(tabs_exclusive, "window: タブはウィンドウ間で排他 (#339)");
+            let first_window = window
+                .update(cx, |app, _, _| app.workspace.windows()[0].id().as_u64())
+                .unwrap_or(0);
+            let moved_tab = new_tab.map(|t| t.as_u64()).unwrap_or(0);
+            let move_ok = window
+                .update(cx, |app, _, cx| {
+                    let r = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::WindowMoveTab {
+                            tab: moved_tab,
+                            window: first_window,
+                        },
+                        tako_core::PaneOrigin::Cli,
+                    );
+                    app.sync_viewports(cx);
+                    r.is_ok()
+                })
+                .unwrap_or(false);
+            check(move_ok, "window move-tab の dispatch が成功する (#339)");
+            wait(cx, 1500).await;
+            let (logical_end, gpui_end, tab_moved) = window
+                .update(cx, |app, _, cx| {
+                    (
+                        app.workspace.windows().len(),
+                        cx.windows().len(),
+                        app.workspace
+                            .window_of_tab(TabId::from_raw(moved_tab))
+                            .map(|w| w.as_u64()),
+                    )
+                })
+                .unwrap_or((0, 0, None));
+            check(
+                logical_end == win_before.0
+                    && gpui_end == win_before.1
+                    && tab_moved == Some(first_window),
+                "window move-tab: タブ合流 + 空ウィンドウ自動 close (#339)",
+            );
+            // 後始末: 合流させたタブを閉じてレイアウトを戻す
+            let _ = window.update(cx, |app, _, cx| {
+                let tab = TabId::from_raw(moved_tab);
+                if let Some(pane) = app.workspace.get_tab(tab).map(|t| t.tree().focused()) {
+                    app.remove_pane(pane, cx);
+                }
+            });
+            wait(cx, 800).await;
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
