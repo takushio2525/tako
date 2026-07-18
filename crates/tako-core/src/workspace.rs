@@ -1,4 +1,12 @@
 //! Workspace — タブ一覧とアクティブタブの管理（FR-1.2）
+//!
+//! 複数ウィンドウ（Issue #339・ビューポート方式）: タブ・ペインの実体は Workspace が
+//! 単一で持ち、論理ウィンドウ（`WorkspaceWindow`）は「どのタブを表示するか」だけを持つ。
+//! 各タブはちょうど 1 つのウィンドウに属する（同一タブの複数ウィンドウ同時表示はしない）。
+
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::pane::{Pane, PaneId};
 use crate::pane_tree::{PaneTreeError, SplitDirection};
@@ -16,9 +24,63 @@ pub enum WorkspaceError {
     AlreadyInTab(PaneId, TabId),
     #[error("ペイン {0} を自分自身の隣へは移動できない")]
     MoveOntoSelf(PaneId),
+    #[error("ウィンドウ {0} が見つからない")]
+    WindowNotFound(WindowId),
+    #[error("最後の 1 ウィンドウは閉じられない")]
+    LastWindow,
 }
 
-/// アプリ全体の状態のルート。常に 1 つ以上のタブを持つ
+/// 論理ウィンドウ ID（Issue #339）。GPUI 非依存の連番で、OS ウィンドウとの対応は
+/// UI 層（tako-app）が持つ。CLI / MCP にはこの ID を公開する
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WindowId(u64);
+
+static WINDOW_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+impl WindowId {
+    fn next() -> Self {
+        WindowId(WINDOW_ID_COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// 既知の ID から構築する（レイアウト復元用）。採番カウンタを ID の先へ進めて
+    /// 後続の新規ウィンドウとの ID 再利用衝突を防ぐ（`TabId::from_raw` と同様）
+    pub fn from_raw(id: u64) -> Self {
+        WINDOW_ID_COUNTER.fetch_max(id.saturating_add(1), Ordering::Relaxed);
+        WindowId(id)
+    }
+
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for WindowId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// ビューポート方式の論理ウィンドウ（Issue #339）。表示タブの参照だけを持ち、
+/// タブ → ウィンドウの所属は `Workspace::assignments` が正
+#[derive(Debug)]
+pub struct WorkspaceWindow {
+    id: WindowId,
+    /// このウィンドウが表示中のタブ
+    active: TabId,
+}
+
+impl WorkspaceWindow {
+    pub fn id(&self) -> WindowId {
+        self.id
+    }
+
+    /// このウィンドウが表示中のタブ
+    pub fn active_tab(&self) -> TabId {
+        self.active
+    }
+}
+
+/// アプリ全体の状態のルート。常に 1 つ以上のタブと 1 つ以上のウィンドウを持つ
 #[derive(Debug)]
 pub struct Workspace {
     tabs: Vec<Tab>,
@@ -26,6 +88,12 @@ pub struct Workspace {
     /// バックグラウンド（FR-2.15）: タブから外したがプロセスは生きているペイン。
     /// 由来タブごとに分離表示する（FR-2.15.6）ため `BackgroundPane` で由来を保持する
     shelved: Vec<BackgroundPane>,
+    /// 論理ウィンドウ（Issue #339）。常に 1 つ以上。空になったウィンドウは即座に除去する
+    windows: Vec<WorkspaceWindow>,
+    /// タブ → 所属ウィンドウ。不変条件: 全タブがちょうど 1 ウィンドウに属する
+    assignments: HashMap<TabId, WindowId>,
+    /// フォーカスされている論理ウィンドウ。不変条件: `active` は常にこのウィンドウの表示タブ
+    active_window: WindowId,
 }
 
 /// バックグラウンドへバックグラウンドしたペイン（FR-2.15）。「タブ別分離」表示（タブツリー・ドロワー）と
@@ -83,10 +151,20 @@ impl Workspace {
     pub fn new(initial_tab_title: impl Into<String>, root_pane: Pane) -> Self {
         let tab = Tab::new(initial_tab_title, root_pane);
         let active = tab.id();
+        Self::single_window(vec![tab], active, Vec::new())
+    }
+
+    /// 全タブを 1 つの論理ウィンドウに載せて構築する（新規作成・後方互換復元の共通経路）
+    fn single_window(tabs: Vec<Tab>, active: TabId, shelved: Vec<BackgroundPane>) -> Self {
+        let wid = WindowId::next();
+        let assignments = tabs.iter().map(|t| (t.id(), wid)).collect();
         Self {
-            tabs: vec![tab],
+            tabs,
             active,
-            shelved: Vec::new(),
+            shelved,
+            windows: vec![WorkspaceWindow { id: wid, active }],
+            assignments,
+            active_window: wid,
         }
     }
 
@@ -101,11 +179,7 @@ impl Workspace {
         } else {
             tabs[0].id()
         };
-        Some(Self {
-            tabs,
-            active,
-            shelved: Vec::new(),
-        })
+        Some(Self::single_window(tabs, active, Vec::new()))
     }
 
     pub fn tabs(&self) -> &[Tab] {
@@ -140,16 +214,37 @@ impl Workspace {
         self.tabs.iter_mut().find(|t| t.id() == id)
     }
 
-    /// 新しいタブを末尾に作成し、アクティブにする
+    /// 新しいタブを末尾に作成し、アクティブにする（アクティブウィンドウに属する）
     pub fn create_tab(&mut self, title: impl Into<String>, root_pane: Pane) -> TabId {
+        let wid = self.active_window;
+        self.create_tab_in_window(title, root_pane, wid)
+            .expect("アクティブウィンドウは常に存在する")
+    }
+
+    /// 指定ウィンドウに新しいタブを作り、そのウィンドウの表示タブにする（Issue #339）。
+    /// アクティブウィンドウに作った場合はグローバルのアクティブタブも切り替わる
+    pub fn create_tab_in_window(
+        &mut self,
+        title: impl Into<String>,
+        root_pane: Pane,
+        wid: WindowId,
+    ) -> Result<TabId, WorkspaceError> {
+        if self.get_window(wid).is_none() {
+            return Err(WorkspaceError::WindowNotFound(wid));
+        }
         let tab = Tab::new(title, root_pane);
         let id = tab.id();
         self.tabs.push(tab);
-        self.active = id;
-        id
+        self.assignments.insert(id, wid);
+        self.window_mut(wid).active = id;
+        if self.active_window == wid {
+            self.active = id;
+        }
+        Ok(id)
     }
 
-    /// タブを閉じる。アクティブタブを閉じた場合は左隣（先頭なら新しい先頭）へ移る
+    /// タブを閉じる。ウィンドウの表示タブを閉じた場合は同一ウィンドウ内の左隣
+    /// （先頭なら新しい先頭）へ移る。ウィンドウが空になったら除去する（Issue #339）
     pub fn close_tab(&mut self, id: TabId) -> Result<Tab, WorkspaceError> {
         let index = self
             .tabs
@@ -159,9 +254,31 @@ impl Workspace {
         if self.tabs.len() == 1 {
             return Err(WorkspaceError::LastTab);
         }
+        let wid = self
+            .assignments
+            .get(&id)
+            .copied()
+            .unwrap_or(self.active_window);
         let tab = self.tabs.remove(index);
-        if self.active == id {
-            self.active = self.tabs[index.saturating_sub(1)].id();
+        self.assignments.remove(&id);
+        let remaining = self.window_tab_ids(wid);
+        if remaining.is_empty() {
+            // ウィンドウが空 → 除去（LastTab チェック済みなので他ウィンドウにタブが必ず残る）
+            self.remove_empty_window(wid);
+        } else {
+            // 同一ウィンドウ内の左隣: remove 後の tabs[..index] = 元の並びで閉じたタブより前
+            let fallback = self.tabs[..index]
+                .iter()
+                .map(|t| t.id())
+                .rfind(|t| self.assignments.get(t) == Some(&wid))
+                .unwrap_or(remaining[0]);
+            let w = self.window_mut(wid);
+            if w.active == id {
+                w.active = fallback;
+            }
+            if self.active == id {
+                self.active = fallback;
+            }
         }
         Ok(tab)
     }
@@ -170,18 +287,28 @@ impl Workspace {
         if self.get_tab(id).is_none() {
             return Err(WorkspaceError::TabNotFound(id));
         }
+        // タブの所属ウィンドウごとアクティブにする（Issue #339。ウィンドウ切替に追随）
+        let wid = self
+            .assignments
+            .get(&id)
+            .copied()
+            .unwrap_or(self.active_window);
+        if self.get_window(wid).is_some() {
+            self.window_mut(wid).active = id;
+            self.active_window = wid;
+        }
         self.active = id;
         Ok(())
     }
 
-    /// 次のタブへ巡回切替
+    /// 次のタブへ巡回切替（アクティブウィンドウ内で巡回する。Issue #339）
     pub fn activate_next_tab(&mut self) -> TabId {
-        self.activate_by_offset(1)
+        self.activate_by_offset(true)
     }
 
-    /// 前のタブへ巡回切替
+    /// 前のタブへ巡回切替（アクティブウィンドウ内で巡回する。Issue #339）
     pub fn activate_prev_tab(&mut self) -> TabId {
-        self.activate_by_offset(self.tabs.len() - 1)
+        self.activate_by_offset(false)
     }
 
     /// タブを指定インデックスへ移動する（D&D 並べ替え / CLI / MCP。#308）。
@@ -336,10 +463,71 @@ impl Workspace {
         } else {
             tabs[0].id()
         };
+        Some(Self::single_window(tabs, active, shelved))
+    }
+
+    /// レイアウト復元用（Issue #339）。保存済みのウィンドウ割当も復元する。
+    /// `windows` は (ウィンドウ ID, 所属タブ, 表示タブ)。存在しないタブ・二重割当は
+    /// 読み飛ばし、未割当タブは先頭ウィンドウへ、タブを持たないウィンドウは除去する
+    /// （壊れた保存値でも必ず不変条件を満たした状態で起動する）
+    pub fn restore_with_windows(
+        tabs: Vec<Tab>,
+        active: TabId,
+        shelved: Vec<BackgroundPane>,
+        windows: Vec<(u64, Vec<TabId>, TabId)>,
+    ) -> Option<Self> {
+        if tabs.is_empty() {
+            return None;
+        }
+        let active = if tabs.iter().any(|t| t.id() == active) {
+            active
+        } else {
+            tabs[0].id()
+        };
+        let mut ws_windows: Vec<WorkspaceWindow> = Vec::new();
+        let mut assignments: HashMap<TabId, WindowId> = HashMap::new();
+        for (raw_id, tab_ids, win_active) in windows {
+            let owned: Vec<TabId> = tab_ids
+                .into_iter()
+                .filter(|t| tabs.iter().any(|tab| tab.id() == *t) && !assignments.contains_key(t))
+                .collect();
+            if owned.is_empty() {
+                continue;
+            }
+            let wid = WindowId::from_raw(raw_id);
+            let win_active = if owned.contains(&win_active) {
+                win_active
+            } else {
+                owned[0]
+            };
+            for t in &owned {
+                assignments.insert(*t, wid);
+            }
+            ws_windows.push(WorkspaceWindow {
+                id: wid,
+                active: win_active,
+            });
+        }
+        if ws_windows.is_empty() {
+            return Some(Self::single_window(tabs, active, shelved));
+        }
+        // 保存値に載っていないタブは先頭ウィンドウへ
+        let first = ws_windows[0].id;
+        for t in &tabs {
+            assignments.entry(t.id()).or_insert(first);
+        }
+        // アクティブウィンドウ = アクティブタブの所属。表示タブも同期する
+        let active_window = assignments[&active];
+        if let Some(w) = ws_windows.iter_mut().find(|w| w.id == active_window) {
+            w.active = active;
+        }
         Some(Self {
             tabs,
             active,
             shelved,
+            windows: ws_windows,
+            assignments,
+            active_window,
         })
     }
 
@@ -451,14 +639,198 @@ impl Workspace {
         Ok(ids)
     }
 
-    fn activate_by_offset(&mut self, offset: usize) -> TabId {
-        let index = self
-            .tabs
-            .iter()
-            .position(|t| t.id() == self.active)
-            .expect("active タブは常に存在する");
-        self.active = self.tabs[(index + offset) % self.tabs.len()].id();
+    fn activate_by_offset(&mut self, forward: bool) -> TabId {
+        // アクティブウィンドウ内で巡回する（Issue #339。単一ウィンドウなら従来どおり全タブ巡回）
+        let win_tabs = self.window_tab_ids(self.active_window);
+        let len = win_tabs.len();
+        let index = win_tabs.iter().position(|t| *t == self.active).unwrap_or(0);
+        let next = if forward {
+            (index + 1) % len
+        } else {
+            (index + len - 1) % len
+        };
+        let id = win_tabs[next];
+        self.window_mut(self.active_window).active = id;
+        self.active = id;
         self.active
+    }
+
+    // === 論理ウィンドウ（Issue #339・ビューポート方式） ===
+
+    /// 全論理ウィンドウ（常に 1 つ以上）
+    pub fn windows(&self) -> &[WorkspaceWindow] {
+        &self.windows
+    }
+
+    /// フォーカスされている論理ウィンドウ
+    pub fn active_window_id(&self) -> WindowId {
+        self.active_window
+    }
+
+    pub fn get_window(&self, id: WindowId) -> Option<&WorkspaceWindow> {
+        self.windows.iter().find(|w| w.id == id)
+    }
+
+    /// タブが属するウィンドウ（不変条件により全タブで Some）
+    pub fn window_of_tab(&self, tab: TabId) -> Option<WindowId> {
+        self.assignments.get(&tab).copied()
+    }
+
+    /// ウィンドウに属するタブ ID（`tabs` 全体リストの順序を保つ）
+    pub fn window_tab_ids(&self, id: WindowId) -> Vec<TabId> {
+        self.tabs
+            .iter()
+            .map(|t| t.id())
+            .filter(|t| self.assignments.get(t) == Some(&id))
+            .collect()
+    }
+
+    /// ウィンドウをアクティブにする（OS のウィンドウフォーカス変化に追随する。UI 層から呼ぶ）
+    pub fn activate_window(&mut self, id: WindowId) -> Result<(), WorkspaceError> {
+        let win_active = self
+            .get_window(id)
+            .ok_or(WorkspaceError::WindowNotFound(id))?
+            .active;
+        self.active_window = id;
+        self.active = win_active;
+        Ok(())
+    }
+
+    /// 新しい論理ウィンドウを新規タブ 1 つ付きで作りアクティブにする（New Window。
+    /// ウィンドウは常に 1 タブ以上を持つため必ずタブを伴う）
+    pub fn create_window(
+        &mut self,
+        title: impl Into<String>,
+        root_pane: Pane,
+    ) -> (WindowId, TabId) {
+        let wid = WindowId::next();
+        let tab = Tab::new(title, root_pane);
+        let id = tab.id();
+        self.tabs.push(tab);
+        self.assignments.insert(id, wid);
+        self.windows.push(WorkspaceWindow {
+            id: wid,
+            active: id,
+        });
+        self.active_window = wid;
+        self.active = id;
+        (wid, id)
+    }
+
+    /// タブを既存ウィンドウへ移動し、移動先の表示タブにする（Issue #339）。
+    /// アクティブタブを移した場合はフォーカスもタブについて行く。
+    /// 移動元ウィンドウが空になったら除去し、その ID を返す（UI 層が OS ウィンドウを閉じる）
+    pub fn move_tab_to_window(
+        &mut self,
+        tab: TabId,
+        dest: WindowId,
+    ) -> Result<Option<WindowId>, WorkspaceError> {
+        if self.get_tab(tab).is_none() {
+            return Err(WorkspaceError::TabNotFound(tab));
+        }
+        if self.get_window(dest).is_none() {
+            return Err(WorkspaceError::WindowNotFound(dest));
+        }
+        let src = self
+            .assignments
+            .get(&tab)
+            .copied()
+            .unwrap_or(self.active_window);
+        if src == dest {
+            // 冪等: 既に居るウィンドウなら表示タブにするだけ
+            self.window_mut(dest).active = tab;
+            if self.active_window == dest {
+                self.active = tab;
+            }
+            return Ok(None);
+        }
+        self.assignments.insert(tab, dest);
+        self.window_mut(dest).active = tab;
+        if self.active == tab {
+            // アクティブタブを移した → フォーカスはタブについて行く
+            self.active_window = dest;
+        } else if self.active_window == dest {
+            // アクティブウィンドウへ移してきた → 表示タブが変わるので active も同期
+            self.active = tab;
+        }
+        // 移動元の後始末: 空なら除去、表示タブを失ったら残タブの先頭へ
+        let remaining = self.window_tab_ids(src);
+        if remaining.is_empty() {
+            self.remove_empty_window(src);
+            Ok(Some(src))
+        } else {
+            let w = self.window_mut(src);
+            if w.active == tab {
+                w.active = remaining[0];
+            }
+            Ok(None)
+        }
+    }
+
+    /// タブを新しい論理ウィンドウへ分離する（Issue #339）。
+    /// 戻り値は (新ウィンドウ, 空になって除去された移動元ウィンドウ)
+    pub fn move_tab_to_new_window(
+        &mut self,
+        tab: TabId,
+    ) -> Result<(WindowId, Option<WindowId>), WorkspaceError> {
+        if self.get_tab(tab).is_none() {
+            return Err(WorkspaceError::TabNotFound(tab));
+        }
+        let wid = WindowId::next();
+        self.windows.push(WorkspaceWindow {
+            id: wid,
+            active: tab,
+        });
+        let removed = self.move_tab_to_window(tab, wid)?;
+        Ok((wid, removed))
+    }
+
+    /// 論理ウィンドウを閉じ、所属タブを残存ウィンドウの末尾へ合流させる（Issue #339。
+    /// ビューポートを閉じるだけでタブ・プロセスは殺さない）。合流先の表示タブは変えない。
+    /// 最後の 1 ウィンドウは閉じられない。戻り値は合流したタブ
+    pub fn close_window(&mut self, wid: WindowId) -> Result<Vec<TabId>, WorkspaceError> {
+        if self.get_window(wid).is_none() {
+            return Err(WorkspaceError::WindowNotFound(wid));
+        }
+        if self.windows.len() == 1 {
+            return Err(WorkspaceError::LastWindow);
+        }
+        let moved = self.window_tab_ids(wid);
+        let dest = if self.active_window != wid {
+            self.active_window
+        } else {
+            self.windows
+                .iter()
+                .map(|w| w.id)
+                .find(|w| *w != wid)
+                .expect("2 ウィンドウ以上を確認済み")
+        };
+        for t in &moved {
+            self.assignments.insert(*t, dest);
+        }
+        self.windows.retain(|w| w.id != wid);
+        if self.active_window == wid {
+            self.active_window = dest;
+            self.active = self.get_window(dest).expect("dest は存在する").active;
+        }
+        Ok(moved)
+    }
+
+    /// 空になったウィンドウを除去し、アクティブウィンドウを失った場合は残存先頭へ移す
+    fn remove_empty_window(&mut self, wid: WindowId) {
+        self.windows.retain(|w| w.id != wid);
+        if self.active_window == wid {
+            let nw = self.windows[0].id;
+            self.active_window = nw;
+            self.active = self.windows[0].active;
+        }
+    }
+
+    fn window_mut(&mut self, id: WindowId) -> &mut WorkspaceWindow {
+        self.windows
+            .iter_mut()
+            .find(|w| w.id == id)
+            .expect("呼び出し前に存在確認済みのウィンドウ")
     }
 }
 
@@ -825,5 +1197,264 @@ mod tests {
             ws.move_tab(ghost, 0),
             Err(WorkspaceError::TabNotFound(ghost))
         );
+    }
+
+    // === 論理ウィンドウ（Issue #339） ===
+
+    #[test]
+    fn 初期状態は1ウィンドウで全タブが属する() {
+        let mut ws = Workspace::new("t1", pane());
+        let t1 = ws.active_tab_id();
+        let t2 = ws.create_tab("t2", pane());
+        assert_eq!(ws.windows().len(), 1);
+        let wid = ws.active_window_id();
+        assert_eq!(ws.window_of_tab(t1), Some(wid));
+        assert_eq!(ws.window_of_tab(t2), Some(wid));
+        assert_eq!(ws.window_tab_ids(wid), vec![t1, t2]);
+        assert_eq!(ws.get_window(wid).unwrap().active_tab(), t2);
+    }
+
+    #[test]
+    fn create_windowで新規タブ付きウィンドウがアクティブになる() {
+        let mut ws = Workspace::new("t1", pane());
+        let w1 = ws.active_window_id();
+        let t1 = ws.active_tab_id();
+        let (w2, t2) = ws.create_window("t2", pane());
+        assert_eq!(ws.windows().len(), 2);
+        assert_eq!(ws.active_window_id(), w2);
+        assert_eq!(ws.active_tab_id(), t2);
+        assert_eq!(ws.window_of_tab(t2), Some(w2));
+        // 元ウィンドウは無傷
+        assert_eq!(ws.window_tab_ids(w1), vec![t1]);
+        assert_eq!(ws.get_window(w1).unwrap().active_tab(), t1);
+    }
+
+    #[test]
+    fn activate_windowで表示タブごと切り替わる() {
+        let mut ws = Workspace::new("t1", pane());
+        let w1 = ws.active_window_id();
+        let t1 = ws.active_tab_id();
+        let (w2, t2) = ws.create_window("t2", pane());
+        ws.activate_window(w1).unwrap();
+        assert_eq!(ws.active_window_id(), w1);
+        assert_eq!(ws.active_tab_id(), t1);
+        ws.activate_window(w2).unwrap();
+        assert_eq!(ws.active_tab_id(), t2);
+        let ghost = WindowId::from_raw(9999);
+        assert_eq!(
+            ws.activate_window(ghost),
+            Err(WorkspaceError::WindowNotFound(ghost))
+        );
+    }
+
+    #[test]
+    fn activate_tabは所属ウィンドウごとアクティブにする() {
+        let mut ws = Workspace::new("t1", pane());
+        let w1 = ws.active_window_id();
+        let t1 = ws.active_tab_id();
+        let (w2, _t2) = ws.create_window("t2", pane());
+        assert_eq!(ws.active_window_id(), w2);
+        // 別ウィンドウのタブをアクティブにするとウィンドウも切り替わる
+        ws.activate_tab(t1).unwrap();
+        assert_eq!(ws.active_window_id(), w1);
+        assert_eq!(ws.active_tab_id(), t1);
+    }
+
+    #[test]
+    fn タブ巡回はアクティブウィンドウ内で閉じる() {
+        let mut ws = Workspace::new("t1", pane());
+        let t1 = ws.active_tab_id();
+        let t2 = ws.create_tab("t2", pane());
+        let (_w2, t3) = ws.create_window("t3", pane());
+        // ウィンドウ 2（タブ 1 個）で巡回しても t3 のまま
+        assert_eq!(ws.activate_next_tab(), t3);
+        assert_eq!(ws.activate_prev_tab(), t3);
+        // ウィンドウ 1 に切り替えると t1 ⇔ t2 で巡回し t3 を跨がない
+        ws.activate_tab(t1).unwrap();
+        assert_eq!(ws.activate_next_tab(), t2);
+        assert_eq!(ws.activate_next_tab(), t1);
+        assert_eq!(ws.activate_prev_tab(), t2);
+    }
+
+    #[test]
+    fn move_tab_to_windowで移動先の表示タブになる() {
+        let mut ws = Workspace::new("t1", pane());
+        let w1 = ws.active_window_id();
+        let t1 = ws.active_tab_id();
+        let t2 = ws.create_tab("t2", pane());
+        let (w2, t3) = ws.create_window("t3", pane());
+        // t2 を w2 へ（w1 には t1 が残る）
+        assert_eq!(ws.move_tab_to_window(t2, w2).unwrap(), None);
+        assert_eq!(ws.window_of_tab(t2), Some(w2));
+        assert_eq!(ws.window_tab_ids(w1), vec![t1]);
+        assert_eq!(ws.window_tab_ids(w2), vec![t2, t3]);
+        // 移動先では移動タブが表示タブになる（アクティブウィンドウなので active も追随）
+        assert_eq!(ws.get_window(w2).unwrap().active_tab(), t2);
+        assert_eq!(ws.active_window_id(), w2);
+        assert_eq!(ws.active_tab_id(), t2);
+    }
+
+    #[test]
+    fn move_tab_to_windowで空になった移動元は除去される() {
+        let mut ws = Workspace::new("t1", pane());
+        let w1 = ws.active_window_id();
+        let t1 = ws.active_tab_id();
+        let (w2, _t2) = ws.create_window("t2", pane());
+        // w1 の唯一のタブを w2 へ → w1 は除去される
+        assert_eq!(ws.move_tab_to_window(t1, w2).unwrap(), Some(w1));
+        assert_eq!(ws.windows().len(), 1);
+        assert!(ws.get_window(w1).is_none());
+        // アクティブウィンドウへ移したので表示タブ = active も追随する
+        assert_eq!(ws.active_window_id(), w2);
+        assert_eq!(ws.active_tab_id(), t1);
+    }
+
+    #[test]
+    fn move_tab_to_new_windowで分離できる() {
+        let mut ws = Workspace::new("t1", pane());
+        let w1 = ws.active_window_id();
+        let t1 = ws.active_tab_id();
+        let t2 = ws.create_tab("t2", pane());
+        let (w2, removed) = ws.move_tab_to_new_window(t2).unwrap();
+        assert_eq!(removed, None);
+        assert_eq!(ws.windows().len(), 2);
+        assert_eq!(ws.window_of_tab(t2), Some(w2));
+        assert_eq!(ws.window_tab_ids(w1), vec![t1]);
+        // アクティブタブ（t2）を分離したのでフォーカスは新ウィンドウへ
+        assert_eq!(ws.active_window_id(), w2);
+        // w1 の表示タブは残タブへ落ちている
+        assert_eq!(ws.get_window(w1).unwrap().active_tab(), t1);
+    }
+
+    #[test]
+    fn close_windowでタブは残存ウィンドウへ合流する() {
+        let mut ws = Workspace::new("t1", pane());
+        let w1 = ws.active_window_id();
+        let t1 = ws.active_tab_id();
+        let (w2, t2) = ws.create_window("t2", pane());
+        let t3 = ws.create_tab("t3", pane());
+        // w2（t2, t3）を閉じる → 両タブが w1 へ合流、タブ・実体は残る
+        let moved = ws.close_window(w2).unwrap();
+        assert_eq!(moved, vec![t2, t3]);
+        assert_eq!(ws.windows().len(), 1);
+        assert_eq!(ws.tabs().len(), 3);
+        assert_eq!(ws.window_tab_ids(w1), vec![t1, t2, t3]);
+        // 合流先の表示タブは変えない（w1 は t1 を表示していた）
+        assert_eq!(ws.active_window_id(), w1);
+        assert_eq!(ws.active_tab_id(), t1);
+    }
+
+    #[test]
+    fn 最後のウィンドウは閉じられない() {
+        let mut ws = Workspace::new("t1", pane());
+        let w1 = ws.active_window_id();
+        assert_eq!(ws.close_window(w1), Err(WorkspaceError::LastWindow));
+    }
+
+    #[test]
+    fn close_tabでウィンドウの表示タブは同窓の左隣へ移る() {
+        let mut ws = Workspace::new("t1", pane());
+        let t1 = ws.active_tab_id();
+        let t2 = ws.create_tab("t2", pane());
+        let (w2, t3) = ws.create_window("t3", pane());
+        // w1 の t2（表示タブ）を閉じる → w1 の表示タブは t1 へ（t3 は別窓なので跨がない）
+        let w1 = ws.window_of_tab(t1).unwrap();
+        ws.close_tab(t2).unwrap();
+        assert_eq!(ws.get_window(w1).unwrap().active_tab(), t1);
+        // アクティブウィンドウ（w2）は無関係のまま
+        assert_eq!(ws.active_window_id(), w2);
+        assert_eq!(ws.active_tab_id(), t3);
+    }
+
+    #[test]
+    fn close_tabで空になったウィンドウは除去される() {
+        let mut ws = Workspace::new("t1", pane());
+        let w1 = ws.active_window_id();
+        let t1 = ws.active_tab_id();
+        let (w2, t2) = ws.create_window("t2", pane());
+        // w2 の唯一のタブを閉じる → w2 除去 + フォーカスは w1 へ戻る
+        ws.close_tab(t2).unwrap();
+        assert_eq!(ws.windows().len(), 1);
+        assert!(ws.get_window(w2).is_none());
+        assert_eq!(ws.active_window_id(), w1);
+        assert_eq!(ws.active_tab_id(), t1);
+    }
+
+    #[test]
+    fn create_tab_in_windowは非アクティブウィンドウのグローバルactiveを奪わない() {
+        let mut ws = Workspace::new("t1", pane());
+        let w1 = ws.active_window_id();
+        let (w2, t2) = ws.create_window("t2", pane());
+        // アクティブは w2。w1 に新規タブを作っても w2 のフォーカスは奪われない
+        let t3 = ws.create_tab_in_window("t3", pane(), w1).unwrap();
+        assert_eq!(ws.active_window_id(), w2);
+        assert_eq!(ws.active_tab_id(), t2);
+        // w1 の表示タブは新タブに切り替わる
+        assert_eq!(ws.get_window(w1).unwrap().active_tab(), t3);
+        let ghost = WindowId::from_raw(88888);
+        assert_eq!(
+            ws.create_tab_in_window("x", pane(), ghost),
+            Err(WorkspaceError::WindowNotFound(ghost))
+        );
+    }
+
+    #[test]
+    fn restore_with_windowsで割当を復元する() {
+        let t1 = Tab::new("t1", pane());
+        let t2 = Tab::new("t2", pane());
+        let t3 = Tab::new("t3", pane());
+        let (i1, i2, i3) = (t1.id(), t2.id(), t3.id());
+        let ws = Workspace::restore_with_windows(
+            vec![t1, t2, t3],
+            i2,
+            Vec::new(),
+            vec![(101, vec![i1, i2], i2), (102, vec![i3], i3)],
+        )
+        .unwrap();
+        assert_eq!(ws.windows().len(), 2);
+        let w1 = ws.window_of_tab(i1).unwrap();
+        let w2 = ws.window_of_tab(i3).unwrap();
+        assert_eq!(w1.as_u64(), 101);
+        assert_eq!(w2.as_u64(), 102);
+        assert_eq!(ws.window_of_tab(i2), Some(w1));
+        assert_eq!(ws.active_window_id(), w1);
+        assert_eq!(ws.active_tab_id(), i2);
+        assert_eq!(ws.get_window(w2).unwrap().active_tab(), i3);
+    }
+
+    #[test]
+    fn restore_with_windowsは壊れた保存値でも安全に復元する() {
+        let t1 = Tab::new("t1", pane());
+        let t2 = Tab::new("t2", pane());
+        let (i1, i2) = (t1.id(), t2.id());
+        let ghost = TabId::from_raw(77777);
+        // 存在しないタブだけのウィンドウ・二重割当・未割当タブ・存在しない表示タブが混在
+        let ws = Workspace::restore_with_windows(
+            vec![t1, t2],
+            i1,
+            Vec::new(),
+            vec![
+                (201, vec![ghost], ghost), // 実在タブなし → ウィンドウごと読み飛ばし
+                (202, vec![i1], ghost),    // 表示タブ不正 → 先頭タブへ
+                (203, vec![i1], i1),       // i1 は 202 に割当済み → 空になり読み飛ばし
+            ],
+        )
+        .unwrap();
+        assert_eq!(ws.windows().len(), 1);
+        let w = ws.active_window_id();
+        assert_eq!(w.as_u64(), 202);
+        // 未割当の i2 は先頭ウィンドウへ合流
+        assert_eq!(ws.window_of_tab(i2), Some(w));
+        assert_eq!(ws.window_tab_ids(w), vec![i1, i2]);
+        assert_eq!(ws.active_tab_id(), i1);
+    }
+
+    #[test]
+    fn restore_with_windowsの空保存値は単一ウィンドウへフォールバック() {
+        let t1 = Tab::new("t1", pane());
+        let i1 = t1.id();
+        let ws = Workspace::restore_with_windows(vec![t1], i1, Vec::new(), Vec::new()).unwrap();
+        assert_eq!(ws.windows().len(), 1);
+        assert_eq!(ws.window_of_tab(i1), Some(ws.active_window_id()));
     }
 }

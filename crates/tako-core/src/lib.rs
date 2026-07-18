@@ -74,7 +74,7 @@ pub use terminal::{
 pub use text_edit::{CursorMovement, SearchHit, TextBuffer, TextEditError};
 pub use theme::{Rgb, Theme};
 pub use tmux::{TmuxSession, TmuxWindow};
-pub use workspace::{BackgroundPane, Workspace, WorkspaceError};
+pub use workspace::{BackgroundPane, WindowId, Workspace, WorkspaceError, WorkspaceWindow};
 
 /// 外部バイナリの解決（環境変数 → PATH 直 → 既知パス → ログインシェル）。
 /// `tmux_bin()` / `git_bin()` の共通基盤
