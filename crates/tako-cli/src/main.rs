@@ -1144,6 +1144,15 @@ enum OrchestratorCommand {
         #[arg(long)]
         choice: String,
     },
+    /// worker の報告内容を取得する（scrollback 主 + transcript 補強。#364）
+    Report {
+        /// 対象ペイン ID
+        #[arg(long)]
+        pane: u64,
+        /// スクロールバック取得行数（既定 2000）
+        #[arg(long, default_value = "2000")]
+        lines: usize,
+    },
     /// spawn + 完了待ち + 出力取得 + close を 1 回で行う
     Run {
         /// プロジェクトキー（projects.yaml に登録済み）
@@ -1873,6 +1882,13 @@ fn main() -> ExitCode {
                 pane_id: pane,
                 choice: choice.clone(),
                 caller_role,
+            })
+            .map(|result| println!("{}", pretty_json(&result)))
+        }
+        Command::Orchestrator(OrchestratorCommand::Report { pane, lines }) => {
+            send_request(Request::OrchestratorReport {
+                pane_id: pane,
+                lines: Some(lines),
             })
             .map(|result| println!("{}", pretty_json(&result)))
         }
@@ -3698,6 +3714,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }
         Command::Orchestrator(OrchestratorCommand::Layout { .. }) => {
             unreachable!("orchestrator layout は run() を通らない（ローカルで config.yaml を操作）")
+        }
+        Command::Orchestrator(OrchestratorCommand::Report { .. }) => {
+            unreachable!("orchestrator report は run() を通らない")
         }
         Command::Orchestrator(OrchestratorCommand::Respond { .. }) => {
             unreachable!("orchestrator respond は run() を通らない")

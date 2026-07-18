@@ -604,6 +604,14 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_role: Option<String>,
     },
+    /// オーケストレーター: worker の報告内容を取得する（#364）。
+    /// 第 1 層 scrollback（全 agent 共通）+ 第 2 層 transcript アダプタ（claude 等）
+    OrchestratorReport {
+        pane_id: u64,
+        /// スクロールバック取得行数（既定 2000）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lines: Option<usize>,
+    },
     /// オーケストレーター: 委任台帳の操作（Issue #292）。
     /// action: list / stats / record / amend
     OrchestratorLedger {

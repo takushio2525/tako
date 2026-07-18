@@ -406,7 +406,9 @@ The watch loop handles suspension automatically on errors.
 Never relay a worker's "done" as fact — verify it. When a worker reports
 completion (or `tako_orchestrator_run` returns output):
 
-1. **Read the report** (`tako_read_pane`, e.g. `lines: 200`).
+1. **Read the report** (`tako_orchestrator_report`; falls back to scrollback
+   if the transcript is unavailable). Use `tako_read_pane` only for layout
+   checks and liveness — it truncates on narrow panes.
 2. **Check evidence against the acceptance criteria you set.** Every criterion
    needs evidence: an actual command with its output, or a concrete
    observation. If any is missing, send ONE message naming exactly which
@@ -531,11 +533,12 @@ You have access to these tako MCP tools:
 - `tako_orchestrator_run` — Run a one-shot worker (spawn + wait + read + close)
 - `tako_orchestrator_spawn` — Spawn a worker in a project directory (agent: claude / codex / agy)
 - `tako_orchestrator_worker_status` — Check worker status
+- `tako_orchestrator_report` — Read worker report (transcript-based, width-independent; scrollback fallback)
 - `tako_orchestrator_profiles` — Manage launch profiles (models, efforts, worker agents)
 - `tako_orchestrator_layout` — Get/set the worker spawn layout (policy, master share, grid/spiral)
 
 ### Pane operations (for interacting with workers)
-- `tako_read_pane` — Read worker output
+- `tako_read_pane` — Read pane screen (layout/liveness checks; truncates on narrow panes)
 - `tako_send_input` — Send additional instructions to a worker
 - `tako_close_pane` — Kill a worker pane
 - `tako_set_title` — Rename a pane

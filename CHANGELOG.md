@@ -3,6 +3,18 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+- [機能追加] orchestrator report: worker 報告の scrollback + transcript 直読 (#364)
+  `tako orchestrator report` / MCP `tako_orchestrator_report` で worker の出力を
+  ペイン幅に依存しない tmux スクロールバック + claude transcript 2 層で取得（100 ツール）。
+  worker-status に history フィールド（履歴行数/バイト）を追加
+
+  orchestrator report: scrollback + transcript-based worker report reading (#364).
+  `tako orchestrator report` / MCP `tako_orchestrator_report` retrieves worker output
+  via width-independent tmux scrollback + claude transcript two-layer approach (100 tools).
+  Added history field (lines/bytes) to worker-status.
+
 ## [0.5.6] - 2026-07-18
 
 Nightly patch release (automated). Changes since v0.5.5:
