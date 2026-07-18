@@ -1912,7 +1912,9 @@ impl TakoApp {
         // 蓋閉じ防止の残留チェック（#218: 前回クラッシュ時の disablesleep=1 を自動復帰）
         tako_control::sleep_guard::disable_app_nap();
         tako_control::sleep_guard::check_disablesleep_residual();
-        app.update_sleep_guard();
+        // 起動直後は Unknown バックエンドの子プロセス判定（tmux + ps）を待たず 0 で仮適用し、
+        // 初回の 2 秒 tick が background 判定で正確な値に補正する（#340）
+        app.apply_sleep_guard(&tako_control::settings::load(), 0);
 
         // 終了処理（layout 保存 + 接続情報の後片付け）はアプリ終了フックで一元化する
         // （#103）。Cmd-Q（グローバル Quit アクション）・メニュー・Dock 右クリック終了・
@@ -2373,10 +2375,10 @@ impl TakoApp {
                         let _s = tako_control::diag::perf_span("periodic_prep:webview");
                         app.poll_webview_state();
                     }
-                    {
+                    let sleep_guard_unknowns = {
                         let _s = tako_control::diag::perf_span("periodic_prep:sleep_guard");
-                        app.update_sleep_guard();
-                    }
+                        app.sleep_guard_unknown_backends()
+                    };
                     // 失敗遷移の検知 → Attention トースト（#217）
                     app.update_attention_toasts();
                     // ペインログ: 直接ペインはここで取り込み、バックエンドはジョブ化（Issue #112 B）
@@ -2417,6 +2419,7 @@ impl TakoApp {
                         sidebar_git_cwd,
                         log_jobs,
                         app.pane_logs.clone(),
+                        sleep_guard_unknowns,
                     )
                 });
                 // UI スレッド専有時間の計測（Issue #113 診断。しきい値超えのみ記録）
@@ -2435,10 +2438,35 @@ impl TakoApp {
                     sidebar_git_cwd,
                     log_jobs,
                     pane_logs,
+                    sleep_guard_unknowns,
                 )) = prep
                 else {
                     break;
                 };
+                // ② background: sleep guard の settings 読み + Unknown バックエンドの
+                // 子プロセス判定（tmux + ps 実行）。#324 で UI スレッドに置かれ、Unknown
+                // ペイン常在時に 2 秒毎 p50 42ms の UI 専有源だった（#340。#212 と同型）
+                {
+                    let (settings, restored_busy) = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let restored_busy = if sleep_guard_unknowns.is_empty() {
+                                0
+                            } else {
+                                let refs: Vec<&str> =
+                                    sleep_guard_unknowns.iter().map(|s| s.as_str()).collect();
+                                tako_control::agents::count_sessions_with_running_children(&refs)
+                            };
+                            (tako_control::settings::load(), restored_busy)
+                        })
+                        .await;
+                    let ok = this.update(cx, |app: &mut TakoApp, _| {
+                        app.apply_sleep_guard(&settings, restored_busy);
+                    });
+                    if ok.is_err() {
+                        break;
+                    }
+                }
                 // ② background: バックエンドペインのペインログ取り込み（probe + capture。
                 // await して tick 内の順序を保つ = 同一ペインの増分が並行取り込みで重複しない）
                 if !log_jobs.is_empty() {
@@ -6715,25 +6743,33 @@ impl TakoApp {
         }
     }
 
-    fn update_sleep_guard(&mut self) {
+    /// sleep guard の UI 収集部: persist 復元後に OSC 133 未検知（Unknown）の
+    /// バックエンドセッション名を集める（#324: 復元 worker の busy 漏れ根治）。
+    /// 子プロセス有無の実判定（tmux + ps 実行）は background で行い、UI スレッドに
+    /// サブプロセス実行を置かない（#340: 2 秒毎に p50 42ms の UI 専有を作っていた）
+    fn sleep_guard_unknown_backends(&self) -> Vec<String> {
         use tako_core::CommandState;
-        let settings = tako_control::settings::load();
+        self.terminals
+            .iter()
+            .filter(|(_, s)| matches!(s.command_state(), CommandState::Unknown))
+            .filter_map(|(pid, _)| self.backend_sessions.get(pid).cloned())
+            .collect()
+    }
+
+    /// sleep guard の適用部。settings と restored_busy（Unknown バックエンドの
+    /// 子プロセス判定結果）は background で取得済みのものを受け取る
+    fn apply_sleep_guard(
+        &mut self,
+        settings: &tako_control::settings::Settings,
+        restored_busy: usize,
+    ) {
+        use tako_core::CommandState;
         // OSC 133 で Running が検知できているペイン数
         let running_count = self
             .terminals
             .values()
             .filter(|s| matches!(s.command_state(), CommandState::Running))
             .count();
-        // persist 復元後に OSC 133 未検知（Unknown）だがバックエンドに
-        // 実行中の子プロセスがいるペイン数（#324: 復元 worker の busy 漏れ根治）
-        let unknown_backends: Vec<&str> = self
-            .terminals
-            .iter()
-            .filter(|(_, s)| matches!(s.command_state(), CommandState::Unknown))
-            .filter_map(|(pid, _)| self.backend_sessions.get(pid).map(|s| s.as_str()))
-            .collect();
-        let restored_busy =
-            tako_control::agents::count_sessions_with_running_children(&unknown_backends);
         let busy_agents = running_count + restored_busy;
         let state = tako_control::sleep_guard::update(
             settings.sleep_guard_mode,
