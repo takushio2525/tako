@@ -4631,6 +4631,10 @@ fn print_result(command: &Command, result: &Value) {
             println!("{}", pretty_json(result));
         }
         Command::Tab(TabCommand::New { .. }) => println!("{result}"),
+        Command::Window(WindowCommand::List) => println!("{}", pretty_json(result)),
+        Command::Window(
+            WindowCommand::New { .. } | WindowCommand::Close { .. } | WindowCommand::MoveTab { .. },
+        ) => println!("{result}"),
         Command::Open(_) | Command::Preview(_) | Command::PreviewOutline(_) | Command::Edit(_) => {
             println!("{result}")
         }

@@ -2201,6 +2201,10 @@ impl TakoApp {
                     }
                     // 重量プレビュー（PDF / 動画）の background 読み込み（Issue #168）
                     app.drain_pending_preview_loads(cx);
+                    // ウィンドウ操作（Issue #339）の GPUI ウィンドウ生成・close を即座に
+                    // 反映する。render 冒頭の同期はウィンドウが隠れているとフレームが
+                    // 来ず走らないため、CLI / MCP 経路はここで消費する
+                    app.sync_viewports(cx);
                     // AI / CLI 操作によるレイアウト変化を即座に永続化する（Phase 5.5）
                     app.save_layout();
                     cx.notify();
