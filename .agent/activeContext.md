@@ -4,17 +4,18 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-18・#338 再修正完了）
+## 現在の対象（2026-07-18・#364 実装完了）
 
-**Issue #338: チェンジログビューの git 検出が .app 環境で全滅する問題を根治**
+**Issue #364: orchestrator report — scrollback + transcript 2 層で worker 報告を取得**
 
-- コミット `4395f32` on main、PR #365 squash merge 済み
-- Issue に修正証拠 + 目視チェックリストをコメント済み
-- worktree `~/dev/tako-wt-338b` は除去済み
+- コミット `46b925b` on main、PR #366 squash merge 済み
+- Issue に実測証拠コメント済み
+- worktree `~/dev/tako-wt-364` は除去済み
 
 ## 次の一手
 
-- `build-app.sh --install` で .app 更新 → Dock 起動で目視確認（チェンジログビュー・ファイルツリー git マーク）
+- `build-app.sh --install` で .app 更新 → 実 claude ペインでの report 実測（transcript 直読 e2e）
+- codex / agy ペインでの scrollback fallback 実測
 - #287 の master レビュー・main マージ判断（renewal/remote-transport）
 - v0.6.0 リリース判断
 

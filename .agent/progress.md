@@ -878,3 +878,10 @@
 - 根因 = `repo_root()` に `current_dir` としてファイルパスを渡すと ENOTDIR で git 実行不能。横断で `"git"` 直接指定 3 箇所も `git_bin()` に統一
 - 関連コミット: `4395f32`（PR #365 squash merge）。fmt / clippy / test 954 全緑。回帰テスト 4 本追加
 - 次: `build-app.sh --install` → Dock 起動で履歴トグル・ファイルツリー git マークの目視確認
+
+## 2026-07-18（#364: orchestrator report — scrollback + transcript 2 層実装）
+- 第 1 層 tmux scrollback（capture-pane -p -J -S）全 agent 共通 + 第 2 層 claude transcript アダプタ。
+  CLI `tako orchestrator report` + MCP `tako_orchestrator_report`（100 ツール）。worker-status に
+  history フィールド追加。隔離実測で可視画面 10 行 → scrollback 330 行を確認
+- 関連コミット: `46b925b`（PR #366 squash merge）。288 tests / セルフテスト FAILED 1（既知 #332）
+- 次: `build-app.sh --install` → 実 claude ペインでの report e2e + codex fallback 実測
