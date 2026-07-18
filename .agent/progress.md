@@ -873,3 +873,8 @@
 - 根因 = GPUI の on_drag は DRAG_THRESHOLD(2px) 超過まで待機するが、親 tab-bar の on_mouse_move → start_window_move() が 1px 移動で先に発火。tab_mouse_down フラグで抑制
 - 関連コミット: `73da200`（PR #363 squash merge）。fmt / clippy / test 288 / セルフテスト全緑
 - 次: `build-app.sh --install` → 実機確認（タブドラッグ並べ替え・空き領域ウインドウ移動の両立）
+
+## 2026-07-18（#338 再修正: チェンジログビューの git 検出が .app 環境で全滅する問題を根治）
+- 根因 = `repo_root()` に `current_dir` としてファイルパスを渡すと ENOTDIR で git 実行不能。横断で `"git"` 直接指定 3 箇所も `git_bin()` に統一
+- 関連コミット: `4395f32`（PR #365 squash merge）。fmt / clippy / test 954 全緑。回帰テスト 4 本追加
+- 次: `build-app.sh --install` → Dock 起動で履歴トグル・ファイルツリー git マークの目視確認
