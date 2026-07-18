@@ -1646,6 +1646,8 @@ impl TakoApp {
             std::collections::HashSet::new();
         // Web ビュー dock の退避分（#155。表示分は RestoredPane.webview で運ばれる）
         let mut webview_dock_restore: Vec<String> = Vec::new();
+        // 複数ウィンドウの保存フレーム（Issue #339。復元ウィンドウの初期 bounds に使う）
+        let mut window_frames_restore: Vec<(u64, tako_control::layout::WindowFrame)> = Vec::new();
         let (workspace, restore_report) = if let Some(reason) = &secondary_reason {
             let msg = format!(
                 "復元スキップ: {reason}のためセカンダリモードで起動\
@@ -1663,6 +1665,11 @@ impl TakoApp {
                     .map(|id| TabId::from_raw(*id))
                     .collect();
                 webview_dock_restore = file.webview_dock.clone();
+                window_frames_restore = file
+                    .windows
+                    .iter()
+                    .filter_map(|w| w.frame.clone().map(|f| (w.id, f)))
+                    .collect();
                 tako_control::layout::restore(&file)
             });
             match loaded {
@@ -1883,9 +1890,24 @@ impl TakoApp {
             tab_mouse_down: false,
             viewports: Vec::new(),
             viewport_subs: HashMap::new(),
-            window_frames: HashMap::new(),
+            // 復元した保存フレーム（Issue #339。追加ウィンドウを開くときの初期 bounds）
+            window_frames: window_frames_restore
+                .iter()
+                .map(|(id, f)| (tako_core::WindowId::from_raw(*id), f.clone()))
+                .collect(),
             pending_viewport_opens: Vec::new(),
         };
+        // 複数ウィンドウの復元（Issue #339）: アクティブ以外の論理ウィンドウは
+        // 初回 render / dispatch の sync_viewports が保存フレームで開き直す
+        // （アクティブウィンドウは open_primary_window が担う）
+        let active_window = app.workspace.active_window_id();
+        app.pending_viewport_opens = app
+            .workspace
+            .windows()
+            .iter()
+            .map(|w| w.id())
+            .filter(|w| *w != active_window)
+            .collect();
         // App Nap 無効化 + 初回スリープ防止更新（Issue #173）
         // 蓋閉じ防止の残留チェック（#218: 前回クラッシュ時の disablesleep=1 を自動復帰）
         tako_control::sleep_guard::disable_app_nap();
@@ -4619,8 +4641,20 @@ impl TakoApp {
                     .find(|e| e.pane == Some(pane))
                     .map(|e| e.current_url()),
             },
-            self.window_frame.clone(),
+            // 旧スキーマ互換の単一フレームはアクティブウィンドウのもの（Issue #339。
+            // 起動時のプライマリウィンドウ復元 = open_primary_window が読む値）
+            self.window_frames
+                .get(&self.workspace.active_window_id())
+                .cloned()
+                .or_else(|| self.window_frame.clone()),
         );
+        // 複数ウィンドウの OS フレーム（Issue #339）。render で採取済みの分を埋める
+        for w in &mut layout.windows {
+            w.frame = self
+                .window_frames
+                .get(&tako_core::WindowId::from_raw(w.id))
+                .cloned();
+        }
         // 折りたたみ状態（FR-2.16.14）を埋める。現存タブのみ（閉じたタブの残骸は除く）
         layout.collapsed = self
             .collapsed_tmux_tabs
@@ -5517,10 +5551,24 @@ impl TakoApp {
         cx.notify();
     }
 
-    /// 論理ウィンドウに対応する GPUI ウィンドウを開く（entity 借用の外で defer 実行）
+    /// 論理ウィンドウに対応する GPUI ウィンドウを開く（entity 借用の外で defer 実行）。
+    /// 保存フレーム（persist 復元）があれば初期 bounds に使う。壊れた保存値は
+    /// 既定サイズへフォールバック（open_restored_window と同じ検証）
     fn open_viewport(&mut self, logical: tako_core::WindowId, cx: &mut Context<Self>) {
         let entity = cx.entity();
-        cx.defer(move |cx| open_viewport_window(entity, logical, None, cx));
+        let bounds = self
+            .window_frames
+            .get(&logical)
+            .filter(|f| f.width >= 200.0 && f.height >= 150.0)
+            .map(|f| {
+                let b = Bounds::new(point(px(f.x), px(f.y)), size(px(f.width), px(f.height)));
+                match f.state.as_str() {
+                    "fullscreen" => WindowBounds::Fullscreen(b),
+                    "maximized" => WindowBounds::Maximized(b),
+                    _ => WindowBounds::Windowed(b),
+                }
+            });
+        cx.defer(move |cx| open_viewport_window(entity, logical, bounds, cx));
     }
 
     /// 論理ウィンドウと GPUI ウィンドウの突き合わせ（Issue #339）。render 冒頭から
