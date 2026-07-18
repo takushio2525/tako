@@ -5,6 +5,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- [機能追加] 複数ウィンドウ対応: ビューポート方式で別ウィンドウに別タブを表示 (#339)
+  単一アプリ状態（タブ・ペイン・tmux・discovery）を複数ウィンドウで共有し、各ウィンドウは
+  表示タブだけを持つ。New Window（⌘⇧N）が状態共有の追加ウィンドウになり、タブの
+  ウィンドウ間移動・persist でのウィンドウ配置復元・`tako window` CLI / MCP `tako_window`
+  （101 ツール）・`tako list` へのウィンドウ情報追加（後方互換）を含む。赤ボタン close は
+  複数枚ならタブを残存ウィンドウへ合流（プロセス維持）、最後の 1 枚は従来どおり
+  Dock 復帰（#312）と整合
+
+  Multi-window support: viewport model showing different tabs per window (#339).
+  A single app state (tabs, panes, tmux, discovery) is shared across windows; each
+  window only holds which tab it displays. New Window (⌘⇧N) now opens a
+  state-sharing viewport. Includes moving tabs between windows, window layout
+  persistence/restore, `tako window` CLI / MCP `tako_window` (101 tools), and
+  backward-compatible window info in `tako list`. Closing a non-last window merges
+  its tabs into a remaining window (processes preserved); closing the last window
+  keeps the #312 Dock-revival behavior.
+
 - [機能追加] orchestrator report: worker 報告の scrollback + transcript 直読 (#364)
   `tako orchestrator report` / MCP `tako_orchestrator_report` で worker の出力を
   ペイン幅に依存しない tmux スクロールバック + claude transcript 2 層で取得（100 ツール）。
