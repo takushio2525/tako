@@ -4,17 +4,17 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-19・#378 完了）
+## 現在の対象（2026-07-19・#375 修正完了）
 
-**Issue #378: タブ名の自動命名** — PR #382 squash merge 済み（`6948491`）
+**Issue #375: Web dock URL 入力欄フォーカス不在** — PR #383 squash merge 済み（`071f37e`）
 
 ## 次の一手
 
-- `build-app.sh --install` で .app 更新 → 実機目視: 新バイナリでの source=auto / 命名規則注入
+- `build-app.sh --install` で .app 更新 → 実機目視: Web dock URL 入力欄のカーソル表示 + 手打ち + Enter 遷移 + 日本語 IME
 - #368 / #369 の着手判断（#368 が効果最大: アイドルの見えない消費 4% 相当）
 - #364 の実 claude ペイン report e2e + codex fallback 実測（持ち越し）
 - #287 の master レビュー・main マージ判断（renewal/remote-transport）
-- v0.6.0 リリース判断（#339 + #364 + #340 + #371 + #378 修正同梱）
+- v0.6.0 リリース判断（#339 + #364 + #340 + #371 + #375 + #378 修正同梱）
 
 ## 現フェーズで Read すべき設計書
 

@@ -914,3 +914,8 @@
   master / solo プロンプトにタブ名更新の標準動作を追記。テスト 4 本追加・品質ゲート全緑
 - 関連コミット: `6948491`（PR #382 squash merge）。Issue #378 close 済み
 - 次: `build-app.sh --install` → 実機で source=auto と命名規則注入の確認
+
+## 2026-07-19（#375: Web dock URL 入力欄のフォーカス不在を修正）
+- 根因 2 件: ①フォーカス時カーソルバー非表示（空入力でプレースホルダのみ） ②フォーカス解除欠如（Enter/Escape 以外で false に戻らない）。カーソルバー方式に刷新 + ルート div の on_mouse_down でフォーカス解除
+- 関連コミット: `071f37e`（PR #383 squash merge）。品質ゲート全緑（308 tests）
+- 次: `build-app.sh --install` → ユーザー実機でカーソル表示 + 手打ち + IME 確認 → #375 クローズ判断
