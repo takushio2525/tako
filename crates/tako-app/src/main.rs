@@ -15472,15 +15472,56 @@ mod self_test {
                 .unwrap_or_else(|| fail("MCP initialized 通知"));
             check(status == 202, "MCP 通知は 202");
 
-            // 32. tools/list が FR-2.5 の操作セットを公開している
+            // 32. tools/list のスナップショット検証（#358）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], TOOLS_LIST_MSG)
                 .await
                 .unwrap_or_else(|| fail("MCP tools/list 接続"));
-            let tool_count = serde_json::from_str::<serde_json::Value>(&response)
-                .ok()
-                .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
-                .unwrap_or(0);
-            check(status == 200 && tool_count == 101, "MCP tools/list は 101 ツール");
+            let tools_ok = {
+                const SNAPSHOT: &str =
+                    include_str!("../testdata/mcp_tools_snapshot.txt");
+                let expected: Vec<&str> =
+                    SNAPSHOT.lines().filter(|l| !l.is_empty()).collect();
+                let mut actual: Vec<String> = serde_json::from_str::<serde_json::Value>(&response)
+                    .ok()
+                    .and_then(|v| {
+                        v["result"]["tools"].as_array().map(|arr| {
+                            arr.iter()
+                                .filter_map(|t| t["name"].as_str().map(String::from))
+                                .collect()
+                        })
+                    })
+                    .unwrap_or_default();
+                actual.sort();
+                let ok = status == 200 && actual.iter().map(|s| s.as_str()).collect::<Vec<_>>() == expected;
+                if !ok {
+                    let actual_set: std::collections::HashSet<&str> =
+                        actual.iter().map(|s| s.as_str()).collect();
+                    let expected_set: std::collections::HashSet<&str> =
+                        expected.iter().copied().collect();
+                    let added: Vec<&&str> = actual_set.difference(&expected_set).collect();
+                    let removed: Vec<&&str> = expected_set.difference(&actual_set).collect();
+                    eprintln!("[selftest 32] MCP ツールスナップショット不一致:");
+                    if !added.is_empty() {
+                        eprintln!("  追加（スナップショット未登録）: {:?}", added);
+                    }
+                    if !removed.is_empty() {
+                        eprintln!("  削除（スナップショットに残存）: {:?}", removed);
+                    }
+                    eprintln!(
+                        "  → TAKO_UPDATE_SNAPSHOT=1 cargo run -p tako-app で再生成してください"
+                    );
+                    // TAKO_UPDATE_SNAPSHOT=1 なら実態でスナップショットを上書き
+                    if std::env::var("TAKO_UPDATE_SNAPSHOT").is_ok() {
+                        let snap_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("testdata/mcp_tools_snapshot.txt");
+                        let content = actual.join("\n") + "\n";
+                        let _ = std::fs::write(&snap_path, &content);
+                        eprintln!("  → スナップショットを更新しました: {}", snap_path.display());
+                    }
+                }
+                ok || std::env::var("TAKO_UPDATE_SNAPSHOT").is_ok()
+            };
+            check(tools_ok, "MCP tools/list スナップショット検証");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -16620,17 +16661,23 @@ mod self_test {
                 .unwrap_or_else(|_| fail("FR-2.12 開始時の状態取得"));
             press(any, cx, "ctrl-u");
             type_text(any, cx, &format!("{cli} tab rename 実験タブ"), true);
-            wait(cx, 1000).await;
-            let renamed = window
-                .update(cx, |app, _, _| {
-                    app.workspace
-                        .get_tab(active_tab)
-                        .map(|t| {
-                            t.title() == "実験タブ" && t.title_source() == TitleSource::Manual
-                        })
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
+            let mut renamed = false;
+            for _ in 0..15 {
+                wait(cx, 200).await;
+                renamed = window
+                    .update(cx, |app, _, _| {
+                        app.workspace
+                            .get_tab(active_tab)
+                            .map(|t| {
+                                t.title() == "実験タブ" && t.title_source() == TitleSource::Manual
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if renamed {
+                    break;
+                }
+            }
             check(renamed, "tako tab rename（手動扱い）");
 
             // 51. 自動リネームの適用と手動優先（FR-2.12.3）: 手動のタブ・ペインは
@@ -20673,15 +20720,27 @@ mod self_test {
             // 復元するが、このセルフテスト環境は draw が止まり得るため打鍵経路で検証
             // する。修正前はこの check が FAILED = blur が恒久化していた
             let _ = any.update(cx, |_, window, _| window.blur());
-            wait(cx, 300).await;
-            let blurred = window
-                .update(cx, |app, window, _| !app.focus_handle.is_focused(window))
-                .unwrap_or(false);
+            let mut blurred = false;
+            for _ in 0..10 {
+                wait(cx, 50).await;
+                blurred = window
+                    .update(cx, |app, window, _| !app.focus_handle.is_focused(window))
+                    .unwrap_or(false);
+                if blurred {
+                    break;
+                }
+            }
             press(any, cx, "escape");
-            wait(cx, 300).await;
-            let refocused = window
-                .update(cx, |app, window, _| app.focus_handle.is_focused(window))
-                .unwrap_or(false);
+            let mut refocused = false;
+            for _ in 0..15 {
+                wait(cx, 100).await;
+                refocused = window
+                    .update(cx, |app, window, _| app.focus_handle.is_focused(window))
+                    .unwrap_or(false);
+                if refocused {
+                    break;
+                }
+            }
             check(
                 blurred && refocused,
                 "IME 経路: blur 後の focus 自己修復 (#332)",
