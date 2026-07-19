@@ -924,3 +924,9 @@
 - 根因を計装で確定: render のたびに `preview_pdf_page_image_bounds` を空 HashMap でクリアし、canvas paint の `cx.defer()` で再記録する設計のタイミング窓。release ビルドの .app 環境で GPUI effect cycle の差異により常に空 map を参照。render 冒頭のクリアを削除（defer 上書きで実害なし）
 - 関連コミット: `f40bcc0`（PR #386 squash merge）。品質ゲート全緑（308 tests）+ セルフテスト PDF 全通過
 - 次: `build-app.sh --install` → ユーザー実機で cmd ホバー + cmd クリック確認 → #315 クローズ判断
+
+## 2026-07-19（#369 + #374: orchestrator 改善 — probe 一括化 + report --messages）
+- #369: `pane_log_probe_batch()` 新設。2 秒 tick の tmux 起動を N 回→1 回に削減（list-panes -a -F）。テスト 2 本追加
+- #374: `tako orchestrator report --messages N` + MCP `messages` パラメータ。直近 N 件 assistant テキスト取得（古い順、既定 1、超過=全件）
+- 関連コミット: `b3f1bbc`（PR #387 squash merge）。品質ゲート全緑（983 tests）
+- 次: `build-app.sh --install` → 実 claude ペインで `--messages 3` の取得実測
