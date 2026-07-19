@@ -25,26 +25,35 @@ Nightly patch release (automated). Changes since v0.5.6:
 
 ## [Unreleased]
 
-- [機能追加] PDF プレビューで文字選択ドラッグ中の端到達で自動スクロール (#309)
-  ペイン上下端 40px のマージン内で速度変化付き自動スクロールが開始され、ページ境界を
-  またいだ連続選択・コピーが可能に。ターミナル側の #310 と同じ操作感・速度カーブ。
-  PDF preview now auto-scrolls during text selection drag near viewport edges,
-  enabling cross-page selection and copy. Same feel and speed curve as #310.
+- [修正] 赤ボタン close → Dock 復帰の TakoApp 二重生成による全タブ消失を根治 (#381)
+  最後のウィンドウを赤ボタンで閉じて Dock から復帰すると TakoApp が再生成され、
+  旧インスタンスがゾンビ化（CLI / MCP 接続先の分裂・layout 保存の競合）、復元 spawn の
+  `-A -D` がゾンビ側の tmux クライアントを強奪して Exited 連鎖 → 縮退 layout 上書き・
+  silent death を起こしていた。Dock 復帰・メニューの New Window は生存ワークスペースの
+  ウィンドウを開き直す方式に変更（復元も spawn も経ない）。「最後の 1 枚」判定も
+  論理ウィンドウ数から GPUI ウィンドウ数に修正。あわせてパニックのローカル記録
+  （`<data_dir>/panic.log`、テレメトリ設定と無関係に常時）と終了処理の開始ログを追加し、
+  痕跡なしのプロセス消滅を事後調査できるようにした。
+  Fixed total tab loss caused by duplicated TakoApp instances on red-button close →
+  Dock reopen: the stale instance kept running (split CLI/MCP endpoints, conflicting
+  layout saves) and the new instance's restore spawn (`-A -D`) took over its tmux
+  clients, cascading pane exits into a degraded layout overwrite or silent death.
+  Dock reopen and menu New Window now reopen windows of the live workspace without
+  re-restoring. Also added always-on local panic logging (`panic.log`) and an
+  app-quit trace for post-mortem of silent process deaths.
 
-- [改善] 利用制限表示にリロードボタンを追加 + agy を「unsupported」明示表示に (#357)
-  USAGE LIMITS ドロップダウンのヘッダーにリロードボタンを追加し、全ペインの TUI フッターを
-  即時再走査して最新メトリクスを取得する。agy の制限データ取得は不可能と確定したため
-  「--」から「unsupported」明示表示に変更。CLI `tako limit-service --refresh` +
-  MCP `tako_limit_service` action=refresh で 1:1 公開。
-  Add a reload button to the USAGE LIMITS dropdown (#357). The button re-scans
-  all pane TUI footers immediately for the latest metrics. agy is confirmed
-  unsupported and now explicitly shown as such instead of "--".
+- [改善] 復元・orphan 自動復帰の防御的堅牢化 (#381)
+  空レイアウト（タブ / ペイン 0 個）の保存を拒否して既存 layout.json を保護、復元成功時に
+  良品スナップショット `layout.json.good` を保全（`tako recover --apply good` で復旧可能、
+  一覧にも表示）。orphan 自動復帰は unwrap / アクティブタブ前提 / split 失敗時の孤児登録を
+  総点検で除去し、復帰処理全体を catch_unwind で包んでパニックでも起動を続行する
+  （9 セッション一括復帰 ×5 回 + 復元併発 ×2 回の隔離反復で安定を実測）。
+  Hardened restore and orphan auto-recovery: empty layouts are rejected on save,
+  a known-good snapshot (`layout.json.good`) is preserved after each successful
+  restore (restorable via `tako recover --apply good`), and the recovery path was
+  audited (no unwrap / active-tab assumptions / orphaned registrations) and wrapped
+  in catch_unwind so a panic can no longer take down the whole app at startup.
 
-- [修正] sleep-guard の busy_agents が稼働中 worker を数えない問題を根治 (#372)
-  旧実装は OSC 133 の CommandState が Unknown のバックエンドのみ子プロセス判定していたが、
-  TUI エージェント（claude 等）が Idle→Running に遷移しないケースで busy=0 のまま assertion
-  未保持になっていた。全バックエンドの子プロセス判定に変更し、`status()` の busy_agents
-  ハードコード 0 も修正。
 - [スタイル] タブ D&D 並べ替え時のドロップ先挿入位置インジケータを改善 (#371)
   ドラッグ中に挿入位置を示す縦線バー（3px + accent glow）を表示、ソースタブを
   半透明 + 点線ボーダーで「掴まれた」状態に変化。ライト/ダーク両テーマ対応。

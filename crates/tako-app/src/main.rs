@@ -1559,14 +1559,20 @@ impl Render for DragGhost {
     }
 }
 
-/// プロセス内でプライマリウインドウが 1 つだけ存在することを保証するフラグ（Issue #113）。
-/// 赤ボタン close でウインドウが閉じてもプロセスが生存するため、Dock 復帰時に
-/// 再びプライマリとして復元できるよう `release_primary` で解放する（#312）
+/// プロセス内でプライマリの TakoApp が 1 つだけ存在することを保証するフラグ（Issue #113）。
+/// 赤ボタン close で全ウインドウが閉じてもプライマリ entity は生き続け、Dock 復帰は
+/// `PrimaryApp` global 経由で同じ entity のウインドウを開き直す（#381）。このフラグを
+/// 解放して TakoApp::new を作り直すと、旧 entity がゾンビ化（IPC スレッド等が参照を保持）
+/// して新旧の保存が競合し、復元 spawn の `-A -D` がゾンビ側の tmux クライアントを
+/// 強奪 → ゾンビの Exited 連鎖 → 縮退 layout 上書きの全タブ消失を起こす（#381 実測）
 static PRIMARY_CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn release_primary() {
-    PRIMARY_CLAIMED.store(false, std::sync::atomic::Ordering::SeqCst);
-}
+/// プロセス内プライマリの TakoApp entity（#381）。赤ボタン close で GPUI ウインドウが
+/// 0 枚になっても entity は生存するため、Dock 復帰（on_reopen）・メニューの New Window は
+/// これを upgrade してウインドウだけ開き直す（TakoApp::new の二重生成 = ゾンビ化を防ぐ）
+struct PrimaryApp(gpui::WeakEntity<TakoApp>);
+
+impl gpui::Global for PrimaryApp {}
 
 impl TakoApp {
     fn new(cx: &mut Context<Self>) -> Self {
@@ -1709,6 +1715,8 @@ impl TakoApp {
                         }
                     );
                     persist_diag(&msg);
+                    // 実際に復元へ使えた実績のある layout を良品として保全（#381）
+                    tako_control::layout::snapshot_good();
                     (ws, msg)
                 }
                 Err(e) => {
@@ -1951,6 +1959,14 @@ impl TakoApp {
         // 「全ペイン終了」経路（quitting=true）は layout.json の削除 / 保持を
         // close_pane 側で確定済みのため、ここでは触らない（#30 / #113 の挙動を維持）
         cx.on_app_quit(|this: &mut TakoApp, _cx| {
+            // 終了の痕跡を必ず残す（#381: silent death 調査で「このログがあるのに次の
+            // 起動が無い = 正常終了、ログすら無い = kill / パニック」を切り分けるため）
+            if !this.secondary {
+                persist_diag(&format!(
+                    "on_app_quit: 終了処理開始（quitting={}）",
+                    this.quitting
+                ));
+            }
             if !this.quitting {
                 // ペインログ（Issue #112 B）: バックエンドの無い直接ペインはアプリと共に
                 // プロセスが死ぬため、可視画面をフラッシュして書き残す。バックエンドペインは
@@ -2140,7 +2156,16 @@ impl TakoApp {
         // セッションを拾い、「復帰」タブにまとめて配置する。
         // セカンダリモード・persist OFF・tmux 不在では何もしない（= クリーン起動に影響なし）
         if tmux_persist && tmux_available && !secondary {
-            let recovered = app.recover_orphan_sessions(cx);
+            // #381: 多セッション一括復帰の未知のパニックで起動ごと死なない（silent death
+            // 対策）。panic hook が panic.log へ記録した上で、ここでは復帰を断念して
+            // 起動を続行する（tmux セッション自体は無傷で残り、次回起動で再試行される）
+            let recovered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                app.recover_orphan_sessions(cx)
+            }))
+            .unwrap_or_else(|_| {
+                persist_diag("orphan 自動復帰が panic（詳細は panic.log）: 復帰を断念して起動続行");
+                Vec::new()
+            });
             if !recovered.is_empty() {
                 app.recovered_count = recovered.len();
                 let report = format!(
@@ -4589,7 +4614,12 @@ impl TakoApp {
         let first_pane = Pane::new(PaneOrigin::User);
         let first_id = first_pane.id();
         self.workspace.create_tab(tab_title, first_pane);
-        let tab_id = self.workspace.find_tab_of_pane(first_id).unwrap();
+        // #381 総点検: unwrap をやめ、論理的に到達しないケースでもパニックではなく
+        // 復帰断念（起動続行）を選ぶ（多セッション一括復帰の途中パニックは silent death に直結）
+        let Some(tab_id) = self.workspace.find_tab_of_pane(first_id) else {
+            eprintln!("warning: orphan 復帰タブを作成できないため復帰を断念");
+            return Vec::new();
+        };
         // 最初の orphan を最初のペインに割り当て、残りは分割で追加
         let mut recovered = Vec::new();
         for (i, name) in orphans.iter().enumerate() {
@@ -4598,11 +4628,21 @@ impl TakoApp {
             } else {
                 let new_pane = Pane::new(PaneOrigin::User);
                 let new_id = new_pane.id();
-                let _ = self.workspace.active_tab_mut().tree_mut().split(
-                    first_id,
-                    tako_core::SplitDirection::Down,
-                    new_pane,
-                );
+                // #381 総点検: 復帰タブを ID で直接指す（旧実装の active_tab_mut は
+                // 「復帰タブがアクティブのまま」という前提で、途中で create 系 dispatch が
+                // 割り込むと別タブへ split する）。split 失敗時はこの orphan をスキップし、
+                // ツリー外ペインへの backend 登録・spawn（孤児化）を防ぐ
+                let Some(tab) = self.workspace.get_tab_mut(tab_id) else {
+                    eprintln!("warning: orphan 復帰タブが消えたため残りの復帰を断念");
+                    break;
+                };
+                if let Err(e) =
+                    tab.tree_mut()
+                        .split(first_id, tako_core::SplitDirection::Down, new_pane)
+                {
+                    eprintln!("warning: orphan セッション {name} の復帰ペインを作れない: {e}");
+                    continue;
+                }
                 new_id
             };
             self.backend_sessions.insert(pane_id, name.clone());
@@ -4659,8 +4699,9 @@ impl TakoApp {
             if let Some(tab_id) = self.workspace.find_tab_of_pane(first_id) {
                 self.remove_tab_with(tab_id, CloseReason::Explicit, cx);
             }
-        } else {
-            self.workspace.active_tab_mut().tree_mut().equalize();
+        } else if let Some(tab) = self.workspace.get_tab_mut(tab_id) {
+            // 復帰タブを ID で直接均等化（#381 総点検: active タブ前提を除去）
+            tab.tree_mut().equalize();
         }
         recovered
     }
@@ -5571,19 +5612,25 @@ impl TakoApp {
 
     /// 赤ボタン close（on_window_should_close）。複数ウィンドウならビューポートだけ
     /// 閉じてタブを残存ウィンドウへ合流させる（タブ・プロセスは殺さない）。
-    /// 最後の 1 枚は #312 の従来挙動（layout 保存 + primary 解放 → プロセス生存 →
-    /// Dock 復帰で復元）
+    /// 最後の 1 枚は layout 保存のみ（entity・workspace・tmux クライアントは生存し、
+    /// Dock 復帰（on_reopen）が同じ entity のウインドウを開き直す。#312 → #381 で
+    /// primary 解放 + TakoApp::new 再生成を廃止: 旧 entity のゾンビ化と保存競合が
+    /// 全タブ消失を起こしていた）。
+    /// 「最後の 1 枚」判定は GPUI ウインドウ数で行う（論理ウインドウ数だと viewport
+    /// 生成失敗などで枚数がズレたとき、保存されないままウインドウ 0 枚になり得る）
     fn handle_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let handle = window.window_handle();
         let logical = self.viewport_of(window);
-        if self.workspace.windows().len() > 1 {
+        if cx.windows().len() > 1 {
             if let Some(lid) = logical {
-                match self.workspace.close_window(lid) {
-                    Ok(moved) => persist_diag(&format!(
-                        "ウィンドウ close: タブ {} 枚を残存ウィンドウへ合流",
-                        moved.len()
-                    )),
-                    Err(e) => eprintln!("warning: ウィンドウを閉じられない: {e}"),
+                if self.workspace.windows().len() > 1 {
+                    match self.workspace.close_window(lid) {
+                        Ok(moved) => persist_diag(&format!(
+                            "ウィンドウ close: タブ {} 枚を残存ウィンドウへ合流",
+                            moved.len()
+                        )),
+                        Err(e) => eprintln!("warning: ウィンドウを閉じられない: {e}"),
+                    }
                 }
                 self.drop_viewport(lid, handle);
                 self.save_layout();
@@ -5591,9 +5638,8 @@ impl TakoApp {
             }
             return true;
         }
-        persist_diag("赤ボタン close: layout 保存 + primary 解放");
+        persist_diag("赤ボタン close: layout 保存（ワークスペースは生存、Dock 復帰で再表示）");
         self.save_layout();
-        release_primary();
         if let Some(lid) = logical {
             self.drop_viewport(lid, handle);
         }
@@ -13969,6 +14015,35 @@ fn open_restored_window(cx: &mut App) {
     open_primary_window(bounds, cx);
 }
 
+/// ウインドウが 0 枚になった後の再表示（#381: Dock 復帰・New Window）。生きている
+/// プライマリ entity があればその論理ウインドウの GPUI ウインドウだけを開き直し、
+/// 無ければ従来どおり保存レイアウトから復元して開く。TakoApp::new を作り直さない
+/// ことで、旧 entity のゾンビ化（保存競合 + 復元 spawn の `-A -D` クライアント強奪 →
+/// Exited 連鎖 → 縮退 layout 上書き = 全タブ消失）を構造的に防ぐ
+fn reopen_or_restore(cx: &mut App) {
+    let live = cx.try_global::<PrimaryApp>().and_then(|g| g.0.upgrade());
+    match live {
+        Some(entity) => entity.update(cx, |app, cx| {
+            let logicals: Vec<tako_core::WindowId> =
+                app.workspace.windows().iter().map(|w| w.id()).collect();
+            persist_diag(&format!(
+                "on_reopen: 生存ワークスペースのウィンドウを開き直す（{} タブ / {} ウィンドウ）",
+                app.workspace.tabs().len(),
+                logicals.len()
+            ));
+            for lid in logicals {
+                if !app.viewports.iter().any(|(l, _)| *l == lid) {
+                    app.open_viewport(lid, cx);
+                }
+            }
+        }),
+        None => {
+            persist_diag("on_reopen: ウインドウなし → 復元ウインドウを開く");
+            open_restored_window(cx);
+        }
+    }
+}
+
 /// プライマリウィンドウを開く（TakoApp entity を新規作成する経路: 初回起動・Dock 復帰）。
 /// 追加ウィンドウは `open_viewport_window`（同一 entity 共有。Issue #339）を使う。
 /// 赤ボタン close の挙動は `TakoApp::handle_window_close`（複数ウィンドウなら
@@ -13982,6 +14057,12 @@ fn open_primary_window(window_bounds: WindowBounds, cx: &mut App) -> gpui::Windo
         },
         |window, cx| {
             let view = cx.new(TakoApp::new);
+            // プロセス内プライマリを記録（#381。Dock 復帰・New Window はこの entity の
+            // ウインドウを開き直す）。セカンダリ（多重起動の後発）はプライマリの
+            // 再表示先を乗っ取らないよう記録しない
+            if !view.read(cx).secondary {
+                cx.set_global(PrimaryApp(view.downgrade()));
+            }
             let logical = view.read(cx).workspace.active_window_id();
             view.update(cx, |app, cx| app.register_viewport(logical, window, cx));
             let entity = view.clone();
@@ -14123,6 +14204,15 @@ fn main() {
         tako_control::telemetry::init(settings.telemetry);
         tako_control::telemetry::install_panic_handler();
     }
+    // パニック記録経路の診断フック（#381）: TAKO_DEBUG_PANIC=1 で起動直後に故意に
+    // パニックし、<data_dir>/panic.log への記録（テレメトリ設定と無関係）を検証できる。
+    // 本番動作には影響しない（環境変数の明示時のみ）
+    if matches!(
+        std::env::var("TAKO_DEBUG_PANIC").ok().as_deref(),
+        Some("1" | "true" | "on")
+    ) {
+        panic!("TAKO_DEBUG_PANIC: パニック記録経路の診断用（panic.log へ書かれることを検証）");
+    }
     let initial_dir = parse_initial_dir();
     if let Some(ref dir) = initial_dir {
         if let Err(e) = std::env::set_current_dir(dir) {
@@ -14135,8 +14225,7 @@ fn main() {
     // 無ければ保存済みレイアウトから復元して新規ウインドウを開く）
     app.on_reopen(|cx| {
         if cx.windows().is_empty() {
-            persist_diag("on_reopen: ウインドウなし → 復元ウインドウを開く");
-            open_restored_window(cx);
+            reopen_or_restore(cx);
             cx.activate(true);
         }
     });
@@ -14147,10 +14236,10 @@ fn main() {
         // New Window はルート div（TakoApp::new_viewport_window = 同一 entity の
         // ビューポート追加。Issue #339）が処理する。ここはウィンドウが 1 枚も無い
         // （全部閉じた後にメニューから New Window）ときだけ届くグローバルフォール
-        // バックで、Dock 復帰（on_reopen）と同じ復元ウィンドウを開く
+        // バックで、Dock 復帰（on_reopen）と同じく生存 entity のウインドウを開き直す（#381）
         cx.on_action(|_: &NewWindow, cx| {
             if cx.windows().is_empty() {
-                open_restored_window(cx);
+                reopen_or_restore(cx);
                 cx.activate(true);
             }
         });
@@ -21213,6 +21302,49 @@ mod self_test {
             });
             wait(cx, 800).await;
 
+            // 79. 赤ボタン close → 再表示（#381）: 最後の 1 枚の赤ボタン close は
+            //     TakoApp entity を破棄せず、Dock 復帰（reopen_or_restore）が**同一
+            //     entity** のウィンドウを開き直す。旧実装は TakoApp::new を再生成して
+            //     旧 entity がゾンビ化（IPC 二重化・保存競合・復元 spawn の -A -D
+            //     クライアント強奪 → Exited 連鎖）し全タブ消失を起こしていた
+            let before = window
+                .update(cx, |app, _, cx| {
+                    (app.workspace.tabs().len(), cx.entity().entity_id())
+                })
+                .ok();
+            check(before.is_some(), "赤ボタン close 前の状態を採取できる (#381)");
+            // 赤ボタン close 相当: should_close ハンドラ → true → remove_window
+            let _ = window.update(cx, |app, win, cx| {
+                let allow = app.handle_window_close(win, cx);
+                if allow {
+                    win.remove_window();
+                }
+            });
+            wait(cx, 800).await;
+            let gpui_empty = cx.update(|cx| cx.windows().is_empty());
+            check(gpui_empty, "赤ボタン close で GPUI ウィンドウが 0 枚になる (#381)");
+            // Dock 復帰相当: reopen_or_restore が生存 entity のウィンドウを開き直す
+            cx.update(reopen_or_restore);
+            wait(cx, 1200).await;
+            let after = cx.update(|cx| {
+                let wins = cx.windows().len();
+                cx.try_global::<PrimaryApp>()
+                    .and_then(|g| g.0.upgrade())
+                    .map(|e| (wins, e.entity_id(), e.read(cx).workspace.tabs().len()))
+            });
+            check(
+                after.map(|(wins, _, _)| wins) == Some(1),
+                "Dock 復帰でウィンドウが 1 枚開き直される (#381)",
+            );
+            check(
+                before.map(|(_, id)| id) == after.map(|(_, id, _)| id),
+                "Dock 復帰は同一 TakoApp entity を再利用する（TakoApp::new を再生成しない） (#381)",
+            );
+            check(
+                before.map(|(tabs, _)| tabs) == after.map(|(_, _, tabs)| tabs),
+                "Dock 復帰後もタブ構成が維持される（復元を経ない） (#381)",
+            );
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -21225,8 +21357,12 @@ mod self_test {
             // quit → on_app_quit フック（OK マーカー印字）→ 自然終了（exit 0）する。
             // 「終了すること」自体が成功条件のため必ず最後に置く。不発時のみ 5 秒後の
             // fail（exit 1・OK マーカーなし）へ到達する
-            let _ = any.update(cx, |_, window, _| window.blur());
-            press(any, cx, "cmd-q");
+            // （項目 78 でウィンドウを開き直しているため handle を取り直す。#381）
+            let final_any = cx
+                .update(|cx| cx.windows().first().copied())
+                .unwrap_or(any);
+            let _ = final_any.update(cx, |_, window, _| window.blur());
+            press(final_any, cx, "cmd-q");
             wait(cx, 5000).await;
             fail("フォーカス喪失状態の cmd-q で終了しない (#103)");
         })
