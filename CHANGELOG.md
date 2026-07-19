@@ -3,6 +3,40 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.8] - 2026-07-20
+
+Nightly patch release (automated). Changes since v0.5.7:
+夜間パッチリリース（自動）。v0.5.7 以降の変更:
+
+- [ドキュメント] activeContext / progress を #381 完了で更新
+- [修正] 赤ボタン close → Dock 復帰の TakoApp 二重生成による全タブ消失を根治 + 復元の防御的堅牢化 (#381) (#400)
+- [機能追加] Finder D&D 改善: ツリー追加 + cmd ドロップ出し分け (#219, #21) (#399)
+- [改善] Web ビュー改善: target=_blank 対応 / SVG ツールバー / アドレスバー (#335, #336, #337) (#398)
+- [改善] セルフテスト基盤改善: スナップショット検証化 + flaky 安定化 (#358, #343) (#397)
+- [修正] Web dock URL 入力のセルフテスト項目 78 を追加 (#375)
+- [ドキュメント] activeContext / progress を #391 修正完了で更新
+- [修正] setup: 対話エージェントの既定起動を復元 (#391) (#396)
+- [機能追加] PDF プレビューのドラッグ選択で端到達時の自動スクロールとページまたぎ選択 (#309) (#395)
+- [修正] リサイズ・レイアウト変化時のペイン暗転を根治 (#385) (#394)
+- [ドキュメント] activeContext / progress を #357 完了で更新
+- [スタイル] UI 掃除: workers 起動ボタン + 失敗トースト/再試行を撤去 (#392)
+- [改善] 利用制限表示にリロードボタン追加 + agy を unsupported 明示表示に (#357) (#393)
+- [ドキュメント] activeContext / progress を #372 修正完了で更新
+- [修正] sleep-guard: 全バックエンドの子プロセス判定で busy 漏れを根治 (#372) (#389)
+- [改善] エラーレポート自動送信の Phase 2: 送信キュー・PII マスキング強化・重大エラーフック (#333) (#388)
+- [ドキュメント] activeContext / progress を #369 + #374 修正完了で更新
+- [改善] orchestrator: probe 一括化 + report --messages (#369 #374) (#387)
+- [ドキュメント] activeContext / progress を #315 R2 修正完了で更新
+- [修正] PDF リンクの cmd ホバー/クリックが .app 環境で不発になる問題を根治 (#315) (#386)
+- [修正] verify_pid_identity の fail-open を fail-safe に変更 (#329) (#384)
+- [ドキュメント] activeContext / progress を #375 修正完了で更新
+- [ドキュメント] activeContext / progress を #378 実装完了で更新
+- [修正] Web dock URL 入力欄のフォーカス不在を修正 (#375) (#383)
+- [機能追加] タブ名の自動命名: source パラメータ + 命名規則設定 + master プロンプト追記 (#378) (#382)
+- [改善] claude session スキャンの Node 起動コスト削減 (#368) (#376)
+- [ドキュメント] activeContext / progress を #371 実装完了で更新
+- [スタイル] タブ D&D 並べ替えのドロップ先挿入位置インジケータを実装 (#371) (#373)
+
 ## [0.5.7] - 2026-07-19
 
 Nightly patch release (automated). Changes since v0.5.6:
