@@ -9772,12 +9772,10 @@ impl TakoApp {
         cx.notify();
     }
 
-    /// 子ワーカードロップダウン（#217 カンプ: w282 / radius 9 / ヘッダ + 行 + フッター）。
-    /// master ペインの「N workers ▾」から開く。行クリックでジャンプ、
-    /// フッターは master ペインへのフォーカス（起動指示の導線）
+    /// 子ワーカードロップダウン（#217 カンプ: w282 / radius 9 / ヘッダ + 行）。
+    /// master ペインの「N workers ▾」から開く。行クリックでジャンプ
     fn render_workers_menu(
         &self,
-        master_pane: PaneId,
         workers: &[WorkerRow],
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -9896,39 +9894,6 @@ impl TakoApp {
                                     })),
                             )
                     })),
-            )
-            .child(
-                div()
-                    .id(("workers-menu-spawn", master_pane.as_u64()))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
-                    .px(px(12.0))
-                    .py(px(8.0))
-                    .border_t_1()
-                    .border_color(hsla(theme.border_subtle))
-                    .text_size(px(11.0))
-                    .text_color(hsla(theme.text_muted))
-                    .cursor_pointer()
-                    .hover(|d| {
-                        d.text_color(hsla(theme.foreground))
-                            .bg(rgba(theme.surface_hover))
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.workers_menu_open = None;
-                        // 起動指示は master との対話で行う（master ペインへ導線）
-                        this.jump_to_pane(master_pane, cx);
-                    }))
-                    .child(
-                        svg()
-                            .path(crate::file_icons::ui_icon::PLUS)
-                            .w(px(11.0))
-                            .h(px(11.0))
-                            .text_color(hsla(theme.text_muted)),
-                    )
-                    .child("ワーカーを起動"),
             )
             .into_any_element()
     }
@@ -10845,7 +10810,7 @@ impl TakoApp {
             // 子ワーカードロップダウン（カンプ: w282 / radius 9。ヘッダ下に絶対配置）
             // ターミナルテキストエリアより後に描画し、背後が透けないようにする（#341）
             .when(workers_menu_open, |d| {
-                d.child(self.render_workers_menu(pane_id, &workers, cx))
+                d.child(self.render_workers_menu(&workers, cx))
             })
             .into_any_element()
     }
