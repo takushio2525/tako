@@ -632,6 +632,9 @@ pub enum Request {
         /// スクロールバック取得行数（既定 2000）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         lines: Option<usize>,
+        /// transcript から取得する直近 assistant メッセージ件数（#374。既定 1）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        messages: Option<usize>,
     },
     /// オーケストレーター: 委任台帳の操作（Issue #292）。
     /// action: list / stats / record / amend

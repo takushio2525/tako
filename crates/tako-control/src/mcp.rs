@@ -1490,7 +1490,8 @@ pub fn tools() -> Vec<Value> {
                 transcript が利用可能なら source=transcript で全文テキストを返し、scrollback_text に \
                 スクロールバック版も併記する。利用不可（codex / agy 等）なら source=scrollback。\
                 tako_read_pane（可視画面のみ）と異なり、スクロールバック履歴を遡るため長い出力も取得できる。\
-                報告の読み取りには report を使い、read_pane は配置・生存確認用に限定すること。",
+                報告の読み取りには report を使い、read_pane は配置・生存確認用に限定すること。\
+                messages で直近 n 件の assistant テキストを取得できる（古い順で返す。省略時 1 件）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1498,6 +1499,10 @@ pub fn tools() -> Vec<Value> {
                     "lines": {
                         "type": "integer", "minimum": 1, "maximum": 100000,
                         "description": "スクロールバック取得行数（既定 2000）",
+                    },
+                    "messages": {
+                        "type": "integer", "minimum": 1, "maximum": 1000,
+                        "description": "transcript から取得する直近 assistant メッセージ件数（既定 1。古い順で返す。総数超過時は全件）",
                     },
                 },
                 "required": ["pane_id"],
@@ -2962,6 +2967,7 @@ fn build_request(
         "tako_orchestrator_report" => Request::OrchestratorReport {
             pane_id: required_u64(args, "pane_id")?,
             lines: u64_arg(args, "lines")?.map(|v| v as usize),
+            messages: u64_arg(args, "messages")?.map(|v| v as usize),
         },
         "tako_orchestrator_worker_status" => Request::OrchestratorWorkerStatus {
             pane_id: required_u64(args, "pane_id")?,

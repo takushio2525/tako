@@ -1155,6 +1155,9 @@ enum OrchestratorCommand {
         /// スクロールバック取得行数（既定 2000）
         #[arg(long, default_value = "2000")]
         lines: usize,
+        /// transcript から取得する直近 assistant メッセージ件数（既定 1。古い順で返す）
+        #[arg(long)]
+        messages: Option<usize>,
     },
     /// spawn + 完了待ち + 出力取得 + close を 1 回で行う
     Run {
@@ -1925,13 +1928,16 @@ fn main() -> ExitCode {
             })
             .map(|result| println!("{}", pretty_json(&result)))
         }
-        Command::Orchestrator(OrchestratorCommand::Report { pane, lines }) => {
-            send_request(Request::OrchestratorReport {
-                pane_id: pane,
-                lines: Some(lines),
-            })
-            .map(|result| println!("{}", pretty_json(&result)))
-        }
+        Command::Orchestrator(OrchestratorCommand::Report {
+            pane,
+            lines,
+            messages,
+        }) => send_request(Request::OrchestratorReport {
+            pane_id: pane,
+            lines: Some(lines),
+            messages,
+        })
+        .map(|result| println!("{}", pretty_json(&result))),
         Command::Orchestrator(OrchestratorCommand::Run {
             ref project,
             ref prompt,
