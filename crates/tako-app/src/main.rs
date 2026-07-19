@@ -906,6 +906,10 @@ struct TakoApp {
     webview_dock_url_cursor: usize,
     /// URL 入力欄がフォーカスされているか（dock は開いていてもターミナルへ入力できる）
     webview_dock_url_focused: bool,
+    /// Web ビューペインのアドレスバー編集状態（#337。pane_id → (入力文字列, カーソル位置)）
+    webview_address_bar: HashMap<u64, (String, usize)>,
+    /// アドレスバー編集中の pane_id（同時に 1 つのみ）
+    webview_address_bar_active: Option<PaneId>,
     /// wry の親にする GPUI ウィンドウの生ハンドル（初回 render で採取）
     window_raw_handle: Option<webview::WindowHandleBox>,
     /// 起動復元で開き直す Web ビュー（ペイン対応, URL）。ウィンドウハンドルが
@@ -1881,6 +1885,8 @@ impl TakoApp {
             webview_dock_url_input: String::new(),
             webview_dock_url_cursor: 0,
             webview_dock_url_focused: false,
+            webview_address_bar: HashMap::new(),
+            webview_address_bar_active: None,
             window_raw_handle: None,
             pending_webview_restore: Vec::new(),
             update_state: update_checker::UpdateState::Idle,
@@ -2409,7 +2415,7 @@ impl TakoApp {
                 cx.background_executor().timer(Duration::from_secs(2)).await;
                 // ① main thread: tmux コンテキスト + filetree 対象 + view 監視対象 + git を収集（高速）
                 let t0 = std::time::Instant::now();
-                let prep = this.update(cx, |app: &mut TakoApp, _| {
+                let prep = this.update(cx, |app: &mut TakoApp, wcx| {
                     // Issue #168: 定期更新の UI スレッド部（収集 + save_layout）を計測
                     let _span = tako_control::diag::perf_span("periodic_prep");
                     // ステップ別サブスパン（#212: periodic_prep の秒級スパイクをステップ単位で
@@ -2433,6 +2439,7 @@ impl TakoApp {
                     {
                         let _s = tako_control::diag::perf_span("periodic_prep:webview");
                         app.poll_webview_state();
+                        app.process_pending_new_windows(wcx);
                     }
                     let sleep_guard_backends = {
                         let _s = tako_control::diag::perf_span("periodic_prep:sleep_guard");
@@ -6491,6 +6498,12 @@ impl TakoApp {
             return;
         }
 
+        if self.webview_address_bar_active.is_some()
+            && self.handle_webview_address_bar_key(keystroke, cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
         if self.webview_dock_url_focused && self.handle_webview_dock_url_key(keystroke, cx) {
             cx.stop_propagation();
             return;
@@ -9052,14 +9065,17 @@ impl TakoApp {
         let id = self.webviews[idx].id;
         let url = self.webviews[idx].current_url();
         let title = self.webviews[idx].current_title();
-        let loading = self.webviews[idx].is_loading();
+        let _loading = self.webviews[idx].is_loading();
+        let can_go_back = self.webviews[idx].can_go_back();
+        let can_go_forward = self.webviews[idx].can_go_forward();
         let error_state = self.webviews[idx].error_state();
 
         // 本文領域 = pane_text_areas と同じ絶対座標（タイトルバー・枠・パディングの内側）。
         // GPUI の Pixels は論理座標なので wry の Logical bounds へそのまま渡せる。
         // 実描画はネイティブ webview 自身が行い、GPUI 側は枠とタイトルバーだけを描く
         self.webview_marks.insert(id);
-        if error_state.is_none() {
+        let editing_addr = self.webview_address_bar_active == Some(pane_id);
+        if error_state.is_none() && !editing_addr {
             let bounds = (
                 f64::from(f32::from(area.origin.x)),
                 f64::from(f32::from(area.origin.y)),
@@ -9076,42 +9092,50 @@ impl TakoApp {
         } else {
             title
         };
-        // ← / → / ⟳ のナビゲーションボタン（webview 本体はネイティブが処理するため、
-        // GPUI 側 UI はタイトルバーに限られる）
-        let nav_button = |icon: &'static str,
-                          to: &'static str,
-                          cx: &mut Context<Self>|
-         -> gpui::Stateful<gpui::Div> {
-            div()
-                .id((to, pane_id.as_u64()))
-                .w(px(20.0))
-                .h(px(18.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_sm()
-                .cursor_pointer()
-                .text_size(px(12.0))
-                .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.9))
-                .hover(|d| {
-                    d.bg(rgba_alpha(theme.surface_2, 0.9))
-                        .text_color(hsla(theme.foreground))
-                })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    if let Some(e) = this.webviews.iter().find(|e| e.pane == Some(pane_id)) {
-                        if let Err(err) = e.navigate(to) {
-                            eprintln!("warning: webview navigate({to}) 失敗: {err}");
-                        }
-                    }
-                    cx.notify();
-                }))
-                .child(icon)
-        };
+        // ナビゲーションボタン（SVG アイコン + 無効状態対応。#336）
+        let nav_button =
+            |icon_path: &'static str,
+             to: &'static str,
+             enabled: bool,
+             cx: &mut Context<Self>|
+             -> gpui::Stateful<gpui::Div> {
+                let base =
+                    div()
+                        .id((to, pane_id.as_u64()))
+                        .w(px(20.0))
+                        .h(px(18.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .child(svg().path(icon_path).w(px(12.0)).h(px(12.0)).text_color(
+                            if enabled {
+                                hsla_alpha(theme.tab_inactive_foreground, 0.9)
+                            } else {
+                                hsla_alpha(theme.tab_inactive_foreground, 0.3)
+                            },
+                        ));
+                if enabled {
+                    base.cursor_pointer()
+                        .hover(|d| d.bg(rgba_alpha(theme.surface_2, 0.9)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(e) = this.webviews.iter().find(|e| e.pane == Some(pane_id))
+                            {
+                                if let Err(err) = e.navigate(to) {
+                                    eprintln!("warning: webview navigate({to}) 失敗: {err}");
+                                }
+                            }
+                            cx.notify();
+                        }))
+                } else {
+                    base.cursor(CursorStyle::Arrow)
+                }
+            };
         let body = if let Some((error_msg, failed_url)) = &error_state {
             self.render_webview_error_overlay(pane_id, error_msg, failed_url, &theme, cx)
         } else {
@@ -9213,10 +9237,15 @@ impl TakoApp {
                                 cx.stop_propagation();
                                 this.webview_close_button(pane_id, cx);
                             }))
-                            .child("×"),
+                            .child(
+                                svg()
+                                    .path(crate::file_icons::ui_icon::CLOSE)
+                                    .w(px(10.0))
+                                    .h(px(10.0))
+                                    .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8)),
+                            ),
                     )
                     .child(
-                        // ー = dock へ退避（ページは生きたまま。たまり場の ー と同じ作法）
                         div()
                             .id(("pane-web-hide", pane_id.as_u64()))
                             .w(px(16.0))
@@ -9239,52 +9268,150 @@ impl TakoApp {
                                 cx.stop_propagation();
                                 this.webview_hide_button(pane_id, cx);
                             }))
-                            .child("ー"),
+                            .child(
+                                svg()
+                                    .path(crate::file_icons::ui_icon::MINUS)
+                                    .w(px(10.0))
+                                    .h(px(10.0))
+                                    .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8)),
+                            ),
                     )
-                    .child(nav_button("←", "back", cx))
-                    .child(nav_button("→", "forward", cx))
+                    .child(nav_button(
+                        crate::file_icons::ui_icon::CHEVRON_LEFT,
+                        "back",
+                        can_go_back,
+                        cx,
+                    ))
+                    .child(nav_button(
+                        crate::file_icons::ui_icon::CHEVRON_RIGHT,
+                        "forward",
+                        can_go_forward,
+                        cx,
+                    ))
                     .child(nav_button(
                         if error_state.is_some() {
-                            "!"
-                        } else if loading {
-                            "…"
+                            crate::file_icons::ui_icon::WARNING
                         } else {
-                            "⟳"
+                            crate::file_icons::ui_icon::REFRESH
                         },
                         "reload",
+                        true,
                         cx,
                     ))
                     .child(
-                        div()
-                            .text_color(if focused {
-                                hsla(theme.foreground)
-                            } else {
-                                hsla(theme.tab_inactive_foreground)
-                            })
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(5.0))
-                            .child(
-                                svg()
-                                    .path(crate::file_icons::ui_icon::GLOBE)
-                                    .w(px(12.0))
-                                    .h(px(12.0))
-                                    .text_color(hsla(theme.accent)),
-                            )
-                            .child(SharedString::from(truncate(&display_title, 32))),
+                        svg()
+                            .path(crate::file_icons::ui_icon::GLOBE)
+                            .w(px(12.0))
+                            .h(px(12.0))
+                            .text_color(hsla(theme.accent)),
                     )
-                    .child(
-                        // URL 表示（タイトルの右に控えめに。編集は CLI / MCP / cmd+K 経由）
-                        div()
-                            .flex_grow(1.0)
-                            .overflow_hidden()
-                            .text_size(px(10.0))
-                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.7))
-                            .child(SharedString::from(truncate(&url, 48))),
-                    ),
+                    .child(self.render_webview_address_bar(
+                        pane_id,
+                        &url,
+                        &display_title,
+                        focused,
+                        cx,
+                    )),
             )
             .child(body)
+    }
+
+    /// Web ビューペインのアドレスバー（#337）。通常は URL 表示、クリックで編集モード
+    fn render_webview_address_bar(
+        &self,
+        pane_id: PaneId,
+        url: &str,
+        title: &str,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = &self.theme;
+        let editing = self.webview_address_bar_active == Some(pane_id);
+        if editing {
+            let (input, cursor) = self
+                .webview_address_bar
+                .get(&pane_id.as_u64())
+                .cloned()
+                .unwrap_or_default();
+            let cursor = cursor.min(input.len());
+            let before = &input[..cursor];
+            let after = &input[cursor..];
+            div()
+                .id(("web-addr-bar", pane_id.as_u64()))
+                .flex_1()
+                .flex()
+                .flex_row()
+                .items_center()
+                .overflow_hidden()
+                .px(px(4.0))
+                .py(px(1.0))
+                .rounded_sm()
+                .bg(rgba_alpha(theme.accent, 0.10))
+                .border_1()
+                .border_color(hsla_alpha(theme.accent, 0.5))
+                .text_size(px(11.0))
+                .text_color(hsla(theme.foreground))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                )
+                .child(SharedString::from(before.to_string()))
+                .child(
+                    div()
+                        .w(px(1.5))
+                        .h(px(14.0))
+                        .flex_none()
+                        .bg(hsla(theme.accent)),
+                )
+                .child(SharedString::from(after.to_string()))
+        } else {
+            let display = if title.is_empty() || title == url {
+                truncate(url, 60)
+            } else {
+                format!("{} — {}", truncate(title, 24), truncate(url, 36))
+            };
+            div()
+                .id(("web-addr-bar", pane_id.as_u64()))
+                .flex_1()
+                .flex()
+                .flex_row()
+                .items_center()
+                .overflow_hidden()
+                .px(px(4.0))
+                .py(px(1.0))
+                .rounded_sm()
+                .cursor(CursorStyle::IBeam)
+                .hover(|d| d.bg(rgba_alpha(theme.surface_2, 0.6)))
+                .text_size(px(11.0))
+                .text_color(if focused {
+                    hsla(theme.foreground)
+                } else {
+                    hsla(theme.tab_inactive_foreground)
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        let current_url = this
+                            .webviews
+                            .iter()
+                            .find(|e| e.pane == Some(pane_id))
+                            .map(|e| e.current_url())
+                            .unwrap_or_default();
+                        let len = current_url.len();
+                        this.webview_address_bar
+                            .insert(pane_id.as_u64(), (current_url, len));
+                        this.webview_address_bar_active = Some(pane_id);
+                        // アドレスバー編集中は webview を隠してキー入力を GPUI に渡す
+                        if let Some(e) = this.webviews.iter_mut().find(|e| e.pane == Some(pane_id))
+                        {
+                            e.sync_frame(None);
+                        }
+                        cx.notify();
+                    }),
+                )
+                .child(SharedString::from(display))
+        }
     }
 
     /// Web ビューのエラーオーバーレイ（#327）。ネイティブ webview を隠し、GPUI で
@@ -9418,6 +9545,23 @@ impl TakoApp {
         }
     }
 
+    /// target=_blank / window.open で要求された新規ウィンドウ URL を処理する（#335）。
+    /// 2 秒ポーリングの中で呼ばれ、各 URL ごとに新規 Web ビューペインを開く
+    fn process_pending_new_windows(&mut self, cx: &mut Context<Self>) {
+        let urls: Vec<String> = self
+            .webviews
+            .iter()
+            .flat_map(|e| e.drain_new_window_urls())
+            .collect();
+        for url in urls {
+            let normalized = webview::normalize_url(&url);
+            if webview::validate_url(&normalized).is_err() {
+                continue;
+            }
+            self.open_webview_from_dock(&normalized, cx);
+        }
+    }
+
     /// dock の「表示」ボタン / dispatch 以外からの呼び出し口。表示中ならそのペインへ
     /// フォーカス（タブ切替込み）、dock 退避中ならフォーカスペインを右分割して表示する
     fn webview_show_from_dock(&mut self, id: webview::WebViewId, cx: &mut Context<Self>) {
@@ -9456,6 +9600,108 @@ impl TakoApp {
             }
         }
         cx.notify();
+    }
+
+    /// アドレスバーのキー処理（#337）。編集中のみ呼ばれる
+    fn handle_webview_address_bar_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) -> bool {
+        let Some(pane_id) = self.webview_address_bar_active else {
+            return false;
+        };
+        let key = pane_id.as_u64();
+        match ks.key.as_str() {
+            "enter" => {
+                let url = self
+                    .webview_address_bar
+                    .remove(&key)
+                    .map(|(s, _)| s)
+                    .unwrap_or_default();
+                self.webview_address_bar_active = None;
+                let url = url.trim().to_string();
+                if !url.is_empty() {
+                    let normalized = webview::normalize_url(&url);
+                    if let Some(e) = self.webviews.iter().find(|e| e.pane == Some(pane_id)) {
+                        let _ = e.navigate(&normalized);
+                    }
+                }
+                cx.notify();
+                true
+            }
+            "escape" => {
+                self.webview_address_bar.remove(&key);
+                self.webview_address_bar_active = None;
+                cx.notify();
+                true
+            }
+            "backspace" => {
+                if let Some((input, cursor)) = self.webview_address_bar.get_mut(&key) {
+                    if *cursor > 0 {
+                        let prev = input[..*cursor]
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        input.drain(prev..*cursor);
+                        *cursor = prev;
+                    }
+                }
+                cx.notify();
+                true
+            }
+            "delete" => {
+                if let Some((input, cursor)) = self.webview_address_bar.get_mut(&key) {
+                    if *cursor < input.len() {
+                        let next = *cursor
+                            + input[*cursor..]
+                                .chars()
+                                .next()
+                                .map(|c| c.len_utf8())
+                                .unwrap_or(0);
+                        input.drain(*cursor..next);
+                    }
+                }
+                cx.notify();
+                true
+            }
+            "left" => {
+                if let Some((input, cursor)) = self.webview_address_bar.get_mut(&key) {
+                    if *cursor > 0 {
+                        *cursor = input[..*cursor]
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                    }
+                }
+                cx.notify();
+                true
+            }
+            "right" => {
+                if let Some((input, cursor)) = self.webview_address_bar.get_mut(&key) {
+                    if *cursor < input.len() {
+                        *cursor += input[*cursor..]
+                            .chars()
+                            .next()
+                            .map(|c| c.len_utf8())
+                            .unwrap_or(0);
+                    }
+                }
+                cx.notify();
+                true
+            }
+            _ => {
+                if let Some(ch) = ks.key_char.as_deref() {
+                    if !ch.chars().any(|c| c.is_control()) {
+                        if let Some((input, cursor)) = self.webview_address_bar.get_mut(&key) {
+                            input.insert_str(*cursor, ch);
+                            *cursor += ch.len();
+                        }
+                        cx.notify();
+                        return true;
+                    }
+                }
+                true
+            }
+        }
     }
 
     /// Web dock URL 入力欄のキー処理（#207）。dock が開いているときだけ呼ばれる。
@@ -9674,7 +9920,13 @@ impl TakoApp {
                                 }
                                 cx.notify();
                             }))
-                            .child("×"),
+                            .child(
+                                svg()
+                                    .path(crate::file_icons::ui_icon::CLOSE)
+                                    .w(px(10.0))
+                                    .h(px(10.0))
+                                    .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8)),
+                            ),
                     )
             })
             .collect();
@@ -13086,8 +13338,18 @@ impl Render for TakoApp {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    let mut changed = false;
                     if this.webview_dock_url_focused {
                         this.webview_dock_url_focused = false;
+                        changed = true;
+                    }
+                    if this.webview_address_bar_active.is_some() {
+                        if let Some(pane_id) = this.webview_address_bar_active.take() {
+                            this.webview_address_bar.remove(&pane_id.as_u64());
+                        }
+                        changed = true;
+                    }
+                    if changed {
                         cx.notify();
                     }
                 }),
