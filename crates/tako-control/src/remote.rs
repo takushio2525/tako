@@ -3653,8 +3653,8 @@ mod tests {
     #[test]
     fn daemon_stop_implはps実行不能でもkillしない() {
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // 使い捨てプロセスを起動して PID を取得（テスト終了時に自動回収）
-        let child = std::process::Command::new("/bin/sleep")
+        // 使い捨てプロセスを起動して PID を取得（テスト末尾で kill + wait 回収）
+        let mut child = std::process::Command::new("/bin/sleep")
             .arg("60")
             .spawn()
             .expect("sleep プロセスの起動");
@@ -3674,9 +3674,9 @@ mod tests {
         let alive = unsafe { libc::kill(child_pid as libc::pid_t, 0) } == 0;
         assert!(alive, "sleep プロセスが SIGTERM されていないこと");
 
-        // 後始末
-        unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGKILL) };
-        let _ = std::process::Command::new("/bin/wait").status(); // zombie 回収
+        // 後始末（kill + wait で zombie を残さない）
+        let _ = child.kill();
+        let _ = child.wait();
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(result.is_err(), "検証失敗でエラーが返る");

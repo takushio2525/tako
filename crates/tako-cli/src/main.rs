@@ -280,10 +280,10 @@ struct RunInteractiveStatusArgs {
 
 #[derive(Args)]
 struct RecoverArgs {
-    /// このバックアップ世代（1〜3）を layout.json へ復元する。
-    /// 現在の layout.json は layout.json.pre-recover へ退避される
+    /// このバックアップ世代（1〜3、または good = 最後に復元へ成功した良品）を
+    /// layout.json へ復元する。現在の layout.json は layout.json.pre-recover へ退避される
     #[arg(long, value_name = "世代")]
-    apply: Option<u32>,
+    apply: Option<String>,
     /// 稼働中チェックをスキップして強制実行する（プロセス走査は別データ
     /// ディレクトリで動く無関係な tako も検出するため、その場合の明示上書き用）
     #[arg(long)]
@@ -2853,7 +2853,7 @@ fn fda_local(sub: &FdaCommand) -> Result<(), String> {
 fn recover_local(args: &RecoverArgs) -> Result<(), String> {
     let path = tako_control::layout::layout_path()
         .ok_or_else(|| "データディレクトリを解決できない（HOME 未設定等）".to_string())?;
-    match args.apply {
+    match args.apply.as_deref() {
         None => recover_list(&path),
         Some(generation) => recover_apply(&path, generation, args.force),
     }
@@ -2897,20 +2897,29 @@ fn recover_list(path: &std::path::Path) -> Result<(), String> {
         let bak = tako_control::config_io::backup_path(path, generation);
         println!("layout.json.bak.{generation}   : {}", describe(&bak));
     }
+    // 良品スナップショット（#381: 最後に復元へ実際に成功した構成）
+    let good = path.with_extension("json.good");
+    println!("layout.json.good    : {}", describe(&good));
     eprintln!();
     eprintln!("復元するには: tako を終了（Cmd-Q）してから `tako recover --apply <世代>` →");
     eprintln!("tako を再起動すると復元されたレイアウトで立ち上がります。");
     eprintln!("実体の tmux セッションが生きていれば、実行中プロセスごと画面に戻ります。");
+    eprintln!("（good = 最後に復元へ成功した良品。`tako recover --apply good` で戻せます）");
     Ok(())
 }
 
-/// バックアップ世代を layout.json へ復元する（現行は layout.json.pre-recover へ退避）
-fn recover_apply(path: &std::path::Path, generation: u32, force: bool) -> Result<(), String> {
-    if !(1..=3).contains(&generation) {
-        return Err(format!(
-            "世代は 1〜3 で指定してください（指定: {generation}）"
-        ));
-    }
+/// バックアップ世代（1〜3 / good）を layout.json へ復元する
+/// （現行は layout.json.pre-recover へ退避）
+fn recover_apply(path: &std::path::Path, generation: &str, force: bool) -> Result<(), String> {
+    let bak = match generation {
+        "1" | "2" | "3" => tako_control::config_io::backup_path(path, generation.parse().unwrap()),
+        "good" => path.with_extension("json.good"),
+        other => {
+            return Err(format!(
+                "世代は 1〜3 または good で指定してください（指定: {other}）"
+            ))
+        }
+    };
     // 稼働中の tako があると、復元した layout.json を定期保存が即上書きしてしまう。
     // discovery（control.json）と全プロセス走査の両方で確認する（#177 の教訓:
     // control.json は消えている・別を指していることがある）
@@ -2928,7 +2937,6 @@ fn recover_apply(path: &std::path::Path, generation: u32, force: bool) -> Result
             );
         }
     }
-    let bak = tako_control::config_io::backup_path(path, generation);
     let layout = tako_control::layout::load_file(&bak)
         .map_err(|e| format!("バックアップ {} を読めない: {e}", bak.display()))?;
     if path.is_file() {
@@ -2938,7 +2946,10 @@ fn recover_apply(path: &std::path::Path, generation: u32, force: bool) -> Result
     }
     std::fs::copy(&bak, path).map_err(|e| format!("復元コピーに失敗: {e}"))?;
     eprintln!(
-        "layout.json.bak.{generation}（{} タブ / {} ペイン）→ layout.json へ復元しました。",
+        "{}（{} タブ / {} ペイン）→ layout.json へ復元しました。",
+        bak.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| bak.display().to_string()),
         layout.tabs.len(),
         layout.pane_count()
     );
