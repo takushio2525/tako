@@ -7190,6 +7190,44 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// ファイルツリーから cmd+ドロップ時: ドロップ先ペインの「下にある」ターミナルへパス入力（Issue #21）。
+    /// ドロップ先がプレビューペインなら、同タブのフォーカスターミナルペインに送る
+    fn drop_file_to_underlying_terminal(
+        &mut self,
+        path: &std::path::Path,
+        drop_target: PaneId,
+        cx: &mut Context<Self>,
+    ) {
+        let target_pane = if self.previews.contains_key(&drop_target) {
+            self.workspace
+                .active_tab()
+                .tree()
+                .panes()
+                .iter()
+                .find(|p| {
+                    self.terminals.contains_key(&p.id()) && !self.previews.contains_key(&p.id())
+                })
+                .map(|p| p.id())
+        } else {
+            Some(drop_target)
+        };
+        if let Some(target) = target_pane {
+            let text = tako_core::quote_paths_for_shell(std::slice::from_ref(&path.to_path_buf()));
+            let _ = tako_control::dispatch(
+                self,
+                tako_control::protocol::Request::Send {
+                    pane: Some(target.as_u64()),
+                    text,
+                    newline: false,
+                    tmux_session: None,
+                    await_prompt: false,
+                },
+                PaneOrigin::User,
+            );
+            cx.notify();
+        }
+    }
+
     /// Finder からサイドバー（ファイルツリー）への外部ファイルドロップ（Issue #219）:
     /// ディレクトリ → pinned_folders に追加、ファイル → プレビュー表示 + 親ディレクトリを追加
     fn drop_files_to_sidebar(&mut self, paths: &[std::path::PathBuf], cx: &mut Context<Self>) {
@@ -7306,8 +7344,13 @@ impl TakoApp {
             .on_drop::<TmuxSessionDrag>(cx.listener(move |this, drag: &TmuxSessionDrag, _, cx| {
                 this.drop_tmux_session(pane_id, drag.clone(), cx);
             }))
-            .on_drop::<FileDrag>(cx.listener(move |this, drag: &FileDrag, _, cx| {
-                this.drop_files(pane_id, std::slice::from_ref(&drag.path), false, cx);
+            .on_drop::<FileDrag>(cx.listener(move |this, drag: &FileDrag, window, cx| {
+                let cmd_held = window.modifiers().platform;
+                if cmd_held {
+                    this.drop_file_to_underlying_terminal(&drag.path, pane_id, cx);
+                } else {
+                    this.drop_files(pane_id, std::slice::from_ref(&drag.path), false, cx);
+                }
             }))
             .on_drag_move::<ExternalPaths>(cx.listener(
                 move |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
