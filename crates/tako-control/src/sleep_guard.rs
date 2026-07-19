@@ -26,8 +26,13 @@
 //! - ac-only: AC 接続時のみ（既定）
 //! - always: バッテリー時も
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+/// update() で計算された busy_agents の最新値。status() が読み取る（#372）
+static BUSY_AGENTS: AtomicUsize = AtomicUsize::new(0);
 
 /// スリープ防止のモード
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -646,6 +651,7 @@ pub fn update(
     lid_sleep_mode: LidSleepMode,
     busy_agents: usize,
 ) -> SleepGuardState {
+    BUSY_AGENTS.store(busy_agents, Ordering::Relaxed);
     #[cfg(not(target_os = "macos"))]
     {
         let _ = lid_sleep_mode;
@@ -742,6 +748,7 @@ pub fn status(
     power_condition: PowerCondition,
     lid_sleep_mode: LidSleepMode,
 ) -> SleepGuardState {
+    let busy_agents = BUSY_AGENTS.load(Ordering::Relaxed);
     #[cfg(not(target_os = "macos"))]
     {
         let _ = lid_sleep_mode;
@@ -750,7 +757,7 @@ pub fn status(
             mode,
             power_condition,
             on_ac_power: false,
-            busy_agents: 0,
+            busy_agents,
             platform_supported: false,
             lid_closed: false,
             lid_sleep_disabled: false,
@@ -767,7 +774,7 @@ pub fn status(
             mode,
             power_condition,
             on_ac_power: iokit::on_ac_power(),
-            busy_agents: 0,
+            busy_agents,
             platform_supported: true,
             lid_closed: iokit::clamshell_closed(),
             lid_sleep_disabled: iokit::sleep_disabled(),
