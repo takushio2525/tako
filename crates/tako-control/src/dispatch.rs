@@ -2050,9 +2050,16 @@ fn dispatch_inner(
         } => dispatch_orchestrator_respond(host, pane_id, &choice, caller_role.as_deref()),
 
         // #364: worker の報告内容を scrollback + transcript から取得
-        Request::OrchestratorReport { pane_id, lines } => {
-            dispatch_orchestrator_report(host, pane_id, lines.unwrap_or(2000))
-        }
+        Request::OrchestratorReport {
+            pane_id,
+            lines,
+            messages,
+        } => dispatch_orchestrator_report(
+            host,
+            pane_id,
+            lines.unwrap_or(2000),
+            messages.unwrap_or(1),
+        ),
 
         Request::OrchestratorLedger {
             action,
@@ -3791,6 +3798,7 @@ fn dispatch_orchestrator_report(
     host: &dyn ControlHost,
     pane_id: u64,
     lines: usize,
+    messages: usize,
 ) -> Result<Value, DispatchError> {
     let target = PaneId::from_raw(pane_id);
     let mut result = json!({ "pane_id": pane_id });
@@ -3804,19 +3812,26 @@ fn dispatch_orchestrator_report(
     };
 
     // 第 2 層: transcript アダプタ（claude のみ。将来 codex 等を追加する拡張点）
+    // messages パラメータで直近 N 件を取得（#374。既定 1 件で後方互換）
+    let msg_count = messages.max(1);
     let transcript = resolve_session_id_for_pane_via_host(host, target).and_then(|sid| {
-        let texts = crate::transcript::last_assistant_texts(&sid, 1).ok()?;
+        let texts = crate::transcript::last_assistant_texts(&sid, msg_count).ok()?;
         if texts.is_empty() {
             return None;
         }
         result["session_id"] = json!(sid);
-        Some(texts.join("\n"))
+        Some(texts)
     });
 
     match (&transcript, &scrollback) {
-        (Some(t), _) => {
+        (Some(texts), _) => {
             result["source"] = json!("transcript");
-            result["text"] = json!(t);
+            if msg_count == 1 {
+                result["text"] = json!(texts.join("\n"));
+            } else {
+                result["text"] = json!(texts.last().unwrap_or(&String::new()));
+                result["messages"] = json!(texts);
+            }
             if let Some(ref sb) = scrollback {
                 result["scrollback_text"] = json!(sb);
             }

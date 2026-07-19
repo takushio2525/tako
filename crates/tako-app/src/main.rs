@@ -986,8 +986,10 @@ fn process_pane_log_jobs(
     jobs: Vec<PaneLogJob>,
 ) {
     use tako_core::pane_log::{ChunkKind, PaneObservation, CAPTURE_CHUNK};
+    // #369: ペイン毎の display-message N 回を list-panes -a 1 回に削減
+    let probes = tako_core::tmux::pane_log_probe_batch(Some(socket));
     for job in jobs {
-        let Some(probe) = tako_core::tmux::pane_log_probe(Some(socket), &job.session) else {
+        let Some(probe) = probes.get(&job.session).copied() else {
             continue;
         };
         let chunk = if probe.history < job.last_history {
