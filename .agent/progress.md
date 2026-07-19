@@ -907,3 +907,10 @@
 - ドラッグ中に挿入位置を示す縦線バー（3px + accent glow）表示、ソースタブを半透明 + 点線ボーダー化。scroll-area `on_drag_move` によるインジケータ上書き問題を修正
 - 関連コミット: `55f9c31`（PR #373 squash merge）。隔離実機ダーク/ライト両テーマ + セルフテスト全緑
 - 次: `build-app.sh --install` → 本番目視確認
+
+## 2026-07-19（#378: タブ名の自動命名 — source パラメータ + 命名規則設定 + プロンプト追記）
+- tako_rename_tab に source パラメータ追加（auto = set_title_auto で手動を上書きしない / manual = 従来）。
+  Profile に tab_naming_convention 追加（profiles set --tab-naming-convention / MCP 1:1）、
+  master / solo プロンプトにタブ名更新の標準動作を追記。テスト 4 本追加・品質ゲート全緑
+- 関連コミット: `6948491`（PR #382 squash merge）。Issue #378 close 済み
+- 次: `build-app.sh --install` → 実機で source=auto と命名規則注入の確認
