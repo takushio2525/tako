@@ -1,8 +1,8 @@
-//! `tako setup` — 質問ゼロを既定にした自動セットアップコマンド。
+//! `tako setup` — 検出 + 対話の自動セットアップコマンド。
 //!
 //! エージェント CLI（claude / codex / agy）の検出・プラン解決 →
-//! 依存ツールチェック → MCP 登録 → 指示・profile・リソース生成 → 最終サマリ、
-//! の一連のフローを提供する。個別対話は明示的な `--review` だけで起動する。
+//! 依存ツールチェック → MCP 登録 → 指示・profile・リソース生成 → 対話エージェント起動、
+//! の一連のフローを提供する。対話 agent は既定で起動し、--yes / 非 TTY 時のみスキップ。
 //! IPC 不要で、tako アプリ未起動でも動作する。
 //!
 //! config.yaml のスキーマと setup changelog は `tako_control::setup` にある
@@ -765,7 +765,7 @@ fn print_pending_changes(pending: &[SetupChange], applied_revision: u32) {
     for change in pending {
         let kind = match change.kind {
             ChangeKind::Auto => "自動適用",
-            ChangeKind::Guided => "--review で個別確認",
+            ChangeKind::Guided => "対話で個別確認",
         };
         eprintln!(
             "      [rev {} / v{} / {kind}] {}",
@@ -1427,90 +1427,6 @@ fn print_next_steps(master_ready: bool) {
     eprintln!("  「品質重視にして」「利用回数を節約して」のような調整は master に日本語で頼めます");
 }
 
-/// tako ペイン内での実行か（tako が注入する環境変数の有無で判定）
-fn inside_tako_pane() -> bool {
-    std::env::var_os("TAKO_PANE_ID").is_some() && std::env::var_os("TAKO_SOCKET").is_some()
-}
-
-/// setup 完了直後に tako master（最短導線）の開始を提案する（Issue #322）。
-/// tako master はペインへの送信を伴うため、tako 内実行のときだけ呼ぶ
-fn prompt_launch_master() -> bool {
-    eprintln!();
-    eprint!("続けて tako master でオーケストレーションを開始しますか？ [Y/n]: ");
-    let mut input = String::new();
-    let _ = std::io::stdin().read_line(&mut input);
-    let trimmed = input.trim().to_ascii_lowercase();
-    trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
-}
-
-/// `tako master` を子プロセスで実行する（インライン起動 = 現在ペインへ master コマンドを送る。
-/// setup 終了後にシェルへ渡り master が立ち上がる）
-fn launch_master() -> Result<std::process::ExitStatus, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("実行バイナリの特定に失敗: {e}"))?;
-    std::process::Command::new(exe)
-        .arg("master")
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
-        .map_err(|e| format!("tako master の起動に失敗: {e}"))
-}
-
-/// 認証済みエージェントを対話で選んで返す。
-/// エージェント 1 つなら Y/n、複数なら番号選択。選ばなければ None。
-fn prompt_launch_agent(agents: &[DetectedAgent]) -> Option<DetectedAgent> {
-    let launchable: Vec<_> = agents.iter().filter(|a| a.authenticated).collect();
-    if launchable.is_empty() {
-        return None;
-    }
-    eprintln!();
-    if launchable.len() == 1 {
-        let agent = launchable[0];
-        eprint!(
-            "続けて {} で対話を開始しますか？ [Y/n]: ",
-            agent.kind.as_str()
-        );
-        let mut input = String::new();
-        let _ = std::io::stdin().read_line(&mut input);
-        let trimmed = input.trim().to_ascii_lowercase();
-        if trimmed.is_empty() || trimmed == "y" || trimmed == "yes" {
-            return Some(agent.clone());
-        }
-        return None;
-    }
-    eprintln!("続けてエージェントで対話を開始しますか？");
-    for (i, agent) in launchable.iter().enumerate() {
-        eprintln!("  {}) {}", i + 1, agent.kind.as_str());
-    }
-    eprintln!("  Enter) 起動しない");
-    eprint!("選択 [Enter]: ");
-    let mut input = String::new();
-    let _ = std::io::stdin().read_line(&mut input);
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    trimmed
-        .parse::<usize>()
-        .ok()
-        .and_then(|n| launchable.get(n.wrapping_sub(1)))
-        .map(|a| (*a).clone())
-}
-
-/// エージェント CLI をユーザーのホームディレクトリで対話起動する。
-fn launch_agent_interactive(agent: &DetectedAgent) -> Result<std::process::ExitStatus, String> {
-    let cwd = home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let mut command = std::process::Command::new(&agent.path);
-    command.current_dir(&cwd);
-    command
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
-    command
-        .status()
-        .map_err(|e| format!("{} の起動に失敗: {e}", agent.kind.as_str()))
-}
-
 /// グローバル指示ファイルを解決し、既存内容は同梱推奨ルールと項目レベルで比較する（Issue #322）。
 /// 戻り値は setup-context.yaml へ書かれ、`--review` の setup agent が裏取りに使う。
 /// None = 同梱既定で新規作成（既定は全項目カバー済みのため比較不要。機械検証は tako-control のテスト）
@@ -1845,7 +1761,7 @@ pub fn run_changes(json: bool) -> Result<(), String> {
     for change in &pending {
         let kind = match change.kind {
             ChangeKind::Auto => "auto（setup 再実行で自動適用）",
-            ChangeKind::Guided => "guided（setup --review で個別確認・適用）",
+            ChangeKind::Guided => "guided（対話で個別確認・適用）",
         };
         eprintln!(
             "  [rev {} / v{} / {}] {}",
@@ -2133,8 +2049,20 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
         instruction_coverage.as_ref(),
     )?;
 
-    if review_mode {
-        if instruction_existed {
+    let revision = mark_setup_complete(selected, &plans, answers.orchestrator.as_ref())?;
+    sync_pending_changes_file(&dir, &[], revision)?;
+    print_setup_summary(&plan);
+    eprintln!("セットアップが完了しました。");
+
+    // --- 対話エージェント起動（Issue #295 / #322 / #391）---
+    // 既定: 検出フロー完了後に setup agent を対話起動し、設定変更・解説・次の一歩を対話で行う。
+    // スキップ条件: --yes / 非 TTY / --answers launch_agent=none
+    let skip_agent = assume_yes
+        || !std::io::IsTerminal::is_terminal(&std::io::stdin())
+        || answers.launch_agent.as_deref().is_some_and(|v| v == "none");
+
+    if !skip_agent {
+        if review_mode && instruction_existed {
             let parent = instruction.parent().unwrap_or(Path::new("."));
             let filename = instruction
                 .file_name()
@@ -2151,12 +2079,20 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
             }
         }
         eprintln!();
-        eprintln!("個別見直しを開始します。");
+        eprintln!("対話アシスタントを起動します。設定の変更・解説・次の一歩の相談ができます。");
         eprintln!("─────────────────────────────────────────────────────");
-        let greeting = if pending.is_empty() {
-            "最初に setup-instructions.md を読んでください。前回設定の個別見直しを始めます。変更したい項目だけ確認してください。"
+        let greeting = if review_mode {
+            if pending.is_empty() {
+                "最初に setup-instructions.md を読んでください。前回設定の個別見直しを始めます。変更したい項目だけ確認してください。"
+            } else {
+                "最初に setup-instructions.md と pending-changes.md を読んでください。アップデート変更と前回設定の個別見直しを始めます。"
+            }
+        } else if is_first_run {
+            "最初に setup-instructions.md を読んでください。セットアップが完了しました。設定の確認・変更、コマンドの使い方、次に何をすればよいかなど、何でも聞いてください。"
+        } else if !pending.is_empty() {
+            "最初に setup-instructions.md と pending-changes.md を読んでください。アップデート変更があります。確認と設定の調整ができます。何でも聞いてください。"
         } else {
-            "最初に setup-instructions.md と pending-changes.md を読んでください。アップデート変更と前回設定の個別見直しを始めます。"
+            "最初に setup-instructions.md を読んでください。設定の確認・変更、コマンドの使い方、次に何をすればよいかなど、何でも聞いてください。"
         };
         let status = launch_setup_agent(selected_agent, &dir, greeting)?;
         if !status.success() {
@@ -2165,64 +2101,12 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
                 selected.as_str(),
                 status.code().unwrap_or(-1)
             );
-            return Ok(());
         }
-    }
-
-    let revision = mark_setup_complete(selected, &plans, answers.orchestrator.as_ref())?;
-    sync_pending_changes_file(&dir, &[], revision)?;
-    print_setup_summary(&plan);
-    eprintln!("セットアップが完了しました。");
-
-    let master_ready = agents
-        .iter()
-        .any(|agent| agent.authenticated && agent.kind.supports_master());
-    print_next_steps(master_ready);
-
-    // --- 起動ランチャー（Issue #295 / #322）---
-    // --answers で launch_agent を明示指定した場合はそれに従う。
-    // --yes のみ / --answers で launch_agent 省略 / 非 TTY → スキップ。
-    // 対話時は tako 内 + master 対応 agent なら tako master（最短導線）を先に提案し、
-    // 断られた場合と tako 外は従来の agent 単独起動の提案へ
-    let launch_result = if let Some(specified) = answers.launch_agent.as_deref() {
-        if specified == "none" {
-            None
-        } else {
-            SetupAgent::parse(specified).and_then(|kind| {
-                agents
-                    .iter()
-                    .find(|a| a.kind == kind && a.authenticated)
-                    .cloned()
-            })
-        }
-    } else if assume_yes || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        None
-    } else if master_ready && inside_tako_pane() {
-        if prompt_launch_master() {
-            let status = launch_master()?;
-            if !status.success() {
-                eprintln!(
-                    "tako master の起動に失敗しました（exit code: {}）。tako master で再試行できます",
-                    status.code().unwrap_or(-1)
-                );
-            }
-        }
-        None
     } else {
-        prompt_launch_agent(&agents)
-    };
-    if let Some(agent) = launch_result {
-        eprintln!();
-        eprintln!("{} を起動します…", agent.kind.as_str());
-        eprintln!("─────────────────────────────────────────────────────");
-        let status = launch_agent_interactive(&agent)?;
-        if !status.success() {
-            eprintln!(
-                "{} が終了しました（exit code: {}）",
-                agent.kind.as_str(),
-                status.code().unwrap_or(-1)
-            );
-        }
+        let master_ready = agents
+            .iter()
+            .any(|agent| agent.authenticated && agent.kind.supports_master());
+        print_next_steps(master_ready);
     }
 
     Ok(())
