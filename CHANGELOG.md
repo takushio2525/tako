@@ -25,6 +25,11 @@ Nightly patch release (automated). Changes since v0.5.6:
 
 ## [Unreleased]
 
+- [スタイル] タブ D&D 並べ替え時のドロップ先挿入位置インジケータを改善 (#371)
+  ドラッグ中に挿入位置を示す縦線バー（3px + accent glow）を表示、ソースタブを
+  半透明 + 点線ボーダーで「掴まれた」状態に変化。ライト/ダーク両テーマ対応。
+  Tab D&D indicator now shows a vertical bar (3px + accent glow) at the drop
+  position, and the dragged tab becomes translucent with a dashed border.
 - [改善] sleep guard の busy 判定を UI スレッドから background へ移動 (#340)
   persist 復元後の Unknown ペイン常在時、2 秒毎の子プロセス判定（tmux + ps 実行）が
   UI スレッドを p50 42ms 専有し続けていた（#324 で導入、#212 の pmset と同型）。
