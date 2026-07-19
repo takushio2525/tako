@@ -919,3 +919,8 @@
 - 根因 2 件: ①フォーカス時カーソルバー非表示（空入力でプレースホルダのみ） ②フォーカス解除欠如（Enter/Escape 以外で false に戻らない）。カーソルバー方式に刷新 + ルート div の on_mouse_down でフォーカス解除
 - 関連コミット: `071f37e`（PR #383 squash merge）。品質ゲート全緑（308 tests）
 - 次: `build-app.sh --install` → ユーザー実機でカーソル表示 + 手打ち + IME 確認 → #375 クローズ判断
+
+## 2026-07-19（#315 R2: PDF リンク cmd ホバー/クリック不発を根治）
+- 根因を計装で確定: render のたびに `preview_pdf_page_image_bounds` を空 HashMap でクリアし、canvas paint の `cx.defer()` で再記録する設計のタイミング窓。release ビルドの .app 環境で GPUI effect cycle の差異により常に空 map を参照。render 冒頭のクリアを削除（defer 上書きで実害なし）
+- 関連コミット: `f40bcc0`（PR #386 squash merge）。品質ゲート全緑（308 tests）+ セルフテスト PDF 全通過
+- 次: `build-app.sh --install` → ユーザー実機で cmd ホバー + cmd クリック確認 → #315 クローズ判断
