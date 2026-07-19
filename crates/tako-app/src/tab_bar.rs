@@ -145,6 +145,7 @@ impl TakoApp {
         let is_pane_dragging = self.drag_kind == Some(DragKind::Pane);
         let tab_reorder = self.tab_reorder_indicator;
         let is_tab_dragging = self.drag_kind == Some(DragKind::Tab);
+        let dragging_tab_id = self.dragging_tab;
 
         div()
             .id("tab-bar")
@@ -210,11 +211,6 @@ impl TakoApp {
                     .min_w(px(0.0))
                     .overflow_x_scroll()
                     .track_scroll(&self.tab_scroll_handle)
-                    .on_drag_move::<TabDrag>(cx.listener(
-                        |this, _: &DragMoveEvent<TabDrag>, _, cx| {
-                            this.set_tab_reorder_indicator(None, cx);
-                        },
-                    ))
                     .on_drop::<TabDrag>(cx.listener(|this, drag: &TabDrag, _, cx| {
                         this.drop_tab_reorder(drag.tab, None, cx);
                     }))
@@ -265,9 +261,10 @@ impl TakoApp {
 
                                 let truncated = truncate(&label, label_max);
 
-                                // タブ D&D 並べ替えの挿入インジケータ（#308）
+                                // タブ D&D 並べ替えの挿入インジケータ（#371）
                                 let show_indicator =
                                     is_tab_dragging && tab_reorder == Some(Some(id));
+                                let is_drag_source = is_tab_dragging && dragging_tab_id == Some(id);
 
                                 div()
                                     .flex()
@@ -277,11 +274,18 @@ impl TakoApp {
                                     .when(show_indicator, |d| {
                                         d.child(
                                             div()
-                                                .w(px(2.0))
+                                                .w(px(3.0))
                                                 .h(px(22.0))
                                                 .flex_none()
-                                                .rounded(px(1.0))
-                                                .bg(hsla(theme.accent)),
+                                                .rounded(px(1.5))
+                                                .bg(hsla(theme.accent))
+                                                .shadow(vec![BoxShadow {
+                                                    color: hsla_alpha(theme.accent, 0.5),
+                                                    offset: point(px(0.), px(0.)),
+                                                    blur_radius: px(4.0),
+                                                    spread_radius: px(0.),
+                                                    inset: false,
+                                                }]),
                                         )
                                     })
                                     .child(
@@ -298,7 +302,13 @@ impl TakoApp {
                                             .flex_shrink_0()
                                             .rounded(px(8.0))
                                             .cursor_pointer()
-                                            .when(is_active, |d| {
+                                            .when(is_drag_source, |d| {
+                                                d.opacity(0.4)
+                                                    .border_1()
+                                                    .border_color(hsla(theme.border_subtle))
+                                                    .border_dashed()
+                                            })
+                                            .when(is_active && !is_drag_source, |d| {
                                                 d.bg(rgba(theme.tab_active_background))
                                                     .border_1()
                                                     .border_color(hsla(theme.border_heavy))
@@ -310,7 +320,7 @@ impl TakoApp {
                                                         inset: true,
                                                     }])
                                             })
-                                            .when(!is_active, |d| {
+                                            .when(!is_active && !is_drag_source, |d| {
                                                 d.hover(|d| d.bg(rgba(theme.surface_hover)))
                                             })
                                             .when(
@@ -342,9 +352,10 @@ impl TakoApp {
                                             }))
                                             .on_drag(
                                                 TabDrag { tab: id },
-                                                self.drag_ghost_builder(
+                                                self.drag_ghost_builder_with_tab(
                                                     DragKind::Tab,
                                                     truncated.clone(),
+                                                    Some(id),
                                                     cx,
                                                 ),
                                             )
@@ -477,15 +488,22 @@ impl TakoApp {
                                     ) // .child(div() inner tab pill)
                             }),
                     )
-                    // 末尾の挿入インジケータ（タブ D&D 並べ替え: 末尾移動。#308）
+                    // 末尾の挿入インジケータ（タブ D&D 並べ替え: 末尾移動。#371）
                     .when(is_tab_dragging && tab_reorder == Some(None), |d| {
                         d.child(
                             div()
-                                .w(px(2.0))
+                                .w(px(3.0))
                                 .h(px(22.0))
                                 .flex_none()
-                                .rounded(px(1.0))
-                                .bg(hsla(theme.accent)),
+                                .rounded(px(1.5))
+                                .bg(hsla(theme.accent))
+                                .shadow(vec![BoxShadow {
+                                    color: hsla_alpha(theme.accent, 0.5),
+                                    offset: point(px(0.), px(0.)),
+                                    blur_radius: px(4.0),
+                                    spread_radius: px(0.),
+                                    inset: false,
+                                }]),
                         )
                     })
                     // +: 新規タブ（カンプ 30×30 / radius 8）

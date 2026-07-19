@@ -781,6 +781,8 @@ struct TakoApp {
     /// タブ D&D 並べ替え中の挿入位置インジケータ（#308）。
     /// Some(tab_id) = そのタブの**左**にインジケータを表示、None = 末尾
     tab_reorder_indicator: Option<Option<TabId>>,
+    /// タブ D&D 並べ替え中のドラッグ元タブ（#371: ソースタブの半透明化に使用）
+    dragging_tab: Option<TabId>,
     /// git パネルのデータ（FR-3.6。cwd 連動で 2 秒ポーリング更新）
     git_data: Option<GitPanelData>,
     /// サイドバー用の軽量 git サマリ（#217。ブランチチップ + 変更フッター）
@@ -1811,6 +1813,7 @@ impl TakoApp {
             drop_target: None,
             tab_drop_target: None,
             tab_reorder_indicator: None,
+            dragging_tab: None,
             git_data: None,
             sidebar_git: None,
             git_selected_commit: None,
@@ -6786,11 +6789,23 @@ impl TakoApp {
     // --- D&D（FR-2.16.10 tmux セッション取り込み / FR-3.11 ファイルプレビュー） ---
 
     /// `on_drag` のコンストラクタを作る共通部: drag_kind を記録してゴーストチップを返す。
-    /// gpui はドラッグ開始時にこのコンストラクタを 1 回呼ぶ（= ドラッグ開始フック）
+    /// gpui はドラッグ開始時にこのコンストラクタを 1 回呼ぶ（= ドラッグ開始フック）。
+    /// `tab_id`: タブ D&D 時にソースタブの半透明化（#371）に使う
     fn drag_ghost_builder<T: 'static>(
         &self,
         kind: DragKind,
         label: String,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&T, Point<Pixels>, &mut Window, &mut App) -> gpui::Entity<DragGhost> + 'static
+    {
+        self.drag_ghost_builder_with_tab(kind, label, None, cx)
+    }
+
+    fn drag_ghost_builder_with_tab<T: 'static>(
+        &self,
+        kind: DragKind,
+        label: String,
+        tab_id: Option<TabId>,
         cx: &mut Context<Self>,
     ) -> impl Fn(&T, Point<Pixels>, &mut Window, &mut App) -> gpui::Entity<DragGhost> + 'static
     {
@@ -6802,6 +6817,7 @@ impl TakoApp {
                 this.drop_target = None;
                 this.titlebar_dragging = false;
                 this.tab_mouse_down = false;
+                this.dragging_tab = tab_id;
                 cx.notify();
             });
             cx.new(|_| DragGhost {
@@ -6837,8 +6853,13 @@ impl TakoApp {
         });
         match new {
             Some(target) => {
-                if self.drop_target != Some(target) {
-                    self.drop_target = Some(target);
+                let mut changed = self.drop_target != Some(target);
+                self.drop_target = Some(target);
+                // ペインオーバーレイに入ったらタブバーの挿入インジケータを消す（#371）
+                if self.tab_reorder_indicator.take().is_some() {
+                    changed = true;
+                }
+                if changed {
                     cx.notify();
                 }
             }
@@ -6857,6 +6878,7 @@ impl TakoApp {
         self.drag_kind = None;
         self.tab_drop_target = None;
         self.tab_reorder_indicator = None;
+        self.dragging_tab = None;
         self.drop_target
             .take()
             .filter(|(p, _)| *p == pane_id)
@@ -6962,6 +6984,7 @@ impl TakoApp {
     ) {
         self.drag_kind = None;
         self.tab_reorder_indicator = None;
+        self.dragging_tab = None;
         let target_index = match before {
             Some(before_id) => self
                 .workspace
@@ -7785,6 +7808,7 @@ impl TakoApp {
             | self.drop_target.take().is_some()
             | self.tab_drop_target.take().is_some()
             | self.tab_reorder_indicator.take().is_some()
+            | self.dragging_tab.take().is_some()
         {
             cx.notify();
             return;
