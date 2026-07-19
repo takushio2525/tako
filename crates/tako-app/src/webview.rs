@@ -80,6 +80,12 @@ pub struct WebShared {
     pub nav_committed: bool,
     /// ナビゲーション先の URL（poll_state の JS 評価で url が上書きされるため別途保持）
     pub nav_target_url: Option<String>,
+    /// target=_blank / window.open で要求された新規ウィンドウ URL（メインループで消費）
+    pub pending_new_window_urls: Vec<String>,
+    /// ブラウザ履歴で「戻る」が可能か（history.length > 1 かつ現在位置が先頭でない）
+    pub can_go_back: bool,
+    /// ブラウザ履歴で「進む」が可能か
+    pub can_go_forward: bool,
 }
 
 /// タイトル・URL の変化を Rust 側へ通知する初期化スクリプト。
@@ -157,11 +163,18 @@ impl WebViewEntry {
         }));
         let ipc_shared = Arc::clone(&shared);
         let load_shared = Arc::clone(&shared);
+        let new_win_shared = Arc::clone(&shared);
         let view = wry::WebViewBuilder::new()
             .with_url(url)
             .with_visible(false)
             .with_focused(false)
             .with_initialization_script(STATE_HOOK_JS)
+            .with_new_window_req_handler(move |url, _features| {
+                if let Ok(mut s) = new_win_shared.lock() {
+                    s.pending_new_window_urls.push(url);
+                }
+                wry::NewWindowResponse::Deny
+            })
             .with_ipc_handler(move |req| {
                 let body: &str = req.body();
                 let Ok(msg) = serde_json::from_str::<serde_json::Value>(body) else {
@@ -250,9 +263,8 @@ impl WebViewEntry {
     pub fn poll_state(&self) {
         let shared = Arc::clone(&self.shared);
         let _ = self.view.evaluate_script_with_callback(
-            "JSON.stringify({t:document.title||'',u:location.href||''})",
+            "JSON.stringify({t:document.title||'',u:location.href||'',b:navigation&&navigation.canGoBack||false,f:navigation&&navigation.canGoForward||false,h:history.length||0})",
             move |result| {
-                // 評価値は JS 文字列 = 「JSON 文字列を更に JSON 文字列化」した二重包み
                 let Ok(serde_json::Value::String(inner)) =
                     serde_json::from_str::<serde_json::Value>(&result)
                 else {
@@ -267,6 +279,16 @@ impl WebViewEntry {
                     }
                     if let Some(u) = v.get("u").and_then(|x| x.as_str()) {
                         s.url = u.to_string();
+                    }
+                    // Navigation API（Safari 17.4+）が使えればそちらを優先
+                    if let Some(b) = v.get("b").and_then(|x| x.as_bool()) {
+                        s.can_go_back = b;
+                        s.can_go_forward =
+                            v.get("f").and_then(|x| x.as_bool()).unwrap_or(false);
+                    } else {
+                        // フォールバック: history.length > 1 なら back 可能と推定
+                        let h = v.get("h").and_then(|x| x.as_u64()).unwrap_or(0);
+                        s.can_go_back = h > 1;
                     }
                 }
             },
@@ -358,9 +380,31 @@ impl WebViewEntry {
             .unwrap_or_default()
     }
 
+    /// 「戻る」が可能か
+    pub fn can_go_back(&self) -> bool {
+        self.shared.lock().map(|s| s.can_go_back).unwrap_or(false)
+    }
+
+    /// 「進む」が可能か
+    pub fn can_go_forward(&self) -> bool {
+        self.shared
+            .lock()
+            .map(|s| s.can_go_forward)
+            .unwrap_or(false)
+    }
+
     /// ページ読み込み中か
     pub fn is_loading(&self) -> bool {
         self.shared.lock().map(|s| s.loading).unwrap_or(false)
+    }
+
+    /// target=_blank / window.open で溜まった新規ウィンドウ URL をドレインする
+    pub fn drain_new_window_urls(&self) -> Vec<String> {
+        self.shared
+            .lock()
+            .ok()
+            .map(|mut s| std::mem::take(&mut s.pending_new_window_urls))
+            .unwrap_or_default()
     }
 
     /// エラー状態を返す（None = 正常）
@@ -750,5 +794,13 @@ mod tests {
         assert!(s.failed_url.is_none());
         assert!(!s.nav_committed);
         assert!(s.nav_started_at.is_none());
+    }
+
+    #[test]
+    fn web_shared_のデフォルトはナビ状態が初期値() {
+        let s = WebShared::default();
+        assert!(!s.can_go_back);
+        assert!(!s.can_go_forward);
+        assert!(s.pending_new_window_urls.is_empty());
     }
 }

@@ -2185,6 +2185,11 @@ fn dispatch_inner(
             match action.as_str() {
                 "open" => {
                     let url = url.ok_or(DispatchError::InvalidParams("url は必須".into()))?;
+                    if url.trim().is_empty() {
+                        return Err(DispatchError::InvalidParams(
+                            "URL が空です".into(),
+                        ));
+                    }
                     split_and(host, pane, &|h, new_id| h.web_open(new_id, &url))
                 }
                 "show" => {
