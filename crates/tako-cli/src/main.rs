@@ -1651,6 +1651,9 @@ struct LimitServiceArgs {
     /// claude / codex / agy（省略時は現在サービスを表示）
     #[arg(value_parser = ["claude", "codex", "agy"])]
     service: Option<String>,
+    /// 最新メトリクスを即時再取得する
+    #[arg(long)]
+    refresh: bool,
 }
 
 #[derive(Args)]
@@ -3497,7 +3500,11 @@ fn build_request(command: &Command) -> Result<Request, String> {
             mode: args.mode.clone().filter(|m| m != "toggle"),
         },
         Command::LimitService(args) => Request::LimitService {
-            action: args.service.as_ref().map(|_| "set".to_string()),
+            action: if args.refresh {
+                Some("refresh".to_string())
+            } else {
+                args.service.as_ref().map(|_| "set".to_string())
+            },
             service: args.service.clone(),
         },
         Command::Git(GitCommand::Log { max_count, pane }) => Request::GitLog {

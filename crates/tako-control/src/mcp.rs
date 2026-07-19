@@ -1749,17 +1749,17 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_limit_service",
-            "description": "ステータスバーの利用制限表示サービスの状態確認・切替（Issue #321）。\
+            "description": "ステータスバーの利用制限表示サービスの状態確認・切替・再取得（Issue #321 / #357）。\
                 ステータスバーの 5h / 7d リミットメーターにどのサービス（claude / codex / agy）の値を表示するかを制御する。\
                 action=status（既定）: 現在の選択サービスと利用可能サービス一覧を返す。\
-                action=set: service で指定したサービスへ切り替える。\
-                変更は settings.json に永続化され、GUI に即時反映される。",
+                action=set: service で指定したサービスへ切り替える。変更は settings.json に永続化され、GUI に即時反映される。\
+                action=refresh: 全ペインの TUI フッターを即時再走査し、各サービスの最新メトリクスを返す。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "set"],
+                        "enum": ["status", "set", "refresh"],
                         "description": "操作種別（省略時は status）",
                     },
                     "service": {

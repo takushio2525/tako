@@ -203,6 +203,15 @@ pub trait UiStateHost {
     }
     /// 利用制限表示のサービス切替（再描画は実装側の責務。永続化は dispatch 側で行う）
     fn set_limit_service(&mut self, _service: tako_core::LimitService) {}
+    /// 利用制限メトリクスの即時再取得（#357 リロードボタン）。
+    /// 全ペインの TUI フッターを再走査し、現在のメトリクスを JSON で返す
+    fn refresh_limits(&mut self) -> serde_json::Value {
+        serde_json::json!({
+            "claude": { "5h": null, "7d": null },
+            "codex": { "primary": null, "secondary": null },
+            "agy": { "status": "unsupported" },
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
