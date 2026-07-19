@@ -524,14 +524,17 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_rename_tab",
-            "description": "タブの表示タイトルを変更する。明示リネームとして\
-                自動リネームより優先される。空文字を渡すと手動指定を解除し、\
-                自動リネーム（有効時）が再びタブ名を更新するようになる。",
+            "description": "タブの表示タイトルを変更する。\
+                source=\"manual\"（既定）は手動リネームとして自動更新をブロックする。\
+                source=\"auto\" はタスク内容に基づく自動命名として、手動リネーム済みタブは上書きしない。\
+                手動で付けた名前（tako_set_title / tako_rename_tab）は自動より常に優先される。\
+                空文字を渡すと手動指定を解除し、自動リネームが再びタブ名を更新するようになる。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "tab": { "type": "integer", "minimum": 0, "description": "対象タブ ID（省略時は呼び出し元ペインのタブ）" },
                     "title": { "type": "string", "description": "新しいタブタイトル（空文字で手動指定を解除）" },
+                    "source": { "type": "string", "enum": ["manual", "auto"], "description": "manual（既定）= 手動リネームとして自動更新をブロック。auto = 作業内容に基づく自動命名（手動リネーム済みタブは上書きしない）" },
                 },
                 "required": ["title"],
                 "additionalProperties": false,
@@ -1191,6 +1194,7 @@ pub fn tools() -> Vec<Value> {
                         "description": "対象エージェントの追加 CLI 引数（丸ごと置き換え。空配列でクリア）",
                     },
                     "worker_model_policy": { "type": "string", "enum": ["inherit", "delegate", "fixed"], "description": "worker のモデル選択ポリシー（inherit: master と同じ / delegate: master が都度選ぶ / fixed: worker_model 固定）" },
+                    "tab_naming_convention": { "type": "string", "description": "タブ名の命名規則（master プロンプトに注入される自由記述。空文字でクリア。set 時）" },
                 },
                 "additionalProperties": false,
             },
@@ -2630,7 +2634,6 @@ fn build_request(
         "tako_rename_tab" => {
             let tab = u64_arg(args, "tab")?;
             Request::TabRename {
-                // tab 省略時は呼び出し元ペインからタブを解決する（Equalize と同パターン）
                 pane: if tab.is_none() {
                     Some(target_pane(args, caller)?)
                 } else {
@@ -2638,6 +2641,7 @@ fn build_request(
                 },
                 tab,
                 title: str_arg(args, "title")?.ok_or("title を指定する")?,
+                source: str_arg(args, "source")?,
             }
         }
         "tako_create_tab" => Request::TabNew {
@@ -2909,6 +2913,7 @@ fn build_request(
             agent_skip_permissions: bool_arg(args, "agent_skip_permissions")?,
             agent_args: str_vec_arg(args, "agent_args")?,
             worker_model_policy: str_arg(args, "worker_model_policy")?,
+            tab_naming_convention: str_arg(args, "tab_naming_convention")?,
         },
         "tako_orchestrator_layout" => Request::OrchestratorLayout {
             policy: str_arg(args, "policy")?,

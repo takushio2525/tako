@@ -846,7 +846,12 @@ fn dispatch_inner(
             Ok(json!({ "killed": killed }))
         }
 
-        Request::TabRename { pane, tab, title } => {
+        Request::TabRename {
+            pane,
+            tab,
+            title,
+            source,
+        } => {
             let tab_id = match tab {
                 Some(raw) => find_tab(host.workspace(), raw)?,
                 None => resolve_pane(host.workspace(), pane)?.0,
@@ -855,13 +860,17 @@ fn dispatch_inner(
                 .workspace_mut()
                 .get_tab_mut(tab_id)
                 .expect("find_tab / resolve_pane で存在確認済み");
+            let is_auto = source.as_deref() == Some("auto");
             if title.is_empty() {
-                // 空文字 = 手動指定の解除（タイトルは保持し、自動リネームを再開させる）
                 tab.clear_manual_title();
+            } else if is_auto {
+                tab.set_title_auto(&title);
             } else {
                 tab.set_title_manual(title);
             }
-            Ok(json!({ "tab": tab_id.as_u64(), "title": tab.title() }))
+            Ok(
+                json!({ "tab": tab_id.as_u64(), "title": tab.title(), "source": tab.title_source().as_str() }),
+            )
         }
 
         Request::TabNew { title, focus } => {
@@ -1924,6 +1933,7 @@ fn dispatch_inner(
             agent_skip_permissions,
             agent_args,
             worker_model_policy,
+            tab_naming_convention,
         } => dispatch_orchestrator_profiles(ProfilesParams {
             action,
             name,
@@ -1945,6 +1955,7 @@ fn dispatch_inner(
             agent_skip_permissions,
             worker_model_policy,
             agent_args,
+            tab_naming_convention,
         }),
 
         Request::OrchestratorLayout {
@@ -3265,6 +3276,8 @@ pub struct ProfilesParams {
     pub agent_args: Option<Vec<String>>,
     /// worker_model_policy（inherit / delegate / fixed）
     pub worker_model_policy: Option<String>,
+    /// タブ名の命名規則
+    pub tab_naming_convention: Option<String>,
 }
 
 /// プロファイルを JSON 化する（list / show / set の共通形）。
@@ -3291,6 +3304,9 @@ fn profile_to_json(name: &str, profile: &crate::orchestrator::Profile) -> Value 
     // master エージェント設定（#127）も使用時のみ出力
     if profile.master_agent.is_some() {
         v["master_agent"] = json!(profile.master_agent);
+    }
+    if profile.tab_naming_convention.is_some() {
+        v["tab_naming_convention"] = json!(profile.tab_naming_convention);
     }
     v
 }
@@ -3409,6 +3425,13 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                 }
                 if let Some(policy) = policy {
                     profile.worker_model_policy = policy;
+                }
+                if let Some(conv) = params.tab_naming_convention {
+                    if conv.is_empty() {
+                        profile.tab_naming_convention = None;
+                    } else {
+                        profile.tab_naming_convention = Some(conv);
+                    }
                 }
                 if let Some(agent_name) = params.agent {
                     let cfg = profile.worker_agents.entry(agent_name).or_default();
@@ -5081,11 +5104,7 @@ fn pinned_json(host: &dyn ControlHost) -> Value {
 
 /// タイトルの出どころの文字列表現（list / MCP 公開用。FR-2.12.1）
 fn title_source_str(source: tako_core::TitleSource) -> &'static str {
-    match source {
-        tako_core::TitleSource::Default => "default",
-        tako_core::TitleSource::Auto => "auto",
-        tako_core::TitleSource::Manual => "manual",
-    }
+    source.as_str()
 }
 
 /// コマンド実行状態の文字列表現（list / MCP 公開用）
@@ -6756,6 +6775,7 @@ mod tests {
                 pane: Some(root),
                 tab: None,
                 title: "実験".into(),
+                source: None,
             },
             PaneOrigin::Cli,
         )
@@ -6779,6 +6799,7 @@ mod tests {
                 pane: None,
                 tab: Some(tab_id),
                 title: String::new(),
+                source: None,
             },
             PaneOrigin::Cli,
         )
@@ -6786,6 +6807,68 @@ mod tests {
         let tab = &host.ws.tabs()[0];
         assert_eq!(tab.title(), "実験");
         assert_eq!(tab.title_source(), tako_core::TitleSource::Default);
+    }
+
+    #[test]
+    fn タブの自動リネームは手動リネーム済みを上書きしない() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let tab_id = host.ws.tabs()[0].id().as_u64();
+        // 手動リネーム
+        dispatch(
+            &mut host,
+            Request::TabRename {
+                pane: Some(root),
+                tab: None,
+                title: "手動名".into(),
+                source: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            host.ws.tabs()[0].title_source(),
+            tako_core::TitleSource::Manual
+        );
+        // source=auto で上書きを試みる → 手動が優先されタイトル変わらず
+        let result = dispatch(
+            &mut host,
+            Request::TabRename {
+                pane: None,
+                tab: Some(tab_id),
+                title: "自動名".into(),
+                source: Some("auto".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["title"].as_str(), Some("手動名"));
+        assert_eq!(result["source"].as_str(), Some("manual"));
+        // 手動解除後は自動リネームが通る
+        dispatch(
+            &mut host,
+            Request::TabRename {
+                pane: None,
+                tab: Some(tab_id),
+                title: String::new(),
+                source: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let result = dispatch(
+            &mut host,
+            Request::TabRename {
+                pane: None,
+                tab: Some(tab_id),
+                title: "自動名".into(),
+                source: Some("auto".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["title"].as_str(), Some("自動名"));
+        assert_eq!(result["source"].as_str(), Some("auto"));
     }
 
     #[test]
