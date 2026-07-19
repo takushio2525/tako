@@ -19241,6 +19241,59 @@ mod self_test {
                     }
                 }
                 check(view_ready, "TmuxOpen ペインに外部セッションの画面が映る");
+
+                // 78. Web dock URL 入力欄のフォーカスと入力 (#375)
+                let url_input_ok = window
+                    .update(cx, |app, _, cx| {
+                        app.webview_dock_open = true;
+                        app.webview_dock_url_focused = true;
+                        app.webview_dock_url_input.clear();
+                        app.webview_dock_url_cursor = 0;
+                        cx.notify();
+                        let opened = app.webview_dock_open && app.webview_dock_url_focused;
+                        let char_ks = |c: &str| Keystroke {
+                            modifiers: Modifiers::default(),
+                            key: c.to_string(),
+                            key_char: Some(c.to_string()),
+                        };
+                        app.handle_webview_dock_url_key(&char_ks("e"), cx);
+                        app.handle_webview_dock_url_key(&char_ks("x"), cx);
+                        let typed = app.webview_dock_url_input == "ex";
+                        app.handle_webview_dock_url_key(
+                            &Keystroke::parse("backspace").unwrap(),
+                            cx,
+                        );
+                        let bs_ok = app.webview_dock_url_input == "e";
+                        app.webview_dock_url_input = "example.com".into();
+                        app.webview_dock_url_cursor = 11;
+                        app.handle_webview_dock_url_key(
+                            &Keystroke::parse("enter").unwrap(),
+                            cx,
+                        );
+                        let enter_closed = !app.webview_dock_url_focused;
+                        app.webview_dock_open = true;
+                        app.webview_dock_url_focused = true;
+                        app.webview_dock_url_input = "test".into();
+                        app.handle_webview_dock_url_key(
+                            &Keystroke::parse("escape").unwrap(),
+                            cx,
+                        );
+                        let esc_ok = !app.webview_dock_url_focused
+                            && !app.webview_dock_open
+                            && app.webview_dock_url_input.is_empty();
+                        app.webview_dock_open = false;
+                        app.webview_dock_url_focused = false;
+                        app.webview_dock_url_input.clear();
+                        app.webview_dock_url_cursor = 0;
+                        cx.notify();
+                        opened && typed && bs_ok && enter_closed && esc_ok
+                    })
+                    .unwrap_or(false);
+                check(
+                    url_input_ok,
+                    "Web dock URL 入力: フォーカス + 手打ち + BS + Enter + Esc (#375)",
+                );
+
                 // ホイール = ミラー表示 + スクロールバー表示（#159 と同じ機構に乗る）
                 window
                     .update(cx, |app, win, cx| {
