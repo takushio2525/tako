@@ -80,6 +80,10 @@ pub enum OffloadJob {
         session_id: Option<String>,
         tmux_session: Option<String>,
     },
+    Workers {
+        live_panes: Vec<u64>,
+        include_closed: bool,
+    },
     GitLog {
         cwd: PathBuf,
         max_count: Option<usize>,
@@ -104,10 +108,26 @@ pub fn prepare_offload(
             pane_id,
             session_id,
             tmux_session,
-        } => Some(Ok(OffloadJob::WorkerStatus {
-            ctx: collect_worker_status_ctx(host, *pane_id),
-            session_id: session_id.clone(),
-            tmux_session: tmux_session.clone(),
+            worker,
+        } => {
+            let q = match resolve_worker_query(
+                *pane_id,
+                worker.as_deref(),
+                session_id.clone(),
+                tmux_session.clone(),
+            ) {
+                Ok(q) => q,
+                Err(e) => return Some(Err(e)),
+            };
+            Some(Ok(OffloadJob::WorkerStatus {
+                ctx: collect_worker_status_ctx(host, q.pane_id),
+                session_id: q.session_id,
+                tmux_session: q.tmux_session,
+            }))
+        }
+        Request::OrchestratorWorkers { all } => Some(Ok(OffloadJob::Workers {
+            live_panes: collect_live_panes(host),
+            include_closed: all.unwrap_or(false),
         })),
         Request::GitLog { pane, max_count } => {
             Some(git_pane_cwd(host, *pane).map(|cwd| OffloadJob::GitLog {
@@ -134,10 +154,115 @@ impl OffloadJob {
                 session_id,
                 tmux_session,
             } => finish_worker_status(ctx, session_id.as_deref(), tmux_session.as_deref()),
+            OffloadJob::Workers {
+                live_panes,
+                include_closed,
+            } => finish_workers_list(&live_panes, include_closed),
             OffloadJob::GitLog { cwd, max_count } => run_git_log(&cwd, max_count),
             OffloadJob::GitDiff { cwd, target } => run_git_diff(&cwd, target.as_deref()),
         }
     }
+}
+
+/// worker_status / report のクエリ正規化結果（#390）
+struct WorkerQuery {
+    pane_id: u64,
+    session_id: Option<String>,
+    tmux_session: Option<String>,
+}
+
+/// worker_status / report の対象解決（#390）。
+/// `worker`（レジストリ ID）指定ならレジストリからペイン・追跡キーを解決し、
+/// pane_id 指定でも session_id / tmux_session の欠けをレジストリの active エントリで
+/// 補完する（master が pane_id しか知らなくても pane 消失後の追跡が切れない）。
+/// レジストリの読み取り失敗は補完スキップ（既存動作を壊さない。フォールバック層）
+fn resolve_worker_query(
+    pane_id: Option<u64>,
+    worker: Option<&str>,
+    session_id: Option<String>,
+    tmux_session: Option<String>,
+) -> Result<WorkerQuery, DispatchError> {
+    use crate::orchestrator::registry::WorkerRegistry;
+    if let Some(worker_id) = worker {
+        let reg = WorkerRegistry::load()
+            .map_err(|e| DispatchError::Operation(format!("worker レジストリを読めない: {e}")))?;
+        let (_, entry) = reg
+            .resolve(worker_id)
+            .map_err(DispatchError::InvalidParams)?;
+        return Ok(WorkerQuery {
+            pane_id: entry.pane,
+            session_id: session_id.or_else(|| entry.session_id.clone()),
+            tmux_session: tmux_session.or_else(|| entry.tmux_session.clone()),
+        });
+    }
+    let Some(pane_id) = pane_id else {
+        return Err(DispatchError::InvalidParams(
+            "pane_id または worker を指定してください".into(),
+        ));
+    };
+    // pane_id 指定: 欠けている追跡キーだけをレジストリで補完（明示指定は常に優先）
+    if session_id.is_none() || tmux_session.is_none() {
+        if let Ok(reg) = WorkerRegistry::load() {
+            if let Some((_, entry)) = reg.find_active_by_pane(pane_id) {
+                return Ok(WorkerQuery {
+                    pane_id,
+                    session_id: session_id.or_else(|| entry.session_id.clone()),
+                    tmux_session: tmux_session.or_else(|| entry.tmux_session.clone()),
+                });
+            }
+        }
+    }
+    Ok(WorkerQuery {
+        pane_id,
+        session_id,
+        tmux_session,
+    })
+}
+
+/// OrchestratorWorkers の UI スレッド必須部分: GUI に現存するペイン ID の収集
+fn collect_live_panes(host: &dyn ControlHost) -> Vec<u64> {
+    let mut panes: Vec<u64> = host
+        .workspace()
+        .tabs()
+        .iter()
+        .flat_map(|tab| tab.tree().panes())
+        .map(|p| p.id().as_u64())
+        .collect();
+    panes.extend(
+        host.workspace()
+            .shelved_panes()
+            .iter()
+            .map(|s| s.id().as_u64()),
+    );
+    panes
+}
+
+/// OrchestratorWorkers のサブプロセス実行部分（tmux ls + レジストリ読み）。
+/// UI スレッドで呼ばないこと（OffloadJob::run / dispatch 同期経路用）
+fn finish_workers_list(live_panes: &[u64], include_closed: bool) -> Result<Value, DispatchError> {
+    use crate::orchestrator::registry;
+    let reg = registry::WorkerRegistry::load()
+        .map_err(|e| DispatchError::Operation(format!("worker レジストリを読めない: {e}")))?;
+    // 現存 tmux セッションを 1 コマンドで列挙（サーバー未起動は空 = 全て dead 扱い）
+    let socket = tako_core::tmux_backend::socket_name();
+    let live_backends: Vec<String> = tako_core::tmux::tmux_command(Some(&socket))
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(registry::list_payload(
+        &reg,
+        &live_backends,
+        live_panes,
+        include_closed,
+    ))
 }
 
 /// GitLog / GitDiff の UI スレッド必須部分: ペインの cwd 解決（キャッシュ済み値の読み取り）
@@ -324,6 +449,15 @@ fn dispatch_inner(
                 Err(e) => return Err(op_err(e)),
             }
             host.detach_session(target);
+            // #390: worker レジストリの該当エントリを closed へ（worker でなければ no-op。
+            // PTY 死亡（Exited）はここを通らないため「pane が消えても worker は生存」の
+            // 追跡は維持される）
+            if let Err(e) = crate::orchestrator::registry::mark_closed_by_pane(
+                target.as_u64(),
+                "explicit_close",
+            ) {
+                eprintln!("warning: worker レジストリの close 記録に失敗: {e}");
+            }
             Ok(json!({ "closed": target.as_u64() }))
         }
 
@@ -2021,11 +2155,19 @@ fn dispatch_inner(
             pane_id,
             session_id,
             tmux_session,
+            worker,
         } => {
             // 同期経路（テスト・直呼び用）。IPC / MCP 経由は prepare_offload が
             // collect（UI）と finish（background）に分割して実行する（#168 / #181）
-            let ctx = collect_worker_status_ctx(host, pane_id);
-            finish_worker_status(ctx, session_id.as_deref(), tmux_session.as_deref())
+            let q = resolve_worker_query(pane_id, worker.as_deref(), session_id, tmux_session)?;
+            let ctx = collect_worker_status_ctx(host, q.pane_id);
+            finish_worker_status(ctx, q.session_id.as_deref(), q.tmux_session.as_deref())
+        }
+
+        // #390: worker レジストリの一覧（同期経路。IPC / MCP 経由は prepare_offload 側）
+        Request::OrchestratorWorkers { all } => {
+            let live_panes = collect_live_panes(host);
+            finish_workers_list(&live_panes, all.unwrap_or(false))
         }
 
         // 非同期 run の進捗照会・結果回収（#121）。レジストリはプロセス内グローバルで
@@ -2050,16 +2192,16 @@ fn dispatch_inner(
         } => dispatch_orchestrator_respond(host, pane_id, &choice, caller_role.as_deref()),
 
         // #364: worker の報告内容を scrollback + transcript から取得
+        // #390: worker 指定 / pane 消失時はレジストリの追跡キーで継続
         Request::OrchestratorReport {
             pane_id,
             lines,
             messages,
-        } => dispatch_orchestrator_report(
-            host,
-            pane_id,
-            lines.unwrap_or(2000),
-            messages.unwrap_or(1),
-        ),
+            worker,
+        } => {
+            let q = resolve_worker_query(pane_id, worker.as_deref(), None, None)?;
+            dispatch_orchestrator_report(host, q, lines.unwrap_or(2000), messages.unwrap_or(1))
+        }
 
         Request::OrchestratorLedger {
             action,
@@ -3829,32 +3971,45 @@ fn resolve_session_id_for_pane_via_host(host: &dyn ControlHost, pane_id: PaneId)
 /// source フィールドで判別。transcript 利用時は scrollback も併記し対比可能にする
 fn dispatch_orchestrator_report(
     host: &dyn ControlHost,
-    pane_id: u64,
+    query: WorkerQuery,
     lines: usize,
     messages: usize,
 ) -> Result<Value, DispatchError> {
+    let pane_id = query.pane_id;
     let target = PaneId::from_raw(pane_id);
     let mut result = json!({ "pane_id": pane_id });
 
-    // 第 1 層: scrollback（全 agent 共通の主ソース）
+    // 第 1 層: scrollback（全 agent 共通の主ソース）。
+    // pane が GUI から消えていても、レジストリ由来の tmux_session が生きていれば
+    // そこから capture する（#390: ペイン消失後の追跡継続）
+    let socket = tako_core::tmux_backend::socket_name();
     let scrollback = if let Some(backend) = host.backend_session(target) {
-        let socket = tako_core::tmux_backend::socket_name();
         capture_scrollback_joined(Some(&socket), &backend, lines)
+    } else if let Some(ref ts) = query.tmux_session {
+        if tako_core::tmux::session_alive(Some(&socket), ts) {
+            result["source_fallback"] = json!("registry_tmux");
+            capture_scrollback_joined(Some(&socket), ts, lines)
+        } else {
+            None
+        }
     } else {
         None
     };
 
     // 第 2 層: transcript アダプタ（claude のみ。将来 codex 等を追加する拡張点）
-    // messages パラメータで直近 N 件を取得（#374。既定 1 件で後方互換）
+    // messages パラメータで直近 N 件を取得（#374。既定 1 件で後方互換）。
+    // pane から解決できなければレジストリ由来の session_id で継続（#390）
     let msg_count = messages.max(1);
-    let transcript = resolve_session_id_for_pane_via_host(host, target).and_then(|sid| {
-        let texts = crate::transcript::last_assistant_texts(&sid, msg_count).ok()?;
-        if texts.is_empty() {
-            return None;
-        }
-        result["session_id"] = json!(sid);
-        Some(texts)
-    });
+    let transcript = resolve_session_id_for_pane_via_host(host, target)
+        .or(query.session_id)
+        .and_then(|sid| {
+            let texts = crate::transcript::last_assistant_texts(&sid, msg_count).ok()?;
+            if texts.is_empty() {
+                return None;
+            }
+            result["session_id"] = json!(sid);
+            Some(texts)
+        });
 
     match (&transcript, &scrollback) {
         (Some(texts), _) => {
@@ -4245,6 +4400,31 @@ fn dispatch_orchestrator_spawn(
         String::new()
     });
 
+    // worker レジストリへ登録（Issue #390）。ペイン消失・tako 再起動後も
+    // watch / status / report が追跡を継続するための永続キー。失敗しても spawn は止めない
+    let worker_id =
+        crate::orchestrator::registry::record_spawn(crate::orchestrator::registry::RegisterSpawn {
+            label: label.map(str::to_string),
+            project: project.to_string(),
+            agent: worker_agent.as_str().to_string(),
+            model: launch.model.clone(),
+            effort: launch.effort.clone(),
+            pane: new_id.as_u64(),
+            tab: Some(tab_id.as_u64()),
+            tmux_session: tmux_session.clone(),
+            issues: crate::sessions::extract_issues(&format!(
+                "{} {prompt}",
+                label.unwrap_or_default()
+            )),
+            ledger_id: Some(ledger_id.clone()).filter(|s| !s.is_empty()),
+            cwd: Some(cwd.clone()),
+            prompt_head: Some(crate::sessions::prompt_head(prompt, 200)),
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("warning: worker レジストリへの登録に失敗: {e}");
+            String::new()
+        });
+
     // #368: spawn 完了 → claude session スキャンを即時トリガー
     crate::request_claude_scan();
 
@@ -4263,6 +4443,7 @@ fn dispatch_orchestrator_spawn(
         "pre_trusted": pre_trusted,
         "tmux_session": tmux_session,
         "ledger_id": ledger_id,
+        "worker_id": Some(worker_id).filter(|s| !s.is_empty()),
     }))
 }
 
@@ -4272,6 +4453,8 @@ fn dispatch_orchestrator_spawn(
 /// #181 の worker_status_snapshot/compute と同時期に同じ分割で実装され、
 /// GitLog / GitDiff も扱う OffloadJob 機構へ一本化した）
 pub struct WorkerStatusCtx {
+    /// 照会対象のペイン ID（#390: レジストリ突き合わせ用）
+    pane_id: u64,
     pane_exists: bool,
     backend_session: Option<String>,
     /// ライブ画面の末尾（空行除去 + 最大 30 行に整形済み）。ペインが GUI に無ければ None
@@ -4309,6 +4492,7 @@ fn collect_worker_status_ctx(host: &dyn ControlHost, pane_id: u64) -> WorkerStat
         .as_ref()
         .is_some_and(|bs| crate::agents::has_running_children(bs));
     WorkerStatusCtx {
+        pane_id,
         pane_exists: in_tree || host.workspace().is_shelved(target),
         backend_session,
         has_running_children,
@@ -4325,12 +4509,23 @@ fn finish_worker_status(
     use crate::orchestrator;
 
     let WorkerStatusCtx {
+        pane_id,
         pane_exists,
         backend_session,
         live_tail,
         full_screen,
         has_running_children: has_children,
     } = ctx;
+
+    // #390: レジストリの active エントリ（prompt 未達判定 + lazy 昇格用）。
+    // 読めなくても既存動作は変えない（フォールバック層）
+    let registry_worker: Option<(String, orchestrator::registry::WorkerEntry)> =
+        orchestrator::registry::WorkerRegistry::load()
+            .ok()
+            .and_then(|reg| {
+                reg.find_active_by_pane(pane_id)
+                    .map(|(id, e)| (id.clone(), e.clone()))
+            });
 
     // session_id の解決: 明示指定 > pane→session 自動解決 > フォールバック
     let (resolved_sid, status_source);
@@ -4386,6 +4581,28 @@ fn finish_worker_status(
         Some(tail_join(lines))
     });
 
+    // #390: session_id が今回の照会で解決できたらレジストリへ書き戻す（lazy 昇格）。
+    // GUI の定期スキャンが止まっていても（セカンダリモード等）prompt 到達の証跡が残り、
+    // 未達の誤検知を防ぐ。best-effort（失敗は無視）
+    let prompt_delivery = registry_worker.as_ref().map(|(_, entry)| {
+        if entry.session_id.is_none() {
+            if let (Some(sid), Some(ts)) = (resolved_sid.as_deref(), entry.tmux_session.as_deref())
+            {
+                let _ = orchestrator::registry::record_session_detected(ts, sid);
+            }
+        }
+        let mut effective = entry.clone();
+        if effective.session_id.is_none() {
+            effective.session_id = resolved_sid.clone();
+        }
+        let now_epoch = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap_or(0);
+        let spawned_epoch = crate::sessions::parse_iso(&effective.spawned_at).unwrap_or(now_epoch);
+        (
+            orchestrator::registry::prompt_delivery_assessment(&effective, now_epoch),
+            now_epoch - spawned_epoch,
+        )
+    });
+
     apply_worker_status_corrections(ResolvedWorkerStatus {
         status,
         status_source: status_source.to_string(),
@@ -4396,10 +4613,13 @@ fn finish_worker_status(
         recent_output,
         full_screen,
         tmux_session: tmux_session.map(String::from),
+        registry_worker_id: registry_worker.map(|(id, _)| id),
+        prompt_delivery,
     })
 }
 
 /// `apply_worker_status_corrections` への入力（agents / screen 解決後の初期状態）
+#[derive(Default)]
 struct ResolvedWorkerStatus {
     status: String,
     status_source: String,
@@ -4410,6 +4630,10 @@ struct ResolvedWorkerStatus {
     recent_output: Option<String>,
     full_screen: Option<String>,
     tmux_session: Option<String>,
+    /// #390: レジストリ上の worker ID（登録済み worker のみ）
+    registry_worker_id: Option<String>,
+    /// #390: prompt 送達判定（レジストリ登録済み worker のみ）と spawn からの経過秒
+    prompt_delivery: Option<(crate::orchestrator::registry::PromptDelivery, i64)>,
 }
 
 /// worker_status の初期状態に補正ロジックを適用し、最終的な JSON 応答を構築する。
@@ -4425,6 +4649,8 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         recent_output,
         full_screen,
         tmux_session,
+        registry_worker_id,
+        prompt_delivery,
     } = resolved;
     // #267: agents が "gone" を返しても pane が workspace にある場合は
     // セッション未発見なだけで worker は健在 → unknown に降格
@@ -4510,7 +4736,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         .is_some_and(|s| crate::orchestrator::wait::screen_is_collapsed(s));
 
     // #243: events 配列（question / model_switched / context_high / permission_dialog）
-    let events: Vec<Value> = crate::orchestrator::wait::collect_worker_events(
+    let mut events: Vec<Value> = crate::orchestrator::wait::collect_worker_events(
         &status,
         recent_output.as_deref(),
         ctx_percent,
@@ -4518,6 +4744,37 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     .iter()
     .map(|e| e.to_json())
     .collect();
+
+    // #390: prompt 未達検知（保守的な複合条件で誤検知を防ぐ）。
+    // レジストリ判定が「猶予超過 + transcript 未観測」でも、画面が busy または
+    // 実行中子プロセスがあれば作業中とみなして発火しない（検出遅延の可能性）
+    let prompt_delivery_final = prompt_delivery.map(|(assessment, since_spawn)| {
+        use crate::orchestrator::registry::PromptDelivery;
+        if assessment == PromptDelivery::OverdueSuspect {
+            let screen_busy = recent_output
+                .as_ref()
+                .is_some_and(|out| crate::orchestrator::wait::screen_looks_busy(out));
+            if screen_busy || has_children || status == "busy" {
+                (PromptDelivery::Pending, since_spawn)
+            } else {
+                (assessment, since_spawn)
+            }
+        } else {
+            (assessment, since_spawn)
+        }
+    });
+    if let Some((crate::orchestrator::registry::PromptDelivery::OverdueSuspect, since_spawn)) =
+        prompt_delivery_final
+    {
+        events.push(
+            crate::orchestrator::wait::WorkerEvent {
+                kind: crate::orchestrator::wait::WorkerEventKind::PromptUndelivered {
+                    seconds_since_spawn: since_spawn,
+                },
+            }
+            .to_json(),
+        );
+    }
 
     // #319: waiting + 画面に permission ダイアログがあれば構造化情報を付与
     let permission_dialog: Option<Value> = if status == "waiting" {
@@ -4556,6 +4813,9 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         "events": events,
         "permission_dialog": permission_dialog,
         "history": history_info,
+        // #390: worker レジストリ由来の情報（未登録ペインは null）
+        "worker_id": registry_worker_id,
+        "prompt_delivery": prompt_delivery_final.map(|(d, _)| d.as_str()),
     }))
 }
 
@@ -8135,6 +8395,7 @@ mod tests {
     #[test]
     fn finish_worker_statusがペイン不在でgoneを返す() {
         let ctx = WorkerStatusCtx {
+            pane_id: 0,
             pane_exists: false,
             backend_session: None,
             live_tail: None,
@@ -8152,6 +8413,7 @@ mod tests {
         // ❯ プロンプト行 = idle（backend 無しなので status_source は screen）
         let idle = finish_worker_status(
             WorkerStatusCtx {
+                pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some("done\n❯ ".into()),
@@ -8167,6 +8429,7 @@ mod tests {
         // busy マーカー行 = busy
         let busy = finish_worker_status(
             WorkerStatusCtx {
+                pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some("Thinking…\nesc to interrupt".into()),
@@ -8181,6 +8444,7 @@ mod tests {
         // 画面なし = unknown のまま
         let unknown = finish_worker_status(
             WorkerStatusCtx {
+                pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: None,
@@ -8199,6 +8463,7 @@ mod tests {
         // #157: idle（❯ プロンプト表示）+ 画面に API Error → status=error + error オブジェクト
         let v = finish_worker_status(
             WorkerStatusCtx {
+                pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some(
@@ -8222,6 +8487,7 @@ mod tests {
         // usage limit 停止（codex の実採取文言）
         let limited = finish_worker_status(
             WorkerStatusCtx {
+                pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some(
@@ -8241,6 +8507,7 @@ mod tests {
         // 正常 idle では error が付かない（誤発火しない）
         let clean = finish_worker_status(
             WorkerStatusCtx {
+                pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some("done\n❯ ".into()),
@@ -8257,6 +8524,7 @@ mod tests {
         // busy 中はエラー行が見えていても busy のまま（自動リトライへの誤検知防止）
         let retrying = finish_worker_status(
             WorkerStatusCtx {
+                pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some(
@@ -8278,6 +8546,7 @@ mod tests {
         // #243: 質問画面で question イベント
         let v = finish_worker_status(
             WorkerStatusCtx {
+                pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some(
@@ -8300,6 +8569,7 @@ mod tests {
         // モデル切替画面で model_switched + context_high（ctx 65%）
         let v2 = finish_worker_status(
             WorkerStatusCtx {
+                pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some(
@@ -8324,6 +8594,7 @@ mod tests {
         // 正常完了画面では events が空
         let v3 = finish_worker_status(
             WorkerStatusCtx {
+                pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some("done\n❯ ".into()),
@@ -8357,6 +8628,7 @@ mod tests {
             recent_output: Some("done\n❯ \n──────".into()),
             full_screen: None,
             tmux_session: None,
+            ..Default::default()
         }
     }
 
@@ -9514,5 +9786,275 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- #390: worker レジストリ ---
+
+    #[test]
+    fn issue390_spawnがレジストリ登録しcloseでclosedになる() {
+        use crate::orchestrator::registry::WorkerRegistry;
+        with_test_project(|| {
+            let mut host = MockHost::new();
+            let master = host.root_pane();
+            let params = SpawnParams {
+                project: TEST_PROJECT,
+                prompt: "registry test",
+                label: Some("reg-test"),
+                model: None,
+                effort: Some("high"),
+                pane: Some(master),
+                tab: None,
+                caller_role: None,
+                agent: None,
+                caller_pid: None,
+                task_type: None,
+            };
+            let val = dispatch_orchestrator_spawn(&mut host, PaneOrigin::Mcp, params).unwrap();
+            let worker_id = val["worker_id"]
+                .as_str()
+                .expect("spawn 応答に worker_id が入る")
+                .to_string();
+            let worker_pane = val["pane_id"].as_u64().unwrap();
+
+            let reg = WorkerRegistry::load().unwrap();
+            let (_, entry) = reg.resolve(&worker_id).expect("レジストリに登録済み");
+            assert!(entry.is_active());
+            assert_eq!(entry.pane, worker_pane);
+            assert_eq!(entry.project, TEST_PROJECT);
+            assert_eq!(entry.label.as_deref(), Some("reg-test"));
+            assert_eq!(entry.agent, "claude");
+            // pane→worker の逆引き（フォールバック解決の中核）
+            assert!(reg.find_active_by_pane(worker_pane).is_some());
+
+            // 明示 close → closed へ（PTY 死亡はここを通らない = 追跡は維持される）
+            dispatch(
+                &mut host,
+                Request::Close {
+                    pane: Some(worker_pane),
+                    force: true,
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+            let reg = WorkerRegistry::load().unwrap();
+            let (_, entry) = reg.resolve(&worker_id).unwrap();
+            assert_eq!(entry.status, "closed");
+            assert_eq!(entry.close_reason.as_deref(), Some("explicit_close"));
+            assert!(reg.find_active_by_pane(worker_pane).is_none());
+        });
+    }
+
+    #[test]
+    fn issue390_resolve_worker_queryが解決と補完をする() {
+        use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
+        let path = registry_path().unwrap();
+        WorkerRegistry::mutate_at(&path, |reg| {
+            reg.next_id += 1;
+            reg.workers.insert(
+                "q7701".into(),
+                WorkerEntry {
+                    pane: 7701,
+                    tmux_session: Some("tako-q7701".into()),
+                    session_id: Some("sid-7701".into()),
+                    agent: "claude".into(),
+                    status: "active".into(),
+                    spawned_at: crate::sessions::now_iso(),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+
+        // worker 指定: pane / session / tmux をレジストリから解決
+        let q = resolve_worker_query(None, Some("q7701"), None, None).unwrap();
+        assert_eq!(q.pane_id, 7701);
+        assert_eq!(q.session_id.as_deref(), Some("sid-7701"));
+        assert_eq!(q.tmux_session.as_deref(), Some("tako-q7701"));
+
+        // pane 指定: 欠けたキーだけ補完、明示指定は優先
+        let q = resolve_worker_query(Some(7701), None, Some("explicit-sid".into()), None).unwrap();
+        assert_eq!(q.pane_id, 7701);
+        assert_eq!(q.session_id.as_deref(), Some("explicit-sid"));
+        assert_eq!(q.tmux_session.as_deref(), Some("tako-q7701"));
+
+        // 未登録 pane: 補完なしでそのまま
+        let q = resolve_worker_query(Some(60660), None, None, None).unwrap();
+        assert_eq!(q.pane_id, 60660);
+        assert!(q.session_id.is_none() && q.tmux_session.is_none());
+
+        // どちらも無し / 未知 worker はエラー
+        assert!(resolve_worker_query(None, None, None, None).is_err());
+        assert!(resolve_worker_query(None, Some("zz-unknown"), None, None).is_err());
+    }
+
+    #[test]
+    fn issue390_finish_worker_statusがprompt未達を検知する() {
+        use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
+        let path = registry_path().unwrap();
+        // spawn から十分経過（猶予 240 秒超）した claude worker。session_id 未検出
+        WorkerRegistry::mutate_at(&path, |reg| {
+            reg.workers.insert(
+                "q7801".into(),
+                WorkerEntry {
+                    pane: 7801,
+                    agent: "claude".into(),
+                    status: "active".into(),
+                    spawned_at: "2026-01-01T00:00:00Z".into(),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+
+        // idle 画面（welcome のまま）→ prompt_undelivered イベント発火
+        let v = finish_worker_status(
+            WorkerStatusCtx {
+                pane_id: 7801,
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some("Welcome to Claude Code\n❯ ".into()),
+                full_screen: None,
+                has_running_children: false,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["worker_id"], "q7801");
+        assert_eq!(v["prompt_delivery"], "undelivered");
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(
+            kinds.contains(&"prompt_undelivered"),
+            "events に prompt_undelivered: {kinds:?}"
+        );
+
+        // busy 画面なら発火しない（誤検知防止: 検出遅延の可能性）
+        let v = finish_worker_status(
+            WorkerStatusCtx {
+                pane_id: 7801,
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some("Thinking…\nesc to interrupt".into()),
+                full_screen: None,
+                has_running_children: false,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["prompt_delivery"], "pending");
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(
+            !kinds.contains(&"prompt_undelivered"),
+            "busy 中は発火しない"
+        );
+
+        // session_id を渡した照会（agents 解決相当）は delivered へ倒れ、
+        // レジストリへも lazy 昇格される
+        WorkerRegistry::mutate_at(&path, |reg| {
+            if let Some(e) = reg.workers.get_mut("q7801") {
+                e.tmux_session = Some("tako-q7801".into());
+            }
+        })
+        .unwrap();
+        let v = finish_worker_status(
+            WorkerStatusCtx {
+                pane_id: 7801,
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some("done\n❯ ".into()),
+                full_screen: None,
+                has_running_children: false,
+            },
+            Some("sid-7801-detected"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["prompt_delivery"], "delivered");
+        let reg = WorkerRegistry::load().unwrap();
+        let entry = &reg.workers["q7801"];
+        assert_eq!(
+            entry.session_id.as_deref(),
+            Some("sid-7801-detected"),
+            "解決済み session_id がレジストリへ書き戻される"
+        );
+        assert!(entry.prompt_delivered_at.is_some());
+    }
+
+    #[test]
+    fn issue390_workersリストがdispatchで返る() {
+        use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
+        let path = registry_path().unwrap();
+        WorkerRegistry::mutate_at(&path, |reg| {
+            reg.workers.insert(
+                "q7901".into(),
+                WorkerEntry {
+                    pane: 7901,
+                    agent: "claude".into(),
+                    status: "active".into(),
+                    spawned_at: crate::sessions::now_iso(),
+                    ..Default::default()
+                },
+            );
+            reg.workers.insert(
+                "q7902".into(),
+                WorkerEntry {
+                    pane: 7902,
+                    agent: "claude".into(),
+                    status: "closed".into(),
+                    spawned_at: crate::sessions::now_iso(),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        let mut host = MockHost::new();
+        // 既定: active のみ
+        let v = dispatch(
+            &mut host,
+            Request::OrchestratorWorkers { all: None },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let ids: Vec<&str> = v["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|w| w["worker_id"].as_str())
+            .collect();
+        assert!(ids.contains(&"q7901"));
+        assert!(!ids.contains(&"q7902"), "closed は既定で出ない");
+        // all = true で closed も
+        let v = dispatch(
+            &mut host,
+            Request::OrchestratorWorkers { all: Some(true) },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let ids: Vec<&str> = v["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|w| w["worker_id"].as_str())
+            .collect();
+        assert!(ids.contains(&"q7901") && ids.contains(&"q7902"));
+        // GUI にペインが無いので pane_alive = false（レジストリ追跡は継続）
+        let w = v["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["worker_id"] == "q7901")
+            .unwrap();
+        assert_eq!(w["pane_alive"], false);
     }
 }

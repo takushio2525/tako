@@ -622,8 +622,8 @@ pub fn now_iso() -> String {
     crate::diag::format_utc(secs)
 }
 
-/// `YYYY-MM-DDTHH:MM:SSZ` → unix 秒（GC の期限計算用。失敗は None）
-fn parse_iso(iso: &str) -> Option<i64> {
+/// `YYYY-MM-DDTHH:MM:SSZ` → unix 秒（GC の期限計算・レジストリの経過時間判定用。失敗は None）
+pub(crate) fn parse_iso(iso: &str) -> Option<i64> {
     let b = iso.as_bytes();
     if b.len() < 20 {
         return None;

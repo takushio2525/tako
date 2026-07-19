@@ -289,6 +289,10 @@ struct PromptFlow {
     trust_accepts: u8,
     /// 入力欄残留に対する Enter 単独再送の残り回数
     enter_retries_left: u8,
+    /// 貼り付けが入力欄に反映されなかった場合の再貼り付け残り回数（#390）。
+    /// claude TUI の起動完了前に貼り付けると raw mode 切替の狭間で吸われ、
+    /// 入力欄が空のまま「送信成功」と誤判定される競合への対策
+    paste_retries_left: u8,
     /// true = claude TUI の起動（alt_screen + プロンプト記号）を待つ（spawn / await_prompt）。
     /// false = 現画面へ即貼り付けの汎用送信（TUI でなければ 2 秒待って貼る）
     wait_tui: bool,
@@ -316,6 +320,7 @@ impl PromptFlow {
             state_entered_at: now,
             trust_accepts: 0,
             enter_retries_left: 4,
+            paste_retries_left: 2,
             wait_tui,
             enter_only: false,
             baseline: None,
@@ -2393,6 +2398,20 @@ impl TakoApp {
                             {
                                 eprintln!("warning: セッションカタログの同期に失敗: {e}");
                             }
+                            // #390: worker レジストリへも session_id を反映
+                            // （prompt 到達の証跡。未変更ならファイル書き込みしない）
+                            for d in &detected {
+                                if let Err(e) =
+                                    tako_control::orchestrator::registry::record_session_detected(
+                                        &d.tmux_session,
+                                        &d.session_id,
+                                    )
+                                {
+                                    eprintln!(
+                                        "warning: worker レジストリの session 反映に失敗: {e}"
+                                    );
+                                }
+                            }
                         })
                         .await;
                 }
@@ -3691,12 +3710,35 @@ impl TakoApp {
                         || (!head.is_empty() && lines.iter().any(|l| l.contains(head.as_str())));
                     let timed_out =
                         flow.state_entered_at.elapsed() > std::time::Duration::from_secs(10);
-                    if reflected || timed_out {
+                    if reflected {
                         // 送信の Enter は貼り付けと分離した単独キーとして送る
                         // （貼り付けバーストに混ざると「次の行」と解釈される）
                         session.write(b"\r".to_vec());
                         flow.state = PromptFlowState::VerifySubmitted;
                         flow.state_entered_at = now;
+                    } else if timed_out {
+                        // #390: 反映が確認できないままタイムアウト。入力欄が「確認できて
+                        // 空」なら貼り付け自体が TUI 初期化中に吸われた疑いが濃いので
+                        // 再貼り付けする（従来はそのまま Enter → VerifySubmitted が
+                        // 「入力欄が空 = 送信成功」と誤判定し、welcome 画面のまま放置される
+                        // 未達経路だった）。折り返し等で reflected 判定に失敗しただけの
+                        // ケースは入力欄が非空のため再貼り付けせず従来どおり Enter を送る
+                        // （二重貼り付け防止）
+                        let input_empty = claude_tui::input_line(&lines)
+                            .is_some_and(claude_tui::input_content_is_empty);
+                        if input_empty && flow.paste_retries_left > 0 {
+                            flow.paste_retries_left -= 1;
+                            eprintln!(
+                                "warning: プロンプト貼り付けが入力欄に反映されず（pane={}）再貼り付けする",
+                                flow.pane.as_u64()
+                            );
+                            session.paste(&flow.prompt);
+                            flow.state_entered_at = now;
+                        } else {
+                            session.write(b"\r".to_vec());
+                            flow.state = PromptFlowState::VerifySubmitted;
+                            flow.state_entered_at = now;
+                        }
                     }
                 }
                 PromptFlowState::VerifySubmitted => {
@@ -16020,9 +16062,9 @@ mod self_test {
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], TOOLS_LIST_MSG)
                 .await
                 .unwrap_or_else(|| fail("MCP tools/list 接続"));
+<<<<<<< HEAD
             let tools_ok = {
-                const SNAPSHOT: &str =
-                    include_str!("../testdata/mcp_tools_snapshot.txt");
+                const SNAPSHOT: &str = include_str!("../testdata/mcp_tools_snapshot.txt");
                 let expected: Vec<&str> =
                     SNAPSHOT.lines().filter(|l| !l.is_empty()).collect();
                 let mut actual: Vec<String> = serde_json::from_str::<serde_json::Value>(&response)

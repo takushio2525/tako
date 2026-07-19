@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod ledger;
+pub mod registry;
 pub mod wait;
 
 use serde::{Deserialize, Serialize};

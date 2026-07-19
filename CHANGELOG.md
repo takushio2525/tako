@@ -5,6 +5,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- [機能追加] worker レジストリ: ペイン消失後も worker を追跡・watch できるように (#390)
+  spawn した worker を永続レジストリ（workers.yaml）へ登録し、アプリ再起動・ペイン消失後も
+  watch / status / report が tmux session / claude session ID 経由で追跡を継続する。
+  pane_id 指定のままでも追跡キーが自動補完されるため既存の watch 運用は無変更で恩恵を受ける。
+  `tako orchestrator workers [--all]` + MCP `tako_orchestrator_workers` で一覧、
+  watch / status / report に `--worker <ID>` を追加（MCP 1:1）。
+  prompt 未達検知も追加: spawn 後に transcript が生成されない claude worker を保守的な
+  複合条件（猶予 4 分 + 非 busy）で検出し、worker_status の
+  `prompt_delivery: undelivered` + events `prompt_undelivered` で通知する。
+  spawn 側も強化: プロンプト貼り付けが claude TUI 初期化中に吸われ入力欄が空のまま
+  「送信成功」と誤判定される競合を、入力欄空検出時の再貼り付けで塞いだ。
+  エージェント突然死（SIGSEGV 等）も検知: session 検出済み worker の実行プロセスが
+  消えると watch が `WORKER_DEAD` を発火し、レジストリの session ID から組み立てた
+  `claude --resume` コマンドを提示する（自動 resume はクラッシュループ回避のためしない）。
+  Add a persistent worker registry (#390). Spawned workers are recorded in
+  workers.yaml so watch / status / report keep tracking via tmux session /
+  claude session ID even after panes vanish or the app restarts. Adds
+  `tako orchestrator workers`, `--worker <ID>` options (MCP 1:1), undelivered
+  prompt detection, agent crash detection (`WORKER_DEAD` with a suggested
+  `claude --resume` command), and paste-retry hardening in the spawn flow.
+
 ## [0.6.0-test.1] - 2026-07-21
 
 テスト版リリース（#403）。remote 全面刷新（Tailscale Serve 一本化 + 機器ペアリング認証）と v0.5.x 期間中の全機能・修正を含む。

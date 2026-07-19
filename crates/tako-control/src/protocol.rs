@@ -597,12 +597,18 @@ pub enum Request {
         caller_pid: Option<u32>,
     },
     /// オーケストレーター: worker の状態確認。`tmux_session` 指定時は pane が gone でも
-    /// tmux session 経由で recent_output を取得する
+    /// tmux session 経由で recent_output を取得する。
+    /// #390: `worker`（レジストリ ID）指定で pane_id を省略可能。pane_id 指定でも
+    /// session_id / tmux_session の欠けはレジストリから自動補完される
     OrchestratorWorkerStatus {
-        pane_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u64>,
         session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tmux_session: Option<String>,
+        /// worker レジストリの ID（#390。pane_id と排他。両方指定時は worker 優先）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker: Option<String>,
     },
     /// オーケストレーター: 非同期 run の進捗照会（#121）。
     /// run_id が不明なら Err。run_id 省略時は全 run の一覧を返す
@@ -626,15 +632,28 @@ pub enum Request {
         caller_role: Option<String>,
     },
     /// オーケストレーター: worker の報告内容を取得する（#364）。
-    /// 第 1 層 scrollback（全 agent 共通）+ 第 2 層 transcript アダプタ（claude 等）
+    /// 第 1 層 scrollback（全 agent 共通）+ 第 2 層 transcript アダプタ（claude 等）。
+    /// #390: `worker`（レジストリ ID）指定で pane_id を省略可能。pane 消失時は
+    /// レジストリの tmux_session / session_id 経由で取得を継続する
     OrchestratorReport {
-        pane_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u64>,
         /// スクロールバック取得行数（既定 2000）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         lines: Option<usize>,
         /// transcript から取得する直近 assistant メッセージ件数（#374。既定 1）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         messages: Option<usize>,
+        /// worker レジストリの ID（#390。pane_id と排他。両方指定時は worker 優先）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker: Option<String>,
+    },
+    /// オーケストレーター: worker レジストリの一覧（#390）。
+    /// spawn 済み worker をペインの生死と無関係に列挙する（tako 再起動後も追跡可能）。
+    /// 既定は active のみ、`all` = true で closed も含める
+    OrchestratorWorkers {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        all: Option<bool>,
     },
     /// オーケストレーター: 委任台帳の操作（Issue #292）。
     /// action: list / stats / record / amend

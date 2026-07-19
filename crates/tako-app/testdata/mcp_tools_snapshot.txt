@@ -35,6 +35,7 @@ tako_orchestrator_run_status
 tako_orchestrator_self
 tako_orchestrator_spawn
 tako_orchestrator_worker_status
+tako_orchestrator_workers
 tako_panel
 tako_persist
 tako_pin_preview

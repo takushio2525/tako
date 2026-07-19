@@ -1080,6 +1080,9 @@ enum OrchestratorCommand {
         /// 監視対象ペイン ID（位置引数）
         #[arg(value_name = "PANE_ID")]
         pane_pos: Option<u64>,
+        /// worker レジストリの ID（#390。pane が消えても追跡を継続する）
+        #[arg(long)]
+        worker: Option<String>,
         /// claude の session ID（あれば精度向上）
         #[arg(long)]
         session_id: Option<String>,
@@ -1141,9 +1144,12 @@ enum OrchestratorCommand {
     /// worker の状態確認（busy / idle / error / gone / unknown。error 時は
     /// error.kind（api_error / usage_limit / limit_dialog）と recommended_action を含む。#157）
     Status {
-        /// ペイン ID
+        /// ペイン ID（--worker と排他。どちらか必須）
         #[arg(long)]
-        pane: u64,
+        pane: Option<u64>,
+        /// worker レジストリの ID（#390。pane が消えても状態を取得できる）
+        #[arg(long)]
+        worker: Option<String>,
         /// claude の session ID
         #[arg(long)]
         session_id: Option<String>,
@@ -1179,15 +1185,25 @@ enum OrchestratorCommand {
     },
     /// worker の報告内容を取得する（scrollback 主 + transcript 補強。#364）
     Report {
-        /// 対象ペイン ID
+        /// 対象ペイン ID（--worker と排他。どちらか必須）
         #[arg(long)]
-        pane: u64,
+        pane: Option<u64>,
+        /// worker レジストリの ID（#390。pane が消えても報告を取得できる）
+        #[arg(long)]
+        worker: Option<String>,
         /// スクロールバック取得行数（既定 2000）
         #[arg(long, default_value = "2000")]
         lines: usize,
         /// transcript から取得する直近 assistant メッセージ件数（既定 1。古い順で返す）
         #[arg(long)]
         messages: Option<usize>,
+    },
+    /// worker レジストリの一覧（#390）。spawn 済み worker をペインの生死と
+    /// 無関係に列挙する（tako 再起動後も追跡できる）。既定は active のみ
+    Workers {
+        /// closed（明示 close 済み）の worker も含める
+        #[arg(long)]
+        all: bool,
     },
     /// spawn + 完了待ち + 出力取得 + close を 1 回で行う
     Run {
@@ -1896,20 +1912,17 @@ fn main() -> ExitCode {
         Command::Orchestrator(OrchestratorCommand::Watch {
             pane,
             pane_pos,
+            ref worker,
             ref session_id,
             ref tmux_session,
             timeout,
-        }) => {
-            let resolved = pane.or(pane_pos).ok_or_else(|| {
-                "ペイン ID を指定してください（tako orchestrator watch <PANE_ID> または --pane <N>）".to_string()
-            });
-            match resolved {
-                Ok(p) => {
-                    orchestrator_watch(p, session_id.as_deref(), tmux_session.as_deref(), timeout)
-                }
-                Err(e) => Err(e),
-            }
-        }
+        }) => orchestrator_watch(
+            pane.or(pane_pos),
+            worker.as_deref(),
+            session_id.as_deref(),
+            tmux_session.as_deref(),
+            timeout,
+        ),
         Command::Orchestrator(OrchestratorCommand::Projects(ref sub)) => {
             orchestrator_projects_cli(sub)
         }
@@ -1963,14 +1976,22 @@ fn main() -> ExitCode {
         }
         Command::Orchestrator(OrchestratorCommand::Report {
             pane,
+            ref worker,
             lines,
             messages,
         }) => send_request(Request::OrchestratorReport {
             pane_id: pane,
             lines: Some(lines),
             messages,
+            worker: worker.clone(),
         })
         .map(|result| println!("{}", pretty_json(&result))),
+        Command::Orchestrator(OrchestratorCommand::Workers { all }) => {
+            send_request(Request::OrchestratorWorkers {
+                all: Some(all).filter(|a| *a),
+            })
+            .map(|result| println!("{}", pretty_json(&result)))
+        }
         Command::Orchestrator(OrchestratorCommand::Run {
             ref project,
             ref prompt,
@@ -2437,20 +2458,54 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// `tako orchestrator watch --pane N [--session-id S] [--timeout T]` — worker の完了まで待機し 1 行出力する。
+/// `tako orchestrator watch --pane N [--worker W] [--session-id S] [--timeout T]` —
+/// worker の完了まで待機し 1 行出力する。
 /// 判定は tako-control の完了待ちエンジン（`orchestrator::wait`。MCP の run と共通。#83）。
-/// 異常停止（API エラー・usage limit 等）は WORKER_ERROR として区別する（#157）
+/// 異常停止（API エラー・usage limit 等）は WORKER_ERROR として区別する（#157）。
+/// #390: `--worker`（レジストリ ID）指定で pane 省略可。pane 指定でも session_id /
+/// tmux_session の欠けをレジストリで自動補完し、pane 消失後も追跡を継続する
 fn orchestrator_watch(
-    pane: u64,
+    pane: Option<u64>,
+    worker: Option<&str>,
     session_id: Option<&str>,
     tmux_session: Option<&str>,
     timeout_secs: Option<u64>,
 ) -> Result<(), String> {
+    use tako_control::orchestrator::registry::WorkerRegistry;
+    let mut session_id = session_id.map(str::to_string);
+    let mut tmux_session = tmux_session.map(str::to_string);
+    let pane = if let Some(worker_id) = worker {
+        // レジストリからペイン・追跡キーを解決（watch ループは IPC 断でも回り続ける
+        // 設計のため、レジストリ解決も CLI プロセス内で行い tako 本体に依存しない）
+        let reg =
+            WorkerRegistry::load().map_err(|e| format!("worker レジストリを読めない: {e}"))?;
+        let (_, entry) = reg.resolve(worker_id)?;
+        session_id = session_id.or_else(|| entry.session_id.clone());
+        tmux_session = tmux_session.or_else(|| entry.tmux_session.clone());
+        entry.pane
+    } else {
+        let Some(p) = pane else {
+            return Err(
+                "ペイン ID または --worker を指定してください（tako orchestrator watch <PANE_ID> / --worker <ID>）"
+                    .to_string(),
+            );
+        };
+        // pane 指定でも欠けた追跡キーはレジストリで補完（読めなければ従来動作）
+        if session_id.is_none() || tmux_session.is_none() {
+            if let Ok(reg) = WorkerRegistry::load() {
+                if let Some((_, entry)) = reg.find_active_by_pane(p) {
+                    session_id = session_id.or_else(|| entry.session_id.clone());
+                    tmux_session = tmux_session.or_else(|| entry.tmux_session.clone());
+                }
+            }
+        }
+        p
+    };
     let mut exec = |req: Request| send_request(req);
     let opts = wait::WatchOptions {
         pane_id: pane,
-        session_id: session_id.map(|s| s.to_string()),
-        tmux_session: tmux_session.map(|s| s.to_string()),
+        session_id: session_id.clone(),
+        tmux_session: tmux_session.clone(),
         timeout: timeout_secs.map(std::time::Duration::from_secs),
         initial_delay: std::time::Duration::ZERO,
         interval: std::time::Duration::from_secs(5),
@@ -2462,9 +2517,10 @@ fn orchestrator_watch(
     // 完了後に worker_status を 1 回追加で取得する
     let print_events = |exec: &mut dyn FnMut(Request) -> Result<serde_json::Value, String>| {
         if let Ok(val) = exec(Request::OrchestratorWorkerStatus {
-            pane_id: pane,
-            session_id: session_id.map(|s| s.to_string()),
-            tmux_session: tmux_session.map(|s| s.to_string()),
+            pane_id: Some(pane),
+            session_id: session_id.clone(),
+            tmux_session: tmux_session.clone(),
+            worker: None,
         }) {
             if let Some(events) = val["events"].as_array() {
                 for ev in events {
@@ -3815,13 +3871,18 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }
         Command::Orchestrator(OrchestratorCommand::Status {
             pane,
+            worker,
             session_id,
             tmux_session,
         }) => Request::OrchestratorWorkerStatus {
             pane_id: *pane,
             session_id: session_id.clone(),
             tmux_session: tmux_session.clone(),
+            worker: worker.clone(),
         },
+        Command::Orchestrator(OrchestratorCommand::Workers { .. }) => {
+            unreachable!("orchestrator workers は run() を通らない（main() でローカル処理済み）")
+        }
         // remote コマンドは main() でローカル処理済みのため到達不能
         Command::Remote(_) => unreachable!("remote は run() を通らない"),
         // main() で分岐済みのため論理的に到達不能

@@ -152,9 +152,10 @@ pub fn wait_for_worker(
         }
 
         let result = exec(Request::OrchestratorWorkerStatus {
-            pane_id: opts.pane_id,
+            pane_id: Some(opts.pane_id),
             session_id: opts.session_id.clone(),
             tmux_session: opts.tmux_session.clone(),
+            worker: None,
         });
 
         match result {
@@ -984,6 +985,10 @@ pub enum WorkerEventKind {
     ModelSwitched { from: String, to: String },
     /// ctx 使用率が閾値（60%）を超えた
     ContextHigh { percent: u64 },
+    /// spawn 後にプロンプトが届いていない疑い（#390）。
+    /// レジストリ登録済み claude worker で transcript（session_id）未観測のまま
+    /// 猶予時間を超過し、かつ画面が busy でない・実行中子プロセスも無い場合に発火
+    PromptUndelivered { seconds_since_spawn: i64 },
 }
 
 /// worker_status の events 配列に載せる 1 イベント
@@ -1002,6 +1007,15 @@ impl WorkerEvent {
             }
             WorkerEventKind::ContextHigh { percent } => {
                 json!({ "kind": "context_high", "percent": percent })
+            }
+            WorkerEventKind::PromptUndelivered {
+                seconds_since_spawn,
+            } => {
+                json!({
+                    "kind": "prompt_undelivered",
+                    "seconds_since_spawn": seconds_since_spawn,
+                    "recommended_action": "resend_prompt",
+                })
             }
         }
     }
