@@ -9620,20 +9620,49 @@ impl TakoApp {
         )
     }
 
-    /// Web dock URL 入力行の描画（#207）
+    /// Web dock URL 入力行の描画（#207 / #375）
     fn render_webview_dock_url_input(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let cursor = self
             .webview_dock_url_cursor
             .min(self.webview_dock_url_input.len());
         let before = &self.webview_dock_url_input[..cursor];
         let after = &self.webview_dock_url_input[cursor..];
-        let display = if self.webview_dock_url_input.is_empty() {
-            SharedString::from("URL を入力して Enter（例: example.com）")
-        } else {
-            SharedString::from(format!("{before}|{after}"))
-        };
         let placeholder = self.webview_dock_url_input.is_empty();
         let focused = self.webview_dock_url_focused;
+        let text_content = div()
+            .flex_1()
+            .flex()
+            .flex_row()
+            .items_center()
+            .overflow_hidden()
+            .text_size(px(11.0))
+            .when(placeholder, |d| {
+                d.child(
+                    div()
+                        .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.5))
+                        .child("URL を入力して Enter（例: example.com）"),
+                )
+            })
+            .when(!placeholder, |d| {
+                d.text_color(hsla(theme.foreground))
+                    .child(SharedString::from(before.to_string()))
+            })
+            .when(focused, |d| {
+                d.child(
+                    div()
+                        .w(px(1.5))
+                        .h(px(14.0))
+                        .flex_none()
+                        .bg(hsla(theme.accent)),
+                )
+            })
+            .when(!placeholder, |d| {
+                d.child(
+                    div()
+                        .text_color(hsla(theme.foreground))
+                        .child(SharedString::from(after.to_string())),
+                )
+            });
         div()
             .flex()
             .flex_row()
@@ -9668,13 +9697,7 @@ impl TakoApp {
                             cx.notify();
                         }),
                     )
-                    .text_size(px(11.0))
-                    .text_color(if placeholder {
-                        hsla_alpha(theme.tab_inactive_foreground, 0.5)
-                    } else {
-                        hsla(theme.foreground)
-                    })
-                    .child(display),
+                    .child(text_content),
             )
             .child(
                 div()
@@ -13048,6 +13071,15 @@ impl Render for TakoApp {
             .text_size(px(theme.font_size))
             .track_focus(&self.focus_handle)
             .key_context("TakoApp")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    if this.webview_dock_url_focused {
+                        this.webview_dock_url_focused = false;
+                        cx.notify();
+                    }
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &SplitRight, _, cx| this.split(SplitDirection::Right, cx)),
             )
