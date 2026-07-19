@@ -63,9 +63,12 @@ use tako_core::{
 const INITIAL_COLS: usize = 80;
 const INITIAL_ROWS: usize = 24;
 
-/// 実行中 Claude Code とペインの対応を layout.json へ反映する間隔。
-/// 外部 CLI を呼ぶため描画ループとは分離し、成功時だけ保存キャッシュを更新する。
-const CLAUDE_SESSION_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+/// `claude agents --json` のフルスキャン間隔。Node 起動 1 回 0.2s CPU のため
+/// アイドル時のコスト削減が目的（#368: 5s→30s に延長、前段ガード + イベント駆動併用）
+const CLAUDE_SESSION_SCAN_INTERVAL: Duration = Duration::from_secs(30);
+/// イベント駆動フラグのチェック間隔。spawn / PromptFlow 完了で立つフラグを
+/// この間隔で拾い、即時スキャンする（最悪 5s 遅延 = 旧スキャン間隔と同等）
+const CLAUDE_SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 復元時に新しいシェルへ投入する Claude resume コマンドを安全条件つきで組み立てる。
 /// backend 生存時はプロセスごと再 attach するため、二重起動を避けて None。
@@ -2251,54 +2254,94 @@ impl TakoApp {
         // PC 再起動では tmux プロセスも消えるため、実行中 Claude Code の session ID を
         // ペインごとに保存して `claude --resume` へ使う。外部コマンドは background で実行し、
         // 検出失敗時は直前の成功値を壊さない。既存 persist トグルが CLI / MCP 共通の制御点。
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor()
-                .timer(CLAUDE_SESSION_SCAN_INTERVAL)
-                .await;
-            let should_scan = this
-                .update(cx, |app: &mut TakoApp, _| {
-                    app.tmux_persist
-                        && !app.secondary
-                        && !app.backend_sessions.is_empty()
-                        // self-test は外部 Claude CLI を呼ばず決定的に完走させる
-                        && std::env::var_os("TAKO_SELF_TEST").is_none()
-                })
-                .unwrap_or(false);
-            if !should_scan {
-                continue;
-            }
-            // 1 回の `claude agents --json` 取得から resume マップ（従来）と
-            // セッションカタログの検出（Issue #112 A）の両方を導出する
-            let agents_value = cx
-                .background_executor()
-                .spawn(async { tako_control::agents::list_agents_with_panes(None) })
-                .await;
-            let Ok(agents_value) = agents_value else {
-                continue;
-            };
-            let detected = tako_control::sessions::detect_from_agents_value(&agents_value);
-            let resume_map: HashMap<String, String> = detected
-                .iter()
-                .map(|d| (d.tmux_session.clone(), d.session_id.clone()))
-                .collect();
-            let pane_meta = this.update(cx, |app: &mut TakoApp, _| {
-                app.apply_claude_resume_sessions(&resume_map);
-                app.save_layout();
-                app.collect_pane_meta_snapshots()
-            });
-            let Ok(pane_meta) = pane_meta else {
-                break;
-            };
-            // カタログの書き込み（ファイルロック + アトミック書き込み）は background で
-            if !detected.is_empty() {
+        //
+        // #368: Node 起動コスト削減。3 層で無駄を排除する:
+        //   1) 間隔延長（5s→30s）+ イベント駆動即時スキャン（spawn / PromptFlow 完了）
+        //   2) 前段ガード: バックエンドに実行中子プロセスがなければ Node 起動を丸ごとスキップ
+        //   3) TTL 延長（2s→5s）: watch / worker_status の重複 Node 起動を抑制
+        cx.spawn(async move |this, cx| {
+            let mut last_scan = std::time::Instant::now() - CLAUDE_SESSION_SCAN_INTERVAL;
+            loop {
                 cx.background_executor()
+                    .timer(CLAUDE_SESSION_CHECK_INTERVAL)
+                    .await;
+                let event_triggered = tako_control::take_claude_scan_request();
+                let timer_triggered = last_scan.elapsed() >= CLAUDE_SESSION_SCAN_INTERVAL;
+                if !event_triggered && !timer_triggered {
+                    continue;
+                }
+                let (should_scan, backends) = this
+                    .update(cx, |app: &mut TakoApp, _| {
+                        let should = app.tmux_persist
+                            && !app.secondary
+                            && !app.backend_sessions.is_empty()
+                            && std::env::var_os("TAKO_SELF_TEST").is_none();
+                        let bs: Vec<String> = if should {
+                            app.backend_sessions.values().cloned().collect()
+                        } else {
+                            Vec::new()
+                        };
+                        (should, bs)
+                    })
+                    .unwrap_or((false, Vec::new()));
+                if !should_scan {
+                    last_scan = std::time::Instant::now();
+                    continue;
+                }
+                // 前段ガード: バックエンドセッションに実行中の子プロセスがなければ
+                // claude も居ないので Node 起動をスキップする（~10ms で判定、Node 起動 200ms を回避）
+                let has_children = cx
+                    .background_executor()
                     .spawn(async move {
-                        if let Err(e) = tako_control::sessions::sync_detected(&detected, &pane_meta)
-                        {
-                            eprintln!("warning: セッションカタログの同期に失敗: {e}");
-                        }
+                        let refs: Vec<&str> = backends.iter().map(|s| s.as_str()).collect();
+                        tako_control::agents::count_sessions_with_running_children(&refs) > 0
                     })
                     .await;
+                if !has_children {
+                    last_scan = std::time::Instant::now();
+                    let _ = this.update(cx, |app: &mut TakoApp, _| {
+                        if !app.claude_resume_sessions.is_empty() {
+                            app.claude_resume_sessions.clear();
+                            app.save_layout();
+                        }
+                    });
+                    continue;
+                }
+                // 1 回の `claude agents --json` 取得から resume マップ（従来）と
+                // セッションカタログの検出（Issue #112 A）の両方を導出する
+                let agents_value = cx
+                    .background_executor()
+                    .spawn(async { tako_control::agents::list_agents_with_panes(None) })
+                    .await;
+                last_scan = std::time::Instant::now();
+                let Ok(agents_value) = agents_value else {
+                    continue;
+                };
+                let detected = tako_control::sessions::detect_from_agents_value(&agents_value);
+                let resume_map: HashMap<String, String> = detected
+                    .iter()
+                    .map(|d| (d.tmux_session.clone(), d.session_id.clone()))
+                    .collect();
+                let pane_meta = this.update(cx, |app: &mut TakoApp, _| {
+                    app.apply_claude_resume_sessions(&resume_map);
+                    app.save_layout();
+                    app.collect_pane_meta_snapshots()
+                });
+                let Ok(pane_meta) = pane_meta else {
+                    break;
+                };
+                // カタログの書き込み（ファイルロック + アトミック書き込み）は background で
+                if !detected.is_empty() {
+                    cx.background_executor()
+                        .spawn(async move {
+                            if let Err(e) =
+                                tako_control::sessions::sync_detected(&detected, &pane_meta)
+                            {
+                                eprintln!("warning: セッションカタログの同期に失敗: {e}");
+                            }
+                        })
+                        .await;
+                }
             }
         })
         .detach();
@@ -3498,6 +3541,7 @@ impl TakoApp {
         // 先行フローが完了するまで後続は待たせる（Vec の順序 = 送信順）
         let mut active_panes: std::collections::HashSet<PaneId> = std::collections::HashSet::new();
         let now = std::time::Instant::now();
+        let prev_len = self.prompt_flows.len();
         for mut flow in std::mem::take(&mut self.prompt_flows) {
             if flow.created_at.elapsed() > std::time::Duration::from_secs(120) {
                 eprintln!(
@@ -3626,6 +3670,10 @@ impl TakoApp {
                 active_panes.insert(flow.pane);
                 remaining.push(flow);
             }
+        }
+        // #368: PromptFlow 完了 → 新 claude セッションが生まれるので即時スキャン
+        if remaining.len() < prev_len {
+            tako_control::request_claude_scan();
         }
         self.prompt_flows = remaining;
     }

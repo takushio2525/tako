@@ -50,6 +50,18 @@ pub use host::{
 pub use ipc::{IncomingRequest, IpcServer};
 pub use mcp::McpServer;
 
+// --- claude session スキャンのイベント駆動トリガー（#368） ---
+use std::sync::atomic::{AtomicBool, Ordering};
+static CLAUDE_SCAN_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// spawn / PromptFlow 完了時に呼び、次の周期スキャンを即時実行させる
+pub fn request_claude_scan() {
+    CLAUDE_SCAN_REQUESTED.store(true, Ordering::Relaxed);
+}
+/// スキャンループが毎 tick 呼ぶ（flag を消費して返す）
+pub fn take_claude_scan_request() -> bool {
+    CLAUDE_SCAN_REQUESTED.swap(false, Ordering::Relaxed)
+}
+
 /// 接続認証トークンを OS の CSPRNG から生成する（hex 64 文字。FR-2.3.4）。
 /// IPC と MCP はこのセッション共有トークンで認証する。ログに出さないこと
 pub fn generate_token() -> std::io::Result<String> {
