@@ -9954,9 +9954,12 @@ impl TakoApp {
             .or(self.cell_size)
             .expect("render 冒頭で実測済み");
 
-        // PTY リサイズ追従: テキスト領域に収まる cols/rows へ
-        let cols = (f32::from(area.size.width) / f32::from(cell.width)).floor() as usize;
-        let rows = (f32::from(area.size.height) / f32::from(cell.height)).floor() as usize;
+        // PTY リサイズ追従: テキスト領域に収まる cols/rows へ。
+        // 急速リサイズで area が極小/負になる場合に備え 0 クランプ（#385）
+        let area_w = f32::from(area.size.width).max(0.0);
+        let area_h = f32::from(area.size.height).max(0.0);
+        let cols = (area_w / f32::from(cell.width)).floor() as usize;
+        let rows = (area_h / f32::from(cell.height)).floor() as usize;
         if let Some(session) = self.terminals.get_mut(&pane_id) {
             session.resize(
                 cols,
@@ -10714,11 +10717,14 @@ impl TakoApp {
             .child(
                 // テキスト領域: サブラインスクロール（#159）のため行スタックを
                 // absolute 配置し、fract 行ぶん上へずらして描画する（overflow_hidden で
-                // 上下端は部分行として見切れる = ピクセル単位のスムーススクロール）
+                // 上下端は部分行として見切れる = ピクセル単位のスムーススクロール）。
+                // bg を明示する（#385）: リサイズ・レイアウト変化時に端末行が新サイズを
+                // 埋め切る前のフレームでも、ペイン背景色と同色が塗られて暗転しない
                 div()
                     .flex_1()
                     .overflow_hidden()
                     .relative()
+                    .bg(rgba(theme.background))
                     .when(has_link_hover, |d| d.cursor(CursorStyle::PointingHand))
                     .child(
                         div()
@@ -12847,18 +12853,25 @@ impl Render for TakoApp {
             .tree();
         let focused = tree.focused();
         let layout = tree.layout(Rect::UNIT);
+        // デバイスピクセルスナップ（#385）: ターミナルはグリッドベースの描画のため、
+        // サブピクセル座標のままだとリサイズ時にグリフのラスタライズ位置がフレーム間で
+        // 振動し、暗転・ちらつきとして知覚される（zed の terminal_element と同じ対策）
+        let scale_factor = window.scale_factor();
+        let snap = |v: Pixels| -> Pixels {
+            Pixels::from((f32::from(v) * scale_factor).round() / scale_factor)
+        };
         let new_areas: Vec<(PaneId, Bounds<Pixels>)> = layout
             .iter()
             .map(|(id, r)| {
                 let inset = PANE_BORDER + PANE_PADDING;
                 // テキスト領域はタイトルバー（PANE_TITLE_BAR）の下から始まる
                 let origin = point(
-                    content_origin.x + content_size.width * r.x + px(inset),
-                    content_origin.y + content_size.height * r.y + px(inset + PANE_TITLE_BAR),
+                    snap(content_origin.x + content_size.width * r.x + px(inset)),
+                    snap(content_origin.y + content_size.height * r.y + px(inset + PANE_TITLE_BAR)),
                 );
                 let area_size = size(
-                    content_size.width * r.width - px(inset * 2.0),
-                    content_size.height * r.height - px(inset * 2.0 + PANE_TITLE_BAR),
+                    snap(content_size.width * r.width - px(inset * 2.0)),
+                    snap(content_size.height * r.height - px(inset * 2.0 + PANE_TITLE_BAR)),
                 );
                 (*id, Bounds::new(origin, area_size))
             })
