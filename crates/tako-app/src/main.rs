@@ -798,6 +798,8 @@ struct TakoApp {
     tab_reorder_indicator: Option<Option<TabId>>,
     /// タブ D&D 並べ替え中のドラッグ元タブ（#371: ソースタブの半透明化に使用）
     dragging_tab: Option<TabId>,
+    /// サイドバーへの外部ファイルドラッグ中のハイライト（#219）
+    sidebar_drop_highlight: bool,
     /// git パネルのデータ（FR-3.6。cwd 連動で 2 秒ポーリング更新）
     git_data: Option<GitPanelData>,
     /// サイドバー用の軽量 git サマリ（#217。ブランチチップ + 変更フッター）
@@ -1835,6 +1837,7 @@ impl TakoApp {
             tab_drop_target: None,
             tab_reorder_indicator: None,
             dragging_tab: None,
+            sidebar_drop_highlight: false,
             git_data: None,
             sidebar_git: None,
             git_selected_commit: None,
@@ -6894,6 +6897,11 @@ impl TakoApp {
                 if self.tab_reorder_indicator.take().is_some() {
                     changed = true;
                 }
+                // サイドバーハイライトをリセット（#219）
+                if self.sidebar_drop_highlight {
+                    self.sidebar_drop_highlight = false;
+                    changed = true;
+                }
                 if changed {
                     cx.notify();
                 }
@@ -7182,6 +7190,83 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// ファイルツリーから cmd+ドロップ時: ドロップ先ペインの「下にある」ターミナルへパス入力（Issue #21）。
+    /// ドロップ先がプレビューペインなら、同タブのフォーカスターミナルペインに送る
+    fn drop_file_to_underlying_terminal(
+        &mut self,
+        path: &std::path::Path,
+        drop_target: PaneId,
+        cx: &mut Context<Self>,
+    ) {
+        let target_pane = if self.previews.contains_key(&drop_target) {
+            self.workspace
+                .active_tab()
+                .tree()
+                .panes()
+                .iter()
+                .find(|p| {
+                    self.terminals.contains_key(&p.id()) && !self.previews.contains_key(&p.id())
+                })
+                .map(|p| p.id())
+        } else {
+            Some(drop_target)
+        };
+        if let Some(target) = target_pane {
+            let text = tako_core::quote_paths_for_shell(std::slice::from_ref(&path.to_path_buf()));
+            let _ = tako_control::dispatch(
+                self,
+                tako_control::protocol::Request::Send {
+                    pane: Some(target.as_u64()),
+                    text,
+                    newline: false,
+                    tmux_session: None,
+                    await_prompt: false,
+                },
+                PaneOrigin::User,
+            );
+            cx.notify();
+        }
+    }
+
+    /// Finder からサイドバー（ファイルツリー）への外部ファイルドロップ（Issue #219）:
+    /// ディレクトリ → pinned_folders に追加、ファイル → プレビュー表示 + 親ディレクトリを追加
+    fn drop_files_to_sidebar(&mut self, paths: &[std::path::PathBuf], cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        let tab_id = self.workspace.active_tab().id();
+        let mut added_folder = false;
+        let mut files_to_open: Vec<std::path::PathBuf> = Vec::new();
+        for path in paths {
+            if path.is_dir() {
+                if let Some(tab) = self.workspace.get_tab_mut(tab_id) {
+                    if tab.add_pinned_folder(path.clone()) {
+                        added_folder = true;
+                    }
+                }
+            } else {
+                files_to_open.push(path.clone());
+                if let Some(parent) = path.parent() {
+                    if parent.is_dir() {
+                        if let Some(tab) = self.workspace.get_tab_mut(tab_id) {
+                            if tab.add_pinned_folder(parent.to_path_buf()) {
+                                added_folder = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if added_folder {
+            self.sync_filetree_roots();
+        }
+        if !files_to_open.is_empty() {
+            self.open_dropped_files(&files_to_open, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
     /// ペイン 1 枚分のドロップ先オーバーレイ（D&D 中のみ生成）。
     /// ホバー中はドロップ後に新ペインが占める半面をハイライトし、結果ラベルを出す
     /// （FR-2.16.10 / FR-3.11 の「ドロップしたらこうなる」挿入プレビュー）
@@ -7259,8 +7344,13 @@ impl TakoApp {
             .on_drop::<TmuxSessionDrag>(cx.listener(move |this, drag: &TmuxSessionDrag, _, cx| {
                 this.drop_tmux_session(pane_id, drag.clone(), cx);
             }))
-            .on_drop::<FileDrag>(cx.listener(move |this, drag: &FileDrag, _, cx| {
-                this.drop_files(pane_id, std::slice::from_ref(&drag.path), false, cx);
+            .on_drop::<FileDrag>(cx.listener(move |this, drag: &FileDrag, window, cx| {
+                let cmd_held = window.modifiers().platform;
+                if cmd_held {
+                    this.drop_file_to_underlying_terminal(&drag.path, pane_id, cx);
+                } else {
+                    this.drop_files(pane_id, std::slice::from_ref(&drag.path), false, cx);
+                }
             }))
             .on_drag_move::<ExternalPaths>(cx.listener(
                 move |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
@@ -7946,6 +8036,7 @@ impl TakoApp {
             | self.tab_drop_target.take().is_some()
             | self.tab_reorder_indicator.take().is_some()
             | self.dragging_tab.take().is_some()
+            | std::mem::take(&mut self.sidebar_drop_highlight)
         {
             cx.notify();
             return;
