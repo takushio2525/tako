@@ -940,3 +940,8 @@
 - USAGE LIMITS ドロップダウンのヘッダーにリロードボタン追加（即時再走査）、agy を「unsupported」明示表示に変更。dispatch / CLI / MCP に refresh アクション追加（1:1）。codex のローカル DB 調査で永続化なし確認
 - 関連コミット: `3059701`（PR #393 squash merge）。310 tests / clippy / fmt 緑
 - 次: `build-app.sh --install` → リロードボタン実機確認
+
+## 2026-07-19（#391: setup 対話 agent の既定起動を復元）
+- 回帰点を特定: #322（PR #330）で master 提案優先ロジック追加時に agent フォールバック欠落 + `--review` 限定化。修正 = 旧ランチャー除去 + `launch_setup_agent` を既定呼び出し。`--yes`/非TTY/`launch_agent=none` でスキップ。docs に「素のコマンドで完結」原則を追記
+- 関連コミット: `15fefa2`（PR #396 squash merge）。CLI 27 + control 529 + core 310 tests / clippy / fmt 緑 + 実機で対話起動・greeting 注入を実測
+- 次: `build-app.sh --install` → 本番で `tako setup` の対話起動確認
