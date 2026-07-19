@@ -935,3 +935,8 @@
 - 旧実装は Unknown ペインのみ子プロセス判定 → Idle のまま子プロセスが走る TUI エージェントを見落とし。全バックエンドを対象に変更 + status() の busy_agents ハードコード 0 も修正
 - 関連コミット: `f652dc8`（PR #389 squash merge）。308 tests / clippy / fmt 緑 + 隔離セルフテスト完走
 - 次: `build-app.sh --install` → 本番で busy_agents 確認。Issue クローズは master 管理
+
+## 2026-07-19（#357: 利用制限表示にリロードボタン追加 + agy unsupported 明示）
+- USAGE LIMITS ドロップダウンのヘッダーにリロードボタン追加（即時再走査）、agy を「unsupported」明示表示に変更。dispatch / CLI / MCP に refresh アクション追加（1:1）。codex のローカル DB 調査で永続化なし確認
+- 関連コミット: `3059701`（PR #393 squash merge）。310 tests / clippy / fmt 緑
+- 次: `build-app.sh --install` → リロードボタン実機確認
