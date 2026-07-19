@@ -2837,6 +2837,9 @@ impl TakoApp {
                         cx.listener(move |this, _ev: &MouseUpEvent, _, _cx| {
                             if this.preview_selecting == Some(pane_id) {
                                 this.preview_selecting = None;
+                                if this.drag_scroll.as_ref().is_some_and(|s| s.preview) {
+                                    this.drag_scroll = None;
+                                }
                             }
                         }),
                     )
@@ -2851,6 +2854,8 @@ impl TakoApp {
                                 this.sync_editor_selection_from_preview(pane_id);
                                 cx.notify();
                             }
+                            // ドラッグ選択中の端到達自動スクロール（#309）
+                            this.update_preview_drag_scroll(pane_id, ev.position, cx);
                         }
                     }))
                     .children(body)

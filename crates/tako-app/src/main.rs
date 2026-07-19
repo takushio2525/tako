@@ -111,6 +111,16 @@ fn drag_scroll_delta(factor_abs: f32) -> f32 {
     speed * (DRAG_SCROLL_INTERVAL_MS as f32 / 1000.0)
 }
 
+/// PDF プレビュー用: 速度係数（0.0..1.0）を 1 ティック分のスクロールピクセル数（正）に変換する（#309）
+const DRAG_SCROLL_MIN_PX_PER_SEC: f32 = 40.0;
+const DRAG_SCROLL_MAX_PX_PER_SEC: f32 = 600.0;
+
+fn drag_scroll_delta_px(factor_abs: f32) -> f32 {
+    let speed = DRAG_SCROLL_MIN_PX_PER_SEC
+        + (DRAG_SCROLL_MAX_PX_PER_SEC - DRAG_SCROLL_MIN_PX_PER_SEC) * factor_abs;
+    speed * (DRAG_SCROLL_INTERVAL_MS as f32 / 1000.0)
+}
+
 /// スクロールバーの当たり領域の幅（px。サムはこの内側に描く）
 const SCROLLBAR_WIDTH: f32 = 10.0;
 /// スクロールバーの表示維持時間とフェード時間（iTerm2 流の出し方。FR-2.5.13）
@@ -598,11 +608,13 @@ fn byte_to_utf16_offset(text: &str, byte_offset: usize) -> usize {
     text[..offset].chars().map(char::len_utf16).sum()
 }
 
-/// ドラッグ選択中の自動スクロール状態（#310）
+/// ドラッグ選択中の自動スクロール状態（#310 ターミナル / #309 PDF プレビュー）
 struct DragScrollState {
     pane: PaneId,
     /// 正 = 過去方向（上）、負 = 未来方向（下）。絶対値が速度係数（0.0..1.0）
     speed_factor: f32,
+    /// true = PDF プレビューのドラッグスクロール（scroll_handle 操作）
+    preview: bool,
 }
 
 /// IME 変換状態の対象ペインを解決する（#332）。変換開始時のペインが既に閉じられて
@@ -7605,6 +7617,8 @@ impl TakoApp {
                 self.sync_editor_selection_from_preview(pid);
                 cx.notify();
             }
+            // ドラッグ選択中のオートスクロール判定（#309）
+            self.update_preview_drag_scroll(pid, event.position, cx);
             return;
         }
         let Some(pane_id) = self.selecting else {
@@ -7666,6 +7680,50 @@ impl TakoApp {
         self.drag_scroll = Some(DragScrollState {
             pane: pane_id,
             speed_factor,
+            preview: false,
+        });
+        if was_none {
+            self.start_drag_scroll_timer(cx);
+        }
+    }
+
+    /// PDF プレビュー用のドラッグ選択オートスクロール判定（#309）
+    fn update_preview_drag_scroll(
+        &mut self,
+        pane_id: PaneId,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(handle) = self.preview_scroll_handles.get(&pane_id) else {
+            return;
+        };
+        let area = handle.bounds();
+        let y = f32::from(position.y);
+        let top = f32::from(area.origin.y);
+        let bottom = top + f32::from(area.size.height);
+
+        let speed_factor = if y < top + DRAG_SCROLL_MARGIN {
+            let dist = (top + DRAG_SCROLL_MARGIN - y).min(DRAG_SCROLL_MARGIN);
+            dist / DRAG_SCROLL_MARGIN
+        } else if y > bottom - DRAG_SCROLL_MARGIN {
+            let dist = (y - (bottom - DRAG_SCROLL_MARGIN)).min(DRAG_SCROLL_MARGIN);
+            -(dist / DRAG_SCROLL_MARGIN)
+        } else {
+            0.0
+        };
+
+        if speed_factor == 0.0 {
+            if self.drag_scroll.as_ref().is_some_and(|s| s.preview) {
+                self.drag_scroll = None;
+            }
+            return;
+        }
+
+        let was_none = self.drag_scroll.is_none();
+        self.drag_scroll = Some(DragScrollState {
+            pane: pane_id,
+            speed_factor,
+            preview: true,
         });
         if was_none {
             self.start_drag_scroll_timer(cx);
@@ -7693,12 +7751,18 @@ impl TakoApp {
         let Some(state) = &self.drag_scroll else {
             return false;
         };
-        if self.selecting != Some(state.pane) {
+        let pane_id = state.pane;
+        let factor = state.speed_factor;
+        let is_preview = state.preview;
+
+        if is_preview {
+            return self.tick_preview_drag_scroll(pane_id, factor, cx);
+        }
+
+        if self.selecting != Some(pane_id) {
             self.drag_scroll = None;
             return false;
         }
-        let pane_id = state.pane;
-        let factor = state.speed_factor;
         let delta_rows = drag_scroll_delta(factor.abs());
 
         let session = match self.terminals.get(&pane_id) {
@@ -7719,6 +7783,56 @@ impl TakoApp {
             session.scroll_display(-(delta_rows.ceil() as i32));
             session.extend_selection(cols.saturating_sub(1), rows.saturating_sub(1), true);
         }
+        cx.notify();
+        true
+    }
+
+    /// PDF プレビューのドラッグ選択オートスクロール 1 ティック（#309）
+    fn tick_preview_drag_scroll(
+        &mut self,
+        pane_id: PaneId,
+        factor: f32,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.preview_selecting != Some(pane_id) {
+            self.drag_scroll = None;
+            return false;
+        }
+        let Some(handle) = self.preview_scroll_handles.get(&pane_id) else {
+            self.drag_scroll = None;
+            return false;
+        };
+
+        let delta_px = drag_scroll_delta_px(factor.abs());
+        let offset = handle.offset();
+        let current_y = f32::from(offset.y);
+
+        let new_y = if factor > 0.0 {
+            // 上方向（正 = 先頭へ）。offset は負方向
+            (current_y + delta_px).min(0.0)
+        } else {
+            current_y - delta_px
+        };
+        handle.set_offset(point(offset.x, px(new_y)));
+
+        // スクロール後の端位置で選択を更新。スクロール領域の上端/下端のヒットテストを行い、
+        // ビューポートからはみ出た先のテキストを選択範囲に含める
+        let area = handle.bounds();
+        let hit_pos = if factor > 0.0 {
+            point(area.origin.x, area.origin.y)
+        } else {
+            point(
+                area.origin.x + area.size.width,
+                area.origin.y + area.size.height,
+            )
+        };
+        if let Some(pos) = self.preview_hit_test(pane_id, hit_pos) {
+            if let Some(sel) = self.preview_selections.get_mut(&pane_id) {
+                sel.head = pos;
+            }
+            self.sync_editor_selection_from_preview(pane_id);
+        }
+
         cx.notify();
         true
     }
@@ -21112,6 +21226,33 @@ mod drag_scroll_tests {
         for i in 1..=10 {
             let factor = i as f32 / 10.0;
             let delta = drag_scroll_delta(factor);
+            assert!(delta > prev, "factor={factor}: {delta} <= {prev}");
+            prev = delta;
+        }
+    }
+
+    // --- PDF プレビュー用（#309） ---
+
+    #[test]
+    fn pdf_最小速度係数では最小ピクセル速度になる() {
+        let delta = drag_scroll_delta_px(0.0);
+        let expected = DRAG_SCROLL_MIN_PX_PER_SEC * (DRAG_SCROLL_INTERVAL_MS as f32 / 1000.0);
+        assert!((delta - expected).abs() < 0.01);
+    }
+
+    #[test]
+    fn pdf_最大速度係数では最大ピクセル速度になる() {
+        let delta = drag_scroll_delta_px(1.0);
+        let expected = DRAG_SCROLL_MAX_PX_PER_SEC * (DRAG_SCROLL_INTERVAL_MS as f32 / 1000.0);
+        assert!((delta - expected).abs() < 0.01);
+    }
+
+    #[test]
+    fn pdf_速度は単調増加する() {
+        let mut prev = drag_scroll_delta_px(0.0);
+        for i in 1..=10 {
+            let factor = i as f32 / 10.0;
+            let delta = drag_scroll_delta_px(factor);
             assert!(delta > prev, "factor={factor}: {delta} <= {prev}");
             prev = delta;
         }
