@@ -4174,6 +4174,9 @@ fn dispatch_orchestrator_spawn(
         String::new()
     });
 
+    // #368: spawn 完了 → claude session スキャンを即時トリガー
+    crate::request_claude_scan();
+
     Ok(json!({
         "pane_id": new_id.as_u64(),
         "spawned_by": target.as_u64(),

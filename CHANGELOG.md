@@ -30,6 +30,19 @@ Nightly patch release (automated). Changes since v0.5.6:
   半透明 + 点線ボーダーで「掴まれた」状態に変化。ライト/ダーク両テーマ対応。
   Tab D&D indicator now shows a vertical bar (3px + accent glow) at the drop
   position, and the dragged tab becomes translucent with a dashed border.
+
+- [改善] claude session スキャンの Node 起動コスト削減 (#368)
+  `claude agents --json` の 5 秒毎無条件実行（1 コア 4% 相当の常時消費）を 3 層で最適化:
+  スキャン間隔 5s→30s + イベント駆動即時スキャン、前段ガード（実行中子プロセスの
+  有無で Node 起動自体をスキップ）、TTL 2s→5s（watch 重複抑制）。
+  アイドル時の Node 起動を完全排除（実測 12 回/分→0 回/分）
+
+  Reduce CPU cost of the claude session scanner (#368). The unconditional
+  5-second `claude agents --json` poll (≈4% of one core) is optimised in three
+  layers: scan interval 5s→30s with event-driven immediate re-scan on spawn /
+  prompt delivery, a pre-check guard that skips the Node launch entirely when no
+  child processes are running in backend sessions, and TTL 2s→5s to deduplicate
+  watch/worker_status calls. Idle Node launches drop from 12/min to 0/min.
 - [改善] sleep guard の busy 判定を UI スレッドから background へ移動 (#340)
   persist 復元後の Unknown ペイン常在時、2 秒毎の子プロセス判定（tmux + ps 実行）が
   UI スレッドを p50 42ms 専有し続けていた（#324 で導入、#212 の pmset と同型）。

@@ -1253,8 +1253,9 @@ pub(crate) fn run_claude_agents_json() -> Option<Vec<u8>> {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     static CACHE: Mutex<Option<(Instant, Option<Vec<u8>>)>> = Mutex::new(None);
-    /// watch のポーリング間隔（数秒）より短く、判定の鮮度に影響しない長さ
-    const TTL: Duration = Duration::from_secs(2);
+    /// watch のポーリング間隔（5 秒）と同じ長さ。同一 TTL 窓内の watch / worker_status
+    /// 呼び出しは前回結果を返し、Node 起動コストを抑える（#368）
+    const TTL: Duration = Duration::from_secs(5);
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((at, value)) = cache.as_ref() {
         if at.elapsed() < TTL {
