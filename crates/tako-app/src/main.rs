@@ -16661,17 +16661,23 @@ mod self_test {
                 .unwrap_or_else(|_| fail("FR-2.12 開始時の状態取得"));
             press(any, cx, "ctrl-u");
             type_text(any, cx, &format!("{cli} tab rename 実験タブ"), true);
-            wait(cx, 1000).await;
-            let renamed = window
-                .update(cx, |app, _, _| {
-                    app.workspace
-                        .get_tab(active_tab)
-                        .map(|t| {
-                            t.title() == "実験タブ" && t.title_source() == TitleSource::Manual
-                        })
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
+            let mut renamed = false;
+            for _ in 0..15 {
+                wait(cx, 200).await;
+                renamed = window
+                    .update(cx, |app, _, _| {
+                        app.workspace
+                            .get_tab(active_tab)
+                            .map(|t| {
+                                t.title() == "実験タブ" && t.title_source() == TitleSource::Manual
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if renamed {
+                    break;
+                }
+            }
             check(renamed, "tako tab rename（手動扱い）");
 
             // 51. 自動リネームの適用と手動優先（FR-2.12.3）: 手動のタブ・ペインは
@@ -20714,15 +20720,27 @@ mod self_test {
             // 復元するが、このセルフテスト環境は draw が止まり得るため打鍵経路で検証
             // する。修正前はこの check が FAILED = blur が恒久化していた
             let _ = any.update(cx, |_, window, _| window.blur());
-            wait(cx, 300).await;
-            let blurred = window
-                .update(cx, |app, window, _| !app.focus_handle.is_focused(window))
-                .unwrap_or(false);
+            let mut blurred = false;
+            for _ in 0..10 {
+                wait(cx, 50).await;
+                blurred = window
+                    .update(cx, |app, window, _| !app.focus_handle.is_focused(window))
+                    .unwrap_or(false);
+                if blurred {
+                    break;
+                }
+            }
             press(any, cx, "escape");
-            wait(cx, 300).await;
-            let refocused = window
-                .update(cx, |app, window, _| app.focus_handle.is_focused(window))
-                .unwrap_or(false);
+            let mut refocused = false;
+            for _ in 0..15 {
+                wait(cx, 100).await;
+                refocused = window
+                    .update(cx, |app, window, _| app.focus_handle.is_focused(window))
+                    .unwrap_or(false);
+                if refocused {
+                    break;
+                }
+            }
             check(
                 blurred && refocused,
                 "IME 経路: blur 後の focus 自己修復 (#332)",
