@@ -930,3 +930,8 @@
 - #374: `tako orchestrator report --messages N` + MCP `messages` パラメータ。直近 N 件 assistant テキスト取得（古い順、既定 1、超過=全件）
 - 関連コミット: `b3f1bbc`（PR #387 squash merge）。品質ゲート全緑（983 tests）
 - 次: `build-app.sh --install` → 実 claude ペインで `--messages 3` の取得実測
+
+## 2026-07-19（#372: sleep-guard busy_agents 漏れの根治）
+- 旧実装は Unknown ペインのみ子プロセス判定 → Idle のまま子プロセスが走る TUI エージェントを見落とし。全バックエンドを対象に変更 + status() の busy_agents ハードコード 0 も修正
+- 関連コミット: `f652dc8`（PR #389 squash merge）。308 tests / clippy / fmt 緑 + 隔離セルフテスト完走
+- 次: `build-app.sh --install` → 本番で busy_agents 確認。Issue クローズは master 管理

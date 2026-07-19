@@ -4,16 +4,16 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-19・#369 + #374 修正完了）
+## 現在の対象（2026-07-19・#372 修正完了）
 
-**Issue #369 + #374: orchestrator 改善 2 件** — PR #387 squash merge 済み（`b3f1bbc`）
+**Issue #372: sleep-guard busy_agents 漏れ** — PR #389 squash merge 済み（`f652dc8`）
 
 ## 次の一手
 
-- `build-app.sh --install` で .app 更新 → 実機で `--messages 3` の取得実測
+- `build-app.sh --install` で .app 更新 → 本番で `tako sleep-guard status` の busy_agents 確認
 - #364 の実 claude ペイン report e2e + codex fallback 実測（持ち越し）
 - #287 の master レビュー・main マージ判断（renewal/remote-transport）
-- v0.6.0 リリース判断（#339 + #364 + #340 + #371 + #375 + #378 + #315 + #369 + #374 修正同梱）
+- v0.6.0 リリース判断
 
 ## 現フェーズで Read すべき設計書
 
