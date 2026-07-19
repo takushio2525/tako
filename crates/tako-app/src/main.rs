@@ -1697,22 +1697,24 @@ impl TakoApp {
                 }
                 Err(e) => {
                     let msg = if e == tako_control::layout::LayoutError::NotFound {
-                        // 初回起動・明示クローズ後の正常系。理由だけ記録する
                         format!("復元なし: {e}")
                     } else {
-                        // 破損・不整合ファイルは .corrupt へ退避して原因調査に残す
-                        // （放置すると次の定期保存で黙って上書きされるため）
                         let stashed = tako_control::layout::layout_path()
                             .map(|p| std::fs::rename(&p, p.with_extension("json.corrupt")).is_ok())
                             .unwrap_or(false);
-                        format!(
+                        let msg = format!(
                             "復元失敗: {e}{}",
                             if stashed {
                                 "（layout.json.corrupt へ退避）"
                             } else {
                                 ""
                             }
-                        )
+                        );
+                        tako_control::telemetry::report_critical(
+                            tako_control::telemetry::ErrorKind::RestoreFailed,
+                            &msg,
+                        );
+                        msg
                     };
                     persist_diag(&msg);
                     (Workspace::new("1", Pane::new(PaneOrigin::User)), msg)

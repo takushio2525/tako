@@ -2773,6 +2773,7 @@ fn telemetry_local(sub: &TelemetryCommand) -> Result<(), String> {
     match sub {
         TelemetryCommand::Status => {
             let recent = tako_control::telemetry::recent_count();
+            let queued = tako_control::telemetry::queue_count();
             let log_path = tako_control::telemetry::log_file_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
@@ -2782,10 +2783,14 @@ fn telemetry_local(sub: &TelemetryCommand) -> Result<(), String> {
                 eprintln!("telemetry: OFF");
             }
             eprintln!("  直近のレポート件数: {recent}");
+            if queued > 0 {
+                eprintln!("  未送信キュー: {queued}");
+            }
             eprintln!("  ログ: {log_path}");
             let json = serde_json::json!({
                 "telemetry": settings.telemetry,
                 "recent_reports": recent,
+                "queued_reports": queued,
                 "log_path": log_path,
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
