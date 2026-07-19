@@ -25,6 +25,12 @@ Nightly patch release (automated). Changes since v0.5.6:
 
 ## [Unreleased]
 
+- [機能追加] PDF プレビューで文字選択ドラッグ中の端到達で自動スクロール (#309)
+  ペイン上下端 40px のマージン内で速度変化付き自動スクロールが開始され、ページ境界を
+  またいだ連続選択・コピーが可能に。ターミナル側の #310 と同じ操作感・速度カーブ。
+  PDF preview now auto-scrolls during text selection drag near viewport edges,
+  enabling cross-page selection and copy. Same feel and speed curve as #310.
+
 - [改善] 利用制限表示にリロードボタンを追加 + agy を「unsupported」明示表示に (#357)
   USAGE LIMITS ドロップダウンのヘッダーにリロードボタンを追加し、全ペインの TUI フッターを
   即時再走査して最新メトリクスを取得する。agy の制限データ取得は不可能と確定したため
