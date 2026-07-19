@@ -25,6 +25,11 @@ Nightly patch release (automated). Changes since v0.5.6:
 
 ## [Unreleased]
 
+- [修正] sleep-guard の busy_agents が稼働中 worker を数えない問題を根治 (#372)
+  旧実装は OSC 133 の CommandState が Unknown のバックエンドのみ子プロセス判定していたが、
+  TUI エージェント（claude 等）が Idle→Running に遷移しないケースで busy=0 のまま assertion
+  未保持になっていた。全バックエンドの子プロセス判定に変更し、`status()` の busy_agents
+  ハードコード 0 も修正。
 - [スタイル] タブ D&D 並べ替え時のドロップ先挿入位置インジケータを改善 (#371)
   ドラッグ中に挿入位置を示す縦線バー（3px + accent glow）を表示、ソースタブを
   半透明 + 点線ボーダーで「掴まれた」状態に変化。ライト/ダーク両テーマ対応。
