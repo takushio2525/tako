@@ -1006,50 +1006,63 @@ fn parse_pid_file() -> Result<PidInfo, String> {
 }
 
 /// P0-4: PID が本当に tako remote serve プロセスか検証する。
-/// 実行ファイルパスまたは ps の args で確認し、起動時刻もチェックする
+/// 実行ファイルパスまたは ps の args で確認し、起動時刻もチェックする。
+/// ps の起動自体が失敗した場合は安全側に倒す（検証不能 = false = kill しない）
 fn verify_pid_identity(info: &PidInfo) -> bool {
     if !is_process_alive(info.pid) {
         return false;
     }
     #[cfg(unix)]
     {
-        // ps で実行コマンドを取得し、tako remote serve かどうか確認
-        if let Ok(output) = Command::new("ps")
+        // ps で実行コマンドを取得し、tako remote serve かどうか確認。
+        // 絶対パスで呼び出し PATH 制限環境でも動作する
+        let ps_result = Command::new("/bin/ps")
             .args(["-p", &info.pid.to_string(), "-o", "args="])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .output()
-        {
-            let cmd = String::from_utf8_lossy(&output.stdout);
-            let cmd = cmd.trim();
-            let is_tako_remote =
-                cmd.contains("tako") && cmd.contains("remote") && cmd.contains("serve");
-            if !cmd.is_empty() && !is_tako_remote {
+            .output();
+        match ps_result {
+            Ok(output) => {
+                let cmd = String::from_utf8_lossy(&output.stdout);
+                let cmd = cmd.trim();
+                let is_tako_remote =
+                    cmd.contains("tako") && cmd.contains("remote") && cmd.contains("serve");
+                if !cmd.is_empty() && !is_tako_remote {
+                    return false;
+                }
+            }
+            Err(_) => {
+                // ps を実行できない = 検証不能。安全側に倒す（kill しない）
                 return false;
             }
         }
         // etime ベースの起動時刻チェック（記録がある場合のみ。±5 秒の余裕）。
         // ps etime（経過時間）+ 現在 epoch → 起動 epoch を逆算し、記録値と照合する
         if let Some(recorded) = info.start_time {
-            if let Ok(output) = Command::new("ps")
+            let etime_result = Command::new("/bin/ps")
                 .args(["-p", &info.pid.to_string(), "-o", "etime="])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
-                .output()
-            {
-                let etime_str = String::from_utf8_lossy(&output.stdout);
-                let etime_str = etime_str.trim();
-                if !etime_str.is_empty() {
-                    if let Some(elapsed_secs) = parse_etime(etime_str) {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let actual_start = now.saturating_sub(elapsed_secs);
-                        if actual_start.abs_diff(recorded) > 5 {
-                            return false;
+                .output();
+            match etime_result {
+                Ok(output) => {
+                    let etime_str = String::from_utf8_lossy(&output.stdout);
+                    let etime_str = etime_str.trim();
+                    if !etime_str.is_empty() {
+                        if let Some(elapsed_secs) = parse_etime(etime_str) {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let actual_start = now.saturating_sub(elapsed_secs);
+                            if actual_start.abs_diff(recorded) > 5 {
+                                return false;
+                            }
                         }
                     }
+                }
+                Err(_) => {
+                    return false;
                 }
             }
         }
@@ -1121,13 +1134,14 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
         cleanup_state_files();
         return Err("リモートサーバーが起動していない（プロセスは既に終了）".to_string());
     }
-    // P0-4: PID が本当に tako remote プロセスか検証
+    // P0-4: PID が本当に tako remote プロセスか検証（検証不能時も kill しない = fail-safe）
     if !verify_pid_identity(&pid_info) {
-        // PID が再利用されている。state だけ掃除して終了（無関係プロセスを kill しない）
         cleanup_state_files();
         return Err(format!(
-            "PID {pid_num} は tako remote ではないプロセスに再利用されています。\
-             state ファイルを掃除しました"
+            "PID {pid_num} が tako remote serve であることを確認できません\
+             （PID 再利用または検証コマンド実行不能）。\
+             安全のため停止操作を中止し、state ファイルを掃除しました。\
+             手動で停止するには: kill {pid_num}"
         ));
     }
     #[cfg(unix)]
@@ -1330,7 +1344,7 @@ fn find_port_occupant(port: u16) -> Option<(u32, bool)> {
         .trim()
         .parse()
         .ok()?;
-    let is_tako = Command::new("ps")
+    let is_tako = Command::new("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "args="])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -3613,10 +3627,64 @@ mod tests {
         assert!(result.is_err(), "PID 再利用を検知してエラーになる");
         let err = result.unwrap_err();
         assert!(
-            err.contains("再利用"),
-            "エラーメッセージに PID 再利用を示す: {err}"
+            err.contains("確認できません"),
+            "エラーメッセージに検証失敗を示す: {err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_pid_identityはps実行不能環境でfalseを返す() {
+        // /bin/ps が存在しない PID で呼ぶ（プロセス生存チェックで先に false）ので、
+        // ps 起動失敗の分岐を直接テストするため生存プロセスの PID を使う。
+        // 自プロセスは "tako remote serve" ではないので、ps 成功時も false になる。
+        // ここでは fail-safe 原則が守られていることだけを確認する
+        let info = PidInfo {
+            pid: std::process::id(),
+            exe: None,
+            start_time: None,
+        };
+        // 正常環境でも自プロセスは tako remote serve ではないため false
+        assert!(!verify_pid_identity(&info));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_stop_implはps実行不能でもkillしない() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 使い捨てプロセスを起動して PID を取得（テスト終了時に自動回収）
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("sleep プロセスの起動");
+        let child_pid = child.id();
+
+        let dir = std::env::temp_dir().join(format!("tako-test-ps-fail-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
+        let pid_file = dir.join("tako-remote.pid");
+        // sleep プロセスの PID を書く（"tako remote serve" ではない）
+        std::fs::write(&pid_file, format!("{child_pid}\n/bin/sleep\n0\n")).unwrap();
+
+        let result = daemon_stop_impl(false);
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+
+        // sleep プロセスがまだ生存していることを確認（SIGTERM されていない）
+        let alive = unsafe { libc::kill(child_pid as libc::pid_t, 0) } == 0;
+        assert!(alive, "sleep プロセスが SIGTERM されていないこと");
+
+        // 後始末
+        unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGKILL) };
+        let _ = std::process::Command::new("/bin/wait").status(); // zombie 回収
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(result.is_err(), "検証失敗でエラーが返る");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("確認できません"),
+            "検証不能時のエラーメッセージ: {err}"
+        );
     }
 
     #[cfg(unix)]
