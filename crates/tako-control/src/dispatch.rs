@@ -2454,11 +2454,13 @@ fn dispatch_inner(
                 "status" => {
                     let enabled = crate::telemetry::is_enabled();
                     let recent = crate::telemetry::recent_count();
+                    let queued = crate::telemetry::queue_count();
                     let log_path =
                         crate::telemetry::log_file_path().map(|p| p.display().to_string());
                     Ok(serde_json::json!({
                         "telemetry": enabled,
                         "recent_reports": recent,
+                        "queued_reports": queued,
                         "log_path": log_path,
                     }))
                 }
