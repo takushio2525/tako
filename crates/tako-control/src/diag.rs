@@ -24,6 +24,20 @@ pub fn persist_log_path() -> Option<PathBuf> {
     tako_core::paths::data_dir().map(|d| d.join("persist.log"))
 }
 
+/// パニックのローカル記録のパス（`<data_dir>/panic.log`。#381）
+pub fn panic_log_path() -> Option<PathBuf> {
+    tako_core::paths::data_dir().map(|d| d.join("panic.log"))
+}
+
+/// パニックの痕跡をローカルへ書き残す（#381: silent death の事後調査用）。
+/// .app 起動は stderr が捨てられ、テレメトリ（既定 OFF）以外に記録先が無く、
+/// 「クラッシュレポートも stderr も無いプロセス消滅」の原因を追えなかった。
+/// テレメトリの有効 / 無効に関係なく常時書く（内容はパニックメッセージと
+/// バックトレースのみ = ペイン内容・トークンは含まれない）
+pub fn panic_log(msg: &str) {
+    append_log(panic_log_path(), msg);
+}
+
 /// パフォーマンス診断ログのパス（`<data_dir>/perf.log`。Issue #113）。
 /// `TAKO_PERF_LOG` で上書き可（Issue #168: 隔離実測で本番ログと混ざらないように）
 pub fn perf_log_path() -> Option<PathBuf> {

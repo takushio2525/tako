@@ -551,6 +551,31 @@ pub fn install_panic_handler() {
     std::panic::set_hook(Box::new(move |info| {
         prev(info);
 
+        // ローカル記録（#381）: .app 起動は stderr が捨てられるため、テレメトリの
+        // 有効 / 無効に関係なく <data_dir>/panic.log へ常時書き残す。silent death
+        // （クラッシュレポートも stderr も無いプロセス消滅）の事後調査用
+        {
+            let message = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "(メッセージなし)".into());
+            let location = info
+                .location()
+                .map(|loc| loc.to_string())
+                .unwrap_or_else(|| "(位置不明)".into());
+            crate::diag::panic_log(&format!(
+                "panic at {location}: {message} [pid {}]\n{}",
+                std::process::id(),
+                std::backtrace::Backtrace::force_capture()
+            ));
+            crate::diag::persist_log(&format!(
+                "panic 発生: {location}（詳細は panic.log） [pid {}]",
+                std::process::id()
+            ));
+        }
+
         if !is_enabled() {
             return;
         }
