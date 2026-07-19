@@ -25,6 +25,15 @@ Nightly patch release (automated). Changes since v0.5.6:
 
 ## [Unreleased]
 
+- [改善] 利用制限表示にリロードボタンを追加 + agy を「unsupported」明示表示に (#357)
+  USAGE LIMITS ドロップダウンのヘッダーにリロードボタンを追加し、全ペインの TUI フッターを
+  即時再走査して最新メトリクスを取得する。agy の制限データ取得は不可能と確定したため
+  「--」から「unsupported」明示表示に変更。CLI `tako limit-service --refresh` +
+  MCP `tako_limit_service` action=refresh で 1:1 公開。
+  Add a reload button to the USAGE LIMITS dropdown (#357). The button re-scans
+  all pane TUI footers immediately for the latest metrics. agy is confirmed
+  unsupported and now explicitly shown as such instead of "--".
+
 - [修正] sleep-guard の busy_agents が稼働中 worker を数えない問題を根治 (#372)
   旧実装は OSC 133 の CommandState が Unknown のバックエンドのみ子プロセス判定していたが、
   TUI エージェント（claude 等）が Idle→Running に遷移しないケースで busy=0 のまま assertion

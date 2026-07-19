@@ -480,13 +480,17 @@ impl TakoApp {
                         d.children(limit_5h.map(|v| meter(l1, v)))
                             .children(limit_week.map(|v| meter(l2, v)))
                     })
-                    // データがないとき（agy、またはデータ未取得）
                     .when(!has_data, |d| {
+                        let label = if selected_limit_service == LimitService::Agy {
+                            "unsupported"
+                        } else {
+                            "--"
+                        };
                         d.child(
                             div()
                                 .text_size(px(10.5))
                                 .text_color(hsla(theme.text_faint))
-                                .child(SharedString::from("--")),
+                                .child(SharedString::from(label)),
                         )
                     })
                 // ドロップダウンメニューはルート div のオーバーレイとして描画
@@ -1081,7 +1085,8 @@ impl TakoApp {
                    h5: Option<u32>,
                    w7: Option<u32>,
                    l1: &'static str,
-                   l2: &'static str| {
+                   l2: &'static str,
+                   unsupported: bool| {
             let is_selected = svc == selected;
             let svc_color = match svc {
                 LimitService::Claude => theme.accent,
@@ -1184,10 +1189,17 @@ impl TakoApp {
                         })
                         .child(svc.as_str()),
                 )
-                // 短期枠メーター（Claude: 5h / Codex: P）
-                .child(meter_inline(l1, h5))
-                // 長期枠メーター（Claude: 7d / Codex: S）
-                .child(meter_inline(l2, w7))
+                .when(unsupported, |d| {
+                    d.child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(hsla(theme.text_faint))
+                            .child("unsupported"),
+                    )
+                })
+                .when(!unsupported, |d| {
+                    d.child(meter_inline(l1, h5)).child(meter_inline(l2, w7))
+                })
         };
 
         let menu_w: f32 = 340.0;
@@ -1232,15 +1244,40 @@ impl TakoApp {
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(
                             div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
                                 .px(px(11.0))
                                 .pt(px(8.0))
                                 .pb(px(7.0))
                                 .border_b_1()
                                 .border_color(hsla(theme.border_subtle))
-                                .text_size(px(9.5))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(hsla(theme.text_muted))
-                                .child("USAGE LIMITS"),
+                                .child(
+                                    div()
+                                        .text_size(px(9.5))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(hsla(theme.text_muted))
+                                        .child("USAGE LIMITS"),
+                                )
+                                .child(
+                                    div()
+                                        .id("limit-refresh-btn")
+                                        .cursor_pointer()
+                                        .rounded(px(4.0))
+                                        .p(px(2.0))
+                                        .hover(|d| d.bg(rgba(theme.surface_hover_strong)))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.refresh_agent_metrics();
+                                            cx.notify();
+                                        }))
+                                        .child(
+                                            svg()
+                                                .path(ui_icon::REFRESH)
+                                                .size(px(12.0))
+                                                .text_color(hsla(theme.text_muted)),
+                                        ),
+                                ),
                         )
                         .child(
                             div()
@@ -1253,6 +1290,7 @@ impl TakoApp {
                                     claude_week,
                                     "5h",
                                     "7d",
+                                    false,
                                 ))
                                 .child(row(
                                     LimitService::Codex,
@@ -1260,8 +1298,9 @@ impl TakoApp {
                                     codex_secondary,
                                     "P",
                                     "S",
+                                    false,
                                 ))
-                                .child(row(LimitService::Agy, None, None, "5h", "7d")),
+                                .child(row(LimitService::Agy, None, None, "5h", "7d", true)),
                         ),
                 )
                 .into_any_element(),

@@ -11253,6 +11253,21 @@ impl UiStateHost for TakoApp {
         self.limit_service_menu_anchor = None;
     }
 
+    fn refresh_limits(&mut self) -> serde_json::Value {
+        self.refresh_agent_metrics();
+        let m = |metrics: &AgentMetrics, l1: &str, l2: &str| {
+            serde_json::json!({
+                l1: metrics.limit_5h,
+                l2: metrics.limit_week,
+            })
+        };
+        serde_json::json!({
+            "claude": m(&self.agent_metrics, "5h", "7d"),
+            "codex": m(&self.codex_metrics, "primary", "secondary"),
+            "agy": { "status": "unsupported" },
+        })
+    }
+
     fn panel_state(&self) -> (bool, f32, tako_control::protocol::PanelViewWire) {
         let view = match self.panel_view {
             PanelView::Tmux => tako_control::protocol::PanelViewWire::Tmux,

@@ -2523,8 +2523,9 @@ fn dispatch_inner(
                     host.set_limit_service(next);
                     Ok(status_json(next))
                 }
+                "refresh" => Ok(host.refresh_limits()),
                 other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / set のいずれか）"
+                    "不明な action: {other:?}（status / set / refresh のいずれか）"
                 ))),
             }
         }
@@ -8799,6 +8800,19 @@ mod tests {
             PaneOrigin::Cli,
         )
         .is_err());
+        // refresh はデフォルト実装で null 値を返す
+        let v = dispatch(
+            &mut host,
+            Request::LimitService {
+                action: Some("refresh".into()),
+                service: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!(v["claude"].is_object());
+        assert!(v["codex"].is_object());
+        assert_eq!(v["agy"]["status"], "unsupported");
     }
 
     // --- OpenDir / OpenRemote / SshHosts / RecentItems テスト (#20) ---
