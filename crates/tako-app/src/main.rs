@@ -805,9 +805,7 @@ struct TakoApp {
     hover_preview: Option<HoverPreview>,
     /// 子ワーカードロップダウンを開いている master ペイン（#217。「N workers ▾」）
     workers_menu_open: Option<PaneId>,
-    /// Attention トースト（#217。失敗の即時通知。右下に積む）
-    toasts: Vec<AttentionToast>,
-    /// トースト検知用: 前回スナップショットで Failed だったペイン（#217）
+    /// 失敗検知用: 前回スナップショットで Failed だったペイン
     known_failed: std::collections::HashSet<PaneId>,
     /// ⌘K コマンドパレット（#217。None = 閉じている）
     command_palette: Option<CommandPalette>,
@@ -1826,7 +1824,6 @@ impl TakoApp {
             bg_pending_kill: None,
             hover_preview: None,
             workers_menu_open: None,
-            toasts: Vec::new(),
             known_failed: std::collections::HashSet::new(),
             command_palette: None,
             pinned_previews: Vec::new(),
@@ -2425,8 +2422,7 @@ impl TakoApp {
                         let _s = tako_control::diag::perf_span("periodic_prep:sleep_guard");
                         app.sleep_guard_unknown_backends()
                     };
-                    // 失敗遷移の検知 → Attention トースト（#217）
-                    app.update_attention_toasts();
+                    app.detect_new_failures();
                     // ペインログ: 直接ペインはここで取り込み、バックエンドはジョブ化（Issue #112 B）
                     let log_jobs = {
                         let _s = tako_control::diag::perf_span("periodic_prep:pane_log");
@@ -5324,8 +5320,8 @@ impl TakoApp {
         }
     }
 
-    /// 失敗遷移を検知して Attention トーストを積む（#217 カンプ。periodic から呼ぶ）
-    fn update_attention_toasts(&mut self) {
+    /// 失敗遷移を検知してログに記録する（periodic から呼ぶ）
+    fn detect_new_failures(&mut self) {
         let current: std::collections::HashSet<PaneId> = self
             .terminals
             .iter()
@@ -5341,34 +5337,7 @@ impl TakoApp {
                     _ => None,
                 })
                 .unwrap_or(1);
-            // ペイン名とタブ情報
-            let mut name = "ターミナル".to_string();
-            let mut tab_title = String::new();
-            let mut pane_index = 0;
-            for tab in self.workspace.tabs() {
-                let panes = tab.tree().panes();
-                if let Some(pos) = panes.iter().position(|p| p.id() == *pane_id) {
-                    let p = &panes[pos];
-                    name = p
-                        .title()
-                        .or_else(|| p.role())
-                        .map(str::to_string)
-                        .unwrap_or(name);
-                    tab_title = tab.title().to_string();
-                    pane_index = pos + 1;
-                    break;
-                }
-            }
-            self.toasts.push(AttentionToast {
-                pane: *pane_id,
-                title: format!("{} が失敗", truncate(&name, 24)),
-                detail: format!("{tab_title} \u{203A} pane {pane_index} \u{00B7} exit {exit_code}"),
-                at: std::time::Instant::now(),
-            });
-            // 溜まりすぎ防止（最新 3 件のみ表示対象）
-            if self.toasts.len() > 3 {
-                self.toasts.remove(0);
-            }
+            eprintln!("pane {} failed (exit {})", pane_id.as_u64(), exit_code);
         }
         self.known_failed = current;
     }
@@ -9763,15 +9732,6 @@ impl TakoApp {
         }
     }
 
-    /// 失敗ペインの「再実行」（#217 カンプ）。シェルの履歴呼び出し（上矢印）+
-    /// Enter を送り、直前コマンドを再実行する
-    fn retry_last_command(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
-        if let Some(session) = self.terminals.get(&pane_id) {
-            session.write(b"\x1b[A\r".to_vec());
-        }
-        cx.notify();
-    }
-
     /// 子ワーカードロップダウン（#217 カンプ: w282 / radius 9 / ヘッダ + 行）。
     /// master ペインの「N workers ▾」から開く。行クリックでジャンプ
     fn render_workers_menu(
@@ -10494,46 +10454,6 @@ impl TakoApp {
                             .flex_row()
                             .items_center()
                             .gap(px(4.0))
-                            // failed: 再実行ボタン
-                            .when(is_failed && !hv.more_menu, |d| {
-                                d.child(
-                                    div()
-                                        .id(("pane-retry", pane_id.as_u64()))
-                                        .flex()
-                                        .flex_none()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(4.0))
-                                        .px(px(9.0))
-                                        .py(px(3.0))
-                                        .rounded(px(6.0))
-                                        .border_1()
-                                        .border_color(hsla_alpha(theme.red, 0.35))
-                                        .text_size(px(10.5))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(hsla(theme.red))
-                                        .cursor_pointer()
-                                        .hover(|d| d.bg(rgba_alpha(theme.red, 0.10)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                                                cx.stop_propagation()
-                                            }),
-                                        )
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.retry_last_command(pane_id, cx);
-                                        }))
-                                        .child(
-                                            svg()
-                                                .path(crate::file_icons::ui_icon::RETRY)
-                                                .w(px(11.0))
-                                                .h(px(11.0))
-                                                .text_color(hsla(theme.red)),
-                                        )
-                                        .child("再実行"),
-                                )
-                            })
                             // split ボタン（カンプ: 13px SVG）
                             .when(hv.split_button, |d| {
                                 d.child(
@@ -12636,14 +12556,6 @@ struct WorkerRow {
     state: tako_core::CommandState,
 }
 
-/// Attention トースト 1 件（#217 カンプ。失敗即知の右下通知）
-struct AttentionToast {
-    pane: PaneId,
-    title: String,
-    detail: String,
-    at: std::time::Instant,
-}
-
 /// ⌘K コマンドパレットの状態（#217 カンプ。ペイン・コマンド検索）
 #[derive(Default)]
 struct CommandPalette {
@@ -13217,7 +13129,6 @@ impl Render for TakoApp {
             .children(pinned_overlays)
             .children(self.render_limit_service_overlay(cx))
             .children(self.render_close_confirm_dialog(cx))
-            .children(self.render_attention_toasts(cx))
             .children(self.render_command_palette(cx))
     }
 }
