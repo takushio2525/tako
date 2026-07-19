@@ -154,6 +154,7 @@ impl TakoApp {
         }
         let inline_edit_snapshot = self.inline_edit.clone();
         let sidebar_w = self.sidebar_width;
+        let drop_highlight = self.sidebar_drop_highlight;
         Some(
             div()
                 .w(px(sidebar_w))
@@ -161,15 +162,30 @@ impl TakoApp {
                 .relative()
                 .flex()
                 .flex_col()
-                .bg(rgba(theme.mantle))
+                .bg(if drop_highlight {
+                    rgba_alpha(theme.accent, 0.06)
+                } else {
+                    rgba(theme.mantle)
+                })
                 .border_r_1()
-                .border_color(hsla(theme.border_subtle))
+                .border_color(if drop_highlight {
+                    hsla(theme.accent)
+                } else {
+                    hsla(theme.border_subtle)
+                })
                 .text_size(px(12.0))
                 .text_color(hsla(theme.foreground))
                 .overflow_hidden()
-                // Issue #21: 外部ファイルをサイドバーにドロップ → プレビューで開く
+                // Issue #219: 外部ファイルドラッグ中のハイライト + ドロップ処理
+                .on_drag_move::<ExternalPaths>(cx.listener(|this, _, _, cx| {
+                    if !this.sidebar_drop_highlight {
+                        this.sidebar_drop_highlight = true;
+                        cx.notify();
+                    }
+                }))
                 .on_drop::<ExternalPaths>(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                    this.open_dropped_files(paths.paths(), cx);
+                    this.sidebar_drop_highlight = false;
+                    this.drop_files_to_sidebar(paths.paths(), cx);
                 }))
                 // プロジェクトヘッダ（カンプ: 名前 + ブランチチップ + フルパスボックス）
                 .child(

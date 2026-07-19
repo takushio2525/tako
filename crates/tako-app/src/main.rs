@@ -798,6 +798,8 @@ struct TakoApp {
     tab_reorder_indicator: Option<Option<TabId>>,
     /// タブ D&D 並べ替え中のドラッグ元タブ（#371: ソースタブの半透明化に使用）
     dragging_tab: Option<TabId>,
+    /// サイドバーへの外部ファイルドラッグ中のハイライト（#219）
+    sidebar_drop_highlight: bool,
     /// git パネルのデータ（FR-3.6。cwd 連動で 2 秒ポーリング更新）
     git_data: Option<GitPanelData>,
     /// サイドバー用の軽量 git サマリ（#217。ブランチチップ + 変更フッター）
@@ -1835,6 +1837,7 @@ impl TakoApp {
             tab_drop_target: None,
             tab_reorder_indicator: None,
             dragging_tab: None,
+            sidebar_drop_highlight: false,
             git_data: None,
             sidebar_git: None,
             git_selected_commit: None,
@@ -6894,6 +6897,11 @@ impl TakoApp {
                 if self.tab_reorder_indicator.take().is_some() {
                     changed = true;
                 }
+                // サイドバーハイライトをリセット（#219）
+                if self.sidebar_drop_highlight {
+                    self.sidebar_drop_highlight = false;
+                    changed = true;
+                }
                 if changed {
                     cx.notify();
                 }
@@ -7180,6 +7188,45 @@ impl TakoApp {
         }
         self.drain_pending_highlights(cx);
         cx.notify();
+    }
+
+    /// Finder からサイドバー（ファイルツリー）への外部ファイルドロップ（Issue #219）:
+    /// ディレクトリ → pinned_folders に追加、ファイル → プレビュー表示 + 親ディレクトリを追加
+    fn drop_files_to_sidebar(&mut self, paths: &[std::path::PathBuf], cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        let tab_id = self.workspace.active_tab().id();
+        let mut added_folder = false;
+        let mut files_to_open: Vec<std::path::PathBuf> = Vec::new();
+        for path in paths {
+            if path.is_dir() {
+                if let Some(tab) = self.workspace.get_tab_mut(tab_id) {
+                    if tab.add_pinned_folder(path.clone()) {
+                        added_folder = true;
+                    }
+                }
+            } else {
+                files_to_open.push(path.clone());
+                if let Some(parent) = path.parent() {
+                    if parent.is_dir() {
+                        if let Some(tab) = self.workspace.get_tab_mut(tab_id) {
+                            if tab.add_pinned_folder(parent.to_path_buf()) {
+                                added_folder = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if added_folder {
+            self.sync_filetree_roots();
+        }
+        if !files_to_open.is_empty() {
+            self.open_dropped_files(&files_to_open, cx);
+        } else {
+            cx.notify();
+        }
     }
 
     /// ペイン 1 枚分のドロップ先オーバーレイ（D&D 中のみ生成）。
@@ -7946,6 +7993,7 @@ impl TakoApp {
             | self.tab_drop_target.take().is_some()
             | self.tab_reorder_indicator.take().is_some()
             | self.dragging_tab.take().is_some()
+            | std::mem::take(&mut self.sidebar_drop_highlight)
         {
             cx.notify();
             return;
