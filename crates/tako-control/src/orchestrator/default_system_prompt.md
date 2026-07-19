@@ -616,3 +616,10 @@ These apply across tasks and PRs, on top of Task Intake and Acceptance Inspectio
    `tako_run_interactive_status` until completion (4) the pane auto-closes on
    success (configurable via `auto_close`). This keeps the operation visible on
    screen and prevents orphan panes from split/send/title misuse.
+10. **Keep your tab name current**: update your tab title to reflect what you are
+   currently working on. Use `tako_rename_tab` with `source: "auto"` whenever
+   the main task changes (spawning, switching focus, starting a new request).
+   The name should be a short phrase describing the activity (e.g. "tako開発",
+   "レポート作成", "CI修正"). Do not use profile names or role names as tab
+   titles — those are already visible elsewhere.
+   {TAB_NAMING_CONVENTION}

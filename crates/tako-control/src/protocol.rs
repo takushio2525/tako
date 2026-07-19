@@ -239,11 +239,14 @@ pub enum Request {
     /// kill する（使用中・ユーザーセッションには触れない）。kill した名前を返す
     TmuxCleanup { socket: Option<String> },
     /// タブのリネーム（FR-2.12.1）。`tab` 省略時は `pane`（呼び出し元）の属するタブ。
-    /// 明示リネームとして自動リネーム（FR-2.12）より優先され、空文字で手動指定を解除する
+    /// `source` = "auto" なら `set_title_auto`（手動リネーム済みタブは上書きしない）。
+    /// "manual"（既定）なら `set_title_manual`（自動リネームをブロック）。
+    /// 空文字タイトルで手動指定を解除する
     TabRename {
         pane: Option<u64>,
         tab: Option<u64>,
         title: String,
+        source: Option<String>,
     },
     /// タブ作成（FR-2.5.10）
     TabNew {
@@ -532,6 +535,9 @@ pub enum Request {
         /// worker_model_policy（inherit / delegate / fixed）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worker_model_policy: Option<String>,
+        /// タブ名の命名規則（空文字でクリア）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab_naming_convention: Option<String>,
     },
     /// オーケストレーター: worker spawn のレイアウト設定の取得・変更（Issue #165）。
     /// 全パラメータ省略で現在値の取得、いずれか指定でその項目を更新して結果を返す。

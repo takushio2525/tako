@@ -1346,6 +1346,9 @@ enum ProfilesCommand {
         /// worker のモデル選択ポリシー（inherit / delegate / fixed）
         #[arg(long)]
         worker_model_policy: Option<String>,
+        /// タブ名の命名規則（master プロンプトに注入。空文字でクリア）
+        #[arg(long)]
+        tab_naming_convention: Option<String>,
     },
 }
 
@@ -1750,6 +1753,9 @@ enum TabCommand {
         /// 対象タブ ID（省略時は呼び出し元ペインの属するタブ）
         #[arg(long)]
         tab: Option<u64>,
+        /// manual（既定）= 手動リネーム。auto = 作業内容ベースの自動命名（手動リネーム済みタブは上書きしない）
+        #[arg(long)]
+        source: Option<String>,
         /// 新しいタイトル（複数引数はスペース連結。空文字で手動指定を解除）
         title: Vec<String>,
     },
@@ -2221,6 +2227,7 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
             tab: None,
             pane: Some(cp),
             title: tab_title.clone(),
+            source: None,
         })
         .ok();
         cp
@@ -2350,6 +2357,7 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
             tab: None,
             pane: Some(cp),
             title: tab_title.clone(),
+            source: None,
         })
         .ok();
         cp
@@ -2622,6 +2630,7 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             agent_skip_permissions,
             agent_args,
             worker_model_policy,
+            tab_naming_convention,
         } => ProfilesParams {
             action: "set".into(),
             name: Some(name.clone()),
@@ -2643,6 +2652,7 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             agent_skip_permissions: *agent_skip_permissions,
             agent_args: agent_args.clone(),
             worker_model_policy: worker_model_policy.clone(),
+            tab_naming_convention: tab_naming_convention.clone(),
         },
     };
     let result = dispatch_orchestrator_profiles(params).map_err(|e| e.to_string())?;
@@ -3380,8 +3390,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             title: title.clone(),
             focus: if *focus { Some(true) } else { None },
         },
-        Command::Tab(TabCommand::Rename { tab, title }) => Request::TabRename {
-            // --tab 指定があればそれを、無ければ呼び出し元ペインからタブを解決する
+        Command::Tab(TabCommand::Rename { tab, source, title }) => Request::TabRename {
             pane: if tab.is_none() {
                 target_pane(None)?
             } else {
@@ -3389,6 +3398,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             },
             tab: *tab,
             title: title.join(" "),
+            source: source.clone(),
         },
         Command::Tab(TabCommand::Select { tab }) => Request::TabSelect { tab: *tab },
         Command::Window(WindowCommand::List) => Request::WindowList,
@@ -5234,6 +5244,26 @@ mod tests {
                 pane: None,
                 tab: Some(3),
                 title: "実験 用".into(),
+                source: None,
+            }
+        );
+        let command2 = parse(&[
+            "tako",
+            "tab",
+            "rename",
+            "--tab",
+            "5",
+            "--source",
+            "auto",
+            "開発中",
+        ]);
+        assert_eq!(
+            build_request(&command2).unwrap(),
+            Request::TabRename {
+                pane: None,
+                tab: Some(5),
+                title: "開発中".into(),
+                source: Some("auto".into()),
             }
         );
     }

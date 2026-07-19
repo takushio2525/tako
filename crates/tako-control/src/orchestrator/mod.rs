@@ -324,6 +324,10 @@ pub struct Profile {
     pub prompt_blocks: Option<PromptBlocks>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projects: Option<Vec<String>>,
+
+    /// タブ名の命名規則（master プロンプトに注入。未設定時はデフォルト規則を使用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_naming_convention: Option<String>,
 }
 
 /// master / claude worker の既定 effort
@@ -348,6 +352,7 @@ impl Default for Profile {
             system_prompt: None,
             prompt_blocks: None,
             projects: None,
+            tab_naming_convention: None,
         }
     }
 }
@@ -628,6 +633,11 @@ impl Profile {
             result.push('\n');
         }
 
+        let naming_convention = self.tab_naming_convention.as_deref().unwrap_or(
+            "Naming rule: describe the current activity concisely in the user's language.",
+        );
+        let result = result.replace("{TAB_NAMING_CONVENTION}", naming_convention);
+
         result.trim_end().to_string()
     }
 
@@ -882,6 +892,11 @@ impl Profile {
             result.push_str(&resolve_text_or_file(text));
             result.push('\n');
         }
+
+        let naming_convention = self.tab_naming_convention.as_deref().unwrap_or(
+            "Naming rule: describe the current activity concisely in the user's language.",
+        );
+        let result = result.replace("{TAB_NAMING_CONVENTION}", naming_convention);
 
         result.trim_end().to_string()
     }
@@ -2561,6 +2576,30 @@ worker_agents:
         assert!(prompt.contains("claude-sonnet-5"));
         assert!(prompt.contains("medium"));
         assert!(prompt.contains("`fast`"));
+    }
+
+    #[test]
+    fn tab_naming_convention_is_injected_into_prompt() {
+        let p = Profile {
+            tab_naming_convention: Some("3文字の日本語動詞で命名する".into()),
+            ..Default::default()
+        };
+        let master = p.build_system_prompt("default");
+        assert!(master.contains("3文字の日本語動詞で命名する"));
+        assert!(master.contains("Keep your tab name current"));
+        assert!(!master.contains("{TAB_NAMING_CONVENTION}"));
+
+        let solo = p.build_solo_system_prompt("default");
+        assert!(solo.contains("3文字の日本語動詞で命名する"));
+        assert!(!solo.contains("{TAB_NAMING_CONVENTION}"));
+    }
+
+    #[test]
+    fn tab_naming_convention_default_when_unset() {
+        let p = Profile::default();
+        let master = p.build_system_prompt("default");
+        assert!(master.contains("Naming rule: describe the current activity"));
+        assert!(!master.contains("{TAB_NAMING_CONVENTION}"));
     }
 
     #[test]
