@@ -730,39 +730,41 @@ impl TakoApp {
                 .border_color(hsla(theme.border_subtle))
         };
         match &self.update_state {
-            super::update_checker::UpdateState::Available(info) => {
-                let ver = info.version.clone();
-                let method = super::update_checker::detect_install_method();
-                let method_label = match method {
-                    super::update_checker::InstallMethod::Homebrew => "brew",
-                    super::update_checker::InstallMethod::Zip => "zip",
-                    super::update_checker::InstallMethod::BrokenBrew => "zip (brew 破損)",
+            super::update_checker::UpdateState::Available(updates) => {
+                let count = updates.stable.as_ref().map_or(0, |_| 1)
+                    + updates.test.as_ref().map_or(0, |_| 1);
+                let summary = if count == 2 {
+                    "更新あり（安定版 + テスト版）".to_string()
+                } else if let Some(ref s) = updates.stable {
+                    format!("v{} (安定版) が利用可能", s.version)
+                } else if let Some(ref t) = updates.test {
+                    format!("v{} (test) が利用可能", t.version)
+                } else {
+                    return None;
                 };
                 Some(
                     pill()
                         .id("update-banner")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.update_dropdown_open = !this.update_dropdown_open;
+                            cx.notify();
+                        }))
                         .child(
                             div()
                                 .text_size(px(10.5))
                                 .text_color(hsla(theme.accent))
-                                .child(SharedString::from(format!(
-                                    "v{ver} が利用可能（{method_label}）"
-                                ))),
+                                .child(SharedString::from(summary)),
                         )
                         .child(
                             div()
-                                .id("update-btn")
-                                .cursor_pointer()
-                                .px_1()
-                                .rounded(px(3.0))
-                                .bg(hsla(theme.accent))
-                                .text_size(px(10.0))
-                                .text_color(hsla(theme.background))
-                                .hover(|d| d.opacity(0.8))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.show_update_confirm(cx);
-                                }))
-                                .child("更新"),
+                                .text_size(px(8.0))
+                                .text_color(hsla(theme.text_tertiary))
+                                .child(if self.update_dropdown_open {
+                                    "▲"
+                                } else {
+                                    "▼"
+                                }),
                         )
                         .child(
                             div()
@@ -774,6 +776,7 @@ impl TakoApp {
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.update_state =
                                         super::update_checker::UpdateState::Dismissed;
+                                    this.update_dropdown_open = false;
                                     cx.notify();
                                 }))
                                 .child("×"),
@@ -781,8 +784,56 @@ impl TakoApp {
                         .into_any_element(),
                 )
             }
+            super::update_checker::UpdateState::TestWarning(info) => {
+                let ver = info.version.clone();
+                Some(
+                    pill()
+                        .id("update-test-warning")
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(hsla(theme.yellow))
+                                .child(SharedString::from(format!(
+                                "v{ver} はテスト版です（不安定な可能性があります）。更新しますか？"
+                            ))),
+                        )
+                        .child(
+                            div()
+                                .id("update-test-yes")
+                                .cursor_pointer()
+                                .px_1()
+                                .rounded(px(3.0))
+                                .bg(hsla(theme.yellow))
+                                .text_size(px(10.0))
+                                .text_color(hsla(theme.background))
+                                .hover(|d| d.opacity(0.8))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.confirm_test_update(cx);
+                                }))
+                                .child("続行"),
+                        )
+                        .child(
+                            div()
+                                .id("update-test-no")
+                                .cursor_pointer()
+                                .px_1()
+                                .rounded(px(3.0))
+                                .text_size(px(10.0))
+                                .text_color(hsla(theme.text_secondary))
+                                .hover(|d| d.text_color(hsla(theme.text_secondary)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.update_state =
+                                        super::update_checker::UpdateState::Dismissed;
+                                    cx.notify();
+                                }))
+                                .child("キャンセル"),
+                        )
+                        .into_any_element(),
+                )
+            }
             super::update_checker::UpdateState::ConfirmPending(info) => {
                 let ver = info.version.clone();
+                let ch_label = info.channel.display_label();
                 let method = super::update_checker::detect_install_method();
                 let method_label = match method {
                     super::update_checker::InstallMethod::Homebrew => "Homebrew",
@@ -797,7 +848,7 @@ impl TakoApp {
                                 .text_size(px(10.5))
                                 .text_color(hsla(theme.yellow))
                                 .child(SharedString::from(format!(
-                                    "v{ver} に更新して再起動しますか？（{method_label}。実行中のプロセスは失われます）"
+                                    "v{ver} ({ch_label}) に更新して再起動しますか？（{method_label}。実行中のプロセスは失われます）"
                                 ))),
                         )
                         .child(
@@ -962,9 +1013,23 @@ impl TakoApp {
         }
     }
 
-    fn show_update_confirm(&mut self, cx: &mut Context<Self>) {
+    fn show_update_confirm_for_channel(
+        &mut self,
+        info: super::update_checker::UpdateInfo,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_dropdown_open = false;
+        if info.channel == super::update_checker::Channel::Test {
+            self.update_state = super::update_checker::UpdateState::TestWarning(info);
+        } else {
+            self.update_state = super::update_checker::UpdateState::ConfirmPending(info);
+        }
+        cx.notify();
+    }
+
+    fn confirm_test_update(&mut self, cx: &mut Context<Self>) {
         let info = match &self.update_state {
-            super::update_checker::UpdateState::Available(info) => info.clone(),
+            super::update_checker::UpdateState::TestWarning(info) => info.clone(),
             _ => return,
         };
         self.update_state = super::update_checker::UpdateState::ConfirmPending(info);
@@ -1061,6 +1126,219 @@ impl TakoApp {
             });
         })
         .detach();
+    }
+
+    pub(crate) fn render_update_dropdown_overlay(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !self.update_dropdown_open {
+            return None;
+        }
+        let updates = match &self.update_state {
+            super::update_checker::UpdateState::Available(u) => u.clone(),
+            _ => return None,
+        };
+        let theme = self.theme.clone();
+        let method = super::update_checker::detect_install_method();
+        let method_label = match method {
+            super::update_checker::InstallMethod::Homebrew => "brew",
+            super::update_checker::InstallMethod::Zip => "zip",
+            super::update_checker::InstallMethod::BrokenBrew => "zip (brew 破損)",
+        };
+
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+
+        // ヘッダー
+        rows.push(
+            div()
+                .text_size(px(10.0))
+                .text_color(hsla(theme.text_tertiary))
+                .pb(px(4.0))
+                .mb(px(4.0))
+                .border_b_1()
+                .border_color(hsla(theme.border_subtle))
+                .child(SharedString::from(format!(
+                    "現在: v{} ({}) / {}",
+                    super::update_checker::CURRENT_VERSION,
+                    if super::update_checker::CURRENT_VERSION.contains("-test.") {
+                        "test"
+                    } else {
+                        "stable"
+                    },
+                    method_label,
+                )))
+                .into_any_element(),
+        );
+
+        // 安定版行
+        if let Some(ref info) = updates.stable {
+            let ver = info.version.clone();
+            let info_clone = info.clone();
+            rows.push(
+                div()
+                    .id("update-dd-stable")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .py(px(3.0))
+                    .child(
+                        div()
+                            .px(px(4.0))
+                            .py(px(1.0))
+                            .rounded(px(3.0))
+                            .bg(hsla(theme.green))
+                            .text_size(px(9.0))
+                            .text_color(hsla(theme.background))
+                            .child("stable"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(10.5))
+                            .text_color(hsla(theme.foreground))
+                            .child(SharedString::from(format!("v{ver}"))),
+                    )
+                    .child(
+                        div()
+                            .id("update-dd-stable-btn")
+                            .cursor_pointer()
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .rounded(px(3.0))
+                            .bg(hsla(theme.accent))
+                            .text_size(px(9.5))
+                            .text_color(hsla(theme.background))
+                            .hover(|d| d.opacity(0.8))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.show_update_confirm_for_channel(info_clone.clone(), cx);
+                            }))
+                            .child("更新"),
+                    )
+                    .into_any_element(),
+            );
+        } else {
+            rows.push(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .py(px(3.0))
+                    .child(
+                        div()
+                            .px(px(4.0))
+                            .py(px(1.0))
+                            .rounded(px(3.0))
+                            .bg(hsla(theme.green))
+                            .text_size(px(9.0))
+                            .text_color(hsla(theme.background))
+                            .child("stable"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(10.5))
+                            .text_color(hsla(theme.text_tertiary))
+                            .child("最新版です"),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        // テスト版行
+        if let Some(ref info) = updates.test {
+            let ver = info.version.clone();
+            let info_clone = info.clone();
+            rows.push(
+                div()
+                    .id("update-dd-test")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .py(px(3.0))
+                    .child(
+                        div()
+                            .px(px(4.0))
+                            .py(px(1.0))
+                            .rounded(px(3.0))
+                            .bg(hsla(theme.yellow))
+                            .text_size(px(9.0))
+                            .text_color(hsla(theme.background))
+                            .child("test"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(10.5))
+                            .text_color(hsla(theme.foreground))
+                            .child(SharedString::from(format!("v{ver}"))),
+                    )
+                    .child(
+                        div()
+                            .id("update-dd-test-btn")
+                            .cursor_pointer()
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .rounded(px(3.0))
+                            .bg(hsla(theme.yellow))
+                            .text_size(px(9.5))
+                            .text_color(hsla(theme.background))
+                            .hover(|d| d.opacity(0.8))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.show_update_confirm_for_channel(info_clone.clone(), cx);
+                            }))
+                            .child("更新"),
+                    )
+                    .into_any_element(),
+            );
+        } else {
+            rows.push(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .py(px(3.0))
+                    .child(
+                        div()
+                            .px(px(4.0))
+                            .py(px(1.0))
+                            .rounded(px(3.0))
+                            .bg(hsla(theme.yellow))
+                            .text_size(px(9.0))
+                            .text_color(hsla(theme.background))
+                            .child("test"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(10.5))
+                            .text_color(hsla(theme.text_tertiary))
+                            .child("テスト版なし"),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        Some(
+            div()
+                .id("update-dropdown-overlay")
+                .absolute()
+                .bottom(px(24.0))
+                .left(px(200.0))
+                .w(px(300.0))
+                .bg(hsla(theme.surface_0))
+                .border_1()
+                .border_color(hsla(theme.border_subtle))
+                .rounded(px(6.0))
+                .shadow_lg()
+                .p(px(8.0))
+                .children(rows)
+                .into_any_element(),
+        )
     }
 
     pub(crate) fn toggle_filetree(&mut self) {

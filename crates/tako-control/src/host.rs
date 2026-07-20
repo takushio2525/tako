@@ -483,22 +483,23 @@ pub trait SystemHost {
     fn update_status(&self) -> Value {
         serde_json::json!({
             "current_version": "unknown",
+            "current_channel": "stable",
             "install_method": "zip",
             "duplicate_cli": [],
         })
     }
-    /// 更新チェック（Issue #36）。最新版の有無を JSON で返す（ブロッキング不可のため
-    /// 同期呼び出しは非推奨。CLI / MCP はこの既定実装を使う）
-    fn update_check(&self) -> Value {
+    /// 更新チェック（#403）。channel で指定したチャンネルの最新版の有無を返す。
+    /// None なら全チャンネル同時チェック
+    fn update_check(&self, _channel: Option<&str>) -> Value {
         serde_json::json!({ "available": false })
     }
-    /// 更新の実行（Issue #36）。配布系統に応じて brew upgrade or zip 差し替えを行う。
+    /// 更新の実行（#403）。channel で対象チャンネルを指定（既定 stable）。
     /// UI 層は更新完了後に自動再起動する（dispatch は再起動しない）
-    fn update_apply(&mut self) -> Result<Value, String> {
+    fn update_apply(&mut self, _channel: Option<&str>) -> Result<Value, String> {
         Err("この環境では更新を実行できない".into())
     }
     /// zip 強制更新（#50）。brew 失敗時のフォールバック。配布系統を問わず zip で更新する
-    fn update_apply_zip(&mut self) -> Result<Value, String> {
+    fn update_apply_zip(&mut self, _channel: Option<&str>) -> Result<Value, String> {
         Err("この環境では更新を実行できない".into())
     }
     /// broken-brew の修復（#50）。`brew install --cask --force` で台帳を再締結する

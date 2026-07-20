@@ -6,6 +6,8 @@
 #   scripts/release.sh --publish    # zip 生成 + GitHub Release 作成・アップロード
 #   scripts/release.sh --draft      # zip 生成 + ドラフトリリース作成
 #   scripts/release.sh --skip-build # ビルド済み dist/tako.app を使って zip のみ再生成
+#   scripts/release.sh --test       # テスト版（prerelease）としてリリース（#403）
+#   scripts/release.sh --promote <test-tag>  # テスト版を安定版に昇格（#403）
 #
 # 前提:
 #   - macOS（build-app.sh と同じ）
@@ -29,14 +31,125 @@ ZIP_PATH="$DIST/$ZIP_NAME"
 PUBLISH=0
 DRAFT=0
 SKIP_BUILD=0
-for arg in "$@"; do
-  case "$arg" in
-    --publish)    PUBLISH=1 ;;
-    --draft)      DRAFT=1 ;;
-    --skip-build) SKIP_BUILD=1 ;;
-    *) echo "不明な引数: $arg（--publish / --draft / --skip-build のみ対応）" >&2; exit 2 ;;
+TEST_RELEASE=0
+PROMOTE_TAG=""
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --publish)    PUBLISH=1; shift ;;
+    --draft)      DRAFT=1; shift ;;
+    --skip-build) SKIP_BUILD=1; shift ;;
+    --test)       TEST_RELEASE=1; PUBLISH=1; shift ;;
+    --promote)
+      shift
+      if [[ $# -eq 0 ]]; then
+        echo "エラー: --promote にはテスト版タグを指定してください（例: --promote v0.6.0-test.1）" >&2
+        exit 2
+      fi
+      PROMOTE_TAG="$1"; shift ;;
+    *) echo "不明な引数: $1（--publish / --draft / --skip-build / --test / --promote <tag>）" >&2; exit 2 ;;
   esac
 done
+
+# --- 昇格（--promote）処理: テスト版と同一コミットに安定版リリースを作成 ---
+if [[ -n "$PROMOTE_TAG" ]]; then
+  if ! command -v gh >/dev/null; then
+    echo "エラー: gh CLI が必要（brew install gh）" >&2
+    exit 1
+  fi
+  echo "==> テスト版 $PROMOTE_TAG を安定版に昇格"
+
+  # テスト版リリースの存在確認
+  if ! gh release view "$PROMOTE_TAG" >/dev/null 2>&1; then
+    echo "エラー: テスト版リリース $PROMOTE_TAG が見つからない" >&2
+    exit 1
+  fi
+
+  # テスト版タグのコミットを取得
+  PROMOTE_COMMIT=$(git rev-list -n1 "$PROMOTE_TAG" 2>/dev/null || true)
+  if [[ -z "$PROMOTE_COMMIT" ]]; then
+    echo "エラー: タグ $PROMOTE_TAG のコミットが見つからない（git fetch --tags してください）" >&2
+    exit 1
+  fi
+
+  # 安定版タグを生成（v0.6.0-test.1 → v0.6.0）
+  STABLE_TAG=$(echo "$PROMOTE_TAG" | sed 's/-test\.[0-9]*$//')
+  STABLE_VERSION="${STABLE_TAG#v}"
+  if [[ "$STABLE_TAG" == "$PROMOTE_TAG" ]]; then
+    echo "エラー: $PROMOTE_TAG はテスト版タグ（-test.N サフィックス）ではない" >&2
+    exit 1
+  fi
+
+  echo "  テスト版: $PROMOTE_TAG (commit: ${PROMOTE_COMMIT:0:7})"
+  echo "  安定版:   $STABLE_TAG"
+
+  # テスト版のアセットをダウンロードして安定版に添付
+  PROMOTE_TMPDIR=$(mktemp -d)
+  trap 'rm -rf "$PROMOTE_TMPDIR"' EXIT
+  echo "  アセットをダウンロード..."
+  gh release download "$PROMOTE_TAG" --dir "$PROMOTE_TMPDIR" 2>/dev/null || true
+
+  # 安定版のリリースノート
+  CHANGELOG_BODY=$(extract_changelog "$STABLE_VERSION")
+  PROMOTE_NOTES="## tako $STABLE_TAG
+
+Promoted from test release $PROMOTE_TAG.
+テスト版 $PROMOTE_TAG からの昇格リリース。
+"
+  if [[ -n "$CHANGELOG_BODY" ]]; then
+    PROMOTE_NOTES+="
+${CHANGELOG_BODY}
+---
+"
+  fi
+  PROMOTE_NOTES+="
+### インストール（macOS） / Install (macOS)
+
+1. **tako-${STABLE_TAG}-macos-*.zip** をダウンロード / Download the zip
+2. zip を展開 / Extract
+3. \`tako.app\` を \`/Applications\` へ / Drag to \`/Applications\`
+"
+
+  # 安定版タグを同コミットに作成
+  if git rev-parse "$STABLE_TAG" >/dev/null 2>&1; then
+    echo "  安定版タグ $STABLE_TAG は既に存在。スキップ"
+  else
+    git tag -a "$STABLE_TAG" "$PROMOTE_COMMIT" -m "tako $STABLE_TAG — promoted from $PROMOTE_TAG"
+    git push origin "$STABLE_TAG"
+    echo "  安定版タグ $STABLE_TAG を作成・push"
+  fi
+
+  # アセットをリネーム（-test.N を除去）してリリース作成
+  ASSETS=()
+  for f in "$PROMOTE_TMPDIR"/*; do
+    [[ -f "$f" ]] || continue
+    BASENAME=$(basename "$f")
+    # tako-v0.6.0-test.1-macos-arm64.zip → tako-v0.6.0-macos-arm64.zip
+    NEWNAME=$(echo "$BASENAME" | sed "s/${PROMOTE_TAG#v}/$STABLE_VERSION/g")
+    if [[ "$NEWNAME" != "$BASENAME" ]]; then
+      mv "$f" "$PROMOTE_TMPDIR/$NEWNAME"
+    fi
+    ASSETS+=("$PROMOTE_TMPDIR/$NEWNAME")
+  done
+
+  if gh release view "$STABLE_TAG" >/dev/null 2>&1; then
+    echo "  安定版 Release $STABLE_TAG は既に存在。アセットのみアップロード"
+    for a in "${ASSETS[@]}"; do
+      gh release upload "$STABLE_TAG" "$a" --clobber
+    done
+  else
+    gh release create "$STABLE_TAG" \
+      --title "tako $STABLE_TAG" \
+      --notes "$PROMOTE_NOTES" \
+      --generate-notes \
+      "${ASSETS[@]}"
+    echo "  安定版 Release $STABLE_TAG を作成"
+  fi
+
+  # テスト版リリースの prerelease フラグ維持（昇格しても消さない。履歴として残す）
+  echo "==> 昇格完了: $PROMOTE_TAG → $STABLE_TAG"
+  exit 0
+fi
 
 if [[ "$(uname)" != "Darwin" ]]; then
   echo "エラー: macOS 専用" >&2
@@ -114,6 +227,12 @@ if [[ $PUBLISH -eq 1 ]] || [[ $DRAFT -eq 1 ]]; then
     DRAFT_FLAG="--draft"
   fi
 
+  PRERELEASE_FLAG=""
+  if [[ $TEST_RELEASE -eq 1 ]]; then
+    PRERELEASE_FLAG="--prerelease"
+    echo "  [テスト版] prerelease フラグ付きでリリース"
+  fi
+
   # CHANGELOG からリリースノートを組み立て
   CHANGELOG_BODY=$(extract_changelog "$VERSION")
 
@@ -169,6 +288,7 @@ claude mcp add --scope user tako -- /Applications/tako.app/Contents/MacOS/tako m
           --notes "$RELEASE_NOTES" \
           --generate-notes \
           $DRAFT_FLAG \
+          $PRERELEASE_FLAG \
           "$ZIP_PATH" 2>"$GH_STDERR_FILE" || GH_EXIT=$?
 
       if [[ $GH_EXIT -eq 0 ]]; then

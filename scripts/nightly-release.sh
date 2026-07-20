@@ -296,11 +296,12 @@ $LATEST_TAG 以降の変更:
 $(git log --format='- %s' "$LATEST_TAG..HEAD~1")"
 git push origin "$NEW_TAG" --quiet
 
-if ! "$REPO_ROOT/scripts/release.sh" --skip-build --publish >> "$LOG_FILE" 2>&1; then
-  log "ERROR: GitHub Release 作成に失敗（tag $NEW_TAG は push 済み）。手動リカバリ: scripts/release.sh --skip-build --publish"
+# 夜間リリースはテスト版（prerelease）として配布する（#403）
+if ! "$REPO_ROOT/scripts/release.sh" --skip-build --test >> "$LOG_FILE" 2>&1; then
+  log "ERROR: GitHub Release 作成に失敗（tag $NEW_TAG は push 済み）。手動リカバリ: scripts/release.sh --skip-build --test"
   notify "失敗: Release 作成（tag は push 済み、要手動リカバリ）"
   exit 1
 fi
 
-log "完了: ${NEW_TAG}（$COMMITS 件、https://github.com/takushio2525/tako/releases/tag/${NEW_TAG}）"
-notify "リリース完了: ${NEW_TAG}（$COMMITS 件の変更）"
+log "完了: ${NEW_TAG}（テスト版、$COMMITS 件、https://github.com/takushio2525/tako/releases/tag/${NEW_TAG}）"
+notify "テスト版リリース完了: ${NEW_TAG}（$COMMITS 件の変更）"

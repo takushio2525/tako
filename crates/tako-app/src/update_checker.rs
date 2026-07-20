@@ -1,8 +1,11 @@
 //! アプリ内自動更新チェッカー
 //!
-//! GitHub Web リダイレクト（API レート制限の対象外）で最新リリースを検知し、
-//! ステータスバーに通知。配布系統（Homebrew / zip 手動配置）を自動判別し、
-//! 系統内で更新を実行する。更新完了後は自動再起動する（#30 のタブ永続化で構成は復元される）。
+//! GitHub Releases から安定版（stable）とテスト版（test = prerelease）の 2 チャンネルを
+//! チェックし、ステータスバーにドロップダウンで通知する。配布系統（Homebrew / zip）を
+//! 自動判別し、系統内で更新を実行する。更新完了後は自動再起動する。
+//!
+//! チャンネル制（#403）: GitHub Releases の prerelease フラグで stable / test を判別。
+//! タグ例: stable = `v0.6.0`、test = `v0.6.0-test.1`。
 //!
 //! broken-brew 検知（#50）: brew upgrade 失敗等で「.app 実体あり・cask 台帳なし」の
 //! 詰み状態を検知し、修復（`brew install --cask --force`）または zip フォールバックを提供。
@@ -24,13 +27,68 @@ const OWNER_REPO: &str = "takushio2525/tako";
 /// Web 側の latest リリース URL（API レート制限の対象外。302 で /releases/tag/vX.Y.Z へ飛ぶ）
 const LATEST_WEB_URL: &str = "https://github.com/takushio2525/tako/releases/latest";
 
+/// GitHub API で直近リリースを取得する URL
+const RELEASES_API_URL: &str =
+    "https://api.github.com/repos/takushio2525/tako/releases?per_page=30";
+
+/// リリースチャンネル
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Channel {
+    Stable,
+    Test,
+}
+
+impl Channel {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Channel::Stable => "stable",
+            Channel::Test => "test",
+        }
+    }
+
+    pub fn display_label(&self) -> &'static str {
+        match self {
+            Channel::Stable => "安定版",
+            Channel::Test => "テスト版",
+        }
+    }
+}
+
+impl std::fmt::Display for Channel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl std::str::FromStr for Channel {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "stable" => Ok(Channel::Stable),
+            "test" => Ok(Channel::Test),
+            _ => Err(format!(
+                "不明なチャンネル: {s:?}（stable / test のいずれか）"
+            )),
+        }
+    }
+}
+
 /// 更新チェック結果
 #[derive(Debug, Clone)]
 pub struct UpdateInfo {
     pub version: String,
+    pub channel: Channel,
     #[allow(dead_code)]
     pub html_url: String,
     pub download_url: Option<String>,
+}
+
+/// 2 チャンネル同時チェック結果
+#[derive(Debug, Clone, Default)]
+pub struct ChannelUpdates {
+    pub stable: Option<UpdateInfo>,
+    pub test: Option<UpdateInfo>,
 }
 
 /// 更新チェックのエラー（#59: エラーと「更新なし」を区別する）
@@ -124,9 +182,11 @@ fn format_reset_time(unix_ts: u64) -> String {
 pub enum UpdateState {
     /// チェック中 or 更新なし
     Idle,
-    /// 新しいバージョンが利用可能
-    Available(UpdateInfo),
-    /// 更新確認ダイアログ表示中
+    /// 新しいバージョンが利用可能（1 チャンネル以上）
+    Available(ChannelUpdates),
+    /// テスト版の不安定警告確認中
+    TestWarning(UpdateInfo),
+    /// 更新確認ダイアログ表示中（チャンネル情報付き）
     ConfirmPending(UpdateInfo),
     /// ダウンロード/更新中
     Updating(String),
@@ -327,8 +387,9 @@ pub fn detect_duplicate_cli() -> Vec<PathBuf> {
     seen
 }
 
-/// 最新版をチェック（Web リダイレクト方式。API レート制限の対象外）。
+/// 最新の安定版をチェック（Web リダイレクト方式。API レート制限の対象外）。
 /// 新しいバージョンがあれば Some(info)、既に最新なら None、エラー時は Err。
+/// 安定版のみ。テスト版を含む全チャンネルチェックは `check_all_channels()` を使う
 pub fn check_latest() -> Result<Option<UpdateInfo>, CheckError> {
     let agent = ureq::Agent::config_builder()
         .max_redirects(0)
@@ -351,7 +412,6 @@ pub fn check_latest() -> Result<Option<UpdateInfo>, CheckError> {
                 .and_then(|v| v.to_str().ok())
                 .ok_or_else(|| CheckError::Parse("Location ヘッダーがない".into()))?;
 
-            // Location: https://github.com/takushio2525/tako/releases/tag/v0.2.6
             let version = location
                 .rsplit('/')
                 .next()
@@ -372,6 +432,7 @@ pub fn check_latest() -> Result<Option<UpdateInfo>, CheckError> {
 
             Ok(Some(UpdateInfo {
                 version: version.to_string(),
+                channel: Channel::Stable,
                 html_url: location.to_string(),
                 download_url: Some(download_url),
             }))
@@ -393,23 +454,185 @@ pub fn check_latest() -> Result<Option<UpdateInfo>, CheckError> {
     }
 }
 
-/// semver 比較（a > b なら true）。不正な形式は false
-pub fn is_newer(a: &str, b: &str) -> bool {
-    let parse = |s: &str| -> Option<(u32, u32, u32)> {
-        let parts: Vec<&str> = s.split('.').collect();
+/// 指定チャンネルの最新版をチェック
+pub fn check_channel(channel: Channel) -> Result<Option<UpdateInfo>, CheckError> {
+    match channel {
+        Channel::Stable => check_latest(),
+        Channel::Test => {
+            let updates = check_all_channels()?;
+            Ok(updates.test)
+        }
+    }
+}
+
+/// パース済みバージョン（`X.Y.Z` または `X.Y.Z-test.N`）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+    /// None = 安定版、Some(n) = テスト版 `-test.N`
+    pub test_num: Option<u32>,
+}
+
+impl ParsedVersion {
+    pub fn parse(s: &str) -> Option<Self> {
+        let (base, test_num) = if let Some((base, suffix)) = s.split_once("-test.") {
+            (base, Some(suffix.parse::<u32>().ok()?))
+        } else if s.contains('-') {
+            // `-test.N` 以外のプレリリースサフィックス（例: `-rc.1`）はテスト版扱い
+            return None;
+        } else {
+            (s, None)
+        };
+        let parts: Vec<&str> = base.split('.').collect();
         if parts.len() != 3 {
             return None;
         }
-        Some((
-            parts[0].parse().ok()?,
-            parts[1].parse().ok()?,
-            parts[2].parse().ok()?,
-        ))
-    };
-    match (parse(a), parse(b)) {
+        Some(Self {
+            major: parts[0].parse().ok()?,
+            minor: parts[1].parse().ok()?,
+            patch: parts[2].parse().ok()?,
+            test_num,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn channel(&self) -> Channel {
+        if self.test_num.is_some() {
+            Channel::Test
+        } else {
+            Channel::Stable
+        }
+    }
+
+    /// 安定版ベースバージョン同士の比較用タプル
+    fn base_tuple(&self) -> (u32, u32, u32) {
+        (self.major, self.minor, self.patch)
+    }
+}
+
+impl PartialOrd for ParsedVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ParsedVersion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.base_tuple().cmp(&other.base_tuple()).then_with(|| {
+            match (self.test_num, other.test_num) {
+                // 同じベースなら: stable(None) > test(Some)
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (Some(a), Some(b)) => a.cmp(&b),
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        })
+    }
+}
+
+/// semver 比較（a > b なら true）。`-test.N` サフィックス対応
+pub fn is_newer(a: &str, b: &str) -> bool {
+    match (ParsedVersion::parse(a), ParsedVersion::parse(b)) {
         (Some(a), Some(b)) => a > b,
         _ => false,
     }
+}
+
+/// 2 チャンネル同時チェック（GitHub API。認証なし 60req/h = 24h 周期では十分）。
+/// 現在バージョンより新しいリリースがあるチャンネルのみ Some を返す
+pub fn check_all_channels() -> Result<ChannelUpdates, CheckError> {
+    let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+
+    let resp = agent
+        .get(RELEASES_API_URL)
+        .header("User-Agent", &format!("tako/{CURRENT_VERSION}"))
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| CheckError::Network(e.to_string()))?;
+
+    let status = resp.status().as_u16();
+    if status == 403 || status == 429 {
+        let retry_after = resp
+            .headers()
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        return Err(CheckError::RateLimit { retry_after });
+    }
+    if status == 404 {
+        return Err(CheckError::Network(
+            "リリースが見つからない（リポジトリ未公開または未リリース）".into(),
+        ));
+    }
+    if status != 200 {
+        return Err(CheckError::Network(format!(
+            "予期しないステータスコード: {status}"
+        )));
+    }
+
+    let body: String = resp
+        .into_body()
+        .read_to_string()
+        .map_err(|e| CheckError::Parse(format!("レスポンス読み取りエラー: {e}")))?;
+    let releases: Vec<serde_json::Value> = serde_json::from_str(&body)
+        .map_err(|e| CheckError::Parse(format!("JSON パースエラー: {e}")))?;
+
+    let current = ParsedVersion::parse(CURRENT_VERSION);
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        other => other,
+    };
+
+    let mut result = ChannelUpdates::default();
+
+    for release in &releases {
+        let tag = release["tag_name"].as_str().unwrap_or_default();
+        let version_str = tag.strip_prefix('v').unwrap_or(tag);
+        let Some(ver) = ParsedVersion::parse(version_str) else {
+            continue;
+        };
+        let is_prerelease = release["prerelease"].as_bool().unwrap_or(false);
+        let channel = if is_prerelease {
+            Channel::Test
+        } else {
+            Channel::Stable
+        };
+
+        if let Some(ref cur) = current {
+            if ver <= *cur {
+                continue;
+            }
+        }
+
+        let html_url = release["html_url"].as_str().unwrap_or_default().to_string();
+        let download_url = format!(
+            "https://github.com/{OWNER_REPO}/releases/download/{tag}/tako-{tag}-macos-{arch}.zip"
+        );
+
+        let slot = match channel {
+            Channel::Stable => &mut result.stable,
+            Channel::Test => &mut result.test,
+        };
+        if slot.is_none() {
+            *slot = Some(UpdateInfo {
+                version: version_str.to_string(),
+                channel,
+                html_url,
+                download_url: Some(download_url),
+            });
+        }
+
+        if result.stable.is_some() && result.test.is_some() {
+            break;
+        }
+    }
+
+    Ok(result)
 }
 
 /// 更新を実行する（ブロッキング。background executor で呼ぶ）。
@@ -559,8 +782,14 @@ pub fn restart_app() -> Result<(), String> {
 pub fn update_status_json() -> serde_json::Value {
     let method = detect_install_method_full();
     let duplicates = detect_duplicate_cli();
+    let current_channel = if CURRENT_VERSION.contains("-test.") {
+        Channel::Test
+    } else {
+        Channel::Stable
+    };
     let mut json = serde_json::json!({
         "current_version": CURRENT_VERSION,
+        "current_channel": current_channel.label(),
         "install_method": method.label(),
         "duplicate_cli": duplicates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
     });
@@ -593,6 +822,54 @@ mod tests {
     }
 
     #[test]
+    fn test_is_newer_with_test_suffix() {
+        // テスト版 < 同ベースの安定版
+        assert!(is_newer("0.6.0", "0.6.0-test.1"));
+        assert!(is_newer("0.6.0", "0.6.0-test.99"));
+        // テスト版同士
+        assert!(is_newer("0.6.0-test.2", "0.6.0-test.1"));
+        assert!(!is_newer("0.6.0-test.1", "0.6.0-test.2"));
+        assert!(!is_newer("0.6.0-test.1", "0.6.0-test.1"));
+        // 異なるベース
+        assert!(is_newer("0.7.0-test.1", "0.6.0"));
+        assert!(!is_newer("0.5.0-test.1", "0.6.0"));
+        // テスト版 vs 旧安定版
+        assert!(is_newer("0.6.0-test.1", "0.5.8"));
+    }
+
+    #[test]
+    fn test_parsed_version() {
+        let v = ParsedVersion::parse("0.6.0").unwrap();
+        assert_eq!(v.major, 0);
+        assert_eq!(v.minor, 6);
+        assert_eq!(v.patch, 0);
+        assert_eq!(v.test_num, None);
+        assert_eq!(v.channel(), Channel::Stable);
+
+        let v = ParsedVersion::parse("0.6.0-test.3").unwrap();
+        assert_eq!(v.test_num, Some(3));
+        assert_eq!(v.channel(), Channel::Test);
+
+        assert!(ParsedVersion::parse("invalid").is_none());
+        assert!(ParsedVersion::parse("0.6.0-rc.1").is_none());
+    }
+
+    #[test]
+    fn test_channel_label() {
+        assert_eq!(Channel::Stable.label(), "stable");
+        assert_eq!(Channel::Test.label(), "test");
+        assert_eq!(Channel::Stable.display_label(), "安定版");
+        assert_eq!(Channel::Test.display_label(), "テスト版");
+    }
+
+    #[test]
+    fn test_channel_from_str() {
+        assert_eq!("stable".parse::<Channel>().unwrap(), Channel::Stable);
+        assert_eq!("test".parse::<Channel>().unwrap(), Channel::Test);
+        assert!("unknown".parse::<Channel>().is_err());
+    }
+
+    #[test]
     fn test_detect_install_method_returns_value() {
         let method = detect_install_method();
         assert!(
@@ -618,6 +895,7 @@ mod tests {
     fn test_update_status_json() {
         let json = update_status_json();
         assert!(json.get("current_version").is_some());
+        assert!(json.get("current_channel").is_some());
         assert!(json.get("install_method").is_some());
         assert!(json.get("duplicate_cli").is_some());
     }
