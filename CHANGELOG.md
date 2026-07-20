@@ -59,6 +59,17 @@ Nightly patch release (automated). Changes since v0.5.6:
 
 ## [Unreleased]
 
+- [改善] タブバーを全ウィンドウ共有にする (#380)
+  どのウィンドウのタブバーにも全タブが表示され、New Window 直後から既存タブが全部
+  見える。タブをクリックするとそのウィンドウへ表示が自動で移り（`tako window move-tab`
+  と同一経路。「同一タブは同時に 1 ウィンドウのみ表示」の排他は維持）、他ウィンドウで
+  表示中のタブには W<番号> バッジが付く。⌘数字・次/前タブ巡回も全タブ基準に統一。
+  The tab bar is now shared across all windows (#380): every window shows every
+  tab (immediately after New Window too). Clicking a tab moves its display to
+  that window (same path as `tako window move-tab`; the one-window-per-tab
+  exclusivity is kept), and tabs displayed in another window get a W<n> badge.
+  Cmd+number and next/prev tab cycling now operate over all tabs.
+
 - [修正] 赤ボタン close → Dock 復帰の TakoApp 二重生成による全タブ消失を根治 (#381)
   最後のウィンドウを赤ボタンで閉じて Dock から復帰すると TakoApp が再生成され、
   旧インスタンスがゾンビ化（CLI / MCP 接続先の分裂・layout 保存の競合）、復元 spawn の

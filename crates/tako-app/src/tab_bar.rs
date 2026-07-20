@@ -51,13 +51,10 @@ impl TakoApp {
     /// アクティブタブが表示領域に入るよう ScrollHandle を更新する。
     /// タブ切替を行うすべての経路（クリック・⌘数字・CLI/MCP）から呼ぶ。
     /// scroll_to_item は子要素インデックスで動くため、タブバーの表示と同じ
-    /// アクティブウィンドウ内の並びで位置を計算する（Issue #339）
+    /// 全タブの並びで位置を計算する（#380: タブバーは全ウィンドウ共有）
     pub(crate) fn scroll_active_tab_into_view(&self) {
         let active = self.workspace.active_tab_id();
-        let win_tabs = self
-            .workspace
-            .window_tab_ids(self.workspace.active_window_id());
-        if let Some(idx) = win_tabs.iter().position(|t| *t == active) {
+        if let Some(idx) = self.workspace.tabs().iter().position(|t| t.id() == active) {
             self.tab_scroll_handle.scroll_to_item(idx);
         }
     }
@@ -80,7 +77,9 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme.clone();
-        // このウィンドウの表示タブと所属タブだけを描く（Issue #339 ビューポート方式）
+        // タブバーは全ウィンドウ共有（#380）: どのウィンドウにも全タブを描き、
+        // 「このウィンドウの表示タブ」だけをアクティブ表示にする。
+        // 他ウィンドウで表示中のタブは W バッジで区別する
         let viewport = self
             .viewport_of(window)
             .unwrap_or_else(|| self.workspace.active_window_id());
@@ -97,12 +96,10 @@ impl TakoApp {
             self.scroll_active_tab_into_view();
         }
 
-        let window_tabs = self.workspace.window_tab_ids(viewport);
         let tabs: Vec<_> = self
             .workspace
             .tabs()
             .iter()
-            .filter(|tab| window_tabs.contains(&tab.id()))
             .map(|tab| {
                 let id = tab.id();
                 let label = if tab.title_source() == TitleSource::Default {
@@ -129,10 +126,17 @@ impl TakoApp {
                     .iter()
                     .filter(|s| matches!(s, CommandState::Failed(_)))
                     .count();
-                (id, label, agg, pane_states, fails)
+                // 他ウィンドウで表示中のタブに出す区別バッジ（#380。W<番号>）
+                let shown_in = self
+                    .workspace
+                    .windows()
+                    .iter()
+                    .find(|w| w.id() != viewport && w.active_tab() == id)
+                    .map(|w| w.id().as_u64());
+                (id, label, agg, pane_states, fails, shown_in)
             })
             .collect();
-        let attention: usize = tabs.iter().map(|(_, _, _, _, fails)| fails).sum();
+        let attention: usize = tabs.iter().map(|(_, _, _, _, fails, _)| fails).sum();
         let state_color = |state: &CommandState| match state {
             CommandState::Failed(_) => theme.red,
             CommandState::Running => theme.accent,
@@ -222,239 +226,249 @@ impl TakoApp {
                     .on_drop::<PaneDrag>(cx.listener(|this, drag: &PaneDrag, _, cx| {
                         this.drop_pane_on_tab(drag.pane, None, cx);
                     }))
-                    .children(
-                        tabs.into_iter()
-                            .map(|(id, label, agg, pane_states, fails)| {
-                                let is_active = id == active;
-                                let dot_color = state_color(&agg);
-                                let pulsing = matches!(agg, CommandState::Running);
+                    .children(tabs.into_iter().map(
+                        |(id, label, agg, pane_states, fails, shown_in)| {
+                            let is_active = id == active;
+                            let dot_color = state_color(&agg);
+                            let pulsing = matches!(agg, CommandState::Running);
 
-                                let dot = div()
-                                    .w(px(7.0))
-                                    .h(px(7.0))
-                                    .flex_none()
-                                    .rounded_full()
-                                    .bg(hsla(dot_color))
-                                    .when(is_active, |d| {
-                                        d.shadow(vec![BoxShadow {
-                                            color: hsla_alpha(dot_color, 0.7),
-                                            offset: point(px(0.), px(0.)),
-                                            blur_radius: px(6.0),
-                                            spread_radius: px(0.),
-                                            inset: false,
-                                        }])
-                                    });
-                                let dot = if pulsing {
-                                    dot.with_animation(
-                                        ("tab-dot-pulse", id.as_u64()),
-                                        Animation::new(Duration::from_secs(2)).repeat(),
-                                        |el, t| {
-                                            el.opacity(
-                                                1.0 - 0.65 * (std::f32::consts::PI * t).sin(),
-                                            )
-                                        },
-                                    )
-                                    .into_any_element()
-                                } else {
-                                    dot.into_any_element()
-                                };
+                            let dot = div()
+                                .w(px(7.0))
+                                .h(px(7.0))
+                                .flex_none()
+                                .rounded_full()
+                                .bg(hsla(dot_color))
+                                .when(is_active, |d| {
+                                    d.shadow(vec![BoxShadow {
+                                        color: hsla_alpha(dot_color, 0.7),
+                                        offset: point(px(0.), px(0.)),
+                                        blur_radius: px(6.0),
+                                        spread_radius: px(0.),
+                                        inset: false,
+                                    }])
+                                });
+                            let dot = if pulsing {
+                                dot.with_animation(
+                                    ("tab-dot-pulse", id.as_u64()),
+                                    Animation::new(Duration::from_secs(2)).repeat(),
+                                    |el, t| {
+                                        el.opacity(1.0 - 0.65 * (std::f32::consts::PI * t).sin())
+                                    },
+                                )
+                                .into_any_element()
+                            } else {
+                                dot.into_any_element()
+                            };
 
-                                let truncated = truncate(&label, label_max);
+                            let truncated = truncate(&label, label_max);
 
-                                // タブ D&D 並べ替えの挿入インジケータ（#371）
-                                let show_indicator =
-                                    is_tab_dragging && tab_reorder == Some(Some(id));
-                                let is_drag_source = is_tab_dragging && dragging_tab_id == Some(id);
+                            // タブ D&D 並べ替えの挿入インジケータ（#371）
+                            let show_indicator = is_tab_dragging && tab_reorder == Some(Some(id));
+                            let is_drag_source = is_tab_dragging && dragging_tab_id == Some(id);
 
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .flex_shrink_0()
-                                    .when(show_indicator, |d| {
-                                        d.child(
-                                            div()
-                                                .w(px(3.0))
-                                                .h(px(22.0))
-                                                .flex_none()
-                                                .rounded(px(1.5))
-                                                .bg(hsla(theme.accent))
-                                                .shadow(vec![BoxShadow {
-                                                    color: hsla_alpha(theme.accent, 0.5),
-                                                    offset: point(px(0.), px(0.)),
-                                                    blur_radius: px(4.0),
-                                                    spread_radius: px(0.),
-                                                    inset: false,
-                                                }]),
-                                        )
-                                    })
-                                    .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .flex_shrink_0()
+                                .when(show_indicator, |d| {
+                                    d.child(
                                         div()
-                                            .id(("tab", id.as_u64()))
-                                            .group("tab-pill")
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .gap(px(8.0))
-                                            .h(px(30.0))
-                                            .pl(px(10.0))
-                                            .pr(px(11.0))
-                                            .flex_shrink_0()
-                                            .rounded(px(8.0))
-                                            .cursor_pointer()
-                                            .when(is_drag_source, |d| {
-                                                d.opacity(0.4)
+                                            .w(px(3.0))
+                                            .h(px(22.0))
+                                            .flex_none()
+                                            .rounded(px(1.5))
+                                            .bg(hsla(theme.accent))
+                                            .shadow(vec![BoxShadow {
+                                                color: hsla_alpha(theme.accent, 0.5),
+                                                offset: point(px(0.), px(0.)),
+                                                blur_radius: px(4.0),
+                                                spread_radius: px(0.),
+                                                inset: false,
+                                            }]),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .id(("tab", id.as_u64()))
+                                        .group("tab-pill")
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .h(px(30.0))
+                                        .pl(px(10.0))
+                                        .pr(px(11.0))
+                                        .flex_shrink_0()
+                                        .rounded(px(8.0))
+                                        .cursor_pointer()
+                                        .when(is_drag_source, |d| {
+                                            d.opacity(0.4)
+                                                .border_1()
+                                                .border_color(hsla(theme.border_subtle))
+                                                .border_dashed()
+                                        })
+                                        .when(is_active && !is_drag_source, |d| {
+                                            d.bg(rgba(theme.tab_active_background))
+                                                .border_1()
+                                                .border_color(hsla(theme.border_heavy))
+                                                .shadow(vec![BoxShadow {
+                                                    color: hsla_alpha(theme.foreground, 0.05),
+                                                    offset: point(px(0.), px(1.)),
+                                                    blur_radius: px(0.),
+                                                    spread_radius: px(0.),
+                                                    inset: true,
+                                                }])
+                                        })
+                                        .when(!is_active && !is_drag_source, |d| {
+                                            d.hover(|d| d.bg(rgba(theme.surface_hover)))
+                                        })
+                                        .when(is_pane_dragging && tab_drop == Some(Some(id)), |d| {
+                                            d.bg(rgba_alpha(theme.accent, 0.15))
+                                                .border_2()
+                                                .border_color(hsla(theme.accent))
+                                        })
+                                        .text_color(if is_active {
+                                            hsla(theme.tab_active_foreground)
+                                        } else if fails > 0 {
+                                            hsla(theme.text_tertiary)
+                                        } else {
+                                            hsla(theme.tab_inactive_foreground)
+                                        })
+                                        .text_size(px(12.5))
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            cx.listener(move |this, _, _, _| {
+                                                this.tab_mouse_down = true;
+                                            }),
+                                        )
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            // 共有タブバー（#380）: クリックしたウィンドウへ
+                                            // 表示を移す（他ウィンドウ所属なら奪取）
+                                            this.select_tab_in_viewport(id, window, cx);
+                                        }))
+                                        .on_drag(
+                                            TabDrag { tab: id },
+                                            self.drag_ghost_builder_with_tab(
+                                                DragKind::Tab,
+                                                truncated.clone(),
+                                                Some(id),
+                                                cx,
+                                            ),
+                                        )
+                                        .on_drag_move::<TabDrag>(cx.listener(
+                                            move |this, e: &DragMoveEvent<TabDrag>, _, cx| {
+                                                if e.drag(cx).tab == id {
+                                                    return;
+                                                }
+                                                this.set_tab_reorder_indicator(Some(id), cx);
+                                            },
+                                        ))
+                                        .on_drop::<TabDrag>(cx.listener(
+                                            move |this, drag: &TabDrag, _, cx| {
+                                                this.drop_tab_reorder(drag.tab, Some(id), cx);
+                                            },
+                                        ))
+                                        .on_drag_move::<PaneDrag>(cx.listener(
+                                            move |this, _: &DragMoveEvent<PaneDrag>, _, cx| {
+                                                this.set_tab_drop_target(Some(id), cx);
+                                            },
+                                        ))
+                                        .on_drop::<PaneDrag>(cx.listener(
+                                            move |this, drag: &PaneDrag, _, cx| {
+                                                this.drop_pane_on_tab(drag.pane, Some(id), cx);
+                                            },
+                                        ))
+                                        .child(dot)
+                                        .child(
+                                            div()
+                                                .font_weight(if is_active {
+                                                    FontWeight::SEMIBOLD
+                                                } else {
+                                                    FontWeight::MEDIUM
+                                                })
+                                                .child(SharedString::from(truncated)),
+                                        )
+                                        // 他ウィンドウで表示中の区別バッジ（#380。
+                                        // クリックすればこのウィンドウへ表示が移る）
+                                        .when_some(shown_in, |d, win| {
+                                            d.child(
+                                                div()
+                                                    .flex_none()
+                                                    .px(px(4.0))
+                                                    .h(px(15.0))
+                                                    .flex()
+                                                    .items_center()
+                                                    .rounded(px(4.0))
                                                     .border_1()
                                                     .border_color(hsla(theme.border_subtle))
-                                                    .border_dashed()
-                                            })
-                                            .when(is_active && !is_drag_source, |d| {
-                                                d.bg(rgba(theme.tab_active_background))
-                                                    .border_1()
-                                                    .border_color(hsla(theme.border_heavy))
-                                                    .shadow(vec![BoxShadow {
-                                                        color: hsla_alpha(theme.foreground, 0.05),
-                                                        offset: point(px(0.), px(1.)),
-                                                        blur_radius: px(0.),
-                                                        spread_radius: px(0.),
-                                                        inset: true,
-                                                    }])
-                                            })
-                                            .when(!is_active && !is_drag_source, |d| {
-                                                d.hover(|d| d.bg(rgba(theme.surface_hover)))
-                                            })
-                                            .when(
-                                                is_pane_dragging && tab_drop == Some(Some(id)),
-                                                |d| {
-                                                    d.bg(rgba_alpha(theme.accent, 0.15))
-                                                        .border_2()
-                                                        .border_color(hsla(theme.accent))
-                                                },
+                                                    .text_size(px(9.5))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(hsla(theme.text_muted))
+                                                    .child(SharedString::from(format!("W{win}"))),
                                             )
-                                            .text_color(if is_active {
-                                                hsla(theme.tab_active_foreground)
-                                            } else if fails > 0 {
-                                                hsla(theme.text_tertiary)
-                                            } else {
-                                                hsla(theme.tab_inactive_foreground)
-                                            })
-                                            .text_size(px(12.5))
-                                            .on_mouse_down(
-                                                gpui::MouseButton::Left,
-                                                cx.listener(move |this, _, _, _| {
-                                                    this.tab_mouse_down = true;
-                                                }),
-                                            )
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                let _ = this.workspace.activate_tab(id);
-                                                this.scroll_active_tab_into_view();
-                                                cx.notify();
-                                            }))
-                                            .on_drag(
-                                                TabDrag { tab: id },
-                                                self.drag_ghost_builder_with_tab(
-                                                    DragKind::Tab,
-                                                    truncated.clone(),
-                                                    Some(id),
-                                                    cx,
-                                                ),
-                                            )
-                                            .on_drag_move::<TabDrag>(cx.listener(
-                                                move |this, e: &DragMoveEvent<TabDrag>, _, cx| {
-                                                    if e.drag(cx).tab == id {
-                                                        return;
-                                                    }
-                                                    this.set_tab_reorder_indicator(Some(id), cx);
-                                                },
-                                            ))
-                                            .on_drop::<TabDrag>(cx.listener(
-                                                move |this, drag: &TabDrag, _, cx| {
-                                                    this.drop_tab_reorder(drag.tab, Some(id), cx);
-                                                },
-                                            ))
-                                            .on_drag_move::<PaneDrag>(cx.listener(
-                                                move |this, _: &DragMoveEvent<PaneDrag>, _, cx| {
-                                                    this.set_tab_drop_target(Some(id), cx);
-                                                },
-                                            ))
-                                            .on_drop::<PaneDrag>(cx.listener(
-                                                move |this, drag: &PaneDrag, _, cx| {
-                                                    this.drop_pane_on_tab(drag.pane, Some(id), cx);
-                                                },
-                                            ))
-                                            .child(dot)
-                                            .child(
+                                        })
+                                        .when(is_active && pane_states.len() > 1, |d| {
+                                            d.child(
                                                 div()
-                                                    .font_weight(if is_active {
-                                                        FontWeight::SEMIBOLD
-                                                    } else {
-                                                        FontWeight::MEDIUM
-                                                    })
-                                                    .child(SharedString::from(truncated)),
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap(px(2.5))
+                                                    .children(pane_states.iter().map(|s| {
+                                                        div()
+                                                            .w(px(5.0))
+                                                            .h(px(5.0))
+                                                            .flex_none()
+                                                            .rounded(px(1.5))
+                                                            .bg(hsla(state_color(s)))
+                                                    })),
                                             )
-                                            .when(is_active && pane_states.len() > 1, |d| {
-                                                d.child(
-                                                    div()
-                                                        .flex()
-                                                        .flex_row()
-                                                        .items_center()
-                                                        .gap(px(2.5))
-                                                        .children(pane_states.iter().map(|s| {
-                                                            div()
-                                                                .w(px(5.0))
-                                                                .h(px(5.0))
-                                                                .flex_none()
-                                                                .rounded(px(1.5))
-                                                                .bg(hsla(state_color(s)))
-                                                        })),
-                                                )
-                                            })
-                                            .when(!is_active && fails > 0, |d| {
-                                                d.child(
-                                                    div()
-                                                        .font_family(theme.font_family.clone())
-                                                        .text_size(px(10.5))
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .text_color(hsla(theme.red))
-                                                        .child(SharedString::from(format!(
-                                                            "{fails} fail"
-                                                        ))),
-                                                )
-                                            })
-                                            .when(is_active, |d| {
-                                                d.child(
-                                                    div()
-                                                        .id(("tab-bg", id.as_u64()))
-                                                        .w(px(17.0))
-                                                        .h(px(17.0))
-                                                        .flex()
-                                                        .flex_none()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .rounded(px(5.0))
-                                                        .cursor_pointer()
-                                                        .text_color(hsla(theme.text_muted))
-                                                        .hover(|d| {
-                                                            d.bg(rgba(theme.surface_highlight))
-                                                                .text_color(hsla(theme.foreground))
-                                                        })
-                                                        .on_click(cx.listener(
-                                                            move |this, _, _, cx| {
-                                                                cx.stop_propagation();
-                                                                this.background_tab(id, cx);
-                                                            },
-                                                        ))
-                                                        .child(
-                                                            svg()
-                                                                .path(ui_icon::MINUS)
-                                                                .w(px(12.0))
-                                                                .h(px(12.0))
-                                                                .text_color(hsla(theme.text_muted)),
-                                                        ),
-                                                )
-                                            })
-                                            .when(is_active, |d| {
-                                                d.child(
+                                        })
+                                        .when(!is_active && fails > 0, |d| {
+                                            d.child(
+                                                div()
+                                                    .font_family(theme.font_family.clone())
+                                                    .text_size(px(10.5))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(hsla(theme.red))
+                                                    .child(SharedString::from(format!(
+                                                        "{fails} fail"
+                                                    ))),
+                                            )
+                                        })
+                                        .when(is_active, |d| {
+                                            d.child(
+                                                div()
+                                                    .id(("tab-bg", id.as_u64()))
+                                                    .w(px(17.0))
+                                                    .h(px(17.0))
+                                                    .flex()
+                                                    .flex_none()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded(px(5.0))
+                                                    .cursor_pointer()
+                                                    .text_color(hsla(theme.text_muted))
+                                                    .hover(|d| {
+                                                        d.bg(rgba(theme.surface_highlight))
+                                                            .text_color(hsla(theme.foreground))
+                                                    })
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.background_tab(id, cx);
+                                                    }))
+                                                    .child(
+                                                        svg()
+                                                            .path(ui_icon::MINUS)
+                                                            .w(px(12.0))
+                                                            .h(px(12.0))
+                                                            .text_color(hsla(theme.text_muted)),
+                                                    ),
+                                            )
+                                        })
+                                        .when(is_active, |d| {
+                                            d.child(
                                             div()
                                                 .id(("tab-close", id.as_u64()))
                                                 .w(px(17.0))
@@ -484,10 +498,10 @@ impl TakoApp {
                                                         .text_color(hsla(theme.text_muted)),
                                                 ),
                                         )
-                                            }),
-                                    ) // .child(div() inner tab pill)
-                            }),
-                    )
+                                        }),
+                                ) // .child(div() inner tab pill)
+                        },
+                    ))
                     // 末尾の挿入インジケータ（タブ D&D 並べ替え: 末尾移動。#371）
                     .when(is_tab_dragging && tab_reorder == Some(None), |d| {
                         d.child(
