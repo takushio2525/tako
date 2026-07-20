@@ -52,6 +52,9 @@ pub fn detect_permission_dialog(lines: &[String]) -> Option<PermissionDialog> {
     if is_trust_dialog(lines) {
         return None;
     }
+    if is_bypass_dialog(lines) {
+        return None;
+    }
     if lines.iter().any(|l| l.contains("Approaching rate limits")) {
         return None;
     }
@@ -174,6 +177,23 @@ pub fn is_trust_dialog(lines: &[String]) -> bool {
     })
 }
 
+/// Bypass Permissions 確認ダイアログが表示されているか（Issue #407）。
+/// `claude --dangerously-skip-permissions` の初回起動で表示される:
+/// ```text
+/// WARNING: Claude Code running in Bypass Permissions mode
+/// ...
+/// ❯ 1. No, exit
+///   2. Yes, I accept
+/// ```
+/// 既定選択が「No, exit」のため、信頼ダイアログと異なり Enter だけでは突破できず、
+/// 「↓ + Enter」で「Yes, I accept」を確定する必要がある
+pub fn is_bypass_dialog(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .any(|l| l.contains("Bypass Permissions mode") || l.contains("Bypass permissions mode"))
+        && lines.iter().any(|l| l.contains("Yes, I accept"))
+}
+
 /// 入力欄の内容を返す。会話ログの送信済みメッセージも同じプロンプト文字で始まるため、
 /// 入力欄 = **画面の一番下にある**プロンプト行とみなし、プロンプト文字以降を trim して返す。
 /// プロンプト文字は claude `❯` / codex `›` / agy `>` の和集合（Issue #120）。
@@ -270,6 +290,46 @@ pub fn ensure_trusted(cwd: &str) -> Result<bool, String> {
     ensure_trusted_at(&home.join(".claude.json"), cwd)
 }
 
+// --- Bypass Permissions 事前承認（Issue #407） ---
+
+/// `--dangerously-skip-permissions` の初回確認ダイアログを抑制する。
+/// `~/.claude.json` のルートに `bypassPermissionsModeAccepted: true` を書き込む。
+/// claude CLI のソースで `ensureAgentsBypassConsent` がこのフラグを参照し、
+/// true ならダイアログ表示自体をスキップする（v2.1.215 で実測確認済み）。
+/// ensure_trusted と同様に best-effort: 失敗時は deliver_via_tmux のダイアログ検出
+/// → 承諾がフォールバックする
+pub fn ensure_bypass_accepted() -> Result<bool, String> {
+    let home = crate::orchestrator::home_dir().ok_or("ホームディレクトリを特定できない")?;
+    ensure_bypass_accepted_at(&home.join(".claude.json"))
+}
+
+fn ensure_bypass_accepted_at(path: &Path) -> Result<bool, String> {
+    let mut root: serde_json::Value = match std::fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s)
+            .map_err(|e| format!("{} を解釈できない: {e}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(e) => return Err(format!("{} を読めない: {e}", path.display())),
+    };
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| format!("{} のトップレベルがオブジェクトでない", path.display()))?;
+    if obj
+        .get("bypassPermissionsModeAccepted")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        return Ok(true);
+    }
+    obj.insert("bypassPermissionsModeAccepted".into(), json!(true));
+
+    let tmp = path.with_extension("json.tako-tmp");
+    let serialized =
+        serde_json::to_string_pretty(&root).map_err(|e| format!("設定を直列化できない: {e}"))?;
+    std::fs::write(&tmp, serialized).map_err(|e| format!("{} を書けない: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("{} を置換できない: {e}", path.display()))?;
+    Ok(true)
+}
+
 fn ensure_trusted_at(path: &Path, cwd: &str) -> Result<bool, String> {
     let mut root: serde_json::Value = match std::fs::read_to_string(path) {
         Ok(s) => serde_json::from_str(&s)
@@ -355,6 +415,19 @@ pub fn deliver_via_tmux(
             if report.trust_dialogs_accepted >= 3 {
                 return Err("信頼ダイアログを承諾しても消えない".into());
             }
+            tako_core::tmux::send_key(socket, session, "Enter")?;
+            report.trust_dialogs_accepted += 1;
+            std::thread::sleep(Duration::from_millis(700));
+            continue;
+        }
+        // Bypass Permissions 確認ダイアログ（#407）: 既定選択が「No, exit」のため
+        // ↓ で「Yes, I accept」へ移動してから Enter で確定する
+        if is_bypass_dialog(&lines) {
+            if report.trust_dialogs_accepted >= 3 {
+                return Err("Bypass 確認ダイアログを承諾しても消えない".into());
+            }
+            tako_core::tmux::send_key(socket, session, "Down")?;
+            std::thread::sleep(Duration::from_millis(200));
             tako_core::tmux::send_key(socket, session, "Enter")?;
             report.trust_dialogs_accepted += 1;
             std::thread::sleep(Duration::from_millis(700));
@@ -639,6 +712,82 @@ mod tests {
         let root: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(root["projects"]["/fresh"]["hasTrustDialogAccepted"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #407: Bypass Permissions 事前承認 ---
+
+    // claude v2.1.215 の実画面（tmux capture-pane -p -J より採取。2026-07-21）
+    const BYPASS_DIALOG: &str = r#"
+────────────────────────────────────────────────────────────────────────────────
+  WARNING: Claude Code running in Bypass Permissions mode
+
+  In Bypass Permissions mode, Claude Code will not ask for your approval
+  before running potentially dangerous commands.
+  This mode should only be used in a sandboxed container/VM that has
+  restricted internet access and can easily be restored if damaged.
+
+  By proceeding, you accept all responsibility for actions taken while running
+  in Bypass Permissions mode.
+
+  https://code.claude.com/docs/en/security
+
+  ❯ 1. No, exit
+    2. Yes, I accept
+
+  Enter to confirm · Esc to cancel"#;
+
+    #[test]
+    fn bypassダイアログを検出する() {
+        let lines = screen(BYPASS_DIALOG);
+        assert!(is_bypass_dialog(&lines));
+        // 信頼ダイアログとは誤認しない
+        assert!(!is_trust_dialog(&lines));
+        // permission ダイアログとも誤認しない
+        assert!(detect_permission_dialog(&lines).is_none());
+    }
+
+    #[test]
+    fn bypass以外の画面ではbypassと判定しない() {
+        assert!(!is_bypass_dialog(&screen(TRUST_DIALOG)));
+        assert!(!is_bypass_dialog(&screen(READY_PLACEHOLDER)));
+        assert!(!is_bypass_dialog(&screen(CLAUDE_BASH_PERMISSION)));
+    }
+
+    #[test]
+    fn ensure_bypass_acceptedは新規書き込みと冪等動作する() {
+        let dir = std::env::temp_dir().join(format!("tako-bypass-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("claude.json");
+        std::fs::write(
+            &path,
+            r#"{"installMethod":"brew","projects":{"/example":{"hasTrustDialogAccepted":true}}}"#,
+        )
+        .unwrap();
+
+        // 新規書き込み
+        assert_eq!(ensure_bypass_accepted_at(&path), Ok(true));
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["bypassPermissionsModeAccepted"], true);
+        assert_eq!(root["installMethod"], "brew"); // 無関係キーを保持
+        assert_eq!(root["projects"]["/example"]["hasTrustDialogAccepted"], true); // 他の事前信頼を保持
+
+        // 冪等
+        assert_eq!(ensure_bypass_accepted_at(&path), Ok(true));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_bypass_acceptedはファイル不在でも新規作成する() {
+        let dir = std::env::temp_dir().join(format!("tako-bypass-new-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("claude.json");
+        assert_eq!(ensure_bypass_accepted_at(&path), Ok(true));
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["bypassPermissionsModeAccepted"], true);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
