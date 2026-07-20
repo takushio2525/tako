@@ -964,3 +964,10 @@
 - 関連コミット: `f9c2ac8`（PR #400 squash merge）。受け入れ 3 パターン + panic e2e +
   orphan 反復 ×7 隔離実測。証拠は ~/Desktop/tako-381-evidence/
 - 次: #380 共有タブバー化（同一 worker 継続）。実機 install はユーザー
+
+## 2026-07-21（#380 完了: タブバーの全ウィンドウ共有化）
+- タブバーを全ウィンドウ共有に是正（全タブ表示 + クリックで表示奪取 + W バッジ + 巡回全タブ化。
+  排他原則・move-tab CLI/MCP 互換・persist 復元は維持）
+- 関連コミット: `823e149`（PR #402 squash merge）。実クリック奪取・persist 復元・品質ゲートを
+  隔離実測。スクショ証拠は ~/Desktop/tako-380-evidence/
+- 次: build-app.sh --install → ユーザー実機確認（#381/#380 とも）→ Issue クローズは master
