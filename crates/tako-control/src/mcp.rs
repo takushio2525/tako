@@ -1698,16 +1698,15 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_update",
-            "description": "アプリ内更新の診断・チェック・実行（Issue #36 + #50）。\
+            "description": "アプリ内更新の診断・チェック・実行（#36 + #50 + #403 チャンネル制）。\
                 action=status で配布系統（homebrew / zip / broken-brew）・現在バージョン・\
-                PATH 上の重複 CLI を返す。broken-brew 検知時は診断情報と修復コマンドも含む。\
+                現在チャンネル（stable / test）・PATH 上の重複 CLI を返す。\
                 action=check で GitHub Releases から最新版の有無を確認する（更新は行わない）。\
-                action=apply で配布系統に応じた更新を実行する \
-                （homebrew → brew upgrade --cask、zip/broken-brew → zip DL で .app 差し替え）。\
-                action=apply-zip で配布系統を問わず zip 経由で強制更新する \
-                （brew upgrade 失敗時のフォールバック）。\
-                action=repair で broken-brew 状態を修復する \
-                （brew install --cask --force で cask 台帳を再締結）。\
+                channel で stable / test を指定可。省略で全チャンネル同時チェック。\
+                action=apply で配布系統に応じた更新を実行する。\
+                channel で stable（既定）/ test を指定。\
+                action=apply-zip で zip 経由で強制更新する。\
+                action=repair で broken-brew 状態を修復する。\
                 apply 成功後の再起動は UI 側で行う（CLI / MCP からは apply 結果の確認まで）。",
             "inputSchema": {
                 "type": "object",
@@ -1716,6 +1715,11 @@ pub fn tools() -> Vec<Value> {
                         "type": "string",
                         "enum": ["status", "check", "apply", "apply-zip", "repair"],
                         "description": "操作種別（省略時は status）",
+                    },
+                    "channel": {
+                        "type": "string",
+                        "enum": ["stable", "test"],
+                        "description": "対象チャンネル。check 時は省略で全チャンネル、apply 時は省略で stable",
                     },
                 },
                 "additionalProperties": false,
@@ -3076,6 +3080,7 @@ fn build_request(
         }
         "tako_update" => Request::Update {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
+            channel: str_arg(args, "channel")?.map(|s| s.to_string()),
         },
         "tako_fda" => Request::Fda {
             action: str_arg(args, "action")?.map(|s| s.to_string()),

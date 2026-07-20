@@ -2277,13 +2277,14 @@ fn dispatch_inner(
             }
         }
 
-        Request::Update { action } => {
+        Request::Update { action, channel } => {
             let action = action.as_deref().unwrap_or("status");
+            let ch = channel.as_deref();
             match action {
                 "status" => Ok(host.update_status()),
-                "check" => Ok(host.update_check()),
-                "apply" => host.update_apply().map_err(DispatchError::Operation),
-                "apply-zip" => host.update_apply_zip().map_err(DispatchError::Operation),
+                "check" => Ok(host.update_check(ch)),
+                "apply" => host.update_apply(ch).map_err(DispatchError::Operation),
+                "apply-zip" => host.update_apply_zip(ch).map_err(DispatchError::Operation),
                 "repair" => host.update_repair().map_err(DispatchError::Operation),
                 other => Err(DispatchError::InvalidParams(format!(
                     "不明な action: {other:?}（status / check / apply / apply-zip / repair のいずれか）"

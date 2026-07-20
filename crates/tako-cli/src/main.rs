@@ -440,14 +440,26 @@ enum WebCommand {
 
 #[derive(Subcommand)]
 enum UpdateCommand {
-    /// 配布系統・現在バージョン・重複 CLI の診断情報を表示する
+    /// 配布系統・現在バージョン・チャンネル・重複 CLI の診断情報を表示する
     Status,
     /// GitHub Releases から最新版の有無を確認する（更新は行わない）
-    Check,
+    Check {
+        /// 対象チャンネル（stable / test。省略で全チャンネル同時チェック）
+        #[arg(long)]
+        channel: Option<String>,
+    },
     /// 配布系統に応じた更新を実行する
-    Apply,
+    Apply {
+        /// 対象チャンネル（stable / test。省略で stable）
+        #[arg(long)]
+        channel: Option<String>,
+    },
     /// zip 経由で強制更新する（brew 失敗時のフォールバック）
-    ApplyZip,
+    ApplyZip {
+        /// 対象チャンネル（stable / test。省略で stable）
+        #[arg(long)]
+        channel: Option<String>,
+    },
     /// broken-brew 状態の修復（brew install --cask --force で台帳を再締結）
     Repair,
 }
@@ -3972,15 +3984,19 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 }
             }
         }
-        Command::Update(sub) => Request::Update {
-            action: Some(match sub {
-                UpdateCommand::Status => "status".to_string(),
-                UpdateCommand::Check => "check".to_string(),
-                UpdateCommand::Apply => "apply".to_string(),
-                UpdateCommand::ApplyZip => "apply-zip".to_string(),
-                UpdateCommand::Repair => "repair".to_string(),
-            }),
-        },
+        Command::Update(sub) => {
+            let (action, channel) = match sub {
+                UpdateCommand::Status => ("status", None),
+                UpdateCommand::Check { channel } => ("check", channel.clone()),
+                UpdateCommand::Apply { channel } => ("apply", channel.clone()),
+                UpdateCommand::ApplyZip { channel } => ("apply-zip", channel.clone()),
+                UpdateCommand::Repair => ("repair", None),
+            };
+            Request::Update {
+                action: Some(action.to_string()),
+                channel,
+            }
+        }
         Command::Telemetry(sub) => Request::Telemetry {
             action: Some(match sub {
                 TelemetryCommand::Status => "status".to_string(),

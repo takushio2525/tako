@@ -920,6 +920,8 @@ struct TakoApp {
     pending_webview_restore: Vec<(Option<u64>, String)>,
     /// アプリ内自動更新の状態
     update_state: update_checker::UpdateState,
+    /// 更新チャンネルドロップダウンの開閉状態（#403）
+    update_dropdown_open: bool,
     /// グリフ advance がセル幅（半角 1 セル）と一致するかのキャッシュ（Issue #64）。
     /// テーマフォントに無いグリフ（⏺ ⎿ 等）はフォールバックフォントで描画され
     /// advance がセル幅とずれるため、描画グループ化から除外する判定に使う
@@ -1904,6 +1906,7 @@ impl TakoApp {
             window_raw_handle: None,
             pending_webview_restore: Vec::new(),
             update_state: update_checker::UpdateState::Idle,
+            update_dropdown_open: false,
             glyph_snap_cache: std::cell::RefCell::new(HashMap::new()),
             text_system: cx.text_system().clone(),
             pane_links: HashMap::new(),
@@ -2851,37 +2854,41 @@ impl TakoApp {
         })
         .detach();
 
-        // アプリ内自動更新チェック（起動時 + 24 時間ごと。失敗時は静かにリトライ）
+        // アプリ内自動更新チェック（起動時 + 24 時間ごと。2 チャンネル同時。#403）
         if std::env::var_os("TAKO_SELF_TEST").is_none() {
             cx.spawn(async move |this, cx| loop {
                 let task = cx
                     .background_executor()
-                    .spawn(async { update_checker::check_latest() });
+                    .spawn(async { update_checker::check_all_channels() });
                 let result = task.await;
                 let wait = match result {
-                    Ok(Some(info)) => {
-                        let ok = this.update(cx, |app: &mut TakoApp, cx| {
-                            if !matches!(app.update_state, update_checker::UpdateState::Dismissed) {
-                                app.update_state = update_checker::UpdateState::Available(info);
-                                cx.notify();
+                    Ok(updates) => {
+                        let has_any = updates.stable.is_some() || updates.test.is_some();
+                        if has_any {
+                            let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                                if !matches!(
+                                    app.update_state,
+                                    update_checker::UpdateState::Dismissed
+                                ) {
+                                    app.update_state =
+                                        update_checker::UpdateState::Available(updates);
+                                    cx.notify();
+                                }
+                            });
+                            if ok.is_err() {
+                                break;
                             }
-                        });
-                        if ok.is_err() {
-                            break;
+                        } else {
+                            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                                if matches!(
+                                    app.update_state,
+                                    update_checker::UpdateState::CheckFailed(_)
+                                ) {
+                                    app.update_state = update_checker::UpdateState::Idle;
+                                    cx.notify();
+                                }
+                            });
                         }
-                        update_checker::CHECK_INTERVAL
-                    }
-                    Ok(None) => {
-                        // 既に最新 — CheckFailed 状態だったらクリアする
-                        let _ = this.update(cx, |app: &mut TakoApp, cx| {
-                            if matches!(
-                                app.update_state,
-                                update_checker::UpdateState::CheckFailed(_)
-                            ) {
-                                app.update_state = update_checker::UpdateState::Idle;
-                                cx.notify();
-                            }
-                        });
                         update_checker::CHECK_INTERVAL
                     }
                     Err(e) => {
@@ -12529,43 +12536,90 @@ impl SystemHost for TakoApp {
     fn update_status(&self) -> serde_json::Value {
         update_checker::update_status_json()
     }
-    fn update_check(&self) -> serde_json::Value {
-        match update_checker::check_latest() {
-            Ok(Some(info)) => serde_json::json!({
-                "available": true,
+    fn update_check(&self, channel: Option<&str>) -> serde_json::Value {
+        let ch = channel.and_then(|s| s.parse::<update_checker::Channel>().ok());
+        let format_info = |info: &update_checker::UpdateInfo| {
+            serde_json::json!({
                 "version": info.version,
+                "channel": info.channel.label(),
                 "download_url": info.download_url,
-            }),
-            Ok(None) => serde_json::json!({ "available": false }),
-            Err(e) => {
-                let mut json = serde_json::json!({
-                    "available": false,
-                    "error": e.to_json(),
-                });
-                json["error_message"] = serde_json::Value::String(e.to_string());
-                json
-            }
+            })
+        };
+        match ch {
+            Some(specific) => match update_checker::check_channel(specific) {
+                Ok(Some(info)) => {
+                    let mut j = format_info(&info);
+                    j["available"] = serde_json::json!(true);
+                    j
+                }
+                Ok(None) => serde_json::json!({ "available": false, "channel": specific.label() }),
+                Err(e) => {
+                    let mut json = serde_json::json!({
+                        "available": false,
+                        "channel": specific.label(),
+                        "error": e.to_json(),
+                    });
+                    json["error_message"] = serde_json::Value::String(e.to_string());
+                    json
+                }
+            },
+            None => match update_checker::check_all_channels() {
+                Ok(updates) => {
+                    let mut json = serde_json::json!({ "available": updates.stable.is_some() || updates.test.is_some() });
+                    if let Some(ref s) = updates.stable {
+                        json["stable"] = format_info(s);
+                    }
+                    if let Some(ref t) = updates.test {
+                        json["test"] = format_info(t);
+                    }
+                    json
+                }
+                Err(e) => {
+                    let mut json = serde_json::json!({
+                        "available": false,
+                        "error": e.to_json(),
+                    });
+                    json["error_message"] = serde_json::Value::String(e.to_string());
+                    json
+                }
+            },
         }
     }
-    fn update_apply(&mut self) -> Result<serde_json::Value, String> {
-        let info = update_checker::check_latest()
+    fn update_apply(&mut self, channel: Option<&str>) -> Result<serde_json::Value, String> {
+        let ch: update_checker::Channel =
+            channel.unwrap_or("stable").parse().map_err(|e: String| e)?;
+        let info = update_checker::check_channel(ch)
             .map_err(|e| format!("更新チェックに失敗: {e}"))?
-            .ok_or_else(|| "新しいバージョンが見つからない（既に最新版です）".to_string())?;
+            .ok_or_else(|| {
+                format!(
+                    "{}の新しいバージョンが見つからない（既に最新版です）",
+                    ch.display_label()
+                )
+            })?;
         update_checker::perform_update(&info)?;
         Ok(serde_json::json!({
             "updated": true,
             "version": info.version,
+            "channel": info.channel.label(),
             "install_method": update_checker::detect_install_method().label(),
         }))
     }
-    fn update_apply_zip(&mut self) -> Result<serde_json::Value, String> {
-        let info = update_checker::check_latest()
+    fn update_apply_zip(&mut self, channel: Option<&str>) -> Result<serde_json::Value, String> {
+        let ch: update_checker::Channel =
+            channel.unwrap_or("stable").parse().map_err(|e: String| e)?;
+        let info = update_checker::check_channel(ch)
             .map_err(|e| format!("更新チェックに失敗: {e}"))?
-            .ok_or_else(|| "新しいバージョンが見つからない（既に最新版です）".to_string())?;
+            .ok_or_else(|| {
+                format!(
+                    "{}の新しいバージョンが見つからない（既に最新版です）",
+                    ch.display_label()
+                )
+            })?;
         update_checker::perform_update_zip(&info)?;
         Ok(serde_json::json!({
             "updated": true,
             "version": info.version,
+            "channel": info.channel.label(),
             "install_method": "zip (fallback)",
         }))
     }
@@ -13708,6 +13762,7 @@ impl Render for TakoApp {
             .children(hover_preview_overlay)
             .children(pinned_overlays)
             .children(self.render_limit_service_overlay(cx))
+            .children(self.render_update_dropdown_overlay(cx))
             .children(self.render_close_confirm_dialog(cx))
             .children(self.render_remote_overlay(cx))
             .children(self.render_command_palette(cx))

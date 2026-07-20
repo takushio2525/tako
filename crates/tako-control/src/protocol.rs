@@ -740,15 +740,19 @@ pub enum Request {
         #[serde(default)]
         focus: Option<bool>,
     },
-    /// アプリ内更新の診断・実行（Issue #36 + #50）。
-    /// `action` 省略 or `"status"` → 配布系統・現在バージョン・重複 CLI の診断情報。
+    /// アプリ内更新の診断・実行（Issue #36 + #50 + #403 チャンネル制）。
+    /// `action` 省略 or `"status"` → 配布系統・現在バージョン・チャンネル・重複 CLI の診断情報。
     /// `"check"` → GitHub Releases を問い合わせて最新版の有無を返す（更新しない）。
+    ///   `channel` = "stable" / "test" で絞り込み、省略で全チャンネル同時チェック。
     /// `"apply"` → 配布系統に応じた更新を実行する（再起動は UI 側の責務）。
+    ///   `channel` = "stable"（既定）/ "test" で対象チャンネルを指定。
     /// `"apply-zip"` → 配布系統を問わず zip 経由で強制更新する（brew 失敗時のフォールバック）。
     /// `"repair"` → broken-brew 状態を修復する（brew install --cask --force で台帳を再締結）
     Update {
         #[serde(default)]
         action: Option<String>,
+        #[serde(default)]
+        channel: Option<String>,
     },
     /// フルディスクアクセス (FDA) の状態確認と設定画面を開く操作（Issue #118）。
     /// `action` = "status"（既定）/ "open"（システム設定を開く）
