@@ -5,6 +5,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- [修正] 赤ボタン close → Dock 復帰でウインドウサイズ・位置がデフォルトに戻る問題を修正 (#412)
+  最後のウィンドウ close 時に `drop_viewport` が `window_frames` を削除し、Dock 復帰の
+  `reopen_or_restore` → `open_viewport` が保存フレームを参照できずデフォルトサイズになっていた。
+  Fix: window size and position not restored after red-button close → Dock reopen (#412).
+  `drop_viewport` was clearing the in-memory frame cache on last-window close.
+
 - [改善] 更新チェッカの GitHub API レート制限対策 (#416)
   gh CLI の認証トークンがあれば自動使用（60→5000req/h）、
   2 チャンネル判定を /releases 一覧の 1 リクエストに統合（旧 check_latest の Web リダイレクト

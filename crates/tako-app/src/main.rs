@@ -5740,7 +5740,10 @@ impl TakoApp {
         persist_diag("赤ボタン close: layout 保存（ワークスペースは生存、Dock 復帰で再表示）");
         self.save_layout();
         if let Some(lid) = logical {
-            self.drop_viewport(lid, handle);
+            // Dock 復帰（reopen_or_restore → open_viewport）が window_frames を参照
+            // するため、フレームだけは保持して viewport 対応表のみ掃除する（#412）
+            self.viewports.retain(|(l, h)| *l != lid && *h != handle);
+            self.viewport_subs.remove(&handle.window_id());
         }
         true
     }
