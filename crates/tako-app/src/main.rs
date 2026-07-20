@@ -19903,6 +19903,16 @@ mod self_test {
                             cx,
                         );
                         let enter_closed = !app.webview_dock_url_focused;
+                        // Enter で生成された webview を後始末（項目 71 の close テストに影響する）
+                        let stale: Vec<_> = app
+                            .webviews
+                            .drain(..)
+                            .filter_map(|e| e.pane)
+                            .collect();
+                        for p in stale {
+                            app.remove_pane(p, cx);
+                        }
+                        webview::set_has_webview(false);
                         app.webview_dock_open = true;
                         app.webview_dock_url_focused = true;
                         app.webview_dock_url_input = "test".into();
