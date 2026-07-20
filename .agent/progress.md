@@ -1003,3 +1003,11 @@
   kill -9 再起動 / 送達阻害 / kill -SEGV）。副産物: セルフテスト 74 の確定失敗を修正同梱、
   #406（webview close 失敗）/ #407（Bypass ダイアログ死）起票
 - 次: `build-app.sh --install` → 本番 master での workers / --worker 運用開始
+
+## 2026-07-22（#413: タブ D&D インジケータが右端固定になる回帰を修正）
+- 根因: GPUI の `on_drag_move` は capture フェーズで全登録要素に hitbox チェックなしで発火し、
+  DOM 順で最後の + ボタンが常に勝ちインジケータが末尾固定。#371 でスクロールエリアの上書きは
+  除去したが + ボタンの上書きは残っていた。#402 の全タブ描画化で視覚的に顕在化
+- 修正: 各 `on_drag_move::<TabDrag>` に `bounds.contains(&position)` チェックを追加
+- 関連コミット: `5bf0759`（PR #419 squash merge）。品質ゲート全緑 + セルフテスト FAILED 0
+- 次: `build-app.sh --install` → 実機でタブ D&D のインジケータ正位置を目視確認
