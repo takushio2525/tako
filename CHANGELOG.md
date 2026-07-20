@@ -5,6 +5,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- [機能追加] worker 自動復旧 supervisor (#401)
+  watch の検知イベント（usage_limit / api_error / limit_dialog / WORKER_DEAD /
+  prompt_undelivered）に対して自動リカバリアクションを実行する常駐ロジックを追加。
+  usage_limit: ダイアログ確定 → リセット時刻待ち → 続行ナッジ → busy 検証。
+  api_error: バックオフ付き続行ナッジ。WORKER_DEAD: 自動 resume（既定 notify-only、opt-in）。
+  prompt_undelivered: レジストリの prompt_head から自動再送。
+  同一 worker で N 回（既定 3）失敗するとエスカレーション（自動停止 + 通知のみ）。
+  監査ログ（supervisor.log）に全アクションを記録。
+  `tako orchestrator supervisor status/set_mode/history` + MCP `tako_orchestrator_supervisor`。
+  Add worker auto-recovery supervisor (#401). Automatic actions for usage_limit
+  (dialog confirm → wait for reset → nudge → verify), api_error (backoff nudge),
+  WORKER_DEAD (auto resume, opt-in), and prompt_undelivered (re-send). Escalation
+  after N failures. Audit log + MCP/CLI 1:1.
+
 - [機能追加] worker レジストリ: ペイン消失後も worker を追跡・watch できるように (#390)
   spawn した worker を永続レジストリ（workers.yaml）へ登録し、アプリ再起動・ペイン消失後も
   watch / status / report が tmux session / claude session ID 経由で追跡を継続する。

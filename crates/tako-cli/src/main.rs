@@ -1205,6 +1205,23 @@ enum OrchestratorCommand {
         #[arg(long)]
         all: bool,
     },
+    /// worker 自動復旧 supervisor の操作（#401）
+    Supervisor {
+        /// status / set_mode / history
+        action: String,
+        /// set_mode 時のモード（auto / notify_only / off）
+        #[arg(long)]
+        mode: Option<String>,
+        /// set_mode 時: WORKER_DEAD の自動 resume を有効にする
+        #[arg(long)]
+        auto_resume_dead: Option<bool>,
+        /// set_mode 時: 同一 worker の最大リトライ回数（既定 3）
+        #[arg(long)]
+        max_retries: Option<u32>,
+        /// 監査ログの返却行数
+        #[arg(long)]
+        lines: Option<usize>,
+    },
     /// spawn + 完了待ち + 出力取得 + close を 1 回で行う
     Run {
         /// プロジェクトキー（projects.yaml に登録済み）
@@ -1992,6 +2009,20 @@ fn main() -> ExitCode {
             })
             .map(|result| println!("{}", pretty_json(&result)))
         }
+        Command::Orchestrator(OrchestratorCommand::Supervisor {
+            ref action,
+            ref mode,
+            auto_resume_dead,
+            max_retries,
+            lines,
+        }) => send_request(Request::OrchestratorSupervisor {
+            action: action.clone(),
+            mode: mode.clone(),
+            auto_resume_dead,
+            max_retries,
+            lines,
+        })
+        .map(|result| println!("{}", pretty_json(&result))),
         Command::Orchestrator(OrchestratorCommand::Run {
             ref project,
             ref prompt,
@@ -3899,6 +3930,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         },
         Command::Orchestrator(OrchestratorCommand::Workers { .. }) => {
             unreachable!("orchestrator workers は run() を通らない（main() でローカル処理済み）")
+        }
+        Command::Orchestrator(OrchestratorCommand::Supervisor { .. }) => {
+            unreachable!("orchestrator supervisor は run() を通らない（main() でローカル処理済み）")
         }
         // remote コマンドは main() でローカル処理済みのため到達不能
         Command::Remote(_) => unreachable!("remote は run() を通らない"),

@@ -7,6 +7,7 @@
 pub mod agent;
 pub mod ledger;
 pub mod registry;
+pub mod supervisor;
 pub mod wait;
 
 use serde::{Deserialize, Serialize};
@@ -329,6 +330,17 @@ pub struct Profile {
     /// タブ名の命名規則（master プロンプトに注入。未設定時はデフォルト規則を使用）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_naming_convention: Option<String>,
+
+    /// supervisor モード（auto / notify_only / off。既定 auto）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_mode: Option<supervisor::SupervisorMode>,
+    /// WORKER_DEAD の自動 resume を有効にする（既定 false = notify-only。
+    /// #390 の設計判断「クラッシュループの危険」を尊重し opt-in）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_resume_dead: Option<bool>,
+    /// supervisor の最大リトライ回数（既定 3。超過でエスカレーション）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_max_retries: Option<u32>,
 }
 
 /// master / claude worker の既定 effort
@@ -354,6 +366,9 @@ impl Default for Profile {
             prompt_blocks: None,
             projects: None,
             tab_naming_convention: None,
+            supervisor_mode: None,
+            auto_resume_dead: None,
+            supervisor_max_retries: None,
         }
     }
 }
