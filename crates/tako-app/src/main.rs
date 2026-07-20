@@ -12614,6 +12614,9 @@ impl SystemHost for TakoApp {
                     if let Some(ref t) = updates.test {
                         json["test"] = format_info(t);
                     }
+                    if let Some(ref note) = updates.rate_limit_note {
+                        json["rate_limit_note"] = serde_json::Value::String(note.clone());
+                    }
                     json
                 }
                 Err(e) => {
