@@ -215,6 +215,13 @@ if [[ "$CUR_VERSION" != "$TAG_VERSION" ]]; then
   exit 0
 fi
 
+# テスト版バージョン（-test.N 等のプレリリースサフィックス付き）はパッチ bump の対象外
+if [[ "$CUR_VERSION" == *-* ]]; then
+  log "SKIP: プレリリース版 ($CUR_VERSION)。夜間パッチ bump は安定版のみ対象"
+  notify "スキップ: プレリリース版（${CUR_VERSION}）"
+  exit 0
+fi
+
 IFS=. read -r major minor patch <<< "$CUR_VERSION"
 NEW_VERSION="$major.$minor.$((patch + 1))"
 NEW_TAG="v$NEW_VERSION"
