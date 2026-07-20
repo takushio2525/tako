@@ -20045,8 +20045,38 @@ mod self_test {
             //      （claude CLI 起動 500〜1100ms の UI 専有 = スクロールのカクつき根治）。
             //      分離後も実 CLI → IPC 経由で応答が返ることを機械検証する
             {
+                // #390 調査で発見した確定失敗の修正: 直前の項目群がフォーカスを
+                // プレビューペイン（terminal なし）に残すことがあり、type_text の
+                // 打鍵が空振りしてコマンドが実行されず必ず失敗していた。
+                // terminal を持つペインへフォーカスを移してから打鍵する
+                // （この項目の検証対象は IPC 応答であり、ペインの選び方は本質でない）
                 let ws_pane = window
-                    .update(cx, |app, _, _| app.focused_pane().as_u64())
+                    .update(cx, |app, _, cx| {
+                        let focused = app.focused_pane();
+                        let target = if app.terminals.contains_key(&focused) {
+                            focused
+                        } else {
+                            let fallback = app
+                                .workspace
+                                .tabs()
+                                .iter()
+                                .flat_map(|t| t.tree().panes())
+                                .map(|p| p.id())
+                                .find(|id| app.terminals.contains_key(id))
+                                .unwrap_or(focused);
+                            let _ = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::Focus {
+                                    pane: Some(fallback.as_u64()),
+                                    direction: None,
+                                },
+                                PaneOrigin::Cli,
+                            );
+                            cx.notify();
+                            fallback
+                        };
+                        target.as_u64()
+                    })
                     .unwrap_or(0);
                 let ws_out = std::env::temp_dir()
                     .join(format!("tako-selftest-ws-{}.json", std::process::id()));
