@@ -5532,12 +5532,49 @@ impl TakoApp {
     }
 
     fn activate_tab_index(&mut self, index: usize, cx: &mut Context<Self>) {
-        // cmd+数字はアクティブウィンドウ内の並びで解釈する（Issue #339）
-        let win_tabs = self
-            .workspace
-            .window_tab_ids(self.workspace.active_window_id());
-        if let Some(id) = win_tabs.get(index).copied() {
-            let _ = self.workspace.activate_tab(id);
+        // cmd+数字は共有タブバーの並び = 全タブで解釈する（#380）
+        let all: Vec<TabId> = self.workspace.tabs().iter().map(|t| t.id()).collect();
+        if let Some(id) = all.get(index).copied() {
+            self.select_tab_for_window(id, self.workspace.active_window_id(), cx);
+        } else {
+            self.scroll_active_tab_into_view();
+            self.sync_filetree_roots();
+            cx.notify();
+        }
+    }
+
+    /// 共有タブバーからのタブ選択（#380）。クリックされた GPUI ウィンドウへ表示を移す
+    pub(crate) fn select_tab_in_viewport(
+        &mut self,
+        tab: TabId,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let viewport = self
+            .viewport_of(window)
+            .unwrap_or_else(|| self.workspace.active_window_id());
+        self.select_tab_for_window(tab, viewport, cx);
+    }
+
+    /// タブを指定ウィンドウの表示にする（#380 共有タブバーの中核）。
+    /// 所属が同じウィンドウなら従来どおり表示タブを切り替え、別ウィンドウ所属なら
+    /// `move_tab_to_window` で表示を奪う（「同一タブは同時に 1 ウィンドウのみ表示」の
+    /// 排他は維持。空になった移動元ウィンドウは除去され sync_viewports が GPUI も閉じる）
+    fn select_tab_for_window(
+        &mut self,
+        tab: TabId,
+        viewport: tako_core::WindowId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.get_window(viewport).is_none()
+            || self.workspace.window_of_tab(tab) == Some(viewport)
+        {
+            let _ = self.workspace.activate_tab(tab);
+        } else {
+            let _ = self.workspace.move_tab_to_window(tab, viewport);
+            // クリック直後の activation イベント順に依存せず、選択先を確実に
+            // アクティブへ（move 済みなので activate_tab は viewport 側で解決される）
+            let _ = self.workspace.activate_tab(tab);
         }
         self.scroll_active_tab_into_view();
         self.sync_filetree_roots();
@@ -21344,6 +21381,60 @@ mod self_test {
                 before.map(|(tabs, _)| tabs) == after.map(|(_, _, tabs)| tabs),
                 "Dock 復帰後もタブ構成が維持される（復元を経ない） (#381)",
             );
+
+            // 80. 共有タブバー（#380）: 別ウィンドウ所属のタブを選択すると表示が
+            //     そのウィンドウへ移る（move_tab_to_window の奪取）。排他は維持され、
+            //     空になった移動元ウィンドウは除去される
+            let win = cx
+                .update(|cx| cx.windows().first().copied())
+                .unwrap_or(any);
+            let shared_ok = win
+                .update(cx, |view, _, cx| {
+                    view.downcast::<TakoApp>().ok().map(|view| {
+                        view.update(cx, |app, cx| {
+                            let base_tab = app.workspace.active_tab_id();
+                            let base_win = app.workspace.active_window_id();
+                            let (w2, t2) = app
+                                .workspace
+                                .create_window("shared-test", Pane::new(PaneOrigin::User));
+                            // 奪取: W2 の viewport から base_tab（W1 所属）を選択
+                            app.select_tab_for_window(base_tab, w2, cx);
+                            let stolen = app.workspace.window_of_tab(base_tab) == Some(w2)
+                                && app.workspace.active_tab_id() == base_tab;
+                            // 排他: 全タブがちょうど 1 ウィンドウに属する
+                            let sum: usize = app
+                                .workspace
+                                .windows()
+                                .iter()
+                                .map(|w| app.workspace.window_tab_ids(w.id()).len())
+                                .sum();
+                            let exclusive = app.workspace.tabs().len() == sum;
+                            // 後始末: テスト用タブを閉じ、base_tab を元のウィンドウへ戻す
+                            if let Some(p) =
+                                app.workspace.get_tab(t2).map(|t| t.tree().focused())
+                            {
+                                app.remove_pane(p, cx);
+                            }
+                            let restored = if app.workspace.get_window(base_win).is_some() {
+                                let _ = app.workspace.move_tab_to_window(base_tab, base_win);
+                                app.workspace.window_of_tab(base_tab) == Some(base_win)
+                            } else {
+                                // W1 が空で除去された場合は base_tab の所属ウィンドウが正
+                                app.workspace.window_of_tab(base_tab).is_some()
+                            };
+                            app.sync_viewports(cx);
+                            stolen && exclusive && restored
+                        })
+                    })
+                })
+                .ok()
+                .flatten()
+                .unwrap_or(false);
+            check(
+                shared_ok,
+                "共有タブバー: 別ウィンドウ所属タブの選択で表示を奪い排他を維持する (#380)",
+            );
+            wait(cx, 800).await;
 
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {

@@ -640,18 +640,24 @@ impl Workspace {
     }
 
     fn activate_by_offset(&mut self, forward: bool) -> TabId {
-        // アクティブウィンドウ内で巡回する（Issue #339。単一ウィンドウなら従来どおり全タブ巡回）
-        let win_tabs = self.window_tab_ids(self.active_window);
-        let len = win_tabs.len();
-        let index = win_tabs.iter().position(|t| *t == self.active).unwrap_or(0);
+        // 共有タブバー（#380）: 表示順 = 全タブで巡回する。他ウィンドウ所属のタブへ
+        // 進んだときはアクティブウィンドウへ表示を移す（タブクリックと同じ奪取規則。
+        // 「同一タブは同時に 1 ウィンドウのみ表示」の排他は move_tab_to_window が保つ）
+        let all: Vec<TabId> = self.tabs.iter().map(|t| t.id()).collect();
+        let len = all.len();
+        let index = all.iter().position(|t| *t == self.active).unwrap_or(0);
         let next = if forward {
             (index + 1) % len
         } else {
             (index + len - 1) % len
         };
-        let id = win_tabs[next];
-        self.window_mut(self.active_window).active = id;
-        self.active = id;
+        let id = all[next];
+        if self.window_of_tab(id) == Some(self.active_window) {
+            self.window_mut(self.active_window).active = id;
+            self.active = id;
+        } else {
+            let _ = self.move_tab_to_window(id, self.active_window);
+        }
         self.active
     }
 
@@ -1261,18 +1267,23 @@ mod tests {
     }
 
     #[test]
-    fn タブ巡回はアクティブウィンドウ内で閉じる() {
+    fn タブ巡回は全タブを跨ぎ他ウィンドウ所属は表示を奪う() {
+        // #380 共有タブバー: next/prev は表示順 = 全タブで巡回し、
+        // 他ウィンドウ所属のタブへ進んだらアクティブウィンドウへ表示を移す
         let mut ws = Workspace::new("t1", pane());
         let t1 = ws.active_tab_id();
         let t2 = ws.create_tab("t2", pane());
-        let (_w2, t3) = ws.create_window("t3", pane());
-        // ウィンドウ 2（タブ 1 個）で巡回しても t3 のまま
-        assert_eq!(ws.activate_next_tab(), t3);
-        assert_eq!(ws.activate_prev_tab(), t3);
-        // ウィンドウ 1 に切り替えると t1 ⇔ t2 で巡回し t3 を跨がない
-        ws.activate_tab(t1).unwrap();
-        assert_eq!(ws.activate_next_tab(), t2);
+        let (w2, t3) = ws.create_window("t3", pane());
+        // ウィンドウ 2（アクティブ）で next → 全タブ順で t3 の次 = t1 を W2 へ奪取
         assert_eq!(ws.activate_next_tab(), t1);
+        assert_eq!(ws.window_of_tab(t1), Some(w2));
+        assert_eq!(ws.active_window_id(), w2);
+        // さらに next → t2 も W2 へ。W1 は空になり除去される（排他は維持）
+        assert_eq!(ws.activate_next_tab(), t2);
+        assert_eq!(ws.window_of_tab(t2), Some(w2));
+        assert_eq!(ws.windows().len(), 1);
+        // 全タブが同一ウィンドウになった後は従来どおりの巡回
+        assert_eq!(ws.activate_next_tab(), t3);
         assert_eq!(ws.activate_prev_tab(), t2);
     }
 
