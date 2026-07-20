@@ -983,3 +983,12 @@
 - 関連コミット: `823e149`（PR #402 squash merge）。実クリック奪取・persist 復元・品質ゲートを
   隔離実測。スクショ証拠は ~/Desktop/tako-380-evidence/
 - 次: build-app.sh --install → ユーザー実機確認（#381/#380 とも）→ Issue クローズは master
+
+## 2026-07-21（renewal 統合同期: origin/main → renewal/remote-transport マージ）
+- v0.6.0 前の統合同期。main 47+ コミット（#391/#358/#384/#392/#397/#398/#381/#380/#399 等）を
+  3 段マージ（`aa349ae` → `a910886` → `e8a7165`）で取り込み。コンフリクト 13 ファイル解決
+  （remote.rs = renewal 正 + #384/#330 統合、setup.rs = #391 と remote 案内両立、
+  changes.yaml = rev 12 振り直し、MCP スナップショット 103 ツール再生成）
+- 検証: fmt / clippy(-D warnings) / test 全緑（1028 本）+ main 側 20 PR の消失ゼロを機械確認。
+  セルフテスト「worker_status IPC（#181）」FAILED は素の main で再現する main 由来（#390 対処中）
+- 次: iPhone 実機確認（統合ビルド）→ #287 レビュー → renewal → main 逆マージ → v0.6.0
