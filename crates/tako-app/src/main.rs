@@ -16062,7 +16062,6 @@ mod self_test {
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], TOOLS_LIST_MSG)
                 .await
                 .unwrap_or_else(|| fail("MCP tools/list 接続"));
-<<<<<<< HEAD
             let tools_ok = {
                 const SNAPSHOT: &str = include_str!("../testdata/mcp_tools_snapshot.txt");
                 let expected: Vec<&str> =
