@@ -358,6 +358,12 @@ impl TakoApp {
                                         )
                                         .on_drag_move::<TabDrag>(cx.listener(
                                             move |this, e: &DragMoveEvent<TabDrag>, _, cx| {
+                                                // GPUI の on_drag_move は capture フェーズで
+                                                // 全登録要素に発火するため、自身の bounds 内か
+                                                // を明示チェックする（#413）
+                                                if !e.bounds.contains(&e.event.position) {
+                                                    return;
+                                                }
                                                 if e.drag(cx).tab == id {
                                                     return;
                                                 }
@@ -537,7 +543,10 @@ impl TakoApp {
                                 this.new_tab_in_viewport(window, cx)
                             }))
                             .on_drag_move::<TabDrag>(cx.listener(
-                                |this, _: &DragMoveEvent<TabDrag>, _, cx| {
+                                |this, e: &DragMoveEvent<TabDrag>, _, cx| {
+                                    if !e.bounds.contains(&e.event.position) {
+                                        return;
+                                    }
                                     this.set_tab_reorder_indicator(None, cx);
                                 },
                             ))

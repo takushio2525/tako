@@ -20,6 +20,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   unified two-channel check into a single /releases API request,
   and shows cached results with a note when rate-limited.
 
+- [修正] タブ D&D 挿入位置インジケータが常に右端に固定表示される問題を修正 (#413)
+  GPUI の on_drag_move が capture フェーズで全登録要素に hitbox チェックなしで発火する
+  ため、+ ボタンのハンドラが常に最後に勝ってインジケータが末尾に固定されていた。
+  各ハンドラに bounds.contains チェックを追加し、カーソル直下の要素だけが反応するよう修正。
+  Fix tab D&D insertion indicator always appearing at the right end (#413).
+  GPUI's on_drag_move fires on all registered elements in capture phase without
+  hitbox checking. Added explicit bounds check to each handler.
+
 - [機能追加] worker 自動復旧 supervisor (#401)
   watch の検知イベント（usage_limit / api_error / limit_dialog / WORKER_DEAD /
   prompt_undelivered）に対して自動リカバリアクションを実行する常駐ロジックを追加。
