@@ -1510,6 +1510,45 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_orchestrator_supervisor",
+            "description": "worker 自動復旧 supervisor の操作（#401）。\
+                usage_limit / api_error / agent_dead / prompt_undelivered に対する自動リカバリの設定・状態照会・履歴参照。\
+                action=status: 現在の設定（mode / auto_resume_dead / max_retries）と監査ログ末尾。\
+                action=set_mode: supervisor モードを変更する（auto = 自動復旧 / notify_only = 通知のみ / off = 無効）。\
+                action=history: 監査ログの末尾を取得する（復旧アクションの全記録）。\
+                WORKER_DEAD の自動 resume は既定 notify-only（auto_resume_dead=false）。\
+                opt-in するには set_mode で auto_resume_dead=true を設定する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "set_mode", "history"],
+                        "description": "status: 現在の設定と監査ログ / set_mode: モード変更 / history: 監査ログ"
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["auto", "notify_only", "off"],
+                        "description": "set_mode 時のモード"
+                    },
+                    "auto_resume_dead": {
+                        "type": "boolean",
+                        "description": "set_mode 時: WORKER_DEAD の自動 resume を有効にする（既定 false）"
+                    },
+                    "max_retries": {
+                        "type": "integer", "minimum": 1, "maximum": 20,
+                        "description": "set_mode 時: 同一 worker の最大リトライ回数（既定 3。超過でエスカレーション）"
+                    },
+                    "lines": {
+                        "type": "integer", "minimum": 1, "maximum": 200,
+                        "description": "status / history: 監査ログの返却行数（既定 20）"
+                    },
+                },
+                "required": ["action"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_orchestrator_report",
             "description": "worker の報告内容を取得する（#364）。\
                 第 1 層: tmux scrollback（capture-pane -J で折返し結合。全 agent 共通）。\
@@ -3056,6 +3095,13 @@ fn build_request(
             choice: str_arg(args, "choice")?.ok_or("choice を指定する")?,
             caller_role: caller_role.map(str::to_string),
         },
+        "tako_orchestrator_supervisor" => Request::OrchestratorSupervisor {
+            action: str_arg(args, "action")?.ok_or("action を指定する")?,
+            mode: str_arg(args, "mode")?,
+            auto_resume_dead: bool_arg(args, "auto_resume_dead")?,
+            max_retries: u64_arg(args, "max_retries")?.map(|v| v as u32),
+            lines: u64_arg(args, "lines")?.map(|v| v as usize),
+        },
         "tako_orchestrator_ledger" => Request::OrchestratorLedger {
             action: str_arg(args, "action")?.ok_or("action を指定する")?,
             id: str_arg(args, "id")?,
@@ -4001,7 +4047,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 104);
+        assert_eq!(tools.len(), 105);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

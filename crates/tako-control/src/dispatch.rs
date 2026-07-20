@@ -2230,6 +2230,20 @@ fn dispatch_inner(
             dispatch_orchestrator_report(host, q, lines.unwrap_or(2000), messages.unwrap_or(1))
         }
 
+        Request::OrchestratorSupervisor {
+            action,
+            mode,
+            auto_resume_dead,
+            max_retries,
+            lines,
+        } => dispatch_orchestrator_supervisor(
+            &action,
+            mode.as_deref(),
+            auto_resume_dead,
+            max_retries,
+            lines,
+        ),
+
         Request::OrchestratorLedger {
             action,
             id,
@@ -5931,6 +5945,67 @@ struct LedgerParams {
     project: Option<String>,
     task_type: Option<String>,
     limit: Option<usize>,
+}
+
+/// OrchestratorSupervisor の dispatch（Issue #401）
+fn dispatch_orchestrator_supervisor(
+    action: &str,
+    mode: Option<&str>,
+    auto_resume_dead: Option<bool>,
+    max_retries: Option<u32>,
+    lines: Option<usize>,
+) -> Result<Value, DispatchError> {
+    use crate::orchestrator::supervisor;
+
+    match action {
+        "status" => {
+            let profile = crate::orchestrator::Profile::load("default").unwrap_or_default();
+            let sv_mode = profile
+                .supervisor_mode
+                .unwrap_or(supervisor::SupervisorMode::Auto);
+            let auto_dead = profile.auto_resume_dead.unwrap_or(false);
+            let retries = profile.supervisor_max_retries.unwrap_or(3);
+            let log = supervisor::read_audit_log(lines.unwrap_or(20));
+            Ok(json!({
+                "mode": sv_mode.as_str(),
+                "auto_resume_dead": auto_dead,
+                "max_retries": retries,
+                "audit_log": log,
+            }))
+        }
+        "set_mode" => {
+            let sv_mode = mode
+                .and_then(supervisor::SupervisorMode::parse_mode)
+                .ok_or_else(|| {
+                    DispatchError::Operation(
+                        "mode は auto / notify_only / off のいずれかを指定".to_string(),
+                    )
+                })?;
+            crate::orchestrator::Profile::mutate_named("default", |p| {
+                p.supervisor_mode = Some(sv_mode);
+                if let Some(ard) = auto_resume_dead {
+                    p.auto_resume_dead = Some(ard);
+                }
+                if let Some(mr) = max_retries {
+                    p.supervisor_max_retries = Some(mr);
+                }
+            })
+            .map_err(DispatchError::Operation)?;
+            Ok(json!({
+                "mode": sv_mode.as_str(),
+                "auto_resume_dead": auto_resume_dead.unwrap_or(false),
+                "max_retries": max_retries.unwrap_or(3),
+                "updated": true,
+            }))
+        }
+        "history" => {
+            let log = supervisor::read_audit_log(lines.unwrap_or(50));
+            Ok(json!({ "audit_log": log }))
+        }
+        _ => Err(DispatchError::Operation(format!(
+            "supervisor の action は status / set_mode / history のいずれか（不明: '{action}'）"
+        ))),
+    }
 }
 
 /// OrchestratorLedger の dispatch（Issue #292）。ControlHost 不要のためスタンドアロン

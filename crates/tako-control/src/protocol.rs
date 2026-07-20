@@ -655,6 +655,24 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         all: Option<bool>,
     },
+    /// オーケストレーター: supervisor の操作（Issue #401）。
+    /// action: status / set_mode / history
+    OrchestratorSupervisor {
+        /// status: 現在の設定と状態。set_mode: モード変更。history: 復旧履歴
+        action: String,
+        /// set_mode 時のモード（auto / notify_only / off）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        /// set_mode 時の auto_resume_dead 設定
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_resume_dead: Option<bool>,
+        /// set_mode 時の max_retries 設定
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_retries: Option<u32>,
+        /// history: 返す件数（既定 20）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lines: Option<usize>,
+    },
     /// オーケストレーター: 委任台帳の操作（Issue #292）。
     /// action: list / stats / record / amend
     OrchestratorLedger {
