@@ -742,6 +742,7 @@ impl TakoApp {
                 } else {
                     return None;
                 };
+                let rate_note = updates.rate_limit_note.clone();
                 Some(
                     pill()
                         .id("update-banner")
@@ -756,6 +757,14 @@ impl TakoApp {
                                 .text_color(hsla(theme.accent))
                                 .child(SharedString::from(summary)),
                         )
+                        .when_some(rate_note, |el, note| {
+                            el.child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(hsla(theme.text_tertiary))
+                                    .child(SharedString::from(note)),
+                            )
+                        })
                         .child(
                             div()
                                 .text_size(px(8.0))

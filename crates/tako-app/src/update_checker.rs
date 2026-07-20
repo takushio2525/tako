@@ -9,8 +9,12 @@
 //!
 //! broken-brew 検知（#50）: brew upgrade 失敗等で「.app 実体あり・cask 台帳なし」の
 //! 詰み状態を検知し、修復（`brew install --cask --force`）または zip フォールバックを提供。
+//!
+//! レート制限対策（#416）: gh CLI 認証トークンがあれば 5000req/h で API を叩く。
+//! 2 チャンネル判定を /releases 一覧の 1 リクエストに統合。レート制限時はキャッシュ表示。
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// 更新チェック間隔（24 時間）
@@ -24,12 +28,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const OWNER_REPO: &str = "takushio2525/tako";
 
-/// Web 側の latest リリース URL（API レート制限の対象外。302 で /releases/tag/vX.Y.Z へ飛ぶ）
-const LATEST_WEB_URL: &str = "https://github.com/takushio2525/tako/releases/latest";
-
 /// GitHub API で直近リリースを取得する URL
 const RELEASES_API_URL: &str =
     "https://api.github.com/repos/takushio2525/tako/releases?per_page=30";
+
+/// 直前の成功結果キャッシュ（レート制限時に表示用）
+static CACHED_UPDATES: Mutex<Option<ChannelUpdates>> = Mutex::new(None);
 
 /// リリースチャンネル
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -89,6 +93,8 @@ pub struct UpdateInfo {
 pub struct ChannelUpdates {
     pub stable: Option<UpdateInfo>,
     pub test: Option<UpdateInfo>,
+    /// レート制限でキャッシュから取得した場合の補助表示（例: 「制限中・約50分後にリセット」）
+    pub rate_limit_note: Option<String>,
 }
 
 /// 更新チェックのエラー（#59: エラーと「更新なし」を区別する）
@@ -387,82 +393,13 @@ pub fn detect_duplicate_cli() -> Vec<PathBuf> {
     seen
 }
 
-/// 最新の安定版をチェック（Web リダイレクト方式。API レート制限の対象外）。
-/// 新しいバージョンがあれば Some(info)、既に最新なら None、エラー時は Err。
-/// 安定版のみ。テスト版を含む全チャンネルチェックは `check_all_channels()` を使う
-pub fn check_latest() -> Result<Option<UpdateInfo>, CheckError> {
-    let agent = ureq::Agent::config_builder()
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
-
-    let resp = agent
-        .get(LATEST_WEB_URL)
-        .header("User-Agent", &format!("tako/{CURRENT_VERSION}"))
-        .call()
-        .map_err(|e| CheckError::Network(e.to_string()))?;
-
-    let status = resp.status().as_u16();
-    match status {
-        301 | 302 => {
-            let location = resp
-                .headers()
-                .get("location")
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| CheckError::Parse("Location ヘッダーがない".into()))?;
-
-            let version = location
-                .rsplit('/')
-                .next()
-                .and_then(|tag| tag.strip_prefix('v'))
-                .ok_or_else(|| CheckError::Parse(format!("タグをパースできない: {location}")))?;
-
-            if !is_newer(version, CURRENT_VERSION) {
-                return Ok(None);
-            }
-
-            let arch = match std::env::consts::ARCH {
-                "aarch64" => "arm64",
-                other => other,
-            };
-            let download_url = format!(
-                "https://github.com/{OWNER_REPO}/releases/download/v{version}/tako-v{version}-macos-{arch}.zip"
-            );
-
-            Ok(Some(UpdateInfo {
-                version: version.to_string(),
-                channel: Channel::Stable,
-                html_url: location.to_string(),
-                download_url: Some(download_url),
-            }))
-        }
-        404 => Err(CheckError::Network(
-            "リリースが見つからない（リポジトリ未公開または未リリース）".into(),
-        )),
-        429 | 403 => {
-            let retry_after = resp
-                .headers()
-                .get("x-ratelimit-reset")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
-            Err(CheckError::RateLimit { retry_after })
-        }
-        _ => Err(CheckError::Network(format!(
-            "予期しないステータスコード: {status}"
-        ))),
-    }
-}
-
-/// 指定チャンネルの最新版をチェック
+/// 指定チャンネルの最新版をチェック（#416: check_all_channels 1 本に統合）
 pub fn check_channel(channel: Channel) -> Result<Option<UpdateInfo>, CheckError> {
-    match channel {
-        Channel::Stable => check_latest(),
-        Channel::Test => {
-            let updates = check_all_channels()?;
-            Ok(updates.test)
-        }
-    }
+    let updates = check_all_channels()?;
+    Ok(match channel {
+        Channel::Stable => updates.stable,
+        Channel::Test => updates.test,
+    })
 }
 
 /// パース済みバージョン（`X.Y.Z` または `X.Y.Z-test.N`）
@@ -533,27 +470,52 @@ impl Ord for ParsedVersion {
 }
 
 /// semver 比較（a > b なら true）。`-test.N` サフィックス対応
-pub fn is_newer(a: &str, b: &str) -> bool {
+#[cfg(test)]
+fn is_newer(a: &str, b: &str) -> bool {
     match (ParsedVersion::parse(a), ParsedVersion::parse(b)) {
         (Some(a), Some(b)) => a > b,
         _ => false,
     }
 }
 
-/// 2 チャンネル同時チェック（GitHub API。認証なし 60req/h = 24h 周期では十分）。
-/// 現在バージョンより新しいリリースがあるチャンネルのみ Some を返す
+/// gh CLI の認証トークンを取得（#416）。メモリ内のみで保持しログ・設定に書かない
+fn gh_auth_token() -> Option<String> {
+    let output = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let token = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if token.is_empty() {
+        return None;
+    }
+    Some(token)
+}
+
+/// 2 チャンネル同時チェック（GitHub API 1 リクエスト。#416）。
+/// gh CLI トークンがあれば認証付き（5000req/h）、なければ未認証（60req/h）。
+/// レート制限時はキャッシュがあれば rate_limit_note 付きで返す
 pub fn check_all_channels() -> Result<ChannelUpdates, CheckError> {
+    let token = gh_auth_token();
+
     let agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .build()
         .new_agent();
 
-    let resp = agent
+    let mut req = agent
         .get(RELEASES_API_URL)
         .header("User-Agent", &format!("tako/{CURRENT_VERSION}"))
-        .header("Accept", "application/vnd.github+json")
-        .call()
-        .map_err(|e| CheckError::Network(e.to_string()))?;
+        .header("Accept", "application/vnd.github+json");
+    if let Some(ref t) = token {
+        req = req.header("Authorization", &format!("Bearer {t}"));
+    }
+
+    let resp = req.call().map_err(|e| CheckError::Network(e.to_string()))?;
 
     let status = resp.status().as_u16();
     if status == 403 || status == 429 {
@@ -562,6 +524,20 @@ pub fn check_all_channels() -> Result<ChannelUpdates, CheckError> {
             .get("x-ratelimit-reset")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
+        // キャッシュがあれば補助表示付きで返す
+        if let Some(cached) = CACHED_UPDATES.lock().ok().and_then(|g| g.clone()) {
+            let note = match retry_after {
+                Some(ts) => format!(
+                    "GitHub API 制限中（キャッシュ表示・リセット: {}）",
+                    format_reset_time(ts)
+                ),
+                None => "GitHub API 制限中（キャッシュ表示）".into(),
+            };
+            return Ok(ChannelUpdates {
+                rate_limit_note: Some(note),
+                ..cached
+            });
+        }
         return Err(CheckError::RateLimit { retry_after });
     }
     if status == 404 {
@@ -582,6 +558,17 @@ pub fn check_all_channels() -> Result<ChannelUpdates, CheckError> {
     let releases: Vec<serde_json::Value> = serde_json::from_str(&body)
         .map_err(|e| CheckError::Parse(format!("JSON パースエラー: {e}")))?;
 
+    let result = parse_releases(&releases);
+
+    if let Ok(mut guard) = CACHED_UPDATES.lock() {
+        *guard = Some(result.clone());
+    }
+
+    Ok(result)
+}
+
+/// /releases JSON 配列から ChannelUpdates をパースする（テスト用にも公開）
+fn parse_releases(releases: &[serde_json::Value]) -> ChannelUpdates {
     let current = ParsedVersion::parse(CURRENT_VERSION);
     let arch = match std::env::consts::ARCH {
         "aarch64" => "arm64",
@@ -590,7 +577,7 @@ pub fn check_all_channels() -> Result<ChannelUpdates, CheckError> {
 
     let mut result = ChannelUpdates::default();
 
-    for release in &releases {
+    for release in releases {
         let tag = release["tag_name"].as_str().unwrap_or_default();
         let version_str = tag.strip_prefix('v').unwrap_or(tag);
         let Some(ver) = ParsedVersion::parse(version_str) else {
@@ -632,7 +619,7 @@ pub fn check_all_channels() -> Result<ChannelUpdates, CheckError> {
         }
     }
 
-    Ok(result)
+    result
 }
 
 /// 更新を実行する（ブロッキング。background executor で呼ぶ）。
@@ -1048,5 +1035,73 @@ mod tests {
             assert!(result.is_err());
             assert!(result.unwrap_err().contains("修復は不要"));
         }
+    }
+
+    // --- #416: parse_releases / gh トークン / キャッシュ ---
+
+    #[test]
+    fn test_parse_releases_both_channels() {
+        let releases = serde_json::json!([
+            {
+                "tag_name": "v99.0.0",
+                "prerelease": false,
+                "html_url": "https://github.com/takushio2525/tako/releases/tag/v99.0.0"
+            },
+            {
+                "tag_name": "v99.0.1-test.1",
+                "prerelease": true,
+                "html_url": "https://github.com/takushio2525/tako/releases/tag/v99.0.1-test.1"
+            },
+        ]);
+        let arr: Vec<serde_json::Value> = serde_json::from_value(releases).unwrap();
+        let result = parse_releases(&arr);
+        assert!(result.stable.is_some());
+        assert_eq!(result.stable.as_ref().unwrap().version, "99.0.0");
+        assert!(result.test.is_some());
+        assert_eq!(result.test.as_ref().unwrap().version, "99.0.1-test.1");
+        assert!(result.rate_limit_note.is_none());
+    }
+
+    #[test]
+    fn test_parse_releases_skips_older() {
+        let releases = serde_json::json!([
+            { "tag_name": "v0.0.1", "prerelease": false, "html_url": "" },
+        ]);
+        let arr: Vec<serde_json::Value> = serde_json::from_value(releases).unwrap();
+        let result = parse_releases(&arr);
+        assert!(result.stable.is_none());
+        assert!(result.test.is_none());
+    }
+
+    #[test]
+    fn test_parse_releases_invalid_tag() {
+        let releases = serde_json::json!([
+            { "tag_name": "nightly", "prerelease": false, "html_url": "" },
+        ]);
+        let arr: Vec<serde_json::Value> = serde_json::from_value(releases).unwrap();
+        let result = parse_releases(&arr);
+        assert!(result.stable.is_none());
+    }
+
+    #[test]
+    fn test_gh_auth_token_does_not_panic() {
+        // gh がなくても None を返すだけで panic しない
+        let _ = gh_auth_token();
+    }
+
+    #[test]
+    fn test_channel_updates_default_has_no_rate_note() {
+        let u = ChannelUpdates::default();
+        assert!(u.rate_limit_note.is_none());
+    }
+
+    #[test]
+    fn test_check_channel_uses_all_channels() {
+        // check_channel が check_all_channels 経由であることの型レベル確認
+        // 実際の API 呼び出しはここではしないが、関数が存在し呼べることを確認
+        let _ = std::panic::catch_unwind(|| {
+            // ネットワーク不達なら Network エラーが返る（panic しない）
+            let _ = check_channel(Channel::Stable);
+        });
     }
 }

@@ -5,6 +5,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- [改善] 更新チェッカの GitHub API レート制限対策 (#416)
+  gh CLI の認証トークンがあれば自動使用（60→5000req/h）、
+  2 チャンネル判定を /releases 一覧の 1 リクエストに統合（旧 check_latest の Web リダイレクト
+  方式を廃止）、レート制限時はキャッシュ済みの結果を補助表示付きで返すように変更。
+  GitHub rate limit countermeasures for the update checker (#416).
+  Automatically uses gh CLI auth token when available (60→5000req/h),
+  unified two-channel check into a single /releases API request,
+  and shows cached results with a note when rate-limited.
+
 - [機能追加] worker 自動復旧 supervisor (#401)
   watch の検知イベント（usage_limit / api_error / limit_dialog / WORKER_DEAD /
   prompt_undelivered）に対して自動リカバリアクションを実行する常駐ロジックを追加。
