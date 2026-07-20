@@ -81,7 +81,7 @@ pub enum OffloadJob {
         tmux_session: Option<String>,
     },
     Workers {
-        live_panes: Vec<u64>,
+        live_panes: Vec<(u64, Option<String>)>,
         include_closed: bool,
     },
     GitLog {
@@ -120,7 +120,10 @@ pub fn prepare_offload(
                 Err(e) => return Some(Err(e)),
             };
             Some(Ok(OffloadJob::WorkerStatus {
-                ctx: collect_worker_status_ctx(host, q.pane_id),
+                ctx: verify_ctx_pane_identity(
+                    collect_worker_status_ctx(host, q.pane_id),
+                    q.tmux_session.as_deref(),
+                ),
                 session_id: q.session_id,
                 tmux_session: q.tmux_session,
             }))
@@ -219,27 +222,48 @@ fn resolve_worker_query(
     })
 }
 
-/// OrchestratorWorkers の UI スレッド必須部分: GUI に現存するペイン ID の収集
-fn collect_live_panes(host: &dyn ControlHost) -> Vec<u64> {
-    let mut panes: Vec<u64> = host
-        .workspace()
-        .tabs()
-        .iter()
-        .flat_map(|tab| tab.tree().panes())
-        .map(|p| p.id().as_u64())
-        .collect();
-    panes.extend(
-        host.workspace()
-            .shelved_panes()
-            .iter()
-            .map(|s| s.id().as_u64()),
-    );
+/// pane ID 再利用の誤マッチ検証（#390）。復元なし再起動では新プロセスが同じ
+/// pane 番号を別ペインへ振り直すため、レジストリ由来の pane ID が「現 GUI の
+/// 無関係なペイン」を指すことがある。期待する tmux バックエンドセッションと
+/// 現ペインの backend が食い違えば別物とみなし、ライブ画面を破棄して
+/// tmux セッションフォールバック（正しい worker の実体）だけで判定させる
+fn verify_ctx_pane_identity(
+    mut ctx: WorkerStatusCtx,
+    expected_tmux: Option<&str>,
+) -> WorkerStatusCtx {
+    if let Some(expect) = expected_tmux {
+        if ctx.pane_exists && ctx.backend_session.as_deref() != Some(expect) {
+            ctx.pane_exists = false;
+            ctx.backend_session = None;
+            ctx.live_tail = None;
+            ctx.full_screen = None;
+            ctx.has_running_children = false;
+        }
+    }
+    ctx
+}
+
+/// OrchestratorWorkers の UI スレッド必須部分: GUI に現存するペイン ID と
+/// backend セッション名の収集（backend は pane ID 再利用の同一性検証に使う。#390）
+fn collect_live_panes(host: &dyn ControlHost) -> Vec<(u64, Option<String>)> {
+    let mut panes: Vec<(u64, Option<String>)> = Vec::new();
+    for tab in host.workspace().tabs() {
+        for p in tab.tree().panes() {
+            panes.push((p.id().as_u64(), host.backend_session(p.id())));
+        }
+    }
+    for s in host.workspace().shelved_panes() {
+        panes.push((s.id().as_u64(), host.backend_session(s.id())));
+    }
     panes
 }
 
 /// OrchestratorWorkers のサブプロセス実行部分（tmux ls + レジストリ読み）。
 /// UI スレッドで呼ばないこと（OffloadJob::run / dispatch 同期経路用）
-fn finish_workers_list(live_panes: &[u64], include_closed: bool) -> Result<Value, DispatchError> {
+fn finish_workers_list(
+    live_panes: &[(u64, Option<String>)],
+    include_closed: bool,
+) -> Result<Value, DispatchError> {
     use crate::orchestrator::registry;
     let reg = registry::WorkerRegistry::load()
         .map_err(|e| DispatchError::Operation(format!("worker レジストリを読めない: {e}")))?;
@@ -2160,7 +2184,10 @@ fn dispatch_inner(
             // 同期経路（テスト・直呼び用）。IPC / MCP 経由は prepare_offload が
             // collect（UI）と finish（background）に分割して実行する（#168 / #181）
             let q = resolve_worker_query(pane_id, worker.as_deref(), session_id, tmux_session)?;
-            let ctx = collect_worker_status_ctx(host, q.pane_id);
+            let ctx = verify_ctx_pane_identity(
+                collect_worker_status_ctx(host, q.pane_id),
+                q.tmux_session.as_deref(),
+            );
             finish_worker_status(ctx, q.session_id.as_deref(), q.tmux_session.as_deref())
         }
 
@@ -3981,10 +4008,19 @@ fn dispatch_orchestrator_report(
 
     // 第 1 層: scrollback（全 agent 共通の主ソース）。
     // pane が GUI から消えていても、レジストリ由来の tmux_session が生きていれば
-    // そこから capture する（#390: ペイン消失後の追跡継続）
+    // そこから capture する（#390: ペイン消失後の追跡継続）。
+    // pane ID 再利用の誤マッチ検証: 期待 tmux_session と現ペインの backend が
+    // 食い違えば別ペインなので、backend ではなく期待セッション側を読む
     let socket = tako_core::tmux_backend::socket_name();
-    let scrollback = if let Some(backend) = host.backend_session(target) {
-        capture_scrollback_joined(Some(&socket), &backend, lines)
+    let backend = host.backend_session(target).filter(|b| {
+        query
+            .tmux_session
+            .as_deref()
+            .is_none_or(|expect| expect == b)
+    });
+    let pane_identity_ok = backend.is_some();
+    let scrollback = if let Some(ref backend) = backend {
+        capture_scrollback_joined(Some(&socket), backend, lines)
     } else if let Some(ref ts) = query.tmux_session {
         if tako_core::tmux::session_alive(Some(&socket), ts) {
             result["source_fallback"] = json!("registry_tmux");
@@ -3998,18 +4034,23 @@ fn dispatch_orchestrator_report(
 
     // 第 2 層: transcript アダプタ（claude のみ。将来 codex 等を追加する拡張点）
     // messages パラメータで直近 N 件を取得（#374。既定 1 件で後方互換）。
-    // pane から解決できなければレジストリ由来の session_id で継続（#390）
+    // pane 経由の session 解決は pane の同一性が確認できた場合のみ
+    // （pane ID 再利用時に別 worker の transcript を返さない。#390）。
+    // pane から解決できなければレジストリ由来の session_id で継続
     let msg_count = messages.max(1);
-    let transcript = resolve_session_id_for_pane_via_host(host, target)
-        .or(query.session_id)
-        .and_then(|sid| {
-            let texts = crate::transcript::last_assistant_texts(&sid, msg_count).ok()?;
-            if texts.is_empty() {
-                return None;
-            }
-            result["session_id"] = json!(sid);
-            Some(texts)
-        });
+    let pane_sid = if pane_identity_ok {
+        resolve_session_id_for_pane_via_host(host, target)
+    } else {
+        None
+    };
+    let transcript = pane_sid.or(query.session_id).and_then(|sid| {
+        let texts = crate::transcript::last_assistant_texts(&sid, msg_count).ok()?;
+        if texts.is_empty() {
+            return None;
+        }
+        result["session_id"] = json!(sid);
+        Some(texts)
+    });
 
     match (&transcript, &scrollback) {
         (Some(texts), _) => {
@@ -4581,6 +4622,31 @@ fn finish_worker_status(
         Some(tail_join(lines))
     });
 
+    // #390: エージェントプロセスの生存シグナル（突然死判定専用）。
+    // ctx の has_children（pane 健在時のみ計算）に加え、pane 消失中は
+    // レジストリ由来の tmux_session で子プロセスを再計算する。
+    // busy / stalled 補正の has_children には**混ぜない**: idle 中のエージェント
+    // TUI プロセス自体も「子」に数えられるため、補正へ流すと pane 消失中の
+    // 完了 worker が永遠に busy 判定になり IDLE を検知できない（run6 実測で確認）
+    let agent_process_alive = has_children
+        || (backend_session.is_none()
+            && tmux_session.is_some_and(|ts| {
+                let socket = tako_core::tmux_backend::socket_name();
+                tako_core::tmux::session_alive(Some(&socket), ts)
+                    && crate::agents::has_running_children(ts)
+            }));
+
+    // #390: エージェント突然死判定の材料と復旧コマンド（apply 側で最終判定）。
+    // 判定は「画面を観測できている」ことを前提にする（recent_output なし = tmux も
+    // 引けない状態で dead と断定しない）
+    let registry_session_detected = registry_worker
+        .as_ref()
+        .is_some_and(|(_, e)| e.session_id.is_some())
+        && recent_output.is_some();
+    let registry_resume_command = registry_worker
+        .as_ref()
+        .and_then(|(_, e)| orchestrator::registry::resume_command(e));
+
     // #390: session_id が今回の照会で解決できたらレジストリへ書き戻す（lazy 昇格）。
     // GUI の定期スキャンが止まっていても（セカンダリモード等）prompt 到達の証跡が残り、
     // 未達の誤検知を防ぐ。best-effort（失敗は無視）
@@ -4615,6 +4681,9 @@ fn finish_worker_status(
         tmux_session: tmux_session.map(String::from),
         registry_worker_id: registry_worker.map(|(id, _)| id),
         prompt_delivery,
+        registry_session_detected,
+        registry_resume_command,
+        agent_process_alive,
     })
 }
 
@@ -4634,6 +4703,13 @@ struct ResolvedWorkerStatus {
     registry_worker_id: Option<String>,
     /// #390: prompt 送達判定（レジストリ登録済み worker のみ）と spawn からの経過秒
     prompt_delivery: Option<(crate::orchestrator::registry::PromptDelivery, i64)>,
+    /// #390: レジストリに session_id が記録済み（= エージェントは一度起動して走った）
+    registry_session_detected: bool,
+    /// #390: レジストリの session ID から組み立てた復旧コマンド（claude のみ）
+    registry_resume_command: Option<String>,
+    /// #390: エージェントプロセスの生存シグナル（突然死判定専用。pane 消失中は
+    /// tmux フォールバックで再計算済み。busy / stalled 補正には使わない）
+    agent_process_alive: bool,
 }
 
 /// worker_status の初期状態に補正ロジックを適用し、最終的な JSON 応答を構築する。
@@ -4651,6 +4727,9 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         tmux_session,
         registry_worker_id,
         prompt_delivery,
+        registry_session_detected,
+        registry_resume_command,
+        agent_process_alive,
     } = resolved;
     // #267: agents が "gone" を返しても pane が workspace にある場合は
     // セッション未発見なだけで worker は健在 → unknown に降格
@@ -4746,15 +4825,18 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     .collect();
 
     // #390: prompt 未達検知（保守的な複合条件で誤検知を防ぐ）。
-    // レジストリ判定が「猶予超過 + transcript 未観測」でも、画面が busy または
-    // 実行中子プロセスがあれば作業中とみなして発火しない（検出遅延の可能性）
+    // レジストリ判定が「猶予超過 + transcript 未観測」でも、画面が busy なら
+    // 作業中とみなして発火しない（transcript 検出遅延の可能性）。
+    // has_children は抑制条件にしない: プロンプト未達の claude は welcome 画面の
+    // まま「プロセスとしては生存」しているため（当日の実害 2 件目 = ペイン健在の
+    // 未達がまさにこの状態）、子プロセスの有無は未達かどうかの判別に使えない
     let prompt_delivery_final = prompt_delivery.map(|(assessment, since_spawn)| {
         use crate::orchestrator::registry::PromptDelivery;
         if assessment == PromptDelivery::OverdueSuspect {
             let screen_busy = recent_output
                 .as_ref()
                 .is_some_and(|out| crate::orchestrator::wait::screen_looks_busy(out));
-            if screen_busy || has_children || status == "busy" {
+            if screen_busy || status == "busy" {
                 (PromptDelivery::Pending, since_spawn)
             } else {
                 (assessment, since_spawn)
@@ -4770,6 +4852,32 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
             crate::orchestrator::wait::WorkerEvent {
                 kind: crate::orchestrator::wait::WorkerEventKind::PromptUndelivered {
                     seconds_since_spawn: since_spawn,
+                },
+            }
+            .to_json(),
+        );
+    }
+
+    // #390: エージェント CLI プロセスの突然死検知（SIGSEGV 等）。
+    // 条件: レジストリに session_id 記録済み（= 一度は起動して走った）+ 実行中子プロセス
+    // なし + agents API がプロセス生存を確認していない + gone / busy でない。
+    // busy は「動いている」判定を尊重して発火しない（誤爆ゼロ優先。SIGSEGV 残骸の
+    // 偽 busy は has_children=false により stalled へ転換されてから本判定に入る）。
+    // 単発照会では「疑い」であり、watch は 2 回連続観測で WORKER_DEAD を確定する。
+    // 自動 resume はしない（クラッシュループの危険 + master の判断を奪わないため、
+    // resume_command の提示まで）
+    let alive_by_agents =
+        status_source.starts_with("agents") && status != "unknown" && status != "gone";
+    let agent_dead = registry_session_detected
+        && !agent_process_alive
+        && !alive_by_agents
+        && status != "gone"
+        && status != "busy";
+    if agent_dead {
+        events.push(
+            crate::orchestrator::wait::WorkerEvent {
+                kind: crate::orchestrator::wait::WorkerEventKind::AgentDead {
+                    resume_command: registry_resume_command.clone(),
                 },
             }
             .to_json(),
@@ -4816,6 +4924,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         // #390: worker レジストリ由来の情報（未登録ペインは null）
         "worker_id": registry_worker_id,
         "prompt_delivery": prompt_delivery_final.map(|(d, _)| d.as_str()),
+        "resume_command": registry_resume_command,
     }))
 }
 
@@ -9989,6 +10098,113 @@ mod tests {
             "解決済み session_id がレジストリへ書き戻される"
         );
         assert!(entry.prompt_delivered_at.is_some());
+    }
+
+    #[test]
+    fn issue390_agent突然死をagent_deadイベントで検知しresumeを提示する() {
+        use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
+        let path = registry_path().unwrap();
+        // session_id 記録済み（= 一度は走った）claude worker
+        WorkerRegistry::mutate_at(&path, |reg| {
+            reg.workers.insert(
+                "q7802".into(),
+                WorkerEntry {
+                    pane: 7802,
+                    agent: "claude".into(),
+                    status: "active".into(),
+                    session_id: Some("sid-7802".into()),
+                    cwd: Some("/tmp/proj".into()),
+                    spawned_at: crate::sessions::now_iso(),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+
+        let dead_ctx = |has_children: bool| WorkerStatusCtx {
+            pane_id: 7802,
+            pane_exists: true,
+            backend_session: None,
+            // SIGSEGV 後のシェルプロンプト画面（claude TUI の ❯ ではない）
+            live_tail: Some("zsh: segmentation fault  claude\n% ".into()),
+            full_screen: None,
+            has_running_children: has_children,
+        };
+
+        // 子プロセスなし → agent_dead イベント + resume_command
+        let v = finish_worker_status(dead_ctx(false), None, None).unwrap();
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(kinds.contains(&"agent_dead"), "events: {kinds:?}");
+        assert_eq!(
+            v["resume_command"],
+            "cd '/tmp/proj' && claude --resume sid-7802"
+        );
+        let dead_ev = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["kind"] == "agent_dead")
+            .unwrap();
+        assert_eq!(
+            dead_ev["resume_command"],
+            "cd '/tmp/proj' && claude --resume sid-7802"
+        );
+        assert_eq!(dead_ev["recommended_action"], "resume_session");
+        // session 検出済みなので prompt_undelivered は出ない
+        assert!(!kinds.contains(&"prompt_undelivered"));
+
+        // 実行中子プロセスあり（生存中）→ 発火しない
+        let v = finish_worker_status(dead_ctx(true), None, None).unwrap();
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(!kinds.contains(&"agent_dead"), "生存中は発火しない");
+    }
+
+    #[test]
+    fn issue390_wait_for_workerがagent_dead2連続でworker_deadを確定する() {
+        use crate::orchestrator::wait::{wait_for_worker, WatchOptions, WatchOutcome};
+        let mut calls = 0u32;
+        let mut exec = |_req: Request| -> Result<Value, String> {
+            calls += 1;
+            Ok(json!({
+                "status": "unknown",
+                "recent_output": "% ",
+                "status_source": "screen",
+                "events": [{
+                    "kind": "agent_dead",
+                    "resume_command": "claude --resume sid-x",
+                    "recommended_action": "resume_session",
+                }],
+            }))
+        };
+        let outcome = wait_for_worker(
+            &mut exec,
+            &WatchOptions {
+                pane_id: 7803,
+                session_id: None,
+                tmux_session: None,
+                timeout: Some(std::time::Duration::from_secs(30)),
+                initial_delay: std::time::Duration::ZERO,
+                interval: std::time::Duration::ZERO,
+            },
+            None,
+        );
+        assert_eq!(
+            outcome,
+            WatchOutcome::AgentDead {
+                resume_command: Some("claude --resume sid-x".into())
+            }
+        );
+        assert_eq!(calls, 2, "2 回連続観測で確定（単発の取りこぼし誤爆を防ぐ）");
     }
 
     #[test]

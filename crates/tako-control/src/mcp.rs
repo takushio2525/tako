@@ -1301,7 +1301,10 @@ pub fn tools() -> Vec<Value> {
                 worker（レジストリ ID）指定なら pane_id 省略可。\
                 応答の prompt_delivery（delivered / pending / undelivered）と \
                 events の prompt_undelivered イベントで spawn プロンプトの未達を検知できる \
-                （undelivered なら tako_send_input でプロンプトを再送する）。",
+                （undelivered なら tako_send_input でプロンプトを再送する）。\
+                events の agent_dead はエージェント CLI プロセスの突然死（SIGSEGV 等）の疑い: \
+                応答の resume_command（レジストリの session ID から組み立てた claude --resume）を \
+                ペインのシェルへ tako_send_input すれば文脈ごと復旧できる（自動 resume はしない）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1322,7 +1325,8 @@ pub fn tools() -> Vec<Value> {
                 tako 再起動でペインが消えても、レジストリに残る worker は tmux_session / session_id 経由で \
                 watch / status / report を継続できる。各エントリに worker_id / pane / tmux_session / \
                 session_id / pane_alive（GUI にペインが現存するか）/ tmux_alive（tmux session が生存中か）/ \
-                prompt_delivery（delivered = プロンプト到達済み / pending = 確認中 / undelivered = 未達の疑い）が入る。\
+                prompt_delivery（delivered = プロンプト到達済み / pending = 確認中 / undelivered = 未達の疑い）/ \
+                resume_command（session ID 検出済み claude worker の復旧コマンド。突然死時に使う）が入る。\
                 既定は active のみ。all = true で closed（明示 close 済み）も含める。",
             "inputSchema": {
                 "type": "object",

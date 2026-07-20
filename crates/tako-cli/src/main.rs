@@ -2593,8 +2593,25 @@ fn orchestrator_watch(
             println!("  action: respond");
             print_events(&mut exec);
         }
+        wait::WatchOutcome::AgentDead { resume_command } => {
+            println!("WORKER_DEAD: tako:{pane}");
+            println!(
+                "  detail: エージェント CLI プロセスが終了している（SIGSEGV 等の突然死の疑い）"
+            );
+            if let Some(cmd) = resume_command {
+                println!("  resume: {cmd}");
+            } else {
+                println!("  resume: (session ID 未記録のため resume コマンドを組み立てられない)");
+            }
+            println!("  action: resume_session");
+        }
         wait::WatchOutcome::Gone => println!("WORKER_GONE: tako:{pane}"),
-        wait::WatchOutcome::Timeout => println!("WORKER_TIMEOUT: tako:{pane}"),
+        wait::WatchOutcome::Timeout => {
+            println!("WORKER_TIMEOUT: tako:{pane}");
+            // #390: prompt 未達（welcome 画面のまま = idle 判定が積めず TIMEOUT に
+            // なりやすい）等の検知イベントを補助行で出す
+            print_events(&mut exec);
+        }
     }
     Ok(())
 }

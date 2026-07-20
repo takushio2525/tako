@@ -354,6 +354,29 @@ pub fn record_session_detected(tmux_session: &str, session_id: &str) -> Result<(
     })
 }
 
+/// レジストリの session ID から復旧コマンドを組み立てる（#390: SIGSEGV 等の
+/// 突然死からの復旧提示）。claude のみ（--resume の互換が確認できているのは claude）。
+/// master はこのコマンドを死んだペインのシェルへ send_input するか、新ペインで実行する
+pub fn resume_command(entry: &WorkerEntry) -> Option<String> {
+    if entry.agent != "claude" {
+        return None;
+    }
+    let sid = entry.session_id.as_deref()?;
+    let mut cmd = String::new();
+    if let Some(cwd) = entry.cwd.as_deref().filter(|c| !c.is_empty()) {
+        cmd.push_str(&format!("cd '{}' && ", cwd.replace('\'', "'\\''")));
+    }
+    cmd.push_str("claude");
+    if let Some(model) = entry.model.as_deref().filter(|m| !m.is_empty()) {
+        cmd.push_str(&format!(" --model {model}"));
+    }
+    if let Some(effort) = entry.effort.as_deref().filter(|e| !e.is_empty()) {
+        cmd.push_str(&format!(" --effort {effort}"));
+    }
+    cmd.push_str(&format!(" --resume {sid}"));
+    Some(cmd)
+}
+
 /// prompt 送達状態を判定する（Issue #390 要件 4）。
 /// OverdueSuspect は「疑い」であり、最終的な未達イベントの発火は呼び出し側が
 /// 画面状態（busy でない・実行中子プロセスなし）と組み合わせて決める
@@ -378,12 +401,15 @@ pub fn prompt_delivery_assessment(entry: &WorkerEntry, now_epoch: i64) -> Prompt
 
 /// workers 一覧の JSON ペイロードを組み立てる。
 /// `live_backends` は現存する tmux セッション名（呼び出し側が 1 コマンドで列挙）、
-/// `live_panes` は GUI に現存するペイン ID（tree + shelved）。
+/// `live_panes` は GUI に現存する（ペイン ID, backend セッション名）の組（tree + shelved）。
+/// backend は pane ID 再利用の同一性検証に使う: エントリが tmux_session を持つ場合、
+/// 同番号ペインの backend が一致しなければ「別物」= pane_alive にしない（#390。
+/// 復元なし再起動では新プロセスが同じ番号を別ペインへ振るため）。
 /// `include_closed` = false なら active のみ返す
 pub fn list_payload(
     registry: &WorkerRegistry,
     live_backends: &[String],
-    live_panes: &[u64],
+    live_panes: &[(u64, Option<String>)],
     include_closed: bool,
 ) -> Value {
     let now_epoch = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap_or(0);
@@ -400,7 +426,15 @@ pub fn list_payload(
             .tmux_session
             .as_deref()
             .is_some_and(|ts| live_backends.iter().any(|b| b == ts));
-        let pane_alive = live_panes.contains(&e.pane);
+        let pane_alive = live_panes.iter().any(|(pid, backend)| {
+            *pid == e.pane
+                && match e.tmux_session.as_deref() {
+                    // 追跡キーがあれば backend の一致で同一性を確認
+                    Some(expect) => backend.as_deref() == Some(expect),
+                    // キーが無い（tmux 無し spawn）場合は番号のみで判定
+                    None => true,
+                }
+        });
         let delivery = prompt_delivery_assessment(e, now_epoch);
         items.push(json!({
             "worker_id": id,
@@ -424,6 +458,7 @@ pub fn list_payload(
             "pane_alive": pane_alive,
             "tmux_alive": tmux_alive,
             "prompt_delivery": delivery.as_str(),
+            "resume_command": resume_command(e),
         }));
     }
     json!({ "workers": items, "count": items.len() })
@@ -654,6 +689,44 @@ mod tests {
     }
 
     #[test]
+    fn resume_commandはsession検出済みclaudeのみ組み立てる() {
+        let entry = WorkerEntry {
+            agent: "claude".into(),
+            session_id: Some("abc-123".into()),
+            cwd: Some("/tmp/proj".into()),
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resume_command(&entry).as_deref(),
+            Some("cd '/tmp/proj' && claude --model opus --effort high --resume abc-123")
+        );
+        // model / effort / cwd 省略時は最簡形
+        let minimal = WorkerEntry {
+            agent: "claude".into(),
+            session_id: Some("abc-123".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resume_command(&minimal).as_deref(),
+            Some("claude --resume abc-123")
+        );
+        // session 未検出 / claude 以外は None
+        let no_sid = WorkerEntry {
+            agent: "claude".into(),
+            ..Default::default()
+        };
+        assert!(resume_command(&no_sid).is_none());
+        let codex = WorkerEntry {
+            agent: "codex".into(),
+            session_id: Some("abc".into()),
+            ..Default::default()
+        };
+        assert!(resume_command(&codex).is_none());
+    }
+
+    #[test]
     fn resolveの前方一致と曖昧エラー() {
         let path = temp_registry_file("resolve");
         for pane in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] {
@@ -699,7 +772,7 @@ mod tests {
         let payload = list_payload(
             &reg,
             &["tako-pane-30".to_string()],
-            &[999], // pane 30 は GUI に不在
+            &[(999, None)], // pane 30 は GUI に不在
             false,
         );
         assert_eq!(payload["count"], 1);
@@ -709,6 +782,30 @@ mod tests {
         assert_eq!(w["tmux_alive"], true);
         assert_eq!(w["prompt_delivery"], "pending");
         assert_eq!(w["status"], "active");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn list_payloadはpane番号再利用の別ペインをaliveにしない() {
+        let path = temp_registry_file("payload-reuse");
+        register_at(&path, sample_record(30)); // tmux_session = tako-pane-30
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        // 同じ pane 番号 30 が GUI に居るが backend が別（= 再起動後の別ペイン）
+        let payload = list_payload(
+            &reg,
+            &["tako-pane-30".to_string()],
+            &[(30, Some("tako-other".to_string()))],
+            false,
+        );
+        assert_eq!(payload["workers"][0]["pane_alive"], false);
+        // backend が一致すれば alive（persist 復元で同一ペイン）
+        let payload = list_payload(
+            &reg,
+            &["tako-pane-30".to_string()],
+            &[(30, Some("tako-pane-30".to_string()))],
+            false,
+        );
+        assert_eq!(payload["workers"][0]["pane_alive"], true);
         let _ = std::fs::remove_file(&path);
     }
 }
