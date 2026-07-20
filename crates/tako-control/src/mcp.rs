@@ -1237,7 +1237,8 @@ pub fn tools() -> Vec<Value> {
             "description": "プロジェクトの作業ディレクトリで子 worker を spawn する。\
                 worker のエージェント CLI は claude（既定）/ codex / agy から選べる（agent パラメータ）。\
                 呼び出し元ペインを右に分割して新ペインを作り、エージェントを起動してプロンプトを送信する。\
-                worker の pane_id・tmux_session・spawned_by（spawn 元ペイン ID）・agent を返す。\
+                worker の pane_id・tmux_session・spawned_by（spawn 元ペイン ID）・agent・\
+                worker_id（レジストリ ID。#390: ペイン消失後の watch / status / report に使える）を返す。\
                 tmux_session は pane ID が解決できない場合\
                 （BG タブ移動・tako 再起動後）のフォールバックとして tako_read_pane / tako_send_input に渡せる。\
                 worker_status / watch は pane_id だけで session を自動解決するため session_id は不要\
@@ -1294,18 +1295,44 @@ pub fn tools() -> Vec<Value> {
                 tmux_session を渡すとペインが消えても tmux session が生きている限り \
                 recent_output を取得でき、gone にならない。\
                 退避（shelved）されたペインも追跡可能。recent_output はペインの最近 30 行の出力。\
-                resolved_session_id に自動解決された session_id が入る。",
+                resolved_session_id に自動解決された session_id が入る。\
+                #390: spawn 済み worker はレジストリに登録済みのため、pane_id 指定でも \
+                tmux_session / session_id が自動補完され、ペイン消失後も追跡が切れない。\
+                worker（レジストリ ID）指定なら pane_id 省略可。\
+                応答の prompt_delivery（delivered / pending / undelivered）と \
+                events の prompt_undelivered イベントで spawn プロンプトの未達を検知できる \
+                （undelivered なら tako_send_input でプロンプトを再送する）。\
+                events の agent_dead はエージェント CLI プロセスの突然死（SIGSEGV 等）の疑い: \
+                応答の resume_command（レジストリの session ID から組み立てた claude --resume）を \
+                ペインのシェルへ tako_send_input すれば文脈ごと復旧できる（自動 resume はしない）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pane_id": { "type": "integer", "minimum": 0, "description": "worker のペイン ID（必須）" },
+                    "pane_id": { "type": "integer", "minimum": 0, "description": "worker のペイン ID（worker と排他。どちらか必須）" },
+                    "worker": { "type": "string", "description": "worker レジストリの ID（#390。tako_orchestrator_spawn の返り値 worker_id / tako_orchestrator_workers で確認）" },
                     "session_id": { "type": "string", "description": "claude の session ID（あれば精度向上）" },
                     "tmux_session": {
                         "type": "string",
                         "description": "tmux session 名（pane 消滅時のフォールバック追跡。tako_orchestrator_spawn の返り値に含まれる）",
                     },
                 },
-                "required": ["pane_id"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_orchestrator_workers",
+            "description": "worker レジストリの一覧（#390）。spawn 済み worker をペインの生死と無関係に列挙する。\
+                tako 再起動でペインが消えても、レジストリに残る worker は tmux_session / session_id 経由で \
+                watch / status / report を継続できる。各エントリに worker_id / pane / tmux_session / \
+                session_id / pane_alive（GUI にペインが現存するか）/ tmux_alive（tmux session が生存中か）/ \
+                prompt_delivery（delivered = プロンプト到達済み / pending = 確認中 / undelivered = 未達の疑い）/ \
+                resume_command（session ID 検出済み claude worker の復旧コマンド。突然死時に使う）が入る。\
+                既定は active のみ。all = true で closed（明示 close 済み）も含める。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "all": { "type": "boolean", "description": "closed の worker も含める（既定 false）" },
+                },
                 "additionalProperties": false,
             },
         }),
@@ -1491,11 +1518,14 @@ pub fn tools() -> Vec<Value> {
                 スクロールバック版も併記する。利用不可（codex / agy 等）なら source=scrollback。\
                 tako_read_pane（可視画面のみ）と異なり、スクロールバック履歴を遡るため長い出力も取得できる。\
                 報告の読み取りには report を使い、read_pane は配置・生存確認用に限定すること。\
-                messages で直近 n 件の assistant テキストを取得できる（古い順で返す。省略時 1 件）。",
+                messages で直近 n 件の assistant テキストを取得できる（古い順で返す。省略時 1 件）。\
+                #390: worker（レジストリ ID）指定なら pane_id 省略可。ペイン消失後も \
+                レジストリの tmux_session / session_id 経由で報告を取得できる。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pane_id": { "type": "integer", "minimum": 0, "description": "worker のペイン ID（必須）" },
+                    "pane_id": { "type": "integer", "minimum": 0, "description": "worker のペイン ID（worker と排他。どちらか必須）" },
+                    "worker": { "type": "string", "description": "worker レジストリの ID（#390。ペイン消失後の取得にも使える）" },
                     "lines": {
                         "type": "integer", "minimum": 1, "maximum": 100000,
                         "description": "スクロールバック取得行数（既定 2000）",
@@ -1505,7 +1535,6 @@ pub fn tools() -> Vec<Value> {
                         "description": "transcript から取得する直近 assistant メッセージ件数（既定 1。古い順で返す。総数超過時は全件）",
                     },
                 },
-                "required": ["pane_id"],
                 "additionalProperties": false,
             },
         }),
@@ -3002,14 +3031,19 @@ fn build_request(
             }
         }
         "tako_orchestrator_report" => Request::OrchestratorReport {
-            pane_id: required_u64(args, "pane_id")?,
+            pane_id: u64_arg(args, "pane_id")?,
             lines: u64_arg(args, "lines")?.map(|v| v as usize),
             messages: u64_arg(args, "messages")?.map(|v| v as usize),
+            worker: str_arg(args, "worker")?,
         },
         "tako_orchestrator_worker_status" => Request::OrchestratorWorkerStatus {
-            pane_id: required_u64(args, "pane_id")?,
+            pane_id: u64_arg(args, "pane_id")?,
             session_id: str_arg(args, "session_id")?,
             tmux_session: str_arg(args, "tmux_session")?,
+            worker: str_arg(args, "worker")?,
+        },
+        "tako_orchestrator_workers" => Request::OrchestratorWorkers {
+            all: bool_arg(args, "all")?,
         },
         "tako_orchestrator_run_status" => Request::OrchestratorRunStatus {
             run_id: str_arg(args, "run_id")?,
@@ -3967,7 +4001,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 103);
+        assert_eq!(tools.len(), 104);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

@@ -67,6 +67,12 @@ pub enum WatchOutcome {
     },
     /// worker が停滞: 実行中子プロセスなし + 画面不変（#224）
     Stalled { detail: String },
+    /// worker のエージェント CLI プロセスが死んだ（#390。SIGSEGV 等の突然死）。
+    /// tmux セッション（シェル）は生存しているがエージェントの子プロセスが消えた状態。
+    /// `resume_command` はレジストリの session ID から組み立てた復旧コマンド
+    /// （session ID 未保持なら None）。自動 resume はしない（クラッシュループの
+    /// 危険と master の判断を奪わないため。復旧は master が resume_command を実行）
+    AgentDead { resume_command: Option<String> },
     /// ペインも tmux session も消滅した
     Gone,
     /// タイムアウトに達した（worker は動き続けている可能性がある）
@@ -143,6 +149,7 @@ pub fn wait_for_worker(
     let mut idle_streak: u32 = 0;
     let mut gone_streak: u32 = 0;
     let mut stalled_streak: u32 = 0;
+    let mut agent_dead_streak: u32 = 0;
 
     loop {
         if let Some(dl) = deadline {
@@ -152,9 +159,10 @@ pub fn wait_for_worker(
         }
 
         let result = exec(Request::OrchestratorWorkerStatus {
-            pane_id: opts.pane_id,
+            pane_id: Some(opts.pane_id),
             session_id: opts.session_id.clone(),
             tmux_session: opts.tmux_session.clone(),
+            worker: None,
         });
 
         match result {
@@ -171,6 +179,28 @@ pub fn wait_for_worker(
                         s.worker_status = status.to_string();
                         s.elapsed_secs = start.elapsed().as_secs();
                     }
+                }
+
+                // #390: エージェント CLI プロセスの突然死（SIGSEGV 等）。
+                // dispatch がレジストリ + 子プロセス走査から events に agent_dead を
+                // 積む。ps のタイミング取りこぼしによる誤爆を防ぐため 2 回連続で確定
+                // （dead は安定状態なので連続観測できる）。idle streak を待たない:
+                // SIGSEGV 後の画面はシェルプロンプトで idle 判定できないことがあり、
+                // 従来はここで永遠に unknown のまま検出不能だった
+                let agent_dead_ev = val["events"].as_array().and_then(|evts| {
+                    evts.iter()
+                        .find(|e| e["kind"].as_str() == Some("agent_dead"))
+                        .cloned()
+                });
+                if let Some(ev) = agent_dead_ev {
+                    agent_dead_streak += 1;
+                    if agent_dead_streak >= 2 {
+                        return WatchOutcome::AgentDead {
+                            resume_command: ev["resume_command"].as_str().map(str::to_string),
+                        };
+                    }
+                } else {
+                    agent_dead_streak = 0;
                 }
 
                 match status {
@@ -378,6 +408,7 @@ pub fn run_worker(
         WatchOutcome::Error { .. } => "worker_error",
         WatchOutcome::Stalled { .. } => "worker_stalled",
         WatchOutcome::PermissionWaiting { .. } => "permission_waiting",
+        WatchOutcome::AgentDead { .. } => "worker_dead",
         WatchOutcome::Gone => "error",
         WatchOutcome::Timeout => "timeout",
     };
@@ -394,7 +425,8 @@ pub fn run_worker(
     .unwrap_or_default();
 
     // --- 4. 自動 close（run の完了後なので force: true）。
-    // エラー / stalled / question / permission 時は close しない ---
+    // エラー / stalled / question / permission / agent 死亡時は close しない
+    // （agent 死亡はペインのシェルが resume の実行先になるため残す。#390） ---
     let closed = if opts.auto_close
         && !matches!(
             outcome,
@@ -402,6 +434,7 @@ pub fn run_worker(
                 | WatchOutcome::Stalled { .. }
                 | WatchOutcome::Question { .. }
                 | WatchOutcome::PermissionWaiting { .. }
+                | WatchOutcome::AgentDead { .. }
         ) {
         exec(Request::Close {
             pane: Some(pane_id),
@@ -442,10 +475,17 @@ pub fn run_worker(
     {
         result["permission_dialog"] = permission_dialog.clone();
     }
+    if let WatchOutcome::AgentDead { ref resume_command } = outcome {
+        result["agent_dead"] = json!({
+            "resume_command": resume_command,
+            "recommended_action": "resume_session",
+        });
+    }
 
     // Issue #242: usage_limit / crash / gone でチェックポイントを Suspended に遷移させる
     let suspend_reason = match &outcome {
         WatchOutcome::Error { kind, .. } => Some(kind.as_str().to_string()),
+        WatchOutcome::AgentDead { .. } => Some("agent_dead".to_string()),
         WatchOutcome::Gone => Some("gone".to_string()),
         _ => None,
     };
@@ -664,6 +704,7 @@ pub fn run_status(run_id: &str) -> Result<Value, String> {
             WatchOutcome::Error { .. } => "worker_error",
             WatchOutcome::Stalled { .. } => "worker_stalled",
             WatchOutcome::PermissionWaiting { .. } => "permission_waiting",
+            WatchOutcome::AgentDead { .. } => "worker_dead",
             WatchOutcome::Gone => "error",
             WatchOutcome::Timeout => "timeout",
         };
@@ -736,6 +777,7 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
         WatchOutcome::Error { .. } => "worker_error",
         WatchOutcome::Stalled { .. } => "worker_stalled",
         WatchOutcome::PermissionWaiting { .. } => "permission_waiting",
+        WatchOutcome::AgentDead { .. } => "worker_dead",
         WatchOutcome::Gone => "error",
         WatchOutcome::Timeout => "timeout",
     };
@@ -750,7 +792,7 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
     .and_then(|v| v["text"].as_str().map(String::from))
     .unwrap_or_default();
 
-    // auto_close（エラー / stalled / question / permission 時は close しない）
+    // auto_close（エラー / stalled / question / permission / agent 死亡時は close しない）
     let closed = if auto_close
         && !matches!(
             c.outcome,
@@ -758,6 +800,7 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
                 | WatchOutcome::Stalled { .. }
                 | WatchOutcome::Question { .. }
                 | WatchOutcome::PermissionWaiting { .. }
+                | WatchOutcome::AgentDead { .. }
         ) {
         exec(Request::Close {
             pane: Some(pane_id),
@@ -806,6 +849,12 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
     {
         result["permission_dialog"] = permission_dialog.clone();
     }
+    if let WatchOutcome::AgentDead { ref resume_command } = c.outcome {
+        result["agent_dead"] = json!({
+            "resume_command": resume_command,
+            "recommended_action": "resume_session",
+        });
+    }
     Ok(result)
 }
 
@@ -823,6 +872,7 @@ pub fn run_list() -> Value {
                     WatchOutcome::Error { .. } => "worker_error",
                     WatchOutcome::Stalled { .. } => "worker_stalled",
                     WatchOutcome::PermissionWaiting { .. } => "permission_waiting",
+                    WatchOutcome::AgentDead { .. } => "worker_dead",
                     WatchOutcome::Gone => "error",
                     WatchOutcome::Timeout => "timeout",
                 };
@@ -984,6 +1034,15 @@ pub enum WorkerEventKind {
     ModelSwitched { from: String, to: String },
     /// ctx 使用率が閾値（60%）を超えた
     ContextHigh { percent: u64 },
+    /// spawn 後にプロンプトが届いていない疑い（#390）。
+    /// レジストリ登録済み claude worker で transcript（session_id）未観測のまま
+    /// 猶予時間を超過し、かつ画面が busy でない・実行中子プロセスも無い場合に発火
+    PromptUndelivered { seconds_since_spawn: i64 },
+    /// エージェント CLI プロセスの死亡疑い（#390。SIGSEGV 等の突然死）。
+    /// レジストリ登録済み worker で session_id 検出済み（= 一度は起動した）なのに
+    /// tmux セッション配下の実行中子プロセスが消えた場合に発火。
+    /// `resume_command` があれば claude --resume で文脈ごと復旧できる
+    AgentDead { resume_command: Option<String> },
 }
 
 /// worker_status の events 配列に載せる 1 イベント
@@ -1002,6 +1061,22 @@ impl WorkerEvent {
             }
             WorkerEventKind::ContextHigh { percent } => {
                 json!({ "kind": "context_high", "percent": percent })
+            }
+            WorkerEventKind::PromptUndelivered {
+                seconds_since_spawn,
+            } => {
+                json!({
+                    "kind": "prompt_undelivered",
+                    "seconds_since_spawn": seconds_since_spawn,
+                    "recommended_action": "resend_prompt",
+                })
+            }
+            WorkerEventKind::AgentDead { resume_command } => {
+                json!({
+                    "kind": "agent_dead",
+                    "resume_command": resume_command,
+                    "recommended_action": "resume_session",
+                })
             }
         }
     }
