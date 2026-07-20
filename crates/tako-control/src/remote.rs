@@ -24,49 +24,47 @@
 //!   update（履歴へ押し出された行 + 現画面）をプッシュ。描画・スクロール・折り返しは
 //!   クライアント側の責務（Issue #63）。操作系は REST を使う）
 //!
-//! 認証: `Authorization: Bearer <token>` ヘッダ必須（/api/health 以外）。
-//! WS は Sec-WebSocket-Protocol の `token.<T>` で検証（ブラウザ WS API はヘッダ不可のため）。
-//! CORS: PWA からのアクセス用にワイルドカード許可。
+//! 認証（Issue #283: 機器ペアリング二層認証。長寿命 bearer token は全廃）:
+//! - 層①: `tailscale serve` が付与する `X-Forwarded-For` を `tailscale whois` で照合し、
+//!   tailnet 上の実在ノードのみ通す（ローカル直結・偽装 IP は拒否）
+//! - 層②: ノードの恒久 ID をデバイスレジストリと照合し、role（Observe / Interact /
+//!   Manage / Admin）で操作を認可する。未登録端末はペアリング要求（`POST /api/pair`）
+//!   だけができ、Mac 画面の承認ダイアログで許可されるまで画面データを受け取れない
+//! - 管理 API（`/api/admin/*`）: ローカル直結 + `X-Tako-Admin: <管理トークン>` のみ。
+//!   ペアリング承認・role 変更は tako-app の GUI ダイアログ専用（`.agent/requirements.md`）
+//! - 詳細は `remote_auth` モジュールと計画 `.agent/plans/tako-remote-plan.md` §4
 //!
-//! 接続リンクの構成（Issue #91）:
-//! - トンネル成功 + リレー登録成功 → `https://tako-remote.pages.dev/#/connect?machine=...`
-//!   （固定 URL。PWA は Cloudflare Pages が配信し、KV リレーで machineId → 現在の
-//!   トンネル URL を解決してデータだけトンネル経由で流す。トンネルが再起動しても
-//!   リンク / ブックマークは不変）。トンネル直 URL は `fallback_url` として併記
-//!   （リレー障害時の予備。デーモン内蔵 PWA がトンネル経由で配信される）
-//! - トンネル成功 + リレー登録失敗 → トンネル直 URL（従来形式）
-//! - トンネル失敗（cloudflared 不在等）→ **起動を拒否する**（#104。暗号化経路を確立できない
-//!   状態では安全に提供できないため）。信頼できる LAN 内で平文のまま使いたい場合のみ
-//!   `--insecure`（明示 opt-in・非推奨）で LAN URL 直（内蔵 PWA）を許可する
+//! PWA は daemon 自身が配信する（同一 origin・バージョン一致。公開 Pages 配信は廃止）。
+//!
+//! transport（Issue #282: Tailscale Serve 一本化）:
+//! - daemon は `127.0.0.1` のみ bind し、`tailscale serve` が HTTPS:443 →
+//!   `http://127.0.0.1:<port>` のプロキシとして tailnet 内へ公開する
+//!   （WireGuard E2E 暗号化・public internet に入口を持たない）
+//! - 接続リンクは恒久固定の `https://<ホスト名>.<tailnet>.ts.net`（MagicDNS 名。
+//!   serve の off → 再設定でも不変。弾 0 実測 `.agent/investigations/tailscale-serve-poc.md`）
+//! - Tailscale 未セットアップ（未導入・デーモン未起動・未ログイン・HTTPS 未有効）での
+//!   起動は不足項目を列挙して**拒否**し、`tako remote setup` へ誘導する（黙って失敗させない）
 //!
 //! デーモン管理:
 //! - `tako remote start` → `tako remote serve` をバックグラウンド fork
-//! - PID ファイル（`/tmp/tako-remote.pid`）で管理
-//! - `tako remote stop` → PID ファイルから kill
+//! - PID ファイル（`<data_dir>/remote/tako-remote.pid`）で管理
+//! - `tako remote stop` → PID ファイルから kill + serve 設定の解除
 
 use std::collections::HashMap;
 use std::io;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use rust_embed::Embed;
 use serde_json::{json, Value};
 
+use crate::remote_auth::{DeviceRegistry, DeviceRole, Identity};
+
 const DEFAULT_PORT: u16 = 7749;
 const MAX_BODY_BYTES: u64 = 1024 * 1024;
-/// KV リレーの Workers URL（Cloudflare Pages / Workers のデプロイ先）。
-/// PWA 側（web/tako-remote/src/api.js）の DEFAULT_RELAY_URL と一致させること
-const DEFAULT_RELAY_URL: &str = "https://tako-remote-relay.takushio2525.workers.dev";
-/// 接続入口の Cloudflare Pages URL（PWA の固定ホスティング先。scripts/deploy-pages.sh で更新）。
-/// トンネル有効時の接続リンクはこの固定 URL をベースにし、PWA が KV リレー経由で実際の
-/// トンネル URL を解決する（Issue #91: trycloudflare のランダム URL をユーザーに見せず、
-/// ブックマークを恒久化する）。`TAKO_PAGES_URL` で差し替え可能（セルフホスト・検証用）
-const DEFAULT_PAGES_URL: &str = "https://tako-remote.pages.dev";
-
-fn pages_url() -> String {
-    std::env::var("TAKO_PAGES_URL").unwrap_or_else(|_| DEFAULT_PAGES_URL.to_string())
-}
+/// interact idle session の定期スイープ間隔
+const SESSION_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 // --- PID / トークン / ポートファイルのパス ---
 // P0-3: 共有 /tmp から <data_dir>/remote/（0700）へ移動。作成時から 0600。
 
@@ -103,14 +101,19 @@ pub fn token_path() -> std::path::PathBuf {
 pub fn port_path() -> std::path::PathBuf {
     state_dir().join("tako-remote.port")
 }
-/// トンネル状態（tunnel URL / machineId / リレー登録成否）の JSON。
-/// デーモンがトンネル確立時に書き、`daemon_status` が接続リンクの再構成に使う
-pub fn tunnel_path() -> std::path::PathBuf {
-    state_dir().join("tako-remote.tunnel")
+/// 公開中の固定 ts.net URL を記録するファイル。
+/// デーモンが serve 確立時に書き、`daemon_status` が接続リンクの再構成に使う
+pub fn url_path() -> std::path::PathBuf {
+    state_dir().join("tako-remote.url")
 }
 
 /// 秘密を含むファイルを作成時から 0600 で書き込む。
-/// temp → atomic rename で symlink race を防ぐ
+/// temp → atomic rename で symlink race を防ぐ。
+/// devices.json（remote_auth）も identity 情報を含むため同じ経路で書く
+pub(crate) fn write_state_file(path: &std::path::Path, content: &str) -> io::Result<()> {
+    write_secret_file(path, content)
+}
+
 fn write_secret_file(path: &std::path::Path, content: &str) -> io::Result<()> {
     let dir = path
         .parent()
@@ -161,7 +164,7 @@ fn cleanup_state_files() {
     let _ = std::fs::remove_file(pid_path());
     let _ = std::fs::remove_file(token_path());
     let _ = std::fs::remove_file(port_path());
-    let _ = std::fs::remove_file(tunnel_path());
+    let _ = std::fs::remove_file(url_path());
     // QR ファイル（ランダム名）を掃除する
     let dir = state_dir();
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -194,6 +197,181 @@ fn cleanup_legacy_state_files() {
 #[derive(Embed)]
 #[folder = "../../web/tako-remote/dist/"]
 struct PwaAssets;
+
+// --- daemon 共有コンテキスト（二層認証・接続追跡。#283）---
+
+/// daemon がリクエストハンドラ間で共有する状態。
+/// registry（デバイスレジストリ + 保留 + interact session + whois キャッシュ）と
+/// WS 接続数（通知・status 表示用）を持つ
+struct DaemonCtx {
+    registry: Mutex<DeviceRegistry>,
+    /// tailscale CLI のパス（whois 照合に使う）
+    ts_cli: String,
+    /// ローカル管理トークン（`/api/admin/*` 専用。リモート端末には決して渡らない）
+    admin_token: String,
+    tmux_socket: String,
+    /// デバイスごとの WS 接続数（0→1 で接続開始、1→0 で終了とみなす）
+    ws_connections: Mutex<HashMap<String, usize>>,
+    /// 稼働ポート・公開 URL（admin state 表示用）
+    port: u16,
+    base_url: String,
+    /// 自ノードの ts.net ホスト名（XFF 検証用。#287 P1-1）
+    expected_host: String,
+}
+
+impl DaemonCtx {
+    /// デバイスの WS 接続数を +1 する。0→1（接続開始）なら true
+    fn ws_connect(&self, device_id: &str) -> bool {
+        let mut map = self.ws_connections.lock().unwrap();
+        let count = map.entry(device_id.to_string()).or_insert(0);
+        *count += 1;
+        *count == 1
+    }
+
+    /// デバイスの WS 接続数を -1 する。1→0（全切断）なら true
+    fn ws_disconnect(&self, device_id: &str) -> bool {
+        let mut map = self.ws_connections.lock().unwrap();
+        match map.get_mut(device_id) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                false
+            }
+            Some(_) => {
+                map.remove(device_id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 接続中デバイス → WS 接続数のスナップショット
+    fn connections_snapshot(&self) -> HashMap<String, usize> {
+        self.ws_connections.lock().unwrap().clone()
+    }
+}
+
+/// macOS 通知を表示する（接続開始終了・操作セッション開始。#283）。
+/// osascript 経由（依存追加なし）。`TAKO_REMOTE_NO_NOTIFY=1` で抑止（テスト・検証用）。
+/// 通知文にはデバイス名・イベントのみを載せ、ペイン内容は含めない
+fn notify_macos(message: &str) {
+    if std::env::var("TAKO_REMOTE_NO_NOTIFY").is_ok_and(|v| v == "1") {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // osascript の文字列リテラルは引数渡し（argv）にして injection を避ける
+        let script = "on run argv\ndisplay notification (item 1 of argv) with title \"tako remote\"\nend run";
+        let _ = Command::new("osascript")
+            .args(["-e", script, message])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = message;
+    }
+}
+
+/// 認可判定の結果
+enum AuthDecision {
+    /// 承認済みデバイスとして許可
+    Allowed(crate::remote_auth::Device),
+    /// 拒否（HTTP status, エラーメッセージ）
+    Rejected(u16, String),
+}
+
+/// 層①（identity）+ 層②（デバイス role）を評価する。
+/// `required` 以上の role を持つ登録済みデバイスのみ Allowed
+fn authorize_device(
+    ctx: &DaemonCtx,
+    request: &tiny_http::Request,
+    required: DeviceRole,
+) -> AuthDecision {
+    let forwarded = header_value(request, "x-forwarded-for");
+    let forwarded_host = header_value(request, "x-forwarded-host");
+    match crate::remote_auth::identify(
+        &ctx.registry,
+        &ctx.ts_cli,
+        forwarded.as_deref(),
+        forwarded_host.as_deref(),
+        &ctx.expected_host,
+    ) {
+        Ok(Identity::Tailnet(who)) => {
+            let mut reg = ctx.registry.lock().unwrap();
+            match reg.device(&who.stable_id).cloned() {
+                Some(device) if device.role >= required => {
+                    reg.touch(&device.id);
+                    AuthDecision::Allowed(device)
+                }
+                Some(device) => AuthDecision::Rejected(
+                    403,
+                    format!(
+                        "この操作には {} 以上の role が必要（現在: {}）。\
+                         role の変更はペアリング画面から要求できます",
+                        required.as_str(),
+                        device.role.as_str()
+                    ),
+                ),
+                None => AuthDecision::Rejected(
+                    403,
+                    "この端末はペアリングされていない。PWA のペアリング画面から要求してください"
+                        .to_string(),
+                ),
+            }
+        }
+        Ok(Identity::Local) => AuthDecision::Rejected(
+            401,
+            "tailscale serve 経由のアクセスのみ受け付ける".to_string(),
+        ),
+        Err(e) => AuthDecision::Rejected(401, e),
+    }
+}
+
+/// 層①のみ評価する（静的アセット・/api/health・/api/me・/api/pair 用）。
+/// tailnet ノードなら Ok(WhoisInfo)
+fn identify_tailnet(
+    ctx: &DaemonCtx,
+    request: &tiny_http::Request,
+) -> Result<crate::tailscale::WhoisInfo, (u16, String)> {
+    let forwarded = header_value(request, "x-forwarded-for");
+    let forwarded_host = header_value(request, "x-forwarded-host");
+    match crate::remote_auth::identify(
+        &ctx.registry,
+        &ctx.ts_cli,
+        forwarded.as_deref(),
+        forwarded_host.as_deref(),
+        &ctx.expected_host,
+    ) {
+        Ok(Identity::Tailnet(who)) => Ok(who),
+        Ok(Identity::Local) => Err((
+            401,
+            "tailscale serve 経由のアクセスのみ受け付ける".to_string(),
+        )),
+        Err(e) => Err((401, e)),
+    }
+}
+
+/// 管理 API の認証: ローカル直結（serve 経由でない）+ `X-Tako-Admin` ヘッダが
+/// 管理トークンと一致する場合のみ許可する。
+/// serve 経由（X-Forwarded-For あり）は管理トークンが正しくても拒否する
+/// （管理トークンは tailnet 上に流れない前提を守る。漏えいの兆候として監査に残す）
+fn check_admin(ctx: &DaemonCtx, request: &tiny_http::Request) -> bool {
+    if header_value(request, "x-forwarded-for").is_some() {
+        if let Ok(reg) = ctx.registry.lock() {
+            reg.audit(
+                "admin_over_tailnet_rejected",
+                "",
+                "",
+                json!({ "route": request.url().split('?').next().unwrap_or("") }),
+            );
+        }
+        return false;
+    }
+    header_value(request, "x-tako-admin")
+        .is_some_and(|v| constant_time_eq(v.as_bytes(), ctx.admin_token.as_bytes()))
+}
 
 // --- IPC クライアント（daemon → app の正規 dispatch 経路。#281 H-7）---
 
@@ -378,9 +556,11 @@ impl PaneMapping {
 
 // --- WS broadcaster（M-5: 接続数分の tmux subprocess 乱立を解消。#281）---
 
-/// ペインごとの共有 broadcaster。1 つの capture ループを共有し、複数 WS クライアントへ配信する
+/// ペインごとの共有 broadcaster。1 つの capture ループを共有し、複数 WS クライアントへ配信する。
+/// subscriber はデバイス ID つきで登録し、revoke 時に該当デバイスの接続だけを
+/// 即時切断できる（#283 受け入れ条件: revoke 即時反映）
 struct PaneBroadcaster {
-    subscribers: Vec<std::sync::mpsc::Sender<String>>,
+    subscribers: Vec<(String, std::sync::mpsc::Sender<String>)>,
     /// 最新の init メッセージ。新規 subscriber に即送するためキャッシュする
     last_init: Option<String>,
 }
@@ -396,19 +576,25 @@ impl PaneBroadcaster {
     /// 新しい subscriber を登録し、受信チャンネルを返す。
     /// キャッシュ済みの init があれば即座に送信する（画面変化がない間に
     /// サブスクライブした subscriber が init を受け取れないのを防ぐ）
-    fn subscribe(&mut self) -> std::sync::mpsc::Receiver<String> {
+    fn subscribe(&mut self, device_id: &str) -> std::sync::mpsc::Receiver<String> {
         let (tx, rx) = std::sync::mpsc::channel();
         if let Some(ref init) = self.last_init {
             let _ = tx.send(init.clone());
         }
-        self.subscribers.push(tx);
+        self.subscribers.push((device_id.to_string(), tx));
         rx
+    }
+
+    /// 指定デバイスの subscriber を除去する（Sender の drop で受信側が
+    /// Disconnected を検知し、WS 転送スレッドが即座に接続を閉じる）
+    fn drop_device(&mut self, device_id: &str) {
+        self.subscribers.retain(|(id, _)| id != device_id);
     }
 
     /// 全 subscriber にメッセージを配信。切断済みの subscriber は除去する
     fn broadcast(&mut self, msg: &str) {
         self.subscribers
-            .retain(|tx| tx.send(msg.to_string()).is_ok());
+            .retain(|(_, tx)| tx.send(msg.to_string()).is_ok());
     }
 
     /// init メッセージをキャッシュして全 subscriber に配信する
@@ -429,11 +615,21 @@ fn new_broadcaster_map() -> BroadcasterMap {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// 指定デバイスの WS 接続をすべて即時切断する（revoke の即時反映。#283）
+fn disconnect_device_ws(map: &BroadcasterMap, device_id: &str) {
+    let broadcasters: Vec<Arc<Mutex<PaneBroadcaster>>> =
+        map.lock().unwrap().values().cloned().collect();
+    for bc in broadcasters {
+        bc.lock().unwrap().drop_device(device_id);
+    }
+}
+
 /// 指定ペインの broadcaster を取得するか新規作成する。
 /// 新規作成時は capture ループスレッドを起動する
 fn get_or_create_broadcaster(
     map: &BroadcasterMap,
     pane: &str,
+    device_id: &str,
     tmux_socket: &str,
     shutdown: Arc<AtomicBool>,
 ) -> (
@@ -458,7 +654,7 @@ fn get_or_create_broadcaster(
             bc
         })
         .clone();
-    let rx = broadcaster.lock().unwrap().subscribe();
+    let rx = broadcaster.lock().unwrap().subscribe(device_id);
     (broadcaster, rx)
 }
 
@@ -610,19 +806,77 @@ fn broadcaster_loop(
     }
 }
 
+/// Tailscale setup の不足項目を列挙した起動拒否エラーを組み立てる。
+/// `tako remote start` の誘導文言（Issue #282: 黙って失敗させない）
+fn setup_incomplete_error(status: &crate::tailscale::SetupStatus) -> io::Error {
+    let items = status
+        .missing
+        .iter()
+        .map(|m| format!("  - {}", m.describe()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    io::Error::other(format!(
+        "Tailscale のセットアップが完了していないため、remote サーバーを起動できません。\n\
+         不足項目:\n{items}\n\
+         `tako remote setup` を実行してください。"
+    ))
+}
+
+/// Tailscale の setup 状態を検証し、serve を設定して固定 ts.net URL を返す。
+/// 返り値: (tailscale CLI パス, 固定 URL)。
+/// 既存の serve 設定が tako 管理形式（HTTPS:443 の "/" 単純プロキシ）で自ポートを
+/// 向いている場合は再利用し、それ以外の設定は上書きせず拒否する
+fn establish_tailscale_serve(port: u16) -> io::Result<(String, String)> {
+    let status = crate::tailscale::setup_status();
+    if !status.ready() {
+        return Err(setup_incomplete_error(&status));
+    }
+    // ready() = missing が空なら cli_path / dns_name は必ず埋まっている
+    let cli = status
+        .cli_path
+        .clone()
+        .ok_or_else(|| io::Error::other("tailscale CLI パスを解決できない"))?;
+    let base_url = status
+        .ts_net_url()
+        .ok_or_else(|| io::Error::other("ts.net URL を解決できない"))?;
+
+    match crate::tailscale::serve_state(&cli).map_err(io::Error::other)? {
+        crate::tailscale::ServeState::NotConfigured => {
+            crate::tailscale::serve_start(&cli, port).map_err(io::Error::other)?;
+        }
+        crate::tailscale::ServeState::Proxy(target)
+            if target == crate::tailscale::proxy_target_for_port(port) =>
+        {
+            // 前回の設定が残っている（強制終了等）。同一ポートなのでそのまま再利用する
+        }
+        crate::tailscale::ServeState::Proxy(target) => {
+            return Err(io::Error::other(format!(
+                "tailscale serve に既存の設定があります（HTTPS:443 → {target}）。\
+                 ユーザー設定を壊さないため上書きしません。tako の以前の設定の残骸で\
+                 あれば `tailscale serve --https=443 off` で解除するか、同じポートを\
+                 使うなら `tako remote start --port <ポート番号>` を指定してください"
+            )));
+        }
+        crate::tailscale::ServeState::Other => {
+            return Err(io::Error::other(
+                "tailscale serve に tako 管理外の設定があります（パス分けハンドラ等）。\
+                 上書きを避けるため起動を中止しました。`tailscale serve status` で確認してください",
+            ));
+        }
+    }
+    Ok((cli, base_url))
+}
+
 /// 独立デーモンとして HTTP サーバーを起動し、SIGTERM まで待機する。
 /// `tako remote serve` から呼ばれる内部用関数。
 ///
-/// セキュリティ方針（#104）: 既定では**暗号化されたトンネル経由でのみ**ホストする。
-/// cloudflared トンネルが張れなければ起動を**拒否**する（平文 LAN へフォールバックしない）。
-/// `insecure = true` のときだけ、平文 HTTP の LAN 直モードを許可する（明示 opt-in。
-/// 同一 LAN 上の第三者にトークンを盗聴されうるため、信頼できるネットワーク限定）
-pub fn run_daemon(port: Option<u16>, insecure: bool) -> io::Result<()> {
+/// transport 方針（#282）: `127.0.0.1` のみ bind し、`tailscale serve` 経由でのみ
+/// tailnet 内へ公開する（WireGuard E2E 暗号化。平文 LAN モードは存在しない）。
+/// Tailscale が未セットアップなら不足項目を列挙して起動を拒否する
+pub fn run_daemon(port: Option<u16>) -> io::Result<()> {
     let port = port.unwrap_or(DEFAULT_PORT);
-    // P0-1: secure モードは 127.0.0.1（ループバック）のみ bind。cloudflared だけがアクセスする。
-    // insecure（LAN 直）のみ 0.0.0.0 に bind する
-    let bind_host = if insecure { "0.0.0.0" } else { "127.0.0.1" };
-    let addr = format!("{bind_host}:{port}");
+    // P0-1: 127.0.0.1（ループバック）のみ bind。tailscale serve だけがアクセスする
+    let addr = format!("127.0.0.1:{port}");
     let server = tiny_http::Server::http(&addr)
         .map_err(|e| io::Error::other(format!("remote API サーバーを起動できない: {e}")))?;
     let actual_port = server
@@ -641,11 +895,27 @@ pub fn run_daemon(port: Option<u16>, insecure: bool) -> io::Result<()> {
         ));
     }
 
-    // トークン生成
+    // Tailscale setup 検証 + serve 設定（不足があればここで起動拒否）。
+    // e2e 検証モード（TAKO_REMOTE_TEST_MODE=1）では実 tailscale serve を張らず、
+    // ts CLI パスと fake base URL だけを用意する（本番 tailnet の serve 設定を壊さず、
+    // localhost 直叩き + fake identity 注入で認証層を実測するため。#283 の実測方針）。
+    // このモードは 127.0.0.1 bind のまま = 外部到達経路は増えない
+    let test_mode = std::env::var("TAKO_REMOTE_TEST_MODE").is_ok_and(|v| v == "1");
+    let (ts_cli, base_url) = if test_mode {
+        let cli = crate::tailscale::find_tailscale().unwrap_or_else(|| "tailscale".to_string());
+        (cli, format!("http://127.0.0.1:{actual_port}"))
+    } else {
+        establish_tailscale_serve(actual_port)?
+    };
+
+    // ローカル管理トークン生成（/api/admin/* 専用。リモート端末には渡らない。#283）
     let token = crate::generate_token()?;
 
     // P0-3: state ディレクトリを 0700 で確保し、各ファイルを 0600 で書き出す
     ensure_state_dir()?;
+
+    // デバイスレジストリを開く（devices.json 破損時は黙って全失効させず起動を拒否する）
+    let registry = DeviceRegistry::open(&state_dir()).map_err(io::Error::other)?;
 
     // PID ファイル: 実行ファイルパスと起動時刻も記録（P0-4 の stop 照合用）
     let pid_info = format!(
@@ -701,95 +971,47 @@ pub fn run_daemon(port: Option<u16>, insecure: bool) -> io::Result<()> {
             })?;
     }
 
-    // cloudflared tunnel
-    let mut tunnel_url: Option<String> = None;
-    let mut tunnel_process: Option<Child> = None;
-    let mut mid: Option<String> = None;
-    // 起動失敗はもう Err で中止するため、この情報 JSON では常に null（後方互換のため残す）
-    let tunnel_error: Option<String> = None;
-    let mut relay_ok = false;
-
-    if insecure {
-        // 平文 LAN 直モード（明示 opt-in）。トンネルを張らない。強い警告を出す
-        eprintln!("⚠ insecure モード: 暗号化されていない平文 HTTP で LAN に公開します。");
-        eprintln!(
-            "  同一 Wi-Fi / LAN 上の第三者にトークンを含む通信を盗聴されうる。信頼できるネットワークでのみ使うこと。"
-        );
-    } else {
-        // secure モード（既定）: 暗号化トンネル必須。張れなければ起動を拒否する
-        match start_cloudflared(actual_port) {
-            Ok((child, url)) => {
-                let machine = machine_id();
-                match register_relay(&machine, &url) {
-                    Ok(()) => relay_ok = true,
-                    Err(e) => eprintln!("KV リレー登録失敗（トンネル直 URL で継続）: {e}"),
-                }
-                mid = Some(machine);
-                tunnel_url = Some(url);
-                tunnel_process = Some(child);
-            }
-            Err(e) => {
-                // 暗号化経路を確立できない = 安全に提供できない。起動を中止する（#104）。
-                // 書き込んだ state ファイルを片付けてから Err を返す
-                cleanup_state_files();
-                return Err(io::Error::other(format!(
-                    "暗号化トンネルを確立できないため remote サーバーの起動を中止しました: {e}\n\
-                     cloudflared を導入してください（brew install cloudflared）。\
-                     信頼できる LAN 内で平文のまま使うには `tako remote start --insecure` を指定します（非推奨）。"
-                )));
-            }
+    // 公開 URL を state ファイルに残す（`tako remote status` が接続リンクを再構成するため）
+    if let Err(e) = write_secret_file(&url_path(), &base_url) {
+        // 起動情報の整合が取れないため中止する。設定した serve と state を片付ける
+        // （test_mode では serve を張っていないので触らない = 本番設定を壊さない）
+        if !test_mode {
+            let _ = crate::tailscale::serve_stop_if_ours(&ts_cli, actual_port);
         }
-    }
-
-    // トンネル状態を state ファイルに残す（`tako remote status` が接続リンクを再構成するため）
-    if let Some(ref t) = tunnel_url {
-        let state = json!({ "tunnel_url": t, "machine_id": mid, "relay_ok": relay_ok });
-        let _ = write_secret_file(&tunnel_path(), &state.to_string());
+        cleanup_state_files();
+        return Err(io::Error::other(format!(
+            "URL ファイルの書き出しに失敗: {e}"
+        )));
     }
 
     // 起動情報を JSON で stdout に出力（start コマンドが読み取る）。
-    // 接続リンク: リレー登録済みなら Pages 固定 URL + トンネル直 URL を予備として併記
-    // （リレーが単一障害点にならないように。Issue #91 留意点）
-    // P0-1: secure モードでは LAN URL を生成しない（ループバック bind のため到達不能）
-    let local_url = if insecure {
-        let lan_host = lan_ip().unwrap_or_else(|| "localhost".to_string());
-        format!("http://{lan_host}:{actual_port}")
-    } else {
-        format!("http://127.0.0.1:{actual_port}")
-    };
-    let host_name = hostname();
-    let mid_for_link = if relay_ok { mid.as_deref() } else { None };
-    let connect = connect_url(
-        tunnel_url.as_deref(),
-        &local_url,
-        &token,
-        Some(&host_name),
-        mid_for_link,
-    );
-    let fallback = if relay_ok && tunnel_url.is_some() {
-        Some(connect_url(
-            tunnel_url.as_deref(),
-            &local_url,
-            &token,
-            Some(&host_name),
-            None,
-        ))
-    } else {
-        None
-    };
+    // 接続リンクは恒久固定の ts.net URL（tailnet 内限定・WireGuard E2E 暗号化）。
+    // #283: URL に token は載せない（接続時の認証は機器ペアリングが行う）
     let info = json!({
         "running": true,
         "port": actual_port,
         "bind_addr": addr,
-        "token": token,
-        "url": local_url,
-        "tunnel_url": tunnel_url,
-        "tunnel_error": tunnel_error,
-        "machine_id": mid,
-        "connect_url": connect,
-        "fallback_url": fallback,
+        "url": base_url,
+        "transport": "tailscale-serve",
     });
     println!("{info}");
+
+    // daemon 共有コンテキスト（二層認証・接続追跡。#283）
+    // base_url は "https://<host>.ts.net" 形式。expected_host はスキーム除去
+    let expected_host = base_url
+        .strip_prefix("https://")
+        .unwrap_or(&base_url)
+        .to_string();
+    let ctx = Arc::new(DaemonCtx {
+        registry: Mutex::new(registry),
+        ts_cli: ts_cli.clone(),
+        admin_token: token.clone(),
+        tmux_socket: tmux_socket.clone(),
+        ws_connections: Mutex::new(HashMap::new()),
+        port: actual_port,
+        base_url: base_url.clone(),
+        expected_host,
+    });
 
     // IPC 接続（#281: dispatch 正規経路。app 不在時は read-only fallback）
     let app_conn = Arc::new(RwLock::new(AppConnection::new()));
@@ -798,21 +1020,32 @@ pub fn run_daemon(port: Option<u16>, insecure: bool) -> io::Result<()> {
     // WS broadcaster map（M-5: ペインごとの共有 broadcaster）
     let broadcasters = new_broadcaster_map();
 
+    // interact idle session の定期スイープ（session_end の監査記録。#283）
+    {
+        let ctx_sweep = ctx.clone();
+        let shutdown_sweep = shutdown.clone();
+        std::thread::Builder::new()
+            .name("remote-session-sweep".into())
+            .spawn(move || {
+                while !shutdown_sweep.load(Ordering::Relaxed) {
+                    std::thread::sleep(SESSION_SWEEP_INTERVAL);
+                    if let Ok(mut reg) = ctx_sweep.registry.lock() {
+                        let _ = reg.sweep_idle_sessions();
+                    }
+                }
+            })
+            .ok();
+    }
+
     // HTTP サーバーループ
     while !shutdown.load(Ordering::Relaxed) {
         match server.recv_timeout(std::time::Duration::from_millis(200)) {
             Ok(Some(request)) => {
                 let path = request.url().split('?').next().unwrap_or("");
                 if path == "/ws" && is_ws_upgrade(&request) {
-                    handle_ws_v2(
-                        request,
-                        &token,
-                        &tmux_socket,
-                        shutdown.clone(),
-                        broadcasters.clone(),
-                    );
+                    handle_ws_v2(request, &ctx, shutdown.clone(), broadcasters.clone());
                 } else {
-                    handle_request_v2(request, &token, &tmux_socket, &app_conn, &pane_mapping);
+                    handle_request_v2(request, &ctx, &app_conn, &pane_mapping, &broadcasters);
                 }
             }
             Ok(None) => {}
@@ -820,10 +1053,12 @@ pub fn run_daemon(port: Option<u16>, insecure: bool) -> io::Result<()> {
         }
     }
 
-    // クリーンアップ
-    if let Some(mut child) = tunnel_process.take() {
-        let _ = child.kill();
-        let _ = child.wait();
+    // クリーンアップ: 自分が公開に使った serve 設定のみ解除する
+    // （test_mode では serve を張っていないので触らない = 本番設定を壊さない）
+    if !test_mode {
+        if let Err(e) = crate::tailscale::serve_stop_if_ours(&ts_cli, actual_port) {
+            eprintln!("tailscale serve の解除に失敗（tailscale serve --https=443 off で手動解除できます）: {e}");
+        }
     }
     cleanup_state_files();
 
@@ -859,14 +1094,12 @@ pub fn scrollback(pane_id: &str, lines: u32) -> Result<Vec<String>, String> {
 }
 
 /// デーモンの状態を PID ファイルから確認する。
-/// 返り値: running=true ならポート/トークンも含む
+/// 返り値: running=true ならポート/トークンも含む。
+/// PID ファイルは 3 行形式（PID / 実行ファイル / 起動時刻。P0-4）のため
+/// parse_pid_file で先頭行の PID を取り出す
 pub fn daemon_status() -> Value {
-    let pid = match std::fs::read_to_string(pid_path()) {
-        Ok(s) => s.trim().to_string(),
-        Err(_) => return json!({ "running": false }),
-    };
-    let pid_num: u32 = match pid.parse() {
-        Ok(n) => n,
+    let pid_num = match parse_pid_file() {
+        Ok(info) => info.pid,
         Err(_) => return json!({ "running": false }),
     };
     if !is_process_alive(pid_num) {
@@ -877,86 +1110,27 @@ pub fn daemon_status() -> Value {
         .ok()
         .and_then(|s| s.trim().parse::<u16>().ok())
         .unwrap_or(DEFAULT_PORT);
-    let token = std::fs::read_to_string(token_path())
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let lan_host = lan_ip().unwrap_or_else(|| "localhost".to_string());
-    let local_url = format!("http://{lan_host}:{port}");
-    let host_name = hostname();
-    // トンネル状態ファイルがあれば、起動時と同じ規則で接続リンクを再構成する
-    let tunnel_state: Option<Value> = std::fs::read_to_string(tunnel_path())
+    // URL ファイル（起動時に確定した固定 ts.net URL）から接続リンクを再構成する。
+    // #283: URL に token は含まれない（QR も固定 URL のみ）
+    let base_url = std::fs::read_to_string(url_path())
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok());
-    let tunnel_url = tunnel_state
-        .as_ref()
-        .and_then(|v| v["tunnel_url"].as_str().map(String::from));
-    let mid = tunnel_state
-        .as_ref()
-        .and_then(|v| v["machine_id"].as_str().map(String::from));
-    let relay_ok = tunnel_state
-        .as_ref()
-        .and_then(|v| v["relay_ok"].as_bool())
-        .unwrap_or(false);
-    let mid_for_link = if relay_ok { mid.as_deref() } else { None };
-    let connect = connect_url(
-        tunnel_url.as_deref(),
-        &local_url,
-        &token,
-        Some(&host_name),
-        mid_for_link,
-    );
-    json!({
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    // 登録済みデバイス数（devices.json を読むだけ。破損時は数えず None）
+    let devices = DeviceRegistry::open(&state_dir())
+        .ok()
+        .map(|reg| reg.devices().len());
+    let mut status = json!({
         "running": true,
         "pid": pid_num,
         "port": port,
-        "token": token,
-        "url": local_url,
-        "tunnel_url": tunnel_url,
-        "machine_id": mid,
-        "connect_url": connect,
-    })
-}
-
-/// URL のクエリ / fragment 内の `token=<値>` を `token=***` に置換する。
-/// 次の `&` または文字列末尾までを値とみなす。`token=` が無ければそのまま返す
-fn mask_token_in_url(url: &str) -> String {
-    let mut out = String::with_capacity(url.len());
-    let mut rest = url;
-    while let Some(pos) = rest.find("token=") {
-        let val_start = pos + "token=".len();
-        out.push_str(&rest[..val_start]);
-        out.push_str("***");
-        // 値の終端（次の `&` まで。無ければ末尾）以降を残す
-        let after = &rest[val_start..];
-        match after.find('&') {
-            Some(amp) => rest = &after[amp..],
-            None => {
-                rest = "";
-                break;
-            }
-        }
+        "url": base_url,
+        "transport": "tailscale-serve",
+    });
+    if let Some(n) = devices {
+        status["devices"] = json!(n);
     }
-    out.push_str(rest);
-    out
-}
-
-/// `daemon_status()` が返す状態 JSON のトークンをマスクする（`***` へ置換）。
-/// スクリーンショット・画面共有経由でのトークン漏えいを防ぐため、CLI / MCP の
-/// `remote status` は既定でこれを通す（`--show-token` 指定時のみ生値を出す）。
-/// 単体の `token` フィールドに加え、接続 URL（`connect_url` / `fallback_url` / `url`）の
-/// クエリに載る `token=<生値>` もマスクする（#104。URL だけ生値が残るとマスクの意味がないため）
-pub fn mask_status_token(status: &mut Value) {
-    if let Some(obj) = status.as_object_mut() {
-        if obj.get("token").and_then(|t| t.as_str()).is_some() {
-            obj.insert("token".to_string(), json!("***"));
-        }
-        for key in ["connect_url", "fallback_url", "url"] {
-            if let Some(masked) = obj.get(key).and_then(|v| v.as_str()).map(mask_token_in_url) {
-                obj.insert(key.to_string(), json!(masked));
-            }
-        }
-    }
+    status
 }
 
 /// 2 つのバイト列を定数時間で比較する（長さと内容の両方を一定時間で判定）。
@@ -1112,6 +1286,24 @@ pub fn daemon_force_stop() -> Result<Value, String> {
     daemon_stop_impl(true)
 }
 
+/// デーモン停止後に残った serve 設定をベストエフォートで解除する。
+/// SIGKILL などで daemon 自身のクリーンアップが走らなかったケースの回収。
+/// 対象ポートへの tako 管理プロキシである場合のみ解除する（ユーザー設定は不可侵）
+fn cleanup_serve_leftover(port: Option<u16>) {
+    let Some(port) = port else { return };
+    let Some(cli) = crate::tailscale::find_tailscale() else {
+        return;
+    };
+    let _ = crate::tailscale::serve_stop_if_ours(&cli, port);
+}
+
+/// port ファイルに記録されたデーモンのポート番号を読む（無ければ None）
+fn recorded_port() -> Option<u16> {
+    std::fs::read_to_string(port_path())
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+}
+
 fn daemon_stop_impl(force: bool) -> Result<Value, String> {
     let pid_info = match parse_pid_file() {
         Ok(info) => info,
@@ -1123,6 +1315,7 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
                         "PID ファイルが消失していますが、stale デーモン（PID {occupant}）を検出。停止します…"
                     );
                     kill_stale_daemon(occupant);
+                    cleanup_serve_leftover(Some(DEFAULT_PORT));
                     return Ok(json!({ "stopped": true, "stale_pid": occupant }));
                 }
             }
@@ -1130,6 +1323,8 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
         }
     };
     let pid_num = pid_info.pid;
+    // kill 後は state が消えるため、serve 残骸回収用のポートを先に読んでおく
+    let daemon_port = recorded_port();
     if !is_process_alive(pid_num) {
         cleanup_state_files();
         return Err("リモートサーバーが起動していない（プロセスは既に終了）".to_string());
@@ -1180,15 +1375,33 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    // SIGTERM ならデーモン自身が serve を解除して終了する。SIGKILL（--force）や
+    // 異常終了で残った serve 設定はここでベストエフォート回収する（冪等）
+    cleanup_serve_leftover(daemon_port);
     cleanup_state_files();
     Ok(json!({ "stopped": true }))
 }
 
+/// serve 子プロセスに使う tako バイナリを解決する。
+/// tako CLI 自身から呼ばれた場合は自分（current_exe）を使う: PATH 優先の解決だと、
+/// dev ビルドや .app 同梱 CLI からの起動が PATH 上の**別バージョンの tako**へ化けて
+/// 旧実装の serve が立つ事故が起きる。tako-app（ファイル名が tako でない）から
+/// 呼ばれた場合のみ resolve_tako_binary（PATH → 同梱 CLI）に委ねる
+fn serve_binary() -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        if exe.file_name().and_then(|n| n.to_str()) == Some("tako") {
+            return exe.display().to_string();
+        }
+    }
+    crate::dispatch::resolve_tako_binary()
+}
+
 /// デーモンをバックグラウンドで fork 起動する。
-/// `tako remote serve --port N [--insecure]` を子プロセスとして起動し、
+/// `tako remote serve --port N` を子プロセスとして起動し、
 /// stdout から起動情報 JSON を読み取って返す。
-/// `insecure = true` のときだけ平文 LAN 直モードを許可する（既定は暗号化トンネル必須。#104）
-pub fn spawn_daemon(port: Option<u16>, insecure: bool) -> Result<Value, String> {
+/// Tailscale 未セットアップ時は子プロセスが不足項目を stderr に出して終了するため、
+/// その内容がこの関数の Err に載る（#282: `tako remote setup` への誘導）
+pub fn spawn_daemon(port: Option<u16>) -> Result<Value, String> {
     let actual_port = port.unwrap_or(DEFAULT_PORT);
 
     // 既に起動中か確認
@@ -1220,14 +1433,11 @@ pub fn spawn_daemon(port: Option<u16>, insecure: bool) -> Result<Value, String> 
         }
     }
 
-    let tako_bin = crate::dispatch::resolve_tako_binary();
+    let tako_bin = serve_binary();
     let mut args = vec!["remote".to_string(), "serve".to_string()];
     if let Some(p) = port {
         args.push("--port".to_string());
         args.push(p.to_string());
-    }
-    if insecure {
-        args.push("--insecure".to_string());
     }
 
     let mut cmd = Command::new(&tako_bin);
@@ -1285,26 +1495,43 @@ pub fn spawn_daemon(port: Option<u16>, insecure: bool) -> Result<Value, String> 
             })
             .map_err(|e| format!("reader スレッドの起動に失敗: {e}"))?;
 
+        // JSON を得られず stdout が閉じた（子が起動前チェックで終了した等）場合も
+        // タイムアウトと同じ経路に落とし、下で stderr から実際の原因を拾って返す
         match rx.recv_timeout(std::time::Duration::from_secs(30)) {
             Ok(Ok(v)) => Some(v),
-            Ok(Err(e)) => return Err(e),
-            Err(_) => None,
+            Ok(Err(_)) | Err(_) => None,
         }
     };
 
     let Some(info) = info else {
-        // 起動情報が来なかった。子が即死していれば stderr から原因を拾う
-        // （例: ポート使用中で bind 失敗。orphan デーモンの残骸が典型）
-        if let Ok(Some(status)) = child.try_wait() {
+        // 起動情報が来なかった。子の終了を少し待ち、stderr から原因を拾う
+        // （例: Tailscale 未セットアップの不足項目列挙、ポート使用中で bind 失敗）
+        let status = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(s)) => break Some(s),
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    _ => break None,
+                }
+            }
+        };
+        if let Some(status) = status {
             let mut detail = String::new();
             if let Some(mut err) = child.stderr.take() {
                 use std::io::Read as _;
                 let _ = (&mut err).take(4096).read_to_string(&mut detail);
             }
             let detail = detail.trim();
-            return Err(format!(
-                "デーモンが起動情報を返さず終了した（{status}）: {detail}"
-            ));
+            if !detail.is_empty() {
+                // 子の stderr（不足項目の列挙 + setup 誘導など）をそのまま伝える。
+                // 呼び出し側 CLI も「error: 」を付けるため、子側の接頭辞は剥がして二重化を防ぐ
+                let detail = detail.strip_prefix("error: ").unwrap_or(detail);
+                return Err(detail.to_string());
+            }
+            return Err(format!("デーモンが起動情報を返さず終了した（{status}）"));
         }
         let _ = child.kill();
         return Err("デーモンからの起動情報を受信できなかった（30 秒タイムアウト）".into());
@@ -1391,258 +1618,110 @@ fn kill_stale_daemon(pid: u32) {
     cleanup_state_files();
 }
 
-// --- cloudflared Quick Tunnel ---
+// --- ローカル管理クライアント（GUI / CLI / MCP → daemon の admin API。#283）---
+//
+// 承認・拒否は tako-app の GUI ダイアログ専用（AI フルコントロール不変条件の例外。
+// `.agent/requirements.md`）。devices list / revoke は CLI / MCP にも公開する。
+// 認証はローカル管理トークン（state_dir の token ファイル、0600 = 同一ユーザーのみ）。
 
-/// cloudflared を起動して Quick Tunnel URL を取得する
-fn start_cloudflared(port: u16) -> io::Result<(Child, String)> {
-    let cloudflared = find_cloudflared()?;
-    let mut child = Command::new(&cloudflared)
-        .args(["tunnel", "--url", &format!("http://127.0.0.1:{port}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| io::Error::other(format!("cloudflared の起動に失敗: {e}")))?;
+/// 稼働中 daemon の admin API を叩く最小 HTTP クライアント（localhost 専用）。
+/// 外部依存を増やさないため std TcpStream + HTTP/1.1 の自前実装
+pub fn admin_request(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    use std::io::{Read as _, Write as _};
 
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other("cloudflared の stderr を取得できない"))?;
-
-    let url = parse_tunnel_url(stderr)?;
-    Ok((child, url))
-}
-
-/// PATH から cloudflared を探す
-fn find_cloudflared() -> io::Result<String> {
-    let candidates = [
-        "cloudflared",
-        "/opt/homebrew/bin/cloudflared",
-        "/usr/local/bin/cloudflared",
-    ];
-    for c in &candidates {
-        if Command::new(c)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return Ok(c.to_string());
-        }
+    let status = daemon_status();
+    if status["running"].as_bool() != Some(true) {
+        return Err("リモートサーバーが起動していない".to_string());
     }
-    Err(io::Error::other(
-        "cloudflared が見つかりません。インストールしてください: brew install cloudflared",
-    ))
-}
+    let port = status["port"].as_u64().unwrap_or(DEFAULT_PORT as u64) as u16;
+    let token = std::fs::read_to_string(token_path())
+        .map_err(|e| format!("管理トークンの読み取りに失敗: {e}"))?
+        .trim()
+        .to_string();
 
-/// cloudflared の stderr 出力から tunnel URL を読み取る。
-/// H-6: reader thread + recv_timeout で blocking read がタイムアウトを妨げない
-fn parse_tunnel_url(stderr: std::process::ChildStderr) -> io::Result<String> {
-    use std::sync::mpsc;
-    let (tx, rx) = mpsc::channel::<io::Result<String>>();
+    let body_str = body.map(|b| b.to_string()).unwrap_or_default();
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Tako-Admin: {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
+        body_str.len()
+    );
 
-    std::thread::Builder::new()
-        .name("cloudflared-stderr-reader".into())
-        .spawn(move || {
-            use std::io::BufRead;
-            let reader = std::io::BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Some(result) = lines.next() {
-                match result {
-                    Ok(line) => {
-                        if let Some(url) = extract_trycloudflare_url(&line) {
-                            let _ = tx.send(Ok(url));
-                            // 残りの stderr を drain して pipe 詰まりを防ぐ
-                            for _ in lines {}
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        return;
-                    }
-                }
-            }
-            let _ = tx.send(Err(io::Error::other(
-                "cloudflared が tunnel URL を出力せず終了した",
-            )));
-        })
-        .map_err(|e| io::Error::other(format!("reader スレッドの起動に失敗: {e}")))?;
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
+        .map_err(|e| format!("daemon へ接続できない (127.0.0.1:{port}): {e}"))?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .ok();
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("daemon への送信に失敗: {e}"))?;
 
-    match rx.recv_timeout(std::time::Duration::from_secs(30)) {
-        Ok(Ok(url)) => Ok(url),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(io::Error::other(
-            "cloudflared から tunnel URL を取得できなかった（30 秒タイムアウト）",
-        )),
-    }
-}
-
-/// 1 行のテキストから trycloudflare.com の URL を抽出する
-fn extract_trycloudflare_url(line: &str) -> Option<String> {
-    let marker = ".trycloudflare.com";
-    let end_pos = line.find(marker)?;
-    let url_end = end_pos + marker.len();
-    let before = &line[..end_pos];
-    let https_pos = before.rfind("https://")?;
-    let url = &line[https_pos..url_end];
-    Some(url.to_string())
-}
-
-// --- マシン ID ---
-
-/// マシン固有の安定 ID を取得する。初回は UUID v4 を生成してファイルに保存する
-pub fn machine_id() -> String {
-    let path = machine_id_path();
-    if let Some(ref p) = path {
-        if let Ok(id) = std::fs::read_to_string(p) {
-            let id = id.trim().to_string();
-            if !id.is_empty() {
-                return id;
-            }
-        }
-    }
-    let id = uuid::Uuid::new_v4().to_string();
-    if let Some(ref p) = path {
-        if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(p, &id);
-    }
-    id
-}
-
-fn machine_id_path() -> Option<std::path::PathBuf> {
-    tako_core::paths::data_dir().map(|d| d.join("machine_id"))
-}
-
-// --- リレー登録シークレット ---
-
-/// リレー登録シークレットを読み込むか、初回は CSPRNG で生成して保存する（hex 64 文字）。
-/// リレー worker 側で machineId エントリを first-write-wins で保護するためのもの
-/// （worker には SHA-256 ハッシュのみ保存される）。token と同様、ログに出さないこと
-fn relay_secret() -> Option<String> {
-    let path = tako_core::paths::data_dir().map(|d| d.join("relay_secret"))?;
-    relay_secret_at(&path)
-}
-
-fn relay_secret_at(path: &std::path::Path) -> Option<String> {
-    if let Ok(content) = std::fs::read_to_string(path) {
-        let secret = content.trim().to_string();
-        if secret.len() >= 32 {
-            return Some(secret);
-        }
-    }
-    let secret = crate::generate_token().ok()?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).ok()?;
-    }
-    std::fs::write(path, &secret).ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    Some(secret)
-}
-
-// --- KV リレー登録 ---
-
-fn register_relay(machine_id: &str, tunnel_url: &str) -> Result<(), String> {
-    let relay_url =
-        std::env::var("TAKO_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY_URL.to_string());
-    let url = format!("{relay_url}/api/register");
-    let mut body = json!({
-        "machineId": machine_id,
-        "tunnelUrl": tunnel_url,
-    });
-    // secret が用意できない環境（data_dir なし）では従来どおり無 secret で登録する
-    // （worker 側もレガシー登録として受理する。保護は効かないが機能は壊れない）
-    if let Some(secret) = relay_secret() {
-        body["secret"] = json!(secret);
-    }
-
-    // H-6: --connect-timeout / --max-time で curl のブロッキングを制限する
-    let status = Command::new("curl")
-        .args([
-            "-s",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            "--connect-timeout",
-            "10",
-            "--max-time",
-            "15",
-            "-X",
-            "POST",
-            "-H",
-            "Content-Type: application/json",
-            "-d",
-            &body.to_string(),
-            &url,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| format!("curl の実行に失敗: {e}"))?;
-
-    let code = String::from_utf8_lossy(&status.stdout);
-    if code.starts_with('2') {
-        Ok(())
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|e| format!("daemon からの受信に失敗: {e}"))?;
+    let response = String::from_utf8_lossy(&response);
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or("daemon の応答が不正（ヘッダ境界なし）")?;
+    let status_code: u16 = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .ok_or("daemon の応答が不正（ステータス行なし）")?;
+    let value: Value = if body.trim().is_empty() {
+        Value::Null
     } else {
-        Err(format!("KV リレー登録が HTTP {code} で失敗"))
-    }
-}
-
-/// QR コードに含める接続 URL を生成する。
-/// トークンは URL fragment（`/#/connect?token=...`）に載せる: fragment はブラウザが
-/// サーバーへ送信しないため、アクセスログ・cloudflared のログ・Referer に平文トークンが
-/// 残らない（Issue #23 認証改善）。PWA はハッシュルーターなのでこの形式を直接解釈できる。
-///
-/// トンネル有効時（`tunnel_url` と `machine_id` の両方あり）は Cloudflare Pages の
-/// 固定 URL をベースにし、`machine` パラメータで PWA に KV リレー解決させる（Issue #91）。
-/// トンネル URL はリンクに現れず KV 内部の値に留まるため、トンネル再起動でもリンク不変。
-/// `machine_id` の呼び出し側契約: リレー登録が成功しているときだけ渡す（未登録の
-/// machineId で Pages リンクを出すと PWA が接続先を解決できない）。
-/// LAN-only 時は従来どおり内蔵 PWA の LAN URL 直リンク（https の Pages から
-/// プライベート IP の http へは mixed content で接続できないため、Pages 化しない）
-pub fn connect_url(
-    tunnel_url: Option<&str>,
-    local_url: &str,
-    token: &str,
-    name: Option<&str>,
-    machine_id: Option<&str>,
-) -> String {
-    connect_url_with_pages(&pages_url(), tunnel_url, local_url, token, name, machine_id)
-}
-
-/// connect_url の本体（Pages ベース URL を引数化。env 非依存でテスト可能にするため分離）
-fn connect_url_with_pages(
-    pages_base: &str,
-    tunnel_url: Option<&str>,
-    local_url: &str,
-    token: &str,
-    name: Option<&str>,
-    machine_id: Option<&str>,
-) -> String {
-    let mut url = match (tunnel_url, machine_id) {
-        // トンネル + machineId → Pages 固定 URL（リレー解決経路）
-        (Some(_), Some(mid)) => format!(
-            "{}/#/connect?machine={}&token={}",
-            pages_base.trim_end_matches('/'),
-            urlencoding::encode(mid),
-            urlencoding::encode(token),
-        ),
-        // トンネルはあるが machineId が無い（リレー登録失敗）→ トンネル直（トンネルが PWA を配信）
-        (Some(t), None) => format!("{t}/#/connect?token={}", urlencoding::encode(token)),
-        // LAN-only → LAN URL 直（内蔵 PWA）
-        (None, _) => format!("{local_url}/#/connect?token={}", urlencoding::encode(token)),
+        serde_json::from_str(body.trim())
+            .map_err(|e| format!("daemon の応答を解釈できない: {e}"))?
     };
-    if let Some(n) = name {
-        url.push_str(&format!("&name={}", urlencoding::encode(n)));
+    if !(200..300).contains(&status_code) {
+        let msg = value["error"]
+            .as_str()
+            .unwrap_or("不明なエラー")
+            .to_string();
+        return Err(format!("daemon がエラーを返した ({status_code}): {msg}"));
     }
-    url
+    Ok(value)
+}
+
+/// 登録済みデバイスの一覧（CLI `tako remote devices list` / MCP / GUI から使う）。
+/// daemon 稼働中は admin API（接続状態込み）、停止中は devices.json を直接読む
+pub fn devices_list() -> Result<Value, String> {
+    if daemon_status()["running"].as_bool() == Some(true) {
+        return admin_request("GET", "/api/admin/state", None);
+    }
+    let reg = DeviceRegistry::open(&state_dir())?;
+    let devices: Vec<Value> = reg.devices().iter().map(device_json).collect();
+    Ok(json!({ "running": false, "devices": devices, "pending": [], "connections": {} }))
+}
+
+/// デバイスの登録を失効させる（CLI `tako remote devices revoke` / MCP / GUI から使う）。
+/// daemon 稼働中は admin API 経由（接続中 WS の即時切断込み）、停止中はレジストリ直接編集
+pub fn devices_revoke(device_id: &str) -> Result<Value, String> {
+    if daemon_status()["running"].as_bool() == Some(true) {
+        return admin_request(
+            "POST",
+            "/api/admin/devices/revoke",
+            Some(&json!({ "device_id": device_id })),
+        );
+    }
+    let mut reg = DeviceRegistry::open(&state_dir())?;
+    let device = reg.revoke(device_id)?;
+    Ok(json!({ "revoked": true, "device": device_json(&device) }))
+}
+
+/// Device を API 応答用の JSON に変換する
+fn device_json(d: &crate::remote_auth::Device) -> Value {
+    json!({
+        "id": d.id,
+        "name": d.name,
+        "login": d.login,
+        "node_name": d.node_name,
+        "role": d.role.as_str(),
+        "created_at": d.created_at,
+        "last_seen": d.last_seen,
+    })
 }
 
 /// ホスト名を取得する（表示用）
@@ -2032,10 +2111,19 @@ fn header_value(request: &tiny_http::Request, name: &'static str) -> Option<Stri
         .map(|h| h.value.as_str().to_string())
 }
 
-fn check_auth(request: &tiny_http::Request, token: &str) -> bool {
-    let expected = format!("Bearer {token}");
-    header_value(request, "authorization")
-        .is_some_and(|v| constant_time_eq(v.as_bytes(), expected.as_bytes()))
+/// リクエストボディを JSON として読む（サイズ上限つき）
+fn read_json_body(request: &mut tiny_http::Request) -> Result<Value, String> {
+    use std::io::Read as _;
+    let mut body = String::new();
+    request
+        .as_reader()
+        .take(MAX_BODY_BYTES)
+        .read_to_string(&mut body)
+        .map_err(|_| "リクエストボディの読み取りに失敗".to_string())?;
+    if body.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(&body).map_err(|e| format!("JSON パースエラー: {e}"))
 }
 
 // --- WebSocket（画面プッシュ専用チャンネル） ---
@@ -2078,14 +2166,6 @@ const WS_PUSH_MARGIN: u64 = 50;
 /// リクエストが WebSocket アップグレードかどうか
 fn is_ws_upgrade(request: &tiny_http::Request) -> bool {
     header_value(request, "upgrade").is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
-}
-
-/// Sec-WebSocket-Protocol の値からトークンを取り出す（`token.<T>` エントリ）
-fn ws_token_from_protocols(protocols: &str) -> Option<String> {
-    protocols
-        .split(',')
-        .map(|p| p.trim())
-        .find_map(|p| p.strip_prefix("token.").map(|t| t.to_string()))
 }
 
 /// ペインの一貫スナップショット。`display-message` と `capture-pane` を 1 回の
@@ -2256,7 +2336,8 @@ fn refresh_pane_mapping(
 }
 
 /// List 応答をリモート API v2 形式に変換する。
-/// agent 種別・タイトル・role・cwd・タブ内位置・モデル・状態を含むペイン情報
+/// agent 種別・タイトル・role・cwd・タブ内位置・モデル・状態・session_id を含むペイン情報。
+/// agents が Some なら session_id をペインに紐付ける（チャットビュー用。#284）
 fn list_to_api_v2(list: &Value) -> Value {
     let mut panes = Vec::new();
     let tabs = list["tabs"].as_array().cloned().unwrap_or_default();
@@ -2273,17 +2354,11 @@ fn list_to_api_v2(list: &Value) -> Value {
             let state = pane["state"].as_str().unwrap_or("unknown");
             let surface = pane["surface"].as_str().unwrap_or("background");
 
-            // agent 種別の推定: role から判定
-            let agent_type = if role.contains("master") || role.contains("solo") {
-                if role.contains("codex") {
-                    "codex"
-                } else if role.contains("agy") {
-                    "agy"
-                } else {
-                    "claude"
-                }
-            } else if role.starts_with("orchestrator-worker") {
-                // worker は role の suffix から agent を推定
+            // agent 種別の推定: role から判定（master/solo/worker は同一ロジック）
+            let has_agent_role = role.contains("master")
+                || role.contains("solo")
+                || role.starts_with("orchestrator-worker");
+            let agent_type = if has_agent_role {
                 if role.contains("codex") {
                     "codex"
                 } else if role.contains("agy") {
@@ -2303,7 +2378,10 @@ fn list_to_api_v2(list: &Value) -> Value {
             // タブ内位置（1/N 形式）
             let position = format!("{}/{}", idx + 1, total_panes);
 
-            panes.push(json!({
+            // session_id + model: sessions カタログからペインに紐づく情報を解決
+            let (session_id, model) = resolve_pane_session_info(pane, id);
+
+            let mut entry = json!({
                 "id": id,
                 "title": title,
                 "role": role,
@@ -2317,10 +2395,34 @@ fn list_to_api_v2(list: &Value) -> Value {
                 "cols": pane["cols"],
                 "rows": pane["rows"],
                 "focused": pane["focused"],
-            }));
+            });
+            if let Some(sid) = session_id {
+                entry["session_id"] = json!(sid);
+            }
+            if let Some(m) = model {
+                entry["model"] = json!(m);
+            }
+            panes.push(entry);
         }
     }
     json!({ "panes": panes, "api_version": 2 })
+}
+
+/// ペインの session_id と model を解決する（#284）。
+/// tmux バックエンドセッション → agents 逆引き → sessions カタログの順で探す
+fn resolve_pane_session_info(pane: &Value, pane_id: u64) -> (Option<String>, Option<String>) {
+    let session_id = pane["tmux_session"]
+        .as_str()
+        .and_then(crate::agents::resolve_session_id_for_backend)
+        .or_else(|| {
+            let id_str = pane_id.to_string();
+            crate::sessions::resolve_session_for_pane(&id_str)
+        });
+    let model = session_id.as_ref().and_then(|sid| {
+        let catalog = crate::sessions::SessionCatalog::load().ok()?;
+        catalog.entries.get(sid)?.model.clone()
+    });
+    (session_id, model)
 }
 
 /// tmux target を使って IPC 経由で Send dispatch を呼ぶ。
@@ -2470,30 +2572,58 @@ fn find_pane_id_for_tmux_target(list: &Value, session_name: &str) -> Option<u64>
 
 /// dispatch 統合版のリクエストハンドラ。
 /// 書き込み系（input/close/resize）は IPC 経由で dispatch を通す。
-/// 読み取り系は従来どおり tmux 直接 + API v2 は IPC List 経由
+/// 読み取り系は従来どおり tmux 直接 + API v2 は IPC List 経由。
+///
+/// 認可（#283 二層認証）:
+/// - 静的アセット・/api/health・/api/me・/api/pair: 層①のみ（tailnet ノードなら可）
+/// - /api/admin/*: ローカル直結 + 管理トークンのみ（GUI / CLI / MCP 用）
+/// - その他の /api/*: 層① + 層②（Observe / Interact / Manage / Admin の role 認可）
 fn handle_request_v2(
     mut request: tiny_http::Request,
-    token: &str,
-    tmux_socket: &str,
+    ctx: &Arc<DaemonCtx>,
     app_conn: &Arc<RwLock<AppConnection>>,
     pane_mapping: &Arc<RwLock<PaneMapping>>,
+    broadcasters: &BroadcasterMap,
 ) {
     let method = request.method().clone();
     let url_full = request.url().to_string();
     let path = url_full.split('?').next().unwrap_or("").to_string();
+    let tmux_socket = &ctx.tmux_socket;
 
     // CORS preflight
     if method == tiny_http::Method::Options {
         return respond(request, 204, None);
     }
 
-    // /api/health は認証不要
+    // --- 管理 API（ローカル直結 + 管理トークン。GUI 承認ダイアログ / CLI / MCP 用）---
+    if path.starts_with("/api/admin/") {
+        if !check_admin(ctx, &request) {
+            return respond(
+                request,
+                401,
+                Some(json!({ "error": "管理 API はローカルの管理トークンが必要" }).to_string()),
+            );
+        }
+        return handle_admin_api(request, &method, &path, ctx, broadcasters);
+    }
+
+    // --- 層①: tailnet identity 検証（serve 経由の実在ノードのみ通す）---
+    // 静的アセット（PWA）とペアリング前 API も tailnet ノード限定
+    let who = match identify_tailnet(ctx, &request) {
+        Ok(who) => who,
+        Err((status, e)) => {
+            return respond(request, status, Some(json!({ "error": e }).to_string()));
+        }
+    };
+
+    // API 以外のパスは PWA 静的ファイルとして配信（層①通過のみで可 —
+    // 未登録端末がペアリング画面を表示するために必要。画面データは含まない）
+    if !path.starts_with("/api/") {
+        return serve_embedded(request, &path);
+    }
+
+    // /api/health: 層①のみ。version は PWA の互換チェックに使う
     if path == "/api/health" && method == tiny_http::Method::Get {
-        let app_available = app_conn
-            .read()
-            .ok()
-            .and_then(|c| c.client.as_ref().map(|_| true))
-            .unwrap_or(false);
         return respond(
             request,
             200,
@@ -2501,25 +2631,119 @@ fn handle_request_v2(
                 json!({
                     "status": "ok",
                     "version": env!("CARGO_PKG_VERSION"),
-                    "app_connected": app_available,
                 })
                 .to_string(),
             ),
         );
     }
 
-    // API 以外のパスは PWA 静的ファイルとして配信（認証不要）
-    if !path.starts_with("/api/") {
-        return serve_embedded(request, &path);
+    // /api/me: 層①のみ。この端末の登録状態を返す（ペアリング画面のポーリング先）
+    if path == "/api/me" && method == tiny_http::Method::Get {
+        let mut reg = ctx.registry.lock().unwrap();
+        let body = match reg.device(&who.stable_id).cloned() {
+            Some(device) => json!({
+                "registered": true,
+                "device_id": device.id,
+                "name": device.name,
+                "role": device.role.as_str(),
+                "login": device.login,
+                "host": hostname(),
+                "version": env!("CARGO_PKG_VERSION"),
+                "app_connected": app_conn
+                    .read()
+                    .ok()
+                    .and_then(|c| c.client.as_ref().map(|_| true))
+                    .unwrap_or(false),
+            }),
+            None => {
+                let pending = reg.pending().iter().any(|p| p.device_id == who.stable_id);
+                json!({
+                    "registered": false,
+                    "pending": pending,
+                    "denied": !pending && reg.recently_denied(&who.stable_id),
+                    "host": hostname(),
+                    "version": env!("CARGO_PKG_VERSION"),
+                })
+            }
+        };
+        return respond_sensitive(request, 200, Some(body.to_string()));
     }
 
-    // API エンドポイントの認証チェック
-    if !check_auth(&request, token) {
-        return respond(
+    // /api/pair: 層①のみ。ペアリング / role 変更を要求する（Mac 承認待ちになる）
+    if path == "/api/pair" && method == tiny_http::Method::Post {
+        let parsed = match read_json_body(&mut request) {
+            Ok(v) => v,
+            Err(e) => {
+                return respond(request, 400, Some(json!({ "error": e }).to_string()));
+            }
+        };
+        let name = parsed["name"].as_str().unwrap_or("").to_string();
+        let role_str = parsed["role"].as_str().unwrap_or("observe");
+        let Some(role) = DeviceRole::parse(role_str) else {
+            return respond(
+                request,
+                400,
+                Some(
+                    json!({ "error": format!("不正な role: {role_str}（observe / interact / manage / admin）") })
+                        .to_string(),
+                ),
+            );
+        };
+        let result = ctx
+            .registry
+            .lock()
+            .unwrap()
+            .request_pairing(&who, &name, role);
+        return respond_sensitive(request, 200, Some(result.to_string()));
+    }
+
+    // --- 層②: 機器ペアリング認可（未登録・role 不足は 403）---
+    // 読み取り系は Observe、input は Interact、close / resize は Manage、
+    // 端末管理は Admin（役割は remote_auth::DeviceRole。強い role は弱い role を包含）
+    let required = required_role(&method, &path);
+    let device = match authorize_device_checked(ctx, &request, required) {
+        Ok(device) => device,
+        Err((status, e)) => {
+            return respond(request, status, Some(json!({ "error": e }).to_string()));
+        }
+    };
+
+    // --- リモート端末管理（Admin role。承認・role 変更は含まない = GUI 限定）---
+    if path == "/api/devices" && method == tiny_http::Method::Get {
+        let reg = ctx.registry.lock().unwrap();
+        let devices: Vec<Value> = reg.devices().iter().map(device_json).collect();
+        return respond_sensitive(
             request,
-            401,
-            Some(json!({ "error": "認証が必要" }).to_string()),
+            200,
+            Some(json!({ "devices": devices }).to_string()),
         );
+    }
+    if path == "/api/devices/revoke" && method == tiny_http::Method::Post {
+        let parsed = match read_json_body(&mut request) {
+            Ok(v) => v,
+            Err(e) => {
+                return respond(request, 400, Some(json!({ "error": e }).to_string()));
+            }
+        };
+        let Some(target_id) = parsed["device_id"].as_str() else {
+            return respond(
+                request,
+                400,
+                Some(json!({ "error": "device_id が必要" }).to_string()),
+            );
+        };
+        let result = ctx.registry.lock().unwrap().revoke(target_id);
+        return match result {
+            Ok(revoked) => {
+                disconnect_device_ws(broadcasters, target_id);
+                respond(
+                    request,
+                    200,
+                    Some(json!({ "revoked": true, "device": device_json(&revoked) }).to_string()),
+                )
+            }
+            Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
+        };
     }
 
     // --- API v2 エンドポイント（IPC 経由のリッチ情報。#281）---
@@ -2538,7 +2762,197 @@ fn handle_request_v2(
     }
 
     // --- API ルーティング（dispatch 統合 + tmux 直接操作）---
-    match (method, path.as_str()) {
+    handle_api_v2_routes(
+        request,
+        method,
+        &path,
+        &url_full,
+        ctx,
+        &device,
+        app_conn,
+        pane_mapping,
+    )
+}
+
+/// パス・メソッドから必要 role を決める（強い role は弱い role の操作を包含する）
+fn required_role(method: &tiny_http::Method, path: &str) -> DeviceRole {
+    if path.starts_with("/api/devices") {
+        return DeviceRole::Admin;
+    }
+    if *method == tiny_http::Method::Post {
+        if path.ends_with("/input") || path == "/api/upload" {
+            return DeviceRole::Interact;
+        }
+        if path.ends_with("/close") || path.ends_with("/resize") {
+            return DeviceRole::Manage;
+        }
+        // 未知の POST は安全側（Manage）
+        return DeviceRole::Manage;
+    }
+    DeviceRole::Observe
+}
+
+/// authorize_device の Result 版（呼び出し側の early-return 用）
+fn authorize_device_checked(
+    ctx: &DaemonCtx,
+    request: &tiny_http::Request,
+    required: DeviceRole,
+) -> Result<crate::remote_auth::Device, (u16, String)> {
+    match authorize_device(ctx, request, required) {
+        AuthDecision::Allowed(device) => Ok(device),
+        AuthDecision::Rejected(status, e) => Err((status, e)),
+    }
+}
+
+/// 管理 API のルーティング（check_admin 通過後に呼ばれる）。
+/// ペアリング承認・拒否はここだけ = Mac 側 GUI（+ 同一ユーザーのローカルプロセス）限定
+fn handle_admin_api(
+    mut request: tiny_http::Request,
+    method: &tiny_http::Method,
+    path: &str,
+    ctx: &Arc<DaemonCtx>,
+    broadcasters: &BroadcasterMap,
+) {
+    match (method.clone(), path) {
+        // 状態スナップショット（GUI の 2 秒ポーリング先）
+        (tiny_http::Method::Get, "/api/admin/state") => {
+            let reg = ctx.registry.lock().unwrap();
+            let devices: Vec<Value> = reg.devices().iter().map(device_json).collect();
+            let pending: Vec<Value> = reg
+                .pending()
+                .iter()
+                .map(|p| {
+                    json!({
+                        "device_id": p.device_id,
+                        "name": p.name,
+                        "login": p.login,
+                        "node_name": p.node_name,
+                        "requested_role": p.requested_role.as_str(),
+                        "kind": p.kind,
+                        "requested_at": p.requested_at,
+                    })
+                })
+                .collect();
+            drop(reg);
+            let connections = ctx.connections_snapshot();
+            let body = json!({
+                "running": true,
+                "port": ctx.port,
+                "url": ctx.base_url,
+                "devices": devices,
+                "pending": pending,
+                "connections": connections,
+            });
+            respond_sensitive(request, 200, Some(body.to_string()))
+        }
+        // ペアリング / 昇格の承認（GUI 限定経路）
+        (tiny_http::Method::Post, "/api/admin/pair/approve") => {
+            let parsed = match read_json_body(&mut request) {
+                Ok(v) => v,
+                Err(e) => {
+                    return respond(request, 400, Some(json!({ "error": e }).to_string()));
+                }
+            };
+            let Some(device_id) = parsed["device_id"].as_str() else {
+                return respond(
+                    request,
+                    400,
+                    Some(json!({ "error": "device_id が必要" }).to_string()),
+                );
+            };
+            let role = parsed["role"].as_str().and_then(DeviceRole::parse);
+            let result = ctx.registry.lock().unwrap().approve(device_id, role);
+            match result {
+                Ok(device) => {
+                    notify_macos(&format!(
+                        "{} を {} として登録しました",
+                        device.name,
+                        device.role.as_str()
+                    ));
+                    respond(
+                        request,
+                        200,
+                        Some(
+                            json!({ "approved": true, "device": device_json(&device) }).to_string(),
+                        ),
+                    )
+                }
+                Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
+            }
+        }
+        // ペアリング / 昇格の拒否（GUI 限定経路）
+        (tiny_http::Method::Post, "/api/admin/pair/deny") => {
+            let parsed = match read_json_body(&mut request) {
+                Ok(v) => v,
+                Err(e) => {
+                    return respond(request, 400, Some(json!({ "error": e }).to_string()));
+                }
+            };
+            let Some(device_id) = parsed["device_id"].as_str() else {
+                return respond(
+                    request,
+                    400,
+                    Some(json!({ "error": "device_id が必要" }).to_string()),
+                );
+            };
+            let result = ctx.registry.lock().unwrap().deny(device_id);
+            match result {
+                Ok(()) => respond(request, 200, Some(json!({ "denied": true }).to_string())),
+                Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
+            }
+        }
+        // デバイス失効（CLI / MCP / GUI の revoke。接続中 WS は即時切断）
+        (tiny_http::Method::Post, "/api/admin/devices/revoke") => {
+            let parsed = match read_json_body(&mut request) {
+                Ok(v) => v,
+                Err(e) => {
+                    return respond(request, 400, Some(json!({ "error": e }).to_string()));
+                }
+            };
+            let Some(device_id) = parsed["device_id"].as_str() else {
+                return respond(
+                    request,
+                    400,
+                    Some(json!({ "error": "device_id が必要" }).to_string()),
+                );
+            };
+            let result = ctx.registry.lock().unwrap().revoke(device_id);
+            match result {
+                Ok(device) => {
+                    disconnect_device_ws(broadcasters, device_id);
+                    respond(
+                        request,
+                        200,
+                        Some(
+                            json!({ "revoked": true, "device": device_json(&device) }).to_string(),
+                        ),
+                    )
+                }
+                Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
+            }
+        }
+        _ => respond(
+            request,
+            404,
+            Some(json!({ "error": "管理 API エンドポイントが見つからない" }).to_string()),
+        ),
+    }
+}
+
+/// 認可済みリクエストの API ルーティング（従来の handle_request_v2 後段）
+#[allow(clippy::too_many_arguments)]
+fn handle_api_v2_routes(
+    mut request: tiny_http::Request,
+    method: tiny_http::Method,
+    path: &str,
+    url_full: &str,
+    ctx: &Arc<DaemonCtx>,
+    device: &crate::remote_auth::Device,
+    app_conn: &Arc<RwLock<AppConnection>>,
+    pane_mapping: &Arc<RwLock<PaneMapping>>,
+) {
+    let tmux_socket = &ctx.tmux_socket;
+    match (method, path) {
         (tiny_http::Method::Get, "/api/panes") => {
             // v1: 従来の tmux 直接一覧（後方互換）
             let result = tmux_list_panes(tmux_socket);
@@ -2560,7 +2974,7 @@ fn handle_request_v2(
                     Some(json!({ "error": "無効なセッション ID" }).to_string()),
                 );
             };
-            let tail = query_param(&url_full, "tail")
+            let tail = query_param(url_full, "tail")
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(30);
             match crate::transcript::read_messages(&session_id, tail) {
@@ -2577,8 +2991,8 @@ fn handle_request_v2(
                 );
             };
             let tmux_target = format!("={target}");
-            let ansi = query_param(&url_full, "ansi").is_some_and(|v| v == "1" || v == "true");
-            let history = query_param(&url_full, "lines").and_then(|v| v.parse::<u32>().ok());
+            let ansi = query_param(url_full, "ansi").is_some_and(|v| v == "1" || v == "true");
+            let history = query_param(url_full, "lines").and_then(|v| v.parse::<u32>().ok());
             match tmux_capture_pane(tmux_socket, &tmux_target, ansi, history) {
                 Ok(lines) => {
                     let mut body = json!({ "lines": lines });
@@ -2602,7 +3016,7 @@ fn handle_request_v2(
                 );
             };
             let tmux_target = format!("={target}");
-            let history = query_param(&url_full, "lines")
+            let history = query_param(url_full, "lines")
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(1000);
             match tmux_capture_pane(tmux_socket, &tmux_target, false, Some(history)) {
@@ -2625,36 +3039,33 @@ fn handle_request_v2(
                     Some(json!({ "error": "無効なペイン ID" }).to_string()),
                 );
             };
-            let mut body = String::new();
-            {
-                use std::io::Read as _;
-                if request
-                    .as_reader()
-                    .take(MAX_BODY_BYTES)
-                    .read_to_string(&mut body)
-                    .is_err()
-                {
-                    return respond(
-                        request,
-                        400,
-                        Some(json!({ "error": "リクエストボディの読み取りに失敗" }).to_string()),
-                    );
-                }
-            }
-            let parsed: Value = match serde_json::from_str(&body) {
+            let parsed = match read_json_body(&mut request) {
                 Ok(v) => v,
                 Err(e) => {
-                    return respond(
-                        request,
-                        400,
-                        Some(json!({ "error": format!("JSON パースエラー: {e}") }).to_string()),
-                    );
+                    return respond(request, 400, Some(json!({ "error": e }).to_string()));
                 }
             };
             // IPC 経由で dispatch Send を呼ぶ（H-7: #95 送達検証が効く）
             let keys = parsed["keys"].as_str().map(|s| s.to_string());
             let text = parsed["text"].as_str().unwrap_or("").to_string();
             let newline = parsed["newline"].as_bool().unwrap_or(true);
+            // 監査 metadata（バイト数のみ。テキスト内容は記録しない）+ interact session。
+            // idle timeout 明けの最初の入力は操作セッション開始として macOS 通知を出す
+            let input_bytes = text.len() + keys.as_deref().map(|k| k.len()).unwrap_or(0);
+            {
+                let mut reg = ctx.registry.lock().unwrap();
+                let session_started = reg.record_input(&device.id);
+                reg.audit(
+                    "input",
+                    &device.id,
+                    &device.name,
+                    json!({ "route": p, "bytes": input_bytes }),
+                );
+                drop(reg);
+                if session_started {
+                    notify_macos(&format!("{} が操作を開始しました", device.name));
+                }
+            }
             match dispatch_send(app_conn, &target, &text, newline, keys.as_deref()) {
                 Ok(_) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
                 Err((status, e)) => {
@@ -2670,6 +3081,12 @@ fn handle_request_v2(
                     Some(json!({ "error": "無効なペイン ID" }).to_string()),
                 );
             };
+            ctx.registry.lock().unwrap().audit(
+                "close",
+                &device.id,
+                &device.name,
+                json!({ "route": p }),
+            );
             // IPC 経由で dispatch Close を呼ぶ（H-7: 最後のペイン保護が効く）
             match dispatch_close(app_conn, pane_mapping, &target) {
                 Ok(_) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
@@ -2686,32 +3103,18 @@ fn handle_request_v2(
                     Some(json!({ "error": "無効なペイン ID" }).to_string()),
                 );
             };
-            let mut body = String::new();
-            {
-                use std::io::Read as _;
-                if request
-                    .as_reader()
-                    .take(MAX_BODY_BYTES)
-                    .read_to_string(&mut body)
-                    .is_err()
-                {
-                    return respond(
-                        request,
-                        400,
-                        Some(json!({ "error": "リクエストボディの読み取りに失敗" }).to_string()),
-                    );
-                }
-            }
-            let parsed: Value = match serde_json::from_str(&body) {
+            let parsed = match read_json_body(&mut request) {
                 Ok(v) => v,
                 Err(e) => {
-                    return respond(
-                        request,
-                        400,
-                        Some(json!({ "error": format!("JSON パースエラー: {e}") }).to_string()),
-                    );
+                    return respond(request, 400, Some(json!({ "error": e }).to_string()));
                 }
             };
+            ctx.registry.lock().unwrap().audit(
+                "resize",
+                &device.id,
+                &device.name,
+                json!({ "route": p }),
+            );
             // IPC 経由で TmuxResize dispatch を呼ぶ
             let session_part = target.split(':').next().unwrap_or(&target);
             let window_part = target
@@ -2781,6 +3184,10 @@ fn handle_request_v2(
                 }
             }
         }
+        // --- ファイルアップロード（#285）: Interact role 必須 ---
+        (tiny_http::Method::Post, "/api/upload") => {
+            handle_upload(request, ctx, device, pane_mapping)
+        }
         _ => respond(
             request,
             404,
@@ -2789,28 +3196,336 @@ fn handle_request_v2(
     }
 }
 
+/// POST /api/upload: リモート端末からのファイルアップロード（#285）
+///
+/// Interact role 必須 / 20MB 上限 / 保存先は対象ペインの cwd 配下
+/// `.tako-remote-uploads/` 固定 / パス traversal 検証 / 実行権限なし
+fn handle_upload(
+    mut request: tiny_http::Request,
+    ctx: &Arc<DaemonCtx>,
+    device: &crate::remote_auth::Device,
+    pane_mapping: &Arc<RwLock<PaneMapping>>,
+) {
+    const MAX_UPLOAD_SIZE: u64 = 20 * 1024 * 1024; // 20MB
+    const UPLOAD_DIR: &str = ".tako-remote-uploads";
+
+    // Content-Length の事前チェック
+    let content_length = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Content-Length"))
+        .and_then(|h| h.value.as_str().parse::<u64>().ok())
+        .unwrap_or(0);
+    if content_length > MAX_UPLOAD_SIZE {
+        return respond(
+            request,
+            413,
+            Some(json!({ "error": format!("ファイルサイズが上限 ({}MB) を超えています", MAX_UPLOAD_SIZE / (1024 * 1024)) }).to_string()),
+        );
+    }
+
+    // Content-Type が multipart/form-data であることを確認
+    let content_type = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Content-Type"))
+        .map(|h| h.value.as_str().to_string())
+        .unwrap_or_default();
+    let boundary = extract_multipart_boundary(&content_type);
+    let Some(boundary) = boundary else {
+        return respond(
+            request,
+            400,
+            Some(json!({ "error": "multipart/form-data が必要です" }).to_string()),
+        );
+    };
+
+    // ボディを全て読む（サイズ上限を超えたら中断）
+    use std::io::Read as _;
+    let mut body = Vec::new();
+    let mut reader = request.as_reader().take(MAX_UPLOAD_SIZE);
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                body.extend_from_slice(&buf[..n]);
+                if body.len() as u64 > MAX_UPLOAD_SIZE {
+                    return respond(
+                        request,
+                        413,
+                        Some(json!({ "error": format!("ファイルサイズが上限 ({}MB) を超えています", MAX_UPLOAD_SIZE / (1024 * 1024)) }).to_string()),
+                    );
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    // multipart パーシング（最小実装: file と pane フィールドを抽出）
+    let (file_name, file_data, pane_id) = match parse_multipart(&body, &boundary) {
+        Ok(parts) => parts,
+        Err(e) => {
+            return respond(request, 400, Some(json!({ "error": e }).to_string()));
+        }
+    };
+
+    // ファイル名の traversal 検証
+    if file_name.contains('/')
+        || file_name.contains('\\')
+        || file_name.contains("..")
+        || file_name.is_empty()
+    {
+        return respond(
+            request,
+            400,
+            Some(json!({ "error": "不正なファイル名です" }).to_string()),
+        );
+    }
+
+    // cwd を取得（pane_mapping の pane_info から）
+    let cwd = {
+        let mapping = pane_mapping.read().unwrap();
+        pane_id
+            .parse::<u64>()
+            .ok()
+            .and_then(|id| mapping.pane_info.get(&id))
+            .and_then(|info| info["cwd"].as_str())
+            .map(String::from)
+    };
+
+    let Some(cwd) = cwd else {
+        return respond(
+            request,
+            404,
+            Some(json!({ "error": "対象ペインの作業ディレクトリが取得できません" }).to_string()),
+        );
+    };
+
+    // 保存先ディレクトリの作成
+    let upload_dir = std::path::Path::new(&cwd).join(UPLOAD_DIR);
+    if let Err(e) = std::fs::create_dir_all(&upload_dir) {
+        return respond(
+            request,
+            500,
+            Some(
+                json!({ "error": format!("アップロードディレクトリの作成に失敗: {e}") })
+                    .to_string(),
+            ),
+        );
+    }
+
+    // symlink follow 拒否: upload_dir 自体がシンボリックリンクなら拒否する。
+    // リンク先への意図しない書き込み（任意パスへのファイル配置）を防ぐ（#287 P2-4）
+    if upload_dir
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return respond(
+            request,
+            400,
+            Some(
+                json!({ "error": "アップロード先がシンボリックリンクのため拒否しました" })
+                    .to_string(),
+            ),
+        );
+    }
+
+    // パスの最終検証（canonicalize で traversal を防止）
+    let target_path = upload_dir.join(&file_name);
+
+    // target_path が既存の symlink なら拒否（上書きによるリンク先改変を防ぐ。#287 P2-4）
+    if target_path
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return respond(
+            request,
+            400,
+            Some(
+                json!({ "error": "既存のシンボリックリンクへの上書きは拒否しました" }).to_string(),
+            ),
+        );
+    }
+
+    let canonical_dir = match upload_dir.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            return respond(
+                request,
+                500,
+                Some(json!({ "error": format!("パス解決に失敗: {e}") }).to_string()),
+            );
+        }
+    };
+
+    // ファイル書き込み（所有者のみ読み書き可。#287 P2-1）
+    use std::io::Write;
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&target_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return respond(
+                request,
+                500,
+                Some(json!({ "error": format!("ファイル書き込みに失敗: {e}") }).to_string()),
+            );
+        }
+    };
+    if let Err(e) = file.write_all(&file_data) {
+        return respond(
+            request,
+            500,
+            Some(json!({ "error": format!("ファイル書き込みに失敗: {e}") }).to_string()),
+        );
+    }
+    drop(file);
+
+    // 所有者のみ読み書き可（0o600）。リモート端末から受信したファイルは
+    // 本人以外がアクセスする必要がない（#287 P2-1）
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    // canonicalize で traversal していないことを最終確認
+    if let Ok(canonical_target) = target_path.canonicalize() {
+        if !canonical_target.starts_with(&canonical_dir) {
+            let _ = std::fs::remove_file(&target_path);
+            return respond(
+                request,
+                400,
+                Some(json!({ "error": "パス traversal が検出されました" }).to_string()),
+            );
+        }
+    }
+
+    // 監査ログ（ファイル名はペイン内容に準じ記録しない。バイト数のみ。#287 P2-2）
+    ctx.registry.lock().unwrap().audit(
+        "upload",
+        &device.id,
+        &device.name,
+        json!({
+            "bytes": file_data.len(),
+            "pane": pane_id,
+        }),
+    );
+
+    let relative_path = format!("{UPLOAD_DIR}/{file_name}");
+    respond(
+        request,
+        200,
+        Some(
+            json!({
+                "ok": true,
+                "path": relative_path,
+                "size": file_data.len(),
+            })
+            .to_string(),
+        ),
+    )
+}
+
+/// multipart/form-data の boundary を抽出する
+fn extract_multipart_boundary(content_type: &str) -> Option<String> {
+    if !content_type.starts_with("multipart/form-data") {
+        return None;
+    }
+    content_type.split(';').find_map(|part| {
+        let part = part.trim();
+        part.strip_prefix("boundary=")
+            .map(|b| b.trim_matches('"').to_string())
+    })
+}
+
+/// multipart ボディから file パートと pane フィールドを抽出する最小実装
+fn parse_multipart(body: &[u8], boundary: &str) -> Result<(String, Vec<u8>, String), String> {
+    let delimiter = format!("--{boundary}");
+    let body_str_lossy = String::from_utf8_lossy(body);
+    let parts: Vec<&str> = body_str_lossy.split(&delimiter).collect();
+
+    let mut file_name = String::new();
+    let mut file_data: Option<Vec<u8>> = None;
+    let mut pane_id = String::new();
+
+    for part in &parts {
+        if part.starts_with("--") || part.is_empty() {
+            continue;
+        }
+        let Some(header_end) = part.find("\r\n\r\n") else {
+            continue;
+        };
+        let headers = &part[..header_end];
+        let body_start = header_end + 4;
+        let body_part = &part[body_start..];
+        // 末尾の \r\n を除去
+        let body_part = body_part.strip_suffix("\r\n").unwrap_or(body_part);
+
+        if headers.contains("name=\"pane\"") {
+            pane_id = body_part.trim().to_string();
+        } else if headers.contains("name=\"file\"") {
+            // filename の抽出
+            if let Some(fname_start) = headers.find("filename=\"") {
+                let rest = &headers[fname_start + 10..];
+                if let Some(fname_end) = rest.find('"') {
+                    file_name = rest[..fname_end].to_string();
+                }
+            }
+            // バイナリデータの正確な抽出（lossy 変換ではなく元のバイト列から）
+            let header_bytes = format!("{delimiter}{}", &part[..body_start]);
+            let offset_in_body = body
+                .windows(header_bytes.len())
+                .position(|w| w == header_bytes.as_bytes());
+            if let Some(offset) = offset_in_body {
+                let data_start = offset + header_bytes.len();
+                let next_delim = format!("\r\n{delimiter}");
+                let data_end = body[data_start..]
+                    .windows(next_delim.len())
+                    .position(|w| w == next_delim.as_bytes())
+                    .map(|p| data_start + p)
+                    .unwrap_or(body.len());
+                file_data = Some(body[data_start..data_end].to_vec());
+            }
+        }
+    }
+
+    if file_name.is_empty() {
+        return Err("ファイルが含まれていません".to_string());
+    }
+    if pane_id.is_empty() {
+        return Err("pane パラメータが必要です".to_string());
+    }
+    let data = file_data.ok_or_else(|| "ファイルデータの読み取りに失敗".to_string())?;
+    Ok((file_name, data, pane_id))
+}
+
 /// WS broadcaster 版のハンドラ（M-5: ペインごとの共有 broadcaster で接続数分の
-/// tmux subprocess 乱立を解消）
+/// tmux subprocess 乱立を解消）。
+///
+/// 認証（#283）: 機器ペアリングの二層認証（Observe 以上）。
+/// 旧方式の `token.<T>` サブプロトコルは全廃 — serve が付与する identity ヘッダは
+/// WS の upgrade リクエストにも載る（弾 0 実測）ため、REST と同じ認可を通せる。
+/// デバイスの WS 接続数 0→1 / 1→0 で接続開始・終了の通知と監査を行い、
+/// revoke 時は該当デバイスの subscriber を落として即時切断する
 fn handle_ws_v2(
     request: tiny_http::Request,
-    token: &str,
-    tmux_socket: &str,
+    ctx: &Arc<DaemonCtx>,
     shutdown: Arc<AtomicBool>,
     broadcasters: BroadcasterMap,
 ) {
     let url_full = request.url().to_string();
-    let client_token =
-        header_value(&request, "sec-websocket-protocol").and_then(|v| ws_token_from_protocols(&v));
-    let token_ok = client_token
-        .as_deref()
-        .is_some_and(|t| constant_time_eq(t.as_bytes(), token.as_bytes()));
-    if !token_ok {
-        return respond(
-            request,
-            401,
-            Some(json!({ "error": "認証が必要" }).to_string()),
-        );
-    }
+    // 二層認証（画面データは Observe role から）
+    let device = match authorize_device_checked(ctx, &request, DeviceRole::Observe) {
+        Ok(device) => device,
+        Err((status, e)) => {
+            return respond(request, status, Some(json!({ "error": e }).to_string()));
+        }
+    };
     let Some(pane) = query_param(&url_full, "pane") else {
         return respond(
             request,
@@ -2839,11 +3554,26 @@ fn handle_ws_v2(
         );
     let stream = request.upgrade("websocket", response);
 
-    // broadcaster に subscribe して WS 配信スレッドを起動
-    let (_, rx) = get_or_create_broadcaster(&broadcasters, &pane, tmux_socket, shutdown);
+    // broadcaster に subscribe して WS 配信スレッドを起動（subscriber はデバイス ID つき =
+    // revoke 時に disconnect_device_ws で該当デバイスだけ即時切断できる）
+    let (_, rx) =
+        get_or_create_broadcaster(&broadcasters, &pane, &device.id, &ctx.tmux_socket, shutdown);
 
+    // 接続開始（このデバイスの 1 本目の WS）なら通知 + 監査
+    if ctx.ws_connect(&device.id) {
+        ctx.registry.lock().unwrap().audit(
+            "conn_open",
+            &device.id,
+            &device.name,
+            json!({ "route": "/ws" }),
+        );
+        notify_macos(&format!("{} が接続しました", device.name));
+    }
+
+    let ctx_fwd = ctx.clone();
+    let device_fwd = device.clone();
     std::thread::Builder::new()
-        .name("tako-remote-ws-relay".into())
+        .name("tako-remote-ws-forward".into())
         .spawn(move || {
             use tungstenite::protocol::{Role, WebSocket};
             let mut ws = WebSocket::from_raw_socket(stream, Role::Server, None);
@@ -2864,36 +3594,26 @@ fn handle_ws_v2(
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        // broadcaster が終了した
+                        // broadcaster の終了 or revoke による切断
                         break;
                     }
                 }
             }
             let _ = ws.close(None);
+            // 全 WS 切断（このデバイスの最後の 1 本）なら通知 + 監査
+            if ctx_fwd.ws_disconnect(&device_fwd.id) {
+                if let Ok(reg) = ctx_fwd.registry.lock() {
+                    reg.audit(
+                        "conn_close",
+                        &device_fwd.id,
+                        &device_fwd.name,
+                        json!({ "route": "/ws" }),
+                    );
+                }
+                notify_macos(&format!("{} が切断しました", device_fwd.name));
+            }
         })
         .ok();
-}
-
-/// macOS の LAN IP アドレスを取得する。取得できなければ None を返す
-pub fn lan_ip() -> Option<String> {
-    let output = Command::new("ifconfig")
-        .arg("en0")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("inet ") {
-            if let Some(ip) = rest.split_whitespace().next() {
-                if ip != "127.0.0.1" {
-                    return Some(ip.to_string());
-                }
-            }
-        }
-    }
-    None
 }
 
 /// QR コードを PNG 画像として生成する。生成先のパスを返す
@@ -2949,22 +3669,6 @@ pub fn generate_qr_png(url: &str) -> io::Result<std::path::PathBuf> {
 // --- URL エンコーディング（最小実装。外部依存なし）---
 
 mod urlencoding {
-    pub fn encode(s: &str) -> String {
-        let mut result = String::with_capacity(s.len());
-        for b in s.bytes() {
-            match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    result.push(b as char);
-                }
-                _ => {
-                    result.push('%');
-                    result.push_str(&format!("{b:02X}"));
-                }
-            }
-        }
-        result
-    }
-
     pub fn decode(s: &str) -> String {
         let mut result = Vec::with_capacity(s.len());
         let bytes = s.as_bytes();
@@ -3030,19 +3734,81 @@ mod tests {
     }
 
     #[test]
-    fn ws_token_from_protocolsの抽出() {
+    fn required_roleは操作種別ごとに正しいroleを要求する() {
+        use tiny_http::Method;
+        // 読み取り系は Observe
         assert_eq!(
-            ws_token_from_protocols("tako-remote, token.abc123"),
-            Some("abc123".to_string())
+            required_role(&Method::Get, "/api/panes"),
+            DeviceRole::Observe
         );
         assert_eq!(
-            ws_token_from_protocols("token.xyz"),
-            Some("xyz".to_string())
+            required_role(&Method::Get, "/api/v2/panes"),
+            DeviceRole::Observe
         );
-        assert_eq!(ws_token_from_protocols("tako-remote"), None);
-        assert_eq!(ws_token_from_protocols(""), None);
-        // token. 接頭辞のみ（空トークン）は Some("") となり、実トークンと一致しないため安全
-        assert_eq!(ws_token_from_protocols("token."), Some(String::new()));
+        assert_eq!(
+            required_role(&Method::Get, "/api/panes/s:0.0/screen"),
+            DeviceRole::Observe
+        );
+        assert_eq!(
+            required_role(&Method::Get, "/api/panes/s:0.0/scrollback"),
+            DeviceRole::Observe
+        );
+        assert_eq!(
+            required_role(&Method::Get, "/api/sessions/abc/messages"),
+            DeviceRole::Observe
+        );
+        // input は Interact
+        assert_eq!(
+            required_role(&Method::Post, "/api/panes/s:0.0/input"),
+            DeviceRole::Interact
+        );
+        // close / resize は Manage
+        assert_eq!(
+            required_role(&Method::Post, "/api/panes/s:0.0/close"),
+            DeviceRole::Manage
+        );
+        assert_eq!(
+            required_role(&Method::Post, "/api/panes/s:0.0/resize"),
+            DeviceRole::Manage
+        );
+        // 端末管理は Admin
+        assert_eq!(
+            required_role(&Method::Get, "/api/devices"),
+            DeviceRole::Admin
+        );
+        assert_eq!(
+            required_role(&Method::Post, "/api/devices/revoke"),
+            DeviceRole::Admin
+        );
+        // upload は Interact
+        assert_eq!(
+            required_role(&Method::Post, "/api/upload"),
+            DeviceRole::Interact
+        );
+        // 未知の POST は安全側（Manage）
+        assert_eq!(
+            required_role(&Method::Post, "/api/unknown"),
+            DeviceRole::Manage
+        );
+    }
+
+    #[test]
+    fn device_jsonは全フィールドを含む() {
+        let d = crate::remote_auth::Device {
+            id: "nDEV1".into(),
+            name: "iPhone".into(),
+            login: "u@e.com".into(),
+            node_name: "iphone.tail1234.ts.net".into(),
+            role: DeviceRole::Interact,
+            created_at: 100,
+            last_seen: 200,
+        };
+        let v = device_json(&d);
+        assert_eq!(v["id"], "nDEV1");
+        assert_eq!(v["name"], "iPhone");
+        assert_eq!(v["role"], "interact");
+        assert_eq!(v["created_at"], 100);
+        assert_eq!(v["last_seen"], 200);
     }
 
     #[test]
@@ -3165,15 +3931,6 @@ mod tests {
     }
 
     #[test]
-    fn lan_ipはipv4形式を返す() {
-        if let Some(ip) = lan_ip() {
-            let parts: Vec<&str> = ip.split('.').collect();
-            assert_eq!(parts.len(), 4, "IPv4 アドレスではない: {ip}");
-            assert_ne!(ip, "127.0.0.1", "ループバックは除外される");
-        }
-    }
-
-    #[test]
     fn qr_pngを生成できる() {
         // generate_qr_png は state_dir（TAKO_REMOTE_STATE_DIR の影響下）に保存するため直列化する
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3182,241 +3939,6 @@ mod tests {
         assert!(path.exists());
         assert!(std::fs::metadata(&path).unwrap().len() > 100);
         let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn trycloudflare_urlをパースできる() {
-        assert_eq!(
-            extract_trycloudflare_url(
-                "INF |  https://foo-bar-baz.trycloudflare.com                    |"
-            ),
-            Some("https://foo-bar-baz.trycloudflare.com".to_string()),
-        );
-        assert_eq!(
-            extract_trycloudflare_url("Visit it at: https://abc-123.trycloudflare.com"),
-            Some("https://abc-123.trycloudflare.com".to_string()),
-        );
-        assert_eq!(extract_trycloudflare_url("no url here"), None);
-    }
-
-    #[test]
-    fn machine_idは安定して返る() {
-        let id1 = machine_id();
-        let id2 = machine_id();
-        assert_eq!(id1, id2);
-        assert!(!id1.is_empty());
-    }
-
-    #[test]
-    fn connect_urlの生成() {
-        // machineId なし（リレー登録失敗）→ トンネル直 URL
-        let url = connect_url(
-            Some("https://foo.trycloudflare.com"),
-            "http://localhost:7749",
-            "abc123",
-            Some("my-mac"),
-            None,
-        );
-        assert!(url.starts_with("https://foo.trycloudflare.com/#/connect?"));
-        assert!(!url.contains("host="));
-        assert!(url.contains("token=abc123"));
-        assert!(url.contains("name=my-mac"));
-
-        let url = connect_url(
-            None,
-            "http://192.168.1.10:7749",
-            "tok456",
-            Some("host1"),
-            None,
-        );
-        assert!(url.starts_with("http://192.168.1.10:7749/#/connect?"));
-        assert!(!url.contains("host="));
-        assert!(url.contains("token=tok456"));
-        assert!(url.contains("name=host1"));
-
-        let url = connect_url(None, "http://localhost:7749", "abc123", None, None);
-        assert!(url.starts_with("http://localhost:7749/#/connect?"));
-        assert!(url.contains("token=abc123"));
-        assert!(!url.contains("name="));
-    }
-
-    #[test]
-    fn connect_urlはトンネルとmachine_idが揃うとpages固定urlになる() {
-        // Issue #91: トンネル有効 + リレー登録済みの正常系はランダムな trycloudflare URL を
-        // 見せず、Pages 固定 URL + machine パラメータで PWA にリレー解決させる
-        let url = connect_url_with_pages(
-            "https://tako-remote.pages.dev",
-            Some("https://foo.trycloudflare.com"),
-            "http://localhost:7749",
-            "tok123",
-            Some("my-mac"),
-            Some("aaaabbbb-cccc-4ddd-8eee-ffff00001111"),
-        );
-        assert!(url.starts_with("https://tako-remote.pages.dev/#/connect?"));
-        assert!(url.contains("machine=aaaabbbb-cccc-4ddd-8eee-ffff00001111"));
-        assert!(url.contains("token=tok123"));
-        assert!(url.contains("name=my-mac"));
-        assert!(
-            !url.contains("trycloudflare"),
-            "トンネル URL を露出させない: {url}"
-        );
-    }
-
-    #[test]
-    fn connect_urlはlan_onlyならmachine_idがあってもlan直リンク() {
-        // https の Pages からプライベート IP の http へは mixed content で接続できないため、
-        // LAN-only では Pages 化しない
-        let url = connect_url_with_pages(
-            "https://tako-remote.pages.dev",
-            None,
-            "http://192.168.1.10:7749",
-            "tok123",
-            None,
-            Some("aaaabbbb-cccc-4ddd-8eee-ffff00001111"),
-        );
-        assert!(url.starts_with("http://192.168.1.10:7749/#/connect?"));
-        assert!(!url.contains("pages.dev"));
-    }
-
-    #[test]
-    fn connect_urlのpagesベース末尾スラッシュは正規化される() {
-        let url = connect_url_with_pages(
-            "https://tako-remote.pages.dev/",
-            Some("https://foo.trycloudflare.com"),
-            "http://localhost:7749",
-            "t",
-            None,
-            Some("m-1"),
-        );
-        assert!(url.starts_with("https://tako-remote.pages.dev/#/connect?"));
-    }
-
-    #[test]
-    fn connect_urlのトークンはfragmentに載る() {
-        // fragment（# 以降）はブラウザがサーバーへ送らない = ログ・Referer に残らない。
-        // token が # より後ろにあることを検証する（LAN 直 / Pages の両形式）
-        let url = connect_url(None, "http://192.168.1.10:7749", "secret", None, None);
-        let hash_pos = url.find('#').expect("fragment がある");
-        let token_pos = url.find("token=").expect("token がある");
-        assert!(token_pos > hash_pos, "token は fragment 内: {url}");
-
-        let url = connect_url_with_pages(
-            "https://tako-remote.pages.dev",
-            Some("https://foo.trycloudflare.com"),
-            "http://localhost:7749",
-            "secret",
-            None,
-            Some("m-1"),
-        );
-        let hash_pos = url.find('#').expect("fragment がある");
-        let token_pos = url.find("token=").expect("token がある");
-        let machine_pos = url.find("machine=").expect("machine がある");
-        assert!(token_pos > hash_pos, "token は fragment 内: {url}");
-        assert!(machine_pos > hash_pos, "machine も fragment 内: {url}");
-    }
-
-    #[test]
-    fn urlエンコーディング() {
-        assert_eq!(urlencoding::encode("hello"), "hello");
-        assert_eq!(
-            urlencoding::encode("https://foo.com"),
-            "https%3A%2F%2Ffoo.com"
-        );
-    }
-
-    #[test]
-    fn cloudflaredが無い環境ではエラーを返す() {
-        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let original = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", "");
-        let result = find_cloudflared();
-        std::env::set_var("PATH", &original);
-        if let Err(e) = result {
-            assert!(e.to_string().contains("cloudflared"));
-        }
-    }
-
-    #[test]
-    fn trycloudflare_url抽出のエッジケース() {
-        assert_eq!(
-            extract_trycloudflare_url("2024-06-22 INF https://a-b-c.trycloudflare.com registered"),
-            Some("https://a-b-c.trycloudflare.com".to_string()),
-        );
-        assert_eq!(
-            extract_trycloudflare_url("see https://example.com and https://x.trycloudflare.com"),
-            Some("https://x.trycloudflare.com".to_string()),
-        );
-        assert_eq!(extract_trycloudflare_url("https://example.com"), None);
-        assert_eq!(extract_trycloudflare_url(""), None);
-    }
-
-    #[test]
-    fn machine_idはuuid形式() {
-        let id = machine_id();
-        assert_eq!(id.len(), 36);
-        assert_eq!(id.chars().filter(|c| *c == '-').count(), 4);
-    }
-
-    #[test]
-    fn machine_idをファイルに保存して再読み込みできる() {
-        let tmp = std::env::temp_dir().join(format!("tako-test-mid-{}", std::process::id()));
-        let _ = std::fs::remove_file(&tmp);
-
-        let id1 = {
-            let _ = std::fs::write(&tmp, "");
-            let fresh = uuid::Uuid::new_v4().to_string();
-            std::fs::write(&tmp, &fresh).unwrap();
-            fresh
-        };
-        let id2 = std::fs::read_to_string(&tmp).unwrap().trim().to_string();
-        assert_eq!(id1, id2);
-        let _ = std::fs::remove_file(&tmp);
-    }
-
-    #[test]
-    fn register_relayは不正urlでエラーを返す() {
-        std::env::set_var("TAKO_RELAY_URL", "http://127.0.0.1:1");
-        let result = register_relay("test-machine", "https://example.trycloudflare.com");
-        std::env::remove_var("TAKO_RELAY_URL");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn relay_secretは初回生成後に安定して返る() {
-        let tmp = std::env::temp_dir().join(format!("tako-test-rsec-{}", std::process::id()));
-        let _ = std::fs::remove_file(&tmp);
-
-        let s1 = relay_secret_at(&tmp).expect("初回生成");
-        assert_eq!(s1.len(), 64, "hex 64 文字");
-        assert!(s1.chars().all(|c| c.is_ascii_hexdigit()));
-
-        let s2 = relay_secret_at(&tmp).expect("再読み込み");
-        assert_eq!(s1, s2, "永続化された同じ値が返る");
-        let _ = std::fs::remove_file(&tmp);
-    }
-
-    #[test]
-    fn relay_secretは短すぎる既存値を再生成する() {
-        let tmp = std::env::temp_dir().join(format!("tako-test-rsec2-{}", std::process::id()));
-        std::fs::write(&tmp, "short").unwrap();
-        let s = relay_secret_at(&tmp).expect("再生成");
-        assert_eq!(s.len(), 64);
-        let _ = std::fs::remove_file(&tmp);
-    }
-
-    #[test]
-    fn connect_urlはtunnelありnameなしでもtunnel直接() {
-        let url = connect_url(
-            Some("https://foo.trycloudflare.com"),
-            "http://localhost:7749",
-            "tok123",
-            None,
-            None,
-        );
-        assert!(url.starts_with("https://foo.trycloudflare.com/#/connect?"));
-        assert!(!url.contains("host="));
-        assert!(url.contains("token=tok123"));
-        assert!(!url.contains("name="));
     }
 
     #[test]
@@ -3451,40 +3973,6 @@ mod tests {
     }
 
     #[test]
-    fn mask_status_tokenはトークンをマスクしそれ以外を残す() {
-        let mut v =
-            json!({ "running": true, "port": 7749, "token": "deadbeef", "url": "http://x" });
-        mask_status_token(&mut v);
-        assert_eq!(v["token"], json!("***"));
-        assert_eq!(v["port"], json!(7749));
-        assert_eq!(v["running"], json!(true));
-
-        // token フィールドが無ければ何も壊さない
-        let mut v2 = json!({ "running": false });
-        mask_status_token(&mut v2);
-        assert_eq!(v2, json!({ "running": false }));
-    }
-
-    #[test]
-    fn mask_token_in_urlはクエリのtokenを伏せる() {
-        // fragment 内 + 後続パラメータあり
-        assert_eq!(
-            mask_token_in_url("https://x.pages.dev/#/connect?machine=m1&token=deadbeef&name=mac"),
-            "https://x.pages.dev/#/connect?machine=m1&token=***&name=mac"
-        );
-        // token が末尾
-        assert_eq!(
-            mask_token_in_url("http://10.0.0.1:7749/#/connect?token=secretvalue"),
-            "http://10.0.0.1:7749/#/connect?token=***"
-        );
-        // token 無しはそのまま
-        assert_eq!(
-            mask_token_in_url("http://10.0.0.1:7749/"),
-            "http://10.0.0.1:7749/"
-        );
-    }
-
-    #[test]
     fn find_port_occupantは未使用ポートでnoneを返す() {
         // 存在しないであろう高番号ポート
         assert!(find_port_occupant(59999).is_none());
@@ -3511,37 +3999,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn mask_status_tokenはconnect_url内のtokenもマスクする() {
-        // #104: token フィールドだけでなく URL クエリの生トークンも伏せる
-        let mut v = json!({
-            "running": true,
-            "token": "aabbccdd",
-            "url": "http://10.0.0.5:7749",
-            "connect_url": "https://tako-remote.pages.dev/#/connect?machine=m1&token=aabbccdd&name=mac",
-            "fallback_url": "https://foo.trycloudflare.com/#/connect?token=aabbccdd&name=mac",
-        });
-        mask_status_token(&mut v);
-        assert_eq!(v["token"], json!("***"));
-        let connect = v["connect_url"].as_str().unwrap();
-        let fallback = v["fallback_url"].as_str().unwrap();
-        assert!(
-            !connect.contains("aabbccdd"),
-            "connect_url に生トークンが残る: {connect}"
-        );
-        assert!(
-            !fallback.contains("aabbccdd"),
-            "fallback_url に生トークンが残る: {fallback}"
-        );
-        assert!(connect.contains("token=***"));
-        assert!(connect.contains("machine=m1"), "他のクエリは保持する");
-        assert!(connect.contains("name=mac"));
-    }
-
     // --- P0-3 テスト ---
 
     #[test]
     fn state_dirはdata_dir配下のremoteを返す() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = state_dir();
         let s = dir.to_string_lossy();
         assert!(
@@ -3552,6 +4014,7 @@ mod tests {
 
     #[test]
     fn write_secret_fileは0600で書ける() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("tako-test-wsf-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("secret.txt");
@@ -3695,5 +4158,48 @@ mod tests {
         assert_eq!(parse_etime("2-01:03:42"), Some(2 * 86400 + 3822));
         assert_eq!(parse_etime("00:05"), Some(5));
         assert_eq!(parse_etime("bad"), None);
+    }
+
+    // --- upload API テスト (#285) ---
+
+    #[test]
+    fn extract_multipart_boundaryはboundaryを抽出する() {
+        assert_eq!(
+            extract_multipart_boundary("multipart/form-data; boundary=----WebKitFormBoundary"),
+            Some("----WebKitFormBoundary".to_string())
+        );
+        assert_eq!(
+            extract_multipart_boundary("multipart/form-data; boundary=\"abc123\""),
+            Some("abc123".to_string())
+        );
+        assert_eq!(extract_multipart_boundary("application/json"), None);
+    }
+
+    #[test]
+    fn parse_multipartはfileとpaneを抽出する() {
+        let boundary = "----boundary";
+        let body = "------boundary\r\nContent-Disposition: form-data; name=\"pane\"\r\n\r\n42\r\n\
+             ------boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\n\
+             Content-Type: text/plain\r\n\r\nhello world\r\n------boundary--\r\n";
+        let (name, data, pane) = parse_multipart(body.as_bytes(), boundary).unwrap();
+        assert_eq!(name, "test.txt");
+        assert_eq!(data, b"hello world");
+        assert_eq!(pane, "42");
+    }
+
+    #[test]
+    fn parse_multipartはファイルなしでエラーを返す() {
+        let boundary = "----boundary";
+        let body = "------boundary\r\nContent-Disposition: form-data; name=\"pane\"\r\n\r\n42\r\n------boundary--\r\n";
+        assert!(parse_multipart(body.as_bytes(), boundary).is_err());
+    }
+
+    #[test]
+    fn upload_roleはinteractが必要() {
+        use tiny_http::Method;
+        assert_eq!(
+            required_role(&Method::Post, "/api/upload"),
+            DeviceRole::Interact
+        );
     }
 }

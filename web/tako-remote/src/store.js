@@ -1,63 +1,30 @@
-const KEY = 'tako-remote';
+// #283: 旧 machines / token の localStorage 保存は全廃した。
+// PWA は daemon 自身から配信され（同一 origin）、認証はサーバー側の
+// 機器ペアリングが行うため、クライアントに保存する接続情報は存在しない。
+// 残るのはペアリング要求時に使うデバイス表示名の記憶だけ。
+const NAME_KEY = 'tako-remote-device-name';
 
-function load() {
+export function getDeviceName() {
   try {
-    return JSON.parse(localStorage.getItem(KEY)) || { machines: [], activeId: null };
+    return localStorage.getItem(NAME_KEY) || '';
   } catch {
-    return { machines: [], activeId: null };
+    return '';
   }
 }
 
-function save(data) {
-  localStorage.setItem(KEY, JSON.stringify(data));
-}
-
-export function getMachines() {
-  return load().machines;
-}
-
-export function addMachine({ id, name, host, token, version }) {
-  const data = load();
-  const idx = data.machines.findIndex(m => m.id === id);
-  const entry = { id, name: name || id, host, token, lastSeen: Date.now() };
-  // デーモンのバージョン（/api/health の version）。PWA との互換判断用（Issue #91）。
-  // 未取得（undefined）のときは既存の記録を上書きしない
-  if (version !== undefined) entry.version = version;
-  if (idx >= 0) {
-    Object.assign(data.machines[idx], entry);
-  } else {
-    data.machines.push(entry);
-  }
-  save(data);
-  return entry;
-}
-
-export function removeMachine(id) {
-  const data = load();
-  data.machines = data.machines.filter(m => m.id !== id);
-  if (data.activeId === id) data.activeId = null;
-  save(data);
-}
-
-export function updateMachineHost(id, host) {
-  const data = load();
-  const m = data.machines.find(x => x.id === id);
-  if (m) {
-    m.host = host;
-    m.lastSeen = Date.now();
-    save(data);
+export function setDeviceName(name) {
+  try {
+    localStorage.setItem(NAME_KEY, name);
+  } catch {
+    // プライベートブラウズ等で保存できなくても動作は継続する
   }
 }
 
-export function getActiveMachine() {
-  const data = load();
-  return data.machines.find(m => m.id === data.activeId) || null;
-}
-
-export function setActiveMachine(id) {
-  const data = load();
-  data.activeId = id;
-  const m = data.machines.find(x => x.id === id);
-  if (m) m.lastSeen = Date.now();
-  save(data);
+// 旧バージョンが残した machines / token を掃除する（一度だけ走れば十分）
+export function cleanupLegacyStore() {
+  try {
+    localStorage.removeItem('tako-remote');
+  } catch {
+    // 失敗しても害はない
+  }
 }

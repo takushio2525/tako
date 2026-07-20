@@ -3,6 +3,53 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — remote 全面刷新（統合ブランチ `renewal/remote-transport`。v0.6.0 で一括リリース予定）
+
+このセクションは破壊的変更を含むため、統合ブランチで積み上げ、レビュー後に main へ
+マージして v0.6.0 として出荷する（夜間自動リリースには乗せない）。
+
+### Breaking / Security
+
+- **remote transport を Tailscale Serve へ一本化** (#282): Quick Tunnel / Cloudflare relay
+  Worker / 公開 Pages PWA / URL 埋め込みトークン / `--insecure` 平文 LAN モードを廃止。
+  接続は tailnet 内限定・WireGuard E2E 暗号化・恒久固定 URL のみ。
+  *Migrate the remote transport to Tailscale Serve; remove Quick Tunnel, the Cloudflare relay
+  Worker, public Pages hosting, URL-embedded tokens, and the plaintext LAN mode.*
+- **機器ペアリング二層認証を実装 + PWA を daemon 配信化** (#283):
+  - 層① Tailscale identity 検証（`tailscale whois` で接続元ノードを照合）+
+    層② 機器ペアリング（Mac 承認ダイアログ・role = observe/interact/manage/admin・
+    devices.json 永続化）。未登録端末は画面データを 1 バイトも受け取れない。
+  - 長寿命 bearer token / QR の token 埋め込み / `tako remote status --show-token` を全廃。
+  - 端末失効の即時反映（接続中の WS を即切断）・interact idle timeout（15 分）・
+    接続開始終了の macOS 通知・status bar インジケータ + kill switch・監査ログ
+    （内容は記録しない）。
+  - PWA を daemon の静的配信へ（同一 origin・バージョン一致）。ペアリング画面を新設。
+  - CLI `tako remote devices list/revoke` + MCP `tako_remote_devices`（計 92 ツール）。
+    **承認・権限昇格は Mac GUI 限定**（AI フルコントロール不変条件の明示的な例外）。
+  *Implement two-layer device-pairing authentication and serve the PWA from the daemon
+  (same-origin, version-matched); approval and role elevation are Mac-GUI-only.*
+
+### Added / 機能追加
+
+- **`tako remote setup` 対話ウィザード新設** (#286): Tailscale の導入検出 → brew/App Store
+  案内 → ログイン確認 → MagicDNS/HTTPS 有効化ガイド → serve 設定 → 自己接続確認 →
+  固定 URL の QR（PNG）表示 → スマホ側手順案内。`--yes` / `--answers` で非対話実行可。
+  dispatch `RemoteSetup` + MCP `tako_remote_setup` と 1:1（101 ツール）。
+  *New `tako remote setup` interactive wizard for Tailscale Serve configuration: detects
+  installation, guides login/HTTPS setup, configures serve, generates QR PNG, and shows
+  phone-side instructions. Non-interactive via `--yes` / `--answers`. MCP 1:1 (101 tools).*
+- `tako setup` の依存チェックに tailscale を追加（任意扱い）。完了サマリ末尾に
+  `tako remote setup` への案内を表示。setup changes.yaml rev 11 で既存ユーザーにも配信。
+  *Added tailscale to `tako setup` dependency check (optional). Shows `tako remote setup`
+  guidance at the end of setup summary. Distributed via changes.yaml rev 11.*
+
+### Documentation / ドキュメント
+
+- threat model を `.agent/threat-model-remote.md` に新設（信頼境界・Tailscale 侵害時の
+  挙動・CT log 露出・ペアリング承認の人間限定・残存リスク）。
+  `.agent/architecture.md` の「リモート機能は持たない」矛盾を解消。
+  *New threat model at `.agent/threat-model-remote.md`. Resolved "no remote" contradiction
+  in architecture.md.*
 ## [0.5.8] - 2026-07-20
 
 Nightly patch release (automated). Changes since v0.5.7:

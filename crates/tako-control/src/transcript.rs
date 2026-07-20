@@ -202,7 +202,70 @@ pub fn normalize_lines(lines: impl Iterator<Item = String>, tail: usize) -> Vec<
             _ => {}
         }
     }
+    // 最終 assistant エントリで tool_use の結果が返っていない場合、
+    // 承認待ちの可能性がある（PWA の承認カード表示に使う）。
+    // 最後のツール名とサマリを approval フィールドとして付与する
+    if let Some(last) = out.back_mut() {
+        if last["role"] == "assistant" {
+            if let Some(tools) = last["tools"].as_array() {
+                if let Some(last_tool) = tools.last() {
+                    let tool_name = last_tool["name"].as_str().unwrap_or("");
+                    let tool_summary = last_tool["summary"].as_str().unwrap_or("");
+                    last["approval"] = json!({
+                        "tool": tool_name,
+                        "command": tool_summary,
+                    });
+                }
+            }
+        }
+    }
+
+    // テキスト内の選択肢パターンを検出（「1. xxx 2. yyy」形式）
+    if let Some(last) = out.back_mut() {
+        if last["role"] == "assistant" {
+            if let Some(text) = last["text"].as_str() {
+                let choices = extract_choices(text);
+                if !choices.is_empty() {
+                    last["choices"] = json!(choices);
+                }
+            }
+        }
+    }
+
     out.into_iter().collect()
+}
+
+/// テキストから選択肢パターンを抽出する。
+/// 「1. xxx\n2. yyy」形式を検出する（番号が 1 始まりで連続すること）
+fn extract_choices(text: &str) -> Vec<String> {
+    let mut choices = Vec::new();
+    let mut expected = 1u32;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // "N. text" または "N) text" を試す
+        let rest = try_parse_numbered_line(trimmed, expected);
+        if let Some(label) = rest {
+            choices.push(label.to_string());
+            expected += 1;
+        }
+    }
+    if choices.len() < 2 {
+        return Vec::new();
+    }
+    choices
+}
+
+fn try_parse_numbered_line(line: &str, expected: u32) -> Option<&str> {
+    let prefix = expected.to_string();
+    let rest = line.strip_prefix(&prefix)?;
+    let rest = rest
+        .strip_prefix(". ")
+        .or_else(|| rest.strip_prefix(") "))?;
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed)
 }
 
 /// 既存 assistant エントリへ後続行の内容を統合する
@@ -480,6 +543,42 @@ mod tests {
         assert_eq!(value["session_id"], sid);
         assert_eq!(value["messages"].as_array().unwrap().len(), 2);
         assert!(missing.is_err());
+    }
+
+    #[test]
+    fn extract_choicesは番号付きリストを抽出する() {
+        let text = "設定を変更しますか？\n1. 変更する\n2. 詳細を見る\n3. キャンセル";
+        let choices = extract_choices(text);
+        assert_eq!(choices, vec!["変更する", "詳細を見る", "キャンセル"]);
+    }
+
+    #[test]
+    fn extract_choicesは括弧形式も扱う() {
+        let text = "選んでください:\n1) はい\n2) いいえ";
+        let choices = extract_choices(text);
+        assert_eq!(choices, vec!["はい", "いいえ"]);
+    }
+
+    #[test]
+    fn extract_choicesは1項目だけなら空を返す() {
+        let text = "1. これだけ";
+        let choices = extract_choices(text);
+        assert!(choices.is_empty());
+    }
+
+    #[test]
+    fn extract_choicesは番号が飛んでいたら途中で止まる() {
+        let text = "1. A\n3. C";
+        let choices = extract_choices(text);
+        assert!(choices.is_empty());
+    }
+
+    #[test]
+    fn try_parse_numbered_lineのテスト() {
+        assert_eq!(try_parse_numbered_line("1. hello", 1), Some("hello"));
+        assert_eq!(try_parse_numbered_line("2) world", 2), Some("world"));
+        assert_eq!(try_parse_numbered_line("1. hello", 2), None);
+        assert_eq!(try_parse_numbered_line("not a number", 1), None);
     }
 
     #[test]

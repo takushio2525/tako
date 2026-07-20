@@ -2081,9 +2081,7 @@ fn dispatch_inner(
             limit,
         }),
 
-        Request::RemoteStart { port, insecure } => host
-            .remote_start(port, insecure)
-            .map_err(DispatchError::Operation),
+        Request::RemoteStart { port } => host.remote_start(port).map_err(DispatchError::Operation),
         Request::RemoteStop { force } => {
             if force {
                 crate::remote::daemon_force_stop().map_err(DispatchError::Operation)
@@ -2091,13 +2089,7 @@ fn dispatch_inner(
                 host.remote_stop().map_err(DispatchError::Operation)
             }
         }
-        Request::RemoteStatus { show_token } => {
-            let mut status = host.remote_status();
-            if !show_token {
-                crate::remote::mask_status_token(&mut status);
-            }
-            Ok(status)
-        }
+        Request::RemoteStatus => Ok(host.remote_status()),
 
         // エージェント一覧と会話ログはどのプロセスでも取得できる（ControlHost 不要）
         Request::RemoteAgents => {
@@ -2109,11 +2101,43 @@ fn dispatch_inner(
                 .map_err(DispatchError::Operation)
         }
 
+        // ペアリング済み端末の管理（#283）。承認・role 変更はここに存在しない
+        // （Mac 画面の GUI ダイアログ限定 = AI フルコントロール不変条件の例外）
+        Request::RemoteDevices { action, device_id } => match action.as_str() {
+            "list" => crate::remote::devices_list().map_err(DispatchError::Operation),
+            "revoke" => {
+                let id = device_id.ok_or_else(|| {
+                    DispatchError::Operation("revoke には device_id が必要".to_string())
+                })?;
+                crate::remote::devices_revoke(&id).map_err(DispatchError::Operation)
+            }
+            other => Err(DispatchError::Operation(format!(
+                "不明な action: {other}（list / revoke）"
+            ))),
+        },
+
         Request::RemoteScrollback { pane_id, lines } => {
             let result = crate::remote::scrollback(&pane_id, lines.unwrap_or(1000))
                 .map_err(DispatchError::Operation)?;
             Ok(json!({ "lines": result }))
         }
+
+        Request::RemoteSetup { action, answers } => match action.as_str() {
+            "run" => {
+                let parsed: crate::remote_setup::RemoteSetupAnswers = answers
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|e| {
+                        DispatchError::InvalidParams(format!("remote setup answers が不正: {e}"))
+                    })?
+                    .unwrap_or_default();
+                crate::remote_setup::run_noninteractive(&parsed).map_err(DispatchError::Operation)
+            }
+            "check" => Ok(crate::remote_setup::check_status()),
+            other => Err(DispatchError::InvalidParams(format!(
+                "不明な action: {other}（run / check）"
+            ))),
+        },
 
         Request::Web {
             action,

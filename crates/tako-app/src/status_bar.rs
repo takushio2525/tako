@@ -233,6 +233,8 @@ impl TakoApp {
                         )
                     })
             })
+            // リモート接続インジケータ（#283。daemon 稼働中のみ表示・クリックで端末一覧）
+            .children(self.render_remote_indicator(cx))
             // フォーカスペインの cwd breadcrumb（カンプ新設。クリックでコピー）
             .children(cwd_breadcrumb.map(|(parent, leaf, full)| {
                 div()

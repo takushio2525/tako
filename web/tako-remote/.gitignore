@@ -2,3 +2,4 @@ node_modules/
 dist/
 .env*
 mock-server.js
+test-results/

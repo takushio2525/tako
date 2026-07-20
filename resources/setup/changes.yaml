@@ -201,3 +201,18 @@ changes:
       tako 内での対話 setup 完了直後は tako master の開始をその場で提案する。
       コマンド案内は最簡形（default プロファイルは `tako master`）に統一した。
       setup の再実行だけで適用され、個別の作業は不要。
+
+  - revision: 12
+    version: "0.6.0"
+    date: "2026-07-17"
+    kind: auto
+    title: リモート接続を Tailscale Serve へ一本化 + setup ウィザード新設
+    description: |
+      リモート接続（tako remote）の transport を Tailscale Serve に一本化した。
+      旧方式（Cloudflare Quick Tunnel / relay Worker / 公開 Pages / 平文 LAN モード）は
+      すべて廃止された（Issue #282 / #286）。
+      WireGuard E2E 暗号化 + tailnet 内限定で、通信経路上の第三者が内容を読めない構造。
+      URL は `https://<マシン名>.<tailnet>.ts.net` で恒久固定。
+      セットアップは `tako remote setup` で対話的に行える（Tailscale の導入から serve 設定、
+      QR コード生成までを案内）。`tako setup` の依存チェックにも tailscale が追加された（任意）。
+      旧方式を使っていた場合は `tako remote setup` で新方式へ移行できる。

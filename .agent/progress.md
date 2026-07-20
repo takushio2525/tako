@@ -854,6 +854,18 @@
 - 関連コミット: `690d220`（PR #359 squash merge）。テスト 4 本追加 + 品質ゲート全緑
 - 次: `build-app.sh --install` → 有料プラン codex 環境での実測確認（free tier では rate limit 表示なし）
 
+## 2026-07-17（#282: remote 刷新 弾3 — Tailscale transport 一本化・統合ブランチ開始）
+- `renewal/remote-transport` を開始。`tako-control::tailscale` 新設（検出 / setup 判定 /
+  serve 管理。判定関数は弾 6 と共有）、daemon を tailscale serve 化（固定 ts.net URL・
+  未 setup は不足列挙 + `tako remote setup` 誘導で停止）、cloudflared / relay / --insecure /
+  `web/tako-remote-worker/` / setup 依存チェックの cloudflared を全削除
+- 副産物修正: daemon_status の 3 行 PID 未追従（常に running=false）/ spawn_daemon の
+  PATH 旧バイナリ化け / 子 stderr 握りつぶし / agents.rs の clippy 違反（いずれも main 由来）
+- 検証: 全品質ゲート + 隔離セルフテスト完走 + 未 setup 4 状態・serve 残骸エッジの実測 +
+  実 tailnet 通し実測（start → TLS 検証込み到達（health/PWA/認証/WS 101）→ stop → 到達不能。
+  受け入れ 1〜4 完了、証拠 = Issue #282 コメント。iPhone 実機到達のみ要実機確認）
+- 次: 弾 4（#283 ペアリング認証 + PWA daemon 配信）を同ブランチに積む
+
 ## 2026-07-17（#287: セキュリティレビュー P1×2 + P2×4 修正）
 - P1-1 XFF identity 偽装対策（XFH 検証追加）、P1-2 PII プレースホルダ化、P2-1〜P2-4（upload 0o600 / 監査ログファイル名除去 / Windows パス redact / symlink 拒否）。threat model 正確化。テスト 9 本追加、全 843 テスト緑
 - 関連コミット: `d008e6c`（`renewal/remote-transport`）。Issue に修正証拠コメント済み
@@ -971,3 +983,12 @@
 - 関連コミット: `823e149`（PR #402 squash merge）。実クリック奪取・persist 復元・品質ゲートを
   隔離実測。スクショ証拠は ~/Desktop/tako-380-evidence/
 - 次: build-app.sh --install → ユーザー実機確認（#381/#380 とも）→ Issue クローズは master
+
+## 2026-07-21（renewal 統合同期: origin/main → renewal/remote-transport マージ）
+- v0.6.0 前の統合同期。main 47+ コミット（#391/#358/#384/#392/#397/#398/#381/#380/#399 等）を
+  3 段マージ（`aa349ae` → `a910886` → `e8a7165`）で取り込み。コンフリクト 13 ファイル解決
+  （remote.rs = renewal 正 + #384/#330 統合、setup.rs = #391 と remote 案内両立、
+  changes.yaml = rev 12 振り直し、MCP スナップショット 103 ツール再生成）
+- 検証: fmt / clippy(-D warnings) / test 全緑（1028 本）+ main 側 20 PR の消失ゼロを機械確認。
+  セルフテスト「worker_status IPC（#181）」FAILED は素の main で再現する main 由来（#390 対処中）
+- 次: iPhone 実機確認（統合ビルド）→ #287 レビュー → renewal → main 逆マージ → v0.6.0

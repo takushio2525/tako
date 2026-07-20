@@ -49,8 +49,6 @@ make_test_env() {
   mkdir -p "$dir/scripts" "$dir/dist/tako.app/Contents" \
            "$dir/web/tako-remote/dist/assets" "$dir/mock-bin"
   cp scripts/release.sh "$dir/scripts/"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$dir/scripts/deploy-pages.sh"
-  chmod +x "$dir/scripts/deploy-pages.sh"
   echo 'version = "99.0.0"' > "$dir/Cargo.toml"
   printf '## [99.0.0] - 2026-01-01\nTest release\n' > "$dir/CHANGELOG.md"
   echo 'ペイン' > "$dir/web/tako-remote/dist/assets/test.js"

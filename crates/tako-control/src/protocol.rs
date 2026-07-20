@@ -663,26 +663,19 @@ pub enum Request {
         limit: Option<usize>,
     },
     /// リモートアクセス API サーバーの起動。`port` 省略時は 7749。
-    /// 既定では暗号化トンネル（cloudflared）経由でのみホストし、トンネルを張れなければ
-    /// 起動を拒否する。`insecure` = true のときだけ平文 HTTP の LAN 直モードを許可する
-    /// （明示 opt-in・非推奨。同一 LAN 上の盗聴リスクあり。#104）
-    RemoteStart {
-        port: Option<u16>,
-        #[serde(default)]
-        insecure: bool,
-    },
+    /// transport は Tailscale Serve のみ（tailnet 内限定・WireGuard E2E 暗号化。#282）。
+    /// Tailscale が未セットアップ（未導入・未ログイン・HTTPS 未有効等）なら
+    /// 不足項目を列挙して起動を拒否し、`tako remote setup` へ誘導する
+    RemoteStart { port: Option<u16> },
     /// リモートアクセス API サーバーの停止。`force` = true で SIGKILL
     RemoteStop {
         #[serde(default)]
         force: bool,
     },
     /// リモートアクセス API サーバーの状態取得。
-    /// `show_token` = true のときだけ応答にトークンを平文で含める（既定はマスク。
-    /// スクリーンショット・画面共有経由でのトークン漏えいを防ぐため）
-    RemoteStatus {
-        #[serde(default)]
-        show_token: bool,
-    },
+    /// 応答にトークンは含まれない（#283 で長寿命 bearer token を全廃。
+    /// 接続時の認証は機器ペアリング二層認証が行う）
+    RemoteStatus,
     /// エージェント一覧（`claude agents --json` プロキシ + tmux ペイン対応付け。Issue #23）
     RemoteAgents,
     /// Claude Code の会話ログ（transcript）の末尾 `tail` 件を正規化して取得（Issue #23）
@@ -692,6 +685,26 @@ pub enum Request {
     },
     /// ペインのスクロールバック履歴をプレーンテキストで取得（Issue #42 履歴レイヤー用）
     RemoteScrollback { pane_id: String, lines: Option<u32> },
+    /// ペアリング済み端末の管理（#283）。`action`:
+    /// - "list": 登録済み端末と保留中のペアリング要求を一覧
+    /// - "revoke": `device_id` の登録を失効（接続中なら即時切断）
+    ///
+    /// ペアリングの承認・role 変更はここに**存在しない**: Mac 画面の GUI ダイアログ
+    /// でのみ行う（AI フルコントロール不変条件の例外。`.agent/requirements.md`）
+    RemoteDevices {
+        action: String,
+        device_id: Option<String>,
+    },
+    /// リモートアクセスの対話セットアップ（Issue #286 弾6）。
+    /// Tailscale の導入状態を検証し、serve 設定と QR PNG 生成まで行う。
+    /// `action`:
+    /// - "run": ウィザードを実行（非対話。`answers` で制御。既定ポートは 7749）
+    /// - "check": setup 状態のチェックのみ（変更なし）
+    RemoteSetup {
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answers: Option<serde_json::Value>,
+    },
     /// Web ビューペインの操作（FR-3.8、Issue #155）。ネイティブ webview
     /// （macOS = WKWebView）をペインとして表示・管理する。`action`:
     /// - "open": `url` を新しい Web ビューペインで開く（`pane` を `direction` 方向に分割）

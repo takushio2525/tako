@@ -22,6 +22,7 @@ mod overlays;
 mod preview;
 mod preview_render;
 mod preview_watch;
+mod remote_panel;
 mod right_panel;
 mod sidebar;
 mod status_bar;
@@ -355,7 +356,7 @@ fn hsla(c: tako_core::Rgb) -> Hsla {
 }
 
 /// 半透明色（スクロールバー等のオーバーレイ用）
-fn rgba_alpha(c: tako_core::Rgb, a: f32) -> Rgba {
+pub(crate) fn rgba_alpha(c: tako_core::Rgb, a: f32) -> Rgba {
     Rgba { a, ..rgba(c) }
 }
 
@@ -951,6 +952,8 @@ struct TakoApp {
     tab_scroll_handle: gpui::ScrollHandle,
     /// 前回 render 時のアクティブタブ ID（タブ切替時のみ自動スクロール発火用。Issue #208）
     last_active_tab: Option<TabId>,
+    /// リモート接続の GUI 状態（#283。承認ダイアログ・接続端末インジケータ・kill switch）
+    remote: remote_panel::RemoteUiState,
     /// タイトルバー（タブバー領域）のドラッグでウインドウ移動中か（#312）
     titlebar_dragging: bool,
     /// タブ要素上で mouse down されたか（#308: タブ D&D とウインドウドラッグの競合防止）
@@ -1922,6 +1925,7 @@ impl TakoApp {
             autosave_pending: std::collections::HashSet::new(),
             tab_scroll_handle: gpui::ScrollHandle::new(),
             last_active_tab: None,
+            remote: remote_panel::RemoteUiState::default(),
             titlebar_dragging: false,
             tab_mouse_down: false,
             viewports: Vec::new(),
@@ -2441,6 +2445,15 @@ impl TakoApp {
             let mut pane_log_tick: u32 = 0;
             loop {
                 cx.background_executor().timer(Duration::from_secs(2)).await;
+                // リモート接続の承認待ち・接続端末を更新（#283。状態確認 + admin API は
+                // すべて background で行い、UI スレッドをブロックしない。daemon 停止中は
+                // running=false になるだけ）
+                if this
+                    .update(cx, |app: &mut TakoApp, cx| app.refresh_remote_state(cx))
+                    .is_err()
+                {
+                    break;
+                }
                 // ① main thread: tmux コンテキスト + filetree 対象 + view 監視対象 + git を収集（高速）
                 let t0 = std::time::Instant::now();
                 let prep = this.update(cx, |app: &mut TakoApp, wcx| {
@@ -12317,12 +12330,8 @@ impl PreviewHost for TakoApp {
 }
 
 impl RemoteHost for TakoApp {
-    fn remote_start(
-        &mut self,
-        port: Option<u16>,
-        insecure: bool,
-    ) -> Result<serde_json::Value, String> {
-        tako_control::remote::spawn_daemon(port, insecure)
+    fn remote_start(&mut self, port: Option<u16>) -> Result<serde_json::Value, String> {
+        tako_control::remote::spawn_daemon(port)
     }
 
     fn remote_stop(&mut self) -> Result<serde_json::Value, String> {
@@ -13700,6 +13709,7 @@ impl Render for TakoApp {
             .children(pinned_overlays)
             .children(self.render_limit_service_overlay(cx))
             .children(self.render_close_confirm_dialog(cx))
+            .children(self.render_remote_overlay(cx))
             .children(self.render_command_palette(cx))
     }
 }

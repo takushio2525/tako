@@ -6646,7 +6646,6 @@ dependencies = [
  "tracing",
  "tungstenite",
  "ureq",
- "uuid",
 ]
 
 [[package]]

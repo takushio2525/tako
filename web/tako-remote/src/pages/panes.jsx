@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
-import { getActiveMachine } from '../store';
 import { createClient } from '../api';
+import { AgentIcon, agentColor } from '../components/agent-icon';
 
 function SkeletonCard() {
   return (
@@ -19,10 +19,6 @@ function SkeletonCard() {
           <div class="skeleton skeleton-line" style="width: 50%" />
         </div>
       </div>
-      <div class="pane-card-footer">
-        <span class="skeleton skeleton-text" style="width: 60px" />
-        <span class="skeleton skeleton-text" style="width: 40px" />
-      </div>
     </div>
   );
 }
@@ -36,8 +32,8 @@ function stateOf(p) {
 
 function stateLabel(st) {
   switch (st) {
-    case 'error': return 'exit 1';
-    case 'busy': return 'NEEDS INPUT';
+    case 'error': return 'error';
+    case 'busy': return 'needs input';
     case 'running': return 'running';
     default: return 'idle';
   }
@@ -45,7 +41,7 @@ function stateLabel(st) {
 
 const PULL_THRESHOLD = 80;
 
-export function PanesPage() {
+export function PanesPage({ me }) {
   const [panes, setPanes] = useState([]);
   const [previews, setPreviews] = useState({});
   const [loading, setLoading] = useState(true);
@@ -53,14 +49,12 @@ export function PanesPage() {
   const [pulling, setPulling] = useState(false);
   const [pullY, setPullY] = useState(0);
   const [filter, setFilter] = useState('all');
-  const machine = getActiveMachine();
   const timerRef = useRef(null);
   const touchStartRef = useRef({ y: 0, scrollTop: 0 });
   const listRef = useRef(null);
 
   const refresh = useCallback(async (client) => {
-    const c = client || (machine && createClient(machine.host, machine.token));
-    if (!c) return;
+    const c = client || createClient();
     try {
       const result = await c.panes();
       const list = result.panes || [];
@@ -74,14 +68,14 @@ export function PanesPage() {
           .catch(() => {});
       }
     } catch (e) {
+      if (e.status === 403) { window.location.reload(); return; }
       setError(e.message);
       setLoading(false);
     }
-  }, [machine]);
+  }, []);
 
   useEffect(() => {
-    if (!machine) { window.location.hash = '#/'; return; }
-    const client = createClient(machine.host, machine.token);
+    const client = createClient();
     refresh(client);
     timerRef.current = setInterval(() => refresh(client), 3000);
     return () => clearInterval(timerRef.current);
@@ -91,7 +85,6 @@ export function PanesPage() {
     const el = listRef.current;
     touchStartRef.current = { y: e.touches[0].clientY, scrollTop: el?.scrollTop || 0 };
   }
-
   function onTouchMove(e) {
     const el = listRef.current;
     if (!el || touchStartRef.current.scrollTop > 0) return;
@@ -101,7 +94,6 @@ export function PanesPage() {
       if (dy > 10) e.preventDefault();
     }
   }
-
   function onTouchEnd() {
     if (pullY >= PULL_THRESHOLD) {
       setPulling(true);
@@ -112,20 +104,17 @@ export function PanesPage() {
     }
   }
 
-  if (!machine) return null;
-
   const counts = { all: panes.length, busy: 0, running: 0, idle: 0, error: 0 };
   panes.forEach(p => { counts[stateOf(p)]++; });
   const filtered = filter === 'all' ? panes : panes.filter(p => stateOf(p) === filter);
 
   return (
     <div class="page">
-      <div class="panes-header" style={`padding-top: calc(8px + env(safe-area-inset-top, 0px))`}>
+      <div class="panes-header">
         <div class="panes-header-row">
-          <div class="machine-chip" onClick={() => { window.location.hash = '#/'; }}>
+          <div class="machine-chip">
             <span class="dot online" style="width: 7px; height: 7px;" />
-            <span class="chip-name">{machine.name}</span>
-            <span class="chip-arrow">▾</span>
+            <span class="chip-name">{(me && me.host) || 'tako'}</span>
           </div>
         </div>
         <div style="display: flex; gap: 7px; overflow-x: auto;">
@@ -134,19 +123,19 @@ export function PanesPage() {
           </button>
           {counts.busy > 0 && (
             <button class={`filter-chip${filter === 'busy' ? ' active' : ''}`} onClick={() => setFilter('busy')}>
-              <span class="chip-dot" style="background: var(--warning);" />
+              <span class="chip-dot" style="background: var(--amber);" />
               needs you {counts.busy}
             </button>
           )}
           {counts.running > 0 && (
             <button class={`filter-chip${filter === 'running' ? ' active' : ''}`} onClick={() => setFilter('running')}>
-              <span class="chip-dot" style="background: var(--success);" />
+              <span class="chip-dot" style="background: var(--green);" />
               running {counts.running}
             </button>
           )}
           {counts.error > 0 && (
             <button class={`filter-chip${filter === 'error' ? ' active' : ''}`} onClick={() => setFilter('error')}>
-              <span class="chip-dot" style="background: var(--danger);" />
+              <span class="chip-dot" style="background: var(--red);" />
               failed {counts.error}
             </button>
           )}
@@ -180,15 +169,26 @@ export function PanesPage() {
         >
           {filtered.map(p => {
             const st = stateOf(p);
+            const agentType = p.agent_type || 'plain';
+            const displayTitle = p.title || `Pane ${p.id}`;
+            const cardTitle = agentType !== 'plain'
+              ? `${agentType} · ${displayTitle}`
+              : displayTitle;
+
             return (
               <div key={p.id} class={`pane-card state-${st}`} onClick={() => { window.location.hash = `#/panes/${p.id}`; }}>
                 <div class="edge-bar" />
                 <div class="pane-card-header">
                   <div class="pane-card-left">
-                    <span class={`dot ${st === 'busy' ? 'busy' : st === 'running' ? 'running' : st === 'error' ? 'error' : 'idle'}`} />
-                    <span class="pane-card-title">{p.title || `Pane ${p.id}`}</span>
+                    <AgentIcon type={agentType} />
+                    <span class="pane-card-title">{cardTitle}</span>
                   </div>
                   <span class="state-badge">{stateLabel(st)}</span>
+                </div>
+                <div class="pane-card-meta">
+                  {(me && me.host) || 'tako'}
+                  {p.position ? ` · ${p.position}` : ''}
+                  {p.role ? ` · ${p.role}` : ''}
                 </div>
                 <div class="pane-card-preview">
                   <div class="pane-card-preview-box">
