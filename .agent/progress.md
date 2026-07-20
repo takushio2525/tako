@@ -992,3 +992,14 @@
 - 検証: fmt / clippy(-D warnings) / test 全緑（1028 本）+ main 側 20 PR の消失ゼロを機械確認。
   セルフテスト「worker_status IPC（#181）」FAILED は素の main で再現する main 由来（#390 対処中）
 - 次: iPhone 実機確認（統合ビルド）→ #287 レビュー → renewal → main 逆マージ → v0.6.0
+
+## 2026-07-21（#390: worker レジストリ — ペイン消失・突然死後の追跡継続）
+- workers.yaml 永続レジストリ新設（spawn 登録 / close 記録 / sid 自動昇格 / GC）。watch / status /
+  report は pane 消失時にレジストリの tmux_session / session_id で自動補完（判定ロジック不変の
+  フォールバック層）。prompt 未達検知（240 秒 + 非 busy → prompt_undelivered）、SIGSEGV 突然死
+  検知（WORKER_DEAD + claude --resume 提示、自動 resume は設計判断で見送り）、PromptFlow 再貼り付け、
+  pane ID 再利用の誤マッチ防御、`tako orchestrator workers` + MCP（計 104 ツール）
+- 関連コミット: `b23266d`（PR #408 squash merge）。受け入れ 1〜3 + 突然死を隔離実測（実 claude、
+  kill -9 再起動 / 送達阻害 / kill -SEGV）。副産物: セルフテスト 74 の確定失敗を修正同梱、
+  #406（webview close 失敗）/ #407（Bypass ダイアログ死）起票
+- 次: `build-app.sh --install` → 本番 master での workers / --worker 運用開始
