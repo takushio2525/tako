@@ -957,3 +957,22 @@
 - 回帰点を特定: #322（PR #330）で master 提案優先ロジック追加時に agent フォールバック欠落 + `--review` 限定化。修正 = 旧ランチャー除去 + `launch_setup_agent` を既定呼び出し。`--yes`/非TTY/`launch_agent=none` でスキップ。docs に「素のコマンドで完結」原則を追記
 - 関連コミット: `15fefa2`（PR #396 squash merge）。CLI 27 + control 529 + core 310 tests / clippy / fmt 緑 + 実機で対話起動・greeting 注入を実測
 - 次: `build-app.sh --install` → 本番で `tako setup` の対話起動確認
+
+## 2026-07-19（#381: 赤ボタン close → Dock 復帰の TakoApp 二重生成による全タブ消失を根治）
+- 根因を実測で確定: on_reopen の TakoApp::new 再生成で旧 entity がゾンビ化（本番 pid で IPC ソケット
+  2 個 LISTEN を実測）→ 復元 spawn -A -D がゾンビの tmux クライアント強奪 → Exited 連鎖で
+  「まっさら」（1 回目）/ cx.quit() の silent death（2 回目、隔離で再現）。修正 = PrimaryApp global +
+  reopen_or_restore で同一 entity のウィンドウ開き直し + GPUI 枚数判定 + panic.log 常時記録
+- 検証: 根因シーケンス A/B 比較（修正前 = プロセス即死、修正後 = タブ・クライアント・ソケット維持）+
+  受け入れ 3 パターン（New Window 直後 / タブ移動後 / ウィンドウ close 後の quit → 再起動で全タブ復元）+
+  persist OFF エッジ + 品質ゲート全緑。復元の複数ウィンドウ開き直しはクリーン 3/3 決定的
+- 副産物: 検証 CLI が worker 注入 env（TAKO_SOCKET）で本番ゾンビに誤接続し layout.json を一時汚染
+  （即時復旧済み、E2 の自然保存で 5 タブ復帰確認）。以後の隔離検証は env -u ラッパー必須
+
+## 2026-07-19（#381 完了: PR #400 squash merge）
+- 全根因の実測確定（TakoApp 二重生成 → ゾンビ → -A -D 強奪 → まっさら/silent death）と
+  entity 再利用への構造修正 + 堅牢化 3 点（panic.log 恒久記録 / orphan 復帰総点検 +
+  catch_unwind / 空 layout 保存拒否 + layout.json.good + recover --apply good）
+- 関連コミット: `f9c2ac8`（PR #400 squash merge）。受け入れ 3 パターン + panic e2e +
+  orphan 反復 ×7 隔離実測。証拠は ~/Desktop/tako-381-evidence/
+- 次: #380 共有タブバー化（同一 worker 継続）。実機 install はユーザー

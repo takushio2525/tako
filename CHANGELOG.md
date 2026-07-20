@@ -50,6 +50,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `.agent/architecture.md` の「リモート機能は持たない」矛盾を解消。
   *New threat model at `.agent/threat-model-remote.md`. Resolved "no remote" contradiction
   in architecture.md.*
+## [0.5.8] - 2026-07-20
+
+Nightly patch release (automated). Changes since v0.5.7:
+夜間パッチリリース（自動）。v0.5.7 以降の変更:
+
+- [ドキュメント] activeContext / progress を #381 完了で更新
+- [修正] 赤ボタン close → Dock 復帰の TakoApp 二重生成による全タブ消失を根治 + 復元の防御的堅牢化 (#381) (#400)
+- [機能追加] Finder D&D 改善: ツリー追加 + cmd ドロップ出し分け (#219, #21) (#399)
+- [改善] Web ビュー改善: target=_blank 対応 / SVG ツールバー / アドレスバー (#335, #336, #337) (#398)
+- [改善] セルフテスト基盤改善: スナップショット検証化 + flaky 安定化 (#358, #343) (#397)
+- [修正] Web dock URL 入力のセルフテスト項目 78 を追加 (#375)
+- [ドキュメント] activeContext / progress を #391 修正完了で更新
+- [修正] setup: 対話エージェントの既定起動を復元 (#391) (#396)
+- [機能追加] PDF プレビューのドラッグ選択で端到達時の自動スクロールとページまたぎ選択 (#309) (#395)
+- [修正] リサイズ・レイアウト変化時のペイン暗転を根治 (#385) (#394)
+- [ドキュメント] activeContext / progress を #357 完了で更新
+- [スタイル] UI 掃除: workers 起動ボタン + 失敗トースト/再試行を撤去 (#392)
+- [改善] 利用制限表示にリロードボタン追加 + agy を unsupported 明示表示に (#357) (#393)
+- [ドキュメント] activeContext / progress を #372 修正完了で更新
+- [修正] sleep-guard: 全バックエンドの子プロセス判定で busy 漏れを根治 (#372) (#389)
+- [改善] エラーレポート自動送信の Phase 2: 送信キュー・PII マスキング強化・重大エラーフック (#333) (#388)
+- [ドキュメント] activeContext / progress を #369 + #374 修正完了で更新
+- [改善] orchestrator: probe 一括化 + report --messages (#369 #374) (#387)
+- [ドキュメント] activeContext / progress を #315 R2 修正完了で更新
+- [修正] PDF リンクの cmd ホバー/クリックが .app 環境で不発になる問題を根治 (#315) (#386)
+- [修正] verify_pid_identity の fail-open を fail-safe に変更 (#329) (#384)
+- [ドキュメント] activeContext / progress を #375 修正完了で更新
+- [ドキュメント] activeContext / progress を #378 実装完了で更新
+- [修正] Web dock URL 入力欄のフォーカス不在を修正 (#375) (#383)
+- [機能追加] タブ名の自動命名: source パラメータ + 命名規則設定 + master プロンプト追記 (#378) (#382)
+- [改善] claude session スキャンの Node 起動コスト削減 (#368) (#376)
+- [ドキュメント] activeContext / progress を #371 実装完了で更新
+- [スタイル] タブ D&D 並べ替えのドロップ先挿入位置インジケータを実装 (#371) (#373)
 
 ## [0.5.7] - 2026-07-19
 
@@ -73,26 +106,46 @@ Nightly patch release (automated). Changes since v0.5.6:
 
 ## [Unreleased]
 
-- [機能追加] PDF プレビューで文字選択ドラッグ中の端到達で自動スクロール (#309)
-  ペイン上下端 40px のマージン内で速度変化付き自動スクロールが開始され、ページ境界を
-  またいだ連続選択・コピーが可能に。ターミナル側の #310 と同じ操作感・速度カーブ。
-  PDF preview now auto-scrolls during text selection drag near viewport edges,
-  enabling cross-page selection and copy. Same feel and speed curve as #310.
+- [改善] タブバーを全ウィンドウ共有にする (#380)
+  どのウィンドウのタブバーにも全タブが表示され、New Window 直後から既存タブが全部
+  見える。タブをクリックするとそのウィンドウへ表示が自動で移り（`tako window move-tab`
+  と同一経路。「同一タブは同時に 1 ウィンドウのみ表示」の排他は維持）、他ウィンドウで
+  表示中のタブには W<番号> バッジが付く。⌘数字・次/前タブ巡回も全タブ基準に統一。
+  The tab bar is now shared across all windows (#380): every window shows every
+  tab (immediately after New Window too). Clicking a tab moves its display to
+  that window (same path as `tako window move-tab`; the one-window-per-tab
+  exclusivity is kept), and tabs displayed in another window get a W<n> badge.
+  Cmd+number and next/prev tab cycling now operate over all tabs.
 
-- [改善] 利用制限表示にリロードボタンを追加 + agy を「unsupported」明示表示に (#357)
-  USAGE LIMITS ドロップダウンのヘッダーにリロードボタンを追加し、全ペインの TUI フッターを
-  即時再走査して最新メトリクスを取得する。agy の制限データ取得は不可能と確定したため
-  「--」から「unsupported」明示表示に変更。CLI `tako limit-service --refresh` +
-  MCP `tako_limit_service` action=refresh で 1:1 公開。
-  Add a reload button to the USAGE LIMITS dropdown (#357). The button re-scans
-  all pane TUI footers immediately for the latest metrics. agy is confirmed
-  unsupported and now explicitly shown as such instead of "--".
+- [修正] 赤ボタン close → Dock 復帰の TakoApp 二重生成による全タブ消失を根治 (#381)
+  最後のウィンドウを赤ボタンで閉じて Dock から復帰すると TakoApp が再生成され、
+  旧インスタンスがゾンビ化（CLI / MCP 接続先の分裂・layout 保存の競合）、復元 spawn の
+  `-A -D` がゾンビ側の tmux クライアントを強奪して Exited 連鎖 → 縮退 layout 上書き・
+  silent death を起こしていた。Dock 復帰・メニューの New Window は生存ワークスペースの
+  ウィンドウを開き直す方式に変更（復元も spawn も経ない）。「最後の 1 枚」判定も
+  論理ウィンドウ数から GPUI ウィンドウ数に修正。あわせてパニックのローカル記録
+  （`<data_dir>/panic.log`、テレメトリ設定と無関係に常時）と終了処理の開始ログを追加し、
+  痕跡なしのプロセス消滅を事後調査できるようにした。
+  Fixed total tab loss caused by duplicated TakoApp instances on red-button close →
+  Dock reopen: the stale instance kept running (split CLI/MCP endpoints, conflicting
+  layout saves) and the new instance's restore spawn (`-A -D`) took over its tmux
+  clients, cascading pane exits into a degraded layout overwrite or silent death.
+  Dock reopen and menu New Window now reopen windows of the live workspace without
+  re-restoring. Also added always-on local panic logging (`panic.log`) and an
+  app-quit trace for post-mortem of silent process deaths.
 
-- [修正] sleep-guard の busy_agents が稼働中 worker を数えない問題を根治 (#372)
-  旧実装は OSC 133 の CommandState が Unknown のバックエンドのみ子プロセス判定していたが、
-  TUI エージェント（claude 等）が Idle→Running に遷移しないケースで busy=0 のまま assertion
-  未保持になっていた。全バックエンドの子プロセス判定に変更し、`status()` の busy_agents
-  ハードコード 0 も修正。
+- [改善] 復元・orphan 自動復帰の防御的堅牢化 (#381)
+  空レイアウト（タブ / ペイン 0 個）の保存を拒否して既存 layout.json を保護、復元成功時に
+  良品スナップショット `layout.json.good` を保全（`tako recover --apply good` で復旧可能、
+  一覧にも表示）。orphan 自動復帰は unwrap / アクティブタブ前提 / split 失敗時の孤児登録を
+  総点検で除去し、復帰処理全体を catch_unwind で包んでパニックでも起動を続行する
+  （9 セッション一括復帰 ×5 回 + 復元併発 ×2 回の隔離反復で安定を実測）。
+  Hardened restore and orphan auto-recovery: empty layouts are rejected on save,
+  a known-good snapshot (`layout.json.good`) is preserved after each successful
+  restore (restorable via `tako recover --apply good`), and the recovery path was
+  audited (no unwrap / active-tab assumptions / orphaned registrations) and wrapped
+  in catch_unwind so a panic can no longer take down the whole app at startup.
+
 - [スタイル] タブ D&D 並べ替え時のドロップ先挿入位置インジケータを改善 (#371)
   ドラッグ中に挿入位置を示す縦線バー（3px + accent glow）を表示、ソースタブを
   半透明 + 点線ボーダーで「掴まれた」状態に変化。ライト/ダーク両テーマ対応。

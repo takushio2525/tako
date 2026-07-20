@@ -618,8 +618,17 @@ pub fn load_file(path: &Path) -> Result<LayoutFile, LayoutError> {
 /// 書き出し（tmp + rename。settings と同方式）。
 /// ペイン数が大幅に減る保存は、上書き前に直前の layout.json を世代バックアップ
 /// （`.bak.1`〜`.bak.3`）へ退避する（#177: tmux クライアント強奪で PTY が一斉死亡した
-/// 直後の自動保存が「正常だった構成」を上書き破壊し、復元不能になった）
+/// 直後の自動保存が「正常だった構成」を上書き破壊し、復元不能になった）。
+/// 空のレイアウト（タブ 0 個 / ペイン 0 個）は復元不能な上書きにしかならないため
+/// 保存自体を拒否する（#381: どのような異常経路でも既存の良品を空で潰さない防御線。
+/// restore 側の `LayoutError::Empty` 拒否と対の二重防御）
 pub fn save(layout: &LayoutFile) -> io::Result<PathBuf> {
+    if is_empty_layout(layout) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "空のレイアウト（タブ / ペイン 0 個）は保存しない（既存の layout.json を保護）",
+        ));
+    }
     let path = layout_path().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::Unsupported,
@@ -631,10 +640,32 @@ pub fn save(layout: &LayoutFile) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+/// 復元に成功した直後のレイアウトを「良品スナップショット」（`layout.json.good`）として
+/// 保全する（#381: 縮退保存の連鎖やゾンビ保存で `.bak.1`〜`.bak.3` が汚染されても、
+/// 「最後に実際へ復元できた構成」が必ず 1 世代残ることを保証する）。
+/// 失敗しても起動は止めない（best-effort）
+pub fn snapshot_good() {
+    let Some(path) = layout_path() else {
+        return;
+    };
+    if !path.exists() {
+        return;
+    }
+    let good = path.with_extension("json.good");
+    if let Err(e) = std::fs::copy(&path, &good) {
+        eprintln!("warning: 良品スナップショット（layout.json.good）の作成に失敗: {e}");
+    }
+}
+
 /// 縮退保存とみなすしきい値: 直前 4 ペイン以上から半分未満へ減る保存。
 /// 1〜3 ペインの増減は日常操作（ペインを閉じる）なので対象外
 fn is_degraded_shrink(prev: usize, next: usize) -> bool {
     prev >= 4 && next < prev.div_ceil(2)
+}
+
+/// 保存を拒否すべき空レイアウトか（#381: 空での上書きは復元不能に直結する）
+fn is_empty_layout(layout: &LayoutFile) -> bool {
+    layout.tabs.is_empty() || layout.pane_count() == 0
 }
 
 /// 縮退の連鎖（Exited が 1 ペインずつ届き 16→15→…→3 と段階保存される）で
@@ -1085,6 +1116,27 @@ mod tests {
         assert!(!is_degraded_shrink(3, 1)); // 少ペインからの減少は日常操作
         assert!(!is_degraded_shrink(16, 20)); // 増加
         assert!(!is_degraded_shrink(16, 16)); // 不変
+    }
+
+    #[test]
+    fn 空レイアウトは保存拒否の対象になる() {
+        // #381: どのような異常経路でも既存の layout.json を空で潰さない防御線
+        let empty = LayoutFile {
+            version: LAYOUT_VERSION,
+            active_tab: 1,
+            tabs: vec![],
+            window: None,
+            backgrounded: vec![],
+            collapsed: vec![],
+            webview_dock: vec![],
+            windows: vec![],
+        };
+        assert!(is_empty_layout(&empty));
+        // 正常構成（タブ + ペインあり）は保存対象
+        let ws = sample_workspace();
+        let layout = capture(&ws, &|_| PaneMeta::default(), None);
+        assert!(!is_empty_layout(&layout));
+        assert!(layout.pane_count() > 0);
     }
 
     #[test]
