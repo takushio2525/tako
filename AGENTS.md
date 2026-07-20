@@ -55,6 +55,10 @@ tako/
 - 新機能の操作ロジックは tako-core の操作 API として実装し、`tako-control::dispatch`
   （protocol + ControlHost）へ 1:1 で載せる（UI 層に閉じたロジックを作らない）。
   Phase 2 以降、CLI はこの経路で操作できる。MCP 公開（Phase 3）も同じ dispatch を呼ぶ
+- **「最も簡単なコマンドを提案する」原則（#322）**: ユーザーへ提示するコマンドは常に最簡形
+  （既定値で済む引数を付けない。`tako master -default` ではなく `tako master`）。機能追加は
+  新しい `--オプション` ではなく既定動作を賢くする方向で設計する。CLI 出力・system prompt・
+  docs のすべてに適用。詳細は `.agent/conventions.md`「コマンド案内の規約」
 
 ## コマンド
 
@@ -77,6 +81,7 @@ tako/
 | オーケストレーター master 引き継ぎ | `tako orchestrator handoff [--pane N] [--tab T]`（handoff ファイルを読み新 master spawn。#193） |
 | オーケストレーター worker spawn | `tako orchestrator spawn --project <key> --prompt "..."` |
 | オーケストレーター worker 監視 | `tako orchestrator watch --pane <N> --session-id <S>` |
+| オーケストレーター worker 報告取得 | `tako orchestrator report --pane <N> [--lines 2000]`（scrollback + transcript 2 層。MCP `tako_orchestrator_report` と 1:1。#364） |
 | オーケストレーター プロジェクト管理 | `tako orchestrator projects list/add/remove` |
 | worker spawn のレイアウト設定 | `tako orchestrator layout [--policy master-reserved\|legacy] [--master-ratio 0.5] [--algorithm grid\|spiral]`（全省略で現在値表示。#165） |
 | build | `cargo build --workspace` |
@@ -88,6 +93,7 @@ tako/
 | プレビュー画像キャッシュ | `tako preview-cache [max_mb]`（引数なしで上限・使用量・件数。既定 512MiB、256〜8192MiB、settings.json 永続化・MCP `tako_preview_cache` と 1:1。#258） |
 | 受け入れゲート（#244） | `tako task gate set <task_id> --command "cmd" [--pr-merged N] [--custom "desc"]` / `tako task gate check <task_id>` / `tako task gate show <task_id>`（MCP `tako_task_gate` / `tako_task_gate_check` / `tako_task_gate_show` と 1:1） |
 | Web ビューペイン操作 | `tako web open <url>` / `list` / `show <id>` / `hide` / `close` / `nav <to>` / `eval <js>` / `eval-result <token>` / `read`（ネイティブ WKWebView ペイン。#155） |
+| 複数ウィンドウ操作（ビューポート方式。#339） | `tako window list` / `new [--tab N]` / `close <W>` / `move-tab --tab N --window W` / `focus <W>`（タブ・ペインの実体は全ウィンドウ共有。MCP `tako_window` と 1:1） |
 | エージェント共通ルール同期 | `tako agents sync-rules` / `tako agents status`（正本から各エージェントのグローバル指示ファイルへマーカーブロック同期。#136） |
 | レイアウト復旧（タブ・ペイン大量消失時。#177） | `tako recover`（バックアップ世代一覧）→ tako 終了 → `tako recover --apply <世代>` → tako 再起動。実体 tmux セッションの個別取り込みは `tako tmux open --socket tako --pane <N> <session>` |
 | セッションカタログ（会話の発見・復元。#112） | `tako sessions list [--role r] [--project p]` / `tako sessions show <id>` / `tako sessions resume <id>`（記録 cwd で `claude --resume` をペイン起動。claude のみ） |

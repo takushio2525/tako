@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use crate::theme::Rgb;
 
 /// git バイナリの場所（tmux_bin と同パターン、プロセス内 1 回解決）
-pub(crate) fn git_bin() -> &'static str {
+pub fn git_bin() -> &'static str {
     static BIN: OnceLock<String> = OnceLock::new();
     BIN.get_or_init(resolve_git_bin)
 }
@@ -126,10 +126,11 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// cwd から git リポジトリのルートを解決する（`git rev-parse --show-toplevel`）。
-/// リポ外なら None
-pub fn repo_root(cwd: &Path) -> Option<std::path::PathBuf> {
-    let output = git_command(cwd)
+/// パスから git リポジトリのルートを解決する（`git rev-parse --show-toplevel`）。
+/// ファイルパスが渡された場合は親ディレクトリで解決する。リポ外なら None。
+pub fn repo_root(path: &Path) -> Option<std::path::PathBuf> {
+    let dir = if path.is_file() { path.parent()? } else { path };
+    let output = git_command(dir)
         .args(["rev-parse", "--show-toplevel"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -792,12 +793,32 @@ mod tests {
             .parent()
             .unwrap();
         if repo_root(repo).is_none() {
-            return; // git リポ外（CI 等）ではスキップ
+            return;
         }
         let commits = log_file_commits(repo, "Cargo.toml", 5);
         assert!(!commits.is_empty(), "Cargo.toml に履歴がある");
         assert!(commits.len() <= 5);
         assert!(!commits[0].hash.is_empty());
+    }
+
+    #[test]
+    fn ファイルパス経由のrepo_rootでlog_file_commitsが動く() {
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("Cargo.toml");
+        let repo = match repo_root(&file) {
+            Some(r) => r,
+            None => return,
+        };
+        let rel = file
+            .strip_prefix(&repo)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let commits = log_file_commits(&repo, &rel, 5);
+        assert!(!commits.is_empty(), "ファイルパス経由でも履歴が取れる");
     }
 
     #[test]
@@ -818,6 +839,29 @@ mod tests {
         // 最新コミットが Cargo.toml を変更していなければ空
         // 変更していれば hunk が取れる。どちらもパニックしない
         let _ = hunks;
+    }
+
+    #[test]
+    fn repo_rootはファイルパスでも親ディレクトリから解決できる() {
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        assert!(file.is_file());
+        let root = repo_root(&file);
+        assert!(root.is_some(), "ファイルパスでも repo_root が取れる");
+    }
+
+    #[test]
+    fn repo_rootはディレクトリパスでも従来どおり解決できる() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(dir.is_dir());
+        let root = repo_root(dir);
+        assert!(root.is_some(), "ディレクトリパスで repo_root が取れる");
+    }
+
+    #[test]
+    fn repo_rootはリポ外のファイルで空を返す() {
+        let file = std::path::Path::new("/tmp/.tako_test_nonexistent_file");
+        let root = repo_root(file);
+        assert!(root.is_none());
     }
 
     #[test]

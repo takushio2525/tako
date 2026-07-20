@@ -49,12 +49,29 @@ impl TakoApp {
     }
 
     /// アクティブタブが表示領域に入るよう ScrollHandle を更新する。
-    /// タブ切替を行うすべての経路（クリック・⌘数字・CLI/MCP）から呼ぶ
+    /// タブ切替を行うすべての経路（クリック・⌘数字・CLI/MCP）から呼ぶ。
+    /// scroll_to_item は子要素インデックスで動くため、タブバーの表示と同じ
+    /// アクティブウィンドウ内の並びで位置を計算する（Issue #339）
     pub(crate) fn scroll_active_tab_into_view(&self) {
         let active = self.workspace.active_tab_id();
-        if let Some(idx) = self.workspace.tabs().iter().position(|t| t.id() == active) {
+        let win_tabs = self
+            .workspace
+            .window_tab_ids(self.workspace.active_window_id());
+        if let Some(idx) = win_tabs.iter().position(|t| *t == active) {
             self.tab_scroll_handle.scroll_to_item(idx);
         }
+    }
+
+    /// タブバーの + ボタン: クリックされたウィンドウに新規タブを作る（Issue #339。
+    /// 非アクティブウィンドウの + でも activation イベントの順序に依存せず正しく動かす）
+    pub(crate) fn new_tab_in_viewport(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if let Some(lid) = self.viewport_of(window) {
+            if self.workspace.get_window(lid).is_some() && self.workspace.active_window_id() != lid
+            {
+                let _ = self.workspace.activate_window(lid);
+            }
+        }
+        self.new_tab(cx);
     }
 
     pub(crate) fn render_tab_bar(
@@ -63,18 +80,29 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme.clone();
-        let active = self.workspace.active_tab_id();
+        // このウィンドウの表示タブと所属タブだけを描く（Issue #339 ビューポート方式）
+        let viewport = self
+            .viewport_of(window)
+            .unwrap_or_else(|| self.workspace.active_window_id());
+        let active = self
+            .workspace
+            .get_window(viewport)
+            .map(|w| w.active_tab())
+            .unwrap_or_else(|| self.workspace.active_tab_id());
 
-        // アクティブタブが変わった（dispatch / new_tab 等）ら自動スクロールイン
-        if self.last_active_tab != Some(active) {
+        // アクティブタブが変わった（dispatch / new_tab 等）ら自動スクロールイン。
+        // スクロール位置（tab_scroll_handle）は共有のためアクティブウィンドウでのみ追従
+        if viewport == self.workspace.active_window_id() && self.last_active_tab != Some(active) {
             self.last_active_tab = Some(active);
             self.scroll_active_tab_into_view();
         }
 
+        let window_tabs = self.workspace.window_tab_ids(viewport);
         let tabs: Vec<_> = self
             .workspace
             .tabs()
             .iter()
+            .filter(|tab| window_tabs.contains(&tab.id()))
             .map(|tab| {
                 let id = tab.id();
                 let label = if tab.title_source() == TitleSource::Default {
@@ -117,6 +145,7 @@ impl TakoApp {
         let is_pane_dragging = self.drag_kind == Some(DragKind::Pane);
         let tab_reorder = self.tab_reorder_indicator;
         let is_tab_dragging = self.drag_kind == Some(DragKind::Tab);
+        let dragging_tab_id = self.dragging_tab;
 
         div()
             .id("tab-bar")
@@ -147,13 +176,15 @@ impl TakoApp {
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, _, _| {
                     this.titlebar_dragging = false;
+                    this.tab_mouse_down = false;
                 }),
             )
             .on_mouse_down_out(cx.listener(|this, _, _, _| {
                 this.titlebar_dragging = false;
+                this.tab_mouse_down = false;
             }))
             .on_mouse_move(cx.listener(|this, _, window, _| {
-                if this.titlebar_dragging {
+                if this.titlebar_dragging && !this.tab_mouse_down {
                     this.titlebar_dragging = false;
                     window.start_window_move();
                 }
@@ -180,11 +211,6 @@ impl TakoApp {
                     .min_w(px(0.0))
                     .overflow_x_scroll()
                     .track_scroll(&self.tab_scroll_handle)
-                    .on_drag_move::<TabDrag>(cx.listener(
-                        |this, _: &DragMoveEvent<TabDrag>, _, cx| {
-                            this.set_tab_reorder_indicator(None, cx);
-                        },
-                    ))
                     .on_drop::<TabDrag>(cx.listener(|this, drag: &TabDrag, _, cx| {
                         this.drop_tab_reorder(drag.tab, None, cx);
                     }))
@@ -235,9 +261,10 @@ impl TakoApp {
 
                                 let truncated = truncate(&label, label_max);
 
-                                // タブ D&D 並べ替えの挿入インジケータ（#308）
+                                // タブ D&D 並べ替えの挿入インジケータ（#371）
                                 let show_indicator =
                                     is_tab_dragging && tab_reorder == Some(Some(id));
+                                let is_drag_source = is_tab_dragging && dragging_tab_id == Some(id);
 
                                 div()
                                     .flex()
@@ -247,11 +274,18 @@ impl TakoApp {
                                     .when(show_indicator, |d| {
                                         d.child(
                                             div()
-                                                .w(px(2.0))
+                                                .w(px(3.0))
                                                 .h(px(22.0))
                                                 .flex_none()
-                                                .rounded(px(1.0))
-                                                .bg(hsla(theme.accent)),
+                                                .rounded(px(1.5))
+                                                .bg(hsla(theme.accent))
+                                                .shadow(vec![BoxShadow {
+                                                    color: hsla_alpha(theme.accent, 0.5),
+                                                    offset: point(px(0.), px(0.)),
+                                                    blur_radius: px(4.0),
+                                                    spread_radius: px(0.),
+                                                    inset: false,
+                                                }]),
                                         )
                                     })
                                     .child(
@@ -268,7 +302,13 @@ impl TakoApp {
                                             .flex_shrink_0()
                                             .rounded(px(8.0))
                                             .cursor_pointer()
-                                            .when(is_active, |d| {
+                                            .when(is_drag_source, |d| {
+                                                d.opacity(0.4)
+                                                    .border_1()
+                                                    .border_color(hsla(theme.border_subtle))
+                                                    .border_dashed()
+                                            })
+                                            .when(is_active && !is_drag_source, |d| {
                                                 d.bg(rgba(theme.tab_active_background))
                                                     .border_1()
                                                     .border_color(hsla(theme.border_heavy))
@@ -280,7 +320,7 @@ impl TakoApp {
                                                         inset: true,
                                                     }])
                                             })
-                                            .when(!is_active, |d| {
+                                            .when(!is_active && !is_drag_source, |d| {
                                                 d.hover(|d| d.bg(rgba(theme.surface_hover)))
                                             })
                                             .when(
@@ -299,6 +339,12 @@ impl TakoApp {
                                                 hsla(theme.tab_inactive_foreground)
                                             })
                                             .text_size(px(12.5))
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                cx.listener(move |this, _, _, _| {
+                                                    this.tab_mouse_down = true;
+                                                }),
+                                            )
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 let _ = this.workspace.activate_tab(id);
                                                 this.scroll_active_tab_into_view();
@@ -306,9 +352,10 @@ impl TakoApp {
                                             }))
                                             .on_drag(
                                                 TabDrag { tab: id },
-                                                self.drag_ghost_builder(
+                                                self.drag_ghost_builder_with_tab(
                                                     DragKind::Tab,
                                                     truncated.clone(),
+                                                    Some(id),
                                                     cx,
                                                 ),
                                             )
@@ -441,15 +488,22 @@ impl TakoApp {
                                     ) // .child(div() inner tab pill)
                             }),
                     )
-                    // 末尾の挿入インジケータ（タブ D&D 並べ替え: 末尾移動。#308）
+                    // 末尾の挿入インジケータ（タブ D&D 並べ替え: 末尾移動。#371）
                     .when(is_tab_dragging && tab_reorder == Some(None), |d| {
                         d.child(
                             div()
-                                .w(px(2.0))
+                                .w(px(3.0))
                                 .h(px(22.0))
                                 .flex_none()
-                                .rounded(px(1.0))
-                                .bg(hsla(theme.accent)),
+                                .rounded(px(1.5))
+                                .bg(hsla(theme.accent))
+                                .shadow(vec![BoxShadow {
+                                    color: hsla_alpha(theme.accent, 0.5),
+                                    offset: point(px(0.), px(0.)),
+                                    blur_radius: px(4.0),
+                                    spread_radius: px(0.),
+                                    inset: false,
+                                }]),
                         )
                     })
                     // +: 新規タブ（カンプ 30×30 / radius 8）
@@ -465,7 +519,9 @@ impl TakoApp {
                             .rounded(px(8.0))
                             .cursor_pointer()
                             .hover(|d| d.bg(rgba(theme.surface_hover)))
-                            .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.new_tab_in_viewport(window, cx)
+                            }))
                             .on_drag_move::<TabDrag>(cx.listener(
                                 |this, _: &DragMoveEvent<TabDrag>, _, cx| {
                                     this.set_tab_reorder_indicator(None, cx);

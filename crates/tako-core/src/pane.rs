@@ -66,6 +66,16 @@ pub enum TitleSource {
     Manual,
 }
 
+impl TitleSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+        }
+    }
+}
+
 /// ペイン。Phase 1 はターミナルのみ。プレビュー種別は Phase 5 で拡張する
 #[derive(Debug)]
 pub struct Pane {

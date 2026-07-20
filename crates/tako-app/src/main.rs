@@ -41,13 +41,13 @@ use std::time::Duration;
 use futures::channel::mpsc::unbounded;
 use futures::StreamExt;
 use gpui::{
-    canvas, div, fill, point, prelude::*, px, quad, relative, size, svg, App, BorderStyle, Bounds,
-    BoxShadow, ClipboardItem, Context, CursorStyle, DragMoveEvent, ElementInputHandler,
-    EntityInputHandler, ExternalPaths, FocusHandle, Font, FontStyle, FontWeight, HighlightStyle,
-    Hsla, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, Rgba, ScrollDelta, ScrollWheelEvent, SharedString, Size, StrikethroughStyle, StyledText,
-    TextLayout, TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window, WindowBounds,
-    WindowOptions,
+    canvas, div, fill, point, prelude::*, px, quad, relative, size, svg, AnyWindowHandle, App,
+    BorderStyle, Bounds, BoxShadow, ClipboardItem, Context, CursorStyle, DragMoveEvent,
+    ElementInputHandler, EntityInputHandler, ExternalPaths, FocusHandle, Font, FontStyle,
+    FontWeight, HighlightStyle, Hsla, Keystroke, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollDelta, ScrollWheelEvent, SharedString,
+    Size, StrikethroughStyle, StyledText, Subscription, TextLayout, TextRun, TextStyle,
+    UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use tako_control::{
@@ -64,9 +64,12 @@ use tako_core::{
 const INITIAL_COLS: usize = 80;
 const INITIAL_ROWS: usize = 24;
 
-/// 実行中 Claude Code とペインの対応を layout.json へ反映する間隔。
-/// 外部 CLI を呼ぶため描画ループとは分離し、成功時だけ保存キャッシュを更新する。
-const CLAUDE_SESSION_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+/// `claude agents --json` のフルスキャン間隔。Node 起動 1 回 0.2s CPU のため
+/// アイドル時のコスト削減が目的（#368: 5s→30s に延長、前段ガード + イベント駆動併用）
+const CLAUDE_SESSION_SCAN_INTERVAL: Duration = Duration::from_secs(30);
+/// イベント駆動フラグのチェック間隔。spawn / PromptFlow 完了で立つフラグを
+/// この間隔で拾い、即時スキャンする（最悪 5s 遅延 = 旧スキャン間隔と同等）
+const CLAUDE_SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 復元時に新しいシェルへ投入する Claude resume コマンドを安全条件つきで組み立てる。
 /// backend 生存時はプロセスごと再 attach するため、二重起動を避けて None。
@@ -106,6 +109,16 @@ const DRAG_SCROLL_MAX_SPEED: f32 = 30.0;
 fn drag_scroll_delta(factor_abs: f32) -> f32 {
     let speed =
         DRAG_SCROLL_MIN_SPEED + (DRAG_SCROLL_MAX_SPEED - DRAG_SCROLL_MIN_SPEED) * factor_abs;
+    speed * (DRAG_SCROLL_INTERVAL_MS as f32 / 1000.0)
+}
+
+/// PDF プレビュー用: 速度係数（0.0..1.0）を 1 ティック分のスクロールピクセル数（正）に変換する（#309）
+const DRAG_SCROLL_MIN_PX_PER_SEC: f32 = 40.0;
+const DRAG_SCROLL_MAX_PX_PER_SEC: f32 = 600.0;
+
+fn drag_scroll_delta_px(factor_abs: f32) -> f32 {
+    let speed = DRAG_SCROLL_MIN_PX_PER_SEC
+        + (DRAG_SCROLL_MAX_PX_PER_SEC - DRAG_SCROLL_MIN_PX_PER_SEC) * factor_abs;
     speed * (DRAG_SCROLL_INTERVAL_MS as f32 / 1000.0)
 }
 
@@ -596,11 +609,27 @@ fn byte_to_utf16_offset(text: &str, byte_offset: usize) -> usize {
     text[..offset].chars().map(char::len_utf16).sum()
 }
 
-/// ドラッグ選択中の自動スクロール状態（#310）
+/// ドラッグ選択中の自動スクロール状態（#310 ターミナル / #309 PDF プレビュー）
 struct DragScrollState {
     pane: PaneId,
     /// 正 = 過去方向（上）、負 = 未来方向（下）。絶対値が速度係数（0.0..1.0）
     speed_factor: f32,
+    /// true = PDF プレビューのドラッグスクロール（scroll_handle 操作）
+    preview: bool,
+}
+
+/// IME 変換状態の対象ペインを解決する（#332）。変換開始時のペインが既に閉じられて
+/// いる場合、候補ウィンドウの位置出しと確定文字列が死んだペインへ向かわないよう
+/// 現在のフォーカスペインへ倒す
+fn resolve_ime_pane(
+    recorded: Option<PaneId>,
+    alive: impl Fn(PaneId) -> bool,
+    focused: PaneId,
+) -> PaneId {
+    match recorded {
+        Some(pane) if alive(pane) => pane,
+        _ => focused,
+    }
 }
 
 struct TakoApp {
@@ -648,6 +677,8 @@ struct TakoApp {
     active_pdf_rasters: std::collections::HashSet<PaneId>,
     /// IME 変換中の未確定文字列（FR-1.9。None = 変換中でない）
     ime: Option<ImeComposition>,
+    /// 直近 render のフォーカスペイン（IM 座標キャッシュ更新の変化検知用。#332）
+    last_ime_focus: Option<PaneId>,
     /// ドラッグ中のペイン境界（None = ドラッグしていない）
     dragging_border: Option<DragBorder>,
     /// スクロールバーをドラッグ中のペイン
@@ -766,6 +797,8 @@ struct TakoApp {
     /// タブ D&D 並べ替え中の挿入位置インジケータ（#308）。
     /// Some(tab_id) = そのタブの**左**にインジケータを表示、None = 末尾
     tab_reorder_indicator: Option<Option<TabId>>,
+    /// タブ D&D 並べ替え中のドラッグ元タブ（#371: ソースタブの半透明化に使用）
+    dragging_tab: Option<TabId>,
     /// git パネルのデータ（FR-3.6。cwd 連動で 2 秒ポーリング更新）
     git_data: Option<GitPanelData>,
     /// サイドバー用の軽量 git サマリ（#217。ブランチチップ + 変更フッター）
@@ -785,9 +818,7 @@ struct TakoApp {
     hover_preview: Option<HoverPreview>,
     /// 子ワーカードロップダウンを開いている master ペイン（#217。「N workers ▾」）
     workers_menu_open: Option<PaneId>,
-    /// Attention トースト（#217。失敗の即時通知。右下に積む）
-    toasts: Vec<AttentionToast>,
-    /// トースト検知用: 前回スナップショットで Failed だったペイン（#217）
+    /// 失敗検知用: 前回スナップショットで Failed だったペイン
     known_failed: std::collections::HashSet<PaneId>,
     /// ⌘K コマンドパレット（#217。None = 閉じている）
     command_palette: Option<CommandPalette>,
@@ -801,10 +832,14 @@ struct TakoApp {
     video_ticker: bool,
     /// 全ペインから集約した Claude エージェントメトリクス（ctx/usage。ポーリングで更新）
     agent_metrics: AgentMetrics,
+    /// codex ペインから集約したメトリクス（#357: サービス別制限データ）
+    codex_metrics: AgentMetrics,
     /// ステータスバーの利用制限表示で選択中のサービス（Issue #321。settings.json 永続化）
     limit_service: tako_core::LimitService,
     /// ステータスバーの利用制限サービス切替ドロップダウンが開いているか（Issue #321）
     limit_service_menu_open: bool,
+    /// ドロップダウンメニューのアンカー位置（ステータスバーの overflow_hidden 外へ描画するため）
+    limit_service_menu_anchor: Option<gpui::Point<gpui::Pixels>>,
     /// usage トークン推移の履歴（#217 スパークライン。最大 5 点、変化時のみ追記）
     usage_history: std::collections::VecDeque<f32>,
     /// 端末イベントの再描画デバウンス: 最後に notify した時刻
@@ -872,6 +907,10 @@ struct TakoApp {
     webview_dock_url_cursor: usize,
     /// URL 入力欄がフォーカスされているか（dock は開いていてもターミナルへ入力できる）
     webview_dock_url_focused: bool,
+    /// Web ビューペインのアドレスバー編集状態（#337。pane_id → (入力文字列, カーソル位置)）
+    webview_address_bar: HashMap<u64, (String, usize)>,
+    /// アドレスバー編集中の pane_id（同時に 1 つのみ）
+    webview_address_bar_active: Option<PaneId>,
     /// wry の親にする GPUI ウィンドウの生ハンドル（初回 render で採取）
     window_raw_handle: Option<webview::WindowHandleBox>,
     /// 起動復元で開き直す Web ビュー（ペイン対応, URL）。ウィンドウハンドルが
@@ -915,6 +954,20 @@ struct TakoApp {
     remote: remote_panel::RemoteUiState,
     /// タイトルバー（タブバー領域）のドラッグでウインドウ移動中か（#312）
     titlebar_dragging: bool,
+    /// タブ要素上で mouse down されたか（#308: タブ D&D とウインドウドラッグの競合防止）
+    tab_mouse_down: bool,
+    /// GPUI ウィンドウ ⇔ 論理ウィンドウの対応（Issue #339 ビューポート方式）。
+    /// 同一 TakoApp entity を全ウィンドウの root view として共有し、render 冒頭で
+    /// 呼び出し元 window からこの対応表で表示タブを解決する
+    viewports: Vec<(tako_core::WindowId, gpui::AnyWindowHandle)>,
+    /// ウィンドウごとの購読（focus 自己修復 #332 + activation 追随 #339）。
+    /// ウィンドウ close で drop して購読解除する
+    viewport_subs: HashMap<gpui::WindowId, Vec<Subscription>>,
+    /// ウィンドウごとの OS フレーム（render で採取し layout 保存に含める。Issue #339）
+    window_frames: HashMap<tako_core::WindowId, tako_control::layout::WindowFrame>,
+    /// 論理ウィンドウ作成済みで GPUI ウィンドウが未生成のもの（dispatch 経由の
+    /// window new 等。GPUI の Context が要るため render / defer で消費する）
+    pending_viewport_opens: Vec<tako_core::WindowId>,
 }
 
 /// × ボタン close の確認ダイアログ対象（Issue #172）
@@ -950,8 +1003,10 @@ fn process_pane_log_jobs(
     jobs: Vec<PaneLogJob>,
 ) {
     use tako_core::pane_log::{ChunkKind, PaneObservation, CAPTURE_CHUNK};
+    // #369: ペイン毎の display-message N 回を list-panes -a 1 回に削減
+    let probes = tako_core::tmux::pane_log_probe_batch(Some(socket));
     for job in jobs {
-        let Some(probe) = tako_core::tmux::pane_log_probe(Some(socket), &job.session) else {
+        let Some(probe) = probes.get(&job.session).copied() else {
             continue;
         };
         let chunk = if probe.history < job.last_history {
@@ -1505,6 +1560,15 @@ impl Render for DragGhost {
     }
 }
 
+/// プロセス内でプライマリウインドウが 1 つだけ存在することを保証するフラグ（Issue #113）。
+/// 赤ボタン close でウインドウが閉じてもプロセスが生存するため、Dock 復帰時に
+/// 再びプライマリとして復元できるよう `release_primary` で解放する（#312）
+static PRIMARY_CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn release_primary() {
+    PRIMARY_CLAIMED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
 impl TakoApp {
     fn new(cx: &mut Context<Self>) -> Self {
         // 多重インスタンスガード（Issue #113）: 別の生きたインスタンスがプライマリである間は
@@ -1516,8 +1580,6 @@ impl TakoApp {
         // - プロセス内: NewWindow で 2 つ目以降の TakoApp（最初の 1 つだけがプライマリ）
         // - プロセス間: control.json の主がまだ生きた tako-app（SIGKILL 残骸は pid 死亡で除外）
         // TAKO_FORCE_PRIMARY=1 は検証・緊急脱出用の明示オーバーライド（多重復元の保護も切れる）
-        static PRIMARY_CLAIMED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
         let in_process_secondary = PRIMARY_CLAIMED.swap(true, std::sync::atomic::Ordering::SeqCst);
         let secondary_reason: Option<String> = if std::env::var_os("TAKO_SELF_TEST").is_some()
             || std::env::var_os("TAKO_FORCE_PRIMARY").is_some()
@@ -1608,6 +1670,8 @@ impl TakoApp {
             std::collections::HashSet::new();
         // Web ビュー dock の退避分（#155。表示分は RestoredPane.webview で運ばれる）
         let mut webview_dock_restore: Vec<String> = Vec::new();
+        // 複数ウィンドウの保存フレーム（Issue #339。復元ウィンドウの初期 bounds に使う）
+        let mut window_frames_restore: Vec<(u64, tako_control::layout::WindowFrame)> = Vec::new();
         let (workspace, restore_report) = if let Some(reason) = &secondary_reason {
             let msg = format!(
                 "復元スキップ: {reason}のためセカンダリモードで起動\
@@ -1625,6 +1689,11 @@ impl TakoApp {
                     .map(|id| TabId::from_raw(*id))
                     .collect();
                 webview_dock_restore = file.webview_dock.clone();
+                window_frames_restore = file
+                    .windows
+                    .iter()
+                    .filter_map(|w| w.frame.clone().map(|f| (w.id, f)))
+                    .collect();
                 tako_control::layout::restore(&file)
             });
             match loaded {
@@ -1645,22 +1714,24 @@ impl TakoApp {
                 }
                 Err(e) => {
                     let msg = if e == tako_control::layout::LayoutError::NotFound {
-                        // 初回起動・明示クローズ後の正常系。理由だけ記録する
                         format!("復元なし: {e}")
                     } else {
-                        // 破損・不整合ファイルは .corrupt へ退避して原因調査に残す
-                        // （放置すると次の定期保存で黙って上書きされるため）
                         let stashed = tako_control::layout::layout_path()
                             .map(|p| std::fs::rename(&p, p.with_extension("json.corrupt")).is_ok())
                             .unwrap_or(false);
-                        format!(
+                        let msg = format!(
                             "復元失敗: {e}{}",
                             if stashed {
                                 "（layout.json.corrupt へ退避）"
                             } else {
                                 ""
                             }
-                        )
+                        );
+                        tako_control::telemetry::report_critical(
+                            tako_control::telemetry::ErrorKind::RestoreFailed,
+                            &msg,
+                        );
+                        msg
                     };
                     persist_diag(&msg);
                     (Workspace::new("1", Pane::new(PaneOrigin::User)), msg)
@@ -1709,6 +1780,7 @@ impl TakoApp {
             pending_pdf_rasters: HashMap::new(),
             active_pdf_rasters: std::collections::HashSet::new(),
             ime: None,
+            last_ime_focus: None,
             dragging_border: None,
             dragging_scrollbar: None,
             hovered_scrollbar: None,
@@ -1765,6 +1837,7 @@ impl TakoApp {
             drop_target: None,
             tab_drop_target: None,
             tab_reorder_indicator: None,
+            dragging_tab: None,
             git_data: None,
             sidebar_git: None,
             git_selected_commit: None,
@@ -1774,14 +1847,15 @@ impl TakoApp {
             bg_pending_kill: None,
             hover_preview: None,
             workers_menu_open: None,
-            toasts: Vec::new(),
             known_failed: std::collections::HashSet::new(),
             command_palette: None,
             pinned_previews: Vec::new(),
             dragging_pin: None,
             agent_metrics: AgentMetrics::default(),
+            codex_metrics: AgentMetrics::default(),
             limit_service: tako_control::settings::load().limit_service(),
             limit_service_menu_open: false,
+            limit_service_menu_anchor: None,
             usage_history: std::collections::VecDeque::new(),
             last_term_notify: std::time::Instant::now(),
             term_notify_pending: false,
@@ -1814,6 +1888,8 @@ impl TakoApp {
             webview_dock_url_input: String::new(),
             webview_dock_url_cursor: 0,
             webview_dock_url_focused: false,
+            webview_address_bar: HashMap::new(),
+            webview_address_bar_active: None,
             window_raw_handle: None,
             pending_webview_restore: Vec::new(),
             update_state: update_checker::UpdateState::Idle,
@@ -1840,12 +1916,34 @@ impl TakoApp {
             last_active_tab: None,
             remote: remote_panel::RemoteUiState::default(),
             titlebar_dragging: false,
+            tab_mouse_down: false,
+            viewports: Vec::new(),
+            viewport_subs: HashMap::new(),
+            // 復元した保存フレーム（Issue #339。追加ウィンドウを開くときの初期 bounds）
+            window_frames: window_frames_restore
+                .iter()
+                .map(|(id, f)| (tako_core::WindowId::from_raw(*id), f.clone()))
+                .collect(),
+            pending_viewport_opens: Vec::new(),
         };
+        // 複数ウィンドウの復元（Issue #339）: アクティブ以外の論理ウィンドウは
+        // 初回 render / dispatch の sync_viewports が保存フレームで開き直す
+        // （アクティブウィンドウは open_primary_window が担う）
+        let active_window = app.workspace.active_window_id();
+        app.pending_viewport_opens = app
+            .workspace
+            .windows()
+            .iter()
+            .map(|w| w.id())
+            .filter(|w| *w != active_window)
+            .collect();
         // App Nap 無効化 + 初回スリープ防止更新（Issue #173）
         // 蓋閉じ防止の残留チェック（#218: 前回クラッシュ時の disablesleep=1 を自動復帰）
         tako_control::sleep_guard::disable_app_nap();
         tako_control::sleep_guard::check_disablesleep_residual();
-        app.update_sleep_guard();
+        // 起動直後は Unknown バックエンドの子プロセス判定（tmux + ps）を待たず 0 で仮適用し、
+        // 初回の 2 秒 tick が background 判定で正確な値に補正する（#340）
+        app.apply_sleep_guard(&tako_control::settings::load(), 0);
 
         // 終了処理（layout 保存 + 接続情報の後片付け）はアプリ終了フックで一元化する
         // （#103）。Cmd-Q（グローバル Quit アクション）・メニュー・Dock 右クリック終了・
@@ -2118,7 +2216,13 @@ impl TakoApp {
                         incoming.request,
                         tako_control::protocol::Request::Scroll { .. }
                     );
+                    let prev_window = app.workspace.active_window_id();
                     let mut result = tako_control::dispatch(app, incoming.request, incoming.origin);
+                    // CLI / MCP のタブ選択・ウィンドウ操作がアクティブウィンドウを
+                    // またいだら OS ウィンドウも前面化する（Issue #339）
+                    if app.workspace.active_window_id() != prev_window {
+                        app.focus_active_viewport(cx);
+                    }
                     // CLI / MCP のスクロールでも UI のスクロールバー・カーソル抑止が
                     // 同じ状態を共有する（開発不変条件: UI と AI 操作の等価性）
                     if was_scroll {
@@ -2150,6 +2254,10 @@ impl TakoApp {
                     }
                     // 重量プレビュー（PDF / 動画）の background 読み込み（Issue #168）
                     app.drain_pending_preview_loads(cx);
+                    // ウィンドウ操作（Issue #339）の GPUI ウィンドウ生成・close を即座に
+                    // 反映する。render 冒頭の同期はウィンドウが隠れているとフレームが
+                    // 来ず走らないため、CLI / MCP 経路はここで消費する
+                    app.sync_viewports(cx);
                     // AI / CLI 操作によるレイアウト変化を即座に永続化する（Phase 5.5）
                     app.save_layout();
                     cx.notify();
@@ -2169,54 +2277,94 @@ impl TakoApp {
         // PC 再起動では tmux プロセスも消えるため、実行中 Claude Code の session ID を
         // ペインごとに保存して `claude --resume` へ使う。外部コマンドは background で実行し、
         // 検出失敗時は直前の成功値を壊さない。既存 persist トグルが CLI / MCP 共通の制御点。
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor()
-                .timer(CLAUDE_SESSION_SCAN_INTERVAL)
-                .await;
-            let should_scan = this
-                .update(cx, |app: &mut TakoApp, _| {
-                    app.tmux_persist
-                        && !app.secondary
-                        && !app.backend_sessions.is_empty()
-                        // self-test は外部 Claude CLI を呼ばず決定的に完走させる
-                        && std::env::var_os("TAKO_SELF_TEST").is_none()
-                })
-                .unwrap_or(false);
-            if !should_scan {
-                continue;
-            }
-            // 1 回の `claude agents --json` 取得から resume マップ（従来）と
-            // セッションカタログの検出（Issue #112 A）の両方を導出する
-            let agents_value = cx
-                .background_executor()
-                .spawn(async { tako_control::agents::list_agents_with_panes(None) })
-                .await;
-            let Ok(agents_value) = agents_value else {
-                continue;
-            };
-            let detected = tako_control::sessions::detect_from_agents_value(&agents_value);
-            let resume_map: HashMap<String, String> = detected
-                .iter()
-                .map(|d| (d.tmux_session.clone(), d.session_id.clone()))
-                .collect();
-            let pane_meta = this.update(cx, |app: &mut TakoApp, _| {
-                app.apply_claude_resume_sessions(&resume_map);
-                app.save_layout();
-                app.collect_pane_meta_snapshots()
-            });
-            let Ok(pane_meta) = pane_meta else {
-                break;
-            };
-            // カタログの書き込み（ファイルロック + アトミック書き込み）は background で
-            if !detected.is_empty() {
+        //
+        // #368: Node 起動コスト削減。3 層で無駄を排除する:
+        //   1) 間隔延長（5s→30s）+ イベント駆動即時スキャン（spawn / PromptFlow 完了）
+        //   2) 前段ガード: バックエンドに実行中子プロセスがなければ Node 起動を丸ごとスキップ
+        //   3) TTL 延長（2s→5s）: watch / worker_status の重複 Node 起動を抑制
+        cx.spawn(async move |this, cx| {
+            let mut last_scan = std::time::Instant::now() - CLAUDE_SESSION_SCAN_INTERVAL;
+            loop {
                 cx.background_executor()
+                    .timer(CLAUDE_SESSION_CHECK_INTERVAL)
+                    .await;
+                let event_triggered = tako_control::take_claude_scan_request();
+                let timer_triggered = last_scan.elapsed() >= CLAUDE_SESSION_SCAN_INTERVAL;
+                if !event_triggered && !timer_triggered {
+                    continue;
+                }
+                let (should_scan, backends) = this
+                    .update(cx, |app: &mut TakoApp, _| {
+                        let should = app.tmux_persist
+                            && !app.secondary
+                            && !app.backend_sessions.is_empty()
+                            && std::env::var_os("TAKO_SELF_TEST").is_none();
+                        let bs: Vec<String> = if should {
+                            app.backend_sessions.values().cloned().collect()
+                        } else {
+                            Vec::new()
+                        };
+                        (should, bs)
+                    })
+                    .unwrap_or((false, Vec::new()));
+                if !should_scan {
+                    last_scan = std::time::Instant::now();
+                    continue;
+                }
+                // 前段ガード: バックエンドセッションに実行中の子プロセスがなければ
+                // claude も居ないので Node 起動をスキップする（~10ms で判定、Node 起動 200ms を回避）
+                let has_children = cx
+                    .background_executor()
                     .spawn(async move {
-                        if let Err(e) = tako_control::sessions::sync_detected(&detected, &pane_meta)
-                        {
-                            eprintln!("warning: セッションカタログの同期に失敗: {e}");
-                        }
+                        let refs: Vec<&str> = backends.iter().map(|s| s.as_str()).collect();
+                        tako_control::agents::count_sessions_with_running_children(&refs) > 0
                     })
                     .await;
+                if !has_children {
+                    last_scan = std::time::Instant::now();
+                    let _ = this.update(cx, |app: &mut TakoApp, _| {
+                        if !app.claude_resume_sessions.is_empty() {
+                            app.claude_resume_sessions.clear();
+                            app.save_layout();
+                        }
+                    });
+                    continue;
+                }
+                // 1 回の `claude agents --json` 取得から resume マップ（従来）と
+                // セッションカタログの検出（Issue #112 A）の両方を導出する
+                let agents_value = cx
+                    .background_executor()
+                    .spawn(async { tako_control::agents::list_agents_with_panes(None) })
+                    .await;
+                last_scan = std::time::Instant::now();
+                let Ok(agents_value) = agents_value else {
+                    continue;
+                };
+                let detected = tako_control::sessions::detect_from_agents_value(&agents_value);
+                let resume_map: HashMap<String, String> = detected
+                    .iter()
+                    .map(|d| (d.tmux_session.clone(), d.session_id.clone()))
+                    .collect();
+                let pane_meta = this.update(cx, |app: &mut TakoApp, _| {
+                    app.apply_claude_resume_sessions(&resume_map);
+                    app.save_layout();
+                    app.collect_pane_meta_snapshots()
+                });
+                let Ok(pane_meta) = pane_meta else {
+                    break;
+                };
+                // カタログの書き込み（ファイルロック + アトミック書き込み）は background で
+                if !detected.is_empty() {
+                    cx.background_executor()
+                        .spawn(async move {
+                            if let Err(e) =
+                                tako_control::sessions::sync_detected(&detected, &pane_meta)
+                            {
+                                eprintln!("warning: セッションカタログの同期に失敗: {e}");
+                            }
+                        })
+                        .await;
+                }
             }
         })
         .detach();
@@ -2280,7 +2428,7 @@ impl TakoApp {
                 }
                 // ① main thread: tmux コンテキスト + filetree 対象 + view 監視対象 + git を収集（高速）
                 let t0 = std::time::Instant::now();
-                let prep = this.update(cx, |app: &mut TakoApp, _| {
+                let prep = this.update(cx, |app: &mut TakoApp, wcx| {
                     // Issue #168: 定期更新の UI スレッド部（収集 + save_layout）を計測
                     let _span = tako_control::diag::perf_span("periodic_prep");
                     // ステップ別サブスパン（#212: periodic_prep の秒級スパイクをステップ単位で
@@ -2304,13 +2452,13 @@ impl TakoApp {
                     {
                         let _s = tako_control::diag::perf_span("periodic_prep:webview");
                         app.poll_webview_state();
+                        app.process_pending_new_windows(wcx);
                     }
-                    {
+                    let sleep_guard_backends = {
                         let _s = tako_control::diag::perf_span("periodic_prep:sleep_guard");
-                        app.update_sleep_guard();
-                    }
-                    // 失敗遷移の検知 → Attention トースト（#217）
-                    app.update_attention_toasts();
+                        app.sleep_guard_backends()
+                    };
+                    app.detect_new_failures();
                     // ペインログ: 直接ペインはここで取り込み、バックエンドはジョブ化（Issue #112 B）
                     let log_jobs = {
                         let _s = tako_control::diag::perf_span("periodic_prep:pane_log");
@@ -2349,6 +2497,7 @@ impl TakoApp {
                         sidebar_git_cwd,
                         log_jobs,
                         app.pane_logs.clone(),
+                        sleep_guard_backends,
                     )
                 });
                 // UI スレッド専有時間の計測（Issue #113 診断。しきい値超えのみ記録）
@@ -2367,10 +2516,35 @@ impl TakoApp {
                     sidebar_git_cwd,
                     log_jobs,
                     pane_logs,
+                    sleep_guard_backends,
                 )) = prep
                 else {
                     break;
                 };
+                // ② background: sleep guard の settings 読み + 全バックエンドの子プロセス判定。
+                // #372: 旧実装は Unknown ペインのみ対象で、Idle のまま子プロセスが走る
+                // ペイン（TUI エージェント）を見落としていた。全バックエンドを対象にする
+                {
+                    let (settings, busy_agents) = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let busy = if sleep_guard_backends.is_empty() {
+                                0
+                            } else {
+                                let refs: Vec<&str> =
+                                    sleep_guard_backends.iter().map(|s| s.as_str()).collect();
+                                tako_control::agents::count_sessions_with_running_children(&refs)
+                            };
+                            (tako_control::settings::load(), busy)
+                        })
+                        .await;
+                    let ok = this.update(cx, |app: &mut TakoApp, _| {
+                        app.apply_sleep_guard(&settings, busy_agents);
+                    });
+                    if ok.is_err() {
+                        break;
+                    }
+                }
                 // ② background: バックエンドペインのペインログ取り込み（probe + capture。
                 // await して tick 内の順序を保つ = 同一ペインの増分が並行取り込みで重複しない）
                 if !log_jobs.is_empty() {
@@ -3399,6 +3573,7 @@ impl TakoApp {
         // 先行フローが完了するまで後続は待たせる（Vec の順序 = 送信順）
         let mut active_panes: std::collections::HashSet<PaneId> = std::collections::HashSet::new();
         let now = std::time::Instant::now();
+        let prev_len = self.prompt_flows.len();
         for mut flow in std::mem::take(&mut self.prompt_flows) {
             if flow.created_at.elapsed() > std::time::Duration::from_secs(120) {
                 eprintln!(
@@ -3527,6 +3702,10 @@ impl TakoApp {
                 active_panes.insert(flow.pane);
                 remaining.push(flow);
             }
+        }
+        // #368: PromptFlow 完了 → 新 claude セッションが生まれるので即時スキャン
+        if remaining.len() < prev_len {
+            tako_control::request_claude_scan();
         }
         self.prompt_flows = remaining;
     }
@@ -4261,6 +4440,7 @@ impl TakoApp {
                 self.terminals.remove(&pane_id);
                 self.previews.remove(&pane_id);
                 self.preview_edits.remove(&pane_id);
+                self.discard_ime_for_pane(pane_id);
                 self.video_players.remove(&pane_id);
                 self.remove_video_frame_cache(pane_id);
                 self.remove_preview_image_cache(pane_id);
@@ -4320,6 +4500,7 @@ impl TakoApp {
                     self.terminals.remove(&id);
                     self.previews.remove(&id);
                     self.preview_edits.remove(&id);
+                    self.discard_ime_for_pane(id);
                     self.video_players.remove(&id);
                     self.remove_video_frame_cache(id);
                     self.remove_preview_image_cache(id);
@@ -4571,8 +4752,20 @@ impl TakoApp {
                     .find(|e| e.pane == Some(pane))
                     .map(|e| e.current_url()),
             },
-            self.window_frame.clone(),
+            // 旧スキーマ互換の単一フレームはアクティブウィンドウのもの（Issue #339。
+            // 起動時のプライマリウィンドウ復元 = open_primary_window が読む値）
+            self.window_frames
+                .get(&self.workspace.active_window_id())
+                .cloned()
+                .or_else(|| self.window_frame.clone()),
         );
+        // 複数ウィンドウの OS フレーム（Issue #339）。render で採取済みの分を埋める
+        for w in &mut layout.windows {
+            w.frame = self
+                .window_frames
+                .get(&tako_core::WindowId::from_raw(w.id))
+                .cloned();
+        }
         // 折りたたみ状態（FR-2.16.14）を埋める。現存タブのみ（閉じたタブの残骸は除く）
         layout.collapsed = self
             .collapsed_tmux_tabs
@@ -5163,8 +5356,8 @@ impl TakoApp {
         }
     }
 
-    /// 失敗遷移を検知して Attention トーストを積む（#217 カンプ。periodic から呼ぶ）
-    fn update_attention_toasts(&mut self) {
+    /// 失敗遷移を検知してログに記録する（periodic から呼ぶ）
+    fn detect_new_failures(&mut self) {
         let current: std::collections::HashSet<PaneId> = self
             .terminals
             .iter()
@@ -5180,34 +5373,7 @@ impl TakoApp {
                     _ => None,
                 })
                 .unwrap_or(1);
-            // ペイン名とタブ情報
-            let mut name = "ターミナル".to_string();
-            let mut tab_title = String::new();
-            let mut pane_index = 0;
-            for tab in self.workspace.tabs() {
-                let panes = tab.tree().panes();
-                if let Some(pos) = panes.iter().position(|p| p.id() == *pane_id) {
-                    let p = &panes[pos];
-                    name = p
-                        .title()
-                        .or_else(|| p.role())
-                        .map(str::to_string)
-                        .unwrap_or(name);
-                    tab_title = tab.title().to_string();
-                    pane_index = pos + 1;
-                    break;
-                }
-            }
-            self.toasts.push(AttentionToast {
-                pane: *pane_id,
-                title: format!("{} が失敗", truncate(&name, 24)),
-                detail: format!("{tab_title} \u{203A} pane {pane_index} \u{00B7} exit {exit_code}"),
-                at: std::time::Instant::now(),
-            });
-            // 溜まりすぎ防止（最新 3 件のみ表示対象）
-            if self.toasts.len() > 3 {
-                self.toasts.remove(0);
-            }
+            eprintln!("pane {} failed (exit {})", pane_id.as_u64(), exit_code);
         }
         self.known_failed = current;
     }
@@ -5335,12 +5501,197 @@ impl TakoApp {
     }
 
     fn activate_tab_index(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Some(id) = self.workspace.tabs().get(index).map(|t| t.id()) {
+        // cmd+数字はアクティブウィンドウ内の並びで解釈する（Issue #339）
+        let win_tabs = self
+            .workspace
+            .window_tab_ids(self.workspace.active_window_id());
+        if let Some(id) = win_tabs.get(index).copied() {
             let _ = self.workspace.activate_tab(id);
         }
         self.scroll_active_tab_into_view();
         self.sync_filetree_roots();
         cx.notify();
+    }
+
+    // === 複数ウィンドウ（Issue #339・ビューポート方式） ===
+
+    /// GPUI ウィンドウを論理ウィンドウに対応付け、ウィンドウ単位の購読
+    /// （focus 自己修復 #332 / OS フォーカス追随）を張る。open_window 直後に呼ぶ
+    fn register_viewport(
+        &mut self,
+        logical: tako_core::WindowId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let handle = window.window_handle();
+        self.viewports
+            .retain(|(l, h)| *l != logical && *h != handle);
+        self.viewports.push((logical, handle));
+        // 初期 focus + blur からの自動復元（#332）: focus が無いと Window::handle_input
+        // が input handler を登録せず、日本語 IM の printable キーが IME を素通りして
+        // ASCII 直書きになる。on_focus_lost は「ウィンドウ内のどこにも focus が無く
+        // なった」draw 末尾に発火するため、view render が reuse でスキップされる
+        // フレームでも確実に呼ばれる
+        window.focus(&self.focus_handle.clone(), cx);
+        let focus_sub = cx.on_focus_lost(window, |app, window, cx| {
+            window.focus(&app.focus_handle.clone(), cx);
+            window.invalidate_character_coordinates();
+            cx.notify();
+        });
+        // OS のウィンドウフォーカス変化に workspace のアクティブウィンドウを追随させる
+        let activation_sub = cx.observe_window_activation(window, |app, window, cx| {
+            if window.is_window_active() {
+                app.on_viewport_activated(window, cx);
+            }
+        });
+        self.viewport_subs
+            .insert(handle.window_id(), vec![focus_sub, activation_sub]);
+    }
+
+    /// 呼び出し元 GPUI ウィンドウの論理ウィンドウを解決する
+    fn viewport_of(&self, window: &Window) -> Option<tako_core::WindowId> {
+        let handle = window.window_handle();
+        self.viewports
+            .iter()
+            .find(|(_, h)| *h == handle)
+            .map(|(l, _)| *l)
+    }
+
+    /// このウィンドウが表示すべきタブ（Issue #339）。未登録ウィンドウ（保険経路）は
+    /// グローバルのアクティブタブへフォールバックする
+    fn display_tab_for(&self, window: &Window) -> TabId {
+        self.viewport_of(window)
+            .and_then(|l| self.workspace.get_window(l))
+            .map(|w| w.active_tab())
+            .unwrap_or_else(|| self.workspace.active_tab_id())
+    }
+
+    /// OS ウィンドウがフォーカスされた → workspace のアクティブウィンドウを追随させる
+    fn on_viewport_activated(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(lid) = self.viewport_of(window) else {
+            return;
+        };
+        if self.workspace.active_window_id() != lid && self.workspace.get_window(lid).is_some() {
+            let _ = self.workspace.activate_window(lid);
+            self.sync_filetree_roots();
+            self.scroll_active_tab_into_view();
+            cx.notify();
+        }
+    }
+
+    /// 赤ボタン close（on_window_should_close）。複数ウィンドウならビューポートだけ
+    /// 閉じてタブを残存ウィンドウへ合流させる（タブ・プロセスは殺さない）。
+    /// 最後の 1 枚は #312 の従来挙動（layout 保存 + primary 解放 → プロセス生存 →
+    /// Dock 復帰で復元）
+    fn handle_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let handle = window.window_handle();
+        let logical = self.viewport_of(window);
+        if self.workspace.windows().len() > 1 {
+            if let Some(lid) = logical {
+                match self.workspace.close_window(lid) {
+                    Ok(moved) => persist_diag(&format!(
+                        "ウィンドウ close: タブ {} 枚を残存ウィンドウへ合流",
+                        moved.len()
+                    )),
+                    Err(e) => eprintln!("warning: ウィンドウを閉じられない: {e}"),
+                }
+                self.drop_viewport(lid, handle);
+                self.save_layout();
+                cx.notify();
+            }
+            return true;
+        }
+        persist_diag("赤ボタン close: layout 保存 + primary 解放");
+        self.save_layout();
+        release_primary();
+        if let Some(lid) = logical {
+            self.drop_viewport(lid, handle);
+        }
+        true
+    }
+
+    /// ビューポート対応表と購読・フレームを掃除する（close 経路共通）
+    fn drop_viewport(&mut self, logical: tako_core::WindowId, handle: AnyWindowHandle) {
+        self.viewports
+            .retain(|(l, h)| *l != logical && *h != handle);
+        self.viewport_subs.remove(&handle.window_id());
+        self.window_frames.remove(&logical);
+    }
+
+    /// New Window（Issue #339）: 新規タブ 1 つ付きの論理ウィンドウを作り、
+    /// 同一 TakoApp entity を root にした GPUI ウィンドウを開く
+    fn new_viewport_window(&mut self, cx: &mut Context<Self>) {
+        let title = (self.workspace.tabs().len() + 1).to_string();
+        let pane = Pane::new(PaneOrigin::User);
+        let pane_id = pane.id();
+        let (wid, _tab) = self.workspace.create_window(title, pane);
+        if let Err(e) = self.spawn_session(pane_id, SpawnOptions::default(), cx) {
+            eprintln!("warning: 新しいウィンドウを開けない: {e}");
+            self.remove_pane(pane_id, cx); // タブごと畳まれ空ウィンドウも除去される
+            return;
+        }
+        self.open_viewport(wid, cx);
+        self.sync_filetree_roots();
+        cx.notify();
+    }
+
+    /// 論理ウィンドウに対応する GPUI ウィンドウを開く（entity 借用の外で defer 実行）。
+    /// 保存フレーム（persist 復元）があれば初期 bounds に使う。壊れた保存値は
+    /// 既定サイズへフォールバック（open_restored_window と同じ検証）
+    fn open_viewport(&mut self, logical: tako_core::WindowId, cx: &mut Context<Self>) {
+        let entity = cx.entity();
+        let bounds = self
+            .window_frames
+            .get(&logical)
+            .filter(|f| f.width >= 200.0 && f.height >= 150.0)
+            .map(|f| {
+                let b = Bounds::new(point(px(f.x), px(f.y)), size(px(f.width), px(f.height)));
+                match f.state.as_str() {
+                    "fullscreen" => WindowBounds::Fullscreen(b),
+                    "maximized" => WindowBounds::Maximized(b),
+                    _ => WindowBounds::Windowed(b),
+                }
+            });
+        cx.defer(move |cx| open_viewport_window(entity, logical, bounds, cx));
+    }
+
+    /// 論理ウィンドウと GPUI ウィンドウの突き合わせ（Issue #339）。render 冒頭から
+    /// 毎フレーム呼ばれる冪等な同期で、どの経路（close_tab / タブ移動 / dispatch）で
+    /// 論理ウィンドウが消えても GPUI ウィンドウを閉じ漏らさない。
+    /// dispatch 経由で作られた GPUI 未生成の論理ウィンドウはここで開く
+    fn sync_viewports(&mut self, cx: &mut Context<Self>) {
+        let live: std::collections::HashSet<tako_core::WindowId> =
+            self.workspace.windows().iter().map(|w| w.id()).collect();
+        let dead: Vec<(tako_core::WindowId, AnyWindowHandle)> = self
+            .viewports
+            .iter()
+            .filter(|(l, _)| !live.contains(l))
+            .copied()
+            .collect();
+        for (lid, handle) in dead {
+            self.drop_viewport(lid, handle);
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, _| window.remove_window());
+            });
+        }
+        for lid in std::mem::take(&mut self.pending_viewport_opens) {
+            if live.contains(&lid) && !self.viewports.iter().any(|(l, _)| *l == lid) {
+                self.open_viewport(lid, cx);
+            }
+        }
+    }
+
+    /// アクティブ論理ウィンドウの GPUI ウィンドウを前面化する（タブ切替がウィンドウを
+    /// またいだとき用。CLI / MCP / パレット経由のタブ選択から呼ぶ）
+    fn focus_active_viewport(&mut self, cx: &mut Context<Self>) {
+        let lid = self.workspace.active_window_id();
+        let Some(entry) = self.viewports.iter().find(|(l, _)| *l == lid).copied() else {
+            return;
+        };
+        let (_, handle) = entry;
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, _| window.activate_window());
+        });
     }
 
     fn select_all_preview(&mut self, cx: &mut Context<Self>) {
@@ -6160,6 +6511,12 @@ impl TakoApp {
             return;
         }
 
+        if self.webview_address_bar_active.is_some()
+            && self.handle_webview_address_bar_key(keystroke, cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
         if self.webview_dock_url_focused && self.handle_webview_dock_url_key(keystroke, cx) {
             cx.stop_propagation();
             return;
@@ -6244,10 +6601,25 @@ impl TakoApp {
 
     /// IME 操作の対象ペイン。変換中はその開始ペイン、それ以外はフォーカスペイン
     fn ime_target(&self) -> PaneId {
-        self.ime
-            .as_ref()
-            .map(|ime| ime.pane)
-            .unwrap_or_else(|| self.focused_pane())
+        resolve_ime_pane(
+            self.ime.as_ref().map(|ime| ime.pane),
+            |pane| self.ime_pane_alive(pane),
+            self.focused_pane(),
+        )
+    }
+
+    /// ime.pane がまだ入力先として実在するか（terminal / プレビュー編集のどちらか）（#332）
+    fn ime_pane_alive(&self, pane: PaneId) -> bool {
+        self.terminals.contains_key(&pane) || self.preview_edits.contains_key(&pane)
+    }
+
+    /// ペインが閉じられたとき、そのペインを対象にした IME 変換状態を畳む（#332）。
+    /// 残すと ime_target / 確定書き込みが死んだペインへ向き続け、候補ウィンドウの
+    /// 位置出しと確定文字列の宛先が壊れる
+    fn discard_ime_for_pane(&mut self, pane_id: PaneId) {
+        if self.ime.as_ref().is_some_and(|ime| ime.pane == pane_id) {
+            self.ime = None;
+        }
     }
 
     /// 指定ペインのカーソルセル左上（ウィンドウ座標）。
@@ -6373,10 +6745,12 @@ impl TakoApp {
     }
 
     /// kill 確認のインラインブロック（FR-2.16.7）。メッセージ行（折り返し）+ ボタン行の
-    /// 全ペインから Claude TUI のメトリクス（ctx%/usage）を収集・更新する
+    /// 全ペインから Claude / Codex TUI のメトリクス（ctx%/usage）を収集・更新する（#357 拡張）
     fn refresh_agent_metrics(&mut self) {
-        let mut best: Option<AgentMetrics> = None;
-        // フォーカスペインを優先し、なければ他の alt_screen ペインから取得
+        use tako_core::MetricsSource;
+        let mut best_claude: Option<AgentMetrics> = None;
+        let mut best_codex: Option<AgentMetrics> = None;
+        // フォーカスペインを優先し、なければ他のペインから取得
         let focused = self.workspace.active_tab().tree().focused();
         let pane_ids: Vec<PaneId> = std::iter::once(focused)
             .chain(
@@ -6390,18 +6764,31 @@ impl TakoApp {
         for pid in pane_ids {
             if let Some(session) = self.terminals.get(&pid) {
                 if let Some(m) = session.agent_metrics() {
-                    if m.ctx_percent.is_some() || m.usage_text.is_some() || m.limit_5h.is_some() {
-                        best = Some(m);
+                    let has_data =
+                        m.ctx_percent.is_some() || m.usage_text.is_some() || m.limit_5h.is_some();
+                    if !has_data {
+                        continue;
+                    }
+                    match m.source {
+                        MetricsSource::Codex => {
+                            if best_codex.is_none() {
+                                best_codex = Some(m);
+                            }
+                        }
+                        _ => {
+                            if best_claude.is_none() {
+                                best_claude = Some(m);
+                            }
+                        }
+                    }
+                    if best_claude.is_some() && best_codex.is_some() {
                         break;
                     }
                 }
             }
         }
-        if let Some(m) = best {
-            self.agent_metrics = m;
-        } else {
-            self.agent_metrics = AgentMetrics::default();
-        }
+        self.agent_metrics = best_claude.unwrap_or_default();
+        self.codex_metrics = best_codex.unwrap_or_default();
         // usage トークン推移の履歴（#217 スパークライン。取れたときだけ・変化時だけ積む）
         if let Some(tok) = self
             .agent_metrics
@@ -6418,26 +6805,23 @@ impl TakoApp {
         }
     }
 
-    fn update_sleep_guard(&mut self) {
-        use tako_core::CommandState;
-        let settings = tako_control::settings::load();
-        // OSC 133 で Running が検知できているペイン数
-        let running_count = self
-            .terminals
-            .values()
-            .filter(|s| matches!(s.command_state(), CommandState::Running))
-            .count();
-        // persist 復元後に OSC 133 未検知（Unknown）だがバックエンドに
-        // 実行中の子プロセスがいるペイン数（#324: 復元 worker の busy 漏れ根治）
-        let unknown_backends: Vec<&str> = self
-            .terminals
-            .iter()
-            .filter(|(_, s)| matches!(s.command_state(), CommandState::Unknown))
-            .filter_map(|(pid, _)| self.backend_sessions.get(pid).map(|s| s.as_str()))
-            .collect();
-        let restored_busy =
-            tako_control::agents::count_sessions_with_running_children(&unknown_backends);
-        let busy_agents = running_count + restored_busy;
+    /// sleep guard の UI 収集部: 全バックエンドセッション名を集める。
+    /// 子プロセス有無の実判定（tmux + ps 実行）は background で行い、UI スレッドに
+    /// サブプロセス実行を置かない（#340）。
+    /// #372: 旧実装は Unknown ペインのみ対象だったが、OSC 133 の遷移に依存すると
+    /// Idle のまま子プロセスが走るペイン（TUI エージェント）を見落とす。全バックエンドを
+    /// 対象にし、子プロセス判定のみで busy を決定する
+    fn sleep_guard_backends(&self) -> Vec<String> {
+        self.backend_sessions.values().cloned().collect()
+    }
+
+    /// sleep guard の適用部。busy_agents（バックエンドセッションのうち実行中子プロセスを
+    /// 持つ数）は background で取得済みのものを受け取る
+    fn apply_sleep_guard(
+        &mut self,
+        settings: &tako_control::settings::Settings,
+        busy_agents: usize,
+    ) {
         let state = tako_control::sleep_guard::update(
             settings.sleep_guard_mode,
             settings.sleep_guard_power,
@@ -6453,11 +6837,23 @@ impl TakoApp {
     // --- D&D（FR-2.16.10 tmux セッション取り込み / FR-3.11 ファイルプレビュー） ---
 
     /// `on_drag` のコンストラクタを作る共通部: drag_kind を記録してゴーストチップを返す。
-    /// gpui はドラッグ開始時にこのコンストラクタを 1 回呼ぶ（= ドラッグ開始フック）
+    /// gpui はドラッグ開始時にこのコンストラクタを 1 回呼ぶ（= ドラッグ開始フック）。
+    /// `tab_id`: タブ D&D 時にソースタブの半透明化（#371）に使う
     fn drag_ghost_builder<T: 'static>(
         &self,
         kind: DragKind,
         label: String,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&T, Point<Pixels>, &mut Window, &mut App) -> gpui::Entity<DragGhost> + 'static
+    {
+        self.drag_ghost_builder_with_tab(kind, label, None, cx)
+    }
+
+    fn drag_ghost_builder_with_tab<T: 'static>(
+        &self,
+        kind: DragKind,
+        label: String,
+        tab_id: Option<TabId>,
         cx: &mut Context<Self>,
     ) -> impl Fn(&T, Point<Pixels>, &mut Window, &mut App) -> gpui::Entity<DragGhost> + 'static
     {
@@ -6467,9 +6863,9 @@ impl TakoApp {
             let _ = entity.update(cx, |this, cx| {
                 this.drag_kind = Some(kind);
                 this.drop_target = None;
-                // #308: タブ D&D 開始時に titlebar_dragging を解除して
-                // #312 のウインドウ移動と競合しないようにする
                 this.titlebar_dragging = false;
+                this.tab_mouse_down = false;
+                this.dragging_tab = tab_id;
                 cx.notify();
             });
             cx.new(|_| DragGhost {
@@ -6505,8 +6901,13 @@ impl TakoApp {
         });
         match new {
             Some(target) => {
-                if self.drop_target != Some(target) {
-                    self.drop_target = Some(target);
+                let mut changed = self.drop_target != Some(target);
+                self.drop_target = Some(target);
+                // ペインオーバーレイに入ったらタブバーの挿入インジケータを消す（#371）
+                if self.tab_reorder_indicator.take().is_some() {
+                    changed = true;
+                }
+                if changed {
                     cx.notify();
                 }
             }
@@ -6525,6 +6926,7 @@ impl TakoApp {
         self.drag_kind = None;
         self.tab_drop_target = None;
         self.tab_reorder_indicator = None;
+        self.dragging_tab = None;
         self.drop_target
             .take()
             .filter(|(p, _)| *p == pane_id)
@@ -6630,6 +7032,7 @@ impl TakoApp {
     ) {
         self.drag_kind = None;
         self.tab_reorder_indicator = None;
+        self.dragging_tab = None;
         let target_index = match before {
             Some(before_id) => self
                 .workspace
@@ -7240,6 +7643,8 @@ impl TakoApp {
                 self.sync_editor_selection_from_preview(pid);
                 cx.notify();
             }
+            // ドラッグ選択中のオートスクロール判定（#309）
+            self.update_preview_drag_scroll(pid, event.position, cx);
             return;
         }
         let Some(pane_id) = self.selecting else {
@@ -7301,6 +7706,50 @@ impl TakoApp {
         self.drag_scroll = Some(DragScrollState {
             pane: pane_id,
             speed_factor,
+            preview: false,
+        });
+        if was_none {
+            self.start_drag_scroll_timer(cx);
+        }
+    }
+
+    /// PDF プレビュー用のドラッグ選択オートスクロール判定（#309）
+    fn update_preview_drag_scroll(
+        &mut self,
+        pane_id: PaneId,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(handle) = self.preview_scroll_handles.get(&pane_id) else {
+            return;
+        };
+        let area = handle.bounds();
+        let y = f32::from(position.y);
+        let top = f32::from(area.origin.y);
+        let bottom = top + f32::from(area.size.height);
+
+        let speed_factor = if y < top + DRAG_SCROLL_MARGIN {
+            let dist = (top + DRAG_SCROLL_MARGIN - y).min(DRAG_SCROLL_MARGIN);
+            dist / DRAG_SCROLL_MARGIN
+        } else if y > bottom - DRAG_SCROLL_MARGIN {
+            let dist = (y - (bottom - DRAG_SCROLL_MARGIN)).min(DRAG_SCROLL_MARGIN);
+            -(dist / DRAG_SCROLL_MARGIN)
+        } else {
+            0.0
+        };
+
+        if speed_factor == 0.0 {
+            if self.drag_scroll.as_ref().is_some_and(|s| s.preview) {
+                self.drag_scroll = None;
+            }
+            return;
+        }
+
+        let was_none = self.drag_scroll.is_none();
+        self.drag_scroll = Some(DragScrollState {
+            pane: pane_id,
+            speed_factor,
+            preview: true,
         });
         if was_none {
             self.start_drag_scroll_timer(cx);
@@ -7328,12 +7777,18 @@ impl TakoApp {
         let Some(state) = &self.drag_scroll else {
             return false;
         };
-        if self.selecting != Some(state.pane) {
+        let pane_id = state.pane;
+        let factor = state.speed_factor;
+        let is_preview = state.preview;
+
+        if is_preview {
+            return self.tick_preview_drag_scroll(pane_id, factor, cx);
+        }
+
+        if self.selecting != Some(pane_id) {
             self.drag_scroll = None;
             return false;
         }
-        let pane_id = state.pane;
-        let factor = state.speed_factor;
         let delta_rows = drag_scroll_delta(factor.abs());
 
         let session = match self.terminals.get(&pane_id) {
@@ -7354,6 +7809,56 @@ impl TakoApp {
             session.scroll_display(-(delta_rows.ceil() as i32));
             session.extend_selection(cols.saturating_sub(1), rows.saturating_sub(1), true);
         }
+        cx.notify();
+        true
+    }
+
+    /// PDF プレビューのドラッグ選択オートスクロール 1 ティック（#309）
+    fn tick_preview_drag_scroll(
+        &mut self,
+        pane_id: PaneId,
+        factor: f32,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.preview_selecting != Some(pane_id) {
+            self.drag_scroll = None;
+            return false;
+        }
+        let Some(handle) = self.preview_scroll_handles.get(&pane_id) else {
+            self.drag_scroll = None;
+            return false;
+        };
+
+        let delta_px = drag_scroll_delta_px(factor.abs());
+        let offset = handle.offset();
+        let current_y = f32::from(offset.y);
+
+        let new_y = if factor > 0.0 {
+            // 上方向（正 = 先頭へ）。offset は負方向
+            (current_y + delta_px).min(0.0)
+        } else {
+            current_y - delta_px
+        };
+        handle.set_offset(point(offset.x, px(new_y)));
+
+        // スクロール後の端位置で選択を更新。スクロール領域の上端/下端のヒットテストを行い、
+        // ビューポートからはみ出た先のテキストを選択範囲に含める
+        let area = handle.bounds();
+        let hit_pos = if factor > 0.0 {
+            point(area.origin.x, area.origin.y)
+        } else {
+            point(
+                area.origin.x + area.size.width,
+                area.origin.y + area.size.height,
+            )
+        };
+        if let Some(pos) = self.preview_hit_test(pane_id, hit_pos) {
+            if let Some(sel) = self.preview_selections.get_mut(&pane_id) {
+                sel.head = pos;
+            }
+            self.sync_editor_selection_from_preview(pane_id);
+        }
+
         cx.notify();
         true
     }
@@ -7453,6 +7958,7 @@ impl TakoApp {
             | self.drop_target.take().is_some()
             | self.tab_drop_target.take().is_some()
             | self.tab_reorder_indicator.take().is_some()
+            | self.dragging_tab.take().is_some()
         {
             cx.notify();
             return;
@@ -8572,62 +9078,82 @@ impl TakoApp {
         let id = self.webviews[idx].id;
         let url = self.webviews[idx].current_url();
         let title = self.webviews[idx].current_title();
-        let loading = self.webviews[idx].is_loading();
+        let _loading = self.webviews[idx].is_loading();
+        let can_go_back = self.webviews[idx].can_go_back();
+        let can_go_forward = self.webviews[idx].can_go_forward();
+        let error_state = self.webviews[idx].error_state();
 
         // 本文領域 = pane_text_areas と同じ絶対座標（タイトルバー・枠・パディングの内側）。
         // GPUI の Pixels は論理座標なので wry の Logical bounds へそのまま渡せる。
         // 実描画はネイティブ webview 自身が行い、GPUI 側は枠とタイトルバーだけを描く
         self.webview_marks.insert(id);
-        let bounds = (
-            f64::from(f32::from(area.origin.x)),
-            f64::from(f32::from(area.origin.y)),
-            f64::from(f32::from(area.size.width)),
-            f64::from(f32::from(area.size.height)),
-        );
-        self.webviews[idx].sync_frame(Some(bounds));
+        let editing_addr = self.webview_address_bar_active == Some(pane_id);
+        if error_state.is_none() && !editing_addr {
+            let bounds = (
+                f64::from(f32::from(area.origin.x)),
+                f64::from(f32::from(area.origin.y)),
+                f64::from(f32::from(area.size.width)),
+                f64::from(f32::from(area.size.height)),
+            );
+            self.webviews[idx].sync_frame(Some(bounds));
+        } else {
+            self.webviews[idx].sync_frame(None);
+        }
 
         let display_title = if title.trim().is_empty() {
             url.clone()
         } else {
             title
         };
-        // ← / → / ⟳ のナビゲーションボタン（webview 本体はネイティブが処理するため、
-        // GPUI 側 UI はタイトルバーに限られる）
-        let nav_button = |icon: &'static str,
-                          to: &'static str,
-                          cx: &mut Context<Self>|
-         -> gpui::Stateful<gpui::Div> {
-            div()
-                .id((to, pane_id.as_u64()))
-                .w(px(20.0))
-                .h(px(18.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_sm()
-                .cursor_pointer()
-                .text_size(px(12.0))
-                .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.9))
-                .hover(|d| {
-                    d.bg(rgba_alpha(theme.surface_2, 0.9))
-                        .text_color(hsla(theme.foreground))
-                })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    if let Some(e) = this.webviews.iter().find(|e| e.pane == Some(pane_id)) {
-                        if let Err(err) = e.navigate(to) {
-                            eprintln!("warning: webview navigate({to}) 失敗: {err}");
-                        }
-                    }
-                    cx.notify();
-                }))
-                .child(icon)
+        // ナビゲーションボタン（SVG アイコン + 無効状態対応。#336）
+        let nav_button =
+            |icon_path: &'static str,
+             to: &'static str,
+             enabled: bool,
+             cx: &mut Context<Self>|
+             -> gpui::Stateful<gpui::Div> {
+                let base =
+                    div()
+                        .id((to, pane_id.as_u64()))
+                        .w(px(20.0))
+                        .h(px(18.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .child(svg().path(icon_path).w(px(12.0)).h(px(12.0)).text_color(
+                            if enabled {
+                                hsla_alpha(theme.tab_inactive_foreground, 0.9)
+                            } else {
+                                hsla_alpha(theme.tab_inactive_foreground, 0.3)
+                            },
+                        ));
+                if enabled {
+                    base.cursor_pointer()
+                        .hover(|d| d.bg(rgba_alpha(theme.surface_2, 0.9)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(e) = this.webviews.iter().find(|e| e.pane == Some(pane_id))
+                            {
+                                if let Err(err) = e.navigate(to) {
+                                    eprintln!("warning: webview navigate({to}) 失敗: {err}");
+                                }
+                            }
+                            cx.notify();
+                        }))
+                } else {
+                    base.cursor(CursorStyle::Arrow)
+                }
+            };
+        let body = if let Some((error_msg, failed_url)) = &error_state {
+            self.render_webview_error_overlay(pane_id, error_msg, failed_url, &theme, cx)
+        } else {
+            div().flex_1().bg(rgba(theme.background))
         };
-        let body = div().flex_1().bg(rgba(theme.background));
 
         div()
             .id(("pane", pane_id.as_u64()))
@@ -8724,10 +9250,15 @@ impl TakoApp {
                                 cx.stop_propagation();
                                 this.webview_close_button(pane_id, cx);
                             }))
-                            .child("×"),
+                            .child(
+                                svg()
+                                    .path(crate::file_icons::ui_icon::CLOSE)
+                                    .w(px(10.0))
+                                    .h(px(10.0))
+                                    .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8)),
+                            ),
                     )
                     .child(
-                        // ー = dock へ退避（ページは生きたまま。たまり場の ー と同じ作法）
                         div()
                             .id(("pane-web-hide", pane_id.as_u64()))
                             .w(px(16.0))
@@ -8750,42 +9281,227 @@ impl TakoApp {
                                 cx.stop_propagation();
                                 this.webview_hide_button(pane_id, cx);
                             }))
-                            .child("ー"),
-                    )
-                    .child(nav_button("←", "back", cx))
-                    .child(nav_button("→", "forward", cx))
-                    .child(nav_button(if loading { "…" } else { "⟳" }, "reload", cx))
-                    .child(
-                        div()
-                            .text_color(if focused {
-                                hsla(theme.foreground)
-                            } else {
-                                hsla(theme.tab_inactive_foreground)
-                            })
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(5.0))
                             .child(
                                 svg()
-                                    .path(crate::file_icons::ui_icon::GLOBE)
-                                    .w(px(12.0))
-                                    .h(px(12.0))
-                                    .text_color(hsla(theme.accent)),
-                            )
-                            .child(SharedString::from(truncate(&display_title, 32))),
+                                    .path(crate::file_icons::ui_icon::MINUS)
+                                    .w(px(10.0))
+                                    .h(px(10.0))
+                                    .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8)),
+                            ),
                     )
+                    .child(nav_button(
+                        crate::file_icons::ui_icon::CHEVRON_LEFT,
+                        "back",
+                        can_go_back,
+                        cx,
+                    ))
+                    .child(nav_button(
+                        crate::file_icons::ui_icon::CHEVRON_RIGHT,
+                        "forward",
+                        can_go_forward,
+                        cx,
+                    ))
+                    .child(nav_button(
+                        if error_state.is_some() {
+                            crate::file_icons::ui_icon::WARNING
+                        } else {
+                            crate::file_icons::ui_icon::REFRESH
+                        },
+                        "reload",
+                        true,
+                        cx,
+                    ))
                     .child(
-                        // URL 表示（タイトルの右に控えめに。編集は CLI / MCP / cmd+K 経由）
-                        div()
-                            .flex_grow(1.0)
-                            .overflow_hidden()
-                            .text_size(px(10.0))
-                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.7))
-                            .child(SharedString::from(truncate(&url, 48))),
-                    ),
+                        svg()
+                            .path(crate::file_icons::ui_icon::GLOBE)
+                            .w(px(12.0))
+                            .h(px(12.0))
+                            .text_color(hsla(theme.accent)),
+                    )
+                    .child(self.render_webview_address_bar(
+                        pane_id,
+                        &url,
+                        &display_title,
+                        focused,
+                        cx,
+                    )),
             )
             .child(body)
+    }
+
+    /// Web ビューペインのアドレスバー（#337）。通常は URL 表示、クリックで編集モード
+    fn render_webview_address_bar(
+        &self,
+        pane_id: PaneId,
+        url: &str,
+        title: &str,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = &self.theme;
+        let editing = self.webview_address_bar_active == Some(pane_id);
+        if editing {
+            let (input, cursor) = self
+                .webview_address_bar
+                .get(&pane_id.as_u64())
+                .cloned()
+                .unwrap_or_default();
+            let cursor = cursor.min(input.len());
+            let before = &input[..cursor];
+            let after = &input[cursor..];
+            div()
+                .id(("web-addr-bar", pane_id.as_u64()))
+                .flex_1()
+                .flex()
+                .flex_row()
+                .items_center()
+                .overflow_hidden()
+                .px(px(4.0))
+                .py(px(1.0))
+                .rounded_sm()
+                .bg(rgba_alpha(theme.accent, 0.10))
+                .border_1()
+                .border_color(hsla_alpha(theme.accent, 0.5))
+                .text_size(px(11.0))
+                .text_color(hsla(theme.foreground))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                )
+                .child(SharedString::from(before.to_string()))
+                .child(
+                    div()
+                        .w(px(1.5))
+                        .h(px(14.0))
+                        .flex_none()
+                        .bg(hsla(theme.accent)),
+                )
+                .child(SharedString::from(after.to_string()))
+        } else {
+            let display = if title.is_empty() || title == url {
+                truncate(url, 60)
+            } else {
+                format!("{} — {}", truncate(title, 24), truncate(url, 36))
+            };
+            div()
+                .id(("web-addr-bar", pane_id.as_u64()))
+                .flex_1()
+                .flex()
+                .flex_row()
+                .items_center()
+                .overflow_hidden()
+                .px(px(4.0))
+                .py(px(1.0))
+                .rounded_sm()
+                .cursor(CursorStyle::IBeam)
+                .hover(|d| d.bg(rgba_alpha(theme.surface_2, 0.6)))
+                .text_size(px(11.0))
+                .text_color(if focused {
+                    hsla(theme.foreground)
+                } else {
+                    hsla(theme.tab_inactive_foreground)
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        let current_url = this
+                            .webviews
+                            .iter()
+                            .find(|e| e.pane == Some(pane_id))
+                            .map(|e| e.current_url())
+                            .unwrap_or_default();
+                        let len = current_url.len();
+                        this.webview_address_bar
+                            .insert(pane_id.as_u64(), (current_url, len));
+                        this.webview_address_bar_active = Some(pane_id);
+                        // アドレスバー編集中は webview を隠してキー入力を GPUI に渡す
+                        if let Some(e) = this.webviews.iter_mut().find(|e| e.pane == Some(pane_id))
+                        {
+                            e.sync_frame(None);
+                        }
+                        cx.notify();
+                    }),
+                )
+                .child(SharedString::from(display))
+        }
+    }
+
+    /// Web ビューのエラーオーバーレイ（#327）。ネイティブ webview を隠し、GPUI で
+    /// エラーメッセージ + 再読み込みボタンを描画する
+    fn render_webview_error_overlay(
+        &self,
+        pane_id: PaneId,
+        error_msg: &str,
+        failed_url: &str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let error_msg = SharedString::from(error_msg.to_string());
+        let url_display = SharedString::from(truncate(failed_url, 60));
+        div()
+            .flex_1()
+            .bg(rgba(theme.background))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .max_w(px(380.0))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(
+                        svg()
+                            .path(crate::file_icons::ui_icon::GLOBE)
+                            .w(px(32.0))
+                            .h(px(32.0))
+                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.4)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(hsla(theme.foreground))
+                            .child(error_msg),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.7))
+                            .overflow_hidden()
+                            .child(url_display),
+                    )
+                    .child(
+                        div()
+                            .id(("web-retry", pane_id.as_u64()))
+                            .mt(px(4.0))
+                            .px(px(16.0))
+                            .py(px(6.0))
+                            .rounded(px(6.0))
+                            .bg(rgba_alpha(theme.accent, 0.15))
+                            .text_size(px(12.0))
+                            .text_color(hsla(theme.accent))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(rgba_alpha(theme.accent, 0.25)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if let Some(e) =
+                                    this.webviews.iter().find(|e| e.pane == Some(pane_id))
+                                {
+                                    let _ = e.retry();
+                                }
+                                cx.notify();
+                            }))
+                            .child("再読み込み"),
+                    ),
+            )
     }
 
     /// Web ビューペインの × = ページごと完全破棄（ブラウザのタブ × と同じ）。
@@ -8837,7 +9553,25 @@ impl TakoApp {
         for e in &self.webviews {
             if e.pane.is_some() {
                 e.poll_state();
+                e.check_nav_timeout();
             }
+        }
+    }
+
+    /// target=_blank / window.open で要求された新規ウィンドウ URL を処理する（#335）。
+    /// 2 秒ポーリングの中で呼ばれ、各 URL ごとに新規 Web ビューペインを開く
+    fn process_pending_new_windows(&mut self, cx: &mut Context<Self>) {
+        let urls: Vec<String> = self
+            .webviews
+            .iter()
+            .flat_map(|e| e.drain_new_window_urls())
+            .collect();
+        for url in urls {
+            let normalized = webview::normalize_url(&url);
+            if webview::validate_url(&normalized).is_err() {
+                continue;
+            }
+            self.open_webview_from_dock(&normalized, cx);
         }
     }
 
@@ -8879,6 +9613,108 @@ impl TakoApp {
             }
         }
         cx.notify();
+    }
+
+    /// アドレスバーのキー処理（#337）。編集中のみ呼ばれる
+    fn handle_webview_address_bar_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) -> bool {
+        let Some(pane_id) = self.webview_address_bar_active else {
+            return false;
+        };
+        let key = pane_id.as_u64();
+        match ks.key.as_str() {
+            "enter" => {
+                let url = self
+                    .webview_address_bar
+                    .remove(&key)
+                    .map(|(s, _)| s)
+                    .unwrap_or_default();
+                self.webview_address_bar_active = None;
+                let url = url.trim().to_string();
+                if !url.is_empty() {
+                    let normalized = webview::normalize_url(&url);
+                    if let Some(e) = self.webviews.iter().find(|e| e.pane == Some(pane_id)) {
+                        let _ = e.navigate(&normalized);
+                    }
+                }
+                cx.notify();
+                true
+            }
+            "escape" => {
+                self.webview_address_bar.remove(&key);
+                self.webview_address_bar_active = None;
+                cx.notify();
+                true
+            }
+            "backspace" => {
+                if let Some((input, cursor)) = self.webview_address_bar.get_mut(&key) {
+                    if *cursor > 0 {
+                        let prev = input[..*cursor]
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        input.drain(prev..*cursor);
+                        *cursor = prev;
+                    }
+                }
+                cx.notify();
+                true
+            }
+            "delete" => {
+                if let Some((input, cursor)) = self.webview_address_bar.get_mut(&key) {
+                    if *cursor < input.len() {
+                        let next = *cursor
+                            + input[*cursor..]
+                                .chars()
+                                .next()
+                                .map(|c| c.len_utf8())
+                                .unwrap_or(0);
+                        input.drain(*cursor..next);
+                    }
+                }
+                cx.notify();
+                true
+            }
+            "left" => {
+                if let Some((input, cursor)) = self.webview_address_bar.get_mut(&key) {
+                    if *cursor > 0 {
+                        *cursor = input[..*cursor]
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                    }
+                }
+                cx.notify();
+                true
+            }
+            "right" => {
+                if let Some((input, cursor)) = self.webview_address_bar.get_mut(&key) {
+                    if *cursor < input.len() {
+                        *cursor += input[*cursor..]
+                            .chars()
+                            .next()
+                            .map(|c| c.len_utf8())
+                            .unwrap_or(0);
+                    }
+                }
+                cx.notify();
+                true
+            }
+            _ => {
+                if let Some(ch) = ks.key_char.as_deref() {
+                    if !ch.chars().any(|c| c.is_control()) {
+                        if let Some((input, cursor)) = self.webview_address_bar.get_mut(&key) {
+                            input.insert_str(*cursor, ch);
+                            *cursor += ch.len();
+                        }
+                        cx.notify();
+                        return true;
+                    }
+                }
+                true
+            }
+        }
     }
 
     /// Web dock URL 入力欄のキー処理（#207）。dock が開いているときだけ呼ばれる。
@@ -9097,7 +9933,13 @@ impl TakoApp {
                                 }
                                 cx.notify();
                             }))
-                            .child("×"),
+                            .child(
+                                svg()
+                                    .path(crate::file_icons::ui_icon::CLOSE)
+                                    .w(px(10.0))
+                                    .h(px(10.0))
+                                    .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8)),
+                            ),
                     )
             })
             .collect();
@@ -9119,20 +9961,49 @@ impl TakoApp {
         )
     }
 
-    /// Web dock URL 入力行の描画（#207）
+    /// Web dock URL 入力行の描画（#207 / #375）
     fn render_webview_dock_url_input(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let cursor = self
             .webview_dock_url_cursor
             .min(self.webview_dock_url_input.len());
         let before = &self.webview_dock_url_input[..cursor];
         let after = &self.webview_dock_url_input[cursor..];
-        let display = if self.webview_dock_url_input.is_empty() {
-            SharedString::from("URL を入力して Enter（例: example.com）")
-        } else {
-            SharedString::from(format!("{before}|{after}"))
-        };
         let placeholder = self.webview_dock_url_input.is_empty();
         let focused = self.webview_dock_url_focused;
+        let text_content = div()
+            .flex_1()
+            .flex()
+            .flex_row()
+            .items_center()
+            .overflow_hidden()
+            .text_size(px(11.0))
+            .when(placeholder, |d| {
+                d.child(
+                    div()
+                        .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.5))
+                        .child("URL を入力して Enter（例: example.com）"),
+                )
+            })
+            .when(!placeholder, |d| {
+                d.text_color(hsla(theme.foreground))
+                    .child(SharedString::from(before.to_string()))
+            })
+            .when(focused, |d| {
+                d.child(
+                    div()
+                        .w(px(1.5))
+                        .h(px(14.0))
+                        .flex_none()
+                        .bg(hsla(theme.accent)),
+                )
+            })
+            .when(!placeholder, |d| {
+                d.child(
+                    div()
+                        .text_color(hsla(theme.foreground))
+                        .child(SharedString::from(after.to_string())),
+                )
+            });
         div()
             .flex()
             .flex_row()
@@ -9167,13 +10038,7 @@ impl TakoApp {
                             cx.notify();
                         }),
                     )
-                    .text_size(px(11.0))
-                    .text_color(if placeholder {
-                        hsla_alpha(theme.tab_inactive_foreground, 0.5)
-                    } else {
-                        hsla(theme.foreground)
-                    })
-                    .child(display),
+                    .child(text_content),
             )
             .child(
                 div()
@@ -9239,21 +10104,10 @@ impl TakoApp {
         }
     }
 
-    /// 失敗ペインの「再実行」（#217 カンプ）。シェルの履歴呼び出し（上矢印）+
-    /// Enter を送り、直前コマンドを再実行する
-    fn retry_last_command(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
-        if let Some(session) = self.terminals.get(&pane_id) {
-            session.write(b"\x1b[A\r".to_vec());
-        }
-        cx.notify();
-    }
-
-    /// 子ワーカードロップダウン（#217 カンプ: w282 / radius 9 / ヘッダ + 行 + フッター）。
-    /// master ペインの「N workers ▾」から開く。行クリックでジャンプ、
-    /// フッターは master ペインへのフォーカス（起動指示の導線）
+    /// 子ワーカードロップダウン（#217 カンプ: w282 / radius 9 / ヘッダ + 行）。
+    /// master ペインの「N workers ▾」から開く。行クリックでジャンプ
     fn render_workers_menu(
         &self,
-        master_pane: PaneId,
         workers: &[WorkerRow],
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -9373,39 +10227,6 @@ impl TakoApp {
                             )
                     })),
             )
-            .child(
-                div()
-                    .id(("workers-menu-spawn", master_pane.as_u64()))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
-                    .px(px(12.0))
-                    .py(px(8.0))
-                    .border_t_1()
-                    .border_color(hsla(theme.border_subtle))
-                    .text_size(px(11.0))
-                    .text_color(hsla(theme.text_muted))
-                    .cursor_pointer()
-                    .hover(|d| {
-                        d.text_color(hsla(theme.foreground))
-                            .bg(rgba(theme.surface_hover))
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.workers_menu_open = None;
-                        // 起動指示は master との対話で行う（master ペインへ導線）
-                        this.jump_to_pane(master_pane, cx);
-                    }))
-                    .child(
-                        svg()
-                            .path(crate::file_icons::ui_icon::PLUS)
-                            .w(px(11.0))
-                            .h(px(11.0))
-                            .text_color(hsla(theme.text_muted)),
-                    )
-                    .child("ワーカーを起動"),
-            )
             .into_any_element()
     }
 
@@ -9437,9 +10258,12 @@ impl TakoApp {
             .or(self.cell_size)
             .expect("render 冒頭で実測済み");
 
-        // PTY リサイズ追従: テキスト領域に収まる cols/rows へ
-        let cols = (f32::from(area.size.width) / f32::from(cell.width)).floor() as usize;
-        let rows = (f32::from(area.size.height) / f32::from(cell.height)).floor() as usize;
+        // PTY リサイズ追従: テキスト領域に収まる cols/rows へ。
+        // 急速リサイズで area が極小/負になる場合に備え 0 クランプ（#385）
+        let area_w = f32::from(area.size.width).max(0.0);
+        let area_h = f32::from(area.size.height).max(0.0);
+        let cols = (area_w / f32::from(cell.width)).floor() as usize;
+        let rows = (area_h / f32::from(cell.height)).floor() as usize;
         if let Some(session) = self.terminals.get_mut(&pane_id) {
             session.resize(
                 cols,
@@ -10005,46 +10829,6 @@ impl TakoApp {
                             .flex_row()
                             .items_center()
                             .gap(px(4.0))
-                            // failed: 再実行ボタン
-                            .when(is_failed && !hv.more_menu, |d| {
-                                d.child(
-                                    div()
-                                        .id(("pane-retry", pane_id.as_u64()))
-                                        .flex()
-                                        .flex_none()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(4.0))
-                                        .px(px(9.0))
-                                        .py(px(3.0))
-                                        .rounded(px(6.0))
-                                        .border_1()
-                                        .border_color(hsla_alpha(theme.red, 0.35))
-                                        .text_size(px(10.5))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(hsla(theme.red))
-                                        .cursor_pointer()
-                                        .hover(|d| d.bg(rgba_alpha(theme.red, 0.10)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                                                cx.stop_propagation()
-                                            }),
-                                        )
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.retry_last_command(pane_id, cx);
-                                        }))
-                                        .child(
-                                            svg()
-                                                .path(crate::file_icons::ui_icon::RETRY)
-                                                .w(px(11.0))
-                                                .h(px(11.0))
-                                                .text_color(hsla(theme.red)),
-                                        )
-                                        .child("再実行"),
-                                )
-                            })
                             // split ボタン（カンプ: 13px SVG）
                             .when(hv.split_button, |d| {
                                 d.child(
@@ -10197,11 +10981,14 @@ impl TakoApp {
             .child(
                 // テキスト領域: サブラインスクロール（#159）のため行スタックを
                 // absolute 配置し、fract 行ぶん上へずらして描画する（overflow_hidden で
-                // 上下端は部分行として見切れる = ピクセル単位のスムーススクロール）
+                // 上下端は部分行として見切れる = ピクセル単位のスムーススクロール）。
+                // bg を明示する（#385）: リサイズ・レイアウト変化時に端末行が新サイズを
+                // 埋め切る前のフレームでも、ペイン背景色と同色が塗られて暗転しない
                 div()
                     .flex_1()
                     .overflow_hidden()
                     .relative()
+                    .bg(rgba(theme.background))
                     .when(has_link_hover, |d| d.cursor(CursorStyle::PointingHand))
                     .child(
                         div()
@@ -10321,7 +11108,7 @@ impl TakoApp {
             // 子ワーカードロップダウン（カンプ: w282 / radius 9。ヘッダ下に絶対配置）
             // ターミナルテキストエリアより後に描画し、背後が透けないようにする（#341）
             .when(workers_menu_open, |d| {
-                d.child(self.render_workers_menu(pane_id, &workers, cx))
+                d.child(self.render_workers_menu(&workers, cx))
             })
             .into_any_element()
     }
@@ -10501,6 +11288,7 @@ impl SessionHost for TakoApp {
         self.terminals.remove(&pane);
         self.previews.remove(&pane);
         self.preview_edits.remove(&pane);
+        self.discard_ime_for_pane(pane);
         self.remove_preview_image_cache(pane);
         self.preview_views.remove(&pane);
         self.preview_scroll_handles.remove(&pane);
@@ -10661,6 +11449,11 @@ impl TmuxHost for TakoApp {
 }
 
 impl UiStateHost for TakoApp {
+    fn request_viewport_open(&mut self, window: tako_core::WindowId) {
+        // GPUI ウィンドウの生成は Context が要るため render の sync_viewports で消費する
+        self.pending_viewport_opens.push(window);
+    }
+
     fn auto_rename_enabled(&self) -> bool {
         self.autorename.enabled
     }
@@ -10726,6 +11519,23 @@ impl UiStateHost for TakoApp {
 
     fn set_limit_service(&mut self, service: tako_core::LimitService) {
         self.limit_service = service;
+        self.limit_service_menu_open = false;
+        self.limit_service_menu_anchor = None;
+    }
+
+    fn refresh_limits(&mut self) -> serde_json::Value {
+        self.refresh_agent_metrics();
+        let m = |metrics: &AgentMetrics, l1: &str, l2: &str| {
+            serde_json::json!({
+                l1: metrics.limit_5h,
+                l2: metrics.limit_week,
+            })
+        };
+        serde_json::json!({
+            "claude": m(&self.agent_metrics, "5h", "7d"),
+            "codex": m(&self.codex_metrics, "primary", "secondary"),
+            "agy": { "status": "unsupported" },
+        })
     }
 
     fn panel_state(&self) -> (bool, f32, tako_control::protocol::PanelViewWire) {
@@ -11397,12 +12207,15 @@ impl WebViewHost for TakoApp {
             self.webviews
                 .iter()
                 .map(|e| {
+                    let err = e.error_state();
                     serde_json::json!({
                         "id": e.id.as_u64(),
                         "url": e.current_url(),
                         "title": e.current_title(),
                         "pane": e.pane.map(|p| p.as_u64()),
                         "loading": e.is_loading(),
+                        "error": err.as_ref().map(|(msg, _)| msg.as_str()),
+                        "failed_url": err.as_ref().map(|(_, url)| url.as_str()),
                     })
                 })
                 .collect(),
@@ -11496,12 +12309,15 @@ impl WebViewHost for TakoApp {
             .iter()
             .find(|e| e.id.as_u64() == id)
             .ok_or(format!("Web ビュー {id} が見つからない"))?;
+        let err = e.error_state();
         Ok(serde_json::json!({
             "id": id,
             "url": e.current_url(),
             "title": e.current_title(),
             "loading": e.is_loading(),
             "pane": e.pane.map(|p| p.as_u64()),
+            "error": err.as_ref().map(|(msg, _)| msg.as_str()),
+            "failed_url": err.as_ref().map(|(_, url)| url.as_str()),
         }))
     }
 }
@@ -11669,32 +12485,39 @@ impl EntityInputHandler for TakoApp {
         self.ime.as_ref().map(|ime| 0..utf16_len(&ime.text))
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // NSTextInputClient の規約: unmark は「未確定文字列をそのまま挿入扱いにする」
         if let Some(ime) = self.ime.take() {
+            // 変換開始ペインが既に閉じられていたらフォーカスペインへ倒す（#332）
+            let pane = if self.ime_pane_alive(ime.pane) {
+                ime.pane
+            } else {
+                self.focused_pane()
+            };
             // 検索バー表示中は検索/置換フィールドへ
             if self
                 .preview_edits
-                .get(&ime.pane)
+                .get(&pane)
                 .is_some_and(|edit| edit.search_visible)
             {
                 if !ime.text.is_empty() {
-                    self.insert_search_char(ime.pane, &ime.text);
+                    self.insert_search_char(pane, &ime.text);
                 }
             } else if let Some(edit) = self
                 .preview_edits
-                .get_mut(&ime.pane)
+                .get_mut(&pane)
                 .filter(|edit| edit.editing)
             {
-                let p = ime.pane;
                 edit.buffer.insert(&ime.text);
                 edit.message = None;
-                self.refresh_preview_from_editor(p);
-                self.schedule_autosave(p);
-                self.start_autosave_timer(p, cx);
-            } else if let Some(session) = self.terminals.get(&ime.pane) {
+                self.refresh_preview_from_editor(pane);
+                self.schedule_autosave(pane);
+                self.start_autosave_timer(pane, cx);
+            } else if let Some(session) = self.terminals.get(&pane) {
                 session.write(ime.text.into_bytes());
             }
+            // 挿入確定でテキストが動いたので IM に文字座標の再計算を促す（zed 準拠。#332）
+            window.invalidate_character_coordinates();
         }
         cx.notify();
     }
@@ -11703,7 +12526,7 @@ impl EntityInputHandler for TakoApp {
         &mut self,
         _range_utf16: Option<Range<usize>>,
         text: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // インライン編集中は IME 確定文字列をインライン入力に振り分ける
@@ -11725,11 +12548,7 @@ impl EntityInputHandler for TakoApp {
             cx.notify();
             return;
         }
-        let pane = self
-            .ime
-            .as_ref()
-            .map(|ime| ime.pane)
-            .unwrap_or_else(|| self.focused_pane());
+        let pane = self.ime_target();
         // 検索バー表示中は入力文字を検索/置換フィールドへ
         if self
             .preview_edits
@@ -11760,20 +12579,25 @@ impl EntityInputHandler for TakoApp {
             self.refresh_preview_from_editor(pane);
             self.schedule_autosave(pane);
             self.start_autosave_timer(pane, cx);
+            window.invalidate_character_coordinates();
             cx.notify();
             return;
         }
-        // 確定（insertText 相当）。変換を開始したペインへ書き、変換状態を畳む
+        // 確定（insertText 相当）。変換を開始したペインへ書き、変換状態を畳む。
+        // 開始ペインが既に閉じられていたらフォーカスペインへ倒す（#332）
         let pane = self
             .ime
             .take()
             .map(|ime| ime.pane)
+            .filter(|pane| self.ime_pane_alive(*pane))
             .unwrap_or_else(|| self.focused_pane());
         self.cancel_scroll_before_input(pane);
         if let Some(session) = self.terminals.get(&pane) {
             session.clear_selection();
             session.write(text.as_bytes().to_vec());
         }
+        // 確定でテキストが動いたので IM に文字座標の再計算を促す（zed 準拠。#332）
+        window.invalidate_character_coordinates();
         cx.notify();
     }
 
@@ -11790,10 +12614,14 @@ impl EntityInputHandler for TakoApp {
         if new_text.is_empty() {
             self.ime = None;
         } else {
+            // 変換継続中は開始ペインを維持する。ただし開始ペインが既に閉じられて
+            // いたらフォーカスペインへ付け替える（stale なまま引き継ぐと以後の
+            // 変換・確定がすべて死んだペインへ向かう。#332）
             let pane = self
                 .ime
                 .take()
                 .map(|ime| ime.pane)
+                .filter(|pane| self.ime_pane_alive(*pane))
                 .unwrap_or_else(|| self.focused_pane());
             self.ime = Some(ImeComposition {
                 pane,
@@ -12117,14 +12945,6 @@ struct WorkerRow {
     state: tako_core::CommandState,
 }
 
-/// Attention トースト 1 件（#217 カンプ。失敗即知の右下通知）
-struct AttentionToast {
-    pane: PaneId,
-    title: String,
-    detail: String,
-    at: std::time::Instant,
-}
-
 /// ⌘K コマンドパレットの状態（#217 カンプ。ペイン・コマンド検索）
 #[derive(Default)]
 struct CommandPalette {
@@ -12202,6 +13022,23 @@ impl Render for TakoApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Issue #168: フレーム構築（element tree 生成）のメインスレッド専有を計測
         let _span = tako_control::diag::perf_span("render");
+        // IME 経路の自己修復の保険（#332）: 本線は wire_focus_self_heal の
+        // on_focus_lost（draw 末尾で発火し view render の reuse に依存しない）。
+        // ここは購読が何らかの理由で効かなかった場合に、次の notify 契機で
+        // 復元する多層防御。tako は単一 focus_handle 設計で「フォーカスが無い」
+        // 正当な状態は存在しない
+        if window.focused(cx).is_none() {
+            window.focus(&self.focus_handle.clone(), cx);
+            window.invalidate_character_coordinates();
+        }
+        // フォーカスペインが変わったら IM に文字座標の再計算を促す（zed の
+        // SelectionsChanged / focus_in 相当。放置すると候補ウィンドウが旧ペインの
+        // 座標キャッシュ位置へ出る。#332）
+        let ime_focus_now = self.focused_pane();
+        if self.last_ime_focus != Some(ime_focus_now) {
+            self.last_ime_focus = Some(ime_focus_now);
+            window.invalidate_character_coordinates();
+        }
         self.drain_preview_image_evictions(window, cx);
         self.preview_device_scale = window.scale_factor();
         // Web ビュー（FR-3.8）: wry の親にするウィンドウハンドルは render でしか
@@ -12224,9 +13061,15 @@ impl Render for TakoApp {
         // ファイルツリーの root 同期は 2 秒ポーリングとイベント駆動に移した
         // （render 毎フレームの呼び出しを廃止してパフォーマンス改善）
 
+        // 論理ウィンドウ ⇔ GPUI ウィンドウの同期（Issue #339。空ウィンドウの close 等）
+        self.sync_viewports(cx);
+        // このウィンドウの表示タブ（Issue #339 ビューポート方式)。同一 entity を
+        // 全ウィンドウの root view として共有するため、呼び出し元 window ごとに解決する
+        let display_tab = self.display_tab_for(window);
+
         // OS ウィンドウのフレームを採取する（layout 保存 = 再起動時のウィンドウ復元用。
         // window_bounds() は fullscreen / maximized 中でも復元サイズを返す）
-        self.window_frame = Some({
+        let frame = {
             let (state, bounds) = match window.window_bounds() {
                 WindowBounds::Windowed(b) => ("windowed", b),
                 WindowBounds::Maximized(b) => ("maximized", b),
@@ -12239,9 +13082,17 @@ impl Render for TakoApp {
                 height: f32::from(bounds.size.height),
                 state: state.to_string(),
             }
-        });
+        };
+        let this_viewport = self.viewport_of(window);
+        if let Some(lid) = this_viewport {
+            self.window_frames.insert(lid, frame.clone());
+        }
+        // 旧スキーマ互換の単一フレーム（layout.window）はプライマリ（先頭ビューポート）のもの
+        if self.viewports.first().map(|(l, _)| *l) == this_viewport || this_viewport.is_none() {
+            self.window_frame = Some(frame);
+        }
 
-        // アクティブタブのレイアウト（単位矩形）と、マウス変換用のピクセル矩形を更新する。
+        // 表示タブのレイアウト（単位矩形）と、マウス変換用のピクセル矩形を更新する。
         // サイドバー表示中はその幅だけコンテンツ領域を右へずらす（ペイン矩形・境界
         // ハンドル・IME 位置はすべて content_origin / content_size 起点で連動する）
         let viewport = window.viewport_size();
@@ -12262,25 +13113,51 @@ impl Render for TakoApp {
             viewport.width - sidebar_width - panel_width,
             viewport.height - px(TAB_BAR_HEIGHT) - px(STATUS_BAR_HEIGHT),
         );
-        let tree = self.workspace.active_tab().tree();
+        let tree = self
+            .workspace
+            .get_tab(display_tab)
+            .unwrap_or_else(|| self.workspace.active_tab())
+            .tree();
         let focused = tree.focused();
         let layout = tree.layout(Rect::UNIT);
-        self.pane_text_areas = layout
+        // デバイスピクセルスナップ（#385）: ターミナルはグリッドベースの描画のため、
+        // サブピクセル座標のままだとリサイズ時にグリフのラスタライズ位置がフレーム間で
+        // 振動し、暗転・ちらつきとして知覚される（zed の terminal_element と同じ対策）
+        let scale_factor = window.scale_factor();
+        let snap = |v: Pixels| -> Pixels {
+            Pixels::from((f32::from(v) * scale_factor).round() / scale_factor)
+        };
+        let new_areas: Vec<(PaneId, Bounds<Pixels>)> = layout
             .iter()
             .map(|(id, r)| {
                 let inset = PANE_BORDER + PANE_PADDING;
                 // テキスト領域はタイトルバー（PANE_TITLE_BAR）の下から始まる
                 let origin = point(
-                    content_origin.x + content_size.width * r.x + px(inset),
-                    content_origin.y + content_size.height * r.y + px(inset + PANE_TITLE_BAR),
+                    snap(content_origin.x + content_size.width * r.x + px(inset)),
+                    snap(content_origin.y + content_size.height * r.y + px(inset + PANE_TITLE_BAR)),
                 );
                 let area_size = size(
-                    content_size.width * r.width - px(inset * 2.0),
-                    content_size.height * r.height - px(inset * 2.0 + PANE_TITLE_BAR),
+                    snap(content_size.width * r.width - px(inset * 2.0)),
+                    snap(content_size.height * r.height - px(inset * 2.0 + PANE_TITLE_BAR)),
                 );
                 (*id, Bounds::new(origin, area_size))
             })
             .collect();
+        // pane_text_areas は全ウィンドウ共有（Issue #339）: 自ウィンドウの表示タブ分を
+        // 差し替え、他ウィンドウが表示中のタブの分は残す（同一タブは 1 ウィンドウのみ
+        // 表示なのでキー空間は排他）。非表示タブ・消えたペインの残骸はここで掃除する
+        let visible_tabs: std::collections::HashSet<TabId> = self
+            .workspace
+            .windows()
+            .iter()
+            .map(|w| w.active_tab())
+            .collect();
+        self.pane_text_areas.retain(|(pid, _)| {
+            self.workspace
+                .find_tab_of_pane(*pid)
+                .is_some_and(|t| t != display_tab && visible_tabs.contains(&t))
+        });
+        self.pane_text_areas.extend(new_areas);
 
         let drop_layout = layout.clone();
         let panes: Vec<_> = layout
@@ -12331,7 +13208,8 @@ impl Render for TakoApp {
         let origin_y = f32::from(content_origin.y);
         let border_handles: Vec<_> = self
             .workspace
-            .active_tab()
+            .get_tab(display_tab)
+            .unwrap_or_else(|| self.workspace.active_tab())
             .tree()
             .borders(border_rect)
             .into_iter()
@@ -12466,6 +13344,25 @@ impl Render for TakoApp {
             .text_size(px(theme.font_size))
             .track_focus(&self.focus_handle)
             .key_context("TakoApp")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    let mut changed = false;
+                    if this.webview_dock_url_focused {
+                        this.webview_dock_url_focused = false;
+                        changed = true;
+                    }
+                    if this.webview_address_bar_active.is_some() {
+                        if let Some(pane_id) = this.webview_address_bar_active.take() {
+                            this.webview_address_bar.remove(&pane_id.as_u64());
+                        }
+                        changed = true;
+                    }
+                    if changed {
+                        cx.notify();
+                    }
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &SplitRight, _, cx| this.split(SplitDirection::Right, cx)),
             )
@@ -12474,6 +13371,7 @@ impl Render for TakoApp {
             )
             .on_action(cx.listener(|this, _: &ClosePane, _, cx| this.close_focused_pane(cx)))
             .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_tab(cx)))
+            .on_action(cx.listener(|this, _: &NewWindow, _, cx| this.new_viewport_window(cx)))
             .on_action(cx.listener(|this, _: &NextTab, _, cx| {
                 this.workspace.activate_next_tab();
                 this.sync_filetree_roots();
@@ -12576,7 +13474,16 @@ impl Render for TakoApp {
             .on_action(cx.listener(|this, _: &OpenRecent, _, cx| {
                 this.open_recent_palette(cx);
             }))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                // blur（外部 a11y 等）からの自動復元（#332）: focus が無いと
+                // input handler が未登録になり日本語 IM の printable キーが IME を
+                // 素通りする。キーイベント自体は blur 中も root dispatch フォール
+                // バックで届く（#103 で実証）ため、打鍵を検知したら focus を戻す。
+                // draw 停止中（不可視ウィンドウ）でも効く復元経路
+                if !this.focus_handle.is_focused(window) {
+                    window.focus(&this.focus_handle.clone(), cx);
+                    window.invalidate_character_coordinates();
+                }
                 this.handle_key(&event.keystroke, cx);
             }))
             .on_modifiers_changed(cx.listener(
@@ -12626,9 +13533,9 @@ impl Render for TakoApp {
             .children(pane_context_overlay)
             .children(hover_preview_overlay)
             .children(pinned_overlays)
+            .children(self.render_limit_service_overlay(cx))
             .children(self.render_close_confirm_dialog(cx))
             .children(self.render_remote_overlay(cx))
-            .children(self.render_attention_toasts(cx))
             .children(self.render_command_palette(cx))
     }
 }
@@ -12964,13 +13871,6 @@ fn tako_titlebar_options() -> gpui::TitlebarOptions {
     }
 }
 
-fn open_new_window(cx: &mut App) {
-    open_window_with_bounds(
-        WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx)),
-        cx,
-    );
-}
-
 /// 保存済みレイアウトから復元してウインドウを開く（#312: Dock クリックでの復帰用）
 fn open_restored_window(cx: &mut App) {
     let saved_frame = tako_control::layout::load().and_then(|l| l.window);
@@ -12985,31 +13885,68 @@ fn open_restored_window(cx: &mut App) {
         }
         _ => WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx)),
     };
-    open_window_with_bounds(bounds, cx);
+    open_primary_window(bounds, cx);
 }
 
-fn open_window_with_bounds(window_bounds: WindowBounds, cx: &mut App) {
-    let _ = cx
-        .open_window(
-            WindowOptions {
-                window_bounds: Some(window_bounds),
-                titlebar: Some(tako_titlebar_options()),
-                ..Default::default()
-            },
-            |window, cx| {
-                let view = cx.new(TakoApp::new);
-                window.focus(&view.read(cx).focus_handle.clone(), cx);
-                // 赤ボタン close 時にレイアウトを保存する（#312。quit ではなく
-                // ウインドウ単体の close なので on_app_quit は走らない）
-                let entity = view.clone();
-                window.on_window_should_close(cx, move |_window, cx| {
-                    entity.update(cx, |app, _cx| app.save_layout());
-                    true
-                });
-                view
-            },
-        )
-        .expect("新規ウィンドウを開けなかった");
+/// プライマリウィンドウを開く（TakoApp entity を新規作成する経路: 初回起動・Dock 復帰）。
+/// 追加ウィンドウは `open_viewport_window`（同一 entity 共有。Issue #339）を使う。
+/// 赤ボタン close の挙動は `TakoApp::handle_window_close`（複数ウィンドウなら
+/// タブ合流のみ、最後の 1 枚なら #312 の layout 保存 + primary 解放）
+fn open_primary_window(window_bounds: WindowBounds, cx: &mut App) -> gpui::WindowHandle<TakoApp> {
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(window_bounds),
+            titlebar: Some(tako_titlebar_options()),
+            ..Default::default()
+        },
+        |window, cx| {
+            let view = cx.new(TakoApp::new);
+            let logical = view.read(cx).workspace.active_window_id();
+            view.update(cx, |app, cx| app.register_viewport(logical, window, cx));
+            let entity = view.clone();
+            window.on_window_should_close(cx, move |window, cx| {
+                entity.update(cx, |app, cx| app.handle_window_close(window, cx))
+            });
+            view
+        },
+    )
+    .expect("ウィンドウを開けなかった")
+}
+
+/// 同一 TakoApp entity を root view にした追加ウィンドウを開く（Issue #339 ビューポート
+/// 方式）。GPUI は entity を描画中の全ウィンドウを notify で invalidate するため、
+/// アプリ状態の変更は全ウィンドウへ自動反映される
+fn open_viewport_window(
+    entity: gpui::Entity<TakoApp>,
+    logical: tako_core::WindowId,
+    bounds: Option<WindowBounds>,
+    cx: &mut App,
+) {
+    let bounds = bounds.unwrap_or_else(|| {
+        WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx))
+    });
+    let opened = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(bounds),
+            titlebar: Some(tako_titlebar_options()),
+            ..Default::default()
+        },
+        |window, cx| {
+            entity.update(cx, |app, cx| app.register_viewport(logical, window, cx));
+            let close_entity = entity.clone();
+            window.on_window_should_close(cx, move |window, cx| {
+                close_entity.update(cx, |app, cx| app.handle_window_close(window, cx))
+            });
+            entity.clone()
+        },
+    );
+    if opened.is_err() {
+        eprintln!("warning: 新しいウィンドウを開けなかった");
+        // GPUI ウィンドウの無い論理ウィンドウは操作不能になるため合流で畳む
+        entity.update(cx, |app, _| {
+            let _ = app.workspace.close_window(logical);
+        });
+    }
 }
 
 fn main() {
@@ -13117,6 +14054,7 @@ fn main() {
     // 無ければ保存済みレイアウトから復元して新規ウインドウを開く）
     app.on_reopen(|cx| {
         if cx.windows().is_empty() {
+            persist_diag("on_reopen: ウインドウなし → 復元ウインドウを開く");
             open_restored_window(cx);
             cx.activate(true);
         }
@@ -13125,8 +14063,15 @@ fn main() {
         cx.bind_keys(key_bindings());
         cx.set_menus(app_menus());
         webview::install_key_monitor();
+        // New Window はルート div（TakoApp::new_viewport_window = 同一 entity の
+        // ビューポート追加。Issue #339）が処理する。ここはウィンドウが 1 枚も無い
+        // （全部閉じた後にメニューから New Window）ときだけ届くグローバルフォール
+        // バックで、Dock 復帰（on_reopen）と同じ復元ウィンドウを開く
         cx.on_action(|_: &NewWindow, cx| {
-            open_new_window(cx);
+            if cx.windows().is_empty() {
+                open_restored_window(cx);
+                cx.activate(true);
+            }
         });
         // Quit はグローバルアクションとして登録する（#103: ルート div の on_action
         // だけだとウィンドウのフォーカスパス上でしか発火せず、フォーカス喪失
@@ -13155,26 +14100,7 @@ fn main() {
             }
             _ => WindowBounds::Windowed(Bounds::centered(None, size(px(960.), px(600.)), cx)),
         };
-        let window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(window_bounds),
-                    titlebar: Some(tako_titlebar_options()),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    let view = cx.new(TakoApp::new);
-                    window.focus(&view.read(cx).focus_handle.clone(), cx);
-                    // 赤ボタン close 時にレイアウトを保存（#312）
-                    let entity = view.clone();
-                    window.on_window_should_close(cx, move |_window, cx| {
-                        entity.update(cx, |app, _cx| app.save_layout());
-                        true
-                    });
-                    view
-                },
-            )
-            .expect("ウィンドウを開けなかった");
+        let window = open_primary_window(window_bounds, cx);
         cx.activate(true);
 
         if std::env::var_os("TAKO_VISUAL_TEST").is_some() {
@@ -14117,13 +15043,19 @@ mod self_test {
             wait(cx, 1000).await;
             check(focused_contains(window, cx, "TAKO-INPUT-OK"), "入力エコー");
 
-            // 1b. TERM / COLORTERM 注入（tmux 等の「missing or unsuitable terminal」回避）
+            // 1b. TERM / COLORTERM 注入（tmux 等の「missing or unsuitable terminal」回避）。
+            //     高負荷環境（worker のビルド並走等）ではエコー反映が 800ms を超えることが
+            //     あるため、リトライループで待つ（フレーキー対策。項目 17 と同型）
             type_text(any, cx, "echo TERMCHK=$TERM,$COLORTERM", true);
-            wait(cx, 800).await;
-            check(
-                focused_contains(window, cx, "TERMCHK=xterm-256color,truecolor"),
-                "TERM / COLORTERM 注入",
-            );
+            let mut term_ok = false;
+            for _ in 0..8 {
+                wait(cx, 800).await;
+                term_ok = focused_contains(window, cx, "TERMCHK=xterm-256color,truecolor");
+                if term_ok {
+                    break;
+                }
+            }
+            check(term_ok, "TERM / COLORTERM 注入");
 
             // 1c. 初期 cwd はホーム（.app 起動時に `/` へ落ちない）
             type_text(any, cx, "[ \"$PWD\" = \"$HOME\" ] && echo CWDCHK-$((40+2))", true);
@@ -14351,26 +15283,35 @@ mod self_test {
                 "cmd-t で新タブ",
             );
 
-            // 8. 色つき出力（ANSI 赤）が Theme の赤へ解決される
+            // 8. 色つき出力（ANSI 赤）が Theme の赤へ解決される。
+            //    新タブ直後の初回コマンドは高負荷環境でシェル初期化が 1 秒を超えることが
+            //    あるため、リトライループで待つ（フレーキー対策。項目 17 と同型）
             type_text(any, cx, r"printf '\e[31mTAKO-RED\e[0m\n'", true);
-            wait(cx, 1000).await;
-            let red_ok = window
-                .update(cx, |app, _, _| {
-                    let theme = app.theme.clone();
-                    app.focused_session()
-                        .map(|s| {
-                            let screen = s.screen(&theme);
-                            screen.lines.iter().any(|line| {
-                                line.text.contains("TAKO-RED")
-                                    && line.runs.iter().any(|run| {
-                                        run.fg == theme.red
-                                            && line.text[run.range.clone()].contains("TAKO-RED")
-                                    })
+            let mut red_ok = false;
+            for _ in 0..8 {
+                wait(cx, 1000).await;
+                red_ok = window
+                    .update(cx, |app, _, _| {
+                        let theme = app.theme.clone();
+                        app.focused_session()
+                            .map(|s| {
+                                let screen = s.screen(&theme);
+                                screen.lines.iter().any(|line| {
+                                    line.text.contains("TAKO-RED")
+                                        && line.runs.iter().any(|run| {
+                                            run.fg == theme.red
+                                                && line.text[run.range.clone()]
+                                                    .contains("TAKO-RED")
+                                        })
+                                })
                             })
-                        })
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if red_ok {
+                    break;
+                }
+            }
             check(red_ok, "ANSI 赤の解決");
 
             // 9. スクロールバック表示
@@ -14523,43 +15464,61 @@ mod self_test {
 
             // 18. tako split --down --focus（呼び出し元の自動特定 + origin=cli + フォーカス移動）。
             // 既定はフォーカスを分割元に維持する仕様（3c9d363）のため、--focus を明示して
-            // 新ペインへ移す（後続テストは新ペインからの入力を前提とする）
+            // 新ペインへ移す（後続テストは新ペインからの入力を前提とする）。
+            // ペイン数が増えるまでリトライで待つ（項目 17 と同型のフレーキー対策）
             type_text(any, cx, &format!("{cli} split --down --focus"), true);
-            wait(cx, 1500).await;
-            let (pane_count, pane4, origin_cli) = window
-                .update(cx, |app, _, _| {
-                    let tree = app.workspace.active_tab().tree();
-                    let focused = tree.focused();
-                    (
-                        tree.len(),
-                        focused,
-                        tree.get(focused).map(|p| p.origin()) == Some(PaneOrigin::Cli),
-                    )
-                })
-                .unwrap_or_else(|_| fail("tako split 後の状態取得"));
+            let mut split_state = None;
+            for _ in 0..8 {
+                wait(cx, 1500).await;
+                let state = window
+                    .update(cx, |app, _, _| {
+                        let tree = app.workspace.active_tab().tree();
+                        let focused = tree.focused();
+                        (
+                            tree.len(),
+                            focused,
+                            tree.get(focused).map(|p| p.origin()) == Some(PaneOrigin::Cli),
+                        )
+                    })
+                    .unwrap_or_else(|_| fail("tako split 後の状態取得"));
+                let done = state.0 == 2;
+                split_state = Some(state);
+                if done {
+                    break;
+                }
+            }
+            let (pane_count, pane4, origin_cli) =
+                split_state.unwrap_or_else(|| fail("tako split 後の状態取得"));
             check(pane_count == 2, "tako split で 2 ペイン");
             check(pane4 != pane2, "split --focus 後フォーカスは新ペイン");
             check(origin_cli, "新ペインの origin は cli");
 
-            // 19. tako send で別ペインへコマンドを流し込む（FR-2.2.2。pane4 から pane2 へ）
+            // 19. tako send で別ペインへコマンドを流し込む（FR-2.2.2。pane4 から pane2 へ）。
+            //     debug CLI 起動 + IPC 往復は高負荷時に 1 秒を超えるためリトライで待つ（項目 17 と同型）
             type_text(
                 any,
                 cx,
                 &format!("{cli} send --pane {pane2} 'echo TAKO-SEND-$((40+2))'"),
                 true,
             );
-            wait(cx, 1200).await;
-            let sent = window
-                .update(cx, |app, _, _| {
-                    app.terminals
-                        .get(&pane2)
-                        .map(|s| s.visible_lines().iter().any(|l| l.contains("TAKO-SEND-42")))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
+            let mut sent = false;
+            for _ in 0..8 {
+                wait(cx, 1200).await;
+                sent = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&pane2)
+                            .map(|s| s.visible_lines().iter().any(|l| l.contains("TAKO-SEND-42")))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if sent {
+                    break;
+                }
+            }
             check(sent, "tako send で別ペインへ送信");
 
-            // 20. tako read で別ペインの画面内容を取得する（FR-2.2.5）
+            // 20. tako read で別ペインの画面内容を取得する（FR-2.2.5。リトライは項目 17 と同型）
             type_text(
                 any,
                 cx,
@@ -14568,8 +15527,15 @@ mod self_test {
                 ),
                 true,
             );
-            wait(cx, 1000).await;
-            check(focused_contains(window, cx, "TAKO-READ-42"), "tako read");
+            let mut read_ok = false;
+            for _ in 0..8 {
+                wait(cx, 1000).await;
+                read_ok = focused_contains(window, cx, "TAKO-READ-42");
+                if read_ok {
+                    break;
+                }
+            }
+            check(read_ok, "tako read");
 
             // 21. tako title --role（FR-2.2.6 / FR-2.1.3）
             type_text(
@@ -14778,15 +15744,56 @@ mod self_test {
                 .unwrap_or_else(|| fail("MCP initialized 通知"));
             check(status == 202, "MCP 通知は 202");
 
-            // 32. tools/list が FR-2.5 の操作セットを公開している
+            // 32. tools/list のスナップショット検証（#358）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], TOOLS_LIST_MSG)
                 .await
                 .unwrap_or_else(|| fail("MCP tools/list 接続"));
-            let tool_count = serde_json::from_str::<serde_json::Value>(&response)
-                .ok()
-                .and_then(|v| v["result"]["tools"].as_array().map(|t| t.len()))
-                .unwrap_or(0);
-            check(status == 200 && tool_count == 101, "MCP tools/list は 101 ツール");
+            let tools_ok = {
+                const SNAPSHOT: &str =
+                    include_str!("../testdata/mcp_tools_snapshot.txt");
+                let expected: Vec<&str> =
+                    SNAPSHOT.lines().filter(|l| !l.is_empty()).collect();
+                let mut actual: Vec<String> = serde_json::from_str::<serde_json::Value>(&response)
+                    .ok()
+                    .and_then(|v| {
+                        v["result"]["tools"].as_array().map(|arr| {
+                            arr.iter()
+                                .filter_map(|t| t["name"].as_str().map(String::from))
+                                .collect()
+                        })
+                    })
+                    .unwrap_or_default();
+                actual.sort();
+                let ok = status == 200 && actual.iter().map(|s| s.as_str()).collect::<Vec<_>>() == expected;
+                if !ok {
+                    let actual_set: std::collections::HashSet<&str> =
+                        actual.iter().map(|s| s.as_str()).collect();
+                    let expected_set: std::collections::HashSet<&str> =
+                        expected.iter().copied().collect();
+                    let added: Vec<&&str> = actual_set.difference(&expected_set).collect();
+                    let removed: Vec<&&str> = expected_set.difference(&actual_set).collect();
+                    eprintln!("[selftest 32] MCP ツールスナップショット不一致:");
+                    if !added.is_empty() {
+                        eprintln!("  追加（スナップショット未登録）: {:?}", added);
+                    }
+                    if !removed.is_empty() {
+                        eprintln!("  削除（スナップショットに残存）: {:?}", removed);
+                    }
+                    eprintln!(
+                        "  → TAKO_UPDATE_SNAPSHOT=1 cargo run -p tako-app で再生成してください"
+                    );
+                    // TAKO_UPDATE_SNAPSHOT=1 なら実態でスナップショットを上書き
+                    if std::env::var("TAKO_UPDATE_SNAPSHOT").is_ok() {
+                        let snap_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("testdata/mcp_tools_snapshot.txt");
+                        let content = actual.join("\n") + "\n";
+                        let _ = std::fs::write(&snap_path, &content);
+                        eprintln!("  → スナップショットを更新しました: {}", snap_path.display());
+                    }
+                }
+                ok || std::env::var("TAKO_UPDATE_SNAPSHOT").is_ok()
+            };
+            check(tools_ok, "MCP tools/list スナップショット検証");
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -15209,28 +16216,56 @@ mod self_test {
                 })
                 .unwrap_or(false);
             check(osc_cwd_ok, "シェル統合の OSC 7 で cwd 検知");
-            type_text(any, cx, "sleep 2", true);
-            wait(cx, 700).await;
-            let osc_running = window
-                .update(cx, |app, _, _| {
-                    app.terminals
-                        .get(&app.focused_pane())
-                        .map(|s| s.command_state() == CommandState::Running)
-                        == Some(true)
-                })
-                .unwrap_or(false);
+            // 実行中状態の検知: sleep 5 の実行ウィンドウ内で Running への遷移をポーリングで
+            // 捕まえる（高負荷時はコマンド開始自体が 1 秒超遅れるため。項目 17 と同型の対策）
+            type_text(any, cx, "sleep 5", true);
+            let mut osc_running = false;
+            for _ in 0..12 {
+                wait(cx, 300).await;
+                osc_running = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&app.focused_pane())
+                            .map(|s| s.command_state() == CommandState::Running)
+                            == Some(true)
+                    })
+                    .unwrap_or(false);
+                if osc_running {
+                    break;
+                }
+            }
             check(osc_running, "実行中コマンドが running");
-            wait(cx, 1800).await; // sleep 2 の完了を待つ
+            // sleep 5 の完了（Running でなくなる）を待ってから失敗コマンドへ
+            for _ in 0..10 {
+                wait(cx, 800).await;
+                let done = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&app.focused_pane())
+                            .map(|s| s.command_state() != CommandState::Running)
+                            == Some(true)
+                    })
+                    .unwrap_or(false);
+                if done {
+                    break;
+                }
+            }
             type_text(any, cx, "false", true);
-            wait(cx, 800).await;
-            let osc_failed = window
-                .update(cx, |app, _, _| {
-                    app.terminals
-                        .get(&app.focused_pane())
-                        .map(|s| s.command_state() == CommandState::Failed(1))
-                        == Some(true)
-                })
-                .unwrap_or(false);
+            let mut osc_failed = false;
+            for _ in 0..8 {
+                wait(cx, 800).await;
+                osc_failed = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&app.focused_pane())
+                            .map(|s| s.command_state() == CommandState::Failed(1))
+                            == Some(true)
+                    })
+                    .unwrap_or(false);
+                if osc_failed {
+                    break;
+                }
+            }
             check(osc_failed, "失敗コマンドで failed（プロンプト後も保持）");
             // 開発不変条件: 検知した状態は list（CLI / MCP 共有の dispatch）からも見える
             let list_exposes = window
@@ -15898,17 +16933,23 @@ mod self_test {
                 .unwrap_or_else(|_| fail("FR-2.12 開始時の状態取得"));
             press(any, cx, "ctrl-u");
             type_text(any, cx, &format!("{cli} tab rename 実験タブ"), true);
-            wait(cx, 1000).await;
-            let renamed = window
-                .update(cx, |app, _, _| {
-                    app.workspace
-                        .get_tab(active_tab)
-                        .map(|t| {
-                            t.title() == "実験タブ" && t.title_source() == TitleSource::Manual
-                        })
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
+            let mut renamed = false;
+            for _ in 0..15 {
+                wait(cx, 200).await;
+                renamed = window
+                    .update(cx, |app, _, _| {
+                        app.workspace
+                            .get_tab(active_tab)
+                            .map(|t| {
+                                t.title() == "実験タブ" && t.title_source() == TitleSource::Manual
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if renamed {
+                    break;
+                }
+            }
             check(renamed, "tako tab rename（手動扱い）");
 
             // 51. 自動リネームの適用と手動優先（FR-2.12.3）: 手動のタブ・ペインは
@@ -16204,11 +17245,17 @@ mod self_test {
                 ),
                 true,
             );
-            wait(cx, 1200).await;
-            check(
-                focused_contains(window, cx, "TAKO-PS-58"),
-                "tako persist on / 状態取得",
-            );
+            // debug CLI 3 連発 + IPC 往復のため固定待ちでは不足することがある
+            // （リトライは項目 17 と同型のフレーキー対策）
+            let mut persist_status_ok = false;
+            for _ in 0..8 {
+                wait(cx, 1200).await;
+                persist_status_ok = focused_contains(window, cx, "TAKO-PS-58");
+                if persist_status_ok {
+                    break;
+                }
+            }
+            check(persist_status_ok, "tako persist on / 状態取得");
             let persist_on = window
                 .update(cx, |app, _, _| app.tmux_persist)
                 .unwrap_or(false);
@@ -16387,9 +17434,14 @@ mod self_test {
                     "バックエンドのホイールがミラー表示に乗る（copy-mode 不使用）",
                 );
 
-                // 61c. スクロールバーはスクロール中だけ表示され、時間経過でフェードする
+                // 61c. スクロールバーはスクロール中だけ表示され、時間経過でフェードする。
+                //      直前 61b の確認リトライが長引くとフェード時間を過ぎてしまうため、
+                //      「スクロール活動直後」の状態を明示的に再現してから判定する（決定化）
                 let bar_visible = window
                     .update(cx, |app, _, _| {
+                        if let Some(ctl) = app.scroll_ctls.get_mut(&backend_pane) {
+                            ctl.last_activity = std::time::Instant::now();
+                        }
                         let area = app
                             .pane_text_areas
                             .iter()
@@ -18508,6 +19560,59 @@ mod self_test {
                     }
                 }
                 check(view_ready, "TmuxOpen ペインに外部セッションの画面が映る");
+
+                // 78. Web dock URL 入力欄のフォーカスと入力 (#375)
+                let url_input_ok = window
+                    .update(cx, |app, _, cx| {
+                        app.webview_dock_open = true;
+                        app.webview_dock_url_focused = true;
+                        app.webview_dock_url_input.clear();
+                        app.webview_dock_url_cursor = 0;
+                        cx.notify();
+                        let opened = app.webview_dock_open && app.webview_dock_url_focused;
+                        let char_ks = |c: &str| Keystroke {
+                            modifiers: Modifiers::default(),
+                            key: c.to_string(),
+                            key_char: Some(c.to_string()),
+                        };
+                        app.handle_webview_dock_url_key(&char_ks("e"), cx);
+                        app.handle_webview_dock_url_key(&char_ks("x"), cx);
+                        let typed = app.webview_dock_url_input == "ex";
+                        app.handle_webview_dock_url_key(
+                            &Keystroke::parse("backspace").unwrap(),
+                            cx,
+                        );
+                        let bs_ok = app.webview_dock_url_input == "e";
+                        app.webview_dock_url_input = "example.com".into();
+                        app.webview_dock_url_cursor = 11;
+                        app.handle_webview_dock_url_key(
+                            &Keystroke::parse("enter").unwrap(),
+                            cx,
+                        );
+                        let enter_closed = !app.webview_dock_url_focused;
+                        app.webview_dock_open = true;
+                        app.webview_dock_url_focused = true;
+                        app.webview_dock_url_input = "test".into();
+                        app.handle_webview_dock_url_key(
+                            &Keystroke::parse("escape").unwrap(),
+                            cx,
+                        );
+                        let esc_ok = !app.webview_dock_url_focused
+                            && !app.webview_dock_open
+                            && app.webview_dock_url_input.is_empty();
+                        app.webview_dock_open = false;
+                        app.webview_dock_url_focused = false;
+                        app.webview_dock_url_input.clear();
+                        app.webview_dock_url_cursor = 0;
+                        cx.notify();
+                        opened && typed && bs_ok && enter_closed && esc_ok
+                    })
+                    .unwrap_or(false);
+                check(
+                    url_input_ok,
+                    "Web dock URL 入力: フォーカス + 手打ち + BS + Enter + Esc (#375)",
+                );
+
                 // ホイール = ミラー表示 + スクロールバー表示（#159 と同じ機構に乗る）
                 window
                     .update(cx, |app, win, cx| {
@@ -19877,6 +20982,156 @@ mod self_test {
                 check(tab_ok, "確認ダイアログ: タブの × でダイアログ表示 + キャンセル");
             }
 
+            // 76. IME 経路の自己修復（#332）: 外部要因（a11y の Blur アクション等）で
+            // window.blur() が起きても、次のキー打鍵で focus が TakoApp へ復元される
+            // （on_key_down 冒頭の復元。キーは blur 中も root dispatch フォール
+            // バックで届く = #103 実証）。復元されないと Window::handle_input が
+            // input handler を登録しなくなり、日本語 IM の printable キーが IME を
+            // 素通りして ASCII のまま terminal へ入り続ける（候補ウィンドウが再起動
+            // まで出ない）。可視ウィンドウでは on_focus_lost（draw 末尾）が打鍵前に
+            // 復元するが、このセルフテスト環境は draw が止まり得るため打鍵経路で検証
+            // する。修正前はこの check が FAILED = blur が恒久化していた
+            let _ = any.update(cx, |_, window, _| window.blur());
+            let mut blurred = false;
+            for _ in 0..10 {
+                wait(cx, 50).await;
+                blurred = window
+                    .update(cx, |app, window, _| !app.focus_handle.is_focused(window))
+                    .unwrap_or(false);
+                if blurred {
+                    break;
+                }
+            }
+            press(any, cx, "escape");
+            let mut refocused = false;
+            for _ in 0..15 {
+                wait(cx, 100).await;
+                refocused = window
+                    .update(cx, |app, window, _| app.focus_handle.is_focused(window))
+                    .unwrap_or(false);
+                if refocused {
+                    break;
+                }
+            }
+            check(
+                blurred && refocused,
+                "IME 経路: blur 後の focus 自己修復 (#332)",
+            );
+
+            // 76b. 変換中ペインの close で IME 状態が畳まれる（#332）。
+            // 畳まれないと ime_target / 確定書き込みが死んだペインへ向き続け、
+            // 候補ウィンドウの位置出しと確定文字列の宛先が壊れる
+            let _ = window.update(cx, |app, _, cx| app.split(SplitDirection::Right, cx));
+            wait(cx, 1200).await;
+            let ime_close_ok = window
+                .update(cx, |app, window, cx| {
+                    let target = app.focused_pane();
+                    app.replace_and_mark_text_in_range(None, "へんかん", None, window, cx);
+                    let composing = app.ime.is_some();
+                    app.remove_pane(target, cx);
+                    let cleared = app.ime.is_none();
+                    // 畳んだ後の ime_target がフォーカスペインへ解決されることも固定
+                    let target_ok = app.ime_target() == app.focused_pane();
+                    composing && cleared && target_ok
+                })
+                .unwrap_or(false);
+            check(ime_close_ok, "IME 状態: 変換中ペインの close で畳まれる (#332)");
+
+            // 77. 複数ウィンドウ（#339 ビューポート方式）: CLI で window new →
+            //     論理 + GPUI ウィンドウが増え同一 TakoApp entity を共有 → タブは
+            //     ウィンドウ間で排他 → move-tab で合流すると空ウィンドウが自動 close
+            let win_before = window
+                .update(cx, |app, _, cx| {
+                    (app.workspace.windows().len(), cx.windows().len())
+                })
+                .unwrap_or((0, 0));
+            let new_ok = window
+                .update(cx, |app, _, cx| {
+                    let r = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::WindowNew { tab: None },
+                        tako_core::PaneOrigin::Cli,
+                    );
+                    // IPC ループの後処理相当（pending 消費 + GPUI ウィンドウ同期）
+                    for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                        let _ = app.spawn_session(pane, options, cx);
+                    }
+                    app.sync_viewports(cx);
+                    r.is_ok()
+                })
+                .unwrap_or(false);
+            check(new_ok, "window new の dispatch が成功する (#339)");
+            wait(cx, 1500).await;
+            let (logical_after, gpui_after, new_tab, tabs_exclusive) = window
+                .update(cx, |app, _, cx| {
+                    let logical = app.workspace.windows().len();
+                    let gpui = cx.windows().len();
+                    let active_win = app.workspace.active_window_id();
+                    let new_tab = app
+                        .workspace
+                        .get_window(active_win)
+                        .map(|w| w.active_tab());
+                    // 全タブがちょうど 1 つのウィンドウに属する（排他）
+                    let sum: usize = app
+                        .workspace
+                        .windows()
+                        .iter()
+                        .map(|w| app.workspace.window_tab_ids(w.id()).len())
+                        .sum();
+                    (logical, gpui, new_tab, app.workspace.tabs().len() == sum)
+                })
+                .unwrap_or((0, 0, None, false));
+            check(
+                logical_after == win_before.0 + 1 && gpui_after == win_before.1 + 1,
+                "window new: 論理 + GPUI ウィンドウが 1 枚増える (#339)",
+            );
+            check(tabs_exclusive, "window: タブはウィンドウ間で排他 (#339)");
+            let first_window = window
+                .update(cx, |app, _, _| app.workspace.windows()[0].id().as_u64())
+                .unwrap_or(0);
+            let moved_tab = new_tab.map(|t| t.as_u64()).unwrap_or(0);
+            let move_ok = window
+                .update(cx, |app, _, cx| {
+                    let r = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::WindowMoveTab {
+                            tab: moved_tab,
+                            window: first_window,
+                        },
+                        tako_core::PaneOrigin::Cli,
+                    );
+                    app.sync_viewports(cx);
+                    r.is_ok()
+                })
+                .unwrap_or(false);
+            check(move_ok, "window move-tab の dispatch が成功する (#339)");
+            wait(cx, 1500).await;
+            let (logical_end, gpui_end, tab_moved) = window
+                .update(cx, |app, _, cx| {
+                    (
+                        app.workspace.windows().len(),
+                        cx.windows().len(),
+                        app.workspace
+                            .window_of_tab(TabId::from_raw(moved_tab))
+                            .map(|w| w.as_u64()),
+                    )
+                })
+                .unwrap_or((0, 0, None));
+            check(
+                logical_end == win_before.0
+                    && gpui_end == win_before.1
+                    && tab_moved == Some(first_window),
+                "window move-tab: タブ合流 + 空ウィンドウ自動 close (#339)",
+            );
+            // 後始末: 合流させたタブを閉じてレイアウトを戻す
+            let _ = window.update(cx, |app, _, cx| {
+                let tab = TabId::from_raw(moved_tab);
+                if let Some(pane) = app.workspace.get_tab(tab).map(|t| t.tree().focused()) {
+                    app.remove_pane(pane, cx);
+                }
+            });
+            wait(cx, 800).await;
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -19913,22 +21168,7 @@ fn has_git_ancestor(dir: &std::path::Path) -> bool {
 }
 
 fn find_git_root(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let root = String::from_utf8(output.stdout).ok()?;
-    let root = root.trim();
-    if root.is_empty() {
-        return None;
-    }
-    Some(std::path::PathBuf::from(root))
+    tako_core::git::repo_root(dir)
 }
 
 fn shell_escape(path: &std::path::Path) -> String {
@@ -19975,6 +21215,45 @@ fn accumulate_scroll(carry: f32, delta_lines: f32) -> (i32, f32) {
     let total = carry + delta_lines;
     let lines = total.trunc() as i32;
     (lines, total - lines as f32)
+}
+
+#[cfg(test)]
+mod ime_tests {
+    use super::resolve_ime_pane;
+    use tako_core::PaneId;
+
+    // #332: IME 変換状態の対象ペイン解決。変換開始ペインが閉じられた後も
+    // 死んだペインへ向け続けると、候補ウィンドウの位置出し（bounds_for_range が
+    // カーソル解決に失敗してコンテンツ左上へフォールバック）と確定文字列の宛先
+    // （terminals.get = None で入力が虚空へ消える）が壊れる
+
+    #[test]
+    fn 変換中は開始ペインを対象にする() {
+        let started = PaneId::from_raw(1);
+        let focused = PaneId::from_raw(2);
+        assert_eq!(
+            resolve_ime_pane(Some(started), |_| true, focused),
+            started,
+            "生きている開始ペインが対象（変換途中のフォーカス移動で確定先がぶれない）"
+        );
+    }
+
+    #[test]
+    fn 開始ペインが閉じられていたらフォーカスペインへ倒す() {
+        let dead = PaneId::from_raw(1);
+        let focused = PaneId::from_raw(2);
+        assert_eq!(
+            resolve_ime_pane(Some(dead), |_| false, focused),
+            focused,
+            "死んだペインを対象にし続けない（#332 の stale 防御）"
+        );
+    }
+
+    #[test]
+    fn 非変換中はフォーカスペインを対象にする() {
+        let focused = PaneId::from_raw(2);
+        assert_eq!(resolve_ime_pane(None, |_| true, focused), focused);
+    }
 }
 
 #[cfg(test)]
@@ -20344,6 +21623,33 @@ mod drag_scroll_tests {
         for i in 1..=10 {
             let factor = i as f32 / 10.0;
             let delta = drag_scroll_delta(factor);
+            assert!(delta > prev, "factor={factor}: {delta} <= {prev}");
+            prev = delta;
+        }
+    }
+
+    // --- PDF プレビュー用（#309） ---
+
+    #[test]
+    fn pdf_最小速度係数では最小ピクセル速度になる() {
+        let delta = drag_scroll_delta_px(0.0);
+        let expected = DRAG_SCROLL_MIN_PX_PER_SEC * (DRAG_SCROLL_INTERVAL_MS as f32 / 1000.0);
+        assert!((delta - expected).abs() < 0.01);
+    }
+
+    #[test]
+    fn pdf_最大速度係数では最大ピクセル速度になる() {
+        let delta = drag_scroll_delta_px(1.0);
+        let expected = DRAG_SCROLL_MAX_PX_PER_SEC * (DRAG_SCROLL_INTERVAL_MS as f32 / 1000.0);
+        assert!((delta - expected).abs() < 0.01);
+    }
+
+    #[test]
+    fn pdf_速度は単調増加する() {
+        let mut prev = drag_scroll_delta_px(0.0);
+        for i in 1..=10 {
+            let factor = i as f32 / 10.0;
+            let delta = drag_scroll_delta_px(factor);
             assert!(delta > prev, "factor={factor}: {delta} <= {prev}");
             prev = delta;
         }

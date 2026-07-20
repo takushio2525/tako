@@ -1258,7 +1258,6 @@ impl TakoApp {
                                     if let Some(e) = entity.upgrade() {
                                         cx.defer(move |cx| {
                                             e.update(cx, |app, cx| {
-                                                // ページ画像 bounds を直接記録（#315）
                                                 app.preview_pdf_page_image_bounds
                                                     .entry(pane_id)
                                                     .or_default()
@@ -2701,8 +2700,12 @@ impl TakoApp {
                 self.preview_line_texts.insert(pane_id, line_texts);
                 // bounds 追跡用にリセット（各行の canvas で上書きされる）
                 self.preview_line_bounds.insert(pane_id, Vec::new());
-                self.preview_pdf_page_image_bounds
-                    .insert(pane_id, HashMap::new());
+                // #315 根治: preview_pdf_page_image_bounds を render のたびにクリアしない。
+                // canvas paint の cx.defer() で上書きされるが、クリア→再記録の間の
+                // タイミング窓で update_pdf_link_hover が空 map を参照し、ホバーが
+                // 効かないバグの根因だった（release ビルドの .app 環境で顕在化）。
+                // 古い bounds は同じフレームの paint で上書きされるため実害なし。
+                // ペイン削除時は remove_pane_with で除去される。
                 self.preview_text_layouts.insert(pane_id, line_layouts);
                 let scroll_handle = self
                     .preview_scroll_handles
@@ -2834,6 +2837,9 @@ impl TakoApp {
                         cx.listener(move |this, _ev: &MouseUpEvent, _, _cx| {
                             if this.preview_selecting == Some(pane_id) {
                                 this.preview_selecting = None;
+                                if this.drag_scroll.as_ref().is_some_and(|s| s.preview) {
+                                    this.drag_scroll = None;
+                                }
                             }
                         }),
                     )
@@ -2848,6 +2854,8 @@ impl TakoApp {
                                 this.sync_editor_selection_from_preview(pane_id);
                                 cx.notify();
                             }
+                            // ドラッグ選択中の端到達自動スクロール（#309）
+                            this.update_preview_drag_scroll(pane_id, ev.position, cx);
                         }
                     }))
                     .children(body)

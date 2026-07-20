@@ -85,13 +85,20 @@ impl TakoApp {
         let ctx_fill_frac = ctx_pct as f32 / 100.0;
         let ctx_detail = self.agent_metrics.ctx_detail.clone();
         let usage_text = self.agent_metrics.usage_text.clone();
-        let limit_5h = self.agent_metrics.limit_5h;
-        let limit_week = self.agent_metrics.limit_week;
+        let claude_5h = self.agent_metrics.limit_5h;
+        let claude_week = self.agent_metrics.limit_week;
+        let codex_primary = self.codex_metrics.limit_5h;
+        let codex_secondary = self.codex_metrics.limit_week;
         let selected_limit_service = self.limit_service;
-        let limit_menu_open = self.limit_service_menu_open;
+        // 選択中のサービスに応じてメーター表示データを選択（#357）
+        let (limit_5h, limit_week) = match selected_limit_service {
+            LimitService::Claude => (claude_5h, claude_week),
+            LimitService::Codex => (codex_primary, codex_secondary),
+            LimitService::Agy => (None, None),
+        };
         // リミット表示があるとき、usage_text が同じ「Nh NN%」なら重複表示を避ける
         let usage_text = usage_text.filter(|t| {
-            limit_5h.is_none() || t.contains('$') || t.contains('k') || t.contains('K')
+            claude_5h.is_none() || t.contains('$') || t.contains('k') || t.contains('K')
         });
         // リミットの色（カンプ: >=90 red / >=70 yellow / 通常 text_tertiary）
         let limit_color = |v: u32| {
@@ -373,8 +380,7 @@ impl TakoApp {
             .children(self.render_update_banner(&theme, cx))
             // 利用リミットメーター（Issue #321: サービス切替ドロップダウン + 「7d」表記）
             .child({
-                let has_data = selected_limit_service == LimitService::Claude
-                    && (limit_5h.is_some() || limit_week.is_some());
+                let has_data = limit_5h.is_some() || limit_week.is_some();
                 let meter = |label: &'static str, v: u32| {
                     let color = limit_color(v);
                     div()
@@ -426,15 +432,17 @@ impl TakoApp {
                     .hover(|d| d.bg(rgba(theme.surface_hover)))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|_, _: &gpui::MouseDownEvent, _, cx| {
+                        cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
                             cx.stop_propagation();
+                            this.limit_service_menu_open = !this.limit_service_menu_open;
+                            if this.limit_service_menu_open {
+                                this.limit_service_menu_anchor = Some(event.position);
+                            } else {
+                                this.limit_service_menu_anchor = None;
+                            }
+                            cx.notify();
                         }),
                     )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.limit_service_menu_open = !this.limit_service_menu_open;
-                        cx.notify();
-                    }))
                     // サービスラベル + ドット（視覚的区別）
                     .child(
                         div()
@@ -465,24 +473,30 @@ impl TakoApp {
                                     .text_color(hsla(theme.text_tertiary)),
                             ),
                     )
-                    // メーター（データがあるときだけ）
+                    // メーター（データがあるときだけ。ラベルはサービスで切替。#357）
                     .when(has_data, |d| {
-                        d.children(limit_5h.map(|v| meter("5h", v)))
-                            .children(limit_week.map(|v| meter("7d", v)))
+                        let (l1, l2) = match selected_limit_service {
+                            LimitService::Codex => ("P", "S"),
+                            _ => ("5h", "7d"),
+                        };
+                        d.children(limit_5h.map(|v| meter(l1, v)))
+                            .children(limit_week.map(|v| meter(l2, v)))
                     })
-                    // データがないとき（codex/agy、または claude でデータ未取得）
                     .when(!has_data, |d| {
+                        let label = if selected_limit_service == LimitService::Agy {
+                            "unsupported"
+                        } else {
+                            "--"
+                        };
                         d.child(
                             div()
                                 .text_size(px(10.5))
                                 .text_color(hsla(theme.text_faint))
-                                .child(SharedString::from("--")),
+                                .child(SharedString::from(label)),
                         )
                     })
-                    // ドロップダウンポップアップ
-                    .when(limit_menu_open, |d| {
-                        d.child(self.render_limit_service_menu(limit_5h, limit_week, cx))
-                    })
+                // ドロップダウンメニューはルート div のオーバーレイとして描画
+                // （ステータスバーの overflow_hidden の外へ出すため）
             })
             // usage（カンプ: トレンドアイコン + スパークライン + tok + cost）
             .children(usage_text.map(|text| {
@@ -1054,16 +1068,27 @@ impl TakoApp {
         self.sync_filetree_roots();
     }
 
-    fn render_limit_service_menu(
+    pub(crate) fn render_limit_service_overlay(
         &self,
-        claude_5h: Option<u32>,
-        claude_week: Option<u32>,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> Option<gpui::AnyElement> {
+        if !self.limit_service_menu_open {
+            return None;
+        }
+        let anchor = self.limit_service_menu_anchor?;
+        let claude_5h = self.agent_metrics.limit_5h;
+        let claude_week = self.agent_metrics.limit_week;
+        let codex_primary = self.codex_metrics.limit_5h;
+        let codex_secondary = self.codex_metrics.limit_week;
         let theme = self.theme.clone();
         let selected = self.limit_service;
 
-        let row = |svc: LimitService, h5: Option<u32>, w7: Option<u32>| {
+        let row = |svc: LimitService,
+                   h5: Option<u32>,
+                   w7: Option<u32>,
+                   l1: &'static str,
+                   l2: &'static str,
+                   unsupported: bool| {
             let is_selected = svc == selected;
             let svc_color = match svc {
                 LimitService::Claude => theme.accent,
@@ -1136,6 +1161,7 @@ impl TakoApp {
                     cx.stop_propagation();
                     this.limit_service = svc;
                     this.limit_service_menu_open = false;
+                    this.limit_service_menu_anchor = None;
                     if !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none() {
                         let mut settings = tako_control::settings::load();
                         settings.limit_service = svc.as_str().into();
@@ -1165,52 +1191,122 @@ impl TakoApp {
                         })
                         .child(svc.as_str()),
                 )
-                // 5h メーター
-                .child(meter_inline("5h", h5))
-                // 7d メーター
-                .child(meter_inline("7d", w7))
+                .when(unsupported, |d| {
+                    d.child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(hsla(theme.text_faint))
+                            .child("unsupported"),
+                    )
+                })
+                .when(!unsupported, |d| {
+                    d.child(meter_inline(l1, h5)).child(meter_inline(l2, w7))
+                })
         };
 
-        div()
-            .absolute()
-            .bottom(px(STATUS_BAR_HEIGHT + 4.0))
-            .right(px(0.0))
-            .w(px(340.0))
-            .rounded(px(9.0))
-            .bg(rgba(theme.surface_1))
-            .border_1()
-            .border_color(hsla(theme.border_heavy))
-            .shadow(vec![BoxShadow {
-                color: gpui::hsla(0., 0., 0., 0.5),
-                offset: point(px(0.), px(12.)),
-                blur_radius: px(28.),
-                spread_radius: px(0.),
-                inset: false,
-            }])
-            .overflow_hidden()
-            .occlude()
-            .child(
-                div()
-                    .px(px(11.0))
-                    .pt(px(8.0))
-                    .pb(px(7.0))
-                    .border_b_1()
-                    .border_color(hsla(theme.border_subtle))
-                    .text_size(px(9.5))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(hsla(theme.text_muted))
-                    .child("USAGE LIMITS"),
-            )
-            .child(
-                div()
-                    .p(px(4.0))
-                    .flex()
-                    .flex_col()
-                    .child(row(LimitService::Claude, claude_5h, claude_week))
-                    .child(row(LimitService::Codex, None, None))
-                    .child(row(LimitService::Agy, None, None)),
-            )
-            .into_any_element()
+        let menu_w: f32 = 340.0;
+        let menu_left = anchor.x - px(menu_w);
+
+        // 背面クリックで dismiss + メニュー本体
+        Some(
+            div()
+                .id("limit-service-dismiss")
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.limit_service_menu_open = false;
+                        this.limit_service_menu_anchor = None;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(menu_left.max(px(4.0)))
+                        .bottom(px(STATUS_BAR_HEIGHT + 4.0))
+                        .w(px(menu_w))
+                        .rounded(px(9.0))
+                        .bg(rgba(theme.surface_1))
+                        .border_1()
+                        .border_color(hsla(theme.border_heavy))
+                        .shadow(vec![BoxShadow {
+                            color: gpui::hsla(0., 0., 0., 0.5),
+                            offset: point(px(0.), px(12.)),
+                            blur_radius: px(28.),
+                            spread_radius: px(0.),
+                            inset: false,
+                        }])
+                        .overflow_hidden()
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .px(px(11.0))
+                                .pt(px(8.0))
+                                .pb(px(7.0))
+                                .border_b_1()
+                                .border_color(hsla(theme.border_subtle))
+                                .child(
+                                    div()
+                                        .text_size(px(9.5))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(hsla(theme.text_muted))
+                                        .child("USAGE LIMITS"),
+                                )
+                                .child(
+                                    div()
+                                        .id("limit-refresh-btn")
+                                        .cursor_pointer()
+                                        .rounded(px(4.0))
+                                        .p(px(2.0))
+                                        .hover(|d| d.bg(rgba(theme.surface_hover_strong)))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.refresh_agent_metrics();
+                                            cx.notify();
+                                        }))
+                                        .child(
+                                            svg()
+                                                .path(ui_icon::REFRESH)
+                                                .size(px(12.0))
+                                                .text_color(hsla(theme.text_muted)),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .p(px(4.0))
+                                .flex()
+                                .flex_col()
+                                .child(row(
+                                    LimitService::Claude,
+                                    claude_5h,
+                                    claude_week,
+                                    "5h",
+                                    "7d",
+                                    false,
+                                ))
+                                .child(row(
+                                    LimitService::Codex,
+                                    codex_primary,
+                                    codex_secondary,
+                                    "P",
+                                    "S",
+                                    false,
+                                ))
+                                .child(row(LimitService::Agy, None, None, "5h", "7d", true)),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     pub(crate) fn toggle_panel_view(&mut self, view: PanelView, cx: &mut Context<Self>) {

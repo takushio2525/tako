@@ -1,8 +1,8 @@
-//! `tako setup` — 質問ゼロを既定にした自動セットアップコマンド。
+//! `tako setup` — 検出 + 対話の自動セットアップコマンド。
 //!
 //! エージェント CLI（claude / codex / agy）の検出・プラン解決 →
-//! 依存ツールチェック → MCP 登録 → 指示・profile・リソース生成 → 最終サマリ、
-//! の一連のフローを提供する。個別対話は明示的な `--review` だけで起動する。
+//! 依存ツールチェック → MCP 登録 → 指示・profile・リソース生成 → 対話エージェント起動、
+//! の一連のフローを提供する。対話 agent は既定で起動し、--yes / 非 TTY 時のみスキップ。
 //! IPC 不要で、tako アプリ未起動でも動作する。
 //!
 //! config.yaml のスキーマと setup changelog は `tako_control::setup` にある
@@ -11,30 +11,17 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tako_control::setup::{
-    load_config, pending_changes, resolve_setup_value, ChangeKind, ResolvedSetupValue,
-    SetupAnswers, SetupChange, SetupPlan, SetupValueSource, CHANGES_YAML,
+    compare_instruction_coverage, load_config, pending_changes, resolve_setup_value, ChangeKind,
+    InstructionCoverage, ResolvedSetupValue, SetupAnswers, SetupChange, SetupPlan,
+    SetupValueSource, CHANGES_YAML, INSTRUCTIONS_DEFAULT, RECOMMENDED_SECTIONS,
 };
 
 // --- バイナリ埋め込みリソース ---
+// 推奨ルールのセクションと既定指示ファイルは tako_control::setup が正
+// （項目レベル比較 Issue #322 と共有。二重埋め込みを作らない）
 
 const SYSTEM_PROMPT: &str = include_str!("../../../resources/setup/system-prompt.md");
-const TPL_00_LANGUAGE: &str =
-    include_str!("../../../resources/setup/templates/sections/00-language.md");
-const TPL_01_INTERACTION: &str =
-    include_str!("../../../resources/setup/templates/sections/01-interaction-style.md");
-const TPL_02_GIT: &str =
-    include_str!("../../../resources/setup/templates/sections/02-git-workflow.md");
-const TPL_03_CODE: &str =
-    include_str!("../../../resources/setup/templates/sections/03-code-quality.md");
-const TPL_04_SAFETY: &str =
-    include_str!("../../../resources/setup/templates/sections/04-safety-rules.md");
-const TPL_05_PROPOSAL: &str =
-    include_str!("../../../resources/setup/templates/sections/05-proposal-quality.md");
-const TPL_06_VERIFICATION: &str =
-    include_str!("../../../resources/setup/templates/sections/06-completion-verification.md");
 const CONFIG_DEFAULT: &str = include_str!("../../../resources/setup/templates/config-default.yaml");
-const INSTRUCTIONS_DEFAULT: &str =
-    include_str!("../../../resources/setup/templates/instructions-default.md");
 
 pub fn load_answers(input: Option<&str>) -> Result<SetupAnswers, String> {
     let Some(input) = input else {
@@ -748,41 +735,9 @@ fn write_resource(dir: &Path, rel_path: &str, content: &str) -> Result<(), Strin
 }
 
 fn write_all_resources(setup_dir: &Path) -> Result<(), String> {
-    write_resource(
-        setup_dir,
-        "templates/sections/00-language.md",
-        TPL_00_LANGUAGE,
-    )?;
-    write_resource(
-        setup_dir,
-        "templates/sections/01-interaction-style.md",
-        TPL_01_INTERACTION,
-    )?;
-    write_resource(
-        setup_dir,
-        "templates/sections/02-git-workflow.md",
-        TPL_02_GIT,
-    )?;
-    write_resource(
-        setup_dir,
-        "templates/sections/03-code-quality.md",
-        TPL_03_CODE,
-    )?;
-    write_resource(
-        setup_dir,
-        "templates/sections/04-safety-rules.md",
-        TPL_04_SAFETY,
-    )?;
-    write_resource(
-        setup_dir,
-        "templates/sections/05-proposal-quality.md",
-        TPL_05_PROPOSAL,
-    )?;
-    write_resource(
-        setup_dir,
-        "templates/sections/06-completion-verification.md",
-        TPL_06_VERIFICATION,
-    )?;
+    for (rel_path, content) in RECOMMENDED_SECTIONS {
+        write_resource(setup_dir, rel_path, content)?;
+    }
     write_resource(setup_dir, "templates/config-default.yaml", CONFIG_DEFAULT)?;
     write_resource(
         setup_dir,
@@ -810,7 +765,7 @@ fn print_pending_changes(pending: &[SetupChange], applied_revision: u32) {
     for change in pending {
         let kind = match change.kind {
             ChangeKind::Auto => "自動適用",
-            ChangeKind::Guided => "--review で個別確認",
+            ChangeKind::Guided => "対話で個別確認",
         };
         eprintln!(
             "      [rev {} / v{} / {kind}] {}",
@@ -1331,6 +1286,36 @@ struct SetupContext<'a> {
     authenticated_agents: Vec<&'a str>,
     provider_plans: &'a BTreeMap<String, String>,
     profile_note: &'a str,
+    /// 同梱推奨ルールとの項目レベル比較の結果（Issue #322）。
+    /// setup agent（--review）が Step 1 の裏取りに使う
+    instruction_coverage: InstructionCoverageContext,
+}
+
+#[derive(serde::Serialize)]
+struct InstructionCoverageContext {
+    /// full = 差分なし / partial = 不足の可能性あり / created_default = 同梱既定で新規作成
+    status: &'static str,
+    /// 「項目タイトル: 概念1・概念2」形式の不足一覧（full / created_default では空）
+    missing: Vec<String>,
+}
+
+impl InstructionCoverageContext {
+    fn from_coverage(coverage: Option<&InstructionCoverage>) -> Self {
+        match coverage {
+            None => Self {
+                status: "created_default",
+                missing: Vec::new(),
+            },
+            Some(coverage) if coverage.is_full() => Self {
+                status: "full",
+                missing: Vec::new(),
+            },
+            Some(coverage) => Self {
+                status: "partial",
+                missing: coverage.missing_summaries(),
+            },
+        }
+    }
 }
 
 fn write_setup_context(
@@ -1339,6 +1324,7 @@ fn write_setup_context(
     agents: &[DetectedAgent],
     plans: &BTreeMap<String, String>,
     profile_note: &str,
+    instruction_coverage: Option<&InstructionCoverage>,
 ) -> Result<(), String> {
     let instruction_file = instruction_path(selected)
         .map(|path| display_home_relative(&path))
@@ -1354,6 +1340,7 @@ fn write_setup_context(
             .collect(),
         provider_plans: plans,
         profile_note,
+        instruction_coverage: InstructionCoverageContext::from_coverage(instruction_coverage),
     };
     let yaml = serde_yaml::to_string(&context)
         .map_err(|e| format!("setup-context.yaml の生成に失敗: {e}"))?;
@@ -1403,62 +1390,50 @@ fn print_setup_summary(plan: &SetupPlan) {
     }
 }
 
-/// 認証済みエージェントを対話で選んで返す。
-/// エージェント 1 つなら Y/n、複数なら番号選択。選ばなければ None。
-fn prompt_launch_agent(agents: &[DetectedAgent]) -> Option<DetectedAgent> {
-    let launchable: Vec<_> = agents.iter().filter(|a| a.authenticated).collect();
-    if launchable.is_empty() {
-        return None;
-    }
+/// setup 完了後の「次の一歩」案内（Issue #322 受け入れ条件 2）。
+/// オーケストレーションの最短導線とプロファイルの説明を default profile の実値つきで示す。
+/// コマンドは最も簡単な形で案内する（既定で済むものに引数を付けない。`.agent/conventions.md`）
+fn print_next_steps(master_ready: bool) {
+    use tako_control::orchestrator::{Profile, WorkerModelPolicy};
+
     eprintln!();
-    if launchable.len() == 1 {
-        let agent = launchable[0];
-        eprint!(
-            "続けて {} で対話を開始しますか？ [Y/n]: ",
-            agent.kind.as_str()
+    eprintln!("次の一歩:");
+    if master_ready {
+        eprintln!(
+            "  tako master   オーケストレーションを開始します。起動したら、やってほしいことを"
         );
-        let mut input = String::new();
-        let _ = std::io::stdin().read_line(&mut input);
-        let trimmed = input.trim().to_ascii_lowercase();
-        if trimmed.is_empty() || trimmed == "y" || trimmed == "yes" {
-            return Some(agent.clone());
-        }
-        return None;
+        eprintln!("                日本語で話しかけるだけです（worker の起動・監視・完了報告・");
+        eprintln!("                プロジェクト登録などの設定変更は、すべて master に頼めます）");
+        eprintln!("  tako solo     worker を使わず 1 対 1 で対話します");
+    } else {
+        eprintln!("  agy は worker 専用です。tako master（オーケストレーション）を使うには");
+        eprintln!("  claude または codex を導入してログインし、tako setup を再実行してください");
     }
-    eprintln!("続けてエージェントで対話を開始しますか？");
-    for (i, agent) in launchable.iter().enumerate() {
-        eprintln!("  {}) {}", i + 1, agent.kind.as_str());
-    }
-    eprintln!("  Enter) 起動しない");
-    eprint!("選択 [Enter]: ");
-    let mut input = String::new();
-    let _ = std::io::stdin().read_line(&mut input);
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    trimmed
-        .parse::<usize>()
-        .ok()
-        .and_then(|n| launchable.get(n.wrapping_sub(1)))
-        .map(|a| (*a).clone())
+
+    let profile = Profile::load("default").unwrap_or_default();
+    let master = profile.master_agent.as_deref().unwrap_or("claude");
+    let worker = profile.worker_agent.as_deref().unwrap_or(master);
+    let policy = match profile.worker_model_policy {
+        WorkerModelPolicy::Inherit => "master に合わせる",
+        WorkerModelPolicy::Fixed => "固定値",
+        WorkerModelPolicy::Delegate => "master がタスクごとに判断",
+    };
+    eprintln!();
+    eprintln!("プロファイル（master / worker がどのエージェント・モデル・思考量で動くかの設定）:");
+    eprintln!(
+        "  現在の default: master={master} / worker={worker} / effort={} / worker モデルは {policy}",
+        profile.effort
+    );
+    eprintln!("  「品質重視にして」「利用回数を節約して」のような調整は master に日本語で頼めます");
 }
 
-/// エージェント CLI をユーザーのホームディレクトリで対話起動する。
-fn launch_agent_interactive(agent: &DetectedAgent) -> Result<std::process::ExitStatus, String> {
-    let cwd = home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let mut command = std::process::Command::new(&agent.path);
-    command.current_dir(&cwd);
-    command
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
-    command
-        .status()
-        .map_err(|e| format!("{} の起動に失敗: {e}", agent.kind.as_str()))
-}
-
-fn apply_instruction(agent: SetupAgent, provided: Option<&str>) -> Result<(), String> {
+/// グローバル指示ファイルを解決し、既存内容は同梱推奨ルールと項目レベルで比較する（Issue #322）。
+/// 戻り値は setup-context.yaml へ書かれ、`--review` の setup agent が裏取りに使う。
+/// None = 同梱既定で新規作成（既定は全項目カバー済みのため比較不要。機械検証は tako-control のテスト）
+fn apply_instruction(
+    agent: SetupAgent,
+    provided: Option<&str>,
+) -> Result<Option<InstructionCoverage>, String> {
     let path = instruction_path(agent).ok_or("グローバル指示ファイルのパスを取得できません")?;
     if let Some(content) = provided {
         tako_control::config_io::atomic_write_with_backup(&path, content)?;
@@ -1466,21 +1441,37 @@ fn apply_instruction(agent: SetupAgent, provided: Option<&str>) -> Result<(), St
             "  [input] グローバル指示ファイルを保存: {}",
             display_home_relative(&path)
         );
-        return Ok(());
+        return Ok(Some(report_instruction_coverage(content)));
     }
     if path.is_file() {
         eprintln!(
             "  [previous] グローバル指示ファイルを維持: {}",
             display_home_relative(&path)
         );
-        return Ok(());
+        let existing = std::fs::read_to_string(&path)
+            .map_err(|e| format!("グローバル指示ファイルの読み取りに失敗: {e}"))?;
+        return Ok(Some(report_instruction_coverage(&existing)));
     }
     tako_control::config_io::atomic_write(&path, INSTRUCTIONS_DEFAULT)?;
     eprintln!(
         "  [default] グローバル指示ファイルを作成: {}",
         display_home_relative(&path)
     );
-    Ok(())
+    Ok(None)
+}
+
+/// 項目レベル比較の結果を表示して返す。「なんとなく良さそう」の素通しをさせない（Issue #322）
+fn report_instruction_coverage(content: &str) -> InstructionCoverage {
+    let coverage = compare_instruction_coverage(content);
+    for line in coverage.render_lines() {
+        eprintln!("  {line}");
+    }
+    if !coverage.is_full() {
+        eprintln!(
+            "      補強するには、tako master を起動して「グローバルルールを tako の推奨で補強して」と頼んでください"
+        );
+    }
+    coverage
 }
 
 fn apply_sleep_guard_answers(
@@ -1770,7 +1761,7 @@ pub fn run_changes(json: bool) -> Result<(), String> {
     for change in &pending {
         let kind = match change.kind {
             ChangeKind::Auto => "auto（setup 再実行で自動適用）",
-            ChangeKind::Guided => "guided（setup --review で個別確認・適用）",
+            ChangeKind::Guided => "guided（対話で個別確認・適用）",
         };
         eprintln!(
             "  [rev {} / v{} / {}] {}",
@@ -2030,7 +2021,7 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
 
     // 検出値・既定値だけの標準ケースは確認を挟まず適用する（Issue #262 要件 D）。
     configure_agent_mcp(selected_agent)?;
-    apply_instruction(selected, answers.instruction_content.as_deref())?;
+    let instruction_coverage = apply_instruction(selected, answers.instruction_content.as_deref())?;
     apply_sleep_guard_answers(answers.sleep_guard.as_ref())?;
 
     let dir = setup_dir()?;
@@ -2049,10 +2040,31 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
 
     let profile_note = prepare_profile(selected, &agents, &plans, answers.profile.as_ref())?;
     apply_projects(answers.projects.as_ref())?;
-    write_setup_context(&dir, selected, &agents, &plans, profile_note)?;
+    write_setup_context(
+        &dir,
+        selected,
+        &agents,
+        &plans,
+        profile_note,
+        instruction_coverage.as_ref(),
+    )?;
 
-    if review_mode {
-        if instruction_existed {
+    let revision = mark_setup_complete(selected, &plans, answers.orchestrator.as_ref())?;
+    sync_pending_changes_file(&dir, &[], revision)?;
+    print_setup_summary(&plan);
+    eprintln!("セットアップが完了しました。");
+    eprintln!();
+    eprintln!("スマホからリモート接続するには: tako remote setup");
+
+    // --- 対話エージェント起動（Issue #295 / #322 / #391）---
+    // 既定: 検出フロー完了後に setup agent を対話起動し、設定変更・解説・次の一歩を対話で行う。
+    // スキップ条件: --yes / 非 TTY / --answers launch_agent=none
+    let skip_agent = assume_yes
+        || !std::io::IsTerminal::is_terminal(&std::io::stdin())
+        || answers.launch_agent.as_deref().is_some_and(|v| v == "none");
+
+    if !skip_agent {
+        if review_mode && instruction_existed {
             let parent = instruction.parent().unwrap_or(Path::new("."));
             let filename = instruction
                 .file_name()
@@ -2069,12 +2081,20 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
             }
         }
         eprintln!();
-        eprintln!("個別見直しを開始します。");
+        eprintln!("対話アシスタントを起動します。設定の変更・解説・次の一歩の相談ができます。");
         eprintln!("─────────────────────────────────────────────────────");
-        let greeting = if pending.is_empty() {
-            "最初に setup-instructions.md を読んでください。前回設定の個別見直しを始めます。変更したい項目だけ確認してください。"
+        let greeting = if review_mode {
+            if pending.is_empty() {
+                "最初に setup-instructions.md を読んでください。前回設定の個別見直しを始めます。変更したい項目だけ確認してください。"
+            } else {
+                "最初に setup-instructions.md と pending-changes.md を読んでください。アップデート変更と前回設定の個別見直しを始めます。"
+            }
+        } else if is_first_run {
+            "最初に setup-instructions.md を読んでください。セットアップが完了しました。設定の確認・変更、コマンドの使い方、次に何をすればよいかなど、何でも聞いてください。"
+        } else if !pending.is_empty() {
+            "最初に setup-instructions.md と pending-changes.md を読んでください。アップデート変更があります。確認と設定の調整ができます。何でも聞いてください。"
         } else {
-            "最初に setup-instructions.md と pending-changes.md を読んでください。アップデート変更と前回設定の個別見直しを始めます。"
+            "最初に setup-instructions.md を読んでください。設定の確認・変更、コマンドの使い方、次に何をすればよいかなど、何でも聞いてください。"
         };
         let status = launch_setup_agent(selected_agent, &dir, greeting)?;
         if !status.success() {
@@ -2083,48 +2103,12 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
                 selected.as_str(),
                 status.code().unwrap_or(-1)
             );
-            return Ok(());
         }
-    }
-
-    let revision = mark_setup_complete(selected, &plans, answers.orchestrator.as_ref())?;
-    sync_pending_changes_file(&dir, &[], revision)?;
-    print_setup_summary(&plan);
-    eprintln!("セットアップが完了しました。");
-    eprintln!();
-    eprintln!("スマホからリモート接続するには: tako remote setup");
-
-    // --- 起動ランチャー（Issue #295）---
-    // --answers で launch_agent を明示指定した場合はそれに従う。
-    // --yes のみ / --answers で launch_agent 省略 / 非 TTY → スキップ
-    let launch_result = if let Some(specified) = answers.launch_agent.as_deref() {
-        if specified == "none" {
-            None
-        } else {
-            SetupAgent::parse(specified).and_then(|kind| {
-                agents
-                    .iter()
-                    .find(|a| a.kind == kind && a.authenticated)
-                    .cloned()
-            })
-        }
-    } else if assume_yes || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        None
     } else {
-        prompt_launch_agent(&agents)
-    };
-    if let Some(agent) = launch_result {
-        eprintln!();
-        eprintln!("{} を起動します…", agent.kind.as_str());
-        eprintln!("─────────────────────────────────────────────────────");
-        let status = launch_agent_interactive(&agent)?;
-        if !status.success() {
-            eprintln!(
-                "{} が終了しました（exit code: {}）",
-                agent.kind.as_str(),
-                status.code().unwrap_or(-1)
-            );
-        }
+        let master_ready = agents
+            .iter()
+            .any(|agent| agent.authenticated && agent.kind.supports_master());
+        print_next_steps(master_ready);
     }
 
     Ok(())
@@ -2380,13 +2364,10 @@ mod tests {
     #[test]
     fn embedded_resources_not_empty() {
         assert!(!SYSTEM_PROMPT.is_empty());
-        assert!(!TPL_00_LANGUAGE.is_empty());
-        assert!(!TPL_01_INTERACTION.is_empty());
-        assert!(!TPL_02_GIT.is_empty());
-        assert!(!TPL_03_CODE.is_empty());
-        assert!(!TPL_04_SAFETY.is_empty());
-        assert!(!TPL_05_PROPOSAL.is_empty());
-        assert!(!TPL_06_VERIFICATION.is_empty());
+        assert_eq!(RECOMMENDED_SECTIONS.len(), 7);
+        for (rel_path, content) in RECOMMENDED_SECTIONS {
+            assert!(!content.is_empty(), "{rel_path} が空");
+        }
         assert!(!CONFIG_DEFAULT.is_empty());
         assert!(!INSTRUCTIONS_DEFAULT.is_empty());
         assert!(!CHANGES_YAML.is_empty());

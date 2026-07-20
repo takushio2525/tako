@@ -262,6 +262,16 @@ pub struct AgentWorkerConfig {
     pub args: Vec<String>,
 }
 
+/// プロファイル起動コマンドの案内表記。default は引数なしの最簡形で示す
+/// （「最も簡単なコマンドを提案する」原則。Issue #322、`.agent/conventions.md`）
+pub fn launch_command(base: &str, profile_name: &str) -> String {
+    if profile_name == "default" {
+        base.to_string()
+    } else {
+        format!("{base} -{profile_name}")
+    }
+}
+
 /// `Profile::resolve_agent_launch` の解決結果（spawn で使う worker 起動パラメータ）
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedWorkerLaunch {
@@ -314,6 +324,10 @@ pub struct Profile {
     pub prompt_blocks: Option<PromptBlocks>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projects: Option<Vec<String>>,
+
+    /// タブ名の命名規則（master プロンプトに注入。未設定時はデフォルト規則を使用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_naming_convention: Option<String>,
 }
 
 /// master / claude worker の既定 effort
@@ -338,6 +352,7 @@ impl Default for Profile {
             system_prompt: None,
             prompt_blocks: None,
             projects: None,
+            tab_naming_convention: None,
         }
     }
 }
@@ -618,6 +633,11 @@ impl Profile {
             result.push('\n');
         }
 
+        let naming_convention = self.tab_naming_convention.as_deref().unwrap_or(
+            "Naming rule: describe the current activity concisely in the user's language.",
+        );
+        let result = result.replace("{TAB_NAMING_CONVENTION}", naming_convention);
+
         result.trim_end().to_string()
     }
 
@@ -816,10 +836,11 @@ impl Profile {
             None => String::new(),
         };
 
+        let launch_cmd = launch_command("tako master", profile_name);
         format!(
             "## Session Identity\n\n\
              - **Profile**: `{profile_name}`\n\
-             - **Launch command**: `tako master -{profile_name}`{master_agent_line}\n\
+             - **Launch command**: `{launch_cmd}`{master_agent_line}\n\
              - **Master model**: {}\n\
              - **Master effort**: {}\n\
              - **Worker model policy**: {policy_str}{agent_line}\n\
@@ -872,6 +893,11 @@ impl Profile {
             result.push('\n');
         }
 
+        let naming_convention = self.tab_naming_convention.as_deref().unwrap_or(
+            "Naming rule: describe the current activity concisely in the user's language.",
+        );
+        let result = result.replace("{TAB_NAMING_CONVENTION}", naming_convention);
+
         result.trim_end().to_string()
     }
 
@@ -887,11 +913,12 @@ impl Profile {
             None => String::new(),
         };
 
+        let launch_cmd = launch_command("tako solo", profile_name);
         format!(
             "## Session Identity\n\n\
              - **Mode**: solo (direct execution, no orchestration)\n\
              - **Profile**: `{profile_name}`\n\
-             - **Launch command**: `tako solo -{profile_name}`{agent_line}\n\
+             - **Launch command**: `{launch_cmd}`{agent_line}\n\
              - **Model**: {}\n\
              - **Effort**: {}\n\
              - **Profile config**: `{profile_path}`",
@@ -1241,8 +1268,9 @@ pub(crate) fn run_claude_agents_json() -> Option<Vec<u8>> {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     static CACHE: Mutex<Option<(Instant, Option<Vec<u8>>)>> = Mutex::new(None);
-    /// watch のポーリング間隔（数秒）より短く、判定の鮮度に影響しない長さ
-    const TTL: Duration = Duration::from_secs(2);
+    /// watch のポーリング間隔（5 秒）と同じ長さ。同一 TTL 窓内の watch / worker_status
+    /// 呼び出しは前回結果を返し、Node 起動コストを抑える（#368）
+    const TTL: Duration = Duration::from_secs(5);
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((at, value)) = cache.as_ref() {
         if at.elapsed() < TTL {
@@ -1893,6 +1921,24 @@ prompt_blocks:
         assert!(prompt.contains("claude-sonnet-5"));
     }
 
+    /// default プロファイルの起動コマンド案内は引数なしの最簡形（Issue #322）
+    #[test]
+    fn issue_322_launch_command_simplest_form() {
+        assert_eq!(launch_command("tako master", "default"), "tako master");
+        assert_eq!(launch_command("tako solo", "default"), "tako solo");
+        assert_eq!(launch_command("tako master", "fable"), "tako master -fable");
+        assert_eq!(launch_command("tako solo", "fast"), "tako solo -fast");
+
+        // Session Identity 経由でも -default を見せない
+        let p = Profile::default();
+        let master_prompt = p.build_from_template(DEFAULT_SYSTEM_PROMPT, "default");
+        assert!(master_prompt.contains("Launch command**: `tako master`"));
+        assert!(!master_prompt.contains("tako master -default"));
+        let solo_prompt = p.build_solo_system_prompt("default");
+        assert!(solo_prompt.contains("Launch command**: `tako solo`"));
+        assert!(!solo_prompt.contains("tako solo -default"));
+    }
+
     #[test]
     fn identity_block_shows_customizations() {
         let mut overrides = std::collections::BTreeMap::new();
@@ -2530,6 +2576,30 @@ worker_agents:
         assert!(prompt.contains("claude-sonnet-5"));
         assert!(prompt.contains("medium"));
         assert!(prompt.contains("`fast`"));
+    }
+
+    #[test]
+    fn tab_naming_convention_is_injected_into_prompt() {
+        let p = Profile {
+            tab_naming_convention: Some("3文字の日本語動詞で命名する".into()),
+            ..Default::default()
+        };
+        let master = p.build_system_prompt("default");
+        assert!(master.contains("3文字の日本語動詞で命名する"));
+        assert!(master.contains("Keep your tab name current"));
+        assert!(!master.contains("{TAB_NAMING_CONVENTION}"));
+
+        let solo = p.build_solo_system_prompt("default");
+        assert!(solo.contains("3文字の日本語動詞で命名する"));
+        assert!(!solo.contains("{TAB_NAMING_CONVENTION}"));
+    }
+
+    #[test]
+    fn tab_naming_convention_default_when_unset() {
+        let p = Profile::default();
+        let master = p.build_system_prompt("default");
+        assert!(master.contains("Naming rule: describe the current activity"));
+        assert!(!master.contains("{TAB_NAMING_CONVENTION}"));
     }
 
     #[test]

@@ -239,11 +239,14 @@ pub enum Request {
     /// kill する（使用中・ユーザーセッションには触れない）。kill した名前を返す
     TmuxCleanup { socket: Option<String> },
     /// タブのリネーム（FR-2.12.1）。`tab` 省略時は `pane`（呼び出し元）の属するタブ。
-    /// 明示リネームとして自動リネーム（FR-2.12）より優先され、空文字で手動指定を解除する
+    /// `source` = "auto" なら `set_title_auto`（手動リネーム済みタブは上書きしない）。
+    /// "manual"（既定）なら `set_title_manual`（自動リネームをブロック）。
+    /// 空文字タイトルで手動指定を解除する
     TabRename {
         pane: Option<u64>,
         tab: Option<u64>,
         title: String,
+        source: Option<String>,
     },
     /// タブ作成（FR-2.5.10）
     TabNew {
@@ -256,6 +259,21 @@ pub enum Request {
     TabSelect { tab: u64 },
     /// タブの並べ替え（#308）。`tab` を `index`（0 始まり）の位置へ移動する
     TabReorder { tab: u64, index: usize },
+    /// ウィンドウ一覧（Issue #339。ビューポート方式の論理ウィンドウ）
+    WindowList,
+    /// 新しいウィンドウを開く（Issue #339）。`tab` 指定 = そのタブを新ウィンドウへ
+    /// 分離、省略 = 新規タブ 1 つ付きで開く
+    WindowNew {
+        #[serde(default)]
+        tab: Option<u64>,
+    },
+    /// ウィンドウを閉じる（Issue #339）。所属タブは残存ウィンドウへ合流し、
+    /// タブ・プロセスは殺さない。最後の 1 ウィンドウは閉じられない
+    WindowClose { window: u64 },
+    /// タブを別ウィンドウへ移動する（Issue #339）。移動先の表示タブになる
+    WindowMoveTab { tab: u64, window: u64 },
+    /// ウィンドウをアクティブにして前面化する（Issue #339）
+    WindowFocus { window: u64 },
     /// ペインの移動（FR-2.5.10 / FR-1.10）。`tab` 指定 = 別タブの末尾へ移送（従来動作）、
     /// `target` 指定 = そのペインを `direction`（省略時は右）へ分割した位置に挿し直す
     /// （同タブ内の並べ替え = タイトルバー D&D と同等。タブまたぎも可）。
@@ -517,6 +535,9 @@ pub enum Request {
         /// worker_model_policy（inherit / delegate / fixed）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worker_model_policy: Option<String>,
+        /// タブ名の命名規則（空文字でクリア）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab_naming_convention: Option<String>,
     },
     /// オーケストレーター: worker spawn のレイアウト設定の取得・変更（Issue #165）。
     /// 全パラメータ省略で現在値の取得、いずれか指定でその項目を更新して結果を返す。
@@ -603,6 +624,17 @@ pub enum Request {
         /// 呼び出し元の TAKO_ORCHESTRATOR_ROLE（監査ログ用）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_role: Option<String>,
+    },
+    /// オーケストレーター: worker の報告内容を取得する（#364）。
+    /// 第 1 層 scrollback（全 agent 共通）+ 第 2 層 transcript アダプタ（claude 等）
+    OrchestratorReport {
+        pane_id: u64,
+        /// スクロールバック取得行数（既定 2000）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lines: Option<usize>,
+        /// transcript から取得する直近 assistant メッセージ件数（#374。既定 1）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        messages: Option<usize>,
     },
     /// オーケストレーター: 委任台帳の操作（Issue #292）。
     /// action: list / stats / record / amend

@@ -350,6 +350,51 @@ pub fn pane_log_probe(socket: Option<&str>, session: &str) -> Option<PaneLogProb
     })
 }
 
+/// 全バックエンドセッションの probe 値を `list-panes -a` 1 回で一括取得する（#369）。
+/// ペイン毎に `display-message` を実行する `pane_log_probe` の N 回起動を 1 回に削減する。
+/// 各セッションのアクティブペイン（`#{pane_active}==1`）のみ返す（`display-message -p` と同等）。
+/// 戻り値は session_name → PaneLogProbe のマップ
+pub fn pane_log_probe_batch(
+    socket: Option<&str>,
+) -> std::collections::HashMap<String, PaneLogProbe> {
+    use std::collections::HashMap;
+    let output = run_tmux(
+        socket,
+        &[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}\t#{pane_active}\t#{history_size}\t#{history_limit}\t#{history_bytes}\t#{alternate_on}",
+        ],
+    );
+    let mut map = HashMap::new();
+    let Ok(text) = output else {
+        return map;
+    };
+    for line in text.lines() {
+        let mut f = line.split('\t');
+        let Some(session_name) = f.next() else {
+            continue;
+        };
+        let Some(active) = f.next() else { continue };
+        if active != "1" {
+            continue;
+        }
+        let probe = (|| {
+            Some(PaneLogProbe {
+                history: f.next()?.parse().ok()?,
+                limit: f.next()?.parse().ok()?,
+                bytes: f.next()?.parse().ok()?,
+                alternate: f.next() == Some("1"),
+            })
+        })();
+        if let Some(p) = probe {
+            map.insert(session_name.to_string(), p);
+        }
+    }
+    map
+}
+
 /// 履歴末尾の `count` 行を平文で取得する（Issue #112 ペインログ用）。
 /// `-e` なし = ANSI 除去済み、`-J` なし = 折り返し行のまま（`#{history_size}` の
 /// 行数カウントと 1:1 に対応する）。履歴が足りなければ取れた分だけ返す
@@ -625,5 +670,71 @@ mod tests {
             sessions.iter().any(|s| s.name == "loc-e2e"),
             "list_sessions がパースできない: {sessions:?}"
         );
+    }
+
+    #[test]
+    fn probe_batchのパースが正しい() {
+        // list-panes -a -F の出力形式をシミュレート
+        let output = "sess-a\t1\t500\t2000\t12345\t0\nsess-a\t0\t100\t2000\t5000\t0\nsess-b\t1\t0\t2000\t0\t1\n";
+        let mut map = std::collections::HashMap::new();
+        for line in output.lines() {
+            let mut f = line.split('\t');
+            let session_name = f.next().unwrap();
+            let active = f.next().unwrap();
+            if active != "1" {
+                continue;
+            }
+            let probe = (|| {
+                Some(PaneLogProbe {
+                    history: f.next()?.parse().ok()?,
+                    limit: f.next()?.parse().ok()?,
+                    bytes: f.next()?.parse().ok()?,
+                    alternate: f.next() == Some("1"),
+                })
+            })();
+            if let Some(p) = probe {
+                map.insert(session_name.to_string(), p);
+            }
+        }
+        assert_eq!(map.len(), 2);
+        let a = &map["sess-a"];
+        assert_eq!(a.history, 500);
+        assert_eq!(a.limit, 2000);
+        assert_eq!(a.bytes, 12345);
+        assert!(!a.alternate);
+        let b = &map["sess-b"];
+        assert_eq!(b.history, 0);
+        assert!(b.alternate);
+    }
+
+    #[test]
+    fn probe_batchの空入力と壊れた行は無害() {
+        let map = {
+            let mut m = std::collections::HashMap::new();
+            // 空入力
+            for line in "".lines() {
+                let mut f = line.split('\t');
+                let Some(session_name) = f.next() else {
+                    continue;
+                };
+                let Some(active) = f.next() else { continue };
+                if active != "1" {
+                    continue;
+                }
+                let probe = (|| {
+                    Some(PaneLogProbe {
+                        history: f.next()?.parse().ok()?,
+                        limit: f.next()?.parse().ok()?,
+                        bytes: f.next()?.parse().ok()?,
+                        alternate: f.next() == Some("1"),
+                    })
+                })();
+                if let Some(p) = probe {
+                    m.insert(session_name.to_string(), p);
+                }
+            }
+            m
+        };
+        assert!(map.is_empty());
     }
 }

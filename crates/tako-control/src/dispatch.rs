@@ -846,7 +846,12 @@ fn dispatch_inner(
             Ok(json!({ "killed": killed }))
         }
 
-        Request::TabRename { pane, tab, title } => {
+        Request::TabRename {
+            pane,
+            tab,
+            title,
+            source,
+        } => {
             let tab_id = match tab {
                 Some(raw) => find_tab(host.workspace(), raw)?,
                 None => resolve_pane(host.workspace(), pane)?.0,
@@ -855,13 +860,17 @@ fn dispatch_inner(
                 .workspace_mut()
                 .get_tab_mut(tab_id)
                 .expect("find_tab / resolve_pane で存在確認済み");
+            let is_auto = source.as_deref() == Some("auto");
             if title.is_empty() {
-                // 空文字 = 手動指定の解除（タイトルは保持し、自動リネームを再開させる）
                 tab.clear_manual_title();
+            } else if is_auto {
+                tab.set_title_auto(&title);
             } else {
                 tab.set_title_manual(title);
             }
-            Ok(json!({ "tab": tab_id.as_u64(), "title": tab.title() }))
+            Ok(
+                json!({ "tab": tab_id.as_u64(), "title": tab.title(), "source": tab.title_source().as_str() }),
+            )
         }
 
         Request::TabNew { title, focus } => {
@@ -889,6 +898,69 @@ fn dispatch_inner(
         Request::TabSelect { tab } => {
             let tab_id = find_tab(host.workspace(), tab)?;
             host.workspace_mut().activate_tab(tab_id).map_err(op_err)?;
+            Ok(Value::Null)
+        }
+
+        Request::WindowList => Ok(windows_json(host.workspace())),
+
+        Request::WindowNew { tab } => match tab {
+            // 既存タブを新しいウィンドウへ分離
+            Some(t) => {
+                let tab_id = find_tab(host.workspace(), t)?;
+                let (wid, closed) = host
+                    .workspace_mut()
+                    .move_tab_to_new_window(tab_id)
+                    .map_err(op_err)?;
+                host.request_viewport_open(wid);
+                Ok(json!({
+                    "window": wid.as_u64(),
+                    "tab": tab_id.as_u64(),
+                    "closed_window": closed.map(|w| w.as_u64()),
+                }))
+            }
+            // 新規タブ 1 つ付きの新しいウィンドウ
+            None => {
+                let pane = Pane::new(origin);
+                let pane_id = pane.id();
+                let title = (host.workspace().tabs().len() + 1).to_string();
+                let (wid, tab_id) = host.workspace_mut().create_window(title, pane);
+                host.attach_session(pane_id, SpawnOptions::default());
+                host.request_viewport_open(wid);
+                Ok(json!({
+                    "window": wid.as_u64(),
+                    "tab": tab_id.as_u64(),
+                    "pane": pane_id.as_u64(),
+                }))
+            }
+        },
+
+        Request::WindowClose { window } => {
+            let wid = find_window(host.workspace(), window)?;
+            let moved = host.workspace_mut().close_window(wid).map_err(op_err)?;
+            // GPUI ウィンドウの実 close は UI 層の同期（sync_viewports）が拾う
+            Ok(json!({
+                "window": wid.as_u64(),
+                "moved_tabs": moved.iter().map(|t| t.as_u64()).collect::<Vec<_>>(),
+            }))
+        }
+
+        Request::WindowMoveTab { tab, window } => {
+            let tab_id = find_tab(host.workspace(), tab)?;
+            let wid = find_window(host.workspace(), window)?;
+            let closed = host
+                .workspace_mut()
+                .move_tab_to_window(tab_id, wid)
+                .map_err(op_err)?;
+            Ok(json!({
+                "tab": tab_id.as_u64(),
+                "window": wid.as_u64(),
+                "closed_window": closed.map(|w| w.as_u64()),
+            }))
+        }
+
+        Request::WindowFocus { window } => {
+            let wid = find_window(host.workspace(), window)?;
+            host.workspace_mut().activate_window(wid).map_err(op_err)?;
             Ok(Value::Null)
         }
 
@@ -1861,6 +1933,7 @@ fn dispatch_inner(
             agent_skip_permissions,
             agent_args,
             worker_model_policy,
+            tab_naming_convention,
         } => dispatch_orchestrator_profiles(ProfilesParams {
             action,
             name,
@@ -1882,6 +1955,7 @@ fn dispatch_inner(
             agent_skip_permissions,
             worker_model_policy,
             agent_args,
+            tab_naming_convention,
         }),
 
         Request::OrchestratorLayout {
@@ -1974,6 +2048,18 @@ fn dispatch_inner(
             choice,
             caller_role,
         } => dispatch_orchestrator_respond(host, pane_id, &choice, caller_role.as_deref()),
+
+        // #364: worker の報告内容を scrollback + transcript から取得
+        Request::OrchestratorReport {
+            pane_id,
+            lines,
+            messages,
+        } => dispatch_orchestrator_report(
+            host,
+            pane_id,
+            lines.unwrap_or(2000),
+            messages.unwrap_or(1),
+        ),
 
         Request::OrchestratorLedger {
             action,
@@ -2123,6 +2209,11 @@ fn dispatch_inner(
             match action.as_str() {
                 "open" => {
                     let url = url.ok_or(DispatchError::InvalidParams("url は必須".into()))?;
+                    if url.trim().is_empty() {
+                        return Err(DispatchError::InvalidParams(
+                            "URL が空です".into(),
+                        ));
+                    }
                     split_and(host, pane, &|h, new_id| h.web_open(new_id, &url))
                 }
                 "show" => {
@@ -2399,11 +2490,13 @@ fn dispatch_inner(
                 "status" => {
                     let enabled = crate::telemetry::is_enabled();
                     let recent = crate::telemetry::recent_count();
+                    let queued = crate::telemetry::queue_count();
                     let log_path =
                         crate::telemetry::log_file_path().map(|p| p.display().to_string());
                     Ok(serde_json::json!({
                         "telemetry": enabled,
                         "recent_reports": recent,
+                        "queued_reports": queued,
                         "log_path": log_path,
                     }))
                 }
@@ -2459,8 +2552,9 @@ fn dispatch_inner(
                     host.set_limit_service(next);
                     Ok(status_json(next))
                 }
+                "refresh" => Ok(host.refresh_limits()),
                 other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / set のいずれか）"
+                    "不明な action: {other:?}（status / set / refresh のいずれか）"
                 ))),
             }
         }
@@ -3221,6 +3315,8 @@ pub struct ProfilesParams {
     pub agent_args: Option<Vec<String>>,
     /// worker_model_policy（inherit / delegate / fixed）
     pub worker_model_policy: Option<String>,
+    /// タブ名の命名規則
+    pub tab_naming_convention: Option<String>,
 }
 
 /// プロファイルを JSON 化する（list / show / set の共通形）。
@@ -3247,6 +3343,9 @@ fn profile_to_json(name: &str, profile: &crate::orchestrator::Profile) -> Value 
     // master エージェント設定（#127）も使用時のみ出力
     if profile.master_agent.is_some() {
         v["master_agent"] = json!(profile.master_agent);
+    }
+    if profile.tab_naming_convention.is_some() {
+        v["tab_naming_convention"] = json!(profile.tab_naming_convention);
     }
     v
 }
@@ -3365,6 +3464,13 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                 }
                 if let Some(policy) = policy {
                     profile.worker_model_policy = policy;
+                }
+                if let Some(conv) = params.tab_naming_convention {
+                    if conv.is_empty() {
+                        profile.tab_naming_convention = None;
+                    } else {
+                        profile.tab_naming_convention = Some(conv);
+                    }
                 }
                 if let Some(agent_name) = params.agent {
                     let cfg = profile.worker_agents.entry(agent_name).or_default();
@@ -3716,6 +3822,97 @@ fn resolve_session_id_for_pane_via_host(host: &dyn ControlHost, pane_id: PaneId)
     crate::agents::resolve_session_id_for_backend(&backend)
 }
 
+/// #364: worker の報告内容を取得する。
+/// 第 1 層: tmux scrollback（capture-pane -p -J -S。全 agent 共通）。
+/// 第 2 層: 構造化ソース（claude transcript。アダプタ拡張可能）。
+/// source フィールドで判別。transcript 利用時は scrollback も併記し対比可能にする
+fn dispatch_orchestrator_report(
+    host: &dyn ControlHost,
+    pane_id: u64,
+    lines: usize,
+    messages: usize,
+) -> Result<Value, DispatchError> {
+    let target = PaneId::from_raw(pane_id);
+    let mut result = json!({ "pane_id": pane_id });
+
+    // 第 1 層: scrollback（全 agent 共通の主ソース）
+    let scrollback = if let Some(backend) = host.backend_session(target) {
+        let socket = tako_core::tmux_backend::socket_name();
+        capture_scrollback_joined(Some(&socket), &backend, lines)
+    } else {
+        None
+    };
+
+    // 第 2 層: transcript アダプタ（claude のみ。将来 codex 等を追加する拡張点）
+    // messages パラメータで直近 N 件を取得（#374。既定 1 件で後方互換）
+    let msg_count = messages.max(1);
+    let transcript = resolve_session_id_for_pane_via_host(host, target).and_then(|sid| {
+        let texts = crate::transcript::last_assistant_texts(&sid, msg_count).ok()?;
+        if texts.is_empty() {
+            return None;
+        }
+        result["session_id"] = json!(sid);
+        Some(texts)
+    });
+
+    match (&transcript, &scrollback) {
+        (Some(texts), _) => {
+            result["source"] = json!("transcript");
+            if msg_count == 1 {
+                result["text"] = json!(texts.join("\n"));
+            } else {
+                result["text"] = json!(texts.last().unwrap_or(&String::new()));
+                result["messages"] = json!(texts);
+            }
+            if let Some(ref sb) = scrollback {
+                result["scrollback_text"] = json!(sb);
+            }
+        }
+        (None, Some(sb)) => {
+            result["source"] = json!("scrollback");
+            result["text"] = json!(sb);
+        }
+        (None, None) => {
+            return Err(DispatchError::Operation(format!(
+                "pane {pane_id} の報告を取得できない（backend session 不在または scrollback 空）"
+            )));
+        }
+    }
+
+    Ok(result)
+}
+
+/// tmux capture-pane -p -J -S で折返し結合済みのスクロールバックを取得する
+fn capture_scrollback_joined(socket: Option<&str>, session: &str, lines: usize) -> Option<String> {
+    let start = format!("-{lines}");
+    let output = tako_core::tmux::tmux_command(socket)
+        .args([
+            "capture-pane",
+            "-p",
+            "-J",
+            "-t",
+            &format!("={session}:"),
+            "-S",
+            &start,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end()
+        .to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 /// OrchestratorHandoff — master の引き継ぎ（#193）。
 /// handoff ファイルを読み、同プロファイルの新 master を同タブに spawn し、
 /// handoff 内容を含むプロンプトを注入する。旧 master は閉じない（ユーザー判断）。
@@ -4047,6 +4244,9 @@ fn dispatch_orchestrator_spawn(
         String::new()
     });
 
+    // #368: spawn 完了 → claude session スキャンを即時トリガー
+    crate::request_claude_scan();
+
     Ok(json!({
         "pane_id": new_id.as_u64(),
         "spawned_by": target.as_u64(),
@@ -4333,6 +4533,15 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         None
     };
 
+    // #364: 履歴サイズ計測（agent 非依存の busy シグナル布石）
+    let history_info = tmux_session
+        .as_ref()
+        .and_then(|ts| {
+            let socket = tako_core::tmux_backend::socket_name();
+            tako_core::tmux::pane_log_probe(Some(&socket), ts)
+        })
+        .map(|p| json!({ "lines": p.history, "bytes": p.bytes }));
+
     Ok(json!({
         "status": status,
         "ctx_percent": ctx_percent,
@@ -4345,6 +4554,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         "collapsed": collapsed,
         "events": events,
         "permission_dialog": permission_dialog,
+        "history": history_info,
     }))
 }
 
@@ -4746,6 +4956,27 @@ fn find_tab(ws: &Workspace, raw: u64) -> Result<TabId, DispatchError> {
         .ok_or(DispatchError::TabNotFound(raw))
 }
 
+fn find_window(ws: &Workspace, raw: u64) -> Result<tako_core::WindowId, DispatchError> {
+    ws.windows()
+        .iter()
+        .map(|w| w.id())
+        .find(|w| w.as_u64() == raw)
+        .ok_or_else(|| DispatchError::Operation(format!("ウィンドウ {raw} が見つからない")))
+}
+
+/// ウィンドウ一覧（Issue #339）。`WindowList` 応答と `list` の windows フィールドで共用
+fn windows_json(ws: &Workspace) -> Value {
+    json!({
+        "active_window": ws.active_window_id().as_u64(),
+        "windows": ws.windows().iter().map(|w| json!({
+            "id": w.id().as_u64(),
+            "active": w.id() == ws.active_window_id(),
+            "active_tab": w.active_tab().as_u64(),
+            "tabs": ws.window_tab_ids(w.id()).iter().map(|t| t.as_u64()).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
 fn tree_mut(ws: &mut Workspace, tab: TabId) -> &mut tako_core::PaneTree {
     ws.get_tab_mut(tab)
         .expect("呼び出し前に存在確認済みのタブ")
@@ -4777,15 +5008,18 @@ fn dir_of(path: &std::path::Path) -> std::path::PathBuf {
 /// ツリー構造 + 単位矩形ジオメトリ + 各ペインの状態を返す
 fn list_json(host: &dyn ControlHost) -> Value {
     let ws = host.workspace();
+    // いずれかのウィンドウで表示中のタブ集合（Issue #339。surface 判定に使う）
+    let displayed: std::collections::HashSet<TabId> =
+        ws.windows().iter().map(|w| w.active_tab()).collect();
     let tabs: Vec<Value> = ws
         .tabs()
         .iter()
         .map(|tab| {
             let tree = tab.tree();
             let rects = tree.layout(Rect::UNIT);
-            // 前面表示中（アクティブタブ）か裏で動いているか（FR-2.16.12）。
-            // tako はアクティブタブの全ペインをタイル表示するので、表示中 = アクティブタブ所属
-            let tab_active = tab.id() == ws.active_tab_id();
+            // 前面表示中か裏で動いているか（FR-2.16.12）。tako は表示タブの全ペインを
+            // タイル表示するので、表示中 = いずれかのウィンドウの表示タブ所属（Issue #339）
+            let tab_active = displayed.contains(&tab.id());
             let panes: Vec<Value> = tree
                 .panes()
                 .iter()
@@ -4860,7 +5094,9 @@ fn list_json(host: &dyn ControlHost) -> Value {
                 "id": tab.id().as_u64(),
                 "title": tab.title(),
                 "title_source": title_source_str(tab.title_source()),
-                "active": tab_active,
+                "active": tab.id() == ws.active_tab_id(),
+                // 所属ウィンドウ（Issue #339。後方互換: 単一ウィンドウでは常に同じ値）
+                "window": ws.window_of_tab(tab.id()).map(|w| w.as_u64()),
                 // サイドバー tmux ビューでこのタブ枠が折りたたまれているか（FR-2.16.14）
                 "collapsed": host.tmux_tab_collapsed(tab.id()),
                 "focused_pane": tree.focused().as_u64(),
@@ -4886,6 +5122,9 @@ fn list_json(host: &dyn ControlHost) -> Value {
         .collect();
     json!({
         "active_tab": ws.active_tab_id().as_u64(),
+        // 複数ウィンドウ（Issue #339）。後方互換: 既存フィールドは維持し追加のみ
+        "active_window": ws.active_window_id().as_u64(),
+        "windows": windows_json(ws)["windows"].clone(),
         "tabs": tabs,
         "shelved_panes": shelved,
         // ピン留め中のプレビューウィンドウ（FR-2.16.15。AI が現在のピンを把握できる）
@@ -4912,11 +5151,7 @@ fn pinned_json(host: &dyn ControlHost) -> Value {
 
 /// タイトルの出どころの文字列表現（list / MCP 公開用。FR-2.12.1）
 fn title_source_str(source: tako_core::TitleSource) -> &'static str {
-    match source {
-        tako_core::TitleSource::Default => "default",
-        tako_core::TitleSource::Auto => "auto",
-        tako_core::TitleSource::Manual => "manual",
-    }
+    source.as_str()
 }
 
 /// コマンド実行状態の文字列表現（list / MCP 公開用）
@@ -6587,6 +6822,7 @@ mod tests {
                 pane: Some(root),
                 tab: None,
                 title: "実験".into(),
+                source: None,
             },
             PaneOrigin::Cli,
         )
@@ -6610,6 +6846,7 @@ mod tests {
                 pane: None,
                 tab: Some(tab_id),
                 title: String::new(),
+                source: None,
             },
             PaneOrigin::Cli,
         )
@@ -6617,6 +6854,68 @@ mod tests {
         let tab = &host.ws.tabs()[0];
         assert_eq!(tab.title(), "実験");
         assert_eq!(tab.title_source(), tako_core::TitleSource::Default);
+    }
+
+    #[test]
+    fn タブの自動リネームは手動リネーム済みを上書きしない() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let tab_id = host.ws.tabs()[0].id().as_u64();
+        // 手動リネーム
+        dispatch(
+            &mut host,
+            Request::TabRename {
+                pane: Some(root),
+                tab: None,
+                title: "手動名".into(),
+                source: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            host.ws.tabs()[0].title_source(),
+            tako_core::TitleSource::Manual
+        );
+        // source=auto で上書きを試みる → 手動が優先されタイトル変わらず
+        let result = dispatch(
+            &mut host,
+            Request::TabRename {
+                pane: None,
+                tab: Some(tab_id),
+                title: "自動名".into(),
+                source: Some("auto".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["title"].as_str(), Some("手動名"));
+        assert_eq!(result["source"].as_str(), Some("manual"));
+        // 手動解除後は自動リネームが通る
+        dispatch(
+            &mut host,
+            Request::TabRename {
+                pane: None,
+                tab: Some(tab_id),
+                title: String::new(),
+                source: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let result = dispatch(
+            &mut host,
+            Request::TabRename {
+                pane: None,
+                tab: Some(tab_id),
+                title: "自動名".into(),
+                source: Some("auto".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["title"].as_str(), Some("自動名"));
+        assert_eq!(result["source"].as_str(), Some("auto"));
     }
 
     #[test]
@@ -8530,6 +8829,19 @@ mod tests {
             PaneOrigin::Cli,
         )
         .is_err());
+        // refresh はデフォルト実装で null 値を返す
+        let v = dispatch(
+            &mut host,
+            Request::LimitService {
+                action: Some("refresh".into()),
+                service: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!(v["claude"].is_object());
+        assert!(v["codex"].is_object());
+        assert_eq!(v["agy"]["status"], "unsupported");
     }
 
     // --- OpenDir / OpenRemote / SshHosts / RecentItems テスト (#20) ---
@@ -9090,5 +9402,116 @@ mod tests {
             "{}",
             cmd.program
         );
+    }
+
+    // === 複数ウィンドウ（Issue #339） ===
+
+    #[test]
+    fn window系の一連操作とlist反映() {
+        let mut host = MockHost::new();
+        let w1 = host.workspace().active_window_id().as_u64();
+        // 新規タブ付きの新ウィンドウ
+        let r = dispatch(&mut host, Request::WindowNew { tab: None }, PaneOrigin::Cli).unwrap();
+        let w2 = r["window"].as_u64().unwrap();
+        let t2 = r["tab"].as_u64().unwrap();
+        assert!(r["pane"].as_u64().is_some());
+        assert_ne!(w2, w1);
+        // 一覧: 2 ウィンドウ + 新ウィンドウがアクティブ
+        let r = dispatch(&mut host, Request::WindowList, PaneOrigin::Cli).unwrap();
+        assert_eq!(r["active_window"].as_u64(), Some(w2));
+        assert_eq!(r["windows"].as_array().unwrap().len(), 2);
+        // タブを w1 へ移動 → w2 が空になり除去される
+        let r = dispatch(
+            &mut host,
+            Request::WindowMoveTab {
+                tab: t2,
+                window: w1,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(r["closed_window"].as_u64(), Some(w2));
+        // list に windows / active_window / tabs[].window が載る（後方互換の追加フィールド）
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        assert_eq!(list["active_window"].as_u64(), Some(w1));
+        assert_eq!(list["windows"].as_array().unwrap().len(), 1);
+        let tabs = list["tabs"].as_array().unwrap();
+        assert_eq!(tabs.len(), 2);
+        assert!(tabs.iter().all(|t| t["window"].as_u64() == Some(w1)));
+        // タブ分離（tab 指定の WindowNew）
+        let r = dispatch(
+            &mut host,
+            Request::WindowNew { tab: Some(t2) },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let w3 = r["window"].as_u64().unwrap();
+        assert_eq!(r["tab"].as_u64(), Some(t2));
+        assert_eq!(r["closed_window"], Value::Null);
+        // focus で w1 へ戻す
+        dispatch(
+            &mut host,
+            Request::WindowFocus { window: w1 },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let r = dispatch(&mut host, Request::WindowList, PaneOrigin::Cli).unwrap();
+        assert_eq!(r["active_window"].as_u64(), Some(w1));
+        // close で合流（タブは残る）
+        let tab_count = host.workspace().tabs().len();
+        let r = dispatch(
+            &mut host,
+            Request::WindowClose { window: w3 },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(r["moved_tabs"].as_array().unwrap().len(), 1);
+        assert_eq!(host.workspace().tabs().len(), tab_count);
+        // 存在しないウィンドウはエラー / 最後の 1 ウィンドウは閉じられない
+        assert!(dispatch(
+            &mut host,
+            Request::WindowFocus { window: 99999 },
+            PaneOrigin::Cli
+        )
+        .is_err());
+        assert!(dispatch(
+            &mut host,
+            Request::WindowClose { window: w1 },
+            PaneOrigin::Cli
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn listのsurfaceは全ウィンドウの表示タブを前面扱いする() {
+        let mut host = MockHost::new();
+        // タブ 2 枚目を作って新ウィンドウへ分離 → 両タブとも表示中になる
+        let r = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let t2 = r["tab"].as_u64().unwrap();
+        dispatch(
+            &mut host,
+            Request::WindowNew { tab: Some(t2) },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        for tab in list["tabs"].as_array().unwrap() {
+            for pane in tab["panes"].as_array().unwrap() {
+                assert_eq!(
+                    pane["surface"].as_str(),
+                    Some("foreground"),
+                    "タブ {} のペインは表示中のはず",
+                    tab["id"]
+                );
+            }
+        }
     }
 }

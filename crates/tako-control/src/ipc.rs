@@ -308,9 +308,17 @@ mod tests {
         for _ in 0..10 {
             one_roundtrip(server.endpoint());
         }
-        // 接続スレッドの終了（fd クローズ）を待つ
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let after = fd_count();
+        // 接続スレッドの終了（fd クローズ）を待つ。fd 数はプロセス全体の共有状態で、
+        // 並列実行中の他テストが一時的に開く fd でも揺れるため、落ち着くまでリトライで
+        // 待つ（真のリークなら fd は開いたままなので待っても失敗が保たれる）
+        let mut after = usize::MAX;
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            after = fd_count();
+            if after <= before + 2 {
+                break;
+            }
+        }
         assert!(
             after <= before + 2,
             "IPC 接続 10 回で fd が {before} → {after} に増えた（リーク）"

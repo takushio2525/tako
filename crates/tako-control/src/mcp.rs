@@ -524,14 +524,17 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_rename_tab",
-            "description": "タブの表示タイトルを変更する。明示リネームとして\
-                自動リネームより優先される。空文字を渡すと手動指定を解除し、\
-                自動リネーム（有効時）が再びタブ名を更新するようになる。",
+            "description": "タブの表示タイトルを変更する。\
+                source=\"manual\"（既定）は手動リネームとして自動更新をブロックする。\
+                source=\"auto\" はタスク内容に基づく自動命名として、手動リネーム済みタブは上書きしない。\
+                手動で付けた名前（tako_set_title / tako_rename_tab）は自動より常に優先される。\
+                空文字を渡すと手動指定を解除し、自動リネームが再びタブ名を更新するようになる。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "tab": { "type": "integer", "minimum": 0, "description": "対象タブ ID（省略時は呼び出し元ペインのタブ）" },
                     "title": { "type": "string", "description": "新しいタブタイトル（空文字で手動指定を解除）" },
+                    "source": { "type": "string", "enum": ["manual", "auto"], "description": "manual（既定）= 手動リネームとして自動更新をブロック。auto = 作業内容に基づく自動命名（手動リネーム済みタブは上書きしない）" },
                 },
                 "required": ["title"],
                 "additionalProperties": false,
@@ -574,6 +577,23 @@ pub fn tools() -> Vec<Value> {
                     "index": { "type": "integer", "minimum": 0, "description": "移動先インデックス（0 始まり）" },
                 },
                 "required": ["tab", "index"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_window",
+            "description": "複数ウィンドウの操作（ビューポート方式: タブ・ペインの実体は全ウィンドウで\
+                共有され、各ウィンドウは表示タブだけを持つ）。action: list = ウィンドウ一覧、\
+                new = 新しいウィンドウを開く（tab 指定でそのタブを分離、省略で新規タブ付き）、\
+                close = ウィンドウを閉じる（タブは残存ウィンドウへ合流しプロセスは殺さない）、\
+                move-tab = タブを別ウィンドウへ移動、focus = ウィンドウをアクティブにして前面化。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "new", "close", "move-tab", "focus"], "description": "省略時は list" },
+                    "tab": { "type": "integer", "minimum": 0, "description": "new: 分離するタブ ID（省略で新規タブ）/ move-tab: 移動するタブ ID" },
+                    "window": { "type": "integer", "minimum": 0, "description": "close / move-tab / focus の対象ウィンドウ ID" },
+                },
                 "additionalProperties": false,
             },
         }),
@@ -1174,6 +1194,7 @@ pub fn tools() -> Vec<Value> {
                         "description": "対象エージェントの追加 CLI 引数（丸ごと置き換え。空配列でクリア）",
                     },
                     "worker_model_policy": { "type": "string", "enum": ["inherit", "delegate", "fixed"], "description": "worker のモデル選択ポリシー（inherit: master と同じ / delegate: master が都度選ぶ / fixed: worker_model 固定）" },
+                    "tab_naming_convention": { "type": "string", "description": "タブ名の命名規則（master プロンプトに注入される自由記述。空文字でクリア。set 時）" },
                 },
                 "additionalProperties": false,
             },
@@ -1458,6 +1479,33 @@ pub fn tools() -> Vec<Value> {
                     },
                 },
                 "required": ["pane_id", "choice"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_orchestrator_report",
+            "description": "worker の報告内容を取得する（#364）。\
+                第 1 層: tmux scrollback（capture-pane -J で折返し結合。全 agent 共通）。\
+                第 2 層: 構造化ソース（claude の transcript JSONL。ペイン幅非依存の全文品質）。\
+                transcript が利用可能なら source=transcript で全文テキストを返し、scrollback_text に \
+                スクロールバック版も併記する。利用不可（codex / agy 等）なら source=scrollback。\
+                tako_read_pane（可視画面のみ）と異なり、スクロールバック履歴を遡るため長い出力も取得できる。\
+                報告の読み取りには report を使い、read_pane は配置・生存確認用に限定すること。\
+                messages で直近 n 件の assistant テキストを取得できる（古い順で返す。省略時 1 件）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane_id": { "type": "integer", "minimum": 0, "description": "worker のペイン ID（必須）" },
+                    "lines": {
+                        "type": "integer", "minimum": 1, "maximum": 100000,
+                        "description": "スクロールバック取得行数（既定 2000）",
+                    },
+                    "messages": {
+                        "type": "integer", "minimum": 1, "maximum": 1000,
+                        "description": "transcript から取得する直近 assistant メッセージ件数（既定 1。古い順で返す。総数超過時は全件）",
+                    },
+                },
+                "required": ["pane_id"],
                 "additionalProperties": false,
             },
         }),
@@ -1758,17 +1806,17 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_limit_service",
-            "description": "ステータスバーの利用制限表示サービスの状態確認・切替（Issue #321）。\
+            "description": "ステータスバーの利用制限表示サービスの状態確認・切替・再取得（Issue #321 / #357）。\
                 ステータスバーの 5h / 7d リミットメーターにどのサービス（claude / codex / agy）の値を表示するかを制御する。\
                 action=status（既定）: 現在の選択サービスと利用可能サービス一覧を返す。\
-                action=set: service で指定したサービスへ切り替える。\
-                変更は settings.json に永続化され、GUI に即時反映される。",
+                action=set: service で指定したサービスへ切り替える。変更は settings.json に永続化され、GUI に即時反映される。\
+                action=refresh: 全ペインの TUI フッターを即時再走査し、各サービスの最新メトリクスを返す。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "set"],
+                        "enum": ["status", "set", "refresh"],
                         "description": "操作種別（省略時は status）",
                     },
                     "service": {
@@ -2624,7 +2672,6 @@ fn build_request(
         "tako_rename_tab" => {
             let tab = u64_arg(args, "tab")?;
             Request::TabRename {
-                // tab 省略時は呼び出し元ペインからタブを解決する（Equalize と同パターン）
                 pane: if tab.is_none() {
                     Some(target_pane(args, caller)?)
                 } else {
@@ -2632,6 +2679,7 @@ fn build_request(
                 },
                 tab,
                 title: str_arg(args, "title")?.ok_or("title を指定する")?,
+                source: str_arg(args, "source")?,
             }
         }
         "tako_create_tab" => Request::TabNew {
@@ -2645,6 +2693,30 @@ fn build_request(
             tab: required_u64(args, "tab")?,
             index: required_u64(args, "index")? as usize,
         },
+        "tako_window" => {
+            let action = str_arg(args, "action")?.unwrap_or_else(|| "list".into());
+            match action.as_str() {
+                "list" => Request::WindowList,
+                "new" => Request::WindowNew {
+                    tab: u64_arg(args, "tab")?,
+                },
+                "close" => Request::WindowClose {
+                    window: required_u64(args, "window")?,
+                },
+                "move-tab" => Request::WindowMoveTab {
+                    tab: required_u64(args, "tab")?,
+                    window: required_u64(args, "window")?,
+                },
+                "focus" => Request::WindowFocus {
+                    window: required_u64(args, "window")?,
+                },
+                other => {
+                    return Err(format!(
+                        "action が不正: {other}（list | new | close | move-tab | focus）"
+                    ))
+                }
+            }
+        }
         "tako_move_pane_to_tab" => {
             let new_tab = bool_arg(args, "new_tab")?.unwrap_or(false);
             Request::MovePane {
@@ -2879,6 +2951,7 @@ fn build_request(
             agent_skip_permissions: bool_arg(args, "agent_skip_permissions")?,
             agent_args: str_vec_arg(args, "agent_args")?,
             worker_model_policy: str_arg(args, "worker_model_policy")?,
+            tab_naming_convention: str_arg(args, "tab_naming_convention")?,
         },
         "tako_orchestrator_layout" => Request::OrchestratorLayout {
             policy: str_arg(args, "policy")?,
@@ -2924,6 +2997,11 @@ fn build_request(
                 task_type: str_arg(args, "task_type")?,
             }
         }
+        "tako_orchestrator_report" => Request::OrchestratorReport {
+            pane_id: required_u64(args, "pane_id")?,
+            lines: u64_arg(args, "lines")?.map(|v| v as usize),
+            messages: u64_arg(args, "messages")?.map(|v| v as usize),
+        },
         "tako_orchestrator_worker_status" => Request::OrchestratorWorkerStatus {
             pane_id: required_u64(args, "pane_id")?,
             session_id: str_arg(args, "session_id")?,
@@ -3884,7 +3962,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 101);
+        assert_eq!(tools.len(), 103);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

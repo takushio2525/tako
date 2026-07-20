@@ -4,34 +4,22 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-17・#282 remote 刷新 弾3 = 統合ブランチ開始）
+## 現在の対象（2026-07-19・main 統合同期完了）
 
-**ブランチ `renewal/remote-transport`（このブランチ）で Tailscale transport 一本化を実装済み**:
+**統合ブランチ `renewal/remote-transport` に origin/main（23cbb59 まで 47 コミット）をマージ済み**
 
-- `tako-control::tailscale` 新設: CLI 検出（brew / App Store）・setup 状態判定
-  `setup_status()`（弾 6 ウィザードと共有）・serve start/stop/state・ts.net URL 解決
-- remote daemon: cloudflared / Quick Tunnel / KV リレー / `--insecure` を全削除。
-  start 時に setup 判定 → 不足列挙 + `tako remote setup` 誘導で停止 → serve 設定 →
-  固定 ts.net URL を提示。stop / 異常終了時は**自分が設定した serve のみ**解除
-- protocol / dispatch / host / tako-app / CLI / MCP から insecure を同期削除。
-  PWA から relay 解決を削除。`web/tako-remote-worker/` 削除。
-  setup 依存チェック（#88）から cloudflared 削除。docs / README 更新済み
-- 検証で直した main 由来バグ: daemon_status が 3 行 PID 形式（#280）に未追従で常に
-  running=false / spawn_daemon が PATH の旧 tako へ化ける / 子 stderr の握りつぶし
-
-## 検証状態
-
-- 品質ゲート（fmt / clippy -D warnings / build / test 843 本）+ 隔離セルフテスト完走
-- 未 setup 4 状態（未導入 / デーモン未起動 / 未ログイン / HTTPS 未有効）の start 拒否を実測
-- fake tailscale で start → serve 設定 → API 到達 → stop → serve off、SIGKILL 残骸再利用、
-  別ポート残骸拒否、管理外 serve 保護、stop 二重実行を実測
-- 実 tailnet 通し実測も達成（2026-07-17）: start → 固定 ts.net URL へ TLS 検証込み到達
-  （health / PWA / 認証 API / WS 101）→ stop → 到達不能 + serve 設定ゼロ。
-  受け入れ条件 1〜4 完了、証拠は Issue #282 コメント。iPhone 実機到達のみ要実機確認
+- remote 刷新（弾 3〜7、#282〜#287）は実装・検証完了（経緯は progress.md / 各 Issue）
+- main 側の #391（setup 対話復元）/ #358（ツールカタログのスナップショット検証化）/
+  #384（fail-safe PID 検証）/ #392（失敗トースト撤去）等を取り込み
+- コンフリクト解決の要点: remote.rs = renewal 全面刷新が正 + main の #384/#330 を統合、
+  setup.rs = #391 の対話起動と remote setup 案内を両立、
+  changes.yaml = main の rev 11 を維持し Tailscale エントリを rev 12 へ振り直し
 
 ## 次の一手
 
-- 弾 4（#283 機器ペアリング認証 + PWA daemon 配信化）をこのブランチに積む
+- iPhone 実機確認（main 最新修正 + remote 刷新を両方含むビルドで）
+- #287 の master レビュー・main マージ判断（renewal → main の逆マージは次フェーズ）
+- v0.6.0 リリース判断
 
 ## 現フェーズで Read すべき設計書
 

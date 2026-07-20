@@ -303,6 +303,77 @@ fn tool_summary(input: &Value) -> String {
     truncate_chars(&input.to_string(), SUMMARY_MAX_CHARS)
 }
 
+/// transcript から直近 `count` 件の assistant テキスト（text ブロックのみ）を抽出する。
+/// tool_use / thinking は含めない。report コマンド用の軽量版
+pub fn last_assistant_texts(session_id: &str, count: usize) -> Result<Vec<String>, String> {
+    if !is_valid_session_id(session_id) {
+        return Err("session_id の形式が不正（英数とハイフンのみ）".into());
+    }
+    let path = find_transcript(session_id)
+        .ok_or_else(|| format!("session {session_id} の transcript が見つからない"))?;
+    let file = std::fs::File::open(&path).map_err(|e| format!("transcript を開けない: {e}"))?;
+    let reader = std::io::BufReader::new(file);
+    Ok(extract_assistant_texts(
+        reader.lines().map_while(Result::ok),
+        count.max(1),
+    ))
+}
+
+/// JSONL 行ストリームから assistant の text ブロックだけ抽出し、末尾 count 件を返す
+fn extract_assistant_texts(lines: impl Iterator<Item = String>, count: usize) -> Vec<String> {
+    let mut out: VecDeque<String> = VecDeque::with_capacity(count + 1);
+    let mut last_request_id: Option<String> = None;
+
+    for line in lines {
+        let Ok(obj) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if obj["isSidechain"].as_bool() == Some(true) {
+            continue;
+        }
+        match obj["type"].as_str() {
+            Some("user") => {
+                last_request_id = None;
+            }
+            Some("assistant") => {
+                let request_id = obj["requestId"].as_str().map(|s| s.to_string());
+                let Some(blocks) = obj["message"]["content"].as_array() else {
+                    continue;
+                };
+                let mut text = String::new();
+                for block in blocks {
+                    if block["type"].as_str() == Some("text") {
+                        if let Some(t) = block["text"].as_str() {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(t);
+                        }
+                    }
+                }
+                if text.is_empty() {
+                    continue;
+                }
+                let merged =
+                    request_id.is_some() && request_id == last_request_id && !out.is_empty();
+                if merged {
+                    let prev = out.back_mut().unwrap();
+                    prev.push('\n');
+                    prev.push_str(&text);
+                } else {
+                    out.push_back(text);
+                    last_request_id = request_id;
+                    if out.len() > count {
+                        out.pop_front();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// 文字数ベースの切り詰め（マルチバイト安全）。超過時は … を付ける
 fn truncate_chars(s: &str, max: usize) -> String {
     let s = s.trim().replace('\n', " ");
@@ -508,5 +579,56 @@ mod tests {
         assert_eq!(try_parse_numbered_line("2) world", 2), Some("world"));
         assert_eq!(try_parse_numbered_line("1. hello", 2), None);
         assert_eq!(try_parse_numbered_line("not a number", 1), None);
+    }
+
+    #[test]
+    fn extract_assistant_textsはテキストだけ抽出する() {
+        let raw = [
+            r#"{"type":"user","message":{"content":"やって"}}"#,
+            r#"{"type":"assistant","requestId":"r1","message":{"content":[{"type":"thinking","thinking":"考え中"},{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#,
+            r#"{"type":"assistant","requestId":"r1","message":{"content":[{"type":"text","text":"完了報告"}]}}"#,
+            r#"{"type":"assistant","requestId":"r2","message":{"content":[{"type":"text","text":"補足"}]}}"#,
+        ];
+        let texts = extract_assistant_texts(lines(&raw), 10);
+        assert_eq!(texts.len(), 2);
+        assert_eq!(texts[0], "完了報告");
+        assert_eq!(texts[1], "補足");
+    }
+
+    #[test]
+    fn extract_assistant_textsはtail制限が効く() {
+        let raw: Vec<String> = (0..5)
+            .map(|i| {
+                format!(
+                    r#"{{"type":"assistant","requestId":"r{i}","message":{{"content":[{{"type":"text","text":"msg{i}"}}]}}}}"#
+                )
+            })
+            .collect();
+        let texts = extract_assistant_texts(raw.into_iter(), 2);
+        assert_eq!(texts.len(), 2);
+        assert_eq!(texts[0], "msg3");
+        assert_eq!(texts[1], "msg4");
+    }
+
+    #[test]
+    fn extract_assistant_textsは同一request_idを統合する() {
+        let raw = [
+            r#"{"type":"assistant","requestId":"r1","message":{"content":[{"type":"text","text":"前半"}]}}"#,
+            r#"{"type":"assistant","requestId":"r1","message":{"content":[{"type":"text","text":"後半"}]}}"#,
+        ];
+        let texts = extract_assistant_texts(lines(&raw), 10);
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0], "前半\n後半");
+    }
+
+    #[test]
+    fn extract_assistant_textsはsidechainを除外する() {
+        let raw = [
+            r#"{"type":"assistant","isSidechain":true,"requestId":"r1","message":{"content":[{"type":"text","text":"サブ"}]}}"#,
+            r#"{"type":"assistant","requestId":"r2","message":{"content":[{"type":"text","text":"本"}]}}"#,
+        ];
+        let texts = extract_assistant_texts(lines(&raw), 10);
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0], "本");
     }
 }

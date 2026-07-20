@@ -806,7 +806,7 @@ impl LimitService {
     pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Agy];
 }
 
-/// Claude TUI フッターから抽出したエージェントメトリクス
+/// TUI フッターから抽出したエージェントメトリクス（claude / codex 両対応。#357）
 #[derive(Debug, Clone, Default)]
 pub struct AgentMetrics {
     /// コンテキスト使用率（0–100）
@@ -819,19 +819,35 @@ pub struct AgentMetrics {
     pub limit_5h: Option<u32>,
     /// 週リミット使用率（0–100。「7d NN%」「週 NN%」表示から抽出。#217）
     pub limit_week: Option<u32>,
+    /// メトリクスの取得元（#357: サービス別にルーティングするため）
+    pub source: MetricsSource,
 }
 
-/// 画面行リストから Claude TUI フッターのメトリクスをパースする
+/// メトリクスの取得元 CLI 種別（#357）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MetricsSource {
+    #[default]
+    Unknown,
+    Claude,
+    Codex,
+}
+
+/// 画面行リストから Claude / Codex TUI フッターのメトリクスをパースする（#357 拡張）
 fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
-    // Claude TUI のフッターは画面末尾 8 行以内にある（ステータスバー + ヒント行）
+    // TUI のフッターは画面末尾 8 行以内にある（ステータスバー + ヒント行）
     let scan_lines: Vec<_> = lines.iter().rev().take(8).collect();
     let mut ctx_percent = None;
     let mut ctx_detail = None;
     let mut usage_text = None;
     let mut limit_5h = None;
     let mut limit_week = None;
+    // codex 固有: `primary NN%` / `secondary NN%`（#357）
+    let mut codex_primary = None;
+    let mut codex_secondary = None;
+    let mut source = MetricsSource::Unknown;
 
     for line in &scan_lines {
+        // --- Claude パターン ---
         // リミット表示（「5h NN%」「7d NN%」「週 NN%」。#217 ステータスバー）
         if limit_5h.is_none() {
             limit_5h = extract_labeled_percent(line, "5h");
@@ -840,17 +856,41 @@ fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
             limit_week =
                 extract_labeled_percent(line, "7d").or_else(|| extract_labeled_percent(line, "週"));
         }
-        // `ctx NN%` / `context NN%` パターン（プログレスバー文字を含む行）
+
+        // --- Codex パターン（#357）---
+        // `primary NN%` / `secondary NN%`（codex TUI フッターのレート制限表示）
+        if codex_primary.is_none() {
+            codex_primary = extract_labeled_percent(line, "primary");
+        }
+        if codex_secondary.is_none() {
+            codex_secondary = extract_labeled_percent(line, "secondary");
+        }
+
+        // `ctx NN%` / `context NN%` / `Context NN% used` / `Context NN% left`
         if ctx_percent.is_none() {
             let after = line
+                .to_ascii_lowercase()
                 .find("ctx")
-                .map(|pos| &line[pos + 3..])
-                .or_else(|| line.find("context").map(|pos| &line[pos + 7..]));
-            if let Some(after) = after {
+                .and_then(|pos| line.get(pos + 3..))
+                .or_else(|| {
+                    line.to_ascii_lowercase()
+                        .find("context")
+                        .and_then(|pos| line.get(pos + 7..))
+                })
+                .map(|s| s.to_string());
+            if let Some(ref after) = after {
                 if let Some(pct) = extract_percent(after) {
-                    ctx_percent = Some(pct.min(100));
+                    // codex は `Context NN% left` 表記（used = 100 - left）
+                    let is_left = after.contains("left");
+                    ctx_percent = Some(
+                        if is_left {
+                            100u32.saturating_sub(pct)
+                        } else {
+                            pct
+                        }
+                        .min(100),
+                    );
                 }
-                // ctx 詳細: `NNNK/NNNK` パターン（例: "128K/200K"）
                 if ctx_detail.is_none() {
                     ctx_detail = extract_ctx_detail(after);
                 }
@@ -865,6 +905,17 @@ fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
         }
     }
 
+    // ソース判定: codex primary/secondary があれば Codex、5h/7d があれば Claude
+    if codex_primary.is_some() || codex_secondary.is_some() {
+        source = MetricsSource::Codex;
+        // codex の primary/secondary を limit_5h/limit_week にマッピング
+        // （UI は共通のメーター構造を使う）
+        limit_5h = codex_primary;
+        limit_week = codex_secondary;
+    } else if limit_5h.is_some() || limit_week.is_some() {
+        source = MetricsSource::Claude;
+    }
+
     if ctx_percent.is_none() && usage_text.is_none() && limit_5h.is_none() && limit_week.is_none() {
         return None;
     }
@@ -874,6 +925,7 @@ fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
         usage_text,
         limit_5h,
         limit_week,
+        source,
     })
 }
 
@@ -1524,5 +1576,48 @@ mod tests {
         let m = parse_agent_metrics(&lines).unwrap();
         assert_eq!(m.ctx_percent, Some(30));
         assert_eq!(m.usage_text.as_deref(), Some("45m 78%"));
+    }
+
+    #[test]
+    fn codexのprimary_secondaryパース() {
+        // codex TUI 典型フッター（primary/secondary + Context）
+        let lines = vec![
+            "some output".into(),
+            "".into(),
+            " > ".into(),
+            "primary 42%secondary 18%Context 67% used".into(),
+        ];
+        let m = parse_agent_metrics(&lines).unwrap();
+        assert_eq!(m.source, MetricsSource::Codex);
+        assert_eq!(m.limit_5h, Some(42));
+        assert_eq!(m.limit_week, Some(18));
+        assert_eq!(m.ctx_percent, Some(67));
+    }
+
+    #[test]
+    fn codexのcontext_left表記() {
+        // codex は `Context NN% left` 表記（used ではなく残り）
+        let lines = vec!["Context 30% left".into()];
+        let m = parse_agent_metrics(&lines).unwrap();
+        // 30% left → 70% used
+        assert_eq!(m.ctx_percent, Some(70));
+    }
+
+    #[test]
+    fn codexのprimary単独() {
+        let lines = vec!["primary 85%".into()];
+        let m = parse_agent_metrics(&lines).unwrap();
+        assert_eq!(m.source, MetricsSource::Codex);
+        assert_eq!(m.limit_5h, Some(85));
+        assert_eq!(m.limit_week, None);
+    }
+
+    #[test]
+    fn claude_source判定() {
+        let lines = vec!["5h 23%  7d 45%".into()];
+        let m = parse_agent_metrics(&lines).unwrap();
+        assert_eq!(m.source, MetricsSource::Claude);
+        assert_eq!(m.limit_5h, Some(23));
+        assert_eq!(m.limit_week, Some(45));
     }
 }

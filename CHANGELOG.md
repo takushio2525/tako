@@ -51,6 +51,196 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   *New threat model at `.agent/threat-model-remote.md`. Resolved "no remote" contradiction
   in architecture.md.*
 
+## [0.5.7] - 2026-07-19
+
+Nightly patch release (automated). Changes since v0.5.6:
+夜間パッチリリース（自動）。v0.5.6 以降の変更:
+
+- [ドキュメント] activeContext / progress を #340 監査完了で更新
+- [改善] sleep guard の busy 判定を UI スレッドから background へ移動 (#340) (#370)
+- [ドキュメント] activeContext / progress を #339 実装完了で更新
+- [機能追加] 複数ウィンドウ対応: ビューポート方式で別ウィンドウに別タブを表示 (#339) (#367)
+- [ドキュメント] activeContext / progress を #364 実装完了で更新
+- [機能追加] orchestrator report: scrollback + transcript 2 層で worker 報告を取得 (#364) (#366)
+- [ドキュメント] activeContext / progress を #338 再修正完了で更新
+- [修正] チェンジログビューの git 検出が .app 環境で全滅する問題を根治 (#338) (#365)
+- [ドキュメント] activeContext / progress を #308 再修正完了で更新
+- [ドキュメント] activeContext / progress を #312 再修正完了で更新
+- [修正] タブ D&D がウインドウ移動に食われる競合を根治 (#308) (#363)
+- [修正] 赤ボタン close → Dock 復帰でタブが空になるバグを根治 (#312) (#362)
+- [ドキュメント] activeContext / progress を #321 再修正完了で更新
+- [修正] ステータスバーのサービス切替ドロップダウンが開かない問題を根治 (#321) (#361)
+
+## [Unreleased]
+
+- [機能追加] PDF プレビューで文字選択ドラッグ中の端到達で自動スクロール (#309)
+  ペイン上下端 40px のマージン内で速度変化付き自動スクロールが開始され、ページ境界を
+  またいだ連続選択・コピーが可能に。ターミナル側の #310 と同じ操作感・速度カーブ。
+  PDF preview now auto-scrolls during text selection drag near viewport edges,
+  enabling cross-page selection and copy. Same feel and speed curve as #310.
+
+- [改善] 利用制限表示にリロードボタンを追加 + agy を「unsupported」明示表示に (#357)
+  USAGE LIMITS ドロップダウンのヘッダーにリロードボタンを追加し、全ペインの TUI フッターを
+  即時再走査して最新メトリクスを取得する。agy の制限データ取得は不可能と確定したため
+  「--」から「unsupported」明示表示に変更。CLI `tako limit-service --refresh` +
+  MCP `tako_limit_service` action=refresh で 1:1 公開。
+  Add a reload button to the USAGE LIMITS dropdown (#357). The button re-scans
+  all pane TUI footers immediately for the latest metrics. agy is confirmed
+  unsupported and now explicitly shown as such instead of "--".
+
+- [修正] sleep-guard の busy_agents が稼働中 worker を数えない問題を根治 (#372)
+  旧実装は OSC 133 の CommandState が Unknown のバックエンドのみ子プロセス判定していたが、
+  TUI エージェント（claude 等）が Idle→Running に遷移しないケースで busy=0 のまま assertion
+  未保持になっていた。全バックエンドの子プロセス判定に変更し、`status()` の busy_agents
+  ハードコード 0 も修正。
+- [スタイル] タブ D&D 並べ替え時のドロップ先挿入位置インジケータを改善 (#371)
+  ドラッグ中に挿入位置を示す縦線バー（3px + accent glow）を表示、ソースタブを
+  半透明 + 点線ボーダーで「掴まれた」状態に変化。ライト/ダーク両テーマ対応。
+  Tab D&D indicator now shows a vertical bar (3px + accent glow) at the drop
+  position, and the dragged tab becomes translucent with a dashed border.
+
+- [改善] claude session スキャンの Node 起動コスト削減 (#368)
+  `claude agents --json` の 5 秒毎無条件実行（1 コア 4% 相当の常時消費）を 3 層で最適化:
+  スキャン間隔 5s→30s + イベント駆動即時スキャン、前段ガード（実行中子プロセスの
+  有無で Node 起動自体をスキップ）、TTL 2s→5s（watch 重複抑制）。
+  アイドル時の Node 起動を完全排除（実測 12 回/分→0 回/分）
+
+  Reduce CPU cost of the claude session scanner (#368). The unconditional
+  5-second `claude agents --json` poll (≈4% of one core) is optimised in three
+  layers: scan interval 5s→30s with event-driven immediate re-scan on spawn /
+  prompt delivery, a pre-check guard that skips the Node launch entirely when no
+  child processes are running in backend sessions, and TTL 2s→5s to deduplicate
+  watch/worker_status calls. Idle Node launches drop from 12/min to 0/min.
+- [改善] sleep guard の busy 判定を UI スレッドから background へ移動 (#340)
+  persist 復元後の Unknown ペイン常在時、2 秒毎の子プロセス判定（tmux + ps 実行）が
+  UI スレッドを p50 42ms 専有し続けていた（#324 で導入、#212 の pmset と同型）。
+  判定を background executor へ移し、UI 側は Unknown ペインの収集のみに変更
+
+  Move sleep guard busy detection off the UI thread to the background (#340).
+  With Unknown panes persisting after restore, the 2-second child-process check
+  (spawning tmux + ps) was occupying the UI thread for p50 42ms per tick
+  (introduced in #324; same pattern as the #212 pmset issue). The check now runs
+  on the background executor; the UI thread only collects Unknown pane names.
+
+- [機能追加] 複数ウィンドウ対応: ビューポート方式で別ウィンドウに別タブを表示 (#339)
+  単一アプリ状態（タブ・ペイン・tmux・discovery）を複数ウィンドウで共有し、各ウィンドウは
+  表示タブだけを持つ。New Window（⌘⇧N）が状態共有の追加ウィンドウになり、タブの
+  ウィンドウ間移動・persist でのウィンドウ配置復元・`tako window` CLI / MCP `tako_window`
+  （101 ツール）・`tako list` へのウィンドウ情報追加（後方互換）を含む。赤ボタン close は
+  複数枚ならタブを残存ウィンドウへ合流（プロセス維持）、最後の 1 枚は従来どおり
+  Dock 復帰（#312）と整合
+
+  Multi-window support: viewport model showing different tabs per window (#339).
+  A single app state (tabs, panes, tmux, discovery) is shared across windows; each
+  window only holds which tab it displays. New Window (⌘⇧N) now opens a
+  state-sharing viewport. Includes moving tabs between windows, window layout
+  persistence/restore, `tako window` CLI / MCP `tako_window` (101 tools), and
+  backward-compatible window info in `tako list`. Closing a non-last window merges
+  its tabs into a remaining window (processes preserved); closing the last window
+  keeps the #312 Dock-revival behavior.
+
+- [機能追加] orchestrator report: worker 報告の scrollback + transcript 直読 (#364)
+  `tako orchestrator report` / MCP `tako_orchestrator_report` で worker の出力を
+  ペイン幅に依存しない tmux スクロールバック + claude transcript 2 層で取得（100 ツール）。
+  worker-status に history フィールド（履歴行数/バイト）を追加
+
+  orchestrator report: scrollback + transcript-based worker report reading (#364).
+  `tako orchestrator report` / MCP `tako_orchestrator_report` retrieves worker output
+  via width-independent tmux scrollback + claude transcript two-layer approach (100 tools).
+  Added history field (lines/bytes) to worker-status.
+
+## [0.5.6] - 2026-07-18
+
+Nightly patch release (automated). Changes since v0.5.5:
+夜間パッチリリース（自動）。v0.5.5 以降の変更:
+
+- [ドキュメント] activeContext / progress を #287 修正完了で更新
+- [改善] Web ビューの読み込み失敗にエラー表示 + リトライ導線を追加 (#327) (#360)
+- [ドキュメント] activeContext / progress を #357 完了で更新
+- [機能追加] codex の利用制限データ取得: ドロップダウンの「--」を実データに (#357) (#359)
+- [修正] IME 変換候補ウィンドウが途中から表示されなくなる問題を修正 (#332) (#350)
+- [改善] tako setup の品質向上: ルール項目比較・次の一歩案内・最簡形コマンド案内 (#322) (#330)
+- [修正] Web ビューフォーカス時のグローバルショートカット不発を修正 (#326) (#354)
+- [機能追加] ステータスバー利用制限表示の改修: サービス切替ドロップダウン + 7d 表記 (#321) (#355)
+- [修正] MCP ツールカタログ期待値を 98 に修正（#308 と #338 の squash merge 競合） (#356)
+- [機能追加] ターミナルの選択ドラッグ中に上下端到達で自動スクロール (#310) (#353)
+- [機能追加] タブバーの D&D 並べ替え + CLI/MCP 操作 (#308) (#352)
+- [機能追加] プレビューペインにチェンジログビュー切替 (#338) (#348)
+- [ドキュメント] activeContext / progress を #320 完了で更新
+- [修正] workers ドロップダウンの背景透過を修正 (#341) (#346)
+- [改善] シンタックスハイライト対応形式を 75→210+ に拡充 (#320) (#351)
+- [ドキュメント] activeContext / progress を #314 完了で更新
+- [改善] ファイルツリー右クリメニュー改善: デフォルトアプリ/アプリ選択で開く + 見切れ修正 (#314) (#349)
+- [ドキュメント] activeContext / progress を #333 完了で更新
+- [機能追加] エラーレポートの自動送信基盤（テレメトリ）(#333) (#345)
+- [修正] 不正 URL による Web ビュー panic クラッシュを根治 (#334) (#347)
+- [機能追加] worker の permission ダイアログ検知 + 構造化応答 API (#319) (#344)
+- [修正] run-interactive の余分な Enter 注入と exit マーカー行頭限定を根治 (#325) (#342)
+- [ドキュメント] activeContext / progress を #313 完了で更新
+- [修正] git タブがファイルツリーの表示リポジトリに追随しない問題を根治 (#313) (#331)
+- [ドキュメント] activeContext / progress を #324 完了で更新
+- [修正] sleep-guard の busy_agents が復元 worker を数えない問題を根治 (#324) (#328)
+- [ドキュメント] activeContext / progress を #315 完了で更新
+- [修正] PDF プレビューのリンク ⌘クリック無反応を根治 (#315) (#323)
+- [ドキュメント] activeContext / progress を #312 完了で更新
+- [修正] macOS ウインドウ操作: タブバードラッグ移動 + 赤ボタン後の Dock 復帰 (#312) (#318)
+- [修正] sleep-guard: 蓋閉じ運用時にディスプレイが点灯したままになる問題を修正 (#311) (#317)
+- [ドキュメント] activeContext / progress を #307 完了で更新
+- [機能追加] 左サイドバーのドラッグリサイズ + 幅の永続化・CLI/MCP 操作 (#307) (#316)
+- [機能追加] 対話コマンドのペイン委譲 run-interactive を MCP/CLI の標準動作として実装 (#305) (#306)
+- [修正] TAKO_ISOLATED の隔離セルフテストが本番 ledger.yaml に書き込む問題を根治 (#303) (#304)
+- [修正] MCP 登録パス消失の検知・自己修復を追加 (#299) (#302)
+- [機能追加] 委任台帳: タスク×モデル×結果の自動蓄積 + 検収記録 CLI + 判断基準の二層化 (#292) (#301)
+- [修正] master タスク受付にプロジェクト照合の順序制約を追加 (#263) (#300)
+- [修正] nightly-release の npm 不在による GitHub Release 未作成を根治 (#297) (#298)
+- [修正] agents idle をバックグラウンドシェルの子プロセスで覆さない (#289) (#293)
+
+## [Unreleased]
+
+### Added / 機能追加
+
+- codex の利用制限データ（primary / secondary）を実データで表示: codex TUI フッターの `primary NN%` / `secondary NN%` パターンをスクレイピングし、ステータスバーのサービス切替ドロップダウンに実データを反映。agy は CLI にレート制限表示機能が無いため「未対応」として明示 (#357)
+  Codex usage limit data (primary / secondary) now displays real data: scrapes `primary NN%` / `secondary NN%` patterns from the Codex TUI footer and reflects actual data in the status bar service switcher dropdown. agy is marked as "unsupported" since the CLI lacks rate limit display (#357)
+- ステータスバーの利用制限表示を改修: 「週」→「7d」表記に統一、サービス切替ドロップダウン（claude / codex / agy）を追加。サービス別の色ドット + ラベルで視覚的区別。選択は settings.json に永続化。データ経路の無いサービスは「--」で明示。CLI `tako limit-service` + MCP `tako_limit_service`（99 ツール）(#321)
+  Status bar usage limit display revamp: changed "週" → "7d" notation, added service switcher dropdown (claude / codex / agy) with per-service color dot + label. Selection persists in settings.json. Services without data show "--". CLI `tako limit-service` + MCP `tako_limit_service` (99 tools) (#321)
+- ターミナルペインで選択ドラッグ中にビューポート上下端へ到達すると自動スクロールして選択を継続できるようになった。端への近さでスクロール速度が変化する（最小 2 行/秒、最大 30 行/秒）。上方向はスクロールバックへの遡り、下方向は最新出力方向。alt_screen（全画面 TUI）では従来挙動を維持 (#310)
+  Terminal pane now auto-scrolls during selection drag when the cursor reaches the top or bottom edge of the viewport, extending the selection into scrollback history. Scroll speed increases with proximity to the edge (2–30 lines/sec). Alt-screen (fullscreen TUI) behavior is unchanged (#310)
+- タブバーのタブ D&D 並べ替え: タブを掴んで左右にドラッグすると順序が変わる。挿入位置にアクセントカラーのインジケータを表示。並び順は persist（layout.json）に自動反映。CLI `tako tab reorder` + MCP `tako_reorder_tab`（97 ツール）で操作可能 (#308)
+  Tab bar drag-and-drop reorder: drag tabs left/right to change order. An accent-colored insertion indicator shows the drop position. Order persists in layout.json automatically. CLI `tako tab reorder` + MCP `tako_reorder_tab` (97 tools) (#308)
+- エラーレポートの自動送信基盤（テレメトリ）: panic / 重大エラーを PII なしで Cloudflare Workers エンドポイントへ自動送信。既定 OFF（opt-in）。送信内容はすべてローカルの telemetry.log に記録される透明性設計。CLI `tako telemetry status/on/off` + MCP `tako_telemetry` で操作可能。スキーマ・保持期間 90 日・削除依頼先を docs に明記 (#333)
+  Automatic error reporting (telemetry): sends panic / critical errors to a Cloudflare Workers endpoint with no PII. Disabled by default (opt-in). All sent reports are logged locally to telemetry.log for transparency. CLI `tako telemetry status/on/off` + MCP `tako_telemetry`. Schema, 90-day retention, and deletion contact documented (#333)
+- シンタックスハイライト対応形式の大幅拡充: syntect デフォルト 75 構文 → bat 由来の拡張セット 210+ 構文（two-face crate）。TOML・Dockerfile・TypeScript（ネイティブ）・Swift・Kotlin・INI・DotENV・CMake 等が新たに対応。ファイル名ベースの判定も追加（Cargo.lock → TOML、CMakeLists.txt → CMake、.gitignore → Git Ignore 等）。バイナリサイズ増加は約 550KB (#320)
+  Syntax highlighting coverage expansion: from 75 default syntect grammars to 210+ via two-face crate (bat-curated set). Newly supported: TOML, Dockerfile, TypeScript (native), Swift, Kotlin, INI, DotENV, CMake, and more. Filename-based detection added (Cargo.lock → TOML, CMakeLists.txt → CMake, .gitignore → Git Ignore, etc.). Binary size increase ~550KB (#320)
+- `tako setup` の品質向上: 既存グローバル指示ファイルと同梱推奨ルール（7 項目）の項目レベル差分比較（不足の可能性を具体的に提示、差分ゼロは「差分なし」明示、表示のみでファイル不変）、完了サマリに「次の一歩」（`tako master` の最短導線 + プロファイルの現在値と説明）、tako 内での対話 setup 完了直後の master 開始提案。コマンド案内は最簡形に統一（default プロファイルは `tako master`、`-default` を見せない）。「最も簡単なコマンドを提案する」原則を AGENTS.md / .agent/conventions.md に明文化 (#322)
+  `tako setup` quality: item-level diff of existing global instructions against bundled recommended rules (7 sections; concrete gaps reported, "no diff" stated explicitly, display-only), completion summary now includes "next steps" (shortest path via `tako master` + current profile values), and offers to start master right away when run interactively inside tako. Command guidance unified to simplest form (`tako master`, never `-default`); "suggest the simplest command" principle documented in AGENTS.md / .agent/conventions.md (#322)
+- 左サイドバー（Files ツリー）の境界ドラッグリサイズ: 右端をドラッグして幅変更、最小 120px / 最大ウィンドウ幅 50% でクランプ、幅は settings.json に永続化、CLI `tako panel --sidebar-width` / MCP `sidebar_width` で操作可能 (#307)
+  Sidebar drag resize: drag the right edge to adjust Files sidebar width, clamped to 120px min / 50% of window max, persisted in settings.json, controllable via CLI `tako panel --sidebar-width` / MCP `sidebar_width` (#307)
+- 対話コマンドのペイン委譲 `tako run-interactive`: sudo パスワード・ブラウザ認証等のユーザー入力が必要なコマンドを可視ペインに委譲。split → タイトル設定 → コマンド投入をアトミックに実行し、exit code 回収と auto_close で後片付けまで自動化。MCP `tako_run_interactive` / `tako_run_interactive_status` + CLI 1:1（計 94 ツール）(#305)
+  Interactive command delegation `tako run-interactive`: delegates commands requiring user input (sudo, browser auth) to a visible pane. Atomically splits, titles, and runs the command with exit code recovery marker. Auto-close on success (configurable). MCP `tako_run_interactive` / `tako_run_interactive_status` + CLI 1:1 (94 tools total) (#305)
+- 委任台帳: spawn/run 時に task_type × model × 結果を自動蓄積 + 検収記録 CLI + ユーザーフィードバック反映 + 判断基準の二層化 (#292)
+  Delegation ledger: auto-records task_type × model × outcome on spawn/run, CLI/MCP for acceptance recording (record/amend), judgment criteria two-layer injection (built-in defaults + local overrides), survey frequency control (#292)
+
+### Fixed / 修正
+
+- Web ビューにフォーカスがあるとき tako のグローバルショートカット（⌘K / ⌘T / ⌘W 等）が効かない問題を修正: macOS の NSEvent local monitor で ⌘ キーイベントを先取りし、first responder が WKWebView なら GPUI の content view へ戻す。⌘C/⌘V 等の編集系は webview へそのまま渡す。コマンドパレット等のオーバーレイ表示中は webview を非表示にして重なりも解消 (#326)
+  Fixed global shortcuts (Cmd+K / Cmd+T / Cmd+W, etc.) not working when a Web view pane has focus: installed a macOS NSEvent local monitor that intercepts Cmd-modified key events and switches the first responder from WKWebView back to the GPUI content view for tako shortcuts while passing editing keys (Cmd+C/V, etc.) through to the webview. Also hides webviews when overlays (command palette, close confirm) are active to prevent z-order conflicts (#326)
+- master ペインの workers ドロップダウンの一覧項目に背景色がなく背後のターミナル文字が透けて見える問題を修正: GPUI の描画順でメニューがターミナルテキストエリアの前に描画されていたのをペイン div の最後尾に移動 (#341)
+  Fixed workers dropdown list items having no background with terminal text bleeding through: moved the absolute-positioned menu to be painted last within the pane div, after the terminal text area (#341)
+- IME の変換候補ウィンドウが途中から表示されなくなる問題を修正: GPUI の focus 喪失（外部 a11y 経由の blur 等）で input handler が登録されなくなり、日本語 IM の printable キーが IME を素通りして ASCII のまま terminal へ入り続ける構造欠陥に、render での focus 自己修復を追加。変換中ペインの close で IME 状態を畳む・確定先の stale ペイン防御・zed 準拠の invalidateCharacterCoordinates 呼び出し（確定時 / フォーカスペイン切替時）も追加 (#332)
+  Fixed IME conversion candidate window disappearing mid-session: when GPUI focus is lost (e.g. externally-triggered a11y blur) the input handler is never registered, so Japanese IME printable keys bypass the IME and land as raw ASCII. Added focus self-healing in render, folding of IME composition state when its target pane closes, stale commit-target fallback to the focused pane, and zed-style invalidateCharacterCoordinates on commit / pane-focus change (#332)
+- PDF プレビューのリンク ⌘クリックが無反応だった問題を根治: ページ画像 bounds をテキストレイヤからの逆算ではなく描画時に直接記録する方式に変更。テキストのないページでもリンクが動作し、全描画ページのリンクをチェック、ホバー時のカーソル変化 + 下線ハイライトを追加 (#315)
+  Fixed PDF preview link Cmd+click being unresponsive: page image bounds are now recorded directly during rendering instead of reverse-estimated from text layers. Links work on text-free pages, hit-testing checks all rendered pages, and hover visual feedback (cursor + underline) was added (#315)
+- sleep-guard: 蓋閉じ運用時にディスプレイが点灯したままになる問題を修正。disablesleep=1 中に蓋閉じを検知したら pmset displaysleepnow で画面だけ消灯 (#311)
+  sleep-guard: fixed display staying on when lid is closed with disablesleep=1. Now forces display sleep via pmset displaysleepnow when lid closure is detected while system sleep is disabled (#311)
+- TAKO_ISOLATED の隔離セルフテストが本番 ledger.yaml に書き込む問題を修正: orchestrator の config_dir を data_dir() ベースに切り替え + ledger prune コマンドの追加（CLI / MCP 1:1）(#303)
+  Fixed isolated selftest writing to production ledger.yaml: switched orchestrator config_dir to data_dir()-based resolution (respects TAKO_DATA_DIR / TAKO_ISOLATED) + added ledger prune action for cleanup (CLI / MCP 1:1) (#303)
+- MCP 登録パスが消失しても検知・自己修復されない問題を修正: 安定パス優先解決 + ヘルスチェック + master 起動時警告 (#299)
+  Fixed MCP registration pointing to a dead binary path going undetected: stable path resolution (/Applications priority), health check on existing registrations, and master startup warning (#299)
+- master がタスク受付時に登録プロジェクトの照合を最優先で行うよう順序制約を追加（プロジェクト名の誤認防止）(#263)
+  Added project resolution gate (Step 0) to master task intake: registered projects are matched before general exploration or browser access (#263)
+- nightly-release が launchd 環境（npm 不在の PATH）で GitHub Release 未作成のまま停止する問題を修正 (#297)
+  Fixed nightly-release stopping without creating GitHub Release when npm is not in PATH (launchd environment) (#297)
+
 ## [0.5.5] - 2026-07-17
 
 Nightly patch release (automated). Changes since v0.5.4:

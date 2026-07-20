@@ -67,13 +67,14 @@ pub use spawn_layout::{SpawnLayoutConfig, SpawnLayoutPolicy, WorkerLayoutAlgorit
 pub use tab::{Tab, TabId};
 pub use task_checkpoint::{TaskCheckpoint, TaskPhase};
 pub use terminal::{
-    login_shell_command, AgentMetrics, CommandState, LimitService, SelectionKind, SessionError,
-    SessionEvent, SessionNotice, SpawnCommand, SpawnOptions, TermEvent, TerminalSession,
+    login_shell_command, AgentMetrics, CommandState, LimitService, MetricsSource, SelectionKind,
+    SessionError, SessionEvent, SessionNotice, SpawnCommand, SpawnOptions, TermEvent,
+    TerminalSession,
 };
 pub use text_edit::{CursorMovement, SearchHit, TextBuffer, TextEditError};
 pub use theme::{Rgb, Theme};
 pub use tmux::{TmuxSession, TmuxWindow};
-pub use workspace::{BackgroundPane, Workspace, WorkspaceError};
+pub use workspace::{BackgroundPane, WindowId, Workspace, WorkspaceError, WorkspaceWindow};
 
 /// 外部バイナリの解決（環境変数 → PATH 直 → 既知パス → ログインシェル）。
 /// `tmux_bin()` / `git_bin()` の共通基盤

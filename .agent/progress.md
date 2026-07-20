@@ -789,6 +789,71 @@
 - 初回・2回目・`--yes`・未認証を before 5+/5+/未実装/1 → after 全 0 入力で実測。
   実 Claude Max 認証、検出競合、破損 config、複数 CLI、全品質ゲートも全緑
 
+## 2026-07-17（#307: 左サイドバーのドラッグリサイズ）
+- 右端リサイズハンドル + ドラッグ追従 + 120px〜50% クランプ + settings.json 永続化 + CLI/MCP 1:1。右パネルと同方式
+- 関連コミット: PR #316 squash merge（`e961acc`）。worktree 掃除・Issue 証拠コメント済み
+- 次: ユーザー目視確認（カーソル変化・ドラッグ・永続化）→ #307 クローズ
+
+## 2026-07-17（#312: macOS ウインドウ操作の不備修正）
+- タブバードラッグ移動（`start_window_move`）+ ダブルクリックズーム + 赤ボタン close 後の Dock 復帰（`on_reopen` + `on_window_should_close`）
+- 関連コミット: PR #318 squash merge（`9cd2535`）。worktree 掃除・Issue 証拠コメント済み
+- 次: ユーザー目視確認（ドラッグ移動・Dock 復帰・既存操作との競合なし）→ #312 クローズ
+
+## 2026-07-17（#315: PDF プレビューのリンク ⌘クリック無反応を根治）
+- 根因 = estimate_pdf_page_bounds がテキストなしページで None → ヒットテスト常時失敗。canvas paint でページ画像 bounds を直接記録する方式に変更 + 全描画ページチェック + ホバー全ペイン化 + カーソル変化 + 下線ハイライト
+- 関連コミット: PR #323 squash merge（`9373003`）。worktree 掃除・Issue 証拠コメント済み
+- 次: `build-app.sh --install` → ユーザー目視確認 → #315 クローズ
+
+## 2026-07-17（アプリ内 Web ビュー品質監査 — 調査・起票のみ、コード変更なし）
+- 隔離インスタンス（TAKO_ISOLATED=1 + release）で CLI/MCP 経由に全経路検証。最重大: 空白入り等 NSURL 不能な URL を web open/nav に渡すと wry の `NSURL::URLWithString().unwrap()`（mod.rs:826）で panic → tako 全体 abort（全ペイン消失）。#325/#326/#327 起票
+- 正常確認: URL 正規化・back/forward/reload・hide/show の SPA 維持・file:// のクロスオリジン fetch ブロック・persist 復元・close 後始末・data:/IDN
+- 未検証（別スペースで GUI 操作不可）: cmd+K 等キーボード衝突・実クリック/IME/テーマ目視 → 報告書メモに記載
+
+## 2026-07-17（#324: sleep-guard の busy_agents が復元 worker を数えない問題を根治）
+- 根因 = `update_sleep_guard()` が OSC 133 の `CommandState::Running` のみカウント。persist 復元後は `Unknown` のまま遷移しないため常に 0。`Unknown` バックエンドセッションの子プロセスをバッチ判定し busy にカウントする修正
+- 関連コミット: PR #328 squash merge（`f685e27`）。worktree 掃除・Issue 証拠コメント済み
+- 次: `build-app.sh --install` → 暫定運用復帰 → ユーザー実機確認 → #324 クローズ
+
+## 2026-07-17（#313: git タブがファイルツリーの表示リポジトリに追随しない問題を根治）
+- 根因 = git タブが `active_tab_cwd()`（フォーカスペインの cwd のみ）を参照。ファイルツリーは全ペイン cwd + pinned フォルダを集約するが git タブはこのソースを見ていなかった。`git_cwd_for_tab()` を新設しフォールバック検索に変更
+- 関連コミット: PR #331 squash merge（`2606d03`）。worktree 掃除・Issue 証拠コメント済み
+- 次: `build-app.sh --install` → ユーザー実機確認 → #313 クローズ
+
+## 2026-07-17（#319: worker の permission ダイアログ検知 + 構造化応答 API）
+- `detect_permission_dialog()` で画面から permission ダイアログを構造化検知（コマンド・選択肢・ハイライト）。`worker_status` に `permission_dialog` フィールド、watch に `WORKER_PERMISSION` イベント、`OrchestratorRespond` + CLI `respond` + MCP `tako_orchestrator_respond`（95 ツール）を追加。master prompt に安全/危険コマンドの承認規範を追記
+- 関連コミット: `f8f4dc0`（PR #344）。build / fmt / clippy / test 全緑（484 + 278 passed）
+- 次: 隔離セルフテスト + 実 claude ダイアログ実測 → squash merge → #319 クローズ
+
+## 2026-07-17（#333: エラーレポートの自動送信基盤 — テレメトリ）
+- Cloudflare Worker + Rust telemetry + panic ハンドラ + CLI/MCP 1:1（95 ツール）。既定 OFF（opt-in）。Worker デプロイ + 通し実測（人工レポート到達確認）完了
+- 関連コミット: PR #345 squash merge（`a19dd54`）。Worker テスト 11/11 + Rust テスト 12/12 + 品質ゲート全緑
+- 次: `build-app.sh --install` で反映 → #333 クローズは master 判断
+
+## 2026-07-17（#338: プレビューペインにチェンジログビュー切替を実装）
+- 「履歴」トグルでコード ⇔ git 履歴ビュー切替。コミット一覧 + ファイル単位 diff 展開。git 管理外ファイルは安全表示。CLI `tako preview-changelog` + MCP `tako_preview_changelog`（95 ツール）
+- 関連コミット: `f2c1c80`、PR #348。テスト 4 本追加（606 全緑）+ 品質ゲート全緑
+- 次: squash merge → `build-app.sh --install` → 実機確認 → #338 クローズは master 判断
+
+## 2026-07-17（#314: ファイルツリー右クリメニュー改善 — デフォルトアプリ/見切れ修正）
+- ファイル右クリに「デフォルトアプリで開く」「このアプリで開く...」追加 + コンテキストメニューの見切れ修正（フリップ/クランプ）。FileOpKind に OpenDefault / OpenWith 追加（dispatch / MCP / CLI 1:1）
+- 関連コミット: `495ca44`（PR #349 squash merge）。テスト 5 本追加（486 全緑）+ 品質ゲート全緑 + 隔離セルフテスト完走
+- 次: `build-app.sh --install` → 実機確認 → #314 クローズ
+
+## 2026-07-17（#320: シンタックスハイライト対応形式の大幅拡充）
+- two-face crate（bat 由来）を導入し 75→210+ 構文。TOML・Dockerfile・TypeScript・Swift・Kotlin・CMake 等が新規対応。ファイル名判定 + 拡張子フォールバック追加。バイナリ +550KB（2.5%）
+- 関連コミット: `5dd4bd5`（PR #351 squash merge）。テスト 7 本追加 + fmt / clippy / test 全緑
+- 次: `build-app.sh --install` → 実ファイルでの色分け目視確認
+
+## 2026-07-17（#338: プレビューペインにチェンジログビュー切替を実装）
+- 「履歴」トグルでコード ⇔ git 履歴ビュー切替。コミット一覧 + ファイル単位 diff 展開。CLI `tako preview-changelog` + MCP `tako_preview_changelog`（97 ツール）。隔離セルフテスト完走（FAILED 0 件）
+- 関連コミット: `d29005d`（PR #348 squash merge）。テスト 4 本追加 + 品質ゲート全緑
+- 次: `build-app.sh --install` → 実機確認（目視チェックリスト）→ #338 クローズは master 判断
+
+## 2026-07-17（#357: codex / agy の利用制限データ取得）
+- codex TUI の `primary NN%` / `secondary NN%` スクレイピング + サービス別メトリクス保持 + ドロップダウン実データ表示。agy は取得不能で「--」維持（調査結果を Issue にコメント）
+- 関連コミット: `690d220`（PR #359 squash merge）。テスト 4 本追加 + 品質ゲート全緑
+- 次: `build-app.sh --install` → 有料プラン codex 環境での実測確認（free tier では rate limit 表示なし）
+
 ## 2026-07-17（#282: remote 刷新 弾3 — Tailscale transport 一本化・統合ブランチ開始）
 - `renewal/remote-transport` を開始。`tako-control::tailscale` 新設（検出 / setup 判定 /
   serve 管理。判定関数は弾 6 と共有）、daemon を tailscale serve 化（固定 ts.net URL・
@@ -800,3 +865,95 @@
   実 tailnet 通し実測（start → TLS 検証込み到達（health/PWA/認証/WS 101）→ stop → 到達不能。
   受け入れ 1〜4 完了、証拠 = Issue #282 コメント。iPhone 実機到達のみ要実機確認）
 - 次: 弾 4（#283 ペアリング認証 + PWA daemon 配信）を同ブランチに積む
+
+## 2026-07-17（#287: セキュリティレビュー P1×2 + P2×4 修正）
+- P1-1 XFF identity 偽装対策（XFH 検証追加）、P1-2 PII プレースホルダ化、P2-1〜P2-4（upload 0o600 / 監査ログファイル名除去 / Windows パス redact / symlink 拒否）。threat model 正確化。テスト 9 本追加、全 843 テスト緑
+- 関連コミット: `d008e6c`（`renewal/remote-transport`）。Issue に修正証拠コメント済み
+- 次: master レビュー → main マージ判断 → 実 serve 経由 e2e → v0.6.0
+
+## 2026-07-18（#321: ステータスバーのサービス切替ドロップダウン無反応を根治）
+- 根因 = ステータスバーの container div の overflow_hidden がポップアップをクリップ。メニューをルート div のオーバーレイへ移動（#346 コンテキストメニューと同方式）。背面 dismiss 追加
+- 関連コミット: `09fde57`（PR #361 squash merge）。fmt / clippy / test 288 / セルフテスト全緑
+- 次: `build-app.sh --install` → 実機目視確認
+
+## 2026-07-18（#312 再修正: 赤ボタン close → Dock 復帰でタブが空になるバグを根治）
+- 根因 = PRIMARY_CLAIMED（#113 多重起動ガード）が swap(true) のみで false に戻す処理がなかった。赤ボタン close → プロセス生存 → on_reopen → TakoApp::new 2 回目 → セカンダリ判定 → 復元スキップ。release_primary() を新設し on_window_should_close で解放
+- 関連コミット: `5c1795e`（PR #362 squash merge）。fmt / clippy / test 288 / セルフテスト全緑
+- 次: `build-app.sh --install` → 実機確認（赤ボタン close → Dock 復帰 → タブ完全復元）
+
+## 2026-07-18（#308 再修正: タブ D&D がウインドウ移動に食われる競合を根治）
+- 根因 = GPUI の on_drag は DRAG_THRESHOLD(2px) 超過まで待機するが、親 tab-bar の on_mouse_move → start_window_move() が 1px 移動で先に発火。tab_mouse_down フラグで抑制
+- 関連コミット: `73da200`（PR #363 squash merge）。fmt / clippy / test 288 / セルフテスト全緑
+- 次: `build-app.sh --install` → 実機確認（タブドラッグ並べ替え・空き領域ウインドウ移動の両立）
+
+## 2026-07-18（#338 再修正: チェンジログビューの git 検出が .app 環境で全滅する問題を根治）
+- 根因 = `repo_root()` に `current_dir` としてファイルパスを渡すと ENOTDIR で git 実行不能。横断で `"git"` 直接指定 3 箇所も `git_bin()` に統一
+- 関連コミット: `4395f32`（PR #365 squash merge）。fmt / clippy / test 954 全緑。回帰テスト 4 本追加
+- 次: `build-app.sh --install` → Dock 起動で履歴トグル・ファイルツリー git マークの目視確認
+
+## 2026-07-18（#364: orchestrator report — scrollback + transcript 2 層実装）
+- 第 1 層 tmux scrollback（capture-pane -p -J -S）全 agent 共通 + 第 2 層 claude transcript アダプタ。
+  CLI `tako orchestrator report` + MCP `tako_orchestrator_report`（100 ツール）。worker-status に
+  history フィールド追加。隔離実測で可視画面 10 行 → scrollback 330 行を確認
+- 関連コミット: `46b925b`（PR #366 squash merge）。288 tests / セルフテスト FAILED 1（既知 #332）
+- 次: `build-app.sh --install` → 実 claude ペインでの report e2e + codex fallback 実測
+
+## 2026-07-18（#339: 複数ウィンドウ対応 — ビューポート方式）
+- 単一 TakoApp entity を全 GPUI ウィンドウの root view として共有（GPUI の entity→複数 window
+  invalidation を確認して採用）。tako-core に WorkspaceWindow/WindowId + タブ排他割当、
+  CLI `tako window` + MCP `tako_window`（101 ツール）+ persist windows[]（後方互換）
+- 検証: 品質ゲート全緑（978 tests）+ 隔離セルフテスト完走（項目 77 新設）+ 隔離実測
+  （2 窓別タブ send/read・move-tab・再起動復元・orchestrator spawn→WORKER_IDLE）
+- 関連コミット: `52bb49d`（PR #367 squash merge）。Issue に実測証拠コメント済み
+- 次: `build-app.sh --install` → 実機目視（New Window の状態同期・赤ボタン Dock 復帰）
+## 2026-07-18（#340: エネルギー・CPU 監査 — 3 状態実測 + 棚卸し + sleep_guard BG 化）
+
+- 実測: アイドル 0.24% / 通常 1.05% / 高負荷(8 ペイン 160 行/秒) 1.64% = 本体は軽量。
+  見えない消費 2 件を特定: claude agents 5s スキャン(0.2s CPU/回 = 1 コア 4% 相当 → #368)、
+  sleep_guard の UI 専有 p50 42ms×毎 2s(#324 由来 → 本タスクで BG 化)。pane_log probe は #369
+- 常駐ポーリング棚卸し表 15 項目 + 残骸プロセス(5.8 日常駐 headless Chrome 等)を Issue #340 に報告
+- 関連コミット: PR #370 squash merge（`3cd5693`）。before p50 50ms → after 0ms(隔離再現ベンチ)
+- 次: #368 / #369 の着手判断、残骸プロセスの掃除はユーザー判断
+
+## 2026-07-19（#371: タブ D&D 挿入位置インジケータの実装）
+- ドラッグ中に挿入位置を示す縦線バー（3px + accent glow）表示、ソースタブを半透明 + 点線ボーダー化。scroll-area `on_drag_move` によるインジケータ上書き問題を修正
+- 関連コミット: `55f9c31`（PR #373 squash merge）。隔離実機ダーク/ライト両テーマ + セルフテスト全緑
+- 次: `build-app.sh --install` → 本番目視確認
+
+## 2026-07-19（#378: タブ名の自動命名 — source パラメータ + 命名規則設定 + プロンプト追記）
+- tako_rename_tab に source パラメータ追加（auto = set_title_auto で手動を上書きしない / manual = 従来）。
+  Profile に tab_naming_convention 追加（profiles set --tab-naming-convention / MCP 1:1）、
+  master / solo プロンプトにタブ名更新の標準動作を追記。テスト 4 本追加・品質ゲート全緑
+- 関連コミット: `6948491`（PR #382 squash merge）。Issue #378 close 済み
+- 次: `build-app.sh --install` → 実機で source=auto と命名規則注入の確認
+
+## 2026-07-19（#375: Web dock URL 入力欄のフォーカス不在を修正）
+- 根因 2 件: ①フォーカス時カーソルバー非表示（空入力でプレースホルダのみ） ②フォーカス解除欠如（Enter/Escape 以外で false に戻らない）。カーソルバー方式に刷新 + ルート div の on_mouse_down でフォーカス解除
+- 関連コミット: `071f37e`（PR #383 squash merge）。品質ゲート全緑（308 tests）
+- 次: `build-app.sh --install` → ユーザー実機でカーソル表示 + 手打ち + IME 確認 → #375 クローズ判断
+
+## 2026-07-19（#315 R2: PDF リンク cmd ホバー/クリック不発を根治）
+- 根因を計装で確定: render のたびに `preview_pdf_page_image_bounds` を空 HashMap でクリアし、canvas paint の `cx.defer()` で再記録する設計のタイミング窓。release ビルドの .app 環境で GPUI effect cycle の差異により常に空 map を参照。render 冒頭のクリアを削除（defer 上書きで実害なし）
+- 関連コミット: `f40bcc0`（PR #386 squash merge）。品質ゲート全緑（308 tests）+ セルフテスト PDF 全通過
+- 次: `build-app.sh --install` → ユーザー実機で cmd ホバー + cmd クリック確認 → #315 クローズ判断
+
+## 2026-07-19（#369 + #374: orchestrator 改善 — probe 一括化 + report --messages）
+- #369: `pane_log_probe_batch()` 新設。2 秒 tick の tmux 起動を N 回→1 回に削減（list-panes -a -F）。テスト 2 本追加
+- #374: `tako orchestrator report --messages N` + MCP `messages` パラメータ。直近 N 件 assistant テキスト取得（古い順、既定 1、超過=全件）
+- 関連コミット: `b3f1bbc`（PR #387 squash merge）。品質ゲート全緑（983 tests）
+- 次: `build-app.sh --install` → 実 claude ペインで `--messages 3` の取得実測
+
+## 2026-07-19（#372: sleep-guard busy_agents 漏れの根治）
+- 旧実装は Unknown ペインのみ子プロセス判定 → Idle のまま子プロセスが走る TUI エージェントを見落とし。全バックエンドを対象に変更 + status() の busy_agents ハードコード 0 も修正
+- 関連コミット: `f652dc8`（PR #389 squash merge）。308 tests / clippy / fmt 緑 + 隔離セルフテスト完走
+- 次: `build-app.sh --install` → 本番で busy_agents 確認。Issue クローズは master 管理
+
+## 2026-07-19（#357: 利用制限表示にリロードボタン追加 + agy unsupported 明示）
+- USAGE LIMITS ドロップダウンのヘッダーにリロードボタン追加（即時再走査）、agy を「unsupported」明示表示に変更。dispatch / CLI / MCP に refresh アクション追加（1:1）。codex のローカル DB 調査で永続化なし確認
+- 関連コミット: `3059701`（PR #393 squash merge）。310 tests / clippy / fmt 緑
+- 次: `build-app.sh --install` → リロードボタン実機確認
+
+## 2026-07-19（#391: setup 対話 agent の既定起動を復元）
+- 回帰点を特定: #322（PR #330）で master 提案優先ロジック追加時に agent フォールバック欠落 + `--review` 限定化。修正 = 旧ランチャー除去 + `launch_setup_agent` を既定呼び出し。`--yes`/非TTY/`launch_agent=none` でスキップ。docs に「素のコマンドで完結」原則を追記
+- 関連コミット: `15fefa2`（PR #396 squash merge）。CLI 27 + control 529 + core 310 tests / clippy / fmt 緑 + 実機で対話起動・greeting 注入を実測
+- 次: `build-app.sh --install` → 本番で `tako setup` の対話起動確認

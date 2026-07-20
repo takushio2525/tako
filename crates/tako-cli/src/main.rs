@@ -92,6 +92,9 @@ enum Command {
     /// タブ操作（new / rename / select / move-pane）
     #[command(subcommand)]
     Tab(TabCommand),
+    /// 複数ウィンドウの操作（Issue #339。list / new / close / move-tab / focus）
+    #[command(subcommand)]
+    Window(WindowCommand),
     /// タブ・ペイン名の AI 自動リネームの ON/OFF・状態確認
     Autorename(ToggleArgs),
     /// listen ポート検知 + 提案チップの ON/OFF・状態確認
@@ -1162,6 +1165,18 @@ enum OrchestratorCommand {
         #[arg(long)]
         choice: String,
     },
+    /// worker の報告内容を取得する（scrollback 主 + transcript 補強。#364）
+    Report {
+        /// 対象ペイン ID
+        #[arg(long)]
+        pane: u64,
+        /// スクロールバック取得行数（既定 2000）
+        #[arg(long, default_value = "2000")]
+        lines: usize,
+        /// transcript から取得する直近 assistant メッセージ件数（既定 1。古い順で返す）
+        #[arg(long)]
+        messages: Option<usize>,
+    },
     /// spawn + 完了待ち + 出力取得 + close を 1 回で行う
     Run {
         /// プロジェクトキー（projects.yaml に登録済み）
@@ -1352,6 +1367,9 @@ enum ProfilesCommand {
         /// worker のモデル選択ポリシー（inherit / delegate / fixed）
         #[arg(long)]
         worker_model_policy: Option<String>,
+        /// タブ名の命名規則（master プロンプトに注入。空文字でクリア）
+        #[arg(long)]
+        tab_naming_convention: Option<String>,
     },
 }
 
@@ -1651,6 +1669,9 @@ struct LimitServiceArgs {
     /// claude / codex / agy（省略時は現在サービスを表示）
     #[arg(value_parser = ["claude", "codex", "agy"])]
     service: Option<String>,
+    /// 最新メトリクスを即時再取得する
+    #[arg(long)]
+    refresh: bool,
 }
 
 #[derive(Args)]
@@ -1756,6 +1777,9 @@ enum TabCommand {
         /// 対象タブ ID（省略時は呼び出し元ペインの属するタブ）
         #[arg(long)]
         tab: Option<u64>,
+        /// manual（既定）= 手動リネーム。auto = 作業内容ベースの自動命名（手動リネーム済みタブは上書きしない）
+        #[arg(long)]
+        source: Option<String>,
         /// 新しいタイトル（複数引数はスペース連結。空文字で手動指定を解除）
         title: Vec<String>,
     },
@@ -1799,6 +1823,37 @@ enum TabCommand {
         /// 移動先のタブをアクティブにする（省略時は現在のタブを維持）
         #[arg(long)]
         focus: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum WindowCommand {
+    /// ウィンドウ一覧を表示する
+    List,
+    /// 新しいウィンドウを開く。--tab で既存タブを分離、省略で新規タブ付き
+    New {
+        /// このタブを新しいウィンドウへ分離する（省略時は新規タブを作って開く）
+        #[arg(long)]
+        tab: Option<u64>,
+    },
+    /// ウィンドウを閉じる（タブは残存ウィンドウへ合流。プロセスは殺さない）
+    Close {
+        /// 対象ウィンドウ ID
+        window: u64,
+    },
+    /// タブを別ウィンドウへ移動する（移動先の表示タブになる）
+    MoveTab {
+        /// 移動するタブ ID
+        #[arg(long)]
+        tab: u64,
+        /// 移動先ウィンドウ ID
+        #[arg(long)]
+        window: u64,
+    },
+    /// ウィンドウをアクティブにして前面化する
+    Focus {
+        /// 対象ウィンドウ ID
+        window: u64,
     },
 }
 
@@ -1894,6 +1949,16 @@ fn main() -> ExitCode {
             })
             .map(|result| println!("{}", pretty_json(&result)))
         }
+        Command::Orchestrator(OrchestratorCommand::Report {
+            pane,
+            lines,
+            messages,
+        }) => send_request(Request::OrchestratorReport {
+            pane_id: pane,
+            lines: Some(lines),
+            messages,
+        })
+        .map(|result| println!("{}", pretty_json(&result))),
         Command::Orchestrator(OrchestratorCommand::Run {
             ref project,
             ref prompt,
@@ -2193,6 +2258,7 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
             tab: None,
             pane: Some(cp),
             title: tab_title.clone(),
+            source: None,
         })
         .ok();
         cp
@@ -2322,6 +2388,7 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
             tab: None,
             pane: Some(cp),
             title: tab_title.clone(),
+            source: None,
         })
         .ok();
         cp
@@ -2594,6 +2661,7 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             agent_skip_permissions,
             agent_args,
             worker_model_policy,
+            tab_naming_convention,
         } => ProfilesParams {
             action: "set".into(),
             name: Some(name.clone()),
@@ -2615,6 +2683,7 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             agent_skip_permissions: *agent_skip_permissions,
             agent_args: agent_args.clone(),
             worker_model_policy: worker_model_policy.clone(),
+            tab_naming_convention: tab_naming_convention.clone(),
         },
     };
     let result = dispatch_orchestrator_profiles(params).map_err(|e| e.to_string())?;
@@ -2750,6 +2819,7 @@ fn telemetry_local(sub: &TelemetryCommand) -> Result<(), String> {
     match sub {
         TelemetryCommand::Status => {
             let recent = tako_control::telemetry::recent_count();
+            let queued = tako_control::telemetry::queue_count();
             let log_path = tako_control::telemetry::log_file_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
@@ -2759,10 +2829,14 @@ fn telemetry_local(sub: &TelemetryCommand) -> Result<(), String> {
                 eprintln!("telemetry: OFF");
             }
             eprintln!("  直近のレポート件数: {recent}");
+            if queued > 0 {
+                eprintln!("  未送信キュー: {queued}");
+            }
             eprintln!("  ログ: {log_path}");
             let json = serde_json::json!({
                 "telemetry": settings.telemetry,
                 "recent_reports": recent,
+                "queued_reports": queued,
                 "log_path": log_path,
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
@@ -3373,8 +3447,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             title: title.clone(),
             focus: if *focus { Some(true) } else { None },
         },
-        Command::Tab(TabCommand::Rename { tab, title }) => Request::TabRename {
-            // --tab 指定があればそれを、無ければ呼び出し元ペインからタブを解決する
+        Command::Tab(TabCommand::Rename { tab, source, title }) => Request::TabRename {
             pane: if tab.is_none() {
                 target_pane(None)?
             } else {
@@ -3382,8 +3455,21 @@ fn build_request(command: &Command) -> Result<Request, String> {
             },
             tab: *tab,
             title: title.join(" "),
+            source: source.clone(),
         },
         Command::Tab(TabCommand::Select { tab }) => Request::TabSelect { tab: *tab },
+        Command::Window(WindowCommand::List) => Request::WindowList,
+        Command::Window(WindowCommand::New { tab }) => Request::WindowNew { tab: *tab },
+        Command::Window(WindowCommand::Close { window }) => {
+            Request::WindowClose { window: *window }
+        }
+        Command::Window(WindowCommand::MoveTab { tab, window }) => Request::WindowMoveTab {
+            tab: *tab,
+            window: *window,
+        },
+        Command::Window(WindowCommand::Focus { window }) => {
+            Request::WindowFocus { window: *window }
+        }
         Command::Tab(TabCommand::Reorder { tab, index }) => Request::TabReorder {
             tab: *tab,
             index: *index,
@@ -3457,7 +3543,11 @@ fn build_request(command: &Command) -> Result<Request, String> {
             mode: args.mode.clone().filter(|m| m != "toggle"),
         },
         Command::LimitService(args) => Request::LimitService {
-            action: args.service.as_ref().map(|_| "set".to_string()),
+            action: if args.refresh {
+                Some("refresh".to_string())
+            } else {
+                args.service.as_ref().map(|_| "set".to_string())
+            },
             service: args.service.clone(),
         },
         Command::Git(GitCommand::Log { max_count, pane }) => Request::GitLog {
@@ -3741,6 +3831,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }
         Command::Orchestrator(OrchestratorCommand::Layout { .. }) => {
             unreachable!("orchestrator layout は run() を通らない（ローカルで config.yaml を操作）")
+        }
+        Command::Orchestrator(OrchestratorCommand::Report { .. }) => {
+            unreachable!("orchestrator report は run() を通らない")
         }
         Command::Orchestrator(OrchestratorCommand::Respond { .. }) => {
             unreachable!("orchestrator respond は run() を通らない")
@@ -4395,24 +4488,7 @@ fn resolve_cli_path(path: &str) -> String {
 }
 
 fn find_git_root_cli(dir: &std::path::Path) -> Option<String> {
-    let d = if dir.is_dir() { dir } else { dir.parent()? };
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(d)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let root = String::from_utf8(output.stdout).ok()?;
-    let trimmed = root.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    tako_core::git::repo_root(dir).map(|p| p.to_string_lossy().into_owned())
 }
 
 /// 環境変数から接続情報を読み、1 リクエストを往復させる
@@ -4626,6 +4702,10 @@ fn print_result(command: &Command, result: &Value) {
             println!("{}", pretty_json(result));
         }
         Command::Tab(TabCommand::New { .. }) => println!("{result}"),
+        Command::Window(WindowCommand::List) => println!("{}", pretty_json(result)),
+        Command::Window(
+            WindowCommand::New { .. } | WindowCommand::Close { .. } | WindowCommand::MoveTab { .. },
+        ) => println!("{result}"),
         Command::Open(_) | Command::Preview(_) | Command::PreviewOutline(_) | Command::Edit(_) => {
             println!("{result}")
         }
@@ -5225,6 +5305,26 @@ mod tests {
                 pane: None,
                 tab: Some(3),
                 title: "実験 用".into(),
+                source: None,
+            }
+        );
+        let command2 = parse(&[
+            "tako",
+            "tab",
+            "rename",
+            "--tab",
+            "5",
+            "--source",
+            "auto",
+            "開発中",
+        ]);
+        assert_eq!(
+            build_request(&command2).unwrap(),
+            Request::TabRename {
+                pane: None,
+                tab: Some(5),
+                title: "開発中".into(),
+                source: Some("auto".into()),
             }
         );
     }

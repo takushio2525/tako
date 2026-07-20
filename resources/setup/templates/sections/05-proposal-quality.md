@@ -1,5 +1,7 @@
 # 提案品質
 
+<!-- coverage: 技術選定時の選択肢提示と推奨 = 選択肢 | 候補 | 推奨 | トレードオフ | 技術選定 | option | alternativ | recommend | trade-off | tradeoff -->
+
 ## 必須概念
 
 - 技術選定時に選択肢を提示するルールを定義する

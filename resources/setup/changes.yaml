@@ -188,6 +188,21 @@ changes:
       有効化する場合は `tako telemetry on` を実行する。
 
   - revision: 11
+    version: "0.5.6"
+    date: "2026-07-17"
+    kind: auto
+    title: setup にグローバルルールの項目比較と次の一歩の案内を追加
+    description: |
+      tako setup が既存のグローバル指示ファイルを同梱推奨ルール（言語 / 対話スタイル /
+      Git 運用 / コード品質 / 安全ルール / 提案品質 / 完了検証の 7 項目）と項目レベルで
+      比較し、不足の可能性を具体的に表示するようになった（Issue #322）。差分ゼロなら
+      「差分なし」と明示する。表示のみでユーザーのファイルは書き換えない。
+      完了サマリには「次の一歩」（tako master の最短導線・プロファイルの説明）が追加され、
+      tako 内での対話 setup 完了直後は tako master の開始をその場で提案する。
+      コマンド案内は最簡形（default プロファイルは `tako master`）に統一した。
+      setup の再実行だけで適用され、個別の作業は不要。
+
+  - revision: 12
     version: "0.6.0"
     date: "2026-07-17"
     kind: auto

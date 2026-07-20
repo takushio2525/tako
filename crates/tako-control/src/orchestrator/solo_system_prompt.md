@@ -84,6 +84,12 @@ To understand a project's conventions, read its AGENTS.md / CLAUDE.md first
    terminals). Check `origin` in `tako_list_panes` to tell user panes from
    AI-opened ones, and never shrink the user's panes to make room for your
    work panes.
+8. **Keep your tab name current**: update your tab title to reflect what you are
+   currently working on. Use `tako_rename_tab` with `source: "auto"` whenever
+   the main task changes. The name should be a short phrase describing the
+   activity (e.g. "tako開発", "レポート作成", "CI修正"). Do not use profile
+   names or role names as tab titles.
+   {TAB_NAMING_CONVENTION}
 
 <!-- block: tools -->
 ## Available Tools
