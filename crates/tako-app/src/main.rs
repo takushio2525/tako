@@ -2093,6 +2093,9 @@ impl TakoApp {
                         state
                     };
                     app.previews.insert(pane, state);
+                    // Code Runner: 復元経路でも実行プロファイルを検出する（#453）。
+                    // 検出しないと再生ボタンが淡色（クリック無効）のまま表示される
+                    app.detect_preview_run_profiles(pane, path);
                     restored_previews += 1;
                     continue;
                 }
@@ -12454,25 +12457,7 @@ impl PreviewHost for TakoApp {
             self.preview_navigation_panel = None;
         }
         self.previews.insert(pane, state);
-        // Code Runner: プロファイル検出（#453 M4）
-        {
-            use tako_core::runner;
-            if let Some(head) = runner::read_file_head_for_ui(path) {
-                let settings = tako_control::settings::load();
-                let ext_defaults = runner::merged_defaults(&settings.runner_defaults);
-                match runner::resolve(path, &head, &ext_defaults, None, None) {
-                    Ok(resolution) => {
-                        self.preview_run_profiles
-                            .insert(pane, resolution.all_profiles);
-                    }
-                    Err(_) => {
-                        self.preview_run_profiles.insert(pane, Vec::new());
-                    }
-                }
-            } else {
-                self.preview_run_profiles.remove(&pane);
-            }
-        }
+        self.detect_preview_run_profiles(pane, path);
         self.sync_preview_watches();
         Ok(())
     }
