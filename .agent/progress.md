@@ -1050,3 +1050,11 @@
   （証拠 ~/Desktop/tako-438-evidence/）。使用 2 箇所は同一アセット参照で統一
 - 関連コミット: `025bad7`（PR #441 squash merge）。品質ゲート全緑 + セルフテスト FAILED 0
 - 次: `build-app.sh --install` → 実機で見た目確認 → #438 クローズはユーザー判断
+
+## 2026-07-21（#287 P1: 監査文書の実 PII をプレースホルダ化）
+
+- codex 公開前レビュー P1 所見の是正。`reviews/2026-07-06_公開前セキュリティ監査.md` と
+  `.agent/plans/security-audit-report.md` の実ユーザー名・ホスト名・ホームパス・実メール・
+  実名入り旧 URL を `<user>`/`<hostname>`/`<email>`/`<account_id>`/`<redacted-url>` へ置換（文意不変）
+- 関連コミット: `a9fd9c8`（PR #447 squash merge）。grep で実値ヒット 0 件を確認、Issue にコメント済み
+- 残: #287 の P1-1 cross-origin / P1-2 identity spoof（実装修正）と履歴側 PII の扱い決定は別タスク
