@@ -1959,12 +1959,18 @@ fn tmux_list_panes(tmux_socket: &str) -> Value {
 
 /// tmux バックエンドから全セッション・ペイン情報を v2 API 形式で返す。
 /// IPC 不在時のフォールバック用（#424: v1 形式では role / agent_type がなく
-/// master/worker の識別ができなかった）
-fn tmux_list_panes_v2(tmux_socket: &str) -> Value {
+/// master/worker の識別ができなかった）。
+/// `live` の対話型 claude が動いているセッションは agent_type=claude + session_id を
+/// 付与する（#439: app 不在でもチャットビューを提供できる）
+fn tmux_list_panes_v2(
+    tmux_socket: &str,
+    live: &HashMap<String, crate::agents::LiveClaudeSession>,
+) -> Value {
     let sessions = tako_core::tmux::list_sessions(Some(tmux_socket));
     let mut panes = Vec::new();
 
     for sess in &sessions {
+        let live_session = live.get(&sess.name);
         for win in &sess.windows {
             let pane_list = tmux_list_window_panes(tmux_socket, &sess.name, win.index);
             for (pane_idx, _pane_tty) in pane_list.iter().enumerate() {
@@ -1974,16 +1980,25 @@ fn tmux_list_panes_v2(tmux_socket: &str) -> Value {
                 } else {
                     format!("{}:{}.{}", sess.name, win.name, pane_idx)
                 };
-                panes.push(json!({
+                let agent_type = if live_session.is_some_and(|l| l.interactive) {
+                    "claude"
+                } else {
+                    "plain"
+                };
+                let mut entry = json!({
                     "id": pane_id,
                     "title": title,
                     "role": "",
-                    "agent_type": "plain",
+                    "agent_type": agent_type,
                     "state": if sess.attached { "running" } else { "idle" },
                     "surface": "background",
                     "position": format!("{}/{}", pane_idx + 1, pane_list.len()),
                     "tmux_target": pane_id,
-                }));
+                });
+                if let Some(l) = live_session {
+                    entry["session_id"] = json!(l.session_id);
+                }
+                panes.push(entry);
             }
         }
     }
@@ -2495,8 +2510,12 @@ fn resolve_pane_param(
 
 /// List 応答をリモート API v2 形式に変換する。
 /// agent 種別・タイトル・role・cwd・タブ内位置・モデル・状態・session_id を含むペイン情報。
-/// agents が Some なら session_id をペインに紐付ける（チャットビュー用。#284）
-fn list_to_api_v2(list: &Value) -> Value {
+/// `live` は agents::live_claude_sessions_by_backend の一括解決マップ
+/// （バックエンドセッション → 稼働中 claude セッション）。
+/// role が消失したペイン（#439: 復元・handoff・手動 resume 後の master が典型）でも、
+/// live 解決（pid 祖先 = 実プロセスの存在証明）が interactive claude を示せば
+/// agent_type を claude として扱う
+fn list_to_api_v2(list: &Value, live: &HashMap<String, crate::agents::LiveClaudeSession>) -> Value {
     let mut panes = Vec::new();
     let tabs = list["tabs"].as_array().cloned().unwrap_or_default();
     for tab in &tabs {
@@ -2512,7 +2531,15 @@ fn list_to_api_v2(list: &Value) -> Value {
             let state = pane["state"].as_str().unwrap_or("unknown");
             let surface = pane["surface"].as_str().unwrap_or("background");
 
-            // agent 種別の推定: role から判定（master/solo/worker は同一ロジック）
+            // session_id + model: live 解決 → sessions カタログの順でペインに紐づく情報を解決
+            let live_session = pane["tmux_session"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| live.get(s));
+            let (session_id, model) = resolve_pane_session_info(id, live_session);
+
+            // agent 種別の推定: role から判定（master/solo/worker は同一ロジック）。
+            // role が無くても live の対話型 claude が動いていれば claude（#439）
             let has_agent_role = role.contains("master")
                 || role.contains("solo")
                 || role.starts_with("orchestrator-worker");
@@ -2524,9 +2551,10 @@ fn list_to_api_v2(list: &Value) -> Value {
                 } else {
                     "claude"
                 }
-            } else if pane["osc_title"]
-                .as_str()
-                .is_some_and(|t| t.contains("claude"))
+            } else if live_session.is_some_and(|l| l.interactive)
+                || pane["osc_title"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("claude"))
             {
                 "claude"
             } else {
@@ -2535,9 +2563,6 @@ fn list_to_api_v2(list: &Value) -> Value {
 
             // タブ内位置（1/N 形式）
             let position = format!("{}/{}", idx + 1, total_panes);
-
-            // session_id + model: sessions カタログからペインに紐づく情報を解決
-            let (session_id, model) = resolve_pane_session_info(pane, id);
 
             // tmux ターゲット: WS / screen API で数値 PaneId の代わりに使う
             let tmux_target = pane["tmux_session"]
@@ -2574,20 +2599,57 @@ fn list_to_api_v2(list: &Value) -> Value {
 }
 
 /// ペインの session_id と model を解決する（#284）。
-/// tmux バックエンドセッション → agents 逆引き → sessions カタログの順で探す
-fn resolve_pane_session_info(pane: &Value, pane_id: u64) -> (Option<String>, Option<String>) {
-    let session_id = pane["tmux_session"]
-        .as_str()
-        .and_then(crate::agents::resolve_session_id_for_backend)
-        .or_else(|| {
-            let id_str = pane_id.to_string();
-            crate::sessions::resolve_session_for_pane(&id_str)
-        });
+/// live 解決（agents pid 祖先の一括マップ）→ sessions カタログの順で探す
+fn resolve_pane_session_info(
+    pane_id: u64,
+    live_session: Option<&crate::agents::LiveClaudeSession>,
+) -> (Option<String>, Option<String>) {
+    let session_id = live_session.map(|l| l.session_id.clone()).or_else(|| {
+        let id_str = pane_id.to_string();
+        crate::sessions::resolve_session_for_pane(&id_str)
+    });
     let model = session_id.as_ref().and_then(|sid| {
         let catalog = crate::sessions::SessionCatalog::load().ok()?;
         catalog.entries.get(sid)?.model.clone()
     });
     (session_id, model)
+}
+
+/// 各 agent ペインの画面から permission ダイアログを検知し、ペインエントリへ
+/// `permission_dialog: {command, options, highlighted}` を付与する（#425）。
+///
+/// 承認待ちの判定は transcript の推定ではなく**画面のダイアログ実在**を正とする
+/// （transcript は「ツール実行中」と「承認待ち停止」を区別できない。auto mode の
+/// 実行中ウィンドウで誤って承認カードが出ていた根因）。
+/// `capture` はバックエンドセッション名 → 画面行（テスト差し替え用）
+fn attach_permission_dialogs(result: &mut Value, capture: impl Fn(&str) -> Option<Vec<String>>) {
+    let Some(panes) = result["panes"].as_array_mut() else {
+        return;
+    };
+    for pane in panes {
+        // ダイアログを出しうるのは agent ペインだけ（plain のシェルはスキップ）
+        let agent_type = pane["agent_type"].as_str().unwrap_or("plain");
+        if agent_type == "plain" {
+            continue;
+        }
+        let Some(session) = pane["tmux_target"]
+            .as_str()
+            .map(session_name_of)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let Some(lines) = capture(&session) else {
+            continue;
+        };
+        if let Some(dialog) = crate::claude_tui::detect_permission_dialog(&lines) {
+            pane["permission_dialog"] = json!({
+                "command": dialog.command,
+                "options": dialog.options,
+                "highlighted": dialog.highlighted,
+            });
+        }
+    }
 }
 
 /// tmux ターゲット（`session:0.0` / `session`）からセッション名部分を取り出す。
@@ -2639,6 +2701,40 @@ fn dispatch_send(
     match client.request(request) {
         Ok(v) => Ok(v),
         Err(e) => {
+            conn.invalidate();
+            Err((502, e))
+        }
+    }
+}
+
+/// IPC 経由で OrchestratorRespond dispatch を呼ぶ（#425: permission ダイアログ応答）。
+/// dispatch 側で画面のダイアログ実在を再検証するため、ダイアログが既に解消済みなら
+/// エラーが返る（409 相当としてクライアントへ伝える）
+fn dispatch_respond(
+    app_conn: &Arc<RwLock<AppConnection>>,
+    pane_id: u64,
+    choice: &str,
+    device_name: &str,
+) -> Result<Value, (u16, String)> {
+    let request = crate::protocol::Request::OrchestratorRespond {
+        pane_id,
+        choice: choice.to_string(),
+        caller_role: Some(format!("remote:{device_name}")),
+    };
+    let mut conn = app_conn
+        .write()
+        .map_err(|_| (500u16, "内部エラー".to_string()))?;
+    let client = conn.get().ok_or((
+        503u16,
+        "tako app が稼働していない（リモートからの承認応答は app 経由のみ）".to_string(),
+    ))?;
+    match client.request(request) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            // ダイアログ不在（解消済み）は接続エラーではないので invalidate しない
+            if e.contains("ダイアログが見つからない") {
+                return Err((409, e));
+            }
             conn.invalidate();
             Err((502, e))
         }
@@ -2925,15 +3021,24 @@ fn handle_request_v2(
 
     // --- API v2 エンドポイント（IPC 経由のリッチ情報。#281）---
     if path == "/api/v2/panes" && method == tiny_http::Method::Get {
+        // live claude セッションの一括解決（#439: role 消失ペインの agent 判定 ground truth）
+        let live = crate::agents::live_claude_sessions_by_backend();
         match refresh_pane_mapping(app_conn, pane_mapping) {
             Some(list) => {
-                let result = list_to_api_v2(&list);
+                let mut result = list_to_api_v2(&list, &live);
+                // 承認待ちの正 = 画面の permission ダイアログ実在（#425）
+                attach_permission_dialogs(&mut result, |session| {
+                    tako_core::tmux::capture_session(Some(tmux_socket), session).ok()
+                });
                 return respond_sensitive(request, 200, Some(result.to_string()));
             }
             None => {
                 // app 不在: tmux-only のペイン一覧を v2 形式で返す（#424:
                 // v1 形式では role / agent_type がなく master の識別ができない）
-                let result = tmux_list_panes_v2(tmux_socket);
+                let mut result = tmux_list_panes_v2(tmux_socket, &live);
+                attach_permission_dialogs(&mut result, |session| {
+                    tako_core::tmux::capture_session(Some(tmux_socket), session).ok()
+                });
                 return respond(request, 200, Some(result.to_string()));
             }
         }
@@ -2958,7 +3063,7 @@ fn required_role(method: &tiny_http::Method, path: &str) -> DeviceRole {
         return DeviceRole::Admin;
     }
     if *method == tiny_http::Method::Post {
-        if path.ends_with("/input") || path == "/api/upload" {
+        if path.ends_with("/input") || path.ends_with("/respond") || path == "/api/upload" {
             return DeviceRole::Interact;
         }
         if path.ends_with("/close") || path.ends_with("/resize") {
@@ -3265,6 +3370,56 @@ fn handle_api_v2_routes(
                 keys.as_deref(),
             ) {
                 Ok(_) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
+                Err((status, e)) => {
+                    respond(request, status, Some(json!({ "error": e }).to_string()))
+                }
+            }
+        }
+        // permission ダイアログへの応答（#425）: 画面のダイアログ実在を dispatch 側で
+        // 再検証してから番号キー + Enter を送る（OrchestratorRespond と同一経路 = 監査つき）
+        (tiny_http::Method::Post, p) if p.starts_with("/api/panes/") && p.ends_with("/respond") => {
+            let Some(pane_param) = extract_pane_target(p) else {
+                return respond(
+                    request,
+                    400,
+                    Some(json!({ "error": "無効なペイン ID" }).to_string()),
+                );
+            };
+            let Ok(pane_id) = pane_param.parse::<u64>() else {
+                return respond(
+                    request,
+                    400,
+                    Some(
+                        json!({ "error": "respond は数値ペイン ID のみ（app 稼働時の一覧から取得してください）" })
+                            .to_string(),
+                    ),
+                );
+            };
+            let parsed = match read_json_body(&mut request) {
+                Ok(v) => v,
+                Err(e) => {
+                    return respond(request, 400, Some(json!({ "error": e }).to_string()));
+                }
+            };
+            let choice = match &parsed["choice"] {
+                Value::String(s) if !s.is_empty() => s.clone(),
+                Value::Number(n) => n.to_string(),
+                _ => {
+                    return respond(
+                        request,
+                        400,
+                        Some(json!({ "error": "choice が必要（番号または yes/no）" }).to_string()),
+                    );
+                }
+            };
+            ctx.registry.lock().unwrap().audit(
+                "respond",
+                &device.id,
+                &device.name,
+                json!({ "route": p, "choice": choice }),
+            );
+            match dispatch_respond(app_conn, pane_id, &choice, &device.name) {
+                Ok(v) => respond(request, 200, Some(v.to_string())),
                 Err((status, e)) => {
                     respond(request, status, Some(json!({ "error": e }).to_string()))
                 }
@@ -3985,6 +4140,11 @@ mod tests {
             required_role(&Method::Post, "/api/panes/s:0.0/input"),
             DeviceRole::Interact
         );
+        // permission ダイアログ応答も Interact（#425）
+        assert_eq!(
+            required_role(&Method::Post, "/api/panes/648/respond"),
+            DeviceRole::Interact
+        );
         // close / resize は Manage
         assert_eq!(
             required_role(&Method::Post, "/api/panes/s:0.0/close"),
@@ -4013,6 +4173,148 @@ mod tests {
             required_role(&Method::Post, "/api/unknown"),
             DeviceRole::Manage
         );
+    }
+
+    // --- #439: agent_type の live claude 判定 ---
+
+    /// list_to_api_v2 のテスト用 List（1 タブ 3 ペイン: role 消失 master 相当 /
+    /// role あり worker / plain シェル）
+    fn sample_list() -> Value {
+        json!({
+            "tabs": [{
+                "id": 1,
+                "title": "tab1",
+                "panes": [
+                    { "id": 648, "title": "master相当", "role": null, "osc_title": null,
+                      "cwd": "/Users/u", "state": "running", "surface": "foreground",
+                      "tmux_session": "tako-master648" },
+                    { "id": 700, "title": "worker", "role": "orchestrator-worker:proj:x",
+                      "cwd": "/w", "state": "running", "surface": "foreground",
+                      "tmux_session": "tako-worker700" },
+                    { "id": 701, "title": "shell", "role": null, "osc_title": null,
+                      "cwd": "/", "state": "idle", "surface": "foreground",
+                      "tmux_session": "tako-shell701" },
+                ]
+            }]
+        })
+    }
+
+    #[test]
+    fn role消失ペインでもlive_claudeが動いていればagent_typeはclaude() {
+        // #439 の実機再現形: role=null / osc_title=null だが対話型 claude が稼働
+        let live: HashMap<String, crate::agents::LiveClaudeSession> = [(
+            "tako-master648".to_string(),
+            crate::agents::LiveClaudeSession {
+                session_id: "sid-648".into(),
+                interactive: true,
+            },
+        )]
+        .into();
+        let v2 = list_to_api_v2(&sample_list(), &live);
+        let panes = v2["panes"].as_array().unwrap();
+        let p648 = panes.iter().find(|p| p["id"] == 648).unwrap();
+        assert_eq!(
+            p648["agent_type"], "claude",
+            "live 解決で claude 化: {p648}"
+        );
+        assert_eq!(p648["session_id"], "sid-648");
+        // worker は従来どおり role 由来で claude
+        let p700 = panes.iter().find(|p| p["id"] == 700).unwrap();
+        assert_eq!(p700["agent_type"], "claude");
+        // plain シェルは plain のまま
+        let p701 = panes.iter().find(|p| p["id"] == 701).unwrap();
+        assert_eq!(p701["agent_type"], "plain");
+        assert!(p701["session_id"].is_null());
+    }
+
+    #[test]
+    fn 一時的なheadless_claudeではclaude化しない() {
+        // シェルペインで claude -p が走った瞬間の誤 claude 化を防ぐ（kind != interactive）
+        let live: HashMap<String, crate::agents::LiveClaudeSession> = [(
+            "tako-shell701".to_string(),
+            crate::agents::LiveClaudeSession {
+                session_id: "sid-p".into(),
+                interactive: false,
+            },
+        )]
+        .into();
+        let v2 = list_to_api_v2(&sample_list(), &live);
+        let panes = v2["panes"].as_array().unwrap();
+        let p701 = panes.iter().find(|p| p["id"] == 701).unwrap();
+        assert_eq!(p701["agent_type"], "plain", "headless では claude 化しない");
+        // session_id 自体は付く（transcript は存在するため。チャット判定は agent_type 側で抑止）
+        assert_eq!(p701["session_id"], "sid-p");
+    }
+
+    #[test]
+    fn live不在ならrole判定へフォールバックする() {
+        let live = HashMap::new();
+        let v2 = list_to_api_v2(&sample_list(), &live);
+        let panes = v2["panes"].as_array().unwrap();
+        let p648 = panes.iter().find(|p| p["id"] == 648).unwrap();
+        assert_eq!(p648["agent_type"], "plain", "live 不在 + role なしは plain");
+        let p700 = panes.iter().find(|p| p["id"] == 700).unwrap();
+        assert_eq!(
+            p700["agent_type"], "claude",
+            "role ありは live 不在でも claude"
+        );
+    }
+
+    // --- #425: 画面ダイアログ実在ベースの承認判定 ---
+
+    /// permission ダイアログの画面（claude v2.x 実採取形式の要点再現）
+    fn dialog_screen() -> Vec<String> {
+        [
+            "  Bash command",
+            "  rm -rf build/",
+            "  Do you want to proceed?",
+            "  ❯ 1. Yes",
+            "    2. Yes, and don't ask again for rm commands",
+            "    3. No, and tell Claude what to do differently (esc)",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    #[test]
+    fn attach_permission_dialogsはagentペインの画面ダイアログを付与する() {
+        let mut result = json!({ "panes": [
+            { "id": 648, "agent_type": "claude", "tmux_target": "tako-a:0.0" },
+            { "id": 700, "agent_type": "claude", "tmux_target": "tako-b:0.0" },
+            { "id": 701, "agent_type": "plain", "tmux_target": "tako-c:0.0" },
+        ]});
+        let captured = std::cell::RefCell::new(Vec::new());
+        attach_permission_dialogs(&mut result, |session| {
+            captured.borrow_mut().push(session.to_string());
+            if session == "tako-a" {
+                Some(dialog_screen())
+            } else {
+                // tako-b は通常画面（入力欄のみ）
+                Some(vec!["❯ ".to_string()])
+            }
+        });
+        let panes = result["panes"].as_array().unwrap();
+        let dialog = &panes[0]["permission_dialog"];
+        assert!(dialog.is_object(), "ダイアログ画面のペインに付与: {dialog}");
+        assert_eq!(dialog["options"].as_array().unwrap().len(), 3);
+        assert_eq!(dialog["highlighted"], 0);
+        assert!(
+            panes[1]["permission_dialog"].is_null(),
+            "通常画面には付与しない"
+        );
+        assert!(panes[2]["permission_dialog"].is_null(), "plain は対象外");
+        // plain ペインはキャプチャ自体もしない
+        assert_eq!(*captured.borrow(), vec!["tako-a", "tako-b"]);
+    }
+
+    #[test]
+    fn attach_permission_dialogsはキャプチャ失敗を無視する() {
+        let mut result = json!({ "panes": [
+            { "id": 648, "agent_type": "claude", "tmux_target": "tako-a:0.0" },
+        ]});
+        attach_permission_dialogs(&mut result, |_| None);
+        assert!(result["panes"][0]["permission_dialog"].is_null());
     }
 
     #[test]

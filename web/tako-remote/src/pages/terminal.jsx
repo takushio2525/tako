@@ -147,10 +147,18 @@ export function TerminalPage({ paneId, me }) {
   const color = agentColor(agentType);
   const hasChatSupport = !!info?.session_id && (agentType === 'claude' || agentType === 'codex' || agentType === 'agy');
 
-  // chat が使えなければ自動で term に
+  // ユーザーがトグルで明示選択したか（選択後は自動切替しない。ペイン移動でリセット）
+  const userPinnedViewRef = useRef(false);
+
+  // chat が使えなければ term へ、使えるようになったら chat へ自動追従する。
+  // 旧実装は chat→term の片方向のみで、最初のポーリングで一時的に session_id が
+  // 欠けると以後チャットに戻れなかった（#439 の頑健化）
   useEffect(() => {
-    if (view === 'chat' && info && !hasChatSupport) {
+    if (!info || userPinnedViewRef.current) return;
+    if (view === 'chat' && !hasChatSupport) {
       setView('term');
+    } else if (view === 'term' && hasChatSupport) {
+      setView('chat');
     }
   }, [info, hasChatSupport, view]);
 
@@ -267,6 +275,7 @@ export function TerminalPage({ paneId, me }) {
     atBottomRef.current = true;
     sgrStateRef.current = defaultSgrState();
     pendingInitRef.current = null;
+    userPinnedViewRef.current = false;
     if (historyRef.current) historyRef.current.textContent = '';
     if (screenRef.current) screenRef.current.textContent = '';
     connectWs();
@@ -418,11 +427,11 @@ export function TerminalPage({ paneId, me }) {
             <button
               class={`view-toggle-btn${view === 'chat' ? ' active chat-active' : ''}`}
               style={view === 'chat' ? `color:${color}` : ''}
-              onClick={() => setView('chat')}
+              onClick={() => { userPinnedViewRef.current = true; setView('chat'); }}
             >chat</button>
             <button
               class={`view-toggle-btn${view === 'term' ? ' active term-active' : ''}`}
-              onClick={() => setView('term')}
+              onClick={() => { userPinnedViewRef.current = true; setView('term'); }}
             >term</button>
           </div>
         ) : null}

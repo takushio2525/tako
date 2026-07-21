@@ -64,6 +64,11 @@ export function createClient() {
     sendKeys(id, keys) {
       return request('POST', `/api/panes/${encodeURIComponent(id)}/input`, { keys });
     },
+    // permission ダイアログへの応答（#425）。choice は 1 始まりの選択肢番号。
+    // サーバー側でダイアログ実在を再検証してから番号キー + Enter を送る
+    respond(id, choice) {
+      return request('POST', `/api/panes/${encodeURIComponent(id)}/respond`, { choice: String(choice) });
+    },
     close(id) {
       return request('POST', `/api/panes/${encodeURIComponent(id)}/close`);
     },

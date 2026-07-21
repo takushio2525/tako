@@ -70,15 +70,23 @@ pub fn detect_permission_dialog(lines: &[String]) -> Option<PermissionDialog> {
         return None;
     }
 
-    // コマンド/操作の説明を抽出: 選択肢行より上の内容行
-    let mut command_parts = Vec::new();
+    // コマンド/操作の説明を抽出。ダイアログ本体は罫線ボックスで囲まれ、選択肢の
+    // 直前に説明行が並ぶ。画面全体を capture すると上端のバナー・cwd・ユーザー発話も
+    // 含まれるため、「区切り（空行・罫線）から選択肢までの**連続ブロック**」だけを
+    // command とする（区切りに当たるたびにブロックをリセット）
+    let mut command_block: Vec<String> = Vec::new();
     let mut options = Vec::new();
     let mut highlighted: Option<usize> = None;
     let mut in_choices = false;
 
     for line in lines {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("Press enter") || trimmed.starts_with("Esc ") {
+        // 空行はスキップ（リセットしない: claude の実ダイアログは本体に空行を挟む）。
+        // 選択肢下のヘルプ行もスキップ
+        if trimmed.is_empty()
+            || trimmed.starts_with("Press enter")
+            || trimmed.starts_with("Esc ")
+        {
             continue;
         }
         // 選択カーソル ❯ / > を除去した内容テキスト。
@@ -104,17 +112,17 @@ pub fn detect_permission_dialog(lines: &[String]) -> Option<PermissionDialog> {
             }
             options.push(inner[3..].trim().to_string());
         } else if !in_choices {
-            // 選択肢の前 = コマンド説明部分
+            // 選択肢の前 = コマンド説明部分の候補
             let desc = trimmed
                 .trim_start_matches("? ")
                 .trim_start_matches("❯ ")
                 .trim_start_matches("> ");
-            if !desc.is_empty()
-                && !desc.starts_with("──")
-                && !desc.contains("Navigate")
-                && !desc.contains("ctrl+g")
-            {
-                command_parts.push(desc.to_string());
+            if is_box_rule(desc) {
+                // 罫線 = ダイアログボックスの境界。直前までのブロック（画面上端の
+                // バナー・cwd・ユーザー発話等）を捨て、ボックス内だけを command にする
+                command_block.clear();
+            } else if !desc.contains("Navigate") && !desc.contains("ctrl+g") {
+                command_block.push(desc.to_string());
             }
         }
     }
@@ -123,12 +131,40 @@ pub fn detect_permission_dialog(lines: &[String]) -> Option<PermissionDialog> {
         return None;
     }
 
-    let command = command_parts.join(" ").trim().to_string();
+    let command = command_block.join(" ").trim().to_string();
     Some(PermissionDialog {
         command,
         options,
         highlighted,
     })
+}
+
+/// 罫線ボックスの境界行か（罫線文字と空白のみで構成される非空行）。
+/// これに当たると、それより前の説明候補（画面上端のバナー・cwd 等）を切り捨てる。
+/// 空行は境界にしない（claude の実ダイアログは本体に空行を挟むため）
+fn is_box_rule(desc: &str) -> bool {
+    !desc.is_empty()
+        && desc.chars().all(|c| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '─' | '━'
+                        | '│'
+                        | '┃'
+                        | '╭'
+                        | '╮'
+                        | '╰'
+                        | '╯'
+                        | '┌'
+                        | '┐'
+                        | '└'
+                        | '┘'
+                        | '├'
+                        | '┤'
+                        | '╌'
+                        | '╍'
+                )
+        })
 }
 
 /// claude TUI の画面状態
@@ -1006,6 +1042,60 @@ esc to cancel                                       Claude Opus 4.6 (Thinking)"#
         assert!(detect_permission_dialog(&screen(TRUST_DIALOG)).is_none());
         assert!(detect_permission_dialog(&screen(CODEX_TRUST_DIALOG)).is_none());
         assert!(detect_permission_dialog(&screen(AGY_TRUST_DIALOG)).is_none());
+    }
+
+    /// #425 実採取相当: 画面上端のバナー・cwd・ユーザー発話が capture に含まれ、
+    /// ダイアログ本体は罫線ボックスで囲まれる（tako read で観測した pane 5 の形）
+    const CLAUDE_DIALOG_WITH_BANNER: &str = r#"▝▜█████▛▘  Fable 5 with xhigh effort · Claude Max
+/Users/shiozawatakumi
+⚠ 1 MCP server needs authentication · run /mcp
+Bash ツールで「touch /tmp/te439/approval-test.txt」を実行して
+⏺ Running 1 shell command…
+⎿  $ touch /tmp/te439/approval-test.txt
+────────────────────────────────────────────────
+ Bash command
+   touch /tmp/te439/approval-test.txt
+   Create empty file /tmp/te439/approval-test.txt
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to te439/ from this project
+   3. No
+ Esc to cancel · Tab to amend · ctrl+e to explain"#;
+
+    #[test]
+    fn 罫線ボックスの外側のバナーをcommandに含めない() {
+        let lines = screen(CLAUDE_DIALOG_WITH_BANNER);
+        let dialog = detect_permission_dialog(&lines).expect("検知される");
+        // options / highlighted は正確に取れる
+        assert_eq!(dialog.options.len(), 3);
+        assert_eq!(dialog.options[0], "Yes");
+        assert_eq!(dialog.options[2], "No");
+        assert_eq!(dialog.highlighted, Some(0));
+        // command はボックス内だけ。バナー・cwd・MCP 警告・ユーザー発話は混入しない
+        assert!(
+            dialog.command.contains("touch /tmp/te439/approval-test.txt"),
+            "ボックス内のコマンドは含む: {}",
+            dialog.command
+        );
+        assert!(
+            !dialog.command.contains("Fable 5")
+                && !dialog.command.contains("MCP server")
+                && !dialog.command.contains("を実行して")
+                && !dialog.command.contains("shiozawatakumi"),
+            "罫線より上のバナー・発話は含まない: {}",
+            dialog.command
+        );
+    }
+
+    #[test]
+    fn is_box_ruleは罫線行のみtrue() {
+        assert!(is_box_rule("──────────"));
+        assert!(is_box_rule("╭──────╮"));
+        assert!(is_box_rule("  │   │  "));
+        // 空行は境界にしない（本体に空行を挟む claude 版を壊さないため）
+        assert!(!is_box_rule(""));
+        assert!(!is_box_rule("Bash command"));
+        assert!(!is_box_rule("Allow this command?"));
     }
 
     #[test]

@@ -25,7 +25,8 @@ function SkeletonCard() {
 
 function stateOf(p) {
   if (p.state === 'error' || p.exit_code) return 'error';
-  if (p.state === 'busy' || p.state === 'needs_input') return 'busy';
+  // permission ダイアログ実在 = ユーザーの承認待ち（#425。サーバーが画面から検知）
+  if (p.permission_dialog || p.state === 'busy' || p.state === 'needs_input') return 'busy';
   if (p.state === 'running') return 'running';
   return 'idle';
 }
