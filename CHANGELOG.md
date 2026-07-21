@@ -5,6 +5,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- [修正] リモート: auto mode の自動実行コマンドに承認カードが出る問題を修正 (#425)
+  transcript 正規化が最終 assistant エントリの tools を無条件に承認待ちと判定していた。
+  tool_result の到着を追跡し、実際に承認待ちの場合のみカードを表示するよう修正。
+  Fix remote: approval cards shown for auto-mode tool calls (#425).
+  Transcript normalizer unconditionally flagged the last assistant's tools as pending.
+  Now tracks tool_result arrival and only shows approval when genuinely pending.
+
 - [修正] 赤ボタン close → Dock 復帰でウインドウサイズ・位置がデフォルトに戻る問題を修正 (#412)
   最後のウィンドウ close 時に `drop_viewport` が `window_frames` を削除し、Dock 復帰の
   `reopen_or_restore` → `open_viewport` が保存フレームを参照できずデフォルトサイズになっていた。
