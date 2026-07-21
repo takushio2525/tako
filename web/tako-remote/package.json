@@ -10,7 +10,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "dompurify": "^3.4.12",
     "geist": "^1.7.2",
+    "marked": "^18.0.7",
     "preact": "^10.25.0"
   },
   "devDependencies": {
