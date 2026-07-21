@@ -4,23 +4,22 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-22・#435 i18n 実装完了 → 実機確認待ち。#287 実機確認も継続）
+## 現在の対象（2026-07-22・#459 設定画面 M4〜M7 完了 → PR 作成待ち）
 
-**#435 UI 日英 i18n: PR #454 merge 済み（`be0606d`）。実機確認まで Issue オープン**
+**#459 設定画面（Cmd+,）: M1〜M3 は PR #461 merge 済み。M4〜M7 を feature/459-settings-m4-m7 に実装完了**
 
-- i18n: `tako-core::i18n` + `ui_text/` の `tr!(ja, en)` カタログ + 切替 3 経路
-  （CLI `tako lang` / MCP `tako_lang` = 106 ツール / パレット「表示言語を切替」）。
-  既定 OS ロケール解決・settings.json `language` 永続化。conventions.md に運用明文化
-- #287 P1 cross-origin は merge 済み（実機確認待ち）。残 #287 所見は P1-2 identity spoof のみ
+- M4: Code Runner タブ（拡張子テーブル + user/builtin バッジ + リセット + 変数ヘルプ）
+- M5: セットアップタブ（CLI 検出 / FDA / MCP 登録 / ルール同期 / tako setup 起動）
+- M6: スリープ防止（ラジオ 3 セット）+ リモート（状態 + 開始/停止）+ 高度（JSON 表示 + 関連ファイル）
+- M7: 1:1 監査完了（全項目が既存 CLI/MCP で操作可能。新設 dispatch 不要）
+- テスト修正: テーマテスト回帰 / MCP ツール数 109→110 / clippy field_reassign
+- 品質ゲート: cargo test 1193+ / fmt / clippy(-D warnings) 全緑
 
 ## 次の一手
 
-- `build-app.sh --install` → 実機確認: ① #435 `tako lang en` → 主要 UI 英語 + パレット切替
-  （証拠スクショ ~/Desktop/tako-435-evidence/）② remote 5 Issue + cross-origin（iPhone、
-  evil origin fetch 403）
-- #435 タスク 3（README 等の英語化）と #287 P1-2（Unix socket 化）は別タスクとして着手判断
+- push → PR（`Closes #459`）→ squash merge → main 同期
+- `build-app.sh --install` → 実機確認
 
 ## 現フェーズで Read すべき設計書
 
-- リリースチャンネル仕様: `gh issue view 403 --comments`
-- remote 計画: `.agent/plans/tako-remote-plan.md`
+- 設定画面設計: `.agent/plans/2026-07-settings-ui.md`

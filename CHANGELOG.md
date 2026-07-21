@@ -5,6 +5,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- [機能追加] 設定画面（Cmd+,）の全タブ実装完了（#459）
+  M4: Code Runner タブ（拡張子既定テーブル + 編集 + 変数リファレンス）。
+  M5: セットアップタブ（CLI 検出状態 / FDA / MCP 登録 / ルール同期 / tako setup 起動）。
+  M6: スリープ防止タブ（モード / 電源条件 / 蓋閉じ）+ リモートタブ（状態 / 開始・停止）
+  + 高度タブ（settings.json 表示 / 再読み込み / Finder で表示 / 関連ファイル）。
+  全操作は既存 dispatch 経由で CLI / MCP との 1:1 を維持。
+  Complete settings window (Cmd+,) implementation (#459).
+  M4: Code Runner tab (extension defaults table + edit + variable reference).
+  M5: Setup tab (CLI detection / FDA / MCP registration / rules sync / run setup).
+  M6: Sleep Guard tab (mode / power / lid) + Remote tab (status / start-stop)
+  + Advanced tab (settings.json viewer / reload / Finder reveal / related files).
+  All operations use existing dispatches to maintain CLI/MCP 1:1 parity.
+
 - [改善] リモート PWA チャットビューの Markdown レンダリング対応
   assistant / user メッセージを marked + DOMPurify でパース・サニタイズし、太字・
   インラインコード・コードブロック・見出し・リスト・引用・リンク・テーブル等を正しく
