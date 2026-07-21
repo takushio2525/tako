@@ -1139,10 +1139,11 @@ pub fn scrollback(pane_id: &str, lines: u32) -> Result<Vec<String>, String> {
 /// PID ファイルは 3 行形式（PID / 実行ファイル / 起動時刻。P0-4）のため
 /// parse_pid_file で先頭行の PID を取り出す
 pub fn daemon_status() -> Value {
-    let pid_num = match parse_pid_file() {
-        Ok(info) => info.pid,
+    let pid_info = match parse_pid_file() {
+        Ok(info) => info,
         Err(_) => return json!({ "running": false }),
     };
+    let pid_num = pid_info.pid;
     if !is_process_alive(pid_num) {
         cleanup_state_files();
         return json!({ "running": false });
@@ -1168,6 +1169,11 @@ pub fn daemon_status() -> Value {
         "url": base_url,
         "transport": "tailscale-serve",
     });
+    // 稼働中 serve の実行バイナリを可視化する（#432: どの世代の serve が
+    // 動いているかを ps なしで確認できるようにする）
+    if let Some(exe) = pid_info.exe.as_deref().filter(|e| !e.is_empty()) {
+        status["serve_binary"] = json!(exe);
+    }
     if let Some(n) = devices {
         status["devices"] = json!(n);
     }
@@ -1193,7 +1199,6 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// 形式: 行1=PID, 行2=実行ファイルパス, 行3=起動時刻(unix epoch sec)
 struct PidInfo {
     pid: u32,
-    #[allow(dead_code)]
     exe: Option<String>,
     start_time: Option<u64>,
 }
@@ -1423,18 +1428,56 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
     Ok(json!({ "stopped": true }))
 }
 
-/// serve 子プロセスに使う tako バイナリを解決する。
-/// tako CLI 自身から呼ばれた場合は自分（current_exe）を使う: PATH 優先の解決だと、
-/// dev ビルドや .app 同梱 CLI からの起動が PATH 上の**別バージョンの tako**へ化けて
-/// 旧実装の serve が立つ事故が起きる。tako-app（ファイル名が tako でない）から
-/// 呼ばれた場合のみ resolve_tako_binary（PATH → 同梱 CLI）に委ねる
+/// serve 子プロセスに使う tako バイナリを解決する（#432）。
+/// ① 隔離・検証モード（TAKO_REMOTE_TEST_MODE / TAKO_ISOLATED）は検証対象の
+///    自世代バイナリ: CLI 自身（current_exe）、GUI（tako-app）からは同ディレクトリの
+///    `tako`（同ビルドの CLI）。/Applications に飛ばない = 隔離を壊さない
+/// ② /Applications の安定バイナリを最優先。GUI（.app）と serve の世代を揃える:
+///    旧実装は current_exe 優先で、PATH 先頭に dev の target/release を入れた環境で
+///    シェルから `tako remote start` すると dev CLI 世代の serve が立ち、install 済み
+///    .app と食い違って実機検証が旧コードを踏む事故が起きた
+/// ③ .app が無い環境（cargo install 等）は CLI 自身（current_exe）
+/// ④ それ以外（ファイル名が tako でない呼び出し元）は resolve_tako_binary に委ねる
 fn serve_binary() -> String {
-    if let Ok(exe) = std::env::current_exe() {
-        if exe.file_name().and_then(|n| n.to_str()) == Some("tako") {
-            return exe.display().to_string();
+    let isolated = std::env::var("TAKO_REMOTE_TEST_MODE").is_ok_and(|v| v == "1")
+        || matches!(
+            std::env::var("TAKO_ISOLATED").ok().as_deref(),
+            Some("1" | "true" | "on")
+        );
+    let stable_exists = std::path::Path::new(crate::dispatch::STABLE_APP_BINARY).is_file();
+    serve_binary_impl(isolated, std::env::current_exe().ok(), stable_exists)
+        .unwrap_or_else(crate::dispatch::resolve_tako_binary)
+}
+
+/// serve_binary の判定本体（テスト可能な純関数寄りの形。None = resolve_tako_binary へ委譲）
+fn serve_binary_impl(
+    isolated: bool,
+    current_exe: Option<std::path::PathBuf>,
+    stable_exists: bool,
+) -> Option<String> {
+    if isolated {
+        if let Some(ref exe) = current_exe {
+            if exe.file_name().and_then(|n| n.to_str()) == Some("tako") {
+                return Some(exe.display().to_string());
+            }
+            // GUI（tako-app）等からの起動: 同ディレクトリの CLI（同世代）を使う
+            if let Some(dir) = exe.parent() {
+                let sibling = dir.join("tako");
+                if sibling.is_file() {
+                    return Some(sibling.display().to_string());
+                }
+            }
         }
     }
-    crate::dispatch::resolve_tako_binary()
+    if stable_exists {
+        return Some(crate::dispatch::STABLE_APP_BINARY.to_string());
+    }
+    if let Some(ref exe) = current_exe {
+        if exe.file_name().and_then(|n| n.to_str()) == Some("tako") {
+            return Some(exe.display().to_string());
+        }
+    }
+    None
 }
 
 /// デーモンをバックグラウンドで fork 起動する。
@@ -1448,6 +1491,18 @@ pub fn spawn_daemon(port: Option<u16>) -> Result<Value, String> {
     // 既に起動中か確認
     let status = daemon_status();
     if status["running"].as_bool() == Some(true) {
+        // 稼働中 serve の世代が現在の解決先と異なる場合は差し替えを促す
+        // （#432: install 後も旧バイナリの serve が生き残り、実機検証が
+        // 旧コードを踏む事故の検知）
+        let running_exe = status["serve_binary"].as_str().unwrap_or("");
+        let expected = serve_binary();
+        if !running_exe.is_empty() && running_exe != expected {
+            return Err(format!(
+                "リモートサーバーは既に起動中ですが、稼働中の serve バイナリ\
+                 （{running_exe}）が現在の解決先（{expected}）と異なります。\
+                 `tako remote stop` してから `tako remote start` で差し替えてください"
+            ));
+        }
         return Err("リモートサーバーは既に起動中".to_string());
     }
 
@@ -1580,6 +1635,10 @@ pub fn spawn_daemon(port: Option<u16>) -> Result<Value, String> {
 
     // 子プロセスを切り離す（wait しない → init が引き取る）
     std::mem::forget(child);
+
+    // 起動応答に serve へ使ったバイナリを含める（#432: start 直後に世代を確認できる）
+    let mut info = info;
+    info["serve_binary"] = json!(tako_bin);
 
     Ok(info)
 }
@@ -2531,29 +2590,41 @@ fn resolve_pane_session_info(pane: &Value, pane_id: u64) -> (Option<String>, Opt
     (session_id, model)
 }
 
-/// tmux target を使って IPC 経由で Send dispatch を呼ぶ。
-/// app が不在なら 503 を返す
+/// tmux ターゲット（`session:0.0` / `session`）からセッション名部分を取り出す。
+/// dispatch の tmux_session フィールドはセッション名を期待する（deliver 系が
+/// `={session}:` を組み立てるため、`:0.0` が残ると can't find pane になる。#428）
+fn session_name_of(target: &str) -> String {
+    target.split(':').next().unwrap_or(target).to_string()
+}
+
+/// IPC 経由で Send dispatch を呼ぶ。app が不在なら 503 を返す。
+/// `pane` は tako PaneId（GUI 側 resolve_pane で解決 = 送達検証フローが効く正規経路）、
+/// `tmux_session` はペイン消失時のフォールバック用**セッション名**。
+/// 注意: "session:0.0" のような tmux ターゲット形式を tmux_session に渡してはならない。
+/// deliver 系は `={session}:` を組み立てるため `=session:0.0:` となり
+/// can't find pane で無音失敗する（#428 の根因）
 fn dispatch_send(
     app_conn: &Arc<RwLock<AppConnection>>,
-    tmux_target: &str,
+    pane: Option<u64>,
+    tmux_session: Option<String>,
     text: &str,
     newline: bool,
     keys: Option<&str>,
 ) -> Result<Value, (u16, String)> {
     let request = if let Some(keys_str) = keys {
         crate::protocol::Request::Send {
-            pane: None,
+            pane,
             text: keys_str.to_string(),
             newline: false,
-            tmux_session: Some(tmux_target.to_string()),
+            tmux_session,
             await_prompt: false,
         }
     } else {
         crate::protocol::Request::Send {
-            pane: None,
+            pane,
             text: text.to_string(),
             newline,
-            tmux_session: Some(tmux_target.to_string()),
+            tmux_session,
             await_prompt: false,
         }
     };
@@ -3177,9 +3248,22 @@ fn handle_api_v2_routes(
                     notify_macos(&format!("{} が操作を開始しました", device.name));
                 }
             }
-            let target =
-                resolve_pane_param(&pane_param, app_conn, pane_mapping).unwrap_or(pane_param);
-            match dispatch_send(app_conn, &target, &text, newline, keys.as_deref()) {
+            // dispatch Send へは PaneId（数値）を渡して GUI 側の resolve_pane に解決させる
+            // （alt_screen の送達検証フロー #32/#95 が効く正規経路）。tmux_session
+            // フォールバックには tmux ターゲットではなく**セッション名**を渡す
+            // （#428: "session:0.0" を渡すと deliver 系の `={session}:` 組み立てが
+            // `=session:0.0:` になり can't find pane で無音失敗していた）
+            let pane_id: Option<u64> = pane_param.parse().ok();
+            let session_name = resolve_pane_param(&pane_param, app_conn, pane_mapping)
+                .map(|t| session_name_of(&t));
+            match dispatch_send(
+                app_conn,
+                pane_id,
+                session_name,
+                &text,
+                newline,
+                keys.as_deref(),
+            ) {
                 Ok(_) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
                 Err((status, e)) => {
                     respond(request, status, Some(json!({ "error": e }).to_string()))
@@ -4340,5 +4424,84 @@ mod tests {
             required_role(&Method::Post, "/api/upload"),
             DeviceRole::Interact
         );
+    }
+
+    #[test]
+    fn session_name_ofはtmuxターゲットからセッション名を取り出す() {
+        // #428: dispatch の tmux_session に ":0.0" が残ると deliver 系の
+        // `={session}:` 組み立てが `=session:0.0:` になり can't find pane で無音失敗する
+        assert_eq!(session_name_of("tako-abc123:0.0"), "tako-abc123");
+        assert_eq!(session_name_of("tako-abc123:"), "tako-abc123");
+        assert_eq!(session_name_of("tako-abc123"), "tako-abc123");
+    }
+
+    #[test]
+    fn pane_mappingは数値idをtmuxターゲットとセッション名に解決する() {
+        let mut mapping = PaneMapping::new();
+        mapping.update_from_list(&json!({
+            "tabs": [{ "id": 1, "panes": [
+                { "id": 42, "tmux_session": "tako-deadbeef" },
+                { "id": 7, "tmux_session": "" },
+            ]}]
+        }));
+        // 数値 PaneId → "session:0.0"（WS / screen 用）
+        assert_eq!(
+            mapping.resolve_tmux_target("42").as_deref(),
+            Some("tako-deadbeef:0.0")
+        );
+        // dispatch 用にはセッション名へ分離できる（#428 回帰）
+        let session = mapping
+            .resolve_tmux_target("42")
+            .map(|t| session_name_of(&t));
+        assert_eq!(session.as_deref(), Some("tako-deadbeef"));
+        // tmux_session が空のペインは解決不能（tmux フォールバック不可）
+        assert_eq!(mapping.resolve_tmux_target("7"), None);
+        // tmux ターゲット形式はそのまま通す
+        assert_eq!(
+            mapping.resolve_tmux_target("sess:0.1").as_deref(),
+            Some("sess:0.1")
+        );
+    }
+
+    #[test]
+    fn serve_binary_implは通常モードで安定バイナリを優先する() {
+        // #432: PATH 上の dev CLI から start しても .app 世代の serve を立てる
+        let dev_cli = std::path::PathBuf::from("/tmp/dev/target/release/tako");
+        assert_eq!(
+            serve_binary_impl(false, Some(dev_cli.clone()), true).as_deref(),
+            Some(crate::dispatch::STABLE_APP_BINARY)
+        );
+        // .app が無い環境では CLI 自身
+        assert_eq!(
+            serve_binary_impl(false, Some(dev_cli), false).as_deref(),
+            Some("/tmp/dev/target/release/tako")
+        );
+    }
+
+    #[test]
+    fn serve_binary_implは検証モードで自世代バイナリを返す() {
+        // #432: 隔離・検証時は /Applications に飛ばず検証対象の世代で serve を立てる
+        let dev_cli = std::path::PathBuf::from("/tmp/dev/target/release/tako");
+        assert_eq!(
+            serve_binary_impl(true, Some(dev_cli), true).as_deref(),
+            Some("/tmp/dev/target/release/tako")
+        );
+        // GUI（tako-app）から: 同ディレクトリに実在する CLI（同世代）へ
+        let dir = std::env::temp_dir().join(format!("tako-432-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sibling = dir.join("tako");
+        std::fs::write(&sibling, b"stub").unwrap();
+        let gui = dir.join("tako-app");
+        assert_eq!(
+            serve_binary_impl(true, Some(gui.clone()), true).as_deref(),
+            Some(sibling.display().to_string().as_str())
+        );
+        // sibling が無ければ通常フロー（安定バイナリ）へ落ちる
+        std::fs::remove_file(&sibling).unwrap();
+        assert_eq!(
+            serve_binary_impl(true, Some(gui), true).as_deref(),
+            Some(crate::dispatch::STABLE_APP_BINARY)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
