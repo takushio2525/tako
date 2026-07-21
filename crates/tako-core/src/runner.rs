@@ -501,6 +501,16 @@ fn strip_quotes(s: &str) -> String {
     }
 }
 
+/// UI 向けの軽量ヘッド読み取り（16 KiB 上限。読み取り失敗は None）
+pub fn read_file_head_for_ui(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; SCAN_MAX_BYTES];
+    let n = file.read(&mut buf).ok()?;
+    buf.truncate(n);
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
 // --- テスト ---
 
 #[cfg(test)]

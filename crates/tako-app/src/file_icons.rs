@@ -136,6 +136,7 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     ui_asset!("more"),
     ui_asset!("orch"),
     ui_asset!("orch_active"),
+    ui_asset!("play"),
     ui_asset!("plus"),
     ui_asset!("refresh"),
     ui_asset!("search"),
@@ -178,6 +179,7 @@ pub mod ui_icon {
     pub const MORE: &str = "icons/ui/more.svg";
     pub const ORCH: &str = "icons/ui/orch.svg";
     pub const ORCH_ACTIVE: &str = "icons/ui/orch_active.svg";
+    pub const PLAY: &str = "icons/ui/play.svg";
     pub const PLUS: &str = "icons/ui/plus.svg";
     pub const REFRESH: &str = "icons/ui/refresh.svg";
     pub const REMOTE: &str = "icons/ui/remote.svg";
