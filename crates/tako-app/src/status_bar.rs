@@ -1718,7 +1718,7 @@ impl TakoApp {
                                         .text_size(px(11.5))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(hsla(theme.foreground))
-                                        .child(text::POPOVER_TITLE),
+                                        .child(text::popover_title()),
                                 ),
                         )
                         // 本文（モード / いまの状態 / 蓋を閉じたら）
@@ -1728,15 +1728,15 @@ impl TakoApp {
                                 .flex_col()
                                 .py(px(6.0))
                                 .child(row(
-                                    text::LABEL_MODE,
+                                    text::label_mode(),
                                     SharedString::from(text::mode_label(state.mode)),
                                 ))
                                 .child(row(
-                                    text::LABEL_STATUS,
+                                    text::label_status(),
                                     SharedString::from(text::reason(&state)),
                                 ))
                                 .child(row(
-                                    text::LABEL_LID,
+                                    text::label_lid(),
                                     SharedString::from(text::lid_behavior(&state)),
                                 ))
                                 // 高温警告（蓋閉じ継続が効いている文脈でのみ表示）
@@ -1769,7 +1769,7 @@ impl TakoApp {
                                                     .text_size(px(10.5))
                                                     .line_height(px(15.0))
                                                     .text_color(hsla(theme.red))
-                                                    .child(text::THERMAL_NOTE),
+                                                    .child(text::thermal_note()),
                                             ),
                                     )
                                 }),
@@ -1789,7 +1789,7 @@ impl TakoApp {
                                     div()
                                         .text_size(px(10.5))
                                         .text_color(hsla(theme.text_muted))
-                                        .child(text::LABEL_CHANGE),
+                                        .child(text::label_change()),
                                 )
                                 .child(
                                     div()
@@ -1830,7 +1830,7 @@ impl TakoApp {
                                     div()
                                         .text_size(px(10.0))
                                         .text_color(hsla(theme.text_faint))
-                                        .child(text::CHANGE_HINT_AI),
+                                        .child(text::change_hint_ai()),
                                 ),
                         ),
                 )
