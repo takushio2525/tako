@@ -5,6 +5,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- [改善] リモート PWA チャットビューの Markdown レンダリング対応
+  assistant / user メッセージを marked + DOMPurify でパース・サニタイズし、太字・
+  インラインコード・コードブロック・見出し・リスト・引用・リンク・テーブル等を正しく
+  表示するように改善。コードブロックは等幅フォント + 背景色付き。XSS 防止済み。
+  Add Markdown rendering to the remote PWA chat view. Assistant and user messages
+  are now parsed with marked and sanitized with DOMPurify, properly rendering bold,
+  inline code, code blocks, headings, lists, blockquotes, links, tables, etc.
+  Code blocks use monospace font with a distinct background. XSS-safe.
+
 - [機能追加] UI の日英 i18n: 表示言語の切替（#435）
   UI 文字列をロケールキー化（`ui_text` カタログ + `tr!(日, 英)`）し、日英を切替可能に。
   既定は OS ロケール解決（環境変数 → macOS AppleLanguages）。手動切替は

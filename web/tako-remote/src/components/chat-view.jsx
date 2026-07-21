@@ -1,6 +1,19 @@
-import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'preact/hooks';
+import { marked } from 'marked';
+import DOMPurify from 'dompurify';
 import { createClient } from '../api';
 import { AgentIcon, agentColor, agentDarkColor } from './agent-icon';
+
+marked.setOptions({
+  breaks: true,
+  gfm: true,
+});
+
+function renderMarkdownHtml(text) {
+  if (!text) return '';
+  const raw = marked.parse(text);
+  return DOMPurify.sanitize(raw);
+}
 
 const TOOL_ICONS = {
   Bash: 'Bash',
@@ -100,9 +113,14 @@ function ChoiceButtons({ choices, onSelect }) {
   );
 }
 
+function MarkdownContent({ text, className }) {
+  const html = useMemo(() => renderMarkdownHtml(text), [text]);
+  return <div class={className} dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
 function ChatMessage({ msg, agentType, paneId, onSend, canInteract }) {
   if (msg.role === 'user') {
-    return <div class="chat-user">{msg.text}</div>;
+    return <MarkdownContent text={msg.text} className="chat-user md-content" />;
   }
 
   const agentName = agentType || 'claude';
@@ -114,7 +132,7 @@ function ChatMessage({ msg, agentType, paneId, onSend, canInteract }) {
         <span class="agent-name">{agentName}</span>
       </div>
       {msg.text && (
-        <div class="chat-agent-text">{renderTextWithCode(msg.text)}</div>
+        <MarkdownContent text={msg.text} className="chat-agent-text md-content" />
       )}
       {msg.tools && msg.tools.map((tool, i) => (
         <ToolCard key={i} tool={tool} agentType={agentType} />
@@ -127,16 +145,6 @@ function ChatMessage({ msg, agentType, paneId, onSend, canInteract }) {
       )}
     </div>
   );
-}
-
-function renderTextWithCode(text) {
-  const parts = text.split(/(`[^`]+`)/g);
-  return parts.map((part, i) => {
-    if (part.startsWith('`') && part.endsWith('`')) {
-      return <code key={i}>{part.slice(1, -1)}</code>;
-    }
-    return part;
-  });
 }
 
 function formatTime(ts) {
