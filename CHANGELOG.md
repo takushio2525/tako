@@ -28,6 +28,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   GPUI's on_drag_move fires on all registered elements in capture phase without
   hitbox checking. Added explicit bounds check to each handler.
 
+- [修正] Web ビュー URL 入力欄フォーカス中の paste がペインに入る問題を修正 (#414)
+  paste() が on_action 経由で直接呼ばれ handle_key のフォーカスチェーンを迂回していた。
+  URL 入力欄・address bar・パレット・インライン編集すべてに paste 経路を追加。
+  Fix paste during webview URL input focus leaking to terminal pane (#414).
+
+- [改善] cmd+ドロップ時のハイライトを「パス入力」表示に変更 (#415)
+  ファイルの cmd+ドロップ時のオーバーレイが分割ハイライトのままだったのを、
+  全面パス入力表示（薄い背景 + カーソルバー + ラベル）に変更。cmd の押し離しに即時追従。
+  Show "path insert" overlay instead of split highlight on cmd+drop (#415).
+
 - [機能追加] worker 自動復旧 supervisor (#401)
   watch の検知イベント（usage_limit / api_error / limit_dialog / WORKER_DEAD /
   prompt_undelivered）に対して自動リカバリアクションを実行する常駐ロジックを追加。
