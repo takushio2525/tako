@@ -5,6 +5,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- [スタイル] sleep-guard 状態チップを平易な日本語表示 + クリック詳細ポップオーバーへ刷新 (#440)
+  「awake+lid」等の略語表示をやめ、「スリープ防止中」「スリープ防止中・蓋閉じOK」
+  「スリープ防止中・高温注意」（高温時は赤字）の初見で意味が取れる表示に変更。
+  チップクリックで現在モード・防止が効いている理由（エージェント N 体稼働中）・
+  蓋を閉じたときの挙動・設定変更方法（コマンドはクリックでコピー）を平易な文章で
+  解説するポップオーバーを新設（ルートオーバーレイ方式で #361 のクリップ問題を回避）。
+  UI 文字列は新設の ui_text カタログモジュールに集約し、#435 の i18n（案 B）で
+  ロケールキー化しやすい構造にした。
+  Redesign the sleep-guard status chip with plain-language labels and a
+  click-to-open explainer popover (#440). Replaces the cryptic "awake+lid"
+  labels with self-explanatory Japanese text (red-tinted when the machine is
+  hot), and adds a popover explaining the current mode, why sleep is being
+  prevented (N busy agents), what happens when the lid closes, and how to
+  change the setting (command is click-to-copy). All strings now live in a
+  new ui_text catalog module structured for the upcoming i18n work (#435).
+
 - [スタイル] リロードアイコンを円弧 + 三角矢じりのブラウザ同型デザインへ刷新 (#438)
   旧デザインは円弧 2 本 + 45° 回転の十字で、小サイズ（12px）では ✕ に誤認されていた。
   単一の 270° 円弧 + 塗り三角の矢じり（Chrome / Material のリロードと同型）へ差し替え。

@@ -336,23 +336,15 @@ impl TakoApp {
                         )
                     })
             }))
-            .when(self.sleep_guard_active || self.lid_sleep_disabled, |d| {
-                let label = if self.lid_sleep_disabled {
-                    if self.thermal_warning {
-                        "awake+lid (!)".to_string()
-                    } else {
-                        "awake+lid".to_string()
-                    }
-                } else {
-                    "awake".to_string()
-                };
-                let color = if self.thermal_warning {
-                    theme.red
-                } else {
-                    theme.teal
-                };
-                d.child(
+            // sleep-guard 状態チップ（#440: 平易な日本語表示 + クリックで詳細ポップオーバー）
+            .children(self.sleep_guard_state.as_ref().and_then(|state| {
+                let label = crate::ui_text::sleep_guard::chip_label(state)?;
+                let thermal = state.lid_sleep_disabled && state.thermal_state.is_warning();
+                let color = if thermal { theme.red } else { theme.teal };
+                let popover_open = self.sleep_guard_popover_open;
+                Some(
                     div()
+                        .id("statusbar-sleep")
                         .flex()
                         .flex_row()
                         .items_center()
@@ -361,6 +353,19 @@ impl TakoApp {
                         .px(px(11.0))
                         .border_r_1()
                         .border_color(hsla(theme.border_subtle))
+                        .cursor_pointer()
+                        .when(popover_open, |d| d.bg(rgba(theme.surface_hover)))
+                        .hover(|d| d.bg(rgba(theme.surface_hover)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.sleep_guard_popover_open = !this.sleep_guard_popover_open;
+                                this.sleep_guard_popover_anchor =
+                                    this.sleep_guard_popover_open.then_some(event.position);
+                                cx.notify();
+                            }),
+                        )
                         // coffee アイコン（#217 SVG。#220 の蓋閉じ・高温警告の色分けを維持）
                         .child(
                             svg()
@@ -371,11 +376,16 @@ impl TakoApp {
                         )
                         .child(
                             div()
-                                .text_color(hsla(theme.text_muted))
+                                // 高温警告は文字も赤にして一目で分かるようにする（#440 候補比較 C2）
+                                .text_color(hsla(if thermal {
+                                    theme.red
+                                } else {
+                                    theme.text_muted
+                                }))
                                 .child(SharedString::from(label)),
                         ),
                 )
-            })
+            }))
             .child(div().flex_grow(1.0))
             .children(self.render_update_banner(&theme, cx))
             // 利用リミットメーター（Issue #321: サービス切替ドロップダウン + 「7d」表記）
@@ -1590,6 +1600,238 @@ impl TakoApp {
                                     false,
                                 ))
                                 .child(row(LimitService::Agy, None, None, "5h", "7d", true)),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// sleep-guard 詳細ポップオーバー（#440）。ステータスバーの overflow_hidden に
+    /// クリップされないよう、ルート div のオーバーレイとして描画する（#361 と同方式）。
+    /// 文言は ui_text::sleep_guard（i18n-ready カタログ）から引く
+    pub(crate) fn render_sleep_guard_overlay(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        use crate::ui_text::sleep_guard as text;
+        if !self.sleep_guard_popover_open {
+            return None;
+        }
+        let anchor = self.sleep_guard_popover_anchor?;
+        let state = self.sleep_guard_state.clone()?;
+        let theme = self.theme.clone();
+
+        let thermal = state.lid_sleep_disabled && state.thermal_state.is_warning();
+        let icon_color = if thermal { theme.red } else { theme.teal };
+
+        let row = |label: &'static str, value: SharedString| {
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap(px(10.0))
+                .px(px(12.0))
+                .py(px(5.0))
+                .child(
+                    div()
+                        .w(px(78.0))
+                        .flex_none()
+                        .pt(px(1.5))
+                        .text_size(px(10.5))
+                        .text_color(hsla(theme.text_muted))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        // flex 子の min-content 幅で折り返しが効かなくなるのを防ぐ
+                        // （cwd breadcrumb と同じ min_w(0) パターン）
+                        .min_w(px(0.0))
+                        .text_size(px(11.5))
+                        .line_height(px(17.0))
+                        .text_color(hsla(theme.foreground))
+                        .child(value),
+                )
+        };
+
+        let menu_w: f32 = 360.0;
+        let menu_left = (anchor.x - px(40.0)).max(px(8.0));
+
+        // 背面クリックで dismiss + パネル本体（limit-service メニューと同方式）
+        Some(
+            div()
+                .id("sleep-guard-dismiss")
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.sleep_guard_popover_open = false;
+                        this.sleep_guard_popover_anchor = None;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(menu_left)
+                        .bottom(px(STATUS_BAR_HEIGHT + 4.0))
+                        .w(px(menu_w))
+                        .rounded(px(9.0))
+                        .bg(rgba(theme.surface_1))
+                        .border_1()
+                        .border_color(hsla(theme.border_heavy))
+                        .shadow(vec![BoxShadow {
+                            color: gpui::hsla(0., 0., 0., 0.5),
+                            offset: point(px(0.), px(12.)),
+                            blur_radius: px(28.),
+                            spread_radius: px(0.),
+                            inset: false,
+                        }])
+                        .overflow_hidden()
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        // ヘッダー
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(7.0))
+                                .px(px(12.0))
+                                .pt(px(9.0))
+                                .pb(px(8.0))
+                                .border_b_1()
+                                .border_color(hsla(theme.border_subtle))
+                                .child(
+                                    svg()
+                                        .path(ui_icon::COFFEE)
+                                        .w(px(13.0))
+                                        .h(px(13.0))
+                                        .text_color(hsla(icon_color)),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(hsla(theme.foreground))
+                                        .child(text::POPOVER_TITLE),
+                                ),
+                        )
+                        // 本文（モード / いまの状態 / 蓋を閉じたら）
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .py(px(6.0))
+                                .child(row(
+                                    text::LABEL_MODE,
+                                    SharedString::from(text::mode_label(state.mode)),
+                                ))
+                                .child(row(
+                                    text::LABEL_STATUS,
+                                    SharedString::from(text::reason(&state)),
+                                ))
+                                .child(row(
+                                    text::LABEL_LID,
+                                    SharedString::from(text::lid_behavior(&state)),
+                                ))
+                                // 高温警告（蓋閉じ継続が効いている文脈でのみ表示）
+                                .when(thermal, |d| {
+                                    d.child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_start()
+                                            .gap(px(6.0))
+                                            .mx(px(12.0))
+                                            .mt(px(4.0))
+                                            .px(px(8.0))
+                                            .py(px(6.0))
+                                            .rounded(px(6.0))
+                                            .bg(rgba_alpha(theme.red, 0.12))
+                                            .child(
+                                                svg()
+                                                    .path(ui_icon::WARNING)
+                                                    .w(px(12.0))
+                                                    .h(px(12.0))
+                                                    .flex_none()
+                                                    .mt(px(1.5))
+                                                    .text_color(hsla(theme.red)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.0))
+                                                    .text_size(px(10.5))
+                                                    .line_height(px(15.0))
+                                                    .text_color(hsla(theme.red))
+                                                    .child(text::THERMAL_NOTE),
+                                            ),
+                                    )
+                                }),
+                        )
+                        // フッター（設定変更方法）
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.0))
+                                .px(px(12.0))
+                                .pt(px(8.0))
+                                .pb(px(9.0))
+                                .border_t_1()
+                                .border_color(hsla(theme.border_subtle))
+                                .child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .text_color(hsla(theme.text_muted))
+                                        .child(text::LABEL_CHANGE),
+                                )
+                                .child(
+                                    div()
+                                        .id("sleep-guard-copy-cmd")
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .px(px(8.0))
+                                        .py(px(4.0))
+                                        .rounded(px(5.0))
+                                        .bg(rgba(theme.surface_highlight))
+                                        .cursor_pointer()
+                                        .hover(|d| d.bg(rgba(theme.surface_hover_strong)))
+                                        .on_click(cx.listener(|_, _, _, cx| {
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                                text::CHANGE_COMMAND.to_string(),
+                                            ));
+                                        }))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .font_family(theme.font_family.clone())
+                                                .text_size(px(10.5))
+                                                .text_color(hsla(theme.foreground))
+                                                .child(text::CHANGE_COMMAND),
+                                        )
+                                        .child(
+                                            svg()
+                                                .path(ui_icon::COPY)
+                                                .w(px(10.0))
+                                                .h(px(10.0))
+                                                .flex_none()
+                                                .text_color(hsla(theme.text_faint)),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(hsla(theme.text_faint))
+                                        .child(text::CHANGE_HINT_AI),
+                                ),
                         ),
                 )
                 .into_any_element(),
