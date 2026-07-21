@@ -14665,23 +14665,39 @@ mod self_test {
         let _ = std::fs::remove_file(path);
     }
 
-    /// 文字列をキーストローク列としてウィンドウへ流し込む
+    /// 文字列をキーストローク列としてウィンドウへ流し込む。
+    /// 80 文字以下は dispatch_keystroke 経由（入力経路の検証）、それを超える文字列は
+    /// PTY 直接書き込みで GPUI の毎文字フルレイアウト再計算を回避する（#421）
     fn type_text(any: AnyWindowHandle, cx: &mut AsyncApp, text: &str, enter: bool) {
         let text = text.to_string();
-        let _ = any.update(cx, |_, window, cx| {
-            for ch in text.chars() {
-                let keystroke = Keystroke {
-                    modifiers: Modifiers::default(),
-                    key: ch.to_string(),
-                    key_char: Some(ch.to_string()),
-                };
-                window.dispatch_keystroke(keystroke, cx);
-            }
+        if text.chars().count() <= 80 {
+            let _ = any.update(cx, |_, window, cx| {
+                for ch in text.chars() {
+                    let keystroke = Keystroke {
+                        modifiers: Modifiers::default(),
+                        key: ch.to_string(),
+                        key_char: Some(ch.to_string()),
+                    };
+                    window.dispatch_keystroke(keystroke, cx);
+                }
+                if enter {
+                    window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx);
+                }
+            });
+        } else {
+            let wh: WindowHandle<TakoApp> = any.downcast::<TakoApp>().unwrap();
+            let any2: AnyWindowHandle = wh.into();
+            let _ = wh.update(cx, |app, _, _| {
+                if let Some(session) = app.focused_session() {
+                    session.paste(&text);
+                }
+            });
             if enter {
-                // 固定文字列のパースは失敗しない（論理的に到達不能）
-                window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx);
+                let _ = any2.update(cx, |_, window: &mut Window, cx| {
+                    window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx);
+                });
             }
-        });
+        }
     }
 
     fn press(any: AnyWindowHandle, cx: &mut AsyncApp, combo: &str) {
