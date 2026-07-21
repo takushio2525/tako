@@ -24,6 +24,7 @@ mod preview_render;
 mod preview_watch;
 mod remote_panel;
 mod right_panel;
+mod settings_window;
 mod sidebar;
 mod status_bar;
 mod tab_bar;
@@ -983,6 +984,10 @@ struct TakoApp {
     /// 論理ウィンドウ作成済みで GPUI ウィンドウが未生成のもの（dispatch 経由の
     /// window new 等。GPUI の Context が要るため render / defer で消費する）
     pending_viewport_opens: Vec<tako_core::WindowId>,
+    /// 設定画面ウィンドウのハンドル（単一インスタンス。Issue #459）
+    settings_window_handle: Option<gpui::AnyWindowHandle>,
+    /// dispatch から設定画面を開くための pending キュー（Issue #459）
+    pending_settings_open: Option<Option<settings_window::SettingsTab>>,
 }
 
 /// × ボタン close の確認ダイアログ対象（Issue #172）
@@ -1782,7 +1787,7 @@ impl TakoApp {
             workspace,
             terminals: HashMap::new(),
             // テーマは settings.json の設定値から復元（Issue #217。既定ダーク）
-            theme: Theme::for_mode(tako_control::settings::load().theme_mode()),
+            theme: tako_control::settings::load().resolve_theme().0,
             focus_handle: cx.focus_handle(),
             cell_size: None,
             pane_font_sizes: HashMap::new(),
@@ -1959,6 +1964,8 @@ impl TakoApp {
                 .map(|(id, f)| (tako_core::WindowId::from_raw(*id), f.clone()))
                 .collect(),
             pending_viewport_opens: Vec::new(),
+            settings_window_handle: None,
+            pending_settings_open: None,
         };
         // 複数ウィンドウの復元（Issue #339）: アクティブ以外の論理ウィンドウは
         // 初回 render / dispatch の sync_viewports が保存フレームで開き直す
@@ -2313,6 +2320,9 @@ impl TakoApp {
                     // 反映する。render 冒頭の同期はウィンドウが隠れているとフレームが
                     // 来ず走らないため、CLI / MCP 経路はここで消費する
                     app.sync_viewports(cx);
+                    if let Some(tab) = app.pending_settings_open.take() {
+                        app.open_settings_window_impl(tab, cx);
+                    }
                     // AI / CLI 操作によるレイアウト変化を即座に永続化する（Phase 5.5）
                     app.save_layout();
                     cx.notify();
@@ -5176,7 +5186,6 @@ impl TakoApp {
             ThemeMode::Dark => ThemeMode::Light,
             ThemeMode::Light => ThemeMode::Dark,
         };
-        self.theme = Theme::for_mode(next);
         // セルフテスト中はユーザー設定を汚さない（dispatch 側と同方針）
         if std::env::var_os("TAKO_SELF_TEST").is_none() {
             let mut settings = tako_control::settings::load();
@@ -5185,6 +5194,7 @@ impl TakoApp {
                 eprintln!("warning: 設定を保存できない: {e}");
             }
         }
+        self.theme = tako_control::settings::load().resolve_theme().0;
         cx.notify();
     }
 
@@ -5872,6 +5882,61 @@ impl TakoApp {
                 self.open_viewport(lid, cx);
             }
         }
+    }
+
+    /// 設定ウィンドウを開く / 前面化する（Issue #459）
+    fn open_settings_window_impl(
+        &mut self,
+        tab: Option<settings_window::SettingsTab>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(handle) = self.settings_window_handle {
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, _cx| {
+                    window.activate_window();
+                });
+            });
+            return;
+        }
+        let weak = cx.entity().downgrade();
+        let tab_clone = tab;
+        cx.defer(move |cx| {
+            let weak2 = weak.clone();
+            let result = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                        None,
+                        size(px(760.), px(560.)),
+                        cx,
+                    ))),
+                    ..Default::default()
+                },
+                |_window, cx| {
+                    cx.new(|cx| settings_window::SettingsWindow::new(weak2, tab_clone, cx))
+                },
+            );
+            if let Ok(handle) = result {
+                let any_handle: AnyWindowHandle = handle.into();
+                if let Some(app) = weak.upgrade() {
+                    app.update(cx, |app, _cx| {
+                        app.settings_window_handle = Some(any_handle);
+                    });
+                }
+                let weak3 = weak.clone();
+                handle
+                    .update(cx, |_, window, cx| {
+                        window.on_window_should_close(cx, move |_, _cx| {
+                            if let Some(app) = weak3.upgrade() {
+                                app.update(_cx, |app, _| {
+                                    app.settings_window_handle = None;
+                                });
+                            }
+                            true
+                        });
+                    })
+                    .ok();
+            }
+        });
     }
 
     /// アクティブ論理ウィンドウの GPUI ウィンドウを前面化する（タブ切替がウィンドウを
@@ -11896,6 +11961,21 @@ impl UiStateHost for TakoApp {
         self.theme = Theme::for_mode(mode);
     }
 
+    fn reload_theme(&mut self) {
+        let settings = tako_control::settings::load();
+        let (theme, _) = settings.resolve_theme();
+        self.theme = theme;
+    }
+
+    fn open_settings_window(&mut self, tab: Option<&str>) {
+        let tab = tab.and_then(settings_window::SettingsTab::from_str);
+        self.pending_settings_open = Some(tab);
+    }
+
+    fn settings_window_open(&self) -> bool {
+        self.settings_window_handle.is_some()
+    }
+
     fn ui_lang_setting(&self) -> tako_core::i18n::LangSetting {
         self.lang_setting
     }
@@ -13541,6 +13621,9 @@ impl Render for TakoApp {
 
         // 論理ウィンドウ ⇔ GPUI ウィンドウの同期（Issue #339。空ウィンドウの close 等）
         self.sync_viewports(cx);
+        if let Some(tab) = self.pending_settings_open.take() {
+            self.open_settings_window_impl(tab, cx);
+        }
         // このウィンドウの表示タブ（Issue #339 ビューポート方式)。同一 entity を
         // 全ウィンドウの root view として共有するため、呼び出し元 window ごとに解決する
         let display_tab = self.display_tab_for(window);
@@ -14619,6 +14702,15 @@ fn main() {
         // ウィンドウ有無に依存しない）。layout 保存などの終了処理は
         // on_app_quit（TakoApp::new で登録。Dock 終了でも走る）が担う
         cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.on_action(|_: &OpenSettings, cx| {
+            if let Some(g) = cx.try_global::<PrimaryApp>() {
+                if let Some(app) = g.0.upgrade() {
+                    app.update(cx, |app, cx| {
+                        app.open_settings_window_impl(None, cx);
+                    });
+                }
+            }
+        });
         // 保存済みウィンドウフレームの復元（FR-5。終了前にフルスクリーンなら
         // フルスクリーンで開く）。セルフテストは既定サイズで決定的に動かす
         let saved_frame = if std::env::var_os("TAKO_SELF_TEST").is_none() {

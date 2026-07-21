@@ -138,6 +138,26 @@ pub struct Theme {
     pub line_height: f32,
 }
 
+impl Rgb {
+    /// `#RRGGBB` 形式の文字列へ変換する
+    pub fn to_hex(self) -> String {
+        format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
+    }
+}
+
+/// `#RRGGBB` 文字列を Rgb へパースする（6 桁のみ。3 桁 #RGB は非対応）
+pub fn parse_hex_color(s: &str) -> Option<Rgb> {
+    let s = s.trim();
+    let hex = s.strip_prefix('#').unwrap_or(s);
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(Rgb::new(r, g, b))
+}
+
 impl Default for Theme {
     fn default() -> Self {
         Self::default_dark()
@@ -145,6 +165,236 @@ impl Default for Theme {
 }
 
 impl Theme {
+    /// 全 58 色キー名（settings.json / dispatch 共通。順序は UI カテゴリ順）
+    pub const COLOR_KEYS: &[&str] = &[
+        // ターミナル (21)
+        "background",
+        "foreground",
+        "cursor",
+        "cursor_text",
+        "selection_background",
+        "ansi_black",
+        "ansi_red",
+        "ansi_green",
+        "ansi_yellow",
+        "ansi_blue",
+        "ansi_magenta",
+        "ansi_cyan",
+        "ansi_white",
+        "ansi_bright_black",
+        "ansi_bright_red",
+        "ansi_bright_green",
+        "ansi_bright_yellow",
+        "ansi_bright_blue",
+        "ansi_bright_magenta",
+        "ansi_bright_cyan",
+        "ansi_bright_white",
+        // 背景階層 (12)
+        "crust",
+        "mantle",
+        "surface_0",
+        "surface_1",
+        "surface_2",
+        "surface_hover",
+        "surface_highlight",
+        "chip_surface",
+        "shelved_surface",
+        "surface_hover_strong",
+        "danger_header",
+        "danger_surface",
+        // ボーダー (5)
+        "border_inner",
+        "border_subtle",
+        "border_default",
+        "border_strong",
+        "border_heavy",
+        // テキスト (5)
+        "text_secondary",
+        "text_tertiary",
+        "text_muted",
+        "text_faint",
+        "text_overlay",
+        // アクセント (10)
+        "accent",
+        "accent_muted",
+        "accent_border_muted",
+        "idle_border",
+        "green",
+        "red",
+        "yellow",
+        "teal",
+        "mauve",
+        "peach",
+        // UI クローム (5)
+        "pane_border",
+        "tab_bar_background",
+        "tab_active_background",
+        "tab_active_foreground",
+        "tab_inactive_foreground",
+    ];
+
+    /// 色キーのカテゴリ情報（UI アコーディオン用）
+    pub const COLOR_CATEGORIES: &[(&str, &str, usize)] = &[
+        ("terminal", "ターミナル", 21),
+        ("background", "背景階層", 12),
+        ("border", "ボーダー", 5),
+        ("text", "テキスト", 5),
+        ("accent", "アクセント", 10),
+        ("chrome", "UI クローム", 5),
+    ];
+
+    /// キー名から色値を取得する
+    pub fn color(&self, key: &str) -> Option<Rgb> {
+        match key {
+            "background" => Some(self.background),
+            "foreground" => Some(self.foreground),
+            "cursor" => Some(self.cursor),
+            "cursor_text" => Some(self.cursor_text),
+            "selection_background" => Some(self.selection_background),
+            "ansi_black" => Some(self.ansi[0]),
+            "ansi_red" => Some(self.ansi[1]),
+            "ansi_green" => Some(self.ansi[2]),
+            "ansi_yellow" => Some(self.ansi[3]),
+            "ansi_blue" => Some(self.ansi[4]),
+            "ansi_magenta" => Some(self.ansi[5]),
+            "ansi_cyan" => Some(self.ansi[6]),
+            "ansi_white" => Some(self.ansi[7]),
+            "ansi_bright_black" => Some(self.ansi[8]),
+            "ansi_bright_red" => Some(self.ansi[9]),
+            "ansi_bright_green" => Some(self.ansi[10]),
+            "ansi_bright_yellow" => Some(self.ansi[11]),
+            "ansi_bright_blue" => Some(self.ansi[12]),
+            "ansi_bright_magenta" => Some(self.ansi[13]),
+            "ansi_bright_cyan" => Some(self.ansi[14]),
+            "ansi_bright_white" => Some(self.ansi[15]),
+            "crust" => Some(self.crust),
+            "mantle" => Some(self.mantle),
+            "surface_0" => Some(self.surface_0),
+            "surface_1" => Some(self.surface_1),
+            "surface_2" => Some(self.surface_2),
+            "surface_hover" => Some(self.surface_hover),
+            "surface_highlight" => Some(self.surface_highlight),
+            "chip_surface" => Some(self.chip_surface),
+            "shelved_surface" => Some(self.shelved_surface),
+            "surface_hover_strong" => Some(self.surface_hover_strong),
+            "danger_header" => Some(self.danger_header),
+            "danger_surface" => Some(self.danger_surface),
+            "border_inner" => Some(self.border_inner),
+            "border_subtle" => Some(self.border_subtle),
+            "border_default" => Some(self.border_default),
+            "border_strong" => Some(self.border_strong),
+            "border_heavy" => Some(self.border_heavy),
+            "text_secondary" => Some(self.text_secondary),
+            "text_tertiary" => Some(self.text_tertiary),
+            "text_muted" => Some(self.text_muted),
+            "text_faint" => Some(self.text_faint),
+            "text_overlay" => Some(self.text_overlay),
+            "accent" => Some(self.accent),
+            "accent_muted" => Some(self.accent_muted),
+            "accent_border_muted" => Some(self.accent_border_muted),
+            "idle_border" => Some(self.idle_border),
+            "green" => Some(self.green),
+            "red" => Some(self.red),
+            "yellow" => Some(self.yellow),
+            "teal" => Some(self.teal),
+            "mauve" => Some(self.mauve),
+            "peach" => Some(self.peach),
+            "pane_border" => Some(self.pane_border),
+            "tab_bar_background" => Some(self.tab_bar_background),
+            "tab_active_background" => Some(self.tab_active_background),
+            "tab_active_foreground" => Some(self.tab_active_foreground),
+            "tab_inactive_foreground" => Some(self.tab_inactive_foreground),
+            _ => None,
+        }
+    }
+
+    /// キー名で色値を設定する。存在しないキーは false を返す
+    pub fn set_color(&mut self, key: &str, c: Rgb) -> bool {
+        match key {
+            "background" => self.background = c,
+            "foreground" => self.foreground = c,
+            "cursor" => self.cursor = c,
+            "cursor_text" => self.cursor_text = c,
+            "selection_background" => self.selection_background = c,
+            "ansi_black" => self.ansi[0] = c,
+            "ansi_red" => self.ansi[1] = c,
+            "ansi_green" => self.ansi[2] = c,
+            "ansi_yellow" => self.ansi[3] = c,
+            "ansi_blue" => self.ansi[4] = c,
+            "ansi_magenta" => self.ansi[5] = c,
+            "ansi_cyan" => self.ansi[6] = c,
+            "ansi_white" => self.ansi[7] = c,
+            "ansi_bright_black" => self.ansi[8] = c,
+            "ansi_bright_red" => self.ansi[9] = c,
+            "ansi_bright_green" => self.ansi[10] = c,
+            "ansi_bright_yellow" => self.ansi[11] = c,
+            "ansi_bright_blue" => self.ansi[12] = c,
+            "ansi_bright_magenta" => self.ansi[13] = c,
+            "ansi_bright_cyan" => self.ansi[14] = c,
+            "ansi_bright_white" => self.ansi[15] = c,
+            "crust" => self.crust = c,
+            "mantle" => self.mantle = c,
+            "surface_0" => self.surface_0 = c,
+            "surface_1" => self.surface_1 = c,
+            "surface_2" => self.surface_2 = c,
+            "surface_hover" => self.surface_hover = c,
+            "surface_highlight" => self.surface_highlight = c,
+            "chip_surface" => self.chip_surface = c,
+            "shelved_surface" => self.shelved_surface = c,
+            "surface_hover_strong" => self.surface_hover_strong = c,
+            "danger_header" => self.danger_header = c,
+            "danger_surface" => self.danger_surface = c,
+            "border_inner" => self.border_inner = c,
+            "border_subtle" => self.border_subtle = c,
+            "border_default" => self.border_default = c,
+            "border_strong" => self.border_strong = c,
+            "border_heavy" => self.border_heavy = c,
+            "text_secondary" => self.text_secondary = c,
+            "text_tertiary" => self.text_tertiary = c,
+            "text_muted" => self.text_muted = c,
+            "text_faint" => self.text_faint = c,
+            "text_overlay" => self.text_overlay = c,
+            "accent" => self.accent = c,
+            "accent_muted" => self.accent_muted = c,
+            "accent_border_muted" => self.accent_border_muted = c,
+            "idle_border" => self.idle_border = c,
+            "green" => self.green = c,
+            "red" => self.red = c,
+            "yellow" => self.yellow = c,
+            "teal" => self.teal = c,
+            "mauve" => self.mauve = c,
+            "peach" => self.peach = c,
+            "pane_border" => self.pane_border = c,
+            "tab_bar_background" => self.tab_bar_background = c,
+            "tab_active_background" => self.tab_active_background = c,
+            "tab_active_foreground" => self.tab_active_foreground = c,
+            "tab_inactive_foreground" => self.tab_inactive_foreground = c,
+            _ => return false,
+        }
+        true
+    }
+
+    /// 上書きマップを適用する。未知キー・不正 hex は無視して警告文字列で返す
+    pub fn apply_overrides(
+        &mut self,
+        overrides: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for (key, hex) in overrides {
+            match parse_hex_color(hex) {
+                Some(c) => {
+                    if !self.set_color(key, c) {
+                        warnings.push(format!("未知の色キー: {key}"));
+                    }
+                }
+                None => {
+                    warnings.push(format!("不正な色値: {key}={hex}（#RRGGBB 形式が必要）"));
+                }
+            }
+        }
+        warnings
+    }
+
     /// モードに対応するテーマを返す（Issue #217 ライト/ダーク切替）
     pub fn for_mode(mode: ThemeMode) -> Self {
         match mode {
@@ -376,6 +626,58 @@ mod tests {
             Theme::for_mode(ThemeMode::Light).background,
             Rgb::from_hex(0xeff1f5)
         );
+    }
+
+    #[test]
+    fn parse_hex_colorの基本() {
+        assert_eq!(parse_hex_color("#ff0000"), Some(Rgb::new(255, 0, 0)));
+        assert_eq!(parse_hex_color("#00ff00"), Some(Rgb::new(0, 255, 0)));
+        assert_eq!(parse_hex_color("89b4fa"), Some(Rgb::new(0x89, 0xb4, 0xfa)));
+        assert_eq!(
+            parse_hex_color(" #1e1e2e "),
+            Some(Rgb::new(0x1e, 0x1e, 0x2e))
+        );
+        assert_eq!(parse_hex_color("#fff"), None); // 3桁は非対応
+        assert_eq!(parse_hex_color("#gggggg"), None);
+        assert_eq!(parse_hex_color(""), None);
+    }
+
+    #[test]
+    fn rgb_to_hexの往復() {
+        let c = Rgb::new(0x89, 0xb4, 0xfa);
+        assert_eq!(c.to_hex(), "#89b4fa");
+        assert_eq!(parse_hex_color(&c.to_hex()), Some(c));
+    }
+
+    #[test]
+    fn color_keysと_color_set_colorが完全一致する() {
+        let mut t = Theme::default_dark();
+        for key in Theme::COLOR_KEYS {
+            assert!(t.color(key).is_some(), "color({key}) が None");
+            assert!(
+                t.set_color(key, Rgb::new(1, 2, 3)),
+                "set_color({key}) が false"
+            );
+            assert_eq!(
+                t.color(key),
+                Some(Rgb::new(1, 2, 3)),
+                "{key} の set/get 不一致"
+            );
+        }
+        assert_eq!(Theme::COLOR_KEYS.len(), 58, "色キーは 58 個");
+    }
+
+    #[test]
+    fn apply_overridesは正常値を適用し不正値を警告する() {
+        let mut t = Theme::default_dark();
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("accent".into(), "#ff0000".into());
+        overrides.insert("unknown_key".into(), "#000000".into());
+        overrides.insert("background".into(), "not-hex".into());
+        let warnings = t.apply_overrides(&overrides);
+        assert_eq!(t.accent, Rgb::new(255, 0, 0));
+        assert_ne!(t.background, Rgb::from_hex(0x000000)); // 不正 hex は適用されない
+        assert_eq!(warnings.len(), 2);
     }
 
     #[test]

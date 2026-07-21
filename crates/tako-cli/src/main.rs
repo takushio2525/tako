@@ -105,9 +105,10 @@ enum Command {
     /// × ボタン close の確認ダイアログ ON/OFF・状態確認
     #[command(name = "confirm-close")]
     ConfirmClose(ToggleArgs),
-    /// UI テーマ（ライト/ダーク）の確認・切替（Issue #217）。
-    /// 引数なしで現在テーマを表示、dark / light で指定、toggle で反転
+    /// UI テーマの確認・切替・色設定・プリセット・フォント（Issue #217/#459）
     Theme(ThemeArgs),
+    /// 設定画面を開く（Issue #459）
+    Settings(SettingsArgs),
     /// UI 表示言語（日本語/英語）の確認・切替（Issue #435）。
     /// 引数なしで現在言語を表示、ja / en で指定、system で OS ロケール追従
     Lang(LangArgs),
@@ -1746,12 +1747,32 @@ struct PreviewChangelogArgs {
     expand: Option<String>,
 }
 
-/// UI テーマコマンドの引数（Issue #217）
+/// UI テーマコマンドの引数（Issue #217/#459）
 #[derive(Args)]
 struct ThemeArgs {
-    /// dark / light = 指定テーマへ、toggle = 反転（省略時は現在テーマを表示）
-    #[arg(value_parser = ["dark", "light", "toggle"])]
+    /// dark / light / toggle / colors / preset（省略時は現在テーマを表示）
     mode: Option<String>,
+    /// set-color の色キー名 / preset save の名前
+    name_or_key: Option<String>,
+    /// set-color の #RRGGBB / preset delete
+    value_or_action: Option<String>,
+    /// 色操作の対象
+    #[arg(long)]
+    target: Option<String>,
+    /// reset（reset-color 用）
+    #[arg(long)]
+    reset: bool,
+    /// フォントサイズ
+    #[arg(long)]
+    size: Option<f32>,
+}
+
+/// 設定画面コマンドの引数（Issue #459）
+#[derive(Args)]
+struct SettingsArgs {
+    /// 開くタブ指定
+    #[arg(long)]
+    tab: Option<String>,
 }
 
 /// UI 表示言語コマンドの引数（Issue #435）
@@ -3713,15 +3734,135 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::ConfirmClose(args) => Request::ConfirmClose {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
-        Command::Theme(args) => Request::Theme {
-            action: args.mode.as_deref().map(|m| {
-                if m == "toggle" {
-                    "toggle".to_string()
-                } else {
-                    "set".to_string()
+        Command::Theme(args) => {
+            let m = args.mode.as_deref();
+            match m {
+                Some("colors") => Request::Theme {
+                    action: Some("colors".into()),
+                    mode: None,
+                    target: args.target.clone(),
+                    key: None,
+                    value: None,
+                    name: None,
+                    font_family: None,
+                    font_size: None,
+                },
+                Some("color") => {
+                    let k = args.name_or_key.clone();
+                    if args.reset {
+                        Request::Theme {
+                            action: Some("reset-color".into()),
+                            mode: None,
+                            target: args.target.clone(),
+                            key: k,
+                            value: None,
+                            name: None,
+                            font_family: None,
+                            font_size: None,
+                        }
+                    } else {
+                        Request::Theme {
+                            action: Some("set-color".into()),
+                            mode: None,
+                            target: args.target.clone(),
+                            key: k,
+                            value: args.value_or_action.clone(),
+                            name: None,
+                            font_family: None,
+                            font_size: None,
+                        }
+                    }
                 }
-            }),
-            mode: args.mode.clone().filter(|m| m != "toggle"),
+                Some("reset-colors") => Request::Theme {
+                    action: Some("reset-colors".into()),
+                    mode: None,
+                    target: args.target.clone(),
+                    key: None,
+                    value: None,
+                    name: None,
+                    font_family: None,
+                    font_size: None,
+                },
+                Some("preset") => {
+                    let sub = args.name_or_key.as_deref();
+                    match sub {
+                        Some("save") => Request::Theme {
+                            action: Some("save-preset".into()),
+                            mode: None,
+                            target: None,
+                            key: None,
+                            value: None,
+                            name: args.value_or_action.clone(),
+                            font_family: None,
+                            font_size: None,
+                        },
+                        Some("delete") => Request::Theme {
+                            action: Some("delete-preset".into()),
+                            mode: None,
+                            target: None,
+                            key: None,
+                            value: None,
+                            name: args.value_or_action.clone(),
+                            font_family: None,
+                            font_size: None,
+                        },
+                        _ => Request::Theme {
+                            action: Some("status".into()),
+                            mode: None,
+                            target: None,
+                            key: None,
+                            value: None,
+                            name: None,
+                            font_family: None,
+                            font_size: None,
+                        },
+                    }
+                }
+                Some("font") => Request::Theme {
+                    action: Some("set-font".into()),
+                    mode: None,
+                    target: None,
+                    key: None,
+                    value: None,
+                    name: None,
+                    font_family: args.name_or_key.clone(),
+                    font_size: args.size,
+                },
+                Some("toggle") => Request::Theme {
+                    action: Some("toggle".into()),
+                    mode: None,
+                    target: None,
+                    key: None,
+                    value: None,
+                    name: None,
+                    font_family: None,
+                    font_size: None,
+                },
+                Some(mode_val) => Request::Theme {
+                    action: Some("set".into()),
+                    mode: Some(mode_val.to_string()),
+                    target: None,
+                    key: None,
+                    value: None,
+                    name: None,
+                    font_family: None,
+                    font_size: None,
+                },
+                None => Request::Theme {
+                    action: None,
+                    mode: None,
+                    target: None,
+                    key: None,
+                    value: None,
+                    name: None,
+                    font_family: None,
+                    font_size: None,
+                },
+            }
+        }
+        Command::Settings(args) => Request::Settings {
+            action: Some("open".into()),
+            tab: args.tab.clone(),
         },
         Command::Lang(args) => Request::Lang {
             action: args.value.as_deref().map(|_| "set".to_string()),
@@ -4986,6 +5127,7 @@ fn print_result(command: &Command, result: &Value) {
         | Command::Persist(_)
         | Command::ConfirmClose(_)
         | Command::Theme(_)
+        | Command::Settings(_)
         | Command::Lang(_)
         | Command::LimitService(_)
         | Command::Telemetry(_)

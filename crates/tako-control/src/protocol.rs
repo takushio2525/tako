@@ -840,9 +840,27 @@ pub enum Request {
     Theme {
         #[serde(default)]
         action: Option<String>,
-        /// テーマモード: "dark" / "light"（set 時に必須）
+        /// テーマモード: "dark" / "light" / プリセット名（set 時に必須）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
+        /// 色操作の対象: "dark" / "light" / プリセット名（省略 = 現在の theme）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+        /// set-color / reset-color の色名（58 キー）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+        /// set-color の "#RRGGBB"
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+        /// save-preset / delete-preset のプリセット名
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// set-font のフォントファミリー
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        font_family: Option<String>,
+        /// set-font のフォントサイズ
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        font_size: Option<f32>,
     },
     /// UI 表示言語の状態確認・切替（Issue #435。日英 i18n）。
     /// `action` = "status"（既定）/ "set"（`value` へ変更）。
@@ -1079,6 +1097,15 @@ pub enum Request {
         /// true で削除
         #[serde(default)]
         remove: bool,
+    },
+    /// 設定画面の操作（Issue #459）。
+    /// `action` = "open"（既定。GUI 設定画面を開く）/ "status"（開いているか + 現在タブ）
+    Settings {
+        #[serde(default)]
+        action: Option<String>,
+        /// タブ指定: general / appearance / runner / setup / sleep / remote / advanced
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab: Option<String>,
     },
 }
 

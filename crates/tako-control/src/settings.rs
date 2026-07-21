@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     /// タブ・ペイン名の AI 自動リネーム（FR-2.12.4。既定 ON）
     #[serde(default = "default_true")]
@@ -63,6 +63,27 @@ pub struct Settings {
     /// 値は変数展開が効くコマンドテンプレート。組み込み既定を上書き・追加する）
     #[serde(default)]
     pub runner_defaults: std::collections::BTreeMap<String, String>,
+    /// ビルトイン dark/light への部分色上書き（Issue #459。キーは色名、値は "#RRGGBB"）
+    #[serde(default)]
+    pub theme_colors:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    /// 名前付きカスタムテーマプリセット（Issue #459）
+    #[serde(default)]
+    pub theme_presets: std::collections::BTreeMap<String, ThemePreset>,
+    /// フォントファミリー（省略時はビルトイン既定 Menlo。Issue #459）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_family: Option<String>,
+    /// フォントサイズ（省略時はビルトイン既定 13.0。Issue #459）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<f32>,
+}
+
+/// テーマプリセット（Issue #459）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThemePreset {
+    pub base: String,
+    #[serde(default)]
+    pub colors: std::collections::BTreeMap<String, String>,
 }
 
 fn default_theme() -> String {
@@ -117,11 +138,44 @@ impl Default for Settings {
             limit_service: default_limit_service(),
             language: default_language(),
             runner_defaults: std::collections::BTreeMap::new(),
+            theme_colors: std::collections::BTreeMap::new(),
+            theme_presets: std::collections::BTreeMap::new(),
+            font_family: None,
+            font_size: None,
         }
     }
 }
 
 impl Settings {
+    /// theme 値からテーマ実体を解決する（Issue #459）。
+    /// 優先順: プリセット名 → ビルトイン名 + theme_colors 上書き → ダークフォールバック
+    pub fn resolve_theme(&self) -> (tako_core::theme::Theme, Vec<String>) {
+        use tako_core::theme::{Theme, ThemeMode};
+        let (mut theme, warnings) = if let Some(preset) = self.theme_presets.get(&self.theme) {
+            let mode = ThemeMode::parse(&preset.base).unwrap_or_default();
+            let mut t = Theme::for_mode(mode);
+            let w = t.apply_overrides(&preset.colors);
+            (t, w)
+        } else {
+            let mode = ThemeMode::parse(&self.theme).unwrap_or_default();
+            let mut t = Theme::for_mode(mode);
+            let w = if let Some(overrides) = self.theme_colors.get(mode.as_str()) {
+                t.apply_overrides(overrides)
+            } else {
+                Vec::new()
+            };
+            (t, w)
+        };
+        if let Some(ref family) = self.font_family {
+            theme.font_family = family.clone();
+        }
+        if let Some(size) = self.font_size {
+            let size = size.clamp(8.0, 32.0);
+            theme.font_size = size;
+            theme.line_height = size * (17.0 / 13.0);
+        }
+        (theme, warnings)
+    }
     /// ペインログ設定を tako-core の設定型へ解決する（Issue #112）
     pub fn pane_log_config(&self) -> tako_core::pane_log::PaneLogConfig {
         tako_core::pane_log::PaneLogConfig {
@@ -221,6 +275,10 @@ mod tests {
             limit_service: "codex".into(),
             language: "en".into(),
             runner_defaults: std::collections::BTreeMap::new(),
+            theme_colors: std::collections::BTreeMap::new(),
+            theme_presets: std::collections::BTreeMap::new(),
+            font_family: None,
+            font_size: None,
         };
         save_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), Some(settings));
@@ -280,5 +338,64 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(unknown.theme_mode(), tako_core::theme::ThemeMode::Dark);
+    }
+
+    #[test]
+    fn 新フィールドの後方互換() {
+        let parsed: Settings = serde_json::from_str("{}").unwrap();
+        assert!(parsed.theme_colors.is_empty());
+        assert!(parsed.theme_presets.is_empty());
+        assert!(parsed.font_family.is_none());
+        assert!(parsed.font_size.is_none());
+    }
+
+    #[test]
+    fn resolve_themeはビルトインを返す() {
+        let s = Settings::default();
+        let (theme, warnings) = s.resolve_theme();
+        assert!(warnings.is_empty());
+        assert_eq!(theme.mode, tako_core::theme::ThemeMode::Dark);
+        assert_eq!(theme.accent, tako_core::theme::Rgb::from_hex(0x89b4fa));
+    }
+
+    #[test]
+    fn resolve_themeは色上書きを適用する() {
+        let mut s = Settings::default();
+        let mut dark = std::collections::BTreeMap::new();
+        dark.insert("accent".into(), "#ff0000".into());
+        s.theme_colors.insert("dark".into(), dark);
+        let (theme, warnings) = s.resolve_theme();
+        assert!(warnings.is_empty());
+        assert_eq!(theme.accent, tako_core::theme::Rgb::new(255, 0, 0));
+    }
+
+    #[test]
+    fn resolve_themeはプリセットを解決する() {
+        let mut s = Settings::default();
+        let mut colors = std::collections::BTreeMap::new();
+        colors.insert("accent".into(), "#00ced1".into());
+        s.theme_presets.insert(
+            "ocean".into(),
+            ThemePreset {
+                base: "dark".into(),
+                colors,
+            },
+        );
+        s.theme = "ocean".into();
+        let (theme, warnings) = s.resolve_theme();
+        assert!(warnings.is_empty());
+        assert_eq!(theme.accent, tako_core::theme::Rgb::new(0x00, 0xce, 0xd1));
+        assert_eq!(theme.mode, tako_core::theme::ThemeMode::Dark);
+    }
+
+    #[test]
+    fn resolve_themeはフォント設定を適用する() {
+        let mut s = Settings::default();
+        s.font_family = Some("Monaco".into());
+        s.font_size = Some(16.0);
+        let (theme, _) = s.resolve_theme();
+        assert_eq!(theme.font_family, "Monaco");
+        assert!((theme.font_size - 16.0).abs() < f32::EPSILON);
+        assert!((theme.line_height - 16.0 * 17.0 / 13.0).abs() < 0.01);
     }
 }

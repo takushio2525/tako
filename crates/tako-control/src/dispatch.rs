@@ -2621,49 +2621,219 @@ fn dispatch_inner(
             }
         }
 
-        Request::Theme { action, mode } => {
-            use tako_core::theme::ThemeMode;
+        Request::Theme {
+            action,
+            mode,
+            target,
+            key,
+            value,
+            name,
+            font_family,
+            font_size,
+        } => {
+            use tako_core::theme::{parse_hex_color, Theme, ThemeMode};
             let action = action.as_deref().unwrap_or("status");
-            let status_json = |mode: ThemeMode| {
+            let should_save = !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none();
+            let make_status = |host: &dyn ControlHost| {
+                let settings = crate::settings::load();
+                let presets: Vec<String> = settings.theme_presets.keys().cloned().collect();
                 serde_json::json!({
-                    "theme": mode.as_str(),
+                    "theme": settings.theme,
+                    "mode": host.theme_mode().as_str(),
                     "available": ["dark", "light"],
+                    "presets": presets,
                 })
             };
             match action {
-                "status" => Ok(status_json(host.theme_mode())),
+                "status" => Ok(make_status(host)),
                 "set" | "toggle" => {
-                    let next = match action {
+                    let m = mode.as_deref();
+                    let next_theme: String = match action {
                         "set" => {
-                            let m = mode.as_deref().ok_or_else(|| {
+                            let m = m.ok_or_else(|| {
                                 DispatchError::InvalidParams(
-                                    "set には mode が必要（dark / light）".into(),
+                                    "set には mode が必要（dark / light / プリセット名）".into(),
                                 )
                             })?;
-                            ThemeMode::parse(m).ok_or_else(|| {
-                                DispatchError::InvalidParams(format!(
-                                    "不明な mode: {m:?}（dark / light のいずれか）"
-                                ))
-                            })?
+                            m.to_string()
                         }
-                        _ => match host.theme_mode() {
-                            ThemeMode::Dark => ThemeMode::Light,
-                            ThemeMode::Light => ThemeMode::Dark,
-                        },
+                        _ => {
+                            match host.theme_mode() {
+                                ThemeMode::Dark => "light".into(),
+                                ThemeMode::Light => "dark".into(),
+                            }
+                        }
                     };
-                    // 永続化（テスト・セルフテスト中はユーザー設定を汚さない。ipc.rs と同方針）
-                    if !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none() {
+                    if should_save {
                         let mut settings = crate::settings::load();
-                        settings.theme = next.as_str().into();
+                        settings.theme = next_theme.clone();
                         crate::settings::save(&settings).map_err(|e| {
                             DispatchError::Operation(format!("設定の保存に失敗: {e}"))
                         })?;
                     }
-                    host.set_theme_mode(next);
-                    Ok(status_json(next))
+                    let mode = ThemeMode::parse(&next_theme).unwrap_or_default();
+                    host.set_theme_mode(mode);
+                    host.reload_theme();
+                    Ok(make_status(host))
+                }
+                "colors" => {
+                    let settings = crate::settings::load();
+                    let (theme, _) = settings.resolve_theme();
+                    let empty = std::collections::BTreeMap::new();
+                    let overrides = match settings.theme_presets.get(&settings.theme) {
+                        Some(p) => &p.colors,
+                        None => settings.theme_colors.get(&settings.theme)
+                            .or_else(|| settings.theme_colors.get(host.theme_mode().as_str()))
+                            .unwrap_or(&empty),
+                    };
+                    let colors: serde_json::Value = Theme::COLOR_KEYS.iter().map(|&k| {
+                        let source = if overrides.contains_key(k) { "override" } else { "builtin" };
+                        (k.to_string(), serde_json::json!({
+                            "hex": theme.color(k).map(|c| c.to_hex()).unwrap_or_default(),
+                            "source": source,
+                        }))
+                    }).collect::<serde_json::Map<String, serde_json::Value>>().into();
+                    Ok(serde_json::json!({ "theme": settings.theme, "colors": colors }))
+                }
+                "set-color" => {
+                    let k = key.as_deref().ok_or_else(|| {
+                        DispatchError::InvalidParams("set-color には key が必要".into())
+                    })?;
+                    let v = value.as_deref().ok_or_else(|| {
+                        DispatchError::InvalidParams("set-color には value が必要（#RRGGBB）".into())
+                    })?;
+                    if !Theme::COLOR_KEYS.contains(&k) {
+                        return Err(DispatchError::InvalidParams(format!("未知の色キー: {k}")));
+                    }
+                    parse_hex_color(v).ok_or_else(|| {
+                        DispatchError::InvalidParams(format!("不正な色値: {v}（#RRGGBB 形式が必要）"))
+                    })?;
+                    if should_save {
+                        let mut settings = crate::settings::load();
+                        let tgt = target.as_deref().unwrap_or(&settings.theme).to_string();
+                        if settings.theme_presets.contains_key(&tgt) {
+                            settings.theme_presets.get_mut(&tgt).unwrap().colors.insert(k.to_string(), v.to_string());
+                        } else {
+                            let mode_key = ThemeMode::parse(&tgt).unwrap_or(host.theme_mode()).as_str().to_string();
+                            settings.theme_colors.entry(mode_key).or_default().insert(k.to_string(), v.to_string());
+                        }
+                        crate::settings::save(&settings).map_err(|e| {
+                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
+                        })?;
+                    }
+                    host.reload_theme();
+                    Ok(serde_json::json!({ "ok": true, "key": k, "value": v }))
+                }
+                "reset-color" => {
+                    let k = key.as_deref().ok_or_else(|| {
+                        DispatchError::InvalidParams("reset-color には key が必要".into())
+                    })?;
+                    if should_save {
+                        let mut settings = crate::settings::load();
+                        let tgt = target.as_deref().unwrap_or(&settings.theme).to_string();
+                        if let Some(p) = settings.theme_presets.get_mut(&tgt) {
+                            p.colors.remove(k);
+                        } else {
+                            let mode_key = ThemeMode::parse(&tgt).unwrap_or(host.theme_mode()).as_str().to_string();
+                            if let Some(m) = settings.theme_colors.get_mut(&mode_key) {
+                                m.remove(k);
+                            }
+                        }
+                        crate::settings::save(&settings).map_err(|e| {
+                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
+                        })?;
+                    }
+                    host.reload_theme();
+                    Ok(serde_json::json!({ "ok": true, "key": k }))
+                }
+                "reset-colors" => {
+                    if should_save {
+                        let mut settings = crate::settings::load();
+                        let tgt = target.as_deref().unwrap_or(&settings.theme).to_string();
+                        if let Some(p) = settings.theme_presets.get_mut(&tgt) {
+                            p.colors.clear();
+                        } else {
+                            let mode_key = ThemeMode::parse(&tgt).unwrap_or(host.theme_mode()).as_str().to_string();
+                            settings.theme_colors.remove(&mode_key);
+                        }
+                        crate::settings::save(&settings).map_err(|e| {
+                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
+                        })?;
+                    }
+                    host.reload_theme();
+                    Ok(serde_json::json!({ "ok": true }))
+                }
+                "save-preset" => {
+                    let n = name.as_deref().ok_or_else(|| {
+                        DispatchError::InvalidParams("save-preset には name が必要".into())
+                    })?;
+                    if n == "dark" || n == "light" {
+                        return Err(DispatchError::InvalidParams(format!("{n} は予約名")));
+                    }
+                    if !n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') || n.is_empty() || n.len() > 32 {
+                        return Err(DispatchError::InvalidParams("名前は [a-z0-9-]{1,32}".into()));
+                    }
+                    if should_save {
+                        let mut settings = crate::settings::load();
+                        let (resolved, _) = settings.resolve_theme();
+                        let base_mode = resolved.mode;
+                        let builtin = Theme::for_mode(base_mode);
+                        let mut diff = std::collections::BTreeMap::new();
+                        for &k in Theme::COLOR_KEYS {
+                            if let (Some(cur), Some(blt)) = (resolved.color(k), builtin.color(k)) {
+                                if cur != blt {
+                                    diff.insert(k.to_string(), cur.to_hex());
+                                }
+                            }
+                        }
+                        settings.theme_presets.insert(n.to_string(), crate::settings::ThemePreset {
+                            base: base_mode.as_str().into(),
+                            colors: diff,
+                        });
+                        settings.theme = n.to_string();
+                        crate::settings::save(&settings).map_err(|e| {
+                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
+                        })?;
+                    }
+                    host.reload_theme();
+                    Ok(serde_json::json!({ "ok": true, "name": n }))
+                }
+                "delete-preset" => {
+                    let n = name.as_deref().ok_or_else(|| {
+                        DispatchError::InvalidParams("delete-preset には name が必要".into())
+                    })?;
+                    if should_save {
+                        let mut settings = crate::settings::load();
+                        if let Some(p) = settings.theme_presets.remove(n) {
+                            if settings.theme == n {
+                                settings.theme = p.base;
+                            }
+                        }
+                        crate::settings::save(&settings).map_err(|e| {
+                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
+                        })?;
+                    }
+                    host.reload_theme();
+                    Ok(serde_json::json!({ "ok": true }))
+                }
+                "set-font" => {
+                    if should_save {
+                        let mut settings = crate::settings::load();
+                        if let Some(ref f) = font_family {
+                            settings.font_family = Some(f.clone());
+                        }
+                        if let Some(s) = font_size {
+                            settings.font_size = Some(s.clamp(8.0, 32.0));
+                        }
+                        crate::settings::save(&settings).map_err(|e| {
+                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
+                        })?;
+                    }
+                    host.reload_theme();
+                    Ok(serde_json::json!({ "ok": true }))
                 }
                 other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / set / toggle のいずれか）"
+                    "不明な action: {other:?}（status / set / toggle / colors / set-color / reset-color / reset-colors / save-preset / delete-preset / set-font のいずれか）"
                 ))),
             }
         }
@@ -3492,6 +3662,23 @@ fn dispatch_inner(
                     })
                     .collect();
                 Ok(json!({ "defaults": entries }))
+            }
+        }
+
+        Request::Settings { action, tab } => {
+            let action = action.as_deref().unwrap_or("open");
+            match action {
+                "open" => {
+                    host.open_settings_window(tab.as_deref());
+                    Ok(json!({ "ok": true }))
+                }
+                "status" => {
+                    let is_open = host.settings_window_open();
+                    Ok(json!({ "open": is_open }))
+                }
+                other => Err(DispatchError::InvalidParams(format!(
+                    "不明な action: {other:?}（open / status のいずれか）"
+                ))),
             }
         }
     }
@@ -9536,6 +9723,12 @@ mod tests {
             Request::Theme {
                 action: None,
                 mode: None,
+                target: None,
+                key: None,
+                value: None,
+                name: None,
+                font_family: None,
+                font_size: None,
             },
             PaneOrigin::Cli,
         )
@@ -9547,6 +9740,12 @@ mod tests {
             Request::Theme {
                 action: Some("set".into()),
                 mode: Some("light".into()),
+                target: None,
+                key: None,
+                value: None,
+                name: None,
+                font_family: None,
+                font_size: None,
             },
             PaneOrigin::Cli,
         )
@@ -9559,6 +9758,12 @@ mod tests {
             Request::Theme {
                 action: Some("toggle".into()),
                 mode: None,
+                target: None,
+                key: None,
+                value: None,
+                name: None,
+                font_family: None,
+                font_size: None,
             },
             PaneOrigin::Cli,
         )
@@ -9571,6 +9776,12 @@ mod tests {
             Request::Theme {
                 action: Some("set".into()),
                 mode: Some("sepia".into()),
+                target: None,
+                key: None,
+                value: None,
+                name: None,
+                font_family: None,
+                font_size: None,
             },
             PaneOrigin::Cli,
         )
@@ -9580,6 +9791,12 @@ mod tests {
             Request::Theme {
                 action: Some("set".into()),
                 mode: None,
+                target: None,
+                key: None,
+                value: None,
+                name: None,
+                font_family: None,
+                font_size: None,
             },
             PaneOrigin::Cli,
         )
