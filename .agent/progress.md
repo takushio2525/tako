@@ -1068,3 +1068,12 @@
 - 検証: 候補 9 案の実寸レンダリング比較 + 実クリック e2e（開閉 / backdrop dismiss / コピー
   pbpaste 実測）+ unit 14 本 + 品質ゲート全緑。セルフテスト FAILED 1 = #332 のみ
   （素の main で同一再現 = 差分ゼロ）。証拠 ~/Desktop/tako-440-evidence/
+
+## 2026-07-22（#439/#425: リモート master のチャット非検出 + auto mode 承認カード誤表示を根治）
+- #439: agent_type 判定を role 依存 → live claude 解決（`claude agents --json` の pid 祖先辿り）へ。
+  role 空 master でも対話型 claude 稼働なら claude 化 + session_id 付与（agents::live_claude_sessions_by_backend 新設）
+- #425: 承認判定を transcript 推定 → 画面 permission ダイアログ実在へ再設計（transcript approval 全廃）。
+  v2 panes に permission_dialog 付与 + POST /api/panes/:id/respond 新設。command 抽出を罫線ボックス内に限定
+- 関連コミット: `559ccca`（PR #444 squash merge）。隔離実測 before/after 完了、実機確認まで Issue オープン維持
+- 副産物: 隔離検証の TAKO_REMOTE_STATE_DIR 隔離漏れで本番 remote state ファイル破壊 → #445 起票
+  （本番 daemon は生存・実サービス無傷、復旧は実機アイドル時に `tako remote start` で旧 daemon 自動回収→再生成）
