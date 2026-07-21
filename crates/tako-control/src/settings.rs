@@ -390,9 +390,11 @@ mod tests {
 
     #[test]
     fn resolve_themeはフォント設定を適用する() {
-        let mut s = Settings::default();
-        s.font_family = Some("Monaco".into());
-        s.font_size = Some(16.0);
+        let s = Settings {
+            font_family: Some("Monaco".into()),
+            font_size: Some(16.0),
+            ..Settings::default()
+        };
         let (theme, _) = s.resolve_theme();
         assert_eq!(theme.font_family, "Monaco");
         assert!((theme.font_size - 16.0).abs() < f32::EPSILON);

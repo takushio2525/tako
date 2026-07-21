@@ -1105,3 +1105,10 @@
 - 調査で確定: 設定変更 dispatch 15 種の一覧、settings.json 17 フィールド、MCP 106 ツール
   （snapshot 実測）、confirm_close のみ非永続（config.yaml 初期化・要修正）
 - 次: master レビュー → M1 から実装着手（worker 割当は master 判断）
+
+## 2026-07-22（#459: 設定画面 M4〜M7 — 全 7 タブ実装完了）
+- M4 Code Runner + M5 セットアップ + M6 スリープ防止/リモート/高度の全タブを実装。
+  1:1 監査で全項目が既存 CLI/MCP で操作可能と確認（新設 dispatch 不要）。
+  PR #461 のテーマテスト回帰・MCP 数・clippy も修正
+- 関連コミット: `04dfcee` `[機能追加] 設定画面 M4〜M6`
+- 次: push → PR → squash merge → 実機確認
