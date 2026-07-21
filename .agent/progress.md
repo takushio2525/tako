@@ -1077,3 +1077,10 @@
 - 関連コミット: `559ccca`（PR #444 squash merge）。隔離実測 before/after 完了、実機確認まで Issue オープン維持
 - 副産物: 隔離検証の TAKO_REMOTE_STATE_DIR 隔離漏れで本番 remote state ファイル破壊 → #445 起票
   （本番 daemon は生存・実サービス無傷、復旧は実機アイドル時に `tako remote start` で旧 daemon 自動回収→再生成）
+
+## 2026-07-22（#287 P1: cross-origin での terminal 読取・操作を遮断）
+
+- REST/WS の Origin を daemon base_url と完全一致検証、不一致は認証より手前で 403 拒否。
+  CORS `*` を廃止し許可 origin のみエコー + Vary: Origin。WS で subprotocol 必須化。テスト 5 本追加
+- 関連コミット: `f12a9af`（PR #450 squash merge）。品質ゲート全緑 + 隔離デーモンで evil/正規 Origin の e2e 実測
+- 残: P1-2 identity spoof（Unix socket 化）は別タスク
