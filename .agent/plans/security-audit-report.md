@@ -106,15 +106,15 @@ AVPlayer/AVFoundation は main-thread-only API が多い。現在は GPUI のメ
 
 ### I-2. 個人情報 — 問題なし ✅
 
-- メールアドレス: ソースコード内になし（git コミットの `shiozawataku2525@gmail.com` のみ）
-- ハードコードパス: `/Users/shiozawatakumi` はソース内ゼロ。テストは `/Users/foo` 等のダミー
+- メールアドレス: ソースコード内になし（git コミットの `<email>` のみ）
+- ハードコードパス: `/Users/<user>` はソース内ゼロ。テストは `/Users/foo` 等のダミー
 - 実名: ソース・ドキュメント内になし
 - GitHub ユーザー名 `takushio2525`: Cargo.toml / README / build-app.sh に存在するが、
   公開リポのオーナーとして意図的
 
 ### I-3. git コミットメール
 
-git 履歴のすべてのコミットで `shiozawataku2525@gmail.com` が author。
+git 履歴のすべてのコミットで `<email>`（git author メール）が author。
 公開後にこのメールアドレスが見える。GitHub の「noreply」アドレスに切り替える場合は
 公開前に `git filter-branch` / `git filter-repo` での書き換えが必要
 （186 コミットなので現実的な作業量）。
