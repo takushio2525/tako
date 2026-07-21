@@ -5,6 +5,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- [スタイル] リロードアイコンを円弧 + 三角矢じりのブラウザ同型デザインへ刷新 (#438)
+  旧デザインは円弧 2 本 + 45° 回転の十字で、小サイズ（12px）では ✕ に誤認されていた。
+  単一の 270° 円弧 + 塗り三角の矢じり（Chrome / Material のリロードと同型）へ差し替え。
+  ストローク 1.6・矢じり幅はストロークの 3 倍で 12px でも潰れない比率に調整。
+  ステータスバーの利用制限リロードボタンと Web ビューのリロードボタン（同一アセット）が対象。
+  Redesign the reload icon as a standard arc + solid-triangle arrowhead (#438).
+  The old glyph (two arcs + a 45°-rotated cross) read as an ✕ at small sizes.
+  Replaced with a single 270° arc and a filled triangular arrowhead matching
+  browser reload buttons, tuned to stay legible at 12px. Applies to the usage-limit
+  refresh button in the status bar and the webview reload button (same asset).
+
 - [修正] リモート: 数値 PaneId 宛の入力送信が無音失敗する問題を修正 (#428)
   input API が PaneId を "session:0.0" 形式へ変換して dispatch の tmux_session
   （セッション名を期待）へ渡し、deliver 系の `={session}:` 組み立てが
