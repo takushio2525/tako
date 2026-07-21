@@ -16,6 +16,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (which expects a bare session name), producing an invalid `=session:0.0:`
   target. Now passes the PaneId itself so the GUI delivery-verification flow applies.
 
+- [修正] リモート: ペインを開き直すと term ビューが無限ロードになる問題を修正 (#426, #428)
+  WS の init メッセージが term ビュー DOM の未マウント中（初期 chat 表示中）に
+  届くと捨てられ、update には loading 解除が無いため永久スピナーになっていた。
+  2 回目以降は broadcaster の init キャッシュが接続直後（実測 0ms）に届くため
+  必ず発症。init を保留して term ビューのマウント時に適用するよう修正。
+  Fix remote: term view stuck loading when reopening a pane (#426, #428).
+  WS init arriving before the term view DOM mounted was dropped; updates never
+  clear the loading state. Reopened panes always hit this because the cached
+  init arrives instantly. Init is now buffered and applied on term-view mount.
+
+- [UI] リモート: モバイルの改行キーで送信されてしまう問題を修正 (#429)
+  chat / term 入力欄の Enter を改行入力に変更（モバイルは Shift が無く改行を
+  入力できなかった）。送信は送信ボタンまたは cmd/ctrl+Enter に分離。
+  Fix remote: mobile Enter key sent the message instead of inserting a newline (#429).
+  Enter now inserts a newline; sending is via the send button or cmd/ctrl+Enter.
+
 - [修正] リモート: remote start が PATH 上の別世代バイナリで serve を立てる問題を修正 (#432)
   serve バイナリ解決を /Applications の安定バイナリ優先へ変更（GUI .app と serve の
   世代を揃える。検証モードでは従来どおり自バイナリ）。`tako remote status` と起動

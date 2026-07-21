@@ -473,7 +473,9 @@ export function ChatView({ paneId, info, agentType, onStop, me }) {
 
   function onKeyDown(e) {
     if (e.isComposing) return;
-    if (e.key === 'Enter' && !e.shiftKey) {
+    // 送信は cmd/ctrl+Enter か送信ボタンのみ。素の Enter は改行として入力する
+    // （#429: モバイルキーボードの改行キーで送信されてしまい改行が打てなかった）
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       sendFromComposer();
     }
