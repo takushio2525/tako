@@ -58,6 +58,7 @@ pub struct PreviewHeaderVisibility {
     pub file_name: bool,
     pub file_icon: bool,
     pub path_label: bool,
+    pub run_button: bool,
     pub mode_toggle: bool,
     pub edit_button: bool,
     pub save_button: bool,
@@ -71,6 +72,7 @@ impl PreviewHeaderVisibility {
             file_name: width >= 80.0,
             file_icon: width >= 100.0,
             path_label: width >= 200.0,
+            run_button: width >= 250.0,
             page_info: width >= 250.0,
             edit_button: width >= 300.0,
             mode_toggle: width >= 350.0,
@@ -310,15 +312,26 @@ mod tests {
         assert!(narrow.file_name);
         assert!(!narrow.file_icon);
         assert!(!narrow.path_label);
+        assert!(!narrow.run_button);
 
         let medium = PreviewHeaderVisibility::from_width(250.0);
         assert!(medium.file_name);
         assert!(medium.file_icon);
         assert!(medium.path_label);
+        assert!(medium.run_button);
         assert!(!medium.edit_button);
 
         let wide = PreviewHeaderVisibility::from_width(400.0);
         assert!(wide.edit_button);
         assert!(wide.mode_toggle);
+        assert!(wide.run_button);
+    }
+
+    #[test]
+    fn preview_header_run_button_threshold() {
+        let below = PreviewHeaderVisibility::from_width(249.0);
+        assert!(!below.run_button);
+        let at = PreviewHeaderVisibility::from_width(250.0);
+        assert!(at.run_button);
     }
 }

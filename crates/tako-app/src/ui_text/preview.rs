@@ -27,6 +27,21 @@ pub fn outline_button() -> &'static str {
     tr!("目次", "Outline")
 }
 
+// --- Code Runner（#453 M4。キー: preview.run_*） ---
+
+pub fn run_button() -> &'static str {
+    tr!("実行", "Run")
+}
+pub fn run_no_command() -> &'static str {
+    tr!(
+        "実行コマンド未定義。ファイル先頭に tako:run: <コマンド> を書くか tako run-default で拡張子既定を設定",
+        "No run command. Add tako:run: <command> at file top or set extension default with tako run-default"
+    )
+}
+pub fn run_profile_default() -> &'static str {
+    tr!("実行", "Run")
+}
+
 // --- 編集ステータス（キー: preview.status_*） ---
 
 pub fn saved_suffix() -> &'static str {
@@ -156,6 +171,9 @@ mod tests {
                 edit().to_string(),
                 save_cmd_s().to_string(),
                 outline_button().to_string(),
+                run_button().to_string(),
+                run_no_command().to_string(),
+                run_profile_default().to_string(),
                 saved_suffix().to_string(),
                 conflict_suffix().to_string(),
                 error_suffix().to_string(),

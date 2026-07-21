@@ -867,6 +867,12 @@ struct TakoApp {
     preview_image_lru: tako_core::ByteLru<PreviewImageCacheEntryKey>,
     /// LRU / close で外した GPUI asset。次の render 冒頭で atlas と一緒に解放する。
     pending_preview_image_evictions: Vec<std::sync::Arc<gpui::Image>>,
+    /// Code Runner のプロファイルドロップダウンが開いているペインとアンカー位置
+    preview_run_menu: Option<(PaneId, gpui::Point<Pixels>)>,
+    /// Code Runner: ペインごとのキャッシュ済みプロファイル一覧（プレビュー読込時に解決）
+    preview_run_profiles: HashMap<PaneId, Vec<tako_core::RunPlan>>,
+    /// Code Runner: ペインごとの選択中プロファイル名
+    preview_run_selected: HashMap<PaneId, String>,
     /// チェンジログビューのデータ（Issue #338。pane ごと）
     preview_changelogs: HashMap<PaneId, preview::ChangelogData>,
     /// PDF・画像プレビューのズーム / パン / ページ状態（#234。core モデル）。
@@ -1891,6 +1897,9 @@ impl TakoApp {
             preview_image_cache: HashMap::new(),
             preview_image_lru: tako_core::ByteLru::new(initial_preview_cache_budget()),
             pending_preview_image_evictions: Vec::new(),
+            preview_run_menu: None,
+            preview_run_profiles: HashMap::new(),
+            preview_run_selected: HashMap::new(),
             preview_changelogs: HashMap::new(),
             preview_views: HashMap::new(),
             preview_scroll_handles: HashMap::new(),
@@ -4534,6 +4543,11 @@ impl TakoApp {
                 self.video_players.remove(&pane_id);
                 self.remove_video_frame_cache(pane_id);
                 self.remove_preview_image_cache(pane_id);
+                self.preview_run_profiles.remove(&pane_id);
+                self.preview_run_selected.remove(&pane_id);
+                if self.preview_run_menu.as_ref().map(|m| m.0) == Some(pane_id) {
+                    self.preview_run_menu = None;
+                }
                 self.preview_changelogs.remove(&pane_id);
                 self.preview_views.remove(&pane_id);
                 self.preview_scroll_handles.remove(&pane_id);
@@ -4594,6 +4608,8 @@ impl TakoApp {
                     self.video_players.remove(&id);
                     self.remove_video_frame_cache(id);
                     self.remove_preview_image_cache(id);
+                    self.preview_run_profiles.remove(&id);
+                    self.preview_run_selected.remove(&id);
                     self.preview_views.remove(&id);
                     self.preview_scroll_handles.remove(&id);
                     self.pending_pdf_rasters.remove(&id);
@@ -12358,6 +12374,25 @@ impl PreviewHost for TakoApp {
             self.preview_navigation_panel = None;
         }
         self.previews.insert(pane, state);
+        // Code Runner: プロファイル検出（#453 M4）
+        {
+            use tako_core::runner;
+            if let Some(head) = runner::read_file_head_for_ui(path) {
+                let settings = tako_control::settings::load();
+                let ext_defaults = runner::merged_defaults(&settings.runner_defaults);
+                match runner::resolve(path, &head, &ext_defaults, None, None) {
+                    Ok(resolution) => {
+                        self.preview_run_profiles
+                            .insert(pane, resolution.all_profiles);
+                    }
+                    Err(_) => {
+                        self.preview_run_profiles.insert(pane, Vec::new());
+                    }
+                }
+            } else {
+                self.preview_run_profiles.remove(&pane);
+            }
+        }
         self.sync_preview_watches();
         Ok(())
     }
@@ -13981,6 +14016,7 @@ impl Render for TakoApp {
             .children(hover_preview_overlay)
             .children(pinned_overlays)
             .children(self.render_limit_service_overlay(cx))
+            .children(self.render_run_menu_overlay(cx))
             .children(self.render_sleep_guard_overlay(cx))
             .children(self.render_update_dropdown_overlay(cx))
             .children(self.render_close_confirm_dialog(cx))

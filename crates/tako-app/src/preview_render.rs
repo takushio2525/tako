@@ -1052,6 +1052,25 @@ impl TakoApp {
             .filter(|s| s.search_visible && !s.search_hits.is_empty())
             .map(|s| (s.search_hits.as_slice(), s.search_index));
 
+        // Code Runner 状態（#453 M4）
+        let run_profiles = self
+            .preview_run_profiles
+            .get(&pane_id)
+            .cloned()
+            .unwrap_or_default();
+        let run_capable = !run_profiles.is_empty();
+        let run_has_multiple = run_profiles.len() >= 2;
+        let run_selected = self
+            .preview_run_selected
+            .get(&pane_id)
+            .cloned()
+            .unwrap_or_else(|| "default".to_string());
+        let run_file_path = state.path.clone();
+        let is_code_or_md = matches!(
+            mode,
+            preview::PreviewMode::Code | preview::PreviewMode::Markdown
+        );
+
         // チェンジログビューの判定（Issue #338）
         let changelog_active = self.preview_changelogs.contains_key(&pane_id);
         let changelog_data = self.preview_changelogs.get(&pane_id).cloned();
@@ -2177,6 +2196,169 @@ impl TakoApp {
                                         ),
                                 )
                             })
+                            // Code Runner 再生ボタン（#453 M4）
+                            .when(phv.run_button && is_code_or_md, |d| {
+                                let run_path = run_file_path.clone();
+                                let run_sel = run_selected.clone();
+                                let run_profile_label = if run_sel == "default" {
+                                    crate::ui_text::preview::run_profile_default().to_string()
+                                } else {
+                                    run_sel.clone()
+                                };
+                                let _tooltip: String = if run_capable {
+                                    run_profiles
+                                        .iter()
+                                        .find(|p| p.profile == run_sel)
+                                        .or_else(|| run_profiles.first())
+                                        .map(|p| {
+                                            let cmd = &p.command;
+                                            if cmd.len() > 60 {
+                                                format!("{}…", &cmd[..60])
+                                            } else {
+                                                cmd.clone()
+                                            }
+                                        })
+                                        .unwrap_or_default()
+                                } else {
+                                    crate::ui_text::preview::run_no_command().to_string()
+                                };
+                                let icon_color = if run_capable {
+                                    theme.green
+                                } else {
+                                    theme.text_faint
+                                };
+                                d.child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(0.0))
+                                        // 再生ボタン本体
+                                        .child(
+                                            div()
+                                                .id(("preview-run", pane_id.as_u64()))
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_1()
+                                                .px_1()
+                                                .rounded_sm()
+                                                .cursor(if run_capable {
+                                                    CursorStyle::PointingHand
+                                                } else {
+                                                    CursorStyle::default()
+                                                })
+                                                .when(run_capable, |d| {
+                                                    d.hover(|d| {
+                                                        d.bg(rgba_alpha(
+                                                            theme.tab_active_background,
+                                                            0.8,
+                                                        ))
+                                                    })
+                                                })
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                                        cx.stop_propagation()
+                                                    }),
+                                                )
+                                                .when(run_capable, |d| {
+                                                    let path_for_click = run_path.clone();
+                                                    let sel_for_click = run_sel.clone();
+                                                    d.on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            cx.stop_propagation();
+                                                            this.run_preview_file(
+                                                                pane_id,
+                                                                &path_for_click,
+                                                                &sel_for_click,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    ))
+                                                })
+                                                .child(
+                                                    svg()
+                                                        .path(
+                                                            crate::file_icons::ui_icon::PLAY,
+                                                        )
+                                                        .w(px(12.0))
+                                                        .h(px(12.0))
+                                                        .text_color(hsla(icon_color)),
+                                                )
+                                                .when(!run_has_multiple, |d| {
+                                                    d.child(SharedString::from(
+                                                        crate::ui_text::preview::run_button(),
+                                                    ))
+                                                    .text_color(hsla(icon_color))
+                                                })
+                                                .when(run_has_multiple, |d| {
+                                                    d.child(SharedString::from(
+                                                        run_profile_label.clone(),
+                                                    ))
+                                                    .text_color(hsla(icon_color))
+                                                }),
+                                        )
+                                        // ドロップダウンシェブロン（2+ プロファイル時のみ）
+                                        .when(run_has_multiple, |d| {
+                                            d.child(
+                                                div()
+                                                    .id((
+                                                        "preview-run-dd",
+                                                        pane_id.as_u64(),
+                                                    ))
+                                                    .flex()
+                                                    .items_center()
+                                                    .px(px(2.0))
+                                                    .rounded_sm()
+                                                    .cursor_pointer()
+                                                    .hover(|d| {
+                                                        d.bg(rgba_alpha(
+                                                            theme.tab_active_background,
+                                                            0.8,
+                                                        ))
+                                                    })
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(
+                                                            move |this,
+                                                                  event: &MouseDownEvent,
+                                                                  _,
+                                                                  cx| {
+                                                                cx.stop_propagation();
+                                                                if this
+                                                                    .preview_run_menu
+                                                                    .as_ref()
+                                                                    .map(|m| m.0)
+                                                                    == Some(pane_id)
+                                                                {
+                                                                    this.preview_run_menu = None;
+                                                                } else {
+                                                                    this.preview_run_menu =
+                                                                        Some((
+                                                                            pane_id,
+                                                                            event.position,
+                                                                        ));
+                                                                }
+                                                                cx.notify();
+                                                            },
+                                                        ),
+                                                    )
+                                                    .child(
+                                                        svg()
+                                                            .path(
+                                                                crate::file_icons::ui_icon::CHEVRON_DOWN,
+                                                            )
+                                                            .w(px(10.0))
+                                                            .h(px(10.0))
+                                                            .text_color(hsla(
+                                                                theme.text_tertiary,
+                                                            )),
+                                                    ),
+                                            )
+                                        }),
+                                )
+                            })
                             .when(phv.mode_toggle && md_capable && edit_snap.is_none(), |d| {
                                 let (icon, label) = match mode {
                                     preview::PreviewMode::Markdown => (None, crate::ui_text::preview::view_as_code()),
@@ -3288,6 +3470,187 @@ impl TakoApp {
             }
         }
         cx.notify();
+    }
+
+    /// Code Runner: 再生ボタンクリック → dispatch Run（#453 M4）
+    pub(crate) fn run_preview_file(
+        &mut self,
+        pane_id: PaneId,
+        path: &std::path::Path,
+        profile: &str,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        // dirty バッファがあれば先に保存
+        if self
+            .preview_edits
+            .get(&pane_id)
+            .is_some_and(preview::EditState::dirty)
+        {
+            if let Err(msg) = self.save_preview_local(pane_id) {
+                if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
+                    edit.message = Some(msg);
+                }
+                cx.notify();
+                return;
+            }
+        }
+
+        let profile_param = if profile == "default" {
+            None
+        } else {
+            Some(profile.to_string())
+        };
+
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::Run {
+                path: path.to_string_lossy().to_string(),
+                pane: Some(pane_id.as_u64()),
+                tab: None,
+                profile: profile_param,
+                command: None,
+                direction: Some(tako_control::protocol::Direction::Down),
+                ratio: Some(0.3),
+                auto_close: None,
+                focus: Some(true),
+            },
+            PaneOrigin::User,
+        );
+        match result {
+            Ok(_) => {
+                for (pane, options) in std::mem::take(&mut self.pending_attach) {
+                    if let Err(e) = self.spawn_session(pane, options, cx) {
+                        eprintln!("warning: Run ペインを開けない: {e}");
+                        self.remove_pane(pane, cx);
+                    }
+                }
+                for (pane, data) in std::mem::take(&mut self.pending_writes) {
+                    if let Some(session) = self.terminals.get(&pane) {
+                        session.write(data);
+                    }
+                }
+            }
+            Err(e) => {
+                if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
+                    edit.message = Some(format!("{e}"));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Code Runner: プロファイルドロップダウンオーバーレイの描画（#453 M4）
+    pub(crate) fn render_run_menu_overlay(
+        &self,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let (pane_id, anchor) = self.preview_run_menu?;
+        let profiles = self.preview_run_profiles.get(&pane_id)?.clone();
+        if profiles.is_empty() {
+            return None;
+        }
+        let theme = self.theme.clone();
+        let selected = self
+            .preview_run_selected
+            .get(&pane_id)
+            .cloned()
+            .unwrap_or_else(|| "default".to_string());
+
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        for plan in &profiles {
+            let profile_name = plan.profile.clone();
+            let display_name = if profile_name == "default" {
+                crate::ui_text::preview::run_profile_default().to_string()
+            } else {
+                profile_name.clone()
+            };
+            let is_selected = profile_name == selected;
+            let cmd_preview: String = if plan.command.len() > 40 {
+                format!("{}…", &plan.command[..40])
+            } else {
+                plan.command.clone()
+            };
+            let path = self
+                .previews
+                .get(&pane_id)
+                .map(|s| s.path.clone())
+                .unwrap_or_default();
+
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("run-profile-{}", profile_name)))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .when(is_selected, |d| d.bg(rgba(theme.surface_hover_strong)))
+                    .hover(|d| d.bg(rgba(theme.surface_hover_strong)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.preview_run_selected
+                            .insert(pane_id, profile_name.clone());
+                        this.preview_run_menu = None;
+                        this.run_preview_file(pane_id, &path, &profile_name, cx);
+                    }))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(11.5))
+                            .text_color(if is_selected {
+                                hsla(theme.foreground)
+                            } else {
+                                hsla(theme.text_secondary)
+                            })
+                            .child(SharedString::from(display_name)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(hsla(theme.text_faint))
+                            .child(SharedString::from(cmd_preview)),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        let menu_w: f32 = 280.0;
+        let menu_left = (f32::from(anchor.x) - menu_w / 2.0).max(0.0);
+
+        Some(
+            div()
+                .id("run-menu-dismiss")
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.preview_run_menu = None;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(menu_left))
+                        .top(px(f32::from(anchor.y) + 4.0))
+                        .w(px(menu_w))
+                        .bg(rgba(theme.surface_1))
+                        .border_1()
+                        .border_color(hsla(theme.border_default))
+                        .rounded(px(8.0))
+                        .shadow_lg()
+                        .p(px(6.0))
+                        .children(rows),
+                )
+                .into_any_element(),
+        )
     }
 
     /// チェンジログビューの本文描画（Issue #338）
