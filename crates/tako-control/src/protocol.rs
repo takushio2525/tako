@@ -845,6 +845,16 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
     },
+    /// UI 表示言語の状態確認・切替（Issue #435。日英 i18n）。
+    /// `action` = "status"（既定）/ "set"（`value` へ変更）。
+    /// 変更は settings.json に永続化され、GUI に即時反映される
+    Lang {
+        #[serde(default)]
+        action: Option<String>,
+        /// 言語設定: "system"（OS ロケール追従）/ "ja" / "en"（set 時に必須）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+    },
     /// エラーレポートの自動送信（テレメトリ）の状態確認・切替（Issue #333）。
     /// `action` = "status"（既定）/ "on" / "off"。設定は settings.json に永続化される
     Telemetry {

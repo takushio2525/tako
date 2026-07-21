@@ -197,6 +197,18 @@ pub trait UiStateHost {
     }
     /// UI テーマモードの切替（再描画は実装側の責務。永続化は dispatch 側で行う）
     fn set_theme_mode(&mut self, _mode: tako_core::theme::ThemeMode) {}
+    /// UI 表示言語の設定値（Issue #435。system / ja / en）
+    fn ui_lang_setting(&self) -> tako_core::i18n::LangSetting {
+        tako_core::i18n::LangSetting::System
+    }
+    /// UI 表示言語の切替（表示言語のグローバル反映と再描画は実装側の責務。
+    /// resolved は dispatch 側で解決済みの表示言語。永続化は dispatch 側で行う）
+    fn set_ui_lang(
+        &mut self,
+        _setting: tako_core::i18n::LangSetting,
+        _resolved: tako_core::i18n::Lang,
+    ) {
+    }
     /// ステータスバーの利用制限表示で選択中のサービス（Issue #321）
     fn limit_service(&self) -> tako_core::LimitService {
         tako_core::LimitService::Claude

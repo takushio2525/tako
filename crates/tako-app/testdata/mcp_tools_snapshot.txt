@@ -15,6 +15,7 @@ tako_focus_pane
 tako_foreground_pane
 tako_git_diff
 tako_git_log
+tako_lang
 tako_limit_service
 tako_list_panes
 tako_logs

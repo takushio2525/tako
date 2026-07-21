@@ -108,6 +108,9 @@ enum Command {
     /// UI テーマ（ライト/ダーク）の確認・切替（Issue #217）。
     /// 引数なしで現在テーマを表示、dark / light で指定、toggle で反転
     Theme(ThemeArgs),
+    /// UI 表示言語（日本語/英語）の確認・切替（Issue #435）。
+    /// 引数なしで現在言語を表示、ja / en で指定、system で OS ロケール追従
+    Lang(LangArgs),
     /// ステータスバーの利用制限表示サービスの確認・切替（Issue #321）。
     /// 引数なしで現在サービスを表示、claude / codex / agy で指定
     #[command(name = "limit-service")]
@@ -1706,6 +1709,14 @@ struct ThemeArgs {
     /// dark / light = 指定テーマへ、toggle = 反転（省略時は現在テーマを表示）
     #[arg(value_parser = ["dark", "light", "toggle"])]
     mode: Option<String>,
+}
+
+/// UI 表示言語コマンドの引数（Issue #435）
+#[derive(Args)]
+struct LangArgs {
+    /// ja / en = 指定言語へ、system = OS ロケール追従（省略時は現在言語を表示）
+    #[arg(value_parser = ["ja", "en", "system"])]
+    value: Option<String>,
 }
 
 /// 利用制限表示サービスの引数（Issue #321）
@@ -3669,6 +3680,10 @@ fn build_request(command: &Command) -> Result<Request, String> {
             }),
             mode: args.mode.clone().filter(|m| m != "toggle"),
         },
+        Command::Lang(args) => Request::Lang {
+            action: args.value.as_deref().map(|_| "set".to_string()),
+            value: args.value.clone(),
+        },
         Command::LimitService(args) => Request::LimitService {
             action: if args.refresh {
                 Some("refresh".to_string())
@@ -4858,6 +4873,7 @@ fn print_result(command: &Command, result: &Value) {
         | Command::Persist(_)
         | Command::ConfirmClose(_)
         | Command::Theme(_)
+        | Command::Lang(_)
         | Command::LimitService(_)
         | Command::Telemetry(_)
         | Command::Panel(_)

@@ -846,6 +846,9 @@ struct TakoApp {
     codex_metrics: AgentMetrics,
     /// ステータスバーの利用制限表示で選択中のサービス（Issue #321。settings.json 永続化）
     limit_service: tako_core::LimitService,
+    /// UI 表示言語の設定値（Issue #435。system / ja / en。settings.json 永続化。
+    /// 実際の表示言語は tako_core::i18n のグローバルが正）
+    lang_setting: tako_core::i18n::LangSetting,
     /// ステータスバーの利用制限サービス切替ドロップダウンが開いているか（Issue #321）
     limit_service_menu_open: bool,
     /// ドロップダウンメニューのアンカー位置（ステータスバーの overflow_hidden 外へ描画するため）
@@ -1875,6 +1878,12 @@ impl TakoApp {
             agent_metrics: AgentMetrics::default(),
             codex_metrics: AgentMetrics::default(),
             limit_service: tako_control::settings::load().limit_service(),
+            lang_setting: {
+                // UI 表示言語を最初の render 前に確定する（Issue #435。既定 = OS ロケール）
+                let setting = tako_control::settings::load().lang_setting();
+                tako_core::i18n::set_lang(setting.resolve());
+                setting
+            },
             limit_service_menu_open: false,
             limit_service_menu_anchor: None,
             usage_history: std::collections::VecDeque::new(),
@@ -11847,6 +11856,19 @@ impl UiStateHost for TakoApp {
         self.theme = Theme::for_mode(mode);
     }
 
+    fn ui_lang_setting(&self) -> tako_core::i18n::LangSetting {
+        self.lang_setting
+    }
+
+    fn set_ui_lang(
+        &mut self,
+        setting: tako_core::i18n::LangSetting,
+        resolved: tako_core::i18n::Lang,
+    ) {
+        self.lang_setting = setting;
+        tako_core::i18n::set_lang(resolved);
+    }
+
     fn limit_service(&self) -> tako_core::LimitService {
         self.limit_service
     }
@@ -16265,6 +16287,54 @@ mod self_test {
                 ok || std::env::var("TAKO_UPDATE_SNAPSHOT").is_ok()
             };
             check(tools_ok, "MCP tools/list スナップショット検証");
+
+            // 33c. tools/call tako_lang（Issue #435。set en → i18n 反映 → system 復帰）
+            {
+                let (status, response) = mcp_post_bg(
+                    cx,
+                    &mcp_url,
+                    Some(&token),
+                    &[],
+                    r#"{"jsonrpc":"2.0","id":105,"method":"tools/call","params":{"name":"tako_lang","arguments":{"action":"set","value":"en"}}}"#,
+                )
+                .await
+                .unwrap_or_else(|| fail("MCP lang set 接続"));
+                let en_applied = tako_core::i18n::lang() == tako_core::i18n::Lang::En;
+                check(
+                    status == 200
+                        && response.contains(r#""language":"en""#)
+                        && response.contains(r#""resolved":"en""#)
+                        && en_applied,
+                    "MCP lang set en（i18n 反映）",
+                );
+                let (status, response) = mcp_post_bg(
+                    cx,
+                    &mcp_url,
+                    Some(&token),
+                    &[],
+                    r#"{"jsonrpc":"2.0","id":106,"method":"tools/call","params":{"name":"tako_lang","arguments":{"action":"set","value":"ja"}}}"#,
+                )
+                .await
+                .unwrap_or_else(|| fail("MCP lang set ja 接続"));
+                let ja_applied = tako_core::i18n::lang() == tako_core::i18n::Lang::Ja;
+                check(
+                    status == 200
+                        && response.contains(r#""resolved":"ja""#)
+                        && ja_applied,
+                    "MCP lang set ja（i18n 反映）",
+                );
+                // system へ戻す（セルフテスト環境の既定へ復帰。settings は非保存）
+                let (status, _response) = mcp_post_bg(
+                    cx,
+                    &mcp_url,
+                    Some(&token),
+                    &[],
+                    r#"{"jsonrpc":"2.0","id":107,"method":"tools/call","params":{"name":"tako_lang","arguments":{"action":"set","value":"system"}}}"#,
+                )
+                .await
+                .unwrap_or_else(|| fail("MCP lang set system 接続"));
+                check(status == 200, "MCP lang set system（復帰）");
+            }
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)

@@ -1877,6 +1877,29 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_lang",
+            "description": "UI 表示言語（日本語/英語）の状態確認・切替（Issue #435）。\
+                action=status（既定）: 言語設定（system / ja / en）と実際の表示言語を返す。\
+                action=set: value で指定した言語へ切り替える（system = OS ロケール追従）。\
+                変更は settings.json に永続化され、GUI に即時反映される。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "set"],
+                        "description": "操作種別（省略時は status）",
+                    },
+                    "value": {
+                        "type": "string",
+                        "enum": ["system", "ja", "en"],
+                        "description": "言語設定（set 時に必須。system = OS ロケール追従）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_limit_service",
             "description": "ステータスバーの利用制限表示サービスの状態確認・切替・再取得（Issue #321 / #357）。\
                 ステータスバーの 5h / 7d リミットメーターにどのサービス（claude / codex / agy）の値を表示するかを制御する。\
@@ -3175,6 +3198,10 @@ fn build_request(
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             mode: str_arg(args, "mode")?.map(|s| s.to_string()),
         },
+        "tako_lang" => Request::Lang {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
+            value: str_arg(args, "value")?.map(|s| s.to_string()),
+        },
         "tako_limit_service" => Request::LimitService {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             service: str_arg(args, "service")?.map(|s| s.to_string()),
@@ -4047,7 +4074,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 105);
+        assert_eq!(tools.len(), 106);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

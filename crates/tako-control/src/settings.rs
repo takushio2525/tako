@@ -56,6 +56,9 @@ pub struct Settings {
     /// ステータスバーの利用制限表示で選択中のサービス（Issue #321。既定 "claude"）
     #[serde(default = "default_limit_service")]
     pub limit_service: String,
+    /// UI 表示言語（Issue #435。"system" / "ja" / "en"。既定 system = OS ロケール追従）
+    #[serde(default = "default_language")]
+    pub language: String,
 }
 
 fn default_theme() -> String {
@@ -86,6 +89,10 @@ fn default_limit_service() -> String {
     "claude".into()
 }
 
+fn default_language() -> String {
+    "system".into()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -104,6 +111,7 @@ impl Default for Settings {
             sidebar_width: default_sidebar_width(),
             telemetry: false,
             limit_service: default_limit_service(),
+            language: default_language(),
         }
     }
 }
@@ -126,6 +134,11 @@ impl Settings {
     /// 利用制限表示の選択サービスを解決する（不明値は既定 Claude。Issue #321）
     pub fn limit_service(&self) -> tako_core::LimitService {
         tako_core::LimitService::parse(&self.limit_service).unwrap_or_default()
+    }
+
+    /// UI 表示言語の設定値を tako-core の型へ解決する（不明値は既定 system。Issue #435）
+    pub fn lang_setting(&self) -> tako_core::i18n::LangSetting {
+        tako_core::i18n::LangSetting::parse(&self.language).unwrap_or_default()
     }
 }
 
@@ -201,6 +214,7 @@ mod tests {
             sidebar_width: 300,
             telemetry: true,
             limit_service: "codex".into(),
+            language: "en".into(),
         };
         save_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), Some(settings));
@@ -213,6 +227,8 @@ mod tests {
         assert!(Settings::default().auto_rename);
         // 空オブジェクトでも既定が立つ（後方互換）
         let parsed: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.language, "system");
+        assert_eq!(parsed.lang_setting(), tako_core::i18n::LangSetting::System);
         assert!(parsed.auto_rename);
         assert!(parsed.port_detect);
         assert!(parsed.preview_live_reload);
