@@ -1031,3 +1031,13 @@
 - 修正: has_pending_tools フラグで tool_result 到着を追跡、未到着のみ approval 付与。テスト 4 本追加
 - 関連コミット: `b364bcd`（PR #430 squash merge）。品質ゲート全緑（1084 tests）
 - 次: `build-app.sh --install` → 実機確認（auto mode 非表示 + 実ダイアログ表示）
+
+## 2026-07-22（#432/#426/#428/#424/#429: リモート実機 FAIL の徹底調査 + 修正）
+
+- 根因を隔離実測で確定: ①input が "session:0.0" を dispatch tmux_session へ渡し `=session:0.0:`
+  で can't find pane 無音失敗（#428）②WS init が term DOM 未マウント中に捨てられ、開き直しは
+  init キャッシュ 0ms 着弾で必ず無限ロード（#426/#428）③serve_binary が current_exe 優先で
+  PATH 上の dev CLI から旧世代 serve が立つ（#432。#424 表示欠落もこれ起因の疑い）
+- 修正: input の PaneId 直渡し / PWA 保留 init / Enter=改行・cmd/ctrl+Enter=送信（#429）/
+  serve_binary の /Applications 優先 + status 可視化 + 世代食い違い検知
+- 検証: 隔離 serve + Playwright で before/after 実測（送達成功・2 回目表示・master 一覧表示）

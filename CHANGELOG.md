@@ -5,6 +5,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- [修正] リモート: 数値 PaneId 宛の入力送信が無音失敗する問題を修正 (#428)
+  input API が PaneId を "session:0.0" 形式へ変換して dispatch の tmux_session
+  （セッション名を期待）へ渡し、deliver 系の `={session}:` 組み立てが
+  `=session:0.0:` になり can't find pane で無音失敗していた（HTTP は 200 を返却）。
+  PaneId は dispatch の pane に渡して GUI の送達検証フロー（#32/#95）を通し、
+  tmux フォールバックにはセッション名のみ渡すよう修正。
+  Fix remote: input to numeric PaneId silently failed to deliver (#428).
+  The input API passed a "session:0.0" tmux target into dispatch's tmux_session
+  (which expects a bare session name), producing an invalid `=session:0.0:`
+  target. Now passes the PaneId itself so the GUI delivery-verification flow applies.
+
+- [修正] リモート: ペインを開き直すと term ビューが無限ロードになる問題を修正 (#426, #428)
+  WS の init メッセージが term ビュー DOM の未マウント中（初期 chat 表示中）に
+  届くと捨てられ、update には loading 解除が無いため永久スピナーになっていた。
+  2 回目以降は broadcaster の init キャッシュが接続直後（実測 0ms）に届くため
+  必ず発症。init を保留して term ビューのマウント時に適用するよう修正。
+  Fix remote: term view stuck loading when reopening a pane (#426, #428).
+  WS init arriving before the term view DOM mounted was dropped; updates never
+  clear the loading state. Reopened panes always hit this because the cached
+  init arrives instantly. Init is now buffered and applied on term-view mount.
+
+- [UI] リモート: モバイルの改行キーで送信されてしまう問題を修正 (#429)
+  chat / term 入力欄の Enter を改行入力に変更（モバイルは Shift が無く改行を
+  入力できなかった）。送信は送信ボタンまたは cmd/ctrl+Enter に分離。
+  Fix remote: mobile Enter key sent the message instead of inserting a newline (#429).
+  Enter now inserts a newline; sending is via the send button or cmd/ctrl+Enter.
+
+- [修正] リモート: remote start が PATH 上の別世代バイナリで serve を立てる問題を修正 (#432)
+  serve バイナリ解決を /Applications の安定バイナリ優先へ変更（GUI .app と serve の
+  世代を揃える。検証モードでは従来どおり自バイナリ）。`tako remote status` と起動
+  応答に serve_binary を表示し、稼働中 serve が解決先と食い違う場合は start が
+  停止 → 再起動を案内するように変更。
+  Fix remote: `remote start` could spawn a stale-generation serve from PATH (#432).
+  Binary resolution now prefers the stable /Applications bundle, status/start
+  expose the serve binary path, and a generation mismatch prompts a restart.
+
 - [修正] リモート: auto mode の自動実行コマンドに承認カードが出る問題を修正 (#425)
   transcript 正規化が最終 assistant エントリの tools を無条件に承認待ちと判定していた。
   tool_result の到着を追跡し、実際に承認待ちの場合のみカードを表示するよう修正。

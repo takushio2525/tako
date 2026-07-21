@@ -137,6 +137,9 @@ export function TerminalPage({ paneId, me }) {
   const paneListTimerRef = useRef(null);
   const atBottomRef = useRef(true);
   const sgrStateRef = useRef(defaultSgrState());
+  // term ビュー未マウント中に届いた WS init の保留（#426/#428: chat 表示中に init が
+  // 届くと DOM が無く捨てられ、update に loading 解除が無いため永久スピナーになる）
+  const pendingInitRef = useRef(null);
 
   if (!clientRef.current) clientRef.current = createClient();
 
@@ -172,6 +175,21 @@ export function TerminalPage({ paneId, me }) {
     scr.appendChild(buildScreen(screenLines, cursor));
   };
 
+  // init メッセージを DOM に反映する。term ビュー未マウントなら false（保留させる）
+  const applyInit = (data) => {
+    const reader = readerRef.current;
+    if (!reader || !historyRef.current || !screenRef.current) return false;
+    historyRef.current.textContent = '';
+    sgrStateRef.current = defaultSgrState();
+    appendHistory(data.history || []);
+    replaceScreen(data.screen || [], data.cursor);
+    setLoading(false);
+    setHasNew(false);
+    atBottomRef.current = true;
+    reader.scrollTop = reader.scrollHeight;
+    return true;
+  };
+
   const connectWs = useCallback(() => {
     if (!clientRef.current || !paneId) return;
     if (wsRef.current) {
@@ -186,18 +204,20 @@ export function TerminalPage({ paneId, me }) {
     ws.onmessage = (ev) => {
       let data;
       try { data = JSON.parse(ev.data); } catch { return; }
-      const reader = readerRef.current;
-      if (!reader || !historyRef.current || !screenRef.current) return;
       if (data.type === 'init') {
-        historyRef.current.textContent = '';
-        sgrStateRef.current = defaultSgrState();
-        appendHistory(data.history || []);
-        replaceScreen(data.screen || [], data.cursor);
-        setLoading(false);
-        setHasNew(false);
-        atBottomRef.current = true;
-        reader.scrollTop = reader.scrollHeight;
+        if (applyInit(data)) pendingInitRef.current = null;
+        else pendingInitRef.current = data;
       } else if (data.type === 'update') {
+        // 保留 init がある間の update は保留側にマージする（term マウント時に最新を適用）
+        const pending = pendingInitRef.current;
+        if (pending) {
+          pending.history = (pending.history || []).concat(data.pushed || []);
+          pending.screen = data.screen || [];
+          pending.cursor = data.cursor;
+          return;
+        }
+        const reader = readerRef.current;
+        if (!reader || !historyRef.current || !screenRef.current) return;
         const follow = atBottomRef.current;
         const pushed = data.pushed || [];
         if (pushed.length) {
@@ -222,6 +242,13 @@ export function TerminalPage({ paneId, me }) {
     wsRef.current = ws;
   }, [paneId]);
 
+  // term ビューがマウントされたら保留中の init を適用する（#426/#428）
+  useEffect(() => {
+    if (view !== 'term') return;
+    const pending = pendingInitRef.current;
+    if (pending && applyInit(pending)) pendingInitRef.current = null;
+  }, [view]);
+
   const refreshPanes = useCallback(async () => {
     if (!clientRef.current) return;
     try {
@@ -239,6 +266,7 @@ export function TerminalPage({ paneId, me }) {
     setHasNew(false);
     atBottomRef.current = true;
     sgrStateRef.current = defaultSgrState();
+    pendingInitRef.current = null;
     if (historyRef.current) historyRef.current.textContent = '';
     if (screenRef.current) screenRef.current.textContent = '';
     connectWs();
@@ -337,7 +365,9 @@ export function TerminalPage({ paneId, me }) {
       clientRef.current?.sendKeys(paneId, `C-${e.key}`).catch(() => {});
       return;
     }
-    if (e.key === 'Enter' && !e.shiftKey) {
+    // 送信は cmd/ctrl+Enter か送信ボタンのみ。素の Enter は改行として入力する
+    // （#429: モバイルキーボードの改行キーで送信されてしまい改行が打てなかった）
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       termSend();
     }
@@ -458,7 +488,7 @@ export function TerminalPage({ paneId, me }) {
               autocorrect="off"
               autocapitalize="off"
               spellcheck={false}
-              enterkeyhint="send"
+              enterkeyhint="enter"
               rows={1}
             />
             <button class="term-send-btn" onClick={termSend}>
