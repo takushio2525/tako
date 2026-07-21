@@ -20,6 +20,8 @@
 
 - PR squash merge → `build-app.sh --install` → 実機（iPhone）で 5 Issue の再検証
 - 実機確認項目: 2 回目以降のペイン表示 / master への送信反映 / master 一覧表示 / 改行キー
+- #438 リロードアイコン刷新は PR #441 merge 済み → install 後に GUI で見た目確認
+  （ステータスバー利用制限リロード / Web ビューリロードの 2 箇所。証拠 ~/Desktop/tako-438-evidence/）
 
 ## 現フェーズで Read すべき設計書
 

@@ -1041,3 +1041,12 @@
 - 修正: input の PaneId 直渡し / PWA 保留 init / Enter=改行・cmd/ctrl+Enter=送信（#429）/
   serve_binary の /Applications 優先 + status 可視化 + 世代食い違い検知
 - 検証: 隔離 serve + Playwright で before/after 実測（送達成功・2 回目表示・master 一覧表示）
+
+## 2026-07-21（#438: リロードアイコンを円弧+三角矢じりへ再デザイン）
+
+- 前回却下案（円弧2本+Lブラケット矢印）の敗因を踏まえ、単一 270°円弧 + 塗り三角矢じり
+  （Chrome/Material 同型）で作り直し。候補 4 案の実レンダリング比較 + 12px@2x ピクセル拡大で
+  採用案を決定、隔離実機の before/after 実寸スクショで ✕ に見えないことを目視検証
+  （証拠 ~/Desktop/tako-438-evidence/）。使用 2 箇所は同一アセット参照で統一
+- 関連コミット: `025bad7`（PR #441 squash merge）。品質ゲート全緑 + セルフテスト FAILED 0
+- 次: `build-app.sh --install` → 実機で見た目確認 → #438 クローズはユーザー判断
