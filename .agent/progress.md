@@ -1024,3 +1024,10 @@
 - 根因: v2 API の数値 PaneId を WS/screen API に渡すと tmux ターゲットとして無効で即エラー → WS 無限 open/close + term 無限ロード。PaneId→tmux ターゲット自動解決を全 API に追加、WS 通知デバウンス、v2 fallback 統一
 - 関連コミット: `eea56e1`（PR #427 squash merge）。品質ゲート全緑（1080 tests）
 - 次: `build-app.sh --install` → 実機でリモート接続検証
+
+## 2026-07-22（#425: リモート承認カード誤表示の修正）
+
+- 根因: transcript 正規化で最終 assistant の tools を無条件に approval と判定。auto mode で自動実行された全コマンドに承認カードが表示されていた
+- 修正: has_pending_tools フラグで tool_result 到着を追跡、未到着のみ approval 付与。テスト 4 本追加
+- 関連コミット: `b364bcd`（PR #430 squash merge）。品質ゲート全緑（1084 tests）
+- 次: `build-app.sh --install` → 実機確認（auto mode 非表示 + 実ダイアログ表示）
