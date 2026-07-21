@@ -795,6 +795,8 @@ struct TakoApp {
     /// drop / mouse-up でクリア。gpui の active_drag は型を公開しないため自前で追跡し、
     /// ドロップ先オーバーレイの生成判定 + ラベル出し分けに使う
     drag_kind: Option<DragKind>,
+    /// ファイル D&D 中に cmd が押されているか（#415: パス入力表示の切替に使用）
+    drop_cmd_held: bool,
     /// ドラッグ中のドロップ先（ペイン, 挿入位置）。挿入プレビュー表示の状態
     drop_target: Option<(PaneId, DropZone)>,
     /// タブバーへのペイン D&D: ドロップ先タブ（Some(id) = 既存タブへ合流、None = 新タブ化）
@@ -1851,6 +1853,7 @@ impl TakoApp {
             restore_report,
             window_frame: None,
             drag_kind: None,
+            drop_cmd_held: false,
             drop_target: None,
             tab_drop_target: None,
             tab_reorder_indicator: None,
@@ -6604,6 +6607,36 @@ impl TakoApp {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
+        // handle_key と同じ優先順位で入力先を振り分ける（#414）。
+        // on_action 経由で直接呼ばれるため handle_key のチェーンを迂回する
+        if let Some(palette) = self.command_palette.as_mut() {
+            palette.query.push_str(&text);
+            palette.selected = 0;
+            cx.notify();
+            return;
+        }
+        if let Some(ref mut edit) = self.inline_edit {
+            edit.text.insert_str(edit.cursor, &text);
+            edit.cursor += text.len();
+            cx.notify();
+            return;
+        }
+        if let Some(pane_id) = self.webview_address_bar_active {
+            let key = pane_id.as_u64();
+            if let Some((input, cursor)) = self.webview_address_bar.get_mut(&key) {
+                input.insert_str(*cursor, &text);
+                *cursor += text.len();
+            }
+            cx.notify();
+            return;
+        }
+        if self.webview_dock_url_focused {
+            self.webview_dock_url_input
+                .insert_str(self.webview_dock_url_cursor, &text);
+            self.webview_dock_url_cursor += text.len();
+            cx.notify();
+            return;
+        }
         let pane_id = self.focused_pane();
         if self
             .preview_edits
@@ -7023,19 +7056,19 @@ impl TakoApp {
         kind: DragKind,
         cx: &mut Context<Self>,
     ) {
+        let is_file = matches!(kind, DragKind::File | DragKind::ExternalFile);
         let new = bounds.contains(&position).then(|| {
-            let fx =
-                f32::from(position.x - bounds.origin.x) / f32::from(bounds.size.width).max(1.0);
-            let fy =
-                f32::from(position.y - bounds.origin.y) / f32::from(bounds.size.height).max(1.0);
-            (
-                pane_id,
-                drop_zone(
-                    fx,
-                    fy,
-                    matches!(kind, DragKind::File | DragKind::ExternalFile),
-                ),
-            )
+            // cmd 押下中のファイル D&D はパス入力 → 分割ゾーン判定を省き Center 強制（#415）
+            let zone = if self.drop_cmd_held && is_file {
+                DropZone::Center
+            } else {
+                let fx =
+                    f32::from(position.x - bounds.origin.x) / f32::from(bounds.size.width).max(1.0);
+                let fy = f32::from(position.y - bounds.origin.y)
+                    / f32::from(bounds.size.height).max(1.0);
+                drop_zone(fx, fy, is_file)
+            };
+            (pane_id, zone)
         });
         match new {
             Some(target) => {
@@ -7067,6 +7100,7 @@ impl TakoApp {
     /// ドロップ確定の共通処理: ドラッグ状態を畳み、対象ペインで確定した挿入位置を返す
     fn take_drop_zone(&mut self, pane_id: PaneId) -> Option<DropZone> {
         self.drag_kind = None;
+        self.drop_cmd_held = false;
         self.tab_drop_target = None;
         self.tab_reorder_indicator = None;
         self.dragging_tab = None;
@@ -7174,6 +7208,7 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) {
         self.drag_kind = None;
+        self.drop_cmd_held = false;
         self.tab_reorder_indicator = None;
         self.dragging_tab = None;
         let target_index = match before {
@@ -7201,6 +7236,7 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) {
         self.drag_kind = None;
+        self.drop_cmd_held = false;
         self.tab_drop_target = None;
         let result = match dest {
             Some(tab_id) => {
@@ -7449,7 +7485,8 @@ impl TakoApp {
                 },
             ))
             .on_drag_move::<FileDrag>(cx.listener(
-                move |this, e: &DragMoveEvent<FileDrag>, _, cx| {
+                move |this, e: &DragMoveEvent<FileDrag>, window, cx| {
+                    this.drop_cmd_held = window.modifiers().platform;
                     this.update_drop_target(
                         pane_id,
                         e.bounds,
@@ -7501,7 +7538,8 @@ impl TakoApp {
                 }
             }))
             .on_drag_move::<ExternalPaths>(cx.listener(
-                move |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
+                move |this, e: &DragMoveEvent<ExternalPaths>, window, cx| {
+                    this.drop_cmd_held = window.modifiers().platform;
                     this.update_drop_target(
                         pane_id,
                         e.bounds,
@@ -7526,39 +7564,80 @@ impl TakoApp {
                 },
             ));
         if let Some(zone) = zone {
-            let (left, top, w, h) = match zone {
+            let is_terminal_pane =
+                self.terminals.contains_key(&pane_id) && !self.previews.contains_key(&pane_id);
+            let is_file = matches!(kind, DragKind::File | DragKind::ExternalFile);
+            // cmd 押下中のファイル D&D + ターミナルペイン → パス入力表示（#415）
+            let path_insert = self.drop_cmd_held && is_file && is_terminal_pane;
+            let effective_zone = if path_insert { DropZone::Center } else { zone };
+            let (left, top, w, h) = match effective_zone {
                 DropZone::Left => (0.0, 0.0, 0.5, 1.0),
                 DropZone::Right => (0.5, 0.0, 0.5, 1.0),
                 DropZone::Up => (0.0, 0.0, 1.0, 0.5),
                 DropZone::Down => (0.0, 0.5, 1.0, 0.5),
                 DropZone::Center => (0.0, 0.0, 1.0, 1.0),
             };
-            let is_terminal_pane =
-                self.terminals.contains_key(&pane_id) && !self.previews.contains_key(&pane_id);
-            let label = match (kind, zone) {
-                (DragKind::TmuxSession, _) => "ここに分割して表示",
-                (DragKind::ExternalFile, DropZone::Center) if is_terminal_pane => "パスを入力",
-                (DragKind::File, DropZone::Center) if is_terminal_pane => "パスを入力",
-                (DragKind::ExternalFile | DragKind::File, DropZone::Center) => "ここで開く",
-                (DragKind::ExternalFile | DragKind::File, _) => "ここに分割して開く",
-                (DragKind::Pane, _) => "この位置に移動",
-                (DragKind::BackgroundPane, _) => "ここに復帰",
-                (DragKind::Tab, _) => "この位置に移動",
+            let label = if path_insert {
+                "パス入力"
+            } else {
+                match (kind, effective_zone) {
+                    (DragKind::TmuxSession, _) => "ここに分割して表示",
+                    (DragKind::ExternalFile, DropZone::Center) if is_terminal_pane => "パスを入力",
+                    (DragKind::File, DropZone::Center) if is_terminal_pane => "パスを入力",
+                    (DragKind::ExternalFile | DragKind::File, DropZone::Center) => "ここで開く",
+                    (DragKind::ExternalFile | DragKind::File, _) => "ここに分割して開く",
+                    (DragKind::Pane, _) => "この位置に移動",
+                    (DragKind::BackgroundPane, _) => "ここに復帰",
+                    (DragKind::Tab, _) => "この位置に移動",
+                }
             };
-            overlay = overlay.child(
-                div()
-                    .absolute()
-                    .left(relative(left))
-                    .top(relative(top))
-                    .w(relative(w))
-                    .h(relative(h))
-                    .rounded_sm()
+            let highlight = div()
+                .absolute()
+                .left(relative(left))
+                .top(relative(top))
+                .w(relative(w))
+                .h(relative(h))
+                .rounded_sm()
+                .flex()
+                .items_center()
+                .justify_center();
+            let highlight = if path_insert {
+                // パス入力モード: 薄い背景 + 細枠 + カーソルバー + ラベル
+                highlight
+                    .bg(rgba_alpha(theme.accent, 0.08))
+                    .border_1()
+                    .border_color(rgba_alpha(theme.accent, 0.5))
+                    .child(
+                        div().flex().flex_col().items_center().gap_1().child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .w(px(2.0))
+                                        .h(px(16.0))
+                                        .rounded_sm()
+                                        .bg(hsla(theme.accent)),
+                                )
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(rgba(theme.tab_bar_background))
+                                        .text_size(px(11.0))
+                                        .text_color(hsla(theme.foreground))
+                                        .child(label),
+                                ),
+                        ),
+                    )
+            } else {
+                // 通常の分割ハイライト
+                highlight
                     .bg(rgba_alpha(theme.accent, 0.18))
                     .border_2()
                     .border_color(hsla(theme.accent))
-                    .flex()
-                    .items_center()
-                    .justify_center()
                     .child(
                         div()
                             .px_2()
@@ -7568,8 +7647,9 @@ impl TakoApp {
                             .text_size(px(11.0))
                             .text_color(hsla(theme.foreground))
                             .child(label),
-                    ),
-            );
+                    )
+            };
+            overlay = overlay.child(highlight);
         }
         overlay
     }
@@ -8185,6 +8265,7 @@ impl TakoApp {
             | self.tab_reorder_indicator.take().is_some()
             | self.dragging_tab.take().is_some()
             | std::mem::take(&mut self.sidebar_drop_highlight)
+            | std::mem::take(&mut self.drop_cmd_held)
         {
             cx.notify();
             return;
@@ -13459,7 +13540,11 @@ impl Render for TakoApp {
         self.sync_webview_visibility(hide_webviews);
 
         // D&D 中のみ、各ペインにドロップ先オーバーレイを重ねる（FR-2.16.10 / FR-3.11）。
-        // gpui 側のドラッグが外部要因（Esc 等）で消えたフレームでは出さない
+        // gpui 側のドラッグが外部要因（Esc 等）で消えたフレームでは出さない。
+        // cmd 押下状態を描画フレームで同期（ドラッグ中に cmd を押し/離ししても反映。#415）
+        if cx.has_active_drag() {
+            self.drop_cmd_held = window.modifiers().platform;
+        }
         let drop_overlays: Vec<_> = self
             .drag_kind
             .filter(|_| cx.has_active_drag())
@@ -19940,6 +20025,32 @@ mod self_test {
                 check(
                     url_input_ok,
                     "Web dock URL 入力: フォーカス + 手打ち + BS + Enter + Esc (#375)",
+                );
+
+                // 78b. URL 入力欄フォーカス中の ⌘V ペーストが欄に入る (#414)
+                let paste_ok = window
+                    .update(cx, |app, _, cx| {
+                        app.webview_dock_open = true;
+                        app.webview_dock_url_focused = true;
+                        app.webview_dock_url_input.clear();
+                        app.webview_dock_url_cursor = 0;
+                        cx.write_to_clipboard(ClipboardItem::new_string(
+                            "https://example.com".into(),
+                        ));
+                        app.paste(cx);
+                        let pasted = app.webview_dock_url_input == "https://example.com"
+                            && app.webview_dock_url_cursor == 19;
+                        app.webview_dock_open = false;
+                        app.webview_dock_url_focused = false;
+                        app.webview_dock_url_input.clear();
+                        app.webview_dock_url_cursor = 0;
+                        cx.notify();
+                        pasted
+                    })
+                    .unwrap_or(false);
+                check(
+                    paste_ok,
+                    "Web dock URL 入力: フォーカス中の paste() が欄に入る (#414)",
                 );
 
                 // ホイール = ミラー表示 + スクロールバー表示（#159 と同じ機構に乗る）
