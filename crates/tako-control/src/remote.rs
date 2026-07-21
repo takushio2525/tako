@@ -210,8 +210,8 @@ struct DaemonCtx {
     /// ローカル管理トークン（`/api/admin/*` 専用。リモート端末には決して渡らない）
     admin_token: String,
     tmux_socket: String,
-    /// デバイスごとの WS 接続数（0→1 で接続開始、1→0 で終了とみなす）
-    ws_connections: Mutex<HashMap<String, usize>>,
+    /// デバイスごとの WS 接続数 + 最終切断時刻（短時間の再接続で通知を抑制する）
+    ws_connections: Mutex<HashMap<String, WsDeviceState>>,
     /// 稼働ポート・公開 URL（admin state 表示用）
     port: u16,
     base_url: String,
@@ -219,34 +219,72 @@ struct DaemonCtx {
     expected_host: String,
 }
 
+/// デバイスごとの WS 接続状態
+struct WsDeviceState {
+    count: usize,
+    last_disconnect: Option<std::time::Instant>,
+}
+
+/// 再接続で通知を抑制する猶予時間
+const WS_NOTIFY_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl DaemonCtx {
-    /// デバイスの WS 接続数を +1 する。0→1（接続開始）なら true
+    /// デバイスの WS 接続数を +1 する。
+    /// 接続通知を出すべきなら true（0→1 かつ直前の切断から猶予時間以上経過）
     fn ws_connect(&self, device_id: &str) -> bool {
         let mut map = self.ws_connections.lock().unwrap();
-        let count = map.entry(device_id.to_string()).or_insert(0);
-        *count += 1;
-        *count == 1
+        let state = map.entry(device_id.to_string()).or_insert(WsDeviceState {
+            count: 0,
+            last_disconnect: None,
+        });
+        state.count += 1;
+        if state.count == 1 {
+            let recently = state
+                .last_disconnect
+                .is_some_and(|t| t.elapsed() < WS_NOTIFY_GRACE);
+            return !recently;
+        }
+        false
     }
 
-    /// デバイスの WS 接続数を -1 する。1→0（全切断）なら true
+    /// デバイスの WS 接続数を -1 する。
+    /// 切断通知を出すべきなら true（全 WS が切断された）。
+    /// ただし通知は即時ではなく、猶予時間内の再接続で抑制されるため
+    /// 呼び出し側は切断時刻を記録し、猶予後に改めて判定する
     fn ws_disconnect(&self, device_id: &str) -> bool {
         let mut map = self.ws_connections.lock().unwrap();
         match map.get_mut(device_id) {
-            Some(count) if *count > 1 => {
-                *count -= 1;
+            Some(state) if state.count > 1 => {
+                state.count -= 1;
                 false
             }
-            Some(_) => {
-                map.remove(device_id);
+            Some(state) => {
+                state.count = 0;
+                state.last_disconnect = Some(std::time::Instant::now());
                 true
             }
             None => false,
         }
     }
 
+    /// 指定デバイスが現在 WS 接続中（count > 0）かを返す
+    fn ws_is_connected(&self, device_id: &str) -> bool {
+        self.ws_connections
+            .lock()
+            .unwrap()
+            .get(device_id)
+            .is_some_and(|s| s.count > 0)
+    }
+
     /// 接続中デバイス → WS 接続数のスナップショット
     fn connections_snapshot(&self) -> HashMap<String, usize> {
-        self.ws_connections.lock().unwrap().clone()
+        self.ws_connections
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| s.count > 0)
+            .map(|(k, s)| (k.clone(), s.count))
+            .collect()
     }
 }
 
@@ -525,13 +563,9 @@ impl PaneMapping {
                             continue;
                         };
                         self.pane_info.insert(id, pane.clone());
-                        // backend_windows がある場合、そのセッション名を逆引きに登録
-                        if let Some(windows) = pane["backend_windows"].as_array() {
-                            if !windows.is_empty() {
-                                // backend session 名はペインのタイトルから推定。
-                                // より確実には tmux_list の backend session 名を使う
-                                // ここでは role や osc_title からの推定は不要 —
-                                // remote の pane target 解決で直接 PaneId を返す
+                        if let Some(session) = pane["tmux_session"].as_str() {
+                            if !session.is_empty() {
+                                self.backend_to_pane.insert(session.to_string(), id);
                             }
                         }
                     }
@@ -541,16 +575,16 @@ impl PaneMapping {
         self.updated_at = std::time::Instant::now();
     }
 
-    /// tmux target（`session:window.pane`）から tako PaneId を解決する。
-    /// session 名が backend session と一致すれば対応する PaneId を返す。
-    /// 見つからなければ None（tmux-only のペイン or マッピング未更新）
-    #[allow(dead_code)]
-    fn resolve_pane_id(&self, _tmux_target: &str) -> Option<u64> {
-        // remote の pane target は tmux session:window.pane 形式。
-        // IPC 経由の Send は tmux_session フィールドで session 名を渡せるので
-        // PaneId への変換は必須ではない。ただし Close には PaneId が必要。
-        // List 応答から全ペインの ID を取得済みなので、pane_info のキーから探す
-        None
+    /// tako PaneId（数値文字列）を tmux ターゲット（`session:0.0`）に解決する。
+    /// 既に tmux ターゲット形式（`:` を含む）ならそのまま返す
+    fn resolve_tmux_target(&self, pane_param: &str) -> Option<String> {
+        if pane_param.contains(':') {
+            return Some(pane_param.to_string());
+        }
+        let id: u64 = pane_param.parse().ok()?;
+        let info = self.pane_info.get(&id)?;
+        let session = info["tmux_session"].as_str().filter(|s| !s.is_empty())?;
+        Some(format!("{session}:0.0"))
     }
 }
 
@@ -1043,7 +1077,14 @@ pub fn run_daemon(port: Option<u16>) -> io::Result<()> {
             Ok(Some(request)) => {
                 let path = request.url().split('?').next().unwrap_or("");
                 if path == "/ws" && is_ws_upgrade(&request) {
-                    handle_ws_v2(request, &ctx, shutdown.clone(), broadcasters.clone());
+                    handle_ws_v2(
+                        request,
+                        &ctx,
+                        shutdown.clone(),
+                        broadcasters.clone(),
+                        &app_conn,
+                        &pane_mapping,
+                    );
                 } else {
                     handle_request_v2(request, &ctx, &app_conn, &pane_mapping, &broadcasters);
                 }
@@ -1857,6 +1898,40 @@ fn tmux_list_panes(tmux_socket: &str) -> Value {
     json!({ "panes": panes })
 }
 
+/// tmux バックエンドから全セッション・ペイン情報を v2 API 形式で返す。
+/// IPC 不在時のフォールバック用（#424: v1 形式では role / agent_type がなく
+/// master/worker の識別ができなかった）
+fn tmux_list_panes_v2(tmux_socket: &str) -> Value {
+    let sessions = tako_core::tmux::list_sessions(Some(tmux_socket));
+    let mut panes = Vec::new();
+
+    for sess in &sessions {
+        for win in &sess.windows {
+            let pane_list = tmux_list_window_panes(tmux_socket, &sess.name, win.index);
+            for (pane_idx, _pane_tty) in pane_list.iter().enumerate() {
+                let pane_id = format!("{}:{}.{}", sess.name, win.index, pane_idx);
+                let title = if win.active && pane_idx == 0 {
+                    format!("{} ({})", sess.name, win.name)
+                } else {
+                    format!("{}:{}.{}", sess.name, win.name, pane_idx)
+                };
+                panes.push(json!({
+                    "id": pane_id,
+                    "title": title,
+                    "role": "",
+                    "agent_type": "plain",
+                    "state": if sess.attached { "running" } else { "idle" },
+                    "surface": "background",
+                    "position": format!("{}/{}", pane_idx + 1, pane_list.len()),
+                    "tmux_target": pane_id,
+                }));
+            }
+        }
+    }
+
+    json!({ "panes": panes, "api_version": 2 })
+}
+
 /// tmux の特定 window 内のペイン一覧を取得する
 fn tmux_list_window_panes(tmux_socket: &str, session: &str, window: u32) -> Vec<String> {
     let target = format!("={session}:{window}");
@@ -2335,6 +2410,30 @@ fn refresh_pane_mapping(
     }
 }
 
+/// pane パラメータ（数値 PaneId または tmux ターゲット）を tmux ターゲットに解決する。
+/// 数値 PaneId の場合はキャッシュを参照し、未ヒットなら IPC List で更新してから再試行する。
+/// tmux ターゲット形式（`:` を含む）ならそのまま返す。
+/// 解決できなければ None（#423/#426: v2 API が返す数値 ID への対応）
+fn resolve_pane_param(
+    pane_param: &str,
+    app_conn: &Arc<RwLock<AppConnection>>,
+    pane_mapping: &Arc<RwLock<PaneMapping>>,
+) -> Option<String> {
+    if pane_param.contains(':') {
+        return Some(pane_param.to_string());
+    }
+    if let Ok(mapping) = pane_mapping.read() {
+        if let Some(target) = mapping.resolve_tmux_target(pane_param) {
+            return Some(target);
+        }
+    }
+    refresh_pane_mapping(app_conn, pane_mapping);
+    pane_mapping
+        .read()
+        .ok()
+        .and_then(|m| m.resolve_tmux_target(pane_param))
+}
+
 /// List 応答をリモート API v2 形式に変換する。
 /// agent 種別・タイトル・role・cwd・タブ内位置・モデル・状態・session_id を含むペイン情報。
 /// agents が Some なら session_id をペインに紐付ける（チャットビュー用。#284）
@@ -2381,6 +2480,12 @@ fn list_to_api_v2(list: &Value) -> Value {
             // session_id + model: sessions カタログからペインに紐づく情報を解決
             let (session_id, model) = resolve_pane_session_info(pane, id);
 
+            // tmux ターゲット: WS / screen API で数値 PaneId の代わりに使う
+            let tmux_target = pane["tmux_session"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(|s| format!("{s}:0.0"));
+
             let mut entry = json!({
                 "id": id,
                 "title": title,
@@ -2395,6 +2500,7 @@ fn list_to_api_v2(list: &Value) -> Value {
                 "cols": pane["cols"],
                 "rows": pane["rows"],
                 "focused": pane["focused"],
+                "tmux_target": tmux_target,
             });
             if let Some(sid) = session_id {
                 entry["session_id"] = json!(sid);
@@ -2754,8 +2860,9 @@ fn handle_request_v2(
                 return respond_sensitive(request, 200, Some(result.to_string()));
             }
             None => {
-                // app 不在: tmux-only のペイン一覧（v1 形式にフォールバック）
-                let result = tmux_list_panes(tmux_socket);
+                // app 不在: tmux-only のペイン一覧を v2 形式で返す（#424:
+                // v1 形式では role / agent_type がなく master の識別ができない）
+                let result = tmux_list_panes_v2(tmux_socket);
                 return respond(request, 200, Some(result.to_string()));
             }
         }
@@ -2983,13 +3090,15 @@ fn handle_api_v2_routes(
             }
         }
         (tiny_http::Method::Get, p) if p.starts_with("/api/panes/") && p.ends_with("/screen") => {
-            let Some(target) = extract_pane_target(p) else {
+            let Some(pane_param) = extract_pane_target(p) else {
                 return respond(
                     request,
                     400,
                     Some(json!({ "error": "無効なペイン ID" }).to_string()),
                 );
             };
+            let target =
+                resolve_pane_param(&pane_param, app_conn, pane_mapping).unwrap_or(pane_param);
             let tmux_target = format!("={target}");
             let ansi = query_param(url_full, "ansi").is_some_and(|v| v == "1" || v == "true");
             let history = query_param(url_full, "lines").and_then(|v| v.parse::<u32>().ok());
@@ -3008,13 +3117,15 @@ fn handle_api_v2_routes(
         (tiny_http::Method::Get, p)
             if p.starts_with("/api/panes/") && p.ends_with("/scrollback") =>
         {
-            let Some(target) = extract_pane_target(p) else {
+            let Some(pane_param) = extract_pane_target(p) else {
                 return respond(
                     request,
                     400,
                     Some(json!({ "error": "無効なペイン ID" }).to_string()),
                 );
             };
+            let target =
+                resolve_pane_param(&pane_param, app_conn, pane_mapping).unwrap_or(pane_param);
             let tmux_target = format!("={target}");
             let history = query_param(url_full, "lines")
                 .and_then(|v| v.parse::<u32>().ok())
@@ -3032,7 +3143,7 @@ fn handle_api_v2_routes(
         }
         // --- 書き込み系: dispatch 経由（H-7）---
         (tiny_http::Method::Post, p) if p.starts_with("/api/panes/") && p.ends_with("/input") => {
-            let Some(target) = extract_pane_target(p) else {
+            let Some(pane_param) = extract_pane_target(p) else {
                 return respond(
                     request,
                     400,
@@ -3066,6 +3177,8 @@ fn handle_api_v2_routes(
                     notify_macos(&format!("{} が操作を開始しました", device.name));
                 }
             }
+            let target =
+                resolve_pane_param(&pane_param, app_conn, pane_mapping).unwrap_or(pane_param);
             match dispatch_send(app_conn, &target, &text, newline, keys.as_deref()) {
                 Ok(_) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
                 Err((status, e)) => {
@@ -3074,20 +3187,21 @@ fn handle_api_v2_routes(
             }
         }
         (tiny_http::Method::Post, p) if p.starts_with("/api/panes/") && p.ends_with("/close") => {
-            let Some(target) = extract_pane_target(p) else {
+            let Some(pane_param) = extract_pane_target(p) else {
                 return respond(
                     request,
                     400,
                     Some(json!({ "error": "無効なペイン ID" }).to_string()),
                 );
             };
+            let target =
+                resolve_pane_param(&pane_param, app_conn, pane_mapping).unwrap_or(pane_param);
             ctx.registry.lock().unwrap().audit(
                 "close",
                 &device.id,
                 &device.name,
                 json!({ "route": p }),
             );
-            // IPC 経由で dispatch Close を呼ぶ（H-7: 最後のペイン保護が効く）
             match dispatch_close(app_conn, pane_mapping, &target) {
                 Ok(_) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
                 Err((status, e)) => {
@@ -3096,13 +3210,15 @@ fn handle_api_v2_routes(
             }
         }
         (tiny_http::Method::Post, p) if p.starts_with("/api/panes/") && p.ends_with("/resize") => {
-            let Some(target) = extract_pane_target(p) else {
+            let Some(pane_param) = extract_pane_target(p) else {
                 return respond(
                     request,
                     400,
                     Some(json!({ "error": "無効なペイン ID" }).to_string()),
                 );
             };
+            let target =
+                resolve_pane_param(&pane_param, app_conn, pane_mapping).unwrap_or(pane_param);
             let parsed = match read_json_body(&mut request) {
                 Ok(v) => v,
                 Err(e) => {
@@ -3115,7 +3231,6 @@ fn handle_api_v2_routes(
                 &device.name,
                 json!({ "route": p }),
             );
-            // IPC 経由で TmuxResize dispatch を呼ぶ
             let session_part = target.split(':').next().unwrap_or(&target);
             let window_part = target
                 .split(':')
@@ -3517,6 +3632,8 @@ fn handle_ws_v2(
     ctx: &Arc<DaemonCtx>,
     shutdown: Arc<AtomicBool>,
     broadcasters: BroadcasterMap,
+    app_conn: &Arc<RwLock<AppConnection>>,
+    pane_mapping: &Arc<RwLock<PaneMapping>>,
 ) {
     let url_full = request.url().to_string();
     // 二層認証（画面データは Observe role から）
@@ -3526,11 +3643,20 @@ fn handle_ws_v2(
             return respond(request, status, Some(json!({ "error": e }).to_string()));
         }
     };
-    let Some(pane) = query_param(&url_full, "pane") else {
+    let Some(pane_param) = query_param(&url_full, "pane") else {
         return respond(
             request,
             400,
             Some(json!({ "error": "pane クエリが必要" }).to_string()),
+        );
+    };
+    // 数値 PaneId → tmux ターゲットの解決（#423/#426: v2 API が返す数値 ID 対応）
+    let pane = resolve_pane_param(&pane_param, app_conn, pane_mapping);
+    let Some(ref pane) = pane else {
+        return respond(
+            request,
+            404,
+            Some(json!({ "error": format!("ペイン '{pane_param}' が見つからない") }).to_string()),
         );
     };
     let Some(ws_key) = header_value(&request, "sec-websocket-key") else {
@@ -3557,7 +3683,7 @@ fn handle_ws_v2(
     // broadcaster に subscribe して WS 配信スレッドを起動（subscriber はデバイス ID つき =
     // revoke 時に disconnect_device_ws で該当デバイスだけ即時切断できる）
     let (_, rx) =
-        get_or_create_broadcaster(&broadcasters, &pane, &device.id, &ctx.tmux_socket, shutdown);
+        get_or_create_broadcaster(&broadcasters, pane, &device.id, &ctx.tmux_socket, shutdown);
 
     // 接続開始（このデバイスの 1 本目の WS）なら通知 + 監査
     if ctx.ws_connect(&device.id) {
@@ -3600,17 +3726,30 @@ fn handle_ws_v2(
                 }
             }
             let _ = ws.close(None);
-            // 全 WS 切断（このデバイスの最後の 1 本）なら通知 + 監査
+            // 全 WS 切断（このデバイスの最後の 1 本）なら通知 + 監査。
+            // 短時間の再接続（ネットワーク揺れ等）で通知が嵐にならないよう、
+            // 猶予時間後にまだ切断中の場合のみ通知する（#423）
             if ctx_fwd.ws_disconnect(&device_fwd.id) {
-                if let Ok(reg) = ctx_fwd.registry.lock() {
-                    reg.audit(
-                        "conn_close",
-                        &device_fwd.id,
-                        &device_fwd.name,
-                        json!({ "route": "/ws" }),
-                    );
-                }
-                notify_macos(&format!("{} が切断しました", device_fwd.name));
+                let device_id = device_fwd.id.clone();
+                let device_name = device_fwd.name.clone();
+                let ctx_delayed = ctx_fwd.clone();
+                std::thread::Builder::new()
+                    .name("ws-disconnect-notify".into())
+                    .spawn(move || {
+                        std::thread::sleep(WS_NOTIFY_GRACE);
+                        if !ctx_delayed.ws_is_connected(&device_id) {
+                            if let Ok(reg) = ctx_delayed.registry.lock() {
+                                reg.audit(
+                                    "conn_close",
+                                    &device_id,
+                                    &device_name,
+                                    json!({ "route": "/ws" }),
+                                );
+                            }
+                            notify_macos(&format!("{device_name} が切断しました"));
+                        }
+                    })
+                    .ok();
             }
         })
         .ok();
