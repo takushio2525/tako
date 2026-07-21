@@ -5,6 +5,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- [修正] 隔離起動時に remote state_dir を隔離し本番 state 破壊を防止 (#445)
+  `TAKO_ISOLATED=1` での隔離起動時に `TAKO_REMOTE_STATE_DIR` が隔離されず、
+  2 秒毎の `daemon_status` ポーリングが本番の remote state ファイルを削除し得た。
+  一括隔離ブロックに `TAKO_REMOTE_STATE_DIR` を追加し、`daemon_status` の
+  cleanup に隔離モードガードを二重防御として設置。
+  Fix remote state_dir not being isolated under `TAKO_ISOLATED=1` (#445).
+  The periodic `daemon_status` poll could delete production remote state files
+  when running an isolated instance. Added `TAKO_REMOTE_STATE_DIR` to the
+  bulk isolation block and guarded `daemon_status` cleanup in isolated mode.
+
 - [セキュリティ] リモートの cross-origin 脆弱性を遮断 (#287)
   ペアリング済み端末上で開いた悪意あるサイトから ts.net URL へ fetch して
   ターミナル画面の読取・任意コマンド実行が可能だった穴を塞いだ。

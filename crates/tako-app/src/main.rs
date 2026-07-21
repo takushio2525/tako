@@ -14433,6 +14433,16 @@ fn main() {
                 std::env::temp_dir().join(format!("tako-iso-pane-logs-{}", std::process::id())),
             );
         }
+        // #445: remote daemon の state ファイル（pid/token/port/url）も隔離する。
+        // state_dir() は TAKO_REMOTE_STATE_DIR → data_dir()/remote の順で解決するため、
+        // TAKO_DATA_DIR を隔離しても TAKO_REMOTE_STATE_DIR が環境に残っていると
+        // 本番 state_dir を参照し、2 秒毎の daemon_status で本番 state を消し得る
+        if std::env::var_os("TAKO_REMOTE_STATE_DIR").is_none() {
+            std::env::set_var(
+                "TAKO_REMOTE_STATE_DIR",
+                std::env::temp_dir().join(format!("tako-iso-remote-{}", std::process::id())),
+            );
+        }
     }
     // セルフテストの tmux バックエンド項目は、ユーザーの実バックエンド（tako サーバー）を
     // 汚さない隔離ソケットで行う（終了時に self_test 側が kill-server で片付ける）
