@@ -4,14 +4,15 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-22・#413 修正完了）
+## 現在の対象（2026-07-22・#421 修正完了）
 
-**#413（タブ D&D インジケータが右端固定）を修正・マージ済み**
+**#421（セルフテスト type_text ハング）を修正・マージ済み**
 
-- PR #419 → squash merge（`5bf0759`）。main に反映済み
-- 根因: GPUI の `on_drag_move` が capture フェーズで全登録要素に hitbox チェックなしで
-  発火するため、+ ボタンのハンドラが DOM 順で常に最後に勝ちインジケータが末尾固定
-- 修正: 各ハンドラに `bounds.contains(&position)` チェックを追加
+- PR #422 → squash merge（`f0a3a6c`）。main に反映済み
+- 根因: GPUI の `dispatch_keystroke` が毎文字フルレイアウト再計算（taffy flexbox）を
+  トリガーし、テスト 69c の `link_command`（182 文字）で数百秒かかりタイムアウト
+- 修正: `type_text` に 80 文字閾値を導入。短い文字列は `dispatch_keystroke`（入力経路
+  検証を維持）、長い文字列は PTY 直接 `paste()` で GPUI 再描画を回避
 
 ## 次の一手
 

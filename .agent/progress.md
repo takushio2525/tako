@@ -1011,3 +1011,10 @@
 - 修正: 各 `on_drag_move::<TabDrag>` に `bounds.contains(&position)` チェックを追加
 - 関連コミット: `5bf0759`（PR #419 squash merge）。品質ゲート全緑 + セルフテスト FAILED 0
 - 次: `build-app.sh --install` → 実機でタブ D&D のインジケータ正位置を目視確認
+
+## 2026-07-22（#421: セルフテスト type_text ハングの根治）
+
+- 根因: `dispatch_keystroke` が毎文字 GPUI フルレイアウト再計算（taffy flexbox）をトリガー。
+  テスト 69c の `link_command`（182 文字）で 182 回再描画→タイムアウト。`sample` でスタック確定
+- 修正: `type_text` に 80 文字閾値を導入。長い文字列は PTY 直接 `paste()` で再描画を回避
+- 関連コミット: `f0a3a6c`（PR #422 squash merge）。品質ゲート全緑（1080 tests）
