@@ -246,6 +246,13 @@ enum Command {
     /// exit code マーカーを探し、見つかれば auto_close 方針に従い処理する
     #[command(name = "run-interactive-status")]
     RunInteractiveStatus(RunInteractiveStatusArgs),
+    /// ファイルを実行する（Code Runner: FR-3.18, #453）。
+    /// ファイル内の tako:run 宣言または拡張子既定コマンドで新ペインを分割して実行する
+    #[command(name = "run")]
+    Run(RunArgs),
+    /// 拡張子ごとの実行コマンド既定を一覧/設定/削除する（FR-3.18, #453）
+    #[command(name = "run-default")]
+    RunDefault(RunDefaultArgs),
 }
 
 #[derive(Args)]
@@ -279,6 +286,53 @@ struct RunInteractiveArgs {
 struct RunInteractiveStatusArgs {
     /// 対象ペイン ID
     pane: u64,
+}
+
+#[derive(Args)]
+struct RunArgs {
+    /// 実行対象のファイルパス
+    file: String,
+    /// 実行プロファイル名（省略時は既定プロファイル）
+    #[arg(long)]
+    profile: Option<String>,
+    /// コマンド上書き（最優先）
+    #[arg(long)]
+    command: Option<String>,
+    /// 分割の基準ペイン ID（省略時は呼び出し元）
+    #[arg(long, conflicts_with = "tab")]
+    pane: Option<u64>,
+    /// 分割先タブ ID
+    #[arg(long)]
+    tab: Option<u64>,
+    /// 右に分割（既定は下）
+    #[arg(long)]
+    right: bool,
+    /// 新ペイン側の取り分（0.0–1.0、省略時は 0.3）
+    #[arg(long)]
+    ratio: Option<f32>,
+    /// 完了後の自動 close 方針（success / always / never。既定 never）
+    #[arg(long, default_value = "never")]
+    auto_close: String,
+    /// 新ペインにフォーカスを移す
+    #[arg(long)]
+    focus: bool,
+    /// 完了まで待って exit code を返す（ポーリング）
+    #[arg(long)]
+    wait: bool,
+    /// 実行せずプロファイル一覧を表示する（--dry-run / --list）
+    #[arg(long, alias = "dry-run")]
+    list: bool,
+}
+
+#[derive(Args)]
+struct RunDefaultArgs {
+    /// 拡張子（省略時は全一覧）
+    ext: Option<String>,
+    /// 設定するコマンドテンプレート
+    command: Option<String>,
+    /// 拡張子既定を削除（組み込みに戻す）
+    #[arg(long)]
+    remove: bool,
 }
 
 #[derive(Args)]
@@ -2100,6 +2154,9 @@ fn main() -> ExitCode {
         Command::Recover(ref args) => recover_local(args),
         // run-interactive --wait は起動 + ポーリングの合成
         Command::RunInteractive(ref args) if args.wait => run_interactive_wait(&cli.command),
+        // run --wait / --list は合成処理
+        Command::Run(ref args) if args.wait => run_wait(&cli.command),
+        Command::Run(ref args) if args.list => run_list(&cli.command),
         command => run(command),
     };
     match result {
@@ -4446,6 +4503,33 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane: args.pane,
             no_wait: false,
         },
+        Command::Run(ref args) => {
+            let direction = if args.right {
+                Some(Direction::Right)
+            } else {
+                Some(Direction::Down)
+            };
+            Request::Run {
+                path: args.file.clone(),
+                pane: if args.tab.is_some() {
+                    None
+                } else {
+                    target_pane(args.pane)?
+                },
+                tab: args.tab,
+                profile: args.profile.clone(),
+                command: args.command.clone(),
+                direction,
+                ratio: args.ratio,
+                auto_close: Some(args.auto_close.clone()),
+                focus: Some(args.focus),
+            }
+        }
+        Command::RunDefault(ref args) => Request::RunnerDefaults {
+            ext: args.ext.clone(),
+            command: args.command.clone(),
+            remove: args.remove,
+        },
     })
 }
 
@@ -4538,6 +4622,49 @@ fn run_interactive_wait(command: &Command) -> Result<(), String> {
             return Ok(());
         }
     }
+}
+
+/// run --wait: 起動 → ポーリングで完了待ち → exit code を返す
+fn run_wait(command: &Command) -> Result<(), String> {
+    let request = build_request(command)?;
+    let result = send_request(request)?;
+    let pane = result["pane"]
+        .as_u64()
+        .ok_or("run が pane ID を返さなかった")?;
+    println!(
+        "pane {pane} でコマンドを実行中（command: {}）",
+        result["command"].as_str().unwrap_or("?")
+    );
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let status = send_request(Request::RunInteractiveStatus {
+            pane,
+            no_wait: false,
+        })?;
+        if status["status"].as_str() == Some("exited") {
+            println!("{}", pretty_json(&status));
+            let code = status["exit_code"].as_i64().unwrap_or(1);
+            if code != 0 {
+                return Err(format!("コマンドが exit code {code} で終了"));
+            }
+            return Ok(());
+        }
+    }
+}
+
+/// run --list: ファイルの実行プロファイル一覧を表示する（実行しない）
+fn run_list(command: &Command) -> Result<(), String> {
+    let Command::Run(args) = command else {
+        return Err("内部エラー: run --list に非 Run コマンド".into());
+    };
+    let request = Request::RunResolve {
+        path: args.file.clone(),
+        pane: target_pane(args.pane)?,
+    };
+    let result = send_request(request)?;
+    println!("{}", pretty_json(&result));
+    Ok(())
 }
 
 /// gate 操作のローカル処理（YAML I/O + コマンド実行。IPC 不要。#244）
@@ -4959,6 +5086,12 @@ fn print_result(command: &Command, result: &Value) {
             println!("{}", pretty_json(result));
         }
         Command::RunInteractiveStatus(_) => {
+            println!("{}", pretty_json(result));
+        }
+        Command::Run(_) => {
+            println!("{}", pretty_json(result));
+        }
+        Command::RunDefault(_) => {
             println!("{}", pretty_json(result));
         }
         // remote は run() → print_result を通らない

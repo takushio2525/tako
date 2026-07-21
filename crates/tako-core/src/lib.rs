@@ -21,6 +21,7 @@ pub mod preview_outline;
 pub mod preview_reload;
 pub mod preview_view;
 pub mod recent;
+pub mod runner;
 pub mod screen;
 pub mod scroll;
 pub mod scroll_mirror;
@@ -61,6 +62,10 @@ pub use preview_reload::PreviewReloadState;
 pub use preview_view::{
     PreviewViewState, PreviewViewUpdate, PreviewZoomCommand, PREVIEW_ZOOM_MAX, PREVIEW_ZOOM_MIN,
     PREVIEW_ZOOM_STEP,
+};
+pub use runner::{
+    builtin_defaults, expand_variables, merged_defaults, parse_declarations, resolve, Declarations,
+    ProfileDecl, Resolution, RunPlan, RunSource, RunnerError,
 };
 pub use screen::{InputStatus, InputStyle, Screen, ScreenLine, StyleRun};
 pub use shell::{quote_for_shell, quote_paths_for_shell};

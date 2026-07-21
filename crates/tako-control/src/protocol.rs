@@ -1043,6 +1043,44 @@ pub enum Request {
         #[serde(default)]
         no_wait: bool,
     },
+
+    /// Code Runner: ファイル内宣言/拡張子既定でコマンドを解決し新ペインで実行（FR-3.18, #453）
+    Run {
+        /// 実行対象ファイルパス（相対パスは pane の cwd 基準で解決）
+        path: String,
+        pane: Option<u64>,
+        tab: Option<u64>,
+        /// 実行プロファイル名（省略時は既定プロファイル）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
+        /// コマンド上書き（最優先）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direction: Option<Direction>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ratio: Option<f32>,
+        /// "success" / "always" / "never"（既定 "never"）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_close: Option<String>,
+        /// 新ペインにフォーカスを移すか（既定 false）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus: Option<bool>,
+    },
+    /// Code Runner: ファイルの実行プロファイル一覧を解決して返す（実行しない。FR-3.18, #453）
+    RunResolve { path: String, pane: Option<u64> },
+    /// 拡張子既定コマンドの一覧/設定/削除（FR-3.18, #453）
+    RunnerDefaults {
+        /// 拡張子（省略時は一覧を返す）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ext: Option<String>,
+        /// 設定するコマンドテンプレート
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        /// true で削除
+        #[serde(default)]
+        remove: bool,
+    },
 }
 
 impl Request {
