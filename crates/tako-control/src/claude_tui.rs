@@ -83,10 +83,7 @@ pub fn detect_permission_dialog(lines: &[String]) -> Option<PermissionDialog> {
         let trimmed = line.trim();
         // 空行はスキップ（リセットしない: claude の実ダイアログは本体に空行を挟む）。
         // 選択肢下のヘルプ行もスキップ
-        if trimmed.is_empty()
-            || trimmed.starts_with("Press enter")
-            || trimmed.starts_with("Esc ")
-        {
+        if trimmed.is_empty() || trimmed.starts_with("Press enter") || trimmed.starts_with("Esc ") {
             continue;
         }
         // 選択カーソル ❯ / > を除去した内容テキスト。
@@ -1073,7 +1070,9 @@ Bash ツールで「touch /tmp/te439/approval-test.txt」を実行して
         assert_eq!(dialog.highlighted, Some(0));
         // command はボックス内だけ。バナー・cwd・MCP 警告・ユーザー発話は混入しない
         assert!(
-            dialog.command.contains("touch /tmp/te439/approval-test.txt"),
+            dialog
+                .command
+                .contains("touch /tmp/te439/approval-test.txt"),
             "ボックス内のコマンドは含む: {}",
             dialog.command
         );

@@ -27,6 +27,7 @@ mod right_panel;
 mod sidebar;
 mod status_bar;
 mod tab_bar;
+mod ui_text;
 mod update_checker;
 mod video_player;
 mod webview;
@@ -943,14 +944,13 @@ struct TakoApp {
     confirm_close: bool,
     /// 確認ダイアログ表示中の対象（None = ダイアログ非表示）
     pending_close_confirm: Option<CloseConfirmTarget>,
-    /// スリープ防止のアサーションが現在保持中か（ステータスバー表示用。ポーリングで更新）
-    sleep_guard_active: bool,
-    /// 蓋が閉じているか（#218 ステータスバー表示用）
-    lid_closed: bool,
-    /// pmset disablesleep が有効か（#218 ステータスバー表示用）
-    lid_sleep_disabled: bool,
-    /// thermal 警告中か（#218 ステータスバー表示用）
-    thermal_warning: bool,
+    /// スリープ防止の最新状態（ステータスバーチップ + 詳細ポップオーバー表示用。
+    /// ポーリングで更新。#173/#218/#440）
+    sleep_guard_state: Option<tako_control::sleep_guard::SleepGuardState>,
+    /// sleep-guard 詳細ポップオーバーの開閉（#440）
+    sleep_guard_popover_open: bool,
+    /// sleep-guard ポップオーバーのアンカー位置（チップのクリック位置）
+    sleep_guard_popover_anchor: Option<gpui::Point<gpui::Pixels>>,
     /// 起動時に orphan 自動復帰した tmux セッション数（Issue #191。診断用）
     recovered_count: usize,
     /// ペインの平文ログ管理（Issue #112 B）
@@ -1921,10 +1921,9 @@ impl TakoApp {
             hovered_link: None,
             confirm_close: tako_control::setup::confirm_close_enabled(),
             pending_close_confirm: None,
-            sleep_guard_active: false,
-            lid_closed: false,
-            lid_sleep_disabled: false,
-            thermal_warning: false,
+            sleep_guard_state: None,
+            sleep_guard_popover_open: false,
+            sleep_guard_popover_anchor: None,
             recovered_count: 0,
             pane_logs: std::sync::Arc::new(std::sync::Mutex::new(
                 tako_core::pane_log::PaneLogManager::new(
@@ -6999,10 +6998,7 @@ impl TakoApp {
             settings.lid_sleep_mode,
             busy_agents,
         );
-        self.sleep_guard_active = state.assertion_held;
-        self.lid_closed = state.lid_closed;
-        self.lid_sleep_disabled = state.lid_sleep_disabled;
-        self.thermal_warning = state.thermal_state.is_warning();
+        self.sleep_guard_state = Some(state);
     }
 
     // --- D&D（FR-2.16.10 tmux セッション取り込み / FR-3.11 ファイルプレビュー） ---
@@ -13895,6 +13891,7 @@ impl Render for TakoApp {
             .children(hover_preview_overlay)
             .children(pinned_overlays)
             .children(self.render_limit_service_overlay(cx))
+            .children(self.render_sleep_guard_overlay(cx))
             .children(self.render_update_dropdown_overlay(cx))
             .children(self.render_close_confirm_dialog(cx))
             .children(self.render_remote_overlay(cx))

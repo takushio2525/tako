@@ -1058,3 +1058,13 @@
   実名入り旧 URL を `<user>`/`<hostname>`/`<email>`/`<account_id>`/`<redacted-url>` へ置換（文意不変）
 - 関連コミット: `a9fd9c8`（PR #447 squash merge）。grep で実値ヒット 0 件を確認、Issue にコメント済み
 - 残: #287 の P1-1 cross-origin / P1-2 identity spoof（実装修正）と履歴側 PII の扱い決定は別タスク
+
+## 2026-07-22（#440: sleep-guard チップの平易化 + 詳細ポップオーバー + i18n-ready 化）
+
+- 「awake+lid」を平易な 3 状態（スリープ防止中 / ・蓋閉じOK / ・高温注意=赤字）へ刷新、
+  クリックでモード・理由（エージェント N 体稼働中）・蓋閉じ挙動・変更方法（クリックコピー）の
+  ポップオーバー新設（#361 のルートオーバーレイ方式）。文字列は ui_text.rs 新設カタログへ
+  集約（#435 案 B のキー化準備）。☕ は #217 で SVG 化済みを grep 確認（UI に絵文字ゼロ）
+- 検証: 候補 9 案の実寸レンダリング比較 + 実クリック e2e（開閉 / backdrop dismiss / コピー
+  pbpaste 実測）+ unit 14 本 + 品質ゲート全緑。セルフテスト FAILED 1 = #332 のみ
+  （素の main で同一再現 = 差分ゼロ）。証拠 ~/Desktop/tako-440-evidence/
