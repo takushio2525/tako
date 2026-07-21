@@ -130,7 +130,7 @@ pub struct WebViewEntry {
     /// Some = このペインに表示中 / None = dock 退避中
     pub pane: Option<PaneId>,
     /// 直近フレームの可視状態（差分呼び出しで AppKit 往復を減らす）
-    visible_now: bool,
+    pub(crate) visible_now: bool,
     /// 直近フレームの bounds（論理 px。差分呼び出し用）
     bounds_now: Option<(f64, f64, f64, f64)>,
     /// eval トークン採番

@@ -9854,6 +9854,33 @@ impl TakoApp {
         Ok(id)
     }
 
+    /// render を待たずに webview を可視化する（#442）。
+    /// GPUI は非アクティブウィンドウの render を遅延するため、dispatch 直後に
+    /// sync_frame を呼ばないと webview が不可視のまま残る。
+    /// pane_text_areas に前回 render の area があればそれを使い、
+    /// なければ set_visible(true) だけ呼んで次の render で bounds を補正する
+    fn eagerly_show_webview(&mut self, pane: PaneId) {
+        let Some(e) = self.webviews.iter_mut().find(|e| e.pane == Some(pane)) else {
+            return;
+        };
+        if let Some((_, area)) = self.pane_text_areas.iter().find(|(p, _)| *p == pane) {
+            let bounds = (
+                f64::from(f32::from(area.origin.x)),
+                f64::from(f32::from(area.origin.y)),
+                f64::from(f32::from(area.size.width)),
+                f64::from(f32::from(area.size.height)),
+            );
+            e.sync_frame(Some(bounds));
+        } else {
+            // 新規 split 直後で area 未計算。set_visible(true) だけ呼び、
+            // 次の render の sync_frame で正確な bounds へ補正される
+            if !e.visible_now {
+                let _ = e.view.set_visible(true);
+                e.visible_now = true;
+            }
+        }
+    }
+
     /// 表示中の Web ビューのタイトル・URL を JS 評価で更新する（2 秒ポーリング）。
     /// 結果はコールバック（次の runloop）で shared に届き、次回 render で反映される
     fn poll_webview_state(&self) {
@@ -12479,33 +12506,46 @@ impl RemoteHost for TakoApp {
 impl WebViewHost for TakoApp {
     fn web_open(&mut self, pane: PaneId, url: &str) -> Result<serde_json::Value, String> {
         let id = self.create_webview(&webview::normalize_url(url))?;
-        let e = self
+        if let Some(e) = self.webviews.iter_mut().find(|e| e.id == id) {
+            e.pane = Some(pane);
+        }
+        self.eagerly_show_webview(pane);
+        let url = self
             .webviews
-            .iter_mut()
+            .iter()
             .find(|e| e.id == id)
-            .expect("直前に生成した webview");
-        e.pane = Some(pane);
+            .map(|e| e.current_url())
+            .unwrap_or_default();
         Ok(serde_json::json!({
             "id": id.as_u64(),
             "pane": pane.as_u64(),
-            "url": e.current_url(),
+            "url": url,
         }))
     }
 
     fn web_show(&mut self, pane: PaneId, id: u64) -> Result<serde_json::Value, String> {
-        let e = self
-            .webviews
-            .iter_mut()
-            .find(|e| e.id.as_u64() == id)
-            .ok_or(format!("Web ビュー {id} が見つからない（web list で確認）"))?;
-        if e.pane.is_some() {
-            return Err(format!("Web ビュー {id} は表示中"));
+        {
+            let e = self
+                .webviews
+                .iter_mut()
+                .find(|e| e.id.as_u64() == id)
+                .ok_or(format!("Web ビュー {id} が見つからない（web list で確認）"))?;
+            if e.pane.is_some() {
+                return Err(format!("Web ビュー {id} は表示中"));
+            }
+            e.pane = Some(pane);
         }
-        e.pane = Some(pane);
+        self.eagerly_show_webview(pane);
+        let url = self
+            .webviews
+            .iter()
+            .find(|e| e.id.as_u64() == id)
+            .map(|e| e.current_url())
+            .unwrap_or_default();
         Ok(serde_json::json!({
             "id": id,
             "pane": pane.as_u64(),
-            "url": e.current_url(),
+            "url": url,
         }))
     }
 
