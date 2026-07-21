@@ -215,6 +215,14 @@ pub trait UiStateHost {
     }
     /// 利用制限表示のサービス切替（再描画は実装側の責務。永続化は dispatch 側で行う）
     fn set_limit_service(&mut self, _service: tako_core::LimitService) {}
+    /// settings から resolve_theme し直してテーマを差し替える（Issue #459 色変更用）
+    fn reload_theme(&mut self) {}
+    /// 設定画面を開く（Issue #459）。tab でタブ指定可能
+    fn open_settings_window(&mut self, _tab: Option<&str>) {}
+    /// 設定画面が開いているか（Issue #459）
+    fn settings_window_open(&self) -> bool {
+        false
+    }
     /// 利用制限メトリクスの即時再取得（#357 リロードボタン）。
     /// 全ペインの TUI フッターを再走査し、現在のメトリクスを JSON で返す
     fn refresh_limits(&mut self) -> serde_json::Value {

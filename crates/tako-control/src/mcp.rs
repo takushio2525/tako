@@ -1850,23 +1850,53 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_theme",
-            "description": "UI テーマ（ライト/ダーク）の状態確認・切替（Issue #217）。\
-                action=status（既定）: 現在のテーマ（dark / light）を返す。\
-                action=set: mode で指定したテーマへ切り替える。\
-                action=toggle: 現在のテーマを反転する。\
-                変更は settings.json に永続化され、GUI に即時反映される。",
+            "description": "UI テーマの状態確認・切替・色設定・プリセット・フォント（Issue #217/#459）。\
+                action=status（既定）: 現在のテーマ + 利用可能プリセットを返す。\
+                action=set: mode でテーマ（dark/light/プリセット名）を切り替える。\
+                action=toggle: ダーク/ライトを反転する。\
+                action=colors: 58色キーの現在値とソースを一覧する。\
+                action=set-color: key の色を value(#RRGGBB) へ変更する。\
+                action=reset-color: key の色上書きを削除しビルトインへ戻す。\
+                action=reset-colors: 全色上書きを削除する。\
+                action=save-preset: 現在の色を name で保存する。\
+                action=delete-preset: プリセットを削除する。\
+                action=set-font: フォントファミリーやサイズを変更する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "set", "toggle"],
+                        "enum": ["status", "set", "toggle", "colors", "set-color", "reset-color", "reset-colors", "save-preset", "delete-preset", "set-font"],
                         "description": "操作種別（省略時は status）",
                     },
-                    "mode": {
+                    "mode": { "type": "string", "description": "テーマ: dark / light / プリセット名（set 時に必須）" },
+                    "target": { "type": "string", "description": "色操作の対象（省略 = 現在の theme）" },
+                    "key": { "type": "string", "description": "色キー名（set-color / reset-color 時に必須）" },
+                    "value": { "type": "string", "description": "#RRGGBB（set-color 時に必須）" },
+                    "name": { "type": "string", "description": "プリセット名（save-preset / delete-preset 時に必須）" },
+                    "font_family": { "type": "string", "description": "フォントファミリー（set-font 時）" },
+                    "font_size": { "type": "string", "description": "フォントサイズ（set-font 時。8〜32）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_settings",
+            "description": "設定画面の操作（Issue #459）。\
+                action=open（既定）: GUI 設定画面を開く（個別設定は tako_lang / tako_theme 等を使う）。\
+                action=status: 設定画面が開いているかを返す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
                         "type": "string",
-                        "enum": ["dark", "light"],
-                        "description": "テーマモード（set 時に必須）",
+                        "enum": ["open", "status"],
+                        "description": "操作種別（省略時は open）",
+                    },
+                    "tab": {
+                        "type": "string",
+                        "enum": ["general", "appearance", "runner", "setup", "sleep", "remote", "advanced"],
+                        "description": "開くタブ指定（省略時は現在タブ維持）",
                     },
                 },
                 "additionalProperties": false,
@@ -3303,6 +3333,12 @@ fn build_request(
         "tako_theme" => Request::Theme {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             mode: str_arg(args, "mode")?.map(|s| s.to_string()),
+            target: str_arg(args, "target")?.map(|s| s.to_string()),
+            key: str_arg(args, "key")?.map(|s| s.to_string()),
+            value: str_arg(args, "value")?.map(|s| s.to_string()),
+            name: str_arg(args, "name")?.map(|s| s.to_string()),
+            font_family: str_arg(args, "font_family")?.map(|s| s.to_string()),
+            font_size: str_arg(args, "font_size")?.and_then(|s| s.parse::<f32>().ok()),
         },
         "tako_lang" => Request::Lang {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
@@ -3314,6 +3350,10 @@ fn build_request(
         },
         "tako_telemetry" => Request::Telemetry {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
+        },
+        "tako_settings" => Request::Settings {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
+            tab: str_arg(args, "tab")?.map(|s| s.to_string()),
         },
         "tako_setup_changes" => Request::SetupChanges,
         "tako_setup" => Request::SetupRun {

@@ -70,13 +70,17 @@ tako_remote_stop
 tako_rename_tab
 tako_reorder_tab
 tako_resize_pane
+tako_run
+tako_run_defaults
 tako_run_interactive
 tako_run_interactive_status
+tako_run_resolve
 tako_scroll_pane
 tako_select_tab
 tako_send_input
 tako_sessions
 tako_set_title
+tako_settings
 tako_setup
 tako_setup_changes
 tako_setup_mcp
