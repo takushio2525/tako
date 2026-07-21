@@ -102,6 +102,8 @@ tako/
 | スリープ防止 | `tako sleep-guard status` / `tako sleep-guard set --mode <off\|on\|while-agents-running> --power-condition <ac-only\|always>`（IOKit 電源アサーション。#173） |
 | UI テーマ切替 | `tako theme [dark\|light\|toggle]`（引数なしで現在値。settings.json 永続化・GUI 即時反映。タブバー右のボタン / MCP `tako_theme` と 1:1。#217） |
 | 右パネルの orch ビュー | `tako panel --show --view orch`（master + ワーカーツリーの俯瞰。fleet / orch / git の 3 タブ。#217） |
+| Code Runner でファイル実行（#453） | `tako run <file> [--profile <name>]`（ファイル内 `tako:run:` 宣言 or 拡張子既定で新ペイン分割実行。`--list` でプロファイル一覧、`--wait` で完了待ち。MCP `tako_run` / `tako_run_resolve` / `tako_run_defaults` と 1:1） |
+| 拡張子既定コマンド設定 | `tako run-default [ext] [command]`（引数なし = 一覧。`--remove` で削除。MCP `tako_run_defaults` と 1:1） |
 | target 掃除 | `scripts/clean-target.sh`（dry-run。`--run` で実行。cargo clean + worktree prune） |
 
 CI（`.github/workflows/ci.yml`）は macOS / Windows の両ランナーで build + test を回す。

@@ -623,3 +623,8 @@ These apply across tasks and PRs, on top of Task Intake and Acceptance Inspectio
    "レポート作成", "CI修正"). Do not use profile names or role names as tab
    titles — those are already visible elsewhere.
    {TAB_NAMING_CONVENTION}
+11. **Add `tako:run` headers to executable files**: when creating a new file
+   that can be run (scripts, build targets, .command files, etc.), add a
+   `tako:run: <command>` comment in the first few lines. This lets the user
+   execute the file with one click via the preview pane's play button.
+   See `tako_run` tool description for the full syntax.
