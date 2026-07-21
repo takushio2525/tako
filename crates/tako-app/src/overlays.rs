@@ -80,11 +80,9 @@ impl TakoApp {
                                         .items_center()
                                         .text_size(px(13.0))
                                         .when(query.is_empty(), |d| {
-                                            d.child(
-                                                div()
-                                                    .text_color(hsla(theme.text_faint))
-                                                    .child("ペイン・コマンド検索"),
-                                            )
+                                            d.child(div().text_color(hsla(theme.text_faint)).child(
+                                                crate::ui_text::palette::search_placeholder(),
+                                            ))
                                         })
                                         .when(!query.is_empty(), |d| {
                                             d.text_color(hsla(theme.foreground))
@@ -125,7 +123,7 @@ impl TakoApp {
                                             .py(px(8.0))
                                             .text_size(px(12.0))
                                             .text_color(hsla(theme.text_faint))
-                                            .child("該当なし"),
+                                            .child(crate::ui_text::palette::no_match()),
                                     )
                                 })
                                 .children(items.into_iter().take(10).enumerate().map(

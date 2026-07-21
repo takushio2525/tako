@@ -607,7 +607,7 @@ impl TakoApp {
                             .h(px(13.0))
                             .text_color(hsla(theme.text_muted)),
                     )
-                    .child("ペイン・コマンド検索")
+                    .child(crate::ui_text::palette::search_placeholder())
                     .child(div().flex_grow(1.0))
                     .child(
                         div()

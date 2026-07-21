@@ -93,12 +93,8 @@ pub fn overlay_kind(state: &RemoteUiState) -> RemoteOverlay {
 }
 
 /// role の 4 段階（弱い順）。承認ダイアログの選択肢に使う
-const ROLES: &[(&str, &str)] = &[
-    ("observe", "Observe（画面閲覧のみ）"),
-    ("interact", "Interact（+ 入力）"),
-    ("manage", "Manage（+ 閉じる・リサイズ）"),
-    ("admin", "Admin（+ 端末管理）"),
-];
+/// （表示ラベルは `ui_text::remote::role_label` が言語別に解決する）
+const ROLES: &[&str] = &["observe", "interact", "manage", "admin"];
 
 impl TakoApp {
     /// リモート admin state を background で取得して UI に反映する。
@@ -235,7 +231,7 @@ impl TakoApp {
             theme.text_tertiary
         };
         let label = if connected > 0 {
-            format!("{connected} 接続")
+            crate::ui_text::remote::connected_count(connected)
         } else {
             "remote".to_string()
         };
@@ -283,7 +279,9 @@ impl TakoApp {
                             .bg(rgba_alpha(theme.yellow, 0.25))
                             .text_color(hsla(theme.yellow))
                             .text_size(px(10.5))
-                            .child(SharedString::from(format!("承認待ち {pending}"))),
+                            .child(SharedString::from(crate::ui_text::remote::pending_count(
+                                pending,
+                            ))),
                     )
                 })
                 .into_any_element(),
@@ -308,7 +306,10 @@ impl TakoApp {
     fn render_pairing_dialog(&self, req: &Value, cx: &mut Context<Self>) -> gpui::Div {
         let theme = &self.theme;
         let device_id = req["device_id"].as_str().unwrap_or("").to_string();
-        let name = req["name"].as_str().unwrap_or("(名称未設定)").to_string();
+        let name = req["name"]
+            .as_str()
+            .unwrap_or(crate::ui_text::remote::unnamed_device())
+            .to_string();
         let login = req["login"].as_str().unwrap_or("").to_string();
         let node_name = req["node_name"].as_str().unwrap_or("").to_string();
         let requested_role = req["requested_role"]
@@ -325,13 +326,14 @@ impl TakoApp {
             .unwrap_or_else(|| requested_role.clone());
 
         let title = if is_upgrade {
-            "権限の変更を許可しますか？"
+            crate::ui_text::remote::approve_role_change_title()
         } else {
-            "この端末を接続許可しますか？"
+            crate::ui_text::remote::approve_connect_title()
         };
 
         let mut role_buttons = div().flex().flex_col().gap_1();
-        for (value, label) in ROLES {
+        for value in ROLES {
+            let label = crate::ui_text::remote::role_label(value);
             let value = value.to_string();
             let is_sel = selected == value;
             let did = device_id.clone();
@@ -409,17 +411,23 @@ impl TakoApp {
                             .gap_1()
                             .text_size(px(12.5))
                             .text_color(hsla(theme.tab_inactive_foreground))
-                            .child(SharedString::from(format!("端末名: {name}")))
-                            .child(SharedString::from(format!("ユーザー: {login}")))
+                            .child(SharedString::from(crate::ui_text::remote::device_name(
+                                &name,
+                            )))
+                            .child(SharedString::from(crate::ui_text::remote::device_user(
+                                &login,
+                            )))
                             .when(!node_name.is_empty(), |d| {
-                                d.child(SharedString::from(format!("ノード: {node_name}")))
+                                d.child(SharedString::from(crate::ui_text::remote::device_node(
+                                    &node_name,
+                                )))
                             }),
                     )
                     .child(
                         div()
                             .text_size(px(11.5))
                             .text_color(hsla(theme.text_tertiary))
-                            .child("許可する権限を選択:"),
+                            .child(crate::ui_text::remote::choose_role()),
                     )
                     .child(role_buttons)
                     // アクション: 拒否 / 許可
@@ -443,7 +451,7 @@ impl TakoApp {
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.remote_deny(did_deny.clone(), cx);
                                     }))
-                                    .child("拒否"),
+                                    .child(crate::ui_text::remote::deny()),
                             )
                             .child(
                                 div()
@@ -459,7 +467,7 @@ impl TakoApp {
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.remote_approve(did_approve.clone(), cx);
                                     }))
-                                    .child("許可"),
+                                    .child(crate::ui_text::remote::approve()),
                             ),
                     ),
             )
@@ -474,14 +482,14 @@ impl TakoApp {
                 div()
                     .text_size(px(12.0))
                     .text_color(hsla(theme.text_tertiary))
-                    .child("登録された端末はありません"),
+                    .child(crate::ui_text::remote::no_devices()),
             );
         }
         for device in &self.remote.devices {
             let id = device["id"].as_str().unwrap_or("").to_string();
             let name = device["name"]
                 .as_str()
-                .unwrap_or("(名称未設定)")
+                .unwrap_or(crate::ui_text::remote::unnamed_device())
                 .to_string();
             let role = device["role"].as_str().unwrap_or("observe").to_string();
             let connected = self.remote.connections.get(&id).copied().unwrap_or(0) > 0;
@@ -525,7 +533,11 @@ impl TakoApp {
                                             .text_color(hsla(theme.text_tertiary))
                                             .child(SharedString::from(format!(
                                                 "{role}{}",
-                                                if connected { " · 接続中" } else { "" }
+                                                if connected {
+                                                    crate::ui_text::remote::connected_suffix()
+                                                } else {
+                                                    ""
+                                                }
                                             ))),
                                     ),
                             ),
@@ -543,7 +555,7 @@ impl TakoApp {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.remote_revoke(did.clone(), cx);
                             }))
-                            .child("失効"),
+                            .child(crate::ui_text::remote::revoke()),
                     ),
             );
         }
@@ -595,16 +607,17 @@ impl TakoApp {
                                     .text_size(px(13.0))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(hsla(theme.foreground))
-                                    .child("リモート接続端末"),
+                                    .child(crate::ui_text::remote::panel_title()),
                             )
                             .child(
                                 div()
                                     .text_size(px(11.0))
                                     .text_color(hsla(theme.text_tertiary))
-                                    .child(SharedString::from(format!(
-                                        "{} 接続中",
-                                        self.remote.connected_count()
-                                    ))),
+                                    .child(SharedString::from(
+                                        crate::ui_text::remote::connections_now(
+                                            self.remote.connected_count(),
+                                        ),
+                                    )),
                             ),
                     )
                     .child(list)
@@ -627,7 +640,7 @@ impl TakoApp {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.remote_kill_switch(cx);
                             }))
-                            .child("すべての接続を遮断（remote stop）"),
+                            .child(crate::ui_text::remote::stop_all()),
                     ),
             )
     }

@@ -20,9 +20,18 @@ macro_rules! tr {
         }
     };
 }
-pub(crate) use tr;
+// 注: 子モジュールは textual scope（この定義が mod 宣言より前にあること）で tr! を
+// 直接使える。use は不要（unused import になる）。mod 宣言をマクロ定義より前に
+// 移動しないこと
 
+pub mod common;
+pub mod drawer;
+pub mod palette;
+pub mod panel;
+pub mod remote;
+pub mod sidebar;
 pub mod sleep_guard;
+pub mod update;
 
 #[cfg(test)]
 pub(crate) mod tests_support {

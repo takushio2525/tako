@@ -1,6 +1,5 @@
 //! sleep-guard 状態チップ + 詳細ポップオーバーの文言（#440 → #435 で日英化）
 
-use super::tr;
 use tako_control::sleep_guard::{SleepGuardMode, SleepGuardState};
 
 // --- チップ（キー: sleep_guard.chip_*） ---

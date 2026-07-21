@@ -744,11 +744,11 @@ impl TakoApp {
                 let count = updates.stable.as_ref().map_or(0, |_| 1)
                     + updates.test.as_ref().map_or(0, |_| 1);
                 let summary = if count == 2 {
-                    "更新あり（安定版 + テスト版）".to_string()
+                    crate::ui_text::update::banner_both().to_string()
                 } else if let Some(ref s) = updates.stable {
-                    format!("v{} (安定版) が利用可能", s.version)
+                    crate::ui_text::update::banner_stable(&s.version)
                 } else if let Some(ref t) = updates.test {
-                    format!("v{} (test) が利用可能", t.version)
+                    crate::ui_text::update::banner_test(&t.version)
                 } else {
                     return None;
                 };
@@ -812,9 +812,9 @@ impl TakoApp {
                             div()
                                 .text_size(px(10.5))
                                 .text_color(hsla(theme.yellow))
-                                .child(SharedString::from(format!(
-                                "v{ver} はテスト版です（不安定な可能性があります）。更新しますか？"
-                            ))),
+                                .child(SharedString::from(crate::ui_text::update::test_warning(
+                                    &ver,
+                                ))),
                         )
                         .child(
                             div()
@@ -829,7 +829,7 @@ impl TakoApp {
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.confirm_test_update(cx);
                                 }))
-                                .child("続行"),
+                                .child(crate::ui_text::update::cont()),
                         )
                         .child(
                             div()
@@ -845,7 +845,7 @@ impl TakoApp {
                                         super::update_checker::UpdateState::Dismissed;
                                     cx.notify();
                                 }))
-                                .child("キャンセル"),
+                                .child(crate::ui_text::common::cancel()),
                         )
                         .into_any_element(),
                 )
@@ -857,7 +857,9 @@ impl TakoApp {
                 let method_label = match method {
                     super::update_checker::InstallMethod::Homebrew => "Homebrew",
                     super::update_checker::InstallMethod::Zip
-                    | super::update_checker::InstallMethod::BrokenBrew => "ZIP 差し替え",
+                    | super::update_checker::InstallMethod::BrokenBrew => {
+                        crate::ui_text::update::method_zip()
+                    }
                 };
                 Some(
                     pill()
@@ -866,8 +868,10 @@ impl TakoApp {
                             div()
                                 .text_size(px(10.5))
                                 .text_color(hsla(theme.yellow))
-                                .child(SharedString::from(format!(
-                                    "v{ver} ({ch_label}) に更新して再起動しますか？（{method_label}。実行中のプロセスは失われます）"
+                                .child(SharedString::from(crate::ui_text::update::confirm(
+                                    &ver,
+                                    ch_label,
+                                    method_label,
                                 ))),
                         )
                         .child(
@@ -883,7 +887,7 @@ impl TakoApp {
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.start_update(cx);
                                 }))
-                                .child("実行"),
+                                .child(crate::ui_text::update::run()),
                         )
                         .child(
                             div()
@@ -899,7 +903,7 @@ impl TakoApp {
                                         super::update_checker::UpdateState::Dismissed;
                                     cx.notify();
                                 }))
-                                .child("キャンセル"),
+                                .child(crate::ui_text::common::cancel()),
                         )
                         .into_any_element(),
                 )
@@ -958,12 +962,9 @@ impl TakoApp {
                 Some(
                     pill()
                         .id("update-brew-fallback")
-                        .child(
-                            div()
-                                .text_size(px(10.5))
-                                .text_color(hsla(theme.red))
-                                .child(SharedString::from(format!("brew 更新失敗: {err_short}"))),
-                        )
+                        .child(div().text_size(px(10.5)).text_color(hsla(theme.red)).child(
+                            SharedString::from(crate::ui_text::update::brew_failed(&err_short)),
+                        ))
                         .child(
                             div()
                                 .id("update-fallback-zip")
@@ -977,7 +978,7 @@ impl TakoApp {
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.start_zip_fallback(cx);
                                 }))
-                                .child("zip で更新"),
+                                .child(crate::ui_text::update::update_via_zip()),
                         )
                         .child(
                             div()
@@ -1060,7 +1061,8 @@ impl TakoApp {
             super::update_checker::UpdateState::ConfirmPending(info) => info.clone(),
             _ => return,
         };
-        self.update_state = super::update_checker::UpdateState::Updating("更新中...".into());
+        self.update_state =
+            super::update_checker::UpdateState::Updating(crate::ui_text::update::updating().into());
         cx.notify();
         let info_for_fallback = info.clone();
         cx.spawn(async move |this, cx| {
@@ -1071,15 +1073,15 @@ impl TakoApp {
             let _ = this.update(cx, |app: &mut TakoApp, cx| {
                 match result {
                     Ok(msg) => {
-                        app.update_state = super::update_checker::UpdateState::Done(format!(
-                            "{msg} — 再起動中..."
-                        ));
+                        app.update_state = super::update_checker::UpdateState::Done(
+                            crate::ui_text::update::restarting(&msg),
+                        );
                         cx.notify();
                         app.save_layout();
                         if let Err(e) = super::update_checker::restart_app() {
-                            app.update_state = super::update_checker::UpdateState::Failed(format!(
-                                "更新は完了しましたが再起動に失敗: {e}"
-                            ));
+                            app.update_state = super::update_checker::UpdateState::Failed(
+                                crate::ui_text::update::restart_failed(&e.to_string()),
+                            );
                             cx.notify();
                             return;
                         }
@@ -1112,8 +1114,9 @@ impl TakoApp {
             super::update_checker::UpdateState::BrewFailedFallback { info, .. } => info.clone(),
             _ => return,
         };
-        self.update_state =
-            super::update_checker::UpdateState::Updating("zip フォールバックで更新中...".into());
+        self.update_state = super::update_checker::UpdateState::Updating(
+            crate::ui_text::update::updating_zip_fallback().into(),
+        );
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -1123,15 +1126,15 @@ impl TakoApp {
             let _ = this.update(cx, |app: &mut TakoApp, cx| {
                 match result {
                     Ok(msg) => {
-                        app.update_state = super::update_checker::UpdateState::Done(format!(
-                            "{msg} — 再起動中..."
-                        ));
+                        app.update_state = super::update_checker::UpdateState::Done(
+                            crate::ui_text::update::restarting(&msg),
+                        );
                         cx.notify();
                         app.save_layout();
                         if let Err(e) = super::update_checker::restart_app() {
-                            app.update_state = super::update_checker::UpdateState::Failed(format!(
-                                "更新は完了しましたが再起動に失敗: {e}"
-                            ));
+                            app.update_state = super::update_checker::UpdateState::Failed(
+                                crate::ui_text::update::restart_failed(&e.to_string()),
+                            );
                             cx.notify();
                             return;
                         }
@@ -1163,7 +1166,9 @@ impl TakoApp {
         let method_label = match method {
             super::update_checker::InstallMethod::Homebrew => "brew",
             super::update_checker::InstallMethod::Zip => "zip",
-            super::update_checker::InstallMethod::BrokenBrew => "zip (brew 破損)",
+            super::update_checker::InstallMethod::BrokenBrew => {
+                crate::ui_text::update::method_zip_broken()
+            }
         };
 
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
@@ -1177,8 +1182,7 @@ impl TakoApp {
                 .mb(px(4.0))
                 .border_b_1()
                 .border_color(hsla(theme.border_subtle))
-                .child(SharedString::from(format!(
-                    "現在: v{} ({}) / {}",
+                .child(SharedString::from(crate::ui_text::update::current_line(
                     super::update_checker::CURRENT_VERSION,
                     if super::update_checker::CURRENT_VERSION.contains("-test.") {
                         "test"
@@ -1233,7 +1237,7 @@ impl TakoApp {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.show_update_confirm_for_channel(info_clone.clone(), cx);
                             }))
-                            .child("更新"),
+                            .child(crate::ui_text::common::update()),
                     )
                     .into_any_element(),
             );
@@ -1260,7 +1264,7 @@ impl TakoApp {
                             .flex_1()
                             .text_size(px(10.5))
                             .text_color(hsla(theme.text_tertiary))
-                            .child("最新版です"),
+                            .child(crate::ui_text::update::latest()),
                     )
                     .into_any_element(),
             );
@@ -1309,7 +1313,7 @@ impl TakoApp {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.show_update_confirm_for_channel(info_clone.clone(), cx);
                             }))
-                            .child("更新"),
+                            .child(crate::ui_text::common::update()),
                     )
                     .into_any_element(),
             );
@@ -1336,7 +1340,7 @@ impl TakoApp {
                             .flex_1()
                             .text_size(px(10.5))
                             .text_color(hsla(theme.text_tertiary))
-                            .child("テスト版なし"),
+                            .child(crate::ui_text::update::no_test_build()),
                     )
                     .into_any_element(),
             );

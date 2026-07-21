@@ -366,14 +366,9 @@ pub(crate) fn rgba_alpha(c: tako_core::Rgb, a: f32) -> Rgba {
     Rgba { a, ..rgba(c) }
 }
 
-/// 経過秒の相対表記（tmuxview の作成日時表示用）
+/// 経過秒の相対表記（tmuxview の作成日時表示用。文言は ui_text::common）
 fn format_age(seconds: i64) -> String {
-    match seconds.max(0) {
-        s if s < 60 => format!("{s} 秒前"),
-        s if s < 3600 => format!("{} 分前", s / 60),
-        s if s < 86400 => format!("{} 時間前", s / 3600),
-        s => format!("{} 日前", s / 86400),
-    }
+    crate::ui_text::common::format_age(seconds)
 }
 
 fn hsla_alpha(c: tako_core::Rgb, a: f32) -> Hsla {
@@ -3209,9 +3204,12 @@ impl TakoApp {
                     .get(&p.id())
                     .and_then(|s| s.cwd())
                     .and_then(|c| c.file_name())
-                    .map(|n| format!("ターミナル: {}", n.to_string_lossy()))
+                    .map(|n| {
+                        let base = crate::ui_text::common::terminal_fallback_title();
+                        format!("{base}: {}", n.to_string_lossy())
+                    })
             })
-            .unwrap_or_else(|| "ターミナル".to_string())
+            .unwrap_or_else(|| crate::ui_text::common::terminal_fallback_title().to_string())
     }
 
     /// バックグラウンドペインのコマンド状態（ターミナル不在なら Unknown）
@@ -5271,7 +5269,7 @@ impl TakoApp {
                             .and_then(|s| s.title())
                             .map(str::to_string)
                     })
-                    .unwrap_or_else(|| "ターミナル".into());
+                    .unwrap_or_else(|| crate::ui_text::common::terminal_fallback_title().into());
                 let state = self
                     .terminals
                     .get(&pane.id())
@@ -10628,7 +10626,7 @@ impl TakoApp {
                     .and_then(|s| s.title())
                     .map(str::to_string)
             })
-            .unwrap_or_else(|| "ターミナル".to_string());
+            .unwrap_or_else(|| crate::ui_text::common::terminal_fallback_title().to_string());
         // role ラベル（カンプ: バッジではなく素のテキスト 9.5px 600 tracking 0.06em）
         let is_master = pane_role.as_deref().is_some_and(|r| {
             r.contains("orchestrator-master") || r == "master" || r.starts_with("master:")
