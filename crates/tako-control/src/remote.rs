@@ -65,6 +65,15 @@ const DEFAULT_PORT: u16 = 7749;
 const MAX_BODY_BYTES: u64 = 1024 * 1024;
 /// interact idle session の定期スイープ間隔
 const SESSION_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// #445: TAKO_ISOLATED が有効かどうか。隔離モードでは他インスタンスの
+/// state ファイルを cleanup しない二重防御に使う
+fn is_isolated() -> bool {
+    matches!(
+        std::env::var("TAKO_ISOLATED").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
 // --- PID / トークン / ポートファイルのパス ---
 // P0-3: 共有 /tmp から <data_dir>/remote/（0700）へ移動。作成時から 0600。
 
@@ -1150,7 +1159,10 @@ pub fn daemon_status() -> Value {
     };
     let pid_num = pid_info.pid;
     if !is_process_alive(pid_num) {
-        cleanup_state_files();
+        // #445: TAKO_ISOLATED が有効なら他インスタンスの state を消さない（二重防御）
+        if !is_isolated() {
+            cleanup_state_files();
+        }
         return json!({ "running": false });
     }
     let port = std::fs::read_to_string(port_path())
