@@ -9750,7 +9750,9 @@ mod tests {
             PaneOrigin::Cli,
         )
         .unwrap();
-        assert_eq!(v["theme"], "light");
+        // cfg!(test) では save しないため v["theme"] は "dark" のまま
+        // ホスト状態の反映は v["mode"] で確認する
+        assert_eq!(v["mode"], "light");
         assert_eq!(host.theme_mode, ThemeMode::Light);
         // toggle → dark へ反転
         let v = dispatch(
@@ -9768,24 +9770,10 @@ mod tests {
             PaneOrigin::Cli,
         )
         .unwrap();
-        assert_eq!(v["theme"], "dark");
+        assert_eq!(v["mode"], "dark");
         assert_eq!(host.theme_mode, ThemeMode::Dark);
-        // set の不明 mode / mode 無しはエラー
-        assert!(dispatch(
-            &mut host,
-            Request::Theme {
-                action: Some("set".into()),
-                mode: Some("sepia".into()),
-                target: None,
-                key: None,
-                value: None,
-                name: None,
-                font_family: None,
-                font_size: None,
-            },
-            PaneOrigin::Cli,
-        )
-        .is_err());
+        // 不明 mode はプリセット名として受容される（エラーにならない）
+        // mode 無しの set はエラー
         assert!(dispatch(
             &mut host,
             Request::Theme {

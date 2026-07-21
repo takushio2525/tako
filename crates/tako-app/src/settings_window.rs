@@ -1,5 +1,6 @@
 //! 設定画面（Issue #459）— 独立 GPUI ウィンドウ
 
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use tako_control::settings;
 use tako_core::theme::{Rgb, Theme, ThemeMode};
@@ -60,6 +61,13 @@ pub struct SettingsWindow {
     tab: SettingsTab,
     settings: settings::Settings,
     expanded_categories: Vec<bool>,
+    // M4: Code Runner
+    new_ext: String,
+    new_cmd: String,
+    // M6: Advanced
+    advanced_buffer: String,
+    advanced_error: Option<String>,
+    advanced_saved: bool,
 }
 
 impl SettingsWindow {
@@ -91,6 +99,11 @@ impl SettingsWindow {
             tab: tab.unwrap_or(SettingsTab::General),
             settings,
             expanded_categories: expanded,
+            new_ext: String::new(),
+            new_cmd: String::new(),
+            advanced_buffer: String::new(),
+            advanced_error: None,
+            advanced_saved: false,
         }
     }
 
@@ -104,6 +117,19 @@ impl SettingsWindow {
                 );
             });
         }
+    }
+
+    fn dispatch_query(
+        &self,
+        request: tako_control::protocol::Request,
+        cx: &mut Context<Self>,
+    ) -> Option<serde_json::Value> {
+        self.tako_app.upgrade().and_then(|app| {
+            app.update(cx, |app, _cx| {
+                tako_control::dispatch::dispatch(app, request, tako_core::pane::PaneOrigin::User)
+                    .ok()
+            })
+        })
     }
 
     fn theme(&self) -> Theme {
@@ -171,7 +197,11 @@ impl SettingsWindow {
         let content = match self.tab {
             SettingsTab::General => self.render_general_tab(cx),
             SettingsTab::Appearance => self.render_appearance_tab(cx),
-            _ => self.render_placeholder_tab(),
+            SettingsTab::Runner => self.render_runner_tab(cx),
+            SettingsTab::Setup => self.render_setup_tab(cx),
+            SettingsTab::Sleep => self.render_sleep_tab(cx),
+            SettingsTab::Remote => self.render_remote_tab(cx),
+            SettingsTab::Advanced => self.render_advanced_tab(cx),
         };
         div()
             .id("settings-content")
@@ -181,14 +211,6 @@ impl SettingsWindow {
             .bg(to_hsla(theme.surface_0))
             .p_4()
             .child(content)
-    }
-
-    fn render_placeholder_tab(&self) -> Div {
-        let theme = self.theme();
-        div()
-            .text_color(to_hsla(theme.text_muted))
-            .text_size(px(14.))
-            .child(txt::placeholder_coming_soon())
     }
 
     // --- M2: 一般タブ ---
@@ -559,9 +581,956 @@ impl SettingsWindow {
             .child(font_label);
         content
     }
+
+    // --- M4: Code Runner タブ ---
+
+    fn render_runner_tab(&self, cx: &mut Context<Self>) -> Div {
+        use tako_control::protocol::Request;
+        let theme = self.theme();
+
+        let merged = tako_core::merged_defaults(&self.settings.runner_defaults);
+
+        let mut table = div().flex().flex_col().gap_1();
+
+        // ヘッダ行
+        table = table.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .py(px(4.))
+                .child(
+                    div()
+                        .w(px(60.))
+                        .text_color(to_hsla(theme.text_secondary))
+                        .text_size(px(11.))
+                        .child(txt::runner_col_ext()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_color(to_hsla(theme.text_secondary))
+                        .text_size(px(11.))
+                        .child(txt::runner_col_command()),
+                )
+                .child(
+                    div()
+                        .w(px(60.))
+                        .text_color(to_hsla(theme.text_secondary))
+                        .text_size(px(11.))
+                        .child(txt::runner_col_source()),
+                )
+                .child(div().w(px(50.))),
+        );
+
+        // データ行
+        for (ext, cmd) in &merged {
+            let is_user = self.settings.runner_defaults.contains_key(ext);
+            let source_label = if is_user {
+                txt::runner_source_user()
+            } else {
+                txt::runner_source_builtin()
+            };
+            let source_color = if is_user {
+                to_hsla(theme.accent)
+            } else {
+                to_hsla(theme.text_muted)
+            };
+            let ext_owned = ext.clone();
+            table = table.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py(px(2.))
+                    .child(
+                        div()
+                            .w(px(60.))
+                            .text_color(to_hsla(theme.foreground))
+                            .text_size(px(12.))
+                            .child(ext.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(to_hsla(theme.text_muted))
+                            .text_size(px(12.))
+                            .overflow_x_hidden()
+                            .child(cmd.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(60.))
+                            .text_color(source_color)
+                            .text_size(px(11.))
+                            .child(source_label),
+                    )
+                    .child({
+                        let action_div = div()
+                            .id(SharedString::from(format!("act-rd-{ext}")))
+                            .w(px(50.));
+                        if is_user {
+                            action_div
+                                .text_color(to_hsla(theme.text_faint))
+                                .text_size(px(11.))
+                                .cursor_pointer()
+                                .child(txt::button_reset())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.dispatch(
+                                        Request::RunnerDefaults {
+                                            ext: Some(ext_owned.clone()),
+                                            command: None,
+                                            remove: true,
+                                        },
+                                        cx,
+                                    );
+                                }))
+                        } else {
+                            action_div
+                        }
+                    }),
+            );
+        }
+
+        // 新規追加セクション
+        let new_ext = self.new_ext.clone();
+        let new_cmd = self.new_cmd.clone();
+        let can_add = !new_ext.is_empty() && !new_cmd.is_empty();
+        let add_section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .py_2()
+            .child(
+                div()
+                    .text_color(to_hsla(theme.foreground))
+                    .text_size(px(13.))
+                    .child(txt::runner_add_header()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("runner-new-ext")
+                            .w(px(60.))
+                            .px_1()
+                            .py(px(2.))
+                            .rounded(px(4.))
+                            .bg(to_hsla(theme.chip_surface))
+                            .border_1()
+                            .border_color(to_hsla(theme.border_subtle))
+                            .text_color(to_hsla(theme.foreground))
+                            .text_size(px(12.))
+                            .cursor_pointer()
+                            .child(if new_ext.is_empty() {
+                                txt::runner_col_ext().to_string()
+                            } else {
+                                new_ext.clone()
+                            })
+                            .on_click(cx.listener(|this, _, _, _cx| {
+                                this.new_ext = String::new();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("runner-new-cmd")
+                            .flex_1()
+                            .px_1()
+                            .py(px(2.))
+                            .rounded(px(4.))
+                            .bg(to_hsla(theme.chip_surface))
+                            .border_1()
+                            .border_color(to_hsla(theme.border_subtle))
+                            .text_color(to_hsla(theme.foreground))
+                            .text_size(px(12.))
+                            .cursor_pointer()
+                            .child(if new_cmd.is_empty() {
+                                txt::runner_col_command().to_string()
+                            } else {
+                                new_cmd.clone()
+                            })
+                            .on_click(cx.listener(|this, _, _, _cx| {
+                                this.new_cmd = String::new();
+                            })),
+                    )
+                    .child({
+                        let btn = div()
+                            .id("runner-add-btn")
+                            .px_2()
+                            .py(px(4.))
+                            .rounded(px(4.))
+                            .text_size(px(12.))
+                            .child(txt::runner_add_btn());
+                        if can_add {
+                            let ext_to_add = new_ext.clone();
+                            let cmd_to_add = new_cmd.clone();
+                            btn.bg(to_hsla(theme.accent))
+                                .text_color(gpui::rgb(0xffffff))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.dispatch(
+                                        Request::RunnerDefaults {
+                                            ext: Some(ext_to_add.clone()),
+                                            command: Some(cmd_to_add.clone()),
+                                            remove: false,
+                                        },
+                                        cx,
+                                    );
+                                    this.new_ext.clear();
+                                    this.new_cmd.clear();
+                                }))
+                        } else {
+                            btn.bg(to_hsla(theme.border_default))
+                                .text_color(to_hsla(theme.text_faint))
+                        }
+                    }),
+            );
+
+        // 変数リファレンス
+        let help = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .py_2()
+            .child(
+                div()
+                    .text_color(to_hsla(theme.foreground))
+                    .text_size(px(13.))
+                    .child(txt::runner_help_header()),
+            )
+            .children(
+                [
+                    ("${file}", txt::runner_var_file()),
+                    ("${fileDir}", txt::runner_var_filedir()),
+                    ("${fileBase}", txt::runner_var_filebase()),
+                    ("${fileNoExt}", txt::runner_var_filenoext()),
+                    ("${ext}", txt::runner_var_ext()),
+                ]
+                .into_iter()
+                .map(|(var, desc)| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .pl_2()
+                        .child(
+                            div()
+                                .w(px(100.))
+                                .text_color(to_hsla(theme.accent))
+                                .text_size(px(12.))
+                                .child(var),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_color(to_hsla(theme.text_muted))
+                                .text_size(px(12.))
+                                .child(desc),
+                        )
+                }),
+            )
+            .child(
+                div()
+                    .pt_1()
+                    .text_color(to_hsla(theme.text_faint))
+                    .text_size(px(11.))
+                    .child(txt::runner_resolution_help()),
+            );
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_color(to_hsla(theme.foreground))
+                    .text_size(px(14.))
+                    .child(txt::runner_header()),
+            )
+            .child(table)
+            .child(add_section)
+            .child(help)
+    }
+
+    // --- M5: セットアップタブ ---
+
+    fn render_setup_tab(&self, cx: &mut Context<Self>) -> Div {
+        use tako_control::protocol::Request;
+        let theme = self.theme();
+
+        // エージェント CLI 検出
+        let agents_section = {
+            let cli_names = ["claude", "codex", "agy"];
+            let mut rows = div().flex().flex_col().gap_1();
+            for cli in cli_names {
+                let found = std::process::Command::new("which")
+                    .arg(cli)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                let status_text = if found {
+                    txt::setup_installed()
+                } else {
+                    txt::setup_not_installed()
+                };
+                let status_color = if found {
+                    to_hsla(theme.green)
+                } else {
+                    to_hsla(theme.text_faint)
+                };
+                rows = rows.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .py(px(2.))
+                        .child(
+                            div()
+                                .w(px(80.))
+                                .text_color(to_hsla(theme.foreground))
+                                .text_size(px(12.))
+                                .child(cli),
+                        )
+                        .child(
+                            div()
+                                .text_color(status_color)
+                                .text_size(px(12.))
+                                .child(status_text),
+                        ),
+                );
+            }
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(section_header(txt::setup_agents_header(), &theme))
+                .child(rows)
+        };
+
+        // FDA 状態
+        let fda_section = {
+            let fda_result = self.dispatch_query(
+                Request::Fda {
+                    action: Some("status".into()),
+                },
+                // dispatch_query の引数型を考慮
+                // HACK: cx を一旦 workaround — 後述 immutable borrow 問題
+                // TODO: この関数は &self なので dispatch_query も &self で OK
+                cx,
+            );
+            let fda_status = fda_result
+                .as_ref()
+                .and_then(|v| v.get("full_disk_access"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let fda_color = if fda_status == "granted" {
+                to_hsla(theme.green)
+            } else {
+                to_hsla(theme.yellow)
+            };
+
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(section_header(txt::setup_fda_header(), &theme))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_color(fda_color)
+                                .text_size(px(12.))
+                                .child(fda_status.to_string()),
+                        )
+                        .child(
+                            div()
+                                .id("fda-open")
+                                .px_2()
+                                .py(px(4.))
+                                .rounded(px(4.))
+                                .bg(to_hsla(theme.chip_surface))
+                                .text_color(to_hsla(theme.foreground))
+                                .text_size(px(12.))
+                                .cursor_pointer()
+                                .child(txt::setup_fda_open())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.dispatch(
+                                        Request::Fda {
+                                            action: Some("open".into()),
+                                        },
+                                        cx,
+                                    );
+                                })),
+                        ),
+                )
+        };
+
+        // MCP 登録
+        let mcp_section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(section_header(txt::setup_mcp_header(), &theme))
+            .child(
+                div()
+                    .id("setup-mcp-register")
+                    .px_2()
+                    .py(px(4.))
+                    .rounded(px(4.))
+                    .bg(to_hsla(theme.chip_surface))
+                    .text_color(to_hsla(theme.foreground))
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .child(txt::setup_mcp_register())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.dispatch(
+                            Request::SetupMcp {
+                                scope: None,
+                                pane: None,
+                            },
+                            cx,
+                        );
+                    })),
+            );
+
+        // ルール同期
+        let rules_section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(section_header(txt::setup_rules_header(), &theme))
+            .child(
+                div()
+                    .id("setup-rules-sync")
+                    .px_2()
+                    .py(px(4.))
+                    .rounded(px(4.))
+                    .bg(to_hsla(theme.chip_surface))
+                    .text_color(to_hsla(theme.foreground))
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .child(txt::setup_rules_sync())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.dispatch(
+                            Request::AgentsSyncRules {
+                                action: Some("sync".into()),
+                                source: None,
+                                targets: None,
+                            },
+                            cx,
+                        );
+                    })),
+            );
+
+        // tako setup 実行ボタン
+        let run_setup = div().py_2().child(
+            div()
+                .id("setup-run")
+                .px_2()
+                .py(px(4.))
+                .rounded(px(4.))
+                .bg(to_hsla(theme.accent))
+                .text_color(gpui::rgb(0xffffff))
+                .text_size(px(12.))
+                .cursor_pointer()
+                .child(txt::setup_run_btn())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.dispatch(
+                        Request::RunInteractive {
+                            command: "tako setup".into(),
+                            pane: None,
+                            tab: None,
+                            input_hint: None,
+                            direction: None,
+                            ratio: None,
+                            auto_close: None,
+                        },
+                        cx,
+                    );
+                })),
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(agents_section)
+            .child(fda_section)
+            .child(mcp_section)
+            .child(rules_section)
+            .child(run_setup)
+    }
+
+    // --- M6: スリープ防止タブ ---
+
+    fn render_sleep_tab(&self, cx: &mut Context<Self>) -> Div {
+        use tako_control::protocol::Request;
+        let theme = self.theme();
+        let s = &self.settings;
+
+        let mode_str = s.sleep_guard_mode.as_str();
+        let power_str = s.sleep_guard_power.as_str();
+        let lid_str = s.lid_sleep_mode.as_str();
+
+        let mode_section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(section_header(txt::sleep_mode_header(), &theme))
+            .child(render_radio_option(
+                "sg-off",
+                txt::sleep_mode_off(),
+                mode_str == "off",
+                &theme,
+                cx.listener(|this, _, _, cx| {
+                    this.dispatch(
+                        Request::SleepGuard {
+                            action: Some("set".into()),
+                            mode: Some("off".into()),
+                            power_condition: None,
+                            lid_sleep_mode: None,
+                        },
+                        cx,
+                    );
+                }),
+            ))
+            .child(render_radio_option(
+                "sg-on",
+                txt::sleep_mode_on(),
+                mode_str == "on",
+                &theme,
+                cx.listener(|this, _, _, cx| {
+                    this.dispatch(
+                        Request::SleepGuard {
+                            action: Some("set".into()),
+                            mode: Some("on".into()),
+                            power_condition: None,
+                            lid_sleep_mode: None,
+                        },
+                        cx,
+                    );
+                }),
+            ))
+            .child(render_radio_option(
+                "sg-agents",
+                txt::sleep_mode_agents(),
+                mode_str == "while-agents-running",
+                &theme,
+                cx.listener(|this, _, _, cx| {
+                    this.dispatch(
+                        Request::SleepGuard {
+                            action: Some("set".into()),
+                            mode: Some("while-agents-running".into()),
+                            power_condition: None,
+                            lid_sleep_mode: None,
+                        },
+                        cx,
+                    );
+                }),
+            ));
+
+        let power_section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(section_header(txt::sleep_power_header(), &theme))
+            .child(render_radio_option(
+                "sp-ac",
+                txt::sleep_power_ac(),
+                power_str == "ac-only",
+                &theme,
+                cx.listener(|this, _, _, cx| {
+                    this.dispatch(
+                        Request::SleepGuard {
+                            action: Some("set".into()),
+                            mode: None,
+                            power_condition: Some("ac-only".into()),
+                            lid_sleep_mode: None,
+                        },
+                        cx,
+                    );
+                }),
+            ))
+            .child(render_radio_option(
+                "sp-always",
+                txt::sleep_power_always(),
+                power_str == "always",
+                &theme,
+                cx.listener(|this, _, _, cx| {
+                    this.dispatch(
+                        Request::SleepGuard {
+                            action: Some("set".into()),
+                            mode: None,
+                            power_condition: Some("always".into()),
+                            lid_sleep_mode: None,
+                        },
+                        cx,
+                    );
+                }),
+            ));
+
+        let lid_section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(section_header(txt::sleep_lid_header(), &theme))
+            .child(render_radio_option(
+                "lid-off",
+                txt::sleep_mode_off(),
+                lid_str == "off",
+                &theme,
+                cx.listener(|this, _, _, cx| {
+                    this.dispatch(
+                        Request::SleepGuard {
+                            action: Some("set".into()),
+                            mode: None,
+                            power_condition: None,
+                            lid_sleep_mode: Some("off".into()),
+                        },
+                        cx,
+                    );
+                }),
+            ))
+            .child(render_radio_option(
+                "lid-agents",
+                txt::sleep_mode_agents(),
+                lid_str == "while-agents-running",
+                &theme,
+                cx.listener(|this, _, _, cx| {
+                    this.dispatch(
+                        Request::SleepGuard {
+                            action: Some("set".into()),
+                            mode: None,
+                            power_condition: None,
+                            lid_sleep_mode: Some("while-agents-running".into()),
+                        },
+                        cx,
+                    );
+                }),
+            ));
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(mode_section)
+            .child(power_section)
+            .child(lid_section)
+    }
+
+    // --- M6: リモートタブ ---
+
+    fn render_remote_tab(&self, cx: &mut Context<Self>) -> Div {
+        use tako_control::protocol::Request;
+        let theme = self.theme();
+
+        let status_result = self.dispatch_query(Request::RemoteStatus, cx);
+        let is_running = status_result
+            .as_ref()
+            .and_then(|v| v.get("running"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let url = status_result
+            .as_ref()
+            .and_then(|v| v.get("url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let status_color = if is_running {
+            to_hsla(theme.green)
+        } else {
+            to_hsla(theme.text_faint)
+        };
+        let status_text = if is_running {
+            txt::remote_status_running()
+        } else {
+            txt::remote_status_stopped()
+        };
+
+        let daemon_section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(section_header(txt::remote_daemon_header(), &theme))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_color(status_color)
+                            .text_size(px(12.))
+                            .child(status_text),
+                    )
+                    .when(!url.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_color(to_hsla(theme.text_muted))
+                                .text_size(px(11.))
+                                .child(url),
+                        )
+                    }),
+            )
+            .child(div().flex().gap_2().child(if is_running {
+                div()
+                    .id("remote-stop")
+                    .px_2()
+                    .py(px(4.))
+                    .rounded(px(4.))
+                    .bg(to_hsla(theme.danger_surface))
+                    .text_color(to_hsla(theme.red))
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .child(txt::remote_stop())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.dispatch(Request::RemoteStop { force: false }, cx);
+                    }))
+            } else {
+                div()
+                    .id("remote-start")
+                    .px_2()
+                    .py(px(4.))
+                    .rounded(px(4.))
+                    .bg(to_hsla(theme.accent))
+                    .text_color(gpui::rgb(0xffffff))
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .child(txt::remote_start())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.dispatch(Request::RemoteStart {}, cx);
+                    }))
+            }));
+
+        div().flex().flex_col().gap_3().child(daemon_section)
+    }
+
+    // --- M6: 高度タブ ---
+
+    fn render_advanced_tab(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let settings_path = settings::settings_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let config_path = tako_core::paths::data_dir()
+            .map(|d| d.join("config.yaml").display().to_string())
+            .unwrap_or_default();
+        let profiles_path = tako_core::paths::data_dir()
+            .map(|d| d.join("profiles").display().to_string())
+            .unwrap_or_default();
+
+        // エディタセクション
+        let buffer_display = if self.advanced_buffer.is_empty() {
+            serde_json::to_string_pretty(&self.settings).unwrap_or_default()
+        } else {
+            self.advanced_buffer.clone()
+        };
+
+        let editor_section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(section_header(txt::advanced_editor_header(), &theme))
+            .child(
+                div()
+                    .text_color(to_hsla(theme.text_muted))
+                    .text_size(px(11.))
+                    .child(settings_path.clone()),
+            )
+            .child(
+                div()
+                    .id("adv-editor-area")
+                    .w_full()
+                    .min_h(px(200.))
+                    .max_h(px(400.))
+                    .overflow_y_scroll()
+                    .rounded(px(4.))
+                    .bg(to_hsla(theme.crust))
+                    .border_1()
+                    .border_color(to_hsla(theme.border_subtle))
+                    .p_2()
+                    .child(
+                        div()
+                            .text_color(to_hsla(theme.foreground))
+                            .text_size(px(12.))
+                            .child(buffer_display),
+                    ),
+            )
+            .when(self.advanced_error.is_some(), |d| {
+                d.child(
+                    div()
+                        .text_color(to_hsla(theme.red))
+                        .text_size(px(12.))
+                        .child(format!(
+                            "{}: {}",
+                            txt::advanced_parse_error(),
+                            self.advanced_error.as_deref().unwrap_or("")
+                        )),
+                )
+            })
+            .when(self.advanced_saved, |d| {
+                d.child(
+                    div()
+                        .text_color(to_hsla(theme.green))
+                        .text_size(px(12.))
+                        .child(txt::advanced_saved()),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("adv-reload")
+                            .px_2()
+                            .py(px(4.))
+                            .rounded(px(4.))
+                            .bg(to_hsla(theme.chip_surface))
+                            .text_color(to_hsla(theme.foreground))
+                            .text_size(px(12.))
+                            .cursor_pointer()
+                            .child(txt::advanced_reload())
+                            .on_click(cx.listener(|this, _, _, _cx| {
+                                this.settings = settings::load();
+                                this.advanced_buffer.clear();
+                                this.advanced_error = None;
+                                this.advanced_saved = false;
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("adv-reveal")
+                            .px_2()
+                            .py(px(4.))
+                            .rounded(px(4.))
+                            .bg(to_hsla(theme.chip_surface))
+                            .text_color(to_hsla(theme.foreground))
+                            .text_size(px(12.))
+                            .cursor_pointer()
+                            .child(txt::advanced_open_finder())
+                            .on_click(cx.listener(move |_this, _, _, _cx| {
+                                if let Some(path) = settings::settings_path() {
+                                    let _ = std::process::Command::new("open")
+                                        .arg("-R")
+                                        .arg(&path)
+                                        .spawn();
+                                }
+                            })),
+                    ),
+            );
+
+        // 関連ファイルセクション
+        let related = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(section_header(txt::advanced_related_header(), &theme))
+            .child(file_path_row("config.yaml", &config_path, &theme))
+            .child(file_path_row("profiles/", &profiles_path, &theme));
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(editor_section)
+            .child(related)
+    }
 }
 
 // --- ヘルパー ---
+
+fn section_header(text: &str, theme: &Theme) -> Div {
+    div()
+        .text_color(to_hsla(theme.foreground))
+        .text_size(px(13.))
+        .pb(px(2.))
+        .child(text.to_string())
+}
+
+fn file_path_row(label: &str, path: &str, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .pl_2()
+        .child(
+            div()
+                .w(px(100.))
+                .text_color(to_hsla(theme.foreground))
+                .text_size(px(12.))
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .text_color(to_hsla(theme.text_muted))
+                .text_size(px(11.))
+                .child(path.to_string()),
+        )
+}
+
+fn render_radio_option(
+    id: &str,
+    label: &str,
+    is_active: bool,
+    theme: &Theme,
+    handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let dot_color = if is_active {
+        to_hsla(theme.accent)
+    } else {
+        to_hsla(theme.border_default)
+    };
+    let text_color = if is_active {
+        to_hsla(theme.foreground)
+    } else {
+        to_hsla(theme.text_muted)
+    };
+    div()
+        .id(SharedString::from(id.to_string()))
+        .flex()
+        .items_center()
+        .gap_2()
+        .py(px(2.))
+        .pl_2()
+        .cursor_pointer()
+        .child(
+            div()
+                .w(px(12.))
+                .h(px(12.))
+                .rounded(px(6.))
+                .border_1()
+                .border_color(dot_color)
+                .when(is_active, |d| {
+                    d.child(
+                        div()
+                            .w(px(6.))
+                            .h(px(6.))
+                            .mt(px(2.))
+                            .ml(px(2.))
+                            .rounded(px(3.))
+                            .bg(to_hsla(theme.accent)),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .text_color(text_color)
+                .text_size(px(12.))
+                .child(label.to_string()),
+        )
+        .on_click(handler)
+}
 
 fn to_hsla(c: Rgb) -> Hsla {
     gpui::rgb(((c.r as u32) << 16) | ((c.g as u32) << 8) | (c.b as u32)).into()
