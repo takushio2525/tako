@@ -12536,8 +12536,8 @@ impl PreviewHost for TakoApp {
 }
 
 impl RemoteHost for TakoApp {
-    fn remote_start(&mut self, port: Option<u16>) -> Result<serde_json::Value, String> {
-        tako_control::remote::spawn_daemon(port)
+    fn remote_start(&mut self) -> Result<serde_json::Value, String> {
+        tako_control::remote::spawn_daemon()
     }
 
     fn remote_stop(&mut self) -> Result<serde_json::Value, String> {

@@ -447,7 +447,7 @@ pub trait WebViewHost {
 pub trait RemoteHost {
     /// リモートアクセス API サーバーを起動する。成功時は状態 JSON を返す。
     /// transport は Tailscale Serve のみ。未セットアップなら不足項目を列挙して拒否する（#282）
-    fn remote_start(&mut self, _port: Option<u16>) -> Result<Value, String> {
+    fn remote_start(&mut self) -> Result<Value, String> {
         Err("リモートアクセス API はこの環境では使えない".into())
     }
     /// リモートアクセス API サーバーを停止する

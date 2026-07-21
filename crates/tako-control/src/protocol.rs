@@ -699,11 +699,10 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<usize>,
     },
-    /// リモートアクセス API サーバーの起動。`port` 省略時は 7749。
-    /// transport は Tailscale Serve のみ（tailnet 内限定・WireGuard E2E 暗号化。#282）。
+    /// リモートアクセス API サーバーの起動（UDS + Tailscale Serve。#287 P1-2）。
     /// Tailscale が未セットアップ（未導入・未ログイン・HTTPS 未有効等）なら
     /// 不足項目を列挙して起動を拒否し、`tako remote setup` へ誘導する
-    RemoteStart { port: Option<u16> },
+    RemoteStart {},
     /// リモートアクセス API サーバーの停止。`force` = true で SIGKILL
     RemoteStop {
         #[serde(default)]
@@ -735,7 +734,7 @@ pub enum Request {
     /// リモートアクセスの対話セットアップ（Issue #286 弾6）。
     /// Tailscale の導入状態を検証し、serve 設定と QR PNG 生成まで行う。
     /// `action`:
-    /// - "run": ウィザードを実行（非対話。`answers` で制御。既定ポートは 7749）
+    /// - "run": ウィザードを実行（非対話。`answers` で制御）
     /// - "check": setup 状態のチェックのみ（変更なし）
     RemoteSetup {
         action: String,

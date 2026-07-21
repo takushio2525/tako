@@ -45,24 +45,18 @@ pub struct RemoteSetupResult {
 pub struct RemoteSetupAnswers {
     /// true = 全質問に yes で回答（brew install 等）
     pub yes: Option<bool>,
-    /// 使用するポート（省略時は 7749）
-    pub port: Option<u16>,
 }
 
 impl RemoteSetupAnswers {
     pub fn auto_yes(&self) -> bool {
         self.yes.unwrap_or(false)
     }
-
-    pub fn port(&self) -> u16 {
-        self.port.unwrap_or(7749)
-    }
 }
 
 /// ウィザードの非対話実行（dispatch / MCP から呼ばれる。CLI の対話版は tako-cli 側）。
 /// 各ステップを順に実行し、結果を返す。失敗したステップで停止する。
-pub fn run_noninteractive(answers: &RemoteSetupAnswers) -> Result<Value, String> {
-    let port = answers.port();
+pub fn run_noninteractive(_answers: &RemoteSetupAnswers) -> Result<Value, String> {
+    let sock = crate::remote::socket_path();
     let mut result = RemoteSetupResult {
         success: false,
         ts_net_url: None,
@@ -116,7 +110,7 @@ pub fn run_noninteractive(answers: &RemoteSetupAnswers) -> Result<Value, String>
 
     // Step 3: serve 設定
     let serve = tailscale::serve_state(cli).map_err(|e| format!("serve 状態の取得に失敗: {e}"))?;
-    let target = tailscale::proxy_target_for_port(port);
+    let target = tailscale::proxy_target_for_socket(&sock);
     match serve {
         ServeState::Proxy(ref existing) if *existing == target => {
             result.steps.push(SetupStepResult {
@@ -126,7 +120,8 @@ pub fn run_noninteractive(answers: &RemoteSetupAnswers) -> Result<Value, String>
             });
         }
         ServeState::NotConfigured => {
-            tailscale::serve_start(cli, port).map_err(|e| format!("serve の設定に失敗: {e}"))?;
+            tailscale::serve_start_unix(cli, &sock)
+                .map_err(|e| format!("serve の設定に失敗: {e}"))?;
             result.steps.push(SetupStepResult {
                 step: "serve_config",
                 status: "configured",
@@ -217,11 +212,7 @@ pub fn phone_setup_instructions(ts_url: &str) -> String {
 
 /// `tako remote setup` を対話的に実行する（CLI 専用。TTY 出力つき）。
 /// ステップごとに進捗を表示し、ユーザーの入力を求める場合がある
-pub fn run_interactive(
-    port: u16,
-    auto_yes: bool,
-    writer: &mut dyn io::Write,
-) -> Result<Value, String> {
+pub fn run_interactive(auto_yes: bool, writer: &mut dyn io::Write) -> Result<Value, String> {
     writeln!(writer, "tako remote setup").map_err(|e| e.to_string())?;
     writeln!(writer, "==================").map_err(|e| e.to_string())?;
     writeln!(writer).map_err(|e| e.to_string())?;
@@ -372,15 +363,17 @@ pub fn run_interactive(
     write!(writer, "[4/5] serve を設定中... ").map_err(|e| e.to_string())?;
     let _ = writer.flush();
 
+    let sock = crate::remote::socket_path();
     let serve = tailscale::serve_state(cli).map_err(|e| format!("serve 状態の取得に失敗: {e}"))?;
-    let target = tailscale::proxy_target_for_port(port);
+    let target = tailscale::proxy_target_for_socket(&sock);
 
     match serve {
         ServeState::Proxy(ref existing) if *existing == target => {
             writeln!(writer, "設定済み").map_err(|e| e.to_string())?;
         }
         ServeState::NotConfigured => {
-            tailscale::serve_start(cli, port).map_err(|e| format!("serve の設定に失敗: {e}"))?;
+            tailscale::serve_start_unix(cli, &sock)
+                .map_err(|e| format!("serve の設定に失敗: {e}"))?;
             writeln!(writer, "設定完了 ({target})").map_err(|e| e.to_string())?;
         }
         ServeState::Proxy(existing) => {
@@ -551,13 +544,11 @@ mod tests {
     fn remote_setup_answersの既定値() {
         let answers = RemoteSetupAnswers::default();
         assert!(!answers.auto_yes());
-        assert_eq!(answers.port(), 7749);
     }
 
     #[test]
     fn remote_setup_answersのjsonパース() {
-        let a: RemoteSetupAnswers = serde_json::from_str(r#"{"yes":true,"port":8080}"#).unwrap();
+        let a: RemoteSetupAnswers = serde_json::from_str(r#"{"yes":true}"#).unwrap();
         assert!(a.auto_yes());
-        assert_eq!(a.port(), 8080);
     }
 }

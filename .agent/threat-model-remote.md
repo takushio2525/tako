@@ -8,13 +8,11 @@
 - **Tailscale のデーモンと tailnet のコントロールプレーン**: ノード認証・
   WireGuard 鍵交換・DERP 中継の中身を読めないことを前提とする
 - **WireGuard のプロトコル**: E2E 暗号化により経路上の第三者が通信内容を復号できない
-- **macOS のプロセス分離（制限付き）**: tako daemon（127.0.0.1 bind）にはローカルの
-  任意プロセス（別 OS ユーザー含む）が到達できる。serve 経由の接続は `X-Forwarded-For` +
-  `X-Forwarded-Host` が serve によって設定され、daemon は XFH が期待ホスト名と一致する
-  ことを検証する（#287 P1-1）。XFF のみ / XFH 欠落 / XFH 不一致は拒否。
-  残存リスク: 同一マシンの別ユーザーが tailnet IP **と** ts.net ホスト名の両方を
-  知っている場合、XFF + XFH を偽装して identify を通過できる。
-  ただしペアリング層（層②）が依然として最終防衛線として機能する
+- **UDS のファイルパーミッション（macOS DAC）**: tako daemon は TCP ポートを
+  一切 listen せず、`<state_dir>/tako-remote.sock`（socket 0600、親ディレクトリ 0700）
+  のみで待ち受ける。接続できる主体は tailscaled（serve のプロキシ元・システム権限）、
+  同一 OS ユーザーのプロセス、root に限られ、**別 OS ユーザーは接続自体が不能**（#287 P1-2）。
+  `X-Forwarded-For` / `X-Forwarded-Host` の検証（#287 P1-1）は多層防御として維持する
 - **tako のペアリングレジストリ**: Mac ローカルの devices.json（0600）。
   ファイルの改ざんは macOS のファイル権限で防護
 
@@ -23,8 +21,8 @@
 - **tailnet の他ノード（信頼できない端末が tailnet に参加した場合）**:
   二層目のペアリング認証が、Mac 所有者が明示承認していない端末を遮断する。
   未登録端末は画面データを 1 バイトも受け取れない
-- **インターネット上の攻撃者**: daemon は 127.0.0.1 にのみ bind。serve は
-  tailnet 内限定（Funnel は使わない）。公開 URL はインターネットに存在しない
+- **インターネット上の攻撃者**: daemon は UDS のみで listen し TCP ポートは一切開かない。
+  serve は tailnet 内限定（Funnel は使わない）。公開 URL はインターネットに存在しない
 - **DERP 中継サーバー**: WireGuard 暗号化により中身は読めない。メタデータ
   （接続時刻・IP・転送量）は Tailscale 社が見える
 
@@ -59,8 +57,8 @@
 
 ### daemon の listen 範囲
 
-- daemon は 127.0.0.1 にのみ bind（P0-1 で実装済み）
-- LAN 上の別端末や同一ホストの別ネットワークインターフェースからは到達不能
+- daemon は Unix domain socket（0600）のみで待ち受け、TCP ポートは一切開かない（#287 P1-2）
+- LAN 上の別端末・同一ホストの別ユーザーからは接続不能（OS のファイルパーミッションで強制）
 - serve 経由（tailnet 内）のアクセスのみが到達する
 
 ### 入力操作の role 制限
@@ -90,8 +88,7 @@
   軽減可能だが、完全な防止は不可能）
 - ローカルの root / 管理者権限を持つ攻撃者は daemon のプロセスメモリや
   devices.json を直接読み書きできる（OS レベルの侵害であり tako の防護範囲外）
-- 同一マシンの別 OS ユーザーが tailnet IP と ts.net ホスト名を知っている場合、
-  daemon（127.0.0.1 bind）に XFF + XFH を偽装して接続し、層①の identity 検証を
-  通過できる可能性がある。ペアリング層（層②）が最終防衛線。macOS の典型的な
-  シングルユーザー運用ではこのリスクは事実上発生しない（#287 P1-1 で軽減済み、
-  完全排除は Unix socket 化で対応予定）
+- 同一 OS ユーザーの悪意あるプロセスと root は、socket への接続・token /
+  devices.json の直接読み取りが可能（OS レベルの侵害であり tako の防護範囲外。
+  従来どおり）。別 OS ユーザーによる daemon への到達経路は UDS 化（#287 P1-2）で
+  消滅した

@@ -1583,10 +1583,10 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_remote_start",
             "description": "リモートアクセス API サーバーを起動する。スマホからブラウザ経由で\
-                ペインを操作するための HTTP API サーバーが指定ポート（既定 7749）で開始される。\
-                transport は Tailscale Serve のみ: daemon は 127.0.0.1 に bind し、\
+                ペインを操作するための HTTP API サーバーが Unix domain socket で開始される。\
+                transport は Tailscale Serve のみ: daemon は UDS（0600）のみで listen し、\
                 tailnet 内限定の恒久固定 URL（https://<ホスト名>.<tailnet>.ts.net）で公開される\
-                （WireGuard E2E 暗号化・public internet に入口を持たない）。\
+                （WireGuard E2E 暗号化・TCP ポートは一切開かない）。\
                 Tailscale が未セットアップ（未導入・未ログイン・HTTPS 未有効等）の場合は\
                 不足項目を列挙して起動を拒否するので、ユーザーに `tako remote setup` を案内する。\
                 接続には機器ペアリングが必要: 初回アクセス時に Mac 画面へ承認ダイアログが表示され、\
@@ -1595,12 +1595,7 @@ pub fn tools() -> Vec<Value> {
                 注意: interact 以上を許可した端末はターミナルへ任意コマンドを送信できる（実質シェルアクセス）。",
             "inputSchema": {
                 "type": "object",
-                "properties": {
-                    "port": {
-                        "type": "integer", "minimum": 1, "maximum": 65535,
-                        "description": "サーバーのポート番号（省略時は 7749）",
-                    },
-                },
+                "properties": {},
                 "additionalProperties": false,
             },
         }),
@@ -1622,7 +1617,7 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_remote_status",
             "description": "リモートアクセス API サーバーの状態を取得する。\
-                起動中なら running=true・ポート番号・恒久固定 URL・登録済み端末数を返す。\
+                起動中なら running=true・socket パス・恒久固定 URL・登録済み端末数を返す。\
                 URL に secret は含まれない（接続時の認証は機器ペアリングが行う）。",
             "inputSchema": {
                 "type": "object",
@@ -1716,10 +1711,9 @@ pub fn tools() -> Vec<Value> {
                     },
                     "answers": {
                         "type": "object",
-                        "description": "run 時のオプション。yes=true で全質問を自動承認、port でポート指定",
+                        "description": "run 時のオプション。yes=true で全質問を自動承認",
                         "properties": {
                             "yes": { "type": "boolean" },
-                            "port": { "type": "integer" },
                         },
                     },
                 },
@@ -3249,9 +3243,7 @@ fn build_request(
             task_type: str_arg(args, "task_type")?,
             limit: u64_arg(args, "limit")?.map(|v| v as usize),
         },
-        "tako_remote_start" => Request::RemoteStart {
-            port: u64_arg(args, "port")?.map(|v| v as u16),
-        },
+        "tako_remote_start" => Request::RemoteStart {},
         "tako_remote_stop" => Request::RemoteStop {
             force: bool_arg(args, "force")?.unwrap_or(false),
         },
