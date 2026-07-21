@@ -25,13 +25,17 @@ macro_rules! tr {
 // 移動しないこと
 
 pub mod common;
+pub mod dialog;
 pub mod drawer;
 pub mod palette;
 pub mod panel;
+pub mod ports;
+pub mod preview;
 pub mod remote;
 pub mod sidebar;
 pub mod sleep_guard;
 pub mod update;
+pub mod webdock;
 
 #[cfg(test)]
 pub(crate) mod tests_support {
@@ -68,7 +72,8 @@ pub(crate) mod tests_support {
             assert!(
                 !(0x1F000..=0x1FAFF).contains(&cp)
                     && !(0x2600..=0x27BF).contains(&cp)
-                    && !(0xFE00..=0xFE0F).contains(&cp),
+                    // FE0E（テキスト表示強制）は絵文字化を防ぐ側なので許可。FE0F のみ拒否
+                    && cp != 0xFE0F,
                 "絵文字らしき文字 {c:?} (U+{cp:04X}) が文字列 {s:?} に含まれている"
             );
         }

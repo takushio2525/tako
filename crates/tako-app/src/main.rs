@@ -4281,7 +4281,7 @@ impl TakoApp {
                 let mut parts = Vec::new();
                 if let Some(session) = self.terminals.get(&pane_id) {
                     if session.command_state() == CommandState::Running {
-                        parts.push("実行中のプロセス".to_string());
+                        parts.push(crate::ui_text::dialog::lost_running_process().to_string());
                     }
                 }
                 if let Some(pane) = self
@@ -4298,23 +4298,23 @@ impl TakoApp {
                                 .get(&pane_id)
                                 .is_some_and(|s| s.command_state() == CommandState::Running);
                             if busy {
-                                parts.push("稼働中の worker".to_string());
+                                parts.push(crate::ui_text::dialog::lost_busy_worker().to_string());
                             }
                         }
                     }
                 }
                 if self.backend_sessions.contains_key(&pane_id) {
-                    parts.push("tmux セッション".to_string());
+                    parts.push(crate::ui_text::dialog::lost_tmux_session().to_string());
                 }
                 if parts.is_empty() {
-                    "このペインを閉じますか？".to_string()
+                    crate::ui_text::dialog::close_pane_question().to_string()
                 } else {
-                    format!("閉じると失われるもの: {}", parts.join("、"))
+                    crate::ui_text::dialog::close_loses(&parts)
                 }
             }
             CloseConfirmTarget::Tab(tab_id) => {
                 let Some(tab) = self.workspace.get_tab(tab_id) else {
-                    return "このタブを閉じますか？".to_string();
+                    return crate::ui_text::dialog::close_tab_question().to_string();
                 };
                 let pane_count = tab.tree().panes().len();
                 let running = tab
@@ -4348,17 +4348,17 @@ impl TakoApp {
                     .count();
 
                 let mut parts = Vec::new();
-                parts.push(format!("{pane_count} ペイン"));
+                parts.push(crate::ui_text::dialog::lost_panes(pane_count));
                 if running > 0 {
-                    parts.push(format!("{running} 個の実行中プロセス"));
+                    parts.push(crate::ui_text::dialog::lost_running(running));
                 }
                 if workers > 0 {
-                    parts.push(format!("{workers} 個の稼働中 worker"));
+                    parts.push(crate::ui_text::dialog::lost_workers(workers));
                 }
                 if tmux > 0 {
-                    parts.push(format!("{tmux} 個の tmux セッション"));
+                    parts.push(crate::ui_text::dialog::lost_tmux(tmux));
                 }
-                format!("閉じると失われるもの: {}", parts.join("、"))
+                crate::ui_text::dialog::close_loses(&parts)
             }
         }
     }
@@ -6125,7 +6125,7 @@ impl TakoApp {
             .ok_or_else(|| "編集モードを開始していない".to_string())?;
         match edit.buffer.save() {
             Ok(()) => {
-                edit.message = Some("保存しました".into());
+                edit.message = Some(crate::ui_text::preview::saved_message().into());
                 self.refresh_preview_from_editor(pane_id);
                 Ok(())
             }
@@ -9813,7 +9813,7 @@ impl TakoApp {
                                 }
                                 cx.notify();
                             }))
-                            .child("再読み込み"),
+                            .child(crate::ui_text::webdock::reload()),
                     ),
             )
     }
@@ -10322,7 +10322,7 @@ impl TakoApp {
                 d.child(
                     div()
                         .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.5))
-                        .child("URL を入力して Enter（例: example.com）"),
+                        .child(crate::ui_text::webdock::url_placeholder()),
                 )
             })
             .when(!placeholder, |d| {
@@ -10398,7 +10398,7 @@ impl TakoApp {
                             this.open_webview_from_dock(&url, cx);
                         }
                     }))
-                    .child("開く"),
+                    .child(crate::ui_text::webdock::open()),
             )
     }
 
@@ -11396,9 +11396,9 @@ impl TakoApp {
                 // 提案チップ（FR-2.4.3）: 検知ペイン下端のインライン表示。
                 // 承諾アクションは open_preview（当面は外部ブラウザ。差し替え点）
                 let label = if process.is_empty() {
-                    format!("localhost:{port} が listen 中")
+                    crate::ui_text::ports::listening(port)
                 } else {
-                    format!("localhost:{port}（{process}）が listen 中")
+                    crate::ui_text::ports::listening_with_process(port, &process)
                 };
                 div()
                     .id(("port-chip", pane_id.as_u64()))
@@ -11432,7 +11432,7 @@ impl TakoApp {
                                 cx.stop_propagation();
                                 this.accept_port_suggestion(pane_id, port, cx);
                             }))
-                            .child("ブラウザで開く"),
+                            .child(crate::ui_text::ports::open_in_browser()),
                     )
                     .child(
                         div()
@@ -14044,7 +14044,7 @@ impl TakoApp {
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.close_confirm_cancelled(cx);
                                         }))
-                                        .child("キャンセル (Esc)"),
+                                        .child(crate::ui_text::dialog::cancel_esc()),
                                 )
                                 .child(
                                     div()
@@ -14060,14 +14060,14 @@ impl TakoApp {
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.close_confirm_accepted(cx);
                                         }))
-                                        .child("閉じる (Enter)"),
+                                        .child(crate::ui_text::dialog::close_enter()),
                                 ),
                         )
                         .child(
                             div()
                                 .text_size(px(11.0))
                                 .text_color(hsla(theme.text_overlay))
-                                .child("⌘クリックで確認なしで閉じる"),
+                                .child(crate::ui_text::dialog::close_skip_hint()),
                         ),
                 ),
         )
