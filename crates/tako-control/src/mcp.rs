@@ -135,7 +135,9 @@ const INSTRUCTIONS: &str = "\
 ユーザーが見比べて選べるようにする（tako_equalize_layout で整える）\n\
 - 終わったら片付けろ: 役目を終えた作業ペインは tako_close_pane で閉じ、\
 レイアウトが乱れたら tako_equalize_layout で整える\n\
-- 操作の前に tako_list_panes で現状のレイアウトとペイン ID を把握する";
+- 操作の前に tako_list_panes で現状のレイアウトとペイン ID を把握する\n\
+- 実行可能ファイルを新規作成したら先頭コメントに tako:run 宣言を書く: \
+ユーザーが再生ボタン一発で実行できるようになる（書式は tako_run の説明を参照）";
 
 /// ペイン ID 引数のスキーマ（省略時は呼び出し元）
 fn pane_schema(description: &str) -> Value {
@@ -2430,6 +2432,118 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // --- Code Runner (FR-3.18, #453) ---
+        json!({
+            "name": "tako_run",
+            "description": "ファイルを実行する（Code Runner: FR-3.18, #453）。\
+                ファイル内の tako:run 宣言または拡張子既定コマンドで新ペインを分割して実行する。\
+                \n\n## tako:run 宣言の書式\n\
+                ファイル先頭 64 行以内に以下の形式でコメント内に記述する:\n\
+                - `tako:run: <コマンド>` — 既定の実行コマンド\n\
+                - `tako:run[name]: <コマンド>` — 名前付きプロファイル（複数定義可）\n\
+                - `tako:cwd: <ディレクトリ>` — 作業ディレクトリ（相対パスはファイル基準）\n\
+                - `tako:cwd[name]: <ディレクトリ>` — プロファイル別作業ディレクトリ\n\
+                - `tako:shell: <シェル>` — コマンドを解釈するシェル\n\
+                \nスキャン範囲: 先頭 64 行 / 16 KiB。各言語のコメント記法に依存しない（接頭辞は任意）。\n\
+                \n## 変数展開\n\
+                コマンド・cwd 内で以下の変数が使える（自動シングルクオートエスケープ）:\n\
+                - `${file}` — ファイルの絶対パス\n\
+                - `${fileDir}` — ファイルのあるディレクトリ\n\
+                - `${fileBase}` — ファイル名（拡張子付き）\n\
+                - `${fileNoExt}` — ファイル名（拡張子なし）\n\
+                - `${ext}` — 拡張子（小文字・ドットなし）\n\
+                \n## 解決優先順位\n\
+                1. command パラメータ（最優先）\n\
+                2. ファイル内宣言\n\
+                3. 拡張子既定（settings + 組み込み）\n\
+                4. エラー\n\
+                \n完了確認は tako_run_interactive_status を使う。cwd はファイルのあるディレクトリが既定。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "実行対象ファイルパス（相対パスは呼び出し元ペインの cwd 基準）",
+                    },
+                    "profile": {
+                        "type": "string",
+                        "description": "実行プロファイル名（省略時は既定プロファイル）",
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "コマンド上書き（最優先。宣言・拡張子既定より優先される）",
+                    },
+                    "pane": pane_schema("分割の基準ペイン ID（省略時は呼び出し元）"),
+                    "tab": {
+                        "type": "integer", "minimum": 0,
+                        "description": "分割先タブ ID（pane と排他）",
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["right", "down", "left", "up"],
+                        "description": "新ペインが生える方向（既定 down）",
+                    },
+                    "ratio": {
+                        "type": "number",
+                        "exclusiveMinimum": 0.0,
+                        "exclusiveMaximum": 1.0,
+                        "description": "新ペイン側の取り分（既定 0.3）",
+                    },
+                    "auto_close": {
+                        "type": "string",
+                        "enum": ["success", "always", "never"],
+                        "description": "完了後の自動 close 方針。never（既定）= 残す / success = exit 0 で close / always = 常に close",
+                    },
+                    "focus": {
+                        "type": "boolean",
+                        "description": "新ペインにフォーカスを移すか（既定 false）",
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_run_resolve",
+            "description": "ファイルの実行プロファイル一覧を解決して返す（実行しない。FR-3.18, #453）。\
+                ファイル内宣言と拡張子既定から検出されたプロファイル一覧・コマンド・cwd・source を返す。\
+                UI のドロップダウンと同じデータ。tako_run 実行前の事前確認に使う。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "対象ファイルパス（相対パスは呼び出し元ペインの cwd 基準）",
+                    },
+                    "pane": pane_schema("相対パス解決の基準ペイン ID（省略時は呼び出し元）"),
+                },
+                "required": ["path"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_run_defaults",
+            "description": "拡張子ごとの実行コマンド既定を一覧/設定/削除する（FR-3.18, #453）。\
+                ext を省略すると全一覧。ext のみで単一情報。ext + command で設定。ext + remove で削除。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ext": {
+                        "type": "string",
+                        "description": "拡張子（ドットなし・小文字。省略時は全一覧）",
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "設定するコマンドテンプレート（変数展開 ${fileBase} 等が使える）",
+                    },
+                    "remove": {
+                        "type": "boolean",
+                        "description": "true で削除（組み込み既定に戻る）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -3385,6 +3499,33 @@ fn build_request(
             pane: required_u64(args, "pane")?,
             no_wait: false,
         },
+        "tako_run" => {
+            let tab = u64_arg(args, "tab")?;
+            Request::Run {
+                path: str_arg(args, "path")?.ok_or("path を指定する")?,
+                pane: if tab.is_some() {
+                    None
+                } else {
+                    Some(target_pane(args, caller)?)
+                },
+                tab,
+                profile: str_arg(args, "profile")?,
+                command: str_arg(args, "command")?,
+                direction: direction_arg(args)?,
+                ratio: f32_arg(args, "ratio")?,
+                auto_close: str_arg(args, "auto_close")?,
+                focus: bool_arg(args, "focus")?,
+            }
+        }
+        "tako_run_resolve" => Request::RunResolve {
+            path: str_arg(args, "path")?.ok_or("path を指定する")?,
+            pane: u64_arg(args, "pane")?.or(caller),
+        },
+        "tako_run_defaults" => Request::RunnerDefaults {
+            ext: str_arg(args, "ext")?,
+            command: str_arg(args, "command")?,
+            remove: bool_arg(args, "remove")?.unwrap_or(false),
+        },
         _ => return Err(format!("不明なツール: {name}")),
     })
 }
@@ -4074,7 +4215,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 106);
+        assert_eq!(tools.len(), 109);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

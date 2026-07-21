@@ -3165,45 +3165,24 @@ fn dispatch_inner(
                 resolve_pane(host.workspace(), pane)?
             };
 
-            let new_pane = Pane::new(origin);
-            let new_id = new_pane.id();
-            let new_id_u64 = new_id.as_u64();
-
-            tree_mut(host.workspace_mut(), tab_id)
-                .split_with_ratio(
-                    target,
-                    direction.unwrap_or(Direction::Right).to_core(),
-                    ratio.unwrap_or(0.3),
-                    new_pane,
-                )
-                .map_err(op_err)?;
-
             let cwd = host
                 .session(target)
                 .and_then(|s| s.cwd())
                 .filter(|p| p.is_dir())
                 .map(|p| p.to_path_buf());
 
-            // コマンドをシェルの -c 引数として渡す（#325: queue_write での PTY 直書きは
-            // シェル初期化とのレース条件で余分な入力が read 等の対話コマンドに混入する）。
-            // 末尾の read は PTY を生存させる（exit マーカー検知前にペインが消えるのを防止）
-            let wrapped = format!(
-                "{command}; echo \"__TAKO_EXIT=$?\"; read -r __TAKO_DUMMY__ 2>/dev/null || true"
-            );
-            host.attach_session(
-                new_id,
-                SpawnOptions {
-                    command: Some(SpawnCommand {
-                        program: wrapped,
-                        args: Vec::new(),
-                    }),
-                    cwd,
-                    env: Vec::new(),
-                },
-            );
-
-            // フォーカスを新ペインに移す（ユーザーが入力するため）
-            let _ = tree_mut(host.workspace_mut(), tab_id).focus(new_id);
+            let new_id = spawn_command_pane(
+                host,
+                origin,
+                tab_id,
+                target,
+                direction.unwrap_or(Direction::Right),
+                ratio.unwrap_or(0.3),
+                cwd,
+                &command,
+                ac,
+                true, // focus
+            )?;
 
             // タイトルとメタデータを設定
             let hint = input_hint.as_deref().unwrap_or(&command);
@@ -3213,11 +3192,10 @@ fn dispatch_inner(
                 .and_then(|t| t.tree_mut().get_mut(new_id))
             {
                 p.set_title(Some(format!("(!) {hint}")));
-                p.set_interactive_meta(ac.to_string(), command.clone());
             }
 
             Ok(json!({
-                "pane": new_id_u64,
+                "pane": new_id.as_u64(),
                 "status": "running",
                 "auto_close": ac,
             }))
@@ -3273,7 +3251,318 @@ fn dispatch_inner(
                 }
             }
         }
+
+        // --- Code Runner (FR-3.18, #453) ---
+        Request::Run {
+            path,
+            pane,
+            tab,
+            profile,
+            command: cmd_override,
+            direction,
+            ratio,
+            auto_close,
+            focus,
+        } => {
+            let ac = auto_close.as_deref().unwrap_or("never");
+            if !matches!(ac, "success" | "always" | "never") {
+                return Err(DispatchError::InvalidParams(format!(
+                    "auto_close は success / always / never のいずれか（指定: {ac:?}）"
+                )));
+            }
+
+            let (tab_id, target) = if let Some(tab_raw) = tab {
+                let tid = find_tab(host.workspace(), tab_raw)?;
+                let focused = host
+                    .workspace()
+                    .get_tab(tid)
+                    .expect("find_tab で存在確認済み")
+                    .tree()
+                    .focused();
+                (tid, focused)
+            } else {
+                resolve_pane(host.workspace(), pane)?
+            };
+
+            // パス解決（OpenFile と同一: 相対パスは対象ペインの cwd 基準 + canonicalize）
+            let mut resolved = PathBuf::from(&path);
+            if resolved.is_relative() {
+                if let Some(cwd) = host.session(target).and_then(|s| s.cwd()) {
+                    resolved = cwd.join(resolved);
+                }
+            }
+            let resolved = resolved.canonicalize().map_err(|e| {
+                DispatchError::Operation(format!("ファイルを開けない（{path}: {e}）"))
+            })?;
+            if !resolved.is_file() {
+                return Err(DispatchError::Operation(format!(
+                    "ファイルではない: {}",
+                    resolved.display()
+                )));
+            }
+
+            // ファイル先頭 16 KiB を読む
+            let head = read_file_head(&resolved)?;
+
+            // 拡張子既定のマージ
+            let settings = crate::settings::load();
+            let ext_defaults = tako_core::merged_defaults(&settings.runner_defaults);
+
+            // 解決
+            let resolution = tako_core::resolve(
+                &resolved,
+                &head,
+                &ext_defaults,
+                profile.as_deref(),
+                cmd_override.as_deref(),
+            )
+            .map_err(|e| DispatchError::Operation(e.to_string()))?;
+
+            let plan = &resolution.plan;
+
+            // cwd 存在検査
+            let cwd = plan.cwd.clone();
+            if !cwd.is_dir() {
+                return Err(DispatchError::Operation(format!(
+                    "cwd が存在しない: {}",
+                    cwd.display()
+                )));
+            }
+
+            // シェル指定時はコマンドを包む
+            let final_command = if let Some(shell) = &plan.shell {
+                let escaped = plan.command.replace('\'', "'\\''");
+                format!("{shell} -c '{escaped}'")
+            } else {
+                plan.command.clone()
+            };
+
+            let new_id = spawn_command_pane(
+                host,
+                origin,
+                tab_id,
+                target,
+                direction.unwrap_or(Direction::Down),
+                ratio.unwrap_or(0.3),
+                Some(cwd.clone()),
+                &final_command,
+                ac,
+                focus.unwrap_or(false),
+            )?;
+
+            // タイトル設定
+            let file_base = resolved
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone());
+            let title = if plan.profile == "default" {
+                format!("(>) {file_base}")
+            } else {
+                format!("(>) {file_base} [{}]", plan.profile)
+            };
+            if let Some(p) = host
+                .workspace_mut()
+                .get_tab_mut(tab_id)
+                .and_then(|t| t.tree_mut().get_mut(new_id))
+            {
+                p.set_title(Some(title));
+            }
+
+            Ok(json!({
+                "pane": new_id.as_u64(),
+                "path": resolved.display().to_string(),
+                "profile": plan.profile,
+                "command": plan.command,
+                "cwd": cwd.display().to_string(),
+                "auto_close": ac,
+            }))
+        }
+
+        Request::RunResolve { path, pane } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+
+            let mut resolved = PathBuf::from(&path);
+            if resolved.is_relative() {
+                if let Some(cwd) = host.session(target).and_then(|s| s.cwd()) {
+                    resolved = cwd.join(resolved);
+                }
+            }
+            let resolved = resolved.canonicalize().map_err(|e| {
+                DispatchError::Operation(format!("ファイルを開けない（{path}: {e}）"))
+            })?;
+            if !resolved.is_file() {
+                return Err(DispatchError::Operation(format!(
+                    "ファイルではない: {}",
+                    resolved.display()
+                )));
+            }
+
+            let head = read_file_head(&resolved)?;
+            let settings = crate::settings::load();
+            let ext_defaults = tako_core::merged_defaults(&settings.runner_defaults);
+
+            let resolution = tako_core::resolve(&resolved, &head, &ext_defaults, None, None)
+                .map_err(|e| DispatchError::Operation(e.to_string()))?;
+
+            let profiles: Vec<Value> = resolution
+                .all_profiles
+                .iter()
+                .map(|p| {
+                    json!({
+                        "profile": p.profile,
+                        "command": p.command,
+                        "cwd": p.cwd.display().to_string(),
+                        "source": match p.source {
+                            tako_core::RunSource::Declaration => "declaration",
+                            tako_core::RunSource::ExtensionDefault => "extension_default",
+                            tako_core::RunSource::Override => "override",
+                        },
+                    })
+                })
+                .collect();
+
+            Ok(json!({
+                "path": resolved.display().to_string(),
+                "profiles": profiles,
+                "warnings": resolution.warnings,
+                "default_profile": resolution.plan.profile,
+            }))
+        }
+
+        Request::RunnerDefaults {
+            ext,
+            command,
+            remove,
+        } => {
+            let mut settings = crate::settings::load();
+            let builtins: std::collections::BTreeMap<String, String> =
+                tako_core::builtin_defaults()
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+
+            if let Some(ext_key) = ext {
+                let ext_lower = ext_key.to_ascii_lowercase();
+                if remove {
+                    settings.runner_defaults.remove(&ext_lower);
+                    crate::settings::save(&settings)
+                        .map_err(|e| DispatchError::Operation(e.to_string()))?;
+                    let effective = builtins.get(&ext_lower).cloned();
+                    Ok(json!({
+                        "ext": ext_lower,
+                        "removed": true,
+                        "effective_command": effective,
+                    }))
+                } else if let Some(cmd) = command {
+                    settings
+                        .runner_defaults
+                        .insert(ext_lower.clone(), cmd.clone());
+                    crate::settings::save(&settings)
+                        .map_err(|e| DispatchError::Operation(e.to_string()))?;
+                    Ok(json!({
+                        "ext": ext_lower,
+                        "command": cmd,
+                        "source": "user",
+                    }))
+                } else {
+                    // 単一拡張子の情報
+                    let user_cmd = settings.runner_defaults.get(&ext_lower);
+                    let builtin_cmd = builtins.get(&ext_lower);
+                    let effective = user_cmd.or(builtin_cmd);
+                    Ok(json!({
+                        "ext": ext_lower,
+                        "command": effective,
+                        "source": if user_cmd.is_some() { "user" } else if builtin_cmd.is_some() { "builtin" } else { "none" },
+                        "user_override": user_cmd,
+                        "builtin": builtin_cmd,
+                    }))
+                }
+            } else {
+                // 全一覧
+                let merged = tako_core::merged_defaults(&settings.runner_defaults);
+                let entries: Vec<Value> = merged
+                    .iter()
+                    .map(|(k, v)| {
+                        let source = if settings.runner_defaults.contains_key(k) {
+                            "user"
+                        } else {
+                            "builtin"
+                        };
+                        json!({ "ext": k, "command": v, "source": source })
+                    })
+                    .collect();
+                Ok(json!({ "defaults": entries }))
+            }
+        }
     }
+}
+
+/// RunInteractive / Run 共通: 分割 → コマンド付きセッション起動 → exit マーカーラップ
+#[allow(clippy::too_many_arguments)]
+fn spawn_command_pane(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    tab_id: TabId,
+    target: PaneId,
+    direction: Direction,
+    ratio: f32,
+    cwd: Option<PathBuf>,
+    command: &str,
+    auto_close: &str,
+    focus: bool,
+) -> Result<PaneId, DispatchError> {
+    let new_pane = Pane::new(origin);
+    let new_id = new_pane.id();
+
+    tree_mut(host.workspace_mut(), tab_id)
+        .split_with_ratio(target, direction.to_core(), ratio, new_pane)
+        .map_err(op_err)?;
+
+    let wrapped =
+        format!("{command}; echo \"__TAKO_EXIT=$?\"; read -r __TAKO_DUMMY__ 2>/dev/null || true");
+    host.attach_session(
+        new_id,
+        SpawnOptions {
+            command: Some(SpawnCommand {
+                program: wrapped,
+                args: Vec::new(),
+            }),
+            cwd,
+            env: Vec::new(),
+        },
+    );
+
+    if focus {
+        let _ = tree_mut(host.workspace_mut(), tab_id).focus(new_id);
+    }
+
+    // interactive_meta を設定（RunInteractiveStatus で exit code 回収 + auto_close に使う）
+    if let Some(p) = host
+        .workspace_mut()
+        .get_tab_mut(tab_id)
+        .and_then(|t| t.tree_mut().get_mut(new_id))
+    {
+        p.set_interactive_meta(auto_close.to_string(), command.to_string());
+    }
+
+    Ok(new_id)
+}
+
+/// ファイル先頭 16 KiB を読む（Code Runner の宣言スキャン用）
+fn read_file_head(path: &Path) -> Result<String, DispatchError> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        DispatchError::Operation(format!("ファイルを読めない（{}: {e}）", path.display()))
+    })?;
+    let mut buf = vec![0u8; 16 * 1024];
+    let n = file.read(&mut buf).map_err(|e| {
+        DispatchError::Operation(format!(
+            "ファイルの読み取りに失敗（{}: {e}）",
+            path.display()
+        ))
+    })?;
+    buf.truncate(n);
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// ペインログ設定の状態ペイロード（status / set 共通）

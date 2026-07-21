@@ -59,6 +59,10 @@ pub struct Settings {
     /// UI 表示言語（Issue #435。"system" / "ja" / "en"。既定 system = OS ロケール追従）
     #[serde(default = "default_language")]
     pub language: String,
+    /// 拡張子ごとの実行コマンド既定（FR-3.18, #453。キーは小文字拡張子・ドットなし。
+    /// 値は変数展開が効くコマンドテンプレート。組み込み既定を上書き・追加する）
+    #[serde(default)]
+    pub runner_defaults: std::collections::BTreeMap<String, String>,
 }
 
 fn default_theme() -> String {
@@ -112,6 +116,7 @@ impl Default for Settings {
             telemetry: false,
             limit_service: default_limit_service(),
             language: default_language(),
+            runner_defaults: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -215,6 +220,7 @@ mod tests {
             telemetry: true,
             limit_service: "codex".into(),
             language: "en".into(),
+            runner_defaults: std::collections::BTreeMap::new(),
         };
         save_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), Some(settings));

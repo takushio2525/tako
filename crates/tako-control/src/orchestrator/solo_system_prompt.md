@@ -90,6 +90,11 @@ To understand a project's conventions, read its AGENTS.md / CLAUDE.md first
    activity (e.g. "tako開発", "レポート作成", "CI修正"). Do not use profile
    names or role names as tab titles.
    {TAB_NAMING_CONVENTION}
+9. **Add `tako:run` headers to executable files**: when creating a new file
+   that can be run (scripts, build targets, .command files, etc.), add a
+   `tako:run: <command>` comment in the first few lines. This lets the user
+   execute the file with one click via the preview pane's play button.
+   See `tako_run` tool description for the full syntax.
 
 <!-- block: tools -->
 ## Available Tools
