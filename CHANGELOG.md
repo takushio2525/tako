@@ -5,6 +5,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- [セキュリティ] リモートの cross-origin 脆弱性を遮断 (#287)
+  ペアリング済み端末上で開いた悪意あるサイトから ts.net URL へ fetch して
+  ターミナル画面の読取・任意コマンド実行が可能だった穴を塞いだ。
+  REST/WS の `Origin` ヘッダを daemon の `base_url` と完全一致で検証し、
+  不一致・欠落を原則 403 で拒否する。CORS `Access-Control-Allow-Origin: *` を
+  廃止し、許可 origin のみをエコーする方式に変更。WS upgrade では
+  `Sec-WebSocket-Protocol` に `tako-remote` の提示を必須化。
+  Block cross-origin terminal access on paired devices (#287).
+  Any page opened on a paired phone could fetch the fixed ts.net URL to read
+  terminal screens and send arbitrary input. Now the `Origin` header is
+  validated against the daemon's `base_url` (exact match); mismatched or
+  missing origins are rejected with 403. `Access-Control-Allow-Origin: *` is
+  replaced with echoing the allowed origin only. WS upgrade now requires
+  `Sec-WebSocket-Protocol: tako-remote` to be presented by the client.
+
 - [スタイル] sleep-guard 状態チップを平易な日本語表示 + クリック詳細ポップオーバーへ刷新 (#440)
   「awake+lid」等の略語表示をやめ、「スリープ防止中」「スリープ防止中・蓋閉じOK」
   「スリープ防止中・高温注意」（高温時は赤字）の初見で意味が取れる表示に変更。

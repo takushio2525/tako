@@ -54,7 +54,7 @@ use std::collections::HashMap;
 use std::io;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use rust_embed::Embed;
 use serde_json::{json, Value};
@@ -1029,6 +1029,11 @@ pub fn run_daemon(port: Option<u16>) -> io::Result<()> {
         "transport": "tailscale-serve",
     });
     println!("{info}");
+
+    // CORS 許可 origin を設定（#287 P1: `*` 廃止 → base_url のみエコー）
+    CORS_ALLOWED_ORIGIN
+        .set(base_url.trim_end_matches('/').to_string())
+        .ok();
 
     // daemon 共有コンテキスト（二層認証・接続追跡。#283）
     // base_url は "https://<host>.ts.net" 形式。expected_host はスキーム除去
@@ -2150,9 +2155,17 @@ fn tmux_reset_window_size(tmux_socket: &str, window_target: &str) -> Result<(), 
 
 // --- HTTP サーバー ---
 
+/// daemon 起動時に base_url から設定される許可 origin（#287 P1: cross-origin 遮断）。
+/// `Access-Control-Allow-Origin: *` を廃止し、この値のみをエコーする
+static CORS_ALLOWED_ORIGIN: OnceLock<String> = OnceLock::new();
+
 fn cors_headers() -> Vec<tiny_http::Header> {
+    let origin = CORS_ALLOWED_ORIGIN
+        .get()
+        .map(|s| s.as_str())
+        .unwrap_or("null");
     vec![
-        tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..])
+        tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], origin.as_bytes())
             .expect("固定ヘッダ"),
         tiny_http::Header::from_bytes(
             &b"Access-Control-Allow-Methods"[..],
@@ -2164,7 +2177,23 @@ fn cors_headers() -> Vec<tiny_http::Header> {
             &b"Authorization, Content-Type"[..],
         )
         .expect("固定ヘッダ"),
+        tiny_http::Header::from_bytes(&b"Vary"[..], &b"Origin"[..]).expect("固定ヘッダ"),
     ]
+}
+
+/// Origin ヘッダを base_url と照合する（#287 P1: cross-origin 遮断）。
+/// - Origin 欠落 = 同一 origin のブラウザリクエストまたは非ブラウザ（CLI 等）→ 許可
+/// - Origin が base_url と一致 → 許可
+/// - Origin が base_url と不一致 → 拒否（evil origin）
+fn check_request_origin(ctx: &DaemonCtx, request: &tiny_http::Request) -> Result<(), String> {
+    if let Some(origin) = header_value(request, "origin") {
+        let allowed = ctx.base_url.trim_end_matches('/');
+        let given = origin.trim_end_matches('/');
+        if !given.eq_ignore_ascii_case(allowed) {
+            return Err(format!("Origin '{origin}' は許可されていない"));
+        }
+    }
+    Ok(())
 }
 
 fn respond(request: tiny_http::Request, status: u16, body: Option<String>) {
@@ -2863,7 +2892,13 @@ fn handle_request_v2(
     let path = url_full.split('?').next().unwrap_or("").to_string();
     let tmux_socket = &ctx.tmux_socket;
 
-    // CORS preflight
+    // #287 P1: cross-origin 遮断。Origin ヘッダが存在し base_url と不一致なら即拒否
+    // （evil origin の fetch / preflight を認証より手前で遮断する）
+    if let Err(e) = check_request_origin(ctx, &request) {
+        return respond(request, 403, Some(json!({ "error": e }).to_string()));
+    }
+
+    // CORS preflight（Origin 検証済みの場合のみ到達する）
     if method == tiny_http::Method::Options {
         return respond(request, 204, None);
     }
@@ -3874,6 +3909,27 @@ fn handle_ws_v2(
     app_conn: &Arc<RwLock<AppConnection>>,
     pane_mapping: &Arc<RwLock<PaneMapping>>,
 ) {
+    // #287 P1: WS upgrade でも Origin を検証（ブラウザは WS に必ず Origin を付与する）
+    if let Err(e) = check_request_origin(ctx, &request) {
+        return respond(request, 403, Some(json!({ "error": e }).to_string()));
+    }
+    // #287 P1: クライアントが WS_PROTOCOL を提示していることを検証
+    // （ブラウザは `new WebSocket(url, ["tako-remote"])` で送る）
+    let ws_protocols = header_value(&request, "sec-websocket-protocol").unwrap_or_default();
+    if !ws_protocols
+        .split(',')
+        .any(|p| p.trim().eq_ignore_ascii_case(WS_PROTOCOL))
+    {
+        return respond(
+            request,
+            400,
+            Some(
+                json!({ "error": format!("Sec-WebSocket-Protocol に '{WS_PROTOCOL}' が必要") })
+                    .to_string(),
+            ),
+        );
+    }
+
     let url_full = request.url().to_string();
     // 二層認証（画面データは Observe role から）
     let device = match authorize_device_checked(ctx, &request, DeviceRole::Observe) {
@@ -4805,5 +4861,105 @@ mod tests {
             Some(crate::dispatch::STABLE_APP_BINARY)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #287 P1: cross-origin 遮断テスト ---
+
+    #[test]
+    fn origin検証_同一originは許可() {
+        let base = "https://host.example.ts.net";
+        let allowed = base.trim_end_matches('/');
+
+        // 完全一致
+        let given = "https://host.example.ts.net".trim_end_matches('/');
+        assert!(given.eq_ignore_ascii_case(allowed));
+
+        // 末尾スラッシュの違いを許容
+        let given = "https://host.example.ts.net/".trim_end_matches('/');
+        assert!(given.eq_ignore_ascii_case(allowed));
+
+        // 大文字小文字を無視
+        let given = "HTTPS://HOST.EXAMPLE.TS.NET".trim_end_matches('/');
+        assert!(given.eq_ignore_ascii_case(allowed));
+    }
+
+    #[test]
+    fn origin検証_evil_originは拒否() {
+        let base = "https://host.example.ts.net";
+        let allowed = base.trim_end_matches('/');
+
+        // 別ドメイン
+        let evil = "https://evil.example.com".trim_end_matches('/');
+        assert!(!evil.eq_ignore_ascii_case(allowed));
+
+        // サブドメイン偽装
+        let evil = "https://host.example.ts.net.evil.com".trim_end_matches('/');
+        assert!(!evil.eq_ignore_ascii_case(allowed));
+
+        // スキーム違い（http vs https）
+        let evil = "http://host.example.ts.net".trim_end_matches('/');
+        assert!(!evil.eq_ignore_ascii_case(allowed));
+    }
+
+    #[test]
+    fn origin検証_テストモードのlocalhostも正しく照合() {
+        let base = "http://127.0.0.1:7749";
+        let allowed = base.trim_end_matches('/');
+
+        // 同一ポート = 許可
+        let given = "http://127.0.0.1:7749".trim_end_matches('/');
+        assert!(given.eq_ignore_ascii_case(allowed));
+
+        // 異なるポート = 拒否
+        let evil = "http://127.0.0.1:8080".trim_end_matches('/');
+        assert!(!evil.eq_ignore_ascii_case(allowed));
+    }
+
+    #[test]
+    fn cors_headersにワイルドカードが含まれない() {
+        // OnceLock は一度しか set できないため、既に設定済みでも OK を返す
+        CORS_ALLOWED_ORIGIN
+            .set("https://test.ts.net".to_string())
+            .ok();
+        let headers = cors_headers();
+        for h in &headers {
+            if h.field.equiv("Access-Control-Allow-Origin") {
+                assert_ne!(h.value.as_str(), "*", "CORS に * が含まれてはならない");
+            }
+        }
+        // Vary: Origin が含まれること
+        assert!(
+            headers
+                .iter()
+                .any(|h| h.field.equiv("Vary") && h.value.as_str().contains("Origin")),
+            "Vary: Origin ヘッダが必要"
+        );
+    }
+
+    #[test]
+    fn ws_subprotocol検証のロジック() {
+        // WS_PROTOCOL が含まれるケース
+        let protocols = "tako-remote";
+        assert!(protocols
+            .split(',')
+            .any(|p| p.trim().eq_ignore_ascii_case(WS_PROTOCOL)));
+
+        // 複数プロトコルの中に含まれるケース
+        let protocols = "other, tako-remote, another";
+        assert!(protocols
+            .split(',')
+            .any(|p| p.trim().eq_ignore_ascii_case(WS_PROTOCOL)));
+
+        // 含まれないケース
+        let protocols = "other-protocol";
+        assert!(!protocols
+            .split(',')
+            .any(|p| p.trim().eq_ignore_ascii_case(WS_PROTOCOL)));
+
+        // 空文字列
+        let protocols = "";
+        assert!(!protocols
+            .split(',')
+            .any(|p| p.trim().eq_ignore_ascii_case(WS_PROTOCOL)));
     }
 }
