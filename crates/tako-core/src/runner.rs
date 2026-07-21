@@ -762,6 +762,19 @@ mod tests {
     }
 
     #[test]
+    fn 解決_command拡張子は既定でbash実行() {
+        // #453: 日本語パス + 宣言なし .command が拡張子既定で解決されること
+        let path =
+            PathBuf::from("/Users/a/Documents/クラウドコンピューティング/docs/start-docs.command");
+        let head = "#!/usr/bin/env bash\n# 起動スクリプト\nset -e\n";
+        let defaults = merged_defaults(&BTreeMap::new());
+        let res = resolve(&path, head, &defaults, None, None).unwrap();
+        assert_eq!(res.plan.source, RunSource::ExtensionDefault);
+        assert_eq!(res.plan.command, "bash start-docs.command");
+        assert_eq!(res.all_profiles.len(), 1);
+    }
+
+    #[test]
     fn 解決_オーバーライド最優先() {
         let path = PathBuf::from("/tmp/test.py");
         let head = "# tako:run: python3 ${fileBase}\n";

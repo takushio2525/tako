@@ -3707,12 +3707,15 @@ fn spawn_command_pane(
 
     let wrapped =
         format!("{command}; echo \"__TAKO_EXIT=$?\"; read -r __TAKO_DUMMY__ 2>/dev/null || true");
+    // 複合シェルコード（`;` / `||` 入り）は program 1 語に詰めず /bin/sh -c の引数で渡す。
+    // program に詰めると login_shell_command の shell_quoted が全文を 1 語にクォートし、
+    // シェルが「セミコロン込みの 1 コマンド名」として探して 127 で即死する（#453）
     host.attach_session(
         new_id,
         SpawnOptions {
             command: Some(SpawnCommand {
-                program: wrapped,
-                args: Vec::new(),
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), wrapped],
             }),
             cwd,
             env: Vec::new(),
@@ -10485,18 +10488,55 @@ mod tests {
         let pane_id = result["pane"].as_u64().unwrap();
         let opts = host.attached_options.get(&pane_id).expect("options 記録");
         let cmd = opts.command.as_ref().expect("command が設定されている");
-        assert!(cmd.program.contains("__TAKO_EXIT="), "{}", cmd.program);
+        // 複合シェルコードは /bin/sh -c の引数（program 1 語詰めは 127 即死。#453）
+        assert_eq!(cmd.program, "/bin/sh");
+        assert_eq!(cmd.args.first().map(String::as_str), Some("-c"));
+        let sh_code = cmd.args.get(1).expect("-c の引数");
+        assert!(sh_code.contains("__TAKO_EXIT="), "{sh_code}");
+        assert!(sh_code.contains(r#"read "ans?input: ""#), "{sh_code}");
         assert!(
-            cmd.program.contains(r#"read "ans?input: ""#),
-            "{}",
-            cmd.program
+            sh_code.ends_with("read -r __TAKO_DUMMY__ 2>/dev/null || true"),
+            "{sh_code}"
         );
-        assert!(
-            cmd.program
-                .ends_with("read -r __TAKO_DUMMY__ 2>/dev/null || true"),
-            "{}",
-            cmd.program
-        );
+    }
+
+    #[test]
+    fn runはコマンドをsh_c構造でspawnする() {
+        // #453: Run ペインの SpawnCommand が /bin/sh -c 構造であること
+        //（program に複合コマンド全文を詰めると login_shell_command のクォートで
+        // 1 コマンド名扱いになり command not found で即死する）
+        let dir = std::env::temp_dir().join(format!("tako-run-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hello.command");
+        std::fs::write(&file, "#!/usr/bin/env bash\necho hello\n").unwrap();
+
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::Run {
+                path: file.display().to_string(),
+                pane: Some(root.as_u64()),
+                tab: None,
+                profile: None,
+                command: None,
+                direction: None,
+                ratio: None,
+                auto_close: None,
+                focus: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let pane_id = result["pane"].as_u64().unwrap();
+        let opts = host.attached_options.get(&pane_id).expect("options 記録");
+        let cmd = opts.command.as_ref().expect("command が設定されている");
+        assert_eq!(cmd.program, "/bin/sh");
+        assert_eq!(cmd.args.first().map(String::as_str), Some("-c"));
+        let sh_code = cmd.args.get(1).expect("-c の引数");
+        assert!(sh_code.starts_with("bash hello.command"), "{sh_code}");
+        assert!(sh_code.contains("__TAKO_EXIT="), "{sh_code}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // === 複数ウィンドウ（Issue #339） ===

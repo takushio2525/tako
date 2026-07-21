@@ -1424,6 +1424,8 @@ impl TakoApp {
         // これにより暗転（空 div フォールバック）と旧資源残留を同時に防ぐ。(#257 / #258)
         self.pending_pdf_rasters.remove(&pane);
         self.previews.insert(pane, loaded.state);
+        // Code Runner: リロードで tako:run 宣言の追加・削除を反映する（#453）
+        self.detect_preview_run_profiles(pane, path);
         self.preview_reload_apply_count = self.preview_reload_apply_count.saturating_add(1);
         cx.notify();
     }

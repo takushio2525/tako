@@ -1106,9 +1106,16 @@
   （snapshot 実測）、confirm_close のみ非永続（config.yaml 初期化・要修正）
 - 次: master レビュー → M1 から実装着手（worker 割当は master 判断）
 
-## 2026-07-22（#459: 設定画面 M4〜M7 — 全 7 タブ実装完了）
-- M4 Code Runner + M5 セットアップ + M6 スリープ防止/リモート/高度の全タブを実装。
-  1:1 監査で全項目が既存 CLI/MCP で操作可能と確認（新設 dispatch 不要）。
-  PR #461 のテーマテスト回帰・MCP 数・clippy も修正
-- 関連コミット: `04dfcee` `[機能追加] 設定画面 M4〜M6`
-- 次: push → PR → squash merge → 実機確認
+## 2026-07-22（#453 M4: Code Runner UI — 再生ボタン + プロファイルドロップダウン）
+- プレビューヘッダに play.svg アイコン + ドロップダウンシェブロン（2+ プロファイル時）を追加。
+  宣言検出 / 拡張子既定 / 淡色無効 / dirty 自動保存 / dispatch Run 経路を実装。i18n 対応
+- 関連コミット: PR #460 squash merge。品質ゲート全緑（359+27 tests / fmt / clippy）。
+  CLI 検証 4 項目パス。GUI スクショは screencapture 権限の制約で未取得（ユーザー実機確認待ち）
+
+## 2026-07-22（#453: 再生ボタン無反応の根治 — 復元経路の検出漏れ + Run ペイン即死）
+- 根因 2 件を隔離実測で確定: ①persist 復元・リロード経路で preview_run_profiles 未検出
+  （ボタン淡色 = on_click 無し）→ detect_preview_run_profiles 抽出 + 3 経路呼び出し
+  ②spawn_command_pane の複合コマンド program 1 語詰め → login_shell_command クォートで
+  127 即死 → /bin/sh -c 構造化。テスト 2 本追加 + 既存 1 本を正しい構造検証へ更新
+- 検証: before/after 隔離実測（profiles None→Some(1)・Run ペイン即死→出力可視）+
+  品質ゲート全緑（1195 tests / fmt / clippy）

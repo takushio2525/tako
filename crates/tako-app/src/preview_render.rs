@@ -3473,6 +3473,29 @@ impl TakoApp {
     }
 
     /// Code Runner: 再生ボタンクリック → dispatch Run（#453 M4）
+    /// Code Runner: プレビュー対象ファイルの実行プロファイルを検出して登録する（#453 M4）。
+    /// set_preview（dispatch OpenFile）だけでなく persist 復元・ライブリロードの
+    /// プレビュー差し替えでも呼ぶ。呼び漏れると `preview_run_profiles` が空のままになり、
+    /// 再生ボタンが淡色（クリック無効）で表示される
+    pub(crate) fn detect_preview_run_profiles(&mut self, pane: PaneId, path: &std::path::Path) {
+        use tako_core::runner;
+        if let Some(head) = runner::read_file_head_for_ui(path) {
+            let settings = tako_control::settings::load();
+            let ext_defaults = runner::merged_defaults(&settings.runner_defaults);
+            match runner::resolve(path, &head, &ext_defaults, None, None) {
+                Ok(resolution) => {
+                    self.preview_run_profiles
+                        .insert(pane, resolution.all_profiles);
+                }
+                Err(_) => {
+                    self.preview_run_profiles.insert(pane, Vec::new());
+                }
+            }
+        } else {
+            self.preview_run_profiles.remove(&pane);
+        }
+    }
+
     pub(crate) fn run_preview_file(
         &mut self,
         pane_id: PaneId,
