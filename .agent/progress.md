@@ -1084,3 +1084,14 @@
   CORS `*` を廃止し許可 origin のみエコー + Vary: Origin。WS で subprotocol 必須化。テスト 5 本追加
 - 関連コミット: `f12a9af`（PR #450 squash merge）。品質ゲート全緑 + 隔離デーモンで evil/正規 Origin の e2e 実測
 - 残: P1-2 identity spoof（Unix socket 化）は別タスク
+
+## 2026-07-22（#435: UI の日英 i18n — ロケールキー化 + 言語切替 UI/CLI/MCP）
+
+- `tako-core::i18n` 新設（OS ロケール検出 = env→AppleLanguages→英語）+ `ui_text/` を
+  `tr!(ja, en)` カタログ化し主要 UI を英語対応。切替は CLI `tako lang` / MCP `tako_lang`
+  （106 ツール）/ パレットの 3 経路（settings.json `language` 永続化・GUI 即時反映）。
+  conventions.md に「新機能は日英必須」を明文化
+- 関連コミット: `be0606d`（PR #454 squash merge）。品質ゲート全緑 + 隔離セルフテスト
+  FAILED 0（33c = MCP lang e2e 新設）+ 隔離実測（日英切替スクショ・OS ロケール既定・永続化）
+- 次: install 後に実機確認（`tako lang en` → 英語 UI・パレット切替）→ #435 タスク 3
+  （README 英語化）は別タスク
