@@ -4685,7 +4685,7 @@ impl TakoApp {
             return Vec::new();
         }
         // orphan ごとに cwd と role を取得
-        let tab_title = "復帰".to_string();
+        let tab_title = crate::ui_text::common::restore().to_string();
         let first_pane = Pane::new(PaneOrigin::User);
         let first_id = first_pane.id();
         self.workspace.create_tab(tab_title, first_pane);
@@ -5172,6 +5172,27 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// UI 表示言語の 日→英→日 トグル（Issue #435。コマンドパレット用。
+    /// dispatch::Lang と同じ状態遷移 + settings 永続化で UI / AI 操作の等価性を保つ）
+    pub(crate) fn toggle_language(&mut self, cx: &mut Context<Self>) {
+        use tako_core::i18n::{self, Lang, LangSetting};
+        let next = match i18n::lang() {
+            Lang::Ja => LangSetting::En,
+            Lang::En => LangSetting::Ja,
+        };
+        self.lang_setting = next;
+        i18n::set_lang(next.resolve());
+        // セルフテスト中はユーザー設定を汚さない（dispatch 側と同方針）
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.language = next.as_str().into();
+            if let Err(e) = tako_control::settings::save(&settings) {
+                eprintln!("warning: 設定を保存できない: {e}");
+            }
+        }
+        cx.notify();
+    }
+
     fn save_sidebar_width(&self) {
         if std::env::var_os("TAKO_SELF_TEST").is_some() {
             return;
@@ -5294,20 +5315,24 @@ impl TakoApp {
                 ));
             }
         }
-        // 固定コマンド
-        const COMMANDS: &[(&str, &str)] = &[
-            ("新しいタブ", "new-tab"),
-            ("テーマをライト/ダーク切替", "toggle-theme"),
-            ("ファイルツリーを開閉", "toggle-files"),
-            ("バックグラウンドドロワーを開閉", "toggle-drawer"),
-            ("fleet パネルを開く", "panel-fleet"),
-            ("orch パネルを開く", "panel-orch"),
-            ("git パネルを開く", "panel-git"),
-            ("ペインを右に分割", "split-right"),
-            ("ペインを下に分割", "split-down"),
+        // 固定コマンド（表示ラベルは ui_text::palette が言語別に解決）
+        const COMMANDS: &[&str] = &[
+            "new-tab",
+            "toggle-theme",
+            "toggle-language",
+            "toggle-files",
+            "toggle-drawer",
+            "panel-fleet",
+            "panel-orch",
+            "panel-git",
+            "split-right",
+            "split-down",
         ];
-        for (label, id) in COMMANDS {
-            items.push(PaletteItem::Command(label, id));
+        for id in COMMANDS {
+            items.push(PaletteItem::Command(
+                crate::ui_text::palette::cmd_label(id),
+                id,
+            ));
         }
         if q.is_empty() {
             return items;
@@ -5366,6 +5391,7 @@ impl TakoApp {
             PaletteItem::Command(_, id) => match id {
                 "new-tab" => self.new_tab(cx),
                 "toggle-theme" => self.toggle_theme(cx),
+                "toggle-language" => self.toggle_language(cx),
                 "toggle-files" => {
                     self.toggle_filetree();
                     cx.notify();
@@ -21523,12 +21549,15 @@ mod self_test {
                     .update(cx, |app, window, cx| {
                         app.open_command_palette(window, cx);
                         let opened = app.command_palette.is_some();
-                        // 「テーマ」で絞ると toggle-theme コマンドが先頭に来る
+                        // テーマ切替コマンドのラベルで絞ると toggle-theme が先頭に来る
+                        // （表示言語に依存しないようカタログからラベルを引く。#435）
+                        let theme_label =
+                            crate::ui_text::palette::cmd_label("toggle-theme").to_string();
                         if let Some(p) = app.command_palette.as_mut() {
-                            p.query = "テーマ".into();
+                            p.query = theme_label.clone();
                             p.selected = 0;
                         }
-                        let items = app.palette_items("テーマ");
+                        let items = app.palette_items(&theme_label);
                         let has_theme = matches!(
                             items.first(),
                             Some(PaletteItem::Command(_, "toggle-theme"))
