@@ -16326,8 +16326,8 @@ mod self_test {
                 let en_applied = tako_core::i18n::lang() == tako_core::i18n::Lang::En;
                 check(
                     status == 200
-                        && response.contains(r#""language":"en""#)
-                        && response.contains(r#""resolved":"en""#)
+                        && response.contains(r#"\"language\":\"en\""#)
+                        && response.contains(r#"\"resolved\":\"en\""#)
                         && en_applied,
                     "MCP lang set en（i18n 反映）",
                 );
@@ -16343,7 +16343,7 @@ mod self_test {
                 let ja_applied = tako_core::i18n::lang() == tako_core::i18n::Lang::Ja;
                 check(
                     status == 200
-                        && response.contains(r#""resolved":"ja""#)
+                        && response.contains(r#"\"resolved\":\"ja\""#)
                         && ja_applied,
                     "MCP lang set ja（i18n 反映）",
                 );
