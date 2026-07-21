@@ -63,7 +63,7 @@ export function PanesPage({ me }) {
       setError(null);
 
       for (const p of list) {
-        c.screen(p.id, 5)
+        c.screen(p.tmux_target || p.id, 5)
           .then(s => setPreviews(prev => ({ ...prev, [p.id]: s.lines || [] })))
           .catch(() => {});
       }

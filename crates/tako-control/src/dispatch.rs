@@ -5475,6 +5475,7 @@ fn list_json(host: &dyn ControlHost) -> Value {
                                 "dirty": dirty,
                             })
                         }),
+                        "tmux_session": host.backend_session(p.id()),
                         "backend_windows": host.backend_windows(p.id()).map(|ws| ws.iter().map(|w| json!({
                             "index": w.index,
                             "name": w.name,
