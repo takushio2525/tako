@@ -4,20 +4,20 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-22・#421 修正完了）
+## 現在の対象（2026-07-22・#423/#426/#424 修正完了）
 
-**#421（セルフテスト type_text ハング）を修正・マージ済み**
+**リモートサーバーバグ 3 件を PR #427 で修正・マージ済み**
 
-- PR #422 → squash merge（`f0a3a6c`）。main に反映済み
-- 根因: GPUI の `dispatch_keystroke` が毎文字フルレイアウト再計算（taffy flexbox）を
-  トリガーし、テスト 69c の `link_command`（182 文字）で数百秒かかりタイムアウト
-- 修正: `type_text` に 80 文字閾値を導入。短い文字列は `dispatch_keystroke`（入力経路
-  検証を維持）、長い文字列は PTY 直接 `paste()` で GPUI 再描画を回避
+- PR #427 → squash merge（`eea56e1`）。main に反映済み
+- 根因: v2 API が返す数値 PaneId を WS / screen API にそのまま渡すと
+  tmux ターゲットとして無効で即エラー → WS 即切断 → 3 秒再接続 → 無限ループ
+- 修正: PaneId→tmux ターゲット自動解決を全 API に追加、WS 通知デバウンス、
+  v2 API fallback 統一、tmux_target フィールド追加
 
 ## 次の一手
 
-- `build-app.sh --install` → 実機でタブ D&D のインジケータ正位置を目視確認
-- v0.6.0-test.1 テスト版の iPhone 実機確認（remote 刷新の Tailscale 接続テスト）
+- `build-app.sh --install` → 実機でリモート接続の検証（WS 安定・term 表示・master 一覧）
+- v0.6.0-test.1 テスト版の iPhone 実機確認（Tailscale 接続テスト）
 - テスト版で見つかったバグを修正 → v0.6.0-test.2 を積む
 
 ## 現フェーズで Read すべき設計書

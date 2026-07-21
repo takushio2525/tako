@@ -1018,3 +1018,9 @@
   テスト 69c の `link_command`（182 文字）で 182 回再描画→タイムアウト。`sample` でスタック確定
 - 修正: `type_text` に 80 文字閾値を導入。長い文字列は PTY 直接 `paste()` で再描画を回避
 - 関連コミット: `f0a3a6c`（PR #422 squash merge）。品質ゲート全緑（1080 tests）
+
+## 2026-07-22（#423/#426/#424: リモートサーバーバグ 3 件修正）
+
+- 根因: v2 API の数値 PaneId を WS/screen API に渡すと tmux ターゲットとして無効で即エラー → WS 無限 open/close + term 無限ロード。PaneId→tmux ターゲット自動解決を全 API に追加、WS 通知デバウンス、v2 fallback 統一
+- 関連コミット: `eea56e1`（PR #427 squash merge）。品質ゲート全緑（1080 tests）
+- 次: `build-app.sh --install` → 実機でリモート接続検証
