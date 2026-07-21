@@ -1959,9 +1959,13 @@ impl TakoApp {
             .filter(|w| *w != active_window)
             .collect();
         // App Nap 無効化 + 初回スリープ防止更新（Issue #173）
-        // 蓋閉じ防止の残留チェック（#218: 前回クラッシュ時の disablesleep=1 を自動復帰）
         tako_control::sleep_guard::disable_app_nap();
-        tako_control::sleep_guard::check_disablesleep_residual();
+        // 蓋閉じ防止の残留チェック（#218: 前回クラッシュ時の disablesleep=1 を自動復帰）
+        // セカンダリモードはプライマリの状態を壊すためスキップ（#449。
+        // TAKO_ISOLATED / other_tako_running のガードは関数内で実施）
+        if !secondary {
+            tako_control::sleep_guard::check_disablesleep_residual();
+        }
         // 起動直後は Unknown バックエンドの子プロセス判定（tmux + ps）を待たず 0 で仮適用し、
         // 初回の 2 秒 tick が background 判定で正確な値に補正する（#340）
         app.apply_sleep_guard(&tako_control::settings::load(), 0);
