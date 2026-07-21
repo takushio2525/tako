@@ -1095,3 +1095,13 @@
   FAILED 0（33c = MCP lang e2e 新設）+ 隔離実測（日英切替スクショ・OS ロケール既定・永続化）
 - 次: install 後に実機確認（`tako lang en` → 英語 UI・パレット切替）→ #435 タスク 3
   （README 英語化）は別タスク
+
+## 2026-07-22（#459: 設定画面（Cmd+,）の詳細設計 — 設計のみ・コード変更なし）
+
+- `.agent/plans/2026-07-settings-ui.md` 新設: タブ 7 構成 / 色設定スキーマ（Theme 58 色を
+  settings.json `theme_colors` + `theme_presets` で上書き、既存 `Theme` dispatch の action 拡張）/
+  独立 GPUI ウィンドウ（別 root view + pending キュー）/ dispatch 直呼びによる CLI・MCP 1:1 /
+  M1〜M7 マイルストーン（機械検証つき受け入れ条件）
+- 調査で確定: 設定変更 dispatch 15 種の一覧、settings.json 17 フィールド、MCP 106 ツール
+  （snapshot 実測）、confirm_close のみ非永続（config.yaml 初期化・要修正）
+- 次: master レビュー → M1 から実装着手（worker 割当は master 判断）
