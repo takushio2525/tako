@@ -318,10 +318,17 @@ export function TerminalPage({ paneId, me }) {
     });
   }
 
+  function autoResizeTextarea(el) {
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = el.scrollHeight + 'px';
+  }
+
   async function termSend() {
     if (!clientRef.current) return;
     const text = input;
     setInput('');
+    if (inputRef.current) inputRef.current.style.height = 'auto';
     if (navigator.vibrate) navigator.vibrate(10);
     try { await clientRef.current.input(paneId, text, true); } catch {}
     inputRef.current?.focus();
@@ -490,7 +497,7 @@ export function TerminalPage({ paneId, me }) {
               ref={inputRef}
               class="term-input-field"
               value={input}
-              onInput={e => setInput(e.target.value)}
+              onInput={e => { setInput(e.target.value); autoResizeTextarea(e.target); }}
               onKeyDown={onTermKeyDown}
               placeholder="$ command..."
               autocomplete="off"
