@@ -211,6 +211,80 @@ pub fn resolve_session_id_for_backend(backend_session: &str) -> Option<String> {
     None
 }
 
+/// バックエンドセッションで**今まさに動いている** claude エージェント（live 解決）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveClaudeSession {
+    /// claude の session_id（transcript 参照キー）
+    pub session_id: String,
+    /// 対話型 TUI か（`claude agents --json` の kind == "interactive"。
+    /// `claude -p` 等の一時セッションと区別し、ペインの agent 種別判定に使う）
+    pub interactive: bool,
+}
+
+/// 全バックエンドセッションの live claude セッションを一括解決する
+/// （tmux list-panes / ps / claude agents を各 1 回だけ実行。#439）。
+/// 返り値: バックエンドセッション名 → LiveClaudeSession。
+/// pid 祖先辿りで実プロセスの存在を確認するため、role やカタログの stale 記録に
+/// 依存しない ground truth になる
+pub fn live_claude_sessions_by_backend() -> HashMap<String, LiveClaudeSession> {
+    let socket = tako_core::tmux_backend::socket_name();
+    let panes = tmux_pane_pids(Some(&socket));
+    if panes.is_empty() {
+        return HashMap::new();
+    }
+    let Ok(agents) = list_agents() else {
+        return HashMap::new();
+    };
+    if agents.is_empty() {
+        return HashMap::new();
+    }
+    let parents = process_parent_map();
+    live_sessions_inner(&panes, &agents, &parents)
+}
+
+/// 一括解決の内部ロジック（テスト可能な純関数部）。
+/// 各 agent の pid 祖先がどれかの pane_pid に到達したら、そのペインの
+/// セッション名（`session:w.p` の `:` より前）へ対応付ける
+fn live_sessions_inner(
+    panes: &[(String, u32)],
+    agents: &[Value],
+    parents: &HashMap<u32, u32>,
+) -> HashMap<String, LiveClaudeSession> {
+    let pane_by_pid: HashMap<u32, &str> =
+        panes.iter().map(|(id, pid)| (*pid, id.as_str())).collect();
+    let mut map = HashMap::new();
+    for agent in agents {
+        let Some(pid) = agent["pid"].as_u64().map(|p| p as u32) else {
+            continue;
+        };
+        let Some(session_id) = agent["session_id"].as_str().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some(pane_id) = find_ancestor_pane(pid, parents, &pane_by_pid) else {
+            continue;
+        };
+        let Some(backend) = pane_id.split(':').next().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let interactive = agent["kind"].as_str() == Some("interactive");
+        // 同一セッションに複数 agent が居る場合は interactive を優先して残す
+        map.entry(backend.to_string())
+            .and_modify(|existing: &mut LiveClaudeSession| {
+                if interactive && !existing.interactive {
+                    *existing = LiveClaudeSession {
+                        session_id: session_id.to_string(),
+                        interactive,
+                    };
+                }
+            })
+            .or_insert(LiveClaudeSession {
+                session_id: session_id.to_string(),
+                interactive,
+            });
+    }
+    map
+}
+
 /// tmux セッション配下に実行中の子プロセス（tmux クライアント除外）があるか。
 /// worker_status の idle 判定を補正するために使う（Issue #224: 偽 IDLE 根治）。
 /// `backend_session` は tako の tmux バックエンドセッション名（例: `tako-s3`）。
@@ -461,5 +535,62 @@ mod tests {
             count_sessions_with_children_inner(&["tako-nonexist"], &panes, &parents),
             0
         );
+    }
+
+    // --- #439: live claude セッションの一括解決 ---
+
+    #[test]
+    fn live_sessions_innerはpid祖先でバックエンドへ対応付ける() {
+        // tako-s1 の pane_pid=100 → claude(300)、tako-s2 の pane_pid=500 → claude -p(600)
+        let panes = vec![
+            ("tako-s1:0.0".to_string(), 100u32),
+            ("tako-s2:0.0".to_string(), 500u32),
+        ];
+        let parents: HashMap<u32, u32> =
+            [(300, 200), (200, 100), (100, 1), (600, 500), (500, 1)].into();
+        let agents = vec![
+            json!({ "session_id": "sid-interactive", "pid": 300, "kind": "interactive" }),
+            json!({ "session_id": "sid-headless", "pid": 600, "kind": "headless" }),
+            json!({ "session_id": "sid-orphan", "pid": 999, "kind": "interactive" }),
+            json!({ "session_id": "", "pid": 300 }), // 空 ID は無視
+        ];
+        let map = live_sessions_inner(&panes, &agents, &parents);
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map["tako-s1"],
+            LiveClaudeSession {
+                session_id: "sid-interactive".into(),
+                interactive: true
+            }
+        );
+        assert_eq!(
+            map["tako-s2"],
+            LiveClaudeSession {
+                session_id: "sid-headless".into(),
+                interactive: false
+            }
+        );
+    }
+
+    #[test]
+    fn live_sessions_innerは同一セッションでinteractiveを優先する() {
+        // 同じペイン配下に headless（claude -p 子プロセス）と interactive が同居した場合
+        let panes = vec![("tako-s1:0.0".to_string(), 100u32)];
+        let parents: HashMap<u32, u32> = [(300, 100), (400, 100), (100, 1)].into();
+        let agents_headless_first = vec![
+            json!({ "session_id": "sid-p", "pid": 300, "kind": "headless" }),
+            json!({ "session_id": "sid-tui", "pid": 400, "kind": "interactive" }),
+        ];
+        let map = live_sessions_inner(&panes, &agents_headless_first, &parents);
+        assert_eq!(map["tako-s1"].session_id, "sid-tui");
+        assert!(map["tako-s1"].interactive);
+
+        // 逆順でも interactive が残る
+        let agents_tui_first = vec![
+            json!({ "session_id": "sid-tui", "pid": 400, "kind": "interactive" }),
+            json!({ "session_id": "sid-p", "pid": 300, "kind": "headless" }),
+        ];
+        let map = live_sessions_inner(&panes, &agents_tui_first, &parents);
+        assert_eq!(map["tako-s1"].session_id, "sid-tui");
     }
 }

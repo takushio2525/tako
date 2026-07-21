@@ -56,31 +56,32 @@ function ToolCard({ tool, agentType }) {
   );
 }
 
-// --- 承認待ちカード（カンプ 1b）---
-function ApprovalCard({ approval, onAllow, onDeny, canInteract }) {
+// --- 承認待ちカード（カンプ 1b / #425 再設計）---
+// 表示条件は「ペイン画面に permission ダイアログが実在する」こと（サーバーが
+// 画面キャプチャから検知してペイン情報に付与する）。transcript からの推定は廃止した
+// （auto mode のツール実行中と承認待ちが区別できず誤表示していた）。
+// ボタンは実ダイアログの選択肢そのもの。押すと respond API がダイアログ実在を
+// 再検証したうえで番号キーを送る
+function ApprovalCard({ dialog, onChoose, canInteract, sending }) {
+  const options = dialog.options || [];
+  const disabled = !canInteract || sending;
   return (
     <div class="approval-card">
       <div class="approval-card-header">
         <span class="approval-card-dot" />
         <span class="approval-card-title">承認が必要</span>
       </div>
-      <div class="approval-card-body">
-        {approval.tool && <><strong>{approval.tool}</strong>: </>}
-        {approval.command || approval.description || ''}
-      </div>
-      <div class="approval-card-actions">
-        <button
-          class="approval-btn-allow"
-          onClick={onAllow}
-          disabled={!canInteract}
-          style={!canInteract ? 'opacity:.4;cursor:not-allowed' : ''}
-        >許可 (y)</button>
-        <button
-          class="approval-btn-deny"
-          onClick={onDeny}
-          disabled={!canInteract}
-          style={!canInteract ? 'opacity:.4;cursor:not-allowed' : ''}
-        >拒否 (n)</button>
+      {dialog.command && <div class="approval-card-body">{dialog.command}</div>}
+      <div class="approval-card-actions" style="flex-direction:column;align-items:stretch">
+        {options.map((opt, i) => (
+          <button
+            key={i}
+            class={i === options.length - 1 && options.length > 1 ? 'approval-btn-deny' : 'approval-btn-allow'}
+            onClick={() => onChoose(i + 1)}
+            disabled={disabled}
+            style={`padding:9px 12px${disabled ? ';opacity:.4;cursor:not-allowed' : ''}`}
+          >{i + 1}. {opt}</button>
+        ))}
       </div>
     </div>
   );
@@ -118,14 +119,6 @@ function ChatMessage({ msg, agentType, paneId, onSend, canInteract }) {
       {msg.tools && msg.tools.map((tool, i) => (
         <ToolCard key={i} tool={tool} agentType={agentType} />
       ))}
-      {msg.approval && (
-        <ApprovalCard
-          approval={msg.approval}
-          canInteract={canInteract}
-          onAllow={() => onSend('y')}
-          onDeny={() => onSend('n')}
-        />
-      )}
       {msg.choices && msg.choices.length > 0 && (
         <ChoiceButtons
           choices={msg.choices}
@@ -390,12 +383,15 @@ export function ChatView({ paneId, info, agentType, onStop, me }) {
   const [showAttachSheet, setShowAttachSheet] = useState(false);
   const [pendingFile, setPendingFile] = useState(null);
   const [uploadState, setUploadState] = useState(null);
+  const [respondSending, setRespondSending] = useState(false);
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
   const timerRef = useRef(null);
   const atBottomRef = useRef(true);
 
-  const isRunning = info && (info.state === 'busy' || info.state === 'running');
+  // 承認待ち = ペイン画面に permission ダイアログが実在する（#425。サーバー検知）
+  const permissionDialog = info?.permission_dialog || null;
+  const isRunning = !permissionDialog && info && (info.state === 'busy' || info.state === 'running');
   const canInteract = me && (me.role === 'interact' || me.role === 'manage' || me.role === 'admin');
 
   const fetchMessages = useCallback(async () => {
@@ -426,7 +422,7 @@ export function ChatView({ paneId, info, agentType, onStop, me }) {
     if (atBottomRef.current && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [messages]);
+  }, [messages, permissionDialog]);
 
   function onScroll() {
     const el = scrollRef.current;
@@ -441,6 +437,18 @@ export function ChatView({ paneId, info, agentType, onStop, me }) {
     try {
       await createClient().input(paneId, t, true);
     } catch {}
+  }
+
+  // permission ダイアログへの応答（#425）。サーバーがダイアログ実在を再検証する。
+  // 409（既に解消済み）は次の panes ポーリングでカードが消えるため黙って無視する
+  async function respondToDialog(choice) {
+    if (respondSending) return;
+    setRespondSending(true);
+    if (navigator.vibrate) navigator.vibrate(10);
+    try {
+      await createClient().respond(paneId, choice);
+    } catch {}
+    setRespondSending(false);
   }
 
   async function sendFromComposer() {
@@ -560,6 +568,14 @@ export function ChatView({ paneId, info, agentType, onStop, me }) {
             </div>
           );
         })}
+        {permissionDialog && (
+          <ApprovalCard
+            dialog={permissionDialog}
+            canInteract={canInteract}
+            sending={respondSending}
+            onChoose={respondToDialog}
+          />
+        )}
         {isRunning && (
           <div class="chat-running">
             <span

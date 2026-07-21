@@ -101,8 +101,6 @@ pub fn normalize_lines(lines: impl Iterator<Item = String>, tail: usize) -> Vec<
     let mut out: VecDeque<Value> = VecDeque::with_capacity(tail + 1);
     // 直前の assistant エントリの requestId（複数行にまたがる応答の統合用）
     let mut last_request_id: Option<String> = None;
-    // 最後の tool_use に対する tool_result がまだ来ていないか
-    let mut has_pending_tools = false;
 
     for line in lines {
         let Ok(obj) = serde_json::from_str::<Value>(&line) else {
@@ -114,8 +112,6 @@ pub fn normalize_lines(lines: impl Iterator<Item = String>, tail: usize) -> Vec<
         }
         match obj["type"].as_str() {
             Some("user") => {
-                // tool_result を含む全 user 行で pending フラグをリセット
-                has_pending_tools = false;
                 // 本文が文字列の行だけがユーザー発話。配列は tool_result（スキップ）
                 let Some(text) = obj["message"]["content"].as_str() else {
                     continue;
@@ -175,9 +171,6 @@ pub fn normalize_lines(lines: impl Iterator<Item = String>, tail: usize) -> Vec<
                 if text.is_empty() && thinking.is_empty() && tools.is_empty() {
                     continue;
                 }
-                if !tools.is_empty() {
-                    has_pending_tools = true;
-                }
                 // 同一 requestId の連続 assistant 行は 1 エントリへ統合
                 let merged = request_id.is_some()
                     && request_id == last_request_id
@@ -209,24 +202,11 @@ pub fn normalize_lines(lines: impl Iterator<Item = String>, tail: usize) -> Vec<
             _ => {}
         }
     }
-    // 最終 assistant エントリの tool_use に対する tool_result がまだ来ていない場合のみ
-    // 承認待ちカードを表示する。auto mode で自動実行されたツールには付与しない（#425）
-    if has_pending_tools {
-        if let Some(last) = out.back_mut() {
-            if last["role"] == "assistant" {
-                if let Some(tools) = last["tools"].as_array() {
-                    if let Some(last_tool) = tools.last() {
-                        let tool_name = last_tool["name"].as_str().unwrap_or("");
-                        let tool_summary = last_tool["summary"].as_str().unwrap_or("");
-                        last["approval"] = json!({
-                            "tool": tool_name,
-                            "command": tool_summary,
-                        });
-                    }
-                }
-            }
-        }
-    }
+    // 承認待ち（approval）は transcript からは判定しない（#425 再設計）。
+    // transcript は「ツール実行中（auto mode で承認不要）」と「承認待ちで停止」を
+    // 区別できない — どちらも「末尾 tool_use + tool_result 未着」で同一に見えるため、
+    // 実行に時間がかかるツールの間じゅう誤った承認カードが出ていた。
+    // 承認待ちの正は画面の permission ダイアログ実在（remote::attach_permission_dialogs）
 
     // テキスト内の選択肢パターンを検出（「1. xxx 2. yyy」形式）
     if let Some(last) = out.back_mut() {
@@ -640,11 +620,13 @@ mod tests {
         assert_eq!(texts[0], "本");
     }
 
-    // --- #425: approval フィールドの条件付き付与 ---
+    // --- #425 再設計: transcript からは approval を一切付与しない ---
+    // 「末尾 tool_use + tool_result 未着」は auto mode のツール実行中と承認待ち停止の
+    // 両方で発生し区別不能。承認待ちは画面ダイアログ検知（remote 側）が正
 
     #[test]
-    fn tool_use後にtool_resultが無ければapprovalが付く() {
-        // ツール呼び出し直後（承認待ち）
+    fn tool_use直後でもapprovalは付かない() {
+        // 旧実装は tool_result 未着で approval を付けていた（実行中に誤爆する根因）
         let raw = [
             r#"{"type":"user","message":{"content":"ファイル作って"}}"#,
             r#"{"type":"assistant","requestId":"r1","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"touch foo"}}]}}"#,
@@ -652,14 +634,15 @@ mod tests {
         let msgs = normalize_lines(lines(&raw), 10);
         assert_eq!(msgs.len(), 2);
         assert!(
-            msgs[1]["approval"].is_object(),
-            "tool_result 未到着なので approval が付く"
+            msgs[1]["approval"].is_null(),
+            "実行中と区別できないため transcript では付与しない: {msgs:?}"
         );
-        assert_eq!(msgs[1]["approval"]["tool"], "Bash");
+        // tool 自体の表示情報は維持される
+        assert_eq!(msgs[1]["tools"][0]["name"], "Bash");
     }
 
     #[test]
-    fn tool_resultが来たらapprovalは付かない() {
+    fn tool_result完了後もapprovalは付かない() {
         // auto mode: tool_use → tool_result → 応答テキスト
         let raw = [
             r#"{"type":"user","message":{"content":"ファイル作って"}}"#,
@@ -670,31 +653,11 @@ mod tests {
         let msgs = normalize_lines(lines(&raw), 10);
         // tool_use と text は同一 requestId なので 1 エントリに統合
         assert_eq!(msgs.len(), 2);
-        assert!(
-            msgs[1]["approval"].is_null(),
-            "tool_result 到着済みなので approval は付かない"
-        );
+        assert!(msgs[1]["approval"].is_null());
     }
 
     #[test]
-    fn tool_resultだけ来てテキスト応答前でもapprovalは付かない() {
-        // tool_result は来たが応答テキストはまだ
-        let raw = [
-            r#"{"type":"user","message":{"content":"ls して"}}"#,
-            r#"{"type":"assistant","requestId":"r1","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#,
-            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"file1\nfile2"}]}}"#,
-        ];
-        let msgs = normalize_lines(lines(&raw), 10);
-        assert_eq!(msgs.len(), 2);
-        assert!(
-            msgs[1]["approval"].is_null(),
-            "tool_result 到着でリセットされる"
-        );
-    }
-
-    #[test]
-    fn 連続ツール呼び出しで最後だけpendingならapproval付く() {
-        // 1 つ目は完了、2 つ目は承認待ち
+    fn 連続ツール呼び出しでもapprovalは付かない() {
         let raw = [
             r#"{"type":"assistant","requestId":"r1","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"a.rs"}}]}}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"..."}]}}"#,
@@ -702,13 +665,10 @@ mod tests {
             r#"{"type":"assistant","requestId":"r2","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"a.rs"}}]}}"#,
         ];
         let msgs = normalize_lines(lines(&raw), 10);
-        // r1 は統合、r2 は別エントリ
         assert_eq!(msgs.len(), 2);
         assert!(msgs[0]["approval"].is_null());
-        assert!(
-            msgs[1]["approval"].is_object(),
-            "2 つ目は tool_result 未到着"
-        );
-        assert_eq!(msgs[1]["approval"]["tool"], "Edit");
+        assert!(msgs[1]["approval"].is_null());
+        // tool 表示情報は維持
+        assert_eq!(msgs[1]["tools"][0]["name"], "Edit");
     }
 }

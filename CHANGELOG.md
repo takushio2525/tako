@@ -52,12 +52,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Binary resolution now prefers the stable /Applications bundle, status/start
   expose the serve binary path, and a generation mismatch prompts a restart.
 
-- [修正] リモート: auto mode の自動実行コマンドに承認カードが出る問題を修正 (#425)
-  transcript 正規化が最終 assistant エントリの tools を無条件に承認待ちと判定していた。
-  tool_result の到着を追跡し、実際に承認待ちの場合のみカードを表示するよう修正。
-  Fix remote: approval cards shown for auto-mode tool calls (#425).
-  Transcript normalizer unconditionally flagged the last assistant's tools as pending.
-  Now tracks tool_result arrival and only shows approval when genuinely pending.
+- [修正] リモート: master ペインが claude チャット画面として検出されない問題を修正 (#439)
+  ペインの agent 種別判定が role 文字列だけに依存し、復元・handoff・手動起動などで
+  role が空の master 相当ペインは claude と認識されずチャット UI にならなかった。
+  `claude agents --json` の pid 祖先辿りでバックエンドセッションごとの稼働中 claude を
+  一括解決し（実プロセスの存在証明 = ground truth）、role が無くても対話型 claude が
+  動いていれば agent_type=claude + session_id を付与するよう変更。PWA は chat/term の
+  自動追従を双方向化（session_id が一時的に欠けても復帰できる）。
+  Fix remote: master pane not detected as a claude chat screen (#439).
+  Agent-type detection depended only on the role string, so role-less master panes
+  (after restore/handoff/manual launch) were never recognized as claude. Now resolves
+  the live claude session per backend via pid-ancestry over `claude agents --json`
+  and marks a pane as claude when an interactive claude is actually running.
+
+- [修正] リモート: auto mode の自動実行コマンドに承認カードが出る問題を根本修正 (#425)
+  承認待ちの判定を transcript の推定から**画面の permission ダイアログ実在**へ再設計した。
+  旧実装（#430）は「末尾 tool_use + tool_result 未着」を承認待ちとみなしたが、これは
+  auto mode のツール実行中（承認不要）と承認待ち停止の両方で成立し区別できないため、
+  実行に時間のかかるツールの間じゅう誤った承認カードが出続けていた。transcript からの
+  approval 付与を全廃し、v2 panes API がペイン画面を capture して permission ダイアログを
+  検知したときだけ `permission_dialog` を付与する方式へ変更。PWA はこれを唯一の根拠に
+  承認カードを表示し、選択肢ボタンは実ダイアログの選択肢そのもの。応答は新設の
+  `POST /api/panes/:id/respond`（ダイアログ実在を再検証してから番号キー + Enter を送達）。
+  Fix remote: approval cards shown for auto-mode tool calls, root-cause redesign (#425).
+  Pending-approval is now determined by the actual on-screen permission dialog rather
+  than transcript heuristics. The previous approach (#430) could not distinguish an
+  in-progress auto-mode tool call from a genuine approval stop, so cards appeared for
+  the entire duration of slow tools. Transcript-based approval is removed; the v2 panes
+  API captures the pane screen and attaches `permission_dialog` only when a real dialog
+  is present, answered via the new `POST /api/panes/:id/respond`.
 
 - [修正] 赤ボタン close → Dock 復帰でウインドウサイズ・位置がデフォルトに戻る問題を修正 (#412)
   最後のウィンドウ close 時に `drop_viewport` が `window_frames` を削除し、Dock 復帰の
