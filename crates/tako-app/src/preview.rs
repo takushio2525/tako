@@ -444,16 +444,19 @@ const MAX_IMAGE_BYTES: usize = 50_000_000; // 50 MB
 pub fn load_image(path: &Path) -> PreviewState {
     let format = match image_format_from_path(path) {
         Some(f) => f,
-        None => return PreviewState::error(path, PreviewMode::Image, "対応していない画像形式"),
+        None => {
+            return PreviewState::error(
+                path,
+                PreviewMode::Image,
+                crate::ui_text::preview::unsupported_image(),
+            )
+        }
     };
     match std::fs::read(path) {
         Ok(bytes) if bytes.len() > MAX_IMAGE_BYTES => PreviewState::error(
             path,
             PreviewMode::Image,
-            format!(
-                "画像が大きすぎる（{:.1} MB、上限 50 MB）",
-                bytes.len() as f64 / 1_000_000.0
-            ),
+            crate::ui_text::preview::image_too_large(bytes.len() as f64 / 1_000_000.0),
         ),
         Ok(bytes) => {
             let pixel_size = image::ImageReader::new(std::io::Cursor::new(&bytes))
@@ -473,7 +476,11 @@ pub fn load_image(path: &Path) -> PreviewState {
                 file_stamp: FileStamp::from_path(path),
             }
         }
-        Err(e) => PreviewState::error(path, PreviewMode::Image, format!("読み込めない: {e}")),
+        Err(e) => PreviewState::error(
+            path,
+            PreviewMode::Image,
+            crate::ui_text::preview::cannot_read(&e.to_string()),
+        ),
     }
 }
 
@@ -518,7 +525,11 @@ pub fn load_pdf_with_key(path: &Path, raster_key: PdfRasterKey) -> PreviewState 
     #[cfg(not(target_os = "macos"))]
     {
         let _ = raster_key;
-        PreviewState::error(path, PreviewMode::Pdf, "PDF プレビューは macOS のみ対応")
+        PreviewState::error(
+            path,
+            PreviewMode::Pdf,
+            crate::ui_text::preview::pdf_macos_only(),
+        )
     }
 }
 
@@ -541,7 +552,11 @@ pub fn load_video(path: &Path) -> PreviewState {
     let file_size = match std::fs::metadata(path) {
         Ok(m) => m.len(),
         Err(e) => {
-            return PreviewState::error(path, PreviewMode::Video, format!("読み込めない: {e}"));
+            return PreviewState::error(
+                path,
+                PreviewMode::Video,
+                crate::ui_text::preview::cannot_read(&e.to_string()),
+            );
         }
     };
 
@@ -1620,15 +1635,16 @@ fn read_text(path: &Path) -> Result<(String, bool), String> {
 
 /// 上限 + 1 byte だけ読み、巨大ファイルを丸ごとメモリへ載せずに省略判定する。
 fn read_text_source(path: &Path) -> Result<(String, bool, Vec<u8>), String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("読み込めない: {e}"))?;
+    let file = std::fs::File::open(path)
+        .map_err(|e| crate::ui_text::preview::cannot_read(&e.to_string()))?;
     let mut bytes = Vec::with_capacity(MAX_BYTES.min(64 * 1024) + 1);
     file.take((MAX_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|e| format!("読み込めない: {e}"))?;
+        .map_err(|e| crate::ui_text::preview::cannot_read(&e.to_string()))?;
     let truncated_bytes = bytes.len() > MAX_BYTES;
     bytes.truncate(MAX_BYTES);
     if bytes.contains(&0) {
-        return Err("バイナリファイル（テキストとして表示できない）".into());
+        return Err(crate::ui_text::preview::binary_file().into());
     }
     let mut text = String::from_utf8_lossy(&bytes).into_owned();
     let mut truncated = truncated_bytes;
@@ -2152,7 +2168,9 @@ mod tests {
         let path = dir.join("bin.dat");
         std::fs::write(&path, [0u8, 159, 146, 150]).unwrap();
         let state = load(&path, PreviewMode::Code);
-        assert!(matches!(&state.content, PreviewContent::Error(m) if m.contains("バイナリ")));
+        assert!(
+            matches!(&state.content, PreviewContent::Error(m) if m == crate::ui_text::preview::binary_file())
+        );
         let state = load(&dir.join("no-such.txt"), PreviewMode::Code);
         assert!(matches!(&state.content, PreviewContent::Error(_)));
         let _ = std::fs::remove_dir_all(&dir);

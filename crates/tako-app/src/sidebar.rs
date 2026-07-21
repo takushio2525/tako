@@ -669,24 +669,24 @@ impl TakoApp {
         let is_pinned_root = ctx.is_pinned_root;
         let pos = ctx.position;
         let mut items: Vec<(&str, &str)> = vec![
-            ("copy-rel", "相対パスをコピー"),
-            ("copy-abs", "絶対パスをコピー"),
-            ("reveal", "Finder で表示"),
-            ("open-term", "ターミナルで開く"),
+            ("copy-rel", crate::ui_text::sidebar::menu_copy_rel()),
+            ("copy-abs", crate::ui_text::sidebar::menu_copy_abs()),
+            ("reveal", crate::ui_text::sidebar::menu_reveal()),
+            ("open-term", crate::ui_text::sidebar::menu_open_term()),
         ];
         if !is_dir {
-            items.push(("open-default", "デフォルトアプリで開く"));
-            items.push(("open-with", "このアプリで開く..."));
+            items.push(("open-default", crate::ui_text::sidebar::menu_open_default()));
+            items.push(("open-with", crate::ui_text::sidebar::menu_open_with()));
         }
         items.push(("sep1", ""));
-        items.push(("rename", "名前変更"));
-        items.push(("new-file", "新しいファイル"));
-        items.push(("new-dir", "新しいフォルダ"));
+        items.push(("rename", crate::ui_text::sidebar::menu_rename()));
+        items.push(("new-file", crate::ui_text::sidebar::menu_new_file()));
+        items.push(("new-dir", crate::ui_text::sidebar::menu_new_dir()));
         items.push(("sep2", ""));
-        items.push(("trash", "削除"));
+        items.push(("trash", crate::ui_text::sidebar::menu_trash()));
         if is_pinned_root {
             items.push(("sep3", ""));
-            items.push(("remove-root", "ツリーから除去"));
+            items.push(("remove-root", crate::ui_text::sidebar::menu_remove_root()));
         }
 
         let menu_width: f32 = 200.0;
@@ -1072,8 +1072,7 @@ impl TakoApp {
             .is_some_and(preview::EditState::dirty)
         {
             if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
-                edit.message =
-                    Some("未保存の変更を保存してから表示モードを切り替えてください".into());
+                edit.message = Some(crate::ui_text::sidebar::note_save_before_mode_switch().into());
             }
             cx.notify();
             return;
@@ -1407,8 +1406,7 @@ impl TakoApp {
                 return;
             }
             edit.save_status = Some(preview::SaveStatus::Conflict);
-            edit.message =
-                Some("外部変更を検知しました。編集中の内容を保持し、自動更新は行いません".into());
+            edit.message = Some(crate::ui_text::sidebar::note_external_change().into());
             cx.notify();
             return;
         }

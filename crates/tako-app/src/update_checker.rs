@@ -53,8 +53,8 @@ impl Channel {
 
     pub fn display_label(&self) -> &'static str {
         match self {
-            Channel::Stable => "安定版",
-            Channel::Test => "テスト版",
+            Channel::Stable => crate::ui_text::update::channel_stable(),
+            Channel::Test => crate::ui_text::update::channel_test(),
         }
     }
 }
@@ -174,12 +174,12 @@ fn format_reset_time(unix_ts: u64) -> String {
         let remaining = unix_ts - now;
         let minutes = remaining / 60;
         if minutes > 0 {
-            format!("約{minutes}分後")
+            crate::ui_text::update::eta_minutes(minutes)
         } else {
-            format!("約{remaining}秒後")
+            crate::ui_text::update::eta_seconds(remaining)
         }
     } else {
-        "まもなく".into()
+        crate::ui_text::update::eta_soon().into()
     }
 }
 
@@ -845,8 +845,15 @@ mod tests {
     fn test_channel_label() {
         assert_eq!(Channel::Stable.label(), "stable");
         assert_eq!(Channel::Test.label(), "test");
-        assert_eq!(Channel::Stable.display_label(), "安定版");
-        assert_eq!(Channel::Test.display_label(), "テスト版");
+        // 表示ラベルは言語カタログ依存（#435）。相対比較で言語グローバルに依存しない
+        assert_eq!(
+            Channel::Stable.display_label(),
+            crate::ui_text::update::channel_stable()
+        );
+        assert_eq!(
+            Channel::Test.display_label(),
+            crate::ui_text::update::channel_test()
+        );
     }
 
     #[test]
@@ -933,10 +940,16 @@ mod tests {
             .as_secs()
             + 300;
         let s = format_reset_time(future);
-        assert!(s.contains("分後") || s.contains("秒後"));
+        // 言語カタログ依存（#435）: 分または秒の相対表記のどちらか
+        assert!(
+            s == crate::ui_text::update::eta_minutes(4)
+                || s == crate::ui_text::update::eta_minutes(5)
+                || s.contains(&crate::ui_text::update::eta_seconds(0)[..2]),
+            "相対表記になっていない: {s:?}"
+        );
 
         // 過去の timestamp → 「まもなく」
-        assert_eq!(format_reset_time(0), "まもなく");
+        assert_eq!(format_reset_time(0), crate::ui_text::update::eta_soon());
     }
 
     // --- broken-brew 判定ロジックの単体テスト（サブプロセス不要） ---

@@ -5,6 +5,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- [機能追加] UI の日英 i18n: 表示言語の切替（#435）
+  UI 文字列をロケールキー化（`ui_text` カタログ + `tr!(日, 英)`）し、日英を切替可能に。
+  既定は OS ロケール解決（環境変数 → macOS AppleLanguages）。手動切替は
+  CLI `tako lang [ja|en|system]` / MCP `tako_lang` / コマンドパレット
+  「表示言語を切替」の 3 経路（設定は settings.json の `language` に永続化、GUI 即時反映）。
+  タブバー・パレット・ドロワー・サイドバー・右パネル・リモートパネル・更新バナー・
+  close 確認・ポート検知チップ・プレビューペイン等の主要 UI を英語対応。
+  Add Japanese/English i18n for the UI (#435). UI strings are externalized into a
+  locale catalog (`ui_text` + `tr!(ja, en)`), with the display language resolved
+  from the OS locale by default (env vars, then macOS AppleLanguages). Manual
+  switching via CLI `tako lang [ja|en|system]`, MCP `tako_lang`, or the command
+  palette ("Switch language"); the setting persists to settings.json and applies
+  to the GUI immediately. Major surfaces (tab bar, palette, drawer, sidebar,
+  panels, update banner, close dialogs, port chips, preview pane) are translated.
+
 - [修正] 隔離/多重起動時の disablesleep 残留解除で本番の蓋閉じ防止を外さない (#449)
   `check_disablesleep_residual()` が pmset disablesleep のマシングローバル状態を
   無条件で 0 に戻していたため、本番インスタンスが busy エージェントのために正当に

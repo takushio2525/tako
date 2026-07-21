@@ -2668,6 +2668,51 @@ fn dispatch_inner(
             }
         }
 
+        Request::Lang { action, value } => {
+            use tako_core::i18n::{self, LangSetting};
+            let action = action.as_deref().unwrap_or("status");
+            let status_json = |setting: LangSetting| {
+                serde_json::json!({
+                    "language": setting.as_str(),
+                    "resolved": i18n::lang().as_str(),
+                    "available": ["system", "ja", "en"],
+                })
+            };
+            match action {
+                "status" => Ok(status_json(host.ui_lang_setting())),
+                "set" => {
+                    let v = value.as_deref().ok_or_else(|| {
+                        DispatchError::InvalidParams(
+                            "set には value が必要（system / ja / en）".into(),
+                        )
+                    })?;
+                    let setting = LangSetting::parse(v).ok_or_else(|| {
+                        DispatchError::InvalidParams(format!(
+                            "不明な value: {v:?}（system / ja / en のいずれか）"
+                        ))
+                    })?;
+                    // 永続化（テスト・セルフテスト中はユーザー設定を汚さない。Theme と同方針）
+                    if !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none() {
+                        let mut settings = crate::settings::load();
+                        settings.language = setting.as_str().into();
+                        crate::settings::save(&settings).map_err(|e| {
+                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
+                        })?;
+                    }
+                    let resolved = setting.resolve();
+                    host.set_ui_lang(setting, resolved);
+                    Ok(serde_json::json!({
+                        "language": setting.as_str(),
+                        "resolved": resolved.as_str(),
+                        "available": ["system", "ja", "en"],
+                    }))
+                }
+                other => Err(DispatchError::InvalidParams(format!(
+                    "不明な action: {other:?}（status / set のいずれか）"
+                ))),
+            }
+        }
+
         Request::Telemetry { action } => {
             let action = action.as_deref().unwrap_or("status");
             match action {
@@ -6113,6 +6158,8 @@ mod tests {
         stale_pane_map: std::collections::HashMap<PaneId, PaneId>,
         /// #217: UI テーマモード
         theme_mode: tako_core::theme::ThemeMode,
+        lang_setting: tako_core::i18n::LangSetting,
+        lang_resolved: Option<tako_core::i18n::Lang>,
         /// #321: 利用制限表示サービス
         limit_service: tako_core::LimitService,
         preview_reload: tako_core::PreviewReloadState,
@@ -6135,6 +6182,8 @@ mod tests {
                 pins: Vec::new(),
                 stale_pane_map: std::collections::HashMap::new(),
                 theme_mode: tako_core::theme::ThemeMode::Dark,
+                lang_setting: tako_core::i18n::LangSetting::System,
+                lang_resolved: None,
                 limit_service: tako_core::LimitService::Claude,
                 preview_reload: tako_core::PreviewReloadState::default(),
                 preview_cache: tako_core::PreviewCacheStats {
@@ -6225,6 +6274,17 @@ mod tests {
         }
         fn set_theme_mode(&mut self, mode: tako_core::theme::ThemeMode) {
             self.theme_mode = mode;
+        }
+        fn ui_lang_setting(&self) -> tako_core::i18n::LangSetting {
+            self.lang_setting
+        }
+        fn set_ui_lang(
+            &mut self,
+            setting: tako_core::i18n::LangSetting,
+            resolved: tako_core::i18n::Lang,
+        ) {
+            self.lang_setting = setting;
+            self.lang_resolved = Some(resolved);
         }
         fn limit_service(&self) -> tako_core::LimitService {
             self.limit_service
@@ -9231,6 +9291,79 @@ mod tests {
             Request::Theme {
                 action: Some("set".into()),
                 mode: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn 表示言語のstatus_setが機能する() {
+        use tako_core::i18n::{Lang, LangSetting};
+        let mut host = MockHost::new();
+        // status: 既定は system
+        let v = dispatch(
+            &mut host,
+            Request::Lang {
+                action: None,
+                value: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["language"], "system");
+        assert_eq!(v["available"].as_array().unwrap().len(), 3);
+        // set en → host へ設定値と解決済み表示言語が渡る
+        let v = dispatch(
+            &mut host,
+            Request::Lang {
+                action: Some("set".into()),
+                value: Some("en".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["language"], "en");
+        assert_eq!(v["resolved"], "en");
+        assert_eq!(host.lang_setting, LangSetting::En);
+        assert_eq!(host.lang_resolved, Some(Lang::En));
+        // set ja
+        let v = dispatch(
+            &mut host,
+            Request::Lang {
+                action: Some("set".into()),
+                value: Some("ja".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["resolved"], "ja");
+        assert_eq!(host.lang_setting, LangSetting::Ja);
+        assert_eq!(host.lang_resolved, Some(Lang::Ja));
+        // set の不明 value / value 無し / 不明 action はエラー
+        assert!(dispatch(
+            &mut host,
+            Request::Lang {
+                action: Some("set".into()),
+                value: Some("fr".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .is_err());
+        assert!(dispatch(
+            &mut host,
+            Request::Lang {
+                action: Some("set".into()),
+                value: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .is_err());
+        assert!(dispatch(
+            &mut host,
+            Request::Lang {
+                action: Some("toggle".into()),
+                value: None,
             },
             PaneOrigin::Cli,
         )

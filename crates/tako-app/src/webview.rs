@@ -428,7 +428,7 @@ impl WebViewEntry {
                 let elapsed = started.elapsed();
                 if !s.nav_committed && elapsed > std::time::Duration::from_secs(NAV_TIMEOUT_SECS) {
                     let target = s.nav_target_url.clone().unwrap_or_else(|| s.url.clone());
-                    s.error = Some("ページの読み込みに失敗しました".to_string());
+                    s.error = Some(crate::ui_text::webdock::load_failed().to_string());
                     s.failed_url = Some(target);
                     s.loading = false;
                     s.nav_started_at = None;

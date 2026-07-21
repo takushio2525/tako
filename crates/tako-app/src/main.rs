@@ -366,14 +366,9 @@ pub(crate) fn rgba_alpha(c: tako_core::Rgb, a: f32) -> Rgba {
     Rgba { a, ..rgba(c) }
 }
 
-/// 経過秒の相対表記（tmuxview の作成日時表示用）
+/// 経過秒の相対表記（tmuxview の作成日時表示用。文言は ui_text::common）
 fn format_age(seconds: i64) -> String {
-    match seconds.max(0) {
-        s if s < 60 => format!("{s} 秒前"),
-        s if s < 3600 => format!("{} 分前", s / 60),
-        s if s < 86400 => format!("{} 時間前", s / 3600),
-        s => format!("{} 日前", s / 86400),
-    }
+    crate::ui_text::common::format_age(seconds)
 }
 
 fn hsla_alpha(c: tako_core::Rgb, a: f32) -> Hsla {
@@ -846,6 +841,9 @@ struct TakoApp {
     codex_metrics: AgentMetrics,
     /// ステータスバーの利用制限表示で選択中のサービス（Issue #321。settings.json 永続化）
     limit_service: tako_core::LimitService,
+    /// UI 表示言語の設定値（Issue #435。system / ja / en。settings.json 永続化。
+    /// 実際の表示言語は tako_core::i18n のグローバルが正）
+    lang_setting: tako_core::i18n::LangSetting,
     /// ステータスバーの利用制限サービス切替ドロップダウンが開いているか（Issue #321）
     limit_service_menu_open: bool,
     /// ドロップダウンメニューのアンカー位置（ステータスバーの overflow_hidden 外へ描画するため）
@@ -1875,6 +1873,12 @@ impl TakoApp {
             agent_metrics: AgentMetrics::default(),
             codex_metrics: AgentMetrics::default(),
             limit_service: tako_control::settings::load().limit_service(),
+            lang_setting: {
+                // UI 表示言語を最初の render 前に確定する（Issue #435。既定 = OS ロケール）
+                let setting = tako_control::settings::load().lang_setting();
+                tako_core::i18n::set_lang(setting.resolve());
+                setting
+            },
             limit_service_menu_open: false,
             limit_service_menu_anchor: None,
             usage_history: std::collections::VecDeque::new(),
@@ -3200,9 +3204,12 @@ impl TakoApp {
                     .get(&p.id())
                     .and_then(|s| s.cwd())
                     .and_then(|c| c.file_name())
-                    .map(|n| format!("ターミナル: {}", n.to_string_lossy()))
+                    .map(|n| {
+                        let base = crate::ui_text::common::terminal_fallback_title();
+                        format!("{base}: {}", n.to_string_lossy())
+                    })
             })
-            .unwrap_or_else(|| "ターミナル".to_string())
+            .unwrap_or_else(|| crate::ui_text::common::terminal_fallback_title().to_string())
     }
 
     /// バックグラウンドペインのコマンド状態（ターミナル不在なら Unknown）
@@ -4274,7 +4281,7 @@ impl TakoApp {
                 let mut parts = Vec::new();
                 if let Some(session) = self.terminals.get(&pane_id) {
                     if session.command_state() == CommandState::Running {
-                        parts.push("実行中のプロセス".to_string());
+                        parts.push(crate::ui_text::dialog::lost_running_process().to_string());
                     }
                 }
                 if let Some(pane) = self
@@ -4291,23 +4298,23 @@ impl TakoApp {
                                 .get(&pane_id)
                                 .is_some_and(|s| s.command_state() == CommandState::Running);
                             if busy {
-                                parts.push("稼働中の worker".to_string());
+                                parts.push(crate::ui_text::dialog::lost_busy_worker().to_string());
                             }
                         }
                     }
                 }
                 if self.backend_sessions.contains_key(&pane_id) {
-                    parts.push("tmux セッション".to_string());
+                    parts.push(crate::ui_text::dialog::lost_tmux_session().to_string());
                 }
                 if parts.is_empty() {
-                    "このペインを閉じますか？".to_string()
+                    crate::ui_text::dialog::close_pane_question().to_string()
                 } else {
-                    format!("閉じると失われるもの: {}", parts.join("、"))
+                    crate::ui_text::dialog::close_loses(&parts)
                 }
             }
             CloseConfirmTarget::Tab(tab_id) => {
                 let Some(tab) = self.workspace.get_tab(tab_id) else {
-                    return "このタブを閉じますか？".to_string();
+                    return crate::ui_text::dialog::close_tab_question().to_string();
                 };
                 let pane_count = tab.tree().panes().len();
                 let running = tab
@@ -4341,17 +4348,17 @@ impl TakoApp {
                     .count();
 
                 let mut parts = Vec::new();
-                parts.push(format!("{pane_count} ペイン"));
+                parts.push(crate::ui_text::dialog::lost_panes(pane_count));
                 if running > 0 {
-                    parts.push(format!("{running} 個の実行中プロセス"));
+                    parts.push(crate::ui_text::dialog::lost_running(running));
                 }
                 if workers > 0 {
-                    parts.push(format!("{workers} 個の稼働中 worker"));
+                    parts.push(crate::ui_text::dialog::lost_workers(workers));
                 }
                 if tmux > 0 {
-                    parts.push(format!("{tmux} 個の tmux セッション"));
+                    parts.push(crate::ui_text::dialog::lost_tmux(tmux));
                 }
-                format!("閉じると失われるもの: {}", parts.join("、"))
+                crate::ui_text::dialog::close_loses(&parts)
             }
         }
     }
@@ -4678,7 +4685,7 @@ impl TakoApp {
             return Vec::new();
         }
         // orphan ごとに cwd と role を取得
-        let tab_title = "復帰".to_string();
+        let tab_title = crate::ui_text::common::restore().to_string();
         let first_pane = Pane::new(PaneOrigin::User);
         let first_id = first_pane.id();
         self.workspace.create_tab(tab_title, first_pane);
@@ -5165,6 +5172,27 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// UI 表示言語の 日→英→日 トグル（Issue #435。コマンドパレット用。
+    /// dispatch::Lang と同じ状態遷移 + settings 永続化で UI / AI 操作の等価性を保つ）
+    pub(crate) fn toggle_language(&mut self, cx: &mut Context<Self>) {
+        use tako_core::i18n::{self, Lang, LangSetting};
+        let next = match i18n::lang() {
+            Lang::Ja => LangSetting::En,
+            Lang::En => LangSetting::Ja,
+        };
+        self.lang_setting = next;
+        i18n::set_lang(next.resolve());
+        // セルフテスト中はユーザー設定を汚さない（dispatch 側と同方針）
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.language = next.as_str().into();
+            if let Err(e) = tako_control::settings::save(&settings) {
+                eprintln!("warning: 設定を保存できない: {e}");
+            }
+        }
+        cx.notify();
+    }
+
     fn save_sidebar_width(&self) {
         if std::env::var_os("TAKO_SELF_TEST").is_some() {
             return;
@@ -5262,7 +5290,7 @@ impl TakoApp {
                             .and_then(|s| s.title())
                             .map(str::to_string)
                     })
-                    .unwrap_or_else(|| "ターミナル".into());
+                    .unwrap_or_else(|| crate::ui_text::common::terminal_fallback_title().into());
                 let state = self
                     .terminals
                     .get(&pane.id())
@@ -5287,20 +5315,24 @@ impl TakoApp {
                 ));
             }
         }
-        // 固定コマンド
-        const COMMANDS: &[(&str, &str)] = &[
-            ("新しいタブ", "new-tab"),
-            ("テーマをライト/ダーク切替", "toggle-theme"),
-            ("ファイルツリーを開閉", "toggle-files"),
-            ("バックグラウンドドロワーを開閉", "toggle-drawer"),
-            ("fleet パネルを開く", "panel-fleet"),
-            ("orch パネルを開く", "panel-orch"),
-            ("git パネルを開く", "panel-git"),
-            ("ペインを右に分割", "split-right"),
-            ("ペインを下に分割", "split-down"),
+        // 固定コマンド（表示ラベルは ui_text::palette が言語別に解決）
+        const COMMANDS: &[&str] = &[
+            "new-tab",
+            "toggle-theme",
+            "toggle-language",
+            "toggle-files",
+            "toggle-drawer",
+            "panel-fleet",
+            "panel-orch",
+            "panel-git",
+            "split-right",
+            "split-down",
         ];
-        for (label, id) in COMMANDS {
-            items.push(PaletteItem::Command(label, id));
+        for id in COMMANDS {
+            items.push(PaletteItem::Command(
+                crate::ui_text::palette::cmd_label(id),
+                id,
+            ));
         }
         if q.is_empty() {
             return items;
@@ -5359,6 +5391,7 @@ impl TakoApp {
             PaletteItem::Command(_, id) => match id {
                 "new-tab" => self.new_tab(cx),
                 "toggle-theme" => self.toggle_theme(cx),
+                "toggle-language" => self.toggle_language(cx),
                 "toggle-files" => {
                     self.toggle_filetree();
                     cx.notify();
@@ -6118,7 +6151,7 @@ impl TakoApp {
             .ok_or_else(|| "編集モードを開始していない".to_string())?;
         match edit.buffer.save() {
             Ok(()) => {
-                edit.message = Some("保存しました".into());
+                edit.message = Some(crate::ui_text::preview::saved_message().into());
                 self.refresh_preview_from_editor(pane_id);
                 Ok(())
             }
@@ -9806,7 +9839,7 @@ impl TakoApp {
                                 }
                                 cx.notify();
                             }))
-                            .child("再読み込み"),
+                            .child(crate::ui_text::webdock::reload()),
                     ),
             )
     }
@@ -10315,7 +10348,7 @@ impl TakoApp {
                 d.child(
                     div()
                         .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.5))
-                        .child("URL を入力して Enter（例: example.com）"),
+                        .child(crate::ui_text::webdock::url_placeholder()),
                 )
             })
             .when(!placeholder, |d| {
@@ -10391,7 +10424,7 @@ impl TakoApp {
                             this.open_webview_from_dock(&url, cx);
                         }
                     }))
-                    .child("開く"),
+                    .child(crate::ui_text::webdock::open()),
             )
     }
 
@@ -10619,7 +10652,7 @@ impl TakoApp {
                     .and_then(|s| s.title())
                     .map(str::to_string)
             })
-            .unwrap_or_else(|| "ターミナル".to_string());
+            .unwrap_or_else(|| crate::ui_text::common::terminal_fallback_title().to_string());
         // role ラベル（カンプ: バッジではなく素のテキスト 9.5px 600 tracking 0.06em）
         let is_master = pane_role.as_deref().is_some_and(|r| {
             r.contains("orchestrator-master") || r == "master" || r.starts_with("master:")
@@ -11389,9 +11422,9 @@ impl TakoApp {
                 // 提案チップ（FR-2.4.3）: 検知ペイン下端のインライン表示。
                 // 承諾アクションは open_preview（当面は外部ブラウザ。差し替え点）
                 let label = if process.is_empty() {
-                    format!("localhost:{port} が listen 中")
+                    crate::ui_text::ports::listening(port)
                 } else {
-                    format!("localhost:{port}（{process}）が listen 中")
+                    crate::ui_text::ports::listening_with_process(port, &process)
                 };
                 div()
                     .id(("port-chip", pane_id.as_u64()))
@@ -11425,7 +11458,7 @@ impl TakoApp {
                                 cx.stop_propagation();
                                 this.accept_port_suggestion(pane_id, port, cx);
                             }))
-                            .child("ブラウザで開く"),
+                            .child(crate::ui_text::ports::open_in_browser()),
                     )
                     .child(
                         div()
@@ -11845,6 +11878,19 @@ impl UiStateHost for TakoApp {
             return;
         }
         self.theme = Theme::for_mode(mode);
+    }
+
+    fn ui_lang_setting(&self) -> tako_core::i18n::LangSetting {
+        self.lang_setting
+    }
+
+    fn set_ui_lang(
+        &mut self,
+        setting: tako_core::i18n::LangSetting,
+        resolved: tako_core::i18n::Lang,
+    ) {
+        self.lang_setting = setting;
+        tako_core::i18n::set_lang(resolved);
     }
 
     fn limit_service(&self) -> tako_core::LimitService {
@@ -14024,7 +14070,7 @@ impl TakoApp {
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.close_confirm_cancelled(cx);
                                         }))
-                                        .child("キャンセル (Esc)"),
+                                        .child(crate::ui_text::dialog::cancel_esc()),
                                 )
                                 .child(
                                     div()
@@ -14040,14 +14086,14 @@ impl TakoApp {
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.close_confirm_accepted(cx);
                                         }))
-                                        .child("閉じる (Enter)"),
+                                        .child(crate::ui_text::dialog::close_enter()),
                                 ),
                         )
                         .child(
                             div()
                                 .text_size(px(11.0))
                                 .text_color(hsla(theme.text_overlay))
-                                .child("⌘クリックで確認なしで閉じる"),
+                                .child(crate::ui_text::dialog::close_skip_hint()),
                         ),
                 ),
         )
@@ -16265,6 +16311,54 @@ mod self_test {
                 ok || std::env::var("TAKO_UPDATE_SNAPSHOT").is_ok()
             };
             check(tools_ok, "MCP tools/list スナップショット検証");
+
+            // 33c. tools/call tako_lang（Issue #435。set en → i18n 反映 → system 復帰）
+            {
+                let (status, response) = mcp_post_bg(
+                    cx,
+                    &mcp_url,
+                    Some(&token),
+                    &[],
+                    r#"{"jsonrpc":"2.0","id":105,"method":"tools/call","params":{"name":"tako_lang","arguments":{"action":"set","value":"en"}}}"#,
+                )
+                .await
+                .unwrap_or_else(|| fail("MCP lang set 接続"));
+                let en_applied = tako_core::i18n::lang() == tako_core::i18n::Lang::En;
+                check(
+                    status == 200
+                        && response.contains(r#"\"language\":\"en\""#)
+                        && response.contains(r#"\"resolved\":\"en\""#)
+                        && en_applied,
+                    "MCP lang set en（i18n 反映）",
+                );
+                let (status, response) = mcp_post_bg(
+                    cx,
+                    &mcp_url,
+                    Some(&token),
+                    &[],
+                    r#"{"jsonrpc":"2.0","id":106,"method":"tools/call","params":{"name":"tako_lang","arguments":{"action":"set","value":"ja"}}}"#,
+                )
+                .await
+                .unwrap_or_else(|| fail("MCP lang set ja 接続"));
+                let ja_applied = tako_core::i18n::lang() == tako_core::i18n::Lang::Ja;
+                check(
+                    status == 200
+                        && response.contains(r#"\"resolved\":\"ja\""#)
+                        && ja_applied,
+                    "MCP lang set ja（i18n 反映）",
+                );
+                // system へ戻す（セルフテスト環境の既定へ復帰。settings は非保存）
+                let (status, _response) = mcp_post_bg(
+                    cx,
+                    &mcp_url,
+                    Some(&token),
+                    &[],
+                    r#"{"jsonrpc":"2.0","id":107,"method":"tools/call","params":{"name":"tako_lang","arguments":{"action":"set","value":"system"}}}"#,
+                )
+                .await
+                .unwrap_or_else(|| fail("MCP lang set system 接続"));
+                check(status == 200, "MCP lang set system（復帰）");
+            }
 
             // 33. tools/call tako_list_panes（構造化読み取り。FR-2.5.1）
             let (status, response) = mcp_post_bg(cx, &mcp_url, Some(&token), &[], LIST_CALL_MSG)
@@ -21455,12 +21549,15 @@ mod self_test {
                     .update(cx, |app, window, cx| {
                         app.open_command_palette(window, cx);
                         let opened = app.command_palette.is_some();
-                        // 「テーマ」で絞ると toggle-theme コマンドが先頭に来る
+                        // テーマ切替コマンドのラベルで絞ると toggle-theme が先頭に来る
+                        // （表示言語に依存しないようカタログからラベルを引く。#435）
+                        let theme_label =
+                            crate::ui_text::palette::cmd_label("toggle-theme").to_string();
                         if let Some(p) = app.command_palette.as_mut() {
-                            p.query = "テーマ".into();
+                            p.query = theme_label.clone();
                             p.selected = 0;
                         }
-                        let items = app.palette_items("テーマ");
+                        let items = app.palette_items(&theme_label);
                         let has_theme = matches!(
                             items.first(),
                             Some(PaletteItem::Command(_, "toggle-theme"))

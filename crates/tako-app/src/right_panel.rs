@@ -68,7 +68,7 @@ impl TakoApp {
                                     this.tmux_kill_confirmed(cx);
                                 }
                             }))
-                            .child("kill する"),
+                            .child(crate::ui_text::panel::kill_button()),
                     )
                     .child(
                         div()
@@ -87,7 +87,7 @@ impl TakoApp {
                                 }
                                 cx.notify();
                             }))
-                            .child("やめる"),
+                            .child(crate::ui_text::panel::kill_cancel()),
                     ),
             )
     }
@@ -247,14 +247,8 @@ impl TakoApp {
         if let Some((pending_session, pending_window, _)) = pending_tmux {
             if *pending_session == session.name {
                 let label = match pending_window {
-                    Some(w) => {
-                        format!("window {w} を kill していいですか?（中のプロセスごと終了）")
-                    }
-                    None => format!(
-                        "セッション {} を kill していいですか?（中のプロセスごと終了。\
-                         attach 中のペインからも消える）",
-                        session.name
-                    ),
+                    Some(w) => crate::ui_text::panel::confirm_kill_window(w),
+                    None => crate::ui_text::panel::confirm_kill_session(&session.name),
                 };
                 container = container.child(self.render_kill_confirm(id_seed, label, None, cx));
             }
@@ -522,7 +516,7 @@ impl TakoApp {
                                 .py(px(8.0))
                                 .text_size(px(11.5))
                                 .text_color(hsla(theme.text_muted))
-                                .child("オーケストレーターはいません（tako master で起動）"),
+                                .child(crate::ui_text::panel::orch_empty()),
                         )
                     })
                     .children(cards.into_iter().map(|card| {
@@ -614,7 +608,7 @@ impl TakoApp {
                                                 .flex()
                                                 .flex_row()
                                                 .gap(px(4.0))
-                                                .child("稼働")
+                                                .child(crate::ui_text::panel::orch_uptime_label())
                                                 .child(
                                                     div()
                                                         .text_color(hsla(theme.foreground))
@@ -644,7 +638,7 @@ impl TakoApp {
                                             div()
                                                 .text_size(px(10.5))
                                                 .text_color(hsla(theme.text_faint))
-                                                .child("ワーカーなし"),
+                                                .child(crate::ui_text::panel::orch_no_workers()),
                                         )
                                     })
                                     .children({
@@ -1474,7 +1468,7 @@ impl TakoApp {
                 if pending_pane == Some(pane) {
                     card = card.child(self.render_kill_confirm(
                         pane.as_u64(),
-                        format!("ペイン {pane} を kill していいですか?（中のプロセスごと終了）"),
+                        crate::ui_text::panel::confirm_kill_pane(pane),
                         Some(pane),
                         cx,
                     ));
@@ -1554,7 +1548,7 @@ impl TakoApp {
                                 .child(
                                     div()
                                         .text_size(px(10.0))
-                                        .child(SharedString::from(format!("{win_pane_count} ペイン"))),
+                                        .child(SharedString::from(crate::ui_text::panel::pane_count(win_pane_count))),
                                 )
                                 .child(
                                     div()
@@ -1676,7 +1670,7 @@ impl TakoApp {
             let (badge_label, badge_color) = if session.orphan_backend {
                 ("orphan", theme.red)
             } else {
-                ("外部", theme.yellow)
+                (crate::ui_text::panel::external_badge(), theme.yellow)
             };
             let kill_name = session.name.clone();
             let kill_socket = session.socket.clone();
@@ -1824,7 +1818,7 @@ impl TakoApp {
                                     );
                                     cx.notify();
                                 }))
-                                .child("復帰"),
+                                .child(crate::ui_text::common::restore()),
                         )
                         // kill ボタン（確認つき）
                         .child(
@@ -1927,15 +1921,9 @@ impl TakoApp {
                 if *pending_session == session.name {
                     let name = &session.name;
                     let label = match (pending_window, session.orphan_backend) {
-                        (Some(w), _) => {
-                            format!("window {w} を kill していいですか?（中のプロセスごと終了）")
-                        }
-                        (None, true) => format!(
-                            "{name} は tako の kill 漏れ残骸の可能性。kill していいですか?（中のプロセスごと終了）"
-                        ),
-                        (None, false) => format!(
-                            "管理外セッション {name} を kill していいですか?（中のプロセスごと終了）"
-                        ),
+                        (Some(w), _) => crate::ui_text::panel::confirm_kill_window(w),
+                        (None, true) => crate::ui_text::panel::confirm_kill_leftover(name),
+                        (None, false) => crate::ui_text::panel::confirm_kill_unmanaged(name),
                     };
                     card = card.child(self.render_kill_confirm(index as u64, label, None, cx));
                 }
@@ -1952,7 +1940,7 @@ impl TakoApp {
                     .mt_2()
                     .text_color(hsla(theme.tab_inactive_foreground))
                     .text_size(px(11.0))
-                    .child("閉じたタブのターミナル（バックグラウンドで実行中）"),
+                    .child(crate::ui_text::panel::closed_tab_section()),
             );
         }
         for shelf_group in &closed_origin {
@@ -2002,11 +1990,12 @@ impl TakoApp {
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_ellipsis()
-                                .child(SharedString::from(format!(
-                                    "タブ {}（閉じたタブ・{} 件）",
-                                    truncate(&shelf_group.title, 20),
-                                    shelf_group.entries.len()
-                                ))),
+                                .child(SharedString::from(
+                                    crate::ui_text::panel::closed_tab_group(
+                                        &truncate(&shelf_group.title, 20),
+                                        shelf_group.entries.len(),
+                                    ),
+                                )),
                         )
                         // グループ全体をピン留め（FR-2.16.15 / FR-2.16.16）
                         .child(
@@ -2080,7 +2069,7 @@ impl TakoApp {
                     .detach();
                 }
             }
-            return root.p_4().child("git リポジトリを検出中…");
+            return root.p_4().child(crate::ui_text::panel::git_detecting());
         };
 
         let accent = theme.accent;
@@ -2143,9 +2132,8 @@ impl TakoApp {
                     cx.notify();
                 }))
                 .child(if collapsed.branches { "▸" } else { "▾" })
-                .child(format!(
-                    " ブランチ ({})",
-                    data.branches.iter().filter(|b| !b.is_remote).count()
+                .child(crate::ui_text::panel::git_branches(
+                    data.branches.iter().filter(|b| !b.is_remote).count(),
                 )),
         );
         if !collapsed.branches {
@@ -2190,7 +2178,7 @@ impl TakoApp {
                         cx.notify();
                     }))
                     .child(if collapsed.changes { "▸" } else { "▾" })
-                    .child(format!(" 変更 ({})", data.status.len())),
+                    .child(crate::ui_text::panel::git_changes(data.status.len())),
             );
             if !collapsed.changes {
                 for entry in &data.status {
@@ -2254,7 +2242,7 @@ impl TakoApp {
                     cx.notify();
                 }))
                 .child(if collapsed.commits { "▸" } else { "▾" })
-                .child(format!(" コミット ({})", data.commits.len())),
+                .child(crate::ui_text::panel::git_commits(data.commits.len())),
         );
         if !collapsed.commits {
             for (i, commit) in data.commits.iter().enumerate() {
@@ -2406,9 +2394,9 @@ impl TakoApp {
                         " diff ({}{})",
                         data.diff_files.len(),
                         if selected_commit.is_some() {
-                            " コミット"
+                            crate::ui_text::panel::git_commit_tab()
                         } else {
-                            " ファイル"
+                            crate::ui_text::panel::git_files_tab()
                         }
                     )),
             );

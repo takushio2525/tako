@@ -77,7 +77,7 @@ impl TakoApp {
                         .overflow_x_hidden()
                         .text_ellipsis()
                         .text_color(hsla(theme.red))
-                        .child("完全に破棄?"),
+                        .child(crate::ui_text::drawer::confirm_destroy()),
                 )
                 .child(
                     div()
@@ -87,7 +87,7 @@ impl TakoApp {
                         .hover(|d| d.bg(rgba_alpha(theme.red, 0.2)))
                         .px_1()
                         .rounded_sm()
-                        .child("はい")
+                        .child(crate::ui_text::common::yes())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.bg_pending_kill = None;
                             if this.workspace.remove_shelved(pane_id).is_some() {
@@ -119,7 +119,7 @@ impl TakoApp {
                         .hover(|d| d.bg(rgba_alpha(theme.tab_active_background, 0.5)))
                         .px_1()
                         .rounded_sm()
-                        .child("いいえ")
+                        .child(crate::ui_text::common::no())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.bg_pending_kill = None;
                             cx.notify();
@@ -147,7 +147,7 @@ impl TakoApp {
                         .cursor_pointer()
                         .text_color(hsla(theme.accent))
                         .hover(|d| d.bg(rgba_alpha(theme.accent, 0.2)))
-                        .child("復帰")
+                        .child(crate::ui_text::common::restore())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let origin = this.workspace.shelved_origin_tab(pane_id);
                             let target = origin
@@ -244,7 +244,10 @@ impl TakoApp {
             }
         }
         for closed in self.tmux_view_closed_origin_background() {
-            bg_groups.push((format!("{}（閉じたタブ）", closed.title), closed.entries));
+            bg_groups.push((
+                crate::ui_text::drawer::closed_tab_group(&closed.title),
+                closed.entries,
+            ));
         }
         let bg_total: usize = bg_groups.iter().map(|(_, e)| e.len()).sum();
 
@@ -293,7 +296,7 @@ impl TakoApp {
                     .text_size(px(11.0))
                     .text_color(hsla(theme.tab_inactive_foreground))
                     .py_1()
-                    .child("バックグラウンドのターミナルはありません"),
+                    .child(crate::ui_text::drawer::empty()),
             );
         } else {
             for (gi, (title, entries)) in bg_groups.iter().enumerate() {
@@ -319,10 +322,9 @@ impl TakoApp {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
-                            .child(SharedString::from(format!(
-                                "タブ {}（{}）",
-                                truncate(title, 18),
-                                entries.len()
+                            .child(SharedString::from(crate::ui_text::drawer::tab_group(
+                                &truncate(title, 18),
+                                entries.len(),
                             ))),
                     );
                 let mut row = div().flex().flex_row().flex_1().min_h(px(0.0)).gap_2();
@@ -358,10 +360,7 @@ impl TakoApp {
                         .px_2()
                         .text_size(px(10.0))
                         .text_color(hsla(theme.tab_inactive_foreground))
-                        .child(SharedString::from(format!(
-                            "バックグラウンドのターミナル（{}）",
-                            bg_total
-                        )))
+                        .child(SharedString::from(crate::ui_text::drawer::header(bg_total)))
                         .child(div().flex_grow(1.0))
                         .child(
                             div()

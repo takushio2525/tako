@@ -377,7 +377,7 @@ impl TakoApp {
                     .map(|p| p.origin_tab_title().to_string())
                     .unwrap_or_default();
                 let count = self.background_entries_of_tab(tab).len();
-                format!("タブ {}（閉じたタブ・{count} 件）", truncate(&title, 20))
+                crate::ui_text::panel::closed_tab_group(&truncate(&title, 20), count)
             }
             PreviewTarget::TmuxWindow(pane_id, win) => {
                 let win_name = self
@@ -431,7 +431,7 @@ impl TakoApp {
         self.terminals
             .get(&pane_id)
             .and_then(|s| s.title())
-            .unwrap_or("ターミナル")
+            .unwrap_or_else(|| crate::ui_text::common::terminal_fallback_title())
             .to_string()
     }
 
@@ -1735,7 +1735,9 @@ impl TakoApp {
                                         .bg(hsla(theme.ansi[4]))
                                         .text_color(hsla(theme.background))
                                         .text_size(px(14.0))
-                                        .child(SharedString::from("\u{25b6}\u{fe0e} 再生"))
+                                        .child(SharedString::from(
+                                            crate::ui_text::preview::video_play(),
+                                        ))
                                         .on_click(cx.listener(
                                             move |this, _ev: &gpui::ClickEvent, _, cx| {
                                                 this.start_video_player(pane_id, cx);
@@ -1747,22 +1749,23 @@ impl TakoApp {
                         // メタ情報
                         let mut info_lines = Vec::new();
                         if let Some((w, h)) = data.resolution {
-                            info_lines.push(format!("解像度: {w} x {h}"));
+                            info_lines.push(crate::ui_text::preview::video_resolution(w, h));
                         }
                         if let Some(dur) = data.duration {
                             let mins = dur as u64 / 60;
                             let secs = dur as u64 % 60;
-                            info_lines.push(format!("長さ: {mins}:{secs:02}"));
+                            info_lines.push(crate::ui_text::preview::video_duration(mins, secs));
                         }
                         if let Some(codec) = &data.codec {
-                            info_lines.push(format!("コーデック: {codec}"));
+                            info_lines.push(crate::ui_text::preview::video_codec(codec));
                         }
                         let size_mb = data.file_size as f64 / 1_000_000.0;
                         if size_mb >= 1.0 {
-                            info_lines.push(format!("サイズ: {size_mb:.1} MB"));
+                            info_lines.push(crate::ui_text::preview::video_size_mb(size_mb));
                         } else {
-                            info_lines
-                                .push(format!("サイズ: {:.0} KB", data.file_size as f64 / 1_000.0));
+                            info_lines.push(crate::ui_text::preview::video_size_kb(
+                                data.file_size as f64 / 1_000.0,
+                            ));
                         }
                         elements.push(
                             div()
@@ -1787,7 +1790,7 @@ impl TakoApp {
                     .justify_center()
                     .p_2()
                     .text_color(hsla_alpha(theme.foreground, 0.6))
-                    .child(SharedString::from("読み込み中…"))
+                    .child(SharedString::from(crate::ui_text::preview::loading()))
                     .into_any_element()],
                 preview::PreviewContent::Error(message) => vec![div()
                     .p_2()
@@ -1931,13 +1934,13 @@ impl TakoApp {
                                             let suffix = if autosave {
                                                 match &save_status {
                                                     Some(preview::SaveStatus::Saved) => {
-                                                        " \u{00B7} 保存済"
+                                                        crate::ui_text::preview::saved_suffix()
                                                     }
                                                     Some(preview::SaveStatus::Conflict) => {
-                                                        " \u{00B7} 競合"
+                                                        crate::ui_text::preview::conflict_suffix()
                                                     }
                                                     Some(preview::SaveStatus::Error(_)) => {
-                                                        " \u{00B7} エラー"
+                                                        crate::ui_text::preview::error_suffix()
                                                     }
                                                     None if dirty => " \u{25CF}",
                                                     None => "",
@@ -2067,7 +2070,7 @@ impl TakoApp {
                                                 .h(px(12.0))
                                                 .text_color(hsla(theme.accent)),
                                         )
-                                        .child("目次")
+                                        .child(crate::ui_text::preview::outline_button())
                                         .child(
                                             svg()
                                                 .path(crate::file_icons::ui_icon::CHEVRON_DOWN)
@@ -2176,10 +2179,10 @@ impl TakoApp {
                             })
                             .when(phv.mode_toggle && md_capable && edit_snap.is_none(), |d| {
                                 let (icon, label) = match mode {
-                                    preview::PreviewMode::Markdown => (None, "コードとして表示"),
+                                    preview::PreviewMode::Markdown => (None, crate::ui_text::preview::view_as_code()),
                                     preview::PreviewMode::Code => (
                                         Some(crate::file_icons::ui_icon::EYE),
-                                        "md レンダリング表示",
+                                        crate::ui_text::preview::view_as_markdown(),
                                     ),
                                     _ => (None, ""),
                                 };
@@ -2260,7 +2263,7 @@ impl TakoApp {
                                                     theme.accent
                                                 })),
                                         )
-                                        .child("履歴"),
+                                        .child(crate::ui_text::preview::history()),
                                 )
                             })
                             .when(phv.edit_button && editable, |d| {
@@ -2312,7 +2315,7 @@ impl TakoApp {
                                                     theme.accent
                                                 })),
                                         )
-                                        .child(if editing { "編集中" } else { "編集" }),
+                                        .child(if editing { crate::ui_text::preview::editing() } else { crate::ui_text::preview::edit() }),
                                 )
                             })
                             .when(phv.save_button && dirty && !autosave, |d| {
@@ -2337,7 +2340,7 @@ impl TakoApp {
                                             let _ = this.save_preview_local(pane_id);
                                             cx.notify();
                                         }))
-                                        .child("保存 ⌘S"),
+                                        .child(crate::ui_text::preview::save_cmd_s()),
                                 )
                             })
                             // 閉じるボタン（常に表示。右側に統一 #185）
@@ -2446,7 +2449,7 @@ impl TakoApp {
                                     .into_any_element()
                             })
                             .collect();
-                        ("アウトライン", rows)
+                        (crate::ui_text::preview::outline_section(), rows)
                     }
                     PreviewNavigationPanel::Pages => {
                         let (current, total) = pdf_info.unwrap_or((1, 0));
@@ -2504,11 +2507,11 @@ impl TakoApp {
                                         }
                                         cx.notify();
                                     }))
-                                    .child(SharedString::from(format!("ページ {page}")))
+                                    .child(SharedString::from(crate::ui_text::preview::page_n(page)))
                                     .into_any_element()
                             })
                             .collect();
-                        ("ページへ移動", rows)
+                        (crate::ui_text::preview::goto_page_section(), rows)
                     }
                 };
                 div()
@@ -2532,7 +2535,7 @@ impl TakoApp {
                             .text_size(px(10.0))
                             .text_color(hsla(theme.text_tertiary))
                             .child(label)
-                            .child(SharedString::from(format!("{} 件", rows.len()))),
+                            .child(SharedString::from(crate::ui_text::preview::item_count(rows.len()))),
                     )
                     .children(rows)
             }))
@@ -2864,7 +2867,7 @@ impl TakoApp {
                             .pt_2()
                             .text_size(px(11.0))
                             .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
-                            .child("…（大きいファイルのため末尾を省略して表示）")
+                            .child(crate::ui_text::preview::tail_omitted())
                     }))
             })
             .children((!pdf_highlight_bounds.is_empty()).then(|| {
@@ -3300,9 +3303,9 @@ impl TakoApp {
                 .p_4()
                 .text_color(hsla_alpha(theme.foreground, 0.5))
                 .child(SharedString::from(if data.repo_root.is_none() {
-                    "git 管理外のファイルです"
+                    crate::ui_text::preview::not_in_git()
                 } else {
-                    "このファイルの変更履歴はありません"
+                    crate::ui_text::preview::no_history()
                 }))
                 .into_any_element()];
         }
@@ -3387,7 +3390,7 @@ impl TakoApp {
                 .py_1()
                 .text_color(hsla_alpha(theme.foreground, 0.5))
                 .text_xs()
-                .child(SharedString::from("(変更なし)"))
+                .child(SharedString::from(crate::ui_text::preview::no_diff()))
                 .into_any_element();
         }
         let mut elements: Vec<gpui::AnyElement> = Vec::new();
