@@ -36,10 +36,11 @@
 //!
 //! PWA は daemon 自身が配信する（同一 origin・バージョン一致。公開 Pages 配信は廃止）。
 //!
-//! transport（Issue #282: Tailscale Serve 一本化）:
-//! - daemon は `127.0.0.1` のみ bind し、`tailscale serve` が HTTPS:443 →
-//!   `http://127.0.0.1:<port>` のプロキシとして tailnet 内へ公開する
-//!   （WireGuard E2E 暗号化・public internet に入口を持たない）
+//! transport（Issue #282 + #287 P1-2: UDS + Tailscale Serve）:
+//! - daemon は Unix domain socket（0600）のみで listen し、TCP ポートは一切開かない。
+//!   `tailscale serve` が HTTPS:443 → `unix:<socket path>` のプロキシとして tailnet 内へ
+//!   公開する（WireGuard E2E 暗号化・public internet に入口を持たない）。
+//!   別 OS ユーザーは socket パーミッションにより接続自体が不能
 //! - 接続リンクは恒久固定の `https://<ホスト名>.<tailnet>.ts.net`（MagicDNS 名。
 //!   serve の off → 再設定でも不変。弾 0 実測 `.agent/investigations/tailscale-serve-poc.md`）
 //! - Tailscale 未セットアップ（未導入・デーモン未起動・未ログイン・HTTPS 未有効）での
@@ -61,7 +62,6 @@ use serde_json::{json, Value};
 
 use crate::remote_auth::{DeviceRegistry, DeviceRole, Identity};
 
-const DEFAULT_PORT: u16 = 7749;
 const MAX_BODY_BYTES: u64 = 1024 * 1024;
 /// interact idle session の定期スイープ間隔
 const SESSION_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -107,8 +107,10 @@ pub fn pid_path() -> std::path::PathBuf {
 pub fn token_path() -> std::path::PathBuf {
     state_dir().join("tako-remote.token")
 }
-pub fn port_path() -> std::path::PathBuf {
-    state_dir().join("tako-remote.port")
+/// UDS ソケットのパス。daemon は TCP を listen せず、この socket のみで待ち受ける。
+/// Tailscale Serve は `unix:<path>` をバックエンドとして中継する（#287 P1-2）
+pub fn socket_path() -> std::path::PathBuf {
+    state_dir().join("tako-remote.sock")
 }
 /// 公開中の固定 ts.net URL を記録するファイル。
 /// デーモンが serve 確立時に書き、`daemon_status` が接続リンクの再構成に使う
@@ -172,8 +174,10 @@ fn restrict_permissions(path: &std::path::Path) {
 fn cleanup_state_files() {
     let _ = std::fs::remove_file(pid_path());
     let _ = std::fs::remove_file(token_path());
-    let _ = std::fs::remove_file(port_path());
+    let _ = std::fs::remove_file(socket_path());
     let _ = std::fs::remove_file(url_path());
+    // 旧 port ファイルの掃除（UDS 移行前からのアップグレード）
+    let _ = std::fs::remove_file(state_dir().join("tako-remote.port"));
     // QR ファイル（ランダム名）を掃除する
     let dir = state_dir();
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -221,8 +225,7 @@ struct DaemonCtx {
     tmux_socket: String,
     /// デバイスごとの WS 接続数 + 最終切断時刻（短時間の再接続で通知を抑制する）
     ws_connections: Mutex<HashMap<String, WsDeviceState>>,
-    /// 稼働ポート・公開 URL（admin state 表示用）
-    port: u16,
+    /// 公開 URL（admin state 表示用）
     base_url: String,
     /// 自ノードの ts.net ホスト名（XFF 検証用。#287 P1-1）
     expected_host: String,
@@ -867,14 +870,14 @@ fn setup_incomplete_error(status: &crate::tailscale::SetupStatus) -> io::Error {
 
 /// Tailscale の setup 状態を検証し、serve を設定して固定 ts.net URL を返す。
 /// 返り値: (tailscale CLI パス, 固定 URL)。
-/// 既存の serve 設定が tako 管理形式（HTTPS:443 の "/" 単純プロキシ）で自ポートを
-/// 向いている場合は再利用し、それ以外の設定は上書きせず拒否する
-fn establish_tailscale_serve(port: u16) -> io::Result<(String, String)> {
+/// 既存の serve 設定が tako 管理形式（HTTPS:443 の "/" 単純プロキシ）で自 socket を
+/// 向いている場合は再利用し、それ以外の設定は上書きせず拒否する。
+/// 旧 TCP 形式（`http://127.0.0.1:*`）は tako の残骸と判定して自動移行する
+fn establish_tailscale_serve(sock: &std::path::Path) -> io::Result<(String, String)> {
     let status = crate::tailscale::setup_status();
     if !status.ready() {
         return Err(setup_incomplete_error(&status));
     }
-    // ready() = missing が空なら cli_path / dns_name は必ず埋まっている
     let cli = status
         .cli_path
         .clone()
@@ -883,21 +886,27 @@ fn establish_tailscale_serve(port: u16) -> io::Result<(String, String)> {
         .ts_net_url()
         .ok_or_else(|| io::Error::other("ts.net URL を解決できない"))?;
 
+    let our_target = crate::tailscale::proxy_target_for_socket(sock);
     match crate::tailscale::serve_state(&cli).map_err(io::Error::other)? {
         crate::tailscale::ServeState::NotConfigured => {
-            crate::tailscale::serve_start(&cli, port).map_err(io::Error::other)?;
+            crate::tailscale::serve_start_unix(&cli, sock).map_err(io::Error::other)?;
         }
-        crate::tailscale::ServeState::Proxy(target)
-            if target == crate::tailscale::proxy_target_for_port(port) =>
+        crate::tailscale::ServeState::Proxy(target) if target == our_target => {
+            // 前回の設定が残っている（強制終了等）。同一 socket なのでそのまま再利用する
+        }
+        crate::tailscale::ServeState::Proxy(ref target)
+            if target.starts_with("http://127.0.0.1:") =>
         {
-            // 前回の設定が残っている（強制終了等）。同一ポートなのでそのまま再利用する
+            // 旧 TCP 形式の残骸 → UDS 形式へ自動移行
+            eprintln!("旧 TCP 形式の serve 設定を検出しました（{target}）。UDS 形式へ移行します…");
+            crate::tailscale::serve_stop(&cli).map_err(io::Error::other)?;
+            crate::tailscale::serve_start_unix(&cli, sock).map_err(io::Error::other)?;
         }
         crate::tailscale::ServeState::Proxy(target) => {
             return Err(io::Error::other(format!(
                 "tailscale serve に既存の設定があります（HTTPS:443 → {target}）。\
                  ユーザー設定を壊さないため上書きしません。tako の以前の設定の残骸で\
-                 あれば `tailscale serve --https=443 off` で解除するか、同じポートを\
-                 使うなら `tako remote start --port <ポート番号>` を指定してください"
+                 あれば `tailscale serve --https=443 off` で解除してください"
             )));
         }
         crate::tailscale::ServeState::Other => {
@@ -913,20 +922,46 @@ fn establish_tailscale_serve(port: u16) -> io::Result<(String, String)> {
 /// 独立デーモンとして HTTP サーバーを起動し、SIGTERM まで待機する。
 /// `tako remote serve` から呼ばれる内部用関数。
 ///
-/// transport 方針（#282）: `127.0.0.1` のみ bind し、`tailscale serve` 経由でのみ
-/// tailnet 内へ公開する（WireGuard E2E 暗号化。平文 LAN モードは存在しない）。
+/// transport 方針（#287 P1-2 根治）: TCP ポートを一切 listen せず、Unix domain socket
+/// （0600）のみで待ち受ける。`tailscale serve` が `unix:<socket path>` をバックエンドと
+/// して tailnet 内へ HTTPS プロキシする。別 OS ユーザーは接続自体が不能になり、
+/// XFF/XFH 偽装の攻撃経路が構造的に消滅する。
 /// Tailscale が未セットアップなら不足項目を列挙して起動を拒否する
-pub fn run_daemon(port: Option<u16>) -> io::Result<()> {
-    let port = port.unwrap_or(DEFAULT_PORT);
-    // P0-1: 127.0.0.1（ループバック）のみ bind。tailscale serve だけがアクセスする
-    let addr = format!("127.0.0.1:{port}");
-    let server = tiny_http::Server::http(&addr)
+pub fn run_daemon() -> io::Result<()> {
+    let sock = socket_path();
+    // socket パス長チェック（macOS の sun_path は 104 バイト）
+    let sock_bytes = sock.as_os_str().as_encoded_bytes().len();
+    if sock_bytes > 100 {
+        return Err(io::Error::other(format!(
+            "socket パスが長すぎます（{sock_bytes} バイト、上限 100）。\
+             TAKO_REMOTE_STATE_DIR でより短いパスを指定してください: {}",
+            sock.display()
+        )));
+    }
+    // stale socket の回収: 既存ファイルがあれば接続試行で生死判定
+    if sock.exists() {
+        match std::os::unix::net::UnixStream::connect(&sock) {
+            Ok(_) => {
+                return Err(io::Error::other(format!(
+                    "別の daemon が既にこの socket で稼働中です: {}",
+                    sock.display()
+                )));
+            }
+            Err(_) => {
+                // stale socket — unlink して起動続行
+                let _ = std::fs::remove_file(&sock);
+            }
+        }
+    }
+    let server = tiny_http::Server::http_unix(&sock)
         .map_err(|e| io::Error::other(format!("remote API サーバーを起動できない: {e}")))?;
-    let actual_port = server
-        .server_addr()
-        .to_ip()
-        .ok_or_else(|| io::Error::other("remote サーバーのポートを特定できない"))?
-        .port();
+    // socket を 0600 に制限（別 OS ユーザーの接続を遮断）
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| io::Error::other(format!("socket パーミッションの設定に失敗: {e}")))?;
+    }
 
     // tmux バックエンドソケット名を解決
     let tmux_socket = tako_core::tmux_backend::socket_name();
@@ -941,14 +976,13 @@ pub fn run_daemon(port: Option<u16>) -> io::Result<()> {
     // Tailscale setup 検証 + serve 設定（不足があればここで起動拒否）。
     // e2e 検証モード（TAKO_REMOTE_TEST_MODE=1）では実 tailscale serve を張らず、
     // ts CLI パスと fake base URL だけを用意する（本番 tailnet の serve 設定を壊さず、
-    // localhost 直叩き + fake identity 注入で認証層を実測するため。#283 の実測方針）。
-    // このモードは 127.0.0.1 bind のまま = 外部到達経路は増えない
+    // UDS 直叩き + fake identity 注入で認証層を実測するため。#283 の実測方針）
     let test_mode = std::env::var("TAKO_REMOTE_TEST_MODE").is_ok_and(|v| v == "1");
     let (ts_cli, base_url) = if test_mode {
         let cli = crate::tailscale::find_tailscale().unwrap_or_else(|| "tailscale".to_string());
-        (cli, format!("http://127.0.0.1:{actual_port}"))
+        (cli, "http://tako-remote.test".to_string())
     } else {
-        establish_tailscale_serve(actual_port)?
+        establish_tailscale_serve(&sock)?
     };
 
     // ローカル管理トークン生成（/api/admin/* 専用。リモート端末には渡らない。#283）
@@ -974,8 +1008,6 @@ pub fn run_daemon(port: Option<u16>) -> io::Result<()> {
         .map_err(|e| io::Error::other(format!("PID ファイルの書き出しに失敗: {e}")))?;
     write_secret_file(&token_path(), &token)
         .map_err(|e| io::Error::other(format!("トークンファイルの書き出しに失敗: {e}")))?;
-    write_secret_file(&port_path(), &actual_port.to_string())
-        .map_err(|e| io::Error::other(format!("ポートファイルの書き出しに失敗: {e}")))?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_for_signal = shutdown.clone();
@@ -1019,7 +1051,7 @@ pub fn run_daemon(port: Option<u16>) -> io::Result<()> {
         // 起動情報の整合が取れないため中止する。設定した serve と state を片付ける
         // （test_mode では serve を張っていないので触らない = 本番設定を壊さない）
         if !test_mode {
-            let _ = crate::tailscale::serve_stop_if_ours(&ts_cli, actual_port);
+            let _ = crate::tailscale::serve_stop_if_ours_unix(&ts_cli, &sock);
         }
         cleanup_state_files();
         return Err(io::Error::other(format!(
@@ -1032,8 +1064,7 @@ pub fn run_daemon(port: Option<u16>) -> io::Result<()> {
     // #283: URL に token は載せない（接続時の認証は機器ペアリングが行う）
     let info = json!({
         "running": true,
-        "port": actual_port,
-        "bind_addr": addr,
+        "socket": sock.display().to_string(),
         "url": base_url,
         "transport": "tailscale-serve",
     });
@@ -1056,7 +1087,6 @@ pub fn run_daemon(port: Option<u16>) -> io::Result<()> {
         admin_token: token.clone(),
         tmux_socket: tmux_socket.clone(),
         ws_connections: Mutex::new(HashMap::new()),
-        port: actual_port,
         base_url: base_url.clone(),
         expected_host,
     });
@@ -1111,7 +1141,7 @@ pub fn run_daemon(port: Option<u16>) -> io::Result<()> {
     // クリーンアップ: 自分が公開に使った serve 設定のみ解除する
     // （test_mode では serve を張っていないので触らない = 本番設定を壊さない）
     if !test_mode {
-        if let Err(e) = crate::tailscale::serve_stop_if_ours(&ts_cli, actual_port) {
+        if let Err(e) = crate::tailscale::serve_stop_if_ours_unix(&ts_cli, &sock) {
             eprintln!("tailscale serve の解除に失敗（tailscale serve --https=443 off で手動解除できます）: {e}");
         }
     }
@@ -1165,10 +1195,6 @@ pub fn daemon_status() -> Value {
         }
         return json!({ "running": false });
     }
-    let port = std::fs::read_to_string(port_path())
-        .ok()
-        .and_then(|s| s.trim().parse::<u16>().ok())
-        .unwrap_or(DEFAULT_PORT);
     // URL ファイル（起動時に確定した固定 ts.net URL）から接続リンクを再構成する。
     // #283: URL に token は含まれない（QR も固定 URL のみ）
     let base_url = std::fs::read_to_string(url_path())
@@ -1182,7 +1208,7 @@ pub fn daemon_status() -> Value {
     let mut status = json!({
         "running": true,
         "pid": pid_num,
-        "port": port,
+        "socket": socket_path().display().to_string(),
         "url": base_url,
         "transport": "tailscale-serve",
     });
@@ -1351,43 +1377,52 @@ pub fn daemon_force_stop() -> Result<Value, String> {
 
 /// デーモン停止後に残った serve 設定をベストエフォートで解除する。
 /// SIGKILL などで daemon 自身のクリーンアップが走らなかったケースの回収。
-/// 対象ポートへの tako 管理プロキシである場合のみ解除する（ユーザー設定は不可侵）
-fn cleanup_serve_leftover(port: Option<u16>) {
-    let Some(port) = port else { return };
+/// 自 socket + 旧 TCP 残骸の両方を回収する（ユーザー設定は不可侵）
+fn cleanup_serve_leftover() {
     let Some(cli) = crate::tailscale::find_tailscale() else {
         return;
     };
-    let _ = crate::tailscale::serve_stop_if_ours(&cli, port);
-}
-
-/// port ファイルに記録されたデーモンのポート番号を読む（無ければ None）
-fn recorded_port() -> Option<u16> {
-    std::fs::read_to_string(port_path())
-        .ok()
-        .and_then(|s| s.trim().parse::<u16>().ok())
+    let _ = crate::tailscale::serve_stop_if_ours_unix(&cli, &socket_path());
 }
 
 fn daemon_stop_impl(force: bool) -> Result<Value, String> {
     let pid_info = match parse_pid_file() {
         Ok(info) => info,
         Err(_) => {
-            // PID ファイルが無い → ポート占有者を探す
-            if let Some((occupant, is_tako)) = find_port_occupant(DEFAULT_PORT) {
-                if is_tako {
-                    eprintln!(
-                        "PID ファイルが消失していますが、stale デーモン（PID {occupant}）を検出。停止します…"
-                    );
-                    kill_stale_daemon(occupant);
-                    cleanup_serve_leftover(Some(DEFAULT_PORT));
-                    return Ok(json!({ "stopped": true, "stale_pid": occupant }));
+            // PID ファイルが無い → socket 接続で stale daemon を探す
+            let sock = socket_path();
+            if sock.exists() {
+                if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) {
+                    // 生きた daemon がいる → health を叩いて pid を取得
+                    use std::io::{Read as _, Write as _};
+                    let req =
+                        "GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+                    if stream.write_all(req.as_bytes()).is_ok() {
+                        let mut buf = Vec::new();
+                        let _ = stream.read_to_end(&mut buf);
+                        let resp = String::from_utf8_lossy(&buf);
+                        if let Some(body) = resp.split_once("\r\n\r\n").map(|(_, b)| b) {
+                            if let Ok(v) = serde_json::from_str::<Value>(body.trim()) {
+                                if let Some(pid) = v["pid"].as_u64() {
+                                    eprintln!(
+                                        "PID ファイルが消失していますが、稼働中デーモン（PID {pid}）を検出。停止します…"
+                                    );
+                                    kill_stale_daemon(pid as u32);
+                                    cleanup_serve_leftover();
+                                    return Ok(json!({ "stopped": true, "stale_pid": pid }));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // stale socket — unlink
+                    let _ = std::fs::remove_file(&sock);
                 }
             }
             return Err("リモートサーバーが起動していない（PID ファイルが無い）".to_string());
         }
     };
     let pid_num = pid_info.pid;
-    // kill 後は state が消えるため、serve 残骸回収用のポートを先に読んでおく
-    let daemon_port = recorded_port();
     if !is_process_alive(pid_num) {
         cleanup_state_files();
         return Err("リモートサーバーが起動していない（プロセスは既に終了）".to_string());
@@ -1440,7 +1475,7 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
     }
     // SIGTERM ならデーモン自身が serve を解除して終了する。SIGKILL（--force）や
     // 異常終了で残った serve 設定はここでベストエフォート回収する（冪等）
-    cleanup_serve_leftover(daemon_port);
+    cleanup_serve_leftover();
     cleanup_state_files();
     Ok(json!({ "stopped": true }))
 }
@@ -1498,19 +1533,14 @@ fn serve_binary_impl(
 }
 
 /// デーモンをバックグラウンドで fork 起動する。
-/// `tako remote serve --port N` を子プロセスとして起動し、
+/// `tako remote serve` を子プロセスとして起動し、
 /// stdout から起動情報 JSON を読み取って返す。
 /// Tailscale 未セットアップ時は子プロセスが不足項目を stderr に出して終了するため、
 /// その内容がこの関数の Err に載る（#282: `tako remote setup` への誘導）
-pub fn spawn_daemon(port: Option<u16>) -> Result<Value, String> {
-    let actual_port = port.unwrap_or(DEFAULT_PORT);
-
+pub fn spawn_daemon() -> Result<Value, String> {
     // 既に起動中か確認
     let status = daemon_status();
     if status["running"].as_bool() == Some(true) {
-        // 稼働中 serve の世代が現在の解決先と異なる場合は差し替えを促す
-        // （#432: install 後も旧バイナリの serve が生き残り、実機検証が
-        // 旧コードを踏む事故の検知）
         let running_exe = status["serve_binary"].as_str().unwrap_or("");
         let expected = serve_binary();
         if !running_exe.is_empty() && running_exe != expected {
@@ -1523,35 +1553,28 @@ pub fn spawn_daemon(port: Option<u16>) -> Result<Value, String> {
         return Err("リモートサーバーは既に起動中".to_string());
     }
 
-    // PID ファイルが無くてもポートが占有されている場合がある（state ファイル消失 + プロセス生存）
-    if let Some((occupant_pid, is_tako)) = find_port_occupant(actual_port) {
-        if is_tako {
-            eprintln!(
-                "stale な tako remote デーモン（PID {occupant_pid}）がポート {actual_port} を\
-                 保持しています。自動回収します…"
-            );
-            kill_stale_daemon(occupant_pid);
-            if find_port_occupant(actual_port).is_some() {
+    // stale socket の回収（PID ファイル消失 + プロセス死亡で socket だけ残るケース）
+    let sock = socket_path();
+    if sock.exists() {
+        match std::os::unix::net::UnixStream::connect(&sock) {
+            Ok(_) => {
                 return Err(format!(
-                    "stale デーモン（PID {occupant_pid}）を kill しましたが、\
-                     ポート {actual_port} がまだ解放されません"
+                    "別の daemon が既にこの socket で稼働中です: {}",
+                    sock.display()
                 ));
             }
-        } else {
-            return Err(format!(
-                "ポート {actual_port} は別のプロセス（PID {occupant_pid}）が使用中です。\
-                 `tako remote start --port <別のポート>` で別ポートを指定するか、\
-                 該当プロセスを停止してください"
-            ));
+            Err(_) => {
+                eprintln!(
+                    "stale socket を検出しました。自動回収します: {}",
+                    sock.display()
+                );
+                let _ = std::fs::remove_file(&sock);
+            }
         }
     }
 
     let tako_bin = serve_binary();
-    let mut args = vec!["remote".to_string(), "serve".to_string()];
-    if let Some(p) = port {
-        args.push("--port".to_string());
-        args.push(p.to_string());
-    }
+    let args = vec!["remote".to_string(), "serve".to_string()];
 
     let mut cmd = Command::new(&tako_bin);
     cmd.args(&args)
@@ -1672,41 +1695,6 @@ fn is_process_alive(pid: u32) -> bool {
     }
 }
 
-/// 指定ポートを LISTEN しているプロセスを探す。
-/// 返り値: `Some((pid, is_tako_remote))` — `is_tako_remote` は `tako remote serve` かどうか
-#[cfg(unix)]
-fn find_port_occupant(port: u16) -> Option<(u32, bool)> {
-    let output = Command::new("lsof")
-        .args(["-t", "-i", &format!(":{port}"), "-sTCP:LISTEN"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let pid: u32 = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()?
-        .trim()
-        .parse()
-        .ok()?;
-    let is_tako = Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "args="])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .map(|o| {
-            let cmd = String::from_utf8_lossy(&o.stdout);
-            cmd.contains("tako") && cmd.contains("remote") && cmd.contains("serve")
-        })
-        .unwrap_or(false);
-    Some((pid, is_tako))
-}
-
-#[cfg(not(unix))]
-fn find_port_occupant(_port: u16) -> Option<(u32, bool)> {
-    None
-}
-
 /// stale なデーモンプロセスを kill し、終了を確認して state ファイルを掃除する。
 /// SIGTERM → 最大 5 秒ポーリング → 終了しなければ SIGKILL
 fn kill_stale_daemon(pid: u32) {
@@ -1741,8 +1729,8 @@ fn kill_stale_daemon(pid: u32) {
 // `.agent/requirements.md`）。devices list / revoke は CLI / MCP にも公開する。
 // 認証はローカル管理トークン（state_dir の token ファイル、0600 = 同一ユーザーのみ）。
 
-/// 稼働中 daemon の admin API を叩く最小 HTTP クライアント（localhost 専用）。
-/// 外部依存を増やさないため std TcpStream + HTTP/1.1 の自前実装
+/// 稼働中 daemon の admin API を叩く最小 HTTP クライアント（UDS 専用）。
+/// 外部依存を増やさないため std UnixStream + HTTP/1.1 の自前実装
 pub fn admin_request(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
     use std::io::{Read as _, Write as _};
 
@@ -1750,7 +1738,7 @@ pub fn admin_request(method: &str, path: &str, body: Option<&Value>) -> Result<V
     if status["running"].as_bool() != Some(true) {
         return Err("リモートサーバーが起動していない".to_string());
     }
-    let port = status["port"].as_u64().unwrap_or(DEFAULT_PORT as u64) as u16;
+    let sock = socket_path();
     let token = std::fs::read_to_string(token_path())
         .map_err(|e| format!("管理トークンの読み取りに失敗: {e}"))?
         .trim()
@@ -1758,13 +1746,13 @@ pub fn admin_request(method: &str, path: &str, body: Option<&Value>) -> Result<V
 
     let body_str = body.map(|b| b.to_string()).unwrap_or_default();
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Tako-Admin: {token}\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nX-Tako-Admin: {token}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
         body_str.len()
     );
 
-    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
-        .map_err(|e| format!("daemon へ接続できない (127.0.0.1:{port}): {e}"))?;
+    let mut stream = std::os::unix::net::UnixStream::connect(&sock)
+        .map_err(|e| format!("daemon へ接続できない ({}): {e}", sock.display()))?;
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(10)))
         .ok();
@@ -2942,7 +2930,8 @@ fn handle_request_v2(
         return serve_embedded(request, &path);
     }
 
-    // /api/health: 層①のみ。version は PWA の互換チェックに使う
+    // /api/health: 層①のみ。version は PWA の互換チェックに使う。
+    // pid は stale daemon 検出時の回収に使う（daemon_stop_impl）
     if path == "/api/health" && method == tiny_http::Method::Get {
         return respond(
             request,
@@ -2951,6 +2940,7 @@ fn handle_request_v2(
                 json!({
                     "status": "ok",
                     "version": env!("CARGO_PKG_VERSION"),
+                    "pid": std::process::id(),
                 })
                 .to_string(),
             ),
@@ -3167,7 +3157,6 @@ fn handle_admin_api(
             let connections = ctx.connections_snapshot();
             let body = json!({
                 "running": true,
-                "port": ctx.port,
                 "url": ctx.base_url,
                 "devices": devices,
                 "pending": pending,
@@ -4563,12 +4552,6 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(constant_time_eq(b"", b""));
         assert!(!constant_time_eq(b"", b"x"));
-    }
-
-    #[test]
-    fn find_port_occupantは未使用ポートでnoneを返す() {
-        // 存在しないであろう高番号ポート
-        assert!(find_port_occupant(59999).is_none());
     }
 
     #[test]

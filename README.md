@@ -110,7 +110,7 @@ Register the bundled stdio bridge with any of the methods above; after that, pan
 
 ## リモートアクセス / Remote access
 
-`tako remote start` はスマホのブラウザから tako のペインを操作するための HTTP API サーバーを起動します（既定ポート 7749）。**この機能は既定で無効**で、明示的に起動したときだけ動きます。transport は **Tailscale Serve のみ**: サーバーは `127.0.0.1` にだけ bind し、[Tailscale](https://tailscale.com/) があなたの tailnet（プライベートネットワーク）内限定の恒久固定 URL `https://<ホスト名>.<tailnet>.ts.net` で公開します。通信は WireGuard で**エンドツーエンド暗号化**され、URL は public internet には存在しません。Mac とスマホの両方に Tailscale アプリを入れ、同一アカウントでログインしている必要があります。Tailscale が未セットアップの場合、`tako remote start` は不足項目を列挙して起動を拒否します。
+`tako remote start` はスマホのブラウザから tako のペインを操作するための HTTP API サーバーを起動します。**この機能は既定で無効**で、明示的に起動したときだけ動きます。transport は **Tailscale Serve + Unix domain socket**: サーバーは UDS（0600）のみで listen し TCP ポートは一切開きません。[Tailscale](https://tailscale.com/) があなたの tailnet（プライベートネットワーク）内限定の恒久固定 URL `https://<ホスト名>.<tailnet>.ts.net` で公開します。通信は WireGuard で**エンドツーエンド暗号化**され、URL は public internet には存在しません。Mac とスマホの両方に Tailscale アプリを入れ、同一アカウントでログインしている必要があります。Tailscale が未セットアップの場合、`tako remote start` は不足項目を列挙して起動を拒否します。
 
 **セキュリティ上の注意（使う前に必ず読んでください）:**
 
@@ -120,7 +120,7 @@ Register the bundled stdio bridge with any of the methods above; after that, pan
 
 ---
 
-`tako remote start` launches an HTTP API server that lets you drive tako's panes from a phone browser. **It is disabled by default** and only runs when you explicitly start it. Treat it as a legitimate remote-control tool: once connected, the remote browser can send **arbitrary keystrokes and commands to your terminal** (effectively full shell access). The connection URL/QR embeds a token that is the key to your machine — never share it. Transport is **Tailscale Serve only**: the daemon binds to `127.0.0.1` and is published exclusively inside your tailnet at a permanent URL (`https://<host>.<tailnet>.ts.net`), end-to-end encrypted via WireGuard and invisible to the public internet. Both your Mac and phone need the Tailscale app signed into the same account; if Tailscale is not set up, `tako remote start` lists what is missing and refuses to start.
+`tako remote start` launches an HTTP API server that lets you drive tako's panes from a phone browser. **It is disabled by default** and only runs when you explicitly start it. Treat it as a legitimate remote-control tool: once connected, the remote browser can send **arbitrary keystrokes and commands to your terminal** (effectively full shell access). Transport is **Tailscale Serve + Unix domain socket**: the daemon listens only on a UDS (0600) and opens no TCP ports. It is published exclusively inside your tailnet at a permanent URL (`https://<host>.<tailnet>.ts.net`), end-to-end encrypted via WireGuard and invisible to the public internet. Both your Mac and phone need the Tailscale app signed into the same account; if Tailscale is not set up, `tako remote start` lists what is missing and refuses to start.
 
 ## トラブルシューティング / Troubleshooting
 

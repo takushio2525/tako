@@ -801,12 +801,8 @@ enum AgentsCommand {
 #[derive(Subcommand)]
 enum RemoteCommand {
     /// リモートアクセス API サーバーを起動し、QR コードを表示する
-    /// （transport は Tailscale Serve のみ。未セットアップなら不足項目を案内して停止）
-    Start {
-        /// サーバーのポート番号（省略時は 7749）
-        #[arg(long, default_value_t = 7749)]
-        port: u16,
-    },
+    /// （transport は Tailscale Serve + UDS。未セットアップなら不足項目を案内して停止）
+    Start,
     /// リモートアクセス API サーバーを停止する
     Stop {
         /// SIGTERM の代わりに SIGKILL で停止する（P0-4）
@@ -846,16 +842,9 @@ enum RemoteCommand {
         /// 非対話パラメータを JSON で渡す（MCP / dispatch と同じ形式）
         #[arg(long)]
         answers: Option<String>,
-        /// サーバーのポート番号（省略時は 7749）
-        #[arg(long, default_value_t = 7749)]
-        port: u16,
     },
     /// [内部用] HTTP サーバーをフォアグラウンドで起動する（start から自動呼び出し）
-    Serve {
-        /// サーバーのポート番号（省略時は 7749）
-        #[arg(long, default_value_t = 7749)]
-        port: u16,
-    },
+    Serve,
 }
 
 #[derive(Subcommand)]
@@ -2127,10 +2116,10 @@ fn main() -> ExitCode {
         // gate 操作は YAML I/O + コマンド実行のみのためローカル処理（#244）
         Command::Task(TaskCommand::Gate(ref gate_sub)) => gate_cli(gate_sub),
         // remote コマンドはローカル処理（IPC 不要）
-        Command::Remote(RemoteCommand::Start { port }) => remote_start(port),
+        Command::Remote(RemoteCommand::Start) => remote_start(),
         Command::Remote(RemoteCommand::Stop { force }) => remote_stop(force),
         Command::Remote(RemoteCommand::Status) => remote_status(),
-        Command::Remote(RemoteCommand::Serve { port }) => remote_serve(port),
+        Command::Remote(RemoteCommand::Serve) => remote_serve(),
         Command::Remote(RemoteCommand::Agents) => remote_agents(),
         Command::Remote(RemoteCommand::Messages { session_id, tail }) => {
             remote_messages(&session_id, tail)
@@ -2139,8 +2128,8 @@ fn main() -> ExitCode {
             remote_scrollback(&pane_id, lines)
         }
         Command::Remote(RemoteCommand::Devices { command }) => remote_devices(command),
-        Command::Remote(RemoteCommand::Setup { yes, answers, port }) => {
-            remote_setup_cli(yes, answers.as_deref(), port)
+        Command::Remote(RemoteCommand::Setup { yes, answers }) => {
+            remote_setup_cli(yes, answers.as_deref())
         }
         // テレメトリもローカル処理（IPC 不要。設定ファイルの読み書きのみ）
         Command::Telemetry(ref sub) => telemetry_local(sub),
@@ -2887,8 +2876,8 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
 /// Tailscale 未セットアップ時は spawn_daemon が不足項目を列挙して起動を拒否する（#282）。
 /// QR は恒久固定 URL のみ（#283: secret を含まない。初回接続時に Mac 側で
 /// ペアリング承認ダイアログが表示される）
-fn remote_start(port: u16) -> Result<(), String> {
-    let result = tako_control::remote::spawn_daemon(Some(port))?;
+fn remote_start() -> Result<(), String> {
+    let result = tako_control::remote::spawn_daemon()?;
     println!("{}", pretty_json(&result));
     if let Some(url) = result["url"].as_str() {
         match tako_control::remote::generate_qr_png(url) {
@@ -2951,13 +2940,10 @@ fn remote_devices(command: RemoteDevicesCommand) -> Result<(), String> {
 }
 
 /// `tako remote setup` — Tailscale リモートセットアップウィザード
-fn remote_setup_cli(yes: bool, answers_json: Option<&str>, port: u16) -> Result<(), String> {
+fn remote_setup_cli(yes: bool, answers_json: Option<&str>) -> Result<(), String> {
     if let Some(json_str) = answers_json {
         let mut answers: tako_control::remote_setup::RemoteSetupAnswers =
             serde_json::from_str(json_str).map_err(|e| format!("answers JSON が不正: {e}"))?;
-        if answers.port.is_none() {
-            answers.port = Some(port);
-        }
         if yes {
             answers.yes = Some(true);
         }
@@ -2965,14 +2951,14 @@ fn remote_setup_cli(yes: bool, answers_json: Option<&str>, port: u16) -> Result<
         println!("{}", pretty_json(&result));
     } else {
         let mut stdout = std::io::stdout();
-        tako_control::remote_setup::run_interactive(port, yes, &mut stdout)?;
+        tako_control::remote_setup::run_interactive(yes, &mut stdout)?;
     }
     Ok(())
 }
 
 /// `tako remote serve` — HTTP サーバーをフォアグラウンドで起動する（内部用）
-fn remote_serve(port: u16) -> Result<(), String> {
-    tako_control::remote::run_daemon(Some(port)).map_err(|e| e.to_string())
+fn remote_serve() -> Result<(), String> {
+    tako_control::remote::run_daemon().map_err(|e| e.to_string())
 }
 
 /// `tako remote agents` — claude agents --json + tmux ペイン対応付けを表示する

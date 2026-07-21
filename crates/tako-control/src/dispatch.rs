@@ -2264,7 +2264,7 @@ fn dispatch_inner(
             limit,
         }),
 
-        Request::RemoteStart { port } => host.remote_start(port).map_err(DispatchError::Operation),
+        Request::RemoteStart {} => host.remote_start().map_err(DispatchError::Operation),
         Request::RemoteStop { force } => {
             if force {
                 crate::remote::daemon_force_stop().map_err(DispatchError::Operation)

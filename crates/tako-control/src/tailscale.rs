@@ -260,6 +260,11 @@ pub fn proxy_target_for_port(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// UDS 版のプロキシ先表現。`tailscale serve unix:<path>` の引数そのまま
+pub fn proxy_target_for_socket(path: &std::path::Path) -> String {
+    format!("unix:{}", path.display())
+}
+
 /// `tailscale whois` で得た接続元ノードの情報（層①の identity 検証。#283）。
 /// フィールドは 2026-07-17 実測の JSON 形式が正（`Node.StableID` / `UserProfile.LoginName`）
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +360,21 @@ pub fn serve_start(cli: &str, port: u16) -> Result<(), String> {
     Ok(())
 }
 
+/// UDS 版 serve 設定。`tailscale serve --bg --https=443 unix:<socket_path>`
+pub fn serve_start_unix(cli: &str, socket_path: &std::path::Path) -> Result<(), String> {
+    let target = proxy_target_for_socket(socket_path);
+    let output = run_tailscale(cli, &["serve", "--bg", "--https=443", &target])?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "tailscale serve の設定に失敗（unix: 非対応の可能性。\
+             `tailscale version` を確認してください）: {}",
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
 /// HTTPS:443 の serve 設定を解除する。
 /// 呼び出し側の契約: serve_state で tako 自身の設定（Proxy が自ポート）で
 /// あることを確認してから呼ぶ（ユーザーの既存 serve 設定を壊さないため）
@@ -374,6 +394,22 @@ pub fn serve_stop(cli: &str) -> Result<(), String> {
 pub fn serve_stop_if_ours(cli: &str, port: u16) -> Result<bool, String> {
     match serve_state(cli)? {
         ServeState::Proxy(target) if target == proxy_target_for_port(port) => {
+            serve_stop(cli)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// UDS 版: serve 設定が指定 socket への tako 管理プロキシであれば解除する。
+/// 旧 TCP 形式（`http://127.0.0.1:*`）の残骸も移行対象として回収する
+pub fn serve_stop_if_ours_unix(cli: &str, socket_path: &std::path::Path) -> Result<bool, String> {
+    match serve_state(cli)? {
+        ServeState::Proxy(target) if target == proxy_target_for_socket(socket_path) => {
+            serve_stop(cli)?;
+            Ok(true)
+        }
+        ServeState::Proxy(ref target) if target.starts_with("http://127.0.0.1:") => {
             serve_stop(cli)?;
             Ok(true)
         }
@@ -611,6 +647,37 @@ mod tests {
     #[test]
     fn proxy_target_for_portの形式() {
         assert_eq!(proxy_target_for_port(7749), "http://127.0.0.1:7749");
+    }
+
+    #[test]
+    fn proxy_target_for_socketの形式() {
+        let path = std::path::Path::new("/tmp/tako-remote.sock");
+        assert_eq!(proxy_target_for_socket(path), "unix:/tmp/tako-remote.sock");
+        let space_path = std::path::Path::new(
+            "/Users/test/Library/Application Support/tako/remote/tako-remote.sock",
+        );
+        assert_eq!(
+            proxy_target_for_socket(space_path),
+            "unix:/Users/test/Library/Application Support/tako/remote/tako-remote.sock"
+        );
+    }
+
+    #[test]
+    fn serve_stateはunixソケットプロキシを認識する() {
+        let serve = json!({
+            "TCP": { "443": { "HTTPS": true } },
+            "Web": {
+                "mac.tail1234.ts.net:443": {
+                    "Handlers": { "/": { "Proxy": "unix:/Users/test/Library/Application Support/tako/remote/tako-remote.sock" } }
+                }
+            }
+        });
+        assert_eq!(
+            parse_serve_state(&serve),
+            ServeState::Proxy(
+                "unix:/Users/test/Library/Application Support/tako/remote/tako-remote.sock".into()
+            )
+        );
     }
 
     #[test]
