@@ -34,6 +34,25 @@
 - 仕様書は `.agent/`（日本語）。コードコメントも日本語
 - 仕様変更時は該当する `.agent/*.md` を**同一コミット**で更新する
 
+## UI 文字列の i18n（Issue #435）
+
+UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `tako_lang` /
+パレット「表示言語を切替」で手動切替）。実装規約:
+
+- **新機能の UI 文字列は必ず日英両方を用意する**。GUI に描画する文章を render コードへ
+  直書きせず、`crates/tako-app/src/ui_text/` の機能別モジュールに
+  `pub fn key() -> &'static str { tr!("日本語", "English") }` で追加する
+  （動的文言は `tr!(format!(..), format!(..))` で `String` を返す。選ばれた側だけ評価される）
+- 関数名がロケールキー（例: `sleep_guard::chip_active` → キー `sleep_guard.chip_active`）。
+  モジュールの `catalog_has_both_languages_and_no_emoji` テストに新文字列を追加する
+  （非空・絵文字なし・英語側に日本語が残っていないことを機械検査）
+- **対象は「画面に描画される文字列」のみ**。診断ログ（eprintln / persist.log）・
+  dispatch / CLI / MCP のエラーメッセージ・AI へのプロンプトは対象外（現状維持 = 日本語可）
+- 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
+  settings.json の `language`。言語に依存する単体テストは相対比較
+  （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
+  `ui_text::tests_support::check_ja_en` に集約する（並列テストの競合防止）
+
 ## コマンド案内の規約（Issue #322）
 
 ユーザー体験の設計原則。setup に限らず、CLI 出力・system prompt・docs のすべてに適用する。
