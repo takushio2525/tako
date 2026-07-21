@@ -5,6 +5,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- [修正] 隔離/多重起動時の disablesleep 残留解除で本番の蓋閉じ防止を外さない (#449)
+  `check_disablesleep_residual()` が pmset disablesleep のマシングローバル状態を
+  無条件で 0 に戻していたため、本番インスタンスが busy エージェントのために正当に
+  有効化した蓋閉じ防止を、隔離/検証インスタンスが起動時に一時解除する穴があった。
+  TAKO_ISOLATED / 他 tako プロセス動作中 / セカンダリモードの 3 条件でスキップする
+  ガードを追加。単独残留（クラッシュ後の真の残留）の解除は従来どおり動作する。
+  Fix isolated/secondary instances clearing production lid-sleep prevention (#449).
+  `check_disablesleep_residual()` unconditionally reset the machine-global
+  `pmset disablesleep` to 0, which could momentarily disable lid-sleep prevention
+  that a production instance had legitimately enabled for busy agents. Added guards
+  to skip residual clearing under TAKO_ISOLATED, when another tako process is
+  running, or in secondary mode. Genuine residuals after a crash are still cleared.
+
 - [修正] 隔離起動時に remote state_dir を隔離し本番 state 破壊を防止 (#445)
   `TAKO_ISOLATED=1` での隔離起動時に `TAKO_REMOTE_STATE_DIR` が隔離されず、
   2 秒毎の `daemon_status` ポーリングが本番の remote state ファイルを削除し得た。

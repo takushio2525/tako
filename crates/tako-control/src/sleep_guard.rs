@@ -607,17 +607,47 @@ pub fn set_disablesleep(enable: bool) -> Result<(), String> {
     }
 }
 
-/// 起動時の残留チェック: disablesleep=1 が残っていて busy エージェントがいなければ 0 に戻す
+/// 残留解除を行うべきかを判定する（#449: テスト可能な純粋関数）。
+/// Ok(()) なら解除すべき、Err(理由) ならスキップ
+fn should_clear_residual(
+    is_isolated: bool,
+    other_instance_running: bool,
+    sudoers_installed: bool,
+    sleep_disabled: bool,
+) -> Result<(), &'static str> {
+    if is_isolated {
+        return Err("隔離モード（TAKO_ISOLATED）のためスキップ");
+    }
+    if other_instance_running {
+        return Err("他の tako プロセスが動作中のためスキップ");
+    }
+    if !sudoers_installed {
+        return Err("sudoers 未登録");
+    }
+    if !sleep_disabled {
+        return Err("disablesleep=0（残留なし）");
+    }
+    Ok(())
+}
+
+/// 起動時の残留チェック: disablesleep=1 が残っていて busy エージェントがいなければ 0 に戻す。
+/// セカンダリモードでは呼び出し側でスキップすること（#449）
 pub fn check_disablesleep_residual() {
     #[cfg(target_os = "macos")]
     {
-        if !is_sudoers_installed() {
+        let is_isolated = matches!(
+            std::env::var("TAKO_ISOLATED").ok().as_deref(),
+            Some("1" | "true" | "on")
+        );
+        if let Err(reason) = should_clear_residual(
+            is_isolated,
+            tako_core::ports::other_tako_running(),
+            is_sudoers_installed(),
+            iokit::sleep_disabled(),
+        ) {
+            eprintln!("[sleep-guard] disablesleep 残留チェック: {reason}");
             return;
         }
-        if !iokit::sleep_disabled() {
-            return;
-        }
-        // 起動直後なので busy エージェントは 0 → 残留と判断して解除
         if let Err(e) = set_disablesleep(false) {
             eprintln!("[sleep-guard] disablesleep 残留の自動解除に失敗: {e}");
         } else {
@@ -1137,5 +1167,48 @@ mod tests {
     fn check_qos_returns_json() {
         let qos = check_qos();
         assert!(qos.is_object());
+    }
+
+    // --- #449: should_clear_residual のガード条件テスト ---
+
+    #[test]
+    fn residual_skip_when_isolated() {
+        let r = should_clear_residual(true, false, true, true);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("隔離モード"));
+    }
+
+    #[test]
+    fn residual_skip_when_other_instance_running() {
+        let r = should_clear_residual(false, true, true, true);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("他の tako"));
+    }
+
+    #[test]
+    fn residual_skip_when_no_sudoers() {
+        let r = should_clear_residual(false, false, false, true);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("sudoers"));
+    }
+
+    #[test]
+    fn residual_skip_when_not_disabled() {
+        let r = should_clear_residual(false, false, true, false);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("残留なし"));
+    }
+
+    #[test]
+    fn residual_clear_when_solo_and_disabled() {
+        let r = should_clear_residual(false, false, true, true);
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn residual_isolated_takes_priority_over_other_checks() {
+        let r = should_clear_residual(true, true, true, true);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("隔離モード"));
     }
 }
