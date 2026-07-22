@@ -110,17 +110,31 @@ Register the bundled stdio bridge with any of the methods above; after that, pan
 
 ## リモートアクセス / Remote access
 
-`tako remote start` はスマホのブラウザから tako のペインを操作するための HTTP API サーバーを起動します。**この機能は既定で無効**で、明示的に起動したときだけ動きます。transport は **Tailscale Serve + Unix domain socket**: サーバーは UDS（0600）のみで listen し TCP ポートは一切開きません。[Tailscale](https://tailscale.com/) があなたの tailnet（プライベートネットワーク）内限定の恒久固定 URL `https://<ホスト名>.<tailnet>.ts.net` で公開します。通信は WireGuard で**エンドツーエンド暗号化**され、URL は public internet には存在しません。Mac とスマホの両方に Tailscale アプリを入れ、同一アカウントでログインしている必要があります。Tailscale が未セットアップの場合、`tako remote start` は不足項目を列挙して起動を拒否します。
+`tako remote start` はスマホのブラウザから tako のペインを操作するための HTTP API サーバーを起動します。**この機能は既定で無効**で、明示的に起動したときだけ動きます。
+
+**transport**: サーバーは Unix domain socket（0600）のみで listen し、TCP ポートは一切開きません。[Tailscale](https://tailscale.com/) の `serve` 機能が HTTPS → UDS のプロキシとして tailnet（プライベートネットワーク）内限定の恒久固定 URL `https://<ホスト名>.<tailnet>.ts.net` で公開します。通信は WireGuard で**エンドツーエンド暗号化**され、URL は public internet には存在しません。Mac とスマホの両方に Tailscale アプリを入れ、同一アカウントでログインしている必要があります。Tailscale が未セットアップの場合、`tako remote start` は不足項目を列挙して起動を拒否します。
+
+**認証（機器ペアリング方式）**: 二層の認証でアクセスを制御します。層①では `tailscale whois` で接続元が tailnet 上の実在ノードであることを検証します。層②では、初回接続時にスマホ側からペアリング要求を送り、Mac 画面に表示される承認ダイアログで許可するまで画面データを一切受け取れません。一度ペアリングしたデバイスは以降自動で認証されます。各デバイスには role（閲覧のみ / 入力可 / 管理 / 全権）を割り当てられ、不要になったら Mac 側から失効できます。
 
 **セキュリティ上の注意（使う前に必ず読んでください）:**
 
 - **これは正規の遠隔操作ツールです。** 接続すると、リモートのブラウザから**あなたのターミナルへ任意のキー入力・コマンドを送信できます**（＝実質的にシェルへのフルアクセス）。自分の端末を自分で操作する目的でのみ使ってください。他人の端末に無断で導入・接続する用途のものではありません。
-- **接続 URL・QR コードに含まれるトークンは秘密情報です。** URL の `#token=...` 部分は端末を操作できる鍵そのものです。SNS・スクリーンショット・画面共有で他人に見せないでください。トークンはサーバー起動のたびに新しく生成され、停止で無効になります。
+- **接続 URL は tailnet 内でのみ有効ですが、共有しないでください。** URL 自体にはトークンは含まれませんが、tailnet 内の端末からはアクセス可能です。SNS やスクリーンショットで公開しないでください。
 - **到達できるのは同じ tailnet の端末だけです。** それでも tailnet 内の全端末が信頼できるとは限らない場合（共有 tailnet 等）は、この機能を使わないでください。Tailscale アカウント自体の保護（2 要素認証等）も重要です。
 
 ---
 
-`tako remote start` launches an HTTP API server that lets you drive tako's panes from a phone browser. **It is disabled by default** and only runs when you explicitly start it. Treat it as a legitimate remote-control tool: once connected, the remote browser can send **arbitrary keystrokes and commands to your terminal** (effectively full shell access). Transport is **Tailscale Serve + Unix domain socket**: the daemon listens only on a UDS (0600) and opens no TCP ports. It is published exclusively inside your tailnet at a permanent URL (`https://<host>.<tailnet>.ts.net`), end-to-end encrypted via WireGuard and invisible to the public internet. Both your Mac and phone need the Tailscale app signed into the same account; if Tailscale is not set up, `tako remote start` lists what is missing and refuses to start.
+`tako remote start` launches an HTTP API server that lets you drive tako's panes from a phone browser. **It is disabled by default** and only runs when you explicitly start it. Treat it as a legitimate remote-control tool: once connected, the remote browser can send **arbitrary keystrokes and commands to your terminal** (effectively full shell access).
+
+**Transport**: The daemon listens only on a Unix domain socket (0600) and opens no TCP ports. Tailscale's `serve` feature proxies HTTPS → UDS, publishing the server exclusively inside your tailnet at a permanent URL (`https://<host>.<tailnet>.ts.net`), end-to-end encrypted via WireGuard and invisible to the public internet. Both your Mac and phone need the Tailscale app signed into the same account; if Tailscale is not set up, `tako remote start` lists what is missing and refuses to start.
+
+**Authentication (device pairing)**: Access is controlled by two layers. Layer 1 verifies via `tailscale whois` that the connecting device is a real node on your tailnet. Layer 2 requires first-time devices to send a pairing request; until you approve it on the Mac's dialog, the device cannot receive any screen data. Once paired, a device is recognized automatically on subsequent connections. Each device is assigned a role (observe / interact / manage / admin), and you can revoke access from the Mac at any time.
+
+**Security notes (read before use):**
+
+- **This is a legitimate remote-control tool.** Once connected, the remote browser can send arbitrary keystrokes and commands to your terminal — effectively full shell access. Use it only to control your own machine. It is not intended for unauthorized access to someone else's device.
+- **Do not share the connection URL.** While the URL contains no token, it is reachable from any device on the same tailnet. Do not post it on social media or include it in screenshots.
+- **Only devices on your tailnet can reach it.** If you cannot trust every device on the tailnet (e.g. shared tailnets), do not use this feature. Protecting your Tailscale account itself (2FA, etc.) is also important.
 
 ## トラブルシューティング / Troubleshooting
 
