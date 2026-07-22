@@ -1030,6 +1030,67 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_git_commit",
+            "description": "git commit を実行する。対象ペインの cwd のリポジトリでコミットする。\
+                コミットメッセージは必須。all=true で tracked ファイルを自動ステージ（git commit -a 相当）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン"),
+                    "message": { "type": "string", "description": "コミットメッセージ" },
+                    "all": { "type": "boolean", "description": "tracked ファイルを自動ステージ（-a 相当。省略時 false）" },
+                },
+                "required": ["message"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_git_pull",
+            "description": "git pull を実行する。対象ペインの cwd のリポジトリで pull する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン"),
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_git_push",
+            "description": "git push を実行する。対象ペインの cwd のリポジトリで push する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン"),
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_git_stage",
+            "description": "git add でファイルをステージングする。paths が空なら全変更をステージ（git add -A 相当）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン"),
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "ステージするファイルパス（空で全変更）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_git_unstage",
+            "description": "git reset HEAD でファイルをアンステージする。paths が空なら全アンステージ。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン"),
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "アンステージするファイルパス（空で全変更）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_background_pane",
             "description": "ペインまたはタブをバックグラウンドへ送る。プロセスは生きたまま\
                 画面から外す。邪魔なペインやタブを画面外へ送るのに使う。バックグラウンドのペインは\
@@ -3090,6 +3151,25 @@ fn build_request(
             pane: Some(target_pane(args, caller)?),
             target: str_arg(args, "target")?,
         },
+        "tako_git_commit" => Request::GitCommit {
+            pane: Some(target_pane(args, caller)?),
+            message: str_arg(args, "message")?.ok_or("message を指定する")?,
+            all: bool_arg(args, "all")?.unwrap_or(false),
+        },
+        "tako_git_pull" => Request::GitPull {
+            pane: Some(target_pane(args, caller)?),
+        },
+        "tako_git_push" => Request::GitPush {
+            pane: Some(target_pane(args, caller)?),
+        },
+        "tako_git_stage" => Request::GitStage {
+            pane: Some(target_pane(args, caller)?),
+            paths: str_array_arg(args, "paths"),
+        },
+        "tako_git_unstage" => Request::GitUnstage {
+            pane: Some(target_pane(args, caller)?),
+            paths: str_array_arg(args, "paths"),
+        },
         "tako_background_pane" => {
             let tab = u64_arg(args, "tab")?;
             Request::Background {
@@ -3696,6 +3776,16 @@ fn bool_arg(args: &Value, key: &str) -> Result<Option<bool>, String> {
     }
 }
 
+fn str_array_arg(args: &Value, key: &str) -> Vec<String> {
+    match args.get(key) {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn direction_arg(args: &Value) -> Result<Option<Direction>, String> {
     match str_arg(args, "direction")?.as_deref() {
         None => Ok(None),
@@ -4248,7 +4338,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 110);
+        assert_eq!(tools.len(), 115);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

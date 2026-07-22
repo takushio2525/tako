@@ -2091,10 +2091,18 @@ impl TakoApp {
                 .py_1()
                 .bg(rgba(theme.tab_bar_background))
                 .child(
+                    svg()
+                        .path(ui_icon::GIT_BRANCH)
+                        .w(px(12.0))
+                        .h(px(12.0))
+                        .text_color(hsla(accent)),
+                )
+                .child(
                     div()
+                        .ml_1()
                         .text_size(px(12.0))
                         .text_color(hsla(fg_active))
-                        .child(format!("⎇ {}", data.branch)),
+                        .child(data.branch.clone()),
                 )
                 .child(
                     div()
@@ -2109,9 +2117,145 @@ impl TakoApp {
                             .ml_2()
                             .text_size(px(10.0))
                             .text_color(hsla(fg))
-                            .child(format!("↑ {}", data.upstream)),
+                            .child(format!("-> {}", data.upstream)),
                     )
                 }),
+        );
+
+        // ──── コミットメッセージ入力 + 操作ボタン（#472）────
+        let commit_msg = self.git_commit_message.clone();
+        let branch_name = data.branch.clone();
+        let has_changes = !data.status.is_empty();
+        let repo_root_str = data.repo_root.clone();
+
+        // フィードバック表示
+        if let Some(fb) = &self.git_feedback {
+            let color = if fb.is_error { theme.red } else { theme.green };
+            root = root.child(
+                div()
+                    .px_2()
+                    .py(px(3.0))
+                    .text_size(px(10.0))
+                    .text_color(hsla(color))
+                    .bg(rgba_alpha(color, 0.1))
+                    .child(SharedString::from(fb.message.clone())),
+            );
+        }
+
+        // コミットメッセージ入力欄
+        root = root.child(
+            div().px_2().py(px(4.0)).child(
+                div()
+                    .id("git-commit-input")
+                    .w_full()
+                    .px_1()
+                    .py(px(3.0))
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(hsla(theme.border_subtle))
+                    .bg(rgba(theme.crust))
+                    .text_size(px(11.0))
+                    .text_color(hsla(fg_active))
+                    .cursor_text()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.git_commit_input_focused = true;
+                        cx.notify();
+                    }))
+                    .child(if commit_msg.is_empty() {
+                        SharedString::from(crate::ui_text::panel::git_commit_placeholder(
+                            &branch_name,
+                        ))
+                    } else {
+                        SharedString::from(commit_msg.clone())
+                    })
+                    .when(commit_msg.is_empty(), |d| {
+                        d.text_color(hsla(theme.text_muted))
+                    }),
+            ),
+        );
+
+        // コミット + プル / プッシュ ボタン行
+        let commit_enabled = !self.git_commit_message.trim().is_empty() && has_changes;
+        let btn_base = |id: &'static str, th: &tako_core::Theme, enabled: bool| {
+            div()
+                .id(id)
+                .px_2()
+                .py(px(3.0))
+                .rounded(px(4.0))
+                .text_size(px(11.0))
+                .cursor_pointer()
+                .when(enabled, |d| {
+                    d.bg(rgba_alpha(th.accent, 0.2))
+                        .text_color(hsla(th.accent))
+                        .hover(|d| d.bg(rgba_alpha(th.accent, 0.35)))
+                })
+                .when(!enabled, |d| {
+                    d.bg(rgba_alpha(th.border_subtle, 0.3))
+                        .text_color(hsla(th.text_muted))
+                })
+        };
+
+        let commit_repo = repo_root_str.clone();
+        let pull_repo = repo_root_str.clone();
+        let push_repo = repo_root_str.clone();
+        root = root.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py(px(2.0))
+                .child({
+                    let btn = btn_base("git-commit-btn", &theme, commit_enabled).flex_1();
+                    let btn = if commit_enabled {
+                        btn.on_click(cx.listener(move |this, _, _, cx| {
+                            this.git_do_commit(commit_repo.clone(), cx);
+                        }))
+                    } else {
+                        btn
+                    };
+                    btn.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_center()
+                            .gap_1()
+                            .child(svg().path(ui_icon::CHECK).w(px(12.0)).h(px(12.0)))
+                            .child(crate::ui_text::panel::git_commit_btn()),
+                    )
+                })
+                .child(
+                    btn_base("git-pull-btn", &theme, true)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.git_do_pull(pull_repo.clone(), cx);
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .child(svg().path(ui_icon::ARROW_DOWN).w(px(12.0)).h(px(12.0)))
+                                .child("Pull"),
+                        ),
+                )
+                .child(
+                    btn_base("git-push-btn", &theme, true)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.git_do_push(push_repo.clone(), cx);
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .child(svg().path(ui_icon::ARROW_UP).w(px(12.0)).h(px(12.0)))
+                                .child("Push"),
+                        ),
+                ),
         );
 
         // ──── ブランチ一覧セクション ────
@@ -2460,6 +2604,146 @@ impl TakoApp {
         }
 
         root
+    }
+
+    /// git コミットメッセージ入力欄のキーハンドラ（#472）。
+    /// true を返すとイベントを消費、false を返すと後続ハンドラへ
+    pub(crate) fn handle_git_commit_key(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match keystroke.key.as_str() {
+            "enter" if keystroke.modifiers.platform => {
+                if let Some(data) = &self.git_data {
+                    let repo = data.repo_root.clone();
+                    self.git_do_commit(repo, cx);
+                }
+                true
+            }
+            "escape" => {
+                self.git_commit_input_focused = false;
+                cx.notify();
+                true
+            }
+            "backspace" => {
+                self.git_commit_message.pop();
+                cx.notify();
+                true
+            }
+            key if key.len() == 1
+                && !keystroke.modifiers.platform
+                && !keystroke.modifiers.control =>
+            {
+                self.git_commit_message.push_str(key);
+                cx.notify();
+                true
+            }
+            "space" if !keystroke.modifiers.platform => {
+                self.git_commit_message.push(' ');
+                cx.notify();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// git commit を background で実行し、完了後にフィードバック表示 + データ更新（#472）
+    fn git_do_commit(&mut self, repo_root: String, cx: &mut Context<Self>) {
+        let message = self.git_commit_message.clone();
+        if message.trim().is_empty() {
+            return;
+        }
+        self.git_commit_message.clear();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = std::path::Path::new(&repo_root);
+                    tako_core::git::commit(repo, &message, true)
+                })
+                .await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                match result {
+                    Ok(out) => app.git_set_feedback(out.trim().to_string(), false, cx),
+                    Err(e) => app.git_set_feedback(e, true, cx),
+                }
+                app.refresh_git(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// git pull を background で実行（#472）
+    fn git_do_pull(&mut self, repo_root: String, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = std::path::Path::new(&repo_root);
+                    tako_core::git::pull(repo)
+                })
+                .await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                match result {
+                    Ok(out) => {
+                        let msg = if out.trim().is_empty() {
+                            "Already up to date.".to_string()
+                        } else {
+                            out.trim().lines().last().unwrap_or("pull done").to_string()
+                        };
+                        app.git_set_feedback(msg, false, cx);
+                    }
+                    Err(e) => app.git_set_feedback(e, true, cx),
+                }
+                app.refresh_git(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// git push を background で実行（#472）
+    fn git_do_push(&mut self, repo_root: String, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = std::path::Path::new(&repo_root);
+                    tako_core::git::push(repo)
+                })
+                .await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                match result {
+                    Ok(out) => {
+                        let msg = if out.trim().is_empty() {
+                            "push done".to_string()
+                        } else {
+                            out.trim().lines().last().unwrap_or("push done").to_string()
+                        };
+                        app.git_set_feedback(msg, false, cx);
+                    }
+                    Err(e) => app.git_set_feedback(e, true, cx),
+                }
+                app.refresh_git(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// フィードバックメッセージをセットし、4 秒後に自動クリア（#472）
+    fn git_set_feedback(&mut self, message: String, is_error: bool, cx: &mut Context<Self>) {
+        self.git_feedback = Some(GitFeedback { message, is_error });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(4))
+                .await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                app.git_feedback = None;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// git パネルのデータを即座に background 取得する

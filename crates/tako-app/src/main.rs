@@ -813,6 +813,12 @@ struct TakoApp {
     git_selected_commit: Option<String>,
     /// git パネルのアコーディオン折りたたみ
     git_collapsed: GitCollapsed,
+    /// git コミットメッセージ入力欄の内容（#472）
+    git_commit_message: String,
+    /// git 操作の結果フィードバック（#472。一時表示して数秒で消える）
+    git_feedback: Option<GitFeedback>,
+    /// git コミットメッセージ入力欄にフォーカスがあるか（#472）
+    git_commit_input_focused: bool,
     /// バックグラウンドドロワーの表示状態（FR-2.15。下部ステータスバーのボタンでトグル）
     drawer_visible: bool,
     /// バックグラウンドドロワーの高さ（px）
@@ -1122,6 +1128,13 @@ struct GitCollapsed {
     changes: bool,
     commits: bool,
     diff: bool,
+}
+
+/// git 操作のフィードバック（#472）
+#[derive(Debug, Clone)]
+struct GitFeedback {
+    message: String,
+    is_error: bool,
 }
 
 /// ミラースクロールの実体解決の起点（#181）。
@@ -1872,6 +1885,9 @@ impl TakoApp {
             sidebar_git: None,
             git_selected_commit: None,
             git_collapsed: GitCollapsed::default(),
+            git_commit_message: String::new(),
+            git_feedback: None,
+            git_commit_input_focused: false,
             drawer_visible: false,
             drawer_height: DRAWER_DEFAULT_HEIGHT,
             bg_pending_kill: None,
@@ -6798,6 +6814,11 @@ impl TakoApp {
         }
         if self.inline_edit.is_some() {
             self.handle_inline_edit_key(keystroke, cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.git_commit_input_focused && self.handle_git_commit_key(keystroke, cx) {
             cx.stop_propagation();
             return;
         }

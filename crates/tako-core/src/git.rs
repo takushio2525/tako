@@ -650,6 +650,54 @@ fn first_empty(active: &[Option<String>]) -> usize {
         .unwrap_or(active.len())
 }
 
+// ──────────────────────── 操作系 API ────────────────────────
+
+/// git add: 指定パスをステージングする。パスが空なら全変更（`git add -A`）
+pub fn stage(repo: &Path, paths: &[&str]) -> Result<String, String> {
+    if paths.is_empty() {
+        run_git(repo, &["add", "-A"])
+    } else {
+        let mut args = vec!["add", "--"];
+        args.extend(paths);
+        run_git(repo, &args)
+    }
+}
+
+/// git reset HEAD: 指定パスをアンステージする。パスが空なら全アンステージ
+pub fn unstage(repo: &Path, paths: &[&str]) -> Result<String, String> {
+    if paths.is_empty() {
+        run_git(repo, &["reset", "HEAD"])
+    } else {
+        let mut args = vec!["reset", "HEAD", "--"];
+        args.extend(paths);
+        run_git(repo, &args)
+    }
+}
+
+/// git commit -m: メッセージ付きコミット。`all` = true で `-a`（tracked のみ auto stage）
+pub fn commit(repo: &Path, message: &str, all: bool) -> Result<String, String> {
+    if message.trim().is_empty() {
+        return Err("コミットメッセージが空です".to_string());
+    }
+    let mut args = vec!["commit"];
+    if all {
+        args.push("-a");
+    }
+    args.push("-m");
+    args.push(message);
+    run_git(repo, &args)
+}
+
+/// git pull
+pub fn pull(repo: &Path) -> Result<String, String> {
+    run_git(repo, &["pull"])
+}
+
+/// git push
+pub fn push(repo: &Path) -> Result<String, String> {
+    run_git(repo, &["push"])
+}
+
 // ──────────────────────── テスト ────────────────────────
 
 #[cfg(test)]

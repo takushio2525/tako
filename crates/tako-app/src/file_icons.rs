@@ -128,6 +128,9 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     ui_asset!("fleet"),
     ui_asset!("folder_ui"),
     ui_asset!("git_branch"),
+    ui_asset!("arrow_down"),
+    ui_asset!("arrow_up"),
+    ui_asset!("check"),
     ui_asset!("grip"),
     ui_asset!("jump_arrow"),
     ui_asset!("master"),
@@ -171,6 +174,9 @@ pub mod ui_icon {
     pub const FLEET: &str = "icons/ui/fleet.svg";
     pub const FOLDER: &str = "icons/ui/folder_ui.svg";
     pub const GIT_BRANCH: &str = "icons/ui/git_branch.svg";
+    pub const ARROW_DOWN: &str = "icons/ui/arrow_down.svg";
+    pub const ARROW_UP: &str = "icons/ui/arrow_up.svg";
+    pub const CHECK: &str = "icons/ui/check.svg";
     pub const GRIP: &str = "icons/ui/grip.svg";
     pub const JUMP_ARROW: &str = "icons/ui/jump_arrow.svg";
     pub const MASTER: &str = "icons/ui/master.svg";

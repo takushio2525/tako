@@ -879,6 +879,41 @@ enum GitCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
+    /// git commit（#472）
+    Commit {
+        /// コミットメッセージ
+        #[arg(short, long)]
+        message: String,
+        /// tracked ファイルを自動ステージ（-a 相当）
+        #[arg(short, long)]
+        all: bool,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// git pull（#472）
+    Pull {
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// git push（#472）
+    Push {
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// git stage（#472）。パス指定なしで全変更をステージ
+    Stage {
+        /// ステージするファイルパス（省略で全変更）
+        paths: Vec<String>,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// git unstage（#472）。パス指定なしで全アンステージ
+    Unstage {
+        /// アンステージするファイルパス（省略で全変更）
+        paths: Vec<String>,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3882,6 +3917,25 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane: target_pane(*pane)?,
             target: target.clone(),
         },
+        Command::Git(GitCommand::Commit { message, all, pane }) => Request::GitCommit {
+            pane: target_pane(*pane)?,
+            message: message.clone(),
+            all: *all,
+        },
+        Command::Git(GitCommand::Pull { pane }) => Request::GitPull {
+            pane: target_pane(*pane)?,
+        },
+        Command::Git(GitCommand::Push { pane }) => Request::GitPush {
+            pane: target_pane(*pane)?,
+        },
+        Command::Git(GitCommand::Stage { paths, pane }) => Request::GitStage {
+            pane: target_pane(*pane)?,
+            paths: paths.clone(),
+        },
+        Command::Git(GitCommand::Unstage { paths, pane }) => Request::GitUnstage {
+            pane: target_pane(*pane)?,
+            paths: paths.clone(),
+        },
         Command::Collapse(args) => Request::CollapseTab {
             // tab 明示時はペイン不要。省略時は呼び出し元ペインのタブへ
             pane: if args.tab.is_some() {
@@ -5136,6 +5190,13 @@ fn print_result(command: &Command, result: &Value) {
         }
         Command::Git(GitCommand::Log { .. }) | Command::Git(GitCommand::Diff { .. }) => {
             println!("{}", pretty_json(result));
+        }
+        Command::Git(GitCommand::Commit { .. })
+        | Command::Git(GitCommand::Pull { .. })
+        | Command::Git(GitCommand::Push { .. })
+        | Command::Git(GitCommand::Stage { .. })
+        | Command::Git(GitCommand::Unstage { .. }) => {
+            println!("{result}")
         }
         Command::Tmux(TmuxCommand::List { .. }) | Command::Tmux(TmuxCommand::Cleanup { .. }) => {
             println!("{}", pretty_json(result));

@@ -102,6 +102,15 @@ pub fn git_commit_tab() -> &'static str {
 pub fn git_files_tab() -> &'static str {
     tr!(" ファイル", " files")
 }
+pub fn git_commit_placeholder(branch: &str) -> String {
+    tr!(
+        format!("メッセージ (Cmd+Enter で \"{branch}\" にコミット)"),
+        format!("Message (Cmd+Enter to commit on \"{branch}\")")
+    )
+}
+pub fn git_commit_btn() -> &'static str {
+    tr!("コミット", "Commit")
+}
 
 #[cfg(test)]
 mod tests {
@@ -132,6 +141,8 @@ mod tests {
                 git_commits(10),
                 git_commit_tab().to_string(),
                 git_files_tab().to_string(),
+                git_commit_placeholder("main"),
+                git_commit_btn().to_string(),
             ]
         });
     }
