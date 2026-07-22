@@ -1130,3 +1130,10 @@
   sessions.rs resolve_session_for_pane の last_seen_at 最新優先。テスト 6 本追加
 - 検証: 隔離 GUI + 実 claude 2 世代 + fail 注入で before 凍結 / after 継続（切替 5 ラウンド）
   を実測。品質ゲート全緑（fmt / clippy / 1005+ tests）
+
+## 2026-07-22（#470 Phase A: 紹介動画の構成台本 + 収録パイプライン検証）
+- 構成台本 `.agent/plans/2026-07-promo-video.md`（強み訴求順 6 項目・シーン 7 本・計 72 秒）+
+  収録スクリプト `scripts/promo/record-sample.sh`（隔離インスタンス + CLI ビート再生 +
+  screencapture -v）。サンプル 15 秒 mp4 を実収録し全 15 フレーム目視で PII ゼロを確認
+- 関連コミット: `f7442ef`（PR #474 squash merge）。クリップは ~/Desktop/tako-promo/（リポ外）
+- 次: ユーザーの構成承認（尺・トーン・訴求順・S6 収録方法）→ Phase B 全シーン収録
