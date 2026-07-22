@@ -1855,6 +1855,48 @@ fn dispatch_inner(
             let cwd = git_pane_cwd(host, pane)?;
             run_git_diff(&cwd, target.as_deref())
         }
+        Request::GitCommit { pane, message, all } => {
+            let cwd = git_pane_cwd(host, pane)?;
+            let repo = tako_core::git::repo_root(&cwd)
+                .ok_or_else(|| op_err("git リポジトリが見つかりません"))?;
+            tako_core::git::commit(&repo, &message, all)
+                .map(|out| json!({ "committed": true, "output": out.trim() }))
+                .map_err(op_err)
+        }
+        Request::GitPull { pane } => {
+            let cwd = git_pane_cwd(host, pane)?;
+            let repo = tako_core::git::repo_root(&cwd)
+                .ok_or_else(|| op_err("git リポジトリが見つかりません"))?;
+            tako_core::git::pull(&repo)
+                .map(|out| json!({ "pulled": true, "output": out.trim() }))
+                .map_err(op_err)
+        }
+        Request::GitPush { pane } => {
+            let cwd = git_pane_cwd(host, pane)?;
+            let repo = tako_core::git::repo_root(&cwd)
+                .ok_or_else(|| op_err("git リポジトリが見つかりません"))?;
+            tako_core::git::push(&repo)
+                .map(|out| json!({ "pushed": true, "output": out.trim() }))
+                .map_err(op_err)
+        }
+        Request::GitStage { pane, paths } => {
+            let cwd = git_pane_cwd(host, pane)?;
+            let repo = tako_core::git::repo_root(&cwd)
+                .ok_or_else(|| op_err("git リポジトリが見つかりません"))?;
+            let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+            tako_core::git::stage(&repo, &path_refs)
+                .map(|_| json!({ "staged": true, "paths": paths }))
+                .map_err(op_err)
+        }
+        Request::GitUnstage { pane, paths } => {
+            let cwd = git_pane_cwd(host, pane)?;
+            let repo = tako_core::git::repo_root(&cwd)
+                .ok_or_else(|| op_err("git リポジトリが見つかりません"))?;
+            let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+            tako_core::git::unstage(&repo, &path_refs)
+                .map(|_| json!({ "unstaged": true, "paths": paths }))
+                .map_err(op_err)
+        }
 
         Request::Background { pane, tab } => {
             if let Some(t) = tab {

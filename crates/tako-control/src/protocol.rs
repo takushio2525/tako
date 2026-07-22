@@ -441,6 +441,30 @@ pub enum Request {
         pane: Option<u64>,
         target: Option<String>,
     },
+    /// git commit（#472）。`pane` の cwd のリポジトリでコミットする。
+    /// `all` = true で tracked ファイルを自動ステージ（`-a`）
+    GitCommit {
+        pane: Option<u64>,
+        message: String,
+        #[serde(default)]
+        all: bool,
+    },
+    /// git pull（#472）。`pane` の cwd のリポジトリで pull する
+    GitPull { pane: Option<u64> },
+    /// git push（#472）。`pane` の cwd のリポジトリで push する
+    GitPush { pane: Option<u64> },
+    /// git stage（#472）。指定パスをステージングする。パスが空なら全変更
+    GitStage {
+        pane: Option<u64>,
+        #[serde(default)]
+        paths: Vec<String>,
+    },
+    /// git unstage（#472）。指定パスをアンステージする。パスが空なら全アンステージ
+    GitUnstage {
+        pane: Option<u64>,
+        #[serde(default)]
+        paths: Vec<String>,
+    },
     /// ペインまたはタブをバックグラウンドへ送る（FR-2.15.1）。プロセスは生きたまま画面から外す。
     /// pane と tab は排他。tab 指定時はタブ内全ペインを一括退避する
     Background { pane: Option<u64>, tab: Option<u64> },
