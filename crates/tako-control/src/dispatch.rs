@@ -1992,27 +1992,23 @@ fn dispatch_inner(
 
         Request::SetupMcp { scope, pane } => {
             let scope_str = scope.as_deref().unwrap_or("global");
-            let settings_dir = match scope_str {
+            let mcp_scope = match scope_str {
                 "project" => {
                     let (_, target) = resolve_pane(host.workspace(), pane)?;
                     let cwd = host
                         .session(target)
                         .and_then(|s| s.cwd())
                         .ok_or(DispatchError::Operation("cwd が取得できない".into()))?;
-                    cwd.join(".claude")
+                    McpScope::Project(cwd.to_path_buf())
                 }
-                _ => home_dir()
-                    .ok_or(DispatchError::Operation(
-                        "ホームディレクトリが取得できない".into(),
-                    ))?
-                    .join(".claude"),
+                _ => McpScope::User,
             };
             let tako_bin = resolve_tako_binary();
-            let result = setup_mcp_settings(&tako_bin, &settings_dir.join("settings.json"))?;
+            let result = setup_mcp(&tako_bin, &mcp_scope)?;
             let mut resp = json!({
                 "configured": result.configured,
                 "already_existed": result.already_existed,
-                "settings_path": settings_dir.join("settings.json").display().to_string(),
+                "target_path": result.target_path.display().to_string(),
                 "command": tako_bin,
             });
             if result.repaired {
@@ -2020,6 +2016,9 @@ fn dispatch_inner(
                 if let Some(old) = &result.old_command {
                     resp["old_command"] = json!(old);
                 }
+            }
+            if result.legacy_cleaned {
+                resp["legacy_cleaned"] = json!(true);
             }
             Ok(resp)
         }
@@ -5578,107 +5577,229 @@ fn shell_escape(s: &str) -> String {
     }
 }
 
-/// `setup_mcp_settings` の結果
+/// `setup_mcp` の結果
 pub struct SetupMcpResult {
     pub configured: bool,
     pub already_existed: bool,
-    /// 既存の登録パスが死んでいたため新パスに付け替えた
+    /// 既存の登録パスが死んでいたため付け替えた
     pub repaired: bool,
     /// 修復前の旧パス（repaired=true のときのみ）
     pub old_command: Option<String>,
+    /// 書き込み先ファイルパス
+    pub target_path: std::path::PathBuf,
+    /// 旧 settings.json の誤設定を掃除した
+    pub legacy_cleaned: bool,
 }
 
-/// Claude Code の settings.json に tako MCP サーバーの接続設定を追加する。
-/// `tako_binary` は tako CLI のフルパス、`settings_path` は書き込む settings.json のパス。
-/// 既に設定済みなら `already_existed=true`、新規追加なら `configured=true`。
-/// 既存登録の command パスが存在しない場合は `tako_binary` に付け替え `repaired=true`
-pub fn setup_mcp_settings(
+/// MCP 設定のスコープ
+pub enum McpScope {
+    /// ユーザーグローバル（~/.claude.json 相当）
+    User,
+    /// プロジェクト単位（cwd/.mcp.json）
+    Project(std::path::PathBuf),
+}
+
+/// Claude Code に tako MCP サーバーの接続設定を登録する。
+///
+/// 1. `claude` CLI があれば `claude mcp add` を使う（公式経路）
+/// 2. なければ設定ファイルを直接マージ編集（user → ~/.claude.json、project → cwd/.mcp.json）
+/// 3. 旧バージョンが残した ~/.claude/settings.json の mcpServers.tako を検出・掃除
+pub fn setup_mcp(tako_binary: &str, scope: &McpScope) -> Result<SetupMcpResult, DispatchError> {
+    let existing = read_mcp_registration(scope);
+    if let Some(ref cmd) = existing {
+        if !cmd.is_empty() && std::path::Path::new(cmd).is_file() {
+            let legacy_cleaned = clean_legacy_settings_json();
+            return Ok(SetupMcpResult {
+                configured: false,
+                already_existed: true,
+                repaired: false,
+                old_command: None,
+                target_path: mcp_target_path(scope),
+                legacy_cleaned,
+            });
+        }
+    }
+
+    let old_command = existing.filter(|c| !c.is_empty());
+    let repaired = old_command.is_some();
+
+    let claude_bin = which_claude();
+    if let Some(ref claude) = claude_bin {
+        setup_mcp_via_cli(claude, tako_binary, scope)?;
+    } else {
+        setup_mcp_direct(tako_binary, scope)?;
+    }
+
+    let legacy_cleaned = clean_legacy_settings_json();
+
+    Ok(SetupMcpResult {
+        configured: true,
+        already_existed: repaired,
+        repaired,
+        old_command,
+        target_path: mcp_target_path(scope),
+        legacy_cleaned,
+    })
+}
+
+fn mcp_target_path(scope: &McpScope) -> std::path::PathBuf {
+    match scope {
+        McpScope::User => home_dir()
+            .map(|h| h.join(".claude.json"))
+            .unwrap_or_else(|| std::path::PathBuf::from("~/.claude.json")),
+        McpScope::Project(cwd) => cwd.join(".mcp.json"),
+    }
+}
+
+fn read_mcp_registration(scope: &McpScope) -> Option<String> {
+    let path = mcp_target_path(scope);
+    let content = std::fs::read_to_string(&path).ok()?;
+    let data: serde_json::Value = serde_json::from_str(&content).ok()?;
+    data.get("mcpServers")?
+        .get("tako")?
+        .get("command")?
+        .as_str()
+        .map(String::from)
+}
+
+/// claude CLI のパスを検出
+fn which_claude() -> Option<String> {
+    std::process::Command::new("which")
+        .arg("claude")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if p.is_empty() {
+                None
+            } else {
+                Some(p)
+            }
+        })
+}
+
+fn setup_mcp_via_cli(
+    claude_bin: &str,
     tako_binary: &str,
-    settings_path: &std::path::Path,
-) -> Result<SetupMcpResult, DispatchError> {
-    let mut settings: serde_json::Map<String, Value> = if settings_path.is_file() {
-        let content = std::fs::read_to_string(settings_path).map_err(|e| {
-            DispatchError::Operation(format!("settings.json の読み取りに失敗: {e}"))
+    scope: &McpScope,
+) -> Result<(), DispatchError> {
+    let scope_arg = match scope {
+        McpScope::User => "user",
+        McpScope::Project(_) => "project",
+    };
+
+    // 既存の登録を先に除去（claude mcp add は上書きを許さないため）
+    let mut rm = std::process::Command::new(claude_bin);
+    rm.args(["mcp", "remove", "--scope", scope_arg, "tako"]);
+    if let McpScope::Project(cwd) = scope {
+        rm.current_dir(cwd);
+    }
+    let _ = rm.output(); // 未登録なら失敗するが無視
+
+    let mut cmd = std::process::Command::new(claude_bin);
+    cmd.args([
+        "mcp",
+        "add",
+        "--scope",
+        scope_arg,
+        "--transport",
+        "stdio",
+        "tako",
+        "--",
+    ]);
+    cmd.arg(tako_binary);
+    cmd.args(["mcp", "serve"]);
+    if let McpScope::Project(cwd) = scope {
+        cmd.current_dir(cwd);
+    }
+    let output = cmd
+        .output()
+        .map_err(|e| DispatchError::Operation(format!("claude mcp add の実行に失敗: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(DispatchError::Operation(format!(
+            "claude mcp add が失敗 (exit {}): {stderr}",
+            output.status
+        )));
+    }
+    Ok(())
+}
+
+fn setup_mcp_direct(tako_binary: &str, scope: &McpScope) -> Result<(), DispatchError> {
+    let path = mcp_target_path(scope);
+    let mut data: serde_json::Map<String, Value> = if path.is_file() {
+        let content = std::fs::read_to_string(&path).map_err(|e| {
+            DispatchError::Operation(format!("{} の読み取りに失敗: {e}", path.display()))
         })?;
         serde_json::from_str(&content).unwrap_or_default()
     } else {
         serde_json::Map::new()
     };
-    let servers = settings.entry("mcpServers").or_insert_with(|| json!({}));
-    if let Some(obj) = servers.as_object() {
-        if let Some(existing) = obj.get("tako") {
-            let existing_cmd = existing
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let path_healthy =
-                !existing_cmd.is_empty() && std::path::Path::new(existing_cmd).is_file();
-            if path_healthy {
-                return Ok(SetupMcpResult {
-                    configured: false,
-                    already_existed: true,
-                    repaired: false,
-                    old_command: None,
-                });
-            }
-            // 登録パスが死んでいる → 付け替え
-            let old_cmd = existing_cmd.to_string();
-            let servers_obj = servers.as_object_mut().ok_or_else(|| {
-                DispatchError::Operation("settings.json の mcpServers がオブジェクトでない".into())
-            })?;
-            servers_obj.insert(
-                "tako".to_string(),
-                json!({
-                    "command": tako_binary,
-                    "args": ["mcp", "serve"],
-                }),
-            );
-            write_settings_json(settings_path, &settings)?;
-            return Ok(SetupMcpResult {
-                configured: true,
-                already_existed: true,
-                repaired: true,
-                old_command: Some(old_cmd),
-            });
-        }
-    }
-    let servers_obj = servers.as_object_mut().ok_or_else(|| {
-        DispatchError::Operation("settings.json の mcpServers がオブジェクトでない".into())
-    })?;
+
+    let servers = data.entry("mcpServers").or_insert_with(|| json!({}));
+    let servers_obj = servers
+        .as_object_mut()
+        .ok_or_else(|| DispatchError::Operation("mcpServers がオブジェクトでない".into()))?;
     servers_obj.insert(
         "tako".to_string(),
         json!({
+            "type": "stdio",
             "command": tako_binary,
             "args": ["mcp", "serve"],
+            "env": {},
         }),
     );
-    write_settings_json(settings_path, &settings)?;
-    Ok(SetupMcpResult {
-        configured: true,
-        already_existed: false,
-        repaired: false,
-        old_command: None,
-    })
-}
 
-fn write_settings_json(
-    settings_path: &std::path::Path,
-    settings: &serde_json::Map<String, Value>,
-) -> Result<(), DispatchError> {
-    if let Some(parent) = settings_path.parent() {
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             DispatchError::Operation(format!("{} の作成に失敗: {e}", parent.display()))
         })?;
     }
-    let json = serde_json::to_string_pretty(settings)
+    let json = serde_json::to_string_pretty(&data)
         .map_err(|e| DispatchError::Operation(format!("JSON のシリアライズに失敗: {e}")))?;
-    std::fs::write(settings_path, json).map_err(|e| {
-        DispatchError::Operation(format!(
-            "{} への書き込みに失敗: {e}",
-            settings_path.display()
-        ))
+    std::fs::write(&path, json).map_err(|e| {
+        DispatchError::Operation(format!("{} への書き込みに失敗: {e}", path.display()))
     })?;
     Ok(())
+}
+
+/// 旧バージョンが ~/.claude/settings.json の mcpServers.tako に残した誤設定を掃除する。
+/// 掃除した場合 true を返す。
+pub fn clean_legacy_settings_json() -> bool {
+    let Some(home) = home_dir() else {
+        return false;
+    };
+    let path = home.join(".claude").join("settings.json");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let mut settings: serde_json::Map<String, Value> = match serde_json::from_str(&content) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let removed = if let Some(servers) = settings.get_mut("mcpServers") {
+        if let Some(obj) = servers.as_object_mut() {
+            obj.remove("tako").is_some()
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if !removed {
+        return false;
+    }
+    if let Some(servers) = settings.get("mcpServers") {
+        if servers.as_object().is_some_and(|o| o.is_empty()) {
+            settings.remove("mcpServers");
+        }
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&settings) {
+        let _ = std::fs::write(&path, json);
+    }
+    true
 }
 
 /// MCP 登録に使う安定パス。/Applications/tako.app がある場合に最優先
@@ -10279,69 +10400,136 @@ mod tests {
     }
 
     #[test]
-    fn setup_mcp_settings_新規登録() {
-        let dir = mcp_test_dir("new");
-        let settings = dir.join("settings.json");
-        let result = setup_mcp_settings("/usr/local/bin/tako", &settings).unwrap();
-        assert!(result.configured);
-        assert!(!result.already_existed);
-        assert!(!result.repaired);
+    fn setup_mcp_direct_新規登録() {
+        let dir = mcp_test_dir("direct-new");
+        let scope = McpScope::Project(dir.clone());
+        let target = dir.join(".mcp.json");
+        setup_mcp_direct("/usr/local/bin/tako", &scope).unwrap();
         let content: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
         assert_eq!(
             content["mcpServers"]["tako"]["command"],
             "/usr/local/bin/tako"
         );
+        assert_eq!(content["mcpServers"]["tako"]["type"], "stdio");
     }
 
     #[test]
-    fn setup_mcp_settings_健全な既存登録は触らない() {
-        let dir = mcp_test_dir("healthy");
-        let settings = dir.join("settings.json");
+    fn setup_mcp_direct_既存キーを保全() {
+        let dir = mcp_test_dir("direct-merge");
+        let target = dir.join(".mcp.json");
+        let existing = serde_json::json!({
+            "mcpServers": {
+                "other-server": { "command": "other", "args": [] }
+            }
+        });
+        std::fs::write(&target, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+        let scope = McpScope::Project(dir.clone());
+        setup_mcp_direct("/usr/local/bin/tako", &scope).unwrap();
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(
+            content["mcpServers"]["tako"]["command"],
+            "/usr/local/bin/tako"
+        );
+        assert_eq!(
+            content["mcpServers"]["other-server"]["command"], "other",
+            "既存の other-server が保全されること"
+        );
+    }
+
+    #[test]
+    fn read_mcp_registration_既存登録を読める() {
+        let dir = mcp_test_dir("read-reg");
+        let target = dir.join(".mcp.json");
         let exe = std::env::current_exe().unwrap();
         let existing = serde_json::json!({
             "mcpServers": {
                 "tako": {
+                    "type": "stdio",
                     "command": exe.display().to_string(),
                     "args": ["mcp", "serve"]
                 }
             }
         });
-        std::fs::write(&settings, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
-        let result = setup_mcp_settings("/other/path/tako", &settings).unwrap();
-        assert!(!result.configured);
-        assert!(result.already_existed);
-        assert!(!result.repaired);
-        let content: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        assert_eq!(
-            content["mcpServers"]["tako"]["command"],
-            exe.display().to_string(),
-        );
+        std::fs::write(&target, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+        let scope = McpScope::Project(dir.clone());
+        let cmd = read_mcp_registration(&scope);
+        assert_eq!(cmd, Some(exe.display().to_string()));
     }
 
     #[test]
-    fn setup_mcp_settings_死んだパスを修復() {
+    fn setup_mcp_direct_死んだパスを上書き() {
         let dir = mcp_test_dir("repair");
-        let settings = dir.join("settings.json");
+        let target = dir.join(".mcp.json");
         let dead_path = "/nonexistent/old/path/tako";
         let existing = serde_json::json!({
             "mcpServers": {
                 "tako": {
+                    "type": "stdio",
                     "command": dead_path,
                     "args": ["mcp", "serve"]
                 }
             }
         });
-        std::fs::write(&settings, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
-        let result = setup_mcp_settings("/new/stable/tako", &settings).unwrap();
-        assert!(result.configured);
-        assert!(result.already_existed);
-        assert!(result.repaired);
-        assert_eq!(result.old_command.as_deref(), Some(dead_path));
+        std::fs::write(&target, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+        let scope = McpScope::Project(dir.clone());
+        setup_mcp_direct("/new/stable/tako", &scope).unwrap();
         let content: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
         assert_eq!(content["mcpServers"]["tako"]["command"], "/new/stable/tako");
+    }
+
+    #[test]
+    fn clean_legacy_settings_json_takoキーを掃除() {
+        let dir = mcp_test_dir("legacy");
+        let settings = dir.join("settings.json");
+        let legacy = serde_json::json!({
+            "mcpServers": {
+                "tako": { "command": "/old/tako", "args": ["mcp", "serve"] },
+                "other": { "command": "other" }
+            },
+            "otherKey": true
+        });
+        std::fs::write(&settings, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        // HOME を一時的に dir に向ける
+        let orig_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &dir);
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(
+            dir.join(".claude").join("settings.json"),
+            serde_json::to_string_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let cleaned = clean_legacy_settings_json();
+        assert!(cleaned, "tako キーがある場合は true を返す");
+
+        let content: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".claude").join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            content.get("mcpServers").unwrap().get("tako").is_none(),
+            "tako キーが除去されていること"
+        );
+        assert!(
+            content.get("mcpServers").unwrap().get("other").is_some(),
+            "other キーは保全されること"
+        );
+        assert!(
+            content.get("otherKey").is_some(),
+            "他のトップレベルキーは保全されること"
+        );
+
+        // 2 回目は false
+        let cleaned2 = clean_legacy_settings_json();
+        assert!(!cleaned2, "既に掃除済みなら false");
+
+        if let Some(h) = orig_home {
+            std::env::set_var("HOME", h);
+        }
     }
 
     #[test]

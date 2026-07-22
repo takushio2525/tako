@@ -647,7 +647,7 @@ fn check_claude_mcp_health(claude_path: &str) -> (bool, bool) {
             if !has_tako {
                 return (false, false);
             }
-            // settings.json から登録パスを直接読む（claude mcp list の出力は
+            // ~/.claude.json から登録パスを直接読む（claude mcp list の出力は
             // ✔/✘ の有無やフォーマットがバージョンで変わり得るため）
             let path_alive = read_mcp_command_path()
                 .map(|p| std::path::Path::new(&p).is_file())
@@ -658,10 +658,10 @@ fn check_claude_mcp_health(claude_path: &str) -> (bool, bool) {
     }
 }
 
-/// settings.json から tako MCP 登録の command パスを読み取る
+/// ~/.claude.json から tako MCP 登録の command パスを読み取る
 fn read_mcp_command_path() -> Option<String> {
     let home = home_dir()?;
-    let path = home.join(".claude").join("settings.json");
+    let path = home.join(".claude.json");
     let content = std::fs::read_to_string(path).ok()?;
     let settings: serde_json::Value = serde_json::from_str(&content).ok()?;
     settings
@@ -674,11 +674,8 @@ fn read_mcp_command_path() -> Option<String> {
 
 fn run_setup_mcp() -> Result<(), String> {
     let tako_bin = tako_control::dispatch::resolve_tako_binary();
-    let settings_dir = home_dir()
-        .ok_or("ホームディレクトリが取得できない")?
-        .join(".claude");
-    let settings_path = settings_dir.join("settings.json");
-    match tako_control::dispatch::setup_mcp_settings(&tako_bin, &settings_path) {
+    let scope = tako_control::dispatch::McpScope::User;
+    match tako_control::dispatch::setup_mcp(&tako_bin, &scope) {
         Ok(result) => {
             if result.repaired {
                 let old = result.old_command.as_deref().unwrap_or("(不明)");
@@ -688,7 +685,13 @@ fn run_setup_mcp() -> Result<(), String> {
             } else if result.already_existed {
                 eprintln!("  MCP: 既に設定されています");
             } else {
-                eprintln!("  MCP: 設定を追加しました");
+                eprintln!(
+                    "  MCP: 設定を追加しました（{}）",
+                    result.target_path.display()
+                );
+            }
+            if result.legacy_cleaned {
+                eprintln!("  [掃除] 旧 settings.json の無効な MCP 設定を除去しました");
             }
             Ok(())
         }
