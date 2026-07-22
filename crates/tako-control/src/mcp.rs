@@ -1099,17 +1099,18 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_setup_mcp",
-            "description": "Claude Code の settings.json に tako MCP サーバーの接続設定を\
+            "description": "Claude Code に tako MCP サーバーの接続設定を\
                 自動追加する。初回セットアップ時に呼ぶ。既に設定済みなら何もしない。\
-                scope=global（既定）は ~/.claude/settings.json、scope=project は\
-                呼び出し元ペインの cwd 配下 .claude/settings.json に書き込む。",
+                scope=global（既定）はユーザーグローバル（claude mcp add --scope user 相当）、\
+                scope=project は呼び出し元ペインの cwd の .mcp.json に書き込む。\
+                旧バージョンが ~/.claude/settings.json に書いた無効な設定は自動で掃除する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "scope": {
                         "type": "string",
                         "enum": ["global", "project"],
-                        "description": "設定の書き込み先スコープ（省略時は global = ~/.claude/settings.json）",
+                        "description": "設定の書き込み先スコープ（省略時は global = ユーザーグローバル）",
                     },
                     "pane": pane_schema("対象ペイン ID（scope=project 時の cwd 解決に使う。省略時は呼び出し元）"),
                 },

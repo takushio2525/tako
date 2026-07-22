@@ -1866,10 +1866,10 @@ struct SetupArgs {
 
 #[derive(Args)]
 struct SetupMcpArgs {
-    /// ~/.claude/settings.json（ユーザーグローバル）に書き込む（既定）
+    /// ユーザーグローバルに書き込む（既定）
     #[arg(long, conflicts_with = "project")]
     global: bool,
-    /// カレントディレクトリの .claude/settings.json に書き込む
+    /// カレントディレクトリの .mcp.json に書き込む
     #[arg(long)]
     project: bool,
 }
@@ -2241,32 +2241,30 @@ fn mcp_serve() -> Result<(), String> {
 /// MCP セットアップ（アプリ未起動でも動作）。settings.json に tako MCP 設定を追加する
 fn setup_mcp_local(args: &SetupMcpArgs) -> Result<(), String> {
     let tako_bin = tako_control::dispatch::resolve_tako_binary();
-    let settings_dir = if args.project {
-        std::env::current_dir()
-            .map_err(|e| format!("カレントディレクトリの取得に失敗: {e}"))?
-            .join(".claude")
+    let scope = if args.project {
+        let cwd = std::env::current_dir()
+            .map_err(|e| format!("カレントディレクトリの取得に失敗: {e}"))?;
+        tako_control::dispatch::McpScope::Project(cwd)
     } else {
-        std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(std::path::PathBuf::from)
-            .ok_or("ホームディレクトリが取得できない（$HOME 未設定）")?
-            .join(".claude")
+        tako_control::dispatch::McpScope::User
     };
-    let settings_path = settings_dir.join("settings.json");
-    match tako_control::dispatch::setup_mcp_settings(&tako_bin, &settings_path) {
+    match tako_control::dispatch::setup_mcp(&tako_bin, &scope) {
         Ok(result) => {
             if result.repaired {
                 let old = result.old_command.as_deref().unwrap_or("(不明)");
                 eprintln!(
                     "登録パスが消失していたため付け替えました: {}",
-                    settings_path.display()
+                    result.target_path.display()
                 );
                 eprintln!("  旧: {old}");
                 eprintln!("  新: {tako_bin}");
             } else if result.already_existed {
-                eprintln!("既に設定されています: {}", settings_path.display());
+                eprintln!("既に設定されています: {}", result.target_path.display());
             } else {
-                eprintln!("設定を追加しました: {}", settings_path.display());
+                eprintln!("設定を追加しました: {}", result.target_path.display());
+            }
+            if result.legacy_cleaned {
+                eprintln!("旧 ~/.claude/settings.json の無効な MCP 設定を除去しました");
             }
             Ok(())
         }
@@ -2283,8 +2281,8 @@ fn check_mcp_health_warning() {
         Some(h) => h,
         None => return,
     };
-    let settings_path = home.join(".claude").join("settings.json");
-    let content = match std::fs::read_to_string(&settings_path) {
+    let claude_json = home.join(".claude.json");
+    let content = match std::fs::read_to_string(&claude_json) {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -2299,7 +2297,7 @@ fn check_mcp_health_warning() {
         .and_then(|c| c.as_str())
     {
         Some(c) => c,
-        None => return, // 未登録は setup の管轄
+        None => return,
     };
     if !std::path::Path::new(cmd).is_file() {
         eprintln!("[警告] MCP 登録パスが消失しています: {cmd}");
