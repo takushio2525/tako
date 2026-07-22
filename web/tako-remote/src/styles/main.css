@@ -216,16 +216,35 @@ body {
 .pane-card.state-idle .edge-bar     { background: var(--fg3); }
 .pane-card.state-busy { border-color: rgba(232, 178, 62, .3); background: var(--panel2); }
 
+/* role 別の視覚区別 */
+.pane-card.role-master { border-color: rgba(214, 121, 92, .35); }
+.pane-card.role-master .edge-bar { background: var(--claude) !important; width: 4px; }
+.pane-card.role-worker { border-color: rgba(94, 227, 160, .18); }
+.pane-card.role-user.state-idle:not(:active) { opacity: .6; }
+
 .pane-card-header {
-  display: flex; align-items: center; justify-content: space-between; padding: 14px 15px 9px 16px;
+  display: flex; align-items: flex-start; justify-content: space-between; padding: 12px 14px 6px 16px; gap: 8px;
 }
-.pane-card-left { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.pane-card-left { display: flex; align-items: flex-start; gap: 9px; min-width: 0; flex: 1; }
+.pane-card-titles { display: flex; flex-direction: column; gap: 2px; min-width: 0; overflow: hidden; }
 .pane-card-title {
-  font-family: var(--mono); font-size: 14px; font-weight: 600;
+  font-family: var(--mono); font-size: 13px; font-weight: 600;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+.pane-card-tab {
+  font-family: var(--mono); font-size: 10px; color: var(--fg3);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.pane-card-badges { display: flex; align-items: center; gap: 5px; flex-shrink: 0; }
+.role-badge {
+  font-family: var(--mono); font-size: 9px; padding: 2px 6px; border-radius: 5px;
+  letter-spacing: .03em; text-transform: uppercase; font-weight: 600; flex-shrink: 0;
+}
+.role-badge.role-master { color: var(--claude); background: rgba(214, 121, 92, .15); }
+.role-badge.role-worker { color: var(--green); background: rgba(94, 227, 160, .12); }
+.role-badge.role-user { color: var(--fg3); background: var(--panel2); }
 .pane-card .state-badge {
-  font-family: var(--mono); font-size: 10px; padding: 3px 7px; border-radius: 6px;
+  font-family: var(--mono); font-size: 9px; padding: 2px 6px; border-radius: 5px;
   letter-spacing: .02em; text-transform: uppercase; flex-shrink: 0;
 }
 .pane-card.state-running .state-badge { color: var(--green); }
@@ -235,21 +254,31 @@ body {
 
 .pane-card-meta {
   font-family: var(--mono); font-size: 10px; color: var(--fg3);
-  padding: 0 16px 6px;
+  padding: 0 16px 5px; display: flex; align-items: center; gap: 6px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+.worker-label {
+  color: var(--fg2); background: var(--panel2); padding: 1px 5px; border-radius: 4px;
+  font-size: 9px; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 
-.pane-card-preview { padding: 0 15px 11px 16px; }
+.pane-card-preview { padding: 0 14px 10px 16px; }
 .pane-card-preview-box {
-  font-family: var(--mono); font-size: 11px; line-height: 1.55;
+  font-family: var(--mono); font-size: 10px; line-height: 1.45;
   color: var(--fg2); background: var(--bg);
   border: 1px solid var(--line); border-radius: 9px;
-  padding: 9px 11px; overflow: hidden; max-height: 72px;
+  padding: 7px 9px; overflow: hidden; max-height: 180px;
+}
+.pane-card-no-terminal {
+  display: flex; align-items: center; gap: 8px; color: var(--fg3);
+  font-family: var(--mono); font-size: 11px;
+  background: var(--panel2); border: 1px dashed var(--line2);
+  border-radius: 9px; padding: 14px 12px;
 }
 
 .pane-card-footer {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 9px 15px; border-top: 1px solid var(--line);
+  padding: 8px 14px; border-top: 1px solid var(--line);
 }
 .pane-card-footer .footer-meta { font-family: var(--mono); font-size: 10px; color: var(--fg3); }
 .pane-card-footer .footer-action { font-family: var(--mono); font-size: 11px; font-weight: 600; }
@@ -257,7 +286,7 @@ body {
 .pane-card.state-running .footer-action,
 .pane-card.state-idle .footer-action,
 .pane-card.state-error .footer-action { color: var(--fg2); }
-.pane-card.state-idle:not(:active) { opacity: .7; background: transparent; }
+.pane-card.role-user.state-idle:not(:active) { opacity: .6; }
 
 .mono-line { white-space: pre-wrap; word-break: break-all; }
 .mono-line.faded { color: var(--fg3); }
@@ -652,6 +681,13 @@ body {
   font-size: 17px;
 }
 .term-send-btn:active { background: var(--accent-dim); }
+
+.no-terminal-view {
+  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 12px; padding: 40px 20px; color: var(--fg3);
+}
+.no-terminal-title { font-family: var(--mono); font-size: 16px; font-weight: 600; color: var(--fg2); }
+.no-terminal-detail { font-size: 13px; text-align: center; max-width: 280px; line-height: 1.5; }
 
 /* ============================================================
    Settings

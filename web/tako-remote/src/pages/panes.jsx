@@ -40,6 +40,23 @@ function stateLabel(st) {
   }
 }
 
+function roleCategory(p) {
+  const role = (p.role || '').toLowerCase();
+  if (role.includes('master')) return 'master';
+  if (role.includes('solo')) return 'master';
+  if (role.startsWith('orchestrator-worker') || role.includes('worker')) return 'worker';
+  return 'user';
+}
+
+function roleBadgeLabel(cat) {
+  switch (cat) {
+    case 'master': return 'master';
+    case 'worker': return 'worker';
+    default: return 'user';
+  }
+}
+
+const PREVIEW_LINES = 12;
 const PULL_THRESHOLD = 80;
 
 export function PanesPage({ me }) {
@@ -64,9 +81,13 @@ export function PanesPage({ me }) {
       setError(null);
 
       for (const p of list) {
-        c.screen(p.tmux_target || p.id, 5)
+        if (!p.tmux_target) {
+          setPreviews(prev => ({ ...prev, [p.id]: null }));
+          continue;
+        }
+        c.screen(p.tmux_target || p.id, PREVIEW_LINES)
           .then(s => setPreviews(prev => ({ ...prev, [p.id]: s.lines || [] })))
-          .catch(() => {});
+          .catch(() => setPreviews(prev => ({ ...prev, [p.id]: null })));
       }
     } catch (e) {
       if (e.status === 403) { window.location.reload(); return; }
@@ -152,12 +173,12 @@ export function PanesPage({ me }) {
       ) : error ? (
         <div class="center-fill">
           <p class="error-text">{error}</p>
-          <button class="btn btn-primary" onClick={() => { window.location.hash = '#/'; }}>戻る</button>
+          <button class="btn btn-primary" onClick={() => { window.location.hash = '#/'; }}>back</button>
         </div>
       ) : panes.length === 0 ? (
         <div class="empty-state">
-          <h2>ペインなし</h2>
-          <p>アクティブなペインがありません</p>
+          <h2>No panes</h2>
+          <p>No active panes</p>
         </div>
       ) : (
         <div
@@ -171,37 +192,54 @@ export function PanesPage({ me }) {
           {filtered.map(p => {
             const st = stateOf(p);
             const agentType = p.agent_type || 'plain';
+            const cat = roleCategory(p);
             const displayTitle = p.title || `Pane ${p.id}`;
-            const cardTitle = agentType !== 'plain'
-              ? `${agentType} · ${displayTitle}`
-              : displayTitle;
+            const hasTerminal = !!p.tmux_target;
+            const previewData = previews[p.id];
 
             return (
-              <div key={p.id} class={`pane-card state-${st}`} onClick={() => { window.location.hash = `#/panes/${p.id}`; }}>
+              <div key={p.id} class={`pane-card state-${st} role-${cat}`} onClick={() => { window.location.hash = `#/panes/${p.id}`; }}>
                 <div class="edge-bar" />
                 <div class="pane-card-header">
                   <div class="pane-card-left">
                     <AgentIcon type={agentType} />
-                    <span class="pane-card-title">{cardTitle}</span>
+                    <div class="pane-card-titles">
+                      <span class="pane-card-title">{displayTitle}</span>
+                      {p.tab_title && (
+                        <span class="pane-card-tab">{p.tab_title}</span>
+                      )}
+                    </div>
                   </div>
-                  <span class="state-badge">{stateLabel(st)}</span>
+                  <div class="pane-card-badges">
+                    <span class={`role-badge role-${cat}`}>{roleBadgeLabel(cat)}</span>
+                    <span class="state-badge">{stateLabel(st)}</span>
+                  </div>
                 </div>
                 <div class="pane-card-meta">
-                  {(me && me.host) || 'tako'}
-                  {p.position ? ` · ${p.position}` : ''}
-                  {p.role ? ` · ${p.role}` : ''}
+                  <span>#{p.id}{p.position ? ` · ${p.position}` : ''}</span>
+                  {p.role && cat === 'worker' && (
+                    <span class="worker-label">{p.role}</span>
+                  )}
                 </div>
                 <div class="pane-card-preview">
-                  <div class="pane-card-preview-box">
-                    {(previews[p.id] || []).map((line, i) => (
-                      <div key={i} class="mono-line">{line || ' '}</div>
-                    ))}
-                    {!previews[p.id] && <div class="mono-line faded">...</div>}
-                  </div>
+                  {hasTerminal ? (
+                    <div class="pane-card-preview-box">
+                      {previewData === undefined && <div class="mono-line faded">...</div>}
+                      {previewData === null && <div class="mono-line faded">No terminal output</div>}
+                      {Array.isArray(previewData) && previewData.map((line, i) => (
+                        <div key={i} class="mono-line">{line || ' '}</div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div class="pane-card-no-terminal">
+                      <NoTerminalIcon />
+                      <span>No terminal (preview pane)</span>
+                    </div>
+                  )}
                 </div>
                 <div class="pane-card-footer">
-                  <span class="footer-meta">#{p.id}</span>
-                  <span class="footer-action">{st === 'busy' ? 'respond →' : 'view →'}</span>
+                  <span class="footer-meta">{agentType !== 'plain' ? agentType : 'shell'}</span>
+                  <span class="footer-action">{st === 'busy' ? 'respond' : 'view'}</span>
                 </div>
               </div>
             );
@@ -209,5 +247,16 @@ export function PanesPage({ me }) {
         </div>
       )}
     </div>
+  );
+}
+
+function NoTerminalIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" style="flex-shrink: 0;">
+      <rect x="1.5" y="3.5" width="13" height="9" rx="1.5" stroke="currentColor" stroke-width="1.2" />
+      <path d="M4.5 6.5L7 9L4.5 11.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
+      <line x1="8.5" y1="11.5" x2="11.5" y2="11.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+      <line x1="1" y1="15" x2="15" y2="1" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+    </svg>
   );
 }
