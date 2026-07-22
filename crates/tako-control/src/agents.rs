@@ -4,7 +4,7 @@
 //! 出力（pid / cwd / sessionId / status / name 等）を正規化し、tmux ペインの
 //! `pane_pid` からプロセス祖先を辿って「どのペインで動いているか」を対応付ける。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
 
@@ -227,19 +227,55 @@ pub struct LiveClaudeSession {
 /// pid 祖先辿りで実プロセスの存在を確認するため、role やカタログの stale 記録に
 /// 依存しない ground truth になる
 pub fn live_claude_sessions_by_backend() -> HashMap<String, LiveClaudeSession> {
+    use std::sync::Mutex;
+    // 最後に live 解決できた backend → セッションの記憶（#466）。
+    // `claude agents --json` は一時失敗・実行中エージェントの列挙漏れが現実に起きる
+    // （run_claude_agents_json は TTL 5 秒で失敗もキャッシュする）。素通しで空を返すと
+    // 呼び出し側（remote の v2 panes）が sessions カタログの stale な旧世代セッションへ
+    // フォールバックし、リモートのチャットビューが凍結した古い transcript を
+    // 読み続ける。失敗・欠落時は直近の成功結果で補い、ペインごと消えた backend
+    // だけを忘れる
+    static STICKY: Mutex<Option<HashMap<String, LiveClaudeSession>>> = Mutex::new(None);
+
     let socket = tako_core::tmux_backend::socket_name();
     let panes = tmux_pane_pids(Some(&socket));
     if panes.is_empty() {
         return HashMap::new();
     }
-    let Ok(agents) = list_agents() else {
-        return HashMap::new();
+    let fresh = match list_agents() {
+        Ok(agents) if !agents.is_empty() => {
+            let parents = process_parent_map();
+            Some(live_sessions_inner(&panes, &agents, &parents))
+        }
+        _ => None,
     };
-    if agents.is_empty() {
-        return HashMap::new();
+    let mut sticky = STICKY.lock().unwrap_or_else(|e| e.into_inner());
+    let merged = merge_live_sticky(sticky.take().unwrap_or_default(), &panes, fresh);
+    *sticky = Some(merged.clone());
+    merged
+}
+
+/// sticky 記憶の更新（live_claude_sessions_by_backend のテスト可能な純関数部。#466）。
+/// - `fresh` = Some（agents 取得成功）: 検出された backend は上書き。検出されなかった
+///   backend もペインが生きていれば記憶を保持する（agents 列挙漏れへの耐性）
+/// - `fresh` = None（agents 実行失敗）: ペインが生きている記憶をそのまま使う
+/// - どちらの場合も、tmux ペインごと消えた backend の記憶は破棄する
+fn merge_live_sticky(
+    mut sticky: HashMap<String, LiveClaudeSession>,
+    panes: &[(String, u32)],
+    fresh: Option<HashMap<String, LiveClaudeSession>>,
+) -> HashMap<String, LiveClaudeSession> {
+    let alive: HashSet<&str> = panes
+        .iter()
+        .filter_map(|(id, _)| id.split(':').next())
+        .collect();
+    sticky.retain(|backend, _| alive.contains(backend.as_str()));
+    if let Some(fresh) = fresh {
+        for (backend, session) in fresh {
+            sticky.insert(backend, session);
+        }
     }
-    let parents = process_parent_map();
-    live_sessions_inner(&panes, &agents, &parents)
+    sticky
 }
 
 /// 一括解決の内部ロジック（テスト可能な純関数部）。
@@ -592,5 +628,62 @@ mod tests {
         ];
         let map = live_sessions_inner(&panes, &agents_tui_first, &parents);
         assert_eq!(map["tako-s1"].session_id, "sid-tui");
+    }
+
+    fn live(sid: &str) -> LiveClaudeSession {
+        LiveClaudeSession {
+            session_id: sid.into(),
+            interactive: true,
+        }
+    }
+
+    #[test]
+    fn merge_live_stickyはagents失敗時に生存ペインの記憶を返す() {
+        // #466: agents --json の一時失敗で空を返すと呼び出し側が stale カタログへ
+        // フォールバックする。生存ペインの直近 live 解決を保持する
+        let sticky: HashMap<String, LiveClaudeSession> =
+            [("tako-a".to_string(), live("sid-a"))].into();
+        let panes = vec![("tako-a:0.0".to_string(), 100u32)];
+        let merged = merge_live_sticky(sticky, &panes, None);
+        assert_eq!(merged["tako-a"].session_id, "sid-a");
+    }
+
+    #[test]
+    fn merge_live_stickyは成功時に検出backendを上書きする() {
+        // /clear 等で session が変わったら新しい値へ追従する
+        let sticky: HashMap<String, LiveClaudeSession> =
+            [("tako-a".to_string(), live("sid-old"))].into();
+        let panes = vec![("tako-a:0.0".to_string(), 100u32)];
+        let fresh: HashMap<String, LiveClaudeSession> =
+            [("tako-a".to_string(), live("sid-new"))].into();
+        let merged = merge_live_sticky(sticky, &panes, Some(fresh));
+        assert_eq!(merged["tako-a"].session_id, "sid-new");
+    }
+
+    #[test]
+    fn merge_live_stickyは列挙漏れbackendの記憶を保持する() {
+        // agents --json が実行中エージェントを取りこぼしても（実測で発生）、
+        // ペインが生きている限り直近の解決を使い続ける
+        let sticky: HashMap<String, LiveClaudeSession> =
+            [("tako-a".to_string(), live("sid-a"))].into();
+        let panes = vec![
+            ("tako-a:0.0".to_string(), 100u32),
+            ("tako-b:0.0".to_string(), 200u32),
+        ];
+        let fresh: HashMap<String, LiveClaudeSession> =
+            [("tako-b".to_string(), live("sid-b"))].into();
+        let merged = merge_live_sticky(sticky, &panes, Some(fresh));
+        assert_eq!(merged["tako-a"].session_id, "sid-a");
+        assert_eq!(merged["tako-b"].session_id, "sid-b");
+    }
+
+    #[test]
+    fn merge_live_stickyはペイン消滅backendの記憶を破棄する() {
+        // ペインごと閉じた backend の記憶を持ち続けない（誤った claude 判定の防止）
+        let sticky: HashMap<String, LiveClaudeSession> =
+            [("tako-gone".to_string(), live("sid-gone"))].into();
+        let panes = vec![("tako-a:0.0".to_string(), 100u32)];
+        let merged = merge_live_sticky(sticky, &panes, None);
+        assert!(merged.is_empty());
     }
 }

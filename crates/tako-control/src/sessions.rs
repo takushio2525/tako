@@ -645,14 +645,29 @@ pub(crate) fn parse_iso(iso: &str) -> Option<i64> {
 /// ペイン ID から session_id を逆引きする（カタログの pane フィールドを使用。#284）。
 /// カタログが無い・読めない場合は None
 pub fn resolve_session_for_pane(pane_id: &str) -> Option<String> {
-    let pane_num: u64 = pane_id.parse().ok()?;
     let catalog = SessionCatalog::load().ok()?;
-    for (session_id, entry) in &catalog.entries {
-        if entry.pane == Some(pane_num) {
-            return Some(session_id.clone());
-        }
-    }
-    None
+    resolve_session_for_pane_in(&catalog, pane_id)
+}
+
+/// カタログ指定版（テスト用に分離）。
+/// 同一ペイン番号のエントリは世代を跨いで複数堆積する（spawn / 検出のたびに記録が
+/// 増える。実運用で同一 pane に 20 世代超を確認）。BTreeMap の辞書順先勝ちだと
+/// session_id（uuid）の並び次第で stale な旧世代を毎回返し続けるため（#466）、
+/// 最後に生存確認された世代（last_seen_at、無ければ started_at）を選ぶ
+pub fn resolve_session_for_pane_in(catalog: &SessionCatalog, pane_id: &str) -> Option<String> {
+    let pane_num: u64 = pane_id.parse().ok()?;
+    catalog
+        .entries
+        .iter()
+        .filter(|(_, entry)| entry.pane == Some(pane_num))
+        .max_by_key(|(_, entry)| {
+            if entry.last_seen_at.is_empty() {
+                entry.started_at.as_str()
+            } else {
+                entry.last_seen_at.as_str()
+            }
+        })
+        .map(|(session_id, _)| session_id.clone())
 }
 
 #[cfg(test)]
@@ -937,5 +952,60 @@ mod tests {
         let result = SessionCatalog::mutate_at(&path, |c| c.entries.clear());
         assert!(result.is_err(), "破損時は書き込まない");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn ペイン解決は同一ペインの複数世代から最新を選ぶ() {
+        // #466: 同一 pane 番号のエントリは世代を跨いで堆積する。辞書順の
+        // 先勝ちだと stale な旧世代を返すことがあった。last_seen_at 最新を選ぶ
+        let mut catalog = SessionCatalog::default();
+        for (sid, seen) in [
+            ("session-old", "2026-07-20T00:00:00Z"),
+            ("session-new", "2026-07-22T00:00:00Z"),
+            ("session-mid", "2026-07-21T00:00:00Z"),
+        ] {
+            catalog.entries.insert(
+                sid.to_string(),
+                SessionEntry {
+                    pane: Some(648),
+                    last_seen_at: seen.to_string(),
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(
+            resolve_session_for_pane_in(&catalog, "648").as_deref(),
+            Some("session-new")
+        );
+        // 該当ペインなし・数値でない ID は None
+        assert_eq!(resolve_session_for_pane_in(&catalog, "649"), None);
+        assert_eq!(resolve_session_for_pane_in(&catalog, "tako-a:0.0"), None);
+    }
+
+    #[test]
+    fn ペイン解決はlast_seen_at欠落時にstarted_atへフォールバックする() {
+        let mut catalog = SessionCatalog::default();
+        catalog.entries.insert(
+            "session-seen".to_string(),
+            SessionEntry {
+                pane: Some(7),
+                started_at: "2026-07-01T00:00:00Z".to_string(),
+                last_seen_at: "2026-07-10T00:00:00Z".to_string(),
+                ..Default::default()
+            },
+        );
+        catalog.entries.insert(
+            "session-started-only".to_string(),
+            SessionEntry {
+                pane: Some(7),
+                started_at: "2026-07-15T00:00:00Z".to_string(),
+                last_seen_at: String::new(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            resolve_session_for_pane_in(&catalog, "7").as_deref(),
+            Some("session-started-only")
+        );
     }
 }

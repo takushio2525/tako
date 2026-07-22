@@ -1119,3 +1119,14 @@
   127 即死 → /bin/sh -c 構造化。テスト 2 本追加 + 既存 1 本を正しい構造検証へ更新
 - 検証: before/after 隔離実測（profiles None→Some(1)・Run ペイン即死→出力可視）+
   品質ゲート全緑（1195 tests / fmt / clippy）
+
+## 2026-07-22（#466: リモートチャットビューの更新停止を根治 — sticky live 解決 + カタログ最新優先）
+
+- 根因を隔離実測で確定: ビュー切替はシロ（モック/実環境 × Chromium/WebKit で再現せず）。
+  真因 = `claude agents --json` の一時失敗・列挙漏れ（実測: ps 7 プロセス中 1 個欠落）で
+  live 解決が消えると、v2 panes の session_id がカタログの stale 旧世代（同一 pane に
+  20 世代超・辞書順先勝ち）へ化け、チャットが凍結 transcript を読み続けていた
+- 修正: agents.rs sticky live 解決（失敗・欠落時は直近成功値を保持、ペイン消滅で破棄）+
+  sessions.rs resolve_session_for_pane の last_seen_at 最新優先。テスト 6 本追加
+- 検証: 隔離 GUI + 実 claude 2 世代 + fail 注入で before 凍結 / after 継続（切替 5 ラウンド）
+  を実測。品質ゲート全緑（fmt / clippy / 1005+ tests）
