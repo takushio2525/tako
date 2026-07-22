@@ -284,7 +284,7 @@ function ModelEffortSheet({ currentModel, currentEffort, onSelectModel, onSelect
 }
 
 // --- ファイル添付シート（カンプ 1g）---
-function AttachSheet({ onClose, onFileSelected, pendingFile, agentType }) {
+function AttachSheet({ onClose, onFilesSelected, agentType }) {
   const fileInputRef = useRef(null);
 
   function handleSource(source) {
@@ -296,17 +296,18 @@ function AttachSheet({ onClose, onFileSelected, pendingFile, agentType }) {
       input.accept = 'image/*';
       input.capture = 'environment';
       input.onchange = (e) => {
-        const file = e.target.files?.[0];
-        if (file) onFileSelected(file);
+        const files = Array.from(e.target.files || []);
+        if (files.length) onFilesSelected(files);
       };
       input.click();
     } else if (source === 'photo') {
       const input = document.createElement('input');
       input.type = 'file';
       input.accept = 'image/*,video/*';
+      input.multiple = true;
       input.onchange = (e) => {
-        const file = e.target.files?.[0];
-        if (file) onFileSelected(file);
+        const files = Array.from(e.target.files || []);
+        if (files.length) onFilesSelected(files);
       };
       input.click();
     }
@@ -342,10 +343,12 @@ function AttachSheet({ onClose, onFileSelected, pendingFile, agentType }) {
         <input
           ref={fileInputRef}
           type="file"
+          multiple
           style="display:none"
           onChange={e => {
-            const file = e.target.files?.[0];
-            if (file) onFileSelected(file);
+            const files = Array.from(e.target.files || []);
+            if (files.length) onFilesSelected(files);
+            e.target.value = '';
           }}
         />
       </div>
@@ -353,7 +356,8 @@ function AttachSheet({ onClose, onFileSelected, pendingFile, agentType }) {
   );
 }
 
-function PendingAttachment({ file, uploadState, onRemove }) {
+function PendingAttachment({ entry, onRemove }) {
+  const { file, status, path, error } = entry;
   const icon = file.type?.startsWith('image/') ? 'img' : 'file';
   const sizeStr = file.size < 1024 * 1024
     ? `${(file.size / 1024).toFixed(0)}KB`
@@ -369,14 +373,14 @@ function PendingAttachment({ file, uploadState, onRemove }) {
       </span>
       <div class="pending-attach-info">
         <span class="pending-attach-name">{file.name}</span>
-        <span class={`pending-attach-status ${uploadState?.status || 'pending'}`}>
-          {uploadState?.status === 'uploading' && `↑ ${sizeStr} ・ アップロード中...`}
-          {uploadState?.status === 'done' && `↑ ${sizeStr} ・ 完了`}
-          {uploadState?.status === 'error' && `エラー: ${uploadState.error}`}
-          {(!uploadState || uploadState.status === 'pending') && `${sizeStr}`}
+        <span class={`pending-attach-status ${status || 'pending'}`}>
+          {status === 'uploading' && `${sizeStr} ・ アップロード中...`}
+          {status === 'done' && `${sizeStr} ・ 完了`}
+          {status === 'error' && `エラー: ${error}`}
+          {(!status || status === 'pending') && `${sizeStr}`}
         </span>
       </div>
-      <button class="pending-attach-remove" onClick={onRemove}>✕</button>
+      <button class="pending-attach-remove" onClick={onRemove}>x</button>
     </div>
   );
 }
@@ -389,9 +393,10 @@ export function ChatView({ paneId, info, agentType, onStop, me }) {
   const [showSlash, setShowSlash] = useState(false);
   const [showModelSheet, setShowModelSheet] = useState(false);
   const [showAttachSheet, setShowAttachSheet] = useState(false);
-  const [pendingFile, setPendingFile] = useState(null);
-  const [uploadState, setUploadState] = useState(null);
+  // 添付ファイル配列。各要素: { id, file, status, path, error }
+  const [attachments, setAttachments] = useState([]);
   const [respondSending, setRespondSending] = useState(false);
+  const attachIdCounter = useRef(0);
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
   const timerRef = useRef(null);
@@ -464,15 +469,8 @@ export function ChatView({ paneId, info, agentType, onStop, me }) {
     if (!text) return;
     setInput('');
     setShowSlash(false);
-
-    // 添付ファイルがある場合はパスをプレフィックスに
-    if (pendingFile && uploadState?.status === 'done' && uploadState.path) {
-      await send(`${uploadState.path} ${text}`);
-    } else {
-      await send(text);
-    }
-    setPendingFile(null);
-    setUploadState(null);
+    setAttachments([]);
+    await send(text);
     inputRef.current?.focus();
   }
 
@@ -519,16 +517,51 @@ export function ChatView({ paneId, info, agentType, onStop, me }) {
     send(`/effort ${level}`);
   }
 
-  async function onFileSelected(file) {
+  function insertTextAtCursor(text) {
+    const el = inputRef.current;
+    if (!el) {
+      setInput(prev => prev + text);
+      return;
+    }
+    const start = el.selectionStart ?? el.value.length;
+    const end = el.selectionEnd ?? start;
+    const before = el.value.slice(0, start);
+    const after = el.value.slice(end);
+    const newValue = before + text + after;
+    setInput(newValue);
+    requestAnimationFrame(() => {
+      const pos = start + text.length;
+      el.selectionStart = pos;
+      el.selectionEnd = pos;
+      el.focus();
+    });
+  }
+
+  async function onFilesSelected(files) {
     setShowAttachSheet(false);
-    setPendingFile(file);
-    setUploadState({ status: 'uploading' });
-    try {
-      const client = createClient();
-      const result = await client.upload(paneId, file);
-      setUploadState({ status: 'done', path: result.path });
-    } catch (e) {
-      setUploadState({ status: 'error', error: e.message });
+    const entries = files.map(file => {
+      const id = ++attachIdCounter.current;
+      return { id, file, status: 'uploading', path: null, error: null };
+    });
+    setAttachments(prev => [...prev, ...entries]);
+
+    const client = createClient();
+    const completedPaths = [];
+    for (const entry of entries) {
+      try {
+        const result = await client.upload(paneId, entry.file);
+        setAttachments(prev =>
+          prev.map(a => a.id === entry.id ? { ...a, status: 'done', path: result.path } : a)
+        );
+        completedPaths.push(result.path);
+      } catch (e) {
+        setAttachments(prev =>
+          prev.map(a => a.id === entry.id ? { ...a, status: 'error', error: e.message } : a)
+        );
+      }
+    }
+    if (completedPaths.length) {
+      insertTextAtCursor(completedPaths.join('\n'));
     }
   }
 
@@ -612,13 +645,13 @@ export function ChatView({ paneId, info, agentType, onStop, me }) {
       <div class="composer">
         <div class={`composer-box${showSlash ? ' composer-box-active' : ''}`} style={showSlash ? `border-color:${color}` : ''}>
           {/* 添付プレビュー（カンプ 1g） */}
-          {pendingFile && (
+          {attachments.map(entry => (
             <PendingAttachment
-              file={pendingFile}
-              uploadState={uploadState}
-              onRemove={() => { setPendingFile(null); setUploadState(null); }}
+              key={entry.id}
+              entry={entry}
+              onRemove={() => setAttachments(prev => prev.filter(a => a.id !== entry.id))}
             />
-          )}
+          ))}
           <textarea
             ref={inputRef}
             class="composer-input"
@@ -634,8 +667,8 @@ export function ChatView({ paneId, info, agentType, onStop, me }) {
           />
           <div class="composer-toolbar">
             <button
-              class={`composer-btn-attach${pendingFile ? ' composer-btn-attach-active' : ''}`}
-              style={pendingFile ? `border-color:${color};color:${color}` : ''}
+              class={`composer-btn-attach${attachments.length ? ' composer-btn-attach-active' : ''}`}
+              style={attachments.length ? `border-color:${color};color:${color}` : ''}
               onClick={() => setShowAttachSheet(true)}
             >+</button>
             {info?.model && (
@@ -652,7 +685,7 @@ export function ChatView({ paneId, info, agentType, onStop, me }) {
               class="composer-send"
               style={`background:${color};color:${darkColor}`}
               onClick={sendFromComposer}
-              disabled={!input.trim() && !(pendingFile && uploadState?.status === 'done')}
+              disabled={!input.trim()}
             >
               {'↑'}
             </button>
@@ -676,8 +709,7 @@ export function ChatView({ paneId, info, agentType, onStop, me }) {
       {showAttachSheet && (
         <AttachSheet
           onClose={() => setShowAttachSheet(false)}
-          onFileSelected={onFileSelected}
-          pendingFile={pendingFile}
+          onFilesSelected={onFilesSelected}
           agentType={agentType}
         />
       )}
