@@ -146,6 +146,7 @@ export function TerminalPage({ paneId, me }) {
   const agentType = info?.agent_type || 'plain';
   const color = agentColor(agentType);
   const hasChatSupport = !!info?.session_id && (agentType === 'claude' || agentType === 'codex' || agentType === 'agy');
+  const hasTerminal = info ? !!info.tmux_target : true;
 
   // ユーザーがトグルで明示選択したか（選択後は自動切替しない。ペイン移動でリセット）
   const userPinnedViewRef = useRef(false);
@@ -250,6 +251,16 @@ export function TerminalPage({ paneId, me }) {
     wsRef.current = ws;
   }, [paneId]);
 
+  // terminal-less ペインでは WS を接続しない。info 確定後に判定
+  useEffect(() => {
+    if (!info) return;
+    if (info.tmux_target) {
+      connectWs();
+    } else {
+      setLoading(false);
+    }
+  }, [info?.id, info?.tmux_target, connectWs]);
+
   // term ビューがマウントされたら保留中の init を適用する（#426/#428）
   useEffect(() => {
     if (view !== 'term') return;
@@ -278,8 +289,8 @@ export function TerminalPage({ paneId, me }) {
     userPinnedViewRef.current = false;
     if (historyRef.current) historyRef.current.textContent = '';
     if (screenRef.current) screenRef.current.textContent = '';
-    connectWs();
     refreshPanes();
+    // WS 接続は info 取得後に hasTerminal で判定する（上の effect で開始）
     paneListTimerRef.current = setInterval(refreshPanes, 5000);
     return () => {
       clearInterval(paneListTimerRef.current);
@@ -456,7 +467,7 @@ export function TerminalPage({ paneId, me }) {
       )}
 
       {/* term ビュー */}
-      {view === 'term' && (
+      {view === 'term' && hasTerminal && (
         <>
           <div class="reader-wrap">
             <div
@@ -472,10 +483,10 @@ export function TerminalPage({ paneId, me }) {
             </div>
             {loading && <div class="reader-loading"><div class="spinner" /></div>}
             {hasNew && !loading && (
-              <button class="jump-latest" onClick={jumpToLatest}>{'↓'} 最新へ</button>
+              <button class="jump-latest" onClick={jumpToLatest}>{'↓'} latest</button>
             )}
             {!connected && !loading && (
-              <div class="reconnect-bar">接続が切れています — 再接続中...</div>
+              <div class="reconnect-bar">Disconnected — reconnecting...</div>
             )}
           </div>
 
@@ -512,6 +523,20 @@ export function TerminalPage({ paneId, me }) {
             </button>
           </div>
         </>
+      )}
+
+      {/* terminal-less ペイン（プレビュー等） */}
+      {view === 'term' && !hasTerminal && !loading && (
+        <div class="no-terminal-view">
+          <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+            <rect x="4" y="10" width="40" height="28" rx="4" stroke="var(--fg3)" stroke-width="2" />
+            <path d="M13 20L20 27L13 34" stroke="var(--fg3)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+            <line x1="24" y1="34" x2="35" y2="34" stroke="var(--fg3)" stroke-width="2" stroke-linecap="round" />
+            <line x1="2" y1="46" x2="46" y2="2" stroke="var(--fg3)" stroke-width="2" stroke-linecap="round" />
+          </svg>
+          <p class="no-terminal-title">No terminal session</p>
+          <p class="no-terminal-detail">This pane does not have a terminal (e.g. preview, web view)</p>
+        </div>
       )}
     </div>
   );
