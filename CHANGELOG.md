@@ -3,6 +3,14 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.10] - 2026-07-24
+
+Nightly patch release (automated). Changes since v0.5.9:
+夜間パッチリリース（自動）。v0.5.9 以降の変更:
+
+- [ドキュメント] 紹介動画: 収録待機をキャプチャ可否ベースに変更 + ウィンドウサイズ安定待ち (#470) (#481)
+- [ドキュメント] 紹介動画 Phase B: 制作パイプライン一式 + BGM (#470) (#480)
+
 ## [Unreleased]
 
 ## [0.5.9] - 2026-07-23
