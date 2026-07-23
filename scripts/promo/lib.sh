@@ -72,42 +72,65 @@ promo_check_capturable() {
     return 0
 }
 
-# 画面ロックが解除されるまで待つ（$1 = 最大待ち秒数。既定 0 = 待たない）
-promo_wait_unlock() {
-    local limit=${1:-0} waited=0
-    promo_screen_locked || return 0
-    [ "$limit" -gt 0 ] || return 1
-    echo "   画面ロック中。解除を待機します（最大 ${limit}s）"
-    while promo_screen_locked; do
-        sleep 10
-        waited=$((waited + 10))
-        [ "$waited" -ge "$limit" ] && { echo "   ロック解除を待てませんでした" >&2; return 1; }
+# 実際にキャプチャできる状態になるまで待つ（$1 = 最大待ち秒数。既定 0 = 待たない）。
+# ロックフラグは解除直後にキャプチャ可否と食い違うことがあるため、
+# 「テストキャプチャが 2 回続けて成功する」ことを判定基準にする
+promo_wait_capturable() {
+    local limit=${1:-0} waited=0 probe=/private/tmp/tako-promo-waitcap.png ok=0
+    while :; do
+        rm -f "$probe"
+        if screencapture -x -R0,0,64,64 "$probe" 2>/dev/null && [ -s "$probe" ]; then
+            ok=$((ok + 1))
+            [ "$ok" -ge 2 ] && { rm -f "$probe"; return 0; }
+        else
+            ok=0
+        fi
+        rm -f "$probe"
+        [ "$limit" -gt 0 ] || return 1
+        sleep 5
+        waited=$((waited + 5))
+        if [ "$waited" -ge "$limit" ]; then
+            echo "   収録可能になるのを待てませんでした（${limit}s 経過）" >&2
+            return 1
+        fi
+        if [ $(( waited % 60 )) -eq 0 ]; then
+            echo "   収録可能になるのを待機中（${waited}s。画面ロック中は撮れません）"
+        fi
     done
-    echo "   ロック解除を検知。30 秒待ってから収録に入ります"
-    sleep 30
-    return 0
 }
+
+# 後方互換の別名（呼び出し側の意図は「収録できるまで待つ」）
+promo_wait_unlock() { promo_wait_capturable "$@"; }
 
 # 対象 PID のウィンドウが実際にキャプチャできるようになるまで待つ。
 # 成功したウィンドウ ID を PROMO_WID に入れる
+# ウィンドウは開いた直後にサイズが変化する（GPUI の初期化過程）。過渡状態を掴むと
+# 極端に小さい素材になるので、①最低幅を満たし ②2 回続けて同じサイズ になるまで待つ
+PROMO_MIN_WIN_W=${TAKO_PROMO_MIN_WIN_W:-800}
 promo_wait_window() {
-    local probe="$PROMO_WORK/wid-probe.png" i b
+    local probe="$PROMO_WORK/wid-probe.png" i b wid geom prev=""
     PROMO_WID=""
-    for i in $(seq 1 40); do
+    for i in $(seq 1 60); do
         b=$("$PROMO_WINBOUNDS" "$PROMO_APP_PID" 2>/dev/null || true)
         if [ -n "$b" ]; then
-            local wid; wid=$(echo "$b" | cut -d' ' -f1)
-            rm -f "$probe"
-            if screencapture -x -o -l"$wid" "$probe" 2>/dev/null && [ -s "$probe" ]; then
+            wid=$(echo "$b" | cut -d' ' -f1)
+            geom=$(echo "$b" | cut -d' ' -f4,5)
+            local w; w=$(echo "$geom" | cut -d' ' -f1)
+            if [ "$w" -ge "$PROMO_MIN_WIN_W" ] && [ "$geom" = "$prev" ]; then
                 rm -f "$probe"
-                PROMO_WID=$wid
-                PROMO_WIN_GEOM=$(echo "$b" | cut -d' ' -f4,5)
-                return 0
+                if screencapture -x -o -l"$wid" "$probe" 2>/dev/null && [ -s "$probe" ]; then
+                    rm -f "$probe"
+                    PROMO_WID=$wid
+                    PROMO_WIN_GEOM=$geom
+                    return 0
+                fi
             fi
+            prev=$geom
         fi
         sleep 0.5
     done
-    echo "ERROR: 収録できるウィンドウが現れない（pid=${PROMO_APP_PID}）" >&2
+    echo "ERROR: 収録できるウィンドウが現れない（pid=${PROMO_APP_PID}、" >&2
+    echo "       最低幅 ${PROMO_MIN_WIN_W}pt を満たすウィンドウが安定しない）" >&2
     return 1
 }
 

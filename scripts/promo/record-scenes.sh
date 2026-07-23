@@ -25,16 +25,14 @@ SCENE=${1:-}
 [ -n "$SCENE" ] || { echo "usage: $0 <agent|preview|restore|outro|all>" >&2; exit 2; }
 
 promo_require
-# ロック解除待ち（TAKO_PROMO_WAIT_UNLOCK=秒 を指定したときだけ待つ）
-promo_wait_unlock "${TAKO_PROMO_WAIT_UNLOCK:-0}" || true
-# 収録できる状態かを最初に検査する（黒画面・空クリップを作らないため）
-promo_check_capturable
+# 収録可否（ロック・権限）は各シーンの冒頭で個別に確認する
 
 # ── S4: プレビュー（Markdown ライブリロード + Code Runner）──────────
 scene_preview() {
     local work=/private/tmp/tako-promo-preview socket=tako-promo-prev
     local raw="$PROMO_OUT/scenes/preview-raw.mp4"
     echo "== scene preview"
+    promo_wait_capturable "${TAKO_PROMO_WAIT_UNLOCK:-0}" || promo_check_capturable
     rm -rf "$work"
     promo_make_demo_env
     promo_start_isolated "$work" "$socket"
@@ -75,6 +73,7 @@ scene_agent() {
     local work=/private/tmp/tako-promo-agent socket=tako-promo-agent
     local raw="$PROMO_OUT/scenes/agent-raw.mp4"
     echo "== scene agent"
+    promo_wait_capturable "${TAKO_PROMO_WAIT_UNLOCK:-0}" || promo_check_capturable
     rm -rf "$work"
     promo_make_demo_env
     promo_start_isolated "$work" "$socket"
@@ -113,6 +112,7 @@ scene_restore() {
     local work=/private/tmp/tako-promo-restore socket=tako-promo-rest
     local raw="$PROMO_OUT/scenes/restore"
     echo "== scene restore"
+    promo_wait_capturable "${TAKO_PROMO_WAIT_UNLOCK:-0}" || promo_check_capturable
     rm -rf "$work"
     promo_make_demo_env
     # 1 回目: 永続化 ON で起動しペインを組む
@@ -154,6 +154,7 @@ scene_outro() {
     local work=/private/tmp/tako-promo-outro socket=tako-promo-out
     local raw="$PROMO_OUT/scenes/outro-raw.mp4"
     echo "== scene outro"
+    promo_wait_capturable "${TAKO_PROMO_WAIT_UNLOCK:-0}" || promo_check_capturable
     rm -rf "$work"
     promo_make_demo_env
     promo_start_isolated "$work" "$socket"
