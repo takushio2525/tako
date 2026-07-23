@@ -5,6 +5,58 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.9] - 2026-07-23
+
+- [機能追加] git タブに操作ボタン群: コミット / プル / プッシュ (#472)
+  git タブのヘッダにステージ・コミット・プル・プッシュの操作ボタンを追加。
+  コミットメッセージ入力欄 + ステージ済みファイル一覧表示。dispatch / CLI / MCP 1:1。
+  Add git tab action buttons: stage, commit, pull, push (#472).
+  Commit message input + staged file list. All operations exposed via dispatch/CLI/MCP.
+
+- [修正] setup-mcp の登録先を Claude Code が読む場所に修正 (#476)
+  `tako setup-mcp` が MCP 設定を書き込む先が Claude Code の実際の読み込みパスと
+  異なっていた問題を修正。外部テスター環境でゼロコンフィグ接続が機能しなかった根因。
+  Fix setup-mcp writing MCP config to the wrong location (#476).
+  The registration path did not match where Claude Code actually reads MCP settings,
+  causing zero-config connection to fail on external tester environments.
+
+- [UI] リモート: ペイン一覧カードの情報量増 + role 別スタイル (#433)
+  リモート PWA のペイン一覧カードに role バッジ・状態ドット・cwd・コマンド情報を追加。
+  master / worker / solo を色分け表示。
+  Remote PWA: richer pane cards with role badge, status dot, cwd, command info (#433).
+  Color-coded styling for master / worker / solo roles.
+
+- [修正] リモート: チャットビュー切替後の更新停止を修正 (#466)
+  `claude agents --json` の一時失敗・列挙漏れで live 解決が消えると、セッション ID が
+  カタログの stale 旧世代へ化け、チャットが凍結 transcript を読み続けていた。
+  agents.rs に sticky live 解決（失敗時は直近成功値を保持）を追加、
+  sessions.rs の resolve を last_seen_at 最新優先に変更。
+  Fix remote: chat view freezing after switching panes (#466).
+  Transient failures in `claude agents --json` caused the session ID to fall back to
+  a stale catalog entry. Added sticky live resolution and last_seen_at-based ordering.
+
+- [修正] リモート PWA の複数ファイル添付対応 (#463)
+  チャット入力で複数ファイルを同時添付できるよう修正。
+  Fix remote PWA: support multiple file attachments in chat input (#463).
+
+- [機能追加] Code Runner: ファイル実行機能の実装 (#453)
+  ファイル内 `tako:run:` 宣言または拡張子既定でワンクリック実行。
+  `tako run <file>` / MCP `tako_run` + `tako_run_resolve` + `tako_run_defaults`。
+  プレビューヘッダに再生ボタン + プロファイルドロップダウン（2+ 候補時）。
+  復元・リロード経路での検出漏れ + Run ペイン即死の根治を含む。
+  Add Code Runner: one-click file execution via `tako:run:` declarations or
+  extension defaults (#453). Preview header play button with profile dropdown.
+  Includes fixes for detection on restore/reload paths and Run pane instant death.
+
+- [修正] リモート PWA の入力 textarea を改行に応じて自動リサイズ (#457)
+  Fix remote PWA: auto-resize input textarea as newlines are entered (#457).
+
+- [セキュリティ] remote daemon の TCP listen を UDS 化し identity 偽装を根治 (#287)
+  remote daemon のローカル通信を TCP から Unix domain socket へ移行し、
+  同一マシン上の他プロセスからの identity 偽装（XFF ヘッダ改竄）を構造的に排除。
+  Migrate remote daemon local transport from TCP to Unix domain socket (#287).
+  Structurally eliminates identity spoofing via XFF header forgery from co-located processes.
+
 - [機能追加] 設定画面（Cmd+,）の全タブ実装完了（#459）
   M4: Code Runner タブ（拡張子既定テーブル + 編集 + 変数リファレンス）。
   M5: セットアップタブ（CLI 検出状態 / FDA / MCP 登録 / ルール同期 / tako setup 起動）。
