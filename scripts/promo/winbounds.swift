@@ -12,7 +12,10 @@ guard CommandLine.arguments.count > 1, let pid = Int32(CommandLine.arguments[1])
     FileHandle.standardError.write("usage: winbounds <pid>\n".data(using: .utf8)!)
     exit(2)
 }
-let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+// optionOnScreenOnly は「今表示中の Space にあるウィンドウ」しか返さないため、
+// ユーザーが別の Space に切り替えていると収録対象を見失う。全ウィンドウから
+// PID で絞り込む（screencapture -l は別 Space のウィンドウもキャプチャできる）
+let opts: CGWindowListOption = [.optionAll, .excludeDesktopElements]
 guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
     exit(1)
 }

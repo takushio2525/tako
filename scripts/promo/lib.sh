@@ -5,14 +5,16 @@
 #   - 継承 TAKO_* 環境の遮断（worker ペイン内から実行しても本番へ誤接続しない）
 #   - PII を含まないデモ環境（ダミープロジェクト + クリーンプロンプト）の生成
 #   - 隔離 GUI インスタンス（TAKO_ISOLATED=1 + 明示ソケット/データディレクトリ）の起動と後始末
-#   - ffmpeg avfoundation によるウィンドウ領域収録（screencapture -v は TCC 制約で黒画面のため不採用）
+#   - ウィンドウ単体キャプチャによる収録（screencapture -l<windowID> の連番 → ffmpeg 結合）
 #   - 収録物の ffprobe 検証 + フレーム抽出（PII 全数チェック用）
 #
 # 収録エンジンについて（2026-07-23 実測）:
-#   screencapture -v は本環境で黒画面（静止画 -x は正常）。ffmpeg -f avfoundation は
-#   30fps でフルスクリーンを正常取得できるため、crop フィルタでウィンドウ領域だけを切り出す。
-#   avfoundation はピクセル、CGWindowList はポイントのため winbounds.swift のスクリーン
-#   論理サイズからスケールを求めて変換する。
+#   - screencapture -v（動画）は本環境で黒画面。静止画（-x）は正常なので連番で撮る
+#   - 画面全体を撮って切り出す方式（ffmpeg avfoundation / screencapture -R）は、
+#     対象ウィンドウの手前に別アプリのウィンドウが重なるとその中身ごと写り込むため使わない
+#     （実際に他アプリの内容が混入した素材を作ってしまい破棄した）
+#   - 画面ロック中と、隔離ウィンドウが別 Space にある場合はキャプチャできない。
+#     promo_check_capturable がロックと権限不足を切り分けて事前に止める
 
 PROMO_APP=${TAKO_PROMO_APP:-/Applications/tako.app/Contents/MacOS/tako-app}
 PROMO_CLI=${TAKO_PROMO_CLI:-/Applications/tako.app/Contents/MacOS/tako}
@@ -34,6 +36,79 @@ promo_require() {
     command -v ffmpeg >/dev/null || { echo "ERROR: ffmpeg が必要" >&2; return 1; }
     command -v ffprobe >/dev/null || { echo "ERROR: ffprobe が必要" >&2; return 1; }
     mkdir -p "$PROMO_OUT/scenes" "$PROMO_FRAMES"
+    # winbounds は収録ループから何度も呼ぶので、毎回 swift でコンパイルせず
+    # 一度バイナリ化して使い回す（1 回あたり数秒の差になる）
+    PROMO_WINBOUNDS=/private/tmp/tako-promo-winbounds
+    if [ ! -x "$PROMO_WINBOUNDS" ] || \
+       [ "$PROMO_LIB_DIR/winbounds.swift" -nt "$PROMO_WINBOUNDS" ]; then
+        swiftc -O -o "$PROMO_WINBOUNDS" "$PROMO_LIB_DIR/winbounds.swift" 2>/dev/null || {
+            echo "ERROR: winbounds.swift のコンパイルに失敗" >&2; return 1; }
+    fi
+}
+
+# 画面がロックされていないか調べる（ロック中は screencapture が一切動かない）。
+# ロック中なら 1 を返す
+promo_screen_locked() {
+    ioreg -n Root -d1 -r 2>/dev/null | grep -q '"CGSSessionScreenIsLocked"=Yes'
+}
+
+# 収録可能な状態か事前に検査する。ロック・権限のどちらで止まっているかを切り分ける
+promo_check_capturable() {
+    if promo_screen_locked; then
+        echo "ERROR: 画面がロックされています。ロック中は macOS が画面キャプチャを" >&2
+        echo "       一切許可しないため収録できません。ロックを解除してから再実行してください。" >&2
+        return 1
+    fi
+    local probe=/private/tmp/tako-promo-capcheck.png
+    rm -f "$probe"
+    if ! screencapture -x -R0,0,64,64 "$probe" 2>/dev/null || [ ! -s "$probe" ]; then
+        rm -f "$probe"
+        echo "ERROR: 画面キャプチャができません（ロックはされていない）。" >&2
+        echo "       システム設定 > プライバシーとセキュリティ > 画面収録 で" >&2
+        echo "       このターミナルアプリに許可を与えてください。" >&2
+        return 1
+    fi
+    rm -f "$probe"
+    return 0
+}
+
+# 画面ロックが解除されるまで待つ（$1 = 最大待ち秒数。既定 0 = 待たない）
+promo_wait_unlock() {
+    local limit=${1:-0} waited=0
+    promo_screen_locked || return 0
+    [ "$limit" -gt 0 ] || return 1
+    echo "   画面ロック中。解除を待機します（最大 ${limit}s）"
+    while promo_screen_locked; do
+        sleep 10
+        waited=$((waited + 10))
+        [ "$waited" -ge "$limit" ] && { echo "   ロック解除を待てませんでした" >&2; return 1; }
+    done
+    echo "   ロック解除を検知。30 秒待ってから収録に入ります"
+    sleep 30
+    return 0
+}
+
+# 対象 PID のウィンドウが実際にキャプチャできるようになるまで待つ。
+# 成功したウィンドウ ID を PROMO_WID に入れる
+promo_wait_window() {
+    local probe="$PROMO_WORK/wid-probe.png" i b
+    PROMO_WID=""
+    for i in $(seq 1 40); do
+        b=$("$PROMO_WINBOUNDS" "$PROMO_APP_PID" 2>/dev/null || true)
+        if [ -n "$b" ]; then
+            local wid; wid=$(echo "$b" | cut -d' ' -f1)
+            rm -f "$probe"
+            if screencapture -x -o -l"$wid" "$probe" 2>/dev/null && [ -s "$probe" ]; then
+                rm -f "$probe"
+                PROMO_WID=$wid
+                PROMO_WIN_GEOM=$(echo "$b" | cut -d' ' -f4,5)
+                return 0
+            fi
+        fi
+        sleep 0.5
+    done
+    echo "ERROR: 収録できるウィンドウが現れない（pid=${PROMO_APP_PID}）" >&2
+    return 1
 }
 
 # ── デモ環境（PII ゼロ）────────────────────────────────────────────
@@ -221,21 +296,10 @@ promo_base_pane() {
 # $1 = 出力 mp4, $2 = 尺（秒）。収録は background で走り promo_record_wait で待つ。
 promo_record_start() {
     local out=$1 dur=$2
-    # ウィンドウ ID は起動直後に作り直されることがあるので、
-    # 実際に 1 枚撮れる ID が得られるまで引き直す
-    local wid="" wx wy ww wh bounds probe="$PROMO_WORK/wid-probe.png" try
-    for try in 1 2 3 4 5; do
-        bounds=$(swift "$PROMO_LIB_DIR/winbounds.swift" "$PROMO_APP_PID" 2>/dev/null) || {
-            sleep 1; continue; }
-        read -r wid wx wy ww wh <<< "$bounds"
-        rm -f "$probe"
-        if screencapture -x -o -l"$wid" "$probe" 2>/dev/null && [ -s "$probe" ]; then
-            rm -f "$probe"; break
-        fi
-        wid=""; sleep 1
-    done
-    [ -n "$wid" ] || { echo "ERROR: 収録できるウィンドウを特定できない" >&2; return 1; }
-    echo "   対象ウィンドウ: id=$wid ${ww}x${wh}（尺 ${dur}s）"
+    # 実際にキャプチャできるウィンドウが現れるまで待ってから収録に入る
+    promo_wait_window || return 1
+    local wid=$PROMO_WID
+    echo "   対象ウィンドウ: id=$wid ${PROMO_WIN_GEOM// /x}（尺 ${dur}s）"
 
     PROMO_REC_OUT=$out
     PROMO_REC_DUR=$dur
@@ -260,7 +324,7 @@ promo_record_start() {
                 miss=$((miss + 1))
                 if [ "$miss" -ge 10 ]; then
                     local nb
-                    nb=$(swift "$PROMO_LIB_DIR/winbounds.swift" "$PROMO_APP_PID" 2>/dev/null || true)
+                    nb=$("$PROMO_WINBOUNDS" "$PROMO_APP_PID" 2>/dev/null || true)
                     [ -n "$nb" ] && wid=$(echo "$nb" | cut -d' ' -f1)
                     miss=0
                 fi

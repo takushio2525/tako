@@ -25,6 +25,10 @@ SCENE=${1:-}
 [ -n "$SCENE" ] || { echo "usage: $0 <agent|preview|restore|outro|all>" >&2; exit 2; }
 
 promo_require
+# ロック解除待ち（TAKO_PROMO_WAIT_UNLOCK=秒 を指定したときだけ待つ）
+promo_wait_unlock "${TAKO_PROMO_WAIT_UNLOCK:-0}" || true
+# 収録できる状態かを最初に検査する（黒画面・空クリップを作らないため）
+promo_check_capturable
 
 # ── S4: プレビュー（Markdown ライブリロード + Code Runner）──────────
 scene_preview() {
