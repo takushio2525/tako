@@ -57,13 +57,13 @@ ADD
     # beat 3: 実行可能スクリプトをコードプレビューで開く（再生ボタンが出る）
     tko open --pane "$base" "$PROMO_DEMO/awesome-app/scripts/build.sh" >/dev/null
     sleep 4
-    # beat 4: Code Runner で実行 → 新ペインにビルドログ
-    tko run "$PROMO_DEMO/awesome-app/scripts/build.sh" >/dev/null 2>&1 || true
-    sleep 6
+    # beat 4: Code Runner で実行 → 新ペインにビルドログ（基準ペインを明示する）
+    tko run --pane "$base" "$PROMO_DEMO/awesome-app/scripts/build.sh" >/dev/null
+    sleep 8
 
     promo_record_wait
     promo_stop_isolated "$socket"; trap - EXIT
-    promo_verify "$raw" "$PROMO_OUT/frames/preview" 1
+    promo_verify "$raw" "$PROMO_FRAMES/preview" 1
 }
 
 # ── S1/S2/S3: 実 Claude Code + オーケストレーション ─────────────────
@@ -101,7 +101,7 @@ scene_agent() {
 
     promo_record_wait
     promo_stop_isolated "$socket"; trap - EXIT
-    promo_verify "$raw" "$PROMO_OUT/frames/agent" 1
+    promo_verify "$raw" "$PROMO_FRAMES/agent" 1
 }
 
 # ── S5: 再起動して全ペインが復元される ─────────────────────────────
@@ -141,8 +141,8 @@ scene_restore() {
     promo_record_wait
 
     promo_stop_isolated "$socket"; trap - EXIT
-    promo_verify "$PROMO_OUT/scenes/restore-before-raw.mp4" "$PROMO_OUT/frames/restore-before" 1
-    promo_verify "$PROMO_OUT/scenes/restore-after-raw.mp4" "$PROMO_OUT/frames/restore-after" 1
+    promo_verify "$PROMO_OUT/scenes/restore-before-raw.mp4" "$PROMO_FRAMES/restore-before" 1
+    promo_verify "$PROMO_OUT/scenes/restore-after-raw.mp4" "$PROMO_FRAMES/restore-after" 1
 }
 
 # ── S7: テーマ切替 + コマンドパレット ──────────────────────────────
@@ -174,7 +174,7 @@ scene_outro() {
 
     promo_record_wait
     promo_stop_isolated "$socket"; trap - EXIT
-    promo_verify "$raw" "$PROMO_OUT/frames/outro" 1
+    promo_verify "$raw" "$PROMO_FRAMES/outro" 1
 }
 
 case "$SCENE" in

@@ -17,6 +17,8 @@
 PROMO_APP=${TAKO_PROMO_APP:-/Applications/tako.app/Contents/MacOS/tako-app}
 PROMO_CLI=${TAKO_PROMO_CLI:-/Applications/tako.app/Contents/MacOS/tako}
 PROMO_OUT=${TAKO_PROMO_OUT:-"$HOME/Desktop/tako-promo"}
+# フレーム抽出（PII 検証用の中間物）は Desktop の TCC 制限を避けて /private/tmp に置く
+PROMO_FRAMES=${TAKO_PROMO_FRAMES:-/private/tmp/tako-promo-frames}
 PROMO_DEMO=/private/tmp/tako-demo
 PROMO_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -31,7 +33,7 @@ promo_require() {
     [ -x "$PROMO_CLI" ] || { echo "ERROR: tako CLI が無い: $PROMO_CLI" >&2; return 1; }
     command -v ffmpeg >/dev/null || { echo "ERROR: ffmpeg が必要" >&2; return 1; }
     command -v ffprobe >/dev/null || { echo "ERROR: ffprobe が必要" >&2; return 1; }
-    mkdir -p "$PROMO_OUT/scenes" "$PROMO_OUT/frames"
+    mkdir -p "$PROMO_OUT/scenes" "$PROMO_FRAMES"
 }
 
 # ── デモ環境（PII ゼロ）────────────────────────────────────────────
@@ -108,6 +110,8 @@ for s in "${steps[@]}"; do
     sleep 0.5
 done
 printf '\033[32mbuild succeeded\033[0m in 2.1s\n'
+# 収録用: 完了直後にペインが exit で閉じると結果が写らないので保持する
+sleep 600
 BLD
     chmod +x "$PROMO_DEMO/awesome-app/scripts/build.sh"
 
@@ -181,10 +185,14 @@ promo_start_isolated() {
 
 promo_stop_isolated() {
     local socket=$1
-    [ -n "${PROMO_APP_PID:-}" ] && kill "$PROMO_APP_PID" 2>/dev/null
-    sleep 1
-    [ -n "${PROMO_APP_PID:-}" ] && kill -9 "$PROMO_APP_PID" 2>/dev/null
-    [ -n "$socket" ] && tmux -L "$socket" kill-server 2>/dev/null
+    # 既に終了しているプロセスへの kill は失敗するため、すべて || true で受ける
+    # （set -e 下でここが非ゼロを返すと呼び出し側の検証まで飛ばされる）
+    if [ -n "${PROMO_APP_PID:-}" ]; then
+        kill "$PROMO_APP_PID" 2>/dev/null || true
+        sleep 1
+        kill -9 "$PROMO_APP_PID" 2>/dev/null || true
+    fi
+    [ -n "$socket" ] && { tmux -L "$socket" kill-server 2>/dev/null || true; }
     return 0
 }
 
@@ -213,11 +221,20 @@ promo_base_pane() {
 # $1 = 出力 mp4, $2 = 尺（秒）。収録は background で走り promo_record_wait で待つ。
 promo_record_start() {
     local out=$1 dur=$2
-    local bounds
-    bounds=$(swift "$PROMO_LIB_DIR/winbounds.swift" "$PROMO_APP_PID") || {
-        echo "ERROR: 隔離ウィンドウを特定できない" >&2; return 1; }
-    local wid wx wy ww wh
-    read -r wid wx wy ww wh <<< "$bounds"
+    # ウィンドウ ID は起動直後に作り直されることがあるので、
+    # 実際に 1 枚撮れる ID が得られるまで引き直す
+    local wid="" wx wy ww wh bounds probe="$PROMO_WORK/wid-probe.png" try
+    for try in 1 2 3 4 5; do
+        bounds=$(swift "$PROMO_LIB_DIR/winbounds.swift" "$PROMO_APP_PID" 2>/dev/null) || {
+            sleep 1; continue; }
+        read -r wid wx wy ww wh <<< "$bounds"
+        rm -f "$probe"
+        if screencapture -x -o -l"$wid" "$probe" 2>/dev/null && [ -s "$probe" ]; then
+            rm -f "$probe"; break
+        fi
+        wid=""; sleep 1
+    done
+    [ -n "$wid" ] || { echo "ERROR: 収録できるウィンドウを特定できない" >&2; return 1; }
     echo "   対象ウィンドウ: id=$wid ${ww}x${wh}（尺 ${dur}s）"
 
     PROMO_REC_OUT=$out
@@ -228,16 +245,25 @@ promo_record_start() {
     date +%s > "$marker"
 
     (
-        local end=$(( $(date +%s) + dur )) i=0 last=""
+        local end=$(( $(date +%s) + dur )) i=0 last="" miss=0
         while [ "$(date +%s)" -lt "$end" ]; do
             i=$((i + 1))
             local f
             f=$(printf '%s/f%05d.png' "$PROMO_REC_DIR" "$i")
-            if ! screencapture -x -o -l"$wid" "$f" 2>/dev/null || [ ! -s "$f" ]; then
-                # ウィンドウが一時的に無い場合は直前フレームで埋めて尺を保つ
-                [ -n "$last" ] && cp "$last" "$f" 2>/dev/null || i=$((i - 1))
+            if screencapture -x -o -l"$wid" "$f" 2>/dev/null && [ -s "$f" ]; then
+                last=$f; miss=0
             else
-                last=$f
+                # ウィンドウが一時的に消えた場合は直前フレームで尺を保つ。
+                # 連続で撮れないときはウィンドウが作り直された可能性が高いので ID を引き直す
+                if [ -n "$last" ]; then cp "$last" "$f" 2>/dev/null || i=$((i - 1))
+                else i=$((i - 1)); fi
+                miss=$((miss + 1))
+                if [ "$miss" -ge 10 ]; then
+                    local nb
+                    nb=$(swift "$PROMO_LIB_DIR/winbounds.swift" "$PROMO_APP_PID" 2>/dev/null || true)
+                    [ -n "$nb" ] && wid=$(echo "$nb" | cut -d' ' -f1)
+                    miss=0
+                fi
             fi
         done
         echo "$i" > "$PROMO_WORK/rec.count"
