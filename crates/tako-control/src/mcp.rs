@@ -391,15 +391,17 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_video_playback",
             "description": "動画プレビューペインの再生/一時停止/音量/ループを操作する。\
                 対象ペインが動画プレビュー（tako open で .mp4/.mov 等を開いた状態）の場合のみ有効。\
-                action: play / pause / toggle / rate:N（N は 0.1〜4.0 の速度倍率、例: rate:2.0）/ \
-                mute / unmute / toggle_mute / loop_on / loop_off / toggle_loop。",
+                action: status（状態を変えずに現在値だけ取得）/ play / pause / toggle / \
+                rate:N（N は 0.1〜4.0 の速度倍率、例: rate:2.0）/ \
+                mute / unmute / toggle_mute / loop_on / loop_off / toggle_loop。\
+                応答には UI のシークバー・時刻表示と同じ position / duration / state が入る。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane": pane_schema("対象ペイン ID（省略時は呼び出し元）"),
                     "action": {
                         "type": "string",
-                        "description": "再生操作（play / pause / toggle / rate:N / mute / unmute / toggle_mute / loop_on / loop_off / toggle_loop）",
+                        "description": "再生操作（status / play / pause / toggle / rate:N / mute / unmute / toggle_mute / loop_on / loop_off / toggle_loop）",
                     },
                 },
                 "required": ["action"],

@@ -1120,6 +1120,11 @@ enum VideoCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
+    /// 動画プレイヤーの現在状態（再生位置・総尺・再生状態）。UI の表示と同じ値
+    Status {
+        #[arg(long)]
+        pane: Option<u64>,
+    },
     /// 動画のシーク（秒単位）
     Seek {
         /// シーク先の秒数
@@ -4105,6 +4110,10 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Video(VideoCommand::Toggle { pane }) => Request::VideoPlayback {
             pane: target_pane(*pane)?,
             action: "toggle".into(),
+        },
+        Command::Video(VideoCommand::Status { pane }) => Request::VideoPlayback {
+            pane: target_pane(*pane)?,
+            action: "status".into(),
         },
         Command::Video(VideoCommand::Seek { seconds, pane }) => Request::VideoSeek {
             pane: target_pane(*pane)?,

@@ -1430,39 +1430,40 @@ impl TakoApp {
                         let duration = player.duration;
                         let current_rate = player.rate;
 
-                        let play_btn_label: SharedString = if is_playing {
-                            "\u{23f8}".into() // ⏸
-                        } else {
-                            "\u{25b6}\u{fe0e}".into() // ▶︎
-                        };
-                        let cur_m = current_time as u64 / 60;
-                        let cur_s = current_time as u64 % 60;
-                        let dur_m = duration as u64 / 60;
-                        let dur_s = duration as u64 % 60;
-                        let time_label: SharedString =
-                            format!("{cur_m}:{cur_s:02} / {dur_m}:{dur_s:02}").into();
-                        let progress_frac = if duration > 0.0 {
-                            (current_time / duration).clamp(0.0, 1.0) as f32
-                        } else {
-                            0.0
-                        };
-                        let seek_dur = duration;
+                        let time_label: SharedString = format!(
+                            "{} / {}",
+                            video_player::time_label(current_time),
+                            video_player::time_label(duration)
+                        )
+                        .into();
+                        let progress_frac = video_player::progress_fraction(current_time, duration);
 
                         let is_muted = player.muted;
                         let is_looping = player.looping;
+                        // ツールチップの実効幅（時刻表記 + 左右パディング）。
+                        // バーからはみ出さないようにこの幅でクランプする
+                        let tooltip_width = 44.0;
+                        let seek_bar_width = self
+                            .video_seek_bar_bounds
+                            .get(&pane_id)
+                            .map(|b| f32::from(b.size.width))
+                            .unwrap_or(0.0);
 
                         // ホバー時刻ツールチップ
                         let hover_tooltip = self
                             .video_seek_hover
                             .filter(|&(pid, _, _)| pid == pane_id)
                             .map(|(_, hover_sec, hover_x)| {
-                                let hm = hover_sec as u64 / 60;
-                                let hs = hover_sec as u64 % 60;
-                                let label: SharedString = format!("{hm}:{hs:02}").into();
+                                let label: SharedString =
+                                    video_player::time_label(hover_sec).into();
                                 div()
                                     .absolute()
                                     .bottom(px(16.0))
-                                    .left(px(hover_x - 20.0))
+                                    .left(px(video_player::tooltip_left(
+                                        hover_x,
+                                        seek_bar_width,
+                                        tooltip_width,
+                                    )))
                                     .px(px(4.0))
                                     .py(px(1.0))
                                     .rounded(px(3.0))
@@ -1480,6 +1481,9 @@ impl TakoApp {
                             .relative()
                             .flex_1()
                             .h(px(14.0))
+                            // つまみは端で半分はみ出す。左右に逃がし幅を確保して
+                            // 隣のボタン・時刻表示に重ならないようにする
+                            .mx(px(6.0))
                             .cursor_pointer()
                             .child(
                                 div()
@@ -1491,24 +1495,25 @@ impl TakoApp {
                                     .rounded(px(3.0))
                                     .bg(hsla_alpha(theme.foreground, 0.2))
                                     .child(
+                                        // 再生済み部分。つまみはこの子要素の
+                                        // 右端に置き、塗りの先端とズレないようにする
                                         div()
+                                            .relative()
                                             .h_full()
                                             .rounded(px(3.0))
                                             .bg(hsla(theme.ansi[4]))
-                                            .w(relative(progress_frac)),
+                                            .w(relative(progress_frac))
+                                            .child(
+                                                div()
+                                                    .absolute()
+                                                    .top(px(-3.0))
+                                                    .right(px(-6.0))
+                                                    .w(px(12.0))
+                                                    .h(px(12.0))
+                                                    .rounded_full()
+                                                    .bg(hsla(theme.ansi[4])),
+                                            ),
                                     ),
-                            )
-                            // つまみノブ
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top(px(1.0))
-                                    .left(relative(progress_frac))
-                                    .ml(px(-6.0))
-                                    .w(px(12.0))
-                                    .h(px(12.0))
-                                    .rounded_full()
-                                    .bg(hsla(theme.ansi[4])),
                             )
                             .child({
                                 let entity = cx.entity().downgrade();
@@ -1528,44 +1533,29 @@ impl TakoApp {
                             .on_mouse_down(
                                 gpui::MouseButton::Left,
                                 cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                    // 押した時点で正確シーク。以後の移動は粗い
+                                    // シークで追従し、離した位置で再度正確に合わせる
                                     this.video_seek_dragging = Some(pane_id);
-                                    this.video_seek_by_click(pane_id, ev.position, seek_dur, cx);
+                                    this.video_seek_to_position(pane_id, ev.position, true, cx);
+                                    this.video_seek_update_hover(pane_id, ev.position, cx);
                                 }),
                             )
                             .on_mouse_up(
                                 gpui::MouseButton::Left,
-                                cx.listener(move |this, _ev: &gpui::MouseUpEvent, _, _cx| {
-                                    if this.video_seek_dragging == Some(pane_id) {
-                                        this.video_seek_dragging = None;
-                                    }
+                                cx.listener(move |this, ev: &gpui::MouseUpEvent, _, cx| {
+                                    this.video_seek_end_drag(Some(ev.position), cx);
                                 }),
                             )
                             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
                                 if this.video_seek_dragging == Some(pane_id) {
                                     this.video_seek_by_drag(pane_id, ev.position, cx);
                                 }
-                                // ホバー時刻を計算
-                                if let Some(bounds) =
-                                    this.video_seek_bar_bounds.get(&pane_id).copied()
-                                {
-                                    let bar_x = f32::from(bounds.origin.x);
-                                    let bar_w = f32::from(bounds.size.width);
-                                    let mouse_x = f32::from(ev.position.x);
-                                    if bar_w > 0.0 {
-                                        let frac = ((mouse_x - bar_x) / bar_w).clamp(0.0, 1.0);
-                                        let hover_sec = frac as f64 * seek_dur;
-                                        let rel_x = mouse_x - bar_x;
-                                        this.video_seek_hover = Some((pane_id, hover_sec, rel_x));
-                                        cx.notify();
-                                    }
-                                }
+                                this.video_seek_update_hover(pane_id, ev.position, cx);
                             }))
                             .on_mouse_up_out(
                                 gpui::MouseButton::Left,
-                                cx.listener(move |this, _, _, _| {
-                                    if this.video_seek_dragging == Some(pane_id) {
-                                        this.video_seek_dragging = None;
-                                    }
+                                cx.listener(move |this, ev: &gpui::MouseUpEvent, _, cx| {
+                                    this.video_seek_end_drag(Some(ev.position), cx);
                                 }),
                             );
                         if let Some(tooltip) = hover_tooltip {
@@ -1686,8 +1676,24 @@ impl TakoApp {
                                     div()
                                         .id(("video-toggle", pane_id.as_u64()))
                                         .cursor_pointer()
-                                        .text_size(px(18.0))
-                                        .child(play_btn_label)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .w(px(20.0))
+                                        .h(px(20.0))
+                                        .rounded(px(3.0))
+                                        .hover(|s| s.bg(hsla_alpha(theme.foreground, 0.1)))
+                                        .child(
+                                            svg()
+                                                .path(if is_playing {
+                                                    crate::file_icons::ui_icon::PAUSE
+                                                } else {
+                                                    crate::file_icons::ui_icon::PLAY
+                                                })
+                                                .w(px(14.0))
+                                                .h(px(14.0))
+                                                .text_color(hsla_alpha(theme.foreground, 0.85)),
+                                        )
                                         .on_click(cx.listener(
                                             move |this, _ev: &gpui::ClickEvent, _, cx| {
                                                 if let Some(p) =
