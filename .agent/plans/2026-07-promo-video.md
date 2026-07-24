@@ -28,22 +28,69 @@
 補足: 設定画面（#459）・テーマ切替（#217）・日英 i18n（#435）は単独シーンにせず、
 クロージングの「ちら見せ」素材として扱う（訴求の焦点を絞るため）。
 
-## シーン表（合計 72 秒）
+## シーン表（v2 = 現行。合計 84 秒）
 
-尺はテンポ優先の目安。ナレーションなし・テロップ + BGM 前提（トーンはユーザー確認事項）。
+> v2（2026-07-24）でユーザー指示により**本編の順序を固定**した:
+> **① 画面操作 → ② プレビュー → ③ setup → ④ master**。
+> ③ と ④ が動画の 2 本柱で、どちらも実 UI 収録が必須。
+> restore（再起動復元）と remote（スマホ）は 4 本柱から外れるため v2 の本編からは外した
+> （素材 `restore-before/after-raw.mp4` は残してあり、尺を伸ばす判断が出たら
+> master とアウトロの間に補足として挟める）。
 
-| # | 時間 | 尺 | 内容（実 UI で収録する画） | テロップ文言（案） |
+尺はテンポ優先の目安。ナレーションなし・テロップ + BGM。テロップは**背景パネル付き**（後述）。
+
+| # | 尺 | 素材 | 内容（実 UI で収録する画） | テロップ本文 / 副題 |
 |---|---|---|---|---|
-| S1 | 0:00–0:06 | 6s | フック: 1 タブに master + worker 3 体 + dev サーバーが並ぶ完成形。状態ドットが明滅 | 「AI エージェント開発、画面はもう散らからない」 |
-| S2 | 0:06–0:18 | 12s | Claude Code に日本語で依頼 →「dev サーバーを隣で起動して」→ ペインが自動分割されサーバーログが流れ、README プレビューが開く | 「Claude Code がそのまま画面を操作する」「設定ゼロの内蔵 MCP」 |
-| S3 | 0:18–0:32 | 14s | `tako master` 起動 → worker が 3 体 spawn されグリッド自動配置 → 右パネル orch ビューで俯瞰 → 完了した worker に緑ドット | 「master が worker を並べて監視」「1 グループ = 1 タブ」 |
-| S4 | 0:32–0:44 | 12s | ファイルツリーから Markdown を開く → ライブリロードで編集が即反映 → Code Runner の再生ボタンでスクリプト実行 → PDF/画像プレビュー | 「成果物はターミナルの中で確認」 |
-| S5 | 0:44–0:54 | 10s | Cmd+Q で終了 → 再起動 → 全タブ・全ペインが画面内容ごと復元、サーバーログが続きから流れる | 「再起動しても、全部戻ってくる」 |
-| S6 | 0:54–1:04 | 10s | スマホ実機（または DevTools モバイル表示）: PWA でペイン一覧 → ライブ画面 → 承認ダイアログに応答 | 「外出先はスマホから」 |
-| S7 | 1:04–1:12 | 8s | クロージング: テーマ切替 + 設定画面のちら見せ → tako ロゴ → GitHub URL | 「tako — AI エージェント時代の GUI ターミナル」「github.com/takushio2525/tako」 |
+| S1 | 5s | agent-raw @46s | フック: 1 タブに Claude Code + dev サーバー + README プレビューが並ぶ完成形 | 「エージェントも、その子プロセスも、1 つのタブに」 |
+| S2 | 12s | agent-raw @32s | Claude Code に日本語で依頼 → tako MCP でペインが自動分割され dev サーバーが起動 | 「日本語で頼むと、AI がペインを割って動かす」/「設定ゼロの内蔵 MCP サーバー」 |
+| S3 | 9s | agent-raw @62s | 起動したサーバーのログと README プレビューが同じタブに並ぶ | 「起動したサーバーも、開いた資料も、同じ画面に」/「1 グループ = 1 タブ」 |
+| S4 | 12s | preview-raw @3s | Markdown プレビュー → 外部編集がライブリロードで即反映 → Code Runner でスクリプト実行 | 「成果物はターミナルの中で確認する」/「ライブリロードと Code Runner」 |
+| S5a | 9s | setup-raw @2s | `tako setup --check` が足りない設定を列挙（Claude MCP 未登録など） | 「足りない設定は、tako が自分で教えてくれる」/「tako setup --check」 |
+| S5b | 9s | setup-raw @13s | `tako setup-mcp` で登録 → `claude mcp list` に `tako … ✔ Connected` | 「Claude Code 連携は、コマンド 1 つ」/「一度登録すれば、どのプロジェクトでも設定不要」 |
+| S6a | 12s | master-raw @4s | `tako master` が立ち、worker が spawn されて同じタブにグリッド配置される | 「master が worker を spawn し、同じタブに並べる」/「tako master」 |
+| S6b | 12s | master-raw @22s | 4 体目の worker が増え、右パネル orch ビューで全 worker を俯瞰 | 「全員の進捗が 1 画面で分かる」/「worker ごとにモデルもエージェントも振り分けられる」 |
+| S7 | 8s | outro-raw @4s | クロージング: テーマ切替 → ロゴ → GitHub URL | 「tako」/「AI エージェント時代の GUI ターミナル / github.com/takushio2525/tako」 |
 
-各シーンの実装確認: S1〜S5・S7 はすべて既存機能（CLI/MCP から再現可能）。
-S6 のみ実機スマホ収録 or シミュレータの選択が残る（下記「Phase B への引き継ぎ」）。
+## 2 本柱の訴求内容（実装で裏を取った事実のみ）
+
+宣伝物なので**実在しない機能・未実装の挙動はテロップに書かない**。
+下記は実装・README・実機実行で確認した範囲だけを採用している。
+
+### ③ setup（導入の簡単さ）
+
+確認した実機能（`tako setup --help` / `crates/tako-control/src/setup.rs` /
+`resources/setup/changes.yaml` / README「Claude Code 連携」節 / 実行結果）:
+
+- `tako setup --check` … 環境チェック。エージェント CLI（claude / codex / agy）の検出と認証状態、
+  tmux / git / tailscale、フルディスクアクセス、**Claude MCP への tako 登録有無**、
+  Codex MCP、グローバル指示ファイル、スリープ防止、プロファイルの有無を列挙する
+- `tako setup-mcp` … Claude Code のユーザー設定へ tako MCP を登録（内部で
+  `claude mcp add --scope user`）。**user スコープなので以後どのプロジェクトでも設定不要**
+- `tako setup` … 質問ゼロの自動セットアップ（検出値 → 前回値 → 既定値で解決。`--yes` /
+  `--answers` で完全非対話、`--review` のみ個別対話）。アップデート追従（`--changes`）も持つ
+- 実測の payoff: `claude mcp list` が `tako: … ✔ Connected` を返す
+
+採用したテロップ（S5a / S5b）は上記のうち **「不足を自分で教える」** と
+**「連携はコマンド 1 つ・以後どのプロジェクトでも設定不要」** の 2 点に絞った。
+
+### ④ master（オーケストレーション）
+
+確認した実機能（`crates/tako-control/src/orchestrator/` / AGENTS.md のコマンド表 /
+`tako orchestrator --help`）:
+
+- `tako master` … master system prompt 付きでエージェント CLI（claude 既定 / codex 可）を
+  現在のペインにインライン起動する
+- `tako orchestrator spawn` … worker を新しいペインへ spawn。**worker ごとに
+  `--agent`（claude / codex / agy）・`--model`・`--effort` を指定できる**
+  （プロファイル側の `worker_agent` / `worker_model` / `worker_model_policy` でも既定を振り分け可）
+- spawn レイアウトエンジン（#165）… `master-reserved` ポリシーで master の取り分を保ったまま
+  worker 領域を grid / spiral で自動配置する。close 時は worker 領域だけリフローする
+- 右パネルの orch ビュー（#217）… master + worker のツリーを俯瞰する
+- `tako orchestrator watch` / `workers` / `report` … 完了・エラー・許可待ち・突然死の検知と、
+  ペインが消えたあとも追える worker レジストリ
+
+採用したテロップ（S6a / S6b）は **「1 コマンドで worker が同じタブに並ぶ」** と
+**「進捗が 1 画面で分かる・worker ごとにモデル/エージェントを振り分けられる」** の 2 点。
 
 ## 収録パイプライン（Phase A で検証済み）
 
@@ -88,7 +135,7 @@ Phase B の方式（ウィンドウ単体キャプチャ）へ差し替えた。
 | スクリプト | 役割 |
 |---|---|
 | `scripts/promo/lib.sh` | 隔離インスタンス起動・デモ環境生成・収録・検証の共通処理 |
-| `scripts/promo/record-scenes.sh` | シーン別収録（`agent` / `preview` / `restore` / `outro` / `all`） |
+| `scripts/promo/record-scenes.sh` | シーン別収録（`agent` / `preview` / `setup` / `master` / `restore` / `outro` / `all`） |
 | `scripts/promo/winbounds.swift` | 収録対象ウィンドウ ID と矩形の取得 |
 | `scripts/promo/caption.swift` | テロップ PNG 生成（CoreText） |
 | `scripts/promo/make-bgm.py` | BGM 合成 |
@@ -107,9 +154,10 @@ Phase B の方式（ウィンドウ単体キャプチャ）へ差し替えた。
 - **ライセンス**: 生成物・生成コードとも tako 本体と同じ **GPL-3.0-or-later**。
   再配布・改変・商用利用いずれも可（tako のライセンス条件に従う限り）
 - **第三者権利**: 無し。クレジット表記の義務も無い
-- **内容**: 80 秒 / 100 BPM / A マイナー / コード進行 Am-F-C-G。キック・ハイハット・
-  ベース・アルペジオ・パッドを台本のシーン割りに合わせて出し入れし、S5（再起動シーン）で
-  いったん抜いて復帰させる。実測 mean -17.6 dB / max -1.9 dB、動画合成時は volume 0.85
+- **内容**: 90 秒 / 100 BPM / A マイナー / コード進行 Am-F-C-G。キック・ハイハット・
+  ベース・アルペジオ・パッドを台本のシーン割りに合わせて出し入れする。
+  v2 では構成変更に合わせて出し入れの位置も更新した（setup 節でいったん軽くし、
+  master 節で最も厚くし、アウトロで抜く）。動画合成時は volume 0.85
 
 外部音源を使わなかった理由: 再配布可能なライセンスの確認・クレジット表記・将来の差し替え
 リスクをすべて回避でき、かつ台本のシーン割りに合わせて構成を作り込めるため。
@@ -132,12 +180,63 @@ Phase B の方式（ウィンドウ単体キャプチャ）へ差し替えた。
 5. PNG を overlay するときは **`-loop 1 -framerate <fps>`** が要る。framerate を与えないと
    PTS が進まず `fade` が一切効かない。出力には必ず `-y` を付ける（付け忘れると
    前回の生成物が残り、修正が反映されていないように見える）
+6. **収録ウィンドウが他のウィンドウの背後に完全に隠れると GPUI が描画を止める**
+   （2026-07-24 に判明）。`screencapture -l<windowID>` は、そのウィンドウが今の Space に
+   居て `onscreen=true` でも、直前に描画されたサーフェスをそのまま返す。つまり
+   **同じ絵が延々と撮れ続けるのに気づけない**（v2 の setup シーンを実際に 2 回撮り直した）。
+   対策は 2 つとも実装済み:
+   - `promo_record_start` と収録ループ（20 フレームごと）が `winbounds --activate`
+     （`NSRunningApplication.activate`）で対象アプリを最前面に戻し続ける
+   - `promo_verify` が抽出フレームのハッシュ種類数を数え、「異なるフレームが 1/3 未満」なら
+     **失敗として止める**（動いていない素材を合成まで進ませない）
 
-### 進捗と残作業（2026-07-23 時点）
+## v2 での変更（2026-07-24）
 
-- 完了: パイプライン一式、BGM（80 秒）、S4（プレビュー）素材、編集合成の通し確認
-- **未収録: S1/S2/S3（agent）・S5（restore）・S6（remote）・S7（outro）**
-  → 収録中にユーザーが離席し画面ロックがかかったため中断。ロック解除後に
-  `scripts/promo/record-scenes.sh all` で再開できる
-- 収録が全部揃ったら `scripts/promo/build-video.sh` で
-  `~/Desktop/tako-promo/tako-intro-v1.mp4` が完成する
+v1（58 秒。`~/Desktop/tako-promo/tako-intro-v1.mp4`）に対するユーザー指摘 2 点と
+追加指示 2 点を反映したのが v2（`~/Desktop/tako-promo/tako-intro-v2.mp4`）。
+
+### 1. テロップに背景パネルを付けた（可読性）
+
+v1 は白文字 + 影だけで、背景の UI（README プレビューの箇条書き・claude の ctx バー・
+ログ）と重なった箇所が読めなかった。`caption.swift` を書き直し、
+**テキストの外接矩形に合わせた角丸の半透明パネル**を敷く方式にした。
+
+- 塗り: `#0a0d12` 相当（tako のダーク背景寄り）を **不透明度 0.84**
+- 角丸半径 = フォント px × 0.28、左右パディング = 0.62、上下 = 0.34
+- パネル自体にドロップシャドウ（明るい背景でも縁が溶けない）+ 白 14% の 1.5px 縁
+- パネル幅はテキスト幅に追従（全幅の帯にはしない）。キャンバスは動画幅のまま透過なので
+  `overlay=0:H-h-90` の合成位置は v1 から変更なし。フェードもキャンバス全体の alpha で効く
+
+### 2. setup 節と master 節を新設（本編 4 本柱）
+
+上記「シーン表（v2）」「2 本柱の訴求内容」を参照。収録シーンを 2 つ追加した。
+
+- `record-scenes.sh setup` … デモ用 HOME（`/private/tmp/tako-demo/home`）と
+  デモ用 PATH（`/private/tmp/tako-demo/bin` に必要なコマンドの symlink だけ）へ
+  差し替えて隔離インスタンスを起動する（`promo_make_demo_home`）。
+  これをやらないと `tako setup --check` が `/Users/<ユーザー名>/...` を画面に出す
+- `record-scenes.sh master` … `tako master` で実 Claude Code の master を立て、
+  master 自身に `tako_orchestrator_spawn` で worker を並べさせる。
+  worker が出そろい、かつ**全ペインのテキストから PII が消えた**ことを
+  `promo_wait_pii_clear` で機械確認してから収録を開始する
+  （claude の起動バナーにはアカウントのメールアドレスが出るため）
+
+### 3. 本編の順序を固定した
+
+**画面操作 → プレビュー → setup → master**（ユーザー指示）。
+restore（再起動復元）と remote（スマホ）は 4 本柱から外れるため本編から外した。
+restore 素材は残してあるので、尺を伸ばす判断が出れば master とアウトロの間に挟める。
+
+## 実行手順（v2 を作り直すとき）
+
+```sh
+scripts/build-app.sh                  # dist/tako.app（/Applications には触れない）
+export TAKO_PROMO_APP=$PWD/dist/tako.app/Contents/MacOS/tako-app
+export TAKO_PROMO_CLI=$PWD/dist/tako.app/Contents/MacOS/tako
+scripts/promo/record-scenes.sh all    # agent → preview → setup → master → outro
+scripts/promo/make-bgm.py
+scripts/promo/build-video.sh ~/Desktop/tako-promo/tako-intro-v2.mp4
+```
+
+収録後は `/private/tmp/tako-promo-frames/<シーン>/` の抽出フレームを**全数目視**して
+PII が無いことを確認する（`promo_verify` が自動抽出する）。

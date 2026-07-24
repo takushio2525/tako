@@ -5,12 +5,21 @@
 // **ウィンドウ単体**をキャプチャする。画面全体を撮って切り出す方式（avfoundation +
 // crop / screencapture -R）は、収録中に別アプリのウィンドウが対象領域へ重なると
 // その内容ごと写り込む事故を起こすため採用しない（2026-07-23 に実際に発生）。
+//
+// 第 2 引数に --activate を渡すと、対象アプリを最前面へ出してから座標を返す。
+// GPUI のウィンドウは他のウィンドウに完全に隠れると描画を止めるため、
+// 隠れたまま撮ると同じ絵が延々と撮れてしまう（#470 v2 で実際に発生）。
+import AppKit
 import CoreGraphics
 import Foundation
 
 guard CommandLine.arguments.count > 1, let pid = Int32(CommandLine.arguments[1]) else {
-    FileHandle.standardError.write("usage: winbounds <pid>\n".data(using: .utf8)!)
+    FileHandle.standardError.write("usage: winbounds <pid> [--activate]\n".data(using: .utf8)!)
     exit(2)
+}
+if CommandLine.arguments.contains("--activate") {
+    NSRunningApplication(processIdentifier: pid)?.activate(options: [.activateAllWindows])
+    Thread.sleep(forTimeInterval: 0.15)
 }
 // optionOnScreenOnly は「今表示中の Space にあるウィンドウ」しか返さないため、
 // ユーザーが別の Space に切り替えていると収録対象を見失う。全ウィンドウから

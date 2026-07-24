@@ -26,6 +26,8 @@ PROMO_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 継承 TAKO_* を env -u で落とすための引数列
 PROMO_ENV_CLEAN=()
+# シーン固有の追加環境変数（"KEY=VALUE" 形式。promo_start_isolated が展開する）
+PROMO_EXTRA_ENV=()
 while IFS='=' read -r k _; do
     case "$k" in TAKO_*) PROMO_ENV_CLEAN+=(-u "$k") ;; esac
 done < <(env)
@@ -250,14 +252,70 @@ WRK
     chmod +x "$PROMO_DEMO/awesome-app/scripts/worker.sh"
 }
 
+# setup シーン用のデモ HOME とデモ PATH（#470 v2）。
+# `tako setup` 系は $HOME 配下（~/.claude.json 等）を書き換え、実行パスを画面に出す。
+# 実 HOME のまま撮ると「/Users/<ユーザー名>/...」がフレームに残るため、
+#   - HOME  … /private/tmp/tako-demo/home（使い捨て。実設定に触れない）
+#   - PATH  … /private/tmp/tako-demo/bin（必要なコマンドの symlink だけ）
+# に差し替えて撮る。画面に出るパスはすべて /private/tmp 配下になる。
+promo_make_demo_home() {
+    rm -rf "$PROMO_DEMO/home" "$PROMO_DEMO/bin"
+    mkdir -p "$PROMO_DEMO/home" "$PROMO_DEMO/bin"
+    # tako は収録に使う実体（バンドル内バイナリ）へリンクする
+    ln -sf "$PROMO_CLI" "$PROMO_DEMO/bin/tako"
+    local b p
+    for b in claude codex agy node tmux git tailscale; do
+        p=$(command -v "$b" 2>/dev/null) && ln -sf "$p" "$PROMO_DEMO/bin/$b"
+    done
+}
+
+# 画面に出るテキストへ個人情報（メールアドレス・実ホームパス）が残っていないかを
+# ペインのテキストとして検査する。画像の目視より確実な一次防衛線。
+# $1 = ペイン ID。見つかったら 1 を返す
+promo_pane_has_pii() {
+    local pane=$1 text
+    text=$(tko read --pane "$pane" 2>/dev/null || true)
+    if printf '%s' "$text" | grep -Eq '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'; then
+        echo "   PII 検出（メールアドレス）: pane $pane" >&2
+        return 0
+    fi
+    if printf '%s' "$text" | grep -q "$HOME"; then
+        echo "   PII 検出（実ホームパス）: pane $pane" >&2
+        return 0
+    fi
+    return 1
+}
+
+# 対象ペイン群から PII が消えるまで待つ（エージェントの起動バナーは会話が進むと流れる）。
+# $1 = 最大待ち秒数、$2.. = ペイン ID。時間内に消えなければ 1（呼び出し側で収録を止める）
+promo_wait_pii_clear() {
+    local limit=$1; shift
+    local waited=0 pane dirty
+    while :; do
+        dirty=0
+        for pane in "$@"; do
+            promo_pane_has_pii "$pane" && dirty=1
+        done
+        [ "$dirty" -eq 0 ] && return 0
+        [ "$waited" -ge "$limit" ] && {
+            echo "ERROR: ${limit}s 待っても画面から PII が消えない。収録を中止します" >&2
+            return 1
+        }
+        sleep 5
+        waited=$((waited + 5))
+    done
+}
+
 # ── 隔離インスタンス ───────────────────────────────────────────────
 # $1 = 作業ディレクトリ, $2 = tmux ソケット名, $3 = persist（1 で永続化 ON）
+# 追加の環境変数は PROMO_EXTRA_ENV 配列（"KEY=VALUE" 形式）で渡す
 promo_start_isolated() {
     local work=$1 socket=$2 persist=${3:-0}
     mkdir -p "$work/discovery" "$work/data"
     (
         cd "$PROMO_DEMO/awesome-app"
         env "${PROMO_ENV_CLEAN[@]}" \
+            ${PROMO_EXTRA_ENV[@]+"${PROMO_EXTRA_ENV[@]}"} \
             TAKO_ISOLATED=1 \
             TAKO_PERSIST="$persist" \
             TAKO_TMUX_SOCKET="$socket" \
@@ -322,6 +380,8 @@ promo_base_pane() {
 # $1 = 出力 mp4, $2 = 尺（秒）。収録は background で走り promo_record_wait で待つ。
 promo_record_start() {
     local out=$1 dur=$2
+    # GPUI のウィンドウは完全に隠れると描画を止める。撮る直前に最前面へ出す
+    "$PROMO_WINBOUNDS" "$PROMO_APP_PID" --activate >/dev/null 2>&1 || true
     # 実際にキャプチャできるウィンドウが現れるまで待ってから収録に入る
     promo_wait_window || return 1
     local wid=$PROMO_WID
@@ -340,6 +400,11 @@ promo_record_start() {
             i=$((i + 1))
             local f
             f=$(printf '%s/f%05d.png' "$PROMO_REC_DIR" "$i")
+            # 対象ウィンドウが他のウィンドウの背後に回ると GPUI が描画を止め、
+            # 同じ絵が撮れ続ける。定期的に最前面へ戻して描画を維持する（#470 v2）
+            if [ $((i % 20)) -eq 1 ]; then
+                "$PROMO_WINBOUNDS" "$PROMO_APP_PID" --activate >/dev/null 2>&1 || true
+            fi
             if screencapture -x -o -l"$wid" "$f" 2>/dev/null && [ -s "$f" ]; then
                 last=$f; miss=0
             else
@@ -389,7 +454,20 @@ promo_verify() {
         -of default=nw=1 "$clip"
     rm -rf "$fdir"; mkdir -p "$fdir"
     ffmpeg -v error -i "$clip" -vf "fps=$fps" "$fdir/frame-%03d.png"
-    echo "-- フレーム: $(ls "$fdir" | wc -l | tr -d ' ') 枚 → $fdir"
+    local total distinct
+    total=$(ls "$fdir" | wc -l | tr -d ' ')
+    echo "-- フレーム: ${total} 枚 → $fdir"
+    # 「動いていない素材」の検出（#470 v2）。ウィンドウが他のウィンドウに完全に隠れて
+    # いる等の理由で描画が止まると、同じ絵が延々と撮れて気づかないまま合成まで進む。
+    # 抽出フレームのハッシュ種類数で機械的に弾く
+    distinct=$(md5 -q "$fdir"/frame-*.png 2>/dev/null | sort -u | wc -l | tr -d ' ')
+    echo "-- 異なるフレーム: ${distinct}/${total}"
+    if [ "${total:-0}" -gt 3 ] && [ "$((distinct * 3))" -lt "$total" ]; then
+        echo "!! 警告: 素材がほとんど動いていない（${distinct}/${total}）。" >&2
+        echo "!! 収録ウィンドウが他のウィンドウに隠れて描画が止まっていた可能性が高い。" >&2
+        echo "!! 収録対象ウィンドウを最前面にしてから撮り直すこと。" >&2
+        return 1
+    fi
     # 全黒フレーム（TCC 権限喪失）の自動検出
     local dark
     dark=$( { ffmpeg -v error -i "$clip" -vf "blackdetect=d=0.5:pic_th=0.98" -f null - 2>&1 || true; } \

@@ -3,12 +3,17 @@
 #
 # 使い方:
 #   scripts/promo/record-scenes.sh <scene>
-#     scene = agent | preview | restore | outro | all
+#     scene = agent | preview | setup | master | restore | outro | all
 #
-#   agent   … S1/S2/S3 素材（実 Claude Code + master + worker spawn を通しで収録）
-#   preview … S4 素材（Markdown ライブリロード + Code Runner）
-#   restore … S5 素材（再起動して全ペインが復元される）
-#   outro   … S7 素材（テーマ切替 + パレット）
+#   agent   … S1/S2 素材（実 Claude Code がペインを割って dev サーバー・プレビューを開く）
+#   preview … S3 素材（Markdown ライブリロード + Code Runner）
+#   setup   … S4 素材（tako setup --check / setup-mcp / claude mcp list の導入体験）
+#   master  … S5 素材（tako master → worker が同じタブに並ぶオーケストレーション）
+#   restore … 補足素材（再起動して全ペインが復元される）
+#   outro   … S6 素材（テーマ切替 + パレット）
+#
+# 台本上の並び（.agent/plans/2026-07-promo-video.md）は
+#   画面操作 → プレビュー → setup → master → クロージング
 #
 # 出力: ~/Desktop/tako-promo/scenes/<scene>-raw.mp4（編集前の素材。尺は台本より長め）
 #       ~/Desktop/tako-promo/frames/<scene>/ にフレーム抽出（PII 全数チェック用）
@@ -107,6 +112,136 @@ scene_agent() {
     promo_verify "$raw" "$PROMO_FRAMES/agent" 1
 }
 
+# ── S3: setup（設定ゼロ導入）────────────────────────────────────────
+# 撮る事実（すべて実挙動。誇張しない）:
+#   1. tako setup --check … 足りない設定を tako 自身が列挙する
+#   2. tako setup-mcp     … Claude Code のユーザー設定へ tako MCP を 1 コマンド登録
+#                           （内部で claude mcp add --scope user）→ 以後どのプロジェクトでも有効
+#   3. claude mcp list    … Claude Code 側から tako が Connected として見える
+# HOME / PATH はデモ用（lib.sh の promo_make_demo_home）に差し替えて撮るので、
+# 画面に出るパスは /private/tmp 配下だけになる
+scene_setup() {
+    local work=/private/tmp/tako-promo-setup socket=tako-promo-setup
+    local raw="$PROMO_OUT/scenes/setup-raw.mp4"
+    echo "== scene setup"
+    promo_wait_capturable "${TAKO_PROMO_WAIT_UNLOCK:-0}" || promo_check_capturable
+    rm -rf "$work"
+    promo_make_demo_env
+    promo_make_demo_home
+    PROMO_EXTRA_ENV=(
+        "HOME=$PROMO_DEMO/home"
+        "PATH=$PROMO_DEMO/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    )
+    promo_start_isolated "$work" "$socket"
+    trap 'promo_stop_isolated '"$socket" EXIT
+
+    local base; base=$(promo_base_pane)
+    tko send --pane "$base" "cd $PROMO_DEMO/awesome-app && clear" >/dev/null
+    tko tab rename --tab 1 setup >/dev/null 2>&1 || true
+    sleep 1.5
+
+    promo_record_start "$raw" 40
+
+    # beat 1: 何が足りないかを tako 自身が診断する
+    tko send --pane "$base" "tako setup --check" >/dev/null
+    sleep 11
+    # beat 2: Claude Code への MCP 登録はコマンド 1 つ（user スコープ = 全プロジェクト有効）
+    tko send --pane "$base" "clear && tako setup-mcp" >/dev/null
+    sleep 7
+    # beat 3: Claude Code 側から tako が見えていることを確認する
+    tko send --pane "$base" "claude mcp list" >/dev/null
+    sleep 14
+
+    promo_record_wait
+    promo_stop_isolated "$socket"; trap - EXIT
+    PROMO_EXTRA_ENV=()
+    promo_verify "$raw" "$PROMO_FRAMES/setup" 1
+}
+
+# ── S4: master オーケストレーション ─────────────────────────────────
+# 撮る事実（すべて実挙動）:
+#   - tako master で master（実 Claude Code + master system prompt）が現ペインに立つ
+#   - master が tako_orchestrator_spawn で worker を spawn すると、
+#     レイアウトエンジン（#165 master-reserved）が master の取り分を保ったまま
+#     worker 領域をグリッド分割し、同じタブに worker ペインが並ぶ
+#   - 右パネルの orch ビューで master + worker ツリーを俯瞰できる
+# claude の起動バナーにはアカウントのメールアドレスが出るため、
+# 会話が進んでバナーが流れきった（promo_wait_pii_clear が通った）あとに収録を始める
+scene_master() {
+    local work=/private/tmp/tako-promo-master socket=tako-promo-mast
+    local raw="$PROMO_OUT/scenes/master-raw.mp4"
+    echo "== scene master"
+    promo_wait_capturable "${TAKO_PROMO_WAIT_UNLOCK:-0}" || promo_check_capturable
+    rm -rf "$work"
+    promo_make_demo_env
+    promo_start_isolated "$work" "$socket"
+    trap 'promo_stop_isolated '"$socket" EXIT
+
+    local base; base=$(promo_base_pane)
+    # master が spawn 先に使うプロジェクトを登録しておく（隔離 data_dir 配下の projects.yaml）
+    tko orchestrator projects add --key awesome-app \
+        --cwd "$PROMO_DEMO/awesome-app" --description "デモ用プロジェクト" >/dev/null 2>&1 || true
+    # 収録用に worker は軽いモデルで回す（実運用でも profile で振り分けられる項目）
+    tko orchestrator profiles set default --worker-model haiku \
+        --worker-model-policy fixed >/dev/null 2>&1 || true
+
+    tko send --pane "$base" "cd $PROMO_DEMO/awesome-app && clear" >/dev/null
+    tko tab rename --tab 1 orchestration >/dev/null 2>&1 || true
+    sleep 1
+
+    echo "   master を起動して待機..."
+    tko send --pane "$base" "tako master" >/dev/null
+    sleep 30
+    tko panel --show --view orch >/dev/null 2>&1 || true
+
+    # master に worker 3 体の spawn を依頼する
+    tko send --pane "$base" --await-prompt \
+        "worker を 3 体 spawn して。project は awesome-app。それぞれ 'api' / 'ui' / 'docs' を担当し、\
+プロンプトは「bash scripts/worker.sh <担当名> を実行して、出力の最終行を報告して」でよい。\
+確認は不要、すぐ spawn して。" >/dev/null 2>&1 || true
+
+    # worker ペインが出そろうまで待つ（最大 240s）
+    local i n=0
+    for i in $(seq 1 48); do
+        n=$(tko list 2>/dev/null | /usr/bin/python3 -c \
+            'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(0); raise SystemExit
+print(sum(len(t["panes"]) for t in d["tabs"]))' 2>/dev/null || echo 0)
+        [ "${n:-0}" -ge 4 ] && break
+        sleep 5
+    done
+    echo "   ペイン数: $n"
+    if [ "${n:-0}" -lt 3 ]; then
+        echo "!! master が worker を並べなかった（ペイン $n）。収録を中止します" >&2
+        promo_stop_isolated "$socket"; trap - EXIT
+        return 1
+    fi
+    sleep 10
+
+    # 収録前に全ペインのテキストから PII（起動バナーのメールアドレス）が
+    # 消えていることを確かめる。消えないまま撮らない
+    local panes
+    panes=$(tko list | /usr/bin/python3 -c \
+        'import json,sys; print(" ".join(str(p["id"]) for t in json.load(sys.stdin)["tabs"] for p in t["panes"]))')
+    # shellcheck disable=SC2086
+    promo_wait_pii_clear 120 $panes || {
+        promo_stop_isolated "$socket"; trap - EXIT; return 1; }
+
+    promo_record_start "$raw" 50
+    sleep 6
+    tko equalize >/dev/null 2>&1 || true
+    sleep 14
+    # 収録中に 4 体目を追加して「master が worker を並べる」ところを画に入れる
+    tko send --pane "$base" --await-prompt \
+        "同じ要領で 'tests' 担当の worker をもう 1 体追加して。" >/dev/null 2>&1 || true
+    sleep 26
+
+    promo_record_wait
+    promo_stop_isolated "$socket"; trap - EXIT
+    promo_verify "$raw" "$PROMO_FRAMES/master" 1
+}
+
 # ── S5: 再起動して全ペインが復元される ─────────────────────────────
 scene_restore() {
     local work=/private/tmp/tako-promo-restore socket=tako-promo-rest
@@ -185,9 +320,11 @@ scene_outro() {
 case "$SCENE" in
     preview) scene_preview ;;
     agent)   scene_agent ;;
+    setup)   scene_setup ;;
+    master)  scene_master ;;
     restore) scene_restore ;;
     outro)   scene_outro ;;
-    all)     scene_preview; scene_agent; scene_restore; scene_outro ;;
+    all)     scene_agent; scene_preview; scene_setup; scene_master; scene_outro ;;
     *) echo "unknown scene: $SCENE" >&2; exit 2 ;;
 esac
 echo "== done: $SCENE"
