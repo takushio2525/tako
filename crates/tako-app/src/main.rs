@@ -12,10 +12,6 @@
 //! スクロールバック・コピペの経路に加え、Phase 2 の制御プレーン（環境変数注入・
 //! IPC・`tako` CLI の e2e）と Phase 3 の内蔵 MCP サーバー（Streamable HTTP +
 //! stdio ブリッジ）、Phase 3.5 の IME 変換状態（marked text）を機械検証して終了する。
-// テスト関数がクレート全体で多く、既定の recursion limit(128) では
-// #[test] のマクロ展開が限界に達する（#486 で設定画面のテストを足した際に顕在化）
-#![recursion_limit = "256"]
-
 
 mod about_window;
 mod autorename;

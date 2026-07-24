@@ -716,11 +716,15 @@ pub fn advanced_saved() -> &'static str {
 }
 
 #[cfg(test)]
+// 注意: このクレートは #[test] の展開がコンパイラの recursion limit ぎりぎりで、
+// テストを 1 本増やす / 1 本に詰め込むだけで `recursion limit reached while
+// expanding #[test]` になる（limit を上げると今度は rustc がスタックオーバーフロー
+// する。#486 で実測）。カタログの検証は 2 本に分けてこの範囲へ収めている
 mod tests {
     use super::*;
 
     #[test]
-    fn 日英併記かつ絵文字なし_common() {
+    fn 日英併記かつ絵文字なし_前半() {
         crate::ui_text::tests_support::check_ja_en(|| {
             vec![
                 window_title().into(),
@@ -750,14 +754,6 @@ mod tests {
                 msg_preset_saved().into(),
                 msg_preset_name_required().into(),
                 msg_no_presets().into(),
-            ]
-        });
-    }
-
-    #[test]
-    fn 日英併記かつ絵文字なし_general() {
-        crate::ui_text::tests_support::check_ja_en(|| {
-            vec![
                 label_language().into(),
                 desc_language().into(),
                 lang_system().into(),
@@ -789,14 +785,6 @@ mod tests {
                 desc_pane_log_max().into(),
                 label_pane_log_total().into(),
                 desc_pane_log_total().into(),
-            ]
-        });
-    }
-
-    #[test]
-    fn 日英併記かつ絵文字なし_appearance() {
-        crate::ui_text::tests_support::check_ja_en(|| {
-            vec![
                 label_theme().into(),
                 desc_theme().into(),
                 theme_dark().into(),
@@ -814,15 +802,15 @@ mod tests {
                 category_text().into(),
                 category_accent().into(),
                 category_chrome().into(),
+                runner_header().into(),
             ]
         });
     }
 
     #[test]
-    fn 日英併記かつ絵文字なし_runner() {
+    fn 日英併記かつ絵文字なし_後半() {
         crate::ui_text::tests_support::check_ja_en(|| {
             vec![
-                runner_header().into(),
                 runner_edit_help().into(),
                 runner_col_ext().into(),
                 runner_col_command().into(),
@@ -839,14 +827,6 @@ mod tests {
                 runner_var_filebase().into(),
                 runner_var_filenoext().into(),
                 runner_var_ext().into(),
-            ]
-        });
-    }
-
-    #[test]
-    fn 日英併記かつ絵文字なし_setup_sleep() {
-        crate::ui_text::tests_support::check_ja_en(|| {
-            vec![
                 setup_agents_header().into(),
                 setup_installed().into(),
                 setup_not_installed().into(),
@@ -882,14 +862,6 @@ mod tests {
                 sleep_lid_remove().into(),
                 msg_lid_installed().into(),
                 msg_lid_removed().into(),
-            ]
-        });
-    }
-
-    #[test]
-    fn 日英併記かつ絵文字なし_remote_advanced() {
-        crate::ui_text::tests_support::check_ja_en(|| {
-            vec![
                 remote_daemon_header().into(),
                 remote_status_label().into(),
                 remote_status_running().into(),
