@@ -998,7 +998,7 @@ struct TakoApp {
     /// window new 等。GPUI の Context が要るため render / defer で消費する）
     pending_viewport_opens: Vec<tako_core::WindowId>,
     /// 設定画面ウィンドウのハンドル（単一インスタンス。Issue #459）
-    settings_window_handle: Option<gpui::AnyWindowHandle>,
+    settings_window_handle: Option<gpui::WindowHandle<settings_window::SettingsWindow>>,
     /// dispatch から設定画面を開くための pending キュー（Issue #459）
     pending_settings_open: Option<Option<settings_window::SettingsTab>>,
     /// About ウィンドウのハンドル（単一インスタンス。Issue #485）
@@ -5960,9 +5960,13 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) {
         if let Some(handle) = self.settings_window_handle {
+            // 既に開いているなら前面化し、タブ指定があればそこへ切り替える（設計 §3.3）
             cx.defer(move |cx| {
-                let _ = handle.update(cx, |_, window, _cx| {
+                let _ = handle.update(cx, |view, window, cx| {
                     window.activate_window();
+                    if let Some(tab) = tab {
+                        view.set_tab(tab, cx);
+                    }
                 });
             });
             return;
@@ -5975,9 +5979,16 @@ impl TakoApp {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                         None,
-                        size(px(760.), px(560.)),
+                        size(px(760.), px(600.)),
                         cx,
                     ))),
+                    // 設計 §3.2: 標準タイトルバー + タイトル表示（メインの透過タイトルバーとは別）
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some(crate::ui_text::settings::window_title().into()),
+                        appears_transparent: false,
+                        traffic_light_position: None,
+                    }),
+                    window_min_size: Some(size(px(620.), px(420.))),
                     ..Default::default()
                 },
                 |_window, cx| {
@@ -5985,10 +5996,9 @@ impl TakoApp {
                 },
             );
             if let Ok(handle) = result {
-                let any_handle: AnyWindowHandle = handle.into();
                 if let Some(app) = weak.upgrade() {
                     app.update(cx, |app, _cx| {
-                        app.settings_window_handle = Some(any_handle);
+                        app.settings_window_handle = Some(handle);
                     });
                 }
                 let weak3 = weak.clone();
