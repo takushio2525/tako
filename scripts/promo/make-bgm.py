@@ -28,7 +28,7 @@ SR = 44100
 BPM = 100.0
 BEAT = 60.0 / BPM  # 0.6s
 BAR = BEAT * 4  # 2.4s
-TOTAL = 80.0  # 秒。72 秒の本編 + 前後の余白
+TOTAL = 90.0  # 秒。84 秒の本編（v2 構成）+ 前後の余白
 
 # A マイナー。数値は A4=440 を基準にした周波数
 NOTE = {
@@ -166,8 +166,8 @@ def build() -> Track:
             break
         root, pad_notes, arp_notes = PROGRESSION[(b // 2) % len(PROGRESSION)]
 
-        # セクションごとの音量（台本のシーン割りに対応）
-        # S1 導入 → S2/S3 で厚く → S5 の再起動でブレイク → S7 でフェード
+        # セクションごとの音量（台本 v2 のシーン割りに対応）
+        # 導入 → 画面操作で厚く → setup でいったん軽く → master で最も厚く → アウトロで抜く
         pad_g, arp_g, bass_g, drum_g = 0.30, 0.0, 0.0, 0.0
         if t0 >= 5.0:
             arp_g = 0.16
@@ -175,11 +175,13 @@ def build() -> Track:
             drum_g, bass_g = 0.55, 0.30
         if t0 >= 17.0:
             arp_g, pad_g = 0.20, 0.34
-        if 45.0 <= t0 < 50.0:  # S5: 再起動に合わせて抜く
-            drum_g, bass_g, arp_g = 0.0, 0.0, 0.07
-        if t0 >= 50.0:
-            drum_g, bass_g, arp_g = 0.55, 0.30, 0.20
-        if t0 >= 68.0:  # アウトロ
+        if 36.0 <= t0 < 44.0:  # setup: 説明を聞かせるため軽くする
+            drum_g, bass_g, arp_g = 0.30, 0.20, 0.12
+        if t0 >= 44.0:
+            drum_g, bass_g, arp_g = 0.50, 0.28, 0.18
+        if t0 >= 53.0:  # master: 一番厚くする
+            drum_g, bass_g, arp_g, pad_g = 0.60, 0.32, 0.22, 0.36
+        if t0 >= 76.0:  # アウトロ
             drum_g, bass_g = 0.0, 0.16
             arp_g = 0.10
 

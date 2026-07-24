@@ -4,25 +4,25 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-22・#466 リモートチャット凍結の根治 → 実機確認待ち）
+## 現在の対象（2026-07-24・#470 紹介動画 v2 → ユーザー確認待ち）
 
-**#466 リモート: チャットビュー凍結を根治（fix/466-remote-chat-view-stale）**
+**#470 紹介動画 v2（docs/470-promo-video-v2）**
 
-- 根因はフロントの切替ではなくサーバー側: `claude agents --json` の一時失敗・列挙漏れで
-  live 解決が消えると、v2 panes の session_id が sessions カタログの stale 旧世代
-  （同一 pane に 20 世代超堆積 + BTreeMap 辞書順先勝ち）へ化け、チャットが凍結
-  transcript を読み続けていた（term は画面キャプチャなので正常 = 報告症状と一致）
-- 修正: ① agents.rs に sticky live 解決（失敗・欠落時は直近成功値、ペイン消滅で破棄）
-  ② sessions.rs`resolve_session_for_pane` を last_seen_at 最新優先に
-- 隔離実測: 実 claude 2 世代 + fail 注入で before（アルファ凍結 + トグル消滅）/
-  after（fail 中も現行会話が更新継続、切替 5 ラウンド全緑）を確認
+- テロップに半透明の暗色パネル（不透明度 0.84・角丸・テキスト幅追従）を敷いて可読性を確保
+- 本編を 4 本柱に再構成: 画面操作 → プレビュー → **setup** → **master**
+  （restore / remote は本編から外した。素材は残してある）
+- setup 節（新規収録）= `tako setup --check` → `tako setup-mcp` → `claude mcp list` で
+  `tako … ✔ Connected`。デモ HOME / デモ PATH で撮り、画面のパスは /private/tmp 配下だけ
+- master 節（新規収録）= 実 `tako master` が worker 3→4 体を spawn し、同じタブに
+  グリッド配置 + 右パネル orch ビュー
+- 完成品: `~/Desktop/tako-promo/tako-intro-v2.mp4`（84s / 1920x1200 / BGM 付き）
 
 ## 次の一手
 
-- PR squash merge → `build-app.sh --install` → 実機 iPhone でチャット⇔ターミナル切替の
-  継続更新を確認（ユーザー）
-- #287 P1-2 UDS 化の実機確認も継続
+- ユーザーが v2 を視聴して構成・テロップ文言・尺を確認（OK なら #470 クローズ判断）
+- 収録の落とし穴（隠れたウィンドウで描画が止まる）は `promo_verify` の
+  「異なるフレーム数」チェックで自動検出するようにした
 
 ## 現フェーズで Read すべき設計書
 
-- リモート系: `crates/tako-control/src/remote.rs` ヘッダコメント（二層認証・API 一覧）
+- 紹介動画: `.agent/plans/2026-07-promo-video.md`（シーン表・訴求文言・収録の技術制約）

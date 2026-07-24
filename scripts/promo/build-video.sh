@@ -5,7 +5,7 @@
 # 台本どおりの区間を切り出し、テロップを載せ、クロスフェードで繋ぎ、BGM を合成する。
 #
 # 使い方: scripts/promo/build-video.sh [出力パス]
-#   既定の出力先は ~/Desktop/tako-promo/tako-intro-v1.mp4
+#   既定の出力先は ~/Desktop/tako-promo/tako-intro-v2.mp4
 #
 # 素材が足りないシーンは警告して飛ばすので、途中まででも通しで確認できる。
 # テロップは caption.swift（CoreText）で PNG 化して overlay する
@@ -16,7 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-OUT=${1:-"$PROMO_OUT/tako-intro-v1.mp4"}
+OUT=${1:-"$PROMO_OUT/tako-intro-v2.mp4"}
 SCENES_DIR="$PROMO_OUT/scenes"
 WORK=/private/tmp/tako-promo-build
 BGM="$PROMO_OUT/audio/bgm.wav"
@@ -39,13 +39,14 @@ fi
 # 注意: agent-raw の 0〜31 秒には Claude Code の起動バナーが写っており、
 # そこにアカウントのメールアドレスが含まれる。**32 秒以降だけを使う**こと
 SCENES=(
-  "s1|agent-raw.mp4|46|6|エージェントも、その子プロセスも、1 つのタブに|"
-  "s2|agent-raw.mp4|32|13|日本語で頼むと、AI がペインを割って動かす|設定ゼロの内蔵 MCP サーバー"
-  "s3|agent-raw.mp4|62|11|起動したサーバーも、開いた資料も、同じ画面に|1 グループ = 1 タブ"
-  "s4|preview-raw.mp4|3|13|成果物はターミナルの中で確認する|ライブリロードと Code Runner"
-  "s5a|restore-before-raw.mp4|1|4|再起動しても、レイアウトごと戻ってくる|"
-  "s5b|restore-after-raw.mp4|3|6||タブもペインもそのまま復元"
-  "s6|remote-raw.mp4|2|10|外出先はスマホから見て、答える|"
+  "s1|agent-raw.mp4|46|5|エージェントも、その子プロセスも、1 つのタブに|"
+  "s2|agent-raw.mp4|32|12|日本語で頼むと、AI がペインを割って動かす|設定ゼロの内蔵 MCP サーバー"
+  "s3|agent-raw.mp4|62|9|起動したサーバーも、開いた資料も、同じ画面に|1 グループ = 1 タブ"
+  "s4|preview-raw.mp4|3|12|成果物はターミナルの中で確認する|ライブリロードと Code Runner"
+  "s5a|setup-raw.mp4|4|9|足りない設定は、tako が自分で教えてくれる|tako setup --check"
+  "s5b|setup-raw.mp4|24|9|Claude Code 連携は、コマンド 1 つ|一度登録すれば、どのプロジェクトでも設定不要"
+  "s6a|master-raw.mp4|6|12|master が worker を spawn し、同じタブに並べる|tako master"
+  "s6b|master-raw.mp4|38|12|全員の進捗が 1 画面で分かる|worker ごとにモデルもエージェントも振り分けられる"
   "s7|outro-raw.mp4|4|8|tako|AI エージェント時代の GUI ターミナル / github.com/takushio2525/tako"
 )
 
