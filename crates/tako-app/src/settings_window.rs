@@ -1116,8 +1116,22 @@ impl SettingsWindow {
         }
 
         let is_editing = editing.is_some();
+        // 編集中フィールドの矩形を記録する（IME 候補ウィンドウの位置出し用）。
+        // 何も描かない canvas の prepaint で bounds を拾う
+        let bounds_probe = is_editing.then(|| {
+            let entity = cx.entity();
+            canvas(
+                move |bounds, _window, cx| {
+                    entity.update(cx, |this: &mut Self, _| this.edit_bounds = Some(bounds));
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full()
+        });
         div()
             .id(SharedString::from(format!("field-{id}")))
+            .children(bounds_probe)
             .map(|d| match width {
                 Some(w) => d.w(w).flex_none(),
                 None => d.flex_1().min_w(px(0.)),
