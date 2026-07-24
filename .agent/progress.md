@@ -1145,3 +1145,14 @@
   止め、同じ絵が撮れ続ける。定期 activate + 「異なるフレーム数」チェックで自動検出するようにした
 - 完成品 `~/Desktop/tako-promo/tako-intro-v2.mp4`（84s / 1920x1200 / BGM）。全 168 フレームを
   Vision OCR にかけ PII ゼロを確認
+
+## 2026-07-24（#470 紹介動画 v3: setup 節を対話セットアップの訴求へ + master にプロジェクト文脈）
+- setup 節を「コマンド紹介」から「対話セットアップエージェントと会話して設定が決まる」へ作り直し、
+  実 claude の対話を新規収録。master 節の直後に S6c（ホーム起動 master が projects.yaml から
+  対象プロジェクトを解決し、その cwd で worker を立てる）を追加。訴求は setup.rs /
+  system-prompt.md / default_system_prompt.md Step 0 / dispatch.rs で裏取りした範囲だけ
+- 収録知見 3 件を台本へ追記: デモ HOME だとログインキーチェーンが検索リストから外れて
+  claude が認証できない / `tko` に TAKO_DATA_DIR を渡さないと本番設定を書き換える /
+  `--await-prompt` は生成中のエージェントを中断させることがある
+- 完成品 `~/Desktop/tako-promo/tako-intro-v3.mp4`（106s / 1920x1200 / BGM）。全 106 フレームを
+  Vision OCR にかけ PII ゼロ
