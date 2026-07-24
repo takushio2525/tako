@@ -3,6 +3,20 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.11] - 2026-07-25
+
+Nightly patch release (automated). Changes since v0.5.10:
+夜間パッチリリース（自動）。v0.5.10 以降の変更:
+
+- [修正] mp4 プレビューのシークバー処理を修正 (#484) (#493)
+- [ドキュメント] progress に #487 の作業記録を追記
+- [修正/機能追加] git タブ総点検 + ファイル単位ステージング UI (#487) (#492)
+- [修正] 設定画面（Cmd+,）の総点検: 押せないボタン・未配線ウィジェットの修正 + 言語セレクタ (#486, #488) (#491)
+- [機能追加] macOS アプリケーションメニュー整備: About/バージョン/設定/標準項目 (#485) (#490)
+- [改善] 紹介動画 v3: setup 節を対話セットアップの訴求に刷新 (#470) (#489)
+- [改善] 紹介動画 v2: テロップ背景 + master オーケストレーション節 (#470) (#483)
+- [修正] 隔離モードで更新チェックを止める + 収録スクリプトの取りこぼし修正 (#470) (#482)
+
 ## [0.5.10] - 2026-07-24
 
 Nightly patch release (automated). Changes since v0.5.9:
