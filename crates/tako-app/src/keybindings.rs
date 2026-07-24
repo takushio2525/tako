@@ -44,7 +44,24 @@ actions!(
         UndoPreview,
         RedoPreview,
         FindPreview,
-        OpenCommandPalette
+        OpenCommandPalette,
+        // macOS アプリケーションメニュー（#485）。すべて実在の動作に配線する
+        AboutTako,
+        CheckForUpdates,
+        HideApp,
+        HideOthers,
+        ShowAllApps,
+        MinimizeWindow,
+        ZoomWindow,
+        ToggleFullScreen,
+        ToggleDrawer,
+        ToggleTheme,
+        SwitchLanguage,
+        ShowFleetPanel,
+        ShowOrchPanel,
+        ShowGitPanel,
+        OpenDocumentation,
+        ReportIssue
     ]
 );
 
@@ -92,6 +109,12 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-z", UndoPreview, None),
         KeyBinding::new("cmd-shift-z", RedoPreview, None),
         KeyBinding::new("cmd-f", FindPreview, None),
+        // macOS 慣習のショートカット（#485。cmd 付きの未バインドキーはシェルへ流れない
+        // ＝ ターミナル入力を奪わない。handle_key の platform 修飾ガードを参照）
+        KeyBinding::new("cmd-h", HideApp, None),
+        KeyBinding::new("cmd-alt-h", HideOthers, None),
+        KeyBinding::new("cmd-m", MinimizeWindow, None),
+        KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
     ]
 }
 
