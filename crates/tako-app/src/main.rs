@@ -9803,6 +9803,9 @@ impl TakoApp {
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                     let _ = this.workspace.active_tab_mut().tree_mut().focus(pane_id);
+                    // #487: ペインを触ったら git コミット入力欄のキーボード占有を解く
+                    // （ルート div の blur はペイン側の stop_propagation に阻まれる）
+                    this.git_commit_input_focused = false;
                     cx.notify();
                 }),
             )
@@ -20700,7 +20703,7 @@ mod self_test {
 
                 // 79b. git ステージング UI の分類とコミット挙動 (#487)
                 let git_stage_ok = {
-                    let entries = vec![
+                    let entries = [
                         tako_core::GitStatusEntry {
                             path: "staged.rs".into(),
                             index: 'M',

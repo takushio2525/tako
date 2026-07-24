@@ -2063,9 +2063,11 @@ impl TakoApp {
         let fg = theme.tab_inactive_foreground;
         let bg_hover = theme.selection_background;
         let mut header = div()
+            .w_full()
             .flex()
             .flex_row()
             .items_center()
+            .overflow_hidden()
             .px_2()
             .py(px(3.0))
             .mt_1()
@@ -2078,6 +2080,7 @@ impl TakoApp {
                     .flex_row()
                     .items_center()
                     .flex_1()
+                    .overflow_hidden()
                     .gap(px(2.0))
                     .cursor_pointer()
                     .hover(|d| d.bg(rgba_alpha(bg_hover, 0.3)))
@@ -2097,7 +2100,7 @@ impl TakoApp {
                             .flex_none()
                             .text_color(hsla(fg)),
                     )
-                    .child(SharedString::from(label)),
+                    .child(div().text_ellipsis().child(SharedString::from(label))),
             );
         if let Some((btn_id, icon, tip)) = bulk {
             header = header.child(
@@ -2105,6 +2108,7 @@ impl TakoApp {
                     .id(btn_id)
                     .flex()
                     .flex_row()
+                    .flex_none()
                     .items_center()
                     .gap(px(2.0))
                     .px_1()
@@ -2116,7 +2120,14 @@ impl TakoApp {
                             .text_color(hsla(theme.accent))
                     })
                     .on_click(on_bulk)
-                    .child(svg().path(icon).w(px(10.0)).h(px(10.0)).flex_none())
+                    .child(
+                        svg()
+                            .path(icon)
+                            .w(px(10.0))
+                            .h(px(10.0))
+                            .flex_none()
+                            .text_color(hsla(theme.accent)),
+                    )
                     .child(SharedString::from(tip)),
             );
         }
@@ -2153,9 +2164,11 @@ impl TakoApp {
         div()
             .id(id)
             .group("git-change-row")
+            .w_full()
             .flex()
             .flex_row()
             .items_center()
+            .overflow_hidden()
             .px_3()
             .py(px(1.0))
             .text_size(px(11.0))
@@ -2214,7 +2227,8 @@ impl TakoApp {
                             })
                             .w(px(10.0))
                             .h(px(10.0))
-                            .flex_none(),
+                            .flex_none()
+                            .text_color(hsla(theme.accent)),
                     )
                     // 何のボタンかは行ホバー時にだけ言葉で出す（常時は VSCode 同様アイコンのみ）
                     .child(
@@ -2284,15 +2298,18 @@ impl TakoApp {
             .unwrap_or_else(|| data.repo_root.clone());
         root = root.child(
             div()
+                .w_full()
                 .flex()
                 .flex_row()
                 .items_center()
+                .overflow_hidden()
                 .px_2()
                 .py_1()
                 .bg(rgba(theme.tab_bar_background))
                 .child(
                     svg()
                         .path(ui_icon::GIT_BRANCH)
+                        .flex_none()
                         .w(px(12.0))
                         .h(px(12.0))
                         .text_color(hsla(accent)),
@@ -2342,7 +2359,14 @@ impl TakoApp {
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.refresh_git(cx);
                         }))
-                        .child(svg().path(ui_icon::REFRESH).w(px(11.0)).h(px(11.0)))
+                        .child(
+                            svg()
+                                .path(ui_icon::REFRESH)
+                                .w(px(11.0))
+                                .h(px(11.0))
+                                .flex_none()
+                                .text_color(hsla(fg)),
+                        )
                         .child(crate::ui_text::panel::git_refresh()),
                 ),
         );
@@ -2474,14 +2498,18 @@ impl TakoApp {
         let push_repo = repo_root_str.clone();
         root = root.child(
             div()
+                .w_full()
                 .flex()
                 .flex_row()
                 .items_center()
+                .overflow_hidden()
                 .gap_1()
                 .px_2()
                 .py(px(2.0))
                 .child({
-                    let btn = btn_base("git-commit-btn", &theme, commit_enabled).flex_1();
+                    let btn = btn_base("git-commit-btn", &theme, commit_enabled)
+                        .flex_1()
+                        .overflow_hidden();
                     let btn = if commit_enabled {
                         btn.on_click(cx.listener(move |this, _, _, cx| {
                             this.git_do_commit(commit_repo.clone(), cx);
@@ -2496,26 +2524,24 @@ impl TakoApp {
                             .items_center()
                             .justify_center()
                             .gap_1()
-                            .child(svg().path(ui_icon::CHECK).w(px(12.0)).h(px(12.0)))
+                            .child(
+                                svg()
+                                    .path(ui_icon::CHECK)
+                                    .w(px(12.0))
+                                    .h(px(12.0))
+                                    .flex_none()
+                                    .text_color(hsla(if commit_enabled {
+                                        theme.accent
+                                    } else {
+                                        theme.text_muted
+                                    })),
+                            )
                             .child(crate::ui_text::panel::git_commit_btn()),
                     )
                 })
-                // #487: ステージ済みがあるときは「ステージ済みのみコミット」であることを明示
-                .child(
-                    div()
-                        .text_size(px(9.0))
-                        .text_color(hsla(theme.text_muted))
-                        .text_ellipsis()
-                        .child(if staged_count > 0 {
-                            SharedString::from(crate::ui_text::panel::git_commit_staged_hint(
-                                staged_count,
-                            ))
-                        } else {
-                            SharedString::from(crate::ui_text::panel::git_commit_all_hint())
-                        }),
-                )
                 .child(
                     btn_base("git-pull-btn", &theme, true)
+                        .flex_none()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.git_do_pull(pull_repo.clone(), cx);
                         }))
@@ -2525,12 +2551,20 @@ impl TakoApp {
                                 .flex_row()
                                 .items_center()
                                 .gap_1()
-                                .child(svg().path(ui_icon::ARROW_DOWN).w(px(12.0)).h(px(12.0)))
+                                .child(
+                                    svg()
+                                        .path(ui_icon::ARROW_DOWN)
+                                        .w(px(12.0))
+                                        .h(px(12.0))
+                                        .flex_none()
+                                        .text_color(hsla(theme.accent)),
+                                )
                                 .child("Pull"),
                         ),
                 )
                 .child(
                     btn_base("git-push-btn", &theme, true)
+                        .flex_none()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.git_do_push(push_repo.clone(), cx);
                         }))
@@ -2540,10 +2574,37 @@ impl TakoApp {
                                 .flex_row()
                                 .items_center()
                                 .gap_1()
-                                .child(svg().path(ui_icon::ARROW_UP).w(px(12.0)).h(px(12.0)))
+                                .child(
+                                    svg()
+                                        .path(ui_icon::ARROW_UP)
+                                        .w(px(12.0))
+                                        .h(px(12.0))
+                                        .flex_none()
+                                        .text_color(hsla(theme.accent)),
+                                )
                                 .child("Push"),
                         ),
                 ),
+        );
+        // #487: コミット対象がステージ済みだけかどうかを言葉で明示する
+        root = root.child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .flex_none()
+                .h(px(14.0))
+                .overflow_hidden()
+                .px_2()
+                .text_size(px(9.0))
+                .text_color(hsla(theme.text_muted))
+                .text_ellipsis()
+                .child(if staged_count > 0 {
+                    SharedString::from(crate::ui_text::panel::git_commit_staged_hint(staged_count))
+                } else {
+                    SharedString::from(crate::ui_text::panel::git_commit_all_hint())
+                }),
         );
 
         // ──── ブランチ一覧セクション ────
