@@ -197,10 +197,13 @@ if __name__ == "__main__":
     main()
 PY
 
-    # tako:run 宣言つき = Code Runner の再生ボタンで実行できるデモ用スクリプト
+    # tako:run 宣言つき = Code Runner の再生ボタンで実行できるデモ用スクリプト。
+    # Run ペインの cwd は宣言ファイルのあるディレクトリ（scripts/）になるため、
+    # ${file} で自分自身を絶対パス実行し、スクリプト内でプロジェクト直下へ cd する
     cat > "$PROMO_DEMO/awesome-app/scripts/build.sh" <<'BLD'
 #!/bin/bash
-# tako:run: bash scripts/build.sh
+# tako:run: bash ${file}
+cd "$(dirname "$0")/.." || exit 1
 set -e
 steps=("resolving deps" "compiling src/app.py" "bundling assets" "writing dist/")
 for s in "${steps[@]}"; do

@@ -2921,8 +2921,15 @@ impl TakoApp {
         })
         .detach();
 
-        // アプリ内自動更新チェック（起動時 + 24 時間ごと。2 チャンネル同時。#403）
-        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+        // アプリ内自動更新チェック（起動時 + 24 時間ごと。2 チャンネル同時。#403）。
+        // セルフテストと隔離モード（TAKO_ISOLATED。検証・収録用の使い捨てインスタンス）では
+        // 外部 GitHub へアクセスせず、更新通知バッジも出さない
+        if std::env::var_os("TAKO_SELF_TEST").is_none()
+            && !matches!(
+                std::env::var("TAKO_ISOLATED").ok().as_deref(),
+                Some("1" | "true" | "on")
+            )
+        {
             cx.spawn(async move |this, cx| loop {
                 let task = cx
                     .background_executor()
