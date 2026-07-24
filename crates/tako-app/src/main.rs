@@ -822,6 +822,8 @@ struct TakoApp {
     git_collapsed: GitCollapsed,
     /// git コミットメッセージ入力欄の内容（#472）
     git_commit_message: String,
+    /// git コミットメッセージ入力欄のキャレット位置（バイトオフセット。#487）
+    git_commit_cursor: usize,
     /// git 操作の結果フィードバック（#472。一時表示して数秒で消える）
     git_feedback: Option<GitFeedback>,
     /// git コミットメッセージ入力欄にフォーカスがあるか（#472）
@@ -1121,7 +1123,10 @@ struct GitPanelData {
     commits: Vec<tako_core::GitCommit>,
     branches: Vec<tako_core::GitBranch>,
     status: Vec<tako_core::GitStatusEntry>,
+    /// 表示中の diff。コミット選択時はそのコミット、未選択時は未ステージ分（#487）
     diff_files: Vec<tako_core::DiffFile>,
+    /// ステージ済み分の diff（コミット選択時は空。#487 で unstaged と分離）
+    diff_staged: Vec<tako_core::DiffFile>,
     graph: tako_core::GraphLayout,
 }
 
@@ -1927,6 +1932,7 @@ impl TakoApp {
             git_selected_commit: None,
             git_collapsed: GitCollapsed::default(),
             git_commit_message: String::new(),
+            git_commit_cursor: 0,
             git_feedback: None,
             git_commit_input_focused: false,
             drawer_visible: false,
@@ -6923,6 +6929,13 @@ impl TakoApp {
             cx.notify();
             return;
         }
+        if self.git_commit_input_focused {
+            let cursor = self.git_commit_cursor.min(self.git_commit_message.len());
+            self.git_commit_message.insert_str(cursor, &text);
+            self.git_commit_cursor = cursor + text.len();
+            cx.notify();
+            return;
+        }
         let pane_id = self.focused_pane();
         if self
             .preview_edits
@@ -9790,6 +9803,9 @@ impl TakoApp {
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                     let _ = this.workspace.active_tab_mut().tree_mut().focus(pane_id);
+                    // #487: ペインを触ったら git コミット入力欄のキーボード占有を解く
+                    // （ルート div の blur はペイン側の stop_propagation に阻まれる）
+                    this.git_commit_input_focused = false;
                     cx.notify();
                 }),
             )
@@ -13262,6 +13278,18 @@ impl EntityInputHandler for TakoApp {
             cx.notify();
             return;
         }
+        // git コミットメッセージ入力中（#487。ここを通さないと印字文字が
+        // ターミナルへ抜け、日本語 IME の確定文字列も入らない）
+        if self.git_commit_input_focused {
+            if !text.is_empty() {
+                let cursor = self.git_commit_cursor.min(self.git_commit_message.len());
+                self.git_commit_message.insert_str(cursor, text);
+                self.git_commit_cursor = cursor + text.len();
+            }
+            self.ime = None;
+            cx.notify();
+            return;
+        }
         let pane = self.ime_target();
         // 検索バー表示中は入力文字を検索/置換フィールドへ
         if self
@@ -14081,6 +14109,12 @@ impl Render for TakoApp {
                         this.webview_dock_url_focused = false;
                         changed = true;
                     }
+                    // #487: git コミット入力欄の外をクリックしたらフォーカスを外す
+                    // （外さないとターミナルへ文字が届かなくなる）
+                    if this.git_commit_input_focused {
+                        this.git_commit_input_focused = false;
+                        changed = true;
+                    }
                     if this.webview_address_bar_active.is_some() {
                         if let Some(pane_id) = this.webview_address_bar_active.take() {
                             this.webview_address_bar.remove(&pane_id.as_u64());
@@ -14505,13 +14539,17 @@ fn fetch_git_data(cwd: &std::path::Path, selected_commit: Option<&str>) -> Optio
     let graph = tako_core::git::compute_graph_layout(&commits);
     let branches = tako_core::git::list_branches(&repo);
     let status = tako_core::git::status(&repo);
-    let diff_files = if let Some(hash) = selected_commit {
-        tako_core::git::diff(&repo, &tako_core::DiffTarget::Commit(hash.to_string()))
+    // #487: 未ステージとステージ済みを混ぜず別々に持つ（どちらの差分か UI で区別するため）
+    let (diff_files, diff_staged) = if let Some(hash) = selected_commit {
+        (
+            tako_core::git::diff(&repo, &tako_core::DiffTarget::Commit(hash.to_string())),
+            Vec::new(),
+        )
     } else {
-        let mut files = tako_core::git::diff(&repo, &tako_core::DiffTarget::Unstaged);
-        let staged = tako_core::git::diff(&repo, &tako_core::DiffTarget::Staged);
-        files.extend(staged);
-        files
+        (
+            tako_core::git::diff(&repo, &tako_core::DiffTarget::Unstaged),
+            tako_core::git::diff(&repo, &tako_core::DiffTarget::Staged),
+        )
     };
     Some(GitPanelData {
         repo_root: repo.display().to_string(),
@@ -14521,6 +14559,7 @@ fn fetch_git_data(cwd: &std::path::Path, selected_commit: Option<&str>) -> Optio
         branches,
         status: status.entries,
         diff_files,
+        diff_staged,
         graph,
     })
 }
@@ -20595,6 +20634,117 @@ mod self_test {
                 check(
                     paste_ok,
                     "Web dock URL 入力: フォーカス中の paste() が欄に入る (#414)",
+                );
+
+                // 79. git コミットメッセージ入力欄 (#487)。旧実装は大文字が小文字化し、
+                // 未知キーを流していたため文字がターミナルへ漏れていた
+                let git_input_ok = window
+                    .update(cx, |app, _, cx| {
+                        app.git_commit_input_focused = true;
+                        app.git_commit_message.clear();
+                        app.git_commit_cursor = 0;
+                        // shift+A: key は論理キー名 "a"、key_char が実文字 "A"
+                        let upper = Keystroke {
+                            modifiers: Modifiers {
+                                shift: true,
+                                ..Default::default()
+                            },
+                            key: "a".into(),
+                            key_char: Some("A".into()),
+                        };
+                        let ch = |k: &str, c: &str| Keystroke {
+                            modifiers: Modifiers::default(),
+                            key: k.to_string(),
+                            key_char: Some(c.to_string()),
+                        };
+                        app.handle_git_commit_key(&upper, cx);
+                        app.handle_git_commit_key(&ch("b", "b"), cx);
+                        // key_char が来ない space（実機の挙動）でも空白が入ること
+                        app.handle_git_commit_key(
+                            &Keystroke {
+                                modifiers: Modifiers::default(),
+                                key: "space".into(),
+                                key_char: None,
+                            },
+                            cx,
+                        );
+                        app.handle_git_commit_key(&ch("1", "1"), cx);
+                        app.handle_git_commit_key(&ch("minus", "-"), cx);
+                        let typed = app.git_commit_message == "Ab 1-";
+                        // キャレット移動 + 中間挿入
+                        app.handle_git_commit_key(&Keystroke::parse("left").unwrap(), cx);
+                        app.handle_git_commit_key(&ch("z", "z"), cx);
+                        let caret_ok = app.git_commit_message == "Ab 1z-";
+                        app.handle_git_commit_key(&Keystroke::parse("backspace").unwrap(), cx);
+                        let bs_ok = app.git_commit_message == "Ab 1-";
+                        // IME / 通常文字経路（replace_text_in_range）でも入る
+                        app.git_commit_message.clear();
+                        app.git_commit_cursor = 0;
+                        // 修飾なしの未知キーはターミナルへ漏らさず消費する
+                        let consumed = app.handle_git_commit_key(&ch("f5", ""), cx);
+                        // ⌘ 付きはアプリのキーバインドへ通す（false）
+                        let cmd_v = Keystroke {
+                            modifiers: Modifiers {
+                                platform: true,
+                                ..Default::default()
+                            },
+                            key: "v".into(),
+                            key_char: None,
+                        };
+                        let passed_through = !app.handle_git_commit_key(&cmd_v, cx);
+                        // ⌘V ペーストは欄に入る
+                        cx.write_to_clipboard(ClipboardItem::new_string("Fix: 修正".into()));
+                        app.paste(cx);
+                        let pasted = app.git_commit_message == "Fix: 修正";
+                        app.handle_git_commit_key(&Keystroke::parse("escape").unwrap(), cx);
+                        let esc_ok = !app.git_commit_input_focused;
+                        app.git_commit_message.clear();
+                        app.git_commit_cursor = 0;
+                        cx.notify();
+                        typed && caret_ok && bs_ok && consumed && passed_through && pasted && esc_ok
+                    })
+                    .unwrap_or(false);
+                check(
+                    git_input_ok,
+                    "git コミット入力: 大文字 / 空白 / 記号 / キャレット / ペースト / Esc (#487)",
+                );
+
+                // 79b. git ステージング UI の分類とコミット挙動 (#487)
+                let git_stage_ok = {
+                    let entries = [
+                        tako_core::GitStatusEntry {
+                            path: "staged.rs".into(),
+                            index: 'M',
+                            worktree: '.',
+                        },
+                        tako_core::GitStatusEntry {
+                            path: "unstaged.rs".into(),
+                            index: '.',
+                            worktree: 'M',
+                        },
+                        tako_core::GitStatusEntry {
+                            path: "new.rs".into(),
+                            index: '?',
+                            worktree: '?',
+                        },
+                    ];
+                    let staged: Vec<&str> = entries
+                        .iter()
+                        .filter(|e| e.is_staged())
+                        .map(|e| e.path.as_str())
+                        .collect();
+                    let unstaged: Vec<&str> = entries
+                        .iter()
+                        .filter(|e| e.is_unstaged())
+                        .map(|e| e.path.as_str())
+                        .collect();
+                    staged == vec!["staged.rs"]
+                        && unstaged == vec!["unstaged.rs", "new.rs"]
+                        && entries[2].unstaged_badge() == 'U'
+                };
+                check(
+                    git_stage_ok,
+                    "git ステージング: staged / unstaged の分類とバッジ (#487)",
                 );
 
                 // ホイール = ミラー表示 + スクロールバー表示（#159 と同じ機構に乗る）

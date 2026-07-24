@@ -61,10 +61,46 @@ pub struct GitBranch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitStatusEntry {
     pub path: String,
-    /// index（staging）側の状態（M/A/D/R 等。'.' は変更なし）
+    /// index（staging）側の状態（M/A/D/R 等。'.' は変更なし。untracked は '?'）
     pub index: char,
     /// worktree 側の状態
     pub worktree: char,
+}
+
+impl GitStatusEntry {
+    /// index にステージ済みの変更があるか（#487。untracked '?' は未ステージ扱い）
+    pub fn is_staged(&self) -> bool {
+        self.index != '.' && self.index != '?' && self.index != ' '
+    }
+
+    /// worktree 側に未ステージの変更があるか（#487。untracked も未ステージ側に出す）
+    pub fn is_unstaged(&self) -> bool {
+        self.index == '?' || (self.worktree != '.' && self.worktree != '?' && self.worktree != ' ')
+    }
+
+    /// 未追跡ファイルか
+    pub fn is_untracked(&self) -> bool {
+        self.index == '?'
+    }
+
+    /// ステージ済み側に表示するバッジ文字（#487）
+    pub fn staged_badge(&self) -> char {
+        match self.index {
+            '.' | ' ' => ' ',
+            c => c,
+        }
+    }
+
+    /// 未ステージ側に表示するバッジ文字（#487）
+    pub fn unstaged_badge(&self) -> char {
+        if self.index == '?' {
+            return 'U';
+        }
+        match self.worktree {
+            '.' | ' ' => ' ',
+            c => c,
+        }
+    }
 }
 
 /// git status のサマリ
@@ -203,7 +239,9 @@ pub fn log_file_commits(repo: &Path, file_path: &str, max_count: usize) -> Vec<G
 }
 
 /// 特定コミットでの特定ファイルの diff を取得する。
-/// `git diff <hash>^..<hash> -- <file>`（初期コミットは `--root` フォールバック）
+/// `git diff <hash>^..<hash> -- <file>`（親を持たない初期コミットは
+/// `git diff-tree --root -p` フォールバック。#487 で `git diff --root` から修正 =
+/// 旧実装は「コミット vs 作業ツリー」を返していた）
 pub fn diff_file_commit(repo: &Path, hash: &str, file_path: &str) -> Vec<DiffHunk> {
     let out = run_git(
         repo,
@@ -211,7 +249,9 @@ pub fn diff_file_commit(repo: &Path, hash: &str, file_path: &str) -> Vec<DiffHun
     );
     let raw = match out {
         Ok(s) => s,
-        Err(_) => run_git(repo, &["diff", "--root", hash, "--", file_path]).unwrap_or_default(),
+        Err(_) => {
+            run_git(repo, &["diff-tree", "--root", "-p", hash, "--", file_path]).unwrap_or_default()
+        }
     };
     let files = parse_diff(&raw);
     files.into_iter().flat_map(|f| f.hunks).collect()
@@ -332,8 +372,8 @@ pub enum DiffTarget {
     Unstaged,
     /// index vs HEAD（`git diff --cached`）
     Staged,
-    /// 特定コミットの diff（`git diff <commit>^..<commit>`。初期コミットは
-    /// `git diff --root <commit>` へフォールバック）
+    /// 特定コミットの diff（`git diff <commit>^..<commit>`。親を持たない初期コミットは
+    /// `git diff-tree --root -p <commit>` へフォールバック）
     Commit(String),
 }
 
@@ -347,9 +387,11 @@ pub fn diff(repo: &Path, target: &DiffTarget) -> Vec<DiffFile> {
     let out = match run_git(repo, &arg_refs) {
         Ok(out) => out,
         Err(_) if matches!(target, DiffTarget::Commit(_)) => {
-            // 初期コミット: 親がないので --root でフォールバック
+            // 初期コミット: 親がないので diff-tree --root でフォールバックする（#487。
+            // 旧実装の `git diff --root <hash>` は「そのコミット vs 作業ツリー」を返すため、
+            // 初期コミットを選ぶと作業ツリーの差分が表示されてしまっていた）
             if let DiffTarget::Commit(hash) = target {
-                run_git(repo, &["diff", "--root", hash]).unwrap_or_default()
+                run_git(repo, &["diff-tree", "--root", "-p", hash]).unwrap_or_default()
             } else {
                 String::new()
             }
@@ -739,6 +781,128 @@ mod tests {
         assert_eq!(status.entries[0].index, '.');
         assert_eq!(status.entries[0].worktree, 'M');
         assert_eq!(status.entries[1].index, '?');
+    }
+
+    /// #487: ステージ済み / 未ステージの分類（porcelain v2 の XY 2 文字を分離する）
+    #[test]
+    fn ステージ状態の分類() {
+        // "M." = index だけ変更（= ステージ済み）
+        let staged_only = GitStatusEntry {
+            path: "a.rs".into(),
+            index: 'M',
+            worktree: '.',
+        };
+        assert!(staged_only.is_staged());
+        assert!(!staged_only.is_unstaged());
+        assert_eq!(staged_only.staged_badge(), 'M');
+
+        // ".M" = worktree だけ変更（= 未ステージ）
+        let unstaged_only = GitStatusEntry {
+            path: "b.rs".into(),
+            index: '.',
+            worktree: 'M',
+        };
+        assert!(!unstaged_only.is_staged());
+        assert!(unstaged_only.is_unstaged());
+        assert_eq!(unstaged_only.unstaged_badge(), 'M');
+
+        // "MM" = 両方に出る（VSCode 同様、ステージ済みと未ステージの両セクションに並ぶ）
+        let both = GitStatusEntry {
+            path: "c.rs".into(),
+            index: 'M',
+            worktree: 'M',
+        };
+        assert!(both.is_staged());
+        assert!(both.is_unstaged());
+
+        // untracked は未ステージ側のみ・バッジは U
+        let untracked = GitStatusEntry {
+            path: "d.rs".into(),
+            index: '?',
+            worktree: '?',
+        };
+        assert!(!untracked.is_staged());
+        assert!(untracked.is_unstaged());
+        assert!(untracked.is_untracked());
+        assert_eq!(untracked.unstaged_badge(), 'U');
+
+        // 追加をステージ済み ("A.")
+        let added = GitStatusEntry {
+            path: "e.rs".into(),
+            index: 'A',
+            worktree: '.',
+        };
+        assert!(added.is_staged());
+        assert_eq!(added.staged_badge(), 'A');
+    }
+
+    /// #487: 実際の porcelain v2 出力からの分類（混在状態）
+    #[test]
+    fn parse_status_からのステージ分類() {
+        let raw = concat!(
+            "# branch.head main\n",
+            "1 M. N... 100644 100644 100644 aaa bbb staged.rs\n",
+            "1 .M N... 100644 100644 100644 ccc ddd unstaged.rs\n",
+            "1 MM N... 100644 100644 100644 eee fff both.rs\n",
+            "? new.rs\n"
+        );
+        let status = parse_status(raw);
+        let staged: Vec<&str> = status
+            .entries
+            .iter()
+            .filter(|e| e.is_staged())
+            .map(|e| e.path.as_str())
+            .collect();
+        let unstaged: Vec<&str> = status
+            .entries
+            .iter()
+            .filter(|e| e.is_unstaged())
+            .map(|e| e.path.as_str())
+            .collect();
+        assert_eq!(staged, vec!["staged.rs", "both.rs"]);
+        assert_eq!(unstaged, vec!["unstaged.rs", "both.rs", "new.rs"]);
+    }
+
+    /// #487: 初期コミットのフォールバックが diff-tree になっていること（作業ツリー混入の回帰防止）
+    #[test]
+    fn 初期コミットのdiffはコミット内容そのもの() {
+        let dir = std::env::temp_dir().join(format!("tako-git-root-diff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let repo = dir.as_path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let hash = String::from_utf8_lossy(&git(&["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        // 作業ツリーを汚す: 誤実装（git diff --root）だとこの変更が混ざる
+        std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+
+        let files = diff(repo, &DiffTarget::Commit(hash));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "a.txt");
+        let lines: Vec<&str> = files[0].hunks[0]
+            .lines
+            .iter()
+            .filter(|l| l.kind == DiffLineKind::Add)
+            .map(|l| l.content.as_str())
+            .collect();
+        // 初期コミットの中身 = "one" の追加のみ。"two" が出たら作業ツリーが混入している
+        assert_eq!(lines, vec!["one"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
