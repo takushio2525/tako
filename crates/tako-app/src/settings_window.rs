@@ -771,6 +771,16 @@ impl Render for SettingsWindow {
                 }
                 window.remove_window();
             }))
+            // ⌘V はキーバインドで PasteClipboard アクションになるため on_key_down へ
+            // 落ちてこない。設定ウィンドウでは編集中バッファへの貼り付けとして受ける
+            // （ハンドラが無いとメインウィンドウのターミナルへ流れる恐れもある）
+            .on_action(cx.listener(|this, _: &crate::PasteClipboard, _, cx| {
+                if this.edit.is_some() {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        this.insert_text(&text, cx);
+                    }
+                }
+            }))
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 this.handle_key(&ev.keystroke, window, cx);
             }))
@@ -842,7 +852,9 @@ impl SettingsWindow {
             .flex_col()
             .child(
                 div()
-                    .id("settings-content")
+                    // タブごとにスクロール状態を分ける（同一 id だと前のタブの
+                    // スクロール位置が残り、切替後に途中から表示される。#486）
+                    .id(SharedString::from(format!("settings-content-{:?}", self.tab)))
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_y_scroll()
@@ -1031,12 +1043,14 @@ impl SettingsWindow {
     }
 
     /// テキスト入力欄。クリックで編集開始、Enter で確定、Esc で取消
+    /// テキスト入力欄。クリックで編集開始、Enter で確定、Esc で取消。
+    /// width = None は親の残り幅いっぱい（flex_1）に伸ばす
     fn text_field(
         &self,
         field: EditField,
         current: &str,
         placeholder: &str,
-        width: Pixels,
+        width: Option<Pixels>,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = self.theme();
@@ -1101,7 +1115,10 @@ impl SettingsWindow {
         let is_editing = editing.is_some();
         div()
             .id(SharedString::from(format!("field-{id}")))
-            .w(width)
+            .map(|d| match width {
+                Some(w) => d.w(w).flex_none(),
+                None => d.flex_1().min_w(px(0.)),
+            })
             .px_2()
             .py(px(3.))
             .rounded(px(5.))
@@ -1306,7 +1323,7 @@ impl SettingsWindow {
                     EditField::PreviewCacheMb,
                     &s.preview_cache_max_mb.to_string(),
                     "512",
-                    px(90.),
+                    Some(px(90.)),
                     cx,
                 ),
             ))
@@ -1346,7 +1363,7 @@ impl SettingsWindow {
                     EditField::PaneLogMaxMb,
                     &s.pane_log_max_mb.to_string(),
                     "5",
-                    px(90.),
+                    Some(px(90.)),
                     cx,
                 ),
             ))
@@ -1357,7 +1374,7 @@ impl SettingsWindow {
                     EditField::PaneLogTotalMaxMb,
                     &s.pane_log_total_max_mb.to_string(),
                     "200",
-                    px(90.),
+                    Some(px(90.)),
                     cx,
                 ),
             ))
@@ -1414,7 +1431,7 @@ impl SettingsWindow {
                 EditField::FontFamily,
                 self.settings.font_family.as_deref().unwrap_or(""),
                 "Menlo",
-                px(180.),
+                Some(px(180.)),
                 cx,
             ),
         ));
@@ -1430,7 +1447,7 @@ impl SettingsWindow {
                         .map(|s| format!("{s}"))
                         .unwrap_or_default(),
                     "13",
-                    px(90.),
+                    Some(px(90.)),
                     cx,
                 ),
             ),
@@ -1454,7 +1471,7 @@ impl SettingsWindow {
                     EditField::PresetName,
                     "",
                     txt::placeholder_preset_name(),
-                    px(160.),
+                    Some(px(160.)),
                     cx,
                 ))
                 .child(self.button(
@@ -1657,7 +1674,7 @@ impl SettingsWindow {
                                 EditField::ColorHex(key_owned.clone()),
                                 &hex,
                                 "#000000",
-                                px(90.),
+                                Some(px(90.)),
                                 cx,
                             ))
                             .child(if overridden {
@@ -1733,7 +1750,7 @@ impl SettingsWindow {
                         .text_size(px(11.))
                         .child(txt::runner_col_source()),
                 )
-                .child(div().w(px(64.)).flex_none()),
+                .child(div().w(px(80.)).flex_none()),
         );
 
         for (ext, cmd) in &merged {
@@ -1753,11 +1770,11 @@ impl SettingsWindow {
                             .text_size(px(12.))
                             .child(ext.clone()),
                     )
-                    .child(div().flex_1().min_w(px(0.)).child(self.text_field(
+                    .child(div().flex_1().min_w(px(0.)).flex().child(self.text_field(
                         EditField::RunnerCmd(ext.clone()),
                         cmd,
                         "",
-                        px(0.).max(px(1.)),
+                        None,
                         cx,
                     )))
                     .child(
@@ -1776,7 +1793,7 @@ impl SettingsWindow {
                                 txt::runner_source_builtin()
                             }),
                     )
-                    .child(div().w(px(64.)).flex_none().child(if is_user {
+                    .child(div().w(px(80.)).flex_none().child(if is_user {
                         self.button(
                             &format!("rd-reset-{ext}"),
                             txt::button_reset(),
@@ -1811,7 +1828,6 @@ impl SettingsWindow {
             .flex()
             .flex_col()
             .gap_1()
-            .pt_3()
             .child(self.section(txt::runner_add_header()))
             .child(
                 div()
@@ -1822,14 +1838,14 @@ impl SettingsWindow {
                         EditField::RunnerNewExt,
                         &new_ext,
                         txt::runner_col_ext(),
-                        px(70.),
+                        Some(px(70.)),
                         cx,
                     ))
-                    .child(div().flex_1().min_w(px(0.)).child(self.text_field(
+                    .child(div().flex_1().min_w(px(0.)).flex().child(self.text_field(
                         EditField::RunnerNewCmd,
                         &new_cmd,
                         txt::runner_placeholder_command(),
-                        px(1.),
+                        None,
                         cx,
                     )))
                     .child(if can_add {
@@ -1896,10 +1912,19 @@ impl SettingsWindow {
                     .child(txt::runner_resolution_help()),
             );
 
+        // 新規追加は表より上に置く（表は 21 行あり、下に置くと画面外へ押し出されて
+        // 追加できなくなる。#486 の実機監査で判明）
         div()
             .flex()
             .flex_col()
-            .child(self.section(txt::runner_header()))
+            .child(add_section)
+            .child(
+                div()
+                    .pt_4()
+                    .border_t_1()
+                    .border_color(to_hsla(theme.border_subtle))
+                    .child(self.section(txt::runner_header())),
+            )
             .child(
                 div()
                     .pb_2()
@@ -1908,7 +1933,6 @@ impl SettingsWindow {
                     .child(txt::runner_edit_help()),
             )
             .child(table)
-            .child(add_section)
             .child(help)
     }
 
