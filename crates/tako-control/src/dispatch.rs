@@ -2067,41 +2067,35 @@ fn dispatch_inner(
 
         Request::VideoPlayback { pane, action } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
-            if host.preview_state(target).map(|(_, m)| m) != Some(PreviewModeWire::Video) {
-                return Err(DispatchError::Operation(
-                    "対象ペインは動画プレビューではない".into(),
-                ));
+            require_video_preview(host, target)?;
+            // "status" は状態を変えずに現在値だけを返す（UI 表示との突き合わせ用。#484）
+            if action != "status" {
+                host.video_playback(target, &action)
+                    .map_err(DispatchError::Operation)?;
             }
-            let state = host
-                .video_playback(target, &action)
-                .map_err(DispatchError::Operation)?;
-            Ok(json!({ "pane": target.as_u64(), "state": state }))
+            Ok(video_response(host, target))
         }
 
         Request::VideoSeek { pane, seconds } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
-            if host.preview_state(target).map(|(_, m)| m) != Some(PreviewModeWire::Video) {
-                return Err(DispatchError::Operation(
-                    "対象ペインは動画プレビューではない".into(),
-                ));
-            }
+            require_video_preview(host, target)?;
             let actual = host
                 .video_seek(target, seconds)
                 .map_err(DispatchError::Operation)?;
-            Ok(json!({ "pane": target.as_u64(), "seconds": actual }))
+            let mut resp = video_response(host, target);
+            resp["seconds"] = json!(actual);
+            Ok(resp)
         }
 
         Request::VideoVolume { pane, volume } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
-            if host.preview_state(target).map(|(_, m)| m) != Some(PreviewModeWire::Video) {
-                return Err(DispatchError::Operation(
-                    "対象ペインは動画プレビューではない".into(),
-                ));
-            }
+            require_video_preview(host, target)?;
             let actual = host
                 .video_volume(target, volume)
                 .map_err(DispatchError::Operation)?;
-            Ok(json!({ "pane": target.as_u64(), "volume": actual }))
+            let mut resp = video_response(host, target);
+            resp["volume"] = json!(actual);
+            Ok(resp)
         }
 
         Request::OrchestratorProjects {
@@ -6016,6 +6010,37 @@ fn which(name: &str) -> Option<String> {
         .and_then(|out| String::from_utf8(out.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// 対象ペインが動画プレビューであることを確かめる（#484）
+fn require_video_preview(
+    host: &(impl ControlHost + ?Sized),
+    target: PaneId,
+) -> Result<(), DispatchError> {
+    if host.preview_state(target).map(|(_, m)| m) != Some(PreviewModeWire::Video) {
+        return Err(DispatchError::Operation(
+            "対象ペインは動画プレビューではない".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// 動画操作の共通応答。UI のシークバー・時刻表示と同じ値を返し、
+/// CLI / MCP と UI の一致を観測できるようにする（#484）
+fn video_response(host: &(impl ControlHost + ?Sized), target: PaneId) -> serde_json::Value {
+    let mut resp = json!({ "pane": target.as_u64(), "started": false });
+    if let Ok(status) = host.video_status(target) {
+        resp["started"] = json!(true);
+        resp["state"] = json!(status.state);
+        resp["position"] = json!(status.position);
+        resp["duration"] = json!(status.duration);
+        resp["rate"] = json!(status.rate);
+        resp["volume"] = json!(status.volume);
+        resp["muted"] = json!(status.muted);
+        resp["looping"] = json!(status.looping);
+        resp["ended"] = json!(status.ended);
+    }
+    resp
 }
 
 /// `pane` 省略はエラー（呼び出し元解決はクライアント側の責務。FR-2.2.7）

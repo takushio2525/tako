@@ -2335,6 +2335,12 @@ impl TakoApp {
                     }
                     // 重量プレビュー（PDF / 動画）の background 読み込み（Issue #168）
                     app.drain_pending_preview_loads(cx);
+                    // CLI / MCP の再生・シークでもフレーム取得ティッカーを回す。
+                    // UI 操作と等価にし、一時停止中のシークで絵が古いまま残るのを
+                    // 防ぐ（#484）
+                    if app.video_players.values().any(|p| p.needs_tick()) {
+                        app.ensure_video_ticker(cx);
+                    }
                     // ウィンドウ操作（Issue #339）の GPUI ウィンドウ生成・close を即座に
                     // 反映する。render 冒頭の同期はウィンドウが隠れているとフレームが
                     // 来ず走らないため、CLI / MCP 経路はここで消費する
@@ -8023,8 +8029,14 @@ impl TakoApp {
                 | self.dragging_pin.take().is_some()
                 | std::mem::take(&mut self.dragging_panel)
                 | std::mem::take(&mut self.dragging_sidebar)
-                | self.video_seek_dragging.take().is_some()
             {
+                cx.notify();
+            }
+            // ボタンを離したまま戻ってきたケース。離した位置へ正確に
+            // シークし直してドラッグを畳む（#484）
+            self.video_seek_end_drag(Some(event.position), cx);
+            // シークバーから離れたらホバー時刻表示を消す
+            if self.video_seek_clear_hover_if_outside(event.position) {
                 cx.notify();
             }
             return;
@@ -8032,7 +8044,11 @@ impl TakoApp {
         // シークバードラッグ中はシーク位置を追従
         if let Some(pane_id) = self.video_seek_dragging {
             self.video_seek_by_drag(pane_id, event.position, cx);
+            self.video_seek_update_hover(pane_id, event.position, cx);
             return;
+        }
+        if self.video_seek_clear_hover_if_outside(event.position) {
+            cx.notify();
         }
         // ピン留めウィンドウのタイトルバー D&D 移動（FR-2.16.15）
         if let Some((target, offset)) = self.dragging_pin {
@@ -8401,7 +8417,12 @@ impl TakoApp {
         self.pane_links.insert(pane_id, links);
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        // 動画シークバーのドラッグ終了。離した位置へ正確にシークし直してから
+        // 畳む（ドラッグ中は粗いシークで追従している。#484）
+        if self.video_seek_end_drag(Some(event.position), cx) {
+            return;
+        }
         // D&D の後始末（ドロップ成立時は on_drop が stop_propagation 込みで先に畳む。
         // ここはドロップ先以外で離した場合のクリア）
         if self.drag_kind.take().is_some()
@@ -8421,7 +8442,6 @@ impl TakoApp {
             | self.dragging_pin.take().is_some()
             | std::mem::take(&mut self.dragging_panel)
             | sidebar_was_dragging
-            | self.video_seek_dragging.take().is_some()
         {
             if sidebar_was_dragging {
                 self.save_sidebar_width();
@@ -8871,19 +8891,31 @@ impl TakoApp {
         }
     }
 
+    /// 動画プレイヤーを一時停止状態で用意する（GPUI の Context を必要としない
+    /// ため CLI / MCP 経路からも呼べる。#484）
+    fn ensure_video_player(&mut self, pane_id: PaneId) -> Result<(), String> {
+        if self.video_players.contains_key(&pane_id) {
+            return Ok(());
+        }
+        let path = match self.previews.get(&pane_id) {
+            Some(state) => state.path.clone(),
+            None => return Err("対象ペインにプレビューが無い".into()),
+        };
+        let player = video_player::VideoPlayer::open(&path)?;
+        self.video_players.insert(pane_id, player);
+        Ok(())
+    }
+
     /// 動画プレイヤーを起動し、再生を開始する
     fn start_video_player(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
         if self.video_players.contains_key(&pane_id) {
             return;
         }
-        let path = match self.previews.get(&pane_id) {
-            Some(state) => state.path.clone(),
-            None => return,
-        };
-        match video_player::VideoPlayer::open(&path) {
-            Ok(mut player) => {
-                player.play();
-                self.video_players.insert(pane_id, player);
+        match self.ensure_video_player(pane_id) {
+            Ok(()) => {
+                if let Some(player) = self.video_players.get_mut(&pane_id) {
+                    player.play();
+                }
                 self.ensure_video_ticker(cx);
                 cx.notify();
             }
@@ -8907,20 +8939,26 @@ impl TakoApp {
                     .await;
                 let live = this
                     .update(cx, |app, cx| {
-                        let mut any_playing = false;
-                        let mut any_new_frame = false;
+                        let mut any_live = false;
+                        let mut ticked = false;
                         for player in app.video_players.values_mut() {
-                            if player.state == video_player::PlaybackState::Playing {
-                                any_playing = true;
-                                if player.grab_frame() {
-                                    any_new_frame = true;
-                                }
+                            // 再生中に加えてシーク直後（一時停止中でも絵の
+                            // 差し替えが要る）も回す。#484
+                            if player.needs_tick() {
+                                ticked = true;
+                                player.grab_frame();
+                                // grab_frame 側で末尾停止・取り直し完了へ
+                                // 遷移しうるので、判定は取得後に取り直す
+                                any_live |= player.needs_tick();
                             }
                         }
-                        if any_new_frame {
+                        // つまみ・時刻表示は新フレームが来なくても進むため、
+                        // ティックしたら必ず再描画する（末尾で停止へ落ちた
+                        // 最後の 1 回も含む）
+                        if ticked {
                             cx.notify();
                         }
-                        any_playing
+                        any_live
                     })
                     .unwrap_or(false);
                 if !live {
@@ -8932,25 +8970,42 @@ impl TakoApp {
         .detach();
     }
 
-    /// シークバー上のクリック位置から再生位置を計算してシークする。
-    /// シークバー要素自体の bounds を使い、クリック x 座標→比率→秒数に変換
-    fn video_seek_by_click(
+    /// シークバー上の x 座標から再生位置を計算してシークする（#484）。
+    ///
+    /// `exact` = true（クリック・ドラッグ終了）はフレーム単位の正確シーク、
+    /// false（ドラッグ中）は許容誤差つきの粗いシーク。粗いシークはデコードが
+    /// 軽くつまみが引っかからない。総尺は常にプレイヤーの実値を使う
+    /// （呼び出し時点で描画された値は古くなりうるため）
+    fn video_seek_to_position(
         &mut self,
         pane_id: PaneId,
         position: gpui::Point<Pixels>,
-        duration: f64,
+        exact: bool,
         cx: &mut Context<Self>,
     ) {
-        let bar_bounds = self.video_seek_bar_bounds.get(&pane_id).copied();
-        if let (Some(bounds), Some(player)) = (bar_bounds, self.video_players.get_mut(&pane_id)) {
-            let frac = ((f32::from(position.x) - f32::from(bounds.origin.x))
-                / f32::from(bounds.size.width))
-            .clamp(0.0, 1.0);
-            let new_time = frac as f64 * duration;
-            player.seek(new_time);
-            player.grab_frame();
-            cx.notify();
-        }
+        let Some(bounds) = self.video_seek_bar_bounds.get(&pane_id).copied() else {
+            return;
+        };
+        let Some(player) = self.video_players.get_mut(&pane_id) else {
+            return;
+        };
+        let new_time = video_player::seek_seconds_at(
+            f32::from(position.x),
+            f32::from(bounds.origin.x),
+            f32::from(bounds.size.width),
+            player.duration,
+        );
+        let tolerance = if exact {
+            0.0
+        } else {
+            video_player::SCRUB_TOLERANCE
+        };
+        player.seek_with_tolerance(new_time, tolerance);
+        // シークは非同期。ここでの grab_frame は空振りしうるので、
+        // 絵の差し替えはティッカー（needs_tick）に任せる
+        player.grab_frame();
+        self.ensure_video_ticker(cx);
+        cx.notify();
     }
 
     /// シークバー上のドラッグ移動でシーク位置を追従する
@@ -8960,16 +9015,79 @@ impl TakoApp {
         position: gpui::Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let bar_bounds = self.video_seek_bar_bounds.get(&pane_id).copied();
-        if let (Some(bounds), Some(player)) = (bar_bounds, self.video_players.get_mut(&pane_id)) {
-            let frac = ((f32::from(position.x) - f32::from(bounds.origin.x))
-                / f32::from(bounds.size.width))
-            .clamp(0.0, 1.0);
-            let new_time = frac as f64 * player.duration;
-            player.seek(new_time);
-            player.grab_frame();
+        self.video_seek_to_position(pane_id, position, false, cx);
+    }
+
+    /// シークバーのドラッグを終了する。離した位置へ正確にシークし直す
+    fn video_seek_end_drag(
+        &mut self,
+        position: Option<gpui::Point<Pixels>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(pane_id) = self.video_seek_dragging.take() else {
+            return false;
+        };
+        if let Some(position) = position {
+            self.video_seek_to_position(pane_id, position, true, cx);
+        } else if let Some(player) = self.video_players.get_mut(&pane_id) {
+            // 位置が取れない経路（ウィンドウ外で離した等）は現在位置で確定する
+            let now = player.current_time;
+            player.seek(now);
+            self.ensure_video_ticker(cx);
+        }
+        cx.notify();
+        true
+    }
+
+    /// シークバーのホバー時刻表示を更新する。バーの外に出たら消す
+    fn video_seek_update_hover(
+        &mut self,
+        pane_id: PaneId,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bounds) = self.video_seek_bar_bounds.get(&pane_id).copied() else {
+            return;
+        };
+        let bar_x = f32::from(bounds.origin.x);
+        let bar_w = f32::from(bounds.size.width);
+        let duration = self
+            .video_players
+            .get(&pane_id)
+            .map(|p| p.duration)
+            .unwrap_or(0.0);
+        if bar_w <= 0.0 {
+            return;
+        }
+        let mouse_x = f32::from(position.x);
+        let hover_sec = video_player::seek_seconds_at(mouse_x, bar_x, bar_w, duration);
+        let rel_x = (mouse_x - bar_x).clamp(0.0, bar_w);
+        let next = Some((pane_id, hover_sec, rel_x));
+        if self.video_seek_hover != next {
+            self.video_seek_hover = next;
             cx.notify();
         }
+    }
+
+    /// ポインタがシークバーから離れたらホバー時刻表示を消す。
+    /// 消した場合 true を返す
+    fn video_seek_clear_hover_if_outside(&mut self, position: gpui::Point<Pixels>) -> bool {
+        let Some((pane_id, _, _)) = self.video_seek_hover else {
+            return false;
+        };
+        // ドラッグ中はバーの外へ出ても表示を保つ（掴んだままの追従表示）
+        if self.video_seek_dragging.is_some() {
+            return false;
+        }
+        let inside = self
+            .video_seek_bar_bounds
+            .get(&pane_id)
+            .is_some_and(|bounds| bounds.contains(&position));
+        if inside {
+            return false;
+        }
+        self.video_seek_hover = None;
+        true
     }
 
     /// フォーカスペインが動画プレビューならキーボードショートカットを処理する。
@@ -8995,6 +9113,7 @@ impl TakoApp {
                 if let Some(p) = self.video_players.get_mut(&pane_id) {
                     p.seek_relative(delta);
                     p.grab_frame();
+                    self.ensure_video_ticker(cx);
                     cx.notify();
                 }
                 true
@@ -9004,6 +9123,7 @@ impl TakoApp {
                 if let Some(p) = self.video_players.get_mut(&pane_id) {
                     p.seek_relative(delta);
                     p.grab_frame();
+                    self.ensure_video_ticker(cx);
                     cx.notify();
                 }
                 true
@@ -9013,6 +9133,7 @@ impl TakoApp {
                     p.pause();
                     p.seek_relative(-1.0 / 30.0);
                     p.grab_frame();
+                    self.ensure_video_ticker(cx);
                     cx.notify();
                 }
                 true
@@ -9022,6 +9143,7 @@ impl TakoApp {
                     p.pause();
                     p.seek_relative(1.0 / 30.0);
                     p.grab_frame();
+                    self.ensure_video_ticker(cx);
                     cx.notify();
                 }
                 true
@@ -12353,6 +12475,9 @@ impl PreviewHost for TakoApp {
     }
 
     fn video_playback(&mut self, pane: PaneId, action: &str) -> Result<String, String> {
+        // UI の再生ボタンと同じく、未起動なら開いてから操作する
+        // （UI でできることは AI からもできる = 開発不変条件。#484）
+        self.ensure_video_player(pane)?;
         let player = self
             .video_players
             .get_mut(&pane)
@@ -12412,21 +12537,46 @@ impl PreviewHost for TakoApp {
     }
 
     fn video_seek(&mut self, pane: PaneId, seconds: f64) -> Result<f64, String> {
+        self.ensure_video_player(pane)?;
         let player = self
             .video_players
             .get_mut(&pane)
             .ok_or_else(|| "動画プレイヤーが起動していない".to_string())?;
+        // UI のクリック・ドラッグ確定と同じ正確シーク。返す値は UI のつまみが
+        // 指す位置（player.current_time）と一致する（#484）
         player.seek(seconds);
+        player.grab_frame();
         Ok(player.current_time)
     }
 
     fn video_volume(&mut self, pane: PaneId, volume: f64) -> Result<f64, String> {
+        self.ensure_video_player(pane)?;
         let player = self
             .video_players
             .get_mut(&pane)
             .ok_or_else(|| "動画プレイヤーが起動していない".to_string())?;
         player.set_volume(volume as f32);
         Ok(player.volume as f64)
+    }
+
+    fn video_status(&self, pane: PaneId) -> Result<tako_control::VideoStatus, String> {
+        let player = self
+            .video_players
+            .get(&pane)
+            .ok_or_else(|| "動画プレイヤーが起動していない".to_string())?;
+        Ok(tako_control::VideoStatus {
+            position: player.current_time,
+            duration: player.duration,
+            state: match player.state {
+                video_player::PlaybackState::Playing => "playing",
+                video_player::PlaybackState::Paused => "paused",
+            },
+            rate: player.rate,
+            volume: player.volume,
+            muted: player.muted,
+            looping: player.looping,
+            ended: player.ended,
+        })
     }
 
     fn set_preview(
@@ -21757,6 +21907,159 @@ mod self_test {
                 check(tab_ok, "確認ダイアログ: タブの × でダイアログ表示 + キャンセル");
             }
 
+            // 75b. 動画プレビューの再生位置（#484）: 総尺の取得と、CLI / MCP の
+            //     シークが UI のつまみ位置（= player.current_time）と一致すること、
+            //     末尾で自動停止して再生ボタンで先頭から再開することを検証する。
+            //     修正前は AVPlayerItem.duration が indefinite のまま総尺 0 になり、
+            //     つまみが常に先頭、クリックはどこを押しても 0 秒へ飛んでいた。
+            //     クリック座標→秒数の写像そのものは video_player の単体テストが持つ
+            let video_dir =
+                std::env::temp_dir().join(format!("tako-selftest-video-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&video_dir);
+            std::fs::create_dir_all(&video_dir).expect("一時ディレクトリを作れる");
+            let video_path = video_dir.join("seekbar.mp4");
+            // 30 秒・キーフレーム 10 秒間隔（素の seekToTime: のキーフレームスナップを
+            // 検出できるようにする。正確シークなら 12.0 秒ちょうどに着地する）
+            let ffmpeg_ok = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y", "-v", "error",
+                    "-f", "lavfi", "-i", "testsrc=size=320x180:rate=30:duration=30",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-g", "300", "-keyint_min", "300", "-sc_threshold", "0",
+                ])
+                .arg(&video_path)
+                .status()
+                .map(|st| st.success())
+                .unwrap_or(false)
+                && video_path.exists();
+            let video_view = cx
+                .update(|cx| cx.windows().first().copied())
+                .unwrap_or(any)
+                .update(cx, |view, _, _| view.downcast::<TakoApp>().ok())
+                .ok()
+                .flatten()
+                .filter(|_| ffmpeg_ok);
+            if video_view.is_none() {
+                println!("SKIP: ffmpeg / ウィンドウが無いため動画の再生位置検証を飛ばす (#484)");
+            }
+            if let Some(view) = video_view {
+                let video_pane = view
+                    .update(cx, |app, _| {
+                        let base = app.focused_pane().as_u64();
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::OpenFile {
+                                pane: Some(base),
+                                path: video_path.display().to_string(),
+                                mode: None,
+                                direction: None,
+                                focus: Some(true),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|r| r["pane"].as_u64())
+                    })
+                    .unwrap_or(0);
+                // UI の再生ボタンと同じくプレイヤーを起動する（CLI / MCP からも
+                // 起動できることの検証を兼ねる。開発不変条件「AI フルコントロール」）
+                let playback = move |app: &mut TakoApp, action: &str| {
+                    tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::VideoPlayback {
+                            pane: Some(video_pane),
+                            action: action.into(),
+                        },
+                        PaneOrigin::Cli,
+                    )
+                };
+                let duration = view.update(cx, |app, _| {
+                    playback(app, "pause")
+                        .ok()
+                        .and_then(|r| r["duration"].as_f64())
+                        .unwrap_or(0.0)
+                });
+                check(
+                    (duration - 30.0).abs() < 0.5,
+                    "動画の総尺を取得できる（修正前は 0:00 だった。#484）",
+                );
+                // CLI / MCP のシークと UI が指す位置が一致する。キーフレームは
+                // 0 / 10 / 20 秒にしかないので、12.0 に着地すれば正確シークが効いている
+                let cli_seek = view.update(cx, |app, _| {
+                    tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::VideoSeek {
+                            pane: Some(video_pane),
+                            seconds: 12.0,
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .ok()
+                    .and_then(|r| r["seconds"].as_f64())
+                    .unwrap_or(-1.0)
+                });
+                wait(cx, 250).await;
+                let ui_pos = view.update(cx, |app, _| {
+                    playback(app, "status")
+                        .ok()
+                        .and_then(|r| r["position"].as_f64())
+                        .unwrap_or(-1.0)
+                });
+                println!(
+                    "TAKO_VIDEO_SEEK: pane={video_pane} duration={duration:.2} \
+                     cli={cli_seek:.2} ui={ui_pos:.2}"
+                );
+                check(
+                    (cli_seek - 12.0).abs() < 0.3 && (ui_pos - 12.0).abs() < 0.3,
+                    "CLI / MCP のシークと UI のつまみ位置が一致する (#484)",
+                );
+                // 末尾まで進んだら自動停止し、再生ボタンで先頭から再開する
+                view.update(cx, |app, _| {
+                    if let Some(p) = app.video_players.get_mut(&PaneId::from_raw(video_pane)) {
+                        p.seek(duration);
+                        p.state = video_player::PlaybackState::Playing;
+                    }
+                });
+                let mut stopped = false;
+                for _ in 0..40 {
+                    wait(cx, 50).await;
+                    stopped = view.update(cx, |app, _| {
+                        app.video_players
+                            .get_mut(&PaneId::from_raw(video_pane))
+                            .map(|p| {
+                                p.grab_frame(); // 末尾判定はここで走る
+                                p.state == video_player::PlaybackState::Paused && p.ended
+                            })
+                            .unwrap_or(false)
+                    });
+                    if stopped {
+                        break;
+                    }
+                }
+                let restart_ok = view.update(cx, |app, cx| {
+                    let restarted = app
+                        .video_players
+                        .get_mut(&PaneId::from_raw(video_pane))
+                        .map(|p| {
+                            p.play(); // 末尾からの再生は先頭へ巻き戻す
+                            let restarted = p.current_time < 0.5;
+                            p.pause();
+                            restarted
+                        })
+                        .unwrap_or(false);
+                    app.ensure_video_ticker(cx);
+                    stopped && restarted
+                });
+                check(
+                    restart_ok,
+                    "末尾で自動停止し、再生ボタンで先頭から再開する (#484)",
+                );
+                view.update(cx, |app, cx| {
+                    app.remove_pane(PaneId::from_raw(video_pane), cx);
+                });
+            }
+            let _ = std::fs::remove_dir_all(&video_dir);
+
             // 76. IME 経路の自己修復（#332）: 外部要因（a11y の Blur アクション等）で
             // window.blur() が起きても、次のキー打鍵で focus が TakoApp へ復元される
             // （on_key_down 冒頭の復元。キーは blur 中も root dispatch フォール
@@ -22003,6 +22306,7 @@ mod self_test {
                 "共有タブバー: 別ウィンドウ所属タブの選択で表示を奪い排他を維持する (#380)",
             );
             wait(cx, 800).await;
+
 
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {

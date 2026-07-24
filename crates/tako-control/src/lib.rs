@@ -48,8 +48,8 @@ pub use dispatch::{
     DispatchError, OffloadJob, PinnedView, TmuxContext,
 };
 pub use host::{
-    PreviewHost, RemoteHost, SessionHost, SystemHost, TmuxHost, UiStateHost, WebViewHost,
-    WorkspaceHost,
+    PreviewHost, RemoteHost, SessionHost, SystemHost, TmuxHost, UiStateHost, VideoStatus,
+    WebViewHost, WorkspaceHost,
 };
 pub use ipc::{IncomingRequest, IpcServer};
 pub use mcp::McpServer;

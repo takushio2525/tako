@@ -395,6 +395,30 @@ pub trait PreviewHost {
     fn video_volume(&mut self, _pane: PaneId, _volume: f64) -> Result<f64, String> {
         Err("動画再生は未対応".into())
     }
+    /// 動画プレイヤーの現在状態（UI のつまみ・時刻表示と同じ値。#484）
+    fn video_status(&self, _pane: PaneId) -> Result<VideoStatus, String> {
+        Err("動画再生は未対応".into())
+    }
+}
+
+/// 動画プレイヤーの現在状態。UI のシークバー・時刻表示が使う値をそのまま返す
+/// （CLI / MCP と UI の一致を検証・観測できるようにするため。#484）
+#[derive(Debug, Clone, PartialEq)]
+pub struct VideoStatus {
+    /// 再生位置（秒）
+    pub position: f64,
+    /// 総尺（秒。取得できない場合は 0.0）
+    pub duration: f64,
+    /// "playing" / "paused"
+    pub state: &'static str,
+    /// 再生速度
+    pub rate: f32,
+    /// 音量（0.0〜1.0）
+    pub volume: f32,
+    pub muted: bool,
+    pub looping: bool,
+    /// 末尾に到達して停止しているか
+    pub ended: bool,
 }
 
 // ---------------------------------------------------------------------------
