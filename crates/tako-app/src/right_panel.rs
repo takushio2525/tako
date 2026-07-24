@@ -3115,6 +3115,14 @@ impl TakoApp {
                         return true;
                     }
                 }
+                // 空白は key_char が来ないことがある（実機で「Fix-487 staged」の
+                // 空白以降が入らないのを観測。#487）ので論理キー名で拾い直す
+                if keystroke.key == "space" {
+                    self.git_commit_message.insert(cursor, ' ');
+                    self.git_commit_cursor = cursor + 1;
+                    cx.notify();
+                    return true;
+                }
                 // 修飾なしキーは入力欄が握る（ターミナルへ漏らさない）
                 true
             }

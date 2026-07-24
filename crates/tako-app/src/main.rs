@@ -20659,7 +20659,15 @@ mod self_test {
                         };
                         app.handle_git_commit_key(&upper, cx);
                         app.handle_git_commit_key(&ch("b", "b"), cx);
-                        app.handle_git_commit_key(&ch("space", " "), cx);
+                        // key_char が来ない space（実機の挙動）でも空白が入ること
+                        app.handle_git_commit_key(
+                            &Keystroke {
+                                modifiers: Modifiers::default(),
+                                key: "space".into(),
+                                key_char: None,
+                            },
+                            cx,
+                        );
                         app.handle_git_commit_key(&ch("1", "1"), cx);
                         app.handle_git_commit_key(&ch("minus", "-"), cx);
                         let typed = app.git_commit_message == "Ab 1-";
