@@ -88,19 +88,8 @@ pub fn git_detecting() -> &'static str {
 pub fn git_branches(n: usize) -> String {
     tr!(format!(" ブランチ ({n})"), format!(" Branches ({n})"))
 }
-pub fn git_changes(n: usize) -> String {
-    tr!(format!(" 変更 ({n})"), format!(" Changes ({n})"))
-}
 pub fn git_commits(n: usize) -> String {
     tr!(format!(" コミット ({n})"), format!(" Commits ({n})"))
-}
-/// diff 件数の単位サフィックス（"diff (5 コミット)" = 選択コミットの diff /
-/// "diff (5 ファイル)" = 作業ツリーの diff）
-pub fn git_commit_tab() -> &'static str {
-    tr!(" コミット", " in commit")
-}
-pub fn git_files_tab() -> &'static str {
-    tr!(" ファイル", " files")
 }
 pub fn git_commit_placeholder(branch: &str) -> String {
     tr!(
@@ -110,6 +99,76 @@ pub fn git_commit_placeholder(branch: &str) -> String {
 }
 pub fn git_commit_btn() -> &'static str {
     tr!("コミット", "Commit")
+}
+
+// --- ステージング UI（#487。VSCode ソース管理の 2 セクション構造） ---
+
+/// git リポジトリではない cwd での表示（旧: 検出中のまま止まって見えた）
+pub fn git_not_a_repo() -> &'static str {
+    tr!(
+        "このタブに git リポジトリがありません",
+        "No git repository in this tab"
+    )
+}
+pub fn git_staged_section(n: usize) -> String {
+    tr!(
+        format!(" ステージ済みの変更 ({n})"),
+        format!(" Staged Changes ({n})")
+    )
+}
+pub fn git_unstaged_section(n: usize) -> String {
+    tr!(format!(" 変更 ({n})"), format!(" Changes ({n})"))
+}
+pub fn git_no_changes() -> &'static str {
+    tr!("変更はありません", "No changes")
+}
+/// 行ごとのステージボタンの tooltip 相当ラベル
+pub fn git_stage_file() -> &'static str {
+    tr!("ステージ", "Stage")
+}
+pub fn git_unstage_file() -> &'static str {
+    tr!("アンステージ", "Unstage")
+}
+pub fn git_stage_all() -> &'static str {
+    tr!("すべてステージ", "Stage all")
+}
+pub fn git_unstage_all() -> &'static str {
+    tr!("すべてアンステージ", "Unstage all")
+}
+pub fn git_refresh() -> &'static str {
+    tr!("更新", "Refresh")
+}
+/// diff セクションの見出し（作業ツリー diff は staged / unstaged を明示する）
+pub fn git_diff_unstaged(n: usize) -> String {
+    tr!(
+        format!(" diff: 未ステージ ({n} ファイル)"),
+        format!(" diff: unstaged ({n} files)")
+    )
+}
+pub fn git_diff_staged(n: usize) -> String {
+    tr!(
+        format!(" diff: ステージ済み ({n} ファイル)"),
+        format!(" diff: staged ({n} files)")
+    )
+}
+pub fn git_diff_commit(n: usize) -> String {
+    tr!(
+        format!(" diff: 選択コミット ({n} ファイル)"),
+        format!(" diff: selected commit ({n} files)")
+    )
+}
+/// ステージ済みがあるときのコミットボタン注記（`-a` を付けない旨）
+pub fn git_commit_staged_hint(n: usize) -> String {
+    tr!(
+        format!("ステージ済み {n} 件をコミット"),
+        format!("Commit {n} staged file(s)")
+    )
+}
+pub fn git_commit_all_hint() -> &'static str {
+    tr!(
+        "追跡中の全変更をコミット（ステージ済みなし）",
+        "Commit all tracked changes (nothing staged)"
+    )
 }
 
 #[cfg(test)]
@@ -137,12 +196,23 @@ mod tests {
                 closed_tab_group("dev", 2),
                 git_detecting().to_string(),
                 git_branches(2),
-                git_changes(4),
                 git_commits(10),
-                git_commit_tab().to_string(),
-                git_files_tab().to_string(),
                 git_commit_placeholder("main"),
                 git_commit_btn().to_string(),
+                git_not_a_repo().to_string(),
+                git_staged_section(2),
+                git_unstaged_section(3),
+                git_no_changes().to_string(),
+                git_stage_file().to_string(),
+                git_unstage_file().to_string(),
+                git_stage_all().to_string(),
+                git_unstage_all().to_string(),
+                git_refresh().to_string(),
+                git_diff_unstaged(1),
+                git_diff_staged(2),
+                git_diff_commit(3),
+                git_commit_staged_hint(2),
+                git_commit_all_hint().to_string(),
             ]
         });
     }

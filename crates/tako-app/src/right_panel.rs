@@ -7,6 +7,16 @@ use tako_core::{CommandState, PaneId, SplitDirection};
 use super::*;
 use crate::file_icons::ui_icon;
 
+/// stage / unstage のフィードバック文言用ラベル（#487）。
+/// パス空 = 全件、1 件 = そのパス、複数 = "N files"
+pub(crate) fn stage_feedback_label(paths: &[String]) -> String {
+    match paths.len() {
+        0 => "all".to_string(),
+        1 => paths[0].clone(),
+        n => format!("{n} files"),
+    }
+}
+
 /// orch ビューのワーカー行（#217。render_orch_view で収集）
 struct OrchWorker {
     pane: PaneId,
@@ -2037,6 +2047,189 @@ impl TakoApp {
 
     /// git ビュー（FR-3.6 git graph + FR-3.9 diff ビューア）。cwd 連動で 2 秒ポーリング更新。
     /// セクション: ブランチ → 変更ファイル → コミットグラフ → diff
+    /// 折りたたみ三角 + 見出し + 右端の一括操作ボタンからなるセクションヘッダ（#487）。
+    /// 三角は SVG chevron（UI 絵文字ゼロの規約に合わせる）
+    #[allow(clippy::too_many_arguments)]
+    fn git_section_header(
+        &self,
+        id: &'static str,
+        collapsed: bool,
+        label: String,
+        bulk: Option<(&'static str, &'static str, &'static str)>,
+        theme: &tako_core::Theme,
+        on_bulk: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let fg = theme.tab_inactive_foreground;
+        let bg_hover = theme.selection_background;
+        let mut header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .px_2()
+            .py(px(3.0))
+            .mt_1()
+            .text_size(px(10.0))
+            .text_color(hsla(fg))
+            .child(
+                div()
+                    .id(id)
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .flex_1()
+                    .gap(px(2.0))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgba_alpha(bg_hover, 0.3)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.git_collapsed.changes = !this.git_collapsed.changes;
+                        cx.notify();
+                    }))
+                    .child(
+                        svg()
+                            .path(if collapsed {
+                                ui_icon::CHEVRON_RIGHT
+                            } else {
+                                ui_icon::CHEVRON_DOWN
+                            })
+                            .w(px(10.0))
+                            .h(px(10.0))
+                            .flex_none()
+                            .text_color(hsla(fg)),
+                    )
+                    .child(SharedString::from(label)),
+            );
+        if let Some((btn_id, icon, tip)) = bulk {
+            header = header.child(
+                div()
+                    .id(btn_id)
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(2.0))
+                    .px_1()
+                    .rounded(px(3.0))
+                    .cursor_pointer()
+                    .text_color(hsla(fg))
+                    .hover(|d| {
+                        d.bg(rgba_alpha(theme.accent, 0.2))
+                            .text_color(hsla(theme.accent))
+                    })
+                    .on_click(on_bulk)
+                    .child(svg().path(icon).w(px(10.0)).h(px(10.0)).flex_none())
+                    .child(SharedString::from(tip)),
+            );
+        }
+        header
+    }
+
+    /// 変更ファイル 1 行（#487）。右端の +/− でそのファイルだけ stage / unstage する
+    fn git_change_row(
+        &self,
+        id: (&'static str, usize),
+        entry: &tako_core::GitStatusEntry,
+        staged: bool,
+        repo_root: &str,
+        theme: &tako_core::Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let fg = theme.tab_inactive_foreground;
+        let badge = if staged {
+            entry.staged_badge()
+        } else {
+            entry.unstaged_badge()
+        };
+        // バッジ色: 追加/未追跡 = 緑、変更 = 黄、削除 = 赤、リネーム = accent
+        let color = match badge {
+            'A' | 'U' => theme.green,
+            'M' => theme.yellow,
+            'D' => theme.red,
+            'R' | 'C' => theme.accent,
+            _ => fg,
+        };
+        let path = entry.path.clone();
+        let repo = repo_root.to_string();
+        let action_path = entry.path.clone();
+        div()
+            .id(id)
+            .group("git-change-row")
+            .flex()
+            .flex_row()
+            .items_center()
+            .px_3()
+            .py(px(1.0))
+            .text_size(px(11.0))
+            .hover(|d| d.bg(rgba_alpha(theme.selection_background, 0.25)))
+            .child(
+                div()
+                    .w(px(14.0))
+                    .flex_none()
+                    .text_color(hsla(color))
+                    .child(badge.to_string()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .text_ellipsis()
+                    .overflow_hidden()
+                    .text_color(hsla(if staged {
+                        theme.tab_active_foreground
+                    } else {
+                        fg
+                    }))
+                    .child(path),
+            )
+            .child(
+                div()
+                    .id(("git-row-action", id.1 + if staged { 0 } else { 10_000 }))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(2.0))
+                    .px_1()
+                    .h(px(14.0))
+                    .rounded(px(3.0))
+                    .cursor_pointer()
+                    .text_size(px(9.0))
+                    .text_color(hsla_alpha(fg, 0.6))
+                    .hover(|d| {
+                        d.bg(rgba_alpha(theme.accent, 0.25))
+                            .text_color(hsla(theme.accent))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let paths = vec![action_path.clone()];
+                        if staged {
+                            this.git_do_unstage(repo.clone(), paths, cx);
+                        } else {
+                            this.git_do_stage(repo.clone(), paths, cx);
+                        }
+                    }))
+                    .child(
+                        svg()
+                            .path(if staged {
+                                ui_icon::MINUS
+                            } else {
+                                ui_icon::PLUS
+                            })
+                            .w(px(10.0))
+                            .h(px(10.0))
+                            .flex_none(),
+                    )
+                    // 何のボタンかは行ホバー時にだけ言葉で出す（常時は VSCode 同様アイコンのみ）
+                    .child(
+                        div()
+                            .opacity(0.0)
+                            .group_hover("git-change-row", |d| d.opacity(1.0))
+                            .child(if staged {
+                                crate::ui_text::panel::git_unstage_file()
+                            } else {
+                                crate::ui_text::panel::git_stage_file()
+                            }),
+                    ),
+            )
+    }
+
     fn render_git_view(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme.clone();
         let data = self.git_data.clone();
@@ -2054,8 +2247,9 @@ impl TakoApp {
 
         let Some(data) = data else {
             // git パネルを開いた瞬間のデータ取得（初回は即 fetch）
+            let has_cwd = self.git_cwd_for_tab();
             if self.git_data.is_none() {
-                if let Some(cwd) = self.git_cwd_for_tab() {
+                if let Some(cwd) = has_cwd.clone() {
                     cx.spawn(async move |this, cx| {
                         let data = cx
                             .background_executor()
@@ -2069,7 +2263,13 @@ impl TakoApp {
                     .detach();
                 }
             }
-            return root.p_4().child(crate::ui_text::panel::git_detecting());
+            // #487: リポジトリが無いタブで「検出中…」が永続表示され壊れて見えていたのを、
+            // 検出対象が無い場合は明示メッセージにする
+            return root.p_4().child(if has_cwd.is_some() {
+                crate::ui_text::panel::git_detecting()
+            } else {
+                crate::ui_text::panel::git_not_a_repo()
+            });
         };
 
         let accent = theme.accent;
@@ -2117,16 +2317,57 @@ impl TakoApp {
                             .ml_2()
                             .text_size(px(10.0))
                             .text_color(hsla(fg))
+                            .text_ellipsis()
                             .child(format!("-> {}", data.upstream)),
                     )
-                }),
+                })
+                .child(div().flex_grow(1.0))
+                // 手動更新（#487。2 秒ポーリング待ちをせず即座に取り直す）
+                .child(
+                    div()
+                        .id("git-refresh-btn")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(2.0))
+                        .px_1()
+                        .rounded(px(3.0))
+                        .cursor_pointer()
+                        .text_size(px(9.0))
+                        .text_color(hsla(fg))
+                        .hover(|d| {
+                            d.bg(rgba_alpha(bg_hover, 0.4))
+                                .text_color(hsla(theme.accent))
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.refresh_git(cx);
+                        }))
+                        .child(svg().path(ui_icon::REFRESH).w(px(11.0)).h(px(11.0)))
+                        .child(crate::ui_text::panel::git_refresh()),
+                ),
         );
 
-        // ──── コミットメッセージ入力 + 操作ボタン（#472）────
+        // ──── コミットメッセージ入力 + 操作ボタン（#472 / #487）────
         let commit_msg = self.git_commit_message.clone();
+        let commit_cursor = self.git_commit_cursor.min(commit_msg.len());
+        let commit_focused = self.git_commit_input_focused;
         let branch_name = data.branch.clone();
         let has_changes = !data.status.is_empty();
         let repo_root_str = data.repo_root.clone();
+        // #487: ステージ済み / 未ステージを分類（VSCode ソース管理の 2 セクション構造）
+        let staged_entries: Vec<tako_core::GitStatusEntry> = data
+            .status
+            .iter()
+            .filter(|e| e.is_staged())
+            .cloned()
+            .collect();
+        let unstaged_entries: Vec<tako_core::GitStatusEntry> = data
+            .status
+            .iter()
+            .filter(|e| e.is_unstaged())
+            .cloned()
+            .collect();
+        let staged_count = staged_entries.len();
 
         // フィードバック表示
         if let Some(fb) = &self.git_feedback {
@@ -2142,34 +2383,67 @@ impl TakoApp {
             );
         }
 
-        // コミットメッセージ入力欄
+        // コミットメッセージ入力欄（#487: キャレット表示 + フォーカス可視化。
+        // 実際の文字入力は replace_text_in_range / handle_git_commit_key が担う）
+        let (msg_before, msg_after) = commit_msg.split_at(commit_cursor);
         root = root.child(
             div().px_2().py(px(4.0)).child(
                 div()
                     .id("git-commit-input")
                     .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .overflow_hidden()
                     .px_1()
                     .py(px(3.0))
                     .rounded(px(4.0))
                     .border_1()
-                    .border_color(hsla(theme.border_subtle))
+                    .border_color(hsla_alpha(
+                        if commit_focused {
+                            theme.accent
+                        } else {
+                            theme.border_subtle
+                        },
+                        if commit_focused { 0.7 } else { 1.0 },
+                    ))
                     .bg(rgba(theme.crust))
                     .text_size(px(11.0))
                     .text_color(hsla(fg_active))
-                    .cursor_text()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.git_commit_input_focused = true;
-                        cx.notify();
-                    }))
-                    .child(if commit_msg.is_empty() {
-                        SharedString::from(crate::ui_text::panel::git_commit_placeholder(
-                            &branch_name,
-                        ))
-                    } else {
-                        SharedString::from(commit_msg.clone())
+                    .cursor(CursorStyle::IBeam)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            this.git_commit_input_focused = true;
+                            this.git_commit_cursor = this.git_commit_message.len();
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .when(commit_msg.is_empty() && !commit_focused, |d| {
+                        d.child(
+                            div()
+                                .text_color(hsla(theme.text_muted))
+                                .text_ellipsis()
+                                .child(SharedString::from(
+                                    crate::ui_text::panel::git_commit_placeholder(&branch_name),
+                                )),
+                        )
                     })
-                    .when(commit_msg.is_empty(), |d| {
-                        d.text_color(hsla(theme.text_muted))
+                    .when(!commit_msg.is_empty(), |d| {
+                        d.child(div().child(SharedString::from(msg_before.to_string())))
+                    })
+                    .when(commit_focused, |d| {
+                        d.child(
+                            div()
+                                .w(px(1.5))
+                                .h(px(13.0))
+                                .flex_none()
+                                .bg(hsla(theme.accent)),
+                        )
+                    })
+                    .when(!commit_msg.is_empty(), |d| {
+                        d.child(div().child(SharedString::from(msg_after.to_string())))
                     }),
             ),
         );
@@ -2226,6 +2500,20 @@ impl TakoApp {
                             .child(crate::ui_text::panel::git_commit_btn()),
                     )
                 })
+                // #487: ステージ済みがあるときは「ステージ済みのみコミット」であることを明示
+                .child(
+                    div()
+                        .text_size(px(9.0))
+                        .text_color(hsla(theme.text_muted))
+                        .text_ellipsis()
+                        .child(if staged_count > 0 {
+                            SharedString::from(crate::ui_text::panel::git_commit_staged_hint(
+                                staged_count,
+                            ))
+                        } else {
+                            SharedString::from(crate::ui_text::panel::git_commit_all_hint())
+                        }),
+                )
                 .child(
                     btn_base("git-pull-btn", &theme, true)
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2265,6 +2553,7 @@ impl TakoApp {
                 .flex()
                 .flex_row()
                 .items_center()
+                .gap(px(2.0))
                 .px_2()
                 .py(px(3.0))
                 .cursor_pointer()
@@ -2275,7 +2564,18 @@ impl TakoApp {
                     this.git_collapsed.branches = !this.git_collapsed.branches;
                     cx.notify();
                 }))
-                .child(if collapsed.branches { "▸" } else { "▾" })
+                .child(
+                    svg()
+                        .path(if collapsed.branches {
+                            ui_icon::CHEVRON_RIGHT
+                        } else {
+                            ui_icon::CHEVRON_DOWN
+                        })
+                        .w(px(10.0))
+                        .h(px(10.0))
+                        .flex_none()
+                        .text_color(hsla(fg)),
+                )
                 .child(crate::ui_text::panel::git_branches(
                     data.branches.iter().filter(|b| !b.is_remote).count(),
                 )),
@@ -2302,66 +2602,79 @@ impl TakoApp {
             }
         }
 
-        // ──── 変更ファイルセクション ────
-        if !data.status.is_empty() {
+        // ──── 変更ファイルセクション（#487: ステージ済み / 未ステージの 2 段構成）────
+        // 折りたたみは 2 セクション共通（git_collapsed.changes）で扱う
+        if data.status.is_empty() {
             root = root.child(
                 div()
-                    .id("git-changes-header")
-                    .flex()
-                    .flex_row()
-                    .items_center()
                     .px_2()
-                    .py(px(3.0))
+                    .py(px(4.0))
                     .mt_1()
-                    .cursor_pointer()
                     .text_size(px(10.0))
-                    .text_color(hsla(fg))
-                    .hover(|d| d.bg(rgba_alpha(bg_hover, 0.3)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.git_collapsed.changes = !this.git_collapsed.changes;
-                        cx.notify();
-                    }))
-                    .child(if collapsed.changes { "▸" } else { "▾" })
-                    .child(crate::ui_text::panel::git_changes(data.status.len())),
+                    .text_color(hsla(theme.text_muted))
+                    .child(crate::ui_text::panel::git_no_changes()),
             );
-            if !collapsed.changes {
-                for entry in &data.status {
-                    let color = match (entry.index, entry.worktree) {
-                        ('?', _) => theme.green,          // 緑 = untracked
-                        (_, 'M') => theme.yellow,         // 黄 = modified
-                        ('D', _) | (_, 'D') => theme.red, // 赤 = deleted
-                        ('A', _) => theme.green,          // 緑 = added
-                        _ => fg,
-                    };
-                    let badge = match (entry.index, entry.worktree) {
-                        ('?', _) => "?",
-                        (_, 'M') | ('M', _) => "M",
-                        ('D', _) | (_, 'D') => "D",
-                        ('A', _) => "A",
-                        ('R', _) => "R",
-                        _ => " ",
-                    };
-                    root = root.child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .px_3()
-                            .py(px(1.0))
-                            .text_size(px(11.0))
-                            .child(
-                                div()
-                                    .w(px(14.0))
-                                    .text_color(hsla(color))
-                                    .child(badge.to_string()),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_ellipsis()
-                                    .text_color(hsla(fg))
-                                    .child(entry.path.clone()),
-                            ),
-                    );
+        } else {
+            let repo_for_stage_all = repo_root_str.clone();
+            let repo_for_unstage_all = repo_root_str.clone();
+            // ステージ済みセクション
+            if staged_count > 0 {
+                root = root.child(self.git_section_header(
+                    "git-staged-header",
+                    collapsed.changes,
+                    crate::ui_text::panel::git_staged_section(staged_count),
+                    Some((
+                        "git-unstage-all",
+                        ui_icon::MINUS,
+                        crate::ui_text::panel::git_unstage_all(),
+                    )),
+                    &theme,
+                    cx.listener(move |this, _, _, cx| {
+                        this.git_do_unstage(repo_for_unstage_all.clone(), Vec::new(), cx);
+                    }),
+                    cx,
+                ));
+                if !collapsed.changes {
+                    for (i, entry) in staged_entries.iter().enumerate() {
+                        root = root.child(self.git_change_row(
+                            ("git-staged-row", i),
+                            entry,
+                            true,
+                            &repo_root_str,
+                            &theme,
+                            cx,
+                        ));
+                    }
+                }
+            }
+            // 未ステージセクション
+            if !unstaged_entries.is_empty() {
+                root = root.child(self.git_section_header(
+                    "git-unstaged-header",
+                    collapsed.changes,
+                    crate::ui_text::panel::git_unstaged_section(unstaged_entries.len()),
+                    Some((
+                        "git-stage-all",
+                        ui_icon::PLUS,
+                        crate::ui_text::panel::git_stage_all(),
+                    )),
+                    &theme,
+                    cx.listener(move |this, _, _, cx| {
+                        this.git_do_stage(repo_for_stage_all.clone(), Vec::new(), cx);
+                    }),
+                    cx,
+                ));
+                if !collapsed.changes {
+                    for (i, entry) in unstaged_entries.iter().enumerate() {
+                        root = root.child(self.git_change_row(
+                            ("git-unstaged-row", i),
+                            entry,
+                            false,
+                            &repo_root_str,
+                            &theme,
+                            cx,
+                        ));
+                    }
                 }
             }
         }
@@ -2374,6 +2687,7 @@ impl TakoApp {
                 .flex()
                 .flex_row()
                 .items_center()
+                .gap(px(2.0))
                 .px_2()
                 .py(px(3.0))
                 .mt_1()
@@ -2385,7 +2699,18 @@ impl TakoApp {
                     this.git_collapsed.commits = !this.git_collapsed.commits;
                     cx.notify();
                 }))
-                .child(if collapsed.commits { "▸" } else { "▾" })
+                .child(
+                    svg()
+                        .path(if collapsed.commits {
+                            ui_icon::CHEVRON_RIGHT
+                        } else {
+                            ui_icon::CHEVRON_DOWN
+                        })
+                        .w(px(10.0))
+                        .h(px(10.0))
+                        .flex_none()
+                        .text_color(hsla(fg)),
+                )
                 .child(crate::ui_text::panel::git_commits(data.commits.len())),
         );
         if !collapsed.commits {
@@ -2514,14 +2839,39 @@ impl TakoApp {
             }
         }
 
-        // ──── diff セクション ────
-        if !data.diff_files.is_empty() {
+        // ──── diff セクション（#487: 未ステージ / ステージ済み / 選択コミットを別見出しに）────
+        let diff_sections: Vec<(String, &Vec<tako_core::DiffFile>)> = if selected_commit.is_some() {
+            vec![(
+                crate::ui_text::panel::git_diff_commit(data.diff_files.len()),
+                &data.diff_files,
+            )]
+        } else {
+            let mut v: Vec<(String, &Vec<tako_core::DiffFile>)> = Vec::new();
+            if !data.diff_files.is_empty() {
+                v.push((
+                    crate::ui_text::panel::git_diff_unstaged(data.diff_files.len()),
+                    &data.diff_files,
+                ));
+            }
+            if !data.diff_staged.is_empty() {
+                v.push((
+                    crate::ui_text::panel::git_diff_staged(data.diff_staged.len()),
+                    &data.diff_staged,
+                ));
+            }
+            v
+        };
+        for (si, (label, files)) in diff_sections.iter().enumerate() {
+            if files.is_empty() {
+                continue;
+            }
             root = root.child(
                 div()
-                    .id("git-diff-header")
+                    .id(("git-diff-header", si))
                     .flex()
                     .flex_row()
                     .items_center()
+                    .gap(px(2.0))
                     .px_2()
                     .py(px(3.0))
                     .mt_1()
@@ -2533,71 +2883,75 @@ impl TakoApp {
                         this.git_collapsed.diff = !this.git_collapsed.diff;
                         cx.notify();
                     }))
-                    .child(if collapsed.diff { "▸" } else { "▾" })
-                    .child(format!(
-                        " diff ({}{})",
-                        data.diff_files.len(),
-                        if selected_commit.is_some() {
-                            crate::ui_text::panel::git_commit_tab()
-                        } else {
-                            crate::ui_text::panel::git_files_tab()
-                        }
-                    )),
+                    .child(
+                        svg()
+                            .path(if collapsed.diff {
+                                ui_icon::CHEVRON_RIGHT
+                            } else {
+                                ui_icon::CHEVRON_DOWN
+                            })
+                            .w(px(10.0))
+                            .h(px(10.0))
+                            .flex_none()
+                            .text_color(hsla(fg)),
+                    )
+                    .child(SharedString::from(label.clone())),
             );
-            if !collapsed.diff {
-                for file in &data.diff_files {
-                    // ファイルヘッダ
+            if collapsed.diff {
+                continue;
+            }
+            for file in files.iter() {
+                // ファイルヘッダ
+                root = root.child(
+                    div()
+                        .px_3()
+                        .py(px(2.0))
+                        .text_size(px(10.0))
+                        .text_color(hsla(fg_active))
+                        .bg(rgba_alpha(fg, 0.05))
+                        .child(file.path.clone()),
+                );
+                for hunk in &file.hunks {
+                    // ハンクヘッダ
                     root = root.child(
                         div()
                             .px_3()
-                            .py(px(2.0))
-                            .text_size(px(10.0))
-                            .text_color(hsla(fg_active))
-                            .bg(rgba_alpha(fg, 0.05))
-                            .child(file.path.clone()),
+                            .py(px(1.0))
+                            .text_size(px(9.0))
+                            .text_color(hsla(theme.ansi[6])) // cyan
+                            .child(hunk.header.clone()),
                     );
-                    for hunk in &file.hunks {
-                        // ハンクヘッダ
+                    for line in &hunk.lines {
+                        let (prefix, color, bg_color) = match line.kind {
+                            tako_core::DiffLineKind::Add => (
+                                "+",
+                                theme.green, // 緑
+                                rgba_alpha(theme.green, 0.1),
+                            ),
+                            tako_core::DiffLineKind::Remove => (
+                                "-",
+                                theme.red, // 赤
+                                rgba_alpha(theme.red, 0.1),
+                            ),
+                            tako_core::DiffLineKind::Context => (
+                                " ",
+                                fg,
+                                Rgba {
+                                    r: 0.0,
+                                    g: 0.0,
+                                    b: 0.0,
+                                    a: 0.0,
+                                },
+                            ),
+                        };
                         root = root.child(
                             div()
                                 .px_3()
-                                .py(px(1.0))
-                                .text_size(px(9.0))
-                                .text_color(hsla(theme.ansi[6])) // cyan
-                                .child(hunk.header.clone()),
+                                .text_size(px(11.0))
+                                .text_color(hsla(color))
+                                .bg(bg_color)
+                                .child(format!("{prefix}{}", line.content)),
                         );
-                        for line in &hunk.lines {
-                            let (prefix, color, bg_color) = match line.kind {
-                                tako_core::DiffLineKind::Add => (
-                                    "+",
-                                    theme.green, // 緑
-                                    rgba_alpha(theme.green, 0.1),
-                                ),
-                                tako_core::DiffLineKind::Remove => (
-                                    "-",
-                                    theme.red, // 赤
-                                    rgba_alpha(theme.red, 0.1),
-                                ),
-                                tako_core::DiffLineKind::Context => (
-                                    " ",
-                                    fg,
-                                    Rgba {
-                                        r: 0.0,
-                                        g: 0.0,
-                                        b: 0.0,
-                                        a: 0.0,
-                                    },
-                                ),
-                            };
-                            root = root.child(
-                                div()
-                                    .px_3()
-                                    .text_size(px(11.0))
-                                    .text_color(hsla(color))
-                                    .bg(bg_color)
-                                    .child(format!("{prefix}{}", line.content)),
-                            );
-                        }
                     }
                 }
             }
@@ -2606,13 +2960,19 @@ impl TakoApp {
         root
     }
 
-    /// git コミットメッセージ入力欄のキーハンドラ（#472）。
-    /// true を返すとイベントを消費、false を返すと後続ハンドラへ
+    /// git コミットメッセージ入力欄のキーハンドラ（#472 → #487 で全面修正）。
+    /// true を返すとイベントを消費、false を返すと後続ハンドラへ。
+    ///
+    /// #487 の修正点: ①`keystroke.key` は shift 無視の論理キー名なので大文字が打てなかった →
+    /// `key_char` を使う ②未知キーを false で流していたため文字がターミナルへ漏れていた →
+    /// 修飾なしキーは常に消費する ③キャレット位置（←→ / Home / End / Delete）に対応
     pub(crate) fn handle_git_commit_key(
         &mut self,
         keystroke: &gpui::Keystroke,
         cx: &mut Context<Self>,
     ) -> bool {
+        let cursor = self.git_commit_cursor.min(self.git_commit_message.len());
+        self.git_commit_cursor = cursor;
         match keystroke.key.as_str() {
             "enter" if keystroke.modifiers.platform => {
                 if let Some(data) = &self.git_data {
@@ -2627,40 +2987,157 @@ impl TakoApp {
                 true
             }
             "backspace" => {
-                self.git_commit_message.pop();
+                if cursor > 0 {
+                    let prev = self.git_commit_message[..cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    self.git_commit_message.drain(prev..cursor);
+                    self.git_commit_cursor = prev;
+                }
                 cx.notify();
                 true
             }
-            key if key.len() == 1
-                && !keystroke.modifiers.platform
-                && !keystroke.modifiers.control =>
-            {
-                self.git_commit_message.push_str(key);
+            "delete" => {
+                if cursor < self.git_commit_message.len() {
+                    let next = cursor
+                        + self.git_commit_message[cursor..]
+                            .chars()
+                            .next()
+                            .map(|c| c.len_utf8())
+                            .unwrap_or(0);
+                    self.git_commit_message.drain(cursor..next);
+                }
                 cx.notify();
                 true
             }
-            "space" if !keystroke.modifiers.platform => {
-                self.git_commit_message.push(' ');
+            "left" => {
+                self.git_commit_cursor = self.git_commit_message[..cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
                 cx.notify();
                 true
             }
-            _ => false,
+            "right" => {
+                if cursor < self.git_commit_message.len() {
+                    self.git_commit_cursor = cursor
+                        + self.git_commit_message[cursor..]
+                            .chars()
+                            .next()
+                            .map(|c| c.len_utf8())
+                            .unwrap_or(0);
+                }
+                cx.notify();
+                true
+            }
+            "home" | "up" => {
+                self.git_commit_cursor = 0;
+                cx.notify();
+                true
+            }
+            "end" | "down" => {
+                self.git_commit_cursor = self.git_commit_message.len();
+                cx.notify();
+                true
+            }
+            // cmd / ctrl 付きはアプリのキーバインド（⌘V 等）へ通す
+            _ if keystroke.modifiers.platform || keystroke.modifiers.control => false,
+            _ => {
+                if let Some(ch) = keystroke.key_char.as_deref() {
+                    if !ch.is_empty() && !ch.chars().any(|c| c.is_control()) {
+                        self.git_commit_message.insert_str(cursor, ch);
+                        self.git_commit_cursor = cursor + ch.len();
+                        cx.notify();
+                        return true;
+                    }
+                }
+                // 修飾なしキーは入力欄が握る（ターミナルへ漏らさない）
+                true
+            }
         }
     }
 
-    /// git commit を background で実行し、完了後にフィードバック表示 + データ更新（#472）
-    fn git_do_commit(&mut self, repo_root: String, cx: &mut Context<Self>) {
-        let message = self.git_commit_message.clone();
-        if message.trim().is_empty() {
-            return;
-        }
-        self.git_commit_message.clear();
+    /// ファイル単位 / 全体の git add を background 実行する（#487。
+    /// `paths` が空なら全変更をステージ = CLI `tako git stage` と同じ挙動）
+    pub(crate) fn git_do_stage(
+        &mut self,
+        repo_root: String,
+        paths: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let label = stage_feedback_label(&paths);
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let repo = std::path::Path::new(&repo_root);
-                    tako_core::git::commit(repo, &message, true)
+                    let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+                    tako_core::git::stage(repo, &refs)
+                })
+                .await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                match result {
+                    Ok(_) => app.git_set_feedback(format!("staged: {label}"), false, cx),
+                    Err(e) => app.git_set_feedback(e, true, cx),
+                }
+                app.refresh_git(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// ファイル単位 / 全体の git reset HEAD を background 実行する（#487）
+    pub(crate) fn git_do_unstage(
+        &mut self,
+        repo_root: String,
+        paths: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let label = stage_feedback_label(&paths);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = std::path::Path::new(&repo_root);
+                    let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+                    tako_core::git::unstage(repo, &refs)
+                })
+                .await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                match result {
+                    Ok(_) => app.git_set_feedback(format!("unstaged: {label}"), false, cx),
+                    Err(e) => app.git_set_feedback(e, true, cx),
+                }
+                app.refresh_git(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// git commit を background で実行し、完了後にフィードバック表示 + データ更新（#472）。
+    /// #487: ステージ済みがあるときは `-a` を付けず「ステージした分だけ」コミットする
+    /// （付けたままだと UI のステージング操作が無意味になる）
+    fn git_do_commit(&mut self, repo_root: String, cx: &mut Context<Self>) {
+        let message = self.git_commit_message.clone();
+        if message.trim().is_empty() {
+            return;
+        }
+        let has_staged = self
+            .git_data
+            .as_ref()
+            .is_some_and(|d| d.status.iter().any(|e| e.is_staged()));
+        let all = !has_staged;
+        self.git_commit_message.clear();
+        self.git_commit_cursor = 0;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = std::path::Path::new(&repo_root);
+                    tako_core::git::commit(repo, &message, all)
                 })
                 .await;
             let _ = this.update(cx, |app: &mut TakoApp, cx| {
