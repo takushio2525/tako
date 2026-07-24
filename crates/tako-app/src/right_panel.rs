@@ -2045,8 +2045,6 @@ impl TakoApp {
         root
     }
 
-    /// git ビュー（FR-3.6 git graph + FR-3.9 diff ビューア）。cwd 連動で 2 秒ポーリング更新。
-    /// セクション: ブランチ → 変更ファイル → コミットグラフ → diff
     /// 折りたたみ三角 + 見出し + 右端の一括操作ボタンからなるセクションヘッダ（#487）。
     /// 三角は SVG chevron（UI 絵文字ゼロの規約に合わせる）
     #[allow(clippy::too_many_arguments)]
@@ -2244,6 +2242,9 @@ impl TakoApp {
             )
     }
 
+    /// git ビュー（FR-3.6 git graph + FR-3.9 diff ビューア）。cwd 連動で 2 秒ポーリング更新。
+    /// セクション: リポヘッダ → コミット入力 → 操作ボタン → ブランチ →
+    /// ステージ済みの変更 / 変更（#487 のステージング UI）→ コミットグラフ → diff
     fn render_git_view(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme.clone();
         let data = self.git_data.clone();
