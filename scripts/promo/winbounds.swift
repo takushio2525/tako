@@ -19,6 +19,9 @@ let opts: CGWindowListOption = [.optionAll, .excludeDesktopElements]
 guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
     exit(1)
 }
+// 同じ PID が複数のウィンドウを持つことがある（GPUI が初期化中に作る白い小窓など）。
+// 最初に見つけたものを返すと収録対象を取り違えるため、最も面積の大きいものを選ぶ
+var best: (wid: Int, x: Int, y: Int, w: Int, h: Int)? = nil
 for w in list {
     guard let ownerPid = w[kCGWindowOwnerPID as String] as? Int32, ownerPid == pid,
         let layer = w[kCGWindowLayer as String] as? Int, layer == 0,
@@ -28,7 +31,12 @@ for w in list {
     let x = Int(b["X"] ?? 0), y = Int(b["Y"] ?? 0)
     let wd = Int(b["Width"] ?? 0), ht = Int(b["Height"] ?? 0)
     if wd < 200 || ht < 200 { continue }  // ツールチップ等の小窓を除外
-    print("\(wid) \(x) \(y) \(wd) \(ht)")
+    if best == nil || wd * ht > best!.w * best!.h {
+        best = (wid, x, y, wd, ht)
+    }
+}
+if let b = best {
+    print("\(b.wid) \(b.x) \(b.y) \(b.w) \(b.h)")
     exit(0)
 }
 exit(1)

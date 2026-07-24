@@ -33,15 +33,20 @@ fi
 
 # シーン定義: id | 素材ファイル | 素材内の開始秒 | 尺 | テロップ本文 | 副題
 # 台本 .agent/plans/2026-07-promo-video.md のシーン表と 1:1 で対応する
+# 素材の実収録内容に合わせた割り当て（2026-07-24 収録ぶん）。
+# agent-raw は「日本語で依頼 → MCP がペインを分割 → dev サーバーと
+# プレビューが立ち上がる」流れが 20〜60 秒あたりに写っている
+# 注意: agent-raw の 0〜31 秒には Claude Code の起動バナーが写っており、
+# そこにアカウントのメールアドレスが含まれる。**32 秒以降だけを使う**こと
 SCENES=(
-  "s1|agent-raw.mp4|78|6|エージェントも、その子プロセスも、1 つのタブに|"
-  "s2|agent-raw.mp4|8|12|Claude Code がそのまま画面を操作する|設定ゼロの内蔵 MCP サーバー"
-  "s3|agent-raw.mp4|58|14|master が worker を並べて監視する|1 グループ = 1 タブ"
-  "s4|preview-raw.mp4|2|12|成果物はターミナルの中で確認する|ライブリロードと Code Runner"
-  "s5a|restore-before-raw.mp4|1|4|再起動しても、全部戻ってくる|"
-  "s5b|restore-after-raw.mp4|2|6||画面の中身ごと復元"
+  "s1|agent-raw.mp4|46|6|エージェントも、その子プロセスも、1 つのタブに|"
+  "s2|agent-raw.mp4|32|13|日本語で頼むと、AI がペインを割って動かす|設定ゼロの内蔵 MCP サーバー"
+  "s3|agent-raw.mp4|62|11|起動したサーバーも、開いた資料も、同じ画面に|1 グループ = 1 タブ"
+  "s4|preview-raw.mp4|3|13|成果物はターミナルの中で確認する|ライブリロードと Code Runner"
+  "s5a|restore-before-raw.mp4|1|4|再起動しても、レイアウトごと戻ってくる|"
+  "s5b|restore-after-raw.mp4|3|6||タブもペインもそのまま復元"
   "s6|remote-raw.mp4|2|10|外出先はスマホから見て、答える|"
-  "s7|outro-raw.mp4|3|8|tako|AI エージェント時代の GUI ターミナル / github.com/takushio2525/tako"
+  "s7|outro-raw.mp4|4|8|tako|AI エージェント時代の GUI ターミナル / github.com/takushio2525/tako"
 )
 
 rm -rf "$WORK"; mkdir -p "$WORK"
