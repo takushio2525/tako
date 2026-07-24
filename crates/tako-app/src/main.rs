@@ -13,6 +13,7 @@
 //! IPC・`tako` CLI の e2e）と Phase 3 の内蔵 MCP サーバー（Streamable HTTP +
 //! stdio ブリッジ）、Phase 3.5 の IME 変換状態（marked text）を機械検証して終了する。
 
+mod about_window;
 mod autorename;
 mod drawer;
 mod file_icons;
@@ -578,6 +579,12 @@ fn open_preview(url: &str) {
     }
 }
 
+/// 外部ブラウザで URL を開く（About ウィンドウのリンク・Help メニュー用。#485）。
+/// 実体は `open_preview` と同じ OS 依存の「既定アプリで開く」経路
+fn open_external_url(url: &str) {
+    open_preview(url);
+}
+
 /// IME 変換中（未確定文字列 = marked text）の状態（FR-1.9）。
 /// 変換開始時のフォーカスペインを保持し、変換途中でフォーカスが移っても確定先がぶれないようにする
 struct ImeComposition {
@@ -994,6 +1001,12 @@ struct TakoApp {
     settings_window_handle: Option<gpui::AnyWindowHandle>,
     /// dispatch から設定画面を開くための pending キュー（Issue #459）
     pending_settings_open: Option<Option<settings_window::SettingsTab>>,
+    /// About ウィンドウのハンドル（単一インスタンス。Issue #485）
+    about_window_handle: Option<gpui::AnyWindowHandle>,
+    /// メニューバーを貼った時点の表示言語（Issue #485。言語切替で貼り直す）。
+    /// 起動直後は None: 初回 `cx.set_menus` は TakoApp 生成前（＝ settings の
+    /// 言語適用前）に走るため、初回 render で必ず貼り直して解決済み言語に合わせる
+    menus_lang: Option<tako_core::i18n::Lang>,
 }
 
 /// × ボタン close の確認ダイアログ対象（Issue #172）
@@ -1608,6 +1621,34 @@ struct PrimaryApp(gpui::WeakEntity<TakoApp>);
 
 impl gpui::Global for PrimaryApp {}
 
+/// プライマリ TakoApp に対して処理を行う（グローバルアクションから使う。#485）。
+/// entity が生きていなければ何もしない
+fn with_primary_app(cx: &mut App, f: impl FnOnce(&mut TakoApp, &mut Context<TakoApp>)) {
+    if let Some(g) = cx.try_global::<PrimaryApp>() {
+        if let Some(app) = g.0.upgrade() {
+            app.update(cx, |app, cx| f(app, cx));
+        }
+    }
+}
+
+/// アクティブウィンドウに対して OS ウィンドウ操作を行う（#485。最小化 / ズーム /
+/// フルスクリーンはウィンドウ単位の操作なので、グローバルアクションからは
+/// アクティブウィンドウを引いて適用する）。
+///
+/// メニュー経由のアクションはアクティブウィンドウの update の**内側**で
+/// ディスパッチされるため、その場で `handle.update` すると再入で必ず失敗する
+/// （実測: update ok=false で無反応）。`cx.defer` で update を抜けてから適用する
+fn with_active_window(cx: &mut App, f: impl FnOnce(&mut Window) + 'static) {
+    let Some(handle) = cx.active_window() else {
+        return;
+    };
+    cx.defer(move |cx| {
+        if let Err(e) = handle.update(cx, |_, window, _cx| f(window)) {
+            eprintln!("warning: ウィンドウ操作に失敗: {e}");
+        }
+    });
+}
+
 impl TakoApp {
     fn new(cx: &mut Context<Self>) -> Self {
         // 多重インスタンスガード（Issue #113）: 別の生きたインスタンスがプライマリである間は
@@ -1982,6 +2023,8 @@ impl TakoApp {
             pending_viewport_opens: Vec::new(),
             settings_window_handle: None,
             pending_settings_open: None,
+            about_window_handle: None,
+            menus_lang: None,
         };
         // 複数ウィンドウの復元（Issue #339）: アクティブ以外の論理ウィンドウは
         // 初回 render / dispatch の sync_viewports が保存フレームで開き直す
@@ -5963,6 +6006,96 @@ impl TakoApp {
                     .ok();
             }
         });
+    }
+
+    /// About ウィンドウを開く（Issue #485。tako メニューの「tako について」）。
+    /// 設定画面と同じく単一インスタンスで、二度目以降は前面化するだけ
+    pub(crate) fn open_about_window_impl(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.about_window_handle {
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, _cx| {
+                    window.activate_window();
+                });
+            });
+            return;
+        }
+        let weak = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let weak2 = weak.clone();
+            let result = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                        None,
+                        size(px(420.), px(300.)),
+                        cx,
+                    ))),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some(crate::ui_text::about::window_title().into()),
+                        ..Default::default()
+                    }),
+                    is_resizable: false,
+                    ..Default::default()
+                },
+                |_window, cx| cx.new(|cx| about_window::AboutWindow::new(weak2, cx)),
+            );
+            if let Ok(handle) = result {
+                let any_handle: AnyWindowHandle = handle.into();
+                if let Some(app) = weak.upgrade() {
+                    app.update(cx, |app, _cx| {
+                        app.about_window_handle = Some(any_handle);
+                    });
+                }
+                let weak3 = weak.clone();
+                handle
+                    .update(cx, |_, window, cx| {
+                        window.on_window_should_close(cx, move |_, _cx| {
+                            if let Some(app) = weak3.upgrade() {
+                                app.update(_cx, |app, _| {
+                                    app.about_window_handle = None;
+                                });
+                            }
+                            true
+                        });
+                    })
+                    .ok();
+            }
+        });
+    }
+
+    /// 手動のアップデート確認（Issue #485。tako メニュー / About ウィンドウのボタン）。
+    /// 起動時 + 24 時間ごとの自動チェックと同じ `update_checker` を使い、結果は
+    /// ステータスバーの更新バナー（既存 UI）に出す
+    pub(crate) fn start_update_check(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.update_state,
+            update_checker::UpdateState::Updating(_)
+                | update_checker::UpdateState::ConfirmPending(_)
+                | update_checker::UpdateState::TestWarning(_)
+        ) {
+            return; // 更新処理中はユーザーの確認フローを壊さない
+        }
+        self.update_state =
+            update_checker::UpdateState::Updating(crate::ui_text::update::checking().into());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let task = cx
+                .background_executor()
+                .spawn(async { update_checker::check_all_channels() });
+            let result = task.await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                app.update_state = match result {
+                    Ok(updates) if updates.stable.is_some() || updates.test.is_some() => {
+                        update_checker::UpdateState::Available(updates)
+                    }
+                    Ok(_) => update_checker::UpdateState::Done(crate::ui_text::update::up_to_date(
+                        update_checker::CURRENT_VERSION,
+                    )),
+                    Err(e) => update_checker::UpdateState::CheckFailed(e.to_string()),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// アクティブ論理ウィンドウの GPUI ウィンドウを前面化する（タブ切替がウィンドウを
@@ -13610,6 +13743,14 @@ impl Render for TakoApp {
             self.last_ime_focus = Some(ime_focus_now);
             window.invalidate_character_coordinates();
         }
+        // 表示言語が変わったらメニューバーを貼り直す（#485。メニューは OS が保持する
+        // ため、パレット / 設定画面 / CLI・MCP `tako lang` のどの経路で変わっても
+        // ここで追従する。lang() はグローバルの atomic 読み出しのみで負荷は無視できる）
+        let lang_now = tako_core::i18n::lang();
+        if self.menus_lang != Some(lang_now) {
+            self.menus_lang = Some(lang_now);
+            cx.set_menus(app_menus());
+        }
         self.drain_preview_image_evictions(window, cx);
         self.preview_device_scale = window.scale_factor();
         // Web ビュー（FR-3.8）: wry の親にするウィンドウハンドルは render でしか
@@ -14052,6 +14193,22 @@ impl Render for TakoApp {
             .on_action(cx.listener(|this, _: &OpenRecent, _, cx| {
                 this.open_recent_palette(cx);
             }))
+            // View メニュー（#485）。パレットの同名コマンドと同じ実体を呼ぶ
+            .on_action(cx.listener(|this, _: &ToggleDrawer, _, cx| {
+                this.drawer_visible = !this.drawer_visible;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTheme, _, cx| this.toggle_theme(cx)))
+            .on_action(cx.listener(|this, _: &SwitchLanguage, _, cx| this.toggle_language(cx)))
+            .on_action(cx.listener(|this, _: &ShowFleetPanel, _, cx| {
+                this.toggle_panel_view(PanelView::Tmux, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowOrchPanel, _, cx| {
+                this.toggle_panel_view(PanelView::Orch, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowGitPanel, _, cx| {
+                this.toggle_panel_view(PanelView::Git, cx)
+            }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 // blur（外部 a11y 等）からの自動復元（#332）: focus が無いと
                 // input handler が未登録になり日本語 IM の printable キーが IME を
@@ -14400,43 +14557,92 @@ fn parse_initial_dir() -> Option<std::path::PathBuf> {
     None
 }
 
-/// アプリメニューバーを構成する（File / Edit / Window）
+/// アプリメニューバーを構成する（tako / File / Edit / View / Window / Help。#485）。
+///
+/// **すべての項目は実在の動作に配線する**（無反応のダミーを置かない）。項目名は
+/// `ui_text::menu` が言語別に解決し、言語切替時は `TakoApp::render` が貼り直す。
+/// ショートカット表示は GPUI が `keybindings::key_bindings()` から自動で引く
 fn app_menus() -> Vec<gpui::Menu> {
-    use gpui::{Menu, MenuItem};
+    use crate::ui_text::menu as m;
+    use gpui::{Menu, MenuItem, SystemMenuType};
     vec![
-        Menu::new("tako").items(vec![
-            MenuItem::action("About tako", gpui::NoAction),
+        Menu::new(m::APP).items(vec![
+            MenuItem::action(m::about(), AboutTako),
+            MenuItem::action(m::check_updates(), CheckForUpdates),
             MenuItem::separator(),
-            MenuItem::action("Quit tako", Quit),
+            MenuItem::action(m::settings(), OpenSettings),
+            MenuItem::separator(),
+            MenuItem::os_submenu(m::services(), SystemMenuType::Services),
+            MenuItem::separator(),
+            MenuItem::action(m::hide_app(), HideApp),
+            MenuItem::action(m::hide_others(), HideOthers),
+            MenuItem::action(m::show_all(), ShowAllApps),
+            MenuItem::separator(),
+            MenuItem::action(m::quit(), Quit),
         ]),
-        Menu::new("File").items(vec![
-            MenuItem::action("New Window", NewWindow),
+        Menu::new(m::file()).items(vec![
+            MenuItem::action(m::new_tab(), NewTab),
+            MenuItem::action(m::new_window(), NewWindow),
             MenuItem::separator(),
-            MenuItem::action("Open Directory…", OpenDirectory),
-            MenuItem::action("Open Repository…", OpenRepository),
-            MenuItem::action("Open Remote…", OpenRemote),
+            MenuItem::action(m::split_right(), SplitRight),
+            MenuItem::action(m::split_down(), SplitDown),
             MenuItem::separator(),
-            MenuItem::action("Open Recent…", OpenRecent),
+            MenuItem::action(m::open_directory(), OpenDirectory),
+            MenuItem::action(m::open_repository(), OpenRepository),
+            MenuItem::action(m::open_remote(), OpenRemote),
+            MenuItem::action(m::open_recent(), OpenRecent),
             MenuItem::separator(),
-            MenuItem::action("Save Preview", SavePreview),
+            MenuItem::action(m::save_preview(), SavePreview),
+            MenuItem::separator(),
+            MenuItem::action(m::close_pane(), ClosePane),
         ]),
-        Menu::new("Edit").items(vec![
-            MenuItem::action("Copy", CopySelection),
-            MenuItem::action("Paste", PasteClipboard),
-            MenuItem::action("Select All", SelectAll),
-        ]),
-        Menu::new("View").items(vec![
-            MenuItem::action("Toggle Sidebar", ToggleSidebar),
+        Menu::new(m::edit()).items(vec![
+            MenuItem::action(m::undo(), UndoPreview),
+            MenuItem::action(m::redo(), RedoPreview),
             MenuItem::separator(),
-            MenuItem::action("Zoom In", ZoomIn),
-            MenuItem::action("Zoom Out", ZoomOut),
-            MenuItem::action("Reset Zoom", ResetZoom),
-        ]),
-        Menu::new("Window").items(vec![
-            MenuItem::action("New Tab", NewTab),
+            MenuItem::action(m::copy(), CopySelection),
+            MenuItem::action(m::paste(), PasteClipboard),
+            MenuItem::action(m::select_all(), SelectAll),
             MenuItem::separator(),
-            MenuItem::action("Next Tab", NextTab),
-            MenuItem::action("Previous Tab", PrevTab),
+            MenuItem::action(m::find(), FindPreview),
+        ]),
+        Menu::new(m::view()).items(vec![
+            MenuItem::action(m::command_palette(), OpenCommandPalette),
+            MenuItem::separator(),
+            MenuItem::action(m::toggle_sidebar(), ToggleSidebar),
+            MenuItem::action(m::toggle_drawer(), ToggleDrawer),
+            MenuItem::submenu(Menu::new(m::panel()).items(vec![
+                MenuItem::action(m::panel_fleet(), ShowFleetPanel),
+                MenuItem::action(m::panel_orch(), ShowOrchPanel),
+                MenuItem::action(m::panel_git(), ShowGitPanel),
+            ])),
+            MenuItem::separator(),
+            MenuItem::action(m::zoom_in(), ZoomIn),
+            MenuItem::action(m::zoom_out(), ZoomOut),
+            MenuItem::action(m::reset_zoom(), ResetZoom),
+            MenuItem::separator(),
+            MenuItem::action(m::toggle_theme(), ToggleTheme),
+            MenuItem::action(m::switch_language(), SwitchLanguage),
+            MenuItem::separator(),
+            MenuItem::action(m::toggle_fullscreen(), ToggleFullScreen),
+        ]),
+        Menu::new(m::window()).items(vec![
+            MenuItem::action(m::minimize(), MinimizeWindow),
+            MenuItem::action(m::zoom_window(), ZoomWindow),
+            MenuItem::separator(),
+            MenuItem::action(m::next_tab(), NextTab),
+            MenuItem::action(m::prev_tab(), PrevTab),
+            MenuItem::separator(),
+            MenuItem::submenu(Menu::new(m::select_pane()).items(vec![
+                MenuItem::action(m::focus_left(), FocusLeft),
+                MenuItem::action(m::focus_right(), FocusRight),
+                MenuItem::action(m::focus_up(), FocusUp),
+                MenuItem::action(m::focus_down(), FocusDown),
+            ])),
+        ]),
+        Menu::new(m::help()).items(vec![
+            MenuItem::action(m::documentation(), OpenDocumentation),
+            MenuItem::action(m::report_issue(), ReportIssue),
         ]),
     ]
 }
@@ -14723,6 +14929,32 @@ fn main() {
                     });
                 }
             }
+        });
+        // アプリケーションメニューの標準項目（#485）。ウィンドウのフォーカス状態に
+        // 依存しないよう、Quit / Settings と同じくグローバルアクションで登録する
+        cx.on_action(|_: &AboutTako, cx| {
+            with_primary_app(cx, |app, cx| app.open_about_window_impl(cx));
+        });
+        cx.on_action(|_: &CheckForUpdates, cx| {
+            with_primary_app(cx, |app, cx| app.start_update_check(cx));
+        });
+        cx.on_action(|_: &HideApp, cx: &mut App| cx.hide());
+        cx.on_action(|_: &HideOthers, cx: &mut App| cx.hide_other_apps());
+        cx.on_action(|_: &ShowAllApps, cx: &mut App| cx.unhide_other_apps());
+        cx.on_action(|_: &MinimizeWindow, cx: &mut App| {
+            with_active_window(cx, |window| window.minimize_window());
+        });
+        cx.on_action(|_: &ZoomWindow, cx: &mut App| {
+            with_active_window(cx, |window| window.zoom_window());
+        });
+        cx.on_action(|_: &ToggleFullScreen, cx: &mut App| {
+            with_active_window(cx, |window| window.toggle_fullscreen());
+        });
+        cx.on_action(|_: &OpenDocumentation, _cx: &mut App| {
+            open_external_url(about_window::DOCUMENTATION_URL);
+        });
+        cx.on_action(|_: &ReportIssue, _cx: &mut App| {
+            open_external_url(about_window::ISSUES_URL);
         });
         // 保存済みウィンドウフレームの復元（FR-5。終了前にフルスクリーンなら
         // フルスクリーンで開く）。セルフテストは既定サイズで決定的に動かす
@@ -22528,6 +22760,136 @@ mod drag_scroll_tests {
             let delta = drag_scroll_delta_px(factor);
             assert!(delta > prev, "factor={factor}: {delta} <= {prev}");
             prev = delta;
+        }
+    }
+}
+
+/// アプリケーションメニュー（#485）の構造検査。
+/// 「無反応のダミー項目を置かない」を機械的に固定する
+#[cfg(test)]
+mod app_menu_tests {
+    use super::*;
+    use gpui::{Menu, MenuItem};
+
+    /// メニュー木を辿って (表示名, アクション名) を集める
+    fn collect_actions(items: &[MenuItem], out: &mut Vec<(String, String)>) {
+        for item in items {
+            match item {
+                MenuItem::Action { name, action, .. } => {
+                    out.push((name.to_string(), action.name().to_string()));
+                }
+                MenuItem::Submenu(sub) => collect_actions(&sub.items, out),
+                MenuItem::Separator | MenuItem::SystemMenu(_) => {}
+            }
+        }
+    }
+
+    fn all_actions(menus: &[Menu]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for menu in menus {
+            collect_actions(&menu.items, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn 全項目が実在のアクションに配線されている() {
+        // ハンドラ登録（グローバル cx.on_action / ルート div の on_action）は
+        // すべて main.rs にある。ソースを走査して「メニューにあるのに
+        // ハンドラが無い」＝ 押しても無反応のダミーを検出する
+        let source = include_str!("main.rs");
+        let menus = app_menus();
+        let actions = all_actions(&menus);
+        assert!(actions.len() >= 30, "項目数が少なすぎる: {}", actions.len());
+        for (label, action) in &actions {
+            assert!(
+                action != "gpui::NoAction",
+                "ダミー項目（NoAction）が残っている: {label}"
+            );
+            let short = action.strip_prefix("tako::").unwrap_or_else(|| {
+                panic!("tako 名前空間のアクションではない: {label} -> {action}")
+            });
+            assert!(
+                source.contains(&format!("&{short},")),
+                "{label} のアクション {action} に on_action ハンドラが無い"
+            );
+        }
+    }
+
+    #[test]
+    fn takoメニューは標準項目を慣習順に並べる() {
+        let menus = app_menus();
+        let app_menu = &menus[0];
+        assert_eq!(app_menu.name.as_ref(), "tako");
+        let actions: Vec<String> = {
+            let mut v = Vec::new();
+            collect_actions(&app_menu.items, &mut v);
+            v.into_iter().map(|(_, a)| a).collect()
+        };
+        assert_eq!(
+            actions,
+            vec![
+                "tako::AboutTako",
+                "tako::CheckForUpdates",
+                "tako::OpenSettings",
+                "tako::HideApp",
+                "tako::HideOthers",
+                "tako::ShowAllApps",
+                "tako::Quit",
+            ]
+        );
+        // Services は OS 管理のサブメニュー（アクションを持たない）
+        assert!(
+            app_menu
+                .items
+                .iter()
+                .any(|i| matches!(i, MenuItem::SystemMenu(_))),
+            "Services メニューが無い"
+        );
+    }
+
+    #[test]
+    fn メニュー構成は慣習どおりの並び() {
+        let menus = app_menus();
+        let names: Vec<&str> = menus.iter().map(|m| m.name.as_ref()).collect();
+        assert_eq!(names.len(), 6, "tako / File / Edit / View / Window / Help");
+        assert_eq!(names[0], "tako");
+    }
+
+    #[test]
+    fn 設定はcmdカンマと同じアクションに配線されている() {
+        // Cmd+, のキーバインドとメニューの「設定…」が同一アクション = 同じ動作
+        let binding = key_bindings()
+            .into_iter()
+            .find(|b| b.action().name() == "tako::OpenSettings")
+            .expect("cmd-, のバインドが無い");
+        assert_eq!(binding.keystrokes()[0].inner().key, ",");
+        assert!(binding.keystrokes()[0].inner().modifiers.platform);
+        let menus = app_menus();
+        let mut items = Vec::new();
+        collect_actions(&menus[0].items, &mut items);
+        assert!(
+            items.iter().any(|(_, a)| a == "tako::OpenSettings"),
+            "tako メニューに設定項目が無い"
+        );
+    }
+
+    #[test]
+    fn macos慣習のショートカットがバインドされている() {
+        let bindings = key_bindings();
+        for (action, key, alt) in [
+            ("tako::HideApp", "h", false),
+            ("tako::HideOthers", "h", true),
+            ("tako::MinimizeWindow", "m", false),
+        ] {
+            let b = bindings
+                .iter()
+                .find(|b| b.action().name() == action)
+                .unwrap_or_else(|| panic!("{action} のバインドが無い"));
+            let ks = b.keystrokes()[0].inner();
+            assert_eq!(ks.key, key, "{action}");
+            assert!(ks.modifiers.platform, "{action} は cmd 修飾");
+            assert_eq!(ks.modifiers.alt, alt, "{action} の alt 修飾");
         }
     }
 }

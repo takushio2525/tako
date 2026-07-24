@@ -24,9 +24,11 @@ macro_rules! tr {
 // 直接使える。use は不要（unused import になる）。mod 宣言をマクロ定義より前に
 // 移動しないこと
 
+pub mod about;
 pub mod common;
 pub mod dialog;
 pub mod drawer;
+pub mod menu;
 pub mod palette;
 pub mod panel;
 pub mod ports;

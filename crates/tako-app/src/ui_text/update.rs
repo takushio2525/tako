@@ -88,6 +88,17 @@ pub fn current_line(ver: &str, channel: &str, method: &str) -> String {
 pub fn latest() -> &'static str {
     tr!("最新版です", "Up to date")
 }
+/// 手動チェック中の表示（#485。tako メニュー / About の「アップデートを確認」）
+pub fn checking() -> &'static str {
+    tr!("アップデートを確認中...", "Checking for updates...")
+}
+/// 手動チェックの結果「更新なし」（#485）
+pub fn up_to_date(ver: &str) -> String {
+    tr!(
+        format!("最新版です (v{ver})"),
+        format!("Up to date (v{ver})")
+    )
+}
 pub fn no_test_build() -> &'static str {
     tr!("テスト版なし", "No test build")
 }
@@ -133,6 +144,8 @@ mod tests {
                 restart_failed("spawn error"),
                 current_line("0.6.0", "stable", "Homebrew"),
                 latest().to_string(),
+                checking().to_string(),
+                up_to_date("0.6.0"),
                 no_test_build().to_string(),
                 channel_stable().to_string(),
                 channel_test().to_string(),

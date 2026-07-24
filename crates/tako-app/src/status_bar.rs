@@ -927,6 +927,21 @@ impl TakoApp {
                             .text_color(hsla(theme.green))
                             .child(SharedString::from(msg.clone())),
                     )
+                    // 手動チェック（#485）の「最新版です」は再起動を伴わず残り続けるため
+                    // 閉じられるようにする（更新実行後の Done は直後に再起動が走る）
+                    .child(
+                        div()
+                            .id("update-done-dismiss")
+                            .cursor_pointer()
+                            .text_size(px(10.5))
+                            .text_color(hsla(theme.text_tertiary))
+                            .hover(|d| d.text_color(hsla(theme.text_secondary)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.update_state = super::update_checker::UpdateState::Idle;
+                                cx.notify();
+                            }))
+                            .child("×"),
+                    )
                     .into_any_element(),
             ),
             super::update_checker::UpdateState::Failed(msg) => Some(
