@@ -24,12 +24,18 @@ PROMO_FRAMES=${TAKO_PROMO_FRAMES:-/private/tmp/tako-promo-frames}
 PROMO_DEMO=/private/tmp/tako-demo
 PROMO_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# 継承 TAKO_* を env -u で落とすための引数列
+# 継承環境を env -u で落とすための引数列。
+#   TAKO_*      … 本番インスタンスへの誤接続を防ぐ
+#   CLAUDE*/ANTHROPIC* … 収録スクリプト自体を AI エージェントのペインから流したときに、
+#                        親セッションのマーカー（CLAUDE_CODE_CHILD_SESSION 等）が
+#                        子の claude へ漏れて画面に警告行が出るのを防ぐ（#470 v3）
 PROMO_ENV_CLEAN=()
 # シーン固有の追加環境変数（"KEY=VALUE" 形式。promo_start_isolated が展開する）
 PROMO_EXTRA_ENV=()
 while IFS='=' read -r k _; do
-    case "$k" in TAKO_*) PROMO_ENV_CLEAN+=(-u "$k") ;; esac
+    case "$k" in
+        TAKO_*|CLAUDE*|ANTHROPIC_*) PROMO_ENV_CLEAN+=(-u "$k") ;;
+    esac
 done < <(env)
 
 promo_require() {
@@ -267,6 +273,61 @@ promo_make_demo_home() {
     for b in claude codex agy node tmux git tailscale; do
         p=$(command -v "$b" 2>/dev/null) && ln -sf "$p" "$PROMO_DEMO/bin/$b"
     done
+    promo_demo_home_agent_ready
+}
+
+# デモ HOME でも実エージェント CLI（claude）が対話セッションを張れるようにする（#470 v3）。
+# 背景（実測 2026-07-24）:
+#   HOME を差し替えると macOS のキーチェーン検索リストから**ログインキーチェーンが外れる**
+#   （`security list-keychains` が System.keychain だけになる）。claude の認証情報は
+#   ログインキーチェーンにあるため、デモ HOME では必ず "Not logged in" になり
+#   対話セッションが撮れない。
+# 対処: デモ HOME 側の検索リスト（デモ HOME の Preferences に書かれる）に、実ユーザーの
+#   ログインキーチェーンを指定する。**認証情報のコピー・書き出しは一切しない**
+#   （鍵は元の場所のまま。実 HOME 側の設定も変更しない）。
+# 併せて、収録中にオンボーディング・信頼ダイアログ・許可プロンプトが出ないよう
+# 使い捨て HOME にだけ最小の設定を置く。個人情報（メール・アカウント情報）は書かない。
+promo_demo_home_agent_ready() {
+    mkdir -p "$PROMO_DEMO/home/Library/Preferences" "$PROMO_DEMO/home/.claude"
+    HOME="$PROMO_DEMO/home" security list-keychains -d user \
+        -s "$HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1 || true
+    /usr/bin/python3 - "$PROMO_DEMO" <<'PY'
+import json, os, sys
+
+demo = sys.argv[1]
+home = os.path.join(demo, "home")
+# 収録で claude が開くディレクトリはすべて事前に信頼済みにしておく
+trusted = [
+    home,
+    os.path.join(home, "Library/Application Support/tako/setup"),
+    os.path.join(demo, "awesome-app"),
+]
+config = {
+    "hasCompletedOnboarding": True,
+    "theme": "dark",
+    "autoUpdates": False,
+    "numStartups": 9,
+    "projects": {
+        path: {"hasTrustDialogAccepted": True, "hasCompletedProjectOnboarding": True}
+        for path in trusted
+    },
+}
+with open(os.path.join(home, ".claude.json"), "w") as f:
+    json.dump(config, f, indent=1)
+# 使い捨て HOME + /private/tmp のデモプロジェクト限定。収録中に許可プロンプトを出さない。
+# bypassPermissions は起動時に赤い警告ダイアログ（Enter 待ち）が出て収録に写り込むため使わない
+with open(os.path.join(home, ".claude/settings.json"), "w") as f:
+    json.dump(
+        {
+            "permissions": {
+                "defaultMode": "acceptEdits",
+                "allow": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__tako"],
+            }
+        },
+        f,
+        indent=1,
+    )
+PY
 }
 
 # 画面に出るテキストへ個人情報（メールアドレス・実ホームパス）が残っていないかを
@@ -355,11 +416,15 @@ promo_stop_isolated() {
     return 0
 }
 
-# 隔離インスタンスへ明示接続する CLI ラッパー
+# 隔離インスタンスへ明示接続する CLI ラッパー。
+# TAKO_DATA_DIR も渡すこと（#470 v3）: `tako orchestrator projects add` のような
+# ローカル設定を直接書くサブコマンドは IPC を経由せず自分の data_dir を見るため、
+# 渡さないと **本番の projects.yaml / profiles を書き換えてしまう**（実際に汚染した）
 tko() {
     env "${PROMO_ENV_CLEAN[@]}" \
         TAKO_SOCKET="$PROMO_SOCKET_PATH" \
         TAKO_TOKEN="$PROMO_TOKEN" \
+        TAKO_DATA_DIR="$PROMO_WORK/data" \
         "$PROMO_CLI" "$@"
 }
 

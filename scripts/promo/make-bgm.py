@@ -28,7 +28,7 @@ SR = 44100
 BPM = 100.0
 BEAT = 60.0 / BPM  # 0.6s
 BAR = BEAT * 4  # 2.4s
-TOTAL = 90.0  # 秒。84 秒の本編（v2 構成）+ 前後の余白
+TOTAL = 115.0  # 秒。106 秒の本編（v3 構成）+ 前後の余白
 
 # A マイナー。数値は A4=440 を基準にした周波数
 NOTE = {
@@ -166,8 +166,9 @@ def build() -> Track:
             break
         root, pad_notes, arp_notes = PROGRESSION[(b // 2) % len(PROGRESSION)]
 
-        # セクションごとの音量（台本 v2 のシーン割りに対応）
-        # 導入 → 画面操作で厚く → setup でいったん軽く → master で最も厚く → アウトロで抜く
+        # セクションごとの音量（台本 v3 のシーン割りに対応）
+        # 導入 → 画面操作で厚く → setup（36〜65s）は対話を読ませるため軽く →
+        # master + プロジェクト文脈（65〜98s）で最も厚く → アウトロ（98s〜）で抜く
         pad_g, arp_g, bass_g, drum_g = 0.30, 0.0, 0.0, 0.0
         if t0 >= 5.0:
             arp_g = 0.16
@@ -175,13 +176,11 @@ def build() -> Track:
             drum_g, bass_g = 0.55, 0.30
         if t0 >= 17.0:
             arp_g, pad_g = 0.20, 0.34
-        if 36.0 <= t0 < 44.0:  # setup: 説明を聞かせるため軽くする
+        if 36.0 <= t0 < 65.0:  # setup: テロップと対話画面を読ませるため軽くする
             drum_g, bass_g, arp_g = 0.30, 0.20, 0.12
-        if t0 >= 44.0:
-            drum_g, bass_g, arp_g = 0.50, 0.28, 0.18
-        if t0 >= 53.0:  # master: 一番厚くする
+        if t0 >= 65.0:  # master + プロジェクト文脈: 一番厚くする
             drum_g, bass_g, arp_g, pad_g = 0.60, 0.32, 0.22, 0.36
-        if t0 >= 76.0:  # アウトロ
+        if t0 >= 98.0:  # アウトロ
             drum_g, bass_g = 0.0, 0.16
             arp_g = 0.10
 
