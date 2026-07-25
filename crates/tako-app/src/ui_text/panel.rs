@@ -170,6 +170,38 @@ pub fn git_commit_all_hint() -> &'static str {
         "Commit all tracked changes (nothing staged)"
     )
 }
+/// コミットできない理由（#494。ボタン無効化だけでは理由が分からないので必ず言葉で出す）
+pub fn git_commit_blocked_empty() -> &'static str {
+    tr!(
+        "コミットするにはメッセージを入力してください",
+        "Enter a message to commit"
+    )
+}
+pub fn git_commit_blocked_no_changes() -> &'static str {
+    tr!(
+        "コミットできる変更がありません",
+        "No changes available to commit"
+    )
+}
+/// 実行中（#494。二重押し防止でボタンを無効化している間の表示）
+pub fn git_busy(op: &str) -> String {
+    tr!(format!("{op} を実行中..."), format!("Running {op}..."))
+}
+/// フィードバックカードを閉じる
+pub fn git_dismiss() -> &'static str {
+    tr!("閉じる", "Dismiss")
+}
+/// メッセージが上限に達した
+pub fn git_commit_message_too_long(max: usize) -> String {
+    tr!(
+        format!("コミットメッセージが上限（{max} バイト）に達しました"),
+        format!("Commit message reached the limit ({max} bytes)")
+    )
+}
+/// detached HEAD の表示（ブランチ名の代わり）
+pub fn git_detached_head() -> &'static str {
+    tr!("detached HEAD", "detached HEAD")
+}
 
 #[cfg(test)]
 mod tests {
@@ -213,6 +245,12 @@ mod tests {
                 git_diff_commit(3),
                 git_commit_staged_hint(2),
                 git_commit_all_hint().to_string(),
+                git_commit_blocked_empty().to_string(),
+                git_commit_blocked_no_changes().to_string(),
+                git_busy("commit"),
+                git_dismiss().to_string(),
+                git_commit_message_too_long(4096),
+                git_detached_head().to_string(),
             ]
         });
     }

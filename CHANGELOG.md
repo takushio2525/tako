@@ -3,6 +3,31 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- git panel layout collapse on real machines: the view was a single flex column with
+  `overflow-y: scroll`, so once its content grew taller than the panel, taffy shrank the
+  rows — clipping the repo header and painting the commit input over the action buttons.
+  Split into a fixed header + a scroll body whose rows never shrink, and made every row
+  clip/ellipsize so nothing spills past the panel edge (#494)
+- git パネルが実機で描画崩壊する問題を根治。ビューが 1 枚のスクロール付き flex 列
+  だったため、コンテンツ総高さがパネル高さを超えると taffy が行を圧縮し、リポヘッダが
+  欠け、コミット入力欄が操作ボタンの上に重なって描画されていた。固定ヘッダ + 行が
+  縮まないスクロール本文の 2 段構造へ分離し、全行を省略表示にしてパネル外へ
+  はみ出さないようにした (#494)
+
+### Changed
+
+- git panel robustness: commit is blocked with a visible reason when the message is empty
+  or there is nothing to commit (both button and Cmd+Enter),操作 buttons are disabled while
+  an operation runs, failures stay on screen until dismissed, and pasted control characters
+  are normalized (#494)
+- git パネルの堅牢化: メッセージが空・変更が無いときはボタンと Cmd+Enter の両方で
+  コミットを実行せず理由を表示、実行中は操作ボタンを無効化して二重押しを防止、
+  失敗は閉じるまで表示し続け、貼り付けた制御文字を正規化するようにした (#494)
+
 ## [0.5.11] - 2026-07-25
 
 Nightly patch release (automated). Changes since v0.5.10:

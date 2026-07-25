@@ -716,6 +716,51 @@ pub fn unstage(repo: &Path, paths: &[&str]) -> Result<String, String> {
     }
 }
 
+/// コミットメッセージの最大長（バイト。#494）。
+/// git 自体に上限は無いが、1 行入力欄へ巨大なテキストが貼られたときに
+/// 描画・差分計算が重くなるのを防ぐための実用上の歯止め。
+pub const COMMIT_MESSAGE_MAX: usize = 4096;
+
+/// git パネルの 1 行入力欄向けにコミットメッセージを正規化する（#494）。
+///
+/// - 改行・タブを含む制御文字は半角空白へ潰す（1 行入力欄に改行は入れられないため、
+///   複数行メッセージを貼られても壊れた表示にならないようにする）
+/// - サロゲートペア・結合文字などの通常の文字はそのまま通す（Rust の String は
+///   常に妥当な UTF-8 なので不正バイトは原理的に混入しない）
+/// - `COMMIT_MESSAGE_MAX` を超える分は**文字境界で**切り捨てる
+pub fn sanitize_commit_message(input: &str) -> String {
+    let mut out = String::with_capacity(input.len().min(COMMIT_MESSAGE_MAX));
+    for ch in input.chars() {
+        let ch = if ch.is_control() { ' ' } else { ch };
+        if out.len() + ch.len_utf8() > COMMIT_MESSAGE_MAX {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// コミットを実行できない理由（#494）。UI・CLI で共通の判定にするため core に置く。
+/// 文言化は呼び出し側（UI は日英、CLI は日本語）で行う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitBlock {
+    /// メッセージが空（空白のみを含む）
+    EmptyMessage,
+    /// コミット対象の変更が無い
+    NoChanges,
+}
+
+/// コミットの実行可否を判定する（#494）。`None` なら実行可能。
+pub fn commit_block(message: &str, has_changes: bool) -> Option<CommitBlock> {
+    if message.trim().is_empty() {
+        Some(CommitBlock::EmptyMessage)
+    } else if !has_changes {
+        Some(CommitBlock::NoChanges)
+    } else {
+        None
+    }
+}
+
 /// git commit -m: メッセージ付きコミット。`all` = true で `-a`（tracked のみ auto stage）
 pub fn commit(repo: &Path, message: &str, all: bool) -> Result<String, String> {
     if message.trim().is_empty() {
@@ -781,6 +826,54 @@ mod tests {
         assert_eq!(status.entries[0].index, '.');
         assert_eq!(status.entries[0].worktree, 'M');
         assert_eq!(status.entries[1].index, '?');
+    }
+
+    /// #494: 1 行入力欄向けの正規化。改行・タブ・制御文字は空白へ潰す
+    #[test]
+    fn コミットメッセージの正規化() {
+        assert_eq!(sanitize_commit_message("fix: bug"), "fix: bug");
+        // 改行・タブ・その他の制御文字はすべて半角空白へ
+        assert_eq!(
+            sanitize_commit_message("一行目\n二行目\tタブ\u{7}ベル"),
+            "一行目 二行目 タブ ベル"
+        );
+        // 絵文字・サロゲートペア相当の文字はそのまま通す
+        let emoji = "修正 \u{1F600}\u{1F1EF}\u{1F1F5}";
+        assert_eq!(sanitize_commit_message(emoji), emoji);
+        // 前後の空白は入力途中を壊さないため保持する（コミット時に git 側が扱う）
+        assert_eq!(sanitize_commit_message("  a  "), "  a  ");
+    }
+
+    /// #494: 上限超過は**文字境界**で切る（バイト境界で切ると String が壊れる）
+    #[test]
+    fn コミットメッセージの上限は文字境界で切る() {
+        // 3 バイト文字を上限ちょうどより 1 文字分多く並べる
+        let long = "あ".repeat(COMMIT_MESSAGE_MAX / 3 + 10);
+        let out = sanitize_commit_message(&long);
+        assert!(out.len() <= COMMIT_MESSAGE_MAX);
+        // 文字境界で切れている = そのまま chars で走査できて全部「あ」
+        assert!(out.chars().all(|c| c == 'あ'));
+        assert_eq!(out.len() % 3, 0);
+        // 4 バイト文字（絵文字）でも境界を割らない
+        let emoji = "\u{1F600}".repeat(COMMIT_MESSAGE_MAX / 4 + 10);
+        let out = sanitize_commit_message(&emoji);
+        assert!(out.len() <= COMMIT_MESSAGE_MAX);
+        assert!(out.chars().all(|c| c == '\u{1F600}'));
+    }
+
+    /// #494: コミット可否の判定は UI・CLI で共通
+    #[test]
+    fn コミット可否の判定() {
+        assert_eq!(commit_block("", true), Some(CommitBlock::EmptyMessage));
+        // 空白のみ（全角空白・タブを含む）も「空」扱い
+        assert_eq!(
+            commit_block("   \u{3000}\t ", true),
+            Some(CommitBlock::EmptyMessage)
+        );
+        assert_eq!(commit_block("fix", false), Some(CommitBlock::NoChanges));
+        assert_eq!(commit_block("fix", true), None);
+        // メッセージが空なら変更の有無に関わらず「空」を優先して案内する
+        assert_eq!(commit_block("", false), Some(CommitBlock::EmptyMessage));
     }
 
     /// #487: ステージ済み / 未ステージの分類（porcelain v2 の XY 2 文字を分離する）

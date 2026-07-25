@@ -824,8 +824,10 @@ struct TakoApp {
     git_commit_message: String,
     /// git コミットメッセージ入力欄のキャレット位置（バイトオフセット。#487）
     git_commit_cursor: usize,
-    /// git 操作の結果フィードバック（#472。一時表示して数秒で消える）
+    /// git 操作の結果フィードバック（#472。成功は数秒で消え、失敗は閉じるまで残る）
     git_feedback: Option<GitFeedback>,
+    /// 実行中の git 操作名（#494。連打・二重押しを防ぐためボタンを無効化する）
+    git_busy: Option<&'static str>,
     /// git コミットメッセージ入力欄にフォーカスがあるか（#472）
     git_commit_input_focused: bool,
     /// バックグラウンドドロワーの表示状態（FR-2.15。下部ステータスバーのボタンでトグル）
@@ -1934,6 +1936,7 @@ impl TakoApp {
             git_commit_message: String::new(),
             git_commit_cursor: 0,
             git_feedback: None,
+            git_busy: None,
             git_commit_input_focused: false,
             drawer_visible: false,
             drawer_height: DRAWER_DEFAULT_HEIGHT,
@@ -6936,10 +6939,7 @@ impl TakoApp {
             return;
         }
         if self.git_commit_input_focused {
-            let cursor = self.git_commit_cursor.min(self.git_commit_message.len());
-            self.git_commit_message.insert_str(cursor, &text);
-            self.git_commit_cursor = cursor + text.len();
-            cx.notify();
+            self.git_commit_insert(&text, cx);
             return;
         }
         let pane_id = self.focused_pane();
@@ -13432,9 +13432,7 @@ impl EntityInputHandler for TakoApp {
         // ターミナルへ抜け、日本語 IME の確定文字列も入らない）
         if self.git_commit_input_focused {
             if !text.is_empty() {
-                let cursor = self.git_commit_cursor.min(self.git_commit_message.len());
-                self.git_commit_message.insert_str(cursor, text);
-                self.git_commit_cursor = cursor + text.len();
+                self.git_commit_insert(text, cx);
             }
             self.ime = None;
             cx.notify();
