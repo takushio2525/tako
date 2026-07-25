@@ -11792,4 +11792,58 @@ mod tests {
             .unwrap();
         assert_eq!(w["pane_alive"], false);
     }
+
+    #[test]
+    fn stale_binary_statusはバックエンドなしで対象外を返す() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let v = dispatch(
+            &mut host,
+            Request::StaleBinary {
+                action: Some("status".into()),
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["stale"], false);
+        assert!(v["reason"].as_str().unwrap().contains("対象外"));
+    }
+
+    #[test]
+    fn stale_binary_restartはバックエンドなしでエラー() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let result = dispatch(
+            &mut host,
+            Request::StaleBinary {
+                action: Some("restart".into()),
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("バックエンド") || msg.contains("session_id"),
+            "エラーメッセージが想定と異なる: {msg}"
+        );
+    }
+
+    #[test]
+    fn stale_binary_dismissは正常応答() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let v = dispatch(
+            &mut host,
+            Request::StaleBinary {
+                action: Some("dismiss".into()),
+                pane: Some(pane),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["dismissed"], true);
+        assert_eq!(v["pane"], pane);
+    }
 }

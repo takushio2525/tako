@@ -87,11 +87,20 @@ fn resolve_claude_symlink() -> Option<PathBuf> {
 }
 
 /// バイナリパスからバージョンを推定する。
-/// Claude CLI は `~/.claude/local/claude-cli-<version>/claude` の構造。
+/// Claude CLI は `~/.local/share/claude/versions/<version>`（新）または
+/// `~/.claude/local/claude-cli-<version>/claude`（旧）の構造。
 /// パスに version が含まれていなければ `claude --version` にフォールバック
 pub fn extract_version_from_path(path: &Path) -> String {
-    // パスから抽出: .../claude-cli-2.1.220/claude
     let path_str = path.to_string_lossy();
+    // 新形式: .../versions/2.1.220
+    if let Some(start) = path_str.find("/versions/") {
+        let rest = &path_str[start + "/versions/".len()..];
+        let ver = rest.split('/').next().unwrap_or("");
+        if !ver.is_empty() && ver.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            return ver.to_string();
+        }
+    }
+    // 旧形式: .../claude-cli-2.1.220/claude
     if let Some(start) = path_str.find("claude-cli-") {
         let rest = &path_str[start + "claude-cli-".len()..];
         if let Some(end) = rest.find('/') {
@@ -223,8 +232,13 @@ mod tests {
 
     #[test]
     fn test_extract_version_from_path() {
+        // 旧形式: claude-cli-<ver>/claude
         let path = PathBuf::from("/Users/user/.claude/local/claude-cli-2.1.220/claude");
         assert_eq!(extract_version_from_path(&path), "2.1.220");
+
+        // 新形式: versions/<ver>（symlink 先そのもの）
+        let path_new = PathBuf::from("/Users/user/.local/share/claude/versions/2.1.220");
+        assert_eq!(extract_version_from_path(&path_new), "2.1.220");
 
         let path2 = PathBuf::from("/usr/local/bin/claude");
         // PATH 上のバイナリではバージョン抽出できない（CLI フォールバック）
