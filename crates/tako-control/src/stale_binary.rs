@@ -176,38 +176,49 @@ pub fn check_stale(info: &PaneClaudeInfo) -> StaleStatus {
     }
 }
 
-/// ペインの claude PID を agents.rs の既存メカニズムで解決する
+/// バックエンドセッション内で claude バイナリを実行しているプロセスの PID を探す。
+/// tmux pane_pid → 子プロセスチェーンを辿り、`pidpath` で「claude」を含む
+/// パスを実行しているプロセスを返す。`claude agents --json` に依存しないため
+/// 隔離環境でも動く
 pub fn find_claude_pid_for_backend(backend_session: &str) -> Option<u32> {
     let socket = tako_core::tmux_backend::socket_name();
     let panes = crate::agents::tmux_pane_pids(Some(&socket));
-    let target_panes: Vec<_> = panes
+    let target_pids: Vec<u32> = panes
         .into_iter()
         .filter(|(id, _)| id.starts_with(&format!("{backend_session}:")))
+        .map(|(_, pid)| pid)
         .collect();
-    if target_panes.is_empty() {
+    if target_pids.is_empty() {
         return None;
     }
 
-    let agents = crate::agents::list_agents().ok()?;
+    // 全プロセスの親子マップから、ペイン PID の子孫で claude を実行しているものを探す
     let parents = crate::agents::process_parent_map();
-    let pane_by_pid: HashMap<u32, &str> = target_panes
-        .iter()
-        .map(|(id, pid)| (*pid, id.as_str()))
-        .collect();
+    // 逆引き: pid → 子の集合
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (&child, &parent) in &parents {
+        children.entry(parent).or_default().push(child);
+    }
 
-    for agent in &agents {
-        let Some(pid) = agent["pid"].as_u64().map(|p| p as u32) else {
-            continue;
-        };
-        // 祖先辿りでこのバックエンドに属する agent を見つける
-        let mut current = pid;
-        for _ in 0..20 {
-            if pane_by_pid.contains_key(&current) {
-                return Some(pid);
+    // ペイン PID から BFS で子孫を辿り、pidpath が claude を含むものを探す
+    for &pane_pid in &target_pids {
+        let mut queue = vec![pane_pid];
+        let mut visited = std::collections::HashSet::new();
+        while let Some(pid) = queue.pop() {
+            if !visited.insert(pid) {
+                continue;
             }
-            match parents.get(&current) {
-                Some(&ppid) if ppid != 0 && ppid != current => current = ppid,
-                _ => break,
+            // pidpath で実パスを確認（claude を含むか）
+            if pid != pane_pid {
+                if let Some(path) = pidpath(pid) {
+                    let path_str = path.to_string_lossy();
+                    if path_str.contains("claude") {
+                        return Some(pid);
+                    }
+                }
+            }
+            if let Some(kids) = children.get(&pid) {
+                queue.extend(kids);
             }
         }
     }
