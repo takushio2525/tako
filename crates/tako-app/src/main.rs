@@ -498,7 +498,7 @@ fn persist_diag(msg: &str) {
 /// 対象外（従来どおり -D で引き継ぐ）。正当な再起動では旧インスタンスの死亡と同時に
 /// クライアントも死ぬ（PTY 閉鎖 → SIGHUP）ため、このガードは発動しない
 fn foreign_client_guard() -> Option<String> {
-    if !initial_tmux_persist() || !tako_core::tmux_backend::available() {
+    if !initial_tmux_persist() || !tako_core::backend::capabilities().survives_app_exit {
         return None;
     }
     let file = tako_control::layout::try_load().ok()?;
@@ -1806,7 +1806,8 @@ impl TakoApp {
         // （Issue #30: tmux の有無でレイアウト永続化そのものを無効化しない）。
         // セカンダリモードは persist 一式（復元・保存・バックエンド）を無効化する（Issue #113）
         let tmux_persist = initial_tmux_persist() && !secondary;
-        let tmux_available = tako_core::tmux_backend::available();
+        let backend_caps = tako_core::backend::capabilities();
+        let tmux_available = backend_caps.survives_app_exit;
         if tmux_persist && tmux_available {
             // 生き残っている既存サーバーへ最新 conf を再適用する（conf は
             // サーバー起動時にしか読まれないため、バージョン更新の設定変更が
@@ -4138,7 +4139,7 @@ impl TakoApp {
         // 直接ではなく専用サーバーのセッションとして spawn する。`new-session -A` なので
         // 復元時（既存セッション名）は attach、新規ペインは作成と、同じ経路で済む
         let mut backend_session = None;
-        if self.tmux_persist && tako_core::tmux_backend::available() {
+        if self.tmux_persist && tako_core::backend::capabilities().survives_app_exit {
             let name = self
                 .backend_sessions
                 .entry(pane_id)
@@ -5031,7 +5032,10 @@ impl TakoApp {
     fn cleanup_orphan_tmux_with(&self, min_idle_secs: Option<u64>) -> Vec<String> {
         // セカンダリモードは backend_sessions（= protected）が空でプライマリの
         // セッションを全部 orphan と誤認するため、判定自体を行わない（Issue #113）
-        if self.secondary || !self.tmux_persist || !tako_core::tmux_backend::available() {
+        if self.secondary
+            || !self.tmux_persist
+            || !tako_core::backend::capabilities().survives_app_exit
+        {
             return Vec::new();
         }
         if tako_core::ports::other_tako_running() {
@@ -12488,7 +12492,7 @@ impl TmuxHost for TakoApp {
             return;
         }
         self.tmux_persist = enabled;
-        if enabled && tako_core::tmux_backend::available() {
+        if enabled && tako_core::backend::capabilities().survives_app_exit {
             tako_core::tmux_backend::sync_conf(&tako_core::tmux_backend::socket_name());
         }
         if std::env::var_os("TAKO_SELF_TEST").is_none() {
@@ -13537,7 +13541,7 @@ impl SystemHost for TakoApp {
     }
 
     fn reserve_backend_session(&mut self, pane: PaneId) -> Option<String> {
-        if self.tmux_persist && tako_core::tmux_backend::available() {
+        if self.tmux_persist && tako_core::backend::capabilities().survives_app_exit {
             Some(
                 self.backend_sessions
                     .entry(pane)
@@ -18797,7 +18801,7 @@ mod self_test {
             //     隔離ソケット（main() で TAKO_TMUX_SOCKET=tako-st-<pid> を設定済み）上で
             //     セッション生成 → シェル動作 → OSC パススルー → tty 差し替え →
             //     tmuxview 区別 → 明示 close での kill を検証する
-            if tako_core::tmux_backend::available() {
+            if tako_core::backend::capabilities().survives_app_exit {
                 let backend_sock = tako_core::tmux_backend::socket_name();
 
                 // 59. persist 有効中の分割はバックエンドセッションとして生え、シェルが動く

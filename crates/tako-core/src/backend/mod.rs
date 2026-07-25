@@ -122,10 +122,49 @@ pub struct BackendCapabilities {
 }
 
 impl BackendCapabilities {
-    /// 完全復元ができるか（persist の UI 文言・マトリクスの分類に使う）
+    /// 完全復元ができるか（persist の UI 文言・マトリクスの分類に使う）。
+    ///
+    /// **器があること = 実行中プロセスと画面内容が tako の再起動を生き延びること**。
+    /// 器が無くても構成のみ永続化は動く（#30 で実装・検証済みの経路）ので、
+    /// 「保存するか」の判断にこれを使ってはいけない（保存のゲートは persist 設定だけ）
     pub fn full_restore(&self) -> bool {
         self.survives_app_exit
     }
+
+    /// 縮退の説明。UI・診断・エラー・system prompt がこの 1 文を共有する
+    pub fn degraded_note(&self) -> Option<String> {
+        if self.survives_app_exit {
+            return None;
+        }
+        Some(format!(
+            "永続バックエンド（{}）に器が無いため、タブ・ペイン構成と cwd は復元するが、\
+             実行中プロセスと画面内容は tako の終了時に失われる",
+            self.label
+        ))
+    }
+
+    /// 診断・API 応答用の構造化表現（`tako persist` / MCP が返す）
+    pub fn describe(&self) -> serde_json::Value {
+        serde_json::json!({
+            "label": self.label,
+            "survives_app_exit": self.survives_app_exit,
+            "detached_access": self.detached_access,
+            "scrollback": match self.scrollback {
+                ScrollbackAuthority::Backend => "backend",
+                ScrollbackAuthority::InProcess => "in_process",
+            },
+            "note": self.degraded_note(),
+        })
+    }
+}
+
+/// プロセス全体の backend の能力（`backend().capabilities()` の短縮形）。
+///
+/// **呼び出し側は「tmux があるか」ではなく「何ができるか」を尋ねる**。
+/// この向きにしておくと、案 B-1（器あり・到達なし）が入ったときに
+/// 呼び出し側を書き換えずに済む（設計 §3.6 の合格条件）
+pub fn capabilities() -> BackendCapabilities {
+    backend().capabilities()
 }
 
 /// 器を握っている外部クライアント（#177 の復元強奪ガードの材料）
@@ -355,6 +394,58 @@ mod tests {
         assert_eq!(resolve_choice(Some("")), auto);
         // 明示 tmux も「tmux が無ければ None」= auto と同じ結果になる
         assert_eq!(resolve_choice(Some("tmux")), auto);
+    }
+
+    #[test]
+    fn 器が無いときだけ縮退の説明が出る() {
+        let with_container = BackendCapabilities {
+            survives_app_exit: true,
+            detached_access: true,
+            scrollback: ScrollbackAuthority::Backend,
+            label: "tmux",
+        };
+        assert!(with_container.degraded_note().is_none());
+        assert!(with_container.full_restore());
+
+        let without = BackendCapabilities {
+            survives_app_exit: false,
+            detached_access: false,
+            scrollback: ScrollbackAuthority::InProcess,
+            label: "none",
+        };
+        let note = without.degraded_note().expect("縮退の説明が要る");
+        assert!(note.contains("none"), "note={note}");
+        // 「構成は戻る / 画面は失われる」の両方を言う（片方だけだと誤解を生む）
+        assert!(note.contains("構成"), "note={note}");
+        assert!(note.contains("失われる"), "note={note}");
+    }
+
+    #[test]
+    fn describeは能力をそのまま構造化して返す() {
+        let caps = BackendCapabilities {
+            survives_app_exit: false,
+            detached_access: false,
+            scrollback: ScrollbackAuthority::InProcess,
+            label: "none",
+        };
+        let v = caps.describe();
+        assert_eq!(v["label"], "none");
+        assert_eq!(v["survives_app_exit"], false);
+        assert_eq!(v["detached_access"], false);
+        assert_eq!(v["scrollback"], "in_process");
+        assert!(v["note"].is_string(), "縮退時は note が入る");
+
+        let tmux = BackendCapabilities {
+            survives_app_exit: true,
+            detached_access: true,
+            scrollback: ScrollbackAuthority::Backend,
+            label: "tmux",
+        };
+        assert_eq!(tmux.describe()["scrollback"], "backend");
+        assert!(
+            tmux.describe()["note"].is_null(),
+            "縮退していなければ note は無い"
+        );
     }
 
     #[test]
