@@ -617,11 +617,16 @@ impl Profile {
     /// projects に指定された key が全て projects.yaml に存在するか検証する（Issue #500 Part 7）。
     /// 未登録の key があれば起動時エラーにする
     pub fn validate_projects(&self) -> Result<(), String> {
+        let config = ProjectsConfig::load()?;
+        self.validate_projects_with(&config)
+    }
+
+    /// ProjectsConfig を直接受け取る版（テスト用に公開）
+    pub fn validate_projects_with(&self, config: &ProjectsConfig) -> Result<(), String> {
         let keys = match self.projects.as_ref() {
             Some(k) if !k.is_empty() => k,
             _ => return Ok(()),
         };
-        let config = ProjectsConfig::load()?;
         let mut missing: Vec<&str> = Vec::new();
         for key in keys {
             if !config.projects.contains_key(key) {
@@ -3211,5 +3216,45 @@ worker_agents:
             !prompt.contains("Assigned Projects"),
             "projects セクションが含まれない"
         );
+    }
+
+    #[test]
+    fn validate_projects_rejects_unknown_key() {
+        // ProjectsConfig を直接構築して validate_projects_with でテスト
+        // （OnceLock 競合を回避）
+        let mut config = ProjectsConfig {
+            projects: std::collections::BTreeMap::new(),
+        };
+        config.projects.insert(
+            "tako".into(),
+            ProjectEntry {
+                cwd: "/tmp".into(),
+                description: Some("test".into()),
+            },
+        );
+
+        let p = Profile {
+            projects: Some(vec!["tako".into(), "nonexistent".into()]),
+            ..Default::default()
+        };
+        let err = p.validate_projects_with(&config).unwrap_err();
+        assert!(err.contains("nonexistent"), "未登録 key のエラー: {err}");
+        assert!(
+            !err.contains("tako"),
+            "登録済み key はエラーに含まれない: {err}"
+        );
+
+        let p2 = Profile {
+            projects: Some(vec!["tako".into()]),
+            ..Default::default()
+        };
+        assert!(
+            p2.validate_projects_with(&config).is_ok(),
+            "登録済み key は OK"
+        );
+
+        // projects 未指定は常に OK
+        let p3 = Profile::default();
+        assert!(p3.validate_projects_with(&config).is_ok());
     }
 }

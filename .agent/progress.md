@@ -1198,3 +1198,10 @@
 - #504: accounts.yaml CRUD（116 ツール）、spawn の account パラメータ、master_account/worker_account、model/effort 解決順（spawn > アカウント > プロファイル）
 - 関連コミット: `7c97611`（#500）、`28b0eca`（#504）→ PR #505
 - 次: レビュー → squash merge → 隔離実測 → Part 5-7 は別タスク
+
+## 2026-07-25（#500 Part 5-7: cwd + ファイルツリー自動追加 + 専任マスター）
+- Part 5: Profile に cwd。master 起動時に cd + 存在検証 + ~ 展開。インライン / --tab 両対応
+- Part 6: master 起動後に cwd + projects のフォルダをファイルツリーへ IPC 経由で自動追加
+- Part 7: projects 付きプロファイルで system prompt に Assigned Projects 注入。未登録 key は起動時エラー
+- 関連コミット: `81b8bea` → PR #506（Closes #500）
+- 次: レビュー → squash merge → install
