@@ -1275,4 +1275,14 @@
   画面マーカー 2→0、auto = 再 attach 2・マーカー 2→1。セルフテスト（tmux モード）は FAILED 0 で完走
 - 関連: PR（`Refs #519`）。1280 tests / fmt / clippy / check-windows.sh 全緑
 - 次: 段取り③（`PaneReach` 導入・dispatch 約 40 箇所）→ ④⑤⑥
-||||||| parent of 2800093 ([修正] git タブ: パス表記の可搬性と CRLF 耐性 (#520))
+## 2026-07-26（#496: git タブのブランチ操作 + コンフリクト解消エージェント）
+- ブランチ切替 / 作成 / マージを UI・CLI・MCP へ 1:1 追加。破壊的操作は confirm の
+  dry-run 方式に統一し、切替は「持ち越し」と「妨げる変更」を分けて提示、マージは
+  `git merge-tree --write-tree` で作業ツリーに触れずコンフリクトを事前予測する
+- コンフリクトカード（進行中操作 / ours←theirs / 未解決ファイル / 中止）と
+  claude・codex・agy から選ぶ解消エージェント起動を新設。プロンプトは埋め込み雛形 +
+  `<data_dir>/orchestrator/conflict-resolver.md` で差し替え可
+- 関連コミット: `c22990f` `5202033` `b9430cb`（+ `150ec3b` i18n テストのフレーク修正）→ PR #534
+- 検証: 品質ゲート全緑（1281）+ 隔離セルフテスト完走 + CLI 13 手順 / MCP 7 手順 +
+  実クリック 4 件（証拠 ~/dev/tako-evidence/496/）。カード類のスクショは蓋閉じで未取得
+- 次: 蓋を開けた状態でコンフリクトカード・狭幅のスクショを取得 → master 検収 → merge
