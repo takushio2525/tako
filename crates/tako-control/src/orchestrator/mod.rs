@@ -93,6 +93,114 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
         .filter(|p| p.is_absolute())
 }
 
+// --- accounts.yaml (#504) ---
+
+/// accounts.yaml のパス
+pub fn accounts_yaml_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("accounts.yaml"))
+}
+
+/// 名前つきアカウントレジストリ（Issue #504）。
+/// アカウント名 → config_dir + 既定モデル/effort で、worker 単位のアカウント切替を可能にする
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountsConfig {
+    #[serde(default)]
+    pub accounts: std::collections::BTreeMap<String, AccountEntry>,
+}
+
+/// アカウントエントリ
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountEntry {
+    pub config_dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
+}
+
+/// 解決済みアカウント情報（expand_tilde 適用後）
+#[derive(Debug, Clone)]
+pub struct ResolvedAccount {
+    pub name: String,
+    pub config_dir: String,
+    pub description: Option<String>,
+    pub default_model: Option<String>,
+    pub default_effort: Option<String>,
+}
+
+impl AccountsConfig {
+    pub fn load() -> Result<Self, String> {
+        let path = accounts_yaml_path().ok_or("ホームディレクトリが取得できない")?;
+        Self::load_from(&path)
+    }
+
+    pub fn load_from(path: &Path) -> Result<Self, String> {
+        if !path.is_file() {
+            return Ok(AccountsConfig {
+                accounts: std::collections::BTreeMap::new(),
+            });
+        }
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("accounts.yaml の読み取りに失敗: {e}"))?;
+        serde_yaml::from_str(&content).map_err(|e| format!("accounts.yaml のパースに失敗: {e}"))
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let path = accounts_yaml_path().ok_or("ホームディレクトリが取得できない")?;
+        self.save_to(&path)
+    }
+
+    pub fn save_to(&self, path: &Path) -> Result<(), String> {
+        let content =
+            serde_yaml::to_string(self).map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
+        crate::config_io::atomic_write_with_backup(path, &content)
+    }
+
+    pub fn mutate<R>(f: impl FnOnce(&mut Self) -> R) -> Result<R, String> {
+        let path = accounts_yaml_path().ok_or("ホームディレクトリが取得できない")?;
+        Self::mutate_at(&path, f)
+    }
+
+    pub fn mutate_at<R>(path: &Path, f: impl FnOnce(&mut Self) -> R) -> Result<R, String> {
+        let _lock = crate::config_io::lock_exclusive(path)?;
+        let mut config = Self::load_from(path)?;
+        let result = f(&mut config);
+        config.save_to(path)?;
+        Ok(result)
+    }
+
+    /// アカウント名を解決する。未登録なら Err
+    pub fn resolve(&self, name: &str) -> Result<ResolvedAccount, String> {
+        let entry = self
+            .accounts
+            .get(name)
+            .ok_or_else(|| format!("アカウント '{name}' が accounts.yaml に見つからない"))?;
+        let config_dir = expand_tilde(&entry.config_dir);
+        Ok(ResolvedAccount {
+            name: name.to_string(),
+            config_dir,
+            description: entry.description.clone(),
+            default_model: entry.default_model.clone(),
+            default_effort: entry.default_effort.clone(),
+        })
+    }
+
+    pub fn list_resolved(&self) -> Vec<ResolvedAccount> {
+        self.accounts
+            .iter()
+            .map(|(name, entry)| ResolvedAccount {
+                name: name.clone(),
+                config_dir: expand_tilde(&entry.config_dir),
+                description: entry.description.clone(),
+                default_model: entry.default_model.clone(),
+                default_effort: entry.default_effort.clone(),
+            })
+            .collect()
+    }
+}
+
 // --- projects.yaml ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,6 +455,15 @@ pub struct Profile {
     /// ログや CLI/MCP 出力には値を生で出さない（キー名のみ / マスク）
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, String>,
+
+    /// master の既定アカウント名（accounts.yaml のキー。Issue #504）。
+    /// 指定すると master 起動時に該当 config_dir の CLAUDE_CONFIG_DIR が注入される
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_account: Option<String>,
+    /// worker の既定アカウント名（Issue #504）。
+    /// 省略時は master_account → env の CLAUDE_CONFIG_DIR → 従来挙動の順で解決
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_account: Option<String>,
 }
 
 /// master / claude worker の既定 effort
@@ -376,6 +493,8 @@ impl Default for Profile {
             auto_resume_dead: None,
             supervisor_max_retries: None,
             env: std::collections::BTreeMap::new(),
+            master_account: None,
+            worker_account: None,
         }
     }
 }
@@ -467,6 +586,39 @@ impl Profile {
                 format!("プロファイルの worker_agent が不正: {e}")
             }
         })
+    }
+
+    /// master のアカウント名を解決する（Issue #504）
+    pub fn resolve_master_account_name(&self) -> Option<&str> {
+        self.master_account.as_deref()
+    }
+
+    /// worker のアカウント名を解決する。解決順:
+    /// spawn 時の明示指定 > worker_account > master_account（Issue #504）
+    pub fn resolve_worker_account_name<'a>(&'a self, explicit: Option<&'a str>) -> Option<&'a str> {
+        explicit
+            .or(self.worker_account.as_deref())
+            .or(self.master_account.as_deref())
+    }
+
+    /// アカウント解決に基づく env を返す（Issue #504）。
+    /// アカウントの config_dir を CLAUDE_CONFIG_DIR として注入し、
+    /// アカウントが指定されていない場合はプロファイルの env のみを返す。
+    /// アカウント指定は env の CLAUDE_CONFIG_DIR より優先する
+    pub fn resolved_env_with_account(
+        &self,
+        account: Option<&ResolvedAccount>,
+    ) -> Vec<(String, String)> {
+        let mut env = self.resolved_env();
+        if let Some(acct) = account {
+            // アカウント指定がある場合、CLAUDE_CONFIG_DIR を上書き（明示 > 暗黙）
+            if let Some(pos) = env.iter().position(|(k, _)| k == "CLAUDE_CONFIG_DIR") {
+                env[pos].1 = acct.config_dir.clone();
+            } else {
+                env.push(("CLAUDE_CONFIG_DIR".to_string(), acct.config_dir.clone()));
+            }
+        }
+        env
     }
 
     /// プロファイルの env が内部予約変数を含んでいないか検証する（Issue #500）。
@@ -2770,5 +2922,122 @@ worker_agents:
         assert!(err.contains("TAKO_SOCKET"));
         assert!(err.contains("TAKO_TOKEN"));
         assert!(!err.contains("SAFE_VAR"));
+    }
+
+    // --- accounts (#504) ---
+
+    #[test]
+    fn accounts_crud_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("tako-accounts-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("accounts.yaml");
+
+        // 空ファイルから開始
+        let config = AccountsConfig::load_from(&path).unwrap();
+        assert!(config.accounts.is_empty());
+
+        // add
+        AccountsConfig::mutate_at(&path, |c| {
+            c.accounts.insert(
+                "univ".into(),
+                AccountEntry {
+                    config_dir: "~/.claude-univ".into(),
+                    description: Some("test".into()),
+                    default_model: Some("claude-opus-4-6[1m]".into()),
+                    default_effort: None,
+                },
+            );
+        })
+        .unwrap();
+
+        // show
+        let config = AccountsConfig::load_from(&path).unwrap();
+        let resolved = config.resolve("univ").unwrap();
+        assert!(
+            !resolved.config_dir.starts_with('~'),
+            "チルダ展開されている: {}",
+            resolved.config_dir
+        );
+        assert_eq!(
+            resolved.default_model.as_deref(),
+            Some("claude-opus-4-6[1m]")
+        );
+
+        // 未登録
+        assert!(config.resolve("nonexistent").is_err());
+
+        // remove
+        AccountsConfig::mutate_at(&path, |c| {
+            c.accounts.remove("univ");
+        })
+        .unwrap();
+        let config = AccountsConfig::load_from(&path).unwrap();
+        assert!(config.accounts.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolved_env_with_account_overrides_config_dir() {
+        let mut p = Profile::default();
+        p.env
+            .insert("CLAUDE_CONFIG_DIR".into(), "~/.claude-old".into());
+        p.env.insert("OTHER_VAR".into(), "keep".into());
+
+        let acct = ResolvedAccount {
+            name: "univ".into(),
+            config_dir: "/home/test/.claude-univ".into(),
+            description: None,
+            default_model: None,
+            default_effort: None,
+        };
+        let env = p.resolved_env_with_account(Some(&acct));
+        let config_dir = env.iter().find(|(k, _)| k == "CLAUDE_CONFIG_DIR").unwrap();
+        assert_eq!(config_dir.1, "/home/test/.claude-univ");
+        let other = env.iter().find(|(k, _)| k == "OTHER_VAR").unwrap();
+        assert_eq!(other.1, "keep");
+    }
+
+    #[test]
+    fn resolved_env_with_account_adds_config_dir() {
+        let p = Profile::default();
+        let acct = ResolvedAccount {
+            name: "personal".into(),
+            config_dir: "/home/test/.claude".into(),
+            description: None,
+            default_model: None,
+            default_effort: None,
+        };
+        let env = p.resolved_env_with_account(Some(&acct));
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].0, "CLAUDE_CONFIG_DIR");
+        assert_eq!(env[0].1, "/home/test/.claude");
+    }
+
+    #[test]
+    fn resolved_env_with_no_account_is_profile_only() {
+        let mut p = Profile::default();
+        p.env.insert("MY_VAR".into(), "hello".into());
+        let env = p.resolved_env_with_account(None);
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].0, "MY_VAR");
+    }
+
+    #[test]
+    fn resolve_worker_account_name_priority() {
+        let mut p = Profile {
+            master_account: Some("master-acct".into()),
+            worker_account: Some("worker-acct".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            p.resolve_worker_account_name(Some("explicit")),
+            Some("explicit")
+        );
+        assert_eq!(p.resolve_worker_account_name(None), Some("worker-acct"));
+        p.worker_account = None;
+        assert_eq!(p.resolve_worker_account_name(None), Some("master-acct"));
+        p.master_account = None;
+        assert_eq!(p.resolve_worker_account_name(None), None);
     }
 }

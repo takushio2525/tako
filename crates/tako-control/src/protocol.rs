@@ -568,6 +568,31 @@ pub enum Request {
         /// 環境変数を削除する（キー名の配列。Issue #500）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         env_unset: Option<Vec<String>>,
+        /// master の既定アカウント名（#504）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        master_account: Option<String>,
+        #[serde(default)]
+        clear_master_account: bool,
+        /// worker の既定アカウント名（#504）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_account: Option<String>,
+        #[serde(default)]
+        clear_worker_account: bool,
+    },
+    /// オーケストレーター: アカウントレジストリの CRUD（Issue #504）。
+    /// action: list / show / add / remove
+    OrchestratorAccounts {
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_effort: Option<String>,
     },
     /// オーケストレーター: worker spawn のレイアウト設定の取得・変更（Issue #165）。
     /// 全パラメータ省略で現在値の取得、いずれか指定でその項目を更新して結果を返す。
@@ -604,6 +629,9 @@ pub enum Request {
         /// 委任台帳の task_type（Issue #292。統制語彙。省略時は investigation）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task_type: Option<String>,
+        /// アカウント名（accounts.yaml のキー。この worker だけ該当 config dir で起動。#504）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
     },
     /// オーケストレーター: master が自身の pane/tab/ctx% を取得する（#123 / #193 / #288）。
     /// 解決順序: caller_pid pid 祖先辿り → pane env → stale map → role 検索（複数時エラー）
