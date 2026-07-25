@@ -341,6 +341,12 @@ pub struct Profile {
     /// supervisor の最大リトライ回数（既定 3。超過でエスカレーション）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervisor_max_retries: Option<u32>,
+
+    /// 任意の環境変数を master / worker に注入する（Issue #500）。
+    /// 値の `~` / `$HOME` は展開される。内部変数（TAKO_SOCKET 等）の上書きは拒否する。
+    /// ログや CLI/MCP 出力には値を生で出さない（キー名のみ / マスク）
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// master / claude worker の既定 effort
@@ -369,6 +375,7 @@ impl Default for Profile {
             supervisor_mode: None,
             auto_resume_dead: None,
             supervisor_max_retries: None,
+            env: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -460,6 +467,55 @@ impl Profile {
                 format!("プロファイルの worker_agent が不正: {e}")
             }
         })
+    }
+
+    /// プロファイルの env が内部予約変数を含んでいないか検証する（Issue #500）。
+    /// 違反があればキー名のリストを返す
+    pub fn validate_env(&self) -> Result<(), String> {
+        let reserved: &[&str] = &[
+            "TAKO_SOCKET",
+            "TAKO_TOKEN",
+            "TAKO_PANE_ID",
+            "TAKO_TAB_ID",
+            "TAKO_MCP_URL",
+            "TAKO_ORCHESTRATOR_ROLE",
+            "TAKO_ISOLATED",
+            "TAKO_SELF_TEST",
+            "TAKO_DATA_DIR",
+            "TAKO_PERSIST",
+            "TAKO_DISCOVERY_DIR",
+        ];
+        let violations: Vec<&str> = self
+            .env
+            .keys()
+            .filter(|k| reserved.contains(&k.as_str()))
+            .map(|k| k.as_str())
+            .collect();
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "プロファイルの env に tako 内部変数が含まれている（上書き禁止）: {}",
+                violations.join(", ")
+            ))
+        }
+    }
+
+    /// プロファイルの env を `~` / `$HOME` 展開済みの `Vec<(String, String)>` で返す。
+    /// ログ出力にはキー名のみ表示し、値はマスクする
+    pub fn resolved_env(&self) -> Vec<(String, String)> {
+        self.env
+            .iter()
+            .map(|(k, v)| (k.clone(), expand_tilde(v)))
+            .collect()
+    }
+
+    /// env のキー一覧を返す（値はマスクされた形。CLI/MCP 出力用。Issue #500）
+    pub fn env_keys_masked(&self) -> Vec<(String, String)> {
+        self.env
+            .keys()
+            .map(|k| (k.clone(), "***".to_string()))
+            .collect()
     }
 
     /// worker 起動パラメータ（モデル・effort・許可スキップ・追加引数）を解決する。
@@ -1031,8 +1087,23 @@ pub fn build_master_cmd(
     prompt_path: &Path,
     tako_bin: &str,
 ) -> Result<String, String> {
+    // env 検証（内部変数の上書きを拒否。Issue #500）
+    profile.validate_env()?;
+
     let agent = profile.resolve_master_agent()?;
-    let mut cmd = format!("TAKO_ORCHESTRATOR_ROLE='{role_env}' {}", agent.as_str());
+    // プロファイル env をコマンド先頭で export する。direnv より後勝ちで上書きする
+    let mut cmd = String::new();
+    for (k, v) in profile.resolved_env() {
+        cmd.push_str(&format!(
+            "export {}={}; ",
+            agent::sh_quote(&k),
+            agent::sh_quote(&v)
+        ));
+    }
+    cmd.push_str(&format!(
+        "TAKO_ORCHESTRATOR_ROLE='{role_env}' {}",
+        agent.as_str()
+    ));
     match agent {
         WorkerAgent::Claude => {
             if let Some(model) = profile.model.as_deref() {
@@ -2636,5 +2707,68 @@ worker_agents:
         );
         assert!(prompt.contains("SOLO_APPEND_MARKER"));
         assert!(prompt.contains("Solo Agent"), "role ブロックは維持");
+    }
+
+    // --- env 注入（Issue #500）---
+
+    #[test]
+    fn validate_env_rejects_reserved_vars() {
+        let mut p = Profile::default();
+        p.env.insert("TAKO_SOCKET".into(), "/tmp/test".into());
+        let err = p.validate_env().unwrap_err();
+        assert!(err.contains("TAKO_SOCKET"), "内部変数名が含まれる: {err}");
+    }
+
+    #[test]
+    fn validate_env_accepts_user_vars() {
+        let mut p = Profile::default();
+        p.env
+            .insert("CLAUDE_CONFIG_DIR".into(), "~/.claude-univ".into());
+        p.env.insert("MY_CUSTOM_VAR".into(), "hello".into());
+        assert!(p.validate_env().is_ok());
+    }
+
+    #[test]
+    fn resolved_env_expands_tilde() {
+        let mut p = Profile::default();
+        p.env
+            .insert("CLAUDE_CONFIG_DIR".into(), "~/test-dir".into());
+        let resolved = p.resolved_env();
+        assert_eq!(resolved.len(), 1);
+        let (k, v) = &resolved[0];
+        assert_eq!(k, "CLAUDE_CONFIG_DIR");
+        assert!(!v.starts_with('~'), "チルダが展開されている: {v}");
+        assert!(v.ends_with("/test-dir"), "パスが保持されている: {v}");
+    }
+
+    #[test]
+    fn env_keys_masked_hides_values() {
+        let mut p = Profile::default();
+        p.env
+            .insert("SECRET_TOKEN".into(), "super-secret-123".into());
+        let masked = p.env_keys_masked();
+        assert_eq!(masked.len(), 1);
+        assert_eq!(masked[0].0, "SECRET_TOKEN");
+        assert_eq!(masked[0].1, "***");
+    }
+
+    #[test]
+    fn env_empty_is_backward_compatible() {
+        let p = Profile::default();
+        assert!(p.env.is_empty());
+        assert!(p.validate_env().is_ok());
+        assert!(p.resolved_env().is_empty());
+    }
+
+    #[test]
+    fn validate_env_rejects_multiple_reserved() {
+        let mut p = Profile::default();
+        p.env.insert("TAKO_SOCKET".into(), "x".into());
+        p.env.insert("TAKO_TOKEN".into(), "y".into());
+        p.env.insert("SAFE_VAR".into(), "z".into());
+        let err = p.validate_env().unwrap_err();
+        assert!(err.contains("TAKO_SOCKET"));
+        assert!(err.contains("TAKO_TOKEN"));
+        assert!(!err.contains("SAFE_VAR"));
     }
 }

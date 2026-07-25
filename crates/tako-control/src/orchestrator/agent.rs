@@ -80,17 +80,28 @@ pub struct WorkerLaunch<'a> {
     pub skip_permissions: bool,
     /// プロファイル worker_agents.<agent>.args の追加 CLI 引数（上級者向け）
     pub extra_args: &'a [String],
+    /// プロファイルの env（展開済み）。コマンド先頭で `export K=V;` として注入し、
+    /// direnv が同変数を設定していても明示値が勝つようにする（Issue #500）
+    pub env: &'a [(String, String)],
 }
 
 /// worker 起動用のシェルコマンドを組み立てる。
 /// claude の従来出力（`build_worker_claude_cmd`）と互換（skip_permissions /
 /// extra_args 未使用時は既存文字列と一致する）
 pub fn build_worker_cmd(launch: &WorkerLaunch) -> String {
-    let mut cmd = format!(
+    // プロファイル env をコマンド先頭で export する。ログインシェルが direnv で
+    // 同変数を設定していても、export が後勝ちで上書きする（Issue #500）
+    let mut cmd = String::new();
+    if !launch.env.is_empty() {
+        for (k, v) in launch.env {
+            cmd.push_str(&format!("export {}={}; ", sh_quote(k), sh_quote(v)));
+        }
+    }
+    cmd.push_str(&format!(
         "TAKO_ORCHESTRATOR_ROLE={} {}",
         sh_quote(launch.role),
         launch.agent.as_str()
-    );
+    ));
     if let Some(model) = launch.model {
         cmd.push_str(&format!(" --model {}", sh_quote(model)));
     }
@@ -420,5 +431,60 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(root["trustedWorkspaces"][0], "/fresh");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_worker_cmd_includes_env_export() {
+        let env = vec![
+            (
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/home/test/.claude-univ".to_string(),
+            ),
+            ("MY_VAR".to_string(), "hello world".to_string()),
+        ];
+        let cmd = build_worker_cmd(&WorkerLaunch {
+            agent: WorkerAgent::Claude,
+            role: "worker:test",
+            env: &env,
+            ..Default::default()
+        });
+        assert!(cmd.starts_with("export "), "env export が先頭にある: {cmd}");
+        assert!(
+            cmd.contains("CLAUDE_CONFIG_DIR="),
+            "config dir が含まれる: {cmd}"
+        );
+        assert!(cmd.contains("MY_VAR="), "任意変数が含まれる: {cmd}");
+        assert!(cmd.contains("claude"), "agent コマンドが含まれる: {cmd}");
+    }
+
+    #[test]
+    fn build_worker_cmd_empty_env_is_backward_compatible() {
+        let cmd = build_worker_cmd(&WorkerLaunch {
+            agent: WorkerAgent::Claude,
+            role: "worker:test",
+            effort: Some("max"),
+            ..Default::default()
+        });
+        assert!(
+            cmd.starts_with("TAKO_ORCHESTRATOR_ROLE="),
+            "env なしなら従来と同じ形式: {cmd}"
+        );
+        assert!(!cmd.contains("export "), "export は入らない: {cmd}");
+    }
+
+    #[test]
+    fn build_worker_cmd_env_works_for_codex() {
+        let env = vec![("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string())];
+        let cmd = build_worker_cmd(&WorkerLaunch {
+            agent: WorkerAgent::Codex,
+            role: "worker:test",
+            env: &env,
+            ..Default::default()
+        });
+        assert!(
+            cmd.contains("export ANTHROPIC_API_KEY="),
+            "codex にも env export: {cmd}"
+        );
+        assert!(cmd.contains("codex"), "codex コマンド: {cmd}");
     }
 }

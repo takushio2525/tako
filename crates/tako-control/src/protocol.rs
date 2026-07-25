@@ -562,6 +562,12 @@ pub enum Request {
         /// タブ名の命名規則（空文字でクリア）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tab_naming_convention: Option<String>,
+        /// 環境変数を設定する（KEY=VALUE 形式の配列。Issue #500）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env_set: Option<Vec<String>>,
+        /// 環境変数を削除する（キー名の配列。Issue #500）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env_unset: Option<Vec<String>>,
     },
     /// オーケストレーター: worker spawn のレイアウト設定の取得・変更（Issue #165）。
     /// 全パラメータ省略で現在値の取得、いずれか指定でその項目を更新して結果を返す。

@@ -2127,6 +2127,8 @@ fn dispatch_inner(
             agent_args,
             worker_model_policy,
             tab_naming_convention,
+            env_set,
+            env_unset,
         } => dispatch_orchestrator_profiles(ProfilesParams {
             action,
             name,
@@ -2149,6 +2151,8 @@ fn dispatch_inner(
             worker_model_policy,
             agent_args,
             tab_naming_convention,
+            env_set,
+            env_unset,
         }),
 
         Request::OrchestratorLayout {
@@ -4071,6 +4075,10 @@ pub struct ProfilesParams {
     pub worker_model_policy: Option<String>,
     /// タブ名の命名規則
     pub tab_naming_convention: Option<String>,
+    /// env を設定する（key=value 形式。Issue #500）
+    pub env_set: Option<Vec<String>>,
+    /// env からキーを削除する（Issue #500）
+    pub env_unset: Option<Vec<String>>,
 }
 
 /// プロファイルを JSON 化する（list / show / set の共通形）。
@@ -4100,6 +4108,23 @@ fn profile_to_json(name: &str, profile: &crate::orchestrator::Profile) -> Value 
     }
     if profile.tab_naming_convention.is_some() {
         v["tab_naming_convention"] = json!(profile.tab_naming_convention);
+    }
+    // env はキー名のみ表示（値はマスク。Issue #500）
+    if !profile.env.is_empty() {
+        let masked: serde_json::Map<String, Value> = profile
+            .env
+            .keys()
+            .map(|k| (k.clone(), json!("***")))
+            .collect();
+        v["env"] = Value::Object(masked);
+        // CLAUDE_CONFIG_DIR が設定されている場合、config dir パスだけは表示する
+        // （アカウントの判別に必要。値自体は秘密ではない）
+        if let Some(config_dir) = profile.env.get("CLAUDE_CONFIG_DIR") {
+            v["config_dir"] = json!(orchestrator::expand_tilde(config_dir));
+        }
+    }
+    if profile.projects.is_some() {
+        v["projects"] = json!(profile.projects);
     }
     v
 }
@@ -4187,6 +4212,29 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                 }
                 None => None,
             };
+            // env_set の形式と内部変数チェックを事前検証（クロージャ内から
+            // DispatchError を返せないため。Issue #500）
+            if let Some(ref env_set) = params.env_set {
+                for entry in env_set {
+                    match entry.split_once('=') {
+                        None => {
+                            return Err(DispatchError::InvalidParams(format!(
+                                "env の形式が不正（KEY=VALUE が必要）: {entry}"
+                            )));
+                        }
+                        Some((k, _)) => {
+                            // 一時的に Profile で内部変数チェック
+                            let mut tmp = orchestrator::Profile::default();
+                            tmp.env.insert(k.to_string(), String::new());
+                            if let Err(e) = tmp.validate_env() {
+                                return Err(DispatchError::Operation(e));
+                            }
+                        }
+                    }
+                }
+            }
+            let env_set_clone = params.env_set.clone();
+            let env_unset_clone = params.env_unset.clone();
             // ロック付き read-modify-write（#169）。パースできない既存プロファイルを
             // default に丸めて上書き保存すると設定が消えるため、Err で中断する
             let (path, profile) = orchestrator::Profile::mutate_named(&name, |profile| {
@@ -4243,6 +4291,20 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                     }
                     if let Some(a) = params.agent_args {
                         cfg.args = a;
+                    }
+                }
+                // env の設定・削除（Issue #500）
+                if let Some(ref env_set) = env_set_clone {
+                    for entry in env_set {
+                        if let Some((k, v)) = entry.split_once('=') {
+                            profile.env.insert(k.to_string(), v.to_string());
+                        }
+                        // 不正形式は事前検証済み
+                    }
+                }
+                if let Some(ref env_unset) = env_unset_clone {
+                    for key in env_unset {
+                        profile.env.remove(key);
                     }
                 }
                 // 既定値のみになったエントリは掃除する（YAML を汚さない）
@@ -4740,6 +4802,10 @@ fn dispatch_orchestrator_handoff(
 
     // プロファイルの読み込みとエージェント解決
     let profile = orchestrator::Profile::load(profile_name).unwrap_or_default();
+    // env 検証（内部変数の上書き拒否。Issue #500）
+    profile.validate_env().map_err(DispatchError::Operation)?;
+    let profile_env = profile.resolved_env();
+
     let master_agent = profile
         .resolve_master_agent()
         .map_err(DispatchError::InvalidParams)?;
@@ -4764,11 +4830,11 @@ fn dispatch_orchestrator_handoff(
         .map_err(op_err)?;
     let _ = tree_mut(host.workspace_mut(), tab_id).focus(split_target);
 
-    // セッション起動（cwd をホームに、command は None = シェルのみ起動）
+    // セッション起動（cwd をホームに、プロファイル env を注入。Issue #500）
     let options = SpawnOptions {
         command: None,
         cwd: Some(cwd.clone()),
-        env: Vec::new(),
+        env: profile_env.clone(),
     };
     host.attach_session(new_id, options);
 
@@ -4780,6 +4846,7 @@ fn dispatch_orchestrator_handoff(
         effort: launch.effort.as_deref(),
         skip_permissions: master_agent.default_skip_permissions(),
         extra_args: &launch.extra_args,
+        env: &profile_env,
     });
 
     // 事前信頼
@@ -4884,6 +4951,22 @@ fn dispatch_orchestrator_spawn(
     // 検証はペイン分割の**前**に行う（不正 agent でペインだけ生える事故を防ぐ）
     let caller_pane = pane.map(PaneId::from_raw);
     let profile = resolve_caller_profile_with_role(host.workspace(), caller_pane, &role_suffix);
+
+    // Part 2: projects 制限の強制（Issue #500）。プロファイルに projects が設定されている場合、
+    // 範囲外のプロジェクトへの spawn を拒否する
+    if let Some(ref allowed) = profile.projects {
+        if !allowed.iter().any(|p| p == project) {
+            return Err(DispatchError::Operation(format!(
+                "プロファイルの projects 制限により、プロジェクト '{project}' への spawn は許可されていない（許可: {}）",
+                allowed.join(", ")
+            )));
+        }
+    }
+
+    // Part 1: env 検証（内部変数の上書き拒否。Issue #500）
+    profile.validate_env().map_err(DispatchError::Operation)?;
+    let profile_env = profile.resolved_env();
+
     let worker_agent = profile
         .resolve_worker_agent(agent)
         .map_err(DispatchError::InvalidParams)?;
@@ -4922,7 +5005,7 @@ fn dispatch_orchestrator_spawn(
     let options = SpawnOptions {
         command: None,
         cwd: Some(std::path::PathBuf::from(&cwd)),
-        env: Vec::new(),
+        env: profile_env.clone(),
     };
     host.attach_session(new_id, options);
 
@@ -4937,6 +5020,7 @@ fn dispatch_orchestrator_spawn(
         effort: launch.effort.as_deref(),
         skip_permissions: launch.skip_permissions,
         extra_args: &launch.extra_args,
+        env: &profile_env,
     });
 
     // 事前信頼: 未信頼フォルダでエージェント CLI を起動すると信頼ダイアログが出て、
@@ -5063,6 +5147,14 @@ fn dispatch_orchestrator_spawn(
     // #368: spawn 完了 → claude session スキャンを即時トリガー
     crate::request_claude_scan();
 
+    // Part 4: env のキー一覧（値はマスク。Issue #500）
+    let env_keys: Vec<&str> = profile_env.iter().map(|(k, _)| k.as_str()).collect();
+    // CLAUDE_CONFIG_DIR が設定されている場合、config dir パスを応答に含める
+    let config_dir_value = profile_env
+        .iter()
+        .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+        .map(|(_, v)| v.as_str());
+
     Ok(json!({
         "pane_id": new_id.as_u64(),
         "spawned_by": target.as_u64(),
@@ -5079,6 +5171,8 @@ fn dispatch_orchestrator_spawn(
         "tmux_session": tmux_session,
         "ledger_id": ledger_id,
         "worker_id": Some(worker_id).filter(|s| !s.is_empty()),
+        "env_keys": env_keys,
+        "config_dir": config_dir_value,
     }))
 }
 

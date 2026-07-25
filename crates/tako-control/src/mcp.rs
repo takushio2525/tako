@@ -1261,6 +1261,14 @@ pub fn tools() -> Vec<Value> {
                     },
                     "worker_model_policy": { "type": "string", "enum": ["inherit", "delegate", "fixed"], "description": "worker のモデル選択ポリシー（inherit: master と同じ / delegate: master が都度選ぶ / fixed: worker_model 固定）" },
                     "tab_naming_convention": { "type": "string", "description": "タブ名の命名規則（master プロンプトに注入される自由記述。空文字でクリア。set 時）" },
+                    "env_set": {
+                        "type": "array", "items": { "type": "string" },
+                        "description": "環境変数を設定する（KEY=VALUE 形式の配列。値の ~ は $HOME に展開される。set 時。Issue #500）",
+                    },
+                    "env_unset": {
+                        "type": "array", "items": { "type": "string" },
+                        "description": "環境変数を削除する（キー名の配列。set 時。Issue #500）",
+                    },
                 },
                 "additionalProperties": false,
             },
@@ -3268,6 +3276,8 @@ fn build_request(
             agent_args: str_vec_arg(args, "agent_args")?,
             worker_model_policy: str_arg(args, "worker_model_policy")?,
             tab_naming_convention: str_arg(args, "tab_naming_convention")?,
+            env_set: str_vec_arg(args, "env_set")?,
+            env_unset: str_vec_arg(args, "env_unset")?,
         },
         "tako_orchestrator_layout" => Request::OrchestratorLayout {
             policy: str_arg(args, "policy")?,
