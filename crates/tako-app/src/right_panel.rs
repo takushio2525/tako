@@ -3165,304 +3165,27 @@ impl TakoApp {
                 );
                 row = row.child(info);
                 body.push(row);
-            }
-        }
 
-        // ──── コミット詳細セクション（#495: 選択コミットのメタ + ファイル一覧 + diff）────
-        if let Some(detail) = &data.commit_detail {
-            // メタ情報ヘッダ
-            body.push(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .px_2()
-                    .py(px(4.0))
-                    .mt_1()
-                    .bg(rgba_alpha(accent, 0.06))
-                    .rounded(px(4.0))
-                    // フルハッシュ（クリックでコピー）
-                    .child({
-                        let hash_copy = detail.hash.clone();
-                        div()
-                            .id("git-detail-hash")
-                            .w_full()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .overflow_hidden()
-                            .gap_1()
-                            .cursor_pointer()
-                            .hover(|d| d.bg(rgba_alpha(bg_hover, 0.3)))
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                    hash_copy.clone(),
-                                ));
-                            }))
-                            .child(
-                                div()
-                                    .text_size(px(9.0))
-                                    .text_color(hsla(fg))
-                                    .flex_none()
-                                    .child("SHA"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .text_color(hsla(fg_active))
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .child(SharedString::from(detail.hash.clone())),
-                            )
-                            .child(
-                                svg()
-                                    .path(ui_icon::COPY)
-                                    .w(px(10.0))
-                                    .h(px(10.0))
-                                    .flex_none()
-                                    .text_color(hsla(fg)),
-                            )
-                    })
-                    // subject
-                    .child(
-                        div()
-                            .w_full()
-                            .overflow_hidden()
-                            .text_size(px(11.0))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(hsla(fg_active))
-                            .child(SharedString::from(detail.subject.clone())),
-                    )
-                    // body（あれば）
-                    .when(!detail.body.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .w_full()
-                                .overflow_hidden()
-                                .text_size(px(10.0))
-                                .text_color(hsla(fg))
-                                .child(SharedString::from(detail.body.clone())),
-                        )
-                    })
-                    // author
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .flex_row()
-                            .overflow_hidden()
-                            .gap_1()
-                            .text_size(px(9.0))
-                            .child(div().text_color(hsla(fg)).flex_none().child("Author"))
-                            .child(
-                                div()
-                                    .text_color(hsla(fg_active))
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .child(SharedString::from(format!(
-                                        "{} <{}>",
-                                        detail.author_name, detail.author_email
-                                    ))),
-                            )
-                            .child(
-                                div()
-                                    .text_color(hsla(fg))
-                                    .flex_none()
-                                    .child(SharedString::from(detail.author_date.clone())),
-                            ),
-                    )
-                    // parents
-                    .when(!detail.parents.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .w_full()
-                                .flex()
-                                .flex_row()
-                                .overflow_hidden()
-                                .gap_1()
-                                .text_size(px(9.0))
-                                .child(div().text_color(hsla(fg)).flex_none().child(
-                                    if detail.parents.len() > 1 {
-                                        "Parents"
-                                    } else {
-                                        "Parent"
-                                    },
-                                ))
-                                .child(
-                                    div()
-                                        .text_color(hsla(fg_active))
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .child(SharedString::from(
-                                            detail
-                                                .parents
-                                                .iter()
-                                                .map(|p| &p[..p.len().min(8)])
-                                                .collect::<Vec<_>>()
-                                                .join(", "),
-                                        )),
-                                ),
-                        )
-                    }),
-            );
-
-            // 変更ファイル一覧
-            let selected_file = self.git_selected_file.clone();
-            let file_count = detail.files.len();
-            body.push(
-                div()
-                    .id("git-detail-files-header")
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .overflow_hidden()
-                    .gap(px(2.0))
-                    .px_2()
-                    .py(px(3.0))
-                    .text_size(px(10.0))
-                    .text_color(hsla(fg))
-                    .child(SharedString::from(format!("Files ({file_count})"))),
-            );
-            for (fi, fc) in detail.files.iter().enumerate() {
-                let is_file_selected = selected_file.as_deref() == Some(&fc.path);
-                let file_path = fc.path.clone();
-                let kind_badge = match fc.kind {
-                    'A' => ("A", theme.green),
-                    'D' => ("D", theme.red),
-                    'R' => ("R", theme.ansi[6]),
-                    'C' => ("C", theme.ansi[6]),
-                    _ => ("M", theme.yellow),
-                };
-                let stat_label = format!("+{} -{}", fc.additions, fc.deletions);
-                body.push(
-                    div()
-                        .id(("git-detail-file", fi))
-                        .w_full()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .overflow_hidden()
-                        .gap_1()
-                        .px_3()
-                        .py(px(2.0))
-                        .cursor_pointer()
-                        .when(is_file_selected, |d| d.bg(rgba_alpha(accent, 0.15)))
-                        .hover(|d| d.bg(rgba_alpha(bg_hover, 0.3)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if this.git_selected_file.as_deref() == Some(&file_path) {
-                                this.git_selected_file = None;
-                            } else {
-                                this.git_selected_file = Some(file_path.clone());
-                            }
-                            cx.notify();
-                        }))
-                        .child(
-                            div()
-                                .w(px(14.0))
-                                .flex_none()
-                                .text_size(px(9.0))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(hsla(kind_badge.1))
-                                .child(kind_badge.0),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .text_size(px(10.0))
-                                .text_color(hsla(fg_active))
-                                .child(SharedString::from(fc.path.clone())),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(px(9.0))
-                                .text_color(hsla(fg))
-                                .child(SharedString::from(stat_label)),
-                        ),
-                );
-            }
-
-            // 選択ファイルの diff（diff_files からパスで探す）
-            if let Some(sel_path) = &selected_file {
-                let matching_diff: Vec<&tako_core::DiffFile> = data
-                    .diff_files
-                    .iter()
-                    .filter(|f| f.path == *sel_path)
-                    .collect();
-                if matching_diff.is_empty() {
-                    body.push(
-                        div()
-                            .px_3()
-                            .py(px(4.0))
-                            .text_size(px(10.0))
-                            .text_color(hsla(fg))
-                            .child(SharedString::from(format!("{sel_path}: no diff"))),
-                    );
-                }
-                for file in matching_diff {
-                    body.push(
-                        div()
-                            .w_full()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .px_3()
-                            .py(px(2.0))
-                            .text_size(px(10.0))
-                            .text_color(hsla(fg_active))
-                            .bg(rgba_alpha(fg, 0.05))
-                            .child(SharedString::from(file.path.clone())),
-                    );
-                    for hunk in &file.hunks {
-                        body.push(
-                            div()
-                                .w_full()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .px_3()
-                                .py(px(1.0))
-                                .text_size(px(9.0))
-                                .text_color(hsla(theme.ansi[6]))
-                                .child(SharedString::from(hunk.header.clone())),
-                        );
-                        for line in &hunk.lines {
-                            let (prefix, color, bg_color) = match line.kind {
-                                tako_core::DiffLineKind::Add => {
-                                    ("+", theme.green, rgba_alpha(theme.green, 0.1))
-                                }
-                                tako_core::DiffLineKind::Remove => {
-                                    ("-", theme.red, rgba_alpha(theme.red, 0.1))
-                                }
-                                tako_core::DiffLineKind::Context => (
-                                    " ",
-                                    fg,
-                                    Rgba {
-                                        r: 0.0,
-                                        g: 0.0,
-                                        b: 0.0,
-                                        a: 0.0,
-                                    },
-                                ),
-                            };
-                            body.push(
-                                div()
-                                    .w_full()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .px_3()
-                                    .text_size(px(11.0))
-                                    .text_color(hsla(color))
-                                    .bg(bg_color)
-                                    .child(format!("{prefix}{}", line.content)),
-                            );
-                        }
+                // ──── 選択カードの直下にコミット詳細を挿入（#495 UX 改善）────
+                if is_selected {
+                    if let Some(detail) = &data.commit_detail {
+                        body.push(self.render_commit_detail(
+                            detail,
+                            &data.diff_files,
+                            &theme,
+                            fg,
+                            fg_active,
+                            accent,
+                            bg_hover,
+                            cx,
+                        ));
                     }
                 }
             }
-        } else {
+        }
+
+        // ──── diff セクション（#487: コミット未選択時のみ。選択時はカード直下に表示済み）────
+        if selected_commit.is_none() {
             // ──── diff セクション（#487: 未ステージ / ステージ済みの通常表示）────
             let diff_sections: Vec<(String, &Vec<tako_core::DiffFile>)> = {
                 let mut v: Vec<(String, &Vec<tako_core::DiffFile>)> = Vec::new();
@@ -3583,6 +3306,307 @@ impl TakoApp {
         }
 
         root.child(body.finish())
+    }
+
+    /// コミット詳細ビュー（#495）。選択カードの直下に挿入するため独立メソッドに切り出す。
+    /// 返す要素は GitScrollBody::push 経由で積まれるので flex_shrink_0 が自動付与される
+    #[allow(clippy::too_many_arguments)]
+    fn render_commit_detail(
+        &mut self,
+        detail: &tako_core::CommitDetail,
+        diff_files: &[tako_core::DiffFile],
+        theme: &tako_core::Theme,
+        fg: tako_core::theme::Rgb,
+        fg_active: tako_core::theme::Rgb,
+        accent: tako_core::theme::Rgb,
+        bg_hover: tako_core::theme::Rgb,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let selected_file = self.git_selected_file.clone();
+        let file_count = detail.files.len();
+        let mut container = div().w_full().flex().flex_col();
+
+        // メタ情報カード
+        let hash_copy = detail.hash.clone();
+        container = container.child(
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .px_2()
+                .py(px(4.0))
+                .bg(rgba_alpha(accent, 0.06))
+                .rounded(px(4.0))
+                .child(
+                    div()
+                        .id("git-detail-hash")
+                        .w_full()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .overflow_hidden()
+                        .gap_1()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(rgba_alpha(bg_hover, 0.3)))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                hash_copy.clone(),
+                            ));
+                        }))
+                        .child(
+                            div()
+                                .text_size(px(9.0))
+                                .text_color(hsla(fg))
+                                .flex_none()
+                                .child("SHA"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(hsla(fg_active))
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(SharedString::from(detail.hash.clone())),
+                        )
+                        .child(
+                            svg()
+                                .path(ui_icon::COPY)
+                                .w(px(10.0))
+                                .h(px(10.0))
+                                .flex_none()
+                                .text_color(hsla(fg)),
+                        ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .overflow_hidden()
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(hsla(fg_active))
+                        .child(SharedString::from(detail.subject.clone())),
+                )
+                .when(!detail.body.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .w_full()
+                            .overflow_hidden()
+                            .text_size(px(10.0))
+                            .text_color(hsla(fg))
+                            .child(SharedString::from(detail.body.clone())),
+                    )
+                })
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_row()
+                        .overflow_hidden()
+                        .gap_1()
+                        .text_size(px(9.0))
+                        .child(div().text_color(hsla(fg)).flex_none().child("Author"))
+                        .child(
+                            div()
+                                .text_color(hsla(fg_active))
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(SharedString::from(format!(
+                                    "{} <{}>",
+                                    detail.author_name, detail.author_email
+                                ))),
+                        )
+                        .child(
+                            div()
+                                .text_color(hsla(fg))
+                                .flex_none()
+                                .child(SharedString::from(detail.author_date.clone())),
+                        ),
+                )
+                .when(!detail.parents.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .overflow_hidden()
+                            .gap_1()
+                            .text_size(px(9.0))
+                            .child(div().text_color(hsla(fg)).flex_none().child(
+                                if detail.parents.len() > 1 {
+                                    "Parents"
+                                } else {
+                                    "Parent"
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .text_color(hsla(fg_active))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(SharedString::from(
+                                        detail
+                                            .parents
+                                            .iter()
+                                            .map(|p| &p[..p.len().min(8)])
+                                            .collect::<Vec<_>>()
+                                            .join(", "),
+                                    )),
+                            ),
+                    )
+                }),
+        );
+
+        // 変更ファイル一覧ヘッダ
+        container = container.child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .overflow_hidden()
+                .gap(px(2.0))
+                .px_2()
+                .py(px(3.0))
+                .text_size(px(10.0))
+                .text_color(hsla(fg))
+                .child(SharedString::from(format!("Files ({file_count})"))),
+        );
+        // ファイル行
+        for (fi, fc) in detail.files.iter().enumerate() {
+            let is_file_selected = selected_file.as_deref() == Some(&fc.path);
+            let file_path = fc.path.clone();
+            let kind_badge = match fc.kind {
+                'A' => ("A", theme.green),
+                'D' => ("D", theme.red),
+                'R' => ("R", theme.ansi[6]),
+                'C' => ("C", theme.ansi[6]),
+                _ => ("M", theme.yellow),
+            };
+            let stat_label = format!("+{} -{}", fc.additions, fc.deletions);
+            container = container.child(
+                div()
+                    .id(("git-detail-file", fi))
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .overflow_hidden()
+                    .gap_1()
+                    .px_3()
+                    .py(px(2.0))
+                    .cursor_pointer()
+                    .when(is_file_selected, |d| d.bg(rgba_alpha(accent, 0.15)))
+                    .hover(|d| d.bg(rgba_alpha(bg_hover, 0.3)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.git_selected_file.as_deref() == Some(&file_path) {
+                            this.git_selected_file = None;
+                        } else {
+                            this.git_selected_file = Some(file_path.clone());
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(14.0))
+                            .flex_none()
+                            .text_size(px(9.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(hsla(kind_badge.1))
+                            .child(kind_badge.0),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(10.0))
+                            .text_color(hsla(fg_active))
+                            .child(SharedString::from(fc.path.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(9.0))
+                            .text_color(hsla(fg))
+                            .child(SharedString::from(stat_label)),
+                    ),
+            );
+        }
+        // 選択ファイルの diff
+        if let Some(sel_path) = &selected_file {
+            let matching: Vec<&tako_core::DiffFile> =
+                diff_files.iter().filter(|f| f.path == *sel_path).collect();
+            if matching.is_empty() {
+                container = container.child(
+                    div()
+                        .px_3()
+                        .py(px(4.0))
+                        .text_size(px(10.0))
+                        .text_color(hsla(fg))
+                        .child(SharedString::from(format!("{sel_path}: no diff"))),
+                );
+            }
+            for file in matching {
+                container = container.child(
+                    div()
+                        .w_full()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .px_3()
+                        .py(px(2.0))
+                        .text_size(px(10.0))
+                        .text_color(hsla(fg_active))
+                        .bg(rgba_alpha(fg, 0.05))
+                        .child(SharedString::from(file.path.clone())),
+                );
+                for hunk in &file.hunks {
+                    container = container.child(
+                        div()
+                            .w_full()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .px_3()
+                            .py(px(1.0))
+                            .text_size(px(9.0))
+                            .text_color(hsla(theme.ansi[6]))
+                            .child(SharedString::from(hunk.header.clone())),
+                    );
+                    for line in &hunk.lines {
+                        let (prefix, color, bg_color) = match line.kind {
+                            tako_core::DiffLineKind::Add => {
+                                ("+", theme.green, rgba_alpha(theme.green, 0.1))
+                            }
+                            tako_core::DiffLineKind::Remove => {
+                                ("-", theme.red, rgba_alpha(theme.red, 0.1))
+                            }
+                            tako_core::DiffLineKind::Context => (
+                                " ",
+                                fg,
+                                Rgba {
+                                    r: 0.0,
+                                    g: 0.0,
+                                    b: 0.0,
+                                    a: 0.0,
+                                },
+                            ),
+                        };
+                        container = container.child(
+                            div()
+                                .w_full()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .px_3()
+                                .text_size(px(11.0))
+                                .text_color(hsla(color))
+                                .bg(bg_color)
+                                .child(format!("{prefix}{}", line.content)),
+                        );
+                    }
+                }
+            }
+        }
+        container
     }
 
     /// git コミットメッセージ入力欄のキーハンドラ（#472 → #487 で全面修正）。
