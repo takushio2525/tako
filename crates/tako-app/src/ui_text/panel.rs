@@ -263,6 +263,13 @@ pub fn git_preview_blocking(n: usize) -> String {
         format!("Uncommitted changes blocking the switch: {n} (commit or stash first)")
     )
 }
+/// 切替を実行できない理由（#496。一覧の内訳とは別に「だからできない」を 1 行で言う）
+pub fn git_checkout_blocked() -> &'static str {
+    tr!(
+        "このまま切り替えると変更が失われるため実行できません",
+        "Cannot switch: the change would be lost"
+    )
+}
 pub fn git_preview_creates_local(branch: &str) -> String {
     tr!(
         format!("リモート追跡ブランチから '{branch}' を作成します"),
@@ -439,6 +446,7 @@ mod tests {
                 git_preview_carried(1),
                 git_preview_blocking(2),
                 git_preview_creates_local("release"),
+                git_checkout_blocked().to_string(),
                 git_merge_kind_label("three-way"),
                 git_merge_kind_label("fast-forward"),
                 git_merge_kind_label("up-to-date"),

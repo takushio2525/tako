@@ -153,7 +153,8 @@ pub(crate) fn checkout_confirm_lines(
     }
     let mut blockers = preview.blockers.clone();
     if !preview.blocking_files.is_empty() {
-        blockers.push(txt::git_preview_blocking(preview.blocking_files.len()));
+        // 一覧側と同じ文言を繰り返さない。ここは「だから実行できない」を言う行
+        blockers.push(txt::git_checkout_blocked().to_string());
     }
     (lines, blockers)
 }

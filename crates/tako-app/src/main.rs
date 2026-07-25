@@ -23270,6 +23270,139 @@ mod self_test {
                 }
             }
 
+            // 項目 78 でウィンドウを開き直しているため、以降はハンドルを取り直す（#381）。
+            // 取り直さないと window.update が Err を返し、検証本体が一度も走らないまま
+            // 「失敗」になる（実際にこれで項目 82 が空振りした）
+            let window = cx
+                .update(|cx| {
+                    cx.windows()
+                        .into_iter()
+                        .find_map(|w| w.downcast::<TakoApp>())
+                })
+                .unwrap_or(window);
+
+            // 82. git 新規ブランチ名の入力欄 (#496)。
+            // 実機の合成キーボード入力は IME（かな入力）に吸われて検証できないため、
+            // コミット入力欄（項目 79）と同じくキーストローク経路を直接叩いて固定する。
+            // 検証点: 大文字 / 記号 / キャレット移動 / BS / 空白とタブの除去 /
+            // ペースト / Esc で閉じる / 不正名を git 実行前に弾く
+            {
+                let branch_input_ok = window
+                    .update(cx, |app, _, cx| {
+                        app.git_branch_input = Some(GitBranchInput {
+                            text: String::new(),
+                            cursor: 0,
+                            start_point: None,
+                        });
+                        let ch = |k: &str, c: &str| Keystroke {
+                            modifiers: Modifiers::default(),
+                            key: k.to_string(),
+                            key_char: Some(c.to_string()),
+                        };
+                        let text = |app: &TakoApp| {
+                            app.git_branch_input
+                                .as_ref()
+                                .map(|i| i.text.clone())
+                                .unwrap_or_default()
+                        };
+                        // shift+F: key は論理キー名、key_char が実文字
+                        app.handle_git_branch_input_key(
+                            &Keystroke {
+                                modifiers: Modifiers {
+                                    shift: true,
+                                    ..Default::default()
+                                },
+                                key: "f".into(),
+                                key_char: Some("F".into()),
+                            },
+                            cx,
+                        );
+                        app.handle_git_branch_input_key(&ch("i", "i"), cx);
+                        app.handle_git_branch_input_key(&ch("x", "x"), cx);
+                        app.handle_git_branch_input_key(&ch("slash", "/"), cx);
+                        app.handle_git_branch_input_key(&ch("4", "4"), cx);
+                        app.handle_git_branch_input_key(&ch("9", "9"), cx);
+                        app.handle_git_branch_input_key(&ch("6", "6"), cx);
+                        let typed = text(app) == "Fix/496";
+                        // キャレット移動 + 中間挿入 + BS
+                        app.handle_git_branch_input_key(
+                            &Keystroke::parse("left").unwrap(),
+                            cx,
+                        );
+                        app.handle_git_branch_input_key(&ch("z", "z"), cx);
+                        let caret_ok = text(app) == "Fix/49z6";
+                        app.handle_git_branch_input_key(
+                            &Keystroke::parse("backspace").unwrap(),
+                            cx,
+                        );
+                        let bs_ok = text(app) == "Fix/496";
+                        // 空白はブランチ名に入れられないので入力段階で落とす
+                        app.handle_git_branch_input_key(
+                            &Keystroke {
+                                modifiers: Modifiers::default(),
+                                key: "space".into(),
+                                key_char: Some(" ".into()),
+                            },
+                            cx,
+                        );
+                        let space_dropped = text(app) == "Fix/496";
+                        // ⌘V ペースト（paste 経由）も欄に入る
+                        if let Some(i) = app.git_branch_input.as_mut() {
+                            i.text.clear();
+                            i.cursor = 0;
+                        }
+                        cx.write_to_clipboard(ClipboardItem::new_string("feat/x-1".into()));
+                        app.paste(cx);
+                        let pasted = text(app) == "feat/x-1";
+                        // 不正なブランチ名は git を呼ぶ前に弾き、入力欄を閉じない
+                        if let Some(i) = app.git_branch_input.as_mut() {
+                            i.text = "-d".into();
+                            i.cursor = 2;
+                        }
+                        app.git_feedback = None;
+                        app.git_do_create_branch("/nonexistent-repo-496".into(), cx);
+                        let rejected = app.git_branch_input.is_some()
+                            && app.git_feedback.as_ref().is_some_and(|f| f.is_error);
+                        // Esc で閉じる
+                        app.handle_git_branch_input_key(
+                            &Keystroke::parse("escape").unwrap(),
+                            cx,
+                        );
+                        let esc_ok = app.git_branch_input.is_none();
+                        app.git_feedback = None;
+                        cx.notify();
+                        typed
+                            && caret_ok
+                            && bs_ok
+                            && space_dropped
+                            && pasted
+                            && rejected
+                            && esc_ok
+                    })
+                    .unwrap_or(false);
+                check(
+                    branch_input_ok,
+                    "git 新規ブランチ入力: 大文字 / 記号 / キャレット / 空白除去 / ペースト / 不正名拒否 / Esc (#496)",
+                );
+            }
+
+            // 82b. コンフリクト解消エージェントはコンフリクトが無ければ起動しない (#496)。
+            // 「押しても何も起きない」を避け、理由をエラーで返すことを固定する
+            {
+                let guarded = window
+                    .update(cx, |app, _, cx| {
+                        app.git_feedback = None;
+                        app.git_do_resolve_agent("claude", cx);
+                        // コンフリクトしていないリポ（or リポ外）ではエラーになる
+                        app.git_feedback.as_ref().is_some_and(|f| f.is_error)
+                    })
+                    .unwrap_or(false);
+                check(
+                    guarded,
+                    "解消エージェント: コンフリクトが無ければ理由つきで拒否する (#496)",
+                );
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);

@@ -13,11 +13,17 @@ tako_fda
 tako_file_op
 tako_focus_pane
 tako_foreground_pane
+tako_git_branch_create
+tako_git_checkout
 tako_git_commit
+tako_git_conflicts
 tako_git_diff
 tako_git_log
+tako_git_merge
+tako_git_merge_abort
 tako_git_pull
 tako_git_push
+tako_git_resolve_agent
 tako_git_show
 tako_git_stage
 tako_git_unstage
