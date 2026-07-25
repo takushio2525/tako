@@ -18,6 +18,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   縮まないスクロール本文の 2 段構造へ分離し、全行を省略表示にしてパネル外へ
   はみ出さないようにした (#494)
 
+- IME preedit vanished on panes with the cursor hidden (`DECTCEM off`). The underline
+  overlay anchored on `pane_cursor_origin`, which returns `None` for such panes, so TUI
+  agents that hide the cursor while idle showed the candidate window but no underline.
+  Now both use the `ime_cursor` fallback (#497)
+- カーソル非表示（DECTCEM off）のペインで IME の未確定文字列が表示されない問題を修正。
+  下線オーバーレイのアンカーが `pane_cursor_origin` を使っており、カーソルを消したまま
+  idle に落ちる TUI エージェントのペインでは「候補ウィンドウは出るが下線が出ない」状態に
+  なっていた。候補ウィンドウ側と同じ `ime_cursor` フォールバックを使うようにした (#497)
+- Self-test aborted at item 33b (theme) and therefore never ran any later item —
+  including the #332 IME focus regression check. Theme application no longer reverts
+  itself when the settings save is skipped (#501)
+- セルフテストが項目 33b（テーマ）で中断し、それ以降の全項目（#332 の IME focus 回帰
+  検査を含む）が実行されていなかった問題を修正。設定の保存をスキップしたときに
+  テーマ適用が自分で巻き戻る構造をやめた (#501)
+
 ### Changed
 
 - git panel robustness: commit is blocked with a visible reason when the message is empty
