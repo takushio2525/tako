@@ -1192,3 +1192,9 @@
   #497 の回帰を検出できなかった一因。保存しないときはメモリ上の適用を正とするよう修正
 - 隔離セルフテストが通しで完走（TAKO_APP_SELF_TEST_OK、FAILED 0）
 
+
+## 2026-07-25（#500 Part 1-4 + #504: プロファイル env 注入 + アカウントレジストリ）
+- #500: Profile に env マップ追加、master/worker 全経路に注入（export 後勝ち方式で direnv に勝つ）、内部変数拒否、値マスク、projects 制限強制、CLI/MCP 1:1、起動時可視化
+- #504: accounts.yaml CRUD（116 ツール）、spawn の account パラメータ、master_account/worker_account、model/effort 解決順（spawn > アカウント > プロファイル）
+- 関連コミット: `7c97611`（#500）、`28b0eca`（#504）→ PR #505
+- 次: レビュー → squash merge → 隔離実測 → Part 5-7 は別タスク
