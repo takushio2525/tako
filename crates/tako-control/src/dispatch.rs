@@ -6663,7 +6663,10 @@ fn video_response(host: &(impl ControlHost + ?Sized), target: PaneId) -> serde_j
 }
 
 /// `pane` 省略はエラー（呼び出し元解決はクライアント側の責務。FR-2.2.7）
-fn resolve_pane(ws: &Workspace, pane: Option<u64>) -> Result<(TabId, PaneId), DispatchError> {
+pub(crate) fn resolve_pane(
+    ws: &Workspace,
+    pane: Option<u64>,
+) -> Result<(TabId, PaneId), DispatchError> {
     let raw = pane.ok_or(DispatchError::NoTargetPane)?;
     for tab in ws.tabs() {
         if let Some(p) = tab.tree().panes().iter().find(|p| p.id().as_u64() == raw) {
