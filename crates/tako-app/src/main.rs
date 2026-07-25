@@ -828,6 +828,10 @@ struct TakoApp {
     git_feedback: Option<GitFeedback>,
     /// 実行中の git 操作名（#494。連打・二重押しを防ぐためボタンを無効化する）
     git_busy: Option<&'static str>,
+    /// 直近の render で IME 未確定文字列のアンカーが解決できたか（#497 の回帰検出用）。
+    /// false になると下線オーバーレイが描画されない。カーソル非表示ペインでも
+    /// true であることをセルフテスト 76c / 76d が固定する
+    ime_overlay_anchored: bool,
     /// git コミットメッセージ入力欄にフォーカスがあるか（#472）
     git_commit_input_focused: bool,
     /// バックグラウンドドロワーの表示状態（FR-2.15。下部ステータスバーのボタンでトグル）
@@ -1937,6 +1941,7 @@ impl TakoApp {
             git_commit_cursor: 0,
             git_feedback: None,
             git_busy: None,
+            ime_overlay_anchored: false,
             git_commit_input_focused: false,
             drawer_visible: false,
             drawer_height: DRAWER_DEFAULT_HEIGHT,
@@ -7136,9 +7141,13 @@ impl TakoApp {
         ))
     }
 
-    /// IME 候補ウィンドウ用のカーソル位置。CursorShape::Hidden でもビューポート内なら返す。
+    /// IME 用のカーソル位置。CursorShape::Hidden でもビューポート内なら返す。
     /// カーソルが表示中なら通常カーソル位置、非表示でもビューポート内なら ime_cursor、
-    /// どちらも無い（スクロールバック中）なら None
+    /// どちらも無い（スクロールバック中）なら None。
+    ///
+    /// **未確定文字列の下線オーバーレイと候補ウィンドウは両方ともこれを使うこと**（#497）。
+    /// `pane_cursor_origin` を直に使うと、カーソルを消している TUI ペイン
+    /// （claude 等）でアンカーが None になり、そのペインだけ下線が出なくなる
     fn pane_cursor_origin_for_ime(
         &self,
         pane: PaneId,
@@ -7151,13 +7160,28 @@ impl TakoApp {
         let cell = self.cell_size_for_pane(pane)?;
         let session = self.terminals.get(&pane)?;
         let screen = session.screen(&self.theme);
-        let (col, row) = screen.ime_cursor?;
+        let (col, row) = screen.ime_anchor_cell()?;
         let x = f32::from(cell.width) * col as f32;
         let subline = session.scroll_subline_fract() * f32::from(cell.height);
         Some(point(
             area.origin.x + px(x),
             area.origin.y + cell.height * row as f32 - px(subline),
         ))
+    }
+
+    /// IME 未確定文字列オーバーレイのアンカーを解決する（#497）。
+    ///
+    /// render と回帰テスト（セルフテスト 76c / 76d）が**同じ経路**を通るように
+    /// 関数へ切り出してある。ここが None を返すと下線が一切描画されない。
+    /// 解決の成否は `ime_overlay_anchored` に記録する
+    fn ime_overlay_anchor(&mut self, window: &mut Window) -> Option<Point<Pixels>> {
+        let anchor = self
+            .ime
+            .as_ref()
+            .map(|ime| ime.pane)
+            .and_then(|pane| self.pane_cursor_origin_for_ime(pane, window));
+        self.ime_overlay_anchored = anchor.is_some();
+        anchor
     }
 
     /// 未確定文字列の先頭から指定プレフィックスまでの描画幅（候補ウィンドウの位置出し用）
@@ -14165,8 +14189,16 @@ impl Render for TakoApp {
 
         // IME 変換中テキストのインライン表示（FR-1.9）。変換対象ペインのカーソル位置に
         // 未確定文字列を重ね、全体に細下線・IME の注目文節に太下線 + 選択色を付ける
+        // #497: カーソル非表示（DECTCEM off）のペインでも下線を出す。
+        // claude 等の TUI はカーソルを消したまま idle に落ちることがあり、
+        // `pane_cursor_origin` は CursorShape::Hidden で None を返すため、
+        // 以前はそのペインだけ未確定文字列のオーバーレイが丸ごと消えていた
+        // （#29 が候補ウィンドウ側だけを直して下線側を据え置いた取りこぼし）。
+        // スクロールバック中は ime_anchor_cell も None になるので従来どおり消える。
+        // 解決の成否は回帰検出のため記録する（セルフテスト 76c / 76d）
+        let ime_anchor = self.ime_overlay_anchor(window);
         let ime_overlay = self.ime.as_ref().and_then(|ime| {
-            let anchor = self.pane_cursor_origin(ime.pane, window)?;
+            let anchor = ime_anchor?;
             let text = ime.text.clone();
             // ハイライト範囲は重複禁止（StyledText の要求）のため、注目文節の前・文節・後の
             // 3 区間に分割して組む。文節範囲（UTF-16）はバイト範囲へ変換する
@@ -22526,6 +22558,140 @@ mod self_test {
                 })
                 .unwrap_or(false);
             check(ime_close_ok, "IME 状態: 変換中ペインの close で畳まれる (#332)");
+
+            // 76c / 76d. カーソル非表示（DECTCEM off）のペインで未確定文字列の
+            // 下線オーバーレイが出る（#497）。claude 等の TUI はカーソルを消したまま
+            // idle に落ちることがあり、修正前はそのペインだけ下線が丸ごと消えていた。
+            // 76 は打鍵キーが escape（key_char なし）、76b は close 側の検証で、
+            // どちらもこの穴を通り抜けていた。ここでは `self.ime.is_some()` ではなく
+            // **アンカー解決の成否**（= オーバーレイが実際に組まれたか）を見る。
+            // 76c = 既存ペイン、76d = split 直後の新規ペイン（生成経路の違いを排除）
+            for (label, split_first) in [("76c", false), ("76d", true)] {
+                let mut painted = true;
+                if split_first {
+                    let _ = window.update(cx, |app, _, cx| app.split(SplitDirection::Right, cx));
+                    // 新ペインは 1 度描画されるまで pane_text_areas に載らない
+                    // （アンカー計算に必要）。載るまで待つ
+                    painted = false;
+                    for _ in 0..60 {
+                        wait(cx, 100).await;
+                        painted = window
+                            .update(cx, |app, _, _| {
+                                let pane = app.focused_pane();
+                                app.pane_text_areas.iter().any(|(id, _)| *id == pane)
+                            })
+                            .unwrap_or(false);
+                        if painted {
+                            break;
+                        }
+                    }
+                    if !painted {
+                        // ウィンドウが他アプリに完全に隠れていると GPUI が描画を止め、
+                        // 新ペインは永久に pane_text_areas へ載らない。product の欠陥では
+                        // ないので落とさず、飛ばしたことを明示する（黙って通さない）
+                        println!(
+                            "TAKO_SELF_TEST_SKIPPED: {label}（新ペインが未描画。\
+                             ウィンドウを前面にして再実行すると検証できる）"
+                        );
+                        let _ = window.update(cx, |app, window, cx| {
+                            app.unmark_text(window, cx);
+                            let target = app.focused_pane();
+                            app.remove_pane(target, cx);
+                        });
+                        wait(cx, 300).await;
+                        continue;
+                    }
+                }
+                // DECTCEM でカーソルを消す（claude の TUI と同条件を人工的に作る）。
+                // PTY へ直接エスケープを書いても**入力**として渡るだけで端末は解釈しない。
+                // シェルに printf を実行させ、出力としてエスケープを流す必要がある
+                let hid = window
+                    .update(cx, |app, _, _| {
+                        let pane = app.focused_pane();
+                        match app.terminals.get(&pane) {
+                            Some(s) => {
+                                // 直前の項目が打ちかけた入力が残っていることがあるので
+                                // Ctrl-C で行を捨ててから送る。sleep で保持しないと、
+                                // コマンド終了後の zsh のプロンプト再描画でカーソルが戻る
+                                s.write(b"\x03".to_vec());
+                                s.write(b"printf '\\033[?25l'; sleep 20\r".to_vec());
+                                true
+                            }
+                            None => false,
+                        }
+                    })
+                    .unwrap_or(false);
+                let mut cursor_hidden = false;
+                for _ in 0..40 {
+                    wait(cx, 100).await;
+                    cursor_hidden = window
+                        .update(cx, |app, _, _| {
+                            let pane = app.focused_pane();
+                            app.terminals
+                                .get(&pane)
+                                .map(|s| {
+                                    let screen = s.screen(&app.theme);
+                                    // 前提: 表示中カーソルは消えたが IME 用は残る
+                                    screen.cursor.is_none() && screen.ime_cursor.is_some()
+                                })
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if cursor_hidden {
+                        break;
+                    }
+                }
+                // 変換を開始し、render を回してアンカー解決の成否を観測する
+                let _ = window.update(cx, |app, window, cx| {
+                    app.replace_and_mark_text_in_range(None, "にほんご", None, window, cx);
+                    cx.notify();
+                });
+                // render 待ちにすると、ウィンドウが他アプリに隠れて GPUI が描画を
+                // 止めた環境で永久に false のままになる。render と同じ関数を直接呼ぶ
+                let mut anchored = false;
+                let mut fallback_needed = false;
+                for _ in 0..30 {
+                    wait(cx, 100).await;
+                    let (a, need) = window
+                        .update(cx, |app, window, _| {
+                            let pane = app.ime.as_ref().map(|i| i.pane);
+                            // 表示中カーソル経路が使えないこと（= フォールバックが
+                            // 必要な状況であること）も同時に固定する
+                            let need = pane
+                                .map(|p| app.pane_cursor_origin(p, window).is_none())
+                                .unwrap_or(false);
+                            (app.ime_overlay_anchor(window).is_some(), need)
+                        })
+                        .unwrap_or((false, false));
+                    anchored = a;
+                    fallback_needed = need;
+                    if anchored && fallback_needed {
+                        break;
+                    }
+                }
+                let composing = window
+                    .update(cx, |app, _, _| app.ime.is_some())
+                    .unwrap_or(false);
+                check(
+                    painted && hid && cursor_hidden && composing && anchored && fallback_needed,
+                    &format!(
+                        "{label}. IME 下線: カーソル非表示ペインでもアンカーが解決する (#497)"
+                    ),
+                );
+                // 後始末（変換状態を畳み、76d で作ったペインは閉じる）
+                let _ = window.update(cx, |app, window, cx| {
+                    app.unmark_text(window, cx);
+                    let target = app.focused_pane();
+                    if split_first {
+                        app.remove_pane(target, cx);
+                    } else if let Some(s) = app.terminals.get(&target) {
+                        // sleep を止めてカーソルを戻す（後続項目へ状態を残さない）
+                        s.write(b"\x03".to_vec());
+                        s.write(b"printf '\\033[?25h'\r".to_vec());
+                    }
+                });
+                wait(cx, 300).await;
+            }
 
             // 77. 複数ウィンドウ（#339 ビューポート方式）: CLI で window new →
             //     論理 + GPUI ウィンドウが増え同一 TakoApp entity を共有 → タブは
