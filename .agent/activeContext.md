@@ -4,21 +4,24 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-25・#500 Part 5-7 → PR #506 レビュー待ち）
+## 現在の対象（2026-07-25・本日の全タスク完了）
 
-**ブランチ `feat/500-part5-7`（PR #506）**
+本日 5 件の PR を merge + install + 再起動 + 実機確認まで完了:
+- #505（#500 Part 1-4 + #504: env 注入 + アカウントレジストリ）
+- #506（#500 Part 5-7: cwd + ファイルツリー自動追加 + 専任マスター）
+- #509（#503: テキスト入力フラグ残留でキー奪取を根治）
+- #507（#495: git タブのコミット詳細表示）
+- #508（#498: stale claude バイナリの検知と張り直し）
 
-- Part 5: Profile に cwd フィールド。master 起動時に指定 cwd へ cd（~ 展開 + 存在検証）
-- Part 6: master 起動後に cwd + projects のフォルダをファイルツリーへ自動追加（IPC 経由）
-- Part 7: projects 指定ありプロファイルで「専任マスター」。system prompt に Assigned Projects 注入
-  + 担当外は説明して断る指示 + 未登録 key は起動時エラー
+現在 `/Applications/tako.app` v0.5.11（pid 53024）で全反映済み。
 
 ## 次の一手
 
-- PR #506 をレビュー → squash merge（Closes #500 で #500 完結）→ install
-- #500 の全 Part（1〜7）が完了
+- #496（git タブのブランチ操作）が未着手
+- `worker_account: personal` への切替が残タスク
+- renewal/remote-transport ブランチの統合・v0.6.0 リリース準備
 
 ## 現フェーズで Read すべき設計書
 
-- cwd / projects 注入: `generate_identity_section`（orchestrator/mod.rs）
-- ファイルツリー追加: `orchestrator_master`（tako-cli/main.rs）の TreeFolder dispatch
+- git タブに手を入れる: `crates/tako-app/src/right_panel.rs` の `GitScrollBody`（#494 構造不変条件）
+- オーケストレーター設定: `crates/tako-control/src/orchestrator/mod.rs`（Profile / AccountsConfig）

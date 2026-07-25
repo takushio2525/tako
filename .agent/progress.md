@@ -1205,3 +1205,15 @@
 - Part 7: projects 付きプロファイルで system prompt に Assigned Projects 注入。未登録 key は起動時エラー
 - 関連コミット: `81b8bea` → PR #506（Closes #500）
 - 次: レビュー → squash merge → install
+
+## 2026-07-25（#503: テキスト入力フラグ残留でキー入力が奪われる問題を根治）
+- `clear_text_input_focus()` 新設。9 経路（タブ切替 / フォーカス移動 / パネル非表示 / CLI dispatch 等）にクリア配置 + handle_key の防御的クリア。セルフテスト項目 81 追加
+- 関連コミット: `9dc9c08` → PR #509（Closes #503）
+
+## 2026-07-25（#495: git タブのコミット詳細表示）
+- コミットクリックで変更ファイル一覧 + diff 展開。`git show` の CLI 出力空応答も修正
+- 関連コミット: `fc6c55c` `0bc9c4f` → PR #507（Closes #495）
+
+## 2026-07-25（#498: stale claude バイナリの検知と張り直し）
+- 起動時に PATH 上の claude バイナリの実在・実行可能性を検証し、stale なら再検出
+- 関連コミット: `ab32ff7` → PR #508（Closes #498）
