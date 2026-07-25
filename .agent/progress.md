@@ -1217,3 +1217,7 @@
 ## 2026-07-25（#498: stale claude バイナリの検知と張り直し）
 - 起動時に PATH 上の claude バイナリの実在・実行可能性を検証し、stale なら再検出
 - 関連コミット: `ab32ff7` → PR #508（Closes #498）
+
+## 2026-07-25（#495 UX 改善: 詳細ビューを選択カード直下へ + CLI 空応答修正）
+- 詳細ビューの位置を 200 件末尾から選択カード直下へ移動。`render_commit_detail()` メソッド化。CLI `print_result` の `GitCommand::Show` 未登録を修正（`0bc9c4f`）
+- 関連コミット: `86b7769` `0bc9c4f` → PR #510（Closes #495）
