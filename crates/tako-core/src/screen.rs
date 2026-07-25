@@ -70,6 +70,22 @@ pub struct Screen {
     pub extra_bottom: Option<ScreenLine>,
 }
 
+impl Screen {
+    /// IME の未確定文字列を重ねる基準セル（#497）。
+    ///
+    /// 表示中カーソル → IME 用カーソルの順に解決する。claude 等の TUI は
+    /// DECTCEM（`\x1b[?25l`）でカーソルを消したまま idle に落ちることがあり、
+    /// そのペインでは `cursor` が None になる。**下線オーバーレイも候補ウィンドウも
+    /// このフォールバックを使わなければならない**。片方だけ使っていたために、
+    /// カーソル非表示ペインで「候補ウィンドウは出るが下線だけ出ない」という
+    /// 非対称な壊れ方をしていた（#29 が候補側だけ直した取りこぼし）。
+    ///
+    /// スクロールバック中はどちらも None になり、アンカーなし = 表示しないが正しい。
+    pub fn ime_anchor_cell(&self) -> Option<(usize, usize)> {
+        self.cursor.or(self.ime_cursor)
+    }
+}
+
 /// セル単位の解決済みスタイル（ラン合成前の中間表現）
 #[derive(Debug, Clone, PartialEq)]
 struct CellStyle {
@@ -562,6 +578,32 @@ mod tests {
         assert_eq!(sh.cursor, None);
         // DECTCEM 非表示でも IME 用カーソルは返る（#29 修正の核心）
         assert_eq!(sh.ime_cursor, Some((2, 0)));
+    }
+
+    /// #497: IME のアンカーはカーソル非表示でも解決できなければならない。
+    /// ここが None になると未確定文字列の下線オーバーレイが丸ごと消える
+    #[test]
+    fn ime_anchor_cellはカーソル非表示でもフォールバックする() {
+        // 通常（カーソル表示）: 表示中カーソルをそのまま使う
+        let term = term_with(b"ab");
+        let s = snapshot(&term, &theme());
+        assert_eq!(s.cursor, Some((2, 0)));
+        assert_eq!(s.ime_anchor_cell(), Some((2, 0)));
+
+        // DECTCEM でカーソルを消したペイン（claude の TUI と同条件）
+        let hidden = term_with(b"\x1b[?25lab");
+        let sh = snapshot(&hidden, &theme());
+        assert_eq!(sh.cursor, None, "前提: 表示中カーソルは無い");
+        assert_eq!(
+            sh.ime_anchor_cell(),
+            Some((2, 0)),
+            "カーソル非表示でも ime_cursor へフォールバックすること"
+        );
+
+        // show_cursor=false（copy-mode スクロール中）でも同様
+        let s2 = snapshot_opts(&term, &theme(), false, 0.0);
+        assert_eq!(s2.cursor, None);
+        assert_eq!(s2.ime_anchor_cell(), Some((2, 0)));
     }
 
     #[test]

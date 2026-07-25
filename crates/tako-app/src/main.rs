@@ -5277,8 +5277,13 @@ impl TakoApp {
             if let Err(e) = tako_control::settings::save(&settings) {
                 eprintln!("warning: 設定を保存できない: {e}");
             }
+            // 保存した設定（プリセット・色オーバーライド）を読み直して適用する
+            self.theme = tako_control::settings::load().resolve_theme().0;
+        } else {
+            // 保存していないので settings.json を読み直すと切替が即座に巻き戻る。
+            // メモリ上の適用を正とする（セルフテストのテーマ検査が常に失敗していた）
+            self.theme = Theme::for_mode(next);
         }
-        self.theme = tako_control::settings::load().resolve_theme().0;
         cx.notify();
     }
 
@@ -16951,11 +16956,21 @@ mod self_test {
             )
             .await
             .unwrap_or_else(|| fail("MCP theme set 接続"));
-            let light_applied = window
-                .update(cx, |app, _, _| {
-                    app.theme.mode == tako_core::theme::ThemeMode::Light
-                })
-                .unwrap_or(false);
+            // MCP の応答が返った時点ではまだ GUI 側の entity 更新が済んでいないことが
+            // あるので、他のタイミング検査（17 / 40b / 46）と同じくリトライで待つ。
+            // ここで落ちると 33b 以降のセルフテスト項目が 1 つも走らなくなる
+            let mut light_applied = false;
+            for _ in 0..30 {
+                light_applied = window
+                    .update(cx, |app, _, _| {
+                        app.theme.mode == tako_core::theme::ThemeMode::Light
+                    })
+                    .unwrap_or(false);
+                if light_applied {
+                    break;
+                }
+                wait(cx, 100).await;
+            }
             check(
                 status == 200 && response.contains(r#"\"theme\":\"light\""#) && light_applied,
                 "MCP theme set light（GUI 反映）",
@@ -16969,11 +16984,18 @@ mod self_test {
             )
             .await
             .unwrap_or_else(|| fail("MCP theme toggle 接続"));
-            let dark_restored = window
-                .update(cx, |app, _, _| {
-                    app.theme.mode == tako_core::theme::ThemeMode::Dark
-                })
-                .unwrap_or(false);
+            let mut dark_restored = false;
+            for _ in 0..30 {
+                dark_restored = window
+                    .update(cx, |app, _, _| {
+                        app.theme.mode == tako_core::theme::ThemeMode::Dark
+                    })
+                    .unwrap_or(false);
+                if dark_restored {
+                    break;
+                }
+                wait(cx, 100).await;
+            }
             check(
                 status == 200 && response.contains(r#"\"theme\":\"dark\""#) && dark_restored,
                 "MCP theme toggle（dark へ復帰）",
