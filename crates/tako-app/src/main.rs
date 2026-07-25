@@ -836,6 +836,12 @@ struct TakoApp {
     ime_overlay_anchored: bool,
     /// git コミットメッセージ入力欄にフォーカスがあるか（#472）
     git_commit_input_focused: bool,
+    /// ブランチ操作の事前提示カード（#496。承諾するまで実行しない）
+    git_branch_confirm: Option<GitBranchConfirm>,
+    /// 新規ブランチ名の入力欄（#496。`Some` の間はキー入力をここへ吸う）
+    git_branch_input: Option<GitBranchInput>,
+    /// コンフリクト解消エージェントの選択ドロップダウンを開いているか（#496）
+    git_agent_menu_open: bool,
     /// バックグラウンドドロワーの表示状態（FR-2.15。下部ステータスバーのボタンでトグル）
     drawer_visible: bool,
     /// バックグラウンドドロワーの高さ（px）
@@ -1140,6 +1146,8 @@ struct GitPanelData {
     graph: tako_core::GraphLayout,
     /// 選択中コミットの詳細情報（#495）
     commit_detail: Option<tako_core::CommitDetail>,
+    /// 進行中の merge / rebase 等とコンフリクトファイル（#496）
+    conflict: tako_core::ConflictState,
 }
 
 /// サイドバー用の軽量 git サマリ（#217。ブランチチップ + 変更フッター）
@@ -1158,6 +1166,40 @@ struct GitCollapsed {
     changes: bool,
     commits: bool,
     diff: bool,
+    /// リモート追跡ブランチ（#496。数が多くなりがちなので既定は折りたたみ）
+    remotes: bool,
+}
+
+/// ブランチ操作の種別（#496）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitBranchOp {
+    Checkout,
+    Merge,
+}
+
+/// ブランチ操作の事前提示（#496）。
+/// 「黙って stash / 強制切替しない」ため、実行前に何が起きるかをカードで見せる。
+/// カードは対象ブランチ行の**直下**に出す（#510 の「詳細は選択カード直下」方針）
+#[derive(Debug, Clone)]
+struct GitBranchConfirm {
+    branch: String,
+    op: GitBranchOp,
+    /// 何が起きるかの説明行（表示順のまま）
+    lines: Vec<String>,
+    /// 実行を止める理由。空でなければ実行ボタンを出さない
+    blockers: Vec<String>,
+    /// 予測されたコンフリクトファイル（マージのみ。強調表示に使う）
+    conflicts: Vec<String>,
+}
+
+/// 新規ブランチ名の入力状態（#496。サイドバーの InlineEdit と同じ形）
+#[derive(Debug, Clone)]
+struct GitBranchInput {
+    text: String,
+    /// キャレット位置（バイトオフセット）
+    cursor: usize,
+    /// 基点（None なら現在の HEAD）
+    start_point: Option<String>,
 }
 
 /// git 操作のフィードバック（#472）
@@ -1967,6 +2009,9 @@ impl TakoApp {
             git_busy: None,
             ime_overlay_anchored: false,
             git_commit_input_focused: false,
+            git_branch_confirm: None,
+            git_branch_input: None,
+            git_agent_menu_open: false,
             drawer_visible: false,
             drawer_height: DRAWER_DEFAULT_HEIGHT,
             bg_pending_kill: None,
@@ -3712,13 +3757,22 @@ impl TakoApp {
     /// git リポジトリが見つからなければファイルツリーの全ソース（他ペインの cwd +
     /// pinned フォルダ）からフォールバック検索する（#313）
     fn git_cwd_for_tab(&self) -> Option<std::path::PathBuf> {
+        self.git_source_for_tab().map(|(_, cwd)| cwd)
+    }
+
+    /// git タブの cwd と、それを与えたペイン（#496）。
+    ///
+    /// dispatch 経由の操作（コンフリクト解消エージェントの起動）は「ペインの cwd」から
+    /// リポジトリを解決するため、**パネルが見ているのと同じリポジトリ**を指す pane を
+    /// 渡す必要がある。pinned フォルダ由来の場合はペインが存在しないので `None` を返す
+    fn git_source_for_tab(&self) -> Option<(Option<PaneId>, std::path::PathBuf)> {
         let tab = self.workspace.active_tab();
         let active_pane = tab.tree().focused();
 
         // フォーカスペインの cwd が git リポジトリ内ならそれを使う
         if let Some(cwd) = self.terminals.get(&active_pane).and_then(|s| s.cwd()) {
             if has_git_ancestor(cwd) {
-                return Some(cwd.to_path_buf());
+                return Some((Some(active_pane), cwd.to_path_buf()));
             }
         }
 
@@ -3729,7 +3783,7 @@ impl TakoApp {
             }
             if let Some(cwd) = self.terminals.get(&pane.id()).and_then(|s| s.cwd()) {
                 if has_git_ancestor(cwd) {
-                    return Some(cwd.to_path_buf());
+                    return Some((Some(pane.id()), cwd.to_path_buf()));
                 }
             }
         }
@@ -3737,7 +3791,7 @@ impl TakoApp {
         // pinned フォルダを走査
         for folder in tab.pinned_folders() {
             if has_git_ancestor(folder) {
-                return Some(folder.clone());
+                return Some((None, folder.clone()));
             }
         }
 
@@ -3749,7 +3803,7 @@ impl TakoApp {
             }
             if let Some(cwd) = self.terminals.get(&bp.id()).and_then(|s| s.cwd()) {
                 if has_git_ancestor(cwd) {
-                    return Some(cwd.to_path_buf());
+                    return Some((Some(bp.id()), cwd.to_path_buf()));
                 }
             }
         }
@@ -4217,6 +4271,9 @@ impl TakoApp {
     /// タブ切替・ペインフォーカス移動・パネル非表示化など、入力対象が変わる全経路で呼ぶ
     fn clear_text_input_focus(&mut self) {
         self.git_commit_input_focused = false;
+        // #496: 新規ブランチ名の入力もキーを奪うので同じ経路で落とす（#503 の不変条件）
+        self.git_branch_input = None;
+        self.git_agent_menu_open = false;
         self.webview_dock_url_focused = false;
         if let Some(pane_id) = self.webview_address_bar_active.take() {
             self.webview_address_bar.remove(&pane_id.as_u64());
@@ -7035,6 +7092,11 @@ impl TakoApp {
             cx.notify();
             return;
         }
+        // #496: ブランチ名入力が優先（コミット欄と同時にフォーカスされることはない）
+        if self.git_branch_input.is_some() {
+            self.git_branch_input_insert(&text, cx);
+            return;
+        }
         if self.git_commit_input_focused {
             self.git_commit_insert(&text, cx);
             return;
@@ -7086,10 +7148,18 @@ impl TakoApp {
 
         // #503: git 入力欄が見えない（パネル非表示 or git 以外のビュー）のに
         // フラグが残っていたら強制クリア（防御。通常は経路別クリアで落ちる）
-        if self.git_commit_input_focused
-            && (!self.panel_visible || self.panel_view != PanelView::Git)
-        {
+        let git_panel_hidden = !self.panel_visible || self.panel_view != PanelView::Git;
+        if git_panel_hidden {
             self.git_commit_input_focused = false;
+            // #496: ブランチ名入力・エージェント選択も同じ理由でクリアする
+            self.git_branch_input = None;
+            self.git_agent_menu_open = false;
+        }
+        // #496: ブランチ名入力中は全キーをここで消費する（ターミナルへ漏らさない）
+        if self.git_branch_input.is_some() {
+            self.handle_git_branch_input_key(keystroke, cx);
+            cx.stop_propagation();
+            return;
         }
         if self.git_commit_input_focused && self.handle_git_commit_key(keystroke, cx) {
             cx.stop_propagation();
@@ -13733,6 +13803,15 @@ impl EntityInputHandler for TakoApp {
             cx.notify();
             return;
         }
+        // #496: 新規ブランチ名入力中（IME 確定文字列もここで受ける）
+        if self.git_branch_input.is_some() {
+            if !text.is_empty() {
+                self.git_branch_input_insert(text, cx);
+            }
+            self.ime = None;
+            cx.notify();
+            return;
+        }
         // git コミットメッセージ入力中（#487。ここを通さないと印字文字が
         // ターミナルへ抜け、日本語 IME の確定文字列も入らない）
         if self.git_commit_input_focused {
@@ -14567,6 +14646,8 @@ impl Render for TakoApp {
                 cx.listener(|this, _: &MouseDownEvent, _, cx| {
                     // #503: テキスト入力フラグの一括クリア
                     let had = this.git_commit_input_focused
+                        || this.git_branch_input.is_some()
+                        || this.git_agent_menu_open
                         || this.webview_dock_url_focused
                         || this.webview_address_bar_active.is_some();
                     this.clear_text_input_focus();
@@ -15003,6 +15084,8 @@ fn fetch_git_data(cwd: &std::path::Path, selected_commit: Option<&str>) -> Optio
             None,
         )
     };
+    // #496: コンフリクト状態はカードの表示条件そのものなので毎回取る
+    let conflict = tako_core::git::conflict_state(&repo);
     Some(GitPanelData {
         repo_root: repo.display().to_string(),
         branch: status.branch.clone(),
@@ -15014,6 +15097,7 @@ fn fetch_git_data(cwd: &std::path::Path, selected_commit: Option<&str>) -> Optio
         diff_staged,
         graph,
         commit_detail,
+        conflict,
     })
 }
 
