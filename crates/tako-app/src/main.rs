@@ -954,6 +954,8 @@ struct TakoApp {
     /// 起動復元で開き直す Web ビュー（ペイン対応, URL）。ウィンドウハンドルが
     /// 要るため初回 render で消費する
     pending_webview_restore: Vec<(Option<u64>, String)>,
+    /// stale claude バイナリの検知状態（Issue #498）。ペインごとに管理
+    stale_binary_banners: HashMap<PaneId, StaleBinaryBanner>,
     /// アプリ内自動更新の状態
     update_state: update_checker::UpdateState,
     /// 更新チャンネルドロップダウンの開閉状態（#403）
@@ -1334,6 +1336,23 @@ struct PortSuggestion {
     pane: PaneId,
     port: u16,
     process: String,
+}
+
+/// stale claude バイナリの通知バナー（Issue #498）
+#[derive(Debug, Clone)]
+struct StaleBinaryBanner {
+    /// 起動時の版
+    spawned_version: String,
+    /// 最新の版
+    current_version: String,
+    /// ユーザーが閉じたか
+    dismissed: bool,
+    /// 張り直し中か
+    restarting: bool,
+    /// 張り直し失敗の理由
+    error: Option<String>,
+    /// master か
+    is_master: bool,
 }
 
 /// 統合 tmux ビューのペイン 1 行分（FR-2.16.6。旧集約センター FR-2.10 の写し）
@@ -2007,6 +2026,7 @@ impl TakoApp {
             webview_address_bar_active: None,
             window_raw_handle: None,
             pending_webview_restore: Vec::new(),
+            stale_binary_banners: HashMap::new(),
             update_state: update_checker::UpdateState::Idle,
             update_dropdown_open: false,
             glyph_snap_cache: std::cell::RefCell::new(HashMap::new()),
@@ -2625,6 +2645,10 @@ impl TakoApp {
                     {
                         let _s = tako_control::diag::perf_span("periodic_prep:agent_metrics");
                         app.refresh_agent_metrics();
+                    }
+                    {
+                        let _s = tako_control::diag::perf_span("periodic_prep:stale_binary");
+                        app.check_stale_binaries();
                     }
                     {
                         let _s = tako_control::diag::perf_span("periodic_prep:webview");
@@ -4382,6 +4406,35 @@ impl TakoApp {
             self.pending_close_confirm = Some(CloseConfirmTarget::Pane(pane_id));
             cx.notify();
         }
+    }
+
+    /// stale claude バイナリの張り直しボタンハンドラ（Issue #498）
+    fn stale_binary_restart(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        if let Some(banner) = self.stale_binary_banners.get_mut(&pane_id) {
+            banner.restarting = true;
+            banner.error = None;
+        }
+        cx.notify();
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::StaleBinary {
+                action: Some("restart".into()),
+                pane: Some(pane_id.as_u64()),
+            },
+            tako_core::PaneOrigin::User,
+        );
+        match result {
+            Ok(_) => {
+                self.stale_binary_banners.remove(&pane_id);
+            }
+            Err(e) => {
+                if let Some(banner) = self.stale_binary_banners.get_mut(&pane_id) {
+                    banner.restarting = false;
+                    banner.error = Some(format!("{e}"));
+                }
+            }
+        }
+        cx.notify();
     }
 
     /// タブの × ボタン close の確認ダイアログ付きハンドラ（Issue #172）
@@ -7352,6 +7405,82 @@ impl TakoApp {
                 if self.usage_history.len() > 5 {
                     self.usage_history.pop_front();
                 }
+            }
+        }
+    }
+
+    /// stale claude バイナリの定期チェック（Issue #498）。
+    /// 2 秒ポーリングの periodic_prep に便乗し、role が master/worker のペインだけチェック。
+    /// `resolve_current_claude_binary` は 5 秒 TTL キャッシュ付きなのでほとんどの tick は即返。
+    /// PID 解決（`pidpath`）は FFI 1 回で µs 級なので UI 専有は実質 0ms
+    fn check_stale_binaries(&mut self) {
+        let current = tako_control::stale_binary::resolve_current_claude_binary();
+        let Some(current_path) = current else {
+            return;
+        };
+        let current_version = tako_control::stale_binary::extract_version_from_path(&current_path);
+
+        let pane_ids: Vec<(PaneId, String, bool)> = self
+            .workspace
+            .tabs()
+            .iter()
+            .flat_map(|tab| tab.tree().panes())
+            .filter_map(|p| {
+                let role = p.role()?;
+                let is_master = role.contains("orchestrator-master")
+                    || role == "master"
+                    || role.starts_with("master:");
+                let is_worker = role.contains("orchestrator-worker") || role.starts_with("worker");
+                if is_master || is_worker {
+                    Some((
+                        p.id(),
+                        self.backend_sessions.get(&p.id())?.clone(),
+                        is_master,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (pane_id, _backend, is_master) in &pane_ids {
+            // 既にバナーが出ていてユーザーが操作待ちなら再チェック不要
+            if self
+                .stale_binary_banners
+                .get(pane_id)
+                .is_some_and(|b| !b.dismissed)
+            {
+                continue;
+            }
+
+            // ペインの claude PID を取得して pidpath で実パスを調べる
+            let pid = self.backend_sessions.get(pane_id).and_then(|backend| {
+                tako_control::stale_binary::find_claude_pid_for_backend(backend)
+            });
+            let Some(pid) = pid else {
+                continue;
+            };
+            let Some(running_path) = tako_control::stale_binary::pidpath(pid) else {
+                continue;
+            };
+
+            if running_path != current_path {
+                let spawned_version =
+                    tako_control::stale_binary::extract_version_from_path(&running_path);
+                self.stale_binary_banners.insert(
+                    *pane_id,
+                    StaleBinaryBanner {
+                        spawned_version,
+                        current_version: current_version.clone(),
+                        dismissed: false,
+                        restarting: false,
+                        error: None,
+                        is_master: *is_master,
+                    },
+                );
+            } else {
+                // 最新に追いついたらバナーを消す
+                self.stale_binary_banners.remove(pane_id);
             }
         }
     }
@@ -11806,6 +11935,110 @@ impl TakoApp {
                                 )
                             }),
                     ),
+            )
+            // stale claude バイナリ通知バナー（Issue #498）
+            .when_some(
+                self.stale_binary_banners
+                    .get(&pane_id)
+                    .filter(|b| !b.dismissed)
+                    .cloned(),
+                |d, banner| {
+                    let theme2 = theme.clone();
+                    let msg = if let Some(ref err) = banner.error {
+                        SharedString::from(format!(
+                            "{}: {}",
+                            crate::ui_text::stale::restart_failed(),
+                            err
+                        ))
+                    } else if banner.restarting {
+                        SharedString::from(crate::ui_text::stale::restarting().to_string())
+                    } else {
+                        SharedString::from(crate::ui_text::stale::banner_message(
+                            &banner.current_version,
+                            &banner.spawned_version,
+                        ))
+                    };
+                    d.child(
+                        div()
+                            .id(("stale-banner", pane_id.as_u64()))
+                            .flex_none()
+                            .w_full()
+                            .h(px(28.0))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .px(px(10.0))
+                            .bg(rgba_alpha(theme2.yellow, 0.12))
+                            .border_b_1()
+                            .border_color(hsla_alpha(theme2.yellow, 0.25))
+                            .text_size(px(11.0))
+                            .text_color(hsla(theme2.foreground))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .child(msg),
+                            )
+                            .when(!banner.restarting && banner.error.is_none(), |d| {
+                                d.child(
+                                    div()
+                                        .id(("stale-restart", pane_id.as_u64()))
+                                        .flex_none()
+                                        .px(px(8.0))
+                                        .py(px(2.0))
+                                        .rounded(px(4.0))
+                                        .bg(rgba(theme2.chip_surface))
+                                        .text_size(px(10.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(hsla(theme2.accent))
+                                        .cursor_pointer()
+                                        .hover(|d| d.bg(rgba_alpha(theme2.accent, 0.18)))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.stale_binary_restart(pane_id, cx);
+                                        }))
+                                        .child(SharedString::from(
+                                            if banner.is_master {
+                                                crate::ui_text::stale::handoff_button()
+                                            } else {
+                                                crate::ui_text::stale::restart_button()
+                                            }
+                                            .to_string(),
+                                        )),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id(("stale-dismiss", pane_id.as_u64()))
+                                    .flex_none()
+                                    .w(px(16.0))
+                                    .h(px(16.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .rounded(px(3.0))
+                                    .hover(|d| d.bg(rgba(theme2.surface_highlight)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(b) = this.stale_binary_banners.get_mut(&pane_id)
+                                        {
+                                            b.dismissed = true;
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        svg()
+                                            .path(crate::file_icons::ui_icon::CLOSE)
+                                            .w(px(10.0))
+                                            .h(px(10.0))
+                                            .text_color(hsla(theme2.text_muted)),
+                                    ),
+                            ),
+                    )
+                },
             )
             .child(
                 // テキスト領域: サブラインスクロール（#159）のため行スタックを

@@ -3824,6 +3824,18 @@ fn dispatch_inner(
                 ))),
             }
         }
+
+        Request::StaleBinary { action, pane } => {
+            let action = action.as_deref().unwrap_or("status");
+            match action {
+                "status" => dispatch_stale_binary_status(host, origin, pane),
+                "restart" => dispatch_stale_binary_restart(host, origin, pane),
+                "dismiss" => dispatch_stale_binary_dismiss(host, origin, pane),
+                other => Err(DispatchError::InvalidParams(format!(
+                    "不明な action: {other:?}（status / restart / dismiss のいずれか）"
+                ))),
+            }
+        }
     }
 }
 
@@ -7145,6 +7157,156 @@ fn dispatch_orchestrator_ledger(p: LedgerParams) -> Result<Value, DispatchError>
             "不正な action '{action}'。使用可能: list, stats, record, amend, prune"
         ))),
     }
+}
+
+// ---------------------------------------------------------------------------
+// StaleBinary — stale claude バイナリの検知と張り直し（Issue #498）
+// ---------------------------------------------------------------------------
+
+/// status: 指定ペインの stale 判定情報を返す
+fn dispatch_stale_binary_status(
+    host: &dyn ControlHost,
+    _origin: PaneOrigin,
+    pane: Option<u64>,
+) -> Result<Value, DispatchError> {
+    let (tab_id, pane_id) = resolve_pane(host.workspace(), pane)?;
+    let pane_obj = host
+        .workspace()
+        .get_tab(tab_id)
+        .and_then(|t| t.tree().get(pane_id))
+        .ok_or(DispatchError::PaneNotFound(pane_id.as_u64()))?;
+
+    let role = pane_obj.role().unwrap_or("");
+    let is_master =
+        role.contains("orchestrator-master") || role == "master" || role.starts_with("master:");
+    let is_worker = role.contains("orchestrator-worker") || role.starts_with("worker");
+
+    // バックエンドセッション名を取得
+    let backend = host.backend_session(pane_id);
+    let backend_session = match backend.as_deref() {
+        Some(s) => s,
+        None => {
+            return Ok(json!({
+                "stale": false,
+                "reason": "バックエンドセッションなし（stale 検知対象外）",
+                "pane": pane_id.as_u64(),
+            }));
+        }
+    };
+
+    // claude PID を解決
+    let pid = crate::stale_binary::find_claude_pid_for_backend(backend_session);
+
+    // 起動時バイナリパス: PID が取れたら pidpath で取得
+    let spawned = pid.and_then(crate::stale_binary::pidpath);
+    let current = crate::stale_binary::resolve_current_claude_binary();
+
+    let spawned_version = spawned
+        .as_ref()
+        .map(|p| crate::stale_binary::extract_version_from_path(p))
+        .unwrap_or_default();
+    let current_version = current
+        .as_ref()
+        .map(|p| crate::stale_binary::extract_version_from_path(p))
+        .unwrap_or_default();
+
+    let stale = match (&spawned, &current) {
+        (Some(s), Some(c)) => s != c,
+        _ => false,
+    };
+
+    Ok(json!({
+        "stale": stale,
+        "pane": pane_id.as_u64(),
+        "role": role,
+        "is_master": is_master,
+        "is_worker": is_worker,
+        "spawned_binary": spawned.as_ref().map(|p| p.to_string_lossy().to_string()),
+        "current_binary": current.as_ref().map(|p| p.to_string_lossy().to_string()),
+        "spawned_version": spawned_version,
+        "current_version": current_version,
+        "pid": pid,
+    }))
+}
+
+/// restart: stale ペインを張り直す。worker は resume、master は handoff
+fn dispatch_stale_binary_restart(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    pane: Option<u64>,
+) -> Result<Value, DispatchError> {
+    let (tab_id, pane_id) = resolve_pane(host.workspace(), pane)?;
+    let pane_obj = host
+        .workspace()
+        .get_tab(tab_id)
+        .and_then(|t| t.tree().get(pane_id))
+        .ok_or(DispatchError::PaneNotFound(pane_id.as_u64()))?;
+
+    let role = pane_obj.role().unwrap_or("").to_string();
+    let is_master =
+        role.contains("orchestrator-master") || role == "master" || role.starts_with("master:");
+
+    // busy チェック: Running 状態なら拒否
+    let cmd_state = host
+        .session(pane_id)
+        .map(|s| s.command_state())
+        .unwrap_or(CommandState::Unknown);
+    if matches!(cmd_state, CommandState::Running) {
+        return Err(DispatchError::Operation(
+            "ペインが実行中です。アイドルになってから張り直してください".into(),
+        ));
+    }
+
+    if is_master {
+        // master: handoff 経由で新 master を spawn
+        dispatch_orchestrator_handoff(host, origin, pane, Some(&role), None, None)
+    } else {
+        // worker: session_id を解決して resume
+        let backend = host.backend_session(pane_id);
+        let backend_session = backend.as_deref().ok_or_else(|| {
+            DispatchError::Operation("バックエンドセッションが見つからない".into())
+        })?;
+
+        let session_id = crate::agents::resolve_session_id_for_backend(backend_session)
+            .ok_or_else(|| {
+                DispatchError::Operation(
+                    "claude の session_id を解決できません。プロセスが終了しているか、\
+                     claude agents --json で情報を取得できません"
+                        .into(),
+                )
+            })?;
+
+        // 旧プロセスを終了: Ctrl-C を送信
+        host.queue_write(pane_id, b"\x03".to_vec());
+
+        // 少し待ってから resume コマンドを送信（prompt_flow で送達確認）
+        let resume_cmd = format!("claude --resume {session_id}");
+        host.queue_prompt_flow(pane_id, String::new());
+        // prompt_flow の空文字列はプロンプト待ちのみ。その後にコマンドを書く
+        let mut cmd_bytes = resume_cmd.into_bytes();
+        cmd_bytes.push(b'\r');
+        host.queue_write_on_alt_screen(pane_id, cmd_bytes);
+
+        Ok(json!({
+            "restarted": true,
+            "pane": pane_id.as_u64(),
+            "method": "resume",
+            "session_id": session_id,
+        }))
+    }
+}
+
+/// dismiss: バナーを閉じる（UI 側の状態を変更する指示。GUI 層で使用）
+fn dispatch_stale_binary_dismiss(
+    host: &dyn ControlHost,
+    _origin: PaneOrigin,
+    pane: Option<u64>,
+) -> Result<Value, DispatchError> {
+    let (_, pane_id) = resolve_pane(host.workspace(), pane)?;
+    Ok(json!({
+        "dismissed": true,
+        "pane": pane_id.as_u64(),
+    }))
 }
 
 #[cfg(test)]

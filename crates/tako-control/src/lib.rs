@@ -38,6 +38,7 @@ pub mod sessions;
 pub mod settings;
 pub mod setup;
 pub mod sleep_guard;
+pub mod stale_binary;
 pub mod tailscale;
 pub mod task_checkpoints;
 pub mod telemetry;

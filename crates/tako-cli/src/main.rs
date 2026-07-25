@@ -195,6 +195,10 @@ enum Command {
     /// 引数なしで配布系統・現在バージョン・重複 CLI を表示する
     #[command(subcommand)]
     Update(UpdateCommand),
+    /// stale claude バイナリの検知と張り直し（Issue #498）。
+    /// 長生きセッションが古い claude バイナリのまま動いている場合に検知・張り直し
+    #[command(subcommand, name = "stale-binary")]
+    StaleBinary(StaleBinaryCommand),
     /// フルディスクアクセス (FDA) の状態確認と設定画面の起動（Issue #118）。
     /// FDA を付与するとフォルダアクセス許可ダイアログが一括で出なくなる
     #[command(subcommand)]
@@ -520,6 +524,28 @@ enum UpdateCommand {
     },
     /// broken-brew 状態の修復（brew install --cask --force で台帳を再締結）
     Repair,
+}
+
+#[derive(Subcommand)]
+enum StaleBinaryCommand {
+    /// 指定ペインの stale 判定（握っている版 / 最新版 / stale か）
+    Status {
+        /// 対象ペイン ID
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// stale ペインを張り直す（worker は resume、master は handoff）
+    Restart {
+        /// 対象ペイン ID
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// バナーを閉じる
+    Dismiss {
+        /// 対象ペイン ID
+        #[arg(long)]
+        pane: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -4501,6 +4527,17 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 }
             }
         }
+        Command::StaleBinary(sub) => {
+            let (action, pane) = match sub {
+                StaleBinaryCommand::Status { pane } => ("status", *pane),
+                StaleBinaryCommand::Restart { pane } => ("restart", *pane),
+                StaleBinaryCommand::Dismiss { pane } => ("dismiss", *pane),
+            };
+            Request::StaleBinary {
+                action: Some(action.to_string()),
+                pane,
+            }
+        }
         Command::Update(sub) => {
             let (action, channel) = match sub {
                 UpdateCommand::Status => ("status", None),
@@ -5378,6 +5415,7 @@ fn print_result(command: &Command, result: &Value) {
             println!("{}", pretty_json(result));
         }
         Command::Web(_) => println!("{}", pretty_json(result)),
+        Command::StaleBinary(_) => println!("{}", pretty_json(result)),
         Command::Update(_) => println!("{}", pretty_json(result)),
         Command::Tree(_) => println!("{}", pretty_json(result)),
         Command::Sessions(SessionsCommand::List { json, .. }) => {
