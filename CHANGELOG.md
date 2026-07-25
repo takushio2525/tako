@@ -3,6 +3,33 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.12] - 2026-07-26
+
+Nightly patch release (automated). Changes since v0.5.11:
+夜間パッチリリース（自動）。v0.5.11 以降の変更:
+
+- [リファクタ] persist のゲートを capabilities へ言い換え — 段取り④ (Refs #519) (#540)
+- [リファクタ] dispatch の到達フォールバックを PaneReach 経由へ — 段取り③ (Refs #519) (#539)
+- [ドキュメント] activeContext を今夜の merge 状況へ更新 (#538)
+- [リファクタ] OS 連携の直呼びを境界 B8 へ集約 (#522) (#537)
+- [機能追加] git タブ: ブランチ操作 + コンフリクト解消エージェント (#496) (#534)
+- [修正] git タブ: パス表記の可搬性と CRLF 耐性 (#520) (#536)
+- [機能追加] 永続バックエンドの抽象境界 B2 を新設 (#519) (#535)
+- [機能追加] Windows 移植 基盤: system prompt / setup 配布物の単一ソース化 (#516) (#533)
+- [機能追加] Windows 移植 基盤: プラットフォーム対応マトリクスとパリティテスト (#515) (#532)
+- [ドキュメント] Windows 永続バックエンドの設計 (#518) (#531)
+- [機能追加] Windows 移植 P0: 抽象境界の新設でクロス check を成立させる (#467) (#529)
+- [ドキュメント] progress に #495 UX 改善の作業記録を追記
+- [改善] git タブ: コミット詳細を選択カード直下に表示 (#495) (#510)
+- [ドキュメント] progress に本日の作業記録を追記 + activeContext 更新
+- [修正] CLI git show の出力が print_result に未登録で空応答だった (#495)
+- [機能追加] stale claude バイナリの検知と張り直し (#498) (#508)
+- [機能追加] git タブ: コミット詳細表示 (#495) (#507)
+- [修正] テキスト入力フラグの残留でキー入力が奪われる問題を根治 (#503) (#509)
+- [機能追加] プロファイル cwd + ファイルツリー自動追加 + 専任マスター (#500 Part 5-7) (#506)
+- [機能追加] プロファイル env 注入 + アカウントレジストリ (#500 Part1-4 + #504) (#505)
+- [修正] git タブの描画崩壊を根治 + IME 未確定文字列の欠落を修正 (#494, #497, #501) (#502)
+
 ## [Unreleased]
 
 ### Fixed
