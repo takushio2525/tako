@@ -1233,3 +1233,16 @@
   `.agent/windows-setup.md` で実機初回ビルド手順を用意
 - 関連: PR #529（`Refs #467, #514`）。1268 tests / fmt / clippy 全緑
 - 次: Windows 実機で `cargo build` → #517（プレ版 v0）着手
+
+## 2026-07-25（#515: プラットフォーム抽象基盤 — 対応マトリクスとパリティテスト）
+- `tako-core::platform::support` 新設: 119 機能 × macOS / Windows の機械可読マトリクス。
+  判定は純粋関数で **macOS 上から Windows 側の縮退表を検証できる**。理由文は `Note`（日英対）で
+  1 箇所定義し、UI・診断・prompt が全部そこから引く（#435 準拠）
+- パリティテスト: T1 被覆 / T2 逆被覆 / T3 CLI 表（179 リーフコマンド）/ T4 説明必須 + 日英検査 /
+  T5 診断一致 / T6 単一ソース + スナップショット同期。**全部 macOS の `cargo test` で回る**
+- `tako platform` + MCP `tako_platform`（計 119 ツール）。CLI は GUI 不要のローカル処理
+- 副産物: MCP スナップショットが `tako_git_show`（#495）/ `tako_stale_binary`（#498）を欠いており
+  セルフテスト項目 32 が main で失敗する状態だったのを発見・修正
+- 関連: PR（`Refs #467, #515`）。1287 tests / fmt / clippy / クロス check 全緑
+- 次: #516（単一ソース化）・#517（プレ版 v0）
+

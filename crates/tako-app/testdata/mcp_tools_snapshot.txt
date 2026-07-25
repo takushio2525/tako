@@ -18,6 +18,7 @@ tako_git_diff
 tako_git_log
 tako_git_pull
 tako_git_push
+tako_git_show
 tako_git_stage
 tako_git_unstage
 tako_lang
@@ -47,6 +48,7 @@ tako_orchestrator_workers
 tako_panel
 tako_persist
 tako_pin_preview
+tako_platform
 tako_port_detect
 tako_preview_apply
 tako_preview_autosave
@@ -93,6 +95,7 @@ tako_setup_mcp
 tako_sleep_guard
 tako_split_pane
 tako_ssh_hosts
+tako_stale_binary
 tako_task_checkpoint
 tako_task_gate
 tako_task_gate_check

@@ -928,6 +928,17 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         font_size: Option<f32>,
     },
+    /// プラットフォーム対応マトリクスの参照（Issue #515 / #467）。
+    /// どの機能がどのプラットフォームで使えるか・縮退しているかを返す。
+    /// Windows 上の master が自環境の制約を自己認識するために使う
+    Platform {
+        /// "macos" / "windows"（省略時は実行中のプラットフォーム）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        platform: Option<String>,
+        /// "supported" / "degraded" / "pending" / "unsupported"（省略時は全件）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
     /// UI 表示言語の状態確認・切替（Issue #435。日英 i18n）。
     /// `action` = "status"（既定）/ "set"（`value` へ変更）。
     /// 変更は settings.json に永続化され、GUI に即時反映される
