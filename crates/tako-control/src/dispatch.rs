@@ -4156,6 +4156,9 @@ fn profile_to_json(name: &str, profile: &crate::orchestrator::Profile) -> Value 
             v["config_dir"] = json!(orchestrator::expand_tilde(config_dir));
         }
     }
+    if profile.cwd.is_some() {
+        v["cwd"] = json!(profile.cwd.as_deref().map(orchestrator::expand_tilde));
+    }
     if profile.projects.is_some() {
         v["projects"] = json!(profile.projects);
     }

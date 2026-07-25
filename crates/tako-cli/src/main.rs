@@ -2400,6 +2400,18 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     // env 検証（内部変数の上書き拒否。Issue #500）
     profile.validate_env()?;
 
+    // Part 5: cwd 解決（存在しなければ診断つきエラー）
+    let resolved_cwd = profile.resolve_cwd()?;
+
+    // Part 7: projects の key が projects.yaml に存在するか検証（起動時エラー）
+    profile.validate_projects()?;
+
+    // Part 5: cwd が指定されていれば、そのディレクトリへ移動
+    if let Some(ref cwd) = resolved_cwd {
+        std::env::set_current_dir(cwd)
+            .map_err(|e| format!("プロファイルの cwd に移動できない: {} ({e})", cwd.display()))?;
+    }
+
     let master_agent = profile.resolve_master_agent()?;
 
     if profile.master_agent_is_claude() {
@@ -2524,7 +2536,58 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     if let Some(ref projects) = profile.projects {
         eprintln!("projects 制限: {}", projects.join(", "));
     }
+    // Part 5: cwd 表示
+    if let Some(ref cwd) = resolved_cwd {
+        eprintln!("cwd: {}", cwd.display());
+    }
     eprintln!("system prompt: {}", prompt_path.display());
+
+    // Part 6: master 起動後にファイルツリーへ cwd と projects のフォルダを自動追加
+    let mut tree_folders: Vec<String> = Vec::new();
+    if let Some(ref cwd) = resolved_cwd {
+        if let Ok(canonical) = cwd.canonicalize() {
+            tree_folders.push(canonical.display().to_string());
+        }
+    }
+    if let Some(ref project_keys) = profile.projects {
+        if let Ok(config) = orchestrator::ProjectsConfig::load() {
+            for key in project_keys {
+                if let Ok(cwd) = config.resolve_cwd(key) {
+                    let path = std::path::PathBuf::from(&cwd);
+                    if let Ok(canonical) = path.canonicalize() {
+                        let s = canonical.display().to_string();
+                        if !tree_folders.contains(&s) {
+                            tree_folders.push(s);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for folder in &tree_folders {
+        let _ = send_request(Request::TreeFolder {
+            action: "add".into(),
+            path: Some(folder.clone()),
+            tab: None,
+            pane: Some(pane_id),
+        });
+    }
+    if !tree_folders.is_empty() {
+        eprintln!(
+            "ファイルツリーに追加: {}",
+            tree_folders
+                .iter()
+                .map(|p| {
+                    std::path::Path::new(p)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| p.clone())
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     Ok(())
 }
 
@@ -2557,6 +2620,13 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
 
     // env 検証（内部変数の上書き拒否。Issue #500）
     profile.validate_env()?;
+
+    // Part 5: cwd 解決
+    let resolved_cwd = profile.resolve_cwd()?;
+    if let Some(ref cwd) = resolved_cwd {
+        std::env::set_current_dir(cwd)
+            .map_err(|e| format!("プロファイルの cwd に移動できない: {} ({e})", cwd.display()))?;
+    }
 
     let solo_agent = profile.resolve_master_agent()?;
 
