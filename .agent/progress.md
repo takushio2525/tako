@@ -1312,3 +1312,16 @@
 - 実測: `TAKO_BACKEND=none` で `read` / `send` が「永続バックエンド（none）に…到達手段が無い」の
   構造化エラーを返し、`auto` では従来どおり `can't find session`（挙動不変）
 - 次: 段取り④（persist ゲートの言い換え）→ ⑤⑥
+
+## 2026-07-26（#519 段取り④: persist ゲートを capabilities へ言い換え）
+- 呼び出し側の問いを「tmux があるか」から「backend に何ができるか」へ変え、
+  `tmux_backend::available()` を**全廃**（本体ごと削除。再導入を構造的に防ぐ）。
+  器を問う 9 箇所は `capabilities().survives_app_exit`、remote は `detached_access` へ
+  （remote デーモンは tako-app とは別プロセスなので、必要なのは器ではなく到達手段）
+- `BackendCapabilities::degraded_note()` / `describe()` を新設。縮退の説明を 1 箇所で定義し、
+  `tako persist` / MCP が `backend`（label / survives_app_exit / detached_access / scrollback / note）
+  を返すようにした。`available` は後方互換で存置
+- 実測: `tako persist` が none = `note` つきで全 false、auto = `note: null` で全 true。
+  縮退経路・セルフテスト・不変条件は ③ と同一の結果
+- 挙動差の申告: remote の起動拒否メッセージを「tmux が見つからない」から能力ベースの文面へ
+- 次: 段取り⑤（WorkerEntry.pid / report の pane_log フォールバック / delivery 表示）→ ⑥
