@@ -13217,10 +13217,9 @@ impl PreviewHost for TakoApp {
                 }));
             }
         };
-        let rel = path
-            .strip_prefix(&repo)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| path.to_string_lossy().to_string());
+        // git は常に `/` 区切りのパスを期待する（#520）
+        let rel = tako_core::git::repo_relative(&repo, &path)
+            .unwrap_or_else(|| tako_core::git::to_git_path(&path));
         let commits = tako_core::git::log_file_commits(&repo, &rel, max_count);
         let commit_count = commits.len();
         let entries: Vec<preview::ChangelogEntry> = commits

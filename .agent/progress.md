@@ -1256,6 +1256,14 @@
   → `Note` のまま保持し描画時に解決する形へ修正（#518 に警告したのと同じ罠）
 - 関連: PR（`Refs #467, #516`）。1298 tests / fmt / clippy / クロス check 全緑
 
+## 2026-07-26（#520: git タブ Windows 対応の macOS 完結部分）
+- `git::to_git_path` / `repo_relative` / `from_git_path` / `normalize_repo_root` を新設。
+  git は常に `/` 区切りでパスを出し入れするので、`strip_prefix` の結果をそのまま渡すと
+  Windows で `src\foo.rs` になり履歴が空で返る（実バグ）。呼び出し 2 箇所を境界経由へ
+- CRLF 耐性テストを追加（parse_log / parse_branches / parse_status / parse_diff）。
+  `str::lines()` が `\r` を落とす前提に依存しているので退行検出用に固定
+- UI（right_panel.rs）は #496 が大改修中のため未着手。#520 にコメントで積む
+- 関連: PR（`Refs #467, #520`）。1306 tests / fmt / clippy / クロス check 全緑
 ## 2026-07-25（#518 設計 + #519 段取り①②: 永続バックエンド境界 B2 の新設）
 - #518 設計（`.agent/plans/2026-07-windows-persistence-backend.md`、PR #531 merge 済み）:
   tmux の役割を「生存の器」と「アウトオブプロセス到達」に分離。後者はほぼ全経路で
@@ -1267,3 +1275,4 @@
   画面マーカー 2→0、auto = 再 attach 2・マーカー 2→1。セルフテスト（tmux モード）は FAILED 0 で完走
 - 関連: PR（`Refs #519`）。1280 tests / fmt / clippy / check-windows.sh 全緑
 - 次: 段取り③（`PaneReach` 導入・dispatch 約 40 箇所）→ ④⑤⑥
+||||||| parent of 2800093 ([修正] git タブ: パス表記の可搬性と CRLF 耐性 (#520))
