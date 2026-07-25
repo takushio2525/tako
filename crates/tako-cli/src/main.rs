@@ -1157,6 +1157,7 @@ enum VideoCommand {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum OrchestratorCommand {
     /// worker が完了（idle）・異常停止（error）・消滅（gone）するまでブロックし、結果を出力する。
     /// Monitor ツールから呼ばれる想定。出力形式: WORKER_IDLE / WORKER_ERROR / WORKER_GONE
@@ -1502,6 +1503,24 @@ enum ProfilesCommand {
         /// タブ名の命名規則（master プロンプトに注入。空文字でクリア）
         #[arg(long)]
         tab_naming_convention: Option<String>,
+        /// 環境変数を設定する（KEY=VALUE 形式。複数指定可。Issue #500）
+        #[arg(long = "env-set")]
+        env_set: Option<Vec<String>>,
+        /// 環境変数を削除する（キー名。複数指定可。Issue #500）
+        #[arg(long = "env-unset")]
+        env_unset: Option<Vec<String>>,
+        /// master の既定アカウント名（accounts.yaml のキー。空文字でクリア。#504）
+        #[arg(long)]
+        master_account: Option<String>,
+        /// master_account を解除する
+        #[arg(long)]
+        clear_master_account: bool,
+        /// worker の既定アカウント名（空文字でクリア。#504）
+        #[arg(long)]
+        worker_account: Option<String>,
+        /// worker_account を解除する
+        #[arg(long)]
+        clear_worker_account: bool,
     },
 }
 
@@ -2378,6 +2397,9 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         Err(e) => return Err(e),
     };
 
+    // env 検証（内部変数の上書き拒否。Issue #500）
+    profile.validate_env()?;
+
     let master_agent = profile.resolve_master_agent()?;
 
     if profile.master_agent_is_claude() {
@@ -2490,6 +2512,18 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         orchestrator::WorkerModelPolicy::Delegate => "delegate（master が判断）".into(),
     };
     eprintln!("worker モデルポリシー: {policy_desc}");
+    // Part 4: env の可視化（キー名のみ。Issue #500）
+    if !profile.env.is_empty() {
+        let keys: Vec<&str> = profile.env.keys().map(|k| k.as_str()).collect();
+        eprintln!("env: {}", keys.join(", "));
+        // CLAUDE_CONFIG_DIR が設定されている場合、config dir を明示表示
+        if let Some(config_dir) = profile.env.get("CLAUDE_CONFIG_DIR") {
+            eprintln!("config dir: {}", orchestrator::expand_tilde(config_dir));
+        }
+    }
+    if let Some(ref projects) = profile.projects {
+        eprintln!("projects 制限: {}", projects.join(", "));
+    }
     eprintln!("system prompt: {}", prompt_path.display());
     Ok(())
 }
@@ -2520,6 +2554,9 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         Err(_) if profile_name == "default" => orchestrator::solo_default_profile(),
         Err(e) => return Err(e),
     };
+
+    // env 検証（内部変数の上書き拒否。Issue #500）
+    profile.validate_env()?;
 
     let solo_agent = profile.resolve_master_agent()?;
 
@@ -2601,6 +2638,14 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         profile.effort
     );
     eprintln!("モード: solo（オーケストレーション無し・1 対 1 対話・worker spawn 禁止）");
+    // Part 4: env の可視化（キー名のみ。Issue #500）
+    if !profile.env.is_empty() {
+        let keys: Vec<&str> = profile.env.keys().map(|k| k.as_str()).collect();
+        eprintln!("env: {}", keys.join(", "));
+        if let Some(config_dir) = profile.env.get("CLAUDE_CONFIG_DIR") {
+            eprintln!("config dir: {}", orchestrator::expand_tilde(config_dir));
+        }
+    }
     eprintln!("system prompt: {}", prompt_path.display());
     Ok(())
 }
@@ -2806,6 +2851,7 @@ fn orchestrator_run(
         initial_delay: std::time::Duration::from_secs(20),
         interval: std::time::Duration::from_secs(5),
         task_type: task_type.map(str::to_string),
+        account: None,
     };
     let mut exec = |req: Request| send_request(req);
     let result = wait::run_worker(&mut exec, &opts, &mut |pane_id, tmux| {
@@ -2894,6 +2940,12 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             agent_args,
             worker_model_policy,
             tab_naming_convention,
+            env_set,
+            env_unset,
+            master_account,
+            clear_master_account,
+            worker_account,
+            clear_worker_account,
         } => ProfilesParams {
             action: "set".into(),
             name: Some(name.clone()),
@@ -2916,6 +2968,12 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             agent_args: agent_args.clone(),
             worker_model_policy: worker_model_policy.clone(),
             tab_naming_convention: tab_naming_convention.clone(),
+            env_set: env_set.clone(),
+            env_unset: env_unset.clone(),
+            master_account: master_account.clone(),
+            clear_master_account: *clear_master_account,
+            worker_account: worker_account.clone(),
+            clear_worker_account: *clear_worker_account,
         },
     };
     let result = dispatch_orchestrator_profiles(params).map_err(|e| e.to_string())?;
@@ -4169,6 +4227,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 agent: agent.clone(),
                 caller_pid: Some(std::process::id()),
                 task_type: task_type.clone(),
+                account: None,
             }
         }
         Command::Orchestrator(OrchestratorCommand::SelfInfo { .. }) => {

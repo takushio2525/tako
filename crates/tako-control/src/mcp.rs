@@ -1261,7 +1261,40 @@ pub fn tools() -> Vec<Value> {
                     },
                     "worker_model_policy": { "type": "string", "enum": ["inherit", "delegate", "fixed"], "description": "worker のモデル選択ポリシー（inherit: master と同じ / delegate: master が都度選ぶ / fixed: worker_model 固定）" },
                     "tab_naming_convention": { "type": "string", "description": "タブ名の命名規則（master プロンプトに注入される自由記述。空文字でクリア。set 時）" },
+                    "env_set": {
+                        "type": "array", "items": { "type": "string" },
+                        "description": "環境変数を設定する（KEY=VALUE 形式の配列。値の ~ は $HOME に展開される。set 時。Issue #500）",
+                    },
+                    "env_unset": {
+                        "type": "array", "items": { "type": "string" },
+                        "description": "環境変数を削除する（キー名の配列。set 時。Issue #500）",
+                    },
+                    "master_account": { "type": "string", "description": "master の既定アカウント名（accounts.yaml のキー。空文字でクリア。set 時。#504）" },
+                    "clear_master_account": { "type": "boolean", "description": "master_account を解除する（set 時。#504）" },
+                    "worker_account": { "type": "string", "description": "worker の既定アカウント名（空文字でクリア。set 時。#504）" },
+                    "clear_worker_account": { "type": "boolean", "description": "worker_account を解除する（set 時。#504）" },
                 },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_orchestrator_accounts",
+            "description": "アカウントレジストリの管理（Issue #504）。名前つきアカウント（accounts.yaml）の CRUD。\
+                アカウントは config_dir（CLAUDE_CONFIG_DIR の値）と既定モデル/effort を持ち、\
+                spawn の account パラメータやプロファイルの master_account/worker_account で使う。\
+                action: list（全アカウント一覧）/ show（name 必須。1 件の詳細）/ \
+                add（name + config_dir 必須。追加または更新）/ remove（name 必須。削除）",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "show", "add", "remove"], "description": "操作（list / show / add / remove）" },
+                    "name": { "type": "string", "description": "アカウント名（show / add / remove 時に必須）" },
+                    "config_dir": { "type": "string", "description": "CLAUDE_CONFIG_DIR の値（add 時に必須。~ は $HOME に展開される）" },
+                    "description": { "type": "string", "description": "アカウントの説明（add 時。任意）" },
+                    "default_model": { "type": "string", "description": "このアカウントの既定モデル（add 時。任意。spawn で model 未指定時のフォールバック）" },
+                    "default_effort": { "type": "string", "description": "このアカウントの既定 effort（add 時。任意）" },
+                },
+                "required": ["action"],
                 "additionalProperties": false,
             },
         }),
@@ -1336,6 +1369,7 @@ pub fn tools() -> Vec<Value> {
                         "description": "委任台帳の task_type（省略時は investigation）。\
                             spawn 時に自動記録され、ledger stats で task_type x model の成功率・差し戻し率を集計できる",
                     },
+                    "account": { "type": "string", "description": "アカウント名（accounts.yaml のキー。この worker だけ該当 config dir / モデルで起動する。#504）" },
                 },
                 "required": ["project", "prompt"],
                 "additionalProperties": false,
@@ -2794,6 +2828,7 @@ fn orchestrator_run(
     let sync_mode = bool_arg(args, "sync").map_err(map_err)?.unwrap_or(false);
 
     let task_type = str_arg(args, "task_type").map_err(map_err)?;
+    let account = str_arg(args, "account").map_err(map_err)?;
     let opts = wait::RunOptions {
         project,
         prompt,
@@ -2810,6 +2845,7 @@ fn orchestrator_run(
         initial_delay: std::time::Duration::from_secs(20),
         interval: std::time::Duration::from_secs(5),
         task_type,
+        account,
     };
 
     if sync_mode {
@@ -3268,6 +3304,20 @@ fn build_request(
             agent_args: str_vec_arg(args, "agent_args")?,
             worker_model_policy: str_arg(args, "worker_model_policy")?,
             tab_naming_convention: str_arg(args, "tab_naming_convention")?,
+            env_set: str_vec_arg(args, "env_set")?,
+            env_unset: str_vec_arg(args, "env_unset")?,
+            master_account: str_arg(args, "master_account")?,
+            clear_master_account: bool_arg(args, "clear_master_account")?.unwrap_or(false),
+            worker_account: str_arg(args, "worker_account")?,
+            clear_worker_account: bool_arg(args, "clear_worker_account")?.unwrap_or(false),
+        },
+        "tako_orchestrator_accounts" => Request::OrchestratorAccounts {
+            action: str_arg(args, "action")?.ok_or("action を指定する")?,
+            name: str_arg(args, "name")?,
+            config_dir: str_arg(args, "config_dir")?,
+            description: str_arg(args, "description")?,
+            default_model: str_arg(args, "default_model")?,
+            default_effort: str_arg(args, "default_effort")?,
         },
         "tako_orchestrator_layout" => Request::OrchestratorLayout {
             policy: str_arg(args, "policy")?,
@@ -3311,6 +3361,7 @@ fn build_request(
                 agent: str_arg(args, "agent")?,
                 caller_pid: u64_arg(args, "caller_pid")?.map(|v| v as u32),
                 task_type: str_arg(args, "task_type")?,
+                account: str_arg(args, "account")?,
             }
         }
         "tako_orchestrator_report" => Request::OrchestratorReport {
@@ -4340,7 +4391,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 115);
+        assert_eq!(tools.len(), 116);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

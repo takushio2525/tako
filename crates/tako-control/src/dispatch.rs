@@ -2127,6 +2127,12 @@ fn dispatch_inner(
             agent_args,
             worker_model_policy,
             tab_naming_convention,
+            env_set,
+            env_unset,
+            master_account,
+            clear_master_account,
+            worker_account,
+            clear_worker_account,
         } => dispatch_orchestrator_profiles(ProfilesParams {
             action,
             name,
@@ -2149,7 +2155,30 @@ fn dispatch_inner(
             worker_model_policy,
             agent_args,
             tab_naming_convention,
+            env_set,
+            env_unset,
+            master_account,
+            clear_master_account,
+            worker_account,
+            clear_worker_account,
         }),
+
+        // #504: アカウントレジストリの CRUD
+        Request::OrchestratorAccounts {
+            action,
+            name,
+            config_dir,
+            description,
+            default_model,
+            default_effort,
+        } => dispatch_orchestrator_accounts(
+            &action,
+            name.as_deref(),
+            config_dir.as_deref(),
+            description.as_deref(),
+            default_model.as_deref(),
+            default_effort.as_deref(),
+        ),
 
         Request::OrchestratorLayout {
             policy,
@@ -2189,6 +2218,7 @@ fn dispatch_inner(
             agent,
             caller_pid,
             task_type,
+            account,
         } => dispatch_orchestrator_spawn(
             host,
             origin,
@@ -2204,6 +2234,7 @@ fn dispatch_inner(
                 agent: agent.as_deref(),
                 caller_pid,
                 task_type: task_type.as_deref(),
+                account: account.as_deref(),
             },
         ),
 
@@ -4071,6 +4102,16 @@ pub struct ProfilesParams {
     pub worker_model_policy: Option<String>,
     /// タブ名の命名規則
     pub tab_naming_convention: Option<String>,
+    /// env を設定する（key=value 形式。Issue #500）
+    pub env_set: Option<Vec<String>>,
+    /// env からキーを削除する（Issue #500）
+    pub env_unset: Option<Vec<String>>,
+    /// master の既定アカウント名（Issue #504）
+    pub master_account: Option<String>,
+    pub clear_master_account: bool,
+    /// worker の既定アカウント名（Issue #504）
+    pub worker_account: Option<String>,
+    pub clear_worker_account: bool,
 }
 
 /// プロファイルを JSON 化する（list / show / set の共通形）。
@@ -4100,6 +4141,30 @@ fn profile_to_json(name: &str, profile: &crate::orchestrator::Profile) -> Value 
     }
     if profile.tab_naming_convention.is_some() {
         v["tab_naming_convention"] = json!(profile.tab_naming_convention);
+    }
+    // env はキー名のみ表示（値はマスク。Issue #500）
+    if !profile.env.is_empty() {
+        let masked: serde_json::Map<String, Value> = profile
+            .env
+            .keys()
+            .map(|k| (k.clone(), json!("***")))
+            .collect();
+        v["env"] = Value::Object(masked);
+        // CLAUDE_CONFIG_DIR が設定されている場合、config dir パスだけは表示する
+        // （アカウントの判別に必要。値自体は秘密ではない）
+        if let Some(config_dir) = profile.env.get("CLAUDE_CONFIG_DIR") {
+            v["config_dir"] = json!(orchestrator::expand_tilde(config_dir));
+        }
+    }
+    if profile.projects.is_some() {
+        v["projects"] = json!(profile.projects);
+    }
+    // アカウント設定（#504）は使用時のみ出力
+    if profile.master_account.is_some() {
+        v["master_account"] = json!(profile.master_account);
+    }
+    if profile.worker_account.is_some() {
+        v["worker_account"] = json!(profile.worker_account);
     }
     v
 }
@@ -4187,6 +4252,33 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                 }
                 None => None,
             };
+            // env_set の形式と内部変数チェックを事前検証（クロージャ内から
+            // DispatchError を返せないため。Issue #500）
+            if let Some(ref env_set) = params.env_set {
+                for entry in env_set {
+                    match entry.split_once('=') {
+                        None => {
+                            return Err(DispatchError::InvalidParams(format!(
+                                "env の形式が不正（KEY=VALUE が必要）: {entry}"
+                            )));
+                        }
+                        Some((k, _)) => {
+                            // 一時的に Profile で内部変数チェック
+                            let mut tmp = orchestrator::Profile::default();
+                            tmp.env.insert(k.to_string(), String::new());
+                            if let Err(e) = tmp.validate_env() {
+                                return Err(DispatchError::Operation(e));
+                            }
+                        }
+                    }
+                }
+            }
+            let env_set_clone = params.env_set.clone();
+            let env_unset_clone = params.env_unset.clone();
+            let master_account_clone = params.master_account.clone();
+            let worker_account_clone = params.worker_account.clone();
+            let clear_master_account = params.clear_master_account;
+            let clear_worker_account = params.clear_worker_account;
             // ロック付き read-modify-write（#169）。パースできない既存プロファイルを
             // default に丸めて上書き保存すると設定が消えるため、Err で中断する
             let (path, profile) = orchestrator::Profile::mutate_named(&name, |profile| {
@@ -4244,6 +4336,39 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                     if let Some(a) = params.agent_args {
                         cfg.args = a;
                     }
+                }
+                // env の設定・削除（Issue #500）
+                if let Some(ref env_set) = env_set_clone {
+                    for entry in env_set {
+                        if let Some((k, v)) = entry.split_once('=') {
+                            profile.env.insert(k.to_string(), v.to_string());
+                        }
+                        // 不正形式は事前検証済み
+                    }
+                }
+                if let Some(ref env_unset) = env_unset_clone {
+                    for key in env_unset {
+                        profile.env.remove(key);
+                    }
+                }
+                // アカウントの設定・解除（#504）
+                if let Some(a) = master_account_clone.as_deref() {
+                    if a.is_empty() {
+                        profile.master_account = None;
+                    } else {
+                        profile.master_account = Some(a.to_string());
+                    }
+                } else if clear_master_account {
+                    profile.master_account = None;
+                }
+                if let Some(a) = worker_account_clone.as_deref() {
+                    if a.is_empty() {
+                        profile.worker_account = None;
+                    } else {
+                        profile.worker_account = Some(a.to_string());
+                    }
+                } else if clear_worker_account {
+                    profile.worker_account = None;
                 }
                 // 既定値のみになったエントリは掃除する（YAML を汚さない）
                 profile
@@ -4328,6 +4453,90 @@ fn spawn_tmux_delivery(session: String, text: String, wait_ready: bool) {
 
 /// spawn レイアウト設定の取得・変更（Issue #165）。host 非依存（config.yaml の読み書きのみ）
 /// のため pub にし、CLI `tako orchestrator layout` からもローカル呼び出しで共用する
+/// アカウントレジストリの CRUD（Issue #504）
+fn dispatch_orchestrator_accounts(
+    action: &str,
+    name: Option<&str>,
+    config_dir: Option<&str>,
+    description: Option<&str>,
+    default_model: Option<&str>,
+    default_effort: Option<&str>,
+) -> Result<Value, DispatchError> {
+    use crate::orchestrator;
+    match action {
+        "list" => {
+            let config = orchestrator::AccountsConfig::load().map_err(DispatchError::Operation)?;
+            let accounts: Vec<Value> = config
+                .list_resolved()
+                .into_iter()
+                .map(|a| {
+                    json!({
+                        "name": a.name,
+                        "config_dir": a.config_dir,
+                        "description": a.description,
+                        "default_model": a.default_model,
+                        "default_effort": a.default_effort,
+                    })
+                })
+                .collect();
+            Ok(json!({ "accounts": accounts }))
+        }
+        "show" => {
+            let name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+            let config = orchestrator::AccountsConfig::load().map_err(DispatchError::Operation)?;
+            let a = config.resolve(name).map_err(DispatchError::Operation)?;
+            Ok(json!({
+                "name": a.name,
+                "config_dir": a.config_dir,
+                "description": a.description,
+                "default_model": a.default_model,
+                "default_effort": a.default_effort,
+            }))
+        }
+        "add" => {
+            let name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+            let cd =
+                config_dir.ok_or(DispatchError::InvalidParams("config_dir を指定する".into()))?;
+            let entry = orchestrator::AccountEntry {
+                config_dir: cd.to_string(),
+                description: description.map(str::to_string),
+                default_model: default_model.map(str::to_string),
+                default_effort: default_effort.map(str::to_string),
+            };
+            orchestrator::AccountsConfig::mutate(|config| {
+                config.accounts.insert(name.to_string(), entry);
+            })
+            .map_err(DispatchError::Operation)?;
+            let config = orchestrator::AccountsConfig::load().map_err(DispatchError::Operation)?;
+            let a = config.resolve(name).map_err(DispatchError::Operation)?;
+            Ok(json!({
+                "name": a.name,
+                "config_dir": a.config_dir,
+                "description": a.description,
+                "default_model": a.default_model,
+                "default_effort": a.default_effort,
+            }))
+        }
+        "remove" => {
+            let name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+            let removed = orchestrator::AccountsConfig::mutate(|config| {
+                config.accounts.remove(name).is_some()
+            })
+            .map_err(DispatchError::Operation)?;
+            if removed {
+                Ok(json!({ "removed": name }))
+            } else {
+                Err(DispatchError::Operation(format!(
+                    "アカウント '{name}' は登録されていない"
+                )))
+            }
+        }
+        other => Err(DispatchError::InvalidParams(format!(
+            "action が不正: {other}（list / show / add / remove）"
+        ))),
+    }
+}
+
 /// （二重実装を作らない。#83 の教訓）。
 /// 全パラメータ None = 取得、いずれか Some = 検証して更新。更新はロック付き
 /// read-modify-write（#169。並行する他プロセスの設定更新を巻き戻さない）。
@@ -4740,6 +4949,10 @@ fn dispatch_orchestrator_handoff(
 
     // プロファイルの読み込みとエージェント解決
     let profile = orchestrator::Profile::load(profile_name).unwrap_or_default();
+    // env 検証（内部変数の上書き拒否。Issue #500）
+    profile.validate_env().map_err(DispatchError::Operation)?;
+    let profile_env = profile.resolved_env();
+
     let master_agent = profile
         .resolve_master_agent()
         .map_err(DispatchError::InvalidParams)?;
@@ -4764,11 +4977,11 @@ fn dispatch_orchestrator_handoff(
         .map_err(op_err)?;
     let _ = tree_mut(host.workspace_mut(), tab_id).focus(split_target);
 
-    // セッション起動（cwd をホームに、command は None = シェルのみ起動）
+    // セッション起動（cwd をホームに、プロファイル env を注入。Issue #500）
     let options = SpawnOptions {
         command: None,
         cwd: Some(cwd.clone()),
-        env: Vec::new(),
+        env: profile_env.clone(),
     };
     host.attach_session(new_id, options);
 
@@ -4780,6 +4993,7 @@ fn dispatch_orchestrator_handoff(
         effort: launch.effort.as_deref(),
         skip_permissions: master_agent.default_skip_permissions(),
         extra_args: &launch.extra_args,
+        env: &profile_env,
     });
 
     // 事前信頼
@@ -4840,6 +5054,8 @@ struct SpawnParams<'a> {
     caller_pid: Option<u32>,
     /// 委任台帳の task_type（Issue #292。統制語彙。省略時は investigation）
     task_type: Option<&'a str>,
+    /// アカウント名（accounts.yaml のキー。この worker だけ該当 config dir で起動。#504）
+    account: Option<&'a str>,
 }
 
 fn dispatch_orchestrator_spawn(
@@ -4859,6 +5075,7 @@ fn dispatch_orchestrator_spawn(
         agent,
         caller_pid,
         task_type: _task_type,
+        account,
     } = params;
     if pane.is_none() && tab.is_none() {
         return Err(DispatchError::Operation(
@@ -4884,10 +5101,46 @@ fn dispatch_orchestrator_spawn(
     // 検証はペイン分割の**前**に行う（不正 agent でペインだけ生える事故を防ぐ）
     let caller_pane = pane.map(PaneId::from_raw);
     let profile = resolve_caller_profile_with_role(host.workspace(), caller_pane, &role_suffix);
+
+    // Part 2: projects 制限の強制（Issue #500）。プロファイルに projects が設定されている場合、
+    // 範囲外のプロジェクトへの spawn を拒否する
+    if let Some(ref allowed) = profile.projects {
+        if !allowed.iter().any(|p| p == project) {
+            return Err(DispatchError::Operation(format!(
+                "プロファイルの projects 制限により、プロジェクト '{project}' への spawn は許可されていない（許可: {}）",
+                allowed.join(", ")
+            )));
+        }
+    }
+
+    // Part 1: env 検証（内部変数の上書き拒否。Issue #500）
+    profile.validate_env().map_err(DispatchError::Operation)?;
+
+    // #504: アカウント解決（spawn 指定 > worker_account > master_account）
+    let account_name = profile.resolve_worker_account_name(account);
+    let resolved_account = if let Some(acct_name) = account_name {
+        let accounts = orchestrator::AccountsConfig::load().map_err(DispatchError::Operation)?;
+        Some(
+            accounts
+                .resolve(acct_name)
+                .map_err(DispatchError::Operation)?,
+        )
+    } else {
+        None
+    };
+    let profile_env = profile.resolved_env_with_account(resolved_account.as_ref());
+
     let worker_agent = profile
         .resolve_worker_agent(agent)
         .map_err(DispatchError::InvalidParams)?;
-    let launch = profile.resolve_agent_launch(worker_agent, model, effort);
+    // アカウントの default_model / default_effort をフォールバックに使う（#504）
+    let effective_model = model.or(resolved_account
+        .as_ref()
+        .and_then(|a| a.default_model.as_deref()));
+    let effective_effort = effort.or(resolved_account
+        .as_ref()
+        .and_then(|a| a.default_effort.as_deref()));
+    let launch = profile.resolve_agent_launch(worker_agent, effective_model, effective_effort);
     let window_title = match label {
         Some(l) => format!("{project}: {l}"),
         None => format!("{project}-worker"),
@@ -4922,7 +5175,7 @@ fn dispatch_orchestrator_spawn(
     let options = SpawnOptions {
         command: None,
         cwd: Some(std::path::PathBuf::from(&cwd)),
-        env: Vec::new(),
+        env: profile_env.clone(),
     };
     host.attach_session(new_id, options);
 
@@ -4937,6 +5190,7 @@ fn dispatch_orchestrator_spawn(
         effort: launch.effort.as_deref(),
         skip_permissions: launch.skip_permissions,
         extra_args: &launch.extra_args,
+        env: &profile_env,
     });
 
     // 事前信頼: 未信頼フォルダでエージェント CLI を起動すると信頼ダイアログが出て、
@@ -5063,6 +5317,14 @@ fn dispatch_orchestrator_spawn(
     // #368: spawn 完了 → claude session スキャンを即時トリガー
     crate::request_claude_scan();
 
+    // Part 4: env のキー一覧（値はマスク。Issue #500）
+    let env_keys: Vec<&str> = profile_env.iter().map(|(k, _)| k.as_str()).collect();
+    // CLAUDE_CONFIG_DIR が設定されている場合、config dir パスを応答に含める
+    let config_dir_value = profile_env
+        .iter()
+        .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+        .map(|(_, v)| v.as_str());
+
     Ok(json!({
         "pane_id": new_id.as_u64(),
         "spawned_by": target.as_u64(),
@@ -5079,6 +5341,9 @@ fn dispatch_orchestrator_spawn(
         "tmux_session": tmux_session,
         "ledger_id": ledger_id,
         "worker_id": Some(worker_id).filter(|s| !s.is_empty()),
+        "env_keys": env_keys,
+        "config_dir": config_dir_value,
+        "account": account_name,
     }))
 }
 
@@ -6640,6 +6905,7 @@ fn dispatch_task_resume(
             agent: Some(agent_str),
             caller_pid: None,
             task_type: None,
+            account: None,
         },
     )?;
 
@@ -8732,6 +8998,7 @@ mod tests {
             agent: None,
             caller_pid: None,
             task_type: None,
+            account: None,
         }
     }
 
@@ -9899,6 +10166,7 @@ mod tests {
                 agent: None,
                 caller_pid: None,
                 task_type: None,
+                account: None,
             };
             let result = dispatch_orchestrator_spawn(&mut host, PaneOrigin::Mcp, params);
             assert!(
@@ -10936,6 +11204,7 @@ mod tests {
                 agent: None,
                 caller_pid: None,
                 task_type: None,
+                account: None,
             };
             let val = dispatch_orchestrator_spawn(&mut host, PaneOrigin::Mcp, params).unwrap();
             let worker_id = val["worker_id"]
