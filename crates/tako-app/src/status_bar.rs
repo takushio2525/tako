@@ -1860,6 +1860,8 @@ impl TakoApp {
     pub(crate) fn toggle_panel_view(&mut self, view: PanelView, cx: &mut Context<Self>) {
         if self.panel_visible && self.panel_view == view {
             self.panel_visible = false;
+            // #503: パネルを閉じたらテキスト入力フラグをクリア
+            self.clear_text_input_focus();
         } else {
             self.panel_visible = true;
             self.panel_view = view;
