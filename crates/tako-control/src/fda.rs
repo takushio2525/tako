@@ -66,11 +66,7 @@ pub fn open_settings() -> Result<(), String> {
             "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles",
         ];
         for url in &urls {
-            let status = std::process::Command::new("open")
-                .arg(url)
-                .status()
-                .map_err(|e| format!("open コマンドの実行に失敗: {e}"))?;
-            if status.success() {
+            if crate::platform::os_integration::open_url_wait(url).is_ok() {
                 return Ok(());
             }
         }

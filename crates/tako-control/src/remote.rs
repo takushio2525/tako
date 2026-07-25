@@ -308,21 +308,7 @@ fn notify_macos(message: &str) {
     if std::env::var("TAKO_REMOTE_NO_NOTIFY").is_ok_and(|v| v == "1") {
         return;
     }
-    #[cfg(target_os = "macos")]
-    {
-        // osascript の文字列リテラルは引数渡し（argv）にして injection を避ける
-        let script = "on run argv\ndisplay notification (item 1 of argv) with title \"tako remote\"\nend run";
-        let _ = Command::new("osascript")
-            .args(["-e", script, message])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = message;
-    }
+    crate::platform::os_integration::notify("tako remote", message);
 }
 
 /// 認可判定の結果

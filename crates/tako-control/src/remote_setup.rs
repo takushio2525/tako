@@ -411,8 +411,8 @@ pub fn run_interactive(auto_yes: bool, writer: &mut dyn io::Write) -> Result<Val
     let qr_path = match crate::remote::generate_qr_png(&ts_url) {
         Ok(path) => {
             writeln!(writer, "QR コード: {}", path.display()).map_err(|e| e.to_string())?;
-            // macOS: open で画像ビューアを起動
-            let _ = std::process::Command::new("open").arg(&path).spawn();
+            // 既定の画像ビューアを起動する
+            let _ = crate::platform::os_integration::open_default(&path);
             Some(path.display().to_string())
         }
         Err(e) => {

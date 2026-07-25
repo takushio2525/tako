@@ -758,9 +758,7 @@ fn find_app_bundle(dir: &Path) -> Option<PathBuf> {
 pub fn restart_app() -> Result<(), String> {
     let bundle = app_bundle_path()
         .ok_or_else(|| ".app バンドルのパスが特定できない（CLI 単体実行？）".to_string())?;
-    std::process::Command::new("open")
-        .args(["-n", &bundle.to_string_lossy()])
-        .spawn()
+    tako_control::platform::os_integration::open_new_instance(&bundle)
         .map_err(|e| format!("再起動に失敗: {e}"))?;
     Ok(())
 }

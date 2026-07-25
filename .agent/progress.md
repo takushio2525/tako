@@ -1286,3 +1286,16 @@
 - 検証: 品質ゲート全緑（1281）+ 隔離セルフテスト完走 + CLI 13 手順 / MCP 7 手順 +
   実クリック 4 件（証拠 ~/dev/tako-evidence/496/）。カード類のスクショは蓋閉じで未取得
 - 次: 蓋を開けた状態でコンフリクトカード・狭幅のスクショを取得 → master 検収 → merge
+
+## 2026-07-26（#522: OS 連携（B8）の集約 — open / osascript を境界の内側へ）
+- `platform::os_integration` に `open_url` / `open_url_wait` / `open_in_text_editor` /
+  `open_new_instance` / `pick_application` / `move_to_trash` / `notify` を追加し、
+  散在していた `open` 14 箇所・`osascript` 3 箇所を全部そこへ寄せた（挙動不変）。
+  呼び出し側の `cfg` は **11 個減り**、境界の内側だけが 5 個増えた
+- 権限昇格（`osascript … with administrator privileges`）は B8 に入れず B9（`sleep_guard`）の
+  内側に留めた。汎用の昇格 API を OS 連携境界に置くと危険な踏み台になるため
+- 受け入れ条件 2 の番犬テスト `os連携の直呼びが境界の外に残っていない` を新設。
+  意図的な違反を注入して落ちることまで確認（検出力の実証）
+- 検証: 1313 tests / fmt / clippy / クロス check（警告 13 = baseline 不変）/ 隔離セルフテスト
+  FAILED 0 / ゴミ箱移動の実 e2e（#80 インジェクション検証）緑
+- 次: #522 の残り（links.rs の Windows パス・Windows 実機の手動チェック・IME）
