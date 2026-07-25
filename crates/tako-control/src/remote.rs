@@ -1383,19 +1383,23 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
             // PID ファイルが無い → socket 接続で stale daemon を探す
             let sock = socket_path();
             if sock.exists() {
-                // 生きた daemon がいる → health を叩いて pid を取得
-                let req =
-                    "GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-                if let Ok(resp) = local_endpoint::request_raw(&sock, req, None) {
-                    if let Some(body) = resp.split_once("\r\n\r\n").map(|(_, b)| b) {
-                        if let Ok(v) = serde_json::from_str::<Value>(body.trim()) {
-                            if let Some(pid) = v["pid"].as_u64() {
-                                eprintln!(
-                                    "PID ファイルが消失していますが、稼働中デーモン（PID {pid}）を検出。停止します…"
-                                );
-                                kill_stale_daemon(pid as u32);
-                                cleanup_serve_leftover();
-                                return Ok(json!({ "stopped": true, "stale_pid": pid }));
+                // 到達可能かどうかだけで stale を判定する。応答が返らない場合に
+                // socket を消すと、生きている daemon を到達不能にしてしまう
+                if local_endpoint::probe_alive(&sock) {
+                    // 生きた daemon がいる → health を叩いて pid を取得
+                    let req =
+                        "GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+                    if let Ok(resp) = local_endpoint::request_raw(&sock, req, None) {
+                        if let Some(body) = resp.split_once("\r\n\r\n").map(|(_, b)| b) {
+                            if let Ok(v) = serde_json::from_str::<Value>(body.trim()) {
+                                if let Some(pid) = v["pid"].as_u64() {
+                                    eprintln!(
+                                        "PID ファイルが消失していますが、稼働中デーモン（PID {pid}）を検出。停止します…"
+                                    );
+                                    kill_stale_daemon(pid as u32);
+                                    cleanup_serve_leftover();
+                                    return Ok(json!({ "stopped": true, "stale_pid": pid }));
+                                }
                             }
                         }
                     }
