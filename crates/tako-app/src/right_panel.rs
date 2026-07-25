@@ -3101,6 +3101,21 @@ impl TakoApp {
                         .child(commit.subject.clone()),
                 );
                 if has_refs {
+                    // ref バッジは subject より優先度が低い。狭いパネルではバッジが
+                    // subject を押し出して件名がまるごと消えていたので、バッジ帯の幅に
+                    // 上限（パネル幅の 45%）を設けて件名の表示領域を残す（#494）
+                    let refs_max = (self.panel_width * 0.45).max(60.0);
+                    let mut refs_row = div()
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .overflow_hidden()
+                        .gap_1()
+                        .map(|mut d| {
+                            d.style().max_size.width = Some(px(refs_max).into());
+                            d
+                        });
                     for r in commit.refs.split(", ") {
                         let badge_color = data
                             .graph
@@ -3108,9 +3123,8 @@ impl TakoApp {
                             .get(r)
                             .map(|&ci| tako_core::GRAPH_PALETTE[ci])
                             .unwrap_or(accent);
-                        first_line = first_line.child(
+                        refs_row = refs_row.child(
                             div()
-                                .flex_none()
                                 .overflow_hidden()
                                 .text_ellipsis()
                                 .px_1()
@@ -3121,6 +3135,7 @@ impl TakoApp {
                                 .child(r.to_string()),
                         );
                     }
+                    first_line = first_line.child(refs_row);
                 }
                 info = info.child(first_line);
                 // 2行目: hash + author + date
@@ -3860,8 +3875,8 @@ mod tests {
     /// #494: バイトオフセットを文字境界へ丸める（丸めないと split_at / insert_str が panic する）
     #[test]
     fn 文字境界への丸め() {
-        let s = "あa😀";
-        // 「あ」= 0..3、「a」= 3..4、「😀」= 4..8
+        let s = "あa\u{1F600}";
+        // 「あ」= 0..3、「a」= 3..4、「\u{1F600}」= 4..8
         assert_eq!(floor_char_boundary(s, 0), 0);
         assert_eq!(floor_char_boundary(s, 1), 0);
         assert_eq!(floor_char_boundary(s, 2), 0);
@@ -3884,8 +3899,8 @@ mod tests {
         assert_eq!(head_chars("あいうえお", 2), "あい");
         assert_eq!(head_chars("あい", 5), "あい");
         // サロゲートペア相当でも壊れない
-        assert_eq!(tail_chars("a😀b", 2), "😀b");
-        assert_eq!(head_chars("a😀b", 2), "a😀");
+        assert_eq!(tail_chars("a\u{1F600}b", 2), "\u{1F600}b");
+        assert_eq!(head_chars("a\u{1F600}b", 2), "a\u{1F600}");
     }
 
     /// #494: git のエラーは数十行になり得る。カードがパネルを覆わないよう要約する
