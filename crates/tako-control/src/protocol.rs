@@ -473,6 +473,51 @@ pub enum Request {
         #[serde(default)]
         paths: Vec<String>,
     },
+    /// git checkout: ブランチ切替（#496）。
+    /// `confirm` = false（既定）では、未コミット変更があるなど**破壊的になり得る**場合は
+    /// 実行せずに「何が起きるか」（持ち越し / 衝突ファイル）を返す。`confirm` = true で実行する
+    GitCheckout {
+        pane: Option<u64>,
+        branch: String,
+        #[serde(default)]
+        confirm: bool,
+    },
+    /// git branch: 新規ブランチ作成（#496）。`start_point` 省略時は現在の HEAD が基点。
+    /// `checkout` = true（既定）で作成後そのまま切り替える
+    GitBranchCreate {
+        pane: Option<u64>,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_point: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkout: Option<bool>,
+    },
+    /// git merge: 指定ブランチを現在のブランチへマージする（#496）。
+    /// `confirm` = false（既定）では実行せず、マージ種別・取り込みコミット数・
+    /// 変更ファイル・**予測されるコンフリクト**を返す（作業ツリーには触れない）
+    GitMerge {
+        pane: Option<u64>,
+        branch: String,
+        #[serde(default)]
+        confirm: bool,
+        #[serde(default)]
+        no_ff: bool,
+    },
+    /// 進行中の merge / rebase / cherry-pick / revert を中止する（#496）
+    GitMergeAbort { pane: Option<u64> },
+    /// コンフリクト状態の取得（#496）。進行中の操作・未解決ファイル・マージ元/先を返す
+    GitConflicts { pane: Option<u64> },
+    /// コンフリクト解消エージェントの起動（#496）。同じタブにペインを立て、
+    /// エージェント CLI（claude / codex / agy）を起動して解消用プロンプトを自動投入する
+    GitResolveAgent {
+        pane: Option<u64>,
+        /// エージェント種別（claude / codex / agy。省略時はプロファイル既定）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        /// 分割先のタブ（省略時は呼び出し元ペインのタブ）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab: Option<u64>,
+    },
     /// ペインまたはタブをバックグラウンドへ送る（FR-2.15.1）。プロセスは生きたまま画面から外す。
     /// pane と tab は排他。tab 指定時はタブ内全ペインを一括退避する
     Background { pane: Option<u64>, tab: Option<u64> },

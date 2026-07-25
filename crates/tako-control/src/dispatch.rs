@@ -311,6 +311,115 @@ fn git_pane_cwd(host: &dyn ControlHost, pane: Option<u64>) -> Result<PathBuf, Di
         .ok_or(DispatchError::Operation("cwd が取得できない".into()))
 }
 
+/// ペインの cwd から git リポジトリのルートを解決する（#496）
+fn git_repo_for_pane(host: &dyn ControlHost, pane: Option<u64>) -> Result<PathBuf, DispatchError> {
+    let cwd = git_pane_cwd(host, pane)?;
+    tako_core::git::repo_root(&cwd).ok_or_else(|| op_err("git リポジトリが見つかりません"))
+}
+
+/// コンフリクト状態の JSON 表現（#496。CLI / MCP / UI で同じ形を使う）
+fn conflict_state_json(repo: &Path, state: &tako_core::ConflictState) -> Value {
+    json!({
+        "repo": repo.display().to_string(),
+        "operation": state.operation.as_str(),
+        "conflicted": state.is_active(),
+        "files": state.files,
+        "ours": state.ours,
+        "theirs": state.theirs,
+        "abort_command": state.operation.abort_args().map(|a| format!("git {} {}", a[0], a[1])),
+    })
+}
+
+/// GitCheckout（#496）。`confirm` = false のときは破壊的になり得る場合に実行せず提示を返す
+fn run_git_checkout(repo: &Path, branch: &str, confirm: bool) -> Result<Value, DispatchError> {
+    let preview = tako_core::git::checkout_preview(repo, branch).map_err(op_err)?;
+    let preview_json = json!({
+        "target": preview.target,
+        "current": preview.current,
+        "dirty_files": preview.dirty_files,
+        "blocking_files": preview.blocking_files,
+        "carried_files": preview.carried_files,
+        "changed_files": preview.changed_files,
+        "creates_local_branch": preview.creates_local_branch,
+        "blockers": preview.blockers,
+    });
+    // blockers は confirm でも越えられない（コンフリクト進行中など、git 自体が拒否する状態）
+    if !preview.blockers.is_empty() {
+        return Ok(json!({
+            "checked_out": false,
+            "requires_confirmation": false,
+            "blocked": true,
+            "preview": preview_json,
+        }));
+    }
+    if !confirm && preview.needs_confirmation() {
+        return Ok(json!({
+            "checked_out": false,
+            "requires_confirmation": true,
+            "blocked": false,
+            "preview": preview_json,
+        }));
+    }
+    let out = tako_core::git::checkout(repo, branch).map_err(op_err)?;
+    Ok(json!({
+        "checked_out": true,
+        "requires_confirmation": false,
+        "blocked": false,
+        "branch": tako_core::git::status(repo).branch,
+        "preview": preview_json,
+        "output": out,
+    }))
+}
+
+/// GitMerge（#496）。マージは常に事前提示する（`confirm` = true で実行）
+fn run_git_merge(
+    repo: &Path,
+    branch: &str,
+    confirm: bool,
+    no_ff: bool,
+) -> Result<Value, DispatchError> {
+    let preview = tako_core::git::merge_preview(repo, branch).map_err(op_err)?;
+    let preview_json = json!({
+        "target": preview.target,
+        "current": preview.current,
+        "kind": preview.kind.as_str(),
+        "incoming_commits": preview.incoming_commits,
+        "changed_files": preview.changed_files,
+        "predicted_conflicts": preview.predicted_conflicts,
+        "prediction_available": preview.prediction_available,
+        "dirty_files": preview.dirty_files,
+        "blockers": preview.blockers,
+    });
+    if !preview.blockers.is_empty() {
+        return Ok(json!({
+            "merged": false,
+            "requires_confirmation": false,
+            "blocked": true,
+            "preview": preview_json,
+        }));
+    }
+    if !confirm {
+        return Ok(json!({
+            "merged": false,
+            "requires_confirmation": true,
+            "blocked": false,
+            "preview": preview_json,
+        }));
+    }
+    let outcome = tako_core::git::merge(repo, branch, no_ff).map_err(op_err)?;
+    let state = tako_core::git::conflict_state(repo);
+    Ok(json!({
+        "merged": !outcome.conflicted,
+        "requires_confirmation": false,
+        "blocked": false,
+        "conflicted": outcome.conflicted,
+        "conflicts": outcome.conflicts,
+        "preview": preview_json,
+        "output": outcome.output,
+        "state": conflict_state_json(repo, &state),
+    }))
+}
+
 /// git log + branches + status の取得と応答整形（サブプロセス実行を伴う）
 fn run_git_log(cwd: &Path, max_count: Option<usize>) -> Result<Value, DispatchError> {
     let repo = tako_core::git::repo_root(cwd)
@@ -1916,6 +2025,64 @@ fn dispatch_inner(
             tako_core::git::unstage(&repo, &path_refs)
                 .map(|_| json!({ "unstaged": true, "paths": paths }))
                 .map_err(op_err)
+        }
+        Request::GitCheckout {
+            pane,
+            branch,
+            confirm,
+        } => {
+            let repo = git_repo_for_pane(host, pane)?;
+            run_git_checkout(&repo, &branch, confirm)
+        }
+        Request::GitBranchCreate {
+            pane,
+            name,
+            start_point,
+            checkout,
+        } => {
+            let repo = git_repo_for_pane(host, pane)?;
+            // 既定は「作って切り替える」（#322: 既定動作を賢くする）
+            let switch = checkout.unwrap_or(true);
+            tako_core::git::create_branch(&repo, &name, start_point.as_deref(), switch)
+                .map(|out| {
+                    json!({
+                        "created": name,
+                        "start_point": start_point,
+                        "checked_out": switch,
+                        "branch": tako_core::git::status(&repo).branch,
+                        "output": out,
+                    })
+                })
+                .map_err(op_err)
+        }
+        Request::GitMerge {
+            pane,
+            branch,
+            confirm,
+            no_ff,
+        } => {
+            let repo = git_repo_for_pane(host, pane)?;
+            run_git_merge(&repo, &branch, confirm, no_ff)
+        }
+        Request::GitMergeAbort { pane } => {
+            let repo = git_repo_for_pane(host, pane)?;
+            tako_core::git::abort_operation(&repo)
+                .map(|(op, out)| {
+                    json!({
+                        "aborted": op.as_str(),
+                        "branch": tako_core::git::status(&repo).branch,
+                        "output": out,
+                    })
+                })
+                .map_err(op_err)
+        }
+        Request::GitConflicts { pane } => {
+            let repo = git_repo_for_pane(host, pane)?;
+            let state = tako_core::git::conflict_state(&repo);
+            Ok(conflict_state_json(&repo, &state))
+        }
+        Request::GitResolveAgent { pane, agent, tab } => {
+            dispatch_git_resolve_agent(host, origin, pane, agent.as_deref(), tab)
         }
 
         Request::Background { pane, tab } => {
@@ -5078,6 +5245,146 @@ fn dispatch_orchestrator_handoff(
         "role": new_role,
         "handoff_file": handoff_path,
         "handoff_prompt_length": handoff_prompt.len(),
+    }))
+}
+
+/// GitResolveAgent — コンフリクト解消エージェントの起動（#496 Part 2）。
+///
+/// 既存の spawn 基盤（`orchestrator::agent` のコマンド構築 + 事前信頼 + PromptFlow）を
+/// そのまま使い、新しい系統は作らない。`OrchestratorSpawn` を経由しないのは、
+/// コンフリクトの起きたリポジトリが projects.yaml に登録済みとは限らないため
+/// （handoff と同じ理由・同じ直接 Split + attach の形）。
+fn dispatch_git_resolve_agent(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    pane: Option<u64>,
+    agent: Option<&str>,
+    tab: Option<u64>,
+) -> Result<Value, DispatchError> {
+    use crate::orchestrator;
+
+    let repo = git_repo_for_pane(host, pane)?;
+    let state = tako_core::git::conflict_state(&repo);
+    if !state.is_active() {
+        return Err(op_err(
+            "コンフリクトが発生していません（解消エージェントを起動する状況ではありません）",
+        ));
+    }
+
+    // エージェント種別はプロファイル既定を土台にし、明示指定で上書きする（新系統を作らない）
+    let caller_pane = pane.map(PaneId::from_raw);
+    let profile = resolve_caller_profile_with_role(host.workspace(), caller_pane, &None);
+    profile.validate_env().map_err(DispatchError::Operation)?;
+    let profile_env = profile.resolved_env();
+    let worker_agent = profile
+        .resolve_worker_agent(agent)
+        .map_err(DispatchError::InvalidParams)?;
+    let launch = profile.resolve_agent_launch(worker_agent, None, None);
+
+    // 分割先タブの解決（tab 指定 > 呼び出し元ペインのタブ）。
+    // Issue #496「押すと**同じタブ内に**エージェントのペインを立て」
+    let (tab_id, split_target) = if let Some(raw_tab) = tab {
+        let tid = find_tab(host.workspace(), raw_tab)?;
+        let focused = host
+            .workspace()
+            .get_tab(tid)
+            .ok_or_else(|| op_err("タブが見つかりません"))?
+            .tree()
+            .focused();
+        (tid, focused)
+    } else {
+        resolve_pane(host.workspace(), pane)?
+    };
+
+    let cwd = repo.display().to_string();
+    let new_pane = Pane::new(origin);
+    let new_id = new_pane.id();
+    let layout = crate::setup::spawn_layout_config();
+    tree_mut(host.workspace_mut(), tab_id)
+        .spawn_worker(split_target, new_pane, &layout)
+        .map_err(op_err)?;
+    // フォーカスは呼び出し元に残す（UI 操作中のユーザーの入力を奪わない）
+    let _ = tree_mut(host.workspace_mut(), tab_id).focus(split_target);
+
+    let options = SpawnOptions {
+        command: None,
+        cwd: Some(repo.clone()),
+        env: profile_env.clone(),
+    };
+    host.attach_session(new_id, options);
+
+    let role_value = "conflict-resolver";
+    let agent_cmd = orchestrator::agent::build_worker_cmd(&orchestrator::agent::WorkerLaunch {
+        agent: worker_agent,
+        role: role_value,
+        model: launch.model.as_deref(),
+        effort: launch.effort.as_deref(),
+        skip_permissions: launch.skip_permissions,
+        extra_args: &launch.extra_args,
+        env: &profile_env,
+    });
+
+    // 事前信頼（未信頼フォルダの確認ダイアログにプロンプトが食われるのを防ぐ。Issue #32）
+    let pre_trusted = orchestrator::agent::ensure_trusted(worker_agent, &cwd).unwrap_or_else(|e| {
+        eprintln!("warning: 事前信頼の書き込みに失敗（ダイアログ検出で継続）: {e}");
+        false
+    });
+    if launch.skip_permissions && worker_agent == orchestrator::agent::WorkerAgent::Claude {
+        let _ = crate::claude_tui::ensure_bypass_accepted().map_err(|e| {
+            eprintln!("warning: Bypass 事前承認の書き込みに失敗（ダイアログ検出で継続）: {e}");
+        });
+    }
+
+    let mut cmd_bytes = agent_cmd.clone().into_bytes();
+    cmd_bytes.push(b'\r');
+    host.queue_write(new_id, cmd_bytes);
+
+    // プロンプトは雛形から生成する（文面は conflict-resolver.md で差し替え可能）
+    let template = orchestrator::conflict_resolver_template();
+    let prompt = orchestrator::render_conflict_prompt(
+        &template,
+        &orchestrator::ConflictPromptVars {
+            repo: &cwd,
+            operation: state.operation.as_str(),
+            ours: if state.ours.is_empty() {
+                "(detached HEAD)"
+            } else {
+                &state.ours
+            },
+            theirs: state.theirs.as_deref().unwrap_or("(不明)"),
+            files: &state.files,
+        },
+    );
+    host.queue_prompt_flow(new_id, prompt.clone());
+
+    let window_title = format!("conflict: {}", state.operation.as_str());
+    let pane_obj = tree_mut(host.workspace_mut(), tab_id)
+        .get_mut(new_id)
+        .expect("直前に split で追加済み");
+    pane_obj.set_title(Some(window_title.clone()));
+    pane_obj.set_spawned_by(Some(split_target));
+    pane_obj.set_role(Some(role_value.to_string()));
+
+    let tmux_session = host
+        .reserve_backend_session(new_id)
+        .or_else(|| host.backend_session(new_id));
+
+    Ok(json!({
+        "pane_id": new_id.as_u64(),
+        "tab_id": tab_id.as_u64(),
+        "spawned_by": split_target.as_u64(),
+        "agent": worker_agent.as_str(),
+        "model": launch.model,
+        "effort": launch.effort,
+        "title": window_title,
+        "cwd": cwd,
+        "command": agent_cmd,
+        "prompt": prompt,
+        "prompt_template": orchestrator::conflict_resolver_prompt_path()
+            .map(|p| p.display().to_string()),
+        "pre_trusted": pre_trusted,
+        "tmux_session": tmux_session,
+        "state": conflict_state_json(&repo, &state),
     }))
 }
 

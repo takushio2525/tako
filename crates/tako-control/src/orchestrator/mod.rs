@@ -24,6 +24,55 @@ pub const SOLO_SYSTEM_PROMPT: &str = include_str!("solo_system_prompt.md");
 /// solo のデフォルト effort。master の "max" より低くしてエコ運用を既定にする
 pub const SOLO_DEFAULT_EFFORT: &str = "high";
 
+/// バイナリ埋め込みのコンフリクト解消エージェント用プロンプト雛形（#496）
+pub const CONFLICT_RESOLVER_PROMPT: &str = include_str!("conflict_resolver_prompt.md");
+
+/// コンフリクト解消プロンプトのユーザーカスタムファイルのパス（#496）。
+/// ここに置けば埋め込みの雛形より優先される（文面をベタ書きで固定しないための逃げ道）
+pub fn conflict_resolver_prompt_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("conflict-resolver.md"))
+}
+
+/// コンフリクト解消プロンプトの雛形を解決する（#496）。
+/// カスタムファイルがあればそれ、無ければ埋め込みの既定を返す
+pub fn conflict_resolver_template() -> String {
+    conflict_resolver_prompt_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| CONFLICT_RESOLVER_PROMPT.trim().to_string())
+}
+
+/// コンフリクト解消プロンプトの差し込み値（#496）
+pub struct ConflictPromptVars<'a> {
+    pub repo: &'a str,
+    pub operation: &'a str,
+    pub ours: &'a str,
+    pub theirs: &'a str,
+    pub files: &'a [String],
+}
+
+/// 雛形へ実際の値を差し込む（#496）。
+/// 未知のプレースホルダはそのまま残す（カスタム雛形を壊さない）
+pub fn render_conflict_prompt(template: &str, vars: &ConflictPromptVars) -> String {
+    let files = if vars.files.is_empty() {
+        "  （未解決ファイルなし。git status で確認すること）".to_string()
+    } else {
+        vars.files
+            .iter()
+            .map(|f| format!("  - `{f}`"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    template
+        .replace("{{repo}}", vars.repo)
+        .replace("{{operation}}", vars.operation)
+        .replace("{{ours}}", vars.ours)
+        .replace("{{theirs}}", vars.theirs)
+        .replace("{{file_count}}", &vars.files.len().to_string())
+        .replace("{{files}}", &files)
+}
+
 /// テスト専用: config_dir() の返り先を隔離ディレクトリへ差し替える。
 /// テストが実運用の projects.yaml / profiles / config.yaml に書き込み、
 /// 世代バックアップをテスト由来の内容で汚染するのを防ぐ（#169）
@@ -1709,6 +1758,71 @@ mod tests {
         let expanded = expand_tilde("~/Documents/test");
         assert!(!expanded.starts_with("~/"));
         assert!(expanded.contains("Documents/test"));
+    }
+
+    /// #496: コンフリクト解消プロンプトの雛形は Issue が要求する要素をすべて含む
+    #[test]
+    fn コンフリクト解消プロンプトの雛形が必須要素を持つ() {
+        let t = CONFLICT_RESOLVER_PROMPT;
+        for placeholder in [
+            "{{repo}}",
+            "{{operation}}",
+            "{{ours}}",
+            "{{theirs}}",
+            "{{files}}",
+            "{{file_count}}",
+        ] {
+            assert!(t.contains(placeholder), "{placeholder} が雛形にない");
+        }
+        // 「勝手に commit / push しない」制約（Issue #496 Part 2 の必須項目）
+        assert!(t.contains("commit") && t.contains("push"));
+        assert!(t.contains("報告"));
+    }
+
+    /// #496: 差し込みは全プレースホルダを解決し、ファイル一覧を箇条書きにする
+    #[test]
+    fn コンフリクト解消プロンプトの差し込み() {
+        let files = vec!["src/a.rs".to_string(), "docs/b.md".to_string()];
+        let out = render_conflict_prompt(
+            CONFLICT_RESOLVER_PROMPT,
+            &ConflictPromptVars {
+                repo: "/tmp/demo",
+                operation: "merging",
+                ours: "main",
+                theirs: "feat",
+                files: &files,
+            },
+        );
+        assert!(out.contains("/tmp/demo"));
+        assert!(out.contains("merging"));
+        assert!(out.contains("main"));
+        assert!(out.contains("feat"));
+        assert!(out.contains("- `src/a.rs`"));
+        assert!(out.contains("- `docs/b.md`"));
+        assert!(out.contains("2 件"));
+        // 差し込み後にプレースホルダが残らない
+        assert!(
+            !out.contains("{{"),
+            "未解決のプレースホルダが残っている:\n{out}"
+        );
+    }
+
+    /// #496: 未知のプレースホルダを持つカスタム雛形を壊さない（文面差し替えの逃げ道を保つ）
+    #[test]
+    fn コンフリクト解消プロンプトはカスタム雛形を壊さない() {
+        let out = render_conflict_prompt(
+            "repo={{repo}} unknown={{whatever}} files:\n{{files}}",
+            &ConflictPromptVars {
+                repo: "/r",
+                operation: "merging",
+                ours: "a",
+                theirs: "b",
+                files: &[],
+            },
+        );
+        assert!(out.starts_with("repo=/r unknown={{whatever}}"));
+        // ファイルが空でも空欄にせず、確認方法を書く
+        assert!(out.contains("git status"));
     }
 
     /// テスト用の隔離ディレクトリ（実運用の projects.yaml には絶対に触らない）

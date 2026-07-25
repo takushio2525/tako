@@ -954,6 +954,66 @@ enum GitCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
+    /// ブランチを切り替える（#496）。未コミット変更があるときは実行せず、
+    /// 何が起きるか（持ち越し / 衝突するファイル）を出力する。--yes で実行する
+    Checkout {
+        /// 切替先ブランチ（`origin/foo` を指定すると同名のローカル追跡ブランチを作る）
+        branch: String,
+        /// 事前提示を承諾して実行する
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// 新規ブランチを作成して切り替える（#496）
+    Branch {
+        /// 作成するブランチ名
+        name: String,
+        /// 基点（省略時は現在の HEAD）
+        #[arg(long)]
+        from: Option<String>,
+        /// 作成するだけで切り替えない
+        #[arg(long)]
+        no_checkout: bool,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// 指定ブランチを現在のブランチへマージする（#496）。既定では実行せず、
+    /// マージ種別・取り込みコミット数・予測されるコンフリクトを出力する。--yes で実行する
+    Merge {
+        /// マージ元ブランチ
+        branch: String,
+        /// 事前提示を承諾して実行する
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// 早送りせずマージコミットを作る
+        #[arg(long)]
+        no_ff: bool,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// 進行中の merge / rebase / cherry-pick / revert を中止する（#496）
+    Abort {
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// コンフリクト状態を JSON で出力する（#496）
+    Conflicts {
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// コンフリクト解消エージェントを起動する（#496）。同じタブにペインを立て、
+    /// リポジトリ・未解決ファイル・ブランチを含む解消用プロンプトを自動投入する
+    Resolve {
+        /// エージェント種別（claude / codex / agy。省略時はプロファイル既定）
+        #[arg(long)]
+        agent: Option<String>,
+        /// 分割先タブ（省略時は呼び出し元ペインのタブ）
+        #[arg(long)]
+        tab: Option<u64>,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -4196,6 +4256,44 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane: target_pane(*pane)?,
             paths: paths.clone(),
         },
+        Command::Git(GitCommand::Checkout { branch, yes, pane }) => Request::GitCheckout {
+            pane: target_pane(*pane)?,
+            branch: branch.clone(),
+            confirm: *yes,
+        },
+        Command::Git(GitCommand::Branch {
+            name,
+            from,
+            no_checkout,
+            pane,
+        }) => Request::GitBranchCreate {
+            pane: target_pane(*pane)?,
+            name: name.clone(),
+            start_point: from.clone(),
+            checkout: Some(!*no_checkout),
+        },
+        Command::Git(GitCommand::Merge {
+            branch,
+            yes,
+            no_ff,
+            pane,
+        }) => Request::GitMerge {
+            pane: target_pane(*pane)?,
+            branch: branch.clone(),
+            confirm: *yes,
+            no_ff: *no_ff,
+        },
+        Command::Git(GitCommand::Abort { pane }) => Request::GitMergeAbort {
+            pane: target_pane(*pane)?,
+        },
+        Command::Git(GitCommand::Conflicts { pane }) => Request::GitConflicts {
+            pane: target_pane(*pane)?,
+        },
+        Command::Git(GitCommand::Resolve { agent, tab, pane }) => Request::GitResolveAgent {
+            pane: target_pane(*pane)?,
+            agent: agent.clone(),
+            tab: *tab,
+        },
         Command::Collapse(args) => Request::CollapseTab {
             // tab 明示時はペイン不要。省略時は呼び出し元ペインのタブへ
             pane: if args.tab.is_some() {
@@ -5467,7 +5565,15 @@ fn print_result(command: &Command, result: &Value) {
         }
         Command::Git(GitCommand::Log { .. })
         | Command::Git(GitCommand::Diff { .. })
-        | Command::Git(GitCommand::Show { .. }) => {
+        | Command::Git(GitCommand::Show { .. })
+        // #496: 事前提示（preview）を含む構造化応答なので整形して出す。
+        // ここへの登録漏れは #495 で「空応答」として実機に出た経路
+        | Command::Git(GitCommand::Checkout { .. })
+        | Command::Git(GitCommand::Branch { .. })
+        | Command::Git(GitCommand::Merge { .. })
+        | Command::Git(GitCommand::Abort { .. })
+        | Command::Git(GitCommand::Conflicts { .. })
+        | Command::Git(GitCommand::Resolve { .. }) => {
             println!("{}", pretty_json(result));
         }
         Command::Git(GitCommand::Commit { .. })
@@ -6163,6 +6269,10 @@ mod platform_matrix_parity {
         ("file", "tako_file_op"),
         ("focus", "tako_focus_pane"),
         ("foreground", "tako_foreground_pane"),
+        // #496: CLI は git の語彙（branch / abort / resolve）、MCP は操作名で命名しているぶんのズレ
+        ("git abort", "tako_git_merge_abort"),
+        ("git branch", "tako_git_branch_create"),
+        ("git resolve", "tako_git_resolve_agent"),
         ("list", "tako_list_panes"),
         ("open-in dir", "tako_open_dir"),
         ("open-in remote", "tako_open_remote"),

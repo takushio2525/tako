@@ -1109,6 +1109,101 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_git_checkout",
+            "description": "ブランチを切り替える（#496）。confirm=false（既定）で呼ぶと、\
+                未コミット変更があるなど破壊的になり得る場合は**実行せず**に何が起きるかを返す\
+                （preview.carried_files = 切替後も持ち越される変更 / preview.blocking_files = \
+                git が切替を拒否するファル）。内容を確認したうえで confirm=true で実行する。\
+                branch に `origin/foo` を指定すると detached HEAD ではなく同名のローカル追跡ブランチを作る。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン"),
+                    "branch": { "type": "string", "description": "切替先ブランチ名" },
+                    "confirm": { "type": "boolean", "description": "事前提示を承諾して実行する（省略時 false = 提示のみ）" },
+                },
+                "required": ["branch"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_git_branch_create",
+            "description": "新規ブランチを作成する（#496）。start_point 省略時は現在の HEAD が基点。\
+                checkout=true（既定）で作成後そのまま切り替える。既存名・不正なブランチ名は実行前に拒否する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン"),
+                    "name": { "type": "string", "description": "作成するブランチ名" },
+                    "start_point": { "type": "string", "description": "基点のブランチ / コミット（省略時は現在の HEAD）" },
+                    "checkout": { "type": "boolean", "description": "作成後に切り替えるか（省略時 true）" },
+                },
+                "required": ["name"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_git_merge",
+            "description": "指定ブランチを現在のブランチへマージする（#496）。confirm=false（既定）では\
+                **作業ツリーに一切触れず**に予測だけを返す: preview.kind（up-to-date / fast-forward / \
+                three-way / unrelated）・incoming_commits・changed_files・predicted_conflicts\
+                （git merge-tree による事前計算）。内容を確認して confirm=true で実行する。\
+                コンフリクトはエラーではなく conflicted=true として返り、tako_git_resolve_agent へ繋げられる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン"),
+                    "branch": { "type": "string", "description": "マージ元ブランチ名" },
+                    "confirm": { "type": "boolean", "description": "事前提示を承諾して実行する（省略時 false = 提示のみ）" },
+                    "no_ff": { "type": "boolean", "description": "早送りせずマージコミットを作る（省略時 false）" },
+                },
+                "required": ["branch"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_git_merge_abort",
+            "description": "進行中の merge / rebase / cherry-pick / revert を中止して\
+                コンフリクト前の状態へ戻す（#496）。進行中の操作が無ければエラーを返す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン"),
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_git_conflicts",
+            "description": "コンフリクト状態を取得する（#496）。進行中の操作\
+                （merging / rebasing / cherry-picking / reverting）・未解決ファイル一覧・\
+                取り込み先（ours）と取り込み元（theirs）・中止コマンドを返す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン"),
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_git_resolve_agent",
+            "description": "コンフリクト解消エージェントを起動する（#496）。同じタブにペインを立て、\
+                エージェント CLI（claude / codex / agy）を起動して解消用プロンプトを自動投入する。\
+                プロンプトにはリポジトリパス・未解決ファイル一覧・マージ元/先ブランチと\
+                「解消したら報告し、勝手に commit / push しない」制約が含まれる。\
+                コンフリクトが発生していないときはエラーを返す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン（コンフリクトしているリポジトリの cwd を持つペイン）"),
+                    "agent": { "type": "string", "enum": ["claude", "codex", "agy"], "description": "エージェント種別（省略時はプロファイル既定）" },
+                    "tab": { "type": "integer", "description": "分割先タブ ID（省略時は呼び出し元ペインのタブ）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_background_pane",
             "description": "ペインまたはタブをバックグラウンドへ送る。プロセスは生きたまま\
                 画面から外す。邪魔なペインやタブを画面外へ送るのに使う。バックグラウンドのペインは\
@@ -3278,6 +3373,34 @@ fn build_request(
             pane: Some(target_pane(args, caller)?),
             paths: str_array_arg(args, "paths"),
         },
+        "tako_git_checkout" => Request::GitCheckout {
+            pane: Some(target_pane(args, caller)?),
+            branch: str_arg(args, "branch")?.ok_or("branch を指定する")?,
+            confirm: bool_arg(args, "confirm")?.unwrap_or(false),
+        },
+        "tako_git_branch_create" => Request::GitBranchCreate {
+            pane: Some(target_pane(args, caller)?),
+            name: str_arg(args, "name")?.ok_or("name を指定する")?,
+            start_point: str_arg(args, "start_point")?,
+            checkout: bool_arg(args, "checkout")?,
+        },
+        "tako_git_merge" => Request::GitMerge {
+            pane: Some(target_pane(args, caller)?),
+            branch: str_arg(args, "branch")?.ok_or("branch を指定する")?,
+            confirm: bool_arg(args, "confirm")?.unwrap_or(false),
+            no_ff: bool_arg(args, "no_ff")?.unwrap_or(false),
+        },
+        "tako_git_merge_abort" => Request::GitMergeAbort {
+            pane: Some(target_pane(args, caller)?),
+        },
+        "tako_git_conflicts" => Request::GitConflicts {
+            pane: Some(target_pane(args, caller)?),
+        },
+        "tako_git_resolve_agent" => Request::GitResolveAgent {
+            pane: Some(target_pane(args, caller)?),
+            agent: str_arg(args, "agent")?,
+            tab: u64_arg(args, "tab")?,
+        },
         "tako_background_pane" => {
             let tab = u64_arg(args, "tab")?;
             Request::Background {
@@ -4471,7 +4594,7 @@ mod tests {
         let tools = tools();
         // 件数の固定値。ツール追加時はここと対応マトリクス（#515）の両方を更新する
         // （分類漏れ自体は tests/platform_parity.rs の T1 が検出する）
-        assert_eq!(tools.len(), 119);
+        assert_eq!(tools.len(), 125);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

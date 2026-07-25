@@ -112,6 +112,13 @@ pub mod notes {
         "git タブの Windows 対応（パス表記と改行コードの可搬性）が前提",
         "Requires Windows support for the git tab (path notation and line-ending portability)",
     );
+    /// #520 + #526 の担当範囲（#496 のコンフリクト解消エージェント）。
+    /// git タブの状態検出だけでなく**エージェントペインの spawn** にも依存するので、
+    /// WIN_GIT とは別に「両方が要る」ことを明示する
+    pub const WIN_GIT_RESOLVE_AGENT: Note = Note::new(
+        "git タブの Windows 対応に加えて、エージェントペインの spawn（orchestrator の Windows 縮退モード）が前提",
+        "Requires Windows support for the git tab plus agent pane spawning (the degraded orchestrator mode on Windows)",
+    );
     /// #521 の担当範囲
     pub const WIN_PREVIEW: Note = Note::new(
         "プレビュー / Web ビューの Windows 実装（WebView2・PDF・動画）が前提",
@@ -404,7 +411,31 @@ pub const MATRIX: &[Feature] = &[
         },
     },
     Feature {
+        key: "tako_git_branch_create",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_GIT,
+            issue: 520,
+        },
+    },
+    Feature {
+        key: "tako_git_checkout",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_GIT,
+            issue: 520,
+        },
+    },
+    Feature {
         key: "tako_git_commit",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_GIT,
+            issue: 520,
+        },
+    },
+    Feature {
+        key: "tako_git_conflicts",
         macos: Support::Supported,
         windows: Support::Pending {
             note: notes::WIN_GIT,
@@ -428,6 +459,22 @@ pub const MATRIX: &[Feature] = &[
         },
     },
     Feature {
+        key: "tako_git_merge",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_GIT,
+            issue: 520,
+        },
+    },
+    Feature {
+        key: "tako_git_merge_abort",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_GIT,
+            issue: 520,
+        },
+    },
+    Feature {
         key: "tako_git_pull",
         macos: Support::Supported,
         windows: Support::Pending {
@@ -440,6 +487,14 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Pending {
             note: notes::WIN_GIT,
+            issue: 520,
+        },
+    },
+    Feature {
+        key: "tako_git_resolve_agent",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_GIT_RESOLVE_AGENT,
             issue: 520,
         },
     },
