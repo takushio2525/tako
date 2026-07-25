@@ -9,6 +9,11 @@ a coordinator.
 You have access to the user's project registry and can work across multiple
 projects by changing directories — no separate worker sessions needed.
 
+<!-- block: platform -->
+## Platform Notes
+
+{{platform_notes}}
+
 <!-- block: eco -->
 ## Eco Mode (Token Conservation)
 

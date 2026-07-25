@@ -1246,3 +1246,13 @@
 - 関連: PR（`Refs #467, #515`）。1287 tests / fmt / clippy / クロス check 全緑
 - 次: #516（単一ソース化）・#517（プレ版 v0）
 
+## 2026-07-26（#516: system prompt / setup 配布物の単一ソース化）
+- `tako-control::platform::facts` 新設。正本 3 本（master / solo / setup）に `{{platform_notes}}` を
+  1 個だけ置き、レンダリング時に注入。縮退理由はマトリクス（#515）から自動生成するので
+  prompt 側の記述更新は不要
+- `changes.yaml` に `platforms:`（省略 = 全プラットフォーム。未知の値はパースで弾く）
+- setup の `SYSTEM_PROMPT` を tako-cli から tako-control へ移し正本を一元化
+- 実装中に実バグを検出: `PlatformFacts` が理由文を生成時の言語で凍結していた
+  → `Note` のまま保持し描画時に解決する形へ修正（#518 に警告したのと同じ罠）
+- 関連: PR（`Refs #467, #516`）。1298 tests / fmt / clippy / クロス check 全緑
+

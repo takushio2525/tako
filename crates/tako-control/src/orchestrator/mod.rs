@@ -864,14 +864,15 @@ impl Profile {
             let p = std::path::PathBuf::from(&expanded);
             if p.is_file() {
                 if let Ok(content) = std::fs::read_to_string(&p) {
-                    return content;
+                    // ユーザーのカスタム prompt もプレースホルダを書けば注入される（#516）
+                    return crate::platform::facts::render_current(&content);
                 }
             }
         }
         // カスタム master-system.md があればそれを使う（ブロック制御はスキップ）
         if let Some(custom_path) = resolve_system_prompt_path() {
             if let Ok(content) = std::fs::read_to_string(&custom_path) {
-                return content;
+                return crate::platform::facts::render_current(&content);
             }
         }
 
@@ -937,6 +938,8 @@ impl Profile {
             "Naming rule: describe the current activity concisely in the user's language.",
         );
         let result = result.replace("{TAB_NAMING_CONVENTION}", naming_convention);
+        // プラットフォーム事実の注入（#516）。正本は 1 本に保ち、差分はここで入れる
+        let result = crate::platform::facts::render_current(&result);
 
         result.trim_end().to_string()
     }
@@ -1228,6 +1231,8 @@ impl Profile {
             "Naming rule: describe the current activity concisely in the user's language.",
         );
         let result = result.replace("{TAB_NAMING_CONVENTION}", naming_convention);
+        // プラットフォーム事実の注入（#516）
+        let result = crate::platform::facts::render_current(&result);
 
         result.trim_end().to_string()
     }

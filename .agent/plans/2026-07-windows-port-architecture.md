@@ -213,7 +213,20 @@ Windows 上の master が縮退を踏んでも自力で回避経路を選べる�
 `master-system-windows.md` のような**プラットフォーム別ファイルの複製を作らない**（T6 で機械検出）。
 複製は必ずドリフトする。
 
-### 4.2 方式: 単一正本 + 条件付き断片の注入
+### 4.2 方式: 単一正本 + 条件付き断片の注入（**実装済み・#516**）
+
+実装は `tako-control::platform::facts`。正本は `DEFAULT_SYSTEM_PROMPT` /
+`SOLO_SYSTEM_PROMPT` / `setup::SYSTEM_PROMPT` の 3 本で、いずれも
+`{{platform_notes}}` を**ちょうど 1 個**持つ（機械検査あり）。
+`PlatformFacts::for_platform(p)` は macOS 上から Windows 版も組み立てられるので、
+レンダリング結果を実機なしで検証できる。
+
+**注意**: 縮退理由は `Vec<Note>` のまま保持し、描画時に `text_in(lang)` で解決する。
+`Vec<&'static str>` で持つと生成時の言語で凍結し、言語切替に追従しない
+（実装中にテストが検出した実バグ）。同じ罠は #518 の `BackendCapability` にもある。
+
+`changes.yaml` は各 revision に任意の `platforms:`（省略 = 全プラットフォーム）。
+未知の値はパースで弾く（書き間違いが配信漏れになるため）。
 
 対象の正本:
 

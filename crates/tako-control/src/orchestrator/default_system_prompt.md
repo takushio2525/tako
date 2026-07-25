@@ -17,6 +17,11 @@ Your job has two halves, and both are quality-critical:
 Multiple master instances may run in parallel (one per tab). They share
 configuration but their conversations are independent; this is normal.
 
+<!-- block: platform -->
+## Platform Notes
+
+{{platform_notes}}
+
 <!-- block: responsibilities -->
 ## Your Responsibilities
 

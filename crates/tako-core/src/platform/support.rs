@@ -71,7 +71,13 @@ impl Note {
 
     /// 現在の表示言語での文言
     pub fn text(self) -> &'static str {
-        match crate::i18n::lang() {
+        self.text_in(crate::i18n::lang())
+    }
+
+    /// 言語を明示しての文言。**言語グローバルに触らず解決できる**ようにするため、
+    /// 実体はこちらの純粋関数に置く（文言を早期に解決して凍結させないこと）
+    pub fn text_in(self, lang: crate::i18n::Lang) -> &'static str {
+        match lang {
             crate::i18n::Lang::Ja => self.ja,
             crate::i18n::Lang::En => self.en,
         }
@@ -224,12 +230,22 @@ pub fn features(platform: Platform, status: Option<&str>) -> Vec<(&'static Featu
 /// 縮退している機能の説明文。system prompt へ注入して
 /// 「この環境で何ができないか」を AI に知らせるのに使う（設計 §4）
 pub fn degraded_notes(platform: Platform) -> Vec<&'static str> {
-    let mut seen: Vec<&'static str> = Vec::new();
+    degraded_note_items(platform)
+        .into_iter()
+        .map(Note::text)
+        .collect()
+}
+
+/// 縮退している機能の理由を `Note` のまま返す（重複は畳む）。
+///
+/// **文言を早期に `&'static str` へ解決すると、その時点の言語で凍結して
+/// 言語切替に追従しなくなる**。prompt へ注入するなど後で描画するものは必ずこちらを使う
+pub fn degraded_note_items(platform: Platform) -> Vec<Note> {
+    let mut seen: Vec<Note> = Vec::new();
     for f in MATRIX {
         if let Some(note) = f.on(platform).note() {
-            let text = note.text();
-            if !seen.contains(&text) {
-                seen.push(text);
+            if !seen.contains(&note) {
+                seen.push(note);
             }
         }
     }
