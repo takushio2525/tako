@@ -183,6 +183,64 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
+// ──────────────────────── パス表記の可搬性（#520） ────────────────────────
+//
+// git は**プラットフォームを問わず常に `/` 区切り**でパスを出し入れする。
+// 一方 Windows のファイルシステムパスは `\` 区切りで、ドライブレター（`C:`）や
+// UNC（`\\server\share`）もある。この差を放置すると、
+// `path.strip_prefix(repo)` の結果をそのまま `git log -- <path>` に渡したときに
+// `src\foo.rs` となって git が一致を見つけられない（履歴が空で返る）。
+//
+// 変換はここに集約し、呼び出し側が個別に区切り文字を触らないようにする。
+
+/// ファイルシステムのパスを git が期待する表記（区切りは常に `/`）へ直す。
+/// unix では区切りが元から `/` なので実質そのまま
+pub fn to_git_path(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    if std::path::MAIN_SEPARATOR == '/' {
+        s.into_owned()
+    } else {
+        s.replace(std::path::MAIN_SEPARATOR, "/")
+    }
+}
+
+/// リポジトリルートからの相対パスを **git 表記**で返す。
+///
+/// `strip_prefix` に失敗した場合（リポ外・別ドライブ等）は `None`。
+/// 呼び出し側はフルパスへフォールバックするのではなく、
+/// 「このファイルはリポジトリ管理外」として扱うこと
+pub fn repo_relative(repo: &Path, file: &Path) -> Option<String> {
+    let rel = file.strip_prefix(repo).ok()?;
+    let s = to_git_path(rel);
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// git が返す相対パス（常に `/` 区切り）を実ファイルパスへ直す
+pub fn from_git_path(repo: &Path, rel: &str) -> std::path::PathBuf {
+    let mut out = repo.to_path_buf();
+    for seg in rel.split('/').filter(|s| !s.is_empty() && *s != ".") {
+        out.push(seg);
+    }
+    out
+}
+
+/// `rev-parse --show-toplevel` の出力を実パスへ直す。
+///
+/// git は Windows でも `C:/Users/x/repo` のように `/` で返す。`PathBuf` は
+/// Windows でも `/` を区切りとして解釈するのでそのままでも動くが、
+/// UNC（git は `//server/share` と返す）だけは `\\server\share` に直さないと解決できない
+pub fn normalize_repo_root(raw: &str) -> std::path::PathBuf {
+    let trimmed = raw.trim();
+    if cfg!(windows) && trimmed.starts_with("//") && !trimmed.starts_with("///") {
+        return std::path::PathBuf::from(trimmed.replace('/', "\\"));
+    }
+    std::path::PathBuf::from(trimmed)
+}
+
 /// パスから git リポジトリのルートを解決する（`git rev-parse --show-toplevel`）。
 /// ファイルパスが渡された場合は親ディレクトリで解決する。リポ外なら None。
 pub fn repo_root(path: &Path) -> Option<std::path::PathBuf> {
@@ -194,9 +252,11 @@ pub fn repo_root(path: &Path) -> Option<std::path::PathBuf> {
         .output()
         .ok()?;
     if output.status.success() {
-        let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let root = String::from_utf8_lossy(&output.stdout);
+        let root = root.trim();
         if !root.is_empty() {
-            return Some(std::path::PathBuf::from(root));
+            // git は Windows でも `/` 区切りで返す。UNC だけは実パス表記へ直す
+            return Some(normalize_repo_root(root));
         }
     }
     None
@@ -1450,5 +1510,137 @@ mod tests {
         assert_eq!(detail.files.len(), 2);
         assert!(detail.files.iter().all(|f| f.kind == 'A'));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// パス表記の可搬性と改行コード耐性（#520）。
+/// **Windows 実機が無くても macOS 上で検証できる形**にしてある
+#[cfg(test)]
+mod portability_tests {
+    use super::*;
+
+    #[test]
+    fn to_git_pathは区切りを常にスラッシュにする() {
+        // unix では元から `/` なので不変
+        assert_eq!(to_git_path(Path::new("src/foo.rs")), "src/foo.rs");
+        assert_eq!(to_git_path(Path::new("a/b/c.txt")), "a/b/c.txt");
+    }
+
+    #[test]
+    fn repo_relativeはgit表記の相対パスを返す() {
+        let repo = Path::new("/tmp/repo");
+        assert_eq!(
+            repo_relative(repo, Path::new("/tmp/repo/src/foo.rs")).as_deref(),
+            Some("src/foo.rs")
+        );
+        // リポジトリ自身は相対パスにならない
+        assert_eq!(repo_relative(repo, repo), None);
+        // リポ外は None（フルパスへ勝手にフォールバックしない）
+        assert_eq!(repo_relative(repo, Path::new("/etc/hosts")), None);
+    }
+
+    #[test]
+    fn from_git_pathはスラッシュ区切りを実パスへ戻す() {
+        let repo = Path::new("/tmp/repo");
+        assert_eq!(
+            from_git_path(repo, "src/foo.rs"),
+            Path::new("/tmp/repo/src/foo.rs")
+        );
+        // 余計な区切り・カレント指定は畳む
+        assert_eq!(
+            from_git_path(repo, "./src//foo.rs"),
+            Path::new("/tmp/repo/src/foo.rs")
+        );
+        assert_eq!(from_git_path(repo, ""), repo);
+    }
+
+    #[test]
+    fn to_git_pathとfrom_git_pathは往復する() {
+        let repo = Path::new("/tmp/repo");
+        for rel in ["src/foo.rs", "a/b/c/d.txt", "README.md"] {
+            let abs = from_git_path(repo, rel);
+            assert_eq!(repo_relative(repo, &abs).as_deref(), Some(rel));
+        }
+    }
+
+    #[test]
+    fn normalize_repo_rootは末尾の改行を落とす() {
+        // git の出力は改行付き。CRLF でも壊れないこと
+        assert_eq!(normalize_repo_root("/tmp/repo\n"), Path::new("/tmp/repo"));
+        assert_eq!(normalize_repo_root("/tmp/repo\r\n"), Path::new("/tmp/repo"));
+        assert_eq!(normalize_repo_root("  /tmp/repo  "), Path::new("/tmp/repo"));
+    }
+
+    #[test]
+    fn normalize_repo_rootはドライブレター表記をそのまま扱える() {
+        // git は Windows でも `/` で返す。PathBuf は `/` を区切りとして解釈するので
+        // そのまま渡してよい（分解できることを確認する）
+        let p = normalize_repo_root("C:/Users/dev/repo\n");
+        assert!(p.to_string_lossy().starts_with("C:/") || p.to_string_lossy().starts_with("C:\\"));
+        assert!(p.to_string_lossy().ends_with("repo"));
+    }
+
+    /// CRLF のリポジトリで git 出力を受けても各パーサが壊れないこと。
+    /// `str::lines()` が `\r` を落とすことに依存しているので、退行の検出用に固定する
+    #[test]
+    fn 各パーサはcrlf出力でも壊れない() {
+        let log = "h1\u{1}s1\u{1}alice\u{1}2 days ago\u{1}件名 A\u{1}\u{1}p1\r\n\
+                   h2\u{1}s2\u{1}bob\u{1}3 days ago\u{1}件名 B\u{1}HEAD -> main\u{1}\r\n";
+        let commits = parse_log(log);
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].subject, "件名 A");
+        assert_eq!(commits[0].parents, vec!["p1".to_string()]);
+        // \r が subject / refs に紛れ込んでいないこと
+        assert!(!commits[1].refs.contains('\r'));
+        assert_eq!(commits[1].subject, "件名 B");
+
+        let branches =
+            parse_branches("*\tmain\tabc1234\t最新のコミット\r\n \tfeat/x\tdef5678\t作業中\r\n");
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].name, "main");
+        assert!(branches[0].is_current);
+        // 末尾フィールドに CR が残らないこと（subject は行末なので最も危ない）
+        assert_eq!(branches[0].subject, "最新のコミット");
+        assert_eq!(branches[1].subject, "作業中");
+        assert!(!branches[1].name.contains('\r'));
+
+        let status = parse_status(
+            "# branch.head main\r\n\
+             1 .M N... 100644 100644 100644 aaa bbb src/foo.rs\r\n\
+             ? untracked.txt\r\n",
+        );
+        assert_eq!(status.branch, "main");
+        assert!(
+            status.entries.iter().all(|f| !f.path.contains('\r')),
+            "パスに CR が残っている: {:?}",
+            status.entries
+        );
+        assert!(status.entries.iter().any(|f| f.path == "src/foo.rs"));
+        assert!(status.entries.iter().any(|f| f.path == "untracked.txt"));
+    }
+
+    /// git はパスを常に `/` で返す。CRLF が混ざってもパスが壊れないこと
+    #[test]
+    fn parse_diffはcrlfでもファイルパスを取り違えない() {
+        let raw = "diff --git a/src/foo.rs b/src/foo.rs\r\n\
+                   index 111..222 100644\r\n\
+                   --- a/src/foo.rs\r\n\
+                   +++ b/src/foo.rs\r\n\
+                   @@ -1,2 +1,2 @@\r\n\
+                   -old line\r\n\
+                   +new line\r\n";
+        let files = parse_diff(raw);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/foo.rs");
+        assert!(!files[0].path.contains('\r'));
+        let lines: Vec<&str> = files[0]
+            .hunks
+            .iter()
+            .flat_map(|h| h.lines.iter().map(|l| l.content.as_str()))
+            .collect();
+        assert!(
+            lines.iter().all(|l| !l.contains('\r')),
+            "diff 行に CR が残っている: {lines:?}"
+        );
     }
 }
