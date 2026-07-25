@@ -151,6 +151,7 @@ pub fn git_diff_staged(n: usize) -> String {
         format!(" diff: staged ({n} files)")
     )
 }
+#[allow(dead_code)]
 pub fn git_diff_commit(n: usize) -> String {
     tr!(
         format!(" diff: 選択コミット ({n} ファイル)"),

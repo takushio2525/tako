@@ -1032,6 +1032,22 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_git_show",
+            "description": "特定コミットの詳細情報を取得する（#495）。フルハッシュ・author・committer・\
+                日時・メッセージ全文・親コミット・変更ファイル一覧（パス・変更種別・増減行数）を返す。\
+                file を指定するとそのファイルの diff も含まれる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン"),
+                    "hash": { "type": "string", "description": "コミットハッシュ（短縮可）" },
+                    "file": { "type": "string", "description": "diff を取得するファイルパス（省略時はファイル一覧のみ）" },
+                },
+                "required": ["hash"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_git_commit",
             "description": "git commit を実行する。対象ペインの cwd のリポジトリでコミットする。\
                 コミットメッセージは必須。all=true で tracked ファイルを自動ステージ（git commit -a 相当）。",
@@ -3189,6 +3205,11 @@ fn build_request(
             pane: Some(target_pane(args, caller)?),
             target: str_arg(args, "target")?,
         },
+        "tako_git_show" => Request::GitShow {
+            pane: Some(target_pane(args, caller)?),
+            hash: str_arg(args, "hash")?.ok_or("hash を指定する")?,
+            file: str_arg(args, "file")?,
+        },
         "tako_git_commit" => Request::GitCommit {
             pane: Some(target_pane(args, caller)?),
             message: str_arg(args, "message")?.ok_or("message を指定する")?,
@@ -4391,7 +4412,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 116);
+        assert_eq!(tools.len(), 117);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

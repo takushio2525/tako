@@ -818,6 +818,8 @@ struct TakoApp {
     sidebar_git: Option<SidebarGitSummary>,
     /// git パネルで選択中のコミット（diff 表示用）
     git_selected_commit: Option<String>,
+    /// コミット詳細ビューで選択中のファイル（diff 表示用。#495）
+    git_selected_file: Option<String>,
     /// git パネルのアコーディオン折りたたみ
     git_collapsed: GitCollapsed,
     /// git コミットメッセージ入力欄の内容（#472）
@@ -1134,6 +1136,8 @@ struct GitPanelData {
     /// ステージ済み分の diff（コミット選択時は空。#487 で unstaged と分離）
     diff_staged: Vec<tako_core::DiffFile>,
     graph: tako_core::GraphLayout,
+    /// 選択中コミットの詳細情報（#495）
+    commit_detail: Option<tako_core::CommitDetail>,
 }
 
 /// サイドバー用の軽量 git サマリ（#217。ブランチチップ + 変更フッター）
@@ -1936,6 +1940,7 @@ impl TakoApp {
             git_data: None,
             sidebar_git: None,
             git_selected_commit: None,
+            git_selected_file: None,
             git_collapsed: GitCollapsed::default(),
             git_commit_message: String::new(),
             git_commit_cursor: 0,
@@ -14752,15 +14757,18 @@ fn fetch_git_data(cwd: &std::path::Path, selected_commit: Option<&str>) -> Optio
     let branches = tako_core::git::list_branches(&repo);
     let status = tako_core::git::status(&repo);
     // #487: 未ステージとステージ済みを混ぜず別々に持つ（どちらの差分か UI で区別するため）
-    let (diff_files, diff_staged) = if let Some(hash) = selected_commit {
+    let (diff_files, diff_staged, commit_detail) = if let Some(hash) = selected_commit {
+        let detail = tako_core::git::show_commit(&repo, hash).ok();
         (
             tako_core::git::diff(&repo, &tako_core::DiffTarget::Commit(hash.to_string())),
             Vec::new(),
+            detail,
         )
     } else {
         (
             tako_core::git::diff(&repo, &tako_core::DiffTarget::Unstaged),
             tako_core::git::diff(&repo, &tako_core::DiffTarget::Staged),
+            None,
         )
     };
     Some(GitPanelData {
@@ -14773,6 +14781,7 @@ fn fetch_git_data(cwd: &std::path::Path, selected_commit: Option<&str>) -> Optio
         diff_files,
         diff_staged,
         graph,
+        commit_detail,
     })
 }
 

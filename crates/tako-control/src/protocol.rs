@@ -441,6 +441,14 @@ pub enum Request {
         pane: Option<u64>,
         target: Option<String>,
     },
+    /// git show: コミットの詳細情報（メタ + 変更ファイル一覧 + ファイル単位 diff）を取得する（#495）。
+    /// `hash` でコミットを指定し、`file` があればそのファイルの diff も返す
+    GitShow {
+        pane: Option<u64>,
+        hash: String,
+        /// 特定ファイルの diff を取得する場合にパスを指定
+        file: Option<String>,
+    },
     /// git commit（#472）。`pane` の cwd のリポジトリでコミットする。
     /// `all` = true で tracked ファイルを自動ステージ（`-a`）
     GitCommit {
