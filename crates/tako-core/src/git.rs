@@ -67,15 +67,30 @@ pub struct GitStatusEntry {
     pub worktree: char,
 }
 
+/// コンフリクト（unmerged）行のバッジ文字（#494）。
+/// 「ステージ済み」でも単純な「変更」でもない第 3 の状態なので専用の記号を使う。
+pub const CONFLICT_BADGE: char = '!';
+
 impl GitStatusEntry {
-    /// index にステージ済みの変更があるか（#487。untracked '?' は未ステージ扱い）
-    pub fn is_staged(&self) -> bool {
-        self.index != '.' && self.index != '?' && self.index != ' '
+    /// マージ未解決（porcelain v2 の `u` レコード）か（#494）。
+    /// コンフリクトは解決してステージするまでコミットできないので、
+    /// ステージ済みにも通常の変更にも分類しない
+    pub fn is_conflicted(&self) -> bool {
+        self.index == 'u' || self.worktree == 'u'
     }
 
-    /// worktree 側に未ステージの変更があるか（#487。untracked も未ステージ側に出す）
+    /// index にステージ済みの変更があるか（#487。untracked '?' は未ステージ扱い、
+    /// #494: コンフリクトは「解決前」なのでステージ済みに含めない）
+    pub fn is_staged(&self) -> bool {
+        !self.is_conflicted() && self.index != '.' && self.index != '?' && self.index != ' '
+    }
+
+    /// worktree 側に未ステージの変更があるか（#487。untracked も未ステージ側に出す。
+    /// #494: コンフリクトも「これから手を入れる側」として未ステージへ出す）
     pub fn is_unstaged(&self) -> bool {
-        self.index == '?' || (self.worktree != '.' && self.worktree != '?' && self.worktree != ' ')
+        self.is_conflicted()
+            || self.index == '?'
+            || (self.worktree != '.' && self.worktree != '?' && self.worktree != ' ')
     }
 
     /// 未追跡ファイルか
@@ -85,14 +100,20 @@ impl GitStatusEntry {
 
     /// ステージ済み側に表示するバッジ文字（#487）
     pub fn staged_badge(&self) -> char {
+        if self.is_conflicted() {
+            return CONFLICT_BADGE;
+        }
         match self.index {
             '.' | ' ' => ' ',
             c => c,
         }
     }
 
-    /// 未ステージ側に表示するバッジ文字（#487）
+    /// 未ステージ側に表示するバッジ文字（#487 / #494）
     pub fn unstaged_badge(&self) -> char {
+        if self.is_conflicted() {
+            return CONFLICT_BADGE;
+        }
         if self.index == '?' {
             return 'U';
         }
@@ -323,6 +344,23 @@ fn parse_status(raw: &str) -> GitStatus {
                     index,
                     worktree,
                 });
+            }
+        } else if line.starts_with("u ") {
+            // #494: マージ未解決（unmerged）。
+            // `u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>` の 11 フィールド。
+            // これを無視していたため、コンフリクト中のファイルが git パネルから
+            // まるごと消え「変更はありません」と表示されていた
+            if line.len() > 4 {
+                let path = line.splitn(11, ' ').last().unwrap_or("").to_string();
+                if !path.is_empty() {
+                    result.entries.push(GitStatusEntry {
+                        path,
+                        // XY はコンフリクトの種類（UU / AA / DU 等）だが、
+                        // UI では一律「未解決」として扱えば足りる
+                        index: 'u',
+                        worktree: 'u',
+                    });
+                }
             }
         } else if let Some(rest) = line.strip_prefix("? ") {
             let path = rest.to_string();
@@ -826,6 +864,27 @@ mod tests {
         assert_eq!(status.entries[0].index, '.');
         assert_eq!(status.entries[0].worktree, 'M');
         assert_eq!(status.entries[1].index, '?');
+    }
+
+    /// #494: マージ未解決（porcelain v2 の `u` レコード）を拾えること。
+    /// 拾えていなかったため、コンフリクト中は git パネルが「変更はありません」になっていた
+    #[test]
+    fn parse_statusはマージ未解決を拾う() {
+        let raw = "# branch.head main\n\
+                   u UU N... 100644 100644 100644 100644 aaa bbb ccc f.txt\n\
+                   1 .M N... 100644 100644 100644 abc def other.rs\n";
+        let status = parse_status(raw);
+        assert_eq!(status.entries.len(), 2);
+        let conflict = &status.entries[0];
+        assert_eq!(conflict.path, "f.txt");
+        assert!(conflict.is_conflicted());
+        // 解決前なのでステージ済みには出さず、未ステージ側にだけ出す
+        assert!(!conflict.is_staged());
+        assert!(conflict.is_unstaged());
+        assert_eq!(conflict.unstaged_badge(), CONFLICT_BADGE);
+        // 通常の変更は従来どおり
+        assert!(!status.entries[1].is_conflicted());
+        assert!(status.entries[1].is_unstaged());
     }
 
     /// #494: 1 行入力欄向けの正規化。改行・タブ・制御文字は空白へ潰す

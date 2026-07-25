@@ -98,9 +98,15 @@ struct GitScrollBody {
     rows: Vec<gpui::AnyElement>,
 }
 
+/// スクロール領域の行に必須のスタイルを付ける（#494）。
+/// `GitScrollBody::push` の実体。テストから直接検証できるよう切り出してある。
+pub(crate) fn git_scroll_row<E: Styled>(el: E) -> E {
+    el.flex_shrink_0()
+}
+
 impl GitScrollBody {
     fn push(&mut self, el: impl Styled + IntoElement) {
-        self.rows.push(el.flex_shrink_0().into_any_element());
+        self.rows.push(git_scroll_row(el).into_any_element());
     }
 
     /// スクロール領域そのものを組み立てる。ヘッダ（固定部）の残り高さを全部使う
@@ -2248,11 +2254,11 @@ impl TakoApp {
         } else {
             entry.unstaged_badge()
         };
-        // バッジ色: 追加/未追跡 = 緑、変更 = 黄、削除 = 赤、リネーム = accent
+        // バッジ色: 追加/未追跡 = 緑、変更 = 黄、削除・未解決 = 赤、リネーム = accent
         let color = match badge {
             'A' | 'U' => theme.green,
             'M' => theme.yellow,
-            'D' => theme.red,
+            'D' | tako_core::CONFLICT_BADGE => theme.red,
             'R' | 'C' => theme.accent,
             _ => fg,
         };
@@ -3830,5 +3836,80 @@ impl TakoApp {
                         ),
                 ),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #494 の再発防止（構造不変条件）。
+    /// git ビューのスクロール領域に積む行は **必ず flex-shrink: 0** でなければならない。
+    /// 付いていないと、コンテンツ総高さがパネル高さを超えた瞬間に taffy が行を圧縮し、
+    /// 行同士が重なって描画される（実機で 3 回再発した崩れの本体）。
+    #[test]
+    fn スクロール行は縮まない設定になる() {
+        let mut row = git_scroll_row(div());
+        assert_eq!(
+            row.style().flex_shrink,
+            Some(0.0),
+            "スクロール領域の行に flex_shrink_0 が付いていない"
+        );
+    }
+
+    /// #494: バイトオフセットを文字境界へ丸める（丸めないと split_at / insert_str が panic する）
+    #[test]
+    fn 文字境界への丸め() {
+        let s = "あa😀";
+        // 「あ」= 0..3、「a」= 3..4、「😀」= 4..8
+        assert_eq!(floor_char_boundary(s, 0), 0);
+        assert_eq!(floor_char_boundary(s, 1), 0);
+        assert_eq!(floor_char_boundary(s, 2), 0);
+        assert_eq!(floor_char_boundary(s, 3), 3);
+        assert_eq!(floor_char_boundary(s, 5), 4);
+        assert_eq!(floor_char_boundary(s, 7), 4);
+        // 範囲外は末尾へクランプ
+        assert_eq!(floor_char_boundary(s, 99), s.len());
+        // 丸めた位置で split しても panic しない
+        for i in 0..=s.len() + 5 {
+            let _ = s.split_at(floor_char_boundary(s, i));
+        }
+    }
+
+    /// #494: 長いメッセージでもキャレットを画面内に残すための切り詰め
+    #[test]
+    fn 前後の切り詰めは文字単位() {
+        assert_eq!(tail_chars("あいうえお", 2), "えお");
+        assert_eq!(tail_chars("あい", 5), "あい");
+        assert_eq!(head_chars("あいうえお", 2), "あい");
+        assert_eq!(head_chars("あい", 5), "あい");
+        // サロゲートペア相当でも壊れない
+        assert_eq!(tail_chars("a😀b", 2), "😀b");
+        assert_eq!(head_chars("a😀b", 2), "a😀");
+    }
+
+    /// #494: git のエラーは数十行になり得る。カードがパネルを覆わないよう要約する
+    #[test]
+    fn フィードバックは行数と文字数で頭打ちにする() {
+        let many = (1..=20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = git_feedback_text(&many);
+        assert_eq!(out.lines().count(), GIT_FEEDBACK_MAX_LINES);
+        assert!(out.ends_with('…'), "省略記号が付いていない: {out:?}");
+        // 空行は落とす
+        assert_eq!(git_feedback_text("\n\n  a  \n\n"), "  a");
+        // 1 行が極端に長い場合も文字数で切る
+        let long = "あ".repeat(GIT_FEEDBACK_MAX_CHARS + 100);
+        let out = git_feedback_text(&long);
+        assert_eq!(out.chars().count(), GIT_FEEDBACK_MAX_CHARS + 1);
+    }
+
+    /// #494: 成功出力の要約は「最後の意味のある行」
+    #[test]
+    fn コマンド出力の要約() {
+        assert_eq!(git_result_summary("a\nb\n\n", "fallback"), "b".to_string());
+        assert_eq!(git_result_summary("   \n", "fallback"), "fallback");
     }
 }

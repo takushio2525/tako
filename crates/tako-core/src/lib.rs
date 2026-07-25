@@ -41,7 +41,8 @@ pub mod workspace;
 pub use byte_lru::ByteLru;
 pub use git::{
     CommitBlock, DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffTarget, GitBranch, GitCommit,
-    GitStatus, GitStatusEntry, GraphLayout, GraphLine, GraphRow, COMMIT_MESSAGE_MAX, GRAPH_PALETTE,
+    GitStatus, GitStatusEntry, GraphLayout, GraphLine, GraphRow, COMMIT_MESSAGE_MAX,
+    CONFLICT_BADGE, GRAPH_PALETTE,
 };
 pub use header_layout::{truncate_path_middle, HeaderVisibility, PreviewHeaderVisibility};
 pub use links::{detect_links, detect_links_with_cwd, link_at, DetectedLink, LinkKind};
