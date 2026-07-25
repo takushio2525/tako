@@ -119,6 +119,31 @@ fn in_process_pane(host: &dyn ControlHost, pane: Option<u64>) -> Option<PaneId> 
     host.session(target).map(|_| target)
 }
 
+// --- セッションヒント直指定の到達（pane 解決を伴わない経路） -----------------
+
+/// バックエンドセッションが生きているか。
+///
+/// **器の有無を問う質問**なので、到達手段（`DetachedAccess`）が無い backend でも
+/// 答えられる（`NullBackend` は常に false = 器が無いのだから当然）。
+/// 不正なセッション名（#428 のターゲット式）は false へ倒す
+pub fn session_alive(hint: &str) -> bool {
+    match SessionRef::new(hint) {
+        Ok(s) => backend().exists(&s),
+        Err(_) => false,
+    }
+}
+
+/// セッションヒントから到達手段を引く。
+///
+/// `None` は「そのセッションへは届かない」= 名前が不正か、backend に
+/// アウトオブプロセス到達手段が無いか、のいずれか。
+/// 理由まで要るなら [`PaneReach::resolve`] を使う
+pub fn detached_session(hint: &str) -> Option<(SessionRef, &'static dyn DetachedAccess)> {
+    let session = SessionRef::new(hint).ok()?;
+    let access = backend().detached()?;
+    Some((session, access))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
