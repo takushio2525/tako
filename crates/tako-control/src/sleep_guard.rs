@@ -661,10 +661,10 @@ pub fn check_disablesleep_residual() {
 pub fn open_battery_settings() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open")
-            .arg("x-apple.systempreferences:com.apple.preference.battery")
-            .spawn()
-            .map_err(|e| format!("System Settings を開けません: {e}"))?;
+        crate::platform::os_integration::open_url(
+            "x-apple.systempreferences:com.apple.preference.battery",
+        )
+        .map_err(|e| format!("System Settings を開けません: {e}"))?;
         Ok(())
     }
     #[cfg(not(target_os = "macos"))]

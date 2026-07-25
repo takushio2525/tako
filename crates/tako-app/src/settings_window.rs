@@ -2632,10 +2632,7 @@ impl SettingsWindow {
                         BtnKind::Normal,
                         |_, _, _| {
                             if let Some(path) = settings::settings_path() {
-                                let _ = std::process::Command::new("open")
-                                    .arg("-R")
-                                    .arg(&path)
-                                    .spawn();
+                                let _ = tako_control::platform::os_integration::reveal(&path);
                             }
                         },
                     ))
@@ -2645,10 +2642,9 @@ impl SettingsWindow {
                         BtnKind::Normal,
                         |_, _, _| {
                             if let Some(path) = settings::settings_path() {
-                                let _ = std::process::Command::new("open")
-                                    .arg("-t")
-                                    .arg(&path)
-                                    .spawn();
+                                let _ = tako_control::platform::os_integration::open_in_text_editor(
+                                    &path,
+                                );
                             }
                         },
                     )),

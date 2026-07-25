@@ -279,3 +279,83 @@ mod prompt_single_source {
         }
     }
 }
+
+/// **#522 受け入れ条件 2**: OS シェル連携（`open` / `osascript` / `cmd /C start` /
+/// `xdg-open`）の直接呼び出しが、抽象境界 B8 の外に残っていないこと。
+///
+/// 呼び出し側に `#[cfg(target_os = …)]` を足して塞ぐ変更を構造的に防ぐための番犬。
+/// 新しい直呼びが増えたらここで落ちる（設計原則 1）。
+#[test]
+fn os連携の直呼びが境界の外に残っていない() {
+    // 境界そのもの、および「B8 ではない別の境界の内側」だけを許す。
+    // 許可には必ず理由を書く（黙って穴を開けない）
+    const ALLOWED: &[(&str, &str)] = &[
+        (
+            "crates/tako-control/src/platform/os_integration.rs",
+            "境界 B8 の実装本体",
+        ),
+        (
+            "crates/tako-control/src/sleep_guard.rs",
+            "B9（スリープ防止）の権限昇格。OS シェルに何かを開かせる操作ではなく、\
+             汎用の昇格 API を B8 に置くと危険なため境界 B9 の内側に留める",
+        ),
+    ];
+    // 実際にプロセスを起こす形だけを対象にする（コメント・ドキュメント中の言及は無視）
+    const PATTERNS: &[&str] = &[
+        "Command::new(\"open\")",
+        "Command::new(\"osascript\")",
+        "Command::new(\"xdg-open\")",
+        "\"/C\", \"start\"",
+    ];
+
+    let root = repo_root();
+    let mut offenders = Vec::new();
+    for crate_dir in ["tako-core", "tako-control", "tako-app", "tako-cli"] {
+        let src = root.join("crates").join(crate_dir).join("src");
+        collect_os_shell_calls(&src, &root, PATTERNS, ALLOWED, &mut offenders);
+    }
+    assert!(
+        offenders.is_empty(),
+        "OS シェル連携の直呼びが境界の外にある:\n  {}\n\
+         → tako_control::platform::os_integration へ寄せてください（#522 / 設計 §2 の B8）",
+        offenders.join("\n  ")
+    );
+}
+
+fn collect_os_shell_calls(
+    dir: &Path,
+    root: &Path,
+    patterns: &[&str],
+    allowed: &[(&str, &str)],
+    out: &mut Vec<String>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_os_shell_calls(&path, root, patterns, allowed, out);
+            continue;
+        }
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        if allowed.iter().any(|(p, _)| rel == *p) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (idx, line) in text.lines().enumerate() {
+            if patterns.iter().any(|p| line.contains(p)) {
+                out.push(format!("{rel}:{}", idx + 1));
+            }
+        }
+    }
+}

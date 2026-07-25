@@ -566,15 +566,7 @@ fn open_preview(url: &str) {
     if std::env::var_os("TAKO_SELF_TEST").is_some() {
         return;
     }
-    #[cfg(target_os = "macos")]
-    let result = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(target_os = "windows")]
-    let result = std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn();
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let result = std::process::Command::new("xdg-open").arg(url).spawn();
-    if let Err(e) = result {
+    if let Err(e) = tako_control::platform::os_integration::open_url(url) {
         eprintln!("warning: ブラウザを開けない: {e}");
     }
 }
@@ -6471,7 +6463,7 @@ impl TakoApp {
         };
         match &link.target {
             tako_core::PdfLinkTarget::Url { url } => {
-                let _ = std::process::Command::new("open").arg(url).spawn();
+                let _ = tako_control::platform::os_integration::open_url(url);
             }
             tako_core::PdfLinkTarget::Page { page } => {
                 if let Err(e) = <TakoApp as PreviewHost>::update_preview_view(
@@ -8297,7 +8289,7 @@ impl TakoApp {
     ) {
         match kind {
             tako_core::LinkKind::Url => {
-                let _ = std::process::Command::new("open").arg(target).spawn();
+                let _ = tako_control::platform::os_integration::open_url(target);
             }
             tako_core::LinkKind::Path => {
                 let path = std::path::Path::new(target);
@@ -12985,7 +12977,7 @@ impl PreviewHost for TakoApp {
             .ok_or_else(|| format!("リンクインデックス範囲外: {index}"))?;
         match &link.target {
             tako_core::PdfLinkTarget::Url { url } => {
-                let _ = std::process::Command::new("open").arg(url).spawn();
+                let _ = tako_control::platform::os_integration::open_url(url);
                 Ok(serde_json::json!({
                     "pane": pane.as_u64(),
                     "action": "opened_url",
@@ -14053,13 +14045,12 @@ impl TakoApp {
                             }
                             "reveal" => {
                                 if let Some(p) = &preview_path {
-                                    let _ =
-                                        std::process::Command::new("open").arg("-R").arg(p).spawn();
+                                    let _ = tako_control::platform::os_integration::reveal(p);
                                 }
                             }
                             "open-default" => {
                                 if let Some(p) = &preview_path {
-                                    let _ = std::process::Command::new("open").arg(p).spawn();
+                                    let _ = tako_control::platform::os_integration::open_default(p);
                                 }
                             }
                             "copy-cwd" => {
@@ -14071,7 +14062,7 @@ impl TakoApp {
                             }
                             "reveal-cwd" => {
                                 if let Some(c) = &cwd {
-                                    let _ = std::process::Command::new("open").arg(c).spawn();
+                                    let _ = tako_control::platform::os_integration::open_default(c);
                                 }
                             }
                             "split-right" => {

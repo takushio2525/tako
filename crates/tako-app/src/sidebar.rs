@@ -1431,32 +1431,10 @@ impl TakoApp {
     }
 }
 
-/// macOS のアプリ選択ダイアログ（AppleScript 経由）でアプリを選択し、
-/// 指定ファイルをそのアプリで開く
-#[cfg(target_os = "macos")]
+/// OS のアプリ選択ダイアログでアプリを選び、指定ファイルをそのアプリで開く。
+/// プラットフォーム差は境界 B8（`platform::os_integration`）の内側にある
 fn pick_app_and_open(path: &std::path::Path) -> Result<(), String> {
-    let output = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg("POSIX path of (choose application as alias)")
-        .output()
-        .map_err(|e| format!("osascript 起動に失敗: {e}"))?;
-    if !output.status.success() {
-        return Err("アプリ選択がキャンセルされた".into());
-    }
-    let app_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if app_path.is_empty() {
-        return Err("アプリパスが空".into());
-    }
-    std::process::Command::new("open")
-        .arg("-a")
-        .arg(&app_path)
-        .arg(path)
-        .spawn()
-        .map_err(|e| format!("アプリで開けない: {e}"))?;
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn pick_app_and_open(_path: &std::path::Path) -> Result<(), String> {
-    Err("アプリ選択は macOS のみ対応".into())
+    use tako_control::platform::os_integration as os;
+    let app = os::pick_application()?;
+    os::open_with(&app.to_string_lossy(), path)
 }
