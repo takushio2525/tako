@@ -20,7 +20,8 @@ use tako_control::setup::{
 // 推奨ルールのセクションと既定指示ファイルは tako_control::setup が正
 // （項目レベル比較 Issue #322 と共有。二重埋め込みを作らない）
 
-const SYSTEM_PROMPT: &str = include_str!("../../../resources/setup/system-prompt.md");
+// 正本は tako-control 側に一元化（#516）
+use tako_control::setup::SYSTEM_PROMPT;
 const CONFIG_DEFAULT: &str = include_str!("../../../resources/setup/templates/config-default.yaml");
 
 pub fn load_answers(input: Option<&str>) -> Result<SetupAnswers, String> {
@@ -2037,7 +2038,12 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
         "AGENTS.md",
         "GEMINI.md",
     ] {
-        write_resource(&dir, filename, SYSTEM_PROMPT)?;
+        // プラットフォーム事実の注入（#516）。正本は 1 本で、差分は書き出し時に入れる
+        write_resource(
+            &dir,
+            filename,
+            &tako_control::platform::facts::render_current(SYSTEM_PROMPT),
+        )?;
     }
     sync_pending_changes_file(&dir, &pending, config.setup.applied_revision)?;
 

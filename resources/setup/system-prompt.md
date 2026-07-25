@@ -89,6 +89,11 @@ worker ポリシーが設定されているため、ユーザーが変更を希�
 CLI 検出、認証確認、プラン確認、MCP 設定、推奨 profile 生成は完了している。
 以下から開始する。
 
+
+## 実行環境
+
+{{platform_notes}}
+
 ## Step 1: グローバル指示ファイル
 
 `setup-context.yaml` の `instruction_file` と `instruction_coverage` を Read する。

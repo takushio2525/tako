@@ -142,3 +142,140 @@ fn collect_platform_suffixed(dir: &Path, out: &mut Vec<String>) {
         }
     }
 }
+
+/// **受け入れ条件 4**: `changes.yaml` の `platforms:` が効くこと。
+/// setup 配布物を OS ごとに複製しないための仕組み（設計 §4）
+mod setup_changes_platforms {
+    use tako_control::setup;
+    use tako_core::platform::support::Platform;
+
+    /// 省略時は全プラットフォームが対象（既存エントリの後方互換）
+    #[test]
+    fn platforms省略は全プラットフォーム対象() {
+        let mac = setup::changes_for(Platform::MacOs).expect("パースできること");
+        let win = setup::changes_for(Platform::Windows).expect("パースできること");
+        assert!(!mac.is_empty(), "changelog が空");
+        // 現行の changes.yaml は platforms 未指定のみ = 両プラットフォームで同数
+        assert_eq!(
+            mac.len(),
+            win.len(),
+            "platforms 未指定のエントリは両プラットフォームに配信されること"
+        );
+        assert!(mac.iter().all(|c| c.platforms.is_none()));
+    }
+
+    /// 指定されたプラットフォームだけに配信されること
+    #[test]
+    fn platforms指定は対象プラットフォームだけに配信される() {
+        let win_only = setup::SetupChange {
+            revision: 999,
+            version: "0.0.0".into(),
+            date: "2026-07-26".into(),
+            kind: setup::ChangeKind::Auto,
+            title: "Windows 限定の変更".into(),
+            description: "テスト用".into(),
+            platforms: Some(vec!["windows".into()]),
+        };
+        assert!(win_only.applies_to(Platform::Windows));
+        assert!(!win_only.applies_to(Platform::MacOs));
+
+        let both = setup::SetupChange {
+            platforms: Some(vec!["macos".into(), "windows".into()]),
+            ..win_only.clone()
+        };
+        assert!(both.applies_to(Platform::MacOs) && both.applies_to(Platform::Windows));
+
+        let all = setup::SetupChange {
+            platforms: None,
+            ..win_only
+        };
+        assert!(all.applies_to(Platform::MacOs) && all.applies_to(Platform::Windows));
+    }
+}
+
+/// **受け入れ条件 1**: 実際の正本 3 本が、同じファイルから両プラットフォーム向けに
+/// レンダリングでき、差分がプレースホルダ部分だけであること
+mod prompt_single_source {
+    use tako_control::platform::facts::{render_in, PlatformFacts, PLACEHOLDER};
+    use tako_core::i18n::Lang;
+    use tako_core::platform::support::Platform;
+
+    fn sources() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("master", tako_control::orchestrator::DEFAULT_SYSTEM_PROMPT),
+            ("solo", tako_control::orchestrator::SOLO_SYSTEM_PROMPT),
+            ("setup", tako_control::setup::SYSTEM_PROMPT),
+        ]
+    }
+
+    /// 正本にプレースホルダが**ちょうど 1 個**あること（複数種類を増やさない）
+    #[test]
+    fn 正本のプレースホルダは1種類1個だけ() {
+        for (name, src) in sources() {
+            assert_eq!(
+                src.matches(PLACEHOLDER).count(),
+                1,
+                "{name} の正本に {PLACEHOLDER} がちょうど 1 個ない"
+            );
+            // 別種のプレースホルダを勝手に増やしていないこと
+            let others: Vec<&str> = src
+                .match_indices("{{")
+                .map(|(i, _)| &src[i..src[i..].find("}}").map(|e| i + e + 2).unwrap_or(i + 2)])
+                .filter(|m| *m != PLACEHOLDER)
+                .collect();
+            assert!(
+                others.is_empty(),
+                "{name} の正本に未知のプレースホルダがある: {others:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 正本から両プラットフォームを描き分けられ差分は注記部分だけ() {
+        for (name, src) in sources() {
+            let (prefix, suffix) = src.split_once(PLACEHOLDER).unwrap();
+            for lang in [Lang::Ja, Lang::En] {
+                let mac = render_in(src, &PlatformFacts::for_platform(Platform::MacOs), lang);
+                let win = render_in(src, &PlatformFacts::for_platform(Platform::Windows), lang);
+                assert_ne!(mac, win, "{name}: プラットフォームで内容が変わらない");
+                for (label, out) in [("macos", &mac), ("windows", &win)] {
+                    assert!(
+                        !out.contains(PLACEHOLDER),
+                        "{name}/{label}: プレースホルダが残っている"
+                    );
+                    assert!(
+                        out.starts_with(prefix),
+                        "{name}/{label}: 正本の前半が変わっている"
+                    );
+                    assert!(
+                        out.ends_with(suffix),
+                        "{name}/{label}: 正本の後半が変わっている"
+                    );
+                }
+                assert!(win.contains("Windows"), "{name}: Windows 版に OS 名が無い");
+                assert!(mac.contains("macOS"), "{name}: macOS 版に OS 名が無い");
+            }
+        }
+    }
+
+    /// 縮退の説明はマトリクス由来なので、Windows 版には理由が列挙される
+    #[test]
+    fn windows版には縮退理由がマトリクスから入る() {
+        let notes = tako_core::platform::support::degraded_note_items(Platform::Windows);
+        assert!(!notes.is_empty());
+        for (name, src) in sources() {
+            let win = render_in(
+                src,
+                &PlatformFacts::for_platform(Platform::Windows),
+                Lang::Ja,
+            );
+            for note in &notes {
+                assert!(
+                    win.contains(note.ja()),
+                    "{name}: 縮退理由 {:?} が prompt に入っていない",
+                    note.ja()
+                );
+            }
+        }
+    }
+}

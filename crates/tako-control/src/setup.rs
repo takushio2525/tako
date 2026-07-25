@@ -13,8 +13,14 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use tako_core::platform::support::Platform;
+
 /// バイナリ埋め込みの setup changelog
 pub const CHANGES_YAML: &str = include_str!("../../../resources/setup/changes.yaml");
+
+/// setup アシスタントの system prompt 正本（バイナリ同梱）。
+/// **プラットフォーム別に複製しない**。差分は `platform::facts::render_current` で注入する（#516）
+pub const SYSTEM_PROMPT: &str = include_str!("../../../resources/setup/system-prompt.md");
 
 /// setup が採用した値の出所。CLI 表示のラベルを共通化する（Issue #262）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -631,6 +637,21 @@ pub struct SetupChange {
     pub title: String,
     /// setup エージェント向けの詳細（何が変わったか・確認/適用手順）
     pub description: String,
+    /// この変更が対象とするプラットフォーム（省略時は全プラットフォーム）。
+    /// **正本を OS ごとに複製しないための仕組み**（設計 §4）。
+    /// 値は "macos" / "windows"。未知の値はパースで弾く
+    #[serde(default)]
+    pub platforms: Option<Vec<String>>,
+}
+
+impl SetupChange {
+    /// 指定プラットフォームが対象か（`platforms` 省略 = 全プラットフォーム対象）
+    pub fn applies_to(&self, platform: Platform) -> bool {
+        match &self.platforms {
+            None => true,
+            Some(list) => list.iter().any(|p| Platform::parse(p) == Some(platform)),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -641,12 +662,34 @@ struct ChangesFile {
 fn parse_changes(yaml: &str) -> Result<Vec<SetupChange>, String> {
     let file: ChangesFile =
         serde_yaml::from_str(yaml).map_err(|e| format!("changes.yaml のパースに失敗: {e}"))?;
+    // 未知のプラットフォーム名は黙って無視せず弾く（書き間違いが配信漏れになるため）
+    for c in &file.changes {
+        if let Some(list) = &c.platforms {
+            for p in list {
+                if Platform::parse(p).is_none() {
+                    return Err(format!(
+                        "changes.yaml revision {} の platforms に未知の値: {p}（macos / windows）",
+                        c.revision
+                    ));
+                }
+            }
+        }
+    }
     Ok(file.changes)
 }
 
 /// 埋め込み changelog の全エントリ（revision 昇順はファイル記載順に依存。テストで検証）
 pub fn all_changes() -> Result<Vec<SetupChange>, String> {
-    parse_changes(CHANGES_YAML)
+    changes_for(Platform::current())
+}
+
+/// 指定プラットフォーム向けの changelog（`platforms:` で絞り込む）。
+/// **macOS 上から Windows 向けの配信内容を検証できる**ようにするため引数で受ける
+pub fn changes_for(platform: Platform) -> Result<Vec<SetupChange>, String> {
+    Ok(parse_changes(CHANGES_YAML)?
+        .into_iter()
+        .filter(|c| c.applies_to(platform))
+        .collect())
 }
 
 /// 現在の setup リビジョン（changelog の最大 revision）
