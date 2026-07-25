@@ -30,6 +30,7 @@ pub mod ipc;
 pub mod layout;
 pub mod mcp;
 pub mod orchestrator;
+pub mod platform;
 pub mod protocol;
 pub mod remote;
 pub mod remote_auth;

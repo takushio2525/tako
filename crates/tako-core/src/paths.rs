@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 /// tako のデータディレクトリ。
 /// macOS: `~/Library/Application Support/tako`、その他 unix: `$XDG_DATA_HOME/tako`
-/// （無ければ `~/.local/share/tako`）。Windows は Phase 6 で対応する。
+/// （無ければ `~/.local/share/tako`）、Windows: `%APPDATA%\tako`
+/// （無ければ `%USERPROFILE%\AppData\Roaming\tako`）。
 /// `TAKO_DATA_DIR` で上書き可能（隔離検証用。#177 / #112: 本番の layout.json /
 /// settings.json / token / persist.log に一切触れない起動を 1 変数で作れる）
 pub fn data_dir() -> Option<PathBuf> {
@@ -35,8 +36,18 @@ fn default_data_dir() -> Option<PathBuf> {
             })
             .map(|d| d.join("tako"))
     }
+    // Windows のローミングプロファイル。%APPDATA% は通常セットされているが、
+    // サービス起動など環境が痩せている場合に備えて %USERPROFILE% から組み立てる経路も持つ
     #[cfg(windows)]
     {
-        None
+        std::env::var_os("APPDATA")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .filter(|h| !h.is_empty())
+                    .map(|h| PathBuf::from(h).join("AppData").join("Roaming"))
+            })
+            .map(|d| d.join("tako"))
     }
 }

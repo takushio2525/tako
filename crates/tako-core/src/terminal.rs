@@ -62,60 +62,10 @@ fn default_home_dir() -> Option<PathBuf> {
     home_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
 }
 
-/// 既定シェル。unix では alacritty に `None` を渡さず**ここで明示解決する**。
-///
-/// alacritty の既定（None）は macOS で setuid root の `login` ラッパ経由になり、
-/// ペイン close 時の `Pty::drop` が `kill(login, SIGHUP)` を権限エラーで失敗（返り値無視）
-/// → `child.wait()` が永久ブロック → master fd・signal fd・IO スレッド・login プロセスが
-/// **close のたびにリーク**する。fd 枯渇で PTY 生成が失敗し日常使用でアプリが死ぬ
-/// （2026-06-11 常用報告の根本原因）。本家 alacritty はウィンドウ close = プロセス終了の
-/// ため顕在化しないが、tako はペイン単位でセッションを破棄するので直撃する。
-/// ユーザー権限のシェルを直接 spawn すれば SIGHUP が届き wait も即返る。
-/// `-l` でログインシェル動作（profile 読み込み）は維持する
-#[cfg(unix)]
-pub(crate) fn default_shell() -> Option<SpawnCommand> {
-    let program = std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/bin/sh".into());
-    Some(SpawnCommand {
-        program,
-        args: vec!["-l".into()],
-    })
-}
-
-/// Windows は alacritty の既定（PowerShell / cmd）に任せる（Phase 6 で精査）
-#[cfg(windows)]
-pub(crate) fn default_shell() -> Option<SpawnCommand> {
-    None
-}
-
-/// 明示コマンド（`tako split -- <command>` 等）をログインシェル経由の実行に包む。
-/// .app（Dock 起動）のプロセス環境は PATH が最小構成（/usr/bin:/bin:…）のため、
-/// コマンドを直接 exec すると Homebrew の `tmux` や `npm` が見つからず PTY 生成に
-/// 失敗する（2026-06-12 実機リグレッション）。`$SHELL -l -c "<コマンド>"` にして
-/// ユーザーの PATH・環境変数で実行する
-#[cfg(unix)]
-pub fn login_shell_command(command: SpawnCommand) -> SpawnCommand {
-    let shell = std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/bin/sh".into());
-    SpawnCommand {
-        program: shell,
-        args: vec![
-            "-l".into(),
-            "-c".into(),
-            crate::tmux_backend::shell_quoted(&command),
-        ],
-    }
-}
-
-/// Windows は PATH 探索が CreateProcess 任せのためそのまま（Phase 6 で精査）
-#[cfg(windows)]
-pub fn login_shell_command(command: SpawnCommand) -> SpawnCommand {
-    command
-}
+// 既定シェルの解決は抽象境界 B1（`platform::shell`）に閉じている。
+// 呼び出し側は単一のコードパスを通る（`.agent/plans/2026-07-windows-port-architecture.md`）
+pub(crate) use crate::platform::shell::default_shell;
+pub use crate::platform::shell::login_shell_command;
 
 /// ロケール既定注入の純粋ロジック（テスト用に env 参照と分離）。
 /// LANG / LC_ALL / LC_CTYPE のどれも継承されないときだけ `LC_CTYPE=UTF-8` を返す

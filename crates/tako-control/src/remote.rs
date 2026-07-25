@@ -60,6 +60,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use rust_embed::Embed;
 use serde_json::{json, Value};
 
+use crate::platform::local_endpoint;
 use crate::remote_auth::{DeviceRegistry, DeviceRole, Identity};
 
 const MAX_BODY_BYTES: u64 = 1024 * 1024;
@@ -929,39 +930,29 @@ fn establish_tailscale_serve(sock: &std::path::Path) -> io::Result<(String, Stri
 /// Tailscale が未セットアップなら不足項目を列挙して起動を拒否する
 pub fn run_daemon() -> io::Result<()> {
     let sock = socket_path();
-    // socket パス長チェック（macOS の sun_path は 104 バイト）
-    let sock_bytes = sock.as_os_str().as_encoded_bytes().len();
-    if sock_bytes > 100 {
-        return Err(io::Error::other(format!(
-            "socket パスが長すぎます（{sock_bytes} バイト、上限 100）。\
-             TAKO_REMOTE_STATE_DIR でより短いパスを指定してください: {}",
-            sock.display()
-        )));
+    // エンドポイントのパス長チェック（unix の sun_path 制約に由来）
+    if let Some(limit) = local_endpoint::path_byte_limit() {
+        let sock_bytes = sock.as_os_str().as_encoded_bytes().len();
+        if sock_bytes > limit {
+            return Err(io::Error::other(format!(
+                "socket パスが長すぎます（{sock_bytes} バイト、上限 {limit}）。\
+                 TAKO_REMOTE_STATE_DIR でより短いパスを指定してください: {}",
+                sock.display()
+            )));
+        }
     }
     // stale socket の回収: 既存ファイルがあれば接続試行で生死判定
     if sock.exists() {
-        match std::os::unix::net::UnixStream::connect(&sock) {
-            Ok(_) => {
-                return Err(io::Error::other(format!(
-                    "別の daemon が既にこの socket で稼働中です: {}",
-                    sock.display()
-                )));
-            }
-            Err(_) => {
-                // stale socket — unlink して起動続行
-                let _ = std::fs::remove_file(&sock);
-            }
+        if local_endpoint::probe_alive(&sock) {
+            return Err(io::Error::other(format!(
+                "別の daemon が既にこの socket で稼働中です: {}",
+                sock.display()
+            )));
         }
+        // stale socket — unlink して起動続行
+        let _ = std::fs::remove_file(&sock);
     }
-    let server = tiny_http::Server::http_unix(&sock)
-        .map_err(|e| io::Error::other(format!("remote API サーバーを起動できない: {e}")))?;
-    // socket を 0600 に制限（別 OS ユーザーの接続を遮断）
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| io::Error::other(format!("socket パーミッションの設定に失敗: {e}")))?;
-    }
+    let server = local_endpoint::bind(&sock)?;
 
     // tmux バックエンドソケット名を解決
     let tmux_socket = tako_core::tmux_backend::socket_name();
@@ -1392,25 +1383,19 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
             // PID ファイルが無い → socket 接続で stale daemon を探す
             let sock = socket_path();
             if sock.exists() {
-                if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) {
-                    // 生きた daemon がいる → health を叩いて pid を取得
-                    use std::io::{Read as _, Write as _};
-                    let req =
-                        "GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-                    if stream.write_all(req.as_bytes()).is_ok() {
-                        let mut buf = Vec::new();
-                        let _ = stream.read_to_end(&mut buf);
-                        let resp = String::from_utf8_lossy(&buf);
-                        if let Some(body) = resp.split_once("\r\n\r\n").map(|(_, b)| b) {
-                            if let Ok(v) = serde_json::from_str::<Value>(body.trim()) {
-                                if let Some(pid) = v["pid"].as_u64() {
-                                    eprintln!(
-                                        "PID ファイルが消失していますが、稼働中デーモン（PID {pid}）を検出。停止します…"
-                                    );
-                                    kill_stale_daemon(pid as u32);
-                                    cleanup_serve_leftover();
-                                    return Ok(json!({ "stopped": true, "stale_pid": pid }));
-                                }
+                // 生きた daemon がいる → health を叩いて pid を取得
+                let req =
+                    "GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+                if let Ok(resp) = local_endpoint::request_raw(&sock, req, None) {
+                    if let Some(body) = resp.split_once("\r\n\r\n").map(|(_, b)| b) {
+                        if let Ok(v) = serde_json::from_str::<Value>(body.trim()) {
+                            if let Some(pid) = v["pid"].as_u64() {
+                                eprintln!(
+                                    "PID ファイルが消失していますが、稼働中デーモン（PID {pid}）を検出。停止します…"
+                                );
+                                kill_stale_daemon(pid as u32);
+                                cleanup_serve_leftover();
+                                return Ok(json!({ "stopped": true, "stale_pid": pid }));
                             }
                         }
                     }
@@ -1437,21 +1422,7 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
              手動で停止するには: kill {pid_num}"
         ));
     }
-    #[cfg(unix)]
-    {
-        let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
-        let ret = unsafe { libc::kill(pid_num as libc::pid_t, sig) };
-        if ret != 0 {
-            return Err(format!(
-                "PID {pid_num} への signal 送信に失敗（errno: {}）",
-                std::io::Error::last_os_error()
-            ));
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        return Err("Windows での停止は未実装".to_string());
-    }
+    crate::platform::process::terminate(pid_num, force)?;
     // プロセスの終了をポーリングで確認（最大 5 秒）
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
@@ -1556,21 +1527,17 @@ pub fn spawn_daemon() -> Result<Value, String> {
     // stale socket の回収（PID ファイル消失 + プロセス死亡で socket だけ残るケース）
     let sock = socket_path();
     if sock.exists() {
-        match std::os::unix::net::UnixStream::connect(&sock) {
-            Ok(_) => {
-                return Err(format!(
-                    "別の daemon が既にこの socket で稼働中です: {}",
-                    sock.display()
-                ));
-            }
-            Err(_) => {
-                eprintln!(
-                    "stale socket を検出しました。自動回収します: {}",
-                    sock.display()
-                );
-                let _ = std::fs::remove_file(&sock);
-            }
+        if local_endpoint::probe_alive(&sock) {
+            return Err(format!(
+                "別の daemon が既にこの socket で稼働中です: {}",
+                sock.display()
+            ));
         }
+        eprintln!(
+            "stale socket を検出しました。自動回収します: {}",
+            sock.display()
+        );
+        let _ = std::fs::remove_file(&sock);
     }
 
     let tako_bin = serve_binary();
@@ -1732,8 +1699,6 @@ fn kill_stale_daemon(pid: u32) {
 /// 稼働中 daemon の admin API を叩く最小 HTTP クライアント（UDS 専用）。
 /// 外部依存を増やさないため std UnixStream + HTTP/1.1 の自前実装
 pub fn admin_request(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
-    use std::io::{Read as _, Write as _};
-
     let status = daemon_status();
     if status["running"].as_bool() != Some(true) {
         return Err("リモートサーバーが起動していない".to_string());
@@ -1751,20 +1716,9 @@ pub fn admin_request(method: &str, path: &str, body: Option<&Value>) -> Result<V
         body_str.len()
     );
 
-    let mut stream = std::os::unix::net::UnixStream::connect(&sock)
-        .map_err(|e| format!("daemon へ接続できない ({}): {e}", sock.display()))?;
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-        .ok();
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| format!("daemon への送信に失敗: {e}"))?;
-
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|e| format!("daemon からの受信に失敗: {e}"))?;
-    let response = String::from_utf8_lossy(&response);
+    let response =
+        local_endpoint::request_raw(&sock, &request, Some(std::time::Duration::from_secs(10)))
+            .map_err(|e| format!("daemon との通信に失敗 ({}): {e}", sock.display()))?;
     let (head, body) = response
         .split_once("\r\n\r\n")
         .ok_or("daemon の応答が不正（ヘッダ境界なし）")?;
