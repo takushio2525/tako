@@ -2017,6 +2017,29 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_stale_binary",
+            "description": "稼働中 claude セッションのバイナリ鮮度を検知し、新版への張り直しを行う（Issue #498）。\
+                claude CLI は symlink 張り替えで更新されるが、長生きセッション（特に master）は起動時の旧バイナリを\
+                握り続ける。action=status（既定）で指定ペインの stale 判定（握っている版 / 最新版 / stale か）を返す。\
+                action=restart で張り直し（worker は claude --resume で会話復元、master は handoff で引き継ぎ）。\
+                busy（実行中）のペインでは restart は拒否される。action=dismiss でバナーを閉じる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "restart", "dismiss"],
+                        "description": "操作種別（省略時は status）",
+                    },
+                    "pane": {
+                        "type": "integer",
+                        "description": "対象ペイン ID（省略時はデフォルト解決）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_lang",
             "description": "UI 表示言語（日本語/英語）の状態確認・切替（Issue #435）。\
                 action=status（既定）: 言語設定（system / ja / en）と実際の表示言語を返す。\
@@ -3495,6 +3518,10 @@ fn build_request(
             font_family: str_arg(args, "font_family")?.map(|s| s.to_string()),
             font_size: str_arg(args, "font_size")?.and_then(|s| s.parse::<f32>().ok()),
         },
+        "tako_stale_binary" => Request::StaleBinary {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
+            pane: u64_arg(args, "pane")?,
+        },
         "tako_lang" => Request::Lang {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             value: str_arg(args, "value")?.map(|s| s.to_string()),
@@ -4412,7 +4439,7 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 117);
+        assert_eq!(tools.len(), 118);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

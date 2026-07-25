@@ -1173,6 +1173,16 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tab: Option<String>,
     },
+    /// stale claude バイナリの検知と張り直し（Issue #498）。
+    /// `action` = "status"（既定。指定ペインの stale 判定）/ "restart"（張り直し実行）/
+    /// "dismiss"（バナーを閉じる）
+    StaleBinary {
+        #[serde(default)]
+        action: Option<String>,
+        /// 対象ペイン（省略時はデフォルト解決）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+    },
 }
 
 impl Request {

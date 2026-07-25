@@ -37,6 +37,7 @@ pub mod remote;
 pub mod settings;
 pub mod sidebar;
 pub mod sleep_guard;
+pub mod stale;
 pub mod update;
 pub mod webdock;
 
