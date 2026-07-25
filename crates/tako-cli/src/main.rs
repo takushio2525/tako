@@ -5379,7 +5379,9 @@ fn print_result(command: &Command, result: &Value) {
         | Command::Pin(_) => {
             println!("{result}")
         }
-        Command::Git(GitCommand::Log { .. }) | Command::Git(GitCommand::Diff { .. }) => {
+        Command::Git(GitCommand::Log { .. })
+        | Command::Git(GitCommand::Diff { .. })
+        | Command::Git(GitCommand::Show { .. }) => {
             println!("{}", pretty_json(result));
         }
         Command::Git(GitCommand::Commit { .. })
