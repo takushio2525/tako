@@ -450,6 +450,12 @@ pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervisor_max_retries: Option<u32>,
 
+    /// master の起動ディレクトリ（Issue #500 Part 5）。
+    /// 指定すると `tako master -<name>` がどこから叩いても同じ cwd で起動する。
+    /// `~` / `$HOME` 展開、存在しないディレクトリは起動時に診断つきエラー
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+
     /// 任意の環境変数を master / worker に注入する（Issue #500）。
     /// 値の `~` / `$HOME` は展開される。内部変数（TAKO_SOCKET 等）の上書きは拒否する。
     /// ログや CLI/MCP 出力には値を生で出さない（キー名のみ / マスク）
@@ -492,6 +498,7 @@ impl Default for Profile {
             supervisor_mode: None,
             auto_resume_dead: None,
             supervisor_max_retries: None,
+            cwd: None,
             env: std::collections::BTreeMap::new(),
             master_account: None,
             worker_account: None,
@@ -586,6 +593,75 @@ impl Profile {
                 format!("プロファイルの worker_agent が不正: {e}")
             }
         })
+    }
+
+    /// cwd を解決する（~ 展開 + 存在確認。Issue #500 Part 5）。
+    /// None なら呼び出し元が従来挙動（ホームディレクトリ）を使う
+    pub fn resolve_cwd(&self) -> Result<Option<std::path::PathBuf>, String> {
+        match self.cwd.as_deref() {
+            None => Ok(None),
+            Some(raw) => {
+                let expanded = expand_tilde(raw);
+                let path = std::path::PathBuf::from(&expanded);
+                if !path.is_dir() {
+                    Err(format!(
+                        "プロファイルの cwd が存在しない: {expanded}（元の指定: {raw}）"
+                    ))
+                } else {
+                    Ok(Some(path))
+                }
+            }
+        }
+    }
+
+    /// projects に指定された key が全て projects.yaml に存在するか検証する（Issue #500 Part 7）。
+    /// 未登録の key があれば起動時エラーにする
+    pub fn validate_projects(&self) -> Result<(), String> {
+        let config = ProjectsConfig::load()?;
+        self.validate_projects_with(&config)
+    }
+
+    /// ProjectsConfig を直接受け取る版（テスト用に公開）
+    pub fn validate_projects_with(&self, config: &ProjectsConfig) -> Result<(), String> {
+        let keys = match self.projects.as_ref() {
+            Some(k) if !k.is_empty() => k,
+            _ => return Ok(()),
+        };
+        let mut missing: Vec<&str> = Vec::new();
+        for key in keys {
+            if !config.projects.contains_key(key) {
+                missing.push(key);
+            }
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "プロファイルの projects に projects.yaml に未登録のキーがある: {}",
+                missing.join(", ")
+            ))
+        }
+    }
+
+    /// projects 指定がある場合に、projects.yaml から解決した詳細情報を返す（Part 7: 専任マスター）
+    pub fn resolve_project_details(&self) -> Vec<ResolvedProject> {
+        let keys = match self.projects.as_ref() {
+            Some(k) if !k.is_empty() => k,
+            _ => return Vec::new(),
+        };
+        let config = match ProjectsConfig::load() {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        keys.iter()
+            .filter_map(|key| {
+                config.projects.get(key).map(|entry| ResolvedProject {
+                    key: key.clone(),
+                    cwd: expand_tilde(&entry.cwd),
+                    description: entry.description.clone(),
+                })
+            })
+            .collect()
     }
 
     /// master のアカウント名を解決する（Issue #504）
@@ -1061,6 +1137,37 @@ impl Profile {
         };
 
         let launch_cmd = launch_command("tako master", profile_name);
+
+        // Part 7: 専任マスター — projects 指定があればプロジェクト情報を注入
+        let projects_section = if let Some(ref project_keys) = self.projects {
+            if project_keys.is_empty() {
+                String::new()
+            } else {
+                let details = self.resolve_project_details();
+                let mut section = String::from(
+                    "\n\n## Assigned Projects (Dedicated Master)\n\n\
+                     This master is dedicated to the following project(s). \
+                     You already know the target — skip project resolution (Step 0).\n\n",
+                );
+                for p in &details {
+                    section.push_str(&format!(
+                        "- **{}**: `{}` — {}\n",
+                        p.key,
+                        p.cwd,
+                        p.description.as_deref().unwrap_or("(no description)")
+                    ));
+                }
+                section.push_str(
+                    "\nFor requests outside these projects, explain that this master is dedicated \
+                     to the listed project(s) and suggest using a general-purpose master \
+                     (`tako master`) or a different profile instead.",
+                );
+                section
+            }
+        } else {
+            String::new()
+        };
+
         format!(
             "## Session Identity\n\n\
              - **Profile**: `{profile_name}`\n\
@@ -1070,7 +1177,7 @@ impl Profile {
              - **Worker model policy**: {policy_str}{agent_line}\n\
              - **Profile config**: `{profile_path}`\n\
              - **Prompt blocks**: {}\n\
-             - **Customizations**: {customization_summary}",
+             - **Customizations**: {customization_summary}{projects_section}",
             self.master_model_label(),
             self.effort,
             all_blocks.join(", "),
@@ -3039,5 +3146,115 @@ worker_agents:
         assert_eq!(p.resolve_worker_account_name(None), Some("master-acct"));
         p.master_account = None;
         assert_eq!(p.resolve_worker_account_name(None), None);
+    }
+
+    // --- Part 5: cwd (#500) ---
+
+    #[test]
+    fn resolve_cwd_none_returns_none() {
+        let p = Profile::default();
+        assert!(p.resolve_cwd().unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_cwd_existing_dir() {
+        let p = Profile {
+            cwd: Some("/tmp".into()),
+            ..Default::default()
+        };
+        let resolved = p.resolve_cwd().unwrap();
+        assert!(resolved.is_some());
+        assert_eq!(resolved.unwrap().to_str().unwrap(), "/tmp");
+    }
+
+    #[test]
+    fn resolve_cwd_nonexistent_errors() {
+        let p = Profile {
+            cwd: Some("/nonexistent-dir-tako-test-12345".into()),
+            ..Default::default()
+        };
+        let err = p.resolve_cwd().unwrap_err();
+        assert!(err.contains("存在しない"), "エラーメッセージ: {err}");
+    }
+
+    #[test]
+    fn resolve_cwd_tilde_expanded() {
+        let p = Profile {
+            cwd: Some("~/".into()),
+            ..Default::default()
+        };
+        let resolved = p.resolve_cwd().unwrap().unwrap();
+        assert!(
+            !resolved.to_str().unwrap().starts_with('~'),
+            "チルダが展開されている"
+        );
+    }
+
+    // --- Part 7: 専任マスター (#500) ---
+
+    #[test]
+    fn build_system_prompt_includes_project_section_when_projects_set() {
+        // projects.yaml にキーがなくても resolve_project_details は空を返すだけで
+        // generate_identity_section にセクションが入ることを確認
+        let p = Profile {
+            projects: Some(vec!["test-project".into()]),
+            ..Default::default()
+        };
+        let prompt = p.build_from_template("<!-- block: role -->\nRole text\n", "test");
+        assert!(
+            prompt.contains("Assigned Projects"),
+            "projects セクションが含まれる: {prompt}"
+        );
+        assert!(prompt.contains("dedicated"), "専任マスターの説明が含まれる");
+    }
+
+    #[test]
+    fn build_system_prompt_no_project_section_when_projects_none() {
+        let p = Profile::default();
+        let prompt = p.build_from_template("<!-- block: role -->\nRole text\n", "default");
+        assert!(
+            !prompt.contains("Assigned Projects"),
+            "projects セクションが含まれない"
+        );
+    }
+
+    #[test]
+    fn validate_projects_rejects_unknown_key() {
+        // ProjectsConfig を直接構築して validate_projects_with でテスト
+        // （OnceLock 競合を回避）
+        let mut config = ProjectsConfig {
+            projects: std::collections::BTreeMap::new(),
+        };
+        config.projects.insert(
+            "tako".into(),
+            ProjectEntry {
+                cwd: "/tmp".into(),
+                description: Some("test".into()),
+            },
+        );
+
+        let p = Profile {
+            projects: Some(vec!["tako".into(), "nonexistent".into()]),
+            ..Default::default()
+        };
+        let err = p.validate_projects_with(&config).unwrap_err();
+        assert!(err.contains("nonexistent"), "未登録 key のエラー: {err}");
+        assert!(
+            !err.contains("tako"),
+            "登録済み key はエラーに含まれない: {err}"
+        );
+
+        let p2 = Profile {
+            projects: Some(vec!["tako".into()]),
+            ..Default::default()
+        };
+        assert!(
+            p2.validate_projects_with(&config).is_ok(),
+            "登録済み key は OK"
+        );
+
+        // projects 未指定は常に OK
+        let p3 = Profile::default();
+        assert!(p3.validate_projects_with(&config).is_ok());
     }
 }

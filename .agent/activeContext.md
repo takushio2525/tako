@@ -4,23 +4,21 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-25・#500 Part 1-4 + #504 → PR #505 レビュー待ち）
+## 現在の対象（2026-07-25・#500 Part 5-7 → PR #506 レビュー待ち）
 
-**ブランチ `feat/500-profile-env`（2 コミット・PR #505）**
+**ブランチ `feat/500-part5-7`（PR #506）**
 
-- #500 Part 1-4: Profile に汎用 env マップ追加。master/worker 全経路にenv注入、
-  direnv 対策（export 後勝ち）、内部変数拒否、値マスク、projects 強制、CLI/MCP 1:1
-- #504: accounts.yaml レジストリ（CRUD + 116 ツール）、spawn の account パラメータ、
-  プロファイルの master_account/worker_account、model/effort 解決順
+- Part 5: Profile に cwd フィールド。master 起動時に指定 cwd へ cd（~ 展開 + 存在検証）
+- Part 6: master 起動後に cwd + projects のフォルダをファイルツリーへ自動追加（IPC 経由）
+- Part 7: projects 指定ありプロファイルで「専任マスター」。system prompt に Assigned Projects 注入
+  + 担当外は説明して断る指示 + 未登録 key は起動時エラー
 
 ## 次の一手
 
-- PR #505 をレビュー → squash merge → `scripts/build-app.sh --install`
-- 隔離環境での実測（env 付きプロファイル + アカウント切替の e2e）
-- Part 5-7（cwd / ファイルツリー / 専任マスター）は別タスク
+- PR #506 をレビュー → squash merge（Closes #500 で #500 完結）→ install
+- #500 の全 Part（1〜7）が完了
 
 ## 現フェーズで Read すべき設計書
 
-- env 注入: `crates/tako-control/src/orchestrator/mod.rs` の `Profile::validate_env` / `resolved_env_with_account`
-- accounts: `AccountsConfig` / `ResolvedAccount`（同ファイル）
-- spawn 経路: `dispatch_orchestrator_spawn`（dispatch.rs）の account 解決フロー
+- cwd / projects 注入: `generate_identity_section`（orchestrator/mod.rs）
+- ファイルツリー追加: `orchestrator_master`（tako-cli/main.rs）の TreeFolder dispatch
