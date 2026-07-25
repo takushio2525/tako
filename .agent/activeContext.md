@@ -4,25 +4,26 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-24・#470 紹介動画 v3 → ユーザー確認待ち）
+## 現在の対象（2026-07-25・#494 / #497 / #501 → PR レビュー待ち）
 
-**#470 紹介動画 v3（docs/470-promo-video-v3）**
+**ブランチ `fix/494-git-tab-layout`（3 Issue 分）**
 
-- setup 節を作り直した: コマンド紹介（`--check` / `setup-mcp`）→
-  **対話セットアップエージェント**の訴求へ。`tako setup` が質問ゼロで検出を終えると
-  アシスタントが自動起動し、日本語の相談で指示ファイル・プロファイル・プロジェクト登録が決まる
-- master 節に S6c を追加: **ホーム**で起動した master が projects.yaml のレジストリから
-  「awesome-app」を解決し、その cwd で worker を立てる（`record-scenes.sh project`）
-- v2 から維持: テロップ背景パネル・構成順（画面操作 → プレビュー → setup → master）・
-  絵文字ゼロ・BGM（115 秒へ延長）・agent / preview / master / outro の素材
-- 完成品: `~/Desktop/tako-promo/tako-intro-v3.mp4`（106s / 1920x1200 / H.264 + AAC）
+- #494 git タブ描画崩壊: 根本原因は幅ではなく「コンテンツ総高さ > パネル高さ」による
+  taffy の行圧縮。固定ヘッダ + 行が縮まないスクロール本文の 2 段構造へ分離して根治。
+  併せて操作の堅牢化（空メッセージ拒否 + 理由表示 / 二重押し防止 / エラーカード保持 /
+  制御文字の正規化 / キャレットの文字境界丸め）
+- #497 IME 未確定文字列がカーソル非表示ペインで消える: anchor を `ime_cursor`
+  フォールバック付きへ差し替え。回帰テスト 76c / 76d を追加
+- #501 セルフテストが 33b で中断し以降が未実行: テーマ適用の巻き戻しを修正して完走
 
 ## 次の一手
 
-- ユーザーが v3 を視聴して setup 節の訴求・S6c の追加・尺を確認（OK なら #470 クローズ判断）
-- 収録の落とし穴は台本の「収録の技術制約」7〜9 に追記済み
-  （デモ HOME のキーチェーン / `tko` への `TAKO_DATA_DIR` 必須 / `--await-prompt` の中断）
+- PR をレビュー → squash merge → `scripts/build-app.sh --install`
+- #495（コミット詳細表示）/ #496（ブランチ操作）は別 worker。`GitScrollBody::push`
+  を通せば行を足しても崩れない土台にしてある
 
 ## 現フェーズで Read すべき設計書
 
-- 紹介動画: `.agent/plans/2026-07-promo-video.md`（シーン表・訴求文言・収録の技術制約）
+- git パネルに手を入れる: `crates/tako-app/src/right_panel.rs` の `GitScrollBody`
+  コメント（スクロール領域の行は必ず `flex_shrink_0`。#494 の構造不変条件）
+- IME に手を入れる: `ime_overlay_anchor()` と `Screen::ime_anchor_cell()`（#497）

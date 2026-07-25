@@ -17,6 +17,112 @@ pub(crate) fn stage_feedback_label(paths: &[String]) -> String {
     }
 }
 
+/// git コマンド出力の要約（#494）。
+/// 成功時は最後の意味のある行を出す。空なら既定文言。
+pub(crate) fn git_result_summary(out: &str, fallback: &str) -> String {
+    out.lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+/// フィードバックカードに載せる文字列を安全な長さ・形へ整える（#494）。
+/// git のエラーは数十行になることがあり、そのまま載せるとカードがパネルを覆う。
+pub(crate) const GIT_FEEDBACK_MAX_LINES: usize = 6;
+pub(crate) const GIT_FEEDBACK_MAX_CHARS: usize = 600;
+
+pub(crate) fn git_feedback_text(message: &str) -> String {
+    let mut lines: Vec<&str> = message
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let truncated_lines = lines.len() > GIT_FEEDBACK_MAX_LINES;
+    lines.truncate(GIT_FEEDBACK_MAX_LINES);
+    let mut out = lines.join("\n");
+    if out.chars().count() > GIT_FEEDBACK_MAX_CHARS {
+        out = head_chars(&out, GIT_FEEDBACK_MAX_CHARS);
+        out.push('…');
+    } else if truncated_lines {
+        out.push('…');
+    }
+    out
+}
+
+/// バイトオフセットを直近の文字境界へ切り下げる（#494）。
+///
+/// `String::split_at` / `insert_str` は文字の途中のオフセットを渡すと panic し、
+/// GPUI の描画中に落ちるとアプリ全体が巻き添えで死ぬ。キャレット位置は
+/// マルチバイト文字・IME・貼り付けで境界を外し得るので、使う直前に必ず丸める。
+pub(crate) fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// 末尾 `n` 文字だけを返す（#494。長いメッセージでキャレットを画面内に留めるため）
+pub(crate) fn tail_chars(s: &str, n: usize) -> String {
+    let count = s.chars().count();
+    if count <= n {
+        return s.to_string();
+    }
+    s.chars().skip(count - n).collect()
+}
+
+/// 先頭 `n` 文字だけを返す（#494）
+pub(crate) fn head_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// git ビューのスクロール領域へ行を積むビルダー（#494）。
+///
+/// **スクロールコンテナ（`overflow_y_scroll`）の直接の子には `flex_shrink_0` が必須**。
+/// 付け忘れると、コンテンツ総高さがパネル高さを超えた瞬間に taffy が子を縦方向へ
+/// 圧縮する。`overflow_hidden` を持つ行は CSS 規定で automatic minimum size が 0 に
+/// なる（GPUI `Overflow` のドキュメント参照）ため高さ 0 付近まで潰れ、overflow が
+/// visible な行は中身が隣の行へはみ出して**重なって描画**される。これが #494 で
+/// 実機報告された「ヘッダが欠ける・入力欄がボタンに重なる」の正体。
+///
+/// 個々の `child()` 呼び出しに `flex_shrink_0()` を書いて回ると必ず付け忘れが出るので、
+/// 行の追加経路を `push()` 1 本に集約して構造的に防ぐ。
+#[derive(Default)]
+struct GitScrollBody {
+    rows: Vec<gpui::AnyElement>,
+}
+
+/// スクロール領域の行に必須のスタイルを付ける（#494）。
+/// `GitScrollBody::push` の実体。テストから直接検証できるよう切り出してある。
+pub(crate) fn git_scroll_row<E: Styled>(el: E) -> E {
+    el.flex_shrink_0()
+}
+
+impl GitScrollBody {
+    fn push(&mut self, el: impl Styled + IntoElement) {
+        self.rows.push(git_scroll_row(el).into_any_element());
+    }
+
+    /// スクロール領域そのものを組み立てる。ヘッダ（固定部）の残り高さを全部使う
+    fn finish(self) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("git-scroll")
+            .flex_1()
+            .flex()
+            .flex_col()
+            // overflow_y_scroll 自体が automatic minimum size を 0 にするので、
+            // ヘッダを押しのけずに残り高さへ収まる
+            .overflow_y_scroll()
+            .children(self.rows)
+    }
+}
+
 /// orch ビューのワーカー行（#217。render_orch_view で収集）
 struct OrchWorker {
     pane: PaneId,
@@ -2148,11 +2254,11 @@ impl TakoApp {
         } else {
             entry.unstaged_badge()
         };
-        // バッジ色: 追加/未追跡 = 緑、変更 = 黄、削除 = 赤、リネーム = accent
+        // バッジ色: 追加/未追跡 = 緑、変更 = 黄、削除・未解決 = 赤、リネーム = accent
         let color = match badge {
             'A' | 'U' => theme.green,
             'M' => theme.yellow,
-            'D' => theme.red,
+            'D' | tako_core::CONFLICT_BADGE => theme.red,
             'R' | 'C' => theme.accent,
             _ => fg,
         };
@@ -2243,19 +2349,27 @@ impl TakoApp {
     }
 
     /// git ビュー（FR-3.6 git graph + FR-3.9 diff ビューア）。cwd 連動で 2 秒ポーリング更新。
-    /// セクション: リポヘッダ → コミット入力 → 操作ボタン → ブランチ →
-    /// ステージ済みの変更 / 変更（#487 のステージング UI）→ コミットグラフ → diff
+    ///
+    /// レイアウトは **固定ヘッダ + スクロール本文の 2 段**（#494）。
+    /// - ヘッダ（`flex_none`）: リポヘッダ → フィードバック → コミット入力 → 操作ボタン → 注記。
+    ///   常に見えるので、コミット一覧を下までスクロールしても入力欄を見失わない
+    /// - 本文（`GitScrollBody`）: ブランチ → 変更（#487 の 2 セクション）→ コミット → diff
+    ///
+    /// 以前は全部を 1 個のスクロールコンテナへ平らに積んでいたため、コンテンツ総高さが
+    /// パネル高さを超えると taffy が行を縦に圧縮し、要素同士が重なって描画されていた
+    /// （#494 の根本原因。詳細は `GitScrollBody` のコメント）。
     fn render_git_view(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme.clone();
         let data = self.git_data.clone();
         let collapsed = self.git_collapsed.clone();
 
-        let mut root = div()
+        // 外枠はスクロールしない。ここが overflow_y_scroll だと下の 2 段構造が成立しない
+        let root = div()
             .id("git-view")
             .flex_1()
             .flex()
             .flex_col()
-            .overflow_y_scroll()
+            .overflow_hidden()
             .bg(rgba(theme.mantle))
             .text_color(hsla(theme.tab_inactive_foreground))
             .text_size(px(11.0));
@@ -2297,12 +2411,20 @@ impl TakoApp {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| data.repo_root.clone());
-        root = root.child(
+        // detached HEAD では branch が空になるので、状態を言葉で出す
+        let branch_label = if data.branch.trim().is_empty() {
+            crate::ui_text::panel::git_detached_head().to_string()
+        } else {
+            data.branch.clone()
+        };
+        let mut header = div().w_full().flex_none().flex().flex_col();
+        header = header.child(
             div()
                 .w_full()
                 .flex()
                 .flex_row()
                 .items_center()
+                .flex_none()
                 .overflow_hidden()
                 .px_2()
                 .py_1()
@@ -2315,16 +2437,23 @@ impl TakoApp {
                         .h(px(12.0))
                         .text_color(hsla(accent)),
                 )
+                // ブランチ名・リポ名・upstream は狭いパネルでは削って良い。
+                // overflow_hidden を付けないと flex の自動最小幅が内容幅に張り付き、
+                // text_ellipsis が効かないまま右へ溢れる（#494 の症状 4 と同根）
                 .child(
                     div()
                         .ml_1()
+                        .overflow_hidden()
+                        .text_ellipsis()
                         .text_size(px(12.0))
                         .text_color(hsla(fg_active))
-                        .child(data.branch.clone()),
+                        .child(branch_label),
                 )
                 .child(
                     div()
                         .ml_2()
+                        .overflow_hidden()
+                        .text_ellipsis()
                         .text_size(px(10.0))
                         .text_color(hsla(fg))
                         .child(repo_name),
@@ -2333,13 +2462,14 @@ impl TakoApp {
                     d.child(
                         div()
                             .ml_2()
+                            .overflow_hidden()
                             .text_size(px(10.0))
                             .text_color(hsla(fg))
                             .text_ellipsis()
                             .child(format!("-> {}", data.upstream)),
                     )
                 })
-                .child(div().flex_grow(1.0))
+                .child(div().flex_grow(1.0).flex_shrink_0().w(px(4.0)))
                 // 手動更新（#487。2 秒ポーリング待ちをせず即座に取り直す）
                 .child(
                     div()
@@ -2347,6 +2477,8 @@ impl TakoApp {
                         .flex()
                         .flex_row()
                         .items_center()
+                        // 更新ボタンは常に押せる必要があるので縮ませない
+                        .flex_none()
                         .gap(px(2.0))
                         .px_1()
                         .rounded(px(3.0))
@@ -2394,25 +2526,58 @@ impl TakoApp {
             .collect();
         let staged_count = staged_entries.len();
 
-        // フィードバック表示
+        // フィードバックカード（#494: 失敗は自動で消さず、閉じるボタンで消す。
+        // git のエラーは複数行になるので折り返して全文読めるようにする）
         if let Some(fb) = &self.git_feedback {
             let color = if fb.is_error { theme.red } else { theme.green };
-            root = root.child(
+            header = header.child(
                 div()
+                    .w_full()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap_1()
                     .px_2()
                     .py(px(3.0))
                     .text_size(px(10.0))
                     .text_color(hsla(color))
                     .bg(rgba_alpha(color, 0.1))
-                    .child(SharedString::from(fb.message.clone())),
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .child(SharedString::from(fb.message.clone())),
+                    )
+                    .child(
+                        div()
+                            .id("git-feedback-dismiss")
+                            .flex_none()
+                            .px_1()
+                            .rounded(px(3.0))
+                            .cursor_pointer()
+                            .text_color(hsla_alpha(color, 0.8))
+                            .hover(|d| d.bg(rgba_alpha(color, 0.2)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.git_feedback = None;
+                                cx.notify();
+                            }))
+                            .child(crate::ui_text::panel::git_dismiss()),
+                    ),
             );
         }
 
         // コミットメッセージ入力欄（#487: キャレット表示 + フォーカス可視化。
         // 実際の文字入力は replace_text_in_range / handle_git_commit_key が担う）
+        // #494: split_at はバイト境界でしか切れず、文字の途中で切ると panic して
+        // アプリ全体が落ちる。キャレットは必ず文字境界へ丸めてから使う
+        let commit_cursor = floor_char_boundary(&commit_msg, commit_cursor);
         let (msg_before, msg_after) = commit_msg.split_at(commit_cursor);
-        root = root.child(
-            div().px_2().py(px(4.0)).child(
+        // 長いメッセージでもキャレット位置が見えるように、前後を表示可能な文字数で
+        // 切り詰める（#494。切らないとキャレットが入力欄の外へ押し出されて見えなくなる）
+        let visible_chars = ((self.panel_width - 40.0) / 6.5).max(8.0) as usize;
+        header = header.child(
+            div().flex_none().px_2().py(px(4.0)).child(
                 div()
                     .id("git-commit-input")
                     .w_full()
@@ -2448,6 +2613,7 @@ impl TakoApp {
                     .when(commit_msg.is_empty() && !commit_focused, |d| {
                         d.child(
                             div()
+                                .overflow_hidden()
                                 .text_color(hsla(theme.text_muted))
                                 .text_ellipsis()
                                 .child(SharedString::from(
@@ -2456,7 +2622,11 @@ impl TakoApp {
                         )
                     })
                     .when(!commit_msg.is_empty(), |d| {
-                        d.child(div().child(SharedString::from(msg_before.to_string())))
+                        d.child(
+                            div()
+                                .flex_none()
+                                .child(SharedString::from(tail_chars(msg_before, visible_chars))),
+                        )
                     })
                     .when(commit_focused, |d| {
                         d.child(
@@ -2468,13 +2638,21 @@ impl TakoApp {
                         )
                     })
                     .when(!commit_msg.is_empty(), |d| {
-                        d.child(div().child(SharedString::from(msg_after.to_string())))
+                        d.child(
+                            div()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(SharedString::from(head_chars(msg_after, visible_chars))),
+                        )
                     }),
             ),
         );
 
         // コミット + プル / プッシュ ボタン行
-        let commit_enabled = !self.git_commit_message.trim().is_empty() && has_changes;
+        // #494: 実行中は連打・二重押しを防ぐため全ボタンを無効化する
+        let busy = self.git_busy;
+        let commit_block = tako_core::git::commit_block(&self.git_commit_message, has_changes);
+        let commit_enabled = commit_block.is_none() && busy.is_none();
         let btn_base = |id: &'static str, th: &tako_core::Theme, enabled: bool| {
             div()
                 .id(id)
@@ -2497,9 +2675,11 @@ impl TakoApp {
         let commit_repo = repo_root_str.clone();
         let pull_repo = repo_root_str.clone();
         let push_repo = repo_root_str.clone();
-        root = root.child(
+        let net_enabled = busy.is_none();
+        header = header.child(
             div()
                 .w_full()
+                .flex_none()
                 .flex()
                 .flex_row()
                 .items_center()
@@ -2516,7 +2696,10 @@ impl TakoApp {
                             this.git_do_commit(commit_repo.clone(), cx);
                         }))
                     } else {
-                        btn
+                        // 無効な理由をその場で言葉にする（押しても無反応にしない。#494）
+                        btn.on_click(cx.listener(move |this, _, _, cx| {
+                            this.git_report_commit_block(cx);
+                        }))
                     };
                     btn.child(
                         div()
@@ -2541,11 +2724,13 @@ impl TakoApp {
                     )
                 })
                 .child(
-                    btn_base("git-pull-btn", &theme, true)
+                    btn_base("git-pull-btn", &theme, net_enabled)
                         .flex_none()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.git_do_pull(pull_repo.clone(), cx);
-                        }))
+                        .when(net_enabled, |d| {
+                            d.on_click(cx.listener(move |this, _, _, cx| {
+                                this.git_do_pull(pull_repo.clone(), cx);
+                            }))
+                        })
                         .child(
                             div()
                                 .flex()
@@ -2564,11 +2749,13 @@ impl TakoApp {
                         ),
                 )
                 .child(
-                    btn_base("git-push-btn", &theme, true)
+                    btn_base("git-push-btn", &theme, net_enabled)
                         .flex_none()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.git_do_push(push_repo.clone(), cx);
-                        }))
+                        .when(net_enabled, |d| {
+                            d.on_click(cx.listener(move |this, _, _, cx| {
+                                this.git_do_push(push_repo.clone(), cx);
+                            }))
+                        })
                         .child(
                             div()
                                 .flex()
@@ -2587,8 +2774,37 @@ impl TakoApp {
                         ),
                 ),
         );
-        // #487: コミット対象がステージ済みだけかどうかを言葉で明示する
-        root = root.child(
+        // 注記行: 実行中 > コミットできない理由 > コミット対象の説明 の優先で 1 行出す。
+        // ボタンを淡色にするだけでは理由が伝わらないので必ず言葉にする（#494）
+        let (hint_text, hint_color) = if let Some(op) = busy {
+            (
+                SharedString::from(crate::ui_text::panel::git_busy(op)),
+                theme.accent,
+            )
+        } else if let Some(block) = commit_block {
+            (
+                SharedString::from(match block {
+                    tako_core::CommitBlock::EmptyMessage => {
+                        crate::ui_text::panel::git_commit_blocked_empty()
+                    }
+                    tako_core::CommitBlock::NoChanges => {
+                        crate::ui_text::panel::git_commit_blocked_no_changes()
+                    }
+                }),
+                theme.text_muted,
+            )
+        } else if staged_count > 0 {
+            (
+                SharedString::from(crate::ui_text::panel::git_commit_staged_hint(staged_count)),
+                theme.text_muted,
+            )
+        } else {
+            (
+                SharedString::from(crate::ui_text::panel::git_commit_all_hint()),
+                theme.text_muted,
+            )
+        };
+        header = header.child(
             div()
                 .w_full()
                 .flex()
@@ -2599,22 +2815,24 @@ impl TakoApp {
                 .overflow_hidden()
                 .px_2()
                 .text_size(px(9.0))
-                .text_color(hsla(theme.text_muted))
+                .text_color(hsla(hint_color))
                 .text_ellipsis()
-                .child(if staged_count > 0 {
-                    SharedString::from(crate::ui_text::panel::git_commit_staged_hint(staged_count))
-                } else {
-                    SharedString::from(crate::ui_text::panel::git_commit_all_hint())
-                }),
+                .child(hint_text),
         );
+        let root = root.child(header);
+
+        // ──── ここから下はスクロール領域（行は必ず push 経由で積む。#494）────
+        let mut body = GitScrollBody::default();
 
         // ──── ブランチ一覧セクション ────
-        root = root.child(
+        body.push(
             div()
                 .id("git-branches-header")
+                .w_full()
                 .flex()
                 .flex_row()
                 .items_center()
+                .overflow_hidden()
                 .gap(px(2.0))
                 .px_2()
                 .py(px(3.0))
@@ -2648,8 +2866,11 @@ impl TakoApp {
                     continue;
                 }
                 let is_current = branch.is_current;
-                root = root.child(
+                body.push(
                     div()
+                        .w_full()
+                        .overflow_hidden()
+                        .text_ellipsis()
                         .px_3()
                         .py(px(1.0))
                         .text_size(px(11.0))
@@ -2667,7 +2888,7 @@ impl TakoApp {
         // ──── 変更ファイルセクション（#487: ステージ済み / 未ステージの 2 段構成）────
         // 折りたたみは 2 セクション共通（git_collapsed.changes）で扱う
         if data.status.is_empty() {
-            root = root.child(
+            body.push(
                 div()
                     .px_2()
                     .py(px(4.0))
@@ -2681,7 +2902,7 @@ impl TakoApp {
             let repo_for_unstage_all = repo_root_str.clone();
             // ステージ済みセクション
             if staged_count > 0 {
-                root = root.child(self.git_section_header(
+                body.push(self.git_section_header(
                     "git-staged-header",
                     collapsed.changes,
                     crate::ui_text::panel::git_staged_section(staged_count),
@@ -2698,7 +2919,7 @@ impl TakoApp {
                 ));
                 if !collapsed.changes {
                     for (i, entry) in staged_entries.iter().enumerate() {
-                        root = root.child(self.git_change_row(
+                        body.push(self.git_change_row(
                             ("git-staged-row", i),
                             entry,
                             true,
@@ -2711,7 +2932,7 @@ impl TakoApp {
             }
             // 未ステージセクション
             if !unstaged_entries.is_empty() {
-                root = root.child(self.git_section_header(
+                body.push(self.git_section_header(
                     "git-unstaged-header",
                     collapsed.changes,
                     crate::ui_text::panel::git_unstaged_section(unstaged_entries.len()),
@@ -2728,7 +2949,7 @@ impl TakoApp {
                 ));
                 if !collapsed.changes {
                     for (i, entry) in unstaged_entries.iter().enumerate() {
-                        root = root.child(self.git_change_row(
+                        body.push(self.git_change_row(
                             ("git-unstaged-row", i),
                             entry,
                             false,
@@ -2743,7 +2964,7 @@ impl TakoApp {
 
         // ──── コミットグラフセクション ────
         let selected_commit = self.git_selected_commit.clone();
-        root = root.child(
+        body.push(
             div()
                 .id("git-commits-header")
                 .flex()
@@ -2784,9 +3005,13 @@ impl TakoApp {
 
                 let mut row = div()
                     .id(("git-commit", i))
+                    .w_full()
                     .flex()
                     .flex_row()
                     .items_stretch()
+                    // 行そのものをクリップしないと、内側で ellipsis を効かせても
+                    // 幅の計算がパネル外へ伸びたままになる（#494 の症状 4）
+                    .overflow_hidden()
                     .px_2()
                     .py(px(2.0))
                     .cursor_pointer()
@@ -2853,18 +3078,44 @@ impl TakoApp {
                     .flex_none(),
                 );
 
-                // コミット情報
-                let mut info = div().flex_1().flex().flex_col();
+                // コミット情報。flex アイテムの自動最小幅は内容幅に張り付くので、
+                // overflow_hidden で 0 まで縮められるようにしないと ellipsis が働かず
+                // 行がパネルの右端から流れ出る（#494 の症状 4）
+                let mut info = div().flex_1().flex().flex_col().overflow_hidden();
                 // 1行目: subject + refs
-                let mut first_line = div().flex().flex_row().items_center().gap_1();
+                let mut first_line = div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .overflow_hidden()
+                    .gap_1();
                 first_line = first_line.child(
                     div()
+                        // subject が縮む側、ref バッジは縮まない側
+                        .flex_1()
+                        .overflow_hidden()
                         .text_size(px(11.0))
                         .text_color(hsla(fg_active))
                         .text_ellipsis()
                         .child(commit.subject.clone()),
                 );
                 if has_refs {
+                    // ref バッジは subject より優先度が低い。狭いパネルではバッジが
+                    // subject を押し出して件名がまるごと消えていたので、バッジ帯の幅に
+                    // 上限（パネル幅の 45%）を設けて件名の表示領域を残す（#494）
+                    let refs_max = (self.panel_width * 0.45).max(60.0);
+                    let mut refs_row = div()
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .overflow_hidden()
+                        .gap_1()
+                        .map(|mut d| {
+                            d.style().max_size.width = Some(px(refs_max).into());
+                            d
+                        });
                     for r in commit.refs.split(", ") {
                         let badge_color = data
                             .graph
@@ -2872,8 +3123,10 @@ impl TakoApp {
                             .get(r)
                             .map(|&ci| tako_core::GRAPH_PALETTE[ci])
                             .unwrap_or(accent);
-                        first_line = first_line.child(
+                        refs_row = refs_row.child(
                             div()
+                                .overflow_hidden()
+                                .text_ellipsis()
                                 .px_1()
                                 .rounded(px(3.0))
                                 .text_size(px(9.0))
@@ -2882,22 +3135,35 @@ impl TakoApp {
                                 .child(r.to_string()),
                         );
                     }
+                    first_line = first_line.child(refs_row);
                 }
                 info = info.child(first_line);
                 // 2行目: hash + author + date
                 info = info.child(
                     div()
+                        .w_full()
                         .flex()
                         .flex_row()
+                        .overflow_hidden()
                         .gap_2()
                         .text_size(px(9.0))
                         .text_color(hsla(fg))
-                        .child(hash)
-                        .child(commit.author.clone())
-                        .child(commit.date_relative.clone()),
+                        .child(div().flex_none().child(hash))
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(commit.author.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .overflow_hidden()
+                                .child(commit.date_relative.clone()),
+                        ),
                 );
                 row = row.child(info);
-                root = root.child(row);
+                body.push(row);
             }
         }
 
@@ -2927,12 +3193,14 @@ impl TakoApp {
             if files.is_empty() {
                 continue;
             }
-            root = root.child(
+            body.push(
                 div()
                     .id(("git-diff-header", si))
+                    .w_full()
                     .flex()
                     .flex_row()
                     .items_center()
+                    .overflow_hidden()
                     .gap(px(2.0))
                     .px_2()
                     .py(px(3.0))
@@ -2964,8 +3232,11 @@ impl TakoApp {
             }
             for file in files.iter() {
                 // ファイルヘッダ
-                root = root.child(
+                body.push(
                     div()
+                        .w_full()
+                        .overflow_hidden()
+                        .text_ellipsis()
                         .px_3()
                         .py(px(2.0))
                         .text_size(px(10.0))
@@ -2975,8 +3246,11 @@ impl TakoApp {
                 );
                 for hunk in &file.hunks {
                     // ハンクヘッダ
-                    root = root.child(
+                    body.push(
                         div()
+                            .w_full()
+                            .overflow_hidden()
+                            .text_ellipsis()
                             .px_3()
                             .py(px(1.0))
                             .text_size(px(9.0))
@@ -3006,8 +3280,12 @@ impl TakoApp {
                                 },
                             ),
                         };
-                        root = root.child(
+                        body.push(
                             div()
+                                // diff 行は横に長い。折り返さず省略してパネル内に収める
+                                .w_full()
+                                .overflow_hidden()
+                                .text_ellipsis()
                                 .px_3()
                                 .text_size(px(11.0))
                                 .text_color(hsla(color))
@@ -3019,7 +3297,7 @@ impl TakoApp {
             }
         }
 
-        root
+        root.child(body.finish())
     }
 
     /// git コミットメッセージ入力欄のキーハンドラ（#472 → #487 で全面修正）。
@@ -3033,7 +3311,11 @@ impl TakoApp {
         keystroke: &gpui::Keystroke,
         cx: &mut Context<Self>,
     ) -> bool {
-        let cursor = self.git_commit_cursor.min(self.git_commit_message.len());
+        // #494: 文字境界を割ったまま split/drain すると panic するので必ず丸める
+        let cursor = floor_char_boundary(
+            &self.git_commit_message,
+            self.git_commit_cursor.min(self.git_commit_message.len()),
+        );
         self.git_commit_cursor = cursor;
         match keystroke.key.as_str() {
             "enter" if keystroke.modifiers.platform => {
@@ -3110,18 +3392,14 @@ impl TakoApp {
             _ => {
                 if let Some(ch) = keystroke.key_char.as_deref() {
                     if !ch.is_empty() && !ch.chars().any(|c| c.is_control()) {
-                        self.git_commit_message.insert_str(cursor, ch);
-                        self.git_commit_cursor = cursor + ch.len();
-                        cx.notify();
+                        self.git_commit_insert(ch, cx);
                         return true;
                     }
                 }
                 // 空白は key_char が来ないことがある（実機で「Fix-487 staged」の
                 // 空白以降が入らないのを観測。#487）ので論理キー名で拾い直す
                 if keystroke.key == "space" {
-                    self.git_commit_message.insert(cursor, ' ');
-                    self.git_commit_cursor = cursor + 1;
-                    cx.notify();
+                    self.git_commit_insert(" ", cx);
                     return true;
                 }
                 // 修飾なしキーは入力欄が握る（ターミナルへ漏らさない）
@@ -3138,6 +3416,9 @@ impl TakoApp {
         paths: Vec<String>,
         cx: &mut Context<Self>,
     ) {
+        if !self.git_begin_op("stage", cx) {
+            return;
+        }
         let label = stage_feedback_label(&paths);
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -3149,6 +3430,7 @@ impl TakoApp {
                 })
                 .await;
             let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                app.git_busy = None;
                 match result {
                     Ok(_) => app.git_set_feedback(format!("staged: {label}"), false, cx),
                     Err(e) => app.git_set_feedback(e, true, cx),
@@ -3166,6 +3448,9 @@ impl TakoApp {
         paths: Vec<String>,
         cx: &mut Context<Self>,
     ) {
+        if !self.git_begin_op("unstage", cx) {
+            return;
+        }
         let label = stage_feedback_label(&paths);
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -3177,6 +3462,7 @@ impl TakoApp {
                 })
                 .await;
             let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                app.git_busy = None;
                 match result {
                     Ok(_) => app.git_set_feedback(format!("unstaged: {label}"), false, cx),
                     Err(e) => app.git_set_feedback(e, true, cx),
@@ -3187,14 +3473,86 @@ impl TakoApp {
         .detach();
     }
 
+    /// コミットメッセージ入力欄へ文字列を挿入する（#494）。
+    /// キー入力・IME 確定・貼り付けの全経路をここに集約し、
+    /// ①制御文字の混入 ②上限超過 ③文字境界を割った挿入（panic）を一箇所で防ぐ。
+    pub(crate) fn git_commit_insert(&mut self, text: &str, cx: &mut Context<Self>) {
+        let insert = tako_core::git::sanitize_commit_message(text);
+        if insert.is_empty() {
+            return;
+        }
+        let cursor = crate::right_panel::floor_char_boundary(
+            &self.git_commit_message,
+            self.git_commit_cursor.min(self.git_commit_message.len()),
+        );
+        // 上限に収まる分だけ入れる（超過分は捨て、理由をカードで知らせる）
+        let room = tako_core::COMMIT_MESSAGE_MAX.saturating_sub(self.git_commit_message.len());
+        let insert = if insert.len() > room {
+            let cut = crate::right_panel::floor_char_boundary(&insert, room);
+            let msg =
+                crate::ui_text::panel::git_commit_message_too_long(tako_core::COMMIT_MESSAGE_MAX);
+            self.git_set_feedback(msg, true, cx);
+            insert[..cut].to_string()
+        } else {
+            insert
+        };
+        if insert.is_empty() {
+            cx.notify();
+            return;
+        }
+        self.git_commit_message.insert_str(cursor, &insert);
+        self.git_commit_cursor = cursor + insert.len();
+        cx.notify();
+    }
+
+    /// git 操作を開始できるなら busy を立てて true を返す（#494）。
+    /// 既に別の操作が走っていれば false（連打・二重押しをここで弾く）。
+    fn git_begin_op(&mut self, op: &'static str, cx: &mut Context<Self>) -> bool {
+        if self.git_busy.is_some() {
+            return false;
+        }
+        self.git_busy = Some(op);
+        cx.notify();
+        true
+    }
+
+    /// コミットできない理由をフィードバックへ出す（#494。無効ボタンを押しても
+    /// 無反応にせず、なぜ実行されないのかを必ず言葉で返す）
+    pub(crate) fn git_report_commit_block(&mut self, cx: &mut Context<Self>) {
+        if let Some(op) = self.git_busy {
+            let msg = crate::ui_text::panel::git_busy(op);
+            self.git_set_feedback(msg, false, cx);
+            return;
+        }
+        let has_changes = self.git_data.as_ref().is_some_and(|d| !d.status.is_empty());
+        let msg = match tako_core::git::commit_block(&self.git_commit_message, has_changes) {
+            Some(tako_core::CommitBlock::EmptyMessage) => {
+                crate::ui_text::panel::git_commit_blocked_empty()
+            }
+            Some(tako_core::CommitBlock::NoChanges) => {
+                crate::ui_text::panel::git_commit_blocked_no_changes()
+            }
+            None => return,
+        };
+        self.git_set_feedback(msg.to_string(), true, cx);
+    }
+
     /// git commit を background で実行し、完了後にフィードバック表示 + データ更新（#472）。
     /// #487: ステージ済みがあるときは `-a` を付けず「ステージした分だけ」コミットする
     /// （付けたままだと UI のステージング操作が無意味になる）
     fn git_do_commit(&mut self, repo_root: String, cx: &mut Context<Self>) {
-        let message = self.git_commit_message.clone();
-        if message.trim().is_empty() {
+        // #494: ボタン・Cmd+Enter のどちらの経路でも同じ判定で弾き、理由を必ず出す
+        let has_changes = self.git_data.as_ref().is_some_and(|d| !d.status.is_empty());
+        if tako_core::git::commit_block(&self.git_commit_message, has_changes).is_some() {
+            self.git_report_commit_block(cx);
             return;
         }
+        if !self.git_begin_op("commit", cx) {
+            return;
+        }
+        let message = self.git_commit_message.clone();
+        // 失敗時に入力欄へ戻すため、送るコピーとは別に保持しておく
+        let restore = message.clone();
         let has_staged = self
             .git_data
             .as_ref()
@@ -3211,9 +3569,19 @@ impl TakoApp {
                 })
                 .await;
             let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                app.git_busy = None;
                 match result {
-                    Ok(out) => app.git_set_feedback(out.trim().to_string(), false, cx),
-                    Err(e) => app.git_set_feedback(e, true, cx),
+                    Ok(out) => {
+                        app.git_set_feedback(git_result_summary(&out, "commit done"), false, cx)
+                    }
+                    Err(e) => {
+                        // 失敗したメッセージは打ち直させない（入力欄へ戻す）
+                        if app.git_commit_message.trim().is_empty() {
+                            app.git_commit_message = restore;
+                            app.git_commit_cursor = app.git_commit_message.len();
+                        }
+                        app.git_set_feedback(e, true, cx);
+                    }
                 }
                 app.refresh_git(cx);
             });
@@ -3223,6 +3591,9 @@ impl TakoApp {
 
     /// git pull を background で実行（#472）
     fn git_do_pull(&mut self, repo_root: String, cx: &mut Context<Self>) {
+        if !self.git_begin_op("pull", cx) {
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -3232,12 +3603,13 @@ impl TakoApp {
                 })
                 .await;
             let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                app.git_busy = None;
                 match result {
                     Ok(out) => {
                         let msg = if out.trim().is_empty() {
                             "Already up to date.".to_string()
                         } else {
-                            out.trim().lines().last().unwrap_or("pull done").to_string()
+                            git_result_summary(&out, "pull done")
                         };
                         app.git_set_feedback(msg, false, cx);
                     }
@@ -3251,6 +3623,9 @@ impl TakoApp {
 
     /// git push を background で実行（#472）
     fn git_do_push(&mut self, repo_root: String, cx: &mut Context<Self>) {
+        if !self.git_begin_op("push", cx) {
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -3260,14 +3635,10 @@ impl TakoApp {
                 })
                 .await;
             let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                app.git_busy = None;
                 match result {
                     Ok(out) => {
-                        let msg = if out.trim().is_empty() {
-                            "push done".to_string()
-                        } else {
-                            out.trim().lines().last().unwrap_or("push done").to_string()
-                        };
-                        app.git_set_feedback(msg, false, cx);
+                        app.git_set_feedback(git_result_summary(&out, "push done"), false, cx)
                     }
                     Err(e) => app.git_set_feedback(e, true, cx),
                 }
@@ -3277,17 +3648,27 @@ impl TakoApp {
         .detach();
     }
 
-    /// フィードバックメッセージをセットし、4 秒後に自動クリア（#472）
+    /// フィードバックメッセージをセットする（#472 → #494）。
+    /// 成功は 4 秒で自動クリア、**失敗は閉じるまで残す**（4 秒で消えると
+    /// 何が起きたか読む前に消え、無反応と区別できないため）
     fn git_set_feedback(&mut self, message: String, is_error: bool, cx: &mut Context<Self>) {
-        self.git_feedback = Some(GitFeedback { message, is_error });
+        self.git_feedback = Some(GitFeedback {
+            message: git_feedback_text(&message),
+            is_error,
+        });
         cx.notify();
+        if is_error {
+            return;
+        }
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(std::time::Duration::from_secs(4))
                 .await;
             let _ = this.update(cx, |app: &mut TakoApp, cx| {
-                app.git_feedback = None;
-                cx.notify();
+                if app.git_feedback.as_ref().is_some_and(|f| !f.is_error) {
+                    app.git_feedback = None;
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -3470,5 +3851,80 @@ impl TakoApp {
                         ),
                 ),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #494 の再発防止（構造不変条件）。
+    /// git ビューのスクロール領域に積む行は **必ず flex-shrink: 0** でなければならない。
+    /// 付いていないと、コンテンツ総高さがパネル高さを超えた瞬間に taffy が行を圧縮し、
+    /// 行同士が重なって描画される（実機で 3 回再発した崩れの本体）。
+    #[test]
+    fn スクロール行は縮まない設定になる() {
+        let mut row = git_scroll_row(div());
+        assert_eq!(
+            row.style().flex_shrink,
+            Some(0.0),
+            "スクロール領域の行に flex_shrink_0 が付いていない"
+        );
+    }
+
+    /// #494: バイトオフセットを文字境界へ丸める（丸めないと split_at / insert_str が panic する）
+    #[test]
+    fn 文字境界への丸め() {
+        let s = "あa\u{1F600}";
+        // 「あ」= 0..3、「a」= 3..4、「\u{1F600}」= 4..8
+        assert_eq!(floor_char_boundary(s, 0), 0);
+        assert_eq!(floor_char_boundary(s, 1), 0);
+        assert_eq!(floor_char_boundary(s, 2), 0);
+        assert_eq!(floor_char_boundary(s, 3), 3);
+        assert_eq!(floor_char_boundary(s, 5), 4);
+        assert_eq!(floor_char_boundary(s, 7), 4);
+        // 範囲外は末尾へクランプ
+        assert_eq!(floor_char_boundary(s, 99), s.len());
+        // 丸めた位置で split しても panic しない
+        for i in 0..=s.len() + 5 {
+            let _ = s.split_at(floor_char_boundary(s, i));
+        }
+    }
+
+    /// #494: 長いメッセージでもキャレットを画面内に残すための切り詰め
+    #[test]
+    fn 前後の切り詰めは文字単位() {
+        assert_eq!(tail_chars("あいうえお", 2), "えお");
+        assert_eq!(tail_chars("あい", 5), "あい");
+        assert_eq!(head_chars("あいうえお", 2), "あい");
+        assert_eq!(head_chars("あい", 5), "あい");
+        // サロゲートペア相当でも壊れない
+        assert_eq!(tail_chars("a\u{1F600}b", 2), "\u{1F600}b");
+        assert_eq!(head_chars("a\u{1F600}b", 2), "a\u{1F600}");
+    }
+
+    /// #494: git のエラーは数十行になり得る。カードがパネルを覆わないよう要約する
+    #[test]
+    fn フィードバックは行数と文字数で頭打ちにする() {
+        let many = (1..=20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = git_feedback_text(&many);
+        assert_eq!(out.lines().count(), GIT_FEEDBACK_MAX_LINES);
+        assert!(out.ends_with('…'), "省略記号が付いていない: {out:?}");
+        // 空行は落とす
+        assert_eq!(git_feedback_text("\n\n  a  \n\n"), "  a");
+        // 1 行が極端に長い場合も文字数で切る
+        let long = "あ".repeat(GIT_FEEDBACK_MAX_CHARS + 100);
+        let out = git_feedback_text(&long);
+        assert_eq!(out.chars().count(), GIT_FEEDBACK_MAX_CHARS + 1);
+    }
+
+    /// #494: 成功出力の要約は「最後の意味のある行」
+    #[test]
+    fn コマンド出力の要約() {
+        assert_eq!(git_result_summary("a\nb\n\n", "fallback"), "b".to_string());
+        assert_eq!(git_result_summary("   \n", "fallback"), "fallback");
     }
 }

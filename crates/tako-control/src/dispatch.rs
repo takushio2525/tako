@@ -2708,8 +2708,19 @@ fn dispatch_inner(
                     }
                     let mode = ThemeMode::parse(&next_theme).unwrap_or_default();
                     host.set_theme_mode(mode);
-                    host.reload_theme();
-                    Ok(make_status(host))
+                    if should_save {
+                        // 保存した設定（プリセット・色オーバーライド）を読み直して適用する。
+                        // 保存をスキップしたとき（セルフテスト・単体テスト）に呼ぶと、
+                        // ディスク上の古いテーマを読み直して今の適用を即座に巻き戻す
+                        host.reload_theme();
+                    }
+                    let mut status = make_status(host);
+                    if !should_save {
+                        // settings.json を書いていないので、status の theme は
+                        // ディスクの古い値になる。今適用した値で上書きして返す
+                        status["theme"] = serde_json::json!(next_theme);
+                    }
+                    Ok(status)
                 }
                 "colors" => {
                     let settings = crate::settings::load();
