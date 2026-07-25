@@ -1256,3 +1256,14 @@
   → `Note` のまま保持し描画時に解決する形へ修正（#518 に警告したのと同じ罠）
 - 関連: PR（`Refs #467, #516`）。1298 tests / fmt / clippy / クロス check 全緑
 
+## 2026-07-25（#518 設計 + #519 段取り①②: 永続バックエンド境界 B2 の新設）
+- #518 設計（`.agent/plans/2026-07-windows-persistence-backend.md`、PR #531 merge 済み）:
+  tmux の役割を「生存の器」と「アウトオブプロセス到達」に分離。後者はほぼ全経路で
+  フォールバックであることを実コードで確認し、trait を 2 段（`SessionBackend` / `DetachedAccess`）にした
+- #519 ①②: `tako-core::backend` 新設（`SessionRef` newtype で #428 のターゲット式取り違えを構造排除、
+  `TmuxBackend` は既存自由関数への委譲、`NullBackend` は器なし）。`TAKO_BACKEND=none|tmux|auto` で
+  **macOS 上に Windows の縮退経路が生えた**（`available()` を「tmux が選択されたか」に一本化）
+- 実測（隔離）: none = layout.json 保存あり / session null / tmux サーバー不在 / 復元は構成と cwd のみ・
+  画面マーカー 2→0、auto = 再 attach 2・マーカー 2→1。セルフテスト（tmux モード）は FAILED 0 で完走
+- 関連: PR（`Refs #519`）。1280 tests / fmt / clippy / check-windows.sh 全緑
+- 次: 段取り③（`PaneReach` 導入・dispatch 約 40 箇所）→ ④⑤⑥

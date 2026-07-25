@@ -32,11 +32,26 @@ pub fn socket_name() -> String {
         .unwrap_or_else(|| "tako".into())
 }
 
-/// tmux が使えるか（`tmux -V` が成功するか）。プロセス内でキャッシュする。
-/// バイナリは `tmux::tmux_bin`（ログインシェル解決込み）で引く（.app の最小 PATH 対策）
+/// **tmux バックエンドが有効か**（= 器として tmux が選択されているか）。
+///
+/// Issue #519 で意味を「tmux バイナリが在るか」から
+/// 「`backend::choice()` が tmux を選んだか」へ一段上げた。既存の全呼び出し箇所は
+/// もともと「永続バックエンドが効いているか」の意味で使っており、
+/// 判定の単一定義を `backend::choice()` に寄せることで
+/// `TAKO_BACKEND=none`（設計 §8.2 の R0）が全経路へ一度に効く。
+///
+/// バイナリの実在判定そのものは [`tmux_binary_present`]。
 pub fn available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
+    crate::backend::choice() == crate::backend::Choice::Tmux
+}
+
+/// tmux バイナリが実在して動くか（`tmux -V` が成功するか）。プロセス内でキャッシュする。
+/// バイナリは `tmux::tmux_bin`（ログインシェル解決込み）で引く（.app の最小 PATH 対策）。
+///
+/// これは**環境の事実**であって選択ではない。選択は `backend::choice()` が決める
+pub fn tmux_binary_present() -> bool {
+    static PRESENT: OnceLock<bool> = OnceLock::new();
+    *PRESENT.get_or_init(|| {
         crate::tmux::tmux_command(None)
             .arg("-V")
             .output()
