@@ -92,6 +92,11 @@ pub enum OffloadJob {
         cwd: PathBuf,
         target: Option<String>,
     },
+    GitShow {
+        cwd: PathBuf,
+        hash: String,
+        file: Option<String>,
+    },
 }
 
 /// リクエストが offload 対象なら UI スレッド必須の文脈を収集してジョブ化する。
@@ -144,6 +149,13 @@ pub fn prepare_offload(
                 target: target.clone(),
             }))
         }
+        Request::GitShow { pane, hash, file } => {
+            Some(git_pane_cwd(host, *pane).map(|cwd| OffloadJob::GitShow {
+                cwd,
+                hash: hash.clone(),
+                file: file.clone(),
+            }))
+        }
         _ => None,
     }
 }
@@ -163,6 +175,7 @@ impl OffloadJob {
             } => finish_workers_list(&live_panes, include_closed),
             OffloadJob::GitLog { cwd, max_count } => run_git_log(&cwd, max_count),
             OffloadJob::GitDiff { cwd, target } => run_git_diff(&cwd, target.as_deref()),
+            OffloadJob::GitShow { cwd, hash, file } => run_git_show(&cwd, &hash, file.as_deref()),
         }
     }
 }
@@ -361,6 +374,55 @@ fn run_git_diff(cwd: &Path, target: Option<&str>) -> Result<Value, DispatchError
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
     }))
+}
+
+fn run_git_show(cwd: &Path, hash: &str, file: Option<&str>) -> Result<Value, DispatchError> {
+    let repo = tako_core::git::repo_root(cwd)
+        .ok_or(DispatchError::Operation("git リポジトリではない".into()))?;
+    let detail = tako_core::git::show_commit(&repo, hash).map_err(DispatchError::Operation)?;
+    let mut result = json!({
+        "hash": detail.hash,
+        "author_name": detail.author_name,
+        "author_email": detail.author_email,
+        "author_date": detail.author_date,
+        "committer_name": detail.committer_name,
+        "committer_email": detail.committer_email,
+        "committer_date": detail.committer_date,
+        "subject": detail.subject,
+        "body": detail.body,
+        "parents": detail.parents,
+        "files": detail.files.iter().map(|f| json!({
+            "path": f.path,
+            "kind": String::from(match f.kind {
+                'A' => "added",
+                'D' => "deleted",
+                'R' => "renamed",
+                'C' => "copied",
+                _ => "modified",
+            }),
+            "additions": f.additions,
+            "deletions": f.deletions,
+            "old_path": f.old_path,
+        })).collect::<Vec<_>>(),
+    });
+    if let Some(file_path) = file {
+        let hunks = tako_core::git::diff_file_commit(&repo, hash, file_path);
+        result["diff"] = json!(hunks
+            .iter()
+            .map(|h| json!({
+                "header": h.header,
+                "lines": h.lines.iter().map(|l| json!({
+                    "kind": match l.kind {
+                        tako_core::DiffLineKind::Context => "context",
+                        tako_core::DiffLineKind::Add => "add",
+                        tako_core::DiffLineKind::Remove => "remove",
+                    },
+                    "content": l.content,
+                })).collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>());
+    }
+    Ok(result)
 }
 
 fn dispatch_inner(
@@ -1854,6 +1916,10 @@ fn dispatch_inner(
         Request::GitDiff { pane, target } => {
             let cwd = git_pane_cwd(host, pane)?;
             run_git_diff(&cwd, target.as_deref())
+        }
+        Request::GitShow { pane, hash, file } => {
+            let cwd = git_pane_cwd(host, pane)?;
+            run_git_show(&cwd, &hash, file.as_deref())
         }
         Request::GitCommit { pane, message, all } => {
             let cwd = git_pane_cwd(host, pane)?;

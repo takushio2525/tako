@@ -3023,6 +3023,7 @@ impl TakoApp {
                         } else {
                             this.git_selected_commit = Some(full_hash.clone());
                         }
+                        this.git_selected_file = None;
                         // 即座に diff を取得する
                         if let Some(cwd) = this.git_cwd_for_tab() {
                             let selected = this.git_selected_commit.clone();
@@ -3167,35 +3168,151 @@ impl TakoApp {
             }
         }
 
-        // ──── diff セクション（#487: 未ステージ / ステージ済み / 選択コミットを別見出しに）────
-        let diff_sections: Vec<(String, &Vec<tako_core::DiffFile>)> = if selected_commit.is_some() {
-            vec![(
-                crate::ui_text::panel::git_diff_commit(data.diff_files.len()),
-                &data.diff_files,
-            )]
-        } else {
-            let mut v: Vec<(String, &Vec<tako_core::DiffFile>)> = Vec::new();
-            if !data.diff_files.is_empty() {
-                v.push((
-                    crate::ui_text::panel::git_diff_unstaged(data.diff_files.len()),
-                    &data.diff_files,
-                ));
-            }
-            if !data.diff_staged.is_empty() {
-                v.push((
-                    crate::ui_text::panel::git_diff_staged(data.diff_staged.len()),
-                    &data.diff_staged,
-                ));
-            }
-            v
-        };
-        for (si, (label, files)) in diff_sections.iter().enumerate() {
-            if files.is_empty() {
-                continue;
-            }
+        // ──── コミット詳細セクション（#495: 選択コミットのメタ + ファイル一覧 + diff）────
+        if let Some(detail) = &data.commit_detail {
+            // メタ情報ヘッダ
             body.push(
                 div()
-                    .id(("git-diff-header", si))
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .px_2()
+                    .py(px(4.0))
+                    .mt_1()
+                    .bg(rgba_alpha(accent, 0.06))
+                    .rounded(px(4.0))
+                    // フルハッシュ（クリックでコピー）
+                    .child({
+                        let hash_copy = detail.hash.clone();
+                        div()
+                            .id("git-detail-hash")
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .overflow_hidden()
+                            .gap_1()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(rgba_alpha(bg_hover, 0.3)))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    hash_copy.clone(),
+                                ));
+                            }))
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(hsla(fg))
+                                    .flex_none()
+                                    .child("SHA"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(hsla(fg_active))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(SharedString::from(detail.hash.clone())),
+                            )
+                            .child(
+                                svg()
+                                    .path(ui_icon::COPY)
+                                    .w(px(10.0))
+                                    .h(px(10.0))
+                                    .flex_none()
+                                    .text_color(hsla(fg)),
+                            )
+                    })
+                    // subject
+                    .child(
+                        div()
+                            .w_full()
+                            .overflow_hidden()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(hsla(fg_active))
+                            .child(SharedString::from(detail.subject.clone())),
+                    )
+                    // body（あれば）
+                    .when(!detail.body.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .w_full()
+                                .overflow_hidden()
+                                .text_size(px(10.0))
+                                .text_color(hsla(fg))
+                                .child(SharedString::from(detail.body.clone())),
+                        )
+                    })
+                    // author
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .overflow_hidden()
+                            .gap_1()
+                            .text_size(px(9.0))
+                            .child(div().text_color(hsla(fg)).flex_none().child("Author"))
+                            .child(
+                                div()
+                                    .text_color(hsla(fg_active))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(SharedString::from(format!(
+                                        "{} <{}>",
+                                        detail.author_name, detail.author_email
+                                    ))),
+                            )
+                            .child(
+                                div()
+                                    .text_color(hsla(fg))
+                                    .flex_none()
+                                    .child(SharedString::from(detail.author_date.clone())),
+                            ),
+                    )
+                    // parents
+                    .when(!detail.parents.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .flex_row()
+                                .overflow_hidden()
+                                .gap_1()
+                                .text_size(px(9.0))
+                                .child(div().text_color(hsla(fg)).flex_none().child(
+                                    if detail.parents.len() > 1 {
+                                        "Parents"
+                                    } else {
+                                        "Parent"
+                                    },
+                                ))
+                                .child(
+                                    div()
+                                        .text_color(hsla(fg_active))
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .child(SharedString::from(
+                                            detail
+                                                .parents
+                                                .iter()
+                                                .map(|p| &p[..p.len().min(8)])
+                                                .collect::<Vec<_>>()
+                                                .join(", "),
+                                        )),
+                                ),
+                        )
+                    }),
+            );
+
+            // 変更ファイル一覧
+            let selected_file = self.git_selected_file.clone();
+            let file_count = detail.files.len();
+            body.push(
+                div()
+                    .id("git-detail-files-header")
                     .w_full()
                     .flex()
                     .flex_row()
@@ -3204,94 +3321,262 @@ impl TakoApp {
                     .gap(px(2.0))
                     .px_2()
                     .py(px(3.0))
-                    .mt_1()
-                    .cursor_pointer()
                     .text_size(px(10.0))
                     .text_color(hsla(fg))
-                    .hover(|d| d.bg(rgba_alpha(bg_hover, 0.3)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.git_collapsed.diff = !this.git_collapsed.diff;
-                        cx.notify();
-                    }))
-                    .child(
-                        svg()
-                            .path(if collapsed.diff {
-                                ui_icon::CHEVRON_RIGHT
-                            } else {
-                                ui_icon::CHEVRON_DOWN
-                            })
-                            .w(px(10.0))
-                            .h(px(10.0))
-                            .flex_none()
-                            .text_color(hsla(fg)),
-                    )
-                    .child(SharedString::from(label.clone())),
+                    .child(SharedString::from(format!("Files ({file_count})"))),
             );
-            if collapsed.diff {
-                continue;
-            }
-            for file in files.iter() {
-                // ファイルヘッダ
+            for (fi, fc) in detail.files.iter().enumerate() {
+                let is_file_selected = selected_file.as_deref() == Some(&fc.path);
+                let file_path = fc.path.clone();
+                let kind_badge = match fc.kind {
+                    'A' => ("A", theme.green),
+                    'D' => ("D", theme.red),
+                    'R' => ("R", theme.ansi[6]),
+                    'C' => ("C", theme.ansi[6]),
+                    _ => ("M", theme.yellow),
+                };
+                let stat_label = format!("+{} -{}", fc.additions, fc.deletions);
                 body.push(
                     div()
+                        .id(("git-detail-file", fi))
                         .w_full()
+                        .flex()
+                        .flex_row()
+                        .items_center()
                         .overflow_hidden()
-                        .text_ellipsis()
+                        .gap_1()
                         .px_3()
                         .py(px(2.0))
-                        .text_size(px(10.0))
-                        .text_color(hsla(fg_active))
-                        .bg(rgba_alpha(fg, 0.05))
-                        .child(file.path.clone()),
+                        .cursor_pointer()
+                        .when(is_file_selected, |d| d.bg(rgba_alpha(accent, 0.15)))
+                        .hover(|d| d.bg(rgba_alpha(bg_hover, 0.3)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.git_selected_file.as_deref() == Some(&file_path) {
+                                this.git_selected_file = None;
+                            } else {
+                                this.git_selected_file = Some(file_path.clone());
+                            }
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .w(px(14.0))
+                                .flex_none()
+                                .text_size(px(9.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(hsla(kind_badge.1))
+                                .child(kind_badge.0),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_size(px(10.0))
+                                .text_color(hsla(fg_active))
+                                .child(SharedString::from(fc.path.clone())),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(9.0))
+                                .text_color(hsla(fg))
+                                .child(SharedString::from(stat_label)),
+                        ),
                 );
-                for hunk in &file.hunks {
-                    // ハンクヘッダ
+            }
+
+            // 選択ファイルの diff（diff_files からパスで探す）
+            if let Some(sel_path) = &selected_file {
+                let matching_diff: Vec<&tako_core::DiffFile> = data
+                    .diff_files
+                    .iter()
+                    .filter(|f| f.path == *sel_path)
+                    .collect();
+                if matching_diff.is_empty() {
+                    body.push(
+                        div()
+                            .px_3()
+                            .py(px(4.0))
+                            .text_size(px(10.0))
+                            .text_color(hsla(fg))
+                            .child(SharedString::from(format!("{sel_path}: no diff"))),
+                    );
+                }
+                for file in matching_diff {
                     body.push(
                         div()
                             .w_full()
                             .overflow_hidden()
                             .text_ellipsis()
                             .px_3()
-                            .py(px(1.0))
-                            .text_size(px(9.0))
-                            .text_color(hsla(theme.ansi[6])) // cyan
-                            .child(hunk.header.clone()),
+                            .py(px(2.0))
+                            .text_size(px(10.0))
+                            .text_color(hsla(fg_active))
+                            .bg(rgba_alpha(fg, 0.05))
+                            .child(SharedString::from(file.path.clone())),
                     );
-                    for line in &hunk.lines {
-                        let (prefix, color, bg_color) = match line.kind {
-                            tako_core::DiffLineKind::Add => (
-                                "+",
-                                theme.green, // 緑
-                                rgba_alpha(theme.green, 0.1),
-                            ),
-                            tako_core::DiffLineKind::Remove => (
-                                "-",
-                                theme.red, // 赤
-                                rgba_alpha(theme.red, 0.1),
-                            ),
-                            tako_core::DiffLineKind::Context => (
-                                " ",
-                                fg,
-                                Rgba {
-                                    r: 0.0,
-                                    g: 0.0,
-                                    b: 0.0,
-                                    a: 0.0,
-                                },
-                            ),
-                        };
+                    for hunk in &file.hunks {
                         body.push(
                             div()
-                                // diff 行は横に長い。折り返さず省略してパネル内に収める
                                 .w_full()
                                 .overflow_hidden()
                                 .text_ellipsis()
                                 .px_3()
-                                .text_size(px(11.0))
-                                .text_color(hsla(color))
-                                .bg(bg_color)
-                                .child(format!("{prefix}{}", line.content)),
+                                .py(px(1.0))
+                                .text_size(px(9.0))
+                                .text_color(hsla(theme.ansi[6]))
+                                .child(SharedString::from(hunk.header.clone())),
                         );
+                        for line in &hunk.lines {
+                            let (prefix, color, bg_color) = match line.kind {
+                                tako_core::DiffLineKind::Add => {
+                                    ("+", theme.green, rgba_alpha(theme.green, 0.1))
+                                }
+                                tako_core::DiffLineKind::Remove => {
+                                    ("-", theme.red, rgba_alpha(theme.red, 0.1))
+                                }
+                                tako_core::DiffLineKind::Context => (
+                                    " ",
+                                    fg,
+                                    Rgba {
+                                        r: 0.0,
+                                        g: 0.0,
+                                        b: 0.0,
+                                        a: 0.0,
+                                    },
+                                ),
+                            };
+                            body.push(
+                                div()
+                                    .w_full()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .px_3()
+                                    .text_size(px(11.0))
+                                    .text_color(hsla(color))
+                                    .bg(bg_color)
+                                    .child(format!("{prefix}{}", line.content)),
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            // ──── diff セクション（#487: 未ステージ / ステージ済みの通常表示）────
+            let diff_sections: Vec<(String, &Vec<tako_core::DiffFile>)> = {
+                let mut v: Vec<(String, &Vec<tako_core::DiffFile>)> = Vec::new();
+                if !data.diff_files.is_empty() {
+                    v.push((
+                        crate::ui_text::panel::git_diff_unstaged(data.diff_files.len()),
+                        &data.diff_files,
+                    ));
+                }
+                if !data.diff_staged.is_empty() {
+                    v.push((
+                        crate::ui_text::panel::git_diff_staged(data.diff_staged.len()),
+                        &data.diff_staged,
+                    ));
+                }
+                v
+            };
+            for (si, (label, files)) in diff_sections.iter().enumerate() {
+                if files.is_empty() {
+                    continue;
+                }
+                body.push(
+                    div()
+                        .id(("git-diff-header", si))
+                        .w_full()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .overflow_hidden()
+                        .gap(px(2.0))
+                        .px_2()
+                        .py(px(3.0))
+                        .mt_1()
+                        .cursor_pointer()
+                        .text_size(px(10.0))
+                        .text_color(hsla(fg))
+                        .hover(|d| d.bg(rgba_alpha(bg_hover, 0.3)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.git_collapsed.diff = !this.git_collapsed.diff;
+                            cx.notify();
+                        }))
+                        .child(
+                            svg()
+                                .path(if collapsed.diff {
+                                    ui_icon::CHEVRON_RIGHT
+                                } else {
+                                    ui_icon::CHEVRON_DOWN
+                                })
+                                .w(px(10.0))
+                                .h(px(10.0))
+                                .flex_none()
+                                .text_color(hsla(fg)),
+                        )
+                        .child(SharedString::from(label.clone())),
+                );
+                if collapsed.diff {
+                    continue;
+                }
+                for file in files.iter() {
+                    body.push(
+                        div()
+                            .w_full()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .px_3()
+                            .py(px(2.0))
+                            .text_size(px(10.0))
+                            .text_color(hsla(fg_active))
+                            .bg(rgba_alpha(fg, 0.05))
+                            .child(file.path.clone()),
+                    );
+                    for hunk in &file.hunks {
+                        body.push(
+                            div()
+                                .w_full()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .px_3()
+                                .py(px(1.0))
+                                .text_size(px(9.0))
+                                .text_color(hsla(theme.ansi[6]))
+                                .child(hunk.header.clone()),
+                        );
+                        for line in &hunk.lines {
+                            let (prefix, color, bg_color) = match line.kind {
+                                tako_core::DiffLineKind::Add => {
+                                    ("+", theme.green, rgba_alpha(theme.green, 0.1))
+                                }
+                                tako_core::DiffLineKind::Remove => {
+                                    ("-", theme.red, rgba_alpha(theme.red, 0.1))
+                                }
+                                tako_core::DiffLineKind::Context => (
+                                    " ",
+                                    fg,
+                                    Rgba {
+                                        r: 0.0,
+                                        g: 0.0,
+                                        b: 0.0,
+                                        a: 0.0,
+                                    },
+                                ),
+                            };
+                            body.push(
+                                div()
+                                    .w_full()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .px_3()
+                                    .text_size(px(11.0))
+                                    .text_color(hsla(color))
+                                    .bg(bg_color)
+                                    .child(format!("{prefix}{}", line.content)),
+                            );
+                        }
                     }
                 }
             }

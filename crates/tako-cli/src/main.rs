@@ -879,6 +879,17 @@ enum GitCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
+    /// コミット詳細を JSON で出力する（#495）。メタ情報・変更ファイル一覧を返す。
+    /// --file でそのファイルの diff も含める
+    Show {
+        /// コミットハッシュ（短縮可）
+        hash: String,
+        /// diff を取得するファイルパス（省略時はファイル一覧のみ）
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
     /// git commit（#472）
     Commit {
         /// コミットメッセージ
@@ -4049,6 +4060,11 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Git(GitCommand::Diff { target, pane }) => Request::GitDiff {
             pane: target_pane(*pane)?,
             target: target.clone(),
+        },
+        Command::Git(GitCommand::Show { hash, file, pane }) => Request::GitShow {
+            pane: target_pane(*pane)?,
+            hash: hash.clone(),
+            file: file.clone(),
         },
         Command::Git(GitCommand::Commit { message, all, pane }) => Request::GitCommit {
             pane: target_pane(*pane)?,

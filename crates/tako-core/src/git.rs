@@ -730,6 +730,162 @@ fn first_empty(active: &[Option<String>]) -> usize {
         .unwrap_or(active.len())
 }
 
+// ──────────────────────── コミット詳細（#495）────────────────────────
+
+/// コミットの変更ファイル 1 件（`git show --numstat` + `--diff-filter` から）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitFileChange {
+    pub path: String,
+    /// 変更種別: A(dd) / M(odify) / D(elete) / R(ename) / C(opy)
+    pub kind: char,
+    pub additions: usize,
+    pub deletions: usize,
+    /// リネーム元のパス（kind=R のときのみ有値）
+    pub old_path: Option<String>,
+}
+
+/// コミットの詳細情報（#495。`git show` 相当）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitDetail {
+    pub hash: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub author_date: String,
+    pub committer_name: String,
+    pub committer_email: String,
+    pub committer_date: String,
+    pub subject: String,
+    pub body: String,
+    pub parents: Vec<String>,
+    pub files: Vec<CommitFileChange>,
+}
+
+/// 特定コミットの詳細を取得する（#495）。
+/// `git log -1 --format=...` でメタ情報、`git diff-tree --no-commit-id -r --numstat --diff-filter` で
+/// 変更ファイル一覧を取る（`git show --stat` より機械可読）。
+/// 初期コミット（親なし）は `--root` を付けて対応する
+pub fn show_commit(repo: &Path, hash: &str) -> Result<CommitDetail, String> {
+    const DETAIL_FORMAT: &str = "%H\x01%an\x01%ae\x01%ai\x01%cn\x01%ce\x01%ci\x01%s\x01%b\x01%P";
+    let meta_raw = run_git(
+        repo,
+        &["log", "-1", &format!("--format={DETAIL_FORMAT}"), hash],
+    )?;
+    let meta_raw = meta_raw.trim_end();
+    // %b（本文）に改行が含まれ得るので、最後の \x01 以降を parents として取る
+    // フォーマット: hash\x01author\x01email\x01date\x01cn\x01ce\x01cd\x01subject\x01body\x01parents
+    // body 内に \x01 が入ることは現実的に無いが、分割は先頭 7 + 末尾 1 で固定して安全に取る
+    let fields: Vec<&str> = meta_raw.splitn(8, '\x01').collect();
+    if fields.len() < 8 {
+        return Err(format!("コミット {hash} の情報を解析できない"));
+    }
+    // fields[7] = "subject\x01body\x01parents" — 末尾から parents を分離
+    let rest = fields[7];
+    let (subject_body, parents_str) = rest.rsplit_once('\x01').unwrap_or((rest, ""));
+    let (subject, body_raw) = subject_body
+        .split_once('\x01')
+        .unwrap_or((subject_body, ""));
+    let body = body_raw.trim_end().to_string();
+    let parents: Vec<String> = parents_str
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+
+    // 変更ファイル一覧: diff-tree --numstat + diff-tree --diff-filter で種別を取る
+    let numstat_args = if parents.is_empty() {
+        vec![
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "-r",
+            "--numstat",
+            hash,
+        ]
+    } else {
+        vec!["diff-tree", "--no-commit-id", "-r", "--numstat", hash]
+    };
+    let numstat_raw = run_git(repo, &numstat_args).unwrap_or_default();
+    let filter_args = if parents.is_empty() {
+        vec![
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "-r",
+            "--diff-filter=AMDRC",
+            "--name-status",
+            hash,
+        ]
+    } else {
+        vec![
+            "diff-tree",
+            "--no-commit-id",
+            "-r",
+            "--diff-filter=AMDRC",
+            "--name-status",
+            hash,
+        ]
+    };
+    let filter_raw = run_git(repo, &filter_args).unwrap_or_default();
+
+    // name-status からパス→種別のマップを作る
+    let mut kind_map: std::collections::HashMap<String, (char, Option<String>)> =
+        std::collections::HashMap::new();
+    for line in filter_raw.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 2 {
+            let k = parts[0].chars().next().unwrap_or('M');
+            if k == 'R' || k == 'C' {
+                // リネーム/コピー: "R100\told\tnew" のように来る
+                if parts.len() >= 3 {
+                    kind_map.insert(parts[2].to_string(), (k, Some(parts[1].to_string())));
+                }
+            } else {
+                kind_map.insert(parts[1].to_string(), (k, None));
+            }
+        }
+    }
+
+    // numstat を走査（タブ区切り: "追加\t削除\tパス"）
+    let mut files = Vec::new();
+    for line in numstat_raw.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        // バイナリファイルは "-\t-\tpath" になる
+        let additions = parts[0].parse().unwrap_or(0);
+        let deletions = parts[1].parse().unwrap_or(0);
+        // リネームは "old => new" や "{prefix => suffix}" の形。最後のパスを取る
+        let path = if parts.len() > 3 {
+            // タブ区切り 4 列目以降がある = パス内にタブ（極めて稀）
+            parts[2..].join("\t")
+        } else {
+            parts[2].to_string()
+        };
+        let (kind, old_path) = kind_map.get(&path).cloned().unwrap_or(('M', None));
+        files.push(CommitFileChange {
+            path,
+            kind,
+            additions,
+            deletions,
+            old_path,
+        });
+    }
+
+    Ok(CommitDetail {
+        hash: fields[0].to_string(),
+        author_name: fields[1].to_string(),
+        author_email: fields[2].to_string(),
+        author_date: fields[3].to_string(),
+        committer_name: fields[4].to_string(),
+        committer_email: fields[5].to_string(),
+        committer_date: fields[6].to_string(),
+        subject: subject.to_string(),
+        body,
+        parents,
+        files,
+    })
+}
+
 // ──────────────────────── 操作系 API ────────────────────────
 
 /// git add: 指定パスをステージングする。パスが空なら全変更（`git add -A`）
@@ -1238,5 +1394,61 @@ mod tests {
         assert_eq!(parse_shortstat(" 1 file changed, 1 insertion(+)\n"), (1, 0));
         assert_eq!(parse_shortstat(" 1 file changed, 3 deletions(-)\n"), (0, 3));
         assert_eq!(parse_shortstat(""), (0, 0));
+    }
+
+    #[test]
+    fn show_commitは通常コミットの詳細を取れる() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        if repo_root(repo).is_none() {
+            return;
+        }
+        let commits = log_commits(repo, 3);
+        if commits.is_empty() {
+            return;
+        }
+        let detail = show_commit(repo, &commits[0].hash).expect("show_commit に成功する");
+        assert_eq!(detail.hash, commits[0].hash);
+        assert!(!detail.author_name.is_empty());
+        assert!(!detail.author_email.is_empty());
+        assert!(!detail.author_date.is_empty());
+        assert!(!detail.subject.is_empty());
+    }
+
+    #[test]
+    fn show_commitは初期コミットでも破綻しない() {
+        let dir = std::env::temp_dir().join(format!("tako-git-show-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let repo = dir.as_path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "hello\n").unwrap();
+        std::fs::write(repo.join("b.txt"), "world\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "initial commit\n\nbody text here"]);
+        let hash = String::from_utf8_lossy(&git(&["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        let detail = show_commit(repo, &hash).expect("初期コミットの show_commit に成功する");
+        assert!(detail.parents.is_empty());
+        assert_eq!(detail.subject, "initial commit");
+        assert_eq!(detail.body, "body text here");
+        assert_eq!(detail.files.len(), 2);
+        assert!(detail.files.iter().all(|f| f.kind == 'A'));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
