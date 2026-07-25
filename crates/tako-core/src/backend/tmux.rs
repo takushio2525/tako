@@ -171,6 +171,38 @@ impl DetachedAccess for TmuxBackend {
         crate::tmux::capture_history_plain(self.sock(), session.as_str(), lines)
     }
 
+    fn capture_history_joined(&self, session: &SessionRef, lines: usize) -> Option<String> {
+        // `-J` で折り返し行を結合する。`capture_history`（`-J` 無し）とは別物
+        let start = format!("-{lines}");
+        let output = crate::tmux::tmux_command(self.sock())
+            .args([
+                "capture-pane",
+                "-p",
+                "-J",
+                "-t",
+                &format!("={}:", session.as_str()),
+                "-S",
+                &start,
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        // 行単位で組み直してから末尾を落とす（CRLF 正規化。移設元と同一）
+        let text = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim_end()
+            .to_string();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
     fn history_probe(&self, session: &SessionRef) -> Option<HistoryProbe> {
         crate::tmux::pane_log_probe(self.sock(), session.as_str()).map(|p| HistoryProbe {
             history: p.history,

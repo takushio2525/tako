@@ -232,8 +232,14 @@ pub trait DetachedAccess: Send + Sync {
     /// 可視画面の採取
     fn capture_screen(&self, session: &SessionRef) -> Result<Vec<String>, BackendError>;
 
-    /// 履歴末尾 `lines` 行の平文採取
+    /// 履歴末尾 `lines` 行の平文採取。**折り返し行はそのまま**
+    /// （`#{history_size}` の行数カウントと 1:1 で対応する。pane_log が使う）
     fn capture_history(&self, session: &SessionRef, lines: usize) -> Option<Vec<String>>;
+
+    /// 履歴末尾 `lines` 行を**折り返し結合して** 1 本のテキストで返す。
+    /// 人間・エージェントが読む報告（`orchestrator report` 第 1 層）が使う。
+    /// [`capture_history`] とは折り返しの扱いが違うので混同しないこと
+    fn capture_history_joined(&self, session: &SessionRef, lines: usize) -> Option<String>;
 
     fn history_probe(&self, session: &SessionRef) -> Option<HistoryProbe>;
 

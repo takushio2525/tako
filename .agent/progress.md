@@ -1299,3 +1299,16 @@
 - 検証: 1313 tests / fmt / clippy / クロス check（警告 13 = baseline 不変）/ 隔離セルフテスト
   FAILED 0 / ゴミ箱移動の実 e2e（#80 インジェクション検証）緑
 - 次: #522 の残り（links.rs の Windows パス・Windows 実機の手動チェック・IME）
+
+## 2026-07-26（#519 段取り③: PaneReach 導入 — 到達手段を型で表す）
+- `tako-control::reach` 新設。`PaneReach { InProcess | Detached | Unreachable }` の網羅 match と
+  `UnreachableReason`（NoSession / NoDetachedAccess / InvalidSession）で、
+  「フォールバックが失敗した」と「そもそも到達手段が無い」を初めて型で区別した
+- dispatch.rs の tmux 直呼びを **39 → 17 箇所**（22 箇所を境界へ）。Send / Read のフォールバック、
+  レジストリ列挙、report 第 1 層、worker_status の 4 経路、permission ダイアログの採取と応答
+- `DetachedAccess::capture_history_joined` を追加（`-J` あり = 報告用。`capture_history` とは別物）
+- 残る 17 = `tako_tmux_*` の機能面そのもの（任意 tmux サーバー操作。Windows は Pending）+
+  `available()` 2 箇所（段取り④で capabilities へ）
+- 実測: `TAKO_BACKEND=none` で `read` / `send` が「永続バックエンド（none）に…到達手段が無い」の
+  構造化エラーを返し、`auto` では従来どおり `can't find session`（挙動不変）
+- 次: 段取り④（persist ゲートの言い換え）→ ⑤⑥

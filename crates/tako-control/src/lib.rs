@@ -32,6 +32,7 @@ pub mod mcp;
 pub mod orchestrator;
 pub mod platform;
 pub mod protocol;
+pub mod reach;
 pub mod remote;
 pub mod remote_auth;
 pub mod remote_setup;

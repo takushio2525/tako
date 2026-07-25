@@ -280,20 +280,12 @@ fn finish_workers_list(
     use crate::orchestrator::registry;
     let reg = registry::WorkerRegistry::load()
         .map_err(|e| DispatchError::Operation(format!("worker レジストリを読めない: {e}")))?;
-    // 現存 tmux セッションを 1 コマンドで列挙（サーバー未起動は空 = 全て dead 扱い）
-    let socket = tako_core::tmux_backend::socket_name();
-    let live_backends: Vec<String> = tako_core::tmux::tmux_command(Some(&socket))
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    // 現存するバックエンドセッションを列挙する（器が無い / サーバー未起動は空 = 全て dead 扱い）
+    let live_backends: Vec<String> = tako_core::backend::backend()
+        .list()
+        .into_iter()
+        .map(|s| s.session.into_string())
+        .collect();
     Ok(registry::list_payload(
         &reg,
         &live_backends,
@@ -770,17 +762,34 @@ fn dispatch_inner(
                         if newline {
                             // 改行つき送信は送達確認つき配送（対象が claude TUI なら
                             // 貼り付け + 分離 Enter + 検証、シェルなら即時に無害劣化。
-                            // text が空 / 改行のみなら Enter 単独送達 = Issue #95）
+                            // text が空 / 改行のみなら Enter 単独送達 = Issue #95）。
+                            // 到達手段の有無は先に境界へ問う: 無いまま投げると
+                            // バックグラウンドスレッドの中で黙って失敗する（縮退が見えない）
+                            if crate::reach::detached_session(ts).is_none() {
+                                return Err(DispatchError::Operation(
+                                    crate::reach::UnreachableReason::NoDetachedAccess {
+                                        session: ts.clone(),
+                                        note: crate::reach::no_detached_access_note(),
+                                    }
+                                    .note(),
+                                ));
+                            }
                             spawn_tmux_delivery(ts.clone(), text.clone(), false);
                             Ok(json!({ "queued": true }))
                         } else {
-                            let socket = tako_core::tmux_backend::socket_name();
-                            tako_core::tmux::send_keys(
-                                Some(&socket),
-                                ts,
-                                &normalize_newlines_for_keys(&text),
-                            )
-                            .map_err(DispatchError::Operation)?;
+                            let (session, access) =
+                                crate::reach::detached_session(ts).ok_or_else(|| {
+                                    DispatchError::Operation(
+                                        crate::reach::UnreachableReason::NoDetachedAccess {
+                                            session: ts.clone(),
+                                            note: crate::reach::no_detached_access_note(),
+                                        }
+                                        .note(),
+                                    )
+                                })?;
+                            access
+                                .send_text(&session, &normalize_newlines_for_keys(&text))
+                                .map_err(|e| DispatchError::Operation(e.to_string()))?;
                             Ok(Value::Null)
                         }
                     } else {
@@ -810,9 +819,19 @@ fn dispatch_inner(
                 Some(r) => r,
                 None => {
                     if let Some(ref ts) = tmux_session {
-                        let socket = tako_core::tmux_backend::socket_name();
-                        let captured = tako_core::tmux::capture_session(Some(&socket), ts)
-                            .map_err(DispatchError::Operation)?;
+                        let (session, access) =
+                            crate::reach::detached_session(ts).ok_or_else(|| {
+                                DispatchError::Operation(
+                                    crate::reach::UnreachableReason::NoDetachedAccess {
+                                        session: ts.clone(),
+                                        note: crate::reach::no_detached_access_note(),
+                                    }
+                                    .note(),
+                                )
+                            })?;
+                        let captured = access
+                            .capture_screen(&session)
+                            .map_err(|e| DispatchError::Operation(e.to_string()))?;
                         (pane.unwrap_or(0), captured, None)
                     } else {
                         let (_, target) = resolve_pane(host.workspace(), pane)?;
@@ -4639,6 +4658,11 @@ fn normalize_newlines_for_keys(text: &str) -> String {
 /// tmux セッションへの送達確認つき配送をバックグラウンドスレッドで実行する
 /// （Issue #32）。`deliver_via_tmux` は内部で sleep するブロッキング関数のため、
 /// UI スレッド上の dispatch から直接呼ばない。結果はログのみ（fire-and-forget）
+///
+/// **到達可否の判断は呼び出し側が `crate::reach` へ問う**。ここは tmux 固有の
+/// 送達手順（capture → 貼り付け → 分離 Enter → 空検証）そのものであり、
+/// 案 B-1（器だけの ConPTY セッションホスト）が入ったら同等の手順を
+/// その実装向けに用意して `DetachedAccess` 側へ載せる（設計 §5.1）
 fn spawn_tmux_delivery(session: String, text: String, wait_ready: bool) {
     std::thread::spawn(move || {
         let socket = tako_core::tmux_backend::socket_name();
@@ -5007,7 +5031,6 @@ fn dispatch_orchestrator_report(
     // そこから capture する（#390: ペイン消失後の追跡継続）。
     // pane ID 再利用の誤マッチ検証: 期待 tmux_session と現ペインの backend が
     // 食い違えば別ペインなので、backend ではなく期待セッション側を読む
-    let socket = tako_core::tmux_backend::socket_name();
     let backend = host.backend_session(target).filter(|b| {
         query
             .tmux_session
@@ -5016,11 +5039,11 @@ fn dispatch_orchestrator_report(
     });
     let pane_identity_ok = backend.is_some();
     let scrollback = if let Some(ref backend) = backend {
-        capture_scrollback_joined(Some(&socket), backend, lines)
+        capture_scrollback_joined(backend, lines)
     } else if let Some(ref ts) = query.tmux_session {
-        if tako_core::tmux::session_alive(Some(&socket), ts) {
+        if crate::reach::session_alive(ts) {
             result["source_fallback"] = json!("registry_tmux");
-            capture_scrollback_joined(Some(&socket), ts, lines)
+            capture_scrollback_joined(ts, lines)
         } else {
             None
         }
@@ -5075,35 +5098,11 @@ fn dispatch_orchestrator_report(
     Ok(result)
 }
 
-/// tmux capture-pane -p -J -S で折返し結合済みのスクロールバックを取得する
-fn capture_scrollback_joined(socket: Option<&str>, session: &str, lines: usize) -> Option<String> {
-    let start = format!("-{lines}");
-    let output = tako_core::tmux::tmux_command(socket)
-        .args([
-            "capture-pane",
-            "-p",
-            "-J",
-            "-t",
-            &format!("={session}:"),
-            "-S",
-            &start,
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim_end()
-        .to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+/// 折返し結合済みのスクロールバックを取得する（報告の第 1 層）。
+/// 実際の採取は永続バックエンドの到達手段（`DetachedAccess`）が担う
+fn capture_scrollback_joined(session: &str, lines: usize) -> Option<String> {
+    let (session, access) = crate::reach::detached_session(session)?;
+    access.capture_history_joined(&session, lines)
 }
 
 /// OrchestratorHandoff — master の引き継ぎ（#193）。
@@ -5816,12 +5815,11 @@ fn finish_worker_status(
     // ペインの最近の出力（pane のライブ画面 → tmux session フォールバック）
     let recent_output = live_tail.or_else(|| {
         let ts = tmux_session?;
-        let socket = tako_core::tmux_backend::socket_name();
-        if !tako_core::tmux::session_alive(Some(&socket), ts) {
+        if !crate::reach::session_alive(ts) {
             return None;
         }
-        let lines = tako_core::tmux::capture_session(Some(&socket), ts).ok()?;
-        Some(tail_join(lines))
+        let (session, access) = crate::reach::detached_session(ts)?;
+        Some(tail_join(access.capture_screen(&session).ok()?))
     });
 
     // #390: エージェントプロセスの生存シグナル（突然死判定専用）。
@@ -5833,9 +5831,7 @@ fn finish_worker_status(
     let agent_process_alive = has_children
         || (backend_session.is_none()
             && tmux_session.is_some_and(|ts| {
-                let socket = tako_core::tmux_backend::socket_name();
-                tako_core::tmux::session_alive(Some(&socket), ts)
-                    && crate::agents::has_running_children(ts)
+                crate::reach::session_alive(ts) && crate::agents::has_running_children(ts)
             }));
 
     // #390: エージェント突然死判定の材料と復旧コマンド（apply 側で最終判定）。
@@ -5941,8 +5937,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     // tmux session が生きていれば gone を取り消す（pane は無いが worker は健在）
     if status == "gone" {
         if let Some(ref ts) = tmux_session {
-            let socket = tako_core::tmux_backend::socket_name();
-            if tako_core::tmux::session_alive(Some(&socket), ts) {
+            if crate::reach::session_alive(ts) {
                 status = "unknown".to_string();
             }
         }
@@ -6105,8 +6100,8 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     let history_info = tmux_session
         .as_ref()
         .and_then(|ts| {
-            let socket = tako_core::tmux_backend::socket_name();
-            tako_core::tmux::pane_log_probe(Some(&socket), ts)
+            let (session, access) = crate::reach::detached_session(ts)?;
+            access.history_probe(&session)
         })
         .map(|p| json!({ "lines": p.history, "bytes": p.bytes }));
 
@@ -6146,9 +6141,19 @@ fn dispatch_orchestrator_respond(
         ))
     })?;
 
-    // 画面から permission ダイアログの存在を検証
-    let socket = tako_core::tmux_backend::socket_name();
-    let lines = tako_core::tmux::capture_session(Some(&socket), &backend_session)
+    // 画面から permission ダイアログの存在を検証。
+    // GUI 不在でも応答できることが本 API の意義なので、到達手段は backend 側に依存する
+    let (session, access) = crate::reach::detached_session(&backend_session).ok_or_else(|| {
+        DispatchError::Operation(
+            crate::reach::UnreachableReason::NoDetachedAccess {
+                session: backend_session.clone(),
+                note: crate::reach::no_detached_access_note(),
+            }
+            .note(),
+        )
+    })?;
+    let lines = access
+        .capture_screen(&session)
         .map_err(|e| DispatchError::Operation(format!("画面の取得に失敗: {e}")))?;
     let dialog = crate::claude_tui::detect_permission_dialog(&lines).ok_or_else(|| {
         DispatchError::Operation(
@@ -6184,10 +6189,12 @@ fn dispatch_orchestrator_respond(
     }
 
     // 選択キーを送信: 番号キー → 短い待ち → Enter
-    tako_core::tmux::send_key(Some(&socket), &backend_session, &choice_num.to_string())
+    access
+        .send_key(&session, &choice_num.to_string())
         .map_err(|e| DispatchError::Operation(format!("番号キーの送信に失敗: {e}")))?;
     std::thread::sleep(std::time::Duration::from_millis(200));
-    tako_core::tmux::send_key(Some(&socket), &backend_session, "Enter")
+    access
+        .send_key(&session, "Enter")
         .map_err(|e| DispatchError::Operation(format!("Enter の送信に失敗: {e}")))?;
 
     let chosen_text = dialog
@@ -6663,7 +6670,10 @@ fn video_response(host: &(impl ControlHost + ?Sized), target: PaneId) -> serde_j
 }
 
 /// `pane` 省略はエラー（呼び出し元解決はクライアント側の責務。FR-2.2.7）
-fn resolve_pane(ws: &Workspace, pane: Option<u64>) -> Result<(TabId, PaneId), DispatchError> {
+pub(crate) fn resolve_pane(
+    ws: &Workspace,
+    pane: Option<u64>,
+) -> Result<(TabId, PaneId), DispatchError> {
     let raw = pane.ok_or(DispatchError::NoTargetPane)?;
     for tab in ws.tabs() {
         if let Some(p) = tab.tree().panes().iter().find(|p| p.id().as_u64() == raw) {
