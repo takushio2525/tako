@@ -15,6 +15,7 @@ pub mod pane_log;
 pub mod pane_tree;
 pub mod paths;
 pub mod pdf_links;
+pub mod platform;
 pub mod ports;
 pub mod preview_cache;
 pub mod preview_outline;

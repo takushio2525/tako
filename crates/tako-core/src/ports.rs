@@ -89,7 +89,10 @@ pub(crate) fn listening_ports_of_pid(pid: i32) -> Vec<ListenPort> {
         .collect()
 }
 
+/// 非 macOS の `scan` は空を返すため現状この関数からの呼び出し元は無い。
+/// Windows 実装（`GetExtendedTcpTable`）を入れる差し込み口として残す
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 pub(crate) fn listening_ports_of_pid(_pid: i32) -> Vec<ListenPort> {
     Vec::new()
 }

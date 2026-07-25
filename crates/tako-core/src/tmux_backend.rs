@@ -378,11 +378,23 @@ pub fn kill_server(socket: &str) {
 /// macOS では /tmp → /private/tmp のシンボリックリンク解決でソケット名末尾に `=` が付くため
 /// 両方試す
 fn remove_socket_file(socket: &str) {
-    let uid = unsafe { libc::getuid() };
-    let tmpdir = std::env::var("TMUX_TMPDIR").unwrap_or_else(|_| "/tmp".into());
-    let base = std::path::Path::new(&tmpdir).join(format!("tmux-{uid}"));
+    let Some(base) = socket_dir() else { return };
     let _ = std::fs::remove_file(base.join(socket));
     let _ = std::fs::remove_file(base.join(format!("{socket}=")));
+}
+
+/// tmux がソケットを置くディレクトリ（`$TMUX_TMPDIR|/tmp` の `tmux-<uid>`）。
+/// Windows には tmux もこのレイアウトも存在しないため `None`
+#[cfg(unix)]
+fn socket_dir() -> Option<std::path::PathBuf> {
+    let uid = unsafe { libc::getuid() };
+    let tmpdir = std::env::var("TMUX_TMPDIR").unwrap_or_else(|_| "/tmp".into());
+    Some(std::path::Path::new(&tmpdir).join(format!("tmux-{uid}")))
+}
+
+#[cfg(windows)]
+fn socket_dir() -> Option<std::path::PathBuf> {
+    None
 }
 
 /// 語のリストを sh -c 安全な 1 つのコマンド文字列へ組み立てる
@@ -414,9 +426,7 @@ impl TmuxTestGuard {
         use std::sync::Once;
         static ONCE: Once = Once::new();
         ONCE.call_once(|| {
-            let uid = unsafe { libc::getuid() };
-            let tmpdir = std::env::var("TMUX_TMPDIR").unwrap_or_else(|_| "/tmp".into());
-            let dir = std::path::Path::new(&tmpdir).join(format!("tmux-{uid}"));
+            let Some(dir) = socket_dir() else { return };
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 return;
             };

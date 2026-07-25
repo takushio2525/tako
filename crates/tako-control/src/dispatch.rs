@@ -1750,22 +1750,8 @@ fn dispatch_inner(
                             path.display()
                         )));
                     }
-                    #[cfg(target_os = "macos")]
-                    {
-                        std::process::Command::new("open")
-                            .arg("-R")
-                            .arg(&path)
-                            .spawn()
-                            .map_err(|e| {
-                                DispatchError::Operation(format!("Finder を開けない: {e}"))
-                            })?;
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    {
-                        return Err(DispatchError::Operation(
-                            "Finder で表示は macOS のみ対応".into(),
-                        ));
-                    }
+                    crate::platform::os_integration::reveal(&path)
+                        .map_err(DispatchError::Operation)?;
                     Ok(json!({ "revealed": path.display().to_string() }))
                 }
                 FileOpKind::OpenTerminal => {
@@ -1855,21 +1841,8 @@ fn dispatch_inner(
                             path.display()
                         )));
                     }
-                    #[cfg(target_os = "macos")]
-                    {
-                        std::process::Command::new("open")
-                            .arg(&path)
-                            .spawn()
-                            .map_err(|e| {
-                                DispatchError::Operation(format!("デフォルトアプリで開けない: {e}"))
-                            })?;
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    {
-                        return Err(DispatchError::Operation(
-                            "open_default は macOS のみ対応".into(),
-                        ));
-                    }
+                    crate::platform::os_integration::open_default(&path)
+                        .map_err(DispatchError::Operation)?;
                     Ok(json!({ "opened": path.display().to_string() }))
                 }
                 FileOpKind::OpenWith => {
@@ -1882,27 +1855,8 @@ fn dispatch_inner(
                     let app_name = name.ok_or(DispatchError::InvalidParams(
                         "name（アプリ名）を指定する".into(),
                     ))?;
-                    #[cfg(target_os = "macos")]
-                    {
-                        std::process::Command::new("open")
-                            .arg("-a")
-                            .arg(&app_name)
-                            .arg(&path)
-                            .spawn()
-                            .map_err(|e| {
-                                DispatchError::Operation(format!(
-                                    "アプリ '{}' で開けない: {e}",
-                                    app_name
-                                ))
-                            })?;
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    {
-                        let _ = app_name;
-                        return Err(DispatchError::Operation(
-                            "open_with は macOS のみ対応".into(),
-                        ));
-                    }
+                    crate::platform::os_integration::open_with(&app_name, &path)
+                        .map_err(DispatchError::Operation)?;
                     Ok(json!({ "opened": path.display().to_string(), "app": app_name }))
                 }
             }

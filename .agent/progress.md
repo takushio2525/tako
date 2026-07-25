@@ -1221,3 +1221,15 @@
 ## 2026-07-25（#495 UX 改善: 詳細ビューを選択カード直下へ + CLI 空応答修正）
 - 詳細ビューの位置を 200 件末尾から選択カード直下へ移動。`render_commit_detail()` メソッド化。CLI `print_result` の `GitCommand::Show` 未登録を修正（`0bc9c4f`）
 - 関連コミット: `86b7769` `0bc9c4f` → PR #510（Closes #495）
+
+## 2026-07-25（#467: Windows 移植の実装フェーズ開始 — 設計 + Issue 分割 + P0）
+- ポーティングアーキテクチャ設計を新設（`.agent/plans/2026-07-windows-port-architecture.md`）:
+  抽象境界 B1〜B15 / 機械可読サポートマトリクス + パリティテスト T1〜T6 / prompt の単一ソース化 /
+  mac 先行 → Windows 一括反映のワークフロー
+- 実装 Issue 15 件を起票（#514〜#528。プレ版 v0 = タブ・ペイン管理 → 永続 → git タブ → プレビュー順）。
+  #513（設定の git 共有）も依存関係つきでツリーに組み込み
+- P0 完了: 呼び出し側に cfg を足さず B1/B4/B5/B8 を新設して解決。macOS から
+  `cargo check --workspace --target x86_64-pc-windows-msvc` がエラーゼロ（`scripts/check-windows.sh`）。
+  `.agent/windows-setup.md` で実機初回ビルド手順を用意
+- 関連: PR #529（`Refs #467, #514`）。1268 tests / fmt / clippy 全緑
+- 次: Windows 実機で `cargo build` → #517（プレ版 v0）着手

@@ -1,5 +1,16 @@
 # Windows 対応 実現可能性調査（Issue #467）
 
+> **続きの文書**: 本レポートは「何が動かないか」の調査。
+> 「どう作れば腐らないか」= 抽象境界カタログ・サポートマトリクス・mac 先行開発の運用は
+> `.agent/plans/2026-07-windows-port-architecture.md`（ポーティングアーキテクチャ設計）にある。
+> **実装に着手する前に必ずそちらを読むこと。**
+> Windows 実機での初回ビルド手順は `.agent/windows-setup.md`。
+>
+> なお §5 の「P0 = CI Windows ジョブ再有効化」は**方針変更により無効**（GitHub Actions は
+> 使わない。#469 クローズ済み）。代替は macOS からのクロス検査
+> `scripts/check-windows.sh` + Windows 実機での build。
+> §5 の「P0 は CI で完結可能／実機不要」という記述も、この方針変更で置き換わっている。
+
 - 調査日: 2026-07-22
 - 対象 commit: `0a02fcd`（main）
 - 調査方法: リポジトリ静的調査（rg / Cargo.lock / gh api。**cargo build は実行していない** —
