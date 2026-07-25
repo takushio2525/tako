@@ -171,16 +171,34 @@ fn git_command(repo: &Path) -> Command {
 }
 
 fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
+    let out = run_git_raw(repo, args)?;
+    if out.success {
+        Ok(out.stdout)
+    } else {
+        Err(out.stderr.trim().to_string())
+    }
+}
+
+/// git の生の実行結果（#496）。
+/// `git merge` は「コンフリクトで終了コード 1」を正常な結果として返すため、
+/// 成功/失敗を潰さずに終了コードと両ストリームを見る必要がある。
+struct GitOutput {
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+fn run_git_raw(repo: &Path, args: &[&str]) -> Result<GitOutput, String> {
     let output = git_command(repo)
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("git を実行できない: {e}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
+    Ok(GitOutput {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
 }
 
 // ──────────────────────── パス表記の可搬性（#520） ────────────────────────
@@ -1039,6 +1057,609 @@ pub fn push(repo: &Path) -> Result<String, String> {
     run_git(repo, &["push"])
 }
 
+// ──────────────── ブランチ操作 / マージ / コンフリクト（#496）────────────────
+
+/// 進行中のマルチステップ操作（#496）。コンフリクトを起こし得るものだけを扱う。
+/// 「今どの操作の途中で止まっているか」で中止コマンドが変わるため区別する
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RepoOperation {
+    /// 進行中の操作なし（通常状態）
+    #[default]
+    None,
+    Merging,
+    Rebasing,
+    CherryPicking,
+    Reverting,
+}
+
+impl RepoOperation {
+    /// CLI / MCP の JSON へ出す安定した識別子
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RepoOperation::None => "none",
+            RepoOperation::Merging => "merging",
+            RepoOperation::Rebasing => "rebasing",
+            RepoOperation::CherryPicking => "cherry-picking",
+            RepoOperation::Reverting => "reverting",
+        }
+    }
+
+    /// 中止に使う git サブコマンド。`None` は中止対象が無い
+    pub fn abort_args(&self) -> Option<[&'static str; 2]> {
+        match self {
+            RepoOperation::None => None,
+            RepoOperation::Merging => Some(["merge", "--abort"]),
+            RepoOperation::Rebasing => Some(["rebase", "--abort"]),
+            RepoOperation::CherryPicking => Some(["cherry-pick", "--abort"]),
+            RepoOperation::Reverting => Some(["revert", "--abort"]),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        *self != RepoOperation::None
+    }
+}
+
+/// コンフリクト状態（#496 Part 2）。
+/// 進行中の操作・未解決ファイル・マージ元/先を 1 まとめにして UI / CLI / MCP へ返す
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConflictState {
+    pub operation: RepoOperation,
+    /// 未解決（unmerged）ファイルのパス
+    pub files: Vec<String>,
+    /// マージ先 = 現在のブランチ（detached HEAD なら空）
+    pub ours: String,
+    /// マージ元（`MERGE_HEAD` 等の ref 名。解決できなければ短縮ハッシュ）
+    pub theirs: Option<String>,
+}
+
+impl ConflictState {
+    /// コンフリクトカードを出すべき状態か。
+    /// 操作が進行中なら未解決ファイルが 0 でも（= 解決済みでコミット待ち）カードは出す
+    pub fn is_active(&self) -> bool {
+        self.operation.is_active()
+    }
+}
+
+/// `.git` ディレクトリの実体を解決する（worktree では `.git` がファイルなので rev-parse を使う）
+fn git_dir(repo: &Path) -> Option<std::path::PathBuf> {
+    let out = run_git(repo, &["rev-parse", "--absolute-git-dir"]).ok()?;
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(trimmed))
+    }
+}
+
+/// 進行中の操作とコンフリクトファイルを取得する（#496）
+pub fn conflict_state(repo: &Path) -> ConflictState {
+    let st = status(repo);
+    let files: Vec<String> = st
+        .entries
+        .iter()
+        .filter(|e| e.is_conflicted())
+        .map(|e| e.path.clone())
+        .collect();
+
+    let Some(dir) = git_dir(repo) else {
+        return ConflictState {
+            operation: RepoOperation::None,
+            files,
+            ours: st.branch,
+            theirs: None,
+        };
+    };
+    // 判定順はリカバリの緊急度が高い順。rebase は 2 種類のディレクトリ形式がある
+    let operation = if dir.join("MERGE_HEAD").exists() {
+        RepoOperation::Merging
+    } else if dir.join("rebase-merge").exists() || dir.join("rebase-apply").exists() {
+        RepoOperation::Rebasing
+    } else if dir.join("CHERRY_PICK_HEAD").exists() {
+        RepoOperation::CherryPicking
+    } else if dir.join("REVERT_HEAD").exists() {
+        RepoOperation::Reverting
+    } else {
+        RepoOperation::None
+    };
+
+    let theirs = match operation {
+        RepoOperation::Merging => describe_ref(repo, "MERGE_HEAD"),
+        RepoOperation::CherryPicking => describe_ref(repo, "CHERRY_PICK_HEAD"),
+        RepoOperation::Reverting => describe_ref(repo, "REVERT_HEAD"),
+        // rebase 中は「取り込み中のコミット」が theirs 側になる
+        RepoOperation::Rebasing => describe_ref(repo, "REBASE_HEAD"),
+        RepoOperation::None => None,
+    };
+
+    ConflictState {
+        operation,
+        files,
+        ours: st.branch,
+        theirs,
+    }
+}
+
+/// ref を人が読める名前へ解決する（ブランチ名が取れなければ短縮ハッシュ）
+fn describe_ref(repo: &Path, refname: &str) -> Option<String> {
+    if let Ok(name) = run_git(
+        repo,
+        &["name-rev", "--name-only", "--no-undefined", refname],
+    ) {
+        let name = name.trim();
+        if !name.is_empty() {
+            // `remotes/origin/foo~1` のような表現はそのまま出す（何を取り込んでいるかが分かる）
+            return Some(name.to_string());
+        }
+    }
+    run_git(repo, &["rev-parse", "--short", refname])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// ブランチ名として使えるかを検証する（#496）。
+///
+/// git 自身の `check-ref-format` に相当する規則を純関数で持つ。目的は 2 つ:
+/// - **引数注入の遮断**: `-d` のような名前をそのまま `git branch` へ渡すとオプションとして
+///   解釈される。`git checkout <branch>` は `--` でオプション終端を作れない
+///   （`git checkout -- x` は「ファイルの復元」になる）ので、名前側で弾くしかない
+/// - 実行前に理由を日本語で返す（git のエラーを読ませない）
+pub fn validate_branch_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("ブランチ名が空です".into());
+    }
+    if name.starts_with('-') {
+        return Err("ブランチ名を - で始めることはできません".into());
+    }
+    if name.chars().any(|c| c.is_control() || c == ' ') {
+        return Err("ブランチ名に空白・制御文字は使えません".into());
+    }
+    if let Some(c) = name.chars().find(|c| "~^:?*[\\".contains(*c)) {
+        return Err(format!("ブランチ名に {c} は使えません"));
+    }
+    if name.contains("..") || name.contains("@{") || name == "@" {
+        return Err("ブランチ名に .. や @{ は使えません".into());
+    }
+    if name.starts_with('/') || name.ends_with('/') || name.contains("//") {
+        return Err("ブランチ名の / の使い方が不正です".into());
+    }
+    if name.ends_with('.') || name.ends_with(".lock") {
+        return Err("ブランチ名を . や .lock で終わらせることはできません".into());
+    }
+    if name.split('/').any(|part| part.starts_with('.')) {
+        return Err("ブランチ名の各要素を . で始めることはできません".into());
+    }
+    Ok(())
+}
+
+/// ref（ブランチ・タグ・ハッシュ）が実在するか
+pub fn ref_exists(repo: &Path, refname: &str) -> bool {
+    if refname.starts_with('-') {
+        return false;
+    }
+    run_git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{refname}^{{commit}}"),
+        ],
+    )
+    .map(|s| !s.trim().is_empty())
+    .unwrap_or(false)
+}
+
+/// ローカルブランチが存在するか
+pub fn local_branch_exists(repo: &Path, name: &str) -> bool {
+    if name.starts_with('-') {
+        return false;
+    }
+    run_git(
+        repo,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{name}"),
+        ],
+    )
+    .is_ok()
+}
+
+/// 追跡対象ファイルのうち未コミット変更があるものを返す（untracked は切替・マージを阻害しない）
+fn dirty_tracked_files(status: &GitStatus) -> Vec<String> {
+    status
+        .entries
+        .iter()
+        .filter(|e| !e.is_untracked())
+        .map(|e| e.path.clone())
+        .collect()
+}
+
+/// ブランチ切替の事前提示（#496）。
+/// 「黙って強制切替 / stash しない」ため、実行前に何が起きるかを機械可読で返す
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutPreview {
+    pub target: String,
+    pub current: String,
+    /// 未コミット変更のある追跡ファイル
+    pub dirty_files: Vec<String>,
+    /// 切替で上書きされるため git が切替を**拒否する**ファイル（dirty ∩ 切替差分）
+    pub blocking_files: Vec<String>,
+    /// 切替後もそのまま持ち越される変更ファイル（dirty − blocking）
+    pub carried_files: Vec<String>,
+    /// 切替で内容が入れ替わるファイル数
+    pub changed_files: usize,
+    /// リモート追跡ブランチから同名のローカルブランチを新規作成する切替か
+    pub creates_local_branch: bool,
+    /// 実行を止めるべき理由（進行中のコンフリクト等）
+    pub blockers: Vec<String>,
+}
+
+impl CheckoutPreview {
+    /// 事前提示なしで実行してよいか。未コミット変更が 1 件でもあれば必ず提示する
+    pub fn needs_confirmation(&self) -> bool {
+        !self.blockers.is_empty() || !self.dirty_files.is_empty()
+    }
+}
+
+/// 切替対象の解決結果（ローカル / リモート追跡）
+fn resolve_checkout_target(repo: &Path, target: &str) -> Result<(String, bool), String> {
+    if local_branch_exists(repo, target) {
+        return Ok((target.to_string(), false));
+    }
+    // `origin/foo` / `remotes/origin/foo` をクリックしたときは、detached HEAD にせず
+    // 同名のローカル追跡ブランチを作る（VS Code / lazygit と同じ挙動）
+    let short = target.strip_prefix("remotes/").unwrap_or(target);
+    if ref_exists(repo, short) {
+        let local = short.split_once('/').map(|(_, rest)| rest).unwrap_or(short);
+        if !local.is_empty() && !local_branch_exists(repo, local) && short.contains('/') {
+            return Ok((short.to_string(), true));
+        }
+        return Ok((short.to_string(), false));
+    }
+    Err(format!("ブランチ '{target}' が見つかりません"))
+}
+
+pub fn checkout_preview(repo: &Path, target: &str) -> Result<CheckoutPreview, String> {
+    validate_branch_name(target)?;
+    let (resolved, creates_local_branch) = resolve_checkout_target(repo, target)?;
+    let st = status(repo);
+    let current = st.branch.clone();
+    let dirty_files = dirty_tracked_files(&st);
+
+    // 切替で内容が変わるファイル = HEAD と切替先の差分
+    let changed: Vec<String> = run_git(repo, &["diff", "--name-only", "HEAD", &resolved])
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    // git が切替を拒否するのは「未コミット変更 かつ 切替で上書きされる」ファイルだけ。
+    // それ以外の変更は切替後も残る（= 消えない）ので、両者を分けて提示する
+    let blocking_files: Vec<String> = dirty_files
+        .iter()
+        .filter(|p| changed.contains(p))
+        .cloned()
+        .collect();
+    let carried_files: Vec<String> = dirty_files
+        .iter()
+        .filter(|p| !changed.contains(p))
+        .cloned()
+        .collect();
+
+    let mut blockers = Vec::new();
+    let conflict = conflict_state(repo);
+    if conflict.is_active() {
+        blockers.push(format!(
+            "{} が進行中です。先に解消するか中止してください",
+            conflict.operation.as_str()
+        ));
+    }
+    if !current.is_empty() && current == resolved {
+        blockers.push(format!("すでに '{current}' にいます"));
+    }
+
+    Ok(CheckoutPreview {
+        target: resolved,
+        current,
+        dirty_files,
+        blocking_files,
+        carried_files,
+        changed_files: changed.len(),
+        creates_local_branch,
+        blockers,
+    })
+}
+
+/// ブランチを切り替える（#496）。`preview` の内容を承諾済みである前提で実行する
+pub fn checkout(repo: &Path, target: &str) -> Result<String, String> {
+    validate_branch_name(target)?;
+    let (resolved, creates_local_branch) = resolve_checkout_target(repo, target)?;
+    let out = if creates_local_branch {
+        // リモート追跡ブランチ → 同名ローカルブランチを作って追跡設定つきで切り替える
+        run_git_raw(repo, &["checkout", "--track", &resolved])?
+    } else {
+        run_git_raw(repo, &["checkout", &resolved])?
+    };
+    if out.success {
+        // git checkout は進捗を stderr に出す。成功時はそちらが本文になる
+        Ok(merge_streams(&out.stdout, &out.stderr))
+    } else {
+        Err(out.stderr.trim().to_string())
+    }
+}
+
+/// 新規ブランチを作成する（#496）。`start_point` 省略時は現在の HEAD が基点。
+/// `checkout` = true でそのまま切り替える
+pub fn create_branch(
+    repo: &Path,
+    name: &str,
+    start_point: Option<&str>,
+    switch: bool,
+) -> Result<String, String> {
+    validate_branch_name(name)?;
+    if local_branch_exists(repo, name) {
+        return Err(format!("ブランチ '{name}' はすでに存在します"));
+    }
+    if let Some(start) = start_point {
+        validate_branch_name(start)?;
+        if !ref_exists(repo, start) {
+            return Err(format!("基点 '{start}' が見つかりません"));
+        }
+    }
+    let mut args: Vec<&str> = if switch {
+        vec!["checkout", "-b", name]
+    } else {
+        vec!["branch", name]
+    };
+    if let Some(start) = start_point {
+        args.push(start);
+    }
+    let out = run_git_raw(repo, &args)?;
+    if out.success {
+        Ok(merge_streams(&out.stdout, &out.stderr))
+    } else {
+        Err(out.stderr.trim().to_string())
+    }
+}
+
+/// 2 本のストリームを表示用に 1 本へまとめる（空側は落とす）
+fn merge_streams(stdout: &str, stderr: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if !stdout.trim().is_empty() {
+        parts.push(stdout.trim());
+    }
+    if !stderr.trim().is_empty() {
+        parts.push(stderr.trim());
+    }
+    parts.join("\n")
+}
+
+/// マージの種類（#496）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeKind {
+    /// すでに取り込み済み（何も起きない）
+    UpToDate,
+    /// 早送り（コンフリクトは起こり得ない）
+    FastForward,
+    /// 3-way マージ（コンフリクトが起こり得る）
+    ThreeWay,
+    /// 共通祖先が無い（`--allow-unrelated-histories` が必要）
+    Unrelated,
+}
+
+impl MergeKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MergeKind::UpToDate => "up-to-date",
+            MergeKind::FastForward => "fast-forward",
+            MergeKind::ThreeWay => "three-way",
+            MergeKind::Unrelated => "unrelated",
+        }
+    }
+}
+
+/// マージの事前提示（#496）。**作業ツリーに一切触れずに**結果を予測する
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergePreview {
+    pub target: String,
+    pub current: String,
+    pub kind: MergeKind,
+    /// 取り込まれるコミット数
+    pub incoming_commits: usize,
+    /// 変更されるファイル
+    pub changed_files: Vec<String>,
+    /// コンフリクトすると予測されるファイル（`git merge-tree` による事前計算）
+    pub predicted_conflicts: Vec<String>,
+    /// 予測が実行できたか（古い git では false = 予測なしで実行することになる）
+    pub prediction_available: bool,
+    pub dirty_files: Vec<String>,
+    pub blockers: Vec<String>,
+}
+
+impl MergePreview {
+    /// マージは常に事前提示する（Issue #496: 破壊的になり得る操作は必ず何が起きるかを示す）
+    pub fn needs_confirmation(&self) -> bool {
+        true
+    }
+}
+
+pub fn merge_preview(repo: &Path, target: &str) -> Result<MergePreview, String> {
+    validate_branch_name(target)?;
+    if !ref_exists(repo, target) {
+        return Err(format!("ブランチ '{target}' が見つかりません"));
+    }
+    let st = status(repo);
+    let current = st.branch.clone();
+    let dirty_files = dirty_tracked_files(&st);
+
+    let has_base = run_git(repo, &["merge-base", "HEAD", target]).is_ok();
+    let kind = if !has_base {
+        MergeKind::Unrelated
+    } else if run_git(repo, &["merge-base", "--is-ancestor", target, "HEAD"]).is_ok() {
+        MergeKind::UpToDate
+    } else if run_git(repo, &["merge-base", "--is-ancestor", "HEAD", target]).is_ok() {
+        MergeKind::FastForward
+    } else {
+        MergeKind::ThreeWay
+    };
+
+    let incoming_commits = run_git(repo, &["rev-list", "--count", &format!("HEAD..{target}")])
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let changed_files: Vec<String> = run_git(repo, &["diff", "--name-only", "HEAD", target])
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    // コンフリクト予測。`git merge-tree --write-tree` は作業ツリー・index を
+    // 一切変更せずにマージ結果を計算する（git 2.38+）。使えない git では予測なしと明示する
+    let (predicted_conflicts, prediction_available) = if kind == MergeKind::ThreeWay {
+        predict_merge_conflicts(repo, target)
+    } else {
+        (Vec::new(), true)
+    };
+
+    let mut blockers = Vec::new();
+    let conflict = conflict_state(repo);
+    if conflict.is_active() {
+        blockers.push(format!(
+            "{} が進行中です。先に解消するか中止してください",
+            conflict.operation.as_str()
+        ));
+    }
+    if !current.is_empty() && current == target {
+        blockers.push("現在のブランチを自分自身へマージすることはできません".into());
+    }
+    // 未コミット変更がマージ対象と重なると git はマージを拒否する
+    let overlapping: Vec<&String> = dirty_files
+        .iter()
+        .filter(|p| changed_files.contains(p))
+        .collect();
+    if !overlapping.is_empty() {
+        blockers.push(format!(
+            "未コミットの変更がマージ対象と重なっています（{} 件）。先にコミットするか退避してください",
+            overlapping.len()
+        ));
+    }
+    if kind == MergeKind::Unrelated {
+        blockers.push("共通の祖先がありません（無関係な履歴のマージ）".into());
+    }
+
+    Ok(MergePreview {
+        target: target.to_string(),
+        current,
+        kind,
+        incoming_commits,
+        changed_files,
+        predicted_conflicts,
+        prediction_available,
+        dirty_files,
+        blockers,
+    })
+}
+
+/// `git merge-tree --write-tree` でコンフリクトを事前計算する。
+/// 戻り値の 2 番目は「予測が実行できたか」（古い git では false）
+fn predict_merge_conflicts(repo: &Path, target: &str) -> (Vec<String>, bool) {
+    let Ok(out) = run_git_raw(
+        repo,
+        &["merge-tree", "--write-tree", "--name-only", "HEAD", target],
+    ) else {
+        return (Vec::new(), false);
+    };
+    if out.success {
+        // 成功 = コンフリクトなし（1 行目はマージ結果のツリー OID）
+        return (Vec::new(), true);
+    }
+    // `--write-tree` 非対応の古い git は使い方エラーで落ちる。この場合は「予測不能」
+    if out.stdout.trim().is_empty() {
+        return (Vec::new(), false);
+    }
+    (parse_merge_tree_conflicts(&out.stdout), true)
+}
+
+/// `git merge-tree --write-tree --name-only` の出力からコンフリクトファイルを取り出す。
+/// 形式: 1 行目 = ツリー OID / 2 ブロック目 = 衝突ファイル名 / 空行 / 以降は説明メッセージ
+fn parse_merge_tree_conflicts(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .skip(1)
+        .take_while(|l| !l.trim().is_empty())
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// マージの実行結果（#496）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeOutcome {
+    /// コンフリクトで停止したか（= エラーではなく「解消待ち」状態）
+    pub conflicted: bool,
+    pub output: String,
+    /// 未解決ファイル（conflicted のときのみ）
+    pub conflicts: Vec<String>,
+}
+
+/// ブランチを現在のブランチへマージする（#496）。
+/// コンフリクトは**エラーではなく結果**として返す（解消カードへ繋ぐため）
+pub fn merge(repo: &Path, target: &str, no_ff: bool) -> Result<MergeOutcome, String> {
+    validate_branch_name(target)?;
+    if !ref_exists(repo, target) {
+        return Err(format!("ブランチ '{target}' が見つかりません"));
+    }
+    // --no-edit: エディタが無い環境（GUI から起動した tako）でマージコミットを止めない
+    let mut args = vec!["merge", "--no-edit"];
+    if no_ff {
+        args.push("--no-ff");
+    }
+    args.push(target);
+    let out = run_git_raw(repo, &args)?;
+    let text = merge_streams(&out.stdout, &out.stderr);
+    if out.success {
+        return Ok(MergeOutcome {
+            conflicted: false,
+            output: text,
+            conflicts: Vec::new(),
+        });
+    }
+    // 終了コード != 0 のうち、コンフリクト停止だけは正常系として扱う
+    let state = conflict_state(repo);
+    if state.is_active() && !state.files.is_empty() {
+        return Ok(MergeOutcome {
+            conflicted: true,
+            output: text,
+            conflicts: state.files,
+        });
+    }
+    Err(if text.is_empty() {
+        "マージに失敗しました".to_string()
+    } else {
+        text
+    })
+}
+
+/// 進行中の操作を中止する（#496）。merge / rebase / cherry-pick / revert に対応
+pub fn abort_operation(repo: &Path) -> Result<(RepoOperation, String), String> {
+    let state = conflict_state(repo);
+    let Some(args) = state.operation.abort_args() else {
+        return Err("中止できる操作が進行中ではありません".into());
+    };
+    let out = run_git_raw(repo, &args)?;
+    if out.success {
+        Ok((state.operation, merge_streams(&out.stdout, &out.stderr)))
+    } else {
+        Err(out.stderr.trim().to_string())
+    }
+}
+
 // ──────────────────────── テスト ────────────────────────
 
 #[cfg(test)]
@@ -1476,6 +2097,339 @@ mod tests {
         assert!(!detail.author_email.is_empty());
         assert!(!detail.author_date.is_empty());
         assert!(!detail.subject.is_empty());
+    }
+
+    // ──────────────── ブランチ操作 / マージ（#496）────────────────
+
+    /// 使い捨てリポジトリを作るヘルパ（#496）。**実リポジトリは絶対に触らない**
+    struct TempRepo {
+        dir: std::path::PathBuf,
+    }
+
+    impl TempRepo {
+        fn new(tag: &str) -> Self {
+            // 同一プロセス内の複数テストが衝突しないよう、タグ + pid + カウンタで一意化する
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static SEQ: AtomicUsize = AtomicUsize::new(0);
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("tako-git-496-{tag}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let repo = TempRepo { dir };
+            repo.git(&["init", "-q", "-b", "main"]);
+            repo
+        }
+
+        fn path(&self) -> &Path {
+            &self.dir
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&self.dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("git");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        fn write(&self, name: &str, content: &str) {
+            std::fs::write(self.dir.join(name), content).expect("write");
+        }
+
+        fn commit(&self, name: &str, content: &str, message: &str) {
+            self.write(name, content);
+            self.git(&["add", "-A"]);
+            self.git(&["commit", "-q", "-m", message]);
+        }
+
+        fn current_branch(&self) -> String {
+            self.git(&["branch", "--show-current"])
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// 3-way マージでコンフリクトする状態を作る（main と feat が同じ行を書き換える）
+    fn setup_conflicting(repo: &TempRepo) {
+        repo.commit("f.txt", "a\nb\nc\n", "init");
+        repo.git(&["checkout", "-qb", "feat"]);
+        repo.commit("f.txt", "a\nFEAT\nc\n", "feat change");
+        repo.git(&["checkout", "-q", "main"]);
+        repo.commit("f.txt", "a\nMAIN\nc\n", "main change");
+    }
+
+    #[test]
+    fn ブランチ名の検証() {
+        assert!(validate_branch_name("feature/x-1").is_ok());
+        assert!(validate_branch_name("").is_err());
+        // 引数注入の遮断（git checkout は -- でオプション終端を作れない）
+        assert!(validate_branch_name("-d").is_err());
+        assert!(validate_branch_name("--force").is_err());
+        assert!(validate_branch_name("a b").is_err());
+        assert!(validate_branch_name("a..b").is_err());
+        assert!(validate_branch_name("a~1").is_err());
+        assert!(validate_branch_name("a^").is_err());
+        assert!(validate_branch_name("a:b").is_err());
+        assert!(validate_branch_name("HEAD@{1}").is_err());
+        assert!(validate_branch_name("/x").is_err());
+        assert!(validate_branch_name("x/").is_err());
+        assert!(validate_branch_name("a//b").is_err());
+        assert!(validate_branch_name("x.lock").is_err());
+        assert!(validate_branch_name("x.").is_err());
+        assert!(validate_branch_name(".hidden").is_err());
+        assert!(validate_branch_name("a/.hidden").is_err());
+    }
+
+    #[test]
+    fn ブランチ作成と切替() {
+        let repo = TempRepo::new("create");
+        repo.commit("a.txt", "one\n", "init");
+
+        // HEAD 基点で作成 + 切替
+        let out = create_branch(repo.path(), "topic", None, true).expect("作成できる");
+        assert!(!out.is_empty());
+        assert_eq!(repo.current_branch(), "topic");
+
+        // 既存名は拒否（git のエラーに落ちる前に日本語で返す）
+        let err = create_branch(repo.path(), "topic", None, false).unwrap_err();
+        assert!(err.contains("すでに存在"), "{err}");
+
+        // 任意の基点から作成（切替なし）
+        repo.commit("b.txt", "two\n", "second");
+        create_branch(repo.path(), "from-main", Some("main"), false).expect("基点指定で作成できる");
+        assert_eq!(
+            repo.current_branch(),
+            "topic",
+            "switch=false では切り替わらない"
+        );
+        // 基点が main なので b.txt を含まない
+        let files = repo.git(&["ls-tree", "-r", "--name-only", "from-main"]);
+        assert!(!files.contains("b.txt"), "{files}");
+
+        // 存在しない基点
+        let err = create_branch(repo.path(), "bad", Some("nope"), false).unwrap_err();
+        assert!(err.contains("見つかりません"), "{err}");
+
+        // 切替
+        checkout(repo.path(), "main").expect("切替できる");
+        assert_eq!(repo.current_branch(), "main");
+
+        // 存在しないブランチ
+        let err = checkout(repo.path(), "ghost").unwrap_err();
+        assert!(err.contains("見つかりません"), "{err}");
+    }
+
+    #[test]
+    fn 切替の事前提示はクリーンなら確認不要() {
+        let repo = TempRepo::new("preview-clean");
+        repo.commit("a.txt", "one\n", "init");
+        repo.git(&["branch", "topic"]);
+
+        let p = checkout_preview(repo.path(), "topic").expect("preview");
+        assert_eq!(p.target, "topic");
+        assert_eq!(p.current, "main");
+        assert!(p.dirty_files.is_empty());
+        assert!(p.blockers.is_empty());
+        assert!(!p.needs_confirmation(), "クリーンなら確認不要");
+    }
+
+    #[test]
+    fn 切替の事前提示は未コミット変更を持ち越しと衝突に分ける() {
+        let repo = TempRepo::new("preview-dirty");
+        repo.commit("shared.txt", "base\n", "init");
+        repo.commit("kept.txt", "keep\n", "second");
+        repo.git(&["checkout", "-qb", "topic"]);
+        // topic 側だけ shared.txt を変更 = 切替で入れ替わるファイル
+        repo.commit("shared.txt", "topic\n", "topic change");
+        repo.git(&["checkout", "-q", "main"]);
+
+        // 未コミット変更を 2 つ作る: 片方は切替対象と重なる
+        repo.write("shared.txt", "local edit\n");
+        repo.write("kept.txt", "local keep\n");
+
+        let p = checkout_preview(repo.path(), "topic").expect("preview");
+        assert!(
+            p.needs_confirmation(),
+            "未コミット変更があるなら必ず提示する"
+        );
+        assert_eq!(p.dirty_files.len(), 2);
+        assert_eq!(p.blocking_files, vec!["shared.txt".to_string()]);
+        assert_eq!(p.carried_files, vec!["kept.txt".to_string()]);
+        assert!(p.changed_files >= 1);
+
+        // 提示どおり git は切替を拒否する（= 黙って壊さない）
+        let err = checkout(repo.path(), "topic").unwrap_err();
+        assert!(!err.is_empty());
+        assert_eq!(repo.current_branch(), "main", "切替は起きていない");
+    }
+
+    #[test]
+    fn マージの事前提示は種別とコンフリクトを予測する() {
+        let repo = TempRepo::new("merge-preview");
+        setup_conflicting(&repo);
+
+        let p = merge_preview(repo.path(), "feat").expect("preview");
+        assert_eq!(p.kind, MergeKind::ThreeWay);
+        assert_eq!(p.current, "main");
+        assert_eq!(p.incoming_commits, 1);
+        assert!(p.changed_files.contains(&"f.txt".to_string()));
+        assert!(p.prediction_available, "git 2.38+ なら予測できる");
+        assert_eq!(p.predicted_conflicts, vec!["f.txt".to_string()]);
+        assert!(p.blockers.is_empty());
+        assert!(p.needs_confirmation(), "マージは常に事前提示する");
+
+        // 予測しただけでは作業ツリーもリポ状態も変わっていない
+        assert!(!conflict_state(repo.path()).is_active());
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("f.txt")).unwrap(),
+            "a\nMAIN\nc\n"
+        );
+    }
+
+    #[test]
+    fn マージの事前提示は早送りと取り込み済みを見分ける() {
+        let repo = TempRepo::new("merge-kind");
+        repo.commit("a.txt", "one\n", "init");
+        repo.git(&["checkout", "-qb", "ahead"]);
+        repo.commit("b.txt", "two\n", "ahead commit");
+        repo.git(&["checkout", "-q", "main"]);
+
+        let ff = merge_preview(repo.path(), "ahead").expect("preview");
+        assert_eq!(ff.kind, MergeKind::FastForward);
+        assert_eq!(ff.incoming_commits, 1);
+        assert!(ff.predicted_conflicts.is_empty());
+
+        // 逆向き（main は ahead に含まれている）は up-to-date
+        repo.git(&["checkout", "-q", "ahead"]);
+        let up = merge_preview(repo.path(), "main").expect("preview");
+        assert_eq!(up.kind, MergeKind::UpToDate);
+        assert_eq!(up.incoming_commits, 0);
+    }
+
+    #[test]
+    fn マージ成功とコンフリクトと中止() {
+        let repo = TempRepo::new("merge-run");
+        setup_conflicting(&repo);
+
+        // コンフリクトは Err ではなく「解消待ち」の結果として返る
+        let outcome = merge(repo.path(), "feat", false).expect("コンフリクトは正常系");
+        assert!(outcome.conflicted);
+        assert_eq!(outcome.conflicts, vec!["f.txt".to_string()]);
+
+        let state = conflict_state(repo.path());
+        assert_eq!(state.operation, RepoOperation::Merging);
+        assert!(state.is_active());
+        assert_eq!(state.files, vec!["f.txt".to_string()]);
+        assert_eq!(state.ours, "main");
+        assert_eq!(state.theirs.as_deref(), Some("feat"));
+
+        // コンフリクト中は切替もマージも事前に止める
+        let p = checkout_preview(repo.path(), "feat").expect("preview");
+        assert!(
+            p.blockers.iter().any(|b| b.contains("merging")),
+            "{:?}",
+            p.blockers
+        );
+
+        // 中止で元へ戻る
+        let (op, _) = abort_operation(repo.path()).expect("中止できる");
+        assert_eq!(op, RepoOperation::Merging);
+        let after = conflict_state(repo.path());
+        assert!(!after.is_active());
+        assert!(after.files.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("f.txt")).unwrap(),
+            "a\nMAIN\nc\n"
+        );
+
+        // 中止対象が無ければエラー
+        assert!(abort_operation(repo.path()).is_err());
+
+        // 衝突しないマージは成功として返る
+        repo.git(&["checkout", "-qb", "other", "main"]);
+        repo.commit("g.txt", "other\n", "other change");
+        repo.git(&["checkout", "-q", "main"]);
+        let ok = merge(repo.path(), "other", false).expect("マージ成功");
+        assert!(!ok.conflicted);
+        assert!(repo.path().join("g.txt").exists());
+    }
+
+    #[test]
+    fn リモート追跡ブランチの切替はローカルブランチを作る() {
+        // 「リモート」役の裸リポジトリを用意して clone する（ネットワーク不要）
+        let origin = TempRepo::new("remote-origin");
+        origin.commit("a.txt", "one\n", "init");
+        origin.git(&["checkout", "-qb", "release"]);
+        origin.commit("b.txt", "two\n", "release commit");
+        origin.git(&["checkout", "-q", "main"]);
+
+        let clone_dir =
+            std::env::temp_dir().join(format!("tako-git-496-clone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&clone_dir);
+        let out = std::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                &origin.path().display().to_string(),
+                &clone_dir.display().to_string(),
+            ])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("clone");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let p = checkout_preview(&clone_dir, "origin/release").expect("preview");
+        assert!(
+            p.creates_local_branch,
+            "リモート追跡はローカルブランチを作る"
+        );
+        assert_eq!(p.target, "origin/release");
+
+        checkout(&clone_dir, "origin/release").expect("切替できる");
+        let branch = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&clone_dir)
+            .output()
+            .expect("branch");
+        assert_eq!(
+            String::from_utf8_lossy(&branch.stdout).trim(),
+            "release",
+            "detached HEAD ではなくローカル追跡ブランチになる"
+        );
+        let _ = std::fs::remove_dir_all(&clone_dir);
+    }
+
+    #[test]
+    fn merge_treeの出力からコンフリクトファイルを取り出す() {
+        let raw = "f02c3990f5aaff78cb586e4ed423760394f2c5aa\n\
+                   src/a.rs\n\
+                   src/b.rs\n\
+                   \n\
+                   Auto-merging src/a.rs\n\
+                   CONFLICT (content): Merge conflict in src/a.rs\n";
+        assert_eq!(
+            parse_merge_tree_conflicts(raw),
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
+        );
+        // コンフリクトなし（ツリー OID のみ）
+        assert!(parse_merge_tree_conflicts("f02c399\n").is_empty());
     }
 
     #[test]

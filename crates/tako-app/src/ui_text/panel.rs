@@ -204,6 +204,185 @@ pub fn git_detached_head() -> &'static str {
     tr!("detached HEAD", "detached HEAD")
 }
 
+// --- ブランチ操作（#496 Part 1） ---
+
+pub fn git_remote_branches(n: usize) -> String {
+    tr!(format!(" リモート ({n})"), format!(" Remote ({n})"))
+}
+/// ブランチセクション右端の新規作成ボタン
+pub fn git_branch_new() -> &'static str {
+    tr!("新規", "New")
+}
+pub fn git_branch_new_placeholder() -> &'static str {
+    tr!("新しいブランチ名", "New branch name")
+}
+pub fn git_branch_from(base: &str) -> String {
+    tr!(format!("基点: {base}"), format!("From: {base}"))
+}
+pub fn git_branch_create_btn() -> &'static str {
+    tr!("作成", "Create")
+}
+pub fn git_cancel() -> &'static str {
+    tr!("キャンセル", "Cancel")
+}
+/// ブランチ行のホバー時に出るマージボタン
+pub fn git_merge_btn() -> &'static str {
+    tr!("マージ", "Merge")
+}
+pub fn git_confirm_run() -> &'static str {
+    tr!("実行", "Run")
+}
+/// 事前提示カードの見出し（#496: 黙って実行せず、何が起きるかを先に出す）
+pub fn git_checkout_confirm_title(branch: &str) -> String {
+    tr!(
+        format!("'{branch}' へ切り替えます"),
+        format!("Switch to '{branch}'")
+    )
+}
+pub fn git_merge_confirm_title(branch: &str) -> String {
+    tr!(
+        format!("'{branch}' を現在のブランチへ取り込みます"),
+        format!("Merge '{branch}' into the current branch")
+    )
+}
+pub fn git_preview_changed(n: usize) -> String {
+    tr!(
+        format!("内容が入れ替わるファイル: {n} 件"),
+        format!("Files replaced by the switch: {n}")
+    )
+}
+pub fn git_preview_carried(n: usize) -> String {
+    tr!(
+        format!("切替後もそのまま残る未コミット変更: {n} 件"),
+        format!("Uncommitted changes carried over: {n}")
+    )
+}
+pub fn git_preview_blocking(n: usize) -> String {
+    tr!(
+        format!("切替を妨げる未コミット変更: {n} 件（先にコミットか退避が必要）"),
+        format!("Uncommitted changes blocking the switch: {n} (commit or stash first)")
+    )
+}
+/// 切替を実行できない理由（#496。一覧の内訳とは別に「だからできない」を 1 行で言う）
+pub fn git_checkout_blocked() -> &'static str {
+    tr!(
+        "このまま切り替えると変更が失われるため実行できません",
+        "Cannot switch: the change would be lost"
+    )
+}
+pub fn git_preview_creates_local(branch: &str) -> String {
+    tr!(
+        format!("リモート追跡ブランチから '{branch}' を作成します"),
+        format!("Creates local branch '{branch}' tracking the remote")
+    )
+}
+pub fn git_merge_kind_label(kind: &str) -> String {
+    match kind {
+        "up-to-date" => tr!(
+            "すでに取り込み済み（何も起きません）".to_string(),
+            "Already up to date (nothing happens)".to_string()
+        ),
+        "fast-forward" => tr!(
+            "早送り（コンフリクトは起きません）".to_string(),
+            "Fast-forward (no conflicts possible)".to_string()
+        ),
+        "unrelated" => tr!(
+            "共通の祖先がありません".to_string(),
+            "No common ancestor".to_string()
+        ),
+        _ => tr!(
+            "3-way マージ（マージコミットを作ります）".to_string(),
+            "Three-way merge (creates a merge commit)".to_string()
+        ),
+    }
+}
+pub fn git_merge_incoming(n: usize) -> String {
+    tr!(
+        format!("取り込むコミット: {n} 件"),
+        format!("Commits to merge in: {n}")
+    )
+}
+pub fn git_merge_changed(n: usize) -> String {
+    tr!(
+        format!("変更されるファイル: {n} 件"),
+        format!("Files changed: {n}")
+    )
+}
+pub fn git_merge_predicted(n: usize) -> String {
+    tr!(
+        format!("コンフリクトの予測: {n} 件"),
+        format!("Predicted conflicts: {n}")
+    )
+}
+pub fn git_merge_no_conflict() -> &'static str {
+    tr!("コンフリクトは予測されていません", "No conflicts predicted")
+}
+pub fn git_merge_prediction_unavailable() -> &'static str {
+    tr!(
+        "この git ではコンフリクトを事前予測できません",
+        "This git version cannot predict conflicts"
+    )
+}
+
+// --- コンフリクトカード（#496 Part 2） ---
+
+pub fn git_conflict_title(operation: &str) -> String {
+    let op = match operation {
+        "merging" => tr!("マージ", "merge"),
+        "rebasing" => tr!("リベース", "rebase"),
+        "cherry-picking" => tr!("チェリーピック", "cherry-pick"),
+        "reverting" => tr!("リバート", "revert"),
+        other => other,
+    };
+    tr!(
+        format!("{op}中にコンフリクトが発生しています"),
+        format!("Conflicts during {op}")
+    )
+}
+pub fn git_conflict_branches(ours: &str, theirs: &str) -> String {
+    tr!(format!("{ours} ← {theirs}"), format!("{ours} <- {theirs}"))
+}
+pub fn git_conflict_files(n: usize) -> String {
+    tr!(
+        format!("未解決ファイル ({n})"),
+        format!("Unresolved files ({n})")
+    )
+}
+/// 一覧が長いときの省略表示（カードがパネル高さを食い潰さないための上限。#496）
+pub fn git_conflict_more_files(n: usize) -> String {
+    tr!(format!("ほか {n} 件"), format!("and {n} more"))
+}
+/// 未解決ゼロ = 解決済みでコミット待ち
+pub fn git_conflict_all_resolved() -> &'static str {
+    tr!(
+        "未解決ファイルはありません（コミットすれば完了します）",
+        "No unresolved files left (commit to finish)"
+    )
+}
+pub fn git_conflict_abort(operation: &str) -> String {
+    let op = match operation {
+        "merging" => tr!("マージ", "merge"),
+        "rebasing" => tr!("リベース", "rebase"),
+        "cherry-picking" => tr!("チェリーピック", "cherry-pick"),
+        "reverting" => tr!("リバート", "revert"),
+        other => other,
+    };
+    tr!(format!("{op}を中止"), format!("Abort {op}"))
+}
+pub fn git_conflict_resolve_agent() -> &'static str {
+    tr!("解消エージェントを起動", "Start resolve agent")
+}
+/// エージェント選択ドロップダウンの見出し
+pub fn git_agent_pick() -> &'static str {
+    tr!("エージェントを選ぶ", "Choose an agent")
+}
+pub fn git_resolve_agent_started(agent: &str, pane: u64) -> String {
+    tr!(
+        format!("{agent} をペイン {pane} で起動しました（プロンプト投入中）"),
+        format!("Started {agent} in pane {pane} (delivering prompt)")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -252,6 +431,40 @@ mod tests {
                 git_dismiss().to_string(),
                 git_commit_message_too_long(4096),
                 git_detached_head().to_string(),
+                // #496: ブランチ操作 + コンフリクトカード
+                git_remote_branches(2),
+                git_branch_new().to_string(),
+                git_branch_new_placeholder().to_string(),
+                git_branch_from("main"),
+                git_branch_create_btn().to_string(),
+                git_cancel().to_string(),
+                git_merge_btn().to_string(),
+                git_confirm_run().to_string(),
+                git_checkout_confirm_title("feat"),
+                git_merge_confirm_title("feat"),
+                git_preview_changed(3),
+                git_preview_carried(1),
+                git_preview_blocking(2),
+                git_preview_creates_local("release"),
+                git_checkout_blocked().to_string(),
+                git_merge_kind_label("three-way"),
+                git_merge_kind_label("fast-forward"),
+                git_merge_kind_label("up-to-date"),
+                git_merge_kind_label("unrelated"),
+                git_merge_incoming(2),
+                git_merge_changed(4),
+                git_merge_predicted(1),
+                git_merge_no_conflict().to_string(),
+                git_merge_prediction_unavailable().to_string(),
+                git_conflict_title("merging"),
+                git_conflict_branches("main", "feat"),
+                git_conflict_files(2),
+                git_conflict_more_files(3),
+                git_conflict_all_resolved().to_string(),
+                git_conflict_abort("merging"),
+                git_conflict_resolve_agent().to_string(),
+                git_agent_pick().to_string(),
+                git_resolve_agent_started("claude", 7),
             ]
         });
     }

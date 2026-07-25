@@ -45,10 +45,24 @@ pub mod webdock;
 pub(crate) mod tests_support {
     use tako_core::i18n::{self, Lang};
 
+    /// 言語グローバルを触るテストの直列化ロック（#496）。
+    ///
+    /// `check_ja_en` はプロセス全体で共有される言語設定を Ja → En → 復元と切り替える。
+    /// カタログテストは各モジュールに 1 本ずつあり、cargo test は既定で並列実行するため、
+    /// ロックが無いと「A が En に切り替えている間に B が Ja 前提で collect する」
+    /// 競合が起き、`英語文字列に日本語が残っている` で確率的に落ちる
+    /// （実測: `cargo test -p tako-app ui_text` で毎回 2〜4 本が失敗）。
+    fn lang_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     /// 日英カタログの機械検査。collect を Ja / En それぞれで実行し、
     /// 全文字列が非空・絵文字なし（#217）・英語側に日本語が残っていないことを検査する。
     /// 言語グローバルを切り替えるため、lang 依存の他テストは相対比較で書くこと
     pub(crate) fn check_ja_en(collect: impl Fn() -> Vec<String>) {
+        // 前のテストが assert で落ちてロックが毒されても、検査自体は続行してよい
+        let _guard = lang_lock().lock().unwrap_or_else(|e| e.into_inner());
         let original = i18n::lang();
         i18n::set_lang(Lang::Ja);
         let ja = collect();

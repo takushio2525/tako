@@ -123,6 +123,68 @@ impl GitScrollBody {
     }
 }
 
+/// ブランチ切替の事前提示カードに載せる説明行と、実行を止める理由を組み立てる（#496）。
+///
+/// 戻り値の 2 番目が空でなければ実行ボタンを出さない。git が拒否すると分かっている操作を
+/// 「押せるが失敗する」状態で見せない、が方針（#494 で無効ボタンの理由を必ず言葉にしたのと同じ）。
+pub(crate) fn checkout_confirm_lines(
+    preview: &tako_core::CheckoutPreview,
+) -> (Vec<String>, Vec<String>) {
+    use crate::ui_text::panel as txt;
+    let mut lines = Vec::new();
+    if preview.creates_local_branch {
+        let local = preview
+            .target
+            .split_once('/')
+            .map(|(_, rest)| rest)
+            .unwrap_or(&preview.target);
+        lines.push(txt::git_preview_creates_local(local));
+    }
+    if preview.changed_files > 0 {
+        lines.push(txt::git_preview_changed(preview.changed_files));
+    }
+    if !preview.blocking_files.is_empty() {
+        lines.push(txt::git_preview_blocking(preview.blocking_files.len()));
+        lines.extend(preview.blocking_files.iter().map(|p| format!("  {p}")));
+    }
+    if !preview.carried_files.is_empty() {
+        lines.push(txt::git_preview_carried(preview.carried_files.len()));
+        lines.extend(preview.carried_files.iter().map(|p| format!("  {p}")));
+    }
+    let mut blockers = preview.blockers.clone();
+    if !preview.blocking_files.is_empty() {
+        // 一覧側と同じ文言を繰り返さない。ここは「だから実行できない」を言う行
+        blockers.push(txt::git_checkout_blocked().to_string());
+    }
+    (lines, blockers)
+}
+
+/// マージの事前提示カードに載せる説明行を組み立てる（#496）
+pub(crate) fn merge_confirm_lines(preview: &tako_core::MergePreview) -> Vec<String> {
+    use crate::ui_text::panel as txt;
+    let mut lines = vec![txt::git_merge_kind_label(preview.kind.as_str())];
+    if preview.incoming_commits > 0 {
+        lines.push(txt::git_merge_incoming(preview.incoming_commits));
+    }
+    if !preview.changed_files.is_empty() {
+        lines.push(txt::git_merge_changed(preview.changed_files.len()));
+    }
+    // 予測できたかどうかを必ず言葉にする（黙って「コンフリクトなし」に見せない）
+    if !preview.prediction_available {
+        lines.push(txt::git_merge_prediction_unavailable().to_string());
+    } else if preview.predicted_conflicts.is_empty() {
+        lines.push(txt::git_merge_no_conflict().to_string());
+    } else {
+        lines.push(txt::git_merge_predicted(preview.predicted_conflicts.len()));
+        lines.extend(preview.predicted_conflicts.iter().map(|p| format!("  {p}")));
+    }
+    lines
+}
+
+/// コンフリクトカードに一覧表示する未解決ファイルの上限（#496）。
+/// カードは固定ヘッダ側にあるため、全件出すとパネル高さを食い潰してスクロール本文が消える
+pub(crate) const CONFLICT_FILES_SHOWN: usize = 8;
+
 /// orch ビューのワーカー行（#217。render_orch_view で収集）
 struct OrchWorker {
     pane: PaneId,
@@ -2164,6 +2226,26 @@ impl TakoApp {
         on_bulk: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        let on_toggle = cx.listener(|this, _, _, cx| {
+            this.git_collapsed.changes = !this.git_collapsed.changes;
+            cx.notify();
+        });
+        self.git_section_header_generic(id, collapsed, label, bulk, theme, on_bulk, on_toggle, cx)
+    }
+
+    /// セクションヘッダの実体（#496）。折りたたみ先が節ごとに違うので開閉も差し替え可能にする
+    #[allow(clippy::too_many_arguments)]
+    fn git_section_header_generic(
+        &self,
+        id: &'static str,
+        collapsed: bool,
+        label: String,
+        bulk: Option<(&'static str, &'static str, &'static str)>,
+        theme: &tako_core::Theme,
+        on_bulk: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+        on_toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+        _cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let fg = theme.tab_inactive_foreground;
         let bg_hover = theme.selection_background;
         let mut header = div()
@@ -2188,10 +2270,7 @@ impl TakoApp {
                     .gap(px(2.0))
                     .cursor_pointer()
                     .hover(|d| d.bg(rgba_alpha(bg_hover, 0.3)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.git_collapsed.changes = !this.git_collapsed.changes;
-                        cx.notify();
-                    }))
+                    .on_click(on_toggle)
                     .child(
                         svg()
                             .path(if collapsed {
@@ -2346,6 +2425,603 @@ impl TakoApp {
                             }),
                     ),
             )
+    }
+
+    /// ブランチ 1 行（#496）。行クリックでチェックアウト、ホバー時に出る「マージ」で取り込み。
+    /// どちらも即実行ではなく、必要なら事前提示カードを行の直下に出す
+    fn render_branch_row(
+        &self,
+        id: (&'static str, usize),
+        branch: &tako_core::GitBranch,
+        is_remote: bool,
+        repo_root: &str,
+        theme: &tako_core::Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let fg = theme.tab_inactive_foreground;
+        let accent = theme.accent;
+        let is_current = branch.is_current;
+        let name = branch.name.clone();
+        let selected = self
+            .git_branch_confirm
+            .as_ref()
+            .is_some_and(|c| c.branch == name);
+
+        let checkout_repo = repo_root.to_string();
+        let checkout_name = name.clone();
+        let merge_repo = repo_root.to_string();
+        let merge_name = name.clone();
+
+        div()
+            .id(id)
+            .group("git-branch-row")
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .overflow_hidden()
+            .px_3()
+            .py(px(1.0))
+            .text_size(px(11.0))
+            .cursor_pointer()
+            .when(selected, |d| d.bg(rgba_alpha(accent, 0.15)))
+            .hover(|d| d.bg(rgba_alpha(theme.selection_background, 0.3)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if is_current {
+                    // すでにいるブランチ。カードだけ畳んで何もしない
+                    this.git_clear_branch_confirm(cx);
+                    return;
+                }
+                this.git_do_checkout(checkout_repo.clone(), checkout_name.clone(), false, cx);
+            }))
+            // 現在ブランチの明示（Issue #496 Part 1）。SVG が使えない小サイズなので中黒を使う
+            .child(
+                div()
+                    .w(px(10.0))
+                    .flex_none()
+                    .text_color(hsla(accent))
+                    .child(if is_current { "•" } else { " " }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .when(is_current, |d| d.text_color(hsla(accent)))
+                    .when(!is_current, |d| {
+                        // リモート追跡は 1 段薄くしてローカルと視覚的に区別する
+                        d.text_color(hsla_alpha(fg, if is_remote { 0.75 } else { 1.0 }))
+                    })
+                    .child(name.clone()),
+            )
+            // マージボタン: 現在ブランチ自身には出さない（自分自身はマージできない）
+            .when(!is_current, |d| {
+                d.child(
+                    div()
+                        .id((
+                            "git-branch-merge",
+                            id.1 + if is_remote { 10_000 } else { 0 },
+                        ))
+                        .flex_none()
+                        .px_1()
+                        .rounded(px(3.0))
+                        .text_size(px(9.0))
+                        .text_color(hsla_alpha(fg, 0.6))
+                        .opacity(0.0)
+                        .group_hover("git-branch-row", |d| d.opacity(1.0))
+                        .hover(|d| d.bg(rgba_alpha(accent, 0.25)).text_color(hsla(accent)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.git_do_merge(merge_repo.clone(), merge_name.clone(), false, cx);
+                        }))
+                        .child(crate::ui_text::panel::git_merge_btn()),
+                )
+            })
+    }
+
+    /// 新規ブランチ名の入力行（#496）
+    fn render_branch_input(
+        &self,
+        input: &GitBranchInput,
+        repo_root: &str,
+        theme: &tako_core::Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let fg = theme.tab_inactive_foreground;
+        let base = input
+            .start_point
+            .clone()
+            .or_else(|| self.git_data.as_ref().map(|d| d.branch.clone()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "HEAD".to_string());
+        // キャレット位置は必ず文字境界へ丸めてから split する（#494 と同じ理由）
+        let cursor = floor_char_boundary(&input.text, input.cursor.min(input.text.len()));
+        let (before, after) = input.text.split_at(cursor);
+        let visible = ((self.panel_width - 60.0) / 6.5).max(6.0) as usize;
+        let repo_for_create = repo_root.to_string();
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .px_3()
+            .py(px(2.0))
+            .gap(px(2.0))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .overflow_hidden()
+                    .px_1()
+                    .py(px(2.0))
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(hsla_alpha(theme.accent, 0.7))
+                    .bg(rgba(theme.crust))
+                    .text_size(px(11.0))
+                    .text_color(hsla(theme.tab_active_foreground))
+                    .when(input.text.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_color(hsla(theme.text_muted))
+                                .child(crate::ui_text::panel::git_branch_new_placeholder()),
+                        )
+                    })
+                    .when(!input.text.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .child(SharedString::from(tail_chars(before, visible))),
+                        )
+                    })
+                    .child(
+                        div()
+                            .w(px(1.5))
+                            .h(px(13.0))
+                            .flex_none()
+                            .bg(hsla(theme.accent)),
+                    )
+                    .when(!input.text.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(SharedString::from(head_chars(after, visible))),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .overflow_hidden()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(9.0))
+                            .text_color(hsla(theme.text_muted))
+                            .child(SharedString::from(crate::ui_text::panel::git_branch_from(
+                                &base,
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .id("git-branch-create-btn")
+                            .flex_none()
+                            .px_1()
+                            .rounded(px(3.0))
+                            .cursor_pointer()
+                            .text_size(px(10.0))
+                            .bg(rgba_alpha(theme.accent, 0.2))
+                            .text_color(hsla(theme.accent))
+                            .hover(|d| d.bg(rgba_alpha(theme.accent, 0.35)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.git_do_create_branch(repo_for_create.clone(), cx);
+                            }))
+                            .child(crate::ui_text::panel::git_branch_create_btn()),
+                    )
+                    .child(
+                        div()
+                            .id("git-branch-cancel-btn")
+                            .flex_none()
+                            .px_1()
+                            .rounded(px(3.0))
+                            .cursor_pointer()
+                            .text_size(px(10.0))
+                            .text_color(hsla_alpha(fg, 0.8))
+                            .hover(|d| d.bg(rgba_alpha(theme.selection_background, 0.4)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.git_branch_input = None;
+                                cx.notify();
+                            }))
+                            .child(crate::ui_text::panel::git_cancel()),
+                    ),
+            )
+    }
+
+    /// ブランチ操作の事前提示カード（#496）。対象ブランチ行の直下に出す。
+    /// blockers があるときは実行ボタンを出さない（押しても git に拒否されるだけ）
+    fn render_branch_confirm(
+        &self,
+        confirm: &GitBranchConfirm,
+        repo_root: &str,
+        theme: &tako_core::Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        use crate::ui_text::panel as txt;
+        let blocked = !confirm.blockers.is_empty();
+        let color = if blocked { theme.yellow } else { theme.accent };
+        let title = match confirm.op {
+            GitBranchOp::Checkout => txt::git_checkout_confirm_title(&confirm.branch),
+            GitBranchOp::Merge => txt::git_merge_confirm_title(&confirm.branch),
+        };
+        let repo_for_run = repo_root.to_string();
+        let branch_for_run = confirm.branch.clone();
+        let op = confirm.op;
+        let busy = self.git_busy.is_some();
+
+        let mut card = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(1.0))
+            .mx_2()
+            .px_2()
+            .py(px(4.0))
+            .rounded(px(4.0))
+            .bg(rgba_alpha(color, 0.1))
+            .border_l_2()
+            .border_color(hsla(color))
+            .text_size(px(10.0))
+            .child(
+                div()
+                    .w_full()
+                    .overflow_hidden()
+                    .text_color(hsla(theme.tab_active_foreground))
+                    .child(SharedString::from(title)),
+            );
+        for line in &confirm.lines {
+            let is_conflict = confirm.conflicts.iter().any(|c| line.trim() == c);
+            card = card.child(
+                div()
+                    .w_full()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .text_size(px(9.0))
+                    .text_color(hsla(if is_conflict {
+                        theme.red
+                    } else {
+                        theme.text_muted
+                    }))
+                    .child(SharedString::from(line.clone())),
+            );
+        }
+        for blocker in &confirm.blockers {
+            card = card.child(
+                div()
+                    .w_full()
+                    .overflow_hidden()
+                    .text_size(px(9.0))
+                    .text_color(hsla(theme.yellow))
+                    .child(SharedString::from(blocker.clone())),
+            );
+        }
+
+        card.child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .overflow_hidden()
+                .gap_1()
+                .pt(px(2.0))
+                .when(!blocked, |d| {
+                    d.child(
+                        div()
+                            .id("git-branch-confirm-run")
+                            .flex_none()
+                            .px_2()
+                            .rounded(px(3.0))
+                            .cursor_pointer()
+                            .text_size(px(10.0))
+                            .when(!busy, |d| {
+                                d.bg(rgba_alpha(theme.accent, 0.25))
+                                    .text_color(hsla(theme.accent))
+                                    .hover(|d| d.bg(rgba_alpha(theme.accent, 0.4)))
+                            })
+                            .when(busy, |d| {
+                                d.bg(rgba_alpha(theme.border_subtle, 0.3))
+                                    .text_color(hsla(theme.text_muted))
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                match op {
+                                    GitBranchOp::Checkout => this.git_do_checkout(
+                                        repo_for_run.clone(),
+                                        branch_for_run.clone(),
+                                        true,
+                                        cx,
+                                    ),
+                                    GitBranchOp::Merge => this.git_do_merge(
+                                        repo_for_run.clone(),
+                                        branch_for_run.clone(),
+                                        true,
+                                        cx,
+                                    ),
+                                }
+                            }))
+                            .child(txt::git_confirm_run()),
+                    )
+                })
+                .child(
+                    div()
+                        .id("git-branch-confirm-cancel")
+                        .flex_none()
+                        .px_2()
+                        .rounded(px(3.0))
+                        .cursor_pointer()
+                        .text_size(px(10.0))
+                        .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
+                        .hover(|d| d.bg(rgba_alpha(theme.selection_background, 0.4)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.git_clear_branch_confirm(cx);
+                        }))
+                        .child(txt::git_cancel()),
+                ),
+        )
+    }
+
+    /// コンフリクトカード（#496 Part 2）。
+    /// 進行中の操作・未解決ファイル一覧・中止導線・解消エージェント起動をまとめる
+    fn render_conflict_card(
+        &self,
+        state: &tako_core::ConflictState,
+        repo_root: &str,
+        theme: &tako_core::Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        use crate::ui_text::panel as txt;
+        let red = theme.red;
+        let operation = state.operation.as_str();
+        let ours = if state.ours.is_empty() {
+            txt::git_detached_head().to_string()
+        } else {
+            state.ours.clone()
+        };
+        let theirs = state.theirs.clone().unwrap_or_else(|| "?".to_string());
+        let repo_for_abort = repo_root.to_string();
+        let busy = self.git_busy.is_some();
+
+        // カードは**固定ヘッダ側**に置くため、行が縦に潰れない保証を自前で持つ必要がある
+        // （#494: overflow_hidden な行は automatic minimum size が 0 になり、総高さが
+        // 親を超えた瞬間に taffy が高さ 0 付近まで圧縮して要素同士が重なる）。
+        // 行の追加を push 1 本に集約して構造的に防ぐ = GitScrollBody と同じ考え方
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        macro_rules! push_row {
+            ($el:expr) => {
+                rows.push(git_scroll_row($el).into_any_element())
+            };
+        }
+
+        push_row!(div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .overflow_hidden()
+            .gap_1()
+            .child(
+                svg()
+                    .path(ui_icon::WARNING)
+                    .w(px(11.0))
+                    .h(px(11.0))
+                    .flex_none()
+                    .text_color(hsla(red)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .text_size(px(11.0))
+                    .text_color(hsla(red))
+                    .child(SharedString::from(txt::git_conflict_title(operation))),
+            ));
+        push_row!(div()
+            .w_full()
+            .overflow_hidden()
+            .text_ellipsis()
+            .text_size(px(9.0))
+            .text_color(hsla(theme.text_muted))
+            .child(SharedString::from(txt::git_conflict_branches(
+                &ours, &theirs,
+            ))));
+
+        // 未解決ファイル一覧（porcelain v2 の UU / AA / DU 等を解釈済み）
+        if state.files.is_empty() {
+            push_row!(div()
+                .w_full()
+                .overflow_hidden()
+                .text_size(px(9.0))
+                .text_color(hsla(theme.green))
+                .child(txt::git_conflict_all_resolved()));
+        } else {
+            push_row!(div()
+                .w_full()
+                .overflow_hidden()
+                .text_ellipsis()
+                .text_size(px(9.0))
+                .text_color(hsla(theme.tab_inactive_foreground))
+                .child(SharedString::from(txt::git_conflict_files(
+                    state.files.len(),
+                ))));
+            // 全件出すとヘッダがパネル高さを食い潰してスクロール本文が消える。
+            // 件数はすぐ上の見出しに出ているので、一覧は先頭 N 件で足りる
+            for path in state.files.iter().take(CONFLICT_FILES_SHOWN) {
+                push_row!(div()
+                    .w_full()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .pl_2()
+                    .text_size(px(10.0))
+                    .text_color(hsla(theme.tab_active_foreground))
+                    .child(path.clone()));
+            }
+            if state.files.len() > CONFLICT_FILES_SHOWN {
+                push_row!(div()
+                    .w_full()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .pl_2()
+                    .text_size(px(9.0))
+                    .text_color(hsla(theme.text_muted))
+                    .child(SharedString::from(txt::git_conflict_more_files(
+                        state.files.len() - CONFLICT_FILES_SHOWN
+                    ))));
+            }
+        }
+
+        // 操作行: 中止 / 解消エージェント起動
+        push_row!(div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .overflow_hidden()
+            .gap_1()
+            .pt(px(2.0))
+            .child(
+                div()
+                    .id("git-conflict-resolve-btn")
+                    .flex_1()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .px_1()
+                    .py(px(2.0))
+                    .rounded(px(3.0))
+                    .cursor_pointer()
+                    .text_size(px(10.0))
+                    .bg(rgba_alpha(theme.accent, 0.25))
+                    .text_color(hsla(theme.accent))
+                    .hover(|d| d.bg(rgba_alpha(theme.accent, 0.4)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.git_agent_menu_open = !this.git_agent_menu_open;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(txt::git_conflict_resolve_agent()),
+                            )
+                            .child(
+                                svg()
+                                    .path(if self.git_agent_menu_open {
+                                        ui_icon::CHEVRON_DOWN
+                                    } else {
+                                        ui_icon::CHEVRON_RIGHT
+                                    })
+                                    .w(px(9.0))
+                                    .h(px(9.0))
+                                    .flex_none()
+                                    .text_color(hsla(theme.accent)),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("git-conflict-abort-btn")
+                    .flex_none()
+                    .px_1()
+                    .py(px(2.0))
+                    .rounded(px(3.0))
+                    .cursor_pointer()
+                    .text_size(px(10.0))
+                    .when(!busy, |d| {
+                        d.text_color(hsla(red))
+                            .hover(|d| d.bg(rgba_alpha(red, 0.25)))
+                    })
+                    .when(busy, |d| d.text_color(hsla(theme.text_muted)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.git_do_abort(repo_for_abort.clone(), cx);
+                    }))
+                    .child(SharedString::from(txt::git_conflict_abort(operation))),
+            ));
+
+        // エージェント選択（#496）。狭いパネルで確実に見えるよう、
+        // 浮かせずカード内へ展開する（オーバーレイは 220pt 幅で画面外へ出る）
+        if self.git_agent_menu_open {
+            push_row!(div()
+                .w_full()
+                .overflow_hidden()
+                .text_size(px(9.0))
+                .text_color(hsla(theme.text_muted))
+                .child(txt::git_agent_pick()));
+            let mut row = div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .overflow_hidden()
+                .gap_1();
+            // 既存のエージェント基盤と同じ 3 種（新しい系統は作らない）
+            for (i, agent) in ["claude", "codex", "agy"].into_iter().enumerate() {
+                row = row.child(
+                    div()
+                        .id(("git-conflict-agent", i))
+                        .flex_1()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .px_1()
+                        .py(px(2.0))
+                        .rounded(px(3.0))
+                        .cursor_pointer()
+                        .text_size(px(10.0))
+                        .bg(rgba_alpha(theme.accent, 0.15))
+                        .text_color(hsla(theme.accent))
+                        .hover(|d| d.bg(rgba_alpha(theme.accent, 0.35)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.git_do_resolve_agent(agent, cx);
+                        }))
+                        .child(agent),
+                );
+            }
+            push_row!(row);
+        }
+
+        div()
+            .w_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .px_2()
+            .py(px(4.0))
+            .bg(rgba_alpha(red, 0.12))
+            .border_l_2()
+            .border_color(hsla(red))
+            .children(rows)
     }
 
     /// git ビュー（FR-3.6 git graph + FR-3.9 diff ビューア）。cwd 連動で 2 秒ポーリング更新。
@@ -2503,6 +3179,18 @@ impl TakoApp {
                         .child(crate::ui_text::panel::git_refresh()),
                 ),
         );
+
+        // ──── コンフリクトカード（#496 Part 2）────
+        // フィードバックより上・リポヘッダの直下に置く。コンフリクト中は
+        // 「今どういう状態で、何ができるか」が他のどの情報より優先される
+        if data.conflict.is_active() {
+            header = header.child(self.render_conflict_card(
+                &data.conflict,
+                &data.repo_root,
+                &theme,
+                cx,
+            ));
+        }
 
         // ──── コミットメッセージ入力 + 操作ボタン（#472 / #487）────
         let commit_msg = self.git_commit_message.clone();
@@ -2824,64 +3512,104 @@ impl TakoApp {
         // ──── ここから下はスクロール領域（行は必ず push 経由で積む。#494）────
         let mut body = GitScrollBody::default();
 
-        // ──── ブランチ一覧セクション ────
-        body.push(
-            div()
-                .id("git-branches-header")
-                .w_full()
-                .flex()
-                .flex_row()
-                .items_center()
-                .overflow_hidden()
-                .gap(px(2.0))
-                .px_2()
-                .py(px(3.0))
-                .cursor_pointer()
-                .text_size(px(10.0))
-                .text_color(hsla(fg))
-                .hover(|d| d.bg(rgba_alpha(bg_hover, 0.3)))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.git_collapsed.branches = !this.git_collapsed.branches;
-                    cx.notify();
-                }))
-                .child(
-                    svg()
-                        .path(if collapsed.branches {
-                            ui_icon::CHEVRON_RIGHT
-                        } else {
-                            ui_icon::CHEVRON_DOWN
-                        })
-                        .w(px(10.0))
-                        .h(px(10.0))
-                        .flex_none()
-                        .text_color(hsla(fg)),
-                )
-                .child(crate::ui_text::panel::git_branches(
-                    data.branches.iter().filter(|b| !b.is_remote).count(),
-                )),
-        );
+        // ──── ブランチ一覧セクション（#496: クリックでチェックアウト + マージ + 新規作成）────
+        let local_branches: Vec<&tako_core::GitBranch> =
+            data.branches.iter().filter(|b| !b.is_remote).collect();
+        let remote_branches: Vec<&tako_core::GitBranch> =
+            data.branches.iter().filter(|b| b.is_remote).collect();
+        let repo_for_new_branch = repo_root_str.clone();
+        body.push(self.git_section_header_generic(
+            "git-branches-header",
+            collapsed.branches,
+            crate::ui_text::panel::git_branches(local_branches.len()),
+            Some((
+                "git-branch-new",
+                ui_icon::PLUS,
+                crate::ui_text::panel::git_branch_new(),
+            )),
+            &theme,
+            cx.listener(|this, _, _, cx| {
+                this.git_collapsed.branches = false;
+                // 基点は現在の HEAD（= 今いるブランチ）。入力欄に明示表示する
+                this.git_branch_input = Some(GitBranchInput {
+                    text: String::new(),
+                    cursor: 0,
+                    start_point: None,
+                });
+                this.git_branch_confirm = None;
+                this.git_commit_input_focused = false;
+                cx.notify();
+            }),
+            cx.listener(|this, _, _, cx| {
+                this.git_collapsed.branches = !this.git_collapsed.branches;
+                cx.notify();
+            }),
+            cx,
+        ));
         if !collapsed.branches {
-            for branch in &data.branches {
-                if branch.is_remote {
-                    continue;
+            // 新規ブランチ名の入力行（#496）
+            if let Some(input) = self.git_branch_input.clone() {
+                body.push(self.render_branch_input(&input, &repo_for_new_branch, &theme, cx));
+            }
+            for (i, branch) in local_branches.iter().enumerate() {
+                body.push(self.render_branch_row(
+                    ("git-branch", i),
+                    branch,
+                    false,
+                    &repo_root_str,
+                    &theme,
+                    cx,
+                ));
+                // 事前提示カードは対象ブランチ行の直下に出す（#510 の方針）
+                if self
+                    .git_branch_confirm
+                    .as_ref()
+                    .is_some_and(|c| c.branch == branch.name)
+                {
+                    let confirm = self.git_branch_confirm.clone().expect("直前に確認済み");
+                    body.push(self.render_branch_confirm(&confirm, &repo_root_str, &theme, cx));
                 }
-                let is_current = branch.is_current;
-                body.push(
-                    div()
-                        .w_full()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .px_3()
-                        .py(px(1.0))
-                        .text_size(px(11.0))
-                        .when(is_current, |d| d.text_color(hsla(accent)))
-                        .when(!is_current, |d| d.text_color(hsla(fg)))
-                        .child(format!(
-                            "{}{}",
-                            if is_current { "● " } else { "  " },
-                            branch.name
-                        )),
-                );
+            }
+            // リモート追跡ブランチ（#496: ローカルと区別して別セクションに出す）
+            if !remote_branches.is_empty() {
+                body.push(self.git_section_header_generic(
+                    "git-remotes-header",
+                    collapsed.remotes,
+                    crate::ui_text::panel::git_remote_branches(remote_branches.len()),
+                    None,
+                    &theme,
+                    |_, _, _| {},
+                    cx.listener(|this, _, _, cx| {
+                        this.git_collapsed.remotes = !this.git_collapsed.remotes;
+                        cx.notify();
+                    }),
+                    cx,
+                ));
+                if !collapsed.remotes {
+                    for (i, branch) in remote_branches.iter().enumerate() {
+                        body.push(self.render_branch_row(
+                            ("git-remote-branch", i),
+                            branch,
+                            true,
+                            &repo_root_str,
+                            &theme,
+                            cx,
+                        ));
+                        if self
+                            .git_branch_confirm
+                            .as_ref()
+                            .is_some_and(|c| c.branch == branch.name)
+                        {
+                            let confirm = self.git_branch_confirm.clone().expect("直前に確認済み");
+                            body.push(self.render_branch_confirm(
+                                &confirm,
+                                &repo_root_str,
+                                &theme,
+                                cx,
+                            ));
+                        }
+                    }
+                }
             }
         }
 
@@ -3898,6 +4626,376 @@ impl TakoApp {
         .detach();
     }
 
+    // ──────────── ブランチ操作（#496）────────────
+
+    /// 事前提示カードを閉じる（別のブランチを触った / 実行した / キャンセル）
+    pub(crate) fn git_clear_branch_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.git_branch_confirm.is_some() {
+            self.git_branch_confirm = None;
+            cx.notify();
+        }
+    }
+
+    /// ブランチ切替（#496）。`confirm` = false のときは、未コミット変更があれば
+    /// 実行せず「何が起きるか」をカードに出す（黙って強制切替・stash はしない）
+    pub(crate) fn git_do_checkout(
+        &mut self,
+        repo_root: String,
+        branch: String,
+        confirm: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.git_begin_op("checkout", cx) {
+            return;
+        }
+        let branch_for_task = branch.clone();
+        cx.spawn(async move |this, cx| {
+            // preview と実行はまとめて background で回す（git は数十 ms 単位で UI を止める）
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = std::path::Path::new(&repo_root);
+                    let preview = tako_core::git::checkout_preview(repo, &branch_for_task)?;
+                    if !preview.blockers.is_empty() || (!confirm && preview.needs_confirmation()) {
+                        return Ok::<_, String>((preview, None));
+                    }
+                    let out = tako_core::git::checkout(repo, &branch_for_task)?;
+                    Ok((preview, Some(out)))
+                })
+                .await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                app.git_busy = None;
+                match outcome {
+                    Ok((preview, None)) => app.git_show_checkout_confirm(&branch, &preview, cx),
+                    Ok((preview, Some(out))) => {
+                        app.git_branch_confirm = None;
+                        let msg = if out.trim().is_empty() {
+                            format!("switched to {}", preview.target)
+                        } else {
+                            git_result_summary(&out, "checkout done")
+                        };
+                        app.git_set_feedback(msg, false, cx);
+                    }
+                    Err(e) => app.git_set_feedback(e, true, cx),
+                }
+                app.refresh_git(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 切替の事前提示カードを組み立てる（#496）
+    fn git_show_checkout_confirm(
+        &mut self,
+        branch: &str,
+        preview: &tako_core::CheckoutPreview,
+        cx: &mut Context<Self>,
+    ) {
+        let (lines, blockers) = checkout_confirm_lines(preview);
+        self.git_branch_confirm = Some(GitBranchConfirm {
+            branch: branch.to_string(),
+            op: GitBranchOp::Checkout,
+            lines,
+            blockers,
+            conflicts: Vec::new(),
+        });
+        cx.notify();
+    }
+
+    /// マージ（#496）。`confirm` = false のときは実行せず、
+    /// 作業ツリーに触れずに計算した予測（種別・件数・コンフリクト）をカードに出す
+    pub(crate) fn git_do_merge(
+        &mut self,
+        repo_root: String,
+        branch: String,
+        confirm: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.git_begin_op("merge", cx) {
+            return;
+        }
+        let branch_for_task = branch.clone();
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = std::path::Path::new(&repo_root);
+                    let preview = tako_core::git::merge_preview(repo, &branch_for_task)?;
+                    if !confirm || !preview.blockers.is_empty() {
+                        return Ok::<_, String>((preview, None));
+                    }
+                    let outcome = tako_core::git::merge(repo, &branch_for_task, false)?;
+                    Ok((preview, Some(outcome)))
+                })
+                .await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                app.git_busy = None;
+                match outcome {
+                    Ok((preview, None)) => app.git_show_merge_confirm(&branch, &preview, cx),
+                    Ok((_, Some(result))) => {
+                        app.git_branch_confirm = None;
+                        if result.conflicted {
+                            // 失敗ではなく「解消待ち」。コンフリクトカードが状況を引き継ぐ
+                            app.git_set_feedback(
+                                git_result_summary(&result.output, "merge conflict"),
+                                true,
+                                cx,
+                            );
+                        } else {
+                            app.git_set_feedback(
+                                git_result_summary(&result.output, "merge done"),
+                                false,
+                                cx,
+                            );
+                        }
+                    }
+                    Err(e) => app.git_set_feedback(e, true, cx),
+                }
+                app.refresh_git(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// マージの事前提示カードを組み立てる（#496）
+    fn git_show_merge_confirm(
+        &mut self,
+        branch: &str,
+        preview: &tako_core::MergePreview,
+        cx: &mut Context<Self>,
+    ) {
+        self.git_branch_confirm = Some(GitBranchConfirm {
+            branch: branch.to_string(),
+            op: GitBranchOp::Merge,
+            lines: merge_confirm_lines(preview),
+            blockers: preview.blockers.clone(),
+            conflicts: preview.predicted_conflicts.clone(),
+        });
+        cx.notify();
+    }
+
+    /// 新規ブランチ作成（#496）。入力欄の内容で作成し、そのまま切り替える
+    pub(crate) fn git_do_create_branch(&mut self, repo_root: String, cx: &mut Context<Self>) {
+        let Some(input) = self.git_branch_input.clone() else {
+            return;
+        };
+        let name = input.text.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        // 名前の不正は git を呼ぶ前に理由つきで返す（押しても無反応にしない）
+        if let Err(e) = tako_core::git::validate_branch_name(&name) {
+            self.git_set_feedback(e, true, cx);
+            return;
+        }
+        if !self.git_begin_op("branch", cx) {
+            return;
+        }
+        self.git_branch_input = None;
+        let start = input.start_point.clone();
+        cx.spawn(async move |this, cx| {
+            let name_for_msg = name.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = std::path::Path::new(&repo_root);
+                    tako_core::git::create_branch(repo, &name, start.as_deref(), true)
+                })
+                .await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                app.git_busy = None;
+                match result {
+                    Ok(out) => {
+                        let msg = if out.trim().is_empty() {
+                            format!("created {name_for_msg}")
+                        } else {
+                            git_result_summary(&out, "branch created")
+                        };
+                        app.git_set_feedback(msg, false, cx);
+                    }
+                    Err(e) => app.git_set_feedback(e, true, cx),
+                }
+                app.refresh_git(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 進行中の merge / rebase / cherry-pick / revert を中止する（#496）
+    pub(crate) fn git_do_abort(&mut self, repo_root: String, cx: &mut Context<Self>) {
+        if !self.git_begin_op("abort", cx) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = std::path::Path::new(&repo_root);
+                    tako_core::git::abort_operation(repo)
+                })
+                .await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                app.git_busy = None;
+                match result {
+                    Ok((op, out)) => {
+                        let msg = if out.trim().is_empty() {
+                            format!("aborted {}", op.as_str())
+                        } else {
+                            git_result_summary(&out, "aborted")
+                        };
+                        app.git_set_feedback(msg, false, cx);
+                    }
+                    Err(e) => app.git_set_feedback(e, true, cx),
+                }
+                app.refresh_git(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// コンフリクト解消エージェントを起動する（#496 Part 2）。
+    ///
+    /// **CLI / MCP と同じ dispatch を通す**（ペイン分割・セッション起動・プロンプト投入は
+    /// UI スレッドで完結する同期処理なので background へは出さない）
+    pub(crate) fn git_do_resolve_agent(&mut self, agent: &str, cx: &mut Context<Self>) {
+        self.git_agent_menu_open = false;
+        if self.git_busy.is_some() {
+            self.git_report_commit_block(cx);
+            return;
+        }
+        // パネルが見ているのと同じリポジトリを指すペインを渡す（#496）
+        let pane = self.git_source_for_tab().and_then(|(p, _)| p);
+        let request = tako_control::protocol::Request::GitResolveAgent {
+            pane: pane.map(|p| p.as_u64()),
+            agent: Some(agent.to_string()),
+            tab: None,
+        };
+        match tako_control::dispatch::dispatch(self, request, tako_core::PaneOrigin::User) {
+            Ok(v) => {
+                let pane_id = v["pane_id"].as_u64().unwrap_or(0);
+                let msg = crate::ui_text::panel::git_resolve_agent_started(agent, pane_id);
+                self.git_set_feedback(msg, false, cx);
+            }
+            Err(e) => self.git_set_feedback(e.to_string(), true, cx),
+        }
+        cx.notify();
+    }
+
+    /// 新規ブランチ名入力欄へ文字列を挿入する（#496。キー入力・IME 確定・貼り付け共通）
+    pub(crate) fn git_branch_input_insert(&mut self, text: &str, cx: &mut Context<Self>) {
+        // ブランチ名に改行・タブは入れられない。空白も git が拒否するのでここで落とす
+        let insert: String = text
+            .chars()
+            .filter(|c| !c.is_control() && *c != ' ')
+            .collect();
+        if insert.is_empty() {
+            return;
+        }
+        if let Some(input) = self.git_branch_input.as_mut() {
+            // 上限はブランチ名として現実的な長さに留める（描画も入力欄に収まる）
+            const MAX: usize = 255;
+            let room = MAX.saturating_sub(input.text.len());
+            let cut = floor_char_boundary(&insert, room.min(insert.len()));
+            if cut == 0 {
+                return;
+            }
+            let cursor = floor_char_boundary(&input.text, input.cursor.min(input.text.len()));
+            input.text.insert_str(cursor, &insert[..cut]);
+            input.cursor = cursor + cut;
+        }
+        cx.notify();
+    }
+
+    /// 新規ブランチ名入力欄のキー処理（#496。サイドバーの InlineEdit と同じ操作体系）
+    pub(crate) fn handle_git_branch_input_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) {
+        match ks.key.as_str() {
+            "enter" => {
+                if let Some(repo) = self.git_data.as_ref().map(|d| d.repo_root.clone()) {
+                    self.git_do_create_branch(repo, cx);
+                }
+            }
+            "escape" => {
+                self.git_branch_input = None;
+                cx.notify();
+            }
+            "backspace" => {
+                if let Some(input) = self.git_branch_input.as_mut() {
+                    let cursor = floor_char_boundary(&input.text, input.cursor);
+                    if cursor > 0 {
+                        let prev = input.text[..cursor]
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        input.text.drain(prev..cursor);
+                        input.cursor = prev;
+                    }
+                }
+                cx.notify();
+            }
+            "delete" => {
+                if let Some(input) = self.git_branch_input.as_mut() {
+                    let cursor = floor_char_boundary(&input.text, input.cursor);
+                    if cursor < input.text.len() {
+                        let next = input.text[cursor..]
+                            .char_indices()
+                            .nth(1)
+                            .map(|(i, _)| cursor + i)
+                            .unwrap_or(input.text.len());
+                        input.text.drain(cursor..next);
+                    }
+                }
+                cx.notify();
+            }
+            "left" => {
+                if let Some(input) = self.git_branch_input.as_mut() {
+                    let cursor = floor_char_boundary(&input.text, input.cursor);
+                    input.cursor = input.text[..cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                }
+                cx.notify();
+            }
+            "right" => {
+                if let Some(input) = self.git_branch_input.as_mut() {
+                    let cursor = floor_char_boundary(&input.text, input.cursor);
+                    input.cursor = input.text[cursor..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| cursor + i)
+                        .unwrap_or(input.text.len());
+                }
+                cx.notify();
+            }
+            "home" => {
+                if let Some(input) = self.git_branch_input.as_mut() {
+                    input.cursor = 0;
+                }
+                cx.notify();
+            }
+            "end" => {
+                if let Some(input) = self.git_branch_input.as_mut() {
+                    input.cursor = input.text.len();
+                }
+                cx.notify();
+            }
+            "v" if ks.modifiers.platform => {
+                // ⌘V は paste() 経由（クリップボード読み出しは共通経路に任せる）
+                self.paste(cx);
+            }
+            _ => {
+                if let Some(ch) = ks.key_char.as_deref() {
+                    if !ch.is_empty() && !ch.chars().any(|c| c.is_control()) {
+                        self.git_branch_input_insert(ch, cx);
+                    }
+                }
+                // 修飾なしキーは入力欄が握る（ターミナルへ漏らさない）
+            }
+        }
+    }
+
     /// git pull を background で実行（#472）
     fn git_do_pull(&mut self, repo_root: String, cx: &mut Context<Self>) {
         if !self.git_begin_op("pull", cx) {
@@ -4235,5 +5333,104 @@ mod tests {
     fn コマンド出力の要約() {
         assert_eq!(git_result_summary("a\nb\n\n", "fallback"), "b".to_string());
         assert_eq!(git_result_summary("   \n", "fallback"), "fallback");
+    }
+
+    // ──────────── ブランチ操作の事前提示（#496）────────────
+
+    fn checkout_preview_fixture() -> tako_core::CheckoutPreview {
+        tako_core::CheckoutPreview {
+            target: "topic".into(),
+            current: "main".into(),
+            dirty_files: vec!["shared.txt".into(), "kept.txt".into()],
+            blocking_files: vec!["shared.txt".into()],
+            carried_files: vec!["kept.txt".into()],
+            changed_files: 3,
+            creates_local_branch: false,
+            blockers: Vec::new(),
+        }
+    }
+
+    /// #496: 切替の提示は「持ち越される変更」と「切替を妨げる変更」を必ず**分けて**出す。
+    /// 混ぜると「消えるのか残るのか」が読めず、黙って壊さない保証が伝わらない
+    #[test]
+    fn 切替の事前提示は持ち越しと衝突を分けて出す() {
+        let (lines, blockers) = checkout_confirm_lines(&checkout_preview_fixture());
+        let joined = lines.join("\n");
+        assert!(joined.contains("shared.txt"), "{joined}");
+        assert!(joined.contains("kept.txt"), "{joined}");
+        // 妨げるファイルがあるなら実行ボタンを出さない
+        assert!(!blockers.is_empty());
+    }
+
+    /// #496: クリーンな切替は説明だけで、実行を止めない
+    #[test]
+    fn 切替の事前提示はクリーンなら実行を止めない() {
+        let preview = tako_core::CheckoutPreview {
+            dirty_files: Vec::new(),
+            blocking_files: Vec::new(),
+            carried_files: Vec::new(),
+            ..checkout_preview_fixture()
+        };
+        let (lines, blockers) = checkout_confirm_lines(&preview);
+        assert!(blockers.is_empty());
+        assert!(!lines.is_empty(), "何が起きるかは必ず 1 行以上出す");
+    }
+
+    /// #496: リモート追跡からの切替は「ローカルブランチを作る」ことを明示する
+    #[test]
+    fn 切替の事前提示はローカルブランチ作成を明示する() {
+        let preview = tako_core::CheckoutPreview {
+            target: "origin/release".into(),
+            creates_local_branch: true,
+            dirty_files: Vec::new(),
+            blocking_files: Vec::new(),
+            carried_files: Vec::new(),
+            ..checkout_preview_fixture()
+        };
+        let (lines, _) = checkout_confirm_lines(&preview);
+        // リモート名を剥がしたローカル名で説明する
+        assert!(lines[0].contains("release"), "{:?}", lines);
+        assert!(!lines[0].contains("origin/"), "{:?}", lines);
+    }
+
+    fn merge_preview_fixture() -> tako_core::MergePreview {
+        tako_core::MergePreview {
+            target: "feat".into(),
+            current: "main".into(),
+            kind: tako_core::MergeKind::ThreeWay,
+            incoming_commits: 2,
+            changed_files: vec!["a.rs".into(), "b.rs".into()],
+            predicted_conflicts: vec!["a.rs".into()],
+            prediction_available: true,
+            dirty_files: Vec::new(),
+            blockers: Vec::new(),
+        }
+    }
+
+    /// #496: マージの提示は種別・件数・予測コンフリクトを揃えて出す
+    #[test]
+    fn マージの事前提示は予測コンフリクトを列挙する() {
+        let lines = merge_confirm_lines(&merge_preview_fixture());
+        let joined = lines.join("\n");
+        assert!(joined.contains("2"), "取り込みコミット数: {joined}");
+        assert!(joined.contains("a.rs"), "予測されたコンフリクト: {joined}");
+    }
+
+    /// #496: 予測できないときに「コンフリクトなし」と誤解させない
+    #[test]
+    fn マージの事前提示は予測不能を黙らない() {
+        let preview = tako_core::MergePreview {
+            prediction_available: false,
+            predicted_conflicts: Vec::new(),
+            ..merge_preview_fixture()
+        };
+        let lines = merge_confirm_lines(&preview);
+        let joined = lines.join("\n");
+        let no_conflict = crate::ui_text::panel::git_merge_no_conflict();
+        assert!(
+            !joined.contains(no_conflict),
+            "予測不能なのに「コンフリクトなし」と出している: {joined}"
+        );
+        assert!(joined.contains(crate::ui_text::panel::git_merge_prediction_unavailable()));
     }
 }
