@@ -943,11 +943,15 @@ pub fn run_daemon() -> io::Result<()> {
     // tmux バックエンドソケット名を解決
     let tmux_socket = tako_core::tmux_backend::socket_name();
 
-    // tmux が使えるか確認
-    if !tako_core::tmux_backend::available() {
-        return Err(io::Error::other(
-            "tmux が見つからない。remote サーバーは tmux 経由でペインを操作するため、tmux が必須です",
-        ));
+    // アウトオブプロセス到達手段の有無を確認する。remote デーモンは tako-app とは
+    // 別プロセスなので、ペインを読む・操作するには backend 側の到達手段が要る
+    if !tako_core::backend::capabilities().detached_access {
+        return Err(io::Error::other(format!(
+            "永続バックエンド（{}）にアウトオブプロセス到達手段が無い。\
+             remote サーバーは tako-app の外からペインを操作するため到達手段が必須です\
+             （macOS / Linux では tmux をインストールすると有効になります）",
+            tako_core::backend::capabilities().label
+        )));
     }
 
     // Tailscale setup 検証 + serve 設定（不足があればここで起動拒否）。

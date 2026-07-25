@@ -201,8 +201,9 @@ fn send_copy_command(target: &ScrollTarget, command: &str, count: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::capabilities;
     use crate::terminal::{SpawnCommand, SpawnOptions};
-    use crate::tmux_backend::{available, wrap_options, TmuxTestGuard};
+    use crate::tmux_backend::{wrap_options, TmuxTestGuard};
 
     fn lines_command() -> String {
         "i=0; while [ $i -lt 100 ]; do echo LINE-$i; i=$((i+1)); done; exec sleep 60".into()
@@ -223,7 +224,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn バックエンドのスクロールを正確な行数で駆動できる() {
-        if !available() {
+        if !capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }
@@ -290,7 +291,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn 履歴ゼロではcopy_modeに入らない() {
-        if !available() {
+        if !capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }
@@ -341,7 +342,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn ネスト先セッションを解決して駆動できる() {
-        if !available() {
+        if !capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }

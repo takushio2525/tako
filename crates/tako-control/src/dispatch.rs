@@ -1423,9 +1423,11 @@ fn dispatch_inner(
                 // セカンダリモード（Issue #113: 多重起動の後発）では復元・保存・切替が
                 // 無効。AI / CLI が「切替したのに enabled が変わらない」理由を判別できる
                 "secondary": host.is_secondary(),
-                // tmux 不在環境では PTY が直接 spawn へ劣化していることを示す
-                // （その場合もタブ構成の保存・復元は機能する。復元は新シェル）
-                "available": tako_core::tmux_backend::available(),
+                // 器の有無（tmux 不在環境では PTY が直接 spawn へ劣化する）。
+                // その場合もタブ構成の保存・復元は機能する（復元は新シェル）。
+                // 後方互換のため available は残し、詳細は backend に載せる（設計 §6）
+                "available": tako_core::backend::capabilities().survives_app_exit,
+                "backend": tako_core::backend::capabilities().describe(),
                 // 診断（Issue #30）: 保存先の実パスと存在有無・起動時の復元結果・ログ
                 "layout_path": crate::layout::layout_path()
                     .map(|p| p.display().to_string()),
@@ -6584,7 +6586,7 @@ fn check_health(host: &dyn ControlHost) -> Value {
 
     // セッション永続化の状態
     let persist_enabled = host.tmux_persist_enabled();
-    let persist_available = tako_core::tmux_backend::available();
+    let persist_available = tako_core::backend::capabilities().survives_app_exit;
     if tmux_available && !persist_enabled {
         issues.push(json!({
             "level": "info",

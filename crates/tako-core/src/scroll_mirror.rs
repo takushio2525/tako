@@ -264,9 +264,10 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn tmux履歴をミラーとして取得できる() {
+        use crate::backend::capabilities;
         use crate::terminal::{SpawnCommand, SpawnOptions};
-        use crate::tmux_backend::{available, wrap_options, TmuxTestGuard};
-        if !available() {
+        use crate::tmux_backend::{wrap_options, TmuxTestGuard};
+        if !capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }
@@ -341,9 +342,10 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn ホイールレポートのtmux直接注入が内側に生で届く() {
+        use crate::backend::capabilities;
         use crate::terminal::{SpawnCommand, SpawnOptions};
-        use crate::tmux_backend::{available, wrap_options, TmuxTestGuard};
-        if !available() {
+        use crate::tmux_backend::{wrap_options, TmuxTestGuard};
+        if !capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }

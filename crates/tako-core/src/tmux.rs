@@ -619,7 +619,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn ロケール無し環境でもタブ区切り出力が壊れない() {
-        if !crate::tmux_backend::available() {
+        if !crate::backend::capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }

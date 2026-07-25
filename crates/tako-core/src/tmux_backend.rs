@@ -8,7 +8,7 @@
 //! - `new-session -A` により「新規作成」と「再起動後の再 attach」が**同一コマンド**になる
 //!   （セッションが生きていれば attach、消えていれば（再起動・kill 後）新規作成）
 //! - `-D` で他クライアントを切り離す（多重起動時は最新インスタンスへ収束）
-//! - tmux 不在環境では呼び出し側（tako-app）が `available()` を見て従来の直接 spawn へ
+//! - tmux 不在環境では呼び出し側（tako-app）が `crate::backend::capabilities().survives_app_exit` を見て従来の直接 spawn へ
 //!   無害に劣化する（ゼロコンフィグ原則）
 //! - サーバーは専用 conf（`<data_dir>/tmux-backend.conf`）で起動し、ユーザーの
 //!   `~/.tmux.conf` は読まない（status バー・prefix キー等が見えない裏方に徹する）
@@ -30,19 +30,6 @@ pub fn socket_name() -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "tako".into())
-}
-
-/// **tmux バックエンドが有効か**（= 器として tmux が選択されているか）。
-///
-/// Issue #519 で意味を「tmux バイナリが在るか」から
-/// 「`backend::choice()` が tmux を選んだか」へ一段上げた。既存の全呼び出し箇所は
-/// もともと「永続バックエンドが効いているか」の意味で使っており、
-/// 判定の単一定義を `backend::choice()` に寄せることで
-/// `TAKO_BACKEND=none`（設計 §8.2 の R0）が全経路へ一度に効く。
-///
-/// バイナリの実在判定そのものは [`tmux_binary_present`]。
-pub fn available() -> bool {
-    crate::backend::choice() == crate::backend::Choice::Tmux
 }
 
 /// tmux バイナリが実在して動くか（`tmux -V` が成功するか）。プロセス内でキャッシュする。
@@ -548,7 +535,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn cleanup_orphansは直近アクティブなdetachedセッションを猶予する() {
-        if !available() {
+        if !crate::backend::capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }
@@ -604,7 +591,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn find_orphansはprotected外のtakoセッションだけ返す() {
-        if !available() {
+        if !crate::backend::capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }
@@ -639,7 +626,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn session_cwdはセッションのcwdを返す() {
-        if !available() {
+        if !crate::backend::capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }
@@ -672,7 +659,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn セッションはクライアント切断後もattachで内容ごと戻る() {
-        if !available() {
+        if !crate::backend::capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }
@@ -732,7 +719,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn osc7はtmuxパススルーで外へ届く() {
-        if !available() {
+        if !crate::backend::capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }
@@ -779,7 +766,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn マウスレポートと拡張キーがtmux越しに生で届く() {
-        if !available() {
+        if !crate::backend::capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }
@@ -898,7 +885,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn マウスレポート洪水でも断片がテキスト化しない() {
-        if !available() {
+        if !crate::backend::capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }
@@ -1008,7 +995,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn esc単押しは非kittyアプリにも素のescで届き27uが漏れない() {
-        if !available() {
+        if !crate::backend::capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }
@@ -1115,7 +1102,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn ネストtmux越しのホイールで内側スクロールバックを遡れる() {
-        if !available() {
+        if !crate::backend::capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }
@@ -1180,7 +1167,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn ネストtmux越しのcsi_uが最内アプリへ届く() {
-        if !available() {
+        if !crate::backend::capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }
@@ -1226,7 +1213,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn cjkはロケール無し環境でもtmux越しに描画される() {
-        if !available() {
+        if !crate::backend::capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }
@@ -1275,7 +1262,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn 通常ペインのホイールはcopy_modeで遡りインジケータを出さない() {
-        if !available() {
+        if !crate::backend::capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }
@@ -1363,7 +1350,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn sync_confは稼働中サーバーへ設定を再適用する() {
-        if !available() {
+        if !crate::backend::capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }
@@ -1448,7 +1435,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn alt_screenの非マウスペインでホイールが矢印に化けない() {
-        if !available() {
+        if !crate::backend::capabilities().survives_app_exit {
             eprintln!("skip: tmux が無い環境");
             return;
         }
