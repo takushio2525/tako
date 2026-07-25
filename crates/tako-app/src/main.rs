@@ -2354,8 +2354,19 @@ impl TakoApp {
                         incoming.request,
                         tako_control::protocol::Request::Scroll { .. }
                     );
+                    // #503: フォーカス移動・タブ切替・パネル操作の dispatch 後に
+                    // テキスト入力フラグをクリアする
+                    let clears_text_focus = matches!(
+                        incoming.request,
+                        tako_control::protocol::Request::Focus { .. }
+                            | tako_control::protocol::Request::TabSelect { .. }
+                            | tako_control::protocol::Request::Panel { .. }
+                    );
                     let prev_window = app.workspace.active_window_id();
                     let mut result = tako_control::dispatch(app, incoming.request, incoming.origin);
+                    if clears_text_focus {
+                        app.clear_text_input_focus();
+                    }
                     // CLI / MCP のタブ選択・ウィンドウ操作がアクティブウィンドウを
                     // またいだら OS ウィンドウも前面化する（Issue #339）
                     if app.workspace.active_window_id() != prev_window {
@@ -3521,6 +3532,8 @@ impl TakoApp {
         // ジャンプ後はホバープレビューを畳む（対象が前面化すると hover-leave が
         // 発火せずポップアップが残るため。FR-2.16.13）
         self.hover_preview = None;
+        // #503: ペインジャンプでテキスト入力フラグをクリア
+        self.clear_text_input_focus();
         let result = tako_control::dispatch(
             self,
             tako_control::protocol::Request::Focus {
@@ -4167,6 +4180,18 @@ impl TakoApp {
 
     fn focused_session(&self) -> Option<&TerminalSession> {
         self.terminals.get(&self.focused_pane())
+    }
+
+    /// テキスト入力フラグを一括クリアする（#503）。
+    /// git コミット / Web dock URL / Web アドレスバーの 3 種のフラグを落とし、
+    /// キー入力がターミナルペインへ届くようにする。
+    /// タブ切替・ペインフォーカス移動・パネル非表示化など、入力対象が変わる全経路で呼ぶ
+    fn clear_text_input_focus(&mut self) {
+        self.git_commit_input_focused = false;
+        self.webview_dock_url_focused = false;
+        if let Some(pane_id) = self.webview_address_bar_active.take() {
+            self.webview_address_bar.remove(&pane_id.as_u64());
+        }
     }
 
     // --- ペイン操作（ドメイン API の薄い呼び出し。FR-2.5 と同じセマンティクス） ---
@@ -5236,6 +5261,8 @@ impl TakoApp {
     }
 
     fn focus_direction(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
+        // #503: ペインフォーカス移動でテキスト入力フラグをクリア
+        self.clear_text_input_focus();
         self.workspace
             .active_tab_mut()
             .tree_mut()
@@ -5787,6 +5814,8 @@ impl TakoApp {
         viewport: tako_core::WindowId,
         cx: &mut Context<Self>,
     ) {
+        // #503: タブ切替でテキスト入力フラグをクリア
+        self.clear_text_input_focus();
         if self.workspace.get_window(viewport).is_none()
             || self.workspace.window_of_tab(tab) == Some(viewport)
         {
@@ -6997,6 +7026,13 @@ impl TakoApp {
             return;
         }
 
+        // #503: git 入力欄が見えない（パネル非表示 or git 以外のビュー）のに
+        // フラグが残っていたら強制クリア（防御。通常は経路別クリアで落ちる）
+        if self.git_commit_input_focused
+            && (!self.panel_visible || self.panel_view != PanelView::Git)
+        {
+            self.git_commit_input_focused = false;
+        }
         if self.git_commit_input_focused && self.handle_git_commit_key(keystroke, cx) {
             cx.stop_propagation();
             return;
@@ -9954,9 +9990,8 @@ impl TakoApp {
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                     let _ = this.workspace.active_tab_mut().tree_mut().focus(pane_id);
-                    // #487: ペインを触ったら git コミット入力欄のキーボード占有を解く
-                    // （ルート div の blur はペイン側の stop_propagation に阻まれる）
-                    this.git_commit_input_focused = false;
+                    // #503: ペインを触ったらテキスト入力フラグを一括クリア
+                    this.clear_text_input_focus();
                     cx.notify();
                 }),
             )
@@ -12383,6 +12418,10 @@ impl UiStateHost for TakoApp {
                 tako_control::protocol::PanelViewWire::Git => PanelView::Git,
             };
         }
+        // #503: パネルが非表示になったらテキスト入力フラグをクリア
+        if !self.panel_visible {
+            self.clear_text_input_focus();
+        }
         // tmux ビューを開いたら一覧を即時更新する（描画通知は dispatch ループが行う）
         if self.panel_visible && self.panel_view == PanelView::Tmux {
             self.refresh_tmux_data();
@@ -14289,24 +14328,12 @@ impl Render for TakoApp {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    let mut changed = false;
-                    if this.webview_dock_url_focused {
-                        this.webview_dock_url_focused = false;
-                        changed = true;
-                    }
-                    // #487: git コミット入力欄の外をクリックしたらフォーカスを外す
-                    // （外さないとターミナルへ文字が届かなくなる）
-                    if this.git_commit_input_focused {
-                        this.git_commit_input_focused = false;
-                        changed = true;
-                    }
-                    if this.webview_address_bar_active.is_some() {
-                        if let Some(pane_id) = this.webview_address_bar_active.take() {
-                            this.webview_address_bar.remove(&pane_id.as_u64());
-                        }
-                        changed = true;
-                    }
-                    if changed {
+                    // #503: テキスト入力フラグの一括クリア
+                    let had = this.git_commit_input_focused
+                        || this.webview_dock_url_focused
+                        || this.webview_address_bar_active.is_some();
+                    this.clear_text_input_focus();
+                    if had {
                         cx.notify();
                     }
                 }),
@@ -22886,6 +22913,37 @@ mod self_test {
             );
             wait(cx, 800).await;
 
+
+            // 81. テキスト入力フラグ残留でキー入力が奪われない (#503)
+            // git コミット入力欄のフラグを立てた状態でパネルを閉じると
+            // handle_key の防御的クリアが働き、打鍵がターミナルに届くことを検証する。
+            // 修正を戻すと FAILED になる（検出力確認済み: handle_key の防御的クリアを
+            // コメントアウトすると打鍵が handle_git_commit_key の `_ => true` に吸われ
+            // "ST503OK" がターミナルに出ない）
+            {
+                // フラグを true にしてパネルを閉じた状態にする
+                let setup_ok = window
+                    .update(cx, |app, _, _| {
+                        app.git_commit_input_focused = true;
+                        app.panel_visible = false;
+                    })
+                    .is_ok();
+                if setup_ok {
+                    type_text(any, cx, "echo ST503OK", true);
+                    let mut st503_ok = false;
+                    for _ in 0..8 {
+                        wait(cx, 500).await;
+                        st503_ok = focused_contains(window, cx, "ST503OK");
+                        if st503_ok {
+                            break;
+                        }
+                    }
+                    check(
+                        st503_ok,
+                        "フラグ残留でもパネル非表示なら打鍵がターミナルに届く (#503)",
+                    );
+                }
+            }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
