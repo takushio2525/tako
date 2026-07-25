@@ -109,6 +109,9 @@ enum Command {
     Theme(ThemeArgs),
     /// 設定画面を開く（Issue #459）
     Settings(SettingsArgs),
+    /// プラットフォーム対応マトリクスの参照（Issue #515）。
+    /// この環境でどの機能が使えるか・縮退しているか・未実装かを表示する
+    Platform(PlatformArgs),
     /// UI 表示言語（日本語/英語）の確認・切替（Issue #435）。
     /// 引数なしで現在言語を表示、ja / en で指定、system で OS ロケール追従
     Lang(LangArgs),
@@ -1871,6 +1874,20 @@ struct SettingsArgs {
     tab: Option<String>,
 }
 
+/// プラットフォーム対応マトリクスの参照引数（Issue #515）
+#[derive(Args)]
+struct PlatformArgs {
+    /// 対象プラットフォーム（省略時は実行中の環境）
+    #[arg(long, value_parser = ["macos", "windows"])]
+    platform: Option<String>,
+    /// この状態のものだけに絞る（省略時は全件）
+    #[arg(long, value_parser = ["supported", "degraded", "pending", "unsupported"])]
+    status: Option<String>,
+    /// 生の JSON で出力する
+    #[arg(long)]
+    json: bool,
+}
+
 /// UI 表示言語コマンドの引数（Issue #435）
 #[derive(Args)]
 struct LangArgs {
@@ -2258,6 +2275,9 @@ fn main() -> ExitCode {
         Command::Agents(ref sub) => agents_local(sub),
         // レイアウト復旧もローカル処理（GUI 死亡・縮退保存後の復旧手段のため IPC 不要が本質）
         Command::Recover(ref args) => recover_local(args),
+        // 対応マトリクスはバイナリに埋め込まれた静的な表なのでローカル処理。
+        // GUI が動いていない環境（移植作業中の Windows がまさにそれ）でも引けることが本質
+        Command::Platform(ref args) => platform_local(args),
         // run-interactive --wait は起動 + ポーリングの合成
         Command::RunInteractive(ref args) if args.wait => run_interactive_wait(&cli.command),
         // run --wait / --list は合成処理
@@ -3282,6 +3302,71 @@ fn fda_local(sub: &FdaCommand) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// プラットフォーム対応マトリクスの表示（#515。ローカル処理・IPC 不要）。
+///
+/// 応答の組み立ては `tako_control::platform::report` を通す。MCP `tako_platform` と
+/// **同じ 1 本**なので、CLI と AI で見える内容が食い違わない
+fn platform_local(args: &PlatformArgs) -> Result<(), String> {
+    // 表示言語のグローバルは既定が英語。GUI は起動時に settings.json から解決するので、
+    // CLI 単独で走るここでも同じ解決をしないと日本語設定なのに英語で出てしまう（#435）
+    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    let report = tako_control::platform::report(args.platform.as_deref(), args.status.as_deref())?;
+    if args.json {
+        println!("{}", pretty_json(&report));
+        return Ok(());
+    }
+
+    let target = report["platform"].as_str().unwrap_or("?");
+    let current = report["current"].as_str().unwrap_or("?");
+    let total = report["total"].as_u64().unwrap_or(0);
+    use tako_core::i18n::Lang;
+    let here = if target == current {
+        match tako_core::i18n::lang() {
+            Lang::Ja => "（実行中の環境）",
+            Lang::En => " (current environment)",
+        }
+    } else {
+        ""
+    };
+    println!("platform: {target}{here}");
+    if let Some(counts) = report["counts"].as_object() {
+        let line: Vec<String> = ["supported", "degraded", "pending", "unsupported"]
+            .iter()
+            .filter_map(|k| {
+                counts
+                    .get(*k)
+                    .and_then(|v| v.as_u64())
+                    .map(|n| format!("{k} {n}"))
+            })
+            .collect();
+        println!("counts:   {}", line.join(" / "));
+    }
+    println!();
+
+    for f in report["features"].as_array().into_iter().flatten() {
+        let key = f["key"].as_str().unwrap_or("?");
+        let status = f["status"].as_str().unwrap_or("?");
+        print!("{status:<12} {key}");
+        if let Some(issue) = f["issue"].as_u64() {
+            print!("  #{issue}");
+        }
+        println!();
+        if let Some(note) = f["note"].as_str() {
+            println!("{:<12} {note}", "");
+        }
+    }
+    if total == 0 {
+        println!(
+            "{}",
+            match tako_core::i18n::lang() {
+                Lang::Ja => "（該当なし）",
+                Lang::En => "(no matches)",
+            }
+        );
+    }
+    Ok(())
 }
 
 /// レイアウト世代バックアップからの復旧（#177。ローカル処理・IPC 不要）。
@@ -4716,6 +4801,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         },
         Command::Agents(_) => unreachable!("agents は run() を通らない"),
         Command::Recover(_) => unreachable!("recover は run() を通らない（ローカル処理）"),
+        Command::Platform(_) => unreachable!("platform は run() を通らない（ローカル処理）"),
         Command::OpenIn(sub) => match sub {
             OpenInCommand::Dir { path, no_focus } => Request::OpenDir {
                 path: resolve_cli_path(path),
@@ -6040,5 +6126,161 @@ mod tests {
                 no_wait: false,
             }
         );
+    }
+}
+
+/// T3 CLI 表: 全 CLI サブコマンドがマトリクスのキー（= MCP ツール）へ写像できること。
+///
+/// **狙い**: 「CLI にだけ機能を足して MCP に足さない」を検出する。
+/// tako の開発不変条件「UI でできることはすべて AI からもできる」の機械的な担保でもある。
+/// 新しい CLI コマンドを足すと、規則でも表でも解決できずここが落ちる。
+#[cfg(test)]
+mod platform_matrix_parity {
+    use super::*;
+    use clap::CommandFactory as _;
+    use tako_core::platform::support::MATRIX;
+
+    /// 規則（`tako_` + コマンドパス）で解けない対応を明示する表。
+    /// 前方一致で最長のものが勝つ
+    const CLI_KEY_OVERRIDES: &[(&str, &str)] = &[
+        ("agents", "tako_agents_sync_rules"),
+        ("autorename", "tako_auto_rename"),
+        ("backgrounded", "tako_background_list"),
+        ("background", "tako_background_pane"),
+        ("close", "tako_close_pane"),
+        ("collapse", "tako_collapse_tab"),
+        ("edit apply", "tako_preview_apply"),
+        ("edit autosave", "tako_preview_autosave"),
+        ("edit redo", "tako_preview_redo"),
+        ("edit replace", "tako_preview_replace"),
+        ("edit save", "tako_preview_save"),
+        ("edit search", "tako_preview_search"),
+        ("edit undo", "tako_preview_undo"),
+        ("edit start", "tako_preview_edit"),
+        ("edit status", "tako_preview_edit"),
+        ("edit stop", "tako_preview_edit"),
+        ("equalize", "tako_equalize_layout"),
+        ("file", "tako_file_op"),
+        ("focus", "tako_focus_pane"),
+        ("foreground", "tako_foreground_pane"),
+        ("list", "tako_list_panes"),
+        ("open-in dir", "tako_open_dir"),
+        ("open-in remote", "tako_open_remote"),
+        ("open-in repo", "tako_open_dir"),
+        ("open", "tako_open_file"),
+        ("orchestrator status", "tako_orchestrator_worker_status"),
+        ("orchestrator watch", "tako_orchestrator_worker_status"),
+        ("pin", "tako_pin_preview"),
+        ("portdetect", "tako_port_detect"),
+        ("preview", "tako_preview_view"),
+        ("read", "tako_read_pane"),
+        ("resize", "tako_resize_pane"),
+        ("run-default", "tako_run_defaults"),
+        ("scroll", "tako_scroll_pane"),
+        ("send", "tako_send_input"),
+        ("split", "tako_split_pane"),
+        ("tab move-pane", "tako_move_pane_to_tab"),
+        ("tab new", "tako_create_tab"),
+        ("tab rename", "tako_rename_tab"),
+        ("tab reorder", "tako_reorder_tab"),
+        ("tab select", "tako_select_tab"),
+        ("task update", "tako_task_checkpoint"),
+        ("title", "tako_set_title"),
+        ("tree", "tako_tree_folder"),
+        ("video", "tako_video_playback"),
+    ];
+
+    /// MCP ツールを持たないことが意図的な CLI 専用コマンド。
+    /// いずれも「GUI / MCP が使えない状況のための入口」なので MCP からは提供できない
+    /// （`master` / `solo` はエージェント CLI の起動そのもの、`mcp serve` は MCP ブリッジ自身、
+    /// `recover` は GUI 死亡時の復旧、`remote serve` はデーモン本体）
+    const CLI_ONLY: &[&str] = &["master", "solo", "mcp serve", "recover", "remote serve"];
+
+    fn leaf_commands() -> Vec<String> {
+        fn walk(c: &clap::Command, prefix: &str, out: &mut Vec<String>) {
+            for sub in c.get_subcommands() {
+                let name = if prefix.is_empty() {
+                    sub.get_name().to_string()
+                } else {
+                    format!("{prefix} {}", sub.get_name())
+                };
+                if sub.get_subcommands().next().is_some() {
+                    walk(sub, &name, out);
+                } else {
+                    out.push(name);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&Cli::command(), "", &mut out);
+        out
+    }
+
+    /// CLI コマンドパス → マトリクスキー。`Ok(None)` は意図的な CLI 専用
+    fn resolve(path: &str) -> Result<Option<&'static str>, ()> {
+        let matches = |pref: &str| path == pref || path.starts_with(&format!("{pref} "));
+        if CLI_ONLY.iter().any(|p| matches(p)) {
+            return Ok(None);
+        }
+        let best = CLI_KEY_OVERRIDES
+            .iter()
+            .filter(|(pref, _)| matches(pref))
+            .max_by_key(|(pref, _)| pref.len());
+        if let Some((_, key)) = best {
+            return Ok(Some(key));
+        }
+        // 規則: `tako_` + コマンドパス（後ろの語から順に落として探す）
+        let parts: Vec<&str> = path.split(' ').collect();
+        for i in (1..=parts.len()).rev() {
+            let key = format!("tako_{}", parts[..i].join("_").replace('-', "_"));
+            if let Some(f) = MATRIX.iter().find(|f| f.key == key) {
+                return Ok(Some(f.key));
+            }
+        }
+        Err(())
+    }
+
+    #[test]
+    fn t3_全cliコマンドがマトリクスのキーへ写像できる() {
+        let mut unresolved = Vec::new();
+        for cmd in leaf_commands() {
+            match resolve(&cmd) {
+                Ok(Some(key)) => assert!(
+                    MATRIX.iter().any(|f| f.key == key),
+                    "{cmd} の写像先 {key} が MATRIX に無い"
+                ),
+                Ok(None) => {}
+                Err(()) => unresolved.push(cmd),
+            }
+        }
+        assert!(
+            unresolved.is_empty(),
+            "対応する MCP ツールを解決できない CLI コマンドがある: {unresolved:?}\n\
+             → MCP ツールを追加する（開発不変条件）か、対応表 CLI_KEY_OVERRIDES に写像を書くか、\n\
+             または意図的に CLI 専用なら CLI_ONLY に理由つきで登録してください"
+        );
+    }
+
+    /// 表そのものが腐らないようにする（消えたコマンド・キーを残さない）
+    #[test]
+    fn t3_対応表に死んだエントリが無い() {
+        let cmds = leaf_commands();
+        let used = |pref: &str| {
+            cmds.iter()
+                .any(|c| c == pref || c.starts_with(&format!("{pref} ")))
+        };
+        for (pref, key) in CLI_KEY_OVERRIDES {
+            assert!(
+                used(pref),
+                "CLI_KEY_OVERRIDES の {pref} に該当するコマンドが無い"
+            );
+            assert!(
+                MATRIX.iter().any(|f| f.key == *key),
+                "CLI_KEY_OVERRIDES の写像先 {key} が MATRIX に無い"
+            );
+        }
+        for pref in CLI_ONLY {
+            assert!(used(pref), "CLI_ONLY の {pref} に該当するコマンドが無い");
+        }
     }
 }

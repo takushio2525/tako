@@ -2935,6 +2935,13 @@ fn dispatch_inner(
             }
         }
 
+        // 対応マトリクスの参照（#515）。静的な表を引くだけなのでホスト状態に触れない。
+        // CLI・MCP とも crate::platform::report を通るので表示が食い違わない
+        Request::Platform { platform, status } => {
+            crate::platform::report(platform.as_deref(), status.as_deref())
+                .map_err(DispatchError::InvalidParams)
+        }
+
         Request::Lang { action, value } => {
             use tako_core::i18n::{self, LangSetting};
             let action = action.as_deref().unwrap_or("status");

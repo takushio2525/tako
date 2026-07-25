@@ -113,16 +113,27 @@ crates/tako-core/src/platform/
 
 `crates/tako-core/src/platform/support.rs`:
 
+**実装済み（#515）**。以下が確定スキーマで、`.agent` 配下の他の設計はこれを前提にしてよい。
+
 ```rust
+/// 表示言語に追従する文言。理由文を `&'static str` 直書きにすると
+/// 英語 UI に日本語が出るため、日英を対で持ち i18n::lang() で解決する（#435）
+pub struct Note { /* ja / en */ }
+impl Note {
+    pub const fn new(ja: &'static str, en: &'static str) -> Self;
+    pub fn text(self) -> &'static str;  // 現在の表示言語
+    pub fn ja(self) -> &'static str;
+    pub fn en(self) -> &'static str;
+}
+
+/// 縮退の理由は定数に集約する。同じ理由を多数の機能が共有するため
+pub mod notes { /* WIN_TERMINAL / WIN_PERSIST / WIN_GIT / … */ }
+
 pub enum Support {
-    /// 完全に動く
     Supported,
-    /// 動くが機能が落ちる。note は UI / エラーメッセージにそのまま出る
-    Degraded { note: &'static str },
-    /// 未実装。追跡 Issue 必須
-    Pending { note: &'static str, issue: u32 },
-    /// そのプラットフォームには概念が存在しない（例: Windows の FDA）
-    Unsupported { note: &'static str },
+    Degraded { note: Note },
+    Pending { note: Note, issue: u32 },
+    Unsupported { note: Note },
 }
 
 pub struct Feature {
@@ -132,11 +143,21 @@ pub struct Feature {
     pub windows: Support,
 }
 
-pub const MATRIX: &[Feature] = &[ /* 全機能 */ ];
+pub const MATRIX: &[Feature] = &[ /* 全機能。キーは昇順 */ ];
 
 /// 純粋関数。**macOS 上でも Windows 側の縮退表を検証できる**ことが重要
-pub fn support_for(platform: Platform, key: &str) -> Option<&'static Support>;
+pub fn support_for(platform: Platform, key: &str) -> Option<Support>;
+pub fn features(platform: Platform, status: Option<&str>) -> Vec<(&'static Feature, Support)>;
+/// 縮退理由の一覧（重複は畳む）。system prompt への注入に使う
+pub fn degraded_notes(platform: Platform) -> Vec<&'static str>;
+/// 実行可否の判定。Err の中身がそのまま診断メッセージになる
+pub fn gate(platform: Platform, key: &str) -> Result<(), String>;
 ```
+
+**理由文の単一定義**: 縮退の理由は `notes` の定数 1 箇所で定義し、
+UI・dispatch のエラー・system prompt がすべてそこから引く。
+`Note` は日英を対で持つので、英語 UI に日本語が出ることは構造的に起きない
+（機械検査は `t4_理由文は日英そろっていて英語に日本語が残っていない`）。
 
 ### 3.2 ドリフトを落とすテスト
 
@@ -144,34 +165,42 @@ pub fn support_for(platform: Platform, key: &str) -> Option<&'static Support>;
 操作できる」により、**新機能は必ず MCP ツールを増やす**。したがって MCP ツール表を
 マトリクスと突き合わせれば、未分類は必ず検出できる。
 
-| テスト | 内容 | 落ちる状況 |
-|---|---|---|
-| T1 被覆 | `testdata/mcp_tools_snapshot.txt` の全ツール名が `MATRIX` に存在する | **新機能を足してマトリクスに分類し忘れた** |
-| T2 逆被覆 | `MATRIX` の全キーが snapshot に存在する | 機能を消したのにマトリクスに残っている |
-| T3 CLI 表 | clap の built command から再帰列挙した全サブコマンドが `MATRIX` に存在する | CLI だけ足して MCP を足していない（1:1 違反も同時に検出） |
-| T4 説明必須 | `Degraded` / `Pending` / `Unsupported` の `note` が空でない。`Pending` は `issue != 0` | 理由も追跡先も無い縮退 |
-| T5 診断一致 | `Pending` / `Unsupported` の操作を dispatch した際のエラー文字列が、マトリクスの `note` 由来であること | メッセージの二重管理（マトリクスと実装がズレる） |
-| T6 プロンプト単一ソース | `crates/**/resources/` と `resources/` 配下に `*-windows.*` / `*-macos.*` のような**プラットフォーム別複製ファイルが存在しない** | prompt / 配布物を OS ごとにコピーした |
+**実装済み（#515）**。突き合わせの正は **`mcp::tools()` そのもの**にした
+（当初案のスナップショットファイルは再生成を忘れると腐るため。実際 2026-07-25 時点で
+`tako_git_show` / `tako_stale_binary` の 2 件が欠落していた）。
 
-T1〜T4・T6 は macOS 上で実行でき、Windows 実機を必要としない。
+| テスト | 場所 | 内容 | 落ちる状況 |
+|---|---|---|---|
+| T1 被覆 | `tako-control/tests/platform_parity.rs` | `mcp::tools()` の全ツール名が `MATRIX` に存在する | **新機能を足してマトリクスに分類し忘れた** |
+| T2 逆被覆 | 同上 | `MATRIX` の全キーが `mcp::tools()` に存在する | 機能を消したのにマトリクスに残っている |
+| T3 CLI 表 | `tako-cli`（clap を歩く） | 全 CLI リーフコマンドがマトリクスのキーへ写像できる（規則 + `CLI_KEY_OVERRIDES` + 意図的な `CLI_ONLY`） | CLI だけ足して MCP を足していない（1:1 違反の検出） |
+| T4 説明必須 | `tako-core/platform/support.rs` | 理由文が日英そろっている・英語に日本語が残っていない・絵文字なし・`Pending` は `issue != 0` | 理由も追跡先も無い縮退／訳し漏れ |
+| T5 診断一致 | 同上 | `gate()` のエラー文字列がマトリクスの `note` と `issue` 由来であること | メッセージの二重管理 |
+| T6 プロンプト単一ソース | `tako-control/tests/platform_parity.rs` | `resources/` と `crates/tako-control/src/orchestrator/` に `*-windows.*` / `*-macos.*` の**複製ファイルが存在しない** | prompt / 配布物を OS ごとにコピーした |
+| （追加）スナップショット同期 | 同上 | `mcp::tools()` とセルフテスト用スナップショットが一致する | ツールを足してスナップショットを再生成し忘れた |
+
+**すべて macOS 上で `cargo test` で実行でき、Windows 実機を必要としない。**
 
 ### 3.3 実行時の縮退
 
-`dispatch` の入口で `support_for(current_platform(), req.feature_key())` を引き、
-`Pending` / `Unsupported` なら統一エラー `DispatchError::Unsupported { key, note, issue }` を返す。
-**エラーメッセージはマトリクスの `note` をそのまま使う**（二重管理を作らない）。
+`support::gate(platform, key)` が唯一の入口。`Pending` / `Unsupported` なら
+理由と追跡 Issue を含む診断文字列を返す。**メッセージはマトリクスの `note` 由来**なので
+二重管理が起きない（T5 が検証）。
 
-さらに `Request::feature_key(&self) -> &'static str` を**網羅 match** で実装する。
-新しい `Request` バリアントを足すと match が非網羅になり**コンパイルエラー**になるため、
-テストより早い段階でキー付けを強制できる。
+当初案では `Request::feature_key()` を網羅 match で実装し dispatch 入口で門番する設計だったが、
+**キーを MCP ツール名にしたことで Request からの逆引きが 117 バリアントの手書き表になる**ため、
+`gate` はツール名／コマンド名を持つ層（MCP `call_tool` と CLI）から呼ぶ方針に変更した。
+新機能の分類漏れは T1 が確実に落とすので、強制力は失われていない。
 
 ### 3.4 マトリクスを実行時に見せる
 
-原則 2 に従い、マトリクス自身も操作面に載せる。
+`tako platform [--platform macos|windows] [--status pending] [--json]` と MCP `tako_platform`。
+**CLI は GUI を必要としないローカル処理**にしてある（マトリクスはバイナリに埋め込まれた
+静的な表であり、GUI がまだ動かない Windows でこそ引きたいため）。
+応答の組み立ては CLI・MCP とも `tako_control::platform::report` の 1 本を通るので、
+表示が食い違わない。
 
-- CLI: `tako platform [--platform windows] [--status pending]`
-- MCP: `tako_platform`
-
+原則 2 に従い、マトリクス自身も操作面に載せている。
 これにより AI（master）が「この環境で今使える機能」を自己認識でき、
 Windows 上の master が縮退を踏んでも自力で回避経路を選べる。
 

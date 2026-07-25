@@ -2040,6 +2040,32 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_platform",
+            "description": "プラットフォーム対応マトリクスの参照（Issue #515 / #467）。\
+                どの機能がこの環境で使えるか・縮退しているか・未実装かを返す。\
+                tako は macOS 先行で開発して Windows へ反映していくため、環境によって使えない操作がある。\
+                Windows で作業していて操作が失敗したときは、まず status=pending で確認すること。\
+                platform: 対象プラットフォーム（macos / windows。省略時は実行中の環境）。\
+                status: 絞り込み（supported / degraded / pending / unsupported。省略時は全件）。\
+                応答の各項目は key（MCP ツール名）・status・note（縮退の理由）・issue（追跡先）を持つ。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "platform": {
+                        "type": "string",
+                        "enum": ["macos", "windows"],
+                        "description": "対象プラットフォーム（省略時は実行中の環境）",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["supported", "degraded", "pending", "unsupported"],
+                        "description": "この状態のものだけに絞る（省略時は全件）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_lang",
             "description": "UI 表示言語（日本語/英語）の状態確認・切替（Issue #435）。\
                 action=status（既定）: 言語設定（system / ja / en）と実際の表示言語を返す。\
@@ -3522,6 +3548,10 @@ fn build_request(
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             pane: u64_arg(args, "pane")?,
         },
+        "tako_platform" => Request::Platform {
+            platform: str_arg(args, "platform")?.map(|s| s.to_string()),
+            status: str_arg(args, "status")?.map(|s| s.to_string()),
+        },
         "tako_lang" => Request::Lang {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             value: str_arg(args, "value")?.map(|s| s.to_string()),
@@ -4439,7 +4469,9 @@ mod tests {
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
-        assert_eq!(tools.len(), 118);
+        // 件数の固定値。ツール追加時はここと対応マトリクス（#515）の両方を更新する
+        // （分類漏れ自体は tests/platform_parity.rs の T1 が検出する）
+        assert_eq!(tools.len(), 119);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
