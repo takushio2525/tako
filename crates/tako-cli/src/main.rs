@@ -1287,6 +1287,9 @@ enum OrchestratorCommand {
     /// プロファイル管理（一覧 / 表示 / 設定）
     #[command(subcommand)]
     Profiles(ProfilesCommand),
+    /// アカウント管理（accounts.yaml の一覧 / 表示 / 追加 / 削除。#504 / #548）
+    #[command(subcommand)]
+    Accounts(AccountsCommand),
     /// worker spawn のレイアウト設定（全オプション省略で現在値を表示）
     Layout {
         /// 配置ポリシー: master-reserved（master の取り分を維持。既定）/ legacy（従来の右等分割）
@@ -1464,6 +1467,44 @@ enum OrchestratorCommand {
     /// 委任台帳の操作（Issue #292）
     #[command(subcommand)]
     Ledger(LedgerCommand),
+}
+
+/// `tako orchestrator accounts` — アカウントレジストリ（accounts.yaml）の CRUD。
+/// MCP `tako_orchestrator_accounts` と同じ dispatch 関数を呼ぶ（表示・警告・検証を二重実装しない）
+#[derive(Subcommand)]
+enum AccountsCommand {
+    /// 登録済みアカウントの一覧
+    List,
+    /// 1 件の詳細
+    Show {
+        /// アカウント名
+        name: String,
+    },
+    /// アカウントの追加 / 更新
+    Add {
+        /// アカウント名
+        name: String,
+        /// CLAUDE_CONFIG_DIR に設定するパス（~ は $HOME に展開。--inherit と排他）
+        #[arg(long)]
+        config_dir: Option<String>,
+        /// CLAUDE_CONFIG_DIR を設定しない（既定の資格情報をそのまま使う。#512）
+        #[arg(long, conflicts_with = "config_dir")]
+        inherit: bool,
+        /// 説明
+        #[arg(long)]
+        description: Option<String>,
+        /// このアカウントの既定モデル（spawn で model 未指定時のフォールバック）
+        #[arg(long)]
+        default_model: Option<String>,
+        /// このアカウントの既定 effort
+        #[arg(long)]
+        default_effort: Option<String>,
+    },
+    /// アカウントの削除
+    Remove {
+        /// アカウント名
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2232,6 +2273,48 @@ fn main() -> ExitCode {
                 policy.as_deref(),
                 master_ratio,
                 algorithm.as_deref(),
+            )
+            .map_err(|e| e.to_string())
+            .map(|result| println!("{}", pretty_json(&result)))
+        }
+        Command::Orchestrator(OrchestratorCommand::Accounts(ref sub)) => {
+            // accounts.yaml のみの操作のため IPC 不要。dispatch と同一関数を共用する
+            // （MCP `tako_orchestrator_accounts` と 1:1。二重実装を作らない。#548）
+            let (action, name, config_dir, inherit, description, default_model, default_effort) =
+                match sub {
+                    AccountsCommand::List => ("list", None, None, None, None, None, None),
+                    AccountsCommand::Show { name } => {
+                        ("show", Some(name.as_str()), None, None, None, None, None)
+                    }
+                    AccountsCommand::Add {
+                        name,
+                        config_dir,
+                        inherit,
+                        description,
+                        default_model,
+                        default_effort,
+                    } => (
+                        "add",
+                        Some(name.as_str()),
+                        config_dir.as_deref(),
+                        // 指定が無いときは None を渡す（dispatch 側の既定 = false）
+                        inherit.then_some(true),
+                        description.as_deref(),
+                        default_model.as_deref(),
+                        default_effort.as_deref(),
+                    ),
+                    AccountsCommand::Remove { name } => {
+                        ("remove", Some(name.as_str()), None, None, None, None, None)
+                    }
+                };
+            tako_control::dispatch_orchestrator_accounts(
+                action,
+                name,
+                config_dir,
+                inherit,
+                description,
+                default_model,
+                default_effort,
             )
             .map_err(|e| e.to_string())
             .map(|result| println!("{}", pretty_json(&result)))
@@ -4606,6 +4689,11 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Orchestrator(OrchestratorCommand::Layout { .. }) => {
             unreachable!("orchestrator layout は run() を通らない（ローカルで config.yaml を操作）")
         }
+        Command::Orchestrator(OrchestratorCommand::Accounts(_)) => {
+            unreachable!(
+                "orchestrator accounts は run() を通らない（ローカルで accounts.yaml を操作）"
+            )
+        }
         Command::Orchestrator(OrchestratorCommand::Report { .. }) => {
             unreachable!("orchestrator report は run() を通らない")
         }
@@ -6459,6 +6547,25 @@ mod platform_matrix_parity {
              → MCP ツールを追加する（開発不変条件）か、対応表 CLI_KEY_OVERRIDES に写像を書くか、\n\
              または意図的に CLI 専用なら CLI_ONLY に理由つきで登録してください"
         );
+    }
+
+    /// #548: accounts の 4 コマンドが MCP の 1 ツールへ写ること。
+    /// 規則（後ろの語を落として探す）で解けるので CLI_KEY_OVERRIDES への登録は要らないが、
+    /// MATRIX 側のキー名が変わったら気づけるように明示しておく
+    #[test]
+    fn t3_accountsコマンドはmcpツールへ写る() {
+        for cmd in [
+            "orchestrator accounts list",
+            "orchestrator accounts show",
+            "orchestrator accounts add",
+            "orchestrator accounts remove",
+        ] {
+            assert_eq!(
+                resolve(cmd),
+                Ok(Some("tako_orchestrator_accounts")),
+                "{cmd} の写像先"
+            );
+        }
     }
 
     /// 表そのものが腐らないようにする（消えたコマンド・キーを残さない）
