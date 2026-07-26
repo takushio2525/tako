@@ -3,6 +3,19 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.13] - 2026-07-27
+
+Nightly patch release (automated). Changes since v0.5.12:
+夜間パッチリリース（自動）。v0.5.12 以降の変更:
+
+- [修正] パネルビューの語彙を GUI 表示名 fleet へ統一 (#553) (#564)
+- [修正] アプリ内テキスト入力で ⌘V が効かない問題を根治 (#546) (#563)
+- [修正] git タブのブランチ種別を refname で判定する (#544) (#554)
+- [修正] spawn 初期プロンプトの消失を根治 (#530) (#557)
+- [機能追加] CLI に orchestrator accounts を追加（MCP と 1:1） (#556)
+- [修正] プロファイルの master_account を master / solo 起動へ適用する (#555)
+- [修正] アカウント切替の残欠陥 2 件（CLI --account / inherit） (#543)
+
 ## [0.5.12] - 2026-07-26
 
 Nightly patch release (automated). Changes since v0.5.11:
