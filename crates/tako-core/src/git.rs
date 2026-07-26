@@ -365,24 +365,46 @@ pub fn list_branches(repo: &Path) -> Vec<GitBranch> {
             "branch",
             "-a",
             "--sort=-committerdate",
-            "--format=%(HEAD)\t%(refname:short)\t%(objectname:short)\t%(subject)",
+            // ローカル / リモートの判定は完全な `%(refname)` で行う（#544）。
+            // `%(refname:short)` は曖昧性解決で形が変わる（`refs/remotes/origin/HEAD`
+            // が `origin` まで縮む）ので種別判定には使えない。表示名は refname から
+            // 名前空間の接頭辞を外して機械的に決める
+            "--format=%(HEAD)\t%(refname)\t%(symref)\t%(objectname:short)\t%(subject)",
         ],
     )
     .unwrap_or_default();
     parse_branches(&out)
 }
 
+/// `git branch -a --format=...` の 1 行 1 ブランチ出力を読む。
+///
+/// 落とす行:
+/// - シンボリック参照（`refs/remotes/origin/HEAD` → `origin/main`）。ブランチ実体ではなく、
+///   短縮名が `origin` になるため以前はローカルブランチとして現れていた（#544）
+/// - detached HEAD のとき git が先頭に出す `(HEAD detached at abc1234)` 疑似行
+///   （`refs/` 始まりでないので名前空間の判定で自然に外れる）
 fn parse_branches(raw: &str) -> Vec<GitBranch> {
     raw.lines()
         .filter_map(|line| {
-            let mut f = line.splitn(4, '\t');
+            let mut f = line.splitn(5, '\t');
             let head = f.next()?;
-            let name = f.next()?.to_string();
+            let refname = f.next()?;
+            let symref = f.next()?;
             let hash = f.next()?.to_string();
             let subject = f.next().unwrap_or("").to_string();
+            if !symref.is_empty() {
+                return None;
+            }
+            let (name, is_remote) = if let Some(short) = refname.strip_prefix("refs/heads/") {
+                (short.to_string(), false)
+            } else if let Some(short) = refname.strip_prefix("refs/remotes/") {
+                (short.to_string(), true)
+            } else {
+                return None;
+            };
             Some(GitBranch {
                 is_current: head == "*",
-                is_remote: name.starts_with("remotes/") || name.contains('/'),
+                is_remote,
                 name,
                 commit_hash: hash,
                 subject,
@@ -1682,13 +1704,181 @@ mod tests {
 
     #[test]
     fn parse_branches_基本() {
-        let raw = "*\tmain\tabc1234\tlatest commit\n \tfeature/x\tdef5678\twip\n \tremotes/origin/main\tabc1234\tlatest commit\n";
+        let raw = "*\trefs/heads/main\t\tabc1234\tlatest commit\n \trefs/heads/feature/x\t\tdef5678\twip\n \trefs/remotes/origin/main\t\tabc1234\tlatest commit\n";
         let branches = parse_branches(raw);
         assert_eq!(branches.len(), 3);
         assert!(branches[0].is_current);
         assert_eq!(branches[0].name, "main");
+        assert!(!branches[0].is_remote);
         assert!(!branches[1].is_current);
+        assert_eq!(branches[1].name, "feature/x");
         assert!(branches[2].is_remote);
+        assert_eq!(branches[2].name, "origin/main");
+    }
+
+    /// #544: スラッシュを含むローカルブランチがリモート扱いされていた回帰。
+    /// このリポジトリの命名規約が `fix/123-説明` なので、ここが壊れると
+    /// ほぼ全ブランチが「リモート」欄に落ちる
+    #[test]
+    fn スラッシュ入りローカルブランチはリモート扱いしない() {
+        let raw = "*\trefs/heads/fix/544-branch-classification\t\tabc1234\tfix\n \trefs/heads/feat/519-capabilities\t\tdef5678\tfeat\n \trefs/heads/docs/470-promo-video-v3\t\t111aaaa\tdocs\n \trefs/remotes/origin/fix/544-branch-classification\t\tabc1234\tfix\n";
+        let branches = parse_branches(raw);
+        let local: Vec<&str> = branches
+            .iter()
+            .filter(|b| !b.is_remote)
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(
+            local,
+            vec![
+                "fix/544-branch-classification",
+                "feat/519-capabilities",
+                "docs/470-promo-video-v3"
+            ]
+        );
+        let remote: Vec<&str> = branches
+            .iter()
+            .filter(|b| b.is_remote)
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(remote, vec!["origin/fix/544-branch-classification"]);
+    }
+
+    /// #544: `refs/remotes/origin/HEAD` は symref なのでブランチ一覧に出さない
+    /// （`%(refname:short)` が `origin` になり、ローカルブランチのように見えていた）
+    #[test]
+    fn origin_headのsymrefは一覧に出さない() {
+        let raw = " \trefs/remotes/origin/HEAD\trefs/remotes/origin/main\tabc1234\tlatest\n \trefs/remotes/origin/main\t\tabc1234\tlatest\n";
+        let branches = parse_branches(raw);
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].name, "origin/main");
+        assert!(branches.iter().all(|b| b.name != "origin"));
+    }
+
+    /// #544: detached HEAD のとき git が出す疑似行を架空ブランチにしない
+    #[test]
+    fn detached_headの疑似行は一覧に出さない() {
+        let raw =
+            "*\t(HEAD detached at fce8852)\t\tfce8852\t\n \trefs/heads/main\t\tabc1234\tlatest\n";
+        let branches = parse_branches(raw);
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].name, "main");
+        assert!(!branches[0].is_current, "detached 中は current 無し");
+    }
+
+    /// テスト用一時ディレクトリの後始末。**一時ディレクトリ配下であることを検証してから**
+    /// 消す（変数名の取り違えで実リポジトリを消す事故を構造的に防ぐ）
+    fn remove_temp_dir(dir: &Path) {
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "一時ディレクトリ以外を削除しようとしている: {}",
+            dir.display()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #544: 実 git 相手の通し検証。`--format` の指定と parse_branches の契約が
+    /// 揃っていないと落ちる（純粋な parse テストだけでは format 側の誤りを検出できない）
+    #[test]
+    fn list_branchesが実リポジトリで種別を取り違えない() {
+        let dir = std::env::temp_dir().join(format!("tako-git-branch-544-{}", std::process::id()));
+        remove_temp_dir(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let repo = dir.as_path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let head = String::from_utf8_lossy(&git(&["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        // ローカル: スラッシュ有り 2 本 + 無し 1 本
+        git(&["branch", "fix/544-branch-classification"]);
+        git(&["branch", "feat/519-capabilities"]);
+        git(&["branch", "work-522"]);
+        // リモート追跡: 実ネットワーク無しで ref を直接作る
+        git(&["update-ref", "refs/remotes/origin/main", &head]);
+        git(&[
+            "update-ref",
+            "refs/remotes/origin/fix/544-branch-classification",
+            &head,
+        ]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
+
+        let branches = list_branches(repo);
+        let mut local: Vec<&str> = branches
+            .iter()
+            .filter(|b| !b.is_remote)
+            .map(|b| b.name.as_str())
+            .collect();
+        local.sort_unstable();
+        assert_eq!(
+            local,
+            vec![
+                "feat/519-capabilities",
+                "fix/544-branch-classification",
+                "main",
+                "work-522"
+            ],
+            "スラッシュ入りローカルブランチがリモート欄へ落ちている"
+        );
+        let mut remote: Vec<&str> = branches
+            .iter()
+            .filter(|b| b.is_remote)
+            .map(|b| b.name.as_str())
+            .collect();
+        remote.sort_unstable();
+        assert_eq!(
+            remote,
+            vec!["origin/fix/544-branch-classification", "origin/main"]
+        );
+        assert!(
+            branches.iter().all(|b| b.name != "origin"),
+            "origin/HEAD がローカルブランチ origin として現れている"
+        );
+        assert_eq!(
+            branches.iter().filter(|b| b.is_current).count(),
+            1,
+            "current は main の 1 本"
+        );
+
+        // detached HEAD でも架空ブランチを増やさない
+        git(&["checkout", "-q", "--detach", &head]);
+        let detached = list_branches(repo);
+        assert_eq!(
+            detached.len(),
+            branches.len(),
+            "detached HEAD の疑似行が一覧に混ざっている"
+        );
+        assert!(detached.iter().all(|b| !b.name.starts_with("(HEAD")));
+        assert_eq!(detached.iter().filter(|b| b.is_current).count(), 0);
+
+        remove_temp_dir(&dir);
+    }
+
+    /// subject にタブが含まれても後続フィールドへ食い込まない（splitn の境界）
+    #[test]
+    fn subjectのタブは分割境界を壊さない() {
+        let raw = " \trefs/heads/main\t\tabc1234\tfix:\ttab\tin subject\n";
+        let branches = parse_branches(raw);
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].subject, "fix:\ttab\tin subject");
+        assert_eq!(branches[0].commit_hash, "abc1234");
     }
 
     #[test]
@@ -2548,11 +2738,14 @@ mod portability_tests {
         assert!(!commits[1].refs.contains('\r'));
         assert_eq!(commits[1].subject, "件名 B");
 
-        let branches =
-            parse_branches("*\tmain\tabc1234\t最新のコミット\r\n \tfeat/x\tdef5678\t作業中\r\n");
+        let branches = parse_branches(
+            "*\trefs/heads/main\t\tabc1234\t最新のコミット\r\n \trefs/heads/feat/x\t\tdef5678\t作業中\r\n",
+        );
         assert_eq!(branches.len(), 2);
         assert_eq!(branches[0].name, "main");
         assert!(branches[0].is_current);
+        assert_eq!(branches[1].name, "feat/x");
+        assert!(!branches[1].is_remote, "ローカルブランチのまま (#544)");
         // 末尾フィールドに CR が残らないこと（subject は行末なので最も危ない）
         assert_eq!(branches[0].subject, "最新のコミット");
         assert_eq!(branches[1].subject, "作業中");
