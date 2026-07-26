@@ -298,6 +298,18 @@ pub fn desc_theme() -> &'static str {
     )
 }
 
+/// #550: 隠しファイル表示（ファイルツリー）
+pub fn label_show_hidden_files() -> &'static str {
+    tr!("隠しファイルを表示", "Show hidden files")
+}
+
+pub fn desc_show_hidden_files() -> &'static str {
+    tr!(
+        "ファイルツリーにドット始まり（.git / .env 等）の項目を並べる。既定は非表示",
+        "List dot-prefixed items (.git, .env, ...) in the file tree. Hidden by default"
+    )
+}
+
 pub fn theme_dark() -> &'static str {
     tr!("ダーク", "Dark")
 }
@@ -787,6 +799,8 @@ mod tests {
                 desc_pane_log_total().into(),
                 label_theme().into(),
                 desc_theme().into(),
+                label_show_hidden_files().into(),
+                desc_show_hidden_files().into(),
                 theme_dark().into(),
                 theme_light().into(),
                 label_color_settings().into(),

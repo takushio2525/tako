@@ -1440,6 +1440,30 @@ impl SettingsWindow {
             ),
         ));
 
+        // 隠しファイル表示（#550。設定画面から探すユーザーもここで見つけられる）
+        let show_hidden = self.settings.show_hidden_files;
+        content = content.child(self.row(
+            txt::label_show_hidden_files(),
+            txt::desc_show_hidden_files(),
+            self.toggle(
+                "show-hidden-files",
+                show_hidden,
+                cx.listener(move |this, _, _, cx| {
+                    this.run(
+                        Request::Panel {
+                            visible: None,
+                            width: None,
+                            view: None,
+                            filetree: None,
+                            sidebar_width: None,
+                            show_hidden: Some(!show_hidden),
+                        },
+                        cx,
+                    );
+                }),
+            ),
+        ));
+
         // フォント
         content = content.child(self.row(
             txt::label_font_family(),

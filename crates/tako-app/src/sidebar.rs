@@ -101,6 +101,7 @@ impl TakoApp {
             (parent, leaf, full)
         });
         let git_summary = self.sidebar_git.clone();
+        let show_hidden = self.filetree.show_hidden();
         // プレビュー表示中のファイル（開いている行を控えめにハイライトする）
         let open_paths: std::collections::HashSet<std::path::PathBuf> =
             self.previews.values().map(|p| p.path.clone()).collect();
@@ -247,6 +248,30 @@ impl TakoApp {
                                         .child(SharedString::from(truncate(&g.branch, 14)))
                                 }))
                                 .child(div().flex_grow(1.0))
+                                // 目 = 隠しファイル（ドット始まり）の表示トグル（#550）
+                                .child(
+                                    div()
+                                        .id("sidebar-toggle-hidden")
+                                        .flex_none()
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.toggle_hidden_files(cx);
+                                        }))
+                                        .child(
+                                            svg()
+                                                .path(if show_hidden {
+                                                    file_icons::ui_icon::EYE
+                                                } else {
+                                                    file_icons::ui_icon::EYE_OFF
+                                                })
+                                                .size(px(14.0))
+                                                .text_color(hsla(if show_hidden {
+                                                    theme.accent
+                                                } else {
+                                                    theme.text_muted
+                                                })),
+                                        ),
+                                )
                                 // + = ファイルツリーにルート追加（#268）
                                 .child(
                                     div()
@@ -683,9 +708,19 @@ impl TakoApp {
         items.push(("new-file", crate::ui_text::sidebar::menu_new_file()));
         items.push(("new-dir", crate::ui_text::sidebar::menu_new_dir()));
         items.push(("sep2", ""));
+        // #550: ユーザーがまず探す場所（右クリック）にも表示トグルを置く
+        items.push((
+            "toggle-hidden",
+            if self.filetree.show_hidden() {
+                crate::ui_text::sidebar::hidden_hide()
+            } else {
+                crate::ui_text::sidebar::hidden_show()
+            },
+        ));
+        items.push(("sep3", ""));
         items.push(("trash", crate::ui_text::sidebar::menu_trash()));
         if is_pinned_root {
-            items.push(("sep3", ""));
+            items.push(("sep4", ""));
             items.push(("remove-root", crate::ui_text::sidebar::menu_remove_root()));
         }
 
@@ -856,6 +891,25 @@ impl TakoApp {
         }
     }
 
+    /// 隠しファイル（ドット始まり）の表示トグル（#550）。
+    /// CLI `tako panel --show-hidden` / MCP `tako_panel` と同じ dispatch 経路を通す
+    pub(crate) fn toggle_hidden_files(&mut self, cx: &mut Context<Self>) {
+        let next = !self.filetree.show_hidden();
+        let _ = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::Panel {
+                visible: None,
+                width: None,
+                view: None,
+                filetree: None,
+                sidebar_width: None,
+                show_hidden: Some(next),
+            },
+            PaneOrigin::User,
+        );
+        cx.notify();
+    }
+
     pub(crate) fn commit_inline_edit(&mut self, cx: &mut Context<Self>) {
         use tako_control::protocol::{FileOpKind, Request};
         let Some(edit) = self.inline_edit.take() else {
@@ -1019,6 +1073,9 @@ impl TakoApp {
                     let _ = pick_app_and_open(&path_owned);
                 })
                 .detach();
+            }
+            "toggle-hidden" => {
+                self.toggle_hidden_files(cx);
             }
             "remove-root" => {
                 let _ = tako_control::dispatch(

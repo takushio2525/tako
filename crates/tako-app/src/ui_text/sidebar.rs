@@ -36,6 +36,15 @@ pub fn menu_remove_root() -> &'static str {
     tr!("ツリーから除去", "Remove from tree")
 }
 
+// --- ヘッダ / 右クリックの表示トグル（#550。キー: sidebar.hidden_*） ---
+
+pub fn hidden_show() -> &'static str {
+    tr!("隠しファイルを表示", "Show hidden files")
+}
+pub fn hidden_hide() -> &'static str {
+    tr!("隠しファイルを隠す", "Hide hidden files")
+}
+
 // --- プレビュー編集の通知（FR-3.5。キー: sidebar.note_*） ---
 
 pub fn note_save_before_mode_switch() -> &'static str {
@@ -71,6 +80,8 @@ mod tests {
                 menu_new_dir().to_string(),
                 menu_trash().to_string(),
                 menu_remove_root().to_string(),
+                hidden_show().to_string(),
+                hidden_hide().to_string(),
                 note_save_before_mode_switch().to_string(),
                 note_external_change().to_string(),
             ]

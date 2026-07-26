@@ -347,6 +347,8 @@ pub enum Request {
         filetree: Option<bool>,
         /// 左サイドバーの幅（px。Issue #307）
         sidebar_width: Option<f32>,
+        /// ファイルツリーでドット始まりの項目を表示するか（Issue #550。既定 false）
+        show_hidden: Option<bool>,
     },
     /// サイドバー tmux ビューのタブ枠の折りたたみ（FR-2.16.14）。折りたたむと、その
     /// タブ配下の**バックグラウンド項目（裏で実行中のペイン行 + バックグラウンド）を隠し、前面表示中の

@@ -1964,7 +1964,12 @@ impl TakoApp {
                 w.clamp(SIDEBAR_MIN_WIDTH, 600.0)
             },
             dragging_sidebar: false,
-            filetree: filetree::FileTree::default(),
+            filetree: {
+                // #550: ドット始まりの表示は settings.json に永続化する（既定 = 非表示）
+                let mut tree = filetree::FileTree::default();
+                tree.set_show_hidden(tako_control::settings::load().show_hidden_files);
+                tree
+            },
             previews: HashMap::new(),
             preview_navigation_panel: None,
             preview_reload: tako_core::PreviewReloadState::new(
@@ -12871,6 +12876,14 @@ impl UiStateHost for TakoApp {
         self.filetree.visible
     }
 
+    fn filetree_show_hidden(&self) -> bool {
+        self.filetree.show_hidden()
+    }
+
+    fn set_filetree_show_hidden(&mut self, show: bool) {
+        self.filetree.set_show_hidden(show);
+    }
+
     fn sidebar_width(&self) -> f32 {
         self.sidebar_width
     }
@@ -18569,6 +18582,7 @@ mod self_test {
                             view: Some(tako_control::protocol::PanelViewWire::Fleet),
                             filetree: None,
                             sidebar_width: None,
+                            show_hidden: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -18587,6 +18601,7 @@ mod self_test {
                             view: None,
                             filetree: None,
                             sidebar_width: None,
+                            show_hidden: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -18799,6 +18814,7 @@ mod self_test {
                             view: Some(tako_control::protocol::PanelViewWire::Fleet),
                             filetree: None,
                             sidebar_width: None,
+                            show_hidden: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -23555,6 +23571,68 @@ mod self_test {
                     guarded,
                     "解消エージェント: コンフリクトが無ければ理由つきで拒否する (#496)",
                 );
+            }
+
+            // 83. ファイルツリーの隠しファイル既定非表示とトグル (#550)。
+            // ドット始まりが既定で消え、CLI / MCP と同じ dispatch 経路のトグルで戻る。
+            // 併せて「増えたルートは自動展開されて先頭に来る」も同じ木で検証する
+            {
+                let fixture =
+                    std::env::temp_dir().join(format!("tako-st550-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&fixture);
+                let home = fixture.join("home");
+                let project = fixture.join("project");
+                let _ = std::fs::create_dir_all(home.join(".hidden-dir"));
+                let _ = std::fs::create_dir_all(home.join("visible-dir"));
+                let _ = std::fs::write(home.join(".hidden-file"), "x");
+                let _ = std::fs::create_dir_all(project.join("src"));
+                let names = |app: &mut TakoApp| -> Vec<String> {
+                    app.filetree
+                        .rows()
+                        .iter()
+                        .map(|r| r.entry.name.clone())
+                        .collect()
+                };
+                let st550 = window
+                    .update(cx, |app, _, cx| {
+                        app.filetree.set_show_hidden(false);
+                        app.filetree.set_roots(vec![home.clone()]);
+                        let n = names(app);
+                        let hidden_ok = !n.iter().any(|x| x == ".hidden-dir")
+                            && !n.iter().any(|x| x == ".hidden-file")
+                            && n.iter().any(|x| x == "visible-dir");
+                        // トグル（dispatch 経路 = CLI / MCP と同一）で出る
+                        app.toggle_hidden_files(cx);
+                        let n = names(app);
+                        let shown_ok = app.filetree.show_hidden()
+                            && n.iter().any(|x| x == ".hidden-dir")
+                            && n.iter().any(|x| x == ".hidden-file");
+                        // 設定に永続化されている
+                        let persisted_on = tako_control::settings::load().show_hidden_files;
+                        app.toggle_hidden_files(cx);
+                        let persisted_off = !tako_control::settings::load().show_hidden_files;
+                        // 増えたルートは自動展開されて先頭に来る（#550 案 3）
+                        app.filetree.set_roots(vec![home.clone(), project.clone()]);
+                        let rows = app.filetree.rows();
+                        let first_root_is_project = rows
+                            .first()
+                            .is_some_and(|r| r.root && r.entry.path == project);
+                        let expanded = rows.iter().any(|r| r.entry.name == "src" && r.depth == 1);
+                        hidden_ok
+                            && shown_ok
+                            && persisted_on
+                            && persisted_off
+                            && first_root_is_project
+                            && expanded
+                    })
+                    .unwrap_or(false);
+                check(
+                    st550,
+                    "ファイルツリー: ドット既定非表示 / トグル / 永続化 / 新ルート先頭・自動展開 (#550)",
+                );
+                if fixture.starts_with(std::env::temp_dir()) {
+                    let _ = std::fs::remove_dir_all(&fixture);
+                }
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す
