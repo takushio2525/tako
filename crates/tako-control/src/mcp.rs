@@ -1391,16 +1391,21 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_orchestrator_accounts",
             "description": "アカウントレジストリの管理（Issue #504）。名前つきアカウント（accounts.yaml）の CRUD。\
-                アカウントは config_dir（CLAUDE_CONFIG_DIR の値）と既定モデル/effort を持ち、\
+                アカウントは config_dir（CLAUDE_CONFIG_DIR の値）または inherit（未設定のまま = 既定の資格情報）と\
+                既定モデル/effort を持ち、\
                 spawn の account パラメータやプロファイルの master_account/worker_account で使う。\
                 action: list（全アカウント一覧）/ show（name 必須。1 件の詳細）/ \
-                add（name + config_dir 必須。追加または更新）/ remove（name 必須。削除）",
+                add（name + config_dir か inherit のどちらか必須。追加または更新）/ remove（name 必須。削除）。\
+                既定の claude アカウント（~/.claude）を登録するときは config_dir ではなく inherit=true を使う: \
+                CLAUDE_CONFIG_DIR は設定されているだけで Keychain のエントリ名が変わり、\
+                既定パスを明示しても既存ログインが未ログイン扱いになる（Issue #512）",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["list", "show", "add", "remove"], "description": "操作（list / show / add / remove）" },
                     "name": { "type": "string", "description": "アカウント名（show / add / remove 時に必須）" },
-                    "config_dir": { "type": "string", "description": "CLAUDE_CONFIG_DIR の値（add 時に必須。~ は $HOME に展開される）" },
+                    "config_dir": { "type": "string", "description": "CLAUDE_CONFIG_DIR の値（add 時。~ は $HOME に展開される。inherit と排他）" },
+                    "inherit": { "type": "boolean", "description": "true = CLAUDE_CONFIG_DIR を設定しない（既定の資格情報をそのまま使う。spawn 時は明示 unset で direnv 等の値も消す。#512）" },
                     "description": { "type": "string", "description": "アカウントの説明（add 時。任意）" },
                     "default_model": { "type": "string", "description": "このアカウントの既定モデル（add 時。任意。spawn で model 未指定時のフォールバック）" },
                     "default_effort": { "type": "string", "description": "このアカウントの既定 effort（add 時。任意）" },
@@ -1627,6 +1632,7 @@ pub fn tools() -> Vec<Value> {
                         "enum": ["bugfix-rooted", "bugfix-unrooted", "investigation", "feature-verifiable", "feature-ui", "docs", "review"],
                         "description": "委任台帳の task_type（省略時は investigation）",
                     },
+                    "account": { "type": "string", "description": "アカウント名（accounts.yaml のキー。この worker だけ該当 config dir / モデルで起動する。#504）" },
                 },
                 "required": ["project", "prompt"],
                 "additionalProperties": false,
@@ -3508,6 +3514,7 @@ fn build_request(
             action: str_arg(args, "action")?.ok_or("action を指定する")?,
             name: str_arg(args, "name")?,
             config_dir: str_arg(args, "config_dir")?,
+            inherit: bool_arg(args, "inherit")?,
             description: str_arg(args, "description")?,
             default_model: str_arg(args, "default_model")?,
             default_effort: str_arg(args, "default_effort")?,

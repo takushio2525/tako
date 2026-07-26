@@ -640,6 +640,9 @@ pub enum Request {
         name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         config_dir: Option<String>,
+        /// true = CLAUDE_CONFIG_DIR を設定しない（既定の資格情報を使う。Issue #512）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inherit: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

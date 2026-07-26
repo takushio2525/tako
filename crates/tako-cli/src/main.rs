@@ -1328,6 +1328,9 @@ enum OrchestratorCommand {
         /// 委任台帳の task_type（省略時は investigation）
         #[arg(long)]
         task_type: Option<String>,
+        /// アカウント名（accounts.yaml のキー。この worker だけ該当アカウントで起動する。#504）
+        #[arg(long)]
+        account: Option<String>,
     },
     /// worker の状態確認（busy / idle / error / gone / unknown。error 時は
     /// error.kind（api_error / usage_limit / limit_dialog）と recommended_action を含む。#157）
@@ -1442,6 +1445,9 @@ enum OrchestratorCommand {
         /// 委任台帳の task_type（省略時は investigation）
         #[arg(long)]
         task_type: Option<String>,
+        /// アカウント名（accounts.yaml のキー。この worker だけ該当アカウントで起動する。#504）
+        #[arg(long)]
+        account: Option<String>,
     },
     /// 非同期 run の進捗照会（#121）。run_id 省略時は全 run の一覧
     #[command(name = "run-status")]
@@ -2282,6 +2288,7 @@ fn main() -> ExitCode {
             auto_close,
             output_lines,
             ref task_type,
+            ref account,
         }) => orchestrator_run(
             project,
             prompt,
@@ -2293,6 +2300,7 @@ fn main() -> ExitCode {
             auto_close,
             output_lines,
             task_type.as_deref(),
+            account.as_deref(),
         ),
         Command::Orchestrator(OrchestratorCommand::RunStatus { ref run_id }) => {
             let request = Request::OrchestratorRunStatus {
@@ -3009,6 +3017,7 @@ fn orchestrator_run(
     auto_close: bool,
     output_lines: usize,
     task_type: Option<&str>,
+    account: Option<&str>,
 ) -> Result<(), String> {
     let pane_resolved = if pane.is_some() {
         pane
@@ -3038,7 +3047,7 @@ fn orchestrator_run(
         initial_delay: std::time::Duration::from_secs(20),
         interval: std::time::Duration::from_secs(5),
         task_type: task_type.map(str::to_string),
-        account: None,
+        account: account.map(str::to_string),
     };
     let mut exec = |req: Request| send_request(req);
     let result = wait::run_worker(&mut exec, &opts, &mut |pane_id, tmux| {
@@ -4498,6 +4507,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane,
             tab,
             task_type,
+            account,
         }) => {
             let pane_resolved = if pane.is_some() {
                 *pane
@@ -4522,7 +4532,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 agent: agent.clone(),
                 caller_pid: Some(std::process::id()),
                 task_type: task_type.clone(),
-                account: None,
+                account: account.clone(),
             }
         }
         Command::Orchestrator(OrchestratorCommand::SelfInfo { .. }) => {
@@ -5799,6 +5809,71 @@ mod tests {
                 focus: Some(false),
             }
         );
+    }
+
+    /// #511: dispatch にある account が CLI からも指定できる（1:1 不変条件）
+    #[test]
+    fn spawnのaccountがrequestへ渡る() {
+        let command = parse(&[
+            "tako",
+            "orchestrator",
+            "spawn",
+            "--project",
+            "tako",
+            "--prompt",
+            "テスト",
+            "--pane",
+            "3",
+            "--account",
+            "personal",
+        ]);
+        let request = build_request(&command).unwrap();
+        match request {
+            Request::OrchestratorSpawn { account, .. } => {
+                assert_eq!(account.as_deref(), Some("personal"))
+            }
+            other => panic!("想定外の Request: {other:?}"),
+        }
+        // 省略時は None（従来挙動 = プロファイルの worker_account 解決に委ねる）
+        let command = parse(&[
+            "tako",
+            "orchestrator",
+            "spawn",
+            "--project",
+            "tako",
+            "--prompt",
+            "テスト",
+            "--pane",
+            "3",
+        ]);
+        match build_request(&command).unwrap() {
+            Request::OrchestratorSpawn { account, .. } => assert_eq!(account, None),
+            other => panic!("想定外の Request: {other:?}"),
+        }
+    }
+
+    /// #511: run 側も同じく account を受け取る（spawn と対称）
+    #[test]
+    fn runのaccountフラグがパースできる() {
+        let command = parse(&[
+            "tako",
+            "orchestrator",
+            "run",
+            "--project",
+            "tako",
+            "--prompt",
+            "テスト",
+            "--pane",
+            "3",
+            "--account",
+            "univ",
+        ]);
+        match command {
+            Command::Orchestrator(OrchestratorCommand::Run { account, .. }) => {
+                assert_eq!(account.as_deref(), Some("univ"))
+            }
+            _ => panic!("想定外の Command（run 以外にパースされた）"),
+        }
     }
 
     #[test]

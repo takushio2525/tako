@@ -1325,3 +1325,14 @@
   縮退経路・セルフテスト・不変条件は ③ と同一の結果
 - 挙動差の申告: remote の起動拒否メッセージを「tmux が見つからない」から能力ベースの文面へ
 - 次: 段取り⑤（WorkerEntry.pid / report の pane_log フォールバック / delivery 表示）→ ⑥
+
+## 2026-07-26（#511 / #512: アカウント切替の残欠陥 2 件）
+- #511: CLI `orchestrator spawn / run --account` を追加（dispatch には #504 で入っていたが
+  CLI が account: None 固定だった）。MCP `tako_orchestrator_run` の schema にも account を追加
+- #512: accounts.yaml に `inherit: true`（CLAUDE_CONFIG_DIR を設定しない）を新設。
+  `AccountConfigDir { Path | Inherit }` + `EnvPlan { exports, unsets }` で「未設定」を型で表し、
+  spawn は `unset CLAUDE_CONFIG_DIR;` を前置する（direnv 対策）。既定パス明示の登録は警告
+- 検証: 隔離 GUI + 実 claude で受け入れ 5 件を実測（inherit worker がログイン画面を出さない /
+  direnv 注入に unset が勝つ / MCP・CLI 双方の spawn・run で account 適用）。品質ゲート全緑
+- **事故**: 検証テストの変数シャドウイングで `~/.claude-univ` を削除（復旧不能・要再ログイン）。
+  一時ディレクトリ配下を assert してから消す `remove_temp_dir` を入れて再発を構造で防止
