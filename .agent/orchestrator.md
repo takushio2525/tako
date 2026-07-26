@@ -220,6 +220,11 @@ accounts:
     default_model: claude-opus-5
 ```
 
+`master_account` は `tako master` / `tako solo` / handoff の新 master に、
+`worker_account` は spawn する worker に効く（spawn の `--account` が最優先。#547）。
+起動時に「アカウント: <名前>（config dir: …）」を表示するので、どちらで立ったかは
+コマンド出力で確認できる。登録していないアカウント名は起動前にエラーになる。
+
 **既定アカウントは `config_dir: ~/.claude` ではなく `inherit: true` で書く**（#512）。
 claude は `CLAUDE_CONFIG_DIR` が**設定されている**だけで Keychain のエントリ名に
 ハッシュを付けるため、値が既定パスと同一でも別エントリ（= 未ログイン扱い）になる。

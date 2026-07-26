@@ -5190,7 +5190,10 @@ fn dispatch_orchestrator_handoff(
     let profile = orchestrator::Profile::load(profile_name).unwrap_or_default();
     // env 検証（内部変数の上書き拒否。Issue #500）
     profile.validate_env().map_err(DispatchError::Operation)?;
-    let profile_env = profile.resolved_env_plan();
+    // 引き継ぎ先の master も master_account を反映する（#547。CLI の master 起動と同じ規則）
+    let profile_env = profile
+        .resolved_env_plan_for_master()
+        .map_err(DispatchError::Operation)?;
 
     let master_agent = profile
         .resolve_master_agent()

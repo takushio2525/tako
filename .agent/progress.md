@@ -1336,3 +1336,11 @@
   direnv 注入に unset が勝つ / MCP・CLI 双方の spawn・run で account 適用）。品質ゲート全緑
 - **事故**: 検証テストの変数シャドウイングで `~/.claude-univ` を削除（復旧不能・要再ログイン）。
   一時ディレクトリ配下を assert してから消す `remove_temp_dir` を入れて再発を構造で防止
+
+## 2026-07-26（#547: master_account が master 起動に適用されない問題）
+- `build_master_cmd`（tako master / solo）と handoff の新 master を
+  `resolved_env_plan_for_master()` 経由へ。#512 の inherit（unset）もそのまま効く。
+  未登録アカウント名は起動前に Err。CLI 起動時に「アカウント: <名前>（config dir: …）」を表示
+- 検証: 隔離実測で univ = プロセス env に `CLAUDE_CONFIG_DIR=~/.claude-univ`、
+  personal(inherit) / solo / master_account 無し = 未設定を `ps eww` で確認。
+  ユニット 5 本は修正を戻すと 4 本落ちる（検出力実証）。品質ゲート + クロス check ベースライン不変
