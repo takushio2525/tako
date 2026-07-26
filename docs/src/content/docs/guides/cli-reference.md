@@ -436,6 +436,8 @@ tako panel --show --view tmux    # 旧称。fleet と同じビュー（後方互
 tako panel --hide                # 隠す
 tako panel --filetree on         # 左のファイルツリーを表示
 tako panel --width 360           # パネル幅を変更
+tako panel --show-hidden on      # ツリーに .git / .env 等のドット項目も並べる（既定 off）
+tako panel --show-hidden off     # 既定へ戻す（見出しの目アイコン / 右クリックでも切替可）
 
 # プレビューのピン留め（フローティングウィンドウ化）
 tako pin --pane 3 on
