@@ -7230,6 +7230,20 @@ impl TakoApp {
 
     // --- キー入力 ---
 
+    /// キー入力を丸ごと消費するアプリ内テキスト入力が有効か（#546）。
+    /// パレット・インライン編集・git のブランチ名 / コミットメッセージ欄が該当する。
+    /// これらが有効な間、`handle_key` が `stop_propagation` するので
+    /// `cmd-v` は `PasteClipboard` アクションまで届かない
+    fn text_input_swallows_keys(&self) -> bool {
+        self.command_palette.is_some()
+            || self.inline_edit.is_some()
+            || self.git_branch_input.is_some()
+            // #503 と同じ条件で「見えているコミット欄」に限る（stale フラグで拾わない）
+            || (self.git_commit_input_focused
+                && self.panel_visible
+                && self.panel_view == PanelView::Git)
+    }
+
     fn handle_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
         // Issue #168: キーストローク毎の処理コストを計測（入力レイテンシの内訳）
         let _span = tako_control::diag::perf_span("key_input");
@@ -7239,6 +7253,15 @@ impl TakoApp {
                 "escape" => self.close_confirm_cancelled(cx),
                 _ => {}
             }
+            cx.stop_propagation();
+            return;
+        }
+        // #546: アプリ内テキスト入力が有効な間は下のチェーンが全キーを消費するため、
+        // ⌘V が PasteClipboard アクションへ到達しない（貼り付け先の振り分けは
+        // paste() が持っているので、ここで直接そこへ渡す）。
+        // 入力欄が無いときは従来どおりアクション経由でターミナルへ貼り付ける
+        if is_paste_keystroke(keystroke) && self.text_input_swallows_keys() {
+            self.paste(cx);
             cx.stop_propagation();
             return;
         }
@@ -22771,6 +22794,29 @@ mod self_test {
                     })
                     .unwrap_or(false);
                 check(palette_ok, "コマンドパレット: 絞り込み + Enter 実行 + Esc");
+
+                // 75b. #546: パレット表示中の ⌘V が入力欄へ入る。handle_key が
+                //      パレット中の全キーを消費するため PasteClipboard アクションへ
+                //      到達しない経路の回帰防止（press = 実キー配送）
+                let _ = window.update(cx, |app, window, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                        "TAKO-PALETTE-PASTE".into(),
+                    ));
+                    app.open_command_palette(window, cx);
+                });
+                press(any, cx, "cmd-v");
+                wait(cx, 500).await;
+                let palette_paste_ok = window
+                    .update(cx, |app, _, cx| {
+                        let pasted = app
+                            .command_palette
+                            .as_ref()
+                            .is_some_and(|p| p.query == "TAKO-PALETTE-PASTE");
+                        app.handle_palette_key(&Keystroke::parse("escape").unwrap(), cx);
+                        pasted
+                    })
+                    .unwrap_or(false);
+                check(palette_paste_ok, "コマンドパレット: ⌘V で入力欄へ貼り付け");
 
                 // 73d. confirm_close=false で即クローズ
                 type_text(
