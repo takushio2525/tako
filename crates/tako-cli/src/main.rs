@@ -1900,6 +1900,25 @@ struct PreviewFollowLinkArgs {
     index: usize,
 }
 
+/// `--view` の受理値（#553）。正式値は GUI のタブ表示名と 1:1 で、
+/// 旧称は後方互換のため受理を続ける（`--help` と invalid value エラーの
+/// possible values に旧称も出し、どちらの語彙からでも辿れるようにする）
+fn panel_view_parser() -> clap::builder::PossibleValuesParser {
+    use clap::builder::PossibleValue;
+    use tako_control::protocol::PanelViewWire;
+
+    let mut values: Vec<PossibleValue> = PanelViewWire::VALUES
+        .iter()
+        .map(|v| PossibleValue::new(*v))
+        .collect();
+    values.extend(
+        PanelViewWire::LEGACY_VALUES
+            .iter()
+            .map(|(old, new)| PossibleValue::new(*old).help(format!("{new} の旧称（後方互換）"))),
+    );
+    clap::builder::PossibleValuesParser::new(values)
+}
+
 #[derive(Args)]
 struct PanelArgs {
     /// パネルを表示する
@@ -1911,8 +1930,8 @@ struct PanelArgs {
     /// パネル幅（px）
     #[arg(long)]
     width: Option<f32>,
-    /// 表示するビュー（orch = オーケストレーター俯瞰。#217）
-    #[arg(long, value_parser = ["tmux", "orch", "git"])]
+    /// 表示するビュー（GUI のタブ名と同じ。fleet = ペイン / セッション俯瞰、orch = オーケストレーター俯瞰、git = git。tmux は fleet の旧称）
+    #[arg(long, value_parser = panel_view_parser())]
     view: Option<String>,
     /// 左サイドバーのファイルツリー表示（FR-2.16.5。on = 表示、off = 非表示）
     #[arg(long, value_parser = ["on", "off"])]
@@ -4175,11 +4194,11 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 _ => None,
             },
             width: args.width,
-            view: args.view.as_deref().map(|v| match v {
-                "git" => tako_control::protocol::PanelViewWire::Git,
-                "orch" => tako_control::protocol::PanelViewWire::Orch,
-                _ => tako_control::protocol::PanelViewWire::Tmux,
-            }),
+            // value_parser で正式値・旧称ともに検証済み（#553）
+            view: args
+                .view
+                .as_deref()
+                .and_then(tako_control::protocol::PanelViewWire::parse),
             filetree: args.filetree.as_deref().map(|s| s == "on"),
             sidebar_width: args.sidebar_width,
         },
@@ -6410,6 +6429,37 @@ mod tests {
                 no_wait: false,
             }
         );
+    }
+
+    /// Issue #553: GUI に見えている fleet をそのまま指定できる。
+    /// 旧称 tmux も同じビューへ解決され、既存スクリプトが動き続ける
+    #[test]
+    fn panel_viewはfleetと旧称tmuxの両方を受理する() {
+        use tako_control::protocol::PanelViewWire;
+
+        let view_of = |value: &str| match build_request(&parse(&[
+            "tako", "panel", "--show", "--view", value,
+        ]))
+        .unwrap()
+        {
+            Request::Panel { view, .. } => view,
+            other => panic!("Panel 以外になった: {other:?}"),
+        };
+        assert_eq!(view_of("fleet"), Some(PanelViewWire::Fleet));
+        assert_eq!(view_of("tmux"), Some(PanelViewWire::Fleet));
+        assert_eq!(view_of("orch"), Some(PanelViewWire::Orch));
+        assert_eq!(view_of("git"), Some(PanelViewWire::Git));
+    }
+
+    /// invalid value のエラーに GUI 表示名 fleet と旧称の両方が載る（#553 案 2）
+    #[test]
+    fn panel_viewの不正値エラーにfleetが載る() {
+        let err = match Cli::try_parse_from(["tako", "panel", "--view", "fleets"]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("不正値がエラーにならなかった"),
+        };
+        assert!(err.contains("fleet"), "エラーに fleet が無い: {err}");
+        assert!(err.contains("tmux"), "エラーに旧称 tmux が無い: {err}");
     }
 }
 

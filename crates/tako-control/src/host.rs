@@ -159,7 +159,7 @@ pub trait UiStateHost {
     fn set_confirm_close(&mut self, _enabled: bool) {}
     /// 右サイドバー情報パネルの状態 (visible, width, view)
     fn panel_state(&self) -> (bool, f32, crate::protocol::PanelViewWire) {
-        (false, 0.0, crate::protocol::PanelViewWire::Tmux)
+        (false, 0.0, crate::protocol::PanelViewWire::Fleet)
     }
     /// 右サイドバー情報パネルの操作（None の項目は変更しない）
     fn set_panel(

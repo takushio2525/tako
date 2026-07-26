@@ -73,23 +73,57 @@ fn default_true() -> bool {
 }
 
 /// 右サイドバー情報パネルの内部ビュー（固定タブ 0 個方針。FR-2.16.6 で agents は
-/// tmux ビューへ統合済み。git は git graph（FR-3.6）実装までプレースホルダ表示）
+/// fleet ビューへ統合済み）。
+///
+/// 値の語彙は **GUI のタブ表示名（fleet / orch / git）と一致させる**（#553）。
+/// AI が画面に見えている名前をそのまま指定できることが設計原則 5 の前提。
+/// 旧称 `tmux` は既存スクリプト互換のため受理し続ける（`serde(alias)` + [`parse`]）が、
+/// 応答・案内には出さない。
+///
+/// [`parse`]: PanelViewWire::parse
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PanelViewWire {
-    Tmux,
+    /// GUI の「fleet」タブ（旧称 tmux。#553 で改称）
+    #[serde(alias = "tmux")]
+    Fleet,
     /// オーケストレーター中心ビュー（#217。master + ワーカーツリーの俯瞰）
     Orch,
     Git,
 }
 
 impl PanelViewWire {
+    /// CLI / MCP が案内する正式値（GUI のタブ表示名と 1:1。#553）
+    pub const VALUES: [&'static str; 3] = ["fleet", "orch", "git"];
+    /// 後方互換のみで受理する旧称と現行値の対応（#553）
+    pub const LEGACY_VALUES: [(&'static str, &'static str); 1] = [("tmux", "fleet")];
+
     pub fn as_str(self) -> &'static str {
         match self {
-            PanelViewWire::Tmux => "tmux",
+            PanelViewWire::Fleet => "fleet",
             PanelViewWire::Orch => "orch",
             PanelViewWire::Git => "git",
         }
+    }
+
+    /// 文字列から解決する。旧称（`tmux`）も後方互換で受理する（#553）
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "fleet" | "tmux" => Some(PanelViewWire::Fleet),
+            "orch" => Some(PanelViewWire::Orch),
+            "git" => Some(PanelViewWire::Git),
+            _ => None,
+        }
+    }
+
+    /// 不正値を弾くときに添える案内（GUI 表示名を先に出し、旧称は括弧で補足。#553 案 2）
+    pub fn values_hint() -> String {
+        let legacy = Self::LEGACY_VALUES
+            .iter()
+            .map(|(old, new)| format!("{old} は {new} の旧称"))
+            .collect::<Vec<_>>()
+            .join("、");
+        format!("{}。{legacy}", Self::VALUES.join(" | "))
     }
 }
 
@@ -1417,5 +1451,49 @@ mod tests {
         assert_eq!(Request::SetupChanges.kind_name(), "SetupChanges");
         assert_eq!(Request::SetupRun { answers: None }.kind_name(), "SetupRun");
         assert_eq!(Request::TmuxList { socket: None }.kind_name(), "TmuxList");
+    }
+
+    /// Issue #553: パネルビューの語彙は GUI のタブ表示名と一致する。
+    /// 旧称 `tmux` は受理し続けるが、応答・案内には出さない
+    #[test]
+    fn panel_viewの正式値はgui表示名と一致する() {
+        assert_eq!(PanelViewWire::Fleet.as_str(), "fleet");
+        assert_eq!(PanelViewWire::Orch.as_str(), "orch");
+        assert_eq!(PanelViewWire::Git.as_str(), "git");
+        // 案内する正式値に旧称は混ざらない（GUI に出ない語を勧めない）
+        assert_eq!(PanelViewWire::VALUES, ["fleet", "orch", "git"]);
+        assert!(!PanelViewWire::VALUES.contains(&"tmux"));
+    }
+
+    #[test]
+    fn panel_viewは旧称tmuxを後方互換で受理する() {
+        assert_eq!(PanelViewWire::parse("fleet"), Some(PanelViewWire::Fleet));
+        assert_eq!(PanelViewWire::parse("tmux"), Some(PanelViewWire::Fleet));
+        assert_eq!(PanelViewWire::parse("orch"), Some(PanelViewWire::Orch));
+        assert_eq!(PanelViewWire::parse("git"), Some(PanelViewWire::Git));
+        assert_eq!(PanelViewWire::parse("fleets"), None);
+        assert_eq!(PanelViewWire::parse(""), None);
+        // 旧称で入れても応答の表記は正式値に正規化される
+        assert_eq!(PanelViewWire::parse("tmux").unwrap().as_str(), "fleet");
+    }
+
+    /// IPC 上の JSON も同じ後方互換を持つ（旧 CLI からの Request を新 GUI が読める）
+    #[test]
+    fn panel_viewのjsonは旧称を受理し正式値で書き出す() {
+        let from_new: PanelViewWire = serde_json::from_str("\"fleet\"").unwrap();
+        let from_old: PanelViewWire = serde_json::from_str("\"tmux\"").unwrap();
+        assert_eq!(from_new, PanelViewWire::Fleet);
+        assert_eq!(from_old, PanelViewWire::Fleet);
+        assert_eq!(
+            serde_json::to_string(&PanelViewWire::Fleet).unwrap(),
+            "\"fleet\""
+        );
+    }
+
+    /// 不正値の案内は GUI 表示名を先に出し、旧称との対応も添える（#553 案 2）
+    #[test]
+    fn panel_viewの案内文は表示名と旧称の対応を含む() {
+        let hint = PanelViewWire::values_hint();
+        assert_eq!(hint, "fleet | orch | git。tmux は fleet の旧称");
     }
 }

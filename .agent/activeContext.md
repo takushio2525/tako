@@ -4,9 +4,17 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-26 夜・#530 で spawn プロンプト消失を根治）
+## 現在の対象（2026-07-27・#553 でパネルビューの語彙を GUI と一致させた）
 
-直近: `fix/530-prompt-delivery` で #530 を根治。根因は疑われていた「シェル段階の誤判定」ではなく
+直近: `fix/553-fleet-vocab` で #553 を解消。GUI のタブは fleet / orch / git なのに CLI / MCP の
+`--view` は tmux / orch / git しか受けず、画面に見えている語で操作できなかった（設計原則 5 の前提崩れ）。
+**`PanelViewWire::Fleet` を正式値化**し、語彙の正本を protocol.rs の
+`VALUES` / `LEGACY_VALUES` / `parse` / `values_hint` に集約して CLI・MCP 双方がそこから引く形にした。
+旧称 `tmux` は `serde(alias)` + `parse` で受理し続けるが、応答 JSON は必ず `fleet` に正規化する。
+tako-app 側の `PanelView::Tmux` も `Fleet` へ改称（`PanelView::Tmux => PanelViewWire::Fleet` という
+食い違いの再発を構造で防ぐため）。
+
+その前: `fix/530-prompt-delivery` で #530 を根治。根因は疑われていた「シェル段階の誤判定」ではなく
 **claude の番号付き選択ダイアログ（初回テーマ選択 `❯ 2. Dark mode ✔` / ログイン方法選択）の
 選択カーソルを入力欄と誤認していたこと**。`CLAUDE_CONFIG_DIR` を切り替えると初回に必ず出るため、
 account env 注入つき spawn 特有の症状になっていた。`is_choice_dialog`（文言非依存の構造判定）を

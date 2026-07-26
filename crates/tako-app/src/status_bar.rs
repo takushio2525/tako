@@ -648,12 +648,12 @@ impl TakoApp {
             .child(
                 toggle(
                     "statusbar-tmux",
-                    self.panel_visible && self.panel_view == PanelView::Tmux,
+                    self.panel_visible && self.panel_view == PanelView::Fleet,
                 )
                 .border_r_0()
                 .border_l_1()
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.toggle_panel_view(PanelView::Tmux, cx);
+                    this.toggle_panel_view(PanelView::Fleet, cx);
                 }))
                 .children(agents_dot.map(|color| {
                     div()
@@ -675,7 +675,7 @@ impl TakoApp {
                         .w(px(13.0))
                         .h(px(13.0))
                         .text_color(
-                            if self.panel_visible && self.panel_view == PanelView::Tmux {
+                            if self.panel_visible && self.panel_view == PanelView::Fleet {
                                 hsla(theme.accent)
                             } else {
                                 hsla(theme.text_tertiary)
@@ -1865,7 +1865,7 @@ impl TakoApp {
         } else {
             self.panel_visible = true;
             self.panel_view = view;
-            if view == PanelView::Tmux {
+            if view == PanelView::Fleet {
                 self.refresh_tmux(cx);
             }
             if view == PanelView::Git {
