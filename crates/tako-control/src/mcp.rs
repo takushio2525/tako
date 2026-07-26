@@ -1518,6 +1518,8 @@ pub fn tools() -> Vec<Value> {
                 応答の prompt_delivery（delivered / pending / undelivered）と \
                 events の prompt_undelivered イベントで spawn プロンプトの未達を検知できる \
                 （undelivered なら tako_send_input でプロンプトを再送する）。\
+                #530: 送達フローがプロンプトの到達を確認できなかった場合は、claude が起動して \
+                session が観測できていても undelivered になる（起動 ≠ プロンプト到達）。\
                 events の agent_dead はエージェント CLI プロセスの突然死（SIGSEGV 等）の疑い: \
                 応答の resume_command（レジストリの session ID から組み立てた claude --resume）を \
                 ペインのシェルへ tako_send_input すれば文脈ごと復旧できる（自動 resume はしない）。",
@@ -1542,8 +1544,11 @@ pub fn tools() -> Vec<Value> {
                 watch / status / report を継続できる。各エントリに worker_id / pane / tmux_session / \
                 session_id / pane_alive（GUI にペインが現存するか）/ tmux_alive（tmux session が生存中か）/ \
                 prompt_delivery（delivered = プロンプト到達済み / pending = 確認中 / undelivered = 未達の疑い）/ \
-                resume_command（session ID 検出済み claude worker の復旧コマンド。突然死時に使う）が入る。\
-                既定は active のみ。all = true で closed（明示 close 済み）も含める。",
+                prompt_delivery_failure（未達の理由コード。#530: choice_dialog = 初回のテーマ選択・\
+                ログイン方法選択ダイアログが出て送れなかった / paste_not_reflected / residual_after_retries / \
+                flow_timeout）/ resend_command（未達 worker にだけ入る再送コマンド。同じ依頼文を \
+                tako_send_input で送り直す）/ resume_command（session ID 検出済み claude worker の復旧コマンド。\
+                突然死時に使う）が入る。既定は active のみ。all = true で closed（明示 close 済み）も含める。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

@@ -305,6 +305,12 @@ struct PromptFlow {
     /// enter_only の残留判定基準: Enter 送信時点の入力欄内容。検証時に
     /// 同じ内容が残っていれば未送達とみなし Enter を再送する
     baseline: Option<String>,
+    /// 貼り付けが入力欄へ反映されたことを確認できたか（Issue #530）。
+    /// 「入力欄が空」は送信の証拠にならない（貼り付けが届いていなければ最初から空）ため、
+    /// 送達の確証はこのフラグと残留消失の**両方**が揃ったときだけとする
+    paste_reflected: bool,
+    /// 未達で打ち切ったときの理由コード（規約により画面内容・送信テキストは含めない）
+    unverified_reason: Option<&'static str>,
 }
 
 impl PromptFlow {
@@ -327,6 +333,8 @@ impl PromptFlow {
             wait_tui,
             enter_only: false,
             baseline: None,
+            paste_reflected: false,
+            unverified_reason: None,
         }
     }
 
@@ -3844,6 +3852,12 @@ impl TakoApp {
                     "warning: プロンプト送達フローがタイムアウト（pane={}）",
                     flow.pane.as_u64()
                 );
+                // #530: 未達を worker レジストリへ記録する（master が
+                // `tako orchestrator workers` で未達を検知して再送できるようにする）
+                Self::report_prompt_delivery(
+                    &flow,
+                    flow.unverified_reason.unwrap_or("flow_timeout"),
+                );
                 continue;
             }
             if active_panes.contains(&flow.pane) {
@@ -3853,11 +3867,38 @@ impl TakoApp {
             let session = match self.terminals.get(&flow.pane) {
                 Some(s) => s,
                 None => {
+                    if std::env::var_os("TAKO_PROMPT_FLOW_DEBUG").is_some() {
+                        eprintln!(
+                            "[prompt-flow] pane={} state={:?} session=gone elapsed={:.1}s",
+                            flow.pane.as_u64(),
+                            flow.state,
+                            flow.created_at.elapsed().as_secs_f32()
+                        );
+                    }
                     active_panes.insert(flow.pane);
                     remaining.push(flow);
                     continue;
                 }
             };
+            // 送達フローの遷移診断（#530 の調査で新設）。画面内容・送信テキストは
+            // 出さず、状態・画面種別・経過時間だけを出す（絶対ルール: 診断ログに
+            // ペイン内容を出さない）
+            if std::env::var_os("TAKO_PROMPT_FLOW_DEBUG").is_some() {
+                let lines = session.visible_lines();
+                eprintln!(
+                    "[prompt-flow] pane={} state={:?} alt={} screen={:?} input={} elapsed={:.1}s",
+                    flow.pane.as_u64(),
+                    flow.state,
+                    session.is_alt_screen(),
+                    claude_tui::detect(&lines),
+                    match claude_tui::input_line(&lines) {
+                        None => "none",
+                        Some(c) if claude_tui::input_content_is_empty(c) => "empty",
+                        Some(_) => "nonempty",
+                    },
+                    flow.created_at.elapsed().as_secs_f32()
+                );
+            }
             match flow.state {
                 PromptFlowState::WaitAltScreen => {
                     // agy 1.1.0 は inline モード（非 alt_screen）で動くため、alt_screen 遷移
@@ -3875,7 +3916,24 @@ impl TakoApp {
                 }
                 PromptFlowState::WaitPromptReady => {
                     let lines = session.visible_lines();
-                    if claude_tui::is_trust_dialog(&lines) {
+                    if !flow.enter_only
+                        && !claude_tui::is_trust_dialog(&lines)
+                        && claude_tui::is_choice_dialog(&lines)
+                    {
+                        // 未知の番号付き選択ダイアログ（#530: CLAUDE_CONFIG_DIR 切替時の
+                        // テーマ選択・ログイン方法選択、bypass 確認等）。選択カーソルは
+                        // 入力欄と同じ字面なので、従来はここへ貼ってプロンプトを食わせていた。
+                        // 内容が不明なため自動承諾はせず（勝手に選択を確定させない）、
+                        // ダイアログが消えるまで待って総合タイムアウトで未達を報告する。
+                        // Enter 単独送達（#95）は「Enter を送れ」という明示要求なので対象外
+                        if flow.unverified_reason.is_none() {
+                            eprintln!(
+                                "warning: 選択ダイアログ表示中のためプロンプト送達を保留（pane={}）",
+                                flow.pane.as_u64()
+                            );
+                        }
+                        flow.unverified_reason = Some("choice_dialog");
+                    } else if claude_tui::is_trust_dialog(&lines) {
                         // 信頼ダイアログがプロンプトを消費するのを防ぐ: 先に Enter で承諾する
                         // （事前信頼が書けなかった場合のフォールバック）。tick 間隔 500ms が
                         // 承諾間の自然な遅延になる。3 回で打ち切り（総合タイムアウトに委ねる）
@@ -3904,7 +3962,9 @@ impl TakoApp {
                     {
                         // 入力欄（プロンプト記号）を確認して貼り付け。汎用送信（wait_tui=false）は
                         // 対象が claude TUI でなくても 2 秒待って貼る（他 TUI への送信）。
-                        // bracketed paste はアプリが要求していれば paste() が括りを付ける
+                        // bracketed paste はアプリが要求していれば paste() が括りを付ける。
+                        // ダイアログ待ちを経てここへ来た場合は保留理由を解除する（#530）
+                        flow.unverified_reason = None;
                         session.paste(&flow.prompt);
                         flow.state = PromptFlowState::WaitTextInInput;
                         flow.state_entered_at = now;
@@ -3923,6 +3983,7 @@ impl TakoApp {
                     if reflected {
                         // 送信の Enter は貼り付けと分離した単独キーとして送る
                         // （貼り付けバーストに混ざると「次の行」と解釈される）
+                        flow.paste_reflected = true;
                         session.write(b"\r".to_vec());
                         flow.state = PromptFlowState::VerifySubmitted;
                         flow.state_entered_at = now;
@@ -3945,6 +4006,9 @@ impl TakoApp {
                             session.paste(&flow.prompt);
                             flow.state_entered_at = now;
                         } else {
+                            // 反映を確認できないまま打ち切る。Enter は一応送るが、
+                            // この経路を通った送達は「確認済み」にしない（#530）
+                            flow.unverified_reason = Some("paste_not_reflected");
                             session.write(b"\r".to_vec());
                             flow.state = PromptFlowState::VerifySubmitted;
                             flow.state_entered_at = now;
@@ -3967,8 +4031,21 @@ impl TakoApp {
                             claude_tui::input_residual(&lines, &flow.prompt)
                         };
                         if !residual {
-                            // 入力欄が空へ戻った = 送信された
+                            // 入力欄が空へ戻った。ただし**空であること単体は送信の証拠に
+                            // ならない**（貼り付けが届いていなければ最初から空。#530 の
+                            // 偽陽性）。貼り付け反映を確認できている場合のみ送達確定
                             flow.state = PromptFlowState::Done;
+                            // Enter 単独送達（#95）は貼り付けを伴わないので残留消失で判定。
+                            // 通常のプロンプト送達は「貼り付けが入力欄へ反映された」ことを
+                            // 送達の証拠とする
+                            if flow.enter_only || flow.paste_reflected {
+                                Self::report_prompt_delivery_ok(&flow);
+                            } else {
+                                Self::report_prompt_delivery(
+                                    &flow,
+                                    flow.unverified_reason.unwrap_or("paste_not_reflected"),
+                                );
+                            }
                         } else if flow.enter_retries_left > 0 {
                             // Enter が「送信」と解釈されず残留 → Enter を単独再送
                             session.write(b"\r".to_vec());
@@ -3980,6 +4057,7 @@ impl TakoApp {
                                 flow.pane.as_u64()
                             );
                             flow.state = PromptFlowState::Done;
+                            Self::report_prompt_delivery(&flow, "residual_after_retries");
                         }
                     }
                 }
@@ -3995,6 +4073,39 @@ impl TakoApp {
             tako_control::request_claude_scan();
         }
         self.prompt_flows = remaining;
+    }
+
+    /// 送達フローの結果を worker レジストリへ記録する（Issue #530）。
+    /// enter_only（Enter 代行）は spawn プロンプトではないので記録対象外。
+    /// レジストリ側は「同ペインの active かつ未決着エントリ」だけを更新するため、
+    /// worker でないペインへの送信は no-op になる
+    fn report_prompt_delivery(flow: &PromptFlow, reason: &'static str) {
+        if flow.enter_only {
+            return;
+        }
+        let pane = flow.pane.as_u64();
+        std::thread::spawn(move || {
+            if let Err(e) =
+                tako_control::orchestrator::registry::record_prompt_delivery(pane, false, reason)
+            {
+                eprintln!("warning: worker レジストリへの送達結果記録に失敗: {e}");
+            }
+        });
+    }
+
+    /// 送達を確認できた場合の記録（Issue #530）
+    fn report_prompt_delivery_ok(flow: &PromptFlow) {
+        if flow.enter_only {
+            return;
+        }
+        let pane = flow.pane.as_u64();
+        std::thread::spawn(move || {
+            if let Err(e) =
+                tako_control::orchestrator::registry::record_prompt_delivery(pane, true, "verified")
+            {
+                eprintln!("warning: worker レジストリへの送達結果記録に失敗: {e}");
+            }
+        });
     }
 
     /// 人間の Enter の送達検証フロー（Issue #95）を登録する。同一ペインに

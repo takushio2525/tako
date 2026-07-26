@@ -1351,3 +1351,16 @@
 - 検証: 同一 data_dir に対する CLI と MCP の出力を diff して list / show / add（警告つき）/
   remove が完全一致。`--inherit` / 既定パス警告 / 排他エラー / 壊れたエントリ表示も実測。
   CLI 登録アカウントが spawn で解決されるところまで通し確認。品質ゲート全緑
+
+## 2026-07-26（#530: spawn 初期プロンプトの消失を根治）
+- 根因は疑いにあった「シェル段階の誤判定」ではなく、**claude の番号付き選択ダイアログ**
+  （新 config dir の初回テーマ選択 `❯ 2. Dark mode ✔` / ログイン方法選択）の選択カーソルを
+  `input_line` が入力欄と誤認していたこと。`CLAUDE_CONFIG_DIR` 切替時に必ず出るため
+  account env 注入つき spawn 特有に見えていた。before 実測でテーマ選択が自動確定されて
+  次画面へ進み（t=12.99 → 13.33）プロンプトが消える様子を撮影
+- 修正: 文言非依存の `is_choice_dialog`（最下部プロンプト行が `N. …` + 選択肢 2 件以上）を新設し
+  `input_line` から除外 / 送達の証拠を「入力欄が空」から「貼り付けが入力欄へ反映された」へ /
+  未達は `prompt_delivery=undelivered` + `prompt_delivery_failure` + `resend_command` で報告
+- 検証: 10 連続 spawn で消失ゼロ・registry 全件 delivered、fresh config dir では
+  ダイアログを確定させず undelivered(choice_dialog) + 再送コマンド提示。品質ゲート全緑（1360）+
+  隔離セルフテスト FAILED 0。`claude_tui_e2e` の 2 件失敗は main 時点で同一 = 回帰ではない

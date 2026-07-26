@@ -119,6 +119,14 @@ pub struct WorkerEntry {
     /// claude transcript（session_id）を最初に観測した時刻 = プロンプト到達の証跡
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_delivered_at: Option<String>,
+    /// 送達フロー（PromptFlow）がプロンプトの到達を確認できずに打ち切った時刻（Issue #530）。
+    /// session 検出（= claude が起動しただけ）より優先して未達と判定するための証跡
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_delivery_failed_at: Option<String>,
+    /// 未達の理由コード（`choice_dialog` = 選択ダイアログに阻まれた / `paste_not_reflected` /
+    /// `residual_after_retries` / `flow_timeout`）。規約により画面内容・送信テキストは含めない
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_delivery_failure: Option<String>,
 }
 
 impl WorkerEntry {
@@ -291,6 +299,8 @@ pub fn record_spawn(record: RegisterSpawn) -> Result<String, String> {
                 closed_at: None,
                 close_reason: None,
                 prompt_delivered_at: None,
+                prompt_delivery_failed_at: None,
+                prompt_delivery_failure: None,
             },
         );
         reg.gc();
@@ -354,6 +364,60 @@ pub fn record_session_detected(tmux_session: &str, session_id: &str) -> Result<(
     })
 }
 
+/// 送達フロー（PromptFlow）の結果をレジストリへ記録する（Issue #530）。
+/// `verified = true` は「貼り付けが入力欄へ反映され、送信後に残留が消えた」という
+/// 積極的な証拠。`false` は未達の疑い（理由コードつき）。
+///
+/// pane 番号で引く（PromptFlow が持つキー）。同番号ペインの再利用による誤更新を防ぐため、
+/// active かつ既に決着（delivered / failed）していないエントリだけを対象にする。
+/// 記録失敗で送達フローを止めないよう、呼び出し側は警告のみで継続する
+pub fn record_prompt_delivery(pane: u64, verified: bool, reason: &str) -> Result<(), String> {
+    let Some(path) = registry_path() else {
+        return Ok(());
+    };
+    if !path.is_file() {
+        return Ok(());
+    }
+    // 変更が無いなら書き込みをスキップ（冪等。record_session_detected と同型）
+    let current = WorkerRegistry::load_from(&path)?;
+    let needs_update = current.workers.values().any(|e| {
+        e.is_active()
+            && e.pane == pane
+            && e.prompt_delivery_failed_at.is_none()
+            && (!verified || e.prompt_delivered_at.is_none())
+    });
+    if !needs_update {
+        return Ok(());
+    }
+    let now = crate::sessions::now_iso();
+    WorkerRegistry::mutate_at(&path, |reg| {
+        for entry in reg.workers.values_mut() {
+            if !entry.is_active() || entry.pane != pane || entry.prompt_delivery_failed_at.is_some()
+            {
+                continue;
+            }
+            if verified {
+                if entry.prompt_delivered_at.is_none() {
+                    entry.prompt_delivered_at = Some(now.clone());
+                }
+            } else {
+                entry.prompt_delivery_failed_at = Some(now.clone());
+                entry.prompt_delivery_failure = Some(reason.to_string());
+            }
+        }
+    })
+}
+
+/// 未達 worker へプロンプトを送り直すコマンド（Issue #530 / #390 の再送導線）。
+/// prompt 本文は tako 側に残っていないため（規約により保存しない）、master が
+/// 同じ依頼文を渡し直す前提のテンプレートを返す
+pub fn resend_command(entry: &WorkerEntry) -> Option<String> {
+    if !entry.is_active() {
+        return None;
+    }
+    Some(format!("tako send --pane {} '<同じ依頼文>'", entry.pane))
+}
+
 /// レジストリの session ID から復旧コマンドを組み立てる（#390: SIGSEGV 等の
 /// 突然死からの復旧提示）。claude のみ（--resume の互換が確認できているのは claude）。
 /// master はこのコマンドを死んだペインのシェルへ send_input するか、新ペインで実行する
@@ -381,6 +445,13 @@ pub fn resume_command(entry: &WorkerEntry) -> Option<String> {
 /// OverdueSuspect は「疑い」であり、最終的な未達イベントの発火は呼び出し側が
 /// 画面状態（busy でない・実行中子プロセスなし）と組み合わせて決める
 pub fn prompt_delivery_assessment(entry: &WorkerEntry, now_epoch: i64) -> PromptDelivery {
+    // 送達フローが未達を確定させていれば、それを最優先する（Issue #530）。
+    // session 検出は「claude が起動した」証拠であって「プロンプトが届いた」証拠ではない
+    // （初回のテーマ選択・ログイン方法選択ダイアログにプロンプトが食われても
+    // claude 自体は起動するため session_id は付く = 旧実装の delivered 偽陽性）
+    if entry.prompt_delivery_failed_at.is_some() {
+        return PromptDelivery::OverdueSuspect;
+    }
     if entry.session_id.is_some() || entry.prompt_delivered_at.is_some() {
         return PromptDelivery::Delivered;
     }
@@ -458,7 +529,13 @@ pub fn list_payload(
             "pane_alive": pane_alive,
             "tmux_alive": tmux_alive,
             "prompt_delivery": delivery.as_str(),
+            "prompt_delivery_failure": e.prompt_delivery_failure,
             "resume_command": resume_command(e),
+            // 未達 worker にだけ再送コマンドを出す（#530 の受け入れ条件 3）
+            "resend_command": match delivery {
+                PromptDelivery::OverdueSuspect => resend_command(e),
+                _ => None,
+            },
         }));
     }
     json!({ "workers": items, "count": items.len() })
@@ -527,6 +604,8 @@ mod tests {
                     closed_at: None,
                     close_reason: None,
                     prompt_delivered_at: None,
+                    prompt_delivery_failed_at: None,
+                    prompt_delivery_failure: None,
                 },
             );
             reg.gc();
@@ -685,6 +764,119 @@ mod tests {
         assert_eq!(
             prompt_delivery_assessment(&closed, now_epoch + 10_000),
             PromptDelivery::NotApplicable
+        );
+    }
+
+    #[test]
+    fn 送達フローの未達記録はsession検出より優先される() {
+        // #530: claude が起動すれば session_id は付く（= 起動の証拠であって
+        // プロンプト到達の証拠ではない）。選択ダイアログに食われて未達だった場合、
+        // 送達フローが記録した失敗が delivered を上書きする
+        let now_epoch = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap();
+        let mut entry = WorkerEntry {
+            agent: "claude".into(),
+            status: "active".into(),
+            spawned_at: crate::sessions::now_iso(),
+            session_id: Some("abc".into()),
+            prompt_delivered_at: Some(crate::sessions::now_iso()),
+            ..Default::default()
+        };
+        // 旧実装の判定（session 検出だけで delivered）
+        assert_eq!(
+            prompt_delivery_assessment(&entry, now_epoch),
+            PromptDelivery::Delivered
+        );
+        // 送達フローが未達を記録すると undelivered になる
+        entry.prompt_delivery_failed_at = Some(crate::sessions::now_iso());
+        entry.prompt_delivery_failure = Some("choice_dialog".into());
+        assert_eq!(
+            prompt_delivery_assessment(&entry, now_epoch),
+            PromptDelivery::OverdueSuspect
+        );
+        assert_eq!(PromptDelivery::OverdueSuspect.as_str(), "undelivered");
+    }
+
+    #[test]
+    fn record_prompt_deliveryは同ペインのactiveエントリだけを更新する() {
+        let path = temp_registry_file("delivery");
+        register_at(&path, sample_record(41));
+        // 別ペインの worker（更新対象外）
+        register_at(&path, sample_record(42));
+
+        // 未達記録
+        WorkerRegistry::mutate_at(&path, |reg| {
+            for e in reg.workers.values_mut() {
+                if e.pane == 41 {
+                    e.prompt_delivery_failed_at = Some(crate::sessions::now_iso());
+                    e.prompt_delivery_failure = Some("choice_dialog".into());
+                }
+            }
+        })
+        .unwrap();
+
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        let failed = reg.workers.values().find(|e| e.pane == 41).unwrap();
+        let other = reg.workers.values().find(|e| e.pane == 42).unwrap();
+        assert_eq!(
+            failed.prompt_delivery_failure.as_deref(),
+            Some("choice_dialog")
+        );
+        assert!(other.prompt_delivery_failed_at.is_none(), "別ペインは無傷");
+
+        // 未達 worker にだけ再送コマンドが出る
+        let now_epoch = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap();
+        assert_eq!(
+            prompt_delivery_assessment(failed, now_epoch),
+            PromptDelivery::OverdueSuspect
+        );
+        assert_eq!(
+            resend_command(failed).as_deref(),
+            Some("tako send --pane 41 '<同じ依頼文>'")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn list_payloadは未達workerにだけ再送コマンドを出す() {
+        let mut reg = WorkerRegistry::default();
+        reg.workers.insert(
+            "1".into(),
+            WorkerEntry {
+                agent: "claude".into(),
+                status: "active".into(),
+                pane: 7,
+                spawned_at: crate::sessions::now_iso(),
+                session_id: Some("sid".into()),
+                prompt_delivery_failed_at: Some(crate::sessions::now_iso()),
+                prompt_delivery_failure: Some("choice_dialog".into()),
+                ..Default::default()
+            },
+        );
+        reg.workers.insert(
+            "2".into(),
+            WorkerEntry {
+                agent: "claude".into(),
+                status: "active".into(),
+                pane: 8,
+                spawned_at: crate::sessions::now_iso(),
+                prompt_delivered_at: Some(crate::sessions::now_iso()),
+                ..Default::default()
+            },
+        );
+        let payload = list_payload(&reg, &[], &[], false);
+        let items = payload["workers"].as_array().unwrap();
+        let undelivered = items.iter().find(|w| w["pane"] == 7).unwrap();
+        let delivered = items.iter().find(|w| w["pane"] == 8).unwrap();
+        assert_eq!(undelivered["prompt_delivery"], "undelivered");
+        assert_eq!(undelivered["prompt_delivery_failure"], "choice_dialog");
+        assert!(
+            undelivered["resend_command"].is_string(),
+            "再送コマンドを提示"
+        );
+        assert_eq!(delivered["prompt_delivery"], "delivered");
+        assert!(
+            delivered["resend_command"].is_null(),
+            "到達済みには出さない"
         );
     }
 
