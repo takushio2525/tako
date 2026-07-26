@@ -97,12 +97,9 @@ pub fn detect_permission_dialog(lines: &[String]) -> Option<PermissionDialog> {
         };
 
         // 番号付き選択肢行: 「N. テキスト」（N=1〜9）
-        let is_numbered_choice = inner.len() > 2
-            && inner.as_bytes()[0].is_ascii_digit()
-            && inner.as_bytes()[1] == b'.'
-            && inner.as_bytes()[2] == b' ';
+        let numbered = is_numbered_choice(inner);
 
-        if is_numbered_choice {
+        if numbered {
             in_choices = true;
             if is_highlighted {
                 highlighted = Some(options.len());
@@ -134,6 +131,51 @@ pub fn detect_permission_dialog(lines: &[String]) -> Option<PermissionDialog> {
         options,
         highlighted,
     })
+}
+
+/// 番号付き選択肢の本文か（「N. テキスト」。N は 1 桁の数字）。
+/// 選択カーソル（`❯` / `›` / `>`）は呼び出し側で剥がしてから渡す
+fn is_numbered_choice(inner: &str) -> bool {
+    inner.len() > 2
+        && inner.as_bytes()[0].is_ascii_digit()
+        && inner.as_bytes()[1] == b'.'
+        && inner.as_bytes()[2] == b' '
+}
+
+/// 番号付き選択ダイアログが表示されているか（Issue #530）。
+///
+/// **文言ではなく構造で判定する**のが要点。`is_trust_dialog` / `is_bypass_dialog` は
+/// 既知の文言に依存するため、未知のダイアログを素通りさせる。実際 `CLAUDE_CONFIG_DIR`
+/// を切り替えた初回起動では claude がテーマ選択（`❯ 2. Dark mode ✔`）とログイン方法選択
+/// （`❯ 1. Claude account with subscription …`）を出し、これらの選択カーソル行が
+/// 入力欄（`❯`）と同じ字面のため `input_line` が「入力欄あり」と誤認していた。
+/// その結果プロンプトがダイアログに食われて消え、後段の「入力欄が空 = 送信成功」判定が
+/// 偽陽性になる（#530 の根因）。
+///
+/// 判定条件は「画面最下部のプロンプト行の内容が `N. …` の形」かつ
+/// 「画面に番号付き選択肢が 2 つ以上ある」。単発の `1. ` 入力や、応答本文中の
+/// 箇条書き（最下部の入力欄は空）を誤ってダイアログ扱いしない
+pub fn is_choice_dialog(lines: &[String]) -> bool {
+    let Some(bottom) = bottom_prompt_content(lines) else {
+        return false;
+    };
+    if !is_numbered_choice(bottom) {
+        return false;
+    }
+    lines
+        .iter()
+        .filter(|l| {
+            let t = l.trim();
+            let inner = t
+                .strip_prefix("❯ ")
+                .or_else(|| t.strip_prefix("› "))
+                .or_else(|| t.strip_prefix("> "))
+                .unwrap_or(t)
+                .trim_start();
+            is_numbered_choice(inner)
+        })
+        .count()
+        >= 2
 }
 
 /// 罫線ボックスの境界行か（罫線文字と空白のみで構成される非空行）。
@@ -169,6 +211,10 @@ fn is_box_rule(desc: &str) -> bool {
 pub enum ClaudeScreen {
     /// 信頼確認ダイアログ表示中（キー入力はダイアログに食われる。プロンプト送信不可）
     TrustDialog,
+    /// 番号付き選択ダイアログ表示中（テーマ選択・ログイン方法選択等。Issue #530）。
+    /// 信頼ダイアログと同様にキー入力を食うのでプロンプト送信不可。ただし内容が
+    /// 不明なため自動承諾はしない（勝手に選択を確定させると意図しない設定が入る）
+    ChoiceDialog,
     /// 入力欄（❯）が空で送信可能
     Ready,
     /// 入力欄にテキストが残っている（Enter が「送信」と解釈されなかった等）
@@ -184,6 +230,9 @@ pub enum ClaudeScreen {
 pub fn detect(lines: &[String]) -> ClaudeScreen {
     if is_trust_dialog(lines) {
         return ClaudeScreen::TrustDialog;
+    }
+    if is_choice_dialog(lines) {
+        return ClaudeScreen::ChoiceDialog;
     }
     match input_line(lines) {
         Some(content) if input_content_is_empty(content) => ClaudeScreen::Ready,
@@ -232,8 +281,20 @@ pub fn is_bypass_dialog(lines: &[String]) -> bool {
 /// プロンプト文字は claude `❯` / codex `›` / agy `>` の和集合（Issue #120）。
 /// ASCII の `>` はシェルの PS2・リダイレクト・引用と衝突しうるため
 /// 「`>` 単独 or `> `＋内容」の形のみ入力欄とみなす。
-/// プロンプト行が無ければ None（エージェント TUI ではない）
+/// プロンプト行が無ければ None（エージェント TUI ではない）。
+///
+/// 番号付き選択ダイアログ（`is_choice_dialog`）の選択カーソルは同じ字面だが
+/// 入力欄ではないため None を返す（Issue #530。ここを Some で返していたため
+/// プロンプトがダイアログに食われていた）
 pub fn input_line(lines: &[String]) -> Option<&str> {
+    if is_choice_dialog(lines) {
+        return None;
+    }
+    bottom_prompt_content(lines)
+}
+
+/// 画面最下部のプロンプト記号行の内容（選択ダイアログのガード無し。内部用）
+fn bottom_prompt_content(lines: &[String]) -> Option<&str> {
     lines.iter().rev().find_map(|l| prompt_content(l))
 }
 
@@ -466,10 +527,22 @@ pub fn deliver_via_tmux(
             std::thread::sleep(Duration::from_millis(700));
             continue;
         }
-        if input_line(&lines).is_some() {
-            break; // claude TUI の入力欄あり → 貼り付け可
+        // 未知の番号付き選択ダイアログ（テーマ選択・ログイン方法選択等。#530）。
+        // 内容が不明なため自動承諾はせず、消えるまで待つ。ここで貼るとテキストが
+        // ダイアログに食われて消え、後段の空検証が偽陽性になる。
+        // Enter 単独送達（text 空。#95）は「Enter を送れ」という明示要求なので対象外
+        let choice_dialog = !text.is_empty() && is_choice_dialog(&lines);
+        if !choice_dialog && input_line(&lines).is_some() {
+            break; // エージェント TUI の入力欄あり → 貼り付け可
         }
         if Instant::now() >= ready_deadline {
+            if choice_dialog {
+                return Err(
+                    "選択ダイアログ（テーマ・ログイン方法等）が表示されたままで入力欄が現れない\
+                     （タイムアウト）。ペインで選択を確定してから再送する"
+                        .into(),
+                );
+            }
             if wait_ready {
                 return Err("claude TUI の入力欄（❯）が現れない（タイムアウト）".into());
             }
@@ -506,11 +579,13 @@ pub fn deliver_via_tmux(
     // ③ 反映確認（最大 3 秒）: 入力欄 or 画面のどこかに断片が見えるまで
     let head = prompt_head(text);
     let reflect_deadline = Instant::now() + Duration::from_secs(3);
+    let mut reflected = false;
     while Instant::now() < reflect_deadline {
         let lines = tako_core::tmux::capture_session(socket, session)?;
         if text_in_input(&lines, text)
             || (!head.is_empty() && lines.iter().any(|l| l.contains(head.as_str())))
         {
+            reflected = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -521,12 +596,15 @@ pub fn deliver_via_tmux(
     std::thread::sleep(Duration::from_millis(400));
     tako_core::tmux::send_key(socket, session, "Enter")?;
 
-    // ⑤ 検証: 入力欄が空へ戻ったか。残っていれば Enter を単独再送（最大 4 回）
+    // ⑤ 検証: 入力欄が空へ戻ったか。残っていれば Enter を単独再送（最大 4 回）。
+    //    **入力欄が空であること単体は送信の証拠にならない**（貼り付け自体が届いて
+    //    いなければ最初から空。Issue #530 の偽陽性）。③ で反映を確認できたときのみ
+    //    verified を立てる
     loop {
         std::thread::sleep(Duration::from_millis(700));
         let lines = tako_core::tmux::capture_session(socket, session)?;
         if !input_residual(&lines, text) {
-            report.verified = true;
+            report.verified = reflected;
             return Ok(report);
         }
         if report.enter_retries >= 4 {
@@ -1095,6 +1173,111 @@ Bash ツールで「touch /tmp/te439/approval-test.txt」を実行して
         assert!(!is_box_rule(""));
         assert!(!is_box_rule("Bash command"));
         assert!(!is_box_rule("Allow this command?"));
+    }
+
+    // --- #530: CLAUDE_CONFIG_DIR 切替時の初回ダイアログ（実採取。claude v2.1.220） ---
+
+    /// 新しい CLAUDE_CONFIG_DIR で claude を起動した初回に出るテーマ選択。
+    /// 選択カーソルが入力欄と同じ `❯` のため、旧実装は「入力欄あり」と誤認して
+    /// プロンプトをここへ貼り、ダイアログに食わせて消していた（#530 の根因）
+    const THEME_CHOICE: &str = r#"Welcome to Claude Code v2.1.220
+ Let's get started.
+ Choose the text style that looks best with your terminal
+ To change this later, run /theme
+   1. Auto (match terminal)
+ ❯ 2. Dark mode ✔
+   3. Light mode
+   4. Dark mode (colorblind-friendly)
+   5. Light mode (colorblind-friendly)
+   6. Dark mode (ANSI colors only)
+   7. Light mode (ANSI colors only)
+ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+  1  function greet() {
+  2 -  console.log("Hello, World!");
+  2 +  console.log("Hello, Claude!");
+  3  }
+ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+  Syntax theme: Monokai Extended (ctrl+t to disable)"#;
+
+    /// テーマ選択の次に出るログイン方法選択（未認証の config dir）
+    const LOGIN_CHOICE: &str = r#"Welcome to Claude Code v2.1.220
+ Claude Code can be used with your Claude subscription or billed based on API usage through your
+ Console account.
+ Select login method:
+ ❯ 1. Claude account with subscription · Pro, Max, Team, or Enterprise
+   2. Anthropic Console account · API usage billing
+   3. 3rd-party platform · Amazon Bedrock, Microsoft Foundry, or Vertex AI"#;
+
+    #[test]
+    fn 初回テーマ選択を入力欄と誤認しない() {
+        let lines = screen(THEME_CHOICE);
+        assert!(is_choice_dialog(&lines), "選択ダイアログとして検出する");
+        // 旧実装はここで Some("2. Dark mode ✔") を返し、プロンプトを貼って食わせていた
+        assert_eq!(input_line(&lines), None, "入力欄としては返さない");
+        assert_eq!(detect(&lines), ClaudeScreen::ChoiceDialog);
+        // 文言ベースの既存判定では拾えない（構造判定が必要な理由の固定）
+        assert!(!is_trust_dialog(&lines));
+        assert!(!is_bypass_dialog(&lines));
+    }
+
+    #[test]
+    fn ログイン方法選択を入力欄と誤認しない() {
+        let lines = screen(LOGIN_CHOICE);
+        assert!(is_choice_dialog(&lines));
+        assert_eq!(input_line(&lines), None);
+        assert_eq!(detect(&lines), ClaudeScreen::ChoiceDialog);
+        assert!(!is_trust_dialog(&lines));
+    }
+
+    #[test]
+    fn 選択ダイアログでは残留判定が常にfalseになる() {
+        // 貼り付けたテキストはダイアログに食われて画面に出ない。旧実装は
+        // 「入力欄に残っていない = 送信成功」と判定していた（偽陽性の構造）。
+        // input_line が None になることで text_in_input / input_residual も false になり、
+        // 呼び出し側は「反映を確認できていない」と扱える
+        let lines = screen(THEME_CHOICE);
+        assert!(!text_in_input(&lines, "PROBE530 と 1 行だけ返して"));
+        assert!(!input_residual(&lines, "PROBE530 と 1 行だけ返して"));
+    }
+
+    #[test]
+    fn 通常の入力欄は選択ダイアログと判定しない() {
+        // 空 / プレースホルダ / 入力中のいずれも従来どおり入力欄として扱う
+        assert!(!is_choice_dialog(&screen(READY_PLACEHOLDER)));
+        assert!(!is_choice_dialog(&screen(READY_BARE)));
+        assert!(!is_choice_dialog(&screen(INPUT_PENDING)));
+        assert!(!is_choice_dialog(&screen(CODEX_READY)));
+        assert!(!is_choice_dialog(&screen(AGY_READY)));
+        assert_eq!(detect(&screen(READY_PLACEHOLDER)), ClaudeScreen::Ready);
+        assert_eq!(input_line(&screen(AGY_READY)), Some(""));
+    }
+
+    #[test]
+    fn 応答本文の箇条書きは選択ダイアログと判定しない() {
+        // 会話ログに番号付きリストがあっても、最下部の入力欄が空なら通常画面
+        let lines = screen(
+            "⏺ 手順は次のとおり:\n  1. まず build する\n  2. 次に test する\n\n\
+             ────────────\n❯\n────────────\n  ctx  20% ██░░░░░░░░",
+        );
+        assert!(!is_choice_dialog(&lines));
+        assert_eq!(input_line(&lines), Some(""));
+    }
+
+    #[test]
+    fn 既存の選択ダイアログも構造判定で拾える() {
+        // trust / bypass / permission は専用判定が先に効くが、構造としても選択肢
+        // （= 入力欄ではない）。input_line が None になり誤貼り付けを防ぐ
+        for (name, s) in [
+            ("trust", TRUST_DIALOG),
+            ("bypass", BYPASS_DIALOG),
+            ("permission", CLAUDE_BASH_PERMISSION),
+            ("agy permission", AGY_PERMISSION_DIALOG),
+            ("codex trust", CODEX_TRUST_DIALOG),
+        ] {
+            let lines = screen(s);
+            assert!(is_choice_dialog(&lines), "{name} は選択ダイアログ");
+            assert_eq!(input_line(&lines), None, "{name} は入力欄を返さない");
+        }
     }
 
     #[test]

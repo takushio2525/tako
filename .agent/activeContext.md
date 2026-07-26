@@ -4,11 +4,18 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-26 夜・#511 / #512 でアカウント切替の残欠陥を解消）
+## 現在の対象（2026-07-26 夜・#530 で spawn プロンプト消失を根治）
 
-直近: #548 で `tako orchestrator accounts` を追加し、アカウント系（#511 / #512 / #547 / #548）の
+直近: `fix/530-prompt-delivery` で #530 を根治。根因は疑われていた「シェル段階の誤判定」ではなく
+**claude の番号付き選択ダイアログ（初回テーマ選択 `❯ 2. Dark mode ✔` / ログイン方法選択）の
+選択カーソルを入力欄と誤認していたこと**。`CLAUDE_CONFIG_DIR` を切り替えると初回に必ず出るため、
+account env 注入つき spawn 特有の症状になっていた。`is_choice_dialog`（文言非依存の構造判定）を
+新設して `input_line` から除外し、送達の証拠を「入力欄が空」から「貼り付けが入力欄へ反映された」へ
+変更。未達は `prompt_delivery=undelivered` + `prompt_delivery_failure` + `resend_command` で報告する。
+
+その前: #548 で `tako orchestrator accounts` を追加し、アカウント系（#511 / #512 / #547 / #548）の
 欠落は全て解消。#547 で master_account を master / solo / handoff の起動へ適用。
-その前に `fix/511-512-account-polish` で CLI `spawn/run --account`（#511）と
+さらに前に `fix/511-512-account-polish` で CLI `spawn/run --account`（#511）と
 accounts.yaml の `inherit: true`（#512。既定パス明示 → Keychain 別エントリ問題の根治）を実装。
 **ローカル accounts.yaml の personal を inherit 形式へ更新済み → 古いバイナリでは
 パースできないので tako の再起動が必須**。`~/.claude-univ` を検証事故で失っており、
@@ -43,6 +50,10 @@ open PR は現時点でゼロ。
 
 - #496 のカード描画（コンフリクトカード / マージ確認カード / 狭幅 220pt）の**目視のみ**未確認。
   実装・CLI・dispatch・MCP・ペイン読み取りでの検証は完了済み
+- `claude_tui_e2e`（#32 系。`--ignored` の手動実行専用）が **main 時点で 2 件落ちている**:
+  `事前信頼でダイアログなしの送達が通る` / `残留テキストをenter単独送達で送信できる`。
+  どちらも `ensure_trusted` を書いたのに信頼ダイアログが出る（claude v2.1.220 で
+  `hasTrustDialogAccepted` だけでは足りなくなった疑い）。#530 の変更前後で同一結果 = 回帰ではない
 
 ## GUI 検証の環境知見（#496 で判明。次回の時間浪費を防ぐ）
 
@@ -63,3 +74,5 @@ open PR は現時点でゼロ。
 - 新機能を足す: `crates/tako-core/src/platform/support.rs` の MATRIX に必ず分類を足す
   （忘れるとパリティテスト T1 / T3 が落ちて merge できない）
 - git タブに手を入れる: `crates/tako-app/src/right_panel.rs` の `GitScrollBody`（#494 構造不変条件）
+- プロンプト送達に手を入れる: `crates/tako-control/src/claude_tui.rs`（画面判定の純関数）+
+  `main.rs` の `drive_prompt_flows`。遷移診断は `TAKO_PROMPT_FLOW_DEBUG=1`（画面内容は出さない）
