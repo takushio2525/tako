@@ -221,6 +221,20 @@ impl FileTree {
         }
     }
 
+    /// 1 ディレクトリだけ即座に読み直す（#559。新規作成・リネームの直後に呼び、
+    /// 2 秒ポーリングを待たずに結果を見せる）。ディレクトリ 1 個の read_dir なので
+    /// UI スレッドで同期に呼んでよい（`expand_dir` と同じ扱い）
+    pub fn refresh_dir(&mut self, dir: &Path) {
+        if !self.cache.contains_key(dir) && !self.roots.iter().any(|r| r == dir) {
+            return;
+        }
+        let fresh = read_dir_sorted(dir);
+        if self.cache.get(dir) != Some(&fresh) {
+            self.cache.insert(dir.to_path_buf(), fresh);
+            self.rows_cache = None;
+        }
+    }
+
     /// 同期 refresh（テスト用。本番は refresh_targets → scan_dirs → apply_refresh）
     #[cfg(test)]
     pub fn refresh(&mut self) -> bool {
@@ -555,6 +569,21 @@ mod tests {
         // 同じ集合をポーリングで再同期しても並びは変わらない
         assert!(!tree.set_roots(vec![home.clone(), project.clone()]));
         assert_eq!(tree.roots(), &[project, home]);
+        remove_temp_dir(&dir);
+    }
+
+    /// #559: 新規作成の直後に該当ディレクトリだけ読み直せる
+    #[test]
+    fn refresh_dirは対象ディレクトリだけ読み直す() {
+        let dir = fixture("t7");
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![dir.clone()]);
+        std::fs::write(dir.join("created.txt"), "x").unwrap();
+        assert!(!tree.rows().iter().any(|r| r.entry.name == "created.txt"));
+        tree.refresh_dir(&dir);
+        assert!(tree.rows().iter().any(|r| r.entry.name == "created.txt"));
+        // 未知のディレクトリは無視（キャッシュを作らない）
+        tree.refresh_dir(Path::new("/no/such/dir"));
         remove_temp_dir(&dir);
     }
 

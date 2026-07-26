@@ -6,6 +6,38 @@ use tako_core::PaneId;
 
 use super::*;
 
+/// 新規作成のインライン入力欄を表す仮行のファイル名（#559）。
+/// 行の判定は挿入位置（index）で行うのでパスは表示にも一致判定にも使わない
+const INLINE_NEW_MARKER: &str = "__tako_inline_new__";
+
+/// 新規作成のインライン入力欄を差し込む場所（#559）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InlineInsertSlot {
+    /// 作成先ディレクトリの行番号（挿入前の rows における位置）
+    pub parent_index: usize,
+    /// 入力欄の行番号（挿入後の rows における位置）
+    pub row_index: usize,
+    /// 入力欄の深さ（= 作成先の子と同じ）
+    pub depth: usize,
+}
+
+/// 入力欄を **作成先ディレクトリ行の真下** に、その子と同じ深さで置く（#559）。
+///
+/// 旧実装は「展開済み子孫をすべて飛ばした末尾」へ入れていたため、深い木では
+/// 入力欄が親から何十行も離れた位置に出て「どこに作られるのか」が読めなかった。
+/// VSCode と同じく親の直下に置き、深さも親 +1 に揃える
+pub(crate) fn inline_insert_position(
+    rows: &[filetree::Row],
+    parent: &std::path::Path,
+) -> Option<InlineInsertSlot> {
+    let parent_index = rows.iter().position(|r| r.entry.path == parent)?;
+    Some(InlineInsertSlot {
+        parent_index,
+        row_index: parent_index + 1,
+        depth: rows[parent_index].depth + 1,
+    })
+}
+
 impl TakoApp {
     pub(crate) fn sync_filetree_roots(&mut self) {
         if !self.filetree.visible {
@@ -106,47 +138,27 @@ impl TakoApp {
         let open_paths: std::collections::HashSet<std::path::PathBuf> =
             self.previews.values().map(|p| p.path.clone()).collect();
         let mut rows = self.filetree.rows();
-        // 新規ファイル/フォルダ用の仮行を親の直後に挿入
-        let inline_new_insert = match &self.inline_edit {
-            Some(edit) if edit.kind != InlineEditKind::Rename => {
-                let parent = &edit.parent;
-                // 親ディレクトリの子の末尾（展開済み子孫をすべて飛ばした直後）に挿入
-                let insert_pos =
-                    rows.iter()
-                        .position(|r| r.entry.path == *parent)
-                        .map(|parent_idx| {
-                            let parent_depth = rows[parent_idx].depth;
-                            let mut end = parent_idx + 1;
-                            while end < rows.len() && rows[end].depth > parent_depth {
-                                end += 1;
-                            }
-                            end
-                        });
-                insert_pos.map(|pos| {
-                    let depth = rows
-                        .get(pos.saturating_sub(1))
-                        .filter(|r| r.entry.path == *parent)
-                        .map(|r| r.depth + 1)
-                        .unwrap_or_else(|| {
-                            rows.get(pos.saturating_sub(1))
-                                .map(|r| r.depth)
-                                .unwrap_or(1)
-                        });
-                    (pos, depth)
-                })
-            }
-            _ => None,
-        };
-        if let (Some((pos, depth)), Some(edit)) = (inline_new_insert, self.inline_edit.as_ref()) {
+        let inline_new_insert = self
+            .inline_edit
+            .as_ref()
+            .filter(|edit| edit.kind != InlineEditKind::Rename)
+            .and_then(|edit| inline_insert_position(&rows, &edit.parent));
+        // 作成先ハイライトの対象パス（入力欄そのものではなく親の行）
+        let inline_parent_path = inline_new_insert
+            .and_then(|slot| rows.get(slot.parent_index))
+            .map(|r| r.entry.path.clone());
+        // 挿入後の行番号（入力欄の判定はパスではなく位置で行う）
+        let inline_row_index = inline_new_insert.map(|slot| slot.row_index);
+        if let (Some(slot), Some(edit)) = (inline_new_insert, self.inline_edit.as_ref()) {
             rows.insert(
-                pos,
+                slot.row_index,
                 filetree::Row {
                     entry: filetree::Entry {
-                        path: edit.parent.join("__inline_new__"),
+                        path: edit.parent.join(INLINE_NEW_MARKER),
                         name: String::new(),
                         is_dir: edit.kind == InlineEditKind::NewDir,
                     },
-                    depth,
+                    depth: slot.depth,
                     expanded: false,
                     root: false,
                     git_status: None,
@@ -356,19 +368,17 @@ impl TakoApp {
                                 Some(edit) if edit.kind == InlineEditKind::Rename => {
                                     path == edit.parent
                                 }
-                                Some(edit) if path == edit.parent.join("__inline_new__") => true,
-                                _ => false,
+                                Some(_) => Some(index) == inline_row_index,
+                                None => false,
                             };
                             if let (true, Some(edit)) = (is_inline, inline_edit_snapshot.as_ref()) {
-                                let depth = row.depth;
-                                let indent = 8.0 + 12.0 * depth as f32;
                                 // 種別アイコン（絵文字全廃 #217: SVG マスク描画）
                                 let icon_path = match edit.kind {
                                     InlineEditKind::Rename => {
                                         if is_dir {
                                             Some(file_icons::ui_icon::FOLDER)
                                         } else {
-                                            None
+                                            Some(file_icons::ui_icon::FILE_GENERIC)
                                         }
                                     }
                                     InlineEditKind::NewFile => {
@@ -376,47 +386,103 @@ impl TakoApp {
                                     }
                                     InlineEditKind::NewDir => Some(file_icons::ui_icon::FOLDER),
                                 };
+                                let placeholder = match edit.kind {
+                                    InlineEditKind::Rename => {
+                                        crate::ui_text::sidebar::rename_placeholder()
+                                    }
+                                    InlineEditKind::NewFile => {
+                                        crate::ui_text::sidebar::new_file_placeholder()
+                                    }
+                                    InlineEditKind::NewDir => {
+                                        crate::ui_text::sidebar::new_dir_placeholder()
+                                    }
+                                };
                                 let before_cursor = &edit.text[..edit.cursor];
                                 let after_cursor = &edit.text[edit.cursor..];
+                                let empty = edit.text.is_empty();
+                                // #559: インデントは通常行とまったく同じ規則で置く
+                                // （ml 17*depth + 左ガイド線 + pl 13）。ここが揃っていないと
+                                // 「どの階層に作られるのか」が読めない
                                 return div()
                                     .id(("filetree-row", index as u64))
                                     .flex()
                                     .flex_row()
                                     .items_center()
                                     .gap(px(4.0))
-                                    .w_full()
-                                    .px_1()
-                                    .pl(px(indent))
-                                    .bg(rgba_alpha(theme.tab_active_background, 0.8))
+                                    .py(px(1.0))
+                                    .when(row.depth >= 1, |d| {
+                                        d.ml(px(17.0 * row.depth as f32))
+                                            .border_l_1()
+                                            .border_color(hsla(theme.accent))
+                                            .pl(px(13.0))
+                                    })
+                                    .when(row.depth == 0, |d| d.pl(px(12.0)))
+                                    .pr(px(6.0))
+                                    // chevron 分のスペーサー（兄弟行とアイコン位置を揃える）
+                                    .child(div().w(px(14.0)).flex_none())
                                     .children(icon_path.map(|p| {
                                         svg()
                                             .path(p)
-                                            .size(px(14.0))
+                                            .size(px(16.0))
                                             .flex_none()
-                                            .text_color(hsla(theme.text_muted))
+                                            .text_color(hsla(theme.accent))
                                     }))
                                     .child(
                                         div()
                                             .flex_1()
+                                            .min_w(px(0.0))
                                             .flex()
                                             .flex_row()
+                                            .items_center()
                                             .border_1()
                                             .border_color(hsla(theme.accent))
                                             .rounded_sm()
-                                            .px(px(2.0))
+                                            .px(px(3.0))
+                                            .py(px(1.0))
                                             .bg(rgba(theme.background))
-                                            .child(SharedString::from(before_cursor.to_string()))
-                                            .child(
-                                                div()
-                                                    .w(px(1.0))
-                                                    .h(px(14.0))
-                                                    .bg(hsla(theme.foreground))
-                                                    .flex_none(),
-                                            )
-                                            .child(SharedString::from(after_cursor.to_string())),
+                                            .shadow(vec![BoxShadow {
+                                                color: hsla_alpha(theme.accent, 0.35),
+                                                offset: point(px(0.), px(0.)),
+                                                blur_radius: px(0.),
+                                                spread_radius: px(1.),
+                                                inset: false,
+                                            }])
+                                            .when(empty, |d| {
+                                                d.child(
+                                                    div()
+                                                        .w(px(1.5))
+                                                        .h(px(13.0))
+                                                        .bg(hsla(theme.accent))
+                                                        .flex_none(),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .pl(px(3.0))
+                                                        .text_color(hsla(theme.text_muted))
+                                                        .child(SharedString::from(
+                                                            placeholder.to_string(),
+                                                        )),
+                                                )
+                                            })
+                                            .when(!empty, |d| {
+                                                d.child(SharedString::from(
+                                                    before_cursor.to_string(),
+                                                ))
+                                                .child(
+                                                    div()
+                                                        .w(px(1.5))
+                                                        .h(px(13.0))
+                                                        .bg(hsla(theme.accent))
+                                                        .flex_none(),
+                                                )
+                                                .child(SharedString::from(after_cursor.to_string()))
+                                            }),
                                     );
                             }
                             let is_open = !is_dir && open_paths.contains(&path);
+                            // #559: 作成先の親ディレクトリ行を強調し「ここの直下に作る」を明示する
+                            let is_inline_parent =
+                                inline_parent_path.as_ref().is_some_and(|p| *p == path);
                             let drag_path = path.clone();
                             let base = div()
                                 .id(("filetree-row", index as u64))
@@ -425,6 +491,10 @@ impl TakoApp {
                                 .items_center()
                                 .py(px(1.0))
                                 .cursor_pointer()
+                                .when(is_inline_parent, |d| {
+                                    d.bg(rgba_alpha(theme.accent, 0.16))
+                                        .text_color(hsla(theme.foreground))
+                                })
                                 .hover(|d| d.bg(rgba(theme.surface_hover)))
                                 .on_click(cx.listener({
                                     let ctx_path = path.clone();
@@ -925,16 +995,33 @@ impl TakoApp {
             InlineEditKind::NewFile => (FileOpKind::CreateFile, edit.parent.display().to_string()),
             InlineEditKind::NewDir => (FileOpKind::CreateDir, edit.parent.display().to_string()),
         };
-        let _ = tako_control::dispatch(
+        let result = tako_control::dispatch(
             self,
             Request::FileOp {
                 op,
                 path: path_str,
-                name: Some(name),
+                name: Some(name.clone()),
                 pane: None,
             },
             PaneOrigin::User,
         );
+        if result.is_ok() {
+            // #550 × #559: ドット始まりを作ったのに非表示設定で消える（= 何も起きて
+            // いないように見える）のを防ぐ。明示的に作った物は必ず見せる
+            if filetree::is_hidden_name(&name) && !self.filetree.show_hidden() {
+                self.toggle_hidden_files(cx);
+            }
+            // #559: 2 秒ポーリングを待たず、作った項目を正しい並び順の位置へ即座に出す
+            let dir = match edit.kind {
+                InlineEditKind::Rename => edit
+                    .parent
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| edit.parent.clone()),
+                _ => edit.parent.clone(),
+            };
+            self.filetree.refresh_dir(&dir);
+        }
         self.sync_filetree_roots();
         cx.notify();
     }
@@ -1494,4 +1581,53 @@ fn pick_app_and_open(path: &std::path::Path) -> Result<(), String> {
     use tako_control::platform::os_integration as os;
     let app = os::pick_application()?;
     os::open_with(&app.to_string_lossy(), path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn row(path: &str, depth: usize, root: bool) -> filetree::Row {
+        let path = PathBuf::from(path);
+        filetree::Row {
+            entry: filetree::Entry {
+                name: path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                path,
+                is_dir: true,
+            },
+            depth,
+            expanded: true,
+            root,
+            git_status: None,
+        }
+    }
+
+    /// #559: 入力欄は作成先の**真下**・親 +1 の深さ。展開済み子孫の末尾ではない
+    #[test]
+    fn インライン入力は作成先の直下に親と揃った深さで入る() {
+        // /r (root) ├ /r/sub ├ /r/sub/deep ├ /r/sub/deep/x ├ /r/sub/z.txt └ /r/other
+        let rows = vec![
+            row("/r", 0, true),
+            row("/r/sub", 1, false),
+            row("/r/sub/deep", 2, false),
+            row("/r/sub/deep/x", 3, false),
+            row("/r/sub/z.txt", 2, false),
+            row("/r/other", 1, false),
+        ];
+        let slot = inline_insert_position(&rows, std::path::Path::new("/r/sub")).unwrap();
+        assert_eq!(slot.parent_index, 1);
+        assert_eq!(slot.row_index, 2, "sub の真下（deep の手前）");
+        assert_eq!(slot.depth, 2, "sub の子と同じ深さ");
+
+        // ルート見出しを作成先にした場合は深さ 1
+        let slot = inline_insert_position(&rows, std::path::Path::new("/r")).unwrap();
+        assert_eq!((slot.parent_index, slot.row_index, slot.depth), (0, 1, 1));
+
+        // 折りたたみ中などで作成先が行に無ければ入力欄は出さない
+        assert!(inline_insert_position(&rows, std::path::Path::new("/r/none")).is_none());
+    }
 }

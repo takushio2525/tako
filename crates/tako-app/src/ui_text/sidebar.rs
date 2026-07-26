@@ -36,13 +36,25 @@ pub fn menu_remove_root() -> &'static str {
     tr!("ツリーから除去", "Remove from tree")
 }
 
-// --- ヘッダ / 右クリックの表示トグル（#550。キー: sidebar.hidden_*） ---
+// --- ヘッダのトグル（#550。キー: sidebar.hidden_*） ---
 
 pub fn hidden_show() -> &'static str {
     tr!("隠しファイルを表示", "Show hidden files")
 }
 pub fn hidden_hide() -> &'static str {
     tr!("隠しファイルを隠す", "Hide hidden files")
+}
+
+// --- 新規作成のインライン入力（#559。キー: sidebar.new_*） ---
+
+pub fn new_file_placeholder() -> &'static str {
+    tr!("ファイル名", "File name")
+}
+pub fn new_dir_placeholder() -> &'static str {
+    tr!("フォルダ名", "Folder name")
+}
+pub fn rename_placeholder() -> &'static str {
+    tr!("新しい名前", "New name")
 }
 
 // --- プレビュー編集の通知（FR-3.5。キー: sidebar.note_*） ---
@@ -82,6 +94,9 @@ mod tests {
                 menu_remove_root().to_string(),
                 hidden_show().to_string(),
                 hidden_hide().to_string(),
+                new_file_placeholder().to_string(),
+                new_dir_placeholder().to_string(),
+                rename_placeholder().to_string(),
                 note_save_before_mode_switch().to_string(),
                 note_external_change().to_string(),
             ]

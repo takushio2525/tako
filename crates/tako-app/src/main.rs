@@ -23635,6 +23635,71 @@ mod self_test {
                 }
             }
 
+            // 84. 新規作成のインライン入力が作成先の直下に正しい深さで出る (#559)。
+            // 実機の合成キーボード入力は IME に吸われるため、項目 79 / 82 と同じく
+            // キーストローク経路を直接叩く。検証点: 入力欄の位置（親の真下）と深さ、
+            // 確定で実体が生まれること、確定直後にツリーへ反映されること
+            {
+                let fixture =
+                    std::env::temp_dir().join(format!("tako-st559-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&fixture);
+                let _ = std::fs::create_dir_all(fixture.join("sub/deep"));
+                let _ = std::fs::write(fixture.join("sub/z-last.txt"), "x");
+                let sub = fixture.join("sub");
+                let st559 = window
+                    .update(cx, |app, _, cx| {
+                        app.filetree.set_show_hidden(false);
+                        app.filetree.set_roots(vec![fixture.clone()]);
+                        app.filetree.expand_dir(&sub);
+                        app.filetree.expand_dir(&fixture.join("sub/deep"));
+                        // sub を作成先に指定して新規ファイルのインライン入力を開く
+                        app.handle_context_action("new-file", &sub, true, cx);
+                        let opened = app
+                            .inline_edit
+                            .as_ref()
+                            .is_some_and(|e| e.parent == sub && e.kind == InlineEditKind::NewFile);
+                        // 挿入位置は render が使う純関数そのもので検証する
+                        let rows = app.filetree.rows();
+                        let parent_idx = rows.iter().position(|r| r.entry.path == sub).unwrap_or(0);
+                        let slot = crate::sidebar::inline_insert_position(&rows, &sub);
+                        // 入力欄は親（深さ 1）の真下・深さ 2。末尾（deep / z-last.txt の後）ではない
+                        let insert_ok = slot.is_some_and(|s| {
+                            s.parent_index == parent_idx
+                                && s.row_index == parent_idx + 1
+                                && s.depth == 2
+                        });
+                        // 名前を打ち込んで Enter で確定
+                        for ch in ["a", "b", "c", ".", "t", "x", "t"] {
+                            app.handle_inline_edit_key(
+                                &Keystroke {
+                                    modifiers: Modifiers::default(),
+                                    key: ch.to_string(),
+                                    key_char: Some(ch.to_string()),
+                                },
+                                cx,
+                            );
+                        }
+                        let typed = app.inline_edit.as_ref().is_some_and(|e| e.text == "abc.txt");
+                        app.handle_inline_edit_key(&Keystroke::parse("enter").unwrap(), cx);
+                        let closed = app.inline_edit.is_none();
+                        let created = sub.join("abc.txt").is_file();
+                        // ポーリングを待たずツリーへ反映され、sub の子として並ぶ
+                        let rows = app.filetree.rows();
+                        let listed = rows
+                            .iter()
+                            .any(|r| r.entry.name == "abc.txt" && r.depth == 2);
+                        opened && insert_ok && typed && closed && created && listed
+                    })
+                    .unwrap_or(false);
+                check(
+                    st559,
+                    "ファイルツリー: 新規作成の入力欄が作成先直下に出て確定が即反映される (#559)",
+                );
+                if fixture.starts_with(std::env::temp_dir()) {
+                    let _ = std::fs::remove_dir_all(&fixture);
+                }
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
