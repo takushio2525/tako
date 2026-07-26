@@ -1627,6 +1627,7 @@ pub fn tools() -> Vec<Value> {
                         "enum": ["bugfix-rooted", "bugfix-unrooted", "investigation", "feature-verifiable", "feature-ui", "docs", "review"],
                         "description": "委任台帳の task_type（省略時は investigation）",
                     },
+                    "account": { "type": "string", "description": "アカウント名（accounts.yaml のキー。この worker だけ該当 config dir / モデルで起動する。#504）" },
                 },
                 "required": ["project", "prompt"],
                 "additionalProperties": false,
