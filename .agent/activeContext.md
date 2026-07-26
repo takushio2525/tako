@@ -6,7 +6,8 @@
 
 ## 現在の対象（2026-07-26 夜・#511 / #512 でアカウント切替の残欠陥を解消）
 
-直近: `fix/511-512-account-polish` で CLI `spawn/run --account`（#511）と
+直近: #547 で master_account を master / solo / handoff の起動へ適用（`fix/547-master-account`）。
+その前に `fix/511-512-account-polish` で CLI `spawn/run --account`（#511）と
 accounts.yaml の `inherit: true`（#512。既定パス明示 → Keychain 別エントリ問題の根治）を実装。
 **ローカル accounts.yaml の personal を inherit 形式へ更新済み → 古いバイナリでは
 パースできないので tako の再起動が必須**。`~/.claude-univ` を検証事故で失っており、
