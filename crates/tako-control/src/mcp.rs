@@ -654,15 +654,16 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_panel",
             "description": "右サイドバー情報パネルの表示・非表示・幅・ビュー切替と、\
                 左サイドバーのファイルツリーの表示・非表示を操作する（全省略で現在状態の取得）。\
-                view=tmux はタブごとの全ペイン一覧 + 管理外 / kill 漏れ tmux セッションの統合ビュー、\
-                view=git は git graph（実装まではプレースホルダ）。ユーザーに tmux や\
-                エージェントの状況を見せたいとき表示し、邪魔なら隠す。",
+                view の値は GUI のタブ表示名と同じ。view=fleet はタブごとの全ペイン一覧 + \
+                管理外 / kill 漏れ tmux セッションの統合ビュー、view=orch はオーケストレーター俯瞰、\
+                view=git は git。ユーザーにセッションやエージェントの状況を見せたいとき表示し、\
+                邪魔なら隠す。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "visible": { "type": "boolean", "description": "true = 表示、false = 非表示" },
                     "width": { "type": "number", "exclusiveMinimum": 0, "description": "パネル幅（px）" },
-                    "view": { "type": "string", "enum": ["tmux", "orch", "git"], "description": "表示するビュー（orch = オーケストレーター俯瞰。#217）" },
+                    "view": { "type": "string", "enum": ["fleet", "orch", "git", "tmux"], "description": "表示するビュー（GUI のタブ名と同じ。fleet = ペイン / セッション俯瞰、orch = オーケストレーター俯瞰、git = git。tmux は fleet の旧称で後方互換のみ）" },
                     "filetree": { "type": "boolean", "description": "左サイドバーのファイルツリーの表示・非表示" },
                     "sidebar_width": { "type": "number", "exclusiveMinimum": 0, "description": "左サイドバーの幅（px。Issue #307）" },
                 },
@@ -3437,10 +3438,16 @@ fn build_request(
             width: f32_arg(args, "width")?,
             view: match str_arg(args, "view")?.as_deref() {
                 None => None,
-                Some("tmux") => Some(crate::protocol::PanelViewWire::Tmux),
-                Some("orch") => Some(crate::protocol::PanelViewWire::Orch),
-                Some("git") => Some(crate::protocol::PanelViewWire::Git),
-                Some(other) => return Err(format!("view が不正: {other}（tmux | orch | git）")),
+                // 正式値は GUI のタブ表示名と 1:1、旧称 tmux も後方互換で受理する（#553）
+                Some(v) => match crate::protocol::PanelViewWire::parse(v) {
+                    Some(view) => Some(view),
+                    None => {
+                        return Err(format!(
+                            "view が不正: {v}（{}）",
+                            crate::protocol::PanelViewWire::values_hint()
+                        ))
+                    }
+                },
             },
             filetree: bool_arg(args, "filetree")?,
             sidebar_width: f32_arg(args, "sidebar_width")?,

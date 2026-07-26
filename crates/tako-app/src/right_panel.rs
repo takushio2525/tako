@@ -5176,11 +5176,11 @@ impl TakoApp {
                             tab_button(
                                 "fleet",
                                 crate::file_icons::ui_icon::FLEET,
-                                PanelView::Tmux,
-                                view == PanelView::Tmux,
+                                PanelView::Fleet,
+                                view == PanelView::Fleet,
                             )
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.panel_view = PanelView::Tmux;
+                                this.panel_view = PanelView::Fleet;
                                 this.refresh_tmux(cx);
                             })),
                         )
@@ -5234,7 +5234,7 @@ impl TakoApp {
                         ),
                 )
                 .child(match view {
-                    PanelView::Tmux => self.render_tmux_view(cx).into_any_element(),
+                    PanelView::Fleet => self.render_tmux_view(cx).into_any_element(),
                     PanelView::Orch => self.render_orch_view(cx).into_any_element(),
                     PanelView::Git => self.render_git_view(cx).into_any_element(),
                 })

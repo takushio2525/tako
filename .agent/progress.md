@@ -1364,3 +1364,15 @@
 - 検証: 10 連続 spawn で消失ゼロ・registry 全件 delivered、fresh config dir では
   ダイアログを確定させず undelivered(choice_dialog) + 再送コマンド提示。品質ゲート全緑（1360）+
   隔離セルフテスト FAILED 0。`claude_tui_e2e` の 2 件失敗は main 時点で同一 = 回帰ではない
+
+## 2026-07-27（#553: パネルビューの語彙を GUI 表示名へ統一）
+- GUI は fleet / orch / git、CLI / MCP は tmux / orch / git で食い違い、画面に見えている語で
+  操作できなかった。`PanelViewWire::Fleet` を正式値化し、語彙の正本（`VALUES` /
+  `LEGACY_VALUES` / `parse` / `values_hint`）を protocol.rs に集約して CLI・MCP が同じ表から引く形へ。
+  応答 JSON は旧称入力でも `fleet` に正規化。tako-app の `PanelView::Tmux` も `Fleet` へ改称
+- 後方互換: `--view tmux` と MCP `view:"tmux"` は受理継続（`serde(alias)` で IPC の JSON も同様）。
+  不正値は CLI が possible values + 「a similar value exists: 'fleet'」、MCP が
+  「fleet | orch | git。tmux は fleet の旧称」を返す（#553 案 2）
+- 検証: 品質ゲート全緑（1377）+ 隔離セルフテスト FAILED 0 + 隔離インスタンスへの実測
+  （fleet / tmux / git 切替・MCP 3 経路・tools/list の enum）。GUI スクショは蓋閉じで取得不可、
+  代わりにセルフテスト 49 が `app.panel_view == PanelView::Fleet` と応答 `view=="fleet"` を同時判定

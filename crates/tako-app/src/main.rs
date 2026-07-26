@@ -242,12 +242,13 @@ const PIN_W: f32 = 280.0;
 const PIN_H: f32 = 180.0;
 
 /// 右サイドバー情報パネルの内部タブ（固定タブ 0 個方針。2026-06-12）。
-/// FR-2.16.6 で agents は tmux ビューへ統合済み。Git は git graph（FR-3.6）の
-/// 実装までプレースホルダ（パネルは切り替え式コンテナとして設計）
+/// FR-2.16.6 で agents は fleet ビューへ統合済み。
+/// 名前は GUI のタブ表示名 = CLI / MCP の `--view` 値と揃える（#553）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum PanelView {
+    /// GUI の「fleet」タブ（全ペイン一覧 + tmux セッション。旧称 tmux）
     #[default]
-    Tmux,
+    Fleet,
     /// オーケストレーター中心ビュー（#217 カンプの「orch」タブ。master とその
     /// ワーカーツリー・メトリクスを俯瞰する）
     Orch,
@@ -2678,7 +2679,7 @@ impl TakoApp {
                     // 攻撃者特定できるようにする。しきい値超えのみ記録 = 正常時コストほぼゼロ）
                     let tmux_ctx = {
                         let _s = tako_control::diag::perf_span("periodic_prep:tmux_ctx");
-                        if app.panel_visible && app.panel_view == PanelView::Tmux {
+                        if app.panel_visible && app.panel_view == PanelView::Fleet {
                             Some(app.collect_tmux_context())
                         } else {
                             None
@@ -5769,7 +5770,7 @@ impl TakoApp {
                     self.drawer_visible = !self.drawer_visible;
                     cx.notify();
                 }
-                "panel-fleet" => self.toggle_panel_view(PanelView::Tmux, cx),
+                "panel-fleet" => self.toggle_panel_view(PanelView::Fleet, cx),
                 "panel-orch" => self.toggle_panel_view(PanelView::Orch, cx),
                 "panel-git" => self.toggle_panel_view(PanelView::Git, cx),
                 "split-right" => self.split(SplitDirection::Right, cx),
@@ -12807,7 +12808,7 @@ impl UiStateHost for TakoApp {
 
     fn panel_state(&self) -> (bool, f32, tako_control::protocol::PanelViewWire) {
         let view = match self.panel_view {
-            PanelView::Tmux => tako_control::protocol::PanelViewWire::Tmux,
+            PanelView::Fleet => tako_control::protocol::PanelViewWire::Fleet,
             PanelView::Orch => tako_control::protocol::PanelViewWire::Orch,
             PanelView::Git => tako_control::protocol::PanelViewWire::Git,
         };
@@ -12828,7 +12829,7 @@ impl UiStateHost for TakoApp {
         }
         if let Some(view) = view {
             self.panel_view = match view {
-                tako_control::protocol::PanelViewWire::Tmux => PanelView::Tmux,
+                tako_control::protocol::PanelViewWire::Fleet => PanelView::Fleet,
                 tako_control::protocol::PanelViewWire::Orch => PanelView::Orch,
                 tako_control::protocol::PanelViewWire::Git => PanelView::Git,
             };
@@ -12838,7 +12839,7 @@ impl UiStateHost for TakoApp {
             self.clear_text_input_focus();
         }
         // tmux ビューを開いたら一覧を即時更新する（描画通知は dispatch ループが行う）
-        if self.panel_visible && self.panel_view == PanelView::Tmux {
+        if self.panel_visible && self.panel_view == PanelView::Fleet {
             self.refresh_tmux_data();
         }
     }
@@ -14881,7 +14882,7 @@ impl Render for TakoApp {
             .on_action(cx.listener(|this, _: &ToggleTheme, _, cx| this.toggle_theme(cx)))
             .on_action(cx.listener(|this, _: &SwitchLanguage, _, cx| this.toggle_language(cx)))
             .on_action(cx.listener(|this, _: &ShowFleetPanel, _, cx| {
-                this.toggle_panel_view(PanelView::Tmux, cx)
+                this.toggle_panel_view(PanelView::Fleet, cx)
             }))
             .on_action(cx.listener(|this, _: &ShowOrchPanel, _, cx| {
                 this.toggle_panel_view(PanelView::Orch, cx)
@@ -18532,8 +18533,9 @@ mod self_test {
                 eprintln!("（tmux 不在のため項目 48 をスキップ）");
             }
 
-            // 49. 情報パネルの統合 tmux ビュー（FR-2.13 / FR-2.16.6。dispatch の Panel 操作で
-            //     表示 → 一覧更新 → kill の確認フローが畳めること → 非表示）。固定タブ 0 個方針
+            // 49. 情報パネルの fleet ビュー（FR-2.13 / FR-2.16.6。dispatch の Panel 操作で
+            //     表示 → 一覧更新 → kill の確認フローが畳めること → 非表示）。固定タブ 0 個方針。
+            //     応答の view 表記も GUI のタブ表示名（fleet）と一致することを見る（#553）
             let view_ok = window
                 .update(cx, |app, _, cx| {
                     let opened = tako_control::dispatch(
@@ -18541,15 +18543,15 @@ mod self_test {
                         tako_control::protocol::Request::Panel {
                             visible: Some(true),
                             width: Some(320.0),
-                            view: Some(tako_control::protocol::PanelViewWire::Tmux),
+                            view: Some(tako_control::protocol::PanelViewWire::Fleet),
                             filetree: None,
                             sidebar_width: None,
                         },
                         PaneOrigin::Cli,
                     );
                     let opened_ok = matches!(&opened, Ok(v) if v["visible"].as_bool() == Some(true)
-                        && v["view"].as_str() == Some("tmux"));
-                    let shown = app.panel_visible && app.panel_view == PanelView::Tmux;
+                        && v["view"].as_str() == Some("fleet"));
+                    let shown = app.panel_visible && app.panel_view == PanelView::Fleet;
                     // 確認フロー: 存在しないセッションの kill は無害に失敗し pending が畳まれる
                     app.tmux_pending_kill = Some(("tako-no-such-session".into(), None, None));
                     app.tmux_kill_confirmed(cx);
@@ -18569,7 +18571,7 @@ mod self_test {
                     opened_ok && shown && pending_cleared && closed_ok && !app.panel_visible
                 })
                 .unwrap_or(false);
-            check(view_ok, "情報パネル（統合 tmux ビュー）の表示・確認フロー・非表示");
+            check(view_ok, "情報パネル（fleet ビュー）の表示・確認フロー・非表示");
 
             // 50. tako tab rename（FR-2.12.1）: 呼び出し元ペインからタブを解決し、
             //     明示リネームは手動扱い（title_source = manual）でタブ表示名になる
@@ -18771,13 +18773,13 @@ mod self_test {
                         tako_control::protocol::Request::Panel {
                             visible: Some(true),
                             width: None,
-                            view: Some(tako_control::protocol::PanelViewWire::Tmux),
+                            view: Some(tako_control::protocol::PanelViewWire::Fleet),
                             filetree: None,
                             sidebar_width: None,
                         },
                         PaneOrigin::Cli,
                     );
-                    let opened_ok = matches!(&opened, Ok(v) if v["view"].as_str() == Some("tmux"));
+                    let opened_ok = matches!(&opened, Ok(v) if v["view"].as_str() == Some("fleet"));
                     let groups = app.tmux_view_groups();
                     // タブ枠がタブと 1:1 + 全ペインが載っている + 枠内は注目度順（単調非減少）
                     let tabs_match = groups.len() == app.workspace.tabs().len();
@@ -18857,7 +18859,7 @@ mod self_test {
                     opened_ok && tabs_match && all_listed && sorted && jumped && still_open && killed
                 })
                 .unwrap_or(false);
-            check(groups_ok, "統合 tmux ビューのタブ枠一覧・ジャンプ・kill 確認フロー");
+            check(groups_ok, "fleet ビューのタブ枠一覧・ジャンプ・kill 確認フロー");
 
             // 57. ファイルツリー（FR-3.1 / FR-3.7）。cmd+B で開閉し、表示中は
             //     タブ内ペインの cwd（無ければ $HOME）がワークスペースフォルダとして並ぶ

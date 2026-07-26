@@ -428,8 +428,11 @@ tako tmux resize --session my-session --reset   # 元に戻す
 
 ```bash
 # 右サイドバーの情報パネル（引数なしで現在状態を表示）
-tako panel --show --view tmux    # tmux ビューを表示
+# --view の値は GUI のタブ表示名と同じ（fleet / orch / git）
+tako panel --show --view fleet   # fleet ビュー（全ペイン + tmux セッション）を表示
+tako panel --view orch           # orch ビュー（master + ワーカーツリー）に切替
 tako panel --view git            # git ビューに切替
+tako panel --show --view tmux    # 旧称。fleet と同じビュー（後方互換）
 tako panel --hide                # 隠す
 tako panel --filetree on         # 左のファイルツリーを表示
 tako panel --width 360           # パネル幅を変更
