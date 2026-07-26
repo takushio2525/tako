@@ -921,6 +921,24 @@ impl Profile {
         }
     }
 
+    /// master_account を accounts.yaml から解決する（Issue #547）。
+    /// 未設定なら `Ok(None)`、登録されていない名前なら Err（起動前に落とす）
+    pub fn resolve_master_account(&self) -> Result<Option<ResolvedAccount>, String> {
+        let Some(name) = self.resolve_master_account_name() else {
+            return Ok(None);
+        };
+        let accounts = AccountsConfig::load()?;
+        accounts.resolve(name).map(Some)
+    }
+
+    /// master / solo 起動用の env 計画（Issue #547）。
+    /// master_account を解決して worker と同じ規則で CLAUDE_CONFIG_DIR を
+    /// 注入 / 解除する。master_account が無ければプロファイルの env のみ（従来どおり）
+    pub fn resolved_env_plan_for_master(&self) -> Result<EnvPlan, String> {
+        let account = self.resolve_master_account()?;
+        Ok(self.resolved_env_plan_with_account(account.as_ref()))
+    }
+
     /// env のキー一覧を返す（値はマスクされた形。CLI/MCP 出力用。Issue #500）
     pub fn env_keys_masked(&self) -> Vec<(String, String)> {
         self.env
@@ -1538,8 +1556,10 @@ pub fn build_master_cmd(
     profile.validate_env()?;
 
     let agent = profile.resolve_master_agent()?;
-    // env 計画をコマンド先頭で注入する。direnv より後勝ちで上書き / 解除する
-    let plan = profile.resolved_env_plan();
+    // env 計画をコマンド先頭で注入する。direnv より後勝ちで上書き / 解除する。
+    // master_account があれば worker と同じ規則でアカウントの config dir を反映する
+    // （未登録アカウントはここで Err = 起動前に落ちる。Issue #547）
+    let plan = profile.resolved_env_plan_for_master()?;
     let mut cmd = String::new();
     for k in &plan.unsets {
         cmd.push_str(&format!("unset {}; ", agent::sh_quote(k)));
@@ -3507,6 +3527,123 @@ worker_agents:
             .config_dir
             .is_inherit());
         remove_temp_dir(&dir);
+    }
+
+    /// #547 のテスト用に accounts.yaml を隔離 config_dir へ用意する。
+    /// accounts.yaml を読むテストは他に無いが、共有ディレクトリなので直列化する
+    static MASTER_ACCOUNT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_test_accounts<F: FnOnce()>(yaml: &str, f: F) {
+        let _guard = MASTER_ACCOUNT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        test_config_dir_override().get_or_init(|| {
+            let dir =
+                std::env::temp_dir().join(format!("tako-orch-test-config-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        });
+        let path = accounts_yaml_path().expect("隔離 config_dir");
+        let saved = std::fs::read_to_string(&path).ok();
+        std::fs::write(&path, yaml).expect("accounts.yaml を書ける");
+        f();
+        match saved {
+            Some(prev) => {
+                let _ = std::fs::write(&path, prev);
+            }
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    const TEST_ACCOUNTS_YAML: &str = "accounts:\n  \
+        univ:\n    config_dir: /tmp/tako-test-claude-univ\n  \
+        personal:\n    inherit: true\n";
+
+    /// #547: master_account（パス指定）が master 起動コマンドへ反映される
+    #[test]
+    fn master_account_exports_config_dir() {
+        with_test_accounts(TEST_ACCOUNTS_YAML, || {
+            let p = Profile {
+                master_account: Some("univ".into()),
+                ..Default::default()
+            };
+            let cmd = build_master_cmd("master", &p, Path::new("/tmp/p.md"), "tako").unwrap();
+            assert!(
+                cmd.starts_with("export CLAUDE_CONFIG_DIR=/tmp/tako-test-claude-univ; "),
+                "アカウントの config dir が export される: {cmd}"
+            );
+            assert!(cmd.contains("TAKO_ORCHESTRATOR_ROLE='master' claude"));
+        });
+    }
+
+    /// #547 + #512: inherit の master_account は unset になる
+    #[test]
+    fn master_account_inherit_unsets_config_dir() {
+        with_test_accounts(TEST_ACCOUNTS_YAML, || {
+            let p = Profile {
+                master_account: Some("personal".into()),
+                ..Default::default()
+            };
+            let cmd = build_master_cmd("master", &p, Path::new("/tmp/p.md"), "tako").unwrap();
+            assert!(
+                cmd.starts_with("unset CLAUDE_CONFIG_DIR; "),
+                "既定の資格情報を使う master は unset を前置する: {cmd}"
+            );
+            assert!(!cmd.contains("export CLAUDE_CONFIG_DIR="), "{cmd}");
+        });
+    }
+
+    /// #547: プロファイル env の CLAUDE_CONFIG_DIR より master_account が優先される
+    #[test]
+    fn master_account_overrides_profile_env() {
+        with_test_accounts(TEST_ACCOUNTS_YAML, || {
+            let mut p = Profile {
+                master_account: Some("univ".into()),
+                ..Default::default()
+            };
+            p.env
+                .insert("CLAUDE_CONFIG_DIR".into(), "/tmp/old-dir".into());
+            p.env.insert("OTHER_VAR".into(), "keep".into());
+            let cmd = build_master_cmd("master", &p, Path::new("/tmp/p.md"), "tako").unwrap();
+            assert!(
+                cmd.contains("export CLAUDE_CONFIG_DIR=/tmp/tako-test-claude-univ;"),
+                "{cmd}"
+            );
+            assert!(!cmd.contains("/tmp/old-dir"), "{cmd}");
+            assert!(
+                cmd.contains("export OTHER_VAR=keep;"),
+                "他の env は残る: {cmd}"
+            );
+        });
+    }
+
+    /// #547: 未登録の master_account は起動前に Err（無言で既定アカウントへ落ちない）
+    #[test]
+    fn master_account_unknown_is_error() {
+        with_test_accounts(TEST_ACCOUNTS_YAML, || {
+            let p = Profile {
+                master_account: Some("nosuch".into()),
+                ..Default::default()
+            };
+            let err = build_master_cmd("master", &p, Path::new("/tmp/p.md"), "tako").unwrap_err();
+            assert!(err.contains("nosuch"), "{err}");
+        });
+    }
+
+    /// #547: master_account 無しは従来どおり（env 注入ゼロ）
+    #[test]
+    fn master_without_account_is_backward_compatible() {
+        with_test_accounts(TEST_ACCOUNTS_YAML, || {
+            let p = Profile::default();
+            let cmd = build_master_cmd("master", &p, Path::new("/tmp/p.md"), "tako").unwrap();
+            assert!(
+                cmd.starts_with("TAKO_ORCHESTRATOR_ROLE='master' claude"),
+                "従来と同じ形式: {cmd}"
+            );
+            assert!(!cmd.contains("export ") && !cmd.contains("unset "), "{cmd}");
+        });
     }
 
     /// #512: 既定パスの検出（警告の判定に使う。表記ゆれを吸収する）

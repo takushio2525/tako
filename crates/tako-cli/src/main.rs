@@ -2490,6 +2490,34 @@ fn check_mcp_health_warning() {
     }
 }
 
+/// master / solo 起動時の env とアカウントの可視化（Issue #500 / #547）。
+/// 値はマスクし、キー名と解決後の config dir だけを出す。
+/// アカウント解決の失敗は build_master_cmd が起動前に Err にするので、ここは表示だけ
+fn print_master_env(profile: &tako_control::orchestrator::Profile) {
+    use tako_control::orchestrator;
+    if !profile.env.is_empty() {
+        let keys: Vec<&str> = profile.env.keys().map(|k| k.as_str()).collect();
+        eprintln!("env: {}", keys.join(", "));
+    }
+    match profile.resolve_master_account() {
+        // #547: master_account があればそちらが CLAUDE_CONFIG_DIR の正
+        Ok(Some(account)) => match account.config_dir.path() {
+            Some(dir) => eprintln!("アカウント: {}（config dir: {dir}）", account.name),
+            None => eprintln!(
+                "アカウント: {}（既定の資格情報 / CLAUDE_CONFIG_DIR 未設定）",
+                account.name
+            ),
+        },
+        // アカウント未指定: プロファイル env の config dir を従来どおり出す
+        Ok(None) => {
+            if let Some(config_dir) = profile.env.get("CLAUDE_CONFIG_DIR") {
+                eprintln!("config dir: {}", orchestrator::expand_tilde(config_dir));
+            }
+        }
+        Err(e) => eprintln!("warning: {e}"),
+    }
+}
+
 /// `tako master [-profile]` — 新タブで claude をマスター system prompt 付きで起動する。
 /// `-<名前>` でプロファイルを指定、引数なしは default、旧形式（suffix のみ）も後方互換で動作
 fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
@@ -2649,15 +2677,8 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         orchestrator::WorkerModelPolicy::Delegate => "delegate（master が判断）".into(),
     };
     eprintln!("worker モデルポリシー: {policy_desc}");
-    // Part 4: env の可視化（キー名のみ。Issue #500）
-    if !profile.env.is_empty() {
-        let keys: Vec<&str> = profile.env.keys().map(|k| k.as_str()).collect();
-        eprintln!("env: {}", keys.join(", "));
-        // CLAUDE_CONFIG_DIR が設定されている場合、config dir を明示表示
-        if let Some(config_dir) = profile.env.get("CLAUDE_CONFIG_DIR") {
-            eprintln!("config dir: {}", orchestrator::expand_tilde(config_dir));
-        }
-    }
+    // Part 4: env の可視化（キー名のみ。Issue #500 / #547）
+    print_master_env(&profile);
     if let Some(ref projects) = profile.projects {
         eprintln!("projects 制限: {}", projects.join(", "));
     }
@@ -2833,14 +2854,8 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         profile.effort
     );
     eprintln!("モード: solo（オーケストレーション無し・1 対 1 対話・worker spawn 禁止）");
-    // Part 4: env の可視化（キー名のみ。Issue #500）
-    if !profile.env.is_empty() {
-        let keys: Vec<&str> = profile.env.keys().map(|k| k.as_str()).collect();
-        eprintln!("env: {}", keys.join(", "));
-        if let Some(config_dir) = profile.env.get("CLAUDE_CONFIG_DIR") {
-            eprintln!("config dir: {}", orchestrator::expand_tilde(config_dir));
-        }
-    }
+    // Part 4: env の可視化（キー名のみ。Issue #500 / #547）
+    print_master_env(&profile);
     eprintln!("system prompt: {}", prompt_path.display());
     Ok(())
 }
