@@ -4,7 +4,15 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-26 未明・Windows 移植の基盤が一通り main に載った）
+## 現在の対象（2026-07-26 夜・#511 / #512 でアカウント切替の残欠陥を解消）
+
+直近: `fix/511-512-account-polish` で CLI `spawn/run --account`（#511）と
+accounts.yaml の `inherit: true`（#512。既定パス明示 → Keychain 別エントリ問題の根治）を実装。
+**ローカル accounts.yaml の personal を inherit 形式へ更新済み → 古いバイナリでは
+パースできないので tako の再起動が必須**。`~/.claude-univ` を検証事故で失っており、
+univ アカウントの worker は初回に 1 回ログインが要る。
+
+## これまでの対象（2026-07-26 未明・Windows 移植の基盤が一通り main に載った）
 
 今夜 main へ入った merge（新しい順）:
 
