@@ -1344,3 +1344,10 @@
 - 検証: 隔離実測で univ = プロセス env に `CLAUDE_CONFIG_DIR=~/.claude-univ`、
   personal(inherit) / solo / master_account 無し = 未設定を `ps eww` で確認。
   ユニット 5 本は修正を戻すと 4 本落ちる（検出力実証）。品質ゲート + クロス check ベースライン不変
+
+## 2026-07-26（#548: accounts の CLI 追加でアカウント系の 1:1 欠落を解消）
+- `tako orchestrator accounts list/show/add/remove` を追加。実体は
+  `dispatch_orchestrator_accounts` を pub 化して共用（layout と同じローカル呼び出し）
+- 検証: 同一 data_dir に対する CLI と MCP の出力を diff して list / show / add（警告つき）/
+  remove が完全一致。`--inherit` / 既定パス警告 / 排他エラー / 壊れたエントリ表示も実測。
+  CLI 登録アカウントが spawn で解決されるところまで通し確認。品質ゲート全緑

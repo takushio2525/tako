@@ -4695,10 +4695,11 @@ fn account_json(a: &crate::orchestrator::ResolvedAccount) -> Value {
     })
 }
 
-/// spawn レイアウト設定の取得・変更（Issue #165）。host 非依存（config.yaml の読み書きのみ）
-/// のため pub にし、CLI `tako orchestrator layout` からもローカル呼び出しで共用する
-/// アカウントレジストリの CRUD（Issue #504）
-fn dispatch_orchestrator_accounts(
+/// アカウントレジストリの CRUD（Issue #504 / #512）。host 非依存
+/// （accounts.yaml の読み書きのみ）のため pub にし、CLI `tako orchestrator accounts`
+/// からもローカル呼び出しで共用する（MCP `tako_orchestrator_accounts` と 1:1。
+/// 表示・警告・検証を二重実装しない。Issue #548）
+pub fn dispatch_orchestrator_accounts(
     action: &str,
     name: Option<&str>,
     config_dir: Option<&str>,

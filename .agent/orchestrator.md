@@ -206,9 +206,17 @@ worker_agent / agent_* パラメータ対応）で同じ操作ができる。
 ### アカウント（accounts.yaml。Issue #504 / #512）
 
 worker を別の claude アカウントで動かすための名前つきレジストリ。
-`<data_dir>/orchestrator/accounts.yaml` に置き、MCP `tako_orchestrator_accounts`
-（action: list / show / add / remove）で編集する。使うのは spawn の `--account`、
-プロファイルの `master_account` / `worker_account`。
+`<data_dir>/orchestrator/accounts.yaml` に置き、CLI `tako orchestrator accounts`
+（list / show / add / remove）または MCP `tako_orchestrator_accounts`（同じ action）で編集する
+（両者は同じ dispatch 関数を呼ぶので出力・警告・検証は完全に一致する）。
+使うのは spawn の `--account`、プロファイルの `master_account` / `worker_account`。
+
+```bash
+tako orchestrator accounts list
+tako orchestrator accounts add personal --inherit --default-model claude-opus-5
+tako orchestrator accounts add univ --config-dir ~/.claude-univ --default-model 'claude-opus-4-6[1m]'
+tako orchestrator accounts remove univ
+```
 
 ```yaml
 accounts:
