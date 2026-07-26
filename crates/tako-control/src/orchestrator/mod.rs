@@ -158,9 +158,14 @@ pub struct AccountsConfig {
 }
 
 /// アカウントエントリ
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AccountEntry {
-    pub config_dir: String,
+    /// `CLAUDE_CONFIG_DIR` に設定する値。`inherit: true` のときは省略する
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<String>,
+    /// true = `CLAUDE_CONFIG_DIR` を**設定しない**（既定の資格情報をそのまま使う。Issue #512）
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub inherit: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -169,11 +174,101 @@ pub struct AccountEntry {
     pub default_effort: Option<String>,
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// アカウントが指す claude の設定ディレクトリ（Issue #512）。
+///
+/// claude は `CLAUDE_CONFIG_DIR` が**設定されている**だけで Keychain のエントリ名に
+/// ハッシュサフィックスを付ける。値が既定パスと同一でも別エントリになるため、
+/// 「既定の資格情報を使う」は既定パスの明示ではなく**未設定**でしか表現できない
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountConfigDir {
+    /// `CLAUDE_CONFIG_DIR` にこのパスを設定する（expand_tilde 済み）
+    Path(String),
+    /// `CLAUDE_CONFIG_DIR` を設定しない（設定済みなら明示 unset する）
+    Inherit,
+}
+
+impl AccountConfigDir {
+    /// 設定するパス。inherit（未設定）なら None
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::Path(p) => Some(p),
+            Self::Inherit => None,
+        }
+    }
+
+    pub fn is_inherit(&self) -> bool {
+        matches!(self, Self::Inherit)
+    }
+}
+
+/// claude の既定 config ディレクトリ（`~/.claude`）。
+/// ここを明示指定すると Keychain エントリが分かれる（Issue #512）
+pub fn claude_default_config_dir() -> Option<PathBuf> {
+    home_dir().map(|h| h.join(".claude"))
+}
+
+/// 指定パスが claude の既定 config ディレクトリと同じ場所を指すか（Issue #512 の警告用）
+pub fn is_claude_default_config_dir(path: &str) -> bool {
+    let expanded = expand_tilde(path);
+    let Some(default) = claude_default_config_dir() else {
+        return false;
+    };
+    // 末尾スラッシュ等の表記ゆれを吸収する（存在しないパスでも比較できるよう
+    // canonicalize には頼らない）
+    let normalize = |p: &Path| -> PathBuf { p.components().collect::<PathBuf>() };
+    normalize(Path::new(&expanded)) == normalize(&default)
+}
+
+/// claude の config ディレクトリを指す環境変数名
+pub const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+
+/// 起動コマンドへ注入する環境変数の計画（Issue #512）。
+///
+/// 「値を設定する」だけでなく「**設定されていない状態にする**」を表現できる。
+/// ログインシェルの direnv 等が変数を設定してくる環境では、
+/// 未設定に戻すには明示 unset が要る
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvPlan {
+    /// `export K=V;` として注入する変数
+    pub exports: Vec<(String, String)>,
+    /// `unset K;` として明示的に解除する変数
+    pub unsets: Vec<String>,
+}
+
+/// `WorkerLaunch::default()` 用の空計画
+pub static EMPTY_ENV_PLAN: EnvPlan = EnvPlan {
+    exports: Vec::new(),
+    unsets: Vec::new(),
+};
+
+impl EnvPlan {
+    pub fn is_empty(&self) -> bool {
+        self.exports.is_empty() && self.unsets.is_empty()
+    }
+
+    /// export するキー名の一覧（CLI / MCP 応答用。値はマスクのため出さない）
+    pub fn export_keys(&self) -> Vec<&str> {
+        self.exports.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    /// export される値を引く（応答の config_dir 表示等）
+    pub fn export_value(&self, key: &str) -> Option<&str> {
+        self.exports
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
 /// 解決済みアカウント情報（expand_tilde 適用後）
 #[derive(Debug, Clone)]
 pub struct ResolvedAccount {
     pub name: String,
-    pub config_dir: String,
+    pub config_dir: AccountConfigDir,
     pub description: Option<String>,
     pub default_model: Option<String>,
     pub default_effort: Option<String>,
@@ -220,34 +315,50 @@ impl AccountsConfig {
         Ok(result)
     }
 
-    /// アカウント名を解決する。未登録なら Err
+    /// アカウント名を解決する。未登録・エントリ不正なら Err
     pub fn resolve(&self, name: &str) -> Result<ResolvedAccount, String> {
         let entry = self
             .accounts
             .get(name)
             .ok_or_else(|| format!("アカウント '{name}' が accounts.yaml に見つからない"))?;
-        let config_dir = expand_tilde(&entry.config_dir);
-        Ok(ResolvedAccount {
-            name: name.to_string(),
-            config_dir,
-            description: entry.description.clone(),
-            default_model: entry.default_model.clone(),
-            default_effort: entry.default_effort.clone(),
-        })
+        resolve_entry(name, entry)
     }
 
-    pub fn list_resolved(&self) -> Vec<ResolvedAccount> {
+    /// 全アカウントを解決する。壊れたエントリは Err を保持したまま返す
+    /// （list 表示で握り潰さず、直し方を出す）
+    pub fn list_resolved(&self) -> Vec<(String, Result<ResolvedAccount, String>)> {
         self.accounts
             .iter()
-            .map(|(name, entry)| ResolvedAccount {
-                name: name.clone(),
-                config_dir: expand_tilde(&entry.config_dir),
-                description: entry.description.clone(),
-                default_model: entry.default_model.clone(),
-                default_effort: entry.default_effort.clone(),
-            })
+            .map(|(name, entry)| (name.clone(), resolve_entry(name, entry)))
             .collect()
     }
+}
+
+/// アカウントエントリ 1 件を解決する（Issue #512 で config_dir / inherit の排他を検証）
+fn resolve_entry(name: &str, entry: &AccountEntry) -> Result<ResolvedAccount, String> {
+    let config_dir = match (entry.inherit, entry.config_dir.as_deref()) {
+        (false, Some(dir)) => AccountConfigDir::Path(expand_tilde(dir)),
+        (true, None) => AccountConfigDir::Inherit,
+        (true, Some(_)) => {
+            return Err(format!(
+                "アカウント '{name}' は inherit: true と config_dir を同時に指定している\
+                 （既定の資格情報を使うなら config_dir を消す）"
+            ))
+        }
+        (false, None) => {
+            return Err(format!(
+                "アカウント '{name}' に config_dir が無い\
+                 （別 config dir なら config_dir を、既定の資格情報なら inherit: true を指定する）"
+            ))
+        }
+    };
+    Ok(ResolvedAccount {
+        name: name.to_string(),
+        config_dir,
+        description: entry.description.clone(),
+        default_model: entry.default_model.clone(),
+        default_effort: entry.default_effort.clone(),
+    })
 }
 
 // --- projects.yaml ---
@@ -726,24 +837,38 @@ impl Profile {
             .or(self.master_account.as_deref())
     }
 
-    /// アカウント解決に基づく env を返す（Issue #504）。
+    /// アカウント解決に基づく env 計画を返す（Issue #504 / #512）。
     /// アカウントの config_dir を CLAUDE_CONFIG_DIR として注入し、
     /// アカウントが指定されていない場合はプロファイルの env のみを返す。
-    /// アカウント指定は env の CLAUDE_CONFIG_DIR より優先する
-    pub fn resolved_env_with_account(
-        &self,
-        account: Option<&ResolvedAccount>,
-    ) -> Vec<(String, String)> {
-        let mut env = self.resolved_env();
-        if let Some(acct) = account {
-            // アカウント指定がある場合、CLAUDE_CONFIG_DIR を上書き（明示 > 暗黙）
-            if let Some(pos) = env.iter().position(|(k, _)| k == "CLAUDE_CONFIG_DIR") {
-                env[pos].1 = acct.config_dir.clone();
-            } else {
-                env.push(("CLAUDE_CONFIG_DIR".to_string(), acct.config_dir.clone()));
+    /// アカウント指定は env の CLAUDE_CONFIG_DIR より優先する。
+    /// inherit のアカウントでは export ではなく **unset** を計画する
+    /// （direnv 等が設定してくる値を確実に消すため。Issue #512）
+    pub fn resolved_env_plan_with_account(&self, account: Option<&ResolvedAccount>) -> EnvPlan {
+        let mut plan = self.resolved_env_plan();
+        let Some(acct) = account else {
+            return plan;
+        };
+        match &acct.config_dir {
+            AccountConfigDir::Path(dir) => {
+                // アカウント指定がある場合、CLAUDE_CONFIG_DIR を上書き（明示 > 暗黙）
+                if let Some(pos) = plan
+                    .exports
+                    .iter()
+                    .position(|(k, _)| k == CLAUDE_CONFIG_DIR_ENV)
+                {
+                    plan.exports[pos].1 = dir.clone();
+                } else {
+                    plan.exports
+                        .push((CLAUDE_CONFIG_DIR_ENV.to_string(), dir.clone()));
+                }
+            }
+            AccountConfigDir::Inherit => {
+                // 「未設定」を表すので export 側からは必ず取り除く（exports と unsets は排他）
+                plan.exports.retain(|(k, _)| k != CLAUDE_CONFIG_DIR_ENV);
+                plan.unsets.push(CLAUDE_CONFIG_DIR_ENV.to_string());
             }
         }
-        env
+        plan
     }
 
     /// プロファイルの env が内部予約変数を含んでいないか検証する（Issue #500）。
@@ -785,6 +910,15 @@ impl Profile {
             .iter()
             .map(|(k, v)| (k.clone(), expand_tilde(v)))
             .collect()
+    }
+
+    /// プロファイルの env を注入計画として返す（Issue #512）。
+    /// プロファイル単体では unset は発生しない（unset はアカウント解決で足される）
+    pub fn resolved_env_plan(&self) -> EnvPlan {
+        EnvPlan {
+            exports: self.resolved_env(),
+            unsets: Vec::new(),
+        }
     }
 
     /// env のキー一覧を返す（値はマスクされた形。CLI/MCP 出力用。Issue #500）
@@ -1404,13 +1538,17 @@ pub fn build_master_cmd(
     profile.validate_env()?;
 
     let agent = profile.resolve_master_agent()?;
-    // プロファイル env をコマンド先頭で export する。direnv より後勝ちで上書きする
+    // env 計画をコマンド先頭で注入する。direnv より後勝ちで上書き / 解除する
+    let plan = profile.resolved_env_plan();
     let mut cmd = String::new();
-    for (k, v) in profile.resolved_env() {
+    for k in &plan.unsets {
+        cmd.push_str(&format!("unset {}; ", agent::sh_quote(k)));
+    }
+    for (k, v) in &plan.exports {
         cmd.push_str(&format!(
             "export {}={}; ",
-            agent::sh_quote(&k),
-            agent::sh_quote(&v)
+            agent::sh_quote(k),
+            agent::sh_quote(v)
         ));
     }
     cmd.push_str(&format!(
@@ -3167,10 +3305,10 @@ worker_agents:
             c.accounts.insert(
                 "univ".into(),
                 AccountEntry {
-                    config_dir: "~/.claude-univ".into(),
+                    config_dir: Some("~/.claude-univ".into()),
                     description: Some("test".into()),
                     default_model: Some("claude-opus-4-6[1m]".into()),
-                    default_effort: None,
+                    ..Default::default()
                 },
             );
         })
@@ -3179,10 +3317,12 @@ worker_agents:
         // show
         let config = AccountsConfig::load_from(&path).unwrap();
         let resolved = config.resolve("univ").unwrap();
+        // NOTE: 変数名を `dir` にしない（末尾の remove_dir_all がテスト用一時ディレクトリ
+        // ではなく実アカウントの config dir を消してしまう）
+        let resolved_dir = resolved.config_dir.path().expect("パス指定のアカウント");
         assert!(
-            !resolved.config_dir.starts_with('~'),
-            "チルダ展開されている: {}",
-            resolved.config_dir
+            !resolved_dir.starts_with('~'),
+            "チルダ展開されている: {resolved_dir}"
         );
         assert_eq!(
             resolved.default_model.as_deref(),
@@ -3200,7 +3340,29 @@ worker_agents:
         let config = AccountsConfig::load_from(&path).unwrap();
         assert!(config.accounts.is_empty());
 
-        let _ = std::fs::remove_dir_all(&dir);
+        remove_temp_dir(&dir);
+    }
+
+    /// テスト用一時ディレクトリの後始末。**一時ディレクトリ配下であることを検証してから**
+    /// 消す（変数名の取り違えで実アカウントの config dir を消す事故を構造的に防ぐ）
+    fn remove_temp_dir(dir: &Path) {
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "一時ディレクトリ以外を削除しようとしている: {}",
+            dir.display()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// テスト用の path アカウント
+    fn path_account(name: &str, dir: &str) -> ResolvedAccount {
+        ResolvedAccount {
+            name: name.into(),
+            config_dir: AccountConfigDir::Path(dir.into()),
+            description: None,
+            default_model: None,
+            default_effort: None,
+        }
     }
 
     #[test]
@@ -3210,43 +3372,154 @@ worker_agents:
             .insert("CLAUDE_CONFIG_DIR".into(), "~/.claude-old".into());
         p.env.insert("OTHER_VAR".into(), "keep".into());
 
-        let acct = ResolvedAccount {
-            name: "univ".into(),
-            config_dir: "/home/test/.claude-univ".into(),
-            description: None,
-            default_model: None,
-            default_effort: None,
-        };
-        let env = p.resolved_env_with_account(Some(&acct));
-        let config_dir = env.iter().find(|(k, _)| k == "CLAUDE_CONFIG_DIR").unwrap();
-        assert_eq!(config_dir.1, "/home/test/.claude-univ");
-        let other = env.iter().find(|(k, _)| k == "OTHER_VAR").unwrap();
-        assert_eq!(other.1, "keep");
+        let acct = path_account("univ", "/home/test/.claude-univ");
+        let plan = p.resolved_env_plan_with_account(Some(&acct));
+        assert_eq!(
+            plan.export_value("CLAUDE_CONFIG_DIR"),
+            Some("/home/test/.claude-univ")
+        );
+        assert_eq!(plan.export_value("OTHER_VAR"), Some("keep"));
+        assert!(plan.unsets.is_empty(), "path 指定では unset しない");
     }
 
     #[test]
     fn resolved_env_with_account_adds_config_dir() {
         let p = Profile::default();
-        let acct = ResolvedAccount {
-            name: "personal".into(),
-            config_dir: "/home/test/.claude".into(),
-            description: None,
-            default_model: None,
-            default_effort: None,
-        };
-        let env = p.resolved_env_with_account(Some(&acct));
-        assert_eq!(env.len(), 1);
-        assert_eq!(env[0].0, "CLAUDE_CONFIG_DIR");
-        assert_eq!(env[0].1, "/home/test/.claude");
+        let acct = path_account("personal", "/home/test/.claude");
+        let plan = p.resolved_env_plan_with_account(Some(&acct));
+        assert_eq!(plan.exports.len(), 1);
+        assert_eq!(plan.exports[0].0, "CLAUDE_CONFIG_DIR");
+        assert_eq!(plan.exports[0].1, "/home/test/.claude");
     }
 
     #[test]
     fn resolved_env_with_no_account_is_profile_only() {
         let mut p = Profile::default();
         p.env.insert("MY_VAR".into(), "hello".into());
-        let env = p.resolved_env_with_account(None);
-        assert_eq!(env.len(), 1);
-        assert_eq!(env[0].0, "MY_VAR");
+        let plan = p.resolved_env_plan_with_account(None);
+        assert_eq!(plan.exports.len(), 1);
+        assert_eq!(plan.exports[0].0, "MY_VAR");
+        assert!(plan.unsets.is_empty());
+    }
+
+    /// #512: inherit アカウントは export ではなく unset を計画する
+    #[test]
+    fn inherit_account_unsets_config_dir() {
+        let p = Profile::default();
+        let acct = ResolvedAccount {
+            name: "personal".into(),
+            config_dir: AccountConfigDir::Inherit,
+            description: None,
+            default_model: None,
+            default_effort: None,
+        };
+        let plan = p.resolved_env_plan_with_account(Some(&acct));
+        assert!(
+            plan.export_value("CLAUDE_CONFIG_DIR").is_none(),
+            "既定パスを export してはいけない（Keychain エントリが分かれる）"
+        );
+        assert_eq!(plan.unsets, vec!["CLAUDE_CONFIG_DIR".to_string()]);
+    }
+
+    /// #512: プロファイル env が CLAUDE_CONFIG_DIR を持っていても inherit が勝つ
+    /// （export と unset が両立すると挙動が読めなくなるため exports からは必ず消える）
+    #[test]
+    fn inherit_account_removes_profile_config_dir_export() {
+        let mut p = Profile::default();
+        p.env
+            .insert("CLAUDE_CONFIG_DIR".into(), "~/.claude-old".into());
+        p.env.insert("OTHER_VAR".into(), "keep".into());
+        let acct = ResolvedAccount {
+            name: "personal".into(),
+            config_dir: AccountConfigDir::Inherit,
+            description: None,
+            default_model: None,
+            default_effort: None,
+        };
+        let plan = p.resolved_env_plan_with_account(Some(&acct));
+        assert!(plan.export_value("CLAUDE_CONFIG_DIR").is_none());
+        assert_eq!(plan.export_value("OTHER_VAR"), Some("keep"));
+        assert_eq!(plan.unsets, vec!["CLAUDE_CONFIG_DIR".to_string()]);
+    }
+
+    /// #512: config_dir / inherit の排他と欠落を resolve が弾く
+    #[test]
+    fn account_entry_validation() {
+        let mut config = AccountsConfig {
+            accounts: std::collections::BTreeMap::new(),
+        };
+        config.accounts.insert(
+            "both".into(),
+            AccountEntry {
+                config_dir: Some("~/.claude".into()),
+                inherit: true,
+                ..Default::default()
+            },
+        );
+        config
+            .accounts
+            .insert("neither".into(), AccountEntry::default());
+        config.accounts.insert(
+            "ok".into(),
+            AccountEntry {
+                inherit: true,
+                ..Default::default()
+            },
+        );
+
+        let err = config.resolve("both").unwrap_err();
+        assert!(err.contains("同時に指定"), "{err}");
+        let err = config.resolve("neither").unwrap_err();
+        assert!(err.contains("config_dir が無い"), "{err}");
+        assert!(config.resolve("ok").unwrap().config_dir.is_inherit());
+
+        // list は壊れたエントリを握り潰さず Err のまま返す
+        let listed = config.list_resolved();
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed.iter().filter(|(_, r)| r.is_err()).count(), 2);
+    }
+
+    /// #512: inherit で保存した YAML に config_dir を書き出さない（往復）
+    #[test]
+    fn inherit_account_yaml_roundtrip() {
+        let dir =
+            std::env::temp_dir().join(format!("tako-accounts-inherit-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("accounts.yaml");
+        AccountsConfig::mutate_at(&path, |c| {
+            c.accounts.insert(
+                "personal".into(),
+                AccountEntry {
+                    inherit: true,
+                    description: Some("個人".into()),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        let yaml = std::fs::read_to_string(&path).unwrap();
+        assert!(yaml.contains("inherit: true"), "{yaml}");
+        assert!(!yaml.contains("config_dir"), "{yaml}");
+        let reloaded = AccountsConfig::load_from(&path).unwrap();
+        assert!(reloaded
+            .resolve("personal")
+            .unwrap()
+            .config_dir
+            .is_inherit());
+        remove_temp_dir(&dir);
+    }
+
+    /// #512: 既定パスの検出（警告の判定に使う。表記ゆれを吸収する）
+    #[test]
+    fn claude_default_config_dir_detection() {
+        let home = home_dir().expect("HOME");
+        assert!(is_claude_default_config_dir("~/.claude"));
+        assert!(is_claude_default_config_dir("~/.claude/"));
+        assert!(is_claude_default_config_dir(
+            home.join(".claude").to_str().unwrap()
+        ));
+        assert!(!is_claude_default_config_dir("~/.claude-univ"));
+        assert!(!is_claude_default_config_dir("/tmp/.claude"));
     }
 
     #[test]

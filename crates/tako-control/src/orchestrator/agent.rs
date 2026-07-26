@@ -11,6 +11,8 @@ use std::path::Path;
 
 use serde_json::json;
 
+use super::{EnvPlan, EMPTY_ENV_PLAN};
+
 /// worker として起動できるエージェント CLI の種別
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WorkerAgent {
@@ -66,7 +68,7 @@ impl WorkerAgent {
 }
 
 /// worker 起動コマンドの組み立てパラメータ
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WorkerLaunch<'a> {
     pub agent: WorkerAgent,
     /// TAKO_ORCHESTRATOR_ROLE の値（codex / agy は読まないが識別用に一律注入する）
@@ -80,22 +82,38 @@ pub struct WorkerLaunch<'a> {
     pub skip_permissions: bool,
     /// プロファイル worker_agents.<agent>.args の追加 CLI 引数（上級者向け）
     pub extra_args: &'a [String],
-    /// プロファイルの env（展開済み）。コマンド先頭で `export K=V;` として注入し、
-    /// direnv が同変数を設定していても明示値が勝つようにする（Issue #500）
-    pub env: &'a [(String, String)],
+    /// プロファイル + アカウント解決の env 計画（展開済み）。コマンド先頭で
+    /// `export K=V;` / `unset K;` として注入し、direnv が同変数を設定していても
+    /// 明示指定が勝つようにする（Issue #500 / #512）
+    pub env: &'a EnvPlan,
+}
+
+impl Default for WorkerLaunch<'_> {
+    fn default() -> Self {
+        Self {
+            agent: WorkerAgent::default(),
+            role: "",
+            model: None,
+            effort: None,
+            skip_permissions: false,
+            extra_args: &[],
+            env: &EMPTY_ENV_PLAN,
+        }
+    }
 }
 
 /// worker 起動用のシェルコマンドを組み立てる。
 /// claude の従来出力（`build_worker_claude_cmd`）と互換（skip_permissions /
 /// extra_args 未使用時は既存文字列と一致する）
 pub fn build_worker_cmd(launch: &WorkerLaunch) -> String {
-    // プロファイル env をコマンド先頭で export する。ログインシェルが direnv で
-    // 同変数を設定していても、export が後勝ちで上書きする（Issue #500）
+    // env 計画をコマンド先頭で注入する。ログインシェルが direnv で同変数を
+    // 設定していても、後から実行される export / unset が勝つ（Issue #500 / #512）
     let mut cmd = String::new();
-    if !launch.env.is_empty() {
-        for (k, v) in launch.env {
-            cmd.push_str(&format!("export {}={}; ", sh_quote(k), sh_quote(v)));
-        }
+    for k in &launch.env.unsets {
+        cmd.push_str(&format!("unset {}; ", sh_quote(k)));
+    }
+    for (k, v) in &launch.env.exports {
+        cmd.push_str(&format!("export {}={}; ", sh_quote(k), sh_quote(v)));
     }
     cmd.push_str(&format!(
         "TAKO_ORCHESTRATOR_ROLE={} {}",
@@ -435,13 +453,16 @@ mod tests {
 
     #[test]
     fn build_worker_cmd_includes_env_export() {
-        let env = vec![
-            (
-                "CLAUDE_CONFIG_DIR".to_string(),
-                "/home/test/.claude-univ".to_string(),
-            ),
-            ("MY_VAR".to_string(), "hello world".to_string()),
-        ];
+        let env = EnvPlan {
+            exports: vec![
+                (
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    "/home/test/.claude-univ".to_string(),
+                ),
+                ("MY_VAR".to_string(), "hello world".to_string()),
+            ],
+            unsets: Vec::new(),
+        };
         let cmd = build_worker_cmd(&WorkerLaunch {
             agent: WorkerAgent::Claude,
             role: "worker:test",
@@ -455,6 +476,32 @@ mod tests {
         );
         assert!(cmd.contains("MY_VAR="), "任意変数が含まれる: {cmd}");
         assert!(cmd.contains("claude"), "agent コマンドが含まれる: {cmd}");
+    }
+
+    /// #512: inherit アカウントは `unset CLAUDE_CONFIG_DIR;` を前置する。
+    /// export では既定パスでも Keychain のエントリが分かれてしまうため、
+    /// direnv が設定してくる値を消す唯一の手段が unset
+    #[test]
+    fn build_worker_cmd_unsets_env() {
+        let env = EnvPlan {
+            exports: vec![("MY_VAR".to_string(), "keep".to_string())],
+            unsets: vec!["CLAUDE_CONFIG_DIR".to_string()],
+        };
+        let cmd = build_worker_cmd(&WorkerLaunch {
+            agent: WorkerAgent::Claude,
+            role: "worker:test",
+            env: &env,
+            ..Default::default()
+        });
+        assert!(
+            cmd.starts_with("unset CLAUDE_CONFIG_DIR; "),
+            "unset がコマンド先頭にある: {cmd}"
+        );
+        assert!(
+            !cmd.contains("export CLAUDE_CONFIG_DIR="),
+            "export と併存しない: {cmd}"
+        );
+        assert!(cmd.contains("export MY_VAR="), "他の env は残る: {cmd}");
     }
 
     #[test]
@@ -474,7 +521,10 @@ mod tests {
 
     #[test]
     fn build_worker_cmd_env_works_for_codex() {
-        let env = vec![("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string())];
+        let env = EnvPlan {
+            exports: vec![("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string())],
+            unsets: Vec::new(),
+        };
         let cmd = build_worker_cmd(&WorkerLaunch {
             agent: WorkerAgent::Codex,
             role: "worker:test",

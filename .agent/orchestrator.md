@@ -203,6 +203,30 @@ tako orchestrator profiles set sol --clear-master-agent       # claude 既定へ
 MCP からは `tako_orchestrator_profiles`（action: list / show / set。master_agent /
 worker_agent / agent_* パラメータ対応）で同じ操作ができる。
 
+### アカウント（accounts.yaml。Issue #504 / #512）
+
+worker を別の claude アカウントで動かすための名前つきレジストリ。
+`<data_dir>/orchestrator/accounts.yaml` に置き、MCP `tako_orchestrator_accounts`
+（action: list / show / add / remove）で編集する。使うのは spawn の `--account`、
+プロファイルの `master_account` / `worker_account`。
+
+```yaml
+accounts:
+  univ:
+    config_dir: ~/.claude-univ      # CLAUDE_CONFIG_DIR にこのパスを設定する
+    default_model: claude-opus-4-6[1m]
+  personal:
+    inherit: true                   # CLAUDE_CONFIG_DIR を設定しない（既定の資格情報）
+    default_model: claude-opus-5
+```
+
+**既定アカウントは `config_dir: ~/.claude` ではなく `inherit: true` で書く**（#512）。
+claude は `CLAUDE_CONFIG_DIR` が**設定されている**だけで Keychain のエントリ名に
+ハッシュを付けるため、値が既定パスと同一でも別エントリ（= 未ログイン扱い）になる。
+`inherit: true` の worker は起動コマンドの先頭で `unset CLAUDE_CONFIG_DIR;` を実行し、
+direnv 等が設定してくる値も確実に消す。既定パスを明示指定して登録しようとすると
+add が警告を返す。
+
 ## 基本的な使い方
 
 ### 1. master を起動する
@@ -281,6 +305,7 @@ master は結果を確認してユーザーに報告する。
 | `--agent` | | worker のエージェント CLI（claude / codex / agy。省略時はプロファイルの worker_agent → claude） |
 | `--model` | | worker のモデル（agent のネイティブ表記。省略時はプロファイル設定） |
 | `--effort` | | thinking / reasoning effort（claude・codex のみ。省略時はプロファイル設定） |
+| `--account` | | アカウント名（accounts.yaml のキー。この worker だけ別アカウントで起動する。#504 / #511） |
 
 プロンプト送達は送達確認ループで行う（Issue #32）:
 

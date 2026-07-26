@@ -2370,6 +2370,7 @@ fn dispatch_inner(
             action,
             name,
             config_dir,
+            inherit,
             description,
             default_model,
             default_effort,
@@ -2377,6 +2378,7 @@ fn dispatch_inner(
             &action,
             name.as_deref(),
             config_dir.as_deref(),
+            inherit,
             description.as_deref(),
             default_model.as_deref(),
             default_effort.as_deref(),
@@ -4680,6 +4682,19 @@ fn spawn_tmux_delivery(session: String, text: String, wait_ready: bool) {
     });
 }
 
+/// 解決済みアカウント 1 件の JSON 表現（list / show / add で共通。#504 / #512）
+fn account_json(a: &crate::orchestrator::ResolvedAccount) -> Value {
+    json!({
+        "name": a.name,
+        // inherit のアカウントは CLAUDE_CONFIG_DIR を設定しない = パスを持たない
+        "config_dir": a.config_dir.path(),
+        "inherit": a.config_dir.is_inherit(),
+        "description": a.description,
+        "default_model": a.default_model,
+        "default_effort": a.default_effort,
+    })
+}
+
 /// spawn レイアウト設定の取得・変更（Issue #165）。host 非依存（config.yaml の読み書きのみ）
 /// のため pub にし、CLI `tako orchestrator layout` からもローカル呼び出しで共用する
 /// アカウントレジストリの CRUD（Issue #504）
@@ -4687,6 +4702,7 @@ fn dispatch_orchestrator_accounts(
     action: &str,
     name: Option<&str>,
     config_dir: Option<&str>,
+    inherit: Option<bool>,
     description: Option<&str>,
     default_model: Option<&str>,
     default_effort: Option<&str>,
@@ -4698,14 +4714,10 @@ fn dispatch_orchestrator_accounts(
             let accounts: Vec<Value> = config
                 .list_resolved()
                 .into_iter()
-                .map(|a| {
-                    json!({
-                        "name": a.name,
-                        "config_dir": a.config_dir,
-                        "description": a.description,
-                        "default_model": a.default_model,
-                        "default_effort": a.default_effort,
-                    })
+                .map(|(name, resolved)| match resolved {
+                    Ok(a) => account_json(&a),
+                    // 壊れたエントリも隠さず出す（直し方は error 文言に入っている）
+                    Err(e) => json!({ "name": name, "error": e }),
                 })
                 .collect();
             Ok(json!({ "accounts": accounts }))
@@ -4714,20 +4726,45 @@ fn dispatch_orchestrator_accounts(
             let name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
             let config = orchestrator::AccountsConfig::load().map_err(DispatchError::Operation)?;
             let a = config.resolve(name).map_err(DispatchError::Operation)?;
-            Ok(json!({
-                "name": a.name,
-                "config_dir": a.config_dir,
-                "description": a.description,
-                "default_model": a.default_model,
-                "default_effort": a.default_effort,
-            }))
+            Ok(account_json(&a))
         }
         "add" => {
             let name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
-            let cd =
-                config_dir.ok_or(DispatchError::InvalidParams("config_dir を指定する".into()))?;
+            let inherit = inherit.unwrap_or(false);
+            // config_dir / inherit の排他は登録時に弾く（壊れたエントリを作らせない。#512）
+            match (inherit, config_dir) {
+                (false, None) => {
+                    return Err(DispatchError::InvalidParams(
+                        "config_dir か inherit のどちらかを指定する\
+                         （別 config dir なら config_dir、既定の資格情報をそのまま使うなら inherit=true）"
+                            .into(),
+                    ))
+                }
+                (true, Some(_)) => {
+                    return Err(DispatchError::InvalidParams(
+                        "config_dir と inherit=true は同時に指定できない".into(),
+                    ))
+                }
+                _ => {}
+            }
+            // #512: 既定パスの明示指定は「未設定」と等価ではない（Keychain エントリが分かれ、
+            // 既存ログインが見えなくなる）。登録は通すが必ず警告する
+            let warning = config_dir
+                .filter(|cd| orchestrator::is_claude_default_config_dir(cd))
+                .map(|cd| {
+                    format!(
+                        "config_dir '{cd}' は claude の既定パスです。既定パスを明示指定すると \
+                         CLAUDE_CONFIG_DIR が設定された状態になり、claude が Keychain の別エントリ\
+                         （ハッシュ付き）を見に行くため既存ログインが未ログイン扱いになります。\
+                         既定の資格情報をそのまま使うなら inherit=true で登録してください（#512）"
+                    )
+                });
+            if let Some(w) = &warning {
+                eprintln!("warning: {w}");
+            }
             let entry = orchestrator::AccountEntry {
-                config_dir: cd.to_string(),
+                config_dir: config_dir.map(str::to_string),
+                inherit,
                 description: description.map(str::to_string),
                 default_model: default_model.map(str::to_string),
                 default_effort: default_effort.map(str::to_string),
@@ -4738,13 +4775,11 @@ fn dispatch_orchestrator_accounts(
             .map_err(DispatchError::Operation)?;
             let config = orchestrator::AccountsConfig::load().map_err(DispatchError::Operation)?;
             let a = config.resolve(name).map_err(DispatchError::Operation)?;
-            Ok(json!({
-                "name": a.name,
-                "config_dir": a.config_dir,
-                "description": a.description,
-                "default_model": a.default_model,
-                "default_effort": a.default_effort,
-            }))
+            let mut result = account_json(&a);
+            if let Some(w) = warning {
+                result["warning"] = json!(w);
+            }
+            Ok(result)
         }
         "remove" => {
             let name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
@@ -5155,7 +5190,7 @@ fn dispatch_orchestrator_handoff(
     let profile = orchestrator::Profile::load(profile_name).unwrap_or_default();
     // env 検証（内部変数の上書き拒否。Issue #500）
     profile.validate_env().map_err(DispatchError::Operation)?;
-    let profile_env = profile.resolved_env();
+    let profile_env = profile.resolved_env_plan();
 
     let master_agent = profile
         .resolve_master_agent()
@@ -5185,7 +5220,7 @@ fn dispatch_orchestrator_handoff(
     let options = SpawnOptions {
         command: None,
         cwd: Some(cwd.clone()),
-        env: profile_env.clone(),
+        env: profile_env.exports.clone(),
     };
     host.attach_session(new_id, options);
 
@@ -5270,7 +5305,7 @@ fn dispatch_git_resolve_agent(
     let caller_pane = pane.map(PaneId::from_raw);
     let profile = resolve_caller_profile_with_role(host.workspace(), caller_pane, &None);
     profile.validate_env().map_err(DispatchError::Operation)?;
-    let profile_env = profile.resolved_env();
+    let profile_env = profile.resolved_env_plan();
     let worker_agent = profile
         .resolve_worker_agent(agent)
         .map_err(DispatchError::InvalidParams)?;
@@ -5304,7 +5339,7 @@ fn dispatch_git_resolve_agent(
     let options = SpawnOptions {
         command: None,
         cwd: Some(repo.clone()),
-        env: profile_env.clone(),
+        env: profile_env.exports.clone(),
     };
     host.attach_session(new_id, options);
 
@@ -5472,7 +5507,7 @@ fn dispatch_orchestrator_spawn(
     } else {
         None
     };
-    let profile_env = profile.resolved_env_with_account(resolved_account.as_ref());
+    let profile_env = profile.resolved_env_plan_with_account(resolved_account.as_ref());
 
     let worker_agent = profile
         .resolve_worker_agent(agent)
@@ -5519,7 +5554,7 @@ fn dispatch_orchestrator_spawn(
     let options = SpawnOptions {
         command: None,
         cwd: Some(std::path::PathBuf::from(&cwd)),
-        env: profile_env.clone(),
+        env: profile_env.exports.clone(),
     };
     host.attach_session(new_id, options);
 
@@ -5662,12 +5697,10 @@ fn dispatch_orchestrator_spawn(
     crate::request_claude_scan();
 
     // Part 4: env のキー一覧（値はマスク。Issue #500）
-    let env_keys: Vec<&str> = profile_env.iter().map(|(k, _)| k.as_str()).collect();
-    // CLAUDE_CONFIG_DIR が設定されている場合、config dir パスを応答に含める
-    let config_dir_value = profile_env
-        .iter()
-        .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
-        .map(|(_, v)| v.as_str());
+    let env_keys: Vec<&str> = profile_env.export_keys();
+    // CLAUDE_CONFIG_DIR が設定されている場合、config dir パスを応答に含める。
+    // inherit のアカウントでは設定しない = null + env_unset に現れる（#512）
+    let config_dir_value = profile_env.export_value(orchestrator::CLAUDE_CONFIG_DIR_ENV);
 
     Ok(json!({
         "pane_id": new_id.as_u64(),
@@ -5686,6 +5719,8 @@ fn dispatch_orchestrator_spawn(
         "ledger_id": ledger_id,
         "worker_id": Some(worker_id).filter(|s| !s.is_empty()),
         "env_keys": env_keys,
+        // #512: 明示 unset する変数（inherit アカウントの CLAUDE_CONFIG_DIR 等）
+        "env_unset": profile_env.unsets,
         "config_dir": config_dir_value,
         "account": account_name,
     }))
