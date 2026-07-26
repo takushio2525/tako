@@ -2151,6 +2151,19 @@ enum WindowCommand {
 }
 
 fn main() -> ExitCode {
+    // Windows のメインスレッドは既定 1MB スタックで、コマンド定義（clap の巨大ツリー）
+    // の構築だけで debug ビルドが溢れる（macOS / Linux は 8MB）。本体を十分な
+    // スタックのワーカースレッドで実行する（プラットフォーム共通・挙動不変）
+    std::thread::Builder::new()
+        .name("tako-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(cli_main)
+        .expect("メインスレッドを起動できない")
+        .join()
+        .expect("メインスレッドが異常終了した")
+}
+
+fn cli_main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Mcp(McpCommand::Serve) => mcp_serve(),
@@ -5691,10 +5704,12 @@ impl TransportError {
     }
 }
 
-#[cfg(unix)]
 mod transport {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
+    //! Layer 1 IPC のクライアント側。ワイヤ処理（1 行 1 JSON）はトランスポート
+    //! 非依存（`roundtrip_on`）で、接続の確立だけがプラットフォームで異なる
+    //! （unix: Unix domain socket / windows: named pipe = 抽象境界 B3）
+
+    use std::io::{BufRead, BufReader, Read, Write};
 
     use serde_json::Value;
     use tako_control::protocol::{error_code, Request, RequestEnvelope, ResponseEnvelope};
@@ -5708,21 +5723,50 @@ mod transport {
         request: Request,
         origin: Option<&str>,
     ) -> Result<Value, TransportError> {
+        let (read_half, write_half) = connect(socket)?;
+        roundtrip_on(read_half, write_half, token, request, origin)
+    }
+
+    #[cfg(unix)]
+    fn connect(socket: &str) -> Result<(impl Read, impl Write), TransportError> {
+        use std::os::unix::net::UnixStream;
         let stream = UnixStream::connect(socket).map_err(|e| {
             TransportError::Connect(format!("tako アプリへ接続できない（{socket}: {e}）"))
         })?;
-        let mut writer = stream
+        let read_half = stream
             .try_clone()
             .map_err(|e| TransportError::Other(format!("接続の複製に失敗: {e}")))?;
+        Ok((read_half, stream))
+    }
+
+    #[cfg(windows)]
+    fn connect(socket: &str) -> Result<(impl Read, impl Write), TransportError> {
+        let stream = tako_control::platform::named_pipe::connect_client(socket, 3_000)
+            .map_err(|e| {
+                TransportError::Connect(format!("tako アプリへ接続できない（{socket}: {e}）"))
+            })?;
+        let read_half = stream
+            .try_clone()
+            .map_err(|e| TransportError::Other(format!("接続の複製に失敗: {e}")))?;
+        Ok((read_half, stream))
+    }
+
+    fn roundtrip_on<R: Read, W: Write>(
+        read_half: R,
+        mut write_half: W,
+        token: &str,
+        request: Request,
+        origin: Option<&str>,
+    ) -> Result<Value, TransportError> {
         let mut envelope = RequestEnvelope::new(1, token, request);
         envelope.origin = origin.map(Into::into);
         let json = serde_json::to_string(&envelope)
             .map_err(|e| TransportError::Other(format!("送信の構築に失敗: {e}")))?;
-        writeln!(writer, "{json}")
+        writeln!(write_half, "{json}")
             .map_err(|e| TransportError::Other(format!("送信に失敗: {e}")))?;
 
         let mut line = String::new();
-        BufReader::new(stream)
+        BufReader::new(read_half)
             .read_line(&mut line)
             .map_err(|e| TransportError::Other(format!("応答の受信に失敗: {e}")))?;
         if line.is_empty() {
@@ -5740,27 +5784,6 @@ mod transport {
             });
         }
         Ok(response.result.unwrap_or(Value::Null))
-    }
-}
-
-#[cfg(windows)]
-mod transport {
-    //! TODO(Phase 6): named pipe での実装（`.agent/architecture.md`「IPC トランスポート」節）
-
-    use serde_json::Value;
-    use tako_control::protocol::Request;
-
-    use super::TransportError;
-
-    pub fn roundtrip(
-        _socket: &str,
-        _token: &str,
-        _request: Request,
-        _origin: Option<&str>,
-    ) -> Result<Value, TransportError> {
-        Err(TransportError::Other(
-            "Windows の IPC（named pipe）は未実装（Phase 6 で対応予定）".into(),
-        ))
     }
 }
 

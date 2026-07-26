@@ -6483,7 +6483,8 @@ pub fn resolve_tako_binary() -> String {
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let sibling = dir.join("tako");
+            // Windows は `tako.exe`（EXE_SUFFIX で吸収）
+            let sibling = dir.join(format!("tako{}", std::env::consts::EXE_SUFFIX));
             if sibling.is_file() {
                 return sibling.display().to_string();
             }
@@ -9388,7 +9389,9 @@ mod tests {
         let mut config = orchestrator::ProjectsConfig::load().unwrap();
         let had = config.projects.contains_key(key);
         if !had {
-            config.add(key.to_string(), "/tmp".to_string(), None);
+            // cwd は実在するディレクトリならなんでもよい（/tmp 直書きは Windows に無い）
+            let cwd = std::env::temp_dir().display().to_string();
+            config.add(key.to_string(), cwd, None);
             config.save().unwrap();
         }
         f();

@@ -592,18 +592,15 @@ pub fn resume_command(id: &str, entry: &SessionEntry) -> Result<String, String> 
         }),
         _ => None,
     };
-    let mut cmd = String::new();
-    if let Some(role) = role_env {
-        cmd.push_str(&format!(
-            "TAKO_ORCHESTRATOR_ROLE={} ",
-            crate::orchestrator::agent::sh_quote(&role)
-        ));
-    }
-    cmd.push_str("claude");
+    // シェル方言（unix: POSIX / windows: PowerShell）は agent.rs のペインシェル部品で吸収
+    let mut cmd = match role_env {
+        Some(role) => crate::orchestrator::agent::launch_with_role(&role, "claude"),
+        None => "claude".to_string(),
+    };
     if let Some(model) = entry.model.as_deref() {
         cmd.push_str(&format!(
             " --model {}",
-            crate::orchestrator::agent::sh_quote(model)
+            crate::orchestrator::agent::quote(model)
         ));
     }
     if let Some(effort) = entry.effort.as_deref() {
@@ -870,7 +867,10 @@ mod tests {
         let cmd = resume_command("11111111-2222-3333-4444-555555555555", &entry).unwrap();
         assert_eq!(
             cmd,
-            "TAKO_ORCHESTRATOR_ROLE='worker:tako:112-log' claude --model claude-fable-5 --effort max --resume 11111111-2222-3333-4444-555555555555"
+            format!(
+                "{} --model claude-fable-5 --effort max --resume 11111111-2222-3333-4444-555555555555",
+                crate::orchestrator::agent::launch_with_role("worker:tako:112-log", "claude")
+            )
         );
 
         let solo = SessionEntry {
@@ -880,7 +880,7 @@ mod tests {
         };
         let cmd = resume_command("abc", &solo).unwrap();
         assert!(
-            cmd.starts_with("TAKO_ORCHESTRATOR_ROLE=solo claude"),
+            cmd.starts_with(&crate::orchestrator::agent::launch_with_role("solo", "claude")),
             "{cmd}"
         );
 

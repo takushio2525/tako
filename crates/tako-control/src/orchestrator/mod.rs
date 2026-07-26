@@ -1404,39 +1404,33 @@ pub fn build_master_cmd(
     profile.validate_env()?;
 
     let agent = profile.resolve_master_agent()?;
-    // プロファイル env をコマンド先頭で export する。direnv より後勝ちで上書きする
+    // プロファイル env をコマンド先頭で設定する。direnv より後勝ちで上書きする
+    // （シェル方言の吸収は agent.rs のペインシェル部品に集約。Windows 対応）
     let mut cmd = String::new();
     for (k, v) in profile.resolved_env() {
-        cmd.push_str(&format!(
-            "export {}={}; ",
-            agent::sh_quote(&k),
-            agent::sh_quote(&v)
-        ));
+        cmd.push_str(&agent::env_assign(&k, &v));
     }
-    cmd.push_str(&format!(
-        "TAKO_ORCHESTRATOR_ROLE='{role_env}' {}",
-        agent.as_str()
-    ));
+    cmd.push_str(&agent::launch_with_role(role_env, agent.as_str()));
     match agent {
         WorkerAgent::Claude => {
             if let Some(model) = profile.model.as_deref() {
-                cmd.push_str(&format!(" --model '{model}'"));
+                cmd.push_str(&format!(" --model {}", agent::quote(model)));
             }
             cmd.push_str(&format!(" --effort {}", profile.effort));
             cmd.push_str(&format!(
-                " --append-system-prompt-file '{}'",
-                prompt_path.display()
+                " --append-system-prompt-file {}",
+                agent::quote(&prompt_path.display().to_string())
             ));
         }
         WorkerAgent::Codex => {
             if let Some(model) = profile.model.as_deref() {
-                cmd.push_str(&format!(" --model {}", agent::sh_quote(model)));
+                cmd.push_str(&format!(" --model {}", agent::quote(model)));
             }
             // codex 0.144 の effort は none/minimal/low/medium/high/xhigh/max/ultra
             // （バイナリの enum で確認）。ネイティブ表記をそのまま渡す（worker と同じ思想）
             cmd.push_str(&format!(
                 " -c model_reasoning_effort={}",
-                agent::sh_quote(&profile.effort)
+                agent::quote(&profile.effort)
             ));
             // MCP ツール呼び出し・コマンド実行の承認をスキップ（#132）。
             // `-a never` はコマンド承認のみでMCPツール承認はバイパスしない（実測）。
@@ -1446,7 +1440,7 @@ pub fn build_master_cmd(
             // tako 外で起動した codex にツールを公開しない = FR-2.3.2 と同方針）
             cmd.push_str(&format!(
                 " -c {}",
-                agent::sh_quote(&format!(
+                agent::quote(&format!(
                     "mcp_servers.tako.command={}",
                     agent::toml_quote(tako_bin)
                 ))
@@ -1458,10 +1452,12 @@ pub fn build_master_cmd(
             // system prompt は developer_instructions（developer ロールメッセージとして
             // モデル可視プロンプトへ注入されることを codex debug prompt-input で実証済み）。
             // "$(cat …)" はダブルクォート内コマンド置換のため、ファイル内容の $ / " / '
-            // はシェルに再解釈されない
+            // はシェルに再解釈されない。
+            // NOTE(Windows): PowerShell では $(cat) の展開規則が異なるため、
+            // codex master は Windows 未検証（platform マトリクスの Pending 扱い）
             cmd.push_str(&format!(
                 " -c developer_instructions=\"$(cat {})\"",
-                agent::sh_quote(&prompt_path.display().to_string())
+                agent::quote(&prompt_path.display().to_string())
             ));
         }
         // resolve_master_agent が拒否する（master 非対応）
@@ -2487,7 +2483,11 @@ prompt_blocks:
         let cmd = build_master_cmd("master", &p, Path::new("/tmp/p.md"), "tako").unwrap();
         assert_eq!(
             cmd,
-            "TAKO_ORCHESTRATOR_ROLE='master' claude --effort max --append-system-prompt-file '/tmp/p.md'"
+            format!(
+                "{} --effort max --append-system-prompt-file {}",
+                agent::launch_with_role("master", "claude"),
+                agent::quote("/tmp/p.md")
+            )
         );
         assert!(!cmd.contains("--model"));
     }
@@ -2521,14 +2521,17 @@ prompt_blocks:
         .unwrap();
         assert_eq!(
             cmd,
-            "TAKO_ORCHESTRATOR_ROLE='master:sol' codex \
+            format!(
+                "{} \
              --model gpt-5.6-sol \
              -c model_reasoning_effort=xhigh \
              --dangerously-bypass-approvals-and-sandbox \
              -c 'mcp_servers.tako.command=\"/usr/local/bin/tako\"' \
              -c 'mcp_servers.tako.args=[\"mcp\",\"serve\"]' \
              -c 'mcp_servers.tako.env_vars=[\"TAKO_SOCKET\",\"TAKO_TOKEN\",\"TAKO_PANE_ID\",\"TAKO_TAB_ID\",\"TAKO_ORCHESTRATOR_ROLE\"]' \
-             -c developer_instructions=\"$(cat /tmp/_system_prompt_sol.md)\""
+             -c developer_instructions=\"$(cat /tmp/_system_prompt_sol.md)\"",
+                agent::launch_with_role("master:sol", "codex")
+            )
         );
     }
 
@@ -2651,7 +2654,11 @@ prompt_blocks:
         let cmd = build_master_cmd("solo", &p, Path::new("/tmp/solo.md"), "tako").unwrap();
         assert_eq!(
             cmd,
-            "TAKO_ORCHESTRATOR_ROLE='solo' claude --effort high --append-system-prompt-file '/tmp/solo.md'"
+            format!(
+                "{} --effort high --append-system-prompt-file {}",
+                agent::launch_with_role("solo", "claude"),
+                agent::quote("/tmp/solo.md")
+            )
         );
         assert!(
             !cmd.contains("--model"),
@@ -2660,7 +2667,7 @@ prompt_blocks:
 
         let cmd_suffix =
             build_master_cmd("solo:docs", &p, Path::new("/tmp/solo.md"), "tako").unwrap();
-        assert!(cmd_suffix.contains("TAKO_ORCHESTRATOR_ROLE='solo:docs'"));
+        assert!(cmd_suffix.contains(&agent::launch_with_role("solo:docs", "claude")));
         assert!(cmd_suffix.contains("--effort high"));
     }
 
@@ -2673,7 +2680,7 @@ prompt_blocks:
             ..Default::default()
         };
         let cmd = build_master_cmd("solo", &p, Path::new("/tmp/solo.md"), "tako").unwrap();
-        assert!(cmd.starts_with("TAKO_ORCHESTRATOR_ROLE='solo' codex "));
+        assert!(cmd.starts_with(&agent::launch_with_role("solo", "codex")));
         assert!(cmd.contains("-c model_reasoning_effort=high"));
         assert!(
             cmd.contains("--dangerously-bypass-approvals-and-sandbox"),
@@ -2689,12 +2696,18 @@ prompt_blocks:
         let with = build_worker_claude_cmd("worker:demo", Some("claude-sonnet-5"), "high");
         assert_eq!(
             with,
-            "TAKO_ORCHESTRATOR_ROLE='worker:demo' claude --model claude-sonnet-5 --effort high"
+            format!(
+                "{} --model claude-sonnet-5 --effort high",
+                agent::launch_with_role("worker:demo", "claude")
+            )
         );
         let without = build_worker_claude_cmd("worker:demo", None, "max");
         assert_eq!(
             without,
-            "TAKO_ORCHESTRATOR_ROLE='worker:demo' claude --effort max"
+            format!(
+                "{} --effort max",
+                agent::launch_with_role("worker:demo", "claude")
+            )
         );
     }
 
@@ -3116,7 +3129,10 @@ worker_agents:
         let (k, v) = &resolved[0];
         assert_eq!(k, "CLAUDE_CONFIG_DIR");
         assert!(!v.starts_with('~'), "チルダが展開されている: {v}");
-        assert!(v.ends_with("/test-dir"), "パスが保持されている: {v}");
+        assert!(
+            v.ends_with("/test-dir") || v.ends_with("\\test-dir"),
+            "パスが保持されている: {v}"
+        );
     }
 
     #[test]
@@ -3277,13 +3293,15 @@ worker_agents:
 
     #[test]
     fn resolve_cwd_existing_dir() {
+        // 実在するディレクトリならなんでもよい（/tmp 直書きは Windows に無い）
+        let dir = std::env::temp_dir().display().to_string();
         let p = Profile {
-            cwd: Some("/tmp".into()),
+            cwd: Some(dir.clone()),
             ..Default::default()
         };
         let resolved = p.resolve_cwd().unwrap();
         assert!(resolved.is_some());
-        assert_eq!(resolved.unwrap().to_str().unwrap(), "/tmp");
+        assert_eq!(resolved.unwrap(), std::path::PathBuf::from(dir));
     }
 
     #[test]

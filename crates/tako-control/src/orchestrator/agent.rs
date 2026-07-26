@@ -89,27 +89,23 @@ pub struct WorkerLaunch<'a> {
 /// claude の従来出力（`build_worker_claude_cmd`）と互換（skip_permissions /
 /// extra_args 未使用時は既存文字列と一致する）
 pub fn build_worker_cmd(launch: &WorkerLaunch) -> String {
-    // プロファイル env をコマンド先頭で export する。ログインシェルが direnv で
-    // 同変数を設定していても、export が後勝ちで上書きする（Issue #500）
+    // プロファイル env をコマンド先頭で設定する。ログインシェルが direnv で
+    // 同変数を設定していても、明示の代入が後勝ちで上書きする（Issue #500）
     let mut cmd = String::new();
     if !launch.env.is_empty() {
         for (k, v) in launch.env {
-            cmd.push_str(&format!("export {}={}; ", sh_quote(k), sh_quote(v)));
+            cmd.push_str(&env_assign(k, v));
         }
     }
-    cmd.push_str(&format!(
-        "TAKO_ORCHESTRATOR_ROLE={} {}",
-        sh_quote(launch.role),
-        launch.agent.as_str()
-    ));
+    cmd.push_str(&launch_with_role(launch.role, launch.agent.as_str()));
     if let Some(model) = launch.model {
-        cmd.push_str(&format!(" --model {}", sh_quote(model)));
+        cmd.push_str(&format!(" --model {}", quote(model)));
     }
     if let Some(effort) = launch.effort {
         match launch.agent {
             WorkerAgent::Claude => cmd.push_str(&format!(" --effort {effort}")),
             WorkerAgent::Codex => {
-                cmd.push_str(&format!(" -c model_reasoning_effort={}", sh_quote(effort)))
+                cmd.push_str(&format!(" -c model_reasoning_effort={}", quote(effort)))
             }
             // agy に effort 指定は無い（モデル名の "(High)" 等に組込み）
             WorkerAgent::Agy => {}
@@ -125,14 +121,67 @@ pub fn build_worker_cmd(launch: &WorkerLaunch) -> String {
     }
     for arg in launch.extra_args {
         cmd.push(' ');
-        cmd.push_str(&sh_quote(arg));
+        cmd.push_str(&quote(arg));
     }
     cmd
 }
 
-/// 単一引数のシェルクオート。英数と安全な記号のみなら素通し、
+// --- ペインシェル向けのコマンド行部品 ---
+//
+// master / worker のコマンドはペインの既定シェルへ**文字列として流し込む**ため、
+// シェル方言に合わせて組み立てる必要がある（unix: POSIX sh 系 / windows: PowerShell）。
+// orchestrator のコマンド組み立ては必ずこの部品を通し、POSIX 構文
+// （`export K=V;` / `K=V cmd` / sh クオート）の直書きを増やさない。
+
+/// 単一引数のクオート（ペインの既定シェル向け）
+pub(crate) fn quote(s: &str) -> String {
+    #[cfg(windows)]
+    {
+        ps_quote(s)
+    }
+    #[cfg(not(windows))]
+    {
+        sh_quote(s)
+    }
+}
+
+/// 環境変数の設定文（コマンド行の先頭に置く。末尾に区切りを含む）
+pub(crate) fn env_assign(k: &str, v: &str) -> String {
+    #[cfg(windows)]
+    {
+        // PowerShell の代入の右辺は裸のトークン不可（コマンド呼び出しと解釈される）
+        // のため常に single quote で囲む
+        format!("$env:{k} = '{}'; ", v.replace('\'', "''"))
+    }
+    #[cfg(not(windows))]
+    {
+        format!("export {}={}; ", sh_quote(k), sh_quote(v))
+    }
+}
+
+/// TAKO_ORCHESTRATOR_ROLE を設定してエージェント CLI を起動するコマンドの先頭部分
+pub(crate) fn launch_with_role(role: &str, program: &str) -> String {
+    #[cfg(windows)]
+    {
+        // PowerShell に POSIX の一時 env prefix（`K=V cmd`）は無いので代入 + 呼び出し。
+        // ペインは worker / master 専用でシェルへ env が残っても実害はない
+        format!(
+            "$env:TAKO_ORCHESTRATOR_ROLE = '{}'; & {program}",
+            role.replace('\'', "''")
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        format!("TAKO_ORCHESTRATOR_ROLE={} {program}", sh_quote(role))
+    }
+}
+
+/// 単一引数のシェルクオート（POSIX sh 系）。英数と安全な記号のみなら素通し、
 /// それ以外（role のコロン・agy モデル名の空白等）は single quote で囲む
 /// （内部の `'` は `'\''`）
+// Windows の lib ビルドではペインシェル部品（quote 等）から参照されないが、
+// テストと unix ビルドで使うため常にコンパイルする
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn sh_quote(s: &str) -> String {
     if !s.is_empty()
         && s.chars()
@@ -141,6 +190,20 @@ pub(crate) fn sh_quote(s: &str) -> String {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// 単一引数の PowerShell クオート。英数と安全な記号（パス区切り・ドライブの `:` を含む）
+/// のみなら素通し、それ以外は single quote で囲む（内部の `'` は `''`）
+#[cfg(windows)]
+pub(crate) fn ps_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '/' | '.' | '-' | '_' | '\\' | ':'))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "''"))
     }
 }
 
@@ -269,7 +332,10 @@ mod tests {
         });
         assert_eq!(
             cmd,
-            "TAKO_ORCHESTRATOR_ROLE='worker:demo' claude --model claude-sonnet-5 --effort high"
+            format!(
+                "{} --model claude-sonnet-5 --effort high",
+                launch_with_role("worker:demo", "claude")
+            )
         );
     }
 
@@ -284,7 +350,10 @@ mod tests {
         });
         assert_eq!(
             cmd,
-            "TAKO_ORCHESTRATOR_ROLE='worker:demo' codex --model gpt-5.6-terra -c model_reasoning_effort=medium"
+            format!(
+                "{} --model gpt-5.6-terra -c model_reasoning_effort=medium",
+                launch_with_role("worker:demo", "codex")
+            )
         );
     }
 
@@ -300,7 +369,11 @@ mod tests {
         });
         assert_eq!(
             cmd,
-            "TAKO_ORCHESTRATOR_ROLE='worker:demo' agy --model 'Gemini 3.5 Flash (High)'"
+            format!(
+                "{} --model {}",
+                launch_with_role("worker:demo", "agy"),
+                quote("Gemini 3.5 Flash (High)")
+            )
         );
         assert!(!cmd.contains("effort"), "agy に effort は渡さない");
     }
@@ -330,7 +403,7 @@ mod tests {
             extra_args: &args,
             ..Default::default()
         });
-        assert!(cmd.ends_with("codex --search 'has space'"));
+        assert!(cmd.ends_with(&format!("codex --search {}", quote("has space"))));
     }
 
     #[test]
@@ -343,7 +416,7 @@ mod tests {
             });
             assert!(!cmd.contains("--model"));
             assert!(!cmd.contains("effort"));
-            assert!(cmd.starts_with("TAKO_ORCHESTRATOR_ROLE='worker:x' "));
+            assert!(cmd.starts_with(&launch_with_role("worker:x", agent.as_str())));
         }
     }
 
@@ -353,6 +426,32 @@ mod tests {
         assert_eq!(sh_quote("with space"), "'with space'");
         assert_eq!(sh_quote("it's"), "'it'\\''s'");
         assert_eq!(sh_quote(""), "''");
+    }
+
+    /// ペインシェル部品がプラットフォームの方言で組み立てられる
+    /// （unix: POSIX sh / windows: PowerShell。組み立ての順序・フラグは共通コードが担う）
+    #[test]
+    fn pane_shell_parts_use_platform_dialect() {
+        #[cfg(windows)]
+        {
+            assert_eq!(ps_quote("simple-model_1.0"), "simple-model_1.0");
+            assert_eq!(ps_quote(r"C:\Users\a\p.md"), r"C:\Users\a\p.md");
+            assert_eq!(ps_quote("with space"), "'with space'");
+            assert_eq!(ps_quote("it's"), "'it''s'");
+            assert_eq!(env_assign("K", "v w"), "$env:K = 'v w'; ");
+            assert_eq!(
+                launch_with_role("worker:x", "claude"),
+                "$env:TAKO_ORCHESTRATOR_ROLE = 'worker:x'; & claude"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(env_assign("K", "v w"), "export K='v w'; ");
+            assert_eq!(
+                launch_with_role("worker:x", "claude"),
+                "TAKO_ORCHESTRATOR_ROLE='worker:x' claude"
+            );
+        }
     }
 
     #[test]
@@ -448,12 +547,14 @@ mod tests {
             env: &env,
             ..Default::default()
         });
-        assert!(cmd.starts_with("export "), "env export が先頭にある: {cmd}");
         assert!(
-            cmd.contains("CLAUDE_CONFIG_DIR="),
-            "config dir が含まれる: {cmd}"
+            cmd.starts_with(&env_assign("CLAUDE_CONFIG_DIR", "/home/test/.claude-univ")),
+            "env 設定が先頭にある: {cmd}"
         );
-        assert!(cmd.contains("MY_VAR="), "任意変数が含まれる: {cmd}");
+        assert!(
+            cmd.contains(&env_assign("MY_VAR", "hello world")),
+            "任意変数が含まれる: {cmd}"
+        );
         assert!(cmd.contains("claude"), "agent コマンドが含まれる: {cmd}");
     }
 
@@ -466,10 +567,10 @@ mod tests {
             ..Default::default()
         });
         assert!(
-            cmd.starts_with("TAKO_ORCHESTRATOR_ROLE="),
-            "env なしなら従来と同じ形式: {cmd}"
+            cmd.starts_with(&launch_with_role("worker:test", "claude")),
+            "env なしなら role 設定 + 起動だけの形式: {cmd}"
         );
-        assert!(!cmd.contains("export "), "export は入らない: {cmd}");
+        assert!(!cmd.contains("export "), "env 設定は入らない: {cmd}");
     }
 
     #[test]
@@ -482,8 +583,8 @@ mod tests {
             ..Default::default()
         });
         assert!(
-            cmd.contains("export ANTHROPIC_API_KEY="),
-            "codex にも env export: {cmd}"
+            cmd.contains(&env_assign("ANTHROPIC_API_KEY", "sk-test")),
+            "codex にも env 設定: {cmd}"
         );
         assert!(cmd.contains("codex"), "codex コマンド: {cmd}");
     }

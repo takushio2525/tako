@@ -36,7 +36,10 @@ pub fn find_transcript(session_id: &str) -> Option<PathBuf> {
     if !is_valid_session_id(session_id) {
         return None;
     }
-    let home = std::env::var("HOME").ok()?;
+    // Windows は HOME が未設定のことが多いため USERPROFILE へフォールバックする
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
     let projects = PathBuf::from(home).join(".claude").join("projects");
     let entries = std::fs::read_dir(&projects).ok()?;
     for entry in entries.flatten() {

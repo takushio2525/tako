@@ -147,9 +147,15 @@ pub fn socket_alive(socket: &str) -> bool {
     std::os::unix::net::UnixStream::connect(socket).is_ok()
 }
 
-#[cfg(not(unix))]
+/// Windows: named pipe の待ち受けプローブ（B3。`platform::named_pipe`）
+#[cfg(windows)]
+pub fn socket_alive(socket: &str) -> bool {
+    crate::platform::named_pipe::probe_alive(socket)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn socket_alive(_socket: &str) -> bool {
-    // Windows named pipe は Phase 6。それまで存在確認しない（候補に残して接続試行に任せる）
+    // 未知のプラットフォームでは存在確認しない（候補に残して接続試行に任せる）
     true
 }
 

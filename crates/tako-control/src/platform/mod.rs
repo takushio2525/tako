@@ -9,6 +9,8 @@
 
 pub mod facts;
 pub mod local_endpoint;
+#[cfg(windows)]
+pub mod named_pipe;
 pub mod os_integration;
 pub mod process;
 
