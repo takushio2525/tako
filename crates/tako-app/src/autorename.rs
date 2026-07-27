@@ -164,12 +164,14 @@ fn detect_claude() -> Option<PathBuf> {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "/bin/sh".into());
-    let output = std::process::Command::new(shell)
-        .args(["-l", "-c", "command -v claude"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    // #628: GUI プロセスからの起動なのでコンソールウィンドウを出させない
+    let output =
+        tako_core::platform::process::no_console_window(&mut std::process::Command::new(shell))
+            .args(["-l", "-c", "command -v claude"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
     if !output.status.success() {
         return None;
     }

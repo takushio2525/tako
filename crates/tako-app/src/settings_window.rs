@@ -295,13 +295,15 @@ impl SettingsWindow {
             ["claude", "codex", "agy"]
                 .iter()
                 .map(|cli| {
-                    let found = std::process::Command::new("which")
-                        .arg(cli)
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false);
+                    // #628: GUI プロセスからの起動なのでコンソールウィンドウを出させない
+                    let found = tako_core::platform::process::no_console_window(
+                        std::process::Command::new("which").arg(cli),
+                    )
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
                     (cli.to_string(), found)
                 })
                 .collect::<Vec<_>>()
