@@ -2146,6 +2146,18 @@ enum TabCommand {
         /// 新しいタイトル（複数引数はスペース連結。空文字で手動指定を解除）
         title: Vec<String>,
     },
+    /// いまのタブ名を固定する（自動リネームに上書きされなくなる。#552）
+    Pin {
+        /// 対象タブ ID（省略時は呼び出し元ペインの属するタブ）
+        #[arg(long)]
+        tab: Option<u64>,
+        /// 固定を解除して自動リネームを再開する
+        #[arg(long)]
+        off: bool,
+        /// 変更せず現在の固定状態だけを表示する
+        #[arg(long, conflicts_with = "off")]
+        status: bool,
+    },
     /// タブを切り替える
     Select { tab: u64 },
     /// タブの並び順を変更する（D&D 並べ替えと同等。#308）
@@ -4290,6 +4302,15 @@ fn build_request(command: &Command) -> Result<Request, String> {
             title: title.join(" "),
             source: source.clone(),
         },
+        Command::Tab(TabCommand::Pin { tab, off, status }) => Request::TabPinTitle {
+            pane: if tab.is_none() {
+                target_pane(None)?
+            } else {
+                None
+            },
+            tab: *tab,
+            pinned: if *status { None } else { Some(!*off) },
+        },
         Command::Tab(TabCommand::Select { tab }) => Request::TabSelect { tab: *tab },
         Command::Window(WindowCommand::List) => Request::WindowList,
         Command::Window(WindowCommand::New { tab }) => Request::WindowNew { tab: *tab },
@@ -5826,7 +5847,9 @@ fn print_result(command: &Command, result: &Value) {
         Command::List => {
             println!("{}", pretty_json(result));
         }
-        Command::Tab(TabCommand::New { .. }) => println!("{result}"),
+        Command::Tab(TabCommand::New { .. }) | Command::Tab(TabCommand::Pin { .. }) => {
+            println!("{result}")
+        }
         Command::Window(WindowCommand::List) => println!("{}", pretty_json(result)),
         Command::Window(
             WindowCommand::New { .. } | WindowCommand::Close { .. } | WindowCommand::MoveTab { .. },
@@ -6759,6 +6782,7 @@ mod platform_matrix_parity {
         ("split", "tako_split_pane"),
         ("tab move-pane", "tako_move_pane_to_tab"),
         ("tab new", "tako_create_tab"),
+        ("tab pin", "tako_pin_tab_title"),
         ("tab rename", "tako_rename_tab"),
         ("tab reorder", "tako_reorder_tab"),
         ("tab select", "tako_select_tab"),

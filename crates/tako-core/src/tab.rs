@@ -122,6 +122,17 @@ impl Tab {
         true
     }
 
+    /// いまのタイトルをそのまま手動指定として固定する（#552 案 4「この名前を固定」）。
+    /// 自動命名で付いた名前が気に入ったときに、名前を打ち直さずに以後の自動更新を止める。
+    /// すでに手動指定なら何も変えず false（`clear_manual_title` で自動へ戻す）
+    pub fn pin_title(&mut self) -> bool {
+        if self.title_source == TitleSource::Manual {
+            return false;
+        }
+        self.title_source = TitleSource::Manual;
+        true
+    }
+
     pub fn tree(&self) -> &PaneTree {
         &self.tree
     }
@@ -196,6 +207,26 @@ mod tests {
         tab.clear_manual_title();
         assert!(tab.set_title_auto("再開"));
         assert_eq!(tab.title(), "再開");
+    }
+
+    /// #552 案 4「この名前を固定」: 自動命名された名前を打ち直さずに手動化でき、
+    /// 固定後は自動リネームの対象外になる
+    #[test]
+    fn pin_titleは自動命名された名前をそのまま手動固定する() {
+        let mut tab = Tab::new("1", Pane::new(PaneOrigin::User));
+        assert!(tab.set_title_auto("tako 検証"));
+        assert!(tab.pin_title());
+        assert_eq!(tab.title(), "tako 検証", "名前は変えずに出どころだけ変える");
+        assert_eq!(tab.title_source(), TitleSource::Manual);
+        // 固定後は自動リネームが効かない
+        assert!(!tab.set_title_auto("別名"));
+        assert_eq!(tab.title(), "tako 検証");
+        // 二重固定は false（すでに手動）
+        assert!(!tab.pin_title());
+        // 解除すれば自動が再開する
+        tab.clear_manual_title();
+        assert!(tab.set_title_auto("別名"));
+        assert_eq!(tab.title(), "別名");
     }
 
     // --- #171: pinned_folders の正規パスデデュープ ---

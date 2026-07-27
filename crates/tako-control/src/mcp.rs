@@ -549,6 +549,22 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_pin_tab_title",
+            "description": "いまのタブ名をそのまま固定する（以後 自動リネームに上書きされない）。\
+                GUI で自動命名の直後にタブへ出る「この名前を固定」の印と同じ操作で、\
+                名前を打ち直さずに気に入った名前を残せる。\
+                pinned=false で固定を解除すると自動リネームが再開する。\
+                pinned 省略時は現在の固定状態の取得のみ。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tab": { "type": "integer", "minimum": 0, "description": "対象タブ ID（省略時は呼び出し元ペインのタブ）" },
+                    "pinned": { "type": "boolean", "description": "true = いまの名前を固定、false = 固定解除（自動リネーム再開）。省略時は状態取得のみ" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_create_tab",
             "description": "新しいタブ（= エージェントグループ）を作り、タブ ID と初期ペイン ID を返す。\
                 いまのタブと無関係な作業系列を始めるときに使う（1 グループ = 1 タブ）。\
@@ -3199,6 +3215,18 @@ fn build_request(
                 source: str_arg(args, "source")?,
             }
         }
+        "tako_pin_tab_title" => {
+            let tab = u64_arg(args, "tab")?;
+            Request::TabPinTitle {
+                pane: if tab.is_none() {
+                    Some(target_pane(args, caller)?)
+                } else {
+                    None
+                },
+                tab,
+                pinned: bool_arg(args, "pinned")?,
+            }
+        }
         "tako_create_tab" => Request::TabNew {
             title: str_arg(args, "title")?,
             focus: bool_arg(args, "focus")?,
@@ -4626,7 +4654,7 @@ mod tests {
         let tools = tools();
         // 件数の固定値。ツール追加時はここと対応マトリクス（#515）の両方を更新する
         // （分類漏れ自体は tests/platform_parity.rs の T1 が検出する）
-        assert_eq!(tools.len(), 125);
+        assert_eq!(tools.len(), 126);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
