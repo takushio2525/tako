@@ -16,6 +16,14 @@ pub fn update() -> &'static str {
     tr!("更新", "Update")
 }
 
+/// クリップボード操作（ペインの右クリックメニュー等。キー: common.copy / common.paste）
+pub fn copy() -> &'static str {
+    tr!("コピー", "Copy")
+}
+pub fn paste() -> &'static str {
+    tr!("ペースト", "Paste")
+}
+
 /// タイトル未確定ペインの既定タイトル（キー: common.terminal_fallback_title）
 pub fn terminal_fallback_title() -> &'static str {
     tr!("ターミナル", "Terminal")
@@ -54,6 +62,8 @@ mod tests {
                 cancel().to_string(),
                 restore().to_string(),
                 update().to_string(),
+                copy().to_string(),
+                paste().to_string(),
                 terminal_fallback_title().to_string(),
                 format_age(5),
                 format_age(90),

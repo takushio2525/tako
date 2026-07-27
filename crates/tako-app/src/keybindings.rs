@@ -67,7 +67,7 @@ actions!(
 
 /// iTerm2 の操作感を踏襲したキーバインド
 pub(crate) fn key_bindings() -> Vec<KeyBinding> {
-    vec![
+    let mut bindings = vec![
         KeyBinding::new("cmd-d", SplitRight, None),
         KeyBinding::new("cmd-shift-d", SplitDown, None),
         KeyBinding::new("cmd-w", ClosePane, None),
@@ -115,7 +115,44 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-alt-h", HideOthers, None),
         KeyBinding::new("cmd-m", MinimizeWindow, None),
         KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
+    ];
+    bindings.extend(clipboard_bindings_for_platform());
+    bindings
+}
+
+/// macOS 以外（Windows / Linux）のクリップボード操作バインド（#467）
+///
+/// 上の一覧の `cmd-` は GPUI では **platform 修飾**に解決され、Windows では
+/// Win キーになる（`gpui_windows` が VK_LWIN / VK_RWIN を platform へ写す）。
+/// Win+V は OS のクリップボード履歴が奪うため、`cmd-v` だけだと tako の
+/// ペースト経路（PasteClipboard）へ Windows から到達する手段が無くなる。
+/// そこで OS 慣習のキーを追加で張り、入口を用意する。
+///
+/// トレードオフ: `ctrl-v` を張ると Ctrl+V の C0 制御コード 0x16（readline /
+/// vim の逐語入力）は PTY へ届かなくなる。GPUI はキーバインドのアクションを
+/// `on_key_down` より先に発火し、バブルフェーズでアクションが既定で伝播を
+/// 止めるため（gpui `window.rs` の dispatch_key_event / dispatch_action_on_node）。
+/// Windows Terminal も既定で Ctrl+V をペーストに割り当てており、
+/// 逐語入力より「ペーストできない」ほうが実害が大きいのでこの配分を採る。
+/// Ctrl+C（SIGINT）等は修飾が一致しないので影響しない
+/// （`ctrl-shift-c` は Ctrl+C とは別のキーストローク）。
+#[cfg(not(target_os = "macos"))]
+fn clipboard_bindings_for_platform() -> Vec<KeyBinding> {
+    vec![
+        KeyBinding::new("ctrl-v", PasteClipboard, None),
+        // Linux ターミナル慣習。Ctrl+V を逐語入力へ戻したくなっても残る退路
+        KeyBinding::new("ctrl-shift-v", PasteClipboard, None),
+        // 旧来の Windows 慣習。現状 keystroke_to_bytes は insert を送らないので
+        // ターミナル入力を奪わない
+        KeyBinding::new("shift-insert", PasteClipboard, None),
+        KeyBinding::new("ctrl-shift-c", CopySelection, None),
     ]
+}
+
+/// macOS は `cmd-` が本来の Command キーに解決されるため追加は不要
+#[cfg(target_os = "macos")]
+fn clipboard_bindings_for_platform() -> Vec<KeyBinding> {
+    Vec::new()
 }
 
 /// CSI u（kitty keyboard protocol）の送出範囲
@@ -431,6 +468,80 @@ mod tests {
         assert!(
             quit[0].predicate().is_none(),
             "コンテキスト述語なし（どのフォーカス状態でもマッチ）"
+        );
+    }
+
+    /// 指定アクションのバインドのうち、platform（cmd / Win）修飾を使わないものを集める
+    fn 非platform修飾のバインド(action: &str) -> Vec<Vec<Keystroke>> {
+        key_bindings()
+            .iter()
+            .filter(|b| b.action().name() == action)
+            .map(|b| {
+                b.keystrokes()
+                    .iter()
+                    .map(|k| k.inner().clone())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|ks| !ks.iter().any(|k| k.modifiers.platform))
+            .collect()
+    }
+
+    /// #467: Windows では GPUI の `cmd` = platform 修飾が Win キーに解決され、
+    /// Win+V は OS のクリップボード履歴に奪われる。platform 修飾を使わない
+    /// ペースト経路が最低 1 本残っていることを固定する
+    /// （`clipboard_bindings_for_platform` を消すとこのテストが落ちる）
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn 非macosではplatform修飾なしのペーストバインドが存在する() {
+        let paste = 非platform修飾のバインド("tako::PasteClipboard");
+        assert!(
+            !paste.is_empty(),
+            "PasteClipboard に platform 修飾なしのバインドが 1 本も無い（Windows から到達不能）"
+        );
+        // OS 慣習の 3 経路が揃っていること
+        let 単発 =
+            |ks: &Vec<Keystroke>| -> Option<Keystroke> { (ks.len() == 1).then(|| ks[0].clone()) };
+        let has = |key: &str, ctrl: bool, shift: bool| {
+            paste.iter().filter_map(単発).any(|k| {
+                k.key == key
+                    && k.modifiers.control == ctrl
+                    && k.modifiers.shift == shift
+                    && !k.modifiers.alt
+            })
+        };
+        assert!(has("v", true, false), "ctrl-v が無い");
+        assert!(has("v", true, true), "ctrl-shift-v が無い");
+        assert!(has("insert", false, true), "shift-insert が無い");
+
+        // コピーも同様に platform 修飾なしの経路が要る（ctrl-shift-c）。
+        // Ctrl+C 単独は SIGINT のままでなければならないので shift 必須
+        let copy = 非platform修飾のバインド("tako::CopySelection");
+        let copy_keys: Vec<Keystroke> = copy.iter().filter_map(単発).collect();
+        assert!(
+            copy_keys
+                .iter()
+                .any(|k| k.key == "c" && k.modifiers.control && k.modifiers.shift),
+            "ctrl-shift-c が無い"
+        );
+        assert!(
+            !copy_keys
+                .iter()
+                .any(|k| k.key == "c" && k.modifiers.control && !k.modifiers.shift),
+            "ctrl-c を奪うと SIGINT が送れなくなる"
+        );
+    }
+
+    /// macOS 側は従来どおり cmd- のみ（#467 の追加バインドが漏れ出していない）
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macosではクリップボード操作はcmd修飾のみ() {
+        assert!(
+            非platform修飾のバインド("tako::PasteClipboard").is_empty(),
+            "macOS に非 platform 修飾のペーストバインドが混入している"
+        );
+        assert!(
+            非platform修飾のバインド("tako::CopySelection").is_empty(),
+            "macOS に非 platform 修飾のコピーバインドが混入している"
         );
     }
 }

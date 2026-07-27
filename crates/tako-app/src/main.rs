@@ -4277,6 +4277,15 @@ impl TakoApp {
         }
     }
 
+    /// 右クリックメニューのコピー / ペースト先を、クリックされたペインへ寄せる（#467）。
+    /// `copy_selection` / `paste` はフォーカス中のペイン（と各種テキスト入力欄）に
+    /// 効くため、これを挟まないと別ペインや git 入力欄へ貼られてしまう
+    fn focus_pane_for_clipboard(&mut self, pane_id: PaneId) {
+        let _ = self.workspace.active_tab_mut().tree_mut().focus(pane_id);
+        // #503: ペインを触ったらテキスト入力フラグを一括クリア（左クリックと同じ扱い）
+        self.clear_text_input_focus();
+    }
+
     // --- ペイン操作（ドメイン API の薄い呼び出し。FR-2.5 と同じセマンティクス） ---
 
     fn split(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
@@ -11544,6 +11553,21 @@ impl TakoApp {
                     this.on_pane_mouse_down(pane_id, event, window, cx);
                 }),
             )
+            // #467: ターミナル本体の右クリックメニュー（コピー / ペーストを含む）。
+            // タイトルバー側の同名ハンドラは stop_propagation するのでここへは来ない
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.focus_pane_for_clipboard(pane_id);
+                    this.pane_context_menu = Some(PaneContextMenu {
+                        pane: pane_id,
+                        kind: PaneContextKind::Terminal,
+                        position: event.position,
+                    });
+                    cx.notify();
+                }),
+            )
             .on_scroll_wheel(
                 cx.listener(move |this, event: &ScrollWheelEvent, window, cx| {
                     this.on_pane_scroll(pane_id, event, window, cx);
@@ -14003,16 +14027,33 @@ impl TakoApp {
             .get(&pane_id)
             .and_then(|s| s.cwd())
             .map(|p| p.to_path_buf());
+        // #467: ターミナル本体の右クリックからコピー / ペーストできるようにする。
+        // Windows では GPUI の cmd = Win キーに解決され ⌘V 相当が OS の
+        // クリップボード履歴に奪われるため、マウスだけで完結する経路が要る
+        let has_selection = !is_preview
+            && self
+                .terminals
+                .get(&pane_id)
+                .and_then(|s| s.selection_text())
+                .is_some_and(|t| !t.is_empty());
         let mut items: Vec<(&str, &str)> = Vec::new();
         if is_preview {
             items.push(("copy-path", "パスをコピー"));
             items.push(("reveal", "Finder で表示"));
             items.push(("open-default", "デフォルトアプリで開く"));
             items.push(("sep1", ""));
-        } else if cwd.is_some() {
-            items.push(("copy-cwd", "cwd をコピー"));
-            items.push(("reveal-cwd", "Finder で開く"));
-            items.push(("sep1", ""));
+        } else {
+            // 選択が無いときは「コピー」を出さない（押しても無反応な項目を作らない）
+            if has_selection {
+                items.push(("copy", crate::ui_text::common::copy()));
+            }
+            items.push(("paste", crate::ui_text::common::paste()));
+            items.push(("sep0", ""));
+            if cwd.is_some() {
+                items.push(("copy-cwd", "cwd をコピー"));
+                items.push(("reveal-cwd", "Finder で開く"));
+                items.push(("sep1", ""));
+            }
         }
         items.push(("split-right", "右に分割"));
         items.push(("split-down", "下に分割"));
@@ -14073,6 +14114,16 @@ impl TakoApp {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.pane_context_menu = None;
                         match id {
+                            // #467: copy_selection / paste は「フォーカス中のペイン」に
+                            // 効くので、右クリックしたペインへ先に寄せてから呼ぶ
+                            "copy" => {
+                                this.focus_pane_for_clipboard(pane_id);
+                                this.copy_selection(cx);
+                            }
+                            "paste" => {
+                                this.focus_pane_for_clipboard(pane_id);
+                                this.paste(cx);
+                            }
                             "copy-path" => {
                                 if let Some(p) = &preview_path {
                                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(
