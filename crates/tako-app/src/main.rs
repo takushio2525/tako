@@ -1028,6 +1028,9 @@ struct TakoApp {
     /// 論理ウィンドウ作成済みで GPUI ウィンドウが未生成のもの（dispatch 経由の
     /// window new 等。GPUI の Context が要るため render / defer で消費する）
     pending_viewport_opens: Vec<tako_core::WindowId>,
+    /// dispatch 経由のウィンドウ最小化 / 最大化 / 復元の pending キュー（Issue #584）。
+    /// GPUI の Context が要るので `sync_viewports` で消費する
+    pending_window_states: Vec<(tako_core::WindowId, tako_control::protocol::WindowStateOp)>,
     /// 設定画面ウィンドウのハンドル（単一インスタンス。Issue #459）
     settings_window_handle: Option<gpui::WindowHandle<settings_window::SettingsWindow>>,
     /// dispatch から設定画面を開くための pending キュー（Issue #459）
@@ -2120,6 +2123,7 @@ impl TakoApp {
                 .map(|(id, f)| (tako_core::WindowId::from_raw(*id), f.clone()))
                 .collect(),
             pending_viewport_opens: Vec::new(),
+            pending_window_states: Vec::new(),
             settings_window_handle: None,
             pending_settings_open: None,
             about_window_handle: None,
@@ -6153,6 +6157,16 @@ impl TakoApp {
             if live.contains(&lid) && !self.viewports.iter().any(|(l, _)| *l == lid) {
                 self.open_viewport(lid, cx);
             }
+        }
+        // CLI / MCP からの最小化 / 最大化 / 復元（#584）。最小化中のウィンドウには
+        // render が回らないため、IPC ハンドラ側の sync_viewports 呼び出しが復帰経路になる
+        for (lid, op) in std::mem::take(&mut self.pending_window_states) {
+            let Some((_, handle)) = self.viewports.iter().find(|(l, _)| *l == lid).copied() else {
+                continue;
+            };
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, _| apply_window_state(window, op));
+            });
         }
     }
 
@@ -12660,6 +12674,15 @@ impl UiStateHost for TakoApp {
         self.pending_viewport_opens.push(window);
     }
 
+    fn request_window_state(
+        &mut self,
+        window: tako_core::WindowId,
+        op: tako_control::protocol::WindowStateOp,
+    ) {
+        // 最小化 / 最大化 / 復元も Context が要るため sync_viewports で消費する（#584）
+        self.pending_window_states.push((window, op));
+    }
+
     fn auto_rename_enabled(&self) -> bool {
         self.autorename.enabled
     }
@@ -15355,6 +15378,67 @@ fn tako_titlebar_options() -> gpui::TitlebarOptions {
         appears_transparent: true,
         // 12px のライトをタブバー縦中央へ（(44-12)/2 = 16。カンプ padding-left 16）
         traffic_light_position: Some(point(px(16.), px(16.))),
+    }
+}
+
+/// CLI / MCP からのウィンドウ表示状態の適用（Issue #584）。
+///
+/// GUI のキャプションボタンは押した時点で OS のネイティブ経路が直接実行するので
+/// ここを通らない（`tab_bar::render_window_controls` のドキュメント参照）。
+/// この関数は同じ操作を AI / CLI からも行えるようにするための経路
+/// （開発不変条件「AI フルコントロール」= UI でできることは AI からもできる）。
+fn apply_window_state(window: &mut Window, op: tako_control::protocol::WindowStateOp) {
+    use tako_control::protocol::WindowStateOp;
+    match op {
+        WindowStateOp::Minimize => window.minimize_window(),
+        // macOS の zoom_window はトグルなので、既に最大化なら触らない
+        WindowStateOp::Maximize => {
+            if !window.is_maximized() {
+                window.zoom_window();
+            }
+        }
+        WindowStateOp::Restore => restore_window(window),
+    }
+}
+
+/// 最大化を解除して元のサイズへ戻す（Issue #584）。
+///
+/// macOS は NSWindow の zoom がトグルなので `zoom_window()` がそのまま復元になる。
+#[cfg(not(target_os = "windows"))]
+fn restore_window(window: &mut Window) {
+    if window.is_maximized() {
+        window.zoom_window();
+    }
+}
+
+/// Windows の復元（Issue #584）。
+///
+/// GPUI Windows の `zoom()` は `SW_MAXIMIZE` 固定で、復元手段を公開していない
+/// （rev `cafbf4b5`）。GUI のキャプションボタンは `WM_NCLBUTTONUP` の中で GPUI が
+/// `IsZoomed` を見て `SW_NORMAL` を送っているが、その経路は NC ヒットテスト由来で
+/// しか通らない。CLI / MCP からも復元できるよう、ここだけ user32 の
+/// `ShowWindowAsync` を直接呼ぶ（`windows` クレートを足さない最小 FFI。
+/// 既存の CoreGraphics / PDFKit 呼び出しと同じ作法）。
+#[cfg(target_os = "windows")]
+fn restore_window(window: &mut Window) {
+    /// `SW_RESTORE`（winuser.h）。最小化・最大化を解除して元のサイズ・位置へ戻す
+    const SW_RESTORE: i32 = 9;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn ShowWindowAsync(hwnd: isize, n_cmd_show: i32) -> i32;
+    }
+
+    let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: HWND は GPUI が生きている間有効。ShowWindowAsync は
+    // 対象ウィンドウのスレッドへポストするだけで、この場でブロックしない
+    unsafe {
+        ShowWindowAsync(win32.hwnd.get(), SW_RESTORE);
     }
 }
 

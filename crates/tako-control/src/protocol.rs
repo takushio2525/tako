@@ -72,6 +72,26 @@ fn default_true() -> bool {
     true
 }
 
+/// OS ウィンドウの表示状態操作（Issue #584）。dispatch は GPUI の Context を
+/// 持たないため、UI 層へ「何をするか」だけを渡して実適用は UI 層に委ねる
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowStateOp {
+    Minimize,
+    Maximize,
+    Restore,
+}
+
+impl WindowStateOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WindowStateOp::Minimize => "minimize",
+            WindowStateOp::Maximize => "maximize",
+            WindowStateOp::Restore => "restore",
+        }
+    }
+}
+
 /// 右サイドバー情報パネルの内部ビュー（固定タブ 0 個方針。FR-2.16.6 で agents は
 /// tmux ビューへ統合済み。git は git graph（FR-3.6）実装までプレースホルダ表示）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,6 +294,21 @@ pub enum Request {
     WindowMoveTab { tab: u64, window: u64 },
     /// ウィンドウをアクティブにして前面化する（Issue #339）
     WindowFocus { window: u64 },
+    /// ウィンドウを最小化する（Issue #584）。`window` 省略でアクティブウィンドウ
+    WindowMinimize {
+        #[serde(default)]
+        window: Option<u64>,
+    },
+    /// ウィンドウを最大化する（Issue #584）。既に最大化なら何もしない
+    WindowMaximize {
+        #[serde(default)]
+        window: Option<u64>,
+    },
+    /// 最大化を解除して元のサイズへ戻す（Issue #584）。最大化していなければ何もしない
+    WindowRestore {
+        #[serde(default)]
+        window: Option<u64>,
+    },
     /// ペインの移動（FR-2.5.10 / FR-1.10）。`tab` 指定 = 別タブの末尾へ移送（従来動作）、
     /// `target` 指定 = そのペインを `direction`（省略時は右）へ分割した位置に挿し直す
     /// （同タブ内の並べ替え = タイトルバー D&D と同等。タブまたぎも可）。

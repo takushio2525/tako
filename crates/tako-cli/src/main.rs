@@ -2148,6 +2148,21 @@ enum WindowCommand {
         /// 対象ウィンドウ ID
         window: u64,
     },
+    /// ウィンドウを最小化する（省略時はアクティブウィンドウ）
+    Minimize {
+        /// 対象ウィンドウ ID（省略時はアクティブウィンドウ）
+        window: Option<u64>,
+    },
+    /// ウィンドウを最大化する（省略時はアクティブウィンドウ）
+    Maximize {
+        /// 対象ウィンドウ ID（省略時はアクティブウィンドウ）
+        window: Option<u64>,
+    },
+    /// 最大化を解除して元のサイズへ戻す（省略時はアクティブウィンドウ）
+    Restore {
+        /// 対象ウィンドウ ID（省略時はアクティブウィンドウ）
+        window: Option<u64>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -4033,6 +4048,15 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Window(WindowCommand::Focus { window }) => {
             Request::WindowFocus { window: *window }
         }
+        Command::Window(WindowCommand::Minimize { window }) => {
+            Request::WindowMinimize { window: *window }
+        }
+        Command::Window(WindowCommand::Maximize { window }) => {
+            Request::WindowMaximize { window: *window }
+        }
+        Command::Window(WindowCommand::Restore { window }) => {
+            Request::WindowRestore { window: *window }
+        }
         Command::Tab(TabCommand::Reorder { tab, index }) => Request::TabReorder {
             tab: *tab,
             index: *index,
@@ -5552,7 +5576,12 @@ fn print_result(command: &Command, result: &Value) {
         Command::Tab(TabCommand::New { .. }) => println!("{result}"),
         Command::Window(WindowCommand::List) => println!("{}", pretty_json(result)),
         Command::Window(
-            WindowCommand::New { .. } | WindowCommand::Close { .. } | WindowCommand::MoveTab { .. },
+            WindowCommand::New { .. }
+            | WindowCommand::Close { .. }
+            | WindowCommand::MoveTab { .. }
+            | WindowCommand::Minimize { .. }
+            | WindowCommand::Maximize { .. }
+            | WindowCommand::Restore { .. },
         ) => println!("{result}"),
         Command::Open(_) | Command::Preview(_) | Command::PreviewOutline(_) | Command::Edit(_) => {
             println!("{result}")

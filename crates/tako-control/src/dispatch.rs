@@ -1312,6 +1312,16 @@ fn dispatch_inner(
             Ok(Value::Null)
         }
 
+        Request::WindowMinimize { window } => {
+            window_state_op(host, window, crate::protocol::WindowStateOp::Minimize)
+        }
+        Request::WindowMaximize { window } => {
+            window_state_op(host, window, crate::protocol::WindowStateOp::Maximize)
+        }
+        Request::WindowRestore { window } => {
+            window_state_op(host, window, crate::protocol::WindowStateOp::Restore)
+        }
+
         Request::TabReorder { tab, index } => {
             let tab_id = find_tab(host.workspace(), tab)?;
             let actual = host
@@ -6702,6 +6712,21 @@ fn find_window(ws: &Workspace, raw: u64) -> Result<tako_core::WindowId, Dispatch
         .ok_or_else(|| DispatchError::Operation(format!("ウィンドウ {raw} が見つからない")))
 }
 
+/// ウィンドウの最小化 / 最大化 / 復元（Issue #584）。`window` 省略でアクティブウィンドウ。
+/// 実適用は GPUI の Context を持つ UI 層（`request_window_state`）に委ねる
+fn window_state_op(
+    host: &mut dyn ControlHost,
+    window: Option<u64>,
+    op: crate::protocol::WindowStateOp,
+) -> Result<Value, DispatchError> {
+    let wid = match window {
+        Some(raw) => find_window(host.workspace(), raw)?,
+        None => host.workspace().active_window_id(),
+    };
+    host.request_window_state(wid, op);
+    Ok(json!({ "window": wid.as_u64(), "state": op.as_str() }))
+}
+
 /// ウィンドウ一覧（Issue #339）。`WindowList` 応答と `list` の windows フィールドで共用
 fn windows_json(ws: &Workspace) -> Value {
     json!({
@@ -7588,6 +7613,8 @@ mod tests {
         limit_service: tako_core::LimitService,
         preview_reload: tako_core::PreviewReloadState,
         preview_cache: tako_core::PreviewCacheStats,
+        /// #584: UI 層へ依頼したウィンドウ表示状態の操作（window ID, 操作）
+        window_state_ops: Vec<(u64, crate::protocol::WindowStateOp)>,
     }
 
     impl MockHost {
@@ -7615,6 +7642,7 @@ mod tests {
                     used_bytes: 32 * 1024 * 1024,
                     entries: 2,
                 },
+                window_state_ops: Vec::new(),
             }
         }
 
@@ -7676,6 +7704,14 @@ mod tests {
     }
 
     impl UiStateHost for MockHost {
+        fn request_window_state(
+            &mut self,
+            window: tako_core::WindowId,
+            op: crate::protocol::WindowStateOp,
+        ) {
+            self.window_state_ops.push((window.as_u64(), op));
+        }
+
         fn pinned_previews(&self) -> Vec<PinnedView> {
             self.pins
                 .iter()
@@ -11494,6 +11530,64 @@ mod tests {
     }
 
     // === 複数ウィンドウ（Issue #339） ===
+
+    /// #584: 最小化 / 最大化 / 復元は UI 層への依頼として積まれる。
+    /// window 省略でアクティブウィンドウ、明示指定でそのウィンドウ、
+    /// 存在しない ID はエラー（無言で別ウィンドウを操作しない）
+    #[test]
+    fn windowの表示状態操作はui層へ依頼される() {
+        use crate::protocol::WindowStateOp;
+        let mut host = MockHost::new();
+        let w1 = host.workspace().active_window_id().as_u64();
+
+        // window 省略 = アクティブウィンドウ
+        let r = dispatch(
+            &mut host,
+            Request::WindowMinimize { window: None },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(r["window"].as_u64(), Some(w1));
+        assert_eq!(r["state"].as_str(), Some("minimize"));
+
+        // 別ウィンドウを作り、明示指定でそちらを操作する
+        let r = dispatch(&mut host, Request::WindowNew { tab: None }, PaneOrigin::Cli).unwrap();
+        let w2 = r["window"].as_u64().unwrap();
+        dispatch(
+            &mut host,
+            Request::WindowMaximize { window: Some(w1) },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        dispatch(
+            &mut host,
+            Request::WindowRestore { window: None },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        assert_eq!(
+            host.window_state_ops,
+            vec![
+                (w1, WindowStateOp::Minimize),
+                (w1, WindowStateOp::Maximize),
+                // 直前の WindowNew で w2 がアクティブなので、省略は w2 に解決される
+                (w2, WindowStateOp::Restore),
+            ]
+        );
+
+        // 存在しないウィンドウ ID はエラーで、依頼は積まれない
+        let before = host.window_state_ops.len();
+        assert!(dispatch(
+            &mut host,
+            Request::WindowMinimize {
+                window: Some(9_999)
+            },
+            PaneOrigin::Cli,
+        )
+        .is_err());
+        assert_eq!(host.window_state_ops.len(), before);
+    }
 
     #[test]
     fn window系の一連操作とlist反映() {

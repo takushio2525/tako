@@ -149,6 +149,8 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     ui_asset!("trend"),
     ui_asset!("unshelve"),
     ui_asset!("warning"),
+    ui_asset!("window_maximize"),
+    ui_asset!("window_restore"),
 ];
 
 /// UI アイコンのアセットパス定数（#217。`gpui::svg().path(...)` に渡す）
@@ -197,6 +199,10 @@ pub mod ui_icon {
     pub const TREND: &str = "icons/ui/trend.svg";
     pub const UNSHELVE: &str = "icons/ui/unshelve.svg";
     pub const WARNING: &str = "icons/ui/warning.svg";
+    /// Windows のキャプションボタン（最大化）。Issue #584
+    pub const WINDOW_MAXIMIZE: &str = "icons/ui/window_maximize.svg";
+    /// Windows のキャプションボタン（最大化状態からの復元）。Issue #584
+    pub const WINDOW_RESTORE: &str = "icons/ui/window_restore.svg";
 }
 
 impl AssetSource for TakoAssets {

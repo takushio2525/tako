@@ -590,13 +590,14 @@ pub fn tools() -> Vec<Value> {
                 共有され、各ウィンドウは表示タブだけを持つ）。action: list = ウィンドウ一覧、\
                 new = 新しいウィンドウを開く（tab 指定でそのタブを分離、省略で新規タブ付き）、\
                 close = ウィンドウを閉じる（タブは残存ウィンドウへ合流しプロセスは殺さない）、\
-                move-tab = タブを別ウィンドウへ移動、focus = ウィンドウをアクティブにして前面化。",
+                move-tab = タブを別ウィンドウへ移動、focus = ウィンドウをアクティブにして前面化、\
+                minimize = 最小化、maximize = 最大化、restore = 最大化を解除して元のサイズへ戻す。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["list", "new", "close", "move-tab", "focus"], "description": "省略時は list" },
+                    "action": { "type": "string", "enum": ["list", "new", "close", "move-tab", "focus", "minimize", "maximize", "restore"], "description": "省略時は list" },
                     "tab": { "type": "integer", "minimum": 0, "description": "new: 分離するタブ ID（省略で新規タブ）/ move-tab: 移動するタブ ID" },
-                    "window": { "type": "integer", "minimum": 0, "description": "close / move-tab / focus の対象ウィンドウ ID" },
+                    "window": { "type": "integer", "minimum": 0, "description": "close / move-tab / focus の対象ウィンドウ ID。minimize / maximize / restore は省略でアクティブウィンドウ" },
                 },
                 "additionalProperties": false,
             },
@@ -3203,9 +3204,19 @@ fn build_request(
                 "focus" => Request::WindowFocus {
                     window: required_u64(args, "window")?,
                 },
+                "minimize" => Request::WindowMinimize {
+                    window: u64_arg(args, "window")?,
+                },
+                "maximize" => Request::WindowMaximize {
+                    window: u64_arg(args, "window")?,
+                },
+                "restore" => Request::WindowRestore {
+                    window: u64_arg(args, "window")?,
+                },
                 other => {
                     return Err(format!(
-                        "action が不正: {other}（list | new | close | move-tab | focus）"
+                        "action が不正: {other}（list | new | close | move-tab | focus | \
+                         minimize | maximize | restore）"
                     ))
                 }
             }

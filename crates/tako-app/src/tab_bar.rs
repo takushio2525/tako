@@ -22,20 +22,41 @@
 //! したがって **タブバー上の対話要素は必ず `.occlude()` すること**。
 //! 逆に `tab-scroll-area` には付けない —— `flex_1` で空き領域の大半を占めるため、
 //! 付けるとタブバー空き領域でのウィンドウドラッグ移動（#312）が死ぬ。
+//!
+//! # ウィンドウコントロール（Issue #584）
+//!
+//! Windows は `hide_title_bar` でネイティブのキャプションボタンが生成されないため、
+//! 右端に最小化 / 最大化↔復元 / 閉じるを自前で描く（`render_window_controls`）。
+//! macOS は native traffic lights が同居するので描かない。左端の
+//! `TRAFFIC_LIGHTS_SPACER` も同じ理由で macOS 限定。
 
 use std::time::Duration;
 
 use gpui::{
-    div, point, prelude::*, px, svg, Animation, AnimationExt, BoxShadow, Context, DragMoveEvent,
-    FontWeight, SharedString, WindowControlArea,
+    div, point, prelude::*, px, svg, Animation, AnimationExt, AnyElement, BoxShadow, Context,
+    DragMoveEvent, FontWeight, SharedString, WindowControlArea,
 };
 use tako_core::{CommandState, TitleSource};
 
 use super::*;
 use crate::file_icons::ui_icon;
 
-/// traffic lights（12px × 3 + gap 8px × 2 = 52px）+ 右余白 16px
+/// traffic lights（12px × 3 + gap 8px × 2 = 52px）+ 右余白 16px。
+/// native traffic lights を持つのは macOS だけなので、他プラットフォームでは
+/// 意味のない左端余白になる（#584）。0 にして左端からタブを並べる
+#[cfg(target_os = "macos")]
 const TRAFFIC_LIGHTS_SPACER: f32 = 68.0;
+#[cfg(not(target_os = "macos"))]
+const TRAFFIC_LIGHTS_SPACER: f32 = 0.0;
+
+/// 自前ウィンドウコントロール（#584）1 個の一辺。bell / theme ボタンと同寸
+const WINDOW_CONTROL_SIZE: f32 = 30.0;
+/// 自前ウィンドウコントロール群の概算幅（3 ボタン + gap + 左マージン）。
+/// macOS は native traffic lights があるので描かない = 0
+#[cfg(target_os = "macos")]
+const WINDOW_CONTROLS_PX: f32 = 0.0;
+#[cfg(not(target_os = "macos"))]
+const WINDOW_CONTROLS_PX: f32 = WINDOW_CONTROL_SIZE * 3.0 + 12.0;
 
 /// 1 タブのラベル込みの参考幅（px）。ラベル truncate 上限を決めるために使う概算値。
 /// 実測: dot(7) + gap(8) + pl(10) + label + pr(11) + gap(3)。
@@ -56,7 +77,7 @@ impl TakoApp {
             return LABEL_MAX_CHARS;
         }
         let vw = f32::from(window.viewport_size().width);
-        let available = vw - TRAFFIC_LIGHTS_SPACER - RIGHT_CONTROLS_PX - 40.0;
+        let available = vw - TRAFFIC_LIGHTS_SPACER - RIGHT_CONTROLS_PX - WINDOW_CONTROLS_PX - 40.0;
         let per_tab = available / tab_count as f32;
         let label_px = (per_tab - TAB_CHROME_PX).max(0.0);
         let chars = (label_px / CHAR_WIDTH_PX) as usize;
@@ -226,8 +247,10 @@ impl TakoApp {
                     window.titlebar_double_click();
                 }
             })
-            // native traffic lights の載る領域
-            .child(div().w(px(TRAFFIC_LIGHTS_SPACER)).h_full().flex_none())
+            // native traffic lights の載る領域（macOS のみ。#584）
+            .when(TRAFFIC_LIGHTS_SPACER > 0.0, |d| {
+                d.child(div().w(px(TRAFFIC_LIGHTS_SPACER)).h_full().flex_none())
+            })
             // タブ領域（横スクロール対応。Issue #208）
             // scroll_to_item が直接子要素のインデックスで動作するため、
             // タブを scrollable コンテナの直接子要素にする
@@ -739,5 +762,103 @@ impl TakoApp {
                             .text_color(hsla(theme.text_muted)),
                     ),
             )
+            // 自前のウィンドウコントロール（Windows のみ。#584）
+            .when(WINDOW_CONTROLS_PX > 0.0, |d| {
+                d.children(self.render_window_controls(window, &theme))
+            })
+    }
+
+    /// 最小化 / 最大化↔復元 / 閉じるボタン（Issue #584。**Windows 専用**）
+    ///
+    /// `tako_titlebar_options()` の `appears_transparent` は GPUI Windows では
+    /// `hide_title_bar` になり、ウィンドウスタイルから `WS_CAPTION` が落ちる。
+    /// ネイティブのキャプションボタンはそもそも生成されないので自前で描く。
+    /// macOS は native traffic lights が同居するため描かない（`WINDOW_CONTROLS_PX == 0`）。
+    ///
+    /// # 実際にウィンドウを動かすのは GPUI のネイティブ経路（`on_click` ではない）
+    ///
+    /// `window_control_area` は hitbox を登録するだけだが、`gpui_windows` の
+    /// `handle_hit_test_msg`（`WM_NCHITTEST`）がその area を
+    /// `HTMINBUTTON` / `HTMAXBUTTON` / `HTCLOSE` に変換し、`handle_nc_mouse_up_msg` が
+    /// `ShowWindowAsync(SW_MINIMIZE)` /（`IsZoomed` で出し分けた）`SW_MAXIMIZE`・`SW_NORMAL` /
+    /// `PostMessageW(WM_CLOSE)` を実行する。つまり最大化↔復元のトグルは GPUI 側の責務で、
+    /// ここが持つのは「今どちらの状態か」を示すアイコンの出し分けだけ。
+    /// `HTMAXBUTTON` を返すことで Windows 11 の Snap Layouts（最大化ボタンのホバーで出る
+    /// レイアウト選択）も自動で効く。
+    ///
+    /// # `.occlude()` は必須（#576）
+    ///
+    /// 付けないと祖先のタブバー根 div（`WindowControlArea::Drag`）の hitbox も
+    /// `mouse_hit_test.ids` に残り、`on_hit_test_window_control` は
+    /// **登録順（= 描画順 = 祖先が先）で最初に一致したもの**を返すため `Drag` が勝つ。
+    /// すると `HTCAPTION` に化けてボタンが完全に死ぬ。
+    fn render_window_controls(&self, window: &Window, theme: &Theme) -> Vec<AnyElement> {
+        let maximized = window.is_maximized();
+        // 一辺 30px・角丸 8・ホバーで背景 = bell / theme ボタンと同じ作法。
+        // 上端 8px 前後は hide_title_bar 時のリサイズエッジを GPUI が予約しているため、
+        // タブバー（44px）の縦中央に置いて干渉を避ける
+        // `danger` = 閉じるボタン。ホバーを赤にするのは Windows 標準の作法で、
+        // その上でアイコンが読めるよう前景も反転させる（通知バッジと同じ red/crust の組）
+        let button = |id: &'static str, area: WindowControlArea, icon: &'static str, danger| {
+            div()
+                .id(id)
+                .group(id)
+                .w(px(WINDOW_CONTROL_SIZE))
+                .h(px(WINDOW_CONTROL_SIZE))
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.0))
+                .cursor_pointer()
+                .window_control_area(area)
+                // 根 div の Drag ヒットテストに勝たせる（#576）。これが無いと死ぬ
+                .occlude()
+                .hover(|d| {
+                    if danger {
+                        d.bg(hsla(theme.red))
+                    } else {
+                        d.bg(rgba(theme.surface_highlight))
+                    }
+                })
+                .child(
+                    svg()
+                        .path(icon)
+                        .w(px(15.0))
+                        .h(px(15.0))
+                        .text_color(hsla(theme.text_muted))
+                        .when(danger, |s| {
+                            s.group_hover(id, |s| s.text_color(hsla(theme.crust)))
+                        }),
+                )
+        };
+
+        vec![
+            button(
+                "window-minimize",
+                WindowControlArea::Min,
+                ui_icon::MINUS,
+                false,
+            )
+            .into_any_element(),
+            button(
+                "window-maximize",
+                WindowControlArea::Max,
+                if maximized {
+                    ui_icon::WINDOW_RESTORE
+                } else {
+                    ui_icon::WINDOW_MAXIMIZE
+                },
+                false,
+            )
+            .into_any_element(),
+            button(
+                "window-close",
+                WindowControlArea::Close,
+                ui_icon::CLOSE,
+                true,
+            )
+            .into_any_element(),
+        ]
     }
 }
