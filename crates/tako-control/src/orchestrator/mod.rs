@@ -1673,20 +1673,31 @@ pub enum AgentScanTarget {
 /// 続いて accounts.yaml の `config_dir` を重複排除して並べる
 pub fn agent_scan_targets(accounts: &AccountsConfig) -> Vec<AgentScanTarget> {
     let mut targets = vec![AgentScanTarget::Default];
-    for (_, resolved) in accounts.list_resolved() {
-        let Ok(account) = resolved else { continue };
-        let Some(path) = account.config_dir.path() else {
-            continue; // inherit = 既定。Default で観測済み
-        };
-        if is_claude_default_config_dir(path) {
-            continue;
+    for account in accounts.list_resolved() {
+        let path = account.config_dir;
+        if path.is_empty() || is_claude_default_config_dir(&path) {
+            continue; // 既定 config dir は Default で観測済み
         }
-        let target = AgentScanTarget::ConfigDir(path.to_string());
+        let target = AgentScanTarget::ConfigDir(path);
         if !targets.contains(&target) {
             targets.push(target);
         }
     }
     targets
+}
+
+/// `CLAUDE_CONFIG_DIR` 環境変数名（claude CLI が config ディレクトリの上書きに使う）
+pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+
+/// このパスが claude の既定 config ディレクトリ（`~/.claude`）を指すか。
+/// 既定を明示指定したアカウントを `Default` と二重に走査しないための判定
+fn is_claude_default_config_dir(path: &str) -> bool {
+    let Some(home) = home_dir() else {
+        return false;
+    };
+    let default = home.join(".claude");
+    let given = Path::new(path.trim_end_matches(['/', '\\']));
+    given == default
 }
 
 /// `claude agents --json` をログインシェル経由で、**登録済み config ディレクトリすべて**に
@@ -1737,7 +1748,36 @@ fn run_claude_agents_json_uncached(targets: &[AgentScanTarget]) -> Option<Vec<u8
     merge_agents_json(&outputs)
 }
 
+/// 単一走査先に対する `claude agents --json` の実行。
+///
+/// #592: Windows にはログインシェルが無く、`SHELL` も通常空なので、旧実装は
+/// `/bin/sh -l -c …` を起動しようとして**必ず失敗**していた（= `claude agents --json` が
+/// 一度も走らず、worker の状態は常に画面推定に落ちていた）。Windows では
+/// `claude` を直接起動する（PATH は tako-app が起動時の環境から継承する）
+#[cfg(windows)]
+fn run_claude_agents_json_for(target: &AgentScanTarget) -> Option<Vec<u8>> {
+    let mut command = std::process::Command::new("claude");
+    // 走査先の指定はプロセス環境だけで足りる（シェルを挟まないので rc の上書きが無い）
+    match target {
+        AgentScanTarget::Default => {
+            command.env_remove(CLAUDE_CONFIG_DIR_ENV);
+        }
+        AgentScanTarget::ConfigDir(path) => {
+            command.env(CLAUDE_CONFIG_DIR_ENV, path);
+        }
+    }
+    // GUI から数秒おきに呼ばれるのでコンソール窓を出さない
+    tako_core::platform::process::no_console_window(&mut command);
+    let output = command.args(["agents", "--json"]).output().ok()?;
+    if output.status.success() {
+        Some(output.stdout)
+    } else {
+        None
+    }
+}
+
 /// 単一走査先に対する `claude agents --json` の実行
+#[cfg(not(windows))]
 fn run_claude_agents_json_for(target: &AgentScanTarget) -> Option<Vec<u8>> {
     let shell = std::env::var("SHELL")
         .ok()
@@ -3512,8 +3552,8 @@ worker_agents:
         let config = accounts_from(
             "accounts:\n  \
              beta:\n    config_dir: /tmp/claude-beta\n  \
-             shared:\n    inherit: true\n  \
-             alpha:\n    config_dir: /tmp/claude-alpha\n",
+             alpha:\n    config_dir: /tmp/claude-alpha\n  \
+             dup:\n    config_dir: /tmp/claude-alpha\n",
         );
         assert_eq!(
             agent_scan_targets(&config),
@@ -3522,24 +3562,25 @@ worker_agents:
                 AgentScanTarget::ConfigDir("/tmp/claude-alpha".into()),
                 AgentScanTarget::ConfigDir("/tmp/claude-beta".into()),
             ],
-            "inherit は Default に含まれるので重複させない（列挙順は accounts の BTreeMap 順）"
+            "同じ config_dir は重複させない（列挙順は accounts の BTreeMap 順）"
         );
     }
 
     #[test]
-    fn agent_scan_targetsは既定パスの明示指定と壊れたエントリを弾く() {
-        let default = claude_default_config_dir().expect("既定 config dir");
+    fn agent_scan_targetsは既定パスの明示指定と空エントリを弾く() {
+        let default = home_dir().expect("ホームディレクトリ").join(".claude");
         let config = accounts_from(&format!(
             "accounts:\n  \
              explicit:\n    config_dir: {}\n  \
-             broken:\n    inherit: true\n    config_dir: /tmp/x\n  \
-             empty:\n    description: dummy\n",
+             trailing:\n    config_dir: {}/\n  \
+             empty:\n    config_dir: ''\n",
+            default.display(),
             default.display()
         ));
         assert_eq!(
             agent_scan_targets(&config),
             vec![AgentScanTarget::Default],
-            "既定パスの明示指定は Default と同じ場所。壊れたエントリは無視する"
+            "既定パスの明示指定（末尾区切りつきを含む）は Default と同じ場所。空は無視する"
         );
     }
 

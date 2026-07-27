@@ -76,7 +76,9 @@ fn find_ancestor_pane(
     None
 }
 
-/// `ps -axo pid=,ppid=` で全プロセスの親子マップを作る
+/// 全プロセスの親子マップ（pid → ppid）を作る。
+/// unix は `ps -axo pid=,ppid=`、Windows は Toolhelp32 スナップショット（#592）
+#[cfg(unix)]
 pub fn process_parent_map() -> HashMap<u32, u32> {
     let output = std::process::Command::new("ps")
         .args(["-axo", "pid=,ppid="])
@@ -87,7 +89,86 @@ pub fn process_parent_map() -> HashMap<u32, u32> {
     parse_parent_map(&String::from_utf8_lossy(&output.stdout))
 }
 
+#[cfg(windows)]
+pub fn process_parent_map() -> HashMap<u32, u32> {
+    win_process::parent_map()
+}
+
+/// Windows の親子マップ取得（#592）。
+///
+/// `ps` は無く、`wmic` は Windows 11 24H2 で削除済み、PowerShell の
+/// `Get-CimInstance Win32_Process` は 1 回 数百 ms かかる。worker_status は
+/// watch から worker 数 × 数秒間隔で呼ばれるため、**子プロセスを起こさない**
+/// Toolhelp32 スナップショットを直接叩く（1 回 数 ms）。
+///
+/// `windows-sys` を直接依存に足さず必要な 4 関数だけ宣言する方針は、
+/// sleep_guard の IOKit / プレビューの PDFKit と同じ（`.agent/conventions.md`）
+#[cfg(windows)]
+mod win_process {
+    use std::collections::HashMap;
+    use std::ffi::c_void;
+
+    type Handle = *mut c_void;
+
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const MAX_PATH: usize = 260;
+
+    fn invalid_handle() -> Handle {
+        -1isize as Handle
+    }
+
+    /// `PROCESSENTRY32W`（tlhelp32.h）。`repr(C)` で C と同じパディングになる
+    /// （x64 では `th32_process_id` の後ろに 4 バイト入る）
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; MAX_PATH],
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> Handle;
+        fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
+        fn CloseHandle(object: Handle) -> i32;
+    }
+
+    pub(super) fn parent_map() -> HashMap<u32, u32> {
+        let mut map = HashMap::new();
+        // SAFETY: スナップショットハンドルは取得直後に妥当性を検査し、
+        // 復帰経路すべてで CloseHandle する。entry は毎回 dw_size を設定した
+        // ローカル変数で、API はこのサイズ以上には書き込まない
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot.is_null() || snapshot == invalid_handle() {
+                return map;
+            }
+            let mut entry: ProcessEntry32W = std::mem::zeroed();
+            entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
+            if Process32FirstW(snapshot, &mut entry) != 0 {
+                loop {
+                    map.insert(entry.th32_process_id, entry.th32_parent_process_id);
+                    if Process32NextW(snapshot, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snapshot);
+        }
+        map
+    }
+}
+
 /// `ps -axo pid=,ppid=` の出力をパースする
+#[cfg(unix)]
 fn parse_parent_map(text: &str) -> HashMap<u32, u32> {
     let mut map = HashMap::new();
     for line in text.lines() {
@@ -209,6 +290,74 @@ pub fn resolve_session_id_for_backend(backend_session: &str) -> Option<String> {
         }
     }
     None
+}
+
+// --- #592: 器（tmux / psmux）を持たないペインの pid ベース解決 ---
+//
+// tmux バックエンドがあるときは「バックエンドセッション名 → pane_pid」で辿れるが、
+// Windows は既定で backend=none（`SessionBackend` の器なし）なので、
+// ペインのシェルは tako-app の直接の子として素の ConPTY 上で動く。
+// この経路では `TerminalSession::child_pid` が唯一の起点になる。
+
+/// ペインの PTY 子プロセス（シェル）配下で動いている claude エージェントの
+/// session_id を解決する（#592）。
+///
+/// 器を持たないバックエンド（Windows の backend=none / tmux 不在の macOS）で
+/// `resolve_session_id_for_backend` の代わりに使う。`claude agents --json` の
+/// 各エージェントから pid 祖先を辿り、`pane_pid` に到達したものを採用する。
+///
+/// 同一ペイン配下に複数エージェントが居る場合は interactive を優先する
+/// （`claude -p` 等の一時セッションではなく TUI 本体の状態を見たいため）
+pub fn resolve_session_id_for_pane_pid(pane_pid: u32) -> Option<String> {
+    let agents = list_agents().ok()?;
+    if agents.is_empty() {
+        return None;
+    }
+    let parents = process_parent_map();
+    resolve_session_for_pane_pid_inner(pane_pid, &agents, &parents)
+}
+
+/// pid ベース解決の内部ロジック（テスト可能な純関数部）
+fn resolve_session_for_pane_pid_inner(
+    pane_pid: u32,
+    agents: &[Value],
+    parents: &HashMap<u32, u32>,
+) -> Option<String> {
+    let pane_by_pid: HashMap<u32, &str> = [(pane_pid, "pane")].into();
+    let mut fallback: Option<String> = None;
+    for agent in agents {
+        let Some(pid) = agent["pid"].as_u64().map(|p| p as u32) else {
+            continue;
+        };
+        let Some(session_id) = agent["session_id"].as_str().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if find_ancestor_pane(pid, parents, &pane_by_pid).is_none() {
+            continue;
+        }
+        if agent["kind"].as_str() == Some("interactive") {
+            return Some(session_id.to_string());
+        }
+        fallback.get_or_insert_with(|| session_id.to_string());
+    }
+    fallback
+}
+
+/// ペインの PTY 子プロセス（シェル）配下に、シェル以外の実行中プロセスがあるか（#592）。
+/// 器を持たないバックエンドでの `has_running_children` 相当。
+/// **エージェント CLI の TUI プロセス自身も子に数える**ので、これ単体では
+/// 「作業中」を意味しない（#571 の不変条件: 画面の判断をプロセスツリーで覆さない）
+pub fn has_running_children_of_pid(pane_pid: u32) -> bool {
+    let parents = process_parent_map();
+    has_children_of_pid_inner(pane_pid, &parents)
+}
+
+/// 子プロセス判定の内部ロジック（テスト可能な純関数部）
+fn has_children_of_pid_inner(pane_pid: u32, parents: &HashMap<u32, u32>) -> bool {
+    let pane_set: HashSet<u32> = [pane_pid].into();
+    parents
+        .iter()
+        .any(|(&pid, &ppid)| pid != pane_pid && is_descendant_of(ppid, &pane_set, parents))
 }
 
 /// バックエンドセッションで**今まさに動いている** claude エージェント（live 解決）
@@ -503,6 +652,7 @@ mod tests {
         assert_eq!(find_ancestor_pane(10, &parents, &pane_by_pid), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn ps出力のパース() {
         let map = parse_parent_map("  1     0\n  345   1\n 9999 345\nbad line\n");
@@ -511,10 +661,30 @@ mod tests {
         assert_eq!(map.len(), 3);
     }
 
+    /// unix / Windows どちらの実装でも「自プロセスが載る」ことを固定する（#592）。
+    /// Windows は Toolhelp32 スナップショットなので、構造体レイアウトや
+    /// dw_size を間違えると列挙が空になる = このテストが検出する
     #[test]
     fn process_parent_mapは自プロセスを含む() {
         let map = process_parent_map();
         assert!(map.contains_key(&std::process::id()));
+    }
+
+    /// Windows 実装が親 pid まで正しく読めていること（#592）。
+    /// dw_size / パディングを取り違えると pid は合っても ppid がゼロや別値になる。
+    /// 自プロセスの親は必ず存在し、自分自身ではない
+    #[cfg(windows)]
+    #[test]
+    fn process_parent_mapは自プロセスの親を辿れる() {
+        let map = process_parent_map();
+        let me = std::process::id();
+        let parent = *map.get(&me).expect("自プロセスの親 pid が取れる");
+        assert_ne!(parent, me, "自分自身を親にしない");
+        assert!(parent > 0, "親 pid が 0 でない");
+        assert!(
+            map.contains_key(&parent),
+            "親プロセスもスナップショットに載る（pid {parent}）"
+        );
     }
 
     #[test]
@@ -571,6 +741,130 @@ mod tests {
             count_sessions_with_children_inner(&["tako-nonexist"], &panes, &parents),
             0
         );
+    }
+
+    // --- #592: 器を持たないペインの pid ベース解決 ---
+
+    /// Windows 実機のプロセスチェーン（2026-07-27 実測）を模したツリー。
+    /// `tako-app.exe(8076) → pwsh.exe(20872) → claude.exe(13832)` の 2 ペイン分
+    fn windows_like_tree() -> (Vec<Value>, HashMap<u32, u32>) {
+        let parents: HashMap<u32, u32> = [
+            (8076, 5308),  // tako-app.exe ← explorer.exe
+            (20872, 8076), // pane A のシェル
+            (13832, 20872),
+            (9388, 8076), // pane B のシェル
+            (21384, 9388),
+            (15744, 5308), // 無関係（WindowsTerminal 配下）
+            (20932, 15744),
+        ]
+        .into();
+        let agents = vec![
+            json!({ "session_id": "sid-a", "pid": 13832, "kind": "interactive" }),
+            json!({ "session_id": "sid-b", "pid": 21384, "kind": "interactive" }),
+            json!({ "session_id": "sid-outside", "pid": 20932, "kind": "interactive" }),
+        ];
+        (agents, parents)
+    }
+
+    #[test]
+    fn pane_pid祖先辿りでセッションを解決する() {
+        let (agents, parents) = windows_like_tree();
+        assert_eq!(
+            resolve_session_for_pane_pid_inner(20872, &agents, &parents),
+            Some("sid-a".to_string())
+        );
+        assert_eq!(
+            resolve_session_for_pane_pid_inner(9388, &agents, &parents),
+            Some("sid-b".to_string())
+        );
+    }
+
+    #[test]
+    fn pane_pid解決は他ペイン他アプリのセッションを拾わない() {
+        let (agents, parents) = windows_like_tree();
+        // tako-app 自身を起点にすると全ペインが子孫になるが、ペインの起点は
+        // あくまでシェル pid。無関係な pid では解決しない
+        assert_eq!(
+            resolve_session_for_pane_pid_inner(99999, &agents, &parents),
+            None
+        );
+        // WindowsTerminal 配下の claude は tako のペインに属さない
+        assert_eq!(
+            resolve_session_for_pane_pid_inner(15744, &agents, &parents),
+            Some("sid-outside".to_string()),
+            "起点がそのシェルなら解決する（判定はあくまで祖先関係）"
+        );
+    }
+
+    #[test]
+    fn pane_pid解決は同一ペイン内でinteractiveを優先する() {
+        // `claude -p` の一時セッション（headless）と TUI 本体が同居した場合
+        let parents: HashMap<u32, u32> = [(100, 1), (300, 100), (400, 100)].into();
+        let headless_first = vec![
+            json!({ "session_id": "sid-p", "pid": 300, "kind": "headless" }),
+            json!({ "session_id": "sid-tui", "pid": 400, "kind": "interactive" }),
+        ];
+        assert_eq!(
+            resolve_session_for_pane_pid_inner(100, &headless_first, &parents),
+            Some("sid-tui".to_string())
+        );
+        // headless しか居なければそれを返す（無いよりまし）
+        let headless_only = vec![json!({ "session_id": "sid-p", "pid": 300, "kind": "headless" })];
+        assert_eq!(
+            resolve_session_for_pane_pid_inner(100, &headless_only, &parents),
+            Some("sid-p".to_string())
+        );
+    }
+
+    #[test]
+    fn pane_pid解決はsession_idの無いエントリを飛ばす() {
+        let parents: HashMap<u32, u32> = [(100, 1), (300, 100), (400, 100)].into();
+        let agents = vec![
+            json!({ "session_id": "", "pid": 300, "kind": "interactive" }),
+            json!({ "pid": 300, "kind": "interactive" }),
+            json!({ "session_id": "sid-ok", "pid": 400, "kind": "interactive" }),
+        ];
+        assert_eq!(
+            resolve_session_for_pane_pid_inner(100, &agents, &parents),
+            Some("sid-ok".to_string())
+        );
+    }
+
+    /// 実機確認用（#592）。稼働中の tako ペインのシェル pid を渡すと、
+    /// そのペインで動いている claude の session_id を pid 祖先辿りで解決できることを見る。
+    ///
+    /// ```text
+    /// TAKO_TEST_PANE_PID=<ペインのシェル pid> cargo test -p tako-control \
+    ///   --lib 実機_pane_pidからセッションを解決する -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "実 claude + 稼働中の tako ペインが要る（手動実行専用）"]
+    fn 実機_pane_pidからセッションを解決する() {
+        let pid: u32 = std::env::var("TAKO_TEST_PANE_PID")
+            .expect("TAKO_TEST_PANE_PID に対象ペインのシェル pid を渡す")
+            .trim()
+            .parse()
+            .expect("pid は数値");
+        let agents = list_agents().expect("claude agents --json が実行できる");
+        println!("agents={} 件", agents.len());
+        let sid = resolve_session_id_for_pane_pid(pid);
+        println!("pane_pid={pid} -> session_id={sid:?}");
+        println!("has_children={}", has_running_children_of_pid(pid));
+        assert!(sid.is_some(), "pane_pid {pid} 配下の claude を解決できる");
+    }
+
+    #[test]
+    fn pane_pidの子プロセス有無を判定する() {
+        let (_, parents) = windows_like_tree();
+        assert!(
+            has_children_of_pid_inner(20872, &parents),
+            "シェル配下に claude が居る"
+        );
+        assert!(
+            !has_children_of_pid_inner(13832, &parents),
+            "claude 配下には子が無い"
+        );
+        assert!(!has_children_of_pid_inner(99999, &parents), "未知の pid");
     }
 
     // --- #439: live claude セッションの一括解決 ---

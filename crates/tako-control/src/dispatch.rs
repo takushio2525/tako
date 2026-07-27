@@ -251,6 +251,9 @@ fn verify_ctx_pane_identity(
             ctx.live_tail = None;
             ctx.full_screen = None;
             ctx.has_running_children = false;
+            // #592: pid も別ペインのものなので捨てる（残すと無関係な worker の
+            // claude セッションを「このペインの状態」として解決してしまう）
+            ctx.pane_pid = None;
         }
     }
     ctx
@@ -5717,6 +5720,10 @@ pub struct WorkerStatusCtx {
     full_screen: Option<String>,
     /// tmux セッション配下に実行中の子プロセスがあるか（#224）
     has_running_children: bool,
+    /// ペインの PTY 子プロセス（シェル）の pid（#592）。
+    /// 器を持たないバックエンド（Windows の backend=none）で、pane → claude セッションを
+    /// 辿る唯一の起点になる。GUI に無いペイン（レジストリ照会のみ）では None
+    pane_pid: Option<u32>,
 }
 
 /// 末尾の空行を除去し、最大 30 行に切り詰めて 1 本のテキストへ
@@ -5742,9 +5749,13 @@ fn collect_worker_status_ctx(host: &dyn ControlHost, pane_id: u64) -> WorkerStat
     let lines = host.session(target).map(|session| session.visible_lines());
     let full_screen = lines.as_ref().map(|l| l.join("\n"));
     let backend_session = host.backend_session(target);
-    let has_running_children = backend_session
-        .as_ref()
-        .is_some_and(|bs| crate::agents::has_running_children(bs));
+    let pane_pid = host.session(target).and_then(|session| session.child_pid());
+    // 器があればセッション名から、無ければペインの PTY 子プロセスから子孫を数える（#592）。
+    // 器ありのときの経路は従来どおり（macOS の既定は tmux バックエンド）
+    let has_running_children = match backend_session.as_ref() {
+        Some(bs) => crate::agents::has_running_children(bs),
+        None => pane_pid.is_some_and(crate::agents::has_running_children_of_pid),
+    };
     WorkerStatusCtx {
         pane_id,
         pane_exists: in_tree || host.workspace().is_shelved(target),
@@ -5752,6 +5763,7 @@ fn collect_worker_status_ctx(host: &dyn ControlHost, pane_id: u64) -> WorkerStat
         has_running_children,
         live_tail: lines.map(tail_join),
         full_screen,
+        pane_pid,
     }
 }
 
@@ -5773,6 +5785,26 @@ fn normalize_agent_status(raw: &str) -> &'static str {
     }
 }
 
+/// pane → claude セッションの自動解決（#44 / #592）。
+///
+/// 2 つの起点を順に試す。どちらも「実プロセスの祖先を辿って `claude agents --json` の
+/// pid に一致するか」を見るので、role やカタログの stale 記録には依存しない:
+///
+/// 1. **バックエンドセッション名**（器あり = macOS の既定 tmux）。従来経路で不変
+/// 2. **ペインの PTY 子プロセス pid**（器なし = Windows の backend=none / tmux 不在の macOS）。
+///    器が無いとペインのシェルは tako-app の直接の子になり、セッション名では辿れない
+///
+/// ここで解決できないと `status_source` が "screen" のままになり、worker の完了判定が
+/// 画面推定だけになる（#592 の実害: Windows で常に画面推定 = WORKER_IDLE の誤検知）
+fn auto_resolve_session(backend_session: Option<&str>, pane_pid: Option<u32>) -> Option<String> {
+    if let Some(backend) = backend_session {
+        if let Some(sid) = crate::agents::resolve_session_id_for_backend(backend) {
+            return Some(sid);
+        }
+    }
+    crate::agents::resolve_session_id_for_pane_pid(pane_pid?)
+}
+
 fn finish_worker_status(
     ctx: WorkerStatusCtx,
     session_id: Option<&str>,
@@ -5787,6 +5819,7 @@ fn finish_worker_status(
         live_tail,
         full_screen,
         has_running_children: has_children,
+        pane_pid,
     } = ctx;
 
     // #390: レジストリの active エントリ（prompt 未達判定 + lazy 昇格用）。
@@ -5805,18 +5838,15 @@ fn finish_worker_status(
         resolved_sid = Some(sid.to_string());
         status_source = "agents";
     } else if pane_exists {
-        // pane→session 自動解決: backend_session から pid 祖先辿り
-        if let Some(ref backend) = backend_session {
-            if let Some(sid) = crate::agents::resolve_session_id_for_backend(backend) {
+        match auto_resolve_session(backend_session.as_deref(), pane_pid) {
+            Some(sid) => {
                 resolved_sid = Some(sid);
                 status_source = "agents-auto";
-            } else {
+            }
+            None => {
                 resolved_sid = None;
                 status_source = "screen";
             }
-        } else {
-            resolved_sid = None;
-            status_source = "screen";
         }
     } else {
         resolved_sid = None;
@@ -10085,6 +10115,55 @@ mod tests {
         assert!(!gone.pane_exists);
     }
 
+    // --- #592: 器を持たないペイン（Windows の backend=none）の pane→session 解決 ---
+
+    #[test]
+    fn auto_resolve_sessionはpane_pidが無ければ解決しない() {
+        // 器も pane_pid も無い = 辿る起点が無い（旧 Windows の状態）
+        assert_eq!(auto_resolve_session(None, None), None);
+    }
+
+    /// 実機確認用（#592）。稼働中の tako ペインのシェル pid を渡すと、
+    /// worker_status が `status_source: agents-auto` + 非 null の
+    /// `resolved_session_id` を返すことを、本番と同じ経路で確かめる。
+    ///
+    /// ```text
+    /// TAKO_TEST_PANE_PID=<ペインのシェル pid> cargo test -p tako-control \
+    ///   --lib 実機_pane_pidでagents_autoに解決する -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "実 claude + 稼働中の tako ペインが要る（手動実行専用）"]
+    fn 実機_pane_pidでagents_autoに解決する() {
+        let pid: u32 = std::env::var("TAKO_TEST_PANE_PID")
+            .expect("TAKO_TEST_PANE_PID に対象ペインのシェル pid を渡す")
+            .trim()
+            .parse()
+            .expect("pid は数値");
+        let v = finish_worker_status(
+            WorkerStatusCtx {
+                pane_id: 0,
+                pane_exists: true,
+                backend_session: None,
+                live_tail: None,
+                full_screen: None,
+                has_running_children: crate::agents::has_running_children_of_pid(pid),
+                pane_pid: Some(pid),
+            },
+            None,
+            None,
+        )
+        .expect("worker_status が返る");
+        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+        assert_eq!(
+            v["status_source"], "agents-auto",
+            "pid 祖先辿りで一次シグナル（claude agents）へ到達する"
+        );
+        assert!(
+            v["resolved_session_id"].is_string(),
+            "session_id が解決される"
+        );
+    }
+
     #[test]
     fn finish_worker_statusがペイン不在でgoneを返す() {
         let ctx = WorkerStatusCtx {
@@ -10094,6 +10173,7 @@ mod tests {
             live_tail: None,
             full_screen: None,
             has_running_children: false,
+            pane_pid: None,
         };
         let v = finish_worker_status(ctx, None, None).unwrap();
         assert_eq!(v["status"], "gone");
@@ -10112,6 +10192,7 @@ mod tests {
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
                 has_running_children: false,
+                pane_pid: None,
             },
             None,
             None,
@@ -10128,6 +10209,7 @@ mod tests {
                 live_tail: Some("Thinking…\nesc to interrupt".into()),
                 full_screen: None,
                 has_running_children: false,
+                pane_pid: None,
             },
             None,
             None,
@@ -10143,6 +10225,7 @@ mod tests {
                 live_tail: None,
                 full_screen: None,
                 has_running_children: false,
+                pane_pid: None,
             },
             None,
             None,
@@ -10164,6 +10247,7 @@ mod tests {
                 ),
                 full_screen: None,
                 has_running_children: false,
+                pane_pid: None,
             },
             None,
             None,
@@ -10188,6 +10272,7 @@ mod tests {
                 ),
                 full_screen: None,
                 has_running_children: false,
+                pane_pid: None,
             },
             None,
             None,
@@ -10206,6 +10291,7 @@ mod tests {
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
                 has_running_children: false,
+                pane_pid: None,
             },
             None,
             None,
@@ -10225,6 +10311,7 @@ mod tests {
                 ),
                 full_screen: None,
                 has_running_children: false,
+                pane_pid: None,
             },
             None,
             None,
@@ -10247,6 +10334,7 @@ mod tests {
                 ),
                 full_screen: None,
                 has_running_children: false,
+                pane_pid: None,
             },
             None,
             None,
@@ -10271,6 +10359,7 @@ mod tests {
                 ),
                 full_screen: None,
                 has_running_children: false,
+                pane_pid: None,
             },
             None,
             None,
@@ -10293,6 +10382,7 @@ mod tests {
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
                 has_running_children: false,
+                pane_pid: None,
             },
             None,
             None,
@@ -10499,13 +10589,8 @@ mod tests {
         // この状態で `claude agents --json` を素で実行すると worker が一覧に出ない
         std::env::set_var(crate::orchestrator::CLAUDE_CONFIG_DIR_ENV, &alt_config);
 
-        // worker は既定 config dir で走らせるので、事前信頼もそちらへ書く（#558）
-        let default_cfg = crate::orchestrator::claude_default_config_dir()
-            .expect("既定 config dir")
-            .display()
-            .to_string();
-        crate::claude_tui::ensure_trusted_in(Some(&default_cfg), &work.display().to_string())
-            .expect("事前信頼を書ける");
+        // worker は既定 config dir で走らせるので、事前信頼もそちらへ書く
+        crate::claude_tui::ensure_trusted(&work.display().to_string()).expect("事前信頼を書ける");
 
         let _ = std::process::Command::new("tmux")
             .args(["-L", E2E_SOCKET_571, "kill-server"])
@@ -12108,6 +12193,7 @@ mod tests {
                 live_tail: Some("Welcome to Claude Code\n❯ ".into()),
                 full_screen: None,
                 has_running_children: false,
+                pane_pid: None,
             },
             None,
             None,
@@ -12135,6 +12221,7 @@ mod tests {
                 live_tail: Some("Thinking…\nesc to interrupt".into()),
                 full_screen: None,
                 has_running_children: false,
+                pane_pid: None,
             },
             None,
             None,
@@ -12168,6 +12255,7 @@ mod tests {
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
                 has_running_children: false,
+                pane_pid: None,
             },
             Some("sid-7801-detected"),
             None,
@@ -12213,6 +12301,7 @@ mod tests {
             live_tail: Some("zsh: segmentation fault  claude\n% ".into()),
             full_screen: None,
             has_running_children: has_children,
+            pane_pid: None,
         };
 
         // 子プロセスなし → agent_dead イベント + resume_command

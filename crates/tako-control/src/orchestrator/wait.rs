@@ -1758,6 +1758,141 @@ mod tests {
     const AGY_BUSY_SCREEN: &str =
         "▸ Thought Process\n⣻  Generating...\n────\n>\n────\nesc to cancel   Claude Opus 4.6 (Thinking)";
 
+    // --- #592: Windows 実機の実採取画面（2026-07-27。claude v2.1.220 系） ---
+    //
+    // macOS の採取（#571）と決定的に違う 2 点をこの固定データで守る:
+    //
+    // 1. **ペインが狭い**（実測 39 列 × 18 行 = 4 分割時の worker ペイン）。
+    //    フッターのヒントが `⏵⏵ auto mode on · PR #588 · esc to …` と**省略され**、
+    //    `esc to interrupt` が画面から消える。スピナーが唯一の busy シグナルになる
+    // 2. **矢印が ASCII**（`(->1h36m)`。macOS は `(→1h36m)`）。括弧の中身を見る
+    //    スピナー判定が、この形を経過時間と読み違えないこと
+
+    /// **作業中**（worker pane 22 実採取）。1 時間超えの `(1h 0m 22s)` + glyph は `·`。
+    /// スピナーは末尾から 8 行目（旧実装の末尾 5 行では届かない）
+    const WIN_CLAUDE_BUSY_NARROW: &str = "\
+  remaining acceptance criteria and\n\
+  edge cases:\n\
+\n\
+● Making 1 scratchpad edit +151,\n\
+  searching for 2 patterns, running 7\n\
+  shell commands…\n\
+  ⎿  $ git diff\n\
+     crates/tako-app/src/main.rs\n\
+\n\
+· Processing… (1h 0m 22s)\n\
+  ⎿  Tip: Use /clear to start fresh\n\
+     when switching topics and free up\n\
+     context\n\
+\n\
+───────────────────────────────────────\n\
+❯\n\
+───────────────────────────────────────\n\
+  ⏵⏵ auto mode on · PR #588 · esc to …";
+
+    /// **作業中**（worker pane 26 実採取）。`(3m 1s · thinking)` の複合形
+    const WIN_CLAUDE_BUSY_THINKING: &str = "\
+● I'll start by reading the required\n\
+  context files and the Issue, then dig\n\
+  into the current implementation.\n\
+\n\
+  Searching for 4 patterns, reading 4\n\
+  files, listing 1 directory, running 4\n\
+  shell commands…\n\
+  ⎿  crates\\tako-app\\src\\status_bar.rs\n\
+\n\
+✽ Spinning… (3m 1s · thinking)\n\
+  ⎿  Tip: Use /btw to ask a quick side\n\
+     question without interrupting\n\
+     Claude's current work\n\
+\n\
+───────────────────────────────────────\n\
+❯\n\
+───────────────────────────────────────\n\
+  ⏵⏵ auto mode on · PR #588 · esc to …";
+
+    /// **入力待ち**（master pane 5 実採取）。完了行 `✻ Sautéed for 19s` は
+    /// 括弧つき詳細を持たない。`· 3 monitors still running` の小文字 running と
+    /// フッターの ASCII 矢印 `(->1h36m)` が誤爆源になりうる
+    const WIN_CLAUDE_IDLE: &str = "\
+●  立て直したワーカー（pane 28）の transcript が生まれ、監視も張り直しました。\n\
+  5ワーカーの完了を待って、検収 → push → マージ、と進めます。\n\
+\n\
+✻ Sautéed for 19s · 3 monitors still running\n\
+\n\
+─────────────────────────────────────────────────────────────────────\n\
+❯\n\
+─────────────────────────────────────────────────────────────────────\n\
+  [Fable 5 · xH]\n\
+  ctx  45% ████░░░░░░\n\
+  5h   33% ███░░░░░░░ (->1h36m)\n\
+  7d   28% ██░░░░░░░░ (->5d04h)\n\
+  ⏵⏵ auto mode on · 3 monitors · ← for agents";
+
+    #[test]
+    fn windows実機の狭いペインでもスピナーをbusyと読む() {
+        // 狭いペインでは `esc to interrupt` がそもそも描画されない。
+        // ここが false に戻ると Windows の watch は即座に偽 IDLE を出す（#592 の実害）
+        for screen in [WIN_CLAUDE_BUSY_NARROW, WIN_CLAUDE_BUSY_THINKING] {
+            assert!(
+                !screen.contains("esc to interrupt"),
+                "狭いペインではヒントが省略される前提の固定データ"
+            );
+            assert!(
+                screen_looks_busy(screen),
+                "スピナーで busy と読む: {screen}"
+            );
+            // busy 中も入力欄は見えている（呼び出し側が busy を優先する構造）
+            assert!(screen_looks_idle(screen));
+        }
+    }
+
+    #[test]
+    fn windows実機の入力待ち画面をidleと読む() {
+        assert!(
+            !screen_looks_busy(WIN_CLAUDE_IDLE),
+            "完了行 `Sautéed for 19s` / 小文字 running / ASCII 矢印 (->1h36m) に誤爆しない"
+        );
+        assert!(screen_looks_idle(WIN_CLAUDE_IDLE));
+    }
+
+    #[test]
+    fn windowsのascii矢印付きフッターをスピナーと誤読しない() {
+        // macOS の `(→2h33m)` は #571 で固定済み。Windows は `->` になる
+        assert!(!screen_looks_busy("  5h   33% ███░░░░░░░ (->1h36m)"));
+        assert!(!screen_looks_busy("  7d   28% ██░░░░░░░░ (->5d04h)"));
+    }
+
+    /// 本タスクで実採取したスピナー語（claude v2.1.220 系）。
+    /// **語彙の追随はしない**方針の回帰テスト: どれも「括弧の中身」だけで busy と読める
+    #[test]
+    fn 実採取したスピナー語彙は判定に影響しない() {
+        let words = [
+            "Processing",
+            "Cooked",
+            "Sautéed",
+            "Crunched",
+            "Thundering",
+            "Wandering",
+            "Composing",
+            "Whirlpooling",
+            "Improvising",
+            "Elucidating",
+            "Crafting",
+            "Spinning",
+        ];
+        for w in words {
+            assert!(
+                screen_looks_busy(&format!("✽ {w}… (12s)")),
+                "スピナー形なら語に関係なく busy: {w}"
+            );
+            assert!(
+                !screen_looks_busy(&format!("✻ {w} for 12s")),
+                "完了形（for + 経過時間）は busy にしない: {w}"
+            );
+        }
+    }
+
     #[test]
     fn codexとagyの画面判定() {
         assert!(screen_looks_idle(CODEX_IDLE_SCREEN), "codex の › を拾う");

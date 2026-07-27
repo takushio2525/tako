@@ -172,6 +172,10 @@ pub struct TerminalSession {
     command_state_since: Option<std::time::Instant>,
     /// PTY スレーブの tty 名（tmux クライアントとの対応付け。FR-2.13.2）
     tty_name: Option<String>,
+    /// PTY 直下の子プロセス（シェル / 明示コマンド）の pid。
+    /// 器を持たないバックエンド（Windows の backend=none）で、ペイン配下の
+    /// エージェント CLI をプロセス祖先辿りで見つけるための起点（#592）
+    child_pid: Option<u32>,
     /// 検知された listen ポート（FR-2.4.2。UI 層のポーリングが更新する）
     listen_ports: Vec<crate::ports::ListenPort>,
     /// サブライン表示の下方向端数（0.0..1.0 行）。表示位置 = display_offset - fract。
@@ -262,6 +266,10 @@ impl TerminalSession {
         let mut pty = tty::new(&tty_options, window_size, 0).map_err(SessionError::Pty)?;
         // PTY スレーブの tty 名（/dev/ttysNNN）。tmux クライアントとの対応付けに使う（FR-2.13.2）
         let tty_name = slave_tty_name(&mut pty);
+        // PTY 直下の子プロセス（シェル / 明示コマンド）の pid。
+        // 器（tmux）を持たない環境で「このペインで何が動いているか」を辿る唯一の起点になる
+        // （#592: Windows は backend=none なので tty / セッション名では対応付けられない）
+        let child_pid = pty_child_pid(&pty);
         // PTY 読み取りを OSC 7 / 133 タップで観測する（バイト列は変更しない。`osc_tap`）
         let pty = TapPty::new(
             pty,
@@ -286,6 +294,7 @@ impl TerminalSession {
                 command_state: CommandState::default(),
                 command_state_since: None,
                 tty_name,
+                child_pid,
                 listen_ports: Vec::new(),
                 scroll_fract: std::sync::Mutex::new(0.0),
                 wheel_carry: std::sync::Mutex::new(0.0),
@@ -301,6 +310,13 @@ impl TerminalSession {
     /// PTY スレーブの tty 名（取得できない環境では None）
     pub fn tty_name(&self) -> Option<&str> {
         self.tty_name.as_deref()
+    }
+
+    /// PTY 直下の子プロセス（シェル / 明示コマンド）の pid（取得できない環境では None）。
+    /// 起動時に確定した値で、シェルが exec で入れ替わっても pid 自体は変わらない。
+    /// **プロセスの生存は保証しない**（終了後も残る）ので、生存前提の判定に使う側で確かめること
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child_pid
     }
 
     /// tty 名の差し替え（Phase 5.5 tmux バックエンド用）。
@@ -1196,6 +1212,26 @@ fn slave_tty_name(pty: &mut tty::Pty) -> Option<String> {
 #[cfg(not(target_os = "macos"))]
 fn slave_tty_name(_pty: &mut tty::Pty) -> Option<String> {
     // Linux は ptsname_r、Windows は ConPTY で別概念。必要になったフェーズで対応する
+    None
+}
+
+/// PTY 直下の子プロセスの pid（#592）。
+/// alacritty_terminal は API がプラットフォームで分かれる:
+/// unix は `Pty::child()`（`std::process::Child`）、Windows は
+/// `Pty::child_watcher().pid()`（ConPTY 生成時の `GetProcessId`）。
+/// 取得できなければ None（対応付けが劣化するだけで、既存経路には影響しない）
+#[cfg(unix)]
+fn pty_child_pid(pty: &tty::Pty) -> Option<u32> {
+    Some(pty.child().id())
+}
+
+#[cfg(windows)]
+fn pty_child_pid(pty: &tty::Pty) -> Option<u32> {
+    pty.child_watcher().pid().map(|p| p.get())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn pty_child_pid(_pty: &tty::Pty) -> Option<u32> {
     None
 }
 
