@@ -1393,3 +1393,13 @@
   証拠は `~/dev/tako-evidence/550/`
 - 既知: 合成キー入力は IME に吸われるため入力欄への打鍵は GUI 未検証（セルフテスト 84 で代替）。
   `cargo fmt --all --check` が `keybindings.rs:248` で落ちるのは **main 由来**（#546 merge 時点から）
+
+## 2026-07-27（#558: 事前信頼の書き先を claude の config dir 配下へ）
+- 根因: claude は `<config dir>/.claude.json`（既定 `~/.claude/.claude.json`）を読むのに、
+  tako はホーム直下の `~/.claude.json` へ書いていた。承諾直後の diff で「config dir 側だけが
+  変化しホーム直下は無変化」を実測。事前信頼(#32)と bypass 事前承認(#407)が両方無効だった
+- 修正: `config_json_paths`（config dir 配下 → 既定。旧ファイルは存在時のみ併記）+
+  `ensure_trusted_in` / `ensure_bypass_accepted_in` + `EnvPlan::claude_config_dir` で
+  spawn / handoff / git resolve から起動先の config dir を渡す。e2e の後始末も同じ規則へ
+- 検証: `claude_tui_e2e --ignored` が 2 failed → 4 passed（109 秒 → 27 秒）。
+  アカウント指定 spawn の書き先を before/after 実測。品質ゲート全緑（1389）
