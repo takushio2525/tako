@@ -152,14 +152,12 @@ pub mod notes {
         "画像のズーム・パンは動く。PDF は macOS 実装のため開けず操作対象にならない",
         "Zoom and pan work for images. PDF cannot be opened on Windows, so it is not a target",
     );
-    /// #522: OS 連携（B8）の Windows 実装が未了。**ゴミ箱が完全削除に劣化する**ことは
-    /// 取り返しがつかないので必ず書く
-    pub const WIN_FILE_OP_PARTIAL: Note = Note::new(
-        "パスのコピー・cd・作成・リネームは動く。ファイルマネージャ表示と既定アプリで開く操作は未対応で、\
-         ゴミ箱へ移動は完全削除になる（復元できない）",
-        "Copying paths, cd, create and rename work. Revealing in the file manager and opening with the \
-         default app are unavailable, and moving to trash deletes permanently (not recoverable)",
-    );
+    // #617 で B8 の Windows 実装（explorer.exe /select, / ShellExecuteW /
+    // SHFileOperationW + FOF_ALLOWUNDO）が入り、`tako_file_op` は全操作が動くようになった。
+    // 縮退理由 WIN_FILE_OP_PARTIAL（「ゴミ箱へ移動は完全削除になる」）は**実態と食い違う**
+    // ので削除した。宣言が残っていると system prompt へ誤情報が注入される（このファイルの
+    // モジュール doc「この表を直したら」を参照）
+
     /// #524 の担当範囲
     pub const WIN_OS_API: Note = Note::new(
         "OS API（プロセス検査・スリープ防止）の Windows 実装が前提",
@@ -406,11 +404,11 @@ pub const MATRIX: &[Feature] = &[
         },
     },
     Feature {
+        // #617: reveal / trash / open_default / open_with とも Windows 実装済み
+        // （ごみ箱は FOF_ALLOWUNDO で復元可能。完全削除ではない）
         key: "tako_file_op",
         macos: Support::Supported,
-        windows: Support::Degraded {
-            note: notes::WIN_FILE_OP_PARTIAL,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_focus_pane",

@@ -23,8 +23,8 @@ tako platform --status pending # 未対応のものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | ---: | --- |
-| 対応済み | 90 | macOS 版と同じように使えます |
-| 一部対応 | 6 | 使えますが機能が落ちます（理由は各表に記載） |
+| 対応済み | 91 | macOS 版と同じように使えます |
+| 一部対応 | 5 | 使えますが機能が落ちます（理由は各表に記載） |
 | 未対応 | 28 | まだ実装されていません（追跡 Issue つき） |
 | 対象外 | 1 | Windows には概念自体が存在しません |
 | **合計** | **125** | |
@@ -196,7 +196,7 @@ tako を再起動したときにタブ・ペインと実行中プロセスをど
 | `tako_agents_sync_rules` | 対応済み | — |
 | `tako_stale_binary` | 対応済み | — |
 | `tako_tree_folder` | 対応済み | — |
-| `tako_file_op` | 一部対応 | パスのコピー・cd・作成・リネームは動く。ファイルマネージャ表示と既定アプリで開く操作は未対応で、ゴミ箱へ移動は完全削除になる（復元できない） |
+| `tako_file_op` | 対応済み | — |
 | `tako_port_detect` | 未対応 | OS API（プロセス検査・スリープ防止）の Windows 実装が前提 <br />追跡: [#524](https://github.com/takushio2525/tako/issues/524) |
 | `tako_sleep_guard` | 未対応 | OS API（プロセス検査・スリープ防止）の Windows 実装が前提 <br />追跡: [#524](https://github.com/takushio2525/tako/issues/524) |
 | `tako_fda` | 対象外 | Windows に macOS の TCC（フルディスクアクセス）に相当する仕組みが無い |
