@@ -586,15 +586,78 @@ fn open_external_url(url: &str) {
     open_preview(url);
 }
 
+/// IME の変換対象になり得るアプリ内テキスト入力（#561）。
+///
+/// ターミナルペイン宛ての変換と型で区別する。区別が無かった頃は、git のコミット欄に
+/// フォーカスがあっても変換が**ターミナルペインに束縛**され、未確定文字列の下線も
+/// 変換候補ウィンドウもターミナルのカーソル位置に出ていた（入力欄側では何も起きず、
+/// ユーザーには「IME が効かない」に見えていた）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppTextInput {
+    /// git タブのコミットメッセージ欄
+    GitCommit,
+    /// git タブの新規ブランチ名欄
+    GitBranch,
+}
+
 /// IME 変換中（未確定文字列 = marked text）の状態（FR-1.9）。
 /// 変換開始時のフォーカスペインを保持し、変換途中でフォーカスが移っても確定先がぶれないようにする
 struct ImeComposition {
     /// 変換対象のペイン（確定文字列の書き込み先）
     pane: PaneId,
+    /// アプリ内テキスト入力が変換対象なら `Some`（#561）。
+    /// `None` のときだけ `pane` のターミナルが確定先になる。
+    /// 変換開始時に決め、途中では変えない（`pane` と同じ扱い）
+    app_input: Option<AppTextInput>,
     /// 未確定文字列
     text: String,
     /// IME が注目している文節（`text` 内の UTF-16 コード単位の範囲）。太い下線で強調する
     selected_utf16: Option<Range<usize>>,
+}
+
+/// 未確定文字列（marked text）のハイライト区間を組む（FR-1.9）。
+///
+/// ハイライト範囲は重複禁止（`StyledText` の要求）なので、注目文節の前・文節・後の
+/// 3 区間に分割する。文節範囲（UTF-16）はバイト範囲へ変換する。
+/// ターミナル上のオーバーレイと、アプリ内テキスト入力へのインライン描画（#561）が
+/// **同じ見た目**になるよう 1 か所に集約してある
+fn ime_highlight_ranges(
+    text: &str,
+    selected_utf16: Option<&Range<usize>>,
+    theme: &tako_core::Theme,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let thin = HighlightStyle {
+        underline: Some(UnderlineStyle {
+            thickness: px(1.0),
+            color: None,
+            wavy: false,
+        }),
+        ..HighlightStyle::default()
+    };
+    let thick = HighlightStyle {
+        background_color: Some(hsla(theme.selection_background)),
+        underline: Some(UnderlineStyle {
+            thickness: px(2.0),
+            color: Some(hsla(theme.accent)),
+            wavy: false,
+        }),
+        ..HighlightStyle::default()
+    };
+    let clause = selected_utf16
+        .map(|sel| utf16_to_byte_offset(text, sel.start)..utf16_to_byte_offset(text, sel.end))
+        .filter(|r| !r.is_empty())
+        .unwrap_or(0..0);
+    let mut highlights = Vec::new();
+    if clause.start > 0 {
+        highlights.push((0..clause.start, thin));
+    }
+    if !clause.is_empty() {
+        highlights.push((clause.clone(), thick));
+    }
+    if clause.end < text.len() {
+        highlights.push((clause.end..text.len(), thin));
+    }
+    highlights
 }
 
 /// UTF-16 コード単位のオフセットを UTF-8 バイトオフセットへ変換する（範囲外は末尾へ丸める）。
@@ -841,6 +904,10 @@ struct TakoApp {
     /// false になると下線オーバーレイが描画されない。カーソル非表示ペインでも
     /// true であることをセルフテスト 76c / 76d が固定する
     ime_overlay_anchored: bool,
+    /// アプリ内テキスト入力のキャレットが**実際に描かれた**矩形（ウィンドウ座標。#561）。
+    /// 変換候補ウィンドウの位置出し（`bounds_for_range`）に使う。
+    /// paint フェーズでしか分からないので `Rc<Cell>` で render から書き戻す
+    text_input_caret_bounds: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     /// git コミットメッセージ入力欄にフォーカスがあるか（#472）
     git_commit_input_focused: bool,
     /// ブランチ操作の事前提示カード（#496。承諾するまで実行しない）
@@ -2057,6 +2124,7 @@ impl TakoApp {
             git_feedback: None,
             git_busy: None,
             ime_overlay_anchored: false,
+            text_input_caret_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             git_commit_input_focused: false,
             git_branch_confirm: None,
             git_branch_input: None,
@@ -7511,12 +7579,50 @@ impl TakoApp {
         ))
     }
 
+    /// いま IME の変換対象になるアプリ内テキスト入力（#561）。
+    ///
+    /// 振り分けの優先順位は `replace_text_in_range` の確定文字列の振り分けと合わせる。
+    /// インライン編集 / Web dock の URL 欄が有効な間は従来経路（ペイン束縛）のままにする
+    fn app_text_input(&self) -> Option<AppTextInput> {
+        if self.inline_edit.is_some() || self.webview_dock_url_focused {
+            return None;
+        }
+        if self.git_branch_input.is_some() {
+            return Some(AppTextInput::GitBranch);
+        }
+        // #503 と同じ条件で「見えているコミット欄」に限る（stale フラグで拾わない）
+        if self.git_commit_input_focused && self.panel_visible && self.panel_view == PanelView::Git
+        {
+            return Some(AppTextInput::GitCommit);
+        }
+        None
+    }
+
+    /// 確定文字列をアプリ内テキスト入力へ入れる（#561）。
+    /// 通常の打鍵（`handle_key`）と同じ挿入関数を通すので上限・不正文字の扱いが一致する
+    fn insert_app_text_input(&mut self, target: AppTextInput, text: &str, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            return;
+        }
+        match target {
+            AppTextInput::GitCommit => self.git_commit_insert(text, cx),
+            AppTextInput::GitBranch => self.git_branch_input_insert(text, cx),
+        }
+    }
+
     /// IME 未確定文字列オーバーレイのアンカーを解決する（#497）。
     ///
     /// render と回帰テスト（セルフテスト 76c / 76d）が**同じ経路**を通るように
     /// 関数へ切り出してある。ここが None を返すと下線が一切描画されない。
     /// 解決の成否は `ime_overlay_anchored` に記録する
     fn ime_overlay_anchor(&mut self, window: &mut Window) -> Option<Point<Pixels>> {
+        // #561: アプリ内テキスト入力宛ての変換は、未確定文字列を**入力欄の中へ
+        // インライン描画**する。ターミナル上のオーバーレイは出さない
+        // （出すと入力欄から離れた場所に同じ文字列が二重に見える）
+        if self.ime.as_ref().is_some_and(|ime| ime.app_input.is_some()) {
+            self.ime_overlay_anchored = false;
+            return None;
+        }
         let anchor = self
             .ime
             .as_ref()
@@ -13929,6 +14035,14 @@ impl EntityInputHandler for TakoApp {
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // NSTextInputClient の規約: unmark は「未確定文字列をそのまま挿入扱いにする」
         if let Some(ime) = self.ime.take() {
+            // #561: アプリ内テキスト入力宛ての変換はそこへ入れる。
+            // ここを通さないと未確定文字列がターミナルへ流れ、入力欄には何も残らない
+            if let Some(target) = ime.app_input {
+                self.insert_app_text_input(target, &ime.text, cx);
+                window.invalidate_character_coordinates();
+                cx.notify();
+                return;
+            }
             // 変換開始ペインが既に閉じられていたらフォーカスペインへ倒す（#332）
             let pane = if self.ime_pane_alive(ime.pane) {
                 ime.pane
@@ -13970,6 +14084,15 @@ impl EntityInputHandler for TakoApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // #561: 変換中のアプリ内テキスト入力があればそこへ確定する。
+        // 変換開始時に決めた宛先を使うので、途中でフォーカスが外れても確定先はぶれない
+        if let Some(target) = self.ime.as_ref().and_then(|ime| ime.app_input) {
+            self.ime = None;
+            self.insert_app_text_input(target, text, cx);
+            window.invalidate_character_coordinates();
+            cx.notify();
+            return;
+        }
         // インライン編集中は IME 確定文字列をインライン入力に振り分ける
         if let Some(ref mut edit) = self.inline_edit {
             if !text.is_empty() {
@@ -14074,6 +14197,12 @@ impl EntityInputHandler for TakoApp {
         if new_text.is_empty() {
             self.ime = None;
         } else {
+            // #561: 変換の宛先（アプリ内テキスト入力 or ターミナルペイン）は
+            // **変換開始時に 1 度だけ**決め、変換中は変えない。ペインの扱いと同じ
+            let app_input = match self.ime.as_ref() {
+                Some(existing) => existing.app_input,
+                None => self.app_text_input(),
+            };
             // 変換継続中は開始ペインを維持する。ただし開始ペインが既に閉じられて
             // いたらフォーカスペインへ付け替える（stale なまま引き継ぐと以後の
             // 変換・確定がすべて死んだペインへ向かう。#332）
@@ -14085,6 +14214,7 @@ impl EntityInputHandler for TakoApp {
                 .unwrap_or_else(|| self.focused_pane());
             self.ime = Some(ImeComposition {
                 pane,
+                app_input,
                 text: new_text.to_string(),
                 selected_utf16: new_selected_range,
             });
@@ -14099,6 +14229,23 @@ impl EntityInputHandler for TakoApp {
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        // #561: アプリ内テキスト入力宛ての変換は、その入力欄のキャレット矩形を返す。
+        // ここでターミナルのカーソル位置を返していたため、候補ウィンドウが
+        // 右パネルの入力欄から遠く離れた場所（ターミナルのカーソル）に出ていた
+        if let Some(target) = self.ime.as_ref().and_then(|ime| ime.app_input) {
+            if let Some(caret) = self.text_input_caret_bounds.get() {
+                // 高さはキャレットに合わせる。幅 0 だと macOS が無視することがあるので
+                // 最低限の幅を持たせる
+                let _ = target;
+                return Some(Bounds::new(
+                    caret.origin,
+                    size(caret.size.width.max(px(1.0)), caret.size.height),
+                ));
+            }
+            // まだ 1 度も描画されていない（= 入力欄が画面に出ていない）ときは
+            // ターミナルへ倒さず、要素の原点を返す。誤った場所へ出すよりまし
+            return Some(Bounds::new(element_bounds.origin, size(px(1.0), px(16.0))));
+        }
         // 変換候補ウィンドウの位置出し。カーソルセル + 範囲先頭までの描画幅。
         // CursorShape::Hidden（claude 等の TUI アプリ）でもカーソル位置は有効なので
         // ime_cursor をフォールバックに使う（#29: 候補ウィンドウが画面左下に出る問題の修正）
@@ -14740,43 +14887,7 @@ impl Render for TakoApp {
         let ime_overlay = self.ime.as_ref().and_then(|ime| {
             let anchor = ime_anchor?;
             let text = ime.text.clone();
-            // ハイライト範囲は重複禁止（StyledText の要求）のため、注目文節の前・文節・後の
-            // 3 区間に分割して組む。文節範囲（UTF-16）はバイト範囲へ変換する
-            let thin = HighlightStyle {
-                underline: Some(UnderlineStyle {
-                    thickness: px(1.0),
-                    color: None,
-                    wavy: false,
-                }),
-                ..HighlightStyle::default()
-            };
-            let thick = HighlightStyle {
-                background_color: Some(hsla(theme.selection_background)),
-                underline: Some(UnderlineStyle {
-                    thickness: px(2.0),
-                    color: Some(hsla(theme.accent)),
-                    wavy: false,
-                }),
-                ..HighlightStyle::default()
-            };
-            let clause = ime
-                .selected_utf16
-                .as_ref()
-                .map(|sel| {
-                    utf16_to_byte_offset(&text, sel.start)..utf16_to_byte_offset(&text, sel.end)
-                })
-                .filter(|r| !r.is_empty())
-                .unwrap_or(0..0);
-            let mut highlights = Vec::new();
-            if clause.start > 0 {
-                highlights.push((0..clause.start, thin));
-            }
-            if !clause.is_empty() {
-                highlights.push((clause.clone(), thick));
-            }
-            if clause.end < text.len() {
-                highlights.push((clause.end..text.len(), thin));
-            }
+            let highlights = ime_highlight_ranges(&text, ime.selected_utf16.as_ref(), &theme);
             Some(
                 div()
                     .absolute()
@@ -23077,33 +23188,49 @@ mod self_test {
             // 素通りして ASCII のまま terminal へ入り続ける（候補ウィンドウが再起動
             // まで出ない）。可視ウィンドウでは on_focus_lost（draw 末尾）が打鍵前に
             // 復元するが、このセルフテスト環境は draw が止まり得るため打鍵経路で検証
-            // する。修正前はこの check が FAILED = blur が恒久化していた
-            let _ = any.update(cx, |_, window, _| window.blur());
-            let mut blurred = false;
-            for _ in 0..10 {
-                wait(cx, 50).await;
-                blurred = window
-                    .update(cx, |app, window, _| !app.focus_handle.is_focused(window))
-                    .unwrap_or(false);
-                if blurred {
-                    break;
+            // する。修正前はこの check が FAILED = blur が恒久化していた。
+            //
+            // 前提: **この項目に入る時点で focus を持っていること**。他アプリが
+            // 前面でウィンドウが隠れていると GPUI が描画を止め、focus() が確定しない。
+            // その状態で走らせると「blur → 復元しない」= 常に FAILED になり、
+            // ここで exit するので以降の全項目が未実行になる（#501 と同じ穴）。
+            // 前提が成立しないときは product の欠陥ではないので SKIPPED を明示する
+            let focused_before = window
+                .update(cx, |app, window, _| app.focus_handle.is_focused(window))
+                .unwrap_or(false);
+            if !focused_before {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 76（ウィンドウが focus を持っていない。\
+                     前面にして再実行すると検証できる）"
+                );
+            } else {
+                let _ = any.update(cx, |_, window, _| window.blur());
+                let mut blurred = false;
+                for _ in 0..10 {
+                    wait(cx, 50).await;
+                    blurred = window
+                        .update(cx, |app, window, _| !app.focus_handle.is_focused(window))
+                        .unwrap_or(false);
+                    if blurred {
+                        break;
+                    }
                 }
-            }
-            press(any, cx, "escape");
-            let mut refocused = false;
-            for _ in 0..15 {
-                wait(cx, 100).await;
-                refocused = window
-                    .update(cx, |app, window, _| app.focus_handle.is_focused(window))
-                    .unwrap_or(false);
-                if refocused {
-                    break;
+                press(any, cx, "escape");
+                let mut refocused = false;
+                for _ in 0..15 {
+                    wait(cx, 100).await;
+                    refocused = window
+                        .update(cx, |app, window, _| app.focus_handle.is_focused(window))
+                        .unwrap_or(false);
+                    if refocused {
+                        break;
+                    }
                 }
+                check(
+                    blurred && refocused,
+                    "IME 経路: blur 後の focus 自己修復 (#332)",
+                );
             }
-            check(
-                blurred && refocused,
-                "IME 経路: blur 後の focus 自己修復 (#332)",
-            );
 
             // 76b. 変換中ペインの close で IME 状態が畳まれる（#332）。
             // 畳まれないと ime_target / 確定書き込みが死んだペインへ向き続け、
@@ -23741,6 +23868,201 @@ mod self_test {
                 if fixture.starts_with(std::env::temp_dir()) {
                     let _ = std::fs::remove_dir_all(&fixture);
                 }
+            }
+
+            // 85. git タブのセクション表示順（#551 案 2）。
+            // 「変更 → コミット → ブランチ → リモート → diff」の順に積まれることを
+            // render が実際に記録した並び（`git_body_sections`）で固定する。
+            // 目視でしか確認できないと回帰を検出できないので、render と同じ経路を通す。
+            // git リポジトリは pinned フォルダで明示的に与える（この時点のペイン cwd は
+            // 直前の項目が作った一時ディレクトリのことがあり、当てにできない）
+            {
+                let repo_root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+                let repo_root = std::fs::canonicalize(repo_root)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| repo_root.to_string());
+                let pin = repo_root.clone();
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::TreeFolder {
+                            action: "add".into(),
+                            path: Some(pin),
+                            tab: None,
+                            pane: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    app.panel_visible = true;
+                    app.panel_view = PanelView::Git;
+                    app.refresh_git(cx);
+                });
+                let mut order: Vec<&'static str> = Vec::new();
+                let mut has_data = false;
+                for _ in 0..40 {
+                    wait(cx, 200).await;
+                    let r = window.update(cx, |app, _, cx| {
+                        let ok = app.git_data.is_some();
+                        if ok {
+                            let _ = app.render_git_view(cx);
+                        }
+                        (ok, app.git_body_sections.clone())
+                    });
+                    if let Ok((ok, o)) = r {
+                        has_data = ok;
+                        order = o;
+                    }
+                    if order.contains(&"branches") {
+                        break;
+                    }
+                }
+                // 既定でブランチ / リモートは畳まれているので、リモート見出しは
+                // ブランチを開くまで現れない = 初期表示に 163 行が並ばない
+                let collapsed_ok = window
+                    .update(cx, |app, _, _| {
+                        app.git_collapsed.branches
+                            && app.git_collapsed.remotes
+                            && !app.git_collapsed.changes
+                            && !app.git_collapsed.commits
+                    })
+                    .unwrap_or(false);
+                let unpin = repo_root.clone();
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::TreeFolder {
+                            action: "remove".into(),
+                            path: Some(unpin),
+                            tab: None,
+                            pane: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    app.panel_visible = false;
+                    cx.notify();
+                });
+                if !has_data {
+                    println!(
+                        "TAKO_SELF_TEST_SKIPPED: 85（git データを取得できない: {repo_root}）"
+                    );
+                } else {
+                    // リポジトリの状態によって「変更」「diff」は現れないことがあるので、
+                    // **現れたセクションの相対順序**を検査する
+                    let rank = |name: &str| -> Option<usize> {
+                        ["changes", "commits", "branches", "remotes", "diff"]
+                            .iter()
+                            .position(|n| *n == name)
+                    };
+                    let ranks: Vec<usize> = order.iter().filter_map(|n| rank(n)).collect();
+                    let sorted = ranks.windows(2).all(|w| w[0] <= w[1]);
+                    let has_core = order.contains(&"commits") && order.contains(&"branches");
+                    check(
+                        sorted && has_core && collapsed_ok,
+                        &format!(
+                            "git タブのセクション順が 変更 → コミット → ブランチ → リモート → diff (#551): {order:?}"
+                        ),
+                    );
+                }
+            }
+
+            // 86. git コミット入力欄の IME（#561）。
+            //
+            // 実 IME（かな漢字変換）は合成キーボード入力では再現できないので、
+            // macOS の NSTextInputClient が呼ぶのと**同じ EntityInputHandler の
+            // 入り口**を直接叩いて変換の宛先を固定する。修正前の実測値は
+            //   bound_pane=PaneId(1) / overlay_anchor=(11px, 87px)
+            //   candidate_bounds=(11px, 87px) / commit_msg_after_unmark=""
+            // で、変換がターミナルペインに束縛され、未確定文字列の下線も候補
+            // ウィンドウもターミナルのカーソル位置（左上）に出ていた。右パネルの
+            // 入力欄では何も起きないので「IME が効かない」に見えていた
+            {
+                let (routed, overlay_off, marked_inline, committed, unmark_ok, cand_ok) = window
+                    .update(cx, |app, window, cx| {
+                        app.panel_visible = true;
+                        app.panel_view = PanelView::Git;
+                        app.git_branch_input = None;
+                        app.git_commit_input_focused = true;
+                        app.git_commit_message.clear();
+                        app.git_commit_cursor = 0;
+                        let pane = app.focused_pane();
+                        // 変換開始（setMarkedText 相当）
+                        app.replace_and_mark_text_in_range(None, "にほんご", None, window, cx);
+                        let routed = app
+                            .ime
+                            .as_ref()
+                            .is_some_and(|i| i.app_input == Some(AppTextInput::GitCommit));
+                        // ターミナル上のオーバーレイは出さない（入力欄へインライン描画するため）
+                        let overlay_off =
+                            app.ime_overlay_anchor(window).is_none() && !app.ime_overlay_anchored;
+                        // 入力欄の中に未確定文字列の要素が組まれる
+                        let theme = app.theme.clone();
+                        let marked_inline = app
+                            .text_input_marked(AppTextInput::GitCommit, &theme)
+                            .is_some()
+                            // ブランチ欄宛ての変換ではないので、そちらには出ない
+                            && app
+                                .text_input_marked(AppTextInput::GitBranch, &theme)
+                                .is_none();
+                        // 候補ウィンドウはターミナルのカーソル位置を返さない
+                        let term_cursor = app.pane_cursor_origin_for_ime(pane, window);
+                        let cand = app.bounds_for_range(0..4, gpui::Bounds::default(), window, cx);
+                        let cand_ok = match (cand, term_cursor) {
+                            (Some(c), Some(t)) => c.origin != t,
+                            (Some(_), None) => true,
+                            _ => false,
+                        };
+                        // 確定（insertText 相当）は入力欄へ入る
+                        app.replace_text_in_range(None, "日本語", window, cx);
+                        let committed = app.git_commit_message == "日本語" && app.ime.is_none();
+                        // unmark（未確定のまま確定扱い）も入力欄へ入る。
+                        // 修正前はここでターミナルへ流れ、入力欄は空のままだった
+                        app.replace_and_mark_text_in_range(None, "ですね", None, window, cx);
+                        app.unmark_text(window, cx);
+                        let unmark_ok =
+                            app.git_commit_message == "日本語ですね" && app.ime.is_none();
+                        // 後始末（後続項目へフォーカス・本文を残さない。#503）
+                        app.git_commit_message.clear();
+                        app.git_commit_cursor = 0;
+                        app.clear_text_input_focus();
+                        app.panel_visible = false;
+                        cx.notify();
+                        (
+                            routed,
+                            overlay_off,
+                            marked_inline,
+                            committed,
+                            unmark_ok,
+                            cand_ok,
+                        )
+                    })
+                    .unwrap_or((false, false, false, false, false, false));
+                check(
+                    routed && overlay_off && marked_inline && committed && unmark_ok && cand_ok,
+                    "git コミット欄の IME: 変換が入力欄へ束縛され確定文字列も候補位置も入力欄側になる (#561)",
+                );
+            }
+
+            // 86b. ターミナルペインの IME は従来どおり（#561 の回帰防止）。
+            // アプリ内テキスト入力にフォーカスが無ければ変換はペインに束縛され、
+            // 下線オーバーレイのアンカーも解決する（項目 76c / 76d と同じ不変条件）
+            {
+                let term_ok = window
+                    .update(cx, |app, window, cx| {
+                        app.clear_text_input_focus();
+                        app.git_branch_input = None;
+                        app.replace_and_mark_text_in_range(None, "たーみなる", None, window, cx);
+                        let bound_to_pane =
+                            app.ime.as_ref().is_some_and(|i| i.app_input.is_none());
+                        let anchored = app.ime_overlay_anchor(window).is_some();
+                        app.ime = None;
+                        cx.notify();
+                        bound_to_pane && anchored
+                    })
+                    .unwrap_or(false);
+                check(
+                    term_ok,
+                    "ターミナルの IME: 入力欄が非フォーカスなら従来どおりペインへ束縛 (#561)",
+                );
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

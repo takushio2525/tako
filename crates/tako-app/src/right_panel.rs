@@ -2620,13 +2620,9 @@ impl TakoApp {
                                 .child(SharedString::from(tail_chars(before, visible))),
                         )
                     })
-                    .child(
-                        div()
-                            .w(px(1.5))
-                            .h(px(13.0))
-                            .flex_none()
-                            .bg(hsla(theme.accent)),
-                    )
+                    // #561: コミット欄と同じく未確定文字列は入力欄の中へ出す
+                    .children(self.text_input_marked(AppTextInput::GitBranch, theme))
+                    .child(self.text_input_caret(AppTextInput::GitBranch, theme))
                     .when(!input.text.is_empty(), |d| {
                         d.child(
                             div()
@@ -3080,7 +3076,7 @@ impl TakoApp {
     /// 以前は全部を 1 個のスクロールコンテナへ平らに積んでいたため、コンテンツ総高さが
     /// パネル高さを超えると taffy が行を縦に圧縮し、要素同士が重なって描画されていた
     /// （#494 の根本原因。詳細は `GitScrollBody` のコメント）。
-    fn render_git_view(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    pub(crate) fn render_git_view(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme.clone();
         let data = self.git_data.clone();
 
@@ -3389,14 +3385,10 @@ impl TakoApp {
                                 .child(SharedString::from(tail_chars(msg_before, visible_chars))),
                         )
                     })
+                    // #561: 変換中の未確定文字列はキャレット位置へインラインで出す
+                    .children(self.text_input_marked(AppTextInput::GitCommit, &theme))
                     .when(commit_focused, |d| {
-                        d.child(
-                            div()
-                                .w(px(1.5))
-                                .h(px(13.0))
-                                .flex_none()
-                                .bg(hsla(theme.accent)),
-                        )
+                        d.child(self.text_input_caret(AppTextInput::GitCommit, &theme))
                     })
                     .when(!commit_msg.is_empty(), |d| {
                         d.child(
@@ -4539,6 +4531,60 @@ impl TakoApp {
                 true
             }
         }
+    }
+
+    /// アプリ内テキスト入力のキャレット（#487 / #496 の入力欄で共用）。
+    ///
+    /// いま IME の変換対象になっている入力欄なら、**実際に描かれた矩形**を
+    /// `text_input_caret_bounds` へ記録する。変換候補ウィンドウの位置出し
+    /// （`bounds_for_range`）はこれを使う（#561）。paint フェーズでしか
+    /// 分からない値なので、何も描かない canvas の paint フックから書き戻す
+    pub(crate) fn text_input_caret(
+        &self,
+        target: AppTextInput,
+        theme: &tako_core::Theme,
+    ) -> gpui::Div {
+        let slot =
+            (self.app_text_input() == Some(target)).then(|| self.text_input_caret_bounds.clone());
+        div()
+            .w(px(1.5))
+            .h(px(13.0))
+            .flex_none()
+            .bg(hsla(theme.accent))
+            .when_some(slot, |d, slot| {
+                d.child(
+                    canvas(|_, _, _| (), move |bounds, _, _, _| slot.set(Some(bounds))).size_full(),
+                )
+            })
+    }
+
+    /// 変換中の未確定文字列を入力欄の中へインライン描画する（#561）。
+    ///
+    /// ターミナルペイン宛ての変換ではペイン上へオーバーレイするが、入力欄宛ての
+    /// 変換は入力欄の中に出す。見た目（細下線 / 注目文節の太下線）は
+    /// `ime_highlight_ranges` で共通化してある
+    pub(crate) fn text_input_marked(
+        &self,
+        target: AppTextInput,
+        theme: &tako_core::Theme,
+    ) -> Option<gpui::Div> {
+        let ime = self
+            .ime
+            .as_ref()
+            .filter(|ime| ime.app_input == Some(target))?;
+        let text = ime.text.clone();
+        let highlights = ime_highlight_ranges(&text, ime.selected_utf16.as_ref(), theme);
+        let style = gpui::TextStyle {
+            color: hsla(theme.tab_active_foreground),
+            font_family: SharedString::from(theme.font_family.clone()),
+            font_size: px(11.0).into(),
+            ..gpui::TextStyle::default()
+        };
+        Some(
+            div()
+                .flex_none()
+                .child(gpui::StyledText::new(text).with_default_highlights(&style, highlights)),
+        )
     }
 
     /// 変更ファイル行のクリック → そのファイルをプレビューペインで開く（#560）。
