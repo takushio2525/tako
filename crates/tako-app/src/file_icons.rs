@@ -129,6 +129,10 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     ui_asset!("fleet"),
     ui_asset!("folder_ui"),
     ui_asset!("git_branch"),
+    ui_asset!("git_merge"),
+    // remote.svg は定数だけあって登録が漏れており、リモートパネルのアイコンが
+    // 無言で描かれていなかった（下の埋め込み検査テストで検出。#562）
+    ui_asset!("remote"),
     ui_asset!("arrow_down"),
     ui_asset!("arrow_up"),
     ui_asset!("check"),
@@ -178,6 +182,8 @@ pub mod ui_icon {
     pub const FLEET: &str = "icons/ui/fleet.svg";
     pub const FOLDER: &str = "icons/ui/folder_ui.svg";
     pub const GIT_BRANCH: &str = "icons/ui/git_branch.svg";
+    /// ブランチ行のマージボタン（#562: 常時表示にして導線を見つけられるようにした）
+    pub const GIT_MERGE: &str = "icons/ui/git_merge.svg";
     pub const ARROW_DOWN: &str = "icons/ui/arrow_down.svg";
     pub const ARROW_UP: &str = "icons/ui/arrow_up.svg";
     pub const CHECK: &str = "icons/ui/check.svg";
@@ -595,6 +601,36 @@ pub fn chevron_icon(expanded: bool) -> FileIconKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// UI アイコン定数はすべて `EMBEDDED_ASSETS` に登録されていること。
+    /// 登録漏れがあると `svg().path(...)` が**無言で何も描かない**（#487 で
+    /// 実機報告された「アイコンが見えない」の正体）。#562 でマージアイコンを
+    /// 足したときも定数だけ足して登録を忘れており、ここで検出できる
+    #[test]
+    fn uiアイコン定数はすべて埋め込み済み() {
+        let src = include_str!("file_icons.rs");
+        let mut checked = 0;
+        for line in src.lines() {
+            let Some(rest) = line.trim().strip_prefix("pub const ") else {
+                continue;
+            };
+            let Some((_, tail)) = rest.split_once("= \"") else {
+                continue;
+            };
+            let Some(path) = tail.split('"').next() else {
+                continue;
+            };
+            if !path.starts_with("icons/ui/") {
+                continue;
+            }
+            assert!(
+                EMBEDDED_ASSETS.iter().any(|(k, _)| *k == path),
+                "{path} が EMBEDDED_ASSETS に無い（描画時に無言で消える）"
+            );
+            checked += 1;
+        }
+        assert!(checked > 30, "定数の走査に失敗している: {checked} 件");
+    }
 
     #[test]
     fn special_filenames() {

@@ -96,6 +96,9 @@ pub(crate) fn head_chars(s: &str, n: usize) -> String {
 #[derive(Default)]
 struct GitScrollBody {
     rows: Vec<gpui::AnyElement>,
+    /// 積んだセクションの並び（#551）。**表示順そのもの**なので、
+    /// セクションを並べ替えるとここも自動で変わる = 回帰テストの観測点になる
+    sections: Vec<&'static str>,
 }
 
 /// スクロール領域の行に必須のスタイルを付ける（#494）。
@@ -107,6 +110,12 @@ pub(crate) fn git_scroll_row<E: Styled>(el: E) -> E {
 impl GitScrollBody {
     fn push(&mut self, el: impl Styled + IntoElement) {
         self.rows.push(git_scroll_row(el).into_any_element());
+    }
+
+    /// これから積む行がどのセクションかを記録する（#551）。
+    /// セクション見出しを push する直前に呼ぶ
+    fn section(&mut self, name: &'static str) {
+        self.sections.push(name);
     }
 
     /// スクロール領域そのものを組み立てる。ヘッダ（固定部）の残り高さを全部使う
@@ -2344,6 +2353,14 @@ impl TakoApp {
         let path = entry.path.clone();
         let repo = repo_root.to_string();
         let action_path = entry.path.clone();
+        // #560: 行クリックでそのファイルをプレビューペインへ開く。
+        // 削除済みは開く先が無いのでクリック対象から外す（押しても何も起きない
+        // 当たり判定を作らない = #494 で無効ボタンの理由を必ず言葉にしたのと同じ方針）
+        let can_preview = badge != 'D';
+        let preview_path = std::path::Path::new(repo_root)
+            .join(&entry.path)
+            .display()
+            .to_string();
         div()
             .id(id)
             .group("git-change-row")
@@ -2356,6 +2373,12 @@ impl TakoApp {
             .py(px(1.0))
             .text_size(px(11.0))
             .hover(|d| d.bg(rgba_alpha(theme.selection_background, 0.25)))
+            .when(can_preview, |d| {
+                d.cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.git_open_change_file(&preview_path, cx);
+                    }))
+            })
             .child(
                 div()
                     .w(px(14.0))
@@ -2394,6 +2417,9 @@ impl TakoApp {
                             .text_color(hsla(theme.accent))
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        // #560: 行クリック（プレビュー）へ伝播させない。
+                        // ステージのつもりで押したらプレビューまで開く、を防ぐ
+                        cx.stop_propagation();
                         let paths = vec![action_path.clone()];
                         if staged {
                             this.git_do_unstage(repo.clone(), paths, cx);
@@ -2494,7 +2520,10 @@ impl TakoApp {
                     })
                     .child(name.clone()),
             )
-            // マージボタン: 現在ブランチ自身には出さない（自分自身はマージできない）
+            // マージボタン: 現在ブランチ自身には出さない（自分自身はマージできない）。
+            // #562: 以前は opacity(0) + 行ホバーでしか現れず、実機でユーザーが
+            // 「GUI からマージできない」と判断していた。常時薄く出し、
+            // ホバーで強調する（VSCode のインライン操作と同じ出し方）
             .when(!is_current, |d| {
                 d.child(
                     div()
@@ -2502,18 +2531,31 @@ impl TakoApp {
                             "git-branch-merge",
                             id.1 + if is_remote { 10_000 } else { 0 },
                         ))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(2.0))
                         .flex_none()
                         .px_1()
                         .rounded(px(3.0))
+                        .cursor_pointer()
                         .text_size(px(9.0))
-                        .text_color(hsla_alpha(fg, 0.6))
-                        .opacity(0.0)
+                        .text_color(hsla_alpha(fg, 0.75))
+                        .opacity(0.7)
                         .group_hover("git-branch-row", |d| d.opacity(1.0))
                         .hover(|d| d.bg(rgba_alpha(accent, 0.25)).text_color(hsla(accent)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.git_do_merge(merge_repo.clone(), merge_name.clone(), false, cx);
                         }))
+                        .child(
+                            svg()
+                                .path(ui_icon::GIT_MERGE)
+                                .w(px(10.0))
+                                .h(px(10.0))
+                                .flex_none()
+                                .text_color(hsla(accent)),
+                        )
                         .child(crate::ui_text::panel::git_merge_btn()),
                 )
             })
@@ -2578,13 +2620,9 @@ impl TakoApp {
                                 .child(SharedString::from(tail_chars(before, visible))),
                         )
                     })
-                    .child(
-                        div()
-                            .w(px(1.5))
-                            .h(px(13.0))
-                            .flex_none()
-                            .bg(hsla(theme.accent)),
-                    )
+                    // #561: コミット欄と同じく未確定文字列は入力欄の中へ出す
+                    .children(self.text_input_marked(AppTextInput::GitBranch, theme))
+                    .child(self.text_input_caret(AppTextInput::GitBranch, theme))
                     .when(!input.text.is_empty(), |d| {
                         d.child(
                             div()
@@ -3029,15 +3067,18 @@ impl TakoApp {
     /// レイアウトは **固定ヘッダ + スクロール本文の 2 段**（#494）。
     /// - ヘッダ（`flex_none`）: リポヘッダ → フィードバック → コミット入力 → 操作ボタン → 注記。
     ///   常に見えるので、コミット一覧を下までスクロールしても入力欄を見失わない
-    /// - 本文（`GitScrollBody`）: ブランチ → 変更（#487 の 2 セクション）→ コミット → diff
+    /// - 本文（`GitScrollBody`）: 変更（#487 の 2 セクション）→ コミット → ブランチ → リモート → diff
+    ///
+    /// 本文の並びは #551 案 2。git タブを開く動機は「変更を見る / コミットする」なので、
+    /// それに直結するセクションを先に置く。ブランチ・リモートを先頭に置いていた頃は、
+    /// リモート 163 件の展開だけで本命の 2 セクションが初期表示から丸ごと外れていた。
     ///
     /// 以前は全部を 1 個のスクロールコンテナへ平らに積んでいたため、コンテンツ総高さが
     /// パネル高さを超えると taffy が行を縦に圧縮し、要素同士が重なって描画されていた
     /// （#494 の根本原因。詳細は `GitScrollBody` のコメント）。
-    fn render_git_view(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    pub(crate) fn render_git_view(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme.clone();
         let data = self.git_data.clone();
-        let collapsed = self.git_collapsed.clone();
 
         // 外枠はスクロールしない。ここが overflow_y_scroll だと下の 2 段構造が成立しない
         let root = div()
@@ -3077,6 +3118,16 @@ impl TakoApp {
             });
         };
 
+        // リポジトリが切り替わったら折りたたみ状態を既定へ畳み直す（#551 案 1 / 案 3）。
+        // 前のリポジトリでリモートを開いた状態を持ち越すと、163 件のリモートが
+        // そのまま展開されて「変更」「コミット」が画面外へ押し出される
+        if self.git_collapsed_repo.as_deref() != Some(data.repo_root.as_str()) {
+            self.git_collapsed_repo = Some(data.repo_root.clone());
+            let remote_count = data.branches.iter().filter(|b| b.is_remote).count();
+            self.git_collapsed = GitCollapsed::for_repo(remote_count);
+        }
+        let collapsed = self.git_collapsed.clone();
+
         let accent = theme.accent;
         let fg = theme.tab_inactive_foreground;
         let fg_active = theme.tab_active_foreground;
@@ -3105,25 +3156,43 @@ impl TakoApp {
                 .px_2()
                 .py_1()
                 .bg(rgba(theme.tab_bar_background))
-                .child(
-                    svg()
-                        .path(ui_icon::GIT_BRANCH)
-                        .flex_none()
-                        .w(px(12.0))
-                        .h(px(12.0))
-                        .text_color(hsla(accent)),
-                )
-                // ブランチ名・リポ名・upstream は狭いパネルでは削って良い。
-                // overflow_hidden を付けないと flex の自動最小幅が内容幅に張り付き、
-                // text_ellipsis が効かないまま右へ溢れる（#494 の症状 4 と同根）
+                // #551 でブランチセクションは既定で畳むので、ここが「ブランチ一覧への
+                // 入口」になる。#562: クリックでセクションを開き、切替・マージへ導く
                 .child(
                     div()
-                        .ml_1()
+                        .id("git-branch-chip")
+                        .flex()
+                        .flex_row()
+                        .items_center()
                         .overflow_hidden()
-                        .text_ellipsis()
-                        .text_size(px(12.0))
-                        .text_color(hsla(fg_active))
-                        .child(branch_label),
+                        .gap(px(2.0))
+                        .px_1()
+                        .rounded(px(3.0))
+                        .cursor_pointer()
+                        .hover(|d| d.bg(rgba_alpha(bg_hover, 0.4)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.git_collapsed.branches = false;
+                            cx.notify();
+                        }))
+                        .child(
+                            svg()
+                                .path(ui_icon::GIT_BRANCH)
+                                .flex_none()
+                                .w(px(12.0))
+                                .h(px(12.0))
+                                .text_color(hsla(accent)),
+                        )
+                        // ブランチ名・リポ名・upstream は狭いパネルでは削って良い。
+                        // overflow_hidden を付けないと flex の自動最小幅が内容幅に張り付き、
+                        // text_ellipsis が効かないまま右へ溢れる（#494 の症状 4 と同根）
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_size(px(12.0))
+                                .text_color(hsla(fg_active))
+                                .child(branch_label),
+                        ),
                 )
                 .child(
                     div()
@@ -3316,14 +3385,10 @@ impl TakoApp {
                                 .child(SharedString::from(tail_chars(msg_before, visible_chars))),
                         )
                     })
+                    // #561: 変換中の未確定文字列はキャレット位置へインラインで出す
+                    .children(self.text_input_marked(AppTextInput::GitCommit, &theme))
                     .when(commit_focused, |d| {
-                        d.child(
-                            div()
-                                .w(px(1.5))
-                                .h(px(13.0))
-                                .flex_none()
-                                .bg(hsla(theme.accent)),
-                        )
+                        d.child(self.text_input_caret(AppTextInput::GitCommit, &theme))
                     })
                     .when(!commit_msg.is_empty(), |d| {
                         d.child(
@@ -3512,108 +3577,8 @@ impl TakoApp {
         // ──── ここから下はスクロール領域（行は必ず push 経由で積む。#494）────
         let mut body = GitScrollBody::default();
 
-        // ──── ブランチ一覧セクション（#496: クリックでチェックアウト + マージ + 新規作成）────
-        let local_branches: Vec<&tako_core::GitBranch> =
-            data.branches.iter().filter(|b| !b.is_remote).collect();
-        let remote_branches: Vec<&tako_core::GitBranch> =
-            data.branches.iter().filter(|b| b.is_remote).collect();
-        let repo_for_new_branch = repo_root_str.clone();
-        body.push(self.git_section_header_generic(
-            "git-branches-header",
-            collapsed.branches,
-            crate::ui_text::panel::git_branches(local_branches.len()),
-            Some((
-                "git-branch-new",
-                ui_icon::PLUS,
-                crate::ui_text::panel::git_branch_new(),
-            )),
-            &theme,
-            cx.listener(|this, _, _, cx| {
-                this.git_collapsed.branches = false;
-                // 基点は現在の HEAD（= 今いるブランチ）。入力欄に明示表示する
-                this.git_branch_input = Some(GitBranchInput {
-                    text: String::new(),
-                    cursor: 0,
-                    start_point: None,
-                });
-                this.git_branch_confirm = None;
-                this.git_commit_input_focused = false;
-                cx.notify();
-            }),
-            cx.listener(|this, _, _, cx| {
-                this.git_collapsed.branches = !this.git_collapsed.branches;
-                cx.notify();
-            }),
-            cx,
-        ));
-        if !collapsed.branches {
-            // 新規ブランチ名の入力行（#496）
-            if let Some(input) = self.git_branch_input.clone() {
-                body.push(self.render_branch_input(&input, &repo_for_new_branch, &theme, cx));
-            }
-            for (i, branch) in local_branches.iter().enumerate() {
-                body.push(self.render_branch_row(
-                    ("git-branch", i),
-                    branch,
-                    false,
-                    &repo_root_str,
-                    &theme,
-                    cx,
-                ));
-                // 事前提示カードは対象ブランチ行の直下に出す（#510 の方針）
-                if self
-                    .git_branch_confirm
-                    .as_ref()
-                    .is_some_and(|c| c.branch == branch.name)
-                {
-                    let confirm = self.git_branch_confirm.clone().expect("直前に確認済み");
-                    body.push(self.render_branch_confirm(&confirm, &repo_root_str, &theme, cx));
-                }
-            }
-            // リモート追跡ブランチ（#496: ローカルと区別して別セクションに出す）
-            if !remote_branches.is_empty() {
-                body.push(self.git_section_header_generic(
-                    "git-remotes-header",
-                    collapsed.remotes,
-                    crate::ui_text::panel::git_remote_branches(remote_branches.len()),
-                    None,
-                    &theme,
-                    |_, _, _| {},
-                    cx.listener(|this, _, _, cx| {
-                        this.git_collapsed.remotes = !this.git_collapsed.remotes;
-                        cx.notify();
-                    }),
-                    cx,
-                ));
-                if !collapsed.remotes {
-                    for (i, branch) in remote_branches.iter().enumerate() {
-                        body.push(self.render_branch_row(
-                            ("git-remote-branch", i),
-                            branch,
-                            true,
-                            &repo_root_str,
-                            &theme,
-                            cx,
-                        ));
-                        if self
-                            .git_branch_confirm
-                            .as_ref()
-                            .is_some_and(|c| c.branch == branch.name)
-                        {
-                            let confirm = self.git_branch_confirm.clone().expect("直前に確認済み");
-                            body.push(self.render_branch_confirm(
-                                &confirm,
-                                &repo_root_str,
-                                &theme,
-                                cx,
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
         // ──── 変更ファイルセクション（#487: ステージ済み / 未ステージの 2 段構成）────
+        body.section("changes");
         // 折りたたみは 2 セクション共通（git_collapsed.changes）で扱う
         if data.status.is_empty() {
             body.push(
@@ -3691,6 +3656,7 @@ impl TakoApp {
         }
 
         // ──── コミットグラフセクション ────
+        body.section("commits");
         let selected_commit = self.git_selected_commit.clone();
         body.push(
             div()
@@ -3912,6 +3878,125 @@ impl TakoApp {
             }
         }
 
+        // ──── ブランチ一覧セクション（#496: クリックでチェックアウト + マージ + 新規作成）────
+        body.section("branches");
+        let local_branches: Vec<&tako_core::GitBranch> =
+            data.branches.iter().filter(|b| !b.is_remote).collect();
+        let remote_branches: Vec<&tako_core::GitBranch> =
+            data.branches.iter().filter(|b| b.is_remote).collect();
+        let repo_for_new_branch = repo_root_str.clone();
+        body.push(self.git_section_header_generic(
+            "git-branches-header",
+            collapsed.branches,
+            crate::ui_text::panel::git_branches(local_branches.len()),
+            Some((
+                "git-branch-new",
+                ui_icon::PLUS,
+                crate::ui_text::panel::git_branch_new(),
+            )),
+            &theme,
+            cx.listener(|this, _, _, cx| {
+                this.git_collapsed.branches = false;
+                // 基点は現在の HEAD（= 今いるブランチ）。入力欄に明示表示する
+                this.git_branch_input = Some(GitBranchInput {
+                    text: String::new(),
+                    cursor: 0,
+                    start_point: None,
+                });
+                this.git_branch_confirm = None;
+                this.git_commit_input_focused = false;
+                cx.notify();
+            }),
+            cx.listener(|this, _, _, cx| {
+                this.git_collapsed.branches = !this.git_collapsed.branches;
+                cx.notify();
+            }),
+            cx,
+        ));
+        if !collapsed.branches {
+            // #562: 「切替」と「マージ」がこの一覧の操作だと言葉で言う。
+            // マージボタンは行の右端に小さく出るだけなので、アイコンだけでは
+            // 「GUI からマージできない」と読まれていた（実機報告）
+            if local_branches.len() > 1 {
+                body.push(
+                    div()
+                        .w_full()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .px_3()
+                        .py(px(1.0))
+                        .text_size(px(9.0))
+                        .text_color(hsla(theme.text_muted))
+                        .child(crate::ui_text::panel::git_branch_hint()),
+                );
+            }
+            // 新規ブランチ名の入力行（#496）
+            if let Some(input) = self.git_branch_input.clone() {
+                body.push(self.render_branch_input(&input, &repo_for_new_branch, &theme, cx));
+            }
+            for (i, branch) in local_branches.iter().enumerate() {
+                body.push(self.render_branch_row(
+                    ("git-branch", i),
+                    branch,
+                    false,
+                    &repo_root_str,
+                    &theme,
+                    cx,
+                ));
+                // 事前提示カードは対象ブランチ行の直下に出す（#510 の方針）
+                if self
+                    .git_branch_confirm
+                    .as_ref()
+                    .is_some_and(|c| c.branch == branch.name)
+                {
+                    let confirm = self.git_branch_confirm.clone().expect("直前に確認済み");
+                    body.push(self.render_branch_confirm(&confirm, &repo_root_str, &theme, cx));
+                }
+            }
+            // リモート追跡ブランチ（#496: ローカルと区別して別セクションに出す）
+            if !remote_branches.is_empty() {
+                body.section("remotes");
+                body.push(self.git_section_header_generic(
+                    "git-remotes-header",
+                    collapsed.remotes,
+                    crate::ui_text::panel::git_remote_branches(remote_branches.len()),
+                    None,
+                    &theme,
+                    |_, _, _| {},
+                    cx.listener(|this, _, _, cx| {
+                        this.git_collapsed.remotes = !this.git_collapsed.remotes;
+                        cx.notify();
+                    }),
+                    cx,
+                ));
+                if !collapsed.remotes {
+                    for (i, branch) in remote_branches.iter().enumerate() {
+                        body.push(self.render_branch_row(
+                            ("git-remote-branch", i),
+                            branch,
+                            true,
+                            &repo_root_str,
+                            &theme,
+                            cx,
+                        ));
+                        if self
+                            .git_branch_confirm
+                            .as_ref()
+                            .is_some_and(|c| c.branch == branch.name)
+                        {
+                            let confirm = self.git_branch_confirm.clone().expect("直前に確認済み");
+                            body.push(self.render_branch_confirm(
+                                &confirm,
+                                &repo_root_str,
+                                &theme,
+                                cx,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         // ──── diff セクション（#487: コミット未選択時のみ。選択時はカード直下に表示済み）────
         if selected_commit.is_none() {
             // ──── diff セクション（#487: 未ステージ / ステージ済みの通常表示）────
@@ -3935,6 +4020,7 @@ impl TakoApp {
                 if files.is_empty() {
                     continue;
                 }
+                body.section("diff");
                 body.push(
                     div()
                         .id(("git-diff-header", si))
@@ -4033,6 +4119,8 @@ impl TakoApp {
             }
         }
 
+        // #551 の回帰検出点: セクションの並びを記録してから組み立てる
+        self.git_body_sections = body.sections.clone();
         root.child(body.finish())
     }
 
@@ -4443,6 +4531,81 @@ impl TakoApp {
                 true
             }
         }
+    }
+
+    /// アプリ内テキスト入力のキャレット（#487 / #496 の入力欄で共用）。
+    ///
+    /// いま IME の変換対象になっている入力欄なら、**実際に描かれた矩形**を
+    /// `text_input_caret_bounds` へ記録する。変換候補ウィンドウの位置出し
+    /// （`bounds_for_range`）はこれを使う（#561）。paint フェーズでしか
+    /// 分からない値なので、何も描かない canvas の paint フックから書き戻す
+    pub(crate) fn text_input_caret(
+        &self,
+        target: AppTextInput,
+        theme: &tako_core::Theme,
+    ) -> gpui::Div {
+        let slot =
+            (self.app_text_input() == Some(target)).then(|| self.text_input_caret_bounds.clone());
+        div()
+            .w(px(1.5))
+            .h(px(13.0))
+            .flex_none()
+            .bg(hsla(theme.accent))
+            .when_some(slot, |d, slot| {
+                d.child(
+                    canvas(|_, _, _| (), move |bounds, _, _, _| slot.set(Some(bounds))).size_full(),
+                )
+            })
+    }
+
+    /// 変換中の未確定文字列を入力欄の中へインライン描画する（#561）。
+    ///
+    /// ターミナルペイン宛ての変換ではペイン上へオーバーレイするが、入力欄宛ての
+    /// 変換は入力欄の中に出す。見た目（細下線 / 注目文節の太下線）は
+    /// `ime_highlight_ranges` で共通化してある
+    pub(crate) fn text_input_marked(
+        &self,
+        target: AppTextInput,
+        theme: &tako_core::Theme,
+    ) -> Option<gpui::Div> {
+        let ime = self
+            .ime
+            .as_ref()
+            .filter(|ime| ime.app_input == Some(target))?;
+        let text = ime.text.clone();
+        let highlights = ime_highlight_ranges(&text, ime.selected_utf16.as_ref(), theme);
+        let style = gpui::TextStyle {
+            color: hsla(theme.tab_active_foreground),
+            font_family: SharedString::from(theme.font_family.clone()),
+            font_size: px(11.0).into(),
+            ..gpui::TextStyle::default()
+        };
+        Some(
+            div()
+                .flex_none()
+                .child(gpui::StyledText::new(text).with_default_highlights(&style, highlights)),
+        )
+    }
+
+    /// 変更ファイル行のクリック → そのファイルをプレビューペインで開く（#560）。
+    ///
+    /// ファイルツリーの行クリックと同じ `open_file_row`（= dispatch `OpenFile` =
+    /// CLI `tako open` / MCP `tako_open_file`）を通す。git タブ独自の開き方を作ると
+    /// AI から同じことができなくなる（設計原則 5）。
+    ///
+    /// 存在しないパス（別 worktree で消えた等）は黙って何も起きないのではなく、
+    /// フィードバック行に理由を出す
+    pub(crate) fn git_open_change_file(&mut self, path: &str, cx: &mut Context<Self>) {
+        let p = std::path::Path::new(path);
+        if !p.is_file() {
+            self.git_feedback = Some(GitFeedback {
+                message: crate::ui_text::panel::git_preview_missing(path),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+        self.open_file_row(p, cx);
     }
 
     /// ファイル単位 / 全体の git add を background 実行する（#487。
@@ -5264,6 +5427,45 @@ impl TakoApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #551 案 1: git タブを開いた直後に見えるのは「変更」と「コミット」であること。
+    /// ブランチ / リモートを既定で開いていた頃は、リモート 163 件の展開だけで
+    /// 本命の 2 セクションが初期表示から丸ごと外れていた
+    #[test]
+    fn git折りたたみの既定は変更とコミットだけ開く() {
+        let d = GitCollapsed::default();
+        assert!(!d.changes, "変更セクションが既定で畳まれている");
+        assert!(!d.commits, "コミットセクションが既定で畳まれている");
+        assert!(d.branches, "ブランチセクションが既定で開いている");
+        assert!(d.remotes, "リモートセクションが既定で開いている");
+    }
+
+    /// #551 案 3: リモートが多いリポジトリへ切り替えたら必ず畳み直す。
+    /// 少ないリポジトリでも既定は畳む（案 1）ので、どちらも collapsed になる
+    #[test]
+    fn リモートが多いリポジトリでは必ず折りたたむ() {
+        assert!(GitCollapsed::for_repo(GIT_REMOTE_AUTO_COLLAPSE + 1).remotes);
+        assert!(GitCollapsed::for_repo(0).remotes);
+        // 本命 2 セクションは件数に関係なく開いたまま
+        assert!(!GitCollapsed::for_repo(163).changes);
+        assert!(!GitCollapsed::for_repo(163).commits);
+    }
+
+    /// #551 案 2 の並び。`GitScrollBody::section` は表示順そのものを記録するので、
+    /// セクションを積む順を戻すとこのテストが落ちる
+    #[test]
+    fn gitセクションの記録順は積んだ順になる() {
+        let mut body = GitScrollBody::default();
+        body.section("changes");
+        body.section("commits");
+        body.section("branches");
+        body.section("remotes");
+        body.section("diff");
+        assert_eq!(
+            body.sections,
+            vec!["changes", "commits", "branches", "remotes", "diff"]
+        );
+    }
 
     /// #494 の再発防止（構造不変条件）。
     /// git ビューのスクロール領域に積む行は **必ず flex-shrink: 0** でなければならない。
