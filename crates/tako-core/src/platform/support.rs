@@ -739,6 +739,15 @@ pub const MATRIX: &[Feature] = &[
         },
     },
     Feature {
+        // #552: 自動命名された名前の固定（GUI のピン印と 1:1）
+        key: "tako_pin_tab_title",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_TERMINAL,
+            issue: 517,
+        },
+    },
+    Feature {
         key: "tako_platform",
         macos: Support::Supported,
         windows: Support::Supported,

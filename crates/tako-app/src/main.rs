@@ -466,16 +466,6 @@ fn hsla_alpha(c: tako_core::Rgb, a: f32) -> Hsla {
     rgba_alpha(c, a).into()
 }
 
-/// コマンド実行状態のラベル（自動リネームの素材・指紋用。list の表現と揃える）
-fn command_state_label(state: CommandState) -> &'static str {
-    match state {
-        CommandState::Unknown => "unknown",
-        CommandState::Idle => "idle",
-        CommandState::Running => "running",
-        CommandState::Failed(_) => "failed",
-    }
-}
-
 /// 自動リネーム（FR-2.12.4）の起動時の有効判定。
 /// セルフテストでは検知ループを止める（トグル・適用経路だけを機械検証する）。
 /// `TAKO_AUTO_RENAME=0|false|off` は設定ファイルより優先して無効化する
@@ -908,6 +898,9 @@ struct TakoApp {
     preview_edits: HashMap<PaneId, preview::EditState>,
     /// タブ・ペイン名の AI 自動リネームの検知状態（FR-2.12。ループは new で張る）
     autorename: autorename::AutoRenamer,
+    /// 自動命名した時刻（タブ ID → 命名時刻。#552 案 4）。命名直後だけタブに
+    /// 「この名前を固定」の印を出すために持つ。期限は `autorename::PIN_HINT_TTL`
+    auto_title_hints: HashMap<u64, std::time::Instant>,
     /// listen ポート検知 + 提案チップの有効状態（FR-2.4.4。dispatch から切替）
     port_detect: bool,
     /// 表示中の提案チップ（FR-2.4.3。新規 listen ポートごとに 1 件）
@@ -2195,6 +2188,7 @@ impl TakoApp {
             preview_reload_apply_count: 0,
             preview_edits: HashMap::new(),
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
+            auto_title_hints: HashMap::new(),
             port_detect: initial_port_detect(),
             port_suggestions: Vec::new(),
             dismissed_ports: std::collections::HashSet::new(),
@@ -3193,7 +3187,14 @@ impl TakoApp {
             cx.background_executor()
                 .timer(autorename::POLL_INTERVAL)
                 .await;
-            let Ok(jobs) = this.update(cx, |app: &mut TakoApp, _| app.autorename_jobs()) else {
+            let Ok(jobs) = this.update(cx, |app: &mut TakoApp, cx| {
+                // 「この名前を固定」の印は時間で消える（#552 案 4）。
+                // 静穏中でも消えるよう、この 2 秒 tick で期限切れを掃除する
+                if app.prune_auto_title_hints() {
+                    cx.notify();
+                }
+                app.autorename_jobs()
+            }) else {
                 break; // View が破棄された
             };
             for materials in jobs {
@@ -3389,13 +3390,15 @@ impl TakoApp {
     /// 自動リネームの検知 tick（FR-2.12.2）。タブごとの素材指紋を更新し、
     /// 静穏（デバウンス済み）で未処理のタブの素材一式を返す
     fn autorename_jobs(&mut self) -> Vec<autorename::TabMaterials> {
-        let snapshot: Vec<(u64, u64)> = self
+        let snapshot: Vec<autorename::TabSignal> = self
             .workspace
             .tabs()
             .iter()
             .map(|tab| {
                 // 指紋は「節目」だけで取る（cwd / OSC タイトル / 実行状態 / 手動フラグ）。
-                // 画面末尾は実行中に毎 tick 変わり静穏にならないため含めない
+                // 画面末尾は実行中に毎 tick 変わり静穏にならないため含めない。
+                // 実行状態は material_state を通す = 打ち間違い 1 回（Failed）では
+                // 指紋が変わらず発火しない（#552 案 2）
                 let parts: Vec<_> = tab
                     .tree()
                     .panes()
@@ -3411,16 +3414,18 @@ impl TakoApp {
                                 .and_then(|s| s.cwd())
                                 .map(|c| c.display().to_string()),
                             session
-                                .map(|s| command_state_label(s.command_state()))
+                                .map(|s| autorename::material_state(s.command_state()))
                                 .unwrap_or("none"),
                         )
                     })
                     .collect();
                 let manual_tab = tab.title_source() == TitleSource::Manual;
-                (
-                    tab.id().as_u64(),
-                    autorename::fingerprint(&(manual_tab, parts)),
-                )
+                autorename::TabSignal {
+                    tab: tab.id().as_u64(),
+                    fingerprint: autorename::fingerprint(&(manual_tab, parts)),
+                    // 命名済みのタブだけが最小間隔（5 分）の対象（#552 案 1）
+                    named: tab.title_source() != TitleSource::Default,
+                }
             })
             .collect();
         self.autorename
@@ -3428,6 +3433,40 @@ impl TakoApp {
             .into_iter()
             .filter_map(|tab| self.collect_rename_materials(tab))
             .collect()
+    }
+
+    /// 「この名前を固定」の印（#552 案 4）を、期限切れ・タブ消滅で掃除する。
+    /// 表示が変わったら true（呼び出し側が再描画する）
+    fn prune_auto_title_hints(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let before = self.auto_title_hints.len();
+        self.auto_title_hints.retain(|tab, at| {
+            now.duration_since(*at) < autorename::PIN_HINT_TTL
+                && self
+                    .workspace
+                    .tabs()
+                    .iter()
+                    .any(|t| t.id().as_u64() == *tab && t.title_source() == TitleSource::Auto)
+        });
+        self.auto_title_hints.len() != before
+    }
+
+    /// このタブに「この名前を固定」の印を出すか（#552 案 4。自動命名の直後だけ）
+    pub(crate) fn auto_title_hint_active(&self, tab: TabId) -> bool {
+        self.auto_title_hints
+            .get(&tab.as_u64())
+            .is_some_and(|at| at.elapsed() < autorename::PIN_HINT_TTL)
+    }
+
+    /// 印のクリック（#552 案 4）= いまの自動名を手動名として固定する。
+    /// 固定後は自動リネームの対象外（TitleSource::Manual）。
+    /// CLI / MCP の `tako tab pin` / `tako_pin_tab_title` と同じ core API を通る
+    pub(crate) fn pin_auto_tab_title(&mut self, tab: TabId, cx: &mut Context<Self>) {
+        if let Some(t) = self.workspace.get_tab_mut(tab) {
+            t.pin_title();
+        }
+        self.auto_title_hints.remove(&tab.as_u64());
+        cx.notify();
     }
 
     /// 命名素材の収集（FR-2.12.1 で list に公開している情報 + 画面末尾）。
@@ -3452,8 +3491,9 @@ impl TakoApp {
                     cwd: session
                         .and_then(|s| s.cwd())
                         .map(|c| c.display().to_string()),
+                    // 一時的な失敗は「作業内容」ではないので素材に載せない（#552 案 2）
                     state: session
-                        .map(|s| command_state_label(s.command_state()))
+                        .map(|s| autorename::material_state(s.command_state()))
                         .unwrap_or("none"),
                     tail: autorename::trim_tail(
                         session.map(|s| s.visible_lines()).unwrap_or_default(),
@@ -3495,8 +3535,9 @@ impl TakoApp {
             .workspace
             .get_tab_mut(tab_id)
             .expect("直前に存在確認済み");
+        let mut auto_named = false;
         if let Some(title) = &plan.tab {
-            let _ = tab.set_title_auto(title.clone());
+            auto_named = tab.set_title_auto(title.clone());
         }
         let pane_ids: Vec<PaneId> = tab.tree().panes().iter().map(|p| p.id()).collect();
         for (id, title) in &plan.panes {
@@ -3505,6 +3546,11 @@ impl TakoApp {
                     let _ = pane.set_title_auto(title.clone());
                 }
             }
+        }
+        // 自動命名した直後だけ「この名前を固定」の印を出す（#552 案 4）
+        if auto_named {
+            self.auto_title_hints
+                .insert(tab_id.as_u64(), std::time::Instant::now());
         }
         cx.notify();
     }
@@ -6110,6 +6156,7 @@ impl TakoApp {
             "panel-git",
             "split-right",
             "split-down",
+            "pin-tab-title",
         ];
         for id in COMMANDS {
             items.push(PaletteItem::Command(
@@ -6188,6 +6235,11 @@ impl TakoApp {
                 "panel-git" => self.toggle_panel_view(PanelView::Git, cx),
                 "split-right" => self.split(SplitDirection::Right, cx),
                 "split-down" => self.split(SplitDirection::Down, cx),
+                // #552 案 4: いまのタブ名を固定する（ピン印と同じ操作）
+                "pin-tab-title" => {
+                    let tab = self.workspace.active_tab_id();
+                    self.pin_auto_tab_title(tab, cx);
+                }
                 _ => {}
             },
             PaletteItem::SshHost(host) => {
@@ -19388,6 +19440,56 @@ mod self_test {
                 })
                 .unwrap_or(false);
             check(apply_ok, "自動リネームの適用と手動優先");
+
+            // 51b. 自動命名直後の「この名前を固定」（#552 案 4）。項目 51 の直後は
+            //      タブが自動命名された状態なので、印が出ていること → 押すとその名前が
+            //      手動固定になり自動リネームが効かなくなること → CLI から解除できること
+            let hint_ok = window
+                .update(cx, |app, _, _| app.auto_title_hint_active(active_tab))
+                .unwrap_or(false);
+            check(hint_ok, "自動命名の直後は固定の印が出る");
+
+            let pin_ok = window
+                .update(cx, |app, _, cx| {
+                    app.pin_auto_tab_title(active_tab, cx);
+                    let tab = app.workspace.get_tab(active_tab).expect("タブはある");
+                    let pinned =
+                        tab.title() == "自動タブ" && tab.title_source() == TitleSource::Manual;
+                    let hint_cleared = !app.auto_title_hint_active(active_tab);
+                    // 固定後は自動リネームが上書きしない
+                    let plan = autorename::RenamePlan {
+                        tab: Some("別の自動タブ".into()),
+                        panes: Vec::new(),
+                    };
+                    app.apply_rename_plan(active_tab.as_u64(), &plan, cx);
+                    let tab = app.workspace.get_tab(active_tab).expect("タブはある");
+                    pinned && hint_cleared && tab.title() == "自動タブ"
+                })
+                .unwrap_or(false);
+            check(pin_ok, "印のクリックで名前が固定され自動更新が止まる");
+
+            // CLI（= MCP と同じ dispatch）から固定解除 → 自動リネームが再開する
+            press(any, cx, "ctrl-u");
+            type_text(any, cx, &format!("{cli} tab pin --off"), true);
+            let mut released = false;
+            for _ in 0..15 {
+                wait(cx, 200).await;
+                released = window
+                    .update(cx, |app, _, _| {
+                        app.workspace
+                            .get_tab(active_tab)
+                            .map(|t| {
+                                t.title() == "自動タブ"
+                                    && t.title_source() == TitleSource::Default
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if released {
+                    break;
+                }
+            }
+            check(released, "tako tab pin --off で固定を解除できる");
 
             // 52. tako autorename の ON/OFF と状態取得（FR-2.12.4。CLI / MCP と同じ
             //     dispatch 経路。セルフテスト中は設定ファイルへ永続化しない）

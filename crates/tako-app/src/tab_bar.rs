@@ -133,10 +133,13 @@ impl TakoApp {
                     .iter()
                     .find(|w| w.id() != viewport && w.active_tab() == id)
                     .map(|w| w.id().as_u64());
-                (id, label, agg, pane_states, fails, shown_in)
+                // 自動命名の直後だけ出す「この名前を固定」の印（#552 案 4）
+                let pin_hint =
+                    tab.title_source() == TitleSource::Auto && self.auto_title_hint_active(id);
+                (id, label, agg, pane_states, fails, shown_in, pin_hint)
             })
             .collect();
-        let attention: usize = tabs.iter().map(|(_, _, _, _, fails, _)| fails).sum();
+        let attention: usize = tabs.iter().map(|(_, _, _, _, fails, _, _)| fails).sum();
         let state_color = |state: &CommandState| match state {
             CommandState::Failed(_) => theme.red,
             CommandState::Running => theme.accent,
@@ -227,7 +230,7 @@ impl TakoApp {
                         this.drop_pane_on_tab(drag.pane, None, cx);
                     }))
                     .children(tabs.into_iter().map(
-                        |(id, label, agg, pane_states, fails, shown_in)| {
+                        |(id, label, agg, pane_states, fails, shown_in, pin_hint)| {
                             let is_active = id == active;
                             let dot_color = state_color(&agg);
                             let pulsing = matches!(agg, CommandState::Running);
@@ -395,6 +398,38 @@ impl TakoApp {
                                                 })
                                                 .child(SharedString::from(truncated)),
                                         )
+                                        // 自動命名の直後だけ出る「この名前を固定」の印
+                                        // （#552 案 4）。クリックでこの名前が手動名として
+                                        // 固定され、以後 自動リネームに書き換えられなくなる。
+                                        // 時間（PIN_HINT_TTL）が経てば静かに消える
+                                        .when(pin_hint, |d| {
+                                            d.child(
+                                                div()
+                                                    .id(("tab-pin-title", id.as_u64()))
+                                                    .w(px(17.0))
+                                                    .h(px(17.0))
+                                                    .flex()
+                                                    .flex_none()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded(px(5.0))
+                                                    .cursor_pointer()
+                                                    .hover(|d| d.bg(rgba(theme.surface_highlight)))
+                                                    .on_click(cx.listener(
+                                                        move |this, _: &gpui::ClickEvent, _, cx| {
+                                                            cx.stop_propagation();
+                                                            this.pin_auto_tab_title(id, cx);
+                                                        },
+                                                    ))
+                                                    .child(
+                                                        svg()
+                                                            .path(ui_icon::PIN)
+                                                            .w(px(11.0))
+                                                            .h(px(11.0))
+                                                            .text_color(hsla(theme.accent)),
+                                                    ),
+                                            )
+                                        })
                                         // 他ウィンドウで表示中の区別バッジ（#380。
                                         // クリックすればこのウィンドウへ表示が移る）
                                         .when_some(shown_in, |d, win| {

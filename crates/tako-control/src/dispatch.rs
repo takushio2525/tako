@@ -1244,6 +1244,31 @@ fn dispatch_inner(
             )
         }
 
+        // #552 案 4: GUI の「この名前を固定」（自動命名直後に出るピン印）と 1:1
+        Request::TabPinTitle { pane, tab, pinned } => {
+            let tab_id = match tab {
+                Some(raw) => find_tab(host.workspace(), raw)?,
+                None => resolve_pane(host.workspace(), pane)?.0,
+            };
+            let tab = host
+                .workspace_mut()
+                .get_tab_mut(tab_id)
+                .expect("find_tab / resolve_pane で存在確認済み");
+            match pinned {
+                Some(true) => {
+                    tab.pin_title();
+                }
+                Some(false) => tab.clear_manual_title(),
+                None => {}
+            }
+            Ok(json!({
+                "tab": tab_id.as_u64(),
+                "title": tab.title(),
+                "source": tab.title_source().as_str(),
+                "pinned": tab.title_source() == tako_core::TitleSource::Manual,
+            }))
+        }
+
         Request::TabNew { title, focus } => {
             let prev_active = host.workspace().active_tab_id();
             let pane = Pane::new(origin);
@@ -9095,6 +9120,98 @@ mod tests {
         let tab = &host.ws.tabs()[0];
         assert_eq!(tab.title(), "実験");
         assert_eq!(tab.title_source(), tako_core::TitleSource::Default);
+    }
+
+    /// #552 案 4「この名前を固定」: 自動命名された名前を打ち直さずに固定でき、
+    /// 固定後は自動リネームの対象外になる（GUI のピン印と同じ経路）
+    #[test]
+    fn タブ名の固定と解除() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let tab_id = host.ws.tabs()[0].id().as_u64();
+        // 自動命名された状態を作る
+        dispatch(
+            &mut host,
+            Request::TabRename {
+                pane: None,
+                tab: Some(tab_id),
+                title: "tako 検証".into(),
+                source: Some("auto".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        // 変更せずに状態だけ取得できる
+        let status = dispatch(
+            &mut host,
+            Request::TabPinTitle {
+                pane: Some(root),
+                tab: None,
+                pinned: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(status["pinned"].as_bool(), Some(false));
+        assert_eq!(status["source"].as_str(), Some("auto"));
+
+        // 固定: 名前は変えずに手動指定へ
+        let pinned = dispatch(
+            &mut host,
+            Request::TabPinTitle {
+                pane: Some(root),
+                tab: None,
+                pinned: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(pinned["title"].as_str(), Some("tako 検証"));
+        assert_eq!(pinned["pinned"].as_bool(), Some(true));
+        assert_eq!(
+            host.ws.tabs()[0].title_source(),
+            tako_core::TitleSource::Manual
+        );
+        // 固定後は自動リネームが通らない
+        dispatch(
+            &mut host,
+            Request::TabRename {
+                pane: None,
+                tab: Some(tab_id),
+                title: "別の自動名".into(),
+                source: Some("auto".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(host.ws.tabs()[0].title(), "tako 検証");
+
+        // 解除すると自動リネームが再開する（タイトルは保持）
+        let released = dispatch(
+            &mut host,
+            Request::TabPinTitle {
+                pane: None,
+                tab: Some(tab_id),
+                pinned: Some(false),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(released["pinned"].as_bool(), Some(false));
+        assert_eq!(released["title"].as_str(), Some("tako 検証"));
+        dispatch(
+            &mut host,
+            Request::TabRename {
+                pane: None,
+                tab: Some(tab_id),
+                title: "別の自動名".into(),
+                source: Some("auto".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(host.ws.tabs()[0].title(), "別の自動名");
     }
 
     #[test]

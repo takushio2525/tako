@@ -300,6 +300,16 @@ pub enum Request {
         title: String,
         source: Option<String>,
     },
+    /// いまのタブ名を固定する / 固定を解除する（#552 案 4「この名前を固定」）。
+    /// GUI の自動命名直後に出るピン印と 1:1。`pinned` = true で現在のタイトルを
+    /// そのまま手動指定へ（以後 自動リネームが上書きしない）、false で固定解除
+    /// （自動リネーム再開）、省略時は現在状態の取得のみ。
+    /// `tab` 省略時は `pane`（呼び出し元）の属するタブ
+    TabPinTitle {
+        pane: Option<u64>,
+        tab: Option<u64>,
+        pinned: Option<bool>,
+    },
     /// タブ作成（FR-2.5.10）
     TabNew {
         title: Option<String>,

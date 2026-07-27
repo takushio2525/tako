@@ -54,6 +54,7 @@ tako_orchestrator_workers
 tako_panel
 tako_persist
 tako_pin_preview
+tako_pin_tab_title
 tako_platform
 tako_port_detect
 tako_preview_apply
