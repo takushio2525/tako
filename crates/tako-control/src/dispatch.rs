@@ -5904,11 +5904,23 @@ fn finish_worker_status(
     // #390: session_id が今回の照会で解決できたらレジストリへ書き戻す（lazy 昇格）。
     // GUI の定期スキャンが止まっていても（セカンダリモード等）prompt 到達の証跡が残り、
     // 未達の誤検知を防ぐ。best-effort（失敗は無視）
-    let prompt_delivery = registry_worker.as_ref().map(|(_, entry)| {
+    let prompt_delivery = registry_worker.as_ref().map(|(worker_id, entry)| {
         if entry.session_id.is_none() {
-            if let (Some(sid), Some(ts)) = (resolved_sid.as_deref(), entry.tmux_session.as_deref())
-            {
-                let _ = orchestrator::registry::record_session_detected(ts, sid);
+            if let Some(sid) = resolved_sid.as_deref() {
+                match entry.tmux_session.as_deref() {
+                    Some(ts) => {
+                        let _ = orchestrator::registry::record_session_detected(ts, sid);
+                    }
+                    // #592: 器を持たないバックエンド（Windows の backend=none）は
+                    // tmux_session が None なので、セッション名キーの記録は 1 件も
+                    // 刺さらない（送達済みでも prompt_delivery が undelivered のまま
+                    // 残る）。器がないときだけ worker ID で直接書く
+                    None => {
+                        let _ = orchestrator::registry::record_session_detected_for_worker(
+                            worker_id, sid,
+                        );
+                    }
+                }
             }
         }
         let mut effective = entry.clone();

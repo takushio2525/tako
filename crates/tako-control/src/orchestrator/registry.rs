@@ -320,6 +320,51 @@ pub fn mark_closed_by_pane(pane: u64, reason: &str) -> Result<(), String> {
     })
 }
 
+/// 検出済み claude session をレジストリへ反映する（worker ID キー。#592）。
+///
+/// `record_session_detected` は tmux セッション名で引くが、器を持たない
+/// バックエンド（Windows の backend=none）では `tmux_session` が None なので
+/// 一致するエントリが 1 つも無く、**送達済みでも `prompt_delivery` が
+/// `undelivered` のまま残る**。worker_status が特定済みの worker ID を直接使えば
+/// 器の有無に依存しない。ペイン ID 再利用の誤マッチは、呼び出し側が
+/// `find_active_by_pane` + `verify_ctx_pane_identity` で先に排除している
+pub fn record_session_detected_for_worker(worker_id: &str, session_id: &str) -> Result<(), String> {
+    let Some(path) = registry_path() else {
+        return Ok(());
+    };
+    record_session_detected_for_worker_at(&path, worker_id, session_id)
+}
+
+fn record_session_detected_for_worker_at(
+    path: &Path,
+    worker_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    // 変更が無いなら書き込みをスキップ（定期スキャンからの毎回書き込み防止）
+    let current = WorkerRegistry::load_from(path)?;
+    let needs_update = current.workers.get(worker_id).is_some_and(|e| {
+        e.is_active()
+            && (e.session_id.as_deref() != Some(session_id) || e.prompt_delivered_at.is_none())
+    });
+    if !needs_update {
+        return Ok(());
+    }
+    let now = crate::sessions::now_iso();
+    WorkerRegistry::mutate_at(path, |reg| {
+        if let Some(entry) = reg.workers.get_mut(worker_id) {
+            if entry.is_active() {
+                entry.session_id = Some(session_id.to_string());
+                if entry.prompt_delivered_at.is_none() {
+                    entry.prompt_delivered_at = Some(now.clone());
+                }
+            }
+        }
+    })
+}
+
 /// 検出済み claude session をレジストリへ反映する（tmux_session キー）。
 /// session_id の初観測 = transcript 生成 = プロンプト到達の証跡として
 /// `prompt_delivered_at` も同時に記録する。GUI の定期スキャンおよび
@@ -636,6 +681,53 @@ mod tests {
         let entry = reg.workers.values().next().unwrap();
         assert_eq!(entry.session_id.as_deref(), Some("abc-123"));
         assert!(entry.prompt_delivered_at.is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #592: 器を持たないバックエンド（Windows の backend=none）は `tmux_session` が
+    /// None なので、セッション名キーの記録は 1 件も刺さらず prompt_delivery が
+    /// 送達済みでも undelivered に残る。worker ID キーならその条件でも刺さる
+    #[test]
+    fn 器なしでもworker_idキーでsession検出を記録できる() {
+        let path = temp_registry_file("detect-by-worker");
+        let mut record = sample_record(592);
+        record.tmux_session = None; // 器なし
+        let id = register_at(&path, record);
+
+        // セッション名キーは（tmux_session が無いので）何も更新できない
+        assert_eq!(
+            prompt_delivery_assessment(
+                WorkerRegistry::load_from(&path)
+                    .unwrap()
+                    .workers
+                    .get(&id)
+                    .unwrap(),
+                crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap()
+                    + PROMPT_DELIVERY_GRACE_SECS
+                    + 1
+            ),
+            PromptDelivery::OverdueSuspect,
+            "記録前は未達の疑い"
+        );
+
+        record_session_detected_for_worker_at(&path, &id, "sid-592").unwrap();
+
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        let entry = reg.workers.get(&id).unwrap();
+        assert_eq!(entry.session_id.as_deref(), Some("sid-592"));
+        assert!(entry.prompt_delivered_at.is_some());
+        assert_eq!(
+            prompt_delivery_assessment(entry, 0),
+            PromptDelivery::Delivered
+        );
+
+        // 未知の worker ID では何も壊さない
+        record_session_detected_for_worker_at(&path, "no-such-id", "sid-x").unwrap();
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        assert_eq!(
+            reg.workers.get(&id).unwrap().session_id.as_deref(),
+            Some("sid-592")
+        );
         let _ = std::fs::remove_file(&path);
     }
 

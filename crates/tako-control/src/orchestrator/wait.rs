@@ -2283,6 +2283,31 @@ mod tests {
         assert!(!screen_is_collapsed(BUSY_SCREEN));
     }
 
+    /// #592 エッジケース: 画面だけでは状態が読めないときに **idle 側へ倒れない**こと。
+    /// Windows は器を持たないので、agents 解決に失敗するとこの画面フォールバックが
+    /// 最後の砦になる。ここで偽 idle を出すと watch が即 WORKER_IDLE を撃つ
+    #[test]
+    fn 状態を読めない画面はbusyにもidleにも倒れない() {
+        // ① 折りたたみ（長いツール実行後。入力欄すら描画されないことがある）
+        let collapsed = "⏺ 大量のツール出力\n\n95 new messages (click) ↓";
+        assert!(screen_is_collapsed(collapsed));
+        assert!(!screen_looks_busy(collapsed));
+        assert!(
+            !screen_looks_idle(collapsed),
+            "❯ が無いので idle と読まない"
+        );
+
+        // ② TUI 起動直後のロード画面（プロンプトもスピナーも出ていない）
+        let booting = "\
+╭─── Claude Code ──────────────────────╮\n\
+│  Welcome back!                       │\n\
+╰──────────────────────────────────────╯\n\
+\n\
+  Loading…";
+        assert!(!screen_looks_busy(booting));
+        assert!(!screen_looks_idle(booting));
+    }
+
     // --- #224: run_worker で stalled を扱う ---
 
     #[test]
