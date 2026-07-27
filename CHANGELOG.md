@@ -8,6 +8,261 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [Unreleased]
+
+## [0.6.0] - 2026-07-27
+
+安定版ローンチ。v0.5.x のテスト版チャンネル（夜間パッチリリース）で検証してきた
+リモート接続の全面刷新を安定版として正式に提供し、オーケストレーションの検知系
+（idle / busy / permission / プロンプト送達）を根治した上で、初回起動の導線・入力予測・
+ファイルツリー・git タブの使い勝手を整えた。Windows は移植の基盤（抽象境界・対応
+マトリクス・クロスコンパイル CI）までが入っており、配布物は引き続き macOS のみ。
+
+Stable launch. Delivers the fully rebuilt remote access stack — validated on the v0.5.x
+test channel — as a stable release, fixes the orchestration detection layer (idle / busy /
+permission / prompt delivery) at its root, and polishes first-run guidance, input
+prediction, the file tree, and the git tab. Windows support lands as groundwork only
+(abstraction boundaries, support matrix, cross-compile CI); binaries remain macOS-only.
+
+### Highlights / ハイライト
+
+- **リモート接続を Tailscale Serve 一本へ刷新** (#282, #283, #286, #287)
+  Quick Tunnel / Cloudflare relay Worker / 公開 Pages PWA / URL 埋め込みトークン /
+  平文 LAN モードを全廃し、tailnet 内限定（WireGuard による E2E 暗号化）の恒久固定 URL に
+  一本化した。認証は Tailscale identity 検証 + 機器ペアリング（Mac 上の承認ダイアログ・
+  role 別権限・失効の即時反映）の二層で、PWA は daemon が同一 origin で配信し、
+  daemon の listen は Unix domain socket。導入は v0.5.x 系で段階的に行ったため、
+  **安定版チャンネルでの提供は v0.6.0 が初**になる。設定は `tako remote setup` で完結する。
+  *Rebuilt remote access on Tailscale Serve alone: Quick Tunnel, the Cloudflare relay
+  Worker, public Pages hosting, URL-embedded tokens, and the plaintext LAN mode are gone.
+  Access is tailnet-only over a permanent fixed URL, authenticated in two layers
+  (Tailscale identity + device pairing approved on the Mac, with per-role permissions and
+  instant revocation). The PWA is served same-origin by the daemon, which listens on a
+  Unix domain socket. Rolled out during the v0.5.x cycle; v0.6.0 is the first stable
+  release to carry it. Set up with `tako remote setup`.*
+- **オーケストレーションの検知系を根治** (#571, #572, #577, #530)
+  worker が終わっても `WORKER_IDLE` が出ない / 生成中に人間が打った指示が消える /
+  permission ダイアログ待ちが「質問」に化ける / spawn の初期プロンプトが届かない、の
+  4 つを実測で原因まで降りて修正した。いずれも文言の当てずっぽうではなく、画面の
+  dim 属性・ダイアログが入力欄を奪っているか・画面が変化しているかといった構造で
+  判定するようにしてある。
+  *Fixed the four long-standing orchestration detection defects at their root:
+  `WORKER_IDLE` never firing, instructions typed during generation being swallowed,
+  permission prompts being reported as questions, and spawn prompts not arriving.
+  Detection is now structural (dim attributes, whether a dialog owns the input line,
+  whether the screen is still changing) instead of matching UI wording.*
+- [macOS] **入力予測（ゴーストテキスト）を既定 ON で提供** (#600)
+  zsh-autosuggestions v0.7.1（MIT）をバージョン固定で同梱し、tako が開いた zsh にだけ
+  シェル統合経路で読み込ませる。`~/.zshrc` は書き換えないので tako の外の zsh は不変。
+  右矢印で確定、切替は設定画面 / `tako autosuggest` / MCP `tako_autosuggest` の 3 経路で、
+  稼働中のペインにも次のプロンプトから効く。
+  *Ships history-based input prediction (zsh-autosuggestions v0.7.1, MIT) enabled by
+  default, injected only into shells tako itself starts — `~/.zshrc` is never modified.
+  Accept with the right arrow; toggle from settings, `tako autosuggest`, or MCP.*
+- **初回起動の導線を新設** (#549, #601)
+  初回だけタブバー直下にウェルカムバナーを出し、`tako setup` → `tako master` をその場で
+  実行できるようにした（⌘K パレットにも常設）。あわせて tako 内のシェルには同梱 CLI の
+  ディレクトリを PATH 末尾へ自動で足すので、zip 配布でも `tako` コマンドがすぐ通る。
+  *Adds a first-run welcome banner (and matching ⌘K palette entries) that runs
+  `tako setup` / `tako master` in place, and auto-appends the bundled CLI directory to
+  `PATH` inside tako's own shells so `tako` works even from the zip distribution.*
+- **AI 自動リネームの品質改善** (#552)
+  同一タブは 5 分以内に再命名しない、`command not found` のような一時的失敗を材料から
+  除く、出力言語を UI の表示言語に固定する（簡体字の混入を字種検査で防ぐ）、自動命名
+  直後にピン印ワンクリックで固定できる、の 4 点。
+  *Auto-renaming now rate-limits per tab (5 min), ignores transient failures such as
+  `command not found`, pins its output language to the UI language, and can be locked in
+  with a single click right after it renames.*
+- **リリース配布と更新チェックのプラットフォーム対応** (#594, #595)
+  リリースノートを実アセットから自動生成する方式に変え（ダウンロード表・OS 別の
+  インストール手順・Known limitations (Windows)）、更新チェックの候補を「最新リリース」
+  から「自分の OS 向けアセットを含む最新リリース」へ変更した。これで macOS 先行 →
+  Windows 版を同じタグに後付けする運用をしても、片方の OS に「更新はあるが
+  ダウンロードできない」通知が出ない。
+  *Release notes are now generated from the actual assets (download table, per-OS install
+  steps, Known limitations for Windows), and the in-app update check looks for the newest
+  release that has an asset for the running OS and architecture — so shipping macOS first
+  and adding Windows assets to the same tag later never produces a dead-end notification.*
+
+### Added / 機能追加
+
+- **git タブ: ブランチ操作とコンフリクト解消エージェント** (#496)
+  切替 / 作成 / マージを UI・CLI・MCP へ 1:1 で追加。破壊的操作は既定では実行せず
+  「何が起きるか」を出す（`--yes` で実行）。マージは `git merge-tree --write-tree` で
+  作業ツリーに触れずにコンフリクトを予測する。未解決ファイルとマージ元 / 先を含む
+  プロンプトで claude / codex / agy を同じタブに立てる解消エージェントも新設した。
+  *Branch checkout / create / merge exposed 1:1 across UI, CLI, and MCP. Destructive
+  operations dry-run by default and predict conflicts without touching the work tree; a
+  conflict-resolver agent can be launched in the same tab with a prefilled prompt.*
+- **git タブ: コミット詳細とファイル単位ステージング** (#487, #495)
+  「変更」「ステージ済み」の 2 セクション + 行ごとの ± ボタン + 一括ステージ + 更新ボタン。
+  コミットをクリックすると選択カードの直下に変更ファイル一覧と diff が開く。
+  *Two-section staging UI with per-row ± buttons, plus commit details (changed files and
+  diffs) that open directly under the selected commit card.*
+- **プロファイルの env 注入 / アカウントレジストリ / 専任マスター** (#500, #504, #511, #556)
+  プロファイルに `env` / `cwd` / `projects` を追加し、accounts.yaml で複数アカウントを
+  管理できるようにした（既定の資格情報を使うアカウントは `--inherit`）。spawn は
+  `--account` でワーカーごとにアカウントを切り替えられ、master 起動時は `cwd` へ移動して
+  担当プロジェクトをファイルツリーへ自動追加し、system prompt に担当範囲を注入する。
+  CLI `tako orchestrator accounts` も MCP と 1:1 で提供する。
+  *Profiles gain `env`, `cwd`, and `projects`; multiple agent accounts are managed in
+  accounts.yaml (`--inherit` keeps the default credentials). `spawn --account` switches
+  accounts per worker, and a master starts in its profile's `cwd` with its projects added
+  to the file tree and injected into its system prompt.*
+- **リモートインジケータを daemon 停止中も表示** (#590)
+  ステータスバーのインジケータを常時表示にし、停止中はクリックで起動、未セットアップなら
+  `tako remote setup` を案内する。
+  *The remote indicator is always visible; clicking it starts the daemon, or points at
+  `tako remote setup` when the machine is not configured yet.*
+- **stale な claude バイナリの検知と張り直し** (#498)
+  起動時に PATH 上の claude が実在・実行可能かを検証し、失われていれば再検出する。
+  *Validates the resolved `claude` binary at startup and re-detects it when it is stale.*
+- [macOS] **アプリケーションメニューの整備** (#485)
+  About / バージョン表示 / 設定 / 標準の編集・ウインドウ項目を macOS のメニューへ揃えた。
+  *Fills in the standard macOS application menu (About, version, Settings, Edit, Window).*
+- **プラットフォーム対応マトリクスの公開** (#515)
+  この環境でどの機能が使える / 縮退する / 未実装かを `tako platform`（MCP `tako_platform`）
+  で参照できる。リリースノートの Known limitations もここから生成する。
+  *`tako platform` (MCP `tako_platform`) reports which features are supported, degraded,
+  or pending on the current platform; release notes derive their Known limitations from
+  the same matrix.*
+
+### Changed / 改善
+
+- **ファイルツリー: ドット項目の既定非表示と新規作成の入力位置** (#550, #559)
+  `.` 始まりの項目を既定で隠し（見出しの目アイコン / 右クリック / 設定画面で切替）、
+  増えたルートは自動展開して先頭に置く。新規作成のインライン入力欄は「確定後にその項目が
+  並ぶ位置」に出るようにし、インデントを通常行と揃えた。
+  *Dot-prefixed entries are hidden by default (toggle from the tree header, context menu,
+  or settings), newly added roots auto-expand at the top, and the inline create field now
+  appears where the new item will actually land.*
+- **git タブの使い勝手 4 件** (#560, #561, #562, #570)
+  本文の並びを 変更 → コミット → ブランチ → リモート → diff に整理し、変更ファイル行の
+  クリックでプレビューを開き、マージ導線を常時表示にした。コミットメッセージ欄の日本語
+  入力（IME）が確定先を取り違えてターミナル側へ流れる問題も直した。
+  *Reordered the panel (changes → commits → branches → remotes → diff), made changed-file
+  rows open a preview, kept the merge affordance always visible, and fixed IME composition
+  in the commit message field being delivered to the terminal pane instead.*
+- **ペイン close の確認ガードと発生源の記録** (#566)
+  ⌘W も × と同じ確認を通るようにし、確認対象は「失うものがあるペイン」（role 付き・
+  実行中・子プロセスあり）に限定した。close の発生源（キーボード / UI / dispatch + 呼び出し
+  role）をペインログに記録する。
+  *⌘W now goes through the same confirmation as the × button, limited to panes that would
+  actually lose something, and every close records where it came from in the pane log.*
+- **パネルビューの語彙を GUI の表示名へ統一** (#553)
+  CLI / MCP の `tmux` を画面と同じ `fleet` に改め、旧称は後方互換で受理し続ける。
+  *The panel view formerly called `tmux` in CLI/MCP is now `fleet`, matching the GUI label;
+  the old name is still accepted.*
+- **設定画面の総点検と言語セレクタ** (#486, #488)
+  押せないボタン・未配線のウィジェットを洗い出して修正し、表示言語の切替を設定画面へ
+  追加した。
+  *Audited the settings window for dead buttons and unwired widgets, and added the display
+  language selector.*
+
+### Fixed / 修正
+
+- **orchestrator watch が `WORKER_IDLE` を発火しない** (#571)
+  `claude agents --json` をプロセス環境の `CLAUDE_CONFIG_DIR` ごと実行していたため
+  別アカウントの worker が「存在しない」ことになり、画面フォールバックは
+  「子プロセスがある = busy」で必ず上書きされ、busy 判定はフッター 8 行に届いていなかった。
+  3 層すべてを修正した。
+  *Root-caused and fixed all three layers: agent enumeration inheriting the wrong
+  `CLAUDE_CONFIG_DIR`, the screen fallback always overriding idle because the agent TUI is
+  itself a child process, and the busy heuristic not reaching past the 8-line footer.*
+- **生成中に人間が打った指示が消える** (#572)
+  claude は生成中の打鍵を入力欄ではなく内部キューへ入れる。tako はこれを残留テキストと
+  誤認して Enter を空撃ちしていた。入力欄が空かどうかを dim 属性で判定し、キュー滞留を
+  `read` / `worker_status` / watch に公開し、生成が止まってもキューが残っていれば送り出す。
+  *Typing while an agent is generating queues the text inside the agent, which tako misread
+  as leftover input. Emptiness is now judged by dim attributes, queued messages are
+  reported through `read` / `worker_status` / watch, and a stalled queue is flushed.*
+- **permission ダイアログ待ちが「質問」として通知される** (#577)
+  画面推定経路（agents に載らない worker・codex / agy）でダイアログの選択カーソルを入力欄と
+  見なしていた。ダイアログが実在すれば `waiting` へ格上げし、`WORKER_PERMISSION` として
+  通知する。本文中の「1. … 2. …」の誤検知は、ダイアログが入力欄を奪っているかで切り分ける。
+  *When a worker cannot be resolved through `claude agents`, a permission dialog was read as
+  the input line. A real dialog now escalates the status to `waiting` and raises
+  `WORKER_PERMISSION`, while prose that merely looks like a numbered menu does not.*
+- **spawn の初期プロンプトが届かない** (#530)
+  `CLAUDE_CONFIG_DIR` を切り替えた初回に出る番号付き選択ダイアログ（テーマ選択など）の
+  カーソルを入力欄と誤認し、プロンプトが確定操作に化けていた。文言に依存しない
+  ダイアログ判定を入れ、未達時は `prompt_delivery` と再送コマンドを報告する。
+  *The numbered dialogs claude shows on a fresh config dir were mistaken for the input
+  line, turning the prompt into a menu confirmation. Dialog detection is now
+  wording-independent, and undelivered prompts are reported with a resend command.*
+- **事前信頼の書き先が claude の設定ディレクトリ外だった** (#558)
+  `~/.claude.json` へ書いていたが claude が読むのは `<config dir>/.claude.json`。
+  そのためフォルダの事前信頼と bypass の事前承認がどちらも効いていなかった。
+  *tako wrote pre-trust entries to `~/.claude.json` while claude reads
+  `<config dir>/.claude.json`, so neither folder pre-trust nor bypass pre-approval worked.*
+- **stale な `TAKO_PANE_ID` から `tako master` / `solo` が起動できない** (#567)
+  復元後などで環境変数が古いペインを指していても起動できるようフォールバックを追加した。
+  *Added a fallback so master / solo still start from a shell whose `TAKO_PANE_ID` points at
+  a pane that no longer exists.*
+- **アカウント切替の欠落 3 件** (#511, #512, #547)
+  CLI の `spawn / run --account` が未配線だった件、既定の資格情報を使うアカウントを
+  `--inherit` で表現できなかった件、`master_account` が master / solo の起動に適用されて
+  いなかった件を修正した。
+  *Fixed `--account` missing from the CLI spawn/run paths, the inability to express
+  "use the default credentials" (`--inherit`), and `master_account` not applying to
+  master / solo launches.*
+- **git パネルの描画崩壊・IME 未確定文字列の欠落・セルフテストの中断** (#494, #497, #501)
+  コンテンツ総高さがパネル高さを超えると行が圧縮されて重なっていた問題を、固定ヘッダ +
+  行が縮まないスクロール本文へ分離して根治。あわせて、メッセージが空・変更が無いときは
+  ボタンと ⌘Enter の両方でコミットを拒否して理由を出す、実行中は操作ボタンを無効化する、
+  貼り付けた制御文字を正規化する、といった堅牢化も入れた。カーソル非表示ペインで IME の
+  下線が出ない問題と、テーマ項目でセルフテストが中断して以降が未実行になっていた問題も直した。
+  *Split the git panel into a fixed header and a non-shrinking scroll body (rows used to be
+  squeezed and overlap once content exceeded the panel height), blocked commits with a
+  visible reason when there is nothing to commit, disabled controls while an operation runs,
+  normalized pasted control characters, restored the IME underline on panes that hide the
+  cursor, and stopped the self-test aborting at the theme item.*
+- **アプリ内テキスト入力で ⌘V が効かない** (#546) /
+  **テキスト入力フラグの残留でキー入力が奪われる** (#503)
+  *Fixed ⌘V in in-app text fields, and a lingering text-input flag that swallowed keys.*
+- **ファイルツリーのインデントガイド線が途切れる** (#589)
+  行の border-left では自分の深さの線しか描けず、子孫行の区間で祖先の線が欠けていた。
+  *Indent guides now draw the ancestors' verticals too, instead of only the row's own depth.*
+- **git タブのブランチ種別を refname で判定** (#544) /
+  **CLI `git show` が空応答** (#495) /
+  **mp4 プレビューのシークバー** (#484) /
+  **隔離モードで更新チェックが走る** (#470)
+  *Branch kind is decided by refname, `tako git show` prints its result, the mp4 preview
+  seek bar works again, and isolated instances no longer hit the update endpoint.*
+
+### Security / セキュリティ
+
+- 安定版ローンチにあたり、リモート接続の外部セキュリティレビュー (#287) を P0 / P1 ゼロで
+  完了している。到達性は tailnet 内に限定され、未登録の端末は画面データを 1 バイトも
+  受け取れない。監査ログは接続の事実だけを記録し、画面内容・送信テキスト・トークンは
+  記録しない。
+  *The external security review of remote access (#287) closed with no P0 or P1 findings
+  before this stable launch. Reachability is limited to the tailnet, unpaired devices
+  receive no screen data at all, and the audit log records connection events only — never
+  screen contents, typed text, or tokens.*
+
+### Internal / 開発基盤
+
+- **Windows 移植の基盤** (#467, #515, #516, #518, #519, #520, #522)
+  macOS 側から `cargo check --target x86_64-pc-windows-msvc` が通る状態を作り、機能の
+  対応可否を機械可読なマトリクスで持つようにした。永続バックエンド（tmux）を
+  `SessionBackend` / `DetachedAccess` の 2 段 trait へ抽象化し、到達手段を `PaneReach` 型で
+  表現、`tmux_backend::available()` を廃止して能力ベースの問い合わせへ置き換えた。
+  OS 連携（`open` / `osascript`）は境界へ集約し、system prompt と setup 配布物は単一ソース化。
+  git のパス表記も `/` 区切り前提の境界を通すようにした。
+  *Windows-port groundwork: cross-compilation checks pass from macOS, feature support is a
+  machine-readable matrix, the persistence backend is abstracted behind two traits with
+  reachability expressed as a `PaneReach` type, OS integration calls are funneled through
+  one boundary, prompts/setup assets have a single source, and git paths go through a
+  portability boundary.*
+- [Windows] **CI の復旧** (#574)
+  macOS / Windows 両ジョブに PWA のビルド工程を足して 45 日ぶりに緑に戻した。Windows の
+  テストは POSIX 前提の 19 件が残っているため、当面はテストステップのみ非ブロッキング。
+  *Restored CI by adding the PWA build step to both runners; the Windows test step stays
+  non-blocking until the remaining POSIX-only tests are ported.*
+- セルフテストの安定化 (#599)、紹介動画の制作パイプライン (#470)。
+  *Self-test stabilization and the promo-video production pipeline.*
+
 ## [0.5.13] - 2026-07-27
 
 Nightly patch release (automated). Changes since v0.5.12:
@@ -48,46 +303,6 @@ Nightly patch release (automated). Changes since v0.5.11:
 - [機能追加] プロファイル env 注入 + アカウントレジストリ (#500 Part1-4 + #504) (#505)
 - [修正] git タブの描画崩壊を根治 + IME 未確定文字列の欠落を修正 (#494, #497, #501) (#502)
 
-## [Unreleased]
-
-### Fixed
-
-- git panel layout collapse on real machines: the view was a single flex column with
-  `overflow-y: scroll`, so once its content grew taller than the panel, taffy shrank the
-  rows — clipping the repo header and painting the commit input over the action buttons.
-  Split into a fixed header + a scroll body whose rows never shrink, and made every row
-  clip/ellipsize so nothing spills past the panel edge (#494)
-- git パネルが実機で描画崩壊する問題を根治。ビューが 1 枚のスクロール付き flex 列
-  だったため、コンテンツ総高さがパネル高さを超えると taffy が行を圧縮し、リポヘッダが
-  欠け、コミット入力欄が操作ボタンの上に重なって描画されていた。固定ヘッダ + 行が
-  縮まないスクロール本文の 2 段構造へ分離し、全行を省略表示にしてパネル外へ
-  はみ出さないようにした (#494)
-
-- IME preedit vanished on panes with the cursor hidden (`DECTCEM off`). The underline
-  overlay anchored on `pane_cursor_origin`, which returns `None` for such panes, so TUI
-  agents that hide the cursor while idle showed the candidate window but no underline.
-  Now both use the `ime_cursor` fallback (#497)
-- カーソル非表示（DECTCEM off）のペインで IME の未確定文字列が表示されない問題を修正。
-  下線オーバーレイのアンカーが `pane_cursor_origin` を使っており、カーソルを消したまま
-  idle に落ちる TUI エージェントのペインでは「候補ウィンドウは出るが下線が出ない」状態に
-  なっていた。候補ウィンドウ側と同じ `ime_cursor` フォールバックを使うようにした (#497)
-- Self-test aborted at item 33b (theme) and therefore never ran any later item —
-  including the #332 IME focus regression check. Theme application no longer reverts
-  itself when the settings save is skipped (#501)
-- セルフテストが項目 33b（テーマ）で中断し、それ以降の全項目（#332 の IME focus 回帰
-  検査を含む）が実行されていなかった問題を修正。設定の保存をスキップしたときに
-  テーマ適用が自分で巻き戻る構造をやめた (#501)
-
-### Changed
-
-- git panel robustness: commit is blocked with a visible reason when the message is empty
-  or there is nothing to commit (both button and Cmd+Enter),操作 buttons are disabled while
-  an operation runs, failures stay on screen until dismissed, and pasted control characters
-  are normalized (#494)
-- git パネルの堅牢化: メッセージが空・変更が無いときはボタンと Cmd+Enter の両方で
-  コミットを実行せず理由を表示、実行中は操作ボタンを無効化して二重押しを防止、
-  失敗は閉じるまで表示し続け、貼り付けた制御文字を正規化するようにした (#494)
-
 ## [0.5.11] - 2026-07-25
 
 Nightly patch release (automated). Changes since v0.5.10:
@@ -109,8 +324,6 @@ Nightly patch release (automated). Changes since v0.5.9:
 
 - [ドキュメント] 紹介動画: 収録待機をキャプチャ可否ベースに変更 + ウィンドウサイズ安定待ち (#470) (#481)
 - [ドキュメント] 紹介動画 Phase B: 制作パイプライン一式 + BGM (#470) (#480)
-
-## [Unreleased]
 
 ## [0.5.9] - 2026-07-23
 
@@ -401,6 +614,13 @@ Nightly patch release (automated). Changes since v0.5.9:
   `claude --resume` command), and paste-retry hardening in the spawn flow.
 
 ## [0.6.0-test.1] - 2026-07-21
+
+> 注: このテスト版タグは実際には公開されていない（バージョン番号だけが一時的に使われた）。
+> ここに並ぶ変更は v0.5.9 以降の安定版・夜間版として配布済みで、安定版としての正式提供は
+> [0.6.0] にまとめてある。
+> Note: this test tag was never published — only the version number was used briefly.
+> Everything listed here shipped in v0.5.9 and later; [0.6.0] is the stable release that
+> officially carries it.
 
 テスト版リリース（#403）。remote 全面刷新（Tailscale Serve 一本化 + 機器ペアリング認証）と v0.5.x 期間中の全機能・修正を含む。
 Test release (#403). Includes the remote transport overhaul (Tailscale Serve + device pairing auth) plus all features and fixes accumulated during the v0.5.x nightly cycle.
