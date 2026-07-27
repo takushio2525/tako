@@ -10,6 +10,7 @@
 pub mod exe;
 pub mod font;
 pub mod ime;
+pub mod locale;
 pub mod process;
 pub mod shell;
 pub mod support;

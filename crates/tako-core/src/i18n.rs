@@ -94,17 +94,26 @@ pub fn set_lang(l: Lang) {
 
 /// OS ロケールから表示言語を検出する。
 /// 優先順: TAKO_LANG（検証用オーバーライド）→ LC_ALL → LC_MESSAGES → LANG →
-/// macOS の AppleLanguages（GUI 起動はロケール環境変数を持たないため）→ 英語
+/// OS の優先表示言語（GUI 起動はロケール環境変数を持たないため。境界 B10）→ 英語
 pub fn detect_os_lang() -> Lang {
     let vars: Vec<(String, String)> = ["TAKO_LANG", "LC_ALL", "LC_MESSAGES", "LANG"]
         .iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
         .collect();
-    if let Some(l) = detect_from_env(&vars) {
+    detect_with(&vars, crate::platform::locale::system_languages)
+}
+
+/// 検出の優先順を表す純関数（環境変数 → OS の優先表示言語 → 英語）。
+///
+/// `os_languages` は**環境変数で決まらなかったときだけ**評価する
+/// （macOS 実装が `defaults` を起こすため。順序と遅延の両方をテストで固定する）。
+/// OS の優先表示言語は順序付きリストなので、判定できた最初の 1 件を採る
+/// （`C` / `POSIX` のような判定不能値は次の候補へ送られる）
+fn detect_with(vars: &[(String, String)], os_languages: impl FnOnce() -> Vec<String>) -> Lang {
+    if let Some(l) = detect_from_env(vars) {
         return l;
     }
-    #[cfg(target_os = "macos")]
-    if let Some(l) = macos_preferred_language().and_then(|s| lang_from_locale(&s)) {
+    if let Some(l) = os_languages().iter().find_map(|s| lang_from_locale(s)) {
         return l;
     }
     Lang::En
@@ -127,34 +136,6 @@ fn lang_from_locale(s: &str) -> Option<Lang> {
     } else {
         Some(Lang::En)
     }
-}
-
-/// macOS のシステム言語（AppleLanguages 先頭 → AppleLocale の順）。
-/// `defaults` の起動を伴うため detect_os_lang 経由でのみ呼ぶ
-#[cfg(target_os = "macos")]
-fn macos_preferred_language() -> Option<String> {
-    fn defaults_read(key: &str) -> Option<String> {
-        let out = std::process::Command::new("defaults")
-            .args(["read", "-g", key])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    }
-    // AppleLanguages は plist 配列表記: (\n    "ja-JP",\n    "en-JP"\n)。先頭要素を抜く
-    if let Some(langs) = defaults_read("AppleLanguages") {
-        if let Some(first) = langs
-            .split('"')
-            .nth(1)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-        {
-            return Some(first);
-        }
-    }
-    defaults_read("AppleLocale")
 }
 
 #[cfg(test)]
@@ -210,6 +191,55 @@ mod tests {
         ];
         assert_eq!(detect_from_env(&vars), Some(Lang::En));
         assert_eq!(detect_from_env(&[]), None);
+    }
+
+    fn vars(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    fn os_langs(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// TAKO_LANG 等の環境変数が OS の表示言語より優先される（#604 の修正で変えない既存挙動）。
+    /// **OS へ問い合わせないこと**も併せて固定する（macOS の実装が `defaults` を起こすため）
+    #[test]
+    fn 環境変数はos表示言語より優先されos問い合わせもしない() {
+        let asked = std::cell::Cell::new(false);
+        let got = detect_with(&vars(&[("TAKO_LANG", "en")]), || {
+            asked.set(true);
+            os_langs(&["ja-JP"])
+        });
+        assert_eq!(got, Lang::En);
+        assert!(!asked.get(), "環境変数で決まったのに OS へ問い合わせている");
+    }
+
+    /// #604 の本体: 環境変数が無い（Windows GUI の常態）ときに OS の表示言語で決まる
+    #[test]
+    fn 環境変数が無ければos表示言語で決まる() {
+        assert_eq!(detect_with(&[], || os_langs(&["ja-JP", "en-US"])), Lang::Ja);
+        assert_eq!(detect_with(&[], || os_langs(&["en-US", "ja-JP"])), Lang::En);
+    }
+
+    /// 対応していない言語は英語へ落ちる（先頭の優先言語で決める）
+    #[test]
+    fn 対応外の表示言語は英語になる() {
+        assert_eq!(detect_with(&[], || os_langs(&["fr-FR", "ja-JP"])), Lang::En);
+    }
+
+    /// 判定不能な値は次の候補へ送る。OS の優先順リストをフォールバック鎖として使う
+    #[test]
+    fn 判定不能な値は次の優先言語へ送る() {
+        assert_eq!(detect_with(&[], || os_langs(&["C", "ja-JP"])), Lang::Ja);
+    }
+
+    /// OS から何も取れない環境（境界が空を返す）は従来どおり英語
+    #[test]
+    fn os表示言語が空なら英語へフォールバックする() {
+        assert_eq!(detect_with(&[], Vec::new), Lang::En);
     }
 
     #[test]

@@ -1428,3 +1428,12 @@
 - 検証: 全 1416 passed（失敗 13 件は既知の POSIX 前提のみ・baseline と同一）/ clippy 19 件も
   baseline と同一 / fmt 緑 / 実機 e2e 4 種（初回・2 回目冪等・--check・CLI 不在）
 - 残: PowerShell の OSC 7/133 統合本体は未着手（#525 に残す）。Windows のロケール検出は #604
+
+## 2026-07-27（#604: Windows で language:"system" が常に英語になる問題を根治）
+- 抽象境界 **B10（`platform::locale::system_languages()`）** を新設。macOS の AppleLanguages
+  経路を境界の内側へ移し、Windows は `GetUserPreferredUILanguages`（**表示言語**。
+  `GetUserDefaultLocaleName` は「地域形式」で別物）を追加。`detect_os_lang` から `cfg` が消えた
+- 実測（表示言語 ja-JP の実機・環境変数なし）: 修正前 `System.resolve() = En` → 修正後 `Ja`。
+  `system_languages() = ["ja-JP", "en-US"]`。`TAKO_LANG` 優先は不変（テストで固定）
+- 検証: tako-core 460 passed（HEAD と同一の既知 6 失敗のみ・新規テスト 12 本）/ tako-app 220 全緑 /
+  parity 11 全緑 / doc 再生成の差分なし。macOS は cfg 構造保証のみ（未コンパイル）

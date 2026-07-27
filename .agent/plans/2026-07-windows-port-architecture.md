@@ -68,7 +68,7 @@ P0 完了以降、`cargo check --target x86_64-pc-windows-msvc` は **macOS 上�
 | B7 | ファイルロック | `platform::flock::lock_exclusive()` | `tako-control/src/config_io.rs:17,217` | `flock` | `LockFileEx` |
 | B8 | OS 連携（開く・ゴミ箱） | `platform::os_integration`（`reveal` / `open_default` / `open_with` **［P0 で新設済み］**、`open_url` / `move_to_trash` は未着手） | `dispatch.rs:1691,6246-`、`sidebar.rs:1438,1450`、`main.rs:568-575` ほか `open` 16 / `osascript` 6 箇所 | `open` / AppleScript | `ShellExecuteW` / `SHFileOperation` |
 | B9 | スリープ防止 | `trait SleepGuardBackend`（`apply` / `status`） | `tako-control/src/sleep_guard.rs:364-501` | IOKit + pmset | `SetThreadExecutionState`（蓋閉じ・sudoers は macOS 固有 capability） |
-| B10 | ロケール検出 | `platform::locale::system_languages()` | `tako-core/src/i18n.rs:106,132-147` | `defaults read AppleLanguages` | `GetUserDefaultLocaleName` |
+| B10 | ロケール検出 | `platform::locale::system_languages()` **［#604 で新設済み］** | `tako-core/src/i18n.rs:106,132-147`（移設元） | `defaults read AppleLanguages` | `GetUserPreferredUILanguages`（**表示言語**の順序付きリスト。`GetUserDefaultLocaleName` は「地域形式」= 書式ロケールを返す別物で、表示言語 = 英語 / 地域形式 = 日本語のユーザーを誤判定するため使わない。#604） |
 | B11 | Web ビュー ホスト | `trait WebviewHost`（attach / detach / resize / key monitor） | `tako-app/src/webview.rs:467-470` | WKWebView 子ビュー | WebView2 子 HWND |
 | B12 | ドキュメントレンダラ | `trait PdfRenderer` / `trait VideoPlayer` | `tako-app/src/preview.rs:745,821,1039`、`video_player.rs:11-24`、`tako-core/src/pdf_links.rs`、`preview_outline.rs` | PDFKit / CoreGraphics / AVFoundation | pdfium 等 or `Unsupported` 明示 |
 | B13 | シェル統合 | `shell_integration::script_for(shell)` + 注入先解決 | `tako-core/shell-integration/{zshenv.zsh,tako.bash,tako.fish}` | 既存 3 種 | PowerShell profile |
