@@ -1417,6 +1417,22 @@
   隔離セルフテスト `TAKO_APP_SELF_TEST_OK` + 隔離 GUI 実クリック（証拠 ~/dev/tako-evidence/560/）
 - 次: tako 再起動 → #561 の実 IME 目視（この機は日本語入力ソース未有効）と #562 の導線目視。#562 は open 維持
 
+## 2026-07-27（#574 + #567: CI 復旧 + stale TAKO_PANE_ID の master 起動 fallback）
+- #574: 45 日ぶりの CI 実走で腐敗が発覚。ci.yml の mac / Win 両ジョブに PWA ビルド工程を追加
+  （rust_embed が埋め込む `web/tako-remote/dist/` が CI では未生成だった）。Windows は**テスト
+  ステップのみ** continue-on-error（#583 完了までの暫定）。**以後の合格条件 = macOS 全ジョブ緑**
+- #567: stale な `TAKO_PANE_ID` を持つシェルからでも `tako master` / `solo` が起動できる fallback
+- 関連コミット: `cb2d06e`（PR #580）/ `1a5b91d`（PR #573）。CI は macOS / Windows / Pages 全 pass。
+  副産物起票: #583（Windows で tako-control テスト 19 件が POSIX 前提で fail、#467 の子）
+
+## 2026-07-27（#566: ペイン close の確認ガード + 発生源の監査記録）
+- cmd+W を × と同じ確認経由にし、確認対象は「失うものがあるペイン」（role 付き / Running /
+  子プロセスあり）に限定。`CloseOrigin` 型で close の発生源（kbd / ui / dispatch + caller_role）を
+  pane_log マーカーへ記録。副産物: config.yaml が無い環境では **#172 以来 close 確認が既定 OFF**
+  だった `SetupConfig` の serde default 無視バグを発見・修正
+- 関連コミット: `e59ea16`（PR #581 squash merge）。品質ゲート全緑（1400）+ セルフテスト 73a2/73f/87 +
+  実クリック証拠 ~/dev/tako-evidence/566/
+
 ## 2026-07-27（#572: busy 中に人間が打った指示の消失を根治）
 - 根因を隔離実 claude で確定: **claude は生成中の打鍵を入力欄ではなく内部キューへ入れる**
   （ターン終了時に送信）。その間の入力欄は空で dim のヒント `Press up to edit queued messages`
