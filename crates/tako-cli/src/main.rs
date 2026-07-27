@@ -120,6 +120,10 @@ enum Command {
     /// プラットフォーム対応マトリクスの参照（Issue #515）。
     /// この環境でどの機能が使えるか・縮退しているか・未実装かを表示する
     Platform(PlatformArgs),
+    /// AI 系設定（tako の宣言的設定 + claude のグローバル指示）を
+    /// git リポジトリでデバイス間共有する（Issue #513）。
+    /// 引数なしで現在の配線状態と差分を表示する
+    Config(ConfigArgs),
     /// UI 表示言語（日本語/英語）の確認・切替（Issue #435）。
     /// 引数なしで現在言語を表示、ja / en で指定、system で OS ロケール追従
     Lang(LangArgs),
@@ -2149,6 +2153,55 @@ struct SetupArgs {
     review: bool,
 }
 
+/// `tako config`（Issue #513）。サブコマンド省略 = status
+#[derive(Args)]
+struct ConfigArgs {
+    /// 出力を JSON にする（MCP tako_config_share と同一ペイロード）。
+    /// サブコマンドの前後どちらに置いてもよい
+    #[arg(long, global = true)]
+    json: bool,
+    #[command(subcommand)]
+    command: Option<ConfigCommand>,
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// 配線状態と push / pull 待ちの差分を表示する（既定）
+    Status,
+    /// 共有リポジトリを新規に作って配線し、いまの設定を書き出す
+    Init {
+        /// リポジトリの配置先（省略時は ~/tako-config-sync）
+        #[arg(long)]
+        path: Option<String>,
+        /// origin として登録するリモート URL（指定時は初回 push まで行う）
+        #[arg(long)]
+        remote: Option<String>,
+    },
+    /// 既存の共有リポジトリに配線する（ローカルパスまたは git URL）
+    Link {
+        /// リポジトリのパス、または clone 元の git URL
+        target: String,
+        /// URL を clone するときの配置先（省略時は ~/tako-config-sync）
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// 配線を外す（リポジトリ自体は消さない）
+    Unlink,
+    /// このデバイスの設定を書き出してコミットする（リモートがあれば push）
+    Push {
+        /// コミットメッセージ
+        #[arg(long, short = 'm')]
+        message: Option<String>,
+        /// リモートへ送らずコミットまでで止める
+        #[arg(long)]
+        no_push: bool,
+    },
+    /// 共有リポジトリの設定をこのデバイスへ取り込む（リモートがあれば pull）
+    Pull,
+    /// 何を共有し何を共有しないかの分類表を表示する
+    List,
+}
+
 #[derive(Args)]
 struct SetupMcpArgs {
     /// ユーザーグローバルに書き込む（既定）
@@ -2506,6 +2559,7 @@ fn main() -> ExitCode {
         // 対応マトリクスはバイナリに埋め込まれた静的な表なのでローカル処理。
         // GUI が動いていない環境（移植作業中の Windows がまさにそれ）でも引けることが本質
         Command::Platform(ref args) => platform_local(args),
+        Command::Config(ref args) => config_share_local(args),
         // run-interactive --wait は起動 + ポーリングの合成
         Command::RunInteractive(ref args) if args.wait => run_interactive_wait(&cli.command),
         // run --wait / --list は合成処理
@@ -3509,6 +3563,251 @@ fn fda_local(sub: &FdaCommand) -> Result<(), String> {
             );
             Ok(())
         }
+    }
+}
+
+/// `tako config`（Issue #513）。GUI が動いていなくても使えるローカル処理。
+/// 実体は dispatch と共通なので、MCP `tako_config_share` と結果が食い違わない
+fn config_share_local(args: &ConfigArgs) -> Result<(), String> {
+    // CLI 単独で走るのでここでも表示言語を解決する（platform_local と同じ理由。#435）
+    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    let (action, target, path, remote, message, no_push) = match &args.command {
+        None | Some(ConfigCommand::Status) => ("status", None, None, None, None, false),
+        Some(ConfigCommand::List) => ("list", None, None, None, None, false),
+        Some(ConfigCommand::Init { path, remote }) => (
+            "init",
+            None,
+            path.as_deref(),
+            remote.as_deref(),
+            None,
+            false,
+        ),
+        Some(ConfigCommand::Link { target, path }) => (
+            "link",
+            Some(target.as_str()),
+            path.as_deref(),
+            None,
+            None,
+            false,
+        ),
+        Some(ConfigCommand::Unlink) => ("unlink", None, None, None, None, false),
+        Some(ConfigCommand::Push { message, no_push }) => {
+            ("push", None, None, None, message.as_deref(), *no_push)
+        }
+        Some(ConfigCommand::Pull) => ("pull", None, None, None, None, false),
+    };
+    let result = tako_control::dispatch::dispatch_config_share(
+        action, target, path, remote, message, no_push,
+    )
+    .map_err(|e| e.to_string())?;
+    if args.json {
+        println!("{}", pretty_json(&result));
+        return Ok(());
+    }
+    print_config_share(action, &result);
+    Ok(())
+}
+
+/// `tako config` の人向け表示。JSON の全量は `--json` で出せるので、ここは要点だけ
+fn print_config_share(action: &str, result: &serde_json::Value) {
+    use tako_core::i18n::Lang;
+    let ja = matches!(tako_core::i18n::lang(), Lang::Ja);
+    let t = |j: &'static str, e: &'static str| if ja { j } else { e };
+
+    if action == "list" {
+        for entry in result["entries"].as_array().into_iter().flatten() {
+            let class = entry["class"].as_str().unwrap_or("?");
+            println!(
+                "{class:<7} {}/{}",
+                entry["root"].as_str().unwrap_or("?"),
+                entry["path"].as_str().unwrap_or("?")
+            );
+            if let Some(note) = entry["note"].as_str() {
+                println!("        {note}");
+            }
+            let fields = entry["local_fields"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if !fields.is_empty() {
+                let names: Vec<&str> = fields.iter().filter_map(|f| f.as_str()).collect();
+                println!(
+                    "        {}: {}",
+                    t("共有しないフィールド", "fields kept local"),
+                    names.join(", ")
+                );
+            }
+        }
+        let counts = &result["counts"];
+        println!();
+        println!(
+            "shared {} / local {} / secret {}   ({})",
+            counts["shared"],
+            counts["local"],
+            counts["secret"],
+            t(
+                "未分類は共有されません",
+                "unclassified files are never shared"
+            )
+        );
+        return;
+    }
+
+    if result["linked"] == serde_json::Value::Bool(false) {
+        println!("{}", t("設定共有: 未配線", "config share: not linked"));
+        if let Some(hint) = result["hint"].as_str() {
+            println!("{hint}");
+        }
+        return;
+    }
+
+    if let Some(repo) = result["repo"].as_str() {
+        println!("repo:   {repo}");
+    }
+    if let Some(remote) = result["remote"].as_str() {
+        println!("remote: {remote}");
+    }
+    if let Some(branch) = result["branch"].as_str() {
+        println!("branch: {branch}");
+    }
+
+    match action {
+        "status" => {
+            let summary = &result["summary"];
+            println!(
+                "{}: same {} / differs {} / local_only {} / repo_only {}",
+                t("差分", "diff"),
+                summary["same"].as_u64().unwrap_or(0),
+                summary["differs"].as_u64().unwrap_or(0),
+                summary["local_only"].as_u64().unwrap_or(0),
+                summary["repo_only"].as_u64().unwrap_or(0),
+            );
+            for file in result["files"].as_array().into_iter().flatten() {
+                let state = file["state"].as_str().unwrap_or("?");
+                if state == "same" {
+                    continue;
+                }
+                println!("  {state:<11} {}", file["path"].as_str().unwrap_or("?"));
+            }
+            print_list_section(
+                t("共有しない（未分類）", "not shared (unclassified)"),
+                &result["unclassified"],
+            );
+            print_list_section(
+                t(
+                    "リポジトリ内の管理外ファイル",
+                    "untracked files in repository",
+                ),
+                &result["untracked_in_repo"],
+            );
+            print_list_section(
+                t(
+                    "可搬でない絶対パス（別デバイスで解決できません）",
+                    "non-portable absolute paths (unresolvable on other devices)",
+                ),
+                &result["non_portable_paths"],
+            );
+        }
+        "push" | "init" => {
+            let push = if action == "init" {
+                &result["push"]
+            } else {
+                result
+            };
+            println!(
+                "{}: {} files",
+                t("書き出し", "exported"),
+                push["written"].as_u64().unwrap_or(0)
+            );
+            if push["committed"] == serde_json::Value::Bool(true) {
+                println!(
+                    "{}: {}",
+                    t("コミット", "committed"),
+                    push["commit"].as_str().unwrap_or("-")
+                );
+            } else {
+                println!("{}", t("変更なし（コミットなし）", "no changes to commit"));
+            }
+            if push["pushed"] == serde_json::Value::Bool(true) {
+                println!("{}", t("リモートへ push しました", "pushed to remote"));
+            } else if let Some(err) = push["push_error"].as_str() {
+                println!("{}: {err}", t("push に失敗", "push failed"));
+            }
+            print_list_section(
+                t(
+                    "リポジトリ内の管理外ファイル",
+                    "untracked files in repository",
+                ),
+                &push["untracked_in_repo"],
+            );
+        }
+        "pull" => {
+            let applied = result["applied"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let changed: Vec<&serde_json::Value> = applied
+                .iter()
+                .filter(|a| a["action"] != "unchanged")
+                .collect();
+            println!(
+                "{}: {} / {}",
+                t("取り込み", "applied"),
+                changed.len(),
+                applied.len()
+            );
+            for a in changed {
+                println!(
+                    "  {:<9} {}",
+                    a["action"].as_str().unwrap_or("?"),
+                    a["path"].as_str().unwrap_or("?")
+                );
+            }
+            let needs = result["needs_local"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if !needs.is_empty() {
+                println!();
+                println!(
+                    "{}",
+                    t(
+                        "このデバイスで設定が必要な値（共有されない項目）:",
+                        "values that must be set on this device (never shared):"
+                    )
+                );
+                for n in needs {
+                    println!(
+                        "  {} → {}",
+                        n["path"].as_str().unwrap_or("?"),
+                        n["field"].as_str().unwrap_or("?")
+                    );
+                }
+            }
+        }
+        _ => {
+            if let Some(hint) = result["hint"].as_str() {
+                println!("{hint}");
+            }
+        }
+    }
+}
+
+fn print_list_section(title: &str, value: &serde_json::Value) {
+    let items = value.as_array().map(Vec::as_slice).unwrap_or(&[]);
+    if items.is_empty() {
+        return;
+    }
+    println!();
+    println!("{title}: {}", items.len());
+    for item in items.iter().take(20) {
+        match item.as_str() {
+            Some(s) => println!("  {s}"),
+            None => println!("  {item}"),
+        }
+    }
+    if items.len() > 20 {
+        println!("  …");
     }
 }
 
@@ -5299,6 +5598,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Agents(_) => unreachable!("agents は run() を通らない"),
         Command::Recover(_) => unreachable!("recover は run() を通らない（ローカル処理）"),
         Command::Platform(_) => unreachable!("platform は run() を通らない（ローカル処理）"),
+        Command::Config(_) => unreachable!("config は run() を通らない（ローカル処理）"),
         Command::OpenIn(sub) => match sub {
             OpenInCommand::Dir { path, no_focus } => Request::OpenDir {
                 path: resolve_cli_path(path),
@@ -6911,6 +7211,8 @@ mod platform_matrix_parity {
         ("background", "tako_background_pane"),
         ("close", "tako_close_pane"),
         ("collapse", "tako_collapse_tab"),
+        // #513: CLI は `tako config <操作>`、MCP は action 引数を持つ 1 ツール
+        ("config", "tako_config_share"),
         ("edit apply", "tako_preview_apply"),
         ("edit autosave", "tako_preview_autosave"),
         ("edit redo", "tako_preview_redo"),

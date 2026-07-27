@@ -159,6 +159,23 @@ pub struct SetupAnswers {
     /// "claude" / "codex" / "agy" = その場で対話起動、"none" = 起動しない。
     /// 省略時は TTY があれば対話で選択、なければ "none"
     pub launch_agent: Option<String>,
+    /// AI 系設定の git 共有（Issue #513）。**オプション**なので省略時は何もしない
+    /// （標準 setup の質問ゼロ原則 #262 を守る）。明示指定か `--review` でだけ配線する
+    pub config_share: Option<SetupConfigShareAnswers>,
+}
+
+/// 設定共有の回答（Issue #513）
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SetupConfigShareAnswers {
+    /// true で配線する。false / 省略なら何もしない
+    pub enable: Option<bool>,
+    /// 既存の共有リポジトリ（ローカルパスまたは git URL）。省略時は新規作成
+    pub repo: Option<String>,
+    /// リポジトリの配置先（省略時は `~/tako-config-sync`）
+    pub path: Option<String>,
+    /// 新規作成時に origin として登録するリモート URL
+    pub remote: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

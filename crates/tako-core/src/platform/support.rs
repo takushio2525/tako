@@ -150,6 +150,14 @@ pub mod notes {
         "Requires the remote transport and the Windows distribution channel",
     );
 
+    /// #513 の担当範囲。実装はプラットフォーム共通（ファイル操作 + git のみ）で、
+    /// パス可搬化の Windows 表記も macOS 上の単体テストで検証済み。
+    /// 残っているのは**実機での配線確認**だけなので、その一点だけを理由として書く
+    pub const WIN_CONFIG_SHARE: Note = Note::new(
+        "実装はプラットフォーム共通だが、Windows 実機での配線確認が未了",
+        "The implementation is platform-neutral, but wiring has not yet been verified on real Windows hardware",
+    );
+
     /// OS が同等機能を標準で持っていて、tako 側の実装が不要なもの（#600）
     pub const WIN_NO_PSREADLINE_NEEDED: Note = Note::new(
         "Windows の PowerShell は PSReadLine の予測入力を標準搭載しているため、tako 側の注入は要らない",
@@ -377,6 +385,15 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Pending {
             note: notes::WIN_TERMINAL,
             issue: 517,
+        },
+    },
+    Feature {
+        // #513: AI 系設定の git ベース共有。GUI にも tmux にも依存しない
+        key: "tako_config_share",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_CONFIG_SHARE,
+            issue: 513,
         },
     },
     Feature {

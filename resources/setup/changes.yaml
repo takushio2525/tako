@@ -216,3 +216,23 @@ changes:
       セットアップは `tako remote setup` で対話的に行える（Tailscale の導入から serve 設定、
       QR コード生成までを案内）。`tako setup` の依存チェックにも tailscale が追加された（任意）。
       旧方式を使っていた場合は `tako remote setup` で新方式へ移行できる。
+
+  - revision: 13
+    version: "0.6.1"
+    date: "2026-07-28"
+    kind: auto
+    title: AI 系設定の git 共有（tako config）を追加
+    description: |
+      claude のグローバル指示（CLAUDE.md / snippets / commands / templates）と
+      tako の宣言的設定（profiles / projects / accounts / local-rules / settings）を
+      git リポジトリ 1 本でデバイス間共有できるようになった（Issue #513）。
+      `tako config init` で新規リポジトリを作って配線、`tako config link <パス|URL>` で
+      既存リポジトリへ接続、`tako config push` / `pull` で同期、`tako config status` で差分、
+      `tako config list` で「何を共有し何を共有しないか」の分類表を確認できる。
+      秘匿情報（token / credentials / .claude.json）とマシン固有の状態
+      （layout.json / sessions.yaml / workers.yaml / ペインログ）はホワイトリストで
+      構造的に除外され、カタログに載っていないファイルは共有されない。
+      アカウントの資格情報の場所（config_dir）と profile の env も共有対象から外れる。
+      設定内の絶対パスはホーム部分が ~ に置き換わって保存されるので、mac と Windows で
+      ホームの位置が違っても同じリポジトリを使える。
+      **任意機能**なので、使わないなら何もしなくてよい（setup の質問は増えない）。

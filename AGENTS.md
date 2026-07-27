@@ -99,6 +99,7 @@ tako/
 | Web ビューペイン操作 | `tako web open <url>` / `list` / `show <id>` / `hide` / `close` / `nav <to>` / `eval <js>` / `eval-result <token>` / `read`（ネイティブ WKWebView ペイン。#155） |
 | 複数ウィンドウ操作（ビューポート方式 + 共有タブバー。#339/#380） | `tako window list` / `new [--tab N]` / `close <W>` / `move-tab --tab N --window W` / `focus <W>`（タブバーは全ウィンドウ共通で全タブ表示、クリックで表示がそのウィンドウへ移る。MCP `tako_window` と 1:1） |
 | エージェント共通ルール同期 | `tako agents sync-rules` / `tako agents status`（正本から各エージェントのグローバル指示ファイルへマーカーブロック同期。#136） |
+| AI 系設定のデバイス間共有（#513） | `tako config`（引数なしで状態と差分）/ `init [--path P] [--remote URL]` / `link <パス\|URL>` / `push [-m msg]` / `pull` / `list`（何を共有し何を共有しないかの分類表）。claude のグローバル指示（CLAUDE.md / snippets / commands / templates）+ tako の宣言的設定（profiles / projects / accounts / local-rules / settings）を git 1 本で mac ⇔ Windows 共有。秘匿情報とマシンローカル状態はホワイトリストで構造的に除外、未分類は共有しない。絶対パスはホーム部分が `~` に正規化される。MCP `tako_config_share` と 1:1 |
 | レイアウト復旧（タブ・ペイン大量消失時。#177/#381） | `tako recover`（バックアップ世代一覧）→ tako 終了 → `tako recover --apply <世代>`（1〜3 または `good` = 最後に復元へ成功した良品）→ tako 再起動。実体 tmux セッションの個別取り込みは `tako tmux open --socket tako --pane <N> <session>` |
 | セッションカタログ（会話の発見・復元。#112） | `tako sessions list [--role r] [--project p]` / `tako sessions show <id>` / `tako sessions resume <id>`（記録 cwd で `claude --resume` をペイン起動。claude のみ） |
 | ペインの平文ログ（ペイン死亡後も出力を遡る。#112） | `tako logs list` / `tako logs show <pane> [--session <id>] [--lines N]` / `tako logs status` / `tako logs set --enabled --max-mb --total-max-mb` |

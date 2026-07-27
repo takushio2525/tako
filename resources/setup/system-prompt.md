@@ -144,6 +144,21 @@ CLI 検出、認証確認、プラン確認、MCP 設定、推奨 profile 生成
 - 未登録なら、開発プロジェクトのディレクトリを登録するか聞く（任意、スキップ可）
 - ユーザーの同意なしに無関係なディレクトリを探索・登録しない
 
+## Step 3.5: 設定共有（任意。聞くのは 1 回だけ）
+
+複数デバイスを使っているとユーザーが言った場合、または `--review` での見直し中だけ提案する。
+**初回セットアップで自分から質問を増やさない**。
+
+- 何ができるか: claude のグローバル指示（CLAUDE.md / snippets / commands / templates）と
+  tako の宣言的設定（profiles / projects / accounts / local-rules / settings）を
+  git リポジトリ 1 本で別デバイスと共有できる
+- 安全性: 秘匿情報（token / credentials / `.claude.json`）とマシン固有の状態
+  （layout.json / sessions.yaml / workers.yaml）はホワイトリストで構造的に除外される。
+  アカウントの資格情報の場所（`config_dir`）と profile の `env` も共有されない
+- 案内するコマンド: `tako config init`（新規作成）/ `tako config link <パス|URL>`（既存へ接続）/
+  `tako config status`（差分）/ `tako config list`（何を共有するかの一覧）
+- 迷っていたら `tako config list` を実行して分類表を見せる。勝手に配線しない
+
 ## Step 4: 完了サマリー
 
 変更したファイルと設定を一覧にし、次を案内する（コマンド案内の原則に従い最簡形で示す）。

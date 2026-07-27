@@ -895,6 +895,38 @@ tako agents status
 tako agents sync-rules
 ```
 
+### tako config
+
+AI 系の設定を git リポジトリ 1 本でデバイス間共有します（任意機能）。claude のグローバル指示（`CLAUDE.md` / `snippets` / `commands` / `templates`）と tako の宣言的設定（`profiles` / `projects` / `accounts` / `local-rules` / `settings`）が対象です。
+
+```bash
+tako config                          # 配線状態と push / pull 待ちの差分
+tako config list                     # 何を共有し何を共有しないかの分類表
+
+# はじめる（どちらか）
+tako config init                     # 新しく作る（~/tako-config-sync）
+tako config init --remote git@github.com:you/tako-config.git
+tako config link git@github.com:you/tako-config.git   # 2 台目: clone して配線
+tako config link ~/dotfiles/tako     # 既存リポジトリに繋ぐ
+
+# 同期
+tako config push -m "[改善] プロジェクトを追加"
+tako config pull
+tako config unlink                   # 配線を外す（リポジトリは残る）
+```
+
+秘匿情報とマシン固有の状態は、除外リストではなく**ホワイトリスト**で構造的に外れます。カタログに載っていないファイルは共有されません。
+
+| 共有される | 共有されない |
+|---|---|
+| `CLAUDE.md` / snippets / commands / templates | `.claude.json` / credentials / 会話履歴 |
+| profiles / projects / accounts の宣言部 / local-rules | token / control.json / layout.json / sessions.yaml / workers.yaml / ペインログ |
+| settings.json（表示設定） | アカウントの `config_dir`、profile の `env`、「バナーを閉じた」等の操作履歴 |
+
+設定内の絶対パスは、ホーム配下なら `~/…` に正規化して保存され、取り込み時にそのデバイスのホームへ戻ります。mac と Windows でホームの位置が違っても同じリポジトリを使えます。
+
+`tako setup` は質問を増やしません。使いたいときだけ `tako config init` を実行するか、`tako setup --review` の対話で聞かれたときに答えてください。
+
 ## 診断・保守
 
 ### tako platform
