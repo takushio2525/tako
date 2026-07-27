@@ -997,6 +997,9 @@ pub fn run_daemon() -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::sync::atomic::Ordering::Relaxed;
+        // #590: **シグナルマスクを空に戻す**。以後に spawn するスレッドは作成元の
+        // マスクを継承するので、ハンドラ設置より前・スレッド生成より前のここで戻す
+        reset_signal_mask();
         let _ = unsafe {
             libc::signal(
                 libc::SIGTERM,
@@ -1157,6 +1160,22 @@ pub fn scrollback(pane_id: &str, lines: u32) -> Result<Vec<String>, String> {
         .lines()
         .map(|l| l.to_string())
         .collect())
+}
+
+/// シグナルマスクを空に戻す（#590）。
+///
+/// シグナルマスクは fork + exec をまたいで継承される。GUI（tako-app = GPUI / AppKit）
+/// から起動した daemon は SIGTERM / SIGHUP がブロックされたまま生まれ、実測では
+/// ハンドラを設置しても発火せず（SIGHUP の既定動作すら起きず）、`tako remote stop` と
+/// GUI の kill switch（全遮断）が無言で失敗していた。daemon 側とプロセス起動側の
+/// 両方で戻すことで、どの経路から起動しても停止できることを保証する
+#[cfg(unix)]
+fn reset_signal_mask() {
+    unsafe {
+        let mut empty: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut empty);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+    }
 }
 
 /// デーモンの状態を PID ファイルから確認する。
@@ -1550,6 +1569,10 @@ pub fn spawn_daemon() -> Result<Value, String> {
         unsafe {
             cmd.pre_exec(|| {
                 libc::setsid();
+                // #590: 親（GUI = GPUI / AppKit）がブロックしているシグナルは
+                // exec をまたいで継承されるため、ここで必ず空に戻す（exec 前の
+                // 子プロセスなので pthread_sigmask は async-signal-safe な範囲）
+                reset_signal_mask();
                 Ok(())
             });
         }
@@ -4805,6 +4828,37 @@ mod tests {
             Some(crate::dispatch::STABLE_APP_BINARY)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #590: シグナルマスクのリセットが効くこと。
+    /// GUI（GPUI / AppKit）から起動した daemon は SIGTERM がブロックされたまま
+    /// 生まれ、`tako remote stop` と kill switch が無言で失敗していた
+    #[cfg(unix)]
+    #[test]
+    fn reset_signal_maskはブロック中のsigtermを解除する() {
+        // 現在のスレッドのマスクに SIGTERM が入っているか
+        fn sigterm_blocked() -> bool {
+            unsafe {
+                let mut cur: libc::sigset_t = std::mem::zeroed();
+                libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut cur);
+                libc::sigismember(&cur, libc::SIGTERM) == 1
+            }
+        }
+        unsafe {
+            let mut block: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut block);
+            libc::sigaddset(&mut block, libc::SIGTERM);
+            let mut old: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
+            assert!(sigterm_blocked(), "前提: SIGTERM をブロックできている");
+            reset_signal_mask();
+            assert!(
+                !sigterm_blocked(),
+                "reset_signal_mask 後は SIGTERM のブロックが解除される"
+            );
+            // テストスレッドのマスクを元に戻す（他テストへ影響させない）
+            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        }
     }
 
     // --- #287 P1: cross-origin 遮断テスト ---
