@@ -116,29 +116,82 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-m", MinimizeWindow, None),
         KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
     ];
-    bindings.extend(clipboard_bindings_for_platform());
+    bindings.extend(platform_bindings());
     bindings
 }
 
-/// macOS 以外（Windows / Linux）のクリップボード操作バインド（#467）
+/// macOS 以外（Windows / Linux）向けの追加バインド（#467 / #585）
 ///
 /// 上の一覧の `cmd-` は GPUI では **platform 修飾**に解決され、Windows では
-/// Win キーになる（`gpui_windows` が VK_LWIN / VK_RWIN を platform へ写す）。
-/// Win+V は OS のクリップボード履歴が奪うため、`cmd-v` だけだと tako の
-/// ペースト経路（PasteClipboard）へ Windows から到達する手段が無くなる。
-/// そこで OS 慣習のキーを追加で張り、入口を用意する。
+/// Win キーになる（`gpui_windows::current_modifiers` が VK_LWIN / VK_RWIN を
+/// platform へ写す）。Win+T / Win+D / Win+V / Win+K などはシェルが先に奪うため、
+/// 45 本すべてがアプリまで届かない ＝ **Windows ではショートカットが全滅する**
+/// （#585 の症状「新しいタブが開けない」）。そこで OS 慣習のキーを追加で張る。
 ///
-/// トレードオフ: `ctrl-v` を張ると Ctrl+V の C0 制御コード 0x16（readline /
-/// vim の逐語入力）は PTY へ届かなくなる。GPUI はキーバインドのアクションを
-/// `on_key_down` より先に発火し、バブルフェーズでアクションが既定で伝播を
-/// 止めるため（gpui `window.rs` の dispatch_key_event / dispatch_action_on_node）。
-/// Windows Terminal も既定で Ctrl+V をペーストに割り当てており、
-/// 逐語入力より「ペーストできない」ほうが実害が大きいのでこの配分を採る。
-/// Ctrl+C（SIGINT）等は修飾が一致しないので影響しない
-/// （`ctrl-shift-c` は Ctrl+C とは別のキーストローク）。
+/// ## 割当の原則（#585 の 3 分類）
+///
+/// - **`ctrl-<英字>` 単独は奪わない**。C0 制御コード（Ctrl+C = SIGINT、Ctrl+A = 行頭、
+///   Ctrl+D = EOF、Ctrl+Z = SIGTSTP、Ctrl+S = XOFF…）としてシェル / TUI が使う。
+///   例外は `ctrl-v` だけ（#467 の意図的なトレードオフ。下記）
+/// - ターミナル入力と衝突するものは **`ctrl-shift-` へ逃がす**。[`keystroke_to_bytes`]
+///   は `ctrl+shift+<英字>` を `ctrl+<英字>` と同じ C0 バイトへ潰している（shift を
+///   見ない）ため、奪っても**固有の入力手段は失われない**
+/// - **`alt-` は矢印キーだけ**に使う。#575 で素の Alt+印字文字を meta（ESC 前置）で
+///   PTY へ送るようにしたため、`alt-<文字>` を奪うとエージェント CLI の Alt+V
+///   （クリップボード画像の貼り付け）などが死ぬ。Windows Terminal 由来の
+///   Alt+Shift+D（ペイン複製）を分割に採らなかったのもこの理由
+/// - **shift と記号 / 数字を組み合わせない**。GPUI Windows は shift 付きの記号を
+///   「シフト後の文字 + shift 無し」へ正規化して届ける（`get_keystroke_key`）が、
+///   `KeyBinding::new` は `DummyKeyboardMapper` なので書いたままを保持する。
+///   よって `ctrl-shift-]` のようなバインドは**一致しない**（配列依存でもある）。
+///   拡大は正規化後の字面 `ctrl-+` で書く
+///
+/// 慣習の出典は Windows Terminal / VS Code / kitty / ブラウザ。見送り分
+/// （Quit・最小化・アプリを隠す）とキー 1 本ごとの根拠は #585 の対応表。
 #[cfg(not(target_os = "macos"))]
-fn clipboard_bindings_for_platform() -> Vec<KeyBinding> {
+fn platform_bindings() -> Vec<KeyBinding> {
     vec![
+        // --- タブ（Windows Terminal / kitty / ブラウザ）---
+        KeyBinding::new("ctrl-shift-t", NewTab, None),
+        KeyBinding::new("ctrl-shift-w", ClosePane, None),
+        KeyBinding::new("ctrl-tab", NextTab, None),
+        KeyBinding::new("ctrl-shift-tab", PrevTab, None),
+        // Ctrl+数字（ブラウザ / VS Code のタブ切替）。Ctrl+<数字> は現状 PTY へ
+        // 1 バイトも送っていない（ToUnicode が文字を返さず key_char が None）ので
+        // 奪っても失うものが無い
+        KeyBinding::new("ctrl-1", ActivateTab1, None),
+        KeyBinding::new("ctrl-2", ActivateTab2, None),
+        KeyBinding::new("ctrl-3", ActivateTab3, None),
+        KeyBinding::new("ctrl-4", ActivateTab4, None),
+        KeyBinding::new("ctrl-5", ActivateTab5, None),
+        KeyBinding::new("ctrl-6", ActivateTab6, None),
+        KeyBinding::new("ctrl-7", ActivateTab7, None),
+        KeyBinding::new("ctrl-8", ActivateTab8, None),
+        KeyBinding::new("ctrl-9", ActivateTab9, None),
+        KeyBinding::new("ctrl-shift-n", NewWindow, None),
+        // --- ペイン ---
+        // 分割は D = 右（macOS の cmd-d と字面一致。Windows Terminal の
+        // Ctrl+Shift+D = ペイン複製とも一致）、E = 下（shift 段が埋まるため
+        // 隣接キーへ逃がす。Terminator / Tilix も分割に Ctrl+Shift+E を使う）
+        KeyBinding::new("ctrl-shift-d", SplitRight, None),
+        KeyBinding::new("ctrl-shift-e", SplitDown, None),
+        // フォーカス移動 = Alt+矢印、リサイズ = Alt+Shift+矢印（Windows Terminal）。
+        // Ctrl+矢印（readline の単語移動 \x1b[1;5C）は奪わない
+        KeyBinding::new("alt-left", FocusLeft, None),
+        KeyBinding::new("alt-right", FocusRight, None),
+        KeyBinding::new("alt-up", FocusUp, None),
+        KeyBinding::new("alt-down", FocusDown, None),
+        KeyBinding::new("alt-shift-right", WidenPane, None),
+        KeyBinding::new("alt-shift-left", NarrowPane, None),
+        KeyBinding::new("alt-shift-down", TallenPane, None),
+        KeyBinding::new("alt-shift-up", ShortenPane, None),
+        // --- クリップボード（#467 で先行実装。Ctrl+V のみ単独 ctrl の例外）---
+        // トレードオフ: Ctrl+V の C0 制御コード 0x16（readline / vim の逐語入力）は
+        // PTY へ届かなくなる。GPUI はキーバインドのアクションを `on_key_down` より
+        // 先に発火し、バブルフェーズでアクションが既定で伝播を止めるため
+        // （gpui `window.rs` の dispatch_key_event / dispatch_action_on_node）。
+        // Windows Terminal も既定で Ctrl+V をペーストに割り当てており、逐語入力より
+        // 「ペーストできない」ほうが実害が大きいのでこの配分を採る
         KeyBinding::new("ctrl-v", PasteClipboard, None),
         // Linux ターミナル慣習。Ctrl+V を逐語入力へ戻したくなっても残る退路
         KeyBinding::new("ctrl-shift-v", PasteClipboard, None),
@@ -146,12 +199,43 @@ fn clipboard_bindings_for_platform() -> Vec<KeyBinding> {
         // ターミナル入力を奪わない
         KeyBinding::new("shift-insert", PasteClipboard, None),
         KeyBinding::new("ctrl-shift-c", CopySelection, None),
+        // --- 表示（ブラウザ / Windows Terminal）---
+        // Ctrl+= / Ctrl++ / Ctrl+- / Ctrl+0 も ToUnicode が文字を返さないため
+        // PTY へは何も送っていない。`ctrl-+` は JP 配列の Ctrl+Shift+- にも一致する
+        // （GPUI がシフト後の字面 "+" / "=" へ正規化して届けるため）
+        KeyBinding::new("ctrl-=", ZoomIn, None),
+        KeyBinding::new("ctrl-+", ZoomIn, None),
+        KeyBinding::new("ctrl--", ZoomOut, None),
+        KeyBinding::new("ctrl-0", ResetZoom, None),
+        // 全画面は Windows 共通の F11。F キーは keystroke_to_bytes が PTY へ
+        // 送らない（tako は F1〜F12 を未実装）ので奪っても失うものが無い
+        KeyBinding::new("f11", ToggleFullScreen, None),
+        KeyBinding::new("ctrl-shift-b", ToggleSidebar, None),
+        // --- 編集・プレビュー ---
+        KeyBinding::new("ctrl-shift-s", SavePreview, None),
+        KeyBinding::new("ctrl-shift-a", SelectAll, None),
+        // Windows の取り消し = Ctrl+Z / やり直し = Ctrl+Y を 1 段持ち上げた形。
+        // Ctrl+Shift+Z が「やり直し」でない点だけ Windows 慣習と食い違うが、
+        // Ctrl+Z（SIGTSTP）を奪えない以上、取り消し側が shift 段を使う
+        KeyBinding::new("ctrl-shift-z", UndoPreview, None),
+        KeyBinding::new("ctrl-shift-y", RedoPreview, None),
+        KeyBinding::new("ctrl-shift-f", FindPreview, None),
+        // --- 開く・設定 ---
+        KeyBinding::new("ctrl-shift-o", OpenDirectory, None),
+        // O は上で使うため R = Repository。Windows には GPUI のメニューバーが
+        // 無く、この 2 つはキーとパレット以外の入口が無い
+        KeyBinding::new("ctrl-shift-r", OpenRepository, None),
+        KeyBinding::new("ctrl-,", OpenSettings, None),
+        // --- コマンドパレット（VS Code / Windows Terminal は Ctrl+Shift+P。
+        // K は macOS の cmd-k と字面を合わせた退路）---
+        KeyBinding::new("ctrl-shift-p", OpenCommandPalette, None),
+        KeyBinding::new("ctrl-shift-k", OpenCommandPalette, None),
     ]
 }
 
 /// macOS は `cmd-` が本来の Command キーに解決されるため追加は不要
 #[cfg(target_os = "macos")]
-fn clipboard_bindings_for_platform() -> Vec<KeyBinding> {
+fn platform_bindings() -> Vec<KeyBinding> {
     Vec::new()
 }
 
@@ -697,7 +781,7 @@ mod tests {
     /// #467: Windows では GPUI の `cmd` = platform 修飾が Win キーに解決され、
     /// Win+V は OS のクリップボード履歴に奪われる。platform 修飾を使わない
     /// ペースト経路が最低 1 本残っていることを固定する
-    /// （`clipboard_bindings_for_platform` を消すとこのテストが落ちる）
+    /// （`platform_bindings` を消すとこのテストが落ちる）
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn 非macosではplatform修飾なしのペーストバインドが存在する() {
@@ -736,6 +820,325 @@ mod tests {
                 .iter()
                 .any(|k| k.key == "c" && k.modifiers.control && !k.modifiers.shift),
             "ctrl-c を奪うと SIGINT が送れなくなる"
+        );
+    }
+
+    /// #585: 指定のキーストローク（"ctrl-shift-t" 等）に一致するバインドのアクション名。
+    ///
+    /// GPUI の一致判定は `Keystroke::should_match` の
+    /// 「`target.inner.modifiers == self.modifiers && target.inner.key == self.key`」
+    /// （IME 由来の key_char 経路を除く完全一致）なので、ここも inner の完全一致で
+    /// 照合する。`KeyBinding::new` は `DummyKeyboardMapper` を使う ＝ inner は
+    /// 書いた文字列の parse 結果そのままなので、この照合は実機の解決と同じ意味になる
+    fn 一致するアクション(spec: &str) -> Vec<String> {
+        let want: Vec<Keystroke> = spec
+            .split_whitespace()
+            .map(|s| Keystroke::parse(s).expect("キーストロークとして解釈できる"))
+            .collect();
+        key_bindings()
+            .iter()
+            .filter(|b| {
+                b.keystrokes().len() == want.len()
+                    && b.keystrokes().iter().zip(&want).all(|(got, want)| {
+                        let got = got.inner();
+                        got.key == want.key && got.modifiers == want.modifiers
+                    })
+            })
+            .map(|b| b.action().name().to_string())
+            .collect()
+    }
+
+    /// #585 の対応表（Windows / Linux 側の割当）。表に書いた割当はすべてここに載せる
+    #[cfg(not(target_os = "macos"))]
+    fn 非macos割当表() -> Vec<(&'static str, &'static str)> {
+        vec![
+            // タブ
+            ("ctrl-shift-t", "tako::NewTab"),
+            ("ctrl-shift-w", "tako::ClosePane"),
+            ("ctrl-tab", "tako::NextTab"),
+            ("ctrl-shift-tab", "tako::PrevTab"),
+            ("ctrl-1", "tako::ActivateTab1"),
+            ("ctrl-2", "tako::ActivateTab2"),
+            ("ctrl-3", "tako::ActivateTab3"),
+            ("ctrl-4", "tako::ActivateTab4"),
+            ("ctrl-5", "tako::ActivateTab5"),
+            ("ctrl-6", "tako::ActivateTab6"),
+            ("ctrl-7", "tako::ActivateTab7"),
+            ("ctrl-8", "tako::ActivateTab8"),
+            ("ctrl-9", "tako::ActivateTab9"),
+            ("ctrl-shift-n", "tako::NewWindow"),
+            // ペイン
+            ("ctrl-shift-d", "tako::SplitRight"),
+            ("ctrl-shift-e", "tako::SplitDown"),
+            ("alt-left", "tako::FocusLeft"),
+            ("alt-right", "tako::FocusRight"),
+            ("alt-up", "tako::FocusUp"),
+            ("alt-down", "tako::FocusDown"),
+            ("alt-shift-right", "tako::WidenPane"),
+            ("alt-shift-left", "tako::NarrowPane"),
+            ("alt-shift-down", "tako::TallenPane"),
+            ("alt-shift-up", "tako::ShortenPane"),
+            // クリップボード（#467）
+            ("ctrl-v", "tako::PasteClipboard"),
+            ("ctrl-shift-v", "tako::PasteClipboard"),
+            ("shift-insert", "tako::PasteClipboard"),
+            ("ctrl-shift-c", "tako::CopySelection"),
+            // 表示
+            ("ctrl-=", "tako::ZoomIn"),
+            ("ctrl-+", "tako::ZoomIn"),
+            ("ctrl--", "tako::ZoomOut"),
+            ("ctrl-0", "tako::ResetZoom"),
+            ("f11", "tako::ToggleFullScreen"),
+            ("ctrl-shift-b", "tako::ToggleSidebar"),
+            // 編集・プレビュー
+            ("ctrl-shift-s", "tako::SavePreview"),
+            ("ctrl-shift-a", "tako::SelectAll"),
+            ("ctrl-shift-z", "tako::UndoPreview"),
+            ("ctrl-shift-y", "tako::RedoPreview"),
+            ("ctrl-shift-f", "tako::FindPreview"),
+            // 開く・設定
+            ("ctrl-shift-o", "tako::OpenDirectory"),
+            ("ctrl-shift-r", "tako::OpenRepository"),
+            ("ctrl-,", "tako::OpenSettings"),
+            // コマンドパレット
+            ("ctrl-shift-p", "tako::OpenCommandPalette"),
+            ("ctrl-shift-k", "tako::OpenCommandPalette"),
+        ]
+    }
+
+    /// #585: Windows では cmd-（= Win キー）が OS に奪われて全滅するため、
+    /// 対応表どおりの Windows 慣習バインドが解決できることを固定する
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn 非macosは対応表どおりのバインドで解決できる() {
+        for (spec, action) in 非macos割当表() {
+            let actions = 一致するアクション(spec);
+            assert!(
+                actions.iter().any(|a| a == action),
+                "{spec} → {action} のバインドが無い（解決結果: {actions:?}）"
+            );
+        }
+    }
+
+    /// #585: シェル / TUI へ届くべきキーを奪っていない。
+    /// Ctrl+英字は C0 制御コード（Ctrl+C = SIGINT 等）、Shift+Enter は Claude Code の
+    /// 改行、Shift+Tab はモード切替、Alt+英字は #575 の meta 入力（Alt+V = 画像貼り付け）
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn 端末へ流すべきキーを奪っていない() {
+        for spec in [
+            "ctrl-a",
+            "ctrl-b",
+            "ctrl-c",
+            "ctrl-d",
+            "ctrl-e",
+            "ctrl-f",
+            "ctrl-g",
+            "ctrl-h",
+            "ctrl-i",
+            "ctrl-j",
+            "ctrl-k",
+            "ctrl-l",
+            "ctrl-m",
+            "ctrl-n",
+            "ctrl-o",
+            "ctrl-p",
+            "ctrl-q",
+            "ctrl-r",
+            "ctrl-s",
+            "ctrl-t",
+            "ctrl-u",
+            "ctrl-w",
+            "ctrl-x",
+            "ctrl-y",
+            "ctrl-z", // readline の単語移動（\x1b[1;5C）
+            "ctrl-left",
+            "ctrl-right", // 素のキーと TUI が使う修飾キー
+            "tab",
+            "shift-tab",
+            "enter",
+            "shift-enter",
+            "ctrl-enter",
+            "escape",
+            "space",
+            "backspace", // #575 の meta 経路
+            "alt-v",
+            "alt-b",
+            "alt-f",
+            "alt-d",
+            "alt-enter",
+        ] {
+            assert!(
+                一致するアクション(spec).is_empty(),
+                "{spec} を奪っている（端末入力が壊れる）"
+            );
+        }
+    }
+
+    /// #585: 追加バインドが「割当の原則」を守っているかの番犬。
+    /// 原則を破るバインドを足すとここで落ちる
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn 非macos追加バインドは割当の原則を守っている() {
+        for b in key_bindings() {
+            let keystrokes: Vec<Keystroke> =
+                b.keystrokes().iter().map(|k| k.inner().clone()).collect();
+            // platform 修飾つき = macOS 用の元バインド（Windows では Win キーで届かない）
+            if keystrokes.iter().any(|k| k.modifiers.platform) {
+                continue;
+            }
+            let action = b.action().name().to_string();
+            for k in keystrokes {
+                let m = k.modifiers;
+                let 英字 = k.key.len() == 1 && k.key.chars().all(|c| c.is_ascii_alphabetic());
+                if m.control && !m.shift && !m.alt && 英字 {
+                    assert_eq!(
+                        k.key, "v",
+                        "{action}: ctrl-{} は C0 制御コードを奪う（例外はペーストの ctrl-v だけ）",
+                        k.key
+                    );
+                }
+                if m.alt {
+                    assert!(
+                        matches!(k.key.as_str(), "left" | "right" | "up" | "down"),
+                        "{action}: alt-{} は #575 の meta 入力を奪う（alt は矢印だけ）",
+                        k.key
+                    );
+                }
+                if !m.control && !m.alt && !m.shift {
+                    assert_eq!(
+                        k.key, "f11",
+                        "{action}: 修飾なしのバインドは f11 のみ（素のキーは端末入力）"
+                    );
+                }
+                if m.shift {
+                    assert!(
+                        英字 || k.key.len() > 1,
+                        "{action}: shift+{} は GPUI Windows の正規化（シフト後の文字 + shift 無し）で一致しない",
+                        k.key
+                    );
+                }
+            }
+        }
+    }
+
+    /// #585: 奪ったキーが「元々 PTY へ何も送っていない」か「同じバイトを送る経路が
+    /// 別に残る」かのどちらかであることを実際の変換で示す
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn 奪ったキーは端末の入力手段を減らさない() {
+        // Windows 実機で届く形（ctrl 付きは ToUnicode が文字を返さず key_char = None）
+        let ctrl = |key: &str| Keystroke {
+            modifiers: Modifiers {
+                control: true,
+                ..Modifiers::default()
+            },
+            key: key.into(),
+            key_char: None,
+        };
+        // ctrl+数字 / ctrl+記号 / F キーは PTY へ 1 バイトも送っていない
+        for key in ["0", "1", "5", "9", "=", "+", "-", ","] {
+            assert_eq!(
+                keystroke_to_bytes_default(&ctrl(key)),
+                None,
+                "ctrl-{key} が PTY へ送られている（奪うと入力手段が減る）"
+            );
+        }
+        assert_eq!(keystroke_to_bytes_default(&ks("f11")), None);
+        // ctrl+shift+英字 は ctrl+英字 と同じ C0 バイトに潰れる ＝ 奪っても
+        // ctrl+英字 の側に同じ入力手段が残る
+        for key in [
+            "a", "b", "c", "d", "e", "f", "k", "n", "o", "p", "r", "s", "t", "v", "w", "y", "z",
+        ] {
+            let mut shifted = ctrl(key);
+            shifted.modifiers.shift = true;
+            assert_eq!(
+                keystroke_to_bytes_default(&shifted),
+                keystroke_to_bytes_default(&ctrl(key)),
+                "ctrl-shift-{key} が ctrl-{key} と別のバイトを送っている"
+            );
+        }
+    }
+
+    /// #585: macOS のバインド 45 本（cmd- 40 + ctrl-cmd- 5）は Windows 対応で
+    /// 1 本も変えない。両プラットフォームで実行して固定する
+    #[test]
+    fn macos側のバインド45本は不変() {
+        let macos割当表 = [
+            ("cmd-d", "tako::SplitRight"),
+            ("cmd-shift-d", "tako::SplitDown"),
+            ("cmd-w", "tako::ClosePane"),
+            ("cmd-t", "tako::NewTab"),
+            ("cmd-shift-]", "tako::NextTab"),
+            ("cmd-shift-[", "tako::PrevTab"),
+            ("cmd-alt-left", "tako::FocusLeft"),
+            ("cmd-alt-right", "tako::FocusRight"),
+            ("cmd-alt-up", "tako::FocusUp"),
+            ("cmd-alt-down", "tako::FocusDown"),
+            ("ctrl-cmd-right", "tako::WidenPane"),
+            ("ctrl-cmd-left", "tako::NarrowPane"),
+            ("ctrl-cmd-down", "tako::TallenPane"),
+            ("ctrl-cmd-up", "tako::ShortenPane"),
+            ("cmd-c", "tako::CopySelection"),
+            ("cmd-v", "tako::PasteClipboard"),
+            ("cmd-s", "tako::SavePreview"),
+            ("cmd-b", "tako::ToggleSidebar"),
+            ("cmd-k", "tako::OpenCommandPalette"),
+            ("cmd-q", "tako::Quit"),
+            ("cmd-1", "tako::ActivateTab1"),
+            ("cmd-2", "tako::ActivateTab2"),
+            ("cmd-3", "tako::ActivateTab3"),
+            ("cmd-4", "tako::ActivateTab4"),
+            ("cmd-5", "tako::ActivateTab5"),
+            ("cmd-6", "tako::ActivateTab6"),
+            ("cmd-7", "tako::ActivateTab7"),
+            ("cmd-8", "tako::ActivateTab8"),
+            ("cmd-9", "tako::ActivateTab9"),
+            ("cmd-=", "tako::ZoomIn"),
+            ("cmd-+", "tako::ZoomIn"),
+            ("cmd--", "tako::ZoomOut"),
+            ("cmd-0", "tako::ResetZoom"),
+            ("cmd-a", "tako::SelectAll"),
+            ("cmd-o", "tako::OpenDirectory"),
+            ("cmd-shift-o", "tako::OpenRepository"),
+            ("cmd-shift-n", "tako::NewWindow"),
+            ("cmd-,", "tako::OpenSettings"),
+            ("cmd-z", "tako::UndoPreview"),
+            ("cmd-shift-z", "tako::RedoPreview"),
+            ("cmd-f", "tako::FindPreview"),
+            ("cmd-h", "tako::HideApp"),
+            ("cmd-alt-h", "tako::HideOthers"),
+            ("cmd-m", "tako::MinimizeWindow"),
+            ("ctrl-cmd-f", "tako::ToggleFullScreen"),
+        ];
+        assert_eq!(macos割当表.len(), 45, "macOS のバインドは 45 本");
+        for (spec, action) in macos割当表 {
+            let actions = 一致するアクション(spec);
+            assert!(
+                actions.iter().any(|a| a == action),
+                "{spec} → {action} が失われた（解決結果: {actions:?}）"
+            );
+        }
+        let platform本数 = key_bindings()
+            .iter()
+            .filter(|b| b.keystrokes().iter().any(|k| k.inner().modifiers.platform))
+            .count();
+        assert_eq!(
+            platform本数, 45,
+            "platform（cmd / Win）修飾のバインド本数が変わった"
+        );
+    }
+
+    /// macOS 側は従来どおり cmd- のみ（#467 / #585 の追加バインドが漏れ出していない）
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macosには非platform修飾のバインドが無い() {
+        assert!(platform_bindings().is_empty());
+        assert!(
+            key_bindings()
+                .iter()
+                .all(|b| b.keystrokes().iter().all(|k| k.inner().modifiers.platform)),
+            "macOS に非 platform 修飾のバインドが混入している"
         );
     }
 
