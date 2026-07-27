@@ -823,6 +823,12 @@ struct TakoApp {
     git_selected_file: Option<String>,
     /// git パネルのアコーディオン折りたたみ
     git_collapsed: GitCollapsed,
+    /// `git_collapsed` がどのリポジトリに対する状態か（#551）。
+    /// リポジトリが切り替わったら `GitCollapsed::for_repo` で畳み直す
+    git_collapsed_repo: Option<String>,
+    /// 直近の render で git スクロール領域へ積んだセクションの並び（#551 の回帰検出用）。
+    /// 表示順そのものなので、セルフテスト 83 がこの中身で案 2 の並びを固定する
+    git_body_sections: Vec<&'static str>,
     /// git コミットメッセージ入力欄の内容（#472）
     git_commit_message: String,
     /// git コミットメッセージ入力欄のキャレット位置（バイトオフセット。#487）
@@ -1160,8 +1166,17 @@ struct SidebarGitSummary {
     removed_lines: usize,
 }
 
-/// git パネルのアコーディオン折りたたみ状態
-#[derive(Debug, Clone, Default)]
+/// リモート追跡ブランチがこの件数を超えたら、リポジトリ切替時に必ず折りたたむ（#551 案 3）。
+/// 既定でも折りたたむが、ユーザーが前のリポジトリで開いた状態を引き継いだまま
+/// 163 件のリモートが展開されると「変更」「コミット」が画面外へ押し出される
+pub(crate) const GIT_REMOTE_AUTO_COLLAPSE: usize = 20;
+
+/// git パネルのアコーディオン折りたたみ状態。
+///
+/// 既定値は #551 案 1: **git タブを開く動機（変更を見る / コミットする）に直結する
+/// セクションだけ開いておく**。ブランチ・リモートは件数が多くなりがちで、
+/// 展開したままだと本命の 2 セクションを画面外へ押し出す
+#[derive(Debug, Clone)]
 struct GitCollapsed {
     branches: bool,
     changes: bool,
@@ -1169,6 +1184,31 @@ struct GitCollapsed {
     diff: bool,
     /// リモート追跡ブランチ（#496。数が多くなりがちなので既定は折りたたみ）
     remotes: bool,
+}
+
+impl Default for GitCollapsed {
+    fn default() -> Self {
+        Self {
+            branches: true,
+            changes: false,
+            commits: false,
+            diff: false,
+            remotes: true,
+        }
+    }
+}
+
+impl GitCollapsed {
+    /// リポジトリが切り替わったときに適用する折りたたみ状態（#551）。
+    /// 既定は上の `Default` と同じで、リモートが多いリポジトリでは
+    /// 前のリポジトリで展開していても必ず畳み直す（案 3）
+    fn for_repo(remote_count: usize) -> Self {
+        let mut s = Self::default();
+        if remote_count > GIT_REMOTE_AUTO_COLLAPSE {
+            s.remotes = true;
+        }
+        s
+    }
 }
 
 /// ブランチ操作の種別（#496）
@@ -2010,6 +2050,8 @@ impl TakoApp {
             git_selected_commit: None,
             git_selected_file: None,
             git_collapsed: GitCollapsed::default(),
+            git_collapsed_repo: None,
+            git_body_sections: Vec::new(),
             git_commit_message: String::new(),
             git_commit_cursor: 0,
             git_feedback: None,
