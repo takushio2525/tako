@@ -903,6 +903,7 @@ master 1 セッション分の工数がかかった。事故の内訳は「確�
 | FR-6.7 | **interact session の idle timeout**（既定 15 分）+ **接続開始終了・操作開始の macOS 通知**（osascript・`TAKO_REMOTE_NO_NOTIFY=1` で抑止）+ **status bar インジケータ**（接続端末数・承認待ちバッジ）とクリックで端末一覧・kill switch（全遮断 = `tako remote stop` 相当） | M | ✅ #283 |
 | FR-6.8 | **監査 metadata**: 接続開始終了・ペアリング・入力 byte 数・revoke を `<state_dir>/audit.log`（JSONL・256KB ローテート）へ記録する。**ペイン内容・入力テキストは記録しない**（診断ログ規約の維持。ペインログ FR-5.13 と異なりこちらは内容を持たない） | M | ✅ #283 |
 | FR-6.9 | start / stop / status / devices list / devices revoke は MCP・CLI に 1:1 公開（フルコントロール維持）。承認・role 昇格のみ GUI 限定（FR-6.5） | M | ✅ #283 |
+| FR-6.10 | **status bar インジケータは daemon 停止中も常時表示**する（消えるとリモート機能の存在ごと GUI から消え、`tako remote start` を知らないユーザーが到達できない）。停止中は中空リング + オフ文言で稼働中（塗りドット）と区別し、クリックで**起動パネル**（起動ボタン + `remote setup` の check と同じ不足項目の列挙 + `tako remote setup` のコピー行）を出す。起動失敗は daemon が返した理由をパネルへ出す（黙って失敗しない）。稼働中クリックは従来どおり端末一覧 + kill switch（+ 接続 URL のコピー行）。GUI の起動 / 停止 / 不足項目確認は dispatch と同じ操作関数（`remote::spawn_daemon` / `remote::daemon_stop` / `remote_setup::check_status`）を background で呼ぶ = CLI / MCP と 1:1（`dispatch::dispatch` は同期 API で UI スレッドを最長 30 秒塞ぐため直呼びしない。NFR-8） | M | ✅ #590 |
 
 ## NFR 非機能要件
 
