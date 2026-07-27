@@ -2180,6 +2180,15 @@ fn main() -> ExitCode {
 
 fn cli_main() -> ExitCode {
     let cli = Cli::parse();
+    // 表示言語のグローバルは既定が英語で、GUI だけが起動時に settings.json から解決する。
+    // CLI 単独で走る経路でも同じ解決をしないと、日本語の出力の中にマトリクス由来の
+    // 英語の理由文が混ざる（#525 の実測: setup の縮退理由だけ英語で出ていた）。
+    // サブコマンドごとに書くと必ず取りこぼすので、入口で一度だけ行う。
+    //
+    // なお `LangSetting::System` の解決は OS ロケール検出に依存する。
+    // Windows の検出は未実装（#604）なので、あちらが入るまで Windows では
+    // 明示設定（`tako lang ja`）が無い限り英語に解決される
+    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
     let result = match cli.command {
         Command::Mcp(McpCommand::Serve) => mcp_serve(),
         Command::Setup(ref args) => {
@@ -3397,9 +3406,7 @@ fn fda_local(sub: &FdaCommand) -> Result<(), String> {
 /// 応答の組み立ては `tako_control::platform::report` を通す。MCP `tako_platform` と
 /// **同じ 1 本**なので、CLI と AI で見える内容が食い違わない
 fn platform_local(args: &PlatformArgs) -> Result<(), String> {
-    // 表示言語のグローバルは既定が英語。GUI は起動時に settings.json から解決するので、
-    // CLI 単独で走るここでも同じ解決をしないと日本語設定なのに英語で出てしまう（#435）
-    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    // 表示言語の解決は `cli_main` の冒頭で全サブコマンド共通に済ませている（#435 / #525）
     let report = tako_control::platform::report(args.platform.as_deref(), args.status.as_deref())?;
     if args.json {
         println!("{}", pretty_json(&report));

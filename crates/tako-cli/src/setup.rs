@@ -51,10 +51,17 @@ fn home_dir() -> Option<PathBuf> {
         .filter(|p| p.is_absolute())
 }
 
+/// setup の配布物（テンプレート・setup-context.yaml・pending-changes.md）の置き場。
+///
+/// データディレクトリの解決は `tako_core::paths::data_dir()` が唯一の正
+/// （macOS は `~/Library/Application Support/tako` なので**従来と同一パス**、
+/// Windows は `%APPDATA%\tako`）。ここでパスを直書きすると Windows で
+/// `%USERPROFILE%\Library\Application Support\…` という存在しない慣習の場所へ
+/// 書き出すことになる（#525）
 fn setup_dir() -> Result<PathBuf, String> {
-    home_dir()
-        .map(|h| h.join("Library/Application Support/tako/setup"))
-        .ok_or_else(|| "ホームディレクトリが取得できない（$HOME 未設定）".into())
+    tako_core::paths::data_dir()
+        .map(|d| d.join("setup"))
+        .ok_or_else(|| "データディレクトリが取得できない（ホームディレクトリ未設定）".into())
 }
 
 fn codex_home_dir() -> Option<PathBuf> {
@@ -63,44 +70,40 @@ fn codex_home_dir() -> Option<PathBuf> {
         .or_else(|| home_dir().map(|home| home.join(".codex")))
 }
 
+/// 各エージェントのグローバル指示ファイル。
+///
+/// 区切りを埋め込んだ 1 つの `join(".claude/CLAUDE.md")` にしない。
+/// 解決自体は Windows でも動くが、表示が `~\.claude/CLAUDE.md` と混在して
+/// そのままコピーできるパスに見えなくなる
 fn instruction_path(agent: SetupAgent) -> Option<PathBuf> {
     let home = home_dir()?;
     Some(match agent {
-        SetupAgent::Claude => home.join(".claude/CLAUDE.md"),
+        SetupAgent::Claude => home.join(".claude").join("CLAUDE.md"),
         SetupAgent::Codex => codex_home_dir()?.join("AGENTS.md"),
-        SetupAgent::Agy => home.join(".gemini/GEMINI.md"),
+        SetupAgent::Agy => home.join(".gemini").join("GEMINI.md"),
     })
 }
 
+/// ホーム配下のパスを `~` 起点の表示に縮める。
+///
+/// 区切りは**その OS の区切りに揃える**。`~/` 固定にすると Windows で
+/// `~/AppData\Roaming\tako` のように 1 本のパスに `/` と `\` が混在し、
+/// コピーして使えるのか判断できない表示になる
 fn display_home_relative(path: &Path) -> String {
+    let sep = std::path::MAIN_SEPARATOR;
     home_dir()
         .and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf))
-        .map(|relative| format!("~/{}", relative.display()))
+        .map(|relative| format!("~{sep}{}", relative.display()))
         .unwrap_or_else(|| path.display().to_string())
 }
 
 // --- 環境チェック ---
 
-fn login_shell() -> String {
-    std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/bin/sh".into())
-}
-
-/// ログインシェル経由でコマンドを探す（GUI 起動や Homebrew の PATH 差異に対応）
+/// コマンドを探す。探索の作法は抽象境界 B16 が持つ
+/// （macOS はログインシェル経由、Windows は PATH + PATHEXT + ユーザー導入先）。
+/// ここで `$SHELL -l -c "command -v"` を直書きすると Windows では**必ず失敗**する（#525）
 fn find_command(name: &str) -> Option<String> {
-    let output = std::process::Command::new(login_shell())
-        .args(["-l", "-c", &format!("command -v {name}")])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !path.is_empty() {
-            return Some(path);
-        }
-    }
-    None
+    tako_core::platform::exe::find(name)
 }
 
 /// setup を進行できるエージェント CLI。agy はオーケストレーターでは worker 専用だが、
@@ -349,38 +352,76 @@ struct ExternalDep {
     required: bool,
     /// 影響する機能の説明
     purpose: &'static str,
-    /// brew でインストールする場合のパッケージ名（None = brew 非対応）
-    brew_pkg: Option<&'static str>,
-    /// brew 以外の導入案内
+    /// パッケージマネージャで入れる場合の ID（None = 手動導入のみ）。
+    /// macOS は Homebrew の formula 名、Windows は winget の `--id`
+    package: Option<&'static str>,
+    /// パッケージマネージャ以外の導入案内
     install_hint: &'static str,
 }
 
-const EXTERNAL_DEPS: &[ExternalDep] = &[
+/// この環境で意味のある依存の一覧。
+///
+/// **プラットフォームで中身が変わる**: Windows の永続化の器は tmux ではなく psmux
+/// （#519 M2）で、tailscale が要る remote はまだ Windows 未対応（マトリクス参照）。
+/// 使えない機能のために存在しない依存を要求しない
+fn external_deps() -> &'static [ExternalDep] {
+    #[cfg(not(windows))]
+    {
+        MACOS_DEPS
+    }
+    #[cfg(windows)]
+    {
+        WINDOWS_DEPS
+    }
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+const MACOS_DEPS: &[ExternalDep] = &[
     ExternalDep {
         bin: "tmux",
         required: false,
         purpose: "リモート接続（tako remote）・再起動時のセッション完全復元・オーケストレーターの worker 管理",
-        brew_pkg: Some("tmux"),
+        package: Some("tmux"),
         install_hint: "https://github.com/tmux/tmux/wiki/Installing",
     },
     ExternalDep {
         bin: "git",
         required: false,
         purpose: "git パネル（ブランチ・コミットグラフ・diff 表示）",
-        brew_pkg: Some("git"),
+        package: Some("git"),
         install_hint: "xcode-select --install でも導入できます",
     },
     ExternalDep {
         bin: "tailscale",
         required: false,
         purpose: "スマホからのリモート接続（tako remote。WireGuard E2E 暗号化）",
-        brew_pkg: Some("tailscale"),
+        package: Some("tailscale"),
         install_hint: "App Store で「Tailscale」を検索、または brew install tailscale",
     },
 ];
 
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_DEPS: &[ExternalDep] = &[
+    ExternalDep {
+        bin: "psmux",
+        required: false,
+        purpose: "再起動時のセッション完全復元（実行中のエージェントを画面ごと残す）。\
+                  無い場合はタブ・ペイン構成と cwd だけが復元される",
+        package: Some("psmux.psmux"),
+        install_hint: "scoop install psmux でも導入できます",
+    },
+    ExternalDep {
+        bin: "git",
+        required: false,
+        purpose: "git パネル（ブランチ・コミットグラフ・diff 表示）",
+        package: Some("Git.Git"),
+        install_hint: "https://git-scm.com/download/win",
+    },
+];
+
 /// 依存ツールのチェック段階。検出結果を `[OK]` / `[任意]` / `[不足]` で表示し、
-/// interactive = true なら未導入の依存をその場で brew インストールできる。
+/// interactive = true なら未導入の依存をその場でインストールできる
+/// （macOS = Homebrew、Windows = winget）。
 /// 戻り値は検出したエージェントと、チェック後も欠けている必須依存の一覧。
 fn run_dependency_check(interactive: bool) -> (Vec<DetectedAgent>, Vec<String>) {
     let agents = detect_agents();
@@ -398,7 +439,7 @@ fn run_dependency_check(interactive: bool) -> (Vec<DetectedAgent>, Vec<String>) 
             display_home_relative(Path::new(&agent.path))
         );
     }
-    let brew = find_command("brew");
+    let package_manager = PackageManager::detect();
     let mut missing_required = if agents.is_empty() {
         eprintln!("    [不足] claude / codex / agy のいずれも見つかりません");
         for kind in SetupAgent::ALL {
@@ -408,7 +449,7 @@ fn run_dependency_check(interactive: bool) -> (Vec<DetectedAgent>, Vec<String>) 
     } else {
         Vec::new()
     };
-    for dep in EXTERNAL_DEPS {
+    for dep in external_deps() {
         if let Some(path) = find_command(dep.bin) {
             eprintln!("  [OK] {}: {path}", dep.bin);
             continue;
@@ -424,16 +465,21 @@ fn run_dependency_check(interactive: bool) -> (Vec<DetectedAgent>, Vec<String>) 
             eprintln!("      無くても tako 自体は動きますが、上記の機能が使えません");
         }
         let mut installed = false;
-        match (dep.brew_pkg, brew.as_deref()) {
-            (Some(pkg), Some(brew_bin)) => {
-                eprintln!("      導入方法: brew install {pkg}");
+        match (dep.package, package_manager.as_ref()) {
+            (Some(pkg), Some(pm)) => {
+                eprintln!(
+                    "      導入方法: {}",
+                    PackageManager::install_command(pm.name, pkg)
+                );
                 if interactive {
-                    installed = offer_brew_install(pkg, brew_bin);
+                    installed = offer_package_install(pkg, pm);
                 }
             }
             (Some(pkg), None) => {
+                let name = if cfg!(windows) { "winget" } else { "brew" };
                 eprintln!(
-                    "      導入方法: brew install {pkg}（要 Homebrew）/ {}",
+                    "      導入方法: {}（要 {name}）/ {}",
+                    PackageManager::install_command(name, pkg),
                     dep.install_hint
                 );
             }
@@ -458,6 +504,8 @@ fn run_dependency_check(interactive: bool) -> (Vec<DetectedAgent>, Vec<String>) 
             missing_required.push(dep.bin.to_string());
         }
     }
+    // シェル統合（cwd 追従・コマンド状態）の状態
+    run_shell_integration_check();
     // FDA チェック（macOS のみ。任意だが強く推奨）
     #[cfg(target_os = "macos")]
     {
@@ -468,21 +516,94 @@ fn run_dependency_check(interactive: bool) -> (Vec<DetectedAgent>, Vec<String>) 
     (agents, missing_required)
 }
 
-/// 未導入の依存をその場で brew インストールするか確認して実行する。
+/// シェル統合（OSC 7 / 133）の状態を出す。
+///
+/// 未対応の環境で黙って飛ばすと、ユーザーには「ファイルツリーが cwd を追わない」
+/// 「コマンド状態のドットが灰色のまま」が**設定ミスにしか見えない**。
+/// 対応状況の知識は `tako_core::shell_integration` が持つ（ここに cfg は書かない）
+fn run_shell_integration_check() {
+    use tako_core::shell_integration::Availability;
+
+    eprintln!();
+    match tako_core::shell_integration::availability() {
+        Availability::Supported(shells) => {
+            eprintln!("  [OK] シェル統合: 有効（{shells}）");
+            eprintln!("      ペインの cwd 追従とコマンド実行状態の検知に使います");
+        }
+        Availability::Unsupported { note, issue } => {
+            eprintln!("  [未対応] シェル統合: この環境では有効にできません");
+            eprintln!("      理由: {}", note.text());
+            eprintln!(
+                "      影響: ファイルツリーの cwd 追従と、ペインのコマンド状態ドットが働きません"
+            );
+            eprintln!(
+                "      エージェントの稼働監視・オーケストレーションは別経路なので影響しません"
+            );
+            eprintln!("      追跡: #{issue}（設定は不要です。実装され次第、自動で有効になります）");
+        }
+    }
+}
+
+/// この環境のパッケージマネージャ。macOS = Homebrew、Windows = winget。
+/// 導入案内の文面とその場インストールの両方がここから出るので、
+/// **「brew install …」を文字列で直書きしない**（Windows に Homebrew は無い）
+struct PackageManager {
+    bin: String,
+    /// 表示用のコマンド名（`brew` / `winget`）
+    name: &'static str,
+}
+
+impl PackageManager {
+    fn detect() -> Option<Self> {
+        let name = if cfg!(windows) { "winget" } else { "brew" };
+        find_command(name).map(|bin| Self { bin, name })
+    }
+
+    /// ユーザーへ提示するインストールコマンド（最簡形。`.agent/conventions.md`）
+    fn install_command(name: &str, pkg: &str) -> String {
+        if name == "winget" {
+            format!("winget install --id {pkg}")
+        } else {
+            format!("brew install {pkg}")
+        }
+    }
+
+    fn args(&self, pkg: &str) -> Vec<String> {
+        if self.name == "winget" {
+            // 対話確認とライセンス同意で止まらないようにする（非対話前提の導入）
+            [
+                "install",
+                "--id",
+                pkg,
+                "-e",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+        } else {
+            vec!["install".into(), pkg.into()]
+        }
+    }
+}
+
+/// 未導入の依存をその場でインストールするか確認して実行する。
 /// インストールが成功したら true
-fn offer_brew_install(pkg: &str, brew_bin: &str) -> bool {
-    eprint!("      今すぐ brew install {pkg} を実行しますか？ [y/N]: ");
+fn offer_package_install(pkg: &str, pm: &PackageManager) -> bool {
+    let command = PackageManager::install_command(pm.name, pkg);
+    eprint!("      今すぐ {command} を実行しますか？ [y/N]: ");
     let mut input = String::new();
     if std::io::stdin().read_line(&mut input).is_err() {
         return false;
     }
     let answer = input.trim().to_ascii_lowercase();
     if answer != "y" && answer != "yes" {
-        eprintln!("      スキップしました（後から brew install {pkg} で導入できます）");
+        eprintln!("      スキップしました（後から {command} で導入できます）");
         return false;
     }
-    let status = std::process::Command::new(brew_bin)
-        .args(["install", pkg])
+    let status = std::process::Command::new(&pm.bin)
+        .args(pm.args(pkg))
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
@@ -490,7 +611,7 @@ fn offer_brew_install(pkg: &str, brew_bin: &str) -> bool {
     match status {
         Ok(s) if s.success() => true,
         _ => {
-            eprintln!("      [警告] brew install {pkg} が失敗しました。手動で導入してください");
+            eprintln!("      [警告] {command} が失敗しました。手動で導入してください");
             false
         }
     }
@@ -503,6 +624,17 @@ fn run_sleep_guard_check(interactive: bool) {
     let mode = settings.sleep_guard_mode;
     let power = settings.sleep_guard_power;
     eprintln!();
+    // この環境で実際に効くのかをマトリクスへ問う。効かないなら設定を促さない
+    //（設定できたように見せて何も起きないのが一番たちが悪い）
+    if let Err(reason) = tako_core::platform::support::gate(
+        tako_core::platform::support::Platform::current(),
+        "tako_sleep_guard",
+    ) {
+        eprintln!("  [未対応] スリープ防止: この環境では機能しません");
+        eprintln!("      {reason}");
+        eprintln!("      長時間の作業中は OS の電源設定でスリープを無効にしてください");
+        return;
+    }
     eprintln!(
         "  スリープ防止: mode={}, power={}",
         mode.as_str(),
@@ -673,7 +805,13 @@ fn read_mcp_command_path() -> Option<String> {
         .map(String::from)
 }
 
-fn run_setup_mcp() -> Result<(), String> {
+/// MCP 自動登録。**失敗しても setup 自体は止めない**。
+///
+/// MCP は「claude から tako を操作できる」ための配線であって、config 生成や
+/// プロファイル作成とは独立している。ここで `Err` を返して setup 全体を中断すると、
+/// 登録に失敗しただけのユーザーが**設定を 1 つも受け取れない**まま終わる。
+/// 代わりに手で直せる形（実行するコマンドと書き込み先）を必ず出す
+fn run_setup_mcp() {
     let tako_bin = tako_control::dispatch::resolve_tako_binary();
     let scope = tako_control::dispatch::McpScope::User;
     match tako_control::dispatch::setup_mcp(&tako_bin, &scope) {
@@ -694,34 +832,58 @@ fn run_setup_mcp() -> Result<(), String> {
             if result.legacy_cleaned {
                 eprintln!("  [掃除] 旧 settings.json の無効な MCP 設定を除去しました");
             }
-            Ok(())
         }
-        Err(e) => Err(format!("MCP 設定の追加に失敗: {e}")),
+        Err(e) => print_mcp_manual_steps(&tako_bin, &e.to_string()),
     }
 }
 
-fn configure_agent_mcp(agent: &DetectedAgent) -> Result<(), String> {
+/// 自動登録が失敗したときの手動手順。
+/// **実際に叩けるコマンドと、その場で直せる設定ファイルの形**を出す
+fn print_mcp_manual_steps(tako_bin: &str, reason: &str) {
+    let target = home_dir()
+        .map(|h| display_home_relative(&h.join(".claude.json")))
+        .unwrap_or_else(|| "~/.claude.json".to_string());
+    eprintln!("  [警告] MCP の自動登録に失敗しました: {reason}");
+    eprintln!("         セットアップは続行します。claude から tako を操作するには");
+    eprintln!("         次のどちらかで登録してください:");
+    eprintln!();
+    eprintln!("         1) claude CLI で登録する");
+    eprintln!(
+        "            claude mcp add --scope user --transport stdio tako -- {tako_bin} mcp serve"
+    );
+    eprintln!();
+    eprintln!("         2) {target} の mcpServers に直接書く");
+    eprintln!("            \"tako\": {{");
+    eprintln!("              \"type\": \"stdio\",");
+    eprintln!(
+        "              \"command\": \"{}\",",
+        tako_bin.replace('\\', "\\\\")
+    );
+    eprintln!("              \"args\": [\"mcp\", \"serve\"]");
+    eprintln!("            }}");
+    eprintln!();
+    eprintln!("         登録後の確認: tako setup --check");
+}
+
+fn configure_agent_mcp(agent: &DetectedAgent) {
     match agent.kind {
         SetupAgent::Claude => {
             let (registered, healthy) = check_claude_mcp_health(&agent.path);
             if registered && healthy {
                 eprintln!("  [OK] Claude MCP: tako が登録済み");
-                Ok(())
             } else if registered && !healthy {
                 eprintln!("  [警告] Claude MCP: 登録パスが消失しています。修復します");
-                run_setup_mcp()
+                run_setup_mcp();
             } else {
                 eprintln!("  [設定] Claude MCP を自動登録します");
-                run_setup_mcp()
+                run_setup_mcp();
             }
         }
         SetupAgent::Codex => {
             eprintln!("  [OK] Codex MCP: tako master 起動時に一時設定を注入します");
-            Ok(())
         }
         SetupAgent::Agy => {
             eprintln!("  [情報] agy は worker 専用のため MCP 登録は不要です");
-            Ok(())
         }
     }
 }
@@ -1665,8 +1827,13 @@ pub fn run_check() -> Result<(), String> {
         Err(e) => eprintln!("  [情報] エージェント共通ルール同期: 確認失敗 ({e})"),
     }
 
-    // スリープ防止（Issue #173）
-    {
+    // スリープ防止（Issue #173）。この環境で効かないなら設定値ではなく理由を出す
+    if let Err(reason) = tako_core::platform::support::gate(
+        tako_core::platform::support::Platform::current(),
+        "tako_sleep_guard",
+    ) {
+        eprintln!("  [未対応] スリープ防止: {reason}");
+    } else {
         let settings = tako_control::settings::load();
         let mode = settings.sleep_guard_mode;
         let power = settings.sleep_guard_power;
@@ -1697,6 +1864,16 @@ pub fn run_check() -> Result<(), String> {
                     eprintln!("  [不足] 蓋閉じ防止: while-agents-running だが sudoers 未登録（tako sleep-guard install-lid-sleep で登録）");
                 }
             }
+        }
+    }
+
+    // シェル統合（cwd 追従・コマンド状態）
+    match tako_core::shell_integration::availability() {
+        tako_core::shell_integration::Availability::Supported(shells) => {
+            eprintln!("  [OK] シェル統合: 有効（{shells}）");
+        }
+        tako_core::shell_integration::Availability::Unsupported { note, issue } => {
+            eprintln!("  [未対応] シェル統合: {}（追跡: #{issue}）", note.text());
         }
     }
 
@@ -2024,7 +2201,7 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     }
 
     // 検出値・既定値だけの標準ケースは確認を挟まず適用する（Issue #262 要件 D）。
-    configure_agent_mcp(selected_agent)?;
+    configure_agent_mcp(selected_agent);
     let instruction_coverage = apply_instruction(selected, answers.instruction_content.as_deref())?;
     apply_sleep_guard_answers(answers.sleep_guard.as_ref())?;
 
@@ -2062,8 +2239,17 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     sync_pending_changes_file(&dir, &[], revision)?;
     print_setup_summary(&plan);
     eprintln!("セットアップが完了しました。");
-    eprintln!();
-    eprintln!("スマホからリモート接続するには: tako remote setup");
+    // remote が使えない環境で導線だけ出すと、叩いた瞬間に未対応で跳ね返される。
+    // 使える環境にだけ案内する（判定はマトリクスが唯一の正）
+    if tako_core::platform::support::gate(
+        tako_core::platform::support::Platform::current(),
+        "tako_remote_setup",
+    )
+    .is_ok()
+    {
+        eprintln!();
+        eprintln!("スマホからリモート接続するには: tako remote setup");
+    }
 
     // --- 対話エージェント起動（Issue #295 / #322 / #391）---
     // 既定: 検出フロー完了後に setup agent を対話起動し、設定変更・解説・次の一歩を対話で行う。
@@ -2124,15 +2310,9 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
 }
 
 fn find_backup_path(dir: &Path, filename: &str) -> PathBuf {
-    let today = {
-        let output = std::process::Command::new("date")
-            .args(["+%Y-%m-%d"])
-            .output();
-        match output {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            _ => "unknown".into(),
-        }
-    };
+    // `date` コマンドは Windows に無く、旧実装はバックアップ名が
+    // すべて `.backup-unknown` に潰れて世代が区別できなくなっていた
+    let today = now_iso8601().get(..10).unwrap_or("unknown").to_string();
     let base = dir.join(format!("{filename}.backup-{today}"));
     if !base.exists() {
         return base;
@@ -2147,25 +2327,13 @@ fn find_backup_path(dir: &Path, filename: &str) -> PathBuf {
     }
 }
 
+/// ISO 8601（UTC）のタイムスタンプ。
+///
+/// 旧実装は `date` コマンドの子プロセスだった。**Windows に `date` は無い**ので
+/// `completed_at` が丸ごと `"unknown"` になっていた（`tako setup --check` の
+/// 「完了済み (日時不明)」の正体）。既存の移植可能な実装を使い回して二重実装を作らない
 fn now_iso8601() -> String {
-    let output = std::process::Command::new("date")
-        .args(["+%Y-%m-%dT%H:%M:%S%z"])
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            // +0900 → +09:00
-            if s.len() >= 24 && !s.contains('+') {
-                s
-            } else if s.len() >= 24 {
-                let (head, tail) = s.split_at(s.len() - 2);
-                format!("{head}:{tail}")
-            } else {
-                s
-            }
-        }
-        _ => "unknown".into(),
-    }
+    tako_control::orchestrator::ledger::now_iso()
 }
 
 #[cfg(test)]
@@ -2206,26 +2374,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// 依存表は**両プラットフォームぶんを常に検証する**。
+    /// 実行中の OS 側しか見ないと、mac で開発している間に Windows の表が腐っても気付けない
     #[test]
     fn external_deps_table_is_consistent() {
-        // エージェント CLI は 3 者から別途検出するため、汎用依存表には含めない。
-        assert!(EXTERNAL_DEPS.iter().all(|dep| !SetupAgent::ALL
-            .iter()
-            .any(|agent| agent.as_str() == dep.bin)));
-        // tmux は任意依存（remote / 永続化 / オーケストレーターが対象機能）
-        let tmux = EXTERNAL_DEPS.iter().find(|d| d.bin == "tmux").unwrap();
+        for (label, table) in [("macos", MACOS_DEPS), ("windows", WINDOWS_DEPS)] {
+            // エージェント CLI は 3 者から別途検出するため、汎用依存表には含めない
+            assert!(
+                table.iter().all(|dep| !SetupAgent::ALL
+                    .iter()
+                    .any(|agent| agent.as_str() == dep.bin)),
+                "{label}: エージェント CLI が汎用依存表に混ざっている"
+            );
+            // 全依存に用途説明と導入案内がある
+            for dep in table {
+                assert!(
+                    !dep.purpose.is_empty(),
+                    "{label}/{} の purpose が空",
+                    dep.bin
+                );
+                assert!(
+                    !dep.install_hint.is_empty(),
+                    "{label}/{} の install_hint が空",
+                    dep.bin
+                );
+            }
+        }
+
+        // macOS: tmux は任意依存（remote / 永続化 / オーケストレーターが対象機能）。
+        // #282 で旧トンネル用依存を削除、#286 で tailscale を追加した結果の 3 つ
+        let tmux = MACOS_DEPS.iter().find(|d| d.bin == "tmux").unwrap();
         assert!(!tmux.required);
         assert!(tmux.purpose.contains("tako remote"));
-        assert_eq!(tmux.brew_pkg, Some("tmux"));
-        // 依存は tmux / git / tailscale の 3 つ（#282: 旧トンネル用依存は削除済み。
-        // #286: tailscale を弾 6 で追加）
-        assert_eq!(EXTERNAL_DEPS.len(), 3);
-        // 全依存に用途説明と導入案内がある
-        for dep in EXTERNAL_DEPS {
-            assert!(!dep.purpose.is_empty(), "{} の purpose が空", dep.bin);
+        assert_eq!(tmux.package, Some("tmux"));
+        assert_eq!(MACOS_DEPS.len(), 3);
+
+        // Windows: 器は tmux ではなく psmux（#519 M2）。tmux を要求してはいけない
+        assert!(
+            WINDOWS_DEPS.iter().all(|d| d.bin != "tmux"),
+            "Windows に tmux は無い（器は psmux）"
+        );
+        let psmux = WINDOWS_DEPS.iter().find(|d| d.bin == "psmux").unwrap();
+        assert!(!psmux.required, "psmux は任意（無ければ構成のみ復元）");
+        assert_eq!(psmux.package, Some("psmux.psmux"));
+        // remote が Windows 未対応の間は tailscale を要求しない
+        // （使えない機能のために依存を入れさせない）
+        let remote_usable = tako_core::platform::support::support_for(
+            tako_core::platform::support::Platform::Windows,
+            "tako_remote_setup",
+        )
+        .is_some_and(|s| s.is_usable());
+        assert_eq!(
+            WINDOWS_DEPS.iter().any(|d| d.bin == "tailscale"),
+            remote_usable,
+            "tailscale の要否は remote の対応状況と一致していること"
+        );
+    }
+
+    /// 導入案内の文面がプラットフォームで正しく切り替わること。
+    /// 「brew install …」を Windows のテスターへ出す事故（#525）の回帰止め
+    #[test]
+    fn 導入案内はプラットフォームごとのパッケージマネージャを使う() {
+        assert_eq!(
+            PackageManager::install_command("brew", "tmux"),
+            "brew install tmux"
+        );
+        assert_eq!(
+            PackageManager::install_command("winget", "psmux.psmux"),
+            "winget install --id psmux.psmux"
+        );
+        // Windows 側の案内に Homebrew が混ざっていないこと
+        for dep in WINDOWS_DEPS {
             assert!(
-                !dep.install_hint.is_empty(),
-                "{} の install_hint が空",
+                !dep.install_hint.contains("brew"),
+                "{} の install_hint が Homebrew 前提のまま",
+                dep.bin
+            );
+            let pkg = dep.package.unwrap_or_default();
+            assert!(
+                !PackageManager::install_command("winget", pkg).contains("brew"),
+                "{} の導入コマンドが Homebrew 前提のまま",
                 dep.bin
             );
         }

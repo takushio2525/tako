@@ -75,6 +75,42 @@ fn write_scripts() -> std::io::Result<Vec<(String, String)>> {
     Ok(env)
 }
 
+/// シェル統合（OSC 7 / 133）がこの環境で効くか。
+///
+/// **`tako setup` の環境チェックがここを引く**。設定できないものを黙って飛ばすと
+/// 「cwd がファイルツリーに反映されない」「コマンド状態のドットが灰色のまま」の
+/// 理由がユーザーに一切伝わらないため、状態と理由を必ず出せるようにしておく。
+///
+/// 対応シェルの知識はこのモジュールが持つ（マトリクスのキーは MCP ツール名と
+/// 1:1 なので、ツールではないシェル統合はあちらに載せられない）
+pub enum Availability {
+    /// 同梱スクリプトで有効。値は対象シェルの一覧
+    Supported(&'static str),
+    /// 未対応。理由と追跡 Issue
+    Unsupported {
+        note: crate::platform::support::Note,
+        issue: u32,
+    },
+}
+
+/// この環境でのシェル統合の状態
+pub fn availability() -> Availability {
+    imp_availability()
+}
+
+#[cfg(unix)]
+fn imp_availability() -> Availability {
+    Availability::Supported("zsh / bash / fish")
+}
+
+#[cfg(windows)]
+fn imp_availability() -> Availability {
+    Availability::Unsupported {
+        note: crate::platform::support::notes::WIN_NO_SHELL_INTEGRATION,
+        issue: 525,
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use std::path::PathBuf;

@@ -1413,3 +1413,18 @@
   （丸ごと消えていた）とペイン単位フォント拡大（グリフが 13px のままだった）も回復
 - 検証: fmt / clippy（baseline と完全一致・新規 0）/ tako-app 220 passed 0 failed +
   隔離 GUI の before/after ピクセル実測。macOS は未コンパイル・未目視（mac 側で要確認）
+
+## 2026-07-27（#525: tako setup の Windows パリティ — 検出全滅の根治）
+- 実測でマトリクスの誤りを確定: `tako_setup` = Degraded「設定の生成は動く」は嘘で、
+  Windows では **1 ステップ目で exit 1**。`find_command()` が `$SHELL -l -c "command -v"`
+  直呼びで、`$SHELL` 不在 → `/bin/sh` spawn 失敗 → claude / git が導入済みでも全滅していた
+- 抽象境界 **B16（`platform::exe`）** を新設して根治（unix は従来のログインシェル経由を維持、
+  Windows は PATH + PATHEXT + ユーザー導入先。探索の中核は純粋関数で mac からも検証可）。
+  同根の `dispatch::which` / `which_claude`（`which` 直呼び）も寄せて MCP 自動登録が成立
+- setup 側の mac 前提を一掃: 依存表を psmux / git へ分離・案内を winget 化・配布物を
+  `paths::data_dir()` へ・`date` 子プロセス廃止（`completed_at` が "unknown" だった）・
+  スリープ防止と remote 案内をマトリクスで gate・シェル統合の状態と理由を明示・
+  MCP 登録失敗で setup 全体を止めず手動手順を提示
+- 検証: 全 1416 passed（失敗 13 件は既知の POSIX 前提のみ・baseline と同一）/ clippy 19 件も
+  baseline と同一 / fmt 緑 / 実機 e2e 4 種（初回・2 回目冪等・--check・CLI 不在）
+- 残: PowerShell の OSC 7/133 統合本体は未着手（#525 に残す）。Windows のロケール検出は #604

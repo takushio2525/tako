@@ -6410,19 +6410,7 @@ fn read_mcp_registration(scope: &McpScope) -> Option<String> {
 
 /// claude CLI のパスを検出
 fn which_claude() -> Option<String> {
-    std::process::Command::new("which")
-        .arg("claude")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if p.is_empty() {
-                None
-            } else {
-                Some(p)
-            }
-        })
+    which("claude")
 }
 
 fn setup_mcp_via_cli(
@@ -6713,15 +6701,10 @@ fn home_dir() -> Option<std::path::PathBuf> {
         .filter(|p| p.is_absolute())
 }
 
+/// コマンドを探す。探索の作法は抽象境界 B16 が持つ。
+/// `which` は Windows に無いため、直呼びすると MCP 自動登録が丸ごと失敗する（#525）
 fn which(name: &str) -> Option<String> {
-    std::process::Command::new("which")
-        .arg(name)
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    tako_core::platform::exe::find(name)
 }
 
 /// 対象ペインが動画プレビューであることを確かめる（#484）

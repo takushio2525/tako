@@ -170,16 +170,23 @@ pub mod notes {
         "コマンドの実行ペインを POSIX シェル（/bin/sh）で起こす実装のため Windows では起動できない",
         "Spawns the command pane through a POSIX shell (/bin/sh), which does not exist on Windows",
     );
-    /// #525: setup 本体は動くが案内とシェル統合が macOS 前提
+    /// #525: 環境チェック・設定生成・MCP 登録・winget 案内まで通る。
+    /// setup から設定**できない**項目だけが残る（何が残るかを具体的に書く）
     pub const WIN_SETUP_PARTIAL: Note = Note::new(
-        "環境チェックと設定の生成は動く。PowerShell のシェル統合が未対応で、導入案内が Homebrew 前提のままになる",
-        "Environment checks and config generation work. PowerShell shell integration is missing and the \
-         install guidance still assumes Homebrew",
+        "環境チェック・設定の生成・MCP 登録・winget での導入案内は動く。\
+         シェル統合（PowerShell）とスリープ防止は Windows 未対応のため、状態の表示だけで設定はできない",
+        "Environment checks, config generation, MCP registration and winget install guidance all work. \
+         Shell integration (PowerShell) and sleep prevention are unavailable on Windows, so setup only \
+         reports their status instead of configuring them",
     );
-    /// #525: `claude mcp add` の起動に失敗する（claude が POSIX パスのスクリプトとして解決される）
-    pub const WIN_SETUP_MCP_SPAWN: Note = Note::new(
-        "claude CLI の起動が Windows で解決できず、MCP の自動登録が失敗する",
-        "Cannot launch the claude CLI on Windows, so registering the MCP server automatically fails",
+    /// #525: シェル統合（OSC 7 / 133）は zsh / bash / fish 用スクリプトしか同梱していない。
+    /// PowerShell 版が無いと **cwd 追従とコマンド状態の検知が効かない**ので、
+    /// 「何が起きないか」を具体的に書く（設定漏れと区別できるように）
+    pub const WIN_NO_SHELL_INTEGRATION: Note = Note::new(
+        "シェル統合（OSC 7 / 133）が zsh / bash / fish 用のみで PowerShell 版が無い。\
+         ペインの cwd 追従とコマンド実行状態の検知が働かない",
+        "Shell integration (OSC 7 / 133) ships only for zsh / bash / fish; there is no PowerShell \
+         version. Pane cwd tracking and command state detection do not work",
     );
     /// #525 と同根（claude バイナリの解決が POSIX シェル経由）。
     /// 機能そのものは残り、命名の質だけが落ちるので Pending ではなく Degraded
@@ -901,12 +908,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_setup_mcp",
         macos: Support::Supported,
-        // 実測 2026-07-27: `claude mcp add` の起動が os error 3 で失敗する
-        //（claude が POSIX パスのシェルスクリプトとして解決されるため）
-        windows: Support::Pending {
-            note: notes::WIN_SETUP_MCP_SPAWN,
-            issue: 525,
-        },
+        // #525 で解決。旧実装は claude の探索が `which`（Windows に無い）だったため
+        // 一切見つからず自動登録が丸ごと失敗していた。探索を抽象境界 B16
+        //（PATH + PATHEXT）へ寄せて解消。実測 2026-07-27: 登録・再登録とも成功
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_sleep_guard",

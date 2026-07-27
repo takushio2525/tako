@@ -23,9 +23,9 @@ tako platform --status pending # 未対応のものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | ---: | --- |
-| 対応済み | 89 | macOS 版と同じように使えます |
+| 対応済み | 90 | macOS 版と同じように使えます |
 | 一部対応 | 6 | 使えますが機能が落ちます（理由は各表に記載） |
-| 未対応 | 29 | まだ実装されていません（追跡 Issue つき） |
+| 未対応 | 28 | まだ実装されていません（追跡 Issue つき） |
 | 対象外 | 1 | Windows には概念自体が存在しません |
 | **合計** | **125** | |
 
@@ -190,9 +190,9 @@ tako を再起動したときにタブ・ペインと実行中プロセスをど
 
 | 機能 | Windows | 補足 |
 | --- | --- | --- |
-| `tako_setup` | 一部対応 | 環境チェックと設定の生成は動く。PowerShell のシェル統合が未対応で、導入案内が Homebrew 前提のままになる |
+| `tako_setup` | 一部対応 | 環境チェック・設定の生成・MCP 登録・winget での導入案内は動く。シェル統合（PowerShell）とスリープ防止は Windows 未対応のため、状態の表示だけで設定はできない |
 | `tako_setup_changes` | 対応済み | — |
-| `tako_setup_mcp` | 未対応 | claude CLI の起動が Windows で解決できず、MCP の自動登録が失敗する <br />追跡: [#525](https://github.com/takushio2525/tako/issues/525) |
+| `tako_setup_mcp` | 対応済み | — |
 | `tako_agents_sync_rules` | 対応済み | — |
 | `tako_stale_binary` | 対応済み | — |
 | `tako_tree_folder` | 対応済み | — |

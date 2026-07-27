@@ -12,7 +12,9 @@
 入っているもの（詳細は各 Issue の実測証拠コメント）:
 - 修正: Alt+meta エンコード #575 / タブバーボタンクリック #576 / IME 半行ずれ #582 /
   ショートカット 45 本 #585 / 起動時コンソール窓 #586 / 更新通知の 404 死 #528 /
-  worker 状態検知の全滅 #592
+  worker 状態検知の全滅 #592 / **setup のコマンド検出全滅 #525**（`$SHELL` 直呼びで
+  claude / git が導入済みでも exit 1 だった。抽象境界 B16 `platform::exe` で根治。
+  MCP 自動登録も同根で成立 → `tako_setup_mcp` は supported へ）
 - 機能: ウィンドウコントロール + Snap Layouts #584 / 永続化 M1+M2（**psmux 採用**、
   自作 winmux は中止）#518 #519 / Inno インストーラー + ローカルリリース #587 /
   アプリアイコン埋め込み #587 / doc の Windows 導線 + 対応状況ページ #528 #591 /
@@ -36,6 +38,10 @@
   再 attach と orphan 掃除の実測は mac でやること
 - doc の getting-started は Tabs（mac/win 切替）化 + `windows-support.md` 新設（生成は
   `scripts/gen-windows-support-docs.mjs`、support.rs 変更時に再生成）
+- **#525 で mac にも出る挙動差 3 点**（いずれも改善方向・要目視）: ①CLI 入口で表示言語を
+  解決するようにしたので、日本語設定なら全サブコマンドの縮退理由が日本語になる
+  ②`setup` の `completed_at` がローカル時刻 → UTC（`…Z`）表記へ ③MCP 自動登録の失敗が
+  setup 全体を中断しなくなった（手動手順を出して続行）
 - 夜間リリース（launchd）と Windows ローカルリリースの棲み分け: アセット名で OS 分離
   （`tako-setup-{tag}-x64.exe` / `tako-{tag}-windows-x64.zip`）。チャンネル軸とは直交
 
@@ -45,6 +51,10 @@
 - worker 検証の罠: ペイン注入の `TAKO_SOCKET`/`TAKO_TOKEN`/`TAKO_PANE_ID` を剥がさないと
   本番インスタンスへ誤接続する（今日 3 回発生）。隔離は `TAKO_ISOLATED=1` + env 剥がし + 接続先 assert
 - psmux 検証資材: `~/dev/psmux-eval/`（REPORT.md + 生ログ + 検証済みバイナリ）
+- **隔離の穴 2 つ（#525 で実測）**: ①`tako lang` 等の CLI は IPC で稼働中の本番へ届くので、
+  `HOME`/`APPDATA` を隔離しても本番 `settings.json` が変わる ②`claude.exe` は
+  `HOME`/`USERPROFILE` の上書きを無視するので `claude mcp add` 経路は隔離できない
+  （`tako setup` 自身の設定生成は APPDATA 隔離が効く）
 
 ## 現フェーズで Read すべき設計書
 
