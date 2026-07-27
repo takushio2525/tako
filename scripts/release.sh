@@ -234,10 +234,13 @@ collect_dist_asset_names() {
   for platform in $TAKO_ASSET_PLATFORMS; do
     for ext in $(tako_asset_ext_list "$platform"); do
       for f in "$DIST/${TAKO_ASSET_PREFIX}${tag}-${platform}-"*".${ext}"; do
+        # nullglob 未設定なので未マッチ時はパターン文字列がそのまま入る → 実在チェックで弾く
         [[ -f "$f" ]] && basename -- "$f"
       done
     done
   done
+  # 1 件も無いときに最後の [[ -f ]] の非 0 を漏らさない（set -e 対策）
+  return 0
 }
 
 # --- 公開済みリリースのノートを実アセットから作り直す（--update-notes）---

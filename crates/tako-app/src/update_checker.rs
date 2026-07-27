@@ -610,10 +610,7 @@ fn select_asset(
     arch: Arch,
 ) -> Option<(String, String)> {
     let assets = release["assets"].as_array()?;
-    let names: Vec<&str> = assets
-        .iter()
-        .filter_map(|a| a["name"].as_str())
-        .collect::<Vec<_>>();
+    let names: Vec<&str> = assets.iter().filter_map(|a| a["name"].as_str()).collect();
     let chosen = release_assets::select(names.iter().copied(), platform, arch)?;
 
     // 通常は GitHub が browser_download_url を返す。欠けていても命名規則から
