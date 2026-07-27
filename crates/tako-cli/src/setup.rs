@@ -407,7 +407,10 @@ const WINDOWS_DEPS: &[ExternalDep] = &[
         required: false,
         purpose: "再起動時のセッション完全復元（実行中のエージェントを画面ごと残す）。\
                   無い場合はタブ・ペイン構成と cwd だけが復元される",
-        package: Some("psmux.psmux"),
+        // winget の ID は `<発行元>.<パッケージ>`。psmux の発行元は `marlocarlo` で、
+        // 名前から推測した `psmux.psmux` は**存在しない**（実測: exit 20「パッケージが
+        // 見つかりません」）。`psmux.TerminalMap` が同じ接頭辞で実在するのが紛らわしい
+        package: Some("marlocarlo.psmux"),
         install_hint: "scoop install psmux でも導入できます",
     },
     ExternalDep {
@@ -2416,7 +2419,9 @@ mod tests {
         );
         let psmux = WINDOWS_DEPS.iter().find(|d| d.bin == "psmux").unwrap();
         assert!(!psmux.required, "psmux は任意（無ければ構成のみ復元）");
-        assert_eq!(psmux.package, Some("psmux.psmux"));
+        // winget に実在する ID（`winget search psmux` で実測。発行元 = marlocarlo、
+        // 発行元 URL = github.com/psmux）。名前から推測した `psmux.psmux` は存在しない
+        assert_eq!(psmux.package, Some("marlocarlo.psmux"));
         // remote が Windows 未対応の間は tailscale を要求しない
         // （使えない機能のために依存を入れさせない）
         let remote_usable = tako_core::platform::support::support_for(
@@ -2439,9 +2444,13 @@ mod tests {
             PackageManager::install_command("brew", "tmux"),
             "brew install tmux"
         );
+        // psmux の案内は**ユーザーが実際に見る文字列ごと**固定する。
+        // ID を間違えると winget が exit 20（パッケージが見つかりません）で必ず失敗し、
+        // テスターには「tako の案内どおりにやったのに入らない」としか見えない（#525）
+        let psmux = WINDOWS_DEPS.iter().find(|d| d.bin == "psmux").unwrap();
         assert_eq!(
-            PackageManager::install_command("winget", "psmux.psmux"),
-            "winget install --id psmux.psmux"
+            PackageManager::install_command("winget", psmux.package.unwrap()),
+            "winget install --id marlocarlo.psmux"
         );
         // Windows 側の案内に Homebrew が混ざっていないこと
         for dep in WINDOWS_DEPS {
