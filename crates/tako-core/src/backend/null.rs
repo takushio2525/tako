@@ -83,6 +83,11 @@ impl SessionBackend for NullBackend {
         None
     }
 
+    /// 器が無ければ「器の cwd」も無い（復元 cwd は layout.json 側が持つ）
+    fn session_cwd(&self, _session: &SessionRef) -> Option<String> {
+        None
+    }
+
     fn session_env(&self, _session: &SessionRef, _name: &str) -> Option<String> {
         None
     }

@@ -145,6 +145,10 @@ impl SessionBackend for TmuxBackend {
         crate::tmux_backend::pane_tty(&self.socket, session.as_str())
     }
 
+    fn session_cwd(&self, session: &SessionRef) -> Option<String> {
+        crate::tmux_backend::session_cwd(&self.socket, session.as_str())
+    }
+
     fn session_env(&self, session: &SessionRef, name: &str) -> Option<String> {
         crate::tmux_backend::session_env(&self.socket, session.as_str(), name)
     }

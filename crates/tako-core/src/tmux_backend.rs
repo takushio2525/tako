@@ -20,8 +20,11 @@ use crate::paths::data_dir;
 use crate::terminal::{SpawnCommand, SpawnOptions};
 
 /// バックエンドセッション名の接頭辞。シェル統合スクリプトが「tako のバックエンド配下か」を
-/// 判定する目印（ソケット名も同じ接頭辞）なので変更時はスクリプト側も揃えること
-pub const SESSION_PREFIX: &str = "tako-";
+/// 判定する目印（ソケット名も同じ接頭辞）なので変更時はスクリプト側も揃えること。
+///
+/// 正体は境界側の [`crate::backend::SESSION_PREFIX`]（tmux 固有の値ではない）。
+/// ここは既存の参照を壊さないための再エクスポート
+pub use crate::backend::SESSION_PREFIX;
 
 /// 専用 tmux サーバーのソケット名（`tmux -L`）。ユーザーの既定サーバーと分離する。
 /// `TAKO_TMUX_SOCKET` で差し替え可能（セルフテストの隔離に使う）

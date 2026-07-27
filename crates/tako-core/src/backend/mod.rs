@@ -41,6 +41,15 @@ mod tmux;
 pub use null::NullBackend;
 pub use tmux::TmuxBackend;
 
+/// バックエンドセッション名の接頭辞。
+///
+/// **命名ポリシーは呼び出し側の責務**（`reserve` の候補名を作るのは呼び出し側。
+/// 現行の払い出しは `tako-control::generate_token` の CSPRNG に依存しており、
+/// tako-core へ持ち込むと依存が増える）。ただし接頭辞そのものは
+/// 「tako が作った器か」の目印として器の実装側（orphan 判定・シェル統合スクリプト）も
+/// 見るため、**器の実装ではなく境界が持つ**。tmux 固有の値ではない。
+pub const SESSION_PREFIX: &str = "tako-";
+
 /// バックエンドセッションの参照。
 ///
 /// **文字列の直渡しを禁止するための newtype**。#428 は tmux の**ターゲット式**
@@ -245,6 +254,9 @@ pub trait SessionBackend: Send + Sync {
     /// 器の中のペインの制御端末。listen ポート検知（FR-2.4.2）の突き合わせに使う
     fn pane_tty(&self, session: &SessionRef) -> Option<String>;
 
+    /// 器の中の現在の作業ディレクトリ。orphan 復帰（#191）が復元ペインの cwd に使う
+    fn session_cwd(&self, session: &SessionRef) -> Option<String>;
+
     fn session_env(&self, session: &SessionRef, name: &str) -> Option<String>;
 
     fn set_session_env(&self, session: &SessionRef, name: &str, value: &str);
@@ -302,6 +314,54 @@ pub trait DetachedAccess: Send + Sync {
         cols: u32,
         rows: u32,
     ) -> Result<(), BackendError>;
+}
+
+// --- 本番 spawn 経路の配線（#519 M1） --------------------------------------
+
+/// ペインへ器を割り当てる。**本番の spawn 経路と、dispatch の事前予約が共有する 1 箇所**。
+///
+/// 問いを「tmux があるか」でも「`survives_app_exit` か」でもなく
+/// **「この backend はこのペインに器を配るか」**にしてある。器の有無は実装が
+/// [`SessionBackend::reserve`] で答えるので、案 B-1（器あり・到達なし）を足したときに
+/// ここも呼び出し側も変更が要らない（設計 §3.6 の合格条件）。
+///
+/// - `persist`: 永続設定（ユーザーが OFF にしていれば器は配らない）
+/// - `existing`: 既に割り当て済みの名前（復元・再 spawn）。**あればそれを使う**
+/// - `candidate`: 新規払い出しの候補名。`existing` があるときは呼ばない
+pub fn reserve_for_pane(
+    backend: &dyn SessionBackend,
+    persist: bool,
+    existing: Option<&str>,
+    candidate: impl FnOnce() -> String,
+) -> Option<SessionRef> {
+    if !persist {
+        return None;
+    }
+    match existing {
+        Some(name) => backend.reserve(name),
+        None => backend.reserve(&candidate()),
+    }
+}
+
+/// ペインの spawn を器の中で起動する形へ書き換える（[`reserve_for_pane`] + [`SessionBackend::wrap_spawn`]）。
+///
+/// 返り値の `Option<SessionRef>` が `None` = 器なし = 呼び出し側は
+/// そのペインを直接ペインとして扱う（`SpawnOptions` は素通し）。
+/// **PTY を所有するのは呼び出し側の `TerminalSession::spawn` のまま**である点に注意
+pub fn wrap_spawn_for_pane(
+    backend: &dyn SessionBackend,
+    persist: bool,
+    existing: Option<&str>,
+    candidate: impl FnOnce() -> String,
+    options: SpawnOptions,
+) -> (SpawnOptions, Option<SessionRef>) {
+    match reserve_for_pane(backend, persist, existing, candidate) {
+        Some(session) => {
+            let wrapped = backend.wrap_spawn(options, &session);
+            (wrapped, Some(session))
+        }
+        None => (options, None),
+    }
 }
 
 // --- 実装の選択 -----------------------------------------------------------
@@ -446,6 +506,171 @@ mod tests {
             tmux.describe()["note"].is_null(),
             "縮退していなければ note は無い"
         );
+    }
+
+    /// 案 B-1（器だけの ConPTY セッションホスト）の形をした偽 backend。
+    /// **tmux ではない器**がこの境界に嵌まることを検証するための最小実装で、
+    /// 呼ばれた `wrap_spawn` のセッション名を記録する
+    struct FakeSessionHost {
+        wrapped: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeSessionHost {
+        fn new() -> Self {
+            Self {
+                wrapped: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SessionBackend for FakeSessionHost {
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                survives_app_exit: true,
+                detached_access: false,
+                scrollback: ScrollbackAuthority::InProcess,
+                label: "session-host",
+            }
+        }
+        fn reserve(&self, candidate: &str) -> Option<SessionRef> {
+            SessionRef::new(candidate).ok()
+        }
+        fn wrap_spawn(&self, mut options: SpawnOptions, session: &SessionRef) -> SpawnOptions {
+            self.wrapped
+                .lock()
+                .unwrap()
+                .push(session.as_str().to_string());
+            // 器の中で起動する形（B-1 なら session-host クライアントの起動）へ書き換える
+            options.command = Some(crate::terminal::SpawnCommand {
+                program: "tako-session-host".into(),
+                args: vec!["--attach".into(), session.as_str().to_string()],
+            });
+            options
+        }
+        fn exists(&self, _session: &SessionRef) -> bool {
+            true
+        }
+        fn kill(&self, _session: &SessionRef) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn list(&self) -> Vec<SessionInfo> {
+            Vec::new()
+        }
+        fn foreign_holders(&self, _sessions: &[SessionRef]) -> Vec<Holder> {
+            Vec::new()
+        }
+        fn orphans(&self, _protected: &HashSet<SessionRef>) -> Vec<SessionRef> {
+            Vec::new()
+        }
+        fn cleanup_orphans(
+            &self,
+            _protected: &HashSet<SessionRef>,
+            _min_idle: Option<Duration>,
+        ) -> Vec<SessionRef> {
+            Vec::new()
+        }
+        fn pane_tty(&self, _session: &SessionRef) -> Option<String> {
+            None
+        }
+        fn session_cwd(&self, _session: &SessionRef) -> Option<String> {
+            None
+        }
+        fn session_env(&self, _session: &SessionRef, _name: &str) -> Option<String> {
+            None
+        }
+        fn set_session_env(&self, _session: &SessionRef, _name: &str, _value: &str) {}
+    }
+
+    /// **M1 の合格条件（設計 §3.6）**: 本番の spawn 経路が実装名ではなく境界を見ていること。
+    ///
+    /// tmux ではない器（B-1 形）を渡すと、その `wrap_spawn` が実際に呼ばれ、
+    /// 器の中で起動する形へ書き換えられる。**この関数を本番の `spawn_session` が呼ぶ**ので、
+    /// B-1 を足したときの呼び出し側の変更は 0 行になる
+    #[test]
+    fn spawn配線はtmux以外の器でも器の中で起動する() {
+        let host = FakeSessionHost::new();
+        let options = SpawnOptions {
+            command: None,
+            cwd: Some(std::path::PathBuf::from("/tmp/work")),
+            env: vec![("TAKO_PANE_ID".into(), "7".into())],
+        };
+        let (wrapped, session) = wrap_spawn_for_pane(
+            &host,
+            true,
+            None,
+            || "tako-0123456789ab".to_string(),
+            options.clone(),
+        );
+        let session = session.expect("器を持つ backend は器を配る");
+        assert_eq!(session.as_str(), "tako-0123456789ab");
+        let cmd = wrapped.command.expect("器の中で起動する形へ書き換わる");
+        assert_eq!(cmd.program, "tako-session-host");
+        assert_eq!(*host.wrapped.lock().unwrap(), vec!["tako-0123456789ab"]);
+        // env / cwd は素通しで in-process の PTY へ渡る（orchestrator の env 注入が縮退しない）
+        assert_eq!(wrapped.env, options.env);
+        assert_eq!(wrapped.cwd, options.cwd);
+    }
+
+    #[test]
+    fn 既存の器がある再spawnは同じセッションを使い候補名を払い出さない() {
+        // 復元・再 spawn。ここで新しい名前を払い出すと、生きている器を取り残して
+        // 別の器を作る（= 実行中プロセスの置き去り）ことになる
+        let host = FakeSessionHost::new();
+        let (_, session) = wrap_spawn_for_pane(
+            &host,
+            true,
+            Some("tako-ffffffffffff"),
+            || panic!("既存名があるのに候補名を払い出した"),
+            SpawnOptions::default(),
+        );
+        assert_eq!(session.unwrap().as_str(), "tako-ffffffffffff");
+    }
+
+    #[test]
+    fn persist_offと器なしはどちらも直接ペインになる() {
+        let opts = SpawnOptions {
+            command: Some(crate::terminal::SpawnCommand {
+                program: "/bin/zsh".into(),
+                args: vec!["-l".into()],
+            }),
+            cwd: None,
+            env: vec![],
+        };
+
+        // persist OFF: 器を持つ backend でも器は配らない（ユーザー設定が最優先）
+        let host = FakeSessionHost::new();
+        let (passthrough, session) = wrap_spawn_for_pane(
+            &host,
+            false,
+            None,
+            || "tako-0123456789ab".to_string(),
+            opts.clone(),
+        );
+        assert!(session.is_none());
+        assert_eq!(passthrough.command.unwrap().program, "/bin/zsh");
+        assert!(host.wrapped.lock().unwrap().is_empty());
+
+        // 器なし backend: persist ON でも直接ペイン（#30 の「構造のみ永続化」経路）
+        let (passthrough, session) = wrap_spawn_for_pane(
+            &NullBackend,
+            true,
+            None,
+            || "tako-0123456789ab".to_string(),
+            opts.clone(),
+        );
+        assert!(session.is_none());
+        assert_eq!(passthrough.command.unwrap().program, "/bin/zsh");
+    }
+
+    #[test]
+    fn 壊れた既存名は器として採用しない() {
+        // layout.json 由来の名前がターゲット式に化けていても（#428）、
+        // reserve が弾いて直接ペインへ倒れる（無音で別セッションを掴まない）
+        let host = FakeSessionHost::new();
+        let session = reserve_for_pane(&host, true, Some("tako-abc:0.0"), || {
+            "tako-0123456789ab".to_string()
+        });
+        assert!(session.is_none());
     }
 
     #[test]
