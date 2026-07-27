@@ -659,9 +659,12 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_autosuggest",
-            "description": "tako 内の zsh に出す入力予測（履歴ベースのゴーストテキスト）の ON/OFF を\
-                切り替える（enabled 省略時は現在状態の取得のみ）。既定 ON。設定は永続化され、\
-                稼働中のペインにも次のプロンプトから反映される。予測は右矢印キーで確定する。\
+            "description": "tako 内の zsh に出す入力予測（履歴ベースのゴーストテキスト）の ON/OFF と、\
+                確定キーの案内（ヒント）・Tab 確定を切り替える（3 つとも省略時は現在状態の取得のみ）。\
+                いずれも既定 ON。設定は永続化され、稼働中のペインにも次のプロンプトから反映される。\
+                予測は右矢印キー、または Tab（ゴースト表示中かつカーソルが行末のときだけ）で確定する。\
+                ヒントはゴーストの直後に薄く出るチュートリアルで、既定 10 回で自動的に消える\
+                （応答の hint_remaining が残り回数。hint=true で既定回数に戻せる）。\
                 同梱している zsh-autosuggestions を tako が起動したシェルにだけ読み込ませる方式なので、\
                 tako の外の zsh とユーザーの ~/.zshrc には一切影響しない。\
                 ユーザーが自前で zsh-autosuggestions を導入しているペインでは二重注入を避けて何もしない。",
@@ -669,6 +672,8 @@ pub fn tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "enabled": { "type": "boolean", "description": "true = 予測を出す（既定）、false = 出さない（省略時は状態取得）" },
+                    "hint": { "type": "boolean", "description": "確定キーのヒント表示。true = 残り回数を既定へ戻して出す、false = 恒久 OFF" },
+                    "tab": { "type": "boolean", "description": "ゴースト表示中の Tab を確定にするか。false にすると Tab は常に従来の補完" },
                 },
                 "additionalProperties": false,
             },
@@ -3327,6 +3332,8 @@ fn build_request(
         },
         "tako_autosuggest" => Request::Autosuggest {
             enabled: bool_arg(args, "enabled")?,
+            hint: bool_arg(args, "hint")?,
+            tab: bool_arg(args, "tab")?,
         },
         "tako_persist" => Request::Persist {
             enabled: bool_arg(args, "enabled")?,
@@ -4686,11 +4693,18 @@ mod tests {
         );
     }
 
-    /// #600: 入力予測の ON/OFF が MCP から 1:1 で操作できる
+    /// #600 / #614: 入力予測本体・確定ヒント・Tab 確定が MCP から 1:1 で操作できる
     #[test]
     fn autosuggestは状態取得と切替をrequestへ写す() {
         let (_, requests) = run(call("tako_autosuggest", json!({})), None, true);
-        assert_eq!(requests, vec![Request::Autosuggest { enabled: None }]);
+        assert_eq!(
+            requests,
+            vec![Request::Autosuggest {
+                enabled: None,
+                hint: None,
+                tab: None
+            }]
+        );
 
         let (_, requests) = run(
             call("tako_autosuggest", json!({ "enabled": false })),
@@ -4700,7 +4714,24 @@ mod tests {
         assert_eq!(
             requests,
             vec![Request::Autosuggest {
-                enabled: Some(false)
+                enabled: Some(false),
+                hint: None,
+                tab: None
+            }]
+        );
+
+        // #614: ヒント・Tab 確定だけを触る（本体は None のまま = 変更しない）
+        let (_, requests) = run(
+            call("tako_autosuggest", json!({ "hint": false, "tab": false })),
+            None,
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::Autosuggest {
+                enabled: None,
+                hint: Some(false),
+                tab: Some(false)
             }]
         );
     }

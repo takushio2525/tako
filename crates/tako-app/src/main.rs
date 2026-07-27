@@ -510,6 +510,30 @@ fn initial_autosuggest() -> bool {
     tako_control::settings::load().autosuggest
 }
 
+/// 確定キーのヒント表示（Issue #614）の起動時の有効判定。
+/// `TAKO_AUTOSUGGEST_HINT=0|false|off` は設定ファイルより優先して無効化する
+fn initial_autosuggest_hint() -> bool {
+    if matches!(
+        std::env::var("TAKO_AUTOSUGGEST_HINT").ok().as_deref(),
+        Some("0" | "false" | "off")
+    ) {
+        return false;
+    }
+    tako_control::settings::load().autosuggest_hint
+}
+
+/// ゴースト表示中の Tab 確定（Issue #614）の起動時の有効判定。
+/// `TAKO_AUTOSUGGEST_TAB=0|false|off` は設定ファイルより優先して無効化する
+fn initial_autosuggest_tab() -> bool {
+    if matches!(
+        std::env::var("TAKO_AUTOSUGGEST_TAB").ok().as_deref(),
+        Some("0" | "false" | "off")
+    ) {
+        return false;
+    }
+    tako_control::settings::load().autosuggest_tab
+}
+
 /// プレビューライブリロード（Issue #233）の起動時の有効判定。
 /// `TAKO_PREVIEW_RELOAD=0|false|off` は設定ファイルより優先して無効化する。
 fn initial_preview_reload() -> bool {
@@ -919,6 +943,11 @@ struct TakoApp {
     /// tako 内 zsh の入力予測の有効状態（FR-2.4.5 / Issue #600。dispatch から切替）。
     /// 実際にシェルへ伝わるのは `shell_integration` の状態ファイル経由
     autosuggest: bool,
+    /// 確定キーのヒント表示（Issue #614）。false = 恒久 OFF。
+    /// 「あと何回出すか」はシェル側が減らすので、ここは恒久 OFF の有無だけを持つ
+    autosuggest_hint: bool,
+    /// ゴースト表示中の Tab 確定（Issue #614）
+    autosuggest_tab: bool,
     /// 表示中の提案チップ（FR-2.4.3。新規 listen ポートごとに 1 件）
     port_suggestions: Vec<PortSuggestion>,
     /// 却下済みの (ペイン, ポート)。ポートが消えるまで再提案しない
@@ -2211,6 +2240,8 @@ impl TakoApp {
             auto_title_hints: HashMap::new(),
             port_detect: initial_port_detect(),
             autosuggest: initial_autosuggest(),
+            autosuggest_hint: initial_autosuggest_hint(),
+            autosuggest_tab: initial_autosuggest_tab(),
             port_suggestions: Vec::new(),
             dismissed_ports: std::collections::HashSet::new(),
             tmux_persist,
@@ -2366,6 +2397,14 @@ impl TakoApp {
         // シェル側は「不在 = ON」なので、OFF 設定のまま起動したときに必ず書き出す必要がある
         // （書き先は data_dir 配下 = 隔離起動なら隔離される）
         tako_core::shell_integration::set_autosuggest(app.autosuggest);
+        // #614: Tab 確定と、確定キーのヒント文言（表示言語に追従）。
+        // 残り回数は書かない（毎起動で書くと一生減らずチュートリアルが終わらない）。
+        // 恒久 OFF のときだけ状態ファイルへ反映する
+        tako_core::shell_integration::set_autosuggest_tab(app.autosuggest_tab);
+        if !app.autosuggest_hint {
+            tako_core::shell_integration::set_autosuggest_hint(false);
+        }
+        tako_core::shell_integration::refresh_autosuggest_hint_text();
         // #601: tako CLI の在り処を起動のたびに解決し直す。zip 展開先で起動していた人が
         // /Applications へ移した後でも、次に開くペインのシェルからは正しい実体が引ける
         tako_core::shell_integration::refresh_cli_dir();
@@ -6043,6 +6082,8 @@ impl TakoApp {
         };
         self.lang_setting = next;
         i18n::set_lang(next.resolve());
+        // #614: シェルへ渡す確定キーの案内も表示言語に追従させる
+        tako_core::shell_integration::refresh_autosuggest_hint_text();
         // セルフテスト中はユーザー設定を汚さない（dispatch 側と同方針）
         if std::env::var_os("TAKO_SELF_TEST").is_none() {
             let mut settings = tako_control::settings::load();
@@ -13393,6 +13434,42 @@ impl UiStateHost for TakoApp {
         }
     }
 
+    fn autosuggest_hint_enabled(&self) -> bool {
+        self.autosuggest_hint
+    }
+
+    fn set_autosuggest_hint(&mut self, enabled: bool) {
+        self.autosuggest_hint = enabled;
+        // ON は残り回数を既定へ戻す = もう一度チュートリアルを見せる（#614）
+        tako_core::shell_integration::set_autosuggest_hint(enabled);
+        // 永続化。セルフテスト中はユーザー設定を汚さない（set_autosuggest と同じ扱い）
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.autosuggest_hint = enabled;
+            if let Err(e) = tako_control::settings::save(&settings) {
+                eprintln!("warning: 設定を保存できない: {e}");
+            }
+        }
+    }
+
+    fn autosuggest_tab_enabled(&self) -> bool {
+        self.autosuggest_tab
+    }
+
+    fn set_autosuggest_tab(&mut self, enabled: bool) {
+        self.autosuggest_tab = enabled;
+        tako_core::shell_integration::set_autosuggest_tab(enabled);
+        // 文言は Tab 確定の有無で出し分けるので、切替のたびに書き直す
+        tako_core::shell_integration::refresh_autosuggest_hint_text();
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.autosuggest_tab = enabled;
+            if let Err(e) = tako_control::settings::save(&settings) {
+                eprintln!("warning: 設定を保存できない: {e}");
+            }
+        }
+    }
+
     fn confirm_close_enabled(&self) -> bool {
         self.confirm_close
     }
@@ -13447,6 +13524,8 @@ impl UiStateHost for TakoApp {
     ) {
         self.lang_setting = setting;
         tako_core::i18n::set_lang(resolved);
+        // #614: シェルへ渡す確定キーの案内も表示言語に追従させる（CLI / MCP 経路）
+        tako_core::shell_integration::refresh_autosuggest_hint_text();
     }
 
     fn limit_service(&self) -> tako_core::LimitService {
@@ -18925,14 +19004,23 @@ mod self_test {
                 // 予測のネタになる履歴を 1 行だけ置く
                 std::fs::write(as_home.join(".zsh_history"), "echo TAKO600-ghost-ok\n")
                     .expect("履歴を置ける");
+                // #614: Tab の非回帰を見るために補完も本物にしておく（compinit あり）
                 std::fs::write(
                     as_home.join(".zshrc"),
-                    "PROMPT='ST600> '\nHISTFILE=$HOME/.zsh_history\nHISTSIZE=100\nSAVEHIST=100\n",
+                    "PROMPT='ST600> '\nHISTFILE=$HOME/.zsh_history\nHISTSIZE=100\nSAVEHIST=100\n\
+                     autoload -Uz compinit && compinit -u -d $HOME/.zcompdump\n",
                 )
                 .expect(".zshrc を置ける");
+                // #614: 補完でしか出てこない一意なファイル名（ゴーストとは無関係）
+                std::fs::write(as_home.join("TAKO614-unique-file.txt"), "x").expect("置ける");
                 let before = window
                     .update(cx, |app, _, _| app.autosuggest)
                     .unwrap_or(true);
+                let (hint_before, tab_before) = window
+                    .update(cx, |app, _, _| (app.autosuggest_hint, app.autosuggest_tab))
+                    .unwrap_or((true, true));
+                let hint_remaining_before = tako_core::shell_integration::integration_root()
+                    .and_then(|r| tako_core::shell_integration::autosuggest_hint_state_in(&r));
 
                 // 予測 ON の状態から始める（既定 ON。dispatch 経由 = CLI / MCP と同じ経路）
                 let on = window
@@ -18941,6 +19029,8 @@ mod self_test {
                             app,
                             tako_control::protocol::Request::Autosuggest {
                                 enabled: Some(true),
+                                hint: None,
+                                tab: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -18955,6 +19045,32 @@ mod self_test {
                     tako_core::shell_integration::autosuggest_state(),
                     "ON がシェル側の状態ファイルへ書かれる",
                 );
+
+                // #614: 確定キーの案内と Tab 確定を既定（ON）へ揃え、残り回数を既定へ戻す
+                let hint_on = window
+                    .update(cx, |app, _, _| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Autosuggest {
+                                enabled: None,
+                                hint: Some(true),
+                                tab: Some(true),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .expect("autosuggest は常に成功する")
+                    })
+                    .expect("window");
+                check(
+                    hint_on["hint"] == true
+                        && hint_on["tab_accept"] == true
+                        && hint_on["hint_remaining"]
+                            == tako_core::shell_integration::AUTOSUGGEST_HINT_DEFAULT,
+                    "確定ヒント ON で残り回数が既定へ戻る（#614）",
+                );
+                // 案内の文言は tako が言語別に書く。期待値も同じ関数から取る
+                let (hint_text, hint_text_no_tab) =
+                    tako_core::shell_integration::autosuggest_hint_texts();
 
                 type_text(
                     any,
@@ -18976,6 +19092,11 @@ mod self_test {
                     focused_contains(window, cx, "ghost-ok"),
                     "履歴からゴースト予測が出る",
                 );
+                // #614: ゴーストの直後に確定キーの案内が薄く出る
+                check(
+                    focused_contains(window, cx, &hint_text),
+                    "予測の後ろに確定キーの案内が出る（#614）",
+                );
                 // 右矢印（forward-char）で全確定 → 続きを打って実行できる
                 press(any, cx, "right");
                 type_text(any, cx, " 41c", true);
@@ -18983,6 +19104,146 @@ mod self_test {
                 check(
                     focused_contains(window, cx, "TAKO600-ghost-ok 41c"),
                     "右矢印で予測が確定する",
+                );
+
+                // 41c-2. 確定キーの案内 + Tab 確定（Issue #614）。
+                //        案内は POSTDISPLAY（= 確定されるテキストの置き場）へ足しているので、
+                //        「確定した中身に案内の文字が混ざらない」ことが最重要の検査になる
+                //
+                // ① Tab で確定できる（案内の文字列はバッファへ入らない）
+                press(any, cx, "ctrl-u");
+                type_text(any, cx, "clear", true);
+                wait(cx, 800).await;
+                type_text(any, cx, "echo TAKO600-gh", false);
+                wait(cx, 1500).await;
+                check(
+                    focused_contains(window, cx, &hint_text),
+                    "案内は毎行出る（#614）",
+                );
+                press(any, cx, "tab");
+                wait(cx, 800).await;
+                press(any, cx, "enter");
+                wait(cx, 1200).await;
+                check(
+                    focused_contains(window, cx, "TAKO600-ghost-ok")
+                        && !focused_contains(window, cx, &hint_text),
+                    "Tab で予測が確定し、案内の文字列は実行内容に混ざらない（#614）",
+                );
+
+                // ② ゴーストが無いときの Tab は従来の補完のまま（非回帰）。
+                //    補完は「今いる cwd」で走るので、先に隔離 HOME へ移動しておく
+                type_text(any, cx, "cd ~", true);
+                wait(cx, 1000).await;
+                type_text(any, cx, "clear", true);
+                wait(cx, 800).await;
+                type_text(any, cx, "ls TAKO614-uniq", false);
+                wait(cx, 1200).await;
+                press(any, cx, "tab");
+                wait(cx, 2000).await;
+                check(
+                    focused_contains(window, cx, "TAKO614-unique-file.txt"),
+                    "ゴーストが無いときの Tab は従来の補完（#614 非回帰）",
+                );
+                press(any, cx, "ctrl-u");
+
+                // ③ Tab 確定 OFF なら、ゴーストが出ていても Tab は補完のまま（逃げ道）
+                let no_tab = window
+                    .update(cx, |app, _, _| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Autosuggest {
+                                enabled: None,
+                                hint: None,
+                                tab: Some(false),
+                            },
+                            PaneOrigin::Mcp,
+                        )
+                        .expect("autosuggest は常に成功する")
+                    })
+                    .expect("window");
+                check(
+                    no_tab["tab_accept"] == false
+                        && no_tab["accept_keys"] == serde_json::json!(["Right"]),
+                    "Tab 確定 OFF が dispatch で返る（#614）",
+                );
+                type_text(any, cx, "clear", true);
+                wait(cx, 800).await;
+                // ここで実行する行はそのまま履歴に載るので、後続の検査でゴーストの
+                // 種になっている `echo TAKO600-gh` とは**別の接頭辞**にしておく
+                // （完全一致が履歴の先頭に来るとゴーストが出なくなる）
+                type_text(any, cx, "echo TAKO600-g", false);
+                wait(cx, 1500).await;
+                check(
+                    focused_contains(window, cx, &hint_text_no_tab)
+                        && !focused_contains(window, cx, &hint_text),
+                    "Tab 確定 OFF では案内から Tab が消える（#614）",
+                );
+                press(any, cx, "tab");
+                wait(cx, 800).await;
+                press(any, cx, "enter");
+                wait(cx, 1200).await;
+                check(
+                    !focused_contains(window, cx, "ghost-ok"),
+                    "Tab 確定 OFF ならゴーストがあっても Tab は確定しない（#614 逃げ道）",
+                );
+                let _ = window.update(cx, |app, _, _| {
+                    tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Autosuggest {
+                            enabled: None,
+                            hint: None,
+                            tab: Some(true),
+                        },
+                        PaneOrigin::Mcp,
+                    )
+                });
+
+                // ④ 残り回数は 1 行につき 1 減り、使い切ると案内が消える（Tab 確定は残る）。
+                //    残り回数を読み直すのは precmd なので、**予測が出ない空行の Enter**を
+                //    挟んで境界を作る（コマンドを打つ行だと、その行の予測でシェル側が
+                //    自分の手持ちの値から書き戻し、ここで書いた値を上書きしてしまう）
+                press(any, cx, "enter");
+                wait(cx, 1200).await;
+                let hint_root = tako_core::shell_integration::integration_root();
+                if let Some(root) = hint_root.as_ref() {
+                    let _ =
+                        tako_core::shell_integration::write_autosuggest_hint_state_in(root, Some(1));
+                }
+                press(any, cx, "enter");
+                wait(cx, 1200).await;
+                type_text(any, cx, "echo TAKO600-gh", false);
+                wait(cx, 1500).await;
+                check(
+                    focused_contains(window, cx, &hint_text),
+                    "残り 1 回なら案内は出る（#614）",
+                );
+                if let Some(root) = hint_root.as_ref() {
+                    check(
+                        tako_core::shell_integration::autosuggest_hint_state_in(root) == Some(0),
+                        "案内を出すたびに残り回数が 1 減る（#614）",
+                    );
+                }
+                // 使い切った状態で次の行へ（空 Enter で precmd に 0 を読ませる）
+                press(any, cx, "ctrl-u");
+                press(any, cx, "enter");
+                wait(cx, 1200).await;
+                type_text(any, cx, "clear", true);
+                wait(cx, 1000).await;
+                type_text(any, cx, "echo TAKO600-gh", false);
+                wait(cx, 1500).await;
+                check(
+                    focused_contains(window, cx, "ghost-ok")
+                        && !focused_contains(window, cx, &hint_text)
+                        && !focused_contains(window, cx, &hint_text_no_tab),
+                    "残り回数を使い切ると案内が消える（#614 うるさくならない）",
+                );
+                press(any, cx, "tab");
+                wait(cx, 800).await;
+                press(any, cx, "enter");
+                wait(cx, 1200).await;
+                check(
+                    focused_contains(window, cx, "TAKO600-ghost-ok"),
+                    "案内が消えても Tab 確定は効き続ける（#614）",
                 );
 
                 // エッジ 1: IME 変換中（未確定文字列）でも予測表示が壊れないこと。
@@ -19048,6 +19309,8 @@ mod self_test {
                             app,
                             tako_control::protocol::Request::Autosuggest {
                                 enabled: Some(false),
+                                hint: None,
+                                tab: None,
                             },
                             PaneOrigin::Mcp,
                         )
@@ -19077,10 +19340,20 @@ mod self_test {
                         app,
                         tako_control::protocol::Request::Autosuggest {
                             enabled: Some(before),
+                            hint: Some(hint_before),
+                            tab: Some(tab_before),
                         },
                         PaneOrigin::Cli,
                     )
                 });
+                // #614: 残り回数は「ON へ戻す」と既定へリセットされてしまうので、
+                // 元の値を直接書き戻す（ユーザーのチュートリアル進捗を巻き戻さない）
+                if let Some(root) = tako_core::shell_integration::integration_root() {
+                    let _ = tako_core::shell_integration::write_autosuggest_hint_state_in(
+                        &root,
+                        hint_remaining_before,
+                    );
+                }
             }
 
             // 41d. tako CLI の PATH 注入（FR-2.4.6 / Issue #601）: zip 配布のように CLI が

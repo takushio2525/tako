@@ -10,6 +10,19 @@ change-type tag. Entries without a platform tag apply to every platform.
 
 ## [Unreleased]
 
+### Added
+
+- **[macOS] 入力予測の確定キーを案内し、Tab でも確定できるようにした（#614）**:
+  予測（薄いゴースト）の直後に `[→ か Tab で確定]` を薄く出す（既定 10 回で自動的に消え、
+  設定 / `tako autosuggest hint off` / MCP で恒久 OFF にもできる）。加えて
+  **予測が出ていてカーソルが行末にあるときだけ** Tab が確定になり、それ以外の Tab は
+  従来どおりの補完（補完メニューの巡回も不変）。Tab 確定は `tako autosuggest tab off` で切れる。
+  *Shows how to accept an input suggestion, right where you are looking: a faded
+  `[→ or Tab to accept]` hint after the ghost text (a tutorial that fades away after
+  10 command lines, and can be turned off permanently). Tab now also accepts — but only
+  while a suggestion is shown and the cursor is at the end of the line, so ordinary Tab
+  completion and completion-menu cycling are untouched.*
+
 ## [0.6.0] - 2026-07-27
 
 安定版ローンチ。v0.5.x のテスト版チャンネル（夜間パッチリリース）で検証してきた

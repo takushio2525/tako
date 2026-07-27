@@ -1454,20 +1454,38 @@ fn dispatch_inner(
             Ok(json!({ "enabled": host.port_detect_enabled() }))
         }
 
-        Request::Autosuggest { enabled } => {
+        Request::Autosuggest { enabled, hint, tab } => {
             if let Some(enabled) = enabled {
                 host.set_autosuggest(enabled);
             }
+            if let Some(hint) = hint {
+                host.set_autosuggest_hint(hint);
+            }
+            if let Some(tab) = tab {
+                host.set_autosuggest_tab(tab);
+            }
             let enabled = host.autosuggest_enabled();
+            let hint = host.autosuggest_hint_enabled();
+            let tab = host.autosuggest_tab_enabled();
+            // 残り回数は zsh 側がコマンドラインごとに 1 減らす。恒久 OFF と読めない環境は null
+            let hint_remaining = tako_core::shell_integration::integration_root()
+                .and_then(|r| tako_core::shell_integration::autosuggest_hint_state_in(&r));
             Ok(json!({
                 "enabled": enabled,
+                // #614: 確定キーの案内と、確定に使えるキー
+                "hint": hint,
+                "hint_remaining": hint_remaining,
+                "tab_accept": tab,
+                "accept_keys": if tab { vec!["Right", "Tab"] } else { vec!["Right"] },
                 // 何が同梱されているか / どのシェルに効くかを AI にも見せる
                 "shell": "zsh",
                 "provider": "zsh-autosuggestions",
                 "version": tako_core::shell_integration::AUTOSUGGEST_VERSION,
                 "applies_to": "既存ペインを含む tako 内の zsh（次のプロンプトから反映）",
                 "note": "ユーザーが自前で zsh-autosuggestions を導入しているペインでは \
-                    tako は注入せず、この設定も効かない（二重注入ガード）",
+                    tako は注入せず、この設定も効かない（二重注入ガード）。\
+                    Tab 確定が働くのはゴースト表示中かつカーソルが行末のときだけで、\
+                    それ以外の Tab は従来の補完のまま（tab=false にすると常に補完）",
             }))
         }
 
@@ -7936,6 +7954,9 @@ mod tests {
         welcome_banner: bool,
         /// #600: 入力予測（既定 ON）
         autosuggest: bool,
+        /// #614: 確定キーのヒント表示 / ゴースト表示中の Tab 確定（どちらも既定 ON）
+        autosuggest_hint: bool,
+        autosuggest_tab: bool,
     }
 
     impl MockHost {
@@ -7967,6 +7988,8 @@ mod tests {
                 backend_sessions: std::collections::HashMap::new(),
                 welcome_banner: false,
                 autosuggest: true,
+                autosuggest_hint: true,
+                autosuggest_tab: true,
             }
         }
 
@@ -8085,6 +8108,18 @@ mod tests {
         }
         fn set_autosuggest(&mut self, enabled: bool) {
             self.autosuggest = enabled;
+        }
+        fn autosuggest_hint_enabled(&self) -> bool {
+            self.autosuggest_hint
+        }
+        fn set_autosuggest_hint(&mut self, enabled: bool) {
+            self.autosuggest_hint = enabled;
+        }
+        fn autosuggest_tab_enabled(&self) -> bool {
+            self.autosuggest_tab
+        }
+        fn set_autosuggest_tab(&mut self, enabled: bool) {
+            self.autosuggest_tab = enabled;
         }
     }
 
@@ -9655,7 +9690,11 @@ mod tests {
         let mut host = MockHost::new();
         let initial = dispatch(
             &mut host,
-            Request::Autosuggest { enabled: None },
+            Request::Autosuggest {
+                enabled: None,
+                hint: None,
+                tab: None,
+            },
             PaneOrigin::Cli,
         )
         .unwrap();
@@ -9672,23 +9711,86 @@ mod tests {
             &mut host,
             Request::Autosuggest {
                 enabled: Some(false),
+                hint: None,
+                tab: None,
             },
             PaneOrigin::Mcp,
         )
         .unwrap();
         assert_eq!(off["enabled"], false);
         assert!(!host.autosuggest);
+        // #614: 本体だけ触ったときにヒント / Tab 確定を巻き込まない
+        assert_eq!(off["hint"], true);
+        assert_eq!(off["tab_accept"], true);
 
         let on = dispatch(
             &mut host,
             Request::Autosuggest {
                 enabled: Some(true),
+                hint: None,
+                tab: None,
             },
             PaneOrigin::Mcp,
         )
         .unwrap();
         assert_eq!(on["enabled"], true);
         assert!(host.autosuggest);
+    }
+
+    /// #614: 確定キーのヒントと Tab 確定は本体と独立に切り替えられる。
+    /// 「Tab 確定を切ったのに『Tab で確定』と案内する」矛盾も起こさない
+    #[test]
+    fn autosuggestのヒントとtab確定は独立に切り替えられる() {
+        let mut host = MockHost::new();
+        let initial = dispatch(
+            &mut host,
+            Request::Autosuggest {
+                enabled: None,
+                hint: None,
+                tab: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(initial["hint"], true, "ヒントは既定 ON");
+        assert_eq!(initial["tab_accept"], true, "Tab 確定は既定 ON");
+        assert_eq!(initial["accept_keys"], json!(["Right", "Tab"]));
+
+        // Tab 確定だけ切る（本体とヒントは維持）
+        let no_tab = dispatch(
+            &mut host,
+            Request::Autosuggest {
+                enabled: None,
+                hint: None,
+                tab: Some(false),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(no_tab["enabled"], true);
+        assert_eq!(no_tab["hint"], true);
+        assert_eq!(no_tab["tab_accept"], false);
+        assert_eq!(
+            no_tab["accept_keys"],
+            json!(["Right"]),
+            "Tab 確定 OFF なのに Tab を確定キーとして案内している"
+        );
+        assert!(!host.autosuggest_tab);
+
+        // ヒントだけ恒久 OFF（Tab 確定は触らない）
+        let no_hint = dispatch(
+            &mut host,
+            Request::Autosuggest {
+                enabled: None,
+                hint: Some(false),
+                tab: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(no_hint["hint"], false);
+        assert_eq!(no_hint["tab_accept"], false, "Tab 確定を巻き戻していない");
+        assert!(!host.autosuggest_hint);
     }
 
     #[test]

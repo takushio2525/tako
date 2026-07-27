@@ -27,6 +27,10 @@ const ZSH_AUTOSUGGESTIONS_LICENSE: &str =
 /// 同梱している zsh-autosuggestions のバージョン（更新時は PROVENANCE.md と揃える）
 pub const AUTOSUGGEST_VERSION: &str = "v0.7.1";
 
+/// 確定キーのヒントを出す既定回数（Issue #614）。**コマンドライン 1 本につき 1 回**消費する。
+/// zshenv.zsh 側の既定値（状態ファイルが無い / 壊れているときのフォールバック）と揃えること
+pub const AUTOSUGGEST_HINT_DEFAULT: u32 = 10;
+
 /// tako CLI の実行ファイル名（Windows は `tako.exe`）
 fn cli_file_name() -> String {
     format!("tako{}", std::env::consts::EXE_SUFFIX)
@@ -75,14 +79,7 @@ pub fn autosuggest_state_in(root: &Path) -> bool {
 
 /// 状態ファイルを書く（`root` は `integration_root()` 相当）
 pub fn write_autosuggest_state_in(root: &Path, enabled: bool) -> std::io::Result<()> {
-    std::fs::create_dir_all(root)?;
-    // 部分書き込みを zsh に読ませないよう tmp → rename（settings.json と同方式）。
-    // tmp 名はプロセス固有にする（プライマリ / セカンダリが同じ data_dir を共有しうるため。
-    // 同時書き込みでも「どちらかの完全な値」になり、途中の状態は読まれない）
-    let path = root.join("autosuggest");
-    let tmp = root.join(format!("autosuggest.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, if enabled { "on" } else { "off" })?;
-    std::fs::rename(&tmp, &path)
+    write_state_file(root, "autosuggest", if enabled { "on" } else { "off" })
 }
 
 /// 入力予測の ON/OFF をシェル側へ反映する。データディレクトリを解決できなければ何もしない
@@ -92,6 +89,110 @@ pub fn set_autosuggest(enabled: bool) {
     };
     if let Err(e) = write_autosuggest_state_in(&root, enabled) {
         tracing::warn!("入力予測の状態を書き出せない: {e}");
+    }
+}
+
+/// 状態ファイルを 1 行 1 値で書く（部分書き込みを読ませないよう tmp → rename）。
+/// tmp 名はプロセス固有にする（プライマリ / セカンダリが同じ data_dir を共有しうるため）
+fn write_state_file(root: &Path, name: &str, body: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(root)?;
+    let tmp = root.join(format!("{name}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, root.join(name))
+}
+
+/// 確定キーのヒントの残り回数（Issue #614）。`None` = 恒久 OFF。
+///
+/// **不在・壊れた値は既定回数**（zsh 側と同じ倒し方。予測が出ないより出る方が既定に忠実）。
+/// 残り回数は zsh 側が 1 コマンドラインごとに 1 減らして書き戻すので、
+/// この値は「あと何回チュートリアルが出るか」をそのまま表す
+pub fn autosuggest_hint_state_in(root: &Path) -> Option<u32> {
+    match std::fs::read_to_string(root.join("autosuggest-hint")) {
+        Ok(s) if s.trim() == "off" => None,
+        Ok(s) => Some(s.trim().parse().unwrap_or(AUTOSUGGEST_HINT_DEFAULT)),
+        Err(_) => Some(AUTOSUGGEST_HINT_DEFAULT),
+    }
+}
+
+/// ヒントの残り回数を書く。`None` = 恒久 OFF
+pub fn write_autosuggest_hint_state_in(root: &Path, remaining: Option<u32>) -> std::io::Result<()> {
+    let body = match remaining {
+        Some(n) => n.to_string(),
+        None => "off".to_string(),
+    };
+    write_state_file(root, "autosuggest-hint", &body)
+}
+
+/// Tab でも確定できるか（Issue #614）。**不在は ON**（既定 ON）
+pub fn autosuggest_tab_state_in(root: &Path) -> bool {
+    match std::fs::read_to_string(root.join("autosuggest-tab")) {
+        Ok(s) => s.trim() != "off",
+        Err(_) => true,
+    }
+}
+
+/// Tab 確定の ON/OFF を書く
+pub fn write_autosuggest_tab_state_in(root: &Path, enabled: bool) -> std::io::Result<()> {
+    write_state_file(root, "autosuggest-tab", if enabled { "on" } else { "off" })
+}
+
+/// シェルへ渡すヒント文言（Issue #614）。`(Tab 確定あり, Tab 確定なし)`。
+///
+/// **i18n は Rust 側に閉じる**（`tako lang` の切替が同じ経路で効く）。zsh は
+/// 状態ファイルの中身をそのまま出すだけで、文言の組み立てはしない
+pub fn autosuggest_hint_texts() -> (String, String) {
+    autosuggest_hint_texts_for(crate::i18n::lang())
+}
+
+/// `autosuggest_hint_texts` の純粋関数版。表示言語のグローバル状態を触らずにテストできる
+pub fn autosuggest_hint_texts_for(lang: crate::i18n::Lang) -> (String, String) {
+    match lang {
+        crate::i18n::Lang::Ja => ("[→ か Tab で確定]".into(), "[→ で確定]".into()),
+        crate::i18n::Lang::En => ("[→ or Tab to accept]".into(), "[→ to accept]".into()),
+    }
+}
+
+/// ヒント文言を書く（1 行目 = Tab 確定あり、2 行目 = Tab 確定なし）
+pub fn write_autosuggest_hint_text_in(
+    root: &Path,
+    texts: &(String, String),
+) -> std::io::Result<()> {
+    write_state_file(
+        root,
+        "autosuggest-hint-text",
+        &format!("{}\n{}\n", texts.0, texts.1),
+    )
+}
+
+/// ヒントの ON/OFF をシェル側へ反映する。ON は残り回数を既定値へ戻す
+/// （= もう一度チュートリアルを見せる、が素直な意味）
+pub fn set_autosuggest_hint(enabled: bool) {
+    let Some(root) = integration_root() else {
+        return;
+    };
+    let remaining = enabled.then_some(AUTOSUGGEST_HINT_DEFAULT);
+    if let Err(e) = write_autosuggest_hint_state_in(&root, remaining) {
+        tracing::warn!("入力予測ヒントの状態を書き出せない: {e}");
+    }
+}
+
+/// Tab 確定の ON/OFF をシェル側へ反映する
+pub fn set_autosuggest_tab(enabled: bool) {
+    let Some(root) = integration_root() else {
+        return;
+    };
+    if let Err(e) = write_autosuggest_tab_state_in(&root, enabled) {
+        tracing::warn!("入力予測の Tab 確定の状態を書き出せない: {e}");
+    }
+}
+
+/// 現在の表示言語でヒント文言を書き直す。起動時と `tako lang` の切替時に呼ぶ
+pub fn refresh_autosuggest_hint_text() {
+    let Some(root) = integration_root() else {
+        return;
+    };
+    if let Err(e) = write_autosuggest_hint_text_in(&root, &autosuggest_hint_texts()) {
+        tracing::warn!("入力予測ヒントの文言を書き出せない: {e}");
     }
 }
 
@@ -128,15 +229,8 @@ pub fn cli_dir_state_in(root: &Path) -> Option<PathBuf> {
 /// tako-app のプロセス環境（Dock 起動だと最小構成）で判定することになり必ず誤る。
 /// 判定はシェル側が rc を読み終えた後に行うのが唯一正しく、そのとき参照する値をここに置く
 pub fn write_cli_dir_in(root: &Path, dir: Option<&Path>) -> std::io::Result<()> {
-    std::fs::create_dir_all(root)?;
-    // 部分書き込みをシェルに読ませないよう tmp → rename（autosuggest と同方式）
-    let path = root.join("cli-dir");
-    let tmp = root.join(format!("cli-dir.{}.tmp", std::process::id()));
-    std::fs::write(
-        &tmp,
-        dir.map(|d| d.display().to_string()).unwrap_or_default(),
-    )?;
-    std::fs::rename(&tmp, &path)
+    let body = dir.map(|d| d.display().to_string()).unwrap_or_default();
+    write_state_file(root, "cli-dir", &body)
 }
 
 /// 起動時に CLI ディレクトリを解決し直してシェル側へ反映する。
@@ -171,6 +265,12 @@ fn write_scripts() -> std::io::Result<Vec<(String, String)>> {
     )?;
     // MIT の義務（著作権表示とライセンス全文の添付）を配置先でも満たす
     std::fs::write(autosuggest_dir.join("LICENSE"), ZSH_AUTOSUGGESTIONS_LICENSE)?;
+
+    // 確定キーのヒント文言（Issue #614）。残り回数と Tab 確定の状態ファイルは
+    // 「不在 = 既定」で読めるので書かない（残り回数を毎起動で書くと一生減らない）
+    if let Err(e) = write_autosuggest_hint_text_in(&root, &autosuggest_hint_texts()) {
+        tracing::warn!("入力予測ヒントの文言を書き出せない: {e}");
+    }
 
     // tako CLI の PATH 注入（Issue #601）。シェル側が最初のプロンプトで読む。
     // ここで失敗してもシェル統合（OSC 7 / 133）自体は成立させたいので致命扱いしない
@@ -271,6 +371,115 @@ mod tests {
         assert!(ZSH_ZSHENV.contains("_tako_as_state"));
         // 明示的な無効化の逃げ道
         assert!(ZSH_ZSHENV.contains("TAKO_NO_AUTOSUGGESTIONS"));
+    }
+
+    /// #614: ヒント + Tab 確定の不変条件。壊すと「確定したテキストにヒントが混入する」
+    /// 「Tab の従来動作を奪う」という実害になるので、構造をテストで固定する
+    #[test]
+    fn zshenvの確定ヒントとtab確定が不変条件を満たす() {
+        // ヒントは POSTDISPLAY へ足すので、プラグインがそれを読む前後で必ず外す /
+        // 付け直す。関門は highlight_reset（入口）と highlight_apply（出口）の 2 つだけ
+        assert!(ZSH_ZSHENV.contains("_zsh_autosuggest_highlight_reset() {"));
+        assert!(ZSH_ZSHENV.contains("_zsh_autosuggest_highlight_apply() {"));
+        assert!(ZSH_ZSHENV.contains("_tako_as_hint_strip"));
+        assert!(ZSH_ZSHENV.contains("_tako_as_hint_apply"));
+        // 包み込みは冪等（プラグインを読み直されても二重ラップしない）
+        assert!(
+            ZSH_ZSHENV.contains("!= *_tako_as_hint_strip*")
+                && ZSH_ZSHENV.contains("!= *_tako_as_hint_apply*"),
+            "ラップ済み判定が無いと再 source で無限再帰する"
+        );
+        // 出す / 出さないは**その行の最初の 1 回で決める**。残り回数を毎回見ると、
+        // 消費した瞬間（残り 0）に同じ行の再描画から案内が消える（#614 で実際に踏んだ）
+        assert!(ZSH_ZSHENV.contains("_tako_as_hint_line=show"));
+        assert!(ZSH_ZSHENV.contains("_tako_as_hint_line=hide"));
+        assert!(ZSH_ZSHENV.contains("[[ $_tako_as_hint_line == show ]] || return 0"));
+        // Tab はプラグインに包ませない（包まれると POSTDISPLAY が空で渡る）
+        assert!(ZSH_ZSHENV.contains("ZSH_AUTOSUGGEST_IGNORE_WIDGETS+=(tako-autosuggest-tab)"));
+        // ゴーストが無いときは**元のバインドへ委譲**する（補完の非回帰）
+        assert!(ZSH_ZSHENV.contains("_tako_as_tab_orig"));
+        assert!(ZSH_ZSHENV.contains(r#"builtin bindkey '^I'"#));
+        // 確定はカーソルが行末にあるときだけ（プラグイン本体の accept と同じ条件）
+        assert!(ZSH_ZSHENV.contains("CURSOR == $#BUFFER"));
+        // 明示的な無効化の逃げ道
+        assert!(ZSH_ZSHENV.contains("TAKO_NO_AUTOSUGGEST_TAB"));
+        assert!(ZSH_ZSHENV.contains("TAKO_NO_AUTOSUGGEST_HINT"));
+        // 既定回数は Rust 側の定数と揃える（片方だけ変えると挙動が食い違う）
+        assert!(
+            ZSH_ZSHENV.contains(&format!("_tako_as_hint_left={AUTOSUGGEST_HINT_DEFAULT}")),
+            "zsh 側の既定回数が AUTOSUGGEST_HINT_DEFAULT({AUTOSUGGEST_HINT_DEFAULT}) と食い違っている"
+        );
+    }
+
+    /// #614: 状態ファイルの往復。**不在は既定回数 / Tab 確定 ON**（既定 ON）
+    #[test]
+    fn 確定ヒントとtab確定の状態ファイルは往復し不在は既定() {
+        let root = std::env::temp_dir().join(format!("tako-hint-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 不在 = 既定
+        assert_eq!(
+            autosuggest_hint_state_in(&root),
+            Some(AUTOSUGGEST_HINT_DEFAULT)
+        );
+        assert!(autosuggest_tab_state_in(&root));
+
+        // 残り回数（zsh 側が減らして書き戻す値）を読める
+        write_autosuggest_hint_state_in(&root, Some(3)).expect("書ける");
+        assert_eq!(autosuggest_hint_state_in(&root), Some(3));
+        // 0 は「もう出さない」だが恒久 OFF とは区別する（hint on で戻せる）
+        write_autosuggest_hint_state_in(&root, Some(0)).expect("書ける");
+        assert_eq!(autosuggest_hint_state_in(&root), Some(0));
+        // 恒久 OFF
+        write_autosuggest_hint_state_in(&root, None).expect("書ける");
+        assert_eq!(
+            std::fs::read_to_string(root.join("autosuggest-hint")).unwrap(),
+            "off"
+        );
+        assert_eq!(autosuggest_hint_state_in(&root), None);
+        // 壊れた値は既定へ倒す（zsh 側と同じ倒し方）
+        std::fs::write(root.join("autosuggest-hint"), "garbage").unwrap();
+        assert_eq!(
+            autosuggest_hint_state_in(&root),
+            Some(AUTOSUGGEST_HINT_DEFAULT)
+        );
+
+        write_autosuggest_tab_state_in(&root, false).expect("書ける");
+        assert!(!autosuggest_tab_state_in(&root));
+        write_autosuggest_tab_state_in(&root, true).expect("書ける");
+        assert!(autosuggest_tab_state_in(&root));
+
+        // 文言は 1 行目 = Tab 確定あり、2 行目 = Tab 確定なしの 2 行
+        let texts = ("[A]".to_string(), "[B]".to_string());
+        write_autosuggest_hint_text_in(&root, &texts).expect("書ける");
+        let raw = std::fs::read_to_string(root.join("autosuggest-hint-text")).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines, vec!["[A]", "[B]"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #614: 文言は日英とも「Tab を含む版 / 含まない版」が別物であること。
+    /// Tab 確定を OFF にしたのに「Tab で確定」と案内するのは嘘になる
+    #[test]
+    fn 確定ヒントの文言は日英とtab有無で出し分ける() {
+        // `set_lang` はプロセスグローバルで並列テストと競合する（#608）ので触らない
+        let (ja_tab, ja_no_tab) = autosuggest_hint_texts_for(crate::i18n::Lang::Ja);
+        let (en_tab, en_no_tab) = autosuggest_hint_texts_for(crate::i18n::Lang::En);
+
+        for (with, without) in [(&ja_tab, &ja_no_tab), (&en_tab, &en_no_tab)] {
+            assert!(
+                with.contains("Tab"),
+                "Tab 確定ありの案内に Tab が無い: {with}"
+            );
+            assert!(
+                !without.contains("Tab"),
+                "Tab 確定なしの案内に Tab が残っている: {without}"
+            );
+            // 右矢印はどちらでも確定キー
+            assert!(with.contains('→') && without.contains('→'));
+        }
+        assert_ne!(ja_tab, en_tab, "日英で同じ文言になっている");
     }
 
     /// #601: CLI ディレクトリは**実行中バイナリの隣**から決める。

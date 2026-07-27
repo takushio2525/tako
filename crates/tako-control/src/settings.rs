@@ -20,6 +20,15 @@ pub struct Settings {
     /// zsh 以外のシェル・ユーザーが自前で導入済みの環境では設定に関わらず無害に素通しする
     #[serde(default = "default_true")]
     pub autosuggest: bool,
+    /// 入力予測の確定キーのヒント表示（Issue #614。既定 ON）。
+    /// 残り回数そのものは `<data_dir>/shell-integration/autosuggest-hint` にあり、
+    /// ここが持つのは「恒久 OFF にしたか」だけ（ON へ戻すと残り回数が既定に戻る）
+    #[serde(default = "default_true")]
+    pub autosuggest_hint: bool,
+    /// ゴースト表示中の Tab を確定にするか（Issue #614。既定 ON）。
+    /// OFF なら Tab は常に従来の補完へ委譲される
+    #[serde(default = "default_true")]
+    pub autosuggest_tab: bool,
     /// 表示中プレビューファイルのライブリロード（Issue #233。既定 ON）
     #[serde(default = "default_true")]
     pub preview_live_reload: bool,
@@ -136,6 +145,8 @@ impl Default for Settings {
             auto_rename: true,
             port_detect: true,
             autosuggest: true,
+            autosuggest_hint: true,
+            autosuggest_tab: true,
             preview_live_reload: true,
             preview_cache_max_mb: default_preview_cache_max_mb(),
             tmux_persist: true,
@@ -278,6 +289,8 @@ mod tests {
             auto_rename: false,
             port_detect: false,
             autosuggest: false,
+            autosuggest_hint: false,
+            autosuggest_tab: false,
             preview_live_reload: false,
             preview_cache_max_mb: 768,
             tmux_persist: false,
@@ -317,6 +330,9 @@ mod tests {
         assert!(parsed.port_detect);
         // #600: 入力予測は既定 ON（旧ファイル後方互換）
         assert!(parsed.autosuggest);
+        // #614: 確定キーのヒントと Tab 確定も既定 ON（#600 時代のファイルでも立つ）
+        assert!(parsed.autosuggest_hint);
+        assert!(parsed.autosuggest_tab);
         // #550: 隠しファイルは既定で非表示（未知キーの後方互換も兼ねる）
         assert!(!parsed.show_hidden_files);
         assert!(parsed.preview_live_reload);

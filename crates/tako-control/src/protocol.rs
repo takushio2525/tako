@@ -356,9 +356,19 @@ pub enum Request {
     /// `enabled` 省略時は現在状態の取得のみ。設定は永続化される
     PortDetect { enabled: Option<bool> },
     /// tako 内 zsh の入力予測（FR-2.4.5 / Issue #600）の ON/OFF。
-    /// `enabled` 省略時は現在状態の取得のみ。設定は永続化され、
+    /// 3 つとも省略時は現在状態の取得のみ。設定は永続化され、
     /// **稼働中のペインにも次のプロンプトから反映される**（状態ファイルを毎プロンプト読むため）
-    Autosuggest { enabled: Option<bool> },
+    Autosuggest {
+        /// 入力予測そのもの
+        enabled: Option<bool>,
+        /// 確定キーのヒント表示（Issue #614）。ON にすると残り回数が既定へ戻る
+        #[serde(default)]
+        hint: Option<bool>,
+        /// ゴースト表示中の Tab を確定にするか（Issue #614）。
+        /// OFF なら Tab は常に従来の補完
+        #[serde(default)]
+        tab: Option<bool>,
+    },
     /// tmux バックエンドによるセッション永続化（Phase 5.5 / FR-5）の ON/OFF。
     /// `enabled` 省略時は現在状態の取得のみ。切替は**以後生成されるペイン**に効く
     /// （既存ペインのバックエンドは変わらない）。設定は永続化される

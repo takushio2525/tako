@@ -121,6 +121,159 @@ if [[ -o interactive && -n ${TAKO_PANE_ID-} ]]; then
     typeset -g _tako_as_plugin="${_tako_zdotdir:h}/zsh-autosuggestions/zsh-autosuggestions.zsh"
     typeset -g _tako_as_state="${_tako_zdotdir:h}/autosuggest"
     typeset -g _tako_as_owner=
+
+    # 確定キーのヒント + Tab 確定（Issue #614）
+    #
+    # 予測（ゴースト）が出ていても確定キーが右矢印だと気づけない、という実機報告への対処。
+    # 1) ゴーストの直後へ `[→ か Tab で確定]` を薄く出す（チュートリアル。既定 10 回で消える）
+    # 2) **ゴーストが出ているときだけ** Tab を確定にし、それ以外は従来の補完へ委譲する
+    #
+    # ヒントは POSTDISPLAY（ゴースト本体と同じ場所）へ足す。これはプラグインが
+    # 「確定するテキスト」として読む変数でもあるので、**プラグインが POSTDISPLAY に
+    # 触る前後で必ず外す / 付け直す**必要がある。その唯一の関門が
+    # `_zsh_autosuggest_highlight_reset`（全 widget の入口）と
+    # `_zsh_autosuggest_highlight_apply`（全 widget の出口・`zle -R` の直前）なので、
+    # この 2 つだけを包む。個々の accept 系 widget を包むより漏れが無く、
+    # 非同期で予測が届く経路（`zle -F` → `autosuggest-suggest`）も同じ関門を通る
+    typeset -g _tako_as_hint_state="${_tako_zdotdir:h}/autosuggest-hint"
+    typeset -g _tako_as_hint_text_state="${_tako_zdotdir:h}/autosuggest-hint-text"
+    typeset -g _tako_as_tab_state="${_tako_zdotdir:h}/autosuggest-tab"
+    typeset -gi _tako_as_hint_left=0
+    typeset -g _tako_as_hint_body=      # 表示する文言（tako が言語別に書く）
+    typeset -g _tako_as_hint_suffix=    # 実際に付け足した文字列（除去に使う）
+    typeset -g _tako_as_hint_hl=        # region_highlight へ足したエントリ
+    typeset -g _tako_as_hint_line=      # この行で出すか（空 = 未決定 / show / hide）
+    typeset -g _tako_as_tab_on=
+    typeset -g _tako_as_tab_orig=       # 元々 ^I に割り当てられていた widget
+
+    # 付け足したヒントを取り除く。**プラグインが POSTDISPLAY を読む前に必ず通る**
+    _tako_as_hint_strip() {
+      emulate -L zsh
+      if [[ -n $_tako_as_hint_hl ]]; then
+        region_highlight=("${(@)region_highlight:#$_tako_as_hint_hl}")
+        _tako_as_hint_hl=
+      fi
+      if [[ -n $_tako_as_hint_suffix ]]; then
+        [[ $POSTDISPLAY == *"$_tako_as_hint_suffix" ]] &&
+          POSTDISPLAY=${POSTDISPLAY%"$_tako_as_hint_suffix"}
+        _tako_as_hint_suffix=
+      fi
+      return 0
+    }
+
+    # 予測が確定した直後（描画の直前）にヒントを付け足す
+    _tako_as_hint_apply() {
+      emulate -L zsh
+      (( $#POSTDISPLAY )) || { _tako_as_hint_strip; return 0 }
+      [[ -n $_tako_as_hint_suffix ]] && return 0
+      # 出すかどうかは**その行の最初の 1 回で決めて、行のあいだ変えない**。
+      # 残り回数をここで直接見ると、消費した瞬間（残り 0）に同じ行の再描画から
+      # 案内が消えてしまう。消費もこの 1 回だけ（1 打鍵ごとではない）
+      if [[ -z $_tako_as_hint_line ]]; then
+        if (( _tako_as_hint_left > 0 )) && [[ -n $_tako_as_hint_body ]]; then
+          _tako_as_hint_line=show
+          local -i n=$(( _tako_as_hint_left - 1 ))
+          (( n < 0 )) && n=0
+          _tako_as_hint_left=$n
+          print -r -- $n >| $_tako_as_hint_state 2>/dev/null
+        else
+          _tako_as_hint_line=hide
+        fi
+      fi
+      [[ $_tako_as_hint_line == show ]] || return 0
+      local suffix="  $_tako_as_hint_body"
+      # 行が溢れるくらいなら出さない（折り返してまで見せるものではない）
+      (( $#BUFFER + $#POSTDISPLAY + $#suffix + 8 <= COLUMNS )) || return 0
+      local -i start=$(( $#BUFFER + $#POSTDISPLAY ))
+      POSTDISPLAY+="$suffix"
+      _tako_as_hint_suffix="$suffix"
+      # プラグインのハイライトは付け足す前の範囲で計算済みなので、ヒントぶんは自分で塗る
+      _tako_as_hint_hl="$start $(( start + $#suffix )) $ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE"
+      region_highlight+=("$_tako_as_hint_hl")
+      return 0
+    }
+
+    # ^I（Tab）: ゴーストがあれば確定、無ければ**元のバインドへ委譲**する。
+    # 補完メニュー内の Tab は menuselect キーマップなのでここを通らない = 影響しない
+    _tako_autosuggest_tab() {
+      _tako_as_hint_strip
+      if [[ -n $_tako_as_tab_on && -z ${TAKO_NO_AUTOSUGGEST_TAB-} ]] &&
+         (( $#POSTDISPLAY )) && (( CURSOR == $#BUFFER )) && [[ $KEYMAP != vicmd ]]; then
+        zle autosuggest-accept
+        return 0
+      fi
+      if [[ -n $_tako_as_tab_orig ]] && (( ${+widgets[$_tako_as_tab_orig]} )); then
+        zle "$_tako_as_tab_orig" -- "$@"
+      else
+        zle expand-or-complete -- "$@"
+      fi
+    }
+
+    # プラグインを読み込んだ直後に一度だけ: 関門 2 つを包み、^I を差し替える
+    _tako_autosuggest_hint_install() {
+      emulate -L zsh
+      if [[ $functions[_zsh_autosuggest_highlight_reset] != *_tako_as_hint_strip* ]]; then
+        eval "_tako_as_orig_highlight_reset() { $functions[_zsh_autosuggest_highlight_reset] }"
+        _zsh_autosuggest_highlight_reset() {
+          _tako_as_hint_strip
+          _tako_as_orig_highlight_reset "$@"
+        }
+      fi
+      if [[ $functions[_zsh_autosuggest_highlight_apply] != *_tako_as_hint_apply* ]]; then
+        eval "_tako_as_orig_highlight_apply() { $functions[_zsh_autosuggest_highlight_apply] }"
+        _zsh_autosuggest_highlight_apply() {
+          _tako_as_orig_highlight_apply "$@"
+          _tako_as_hint_apply
+        }
+      fi
+      if (( ! ${+widgets[tako-autosuggest-tab]} )); then
+        # .zshrc の後なので、ユーザーが ^I を張り替えていればその widget が取れる
+        _tako_as_tab_orig="${${(z)$(builtin bindkey '^I')}[2]}"
+        [[ -z $_tako_as_tab_orig ||
+           $_tako_as_tab_orig == (undefined-key|tako-autosuggest-tab) ]] &&
+          _tako_as_tab_orig=expand-or-complete
+        zle -N tako-autosuggest-tab _tako_autosuggest_tab
+        builtin bindkey '^I' tako-autosuggest-tab
+      fi
+      return 0
+    }
+
+    # 毎プロンプト: 残り回数・文言・Tab 確定の可否を読み直す（既存ペインにも効かせる）
+    _tako_autosuggest_hint_sync() {
+      emulate -L zsh
+      _tako_as_hint_line=
+      local raw=
+      [[ -r $_tako_as_tab_state ]] && raw="$(<$_tako_as_tab_state)"
+      if [[ ${raw//[[:space:]]/} == off ]]; then
+        _tako_as_tab_on=
+      else
+        _tako_as_tab_on=1
+      fi
+
+      raw=
+      [[ -r $_tako_as_hint_state ]] && raw="$(<$_tako_as_hint_state)"
+      raw=${raw//[[:space:]]/}
+      if [[ -n ${TAKO_NO_AUTOSUGGEST_HINT-} || $raw == off ]]; then
+        _tako_as_hint_left=0
+        return 0
+      elif [[ $raw == <-> ]]; then
+        _tako_as_hint_left=$raw
+      else
+        # 不在・壊れた値は既定回数（tako 側の TAKO_AUTOSUGGEST_HINT_DEFAULT と揃える）
+        _tako_as_hint_left=10
+      fi
+
+      # 文言は tako が言語別に書く。1 行目 = Tab 確定あり、2 行目 = Tab 確定なし
+      local -a texts=()
+      [[ -r $_tako_as_hint_text_state ]] && texts=("${(@f)$(<$_tako_as_hint_text_state)}")
+      if [[ -n $_tako_as_tab_on ]]; then
+        _tako_as_hint_body=${texts[1]-}
+      else
+        _tako_as_hint_body=${texts[2]-}
+      fi
+      return 0
+    }
+
     # 後続の precmd フックが $? を見ることがあるので、必ず 0 で返す
     # （tako のフックはこの時点で既に $? を潰しているため、挙動は現状どおり）
     _tako_autosuggest_sync() {
@@ -139,15 +292,22 @@ if [[ -o interactive && -n ${TAKO_PANE_ID-} ]]; then
       fi
       if [[ $_tako_as_owner == tako ]]; then
         (( ${+_ZSH_AUTOSUGGEST_DISABLED} )) && _zsh_autosuggest_enable
+        _tako_autosuggest_hint_sync
         return 0
       fi
       [[ -r $_tako_as_plugin ]] || return 0
       builtin source "$_tako_as_plugin" || return 0
+      # 自前の Tab widget はプラグインに包ませない（包まれると POSTDISPLAY が
+      # 空にされた状態で呼ばれ、ゴーストの有無を判定できなくなる）
+      ZSH_AUTOSUGGEST_IGNORE_WIDGETS+=(tako-autosuggest-tab)
       _tako_as_owner=tako
       # プラグインが自分で登録する precmd フックは「次の」プロンプトからしか効かない
       # （zsh は precmd_functions を複製してから回すため）。最初のプロンプトから
       # 予測を出すためにここで直接呼ぶ
       _zsh_autosuggest_start
+      # 確定キーのヒント + Tab 確定（#614）。プラグインを読んだ後にしか仕掛けられない
+      _tako_autosuggest_hint_install
+      _tako_autosuggest_hint_sync
       return 0
     }
     precmd_functions+=(_tako_autosuggest_sync)
