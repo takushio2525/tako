@@ -5741,8 +5741,8 @@ mod transport {
 
     #[cfg(windows)]
     fn connect(socket: &str) -> Result<(impl Read, impl Write), TransportError> {
-        let stream = tako_control::platform::named_pipe::connect_client(socket, 3_000)
-            .map_err(|e| {
+        let stream =
+            tako_control::platform::named_pipe::connect_client(socket, 3_000).map_err(|e| {
                 TransportError::Connect(format!("tako アプリへ接続できない（{socket}: {e}）"))
             })?;
         let read_half = stream

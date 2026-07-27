@@ -880,7 +880,9 @@ mod tests {
         };
         let cmd = resume_command("abc", &solo).unwrap();
         assert!(
-            cmd.starts_with(&crate::orchestrator::agent::launch_with_role("solo", "claude")),
+            cmd.starts_with(&crate::orchestrator::agent::launch_with_role(
+                "solo", "claude"
+            )),
             "{cmd}"
         );
 
