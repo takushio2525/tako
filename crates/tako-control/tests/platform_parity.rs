@@ -300,12 +300,17 @@ fn os連携の直呼びが境界の外に残っていない() {
              汎用の昇格 API を B8 に置くと危険なため境界 B9 の内側に留める",
         ),
     ];
-    // 実際にプロセスを起こす形だけを対象にする（コメント・ドキュメント中の言及は無視）
+    // 実際にプロセスを起こす形・シェル API を直接叩く形だけを対象にする
+    // （コメント・ドキュメント中の言及は無視）
     const PATTERNS: &[&str] = &[
         "Command::new(\"open\")",
         "Command::new(\"osascript\")",
         "Command::new(\"xdg-open\")",
         "\"/C\", \"start\"",
+        // Windows 側（#617）。プロセス起動ではなく FFI なので関数名で見る
+        "Command::new(\"explorer",
+        "ShellExecuteW(",
+        "SHFileOperationW(",
     ];
 
     let root = repo_root();

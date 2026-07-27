@@ -2630,7 +2630,7 @@ impl SettingsWindow {
                     ))
                     .child(self.button(
                         "adv-reveal",
-                        txt::advanced_open_finder(),
+                        txt::advanced_reveal(),
                         BtnKind::Normal,
                         |_, _, _| {
                             if let Some(path) = settings::settings_path() {

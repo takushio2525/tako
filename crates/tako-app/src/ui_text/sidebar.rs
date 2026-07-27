@@ -8,8 +8,23 @@ pub fn menu_copy_rel() -> &'static str {
 pub fn menu_copy_abs() -> &'static str {
     tr!("絶対パスをコピー", "Copy absolute path")
 }
+/// ファイルマネージャの名前は OS ごとに違う（#617）。
+/// 「Finder で表示」を Windows で出すと、押しても何も起きないうえに何を指すか伝わらない
 pub fn menu_reveal() -> &'static str {
-    tr!("Finder で表示", "Reveal in Finder")
+    if cfg!(windows) {
+        tr!("エクスプローラーで表示", "Reveal in Explorer")
+    } else {
+        tr!("Finder で表示", "Reveal in Finder")
+    }
+}
+
+/// ディレクトリ（ペインの cwd）をファイルマネージャで開く
+pub fn menu_reveal_dir() -> &'static str {
+    if cfg!(windows) {
+        tr!("エクスプローラーで開く", "Open in Explorer")
+    } else {
+        tr!("Finder で開く", "Open in Finder")
+    }
 }
 pub fn menu_open_term() -> &'static str {
     tr!("ターミナルで開く", "Open in terminal")
@@ -29,8 +44,14 @@ pub fn menu_new_file() -> &'static str {
 pub fn menu_new_dir() -> &'static str {
     tr!("新しいフォルダ", "New folder")
 }
+/// ごみ箱の呼び名も OS ごとに違う。**この操作が復元可能であること**を
+/// ラベルで約束しているので、実装（B8 の `move_to_trash`）と表記を必ず揃える（#617）
 pub fn menu_trash() -> &'static str {
-    tr!("削除", "Move to Trash")
+    if cfg!(windows) {
+        tr!("ごみ箱に移動", "Move to Recycle Bin")
+    } else {
+        tr!("削除", "Move to Trash")
+    }
 }
 pub fn menu_remove_root() -> &'static str {
     tr!("ツリーから除去", "Remove from tree")
@@ -63,6 +84,7 @@ mod tests {
                 menu_copy_rel().to_string(),
                 menu_copy_abs().to_string(),
                 menu_reveal().to_string(),
+                menu_reveal_dir().to_string(),
                 menu_open_term().to_string(),
                 menu_open_default().to_string(),
                 menu_open_with().to_string(),

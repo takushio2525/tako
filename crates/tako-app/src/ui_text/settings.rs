@@ -696,8 +696,13 @@ pub fn advanced_reload() -> &'static str {
     tr!("再読み込み", "Reload")
 }
 
-pub fn advanced_open_finder() -> &'static str {
-    tr!("Finder で表示", "Reveal in Finder")
+/// ファイルマネージャの名前は OS ごとに違う（#617。`sidebar::menu_reveal` と同じ理由）
+pub fn advanced_reveal() -> &'static str {
+    if cfg!(windows) {
+        tr!("エクスプローラーで表示", "Reveal in Explorer")
+    } else {
+        tr!("Finder で表示", "Reveal in Finder")
+    }
 }
 
 pub fn advanced_open_editor() -> &'static str {
@@ -883,7 +888,7 @@ mod tests {
                 advanced_edit_help().into(),
                 advanced_save().into(),
                 advanced_reload().into(),
-                advanced_open_finder().into(),
+                advanced_reveal().into(),
                 advanced_open_editor().into(),
                 advanced_related_header().into(),
                 advanced_parse_error().into(),

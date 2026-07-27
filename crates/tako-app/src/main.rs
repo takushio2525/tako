@@ -14198,7 +14198,8 @@ impl TakoApp {
         let mut items: Vec<(&str, &str)> = Vec::new();
         if is_preview {
             items.push(("copy-path", "パスをコピー"));
-            items.push(("reveal", "Finder で表示"));
+            // ファイルマネージャ名は OS で変わるのでカタログから引く（#617）
+            items.push(("reveal", crate::ui_text::sidebar::menu_reveal()));
             items.push(("open-default", "デフォルトアプリで開く"));
             items.push(("sep1", ""));
         } else {
@@ -14210,7 +14211,7 @@ impl TakoApp {
             items.push(("sep0", ""));
             if cwd.is_some() {
                 items.push(("copy-cwd", "cwd をコピー"));
-                items.push(("reveal-cwd", "Finder で開く"));
+                items.push(("reveal-cwd", crate::ui_text::sidebar::menu_reveal_dir()));
                 items.push(("sep1", ""));
             }
         }
@@ -14367,7 +14368,7 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// メニュー位置���計算（純粋関数・テスト��能）。
+/// メニュー位置の計算（純粋関数・テスト可能）。
 /// 見切れる場合はフリップ（メニュー幅/高さ分の引き戻し）、0 未満にはさせない。
 fn compute_menu_position(
     x: f32,
