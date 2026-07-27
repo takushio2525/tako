@@ -1341,3 +1341,12 @@
 - 関連コミット: `984de32`（境界）`7d4be2b`（本番配線）`9a995b4`（M0 PoC）。**push 禁止の
   Windows 検証機のためローカルブランチ `windows/467-ipc-orchestration-local` に積むのみ**
 - 次: M2（session-host 本体）。触るのは `backend/` の中だけでよい状態になっている
+
+## 2026-07-27（#587: Windows インストーラー（Inno Setup）+ リリースワークフロー）
+- per-user インストーラー（PATH 追加・重複防止・アンインストールで復元）+ .ico 生成 +
+  ポータブル zip + `windows-release.yml` を新設。実機で install → `tako --version` →
+  GUI 起動 → 再インストール → uninstall → PATH 完全復元まで通し実測
+- MSVC CRT を静的リンク（`.cargo/config.toml`）。VCRUNTIME140* の import が消えることと、
+  静的/動的で全テスト結果が同一（既知の POSIX 前提 19 件のみ、#583 相当）であることを A/B 実測
+- 関連コミット: `9a8dbef`（CRT 静的）`9059402`（インストーラー）。**push は master 側**。
+  ワークフローは未実行、`tako-app.exe` へのアイコン埋め込みは別タスク
