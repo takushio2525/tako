@@ -574,6 +574,14 @@ impl TerminalSession {
         self.term.lock().mode().contains(TermMode::ALT_SCREEN)
     }
 
+    /// アプリが bracketed paste（`CSI ? 2004 h`）を要求しているか。
+    ///
+    /// これが偽のまま複数行を貼ると、`paste_payload` の改行正規化で 1 行ごとに CR が
+    /// 入り、TUI 側では「行数ぶんの送信」になる（#623）。送達経路の診断で要る
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
     /// kitty keyboard protocol の disambiguate フラグ（TUI が `CSI > 1 u` で有効化）。
     /// 有効時、UI 層は Esc / 修飾付き Enter 等を CSI u 形式で送る（Shift+Enter の区別）
     pub fn disambiguate_keys(&self) -> bool {

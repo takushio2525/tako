@@ -732,6 +732,17 @@ fn dispatch_inner(
                     let session = host
                         .session(target)
                         .ok_or(DispatchError::NoSession(target.as_u64()))?;
+                    // #623: どちらの送達経路へ落ちたかを残す。alt screen なら貼り付け +
+                    // 分離 Enter（PromptFlow）、そうでなければ改行を CR へ正規化した
+                    // 即時書き込み（= 複数行が「行数ぶんの送信」に化ける）
+                    crate::diag::flow_log(&format!(
+                        "Send: pane={} alt_screen={} newline={} 行数={} バイト={}",
+                        target.as_u64(),
+                        session.is_alt_screen(),
+                        newline,
+                        text.lines().count(),
+                        text.len()
+                    ));
                     if session.is_alt_screen() {
                         // Enter 単独送信（text が空 / 改行のみ）は送達確認つき Enter フローへ
                         // （Issue #95: 素の CR 1 発は claude TUI に取りこぼされることがあり、

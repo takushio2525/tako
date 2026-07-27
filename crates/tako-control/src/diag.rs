@@ -56,6 +56,26 @@ pub fn persist_log(msg: &str) {
     append_log(persist_log_path(), msg);
 }
 
+/// 送達経路の分岐を記録する（`TAKO_FLOW_DIAG=1` のときだけ。#623）。
+///
+/// alt screen かどうかで送信の意味論が丸ごと変わる（貼り付け + 分離 Enter か、
+/// 改行を CR へ正規化した即時書き込みか）。どちらへ落ちたかを残さないと
+/// 「長文が途中で切れた」がどちらの経路の話か切り分けられない。
+///
+/// **送信テキストは出さない**（AGENTS.md の絶対ルール）。出すのは経路と長さだけ
+pub fn flow_log(msg: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_FLOW_DIAG").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    });
+    if on {
+        perf_log(msg);
+    }
+}
+
 /// UI ストール・dispatch 遅延など性能異常の記録（Issue #113: 多ペイン時の無応答の
 /// 犯人特定用）。**しきい値超えのときだけ**呼ぶこと（正常時は何も書かない = 高頻度
 /// 呼び出し禁止は persist_log と同じ方針）。セルフテスト中はユーザーのログを汚さない
