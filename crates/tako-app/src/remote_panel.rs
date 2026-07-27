@@ -236,7 +236,7 @@ impl TakoApp {
     /// `spawn_daemon` は子プロセスの起動情報を最長 30 秒待つので、UI スレッドでは絶対に
     /// 呼ばない（NFR-8）。押した直後に `starting` を立てて二重起動を防ぎ、失敗時は
     /// daemon が返した理由（Tailscale の不足項目列挙など）をそのままパネルへ出す
-    fn remote_start(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn remote_do_start(&mut self, cx: &mut Context<Self>) {
         if self.remote.starting {
             return;
         }
@@ -366,7 +366,7 @@ impl TakoApp {
     }
 
     /// kill switch: 全遮断（`tako remote stop` 相当）。daemon を止めれば全端末が切断される
-    fn remote_kill_switch(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn remote_kill_switch(&mut self, cx: &mut Context<Self>) {
         self.remote.panel_open = false;
         cx.spawn(async move |this, cx| {
             let _ = cx
@@ -728,7 +728,7 @@ impl TakoApp {
                             .bg(rgba_alpha(theme.accent, 0.3))
                             .text_color(hsla(theme.accent))
                             .hover(|d| d.bg(rgba_alpha(theme.accent, 0.5)))
-                            .on_click(cx.listener(|this, _, _, cx| this.remote_start(cx)))
+                            .on_click(cx.listener(|this, _, _, cx| this.remote_do_start(cx)))
                     })
                     .child(
                         svg()
