@@ -8,7 +8,8 @@
 //! 前提: `claude` CLI がログイン済み / `tmux` がある / ネットワーク接続。
 //!
 //! 注意:
-//! - 実ユーザーの `~/.claude.json` に一時ディレクトリの projects エントリを追加する
+//! - 実ユーザーの `.claude.json`（`claude_tui::config_json_paths`。既定は
+//!   `~/.claude/.claude.json`）に一時ディレクトリの projects エントリを追加する
 //!   （テスト終了時に best-effort で除去する）
 //! - Claude Code の信頼は**祖先ディレクトリの信頼済みエントリにも及ぶ**（実測）。
 //!   `std::env::temp_dir()`（`$TMPDIR` = `/var/folders/...`）はルートが信頼済みに
@@ -53,24 +54,24 @@ impl Drop for SessionGuard {
     }
 }
 
-/// ~/.claude.json からテスト用ディレクトリの projects エントリを除去する（best-effort）
+/// claude の `.claude.json` からテスト用ディレクトリの projects エントリを除去する
+/// （best-effort）。書き先は `claude_tui::config_json_paths` と同じ解決規則で引く
+/// （#558: claude は config dir 配下を読む。ホーム直下だけ消しても残骸が溜まっていた）
 fn remove_trust_entry(dir: &Path) {
-    let Some(home) = std::env::var_os("HOME") else {
-        return;
-    };
-    let path = PathBuf::from(home).join(".claude.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return;
-    };
-    let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return;
-    };
-    let Some(projects) = root.get_mut("projects").and_then(|p| p.as_object_mut()) else {
-        return;
-    };
-    if projects.remove(&dir.display().to_string()).is_some() {
-        if let Ok(serialized) = serde_json::to_string_pretty(&root) {
-            let _ = std::fs::write(&path, serialized);
+    for path in claude_tui::config_json_paths(None) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(projects) = root.get_mut("projects").and_then(|p| p.as_object_mut()) else {
+            continue;
+        };
+        if projects.remove(&dir.display().to_string()).is_some() {
+            if let Ok(serialized) = serde_json::to_string_pretty(&root) {
+                let _ = std::fs::write(&path, serialized);
+            }
         }
     }
 }

@@ -248,8 +248,12 @@ mod tests {
         // 修飾なしの v は本文入力
         assert!(!is_paste_keystroke(&ks_char("v", "v")));
         // 別のコマンド combo
-        assert!(!is_paste_keystroke(&Keystroke::parse("cmd-c").expect("cmd-c")));
-        assert!(!is_paste_keystroke(&Keystroke::parse("cmd-k").expect("cmd-k")));
+        assert!(!is_paste_keystroke(
+            &Keystroke::parse("cmd-c").expect("cmd-c")
+        ));
+        assert!(!is_paste_keystroke(
+            &Keystroke::parse("cmd-k").expect("cmd-k")
+        ));
         // 追加修飾つきは別バインドの可能性があるので拾わない
         assert!(!is_paste_keystroke(
             &Keystroke::parse("cmd-alt-v").expect("cmd-alt-v")

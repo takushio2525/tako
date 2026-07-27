@@ -262,6 +262,24 @@ impl EnvPlan {
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
     }
+
+    /// この計画で起動する claude が使う config ディレクトリ（Issue #558）。
+    /// 事前信頼・bypass 事前承認の書き込み先を決めるのに使う
+    /// （claude は config dir 配下の `.claude.json` を読むため、
+    /// アカウントごとに書き先が変わる）。
+    ///
+    /// - `CLAUDE_CONFIG_DIR` を export する計画 → そのパス
+    /// - 明示 unset する計画（inherit。#512）→ claude の既定 `~/.claude`
+    /// - どちらも無い → None（呼び出し側の環境変数 → 既定 の順に委ねる）
+    pub fn claude_config_dir(&self) -> Option<String> {
+        if let Some(v) = self.export_value(CLAUDE_CONFIG_DIR_ENV) {
+            return Some(v.to_string());
+        }
+        if self.unsets.iter().any(|k| k == CLAUDE_CONFIG_DIR_ENV) {
+            return claude_default_config_dir().map(|p| p.display().to_string());
+        }
+        None
+    }
 }
 
 /// 解決済みアカウント情報（expand_tilde 適用後）
@@ -3460,6 +3478,45 @@ worker_agents:
         assert!(plan.export_value("CLAUDE_CONFIG_DIR").is_none());
         assert_eq!(plan.export_value("OTHER_VAR"), Some("keep"));
         assert_eq!(plan.unsets, vec!["CLAUDE_CONFIG_DIR".to_string()]);
+    }
+
+    /// #558: 事前信頼の書き先を決めるため、計画から claude の config dir を引ける
+    #[test]
+    fn env_planからclaude_config_dirを引ける() {
+        let p = Profile::default();
+
+        // 明示パスのアカウント → そのパス（そこの .claude.json に信頼を書く）
+        let path_acct = ResolvedAccount {
+            name: "univ".into(),
+            config_dir: AccountConfigDir::Path("/home/u/.claude-univ".into()),
+            description: None,
+            default_model: None,
+            default_effort: None,
+        };
+        let plan = p.resolved_env_plan_with_account(Some(&path_acct));
+        assert_eq!(
+            plan.claude_config_dir().as_deref(),
+            Some("/home/u/.claude-univ")
+        );
+
+        // inherit（unset）→ claude の既定 config dir。呼び出し側の環境変数に
+        // 引きずられず「起動先が実際に読む場所」を返すのが要点
+        let inherit_acct = ResolvedAccount {
+            name: "personal".into(),
+            config_dir: AccountConfigDir::Inherit,
+            description: None,
+            default_model: None,
+            default_effort: None,
+        };
+        let plan = p.resolved_env_plan_with_account(Some(&inherit_acct));
+        assert_eq!(
+            plan.claude_config_dir(),
+            claude_default_config_dir().map(|p| p.display().to_string())
+        );
+
+        // アカウント指定なし → None（呼び出し側の環境 → 既定 の順に委ねる）
+        let plan = p.resolved_env_plan_with_account(None);
+        assert_eq!(plan.claude_config_dir(), None);
     }
 
     /// #512: config_dir / inherit の排他と欠落を resolve が弾く
