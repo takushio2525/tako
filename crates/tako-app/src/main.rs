@@ -2366,6 +2366,9 @@ impl TakoApp {
         // シェル側は「不在 = ON」なので、OFF 設定のまま起動したときに必ず書き出す必要がある
         // （書き先は data_dir 配下 = 隔離起動なら隔離される）
         tako_core::shell_integration::set_autosuggest(app.autosuggest);
+        // #601: tako CLI の在り処を起動のたびに解決し直す。zip 展開先で起動していた人が
+        // /Applications へ移した後でも、次に開くペインのシェルからは正しい実体が引ける
+        tako_core::shell_integration::refresh_cli_dir();
         // App Nap 無効化 + 初回スリープ防止更新（Issue #173）
         tako_control::sleep_guard::disable_app_nap();
         // 蓋閉じ防止の残留チェック（#218: 前回クラッシュ時の disablesleep=1 を自動復帰）
@@ -19077,6 +19080,128 @@ mod self_test {
                         PaneOrigin::Cli,
                     )
                 });
+            }
+
+            // 41d. tako CLI の PATH 注入（FR-2.4.6 / Issue #601）: zip 配布のように CLI が
+            //      .app の中にしか無い環境でも、tako が開いたシェルからは `tako` が打てる。
+            //      逆にユーザーが自分で PATH を通していれば、その実体の解決順を変えない。
+            //      41c と同じく隔離 HOME の zsh を子として起こし、本番と同じ ZDOTDIR /
+            //      .zshenv / 状態ファイルを実際に通す
+            let zdotdir601 = tako_core::shell_integration::env()
+                .iter()
+                .find(|(k, _)| k == "ZDOTDIR")
+                .map(|(_, v)| v.clone());
+            if let (Some(zdotdir), Some(root), true) = (
+                zdotdir601,
+                tako_core::shell_integration::integration_root(),
+                std::path::Path::new("/bin/zsh").is_file(),
+            ) {
+                // 状態ファイルは起動時に書かれるが、dev ビルドの CLI は項目 14 で初めて
+                // 揃うことがある。ここで解決し直す = 起動時と同じ経路を通す
+                tako_core::shell_integration::refresh_cli_dir();
+                let cli_dir = cli_path.parent().map(|d| d.to_path_buf());
+                check(
+                    tako_core::shell_integration::cli_dir_state_in(&root) == cli_dir,
+                    "CLI ディレクトリが実行中バイナリの隣へ解決される（dev ビルド）",
+                );
+                let cli_dir = cli_dir.expect("CLI の親ディレクトリ");
+
+                let iso = std::env::temp_dir().join(format!("tako-st601-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&iso);
+                std::fs::create_dir_all(iso.join("bin")).expect("隔離 HOME を作れる");
+                let zshrc = iso.join(".zshrc");
+                std::fs::write(&zshrc, "PROMPT='ST601> '\n").expect(".zshrc を置ける");
+                // ユーザーが自分で PATH に置いた tako（別実体）を模す
+                let user_cli = iso.join("bin/tako");
+                std::fs::write(&user_cli, "#!/bin/sh\necho TAKO601-user\n").expect("置ける");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(&user_cli, std::fs::Permissions::from_mode(0o755))
+                        .expect("実行権を付けられる");
+                }
+                let rc_before = std::fs::read(&zshrc).expect("読める");
+
+                // A. PATH に tako が無い（zip 配布相当）→ 同梱 CLI が引ける
+                type_text(
+                    any,
+                    cx,
+                    &format!(
+                        "PATH=/usr/bin:/bin HOME={} ZDOTDIR={zdotdir} /bin/zsh",
+                        iso.display()
+                    ),
+                    true,
+                );
+                wait(cx, 2500).await;
+                check(
+                    focused_contains(window, cx, "ST601>"),
+                    "検証用 zsh が起動する（PATH 注入）",
+                );
+                type_text(any, cx, "clear", true);
+                wait(cx, 800).await;
+                type_text(any, cx, "tako --version | sed 's/^/TAKO601-A=/'", true);
+                wait(cx, 1500).await;
+                check(
+                    focused_contains(window, cx, "TAKO601-A=tako "),
+                    "PATH に tako が無くても tako 内シェルから実行できる",
+                );
+                type_text(any, cx, "command -v tako", true);
+                wait(cx, 1000).await;
+                check(
+                    focused_contains(window, cx, &format!("{}/tako", cli_dir.display())),
+                    "解決されるのは実行中バイナリの隣の CLI",
+                );
+                type_text(any, cx, "exit", true);
+                wait(cx, 1000).await;
+
+                // B. ユーザーが自分で通した tako がある → 解決順を変えず二重追加もしない
+                type_text(
+                    any,
+                    cx,
+                    &format!(
+                        "PATH={}/bin:/usr/bin:/bin HOME={} ZDOTDIR={zdotdir} /bin/zsh",
+                        iso.display(),
+                        iso.display()
+                    ),
+                    true,
+                );
+                wait(cx, 2500).await;
+                type_text(any, cx, "clear", true);
+                wait(cx, 800).await;
+                type_text(any, cx, "tako", true);
+                wait(cx, 1200).await;
+                check(
+                    focused_contains(window, cx, "TAKO601-user"),
+                    "既存の tako の解決順を変えない",
+                );
+                type_text(
+                    any,
+                    cx,
+                    &format!(
+                        "echo TAKO601-B=$(print -l $path | grep -cxF '{}')",
+                        cli_dir.display()
+                    ),
+                    true,
+                );
+                wait(cx, 1200).await;
+                check(
+                    focused_contains(window, cx, "TAKO601-B=0"),
+                    "既存の tako があるときは PATH へ足さない",
+                );
+                type_text(any, cx, "exit", true);
+                wait(cx, 1000).await;
+
+                // C. rc ファイルは書き換えない（注入はプロセス内の PATH だけ）
+                check(
+                    std::fs::read(&zshrc).ok().as_deref() == Some(rc_before.as_slice()),
+                    "シェルの rc ファイルを書き換えない",
+                );
+                let _ = std::fs::remove_dir_all(&iso);
+                // check は失敗時に即 exit するので、この行が出たら 41d は全判定を通っている
+                // （黙って素通りした場合と区別できるようにする）
+                println!("TAKO_SELF_TEST_601: cli_dir={}", cli_dir.display());
+            } else {
+                println!("TAKO_SELF_TEST_SKIPPED: 41d（zsh か統合ディレクトリが無い）");
             }
 
             // 42. 接続情報の永続化と発見（FR-2.2.9）: 環境変数なしでもファイル発見で

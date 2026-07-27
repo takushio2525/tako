@@ -21,6 +21,39 @@ if [[ -f "${ZDOTDIR:-$HOME}/.zshenv" ]]; then
   builtin source "${ZDOTDIR:-$HOME}/.zshenv"
 fi
 
+# tako CLI の PATH 注入（Issue #601）
+#
+# zip 配布では CLI が tako.app の中（Contents/MacOS/tako）にしか無く、外からは見えない。
+# tako が開いたシェルの中だけで PATH に足して「tako の中では常に `tako` が打てる」ようにする。
+# ~/.zshrc は書き換えないので tako の外の zsh は不変（この .zshenv は ZDOTDIR を直後に
+# 戻すので、ペイン内で起動する孫 zsh も読み込まない = ここが走るのは各ペインの先頭シェルだけ）。
+#
+# 足すのは **PATH の末尾**、しかも `tako` が他に見つからないときだけ。ユーザーが自分で
+# 通した実体（Homebrew の /opt/homebrew/bin/tako 等）の解決順は変えない。
+# 逃げ道は TAKO_NO_PATH_INJECTION=1
+_tako_add_cli_path() {
+  [[ -n ${TAKO_NO_PATH_INJECTION-} || -z $_tako_zdotdir ]] && return 0
+  local dir=
+  # $(<file) は zsh では fork しない。tako が起動時に書く（不在・空 = 注入しない）
+  [[ -r ${_tako_zdotdir:h}/cli-dir ]] && dir="$(<${_tako_zdotdir:h}/cli-dir)"
+  [[ -n $dir && -x $dir/tako ]] || return 0
+  # 既に入っている（親シェルからの継承を含む）なら二重に足さない。(Ie) は完全一致検索
+  (( ${path[(Ie)$dir]} )) && return 0
+  # ユーザーが自分で PATH を通しているなら手を出さない（解決順を変えない）
+  (( ${+commands[tako]} )) && return 0
+  # zsh の `path` は PATH と連動した配列。末尾へ足す
+  path+=("$dir")
+  return 0
+}
+
+# 非対話シェル（`$SHELL -l -c <コマンド>` = コマンドペイン・エージェントペイン）は
+# フックが回らないのでここで足す。対話シェルは ~/.zshrc を読み終えた後（precmd）に回す
+# —— .zshrc や .zprofile で PATH を組み立てるユーザーは多く、この時点の PATH で
+# 「tako が既にあるか」を判定すると必ず誤るため
+if [[ ! -o interactive && -n ${TAKO_PANE_ID-} ]]; then
+  _tako_add_cli_path
+fi
+
 if [[ -o interactive && -n ${TAKO_PANE_ID-} ]]; then
   # tako の tmux バックエンド（Phase 5.5 / FR-5。ソケット名 tako*）配下なら:
   # 1) OSC をパススルー（DCS tmux; … ST。allow-passthrough）で包み、外の tako へ届かせる
@@ -64,6 +97,16 @@ if [[ -o interactive && -n ${TAKO_PANE_ID-} ]]; then
   precmd_functions+=(_tako_precmd)
   preexec_functions+=(_tako_mark_exec)
   chpwd_functions+=(_tako_report_cwd)
+
+  # tako CLI の PATH 注入（Issue #601）。最初のプロンプト直前 = ユーザーの .zshrc の
+  # 後に一度だけ実行する。一度足せば PATH はこのシェルに残るのでフックから自分を外す
+  # （zsh は precmd_functions を複製してから回すので、実行中の書き換えは安全）
+  _tako_path_sync() {
+    _tako_add_cli_path
+    precmd_functions=(${precmd_functions:#_tako_path_sync})
+    return 0
+  }
+  precmd_functions+=(_tako_path_sync)
 
   # 入力予測（zsh-autosuggestions 同梱。Issue #600）
   #
