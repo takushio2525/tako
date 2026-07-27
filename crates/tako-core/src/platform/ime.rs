@@ -293,6 +293,112 @@ mod exclude_imp {
     }
 }
 
+/// IME（入力コンテキスト）がこのウィンドウへ結合されているか。
+///
+/// `None` = この OS では概念が無い（macOS）か、ハンドルが無い。
+/// `Some(false)` は **IME が切り離されていて日本語入力が一切できない**状態を意味する。
+///
+/// ## なぜ要るか（#623）
+///
+/// GPUI Windows は**フレーム描画のたび**に `update_ime_enabled()` を呼び、
+/// 「入力ハンドラがスロットに無い」だけで `ImmAssociateContextEx(hwnd, NULL, 0)` して
+/// IME を切り離す（`gpui_windows/src/events.rs`。直前に `CPS_COMPLETE` = 未確定文字列の
+/// 強制確定も飛ばす）。切り離しは次にハンドラが戻るまで解除されないので、
+/// その間の打鍵は落ちる。[`reassociate`] と組で「切り離されたら戻す」保険にする
+pub fn is_associated(window_handle: Option<isize>) -> Option<bool> {
+    let handle = window_handle?;
+    assoc_imp::is_associated(handle)
+}
+
+/// IME を既定の入力コンテキストへ結合し直す。結合できたら `true`。macOS では何もしない。
+///
+/// **[`is_associated`] が `Some(false)` を返したときだけ呼ぶこと。**
+/// 切り離された状態では変換中の文字列は存在しないので、結合し直しても失うものが無い。
+/// 結合済みのウィンドウへ呼んだ場合に変換中の文字列がどうなるかは保証しない
+/// （[`guard_action`] はその条件を満たしたときだけ `reassociate` を立てる）
+pub fn reassociate(window_handle: Option<isize>) -> bool {
+    let Some(handle) = window_handle else {
+        return false;
+    };
+    assoc_imp::reassociate(handle)
+}
+
+#[cfg(not(windows))]
+mod assoc_imp {
+    /// macOS（および非 Windows）は IMM32 が無い。結合という概念自体が無い
+    pub(super) fn is_associated(_handle: isize) -> Option<bool> {
+        None
+    }
+
+    pub(super) fn reassociate(_handle: isize) -> bool {
+        false
+    }
+}
+
+#[cfg(windows)]
+mod assoc_imp {
+    /// `IACE_DEFAULT`（imm.h）。既定の入力コンテキストを結合し直す
+    const IACE_DEFAULT: u32 = 0x0010;
+
+    // 必要な関数だけ宣言する方針は上の `exclude_imp` と同じ
+    #[link(name = "imm32")]
+    unsafe extern "system" {
+        fn ImmGetContext(hwnd: isize) -> isize;
+        fn ImmReleaseContext(hwnd: isize, himc: isize) -> i32;
+        fn ImmAssociateContextEx(hwnd: isize, himc: isize, flags: u32) -> i32;
+    }
+
+    pub(super) fn is_associated(handle: isize) -> Option<bool> {
+        // SAFETY: HWND は GPUI が生きている間有効。取得できた IMC は必ず解放する。
+        // IMM32 はウィンドウを所有するスレッドから呼ぶ必要があり、呼び出し元は
+        // 描画（UI スレッド）に限定してある
+        unsafe {
+            let himc = ImmGetContext(handle);
+            if himc == 0 {
+                return Some(false);
+            }
+            ImmReleaseContext(handle, himc);
+            Some(true)
+        }
+    }
+
+    pub(super) fn reassociate(handle: isize) -> bool {
+        // SAFETY: HWND は GPUI が生きている間有効。himc = 0 + IACE_DEFAULT は
+        // 「既定の入力コンテキストへ戻す」指定で、GPUI が有効化に使うのと同じ呼び出し
+        unsafe { ImmAssociateContextEx(handle, 0, IACE_DEFAULT) != 0 }
+    }
+}
+
+/// IME を壊さないために、このフレームで打つ手。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ImeGuard {
+    /// フォーカスを自分のハンドルへ取り戻す（＝入力ハンドラを登録させる）
+    pub refocus: bool,
+    /// 切り離された IME を結合し直す
+    pub reassociate: bool,
+}
+
+impl ImeGuard {
+    /// 何もしなくてよいか
+    pub fn is_noop(self) -> bool {
+        !self.refocus && !self.reassociate
+    }
+}
+
+/// フレーム描画時に IME を守るための判定（純粋関数。**macOS 上でもテストできる**）。
+///
+/// - `focus_held`: この時点で自分の `FocusHandle` にフォーカスがあるか。
+///   偽だと `Window::handle_input` が登録を飛ばし、GPUI Windows が
+///   「文字入力を受け付けないウィンドウ」と誤認して未確定文字列を強制確定する（#623）
+/// - `associated`: [`is_associated`] の戻り値。`None`（macOS / ハンドル無し）では
+///   結合という概念が無いので**触らない**
+pub fn guard_action(focus_held: bool, associated: Option<bool>) -> ImeGuard {
+    ImeGuard {
+        refocus: !focus_held,
+        reassociate: associated == Some(false),
+    }
+}
+
 /// GPUI Windows がキャレット矩形を IMM32 の POINT へ潰すときの Y（物理ピクセル）。
 ///
 /// **上流（`gpui_windows`）と同じ整数演算を意図的に複製している**。
@@ -528,6 +634,79 @@ mod tests {
             bottom: 10.0,
         };
         assert!(!set_candidate_exclusion(None, &rect, SCALE));
+    }
+
+    // --- #623: 未確定文字列の強制確定を防ぐ判定 ---
+
+    /// 正常時（フォーカスあり・IME 結合済み）は何もしない。
+    /// 毎フレーム走る判定なので「何もしない」が既定であることを固定する
+    #[test]
+    fn 正常なフレームでは何もしない() {
+        let got = guard_action(true, Some(true));
+        assert!(got.is_noop());
+        assert_eq!(got, ImeGuard::default());
+    }
+
+    /// 受け入れ条件の中核: フォーカスが外れたフレームは**必ず**取り戻す。
+    ///
+    /// ここを取りこぼすと `Window::handle_input` が登録を飛ばし、GPUI Windows の
+    /// `update_ime_enabled` が `ImmNotifyIME(CPS_COMPLETE)` で変換中の文字列を
+    /// 強制確定してしまう（#623 の根因）
+    #[test]
+    fn フォーカスが外れていたら取り戻す() {
+        assert!(guard_action(false, Some(true)).refocus);
+        assert!(guard_action(false, Some(false)).refocus);
+        assert!(guard_action(false, None).refocus);
+    }
+
+    /// IME が切り離されている（`ImmGetContext` が NULL）と分かったときだけ結合し直す
+    #[test]
+    fn 切り離されたimeだけ結合し直す() {
+        assert!(guard_action(true, Some(false)).reassociate);
+        assert!(!guard_action(true, Some(true)).reassociate);
+    }
+
+    /// macOS（`is_associated` が `None`）では結合に触らない。
+    /// IMM32 の概念を持たない OS へ Windows 由来の repair を持ち込まないことの担保
+    #[test]
+    fn 結合概念のないosでは結合に触らない() {
+        assert!(!guard_action(true, None).reassociate);
+        assert!(!guard_action(false, None).reassociate);
+        // フォーカス修復のほうは OS 非依存なので効く
+        assert!(guard_action(false, None).refocus);
+    }
+
+    /// 2 つの防御は独立に効く（片方だけ必要な状況がそれぞれ存在する）
+    #[test]
+    fn 二つの防御は独立に効く() {
+        assert_eq!(
+            guard_action(false, Some(false)),
+            ImeGuard {
+                refocus: true,
+                reassociate: true
+            }
+        );
+        assert_eq!(
+            guard_action(true, Some(false)),
+            ImeGuard {
+                refocus: false,
+                reassociate: true
+            }
+        );
+        assert_eq!(
+            guard_action(false, Some(true)),
+            ImeGuard {
+                refocus: true,
+                reassociate: false
+            }
+        );
+    }
+
+    /// ハンドルが無ければ結合状態は問えないし、結合し直しもしない（macOS 経路）
+    #[test]
+    fn ハンドルなしでは結合を問わない() {
+        assert_eq!(is_associated(None), None);
+        assert!(!reassociate(None));
     }
 
     /// 異常なセル高で補正が暴走しないこと（描画より IME の位置決めを優先させない）
