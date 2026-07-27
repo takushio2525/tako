@@ -7,6 +7,21 @@
 //!
 //! オーバーフロー対応（Issue #208）: タブ数に応じてラベルを縮小 + GPUI
 //! ScrollHandle で横スクロール + アクティブタブの自動スクロールイン。
+//!
+//! # ヒットテストの不変条件（Issue #576。Windows でボタンが死ぬ）
+//!
+//! タブバー根 div は `window_control_area(WindowControlArea::Drag)` を張っている（#312）。
+//! GPUI の `Window::hit_test` は hitbox を手前から走査して `HitboxBehavior::BlockMouse`
+//! （= `occlude()`）で `break` するため、**子が occlude していないと祖先（= 根 div）の
+//! hitbox まで hit test に積まれ**、`on_hit_test_window_control` が Drag を返す。
+//! Windows の `WM_NCHITTEST` はこれを `HTCAPTION` に変換するので、子ボタンの上でも
+//! mouse down が `DefWindowProc` のウィンドウ移動モーダルループに食われ、mouse up が
+//! アプリに届かず click が成立しない（macOS は `on_hit_test_window_control` が空実装の
+//! ため同じコードでも壊れない = Windows 固有）。
+//!
+//! したがって **タブバー上の対話要素は必ず `.occlude()` すること**。
+//! 逆に `tab-scroll-area` には付けない —— `flex_1` で空き領域の大半を占めるため、
+//! 付けるとタブバー空き領域でのウィンドウドラッグ移動（#312）が死ぬ。
 
 use std::time::Duration;
 
@@ -183,6 +198,18 @@ impl TakoApp {
                     this.tab_mouse_down = false;
                 }),
             )
+            // 上の on_mouse_up は hitbox の hover ゲート付きなので、occlude した子
+            //（タブピル・各ボタン。#576）の上で離すと発火しない。「mouse up は必ず
+            // 押下フラグを解除する」不変条件を保つため out 側でも同じ解除を行う。
+            // これが無いと tab_mouse_down が立ちっぱなしになり、タブをクリックした後の
+            // 空き領域ドラッグでウィンドウ移動（#312 / #308）が効かなくなる
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, _| {
+                    this.titlebar_dragging = false;
+                    this.tab_mouse_down = false;
+                }),
+            )
             .on_mouse_down_out(cx.listener(|this, _, _, _| {
                 this.titlebar_dragging = false;
                 this.tab_mouse_down = false;
@@ -302,6 +329,8 @@ impl TakoApp {
                                         .flex_shrink_0()
                                         .rounded(px(8.0))
                                         .cursor_pointer()
+                                        // 根 div の Drag ヒットテストに勝たせる（#576）
+                                        .occlude()
                                         .when(is_drag_source, |d| {
                                             d.opacity(0.4)
                                                 .border_1()
@@ -455,6 +484,8 @@ impl TakoApp {
                                                     .justify_center()
                                                     .rounded(px(5.0))
                                                     .cursor_pointer()
+                                                    // 根 div の Drag ヒットテストに勝たせる（#576）
+                                                    .occlude()
                                                     .text_color(hsla(theme.text_muted))
                                                     .hover(|d| {
                                                         d.bg(rgba(theme.surface_highlight))
@@ -485,6 +516,8 @@ impl TakoApp {
                                                 .justify_center()
                                                 .rounded(px(5.0))
                                                 .cursor_pointer()
+                                                // 根 div の Drag ヒットテストに勝たせる（#576）
+                                                .occlude()
                                                 .hover(|d| d.bg(rgba(theme.surface_highlight)))
                                                 .on_click(cx.listener(
                                                     move |this, event: &gpui::ClickEvent, _, cx| {
@@ -538,6 +571,8 @@ impl TakoApp {
                             .justify_center()
                             .rounded(px(8.0))
                             .cursor_pointer()
+                            // 根 div の Drag ヒットテストに勝たせる（#576）
+                            .occlude()
                             .hover(|d| d.bg(rgba(theme.surface_hover)))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.new_tab_in_viewport(window, cx)
@@ -593,6 +628,8 @@ impl TakoApp {
                     .text_color(hsla(theme.text_muted))
                     .text_size(px(12.0))
                     .cursor_pointer()
+                    // 根 div の Drag ヒットテストに勝たせる（#576）
+                    .occlude()
                     .hover(|d| {
                         d.border_color(hsla(theme.border_heavy))
                             .text_color(hsla(theme.text_tertiary))
@@ -636,6 +673,8 @@ impl TakoApp {
                     .justify_center()
                     .rounded(px(8.0))
                     .cursor_pointer()
+                    // 根 div の Drag ヒットテストに勝たせる（#576）
+                    .occlude()
                     .hover(|d| d.bg(rgba(theme.surface_highlight)))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.panel_visible = !this.panel_visible;
@@ -683,6 +722,8 @@ impl TakoApp {
                     .justify_center()
                     .rounded(px(8.0))
                     .cursor_pointer()
+                    // 根 div の Drag ヒットテストに勝たせる（#576）
+                    .occlude()
                     .hover(|d| d.bg(rgba(theme.surface_highlight)))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_theme(cx);
