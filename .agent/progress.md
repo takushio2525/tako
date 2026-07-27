@@ -1350,3 +1350,13 @@
   静的/動的で全テスト結果が同一（既知の POSIX 前提 19 件のみ、#583 相当）であることを A/B 実測
 - 関連コミット: `9a8dbef`（CRT 静的）`9059402`（インストーラー）。**push は master 側**。
   ワークフローは未実行、`tako-app.exe` へのアイコン埋め込みは別タスク
+
+## 2026-07-27（#587: Windows リリースを GitHub Actions からローカル実行へ転換）
+- `windows-release.yml` を未実行のまま削除し、実機で「前検査 → build-installer.ps1 →
+  配布物のスモーク検査 → gh release upload」を通す `release-windows.ps1` を新設。
+  既定は dry-run で、`-Force` が緩めるのは git の状態だけ（版数整合と配布物検査は緩めない）
+- dry-run 実測で実バグ 1 件を検出・修正: Inno Setup の setup exe は FileVersion を
+  空白詰め（`"0.5.12              "`）で返すため、成分比較の前に空白を落とす必要がある
+- 関連コミット: 経緯は `74ad133`。**中身は並行作業のコミット `1ab42de` / `845966f` に
+  巻き込まれて入っている**（push 済み PR #588 上のため履歴は書き換えていない）
+- 次: 実アップロード（`-Upload`）は master 側で実施
