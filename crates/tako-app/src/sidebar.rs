@@ -27,18 +27,20 @@ const INDENT_STEP: f32 = 17.0;
 ///
 /// 高さは `top_0 + bottom_0` で行の高さちょうどに合わせる。行は隙間なく縦に積まれるので、
 /// 隣接する行の線どうしがそのまま繋がる（実測: 同じ深さの連続行は 1 本の run になる）
-fn indent_guides(depth: usize, own: gpui::Hsla, ancestor: gpui::Hsla) -> Vec<gpui::Div> {
-    (1..=depth)
-        .map(|level| {
-            div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left(px(-INDENT_STEP * (depth - level) as f32))
-                .w(px(1.0))
-                .bg(if level == depth { own } else { ancestor })
-        })
-        .collect()
+fn indent_guides(
+    depth: usize,
+    own: gpui::Hsla,
+    ancestor: gpui::Hsla,
+) -> impl Iterator<Item = gpui::Div> {
+    (1..=depth).map(move |level| {
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left(px(-INDENT_STEP * (depth - level) as f32))
+            .w(px(1.0))
+            .bg(if level == depth { own } else { ancestor })
+    })
 }
 
 /// 新規作成のインライン入力欄を差し込む場所（#559）
