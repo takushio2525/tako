@@ -16925,6 +16925,12 @@ mod self_test {
                 cx.background_executor().timer(Duration::from_millis(ms))
             };
 
+            // #566: セルフテストは cmd+W を「ペインを閉じる道具」として多用する
+            // （項目 6 / 62 / 63 等）。close 確認は項目 73 が専門に検証するので、
+            // ここでは既定 OFF にして道具としての cmd+W を素通しにする
+            // （73 / 87 は必要な瞬間だけ自分で ON / OFF する）
+            let _ = window.update(cx, |app, _, _| app.confirm_close = false);
+
             // 1. 起動 + 素の入力経路
             wait(cx, 2500).await;
             type_text(any, cx, "echo TAKO-INPUT-OK", true);
@@ -23003,16 +23009,18 @@ mod self_test {
                 );
                 wait(cx, 1500).await;
 
-                // 対象ペインへ role を付けて「確認が要るペイン」にする（#566）
-                let mark_risky = |app: &mut TakoApp, pane: PaneId| {
-                    if let Some(p) = app
-                        .workspace
-                        .active_tab_mut()
-                        .tree_mut()
-                        .get_mut(pane) {
-                        p.set_role(Some("orchestrator-master:selftest".into()));
+                // 対象ペインへ role を付けて「確認が要るペイン」にする（#566）。
+                // 閉じずに残すペインは必ず clear_risky で戻す: role が残ると以降の項目で
+                // 意図しない確認ダイアログが開き、その escape 消費で後続項目が壊れる
+                let set_role = |app: &mut TakoApp, pane: PaneId, role: Option<String>| {
+                    if let Some(p) = app.workspace.active_tab_mut().tree_mut().get_mut(pane) {
+                        p.set_role(role);
                     }
                 };
+                let mark_risky = |app: &mut TakoApp, pane: PaneId| {
+                    set_role(app, pane, Some("orchestrator-master:selftest".into()));
+                };
+                let clear_risky = |app: &mut TakoApp, pane: PaneId| set_role(app, pane, None);
 
                 // 73a. 確認ダイアログの表示 + Esc キャンセル
                 let esc_ok = window
@@ -23028,6 +23036,8 @@ mod self_test {
                         app.close_confirm_cancelled(cx);
                         let dialog_gone = app.pending_close_confirm.is_none();
                         let still_there = app.workspace.active_tab().tree().len() == before;
+                        clear_risky(app, target);
+                        app.confirm_close = false;
                         dialog_shown && not_closed && dialog_gone && still_there
                     })
                     .unwrap_or(false);
@@ -23046,6 +23056,8 @@ mod self_test {
                             == Some(CloseConfirmTarget::Pane(target, CloseOrigin::Keyboard));
                         let not_closed = app.workspace.active_tab().tree().len() == before;
                         app.close_confirm_cancelled(cx);
+                        clear_risky(app, target);
+                        app.confirm_close = false;
                         dialog_shown && not_closed
                     })
                     .unwrap_or(false);
@@ -23062,6 +23074,7 @@ mod self_test {
                         let dialog_shown = app.pending_close_confirm.is_some();
                         app.close_confirm_accepted(cx);
                         let after = app.workspace.active_tab().tree().len();
+                        app.confirm_close = false;
                         dialog_shown && after == before - 1
                     })
                     .unwrap_or(false);
@@ -23084,6 +23097,7 @@ mod self_test {
                         app.close_pane_with_confirm(target, true, CloseOrigin::PaneButton, cx);
                         let no_dialog = app.pending_close_confirm.is_none();
                         let after = app.workspace.active_tab().tree().len();
+                        app.confirm_close = false;
                         no_dialog && after == before - 1
                     })
                     .unwrap_or(false);
@@ -23108,6 +23122,7 @@ mod self_test {
                         app.close_focused_pane(cx);
                         let no_dialog = app.pending_close_confirm.is_none();
                         let after = app.workspace.active_tab().tree().len();
+                        app.confirm_close = false; // セルフテスト既定へ戻す
                         !needs && no_dialog && after == before - 1
                     })
                     .unwrap_or(false);
@@ -23194,7 +23209,7 @@ mod self_test {
                         app.close_pane_with_confirm(target, false, CloseOrigin::PaneButton, cx);
                         let no_dialog = app.pending_close_confirm.is_none();
                         let after = app.workspace.active_tab().tree().len();
-                        app.confirm_close = true; // 元に戻す
+                        app.confirm_close = false; // セルフテスト既定（OFF）へ戻す
                         no_dialog && after == before - 1
                     })
                     .unwrap_or(false);
@@ -23215,6 +23230,11 @@ mod self_test {
                             == Some(CloseConfirmTarget::Tab(tab_id));
                         app.close_confirm_cancelled(cx);
                         let dialog_gone = app.pending_close_confirm.is_none();
+                        // 長生きするペインなので必ず戻す（以降の項目を汚さない）
+                        if let Some(p) = app.workspace.active_tab_mut().tree_mut().get_mut(first) {
+                            p.set_role(None);
+                        }
+                        app.confirm_close = false; // セルフテスト既定へ戻す
                         dialog_shown && dialog_gone
                     })
                     .unwrap_or(false);
@@ -23253,7 +23273,10 @@ mod self_test {
                 let kbd_pane = window
                     .update(cx, |app, _, cx| {
                         let target = app.focused_pane();
-                        app.confirm_close = true; // 通常ペインなので確認は入らない
+                        // この項目が見るのは「発生源が記録されるか」だけ。確認ゲートは
+                        // 73 が見ているので切っておく（開いたダイアログが残ると
+                        // 以降の項目の escape を食う）
+                        app.confirm_close = false;
                         app.close_focused_pane(cx);
                         target.as_u64()
                     })
@@ -23306,6 +23329,8 @@ mod self_test {
                     markers_ok,
                     "ペインログ: クローズマーカーに発生源（kbd / gui / dispatch）が残る（#566）",
                 );
+                // 後始末: 確認ダイアログを残さない（残ると以降の項目のキー入力を食う）
+                let _ = window.update(cx, |app, _, cx| app.close_confirm_cancelled(cx));
             }
 
             // 75b. 動画プレビューの再生位置（#484）: 総尺の取得と、CLI / MCP の
@@ -23476,9 +23501,22 @@ mod self_test {
             // その状態で走らせると「blur → 復元しない」= 常に FAILED になり、
             // ここで exit するので以降の全項目が未実行になる（#501 と同じ穴）。
             // 前提が成立しないときは product の欠陥ではないので SKIPPED を明示する
-            let focused_before = window
-                .update(cx, |app, window, _| app.focus_handle.is_focused(window))
-                .unwrap_or(false);
+            // #566: この項目は escape の配送に依存する。確認ダイアログ（#172）や
+            // アプリ内テキスト入力が残っていると handle_key が escape を先に食い、
+            // 「blur したまま戻らない」= 常に FAILED になる。前段の項目が状態を
+            // 残していないかを必ず表示してから走らせる（原因の切り分け用）
+            let (focused_before, dialog_pending, input_swallows) = window
+                .update(cx, |app, window, _| {
+                    (
+                        app.focus_handle.is_focused(window),
+                        app.pending_close_confirm.is_some(),
+                        app.text_input_swallows_keys(),
+                    )
+                })
+                .unwrap_or((false, false, false));
+            println!(
+                "TAKO_SELF_TEST_76_PRECOND: focused={focused_before}                  close_dialog={dialog_pending} text_input={input_swallows}"
+            );
             if !focused_before {
                 println!(
                     "TAKO_SELF_TEST_SKIPPED: 76（ウィンドウが focus を持っていない。\
