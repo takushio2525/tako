@@ -4012,7 +4012,45 @@ fn dispatch_inner(
                 ))),
             }
         }
+
+        Request::Welcome { action } => {
+            let action = action.as_deref().unwrap_or("status");
+            match action {
+                "status" => {}
+                "show" => host.set_welcome_banner_visible(true),
+                "dismiss" => {
+                    host.set_welcome_banner_visible(false);
+                    // ユーザー設定を汚さない（Theme / LimitService と同方針）
+                    let should_save = !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none();
+                    if should_save {
+                        if let Err(e) = crate::welcome::mark_dismissed() {
+                            return Err(DispatchError::Operation(format!(
+                                "ウェルカムバナーの状態を保存できない: {e}"
+                            )));
+                        }
+                    }
+                }
+                other => {
+                    return Err(DispatchError::InvalidParams(format!(
+                        "不明な action: {other:?}（status / show / dismiss のいずれか）"
+                    )))
+                }
+            }
+            Ok(welcome_status(host))
+        }
     }
+}
+
+/// ウェルカムバナーの状態 + 案内コマンド（Issue #549）。
+/// コマンドは #322 の最簡形で返す（AI がユーザーへそのまま提示できる）
+fn welcome_status(host: &dyn ControlHost) -> Value {
+    json!({
+        "visible": host.welcome_banner_visible(),
+        "dismissed": crate::settings::load().welcome_dismissed,
+        "first_launch": crate::welcome::is_first_launch(),
+        "setup_command": crate::welcome::SETUP_COMMAND,
+        "master_command": crate::welcome::MASTER_COMMAND,
+    })
 }
 
 /// RunInteractive / Run 共通: 分割 → コマンド付きセッション起動 → exit マーカーラップ
@@ -7816,6 +7854,8 @@ mod tests {
         preview_cache: tako_core::PreviewCacheStats,
         /// ペイン → バックエンド tmux セッション名（#571 の e2e で実セッションを差す）
         backend_sessions: std::collections::HashMap<u64, String>,
+        /// #549: ウェルカムバナーの表示状態
+        welcome_banner: bool,
     }
 
     impl MockHost {
@@ -7845,6 +7885,7 @@ mod tests {
                     entries: 2,
                 },
                 backend_sessions: std::collections::HashMap::new(),
+                welcome_banner: false,
             }
         }
 
@@ -7933,6 +7974,13 @@ mod tests {
         }
         fn set_theme_mode(&mut self, mode: tako_core::theme::ThemeMode) {
             self.theme_mode = mode;
+        }
+        // #549: ウェルカムバナー
+        fn welcome_banner_visible(&self) -> bool {
+            self.welcome_banner
+        }
+        fn set_welcome_banner_visible(&mut self, visible: bool) {
+            self.welcome_banner = visible;
         }
         fn ui_lang_setting(&self) -> tako_core::i18n::LangSetting {
             self.lang_setting
@@ -12673,6 +12721,68 @@ mod tests {
         assert!(
             msg.contains("バックエンド") || msg.contains("session_id"),
             "エラーメッセージが想定と異なる: {msg}"
+        );
+    }
+
+    // --- #549 ウェルカムバナー ---
+
+    #[test]
+    fn welcomeのstatusは表示状態と案内コマンドを返す() {
+        let mut host = MockHost::new();
+        let v = dispatch(
+            &mut host,
+            Request::Welcome { action: None },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["visible"], false);
+        // #322: 案内は最簡形（絶対パスや既定オプションを見せない）
+        assert_eq!(v["setup_command"], "tako setup");
+        assert_eq!(v["master_command"], "tako master");
+        assert!(v["first_launch"].is_boolean());
+        assert!(v["dismissed"].is_boolean());
+    }
+
+    #[test]
+    fn welcomeのshowとdismissが表示状態を切り替える() {
+        let mut host = MockHost::new();
+        let v = dispatch(
+            &mut host,
+            Request::Welcome {
+                action: Some("show".into()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(v["visible"], true);
+        assert!(host.welcome_banner_visible());
+
+        let v = dispatch(
+            &mut host,
+            Request::Welcome {
+                action: Some("dismiss".into()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(v["visible"], false);
+        assert!(!host.welcome_banner_visible());
+    }
+
+    #[test]
+    fn welcomeの不明actionはエラー() {
+        let mut host = MockHost::new();
+        let err = dispatch(
+            &mut host,
+            Request::Welcome {
+                action: Some("explode".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("status / show / dismiss"),
+            "選べる値を案内すること: {err:?}"
         );
     }
 

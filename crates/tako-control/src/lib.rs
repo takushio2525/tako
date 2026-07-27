@@ -45,6 +45,7 @@ pub mod tailscale;
 pub mod task_checkpoints;
 pub mod telemetry;
 pub mod transcript;
+pub mod welcome;
 
 pub use dispatch::{
     dispatch, dispatch_orchestrator_accounts, dispatch_orchestrator_layout, fetch_tmux_sessions,

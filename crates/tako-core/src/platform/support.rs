@@ -1280,6 +1280,14 @@ pub const MATRIX: &[Feature] = &[
         },
     },
     Feature {
+        key: "tako_welcome",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_TERMINAL,
+            issue: 517,
+        },
+    },
+    Feature {
         key: "tako_window",
         macos: Support::Supported,
         windows: Support::Pending {

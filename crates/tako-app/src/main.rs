@@ -1134,6 +1134,10 @@ struct TakoApp {
     pending_webview_restore: Vec<(Option<u64>, String)>,
     /// stale claude バイナリの検知状態（Issue #498）。ペインごとに管理
     stale_binary_banners: HashMap<PaneId, StaleBinaryBanner>,
+    /// 初回起動のウェルカムバナーを表示中か（Issue #549）。
+    /// 起動時に settings.json の実在で判定し（`welcome::should_show_on_launch`）、
+    /// 閉じたら settings.json へ永続化する
+    welcome_banner: bool,
     /// アプリ内自動更新の状態
     update_state: update_checker::UpdateState,
     /// 更新チャンネルドロップダウンの開閉状態（#403）
@@ -2293,6 +2297,10 @@ impl TakoApp {
             window_raw_handle: None,
             pending_webview_restore: Vec::new(),
             stale_binary_banners: HashMap::new(),
+            // #549: 初回起動（settings.json がまだ無い）だけウェルカムバナーを出す。
+            // 起動処理は settings を読むだけで書かないため、ここでの判定は
+            // 「このプロセスが最初の 1 回目か」を正しく反映する
+            welcome_banner: tako_control::welcome::should_show_on_launch(),
             update_state: update_checker::UpdateState::Idle,
             update_dropdown_open: false,
             glyph_snap_cache: std::cell::RefCell::new(HashMap::new()),
@@ -5987,6 +5995,73 @@ impl TakoApp {
         }
     }
 
+    // --- ウェルカムバナー（Issue #549）------------------------------------
+
+    /// バナー / パレットからの「その場実行」。素のログインシェルのタブを作り、
+    /// そこへコマンド行を送る（= ユーザーが自分で打つのと同じ経路）。
+    ///
+    /// コマンドをペインの直接プロセスにしたり RunInteractive のラッパー
+    /// （`sh -c "...; read"`）越しに走らせたりはしない。`tako master` は
+    /// **呼び出し元ペインを自分で解決してそこへ inline 起動する**仕様なので、
+    /// 送り先がラッパーのシェルだと起動コマンドが `read` に食われて壊れる。
+    /// CLI が呼び出し元ペインを解決できないときの経路（`new_tab_target`）と同型。
+    ///
+    /// コマンド行は `welcome::launch_command_line` が実体パスで組み立てるため、
+    /// `tako` が PATH に無い zip 配布でもボタンが動く（#549 の指摘）
+    pub(crate) fn launch_tako_command(
+        &mut self,
+        subcommand: &str,
+        tab_title: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let line = format!(
+            "{}\n",
+            tako_control::welcome::launch_command_line(subcommand)
+        );
+        let pane = Pane::new(PaneOrigin::User);
+        let pane_id = pane.id();
+        self.workspace.create_tab(tab_title.to_string(), pane);
+        if let Err(e) = self.spawn_session(pane_id, SpawnOptions::default(), cx) {
+            eprintln!("warning: {tab_title} タブを開けない: {e}");
+            self.remove_pane(pane_id, cx);
+            return;
+        }
+        if let Some(session) = self.terminals.get(&pane_id) {
+            session.write(line.into_bytes());
+        }
+        self.scroll_active_tab_into_view();
+        self.sync_filetree_roots();
+        cx.notify();
+    }
+
+    /// バナーの「セットアップを実行」/ パレットの同項目
+    pub(crate) fn run_setup_command(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_welcome_banner(cx);
+        self.launch_tako_command("setup", "setup", cx);
+    }
+
+    /// バナーの「master を起動」/ パレットの同項目
+    pub(crate) fn run_master_command(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_welcome_banner(cx);
+        self.launch_tako_command("master", "master", cx);
+    }
+
+    /// バナーを閉じて「次回から出さない」を永続化する。
+    /// 表示していないときは何もしない（設定を無用に書き換えない）
+    pub(crate) fn dismiss_welcome_banner(&mut self, cx: &mut Context<Self>) {
+        if !self.welcome_banner {
+            return;
+        }
+        self.welcome_banner = false;
+        // セルフテスト中はユーザー設定を汚さない（toggle_theme と同方針）
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            if let Err(e) = tako_control::welcome::mark_dismissed() {
+                eprintln!("warning: ウェルカムバナーの状態を保存できない: {e}");
+            }
+        }
+        cx.notify();
+    }
+
     /// ⌘K コマンドパレットを開く（#217 カンプ。ペイン・コマンド検索）
     pub(crate) fn open_command_palette(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.command_palette = Some(CommandPalette {
@@ -6098,8 +6173,13 @@ impl TakoApp {
                 ));
             }
         }
-        // 固定コマンド（表示ラベルは ui_text::palette が言語別に解決）
+        // 固定コマンド（表示ラベルは ui_text::palette が言語別に解決）。
+        // #549: 初期設定・オーケストレーションの導線を先頭に置く。パレットが
+        // 「機能の一覧」でもある以上、tako の目玉機能への入口はここに要る
         const COMMANDS: &[&str] = &[
+            "run-setup",
+            "run-master",
+            "open-settings",
             "new-tab",
             "toggle-theme",
             "toggle-language",
@@ -6172,6 +6252,13 @@ impl TakoApp {
         match item {
             PaletteItem::Pane(pane, _, _) => self.jump_to_pane(pane, cx),
             PaletteItem::Command(_, id) => match id {
+                // #549: 初期設定・オーケストレーションへの導線
+                "run-setup" => self.run_setup_command(cx),
+                "run-master" => self.run_master_command(cx),
+                "open-settings" => {
+                    self.pending_settings_open = Some(None);
+                    cx.notify();
+                }
                 "new-tab" => self.new_tab(cx),
                 "toggle-theme" => self.toggle_theme(cx),
                 "toggle-language" => self.toggle_language(cx),
@@ -13245,6 +13332,15 @@ impl UiStateHost for TakoApp {
         self.settings_window_handle.is_some()
     }
 
+    // #549: ウェルカムバナー。永続化（welcome_dismissed）は dispatch 側の責務
+    fn welcome_banner_visible(&self) -> bool {
+        self.welcome_banner
+    }
+
+    fn set_welcome_banner_visible(&mut self, visible: bool) {
+        self.welcome_banner = visible;
+    }
+
     fn ui_lang_setting(&self) -> tako_core::i18n::LangSetting {
         self.lang_setting
     }
@@ -15407,6 +15503,8 @@ impl Render for TakoApp {
                 }),
             )
             .child(self.render_tab_bar(window, cx))
+            // #549: 初回起動のウェルカムバナー（タブバー直下・全幅。2 回目以降は出ない）
+            .children(self.render_welcome_banner(cx))
             .child(
                 div()
                     .flex_1()
@@ -24825,6 +24923,89 @@ mod self_test {
                     term_ok,
                     "ターミナルの IME: 入力欄が非フォーカスなら従来どおりペインへ束縛 (#561)",
                 );
+            }
+
+            // 88. 初回起動のウェルカムバナー（#549）。
+            // (a) 初回判定: settings.json が無い間だけ出て、書かれた後は出ない
+            //     （実 save 経路を通す = 「1 回目 → 2 回目」の遷移そのもの）
+            // (b) UI 状態と dispatch（CLI / MCP と同一経路）が同じ状態を共有する
+            // (c) パレットに導線 3 項目があり、選ぶと実際に起動タブが増える
+            {
+                let fixture =
+                    std::env::temp_dir().join(format!("tako-st549-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&fixture);
+                let path = fixture.join("settings.json");
+                let defaults = tako_control::settings::Settings::default();
+                // (a) 1 回目 = ファイル不在 → 出す
+                let first_launch = tako_control::welcome::should_show(&path, &defaults);
+                let saved = tako_control::settings::save_to(&path, &defaults).is_ok();
+                // 2 回目 = ファイルが在る → 出さない（既存ユーザーも同じ判定に乗る）
+                let second_launch = tako_control::welcome::should_show(&path, &defaults);
+                // 閉じた記録があればファイルが無くても出さない
+                let dismissed_never_shows = !tako_control::welcome::should_show(
+                    &fixture.join("absent.json"),
+                    &tako_control::settings::Settings {
+                        welcome_dismissed: true,
+                        ..Default::default()
+                    },
+                );
+
+                let st549 = window
+                    .update(cx, |app, _, cx| {
+                        let welcome = |action: &str, app: &mut TakoApp| -> Option<bool> {
+                            tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::Welcome {
+                                    action: Some(action.into()),
+                                },
+                                tako_core::pane::PaneOrigin::Mcp,
+                            )
+                            .ok()
+                            .and_then(|v| v["visible"].as_bool())
+                        };
+                        // (b) dispatch の show / dismiss が UI 状態・描画と一致する
+                        let shown = welcome("show", app) == Some(true) && app.welcome_banner;
+                        let rendered = app.render_welcome_banner(cx).is_some();
+                        let hidden = welcome("dismiss", app) == Some(false) && !app.welcome_banner;
+                        let unrendered = app.render_welcome_banner(cx).is_none();
+
+                        // (c) パレットの導線（ラベルは言語で変わるので id で見る）
+                        let ids: Vec<&str> = app
+                            .palette_items("")
+                            .iter()
+                            .filter_map(|i| match i {
+                                PaletteItem::Command(_, id) => Some(*id),
+                                _ => None,
+                            })
+                            .collect();
+                        let has_entries = ["run-setup", "run-master", "open-settings"]
+                            .iter()
+                            .all(|id| ids.contains(id));
+                        // 選ぶと実際に起動用タブが増える（その場実行の経路が生きている）
+                        let before = app.workspace.tabs().len();
+                        app.palette_execute(
+                            PaletteItem::Command(
+                                crate::ui_text::palette::cmd_label("run-setup"),
+                                "run-setup",
+                            ),
+                            cx,
+                        );
+                        let launched = app.workspace.tabs().len() == before + 1
+                            && app
+                                .workspace
+                                .tabs()
+                                .last()
+                                .is_some_and(|t| t.title() == "setup");
+                        shown && rendered && hidden && unrendered && has_entries && launched
+                    })
+                    .unwrap_or(false);
+                check(
+                    first_launch && saved && !second_launch && dismissed_never_shows && st549,
+                    "ウェルカムバナー: 初回のみ表示 / dispatch と UI の一致 / パレット導線 (#549)",
+                );
+                if fixture.starts_with(std::env::temp_dir()) {
+                    let _ = std::fs::remove_dir_all(&fixture);
+                }
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

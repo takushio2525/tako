@@ -232,6 +232,13 @@ pub trait UiStateHost {
     fn settings_window_open(&self) -> bool {
         false
     }
+    /// 初回起動のウェルカムバナーが表示中か（Issue #549）
+    fn welcome_banner_visible(&self) -> bool {
+        false
+    }
+    /// ウェルカムバナーの表示 / 非表示（再描画は実装側の責務。
+    /// 「以後出さない」の永続化は dispatch 側で行う。Issue #549）
+    fn set_welcome_banner_visible(&mut self, _visible: bool) {}
     /// 利用制限メトリクスの即時再取得（#357 リロードボタン）。
     /// 全ペインの TUI フッターを再走査し、現在のメトリクスを JSON で返す
     fn refresh_limits(&mut self) -> serde_json::Value {

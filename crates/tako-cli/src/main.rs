@@ -110,6 +110,9 @@ enum Command {
     Theme(ThemeArgs),
     /// 設定画面を開く（Issue #459）
     Settings(SettingsArgs),
+    /// 初回起動のウェルカムバナーの状態確認・再表示・非表示（Issue #549）。
+    /// 引数なしで現在の表示状態と案内すべきコマンドを表示する
+    Welcome(WelcomeArgs),
     /// プラットフォーム対応マトリクスの参照（Issue #515）。
     /// この環境でどの機能が使えるか・縮退しているか・未実装かを表示する
     Platform(PlatformArgs),
@@ -2002,6 +2005,13 @@ struct SettingsArgs {
     /// 開くタブ指定
     #[arg(long)]
     tab: Option<String>,
+}
+
+/// ウェルカムバナーコマンドの引数（Issue #549）
+#[derive(Args)]
+struct WelcomeArgs {
+    /// show（再表示）/ dismiss（閉じて以後出さない）。省略時は状態表示
+    action: Option<String>,
 }
 
 /// プラットフォーム対応マトリクスの参照引数（Issue #515）
@@ -4496,6 +4506,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
             action: Some("open".into()),
             tab: args.tab.clone(),
         },
+        Command::Welcome(args) => Request::Welcome {
+            action: args.action.clone(),
+        },
         Command::Lang(args) => Request::Lang {
             action: args.value.as_deref().map(|_| "set".to_string()),
             value: args.value.clone(),
@@ -5845,6 +5858,7 @@ fn print_result(command: &Command, result: &Value) {
         | Command::ConfirmClose(_)
         | Command::Theme(_)
         | Command::Settings(_)
+        | Command::Welcome(_)
         | Command::Lang(_)
         | Command::LimitService(_)
         | Command::Telemetry(_)
