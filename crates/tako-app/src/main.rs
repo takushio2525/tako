@@ -316,7 +316,17 @@ struct PromptFlow {
     /// enter_only の残留判定基準: Enter 送信時点の入力欄内容。検証時に
     /// 同じ内容が残っていれば未送達とみなし Enter を再送する
     baseline: Option<String>,
+    /// 前 tick に観測した入力欄の長さ（#623 の「落ち着くまで待つ」判定用）
+    last_input_len: Option<usize>,
+    /// 入力欄の長さが変わらなかった連続 tick 数（同上）
+    settled_ticks: u8,
 }
+
+/// 入力欄が「落ち着いた」とみなす連続 tick 数（1 tick = 500ms）。
+///
+/// 貼り付け直後の TUI は本文を少しずつ描画するため、長さが増えている間は
+/// **まだ取り込み中**である。1 tick 据え置きなら取り込み完了とみなす（#623）
+const SETTLE_TICKS: u8 = 2;
 
 impl PromptFlow {
     fn new(pane: PaneId, prompt: String, wait_tui: bool) -> Self {
@@ -338,7 +348,30 @@ impl PromptFlow {
             wait_tui,
             enter_only: false,
             baseline: None,
+            last_input_len: None,
+            settled_ticks: 0,
         }
+    }
+
+    /// 入力欄の長さを 1 tick ぶん観測し、「落ち着いたか」を返す（#623）。
+    ///
+    /// 長さが変わっている間は TUI がまだ貼り付けを取り込んでいる最中なので、
+    /// ここで待たずに Enter を撃つと**取り込めた分だけが送信される**（本文が切れる）
+    fn observe_input(&mut self, len: Option<usize>) -> bool {
+        if self.last_input_len == len {
+            self.settled_ticks = self.settled_ticks.saturating_add(1);
+        } else {
+            self.last_input_len = len;
+            self.settled_ticks = 0;
+        }
+        self.settled_ticks >= SETTLE_TICKS
+    }
+
+    /// ステート遷移時に「落ち着き」の観測をやり直す。
+    /// 前ステートの観測値を引き継ぐと、遷移直後に誤って「落ち着き済み」と判定しうる
+    fn reset_settle(&mut self) {
+        self.last_input_len = None;
+        self.settled_ticks = 0;
     }
 
     /// Enter 単独送達フロー（Issue #95）: dispatch の Enter 単独送信
@@ -3946,6 +3979,7 @@ impl TakoApp {
                                 .map(str::to_string);
                             session.write(b"\r".to_vec());
                             flow.state = PromptFlowState::VerifySubmitted;
+                            flow.reset_settle();
                             flow.state_entered_at = now;
                         }
                     } else if claude_tui::input_line(&lines).is_some()
@@ -3964,6 +3998,7 @@ impl TakoApp {
                         ));
                         session.paste(&flow.prompt);
                         flow.state = PromptFlowState::WaitTextInInput;
+                        flow.reset_settle();
                         flow.state_entered_at = now;
                     }
                 }
@@ -3979,19 +4014,29 @@ impl TakoApp {
                     let reflected = in_input || anywhere;
                     let timed_out =
                         flow.state_entered_at.elapsed() > std::time::Duration::from_secs(10);
-                    // #623: どちらの判定で Enter を撃ったかを残す。`anywhere` だけが真なら
-                    // 「入力欄では確認できていないのに画面のどこかに断片が見えた」= 早撃ちの疑い
+                    // #623: 反映判定は「先頭 10 文字が見えるか」でしかないため、
+                    // 長文の取り込み途中でも真になる。実測では入力欄が 78 文字の時点で
+                    // 真になり、本文 2136 バイトの取り込み完了前に Enter を撃っていた。
+                    // 長さが据え置きになる（= 取り込みが終わる）まで待ってから送る
+                    let input_len = claude_tui::input_line(&lines).map(str::len);
+                    let settled = flow.observe_input(input_len);
+                    // `anywhere` だけが真なら「入力欄では確認できていないのに画面の
+                    // どこかに断片が見えた」= 早撃ちの疑い
                     flow_diag(&format!(
-                        "WaitTextInInput: in_input={in_input} anywhere={anywhere} timed_out={timed_out} \
-                         入力欄長={:?} 経過ms={}",
-                        claude_tui::input_line(&lines).map(str::len),
+                        "WaitTextInInput: in_input={in_input} anywhere={anywhere} settled={settled} \
+                         timed_out={timed_out} 入力欄長={input_len:?} 経過ms={}",
                         flow.state_entered_at.elapsed().as_millis()
                     ));
-                    if reflected {
+                    if reflected && settled {
                         // 送信の Enter は貼り付けと分離した単独キーとして送る
                         // （貼り付けバーストに混ざると「次の行」と解釈される）
+                        //
+                        // #623: Enter 直前の入力欄内容を控える。検証側はこれと比べて
+                        // 「画面がまだ一度も塗り替わっていない」ことを判別する
+                        flow.baseline = claude_tui::input_line(&lines).map(str::to_string);
                         session.write(b"\r".to_vec());
                         flow.state = PromptFlowState::VerifySubmitted;
+                        flow.reset_settle();
                         flow.state_entered_at = now;
                     } else if timed_out {
                         // #390: 反映が確認できないままタイムアウト。入力欄が「確認できて
@@ -4014,6 +4059,7 @@ impl TakoApp {
                         } else {
                             session.write(b"\r".to_vec());
                             flow.state = PromptFlowState::VerifySubmitted;
+                            flow.reset_settle();
                             flow.state_entered_at = now;
                         }
                     }
@@ -4033,21 +4079,37 @@ impl TakoApp {
                         } else {
                             claude_tui::input_residual(&lines, &flow.prompt)
                         };
-                        // #623: 残留判定は text_in_input と同じ「先頭 10 文字が見えるか」なので、
-                        // 貼り付けがまだ描画中だと「未送信」と誤判定して Enter を余分に撃つ
+                        // #623: 残留判定は text_in_input と同じ「先頭 10 文字が見えるか」で、
+                        // 送信直後の描画途中でも真になる。実測ではここで 4 回続けて
+                        // Enter を撃ち直し、TUI 側に空送信が 4 件生まれていた。
+                        // 画面が動いている間は判断を保留し、据え置きになってから再送する
+                        let input_len = claude_tui::input_line(&lines).map(str::len);
+                        let settled = flow.observe_input(input_len);
+                        // #623: 入力欄が Enter 直前とまったく同じなら、TUI がまだ一度も
+                        // 塗り替えていない = 「未送信」と「未描画」を区別できない。
+                        // 情報が無い状態で再送すると空 Enter が余分に飛ぶので、
+                        // 画面が動くまで待つ（動かないまま 10 秒経ったら未送信とみなす）
+                        let stale = !flow.enter_only
+                            && flow.baseline.is_some()
+                            && claude_tui::input_line(&lines).map(str::to_string) == flow.baseline
+                            && flow.state_entered_at.elapsed() < std::time::Duration::from_secs(10);
                         flow_diag(&format!(
-                            "VerifySubmitted: residual={residual} enter_only={} 再送残={} 入力欄長={:?}",
+                            "VerifySubmitted: residual={residual} settled={settled} stale={stale} enter_only={} 再送残={} 入力欄長={input_len:?}",
                             flow.enter_only,
                             flow.enter_retries_left,
-                            claude_tui::input_line(&lines).map(str::len)
                         ));
                         if !residual {
                             // 入力欄が空へ戻った = 送信された
                             flow.state = PromptFlowState::Done;
+                        } else if stale || !settled {
+                            // 画面がまだ動いていない / 動いている最中。判断を保留する
                         } else if flow.enter_retries_left > 0 {
-                            // Enter が「送信」と解釈されず残留 → Enter を単独再送
+                            // Enter が「送信」と解釈されず残留 → Enter を単独再送。
+                            // 再送のたびに観測をやり直す（次の tick で即「据え置き」と
+                            // 判定して連打するのを防ぐ。#623）
                             session.write(b"\r".to_vec());
                             flow.enter_retries_left -= 1;
+                            flow.reset_settle();
                             flow.state_entered_at = now;
                         } else {
                             eprintln!(
@@ -24471,6 +24533,67 @@ mod drag_scroll_tests {
 
 /// アプリケーションメニュー（#485）の構造検査。
 /// 「無反応のダミー項目を置かない」を機械的に固定する
+#[cfg(test)]
+mod prompt_flow_settle_tests {
+    use super::*;
+
+    fn flow() -> PromptFlow {
+        PromptFlow::new(PaneId::from_raw(1), "テスト用のプロンプト".into(), false)
+    }
+
+    /// #623 の中核: 入力欄が伸びている間は「落ち着いていない」。
+    ///
+    /// 実測では入力欄が 78 文字の時点で反映判定が真になり、本文 2136 バイトの
+    /// 取り込み完了前に Enter を撃っていた。長さが動いている限り待つこと
+    #[test]
+    fn 長さが動いている間は落ち着かない() {
+        let mut f = flow();
+        assert!(!f.observe_input(Some(0)));
+        assert!(!f.observe_input(Some(40)));
+        assert!(!f.observe_input(Some(78)));
+        // 同じ長さが続いて初めて落ち着く（SETTLE_TICKS 回）
+        assert!(!f.observe_input(Some(78)));
+        assert!(f.observe_input(Some(78)));
+    }
+
+    /// 据え置きが続く限り落ち着いたままで、増えたら即やり直す
+    #[test]
+    fn 伸び始めたら落ち着きは解除される() {
+        let mut f = flow();
+        for _ in 0..4 {
+            f.observe_input(Some(10));
+        }
+        assert!(f.observe_input(Some(10)));
+        assert!(!f.observe_input(Some(20)), "伸びたら待ち直す");
+    }
+
+    /// ステート遷移で観測をやり直す。引き継ぐと遷移直後に誤って
+    /// 「落ち着き済み」と判定して Enter を早撃ちする
+    #[test]
+    fn 遷移時に観測をやり直す() {
+        let mut f = flow();
+        for _ in 0..4 {
+            f.observe_input(Some(78));
+        }
+        assert!(f.observe_input(Some(78)));
+        f.reset_settle();
+        assert!(!f.observe_input(Some(78)), "遷移直後は落ち着き扱いにしない");
+    }
+
+    /// 入力欄の「見えない → 見え始めた」も変化として扱う。
+    ///
+    /// 初期値が `None` なので、見えないまま SETTLE_TICKS 回続けば落ち着き扱いになる
+    /// （この状態では反映判定が偽なので Enter は撃たれない）。見え始めたら待ち直す
+    #[test]
+    fn 入力欄の有無の変化も検出する() {
+        let mut f = flow();
+        assert!(!f.observe_input(None), "1 回目はまだ落ち着かない");
+        assert!(f.observe_input(None), "None が続けば落ち着き");
+        assert!(!f.observe_input(Some(5)), "見え始めたら待ち直す");
+        assert!(!f.observe_input(Some(40)), "伸びている間は待つ");
+    }
+}
+
 #[cfg(test)]
 mod app_menu_tests {
     use super::*;
