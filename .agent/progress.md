@@ -1386,3 +1386,10 @@
   persist.log「tmux 再 attach 1 / 新規シェル 0」。単体 23 + 実バイナリ統合 10 本
 - 関連コミット: `cf6ee4a` `7b9b74c` `1ab42de` `501793a` `845966f` `8778d14` `5ed0859`
 - 次: psmux の導入経路（同梱するか）の判断。役割 B（到達）は引き続き無い
+
+## 2026-07-27（#602: Windows のペイン/タブ操作ショートカットを完了）
+- #585 の 45 本は移植済みで分割は Ctrl+Shift+D で動くと確認（ユーザーの「効かない」は旧バイナリ由来）。
+  Ctrl+D は EOF(0x04) と衝突するため分割に採らず、判断をテストで固定
+- `ctrl-shift-q` → Quit 追加（Windows に正規の終了手段が無かった）+ `cmd-h`/`cmd-alt-h`/`cmd-m` を
+  macOS 限定へ（Win+Alt+H が届くと `hide_other_apps()` の `unimplemented!()` で app ごと abort）
+- 関連コミット: `f69c6ff`。220 passed / 0 failed（変更前 217）。副産物 #603（✕/Alt+F4 のゾンビ化）起票
