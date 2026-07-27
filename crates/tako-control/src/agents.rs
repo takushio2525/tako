@@ -526,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn sessions_with_children_innerで子プロセスありをカウント() {
+    fn sessions_with_children_innerで子プロセスありを列挙() {
         // セッション tako-s1 に pane_pid=100、子プロセス 200→100
         let panes = vec![
             ("tako-s1:0.0".to_string(), 100u32),
@@ -546,14 +546,14 @@ mod tests {
     }
 
     #[test]
-    fn sessions_with_children_innerで空入力は0() {
+    fn sessions_with_children_innerで空入力は空() {
         let panes = vec![("tako-s1:0.0".to_string(), 100u32)];
         let parents: HashMap<u32, u32> = [(100, 1), (200, 100)].into();
         assert!(sessions_with_children_inner(&[], &panes, &parents).is_empty());
     }
 
     #[test]
-    fn sessions_with_children_innerで複数セッションの子プロセスをカウント() {
+    fn sessions_with_children_innerで複数セッションの子プロセスを列挙() {
         let panes = vec![
             ("tako-s1:0.0".to_string(), 100u32),
             ("tako-s2:0.0".to_string(), 300u32),

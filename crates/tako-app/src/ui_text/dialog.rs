@@ -29,6 +29,13 @@ pub fn lost_running_process() -> &'static str {
 pub fn lost_busy_worker() -> &'static str {
     tr!("稼働中の worker", "a busy worker")
 }
+/// エージェントのペイン（#566。確認が出た理由を role つきで示す）
+pub fn lost_agent_pane(role: &str) -> String {
+    tr!(
+        format!("エージェントのペイン（{role}）"),
+        format!("an agent pane ({role})")
+    )
+}
 pub fn lost_tmux_session() -> &'static str {
     tr!("tmux セッション", "a tmux session")
 }
@@ -83,6 +90,7 @@ mod tests {
                 close_loses(&["a".to_string(), "b".to_string()]),
                 lost_running_process().to_string(),
                 lost_busy_worker().to_string(),
+                lost_agent_pane("orchestrator-master"),
                 lost_tmux_session().to_string(),
                 lost_panes(2),
                 lost_running(1),

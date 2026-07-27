@@ -4846,7 +4846,10 @@ impl TakoApp {
                     .flat_map(|t| t.tree().panes())
                     .find(|p| p.id() == pane_id)
                 {
-                    if let Some(role) = pane.role() {
+                    if let Some(role) = pane.role().filter(|r| !r.trim().is_empty()) {
+                        // #566: 確認が出た理由（= このペインはエージェント）を必ず見せる。
+                        // 事故では「何を閉じようとしているのか」が分からないまま消えた
+                        parts.push(crate::ui_text::dialog::lost_agent_pane(role));
                         if role.starts_with("orchestrator-worker") {
                             let busy = self
                                 .terminals
