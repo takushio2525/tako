@@ -925,17 +925,39 @@ pub fn tail_lines(output: &str, n: usize) -> Vec<&str> {
         .collect()
 }
 
-/// worker の画面が busy（作業中）を示すパターンを含むか（末尾 5 行に限定）。
-/// claude / codex は「esc to interrupt」、agy は「esc to cancel」＋
-/// スピナー行「Generating」を拾う（Issue #120。実採取画面より）。
+/// 強マーカー（実行中にしか描画されない）を探す範囲。
+/// claude TUI のフッターは区切り線・入力欄・区切り線・モデル・ctx・5h・7d・auto mode の
+/// 8 行あり、スピナー行は末尾から 9 行目に来る（2026-07-27 実採取）。
+/// 旧実装の 5 行では**スピナーに一度も届かず** busy 判定が常に false だった（#571）。
+/// 将来フッターが伸びても届くよう余裕を取る（`recent_output` は 30 行）
+const BUSY_STRONG_TAIL: usize = 20;
+
+/// 弱マーカー（完了後の画面にも残る一般語）を探す範囲。
+/// 広げると `⏺ Searching for 5 patterns, reading 2 files…` のような**完了済み**
+/// ツール行に誤爆し、今度は永遠に busy になる（#571 と同じ「不検知」を招く）
+const BUSY_WEAK_TAIL: usize = 5;
+
+/// worker の画面が busy（作業中）を示すパターンを含むか。
+///
+/// マーカーを 2 層に分けて、探す範囲を変える（Issue #571）:
+///
+/// - **強マーカー** = 実行中にしか描画されない（`esc to interrupt` / `esc to cancel` /
+///   経過時間つきスピナー）。誤爆しないので末尾 20 行まで見る
+/// - **弱マーカー** = 完了後の出力にも現れる一般語（`Reading` / `Running` 等）。
+///   従来どおり末尾 5 行に限定する
+///
 /// 「Thinking」は素のままだと agy フッターのモデル名表記
 /// 「Claude Opus 4.6 (Thinking)」（常時表示）に誤爆して永遠に busy 判定になるため、
 /// claude スピナーの実表示「Thinking…」に限定する（実機検証 2026-07-10 で発見）
 pub fn screen_looks_busy(output: &str) -> bool {
-    tail_lines(output, 5).iter().any(|l| {
-        l.contains("esc to interrupt")
-            || l.contains("esc to cancel")
-            || l.contains("Generating")
+    let strong = tail_lines(output, BUSY_STRONG_TAIL).iter().any(|l| {
+        l.contains("esc to interrupt") || l.contains("esc to cancel") || spinner_with_elapsed(l)
+    });
+    if strong {
+        return true;
+    }
+    tail_lines(output, BUSY_WEAK_TAIL).iter().any(|l| {
+        l.contains("Generating")
             || l.contains("Working (")
             || l.contains("ing… (")
             || l.contains("Thinking…")
@@ -946,6 +968,25 @@ pub fn screen_looks_busy(output: &str) -> bool {
             || l.contains("Writing")
             || l.contains("Searching")
     })
+}
+
+/// 経過時間つきスピナー行か（強マーカー）。実採取例:
+/// claude `✽ Misting… (10m 49s · ↓ 35.8k tokens)` / codex `Working (12s • Esc to interrupt)`。
+///
+/// 完了行は `✻ Cogitated for 2h 3m 31s` のように**括弧つき経過時間を持たない**ため、
+/// 「マーカー直後の括弧が経過時間で始まる」ことを条件にすると実行中だけを拾える。
+/// スピナーの語は claude の気分次第で変わる（Misting / Cogitating / …）ので語には依存しない
+fn spinner_with_elapsed(line: &str) -> bool {
+    ["… (", "... (", "Working ("]
+        .iter()
+        .filter_map(|marker| line.split_once(marker))
+        .any(|(_, rest)| starts_with_elapsed(rest))
+}
+
+/// 文字列の先頭が経過時間表記（`12s` / `10m 49s` / `2h 3m` 等）か
+fn starts_with_elapsed(s: &str) -> bool {
+    let digits = s.chars().take_while(|c| c.is_ascii_digit()).count();
+    digits > 0 && matches!(s[digits..].chars().next(), Some('s' | 'm' | 'h'))
 }
 
 /// worker の画面が idle（入力欄プロンプト表示 = 入力待ち）を示すか。
@@ -1532,9 +1573,108 @@ mod tests {
         assert!(!screen_looks_idle("Thinking…\nまだ作業中"));
         assert!(screen_looks_busy(BUSY_SCREEN));
         assert!(!screen_looks_busy(IDLE_SCREEN));
-        // 末尾 5 行より前の busy パターンは無視される
-        let old_busy = format!("esc to interrupt\n{}", "行\n".repeat(6));
-        assert!(!screen_looks_busy(&old_busy));
+        // #571: 強マーカーはフッター越し（末尾 5 行より前）でも拾う。
+        // 旧実装はここを拾えず、claude の busy 判定が常に false だった
+        let behind_footer = format!("esc to interrupt\n{}", "行\n".repeat(6));
+        assert!(screen_looks_busy(&behind_footer));
+        // ただし強マーカーの届く範囲にも限りがある（recent_output の 30 行内）
+        let far_above = format!("esc to interrupt\n{}", "行\n".repeat(25));
+        assert!(!screen_looks_busy(&far_above));
+        // 弱マーカーは従来どおり末尾 5 行限定（完了済みツール行への誤爆防止）
+        let weak_behind_footer = format!("Running tests\n{}", "行\n".repeat(6));
+        assert!(!screen_looks_busy(&weak_behind_footer));
+    }
+
+    // --- #571: 実採取した claude TUI 画面（2026-07-27。フッター 8 行） ---
+
+    /// **作業中**の claude。スピナー `✽ Misting… (10m 49s …)` は末尾から 9 行目にあり、
+    /// 旧実装（末尾 5 行）では一度も届かなかった
+    const CLAUDE_BUSY_SCREEN_V2: &str = "\
+⏺ 実測プローブ用に、本番の生画面を採取します。\n\
+\n\
+⏺ Searching for 5 patterns, reading 2 files, calling tako, running 13\n\
+  shell commands…\n\
+\n\
+✽ Misting… (10m 49s · ↓ 35.8k tokens)\n\
+\n\
+──────────────────────────────────────────────────────────────────────\n\
+❯ \n\
+──────────────────────────────────────────────────────────────────────\n\
+  [Opus 5 · MAX]  🔧 worker: tako:571\n\
+  ctx  23% ██░░░░░░░░\n\
+  5h   20% ██░░░░░░░░ (→2h33m)\n\
+  7d   16% █░░░░░░░░░ (→5d10h)\n\
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
+
+    /// **入力待ち**の claude。完了行は `✻ Cogitated for …` で括弧つき経過時間を持たない
+    const CLAUDE_IDLE_SCREEN_V2: &str = "\
+  エディタは時間をおけば戻る見込みです。今すぐ\n\
+  再試行するか、少し待ってから続行するかご指示ください。\n\
+\n\
+✻ Cogitated for 2h 3m 31s\n\
+         new task? /clear to save 500k tokens\n\
+──────────────────────────────────────────────\n\
+❯ \n\
+──────────────────────────────────────────────\n\
+  [Opus 5 (1M context) · MAX]  🔧 worker: bu…\n\
+  ctx  50% █████░░░░░\n\
+  5h   36% ███░░░░░░░ (→2h06m)\n\
+  7d    7% ░░░░░░░░░░ (→6d20h)\n\
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← f…";
+
+    /// **入力待ち**だが、会話部分に完了済みツール行（`⏺ Reading …`）が残っている画面。
+    /// 弱マーカーの探索範囲を広げると、この画面が永遠に busy になる（#571 と同じ「不検知」）
+    const CLAUDE_IDLE_WITH_TOOL_LOG_SCREEN: &str = "\
+⏺ Reading 3 files, Running 2 shell commands, Writing 1 file…\n\
+  ⎿  完了しました\n\
+\n\
+✻ Cogitated for 1m 2s\n\
+──────────────────────────────────────────────\n\
+❯ \n\
+──────────────────────────────────────────────\n\
+  [Opus 5 · MAX]  🔧 worker: tako:571\n\
+  ctx  23% ██░░░░░░░░\n\
+  5h   20% ██░░░░░░░░ (→2h33m)\n\
+  7d   16% █░░░░░░░░░ (→5d10h)\n\
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
+
+    #[test]
+    fn 実採取claude画面のbusyとidleを取り違えない() {
+        // 修正前はここが false（= 画面 busy 判定が完全に盲目）だった
+        assert!(
+            screen_looks_busy(CLAUDE_BUSY_SCREEN_V2),
+            "スピナーはフッター 8 行の向こうにある"
+        );
+        assert!(
+            !screen_looks_busy(CLAUDE_IDLE_SCREEN_V2),
+            "完了行 `Cogitated for` を busy と読まない"
+        );
+        assert!(screen_looks_idle(CLAUDE_IDLE_SCREEN_V2));
+        // busy 中も ❯ は見えている（wait_for_worker / dispatch は busy を優先する構造）
+        assert!(screen_looks_idle(CLAUDE_BUSY_SCREEN_V2));
+    }
+
+    #[test]
+    fn 完了済みツールログのある入力待ち画面をbusyと誤判定しない() {
+        assert!(
+            !screen_looks_busy(CLAUDE_IDLE_WITH_TOOL_LOG_SCREEN),
+            "Reading / Running / Writing は完了行にも出る弱マーカー。範囲を広げてはいけない"
+        );
+        assert!(screen_looks_idle(CLAUDE_IDLE_WITH_TOOL_LOG_SCREEN));
+    }
+
+    #[test]
+    fn スピナー判定は経過時間つきの括弧だけを拾う() {
+        // 語には依存しない（claude のスピナー語は毎回変わる）
+        assert!(screen_looks_busy("✽ Herding… (3s)"));
+        assert!(screen_looks_busy("✽ Puzzling... (1m 12s · ↑ 2k tokens)"));
+        assert!(screen_looks_busy("• Working (3s • esc to interrupt)"));
+        // 経過時間で始まらない括弧には反応しない
+        assert!(!screen_looks_busy("結果をまとめました… (詳細は下記)"));
+        assert!(!screen_looks_busy(
+            "  Output written on main.pdf (10 pages)"
+        ));
+        assert!(!screen_looks_busy("  5h   20% ██░░░░░░░░ (→2h33m)"));
     }
 
     /// codex 0.144.1 の実採取画面（Issue #120）
