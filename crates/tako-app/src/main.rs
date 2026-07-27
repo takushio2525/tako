@@ -14538,9 +14538,16 @@ impl Render for TakoApp {
         // IME 経路の自己修復の保険（#332）: 本線は wire_focus_self_heal の
         // on_focus_lost（draw 末尾で発火し view render の reuse に依存しない）。
         // ここは購読が何らかの理由で効かなかった場合に、次の notify 契機で
-        // 復元する多層防御。tako は単一 focus_handle 設計で「フォーカスが無い」
-        // 正当な状態は存在しない
-        if window.focused(cx).is_none() {
+        // 復元する多層防御。tako は単一 focus_handle 設計で「フォーカスが自分に無い」
+        // 正当な状態は存在しない。
+        //
+        // #623: 判定を `focused(cx).is_none()`（フォーカスが**どこにも**無い）から
+        // 「自分のハンドルに無い」へ強化した。旧判定は他ハンドルへ移った場合を
+        // 素通りさせるが、`Window::handle_input` の登録条件は
+        // 「自分のハンドルにフォーカスがあること」なので、素通りしたフレームは
+        // 入力ハンドラが未登録になり Windows では未確定文字列が強制確定される。
+        // なお本線の防御は同一フレーム内で効く `ime_guard_frame`（canvas の prepaint）
+        if !self.focus_handle.is_focused(window) {
             window.focus(&self.focus_handle.clone(), cx);
             window.invalidate_character_coordinates();
         }
@@ -14850,6 +14857,7 @@ impl Render for TakoApp {
         let ime_registration = {
             let entity = cx.entity();
             let focus = self.focus_handle.clone();
+            let guard_focus = self.focus_handle.clone();
             let target = self.ime_target();
             let target_bounds = self
                 .pane_text_areas
@@ -14858,7 +14866,9 @@ impl Render for TakoApp {
                 .map(|(_, b)| *b)
                 .unwrap_or_else(|| Bounds::new(content_origin, content_size));
             canvas(
-                |_, _, _| (),
+                // #623: paint より**前**に、この canvas が確実に入力ハンドラを
+                // 登録できる状態へ整える。詳細は `ime_guard_frame` の doc
+                move |_, window, cx| ime_guard_frame(window, &guard_focus, cx),
                 move |_, _, window, cx| {
                     window.handle_input(
                         &focus,
@@ -15549,6 +15559,101 @@ fn restore_window(window: &mut Window) {
 /// `RawWindowHandle` の列挙子は全 OS で定義されているので `cfg` は要らない
 /// （macOS では `AppKit` に一致して `None` に落ちる）。プラットフォーム分岐は
 /// 受け取り側の境界（`tako_core::platform`）の内側に閉じる
+thread_local! {
+    /// IME 結合状態を最後に IMM32 へ問い合わせた時刻（#623。UI スレッド専用）
+    static IME_ASSOC_PROBED_AT: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+    /// 防御が発火したことを最後に記録した時刻（ログの間引き用）
+    static IME_GUARD_LOGGED_AT: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// 防御の累積発火回数（#623 の実測用。診断ログにだけ出す）
+static IME_REFOCUS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IME_REASSOC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// IME 破壊の防御（#623）。`handle_input` を呼ぶ canvas の **prepaint** から毎フレーム走る。
+///
+/// ## 何を防いでいるか
+///
+/// `Window::handle_input` は `focus_handle.is_focused(window)` が真のときしか入力ハンドラを
+/// 登録しない（`gpui/src/window.rs`）。登録が飛んだフレームは draw 末尾でハンドラが
+/// プラットフォームへ戻らず、GPUI Windows の `update_ime_enabled()` が
+/// 「このウィンドウは文字入力を受け付けない」と誤認して
+///
+/// 1. `ImmNotifyIME(NI_COMPOSITIONSTR, CPS_COMPLETE)` = **変換中の未確定文字列を強制確定**
+/// 2. `ImmAssociateContextEx(hwnd, NULL, 0)` = **IME を切り離す**（以後の打鍵が落ちる）
+///
+/// を実行する。ユーザー実機では「ばーじょん」が `ｂーじょん` になるなど、
+/// 未確定文字列が途中で確定し、その打鍵が消える形で現れた。
+///
+/// ## なぜ prepaint なのか
+///
+/// 既存の自己修復（`render` 冒頭 / `on_focus_lost`）はどちらも**このフレームの paint に
+/// 間に合わない**。`on_focus_lost` は draw 末尾で発火し、`render` 冒頭は次の notify 契機。
+/// macOS は「1 フレーム遅れて直る」で実害が無かったが、Windows はその 1 フレームで
+/// `CPS_COMPLETE` が飛ぶため取り返しがつかない。prepaint は同一フレームの paint より
+/// 前に走るので、ここで直せば「ハンドラ未登録のフレーム」自体が発生しない。
+///
+/// tako は単一 `focus_handle` 設計（メインウィンドウの `FocusHandle` はこの 1 個だけ）で、
+/// 「フォーカスが自分に無い」正当な状態は存在しない。よってフォーカスの奪い合いは起きない
+fn ime_guard_frame(window: &mut Window, focus: &FocusHandle, cx: &mut App) {
+    let focus_held = focus.is_focused(window);
+    // IMM32 への問い合わせは毎フレームやる必要が無いので 500ms に 1 回へ間引く。
+    // ただしフォーカスが外れたフレームは GPUI が切り離した直後の可能性が高いので必ず見る
+    let probe = !focus_held
+        || IME_ASSOC_PROBED_AT.with(|at| {
+            let now = std::time::Instant::now();
+            match at.get() {
+                Some(prev) if now.duration_since(prev) < Duration::from_millis(500) => false,
+                _ => {
+                    at.set(Some(now));
+                    true
+                }
+            }
+        });
+    let handle = if probe {
+        native_window_handle(window)
+    } else {
+        None
+    };
+    // probe しないフレームは `None` = 「結合状態は不明」となり、結合には触らない
+    let associated = tako_core::platform::ime::is_associated(handle);
+    let action = tako_core::platform::ime::guard_action(focus_held, associated);
+    if action.is_noop() {
+        return;
+    }
+    if action.refocus {
+        IME_REFOCUS_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        window.focus(focus, cx);
+    }
+    if action.reassociate {
+        IME_REASSOC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tako_core::platform::ime::reassociate(handle);
+    }
+    // 発火は異常事象なので記録する。毎フレーム連続で起きうるので 1 秒に 1 行へ間引く。
+    // 出すのは真偽値と回数だけで、未確定文字列は**絶対に出さない**（AGENTS.md の絶対ルール）
+    let should_log = IME_GUARD_LOGGED_AT.with(|at| {
+        let now = std::time::Instant::now();
+        match at.get() {
+            Some(prev) if now.duration_since(prev) < Duration::from_secs(1) => false,
+            _ => {
+                at.set(Some(now));
+                true
+            }
+        }
+    });
+    if should_log {
+        tako_control::diag::perf_log(&format!(
+            "ime-guard: refocus={} reassociate={} (累計 refocus={} reassoc={})",
+            action.refocus,
+            action.reassociate,
+            IME_REFOCUS_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            IME_REASSOC_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+        ));
+    }
+}
+
 fn native_window_handle(window: &Window) -> Option<isize> {
     let handle = raw_window_handle::HasWindowHandle::window_handle(window).ok()?;
     match handle.as_raw() {
