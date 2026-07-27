@@ -4678,8 +4678,10 @@ mod tests {
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
         // 件数の固定値。ツール追加時はここと対応マトリクス（#515）の両方を更新する
-        // （分類漏れ自体は tests/platform_parity.rs の T1 が検出する）
-        assert_eq!(tools.len(), 126);
+        // （分類漏れ自体は tests/platform_parity.rs の T1 が検出する）。
+        // #549 の tako_welcome と #552 の tako_pin_tab_title が別 PR で同時に
+        // 125 → 126 へ更新したため、両方 merge 後の main では 127 とずれていた
+        assert_eq!(tools.len(), 127);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
