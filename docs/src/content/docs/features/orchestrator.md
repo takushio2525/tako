@@ -17,18 +17,11 @@ tako master
 
 tako 内のターミナルで `tako master` を実行すると、次のことが自動で行われます。
 
-1. **新しいタブ「master」が作られる** — 以後、このタブがオーケストレーションの舞台になります
-2. **claude が司令塔モードで起動する** — 司令塔としての指示書（system prompt）付きで起動するため、普通の claude と違い「自分で手を動かさず、worker に作業を委任して監視する」動き方をします
-3. **プロファイル（モデル設定）が読み込まれる** — 既定は「claude CLI の既定モデル / worker は master と同じ」。どの Claude プランでもそのまま動きます
+1. **今いるペインが master になる** — 既定では新しいタブを作らず、その場で司令塔が立ち上がります。以後このタブがオーケストレーションの舞台です（専用タブを立てたいときは `tako master --tab`）
+2. **司令塔モードで起動する** — 司令塔としての指示書（system prompt）付きで起動するため、普通のエージェントと違い「自分で手を動かさず、worker に作業を委任して監視する」動き方をします
+3. **プロファイル（モデル設定）が読み込まれる** — 既定は「エージェント CLI の既定モデル / worker は master と同じ」。どのプランでもそのまま動きます
 
-起動が終わると、こんなメッセージが表示されます。
-
-```
-master を起動しました: タブ 'master'（ペイン N）
-プロファイル: default（モデル: claude 既定、effort: max）
-```
-
-あとは master のペインに向かって、やってほしいことを話しかけるだけです。
+起動時にはプロファイル名と解決されたモデル・思考量（effort）、アカウントを指定していればその名前も表示されます。あとは master のペインに向かって、やってほしいことを話しかけるだけです。
 
 :::note[どのディレクトリから実行しても OK]
 `tako master` は実行時のディレクトリに縛られません。ホームディレクトリからでも、どこか別のリポジトリの中からでも、master は登録済みの全プロジェクトにアクセスできます。
@@ -132,9 +125,24 @@ master が裏でやっていることを少しだけ紹介します。すべて�
 |---|---|
 | `projects.yaml` | 管理対象プロジェクトの登録（key・作業ディレクトリ・説明） |
 | `profiles/<名前>.yaml` | master / worker のエージェント CLI・モデル・effort・worker ポリシー。**起動設定の唯一の正** |
+| `accounts.yaml` | worker ごとに使い分けるアカウントの登録（`tako orchestrator accounts`） |
+| `workers.yaml` | spawn 済み worker のレジストリ（ペインが消えても追跡できる） |
 | `config.yaml` | セットアップ状態と挙動フラグ（auto_close / auto_push） |
 | `master-system.md` | （置いた場合のみ）master の system prompt を差し替えるカスタムファイル |
+| `conflict-resolver.md` | （置いた場合のみ）git コンフリクト解消エージェントへ渡す文面 |
 
 worker のモデルはプロファイルの `worker_model_policy` で決まります: `inherit`（master と同じ・既定）/ `fixed`（別の固定モデル）/ `delegate`（master がタスク内容を見て判断）。master / worker のエージェント CLI は `master_agent`（claude / codex）・`worker_agent`（claude / codex / agy）で選べます。master が claude 以外のときは、プロファイルの `model` / `effort` は claude worker へ継承されません。
 
-CLI から手動で操作したい場合（`tako orchestrator projects / profiles / spawn / run / status / watch`）は [CLI リファレンス](/guides/cli-reference/#オーケストレーター)を参照してください。master が内部で使っているのと同じ操作を、スクリプトからも実行できます。
+CLI から手動で操作したい場合は [CLI リファレンス](/guides/cli-reference/#オーケストレーター)を参照してください。master が内部で使っているのと同じ操作を、スクリプトからも実行できます。
+
+### worker を見失わない仕組み
+
+spawn した worker は `workers.yaml` のレジストリに記録されます。ペインを閉じてしまっても、tako を再起動しても、worker は ID で追跡し続けられます。
+
+```bash
+tako orchestrator workers            # spawn 済み worker の一覧（ペインの生死と無関係）
+tako orchestrator watch --worker <ID> # ペインが消えた後でも完了を待てる
+tako orchestrator report --worker <ID> # 報告内容を取り出す
+```
+
+worker が権限確認のダイアログで止まっているときは `WORKER_PERMISSION` として検知され、`tako orchestrator respond` で応答できます。master はこれを自動で扱うので、通常は意識する必要はありません。

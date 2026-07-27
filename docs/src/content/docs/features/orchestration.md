@@ -102,7 +102,7 @@ tako setup
 tako master
 ```
 
-新しいタブに profile で選ばれた master（claude または codex）が立ち上がります。あとは話しかけるだけです。
+今いるペインに、profile で選ばれた master（claude または codex）が立ち上がります（専用タブにしたいときは `tako master --tab`）。あとは話しかけるだけです。
 
 > 「`~/Documents/webapp` のリポジトリを管理対象に追加して、README を最新のコマンド体系に合わせて書き直して」
 

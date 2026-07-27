@@ -1,56 +1,112 @@
 /*
- * tako Theme — Astro Starlight 用「親しみやすく、きちんと洗練された」テーマ v2
+ * tako Theme — Astro Starlight 用「親しみやすく、きちんと洗練された」テーマ v3
  *
- * 方針:
- *  - ベースは温かみのあるニュートラル（オフホワイト / ダークはプラム寄りチャコール）
- *  - コーラルピンク（tako アイコン色）は「アクセント」に限定 – 塗りすぎない
- *  - 緑のプロンプト色はターミナル / ヒント系のセカンダリアクセント
- *  - 見出しの重い下線ボーダーを廃止し、ウェイト・余白・小さなアクセントで階層を作る
- *  - 枠線は控えめなヘアライン + やわらかい影の角丸カードへ
- *  - タコのマスコット（.hero img）をふわりと浮遊させて主役に
- *
- * このファイルを src/styles/tako-theme.css に上書きしてください。
+ * v3 の方針（v2 の性格は残したまま現代化する）:
+ *  - 受け継ぐもの: 温かみのあるニュートラル地 / コーラルピンクのアクセント /
+ *    緑のセカンダリ / 丸みのある形 / 浮遊するタコのマスコット / 見出しの「—」
+ *  - 現代化するもの:
+ *      1. トークンを階層化（space / radius / shadow / easing を変数に）
+ *      2. 影を「1 枚のぼかし」から「多層の淡い影」へ（今どきの立体感）
+ *      3. 余白とタイポのリズムを 1 つのスケールに統一
+ *      4. 動きに ease-out-quart 系のイージングを与える
+ *      5. 日本語の折り返し（line-break / overflow-wrap）を明示制御
+ *      6. モバイル: 横溢れの根絶とタップ領域の確保
+ *  - 修正した実バグ:
+ *      a. ランディングのターミナルブロックが横に溢れ、はみ出した部分に
+ *         スクロールで到達できない（親の overflow:hidden で切られていた）。
+ *         スマホ幅では brew のコマンドが最後まで読めなかった
+ *      b. ランディングで本文幅が狭いまま右側が大きく余る
  */
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Noto+Sans+JP:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Noto+Sans+JP:wght@400;500;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+/* ============================================================
+ * 共通トークン（テーマ非依存）
+ * ============================================================ */
+:root {
+  /* 余白スケール（4px 基準） */
+  --tako-space-1: 0.25rem;
+  --tako-space-2: 0.5rem;
+  --tako-space-3: 0.75rem;
+  --tako-space-4: 1rem;
+  --tako-space-6: 1.5rem;
+  --tako-space-8: 2rem;
+  --tako-space-12: 3rem;
+  --tako-space-16: 4rem;
+
+  /* 角丸スケール */
+  --tako-radius-sm: 8px;
+  --tako-radius-md: 12px;
+  --tako-radius-lg: 16px;
+  --tako-radius-xl: 22px;
+  --tako-radius-pill: 999px;
+
+  /* イージング（減速を強めにして「気持ちよさ」を出す） */
+  --tako-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --tako-ease-soft: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* 本文の最大字数（可読性の要） */
+  --tako-measure: 74ch;
+}
 
 /* ============================================================
  * ライトモード
  * ============================================================ */
 :root {
-  /* tako トークン（ニュートラル基調） */
+  /* 地の色（温かいオフホワイト） */
   --tako-bg: #fdfcfb;
   --tako-bg-warm: #faf6f2;
-  --tako-surface: #f7f4f2;
-  --tako-surface-2: #efeae7;
+  --tako-surface: #f6f2ef;
+  --tako-surface-2: #ece5df;
   --tako-card: #ffffff;
 
   /* インク（温かみのあるプラムグレー） */
   --tako-ink: #2e2933;
-  --tako-ink-muted: #6f6875;
+  --tako-ink-muted: #6b6472;
   --tako-ink-subtle: #a79fac;
 
-  /* アクセント（コーラルピンク – 効かせる用） */
-  --tako-accent: #e85d8a;
-  --tako-accent-strong: #cf4772;
-  --tako-accent-soft: rgba(232, 93, 138, 0.10);
-  --tako-accent-line: rgba(232, 93, 138, 0.22);
-  --tako-accent-glow: 0 4px 16px -4px rgba(232, 93, 138, 0.25);
+  /* アクセント（コーラルピンク） */
+  --tako-accent: #e15a86;
+  --tako-accent-strong: #c8406b;
+  --tako-accent-soft: rgba(225, 90, 134, 0.09);
+  --tako-accent-line: rgba(225, 90, 134, 0.22);
 
   /* グリーン（ターミナル / ヒント） */
-  --tako-green: #3aaa6e;
-  --tako-green-soft: rgba(58, 170, 110, 0.08);
+  --tako-green: #2f9c63;
+  --tako-green-soft: rgba(47, 156, 99, 0.09);
 
   /* ボーダー */
   --tako-border: #ece5df;
-  --tako-border-strong: #ddd4cc;
-  --tako-border-soft: #f3ede8;
+  --tako-border-strong: #dcd2ca;
+  --tako-border-soft: #f4efeb;
+
+  /* 影（多層。色を黒ではなくインク寄りにして濁りを防ぐ） */
+  --tako-shadow-sm: 0 1px 2px rgba(46, 41, 51, 0.05);
+  --tako-shadow-md: 0 1px 2px rgba(46, 41, 51, 0.04), 0 4px 12px -2px rgba(46, 41, 51, 0.07);
+  --tako-shadow-lg: 0 1px 3px rgba(46, 41, 51, 0.05), 0 10px 28px -6px rgba(46, 41, 51, 0.12);
+  --tako-shadow-accent: 0 2px 6px -1px rgba(225, 90, 134, 0.24), 0 8px 22px -6px rgba(225, 90, 134, 0.3);
+
+  /* カード上端のハイライト（微妙な立体感） */
+  --tako-card-sheen: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+
+  /* ヒーロー背景のグラデーション */
+  --tako-hero-glow-1: rgba(225, 90, 134, 0.11);
+  --tako-hero-glow-2: rgba(47, 156, 99, 0.09);
+
+  /* ターミナル配色（明暗共通で暗色を使う） */
+  --tako-term-bg: #211d28;
+  --tako-term-bar: #171320;
+  --tako-term-fg: #e6e3ee;
+  --tako-term-dim: #8b849c;
+  --tako-term-cmd: #8fe0a8;
+  --tako-term-prompt: #89b4fa;
 
   /* Starlight マッピング */
   --sl-font: 'Inter', 'Noto Sans JP', system-ui, -apple-system, sans-serif;
   --sl-font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
   --sl-text-base: 15.5px;
-  --sl-line-height: 1.75;
+  --sl-line-height: 1.8;
+  --sl-content-width: 48rem;
 
   --sl-color-white: var(--tako-ink);
   --sl-color-black: var(--tako-bg);
@@ -58,7 +114,7 @@
   --sl-color-text-accent: var(--tako-accent);
   --sl-color-text-invert: #ffffff;
   --sl-color-bg: var(--tako-bg);
-  --sl-color-bg-nav: var(--tako-bg);
+  --sl-color-bg-nav: rgba(253, 252, 251, 0.85);
   --sl-color-bg-sidebar: var(--tako-bg-warm);
   --sl-color-bg-inline-code: var(--tako-accent-soft);
   --sl-color-bg-accent: var(--tako-accent);
@@ -67,11 +123,11 @@
   --sl-color-accent: var(--tako-accent);
   --sl-color-accent-high: var(--tako-accent-strong);
 
-  --sl-color-gray-1: #f7f4f2;
+  --sl-color-gray-1: #f6f2ef;
   --sl-color-gray-2: #ece5df;
-  --sl-color-gray-3: #ddd4cc;
+  --sl-color-gray-3: #dcd2ca;
   --sl-color-gray-4: #a79fac;
-  --sl-color-gray-5: #6f6875;
+  --sl-color-gray-5: #6b6472;
   --sl-color-gray-6: #2e2933;
   --sl-color-gray-7: #1a1520;
 
@@ -84,28 +140,40 @@
  * ダークモード
  * ============================================================ */
 :root[data-theme='dark'] {
-  --tako-bg: #1c1821;
-  --tako-bg-warm: #211d28;
-  --tako-surface: #28232f;
-  --tako-surface-2: #322d3a;
-  --tako-card: #28232f;
+  --tako-bg: #191520;
+  --tako-bg-warm: #1e1926;
+  --tako-surface: #251f2e;
+  --tako-surface-2: #302939;
+  --tako-card: #221d2b;
 
-  --tako-ink: #ece5df;
+  --tako-ink: #ede7f0;
   --tako-ink-muted: #a79fac;
-  --tako-ink-subtle: #6f6875;
+  --tako-ink-subtle: #7b7388;
 
-  --tako-accent: #f0799f;
-  --tako-accent-strong: #ffa3bf;
-  --tako-accent-soft: rgba(240, 121, 159, 0.14);
-  --tako-accent-line: rgba(240, 121, 159, 0.25);
-  --tako-accent-glow: 0 4px 16px -4px rgba(240, 121, 159, 0.30);
+  --tako-accent: #f5809f;
+  --tako-accent-strong: #ffa8c2;
+  --tako-accent-soft: rgba(245, 128, 159, 0.13);
+  --tako-accent-line: rgba(245, 128, 159, 0.26);
 
-  --tako-green: #5ece8c;
-  --tako-green-soft: rgba(94, 206, 140, 0.10);
+  --tako-green: #63d493;
+  --tako-green-soft: rgba(99, 212, 147, 0.11);
 
-  --tako-border: #322d3a;
-  --tako-border-strong: #433d4d;
-  --tako-border-soft: #28232f;
+  --tako-border: #302939;
+  --tako-border-strong: #423a4d;
+  --tako-border-soft: #251f2e;
+
+  --tako-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --tako-shadow-md: 0 1px 2px rgba(0, 0, 0, 0.28), 0 4px 14px -2px rgba(0, 0, 0, 0.4);
+  --tako-shadow-lg: 0 1px 3px rgba(0, 0, 0, 0.3), 0 12px 32px -8px rgba(0, 0, 0, 0.55);
+  --tako-shadow-accent: 0 2px 8px -2px rgba(245, 128, 159, 0.3), 0 10px 26px -8px rgba(245, 128, 159, 0.34);
+
+  --tako-card-sheen: inset 0 1px 0 rgba(255, 255, 255, 0.045);
+
+  --tako-hero-glow-1: rgba(245, 128, 159, 0.14);
+  --tako-hero-glow-2: rgba(99, 212, 147, 0.1);
+
+  --tako-term-bg: #16121d;
+  --tako-term-bar: #100d16;
 
   --sl-color-white: var(--tako-ink);
   --sl-color-black: var(--tako-bg);
@@ -113,7 +181,7 @@
   --sl-color-text-accent: var(--tako-accent);
   --sl-color-text-invert: var(--tako-bg);
   --sl-color-bg: var(--tako-bg);
-  --sl-color-bg-nav: var(--tako-bg);
+  --sl-color-bg-nav: rgba(25, 21, 32, 0.85);
   --sl-color-bg-sidebar: var(--tako-bg-warm);
   --sl-color-bg-inline-code: var(--tako-accent-soft);
   --sl-color-bg-accent: var(--tako-accent);
@@ -122,12 +190,12 @@
   --sl-color-accent: var(--tako-accent);
   --sl-color-accent-high: var(--tako-accent-strong);
 
-  --sl-color-gray-1: #211d28;
-  --sl-color-gray-2: #322d3a;
-  --sl-color-gray-3: #433d4d;
-  --sl-color-gray-4: #6f6875;
+  --sl-color-gray-1: #1e1926;
+  --sl-color-gray-2: #302939;
+  --sl-color-gray-3: #423a4d;
+  --sl-color-gray-4: #7b7388;
   --sl-color-gray-5: #a79fac;
-  --sl-color-gray-6: #ece5df;
+  --sl-color-gray-6: #ede7f0;
   --sl-color-gray-7: #faf6f2;
 
   --sl-color-hairline: var(--tako-border);
@@ -143,12 +211,29 @@ body {
   color: var(--tako-ink);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: 'palt' 1; /* 日本語の約物を詰める */
+}
+
+/* 日本語の折り返し規則。長い英単語・URL は折るが、日本語は禁則を守る */
+.sl-markdown-content p,
+.sl-markdown-content li,
+.sl-markdown-content td,
+.sl-markdown-content th {
+  line-break: strict;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+/* 見出しは単語の途中で折らない（日本語 + 英語混在で崩れるため） */
+.sl-markdown-content :is(h1, h2, h3, h4, h5, h6) {
+  overflow-wrap: break-word;
+  text-wrap: balance;
 }
 
 /* ============================================================
- * ランディングページ: ヒーロー（通常テンプレート内に収まる版）
+ * ランディングページ
  * ============================================================ */
-/* Starlight 自動タイトル・右目次をランディングページでは非表示 */
+/* Starlight 自動タイトル・右目次をランディングでは隠す */
 main:has(.tako-landing) > .content-panel:first-child {
   display: none;
 }
@@ -156,9 +241,20 @@ main:has(.tako-landing) ~ [class*='right-sidebar'],
 main:has(.tako-landing) ~ aside {
   display: none;
 }
-/* ランディングではメインコンテンツを幅いっぱいに */
+
+/* [修正 b] ランディングは本文の字数制限を外し、独自の最大幅で中央に置く */
 :has(.tako-landing) .main-pane {
   max-width: 100%;
+}
+:has(.tako-landing) .sl-markdown-content {
+  max-width: 100%;
+}
+.tako-landing {
+  max-width: 62rem;
+  margin-inline: auto;
+  /* 装飾のはみ出しでページが横スクロールしないための保険。
+   * clip はスクロールコンテナを作らないので sticky 等に影響しない */
+  overflow-x: clip;
 }
 
 .tako-landing h1,
@@ -173,14 +269,32 @@ main:has(.tako-landing) ~ aside {
   content: none !important;
 }
 
+/* --- ヒーロー --- */
 .tako-hero {
-  padding: 3rem 0 2.5rem;
+  position: relative;
+  padding: var(--tako-space-12) 0 var(--tako-space-8);
+}
+
+/* 背景のやわらかい光。マスコットの後ろに置いて主役を引き立てる。
+ * 左右へはみ出させない（はみ出すとページ全体が横スクロールしてしまう）。
+ * 画面外へ滲む見え方はグラデーションの広がりで作る */
+.tako-hero::before {
+  content: '';
+  position: absolute;
+  inset: -12% 0 0 0;
+  background:
+    radial-gradient(70% 74% at 84% 30%, var(--tako-hero-glow-1), transparent 70%),
+    radial-gradient(58% 64% at 6% 6%, var(--tako-hero-glow-2), transparent 72%);
+  pointer-events: none;
+  z-index: 0;
 }
 
 .tako-hero-inner {
+  position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
-  gap: 2.5rem;
+  gap: var(--tako-space-8);
 }
 
 .tako-hero-content {
@@ -193,32 +307,40 @@ main:has(.tako-landing) ~ aside {
   align-items: center;
   gap: 0.5em;
   background: var(--tako-green-soft);
-  border: 1px solid rgba(58, 170, 110, 0.25);
-  border-radius: 999px;
-  padding: 0.35em 1em;
-  font-size: 0.85rem;
-  font-weight: 500;
+  border: 1px solid rgba(47, 156, 99, 0.24);
+  border-radius: var(--tako-radius-pill);
+  padding: 0.4em 1em;
+  font-size: 0.82rem;
+  font-weight: 600;
   color: var(--tako-green);
-  margin-bottom: 1.5rem;
+  margin-bottom: var(--tako-space-6);
+  letter-spacing: 0.01em;
 }
 
 .tako-badge-dot {
   display: inline-block;
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--tako-green);
-  box-shadow: 0 0 6px rgba(58, 170, 110, 0.5);
+  box-shadow: 0 0 0 3px var(--tako-green-soft);
+  animation: tako-pulse 2.4s var(--tako-ease-soft) infinite;
+}
+
+@keyframes tako-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
 }
 
 .tako-hero-title {
   font-family: var(--sl-font) !important;
-  font-size: clamp(2rem, 4.5vw, 2.6rem);
+  font-size: clamp(2rem, 4.6vw, 2.9rem);
   font-weight: 800;
-  line-height: 1.3;
-  letter-spacing: -0.02em;
+  line-height: 1.28;
+  letter-spacing: -0.025em;
   color: var(--tako-ink);
-  margin: 0 0 1.2rem;
+  margin: 0 0 var(--tako-space-4);
+  text-wrap: balance;
 }
 
 .tako-highlight {
@@ -226,30 +348,34 @@ main:has(.tako-landing) ~ aside {
 }
 
 .tako-hero-tagline {
-  font-size: 1rem;
-  line-height: 1.8;
+  font-size: 1.02rem;
+  line-height: 1.85;
   color: var(--tako-ink-muted);
-  margin: 0 0 2rem;
-  max-width: 520px;
+  margin: 0 0 var(--tako-space-8);
+  max-width: 34em;
 }
 
 .tako-hero-actions {
   display: flex;
-  gap: 0.8rem;
+  gap: var(--tako-space-3);
   flex-wrap: wrap;
+  align-items: center;
 }
 
 .tako-btn {
   display: inline-flex;
   align-items: center;
-  gap: 0.4em;
+  justify-content: center;
+  gap: 0.45em;
   font-family: var(--sl-font);
   font-weight: 600;
   font-size: 0.95rem;
-  border-radius: 12px;
-  padding: 0.75em 1.6em;
+  border-radius: var(--tako-radius-md);
+  padding: 0.78em 1.6em;
+  min-height: 44px; /* タップ領域 */
   text-decoration: none !important;
-  transition: all 0.2s ease;
+  transition: transform 0.25s var(--tako-ease), box-shadow 0.25s var(--tako-ease),
+    border-color 0.2s var(--tako-ease-soft), color 0.2s var(--tako-ease-soft);
   cursor: pointer;
 }
 
@@ -257,13 +383,12 @@ main:has(.tako-landing) ~ aside {
   background: linear-gradient(135deg, var(--tako-accent) 0%, var(--tako-accent-strong) 100%);
   color: #ffffff !important;
   border: 1px solid transparent;
-  box-shadow: var(--tako-accent-glow);
+  box-shadow: var(--tako-shadow-accent);
 }
 
 .tako-btn-primary:hover {
-  filter: brightness(1.08);
-  box-shadow: 0 6px 20px -4px rgba(232, 93, 138, 0.4);
-  transform: translateY(-1px);
+  transform: translateY(-2px);
+  box-shadow: 0 4px 10px -2px rgba(225, 90, 134, 0.3), 0 14px 32px -8px rgba(225, 90, 134, 0.42);
   color: #ffffff !important;
 }
 
@@ -271,55 +396,50 @@ main:has(.tako-landing) ~ aside {
   background: var(--tako-card);
   color: var(--tako-ink) !important;
   border: 1px solid var(--tako-border-strong);
+  box-shadow: var(--tako-shadow-sm);
 }
 
 .tako-btn-secondary:hover {
   border-color: var(--tako-accent);
   color: var(--tako-accent) !important;
+  transform: translateY(-2px);
+  box-shadow: var(--tako-shadow-md);
 }
 
 :root[data-theme='dark'] .tako-btn-secondary {
   background: var(--tako-surface);
-  border-color: var(--tako-border-strong);
-  color: var(--tako-ink) !important;
-}
-
-:root[data-theme='dark'] .tako-btn-secondary:hover {
-  border-color: var(--tako-accent);
-  color: var(--tako-accent) !important;
 }
 
 .tako-hero-visual {
   flex-shrink: 0;
-  width: 200px;
+  width: 210px;
 }
 
 .tako-mascot {
   width: 100%;
   height: auto;
-  animation: tako-float 4s ease-in-out infinite;
-  filter: drop-shadow(0 12px 24px rgba(232, 93, 138, 0.15));
+  animation: tako-float 5s ease-in-out infinite;
+  filter: drop-shadow(0 14px 28px rgba(225, 90, 134, 0.18));
 }
 
 @keyframes tako-float {
   0%, 100% { transform: translateY(0) rotate(0deg); }
-  25% { transform: translateY(-8px) rotate(1deg); }
-  75% { transform: translateY(4px) rotate(-1deg); }
+  25% { transform: translateY(-9px) rotate(1.2deg); }
+  75% { transform: translateY(5px) rotate(-1.2deg); }
 }
 
-/* ============================================================
- * ランディングページ: セクション共通
- * ============================================================ */
+/* --- セクション共通 --- */
 .tako-section {
-  padding: 2.5rem 0;
+  padding: var(--tako-space-12) 0 var(--tako-space-8);
 }
 
 .tako-section-title {
   font-family: var(--sl-font) !important;
-  font-size: 1.4rem;
+  font-size: 1.45rem;
   font-weight: 700;
+  letter-spacing: -0.015em;
   color: var(--tako-ink);
-  margin: 0 0 1.8rem;
+  margin: 0 0 var(--tako-space-2);
   display: flex;
   align-items: baseline;
   gap: 0.5em;
@@ -331,94 +451,142 @@ main:has(.tako-landing) ~ aside {
   font-weight: 700;
 }
 
-/* ============================================================
- * ランディングページ: 機能カード
- * ============================================================ */
+.tako-section-lead {
+  color: var(--tako-ink-muted);
+  font-size: 0.95rem;
+  margin: 0 0 var(--tako-space-6);
+  max-width: 42em;
+}
+
+/* --- 数字ストリップ --- */
+.tako-stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--tako-space-3);
+  margin: var(--tako-space-8) 0 0;
+  padding: var(--tako-space-6);
+  border-radius: var(--tako-radius-lg);
+  background: linear-gradient(135deg, var(--tako-bg-warm), var(--tako-surface));
+  border: 1px solid var(--tako-border);
+}
+
+.tako-stat {
+  text-align: center;
+  min-width: 0;
+}
+
+.tako-stat-num {
+  display: block;
+  font-family: var(--sl-font);
+  font-size: 1.7rem;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  color: var(--tako-accent);
+  line-height: 1.15;
+}
+
+.tako-stat-label {
+  display: block;
+  font-size: 0.78rem;
+  color: var(--tako-ink-muted);
+  margin-top: 0.3em;
+  line-height: 1.5;
+}
+
+/* --- 機能カード --- */
 .tako-card-grid {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+  gap: var(--tako-space-4);
 }
 
 .tako-card {
+  position: relative;
   background: var(--tako-card);
-  border-radius: 14px;
-  padding: 1.4rem;
-  transition: all 0.2s ease;
+  border-radius: var(--tako-radius-lg);
+  padding: var(--tako-space-6);
   border: 1px solid var(--tako-border);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+  box-shadow: var(--tako-shadow-sm), var(--tako-card-sheen);
+  transition: transform 0.3s var(--tako-ease), box-shadow 0.3s var(--tako-ease),
+    border-color 0.25s var(--tako-ease-soft);
 }
 
 .tako-card:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.06);
+  transform: translateY(-3px);
+  box-shadow: var(--tako-shadow-lg), var(--tako-card-sheen);
   border-color: var(--tako-accent-line);
 }
 
-:root[data-theme='dark'] .tako-card {
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
-}
-
-:root[data-theme='dark'] .tako-card:hover {
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
-}
-
 .tako-card-icon {
-  width: 42px;
-  height: 42px;
-  border-radius: 10px;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--tako-radius-md);
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 20px;
-  margin-bottom: 0.8rem;
+  margin-bottom: var(--tako-space-4);
+}
+
+.tako-card-icon svg {
+  width: 20px;
+  height: 20px;
+  display: block;
 }
 
 .tako-card-icon-pink {
   background: var(--tako-accent-soft);
+  color: var(--tako-accent);
 }
 
 .tako-card-icon-green {
   background: var(--tako-green-soft);
+  color: var(--tako-green);
 }
 
 .tako-card h3 {
   font-family: var(--sl-font) !important;
-  font-size: 1rem;
+  font-size: 1.02rem;
   font-weight: 700;
   color: var(--tako-ink);
-  margin: 0 0 0.4rem;
+  margin: 0 0 var(--tako-space-2);
+  letter-spacing: -0.01em;
 }
 
 .tako-card p {
-  font-size: 0.88rem;
-  line-height: 1.7;
+  font-size: 0.885rem;
+  line-height: 1.75;
   color: var(--tako-ink-muted);
   margin: 0;
+  overflow-wrap: anywhere;
+  line-break: strict;
 }
 
-/* ============================================================
- * ランディングページ: はじめよう（ターミナルブロック）
- * ============================================================ */
+.tako-card code {
+  font-size: 0.85em;
+}
+
+/* --- ターミナルブロック --- */
 .tako-terminal-block {
-  border-radius: 12px;
+  border-radius: var(--tako-radius-md);
   overflow: hidden;
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.12);
-  max-width: 640px;
+  box-shadow: var(--tako-shadow-lg);
+  max-width: 44rem;
+  border: 1px solid rgba(0, 0, 0, 0.35);
 }
 
 .tako-terminal-header {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 10px 16px;
-  background: #1c1821;
+  padding: 11px 16px;
+  background: var(--tako-term-bar);
 }
 
 .tako-dot {
-  width: 12px;
-  height: 12px;
+  width: 11px;
+  height: 11px;
   border-radius: 50%;
+  flex-shrink: 0;
 }
 
 .tako-dot-red { background: #f38ba8; }
@@ -429,49 +597,101 @@ main:has(.tako-landing) ~ aside {
   flex: 1;
   text-align: center;
   font-family: var(--sl-font-mono);
-  font-size: 0.75rem;
-  color: #6c7086;
-  margin-right: 44px;
+  font-size: 0.74rem;
+  color: var(--tako-term-dim);
+  margin-right: 41px;
 }
 
+/* [修正 a] 溢れたら横スクロールさせる。以前は親の overflow:hidden で切られ、
+   はみ出した文字にスクロールでも到達できなかった */
 .tako-terminal-body {
-  background: #211d28;
-  padding: 1.2rem 1.4rem;
+  background: var(--tako-term-bg);
+  padding: var(--tako-space-4) var(--tako-space-6);
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .tako-terminal-line {
   font-family: var(--sl-font-mono);
-  font-size: 0.88rem;
-  line-height: 1.8;
-  color: #cdd6f4;
+  font-size: 0.86rem;
+  line-height: 1.85;
+  color: var(--tako-term-fg);
   white-space: pre;
+  width: max-content;
+  min-width: 100%;
 }
 
-.tako-terminal-comment { color: #6c7086; }
-.tako-terminal-cmd { color: #a6e3a1; }
-.tako-terminal-prompt { color: #89b4fa; }
+.tako-terminal-comment { color: var(--tako-term-dim); }
+.tako-terminal-cmd { color: var(--tako-term-cmd); }
+.tako-terminal-prompt { color: var(--tako-term-prompt); }
 
 .tako-guide-link {
-  margin-top: 1.5rem !important;
-  font-size: 0.95rem;
+  margin-top: var(--tako-space-6) !important;
+  font-size: 0.94rem;
   color: var(--tako-ink-muted);
 }
 
 .tako-guide-link a {
   color: var(--tako-accent) !important;
+  font-weight: 500;
 }
 
-/* ============================================================
- * ランディングページ: レスポンシブ
- * ============================================================ */
+/* --- 次の一歩リンクカード --- */
+.tako-next-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--tako-space-3);
+}
+
+.tako-next-card {
+  display: block;
+  padding: var(--tako-space-4) var(--tako-space-6);
+  border-radius: var(--tako-radius-md);
+  border: 1px solid var(--tako-border);
+  background: var(--tako-card);
+  text-decoration: none !important;
+  box-shadow: var(--tako-shadow-sm);
+  transition: transform 0.25s var(--tako-ease), box-shadow 0.25s var(--tako-ease),
+    border-color 0.2s var(--tako-ease-soft);
+}
+
+.tako-next-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--tako-accent);
+  box-shadow: var(--tako-shadow-md);
+}
+
+.tako-next-card strong {
+  display: block;
+  color: var(--tako-ink);
+  font-size: 0.97rem;
+  margin-bottom: 0.25em;
+}
+
+.tako-next-card span {
+  display: block;
+  color: var(--tako-ink-muted);
+  font-size: 0.84rem;
+  line-height: 1.65;
+}
+
+/* --- ランディングのレスポンシブ --- */
+@media (max-width: 900px) {
+  .tako-stats {
+    grid-template-columns: repeat(2, 1fr);
+    gap: var(--tako-space-4);
+  }
+}
+
 @media (max-width: 768px) {
   .tako-hero {
-    padding: 2rem 0;
+    padding: var(--tako-space-6) 0 var(--tako-space-8);
   }
 
   .tako-hero-inner {
     flex-direction: column;
     text-align: center;
+    gap: var(--tako-space-4);
   }
 
   .tako-hero-tagline {
@@ -482,13 +702,30 @@ main:has(.tako-landing) ~ aside {
     justify-content: center;
   }
 
+  .tako-hero-actions .tako-btn {
+    flex: 1 1 auto;
+    min-width: 12rem;
+  }
+
   .tako-hero-visual {
-    width: 140px;
+    width: 132px;
     order: -1;
   }
 
-  .tako-card-grid {
-    grid-template-columns: 1fr;
+  .tako-section {
+    padding: var(--tako-space-8) 0 var(--tako-space-4);
+  }
+
+  .tako-section-title {
+    font-size: 1.3rem;
+  }
+
+  .tako-terminal-body {
+    padding: var(--tako-space-4);
+  }
+
+  .tako-terminal-line {
+    font-size: 0.8rem;
   }
 }
 
@@ -496,7 +733,9 @@ main:has(.tako-landing) ~ aside {
  * ヘッダー
  * ============================================================ */
 header.header {
-  background: var(--tako-bg) !important;
+  background: var(--sl-color-bg-nav) !important;
+  backdrop-filter: saturate(1.6) blur(12px);
+  -webkit-backdrop-filter: saturate(1.6) blur(12px);
   border-bottom: 1px solid var(--tako-border);
 }
 
@@ -505,10 +744,11 @@ header.header [class*='site-title'] {
   color: var(--tako-ink);
   font-family: var(--sl-font);
   font-weight: 700;
+  letter-spacing: -0.01em;
 }
 
 [class*='site-title'] img {
-  border-radius: 8px;
+  border-radius: var(--tako-radius-sm);
 }
 
 site-search button,
@@ -517,8 +757,13 @@ site-search button,
   background: var(--tako-surface) !important;
   border: 1px solid var(--tako-border) !important;
   color: var(--tako-ink-muted) !important;
-  border-radius: 10px;
+  border-radius: var(--tako-radius-md);
   font-family: var(--sl-font);
+  transition: border-color 0.2s var(--tako-ease-soft);
+}
+
+site-search button:hover {
+  border-color: var(--tako-border-strong) !important;
 }
 
 /* ============================================================
@@ -526,17 +771,28 @@ site-search button,
  * ============================================================ */
 nav.sidebar,
 nav[class*='sidebar'] {
-  background: var(--tako-bg-warm) !important;
+  background: var(--sl-color-bg-sidebar) !important;
   border-right: 1px solid var(--tako-border);
+}
+
+/* 項目が増えたぶんスクロール量も増えるので、末尾の「こまったら？」まで
+   気持ちよく届くよう下端に余白を足す（スクロール自体は Starlight 側で効いている） */
+.sidebar-pane {
+  overscroll-behavior: contain;
+}
+
+.sidebar-content,
+nav.sidebar > .sidebar-content {
+  padding-bottom: var(--tako-space-8);
 }
 
 .sidebar a,
 nav[class*='sidebar'] a {
   color: var(--tako-ink) !important;
   font-family: var(--sl-font);
-  font-size: 0.93rem;
-  border-radius: 8px;
-  transition: all 0.15s;
+  font-size: 0.92rem;
+  border-radius: var(--tako-radius-sm);
+  transition: background-color 0.18s var(--tako-ease-soft), color 0.18s var(--tako-ease-soft);
 }
 
 .sidebar a:hover,
@@ -545,13 +801,27 @@ nav[class*='sidebar'] a:hover {
   color: var(--tako-accent) !important;
 }
 
+/* 現在ページ: 3px の硬い縦線をやめ、やわらかいピル + 左のドットに */
 .sidebar a[aria-current='page'],
 nav[class*='sidebar'] a[aria-current='page'] {
   background: var(--tako-accent-soft) !important;
   color: var(--tako-accent-strong) !important;
   font-weight: 600;
-  border-radius: 8px;
-  border-left: 3px solid var(--tako-accent);
+  border-radius: var(--tako-radius-sm);
+  position: relative;
+}
+
+.sidebar a[aria-current='page']::before,
+nav[class*='sidebar'] a[aria-current='page']::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 1.1em;
+  border-radius: var(--tako-radius-pill);
+  background: var(--tako-accent);
 }
 
 :root[data-theme='dark'] .sidebar a[aria-current='page'],
@@ -561,11 +831,11 @@ nav[class*='sidebar'] a[aria-current='page'] {
 
 .sidebar summary,
 .sidebar [class*='group-label'] {
-  color: var(--tako-ink-muted) !important;
+  color: var(--tako-ink-subtle) !important;
   font-family: var(--sl-font);
-  font-weight: 600;
-  font-size: 0.78rem;
-  letter-spacing: 0.04em;
+  font-weight: 700;
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
@@ -576,7 +846,9 @@ nav[class*='sidebar'] a[aria-current='page'] {
 [class*='toc'] a {
   color: var(--tako-ink-muted) !important;
   font-family: var(--sl-font);
-  font-size: 0.87rem;
+  font-size: 0.85rem;
+  border-radius: var(--tako-radius-sm);
+  transition: color 0.18s var(--tako-ease-soft);
 }
 
 [class*='right-sidebar'] a:hover,
@@ -596,7 +868,7 @@ nav[class*='sidebar'] a[aria-current='page'] {
 .sl-markdown-content {
   font-family: var(--sl-font);
   font-size: 15.5px;
-  line-height: 1.8;
+  line-height: 1.85;
   color: var(--tako-ink);
 }
 
@@ -605,48 +877,49 @@ nav[class*='sidebar'] a[aria-current='page'] {
   color: var(--tako-ink);
 }
 
-.sl-markdown-content h1,
-.sl-markdown-content h2,
-.sl-markdown-content h3,
-.sl-markdown-content h4,
-.sl-markdown-content h5,
-.sl-markdown-content h6 {
+.sl-markdown-content :is(h1, h2, h3, h4, h5, h6) {
   font-family: var(--sl-font);
   font-weight: 700;
   color: var(--tako-ink);
-  letter-spacing: -0.01em;
+  letter-spacing: -0.018em;
 }
 
 .sl-markdown-content h1 {
-  font-size: 2rem;
+  font-size: 2.05rem;
+  line-height: 1.35;
   border-bottom: none;
   padding-bottom: 0;
   margin-top: 0;
-  margin-bottom: 0.8em;
-}
-
-.sl-markdown-content h2 {
-  font-size: 1.4rem;
-  border-bottom: none;
-  padding-bottom: 0;
-  margin-top: 2em;
   margin-bottom: 0.7em;
 }
 
+.sl-markdown-content h2 {
+  font-size: 1.42rem;
+  line-height: 1.45;
+  border-bottom: none;
+  padding-bottom: 0;
+  margin-top: 2.4em;
+  margin-bottom: 0.7em;
+}
+
+/* tako らしさの継承: h2 の前に置くアクセントのダッシュ */
 .sl-markdown-content h2::before {
-  content: "— ";
+  content: '—';
   color: var(--tako-accent);
+  margin-right: 0.4em;
+  font-weight: 700;
 }
 
 .sl-markdown-content h3 {
-  font-size: 1.15rem;
-  margin-top: 1.6em;
+  font-size: 1.14rem;
+  margin-top: 1.9em;
   margin-bottom: 0.5em;
 }
 
 .sl-markdown-content h4 {
-  font-size: 1.05rem;
-  margin-top: 1.3em;
+  font-size: 1.03rem;
+  margin-top: 1.5em;
+  color: var(--tako-ink-muted);
 }
 
 /* リンク */
@@ -657,7 +930,7 @@ a {
   text-decoration-color: var(--tako-accent-line);
   text-underline-offset: 3px;
   text-decoration-thickness: 1px;
-  transition: color 0.15s;
+  transition: color 0.15s var(--tako-ease-soft), text-decoration-color 0.15s var(--tako-ease-soft);
 }
 
 .sl-markdown-content a:hover,
@@ -676,9 +949,10 @@ a:hover {
   background: var(--tako-accent-soft);
   color: var(--tako-accent-strong);
   padding: 0.15em 0.45em;
-  border-radius: 6px;
-  font-size: 0.86em;
+  border-radius: var(--tako-radius-sm);
+  font-size: 0.855em;
   font-weight: 500;
+  overflow-wrap: anywhere;
 }
 
 :root[data-theme='dark'] .sl-markdown-content code:not(pre code) {
@@ -689,17 +963,17 @@ a:hover {
 .sl-markdown-content pre {
   background: var(--tako-surface) !important;
   border: 1px solid var(--tako-border);
-  border-radius: 12px;
+  border-radius: var(--tako-radius-md);
   padding: 1em 1.2em;
   overflow-x: auto;
-  line-height: 1.6;
+  line-height: 1.65;
   font-family: var(--sl-font-mono);
 }
 
 .sl-markdown-content pre code {
   background: transparent !important;
   color: var(--tako-ink);
-  font-size: 0.88em;
+  font-size: 0.87em;
   font-family: var(--sl-font-mono);
 }
 
@@ -707,45 +981,76 @@ a:hover {
 .sl-markdown-content blockquote {
   border-left: 3px solid var(--tako-accent);
   background: var(--tako-surface);
-  padding: 0.5em 1.2em;
+  padding: 0.7em 1.3em;
   color: var(--tako-ink-muted);
-  margin: 1.4em 0;
-  border-radius: 0 12px 12px 0;
+  margin: 1.5em 0;
+  border-radius: 0 var(--tako-radius-md) var(--tako-radius-md) 0;
 }
 
-/* テーブル */
+.sl-markdown-content blockquote p:last-child {
+  margin-bottom: 0;
+}
+
+/* テーブル: 罫線を減らし、行の塗り分けで読ませる（モダンな表組み） */
+.sl-markdown-content .tako-table-scroll,
 .sl-markdown-content table {
-  border-collapse: collapse;
-  margin: 1.4em 0;
-  font-size: 0.95em;
-  width: auto;
+  margin: 1.5em 0;
+}
+
+.sl-markdown-content table {
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 0.93em;
+  width: 100%;
+  border: 1px solid var(--tako-border);
+  border-radius: var(--tako-radius-md);
+  overflow: hidden;
 }
 
 .sl-markdown-content th,
 .sl-markdown-content td {
-  border: 1px solid var(--tako-border);
-  padding: 0.55em 1em;
+  border: none;
+  border-bottom: 1px solid var(--tako-border);
+  padding: 0.6em 1em;
   text-align: left;
+  vertical-align: top;
+}
+
+.sl-markdown-content tr:last-child td {
+  border-bottom: none;
 }
 
 .sl-markdown-content th {
   background: var(--tako-surface);
   font-weight: 700;
   color: var(--tako-ink);
+  white-space: nowrap;
 }
 
-.sl-markdown-content tr:nth-child(even) td {
+.sl-markdown-content tbody tr:nth-child(even) td {
   background: var(--tako-bg-warm);
 }
 
+.sl-markdown-content tbody tr:hover td {
+  background: var(--tako-accent-soft);
+}
+
+/* 表は幅が足りなければ横スクロール（モバイルで崩さないための要） */
+.sl-markdown-content > table,
+.sl-markdown-content .table-wrapper {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
 /* リスト */
-.sl-markdown-content ul,
-.sl-markdown-content ol {
-  padding-left: 1.6em;
+.sl-markdown-content :is(ul, ol) {
+  padding-left: 1.5em;
 }
 
 .sl-markdown-content li {
-  margin: 0.3em 0;
+  margin: 0.35em 0;
 }
 
 .sl-markdown-content li::marker {
@@ -756,7 +1061,7 @@ a:hover {
 .sl-markdown-content hr {
   border: none;
   border-top: 1px solid var(--tako-border);
-  margin: 2.4em 0;
+  margin: 2.6em 0;
 }
 
 /* ============================================================
@@ -767,16 +1072,19 @@ a:hover {
   background: var(--tako-card);
   border: 1px solid var(--tako-border);
   color: var(--tako-ink);
-  border-radius: 12px;
-  padding: 0.8em 1.2em;
-  transition: all 0.15s;
+  border-radius: var(--tako-radius-md);
+  padding: 0.9em 1.2em;
+  box-shadow: var(--tako-shadow-sm);
+  transition: transform 0.25s var(--tako-ease), box-shadow 0.25s var(--tako-ease),
+    border-color 0.2s var(--tako-ease-soft), color 0.2s var(--tako-ease-soft);
 }
 
 [class*='pagination-links'] a:hover {
   border-color: var(--tako-accent);
   color: var(--tako-accent);
   text-decoration: none;
-  box-shadow: var(--tako-accent-glow);
+  transform: translateY(-2px);
+  box-shadow: var(--tako-shadow-md);
 }
 
 /* ============================================================
@@ -786,7 +1094,7 @@ starlight-theme-select select {
   background: var(--tako-surface) !important;
   color: var(--tako-ink) !important;
   border: 1px solid var(--tako-border) !important;
-  border-radius: 8px;
+  border-radius: var(--tako-radius-sm);
 }
 
 /* ============================================================
@@ -812,7 +1120,7 @@ starlight-theme-select select {
   --ec-frm-edTabBarBrdCol: var(--tako-border);
   --ec-frm-inlBtnFg: var(--tako-ink-muted);
   --ec-frm-inlBtnBg: transparent;
-  --ec-frm-frameBoxShdCssVal: 0 2px 8px rgba(0, 0, 0, 0.06);
+  --ec-frm-frameBoxShdCssVal: var(--tako-shadow-sm);
   --ec-frm-tooltipSuccessBg: var(--tako-accent);
   --ec-frm-tooltipSuccessFg: #ffffff;
   --ec-gtrBrdCol: var(--tako-border);
@@ -823,7 +1131,7 @@ starlight-theme-select select {
 .expressive-code .frame,
 .expressive-code .frame.is-terminal,
 .expressive-code .frame.has-title {
-  border-radius: 12px !important;
+  border-radius: var(--tako-radius-md) !important;
   overflow: hidden;
 }
 
@@ -833,9 +1141,9 @@ figure.expressive-code .copy button {
   background: var(--tako-surface-2) !important;
   border: 1px solid var(--tako-border) !important;
   color: var(--tako-ink-muted) !important;
-  border-radius: 8px !important;
+  border-radius: var(--tako-radius-sm) !important;
   opacity: 0.9;
-  transition: all 0.15s;
+  transition: all 0.15s var(--tako-ease-soft);
 }
 
 .expressive-code .copy button::before {
@@ -872,16 +1180,20 @@ figure.expressive-code .copy button {
 .starlight-aside {
   background: var(--tako-surface) !important;
   border-left: 3px solid var(--tako-border-strong) !important;
-  border-radius: 0 12px 12px 0;
+  border-radius: 0 var(--tako-radius-md) var(--tako-radius-md) 0;
   color: var(--tako-ink) !important;
-  padding: 0.9em 1.2em;
-  margin: 1.4em 0;
+  padding: 1em 1.3em;
+  margin: 1.5em 0;
 }
 
 .starlight-aside__title {
   color: var(--tako-ink) !important;
   font-family: var(--sl-font);
   font-weight: 700;
+}
+
+.starlight-aside p:last-child {
+  margin-bottom: 0;
 }
 
 .starlight-aside--note {
@@ -895,31 +1207,31 @@ figure.expressive-code .copy button {
 }
 
 .starlight-aside--caution {
-  background: rgba(234, 179, 8, 0.08) !important;
+  background: rgba(234, 179, 8, 0.09) !important;
   border-left-color: #eab308 !important;
 }
 
 .starlight-aside--danger {
-  background: rgba(239, 68, 68, 0.07) !important;
+  background: rgba(239, 68, 68, 0.08) !important;
   border-left-color: #ef4444 !important;
 }
 
 :root[data-theme='dark'] .starlight-aside--note {
-  background: rgba(240, 121, 159, 0.08) !important;
+  background: rgba(245, 128, 159, 0.09) !important;
 }
 
 :root[data-theme='dark'] .starlight-aside--tip {
-  background: rgba(94, 206, 140, 0.08) !important;
+  background: rgba(99, 212, 147, 0.09) !important;
   border-left-color: var(--tako-green) !important;
 }
 
 :root[data-theme='dark'] .starlight-aside--caution {
-  background: rgba(250, 204, 21, 0.08) !important;
+  background: rgba(250, 204, 21, 0.09) !important;
   border-left-color: #facc15 !important;
 }
 
 :root[data-theme='dark'] .starlight-aside--danger {
-  background: rgba(248, 113, 113, 0.08) !important;
+  background: rgba(248, 113, 113, 0.09) !important;
   border-left-color: #f87171 !important;
 }
 
@@ -932,21 +1244,19 @@ kbd,
   color: var(--tako-ink) !important;
   border: 1px solid var(--tako-border-strong) !important;
   border-radius: 6px;
-  padding: 0.1em 0.45em;
+  padding: 0.12em 0.5em;
   font-family: var(--sl-font-mono) !important;
-  font-size: 0.85em;
+  font-size: 0.83em;
   font-weight: 600;
-  box-shadow: 0 1px 0 var(--tako-border);
+  box-shadow: 0 1px 0 var(--tako-border-strong);
   display: inline-block;
   min-width: 1.2em;
   text-align: center;
+  white-space: nowrap;
 }
 
 :root[data-theme='dark'] kbd,
 :root[data-theme='dark'] .sl-markdown-content kbd {
-  background: var(--tako-surface-2) !important;
-  color: var(--tako-ink) !important;
-  border-color: var(--tako-border-strong) !important;
   box-shadow: 0 1px 0 var(--tako-border-soft);
 }
 
@@ -954,14 +1264,16 @@ kbd,
  * Card grid（Starlight 標準カード）
  * ============================================================ */
 .sl-link-card {
-  border-radius: 14px !important;
+  border-radius: var(--tako-radius-lg) !important;
   border-color: var(--tako-border) !important;
-  transition: all 0.2s ease;
+  box-shadow: var(--tako-shadow-sm);
+  transition: transform 0.25s var(--tako-ease), box-shadow 0.25s var(--tako-ease),
+    border-color 0.2s var(--tako-ease-soft);
 }
 
 .sl-link-card:hover {
   border-color: var(--tako-accent) !important;
-  box-shadow: var(--tako-accent-glow);
+  box-shadow: var(--tako-shadow-md);
   transform: translateY(-2px);
 }
 
@@ -975,11 +1287,78 @@ kbd,
 }
 
 /* ============================================================
+ * モバイル最適化
+ * ============================================================ */
+@media (max-width: 640px) {
+  :root {
+    --sl-text-base: 15px;
+  }
+
+  .sl-markdown-content {
+    font-size: 15px;
+    line-height: 1.82;
+  }
+
+  .sl-markdown-content h1 {
+    font-size: 1.68rem;
+  }
+
+  .sl-markdown-content h2 {
+    font-size: 1.24rem;
+    margin-top: 2em;
+  }
+
+  .sl-markdown-content h3 {
+    font-size: 1.07rem;
+  }
+
+  /* 表は必ず横スクロール可能に（セルを潰して読めなくしない） */
+  .sl-markdown-content table {
+    display: block;
+    overflow-x: auto;
+    white-space: nowrap;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .sl-markdown-content td,
+  .sl-markdown-content th {
+    white-space: normal;
+    min-width: 7rem;
+  }
+
+  .sl-markdown-content pre {
+    padding: 0.9em 1em;
+    border-radius: var(--tako-radius-sm);
+  }
+
+  /* モバイルのリンクはタップしやすく */
+  .sl-markdown-content li {
+    margin: 0.5em 0;
+  }
+}
+
+/* ============================================================
  * モーション控えめ
  * ============================================================ */
 @media (prefers-reduced-motion: reduce) {
-  * {
+  *,
+  *::before,
+  *::after {
     animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ============================================================
+ * 印刷
+ * ============================================================ */
+@media print {
+  nav.sidebar,
+  header.header,
+  [class*='right-sidebar'],
+  [class*='pagination-links'] {
+    display: none !important;
   }
 }
