@@ -35,3 +35,8 @@ ureq.workspace = true
 # Web ビューペイン（FR-3.8）: OS ネイティブ webview の GPUI 子ビュー統合
 wry.workspace = true
 raw-window-handle.workspace = true
+
+# アイコン / バージョン情報リソースの埋め込み（#587。build.rs 参照）。
+# cfg(windows) を付けて macOS のビルドグラフに載せない
+[target.'cfg(windows)'.build-dependencies]
+winresource.workspace = true

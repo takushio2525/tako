@@ -170,3 +170,8 @@ push 運用: リポジトリ公開（Phase 7）までは main 直 push 可。公
   release.sh を先に流す（後発は既存 Release へアセットを足すだけになる）
 - Windows は MSVC CRT を静的リンクする（`.cargo/config.toml`）。VC++ 再頒布可能パッケージを
   配布物の前提にしないための措置で、macOS ビルドには影響しない
+- アプリアイコンとバージョン情報は `crates/tako-app/build.rs` / `crates/tako-cli/build.rs` が
+  exe のリソースへ埋め込む（`assets/icon/tako.ico` が正）。**Windows ホストでビルドしたときだけ**
+  埋まる（リソースコンパイラが要るため。macOS からのクロス検査は素通りする）ので、配布物は
+  必ず windows ランナー / Windows 実機で作る。アイコングループのリソース ID は 1 固定
+  （gpui がウィンドウアイコンとして ID 1 を直接引くため。詳細は build.rs 冒頭）
