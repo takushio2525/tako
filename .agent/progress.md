@@ -1461,3 +1461,55 @@
   隔離 GUI + 実 CLI watch で WORKER_IDLE を idle から 16 秒で発火（復元またぎ・screen 経路も確認）
 - 副産物: permission ダイアログ待ちが WORKER_QUESTION になる（`waiting` へ到達する経路が
   claude では存在しない）を #577 に起票。Stop hook error は無害と確認（Issue の疑いは外れ）
+
+## 2026-07-27（#549: 初回起動のウェルカムバナー + ⌘K パレット導線）
+- 初回起動のみのバナー（setup / master のその場実行）+ パレットに「セットアップを実行 / 設定を
+  開く / master を起動」。`welcome_dismissed` を settings.json 永続化、破損 settings でも安全。
+  MCP `tako_welcome` + CLI 1:1
+- 関連コミット: `6dfd34b`（PR #597 squash merge）。バナー見た目の GUI 目視は画面ロックで未取得
+  （再起動後にユーザー目視）。PATH 問題の残りは #601 へ分離
+
+## 2026-07-27（#589: ファイルツリーのインデントガイド線の途切れを根治）
+- 根因 = 行の border-left では自分の深さの線しか描かれず、子孫行の区間で祖先の線が丸ごと欠けていた。
+  祖先ぶんの縦線もまとめて描く方式へ。visual-test に dark / light / スクロールのピクセル連続性検査を常設
+- 関連コミット: `c601417`（PR #593 squash merge）
+
+## 2026-07-27（#552: AI 自動リネームの品質改善 4 点）
+- 同一タブ 5 分下限 / 一時的失敗（command not found 等）を材料から除外 / 出力言語を UI 言語に固定
+  （簡体字 115 対置換 + CP932 字種検査）/ 自動命名直後のピン印ワンクリック固定（`tako tab pin` + MCP）
+- 関連コミット: `8667da7`（PR #598 squash merge）。副産物 #599 起票
+
+## 2026-07-27（#590: リモートインジケータの常時表示 + GUI からの起動）
+- daemon 非稼働時もステータスバーに表示、クリックで起動導線 + 未セットアップ案内、稼働中は従来の
+  端末一覧。MCP ツール件数ずれ（126→127、main 由来）と SIGTERM 経路の根治も同梱
+- 関連コミット: `818b07c`（PR #596 squash merge）
+
+## 2026-07-27（#599: セルフテスト項目 87 が worker ペインで落ちる問題）
+- 判定を部分一致から `CloseOrigin::marker()` 系 API で生成した期待値との完全一致へ。
+  `close_marker_reason()` を pane_log に新設し、書き出しと判定が同じ定数を共有
+- 関連コミット: `5eec43e`（PR #605 squash merge）。テストのみの変更で install 不要
+
+## 2026-07-27（#594 + #595: リリース配布物のプラットフォーム対応）
+- アセット命名規則の正を `tako-core::platform::release_assets` に新設（シェル写しは実行結果一致の
+  同期テストで拘束）。#595 = 更新候補を「自 OS アセットを含む最新リリース」へ（旧実装は assets を
+  見ず URL を合成していた）。実リリース 28 件の総当たりで macOS 判定の完全一致を固定。
+  #594 = release.sh のノート生成（ダウンロード表 / Known limitations）+ `--notes-only` / `--update-notes`
+- 関連コミット: `a425a63`（PR #606 squash merge）。副産物: `--promote` が set -e で落ちるバグ修正
+
+## 2026-07-27（#600: 入力予測 — zsh-autosuggestions の同梱注入・既定 ON）
+- v0.7.1（MIT）をバージョン固定同梱し、シェル統合（ZDOTDIR）経由で tako 内の zsh 限定・最初の
+  precmd で読込。ON/OFF は状態ファイル方式で稼働中ペインへも次プロンプトから反映。3 経路 1:1
+  （設定画面 / `tako autosuggest` / MCP tako_autosuggest）+ 二重注入ガード + THIRD-PARTY-NOTICES
+- 関連コミット: `e737117`（PR #607 squash merge）。副産物 #608 起票（表示言語グローバル競合フレーク）
+
+## 2026-07-27（#577: permission ダイアログの WORKER_PERMISSION 検知）
+- Issue の機序を実測で訂正: agents 解決成功時は waiting が返る。真の欠陥は**画面推定経路**
+  （agents に載らない環境）。ダイアログが画面に実在すれば waiting へ格上げ +
+  `detect_permission_dialog` に実在検査（入力欄を奪う構造）を必要条件化。question とは排他
+- 関連コミット: `27ae97c`（PR #609）+ `38ab099`（PR #612 = e2e の信頼エントリ残骸の後始末）
+
+## 2026-07-27（#601: tako 内シェルへの CLI PATH 自動注入）
+- FR-2.4.6 新設。判定はシェル側「rc の後」の一点（zsh precmd / bash PROMPT_COMMAND / fish
+  fish_prompt）で、tako が他に見つからないときだけ PATH 末尾へ追加。rc 非侵襲・
+  `TAKO_NO_PATH_INJECTION=1` で無効化。`tako_check_health` に `injected_cli_dir`
+- 関連コミット: `c2c9350`（PR #613 squash merge）。案 2（外部ターミナル向け設置）は FR-2.14.5 に残
