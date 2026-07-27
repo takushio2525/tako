@@ -175,6 +175,12 @@ pub trait UiStateHost {
     }
     /// ファイルツリーの表示・非表示（root の cwd 同期は実装側の責務）
     fn set_filetree(&mut self, _visible: bool) {}
+    /// ファイルツリーでドット始まりの項目を表示しているか（Issue #550）
+    fn filetree_show_hidden(&self) -> bool {
+        false
+    }
+    /// ドット始まり項目の表示切替（Issue #550。永続化は呼び出し側の責務）
+    fn set_filetree_show_hidden(&mut self, _show: bool) {}
     /// 左サイドバーの幅（px。Issue #307）
     fn sidebar_width(&self) -> f32 {
         244.0

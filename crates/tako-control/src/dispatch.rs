@@ -1448,6 +1448,7 @@ fn dispatch_inner(
             view,
             filetree,
             sidebar_width,
+            show_hidden,
         } => {
             if let Some(w) = width {
                 if !w.is_finite() || w <= 0.0 {
@@ -1473,6 +1474,12 @@ fn dispatch_inner(
                 settings.sidebar_width = sw as u32;
                 let _ = crate::settings::save(&settings);
             }
+            if let Some(sh) = show_hidden {
+                host.set_filetree_show_hidden(sh);
+                let mut settings = crate::settings::load();
+                settings.show_hidden_files = sh;
+                let _ = crate::settings::save(&settings);
+            }
             let (visible, width, view) = host.panel_state();
             Ok(json!({
                 "visible": visible,
@@ -1480,6 +1487,7 @@ fn dispatch_inner(
                 "view": view.as_str(),
                 "filetree": host.filetree_visible(),
                 "sidebar_width": host.sidebar_width(),
+                "show_hidden": host.filetree_show_hidden(),
             }))
         }
 

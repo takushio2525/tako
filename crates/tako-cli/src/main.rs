@@ -1939,6 +1939,9 @@ struct PanelArgs {
     /// 左サイドバーの幅（px。Issue #307）
     #[arg(long)]
     sidebar_width: Option<f32>,
+    /// ファイルツリーの隠しファイル（ドット始まり）表示（Issue #550。既定 off）
+    #[arg(long, value_parser = ["on", "off"])]
+    show_hidden: Option<String>,
 }
 
 /// ON/OFF トグル系コマンド共通の引数（autorename / portdetect）
@@ -4201,6 +4204,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 .and_then(tako_control::protocol::PanelViewWire::parse),
             filetree: args.filetree.as_deref().map(|s| s == "on"),
             sidebar_width: args.sidebar_width,
+            show_hidden: args.show_hidden.as_deref().map(|s| s == "on"),
         },
         Command::Portdetect(args) => Request::PortDetect {
             enabled: args.state.as_deref().map(|s| s == "on"),

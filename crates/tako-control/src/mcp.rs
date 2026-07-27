@@ -666,6 +666,7 @@ pub fn tools() -> Vec<Value> {
                     "view": { "type": "string", "enum": ["fleet", "orch", "git", "tmux"], "description": "表示するビュー（GUI のタブ名と同じ。fleet = ペイン / セッション俯瞰、orch = オーケストレーター俯瞰、git = git。tmux は fleet の旧称で後方互換のみ）" },
                     "filetree": { "type": "boolean", "description": "左サイドバーのファイルツリーの表示・非表示" },
                     "sidebar_width": { "type": "number", "exclusiveMinimum": 0, "description": "左サイドバーの幅（px。Issue #307）" },
+                    "show_hidden": { "type": "boolean", "description": "ファイルツリーでドット始まり（.git / .env 等）の項目を表示するか。既定 false = 非表示（Issue #550）" },
                 },
                 "additionalProperties": false,
             },
@@ -3451,6 +3452,7 @@ fn build_request(
             },
             filetree: bool_arg(args, "filetree")?,
             sidebar_width: f32_arg(args, "sidebar_width")?,
+            show_hidden: bool_arg(args, "show_hidden")?,
         },
         "tako_collapse_tab" => Request::CollapseTab {
             pane: u64_arg(args, "pane")?.or(caller),

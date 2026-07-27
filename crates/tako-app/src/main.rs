@@ -1964,7 +1964,12 @@ impl TakoApp {
                 w.clamp(SIDEBAR_MIN_WIDTH, 600.0)
             },
             dragging_sidebar: false,
-            filetree: filetree::FileTree::default(),
+            filetree: {
+                // #550: ドット始まりの表示は settings.json に永続化する（既定 = 非表示）
+                let mut tree = filetree::FileTree::default();
+                tree.set_show_hidden(tako_control::settings::load().show_hidden_files);
+                tree
+            },
             previews: HashMap::new(),
             preview_navigation_panel: None,
             preview_reload: tako_core::PreviewReloadState::new(
@@ -12871,6 +12876,14 @@ impl UiStateHost for TakoApp {
         self.filetree.visible
     }
 
+    fn filetree_show_hidden(&self) -> bool {
+        self.filetree.show_hidden()
+    }
+
+    fn set_filetree_show_hidden(&mut self, show: bool) {
+        self.filetree.set_show_hidden(show);
+    }
+
     fn sidebar_width(&self) -> f32 {
         self.sidebar_width
     }
@@ -18569,6 +18582,7 @@ mod self_test {
                             view: Some(tako_control::protocol::PanelViewWire::Fleet),
                             filetree: None,
                             sidebar_width: None,
+                            show_hidden: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -18587,6 +18601,7 @@ mod self_test {
                             view: None,
                             filetree: None,
                             sidebar_width: None,
+                            show_hidden: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -18799,6 +18814,7 @@ mod self_test {
                             view: Some(tako_control::protocol::PanelViewWire::Fleet),
                             filetree: None,
                             sidebar_width: None,
+                            show_hidden: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -23555,6 +23571,134 @@ mod self_test {
                     guarded,
                     "解消エージェント: コンフリクトが無ければ理由つきで拒否する (#496)",
                 );
+            }
+
+            // 83. ファイルツリーの隠しファイル既定非表示とトグル (#550)。
+            // ドット始まりが既定で消え、CLI / MCP と同じ dispatch 経路のトグルで戻る。
+            // 併せて「増えたルートは自動展開されて先頭に来る」も同じ木で検証する
+            {
+                let fixture =
+                    std::env::temp_dir().join(format!("tako-st550-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&fixture);
+                let home = fixture.join("home");
+                let project = fixture.join("project");
+                let _ = std::fs::create_dir_all(home.join(".hidden-dir"));
+                let _ = std::fs::create_dir_all(home.join("visible-dir"));
+                let _ = std::fs::write(home.join(".hidden-file"), "x");
+                let _ = std::fs::create_dir_all(project.join("src"));
+                let names = |app: &mut TakoApp| -> Vec<String> {
+                    app.filetree
+                        .rows()
+                        .iter()
+                        .map(|r| r.entry.name.clone())
+                        .collect()
+                };
+                let st550 = window
+                    .update(cx, |app, _, cx| {
+                        app.filetree.set_show_hidden(false);
+                        app.filetree.set_roots(vec![home.clone()]);
+                        let n = names(app);
+                        let hidden_ok = !n.iter().any(|x| x == ".hidden-dir")
+                            && !n.iter().any(|x| x == ".hidden-file")
+                            && n.iter().any(|x| x == "visible-dir");
+                        // トグル（dispatch 経路 = CLI / MCP と同一）で出る
+                        app.toggle_hidden_files(cx);
+                        let n = names(app);
+                        let shown_ok = app.filetree.show_hidden()
+                            && n.iter().any(|x| x == ".hidden-dir")
+                            && n.iter().any(|x| x == ".hidden-file");
+                        // 設定に永続化されている
+                        let persisted_on = tako_control::settings::load().show_hidden_files;
+                        app.toggle_hidden_files(cx);
+                        let persisted_off = !tako_control::settings::load().show_hidden_files;
+                        // 増えたルートは自動展開されて先頭に来る（#550 案 3）
+                        app.filetree.set_roots(vec![home.clone(), project.clone()]);
+                        let rows = app.filetree.rows();
+                        let first_root_is_project = rows
+                            .first()
+                            .is_some_and(|r| r.root && r.entry.path == project);
+                        let expanded = rows.iter().any(|r| r.entry.name == "src" && r.depth == 1);
+                        hidden_ok
+                            && shown_ok
+                            && persisted_on
+                            && persisted_off
+                            && first_root_is_project
+                            && expanded
+                    })
+                    .unwrap_or(false);
+                check(
+                    st550,
+                    "ファイルツリー: ドット既定非表示 / トグル / 永続化 / 新ルート先頭・自動展開 (#550)",
+                );
+                if fixture.starts_with(std::env::temp_dir()) {
+                    let _ = std::fs::remove_dir_all(&fixture);
+                }
+            }
+
+            // 84. 新規作成のインライン入力が作成先の直下に正しい深さで出る (#559)。
+            // 実機の合成キーボード入力は IME に吸われるため、項目 79 / 82 と同じく
+            // キーストローク経路を直接叩く。検証点: 入力欄の位置（親の真下）と深さ、
+            // 確定で実体が生まれること、確定直後にツリーへ反映されること
+            {
+                let fixture =
+                    std::env::temp_dir().join(format!("tako-st559-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&fixture);
+                let _ = std::fs::create_dir_all(fixture.join("sub/deep"));
+                let _ = std::fs::write(fixture.join("sub/z-last.txt"), "x");
+                let sub = fixture.join("sub");
+                let st559 = window
+                    .update(cx, |app, _, cx| {
+                        app.filetree.set_show_hidden(false);
+                        app.filetree.set_roots(vec![fixture.clone()]);
+                        app.filetree.expand_dir(&sub);
+                        app.filetree.expand_dir(&fixture.join("sub/deep"));
+                        // sub を作成先に指定して新規ファイルのインライン入力を開く
+                        app.handle_context_action("new-file", &sub, true, cx);
+                        let opened = app
+                            .inline_edit
+                            .as_ref()
+                            .is_some_and(|e| e.parent == sub && e.kind == InlineEditKind::NewFile);
+                        // 挿入位置は render が使う純関数そのもので検証する
+                        let rows = app.filetree.rows();
+                        let parent_idx = rows.iter().position(|r| r.entry.path == sub).unwrap_or(0);
+                        let slot = crate::sidebar::inline_insert_position(&rows, &sub, false);
+                        // 入力欄は sub の子のうちファイル群の先頭（deep とその子孫の直後・
+                        // z-last.txt の手前）で深さ 2。展開済み子孫を全部飛ばした末尾ではない
+                        let insert_ok = slot.is_some_and(|s| {
+                            s.parent_index == parent_idx
+                                && s.row_index == parent_idx + 2
+                                && s.depth == 2
+                        });
+                        // 名前を打ち込んで Enter で確定
+                        for ch in ["a", "b", "c", ".", "t", "x", "t"] {
+                            app.handle_inline_edit_key(
+                                &Keystroke {
+                                    modifiers: Modifiers::default(),
+                                    key: ch.to_string(),
+                                    key_char: Some(ch.to_string()),
+                                },
+                                cx,
+                            );
+                        }
+                        let typed = app.inline_edit.as_ref().is_some_and(|e| e.text == "abc.txt");
+                        app.handle_inline_edit_key(&Keystroke::parse("enter").unwrap(), cx);
+                        let closed = app.inline_edit.is_none();
+                        let created = sub.join("abc.txt").is_file();
+                        // ポーリングを待たずツリーへ反映され、sub の子として並ぶ
+                        let rows = app.filetree.rows();
+                        let listed = rows
+                            .iter()
+                            .any(|r| r.entry.name == "abc.txt" && r.depth == 2);
+                        opened && insert_ok && typed && closed && created && listed
+                    })
+                    .unwrap_or(false);
+                check(
+                    st559,
+                    "ファイルツリー: 新規作成の入力欄が作成先直下に出て確定が即反映される (#559)",
+                );
+                if fixture.starts_with(std::env::temp_dir()) {
+                    let _ = std::fs::remove_dir_all(&fixture);
+                }
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

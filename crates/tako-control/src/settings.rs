@@ -50,6 +50,9 @@ pub struct Settings {
     /// 左サイドバー（ファイルツリー）の幅（px 整数。Issue #307。既定 244）
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: u32,
+    /// ファイルツリーでドット始まりの項目を表示する（Issue #550。既定 false = 非表示）
+    #[serde(default)]
+    pub show_hidden_files: bool,
     /// エラーレポートの自動送信（Issue #333。既定 OFF = opt-in）
     #[serde(default)]
     pub telemetry: bool,
@@ -134,6 +137,7 @@ impl Default for Settings {
             pane_log_total_max_mb: default_pane_log_total_max_mb(),
             theme: default_theme(),
             sidebar_width: default_sidebar_width(),
+            show_hidden_files: false,
             telemetry: false,
             limit_service: default_limit_service(),
             language: default_language(),
@@ -271,6 +275,7 @@ mod tests {
             pane_log_total_max_mb: 300,
             theme: "light".into(),
             sidebar_width: 300,
+            show_hidden_files: true,
             telemetry: true,
             limit_service: "codex".into(),
             language: "en".into(),
@@ -295,6 +300,8 @@ mod tests {
         assert_eq!(parsed.lang_setting(), tako_core::i18n::LangSetting::System);
         assert!(parsed.auto_rename);
         assert!(parsed.port_detect);
+        // #550: 隠しファイルは既定で非表示（未知キーの後方互換も兼ねる）
+        assert!(!parsed.show_hidden_files);
         assert!(parsed.preview_live_reload);
         assert_eq!(parsed.preview_cache_max_mb, 512);
         assert!(parsed.tmux_persist);
