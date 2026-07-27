@@ -2520,7 +2520,10 @@ impl TakoApp {
                     })
                     .child(name.clone()),
             )
-            // マージボタン: 現在ブランチ自身には出さない（自分自身はマージできない）
+            // マージボタン: 現在ブランチ自身には出さない（自分自身はマージできない）。
+            // #562: 以前は opacity(0) + 行ホバーでしか現れず、実機でユーザーが
+            // 「GUI からマージできない」と判断していた。常時薄く出し、
+            // ホバーで強調する（VSCode のインライン操作と同じ出し方）
             .when(!is_current, |d| {
                 d.child(
                     div()
@@ -2528,18 +2531,31 @@ impl TakoApp {
                             "git-branch-merge",
                             id.1 + if is_remote { 10_000 } else { 0 },
                         ))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(2.0))
                         .flex_none()
                         .px_1()
                         .rounded(px(3.0))
+                        .cursor_pointer()
                         .text_size(px(9.0))
-                        .text_color(hsla_alpha(fg, 0.6))
-                        .opacity(0.0)
+                        .text_color(hsla_alpha(fg, 0.75))
+                        .opacity(0.7)
                         .group_hover("git-branch-row", |d| d.opacity(1.0))
                         .hover(|d| d.bg(rgba_alpha(accent, 0.25)).text_color(hsla(accent)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.git_do_merge(merge_repo.clone(), merge_name.clone(), false, cx);
                         }))
+                        .child(
+                            svg()
+                                .path(ui_icon::GIT_MERGE)
+                                .w(px(10.0))
+                                .h(px(10.0))
+                                .flex_none()
+                                .text_color(hsla(accent)),
+                        )
                         .child(crate::ui_text::panel::git_merge_btn()),
                 )
             })
@@ -3144,25 +3160,43 @@ impl TakoApp {
                 .px_2()
                 .py_1()
                 .bg(rgba(theme.tab_bar_background))
-                .child(
-                    svg()
-                        .path(ui_icon::GIT_BRANCH)
-                        .flex_none()
-                        .w(px(12.0))
-                        .h(px(12.0))
-                        .text_color(hsla(accent)),
-                )
-                // ブランチ名・リポ名・upstream は狭いパネルでは削って良い。
-                // overflow_hidden を付けないと flex の自動最小幅が内容幅に張り付き、
-                // text_ellipsis が効かないまま右へ溢れる（#494 の症状 4 と同根）
+                // #551 でブランチセクションは既定で畳むので、ここが「ブランチ一覧への
+                // 入口」になる。#562: クリックでセクションを開き、切替・マージへ導く
                 .child(
                     div()
-                        .ml_1()
+                        .id("git-branch-chip")
+                        .flex()
+                        .flex_row()
+                        .items_center()
                         .overflow_hidden()
-                        .text_ellipsis()
-                        .text_size(px(12.0))
-                        .text_color(hsla(fg_active))
-                        .child(branch_label),
+                        .gap(px(2.0))
+                        .px_1()
+                        .rounded(px(3.0))
+                        .cursor_pointer()
+                        .hover(|d| d.bg(rgba_alpha(bg_hover, 0.4)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.git_collapsed.branches = false;
+                            cx.notify();
+                        }))
+                        .child(
+                            svg()
+                                .path(ui_icon::GIT_BRANCH)
+                                .flex_none()
+                                .w(px(12.0))
+                                .h(px(12.0))
+                                .text_color(hsla(accent)),
+                        )
+                        // ブランチ名・リポ名・upstream は狭いパネルでは削って良い。
+                        // overflow_hidden を付けないと flex の自動最小幅が内容幅に張り付き、
+                        // text_ellipsis が効かないまま右へ溢れる（#494 の症状 4 と同根）
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_size(px(12.0))
+                                .text_color(hsla(fg_active))
+                                .child(branch_label),
+                        ),
                 )
                 .child(
                     div()
@@ -3888,6 +3922,22 @@ impl TakoApp {
             cx,
         ));
         if !collapsed.branches {
+            // #562: 「切替」と「マージ」がこの一覧の操作だと言葉で言う。
+            // マージボタンは行の右端に小さく出るだけなので、アイコンだけでは
+            // 「GUI からマージできない」と読まれていた（実機報告）
+            if local_branches.len() > 1 {
+                body.push(
+                    div()
+                        .w_full()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .px_3()
+                        .py(px(1.0))
+                        .text_size(px(9.0))
+                        .text_color(hsla(theme.text_muted))
+                        .child(crate::ui_text::panel::git_branch_hint()),
+                );
+            }
             // 新規ブランチ名の入力行（#496）
             if let Some(input) = self.git_branch_input.clone() {
                 body.push(self.render_branch_input(&input, &repo_for_new_branch, &theme, cx));

@@ -225,9 +225,16 @@ pub fn git_branch_create_btn() -> &'static str {
 pub fn git_cancel() -> &'static str {
     tr!("キャンセル", "Cancel")
 }
-/// ブランチ行のホバー時に出るマージボタン
+/// ブランチ行のマージボタン（#562: 常時薄く表示し、ホバーで強調する）
 pub fn git_merge_btn() -> &'static str {
     tr!("マージ", "Merge")
+}
+/// ブランチセクションの操作案内（#562: マージ導線が見つけられない問題への対処）
+pub fn git_branch_hint() -> &'static str {
+    tr!(
+        "行クリックで切替 / 右の「マージ」で現在ブランチへ取り込み",
+        "Click a row to switch / \"Merge\" pulls it into the current branch"
+    )
 }
 /// 変更ファイル行クリックでプレビューを開けなかったとき（#560）
 pub fn git_preview_missing(path: &str) -> String {
