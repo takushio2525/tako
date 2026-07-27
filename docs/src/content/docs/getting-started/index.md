@@ -37,15 +37,22 @@ tmux（ティーマックス）は「ターミナルの中身を裏で生かし�
 
 ### 方法 A: Homebrew（推奨）
 
-ターミナル（macOS 標準の「ターミナル.app」で OK）を開き、次の 2 行を実行します。
+ターミナル（macOS 標準の「ターミナル.app」で OK）を開き、次の 1 行を実行します。
+
+```bash
+brew install --cask takushio2525/tako/tako
+```
+
+アプリ本体が `/Applications/tako.app` に入り、`tako` コマンドも自動で使えるようになります。
+
+:::note[`Cask not found` と言われたら]
+配布元の登録（tap）を先に済ませてから、もう一度インストールしてください。
 
 ```bash
 brew tap takushio2525/tako
 brew install --cask takushio2525/tako/tako
 ```
-
-- 1 行目は「tako の配布元を Homebrew に登録する」コマンド（初回のみ）
-- 2 行目が実際のインストール。アプリ本体が `/Applications/tako.app` に入り、`tako` コマンドも自動で使えるようになります
+:::
 
 インストールできたか確認:
 
@@ -53,7 +60,7 @@ brew install --cask takushio2525/tako/tako
 tako --version
 ```
 
-バージョン番号（例: `tako 0.2.8`）が表示されれば成功です。
+バージョン番号（例: `tako 0.6.0`）が表示されれば成功です。
 
 ### 方法 B: ZIP ダウンロード
 
@@ -109,7 +116,11 @@ xattr -dr com.apple.quarantine /Applications/tako.app
 
 `/Applications/tako.app` をダブルクリック、または Dock / Launchpad から起動します。通常のターミナルと同じように、シェルが 1 ペイン開きます。
 
-まずは普段どおりコマンドを打ってみてください。`ls` や `cd` など、通常のターミナルと同じ操作がそのまま使えます。
+**初回起動時は、タブバーの下に案内バナーが出ます。** `tako setup` と `tako master` をその場のボタンから実行できるので、次の手順はバナーからそのまま進められます。バナーは一度閉じると再表示されません（`tako welcome show` でいつでも呼び戻せます）。同じ項目は <kbd>Cmd</kbd>+<kbd>K</kbd> のコマンドパレットにも常設されています。
+
+まずは普段どおりコマンドを打ってみてください。`ls` や `cd` など、通常のターミナルと同じ操作がそのまま使えます。コマンドを打ち始めると、履歴から続きが薄い文字で予測表示されます（<kbd>→</kbd> または <kbd>Tab</kbd> で確定）。最初の 10 回だけ確定キーの案内が薄く表示され、慣れた頃に自然と消えます。
+
+この入力予測は **tako が開いたシェルの中だけ**で効き、`~/.zshrc` は書き換えないので tako の外のターミナルは何も変わりません。挙動は `tako autosuggest off`（予測そのもの）/ `tako autosuggest tab off`（Tab 確定だけ無効化）/ `tako autosuggest hint off`（案内を今すぐ止める）で個別に切り替えられます。
 
 ## 3. `tako setup` — 質問ゼロの自動セットアップ
 
@@ -188,11 +199,11 @@ tako setup --changes
 ```
 tako setup アップデート追従状況
 ─────────────────────────────
-  現在の setup リビジョン: 9（tako v0.5.4）
-  適用済みリビジョン: 8（tako v0.5.2 で setup 実行）
+  現在の setup リビジョン: 12（tako v0.6.0）
+  適用済みリビジョン: 11（tako v0.5.6 で setup 実行）
   未適用の変更: 1 件
 
-  [rev 9 / v0.5.4 / 2026-07-15] setup を質問ゼロ・前回値引き継ぎ・AI 代行へ刷新
+  [rev 12 / v0.6.0 / 2026-07-17] リモート接続を Tailscale Serve へ一本化 + setup ウィザード新設
       区分: auto（setup 再実行で自動適用）
       ...
 
@@ -246,6 +257,8 @@ tako 内のターミナルで master を起動します。setup が生成した 
 ```bash
 tako master
 ```
+
+master は**今いるペインでそのまま起動**します（新しいタブは作りません）。専用のタブを立てたい場合は `tako master --tab` を使ってください。
 
 起動したら、試しにこう話しかけてみてください。
 
@@ -309,5 +322,6 @@ tmux バックエンドが無効になっている可能性があります。`ta
 - [クイックスタート](/getting-started/quickstart/) — `tako master` を起動して AI オーケストレーションを最短で体験する
 - [タブ＆ペイン管理](/features/tabs-and-panes/) — 画面分割やショートカットを覚える
 - [オーケストレーションとは](/features/orchestration/) — AI エージェントを並列に働かせる tako の目玉機能
+- [設定とカスタマイズ](/guides/settings/) — テーマ・表示言語・入力予測などの調整
 - [CLI リファレンス](/guides/cli-reference/) — `tako` コマンド全一覧
 - [リリースノート](/releases/) — 各バージョンの変更内容

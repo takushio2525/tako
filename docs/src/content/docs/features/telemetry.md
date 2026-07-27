@@ -1,88 +1,67 @@
 ---
-title: Error Telemetry
-description: Automatic error reporting for improving tako
+title: エラーテレメトリ
+description: クラッシュ時のエラーレポート自動送信 — 何が送られ、何が送られないか
 ---
 
-# Error Telemetry
+tako には、クラッシュ（panic / 致命的エラー）の情報を自動送信して品質改善に役立てる仕組みがあります。**既定では無効**で、あなたが明示的に有効にしたときだけ動きます。
 
-tako has an opt-in error telemetry feature that automatically sends crash reports (panic / critical errors) to help improve the software. **This feature is disabled by default** and requires explicit opt-in.
+## 何が送られるか
 
-## What is collected
+有効にしている場合、クラッシュ時に送られるのは次の情報だけです。
 
-When telemetry is enabled, the following information is sent on panic or critical error:
-
-| Field | Description | Example |
+| 項目 | 内容 | 例 |
 |---|---|---|
-| `version` | tako version | `0.5.5` |
-| `os_version` | OS version (macOS only) | `macOS 26.0 (Darwin 25.2.0)` |
-| `error_kind` | Error category | `panic` / `critical` / `invariant_violation` |
-| `message` | Error message (paths masked) | `index out of bounds at ~/src/main.rs:42` |
-| `backtrace` | Stack trace (paths masked) | `~/src/...` |
+| `version` | tako のバージョン | `0.6.0` |
+| `os_version` | OS のバージョン | `macOS 26.0 (Darwin 25.2.0)` |
+| `error_kind` | エラーの種別 | `panic` / `critical` / `invariant_violation` |
+| `message` | エラーメッセージ（パスはマスク済み） | `index out of bounds at ~/src/main.rs:42` |
+| `backtrace` | スタックトレース（パスはマスク済み） | `~/src/...` |
 
-## What is NOT collected
+## 何が送られないか
 
-- Screen content, terminal output, or input text
-- Current working directory
-- User name, host name, or email
-- File contents or command history
-- Any personally identifiable information (PII)
+- 画面の内容・ターミナルの出力・入力したテキスト
+- 現在の作業ディレクトリ
+- ユーザー名・ホスト名・メールアドレス
+- ファイルの中身・コマンド履歴
+- その他あらゆる個人を特定できる情報
 
-All file paths in error messages and stack traces are masked:
-- `/Users/<name>/...` → `~/...` (or `/Users/<user>/...`)
-- `/home/<name>/...` → `/home/<user>/...`
+エラーメッセージとスタックトレースに含まれるパスは、送信前にすべてマスクされます。
+
+- `/Users/<名前>/...` → `~/...`
+- `/home/<名前>/...` → `/home/<user>/...`
 - `/var/folders/<id>/<id>/...` → `/var/folders/<tmp>/...`
 
-## How to enable/disable
-
-### CLI
+## 有効にする / 無効にする
 
 ```bash
-# Check status
-tako telemetry status
-
-# Enable
-tako telemetry on
-
-# Disable
-tako telemetry off
+tako telemetry status   # 現在の状態
+tako telemetry on       # 有効化
+tako telemetry off      # 無効化
 ```
 
-### MCP
+MCP ツール `tako_telemetry` からも同じ操作ができます。`tako setup` でも有効にするかどうかを確認します。
 
-```json
-{ "action": "on" }   // Enable
-{ "action": "off" }  // Disable
-{ "action": "status" } // Check (default)
-```
+## 送った内容は自分で確認できます
 
-Tool name: `tako_telemetry`
+送信されたレポートは、すべてローカルにも記録されます（`<データディレクトリ>/telemetry.log`）。**何が送られたか（あるいは有効にしていたら何が送られていたか）を、あとから自分の目で確認できます。** `tako telemetry status` にログファイルのパスと件数が表示されます。
 
-### Setup
+## データの取り扱い
 
-The `tako setup` wizard asks whether to enable telemetry. You can change it at any time with the CLI/MCP commands above.
-
-## Transparency
-
-All sent reports are logged locally at `<data_dir>/telemetry.log`. You can review exactly what was (or would be) sent. The `status` command shows the log file path and count.
-
-## Data handling
-
-| Item | Detail |
+| 項目 | 内容 |
 |---|---|
-| Storage | Cloudflare Workers KV |
-| Retention | 90 days (auto-deleted) |
-| Access | Only the project owner can read reports |
-| Write endpoint | Rate-limited (10 req/min/IP), no authentication required |
-| Read endpoint | Requires admin token (not included in the binary) |
+| 保存先 | Cloudflare Workers KV |
+| 保持期間 | 90 日（自動削除） |
+| 閲覧できる人 | プロジェクトのオーナーのみ |
+| 書き込み口 | レート制限あり（10 リクエスト/分/IP）、認証不要 |
+| 読み出し口 | 管理者トークンが必要（バイナリには含まれていません） |
 
-## Deletion request
+## 削除の依頼
 
-To request deletion of your reports or to ask questions about the telemetry data, please contact the project maintainer via GitHub Issues or email.
+送信済みレポートの削除依頼や、テレメトリのデータに関する質問は [GitHub Issues](https://github.com/takushio2525/tako/issues) からお願いします。
 
-- GitHub: https://github.com/takushio2525/tako/issues
-- Email: shiozawataku2525@gmail.com
+## ソースコード
 
-## Source code
+送受信の実装はどちらも公開されています。
 
-- Worker (collection endpoint): [`web/tako-error-collector/`](https://github.com/takushio2525/tako/tree/main/web/tako-error-collector)
-- Rust client: [`crates/tako-control/src/telemetry.rs`](https://github.com/takushio2525/tako/tree/main/crates/tako-control/src/telemetry.rs)
+- 収集エンドポイント（Worker）: [`web/tako-error-collector/`](https://github.com/takushio2525/tako/tree/main/web/tako-error-collector)
+- Rust 側のクライアント: [`crates/tako-control/src/telemetry.rs`](https://github.com/takushio2525/tako/tree/main/crates/tako-control/src/telemetry.rs)
