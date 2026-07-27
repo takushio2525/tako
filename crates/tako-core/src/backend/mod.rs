@@ -524,13 +524,23 @@ fn decide(env: Option<&str>, binary: &Binary, windows: bool) -> Choice {
 /// 条件にすると patch が上がった翌日に全ユーザーの永続化が黙って落ち、
 /// 無条件に信じると壊れた器を掴む。だから**測って決める**。
 fn vet(choice: Choice, binary: &Binary) -> Choice {
+    vet_with(choice, binary, psmux::behavior_probe)
+}
+
+/// プローブを差し替えられる形（**採否の分岐を実バイナリ無しでテストするため**）。
+/// 検証済みバージョンでは `probe` を**呼ばない**（起動のたびに器を作る無駄を避ける）
+fn vet_with(
+    choice: Choice,
+    binary: &Binary,
+    probe: impl FnOnce(&str) -> Result<(), String>,
+) -> Choice {
     let (Choice::Psmux, Binary::Psmux { bin, version }) = (choice, binary) else {
         return choice;
     };
     if psmux::version_support(version) == psmux::VersionSupport::Verified {
         return choice;
     }
-    match psmux::behavior_probe(bin) {
+    match probe(bin) {
         Ok(()) => {
             eprintln!(
                 "warning: psmux {version} は tako の適合検証済みバージョン（{}）と異なります。\
@@ -667,6 +677,48 @@ mod tests {
         assert_eq!(decide(None, &tmux_bin(), false), Choice::Tmux);
         assert_eq!(decide(None, &Binary::Absent, true), Choice::None);
         assert_eq!(decide(None, &Binary::Absent, false), Choice::None);
+    }
+
+    /// **#519 M2 要件 6**: 未検証バージョンは「測って」から採る。
+    ///
+    /// バージョン一致だけを条件にすると psmux が patch を上げた翌日に全ユーザーの
+    /// 永続化が黙って落ち、無条件に信じると壊れた器を掴む
+    #[test]
+    fn 未検証バージョンはプローブの結果で採否が決まる() {
+        let untested = Binary::Psmux {
+            bin: "psmux".into(),
+            version: "9.9.9".into(),
+        };
+        // 検証済みバージョンではプローブを呼ばない（起動のたびに器を作らない）
+        assert_eq!(
+            vet_with(Choice::Psmux, &psmux_bin(), |_| panic!(
+                "検証済みバージョンでプローブを走らせた"
+            )),
+            Choice::Psmux
+        );
+        // 未検証でもプローブが通れば使う
+        assert_eq!(
+            vet_with(Choice::Psmux, &untested, |_| Ok(())),
+            Choice::Psmux
+        );
+        // 通らなければ器を配らない（構成のみ復元へ明示縮退）
+        assert_eq!(
+            vet_with(Choice::Psmux, &untested, |_| Err("器を壊せない".into())),
+            Choice::None
+        );
+        // psmux 以外の選択にはプローブを挟まない
+        assert_eq!(
+            vet_with(Choice::Tmux, &tmux_bin(), |_| panic!(
+                "tmux でプローブを走らせた"
+            )),
+            Choice::Tmux
+        );
+        assert_eq!(
+            vet_with(Choice::None, &untested, |_| panic!(
+                "器なしでプローブを走らせた"
+            )),
+            Choice::None
+        );
     }
 
     /// psmux が無ければ psmux は選ばれない（明示指定でも器を捏造しない）

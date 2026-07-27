@@ -12,8 +12,8 @@
       tako-setup-{version}-x64.exe   インストーラー
       tako-{version}-windows-x64.zip ポータブル版
 
-    ローカルでも GitHub Actions でも同じ経路を通すため、
-    .github/workflows/windows-release.yml はこのスクリプトを呼ぶ。
+    配布物の作り方をここ 1 本に集約するため、リリース手順
+    （installer/windows/release-windows.ps1）はこのスクリプトを呼ぶ。
 
 .PARAMETER Version
     配布物の名前に入るバージョン。省略時は Cargo.toml の workspace.package.version。

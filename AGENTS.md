@@ -74,6 +74,7 @@ tako/
 | `tako` CLI ビルド | `cargo build -p tako-cli`（バイナリは `target/debug/tako`） |
 | .app バンドル生成（macOS） | `scripts/build-app.sh [--verify] [--install]`（`dist/tako.app`。tako CLI 同梱） |
 | **Windows 配布物生成** | `pwsh -File installer/windows/build-installer.ps1 [-Version v0.6.0]`（`dist/windows/` に `tako-setup-{tag}-x64.exe` + `tako-{tag}-windows-x64.zip`。Inno Setup 6 の ISCC が要る。#587） |
+| **Windows リリース（実機で実行）** | `pwsh -File installer/windows/release-windows.ps1`（前検査 → ビルド → 配布物検査まで。**既定は dry-run**、`-Upload` で GitHub Release へ添付。タグは省略時 Cargo.toml から。#587） |
 | Windows アプリアイコン再生成 | `pwsh -File installer/windows/make-icon.ps1`（A 案 PNG → `assets/icon/tako.ico`。System.Drawing だけで動く） |
 | リリース | `scripts/release.sh`（Cargo.toml バージョン自動読み取り + CHANGELOG.md 連携。`--publish` でタグ + GitHub Release 作成、`--draft` でドラフト） |
 | 夜間パッチリリース（自動） | `scripts/nightly-release.sh`（launchd から毎日 5:00 実行。`--dry-run` で判定のみ、`--install-launchd` でジョブ登録。#166） |
@@ -160,9 +161,21 @@ push 運用: リポジトリ公開（Phase 7）までは main 直 push 可。公
 
 ### Windows 配布物（#587）
 
-- `.github/workflows/windows-release.yml` が `v*` タグの push（または `workflow_dispatch` で
-  タグ指定）で走り、windows-latest 上で release ビルド → Inno Setup → Release へ添付する。
-  中身は `installer/windows/build-installer.ps1` の呼び出しなのでローカルと同じ経路
+- **Windows の CI / リリースは GitHub Actions ではなく Windows 実機で回す**（ユーザー決定。
+  当初あった `.github/workflows/windows-release.yml` は一度も実行しないまま削除した）。
+  `installer/windows/release-windows.ps1` が「前検査 → release ビルド → Inno Setup + zip →
+  配布物のスモーク検査 → Release へ添付」を 1 コマンドで通す。ビルド本体は
+  `installer/windows/build-installer.ps1` の呼び出しなので配布物の作り方は変わらない
+- 手順（Windows 機で）: `git fetch --tags && git checkout <tag>` →
+  `pwsh -File installer/windows/release-windows.ps1`（dry-run。検査まで通る）→
+  問題なければ `-Upload` を付けて再実行する
+- **既定は dry-run**。`-Upload` を明示したときだけアップロードする。Release がまだ無ければ
+  `-CreateRelease` で prerelease として作る。`-Force` が緩めるのは git の状態（作業ツリーが
+  dirty / HEAD がタグと違う）だけで、**バージョン整合と配布物検査は緩まない**
+  （版数を詐称した配布物を上げられないようにするため）
+- タグを省略すると Cargo.toml の version から `v<version>` を組み立てる。タグを渡す場合も
+  Cargo.toml の version と一致していないと前検査で止まる（exe に埋まる FileVersion の正は
+  Cargo.toml なので、食い違うとタグと違う版数を名乗る配布物ができる）
 - アセット名は `tako-setup-{tag}-x64.exe`（インストーラー）と `tako-{tag}-windows-x64.zip`
   （ポータブル）。インストーラーは per-user（`{localappdata}\Programs\tako`）で管理者権限を
   要求せず、ユーザー PATH へインストール先を追加する
@@ -173,5 +186,6 @@ push 運用: リポジトリ公開（Phase 7）までは main 直 push 可。公
 - アプリアイコンとバージョン情報は `crates/tako-app/build.rs` / `crates/tako-cli/build.rs` が
   exe のリソースへ埋め込む（`assets/icon/tako.ico` が正）。**Windows ホストでビルドしたときだけ**
   埋まる（リソースコンパイラが要るため。macOS からのクロス検査は素通りする）ので、配布物は
-  必ず windows ランナー / Windows 実機で作る。アイコングループのリソース ID は 1 固定
+  必ず Windows 実機で作る（release-windows.ps1 の配布物検査が FileVersion の埋め込みまで
+  見るので、macOS で作った成果物はここで落ちる）。アイコングループのリソース ID は 1 固定
   （gpui がウィンドウアイコンとして ID 1 を直接引くため。詳細は build.rs 冒頭）

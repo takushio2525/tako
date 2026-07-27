@@ -9,7 +9,7 @@
 //!   1. **ターゲット**が Windows でなければ即 return（macOS ネイティブビルドは何もしない）
 //!   2. **ホスト**が Windows でなければリソースコンパイルをしない。rc.exe は Windows SDK に
 //!      しか無く、macOS からのクロス検査（`scripts/check-windows.sh`）を落とさないため。
-//!      配布 exe は windows ランナー（`.github/workflows/windows-release.yml`）で作るので
+//!      配布 exe は Windows 実機（`installer/windows/release-windows.ps1`）で作るので
 //!      配布物には影響しない
 //!
 //! アイコングループのリソース ID は 1（winresource の既定）でなければならない。
@@ -67,7 +67,7 @@ fn embed_windows_resources() {
     if std::env::var("PROFILE").unwrap_or_default() == "release" {
         println!(
             "cargo::warning=非 Windows ホストのためアイコン / バージョン情報リソースを埋め込めなかった。\
-             配布用の exe は windows ランナー（.github/workflows/windows-release.yml）で作ること"
+             配布用の exe は Windows 実機（installer/windows/release-windows.ps1）で作ること"
         );
     }
 }

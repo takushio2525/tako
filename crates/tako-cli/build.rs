@@ -42,7 +42,7 @@ fn embed_windows_resources() {
     if std::env::var("PROFILE").unwrap_or_default() == "release" {
         println!(
             "cargo::warning=非 Windows ホストのためアイコン / バージョン情報リソースを埋め込めなかった。\
-             配布用の exe は windows ランナー（.github/workflows/windows-release.yml）で作ること"
+             配布用の exe は Windows 実機（installer/windows/release-windows.ps1）で作ること"
         );
     }
 }
