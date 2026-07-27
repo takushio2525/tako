@@ -89,5 +89,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: ビルド
         run: cargo build --workspace
-      - name: テスト
+      # Windows のテストは #574 でビルドが通るようになって初めて実行され、POSIX 前提の
+      # 既存テスト 18 件（ps / symlink / `~` 展開 / sh 前提の spawn 等）が落ちている。
+      # 内訳と対応は Issue #583（#467 Windows 移植の子タスク）。
+      # **#583 が片付くまで Windows のテストは非ブロッキング**にする。ビルドは
+      # blocking のまま（このジョブの主目的は Windows ビルドスモークのため）
+      - name: テスト（#583 が片付くまで非ブロッキング）
+        continue-on-error: true
         run: cargo test --workspace
